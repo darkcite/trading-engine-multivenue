@@ -19,7 +19,7 @@
 //! * The **boot assertions** (BX-19) — pure judges over the venue's
 //!   answers. The gateway's boot phase makes the (cold, signed) queries and
 //!   refuses the boot on any mismatch; nothing here mutates the account
-//!   (every mutation is the operator tool's, `exec-smoke --binance setup`).
+//!   (every mutation is the operator tool's, `exec-smoke --binance-setup`).
 //!   BX7 adds each owned USDⓈ-M row's margin type and leverage
 //!   ([`judge_symbol_config`]); COIN-M's come with its account read.
 
@@ -179,6 +179,20 @@ pub fn judge_single_asset(body: &[u8]) -> Result<(), AssertErr> {
 /// leverage of 0 (no leverage is not one), a key an entry names twice and
 /// a symbol two entries name (which would hold?).
 pub fn judge_symbol_config(body: &[u8], symbol: &[u8], max_leverage: u8) -> Result<(), AssertErr> {
+    match symbol_config(body, symbol)? {
+        (true, 0) => Err(AssertErr::Unreadable),
+        (true, l) if l <= u64::from(max_leverage) => Ok(()),
+        (true, _) => Err(AssertErr::Leverage),
+        (false, _) => Err(AssertErr::Isolated),
+    }
+}
+
+/// **The `symbolConfig` entry naming `symbol`** (BX11, the account tool's
+/// read): its margin type is `CROSSED` (`true`) or another, and its
+/// leverage — under [`judge_symbol_config`]'s laws: no such entry is
+/// `Unlisted`; one short of either field, a key an entry names twice, or a
+/// symbol two entries name, `Unreadable`.
+pub fn symbol_config(body: &[u8], symbol: &[u8]) -> Result<(bool, u64), AssertErr> {
     let mut e = Elems::new(body, 0).map_err(|()| AssertErr::Unreadable)?;
     let mut verdict = Err(AssertErr::Unlisted);
     let mut listed = false;
@@ -216,10 +230,7 @@ pub fn judge_symbol_config(body: &[u8], symbol: &[u8], max_leverage: u8) -> Resu
         }
         listed = true;
         verdict = match (margin, lev) {
-            (Some(b"CROSSED"), Some(0)) => Err(AssertErr::Unreadable),
-            (Some(b"CROSSED"), Some(l)) if l <= u64::from(max_leverage) => Ok(()),
-            (Some(b"CROSSED"), Some(_)) => Err(AssertErr::Leverage),
-            (Some(_), Some(_)) => Err(AssertErr::Isolated),
+            (Some(m), Some(l)) => Ok((m == b"CROSSED", l)),
             _ => Err(AssertErr::Unreadable),
         };
     }

@@ -7,6 +7,10 @@
 //! USDⓈ-M reports one trade twice — `TRADE_LITE` (lower latency, no
 //! commission) and inside `ORDER_TRADE_UPDATE` — and the gateway books the
 //! first and drops the second on (row, trade id) ([`crate::oot::TidRing`]).
+//! The commission rides only the update (`n`, its asset `N`): the gateway
+//! journals it once per trade, whichever report booked the fill (BX11,
+//! `crate::journal::J_FEE`). A `TRADE_LITE` naming one is read past: its
+//! commission reads 0 and its asset empty.
 //!
 //! [`scan_user_event`] reads one frame in place into a [`UserEvent`] (spans
 //! into the frame, integers ×1e6; no allocation). Fail closed (BX-15): a
@@ -25,7 +29,7 @@
 use core_types::Side;
 
 use crate::inst::{PRODUCT_COINM, PRODUCT_USDM};
-use crate::json::{dec_1e6, str_of, u64_of, Elems, Pairs};
+use crate::json::{dec_1e6, dec_1e9, str_of, u64_of, Elems, Pairs};
 
 /// `ORDER_TRADE_UPDATE`.
 pub const UE_ORDER: u8 = 1;
@@ -173,8 +177,10 @@ pub struct UserEvent {
     /// `p`: the order's price ×1e6 (`riskLevelChange`: `eq`, the account
     /// equity, USD ×1e6).
     pub px_1e6: i64,
-    /// `n`: the commission ×1e6 (0 on `TRADE_LITE`).
-    pub commission_1e6: i64,
+    /// `n`: the commission ×1e9, in its asset [`Self::fee_asset`] (BX11:
+    /// ×1e9 — COIN-M charges it in the coin, 8 decimals); 0 when absent
+    /// (`TRADE_LITE`, an update without a trade).
+    pub commission_1e9: i64,
     /// `ap`: the order's average fill price ×1e6 (0 when none, and on
     /// `TRADE_LITE`).
     pub avg_px_1e6: i64,
@@ -186,6 +192,8 @@ pub struct UserEvent {
     pub symbol: Span,
     /// `c`: the client order id.
     pub cid: Span,
+    /// `N`: the commission's asset (BX11); empty when absent.
+    pub fee_asset: Span,
     /// `UE_*`.
     pub kind: u8,
     /// `Side` as its `u8`.
@@ -270,6 +278,7 @@ const F_N: u32 = 1 << 12;
 const F_AP: u32 = 1 << 13;
 const F_M: u32 = 1 << 14;
 const F_TT: u32 = 1 << 15;
+const F_FA: u32 = 1 << 16;
 const NEED_ORDER: u32 = F_S | F_C | F_SIDE | F_X | F_ST | F_I | F_L | F_LP | F_Z | F_T | F_Q | F_P;
 const NEED_LITE: u32 = F_S | F_C | F_SIDE | F_I | F_L | F_LP | F_T;
 
@@ -347,8 +356,12 @@ fn order_fields(f: &[u8], obj: usize, out: &mut UserEvent) -> Result<u32, ScanEr
                 F_P
             }
             b"n" => {
-                out.commission_1e6 = dec_1e6(f, a, z).map_err(bad)?;
+                out.commission_1e9 = dec_1e9(f, a, z).map_err(bad)?;
                 F_N
+            }
+            b"N" => {
+                out.fee_asset = Span::of(f, str_of(f, a, z).map_err(bad)?);
+                F_FA
             }
             b"ap" => {
                 out.avg_px_1e6 = dec_1e6(f, a, z).map_err(bad)?;
@@ -475,6 +488,9 @@ pub fn scan_user_event(frame: &[u8], out: &mut UserEvent) -> Result<(), ScanErr>
                 return Err(ScanErr::Missing);
             }
             out.exec = X_TRADE;
+            // The commission is the update's alone (BX11).
+            out.commission_1e9 = 0;
+            out.fee_asset = Span::default();
         }
         b"ACCOUNT_UPDATE" => {
             out.kind = UE_ACCOUNT;
@@ -682,6 +698,7 @@ fn scan_data(frame: &[u8], at: usize, out: &mut UserEvent) -> Result<(), ScanErr
     let r = scan_user_event_flat(inner, out);
     out.symbol.at += at as u32;
     out.cid.at += at as u32;
+    out.fee_asset.at += at as u32;
     if out.positions != 0 {
         out.positions += at as u32;
     }
@@ -803,7 +820,8 @@ mod tests {
         assert_eq!((e.kind, e.exec, e.status, e.side), (UE_ORDER, X_TRADE, S_FILLED, Side::Bid as u8));
         assert_eq!((e.venue_oid, e.trade_id), (8_886_774, 4_242));
         assert_eq!((e.last_qty_1e6, e.last_px_1e6, e.cum_qty_1e6), (12_000, 65_000_100_000, 12_000));
-        assert_eq!((e.qty_1e6, e.px_1e6, e.commission_1e6), (12_000, 65_000_100_000, 312_000));
+        assert_eq!((e.qty_1e6, e.px_1e6, e.commission_1e9), (12_000, 65_000_100_000, 312_000_000));
+        assert_eq!(e.fee_asset.get(OTU), b"USDT");
         assert_eq!(e.symbol.get(OTU), b"BTCUSDT");
         assert_eq!(e.cid.get(OTU), b"mv0000000720000000000000005000000");
         assert_eq!((e.event_ms, e.trade_ms), (1_790_000_000_123, 1_790_000_000_119));
@@ -816,6 +834,10 @@ mod tests {
         assert_eq!((e.kind, e.exec, e.side, e.maker), (UE_TRADE_LITE, X_TRADE, Side::Ask as u8, 1));
         assert_eq!((e.last_qty_1e6, e.last_px_1e6, e.trade_id, e.venue_oid), (5_000, 65_000_200_000, 4_243, 8_886_775));
         assert_eq!(e.cid.get(LITE), b"mvX");
+        // BX11: a lite naming a commission is read past — the update's alone.
+        let named = std::str::from_utf8(LITE).unwrap().replace(r#""t":4243"#, r#""t":4243,"n":"5","N":"BNB""#);
+        scan_user_event(named.as_bytes(), &mut e).unwrap();
+        assert_eq!((e.kind, e.commission_1e9, e.fee_asset.len), (UE_TRADE_LITE, 0, 0));
     }
 
     #[test]
@@ -827,6 +849,9 @@ mod tests {
         let mut e = UserEvent::default();
         scan_user_event(&f, &mut e).unwrap();
         assert_eq!(e.symbol.get(&f), b"BTCUSDT");
+        assert_eq!(e.cid.get(&f), b"mv0000000720000000000000005000000");
+        // BX11 (the parser review's P-1): the commission's asset too.
+        assert_eq!(e.fee_asset.get(&f), b"USDT");
         assert_eq!(e.kind, UE_ORDER);
     }
 

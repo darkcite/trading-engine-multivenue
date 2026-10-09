@@ -1748,6 +1748,16 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         out.health_blocked = u64::from(self.exec_health(slot, now_ns).blocked);
         true
     }
+
+    /// BX11: the Binance arm's report, the arm's alone (the router's words
+    /// for its slot ride `exec_counters`). Cold.
+    fn binance_arm_report(
+        &self,
+        now_ns: NsTs,
+        out: &mut clob_dispatcher::BinanceArmReport,
+    ) -> bool {
+        self.live.binance_arm_report(now_ns, out)
+    }
 }
 
 #[cfg(test)]
@@ -2849,6 +2859,8 @@ mod tests {
         health: core_types::ExecHealth,
         /// XMM XH4f (D11): a gateway arm's slot — its report answers.
         gw_slot: Option<u8>,
+        /// BX11: a Binance arm's `acked` — its report answers.
+        bn_acked: Option<u64>,
     }
 
     /// `clob_dispatcher::HaltSignal` under a short name, so the test
@@ -2917,6 +2929,18 @@ mod tests {
                 health_blocked: u64::from(self.health.blocked),
                 ..clob_dispatcher::GatewayArmReport::default()
             };
+            true
+        }
+        fn binance_arm_report(
+            &self,
+            _now_ns: NsTs,
+            out: &mut clob_dispatcher::BinanceArmReport,
+        ) -> bool {
+            let Some(acked) = self.bn_acked else {
+                return false;
+            };
+            out.present = 1;
+            out.acked = acked;
             true
         }
         fn cancel_all(&mut self) -> Result<(), DispatchError> {
@@ -3049,6 +3073,19 @@ mod tests {
             u64::from(EXEC_BLOCKED_HALTED | EXEC_BLOCKED_BUDGET),
             "the router's halt, merged"
         );
+    }
+
+    /// **BX11 — the Binance arm's report** passes through the router as
+    /// the arm filled it; no Binance arm, no report (and `out` untouched).
+    #[test]
+    fn the_binance_arm_s_report_passes_through_the_router() {
+        let mut d = haltable();
+        let mut r = clob_dispatcher::BinanceArmReport::default();
+        assert!(!d.binance_arm_report(T0, &mut r), "no Binance arm");
+        assert_eq!(r, clob_dispatcher::BinanceArmReport::default(), "untouched");
+        d.live_mut().bn_acked = Some(7);
+        assert!(d.binance_arm_report(T0, &mut r));
+        assert_eq!((r.present, r.acked), (1, 7));
     }
 
     /// **XMM XH4f (D7) — a slot's health**: a live slot's is the router's

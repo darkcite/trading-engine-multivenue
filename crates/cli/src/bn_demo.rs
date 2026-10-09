@@ -7,9 +7,10 @@
 //! ([`crate::bn_battery`]) share.
 //!
 //! * [`demo_config`] — the Demo key (Ed25519, or HMAC by its word) on the
-//!   Demo hosts. Every host the tools dial must be Demo's
+//!   Demo hosts. Every host the probes and the battery dial must be Demo's
 //!   ([`demo_host`], BX-16): no flag points them at mainnet, and they read
 //!   only the `BINANCE_DEMO_*` variables `scripts/exec-smoke.sh` exports.
+//!   (BX11's account tools alone reach mainnet, below.)
 //! * [`Rest`] — one futures product's signed REST client, speaking **the
 //!   gateway's own templates** (`rest::fut_specs` at 0, `rest::ord_specs`
 //!   at [`ORD0`]) and parameter renderers. So a request the probes prove
@@ -29,8 +30,18 @@
 //!   outside the row's domain is refused, never wrapped.
 //! * [`Line`] — one JSON line on stdout per finding (the exec-smoke law).
 //! * The exit codes `scripts/exec-smoke.sh` names (50–59).
+//! * **BX11 — the account tools' reach** ([`crate::bn_ops`]): the same
+//!   client on the configuration's own network ([`Rest::ops`],
+//!   [`Public::ops`], [`discover_ops`]) — Demo's, or mainnet's when the
+//!   operator chose it — where every change is signed by
+//!   [`Rest::sign_change`], which refuses a mainnet host without the
+//!   operator's sealed word (`MainnetVerb`); and on a mainnet host the
+//!   client sends no request that changes anything (a template not a GET)
+//!   unless it was signed so, whatever path rendered it. The probes and the
+//!   battery keep the Demo-only constructors.
 //!
-//! COPY-DOCTRINE: operator tools run by hand against Binance Demo, never
+//! COPY-DOCTRINE: operator tools run by hand — against Binance Demo, and
+//! the account tools against mainnet by the operator's word — never
 //! reachable from the engine loop: they allocate and copy freely (answers,
 //! frames, reports).
 
@@ -39,13 +50,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use core_net::{HttpsPost, Method, Params, ReqSpec, WsCfg, WsConn, WsNext, WsProgress, REQ_USER_AGENT};
-use exec_binance::config::{network_of, BnConfig, Network, Scope, Signer, HTTPS_PORT};
-use exec_binance::inst::{BnInstCold, BnInstHot, INST_INVERSE, PRODUCT_COINM};
+use core_types::{make_symbol_id, VenueId, SYMBOL_ID_NONE};
+use exec_binance::config::{network_of, BnConfig, MainnetVerb, Network, Scope, Signer, HTTPS_PORT};
+use exec_binance::inst::{
+    BindSpec, BnInstCold, BnInstHot, InstTable, WireTable, INST_INVERSE, PRODUCT_COINM, PRODUCT_USDM,
+};
 use exec_binance::num::{ceil_to, floor_to};
 use exec_binance::recon::{scan_cm_account, scan_um_account, PosRow};
 use exec_binance::rest::{
-    fut_specs, ord_specs, render_account, sapi_specs, scan_mark, scan_orders, scan_server_time, scan_touch, OrderRow,
-    QueryWriter, FUT_TEMPLATES, KEY_HEADER, ORD_TEMPLATES, R_ACCOUNT, T_OPEN_ORDERS, T_TIME,
+    fut_specs, ord_specs, render_account, sapi_specs, scan_mark, scan_orders, scan_server_time, scan_touch, setup_specs,
+    OrderRow, QueryWriter, FUT_TEMPLATES, KEY_HEADER, ORD_TEMPLATES, R_ACCOUNT, SETUP_TEMPLATES, T_OPEN_ORDERS, T_TIME,
 };
 use exec_binance::userstream::ScanErr;
 use exec_binance::wsapi::{scan_rest_answer, WsAnswer};
@@ -76,6 +90,11 @@ pub(crate) const EXIT_LEFTOVER: u8 = 58;
 /// A probe failed: an arming-precondition probe was refused, or a probe
 /// could not run.
 pub(crate) const EXIT_PROBE: u8 = 59;
+/// BX11: the battery's gap drill — once the gateway is dead, the venue's
+/// dead-man was not seen to cancel the makers: none within the countdown
+/// and its margin, or a maker filled instead (the account tools' codes,
+/// 60–64, are `bn_ops`'). A failure before the kill is the cycle's (52).
+pub(crate) const EXIT_DRILL: u8 = 65;
 
 /// `recvWindow` on every signed request (the venue's default; the engine's
 /// `BN_RECV_WINDOW_MAX_MS`).
@@ -119,6 +138,26 @@ pub(crate) fn demo_host(host: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("`{host}` is not a Demo host — these tools dial Demo only (BX-16)"))
+    }
+}
+
+/// An id the arm owns or sweeps: `cid::classify` reads it as this boot's
+/// or as an orphan of an earlier one (the battery's account check, the
+/// flatten's refusal).
+pub(crate) fn is_arms(cid: &str) -> bool {
+    matches!(
+        exec_binance::cid::classify(cid.as_bytes(), 0),
+        exec_binance::cid::CidClass::Ours { .. } | exec_binance::cid::CidClass::Orphan { .. }
+    )
+}
+
+/// BX11: `host` is on `cfg`'s own network — Demo's, or mainnet's when the
+/// operator chose it (the account tools) — or the refusal that names it.
+fn scope_host(host: &str, cfg: &BnConfig) -> Result<(), String> {
+    if network_of(host) == cfg.scope().network() {
+        Ok(())
+    } else {
+        Err(format!("`{host}` is not on the configuration's network"))
     }
 }
 
@@ -239,15 +278,83 @@ fn push_json_str(out: &mut String, v: &str) {
 }
 
 // -------------------------------------------------------------------------
+// The rows
+// -------------------------------------------------------------------------
+
+/// **Instrument rows bound as the arm binds them** (its tick, step,
+/// minimums, decimals and band) — the probes' and the account tools'.
+pub(crate) struct Rows {
+    table: InstTable,
+    wire: WireTable,
+    /// The next engine ordinal: USDⓈ-M's block (513–), COIN-M's (3073–).
+    next_um: u32,
+    next_cm: u32,
+}
+
+impl Rows {
+    pub(crate) fn new() -> Self {
+        let (table, wire) = InstTable::new(SYMBOL_ID_NONE);
+        Self { table, wire, next_um: 513, next_cm: 3_073 }
+    }
+
+    /// Bind `symbol` of `product` from its discovery row; `None` when the
+    /// venue lists no such row or the table refuses it.
+    pub(crate) fn bind(&mut self, d: &BnDiscovery, product: u8, symbol: &[u8]) -> Option<u16> {
+        let row = d.find(symbol)?;
+        let next = if product == PRODUCT_COINM { &mut self.next_cm } else { &mut self.next_um };
+        let ord = *next;
+        *next += 1;
+        let spec = BindSpec {
+            sym: make_symbol_id(VenueId::Binance, ord),
+            product,
+            row,
+            owned: true,
+            maker_ok: product == PRODUCT_USDM,
+        };
+        self.table.bind(&mut self.wire, &spec).ok()
+    }
+
+    pub(crate) fn hot(&self, row: u16) -> &BnInstHot {
+        self.table.hot(row)
+    }
+
+    /// The row's PERCENT_PRICE band (a touch is judged against it).
+    pub(crate) fn cold(&self, row: u16) -> &BnInstCold {
+        self.table.cold(row)
+    }
+}
+
+// -------------------------------------------------------------------------
 // The signed REST client
 // -------------------------------------------------------------------------
 
 /// The gateway's order-route templates start here (`rest::ord_specs`;
 /// `rest::fut_specs` are at 0).
 pub(crate) const ORD0: usize = FUT_TEMPLATES;
+/// BX11: the account tools' changes start here (`rest::setup_specs`:
+/// `U_DUAL` … `U_STOCK_CONTRACT`), signed by [`Rest::sign_change`].
+pub(crate) const SET0: usize = ORD0 + ORD_TEMPLATES;
 /// `GET /fapi/v1/apiTradingStatus` (K5) — USDⓈ-M only: dapi has none, and a
 /// COIN-M client is built without it.
-pub(crate) const X_TRADING_STATUS: usize = ORD0 + ORD_TEMPLATES;
+pub(crate) const X_TRADING_STATUS: usize = SET0 + SETUP_TEMPLATES;
+
+/// The status word an order answer names (`S_*`), 0 if none.
+#[must_use]
+pub(crate) fn order_status(a: &Answer) -> u8 {
+    order_state(a).0
+}
+
+/// The status word an order answer names (`S_*`, 0 if none) and its
+/// executed quantity ×1e6.
+#[must_use]
+pub(crate) fn order_state(a: &Answer) -> (u8, i64) {
+    let mut ans = WsAnswer::default();
+    if scan_rest_answer(a.status, &a.body, &mut ans).is_ok() {
+        (ans.order_status, ans.executed_1e6)
+    } else {
+        (0, 0)
+    }
+}
 
 /// An answer: the HTTP status and the body.
 pub(crate) struct Answer {
@@ -279,6 +386,69 @@ pub(crate) struct Rest {
     /// The venue clock less the local wall clock, ms ([`Rest::clock`]).
     offset_ms: i64,
     st: WsStatic,
+    /// BX11: what a mainnet host may be sent ([`WordGuard`]).
+    guard: WordGuard,
+}
+
+/// **BX11 — the client's guard** (module docs): on a host off Demo's
+/// network a change — a template not a GET — leaves only as
+/// [`Rest::sign_change`] signed it with the operator's word. A bit per
+/// template: set by `sign_change`, cleared by any other rendering of the
+/// window (`sign`, `plain`), spent by the request that sends it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct WordGuard {
+    /// The host is off Demo's network (the account tools' mainnet reach).
+    live: bool,
+    /// The templates that change something, a bit each ([`write_mask`]).
+    writes: u64,
+    /// The templates whose window holds a change signed with the word.
+    worded: u64,
+}
+
+impl WordGuard {
+    const fn new(live: bool, writes: u64) -> Self {
+        Self { live, writes, worded: 0 }
+    }
+
+    /// Window `t` rendered without the word (`sign`, `plain`).
+    fn rendered(&mut self, t: usize) {
+        if t < 64 {
+            self.worded &= !(1 << t);
+        }
+    }
+
+    /// Window `t` signed with the word (`sign_change`).
+    fn worded(&mut self, t: usize) {
+        if self.live && t < 64 {
+            self.worded |= 1 << t;
+        }
+    }
+
+    /// The request that sends window `t`: `false` (refused, unsent) when it
+    /// would carry a change to a mainnet host without the word — or past
+    /// the guard's 64 templates, anywhere. The word is spent.
+    fn send(&mut self, t: usize) -> bool {
+        if t >= 64 || (self.live && self.writes & (1 << t) != 0 && self.worded & (1 << t) == 0) {
+            return false;
+        }
+        self.worded &= !(1 << t);
+        true
+    }
+}
+
+/// BX11: the templates in `specs` that change something (any method but
+/// GET), a bit each — what a mainnet host is sent only with the operator's
+/// word.
+fn write_mask(specs: &[ReqSpec<'_>]) -> u64 {
+    let mut m = 0u64;
+    let mut i = 0;
+    while i < specs.len() {
+        if !matches!(specs[i].method, Method::Get) {
+            m |= 1 << i;
+        }
+        i += 1;
+    }
+    m
 }
 
 impl Rest {
@@ -287,21 +457,27 @@ impl Rest {
     /// # Errors
     /// The host is not Demo's, or the connection could not be prepared.
     pub(crate) fn new(cfg: &BnConfig, product: u8, tls: Arc<ClientConfig>) -> Result<Self, String> {
+        demo_host(cfg.hosts().lane(product).rest)?;
+        Self::lane(cfg, product, tls)
+    }
+
+    /// **BX11 — the account tools' client**: the product's on `cfg`'s own
+    /// network (Demo's, or mainnet's when the operator chose it). It reads
+    /// freely; it changes only as [`Rest::sign_change`] signs.
+    ///
+    /// # Errors
+    /// The host is not on the configuration's network, or the connection
+    /// could not be prepared.
+    pub(crate) fn ops(cfg: &BnConfig, product: u8, tls: Arc<ClientConfig>) -> Result<Self, String> {
+        scope_host(cfg.hosts().lane(product).rest, cfg)?;
+        Self::lane(cfg, product, tls)
+    }
+
+    /// The product's templates on its REST host ([`lane_specs`]).
+    fn lane(cfg: &BnConfig, product: u8, tls: Arc<ClientConfig>) -> Result<Self, String> {
         let host = cfg.hosts().lane(product).rest;
-        demo_host(host)?;
         let key = [(KEY_HEADER, cfg.api_key())];
-        let mut specs: Vec<ReqSpec<'_>> = Vec::with_capacity(X_TRADING_STATUS + 1);
-        specs.extend_from_slice(&fut_specs(product, false, &key));
-        specs.extend_from_slice(&ord_specs(product, false, &key));
-        if product != PRODUCT_COINM {
-            specs.push(ReqSpec {
-                method: Method::Get,
-                path: "/fapi/v1/apiTradingStatus",
-                params: Params::Query,
-                headers: &key,
-            });
-        }
-        Self::on(host, cfg, tls, &specs, 0)
+        Self::on(host, cfg, tls, &lane_specs(product, &key), 0)
     }
 
     /// **SAPI's client** on `cfg`'s SAPI host — the gateway's own
@@ -318,12 +494,16 @@ impl Rest {
     }
 
     fn on(host: &str, cfg: &BnConfig, tls: Arc<ClientConfig>, specs: &[ReqSpec<'_>], offset_ms: i64) -> Result<Self, String> {
+        if specs.len() > 64 {
+            return Err(format!("{host}: {} templates, past the guard's 64", specs.len()));
+        }
         let http = HttpsPost::with_specs(host, cfg.port(), tls, specs, WIN, RESP)
             .map_err(|e| format!("{host}: the REST client could not be prepared ({e:?})"))?;
         Ok(Self {
             http,
             offset_ms,
             st: WsStatic::new(STP_MODE, RECV_WINDOW_MS),
+            guard: WordGuard::new(network_of(host) != Network::Demo, write_mask(specs)),
         })
     }
 
@@ -359,8 +539,12 @@ impl Rest {
         wall_ms().saturating_add_signed(self.offset_ms)
     }
 
-    /// One request on template `t` whose `len` bytes are in its window.
+    /// One request on template `t` whose `len` bytes are in its window —
+    /// on a mainnet host, a change only as [`Rest::sign_change`] signed it.
     fn call(&mut self, t: usize, len: usize) -> Result<Answer, String> {
+        if !self.guard.send(t) {
+            return Err(format!("{}: a change not signed with the operator's word — refused unsent", self.http.host()));
+        }
         let (status, r) = self
             .http
             .request(t, len)
@@ -379,6 +563,7 @@ impl Rest {
     /// # Errors
     /// The parameters do not fit, or the request failed.
     pub(crate) fn plain(&mut self, t: usize, params: &[u8]) -> Result<Answer, String> {
+        self.guard.rendered(t);
         let w = self.http.window_mut(t);
         if params.len() > w.len() {
             return Err(String::from("the parameters do not fit the template's window"));
@@ -403,6 +588,29 @@ impl Rest {
     ) -> Result<Answer, String> {
         let n = self.sign(t, signer, tamper, render)?;
         self.call(t, n)
+    }
+
+    /// **BX11 — a change signed** (an order, a cancel, an account setting),
+    /// unsent: on a mainnet host only holding the operator's sealed word —
+    /// refused without it — and then marked so that [`Rest::send`] may send
+    /// it. Demo's need none. The rendered length.
+    ///
+    /// # Errors
+    /// A mainnet host and no word, or the request does not fit.
+    pub(crate) fn sign_change(
+        &mut self,
+        t: usize,
+        signer: &Signer,
+        verb: Option<&MainnetVerb>,
+        render: impl FnOnce(&mut QueryWriter<'_>, &WsStatic, u64),
+    ) -> Result<usize, String> {
+        if self.guard.live && verb.is_none() {
+            let why = MainnetVerb::operator_verb(false).err().unwrap_or("unconfirmed");
+            return Err(format!("{}: {why}", self.host()));
+        }
+        let n = self.sign(t, signer, false, render)?;
+        self.guard.worded(t);
+        Ok(n)
     }
 
     /// Send the `n` bytes [`Rest::sign`] rendered into template `t`'s
@@ -430,6 +638,8 @@ impl Rest {
         tamper: bool,
         render: impl FnOnce(&mut QueryWriter<'_>, &WsStatic, u64),
     ) -> Result<usize, String> {
+        // A window signed anew holds no word until `sign_change` gives it.
+        self.guard.rendered(t);
         let ts = self.ts_ms();
         let st = self.st;
         let w = self.http.window_mut(t);
@@ -446,6 +656,25 @@ impl Rest {
         }
         Ok(n)
     }
+}
+
+/// **A futures product's templates** on its REST host: the gateway's
+/// (`fut_specs` at 0, `ord_specs` at [`ORD0`]), the account tools' at
+/// [`SET0`], and USDⓈ-M's trading status at [`X_TRADING_STATUS`].
+fn lane_specs<'a>(product: u8, key: &'a [(&'a str, &'a str)]) -> Vec<ReqSpec<'a>> {
+    let mut specs: Vec<ReqSpec<'a>> = Vec::with_capacity(X_TRADING_STATUS + 1);
+    specs.extend_from_slice(&fut_specs(product, false, key));
+    specs.extend_from_slice(&ord_specs(product, false, key));
+    specs.extend_from_slice(&setup_specs(product, key));
+    if product != PRODUCT_COINM {
+        specs.push(ReqSpec {
+            method: Method::Get,
+            path: "/fapi/v1/apiTradingStatus",
+            params: Params::Query,
+            headers: key,
+        });
+    }
+    specs
 }
 
 /// The signature character the negative control changes: the first
@@ -503,8 +732,22 @@ impl Public {
     /// # Errors
     /// The host is not Demo's, or the connection could not be prepared.
     pub(crate) fn new(cfg: &BnConfig, product: u8, tls: Arc<ClientConfig>) -> Result<Self, String> {
+        demo_host(cfg.hosts().lane(product).rest)?;
+        Self::on(cfg, product, tls)
+    }
+
+    /// BX11: on `cfg`'s own network (the account tools: [`Rest::ops`]).
+    ///
+    /// # Errors
+    /// The host is not on the configuration's network, or the connection
+    /// could not be prepared.
+    pub(crate) fn ops(cfg: &BnConfig, product: u8, tls: Arc<ClientConfig>) -> Result<Self, String> {
+        scope_host(cfg.hosts().lane(product).rest, cfg)?;
+        Self::on(cfg, product, tls)
+    }
+
+    fn on(cfg: &BnConfig, product: u8, tls: Arc<ClientConfig>) -> Result<Self, String> {
         let host = cfg.hosts().lane(product).rest;
-        demo_host(host)?;
         let (book, mark) = if product == PRODUCT_COINM {
             ("/dapi/v1/ticker/bookTicker", "/dapi/v1/premiumIndex")
         } else {
@@ -588,8 +831,22 @@ fn in_band(bid: i64, ask: i64, mark: i64, band: &BnInstCold) -> Result<(), Strin
 /// # Errors
 /// The read failed or the page did not parse.
 pub(crate) fn discover(cfg: &BnConfig, product: u8, tls: &Arc<ClientConfig>) -> Result<BnDiscovery, String> {
+    demo_host(cfg.hosts().lane(product).rest)?;
+    discover_on(cfg, product, tls)
+}
+
+/// BX11: [`discover`] on `cfg`'s own network (the account tools).
+///
+/// # Errors
+/// The host is not on the configuration's network, the read failed or the
+/// page did not parse.
+pub(crate) fn discover_ops(cfg: &BnConfig, product: u8, tls: &Arc<ClientConfig>) -> Result<BnDiscovery, String> {
+    scope_host(cfg.hosts().lane(product).rest, cfg)?;
+    discover_on(cfg, product, tls)
+}
+
+fn discover_on(cfg: &BnConfig, product: u8, tls: &Arc<ClientConfig>) -> Result<BnDiscovery, String> {
     let host = cfg.hosts().lane(product).rest;
-    demo_host(host)?;
     let path = if product == PRODUCT_COINM {
         "/dapi/v1/exchangeInfo"
     } else {
@@ -999,6 +1256,61 @@ mod tests {
             [EXIT_ACCOUNT, EXIT_BOOT, EXIT_CYCLE, EXIT_POST_ONLY, EXIT_TTL, EXIT_SWEEP, EXIT_RECON, EXIT_FILLS, EXIT_LEFTOVER, EXIT_PROBE],
             [50, 51, 52, 53, 54, 55, 56, 57, 58, 59]
         );
+    }
+
+    /// BX11 (the risk review's R1-5): on a mainnet host the client sends a
+    /// change — any template not a GET — only signed with the operator's
+    /// word ([`Rest::sign_change`]); reads go freely; Demo's are unguarded;
+    /// the mask marks exactly the changes, on both products.
+    #[test]
+    fn a_mainnet_host_sends_no_change_without_the_word() {
+        use exec_binance::rest::{
+            R_CANCEL, R_MODIFY, R_PLACE, R_STATUS, T_ACCOUNT, T_CANCEL_ALL, T_COUNTDOWN, T_DUAL, T_LISTEN_KEY_KEEP,
+            T_LISTEN_KEY_NEW, T_MULTI_ASSETS, T_SYMBOL_CONFIG, T_TIME, T_USER_TRADES, U_DUAL, U_LEVERAGE,
+            U_MARGIN_TYPE, U_MULTI_ASSETS, U_STOCK_CONTRACT,
+        };
+        let key = [(KEY_HEADER, "k")];
+        let changes = [
+            T_LISTEN_KEY_NEW,
+            T_LISTEN_KEY_KEEP,
+            T_COUNTDOWN,
+            T_CANCEL_ALL,
+            ORD0 + R_PLACE,
+            ORD0 + R_CANCEL,
+            ORD0 + R_MODIFY,
+            SET0 + U_DUAL,
+            SET0 + U_MULTI_ASSETS,
+            SET0 + U_MARGIN_TYPE,
+            SET0 + U_LEVERAGE,
+            SET0 + U_STOCK_CONTRACT,
+        ];
+        let reads = [T_TIME, T_OPEN_ORDERS, T_USER_TRADES, T_DUAL, T_MULTI_ASSETS, T_ACCOUNT, T_SYMBOL_CONFIG, ORD0 + R_STATUS, ORD0 + R_ACCOUNT];
+        for product in [PRODUCT_USDM, PRODUCT_COINM] {
+            let specs = lane_specs(product, &key);
+            let w = write_mask(&specs);
+            assert_eq!(w.count_ones() as usize, changes.len(), "product {product}: the changes, and nothing else");
+            for t in changes {
+                assert!(w & (1 << t) != 0, "product {product}: template {t} is a change");
+                let mut g = WordGuard::new(true, w);
+                assert!(!g.send(t), "mainnet, no word: refused");
+                g.worded(t);
+                assert!(g.send(t), "mainnet, the word: sent");
+                assert!(!g.send(t), "the word is spent by the request that carried it");
+                // The risk review's R2-6: a window rendered again without
+                // the word — `sign`, or `plain` — holds none.
+                g.worded(t);
+                g.rendered(t);
+                assert!(!g.send(t), "re-rendered without the word: refused");
+                let mut demo = WordGuard::new(false, w);
+                assert!(demo.send(t), "Demo: unguarded");
+                demo.worded(t);
+                assert_eq!(demo.worded, 0, "Demo holds no word");
+            }
+            for t in reads {
+                assert!(WordGuard::new(true, w).send(t), "product {product}: a read ({t}) goes freely");
+            }
+        }
+        assert!(!WordGuard::new(false, 0).send(64), "past the guard's templates: refused anywhere");
     }
 
     #[test]

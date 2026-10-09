@@ -324,6 +324,16 @@ impl<A: OrderDispatch, B: OrderDispatch> OrderDispatch for SlotSplit<A, B> {
     ) -> bool {
         self.b.gateway_arm_report(now_ns, out) || self.a.gateway_arm_report(now_ns, out)
     }
+
+    /// BX11: the Binance arm's report, from whichever arm holds one — the
+    /// split slot's first.
+    fn binance_arm_report(
+        &self,
+        now_ns: NsTs,
+        out: &mut clob_dispatcher::BinanceArmReport,
+    ) -> bool {
+        self.b.binance_arm_report(now_ns, out) || self.a.binance_arm_report(now_ns, out)
+    }
 }
 
 #[cfg(test)]
@@ -348,6 +358,8 @@ mod tests {
         health: core_types::ExecHealth,
         /// A gateway arm's `pushed` (0 = no gateway arm).
         gw: u64,
+        /// A Binance arm's `acked` (0 = no Binance arm).
+        bn: u64,
     }
 
     impl OrderDispatch for Arm {
@@ -388,6 +400,18 @@ mod tests {
             }
             out.present = 1;
             out.pushed = self.gw;
+            true
+        }
+        fn binance_arm_report(
+            &self,
+            _now_ns: NsTs,
+            out: &mut clob_dispatcher::BinanceArmReport,
+        ) -> bool {
+            if self.bn == 0 {
+                return false;
+            }
+            out.present = 1;
+            out.acked = self.bn;
             true
         }
         fn stats(&self) -> DispatchStats {
@@ -488,6 +512,21 @@ mod tests {
         s.b_mut().gw = 6;
         assert!(s.gateway_arm_report(1, &mut r));
         assert_eq!(r.pushed, 6, "the split slot's arm first");
+    }
+
+    /// BX11: the Binance arm's report from whichever arm holds one — the
+    /// split slot's first.
+    #[test]
+    fn the_binance_arm_s_report_comes_from_the_arm_that_holds_one() {
+        let mut s = split();
+        let mut r = clob_dispatcher::BinanceArmReport::default();
+        assert!(!s.binance_arm_report(1, &mut r), "neither arm holds one");
+        s.a_mut().bn = 3;
+        assert!(s.binance_arm_report(1, &mut r));
+        assert_eq!(r.acked, 3);
+        s.b_mut().bn = 6;
+        assert!(s.binance_arm_report(1, &mut r));
+        assert_eq!(r.acked, 6, "the split slot's arm first");
     }
 
     #[test]

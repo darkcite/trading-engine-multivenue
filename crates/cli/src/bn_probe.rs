@@ -52,11 +52,9 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use core_types::{make_symbol_id, Side, VenueId, SYMBOL_ID_NONE};
+use core_types::Side;
 use exec_binance::config::{BnConfig, Signer};
-use exec_binance::inst::{
-    BindSpec, BnInstCold, BnInstHot, InstTable, WireTable, INST_LIVE, PRODUCT_COINM, PRODUCT_USDM,
-};
+use exec_binance::inst::{BnInstHot, INST_LIVE, PRODUCT_COINM, PRODUCT_USDM};
 use exec_binance::json::{dec_1e6, field, str_of, Elems, Pairs};
 use exec_binance::mode::{judge_mode, judge_one_way, judge_single_asset, judge_symbol_config, AccountMode};
 use exec_binance::rest::{
@@ -65,14 +63,14 @@ use exec_binance::rest::{
     T_SYMBOL_CONFIG,
 };
 use exec_binance::userstream::{scan_user_event, UserEvent, S_CANCELED, S_EXPIRED, UE_ORDER};
-use exec_binance::wsapi::{queue_logon, scan_answer, scan_rest_answer, Part, Place, WsAnswer, WsStatic};
-use ingress_binance::discovery::BnDiscovery;
+use exec_binance::wsapi::{queue_logon, scan_answer, Part, Place, WsAnswer, WsStatic};
 use rustls::ClientConfig;
 use tracing::{error, info, warn};
 
 use crate::bn_demo::{
-    demo_config, discover, notional_1e6, open_orders, product_word, px_off, qty_for, read_account, wall_ms, Account,
-    Answer, Line, Public, Rest, Ws, EXIT_LEFTOVER, EXIT_PROBE, ORD0, X_TRADING_STATUS,
+    demo_config, discover, notional_1e6, open_orders, order_status, product_word, px_off, qty_for, read_account,
+    wall_ms, Account, Answer, Line, Public, Rest, Rows, Ws, EXIT_LEFTOVER, EXIT_PROBE, ORD0,
+    X_TRADING_STATUS,
 };
 
 /// The probe's client-id prefix: `cid::classify` reads it foreign.
@@ -144,51 +142,8 @@ fn word(a: &Answer) -> String {
 }
 
 // -------------------------------------------------------------------------
-// The rows and the ids
+// The ids
 // -------------------------------------------------------------------------
-
-/// The probe's instrument rows, bound as the arm binds (its tick, step,
-/// minimums and decimals).
-struct Rows {
-    table: InstTable,
-    wire: WireTable,
-    /// The next engine ordinal: USDⓈ-M's block (513–), COIN-M's (3073–).
-    next_um: u32,
-    next_cm: u32,
-}
-
-impl Rows {
-    fn new() -> Self {
-        let (table, wire) = InstTable::new(SYMBOL_ID_NONE);
-        Self { table, wire, next_um: 513, next_cm: 3_073 }
-    }
-
-    /// Bind `symbol` of `product` from its discovery row; `None` when the
-    /// venue lists no such row or the table refuses it.
-    fn bind(&mut self, d: &BnDiscovery, product: u8, symbol: &[u8]) -> Option<u16> {
-        let row = d.find(symbol)?;
-        let next = if product == PRODUCT_COINM { &mut self.next_cm } else { &mut self.next_um };
-        let ord = *next;
-        *next += 1;
-        let spec = BindSpec {
-            sym: make_symbol_id(VenueId::Binance, ord),
-            product,
-            row,
-            owned: true,
-            maker_ok: product == PRODUCT_USDM,
-        };
-        self.table.bind(&mut self.wire, &spec).ok()
-    }
-
-    fn hot(&self, row: u16) -> &BnInstHot {
-        self.table.hot(row)
-    }
-
-    /// The row's PERCENT_PRICE band (a touch is judged against it).
-    fn cold(&self, row: u16) -> &BnInstCold {
-        self.table.cold(row)
-    }
-}
 
 /// The probe's client ids: `bxprobe<unix s>x<n>` (≤ 36 characters, the
 /// futures pattern).
@@ -702,16 +657,6 @@ fn cancel(rest: &mut Rest, signer: &Signer, symbol: &[u8], cid: &str, tamper: bo
     rest.signed(ORD0 + R_CANCEL, signer, tamper, |w, st, ts| render_by_cid(w, st, symbol, Part::Lit(cid.as_bytes()), ts))
 }
 
-/// The status word an order answer names (`S_*`), 0 if none.
-fn order_status(a: &Answer) -> u8 {
-    let mut ans = WsAnswer::default();
-    if scan_rest_answer(a.status, &a.body, &mut ans).is_ok() {
-        ans.order_status
-    } else {
-        0
-    }
-}
-
 /// The client ids the venue lists open on `symbol`.
 fn open_ids(rest: &mut Rest, signer: &Signer, symbol: &[u8]) -> Result<Vec<String>, String> {
     Ok(open_orders(rest, signer, Some(symbol))?.into_iter().map(|o| o.cid).collect())
@@ -1106,6 +1051,7 @@ fn sweep_symbol(rest: &mut Rest, signer: &Signer, symbol: &[u8], r: &mut Report)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ingress_binance::discovery::BnDiscovery;
 
     #[test]
     fn the_probes_ids_are_foreign_to_the_arm_and_fit_the_futures_pattern() {

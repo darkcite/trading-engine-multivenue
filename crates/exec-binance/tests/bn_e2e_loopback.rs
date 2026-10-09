@@ -10,6 +10,9 @@
 //! |---|---|
 //! | boot | the clock (4 × `/fapi/v1/time`) → the four BX-19 assertions → the listenKey → `session.logon` (Ed25519, verified by `ring` against the seed's public key) → the user stream on `/ws/<key>` → the first reconciliation sweeps the last epoch's orphan (BX-9) and counts a stranger's order foreign → the day's spend (obligation 8) → ready; the router seeds the slot and adopts the venue's day |
 //! | IoC fill | TRADE_LITE, ORDER_TRADE_UPDATE and a replayed duplicate book ONE fill, carrying the engine id (the anchor alias, obligation 7), the client id and the slot; the retirement never overtakes it (obligation 1) |
+//! | BX11 drill: the gateway dies | makers rest under the venue's dead-man; the gateway thread stops without its sweep: the slot halts `WsGap` at its `ws_gap_ms`, and the venue's countdown — renewed no more — fires and cancels them (the BX13 R0 bar, on the loopback) |
+//! | BX11 drill: reconciliation withheld | a classic arm whose cycle cannot read the open orders: the cycles fail and the slot halts `ReconStale` at its `recon_stale_ms` |
+//! | a trade's commission (BX11) | journaled ONCE (`J_FEE`: price, notional, commission ×1e9, the maker bit, the asset to the row, whose order, the product) whether `TRADE_LITE` or the update booked the fill, never for a replayed update; a fill carries none; a lost stream's late update still journals it; COIN-M's in the coin |
 //! | member cancel | a venue-refused cancel leaves the row counted; the confirmed `CANCELED` releases it — never the cancel's `Ok` (obligation 2) |
 //! | modify → TTL | the rename lands on the venue's confirmation; the TTL cancel retires the NEW id as `CANCELED_TTL` |
 //! | partial IoC | one fill, then `EXPIRED` |
@@ -69,7 +72,8 @@ use exec_binance::gateway::{
 };
 use exec_binance::inst::{BindSpec, InstTable, PRODUCT_COINM, PRODUCT_USDM};
 use exec_binance::journal::{
-    JournalTx, JOURNAL_RING, J_ACK, J_ANCHOR, J_ENDED, J_FILL, J_FILL_ADOPTED, J_RECON, J_REJECT, J_SWEEP, J_VENUE,
+    fee_fields, JournalTx, FEE_ASSET_SETTLE, JOURNAL_RING, J_ACK, J_ANCHOR, J_ENDED, J_FEE, J_FILL, J_FILL_ADOPTED, J_FILL_UNSEEN,
+    J_RECON, J_REJECT, J_SWEEP, J_VENUE, TRADE_BY_ADL, TRADE_BY_LIQUIDATION, TRADE_BY_MEMBER, TRADE_BY_ORPHAN, TRADE_BY_SETTLEMENT,
 };
 use exec_binance::margin::{MarginBook, SLOTS};
 use exec_binance::mode::{AccountMode, AssertErr};
@@ -140,6 +144,20 @@ fn d6(s: &str) -> i64 {
         -v
     } else {
         v
+    }
+}
+
+/// The scripted venue's commission ×1e8 (its 8 decimals): 5 bp of the
+/// trade — on USDⓈ-M in USDT (quantity × price), on COIN-M in the coin
+/// (contracts × face ÷ price).
+fn venue_fee_1e8(cm: bool, last: i64, last_px: i64) -> i64 {
+    if cm {
+        if last_px == 0 {
+            return 0;
+        }
+        (last as i128 * CM_FACE_1E6 as i128 * 5 / (last_px as i128 * 100)) as i64
+    } else {
+        (last as i128 * last_px as i128 * 5 / 100_000_000) as i64
     }
 }
 
@@ -320,19 +338,21 @@ impl VOrder {
         )
     }
 
+    /// A resting maker's trade (post-only: `GTX`).
+    fn maker(&self) -> bool {
+        self.tif == "GTX"
+    }
+
     /// `ORDER_TRADE_UPDATE` (`x`, `X`; the last trade if any).
     fn update(&self, x: &str, last: i64, last_px: i64, tid: u64) -> Vec<u8> {
         let now = now_ms();
-        // 5 bp of the trade: USDT on USDⓈ-M; on COIN-M the margin asset's
-        // (contracts × face / price, in BTC).
-        let (fee, asset, ma) = if self.cm {
-            let btc = if last_px == 0 { 0 } else { (last as i128 * CM_FACE_1E6 as i128 / last_px as i128 * 5 / 10_000) as i64 };
-            (btc, "BTC", r#","ma":"BTC""#)
-        } else {
-            ((last as i128 * last_px as i128 / 1_000_000 * 5 / 10_000) as i64, "USDT", "")
-        };
+        // 5 bp of the trade ([`venue_fee_1e8`]): USDT on USDⓈ-M; on COIN-M
+        // the margin asset's, BTC.
+        let fee = venue_fee_1e8(self.cm, last, last_px);
+        let (asset, ma) = if self.cm { ("BTC", r#","ma":"BTC""#) } else { ("USDT", "") };
+        let m = self.maker();
         format!(
-            r#"{{"e":"ORDER_TRADE_UPDATE","E":{now},"T":{now},"o":{{"s":"{}","c":"{}","S":"{}","o":"LIMIT","f":"{}","q":"{}","p":"{}","ap":"{}","sp":"0","x":"{x}","X":"{}","i":{},"l":"{}","z":"{}","L":"{}"{ma},"N":"{asset}","n":"{}00","T":{now},"t":{tid},"b":"0","a":"0","m":false,"R":false,"wt":"CONTRACT_PRICE","ot":"LIMIT","ps":"BOTH","cp":false,"rp":"0","pP":false,"si":0,"ss":0,"V":"EXPIRE_MAKER","pm":"NONE","gtd":0}}}}"#,
+            r#"{{"e":"ORDER_TRADE_UPDATE","E":{now},"T":{now},"o":{{"s":"{}","c":"{}","S":"{}","o":"LIMIT","f":"{}","q":"{}","p":"{}","ap":"{}","sp":"0","x":"{x}","X":"{}","i":{},"l":"{}","z":"{}","L":"{}"{ma},"N":"{asset}","n":"{}.{:08}","T":{now},"t":{tid},"b":"0","a":"0","m":{m},"R":false,"wt":"CONTRACT_PRICE","ot":"LIMIT","ps":"BOTH","cp":false,"rp":"0","pP":false,"si":0,"ss":0,"V":"EXPIRE_MAKER","pm":"NONE","gtd":0}}}}"#,
             self.symbol(),
             self.cid,
             self.side(),
@@ -345,7 +365,8 @@ impl VOrder {
             fx(last, self.qd()),
             fx(self.executed, self.qd()),
             fx(last_px, 1),
-            fx(fee, 6),
+            fee / 100_000_000,
+            fee % 100_000_000,
         )
         .into_bytes()
     }
@@ -353,8 +374,9 @@ impl VOrder {
     /// `TRADE_LITE`.
     fn lite(&self, last: i64, last_px: i64, tid: u64) -> Vec<u8> {
         let now = now_ms();
+        let m = self.maker();
         format!(
-            r#"{{"e":"TRADE_LITE","E":{now},"T":{now},"s":"BTCUSDT","q":"{}","p":"{}","m":false,"c":"{}","S":"{}","L":"{}","l":"{}","t":{tid},"i":{}}}"#,
+            r#"{{"e":"TRADE_LITE","E":{now},"T":{now},"s":"BTCUSDT","q":"{}","p":"{}","m":{m},"c":"{}","S":"{}","L":"{}","l":"{}","t":{tid},"i":{}}}"#,
             fx(self.qty, 3),
             fx(self.px, 1),
             self.cid,
@@ -443,6 +465,17 @@ struct VState {
     /// User events are LOST (kept in `lost`, never sent): the stream is
     /// "down" as far as the venue's events go.
     lose_user: bool,
+    /// BX11: an IoC's `TRADE_LITE` follows its update (the venue's usual
+    /// order is the lite first).
+    lite_after: bool,
+    /// BX11: the venue's dead-man — `countdownCancelAll` arms it (`0`
+    /// clears it); at its end every open USDⓈ-M order is cancelled, as the
+    /// venue does — and how often it fired.
+    countdown_at: Option<Instant>,
+    countdown_fired: u32,
+    /// BX11: the classic open-order listings answer 500 (reconciliation
+    /// withheld).
+    recon_down: bool,
     lost: Vec<Vec<u8>>,
     /// Close the user stream's connection once (it reconnects).
     drop_user: bool,
@@ -581,6 +614,10 @@ impl VState {
             ioc_plan: VecDeque::new(),
             refuse_cancel: None,
             lose_user: false,
+            lite_after: false,
+            countdown_at: None,
+            countdown_fired: 0,
+            recon_down: false,
             lost: Vec::new(),
             drop_user: false,
             ws_down: false,
@@ -632,6 +669,26 @@ impl VState {
             .is_some_and(|t| t.abs_diff(now_ms()) < 1_000);
         if !fresh {
             self.bad_ts += 1;
+        }
+    }
+
+    /// BX11: the venue's dead-man at its end (the acceptor's tick): every
+    /// open USDⓈ-M order cancelled, its update sent.
+    fn tick(&mut self) {
+        let Some(at) = self.countdown_at else {
+            return;
+        };
+        if Instant::now() < at {
+            return;
+        }
+        self.countdown_at = None;
+        self.countdown_fired += 1;
+        for i in 0..self.orders.len() {
+            if self.orders[i].open() && !self.orders[i].cm {
+                self.orders[i].status = "CANCELED";
+                let o = self.orders[i].clone();
+                self.emit(false, o.update("CANCELED", 0, 0, 0));
+            }
         }
     }
 
@@ -826,6 +883,8 @@ impl VState {
                 let sym = qparam(params, "symbol").unwrap_or("");
                 let ct = qparam(params, "countdownTime").unwrap_or("");
                 self.countdown_times.push(ct.parse().unwrap_or(u64::MAX));
+                let ms = ct.parse::<u64>().unwrap_or(0);
+                self.countdown_at = (ms > 0).then(|| Instant::now() + Duration::from_millis(ms));
                 (200, format!(r#"{{"symbol":"{sym}","countdownTime":"{ct}"}}"#))
             }
             ("DELETE", "/fapi/v1/allOpenOrders") | ("DELETE", "/dapi/v1/allOpenOrders") => {
@@ -851,6 +910,10 @@ impl VState {
             | ("PUT", "/dapi/v1/order")
             | ("GET", "/dapi/v1/order")
             | ("GET", "/dapi/v1/account") => self.rest_order(method, path, params),
+            ("GET", "/fapi/v1/openOrders") if self.recon_down => (
+                500,
+                String::from(r#"{"code":-1001,"msg":"Internal error; unable to process your request. Please try again."}"#),
+            ),
             ("GET", "/fapi/v1/openOrders") | ("GET", "/dapi/v1/openOrders") => {
                 let cm = path.starts_with("/dapi/");
                 let rows: Vec<String> = self.orders.iter().filter(|o| o.open() && o.cm == cm).map(VOrder::result).collect();
@@ -1048,14 +1111,21 @@ impl VState {
                         o.avg = px;
                         o.status = if fill == o.qty { "FILLED" } else { "PARTIALLY_FILLED" };
                         self.book(&o.clone(), fill);
-                        if !cm {
-                            let lite = o.lite(fill, px, tid);
-                            self.emit(false, lite);
+                        let lite = (!cm).then(|| o.lite(fill, px, tid));
+                        if !self.lite_after {
+                            if let Some(l) = lite.clone() {
+                                self.emit(false, l);
+                            }
                         }
                         let u = o.update("TRADE", fill, px, tid);
                         self.emit(cm, u.clone());
                         // A replayed duplicate: the trade-id ring's work.
                         self.emit(cm, u);
+                        if self.lite_after {
+                            if let Some(l) = lite {
+                                self.emit(false, l);
+                            }
+                        }
                     }
                     if o.executed < o.qty {
                         o.status = "EXPIRED";
@@ -1547,6 +1617,8 @@ impl Venue {
                             thread::spawn(move || serve(sock, cfg, st, stop));
                         }
                     }
+                    // BX11: the venue's clock — its dead-man fires on time.
+                    st2.lock().expect("venue").tick();
                     if !any {
                         thread::sleep(Duration::from_millis(2));
                     }
@@ -1689,6 +1761,8 @@ struct Opts {
     boot_timeout_ms: u64,
     /// BX7b: the configuration is `Scope::Demo` (the battery's).
     demo: bool,
+    /// BX11: the dead-man's countdown (production: 30 s).
+    countdown_ms: u64,
 }
 
 impl Opts {
@@ -1706,35 +1780,37 @@ impl Opts {
             dust: false,
             boot_timeout_ms: 15_000,
             demo: false,
+            countdown_ms: 30_000,
         }
     }
 }
 
 /// The gateway half of the rig, booted on the test's thread.
-struct Booted {
+struct Booted<const J: usize = JOURNAL_RING> {
     /// The key material, kept alive for as long as anything signs.
     cfg: BnConfig,
     table: InstTable,
-    gw: BnGateway<FILL_N>,
+    gw: BnGateway<FILL_N, J>,
     eng_end: BnEngineEnd,
     fill_rx: Consumer<Fill, FILL_N>,
-    journal: Consumer<ExecRecord, JOURNAL_RING>,
+    journal: Consumer<ExecRecord, J>,
 }
 
 /// A refused boot, and what it left in the journal and on lane 4 (BX7,
 /// N5).
-struct Refused {
+struct Refused<const J: usize = JOURNAL_RING> {
     err: BootErr,
-    journal: Consumer<ExecRecord, JOURNAL_RING>,
+    journal: Consumer<ExecRecord, J>,
     fills: Consumer<Fill, FILL_N>,
 }
 
-/// The booted arm: the engine side, the gateway thread and the journal.
-struct Rig {
+/// The booted arm: the engine side, the gateway thread and the journal (a
+/// ring of `J` records: the engine's, or BX11's small one).
+struct Rig<const J: usize = JOURNAL_RING> {
     e: Engine,
     gw_thread: thread::JoinHandle<Phase>,
     stop: Arc<AtomicBool>,
-    journal: Consumer<ExecRecord, JOURNAL_RING>,
+    journal: Consumer<ExecRecord, J>,
 }
 
 impl Rig {
@@ -1786,9 +1862,21 @@ impl Rig {
         Self::boot_traced(venue, o).map_err(|r| r.err)
     }
 
-    /// [`Rig::boot_gateway`], a refusal keeping what the refused boot left
-    /// in the journal and on lane 4.
+    /// [`Rig::boot_traced_n`] on the engine's journal ring.
     fn boot_traced(venue: &Venue, o: Opts) -> Result<Booted, Refused> {
+        Self::boot_traced_n(venue, o)
+    }
+
+    /// [`Rig::boot_full_n`] on the engine's journal ring.
+    fn boot_full(venue: &Venue, o: Opts) -> Self {
+        Self::boot_full_n(venue, o)
+    }
+}
+
+impl<const J: usize> Rig<J> {
+    /// [`Rig::boot_gateway`], a refusal keeping what the refused boot left
+    /// in the journal and on lane 4; the journal a ring of `J` records.
+    fn boot_traced_n(venue: &Venue, o: Opts) -> Result<Booted<J>, Refused<J>> {
         // Makers only where a dead-man of ours is proven: classic USDⓈ-M.
         let maker_ok = o.mode == AccountMode::Classic;
         let scope = if o.demo { Scope::Demo } else { Scope::Live };
@@ -1824,7 +1912,7 @@ impl Rig {
         }
         let (eng_end, gw_end) = duplex();
         let (fill_tx, fill_rx) = Ring::<Fill, FILL_N>::new().split();
-        let (j_tx, j_rx) = Ring::<ExecRecord, JOURNAL_RING>::new().split();
+        let (j_tx, j_rx) = Ring::<ExecRecord, J>::new().split();
         let knobs = GwKnobs {
             epoch: EPOCH,
             owner_slot: SLOT,
@@ -1832,7 +1920,7 @@ impl Rig {
             mode: o.mode,
             recv_window_ms: 5_000,
             stp_mode: String::from("EXPIRE_MAKER"),
-            countdown_ms: 30_000,
+            countdown_ms: o.countdown_ms,
             heartbeat_ms: 200,
             recon_every_ms: o.recon_every_ms,
             spin: false,
@@ -1845,7 +1933,7 @@ impl Rig {
             max_leverage: 20,
             adopt_cap_usd_1e6: o.adopt_cap_usd_1e6,
         };
-        let mut gw = match BnGateway::<FILL_N>::new(&cfg, venue.client_cfg.clone(), knobs, wire, gw_end, fill_tx, JournalTx::new(j_tx)) {
+        let mut gw = match BnGateway::<FILL_N, J>::new(&cfg, venue.client_cfg.clone(), knobs, wire, gw_end, fill_tx, JournalTx::new(j_tx)) {
             Ok(gw) => gw,
             Err(err) => return Err(Refused { err, journal: j_rx, fills: fill_rx }),
         };
@@ -1855,10 +1943,12 @@ impl Rig {
         Ok(Booted { cfg, table, gw, eng_end, fill_rx, journal: j_rx })
     }
 
-    fn boot_full(venue: &Venue, o: Opts) -> Self {
+    fn boot_full_n(venue: &Venue, o: Opts) -> Self {
         let (cm, maker_ok, halts) = (o.cm, o.mode == AccountMode::Classic, o.halts);
         let booted = Instant::now();
-        let Booted { cfg, table, mut gw, eng_end, fill_rx, journal: j_rx } = Self::boot_gateway(venue, o).expect("boot");
+        let Ok(Booted { cfg, table, mut gw, eng_end, fill_rx, journal: j_rx }) = Self::boot_traced_n(venue, o) else {
+            panic!("boot");
+        };
         assert_eq!(gw.phase(), Phase::Ready);
         assert_eq!(gw.last_verdict().unseen_legs, 0, "nothing unbound at the venue");
 
@@ -1877,6 +1967,8 @@ impl Rig {
                 min_maker_ttl_ns: 100_000_000,
                 margin: MarginBook::new(lim, prod),
                 anchor: core_time::WallAnchor::now(),
+                mode: o.mode,
+                demo: false,
             },
         );
         let mut route = ExecRoute::all_paper();
@@ -1934,7 +2026,7 @@ impl Rig {
     }
 
     /// The shutdown sweep ends the gateway thread.
-    fn shutdown(mut self) -> Consumer<ExecRecord, JOURNAL_RING> {
+    fn shutdown(mut self) -> Consumer<ExecRecord, J> {
         self.e.d.on_shutdown();
         let t0 = Instant::now();
         while !self.gw_thread.is_finished() {
@@ -2109,6 +2201,7 @@ fn the_arm_trades_end_to_end_against_a_scripted_venue() {
     // ---- the journal ------------------------------------------------------------
     let mut n = [0u32; 16];
     let mut recons = Vec::new();
+    let mut fee = None;
     while let Some(g) = j_rx.try_pop_ref() {
         let r: ExecRecord = *g;
         drop(g);
@@ -2116,11 +2209,20 @@ fn the_arm_trades_end_to_end_against_a_scripted_venue() {
         if r.kind == J_RECON {
             recons.push((r.code, r.c));
         }
+        if r.kind == J_FEE && fee.is_none() {
+            fee = Some(r);
+        }
     }
     // An IoC's ACK may lose the race to its fill (then it has nothing
     // left to acknowledge); the makers' never do.
     assert!(n[J_ACK as usize] >= 3, "{n:?}");
     assert_eq!(n[J_FILL as usize], 2);
+    // BX11: each trade's commission once — 101's despite the replay, 105's.
+    assert_eq!(n[J_FEE as usize], 2, "{n:?}");
+    let fee = fee.expect("101's commission");
+    assert_eq!((fee.client_oid, fee.a, fee.b), (101, 64_999_900_000, 2_000 * 64_999_900_000 / 1_000));
+    assert_eq!(fee.c, venue_fee_1e8(false, 2_000, 64_999_900_000) * 10, "the update's n, ×1e9");
+    assert_eq!(fee_fields(fee.code), (false, FEE_ASSET_SETTLE, TRADE_BY_MEMBER, PRODUCT_USDM, false, false));
     assert_eq!(n[J_ENDED as usize], 5, "101, 102, 103→104, 105, 106: {n:?}");
     assert_eq!(n[J_REJECT as usize], 0);
     assert_eq!(n[J_SWEEP as usize], 2, "the halt's sweep and the shutdown's");
@@ -2231,6 +2333,110 @@ fn the_arm_survives_a_lost_stream_a_5xx_and_a_dead_order_session() {
     venue.with(|v| v.ws_down = false);
     e.until("logged on again", |_| venue.with(|v| v.logons) >= 2);
     let rig = Rig { e, ..rig };
+    let mut journal = rig.shutdown();
+    // BX11: 201's fill was booked from the status (UNSEEN, no commission);
+    // its late update still journals the trade's commission — once.
+    let (mut fees, mut unseen) = (Vec::new(), 0);
+    while let Some(g) = journal.try_pop_ref() {
+        fees.extend((g.kind == J_FEE).then_some((g.client_oid, g.c)));
+        unseen += u32::from(g.kind == J_FILL && g.code & J_FILL_UNSEEN != 0);
+    }
+    assert_eq!(unseen, 1);
+    assert_eq!(fees, vec![(201, venue_fee_1e8(false, 2_000, 64_999_900_000) * 10)]);
+}
+
+/// **S8 (BX11, the journal's capacity knob)**: the E7 anchor is the one
+/// record that must land. On a two-record ring the boot's own records —
+/// the first cycle's margin sample and its verdict (an orphan was still
+/// resting) — leave no room when the second cycle reconciles and sets the
+/// anchor: the ring refuses it (counted), the pulse says the anchor is
+/// unsaved (the arm reads it), and the gateway offers it again until the
+/// ring takes it; then the flag drops. Break-and-watch: without the
+/// retry the flag never drops; without `anchor_pending` in the pulse it
+/// is never raised.
+#[test]
+fn an_anchor_the_journal_refused_is_flagged_and_offered_until_it_lands() {
+    let venue = Venue::start();
+    let mut rig = Rig::<2>::boot_full_n(&venue, Opts::new(60_000_000_000, 300));
+    rig.e.until("the pulse says the anchor is unsaved", |e| e.d.live().anchor_unsaved());
+    // Drained as the writer would: the anchor lands, the flag drops.
+    let t0 = Instant::now();
+    let mut anchor = None;
+    loop {
+        while let Some(g) = rig.journal.try_pop_ref() {
+            if g.kind == J_ANCHOR {
+                anchor = Some(g.a);
+            }
+        }
+        if anchor.is_some() && !rig.e.d.live().anchor_unsaved() {
+            break;
+        }
+        rig.e.turn();
+        assert!(t0.elapsed() < Duration::from_secs(10), "the anchor never landed: {anchor:?}");
+        thread::sleep(Duration::from_micros(250));
+    }
+    assert_eq!(anchor, Some(1_000_000_000), "the session's first reconciled equity");
+    assert!(rig.e.d.live().counters().gw[exec_binance::arm::GW_JOURNAL_DROPPED] >= 1, "the refusal was counted");
+    let _ = rig.shutdown();
+}
+
+/// **BX11 drill — the gateway dies** (plan §5 BX11): two makers rest under
+/// the venue's dead-man (a 1 s countdown, renewed every 200 ms heartbeat);
+/// the gateway thread stops WITHOUT its sweep. Its pulse stops: the slot
+/// halts `WsGap` at its 600 ms `ws_gap_ms`; and the venue's countdown,
+/// renewed no more, fires and cancels both — the BX13 R0 bar "the
+/// dead-man fired", on the loopback. Break-and-watch: a venue whose
+/// countdown never fires leaves both resting (the drill's own check), and
+/// an arm that kept its last pulse fresh would not halt.
+#[test]
+fn a_dead_gateway_halts_ws_gap_and_the_venues_countdown_cancels_the_makers() {
+    let venue = Venue::start();
+    let o = Opts { countdown_ms: 1_000, halts: HaltLimits::new(0, 0, 600, 0, 0), ..Opts::new(60_000_000_000, 300) };
+    let rig = Rig::boot_full(&venue, o);
+    let mut e = rig.e;
+    assert_eq!(e.d.submit(&order(601, Side::Bid, ORDER_KIND_MAKER, 60_000_000_000, 2_000)), Ok(()));
+    assert_eq!(e.d.submit(&order(602, Side::Ask, ORDER_KIND_MAKER, 70_000_000_000, 2_000)), Ok(()));
+    e.until("both rest", |_| venue.rests(601) && venue.rests(602));
+    e.until("the dead-man armed", |_| venue.with(|v| v.countdown_at.is_some()));
+    // The gateway dies: no sweep (the engine asked for none).
+    rig.stop.store(true, Ordering::Relaxed);
+    let t0 = Instant::now();
+    while !rig.gw_thread.is_finished() {
+        assert!(t0.elapsed() < Duration::from_secs(5), "the gateway did not stop");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let died = Instant::now();
+    e.until("the WsGap halt", |e| e.d.halt().reason(SLOT as usize) == HaltReason::WsGap);
+    e.until_within("the countdown fired", Duration::from_secs(5), |_| {
+        venue.with(|v| v.countdown_fired == 1 && !v.orders.iter().any(|o| o.open() && !o.cm))
+    });
+    assert!(died.elapsed() < Duration::from_secs(3), "the countdown's end, not a sweep's");
+    assert!(venue.with(|v| v.cancels.iter().all(|c| !c.contains(&cid(EPOCH, 601)))), "no cancel of ours: the venue's");
+}
+
+/// **BX11 drill — reconciliation withheld** (plan §5 BX11): a classic
+/// arm whose cycle cannot read the open orders (the listing answers 500):
+/// the cycles fail, none reconciles, and the slot halts `ReconStale` at its
+/// 1.5 s `recon_stale_ms` — the router-level halt for a classic account (a
+/// unified one's is the test above's). Break-and-watch: a failed listing
+/// judged as an empty one would keep the cycles reconciling.
+#[test]
+fn a_withheld_reconciliation_halts_a_classic_arm_stale() {
+    let venue = Venue::start();
+    let rig = Rig::boot_full(&venue, Opts { halts: HaltLimits::new(0, 0, 0, 0, 1_500), ..Opts::new(60_000_000_000, 300) });
+    let mut e = rig.e;
+    let gw = |e: &Engine, k: usize| e.d.live().counters().gw[k];
+    let ok0 = gw(&e, exec_binance::arm::GW_RECON_OK);
+    e.until("a cycle reconciles", |e| gw(e, exec_binance::arm::GW_RECON_OK) > ok0);
+    assert_eq!(e.d.halt().reason(SLOT as usize), HaltReason::None);
+    let f0 = gw(&e, exec_binance::arm::GW_RECON_FAILED);
+    venue.with(|v| v.recon_down = true);
+    e.until("the cycles fail", |e| gw(e, exec_binance::arm::GW_RECON_FAILED) >= f0 + 2);
+    let ok1 = gw(&e, exec_binance::arm::GW_RECON_OK);
+    e.until("the stale halt", |e| e.d.halt().reason(SLOT as usize) == HaltReason::ReconStale);
+    assert!(gw(&e, exec_binance::arm::GW_RECON_OK) <= ok1 + 1, "no cycle reconciles without the listing");
+    venue.with(|v| v.recon_down = false);
+    let rig = Rig { e, ..rig };
     let _journal = rig.shutdown();
 }
 
@@ -2259,6 +2465,8 @@ fn a_429_makes_the_gateway_quiet_then_the_halts_sweep_clears() {
     // The budget floor halts the slot (its cancel-all is asked for) …
     e.until("the budget floor is seen", |e| e.d.live().halt_signal_for(SLOT).budget_floor_breached == 1);
     e.until("the slot halts", |e| e.d.halt().cancel_outstanding());
+    // BX11 (the 429 drill): the halt's reason word, not only the flag.
+    assert_eq!(e.d.halt().reason(SLOT as usize), HaltReason::BudgetFloor);
     // … and nothing at all reaches the venue while quiet.
     e.idle_for(QUIET_MS - 400);
     assert_eq!(venue.with(|v| v.log.len()), served, "nothing is sent while quiet: {:?}", venue.with(|v| v.log[served..].to_vec()));
@@ -2590,10 +2798,106 @@ fn the_coinm_lane_trades_inverse_iocs_beside_usdm() {
 
     let mut journal = Rig { e, ..rig }.shutdown();
     let mut recon_ok_seen = false;
+    let mut fees = Vec::new();
     while let Some(g) = journal.try_pop_ref() {
         recon_ok_seen |= g.kind == J_RECON && g.code == 1;
+        if g.kind == J_FEE {
+            fees.push(*g);
+        }
     }
     assert!(recon_ok_seen, "a reconciled verdict journaled");
+    // BX11: one commission per trade (701, 703 on COIN-M; 704 on USDⓈ-M):
+    // COIN-M's in the coin, its notional in the coin — 3 contracts × 100
+    // USD ÷ the price.
+    assert_eq!(fees.iter().map(|f| f.client_oid).collect::<Vec<_>>(), vec![701, 703, 704]);
+    for f in &fees[..2] {
+        assert_eq!(f.b, (3_000_000i128 * CM_FACE_1E6 as i128 * 1_000 / f.a as i128) as i64, "BTC ×1e9");
+        assert_eq!(f.c, venue_fee_1e8(true, 3_000_000, f.a) * 10);
+        assert_eq!(fee_fields(f.code), (false, FEE_ASSET_SETTLE, TRADE_BY_MEMBER, PRODUCT_COINM, false, false));
+    }
+    assert_eq!(fee_fields(fees[2].code).3, PRODUCT_USDM);
+}
+
+/// BX11 (`J_FEE`): a trade's commission — carried by its
+/// `ORDER_TRADE_UPDATE` alone — is journaled once, whether `TRADE_LITE`
+/// booked the fill first (an IoC; a resting maker's fill) or the update did
+/// (the lite after it), and never again for a replayed update or the late
+/// lite; the fills carry none. The venue's own trades — an earlier boot's
+/// order, a liquidation, an ADL, a settlement — journal theirs naming whose
+/// they were (BX-14 measures the arm's orders' only). Break-and-watch:
+/// `TidRing::see` without its fee bit journals nothing for a lite-first
+/// trade (the update is "seen"), or twice for a replay.
+#[test]
+fn a_trades_commission_is_journaled_once_whichever_report_booked_it() {
+    let venue = Venue::start();
+    let rig = Rig::boot(&venue, 60_000_000_000, 60_000);
+    let mut e = rig.e;
+    // TRADE_LITE first (the venue's habit, BX7b K2), the update, a replay.
+    assert_eq!(e.d.submit(&order(301, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 2_000)), Ok(()));
+    e.until("the first IoC fills", |e| e.pos() == Some(2_000));
+    // The update first, a replay, the lite after them.
+    venue.with(|v| v.lite_after = true);
+    assert_eq!(e.d.submit(&order(302, Side::Ask, ORDER_KIND_IOC, 64_000_000_000, 2_000)), Ok(()));
+    e.until("the second IoC fills", |e| e.pos() == Some(0));
+    // A resting maker's fill: its lite, then its update.
+    venue.with(|v| v.lite_after = false);
+    assert_eq!(e.d.submit(&order(303, Side::Bid, ORDER_KIND_MAKER, 60_000_000_000, 2_000)), Ok(()));
+    e.until("the maker rests", |_| venue.rests(303));
+    venue.with(|v| v.fill_open(&cid(EPOCH, 303), 2_000));
+    e.until("the maker fills", |e| e.pos() == Some(2_000));
+    e.idle_for(150);
+    assert_eq!(e.fills.len(), 3, "three trades, each booked once");
+    // The venue's own trades, as its stream reports them (no TRADE_LITE).
+    venue.with(|v| {
+        for (k, id) in [cid(OLD_EPOCH, 99).as_str(), "autoclose-1790000000123", "adl_autoclose", "settlement_autoclose-1790000000"]
+            .iter()
+            .enumerate()
+        {
+            let o = VOrder {
+                oid: 9_900 + k as u64,
+                cid: String::from(*id),
+                cm: false,
+                buy: false,
+                tif: String::from("IOC"),
+                qty: 1_000,
+                px: 65_000_000_000,
+                executed: 1_000,
+                avg: 65_000_000_000,
+                status: "FILLED",
+            };
+            let u = o.update("TRADE", 1_000, 65_000_000_000, 9_800 + k as u64);
+            v.user_q.push_back(u);
+        }
+    });
+    e.until("the venue's four trades", |e| e.fills.len() == 7);
+    let mut journal = Rig { e, ..rig }.shutdown();
+    let (mut fills, mut fees) = (0, Vec::new());
+    while let Some(g) = journal.try_pop_ref() {
+        let r: ExecRecord = *g;
+        drop(g);
+        if r.kind == J_FILL {
+            fills += 1;
+            assert_eq!(r.c, 0, "a fill carries no commission since BX11");
+        }
+        if r.kind == J_FEE {
+            fees.push(r);
+        }
+    }
+    assert_eq!(fills, 7);
+    assert_eq!(fees.len(), 7, "one J_FEE per trade: {fees:?}");
+    let want = [(301, 64_999_900_000, 2_000, false), (302, 64_000_100_000, 2_000, false), (303, 60_000_000_000, 2_000, true)];
+    for (r, (oid, px, qty, maker)) in fees.iter().zip(want) {
+        assert_eq!((r.client_oid, r.a), (oid, px));
+        assert_eq!(r.b, (qty as i128 * px as i128 / 1_000) as i64, "the notional ×1e9, in USDT");
+        assert_eq!(r.c, venue_fee_1e8(false, qty, px) * 10, "the update's commission ×1e9");
+        assert_eq!(fee_fields(r.code), (maker, FEE_ASSET_SETTLE, TRADE_BY_MEMBER, PRODUCT_USDM, false, false));
+        assert_ne!(r.venue_oid, 0, "the venue's order id");
+    }
+    let by = [TRADE_BY_ORPHAN, TRADE_BY_LIQUIDATION, TRADE_BY_ADL, TRADE_BY_SETTLEMENT];
+    for (r, (k, by)) in fees[3..].iter().zip(by.iter().enumerate()) {
+        assert_eq!((r.client_oid, r.venue_oid), (0, 9_900 + k as u64), "no member id: the venue's order");
+        assert_eq!(fee_fields(r.code).2, *by, "whose order traded");
+    }
 }
 
 /// BX7 (C2): **Portfolio Margin** — both products on papi, REST only and
@@ -3142,6 +3446,29 @@ fn a_classic_stream_event_naming_fs_is_a_scan_failure() {
         );
     });
     e.until("the drift halt", |e| e.d.halt().reason(SLOT as usize) == HaltReason::ReconDrift);
+    let rig = Rig { e, ..rig };
+    let _journal = rig.shutdown();
+}
+
+/// BX11 (BX-15): a user-stream event of a kind the arm does not act on —
+/// `STRATEGY_UPDATE`, or a kind newer than this build — is counted, never
+/// booked, and halts nothing. Break-and-watch: the gateway's catch-all
+/// dropped it uncounted (the scanner's module doc said "counted").
+#[test]
+fn an_event_of_no_kind_the_arm_acts_on_is_counted_and_halts_nothing() {
+    let venue = Venue::start();
+    let rig = Rig::boot(&venue, 60_000_000_000, 300);
+    let mut e = rig.e;
+    let other = |e: &Engine| e.d.live().counters().gw[exec_binance::arm::GW_EVENTS_OTHER];
+    assert_eq!(other(&e), 0);
+    venue.with(|v| {
+        v.user_q.push_back(br#"{"e":"STRATEGY_UPDATE","T":3,"E":3,"su":{"si":8,"st":"GRID","ss":"NEW","s":"BTCUSDT","ut":3}}"#.to_vec());
+        v.user_q.push_back(br#"{"e":"AN_EVENT_OF_2027","E":4}"#.to_vec());
+    });
+    e.until("both counted", |e| other(e) == 2);
+    e.idle_for(300);
+    assert_eq!(other(&e), 2);
+    assert_eq!(e.d.halt().reason(SLOT as usize), HaltReason::None);
     let rig = Rig { e, ..rig };
     let _journal = rig.shutdown();
 }

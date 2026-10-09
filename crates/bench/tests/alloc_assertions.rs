@@ -6125,6 +6125,27 @@ fn state_snapshot_publish_read_encode_is_zero_alloc() {
     for _ in 0..RECENT_FILLS {
         scratch.recent_fills.push(f);
     }
+    // BX11 (the alloc review's AL-3): every venue arm present — the
+    // `exec.arms` members and their commas — the Binance block's words at
+    // their widest.
+    scratch.exec.arms_binance.present = 1;
+    scratch.exec.arms_hyperliquid_gw.present = 1;
+    scratch.exec.arms_binance_gw = engine_snapshot::BinanceGwSnapshot {
+        present: 1,
+        slot: u8::MAX,
+        account_mode: u8::MAX,
+        sweep: u8::MAX,
+        refused: [u32::MAX; 20],
+        halt_reason: u64::MAX,
+        in_doubt: u64::MAX,
+        events_other: u64::MAX,
+        heartbeat_age_ms: i64::MAX as u64,
+        post_rtt_p99_ns: u64::MAX,
+        clock_offset_ms: i64::MIN,
+        margin_usdm_1e6: i64::MIN,
+        margin_coinm_1e6: i64::MIN,
+        ..engine_snapshot::BinanceGwSnapshot::default()
+    };
     let mut server_scratch = Box::new(EngineSnapshot::empty());
     let mut resp = vec![0u8; 256 * 1024];
 
@@ -6153,6 +6174,9 @@ fn state_snapshot_publish_read_encode_is_zero_alloc() {
         "every har name byte escaped"
     );
     assert!(body.contains("\"day_age_s\":17446657673"), "a real age, not -1");
+    for arm in ["\"binance\":{", "\"binance_gw\":{", "\"hyperliquid_gw\":{"] {
+        assert!(body.contains(arm), "gate 43: {arm} encoded");
+    }
     assert_eq!(
         allocs, 0,
         "/state publish+read+encode allocated {allocs} times ({bytes} B)"
@@ -13218,8 +13242,10 @@ fn ledger_price_feed_steady_state() {
 const BX6_FAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","pair":"BTCUSDT","contractType":"PERPETUAL","status":"TRADING","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.10","maxPrice":"4529764","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","maxQty":"1000","minQty":"0.001"},{"filterType":"MAX_NUM_ORDERS","limit":200},{"filterType":"MIN_NOTIONAL","notional":"100"},{"filterType":"PERCENT_PRICE","multiplierUp":"1.0500","multiplierDown":"0.9500","multiplierDecimal":"4"}]},{"symbol":"ETHUSDT","pair":"ETHUSDT","contractType":"PERPETUAL","status":"TRADING","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.01","maxPrice":"300000","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"0.001","maxQty":"10000","minQty":"0.001"},{"filterType":"MAX_NUM_ORDERS","limit":200},{"filterType":"MIN_NOTIONAL","notional":"20"},{"filterType":"PERCENT_PRICE","multiplierUp":"1.0500","multiplierDown":"0.9500","multiplierDecimal":"4"}]}]}"#;
 
 /// **BX6 gate 92 — the Binance arm on the engine thread, in the engine's
-/// own shape**: `RoutedDispatcher<Paper, VenueSplit<NullLive, BnArm>>`
-/// with the anchor aliased to Binance and both rows bound in the ledger.
+/// own shape**: `RoutedDispatcher<Paper, SlotSplit<VenueSplit<NullLive,
+/// BnArm>, Option<_>>>` (BX11: BIN15's slot beside it, as the engine
+/// composes it) with the anchor aliased to Binance and both rows bound in
+/// the ledger.
 ///
 /// Every verb passes the router's risk gate, the split and the arm (the
 /// alias-first row, the BX-5 quantization, the order budget, QTR,
@@ -13231,7 +13257,10 @@ const BX6_FAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","pair":"BTCUSDT","co
 /// accepted, and once the venue's order budget is spent, refused —
 /// cancels, modifies, EVERY event kind the gateway sends (each pulse
 /// reading the published tallies — BX7, the kit's stats block), the marks
-/// (one of them stale: the sweep expires it), `/state`'s counters and,
+/// (one of them stale: the sweep expires it), `/state`'s counters and
+/// (BX11) the arm's own report — its counters, the pulse's words, the
+/// governor's windows, the margin book, the round trips' quantiles over
+/// trackers that hold samples, one walk a report — and,
 /// last, a venue lock that halts the slot and the sweep — the stats word,
 /// never a command (XG-1) — that clears it. Zero allocations.
 #[test]
@@ -13256,7 +13285,7 @@ fn binance_arm_steady_state() {
     use exec_binance::margin::{MarginBook, SLOTS};
     use exec_router::{
         ExecMode, ExecRoute, HaltLimits, InstrumentSpec, NullLiveDispatcher, RoutedDispatcher,
-        SlotCaps, VenueSplit, LAW_LINEAR,
+        SlotCaps, SlotSplit, VenueSplit, LAW_LINEAR,
     };
 
     const SLOT: u8 = 2;
@@ -13295,6 +13324,8 @@ fn binance_arm_steady_state() {
             min_maker_ttl_ns: 5_000_000_000,
             margin: MarginBook::new(lim, prod),
             anchor: core_time::WallAnchor::now(),
+            mode: exec_binance::mode::AccountMode::Classic,
+            demo: false,
         },
     );
     let bn = VenueId::Binance.to_u8();
@@ -13309,6 +13340,10 @@ fn binance_arm_steady_state() {
         )
         .expect("gate 92 route");
     let split = VenueSplit::new(bn, NullLiveDispatcher::new(), arm, &route);
+    // BX11 (the alloc review's AL-4): BIN15's slot beside the split, an
+    // `Option` arm (here none) — the report crosses every forwarder the
+    // engine's does.
+    let split = SlotSplit::new(3, split, Option::<NullLiveDispatcher>::None);
     let mut d = RoutedDispatcher::new(route, PaperDispatcher::new(), split, core_time::WallAnchor::now());
     d.set_route_aliases(RouteAliases::NONE.with(ALIAS, bn).expect("gate 92 alias"));
     for sym in [ALIAS, eth] {
@@ -13341,6 +13376,16 @@ fn binance_arm_steady_state() {
     let mut aborted = [(0u64, 0u64); 16];
     let mut aborted_at = 0usize;
 
+    let mut bn_report = clob_dispatcher::BinanceArmReport::default();
+    // The trackers hold samples: the report's quantile walks are real
+    // walks inside the window (one a report, round robin).
+    for ns in [900_000u64, 2_000_000, 40_000_000] {
+        gw.stats.post_rtt.record(ns);
+        gw.stats.cancel_rtt.record(ns);
+        gw.stats.fill_venue_to_local.record(ns);
+        gw.stats.rest_rtt.record(ns);
+        gw.stats.push_to_write.record(ns / 1_000);
+    }
     let g = AllocGuard::new();
     // The sweep is due: the stale mark stops pricing its row.
     d.on_idle();
@@ -13473,6 +13518,8 @@ fn binance_arm_steady_state() {
         polls += d.on_idle() as u64;
         if i % 256 == 0 {
             std::hint::black_box(d.exec_counters());
+            assert!(d.binance_arm_report(core_time::now_ns(), &mut bn_report), "gate 92: the arm's report");
+            std::hint::black_box(&bn_report);
         }
         i += 1;
     }
@@ -13530,18 +13577,26 @@ fn binance_arm_steady_state() {
 /// refusal scanned; and — at their own cadence — the reconciliation's
 /// scans and judges. BX7: a position update's not-cross positions walked
 /// in one pass (`NotCross`), each looked up; an `ACCOUNT_CONFIG_UPDATE`
-/// carrying a leverage and the multi-assets mode read. Zero allocations.
+/// carrying a leverage and the multi-assets mode read. BX11: a trade's two
+/// reports seen by the trade-id ring — `TRADE_LITE` books it, its update
+/// owes the commission — and the update's commission (×1e9, its asset
+/// `N`) classified against the row, the trade's notional taken, and its
+/// `J_FEE` noted into the journal's ring (drained as the writer would).
+/// Zero allocations.
 #[test]
 fn binance_gateway_render_and_scan_steady_state() {
     use exec_binance::cid::CidPrefix;
     use exec_binance::clock::VenueClock;
     use exec_binance::inst::{BindSpec, InstTable, PRODUCT_USDM};
+    use exec_binance::journal::{
+        fee_asset, fee_code, fee_notional_1e9, JournalTx, FEE_ASSET_SETTLE, JOURNAL_RING, J_ANCHOR, J_FEE, TRADE_BY_MEMBER,
+    };
     use exec_binance::oot::{EndedRing, Oot, TidRing};
     use exec_binance::recon::{day_increasing_1e6, judge_positions, scan_um_account, Leg, PosRow, Verdict};
     use exec_binance::rest::{
         scan_countdown, scan_error, scan_orders, scan_server_time, scan_trades, OrderRow, QueryWriter, TradeRow,
     };
-    use exec_binance::userstream::{scan_user_event, UserEvent};
+    use exec_binance::userstream::{scan_user_event, UserEvent, UE_OTHER};
     use exec_binance::wsapi::{
         queue_account, queue_cancel, queue_modify, queue_place, queue_status, scan_answer, FrameSink,
         Part, Place, WsAnswer, WsStatic,
@@ -13566,6 +13621,11 @@ fn binance_gateway_render_and_scan_steady_state() {
     // BX7 (BX-19): a position update naming two isolated positions.
     const ACCOUNT_UPDATE: &[u8] = br#"{"e":"ACCOUNT_UPDATE","E":1790000000124,"T":1790000000120,"a":{"m":"ORDER","B":[{"a":"USDT","wb":"1000.00","cw":"1000.00","bc":"0"}],"P":[{"s":"ETHUSDT","pa":"1","ep":"3000","cr":"0","up":"0","mt":"isolated","iw":"10","ps":"BOTH"},{"s":"BTCUSDT","pa":"0.002","ep":"65000","cr":"0","up":"0","mt":"isolated","iw":"10","ps":"BOTH"}]}}"#;
     const REST_REFUSED: &[u8] = br#"{"code":-1021,"msg":"Timestamp for this request is outside of the recvWindow."}"#;
+    // BX11 (the alloc review's AL-1): events of no kind the arm acts on —
+    // a strategy's update, and a kind newer than this build — scanned and
+    // counted.
+    const STRATEGY: &[u8] = br#"{"e":"STRATEGY_UPDATE","T":1790000000126,"E":1790000000126,"su":{"si":8,"st":"GRID","ss":"NEW","s":"BTCUSDT","ut":1790000000126}}"#;
+    const NEWER: &[u8] = br#"{"e":"AN_EVENT_OF_2027","E":1790000000127}"#;
 
     /// The send window, as `WsConn`'s: one preallocated buffer, each frame
     /// written and masked by core-net's own in-place writer.
@@ -13603,6 +13663,15 @@ fn binance_gateway_render_and_scan_steady_state() {
     let mut pend: exec_gateway::Pending<u64, { exec_binance::gateway::WS_IDS }> = exec_gateway::Pending::new(0);
     let mut due = exec_gateway::Expired { deadline_ns: 0, key: 0, kind: 0 };
     let mut tids = TidRing::<256>::new();
+    let (j_p, mut j_c) = Ring::<core_types::ExecRecord, JOURNAL_RING>::new().split();
+    let mut journal = JournalTx::new(j_p);
+    // BX11 (the alloc review's AL-2): S8 — a journal two records deep, so
+    // the E7 anchor's note is refused, offered again and lands under the
+    // guard.
+    let (s8_p, mut s8_c) = Ring::<core_types::ExecRecord, 2>::new().split();
+    let mut s8 = JournalTx::<2>::new(s8_p);
+    let filler = core_types::ExecRecord { kind: J_FEE, ..core_types::ExecRecord::default() };
+    let anchor = core_types::ExecRecord { kind: J_ANCHOR, ..core_types::ExecRecord::default() };
     let mut ended = EndedRing::new();
     let mut clock = VenueClock::new(core_time::WallAnchor::now());
     let mut orders = [OrderRow::default(); 16];
@@ -13614,7 +13683,8 @@ fn binance_gateway_render_and_scan_steady_state() {
     let mut ev = UserEvent::default();
 
     let g = AllocGuard::new();
-    let (mut rendered, mut expired) = (0usize, 0u64);
+    let (mut rendered, mut expired, mut fees) = (0usize, 0u64, 0u64);
+    let (mut others, mut anchored) = (0u64, 0u64);
     let mut i = 0u64;
     while i < N {
         let now = core_time::now_ns();
@@ -13654,11 +13724,36 @@ fn binance_gateway_render_and_scan_steady_state() {
         std::hint::black_box(a.venue_oid);
         scan_answer(REFUSED, &mut a).expect("gate 93 refusal");
         std::hint::black_box(a.code);
+        // A trade's two reports: TRADE_LITE books it, the update owes its
+        // commission (BX11) — noted, then drained as the writer would.
+        let tid = 9_000 + (i & 511);
+        scan_user_event(LITE, &mut ev).expect("gate 93 lite");
+        assert!(!tids.see(0, tid, false).again, "gate 93: a fresh trade");
         scan_user_event(UPDATE, &mut ev).expect("gate 93 update");
         std::hint::black_box(prefix.classify(ev.cid.get(UPDATE)));
-        std::hint::black_box(wire.find(PRODUCT_USDM, ev.symbol.get(UPDATE)));
-        scan_user_event(LITE, &mut ev).expect("gate 93 lite");
-        std::hint::black_box(tids.seen_or_record(0, 9_000 + (i & 511)));
+        let row = wire.find(PRODUCT_USDM, ev.symbol.get(UPDATE));
+        let w = wire.row(row);
+        let asset = fee_asset(w, ev.fee_asset.get(UPDATE));
+        if tids.see(row, tid, true).fee_due {
+            let fee = core_types::ExecRecord {
+                ts_ns: now,
+                wall_ms: ts,
+                client_oid: 0x65 + i,
+                venue_oid: ev.venue_oid,
+                a: ev.last_px_1e6,
+                b: fee_notional_1e9(w, ev.last_px_1e6, ev.last_qty_1e6),
+                c: ev.commission_1e9,
+                code: fee_code(ev.maker != 0, asset, TRADE_BY_MEMBER, w),
+                row,
+                kind: J_FEE,
+                slot: 2,
+            };
+            assert!(journal.note(&fee), "gate 93: the journal's ring has room");
+            fees += u64::from(asset == FEE_ASSET_SETTLE);
+        }
+        while let Some(r) = j_c.try_pop_ref() {
+            std::hint::black_box((r.b, r.c));
+        }
         // BX7 (BX-19): a position update's margin types — every isolated
         // position looked up, in place, in one pass.
         scan_user_event(ACCOUNT_UPDATE, &mut ev).expect("gate 93 account update");
@@ -13671,6 +13766,24 @@ fn binance_gateway_render_and_scan_steady_state() {
         assert_eq!(named, ev.isolated, "gate 93: the walk names what the scan counted");
         scan_user_event(CONFIG_UPDATE, &mut ev).expect("gate 93 config update");
         std::hint::black_box((ev.config, wire.find(PRODUCT_USDM, ev.symbol.get(CONFIG_UPDATE))));
+        // BX11: a kind the arm does not act on scans and is counted, as the
+        // gateway's tally counts it.
+        for f in [STRATEGY, NEWER] {
+            scan_user_event(f, &mut ev).expect("gate 93 another kind");
+            others += u64::from(ev.kind == UE_OTHER);
+        }
+        // BX11: S8 — the anchor on a full ring: refused and counted once,
+        // offered again (not counted), landing once the writer made room.
+        if i % 16 == 0 {
+            let mut k = 0;
+            while k < 8 && s8.offer(&filler) {
+                k += 1;
+            }
+            assert!(!s8.note(&anchor) && !s8.offer(&anchor), "gate 93: the anchor waits on a full ring");
+            std::hint::black_box(s8_c.try_pop_ref().is_some());
+            anchored += u64::from(s8.offer(&anchor));
+            while s8_c.try_pop_ref().is_some() {}
+        }
         // The open-order table, the request's id and deadline, the TTL.
         let ix = oot
             .insert(2, 1_000 + i, 0, side, (i & 1) as u8, px, 2_000, now)
@@ -13735,6 +13848,9 @@ fn binance_gateway_render_and_scan_steady_state() {
 
     assert!(rendered > 0 && expired == N.div_ceil(16), "{rendered} B rendered, {expired} expired");
     assert!(oot.is_empty() && pend.live() == 0 && tq.is_empty());
+    assert_eq!(fees, N, "gate 93: every trade's commission noted once, in the row's quote");
+    assert_eq!(others, 2 * N, "gate 93: every event of another kind scanned as one");
+    assert_eq!((anchored, s8.dropped()), (N.div_ceil(16), N.div_ceil(16)), "gate 93: each anchor refused once, then landed");
     std::hint::black_box(&table);
     assert_eq!(allocs, 0, "gate 93: the gateway's render and scan allocated {allocs} times ({bytes} B)");
 }
@@ -16570,7 +16686,10 @@ fn binance_rest_route_render_sign_and_read_steady_state() {
 /// contracts, `reduceOnly`) and the lane's own `account.status` rendered
 /// and masked into a send window; the answer and the dstream's
 /// `ORDER_TRADE_UPDATE` (the margin asset's fee) scanned in place and their
-/// row found by product; the COIN-M account read (per-asset margins, the
+/// row found by product — BX11: the fee (×1e9, in the coin) classified as
+/// the row's margin coin and the trade's notional taken in the coin
+/// (contracts × face ÷ price), `J_FEE`'s fields; the COIN-M account read
+/// (per-asset margins, the
 /// riskiest asset's ratio — `scan_cm_account`), its position onto an
 /// inverse leg judged at the contract's face, dapi's open orders and the
 /// day's trades summed by the inverse law (contracts × face); the REST
@@ -16658,8 +16777,10 @@ fn binance_coinm_lane_render_and_scan_steady_state() {
         std::hint::black_box(a.venue_oid);
         scan_user_event(UPDATE, &mut ev).expect("gate 105 update");
         std::hint::black_box(prefix.classify(ev.cid.get(UPDATE)));
-        std::hint::black_box(wire.find(PRODUCT_COINM, ev.symbol.get(UPDATE)));
-        std::hint::black_box((ev.qty_1e6, ev.commission_1e6));
+        let r = wire.find(PRODUCT_COINM, ev.symbol.get(UPDATE));
+        let asset = exec_binance::journal::fee_asset(wire.row(r), ev.fee_asset.get(UPDATE));
+        assert_eq!(asset, exec_binance::journal::FEE_ASSET_SETTLE, "gate 105: BTC is the row's coin");
+        std::hint::black_box((ev.qty_1e6, ev.commission_1e9, exec_binance::journal::fee_notional_1e9(&w, ev.last_px_1e6, ev.last_qty_1e6)));
         if i % 8 == 0 {
             // The REST route's place, for `/dapi/v1/order`.
             let mut q = QueryWriter::new(&mut rest_win);

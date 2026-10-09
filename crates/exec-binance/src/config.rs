@@ -120,6 +120,31 @@ pub fn network_of(host: &str) -> Network {
     }
 }
 
+/// **BX11 — the operator's word for mainnet**, sealed: only
+/// [`MainnetVerb::operator_verb`] makes one, and only on the operator's
+/// `--confirm`. The account tools (`exec-smoke --binance-setup`,
+/// `--binance-flatten`) open a mainnet host only holding one; without it
+/// they read, print what they would send, and send nothing. Not `Clone`:
+/// lent, never copied (the `exec_hyperevm::MainnetAuthority` precedent).
+#[derive(Debug)]
+pub struct MainnetVerb {
+    _sealed: (),
+}
+
+impl MainnetVerb {
+    /// The one door: `confirmed` is the operator's `--confirm`.
+    ///
+    /// # Errors
+    /// Not confirmed: the reason, for the operator.
+    pub fn operator_verb(confirmed: bool) -> Result<Self, &'static str> {
+        if confirmed {
+            Ok(Self { _sealed: () })
+        } else {
+            Err("a mainnet account change needs the operator's --confirm — it changes the live account")
+        }
+    }
+}
+
 /// The hosts the futures × classic paths talk to (plan §3.3; COIN-M:
 /// BX7, C1).
 #[derive(Clone, Debug, PartialEq, Eq)]

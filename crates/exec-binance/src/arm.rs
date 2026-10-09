@@ -63,8 +63,8 @@
 //! `Disconnected`; a full ring → `QueueFull`.
 
 use clob_dispatcher::{
-    CancelAllState, DispatchError, DispatchStats, HaltSignal, LiveArmCounters, OrderDispatch,
-    Renamed, Retired, RETIRED_EXPIRED, RETIRED_REJECTED,
+    BinanceArmReport, CancelAllState, DispatchError, DispatchStats, HaltSignal, LiveArmCounters, OrderDispatch,
+    Renamed, Retired, BINANCE_REFUSALS, RETIRED_EXPIRED, RETIRED_REJECTED,
 };
 use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
 use core_time::WallAnchor;
@@ -76,9 +76,10 @@ use core_types::{
 use exec_gateway::stats::{HALT_NONE, PUBLISHED_WORDS, SWEEP_STRANDED, SWEEP_WORKING};
 
 use crate::cmd::*;
-use crate::gov::{classify, CodeClass, FuturesOrders, Qtr, QtrRow, QTR_DUST_USD_1E6};
-use crate::inst::{rx, InstTable, INST_INVERSE, INST_LIVE, INST_MAX, INST_NO_DEADMAN, ROW_NONE};
+use crate::gov::{classify, CodeClass, FuturesOrders, Qtr, QtrRow, ARM_WEIGHT_MAX_PER_MIN, QTR_DUST_USD_1E6};
+use crate::inst::{rx, InstTable, INST_INVERSE, INST_LIVE, INST_MAX, INST_NO_DEADMAN, INST_OWNED, PRODUCT_COINM, PRODUCT_USDM, ROW_NONE};
 use crate::margin::{MarginBook, SLOTS};
+use crate::mode::AccountMode;
 use crate::num::{ceil_to, floor_to};
 
 /// Events drained per `on_idle`.
@@ -204,6 +205,8 @@ pub struct BnArmCounters {
     /// the stats word and never refused; the gateway then leaves its loop
     /// on the stop flag's grace instead).
     pub cancel_all_unqueued: u64,
+    /// Sweeps that ended stranded (BX11: `LiveArmCounters::sweep_stalled`).
+    pub sweeps_stranded: u64,
     /// Local refusals, by [`Refusal`].
     pub refused: [u64; REFUSALS],
     /// The gateway's tallies (fills booked, foreign, unowned, dropped,
@@ -212,10 +215,14 @@ pub struct BnArmCounters {
     pub gw: [u64; GW_TALLIES],
 }
 
+// BX11: the refusals by reason cross the dispatch boundary as an array of
+// the dispatcher's length.
+const _: () = assert!(REFUSALS == BINANCE_REFUSALS);
+
 /// The gateway tallies mirrored in [`BnArmCounters::gw`]: the gateway
 /// publishes tally `i` as the stats block's word `i` (BX7) and the arm
 /// copies them on each pulse ([`EVT_STATUS`]).
-pub const GW_TALLIES: usize = 19;
+pub const GW_TALLIES: usize = 20;
 // The tallies' words, then the gateway's weight word (`PW_WEIGHT`).
 const _: () = assert!(GW_TALLIES < PUBLISHED_WORDS);
 /// [`BnArmCounters::gw`] index: fills booked onto lane 4.
@@ -259,6 +266,11 @@ pub const GW_QUIET: usize = 17;
 /// Hosts resolved again after a dial-failure streak, the new address
 /// handed to their connections (BX7, [`crate::dns`]).
 pub const GW_DNS_RERESOLVED: usize = 18;
+/// User-stream events of a kind the arm does not act on
+/// ([`crate::userstream::UE_OTHER`]: `STRATEGY_UPDATE`, `GRID_UPDATE`, a
+/// kind newer than this build) — scanned, counted, never booked (BX11:
+/// BX-15's "never a silent skip").
+pub const GW_EVENTS_OTHER: usize = 19;
 
 /// The knobs the arm is booted with.
 #[derive(Clone, Debug)]
@@ -277,6 +289,10 @@ pub struct ArmKnobs {
     pub margin: MarginBook,
     /// The boot's wall anchor (the QTR cycle is wall time).
     pub anchor: WallAnchor,
+    /// The account mode the gateway was booted in (BX11: the report).
+    pub mode: AccountMode,
+    /// Demo Mode (the battery; the engine trades mainnet only, BX-16).
+    pub demo: bool,
 }
 
 /// A fixed FIFO on the engine thread. `mark` lets a producer hold back
@@ -350,6 +366,9 @@ struct Seen {
     status_ns: u64,
     gap_ns: u64,
     status_flags: u8,
+    /// The last pulse's clock offset (ms) and orders in doubt (BX11).
+    clock_offset_ms: i64,
+    in_doubt: u64,
     reconciled: bool,
     reconciled_once: bool,
     recon_ok_ns: u64,
@@ -391,7 +410,19 @@ pub struct BnArm {
     retired: Fifo<Retired, RET_CAP>,
     renamed: Fifo<Renamed, REN_CAP>,
     c: BnArmCounters,
+    /// BX11: the gateway's latency quantiles the report carries
+    /// ([`LAT_QUANTILES`]), refreshed one a report, round robin.
+    lat: [core::cell::Cell<u64>; LAT_QUANTILES],
+    /// The next quantile the report refreshes.
+    lat_next: core::cell::Cell<u8>,
 }
+
+/// The report's latency quantiles: the WS API's p50 and p99, the cancel's,
+/// the fill's lag, the REST route's and the push-to-write's p99 — each a
+/// 2 048-bucket walk (`Lat::quantile_ns`, "a /metrics read, never a
+/// loop's"): one walk per report, so the engine thread pays about 1 µs a
+/// second and the six refresh within six reports.
+const LAT_QUANTILES: usize = 6;
 
 /// The order flags this arm honours (BX7, the operator's ruling):
 /// reduce-only on any kind (`reduceOnly=true`); post-only on a maker
@@ -442,6 +473,8 @@ impl BnArm {
             retired: Fifo::new(),
             renamed: Fifo::new(),
             c: BnArmCounters::default(),
+            lat: [const { core::cell::Cell::new(0) }; LAT_QUANTILES],
+            lat_next: core::cell::Cell::new(0),
         }
     }
 
@@ -753,6 +786,8 @@ impl BnArm {
                 self.seen.status_ns = e.ts_ns;
                 self.seen.gap_ns = e.a as u64;
                 self.seen.status_flags = e.flags;
+                self.seen.clock_offset_ms = e.b;
+                self.seen.in_doubt = e.c as u64;
                 // The tallies the gateway published just before this pulse.
                 let s = &*self.end.stats;
                 let mut i = 0;
@@ -796,6 +831,7 @@ impl BnArm {
                 // The outcome is the sweep word (`cancel_all_state`); the
                 // report carries the count at once.
                 self.c.gw[GW_SWEEP_LEFT] = e.a as u64;
+                self.c.sweeps_stranded += u64::from(e.flags & EVT_F_SWEEP_STRANDED != 0);
             }
             EVT_DAY => {
                 if (e.slot as usize) < SLOTS {
@@ -1069,8 +1105,13 @@ impl OrderDispatch for BnArm {
             rejected: c.rejected,
             ioc_missed: c.ioc_missed,
             refused_local,
-            refused_stale: c.refused[Refusal::Unbound as usize] + c.refused[Refusal::NotLive as usize],
-            sent_unanswered: self.in_flight as u64,
+            // BX11 (the published traps): a row bound but no longer live
+            // is LAW E-4's "an instance the table has rolled past"; an
+            // order whose answer never came is one put in doubt (BX-11) —
+            // not every order in flight; a stranded sweep is one that gave
+            // up; the headroom is the request weight's in its minute.
+            refused_stale: c.refused[Refusal::NotLive as usize],
+            sent_unanswered: c.gw[GW_IN_DOUBT_RAISED],
             fills_booked: c.gw[GW_FILLS_BOOKED],
             fills_unresolved: c.gw[GW_FILLS_UNRESOLVED],
             fills_foreign: c.gw[GW_FILLS_FOREIGN],
@@ -1082,9 +1123,11 @@ impl OrderDispatch for BnArm {
             recon_drift_legs: c.gw[GW_RECON_DRIFT_LEGS],
             recon_unseen_legs: c.gw[GW_RECON_UNSEEN_LEGS],
             sweep_left: c.gw[GW_SWEEP_LEFT],
+            sweep_stalled: c.sweeps_stranded,
             cancel_all_unqueued: c.cancel_all_unqueued,
             ws_reconnects: c.gw[GW_RECONNECTS],
             ws_connect_failures: c.gw[GW_CONNECT_FAILURES],
+            budget_remaining: ARM_WEIGHT_MAX_PER_MIN as i64 - self.end.stats.published(crate::gateway::PW_WEIGHT) as i64,
             pnl_anchor_usd_1e6: self.seen.anchor_1e6,
             session_pnl_usd_1e6: self.seen.equity_1e6.saturating_sub(self.seen.anchor_1e6),
             ..LiveArmCounters::default()
@@ -1094,6 +1137,94 @@ impl OrderDispatch for BnArm {
     /// BX6: `/state` `exec.arms.binance`.
     fn venue_arm_counters(&self, venue: u8) -> Option<LiveArmCounters> {
         (venue == VenueId::Binance as u8).then(|| self.arm_counters())
+    }
+
+    /// BX11: `/state` `exec.arms.binance_gw`, `/metrics` `engine_exec_bn_*`
+    /// (the trait's doc). Cold: the counters copied, the gateway's stats
+    /// block read, the owned rows counted (≤ 256), the round trips'
+    /// quantiles taken (`/metrics`' cost, once a second at most).
+    fn binance_arm_report(&self, now_ns: u64, out: &mut BinanceArmReport) -> bool {
+        let (c, st, seen) = (&self.c, &*self.end.stats, &self.seen);
+        let flag = |f: u8| u64::from(seen.status_flags & f != 0);
+        let mut owned = 0u64;
+        let mut row = 0u16;
+        while (row as usize) < self.inst.len() {
+            owned += u64::from(self.inst.hot(row).has(INST_OWNED));
+            row += 1;
+        }
+        let hb = st.heartbeat_ns();
+        let k = usize::from(self.lat_next.get()) % LAT_QUANTILES;
+        self.lat[k].set(match k {
+            0 => st.post_rtt.quantile_ns(0.5),
+            1 => st.post_rtt.quantile_ns(0.99),
+            2 => st.cancel_rtt.quantile_ns(0.99),
+            3 => st.fill_venue_to_local.quantile_ns(0.99),
+            4 => st.rest_rtt.quantile_ns(0.99),
+            _ => st.push_to_write.quantile_ns(0.99),
+        });
+        self.lat_next.set(((k + 1) % LAT_QUANTILES) as u8);
+        // COPY: the report (600 B) into the caller's — cold, once a second;
+        // built whole, so no field is left from an earlier read — rejected:
+        // field-by-field writes into `out` (the same bytes, less legible).
+        *out = BinanceArmReport {
+            present: 1,
+            slot: u64::from(self.knobs.owner_slot),
+            acked: c.acked,
+            cancels_sent: c.cancels_sent,
+            cancels_refused: c.cancels_refused,
+            modifies_sent: c.modifies_sent,
+            modifies_refused: c.modifies_refused,
+            modified: c.modified,
+            retired_dropped: c.retired_dropped,
+            renamed_dropped: c.renamed_dropped,
+            budget_obs: c.budget_obs,
+            locks: c.locks,
+            scan_failed: c.scan_failed,
+            evt_unknown: c.evt_unknown,
+            sweeps_stranded: c.sweeps_stranded,
+            fills_deferred: c.gw[GW_FILLS_DEFERRED],
+            jobs_dropped: c.gw[GW_JOBS_DROPPED],
+            in_doubt_raised: c.gw[GW_IN_DOUBT_RAISED],
+            journal_dropped: c.gw[GW_JOURNAL_DROPPED],
+            cancels_owed: c.gw[GW_CANCELS_OWED],
+            quiet: c.gw[GW_QUIET],
+            dns_reresolved: c.gw[GW_DNS_RERESOLVED],
+            events_other: c.gw[GW_EVENTS_OTHER],
+            refused: c.refused,
+            ready: u64::from(self.ready(now_ns)),
+            order_up: flag(EVT_F_ORDER_UP),
+            user_up: flag(EVT_F_USER_UP),
+            deadman_ok: flag(EVT_F_DEADMAN_OK),
+            clock_ok: flag(EVT_F_CLOCK_OK),
+            anchor_unsaved: flag(EVT_F_ANCHOR_UNSAVED),
+            in_flight: u64::from(self.in_flight),
+            in_doubt: seen.in_doubt,
+            clock_offset_ms: seen.clock_offset_ms,
+            heartbeat_age_ms: if hb == 0 { u64::MAX } else { now_ns.saturating_sub(hb) / 1_000_000 },
+            congestion: st.congestion(),
+            halt_reason: st.halt_reason(),
+            sweep: self.cancel_all_state() as u64,
+            weight_used: st.published(crate::gateway::PW_WEIGHT),
+            weight_max: ARM_WEIGHT_MAX_PER_MIN,
+            orders_10s_used: self.fut.w10s.used(now_ns) as u64,
+            orders_10s_cap: self.fut.w10s.cap() as u64,
+            orders_1m_used: self.fut.w1m.used(now_ns) as u64,
+            orders_1m_cap: self.fut.w1m.cap() as u64,
+            quiet_left_ms: seen.budget_until_ns.saturating_sub(now_ns) / 1_000_000,
+            margin_usdm_1e6: self.margin.ratio(PRODUCT_USDM),
+            margin_coinm_1e6: self.margin.ratio(PRODUCT_COINM),
+            owned_rows: owned,
+            account_mode: self.knobs.mode as u64,
+            demo: u64::from(self.knobs.demo),
+            post_rtt_p50_ns: self.lat[0].get(),
+            post_rtt_p99_ns: self.lat[1].get(),
+            post_rtt_max_ns: st.post_rtt.max_ns(),
+            cancel_rtt_p99_ns: self.lat[2].get(),
+            fill_lag_p99_ns: self.lat[3].get(),
+            rest_rtt_p99_ns: self.lat[4].get(),
+            push_to_write_p99_ns: self.lat[5].get(),
+        };
+        true
     }
 
     /// The sweep (the word: it runs whatever the ring holds), then the
@@ -1160,6 +1291,8 @@ pub(crate) mod tests {
             min_maker_ttl_ns: 5_000_000_000,
             margin: MarginBook::new(lim, prod),
             anchor: WallAnchor::new(0, 1_790_000_000_000_000_000),
+            mode: AccountMode::Classic,
+            demo: false,
         };
         Rig { arm: BnArm::new(eng, t, knobs), gw }
     }
@@ -1625,5 +1758,78 @@ pub(crate) mod tests {
         assert!(core_time::now_ns() - t0 < SHUTDOWN_WAIT_NS, "answered: no wait");
         assert_eq!(r.gw.stats.sweep_requested(), asked + 1);
         assert_eq!(r.arm.counters().cancel_all_unqueued, 1, "the verb found no room");
+    }
+
+    /// BX11: the arm's report reads its counters, the last pulse (its
+    /// flags, its clock offset and the orders in doubt), the gateway's
+    /// published tallies and weight, the governor's windows, the margin
+    /// book and the boot's knobs; and the published traps read what they
+    /// say — `sent_unanswered` the orders put in doubt (not every order in
+    /// flight), `sweep_stalled` the stranded sweeps, `budget_remaining` the
+    /// weight's headroom, `refused_stale` a row bound but not live (never
+    /// an unbound one). Break-and-watch: `sent_unanswered` from `in_flight`
+    /// reads 1, not 2; `refused_stale` with `Unbound` reads 1, not 0.
+    #[test]
+    fn the_report_reads_the_arm_the_pulse_and_the_gateway() {
+        let mut r = rig_with(true);
+        r.healthy();
+        r.arm.submit(&order(ORDER_KIND_IOC, Side::Bid, 65_000_000_000, 10_000, 5)).unwrap();
+        let mut stray = order(ORDER_KIND_IOC, Side::Bid, 65_000_000_000, 10_000, 6);
+        stray.sym = make_symbol_id(VenueId::Binance, 999);
+        assert_eq!(r.arm.submit(&stray), Err(DispatchError::NoLiveRoute));
+        r.gw.stats.publish(GW_IN_DOUBT_RAISED, 2);
+        r.gw.stats.publish(GW_JOURNAL_DROPPED, 3);
+        r.gw.stats.publish(crate::gateway::PW_WEIGHT, 100);
+        let now = core_time::now_ns();
+        let mut p = BnEvt::new(EVT_STATUS, now);
+        p.flags = EVT_F_ORDER_UP | EVT_F_USER_UP | EVT_F_CLOCK_OK | EVT_F_DEADMAN_OK | EVT_F_ANCHOR_UNSAVED;
+        p.b = -12;
+        p.c = 1;
+        r.send(p);
+        let mut m = BnEvt::new(EVT_MARGIN, now);
+        m.product = PRODUCT_USDM;
+        m.a = 250_000;
+        r.send(m);
+        r.arm.on_idle();
+        r.arm.cancel_all().unwrap();
+        r.sweep_done(SWEEP_STRANDED);
+        let mut sw = BnEvt::new(EVT_SWEEP, now);
+        sw.flags = EVT_F_SWEEP_STRANDED;
+        r.send(sw);
+        r.arm.on_idle();
+        let mut rep = BinanceArmReport::default();
+        assert!(r.arm.binance_arm_report(core_time::now_ns(), &mut rep));
+        assert_eq!((rep.present, rep.slot), (1, u64::from(SLOT)));
+        assert_eq!((rep.in_doubt_raised, rep.journal_dropped, rep.in_doubt, rep.in_flight), (2, 3, 1, 1));
+        assert_eq!((rep.order_up, rep.user_up, rep.deadman_ok, rep.clock_ok, rep.anchor_unsaved), (1, 1, 1, 1, 1));
+        assert_eq!(rep.clock_offset_ms, -12);
+        assert_eq!((rep.weight_used, rep.weight_max), (100, ARM_WEIGHT_MAX_PER_MIN));
+        assert_eq!((rep.orders_10s_used, rep.orders_1m_used), (1, 1), "the IoC placed");
+        assert!(rep.orders_10s_cap > 0 && rep.orders_1m_cap > rep.orders_10s_cap);
+        assert_eq!(rep.margin_usdm_1e6, 250_000);
+        assert_eq!((rep.sweep, rep.sweeps_stranded), (CancelAllState::Stranded as u64, 1));
+        assert_eq!((rep.owned_rows, rep.account_mode, rep.demo), (1, AccountMode::Classic as u64, 0));
+        assert_eq!(rep.refused[Refusal::Unbound as usize], 1);
+        assert!(rep.heartbeat_age_ms == u64::MAX, "the test's gateway never beat");
+        let lc = r.arm.arm_counters();
+        assert_eq!(lc.sent_unanswered, 2, "the orders put in doubt, not the one in flight");
+        assert_eq!((lc.sweep_stalled, lc.refused_stale, lc.refused_local), (1, 0, 1));
+        assert_eq!(lc.budget_remaining, ARM_WEIGHT_MAX_PER_MIN as i64 - 100);
+        // The alloc review's AL-5: one latency walk a report, round robin —
+        // the six quantiles all read within six reports, never seven walks
+        // in one.
+        r.gw.stats.post_rtt.record(2_000_000);
+        r.gw.stats.cancel_rtt.record(3_000_000);
+        r.gw.stats.fill_venue_to_local.record(4_000_000);
+        r.gw.stats.rest_rtt.record(5_000_000);
+        r.gw.stats.push_to_write.record(6_000);
+        let mut i = 0;
+        while i < LAT_QUANTILES {
+            assert!(r.arm.binance_arm_report(core_time::now_ns(), &mut rep));
+            i += 1;
+        }
+        let lat = [rep.post_rtt_p50_ns, rep.post_rtt_p99_ns, rep.cancel_rtt_p99_ns, rep.fill_lag_p99_ns, rep.rest_rtt_p99_ns, rep.push_to_write_p99_ns];
+        assert!(lat.iter().all(|&q| q > 0), "every quantile read: {lat:?}");
+        assert!(rep.post_rtt_p99_ns >= 2_000_000 && rep.cancel_rtt_p99_ns >= 3_000_000, "{lat:?}");
     }
 }

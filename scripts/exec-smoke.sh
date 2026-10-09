@@ -36,11 +36,15 @@
 # rejection naming OUR OWN recovered address is stronger evidence than
 # an acceptance.
 #
-# IT CANNOT REACH MAINNET. The binary refuses any configuration that is
-# not the testnet host AND the testnet source, and it reads its own
+# IT CANNOT REACH MAINNET — but for one tool, by the operator's hand.
+# The binary refuses any Hyperliquid configuration that is not the
+# testnet host AND the testnet source, and it reads its own
 # HYPERLIQUID_TESTNET_* variables which are disjoint from the live
-# arm's. There is no flag here, or in the binary, that points it at
-# production.
+# arm's; the Binance battery and probe dial Demo hosts only. The one
+# exception is BX11's account tools (`--binance-setup`,
+# `--binance-flatten`) under `--bn-network mainnet`: they READ the live
+# Binance account with the engine's own key and CHANGE it only with
+# `--confirm` — the operator's word, never a session's.
 #
 # EXIT CODES — pinned by `smoke::tests::the_exit_codes_are_pinned`.
 # Change them in one place and that test fails in the other.
@@ -71,6 +75,24 @@
 #       (`--binance-probe`): 59 a probe failed (an arming-precondition
 #       probe refused, or a probe that could not run). They read only the
 #       BINANCE_DEMO_* variables and dial Demo hosts only.
+#   60-64 BX11, the Binance ACCOUNT TOOLS (pinned by `bn_ops::tests`):
+#       `--binance-setup <um|cm>` and `--binance-flatten <um|cm>`. 60 a
+#       read failed (a setting, the account, the orders or the book), 61
+#       the venue refused a setup change (or a setting read back otherwise)
+#       or a flatten's cancel (or one was not sent; a refused close is the
+#       final read's 63), 62 the flatten found an order of the arm's resting
+#       and was not given --bn-cancel-first (nothing sent: is the engine
+#       running?), 63 a position STILL OPEN after the flatten's tries
+#       (loudest), 64 mainnet without --confirm (read, every change
+#       printed, nothing sent). Demo unless --bn-network mainnet.
+#   65  BX11, the battery's gap drill (`--bn-drill gap`): once the
+#       gateway was stopped, the venue's dead-man was not seen to cancel
+#       the makers (none in time, too soon, or a maker filled); the run
+#       cancelled any left by id. A drill that fails before the gateway
+#       stops is 52. The flatten drill (`--bn-drill flatten`) ends with the
+#       flatten's own code (60-63); before the gateway stops, 57, 56 or 52.
+#       Once a drill stopped the gateway (and no signal came) the end runs
+#       the flatten on Demo, then reads the account (58 if not flat).
 # The diagnostics start at 20 because clap exits 2 on any argument
 # error: a release binary too old to have the arm would otherwise have
 # reported itself as a signing failure.
@@ -124,14 +146,31 @@ offline=0
 dry=0
 hlperp=0
 binance=0
+bnops=0
+drill=0
+mainnet=0
+prev=""
 for a in "$@"; do
   [ "$a" = "--hl-perp" ] && hlperp=1
-  case "$a" in --binance*) binance=1 ;; esac
+  # The account tools first: their names also start `--binance`.
+  case "$a" in
+    --binance-setup*|--binance-flatten*) bnops=1 ;;
+    --binance*) binance=1 ;;
+    --bn-drill*) drill=1 ;;
+    --bn-network=mainnet) mainnet=1 ;;
+  esac
+  [ "$prev" = "--bn-network" ] && [ "$a" = "mainnet" ] && mainnet=1
   [ "$a" = "--offline" ] && offline=1
   # A dry run reaches no venue either, and must not inherit the
   # message that says one verified us. Same rule as --offline.
   [ "$a" = "--dry-run" ] && dry=1
+  prev="$a"
 done
+account="DEMO"
+if [ "$bnops" = 1 ] && [ "$mainnet" = 1 ]; then
+  account="LIVE (mainnet)"
+  echo "exec-smoke: *** --bn-network mainnet: the account tool READS THE LIVE BINANCE ACCOUNT with the engine's own key; it changes it only with --confirm ***" >&2
+fi
 
 # One line of JSON on stdout for CI; the human report on stderr. A
 # Ctrl-C reaches the binary too (its handler ends the battery short);
@@ -146,6 +185,10 @@ case "$rc" in
         echo "exec-smoke: DRY RUN — nothing was sent and NOTHING was verified; the action above is what would go on the wire" >&2
       elif [ "$offline" = 1 ]; then
         echo "exec-smoke: PASS (offline) — this binary reproduces the venue SDK's bytes for every action type; the venue was NOT contacted" >&2
+      elif [ "$bnops" = 1 ]; then
+        echo "exec-smoke: PASS (Binance account tool, $account account) — the report above names every read, change and answer" >&2
+      elif [ "$drill" = 1 ]; then
+        echo "exec-smoke: PASS (Binance Demo drill) — the drill's bar held (the report names it); nothing was left on the Demo account" >&2
       elif [ "$binance" = 1 ]; then
         echo "exec-smoke: PASS (Binance Demo) — the report above names every answer; nothing was left on the Demo account" >&2
       else
@@ -160,6 +203,12 @@ case "$rc" in
   58) echo "exec-smoke: *** BX7b: SOMETHING WAS LEFT ON THE BINANCE DEMO ACCOUNT, OR ITS END COULD NOT READ IT *** — the report names it; read the account by hand and clear it before the next run" >&2 ;;
   59) echo "exec-smoke: *** BX7b: A BINANCE DEMO PROBE FAILED *** — the report above names it" >&2 ;;
   5[0-7]) echo "exec-smoke: BX7b Binance Demo battery FAILED (exit $rc) — the report above names the phase" >&2 ;;
+  60) echo "exec-smoke: *** BX11: A BINANCE READ FAILED *** — the report names it and every change or order sent before it: read the $account account by hand" >&2 ;;
+  61) echo "exec-smoke: *** BX11: THE VENUE REFUSED A SETUP CHANGE OR A FLATTEN'S CANCEL *** — the report names its answer; read the $account account before trying again" >&2 ;;
+  62) echo "exec-smoke: BX11 flatten: an order of the arm's rests — is the engine running? NOTHING was sent; stop it first, or pass --bn-cancel-first" >&2 ;;
+  63) echo "exec-smoke: *** BX11 FLATTEN: A POSITION IS STILL OPEN AFTER ITS TRIES *** — the report names it; close it by hand on the $account account" >&2 ;;
+  64) echo "exec-smoke: BX11: mainnet without --confirm — the account was read and every change it would send is printed above; NOTHING was sent" >&2 ;;
+  65) echo "exec-smoke: *** BX11 DRILL: THE VENUE'S DEAD-MAN WAS NOT SEEN TO CANCEL THE MAKERS *** — the report names why; the run cancelled any left by id and read the Demo account" >&2 ;;
   *) echo "exec-smoke: could not run (exit $rc)" >&2
      # 1 (refused before anything was sent) and 2 (clap) left nothing.
      if [ "$hlperp" = 1 ] && [ "$rc" != 1 ] && [ "$rc" != 2 ]; then
@@ -167,6 +216,9 @@ case "$rc" in
      fi
      if [ "$binance" = 1 ] && [ "$rc" != 1 ] && [ "$rc" != 2 ]; then
        echo "exec-smoke: *** the Binance Demo tool ended abnormally — orders or a position may remain on the DEMO account: read it before the next run ***" >&2
+     fi
+     if [ "$bnops" = 1 ] && [ "$rc" != 1 ] && [ "$rc" != 2 ]; then
+       echo "exec-smoke: *** the Binance account tool ended abnormally — a change or an order may have reached the $account account: read it before anything else ***" >&2
      fi ;;
 esac
 exit $rc

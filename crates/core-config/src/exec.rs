@@ -568,7 +568,7 @@ pub struct ExecBinance {
     /// read locks one above it. Portfolio Margin does not assert it at boot
     /// (a residual: papi's `positionRisk` would); a change there still
     /// locks. `1..=125`, default 20 (Binance's own default). The engine
-    /// never sets it (`exec-smoke --binance setup` does).
+    /// never sets it (`exec-smoke --binance-setup` does).
     pub max_leverage: i64,
     /// Line the section header sat on.
     pub line: usize,

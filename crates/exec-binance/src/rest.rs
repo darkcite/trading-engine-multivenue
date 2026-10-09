@@ -250,6 +250,54 @@ pub fn ord_specs<'a>(product: u8, pm: bool, key: &'a [(&'a str, &'a str)]) -> [R
     ]
 }
 
+/// BX11 — the account tool's mutations (`exec-smoke --binance-setup`),
+/// signed, body-form: `POST positionSide/dual` (`dualSidePosition`).
+/// The engine never sends one (BX-19: it asserts; the operator sets).
+pub const U_DUAL: usize = 0;
+/// `POST multiAssetsMargin` (`multiAssetsMargin`; USDⓈ-M only).
+pub const U_MULTI_ASSETS: usize = 1;
+/// `POST marginType` (`symbol`, `marginType`).
+pub const U_MARGIN_TYPE: usize = 2;
+/// `POST leverage` (`symbol`, `leverage`).
+pub const U_LEVERAGE: usize = 3;
+/// `POST stock/contract`: the TradFi Perps agreement (USDⓈ-M only; plan
+/// §1.6 item 5).
+pub const U_STOCK_CONTRACT: usize = 4;
+/// The setup templates.
+pub const SETUP_TEMPLATES: usize = 5;
+
+/// The account tool's templates for `product` (`PRODUCT_COINM`: dapi;
+/// otherwise fapi), every one carrying the key header. COIN-M names no
+/// multi-assets or agreement endpoint: those two slots are never started
+/// there (as [`fut_specs`]' unused ones).
+#[must_use]
+pub fn setup_specs<'a>(product: u8, key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; SETUP_TEMPLATES] {
+    let p: [&'a str; SETUP_TEMPLATES] = if product == PRODUCT_COINM {
+        [
+            "/dapi/v1/positionSide/dual",
+            "/dapi/v1/multiAssetsMargin",
+            "/dapi/v1/marginType",
+            "/dapi/v1/leverage",
+            "/dapi/v1/stock/contract",
+        ]
+    } else {
+        [
+            "/fapi/v1/positionSide/dual",
+            "/fapi/v1/multiAssetsMargin",
+            "/fapi/v1/marginType",
+            "/fapi/v1/leverage",
+            "/fapi/v1/stock/contract",
+        ]
+    };
+    let b = |t: usize| ReqSpec {
+        method: Method::Post,
+        path: p[t],
+        params: Params::Body(FORM),
+        headers: key,
+    };
+    [b(U_DUAL), b(U_MULTI_ASSETS), b(U_MARGIN_TYPE), b(U_LEVERAGE), b(U_STOCK_CONTRACT)]
+}
+
 /// **`POST /fapi/v1/order`** — the REST route's place (BX7, C5): the WS
 /// API's `order.place` parameters as a query, rendered in place.
 pub fn render_place(w: &mut QueryWriter<'_>, st: &WsStatic, o: &Place<'_>) {

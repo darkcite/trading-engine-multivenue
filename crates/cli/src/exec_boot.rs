@@ -1217,21 +1217,7 @@ mod tests {
         // BX6: the recipe is the key plus the `[exec.binance]` block, both
         // uncommented — and the result must also RESOLVE (a gateway this
         // binary has, the one owner slot).
-        let mut in_block = false;
-        let mut bn = String::new();
-        for l in live
-            .replacen("venues = [\"hyperliquid\"]", "venues = [\"binance\"]", 1)
-            .replacen(
-                "# halt_on_margin_ratio_1e6 = 600000",
-                "halt_on_margin_ratio_1e6 = 600000",
-                1,
-            )
-            .lines()
-        {
-            in_block |= l == "# [exec.binance]";
-            bn.push_str(if in_block { l.strip_prefix("# ").unwrap_or(l) } else { l });
-            bn.push('\n');
-        }
+        let bn = binance_recipe(&live);
         let b = core_config::exec::parse(&bn).expect("the template's Binance recipe parses");
         assert_eq!(b.slot(3).halt_on_margin_ratio_1e6, 600_000);
         assert_eq!(b.binance.as_ref().map(|b| b.products.clone()), Some(vec![String::from("usdm")]));
@@ -1247,6 +1233,75 @@ mod tests {
         ))
         .expect_err("a live Binance slot without the key");
         assert!(e.to_string().contains("halt_on_margin_ratio_1e6"), "{e}");
+    }
+
+    /// The template's Binance recipe (BX6): slot 3 names binance, with the
+    /// margin key and the `[exec.binance]` block uncommented.
+    fn binance_recipe(live: &str) -> String {
+        let mut in_block = false;
+        let mut bn = String::new();
+        for l in live
+            .replacen("venues = [\"hyperliquid\"]", "venues = [\"binance\"]", 1)
+            .replacen(
+                "# halt_on_margin_ratio_1e6 = 600000",
+                "halt_on_margin_ratio_1e6 = 600000",
+                1,
+            )
+            .lines()
+        {
+            in_block |= l == "# [exec.binance]";
+            bn.push_str(if in_block { l.strip_prefix("# ").unwrap_or(l) } else { l });
+            bn.push('\n');
+        }
+        bn
+    }
+
+    /// BX11: the template's Binance recipe boots every product and account
+    /// mode this binary builds, each by the edits its block's comments name
+    /// — and refuses the two the comments forbid (PM, and an HMAC key, off
+    /// the REST route).
+    #[test]
+    fn the_templates_binance_recipe_boots_every_built_product_and_mode() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../exec.toml.example"),
+        )
+        .expect("exec.toml.example must ship with the repo");
+        let base = binance_recipe(&src.replacen("mode = \"paper\"", "mode = \"live\"", 1));
+        const PRODUCTS: &str = "products = [\"usdm\"]";
+        const CLASSIC: &str = "account_mode = \"classic\"";
+        const WS: &str = "order_transport = \"ws\"";
+        const REST: &str = "order_transport = \"rest\"";
+        const ED25519: &str = "signing = \"ed25519\"";
+        let cases: [(&str, &[(&str, &str)], bool); 8] = [
+            ("USD-M classic on the WS API", &[], true),
+            ("COIN-M classic", &[(PRODUCTS, "products = [\"coinm\"]")], true),
+            ("both products, classic", &[(PRODUCTS, "products = [\"usdm\", \"coinm\"]")], true),
+            ("USD-M classic on REST", &[(WS, REST)], true),
+            ("an HMAC key on REST", &[(ED25519, "signing = \"hmac\""), (WS, REST)], true),
+            ("PM on REST, both products", &[(CLASSIC, "account_mode = \"pm\""), (WS, REST), (PRODUCTS, "products = [\"usdm\", \"coinm\"]")], true),
+            ("PM Pro", &[(CLASSIC, "account_mode = \"pm_pro\"")], true),
+            ("PM on the WS API", &[(CLASSIC, "account_mode = \"pm\"")], false),
+        ];
+        for (what, edits, boots) in cases {
+            let mut src = base.clone();
+            for (from, to) in edits {
+                assert!(src.contains(from), "{what}: the template has no `{from}`");
+                src = src.replacen(from, to, 1);
+            }
+            let d = tmp();
+            let p = write(&d, "exec.toml", &src);
+            let got = resolve(Some(&p), Some("3"));
+            std::fs::remove_dir_all(&d).ok();
+            if boots {
+                let eb = got.unwrap_or_else(|e| panic!("{what}: {e}")).expect("a table");
+                assert_eq!(eb.binance_slot(), Some(3), "{what}");
+            } else {
+                assert!(got.is_err(), "{what} must refuse");
+            }
+        }
+        let hmac_ws = base.replacen(ED25519, "signing = \"hmac\"", 1);
+        let e = core_config::exec::parse(&hmac_ws).map(|_| ()).expect_err("an HMAC key on the WS API");
+        assert!(e.to_string().contains("rest"), "{e}");
     }
 
     #[test]

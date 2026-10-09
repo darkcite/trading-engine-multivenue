@@ -359,7 +359,8 @@ pub fn boot_binance_arm(
             unseen,
             "binance: the account holds positions on {unseen} instrument(s) this boot did not \
              bind — the slot stays UNRECONCILED and refuses every order until they are flattened \
-             by hand (there is no flatten tool before BX11)"
+             (the engine stopped: the operator's `scripts/exec-smoke.sh --binance-flatten <um|cm> \
+             --bn-network mainnet --confirm`, or by hand)"
         );
     }
     let arm = BnArm::new(
@@ -373,6 +374,8 @@ pub fn boot_binance_arm(
             min_maker_ttl_ns: u64::try_from(s.min_maker_ttl_ms).unwrap_or(u64::MAX / 2_000_000) * 1_000_000,
             margin,
             anchor: core_time::WallAnchor::now(),
+            mode,
+            demo: false,
         },
     );
     let handle = std::thread::Builder::new()

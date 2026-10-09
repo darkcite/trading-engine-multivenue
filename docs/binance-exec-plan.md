@@ -290,7 +290,7 @@ These are the operator's checklist. None of them blocks a code phase.
    - If K13 or K15 show that papi or SAPI-equity refuse Ed25519, an HMAC or RSA key is added **for that product only**.
 4. **UM/CM account settings.**
    - One-way mode, which is shared by UM and CM; multi-assets off; cross margin; leverage at or below the artifact maximum.
-   - The engine **asserts these and never sets them**; `exec-smoke --binance setup` sets them.
+   - The engine **asserts these and never sets them**; `exec-smoke --binance-setup` sets them.
 5. **Agreements and modes.**
    - The TradFi Perps agreement.
    - The TradFi Options agreement, only if XAU/XAG options are used.
@@ -720,7 +720,7 @@ mv  EEEEEEEE  S  OOOOOOOOOOOOOOOO      27 chars, [a-z0-9] only
    - Binance Stocks none → DAY orders plus the mandatory gateway TTL.
 3. **`exec.HALT` and `--halt-slot`**: unchanged.
 4. **Disable the key in the Binance UI.** It works with the host unreachable.
-5. **Operator flatten tool**, `exec-smoke --binance flatten --product … [--symbol …]`: reduce-only IoC, per product. It is never wired to a trigger.
+5. **Operator flatten tool**, `exec-smoke --binance-flatten <um|cm> [--bn-symbol …]`: reduce-only IoC, per product. It is never wired to a trigger.
 
 ### 3.12 Keys, configuration, interlocks
 
@@ -779,7 +779,7 @@ halt_on_margin_ratio_1e6 = 600000   # D6: halt at 60 % maintenance / equity (ven
 - The TradFi agreement: `-4411` is a per-instrument fatal refusal.
 - Long & Short Sell mode: the first `-6057` is a per-underlying fatal refusal (K18).
 
-Every account mutation lives in the operator tool `exec-smoke --binance setup`.
+Every account mutation lives in the operator tool `exec-smoke --binance-setup`.
 
 ### 3.13 Observability
 
@@ -1381,7 +1381,7 @@ Every scanner gets a `never_panics` proptest and a cargo-fuzz target: `bn_wsapi_
 - **Departures** (each also in risk-policy "BX6"):
   1. The scope above.
   2. Obligation 1 by ordering (fills before the retiring event, retirements one idle late); the router still releases on `FILLED`.
-  3. **No position adoption across a restart.** A venue position the gateway did not book is an unseen leg: the slot stays unreconciled (fail closed) until someone flattens it by hand (no flatten tool before BX11). Adoption is BX7's.
+  3. **No position adoption across a restart.** A venue position the gateway did not book is an unseen leg: the slot stays unreconciled (fail closed) until someone flattens it by hand (no flatten tool before BX11; BX11's is `exec-smoke --binance-flatten`). Adoption is BX7's.
   4. The 23 h rotation is break-and-reconnect at a quiet moment (nothing in flight, the command ring empty); make-before-break is BX7's. The user stream is not rotated: the venue's 24 h cut is a daily reopen, a `doubt_all` and a burst of status queries.
   5. At most one live Binance slot; it owns every bound row (BX-7 as built).
   6. On SIGINT the gateway serves up to 8 s for the engine drain's shutdown sweep (the arm waits 3 s), which cancels makers only and never flattens; then the countdown is the backstop.
@@ -1603,6 +1603,43 @@ Every scanner gets a `never_panics` proptest and a cargo-fuzz target: `bn_wsapi_
 - Force a margin ratio over its threshold (loopback): `MarginRisk` fires.
 
 **Size:** about 900 src + 700 test + docs.
+
+**BX11 record (2026-10-09, branch `binance`, one commit `BX11:`).** The risk law is risk-policy "BX11"; the laws as built are risk-policy "BX — the Binance execution laws (BX-1 … BX-20)"; the operator's procedures are `docs/binance-runbook.md`; the working log is the project doc `claude/bx11-build-plan-2026-10-09.md`. Nothing arms a member (O-BX6); Demo orders only; the session never ran an account tool on mainnet.
+
+- **Built:**
+
+  | file | what |
+  |---|---|
+  | `crates/exec-binance/src/{userstream,oot,journal,json}.rs` | **`J_FEE`** (kind 10; BX-14's defect: a fill booked off `TRADE_LITE` journaled no commission, and the update that carries it was deduplicated away): one record per trade from the first `ORDER_TRADE_UPDATE` that reports it (`TidRing::see` → `TradeSeen`), the commission ×1e9 in its own asset `N` (`json::dec_1e9`), the notional ×1e9 in the row's settlement asset, and in `code` the maker, asset, owner, product, dated and TradFi bits; `J_FILL.c` = 0 |
+  | `crates/exec-binance/src/{arm,gateway}.rs` | `BinanceArmReport` (600 B), filled cold once a second, one latency histogram a report; `GW_EVENTS_OTHER`; the misreading published words corrected; the anchor's journal retry flagged (`anchor_unsaved`); `JournalTx<const N>` |
+  | `crates/clob-dispatcher`, `crates/exec-router` | `OrderDispatch::binance_arm_report`, forwarded by `Option`, `RoutedDispatcher`, `SlotSplit` and `VenueSplit` |
+  | `crates/engine-snapshot`, `crates/cli/src/paper.rs`, `crates/tui` | `/state` `exec.arms.binance_gw` (`BinanceGwSnapshot`, 344 B; `EngineSnapshot` 31 808 B of 32 768), `/metrics` `engine_exec_bn_*` (41 counters, 31 gauges), the TUI's `bn_chip` |
+  | `crates/cli/src/bn_ops.rs` (new) | the account tools `exec-smoke --binance-setup` and `--binance-flatten` (O-BX9, §3.12): classic accounts only; Demo by default; a mainnet change only with `--confirm` (`MainnetVerb`); exit codes 60–64 |
+  | `crates/cli/src/bn_fees.rs` (new) | `multivenue-engine bn-fees <run-dir>…` (BX-14): read-only; the `fees.toml` rows printed, never written |
+  | `crates/cli/src/bn_demo.rs` | the client's guard (`WordGuard`, `Rest::sign_change`): a change reaches a mainnet host only signed with the operator's word, whatever rendered it |
+  | `crates/cli/src/bn_battery.rs` | the Demo drills `--bn-drill gap` and `--bn-drill flatten`; the end's flatten after a drill; `fills_journaled` and `fees_journaled` |
+  | `crates/cli/src/bin/multivenue-engine.rs` | the tools' flags (`BN_TOOL_CONFLICTS`; a tool's own flag `requires = "binance_tool"`), `--bn-drill`, `bn-fees` |
+  | `crates/exec-binance/src/{rest,mode,config}.rs` | the setup templates (`setup_specs`); `mode::symbol_config`; `MainnetVerb` |
+  | `docs/risk-policy.md` | "BX — the Binance execution laws (BX-1 … BX-20)": each law as built, where it is enforced, its tests, its residual; the "BX11" entry |
+  | `docs/binance-runbook.md` (new), `docs/local-setup.md`, `docs/wire-format.md`, `exec.toml.example`, `.env.example`, `scripts/exec-smoke.sh` | the operator's runbook; the journal's format (`J_FEE` and BX7's records); the Binance slot blocks, pinned bootable (`exec_boot`'s template test); the exit codes 60–65 named |
+  | tests | `J_FEE` once per trade (e2e: lite first, update first, replay, a lost stream's late update, COIN-M in the coin); the report against the counters; `/state` keys; the chip; S8 on a 2-slot ring; the loopback drills (`WsGap` and the venue's countdown, `ReconStale`, `BudgetFloor`, `MarginRisk`); the tools' pure parts; gates 43, 92 and 93 extended; proptest F2 and fuzz `bn_user_event` read `N` |
+
+- **Departures from the build list:**
+  1. **The 429 drill is loopback-only** (`BudgetFloor`, the reason asserted): a deliberate breach on Demo risks an IP ban that the running engine's market data shares.
+  2. **The gap drill also runs on Demo** (the battery's `--bn-drill gap`), and a **flatten drill** was added (`--bn-drill flatten`, both products): the operator's flatten closes a real Demo position the arm opened.
+  3. **The tools are classic-only** (`fapi`, `dapi`): PM and PM Pro accounts are set and closed in the app.
+  4. "Sweeps plus confirmation per product × mode; dead-man wiring" were built in BX6–BX7 (risk-policy "BX6": "The dead-man as built", "The sweep"); BX11 drills them.
+  5. **CLAUDE.md is untouched** (its CURRENT STATE is the operator's ask).
+- **Rulings assumed** (the build plan's defaults; the questions stayed unanswered): the tools reach mainnet only behind `--bn-network mainnet --confirm`; `bn-fees` prints the rows and never writes `fees.toml`; N = 30 per class; COIN-M stays IoC-only (O-BX3a; K16 is answered on Demo only).
+- **Evidence** (Demo, 2026-10-09 21:26–21:31Z, the final binary): the probe; the battery on both products (19 fills and 19 fees journaled, one per trade); four setup runs (the "no need" answers `-4059`, `-4171` and `-4046` read as held; the TradFi agreement `SUCCESS`); two flattens (flat: 0; a typo: 1); the flatten drill on each product (a real position closed by the tool on its first try); and the gap drill (the venue's dead-man cancelled both makers 30.918 s after the kill). All as expected, nothing left. The table is in risk-policy "BX11".
+- **Reviewers** (Opus 5.5 subagents acting as the agents, read-only; full dispositions in risk-policy "BX11"):
+  - **Round 1:** risk NEEDS-DOCS (12 findings, among them that only the tool kept a change off mainnet); zero-copy PASS; alloc PASS; parser FAIL (the combined form did not re-base the commission's asset; a battery flag beside a tool parsed and was ignored).
+  - **Round 2:** risk NEEDS-DOCS (10 findings, among them a guard that rendering again could bypass); zero-copy and alloc PASS; parser PASS.
+  - **Round 3:** risk and parser NEEDS-DOCS (the code approved; 4 findings).
+
+  Every finding was fixed or acted on, each new law break-and-watched.
+- **Carried:** the account tools' first mainnet use (the operator's); a measured fee rate (no run journals `J_FEE` before a member arms); the residuals risk-policy "BX11" lists (the connectors' vectors; `recvWindow` unmeasured; `-2015` never `VenueLock`; a mid-session account-mode change unseen; BNB burn; five tests); gate 94 and the TLS loopback set (BX12).
+- **Size:** about 6 000 lines added across 42 files: about 4 900 of code, tests and scripts, and 1 100 of docs.
 
 ### BX12: Gates
 
@@ -1888,6 +1925,13 @@ v1 already absorbs COIN-M, PM and Binance Stocks.
   - The Mac's disk filled during the session (2026-10-08 21:48Z, 114 MiB free; this lane's build caches are about 7 GB of it). The work waited in the cloud until space was freed; nothing was deleted.
   - Docs: `docs/risk-policy.md` ("BX7b"; BX7's pointers), `.env.example` (the Demo keys' readers), this plan (§5 BX7b, §13.5).
   - Git: one commit `BX7b:`, explicit paths. The engine was never touched.
+- **2026-10-09, BX11 built** (branch `binance`, on `4e0d10c` BX7b): the kill switches drilled, observability, the operator's account tools, the laws; Demo orders only; no member arms (O-BX6). The record is in §5 BX11; the risk law in risk-policy "BX11"; the laws in risk-policy "BX — the Binance execution laws".
+  - Demo evidence on the final binary (2026-10-09 21:26–21:31Z): the probe, the battery on both products, four setup runs, two flattens and three drills, each as expected (risk-policy "BX11"). The runs of 20:25Z, on the binary of the round-1 fixes, are superseded.
+  - Reviewers, three rounds: risk NEEDS-DOCS each time (the code approved in round 3); zero-copy and alloc PASS throughout; parser FAIL, PASS, then NEEDS-DOCS beside risk (the code approved). Every finding fixed or acted on, each new law break-and-watched.
+  - Fuzz (Mac, 300 s each, three at a time, no crash): `bn_user_event` 29.3 M, `bn_mode` 24.0 M, `bn_rest_body` 22.1 M, `bn_rest_answer` 32.6 M, `bn_wsapi_frame` 31.0 M and `bn_account` 24.6 M runs — the six targets `json`'s readers reach (`dec_1e6` now shares `dec_1e9`'s reader).
+  - Gates on the final tree (Mac, 21:31–21:35Z): clippy clean; nextest 4 385 run, 4 385 passed, 9 skipped; alloc 117/117 at 0 B/op, 3 ignored, with a fresh `Compiling bench` (gates 43, 92 and 93 extended); `make copy-audit` hits=28 baselined=28 new=0 paid=0 after its self-test; `make license-check` OK (668 files). Then two import lists (`bn_probe.rs`, `bn_battery.rs`) were re-wrapped, no line moved: the release binary rebuilt byte-identical to the Demo evidence's (md5 `d01b857f…`), clippy clean, the cli tests 564 run, 564 passed, 6 skipped.
+  - Docs: `docs/risk-policy.md` (the laws section; "BX11"), `docs/binance-runbook.md` (new), `docs/local-setup.md` (a pointer to it), `docs/wire-format.md` (the journal: `J_FEE`, `ADOPTED`, `MARGIN`'s code, the codes, the anchor line), `exec.toml.example` (the Binance blocks), `.env.example`, this plan (§5 BX11; the tools' spellings).
+  - Git: one commit `BX11:`, explicit paths. The engine was never touched.
 
 ---
 

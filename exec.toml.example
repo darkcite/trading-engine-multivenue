@@ -495,6 +495,12 @@ mode = "paper"
 # (the defaults weigh 1 309).
 # `orders_frac_1e6` / `qtr_frac_1e6`: the share of each venue order
 # window and quantitative-rule threshold the arm may use.
+#
+# The variants this binary boots, each one edit of the block below (BX11:
+# a test resolves every one): products = ["coinm"] or ["usdm", "coinm"];
+# order_transport = "rest"; signing = "hmac" with order_transport =
+# "rest"; account_mode = "pm" with order_transport = "rest";
+# account_mode = "pm_pro". Before arming, docs/binance-runbook.md.
 # [exec.binance]
 # network = "mainnet"
 # account_mode = "classic"

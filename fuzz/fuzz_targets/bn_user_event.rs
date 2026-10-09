@@ -13,7 +13,9 @@
 //! as the scan counted, in frame order, the first being the event's own
 //! span, the count exact (never saturated); and an accepted whole raw frame,
 //! wrapped in the combined form, scans alike (spans re-based) and walks
-//! alike.
+//! alike. BX11: the commission's asset (`N`) is a span inside the frame,
+//! named — with a commission — only by an order update (a `TRADE_LITE`'s
+//! reads empty), and re-based in the combined form like every span.
 
 #![no_main]
 
@@ -48,8 +50,11 @@ fuzz_target!(|data: &[u8]| {
     }
     assert!((UE_ORDER..=UE_CONFIG).contains(&e.kind), "a kind no scan writes");
     assert!(matches!(e.fs, 0 | PRODUCT_USDM | PRODUCT_COINM | u8::MAX), "an fs no scan writes");
-    for s in [e.symbol, e.cid] {
+    for s in [e.symbol, e.cid, e.fee_asset] {
         assert!(s.at as usize + s.len as usize <= data.len(), "a span past the frame");
+    }
+    if e.kind != UE_ORDER {
+        assert!(e.fee_asset.len == 0 && e.commission_1e9 == 0, "a commission on no order update");
     }
     if e.kind == UE_ORDER || e.kind == UE_TRADE_LITE {
         assert!(!e.symbol.get(data).is_empty(), "an order event with no symbol");
@@ -100,6 +105,7 @@ fuzz_target!(|data: &[u8]| {
         let mut want = e;
         want.symbol.at += off;
         want.cid.at += off;
+        want.fee_asset.at += off;
         if want.positions != 0 {
             want.positions += off;
         }

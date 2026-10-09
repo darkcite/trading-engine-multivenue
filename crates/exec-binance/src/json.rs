@@ -9,7 +9,7 @@
 //! can never be mistaken for one of the outer object's), and the caller
 //! dispatches on the key bytes. [`Elems`] walks the elements of one
 //! array. Values are handed out as byte spans of the frame; the typed
-//! readers ([`str_of`], [`dec_1e6`], [`u64_of`], [`i64_of`], [`bool_of`])
+//! readers ([`str_of`], [`dec_1e6`], [`dec_1e9`], [`u64_of`], [`i64_of`], [`bool_of`])
 //! accept Binance's habit of quoting numbers.
 //!
 //! Every malformed input ends the walk with `Err(())`; the scanners turn
@@ -227,6 +227,20 @@ fn num_bytes(b: &[u8], v0: usize, v1: usize) -> Result<&[u8], ()> {
 /// never defaulted; the scale's own overflow is refused by the scanner.
 #[inline]
 pub fn dec_1e6(b: &[u8], v0: usize, v1: usize) -> Result<i64, ()> {
+    dec_scaled::<false>(b, v0, v1)
+}
+
+/// [`dec_1e6`]'s law at ×1e9 (≤ 9 decimals kept), for an amount finer
+/// than a millionth (BX11: a commission — COIN-M's is charged in the coin,
+/// 8 decimals, where ×1e6 keeps nothing of a small trade's).
+#[inline]
+pub fn dec_1e9(b: &[u8], v0: usize, v1: usize) -> Result<i64, ()> {
+    dec_scaled::<true>(b, v0, v1)
+}
+
+/// The two scales' one reader (`E9`: ×1e9, else ×1e6).
+#[inline(always)]
+fn dec_scaled<const E9: bool>(b: &[u8], v0: usize, v1: usize) -> Result<i64, ()> {
     let n = num_bytes(b, v0, v1)?;
     let mut i = (n.first() == Some(&b'-')) as usize;
     let int0 = i;
@@ -236,7 +250,8 @@ pub fn dec_1e6(b: &[u8], v0: usize, v1: usize) -> Result<i64, ()> {
     if i - int0 > 18 {
         return Err(());
     }
-    let (v, end) = core_parse::scan_price_1e6(n, 0).ok_or(())?;
+    let scanned = if E9 { core_parse::scan_price_1e9(n, 0) } else { core_parse::scan_price_1e6(n, 0) };
+    let (v, end) = scanned.ok_or(())?;
     if end != n.len() {
         return Err(());
     }
@@ -376,7 +391,9 @@ mod tests {
         assert_eq!(u64_of(f, 4, 6), Ok(12));
         assert_eq!(i64_of(f, 7, 11), Ok(-3));
         assert_eq!(dec_1e6(f, 12, 19), Ok(1_000));
+        assert_eq!(dec_1e9(f, 12, 19), Ok(1_000_000));
         assert!(dec_1e6(f, 20, 25).is_err(), "no exponent");
+        assert!(dec_1e9(f, 20, 25).is_err(), "no exponent");
         assert!(u64_of(f, 26, 46).is_err(), "20 digits could wrap");
         assert!(u64_of(f, 47, 51).is_err());
     }
@@ -388,7 +405,7 @@ mod tests {
                 for _ in 0..64 {
                     match w.next() {
                         Ok(Some((_, a, z))) => {
-                            let _ = (str_of(&bytes, a, z), dec_1e6(&bytes, a, z), u64_of(&bytes, a, z), i64_of(&bytes, a, z), bool_of(&bytes, a, z));
+                            let _ = (str_of(&bytes, a, z), dec_1e6(&bytes, a, z), dec_1e9(&bytes, a, z), u64_of(&bytes, a, z), i64_of(&bytes, a, z), bool_of(&bytes, a, z));
                         }
                         _ => break,
                     }

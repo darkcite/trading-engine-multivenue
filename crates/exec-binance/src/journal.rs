@@ -5,15 +5,16 @@
 //!
 //! What the venue said, in order, for the fee measurement (BX-14) and the
 //! shadow reconciliation tool: ACKs, refusals with their code, fills with
-//! commission and maker flag, cancels and expiries with their reason,
-//! reconciliation verdicts and margin samples — one
-//! [`core_types::ExecRecord`] (64 B) each.
+//! their maker flag, each trade's commission with its asset ([`J_FEE`],
+//! BX11), cancels and expiries with their reason, reconciliation verdicts
+//! and margin samples — one [`core_types::ExecRecord`] (64 B) each.
 //!
 //! **Out of band.** The gateway never touches the disk: it pushes records
 //! into an SPSC ring ([`JournalTx::note`]) and a cold thread
 //! ([`spawn_writer`]) appends them to the file and flushes once a second.
 //! A full ring DROPS the record and counts it — the journal is evidence,
-//! never a brake on the order path.
+//! never a brake on the order path. The ring's capacity is the type's
+//! (BX11): the engine's is [`JOURNAL_RING`]; a test's can be two.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +25,7 @@ use core_io::slot_capture::SlotCapture;
 use core_ring::{Consumer, Producer};
 use core_types::ExecRecord;
 
+use crate::inst::{BnInstWire, INST_DATED, INST_INVERSE, INST_TRADFI};
 use crate::mode::AccountMode;
 
 /// The ring between the gateway and the writer.
@@ -34,8 +36,9 @@ pub const J_ACK: u8 = 1;
 /// A refusal: `code`.
 pub const J_REJECT: u8 = 2;
 /// A fill: `a` = price ×1e6, `b` = quantity ×1e6 (signed by side), `c` =
-/// commission ×1e6; `code` = 1 if the fill was a maker, plus
-/// [`J_FILL_LOST`] if it never reached lane 4.
+/// 0 (BX11: the trade's commission is its [`J_FEE`]'s — through BX7b, the
+/// update's ×1e6 when the update booked first); `code` = 1 if the fill was
+/// a maker, plus [`J_FILL_LOST`] if it never reached lane 4.
 pub const J_FILL: u8 = 3;
 /// [`J_FILL`] `code` bit: the fill was LOST — lane 4 and the held queue
 /// were both full — and nothing was booked (the pulse raises unbounded
@@ -66,17 +69,132 @@ pub const J_SWEEP: u8 = 8;
 /// The E7 session anchor was set: `a` = equity USD ×1e6. The writer
 /// persists it ([`AnchorFile`]) — the gateway thread never writes a file.
 pub const J_ANCHOR: u8 = 9;
+/// **A trade's commission** (BX11; BX-14's one source). `client_oid` the
+/// member's id (as [`J_FILL`]'s), `venue_oid` the venue's order id, `a` =
+/// the trade's price ×1e6, `b` = its notional ×1e9 in the row's settlement
+/// asset ([`fee_notional_1e9`]), `c` = the commission ×1e9 in its own asset
+/// (`n`; negative for a rebate); `code` = [`fee_code`]'s bits. Only the
+/// `ORDER_TRADE_UPDATE` carries a commission, and `TRADE_LITE` usually
+/// books the fill first: the record is journaled once per trade, from the
+/// first update that reports it, whichever report booked the fill
+/// (`crate::oot::TidRing`). A trade the stream lost has none; neither has
+/// a fill booked without its trade ([`J_FILL_UNSEEN`], [`J_FILL_ADOPTED`]).
+pub const J_FEE: u8 = 10;
 
-/// The gateway's end.
-pub struct JournalTx {
-    p: Producer<ExecRecord, JOURNAL_RING>,
+/// [`J_FEE`] `code` bits 1–2, the commission's asset to its row
+/// ([`fee_asset`]): `N` absent.
+pub const FEE_ASSET_NONE: u8 = 0;
+/// The row's settlement asset — the one its notional ([`J_FEE`]'s `b`) is
+/// in: BX-14's rate is `c / b`.
+pub const FEE_ASSET_SETTLE: u8 = 1;
+/// BNB: the BNB burn is on (the plan's account precondition 6 says off).
+pub const FEE_ASSET_BNB: u8 = 2;
+/// Another asset.
+pub const FEE_ASSET_OTHER: u8 = 3;
+
+/// [`J_FEE`] `code` bits 4–6, whose order traded: the member's.
+pub const TRADE_BY_MEMBER: u8 = 0;
+/// An arm's id no member holds (an earlier boot's order).
+pub const TRADE_BY_ORPHAN: u8 = 1;
+/// The venue's settlement (a delivery, a delisting's close).
+pub const TRADE_BY_SETTLEMENT: u8 = 2;
+/// A liquidation.
+pub const TRADE_BY_LIQUIDATION: u8 = 3;
+/// An auto-deleveraging.
+pub const TRADE_BY_ADL: u8 = 4;
+
+/// **[`J_FEE`]'s `code`**: bit 0 the trade was a maker · bits 1–2 the
+/// asset (`FEE_ASSET_*`) · bits 4–6 whose order (`TRADE_BY_*`) · bits 8–11
+/// the row's product (`PRODUCT_*`) · bit 12 a dated row · bit 13 a TradFi
+/// row — the fee classes BX-14 measures, readable without the boot's
+/// instrument table.
+#[inline]
+#[must_use]
+pub const fn fee_code(maker: bool, asset: u8, by: u8, w: &BnInstWire) -> i32 {
+    (maker as i32)
+        | ((asset as i32 & 3) << 1)
+        | ((by as i32 & 7) << 4)
+        | ((w.product as i32 & 15) << 8)
+        | (((w.flags & INST_DATED != 0) as i32) << 12)
+        | (((w.flags & INST_TRADFI != 0) as i32) << 13)
+}
+
+/// [`fee_code`]'s fields back: (maker, asset, by, product, dated, TradFi).
+#[must_use]
+pub const fn fee_fields(code: i32) -> (bool, u8, u8, u8, bool, bool) {
+    (
+        code & 1 != 0,
+        ((code >> 1) & 3) as u8,
+        ((code >> 4) & 7) as u8,
+        ((code >> 8) & 15) as u8,
+        code & (1 << 12) != 0,
+        code & (1 << 13) != 0,
+    )
+}
+
+/// **The commission's asset `asset` (`N`) to row `w`**: its settlement
+/// asset — USDⓈ-M's quote, USDT or USDC, whole (the symbol, before any `_`
+/// expiry, ends with it: `BTCUSDT`, `BTCUSDC`, `BTCUSDT_261225`; a part of
+/// it, `T` or `SDT`, is another asset), COIN-M's margin coin (the symbol
+/// is the coin then `USD`: `BTCUSD_PERP`) — or BNB, another, none.
+#[must_use]
+pub fn fee_asset(w: &BnInstWire, asset: &[u8]) -> u8 {
+    if asset.is_empty() {
+        return FEE_ASSET_NONE;
+    }
+    let sym = w.symbol();
+    let mut n = 0;
+    while n < sym.len() && sym[n] != b'_' {
+        n += 1;
+    }
+    let head = &sym[..n];
+    let settles = if w.flags & INST_INVERSE != 0 {
+        head.len() == asset.len() + 3 && head.starts_with(asset) && head.ends_with(b"USD")
+    } else {
+        (asset == b"USDT" || asset == b"USDC") && head.len() > asset.len() && head.ends_with(asset)
+    };
+    if settles {
+        FEE_ASSET_SETTLE
+    } else if asset == b"BNB" {
+        FEE_ASSET_BNB
+    } else {
+        FEE_ASSET_OTHER
+    }
+}
+
+/// **A trade's notional ×1e9 in row `w`'s settlement asset** ([`J_FEE`]'s
+/// `b`): linear, price × quantity (the quote); inverse (COIN-M), contracts
+/// × the face ÷ the price (the coin). 0 for a price ≤ 0 (no rate is read
+/// from it); `i64::MAX` past the range.
+#[must_use]
+pub fn fee_notional_1e9(w: &BnInstWire, px_1e6: i64, qty_1e6: i64) -> i64 {
+    if px_1e6 <= 0 {
+        return 0;
+    }
+    let q = i128::from(qty_1e6.saturating_abs());
+    let v = if w.flags & INST_INVERSE != 0 {
+        // A face past any venue's (discovery takes up to `i64::MAX`)
+        // saturates, never wraps.
+        match q.checked_mul(i128::from(w.unit_1e6)).and_then(|x| x.checked_mul(1_000)) {
+            Some(x) => x / i128::from(px_1e6),
+            None => return i64::MAX,
+        }
+    } else {
+        q * i128::from(px_1e6) / 1_000
+    };
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+/// The gateway's end, over a ring of `N` records (a power of two ≥ 2).
+pub struct JournalTx<const N: usize = JOURNAL_RING> {
+    p: Producer<ExecRecord, N>,
     dropped: u64,
 }
 
-impl JournalTx {
+impl<const N: usize> JournalTx<N> {
     /// Over the ring's producer.
     #[must_use]
-    pub const fn new(p: Producer<ExecRecord, JOURNAL_RING>) -> Self {
+    pub const fn new(p: Producer<ExecRecord, N>) -> Self {
         Self { p, dropped: 0 }
     }
 
@@ -112,10 +230,10 @@ impl JournalTx {
 /// retried every [`ANCHOR_RETRY_NS`] until the store succeeds, with the
 /// anchor's `unsaved` flag raised meanwhile (F2: a full disk or a
 /// permission error must not lose the session silently).
-pub fn spawn_writer(
+pub fn spawn_writer<const N: usize>(
     path: &Path,
     epoch_ns: u64,
-    mut rx: Consumer<ExecRecord, JOURNAL_RING>,
+    mut rx: Consumer<ExecRecord, N>,
     stop: Arc<AtomicBool>,
     anchor: Option<AnchorFile>,
 ) -> std::io::Result<std::thread::JoinHandle<u64>> {
@@ -392,5 +510,108 @@ mod tests {
         stop.store(true, Ordering::Release);
         h.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const FEE_FAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","pair":"BTCUSDT","contractType":"PERPETUAL","status":"TRADING","marginAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"1000"}]},{"symbol":"BTCUSDC","pair":"BTCUSDC","contractType":"PERPETUAL","status":"TRADING","marginAsset":"USDC","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"1000"}]},{"symbol":"BTCUSDT_261225","pair":"BTCUSDT","contractType":"CURRENT_QUARTER","status":"TRADING","marginAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"1000"}]},{"symbol":"TSLAUSDT","pair":"TSLAUSDT","contractType":"TRADIFI_PERPETUAL","status":"TRADING","marginAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"1000"}]}]}"#;
+    const FEE_DAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSD_PERP","pair":"BTCUSD","contractType":"PERPETUAL","contractStatus":"TRADING","marginAsset":"BTC","contractSize":100,"filters":[{"filterType":"PRICE_FILTER","tickSize":"0.1"},{"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"}]},{"symbol":"BNBUSD_PERP","pair":"BNBUSD","contractType":"PERPETUAL","contractStatus":"TRADING","marginAsset":"BNB","contractSize":10,"filters":[{"filterType":"PRICE_FILTER","tickSize":"0.001"},{"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"}]},{"symbol":"BTCEUR_PERP","pair":"BTCEUR","contractType":"PERPETUAL","contractStatus":"TRADING","marginAsset":"BTC","contractSize":100,"filters":[{"filterType":"PRICE_FILTER","tickSize":"0.1"},{"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"}]}]}"#;
+
+    /// The wire rows: BTCUSDT, BTCUSDC, BTCUSDT_261225, TSLAUSDT (USDⓈ-M),
+    /// BTCUSD_PERP, BNBUSD_PERP and a made-up BTCEUR_PERP (COIN-M) — rows 0
+    /// to 6.
+    fn fee_rows() -> crate::inst::WireTable {
+        let (fapi, dapi) = (crate::inst::tests::fapi_rows(FEE_FAPI), crate::inst::tests::fapi_rows(FEE_DAPI));
+        let (mut t, mut w) = crate::inst::InstTable::new(7);
+        let rows: [(&[u8], u8); 7] = [
+            (b"BTCUSDT", crate::inst::PRODUCT_USDM),
+            (b"BTCUSDC", crate::inst::PRODUCT_USDM),
+            (b"BTCUSDT_261225", crate::inst::PRODUCT_USDM),
+            (b"TSLAUSDT", crate::inst::PRODUCT_USDM),
+            (b"BTCUSD_PERP", crate::inst::PRODUCT_COINM),
+            (b"BNBUSD_PERP", crate::inst::PRODUCT_COINM),
+            (b"BTCEUR_PERP", crate::inst::PRODUCT_COINM),
+        ];
+        let mut i = 0;
+        while i < rows.len() {
+            let (name, product) = rows[i];
+            let d = if product == crate::inst::PRODUCT_USDM { &fapi } else { &dapi };
+            let spec = crate::inst::BindSpec {
+                sym: core_types::make_symbol_id(core_types::VenueId::Binance, 700 + i as u32),
+                product,
+                row: d.find(name).expect("a fixture row"),
+                owned: true,
+                maker_ok: true,
+            };
+            assert_eq!(t.bind(&mut w, &spec), Ok(i as u16));
+            i += 1;
+        }
+        w
+    }
+
+    /// BX11: a commission's asset is judged against its row — USDⓈ-M's
+    /// quote (a USDC row's, a dated row's, a TradFi row's), COIN-M's coin —
+    /// with BNB and the rest named apart; a row is never "settled" in an
+    /// asset its symbol merely contains. Break-and-watch: dropping the
+    /// inverse arm's `USD` tail check (or comparing the whole symbol)
+    /// misjudges a row below.
+    #[test]
+    fn a_commissions_asset_is_judged_against_its_row() {
+        let w = fee_rows();
+        let cases: [(u16, &[u8], u8); 21] = [
+            (0, b"USDT", FEE_ASSET_SETTLE),
+            // The parser review's P-6: a tail of the quote is not the quote.
+            (0, b"T", FEE_ASSET_OTHER),
+            (0, b"DT", FEE_ASSET_OTHER),
+            (0, b"SDT", FEE_ASSET_OTHER),
+            (1, b"C", FEE_ASSET_OTHER),
+            (0, b"BNB", FEE_ASSET_BNB),
+            (0, b"USDC", FEE_ASSET_OTHER),
+            (0, b"BTC", FEE_ASSET_OTHER),
+            (0, b"", FEE_ASSET_NONE),
+            (0, b"BTCUSDT", FEE_ASSET_OTHER),
+            (1, b"USDC", FEE_ASSET_SETTLE),
+            (1, b"USDT", FEE_ASSET_OTHER),
+            (2, b"USDT", FEE_ASSET_SETTLE),
+            (3, b"USDT", FEE_ASSET_SETTLE),
+            (4, b"BTC", FEE_ASSET_SETTLE),
+            (4, b"BNB", FEE_ASSET_BNB),
+            (4, b"USD", FEE_ASSET_OTHER),
+            (4, b"BT", FEE_ASSET_OTHER),
+            (5, b"BNB", FEE_ASSET_SETTLE),
+            (5, b"BTC", FEE_ASSET_OTHER),
+            (6, b"BTC", FEE_ASSET_OTHER),
+        ];
+        let mut i = 0;
+        while i < cases.len() {
+            let (row, asset, want) = cases[i];
+            assert_eq!(fee_asset(w.row(row), asset), want, "{:?} on row {row}", core::str::from_utf8(asset));
+            i += 1;
+        }
+    }
+
+    /// BX11: the notional is the quote's (price × quantity) on a linear
+    /// row and the coin's (contracts × face ÷ price) on an inverse one,
+    /// ×1e9 either way; the code carries the fee class and reads back.
+    #[test]
+    fn a_fees_notional_and_class() {
+        let w = fee_rows();
+        // 0.002 BTC at 65 000 = 130 USDT; 3 contracts × 100 USD at 65 000 =
+        // 0.004615384 BTC; 7 contracts × 10 USD at 600 = 0.116666666 BNB.
+        assert_eq!(fee_notional_1e9(w.row(0), 65_000_000_000, 2_000), 130_000_000_000);
+        assert_eq!(fee_notional_1e9(w.row(0), 65_000_000_000, -2_000), 130_000_000_000, "the size, whichever side");
+        assert_eq!(fee_notional_1e9(w.row(4), 65_000_000_000, 3_000_000), 4_615_384);
+        assert_eq!(fee_notional_1e9(w.row(5), 600_000_000, 7_000_000), 116_666_666);
+        assert_eq!(fee_notional_1e9(w.row(4), 0, 3_000_000), 0, "no price, no notional");
+        assert_eq!(fee_notional_1e9(w.row(0), i64::MAX, i64::MAX), i64::MAX, "saturated, never wrapped");
+        // The parser review's P-7: an absurd face saturates (it overflowed
+        // i128 and panicked in a debug build).
+        let mut huge = *w.row(4);
+        huge.unit_1e6 = i64::MAX;
+        assert_eq!(fee_notional_1e9(&huge, 1, i64::MAX), i64::MAX, "saturated, never wrapped");
+        let code = fee_code(true, FEE_ASSET_SETTLE, TRADE_BY_ORPHAN, w.row(3));
+        assert_eq!(fee_fields(code), (true, FEE_ASSET_SETTLE, TRADE_BY_ORPHAN, crate::inst::PRODUCT_USDM, false, true));
+        let code = fee_code(false, FEE_ASSET_BNB, TRADE_BY_ADL, w.row(2));
+        assert_eq!(fee_fields(code), (false, FEE_ASSET_BNB, TRADE_BY_ADL, crate::inst::PRODUCT_USDM, true, false));
+        let code = fee_code(false, FEE_ASSET_OTHER, TRADE_BY_LIQUIDATION, w.row(4));
+        assert_eq!(fee_fields(code), (false, FEE_ASSET_OTHER, TRADE_BY_LIQUIDATION, crate::inst::PRODUCT_COINM, false, false));
     }
 }

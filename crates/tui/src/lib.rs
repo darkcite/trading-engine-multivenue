@@ -112,7 +112,7 @@ fn render_frame(f: &mut ratatui::Frame<'_>, s: &EngineSnapshot) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),  // header
+            Constraint::Length(8),  // header (BX11: six lines)
             Constraint::Length(11), // strategies + recent orders
             Constraint::Min(6),     // ruleset rows
             // latency + ingress: two borders + the header + one row per
@@ -172,6 +172,7 @@ fn render_header(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &En
         ratatui::text::Line::from(format!("regime {}", regime_chip(s, 0))),
         ratatui::text::Line::from(format!("       {}", regime_chip(s, 1))),
         ratatui::text::Line::from(vrp_chip(s)),
+        ratatui::text::Line::from(bn_chip(s)),
     ];
     let p = Paragraph::new(lines).block(
         Block::default()
@@ -244,6 +245,72 @@ fn vrp_chip(s: &EngineSnapshot) -> String {
     }
     if c.killed != 0 {
         out.push_str("  !KILLED");
+    }
+    out
+}
+
+/// **BX11: the Binance arm in one line** — whether it takes orders and why
+/// not, what is working and in doubt, its refusals and its headroom, the
+/// order route's round trip; the operator's alerts only when non-zero.
+///
+/// `bn: READY order up user up dm ok | classic | working 2 doubt 0 |
+/// refused 3 | weight 120/1200 orders 4/240 | rtt p99 1.20ms`
+fn bn_chip(s: &EngineSnapshot) -> String {
+    use std::fmt::Write as _;
+    let b = &s.exec.arms_binance_gw;
+    if b.present == 0 {
+        return "bn: (no arm)".to_owned();
+    }
+    let up = |v: u8| if v != 0 { "up" } else { "DOWN" };
+    let mut refused = 0u64;
+    let mut i = 0;
+    while i < b.refused.len() {
+        refused += u64::from(b.refused[i]);
+        i += 1;
+    }
+    let mut out = format!(
+        "bn: {} order {} user {} dm {} | {}{} | working {} doubt {} | refused {} | weight {}/{} orders {}/{} | rtt p99 {}",
+        if b.ready != 0 { "READY" } else { "not ready" },
+        up(b.order_up),
+        up(b.user_up),
+        if b.deadman_ok != 0 { "ok" } else { "-" },
+        engine_snapshot::bn_mode_word(b.account_mode),
+        if b.demo != 0 { " DEMO" } else { "" },
+        b.in_flight,
+        b.in_doubt,
+        refused,
+        b.weight_used,
+        b.weight_max,
+        b.orders_10s_used,
+        b.orders_10s_cap,
+        format_ns(b.post_rtt_p99_ns),
+    );
+    // The operator's ALERTS, printed only when non-zero so a healthy
+    // line stays readable.
+    if b.halt_reason != 0 {
+        let _ = write!(out, "  !HALT {}", b.halt_reason);
+    }
+    if engine_snapshot::sweep_word(b.sweep) == "stranded" {
+        out.push_str("  !sweep stranded");
+    }
+    if b.anchor_unsaved != 0 {
+        out.push_str("  !anchor_unsaved");
+    }
+    for (n, what) in [
+        (b.in_doubt, "in_doubt"),
+        (b.journal_dropped, "journal_dropped"),
+        (b.jobs_dropped, "jobs_dropped"),
+        (b.fills_deferred, "fills_deferred"),
+        (b.scan_failed, "scan_failed"),
+        (b.events_other, "events_other"),
+        (b.locks, "locks"),
+    ] {
+        if n != 0 {
+            let _ = write!(out, "  !{what} {n}");
+        }
+    }
+    if b.quiet_left_ms != 0 {
+        let _ = write!(out, "  !quiet {}ms", b.quiet_left_ms);
     }
     out
 }
@@ -757,6 +824,51 @@ mod tests {
         assert!(line.contains("!hedge_abandoned 1"), "{line}");
         assert!(line.contains("!settled_unpriced 2"), "{line}");
         assert!(line.contains("!KILLED"), "{line}");
+    }
+
+    /// BX11: the Binance arm's line — absent, healthy (no alert), then
+    /// every alert when non-zero.
+    #[test]
+    fn the_bn_chip_shows_the_arm_and_flags_the_alerts() {
+        let mut s = Box::new(EngineSnapshot::empty());
+        assert_eq!(bn_chip(&s), "bn: (no arm)");
+        let b = &mut s.exec.arms_binance_gw;
+        b.present = 1;
+        b.ready = 1;
+        b.order_up = 1;
+        b.user_up = 1;
+        b.deadman_ok = 1;
+        b.in_flight = 2;
+        b.refused[0] = 2;
+        b.refused[5] = 1;
+        b.weight_used = 120;
+        b.weight_max = 1_200;
+        b.orders_10s_used = 4;
+        b.orders_10s_cap = 240;
+        b.post_rtt_p99_ns = 1_200_000;
+        let line = bn_chip(&s);
+        assert_eq!(
+            line,
+            "bn: READY order up user up dm ok | classic | working 2 doubt 0 | refused 3 | \
+             weight 120/1200 orders 4/240 | rtt p99 1.20ms"
+        );
+        assert!(!line.contains('!'), "a healthy line carries no alert: {line}");
+        let b = &mut s.exec.arms_binance_gw;
+        b.ready = 0;
+        b.user_up = 0;
+        b.demo = 1;
+        b.halt_reason = 7;
+        b.sweep = 2;
+        b.anchor_unsaved = 1;
+        b.in_doubt = 1;
+        b.journal_dropped = 3;
+        b.quiet_left_ms = 900;
+        let line = bn_chip(&s);
+        assert!(line.starts_with("bn: not ready order up user DOWN dm ok | classic DEMO |"), "{line}");
+        for alert in ["!HALT 7", "!sweep stranded", "!anchor_unsaved", "!in_doubt 1", "!journal_dropped 3", "!quiet 900ms"] {
+            assert!(line.contains(alert), "{alert}: {line}");
+        }
+        assert!(!line.contains("!locks"), "zero is no alert: {line}");
     }
 
     #[test]

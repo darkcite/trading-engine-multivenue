@@ -20,8 +20,11 @@
 //! totalMarginBalance` from the account snapshot. A balance at or below
 //! zero reads as an unbounded ratio — fail closed. COIN-M margins each
 //! asset apart: its ratio is the riskiest asset's ([`cm_asset_ratio_1e6`],
-//! BX7). The other products' formulas (PM `uniMMR`, options maintenance
-//! over adjusted equity) arrive with their phases.
+//! BX7). The unified account (PM, PM Pro; BX7) has one ratio for every
+//! product it trades — `accountMaintMargin / accountEquity` from its
+//! account read, or a `riskLevelChange`'s own figures: the reciprocal of
+//! the venue's `uniMMR` (a 0.8 ratio is a `uniMMR` of 1.25). Options'
+//! (maintenance over adjusted equity) arrives with BX9.
 
 use crate::inst::PRODUCTS;
 

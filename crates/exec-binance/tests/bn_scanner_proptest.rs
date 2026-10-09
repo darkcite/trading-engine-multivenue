@@ -501,7 +501,7 @@ proptest! {
         let (fs, want) = [(Some("UM"), PRODUCT_USDM), (Some("CM"), PRODUCT_COINM), (Some("MARGIN"), u8::MAX), (None, 0)][which];
         let fs_kv = fs.map(|w| format!(r#""fs":"{w}","#)).unwrap_or_default();
         let raw = format!(
-            r#"{{"e":"ORDER_TRADE_UPDATE",{fs_kv}"E":1,"T":1,"o":{{"s":"BTCUSD_PERP","c":"mvQ","S":"SELL","q":"3","p":"1","x":"TRADE","X":"FILLED","i":7,"l":"3","z":"3","L":"1","T":1,"t":9}}}}"#
+            r#"{{"e":"ORDER_TRADE_UPDATE",{fs_kv}"E":1,"T":1,"o":{{"s":"BTCUSD_PERP","c":"mvQ","S":"SELL","q":"3","p":"1","x":"TRADE","X":"FILLED","i":7,"l":"3","z":"3","L":"1","n":"0.0001","N":"BTC","T":1,"t":9}}}}"#
         );
         let f = if combined { wrap(&raw) } else { raw };
         let mut e = UserEvent::default();
@@ -509,6 +509,9 @@ proptest! {
         prop_assert_eq!((e.kind, e.fs), (UE_ORDER, want));
         prop_assert_eq!(e.symbol.get(f.as_bytes()), b"BTCUSD_PERP");
         prop_assert_eq!(e.cid.get(f.as_bytes()), b"mvQ");
+        // BX11: the commission's asset, re-based in the combined form too.
+        prop_assert_eq!(e.fee_asset.get(f.as_bytes()), b"BTC");
+        prop_assert_eq!(e.commission_1e9, 100_000);
     }
 
     /// E6 — `ACCOUNT_CONFIG_UPDATE`: both changes read, neither lost — a
@@ -848,7 +851,7 @@ proptest! {
 
 /// The order keys `order_fields` reads (`ORDER_TRADE_UPDATE`'s `o`,
 /// `TRADE_LITE`'s top level).
-const ORDER_KEYS: [&str; 16] = ["s", "c", "S", "x", "X", "i", "l", "L", "z", "t", "q", "p", "n", "ap", "m", "T"];
+const ORDER_KEYS: [&str; 17] = ["s", "c", "S", "x", "X", "i", "l", "L", "z", "t", "q", "p", "n", "ap", "m", "T", "N"];
 
 /// A second, readable copy of order key `k` — another order's.
 fn order_kv(k: &str) -> &'static str {
@@ -866,6 +869,7 @@ fn order_kv(k: &str) -> &'static str {
         "q" => r#""q":"7""#,
         "p" => r#""p":"7""#,
         "n" => r#""n":"7""#,
+        "N" => r#""N":"BNB""#,
         "ap" => r#""ap":"7""#,
         "m" => r#""m":true"#,
         _ => r#""T":7"#,
@@ -893,16 +897,17 @@ proptest! {
     /// events every fill comes from (two copies of `c` would book a fill to
     /// whichever cid a reader picked).
     #[test]
-    fn an_order_event_naming_a_read_key_twice_is_refused(k in 0usize..16, lite in any::<bool>()) {
+    fn an_order_event_naming_a_read_key_twice_is_refused(k in 0usize..17, lite in any::<bool>()) {
         let key = ORDER_KEYS[k];
         let f = if lite {
             format!(r#"{{"e":"TRADE_LITE","E":1,"T":1,"s":"BTCUSDT","q":"1","p":"0","m":false,"c":"mvX","S":"BUY","L":"1","l":"1","t":1,"i":1,{}}}"#, order_kv(key))
         } else {
-            format!(r#"{{"e":"ORDER_TRADE_UPDATE","E":1,"T":1,"o":{{"s":"BTCUSDT","c":"mvX","S":"BUY","q":"1","p":"1","x":"TRADE","X":"FILLED","i":1,"l":"1","z":"1","L":"1","T":1,"t":7,"n":"0","ap":"1","m":false,{}}}}}"#, order_kv(key))
+            format!(r#"{{"e":"ORDER_TRADE_UPDATE","E":1,"T":1,"o":{{"s":"BTCUSDT","c":"mvX","S":"BUY","q":"1","p":"1","x":"TRADE","X":"FILLED","i":1,"l":"1","z":"1","L":"1","T":1,"t":7,"n":"0","N":"USDT","ap":"1","m":false,{}}}}}"#, order_kv(key))
         };
         let mut e = UserEvent::default();
-        // TRADE_LITE names no x/X/z/n/ap: a first copy there is not a second.
-        let named_once = lite && matches!(key, "x" | "X" | "z" | "n" | "ap");
+        // TRADE_LITE names no x/X/z/n/N/ap: a first copy there is not a
+        // second.
+        let named_once = lite && matches!(key, "x" | "X" | "z" | "n" | "N" | "ap");
         prop_assert_eq!(scan_user_event(f.as_bytes(), &mut e).is_ok(), named_once, "{}", f);
         if !named_once {
             prop_assert_eq!(scan_user_event(f.as_bytes(), &mut e), Err(ScanErr::Malformed), "{}", f);

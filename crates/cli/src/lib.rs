@@ -44,7 +44,9 @@ pub mod bn_battery;
 /// BX7b: the Binance Demo tools' shared client (`exec-smoke --binance…`) —
 /// the crate's own: the binary reaches it only through the two tools.
 pub(crate) mod bn_demo;
+pub mod bn_fees;
 pub mod bn_live;
+pub mod bn_ops;
 /// BX7b: the K-probes on Binance Demo (`exec-smoke --binance-probe`).
 pub mod bn_probe;
 pub mod capture_catalog;

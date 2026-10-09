@@ -637,12 +637,16 @@ carries the stream and then sends nothing.
   row). Instrument names and syms resolve through
   `options-manifest.tsv` / `instrument-manifest.tsv` as before.
 
-BX6, appended 2026-09-26 — **the Binance execution journal,
-`binance-exec.pmlr`** (PMLR `slot_kind = 8`, `SlotKind::Exec`), one per
-run in the run directory, written by the arm's cold `bn-journal` thread
-from an SPSC ring (1 024 records; a full ring drops a record and counts
-it, `GW_JOURNAL_DROPPED`). A 64 B header, then 64 B `ExecRecord` slots
-(`core_types::ExecRecord`, `#[repr(C, align(64))]`):
+### The Binance execution journal — `binance-exec.pmlr` (BX6; refreshed at BX11, 2026-10-09)
+
+PMLR `slot_kind = 8` (`SlotKind::Exec`), one per run in the run directory,
+written by the arm's cold `bn-journal` thread from an SPSC ring (the
+engine's: 1 024 records; BX11 made the capacity the gateway's type
+parameter, so a test can run a two-record ring). A full ring drops the
+record and counts it (`GW_JOURNAL_DROPPED`, `/state`
+`exec.arms.binance_gw.journal_dropped`) — except the E7 anchor, which the
+gateway offers again until the ring takes it (S8). A 64 B header, then
+64 B `ExecRecord` slots (`core_types::ExecRecord`, `#[repr(C, align(64))]`):
 
 | offset | field | type | meaning |
 |---|---|---|---|
@@ -661,21 +665,32 @@ it, `GW_JOURNAL_DROPPED`). A 64 B header, then 64 B `ExecRecord` slots
 | kind | name | `a` | `b` | `c` | `code` |
 |---|---|---|---|---|---|
 | 1 | ACK | 0 | 0 | 0 | 0 (`venue_oid` set) |
-| 2 | REJECT | filled ×1e6 (0 when refused locally) | quantity ×1e6 (likewise) | 0 | the venue's code (negative) or the gateway's own (9 001…9 008) |
-| 3 | FILL | price ×1e6 | quantity ×1e6, signed by side | commission ×1e6 | bits: 1 maker · 2 LOST (never reached lane 4; nothing booked) · 4 UNSEEN (booked without its trade: from a status answer or a cumulative `z`, at the implied average, commission 0 — exclude from fee and markout work) |
+| 2 | REJECT | filled ×1e6 (0 when refused locally) | quantity ×1e6 (likewise) | 0 | the venue's code (negative), or the gateway's own: 9 001 table full · 9 002 duplicate id · 9 003 not ready · 9 004 render · 9 005 request ids full · 9 006 unknown order · 9 007 modify busy · 9 008 quiet · 9 009 deadline queue full · 9 014 swept unsent (BX7: a REST-route place or modify still held when a sweep began) |
+| 3 | FILL | price ×1e6 | quantity ×1e6, signed by side | **0 since BX11** (the trade's commission is its FEE; BX6–BX7b journals carry the update's commission ×1e6 here when the update booked first, else 0) | bits: 1 maker · 2 LOST (never reached lane 4; nothing booked) · 4 UNSEEN (booked without its trade: from a status answer or a cumulative `z`, at the implied average — no commission or maker flag; exclude from fee and markout work) · 8 ADOPTED (BX7: the venue's position adopted at boot as the owner slot's inventory — no trade; BX-14 excludes it) |
 | 4 | ENDED | filled ×1e6 | quantity ×1e6 | 0 | the `RETIRED_*` reason |
 | 5 | RECON | drift USD ×1e6 | unseen legs | foreign orders | 1 if reconciled |
-| 6 | MARGIN | ratio ×1e6 | equity USD ×1e6 | 1 on a `MARGIN_CALL` | 0 |
-| 7 | VENUE | 0 | 0 | 0 | the budget or lock code |
+| 6 | MARGIN | ratio ×1e6 (the product's) | the session equity USD ×1e6 (USDⓈ-M's on a classic account, the unified account's in PM and PM Pro) | 1 on a margin call | the product (`PRODUCT_*`, BX7; 0 before) |
+| 7 | VENUE | 0 | 0 | 0 | the budget or lock code: the venue's (negative), or 9 010 PM risk level · 9 011 PM account status · 9 012 account reconfigured (`ACCOUNT_CONFIG_UPDATE`) · 9 013 an owned row not cross-margined (BX7) |
 | 8 | SWEEP | orders left | cancels sent | 0 | 0 |
 | 9 | ANCHOR | the E7 session anchor, equity USD ×1e6 | 0 | 0 | 0 |
+| 10 | **FEE** (BX11) | the trade's price ×1e6 | its notional ×1e9 in the row's settlement asset (USDⓈ-M: price × quantity, the quote; COIN-M: contracts × face ÷ price, the coin) | the commission ×1e9 in its own asset (`n`; negative for a rebate) | bit 0 the maker · bits 1–2 the asset to the row (0 none named · 1 the row's settlement asset · 2 BNB · 3 another) · bits 4–6 whose order (0 the member's · 1 an earlier boot's · 2 settlement · 3 liquidation · 4 ADL) · bits 8–11 the product (`PRODUCT_*`) · bit 12 a dated row · bit 13 a TradFi row (`exec_binance::journal::fee_fields` reads them back) |
 
-A FILL's `client_oid` is the member's id, or 0 for a liquidation, ADL,
-settlement or older-epoch fill. An ANCHOR record is also persisted by
-the writer to `binance-pnl-anchor.state` beside `exec.toml`: one line
-`<tag>\t<equity ×1e6>\t<unix s>`, the tag the first 8 bytes of SHA-256
-of the API key in hex (never the key); retried every second until the
-store succeeds.
+A FILL's and a FEE's `client_oid` is the member's id, or 0 for a
+liquidation, ADL, settlement or older-epoch trade; a FEE's `venue_oid` is
+the venue's order id. **One FEE per trade** (BX11): only
+`ORDER_TRADE_UPDATE` carries a commission, and `TRADE_LITE` usually books
+the fill first (BX7b K2: 14 of 15 Demo IoCs), so the FEE comes from the
+first update that reports the trade, whichever report booked it — never
+twice for a replayed update. A trade the stream lost has no FEE (its fill
+is UNSEEN); a fee measurement (BX-14) reads FEE records alone: the rate is
+`c / b` where the asset is the row's settlement asset.
+
+An ANCHOR record is also persisted by the writer to
+`binance-pnl-anchor.state` beside `exec.toml`: one line
+`<tag>\t<equity ×1e6>\t<unix s>\t<account mode>` (the mode since BX7: a
+line without one is a classic session's), the tag the first 8 bytes of
+SHA-256 of the API key in hex (never the key); retried every second until
+the store succeeds.
 
 ### Options manifest — `options-manifest.tsv` (M2 close)
 

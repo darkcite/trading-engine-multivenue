@@ -208,8 +208,9 @@ use crate::dns::{Resolver, DNS_HOSTS};
 use crate::gov::{classify, request_weight, CodeClass, Weighed, ACCOUNT_REREAD_MS, ARM_WEIGHT_MAX_PER_MIN, QTR_ICR_NS, WEIGHT_THROTTLE_PCT};
 use crate::inst::{WireTable, INST_DATED, INST_INVERSE, INST_LIVE, INST_NO_DEADMAN, INST_OWNED, PRODUCT_COINM, PRODUCT_USDM, ROW_NONE};
 use crate::journal::{
-    JournalTx, J_ACK, J_ANCHOR, J_ENDED, J_FILL, J_FILL_ADOPTED, J_FILL_LOST, J_FILL_UNSEEN, J_MARGIN, J_RECON, J_REJECT, J_SWEEP,
-    J_VENUE,
+    fee_asset, fee_code, fee_notional_1e9, JournalTx, FEE_ASSET_NONE, JOURNAL_RING, J_ACK, J_ANCHOR, J_ENDED, J_FEE, J_FILL, J_FILL_ADOPTED,
+    J_FILL_LOST, J_FILL_UNSEEN, J_MARGIN, J_RECON, J_REJECT, J_SWEEP, J_VENUE, TRADE_BY_ADL, TRADE_BY_LIQUIDATION, TRADE_BY_MEMBER,
+    TRADE_BY_ORPHAN, TRADE_BY_SETTLEMENT,
 };
 use crate::margin::um_ratio_1e6;
 use crate::mode::{judge_key, judge_mode, judge_one_way, judge_single_asset, judge_symbol_config, AccountMode, AssertErr};
@@ -945,15 +946,16 @@ impl Desk {
     }
 }
 
-/// **The gateway** (module docs). `FILL_N` is the engine's fill-lane size.
-pub struct BnGateway<const FILL_N: usize> {
+/// **The gateway** (module docs). `FILL_N` is the engine's fill-lane size;
+/// `J_N` the journal ring's (BX11: the engine's [`JOURNAL_RING`]).
+pub struct BnGateway<const FILL_N: usize, const J_N: usize = JOURNAL_RING> {
     cmd: CmdRx<BnCmd, CMD_RING>,
     evt: EvtTx<BnEvt, EVT_RING>,
     /// The duplex's shared block: the sweep and halt words, the heartbeat,
     /// the gauges, the published tallies, the latencies.
     stats: Arc<GatewayStats>,
     fills: Producer<Fill, FILL_N>,
-    journal: JournalTx,
+    journal: JournalTx<J_N>,
     poll: Poll,
     events: Events,
     /// The futures lanes (BX7, M3), one per armed product.
@@ -1086,7 +1088,7 @@ pub struct BnGateway<const FILL_N: usize> {
     last_verdict: Verdict,
 }
 
-impl<const FILL_N: usize> BnGateway<FILL_N> {
+impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
     /// **Boot-only construction**: resolve every host (blocking DNS, here
     /// and never again), build the transports and the ONE signer (after the
     /// signer's own self-test and the boot vectors).
@@ -1097,7 +1099,7 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
         wire: WireTable,
         end: BnGatewayEnd,
         fills: Producer<Fill, FILL_N>,
-        journal: JournalTx,
+        journal: JournalTx<J_N>,
     ) -> Result<Self, BootErr> {
         crate::selftest::run().map_err(BootErr::SelfTest)?;
         let signer = cfg.signer().map_err(|_| BootErr::SelfTest(crate::selftest::SelfTestErr::Signer))?;
@@ -2547,7 +2549,13 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
                         }
                     }
                     let class = self.prefix.classify(ev.cid.get(frame));
-                    self.on_user_event(l, &ev, row, class, now);
+                    // BX11: the commission's asset to its row (`J_FEE`).
+                    let asset = if ev.kind == UE_ORDER && row != ROW_NONE {
+                        fee_asset(self.wire.row(row), ev.fee_asset.get(frame))
+                    } else {
+                        FEE_ASSET_NONE
+                    };
+                    self.on_user_event(l, &ev, row, class, asset, now);
                 }
                 Err(e) => self.scan_failed(SCAN_USER, e, now),
             }
@@ -3054,7 +3062,7 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
                 own_px
             };
             let ts = self.fill_ts_ns(0, now);
-            if self.book_fill(Some(ix), None, row, slot, side, px, missing, 0, J_FILL_UNSEEN, 0, ts, now, cur) {
+            if self.book_fill(Some(ix), None, row, slot, side, px, missing, J_FILL_UNSEEN, 0, ts, now, cur) {
                 self.oot.get_mut(ix).flags |= OF_STATUS_BOOKED;
             }
         }
@@ -3126,9 +3134,9 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
     // The user stream: fills and states
     // ---------------------------------------------------------------------
 
-    fn on_user_event(&mut self, l: usize, ev: &UserEvent, row: u16, class: CidClass, now: u64) {
+    fn on_user_event(&mut self, l: usize, ev: &UserEvent, row: u16, class: CidClass, asset: u8, now: u64) {
         match ev.kind {
-            UE_ORDER | UE_TRADE_LITE => self.on_order_event(ev, row, class, now),
+            UE_ORDER | UE_TRADE_LITE => self.on_order_event(ev, row, class, asset, now),
             UE_MARGIN_CALL => {
                 let mut e = BnEvt::new(EVT_MARGIN, now);
                 e.product = self.lanes[l].product;
@@ -3180,7 +3188,10 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
             }
             // A Portfolio Margin borrow (`liabilityChange`): the unified
             // account's next read carries it.
-            _ => {}
+            UE_LIABILITY => {}
+            // A kind the arm does not act on: counted, never booked
+            // (BX-15).
+            _ => self.t[crate::arm::GW_EVENTS_OTHER] += 1,
         }
     }
 
@@ -3279,7 +3290,7 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
         }
     }
 
-    fn on_order_event(&mut self, ev: &UserEvent, row: u16, class: CidClass, now: u64) {
+    fn on_order_event(&mut self, ev: &UserEvent, row: u16, class: CidClass, asset: u8, now: u64) {
         let trade = ev.exec == X_TRADE || ev.exec == X_CALCULATED;
         if row == ROW_NONE {
             if trade {
@@ -3288,18 +3299,21 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
             return;
         }
         let owner = self.knobs.owner_slot;
-        // The order: in the table, or remembered ending (a late trade).
-        let (ix, ended, slot, order_id, settle, ours) = match class {
+        // The order: in the table, or remembered ending (a late trade);
+        // whose it is (`TRADE_BY_*`).
+        let (ix, ended, slot, order_id, by) = match class {
             CidClass::Ours { slot, client_oid } => match self.oot.by_placement(slot, client_oid) {
                 // S7: an event naming another venue order under this id is
                 // the previous order of a reused id, not this one.
-                Some(ix) if self.same_venue_order(ix, ev.venue_oid) => (Some(ix), None, slot, self.oot.get(ix).current_oid, false, true),
-                _ => (None, self.ended.find(slot, client_oid), slot, client_oid, false, true),
+                Some(ix) if self.same_venue_order(ix, ev.venue_oid) => (Some(ix), None, slot, self.oot.get(ix).current_oid, TRADE_BY_MEMBER),
+                _ => (None, self.ended.find(slot, client_oid), slot, client_oid, TRADE_BY_MEMBER),
             },
             // No member id: a venue order id or an earlier boot's id could
             // collide with a live one.
-            CidClass::Orphan { .. } | CidClass::Liquidation | CidClass::Adl => (None, None, owner, 0, false, false),
-            CidClass::Settlement => (None, None, owner, 0, true, false),
+            CidClass::Orphan { .. } => (None, None, owner, 0, TRADE_BY_ORPHAN),
+            CidClass::Liquidation => (None, None, owner, 0, TRADE_BY_LIQUIDATION),
+            CidClass::Adl => (None, None, owner, 0, TRADE_BY_ADL),
+            CidClass::Settlement => (None, None, owner, 0, TRADE_BY_SETTLEMENT),
             CidClass::Foreign => {
                 // BX-8: what the engine did not place is a reconciliation
                 // fact (drift on a dedicated account), never booked as the
@@ -3310,7 +3324,7 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
                 return;
             }
         };
-        self.book_event(ev, ix, ended, row, slot, order_id, settle, ours, now);
+        self.book_event(ev, ix, ended, row, slot, order_id, by, asset, now);
         if ev.kind != UE_ORDER {
             return;
         }
@@ -3368,9 +3382,13 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
     /// still unbooked (trades the stream lost while down, whose updates
     /// never came) at the implied average, flagged `J_FILL_UNSEEN`. From
     /// then on the order's `TRADE_LITE`s, which carry no `z`, wait for their
-    /// updates (`OF_STATUS_BOOKED`).
+    /// updates (`OF_STATUS_BOOKED`). BX11: a trade's commission — the
+    /// update's alone — is journaled once ([`J_FEE`]), whichever report
+    /// booked it; `by` says whose order traded (`TRADE_BY_*`), `asset` the
+    /// commission's asset to the row (`FEE_ASSET_*`).
     #[allow(clippy::too_many_arguments)]
-    fn book_event(&mut self, ev: &UserEvent, ix: Option<u16>, ended: Option<usize>, row: u16, slot: u8, order_id: u64, settle: bool, ours: bool, now: u64) {
+    fn book_event(&mut self, ev: &UserEvent, ix: Option<u16>, ended: Option<usize>, row: u16, slot: u8, order_id: u64, by: u8, asset: u8, now: u64) {
+        let (settle, ours) = (by == TRADE_BY_SETTLEMENT, by == TRADE_BY_MEMBER);
         let update = ev.kind == UE_ORDER;
         let known = ix.is_some() || ended.is_some();
         let (unseen, mut booked) = match (ix, ended) {
@@ -3383,10 +3401,10 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
         };
         let trade = (ev.exec == X_TRADE || ev.exec == X_CALCULATED) && ev.last_qty_1e6 > 0;
         if trade && (update || !unseen) {
-            let seen = self.tids.seen_or_record(row, ev.trade_id);
+            let seen = self.tids.see(row, ev.trade_id, update);
             // An update books its trade only up to its `z` (a later trade's
             // lite report may be booked already: the rest waits for `z`).
-            let q = if seen {
+            let q = if seen.again {
                 0
             } else if update && known {
                 ev.last_qty_1e6.min(ev.cum_qty_1e6.saturating_sub(booked)).max(0)
@@ -3403,9 +3421,14 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
                 let ts = self.fill_ts_ns(ev.trade_ms, now);
                 let code = (ev.maker != 0) as i32;
                 let flags = FILL_FLAG_SETTLEMENT * u8::from(settle);
-                if self.book_fill(ix, ended, row, slot, ev.side, ev.last_px_1e6, q, ev.commission_1e6, code, flags, ts, now, order_id) {
+                if self.book_fill(ix, ended, row, slot, ev.side, ev.last_px_1e6, q, code, flags, ts, now, order_id) {
                     booked = booked.saturating_add(q);
                 }
+            }
+            if seen.fee_due {
+                let w = self.wire.row(row);
+                let (code, notional) = (fee_code(ev.maker != 0, asset, by, w), fee_notional_1e9(w, ev.last_px_1e6, ev.last_qty_1e6));
+                self.note(J_FEE, now, order_id, ev.venue_oid, ev.last_px_1e6, notional, ev.commission_1e9, code, row, slot);
             }
         }
         if !(update && known) {
@@ -3431,7 +3454,7 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
         };
         let ts = self.fill_ts_ns(0, now);
         let flags = FILL_FLAG_SETTLEMENT * u8::from(settle);
-        if self.book_fill(ix, ended, row, slot, ev.side, px, excess, 0, J_FILL_UNSEEN, flags, ts, now, order_id) {
+        if self.book_fill(ix, ended, row, slot, ev.side, px, excess, J_FILL_UNSEEN, flags, ts, now, order_id) {
             match (ix, ended) {
                 (Some(i), _) => self.oot.get_mut(i).flags |= OF_STATUS_BOOKED,
                 (None, Some(k)) => self.ended.set_status_booked(k),
@@ -3462,7 +3485,6 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
         side: u8,
         px: i64,
         qty: i64,
-        commission: i64,
         code: i32,
         flags: u8,
         ts_ns: u64,
@@ -3480,7 +3502,7 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
             // Nothing downstream drains lane 4. Nothing is booked — the
             // engine never saw it, so the venue's position must read as
             // drift — and the pulse raises unbounded drift (EVT_F_LOST).
-            self.note(J_FILL, now, order_id, 0, px, signed, commission, code | J_FILL_LOST, row, slot);
+            self.note(J_FILL, now, order_id, 0, px, signed, 0, code | J_FILL_LOST, row, slot);
             return false;
         }
         self.t[crate::arm::GW_FILLS_BOOKED] += 1;
@@ -3507,7 +3529,7 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
             r.last_px_1e6 = px;
         }
         let after = r.booked_1e6;
-        self.note(J_FILL, now, order_id, 0, px, signed, commission, code, row, slot);
+        self.note(J_FILL, now, order_id, 0, px, signed, 0, code, row, slot);
         if before.signum() != after.signum() {
             let mut e = BnEvt::new(EVT_POSITION, now);
             e.row = row;
@@ -4349,7 +4371,7 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
                 // A linear leg at the read's mark; an inverse one is its
                 // face's exposure whatever the price — it carries none.
                 let px = if self.wire.row(row).flags & INST_INVERSE != 0 { 0 } else { self.legs[i].px_1e6 };
-                if !self.book_fill(None, None, row, owner, side, px, venue.saturating_abs(), 0, J_FILL_ADOPTED, FILL_FLAG_ADOPTED, ts, now, 0) {
+                if !self.book_fill(None, None, row, owner, side, px, venue.saturating_abs(), J_FILL_ADOPTED, FILL_FLAG_ADOPTED, ts, now, 0) {
                     // The room was checked: unreachable — fail closed all the same.
                     debug_assert!(false, "an adopted fill lost after the room check");
                     return Err(usd);

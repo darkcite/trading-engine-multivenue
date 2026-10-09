@@ -5095,6 +5095,9 @@ pub struct ExecMetricIds {
     /// **XMM XH4f (D11)** — slot 6's gateway arm (`engine_exec_hlgw_*`),
     /// registered only when slot 6 is live on the gateway.
     pub hlgw: Option<ExecHlgwMetricIds>,
+    /// **BX11** — the Binance arm's own numbers (`engine_exec_bn_*`),
+    /// registered only when a live slot names binance.
+    pub bnarm: Option<ExecBnArmMetricIds>,
 }
 
 /// **BX6** — the router counters only a Binance boot can move.
@@ -6029,9 +6032,15 @@ fn register_exec_metrics(
     } else {
         None
     };
+    let bnarm = if spec.binance {
+        Some(register_bnarm_metrics(reg)?)
+    } else {
+        None
+    };
     Ok(ExecMetricIds {
         bn,
         hlgw,
+        bnarm,
         configured,
         live_submits,
         paper_submits,
@@ -6516,6 +6525,237 @@ fn mirror_hlgw_metrics(
         k += 1;
     }
     // COPY: the 88 totals (704 B) kept as the next delta's baseline — 5 s
+    // cadence, cold; a delta needs the previous value.
+    *last = c;
+}
+
+// ---------------------------------------------------------------
+// BX11 — the Binance arm's own numbers (5 s mirror, cold path)
+// ---------------------------------------------------------------
+
+/// The `engine_exec_bn_*` family's counters: the arm's, the gateway's
+/// tallies, then the refusals by reason.
+const BNARM_COUNTERS: usize = 21 + clob_dispatcher::BINANCE_REFUSALS;
+/// Its level gauges.
+const BNARM_GAUGES: usize = 31;
+
+/// The counter rows, in [`bnarm_counter_values`] order — which is what
+/// pins the two together; the refusals' rows are
+/// `engine_exec_bn_refused_<word>_total`, in `Refusal` order.
+const BNARM_COUNTER_NAMES: [&str; BNARM_COUNTERS] = [
+    "engine_exec_bn_acked_total",
+    "engine_exec_bn_cancels_sent_total",
+    "engine_exec_bn_cancels_refused_total",
+    "engine_exec_bn_modifies_sent_total",
+    "engine_exec_bn_modifies_refused_total",
+    "engine_exec_bn_modified_total",
+    "engine_exec_bn_retired_dropped_total",
+    "engine_exec_bn_renamed_dropped_total",
+    "engine_exec_bn_budget_obs_total",
+    "engine_exec_bn_locks_total",
+    "engine_exec_bn_scan_failed_total",
+    "engine_exec_bn_evt_unknown_total",
+    "engine_exec_bn_sweeps_stranded_total",
+    "engine_exec_bn_fills_deferred_total",
+    "engine_exec_bn_jobs_dropped_total",
+    "engine_exec_bn_in_doubt_raised_total",
+    "engine_exec_bn_journal_dropped_total",
+    "engine_exec_bn_cancels_owed_total",
+    "engine_exec_bn_quiet_total",
+    "engine_exec_bn_dns_reresolved_total",
+    "engine_exec_bn_events_other_total",
+    "engine_exec_bn_refused_unbound_total",
+    "engine_exec_bn_refused_not_live_total",
+    "engine_exec_bn_refused_not_owner_total",
+    "engine_exec_bn_refused_kind_total",
+    "engine_exec_bn_refused_no_deadman_total",
+    "engine_exec_bn_refused_not_ready_total",
+    "engine_exec_bn_refused_price_total",
+    "engine_exec_bn_refused_min_qty_total",
+    "engine_exec_bn_refused_min_notional_total",
+    "engine_exec_bn_refused_max_qty_total",
+    "engine_exec_bn_refused_band_total",
+    "engine_exec_bn_refused_ttl_total",
+    "engine_exec_bn_refused_orders_total",
+    "engine_exec_bn_refused_qtr_total",
+    "engine_exec_bn_refused_max_orders_total",
+    "engine_exec_bn_refused_breadth_total",
+    "engine_exec_bn_refused_queue_full_total",
+    "engine_exec_bn_refused_verb_total",
+    "engine_exec_bn_refused_deadman_down_total",
+    "engine_exec_bn_refused_flags_total",
+];
+
+/// `BinanceArmReport`'s totals in [`BNARM_COUNTER_NAMES`] order: one
+/// literal, built in place (the refusals by index — a change of their
+/// count fails to compile here).
+// COPY: [u64; 41] (328 B) returned by value — cold, the 5 s /metrics
+// mirror (then kept as the next delta's baseline); the fields are visited
+// once in the name order — a borrowed view would need the report to be an
+// array, which the POD is not.
+fn bnarm_counter_values(r: &clob_dispatcher::BinanceArmReport) -> [u64; BNARM_COUNTERS] {
+    let f = &r.refused;
+    [
+        r.acked,
+        r.cancels_sent,
+        r.cancels_refused,
+        r.modifies_sent,
+        r.modifies_refused,
+        r.modified,
+        r.retired_dropped,
+        r.renamed_dropped,
+        r.budget_obs,
+        r.locks,
+        r.scan_failed,
+        r.evt_unknown,
+        r.sweeps_stranded,
+        r.fills_deferred,
+        r.jobs_dropped,
+        r.in_doubt_raised,
+        r.journal_dropped,
+        r.cancels_owed,
+        r.quiet,
+        r.dns_reresolved,
+        r.events_other,
+        f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15], f[16], f[17], f[18], f[19],
+    ]
+}
+
+/// Its gauge rows, in [`bnarm_gauge_values`] order.
+const BNARM_GAUGE_NAMES: [&str; BNARM_GAUGES] = [
+    "engine_exec_bn_ready",
+    "engine_exec_bn_order_up",
+    "engine_exec_bn_user_up",
+    "engine_exec_bn_deadman_ok",
+    "engine_exec_bn_clock_ok",
+    "engine_exec_bn_anchor_unsaved",
+    "engine_exec_bn_in_flight",
+    "engine_exec_bn_in_doubt",
+    "engine_exec_bn_clock_offset_ms",
+    "engine_exec_bn_heartbeat_age_ms",
+    "engine_exec_bn_congestion",
+    "engine_exec_bn_halt_reason",
+    "engine_exec_bn_sweep",
+    "engine_exec_bn_weight_used",
+    "engine_exec_bn_weight_max",
+    "engine_exec_bn_orders_10s_used",
+    "engine_exec_bn_orders_10s_cap",
+    "engine_exec_bn_orders_1m_used",
+    "engine_exec_bn_orders_1m_cap",
+    "engine_exec_bn_quiet_left_ms",
+    "engine_exec_bn_margin_usdm_1e6",
+    "engine_exec_bn_margin_coinm_1e6",
+    "engine_exec_bn_owned_rows",
+    "engine_exec_bn_account_mode",
+    "engine_exec_bn_post_rtt_p50_ns",
+    "engine_exec_bn_post_rtt_p99_ns",
+    "engine_exec_bn_post_rtt_max_ns",
+    "engine_exec_bn_cancel_rtt_p99_ns",
+    "engine_exec_bn_fill_lag_p99_ns",
+    "engine_exec_bn_rest_rtt_p99_ns",
+    "engine_exec_bn_push_to_write_p99_ns",
+];
+
+/// `BinanceArmReport`'s levels in [`BNARM_GAUGE_NAMES`] order; an unsigned
+/// level past `i64::MAX` — a heartbeat not yet seen — reads −1.
+// COPY: [i64; 31] (248 B) returned by value — cold, as above.
+fn bnarm_gauge_values(r: &clob_dispatcher::BinanceArmReport) -> [i64; BNARM_GAUGES] {
+    let g = |v: u64| i64::try_from(v).unwrap_or(-1);
+    [
+        g(r.ready),
+        g(r.order_up),
+        g(r.user_up),
+        g(r.deadman_ok),
+        g(r.clock_ok),
+        g(r.anchor_unsaved),
+        g(r.in_flight),
+        g(r.in_doubt),
+        r.clock_offset_ms,
+        g(r.heartbeat_age_ms),
+        g(r.congestion),
+        g(r.halt_reason),
+        g(r.sweep),
+        g(r.weight_used),
+        g(r.weight_max),
+        g(r.orders_10s_used),
+        g(r.orders_10s_cap),
+        g(r.orders_1m_used),
+        g(r.orders_1m_cap),
+        g(r.quiet_left_ms),
+        r.margin_usdm_1e6,
+        r.margin_coinm_1e6,
+        g(r.owned_rows),
+        g(r.account_mode),
+        g(r.post_rtt_p50_ns),
+        g(r.post_rtt_p99_ns),
+        g(r.post_rtt_max_ns),
+        g(r.cancel_rtt_p99_ns),
+        g(r.fill_lag_p99_ns),
+        g(r.rest_rtt_p99_ns),
+        g(r.push_to_write_p99_ns),
+    ]
+}
+
+/// **BX11** — the `engine_exec_bn_*` family: the Binance arm's own
+/// numbers — its verbs, its gateway's tallies, its refusals by reason, its
+/// stream and dead-man words, the governor's headroom, the margin ratios,
+/// the clock and the round trips. Registered only when a live slot names
+/// binance.
+#[derive(Copy, Clone, Debug)]
+pub struct ExecBnArmMetricIds {
+    /// The counters, in [`BNARM_COUNTER_NAMES`] order.
+    pub counters: [core_metrics::CounterId; BNARM_COUNTERS],
+    /// The level gauges, in [`BNARM_GAUGE_NAMES`] order.
+    pub gauges: [GaugeId; BNARM_GAUGES],
+}
+
+/// Register the `engine_exec_bn_*` family. Boot-only.
+fn register_bnarm_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<ExecBnArmMetricIds, &'static str> {
+    let mut counters = [core_metrics::CounterId::default(); BNARM_COUNTERS];
+    let mut i = 0usize;
+    while i < BNARM_COUNTERS {
+        counters[i] = reg
+            .register_counter(BNARM_COUNTER_NAMES[i])
+            .map_err(|_| "register bn arm counter")?;
+        i += 1;
+    }
+    let mut gauges = [GaugeId::default(); BNARM_GAUGES];
+    let mut k = 0usize;
+    while k < BNARM_GAUGES {
+        gauges[k] = reg
+            .register_gauge(BNARM_GAUGE_NAMES[k])
+            .map_err(|_| "register bn arm gauge")?;
+        k += 1;
+    }
+    // COPY: the 288 B id block ((41 + 31) × 4 B), returned by value once at
+    // boot — rejected: an out-param for a one-time move.
+    Ok(ExecBnArmMetricIds { counters, gauges })
+}
+
+/// Mirror the `engine_exec_bn_*` family: the counters as monotonic deltas
+/// of the arm's totals (`last`: the previous mirror's), the gauges as
+/// levels. 5 s cadence — cold path.
+fn mirror_bnarm_metrics(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &ExecBnArmMetricIds,
+    cur: &clob_dispatcher::BinanceArmReport,
+    last: &mut [u64; BNARM_COUNTERS],
+) {
+    let c = bnarm_counter_values(cur);
+    let mut i = 0usize;
+    while i < BNARM_COUNTERS {
+        reg.counter(ids.counters[i]).inc(c[i].saturating_sub(last[i]));
+        i += 1;
+    }
+    let g = bnarm_gauge_values(cur);
+    let mut k = 0usize;
+    while k < BNARM_GAUGES {
+        reg.gauge(ids.gauges[k]).set(g[k]);
+        k += 1;
+    }
+    // COPY: the 41 totals (328 B) kept as the next delta's baseline — 5 s
     // cadence, cold; a delta needs the previous value.
     *last = c;
 }
@@ -8316,6 +8556,68 @@ fn update_tick_age(
     }
 }
 
+/// **BX11** — the Binance arm's report as `/state` shows it
+/// (`exec.arms.binance_gw`): the operator's subset, each word saturated
+/// into its narrower field rather than wrapped.
+// COPY: the 344 B block returned by value into the snapshot — cold, once a
+// second; built whole — rejected: an out-param (the same bytes, and a
+// borrow of the snapshot through the call).
+fn binance_gw_snapshot(b: &clob_dispatcher::BinanceArmReport) -> engine_snapshot::BinanceGwSnapshot {
+    let u8_of = |v: u64| u8::try_from(v).unwrap_or(u8::MAX);
+    let mut refused = [0u32; clob_dispatcher::BINANCE_REFUSALS];
+    let mut i = 0;
+    while i < refused.len() {
+        refused[i] = u32::try_from(b.refused[i]).unwrap_or(u32::MAX);
+        i += 1;
+    }
+    engine_snapshot::BinanceGwSnapshot {
+        present: 1,
+        slot: u8_of(b.slot),
+        ready: u8_of(b.ready),
+        order_up: u8_of(b.order_up),
+        user_up: u8_of(b.user_up),
+        deadman_ok: u8_of(b.deadman_ok),
+        clock_ok: u8_of(b.clock_ok),
+        anchor_unsaved: u8_of(b.anchor_unsaved),
+        congestion: u8_of(b.congestion),
+        sweep: u8_of(b.sweep),
+        account_mode: u8_of(b.account_mode),
+        demo: u8_of(b.demo),
+        refused,
+        halt_reason: b.halt_reason,
+        in_flight: b.in_flight,
+        in_doubt: b.in_doubt,
+        in_doubt_raised: b.in_doubt_raised,
+        jobs_dropped: b.jobs_dropped,
+        fills_deferred: b.fills_deferred,
+        journal_dropped: b.journal_dropped,
+        cancels_owed: b.cancels_owed,
+        quiet: b.quiet,
+        quiet_left_ms: b.quiet_left_ms,
+        dns_reresolved: b.dns_reresolved,
+        events_other: b.events_other,
+        budget_obs: b.budget_obs,
+        locks: b.locks,
+        scan_failed: b.scan_failed,
+        evt_unknown: b.evt_unknown,
+        cancels_refused: b.cancels_refused,
+        modifies_refused: b.modifies_refused,
+        sweeps_stranded: b.sweeps_stranded,
+        heartbeat_age_ms: b.heartbeat_age_ms,
+        weight_used: b.weight_used,
+        weight_max: b.weight_max,
+        orders_10s_used: b.orders_10s_used,
+        orders_10s_cap: b.orders_10s_cap,
+        orders_1m_used: b.orders_1m_used,
+        orders_1m_cap: b.orders_1m_cap,
+        owned_rows: b.owned_rows,
+        post_rtt_p99_ns: b.post_rtt_p99_ns,
+        clock_offset_ms: b.clock_offset_ms,
+        margin_usdm_1e6: b.margin_usdm_1e6,
+        margin_coinm_1e6: b.margin_coinm_1e6,
+    }
+}
+
 /// Fill `out` from every source the loop can reach — the strategy
 /// (through the `StrategyCounters` UFCS route, set-agnostic), the
 /// engine's counters/percentiles/captures/recent rings, the AI status
@@ -8330,6 +8632,7 @@ fn fill_snapshot<S, D>(
     now: NsTs,
     seq: u64,
     gw: Option<&clob_dispatcher::GatewayArmReport>,
+    bn_gw: Option<&clob_dispatcher::BinanceArmReport>,
 ) where
     S: strategy_core::Strategy,
     D: OrderDispatch,
@@ -8516,6 +8819,9 @@ fn fill_snapshot<S, D>(
         },
         None => engine_snapshot::GatewayArmSnapshot::default(),
     };
+    // BX11: the Binance arm's own words, when the composition holds one
+    // (the loop's one report a second).
+    ex.arms_binance_gw = bn_gw.map_or_else(engine_snapshot::BinanceGwSnapshot::default, binance_gw_snapshot);
 
     let st = eng.ai_status();
     let a = &mut out.ai;
@@ -9149,6 +9455,16 @@ where
     let mut gw_report = clob_dispatcher::GatewayArmReport::default();
     let mut gw_ok = false;
     let mut hlgw_last = [0u64; HLGW_COUNTERS];
+    // BX11: the Binance arm's report of the last second, likewise.
+    let bn_read = obs.state.is_some()
+        || obs
+            .counter_ids
+            .as_ref()
+            .and_then(|i| i.exec.as_ref())
+            .is_some_and(|e| e.bnarm.is_some());
+    let mut bn_report = clob_dispatcher::BinanceArmReport::default();
+    let mut bn_ok = false;
+    let mut bnarm_last = [0u64; BNARM_COUNTERS];
     // F18/F21: ONE call site for every member's persisted state, so a
     // third member cannot be added to one of the two places and not the
     // other. A macro rather than a closure because it borrows `eng`
@@ -9242,6 +9558,13 @@ where
                     now,
                     &mut gw_report,
                 );
+            // BX11: the Binance arm's — one report a second, likewise.
+            bn_ok = bn_read
+                && clob_dispatcher::OrderDispatch::binance_arm_report(
+                    eng.dispatcher(),
+                    now,
+                    &mut bn_report,
+                );
             // T1(c): per-venue last-tick stamps, refreshed on the 1 s
             // cadence (the 5 s block below reads them for the age
             // gauges; the snapshot reads them for `last_tick_age_s`).
@@ -9260,6 +9583,7 @@ where
                     now,
                     state_seq,
                     gw_ok.then_some(&gw_report),
+                    bn_ok.then_some(&bn_report),
                 );
                 cell.publish(scratch);
             }
@@ -9407,6 +9731,10 @@ where
                     // report, above).
                     if let (Some(hl), true) = (ex.hlgw.as_ref(), gw_ok) {
                         mirror_hlgw_metrics(reg, hl, &gw_report, &mut hlgw_last);
+                    }
+                    // BX11: the Binance arm (the second's report, above).
+                    if let (Some(bn), true) = (ex.bnarm.as_ref(), bn_ok) {
+                        mirror_bnarm_metrics(reg, bn, &bn_report, &mut bnarm_last);
                     }
                 }
 
@@ -12408,7 +12736,9 @@ mod tests {
         // one counter (519); XMM XH5b-2 two counters and five gauges
         // (521 / 412); XH5c-2 three and three (524 / 415); XH5c-3 two
         // gauges (417); XH5d-1 two gauges (419); XH5d-3b three counters
-        // (527).
+        // (527); XH4i-5 the outcome mode's seventeen (544); BX11 the
+        // Binance arm's family, forty-one counters and thirty-one gauges
+        // (585 / 450 of 640 / 512).
         assert!(reg.gauges_len() <= core_metrics::MAX_GAUGES);
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).expect("/metrics fits its buffer");
@@ -13993,6 +14323,126 @@ mod tests {
         }
         for n in RETIRED_METRIC_NAMES {
             assert!(n.len() <= core_metrics::NAME_MAX);
+        }
+    }
+
+    /// **BX11** — a boot with a live Binance slot registers the
+    /// `engine_exec_bn_*` family and mirrors it: the counters as deltas of
+    /// the arm's totals, the levels as they are (a heartbeat not yet seen
+    /// as −1); the refusal rows are the arm's `Refusal` words, in order.
+    #[test]
+    fn a_binance_boot_registers_the_bn_arm_family_and_mirrors_deltas_and_levels() {
+        let mut modes = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];
+        modes[3] = 1;
+        let obs = Observability::build(
+            true,
+            Some(ExecObs {
+                modes,
+                binance: true,
+                gateway: false,
+            }),
+        )
+        .unwrap();
+        let reg = obs.metrics.as_ref().unwrap();
+        let ex = obs.counter_ids.as_ref().and_then(|i| i.exec.as_ref()).expect("the exec family");
+        assert!(ex.hlgw.is_none(), "no gateway arm");
+        let ids = ex.bnarm.as_ref().expect("the bn arm family");
+        let mut r = clob_dispatcher::BinanceArmReport {
+            present: 1,
+            acked: 3,
+            in_doubt_raised: 4,
+            heartbeat_age_ms: u64::MAX,
+            clock_offset_ms: -12,
+            margin_usdm_1e6: 250_000,
+            account_mode: 2,
+            weight_used: 100,
+            ..clob_dispatcher::BinanceArmReport::default()
+        };
+        r.refused[0] = 2;
+        r.refused[19] = 1;
+        let mut last = [0u64; BNARM_COUNTERS];
+        mirror_bnarm_metrics(reg, ids, &r, &mut last);
+        r.acked = 5;
+        mirror_bnarm_metrics(reg, ids, &r, &mut last);
+        let mut buf = vec![0u8; 256 * 1024];
+        let n = reg.encode_prometheus(&mut buf).unwrap();
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        for (name, v) in [
+            ("engine_exec_bn_acked_total", "5"),
+            ("engine_exec_bn_in_doubt_raised_total", "4"),
+            ("engine_exec_bn_refused_unbound_total", "2"),
+            ("engine_exec_bn_refused_flags_total", "1"),
+            ("engine_exec_bn_heartbeat_age_ms", "-1"),
+            ("engine_exec_bn_clock_offset_ms", "-12"),
+            ("engine_exec_bn_margin_usdm_1e6", "250000"),
+            ("engine_exec_bn_account_mode", "2"),
+            ("engine_exec_bn_weight_used", "100"),
+        ] {
+            assert!(text.contains(&format!("{name} {v}\n")), "{name} {v}: {text}");
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for n in BNARM_COUNTER_NAMES {
+            assert!(n.starts_with("engine_exec_bn_") && n.ends_with("_total"), "{n}");
+            assert!(n.len() <= core_metrics::NAME_MAX && seen.insert(n), "{n}");
+        }
+        for n in BNARM_GAUGE_NAMES {
+            assert!(n.starts_with("engine_exec_bn_") && !n.ends_with("_total"), "{n}");
+            assert!(n.len() <= core_metrics::NAME_MAX && seen.insert(n), "{n}");
+        }
+        let refusals = &BNARM_COUNTER_NAMES[BNARM_COUNTERS - clob_dispatcher::BINANCE_REFUSALS..];
+        for (n, w) in refusals.iter().zip(exec_binance::arm::REFUSAL_WORDS) {
+            assert_eq!(*n, format!("engine_exec_bn_refused_{w}_total"));
+        }
+    }
+
+    /// **BX11** — the report becomes `/state`'s block field by field, each
+    /// word saturated into its narrower field, never wrapped.
+    /// Break-and-watch: an `as u32` refusal count past `u32::MAX` wraps to
+    /// a small number here.
+    #[test]
+    fn the_binance_report_becomes_the_state_block_saturated() {
+        let mut r = clob_dispatcher::BinanceArmReport {
+            present: 1,
+            slot: 300,
+            ready: 1,
+            sweep: 2,
+            account_mode: 1,
+            in_doubt: 3,
+            jobs_dropped: 4,
+            heartbeat_age_ms: u64::MAX,
+            clock_offset_ms: -12,
+            margin_coinm_1e6: 400_000,
+            post_rtt_p99_ns: 9,
+            ..clob_dispatcher::BinanceArmReport::default()
+        };
+        r.refused[0] = u64::from(u32::MAX) + 5;
+        r.refused[19] = 7;
+        let b = binance_gw_snapshot(&r);
+        assert_eq!((b.present, b.slot, b.ready, b.sweep, b.account_mode), (1, u8::MAX, 1, 2, 1));
+        assert_eq!((b.refused[0], b.refused[19]), (u32::MAX, 7), "saturated, never wrapped");
+        assert_eq!((b.in_doubt, b.jobs_dropped, b.heartbeat_age_ms), (3, 4, u64::MAX));
+        assert_eq!((b.clock_offset_ms, b.margin_coinm_1e6, b.post_rtt_p99_ns), (-12, 400_000, 9));
+    }
+
+    /// **BX11** — `/state`'s words for the Binance arm follow the
+    /// numberings they spell: the arm's `Refusal` words, the account mode's
+    /// `exec.toml` words, the sweep's `CancelAllState`.
+    #[test]
+    fn the_binance_arm_s_words_follow_their_numberings() {
+        assert_eq!(engine_snapshot::BN_REFUSAL_WORDS, exec_binance::arm::REFUSAL_WORDS);
+        for m in [
+            exec_binance::mode::AccountMode::Classic,
+            exec_binance::mode::AccountMode::Pm,
+            exec_binance::mode::AccountMode::PmPro,
+        ] {
+            assert_eq!(engine_snapshot::bn_mode_word(m as u8), m.word());
+        }
+        for (c, w) in [
+            (clob_dispatcher::CancelAllState::Clear, "clear"),
+            (clob_dispatcher::CancelAllState::Working, "working"),
+            (clob_dispatcher::CancelAllState::Stranded, "stranded"),
+        ] {
+            assert_eq!(engine_snapshot::sweep_word(c as u8), w);
         }
     }
 

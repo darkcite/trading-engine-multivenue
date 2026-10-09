@@ -22,7 +22,9 @@
 //!
 //! [`TidRing`] deduplicates fills: UM reports one trade twice, as
 //! `TRADE_LITE` and inside `ORDER_TRADE_UPDATE`; the first books, the
-//! second is dropped on (row, trade id) (BX-2).
+//! second is dropped on (row, trade id) (BX-2). Only the update carries
+//! the commission: the ring remembers whether a trade's was seen, so it is
+//! journaled once, whichever report booked the fill (BX11, `J_FEE`).
 
 /// The table's capacity.
 pub const OOT_CAP: usize = 1_024;
@@ -547,8 +549,27 @@ impl Oot {
 /// The last `N` (row, trade id) fills booked (module docs). `N` is a
 /// power of two.
 pub struct TidRing<const N: usize> {
-    k: [(u64, u16); N],
+    k: [Trade; N],
     head: usize,
+}
+
+/// One remembered trade. 16 B.
+#[derive(Copy, Clone)]
+struct Trade {
+    tid: u64,
+    row: u16,
+    /// Its commission was seen (an `ORDER_TRADE_UPDATE` reported it).
+    fee: bool,
+}
+
+/// What [`TidRing::see`] found of one report of a trade.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TradeSeen {
+    /// Reported before: its fill is the earlier report's — book nothing.
+    pub again: bool,
+    /// This report carries the trade's commission, and the first: journal
+    /// it (BX11, once per trade).
+    pub fee_due: bool,
 }
 
 impl<const N: usize> Default for TidRing<N> {
@@ -563,25 +584,29 @@ impl<const N: usize> TidRing<N> {
     pub const fn new() -> Self {
         const { assert!(N.is_power_of_two()) };
         Self {
-            k: [(0, u16::MAX); N],
+            k: [Trade { tid: 0, row: u16::MAX, fee: false }; N],
             head: 0,
         }
     }
 
-    /// Was (row, tid) booked? Records it if not, and says `false`.
+    /// **One report of trade (row, `tid`)**, recorded if new. `fee`: the
+    /// report carries the commission (an `ORDER_TRADE_UPDATE`; a
+    /// `TRADE_LITE` does not).
     #[inline]
-    pub fn seen_or_record(&mut self, row: u16, tid: u64) -> bool {
+    pub fn see(&mut self, row: u16, tid: u64, fee: bool) -> TradeSeen {
         let mut i = 0;
         while i < N {
-            let (t, r) = self.k[i];
-            if t == tid && r == row {
-                return true;
+            let t = &mut self.k[i];
+            if t.tid == tid && t.row == row {
+                let fee_due = fee && !t.fee;
+                t.fee |= fee;
+                return TradeSeen { again: true, fee_due };
             }
             i += 1;
         }
-        self.k[self.head & (N - 1)] = (tid, row);
+        self.k[self.head & (N - 1)] = Trade { tid, row, fee };
         self.head = self.head.wrapping_add(1);
-        false
+        TradeSeen { again: false, fee_due: fee }
     }
 }
 
@@ -799,16 +824,30 @@ mod tests {
         assert_eq!(t.aux(b).booked_quote_1e12, 0, "nothing booked on the new order");
     }
 
+    /// A trade books once and its commission is due once, whichever of
+    /// its two reports comes first (BX-2; BX11). Break-and-watch: `fee_due`
+    /// without `!t.fee` journals a replayed update's commission twice;
+    /// without `t.fee |= fee` a lite-first trade's update finds nothing due
+    /// the second time — it is due exactly once either way.
     #[test]
-    fn tid_ring_dedups() {
+    fn tid_ring_books_once_and_owes_the_fee_once() {
+        let (lite, update) = (false, true);
         let mut r = TidRing::<4>::new();
-        assert!(!r.seen_or_record(1, 10));
-        assert!(r.seen_or_record(1, 10));
-        assert!(!r.seen_or_record(2, 10), "another row's trade");
-        for t in 11..15 {
-            assert!(!r.seen_or_record(1, t));
+        // TRADE_LITE first: it books; its update owes the commission.
+        assert_eq!(r.see(1, 10, lite), TradeSeen { again: false, fee_due: false });
+        assert_eq!(r.see(1, 10, update), TradeSeen { again: true, fee_due: true });
+        assert_eq!(r.see(1, 10, update), TradeSeen { again: true, fee_due: false }, "a replayed update");
+        assert_eq!(r.see(1, 10, lite), TradeSeen { again: true, fee_due: false });
+        // The update first: it books AND owes; the lite then nothing.
+        assert_eq!(r.see(1, 11, update), TradeSeen { again: false, fee_due: true });
+        assert_eq!(r.see(1, 11, lite), TradeSeen { again: true, fee_due: false });
+        assert_eq!(r.see(1, 11, update), TradeSeen { again: true, fee_due: false });
+        // The same id on another row is another trade.
+        assert_eq!(r.see(2, 10, update), TradeSeen { again: false, fee_due: true });
+        for t in 12..15 {
+            assert!(!r.see(1, t, lite).again);
         }
-        assert!(!r.seen_or_record(1, 10), "evicted after N more");
+        assert!(!r.see(1, 10, lite).again, "evicted after N more");
     }
 
     /// A listing read before an order ended is stale; one read after it,

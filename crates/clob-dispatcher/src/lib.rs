@@ -894,6 +894,21 @@ pub trait OrderDispatch {
     fn gateway_arm_report(&self, _now_ns: NsTs, _out: &mut GatewayArmReport) -> bool {
         false
     }
+
+    /// **BX11 — the Binance arm's own numbers** (`/state`
+    /// `exec.arms.binance_gw`, `/metrics` `engine_exec_bn_*`), when the
+    /// composition holds one: `true` with `out` filled by the arm, `false`
+    /// from everything else (the default; `out` untouched). What
+    /// [`LiveArmCounters`] cannot say: the gateway's own tallies, the
+    /// refusals by reason, the stream and dead-man words, the governor's
+    /// headroom, the margin ratios, the clock offset and the round trips.
+    /// `now_ns` is the engine clock. Cold: the 1 s `/state` publish and the
+    /// 5 s `/metrics` mirror; an out-param, so the report never crosses by
+    /// value.
+    #[inline]
+    fn binance_arm_report(&self, _now_ns: NsTs, _out: &mut BinanceArmReport) -> bool {
+        false
+    }
 }
 
 /// **XMM XH4i-5 — an arm the composition may not hold.** `None` is an
@@ -1109,6 +1124,12 @@ impl<D: OrderDispatch> OrderDispatch for Option<D> {
         self.as_ref()
             .is_some_and(|d| d.gateway_arm_report(now_ns, out))
     }
+
+    #[inline]
+    fn binance_arm_report(&self, now_ns: NsTs, out: &mut BinanceArmReport) -> bool {
+        self.as_ref()
+            .is_some_and(|d| d.binance_arm_report(now_ns, out))
+    }
 }
 
 /// **E7 — the live arm's operator numbers**, carried across the
@@ -1128,11 +1149,13 @@ pub struct LiveArmCounters {
     /// Submits refused locally before any packet left.
     pub refused_local: u64,
     /// The LAW E-4 subset of `refused_local`: the order named an
-    /// instance the table has rolled past.
+    /// instance the table has rolled past (Binance, BX11: a row bound but
+    /// not live — rolled past, or never live, as inexact units are).
     pub refused_stale: u64,
     /// Actions that reached the wire and whose answer was never read.
     /// Non-zero = there may be an order at the venue no local book
-    /// has an id for; reconciliation is what finds it.
+    /// has an id for; reconciliation is what finds it. (Binance, BX11:
+    /// the orders put in doubt, a running total.)
     pub sent_unanswered: u64,
     /// Fills that reached fill lane 3.
     pub fills_booked: u64,
@@ -1159,7 +1182,8 @@ pub struct LiveArmCounters {
     pub recon_unseen_legs: u64,
     /// LAW E-8 sweeps abandoned with orders possibly still resting.
     pub sweep_left: u64,
-    /// Sweeps that stopped shrinking and were force-terminated.
+    /// Sweeps that stopped shrinking and were force-terminated
+    /// (Binance, BX11: the sweeps that ended stranded).
     pub sweep_stalled: u64,
     /// Legs a cancel-all could not queue.
     pub cancel_all_unqueued: u64,
@@ -1174,7 +1198,9 @@ pub struct LiveArmCounters {
     /// Symbols two slots both traded — a configuration error.
     pub owner_contested: u64,
     /// The address request budget's remaining headroom, per the
-    /// governor. Negative = past the venue's cliff.
+    /// governor. Negative = past the venue's cliff. (Binance, BX11: the
+    /// request weight's headroom against the arm's own share of the IP's
+    /// minute, `ARM_WEIGHT_MAX_PER_MIN`; negative = past that share.)
     pub budget_remaining: i64,
     /// **E7 session bound** — the equity AT COST (spot USDC plus the
     /// held legs' cost basis, USD ×1e6) the session's P&L is measured
@@ -1527,6 +1553,148 @@ pub struct GatewayArmReport {
 // round trips' p99 and maximum (110). XMM XH4i-5: + the outcome mode's
 // seventeen counters (127).
 const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 1_016);
+
+/// The Binance arm's local refusal reasons ([`BinanceArmReport::refused`]
+/// — `exec_binance::arm::Refusal`, pinned there).
+pub const BINANCE_REFUSALS: usize = 20;
+
+/// **BX11 — the Binance arm's own numbers**
+/// ([`OrderDispatch::binance_arm_report`]): its verbs, its gateway's
+/// tallies, its refusals by reason — counters, monotonic for the process —
+/// then its levels. Words are the arm's codes; `/state` spells them.
+/// Cold; filled in place.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BinanceArmReport {
+    /// `1` when filled.
+    pub present: u64,
+    /// The owner slot (BX-7: it owns every row).
+    pub slot: u64,
+    // ---- the arm's counters ----------------------------------------------
+    /// Orders the venue acknowledged.
+    pub acked: u64,
+    /// Cancels pushed to the gateway / the venue refused.
+    pub cancels_sent: u64,
+    /// See [`Self::cancels_sent`].
+    pub cancels_refused: u64,
+    /// Modifies pushed / refused / confirmed.
+    pub modifies_sent: u64,
+    /// See [`Self::modifies_sent`].
+    pub modifies_refused: u64,
+    /// See [`Self::modifies_sent`].
+    pub modified: u64,
+    /// Retirements and renames the arm's queues could not hold.
+    pub retired_dropped: u64,
+    /// See [`Self::retired_dropped`].
+    pub renamed_dropped: u64,
+    /// Budget observations (a 429 or 418: the quiet period) and venue
+    /// locks.
+    pub budget_obs: u64,
+    /// See [`Self::budget_obs`].
+    pub locks: u64,
+    /// Venue frames that did not scan (each a halt observation, BX-15).
+    pub scan_failed: u64,
+    /// Gateway events of a kind the arm does not know.
+    pub evt_unknown: u64,
+    /// Sweeps that ended STRANDED: orders possibly still resting.
+    pub sweeps_stranded: u64,
+    // ---- the gateway's tallies -------------------------------------------
+    /// Fills held back while the fill lane was full (then delivered).
+    pub fills_deferred: u64,
+    /// Jobs the gateway's queue could not take.
+    pub jobs_dropped: u64,
+    /// Orders put in doubt (their answer lost; resolved by query, BX-11).
+    pub in_doubt_raised: u64,
+    /// Journal records dropped on a full ring.
+    pub journal_dropped: u64,
+    /// Cancels the venue refused, owed and retried.
+    pub cancels_owed: u64,
+    /// Quiet periods (the venue's budget answer).
+    pub quiet: u64,
+    /// Hosts resolved again after failing dials.
+    pub dns_reresolved: u64,
+    /// User-stream events of a kind the arm does not act on (counted, never
+    /// booked: BX-15).
+    pub events_other: u64,
+    /// The arm's local refusals by reason (`exec_binance::arm::Refusal`).
+    pub refused: [u64; BINANCE_REFUSALS],
+    // ---- levels --------------------------------------------------------------
+    /// The arm admits orders now (the gateway ready and its status fresh).
+    pub ready: u64,
+    /// The order route is up / the user stream is up / the venue's
+    /// dead-man answers / the clock is measured (the last status's flags).
+    pub order_up: u64,
+    /// See [`Self::order_up`].
+    pub user_up: u64,
+    /// See [`Self::order_up`].
+    pub deadman_ok: u64,
+    /// See [`Self::order_up`].
+    pub clock_ok: u64,
+    /// The E7 anchor could not be stored (yet).
+    pub anchor_unsaved: u64,
+    /// Orders pushed and not yet terminal (resting makers included).
+    pub in_flight: u64,
+    /// Orders in doubt now.
+    pub in_doubt: u64,
+    /// The venue clock's offset, ms (venue − local).
+    pub clock_offset_ms: i64,
+    /// Since the gateway's last heartbeat, ms; `u64::MAX` = none yet.
+    pub heartbeat_age_ms: u64,
+    /// The gateway's congestion level, its halt word, the sweep's state
+    /// (`CancelAllState` as its `u8`).
+    pub congestion: u64,
+    /// See [`Self::congestion`].
+    pub halt_reason: u64,
+    /// See [`Self::congestion`].
+    pub sweep: u64,
+    /// The request weight spent in the last minute, and the arm's share of
+    /// the IP's minute (the governor's headroom is their difference).
+    pub weight_used: u64,
+    /// See [`Self::weight_used`].
+    pub weight_max: u64,
+    /// The ORDERS pool's windows: placements in the last 10 s and minute,
+    /// and their caps.
+    pub orders_10s_used: u64,
+    /// See [`Self::orders_10s_used`].
+    pub orders_10s_cap: u64,
+    /// See [`Self::orders_10s_used`].
+    pub orders_1m_used: u64,
+    /// See [`Self::orders_10s_used`].
+    pub orders_1m_cap: u64,
+    /// What is left of the quiet period, ms (0: none).
+    pub quiet_left_ms: u64,
+    /// The margin ratio ×1e6, USDⓈ-M's and COIN-M's (maintenance over
+    /// equity; the unified account's on both in PM and PM Pro).
+    pub margin_usdm_1e6: i64,
+    /// See [`Self::margin_usdm_1e6`].
+    pub margin_coinm_1e6: i64,
+    /// Rows on the owned list.
+    pub owned_rows: u64,
+    /// The account mode (`exec_binance::mode::AccountMode` as its `u8`)
+    /// and `1` on Demo (the battery; the engine trades mainnet only).
+    pub account_mode: u64,
+    /// See [`Self::account_mode`].
+    pub demo: u64,
+    /// The order route's round trip: p50, p99, the maximum; the cancel's
+    /// p99; a fill's venue-to-local lag p99; the REST round trip's p99; a
+    /// record's push to its write p99 — ns.
+    pub post_rtt_p50_ns: u64,
+    /// See [`Self::post_rtt_p50_ns`].
+    pub post_rtt_p99_ns: u64,
+    /// See [`Self::post_rtt_p50_ns`].
+    pub post_rtt_max_ns: u64,
+    /// See [`Self::post_rtt_p50_ns`].
+    pub cancel_rtt_p99_ns: u64,
+    /// See [`Self::post_rtt_p50_ns`].
+    pub fill_lag_p99_ns: u64,
+    /// See [`Self::post_rtt_p50_ns`].
+    pub rest_rtt_p99_ns: u64,
+    /// See [`Self::post_rtt_p50_ns`].
+    pub push_to_write_p99_ns: u64,
+}
+
+// BX11: 75 words — pinned, as the other blocks crossing this boundary are.
+const _: () = assert!(core::mem::size_of::<BinanceArmReport>() == 600);
 
 /// **BX3 (F9) — an accepted order that ended without a (further) fill**,
 /// as the arm tells the router ([`OrderDispatch::try_next_retired`]).

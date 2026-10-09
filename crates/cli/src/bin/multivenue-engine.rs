@@ -51,6 +51,22 @@ use tracing_subscriber::EnvFilter;
 /// `--strategy ai+vrp+xsd+bin15` refused the boot at 2026-09-12T20:04:42Z
 /// and the whole set — ai-exec, vm, vrp, xsd and bin15 — went dark
 /// behind a live capture that looked healthy.
+/// BX11 (the parser review's P-2): every `exec-smoke` flag that is not the
+/// account tools' own. clap waives a `requires` whose target conflicts with
+/// an argument present — every battery flag `requires = "binance"`, and the
+/// tools conflict with `--binance` — so a battery flag beside a tool parsed
+/// and was ignored (`--bn-um-symbol ETHUSDT` beside a flatten closed every
+/// position). Each tool names all of these as conflicts instead; a test
+/// keeps the list whole for the flags to come.
+const BN_TOOL_CONFLICTS: [&str; 44] = [
+    "asset", "offline", "lifecycle", "px", "px2", "sz", "sell", "hl_perp", "coins", "cycles",
+    "fill_pairs", "usd", "rest_bps", "cross_bps", "ttl_ms", "sweep_every", "stall", "sweep_first",
+    "dry_run", "fill", "fill_px", "fill_sz", "fill_slot", "fill_cloid", "fill_repeat", "sweep",
+    "requote", "recon", "recon_secs", "watch", "binance_probe", "binance", "bn_rest", "bn_hmac",
+    "bn_um_symbol", "bn_cm_symbol", "bn_cycles", "bn_fill_pairs", "bn_usd", "bn_rest_bps",
+    "bn_cross_bps", "bn_ttl_ms", "bn_rotate_s", "bn_drill",
+];
+
 const STRATEGY_SET_NAMES: &[&str] = &[
     "all",
     "ai",
@@ -139,6 +155,13 @@ enum Cmd {
     /// per-strategy / per-ruleset-hash modeled P&L beside the paper
     /// view. JSON on stdout, human summary on stderr.
     AuditPnl(AuditPnlArgs),
+    /// BX11 (BX-14): the Binance commission measured from the arm's
+    /// journals (`binance-exec.pmlr` in each run directory, or in every
+    /// `run-*` under a root) — per class (product × perpetual/dated/TradFi ×
+    /// maker/taker) the trades, the rate, whether it reached N; the
+    /// `fees.toml` rows it supports, rounded up. Read-only: it never writes
+    /// `fees.toml`. JSON lines on stdout.
+    BnFees(BnFeesArgs),
     /// E3 execution gate: sign a probe action against Hyperliquid
     /// TESTNET and assert the venue verifies it — then assert it
     /// REJECTS a deliberately corrupted one.
@@ -730,6 +753,122 @@ struct ExecSmokeArgs {
     /// seconds (the WS API); 0 = the production 23 h.
     #[arg(long, default_value_t = 0, requires = "binance")]
     bn_rotate_s: u64,
+
+    /// BX11: a drill instead of the battery's phases — `gap`: two makers
+    /// rest under the dead-man, the gateway dies without its sweep, and the
+    /// venue's countdown must cancel them within 40 s (exit 65 if not; the
+    /// end then cancels them by id and reads the account flat); `flatten`:
+    /// one IoC opens a position, the gateway stops, and the operator's
+    /// flatten must close it (its exit code, 60–63, if not).
+    #[arg(long, value_name = "gap|flatten", requires = "binance")]
+    bn_drill: Option<String>,
+
+    /// **BX11 — the Binance account setup** (`cli::bn_ops::setup`): read
+    /// the settings the engine asserts at boot (BX-19), then change only
+    /// what differs — the one-way position mode, the single-asset mode
+    /// (USDⓈ-M), each `--bn-symbol` CROSSED within the leverage cap — and,
+    /// with `--bn-sign-tradfi`, the TradFi agreement. Demo unless
+    /// `--bn-network mainnet`, whose changes need `--confirm`. Exit codes
+    /// 60–64.
+    #[arg(
+        long,
+        value_name = "um|cm",
+        group = "binance_tool",
+        conflicts_with_all = BN_TOOL_CONFLICTS
+    )]
+    binance_setup: Option<String>,
+
+    /// **BX11 — the Binance flatten** (`cli::bn_ops::flatten`, O-BX9):
+    /// close every position (or `--bn-symbol`'s) with reduce-only IoCs
+    /// through the touch, up to three tries each; refused while an order of
+    /// the arm's rests unless `--bn-cancel-first`. Never clears a halt.
+    /// Demo unless `--bn-network mainnet`, whose orders need `--confirm`.
+    #[arg(
+        long,
+        value_name = "um|cm",
+        group = "binance_tool",
+        conflicts_with_all = BN_TOOL_CONFLICTS
+    )]
+    binance_flatten: Option<String>,
+
+    /// BX11: where the account tools reach — `demo` (the default) or
+    /// `mainnet` (the engine's own key; read freely, changed only with
+    /// `--confirm`).
+    #[arg(long, default_value = "demo", value_parser = ["demo", "mainnet"], requires = "binance_tool")]
+    bn_network: String,
+
+    /// BX11: the operator's word for a MAINNET change (`--bn-network
+    /// mainnet`): without it the tool reads, prints what it would send,
+    /// and sends nothing (exit 64).
+    #[arg(long, default_value_t = false, requires = "binance_tool")]
+    confirm: bool,
+
+    /// BX11: a symbol (repeatable): the setup's to set, the flatten's one
+    /// to close.
+    #[arg(long = "bn-symbol", value_name = "SYMBOL", requires = "binance_tool")]
+    bn_symbol: Vec<String>,
+
+    /// BX11 (setup): the leverage to set on each symbol (at most the cap);
+    /// none: a leverage within the cap is left as it is.
+    #[arg(long, requires = "binance_setup", requires = "binance_tool", conflicts_with = "binance_flatten")]
+    bn_leverage: Option<u8>,
+
+    /// BX11 (setup): the leverage cap (`exec.toml` `max_leverage`).
+    #[arg(
+        long,
+        default_value_t = cli::bn_ops::DEFAULT_LEVERAGE_CAP,
+        requires = "binance_setup",
+        requires = "binance_tool",
+        conflicts_with = "binance_flatten"
+    )]
+    bn_leverage_cap: u8,
+
+    /// BX11 (setup): sign the TradFi Perps agreement (USDⓈ-M).
+    #[arg(long, default_value_t = false, requires = "binance_setup", requires = "binance_tool", conflicts_with = "binance_flatten")]
+    bn_sign_tradfi: bool,
+
+    /// BX11 (setup): send every change even where the read says it holds
+    /// (the venue's "no need to change" answers count as held).
+    #[arg(long, default_value_t = false, requires = "binance_setup", requires = "binance_tool", conflicts_with = "binance_flatten")]
+    bn_reassert: bool,
+
+    /// BX11 (flatten): cancel the arm's resting orders by id first.
+    #[arg(long, default_value_t = false, requires = "binance_flatten", requires = "binance_tool", conflicts_with = "binance_setup")]
+    bn_cancel_first: bool,
+
+    /// BX11 (flatten): the first try's distance through the touch, bps
+    /// (doubling each try, at most 300; inside the row's band).
+    #[arg(long, default_value_t = 20, requires = "binance_flatten", requires = "binance_tool", conflicts_with = "binance_setup")]
+    bn_close_bps: i64,
+
+    /// BX11: the account tools sign with the HMAC key (`BINANCE_*HMAC*`).
+    #[arg(long, default_value_t = false, requires = "binance_tool")]
+    bn_ops_hmac: bool,
+}
+
+/// `bn-fees` (BX11, BX-14).
+#[derive(Debug, Parser)]
+struct BnFeesArgs {
+    /// Run directories (`run-<ns>`), or roots holding them.
+    #[arg(required = true)]
+    dirs: Vec<PathBuf>,
+    /// BX-14's N: commission-bearing trades per class before its row is
+    /// measured.
+    #[arg(long, default_value_t = cli::bn_fees::FEE_N)]
+    n: u64,
+}
+
+fn bn_fees(args: &BnFeesArgs) -> ExitCode {
+    match cli::bn_fees::run(&args.dirs, args.n) {
+        Ok(m) => {
+            info!(journal_records = m.records, fees = m.fees, classes = m.classes.len(), "bn-fees: measured (fees.toml untouched)");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!("bn-fees: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -1361,6 +1500,11 @@ fn main() -> ExitCode {
             init_tracing_stderr();
             audit_pnl(args)
         }
+        Cmd::BnFees(args) => {
+            // JSON lines only on stdout.
+            init_tracing_stderr();
+            bn_fees(&args)
+        }
         Cmd::ExecSmoke(args) => {
             // Same law again: one line of JSON on stdout for CI, the
             // human report on stderr.
@@ -1719,6 +1863,15 @@ fn exec_binance_battery(products: &str, args: &ExecSmokeArgs) -> ExitCode {
         cross_bps: args.bn_cross_bps,
         ttl_ms: args.bn_ttl_ms,
         rotate_s: args.bn_rotate_s,
+        drill: match args.bn_drill.as_deref() {
+            None => None,
+            Some("gap") => Some(cli::bn_battery::Drill::Gap),
+            Some("flatten") => Some(cli::bn_battery::Drill::Flatten),
+            Some(other) => {
+                error!("exec-smoke --bn-drill: `{other}` is not a drill (gap, flatten)");
+                return ExitCode::from(1);
+            }
+        },
     };
     info!(?spec, "exec-smoke: BX7b — the Binance Demo battery");
     // SIGINT/SIGTERM end the battery through its end — the cancel-all, the
@@ -1728,6 +1881,35 @@ fn exec_binance_battery(products: &str, args: &ExecSmokeArgs) -> ExitCode {
         return ExitCode::from(1);
     }
     ExitCode::from(cli::bn_battery::run(&spec, TlsTransport::default_client_config()))
+}
+
+/// BX11: the Binance account tools (`--binance-setup`, `--binance-flatten`).
+fn exec_binance_ops(product: &str, args: &ExecSmokeArgs) -> ExitCode {
+    let product = match product {
+        "um" => exec_binance::inst::PRODUCT_USDM,
+        "cm" => exec_binance::inst::PRODUCT_COINM,
+        other => {
+            error!("exec-smoke: `{other}` is not a product (um, cm)");
+            return ExitCode::from(1);
+        }
+    };
+    let spec = cli::bn_ops::OpsSpec {
+        reach: if args.bn_network == "mainnet" { cli::bn_ops::Reach::Mainnet } else { cli::bn_ops::Reach::Demo },
+        confirm: args.confirm,
+        hmac: args.bn_ops_hmac,
+        product,
+        symbols: args.bn_symbol.clone(),
+        leverage: args.bn_leverage,
+        cap: args.bn_leverage_cap,
+        sign_tradfi: args.bn_sign_tradfi,
+        reassert: args.bn_reassert,
+        cancel_first: args.bn_cancel_first,
+        close_bps: args.bn_close_bps,
+    };
+    info!(?spec, "exec-smoke: BX11 — the Binance account tool");
+    let tls = TlsTransport::default_client_config();
+    let code = if args.binance_setup.is_some() { cli::bn_ops::setup(&spec, tls) } else { cli::bn_ops::flatten(&spec, tls) };
+    ExitCode::from(code)
 }
 
 /// E3 arm: the TESTNET-ONLY signature gate.
@@ -1744,7 +1926,10 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
     use exec_hyperliquid::{HlConfig, Scope};
 
     // BX7b: the Binance Demo tools read their own variables and need none
-    // of Hyperliquid's phases.
+    // of Hyperliquid's phases; BX11: nor do the account tools.
+    if let Some(product) = args.binance_setup.as_deref().or(args.binance_flatten.as_deref()) {
+        return exec_binance_ops(product, &args);
+    }
     if args.binance_probe {
         // A SIGINT/SIGTERM stops the probes and still runs their end (the
         // probe's orders cancelled, the account read).
@@ -6246,6 +6431,100 @@ mod strategy_name_pin {
             );
             assert_eq!(strategy_set::mask_for_name(name), Some(mask), "{name}");
             i += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod exec_smoke_args {
+    //! BX11 (the parser review's P-2): the account tools take their own
+    //! flags and no other (`BN_TOOL_CONFLICTS`).
+    use clap::{CommandFactory, Parser};
+
+    /// The account tools' own flags.
+    const TOOLS: [&str; 12] = [
+        "binance_setup",
+        "binance_flatten",
+        "bn_network",
+        "confirm",
+        "bn_symbol",
+        "bn_leverage",
+        "bn_leverage_cap",
+        "bn_sign_tradfi",
+        "bn_reassert",
+        "bn_cancel_first",
+        "bn_close_bps",
+        "bn_ops_hmac",
+    ];
+
+    /// Every `exec-smoke` flag that is not a tool's own conflicts with both
+    /// tools — a flag added later without joining the list fails here.
+    #[test]
+    fn each_tool_conflicts_with_every_flag_not_its_own() {
+        let cli = super::Cli::command();
+        let smoke = cli.find_subcommand("exec-smoke").expect("exec-smoke");
+        for tool in ["binance_setup", "binance_flatten"] {
+            let t = smoke.get_arguments().find(|a| a.get_id() == tool).expect("the tool's flag");
+            let conflicts = smoke.get_arg_conflicts_with(t);
+            for a in smoke.get_arguments() {
+                let id = a.get_id().as_str();
+                if TOOLS.contains(&id) || id == "help" {
+                    continue;
+                }
+                assert!(conflicts.iter().any(|c| c.get_id() == id), "`{id}` parses beside `{tool}`");
+            }
+        }
+    }
+
+    /// The reviewer's case and its kin are refused; the tools' own flags
+    /// still parse.
+    #[test]
+    fn a_battery_flag_beside_a_tool_is_refused() {
+        let refused: [&[&str]; 6] = [
+            &["--binance-flatten", "um", "--bn-um-symbol", "ETHUSDT"],
+            &["--binance-flatten", "um", "--bn-network", "mainnet", "--confirm", "--bn-um-symbol", "ETHUSDT"],
+            &["--binance-setup", "um", "--bn-rest"],
+            &["--binance-setup", "cm", "--bn-cm-symbol", "BTCUSD_PERP"],
+            &["--binance-flatten", "um", "--bn-drill", "gap"],
+            &["--binance-flatten", "um", "--px", "1"],
+        ];
+        for args in refused {
+            let mut argv = vec!["multivenue-engine", "exec-smoke"];
+            argv.extend_from_slice(args);
+            assert!(super::Cli::try_parse_from(&argv).is_err(), "{argv:?} parsed");
+        }
+        // The parser review's P2-2: a tool's flag beside another mode, and
+        // no tool, is refused too (clap waives a `requires` of a flag that
+        // conflicts with one present; a group's, never).
+        let modes: [&[&str]; 4] = [&["--lifecycle"], &["--offline"], &["--binance", "um", "--lifecycle"], &["--binance-probe"]];
+        let owns: [&[&str]; 10] = [
+            &["--bn-leverage", "5"],
+            &["--bn-leverage-cap", "10"],
+            &["--bn-sign-tradfi"],
+            &["--bn-reassert"],
+            &["--bn-cancel-first"],
+            &["--bn-close-bps", "50"],
+            &["--bn-network", "mainnet"],
+            &["--confirm"],
+            &["--bn-symbol", "BTCUSDT"],
+            &["--bn-ops-hmac"],
+        ];
+        for mode in modes {
+            for own in owns {
+                let mut argv = vec!["multivenue-engine", "exec-smoke"];
+                argv.extend_from_slice(mode);
+                argv.extend_from_slice(own);
+                assert!(super::Cli::try_parse_from(&argv).is_err(), "{argv:?} parsed");
+            }
+        }
+        let ok: [&[&str]; 2] = [
+            &["--binance-flatten", "um", "--bn-symbol", "BTCUSDT", "--bn-network", "mainnet", "--confirm", "--bn-cancel-first"],
+            &["--binance-setup", "cm", "--bn-symbol", "BTCUSD_PERP", "--bn-leverage", "5", "--bn-reassert"],
+        ];
+        for args in ok {
+            let mut argv = vec!["multivenue-engine", "exec-smoke"];
+            argv.extend_from_slice(args);
+            assert!(super::Cli::try_parse_from(&argv).is_ok(), "{argv:?} refused");
         }
     }
 }

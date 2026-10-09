@@ -90,8 +90,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use clob_dispatcher::{
-    CancelAllState, DispatchError, OrderDispatch, PaperDispatcher, RETIRED_CANCELED_MEMBER, RETIRED_CANCELED_TTL,
-    RETIRED_EXPIRED, RETIRED_FILLED, RETIRED_REJECTED,
+    BinanceArmReport, CancelAllState, DispatchError, OrderDispatch, PaperDispatcher, RETIRED_CANCELED_MEMBER,
+    RETIRED_CANCELED_TTL, RETIRED_EXPIRED, RETIRED_FILLED, RETIRED_REJECTED,
 };
 use core_config::universe::Instrument;
 use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
@@ -104,31 +104,33 @@ use exec_binance::arm::{
     ArmKnobs, BnArm, Refusal, GW_CONNECT_FAILURES, GW_FILLS_LOST, GW_JOURNAL_DROPPED, GW_RECONNECTS, GW_RECON_FAILED,
     GW_RECON_OK, SHUTDOWN_WAIT_NS,
 };
-use exec_binance::cid::{classify, CidClass, CidPrefix, CID_LEN};
+use exec_binance::cid::{CidPrefix, CID_LEN};
 use exec_binance::cmd::{duplex, EVT_F_SWEEP_DONE};
 use exec_binance::config::{BnConfig, Signer};
 use exec_binance::gateway::{BnGateway, GwKnobs, Phase, QUIET_NS, ROTATE_AFTER_NS};
 use exec_binance::inst::{BnInstCold, BnInstHot, PRODUCT_COINM, PRODUCT_USDM};
-use exec_binance::journal::{JournalTx, JOURNAL_RING, J_ACK, J_ENDED, J_FILL, J_RECON, J_REJECT};
+use exec_binance::journal::{JournalTx, JOURNAL_RING, J_ACK, J_ENDED, J_FEE, J_FILL, J_RECON, J_REJECT};
 use exec_binance::margin::{MarginBook, SLOTS};
 use exec_binance::mode::{judge_one_way, judge_single_asset, judge_symbol_config, AccountMode};
 use exec_binance::recon::MARGIN_CROSS;
 use exec_binance::rest::{
-    render_account, scan_listen_key, R_ACCOUNT, T_DUAL, T_LISTEN_KEY_NEW, T_MULTI_ASSETS, T_OPEN_ORDERS, T_SYMBOL_CONFIG,
+    render_account, render_by_cid, scan_listen_key, R_ACCOUNT, R_CANCEL, R_STATUS, T_DUAL, T_LISTEN_KEY_NEW,
+    T_MULTI_ASSETS, T_OPEN_ORDERS, T_SYMBOL_CONFIG,
 };
-use exec_binance::userstream::{scan_user_event, UserEvent, UE_ORDER, UE_TRADE_LITE, X_TRADE};
-use exec_binance::wsapi::WsStatic;
+use exec_binance::userstream::{scan_user_event, UserEvent, S_CANCELED, UE_ORDER, UE_TRADE_LITE, X_TRADE};
+use exec_binance::wsapi::{Part, WsStatic};
 use exec_router::{ExecMode, ExecRoute, HaltLimits, HaltReason, RoutedDispatcher, SlotCaps};
 use ingress_binance::discovery::BnDiscovery;
 use rustls::ClientConfig;
 use tracing::{error, info, warn};
 
 use crate::bn_demo::{
-    account_of, demo_config, discover, open_orders, orders_of, product_word, px_off, qty_for, read_account, wall_ms, Line,
-    Public, Rest, Ws, EXIT_ACCOUNT, EXIT_BOOT, EXIT_CYCLE, EXIT_FILLS, EXIT_LEFTOVER, EXIT_POST_ONLY, EXIT_RECON,
-    EXIT_SWEEP, EXIT_TTL, ORD0, RECV_WINDOW_MS, STP_MODE,
+    account_of, demo_config, discover, is_arms, open_orders, order_state, orders_of, product_word, px_off, qty_for,
+    read_account, wall_ms, Line, Public, Rest, Ws, EXIT_ACCOUNT, EXIT_BOOT, EXIT_CYCLE, EXIT_DRILL, EXIT_FILLS,
+    EXIT_LEFTOVER, EXIT_POST_ONLY, EXIT_RECON, EXIT_SWEEP, EXIT_TTL, ORD0, RECV_WINDOW_MS, STP_MODE,
 };
 use crate::bn_live::{bind_table, BindSet};
+use crate::bn_ops::{flatten, OpsSpec, Reach, DEFAULT_LEVERAGE_CAP};
 
 /// The slot the battery's orders carry (the arm's ids name it, E-9): the
 /// slot the loopback rig uses; Demo is the battery's alone.
@@ -260,7 +262,28 @@ pub struct BatterySpec {
     /// The order session's planned replacement after this many seconds
     /// (make-before-break on the WS API); 0 = the production 23 h.
     pub rotate_s: u64,
+    /// BX11: a drill instead of the phases (`--bn-drill`).
+    pub drill: Option<Drill>,
 }
+
+/// **BX11 — the battery's drills** (`--bn-drill`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Drill {
+    /// The gateway dies under resting makers: the venue's dead-man must
+    /// cancel them (the BX13 R0 bar "the dead-man fired", on Demo).
+    Gap,
+    /// The operator's flatten on a real position (O-BX9): the arm opens one
+    /// with an IoC through the touch, its gateway stops, and
+    /// `bn_ops::flatten` must close it — its verdict a fresh read.
+    Flatten,
+}
+
+/// The gateway's dead-man countdown on Demo (its heartbeat renews it).
+const COUNTDOWN_MS: u64 = 30_000;
+/// The gateway's heartbeat on Demo: the countdown's renewal cadence.
+const HEARTBEAT_MS: u64 = 10_000;
+/// How long past the countdown the gap drill waits for the venue.
+const DRILL_MARGIN: Duration = Duration::from_secs(10);
 
 impl BatterySpec {
     /// The spec's own refusals, before anything is read.
@@ -285,6 +308,14 @@ impl BatterySpec {
         }
         if !(TTL_MIN_MS..=TTL_MAX_MS).contains(&self.ttl_ms) {
             return Err(format!("--bn-ttl-ms must be {TTL_MIN_MS}..={TTL_MAX_MS} (the arm's shortest maker TTL is 5 s)"));
+        }
+        if self.drill == Some(Drill::Gap) && (!self.um || self.cm || self.rest) {
+            return Err(String::from(
+                "--bn-drill gap is USDⓈ-M's on the WS API (`--binance um`): the dead-man rests makers there only",
+            ));
+        }
+        if self.drill == Some(Drill::Flatten) && self.um == self.cm {
+            return Err(String::from("--bn-drill flatten takes one product (`--binance um` or `--binance cm`)"));
         }
         Ok(())
     }
@@ -324,6 +355,13 @@ struct Report {
     tap_dropped: u64,
     recs_dropped: u64,
     fills_dropped: u64,
+    /// BX11: the gap drill's verdict — the venue's dead-man cancelled the
+    /// makers this long after the gateway died (ms).
+    drill_fired_ms: Option<u64>,
+    /// BX11: the run's `J_FILL` and `J_FEE` records (one fee per trade).
+    fills_journaled: u64,
+    /// See [`Self::fills_journaled`].
+    fees_journaled: u64,
 }
 
 impl Report {
@@ -350,6 +388,10 @@ impl Report {
 /// reconciliations, a halt's sweep. COIN-M: the maker refused, 4 fills, 2
 /// reconciliations.
 fn bar_short(spec: &BatterySpec, rep: &Report) -> Option<(u8, String)> {
+    // A drill is its own bar: its verdict is the run's code.
+    if spec.drill.is_some() {
+        return None;
+    }
     let (um, cm) = (PRODUCT_USDM as usize, PRODUCT_COINM as usize);
     let need: [(bool, u32, u32, u8, &str); 9] = [
         (spec.um, rep.cycles, BAR_CYCLES, EXIT_CYCLE, "maker cycles"),
@@ -502,6 +544,11 @@ struct Battery {
     tap: Option<Tap>,
     /// The UM IoCs' client ids, for K2.
     k2_oids: Vec<u64>,
+    /// BX11: a drill stopped the gateway — no shutdown sweep to wait for,
+    /// and no order through it.
+    gw_killed: bool,
+    /// The TLS configuration (BX11: the flatten drill's own client).
+    tls: Arc<ClientConfig>,
 }
 
 /// **Run the battery** (module docs): the exit code.
@@ -555,6 +602,9 @@ fn summary(spec: &BatterySpec, rep: &mut Report) -> u8 {
         .n("tap_dropped", count(rep.tap_dropped))
         .n("recs_dropped", count(rep.recs_dropped))
         .n("fills_dropped", count(rep.fills_dropped))
+        .n("fills_journaled", count(rep.fills_journaled))
+        .n("fees_journaled", count(rep.fees_journaled))
+        .n("drill_fired_ms", rep.drill_fired_ms.map_or(-1, |ms| ms as i64))
         .s("why", &rep.why)
         .s("left", &rep.left.join(" | "))
         .emit();
@@ -653,8 +703,8 @@ impl Battery {
             mode: AccountMode::Classic,
             recv_window_ms: RECV_WINDOW_MS,
             stp_mode: String::from(STP_MODE),
-            countdown_ms: 30_000,
-            heartbeat_ms: 10_000,
+            countdown_ms: COUNTDOWN_MS,
+            heartbeat_ms: HEARTBEAT_MS,
             recon_every_ms: RECON_EVERY_MS,
             spin: false,
             rotate_after_ns: if spec.rotate_s == 0 { ROTATE_AFTER_NS } else { spec.rotate_s * 1_000_000_000 },
@@ -702,6 +752,8 @@ impl Battery {
                 min_maker_ttl_ns: MIN_MAKER_TTL_NS,
                 margin: MarginBook::new(lim, prods),
                 anchor: core_time::WallAnchor::now(),
+                mode: exec_binance::mode::AccountMode::Classic,
+                demo: true,
             },
         );
         let mut route = ExecRoute::all_paper();
@@ -745,6 +797,8 @@ impl Battery {
             recs_dropped: 0,
             tap,
             k2_oids: Vec::with_capacity(16),
+            gw_killed: false,
+            tls,
         })
     }
 
@@ -985,6 +1039,11 @@ impl Battery {
         if !self.until(SEED_WAIT, |b| b.d.ledger().is_slot_seeded(SLOT as usize)) {
             return Err((EXIT_BOOT, String::from("the router never seeded the slot (no reconciled report from the arm)")));
         }
+        match self.spec.drill {
+            Some(Drill::Gap) => return self.gap_drill(rep),
+            Some(Drill::Flatten) => return self.flatten_drill(rep),
+            None => {}
+        }
         if self.spec.um {
             let l = self.lane(PRODUCT_USDM);
             for i in 0..self.spec.cycles {
@@ -1015,6 +1074,174 @@ impl Battery {
             let l = self.lane(PRODUCT_USDM);
             self.halt_sweep(l).map_err(|e| (EXIT_SWEEP, e))?;
             rep.sweeps += 1;
+        }
+        Ok(())
+    }
+
+    /// **BX11 drill — the gateway dies under resting makers** (plan §5
+    /// BX11): two post-only makers rest behind the touch under the
+    /// dead-man (the gateway's 30 s countdown, renewed every heartbeat);
+    /// once the arm's report says the dead-man covers them, the gateway
+    /// thread is stopped WITHOUT its sweep; the account's open orders are
+    /// read every second until neither is listed — within the countdown
+    /// and 10 s, or the drill fails and cancels them by id (the end then
+    /// reads the account flat).
+    fn gap_drill(&mut self, rep: &mut Report) -> Result<(), Fail> {
+        // Before the kill a failure is the cycle's: the dead-man was never
+        // put to the test (and the end's sweep cancels the makers).
+        let cycle = |e: String| (EXIT_CYCLE, e);
+        let l = self.lane(PRODUCT_USDM);
+        let h = self.lanes[l].h;
+        let (bid, ask) = self.priced(l).map_err(cycle)?;
+        let mut cids = Vec::with_capacity(2);
+        for (side, from, down) in [(Side::Bid, bid, true), (Side::Ask, ask, false)] {
+            let px = px_off(&h, from, self.spec.rest_bps, down).map_err(cycle)?;
+            let qty = qty_for(&h, px, self.spec.usd * 1_000_000).map_err(cycle)?;
+            let o = self.order(l, side, ORDER_KIND_MAKER, px, qty, ORDER_FLAG_POST_ONLY, SAFETY_TTL_NS);
+            self.submit(&o).map_err(cycle)?;
+            self.acked(o.client_oid).map_err(cycle)?;
+            let cid = self.cid(o.client_oid);
+            self.listed(l, &cid, Some((px, qty)), "the drill's maker resting").map_err(cycle)?;
+            cids.push(cid);
+        }
+        let covered = |b: &Self| {
+            let mut r = BinanceArmReport::default();
+            b.d.binance_arm_report(core_time::now_ns(), &mut r) && r.deadman_ok == 1
+        };
+        if !self.until(STEP_WAIT, covered) {
+            return Err(cycle(String::from("the dead-man never covered the makers")));
+        }
+        let phase_end = self.kill_gateway().map_err(cycle)?;
+        let died = Instant::now();
+        phase("drill").s("drill", "gap").s("gateway", &format!("{phase_end:?}")).s("makers", &cids.join(" ")).emit();
+        // The venue's countdown, renewed no more, fires. A read that fails
+        // is read again until the deadline: the verdict is the venue's book.
+        let drill = |e: String| (EXIT_DRILL, e);
+        let deadline = Duration::from_millis(COUNTDOWN_MS) + DRILL_MARGIN;
+        let mut left = cids.len();
+        loop {
+            // After a signal nothing more is read: the makers are cancelled
+            // by id below (the drain bound).
+            let signalled = crate::sigint::shutdown_requested();
+            if !signalled {
+                let lane = &mut self.lanes[l];
+                match open_orders(&mut lane.rest, &self.signer, Some(lane.symbol.as_bytes())) {
+                    Ok(rows) => left = cids.iter().filter(|c| rows.iter().any(|r| r.cid == **c)).count(),
+                    Err(e) => warn!("binance-battery: the drill's listing: {e} — read again"),
+                }
+            }
+            if left == 0 && !signalled {
+                // Unlisted is cancelled — or filled, which proves no
+                // dead-man: each maker's own status says which (a read that
+                // fails, or names none, is read again until the deadline).
+                let mut words = Vec::with_capacity(cids.len());
+                for c in &cids {
+                    let lane = &mut self.lanes[l];
+                    let sym = lane.symbol.clone();
+                    let a = lane.rest.signed(ORD0 + R_STATUS, &self.signer, false, |w, st, ts| {
+                        render_by_cid(w, st, sym.as_bytes(), Part::Lit(c.as_bytes()), ts);
+                    });
+                    words.push((c.clone(), a.as_ref().map_or((0, 0), order_state)));
+                }
+                let ms = died.elapsed().as_millis() as u64;
+                if words.iter().all(|(_, (s, _))| *s != 0) {
+                    // The countdown's own cancel reads CANCELED — and no
+                    // sooner than the countdown less two heartbeats (a
+                    // covered dead-man's last renewal can be two old).
+                    let cancelled = words.iter().all(|(_, (s, _))| *s == S_CANCELED);
+                    let in_time = ms + 2 * HEARTBEAT_MS >= COUNTDOWN_MS;
+                    phase("drill")
+                        .s("drill", "gap")
+                        .b("fired", cancelled && in_time)
+                        .n("after_ms", ms as i64)
+                        .s("statuses", &format!("{words:?}"))
+                        .emit();
+                    if !cancelled {
+                        return Err(drill(format!("the makers left the book, but not cancelled ({words:?}): the dead-man is unproven")));
+                    }
+                    if !in_time {
+                        return Err(drill(format!("the makers were cancelled after {ms} ms — sooner than the countdown: not the dead-man")));
+                    }
+                    rep.drill_fired_ms = Some(ms);
+                    return Ok(());
+                }
+                warn!("binance-battery: the drill's status read named none ({words:?}) — read again");
+            }
+            if died.elapsed() > deadline || signalled {
+                let why = if left == 0 {
+                    String::from("the makers left the book, but their statuses could not be read")
+                } else {
+                    format!("the dead-man did not cancel {left} maker(s) within {} s", deadline.as_secs())
+                };
+                for c in &cids {
+                    let lane = &mut self.lanes[l];
+                    let sym = lane.symbol.clone();
+                    let a = lane.rest.signed(ORD0 + R_CANCEL, &self.signer, false, |w, st, ts| {
+                        render_by_cid(w, st, sym.as_bytes(), Part::Lit(c.as_bytes()), ts);
+                    });
+                    warn!("binance-battery: the drill's cancel of {c}: {}", a.map_or_else(|e| e, |a| a.text()));
+                }
+                return Err(drill(why));
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    /// A drill's stop: the gateway thread ends WITHOUT its sweep (the engine
+    /// asked for none); from here on the end neither sweeps nor orders
+    /// through it (`gw_killed`).
+    fn kill_gateway(&mut self) -> Result<Phase, String> {
+        self.gw_stop.store(true, Ordering::Release);
+        // From here the end neither sweeps nor orders through it — stopped
+        // in time or not.
+        self.gw_killed = true;
+        let t0 = Instant::now();
+        while self.gw.as_ref().is_some_and(|h| !h.is_finished()) && t0.elapsed() < GW_STOP_WAIT {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // A thread still running keeps its handle: the end waits for it.
+        if !self.gw.as_ref().is_some_and(JoinHandle::is_finished) {
+            return Err(String::from("the gateway thread did not stop"));
+        }
+        let handle = self.gw.take().ok_or_else(|| String::from("no gateway thread"))?;
+        Ok(handle.join().unwrap_or((Phase::Clock, 0)).0)
+    }
+
+    /// **BX11 drill — the flatten on a real position** (O-BX9, plan §3.11
+    /// kill switch 5): the arm opens a position with one IoC through the
+    /// touch, reconciled; its gateway stops (no order of the arm's rests —
+    /// an IoC never does); then the operator's tool, `bn_ops::flatten` on
+    /// Demo, closes it with its own reduce-only IoC and judges by a fresh
+    /// read. Its exit code is the drill's; the end reads the account flat.
+    fn flatten_drill(&mut self, rep: &mut Report) -> Result<(), Fail> {
+        let product = if self.spec.um { PRODUCT_USDM } else { PRODUCT_COINM };
+        let l = self.lane(product);
+        let open = self.ioc(l, true, None).map_err(|e| (EXIT_FILLS, format!("the drill's opening IoC: {e}")))?;
+        rep.fills[product as usize] += open.1;
+        self.reconciled_after(open.2, product, rep).map_err(|e| (EXIT_RECON, e))?;
+        let opened = self.pos(self.lanes[l].sym);
+        let gateway = self.kill_gateway().map_err(|e| (EXIT_CYCLE, e))?;
+        phase("drill").s("drill", "flatten").s("gateway", &format!("{gateway:?}")).n("opened", opened).emit();
+        let spec = OpsSpec {
+            reach: Reach::Demo,
+            confirm: false,
+            hmac: self.spec.hmac,
+            product,
+            symbols: vec![self.lanes[l].symbol.clone()],
+            leverage: None,
+            cap: DEFAULT_LEVERAGE_CAP,
+            sign_tradfi: false,
+            reassert: false,
+            cancel_first: false,
+            close_bps: 20,
+        };
+        if crate::sigint::shutdown_requested() {
+            return Err((EXIT_FILLS, String::from("a signal before the flatten: the position is left to the flat read")));
+        }
+        let code = flatten(&spec, self.tls.clone());
+        phase("drill").s("drill", "flatten").n("flatten_exit", i64::from(code)).emit();
+        if code != 0 {
+            return Err((code, format!("the flatten answered {code} on a {opened} ×1e6 position")));
         }
         Ok(())
     }
@@ -1291,12 +1518,13 @@ impl Battery {
     fn end(mut self, rep: &mut Report) {
         // Every position the ledger holds, closed (reduce-only, wider each
         // try) while the slot can still order — not after a signal (a
-        // member's exit is not the signal's to make), and not once halted
-        // (a halted slot refuses every order; its sweep cancels).
+        // member's exit is not the signal's to make), not once halted (a
+        // halted slot refuses every order; its sweep cancels), and not
+        // through a gateway a drill stopped (the flat read judges).
         let mut l = 0;
         while l < self.lanes.len() {
             let mut tries = 0;
-            while tries < CLOSE_TRIES && self.pos(self.lanes[l].sym) != 0 && self.may_reduce().is_ok() {
+            while !self.gw_killed && tries < CLOSE_TRIES && self.pos(self.lanes[l].sym) != 0 && self.may_reduce().is_ok() {
                 tries += 1;
                 let pos = self.pos(self.lanes[l].sym);
                 self.spec.cross_bps = (self.spec.cross_bps * 2).min(300);
@@ -1309,7 +1537,10 @@ impl Battery {
         // The shutdown sweep (the arm spins for it at most
         // `arm::SHUTDOWN_WAIT_NS`); the gateway thread leaves — waited for
         // `SHUTDOWN_WAIT`, or after a signal its drain share; then stopped.
-        self.d.on_shutdown();
+        // Not after the gap drill: it stopped the gateway on purpose.
+        if !self.gw_killed {
+            self.d.on_shutdown();
+        }
         let t0 = Instant::now();
         while self.gw.as_ref().is_some_and(|h| !h.is_finished()) {
             let budget = if crate::sigint::shutdown_requested() { SIGNAL_GW_WAIT } else { SHUTDOWN_WAIT };
@@ -1335,8 +1566,33 @@ impl Battery {
             }
             None => (Phase::Clock, 0),
         };
-        phase("shutdown").s("gateway", &format!("{gw_phase:?}")).b("sweep_done", flag & EVT_F_SWEEP_DONE != 0).emit();
-        if gw_phase != Phase::Exiting {
+        let gateway = if self.gw_killed { String::from("stopped by the drill") } else { format!("{gw_phase:?}") };
+        phase("shutdown").s("gateway", &gateway).b("sweep_done", flag & EVT_F_SWEEP_DONE != 0).emit();
+        // A drill stopped the gateway: what the arm can no longer close or
+        // cancel — a maker that filled before the dead-man fired, a
+        // position the flatten drill left — the operator's own tool does,
+        // on Demo (the arm's orders by id first; a flat account is one
+        // read). The flat read then judges.
+        if self.gw_killed && !crate::sigint::shutdown_requested() {
+            for i in 0..self.lanes.len() {
+                let spec = OpsSpec {
+                    reach: Reach::Demo,
+                    confirm: false,
+                    hmac: self.spec.hmac,
+                    product: self.lanes[i].product,
+                    symbols: vec![self.lanes[i].symbol.clone()],
+                    leverage: None,
+                    cap: DEFAULT_LEVERAGE_CAP,
+                    sign_tradfi: false,
+                    reassert: false,
+                    cancel_first: true,
+                    close_bps: 20,
+                };
+                let code = flatten(&spec, self.tls.clone());
+                phase("end_flatten").s("product", product_word(self.lanes[i].product)).n("exit", i64::from(code)).emit();
+            }
+        }
+        if gw_phase != Phase::Exiting && !self.gw_killed {
             rep.fail(EXIT_SWEEP, format!("the shutdown sweep did not complete (the gateway ended {gw_phase:?})"));
         }
         self.turn();
@@ -1349,6 +1605,10 @@ impl Battery {
         rep.fills_lost = c.gw[GW_FILLS_LOST];
         rep.recs_dropped = self.recs_dropped;
         rep.fills_dropped = self.fills_dropped;
+        // BX11 (BX-14): every trade's commission journaled once — its
+        // `J_FEE` beside its fill (a fill booked without its trade has none).
+        rep.fees_journaled = self.recs.iter().filter(|r| r.kind == J_FEE).count() as u64;
+        rep.fills_journaled = self.recs.iter().filter(|r| r.kind == J_FILL).count() as u64;
         let log = self.tap.take().map(|tap| {
             let (log, ended) = tap.finish();
             if let Some(e) = ended {
@@ -1507,12 +1767,6 @@ fn account_check(rest: &mut Rest, signer: &Signer, product: u8, symbol: &str) ->
     Ok(())
 }
 
-/// An id the arm owns or sweeps: `cid::classify` reads it as this boot's
-/// or as an orphan of an earlier one.
-fn is_arms(cid: &str) -> bool {
-    matches!(classify(cid.as_bytes(), 0), CidClass::Ours { .. } | CidClass::Orphan { .. })
-}
-
 // -------------------------------------------------------------------------
 // K2 and the tap's record
 // -------------------------------------------------------------------------
@@ -1613,12 +1867,26 @@ mod tests {
             cross_bps: 50,
             ttl_ms: 5_000,
             rotate_s: 0,
+            drill: None,
         }
     }
 
     #[test]
     fn the_spec_refuses_what_the_venue_or_the_law_would() {
         assert!(spec().check().is_ok());
+        // BX11: the gap drill is USDⓈ-M's on the WS API.
+        let gap = BatterySpec { cm: false, drill: Some(Drill::Gap), ..spec() };
+        assert!(gap.check().is_ok());
+        assert!(BatterySpec { cm: true, ..gap.clone() }.check().is_err(), "COIN-M rests no maker");
+        assert!(BatterySpec { rest: true, ..gap.clone() }.check().is_err(), "the WS API's");
+        // A drill is its own bar: the plan's counts do not apply.
+        assert_eq!(bar_short(&gap, &Report::default()), None);
+        // BX11: the flatten drill takes one product, either, on either route.
+        let flat = BatterySpec { drill: Some(Drill::Flatten), ..spec() };
+        assert!(flat.check().is_err(), "two products");
+        assert!(BatterySpec { cm: false, ..flat.clone() }.check().is_ok());
+        assert!(BatterySpec { um: false, rest: true, ..flat.clone() }.check().is_ok());
+        assert_eq!(bar_short(&flat, &Report::default()), None);
         assert!(BatterySpec { um: false, cm: false, ..spec() }.check().is_err(), "no product");
         assert!(BatterySpec { hmac: true, ..spec() }.check().is_err(), "HMAC on the WS API");
         assert!(BatterySpec { hmac: true, rest: true, ..spec() }.check().is_ok());
