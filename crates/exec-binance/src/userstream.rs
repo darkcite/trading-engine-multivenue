@@ -22,6 +22,16 @@
 //! than the scan did. Both the raw form (`/ws`, `/private/ws`) and the
 //! combined form (`{"stream":…,"data":{…}}`) are read.
 //!
+//! **Spot (BX8)** has no stream of its own: its user data rides the order
+//! session (`userDataStream.subscribe` after `session.logon`), each event
+//! framed `{"subscriptionId":N,"event":{…}}`. [`scan_spot_event`] reads
+//! the event object in place into the same [`UserEvent`]: an
+//! `executionReport` is an order update ([`UE_ORDER`], its fields the
+//! futures update's letters, so one booking serves both), the end of the
+//! subscription ([`UE_STREAM_END`]) drops the session, and the balance
+//! events (`outboundAccountPosition`, `balanceUpdate`, …) are counted,
+//! never booked — the reconciliation reads the balances.
+//!
 //! [`UserStream`] holds the listenKey and the socket's lifecycle state;
 //! the gateway drives it (the REST calls that create and keep the key are
 //! the gateway's, the one REST caller).
@@ -29,7 +39,7 @@
 use core_types::Side;
 
 use crate::inst::{PRODUCT_COINM, PRODUCT_USDM};
-use crate::json::{dec_1e6, dec_1e9, str_of, u64_of, Elems, Pairs};
+use crate::json::{dec_1e6, dec_1e9, i64_of, is_null, str_of, u64_of, Elems, Pairs};
 
 /// `ORDER_TRADE_UPDATE`.
 pub const UE_ORDER: u8 = 1;
@@ -54,6 +64,10 @@ pub const UE_LIABILITY: u8 = 8;
 /// changed, as bits — a symbol's leverage (`ac`, its symbol in `symbol`),
 /// the multi-assets mode (`ai`), or both in one frame.
 pub const UE_CONFIG: u8 = 9;
+/// Spot's `eventStreamTerminated` (BX8): the order session's user-data
+/// subscription ended — the gateway drops the session (no user data, no
+/// orders on it).
+pub const UE_STREAM_END: u8 = 10;
 
 /// [`UserEvent::config`]'s bit for `ac`: a symbol's leverage changed.
 pub const CONFIG_LEVERAGE: u8 = 1 << 0;
@@ -111,6 +125,9 @@ pub const S_EXPIRED: u8 = 5;
 pub const S_EXPIRED_IN_MATCH: u8 = 6;
 /// Any other status.
 pub const S_OTHER: u8 = 7;
+/// `REJECTED` (BX8: a spot order the venue refused, reported or queried —
+/// ended, never asked about again).
+pub const S_REJECTED: u8 = 8;
 
 /// Why a frame did not scan (BX-15).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -163,7 +180,8 @@ impl Span {
 pub struct UserEvent {
     /// `i`: the venue order id.
     pub venue_oid: u64,
-    /// `t`: the trade id (0 when no trade).
+    /// `t`: the trade id (0 when no trade — `exec` tells that from a spot
+    /// symbol's first trade, whose id is 0).
     pub trade_id: u64,
     /// `l`: the last fill's quantity ×1e6.
     pub last_qty_1e6: i64,
@@ -248,6 +266,7 @@ pub fn status_of(s: &[u8]) -> u8 {
         b"CANCELED" => S_CANCELED,
         b"EXPIRED" => S_EXPIRED,
         b"EXPIRED_IN_MATCH" => S_EXPIRED_IN_MATCH,
+        b"REJECTED" => S_REJECTED,
         _ => S_OTHER,
     }
 }
@@ -279,7 +298,18 @@ const F_AP: u32 = 1 << 13;
 const F_M: u32 = 1 << 14;
 const F_TT: u32 = 1 << 15;
 const F_FA: u32 = 1 << 16;
+// Spot's `executionReport` alone (BX8): the original client id, the
+// cumulative quote, the event's name and time (the report is flat).
+const F_ORIG: u32 = 1 << 17;
+const F_ZQ: u32 = 1 << 18;
+const F_E: u32 = 1 << 19;
+const F_EV: u32 = 1 << 20;
 const NEED_ORDER: u32 = F_S | F_C | F_SIDE | F_X | F_ST | F_I | F_L | F_LP | F_Z | F_T | F_Q | F_P;
+/// Spot's `executionReport` (BX8): every report names its commission and
+/// its asset (`null` with none), the trade time, the maker flag, the
+/// cumulative quote and the original client id (`""` unless a cancel) —
+/// the venue's shape; a report short of one is not read.
+const NEED_SPOT: u32 = NEED_ORDER | F_E | F_EV | F_N | F_FA | F_TT | F_M | F_ZQ | F_ORIG;
 const NEED_LITE: u32 = F_S | F_C | F_SIDE | F_I | F_L | F_LP | F_T;
 
 #[inline(always)]
@@ -296,9 +326,21 @@ fn bad(_: ()) -> ScanErr {
 /// or the `TRADE_LITE` event itself) into `out`: the bits of the keys read,
 /// each at most once — a second copy is refused (BX7, the one-reading law:
 /// two copies of `c` or `s` would book a fill to whichever a reader picked).
-fn order_fields(f: &[u8], obj: usize, out: &mut UserEvent) -> Result<u32, ScanErr> {
+///
+/// `SPOT` (BX8): `obj` is a flat `executionReport` — its name and time
+/// read here too (`e` once, `E`); `t` is `-1` with no trade (read as 0);
+/// `N` is `null` with no commission (read as empty); `C`, the original
+/// client id, names the order a cancel ended (it then replaces `c`, the
+/// cancel's own id); and the average price is `Z / z` (no `ap`). Refused
+/// as no shape of the venue's (`BadField`): a trade without its id
+/// (`t: -1`), a commission without its asset, an original id on anything
+/// but a cancel, and the futures' execution types (`CALCULATED`,
+/// `AMENDMENT`).
+fn order_fields<const SPOT: bool>(f: &[u8], obj: usize, out: &mut UserEvent) -> Result<u32, ScanErr> {
     let mut w = Pairs::new(f, obj).map_err(malformed)?;
     let mut seen = 0u32;
+    let (mut orig, mut quote_1e6) = (Span::default(), 0i64);
+    let (mut no_trade, mut fee_null) = (false, false);
     while let Some((k, a, z)) = w.next().map_err(malformed)? {
         let bit = match k {
             b"s" => {
@@ -344,7 +386,19 @@ fn order_fields(f: &[u8], obj: usize, out: &mut UserEvent) -> Result<u32, ScanEr
                 F_Z
             }
             b"t" => {
-                out.trade_id = u64_of(f, a, z).map_err(bad)?;
+                out.trade_id = if SPOT {
+                    // `-1`: no trade; any other negative is no id.
+                    match i64_of(f, a, z).map_err(bad)? {
+                        -1 => {
+                            no_trade = true;
+                            0
+                        }
+                        t if t >= 0 => t as u64,
+                        _ => return Err(ScanErr::BadField),
+                    }
+                } else {
+                    u64_of(f, a, z).map_err(bad)?
+                };
                 F_T
             }
             b"q" => {
@@ -360,10 +414,39 @@ fn order_fields(f: &[u8], obj: usize, out: &mut UserEvent) -> Result<u32, ScanEr
                 F_N
             }
             b"N" => {
-                out.fee_asset = Span::of(f, str_of(f, a, z).map_err(bad)?);
+                out.fee_asset = if SPOT && is_null(f, a, z) {
+                    fee_null = true;
+                    Span::default()
+                } else {
+                    let s = str_of(f, a, z).map_err(bad)?;
+                    // Spot names a commission's asset, or `null` — never an
+                    // empty one (the parser review's P2-2: its fee would be
+                    // journaled and paid from no balance).
+                    if SPOT && s.is_empty() {
+                        return Err(ScanErr::BadField);
+                    }
+                    Span::of(f, s)
+                };
                 F_FA
             }
-            b"ap" => {
+            b"C" if SPOT => {
+                orig = Span::of(f, str_of(f, a, z).map_err(bad)?);
+                F_ORIG
+            }
+            b"Z" if SPOT => {
+                quote_1e6 = dec_1e6(f, a, z).map_err(bad)?;
+                F_ZQ
+            }
+            // The name was read before (it chose this reader): a second
+            // copy is refused here.
+            b"e" if SPOT => F_E,
+            b"E" if SPOT => {
+                out.event_ms = u64_of(f, a, z).map_err(bad)?;
+                F_EV
+            }
+            // Spot names no `ap` (its average is `Z / z`): one there is
+            // not read.
+            b"ap" if !SPOT => {
                 out.avg_px_1e6 = dec_1e6(f, a, z).map_err(bad)?;
                 F_AP
             }
@@ -382,7 +465,76 @@ fn order_fields(f: &[u8], obj: usize, out: &mut UserEvent) -> Result<u32, ScanEr
         }
         seen |= bit;
     }
+    // A trade of nothing, or at no price, is no trade (BX8, the parser
+    // review's P2-1 — as `rest::scan_trades` reads one): never booked. A
+    // trade short of either figure is the caller's `Missing`.
+    let figures = F_L | F_LP;
+    if (out.exec == X_TRADE || out.exec == X_CALCULATED) && seen & figures == figures && (out.last_qty_1e6 <= 0 || out.last_px_1e6 <= 0) {
+        return Err(ScanErr::BadField);
+    }
+    if SPOT {
+        let shapeless = (out.exec == X_TRADE && no_trade)
+            || (fee_null && out.commission_1e9 != 0)
+            || (orig.len != 0 && out.exec != X_CANCELED)
+            || out.exec == X_CALCULATED
+            || out.exec == X_AMENDMENT;
+        if shapeless {
+            return Err(ScanErr::BadField);
+        }
+        if orig.len != 0 {
+            out.cid = orig;
+        }
+        if out.cum_qty_1e6 > 0 && quote_1e6 > 0 {
+            out.avg_px_1e6 = (quote_1e6 as i128 * 1_000_000 / out.cum_qty_1e6 as i128).min(i64::MAX as i128) as i64;
+        }
+    }
     Ok(seen)
+}
+
+/// **Scan one spot user event** (BX8; module docs): the event object at
+/// `at` in `frame` (the `event` of a `{"subscriptionId":N,"event":{…}}`
+/// frame); spans are into `frame`. The name first — the venue sends `e`
+/// first, so this reads one key — then an `executionReport` read whole
+/// ([`order_fields`]); any other event is read for a second name only
+/// (refused: which would hold?) and counted or acted on by its name.
+pub fn scan_spot_event(frame: &[u8], at: usize, out: &mut UserEvent) -> Result<(), ScanErr> {
+    *out = UserEvent::default();
+    let mut w = Pairs::new(frame, at).map_err(malformed)?;
+    let mut ev: &[u8] = &[];
+    while let Some((k, a, z)) = w.next().map_err(malformed)? {
+        if k == b"e" {
+            ev = str_of(frame, a, z).map_err(bad)?;
+            break;
+        }
+    }
+    if ev.is_empty() {
+        return Err(ScanErr::NoEvent);
+    }
+    // The name is compared as sent: an escaped one is no name of the
+    // venue's (the parser review) — never read as another.
+    let mut i = 0;
+    while i < ev.len() {
+        if ev[i] == b'\\' {
+            return Err(ScanErr::BadField);
+        }
+        i += 1;
+    }
+    if ev == b"executionReport" {
+        out.kind = UE_ORDER;
+        let have = order_fields::<true>(frame, at, out)?;
+        if have & NEED_SPOT != NEED_SPOT {
+            return Err(ScanErr::Missing);
+        }
+        return Ok(());
+    }
+    // The rest of the object, for a second name.
+    while let Some((k, _, _)) = w.next().map_err(malformed)? {
+        if k == b"e" {
+            return Err(ScanErr::Malformed);
+        }
+    }
+    out.kind = if ev == b"eventStreamTerminated" { UE_STREAM_END } else { UE_OTHER };
+    Ok(())
 }
 
 /// **Scan one user-data frame** (module docs).
@@ -476,16 +628,20 @@ pub fn scan_user_event(frame: &[u8], out: &mut UserEvent) -> Result<(), ScanErr>
                 return Err(ScanErr::Missing);
             }
             out.kind = UE_ORDER;
-            let have = order_fields(frame, inner, out)?;
+            let have = order_fields::<false>(frame, inner, out)?;
             if have & NEED_ORDER != NEED_ORDER {
                 return Err(ScanErr::Missing);
             }
         }
         b"TRADE_LITE" => {
             out.kind = UE_TRADE_LITE;
-            let have = order_fields(frame, 0, out)?;
+            let have = order_fields::<false>(frame, 0, out)?;
             if have & NEED_LITE != NEED_LITE {
                 return Err(ScanErr::Missing);
+            }
+            // A trade of nothing, or at no price (BX8, P2-1, as above).
+            if out.last_qty_1e6 <= 0 || out.last_px_1e6 <= 0 {
+                return Err(ScanErr::BadField);
             }
             out.exec = X_TRADE;
             // The commission is the update's alone (BX11).
@@ -810,6 +966,124 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// BX8: spot's `executionReport` (the docs' shape, our IoC's states).
+    const ER_NEW: &[u8] = br#"{"e":"executionReport","E":1790000000100,"s":"BTCUSDT","c":"mv6512ab0f2000000000000006500000","S":"BUY","o":"LIMIT","f":"IOC","q":"0.00200000","p":"65000.01000000","P":"0.00000000","F":"0.00000000","g":-1,"C":"","x":"NEW","X":"NEW","r":"NONE","i":4293153,"l":"0.00000000","z":"0.00000000","L":"0.00000000","n":"0","N":null,"T":1790000000099,"t":-1,"I":8641984,"w":true,"m":false,"M":false,"O":1790000000099,"Z":"0.00000000","Y":"0.00000000","Q":"0.00000000","W":1790000000099,"V":"EXPIRE_MAKER"}"#;
+    const ER_TRADE: &[u8] = br#"{"e":"executionReport","E":1790000000101,"s":"BTCUSDT","c":"mv6512ab0f2000000000000006500000","S":"BUY","o":"LIMIT","f":"IOC","q":"0.00200000","p":"65000.01000000","P":"0.00000000","F":"0.00000000","g":-1,"C":"","x":"TRADE","X":"PARTIALLY_FILLED","r":"NONE","i":4293153,"l":"0.00100000","z":"0.00100000","L":"65000.00000000","n":"0.00000100","N":"BTC","T":1790000000100,"t":6750000001,"I":8641985,"w":false,"m":false,"M":true,"O":1790000000099,"Z":"65.00000000","Y":"65.00000000","Q":"0.00000000","W":1790000000099,"V":"EXPIRE_MAKER"}"#;
+    const ER_EXPIRED: &[u8] = br#"{"e":"executionReport","E":1790000000102,"s":"BTCUSDT","c":"mv6512ab0f2000000000000006500000","S":"BUY","o":"LIMIT","f":"IOC","q":"0.00200000","p":"65000.01000000","P":"0.00000000","F":"0.00000000","g":-1,"C":"","x":"EXPIRED","X":"EXPIRED","r":"NONE","i":4293153,"l":"0.00000000","z":"0.00100000","L":"0.00000000","n":"0","N":null,"T":1790000000101,"t":-1,"I":8641986,"w":false,"m":false,"M":false,"O":1790000000099,"Z":"65.00000000","Y":"0.00000000","Q":"0.00000000","W":1790000000099,"V":"EXPIRE_MAKER","eR":"UNFILLED_IOC_QUANTITY_EXPIRED"}"#;
+
+    fn spot(f: &[u8]) -> Result<UserEvent, ScanErr> {
+        let mut e = UserEvent::default();
+        scan_spot_event(f, 0, &mut e).map(|()| e)
+    }
+
+    /// BX8: an IoC's reports read as the futures update's fields — `t = -1`
+    /// as no trade, `N: null` as no asset, the average `Z / z`.
+    #[test]
+    fn spot_execution_reports_read_as_order_updates() {
+        let n = spot(ER_NEW).unwrap();
+        assert_eq!((n.kind, n.exec, n.status, n.trade_id, n.side), (UE_ORDER, X_NEW, S_NEW, 0, Side::Bid as u8));
+        assert_eq!((n.venue_oid, n.qty_1e6, n.px_1e6, n.event_ms, n.trade_ms), (4_293_153, 2_000, 65_000_010_000, 1_790_000_000_100, 1_790_000_000_099));
+        assert_eq!((n.symbol.get(ER_NEW), n.cid.get(ER_NEW)), (&b"BTCUSDT"[..], &b"mv6512ab0f2000000000000006500000"[..]));
+        assert_eq!((n.fee_asset.len, n.commission_1e9, n.avg_px_1e6), (0, 0, 0));
+        let t = spot(ER_TRADE).unwrap();
+        assert_eq!((t.exec, t.status, t.trade_id), (X_TRADE, S_PARTIALLY_FILLED, 6_750_000_001));
+        assert_eq!((t.last_qty_1e6, t.last_px_1e6, t.cum_qty_1e6), (1_000, 65_000_000_000, 1_000));
+        assert_eq!((t.commission_1e9, t.fee_asset.get(ER_TRADE)), (1_000, &b"BTC"[..]), "0.00000100 BTC, ×1e9");
+        assert_eq!(t.cid.get(ER_TRADE), &b"mv6512ab0f2000000000000006500000"[..], "an empty C keeps c");
+        assert_eq!(t.avg_px_1e6, 65_000_000_000, "Z / z");
+        let x = spot(ER_EXPIRED).unwrap();
+        assert_eq!((x.exec, x.status, x.trade_id, x.last_qty_1e6, x.cum_qty_1e6), (X_EXPIRED, S_EXPIRED, 0, 0, 1_000));
+        // A cancel's report names the order it ended in `C`.
+        let c = std::string::String::from_utf8(ER_EXPIRED.to_vec())
+            .unwrap()
+            .replace(r#""C":"""#, r#""C":"mv6512ab0f2000000000000006600000""#)
+            .replace(r#""c":"mv6512ab0f2000000000000006500000""#, r#""c":"web_d8b2f1""#)
+            .replace(r#""x":"EXPIRED","X":"EXPIRED""#, r#""x":"CANCELED","X":"CANCELED""#);
+        let e = spot(c.as_bytes()).unwrap();
+        assert_eq!((e.exec, e.status, e.cid.get(c.as_bytes())), (X_CANCELED, S_CANCELED, &b"mv6512ab0f2000000000000006600000"[..]));
+        // The states spot has and futures do not are no action.
+        for (x, st) in [("REJECTED", "REJECTED"), ("TRADE_PREVENTION", "EXPIRED"), ("REPLACED", "NEW")] {
+            let f = std::string::String::from_utf8(ER_NEW.to_vec())
+                .unwrap()
+                .replace(r#""x":"NEW","X":"NEW""#, &std::format!(r#""x":"{x}","X":"{st}""#));
+            let e = spot(f.as_bytes()).unwrap();
+            assert_eq!(e.exec, X_OTHER, "{x}");
+        }
+        let pending = std::string::String::from_utf8(ER_NEW.to_vec()).unwrap().replace(r#""X":"NEW""#, r#""X":"PENDING_NEW""#);
+        assert_eq!(spot(pending.as_bytes()).unwrap().status, S_OTHER);
+        let rejected = std::string::String::from_utf8(ER_NEW.to_vec()).unwrap().replace(r#""x":"NEW","X":"NEW""#, r#""x":"REJECTED","X":"REJECTED""#);
+        assert_eq!(spot(rejected.as_bytes()).unwrap().status, S_REJECTED);
+    }
+
+    /// BX8: the other events are counted by name, the subscription's end
+    /// is its own kind; fail closed on a report it cannot read.
+    #[test]
+    fn spot_events_fail_closed() {
+        let pos = br#"{"e":"outboundAccountPosition","E":1790000000103,"u":1790000000102,"B":[{"a":"BTC","f":"0.00099900","l":"0.00000000"},{"a":"USDT","f":"935.00000000","l":"0.00000000"}]}"#;
+        assert_eq!(spot(pos).unwrap().kind, UE_OTHER);
+        let bal = br#"{"e":"balanceUpdate","E":1790000000104,"a":"BTC","d":"0.10000000","T":1790000000104}"#;
+        assert_eq!(spot(bal).unwrap().kind, UE_OTHER);
+        assert_eq!(spot(br#"{"e":"eventStreamTerminated","E":1790000000105}"#).unwrap().kind, UE_STREAM_END);
+        assert_eq!(spot(br#"{"e":"eventStreamTerminated","e":"executionReport"}"#), Err(ScanErr::Malformed), "two names");
+        assert_eq!(spot(br#"{"E":1}"#), Err(ScanErr::NoEvent));
+        assert_eq!(spot(br#"{"e":"\u0065xecutionReport","E":1}"#), Err(ScanErr::BadField), "an escaped name");
+        assert_eq!(spot(b"[1]"), Err(ScanErr::Malformed));
+        let er = std::string::String::from_utf8(ER_TRADE.to_vec()).unwrap();
+        for (what, from, to, err) in [
+            ("no order id", r#""i":4293153,"#, "", ScanErr::Missing),
+            ("a trade id below -1", r#""t":6750000001"#, r#""t":-2"#, ScanErr::BadField),
+            ("the client id twice", r#""C":"","#, r#""C":"","c":"mvx","#, ScanErr::Malformed),
+            ("the name twice", r#""E":1790000000101,"#, r#""E":1790000000101,"e":"executionReport","#, ScanErr::Malformed),
+            ("the original id twice", r#""C":"","#, r#""C":"","C":"","#, ScanErr::Malformed),
+            ("no event time", r#""E":1790000000101,"#, "", ScanErr::Missing),
+            ("a commission asset not a string", r#""N":"BTC""#, r#""N":7"#, ScanErr::BadField),
+            // BX8 parser review: the venue's shape, whole.
+            ("a trade without its id", r#""t":6750000001"#, r#""t":-1"#, ScanErr::BadField),
+            ("a commission without its asset", r#""N":"BTC""#, r#""N":null"#, ScanErr::BadField),
+            ("an original id on a trade", r#""C":"""#, r#""C":"mv6512ab0f2000000000000006600000""#, ScanErr::BadField),
+            ("a futures execution type", r#""x":"TRADE""#, r#""x":"CALCULATED""#, ScanErr::BadField),
+            ("a futures amendment", r#""x":"TRADE""#, r#""x":"AMENDMENT""#, ScanErr::BadField),
+            ("no commission", r#""n":"0.00000100","#, "", ScanErr::Missing),
+            ("no commission asset", r#""N":"BTC","#, "", ScanErr::Missing),
+            ("no trade time", r#""T":1790000000100,"#, "", ScanErr::Missing),
+            ("no maker flag", r#""m":false,"#, "", ScanErr::Missing),
+            ("no cumulative quote", r#""Z":"65.00000000","#, "", ScanErr::Missing),
+            ("no original id", r#""C":"","#, "", ScanErr::Missing),
+            // Round 2 (P2-1, P2-2): a trade of nothing or at no price; an
+            // empty commission asset.
+            ("a trade at no price", r#""L":"65000.00000000""#, r#""L":"0.00000000""#, ScanErr::BadField),
+            ("a trade at a negative price", r#""L":"65000.00000000""#, r#""L":"-65000.00000000""#, ScanErr::BadField),
+            ("a trade of nothing", r#""l":"0.00100000""#, r#""l":"0.00000000""#, ScanErr::BadField),
+            ("an empty commission asset", r#""N":"BTC""#, r#""N":"""#, ScanErr::BadField),
+        ] {
+            assert!(er.contains(from), "{what}: the fixture has `{from}`");
+            assert_eq!(spot(er.replacen(from, to, 1).as_bytes()), Err(err), "{what}");
+        }
+        // Spot names no `ap` (the futures' average): one is not read — the
+        // average is `Z / z` alone, none with no cumulative quote.
+        let ap = er.replacen(r#""Z":"65.00000000""#, r#""Z":"0.00000000","ap":"1.0","ap":"2.0""#, 1);
+        assert_eq!(spot(ap.as_bytes()).unwrap().avg_px_1e6, 0, "an `ap` read on spot");
+        // A symbol's first trade has id 0 (the parser review): a TRADE with
+        // `t:0` is read — the trade-id ring dedupes (row, 0) as any id.
+        let t0 = spot(er.replacen(r#""t":6750000001"#, r#""t":0"#, 1).as_bytes()).unwrap();
+        assert_eq!((t0.exec, t0.trade_id, t0.last_qty_1e6), (X_TRADE, 0, 1_000));
+    }
+
+    /// BX8 (the parser review's P2-1), every product: a futures trade at no
+    /// price, or a lite one, is refused — never booked at 0.
+    #[test]
+    fn a_trade_at_no_price_is_refused() {
+        let mut e = UserEvent::default();
+        let otu = std::string::String::from_utf8(OTU.to_vec()).unwrap();
+        assert!(otu.contains(r#""L":"65000.1""#));
+        assert_eq!(scan_user_event(otu.replacen(r#""L":"65000.1""#, r#""L":"0""#, 1).as_bytes(), &mut e), Err(ScanErr::BadField));
+        assert_eq!(scan_user_event(otu.replacen(r#""l":"0.012""#, r#""l":"-0.012""#, 1).as_bytes(), &mut e), Err(ScanErr::BadField));
+        let lite = std::string::String::from_utf8(LITE.to_vec()).unwrap();
+        assert!(lite.contains(r#""L":"65000.2""#));
+        assert_eq!(scan_user_event(lite.replacen(r#""L":"65000.2""#, r#""L":"0""#, 1).as_bytes(), &mut e), Err(ScanErr::BadField));
+        assert_eq!(scan_user_event(OTU, &mut e), Ok(()), "the venue's own still reads");
+    }
+
     pub(crate) const OTU: &[u8] = br#"{"e":"ORDER_TRADE_UPDATE","E":1790000000123,"T":1790000000120,"o":{"s":"BTCUSDT","c":"mv0000000720000000000000005000000","S":"BUY","o":"LIMIT","f":"IOC","q":"0.012","p":"65000.1","ap":"65000.1","sp":"0","x":"TRADE","X":"FILLED","i":8886774,"l":"0.012","z":"0.012","L":"65000.1","N":"USDT","n":"0.312","T":1790000000119,"t":4242,"b":"0","a":"0","m":false,"R":false,"wt":"CONTRACT_PRICE","ot":"LIMIT","ps":"BOTH","cp":false,"rp":"0","pP":false,"si":0,"ss":0,"V":"EXPIRE_TAKER","pm":"NONE","gtd":0}}"#;
     const LITE: &[u8] = br#"{"e":"TRADE_LITE","E":1790000000100,"T":1790000000099,"s":"BTCUSDT","q":"0.012","p":"0.0","m":true,"c":"mvX","S":"SELL","L":"65000.2","l":"0.005","t":4243,"i":8886775}"#;
 
@@ -1048,6 +1322,50 @@ mod tests {
     }
 
     proptest! {
+        /// BX8: any bytes, and any byte of a real report changed — never a
+        /// panic; a report read names a symbol and an order, its spans in
+        /// the frame.
+        #[test]
+        fn spot_reports_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..512), at in 0usize..600, b in any::<u8>()) {
+            let mut e = UserEvent::default();
+            let _ = scan_spot_event(&bytes, 0, &mut e);
+            let mut m = ER_TRADE.to_vec();
+            let k = at % m.len();
+            m[k] = b;
+            if scan_spot_event(&m, 0, &mut e).is_ok() && e.kind == UE_ORDER {
+                prop_assert!(e.symbol.len > 0 && e.cid.len > 0);
+                prop_assert!(e.symbol.at as usize + e.symbol.len as usize <= m.len());
+                prop_assert!(e.cid.at as usize + e.cid.len as usize <= m.len());
+                prop_assert!(e.fee_asset.at as usize + e.fee_asset.len as usize <= m.len());
+            }
+        }
+
+        /// BX8: a report rendered from its figures reads them back exactly
+        /// (8-decimal strings, the venue's ids; the average `Z / z`).
+        #[test]
+        fn a_spot_report_round_trips(l in 1i64..100_000_000_000, z_more in 0i64..100_000_000_000, px in 1i64..1_000_000_000, fee in 0i64..1_000_000_000, tid in 0i64..1_000_000_000_000_000_000, oid in any::<u32>(), maker in any::<bool>()) {
+            // Quantities on a 1e-6 step, a price on a 1e-2 tick, a fee at 8 decimals;
+            // a trade id within `i64_of`'s 18 digits (a 19th is refused, not wrapped).
+            let d8 = |v: i64, scale: i64| std::format!("{}.{:08}", v / scale, (v % scale) * (100_000_000 / scale));
+            let z = l + z_more;
+            let quote_1e6 = (z as i128 * (px * 10_000) as i128 / 1_000_000) as i64;
+            let f = std::format!(
+                r#"{{"e":"executionReport","E":1790000000101,"s":"BTCUSDT","c":"mv6512ab0f2000000000000006500000","S":"BUY","o":"LIMIT","f":"IOC","q":"{q}","p":"{p}","P":"0.00000000","F":"0.00000000","g":-1,"C":"","x":"TRADE","X":"PARTIALLY_FILLED","r":"NONE","i":{oid},"l":"{l}","z":"{z}","L":"{p}","n":"{n}","N":"BTC","T":1790000000100,"t":{tid},"I":1,"w":false,"m":{maker},"M":true,"O":1790000000099,"Z":"{zq}","Y":"0.00000000","Q":"0.00000000","W":1790000000099,"V":"EXPIRE_MAKER"}}"#,
+                q = d8(z, 1_000_000),
+                p = d8(px * 10_000, 1_000_000),
+                l = d8(l, 1_000_000),
+                z = d8(z, 1_000_000),
+                n = d8(fee, 100_000_000),
+                zq = d8(quote_1e6, 1_000_000),
+            );
+            let e = spot(f.as_bytes()).unwrap();
+            prop_assert_eq!((e.last_qty_1e6, e.cum_qty_1e6, e.qty_1e6), (l, z, z));
+            prop_assert_eq!((e.last_px_1e6, e.px_1e6), (px * 10_000, px * 10_000));
+            prop_assert_eq!(e.commission_1e9, fee * 10);
+            prop_assert_eq!((e.trade_id, e.venue_oid, e.maker), (tid as u64, u64::from(oid), maker as u8));
+            prop_assert_eq!(e.avg_px_1e6, (quote_1e6 as i128 * 1_000_000 / z as i128) as i64);
+        }
+
         #[test]
         fn never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
             let mut e = UserEvent::default();

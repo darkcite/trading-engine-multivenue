@@ -11,25 +11,33 @@
 //!   ([`demo_host`], BX-16): no flag points them at mainnet, and they read
 //!   only the `BINANCE_DEMO_*` variables `scripts/exec-smoke.sh` exports.
 //!   (BX11's account tools alone reach mainnet, below.)
-//! * [`Rest`] — one futures product's signed REST client, speaking **the
-//!   gateway's own templates** (`rest::fut_specs` at 0, `rest::ord_specs`
-//!   at [`ORD0`]) and parameter renderers. So a request the probes prove
-//!   (the body-form DELETEs) is the gateway's request, byte for byte: the
-//!   method, the path, the form body, the signature last.
+//! * [`Rest`] — one product's signed REST client, speaking **the gateway's
+//!   own templates** (`rest::lane_specs` at 0, a futures product's
+//!   `rest::ord_specs` at [`ORD0`]) and parameter renderers. So a request
+//!   the probes prove (the body-form DELETEs) is the gateway's request,
+//!   byte for byte: the method, the path, the form body, the signature
+//!   last. A spot client (BX8) has no order route — spot's orders are the
+//!   gateway's, on the WS API — and reads its account at [`SPOT_ACCOUNT`].
 //! * [`Public`] — the unsigned reads, scanned in place by the gateway
 //!   crate's readers (`rest::scan_touch`, `rest::scan_mark`): the book's
-//!   touch, judged against the mark and the row's PERCENT_PRICE band.
-//! * [`discover`] — a product's `exchangeInfo` into a `BnDiscovery`.
+//!   touch, judged against the mark and the row's PERCENT_PRICE band — or,
+//!   on spot (no mark exists), the touch alone ([`Public::touch`]).
+//! * [`discover`] — a futures product's `exchangeInfo` into a
+//!   `BnDiscovery`; [`discover_spot`] — one spot symbol's (BX8: the whole
+//!   spot page is past the read's room).
 //! * [`read_account`] and [`open_orders`] — the account and the open
 //!   orders, read as the gateway reads them (its scanners; one whole
-//!   answer; a symbol's row or an order's id named twice refused).
+//!   answer; a symbol's row or an order's id named twice refused);
+//!   [`read_spot_account`] — spot's (BX8: `canTrade`, the permissions, a
+//!   base asset's balance at the venue's 8 decimals).
 //! * [`Ws`] — a blocking driver over `core_net::WsConn` (K11's logon,
 //!   K20's streams, the battery's tap).
 //! * The order arithmetic both tools price with ([`qty_for`],
 //!   [`px_off`]), on the instrument table's own rows and rounding: a value
 //!   outside the row's domain is refused, never wrapped.
 //! * [`Line`] — one JSON line on stdout per finding (the exec-smoke law).
-//! * The exit codes `scripts/exec-smoke.sh` names (50–59).
+//! * The exit codes `scripts/exec-smoke.sh` names (50–59), the gap drill's
+//!   (65) and the permission check's refusal (66, BX8).
 //! * **BX11 — the account tools' reach** ([`crate::bn_ops`]): the same
 //!   client on the configuration's own network ([`Rest::ops`],
 //!   [`Public::ops`], [`discover_ops`]) — Demo's, or mainnet's when the
@@ -53,18 +61,20 @@ use core_net::{HttpsPost, Method, Params, ReqSpec, WsCfg, WsConn, WsNext, WsProg
 use core_types::{make_symbol_id, VenueId, SYMBOL_ID_NONE};
 use exec_binance::config::{network_of, BnConfig, MainnetVerb, Network, Scope, Signer, HTTPS_PORT};
 use exec_binance::inst::{
-    BindSpec, BnInstCold, BnInstHot, InstTable, WireTable, INST_INVERSE, PRODUCT_COINM, PRODUCT_USDM,
+    AssetName, BindSpec, BnInstCold, BnInstHot, InstTable, WireTable, INST_INVERSE, PRODUCTS, PRODUCT_COINM,
+    PRODUCT_SPOT, PRODUCT_USDM, PRODUCT_WORDS, WIRE_SYMBOL_MAX,
 };
+use exec_binance::json::{field, str_of, Elems};
 use exec_binance::num::{ceil_to, floor_to};
-use exec_binance::recon::{scan_cm_account, scan_um_account, PosRow};
+use exec_binance::recon::{scan_cm_account, scan_spot_account, scan_um_account, PosRow};
 use exec_binance::rest::{
-    fut_specs, ord_specs, render_account, sapi_specs, scan_mark, scan_orders, scan_server_time, scan_touch, setup_specs,
-    OrderRow, QueryWriter, FUT_TEMPLATES, KEY_HEADER, ORD_TEMPLATES, R_ACCOUNT, SETUP_TEMPLATES, T_OPEN_ORDERS, T_TIME,
+    ord_specs, render_account, sapi_specs, scan_mark, scan_orders, scan_server_time, scan_touch, setup_specs,
+    OrderRow, QueryWriter, LANE_TEMPLATES, KEY_HEADER, ORD_TEMPLATES, R_ACCOUNT, SETUP_TEMPLATES, T_OPEN_ORDERS, T_TIME,
 };
 use exec_binance::userstream::ScanErr;
 use exec_binance::wsapi::{scan_rest_answer, WsAnswer};
 use exec_binance::wsapi::WsStatic;
-use ingress_binance::discovery::BnDiscovery;
+use ingress_binance::discovery::{BnDiscovery, BnPermissions};
 use mio::{Events, Poll, Token};
 use rustls::ClientConfig;
 
@@ -95,6 +105,12 @@ pub(crate) const EXIT_PROBE: u8 = 59;
 /// and its margin, or a maker filled instead (the account tools' codes,
 /// 60–64, are `bn_ops`'). A failure before the kill is the cycle's (52).
 pub(crate) const EXIT_DRILL: u8 = 65;
+/// BX8: the battery's boot was refused by the permission check — a spot
+/// row (a bStock's, typically) needs a permission group the account does
+/// not hold (`AssertErr::SymbolNotPermitted`, the bStock check). The
+/// expected verdict for a row whose group the account lacks; nothing was
+/// placed.
+pub(crate) const EXIT_PERMISSION: u8 = 66;
 
 /// `recvWindow` on every signed request (the venue's default; the engine's
 /// `BN_RECV_WINDOW_MAX_MS`).
@@ -184,19 +200,23 @@ pub(crate) fn demo_config(hmac: bool) -> Result<BnConfig, String> {
         )
     })?;
     let h = cfg.hosts();
-    for host in [&h.fut_wsapi, &h.fut_user, &h.fut_rest, &h.cm_wsapi, &h.cm_user, &h.cm_rest, &h.papi, &h.sapi] {
+    // Every one of the nine (BX8: spot's WS API too; its REST host is
+    // SAPI's).
+    for host in [&h.fut_wsapi, &h.fut_user, &h.fut_rest, &h.cm_wsapi, &h.cm_user, &h.cm_rest, &h.papi, &h.sapi, &h.spot_wsapi] {
         demo_host(host)?;
     }
     Ok(cfg)
 }
 
-/// The product's word in reports.
+/// The product's word in reports — `exec.toml`'s (`inst::PRODUCT_WORDS`:
+/// `spot`, `usdm`, `coinm`, …); `unknown` past them (a journal's fee code
+/// can name any).
 #[must_use]
 pub(crate) const fn product_word(product: u8) -> &'static str {
-    if product == PRODUCT_COINM {
-        "coinm"
+    if (product as usize) < PRODUCTS {
+        PRODUCT_WORDS[product as usize]
     } else {
-        "usdm"
+        "unknown"
     }
 }
 
@@ -329,8 +349,13 @@ impl Rows {
 // -------------------------------------------------------------------------
 
 /// The gateway's order-route templates start here (`rest::ord_specs`;
-/// `rest::fut_specs` are at 0).
-pub(crate) const ORD0: usize = FUT_TEMPLATES;
+/// `rest::lane_specs` are at 0).
+pub(crate) const ORD0: usize = LANE_TEMPLATES;
+/// BX8: a spot client's account read (`GET /api/v3/account`), past the
+/// lane's templates — where a futures client's order route starts
+/// ([`ORD0`]): a spot client has none (spot's orders are the gateway's, on
+/// the WS API).
+pub(crate) const SPOT_ACCOUNT: usize = LANE_TEMPLATES;
 /// BX11: the account tools' changes start here (`rest::setup_specs`:
 /// `U_DUAL` … `U_STOCK_CONTRACT`), signed by [`Rest::sign_change`].
 pub(crate) const SET0: usize = ORD0 + ORD_TEMPLATES;
@@ -378,9 +403,10 @@ impl Answer {
     }
 }
 
-/// **A signed REST client on one Demo host** (module docs): a futures
-/// product's ([`Rest::new`]) or SAPI's ([`Rest::sapi`]) — the gateway's
-/// templates, its renderers, the one signer.
+/// **A signed REST client on one Demo host** (module docs): a product's
+/// ([`Rest::new`]: a futures product's, or spot's — BX8) or SAPI's
+/// ([`Rest::sapi`]) — the gateway's templates, its renderers, the one
+/// signer.
 pub(crate) struct Rest {
     http: HttpsPost,
     /// The venue clock less the local wall clock, ms ([`Rest::clock`]).
@@ -658,12 +684,23 @@ impl Rest {
     }
 }
 
-/// **A futures product's templates** on its REST host: the gateway's
-/// (`fut_specs` at 0, `ord_specs` at [`ORD0`]), the account tools' at
-/// [`SET0`], and USDⓈ-M's trading status at [`X_TRADING_STATUS`].
+/// **A product's templates** on its REST host: the gateway's (`lane_specs`
+/// at 0); a futures product's order route (`ord_specs` at [`ORD0`]), the
+/// account tools' at [`SET0`] and USDⓈ-M's trading status at
+/// [`X_TRADING_STATUS`]; spot's account read alone at [`SPOT_ACCOUNT`]
+/// (BX8: `rest::ord_specs` speaks futures only).
 fn lane_specs<'a>(product: u8, key: &'a [(&'a str, &'a str)]) -> Vec<ReqSpec<'a>> {
     let mut specs: Vec<ReqSpec<'a>> = Vec::with_capacity(X_TRADING_STATUS + 1);
-    specs.extend_from_slice(&fut_specs(product, false, key));
+    specs.extend_from_slice(&exec_binance::rest::lane_specs(product, false, key));
+    if product == PRODUCT_SPOT {
+        specs.push(ReqSpec {
+            method: Method::Get,
+            path: "/api/v3/account",
+            params: Params::Query,
+            headers: key,
+        });
+        return specs;
+    }
     specs.extend_from_slice(&ord_specs(product, false, key));
     specs.extend_from_slice(&setup_specs(product, key));
     if product != PRODUCT_COINM {
@@ -721,9 +758,12 @@ pub(crate) struct Touch {
 }
 
 /// **The unsigned reads on a product's Demo REST host** — no key header:
-/// `…/ticker/bookTicker` and `…/premiumIndex`.
+/// `…/ticker/bookTicker` and `…/premiumIndex` (spot: the book alone — BX8,
+/// spot has no mark).
 pub(crate) struct Public {
     http: HttpsPost,
+    /// `PRODUCT_*`: a spot client holds no mark template.
+    product: u8,
 }
 
 impl Public {
@@ -748,20 +788,19 @@ impl Public {
 
     fn on(cfg: &BnConfig, product: u8, tls: Arc<ClientConfig>) -> Result<Self, String> {
         let host = cfg.hosts().lane(product).rest;
-        let (book, mark) = if product == PRODUCT_COINM {
-            ("/dapi/v1/ticker/bookTicker", "/dapi/v1/premiumIndex")
-        } else {
-            ("/fapi/v1/ticker/bookTicker", "/fapi/v1/premiumIndex")
-        };
         let q = |path| ReqSpec {
             method: Method::Get,
             path,
             params: Params::Query,
             headers: &[],
         };
-        let http = HttpsPost::with_specs(host, cfg.port(), tls, &[q(book), q(mark)], WIN, RESP)
-            .map_err(|e| format!("{host}: the public client could not be prepared ({e:?})"))?;
-        Ok(Self { http })
+        let built = match product {
+            PRODUCT_SPOT => HttpsPost::with_specs(host, cfg.port(), tls, &[q("/api/v3/ticker/bookTicker")], WIN, RESP),
+            PRODUCT_COINM => HttpsPost::with_specs(host, cfg.port(), tls, &[q("/dapi/v1/ticker/bookTicker"), q("/dapi/v1/premiumIndex")], WIN, RESP),
+            _ => HttpsPost::with_specs(host, cfg.port(), tls, &[q("/fapi/v1/ticker/bookTicker"), q("/fapi/v1/premiumIndex")], WIN, RESP),
+        };
+        let http = built.map_err(|e| format!("{host}: the public client could not be prepared ({e:?})"))?;
+        Ok(Self { http, product })
     }
 
     /// One read of `symbol` on template `t`, scanned in place by `scan`
@@ -798,12 +837,28 @@ impl Public {
     /// foreign book prices no order.
     ///
     /// # Errors
-    /// A read failed or did not scan, or the touch lies outside the band.
+    /// A read failed or did not scan, or the touch lies outside the band —
+    /// or a spot client (no mark exists: [`Public::touch`]).
     pub(crate) fn priced(&mut self, symbol: &[u8], band: &BnInstCold) -> Result<(Touch, i64, i64), String> {
+        if self.product == PRODUCT_SPOT {
+            return Err(String::from("spot has no mark: its touch is read alone"));
+        }
         let (mark, index) = self.read(P_MARK, symbol, scan_mark)?;
+        let t = self.touch(symbol)?;
+        in_band(t.bid_1e6, t.ask_1e6, mark, band).map_err(|e| format!("{}: {e}", String::from_utf8_lossy(symbol)))?;
+        Ok((t, mark, index))
+    }
+
+    /// **The touch of `symbol`** (`…/ticker/bookTicker`): one whole answer,
+    /// `symbol`'s, a two-sided book. Alone, it prices a spot IoC (BX8:
+    /// spot has no mark to judge it against — the venue's own
+    /// PERCENT_PRICE_BY_SIDE, around its average price, judges the order).
+    ///
+    /// # Errors
+    /// The read failed or did not scan.
+    pub(crate) fn touch(&mut self, symbol: &[u8]) -> Result<Touch, String> {
         let (bid, ask) = self.read(P_BOOK, symbol, scan_touch)?;
-        in_band(bid, ask, mark, band).map_err(|e| format!("{}: {e}", String::from_utf8_lossy(symbol)))?;
-        Ok((Touch { bid_1e6: bid, ask_1e6: ask }, mark, index))
+        Ok(Touch { bid_1e6: bid, ask_1e6: ask })
     }
 }
 
@@ -825,11 +880,12 @@ fn in_band(bid: i64, ask: i64, mark: i64, band: &BnInstCold) -> Result<(), Strin
     Ok(())
 }
 
-/// **A product's `exchangeInfo`** from its Demo REST host into a discovery
-/// table (the boot discovery's own parser).
+/// **A futures product's `exchangeInfo`** from its Demo REST host into a
+/// discovery table (the boot discovery's own parser; spot's is
+/// [`discover_spot`]).
 ///
 /// # Errors
-/// The read failed or the page did not parse.
+/// Not a futures product, the read failed or the page did not parse.
 pub(crate) fn discover(cfg: &BnConfig, product: u8, tls: &Arc<ClientConfig>) -> Result<BnDiscovery, String> {
     demo_host(cfg.hosts().lane(product).rest)?;
     discover_on(cfg, product, tls)
@@ -846,12 +902,44 @@ pub(crate) fn discover_ops(cfg: &BnConfig, product: u8, tls: &Arc<ClientConfig>)
 }
 
 fn discover_on(cfg: &BnConfig, product: u8, tls: &Arc<ClientConfig>) -> Result<BnDiscovery, String> {
-    let host = cfg.hosts().lane(product).rest;
-    let path = if product == PRODUCT_COINM {
-        "/dapi/v1/exchangeInfo"
-    } else {
-        "/fapi/v1/exchangeInfo"
+    let path = match product {
+        PRODUCT_COINM => "/dapi/v1/exchangeInfo",
+        PRODUCT_USDM => "/fapi/v1/exchangeInfo",
+        // BX8: spot's page names its symbol ([`discover_spot`]).
+        _ => return Err(format!("{}: no futures exchangeInfo — spot's names its symbol", product_word(product))),
     };
+    exchange_info(cfg.hosts().lane(product).rest, path, tls)
+}
+
+/// **BX8 — one spot symbol's `exchangeInfo`** (`GET
+/// /api/v3/exchangeInfo?symbol=`) from the Demo REST host (SAPI's) into a
+/// discovery table: the whole spot page — every symbol, the bStocks'
+/// permission sets of some 200 groups each — is past the read's room.
+///
+/// # Errors
+/// The host is not Demo's, `symbol` is not one ([`spot_symbol_ok`]: it
+/// rides the path), the read failed (the venue answers `-1121` for a
+/// symbol it does not list) or the page did not parse.
+pub(crate) fn discover_spot(cfg: &BnConfig, symbol: &str, tls: &Arc<ClientConfig>) -> Result<BnDiscovery, String> {
+    let host = cfg.hosts().lane(PRODUCT_SPOT).rest;
+    demo_host(host)?;
+    if !spot_symbol_ok(symbol) {
+        return Err(format!("`{symbol}` is not a spot symbol (1 to {WIRE_SYMBOL_MAX} upper-case letters and digits)"));
+    }
+    exchange_info(host, &format!("/api/v3/exchangeInfo?symbol={symbol}"), tls)
+}
+
+/// BX8: `symbol` is a spot wire symbol a request path may carry — 1 to
+/// [`WIRE_SYMBOL_MAX`] upper-case ASCII letters and digits, nothing a
+/// query could read as another parameter.
+#[must_use]
+pub(crate) fn spot_symbol_ok(symbol: &str) -> bool {
+    !symbol.is_empty() && symbol.len() <= WIRE_SYMBOL_MAX && symbol.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+/// `GET host path` into a discovery table (the boot discovery's own
+/// parser).
+fn exchange_info(host: &str, path: &str, tls: &Arc<ClientConfig>) -> Result<BnDiscovery, String> {
     let mut out = Vec::with_capacity(EXCHANGE_INFO_MAX);
     let r = core_net::boot_http::https_get(
         tls,
@@ -973,6 +1061,79 @@ pub(crate) fn account_of(product: u8, answer: Answer) -> Result<Account, String>
         }
     }
     Ok(Account { answer, pos, um, cm_ratio_1e6 })
+}
+
+/// **BX8 — the spot account** (`GET /api/v3/account`, [`SPOT_ACCOUNT`]),
+/// read as the gateway reads `account.status`'s result: the answer one
+/// whole object (`wsapi::scan_rest_answer`), `recon::scan_spot_account` on
+/// it — `canTrade`, the permissions and the balances, each named once.
+pub(crate) struct SpotAccount {
+    /// `canTrade`.
+    pub(crate) can_trade: bool,
+    /// The account's `permissions`, as the permission judge reads them
+    /// (`mode::judge_permission`).
+    pub(crate) perm: BnPermissions,
+    /// Their names as listed — a report; the judge reads [`Self::perm`].
+    pub(crate) names: Vec<String>,
+    /// The asset asked for: `free + locked` ×1e8, the venue's 8 decimals
+    /// (0 when the read omits it — a zero balance).
+    pub(crate) bal_1e8: i64,
+}
+
+/// **Read the spot account** ([`SpotAccount`]) over spot's `rest`, with
+/// `asset`'s balance.
+///
+/// # Errors
+/// The read failed or was refused, or the answer is not one whole account
+/// object as the gateway's scanner reads it.
+pub(crate) fn read_spot_account(rest: &mut Rest, signer: &Signer, asset: AssetName) -> Result<SpotAccount, String> {
+    let answer = rest.signed(SPOT_ACCOUNT, signer, false, render_spot_account)?;
+    spot_account_of(&answer, asset)
+}
+
+/// Spot's account read's parameters: the zero balances left out (a Demo
+/// account lists hundreds — the gateway's `account.status` asks alike),
+/// then the bare signed ones.
+pub(crate) fn render_spot_account(w: &mut QueryWriter<'_>, st: &WsStatic, ts: u64) {
+    w.put(b"omitZeroBalances=true&");
+    render_account(w, st, ts);
+}
+
+/// A spot account answer, judged and scanned ([`read_spot_account`]).
+///
+/// # Errors
+/// [`read_spot_account`]'s, but the request's.
+pub(crate) fn spot_account_of(answer: &Answer, asset: AssetName) -> Result<SpotAccount, String> {
+    if answer.status != 200 {
+        return Err(format!("spot: the account read was refused (http {} code {})", answer.status, answer.code()));
+    }
+    let mut ans = WsAnswer::default();
+    scan_rest_answer(answer.status, &answer.body, &mut ans)
+        .map_err(|e| format!("spot: the account answer is not one whole object ({e:?})"))?;
+    let (mut bal, mut perm) = ([0i64; 1], BnPermissions::EMPTY);
+    let snap = scan_spot_account(&answer.body, ans.result, &[asset], &mut bal, &mut perm)
+        .map_err(|e| format!("spot: the account did not scan ({e:?})"))?;
+    Ok(SpotAccount { can_trade: snap.can_trade, perm, names: perm_names(&answer.body), bal_1e8: bal[0] })
+}
+
+/// The `permissions` an account answer lists, by name — a report (the
+/// judge reads the scanner's `BnPermissions`); what it cannot walk ends
+/// the list.
+fn perm_names(body: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some((a, _)) = field(body, b"permissions") else {
+        return out;
+    };
+    let Ok(mut e) = Elems::new(body, a) else {
+        return out;
+    };
+    while let Ok(Some((ea, ez))) = e.next() {
+        let Ok(name) = str_of(body, ea, ez) else {
+            break;
+        };
+        out.push(String::from_utf8_lossy(name).into_owned());
+    }
+    out
 }
 
 /// One open order as the venue lists it.
@@ -1256,6 +1417,78 @@ mod tests {
             [EXIT_ACCOUNT, EXIT_BOOT, EXIT_CYCLE, EXIT_POST_ONLY, EXIT_TTL, EXIT_SWEEP, EXIT_RECON, EXIT_FILLS, EXIT_LEFTOVER, EXIT_PROBE],
             [50, 51, 52, 53, 54, 55, 56, 57, 58, 59]
         );
+        // BX8: the permission check's refusal, past BX11's 60–65.
+        assert_eq!(EXIT_PERMISSION, 66);
+    }
+
+    /// BX8: the product's word is `exec.toml`'s — spot's too (it read
+    /// `usdm` before) — and a fee code's stray product is no product's.
+    #[test]
+    fn each_product_reports_its_own_word() {
+        assert_eq!(
+            [product_word(PRODUCT_SPOT), product_word(PRODUCT_USDM), product_word(PRODUCT_COINM), product_word(3), product_word(4)],
+            ["spot", "usdm", "coinm", "options", "equity"]
+        );
+        assert_eq!(product_word(5), "unknown");
+        assert_eq!(product_word(u8::MAX), "unknown");
+    }
+
+    /// BX8: a spot client speaks the gateway's spot templates and its own
+    /// account read — no futures path on the spot host (`rest::ord_specs`
+    /// speaks futures only); a futures client's layout is unchanged.
+    #[test]
+    fn a_spot_client_speaks_spots_paths_only() {
+        let key = [(KEY_HEADER, "k")];
+        let s = lane_specs(PRODUCT_SPOT, &key);
+        assert_eq!(s.len(), LANE_TEMPLATES + 1);
+        assert!(s.iter().all(|t| t.path.starts_with("/api/v3/")), "a spot host's paths only");
+        assert_eq!((s[T_TIME].path, s[T_OPEN_ORDERS].path), ("/api/v3/time", "/api/v3/openOrders"));
+        assert_eq!(s[SPOT_ACCOUNT].path, "/api/v3/account");
+        assert!(matches!(s[SPOT_ACCOUNT].method, Method::Get) && matches!(s[SPOT_ACCOUNT].params, Params::Query));
+        assert_eq!(lane_specs(PRODUCT_USDM, &key).len(), X_TRADING_STATUS + 1);
+        assert_eq!(lane_specs(PRODUCT_COINM, &key).len(), X_TRADING_STATUS);
+        assert_eq!(lane_specs(PRODUCT_USDM, &key)[ORD0 + R_ACCOUNT].path, "/fapi/v3/account");
+    }
+
+    /// BX8: a spot symbol rides a request path — upper-case letters and
+    /// digits only, 1 to 32 of them.
+    #[test]
+    fn a_spot_symbol_is_letters_and_digits() {
+        for ok in ["BTCUSDT", "TSLABUSDT", "1000SATSUSDT", "A"] {
+            assert!(spot_symbol_ok(ok), "{ok}");
+        }
+        for bad in ["", "btcusdt", "BTC&recvWindow=1", "BTC USDT", "BTC/USDT", "BTCUSDT_", &"A".repeat(33)] {
+            assert!(!spot_symbol_ok(bad), "{bad:?}");
+        }
+        assert!(spot_symbol_ok(&"A".repeat(32)));
+    }
+
+    /// BX8: the spot account read as the gateway reads `account.status` —
+    /// `canTrade`, the permissions (by name for the report, as the judge
+    /// reads them), the base asset's `free + locked` at 8 decimals (0 when
+    /// omitted) — the answer one whole object; a key named twice, a body
+    /// with bytes after it, or a refusal is no account.
+    #[test]
+    fn the_spot_account_is_read_as_the_gateway_reads_it() {
+        let btc = AssetName::of(b"BTC").expect("an asset");
+        let body = r#"{"makerCommission":10,"commissionRates":{"maker":"0.00100000"},"canTrade":true,"canWithdraw":true,"accountType":"SPOT","balances":[{"asset":"BTC","free":"1.00000000","locked":"0.00012345"},{"asset":"USDT","free":"10000.00000000","locked":"0.00000000"}],"permissions":["SPOT","TRD_GRP_004"],"uid":1}"#;
+        let a = spot_account_of(&answer(String::from(body)), btc).expect("an account");
+        assert!(a.can_trade);
+        assert_eq!(a.bal_1e8, 100_012_345, "free + locked, every decimal kept");
+        assert_eq!(a.names, ["SPOT", "TRD_GRP_004"]);
+        let bstock = {
+            let mut p = BnPermissions::EMPTY;
+            p.add(b"TRD_GRP_004");
+            p.add(b"TRD_GRP_261");
+            p
+        };
+        assert_eq!(exec_binance::mode::judge_permission(&bstock, &a.perm), Ok(()), "a group in common");
+        let eth = AssetName::of(b"ETH").expect("an asset");
+        assert_eq!(spot_account_of(&answer(String::from(body)), eth).map(|a| a.bal_1e8), Ok(0), "omitted: a zero balance");
+        assert!(spot_account_of(&answer(body.replace("\"canTrade\":true,", "")), btc).is_err(), "canTrade missing");
+        assert!(spot_account_of(&answer(body.replace("\"uid\":1", "\"canTrade\":false")), btc).is_err(), "named twice");
+        assert!(spot_account_of(&answer(format!("{body} x")), btc).is_err(), "bytes after the object");
+        assert!(spot_account_of(&Answer { status: 401, body: br#"{"code":-2015,"msg":"x"}"#.to_vec() }, btc).is_err());
     }
 
     /// BX11 (the risk review's R1-5): on a mainnet host the client sends a
@@ -1315,11 +1548,16 @@ mod tests {
 
     #[test]
     fn only_demo_hosts_pass() {
-        for h in ["demo-fapi.binance.com", "demo-dapi.binance.com", "demo-fstream.binance.com", "testnet.binancefuture.com"] {
+        for h in ["demo-fapi.binance.com", "demo-dapi.binance.com", "demo-fstream.binance.com", "testnet.binancefuture.com", "demo-api.binance.com", "demo-ws-api.binance.com"] {
             assert!(demo_host(h).is_ok(), "{h}");
         }
-        for h in ["fapi.binance.com", "dapi.binance.com", "api.binance.com", "fstream.binance.com", "localhost"] {
+        for h in ["fapi.binance.com", "dapi.binance.com", "api.binance.com", "fstream.binance.com", "ws-api.binance.com", "localhost"] {
             assert!(demo_host(h).is_err(), "{h}");
+        }
+        // BX8: every one of the Demo scope's nine hosts — spot's WS API too.
+        let h = exec_binance::config::Hosts::of(Scope::Demo);
+        for host in [&h.fut_wsapi, &h.fut_user, &h.fut_rest, &h.cm_wsapi, &h.cm_user, &h.cm_rest, &h.papi, &h.sapi, &h.spot_wsapi] {
+            assert!(demo_host(host).is_ok(), "{host}");
         }
     }
 

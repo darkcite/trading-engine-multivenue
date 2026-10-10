@@ -1,27 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! **BX7b — the Binance Demo battery** (`exec-smoke --binance <um|cm|um,cm>
-//! --lifecycle`; the build plan `claude/bx7b-build-plan-2026-10-08.md`
-//! §3.4): the engine's arm, router and gateway — `RoutedDispatcher` →
-//! `BnArm` → the command ring → `BnGateway` on its own thread → fill lane 4
-//! and the event ring → the router's ledger — on Binance **Demo**'s hosts
-//! with the Demo keys, driven through `OrderDispatch` as the engine loop
-//! drives it (the idle hook, then the fill lane).
+//! **BX7b — the Binance Demo battery** (`exec-smoke --binance <um|cm|spot,
+//! comma-separated> --lifecycle`; the build plan
+//! `claude/bx7b-build-plan-2026-10-08.md` §3.4, BX8's §3.7): the engine's
+//! arm, router and gateway — `RoutedDispatcher` → `VenueSplit` → `BnArm` →
+//! the command ring → `BnGateway` on its own thread → fill lane 4 and the
+//! event ring → the router's ledger — on Binance **Demo**'s hosts with the
+//! Demo keys, driven through `OrderDispatch` as the engine loop drives it
+//! (the idle hook, then the fill lane).
 //!
 //! COPY-DOCTRINE: an operator tool run by hand against Binance Demo, never
 //! reachable from the engine loop: it allocates and copies freely (the
 //! report, the tap's frames, the journal's records, the reads' answers).
 //!
-//! **Where it departs from the engine's composition** (`bn_live`): no split
-//! layers (no `SlotSplit`, no `VenueSplit`: the arm sits behind the router
-//! directly), no alias check, no journal writer thread (the journal ring is
-//! drained here — every venue answer the gateway journals is the battery's
-//! evidence), no shutdown grace, no thread pinning; the Demo scope
-//! (`Scope::Demo`: classic by construction, no SAPI reads — gateway
-//! "Demo"); no `exec.toml` (the knobs below), slot [`SLOT`]; no anchor file
-//! and no session bound (the battery is not a session); a halt latched in
-//! memory only (no `exec.HALT`).
+//! **Where it departs from the engine's composition** (`bn_live`): the
+//! router over `VenueSplit<NullLiveDispatcher, BnArm>` — the engine's
+//! Binance shape without its slot splits — routing by the engine's own
+//! alias table (`exec_boot::route_aliases`: with spot armed, the M1
+//! anchor's flat id 7 → Binance; BX8); no universe (so no alias-uniqueness
+//! check: the battery's one spot row is its spot\[0\]), no journal writer
+//! thread (the journal ring is drained here — every venue answer the
+//! gateway journals is the battery's evidence), no shutdown grace, no
+//! thread pinning; the Demo scope (`Scope::Demo`: classic by construction,
+//! no SAPI reads — gateway "Demo"); no `exec.toml` (the knobs below), slot
+//! [`SLOT`]; no anchor file and no session bound (the battery is not a
+//! session); a halt latched in memory only (no `exec.HALT`).
 //!
 //! **The router is here.** Its four clamps bound every order
 //! (`max_order_usd`, `cap_instance_usd`, `cap_day_usd`, `max_open_orders`)
@@ -41,26 +45,51 @@
 //!    arm's own (`cid::classify` reads it ours or an orphan the boot
 //!    sweeps), and what BX-19 asserts: one-way, single-asset (USDⓈ-M), each
 //!    symbol CROSSED at a leverage within 20 — else [`EXIT_ACCOUNT`].
+//!    Spot (BX8; `bn_demo::read_spot_account`): `canTrade`, the account's
+//!    permissions by name and the row's verdict under the gateway's own
+//!    judge (`mode::judge_permission` — printed; the boot's check decides),
+//!    the base asset's balance (the boot adopts it), and no order resting
+//!    anywhere (the IoC-only lane sweeps none).
 //! 1. *The boot*: the gateway's own (the clock, BX-19, the listenKey, the
 //!    WS API logon or the REST route, the first reconciliation with its
-//!    orphan sweep, the day); then the router seeds the slot.
+//!    orphan sweep, the day); then the router seeds the slot. Spot (BX8):
+//!    its session logs on and subscribes; the held base balance is adopted
+//!    as the slot's starting inventory within `--bn-adopt-usd` (a Demo spot
+//!    account is seeded — the slot's instance cap carries it too: the
+//!    engine's law, adoption within that cap); a permission group the
+//!    account lacks refuses the boot — [`EXIT_PERMISSION`], the bStock
+//!    check's verdict, nothing placed.
 //! 2. *Maker cycles* (USDⓈ-M; the side alternates): a post-only place
 //!    (listed under our id), a modify of the price, one of the size (each
 //!    listed), a cancel through the verb (`CANCELED_MEMBER`); once, a
 //!    post-only order that would cross (refused, never a fill) and a maker
 //!    with a short TTL (the gateway's `CANCELED_TTL`).
-//! 3. *Fills* (each product): an IoC through the touch, filled and booked
-//!    on lane 4, the ledger's position moved; then a reduce-only IoC
+//! 3. *Fills* (each futures product): an IoC through the touch, filled and
+//!    booked on lane 4, the ledger's position moved; then a reduce-only IoC
 //!    closing it — each leg proven by a reconciliation journaled after its
 //!    end that agrees. COIN-M first refuses a maker locally (O-BX3a).
+//!    **Spot's cycles** (BX8; `--bn-cycles` of them): the touch alone (spot
+//!    has no mark), an IoC BUY of `--bn-usd` across the ask, then an IoC
+//!    SELL across the bid of what it bought less the commission the venue
+//!    charged in the base asset (a BUY pays in what it receives: the SELL
+//!    is floored to the step after the fee, never past the holding the
+//!    ledger shows; [`spot_sell_qty`]) — on the anchor's id as a member
+//!    stamps it (sym 7, venue byte 0), each order proven routed through the
+//!    alias to the Binance arm and its fills on lane 4 carrying sym 7; each
+//!    cycle proven by a reconciliation journaled after its SELL that
+//!    agrees.
 //! 4. *The halt's sweep* (USDⓈ-M, last — a halted slot refuses every order
 //!    after it): two quotes, then an operator halt of the slot; the router
 //!    asks the arm to cancel the slot: `Working`, then `Clear`, the venue
 //!    listing neither.
 //! 5. *The end* — always, after a failure or a signal too: the positions
-//!    the ledger holds closed (not after a signal, not once halted), the
-//!    shutdown sweep, and the account read flat on the run's symbols with
-//!    no order of this run's epoch — else [`EXIT_LEFTOVER`], the loudest.
+//!    the ledger holds closed (not after a signal, not once halted; spot:
+//!    what the cycles bought and did not sell back, never the adopted
+//!    balance), the shutdown sweep (spot's a confirmed no-op: nothing of an
+//!    IoC-only lane rests), and the account read flat on the run's symbols
+//!    with no order of this run's epoch (spot: the base balance no more
+//!    than a step a BUY above the start's) — else [`EXIT_LEFTOVER`], the
+//!    loudest.
 //!
 //! **The bar** is the plan's, absolute ([`bar_short`]): a clean run short
 //! of it exits with the short phase's code, never 0.
@@ -82,7 +111,8 @@
 //! `J_ACK`) against `TRADE_LITE` and the `ORDER_TRADE_UPDATE` trade:
 //! evidence across two sockets, not proof.
 //!
-//! Exit codes: `bn_demo::EXIT_*` (50–58), pinned there.
+//! Exit codes: `bn_demo::EXIT_*` (50–58; the drill's 65; the permission
+//! check's 66, BX8), pinned there.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -93,25 +123,28 @@ use clob_dispatcher::{
     BinanceArmReport, CancelAllState, DispatchError, OrderDispatch, PaperDispatcher, RETIRED_CANCELED_MEMBER,
     RETIRED_CANCELED_TTL, RETIRED_EXPIRED, RETIRED_FILLED, RETIRED_REJECTED,
 };
-use core_config::universe::Instrument;
+use core_config::universe::{Instrument, LEGACY_BN_ANCHOR_SYM};
 use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
 use core_ring::{Consumer, Ring};
 use core_types::{
-    make_symbol_id, CancelReq, ChannelEvent, ChannelId, ExecRecord, Fill, ModifyReq, Order, Price, Qty, Side, SymbolId,
-    VenueId, ORDER_FLAG_POST_ONLY, ORDER_FLAG_REDUCE_ONLY, SYMBOL_ID_NONE,
+    make_symbol_id, symbol_venue_byte, CancelReq, ChannelEvent, ChannelId, ExecRecord, Fill, ModifyReq, Order, Price,
+    Qty, Side, SymbolId, VenueId, ORDER_FLAG_POST_ONLY, ORDER_FLAG_REDUCE_ONLY, SYMBOL_ID_NONE,
 };
 use exec_binance::arm::{
-    ArmKnobs, BnArm, Refusal, GW_CONNECT_FAILURES, GW_FILLS_LOST, GW_JOURNAL_DROPPED, GW_RECONNECTS, GW_RECON_FAILED,
-    GW_RECON_OK, SHUTDOWN_WAIT_NS,
+    ArmKnobs, BnArm, Refusal, GW_CONNECT_FAILURES, GW_FILLS_LOST, GW_JOURNAL_DROPPED, GW_RECONNECTS, GW_RECON_DRIFT_LEGS,
+    GW_RECON_FAILED, GW_RECON_OK, SHUTDOWN_WAIT_NS,
 };
 use exec_binance::cid::{CidPrefix, CID_LEN};
 use exec_binance::cmd::{duplex, EVT_F_SWEEP_DONE};
 use exec_binance::config::{BnConfig, Signer};
-use exec_binance::gateway::{BnGateway, GwKnobs, Phase, QUIET_NS, ROTATE_AFTER_NS};
-use exec_binance::inst::{BnInstCold, BnInstHot, PRODUCT_COINM, PRODUCT_USDM};
-use exec_binance::journal::{JournalTx, JOURNAL_RING, J_ACK, J_ENDED, J_FEE, J_FILL, J_RECON, J_REJECT};
+use exec_binance::gateway::{BnGateway, BootErr, GwKnobs, Phase, QUIET_NS, ROTATE_AFTER_NS};
+use exec_binance::inst::{AssetName, BnInstCold, BnInstHot, PRODUCT_COINM, PRODUCT_SPOT, PRODUCT_USDM};
+use exec_binance::journal::{
+    fee_fields, JournalTx, FEE_ASSET_BNB, FEE_ASSET_OTHER, JOURNAL_RING, J_ACK, J_ENDED, J_FEE, J_FILL, J_RECON, J_REJECT,
+};
 use exec_binance::margin::{MarginBook, SLOTS};
-use exec_binance::mode::{judge_one_way, judge_single_asset, judge_symbol_config, AccountMode};
+use exec_binance::mode::{judge_one_way, judge_permission, judge_single_asset, judge_symbol_config, AccountMode, AssertErr};
+use exec_binance::num::floor_to;
 use exec_binance::recon::MARGIN_CROSS;
 use exec_binance::rest::{
     render_account, render_by_cid, scan_listen_key, R_ACCOUNT, R_CANCEL, R_STATUS, T_DUAL, T_LISTEN_KEY_NEW,
@@ -119,18 +152,20 @@ use exec_binance::rest::{
 };
 use exec_binance::userstream::{scan_user_event, UserEvent, S_CANCELED, UE_ORDER, UE_TRADE_LITE, X_TRADE};
 use exec_binance::wsapi::{Part, WsStatic};
-use exec_router::{ExecMode, ExecRoute, HaltLimits, HaltReason, RoutedDispatcher, SlotCaps};
-use ingress_binance::discovery::BnDiscovery;
+use exec_router::{ExecMode, ExecRoute, HaltLimits, HaltReason, NullLiveDispatcher, RoutedDispatcher, SlotCaps, VenueSplit};
+use ingress_binance::discovery::{BnDiscovery, BnSymbolRow};
 use rustls::ClientConfig;
 use tracing::{error, info, warn};
 
 use crate::bn_demo::{
-    account_of, demo_config, discover, is_arms, open_orders, order_state, orders_of, product_word, px_off, qty_for,
-    read_account, wall_ms, Line, Public, Rest, Ws, EXIT_ACCOUNT, EXIT_BOOT, EXIT_CYCLE, EXIT_DRILL, EXIT_FILLS,
-    EXIT_LEFTOVER, EXIT_POST_ONLY, EXIT_RECON, EXIT_SWEEP, EXIT_TTL, ORD0, RECV_WINDOW_MS, STP_MODE,
+    account_of, demo_config, discover, discover_spot, is_arms, notional_1e6, open_orders, order_state, orders_of,
+    product_word, px_off, qty_for, read_account, read_spot_account, render_spot_account, spot_account_of, spot_symbol_ok,
+    wall_ms, Line, Public, Rest, Ws, EXIT_ACCOUNT, EXIT_BOOT, EXIT_CYCLE, EXIT_DRILL, EXIT_FILLS, EXIT_LEFTOVER,
+    EXIT_PERMISSION, EXIT_POST_ONLY, EXIT_RECON, EXIT_SWEEP, EXIT_TTL, ORD0, RECV_WINDOW_MS, SPOT_ACCOUNT, STP_MODE,
 };
 use crate::bn_live::{bind_table, BindSet};
 use crate::bn_ops::{flatten, OpsSpec, Reach, DEFAULT_LEVERAGE_CAP};
+use crate::exec_boot::route_aliases;
 
 /// The slot the battery's orders carry (the arm's ids name it, E-9): the
 /// slot the loopback rig uses; Demo is the battery's alone.
@@ -141,8 +176,9 @@ const FILL_N: usize = engine::FILL_RING_SIZE;
 /// default `max_leverage`).
 const MAX_LEVERAGE: u8 = 20;
 /// The router's clamps on the battery's slot, USD ×1e6: one order, the net
-/// exposure, the day's buying (the venue's day, adopted at boot, includes
-/// earlier runs'), and the orders working.
+/// exposure (BX8: past the balance the boot adopts — [`instance_cap_1e6`]),
+/// the day's buying (the venue's day, adopted at boot, includes earlier
+/// runs'), and the orders working.
 const CAP_ORDER_USD_1E6: i64 = 600_000_000;
 const CAP_INSTANCE_USD_1E6: i64 = 2_000_000_000;
 const CAP_DAY_USD_1E6: i64 = 100_000_000_000;
@@ -151,6 +187,14 @@ const MAX_OPEN_ORDERS: u32 = 16;
 /// minimum notional can raise an order past it; the router's
 /// `CAP_ORDER_USD_1E6` clamp (600 USD) is the order's real ceiling.
 pub const MAX_USD: i64 = 200;
+/// BX8: the most venue inventory the boot adopts by default, USD
+/// (`--bn-adopt-usd`; `GwKnobs::adopt_cap_usd_1e6`): sized for a Demo spot
+/// account, which is seeded with balances (1 BTC is some 80 000 USD as of
+/// 2026-10 — room past twice that). The futures accounts are checked flat:
+/// a futures position adopted refuses the run.
+pub const DEFAULT_ADOPT_USD: i64 = 250_000;
+/// Its ceiling, USD: a typo limit.
+pub const MAX_ADOPT_USD: i64 = 10_000_000;
 /// The router's kill switches on the slot, `exec.toml.example`'s: 5 venue
 /// refusals in a row, 5 USD of reconciliation drift, 30 s of a silent
 /// order route, 3 local asset refusals in a row, 300 s without an agreeing
@@ -205,12 +249,17 @@ const CLOSE_TRIES: u32 = 3;
 const LISTING_READS: u32 = 10;
 const LISTING_GAP: Duration = Duration::from_millis(300);
 /// The plan's bar (BX7b §3.4): USDⓈ-M's maker cycles, fills and agreeing
-/// reconciliations; COIN-M's fills and reconciliations.
+/// reconciliations; COIN-M's fills and reconciliations; spot's (BX8: §3.7
+/// names no count — COIN-M's, the other IoC-only lane's: two cycles' fills
+/// and two agreeing reconciliations, besides an order routed through the
+/// alias).
 const BAR_CYCLES: u32 = 10;
 const BAR_FILLS_UM: u32 = 6;
 const BAR_RECONS_UM: u32 = 3;
 const BAR_FILLS_CM: u32 = 4;
 const BAR_RECONS_CM: u32 = 2;
+const BAR_FILLS_SPOT: u32 = 4;
+const BAR_RECONS_SPOT: u32 = 2;
 /// What a step that stopped for a signal says.
 const STOPPED: &str = "stopped by a signal";
 
@@ -237,6 +286,9 @@ pub struct BatterySpec {
     pub um: bool,
     /// COIN-M armed (IoC-only, O-BX3a).
     pub cm: bool,
+    /// Spot armed (BX8: IoC-only, classic, on the WS API alone — its user
+    /// data rides the order session).
+    pub spot: bool,
     /// The REST order route (`order_transport = "rest"`) instead of the WS
     /// API.
     pub rest: bool,
@@ -246,9 +298,20 @@ pub struct BatterySpec {
     pub um_symbol: String,
     /// The COIN-M symbol.
     pub cm_symbol: String,
-    /// Maker cycles (USDⓈ-M); the bar is 10.
+    /// The spot symbol (BX8): the battery's spot\[0\] — the M1 anchor,
+    /// bound under its flat id 7 whatever its name, as the universe binds
+    /// spot\[0\] (`core_config::universe::allocate`), and routed by its
+    /// alias. A bStock's (`TSLABUSDT`) proves the permission check.
+    pub spot_symbol: String,
+    /// The most venue inventory the boot adopts, USD (BX8: a Demo spot
+    /// account's seeded base balance; [`DEFAULT_ADOPT_USD`]). 0 adopts
+    /// nothing: a held base balance then refuses the boot.
+    pub adopt_usd: i64,
+    /// Maker cycles (USDⓈ-M); the bar is 10. Spot's IoC cycles too (BX8:
+    /// a BUY and its SELL each).
     pub cycles: u32,
-    /// IoC round trips per product; the bar is 3 (USDⓈ-M) and 2 (COIN-M).
+    /// IoC round trips per futures product; the bar is 3 (USDⓈ-M) and 2
+    /// (COIN-M).
     pub fill_pairs: u32,
     /// Each order's requested notional, USD (raised to the row's minimum;
     /// at most [`MAX_USD`]).
@@ -285,17 +348,46 @@ const HEARTBEAT_MS: u64 = 10_000;
 /// How long past the countdown the gap drill waits for the venue.
 const DRILL_MARGIN: Duration = Duration::from_secs(10);
 
+/// **`--binance`'s products** (`um`, `cm`, `spot`, comma-separated):
+/// `(um, cm, spot)` armed.
+///
+/// # Errors
+/// A word that is not one of the three — refused, never skipped.
+pub fn parse_products(list: &str) -> Result<(bool, bool, bool), String> {
+    let (mut um, mut cm, mut spot) = (false, false, false);
+    for p in list.split(',') {
+        match p.trim() {
+            "um" => um = true,
+            "cm" => cm = true,
+            "spot" => spot = true,
+            other => return Err(format!("`{other}` is not a product (um, cm, spot)")),
+        }
+    }
+    Ok((um, cm, spot))
+}
+
 impl BatterySpec {
     /// The spec's own refusals, before anything is read.
     ///
     /// # Errors
     /// What the operator must change.
     pub fn check(&self) -> Result<(), String> {
-        if !self.um && !self.cm {
-            return Err(String::from("--binance names no product (um, cm or um,cm)"));
+        if !self.um && !self.cm && !self.spot {
+            return Err(String::from("--binance names no product (um, cm, spot — comma-separated)"));
         }
         if self.hmac && !self.rest {
             return Err(String::from("--hmac needs --rest: HMAC signs REST only (the WS API logon takes Ed25519)"));
+        }
+        // BX8: spot's user data exists only on a WS API session (the
+        // gateway refuses `SpotRoute` otherwise).
+        if self.spot && self.rest {
+            return Err(String::from("--binance spot rides the WS API: its user data exists only on a WS API session (no --bn-rest)"));
+        }
+        if self.spot && !spot_symbol_ok(&self.spot_symbol.to_ascii_uppercase()) {
+            return Err(String::from("--bn-spot-symbol must be 1 to 32 letters and digits"));
+        }
+        if !(0..=MAX_ADOPT_USD).contains(&self.adopt_usd) {
+            return Err(format!("--bn-adopt-usd must be 0..={MAX_ADOPT_USD}"));
         }
         if !(1..=MAX_USD).contains(&self.usd) {
             return Err(format!("--bn-usd must be 1..={MAX_USD}"));
@@ -309,15 +401,52 @@ impl BatterySpec {
         if !(TTL_MIN_MS..=TTL_MAX_MS).contains(&self.ttl_ms) {
             return Err(format!("--bn-ttl-ms must be {TTL_MIN_MS}..={TTL_MAX_MS} (the arm's shortest maker TTL is 5 s)"));
         }
-        if self.drill == Some(Drill::Gap) && (!self.um || self.cm || self.rest) {
+        if self.drill == Some(Drill::Gap) && (!self.um || self.cm || self.spot || self.rest) {
             return Err(String::from(
                 "--bn-drill gap is USDⓈ-M's on the WS API (`--binance um`): the dead-man rests makers there only",
             ));
         }
-        if self.drill == Some(Drill::Flatten) && self.um == self.cm {
-            return Err(String::from("--bn-drill flatten takes one product (`--binance um` or `--binance cm`)"));
+        if self.drill == Some(Drill::Flatten) && (self.um == self.cm || self.spot) {
+            return Err(String::from("--bn-drill flatten takes one futures product (`--binance um` or `--binance cm`)"));
         }
         Ok(())
+    }
+}
+
+/// **The slot's instance cap**, USD ×1e6 (BX8): the battery's own
+/// [`CAP_INSTANCE_USD_1E6`] past the most the boot may adopt — the
+/// engine's law is adoption within the slot's instance cap, and a spot
+/// BUY is judged on the whole holding, the adopted balance included.
+const fn instance_cap_1e6(adopt_usd: i64) -> i64 {
+    CAP_INSTANCE_USD_1E6.saturating_add(adopt_usd.saturating_mul(1_000_000))
+}
+
+/// **The boot's refusal as the battery reports it**: the permission
+/// check's (BX8, the bStock check: a spot row needs a group the account
+/// lacks) is [`EXIT_PERMISSION`]; a held balance past the adoption cap
+/// names the flag that raises it; any other is the boot's ([`EXIT_BOOT`]).
+fn boot_refused(e: BootErr, adopt_usd: i64) -> Fail {
+    match e {
+        BootErr::Assert(AssertErr::SymbolNotPermitted) => (
+            EXIT_PERMISSION,
+            String::from(
+                "the permission check refused the boot: the account's permissions lack a group the spot row needs \
+                 (SymbolNotPermitted, the bStock check) — nothing was placed",
+            ),
+        ),
+        BootErr::Inventory(i64::MAX) => (
+            EXIT_BOOT,
+            String::from("the boot refused to adopt a held balance or position it could not price — nothing was adopted"),
+        ),
+        BootErr::Inventory(usd) => (
+            EXIT_BOOT,
+            format!(
+                "the boot refused to adopt {} USD of held balance or positions past the adoption cap ({adopt_usd} USD) — \
+                 raise --bn-adopt-usd, or move the asset off the Demo account",
+                usd / 1_000_000
+            ),
+        ),
+        e => (EXIT_BOOT, format!("the boot was refused: {e:?}")),
     }
 }
 
@@ -362,6 +491,15 @@ struct Report {
     fills_journaled: u64,
     /// See [`Self::fills_journaled`].
     fees_journaled: u64,
+    /// BX8: spot's cycles run whole, and its orders proven routed through
+    /// the alias (sym 7, venue byte 0, to the Binance arm; their fills on
+    /// lane 4 carrying sym 7).
+    spot_cycles: u32,
+    alias: u32,
+    /// BX8: the last reconciliation journaled — reconciled, its drift USD
+    /// ×1e6 — and the drift legs of the gateway's last verdict.
+    last_recon: Option<(bool, i64)>,
+    drift_legs: u64,
 }
 
 impl Report {
@@ -386,14 +524,15 @@ impl Report {
 /// first short count's phase code and why, `None` when met. USDⓈ-M: 10
 /// maker cycles, a post-only refusal, a TTL cancel, 6 fills, 3 agreeing
 /// reconciliations, a halt's sweep. COIN-M: the maker refused, 4 fills, 2
-/// reconciliations.
+/// reconciliations. Spot (BX8): an order routed through the alias, 4
+/// fills, 2 reconciliations.
 fn bar_short(spec: &BatterySpec, rep: &Report) -> Option<(u8, String)> {
     // A drill is its own bar: its verdict is the run's code.
     if spec.drill.is_some() {
         return None;
     }
-    let (um, cm) = (PRODUCT_USDM as usize, PRODUCT_COINM as usize);
-    let need: [(bool, u32, u32, u8, &str); 9] = [
+    let (um, cm, sp) = (PRODUCT_USDM as usize, PRODUCT_COINM as usize, PRODUCT_SPOT as usize);
+    let need: [(bool, u32, u32, u8, &str); 12] = [
         (spec.um, rep.cycles, BAR_CYCLES, EXIT_CYCLE, "maker cycles"),
         (spec.um, rep.post_only, 1, EXIT_POST_ONLY, "post-only refusals"),
         (spec.um, rep.ttl, 1, EXIT_TTL, "TTL cancels"),
@@ -403,6 +542,9 @@ fn bar_short(spec: &BatterySpec, rep: &Report) -> Option<(u8, String)> {
         (spec.cm, u32::from(rep.cm_maker_refused), 1, EXIT_FILLS, "COIN-M maker refusals"),
         (spec.cm, rep.fills[cm], BAR_FILLS_CM, EXIT_FILLS, "COIN-M fills"),
         (spec.cm, rep.recons[cm], BAR_RECONS_CM, EXIT_RECON, "COIN-M agreeing reconciliations"),
+        (spec.spot, rep.alias, 1, EXIT_FILLS, "spot orders routed through the alias"),
+        (spec.spot, rep.fills[sp], BAR_FILLS_SPOT, EXIT_FILLS, "spot fills"),
+        (spec.spot, rep.recons[sp], BAR_RECONS_SPOT, EXIT_RECON, "spot agreeing reconciliations"),
     ];
     let mut i = 0;
     while i < need.len() {
@@ -518,10 +660,41 @@ struct LaneB {
     h: BnInstHot,
     /// Its PERCENT_PRICE band (a touch is judged against it).
     c: BnInstCold,
+    /// Spot's own (BX8); `None` on a futures lane.
+    spot: Option<SpotLeg>,
 }
 
-/// The gateway thread's end: its phase and its last sweep's flag.
-type GwEnd = (Phase, u8);
+/// **A spot lane's own** (BX8): its base asset — whose balance is the leg —
+/// the balance the account check read, and what the cycles left.
+#[derive(Copy, Clone, Debug)]
+struct SpotLeg {
+    /// The row's base asset.
+    base: AssetName,
+    /// Its balance at the account check, ×1e8 (the boot adopts it).
+    base0_1e8: i64,
+    /// The holding the router's ledger booked once the slot was seeded
+    /// (the adopted balance, ×1e6): the end never sells below it.
+    held0_1e6: i64,
+    /// BUYs that filled: the flat read allows the base balance a step of
+    /// dust above the start's for each (a SELL is floored to the step).
+    buys: u32,
+    /// What the cycles bought and did not sell back, net of the base-asset
+    /// commission and floored to the step, ×1e6: what the end sells.
+    unsold_1e6: i64,
+    /// A BUY's commission went unjournaled: what it left is unknown, and
+    /// the end sells nothing blind (the flat read judges the balance).
+    fee_unknown: bool,
+}
+
+/// The gateway thread's end: its phase and its last sweep (orders left,
+/// cancels sent, `EVT_F_SWEEP_*`).
+type GwEnd = (Phase, (i64, i64, u8));
+
+/// **The battery's router** (module docs): the engine's Binance shape — the
+/// router over a venue split whose other arm refuses every order — so an
+/// order reaches the Binance arm only by its route venue (BX8: the
+/// anchor's, by the alias).
+type Router = RoutedDispatcher<PaperDispatcher, VenueSplit<NullLiveDispatcher, BnArm>>;
 
 struct Battery {
     spec: BatterySpec,
@@ -530,7 +703,7 @@ struct Battery {
     _cfg: BnConfig,
     signer: Signer,
     lanes: Vec<LaneB>,
-    d: RoutedDispatcher<PaperDispatcher, BnArm>,
+    d: Router,
     lane4: Consumer<Fill, FILL_N>,
     journal: Consumer<ExecRecord, JOURNAL_RING>,
     gw: Option<JoinHandle<GwEnd>>,
@@ -586,8 +759,14 @@ fn summary(spec: &BatterySpec, rep: &mut Report) -> u8 {
         .n("cycles", i64::from(rep.cycles))
         .n("fills_usdm", i64::from(rep.fills[PRODUCT_USDM as usize]))
         .n("fills_coinm", i64::from(rep.fills[PRODUCT_COINM as usize]))
+        .n("fills_spot", i64::from(rep.fills[PRODUCT_SPOT as usize]))
         .n("recons_usdm", i64::from(rep.recons[PRODUCT_USDM as usize]))
         .n("recons_coinm", i64::from(rep.recons[PRODUCT_COINM as usize]))
+        .n("recons_spot", i64::from(rep.recons[PRODUCT_SPOT as usize]))
+        .n("spot_cycles", i64::from(rep.spot_cycles))
+        .n("alias_routed", i64::from(rep.alias))
+        .s("last_recon", &rep.last_recon.map_or_else(|| String::from("none"), |(ok, drift)| format!("reconciled {ok} drift {drift} USD×1e6")))
+        .n("drift_legs", count(rep.drift_legs))
         .n("sweeps", i64::from(rep.sweeps))
         .n("ttl", i64::from(rep.ttl))
         .n("post_only_refused", i64::from(rep.post_only))
@@ -613,6 +792,12 @@ fn summary(spec: &BatterySpec, rep: &mut Report) -> u8 {
     }
     if code == EXIT_LEFTOVER {
         error!(left = ?rep.left, "binance-battery: SOMETHING WAS LEFT ON THE DEMO ACCOUNT");
+    } else if code == EXIT_PERMISSION {
+        warn!(
+            why = %rep.why,
+            "binance-battery: the PERMISSION CHECK REFUSED THE BOOT (exit 66) — the bStock check's verdict on a row whose \
+             group the account lacks; nothing was placed"
+        );
     } else if code != 0 {
         error!(code, why = %rep.why, "binance-battery: FAILED");
     } else {
@@ -637,9 +822,9 @@ impl Battery {
         };
         let cfg = demo_config(spec.hmac).map_err(acct)?;
         let signer = cfg.signer().map_err(|e| acct(format!("the signer: {e:?}")))?;
-        let mut sets = Vec::with_capacity(2);
-        let mut reads: Vec<(u8, String, SymbolId, Rest, Public)> = Vec::with_capacity(2);
-        let mut discs: Vec<(u8, String, BnDiscovery, SymbolId)> = Vec::with_capacity(2);
+        let mut sets = Vec::with_capacity(3);
+        let mut reads: Vec<(u8, String, SymbolId, Rest, Public, Option<SpotLeg>)> = Vec::with_capacity(3);
+        let mut discs: Vec<(u8, String, BnDiscovery, SymbolId)> = Vec::with_capacity(3);
         for (on, product, symbol, ord) in [(spec.um, PRODUCT_USDM, &spec.um_symbol, 513u32), (spec.cm, PRODUCT_COINM, &spec.cm_symbol, 3_073)] {
             if !on {
                 continue;
@@ -648,6 +833,17 @@ impl Battery {
             let d = discover(&cfg, product, &tls).map_err(acct)?;
             discs.push((product, symbol.to_ascii_uppercase(), d, make_symbol_id(VenueId::Binance, ord)));
         }
+        // BX8: the spot symbol is the battery's spot[0] — the M1 anchor,
+        // under its flat id whatever its name (the universe's law).
+        if spec.spot {
+            stopped()?;
+            let symbol = spec.spot_symbol.to_ascii_uppercase();
+            let d = discover_spot(&cfg, &symbol, &tls).map_err(acct)?;
+            discs.push((PRODUCT_SPOT, symbol, d, LEGACY_BN_ANCHOR_SYM));
+        }
+        // The rows the boot will adopt (BX8: a spot base balance the boot
+        // sees — a millionth or more; the futures accounts are checked flat).
+        let mut to_adopt = 0u32;
         for (product, symbol, d, sym) in &discs {
             stopped()?;
             let row = *d.find(symbol.as_bytes()).ok_or_else(|| acct(format!("Demo lists no {symbol}")))?;
@@ -655,22 +851,31 @@ impl Battery {
             let (offset, rtt) = rest.clock().map_err(acct)?;
             phase("clock").s("host", rest.host()).n("offset_ms", offset).n("rtt_ms", rtt as i64).emit();
             let public = Public::new(&cfg, *product, tls.clone()).map_err(acct)?;
-            account_check(&mut rest, &signer, *product, symbol).map_err(acct)?;
-            sets.push((*product, vec![Instrument { sym: *sym, name: symbol.clone(), descriptor: format!("binance-{}:{}", product_word(*product), symbol.to_ascii_lowercase()) }], vec![(symbol.clone(), row)]));
-            reads.push((*product, symbol.clone(), *sym, rest, public));
+            let (spot, descriptor) = if *product == PRODUCT_SPOT {
+                let leg = spot_account_check(&mut rest, &signer, symbol, &row).map_err(acct)?;
+                to_adopt += u32::from(leg.base0_1e8 >= 100);
+                (Some(leg), format!("binance:{}", symbol.to_ascii_lowercase()))
+            } else {
+                account_check(&mut rest, &signer, *product, symbol).map_err(acct)?;
+                (None, format!("binance-{}:{}", product_word(*product), symbol.to_ascii_lowercase()))
+            };
+            sets.push((*product, vec![Instrument { sym: *sym, name: symbol.clone(), descriptor }], vec![(symbol.clone(), row)]));
+            reads.push((*product, symbol.clone(), *sym, rest, public, spot));
         }
         // The arm's table, bound as `bn_live` binds it (classic: USDT-margined
-        // USDⓈ-M rows only; COIN-M IoC-only).
+        // USDⓈ-M rows only; COIN-M IoC-only; spot IoC-only, its row under the
+        // alias, the ledger's row spot's law — BX8).
         let binds: Vec<BindSet<'_>> = sets
             .iter()
             .map(|(product, insts, rows)| BindSet { product: *product, insts, rows, owned: &[] })
             .collect();
-        let (table, wire, specs) = bind_table(&binds, SYMBOL_ID_NONE, AccountMode::Classic, false).map_err(|e| (EXIT_ACCOUNT, e))?;
+        let alias = if spec.spot { LEGACY_BN_ANCHOR_SYM } else { SYMBOL_ID_NONE };
+        let (table, wire, specs) = bind_table(&binds, alias, AccountMode::Classic, false).map_err(|e| (EXIT_ACCOUNT, e))?;
         let mut lanes: Vec<LaneB> = reads
             .into_iter()
-            .map(|(product, symbol, sym, rest, public)| {
+            .map(|(product, symbol, sym, rest, public, spot)| {
                 let row = table.row_of(sym);
-                LaneB { product, h: *table.hot(row), c: *table.cold(row), symbol, sym, rest, public }
+                LaneB { product, h: *table.hot(row), c: *table.cold(row), symbol, sym, rest, public, spot }
             })
             .collect();
 
@@ -714,28 +919,34 @@ impl Battery {
             quiet_ns: QUIET_NS,
             anchor_unsaved: None,
             max_leverage: MAX_LEVERAGE,
-            adopt_cap_usd_1e6: CAP_INSTANCE_USD_1E6,
+            adopt_cap_usd_1e6: spec.adopt_usd.saturating_mul(1_000_000),
         };
         let boot = |e: String| (EXIT_BOOT, e);
         let mut gw = BnGateway::<FILL_N>::new(&cfg, tls.clone(), knobs, wire, gw_end, fill_tx, JournalTx::new(j_tx))
             .map_err(|e| boot(format!("the gateway could not be built: {e:?}")))?;
         stopped()?;
         let t0 = Instant::now();
-        gw.boot().map_err(|e| boot(format!("the boot was refused: {e:?}")))?;
+        gw.boot().map_err(|e| boot_refused(e, spec.adopt_usd))?;
         // A signal during the boot: nothing is placed yet — the gateway
         // closes as it drops.
         stopped()?;
-        let (adopted, _) = gw.adopted();
+        let (adopted, adopted_usd) = gw.adopted();
         let unseen = gw.last_verdict().unseen_legs;
         phase("boot")
             .n("ms", t0.elapsed().as_millis() as i64)
             .n("epoch", i64::from(epoch))
             .s("route", if spec.rest { "rest" } else { "ws" })
             .n("adopted", i64::from(adopted))
+            .n("adopted_usd", adopted_usd / 1_000_000)
             .n("unseen_legs", i64::from(unseen))
             .emit();
-        if adopted > 0 || unseen > 0 {
-            return Err(boot(format!("the boot found venue positions ({adopted} adopted, {unseen} unseen) on a flat-checked account")));
+        // Adopted: exactly the spot balance the account check read (BX8) —
+        // a futures position is one on a flat-checked account.
+        if adopted != to_adopt || unseen > 0 {
+            return Err(boot(format!(
+                "the boot found venue inventory the account check did not: {adopted} row(s) adopted where {to_adopt} \
+                 (a held spot base balance) was read, {unseen} unseen"
+            )));
         }
         let mut lim = [0i64; SLOTS];
         lim[SLOT as usize] = 600_000;
@@ -762,11 +973,16 @@ impl Battery {
                 SLOT as usize,
                 ExecMode::Live,
                 &[VenueId::Binance.to_u8()],
-                SlotCaps::new(CAP_ORDER_USD_1E6, CAP_INSTANCE_USD_1E6, CAP_DAY_USD_1E6, MAX_OPEN_ORDERS),
+                SlotCaps::new(CAP_ORDER_USD_1E6, instance_cap_1e6(spec.adopt_usd), CAP_DAY_USD_1E6, MAX_OPEN_ORDERS),
                 HALT_LIMITS,
             )
             .map_err(|e| boot(format!("the route: {e:?}")))?;
-        let mut d = RoutedDispatcher::new(route, PaperDispatcher::new(), arm, core_time::WallAnchor::now());
+        // The engine's Binance shape (module docs): an order reaches the arm
+        // by its route venue — the anchor's by the alias (BX8), the table
+        // the router allows by and the split routes by being one.
+        let split = VenueSplit::new(VenueId::Binance.to_u8(), NullLiveDispatcher::new(), arm, &route);
+        let mut d = RoutedDispatcher::new(route, PaperDispatcher::new(), split, core_time::WallAnchor::now());
+        d.set_route_aliases(route_aliases(spec.spot.then_some(LEGACY_BN_ANCHOR_SYM)).map_err(boot)?);
         for s in &specs {
             d.bind_instrument(s).map_err(|e| boot(format!("the ledger row: {e:?}")))?;
         }
@@ -776,7 +992,7 @@ impl Battery {
             .name(String::from("bn-gateway"))
             .spawn(move || {
                 gw.run(&stop, 0);
-                (gw.phase(), gw.last_sweep().2)
+                (gw.phase(), gw.last_sweep())
             })
             .map_err(|e| boot(format!("the gateway thread: {e}")))?;
         Ok(Self {
@@ -871,13 +1087,19 @@ impl Battery {
         Ok(())
     }
 
+    /// The Binance arm, behind the venue split.
+    fn arm(&self) -> &BnArm {
+        self.d.live().b()
+    }
+
     /// **The one gate before every place and modify**: [`Battery::may_reduce`]'s,
-    /// nothing the arm's halt word says, no drift in the latest
-    /// reconciliation (the router halts at 5 USD; the battery grows only on
-    /// an agreeing one), and its record not full.
+    /// nothing the arm's halt word says (the slot's, as the router reads it
+    /// through the split), no drift in the latest reconciliation (the router
+    /// halts at 5 USD; the battery grows only on an agreeing one), and its
+    /// record not full.
     fn may_grow(&self) -> Result<(), String> {
         self.may_reduce()?;
-        let s = self.d.live().halt_signal();
+        let s = self.d.live().halt_signal_for(SLOT);
         if s.gateway_halted != 0 || s.venue_lock != 0 || s.margin_risk != 0 || s.budget_floor_breached != 0 {
             return Err(format!("the arm's halt word: {s:?}"));
         }
@@ -927,19 +1149,24 @@ impl Battery {
         String::from_utf8_lossy(&out).into_owned()
     }
 
+    /// An order on lane `l`'s symbol, stamped as a member stamps one:
+    /// `Order::venue` is the symbol's venue byte (BX8: the anchor's reads 0
+    /// — the route alias, not the byte, sends it to Binance).
     #[allow(clippy::too_many_arguments)]
     fn order(&mut self, l: usize, side: Side, kind: u8, px_1e6: i64, qty_1e6: i64, flags: u8, ttl_ns: u64) -> Order {
         self.next_oid += 1;
+        let sym = self.lanes[l].sym;
         let mut o = Order::new(
             core_time::now_ns(),
             VenueId::Binance,
-            self.lanes[l].sym,
+            sym,
             side,
             kind,
             Price::from_raw(px_1e6),
             Qty::from_raw(qty_1e6),
             self.next_oid,
         );
+        o.venue = symbol_venue_byte(sym);
         o.strategy_id = SLOT;
         o.flags = flags;
         o.ttl_ns = ttl_ns;
@@ -970,7 +1197,7 @@ impl Battery {
     /// route; `DeadmanDown`: a maker before the dead-man is proven). After
     /// a signal no verb goes — but a cancel (`exit`: a member getting out)
     /// goes once, unretried.
-    fn verb(&mut self, exit: bool, mut send: impl FnMut(&mut RoutedDispatcher<PaperDispatcher, BnArm>) -> Result<(), DispatchError>) -> Result<(), String> {
+    fn verb(&mut self, exit: bool, mut send: impl FnMut(&mut Router) -> Result<(), DispatchError>) -> Result<(), String> {
         let t0 = Instant::now();
         loop {
             let stopped = crate::sigint::shutdown_requested();
@@ -978,11 +1205,11 @@ impl Battery {
                 return Err(String::from(STOPPED));
             }
             self.turn();
-            let c = *self.d.live().counters();
+            let c = *self.arm().counters();
             match send(&mut self.d) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    let now = *self.d.live().counters();
+                    let now = *self.arm().counters();
                     let transient = now.refused[Refusal::DeadmanDown as usize] > c.refused[Refusal::DeadmanDown as usize]
                         || now.refused[Refusal::NotReady as usize] > c.refused[Refusal::NotReady as usize];
                     if !transient || stopped || t0.elapsed() > STEP_WAIT {
@@ -1044,6 +1271,21 @@ impl Battery {
             Some(Drill::Flatten) => return self.flatten_drill(rep),
             None => {}
         }
+        // BX8: the spot leg's start — the balance the boot adopted, as the
+        // router's ledger books it (the slot's starting inventory).
+        if self.spec.spot {
+            let l = self.lane(PRODUCT_SPOT);
+            let held0 = self.pos(self.lanes[l].sym);
+            if let Some(leg) = self.lanes[l].spot.as_mut() {
+                leg.held0_1e6 = held0;
+            }
+            phase("spot_start")
+                .s("symbol", &self.lanes[l].symbol)
+                .n("sym", self.lanes[l].sym as i64)
+                .n("adopted", held0)
+                .n("base_balance_1e8", self.lanes[l].spot.map_or(0, |s| s.base0_1e8))
+                .emit();
+        }
         if self.spec.um {
             let l = self.lane(PRODUCT_USDM);
             for i in 0..self.spec.cycles {
@@ -1068,6 +1310,14 @@ impl Battery {
             let l = self.lane(product);
             for k in 0..self.spec.fill_pairs {
                 self.round_trip(l, k, rep)?;
+            }
+        }
+        // BX8: spot's cycles — before the halt's sweep, which ends ordering.
+        if self.spec.spot {
+            let l = self.lane(PRODUCT_SPOT);
+            for i in 0..self.spec.cycles {
+                self.spot_cycle(l, i, rep)?;
+                rep.spot_cycles += 1;
             }
         }
         if self.spec.um {
@@ -1204,7 +1454,7 @@ impl Battery {
             return Err(String::from("the gateway thread did not stop"));
         }
         let handle = self.gw.take().ok_or_else(|| String::from("no gateway thread"))?;
-        Ok(handle.join().unwrap_or((Phase::Clock, 0)).0)
+        Ok(handle.join().map_or(Phase::Clock, |(phase, _)| phase))
     }
 
     /// **BX11 drill — the flatten on a real position** (O-BX9, plan §3.11
@@ -1322,14 +1572,14 @@ impl Battery {
         self.may_grow()?;
         let mut m = self.order(l, prev.side, ORDER_KIND_MAKER, px, qty, prev.flags, SAFETY_TTL_NS);
         m.ts_ns = core_time::now_ns();
-        let before = *self.d.live().counters();
+        let before = *self.arm().counters();
         let req = ModifyReq::new(prev.client_oid, m);
         self.verb(false, |d| d.modify(&req)).map_err(|e| format!("the modify: {e}"))?;
         let done = self.until(STEP_WAIT, |b| {
-            let c = b.d.live().counters();
+            let c = b.arm().counters();
             c.modified > before.modified || c.modifies_refused > before.modifies_refused
         });
-        let after = *self.d.live().counters();
+        let after = *self.arm().counters();
         if !done || after.modified == before.modified {
             return Err(format!("the modify was not confirmed (refused {})", after.modifies_refused - before.modifies_refused));
         }
@@ -1425,9 +1675,9 @@ impl Battery {
         let o = self.order(l, Side::Bid, ORDER_KIND_MAKER, px, qty_for(&h, px, self.spec.usd * 1_000_000)?, ORDER_FLAG_POST_ONLY, SAFETY_TTL_NS);
         self.may_grow()?;
         self.turn();
-        let before = self.d.live().counters().refused[Refusal::NoDeadman as usize];
+        let before = self.arm().counters().refused[Refusal::NoDeadman as usize];
         match self.d.submit(&o) {
-            Err(_) if self.d.live().counters().refused[Refusal::NoDeadman as usize] > before => {
+            Err(_) if self.arm().counters().refused[Refusal::NoDeadman as usize] > before => {
                 phase("coinm_maker").s("refused", "no_deadman").emit();
                 Ok(())
             }
@@ -1511,6 +1761,141 @@ impl Battery {
         Ok((o.client_oid, n, end_ns))
     }
 
+    /// **One spot cycle** (module docs, 3; BX8): an IoC BUY of `--bn-usd`
+    /// across the ask; its base-asset commission off its `J_FEE` records
+    /// ([`base_fee_1e9`]: one a trade — every trade's, or no SELL is sized
+    /// blind); an IoC SELL of what it bought less that fee, floored to the
+    /// step ([`spot_sell_qty`]), across the bid — the cycle proven by a
+    /// reconciliation journaled after the SELL's end that agrees (the
+    /// gateway's explained balance, the fee included, the venue's).
+    fn spot_cycle(&mut self, l: usize, i: u32, rep: &mut Report) -> Result<(), Fail> {
+        let fills = |e: String| (EXIT_FILLS, format!("spot cycle {i}: {e}"));
+        let (h, sym) = (self.lanes[l].h, self.lanes[l].sym);
+        let Some(mut leg) = self.lanes[l].spot else {
+            return Err(fills(String::from("not a spot lane")));
+        };
+        let buy = self.spot_ioc(l, None, rep).map_err(fills)?;
+        rep.fills[PRODUCT_SPOT as usize] += buy.n;
+        leg.buys += 1;
+        let (fees, fee_base_1e9) = base_fee_1e9(&self.recs, buy.oid, leg.base.get() == b"BNB");
+        leg.fee_unknown |= fees < buy.n;
+        // Never past what the ledger holds above the adopted balance (the
+        // run's own holding).
+        let held = self.pos(sym).saturating_sub(leg.held0_1e6);
+        let q = if leg.fee_unknown { None } else { spot_sell_qty(buy.qty_1e6, fee_base_1e9, held, &h) };
+        leg.unsold_1e6 += q.unwrap_or(0);
+        self.lanes[l].spot = Some(leg);
+        if leg.fee_unknown {
+            return Err(fills(format!(
+                "the BUY's commission was journaled for {fees} of its {} trades — its base-asset fee is unknown: no SELL is sized blind",
+                buy.n
+            )));
+        }
+        let q = q.ok_or_else(|| {
+            fills(format!("the BUY's {} less its base-asset fee ({fee_base_1e9} ×1e9) is no SELL on the row's step — raise --bn-usd", buy.qty_1e6))
+        })?;
+        let sold = self.spot_ioc(l, Some(q), rep);
+        // What the SELL sold, whatever its verdict: the end sells the rest.
+        if let (Ok(s), Some(leg)) = (&sold, self.lanes[l].spot.as_mut()) {
+            leg.unsold_1e6 -= s.qty_1e6;
+        }
+        let sell = sold.map_err(fills)?;
+        rep.fills[PRODUCT_SPOT as usize] += sell.n;
+        self.reconciled_after(sell.end_ns, PRODUCT_SPOT, rep).map_err(|e| (EXIT_RECON, format!("spot cycle {i}: {e}")))?;
+        phase("spot_cycle")
+            .n("i", i64::from(i))
+            .n("bought", buy.qty_1e6)
+            .n("buy_vwap", buy.px_1e6)
+            .n("fee_records", i64::from(fees))
+            .n("fee_base_1e9", fee_base_1e9)
+            .n("sold", sell.qty_1e6)
+            .n("sell_vwap", sell.px_1e6)
+            .n("held", self.pos(sym))
+            .emit();
+        if sell.qty_1e6 != q {
+            return Err(fills(format!("the SELL filled {} of {q} — the end sells the rest", sell.qty_1e6)));
+        }
+        Ok(())
+    }
+
+    /// **One spot IoC through the touch** (module docs, 3; BX8) — a BUY of
+    /// `--bn-usd` across the ask, or (`sell`) a SELL of that quantity across
+    /// the bid, its notional at least the row's minimum — waited to its end;
+    /// it must fill. **The alias's proof**, one line an order: it carries the
+    /// anchor's id as a member stamps it (sym 7, venue byte 0 — a byte no
+    /// Binance slot allows); the router's alias table routes it to Binance;
+    /// the split hands it to the Binance arm (the arm's `submitted` moved by
+    /// one, the refusing arm's refusals did not); and every fill lane 4
+    /// carried for it names its sym.
+    fn spot_ioc(&mut self, l: usize, sell: Option<i64>, rep: &mut Report) -> Result<SpotFill, String> {
+        let h = self.lanes[l].h;
+        let t = {
+            let lane = &mut self.lanes[l];
+            lane.public.touch(lane.symbol.as_bytes())?
+        };
+        let (side, px, qty) = match sell {
+            None => {
+                let px = px_off(&h, t.ask_1e6, self.spec.cross_bps, false)?;
+                (Side::Bid, px, qty_for(&h, px, self.spec.usd * 1_000_000)?)
+            }
+            Some(q) => {
+                let px = px_off(&h, t.bid_1e6, self.spec.cross_bps, true)?;
+                if notional_1e6(&h, px, q) < h.min_notional_1e6 {
+                    return Err(format!("a SELL of {q} at {px} is under the row's minimum notional — raise --bn-usd"));
+                }
+                (Side::Ask, px, q)
+            }
+        };
+        let o = self.order(l, side, ORDER_KIND_IOC, px, qty, 0, 0);
+        if sell.is_some() {
+            self.may_reduce()?;
+        } else {
+            self.may_grow()?;
+        }
+        let route = self.d.route_aliases().route_venue(o.sym, o.venue);
+        let (sub0, null0) = (self.arm().counters().submitted, self.d.live().a().refused());
+        self.verb(false, |d| d.submit(&o))?;
+        let accepted = self.arm().counters().submitted - sub0;
+        let null_refused = self.d.live().a().refused() - null0;
+        let end = self.end_of(o.client_oid, STEP_WAIT)?;
+        if end.0 == J_REJECT {
+            return Err(format!("the IoC was refused {}", end.1));
+        }
+        let end_ns = self.end_rec(o.client_oid).map_or(0, |r| r.ts_ns);
+        // The fills reach lane 4 before the retirement (obligation 1).
+        let (n, filled, vwap, on_sym) = fill_sum(&self.fills, o.client_oid, o.sym);
+        let bn = VenueId::Binance.to_u8();
+        let routed = o.venue != bn && route == bn && accepted == 1 && null_refused == 0 && on_sym;
+        let journaled = self.recs.iter().filter(|r| r.kind == J_FILL && r.client_oid == o.client_oid).count();
+        phase("spot_ioc")
+            .s("side", if sell.is_some() { "sell" } else { "buy" })
+            .n("sym", o.sym as i64)
+            .n("venue_byte", i64::from(o.venue))
+            .n("route_venue", i64::from(route))
+            .n("arm_accepted", count(accepted))
+            .n("null_refused", count(null_refused))
+            .b("routed_by_alias", routed)
+            .n("px", px)
+            .n("qty", qty)
+            .n("fills", i64::from(n))
+            .b("fills_on_sym", on_sym)
+            .n("filled", filled)
+            .n("vwap", vwap)
+            .n("journaled", journaled as i64)
+            .emit();
+        if n == 0 || filled == 0 {
+            return Err(format!("the IoC through the touch did not fill (ended {end:?})"));
+        }
+        if !routed {
+            return Err(String::from("the order was not proven routed through the alias to the Binance arm (its spot_ioc line)"));
+        }
+        rep.alias += 1;
+        if end != (J_ENDED, i32::from(RETIRED_FILLED)) && end != (J_ENDED, i32::from(RETIRED_EXPIRED)) {
+            return Err(format!("the IoC ended otherwise: {end:?}"));
+        }
+        Ok(SpotFill { oid: o.client_oid, n, qty_1e6: filled, px_1e6: vwap, end_ns })
+    }
+
     // ---------------------------------------------------------------------
     // 5. The end
     // ---------------------------------------------------------------------
@@ -1520,9 +1905,15 @@ impl Battery {
         // try) while the slot can still order — not after a signal (a
         // member's exit is not the signal's to make), not once halted (a
         // halted slot refuses every order; its sweep cancels), and not
-        // through a gateway a drill stopped (the flat read judges).
+        // through a gateway a drill stopped (the flat read judges). Spot's
+        // (BX8): what the cycles left unsold ([`Battery::spot_close`]).
         let mut l = 0;
         while l < self.lanes.len() {
+            if self.lanes[l].spot.is_some() {
+                self.spot_close(l, rep);
+                l += 1;
+                continue;
+            }
             let mut tries = 0;
             while !self.gw_killed && tries < CLOSE_TRIES && self.pos(self.lanes[l].sym) != 0 && self.may_reduce().is_ok() {
                 tries += 1;
@@ -1558,16 +1949,31 @@ impl Battery {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
-        let (gw_phase, flag) = match self.gw.take() {
-            Some(h) if h.is_finished() => h.join().unwrap_or((Phase::Clock, 0)),
+        let none: GwEnd = (Phase::Clock, (0, 0, 0));
+        let (gw_phase, (sweep_left, sweep_cancels, flag)) = match self.gw.take() {
+            Some(h) if h.is_finished() => h.join().unwrap_or(none),
             Some(_) => {
                 warn!("binance-battery: the gateway thread did not stop — left");
-                (Phase::Clock, 0)
+                none
             }
-            None => (Phase::Clock, 0),
+            None => none,
         };
         let gateway = if self.gw_killed { String::from("stopped by the drill") } else { format!("{gw_phase:?}") };
-        phase("shutdown").s("gateway", &gateway).b("sweep_done", flag & EVT_F_SWEEP_DONE != 0).emit();
+        let done = flag & EVT_F_SWEEP_DONE != 0;
+        // BX8: an IoC-only lane rests nothing — its sweep confirms clear and
+        // cancels none.
+        let no_op = done && sweep_left == 0 && sweep_cancels == 0;
+        phase("shutdown")
+            .s("gateway", &gateway)
+            .b("sweep_done", done)
+            .n("sweep_left", sweep_left)
+            .n("sweep_cancels", sweep_cancels)
+            .b("sweep_no_op", no_op)
+            .emit();
+        let spot_only = self.spec.spot && !self.spec.um && !self.spec.cm;
+        if spot_only && gw_phase == Phase::Exiting && !no_op {
+            rep.fail(EXIT_SWEEP, format!("spot's shutdown sweep was not a confirmed no-op ({sweep_left} left, {sweep_cancels} cancels, done {done})"));
+        }
         // A drill stopped the gateway: what the arm can no longer close or
         // cancel — a maker that filled before the dead-man fired, a
         // position the flatten drill left — the operator's own tool does,
@@ -1596,13 +2002,15 @@ impl Battery {
             rep.fail(EXIT_SWEEP, format!("the shutdown sweep did not complete (the gateway ended {gw_phase:?})"));
         }
         self.turn();
-        let c = *self.d.live().counters();
+        let c = *self.arm().counters();
         rep.reconnects = c.gw[GW_RECONNECTS];
         rep.connect_failures = c.gw[GW_CONNECT_FAILURES];
         rep.recon_ok = c.gw[GW_RECON_OK];
         rep.recon_failed = c.gw[GW_RECON_FAILED];
         rep.journal_dropped = c.gw[GW_JOURNAL_DROPPED];
         rep.fills_lost = c.gw[GW_FILLS_LOST];
+        rep.drift_legs = c.gw[GW_RECON_DRIFT_LEGS];
+        rep.last_recon = self.recs.iter().rev().find(|r| r.kind == J_RECON).map(|r| (r.code == 1, r.a));
         rep.recs_dropped = self.recs_dropped;
         rep.fills_dropped = self.fills_dropped;
         // BX11 (BX-14): every trade's commission journaled once — its
@@ -1627,6 +2035,36 @@ impl Battery {
             } else {
                 rep.k2 = k2(&log.frames, &self.k2_oids, &self.recs, &self.prefix);
                 tap_lines(&log.frames);
+            }
+        }
+    }
+
+    /// **The end's spot close** (BX8): what the cycles bought and did not
+    /// sell back — net of the base-asset commission, floored to the step —
+    /// sold through the touch, wider each try, under the end's own gates.
+    /// Never the balance the boot adopted (the account's, not the run's):
+    /// never past what the ledger holds above it — so a SELL whose end went
+    /// unseen but whose fills were booked is not sold twice. Never blind: a
+    /// commission unknown sells nothing (the flat read judges the balance).
+    fn spot_close(&mut self, l: usize, rep: &mut Report) {
+        let mut tries = 0;
+        while !self.gw_killed && tries < CLOSE_TRIES && self.may_reduce().is_ok() {
+            let (h, sym) = (self.lanes[l].h, self.lanes[l].sym);
+            let Some(leg) = self.lanes[l].spot.filter(|s| !s.fee_unknown) else {
+                return;
+            };
+            let Some(q) = spot_sell_qty(leg.unsold_1e6, 0, self.pos(sym).saturating_sub(leg.held0_1e6), &h) else {
+                return;
+            };
+            tries += 1;
+            self.spec.cross_bps = (self.spec.cross_bps * 2).min(300);
+            match self.spot_ioc(l, Some(q), rep) {
+                Ok(s) => {
+                    if let Some(leg) = self.lanes[l].spot.as_mut() {
+                        leg.unsold_1e6 -= s.qty_1e6;
+                    }
+                }
+                Err(e) => warn!("binance-battery: the end's spot close: {e}"),
             }
         }
     }
@@ -1663,19 +2101,24 @@ impl Battery {
 }
 
 /// The flat read's two requests on `lane` — the account's open orders, its
-/// positions — signed into their templates' windows under
-/// [`FLAT_RECV_WINDOW_MS`] (the second is sent only after the first is
-/// answered): their lengths.
+/// positions (spot's, BX8: its balances) — signed into their templates'
+/// windows under [`FLAT_RECV_WINDOW_MS`] (the second is sent only after the
+/// first is answered): their lengths.
 fn sign_flat(lane: &mut LaneB, signer: &Signer) -> Result<(usize, usize), String> {
     let long = WsStatic::new(STP_MODE, FLAT_RECV_WINDOW_MS);
     let orders = lane.rest.sign(T_OPEN_ORDERS, signer, false, |w, _, ts| render_account(w, &long, ts))?;
-    let account = lane.rest.sign(ORD0 + R_ACCOUNT, signer, false, |w, _, ts| render_account(w, &long, ts))?;
+    let account = if lane.spot.is_some() {
+        lane.rest.sign(SPOT_ACCOUNT, signer, false, |w, _, ts| render_spot_account(w, &long, ts))?
+    } else {
+        lane.rest.sign(ORD0 + R_ACCOUNT, signer, false, |w, _, ts| render_account(w, &long, ts))?
+    };
     Ok((orders, account))
 }
 
 /// One lane's flat read, its requests signed ([`sign_flat`]): no order of
-/// this run's epoch on the product's account, the lane's symbol flat —
-/// what is left, or could not be read.
+/// this run's epoch on the product's account, the lane's symbol flat (spot,
+/// BX8: its base balance within [`spot_left`]'s bound) — what is left, or
+/// could not be read.
 fn flat_lane(lane: &mut LaneB, signed: Result<(usize, usize), String>, epoch_prefix: &str) -> Vec<String> {
     let mut left = Vec::new();
     let pw = product_word(lane.product);
@@ -1693,6 +2136,24 @@ fn flat_lane(lane: &mut LaneB, signed: Result<(usize, usize), String>, epoch_pre
             }
         }
         Err(e) => left.push(format!("{pw}: the open orders could not be read ({e})")),
+    }
+    if let Some(s) = lane.spot {
+        match lane.rest.send(SPOT_ACCOUNT, account).and_then(|a| spot_account_of(&a, s.base)) {
+            Ok(a) => {
+                phase("spot_flat")
+                    .s("symbol", &lane.symbol)
+                    .n("base_start_1e8", s.base0_1e8)
+                    .n("base_end_1e8", a.bal_1e8)
+                    .n("buys", i64::from(s.buys))
+                    .n("unsold", s.unsold_1e6)
+                    .emit();
+                if let Some(grew) = spot_left(s.base0_1e8, a.bal_1e8, s.buys, lane.h.step_1e6) {
+                    left.push(format!("{}: the base balance grew {grew} ×1e8 — a purchase not sold back", lane.symbol));
+                }
+            }
+            Err(e) => left.push(format!("{}: the spot balance could not be read ({e})", lane.symbol)),
+        }
+        return left;
     }
     let position = lane.rest.send(ORD0 + R_ACCOUNT, account).and_then(|a| account_of(lane.product, a));
     match position.and_then(|a| a.position(lane.product, lane.symbol.as_bytes())) {
@@ -1712,6 +2173,80 @@ fn refusal_delta(before: &[u64], after: &[u64]) -> Vec<&'static str> {
         }
     }
     out
+}
+
+// -------------------------------------------------------------------------
+// Spot's arithmetic (BX8)
+// -------------------------------------------------------------------------
+
+/// What a spot IoC did: its client id, lane 4's fills for it — their
+/// count, quantity ×1e6 and volume-weighted price ×1e6 — and its end's
+/// time.
+struct SpotFill {
+    oid: u64,
+    n: u32,
+    qty_1e6: i64,
+    px_1e6: i64,
+    end_ns: u64,
+}
+
+/// Lane 4's fills for `oid`: (count, quantity ×1e6, the volume-weighted
+/// price ×1e6 — 0 with none — and whether every one names `sym`).
+fn fill_sum(fills: &[Fill], oid: u64, sym: SymbolId) -> (u32, i64, i64, bool) {
+    let (mut n, mut qty, mut value, mut on_sym) = (0u32, 0i64, 0i128, true);
+    for f in fills.iter().filter(|f| f.order_id == oid) {
+        n += 1;
+        qty = qty.saturating_add(f.qty.raw());
+        value += i128::from(f.qty.raw()) * i128::from(f.px.raw());
+        on_sym &= f.sym == sym;
+    }
+    let vwap = if qty > 0 { i64::try_from(value / i128::from(qty)).unwrap_or(i64::MAX) } else { 0 };
+    (n, qty, vwap, on_sym)
+}
+
+/// **The base-asset commission a spot BUY paid** (`oid`'s `J_FEE` records,
+/// one a trade): (the records, the commission ×1e9 charged in the base
+/// asset). A BUY pays in the asset it receives — to a spot row's fee code
+/// `FEE_ASSET_OTHER`: neither its quote (the row's settlement asset) nor
+/// BNB — unless BNB burn pays it in BNB, which is the base asset only on a
+/// BNB row. A rebate (negative) takes nothing off.
+fn base_fee_1e9(recs: &[ExecRecord], oid: u64, base_bnb: bool) -> (u32, i64) {
+    let (mut n, mut fee) = (0u32, 0i64);
+    for r in recs.iter().filter(|r| r.kind == J_FEE && r.client_oid == oid) {
+        n += 1;
+        let (_, asset, ..) = fee_fields(r.code);
+        if asset == FEE_ASSET_OTHER || (base_bnb && asset == FEE_ASSET_BNB) {
+            fee = fee.saturating_add(r.c.max(0));
+        }
+    }
+    (n, fee)
+}
+
+/// **A spot SELL's quantity**: what the BUY filled less the commission the
+/// venue charged in the base asset (×1e9, rounded UP to a millionth: the
+/// SELL never reaches past what arrived), never past the holding the
+/// ledger shows, floored to the row's step. `None` when that is no order:
+/// nothing left, or under the row's minimum quantity.
+fn spot_sell_qty(bought_1e6: i64, fee_base_1e9: i64, held_1e6: i64, h: &BnInstHot) -> Option<i64> {
+    let step = i64::from(h.step_1e6.max(1));
+    let fee_1e6 = fee_base_1e9.max(0).saturating_add(999) / 1_000;
+    let net = bought_1e6.saturating_sub(fee_1e6).min(held_1e6);
+    if net <= 0 {
+        return None;
+    }
+    let q = floor_to(net, step, h.step_magic());
+    (q > 0 && q >= h.min_qty_1e6).then_some(q)
+}
+
+/// **What the spot cycles left on the account** (the flat read): the base
+/// balance's growth over the account check's, ×1e8 — `Some` when it
+/// reaches a step for each BUY that filled (a SELL floored to the step
+/// leaves under a step of dust; a purchase never sold leaves at least the
+/// minimum quantity). No BUY, nothing of the run's.
+fn spot_left(base0_1e8: i64, base1_1e8: i64, buys: u32, step_1e6: u32) -> Option<i64> {
+    let grew = base1_1e8.saturating_sub(base0_1e8);
+    let dust = i64::from(buys).saturating_mul(i64::from(step_1e6)).saturating_mul(100);
+    (buys > 0 && grew >= dust).then_some(grew)
 }
 
 // -------------------------------------------------------------------------
@@ -1765,6 +2300,34 @@ fn account_check(rest: &mut Rest, signer: &Signer, product: u8, symbol: &str) ->
     }
     phase("account").s("product", pw).b("flat", true).n("margin_balance_usd", acct.um.map_or(-1, |(b, _)| b / 1_000_000)).emit();
     Ok(())
+}
+
+/// **The spot account check** (module docs, 0; BX8) on spot's REST client:
+/// the account read — `canTrade`; the account's permissions by name and
+/// the row's verdict under the gateway's own judge (`judge_permission` on
+/// the row's `permissionSets`), printed, never decided here: the boot's
+/// check decides, and its refusal is [`EXIT_PERMISSION`]; the base asset's
+/// balance, which the boot adopts — and no order resting anywhere on the
+/// account (the IoC-only lane cancels none: a stray of ours would hold the
+/// boot in its reconciliation, another's leave it unreconciled).
+fn spot_account_check(rest: &mut Rest, signer: &Signer, symbol: &str, row: &BnSymbolRow) -> Result<SpotLeg, String> {
+    let base = AssetName::of(row.base_asset()).ok_or_else(|| format!("spot: {symbol}'s row names no base asset"))?;
+    let a = read_spot_account(rest, signer, base)?;
+    let verdict = judge_permission(&row.perm, &a.perm);
+    phase("spot_account")
+        .s("symbol", symbol)
+        .s("base", &String::from_utf8_lossy(base.get()))
+        .n("base_balance_1e8", a.bal_1e8)
+        .b("can_trade", a.can_trade)
+        .s("permissions", &a.names.join(","))
+        .n("row_groups", i64::from(row.perm.group_count))
+        .s("judge_permission", &verdict.map_or_else(|e| format!("Err({e:?})"), |()| String::from("Ok")))
+        .emit();
+    let resting: Vec<String> = open_orders(rest, signer, None)?.into_iter().map(|o| format!("{}:{}", o.symbol, o.cid)).collect();
+    if !resting.is_empty() {
+        return Err(format!("spot: orders rest on the account ({}) — the IoC-only lane cancels none: clear them in the app", resting.join(" ")));
+    }
+    Ok(SpotLeg { base, base0_1e8: a.bal_1e8, held0_1e6: 0, buys: 0, unsold_1e6: 0, fee_unknown: false })
 }
 
 // -------------------------------------------------------------------------
@@ -1856,10 +2419,13 @@ mod tests {
         BatterySpec {
             um: true,
             cm: true,
+            spot: false,
             rest: false,
             hmac: false,
             um_symbol: String::from("BTCUSDT"),
             cm_symbol: String::from("BNBUSD_PERP"),
+            spot_symbol: String::from("BTCUSDT"),
+            adopt_usd: DEFAULT_ADOPT_USD,
             cycles: 10,
             fill_pairs: 3,
             usd: 60,
@@ -2017,5 +2583,188 @@ mod tests {
         assert_eq!((r.exit(), r.why.as_str()), (EXIT_CYCLE, "first"));
         r.left.push(String::from("an order"));
         assert_eq!(r.exit(), EXIT_LEFTOVER);
+    }
+
+    // ---------------------------------------------------------------------
+    // BX8 — spot
+    // ---------------------------------------------------------------------
+
+    /// Demo's spot BTCUSDT as the venue lists it (tick 0.01, step and
+    /// minimum 0.00001, a 5 USDT minimum notional), bound under the anchor
+    /// as the battery binds it: its hot row and its wire table.
+    fn spot_row() -> (BnInstHot, exec_binance::inst::WireTable) {
+        const SPOT: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.01000000","maxPrice":"1000000.00000000","tickSize":"0.01000000"},{"filterType":"LOT_SIZE","minQty":"0.00001000","maxQty":"9000.00000000","stepSize":"0.00001000"},{"filterType":"NOTIONAL","minNotional":"5.00000000","applyMinToMarket":true,"maxNotional":"9000000.00000000","applyMaxToMarket":false,"avgPriceMins":5}],"permissionSets":[["SPOT","MARGIN","TRD_GRP_004"]]}]}"#;
+        let mut d = BnDiscovery::new();
+        d.ingest_body(SPOT).expect("the spot fixture");
+        let rows = vec![(String::from("BTCUSDT"), *d.find(b"BTCUSDT").expect("row"))];
+        let insts = [Instrument { sym: LEGACY_BN_ANCHOR_SYM, name: String::from("BTCUSDT"), descriptor: String::from("binance:btcusdt") }];
+        let set = BindSet { product: PRODUCT_SPOT, insts: &insts, rows: &rows, owned: &[] };
+        let (t, w, specs) = bind_table(&[set], LEGACY_BN_ANCHOR_SYM, AccountMode::Classic, false).expect("bound");
+        assert_eq!((specs[0].sym, specs[0].law), (LEGACY_BN_ANCHOR_SYM, exec_router::LAW_SPOT), "the ledger's row: the anchor's, spot's law");
+        (*t.hot(t.row_of(LEGACY_BN_ANCHOR_SYM)), w)
+    }
+
+    /// The parse refuses an unknown word, as before; each product is armed
+    /// by its word, in any order, once or twice.
+    #[test]
+    fn the_product_list_names_um_cm_and_spot_only() {
+        assert_eq!(parse_products("um"), Ok((true, false, false)));
+        assert_eq!(parse_products("spot"), Ok((false, false, true)));
+        assert_eq!(parse_products("spot, um,cm"), Ok((true, true, true)));
+        assert_eq!(parse_products("um,um"), Ok((true, false, false)));
+        for bad in ["", "options", "um,", "SPOT", "um;cm"] {
+            assert!(parse_products(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// Spot rides the WS API (no REST route, so no HMAC key); its symbol
+    /// rides a request path; the adoption cap is bounded; no drill takes
+    /// spot (both are futures').
+    #[test]
+    fn the_spec_refuses_what_spot_cannot_do() {
+        let spot = BatterySpec { um: false, cm: false, spot: true, ..spec() };
+        assert!(spot.check().is_ok());
+        assert!(BatterySpec { spot: true, ..spec() }.check().is_ok(), "beside the futures");
+        assert!(BatterySpec { rest: true, ..spot.clone() }.check().is_err(), "the REST route");
+        assert!(BatterySpec { rest: true, hmac: true, ..spot.clone() }.check().is_err(), "an HMAC key");
+        assert!(BatterySpec { spot_symbol: String::from("tslabusdt"), ..spot.clone() }.check().is_ok(), "upper-cased");
+        for bad in ["", "BTC&X=1", "BTC USDT", "A23456789012345678901234567890123"] {
+            assert!(BatterySpec { spot_symbol: String::from(bad), ..spot.clone() }.check().is_err(), "{bad:?}");
+        }
+        assert!(BatterySpec { adopt_usd: 0, ..spot.clone() }.check().is_ok(), "adopt nothing");
+        assert!(BatterySpec { adopt_usd: -1, ..spot.clone() }.check().is_err());
+        assert!(BatterySpec { adopt_usd: MAX_ADOPT_USD + 1, ..spot.clone() }.check().is_err());
+        assert!(BatterySpec { um: true, cm: false, spot: true, drill: Some(Drill::Gap), ..spec() }.check().is_err());
+        assert!(BatterySpec { um: true, cm: false, spot: true, drill: Some(Drill::Flatten), ..spec() }.check().is_err());
+        assert!(BatterySpec { drill: Some(Drill::Flatten), ..spot }.check().is_err(), "the flatten is the futures'");
+    }
+
+    /// Spot's bar: an order routed through the alias, 4 fills, 2 agreeing
+    /// reconciliations — absolute, as the other lanes'.
+    #[test]
+    fn spots_bar_is_the_alias_four_fills_and_two_reconciliations() {
+        let sp = BatterySpec { um: false, cm: false, spot: true, ..spec() };
+        let met = Report { fills: [4, 0, 0], recons: [2, 0, 0], alias: 4, ..Report::default() };
+        assert_eq!(bar_short(&sp, &met), None);
+        let short = |f: fn(&mut Report)| {
+            let mut r = Report { fills: [4, 0, 0], recons: [2, 0, 0], alias: 4, ..Report::default() };
+            f(&mut r);
+            bar_short(&sp, &r).map(|(code, _)| code)
+        };
+        assert_eq!(short(|r| r.alias = 0), Some(EXIT_FILLS));
+        assert_eq!(short(|r| r.fills[0] = 3), Some(EXIT_FILLS));
+        assert_eq!(short(|r| r.recons[0] = 1), Some(EXIT_RECON));
+        // Not armed, not judged; armed beside the futures, judged too.
+        assert_eq!(bar_short(&spec(), &full()), None);
+        assert_eq!(bar_short(&BatterySpec { spot: true, ..spec() }, &full()).map(|(c, _)| c), Some(EXIT_FILLS));
+    }
+
+    /// The boot's refusal: the permission check's is its own code (66),
+    /// distinct from every other; past the adoption cap names the flag;
+    /// anything else is the boot's (51).
+    #[test]
+    fn the_permission_refusal_has_its_own_exit_code() {
+        let (code, why) = boot_refused(BootErr::Assert(AssertErr::SymbolNotPermitted), DEFAULT_ADOPT_USD);
+        assert_eq!(code, EXIT_PERMISSION);
+        assert!(why.contains("permission check"), "{why}");
+        let pinned = [EXIT_ACCOUNT, EXIT_BOOT, EXIT_CYCLE, EXIT_POST_ONLY, EXIT_TTL, EXIT_SWEEP, EXIT_RECON, EXIT_FILLS, EXIT_LEFTOVER, EXIT_DRILL];
+        assert!(!pinned.contains(&EXIT_PERMISSION) && !(60..=64).contains(&EXIT_PERMISSION), "distinct from the battery's and the tools' codes");
+        let (code, why) = boot_refused(BootErr::Inventory(81_000_000_000), 1_000);
+        assert_eq!(code, EXIT_BOOT);
+        assert!(why.contains("81000 USD") && why.contains("--bn-adopt-usd"), "{why}");
+        assert!(boot_refused(BootErr::Inventory(i64::MAX), 1_000).1.contains("could not price"));
+        for other in [BootErr::Assert(AssertErr::CannotTrade), BootErr::SpotRoute, BootErr::Timeout(4)] {
+            assert_eq!(boot_refused(other, 0).0, EXIT_BOOT, "{other:?}");
+        }
+        // The slot's instance cap carries what the boot may adopt.
+        assert_eq!(instance_cap_1e6(0), CAP_INSTANCE_USD_1E6);
+        assert_eq!(instance_cap_1e6(DEFAULT_ADOPT_USD), CAP_INSTANCE_USD_1E6 + 250_000_000_000);
+        assert_eq!(instance_cap_1e6(i64::MAX), i64::MAX, "saturated, never wrapped");
+    }
+
+    /// The SELL: what the BUY filled less its base-asset fee — rounded up
+    /// to a millionth — floored to the step, never past the run's holding,
+    /// at least the row's minimum.
+    #[test]
+    fn a_spot_sell_is_the_buy_less_its_base_fee_on_the_step() {
+        let (h, _) = spot_row();
+        assert_eq!((h.step_1e6, h.min_qty_1e6), (10, 10));
+        // 0.00073 BTC bought, 0.00000073 BTC of fee: 0.00072927 → 0.00072.
+        assert_eq!(spot_sell_qty(730, 730, 1_000_000, &h), Some(720));
+        // BNB burn (no base fee): the whole BUY.
+        assert_eq!(spot_sell_qty(730, 0, 1_000_000, &h), Some(730));
+        // A fee of a whole millionth and more: still never past what arrived.
+        assert_eq!(spot_sell_qty(730, 10_001, 1_000_000, &h), Some(710), "0.000010001 → 11 millionths off");
+        // The run's holding bounds it.
+        assert_eq!(spot_sell_qty(730, 0, 455, &h), Some(450));
+        // Nothing, or under the minimum: no SELL.
+        assert_eq!(spot_sell_qty(730, 730_000, 1_000_000, &h), None, "the fee is the purchase");
+        assert_eq!(spot_sell_qty(15, 7_000, 1_000_000, &h), None, "8 millionths: under the step");
+        assert_eq!(spot_sell_qty(730, 0, 0, &h), None, "no holding");
+        assert_eq!(spot_sell_qty(730, 0, -5, &h), None);
+        assert_eq!(spot_sell_qty(730, -9_000, 1_000_000, &h), Some(730), "a rebate adds nothing to sell");
+    }
+
+    /// The BUY's base fee off its `J_FEE` records: the base asset's
+    /// (`FEE_ASSET_OTHER` to a spot row), BNB's only on a BNB row, never the
+    /// quote's; every record counted; another order's ignored.
+    #[test]
+    fn a_buys_base_fee_is_read_off_its_journal() {
+        use exec_binance::journal::{fee_code, FEE_ASSET_SETTLE, TRADE_BY_MEMBER};
+        let (_, w) = spot_row();
+        let row = w.row(0);
+        let fee = |oid: u64, asset: u8, c: i64| ExecRecord {
+            kind: J_FEE,
+            client_oid: oid,
+            c,
+            code: fee_code(false, asset, TRADE_BY_MEMBER, row),
+            ..ExecRecord::default()
+        };
+        let recs = [
+            fee(5, FEE_ASSET_OTHER, 400),
+            fee(5, FEE_ASSET_OTHER, 330),
+            fee(5, FEE_ASSET_BNB, 9_000),
+            fee(5, FEE_ASSET_SETTLE, 77_000),
+            fee(5, FEE_ASSET_OTHER, -50),
+            fee(6, FEE_ASSET_OTHER, 123),
+            ExecRecord { kind: J_FILL, client_oid: 5, c: 999, ..ExecRecord::default() },
+        ];
+        assert_eq!(base_fee_1e9(&recs, 5, false), (5, 730), "the base's two, the rebate taking nothing off");
+        assert_eq!(base_fee_1e9(&recs, 5, true), (5, 9_730), "BNB is the base on a BNB row");
+        assert_eq!(base_fee_1e9(&recs, 6, false), (1, 123));
+        assert_eq!(base_fee_1e9(&recs, 7, false), (0, 0));
+        // The asset's class as the gateway journals it: the base (BTC) is
+        // another asset to the row, USDT its settlement asset.
+        assert_eq!(exec_binance::journal::fee_asset(row, b"BTC"), FEE_ASSET_OTHER);
+        assert_eq!(exec_binance::journal::fee_asset(row, b"USDT"), FEE_ASSET_SETTLE);
+    }
+
+    /// Lane 4's fills for an order: their count, quantity, volume-weighted
+    /// price, and whether each names the order's sym.
+    #[test]
+    fn lane_fours_fills_are_summed_with_their_sym() {
+        let f = |sym: SymbolId, oid: u64, px: i64, qty: i64| Fill::new(1, sym, Side::Bid, Price::from_raw(px), Qty::from_raw(qty), oid);
+        let fills = [
+            f(LEGACY_BN_ANCHOR_SYM, 3, 80_000_000_000, 300),
+            f(LEGACY_BN_ANCHOR_SYM, 3, 80_010_000_000, 100),
+            f(LEGACY_BN_ANCHOR_SYM, 4, 1, 1),
+        ];
+        assert_eq!(fill_sum(&fills, 3, LEGACY_BN_ANCHOR_SYM), (2, 400, 80_002_500_000, true));
+        assert_eq!(fill_sum(&fills, 9, LEGACY_BN_ANCHOR_SYM), (0, 0, 0, true), "none");
+        let foreign = [f(make_symbol_id(VenueId::Binance, 7), 3, 1, 1)];
+        assert!(!fill_sum(&foreign, 3, LEGACY_BN_ANCHOR_SYM).3, "spot[6]'s id is not the anchor's");
+    }
+
+    /// The flat read's spot law: under a step of dust per BUY is the SELLs'
+    /// flooring; a step a BUY or more is a purchase not sold back; no BUY,
+    /// nothing of the run's.
+    #[test]
+    fn spots_flat_read_allows_a_step_of_dust_per_buy() {
+        // Ten BUYs on a 0.00001 step: up to 9 999 ×1e8 of dust.
+        assert_eq!(spot_left(100_000_000, 100_009_999, 10, 10), None);
+        assert_eq!(spot_left(100_000_000, 100_010_000, 10, 10), Some(10_000));
+        assert_eq!(spot_left(100_000_000, 99_990_000, 10, 10), None, "fees taken: nothing left");
+        assert_eq!(spot_left(100_000_000, 100_073_000, 1, 10), Some(73_000), "a whole purchase");
+        assert_eq!(spot_left(100_000_000, 200_000_000, 0, 10), None, "no BUY of the run's");
     }
 }

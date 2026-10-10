@@ -7,7 +7,10 @@
 //! **Lanes (BX7, M3).** Each armed futures product has its own LANE — its
 //! WS API order sessions (or its REST order route), its user stream and
 //! listenKey, its REST jobs connection and queue, its margin state —
-//! USDⓈ-M's on fapi, COIN-M's on dapi. Everything else is ONE: the
+//! USDⓈ-M's on fapi, COIN-M's on dapi — and so does spot (BX8): its WS API
+//! sessions carry the user data too (each logs on, then subscribes; only
+//! the subscription makes it live), its REST jobs are `api/v3`'s, it has
+//! no listenKey, no margin, no dead-man and no maker. Everything else is ONE: the
 //! open-order table and the rows, the held queue and fill lane 4, the
 //! journal and the stats block, the signer, the clock (Binance's one
 //! server time, measured on the first lane), the desk (ids and deadlines)
@@ -176,9 +179,20 @@
 //!
 //! Built for **USDⓈ-M × classic** (the only maker product, BX-17 after
 //! §13.5), **COIN-M × classic** (BX7: IoC-only, O-BX3a — no dead-man of
-//! ours there, so no maker, cancel or modify is built for it), and **both ×
-//! Portfolio Margin and × PM Pro** (BX7: IoC-only); the other products
-//! arrive with BX8–BX10.
+//! ours there, so no maker, cancel or modify is built for it), **both ×
+//! Portfolio Margin and × PM Pro** (BX7: IoC-only), and **spot × classic**
+//! (BX8: IoC-only — spot has no dead-man, so no maker, cancel or modify is
+//! built for it; its balances are reconciled at the venue's 8 decimals,
+//! every armed row's permission groups judged at every account read); the
+//! other products arrive with BX9–BX10.
+//!
+//! **Spot's balance law (BX8).** A spot row's position IS its base asset's
+//! balance, and a BUY's commission is charged in that asset: each spot row
+//! keeps the balance its bookings explain, ×1e8 — the adopted balance, ±
+//! every fill, − every commission charged in the asset (BNB's on any row,
+//! when BNB is an armed base) — and the reconciliation compares it, never
+//! the gross position the router books. One armed row per base asset, and
+//! no armed base another row's quote: the asset is the row's.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -206,22 +220,25 @@ use crate::cmd::*;
 use crate::config::{BnConfig, Scope, Signer, Signing};
 use crate::dns::{Resolver, DNS_HOSTS};
 use crate::gov::{classify, request_weight, CodeClass, Weighed, ACCOUNT_REREAD_MS, ARM_WEIGHT_MAX_PER_MIN, QTR_ICR_NS, WEIGHT_THROTTLE_PCT};
-use crate::inst::{WireTable, INST_DATED, INST_INVERSE, INST_LIVE, INST_NO_DEADMAN, INST_OWNED, PRODUCT_COINM, PRODUCT_USDM, ROW_NONE};
+use crate::inst::{
+    AssetName, WireTable, INST_DATED, INST_INVERSE, INST_LIVE, INST_NO_DEADMAN, INST_OWNED, PRODUCT_COINM, PRODUCT_SPOT, PRODUCT_USDM, ROW_NONE,
+};
 use crate::journal::{
     fee_asset, fee_code, fee_notional_1e9, JournalTx, FEE_ASSET_NONE, JOURNAL_RING, J_ACK, J_ANCHOR, J_ENDED, J_FEE, J_FILL, J_FILL_ADOPTED,
     J_FILL_LOST, J_FILL_UNSEEN, J_MARGIN, J_RECON, J_REJECT, J_SWEEP, J_VENUE, TRADE_BY_ADL, TRADE_BY_LIQUIDATION, TRADE_BY_MEMBER,
     TRADE_BY_ORPHAN, TRADE_BY_SETTLEMENT,
 };
 use crate::margin::um_ratio_1e6;
-use crate::mode::{judge_key, judge_mode, judge_one_way, judge_single_asset, judge_symbol_config, AccountMode, AssertErr};
+use crate::mode::{judge_key, judge_mode, judge_one_way, judge_permission, judge_single_asset, judge_symbol_config, AccountMode, AssertErr};
 use crate::oot::{
     EndedRing, Oot, OotErr, TidRing, OF_CANCEL_SENT, OF_FILLED_ANY, OF_LISTED, OF_MODIFY_SENT, OF_STATUS_BOOKED, OF_TIMED,
     OF_TTL, OOT_CAP, OWE_MEMBER, OWE_TTL, OWE_UNKNOWN, ST_IN_DOUBT, ST_LIVE, ST_SENT,
 };
 use crate::recon::{
-    day_increasing_1e6, judge_positions, scan_cm_account, scan_pm_account, scan_positions, scan_um_account, Leg, PosRow, Verdict,
-    MARGIN_ISOLATED, PM_LOCKED, PM_MARGIN_CALL, TRADES_PAGE,
+    day_buys_1e6, day_increasing_1e6, judge_positions, scan_cm_account, scan_pm_account, scan_positions, scan_spot_account, scan_um_account, Leg, PosRow,
+    Verdict, MARGIN_ISOLATED, PM_LOCKED, PM_MARGIN_CALL, SPOT_ASSETS_MAX, TRADES_PAGE,
 };
+use ingress_binance::discovery::BnPermissions;
 use crate::rest::*;
 use crate::userstream::*;
 use crate::wsapi::*;
@@ -240,10 +257,10 @@ const TK_RISK: usize = 5;
 /// The boot-only SAPI connection (outside every lane's tokens).
 const TOKEN_SAPI: Token = Token(LANE_TOKENS - 1);
 const _: () = assert!(TK_ORD < LANE_TOKENS - 1 && TK_RISK < LANE_TOKENS - 1);
-/// The futures lanes one gateway serves (BX7, M3: USDⓈ-M and COIN-M).
-pub const LANES: usize = 2;
+/// The lanes one gateway serves (BX7, M3: USDⓈ-M and COIN-M; BX8: spot).
+pub const LANES: usize = 3;
 /// The lanes' order, by product.
-const LANE_ORDER: [u8; LANES] = [PRODUCT_USDM, PRODUCT_COINM];
+const LANE_ORDER: [u8; LANES] = [PRODUCT_USDM, PRODUCT_COINM, PRODUCT_SPOT];
 
 /// Every WS connection's buffers and clocks.
 const WS_CFG: WsCfg = WsCfg {
@@ -370,6 +387,10 @@ pub const CODE_MARGIN_TYPE: i32 = 9_013;
 /// A place or modify the REST order route still held, unsent, when a sweep
 /// began: retired, never sent (BX7) — a place refused, a modify aborted.
 pub const CODE_SWEPT: i32 = 9_014;
+/// The spot account can no longer trade an armed row mid-session — a
+/// permission group the row needs is gone (the bStock check), or the
+/// account answers `canTrade: false` (BX8, BX-19): a `VenueLock`.
+pub const CODE_PERMISSION: i32 = 9_015;
 /// How long the gateway sends nothing after a budget or lock answer (the
 /// production [`GwKnobs::quiet_ns`]): no order, no cancel, no heartbeat
 /// (the dead-man then cancels the makers), no REST, no reconnect.
@@ -471,14 +492,26 @@ pub enum BootErr {
     /// An HMAC key on the WS API route: HMAC signs REST only (R22; the WS
     /// API's `session.logon` takes Ed25519 keys only).
     Signing,
-    /// A bound row of a product no futures lane serves (`PRODUCT_*`; BX7,
-    /// M3: USDⓈ-M and COIN-M only).
+    /// A bound row of a product no lane serves in the account's mode
+    /// (`PRODUCT_*`; BX7, M3: USDⓈ-M and COIN-M; BX8: spot, classic only).
     Product(u8),
     /// The venue holds positions on owned rows whose exposure in all (USD
     /// ×1e6; `i64::MAX` when one cannot be priced) does not fit the owner
     /// slot's instance cap — or more than lane 4 and the held queue can
     /// take at boot: nothing is adopted (BX7).
     Inventory(i64),
+    /// Spot on the REST order route or with an HMAC key (BX8): spot's user
+    /// data exists only on a WS API session, whose logon takes Ed25519
+    /// keys only.
+    SpotRoute,
+    /// A spot row (its index) whose base asset another armed spot row
+    /// shares, or names as its quote — or past [`SPOT_ASSETS_MAX`] rows
+    /// (BX8: the reconciled asset is the row's).
+    SpotAsset(u16),
+    /// An order of ours — a ghost, or another epoch's — rests on a spot
+    /// row (its index) at boot: no spot cancel is built (BX-17), so the
+    /// operator cancels it in the app (BX8).
+    SpotStray(u16),
 }
 
 /// Where the gateway is.
@@ -527,6 +560,13 @@ enum JobKind {
     /// An owned USDⓈ-M row's margin type and leverage
     /// (`/fapi/v1/symbolConfig`; BX7, BX-19): boot only.
     SymbolConfig = 13,
+    /// A spot row's price (`/api/v3/ticker/price`; BX8): a balance the
+    /// boot adopts is valued at it — boot only.
+    Price = 14,
+    /// A spot order's trades (`/api/v3/myTrades?orderId=`; BX8): read after
+    /// a fill of it was booked without its report, for the commissions
+    /// nothing else carries.
+    OrderTrades = 15,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -536,7 +576,30 @@ struct Job {
     /// The lane whose REST connection carries it.
     lane: u8,
     sent_ns: u64,
+    /// [`JobKind::OrderTrades`]: the venue's order id; 0 otherwise.
+    oid: u64,
+    /// [`JobKind::OrderTrades`]: the tries so far (a failed read is asked
+    /// again, up to [`ORDER_TRADES_TRIES`]).
+    tries: u8,
+    /// [`JobKind::OrderTrades`]: the order's executed quantity ×1e6 — its
+    /// trades in the answer must sum to it, or the read is asked again (the
+    /// venue's trade list may lag its match: the risk review's R2-3); 0
+    /// otherwise.
+    qty_1e6: i64,
+    /// [`JobKind::OrderTrades`] asked again: not before this time — the
+    /// venue's list may lag its match longer than a round trip (the e2e
+    /// review); 0 otherwise.
+    not_before_ns: u64,
 }
+
+/// The tries a spot order's trades get (BX8): a commission unread after
+/// them stays unpaid — drift, fail closed.
+const ORDER_TRADES_TRIES: u8 = 3;
+
+/// The pause before a spot order's trades are asked again, × the tries so
+/// far (BX8): 1 s, then 2 s — a lagging list gets three seconds, its rows'
+/// legs held meanwhile.
+const ORDER_TRADES_BACKOFF_NS: u64 = 1_000_000_000;
 
 /// The positions one account read may list (BX7). Portfolio Margin's
 /// `GET /papi/v2/um/account` and dapi's account list EVERY symbol of their
@@ -545,10 +608,12 @@ struct Job {
 const POS_CAP: usize = 2_048;
 
 /// REST jobs queued at once. Each row queues at most one countdown, one
-/// day read and one REST cancel-all at a time, so the queue can hold every
-/// job there can be — a full queue is counted ([`crate::arm::GW_JOBS_DROPPED`])
-/// and cannot occur. A row's symbol-config read (BX7) is the Assert
-/// phase's alone, answered before any of those can be queued.
+/// day read and one REST cancel-all at a time — and a row's symbol-config
+/// read (BX7) is the Assert phase's alone, answered before any of those —
+/// so the queue holds every such job there can be. Spot's order's-trades
+/// reads (BX8) are one per fill booked without its report: a burst of
+/// them past the room is counted ([`crate::arm::GW_JOBS_DROPPED`]) and
+/// their commissions read as drift (fail closed).
 const JOB_CAP: usize = 1_024;
 const _: () = assert!(JOB_CAP >= 3 * crate::inst::INST_MAX + 16);
 
@@ -601,6 +666,15 @@ impl<T: Copy, const N: usize> Fifo<T, N> {
             None
         } else {
             self.buf[self.head % N].as_ref()
+        }
+    }
+    /// The `k`-th queued from the front (a cold walk).
+    #[inline(always)]
+    fn get(&self, k: usize) -> Option<&T> {
+        if k < self.len() {
+            self.buf[(self.head + k) % N].as_ref()
+        } else {
+            None
         }
     }
     #[inline(always)]
@@ -665,6 +739,11 @@ struct RowGw {
     /// read listing it twice fails; a COIN-M read not listing an owned row
     /// is judged.
     listed: u32,
+    /// Spot (BX8): the base asset's balance the row's bookings explain,
+    /// ×1e8 (the module docs' balance law).
+    spot_1e8: i64,
+    /// Spot: the row's index in the armed assets (`u8::MAX`: not spot).
+    spot_k: u8,
 }
 
 /// One WS API request in flight: the in-flight table's record, in place.
@@ -717,7 +796,7 @@ struct RestRoute {
 /// lane 4, the journal, the stats block, the signer, the clock, the desk
 /// and the weight window (one IP pool).
 struct Lane {
-    /// `PRODUCT_USDM` or `PRODUCT_COINM`.
+    /// `PRODUCT_USDM`, `PRODUCT_COINM` or `PRODUCT_SPOT`.
     product: u8,
     /// Its hosts' indices in the resolver (BX7, DNS): the WS API's, the
     /// stream host's (the user stream and PM Pro's risk stream), the REST
@@ -732,8 +811,9 @@ struct Lane {
     unified: bool,
     /// PM Pro's risk stream, on the USDⓈ-M lane (BX7, C3).
     risk: Option<RiskStream>,
-    /// The lane holds a user stream (classic: every lane; Portfolio Margin:
-    /// the first — the account has ONE, its events naming their product).
+    /// The lane holds a user stream (classic futures: every lane; Portfolio
+    /// Margin: the first — the account has ONE, its events naming their
+    /// product; spot: none — its user data rides the order sessions).
     has_us: bool,
     /// The stream's path before the key: `/ws/`, or PM's `/pm/ws/`.
     us_prefix: &'static [u8],
@@ -835,12 +915,16 @@ const fn job_weight(k: JobKind, product: u8) -> Weighed {
         JobKind::Countdown | JobKind::Probe => Weighed::Countdown,
         JobKind::OpenOrders => Weighed::OpenOrders,
         JobKind::UserTrades if product == PRODUCT_COINM => Weighed::UserTradesCm,
-        JobKind::UserTrades => Weighed::UserTrades,
+        JobKind::UserTrades | JobKind::OrderTrades => Weighed::UserTrades,
         JobKind::PmAccount => Weighed::PmAccount,
         JobKind::SymbolConfig => Weighed::SymbolConfig,
-        JobKind::Time | JobKind::Restrictions | JobKind::Portfolio | JobKind::ListenNew | JobKind::ListenKeep | JobKind::CancelAll => {
-            Weighed::One
-        }
+        JobKind::Time
+        | JobKind::Restrictions
+        | JobKind::Portfolio
+        | JobKind::ListenNew
+        | JobKind::ListenKeep
+        | JobKind::CancelAll
+        | JobKind::Price => Weighed::One,
     }
 }
 
@@ -1086,6 +1170,17 @@ pub struct BnGateway<const FILL_N: usize, const J_N: usize = JOURNAL_RING> {
     last_sweep: (i64, i64, u8),
     /// The last reconciliation's verdict.
     last_verdict: Verdict,
+    /// Spot (BX8): the armed base assets (one per spot row, `n_spot` of
+    /// them), each one's row, and the last account read's balances ×1e8 —
+    /// boxed, built where they live (the gateway's move carries pointers).
+    spot_assets: Box<[AssetName; SPOT_ASSETS_MAX]>,
+    spot_rows: Box<[u16; SPOT_ASSETS_MAX]>,
+    n_spot: usize,
+    spot_bal_1e8: Box<[i64; SPOT_ASSETS_MAX]>,
+    /// The spot account's `permissions`, as last read.
+    acct_perm: BnPermissions,
+    /// A permission lock was raised this process (once: [`CODE_PERMISSION`]).
+    perm_locked: bool,
 }
 
 impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
@@ -1119,21 +1214,56 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             return Err(BootErr::Assert(AssertErr::Mode));
         }
         let key_header = [(KEY_HEADER, cfg.api_key())];
-        // The lanes: one per futures product the wire table binds, USDⓈ-M
-        // first (BX7, M3); a row-less arm keeps USDⓈ-M's. A row of any
-        // other product refuses the boot.
+        // The lanes: one per product the wire table binds, USDⓈ-M first,
+        // spot last (BX7, M3; BX8); a row-less arm keeps USDⓈ-M's. A row of
+        // any other product refuses the boot — and spot outside classic.
+        // Spot's armed base assets (BX8): one row each, none another row's
+        // quote (the module docs' balance law).
         let mut want = [false; crate::inst::PRODUCTS];
+        let mut spot_assets: Box<[AssetName; SPOT_ASSETS_MAX]> = exec_gateway::boxed_array(AssetName::EMPTY);
+        let mut spot_rows: Box<[u16; SPOT_ASSETS_MAX]> = exec_gateway::boxed_array(ROW_NONE);
+        let mut n_spot = 0usize;
         let mut i = 0;
         while i < wire.len() {
             let p = wire.row(i as u16).product;
-            if p != PRODUCT_USDM && p != PRODUCT_COINM {
+            let spot = p == PRODUCT_SPOT;
+            if (p != PRODUCT_USDM && p != PRODUCT_COINM && !spot) || (spot && (pm || pm_pro)) {
                 return Err(BootErr::Product(p));
+            }
+            if spot {
+                if n_spot == SPOT_ASSETS_MAX {
+                    return Err(BootErr::SpotAsset(i as u16));
+                }
+                // COPY: the row's base-asset name (17 B), boot only, once per
+                // spot row, into the boxed array the gateway keeps (never
+                // moved again) — the per-event `spot_row_of` and the account
+                // scan read one contiguous array — rejected: walking the
+                // wire table's spot rows per event (a stride of 112 B).
+                spot_assets[n_spot] = wire.spot(i as u16).base;
+                spot_rows[n_spot] = i as u16;
+                n_spot += 1;
             }
             want[p as usize] = true;
             i += 1;
         }
-        if !want[PRODUCT_COINM as usize] {
+        let mut a = 0;
+        while a < n_spot {
+            let mut b = 0;
+            while b < n_spot {
+                if (a != b && spot_assets[a] == spot_assets[b]) || wire.spot(spot_rows[b]).quote == spot_assets[a] {
+                    return Err(BootErr::SpotAsset(spot_rows[a]));
+                }
+                b += 1;
+            }
+            a += 1;
+        }
+        if !want[PRODUCT_USDM as usize] && !want[PRODUCT_COINM as usize] && !want[PRODUCT_SPOT as usize] {
             want[PRODUCT_USDM as usize] = true;
+        }
+        // BX8: spot's user data exists only on a WS API session, whose
+        // logon takes Ed25519 keys only.
+        if want[PRODUCT_SPOT as usize] && (knobs.rest_orders || signer.signing() == Signing::Hmac) {
+            return Err(BootErr::SpotRoute);
         }
         let now = core_time::now_ns();
         let st = WsStatic::new(&knobs.stp_mode, knobs.recv_window_ms);
@@ -1168,6 +1298,18 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         let poll = Poll::new().map_err(|_| BootErr::Transport)?;
         let n = wire.len();
         let mut legs = vec![Leg::default(); n];
+        let mut rows = vec![
+            RowGw {
+                spot_k: u8::MAX,
+                ..RowGw::default()
+            };
+            n
+        ];
+        let mut k = 0;
+        while k < n_spot {
+            rows[spot_rows[k] as usize].spot_k = k as u8;
+            k += 1;
+        }
         let mut cd_probe_row = ROW_NONE;
         let mut i = 0;
         while i < n {
@@ -1226,7 +1368,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             anchor_1e6: knobs.pnl_anchor_1e6,
             knobs,
             phase: Phase::Clock,
-            rows: vec![RowGw::default(); n],
+            rows,
             legs,
             sapi_job: None,
             held: Fifo::new(),
@@ -1276,15 +1418,23 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             sweep_streak: 0,
             last_sweep: (0, 0, 0),
             last_verdict: Verdict::default(),
+            spot_assets,
+            spot_rows,
+            n_spot,
+            spot_bal_1e8: exec_gateway::boxed_array(0),
+            acct_perm: BnPermissions::EMPTY,
+            perm_locked: false,
         })
     }
 
-    /// **One futures lane's connections** (boot only): its WS API pair, its
-    /// user stream and its REST jobs connection — and its REST order route
-    /// when `order_transport = "rest"` — on the product's hosts and paths.
-    /// A Portfolio Margin lane (`pm`, BX7 C2) is papi's: the REST route
+    /// **One lane's connections** (boot only): its WS API pair, its user
+    /// stream and its REST jobs connection — and its REST order route when
+    /// `order_transport = "rest"` — on the product's hosts and paths. A
+    /// Portfolio Margin lane (`pm`, BX7 C2) is papi's: the REST route
     /// always (papi has no WS API: the pair is never dialled), the
-    /// account's ONE stream on the first lane (`/pm/ws/`).
+    /// account's ONE stream on the first lane (`/pm/ws/`). Spot's (BX8)
+    /// holds no stream: its sessions carry the user data (the stream socket
+    /// is built, never dialled).
     #[allow(clippy::too_many_arguments)]
     fn build_lane(
         product: u8,
@@ -1310,7 +1460,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         let us_path = if pm { "/pm/ws/pending" } else { "/ws/pending" };
         let us = WsConn::new(h.user, port, us_path, tls.clone(), WS_CFG, lane_token(l, TK_US), 0x6273_7573 ^ seed)
             .map_err(|_| BootErr::Transport)?;
-        let rest = HttpsConn::new(h.rest, port, tls.clone(), &fut_specs(product, pm, key_header), CONN_CFG, lane_token(l, TK_REST))
+        let rest = HttpsConn::new(h.rest, port, tls.clone(), &lane_specs(product, pm, key_header), CONN_CFG, lane_token(l, TK_REST))
             .map_err(|_| BootErr::Transport)?;
         let rest_route = knobs.rest_orders || pm;
         let route = if rest_route {
@@ -1345,7 +1495,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             pm,
             unified: pm || pm_pro,
             risk,
-            has_us: !pm || l == 0,
+            has_us: product != PRODUCT_SPOT && (!pm || l == 0),
             us_prefix: if pm { b"/pm/ws/" } else { b"/ws/" },
             st: if pm && product == PRODUCT_COINM { st.without_stp() } else { st },
             ws: [ws0, ws1],
@@ -1722,7 +1872,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             let _ = self.desk.take(id);
             return Err(CODE_RENDER);
         }
-        self.weigh(verb_weight(req.verb), now);
+        self.weigh(l, verb_weight(req.verb), now);
         if matches!(req.verb, REQ_PLACE | REQ_CANCEL | REQ_MODIFY) {
             self.stats.note_action_sent();
         }
@@ -1809,7 +1959,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                         rt.queue.advance();
                         rt.wire = Some(RestReq { req: r, sent_ns: now });
                     }
-                    self.weigh(verb_weight(r.verb), now);
+                    self.weigh(l, verb_weight(r.verb), now);
                     if matches!(r.verb, REQ_PLACE | REQ_CANCEL | REQ_MODIFY) {
                         self.stats.note_action_sent();
                     }
@@ -1998,10 +2148,14 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         frame_of(&self.lanes, f)
     }
 
-    /// Spend `w`'s weight from the IP's pool (BX7: the run-time governor).
+    /// Count lane `l`'s request of weight `w` in the IP's one-minute window
+    /// (BX7: the run-time governor) — never a spot lane's: spot's
+    /// REQUEST_WEIGHT is its own pool (BX8, `gov::arm_weight_per_min`).
     #[inline]
-    fn weigh(&mut self, w: Weighed, now: u64) {
-        self.weight.add(now, request_weight(w));
+    fn weigh(&mut self, l: usize, w: Weighed, now: u64) {
+        if self.lanes[l].product != PRODUCT_SPOT {
+            self.weight.add(now, request_weight(w));
+        }
     }
 
     /// The weight spent reached [`WEIGHT_THROTTLE_PCT`] of the arm's
@@ -2445,7 +2599,10 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                     return;
                 };
                 if let Ok(id) = self.desk.issue(&self.stats, WsReq::on(REQ_LOGON, IX_NONE, 0, 0), sess(l, s), now) {
-                    self.weight.add(now, request_weight(Weighed::Logon));
+                    // Field by field (the signer is lent): `weigh`'s law.
+                    if self.lanes[l].product != PRODUCT_SPOT {
+                        self.weight.add(now, request_weight(Weighed::Logon));
+                    }
                     let key = self.api_key.as_bytes();
                     if queue_logon(&mut self.lanes[l].ws[s], id, key, self.clock.venue_ms(now), ed).is_err() {
                         let _ = self.desk.take(id);
@@ -2469,10 +2626,59 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             let mut a = WsAnswer::default();
             let scanned = scan_answer(self.lanes[l].ws[s].payload(span), &mut a);
             match scanned {
+                Ok(()) if a.user => self.spot_event(l, s, span, a.event.at as usize, now),
                 Ok(()) => self.on_answer(l, s, &a, span, now),
                 Err(e) => self.scan_failed(SCAN_WSAPI, e, now),
             }
         }
+    }
+
+    /// **A spot user event** (BX8): the `event` object at `at` in session
+    /// `(l, s)`'s frame — read in place ([`scan_spot_event`]), its row, id
+    /// and commission resolved while the frame is borrowed, then booked as
+    /// a futures update is. On a futures session it is no shape of theirs
+    /// (a scan failure); the subscription's end drops the session.
+    fn spot_event(&mut self, l: usize, s: usize, span: core_net::PayloadSpan, at: usize, now: u64) {
+        if self.lanes[l].product != PRODUCT_SPOT {
+            return self.scan_failed(SCAN_USER, ScanErr::Malformed, now);
+        }
+        let mut ev = UserEvent::default();
+        let resolved = {
+            let frame = self.lanes[l].ws[s].payload(span);
+            match scan_spot_event(frame, at, &mut ev) {
+                Err(e) => Err(e),
+                Ok(()) if ev.kind != UE_ORDER => Ok((ROW_NONE, CidClass::Foreign, FEE_ASSET_NONE, ROW_NONE)),
+                Ok(()) => {
+                    let row = self.wire.find(PRODUCT_SPOT, ev.symbol.get(frame));
+                    // BX-8 on spot: no liquidation, ADL or settlement exists
+                    // there — an id spelling one is someone else's order.
+                    let class = match self.prefix.classify(ev.cid.get(frame)) {
+                        CidClass::Liquidation | CidClass::Adl | CidClass::Settlement => CidClass::Foreign,
+                        c => c,
+                    };
+                    let asset = if row == ROW_NONE { FEE_ASSET_NONE } else { fee_asset(self.wire.row(row), ev.fee_asset.get(frame)) };
+                    Ok((row, class, asset, self.spot_row_of(ev.fee_asset.get(frame))))
+                }
+            }
+        };
+        match resolved {
+            Err(e) => self.scan_failed(SCAN_USER, e, now),
+            Ok(_) if ev.kind == UE_STREAM_END => self.ws_failed(l, s, now),
+            Ok((row, class, asset, fee_row)) => self.on_user_event(l, &ev, row, class, asset, fee_row, now),
+        }
+    }
+
+    /// The armed spot row whose base asset is `asset` (BX8), or
+    /// [`ROW_NONE`].
+    fn spot_row_of(&self, asset: &[u8]) -> u16 {
+        let mut k = 0;
+        while k < self.n_spot {
+            if self.spot_assets[k].get() == asset {
+                return self.spot_rows[k];
+            }
+            k += 1;
+        }
+        ROW_NONE
     }
 
     fn on_us_progress(&mut self, l: usize, p: WsProgress, now: u64) {
@@ -2555,7 +2761,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                     } else {
                         FEE_ASSET_NONE
                     };
-                    self.on_user_event(l, &ev, row, class, asset, now);
+                    self.on_user_event(l, &ev, row, class, asset, ROW_NONE, now);
                 }
                 Err(e) => self.scan_failed(SCAN_USER, e, now),
             }
@@ -2665,6 +2871,26 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         self.lanes[l].ord_down_ns = 0;
         if recovery && self.phase == Phase::Ready {
             self.doubt_lane(l);
+            // BX8: spot's user data rode the lost session — what the venue
+            // sent meanwhile is gone (Binance does not replay): the books
+            // are checked now, as a reopened futures stream's are (B2).
+            if self.lanes[l].product == PRODUCT_SPOT {
+                self.recon_next_ns = now;
+            }
+        }
+    }
+
+    /// **Spot's subscription** (BX8): a session logged on asks for the
+    /// account's user data on itself; only its 200 makes the session live
+    /// — a session that could place but not see its fills never is. A
+    /// subscription that cannot be asked drops the session.
+    fn subscribe(&mut self, l: usize, s: usize, now: u64) {
+        let Ok(id) = self.desk.issue(&self.stats, WsReq::on(REQ_SUBSCRIBE, IX_NONE, 0, 0), sess(l, s), now) else {
+            return self.ws_failed(l, s, now);
+        };
+        if queue_subscribe(&mut self.lanes[l].ws[s], id).is_err() {
+            let _ = self.desk.take(id);
+            self.ws_failed(l, s, now);
         }
     }
 
@@ -2817,7 +3043,19 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         match r.verb {
             REQ_LOGON => {
                 if let Frame::Ws(l, s, _) = fr {
-                    if a.status == 200 {
+                    if a.status != 200 {
+                        self.ws_failed(l, s, now);
+                    } else if self.lanes[l].product == PRODUCT_SPOT {
+                        self.subscribe(l, s, now);
+                    } else {
+                        self.went_live(l, s, now);
+                    }
+                }
+            }
+            // Spot (BX8): the subscription makes the session live.
+            REQ_SUBSCRIBE => {
+                if let Frame::Ws(l, s, _) = fr {
+                    if a.status == 200 && scan_subscribed(self.frame(fr), a.result) {
                         self.went_live(l, s, now);
                     } else {
                         self.ws_failed(l, s, now);
@@ -3064,6 +3302,10 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             let ts = self.fill_ts_ns(0, now);
             if self.book_fill(Some(ix), None, row, slot, side, px, missing, J_FILL_UNSEEN, 0, ts, now, cur) {
                 self.oot.get_mut(ix).flags |= OF_STATUS_BOOKED;
+                // BX8: no report carried these trades' commissions.
+                if self.rows[row as usize].spot_k != u8::MAX {
+                    self.queue_order_trades(row, a.venue_oid, a.executed_1e6);
+                }
             }
         }
         match a.order_status {
@@ -3074,6 +3316,9 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 self.live_again(ix, now);
             }
             S_FILLED => self.end_order(ix, EVT_RETIRED, RETIRED_FILLED, 0, now),
+            // A status naming the order refused (BX8, the risk review):
+            // ended — queried again it would be forever.
+            S_REJECTED => self.end_order(ix, EVT_REJECT, RETIRED_REJECTED, 0, now),
             S_CANCELED => {
                 let why = self.cancel_why(ix);
                 self.end_order(ix, EVT_RETIRED, why, 0, now)
@@ -3134,9 +3379,12 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
     // The user stream: fills and states
     // ---------------------------------------------------------------------
 
-    fn on_user_event(&mut self, l: usize, ev: &UserEvent, row: u16, class: CidClass, asset: u8, now: u64) {
+    /// `fee_row`: the armed spot row whose base asset the commission is
+    /// charged in (BX8), else [`ROW_NONE`].
+    #[allow(clippy::too_many_arguments)]
+    fn on_user_event(&mut self, l: usize, ev: &UserEvent, row: u16, class: CidClass, asset: u8, fee_row: u16, now: u64) {
         match ev.kind {
-            UE_ORDER | UE_TRADE_LITE => self.on_order_event(ev, row, class, asset, now),
+            UE_ORDER | UE_TRADE_LITE => self.on_order_event(ev, row, class, asset, fee_row, now),
             UE_MARGIN_CALL => {
                 let mut e = BnEvt::new(EVT_MARGIN, now);
                 e.product = self.lanes[l].product;
@@ -3290,7 +3538,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         }
     }
 
-    fn on_order_event(&mut self, ev: &UserEvent, row: u16, class: CidClass, asset: u8, now: u64) {
+    fn on_order_event(&mut self, ev: &UserEvent, row: u16, class: CidClass, asset: u8, fee_row: u16, now: u64) {
         let trade = ev.exec == X_TRADE || ev.exec == X_CALCULATED;
         if row == ROW_NONE {
             if trade {
@@ -3324,7 +3572,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 return;
             }
         };
-        self.book_event(ev, ix, ended, row, slot, order_id, by, asset, now);
+        self.book_event(ev, ix, ended, row, slot, order_id, by, asset, fee_row, now);
         if ev.kind != UE_ORDER {
             return;
         }
@@ -3356,6 +3604,9 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 self.live_again(ix, now);
             }
             S_FILLED => self.end_order(ix, EVT_RETIRED, RETIRED_FILLED, 0, now),
+            // The venue's own refusal, reported (BX8, the risk review):
+            // ended, never asked about again.
+            S_REJECTED => self.end_order(ix, EVT_REJECT, RETIRED_REJECTED, 0, now),
             S_CANCELED => {
                 let why = self.cancel_why(ix);
                 self.end_order(ix, EVT_RETIRED, why, 0, now);
@@ -3385,9 +3636,23 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
     /// updates (`OF_STATUS_BOOKED`). BX11: a trade's commission — the
     /// update's alone — is journaled once ([`J_FEE`]), whichever report
     /// booked it; `by` says whose order traded (`TRADE_BY_*`), `asset` the
-    /// commission's asset to the row (`FEE_ASSET_*`).
+    /// commission's asset to the row (`FEE_ASSET_*`). BX8: a commission
+    /// charged in an armed spot asset (`fee_row`) is paid, once, out of
+    /// that row's explained balance (the module docs' balance law).
     #[allow(clippy::too_many_arguments)]
-    fn book_event(&mut self, ev: &UserEvent, ix: Option<u16>, ended: Option<usize>, row: u16, slot: u8, order_id: u64, by: u8, asset: u8, now: u64) {
+    fn book_event(
+        &mut self,
+        ev: &UserEvent,
+        ix: Option<u16>,
+        ended: Option<usize>,
+        row: u16,
+        slot: u8,
+        order_id: u64,
+        by: u8,
+        asset: u8,
+        fee_row: u16,
+        now: u64,
+    ) {
         let (settle, ours) = (by == TRADE_BY_SETTLEMENT, by == TRADE_BY_MEMBER);
         let update = ev.kind == UE_ORDER;
         let known = ix.is_some() || ended.is_some();
@@ -3429,6 +3694,10 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 let w = self.wire.row(row);
                 let (code, notional) = (fee_code(ev.maker != 0, asset, by, w), fee_notional_1e9(w, ev.last_px_1e6, ev.last_qty_1e6));
                 self.note(J_FEE, now, order_id, ev.venue_oid, ev.last_px_1e6, notional, ev.commission_1e9, code, row, slot);
+                if let Some(r) = self.rows.get_mut(fee_row as usize) {
+                    // ×1e9 → ×1e8: the venue charges 8 decimals.
+                    r.spot_1e8 = r.spot_1e8.saturating_sub(ev.commission_1e9 / 10);
+                }
             }
         }
         if !(update && known) {
@@ -3459,6 +3728,10 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 (Some(i), _) => self.oot.get_mut(i).flags |= OF_STATUS_BOOKED,
                 (None, Some(k)) => self.ended.set_status_booked(k),
                 (None, None) => {}
+            }
+            // BX8: no report carried the lost trades' commissions.
+            if self.rows[row as usize].spot_k != u8::MAX {
+                self.queue_order_trades(row, ev.venue_oid, ev.cum_qty_1e6);
             }
         }
     }
@@ -3525,6 +3798,12 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         } else {
             before.saturating_sub(qty)
         };
+        if r.spot_k != u8::MAX {
+            // BX8: a spot fill moves its base asset's explained balance
+            // (×1e8; the quantity is on the step, so exact).
+            let d = qty.saturating_mul(100);
+            r.spot_1e8 = if s == Side::Bid { r.spot_1e8.saturating_add(d) } else { r.spot_1e8.saturating_sub(d) };
+        }
         if px > 0 {
             r.last_px_1e6 = px;
         }
@@ -3547,11 +3826,51 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
     /// silent to the caller (each row queues at most one job of each kind,
     /// so it cannot happen: [`JOB_CAP`]).
     fn queue_job(&mut self, l: usize, kind: JobKind, row: u16) -> bool {
-        if self.lanes[l].jobs.push(Job { kind, row, lane: l as u8, sent_ns: 0 }) {
+        if self.lanes[l].jobs.push(Job { kind, row, lane: l as u8, sent_ns: 0, oid: 0, tries: 0, qty_1e6: 0, not_before_ns: 0 }) {
             return true;
         }
         self.t[crate::arm::GW_JOBS_DROPPED] += 1;
         false
+    }
+
+    /// **Ask for a spot order's trades** (BX8): a fill of venue order
+    /// `venue_oid` on spot row `row` was booked without its report — its
+    /// commission is owed to the explained balance ([`JobKind::OrderTrades`]);
+    /// the order has executed `executed_1e6` in all. A full queue is
+    /// counted; the commission then reads as drift (fail closed).
+    fn queue_order_trades(&mut self, row: u16, venue_oid: u64, executed_1e6: i64) {
+        let l = self.lane_of_row(row);
+        let j = Job { kind: JobKind::OrderTrades, row, lane: l as u8, sent_ns: 0, oid: venue_oid, tries: 0, qty_1e6: executed_1e6, not_before_ns: 0 };
+        if venue_oid == 0 || !self.lanes[l].jobs.push(j) {
+            self.t[crate::arm::GW_JOBS_DROPPED] += 1;
+        }
+    }
+
+    /// A spot order's trades went unread, or read short: asked again
+    /// behind the queue after [`ORDER_TRADES_BACKOFF_NS`] × the tries, up to
+    /// [`ORDER_TRADES_TRIES`] (the risk review) — then counted, the
+    /// commission left unpaid (drift, fail closed).
+    fn retry_order_trades(&mut self, j: Job, now: u64) {
+        let tries = j.tries.saturating_add(1);
+        let again = Job {
+            tries,
+            sent_ns: 0,
+            not_before_ns: now.saturating_add(ORDER_TRADES_BACKOFF_NS * u64::from(tries)),
+            ..j
+        };
+        if again.tries >= ORDER_TRADES_TRIES || !self.lanes[j.lane as usize].jobs.push(again) {
+            self.t[crate::arm::GW_JOBS_DROPPED] += 1;
+            self.order_trades_done(now);
+        }
+    }
+
+    /// A spot order's trades read left the queue for good (paid, or given
+    /// up): its row's leg is held no more ([`Self::hold_owed_legs`]), so the
+    /// next cycle is asked for now — a held cycle's pause lasts one round
+    /// trip, not a cadence (the risk review's R2-1).
+    #[inline]
+    fn order_trades_done(&mut self, now: u64) {
+        self.recon_next_ns = now;
     }
 
     /// A job left the queue for good (answered, failed or dropped): its
@@ -3596,7 +3915,14 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             if let Some(j) = self.lanes[l].jobs.front() {
                 if !self.is_sapi(j.kind) {
                     self.lanes[l].jobs.pop();
-                    self.start_rest(l, j, now, false);
+                    if now < j.not_before_ns {
+                        // A spot order's trades asked again after a pause
+                        // (BX8): behind the queue until its time — the jobs
+                        // behind it go first (just popped: there is room).
+                        let _ = self.lanes[l].jobs.push(j);
+                    } else {
+                        self.start_rest(l, j, now, false);
+                    }
                 }
             }
         }
@@ -3626,10 +3952,18 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             // PM's unified account is papi's; PM Pro's, SAPI's.
             JobKind::PmAccount => (if sapi { S_PORTFOLIO } else { T_ACCOUNT }, true),
             JobKind::SymbolConfig => (T_SYMBOL_CONFIG, true),
+            JobKind::Price => (T_PRICE, false),
+            JobKind::OrderTrades => (T_USER_TRADES, true),
         };
         let per_row = matches!(
             j.kind,
-            JobKind::Countdown | JobKind::UserTrades | JobKind::CancelAll | JobKind::Probe | JobKind::SymbolConfig
+            JobKind::Countdown
+                | JobKind::UserTrades
+                | JobKind::CancelAll
+                | JobKind::Probe
+                | JobKind::SymbolConfig
+                | JobKind::Price
+                | JobKind::OrderTrades
         );
         if per_row && (j.row as usize) >= self.wire.len() {
             debug_assert!(false, "a per-row job for no row");
@@ -3674,9 +4008,15 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 JobKind::UserTrades => {
                     w.put(b"&startTime=").uint(day_start).put(b"&limit=").uint(TRADES_PAGE as u64);
                 }
+                JobKind::OrderTrades => {
+                    w.put(b"&orderId=").uint(j.oid);
+                }
                 _ => {}
             }
-            w.put(b"&");
+            // The signed suffix follows; an unsigned query ends here.
+            if signed {
+                w.put(b"&");
+            }
         }
         let len = if signed {
             w.put(b"recvWindow=").uint(rw).put(b"&timestamp=").uint(ts);
@@ -3690,7 +4030,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         j.sent_ns = now;
         match conn.start(t, len, self.poll.registry(), now) {
             Ok(()) => {
-                self.weight.add(now, request_weight(job_weight(j.kind, self.lanes[l].product)));
+                self.weigh(l, job_weight(j.kind, self.lanes[l].product), now);
                 if sapi {
                     self.sapi_job = Some(j);
                 } else {
@@ -3768,8 +4108,11 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 }
             }
             // The sweep's next round asks again while a maker rests; the
-            // next probe goes at its time.
-            JobKind::CancelAll | JobKind::Probe => {}
+            // next probe goes at its time. A spot price unread leaves its
+            // leg unpriced: the boot's adoption refuses it (BX8).
+            JobKind::CancelAll | JobKind::Probe | JobKind::Price => {}
+            // A spot order's trades: asked again, bounded (BX8).
+            JobKind::OrderTrades => self.retry_order_trades(j, now),
             // A cycle waiting on the unified account fails (BX7); a
             // re-read's next one asks again.
             JobKind::PmAccount => {
@@ -3818,7 +4161,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                     JobKind::SymbolConfig if status == 200 => {
                         judge_symbol_config(b, self.wire.row(j.row).symbol(), self.knobs.max_leverage)
                     }
-                    JobKind::Restrictions if status == 200 => judge_key(b, self.knobs.mode),
+                    JobKind::Restrictions if status == 200 => judge_key(b, self.knobs.mode, self.has_futures(), self.lane_ix[PRODUCT_SPOT as usize] != NO_LANE),
                     JobKind::Portfolio => judge_mode(status, b, self.knobs.mode),
                     _ => Err(AssertErr::Unreadable),
                 };
@@ -3828,14 +4171,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 }
                 self.asserts_left = self.asserts_left.saturating_sub(1);
                 if self.asserts_left == 0 && self.phase == Phase::Assert {
-                    self.phase = Phase::ListenKey;
-                    let mut k = 0;
-                    while k < self.lanes.len() {
-                        if self.lanes[k].has_us {
-                            let _ = self.queue_job(k, JobKind::ListenNew, 0);
-                        }
-                        k += 1;
-                    }
+                    self.asserts_held();
                 }
             }
             JobKind::ListenNew => self.listen_key_answered(l, status, b0, b1, now),
@@ -3868,6 +4204,27 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 }
             }
             JobKind::OpenOrders => self.orders_answered(l, status, b0, b1, j.sent_ns, now),
+            // BX8: the price a spot balance the boot adopts is valued at — its
+            // leg's, for this cycle's adoption (an unread price leaves the
+            // leg unpriced: the adoption refuses it, fail closed).
+            JobKind::Price => {
+                if status == 200 {
+                    let px = if (j.row as usize) < self.wire.len() {
+                        scan_ticker_price(self.body(l, sapi, b0, b1), self.wire.row(j.row).symbol())
+                    } else {
+                        Err(ScanErr::Missing)
+                    };
+                    if let (Ok(px), Some(g)) = (px, self.legs.get_mut(j.row as usize)) {
+                        g.px_1e6 = px;
+                    }
+                }
+            }
+            JobKind::OrderTrades if status != 200 => self.retry_order_trades(j, now),
+            JobKind::OrderTrades => {
+                if !self.order_trades_answered(l, j, b0, b1, now) {
+                    self.retry_order_trades(j, now);
+                }
+            }
             JobKind::PmAccount => self.pm_account_answered(l, status, b0, b1, now, sapi),
             JobKind::UserTrades => self.trades_answered(l, j.row, status, b0, b1, now),
             // The orders' ends arrive on the user stream, or the next
@@ -3969,6 +4326,9 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         }
         let ln = fr.lane();
         let product = self.lanes[ln].product;
+        if product == PRODUCT_SPOT {
+            return self.spot_account_answered(fr, a, now);
+        }
         // The result lies inside the frame its session still holds (or the
         // REST route's body). USDⓈ-M: the ratio and the session equity
         // (E7); COIN-M: the riskiest asset's ratio — no USD equity.
@@ -4075,6 +4435,100 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         self.recon = ReconStep::Orders;
         if !self.queue_job(ln, JobKind::OpenOrders, 0) {
             self.recon_failed();
+        }
+    }
+
+    /// **A spot lane's account read** (BX8): the armed base assets'
+    /// balances onto their legs — ×1e8 read, compared at ×1e6 against the
+    /// balances the bookings explain (the module docs' balance law); the
+    /// account's `canTrade` and permissions judged for every live armed
+    /// row (BX-19, the bStock check: before Ready a refusal refuses the
+    /// boot, after it is a `VenueLock`, raised once); and, the boot's first
+    /// cycle, each balance the boot will adopt priced (`ticker/price`, on
+    /// the lane's REST queue ahead of its listing, so it lands first). No
+    /// margin, no equity.
+    fn spot_account_answered(&mut self, fr: Frame, a: &WsAnswer, now: u64) {
+        let ln = fr.lane();
+        let scanned = {
+            let frame = frame_of(&self.lanes, fr);
+            scan_spot_account(frame, a.result, &self.spot_assets[..self.n_spot], &mut self.spot_bal_1e8[..], &mut self.acct_perm)
+        };
+        let Ok(snap) = scanned else {
+            self.scan_failed(SCAN_ACCOUNT, ScanErr::Malformed, now);
+            return self.recon_failed();
+        };
+        let mut refused = if snap.can_trade { None } else { Some(AssertErr::CannotTrade) };
+        let mut k = 0;
+        while k < self.n_spot && refused.is_none() {
+            let row = self.spot_rows[k];
+            if self.wire.row(row).flags & INST_LIVE != 0 {
+                refused = judge_permission(&self.wire.spot(row).perm, &self.acct_perm).err();
+            }
+            k += 1;
+        }
+        if let Some(e) = refused {
+            if self.phase != Phase::Ready {
+                self.refuse_boot(BootErr::Assert(e));
+                return self.recon_failed();
+            }
+            if !self.perm_locked {
+                self.perm_locked = true;
+                self.venue_lock(CODE_PERMISSION, now);
+            }
+        }
+        if self.recon_account_only {
+            self.recon = ReconStep::Idle;
+            self.recon_account_only = false;
+            return;
+        }
+        let first = self.phase == Phase::Recon && !self.adopt_ran;
+        let mut k = 0;
+        while k < self.n_spot {
+            let i = self.spot_rows[k] as usize;
+            let g = &mut self.legs[i];
+            g.venue_1e6 = self.spot_bal_1e8[k].div_euclid(100);
+            g.booked_1e6 = self.rows[i].spot_1e8.div_euclid(100);
+            g.px_1e6 = self.rows[i].last_px_1e6;
+            g.held = false;
+            k += 1;
+        }
+        self.hold_owed_legs(ln);
+        let mut k = 0;
+        while first && k < self.n_spot {
+            let row = self.spot_rows[k];
+            if self.adoptable(row as usize) && !self.queue_job(ln, JobKind::Price, row) {
+                return self.recon_failed();
+            }
+            k += 1;
+        }
+        self.recon = ReconStep::Orders;
+        if !self.queue_job(ln, JobKind::OpenOrders, 0) {
+            self.recon_failed();
+        }
+    }
+
+    /// While a spot order's trades are being read — queued, paused or in
+    /// flight on lane `l` — a commission is owed that the read has not
+    /// paid, and its asset is the read's to say (the base; BNB's row when
+    /// the burn pays): every spot leg is held this cycle ([`Leg::held`];
+    /// the BX8 e2e review — a status-booked fill read as drift for one
+    /// cycle, and a BNB row's leg judged while its fee was owed). Derived
+    /// from the queue each cycle, never a counter a lost job could leave
+    /// set; a read given up leaves the queue, and the next cycle (asked for
+    /// at once, [`Self::order_trades_done`]) judges the legs.
+    fn hold_owed_legs(&mut self, l: usize) {
+        let mut owed = matches!(self.lanes[l].job, Some(j) if j.kind == JobKind::OrderTrades);
+        let mut k = 0;
+        while !owed && k < self.lanes[l].jobs.len() {
+            owed = matches!(self.lanes[l].jobs.get(k), Some(j) if j.kind == JobKind::OrderTrades);
+            k += 1;
+        }
+        let mut k = 0;
+        while owed && k < self.n_spot {
+            if let Some(g) = self.legs.get_mut(self.spot_rows[k] as usize) {
+                g.held = true;
+            }
+            k += 1;
         }
     }
 
@@ -4191,7 +4645,16 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                     false
                 }
             };
-            if !stray || row == ROW_NONE {
+            // BX8: no spot cancel is built (IoC-only, BX-17) — a stray there
+            // is counted, never cancelled: at boot it refuses the boot by
+            // name (the operator cancels it in the app; the risk review —
+            // never a cycle per second to the timeout); a running arm stays
+            // unreconciled.
+            if stray && product == PRODUCT_SPOT && row != ROW_NONE && self.phase != Phase::Ready && self.boot_err.is_none() {
+                // `refuse_boot`'s law, field by field (the listing is lent).
+                self.boot_err = Some(BootErr::SpotStray(row));
+            }
+            if !stray || row == ROW_NONE || product == PRODUCT_SPOT {
                 continue;
             }
             let venue_oid = o.venue_oid;
@@ -4337,6 +4800,17 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         if self.knobs.shared {
             return Ok(());
         }
+        // BX8: a spot balance under a millionth (dust) reads 0 at ×1e6 —
+        // never adopted, never compared — yet a later fill brings it into
+        // view: the explained balance starts at it, to its last decimal.
+        let mut k = 0;
+        while k < self.n_spot {
+            let i = self.spot_rows[k] as usize;
+            if self.legs[i].venue_1e6 == 0 && self.rows[i].spot_1e8 == 0 {
+                self.rows[i].spot_1e8 = self.spot_bal_1e8[k];
+            }
+            k += 1;
+        }
         let (mut rows, mut usd) = (0u32, 0i64);
         let mut i = 0;
         while i < self.legs.len() {
@@ -4377,6 +4851,12 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                     return Err(usd);
                 }
                 self.legs[i].booked_1e6 = venue;
+                // BX8: a spot row's explained balance is the venue's own, to
+                // its last decimal (the fill carried its ×1e6 part).
+                let k = self.rows[i].spot_k;
+                if k != u8::MAX {
+                    self.rows[i].spot_1e8 = self.spot_bal_1e8[k as usize];
+                }
             }
             i += 1;
         }
@@ -4460,7 +4940,12 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 let w = self.wire.row(row);
                 let (inverse, face) = (w.flags & INST_INVERSE != 0, w.unit_1e6);
                 let cur = self.legs[r].venue_1e6;
-                self.rows[r].day_spent_1e6 = day_increasing_1e6(&mut self.trades[..n], cur, inverse, face);
+                // BX8: a spot row's day is its buys (`day_buys_1e6`).
+                self.rows[r].day_spent_1e6 = if self.rows[r].spot_k != u8::MAX {
+                    day_buys_1e6(&self.trades[..n])
+                } else {
+                    day_increasing_1e6(&mut self.trades[..n], cur, inverse, face)
+                };
                 self.rows[r].day_read = true;
             }
             _ => {}
@@ -4469,6 +4954,74 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         if self.day_left == 0 {
             self.day_done(now);
         }
+    }
+
+    /// **A spot order's trades** (BX8), read after a fill of it was booked
+    /// without its report: each trade's commission not yet paid — the
+    /// dedupe ring says which — is journaled (`J_FEE`) and paid out of the
+    /// explained balance of the row whose base asset it was charged in (the
+    /// module docs' balance law); the trade ids join the ring, so a report
+    /// arriving late pays nothing again. The order id in the journal is the
+    /// venue's (the member's may have ended). A trade of another order or
+    /// symbol is no answer to this read: not paid; a trade naming no
+    /// commission asset is no spot trade (a scan failure). Unscannable, the
+    /// commissions stay unpaid: drift (fail closed).
+    /// `false`: the answer names fewer of the order's trades than it
+    /// executed (none, or a page short of them) — the caller asks again.
+    fn order_trades_answered(&mut self, l: usize, j: Job, b0: usize, b1: usize, now: u64) -> bool {
+        let (row, venue_oid) = (j.row, j.oid);
+        if (row as usize) >= self.rows.len() {
+            self.order_trades_done(now);
+            return true;
+        }
+        let n = {
+            let body = self.lanes[l].rest.resp().get(b0..b1).unwrap_or(&[]);
+            scan_trades(body, &mut self.trades[..])
+        };
+        let Ok(n) = n else {
+            self.scan_failed(SCAN_REST, ScanErr::Malformed, now);
+            self.order_trades_done(now);
+            return true;
+        };
+        let slot = self.knobs.owner_slot;
+        // The order's trades the answer names, ×1e6.
+        let mut named_1e6 = 0i64;
+        let mut k = 0;
+        while k < n {
+            let t = self.trades[k];
+            k += 1;
+            let (ours, fee_row, asset) = {
+                let body = self.lanes[l].rest.resp().get(b0..b1).unwrap_or(&[]);
+                let a = t.fee_asset().get(body);
+                let ours = t.venue_oid == venue_oid && t.symbol.get(body) == self.wire.row(row).symbol();
+                (ours, self.spot_row_of(a), fee_asset(self.wire.row(row), a))
+            };
+            if ours && t.fee_asset().len == 0 {
+                self.scan_failed(SCAN_REST, ScanErr::Missing, now);
+                self.order_trades_done(now);
+                return true;
+            }
+            if ours {
+                named_1e6 = named_1e6.saturating_add(t.qty_1e6);
+            }
+            if !ours || !self.tids.see(row, t.trade_id, true).fee_due {
+                continue;
+            }
+            let w = self.wire.row(row);
+            let (code, notional) = (fee_code(t.maker != 0, asset, TRADE_BY_MEMBER, w), fee_notional_1e9(w, t.px_1e6, t.qty_1e6));
+            self.note(J_FEE, now, 0, t.venue_oid, t.px_1e6, notional, t.commission_1e9, code, row, slot);
+            if let Some(r) = self.rows.get_mut(fee_row as usize) {
+                r.spot_1e8 = r.spot_1e8.saturating_sub(t.commission_1e9 / 10);
+            }
+        }
+        // Short of the order's executed quantity: the venue's list lags
+        // its match (R2-3) — the trades it named are paid (once: the ring),
+        // the rest asked for again.
+        if named_1e6 < j.qty_1e6 {
+            return false;
+        }
+        self.order_trades_done(now);
+        true
     }
 
     fn day_done(&mut self, now: u64) {
@@ -4704,15 +5257,21 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         true
     }
 
-    /// BX-19's boot assertions: per lane the one-way mode — and on USDⓈ-M
-    /// classic the single-asset mode (dapi and papi have none; PM Pro's
-    /// collateral is the program's) — then, once, the key's permissions and
-    /// the account mode (SAPI). Not on Demo, which serves no SAPI: classic
-    /// by construction (`new`; module docs).
+    /// BX-19's boot assertions: per futures lane the one-way mode — and on
+    /// USDⓈ-M classic the single-asset mode (dapi and papi have none; PM
+    /// Pro's collateral is the program's) — then, once, the key's
+    /// permissions and the account mode (SAPI). Not on Demo, which serves
+    /// no SAPI: classic by construction (`new`; module docs). Spot's lane
+    /// asserts nothing here (BX8): its account's permissions are judged at
+    /// every account read. None to ask (a spot-only Demo arm): held now.
     fn queue_asserts(&mut self) {
         self.asserts_left = if self.demo { 0 } else { 2 };
         let mut l = 0;
         while l < self.lanes.len() {
+            if self.lanes[l].product == PRODUCT_SPOT {
+                l += 1;
+                continue;
+            }
             self.asserts_left += 1;
             let _ = self.queue_job(l, JobKind::Dual, 0);
             if self.lanes[l].product == PRODUCT_USDM && !self.lanes[l].unified {
@@ -4739,6 +5298,32 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             let _ = self.queue_job(0, JobKind::Restrictions, 0);
             let _ = self.queue_job(0, JobKind::Portfolio, 0);
         }
+        if self.asserts_left == 0 {
+            self.asserts_held();
+        }
+    }
+
+    /// Every boot assertion held: each lane holding a stream asks for its
+    /// listenKey — or, none holding one (a spot-only arm, BX8), the sockets
+    /// open now.
+    fn asserts_held(&mut self) {
+        self.phase = Phase::ListenKey;
+        let mut k = 0;
+        while k < self.lanes.len() {
+            if self.lanes[k].has_us {
+                let _ = self.queue_job(k, JobKind::ListenNew, 0);
+            }
+            k += 1;
+        }
+        if self.all_keyed() {
+            self.phase = Phase::Connect;
+        }
+    }
+
+    /// A futures lane is armed: the key's futures permission is asserted
+    /// (BX8: a spot-only arm asks spot's alone).
+    fn has_futures(&self) -> bool {
+        self.lane_ix[PRODUCT_USDM as usize] != NO_LANE || self.lane_ix[PRODUCT_COINM as usize] != NO_LANE
     }
 
     /// Every deadline due: TTL cancels (BX-13) and owed cancels; WS API

@@ -24,6 +24,13 @@
 //! no orphan is left and — on a shared account — no foreign order sits on
 //! an owned instrument ([`Verdict::reconciled`]).
 //!
+//! **Spot (BX8)** reads `account.status`: the balances of the armed base
+//! assets, ×1e8 — the venue's own precision, because a BUY's commission
+//! is charged in the base asset at 8 decimals and a ×1e6 reading would
+//! invent drift — the account's `permissions` (the bStock check) and
+//! `canTrade` ([`scan_spot_account`]). Every other asset (the quote, BNB
+//! unless armed, dust) is the operator's, never compared (plan §3.10, D3).
+//!
 //! **The day's spend** ([`day_increasing_1e6`]): the venue's own trades
 //! since 00:00Z on a row, replayed in time order from the position they
 //! started from (today's position minus today's net), adding for each
@@ -32,7 +39,10 @@
 //! side. It is conservative by construction: every trade on an owned row
 //! counts toward its owner slot.
 
-use crate::json::{bool_of, dec_1e6, str_of, u64_of, Elems, Pairs};
+use ingress_binance::discovery::BnPermissions;
+
+use crate::inst::AssetName;
+use crate::json::{bool_of, dec_1e6, dec_1e8, str_of, u64_of, Elems, Pairs};
 use crate::margin::cm_asset_ratio_1e6;
 use crate::rest::{ArrErr, TradeRow};
 use crate::userstream::{ScanErr, Span};
@@ -91,6 +101,7 @@ fn bad(_: ()) -> ScanErr {
 /// position in hedge mode (`positionSide` other than `BOTH`) is refused —
 /// the account left one-way mode mid-session (BX-19).
 pub fn scan_um_account(frame: &[u8], result: Span, pos: &mut [PosRow]) -> Result<AccountSnap, ArrErr> {
+    no_result(result)?;
     let at = result.at as usize;
     let mut w = Pairs::new(frame, at).map_err(malformed)?;
     let mut snap = AccountSnap::default();
@@ -123,6 +134,150 @@ pub fn scan_um_account(frame: &[u8], result: Span, pos: &mut [PosRow]) -> Result
     Ok(snap)
 }
 
+/// An answer with no `result` is no account (BX8, the parser review's
+/// P2-4): the walk would read the answer's own keys as the account's.
+#[inline]
+fn no_result(result: Span) -> Result<(), ArrErr> {
+    if result.len == 0 {
+        return Err(ArrErr::Scan(ScanErr::Missing));
+    }
+    Ok(())
+}
+
+/// A spot account read's figures (BX8).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpotSnap {
+    /// `canTrade`.
+    pub can_trade: bool,
+}
+
+/// The most armed spot assets a read compares (the balance scan's
+/// one-reading mask).
+pub const SPOT_ASSETS_MAX: usize = 64;
+
+/// **Scan a spot `account.status` result** (BX8; the module docs):
+/// `bal_1e8[k]` becomes `assets[k]`'s `free + locked` ×1e8 (0 when the
+/// read omits it — a zero balance), `perms` the account's `permissions`,
+/// and the snap its `canTrade`. Fail closed: the three keys are required,
+/// each read once; a balance short of `asset`, `free` or `locked`, a
+/// negative one, or an armed asset listed twice is refused.
+pub fn scan_spot_account(
+    frame: &[u8],
+    result: Span,
+    assets: &[AssetName],
+    bal_1e8: &mut [i64],
+    perms: &mut BnPermissions,
+) -> Result<SpotSnap, ArrErr> {
+    // The one-reading mask's width and the output's room: a caller's
+    // mistake, refused (never a release panic).
+    if assets.len() > SPOT_ASSETS_MAX || bal_1e8.len() < assets.len() {
+        return Err(ArrErr::Scan(ScanErr::BadField));
+    }
+    no_result(result)?;
+    *perms = BnPermissions::EMPTY;
+    let mut k = 0;
+    while k < assets.len() {
+        bal_1e8[k] = 0;
+        k += 1;
+    }
+    let mut w = Pairs::new(frame, result.at as usize).map_err(malformed)?;
+    let mut snap = SpotSnap::default();
+    let mut seen = 0u8;
+    while let Some((key, a, z)) = w.next().map_err(malformed)? {
+        let bit = match key {
+            b"canTrade" => {
+                snap.can_trade = bool_of(frame, a, z).map_err(bad)?;
+                1
+            }
+            b"permissions" => {
+                let mut e = Elems::new(frame, a).map_err(malformed)?;
+                while let Some((ea, ez)) = e.next().map_err(malformed)? {
+                    perms.add(str_of(frame, ea, ez).map_err(bad)?);
+                }
+                1 << 1
+            }
+            b"balances" => 1 << 2,
+            _ => 0,
+        };
+        if seen & bit != 0 {
+            return Err(ArrErr::Scan(ScanErr::Malformed));
+        }
+        seen |= bit;
+        if key == b"balances" {
+            spot_balances(frame, a, assets, bal_1e8)?;
+        }
+    }
+    if seen != 7 {
+        return Err(ArrErr::Scan(ScanErr::Missing));
+    }
+    Ok(snap)
+}
+
+/// The `balances` array at `at`: the armed assets' `free + locked` ×1e8.
+/// Each balance names its three keys once; only an armed asset's figures
+/// are converted (the risk review: an asset the arm does not trade — a
+/// Demo seed, an airdrop — past ×1e8's range must not fail the read).
+fn spot_balances(frame: &[u8], at: usize, assets: &[AssetName], bal_1e8: &mut [i64]) -> Result<(), ArrErr> {
+    let mut e = Elems::new(frame, at).map_err(malformed)?;
+    // The armed assets listed so far (a second listing: which would hold?).
+    let mut listed = 0u64;
+    while let Some((ea, _)) = e.next().map_err(malformed)? {
+        let mut w = Pairs::new(frame, ea).map_err(malformed)?;
+        let (mut name, mut free, mut locked, mut have): (&[u8], (usize, usize), (usize, usize), u8) = (&[], (0, 0), (0, 0), 0);
+        while let Some((k, a, z)) = w.next().map_err(malformed)? {
+            let bit = match k {
+                b"asset" => {
+                    name = str_of(frame, a, z).map_err(bad)?;
+                    // An escaped name is no asset of the venue's (P2-4): an
+                    // armed one would read as unarmed — its balance as 0.
+                    let mut j = 0;
+                    while j < name.len() {
+                        if name[j] == b'\\' {
+                            return Err(ArrErr::Scan(ScanErr::BadField));
+                        }
+                        j += 1;
+                    }
+                    1
+                }
+                b"free" => {
+                    free = (a, z);
+                    1 << 1
+                }
+                b"locked" => {
+                    locked = (a, z);
+                    1 << 2
+                }
+                _ => 0,
+            };
+            if have & bit != 0 {
+                return Err(ArrErr::Scan(ScanErr::Malformed));
+            }
+            have |= bit;
+        }
+        if have != 7 {
+            return Err(ArrErr::Scan(ScanErr::Missing));
+        }
+        let mut k = 0;
+        while k < assets.len() {
+            if assets[k].get() == name {
+                if listed & (1u64 << k) != 0 {
+                    return Err(ArrErr::Scan(ScanErr::Malformed));
+                }
+                listed |= 1u64 << k;
+                let f = dec_1e8(frame, free.0, free.1).map_err(bad)?;
+                let l = dec_1e8(frame, locked.0, locked.1).map_err(bad)?;
+                if f < 0 || l < 0 {
+                    return Err(ArrErr::Scan(ScanErr::BadField));
+                }
+                bal_1e8[k] = f.checked_add(l).ok_or(ArrErr::Scan(ScanErr::BadField))?;
+                break;
+            }
+            k += 1;
+        }
+    }
+    Ok(())
+}
+
 /// A COIN-M account's figures (BX7, C1).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CmSnap {
@@ -141,6 +296,7 @@ pub struct CmSnap {
 /// refused, and each must carry its leverage (at least 1) and its margin
 /// type (BX-19, judged on every read).
 pub fn scan_cm_account(frame: &[u8], result: Span, pos: &mut [PosRow]) -> Result<CmSnap, ArrErr> {
+    no_result(result)?;
     let at = result.at as usize;
     let mut w = Pairs::new(frame, at).map_err(malformed)?;
     let mut snap = CmSnap::default();
@@ -229,6 +385,7 @@ pub fn scan_pm_account(body: &[u8]) -> Result<PmSnap, ScanErr> {
 /// account's ([`scan_pm_account`]). Fail closed: no `positions` is
 /// refused; hedge mode is refused (BX-19).
 pub fn scan_positions(frame: &[u8], result: Span, pos: &mut [PosRow]) -> Result<usize, ArrErr> {
+    no_result(result)?;
     let mut w = Pairs::new(frame, result.at as usize).map_err(malformed)?;
     let mut n = 0;
     let mut seen = false;
@@ -361,6 +518,12 @@ pub struct Leg {
     /// It differed in the previous cycle (set at boot, so the first cycle
     /// counts at once).
     pub differed: bool,
+    /// Not judged this cycle (BX8): a spot row whose order's trades are
+    /// being read — a fill booked without its report owes a commission
+    /// the read has not paid yet, so the balance differs by it for now.
+    /// The leg keeps its last judged `differed`, and the cycle is
+    /// inconclusive: never drift, never reconciled ([`Verdict::held_legs`]).
+    pub held: bool,
 }
 
 /// A cycle's verdict.
@@ -380,6 +543,10 @@ pub struct Verdict {
     pub foreign: u32,
     /// Foreign activity is a drift HALT (a shared account).
     pub shared: bool,
+    /// Legs held (BX8, [`Leg::held`]): the cycle is inconclusive — never
+    /// drift, and never reconciled (the risk review's R2-1: a held leg may
+    /// hide a real difference beside the commission it waits for).
+    pub held_legs: u32,
 }
 
 impl Verdict {
@@ -388,6 +555,7 @@ impl Verdict {
     pub const fn reconciled(&self) -> bool {
         self.drift_legs == 0
             && self.unseen_legs == 0
+            && self.held_legs == 0
             && self.ghosts == 0
             && self.orphans == 0
             && !(self.shared && self.foreign > 0)
@@ -415,6 +583,10 @@ pub fn judge_positions(legs: &mut [Leg], v: &mut Verdict) {
         if !l.owned {
             continue;
         }
+        if l.held {
+            v.held_legs += 1;
+            continue;
+        }
         let differs = l.booked_1e6 != l.venue_1e6;
         if differs && l.differed {
             if l.booked_1e6 == 0 {
@@ -429,6 +601,26 @@ pub fn judge_positions(legs: &mut [Leg], v: &mut Verdict) {
         }
         l.differed = differs;
     }
+}
+
+/// **The day's spend on a spot row** (BX8): its buys at their prices — a
+/// spot holding is never short, so every buy increases it and no sell does
+/// (the ledger's spot law). The venue's balance is net of the commissions
+/// charged in the base asset, so [`day_increasing_1e6`]'s replay from it
+/// would read part of a buy as covering a short (an undercount: the day's
+/// cap must never be).
+pub fn day_buys_1e6(trades: &[TradeRow]) -> i64 {
+    let buy = core_types::Side::Bid as u8;
+    let mut spent = 0i64;
+    let mut k = 0;
+    while k < trades.len() {
+        let t = &trades[k];
+        if t.side == buy {
+            spent = spent.saturating_add((t.qty_1e6 as i128 * t.px_1e6 as i128 / 1_000_000).min(i64::MAX as i128) as i64);
+        }
+        k += 1;
+    }
+    spent
 }
 
 /// **The day's increasing part on one row** (module docs). `trades` are
@@ -483,6 +675,115 @@ pub const TRADES_PAGE: usize = 1_000;
 mod tests {
     use super::*;
     use core_types::Side;
+
+    /// BX8: spot's `account.status` result (the docs' shape).
+    const SPOT_ACCT: &[u8] = br#"{"makerCommission":15,"takerCommission":15,"buyerCommission":0,"sellerCommission":0,"commissionRates":{"maker":"0.00150000","taker":"0.00150000","buyer":"0.00000000","seller":"0.00000000"},"canTrade":true,"canWithdraw":false,"canDeposit":true,"brokered":false,"requireSelfTradePrevention":false,"preventSor":false,"updateTime":1660801833000,"accountType":"SPOT","balances":[{"asset":"BNB","free":"0.25000000","locked":"0.00000000"},{"asset":"BTC","free":"1.00099900","locked":"0.00000100"},{"asset":"USDT","free":"10000.00000000","locked":"25.00000000"}],"permissions":["SPOT","TRD_GRP_004"],"uid":354937868}"#;
+
+    proptest::proptest! {
+        /// BX8: an account read rendered from its balances reads the armed
+        /// assets' `free + locked` back exactly, ×1e8 — and any bytes, never
+        /// a panic.
+        #[test]
+        fn a_spot_account_round_trips(btc in 0i64..1_000_000_000_000, btc_l in 0i64..1_000_000_000, bnb in 0i64..1_000_000_000_000, other in 0i64..i64::MAX, bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)) {
+            let d8 = |v: i64| std::format!("{}.{:08}", v / 100_000_000, v % 100_000_000);
+            let f = std::format!(
+                r#"{{"canTrade":true,"balances":[{{"asset":"BTC","free":"{}","locked":"{}"}},{{"asset":"DOGE","free":"{}","locked":"0"}},{{"asset":"BNB","free":"{}","locked":"0.00000000"}}],"permissions":["SPOT"]}}"#,
+                d8(btc), d8(btc_l), d8(other), d8(bnb)
+            );
+            let assets = names(&[b"BTC", b"BNB", b"ETH"]);
+            let mut bal = [0i64; SPOT_ASSETS_MAX];
+            let mut perm = BnPermissions::EMPTY;
+            let b = f.as_bytes();
+            proptest::prop_assert!(scan_spot_account(b, whole(b), &assets, &mut bal, &mut perm).unwrap().can_trade);
+            proptest::prop_assert_eq!(&bal[..3], &[btc + btc_l, bnb, 0]);
+            let _ = scan_spot_account(&bytes, whole(&bytes), &assets, &mut bal, &mut perm);
+        }
+    }
+
+    fn names(n: &[&[u8]]) -> std::vec::Vec<AssetName> {
+        n.iter().map(|a| AssetName::of(a).unwrap()).collect()
+    }
+
+    fn whole(b: &[u8]) -> Span {
+        Span { at: 0, len: b.len() as u32 }
+    }
+
+    /// BX8: a spot row's day is its buys — a sell never adds, and nothing
+    /// is read as covering a short (the balance a replay would start from is
+    /// net of the base-asset fees).
+    #[test]
+    fn a_spot_day_is_its_buys() {
+        let t = |side: Side, qty_1e6: i64, px_1e6: i64| {
+            let mut r = TradeRow::default();
+            (r.side, r.qty_1e6, r.px_1e6) = (side as u8, qty_1e6, px_1e6);
+            r
+        };
+        let day = [t(Side::Bid, 1_000, 64_000_000_000), t(Side::Ask, 1_000, 65_000_000_000), t(Side::Bid, 2_000, 63_000_000_000)];
+        assert_eq!(day_buys_1e6(&day), 64_000_000 + 126_000_000);
+        assert_eq!(day_buys_1e6(&[]), 0);
+        // The replay from a balance short by the buy's fee undercounts it.
+        let mut one = [t(Side::Bid, 1_000, 64_000_000_000)];
+        assert!(day_increasing_1e6(&mut one, 999, false, 1_000_000) < day_buys_1e6(&one));
+    }
+
+    /// BX8: the armed assets' balances at the venue's 8 decimals (an
+    /// absent one is a zero balance), the permissions, `canTrade`.
+    #[test]
+    fn a_spot_account_reads_its_armed_assets_exactly() {
+        let assets = names(&[b"BTC", b"ETH", b"BNB"]);
+        let mut bal = [7i64; SPOT_ASSETS_MAX];
+        let mut perm = BnPermissions::EMPTY;
+        let s = scan_spot_account(SPOT_ACCT, whole(SPOT_ACCT), &assets, &mut bal, &mut perm).unwrap();
+        assert!(s.can_trade);
+        assert_eq!(&bal[..3], &[100_100_000, 0, 25_000_000], "BTC free + locked ×1e8; ETH omitted (zero); BNB");
+        assert_eq!(perm.names & ingress_binance::discovery::BN_PERM_SPOT, ingress_binance::discovery::BN_PERM_SPOT);
+        assert_eq!(perm.has_group(4), Some(true));
+        assert_eq!(perm.has_group(5), Some(false));
+        let frozen = std::string::String::from_utf8(SPOT_ACCT.to_vec()).unwrap().replace(r#""canTrade":true"#, r#""canTrade":false"#);
+        assert!(!scan_spot_account(frozen.as_bytes(), whole(frozen.as_bytes()), &assets, &mut bal, &mut perm).unwrap().can_trade);
+    }
+
+    /// BX8: fail closed — a key twice, an armed asset listed twice, a
+    /// balance short of a figure or negative, a required key missing.
+    #[test]
+    fn a_spot_account_read_fails_closed() {
+        let assets = names(&[b"BTC"]);
+        let mut bal = [0i64; SPOT_ASSETS_MAX];
+        let mut perm = BnPermissions::EMPTY;
+        let a = std::string::String::from_utf8(SPOT_ACCT.to_vec()).unwrap();
+        for (what, from, to) in [
+            ("canTrade twice", r#""canTrade":true,"#, r#""canTrade":true,"canTrade":false,"#),
+            ("an armed asset listed twice", r#"{"asset":"USDT""#, r#"{"asset":"BTC","free":"0","locked":"0"},{"asset":"USDT""#),
+            ("free twice", r#""free":"1.00099900","#, r#""free":"1.00099900","free":"9","#),
+            ("no locked", r#","locked":"0.00000100""#, ""),
+            ("negative", r#""free":"1.00099900""#, r#""free":"-1.00099900""#),
+            ("no balances", r#""balances":"#, r#""balancez":"#),
+            ("no permissions", r#""permissions":"#, r#""permissionz":"#),
+            ("no canTrade", r#""canTrade":true,"#, ""),
+            ("permissions not names", r#"["SPOT","TRD_GRP_004"]"#, "[1]"),
+            ("an escaped asset name", r#"{"asset":"BTC""#, r#"{"asset":"B\u0054C""#),
+        ] {
+            assert!(a.contains(from), "{what}: the fixture has `{from}`");
+            let b = a.replacen(from, to, 1);
+            assert!(scan_spot_account(b.as_bytes(), whole(b.as_bytes()), &assets, &mut bal, &mut perm).is_err(), "{what}");
+        }
+        // An asset not armed is never converted: past ×1e8's range it reads
+        // as nothing of ours (the risk review), and it may repeat.
+        let huge = a.replacen(r#"{"asset":"USDT","free":"10000.00000000""#, r#"{"asset":"USDT","free":"99999999999999.00000000""#, 1);
+        assert!(scan_spot_account(huge.as_bytes(), whole(huge.as_bytes()), &assets, &mut bal, &mut perm).is_ok());
+        assert!(scan_spot_account(SPOT_ACCT, whole(SPOT_ACCT), &names(&[&b"BTC"[..]; 65]), &mut [0i64; 65], &mut perm).is_err(), "past the mask");
+        assert!(scan_spot_account(SPOT_ACCT, whole(SPOT_ACCT), &assets, &mut [], &mut perm).is_err(), "no room");
+        // An asset not armed may repeat: it is not read.
+        let dup_other = a.replacen(r#"{"asset":"USDT""#, r#"{"asset":"USDT","free":"1","locked":"0"},{"asset":"USDT""#, 1);
+        assert!(scan_spot_account(dup_other.as_bytes(), whole(dup_other.as_bytes()), &assets, &mut bal, &mut perm).is_ok());
+        // No `result` (P2-4): never the answer's own keys read as the account.
+        let bare = br#"{"id":7,"status":200,"canTrade":true,"permissions":["SPOT","TRD_GRP_004"],"balances":[]}"#;
+        assert_eq!(scan_spot_account(bare, Span::default(), &assets, &mut bal, &mut perm), Err(ArrErr::Scan(ScanErr::Missing)));
+        let mut p = [PosRow::default(); 2];
+        assert_eq!(scan_um_account(bare, Span::default(), &mut p), Err(ArrErr::Scan(ScanErr::Missing)));
+        assert_eq!(scan_cm_account(bare, Span::default(), &mut p), Err(ArrErr::Scan(ScanErr::Missing)));
+        assert_eq!(scan_positions(bare, Span::default(), &mut p), Err(ArrErr::Scan(ScanErr::Missing)));
+    }
 
     fn t(time_ms: u64, id: u64, side: Side, qty: i64, px: i64) -> TradeRow {
         let mut r = TradeRow::default();
@@ -592,7 +893,7 @@ mod tests {
 
     #[test]
     fn drift_needs_two_cycles_after_the_first() {
-        let mut legs = [Leg { booked_1e6: 10_000, venue_1e6: 10_000, px_1e6: 65_000_000_000, owned: true, differed: true }];
+        let mut legs = [Leg { booked_1e6: 10_000, venue_1e6: 10_000, px_1e6: 65_000_000_000, owned: true, differed: true, held: false }];
         let mut v = Verdict::default();
         judge_positions(&mut legs, &mut v);
         assert!(v.reconciled());
@@ -609,8 +910,8 @@ mod tests {
     #[test]
     fn a_boot_with_an_unbooked_venue_leg_is_not_reconciled() {
         let mut legs = [
-            Leg { booked_1e6: 0, venue_1e6: 5_000, px_1e6: 1, owned: true, differed: true },
-            Leg { booked_1e6: 0, venue_1e6: 9_000, px_1e6: 1, owned: false, differed: true },
+            Leg { booked_1e6: 0, venue_1e6: 5_000, px_1e6: 1, owned: true, differed: true, held: false },
+            Leg { booked_1e6: 0, venue_1e6: 9_000, px_1e6: 1, owned: false, differed: true, held: false },
         ];
         let mut v = Verdict::default();
         judge_positions(&mut legs, &mut v);
@@ -630,10 +931,30 @@ mod tests {
 
     #[test]
     fn an_unpriced_drift_is_unbounded() {
-        let mut legs = [Leg { booked_1e6: 1, venue_1e6: 2, px_1e6: 0, owned: true, differed: true }];
+        let mut legs = [Leg { booked_1e6: 1, venue_1e6: 2, px_1e6: 0, owned: true, differed: true, held: false }];
         let mut v = Verdict::default();
         judge_positions(&mut legs, &mut v);
         assert_eq!(v.drift_usd_1e6, i64::MAX);
+    }
+
+    /// BX8: a held leg (its order's trades being read) is not judged — no
+    /// drift, its `differed` kept — and its cycle is not reconciled (R2-1);
+    /// the cycle after it judges again.
+    #[test]
+    fn a_held_leg_waits_for_its_commission() {
+        let mut legs = [Leg { booked_1e6: 2_000, venue_1e6: 1_998, px_1e6: 65_000_000_000, owned: true, differed: true, held: true }];
+        let mut v = Verdict::default();
+        judge_positions(&mut legs, &mut v);
+        assert_eq!((v.drift_legs, v.unseen_legs, v.held_legs, v.drift_usd_1e6), (0, 0, 1, 0), "held: no drift");
+        assert!(!v.reconciled() && legs[0].differed, "held: inconclusive, its last verdict kept");
+        legs[0].held = false;
+        let mut v = Verdict::default();
+        judge_positions(&mut legs, &mut v);
+        assert_eq!(v.drift_legs, 1, "the commission never paid: drift once it is judged");
+        legs[0].venue_1e6 = 2_000;
+        let mut v = Verdict::default();
+        judge_positions(&mut legs, &mut v);
+        assert!(v.reconciled() && !legs[0].differed);
     }
 
     #[test]

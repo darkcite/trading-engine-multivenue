@@ -11,13 +11,18 @@
 //! | budget | scope | venue limit | refused at |
 //! |---|---|---|---|
 //! | ORDERS, USDⓈ-M + COIN-M (one pool since 2026-06-30) | account | 300 / 10 s, 1 200 / min | `orders_frac` of either |
+//! | ORDERS, spot (BX8): the unfilled-order count | account, every key and API | 100 / 10 s, 200 000 / UTC day; an order's first fill takes one off | `orders_frac` of either |
 //! | UM quantitative rules (UFR · ICR · IFER · DR) | symbol, 10-minute cycle | ban at 0.99 (DR 0.9), recorded past 10 000 / 5 000 orders ÷ 1.2^(N−1) | `qtr_frac` of the ban ratio, once recorded |
 //! | open orders per symbol (`MAX_NUM_ORDERS`) | symbol | the row's filter | `orders_frac` of it |
 //! | breadth | account | < 50 symbols with positions or open orders | the slot's `max_symbols` |
 //!
 //! The window is SLIDING over the exact placement times — a sliding count
 //! is never below the venue's fixed-window count, so it can only refuse
-//! earlier. The other products' pools arrive with their phases.
+//! earlier. Spot's day is the venue's own count, mirrored ([`SpotOrders`]):
+//! up one a place, down one an order that filled, never below zero, reset
+//! at 00:00Z; its 10 s window takes no fill off (it can only refuse
+//! earlier). The UM quantitative rules and the breadth are futures' alone.
+//! The other products' pools arrive with their phases.
 //!
 //! **Venue codes** ([`classify`]): `-1015` / 429 / `-1003` are a budget
 //! observation; 418 / `-4400`…`-4402` a venue lock; `-1021` / `-5028` a
@@ -125,6 +130,81 @@ impl FuturesOrders {
     pub fn commit(&mut self, now_ns: u64) {
         self.w10s.commit(now_ns);
         self.w1m.commit(now_ns);
+    }
+}
+
+/// A UTC day, ms.
+pub const DAY_MS: u64 = 86_400_000;
+
+/// **Spot's ORDERS pool and its unfilled-order mirror** (BX8; module
+/// docs): 100 / 10 s sliding, and the UTC day's unfilled count against
+/// 200 000 — each at `orders_frac`.
+pub struct SpotOrders {
+    /// The 10-second window.
+    pub w10s: Window,
+    /// `wall_ms / DAY_MS` of `unfilled`.
+    day: u64,
+    /// Orders placed today that have not filled, as the venue counts them.
+    unfilled: u32,
+    /// The share of the day's 200 000 this arm may use.
+    day_cap: u32,
+}
+
+impl SpotOrders {
+    /// The pool at `frac_1e6` of the venue's limits.
+    #[must_use]
+    pub fn new(frac_1e6: i64) -> Self {
+        Self {
+            w10s: Window::new(100, 10_000, frac_1e6),
+            day: 0,
+            unfilled: 0,
+            day_cap: ((200_000 * frac_1e6) / 1_000_000).clamp(0, u32::MAX as i64) as u32,
+        }
+    }
+
+    /// Roll the day's count forward into the UTC day of `wall_ms` — never
+    /// back: a stamp of an earlier day (an order's end drained after
+    /// midnight) must not reset today's count (the alloc review's AL2-2).
+    #[inline(always)]
+    pub fn roll(&mut self, wall_ms: u64) {
+        let d = wall_ms / DAY_MS;
+        if d > self.day {
+            self.day = d;
+            self.unfilled = 0;
+        }
+    }
+
+    /// May one more placement go at `now_ns` (the day rolled first)?
+    #[inline(always)]
+    #[must_use]
+    pub fn admits(&self, now_ns: u64) -> bool {
+        self.w10s.admits(now_ns) & (self.unfilled < self.day_cap)
+    }
+
+    /// Record one placement.
+    #[inline(always)]
+    pub fn commit(&mut self, now_ns: u64) {
+        self.w10s.commit(now_ns);
+        self.unfilled = self.unfilled.saturating_add(1);
+    }
+
+    /// An order of ours filled (its first fill, as the venue counts it) at
+    /// `wall_ms`: one off the day's count, never below zero — today's only:
+    /// an end of an earlier day takes nothing off today's. The count is
+    /// this process's: it starts at 0 at boot (the venue's own count of
+    /// the day is not read — the risk review's R2-2, carried to BX13).
+    #[inline(always)]
+    pub fn filled(&mut self, wall_ms: u64) {
+        self.roll(wall_ms);
+        if wall_ms / DAY_MS == self.day {
+            self.unfilled = self.unfilled.saturating_sub(1);
+        }
+    }
+
+    /// The day's unfilled count (cold: tests).
+    #[must_use]
+    pub const fn unfilled(&self) -> u32 {
+        self.unfilled
     }
 }
 
@@ -278,7 +358,10 @@ pub const W_CLOCK_PER_MIN: u64 = 4;
 /// dead-man on every one of `max_symbols` rows with a maker, a full
 /// reconciliation every `recon_every_ms` and margin re-reads at their
 /// fastest on each of `lanes` futures products (BX7: UM and CM share the
-/// IP's pool), and the clock. The boot refuses a configuration whose worst case
+/// IP's pool), and the clock. Spot's requests (BX8) are spot's own pool's
+/// (6 000 a minute per IP; a cycle — `account.status` 20, `openOrders` 80 —
+/// is under 2 % of it a minute): never counted here, nor in the run-time
+/// window. The boot refuses a configuration whose worst case
 /// exceeds [`ARM_WEIGHT_SHARE_1E6`] of [`IP_WEIGHT_PER_MIN`]; at run time
 /// (BX7) the gateway sums what it spends in a one-minute window
 /// ([`request_weight`]) and, past [`WEIGHT_THROTTLE_PCT`] of that share,
@@ -409,6 +492,57 @@ mod tests {
     use super::*;
 
     const S: u64 = 1_000_000_000;
+
+    /// BX8: spot's pool — 100 / 10 s sliding at `frac`, and the day's
+    /// unfilled count against 200 000 at `frac`: up a place, down an order
+    /// that filled (never below zero), reset at 00:00Z.
+    #[test]
+    fn the_spot_pool_mirrors_the_unfilled_count() {
+        let mut p = SpotOrders::new(800_000);
+        assert_eq!(p.w10s.cap(), 80);
+        let day0 = 20_000 * DAY_MS;
+        p.roll(day0);
+        let mut t = S;
+        for _ in 0..80 {
+            assert!(p.admits(t));
+            p.commit(t);
+            t += 1;
+        }
+        assert!(!p.admits(t), "the 10 s window at 80 % of 100");
+        assert!(p.admits(t + 10 * S), "the window slides");
+        assert_eq!(p.unfilled(), 80);
+        p.filled(day0 + 1);
+        assert_eq!(p.unfilled(), 79, "an order that filled is off the count");
+        let mut q = SpotOrders::new(1);
+        assert!(!q.admits(S), "a cap of nothing admits nothing");
+        q.filled(day0);
+        assert_eq!(q.unfilled(), 0, "never below zero");
+        // The day's cap: 200 000 × 0.8 = 160 000 — then refused all day.
+        let mut d = SpotOrders::new(800_000);
+        d.roll(day0);
+        d.unfilled = 159_999;
+        assert!(d.admits(S));
+        d.commit(S);
+        assert!(!d.admits(20 * S), "the day's unfilled count at its cap");
+        d.filled(day0 + 2);
+        assert!(d.admits(20 * S), "a fill frees one");
+        d.commit(20 * S);
+        d.roll(day0 + DAY_MS);
+        assert_eq!(d.unfilled(), 0, "a new UTC day");
+        assert!(d.admits(40 * S));
+        // Midnight (AL2-2): an end stamped yesterday, drained after today's
+        // first places, neither rolls the day back nor takes one off today.
+        let mut m = SpotOrders::new(800_000);
+        m.roll(day0 + DAY_MS);
+        m.commit(S);
+        m.commit(S + 1);
+        m.filled(day0 + DAY_MS - 1);
+        assert_eq!(m.unfilled(), 2, "yesterday's end: today's count kept");
+        m.roll(day0);
+        assert_eq!(m.unfilled(), 2, "the day never rolls back");
+        m.filled(day0 + DAY_MS + 5);
+        assert_eq!(m.unfilled(), 1, "today's end: one off");
+    }
 
     #[test]
     fn a_window_refuses_at_its_share_and_slides() {

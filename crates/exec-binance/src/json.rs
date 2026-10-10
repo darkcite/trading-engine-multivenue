@@ -227,7 +227,15 @@ fn num_bytes(b: &[u8], v0: usize, v1: usize) -> Result<&[u8], ()> {
 /// never defaulted; the scale's own overflow is refused by the scanner.
 #[inline]
 pub fn dec_1e6(b: &[u8], v0: usize, v1: usize) -> Result<i64, ()> {
-    dec_scaled::<false>(b, v0, v1)
+    dec_scaled::<6>(b, v0, v1)
+}
+
+/// [`dec_1e6`]'s law at ×1e8 (≤ 8 decimals kept): a spot balance (BX8),
+/// at the venue's own precision — a base-asset commission is finer than a
+/// millionth.
+#[inline]
+pub fn dec_1e8(b: &[u8], v0: usize, v1: usize) -> Result<i64, ()> {
+    dec_scaled::<8>(b, v0, v1)
 }
 
 /// [`dec_1e6`]'s law at ×1e9 (≤ 9 decimals kept), for an amount finer
@@ -235,12 +243,12 @@ pub fn dec_1e6(b: &[u8], v0: usize, v1: usize) -> Result<i64, ()> {
 /// 8 decimals, where ×1e6 keeps nothing of a small trade's).
 #[inline]
 pub fn dec_1e9(b: &[u8], v0: usize, v1: usize) -> Result<i64, ()> {
-    dec_scaled::<true>(b, v0, v1)
+    dec_scaled::<9>(b, v0, v1)
 }
 
-/// The two scales' one reader (`E9`: ×1e9, else ×1e6).
+/// The scales' one reader: ×10^`DIGITS` (6, 8 or 9).
 #[inline(always)]
-fn dec_scaled<const E9: bool>(b: &[u8], v0: usize, v1: usize) -> Result<i64, ()> {
+fn dec_scaled<const DIGITS: u8>(b: &[u8], v0: usize, v1: usize) -> Result<i64, ()> {
     let n = num_bytes(b, v0, v1)?;
     let mut i = (n.first() == Some(&b'-')) as usize;
     let int0 = i;
@@ -250,7 +258,11 @@ fn dec_scaled<const E9: bool>(b: &[u8], v0: usize, v1: usize) -> Result<i64, ()>
     if i - int0 > 18 {
         return Err(());
     }
-    let scanned = if E9 { core_parse::scan_price_1e9(n, 0) } else { core_parse::scan_price_1e6(n, 0) };
+    let scanned = match DIGITS {
+        9 => core_parse::scan_price_1e9(n, 0),
+        8 => core_parse::scan_price_1e8(n, 0),
+        _ => core_parse::scan_price_1e6(n, 0),
+    };
     let (v, end) = scanned.ok_or(())?;
     if end != n.len() {
         return Err(());
@@ -313,6 +325,20 @@ pub fn is_null(b: &[u8], v0: usize, v1: usize) -> bool {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// BX8: ×1e8 keeps a spot balance's 8 decimals (×1e6 would drop the
+    /// last two).
+    #[test]
+    fn eight_decimals_at_1e8() {
+        let b = br#""0.00099900""#;
+        assert_eq!(dec_1e8(b, 0, b.len()), Ok(99_900));
+        assert_eq!(dec_1e6(b, 0, b.len()), Ok(999));
+        let c = br#""0.00000001""#;
+        assert_eq!((dec_1e8(c, 0, c.len()), dec_1e6(c, 0, c.len())), (Ok(1), Ok(0)));
+        let w = br#""1000000.5""#;
+        assert_eq!(dec_1e8(w, 0, w.len()), Ok(100_000_050_000_000));
+        assert!(dec_1e8(b"x", 0, 1).is_err());
+    }
 
     #[test]
     fn walks_one_level_and_skips_nesting() {
@@ -405,7 +431,7 @@ mod tests {
                 for _ in 0..64 {
                     match w.next() {
                         Ok(Some((_, a, z))) => {
-                            let _ = (str_of(&bytes, a, z), dec_1e6(&bytes, a, z), dec_1e9(&bytes, a, z), u64_of(&bytes, a, z), i64_of(&bytes, a, z), bool_of(&bytes, a, z));
+                            let _ = (str_of(&bytes, a, z), dec_1e6(&bytes, a, z), dec_1e8(&bytes, a, z), dec_1e9(&bytes, a, z), u64_of(&bytes, a, z), i64_of(&bytes, a, z), bool_of(&bytes, a, z));
                         }
                         _ => break,
                     }

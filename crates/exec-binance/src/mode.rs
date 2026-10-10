@@ -12,19 +12,27 @@
 //! * [`AccountScope`] — dedicated (the engine owns the account) or shared
 //!   (the artifact's owned lists are the engine's universe; foreign activity
 //!   on an owned instrument is a drift HALT, BX-8).
-//! * [`built`] — what this phase's gateway speaks. BX6 builds **UM ×
-//!   classic** end to end; every other product or mode refuses the boot and
-//!   names the phase that brings it (BX7 futures modes, BX8 spot, BX9
-//!   options, BX10 Binance Stocks).
+//! * [`built`] — what this phase's gateway speaks: USDⓈ-M and COIN-M in
+//!   every mode (BX6, BX7), spot × classic (BX8: IoC-only); every other
+//!   product or mode refuses the boot and names what brings it (BX9
+//!   options, BX10 Binance Stocks, a ruling for spot beside Portfolio
+//!   Margin).
 //! * The **boot assertions** (BX-19) — pure judges over the venue's
 //!   answers. The gateway's boot phase makes the (cold, signed) queries and
 //!   refuses the boot on any mismatch; nothing here mutates the account
 //!   (every mutation is the operator tool's, `exec-smoke --binance-setup`).
 //!   BX7 adds each owned USDⓈ-M row's margin type and leverage
-//!   ([`judge_symbol_config`]); COIN-M's come with its account read.
+//!   ([`judge_symbol_config`]); COIN-M's come with its account read. BX8
+//!   adds the key's spot permission ([`judge_key`]) and each armed spot
+//!   row's permission groups against the account's ([`judge_permission`],
+//!   the bStock check).
 
 use crate::inst::{PRODUCT_COINM, PRODUCT_EQUITY, PRODUCT_OPTIONS, PRODUCT_SPOT, PRODUCT_USDM};
 use crate::json::{bool_of, field, i64_of, str_of, u64_of, Elems, Pairs};
+use ingress_binance::discovery::{
+    BnPermissions, BN_PERM_COPY, BN_PERM_DCA, BN_PERM_FLAT, BN_PERM_GRID, BN_PERM_GROUPS_MAX, BN_PERM_MARGIN, BN_PERM_MULTI_SET, BN_PERM_PSB,
+    BN_PERM_RPI, BN_PERM_SPOT,
+};
 
 /// The account's margin mode (O-BX2).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -103,14 +111,20 @@ pub const fn maker_ok(product: u8, mode: AccountMode) -> bool {
 /// What this phase's gateway speaks: `Ok` for UM and COIN-M × classic
 /// (BX7: COIN-M on its own lane, IoC-only — O-BX3a), × Portfolio Margin
 /// (BX7, C2: papi, IoC-only — K13) and × PM Pro (BX7, C3: the classic
-/// routes, IoC-only until K14 shows the dead-man there); otherwise the
-/// phase that builds the product or mode.
+/// routes, IoC-only until K14 shows the dead-man there), and spot ×
+/// classic (BX8: IoC-only — spot has no dead-man); otherwise the phase or
+/// ruling that brings the product or mode.
 pub const fn built(product: u8, mode: AccountMode) -> Result<(), &'static str> {
     match product {
         PRODUCT_USDM | PRODUCT_COINM => match mode {
             AccountMode::Classic | AccountMode::Pm | AccountMode::PmPro => Ok(()),
         },
-        PRODUCT_SPOT => Err("BX8 (spot)"),
+        PRODUCT_SPOT => match mode {
+            AccountMode::Classic => Ok(()),
+            // Unproven (no PM Demo exists) and outside the unified
+            // account's equity: not built.
+            AccountMode::Pm | AccountMode::PmPro => Err("a ruling (spot beside Portfolio Margin or PM Pro)"),
+        },
         PRODUCT_OPTIONS => Err("BX9 (options)"),
         PRODUCT_EQUITY => Err("BX10 (Binance Stocks)"),
         _ => Err("no phase: an unknown product"),
@@ -144,6 +158,11 @@ pub enum AssertErr {
     Leverage,
     /// The venue's answer does not list an owned row (BX7; fail closed).
     Unlisted,
+    /// An armed spot row's permission groups are not the account's (BX8,
+    /// the bStock check; [`judge_permission`]).
+    SymbolNotPermitted,
+    /// The spot account answers `canTrade: false` (BX8).
+    CannotTrade,
 }
 
 /// The answer's own boolean `key` — named once, at the top level
@@ -237,11 +256,28 @@ pub fn symbol_config(body: &[u8], symbol: &[u8]) -> Result<(bool, u64), AssertEr
     verdict
 }
 
-/// `GET /sapi/v1/account/apiRestrictions` in `mode`: the key trades
-/// futures and cannot withdraw — and in Portfolio Margin it trades PM
-/// (`enablePortfolioMarginTrading`; BX7, C2).
-pub fn judge_key(body: &[u8], mode: AccountMode) -> Result<(), AssertErr> {
-    judge_key_futures(body)?;
+/// `GET /sapi/v1/account/apiRestrictions` in `mode`: the key cannot
+/// withdraw and trades what is armed — futures (`enableFutures`) when a
+/// futures lane is, spot (`enableSpotAndMarginTrading`; BX8) when spot is
+/// — and in Portfolio Margin it trades PM (`enablePortfolioMarginTrading`;
+/// BX7, C2).
+pub fn judge_key(body: &[u8], mode: AccountMode, futures: bool, spot: bool) -> Result<(), AssertErr> {
+    if futures {
+        judge_key_futures(body)?;
+    } else {
+        match json_bool(body, b"enableWithdrawals") {
+            Some(false) => {}
+            Some(true) => return Err(AssertErr::CanWithdraw),
+            None => return Err(AssertErr::Unreadable),
+        }
+    }
+    if spot {
+        match json_bool(body, b"enableSpotAndMarginTrading") {
+            Some(true) => {}
+            Some(false) => return Err(AssertErr::NoTradePermission),
+            None => return Err(AssertErr::Unreadable),
+        }
+    }
     if matches!(mode, AccountMode::Pm) {
         return match json_bool(body, b"enablePortfolioMarginTrading") {
             Some(true) => Ok(()),
@@ -264,6 +300,37 @@ pub fn judge_key_futures(body: &[u8]) -> Result<(), AssertErr> {
         (Some(true), Some(true)) => Err(AssertErr::CanWithdraw),
         _ => Err(AssertErr::Unreadable),
     }
+}
+
+/// The permission names this build knows (`BN_PERM_*`'s name bits).
+const PERM_KNOWN: u16 = BN_PERM_SPOT | BN_PERM_MARGIN | BN_PERM_GRID | BN_PERM_COPY | BN_PERM_DCA | BN_PERM_PSB | BN_PERM_RPI;
+
+/// **BX8 — may the account trade the symbol** (the bStock check, BX-19):
+/// the symbol's `permissionSets` (discovery) against the account's
+/// `permissions` (`account.status`). The venue's rule: each inner set
+/// needs ONE member the account holds — a name (`SPOT`, `MARGIN`, …) or a
+/// `TRD_GRP_n`. Fail closed: a symbol with several sets (the digest is
+/// their union, the venue ANDs them), or a name outside any set (no spot
+/// shape: `BN_PERM_FLAT`, the parser review's P2-5), is refused; a member that only a
+/// name this build does not know (`BN_PERM_OTHER`), or a group past the
+/// bitset (`BN_PERM_GROUP_OVERFLOW`), could match is undecidable, and
+/// refused: only a known name or a group in the bitset held by both
+/// passes.
+pub fn judge_permission(sym: &BnPermissions, acct: &BnPermissions) -> Result<(), AssertErr> {
+    if sym.names & (BN_PERM_MULTI_SET | BN_PERM_FLAT) != 0 {
+        return Err(AssertErr::SymbolNotPermitted);
+    }
+    if sym.names & acct.names & PERM_KNOWN != 0 {
+        return Ok(());
+    }
+    let mut i = 0;
+    while i < BN_PERM_GROUPS_MAX / 64 {
+        if sym.groups[i] & acct.groups[i] != 0 {
+            return Ok(());
+        }
+        i += 1;
+    }
+    Err(AssertErr::SymbolNotPermitted)
 }
 
 /// `GET /sapi/v1/portfolio/account` (K17): a classic account is refused
@@ -296,6 +363,46 @@ pub fn judge_mode(status: u16, body: &[u8], want: AccountMode) -> Result<(), Ass
 mod tests {
     use super::*;
 
+    fn perms(names: &[&[u8]]) -> BnPermissions {
+        let mut p = BnPermissions::EMPTY;
+        for n in names {
+            p.add(n);
+        }
+        p
+    }
+
+    /// BX8, the bStock check: the venue's rule — the account holds a member
+    /// of the symbol's set — and fail closed past it (several sets; a
+    /// member only an unknown name or a group past the bitset could match).
+    #[test]
+    fn the_permission_judge() {
+        let refused = Err(AssertErr::SymbolNotPermitted);
+        let bstock = perms(&[b"TRD_GRP_004", b"TRD_GRP_261"]);
+        assert_eq!(judge_permission(&bstock, &perms(&[b"SPOT"])), refused, "a missing group");
+        assert_eq!(judge_permission(&bstock, &perms(&[b"SPOT", b"TRD_GRP_261"])), Ok(()));
+        let btc = perms(&[b"SPOT", b"MARGIN", b"TRD_GRP_004"]);
+        assert_eq!(judge_permission(&btc, &perms(&[b"SPOT"])), Ok(()), "a name in common");
+        assert_eq!(judge_permission(&btc, &perms(&[b"TRD_GRP_004"])), Ok(()), "a group in common");
+        assert_eq!(judge_permission(&btc, &perms(&[b"TRD_GRP_005"])), refused);
+        assert_eq!(judge_permission(&btc, &BnPermissions::EMPTY), refused, "an account with none");
+        let d = crate::inst::tests::fapi_rows(crate::inst::tests::SPOT);
+        let doge = d.find(b"DOGEUSDT").unwrap().perm;
+        assert_ne!(doge.names & BN_PERM_MULTI_SET, 0, "two sets");
+        assert_eq!(judge_permission(&doge, &perms(&[b"SPOT", b"TRD_GRP_002"])), refused, "the venue ANDs the sets; the digest cannot");
+        assert_eq!(judge_permission(&perms(&[b"LEVERAGED"]), &perms(&[b"LEVERAGED"])), refused, "an unknown name, unseen");
+        assert_eq!(judge_permission(&perms(&[b"TRD_GRP_600"]), &perms(&[b"TRD_GRP_600"])), refused, "past the bitset");
+        assert_eq!(judge_permission(&perms(&[b"TRD_GRP_511"]), &perms(&[b"TRD_GRP_511"])), Ok(()), "the bitset's last group");
+        // The venue's spelling (P2-6a): names compare as strings —
+        // `TRD_GRP_4` is not `TRD_GRP_004`.
+        assert_eq!(judge_permission(&perms(&[b"TRD_GRP_004"]), &perms(&[b"TRD_GRP_4"])), refused, "a spelling the venue never matches");
+        assert_ne!(perms(&[b"TRD_GRP_0004"]).names & ingress_binance::discovery::BN_PERM_OTHER, 0, "a fourth digit led by zero: no group");
+        assert_eq!(perms(&[b"TRD_GRP_04"]).has_group(4), Some(false), "two digits: no group");
+        // A name outside any set (P2-5): no spot shape, refused.
+        let mut flat = perms(&[b"SPOT"]);
+        flat.names |= BN_PERM_FLAT;
+        assert_eq!(judge_permission(&flat, &perms(&[b"SPOT"])), refused, "a flat list");
+    }
+
     #[test]
     fn the_maker_list_is_um_classic_only() {
         let modes = [AccountMode::Classic, AccountMode::Pm, AccountMode::PmPro];
@@ -316,7 +423,10 @@ mod tests {
         assert_eq!(built(PRODUCT_COINM, AccountMode::PmPro), Ok(()));
         assert!(!maker_ok(PRODUCT_USDM, AccountMode::PmPro), "K14: no dead-man proven under PM Pro");
         assert!(!maker_ok(PRODUCT_USDM, AccountMode::Pm), "K13: no dead-man in PM");
-        assert!(built(PRODUCT_SPOT, AccountMode::Classic).unwrap_err().starts_with("BX8"));
+        assert_eq!(built(PRODUCT_SPOT, AccountMode::Classic), Ok(()), "BX8: spot classic");
+        assert!(built(PRODUCT_SPOT, AccountMode::Pm).unwrap_err().starts_with("a ruling"));
+        assert!(built(PRODUCT_SPOT, AccountMode::PmPro).unwrap_err().starts_with("a ruling"));
+        assert!(!maker_ok(PRODUCT_SPOT, AccountMode::Classic), "BX-17: spot has no dead-man");
         assert!(built(PRODUCT_OPTIONS, AccountMode::Classic).unwrap_err().starts_with("BX9"));
         assert!(built(PRODUCT_EQUITY, AccountMode::Classic).unwrap_err().starts_with("BX10"));
         // O-BX3a: no maker rests on COIN-M (no dead-man of ours there yet).
@@ -406,6 +516,20 @@ mod tests {
         // The judges' booleans: the answer's own, once.
         let dup = br#"{"enableWithdrawals":false,"enableFutures":true,"enableWithdrawals":true}"#;
         assert_eq!(judge_key_futures(dup), Err(AssertErr::Unreadable));
+        // BX8: the key trades what is armed — spot's own flag, futures'
+        // only when a futures lane is; never one that can withdraw.
+        let both = br#"{"enableWithdrawals":false,"enableFutures":true,"enableSpotAndMarginTrading":true}"#;
+        let spot_only = br#"{"enableWithdrawals":false,"enableFutures":false,"enableSpotAndMarginTrading":true}"#;
+        let fut_only = br#"{"enableWithdrawals":false,"enableFutures":true,"enableSpotAndMarginTrading":false}"#;
+        let c = AccountMode::Classic;
+        assert_eq!(judge_key(both, c, true, true), Ok(()));
+        assert_eq!(judge_key(spot_only, c, false, true), Ok(()));
+        assert_eq!(judge_key(spot_only, c, true, true), Err(AssertErr::NoTradePermission));
+        assert_eq!(judge_key(fut_only, c, true, true), Err(AssertErr::NoTradePermission));
+        assert_eq!(judge_key(fut_only, c, true, false), Ok(()));
+        let w = br#"{"enableWithdrawals":true,"enableSpotAndMarginTrading":true}"#;
+        assert_eq!(judge_key(w, c, false, true), Err(AssertErr::CanWithdraw));
+        assert_eq!(judge_key(br#"{"enableWithdrawals":false}"#, c, false, true), Err(AssertErr::Unreadable));
         assert_eq!(judge_one_way(br#"{"x":{"dualSidePosition":false}}"#), Err(AssertErr::Unreadable), "a nested key is not the answer's");
     }
 }

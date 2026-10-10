@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! **A scripted Binance futures venue** over a real rustls server on the
-//! loopback (BX12; moved from the end-to-end test): USDⓈ-M (`fapi`, the
-//! WS API, the user stream), COIN-M (`dapi`, ws-dapi, dstream), Portfolio
-//! Margin (`papi`, `/pm/ws/`), PM Pro's risk stream and SAPI's unified
-//! account, all on one listener. The gateway's end-to-end tests
-//! (`tests/bn_e2e_loopback.rs`) and allocation gate 94 run the real
-//! [`crate::gateway::BnGateway`] against it. Feature `testvenue` only;
-//! never in a production build.
+//! **A scripted Binance venue** over a real rustls server on the loopback
+//! (BX12; moved from the end-to-end test): USDⓈ-M (`fapi`, the WS API, the
+//! user stream), COIN-M (`dapi`, ws-dapi, dstream), Portfolio Margin
+//! (`papi`, `/pm/ws/`), PM Pro's risk stream and SAPI's unified account —
+//! and spot (BX8: `api/v3`, and the `/ws-api/v3` sessions, which carry the
+//! account's user data beside their answers) — all on one listener. The
+//! gateway's end-to-end tests (`tests/bn_e2e_loopback.rs`) and allocation
+//! gate 94 run the real [`crate::gateway::BnGateway`] against it. Feature
+//! `testvenue` only; never in a production build.
 //!
 //! It verifies every signed request (Ed25519 with `ring` against
 //! [`SEED`]'s public key, never the signer under test; HMAC with
@@ -17,9 +18,17 @@
 //! served for the tests to assert. Every connection gets its own thread;
 //! [`VState`] is the venue, behind one lock ([`Venue::with`]).
 //!
+//! **Spot (BX8)** keeps its own order store ([`SpotOrder`]: a spot BTCUSDT
+//! never meets USDⓈ-M's) and the account's balances at the venue's 8
+//! decimals. A spot session queues its answers and the account's events in
+//! the order the venue makes them — an answer, then the reports its order
+//! caused — on every subscribed session's queue (a make-before-break
+//! overlap's two sessions both carry each event); each session's thread
+//! sends its queue, then reads (2 ms at most), in turn.
+//!
 //! COPY-DOCTRINE: test fixture; allocates and copies freely.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,6 +75,25 @@ pub const FAPI_DUST: &[u8] = br#"{"symbols":[{"symbol":"DUSTUSDT","pair":"DUSTUS
 /// fapi's `exchangeInfo` row for BTCUSDT (the discovery's own fixture's shape).
 pub const FAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","pair":"BTCUSDT","contractType":"PERPETUAL","status":"TRADING","pricePrecision":2,"quantityPrecision":3,"filters":[{"filterType":"PRICE_FILTER","minPrice":"0.10","maxPrice":"4529764","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","maxQty":"1000","minQty":"0.001"},{"filterType":"MAX_NUM_ORDERS","limit":200},{"filterType":"MIN_NOTIONAL","notional":"100"},{"filterType":"PERCENT_PRICE","multiplierUp":"1.0500","multiplierDown":"0.9500","multiplierDecimal":"4"}]}]}"#;
 
+/// BX8: spot's `exchangeInfo` rows, as the venue lists them — BTCUSDT
+/// (tick 0.01, step 0.00001, a 5 USDT notional) and BNBUSDT, each with a
+/// set the `SPOT` permission meets; TSLABUSDT, a bStock whose one set names
+/// trading groups only (the permission check's, BX-19); BTCUSDC and
+/// BNBBTC, which no arm may bind beside BTCUSDT (BTC armed twice; BTC
+/// another row's quote — `BootErr::SpotAsset`).
+pub const SPOT: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.01000000","maxPrice":"1000000.00000000","tickSize":"0.01000000"},{"filterType":"LOT_SIZE","minQty":"0.00001000","maxQty":"9000.00000000","stepSize":"0.00001000"},{"filterType":"NOTIONAL","minNotional":"5.00000000","applyMinToMarket":true,"maxNotional":"9000000.00000000","applyMaxToMarket":false,"avgPriceMins":5},{"filterType":"MAX_NUM_ORDERS","maxNumOrders":200}],"permissionSets":[["SPOT","MARGIN","TRD_GRP_004"]]},{"symbol":"BNBUSDT","status":"TRADING","baseAsset":"BNB","quoteAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.01000000","maxPrice":"100000.00000000","tickSize":"0.01000000"},{"filterType":"LOT_SIZE","minQty":"0.00100000","maxQty":"9000.00000000","stepSize":"0.00100000"},{"filterType":"NOTIONAL","minNotional":"5.00000000","maxNotional":"9000000.00000000","avgPriceMins":5}],"permissionSets":[["SPOT","MARGIN"]]},{"symbol":"TSLABUSDT","status":"TRADING","baseAsset":"TSLAB","quoteAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.01000000","maxPrice":"100000.00000000","tickSize":"0.01000000"},{"filterType":"LOT_SIZE","minQty":"0.00100000","maxQty":"922327.00000000","stepSize":"0.00100000"},{"filterType":"NOTIONAL","minNotional":"5.00000000","maxNotional":"9000000.00000000","avgPriceMins":5},{"filterType":"MAX_NUM_ORDERS","maxNumOrders":200}],"permissionSets":[["TRD_GRP_004","TRD_GRP_261"]]},{"symbol":"BTCUSDC","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDC","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.01000000","maxPrice":"1000000.00000000","tickSize":"0.01000000"},{"filterType":"LOT_SIZE","minQty":"0.00001000","maxQty":"9000.00000000","stepSize":"0.00001000"},{"filterType":"NOTIONAL","minNotional":"5.00000000","maxNotional":"9000000.00000000","avgPriceMins":5}],"permissionSets":[["SPOT","MARGIN"]]},{"symbol":"BNBBTC","status":"TRADING","baseAsset":"BNB","quoteAsset":"BTC","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.00000100","maxPrice":"100000.00000000","tickSize":"0.00000100"},{"filterType":"LOT_SIZE","minQty":"0.00100000","maxQty":"100000.00000000","stepSize":"0.00100000"},{"filterType":"NOTIONAL","minNotional":"0.00010000","maxNotional":"9000000.00000000","avgPriceMins":5}],"permissionSets":[["SPOT","MARGIN"]]}]}"#;
+/// [`SPOT`]'s symbols, each with its base and quote asset.
+const SPOT_PAIRS: [(&str, &str, &str); 5] = [
+    ("BTCUSDT", "BTC", "USDT"),
+    ("BNBUSDT", "BNB", "USDT"),
+    ("TSLABUSDT", "TSLAB", "USDT"),
+    ("BTCUSDC", "BTC", "USDC"),
+    ("BNBBTC", "BNB", "BTC"),
+];
+/// Their tick ×1e8 (0.01): an IoC's k-th trade is k + 1 ticks better than
+/// its limit.
+const SPOT_TICK_1E8: i64 = 1_000_000;
+
 // =========================================================================
 // Small codecs (the venue's side; independent of the crate under test)
 // =========================================================================
@@ -75,21 +103,44 @@ pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_millis() as u64
 }
 
-/// A decimal string ×1e6 (truncating past six decimals).
-fn d6(s: &str) -> i64 {
+/// A decimal string ×10^`places` (truncating past them).
+fn dec(s: &str, places: usize) -> i64 {
     let (neg, s) = s.strip_prefix('-').map_or((false, s), |r| (true, r));
     let (i, f) = s.split_once('.').unwrap_or((s, ""));
     let mut frac = String::from(f);
-    frac.truncate(6);
-    while frac.len() < 6 {
+    frac.truncate(places);
+    while frac.len() < places {
         frac.push('0');
     }
-    let v = i.parse::<i64>().expect("int") * 1_000_000 + frac.parse::<i64>().expect("frac");
+    let v = i.parse::<i64>().expect("int") * 10i64.pow(places as u32) + frac.parse::<i64>().expect("frac");
     if neg {
         -v
     } else {
         v
     }
+}
+
+/// A decimal string ×1e6 (truncating past six decimals).
+fn d6(s: &str) -> i64 {
+    dec(s, 6)
+}
+
+/// A decimal string ×1e8: spot's figures, at the venue's 8 decimals (BX8).
+fn d8(s: &str) -> i64 {
+    dec(s, 8)
+}
+
+/// A ×1e8 value at the venue's 8 decimals (spot's figures, BX8).
+fn f8(v: i64) -> String {
+    let sign = if v < 0 { "-" } else { "" };
+    let a = v.unsigned_abs();
+    format!("{sign}{}.{:08}", a / 100_000_000, a % 100_000_000)
+}
+
+/// Two ×1e8 figures' product, ×1e8 (truncated): a quantity at a price is
+/// its quote.
+fn mul8(a: i64, b: i64) -> i64 {
+    (a as i128 * b as i128 / 100_000_000) as i64
 }
 
 /// The scripted venue's commission ×1e8 (its 8 decimals): 5 bp of the
@@ -199,6 +250,20 @@ fn pct(s: &str) -> Vec<u8> {
         }
     }
     o
+}
+
+/// A WS API answer to request `id`: its `result`, with the order rate
+/// limits.
+fn ws_ok(id: &str, result: &str) -> Vec<u8> {
+    format!(
+        r#"{{"id":{id},"status":200,"result":{result},"rateLimits":[{{"rateLimitType":"ORDERS","interval":"SECOND","intervalNum":10,"limit":300,"count":1}},{{"rateLimitType":"ORDERS","interval":"MINUTE","intervalNum":1,"limit":1200,"count":1}}]}}"#
+    )
+    .into_bytes()
+}
+
+/// A WS API refusal of request `id`.
+fn ws_err(id: &str, status: u16, code: i32, msg: &str) -> Vec<u8> {
+    format!(r#"{{"id":{id},"status":{status},"error":{{"code":{code},"msg":"{msg}"}}}}"#).into_bytes()
 }
 
 /// A server frame (unmasked; ≤ 64 KiB).
@@ -344,6 +409,166 @@ impl VOrder {
     }
 }
 
+/// One spot order the venue holds (BX8), in spot's own store
+/// ([`VState::spot_orders`]): a spot BTCUSDT never meets USDⓈ-M's. Its
+/// figures are ×1e8, the venue's 8 decimals.
+#[derive(Clone, Debug)]
+pub struct SpotOrder {
+    /// The venue's order id.
+    pub oid: u64,
+    /// The client id it was placed with.
+    pub cid: String,
+    /// One of [`SPOT`]'s symbols.
+    pub symbol: &'static str,
+    /// A buy; else a sell.
+    pub buy: bool,
+    /// The time in force: the arm's `IOC`, or a stranger's resting `GTC`.
+    pub tif: &'static str,
+    /// The quantity ×1e8.
+    pub qty: i64,
+    /// The limit price ×1e8.
+    pub px: i64,
+    /// The quantity filled so far ×1e8 (the report's `z`).
+    pub executed: i64,
+    /// The quote filled so far ×1e8 (`cummulativeQuoteQty`, the report's
+    /// `Z`).
+    pub quote: i64,
+    /// The venue's status word: `NEW`, `PARTIALLY_FILLED`, `FILLED` or
+    /// `EXPIRED`.
+    pub status: &'static str,
+}
+
+/// One spot trade as the venue booked it — what its report and its
+/// `myTrades` row name: the trade and order ids, the symbol and side, the
+/// quantity and price ×1e8, the commission ×1e8 in its asset, the time.
+#[derive(Clone, Copy)]
+struct Trade {
+    id: u64,
+    oid: u64,
+    symbol: &'static str,
+    buy: bool,
+    qty: i64,
+    px: i64,
+    fee: i64,
+    fee_asset: &'static str,
+    time_ms: u64,
+}
+
+impl Trade {
+    /// Its `myTrades` row (the buyer and the maker named, not the side).
+    fn row(&self) -> String {
+        format!(
+            r#"{{"symbol":"{}","id":{},"orderId":{},"orderListId":-1,"price":"{}","qty":"{}","quoteQty":"{}","commission":"{}","commissionAsset":"{}","time":{},"isBuyer":{},"isMaker":false,"isBestMatch":true}}"#,
+            self.symbol,
+            self.id,
+            self.oid,
+            f8(self.px),
+            f8(self.qty),
+            f8(mul8(self.qty, self.px)),
+            f8(self.fee),
+            self.fee_asset,
+            self.time_ms,
+            self.buy
+        )
+    }
+}
+
+impl SpotOrder {
+    /// Still working: `NEW` or `PARTIALLY_FILLED`.
+    pub fn open(&self) -> bool {
+        self.status == "NEW" || self.status == "PARTIALLY_FILLED"
+    }
+
+    fn side(&self) -> &'static str {
+        if self.buy {
+            "BUY"
+        } else {
+            "SELL"
+        }
+    }
+
+    /// Its base and quote assets.
+    fn assets(&self) -> (&'static str, &'static str) {
+        SPOT_PAIRS.iter().find(|p| p.0 == self.symbol).map_or(("", ""), |p| (p.1, p.2))
+    }
+
+    /// `order.place`'s answer under `newOrderRespType=ACK` (spot's has no
+    /// status).
+    fn ack(&self) -> String {
+        format!(
+            r#"{{"symbol":"{}","orderId":{},"orderListId":-1,"clientOrderId":"{}","transactTime":{}}}"#,
+            self.symbol,
+            self.oid,
+            self.cid,
+            now_ms()
+        )
+    }
+
+    /// The `order.status` / `openOrders` shape: no `avgPrice` — the
+    /// average is `cummulativeQuoteQty / executedQty`.
+    fn result(&self) -> String {
+        let now = now_ms();
+        format!(
+            r#"{{"symbol":"{}","orderId":{},"orderListId":-1,"clientOrderId":"{}","price":"{}","origQty":"{}","executedQty":"{}","cummulativeQuoteQty":"{}","status":"{}","timeInForce":"{}","type":"LIMIT","side":"{}","stopPrice":"0.00000000","icebergQty":"0.00000000","time":{now},"updateTime":{now},"isWorking":true,"workingTime":{now},"origQuoteOrderQty":"0.00000000","selfTradePreventionMode":"EXPIRE_MAKER"}}"#,
+            self.symbol,
+            self.oid,
+            self.cid,
+            f8(self.px),
+            f8(self.qty),
+            f8(self.executed),
+            f8(self.quote),
+            self.status,
+            self.tif,
+            self.side()
+        )
+    }
+
+    /// Its `executionReport` of execution type `x` (the status is the
+    /// order's): a trade's id, last quantity and price, and commission in
+    /// its asset — or, with none, `t` -1, `n` "0" and `N` null; an IoC's
+    /// expiry names its reason.
+    fn report(&self, x: &str, trade: Option<Trade>) -> String {
+        let now = now_ms();
+        let (t, l, lp, n, na) = match trade {
+            Some(tr) => (tr.id as i64, tr.qty, tr.px, f8(tr.fee), format!(r#""{}""#, tr.fee_asset)),
+            None => (-1, 0, 0, String::from("0"), String::from("null")),
+        };
+        let why = if x == "EXPIRED" { r#","eR":"UNFILLED_IOC_QUANTITY_EXPIRED""# } else { "" };
+        format!(
+            r#"{{"e":"executionReport","E":{now},"s":"{}","c":"{}","S":"{}","o":"LIMIT","f":"{}","q":"{}","p":"{}","P":"0.00000000","F":"0.00000000","g":-1,"C":"","x":"{x}","X":"{}","r":"NONE","i":{},"l":"{}","z":"{}","L":"{}","n":"{n}","N":{na},"T":{now},"t":{t},"I":{now},"w":{},"m":false,"M":{},"O":{now},"Z":"{}","Y":"{}","Q":"0.00000000","W":{now},"V":"EXPIRE_MAKER"{why}}}"#,
+            self.symbol,
+            self.cid,
+            self.side(),
+            self.tif,
+            f8(self.qty),
+            f8(self.px),
+            self.status,
+            self.oid,
+            f8(l),
+            f8(self.executed),
+            f8(lp),
+            self.open(),
+            trade.is_some(),
+            f8(self.quote),
+            f8(mul8(l, lp)),
+        )
+    }
+}
+
+/// One spot session (BX8, `/ws-api/v3`, by its connection): logged on or
+/// not, its user-data subscription, and the frames waiting to go out on
+/// it — answers and events, in the order the venue made them.
+#[derive(Default)]
+struct SpotSession {
+    logged: bool,
+    /// The subscription its events name (`subscriptionId`), while
+    /// subscribed.
+    sub: Option<u32>,
+    /// The next subscription id: per session, from 0.
+    next_sub: u32,
+    out: VecDeque<Vec<u8>>,
+}
+
 /// Everything the venue holds and saw.
 pub struct VState {
     pk: Vec<u8>,
@@ -437,12 +662,12 @@ pub struct VState {
     /// Refuse the next `order.cancel` once, with this code.
     pub refuse_cancel: Option<i32>,
     /// BX12: refuse the next `order.place` once with this code (400),
-    /// applying nothing — `-1021`, the clock's.
+    /// applying nothing — `-1021`, the clock's (spot's too, BX8).
     pub refuse_place: Option<i32>,
     /// BX12: apply the next `order.place` but never answer it (its answer
-    /// lost on the way: the stream still reports the order). The WS API's
-    /// only: on the REST order route it reads as a 503 `-1007`, an unknown
-    /// outcome (as `defer_place` does).
+    /// lost on the way: the stream — spot's subscription, BX8 — still
+    /// reports the order). The WS API's only: on the REST order route it
+    /// reads as a 503 `-1007`, an unknown outcome (as `defer_place` does).
     pub lose_place_answer: bool,
     /// User events are LOST (kept in `lost`, never sent): the stream is
     /// "down" as far as the venue's events go.
@@ -463,15 +688,15 @@ pub struct VState {
     pub lost: Vec<Vec<u8>>,
     /// Close the user stream's connection once (it reconnects).
     pub drop_user: bool,
-    /// The order session is down: its connection closes and new ones are
-    /// refused.
+    /// The order session is down — spot's too (BX8): its connection closes
+    /// and new ones are refused.
     pub ws_down: bool,
     /// Answer the next `order.place` with a 429 (`-1003`).
     pub budget_next: bool,
     /// Apply the next `order.modify` but answer it 503 (`-1007`).
     pub modify_5xx: bool,
-    /// The order session is HALF-OPEN: its sockets stay up (new ones are
-    /// upgraded) and nothing is answered — not even a logon.
+    /// The order session is HALF-OPEN — spot's too (BX8): its sockets stay
+    /// up (new ones are upgraded) and nothing is answered — not even a logon.
     pub ws_mute: bool,
     /// When this order's status is asked for, first fill this much more of
     /// it (the rest fills while the status is in flight).
@@ -479,15 +704,16 @@ pub struct VState {
     /// `order.status` is answered this late (the socket's thread sleeps
     /// outside the venue's lock: the stream runs meanwhile).
     pub status_delay_ms: u64,
-    /// Order-session connections upgraded…
+    /// Futures order-session connections upgraded (spot's: `spot_conns`)…
     pub order_conns: u32,
     /// …and ended (the client closed them, or the venue did).
     pub order_closed: u32,
-    /// After the next WS API answer, the venue announces its shutdown on
-    /// that connection (`serverShutdown`; it keeps serving it).
+    /// After the next WS API answer — spot's too (BX8) — the venue announces
+    /// its shutdown on that connection (`serverShutdown`; it keeps serving
+    /// it).
     pub shutdown_next: bool,
-    /// A `session.logon` is held this long before it is served (the
-    /// socket's thread sleeps outside the venue's lock).
+    /// A `session.logon` — spot's too (BX8) — is held this long before it is
+    /// served (the socket's thread sleeps outside the venue's lock).
     pub logon_delay_ms: u64,
     /// Hold the next `order.place` answer until the next request's own
     /// answers are out (the venue took the requests out of order).
@@ -496,9 +722,10 @@ pub struct VState {
     /// `order.cancel` is answered this late (as `status_delay_ms`).
     pub cancel_delay_ms: u64,
     /// Every request, in the order served: `GET /fapi/v1/time`,
-    /// `ws order.place`, …
+    /// `ws order.place` (ws-fapi's; ws-dapi's `wsd …`, spot's `spot …`), …
     pub log: Vec<String>,
-    /// Every `order.place` request, as received.
+    /// Every futures `order.place` request, as received (spot's:
+    /// `spot_places`).
     pub places: Vec<String>,
     /// Every `order.modify` request, as received.
     pub modifies: Vec<String>,
@@ -518,12 +745,97 @@ pub struct VState {
     pub unauth: u32,
     /// Requests on a path the venue does not serve.
     pub unknown: u32,
-    /// The `session.logon`s served (ws-fapi and ws-dapi).
+    /// The `session.logon`s served (ws-fapi, ws-dapi and spot's).
     pub logons: u32,
     /// The `countdownCancelAll`s asked for on fapi.
     pub countdowns: u32,
     /// User-stream connections accepted.
     pub user_conns: u32,
+    // ---- Spot (BX8) -------------------------------------------------------
+    /// The spot sessions, by connection (an ended one stays, subscribed to
+    /// nothing).
+    spot_sess: Vec<SpotSession>,
+    /// Every spot order the venue holds, open or ended, in placement order
+    /// — spot's own store; a stranger's resting order may be pushed here.
+    pub spot_orders: Vec<SpotOrder>,
+    /// The account's spot balances: asset → free ×1e8 (nothing is ever
+    /// locked: an IoC ends at once). `account.status` omits the zero ones.
+    pub spot_bal_1e8: BTreeMap<String, i64>,
+    /// The account's `permissions` (`account.status`).
+    pub spot_permissions: Vec<String>,
+    /// The account's `canTrade`.
+    pub spot_can_trade: bool,
+    /// The key trades spot (`apiRestrictions`' `enableSpotAndMarginTrading`).
+    pub key_spot: bool,
+    /// The commission rate ×1e6 (1 000: 0.1 %): a BUY's of its quantity, in
+    /// the base asset; a SELL's of its quote, in the quote asset — at 8
+    /// decimals, truncated.
+    pub spot_fee_rate_1e6: i64,
+    /// The BNB burn: every trade's commission is this much BNB ×1e8 instead
+    /// (the account holds the BNB).
+    pub spot_bnb_fee_1e8: Option<i64>,
+    /// Per spot IoC, in order: its trades' quantities ×1e6, the k-th k + 1
+    /// ticks better than its limit (none queued: one trade of all of it;
+    /// none planned: no fill).
+    pub spot_plan: VecDeque<Vec<i64>>,
+    /// An IoC of exactly this quantity ×1e6, no plan queued, fills half of
+    /// it — the rest expires (0: none). For a venue in a child process,
+    /// whose IoCs no test can plan one by one (alloc gate 108).
+    pub spot_halve_qty_1e6: i64,
+    /// Spot sessions write every frame queued — an answer, each event — in
+    /// its own write (its own TLS record), as the venue may; else all that
+    /// is queued goes out in ONE write (alloc gate 108's per-frame window).
+    pub spot_frame_per_write: bool,
+    /// The next this-many `userDataStream.subscribe`s are answered 200
+    /// naming no `subscriptionId` — and subscribe nothing.
+    pub spot_sub_no_id: u32,
+    /// The next this-many `myTrades` reads by `orderId` answer 500
+    /// (`-1001`), each still logged in `spot_trade_reads`.
+    pub spot_order_trades_500: u32,
+    /// The next this-many reads by `orderId` answer an empty page — the
+    /// venue's trade list lagging its match (the risk review's R2-3).
+    pub spot_order_trades_lag: u32,
+    /// The next this-many reads by `orderId` name only the order's first
+    /// trade: a page short of its fill.
+    pub spot_order_trades_short: u32,
+    /// `ticker/price` answers name this symbol, whatever was asked (at the
+    /// asked symbol's price).
+    pub spot_ticker_names: Option<&'static str>,
+    /// `ticker/price` by symbol ×1e6 (a symbol not here: 400, `-1121`).
+    pub spot_px_1e6: BTreeMap<String, i64>,
+    /// The account's user data is lost: every event while it holds is kept
+    /// in `spot_lost`, never sent.
+    pub spot_mute_events: bool,
+    /// Lose the next this-many `TRADE` reports (each kept in `spot_lost`,
+    /// never sent); every other event goes out.
+    pub spot_drop_trade_reports: u32,
+    /// The events the venue lost (muted, or dropped), unsent, in order —
+    /// [`VState::spot_replay_lost`] delivers them late.
+    pub spot_lost: Vec<String>,
+    /// Every spot trade the venue booked, in order — reported or not: the
+    /// rows `myTrades` answers from.
+    spot_fills: Vec<Trade>,
+    /// Every `myTrades` query served, its parameters as received.
+    pub spot_trade_reads: Vec<String>,
+    /// Hold the next spot `order.place` — read, unserved, and nothing more
+    /// served on its session meanwhile — until another session subscribes:
+    /// a make-before-break overlap's trade then reaches both sessions (its
+    /// timestamp is judged when it is served, as any request's).
+    pub spot_hold_place: bool,
+    /// Every spot `order.place`, as received.
+    pub spot_places: Vec<String>,
+    /// Spot sessions upgraded (`/ws-api/v3`)…
+    pub spot_conns: u32,
+    /// …and ended (the client closed them, or the venue did).
+    pub spot_closed: u32,
+    /// Their `session.logon`s served (counted in `logons` too).
+    pub spot_logons: u32,
+    /// Their `userDataStream.subscribe`s served.
+    pub spot_subscribes: u32,
+    /// Their `account.status` reads served.
+    pub spot_accounts: u32,
+    /// `ticker/price` reads served.
+    pub spot_tickers: u32,
     day_start_ms: u64,
 }
 
@@ -646,6 +958,37 @@ impl VState {
             logons: 0,
             countdowns: 0,
             user_conns: 0,
+            spot_sess: Vec::new(),
+            spot_orders: Vec::new(),
+            // 10 000 USDT, and nothing else.
+            spot_bal_1e8: BTreeMap::from([(String::from("USDT"), 1_000_000_000_000)]),
+            spot_permissions: vec![String::from("SPOT")],
+            spot_can_trade: true,
+            key_spot: true,
+            spot_fee_rate_1e6: 1_000,
+            spot_bnb_fee_1e8: None,
+            spot_plan: VecDeque::new(),
+            spot_halve_qty_1e6: 0,
+            spot_frame_per_write: false,
+            spot_sub_no_id: 0,
+            spot_order_trades_500: 0,
+            spot_order_trades_lag: 0,
+            spot_order_trades_short: 0,
+            spot_ticker_names: None,
+            spot_px_1e6: BTreeMap::from([(String::from("BTCUSDT"), PX_MARK)]),
+            spot_mute_events: false,
+            spot_drop_trade_reports: 0,
+            spot_lost: Vec::new(),
+            spot_fills: Vec::new(),
+            spot_trade_reads: Vec::new(),
+            spot_hold_place: false,
+            spot_places: Vec::new(),
+            spot_conns: 0,
+            spot_closed: 0,
+            spot_logons: 0,
+            spot_subscribes: 0,
+            spot_accounts: 0,
+            spot_tickers: 0,
             day_start_ms,
         }
     }
@@ -818,8 +1161,8 @@ impl VState {
             ("GET", "/sapi/v1/account/apiRestrictions") => (
                 200,
                 format!(
-                    r#"{{"ipRestrict":true,"createTime":{now},"enableReading":true,"enableWithdrawals":false,"enableInternalTransfer":false,"enableMargin":false,"enableFutures":true,"permitsUniversalTransfer":false,"enableVanillaOptions":false,"enableFixApiTrade":false,"enableFixReadOnly":false,"enableSpotAndMarginTrading":false,"enablePortfolioMarginTrading":{}}}"#,
-                    self.pm
+                    r#"{{"ipRestrict":true,"createTime":{now},"enableReading":true,"enableWithdrawals":false,"enableInternalTransfer":false,"enableMargin":false,"enableFutures":true,"permitsUniversalTransfer":false,"enableVanillaOptions":false,"enableFixApiTrade":false,"enableFixReadOnly":false,"enableSpotAndMarginTrading":{},"enablePortfolioMarginTrading":{}}}"#,
+                    self.key_spot, self.pm
                 ),
             ),
             ("GET", "/papi/v1/account") | ("GET", "/sapi/v1/portfolio/account")
@@ -842,6 +1185,8 @@ impl VState {
                 String::from(r#"{"uniMMR":"50.00","accountEquity":"1000.00","actualEquity":"1000.00","accountMaintMargin":"20.00","accountStatus":"NORMAL","accountType":"PM_2"}"#),
             ),
             // ---- Portfolio Margin (BX7, C2): papi --------------------------------
+            // Binance's one server time: Portfolio Margin's clock (papi has
+            // none) and spot's (BX8).
             ("GET", "/api/v3/time") => (200, format!(r#"{{"serverTime":{now}}}"#)),
             ("POST", "/papi/v1/listenKey") | ("PUT", "/papi/v1/listenKey") => {
                 (200, format!(r#"{{"listenKey":"{PM_LISTEN_KEY}"}}"#))
@@ -930,6 +1275,40 @@ impl VState {
             }
             ("GET", "/dapi/v1/userTrades") | ("GET", "/papi/v1/cm/userTrades") => self.cm_trades(),
             ("GET", "/fapi/v1/userTrades") | ("GET", "/papi/v1/um/userTrades") => self.um_trades(),
+            // ---- Spot (BX8): api/v3 — its time is above ------------------------
+            ("GET", "/api/v3/openOrders" | "/api/v3/myTrades") if !params.contains("&signature=") => (
+                400,
+                String::from(r#"{"code":-1102,"msg":"Mandatory parameter 'signature' was not sent, was empty/null, or malformed."}"#),
+            ),
+            ("GET", "/api/v3/openOrders") => {
+                let rows: Vec<String> = self.spot_orders.iter().filter(|o| o.open()).map(SpotOrder::result).collect();
+                (200, format!("[{}]", rows.join(",")))
+            }
+            ("GET", "/api/v3/myTrades") => {
+                self.spot_trade_reads.push(String::from(params));
+                let by_order = qparam(params, "orderId").is_some();
+                if by_order && self.spot_order_trades_500 > 0 {
+                    self.spot_order_trades_500 -= 1;
+                    return (500, String::from(r#"{"code":-1001,"msg":"Internal error; unable to process your request. Please try again."}"#));
+                }
+                if by_order && self.spot_order_trades_lag > 0 {
+                    self.spot_order_trades_lag -= 1;
+                    return (200, String::from("[]"));
+                }
+                let short = by_order && self.spot_order_trades_short > 0;
+                self.spot_order_trades_short -= u32::from(short);
+                self.spot_my_trades(params, if short { 1 } else { usize::MAX })
+            }
+            // Public: the boot's price for a balance it adopts.
+            ("GET", "/api/v3/ticker/price") => {
+                self.spot_tickers += 1;
+                let s = qparam(params, "symbol").unwrap_or("");
+                let named = self.spot_ticker_names.unwrap_or(s);
+                match self.spot_px_1e6.get(s) {
+                    Some(px) => (200, format!(r#"{{"symbol":"{named}","price":"{}"}}"#, f8(px * 100))),
+                    None => (400, String::from(r#"{"code":-1121,"msg":"Invalid symbol."}"#)),
+                }
+            }
             _ => {
                 self.unknown += 1;
                 (404, String::from(r#"{"code":-1000,"msg":"unknown path"}"#))
@@ -949,6 +1328,24 @@ impl VState {
                 t0 + 1
             ),
         )
+    }
+
+    /// `myTrades` (BX8): the account's spot trades on the read's symbol as
+    /// the venue booked them, their reports sent or not — none before its
+    /// `startTime` (the day read), and the order's alone when it names an
+    /// `orderId` (a commission no report carried) — the first `most` of them.
+    fn spot_my_trades(&self, params: &str, most: usize) -> (u16, String) {
+        let symbol = qparam(params, "symbol").unwrap_or("");
+        let order = qparam(params, "orderId").map(|v| v.parse::<u64>().expect("orderId"));
+        let since = qparam(params, "startTime").map_or(0, |v| v.parse::<u64>().expect("startTime"));
+        let rows: Vec<String> = self
+            .spot_fills
+            .iter()
+            .filter(|t| t.symbol == symbol && t.time_ms >= since && order.is_none_or(|o| t.oid == o))
+            .take(most)
+            .map(Trade::row)
+            .collect();
+        (200, format!("[{}]", rows.join(",")))
     }
 
     /// The day's COIN-M trades (dapi's and papi's `cm/` shape).
@@ -1010,6 +1407,23 @@ impl VState {
 
     // ---- WS API ----------------------------------------------------------
 
+    /// `session.logon` (every WS API): the key, and the Ed25519 signature
+    /// over `apiKey=…&timestamp=…` verified against [`SEED`]'s public key —
+    /// the session's result, or `None` (refused).
+    fn logon(&mut self, t: &str) -> Option<String> {
+        let key = jfield(t, "apiKey").unwrap_or("");
+        let ts = jfield(t, "timestamp").unwrap_or("");
+        let sig = b64(jfield(t, "signature").unwrap_or("").as_bytes());
+        if key != KEY || !self.verify(format!("apiKey={key}&timestamp={ts}").as_bytes(), &sig) {
+            return None;
+        }
+        self.logons += 1;
+        let now = now_ms();
+        Some(format!(
+            r#"{{"apiKey":"{KEY}","authorizedSince":{now},"connectedSince":{now},"returnRateLimits":false,"serverTime":{now}}}"#
+        ))
+    }
+
     /// One WS API request's answers — and, after them, an answer the venue
     /// held back (`defer_place`).
     fn ws(&mut self, t: &str, logged: &mut bool, cm: bool) -> Vec<Vec<u8>> {
@@ -1032,31 +1446,16 @@ impl VState {
             // Half-open: read, never answered.
             return Vec::new();
         }
-        let ok = |result: String| -> Vec<u8> {
-            format!(
-                r#"{{"id":{id},"status":200,"result":{result},"rateLimits":[{{"rateLimitType":"ORDERS","interval":"SECOND","intervalNum":10,"limit":300,"count":1}},{{"rateLimitType":"ORDERS","interval":"MINUTE","intervalNum":1,"limit":1200,"count":1}}]}}"#
-            )
-            .into_bytes()
-        };
-        let err = |status: u16, code: i32, msg: &str| -> Vec<u8> {
-            format!(r#"{{"id":{id},"status":{status},"error":{{"code":{code},"msg":"{msg}"}}}}"#).into_bytes()
-        };
+        let ok = |result: String| ws_ok(&id, &result);
+        let err = |status: u16, code: i32, msg: &str| ws_err(&id, status, code, msg);
         self.check_ts(jfield(t, "timestamp"));
         if method == "session.logon" {
-            let key = jfield(t, "apiKey").unwrap_or("");
-            let ts = jfield(t, "timestamp").unwrap_or("");
-            let sig = b64(jfield(t, "signature").unwrap_or("").as_bytes());
-            let good = key == KEY && self.verify(format!("apiKey={key}&timestamp={ts}").as_bytes(), &sig);
-            if !good {
+            let Some(r) = self.logon(t) else {
                 return vec![err(401, -1022, "Signature for this request is not valid.")];
-            }
-            self.logons += 1;
+            };
             self.cm_logons += cm as u32;
             *logged = true;
-            let now = now_ms();
-            return vec![ok(format!(
-                r#"{{"apiKey":"{KEY}","authorizedSince":{now},"connectedSince":{now},"returnRateLimits":false,"serverTime":{now}}}"#
-            ))];
+            return vec![ok(r)];
         }
         if !*logged {
             self.unauth += 1;
@@ -1248,6 +1647,330 @@ impl VState {
             }
         }
     }
+
+    // ---- Spot (BX8): the `/ws-api/v3` sessions ------------------------------
+
+    /// A spot session opened: its index.
+    fn spot_open(&mut self) -> usize {
+        self.spot_conns += 1;
+        self.spot_sess.push(SpotSession::default());
+        self.spot_sess.len() - 1
+    }
+
+    /// Spot session `s` ended: nothing more is queued for it.
+    fn spot_close(&mut self, s: usize) {
+        self.spot_closed += 1;
+        let x = &mut self.spot_sess[s];
+        x.sub = None;
+        x.out.clear();
+    }
+
+    /// Everything queued for spot session `s`, framed: in ONE buffer (one
+    /// write: the frames reach the client together) — or, with
+    /// `spot_frame_per_write`, a buffer a frame (a write each).
+    fn spot_out(&mut self, s: usize) -> Vec<Vec<u8>> {
+        let apart = self.spot_frame_per_write;
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for f in self.spot_sess[s].out.drain(..) {
+            match out.last_mut() {
+                Some(b) if !apart => b.extend_from_slice(&frame(1, &f)),
+                _ => out.push(frame(1, &f)),
+            }
+        }
+        out
+    }
+
+    /// An answer onto spot session `s`'s queue.
+    fn spot_reply(&mut self, s: usize, answer: Vec<u8>) {
+        self.spot_sess[s].out.push_back(answer);
+    }
+
+    /// One user-data event onto every subscribed session's queue, under its
+    /// subscription (`{"subscriptionId":N,"event":…}`) — or, while
+    /// `spot_mute_events` holds, into `spot_lost`.
+    fn spot_emit(&mut self, ev: &str) {
+        if self.spot_mute_events {
+            self.spot_lost.push(String::from(ev));
+            return;
+        }
+        for x in &mut self.spot_sess {
+            if let Some(n) = x.sub {
+                x.out.push_back(format!(r#"{{"subscriptionId":{n},"event":{ev}}}"#).into_bytes());
+            }
+        }
+    }
+
+    /// **The lost events, late** (BX8): everything `spot_lost` holds, to
+    /// every session subscribed now — what Binance never does (it does not
+    /// replay), a test's late report.
+    pub fn spot_replay_lost(&mut self) {
+        for ev in core::mem::take(&mut self.spot_lost) {
+            self.spot_emit(&ev);
+        }
+    }
+
+    /// **The account's user data ends** (BX8): every subscribed session is
+    /// sent `eventStreamTerminated`, once, and is subscribed no more — its
+    /// socket stays up (the gateway must drop it).
+    pub fn spot_end_stream(&mut self) {
+        let ev = format!(r#"{{"e":"eventStreamTerminated","E":{}}}"#, now_ms());
+        for x in &mut self.spot_sess {
+            if let Some(n) = x.sub.take() {
+                x.out.push_back(format!(r#"{{"subscriptionId":{n},"event":{ev}}}"#).into_bytes());
+            }
+        }
+    }
+
+    /// The account's balance of `asset` ×1e8 (0: none).
+    pub fn spot_balance(&self, asset: &str) -> i64 {
+        self.spot_bal_1e8.get(asset).copied().unwrap_or(0)
+    }
+
+    /// `asset`'s balance moves by `d` ×1e8.
+    fn spot_move(&mut self, asset: &str, d: i64) {
+        *self.spot_bal_1e8.entry(String::from(asset)).or_insert(0) += d;
+    }
+
+    /// One request on spot session `s` (logged `spot <method>`): its answer
+    /// onto the session's queue, then the events it caused onto every
+    /// subscribed session's. Logged on first (as the futures WS API); the
+    /// subscription carries no timestamp.
+    fn spot_ws(&mut self, s: usize, t: &str) {
+        let id = jfield(t, "id").unwrap_or("null").to_string();
+        let method = jfield(t, "method").unwrap_or("").to_string();
+        self.log.push(format!("spot {method}"));
+        if self.ws_mute {
+            // Half-open: read, never answered.
+            return;
+        }
+        if method != "userDataStream.subscribe" {
+            self.check_ts(jfield(t, "timestamp"));
+        }
+        if method == "session.logon" {
+            let a = match self.logon(t) {
+                Some(r) => {
+                    self.spot_logons += 1;
+                    self.spot_sess[s].logged = true;
+                    ws_ok(&id, &r)
+                }
+                None => ws_err(&id, 401, -1022, "Signature for this request is not valid."),
+            };
+            self.spot_reply(s, a);
+        } else if !self.spot_sess[s].logged {
+            self.unauth += 1;
+            self.spot_reply(s, ws_err(&id, 401, -2015, "Invalid API-key, IP, or permissions for action."));
+        } else {
+            if t.contains("\"signature\"") || t.contains("\"apiKey\"") {
+                // The session is authenticated: a request that signs again
+                // or carries the key is not what the plan builds.
+                self.key_in_line += 1;
+            }
+            self.spot_request(s, &id, &method, t);
+        }
+        if core::mem::take(&mut self.shutdown_next) {
+            self.spot_reply(s, format!(r#"{{"event":{{"e":"serverShutdown","E":{}}}}}"#, now_ms()).into_bytes());
+        }
+    }
+
+    /// A logged-on spot session's request `method`.
+    fn spot_request(&mut self, s: usize, id: &str, method: &str, t: &str) {
+        match method {
+            "userDataStream.subscribe" if self.spot_sub_no_id > 0 => {
+                self.spot_sub_no_id -= 1;
+                self.spot_subscribes += 1;
+                self.spot_reply(s, ws_ok(id, "{}"));
+            }
+            "userDataStream.subscribe" => {
+                let x = &mut self.spot_sess[s];
+                let n = x.next_sub;
+                x.next_sub += 1;
+                x.sub = Some(n);
+                self.spot_subscribes += 1;
+                self.spot_reply(s, ws_ok(id, &format!(r#"{{"subscriptionId":{n}}}"#)));
+            }
+            "order.place" => self.spot_place(s, id, t),
+            "order.status" => {
+                let (sym, c) = (jfield(t, "symbol").unwrap_or(""), jfield(t, "origClientOrderId").unwrap_or(""));
+                let a = match self.spot_orders.iter().find(|o| o.symbol == sym && o.cid == c) {
+                    Some(o) => ws_ok(id, &o.result()),
+                    None => ws_err(id, 400, -2013, "Order does not exist."),
+                };
+                self.spot_reply(s, a);
+            }
+            "account.status" => {
+                assert_eq!(jfield(t, "omitZeroBalances"), Some("true"), "spot's account read leaves the zero balances out: {t}");
+                self.spot_accounts += 1;
+                let r = self.spot_account();
+                self.spot_reply(s, ws_ok(id, &r));
+            }
+            _ => {
+                self.unknown += 1;
+                self.spot_reply(s, ws_err(id, 400, -1000, "unknown method"));
+            }
+        }
+    }
+
+    /// Spot's `account.status` result (`omitZeroBalances`): the commission
+    /// rates, `canTrade`, the balances that are not zero and the
+    /// `permissions`.
+    fn spot_account(&self) -> String {
+        let now = now_ms();
+        let (bp, rate) = (self.spot_fee_rate_1e6 / 100, f8(self.spot_fee_rate_1e6 * 100));
+        let balances: Vec<String> = self
+            .spot_bal_1e8
+            .iter()
+            .filter(|(_, v)| **v != 0)
+            .map(|(a, v)| format!(r#"{{"asset":"{a}","free":"{}","locked":"0.00000000"}}"#, f8(*v)))
+            .collect();
+        let perms: Vec<String> = self.spot_permissions.iter().map(|p| format!(r#""{p}""#)).collect();
+        format!(
+            r#"{{"makerCommission":{bp},"takerCommission":{bp},"buyerCommission":0,"sellerCommission":0,"commissionRates":{{"maker":"{rate}","taker":"{rate}","buyer":"0.00000000","seller":"0.00000000"}},"canTrade":{},"canWithdraw":false,"canDeposit":true,"brokered":false,"requireSelfTradePrevention":false,"preventSor":false,"updateTime":{now},"accountType":"SPOT","balances":[{}],"permissions":[{}],"uid":354937868}}"#,
+            self.spot_can_trade,
+            balances.join(","),
+            perms.join(",")
+        )
+    }
+
+    /// **A spot `order.place`** (BX8): the arm's law asserted on the wire —
+    /// a `LIMIT` IoC asking for the ACK, and never a `reduceOnly` (spot has
+    /// none: one fails the test, the venue's lock poisoned) — then, on a
+    /// listed symbol and funded at the limit (else `-2010`, as the venue),
+    /// the ACK (unless lost: `lose_place_answer`) and the match: `NEW`, a
+    /// `TRADE` per planned fill ([`Self::spot_plan`]), `EXPIRED` for an
+    /// unfilled rest, and the balances it moved.
+    fn spot_place(&mut self, s: usize, id: &str, t: &str) {
+        self.spot_places.push(String::from(t));
+        assert_eq!(jfield(t, "type"), Some("LIMIT"), "a spot order is a LIMIT: {t}");
+        assert_eq!(jfield(t, "timeInForce"), Some("IOC"), "spot is IoC-only (BX8): {t}");
+        assert_eq!(jfield(t, "reduceOnly"), None, "spot has no reduce-only order (BX8): {t}");
+        assert_eq!(jfield(t, "newOrderRespType"), Some("ACK"), "{t}");
+        if let Some(code) = self.refuse_place.take() {
+            return self.spot_reply(s, ws_err(id, 400, code, "Refused by the script."));
+        }
+        let sym = jfield(t, "symbol").unwrap_or("");
+        let Some(&(symbol, base, quote)) = SPOT_PAIRS.iter().find(|p| p.0 == sym) else {
+            return self.spot_reply(s, ws_err(id, 400, -1121, "Invalid symbol."));
+        };
+        let mut o = SpotOrder {
+            oid: self.next_oid,
+            cid: String::from(jfield(t, "newClientOrderId").unwrap_or("")),
+            symbol,
+            buy: jfield(t, "side") == Some("BUY"),
+            tif: "IOC",
+            qty: d8(jfield(t, "quantity").unwrap_or("0")),
+            px: d8(jfield(t, "price").unwrap_or("0")),
+            executed: 0,
+            quote: 0,
+            status: "NEW",
+        };
+        // A BUY's quote at its limit, a SELL's base: held, or refused.
+        let (asset, need) = if o.buy { (quote, mul8(o.qty, o.px)) } else { (base, o.qty) };
+        if self.spot_balance(asset) < need {
+            return self.spot_reply(s, ws_err(id, 400, -2010, "Account has insufficient balance for requested action."));
+        }
+        self.next_oid += 1;
+        // `newOrderRespType=ACK`: the answer precedes the match.
+        if !core::mem::take(&mut self.lose_place_answer) {
+            self.spot_reply(s, ws_ok(id, &o.ack()));
+        }
+        let r = o.report("NEW", None);
+        self.spot_emit(&r);
+        let plan = match self.spot_plan.pop_front() {
+            Some(p) => p.iter().map(|q| q * 100).collect(),
+            None if o.qty == self.spot_halve_qty_1e6 * 100 => vec![o.qty / 2],
+            None => vec![o.qty],
+        };
+        for (k, q) in plan.into_iter().enumerate() {
+            let q = q.min(o.qty - o.executed);
+            if q <= 0 {
+                break;
+            }
+            let better = (k as i64 + 1) * SPOT_TICK_1E8;
+            let px = if o.buy { o.px - better } else { o.px + better };
+            self.spot_fill(&mut o, q, px);
+        }
+        if o.executed < o.qty {
+            o.status = "EXPIRED";
+            let r = o.report("EXPIRED", None);
+            self.spot_emit(&r);
+        }
+        self.spot_position(&o);
+        self.spot_orders.push(o);
+    }
+
+    /// One trade of `o`: `qty` ×1e8 at `px` ×1e8 — its commission at 8
+    /// decimals, truncated (a BUY's in the base asset, a SELL's in the
+    /// quote; BNB's under the burn), the balances moved, the trade booked
+    /// (`myTrades`), its report sent (or lost: `spot_drop_trade_reports`).
+    fn spot_fill(&mut self, o: &mut SpotOrder, qty: i64, px: i64) {
+        let (base, quote) = o.assets();
+        let cost = mul8(qty, px);
+        o.executed += qty;
+        o.quote += cost;
+        o.status = if o.executed == o.qty { "FILLED" } else { "PARTIALLY_FILLED" };
+        let rate = |v: i64| (v as i128 * self.spot_fee_rate_1e6 as i128 / 1_000_000) as i64;
+        let (fee, fee_asset) = match self.spot_bnb_fee_1e8 {
+            Some(f) => (f, "BNB"),
+            None if o.buy => (rate(qty), base),
+            None => (rate(cost), quote),
+        };
+        let (d_base, d_quote) = if o.buy { (qty, -cost) } else { (-qty, cost) };
+        self.spot_move(base, d_base);
+        self.spot_move(quote, d_quote);
+        self.spot_move(fee_asset, -fee);
+        let t = Trade { id: self.next_tid, oid: o.oid, symbol: o.symbol, buy: o.buy, qty, px, fee, fee_asset, time_ms: now_ms() };
+        self.next_tid += 1;
+        self.spot_fills.push(t);
+        let r = o.report("TRADE", Some(t));
+        if self.spot_drop_trade_reports > 0 {
+            self.spot_drop_trade_reports -= 1;
+            self.spot_lost.push(r);
+        } else {
+            self.spot_emit(&r);
+        }
+    }
+
+    /// `outboundAccountPosition` after `o` traded or ended: its assets'
+    /// balances as they stand — and BNB's, when the burn paid its trades.
+    fn spot_position(&mut self, o: &SpotOrder) {
+        let (base, quote) = o.assets();
+        let mut moved = vec![base, quote];
+        if o.executed > 0 && self.spot_bnb_fee_1e8.is_some() && !moved.contains(&"BNB") {
+            moved.push("BNB");
+        }
+        let now = now_ms();
+        let b: Vec<String> = moved
+            .iter()
+            .map(|a| format!(r#"{{"a":"{a}","f":"{}","l":"0.00000000"}}"#, f8(self.spot_balance(a))))
+            .collect();
+        let ev = format!(r#"{{"e":"outboundAccountPosition","E":{now},"u":{now},"B":[{}]}}"#, b.join(","));
+        self.spot_emit(&ev);
+    }
+
+    /// **A trade the arm did not place** (BX8): the venue's own order `cid`
+    /// on `symbol` — a stranger's on the account, or one whose id spells a
+    /// liquidation — `qty_1e6` at `px_1e6`, whole: its commission charged,
+    /// the balances moved and the trade booked (`myTrades`) as any trade's,
+    /// its report and the balances' sent to every subscribed session.
+    pub fn spot_trade(&mut self, cid: &str, symbol: &'static str, buy: bool, qty_1e6: i64, px_1e6: i64) {
+        let mut o = SpotOrder {
+            oid: self.next_oid,
+            cid: String::from(cid),
+            symbol,
+            buy,
+            tif: "GTC",
+            qty: qty_1e6 * 100,
+            px: px_1e6 * 100,
+            executed: 0,
+            quote: 0,
+            status: "NEW",
+        };
+        self.next_oid += 1;
+        let (q, px) = (o.qty, o.px);
+        self.spot_fill(&mut o, q, px);
+        self.spot_position(&o);
+        self.spot_orders.push(o);
+    }
 }
 
 type Tls = StreamOwned<ServerConnection, TcpStream>;
@@ -1317,30 +2040,41 @@ impl Peer {
         Some(String::from_utf8_lossy(&self.buf.drain(..n).collect::<Vec<u8>>()).into_owned())
     }
 
-    /// One client frame (FIN, masked): (opcode, payload).
+    /// One client frame (FIN, masked), reading until it is whole: (opcode,
+    /// payload).
     fn client_frame(&mut self) -> Option<(u8, Vec<u8>)> {
         loop {
-            if self.buf.len() >= 2 {
-                assert!(self.buf[0] & 0x80 != 0, "the client never fragments");
-                assert!(self.buf[1] & 0x80 != 0, "a client frame is masked");
-                let (len, at) = match self.buf[1] & 0x7F {
-                    126 if self.buf.len() >= 4 => (u16::from_be_bytes([self.buf[2], self.buf[3]]) as usize, 4),
-                    126 => (usize::MAX, 0),
-                    127 => panic!("no 64-bit frames here"),
-                    n => (n as usize, 2),
-                };
-                if len != usize::MAX && self.buf.len() >= at + 4 + len {
-                    let mask = [self.buf[at], self.buf[at + 1], self.buf[at + 2], self.buf[at + 3]];
-                    let p = (0..len).map(|i| self.buf[at + 4 + i] ^ mask[i & 3]).collect();
-                    let op = self.buf[0] & 0x0F;
-                    self.buf.drain(..at + 4 + len);
-                    return Some((op, p));
-                }
+            if let Some(f) = self.take_frame() {
+                return Some(f);
             }
             if !self.fill() {
                 return None;
             }
         }
+    }
+
+    /// One client frame already read whole (FIN, masked): (opcode,
+    /// payload) — none until its bytes are all in.
+    fn take_frame(&mut self) -> Option<(u8, Vec<u8>)> {
+        if self.buf.len() < 2 {
+            return None;
+        }
+        assert!(self.buf[0] & 0x80 != 0, "the client never fragments");
+        assert!(self.buf[1] & 0x80 != 0, "a client frame is masked");
+        let (len, at) = match self.buf[1] & 0x7F {
+            126 if self.buf.len() >= 4 => (u16::from_be_bytes([self.buf[2], self.buf[3]]) as usize, 4),
+            126 => return None,
+            127 => panic!("no 64-bit frames here"),
+            n => (n as usize, 2),
+        };
+        if self.buf.len() < at + 4 + len {
+            return None;
+        }
+        let mask = [self.buf[at], self.buf[at + 1], self.buf[at + 2], self.buf[at + 3]];
+        let p = (0..len).map(|i| self.buf[at + 4 + i] ^ mask[i & 3]).collect();
+        let op = self.buf[0] & 0x0F;
+        self.buf.drain(..at + 4 + len);
+        Some((op, p))
     }
 
     fn send(&mut self, bytes: &[u8]) -> bool {
@@ -1382,7 +2116,9 @@ fn serve(sock: TcpStream, cfg: Arc<ServerConfig>, st: Arc<Mutex<VState>>, stop: 
         return;
     };
     let cm = head.starts_with("GET /ws-dapi/v1 ");
-    if cm || head.starts_with("GET /ws-fapi/v1 ") {
+    // BX8: spot's WS API — its order entry AND the account's user data.
+    let spot = head.starts_with("GET /ws-api/v3 ");
+    if cm || spot || head.starts_with("GET /ws-fapi/v1 ") {
         if st.lock().expect("venue").ws_down {
             // The order session is down: refused before the upgrade.
             return;
@@ -1396,7 +2132,11 @@ fn serve(sock: TcpStream, cfg: Arc<ServerConfig>, st: Arc<Mutex<VState>>, stop: 
             thread::sleep(Duration::from_millis(d));
         }
         p.order_session = true;
-        ws_api(p, &head, &st, cm);
+        if spot {
+            spot_api(p, &head, &st);
+        } else {
+            ws_api(p, &head, &st, cm);
+        }
     } else if head.starts_with("GET /ws/") || head.starts_with("GET /pm/ws/") || head.starts_with("GET /pm-classic/ws/") {
         user_stream(p, &head, &st);
     } else {
@@ -1496,6 +2236,82 @@ fn ws_api_session(p: &mut Peer, st: &Mutex<VState>, cm: bool) {
                 return;
             }
             _ => {}
+        }
+    }
+}
+
+/// A spot session (BX8, `/ws-api/v3`): upgraded, then served until either
+/// side ends it.
+fn spot_api(mut p: Peer, head: &str, st: &Mutex<VState>) {
+    if !p.upgrade(head) {
+        return;
+    }
+    let s = st.lock().expect("venue").spot_open();
+    spot_session(&mut p, st, s);
+    st.lock().expect("venue").spot_close(s);
+}
+
+/// One spot session's turns: everything queued for it — answers and the
+/// account's events, in the order the venue made them — out in ONE write
+/// (or a write a frame: `spot_frame_per_write`); then one read (2 ms at
+/// most) and every request it completed served. A place the venue holds
+/// (`spot_hold_place`) is served once another session has subscribed;
+/// until then nothing more is served on this one.
+fn spot_session(p: &mut Peer, st: &Mutex<VState>, s: usize) {
+    // The held place, and the subscriptions served when it came.
+    let mut held: Option<(String, u32)> = None;
+    loop {
+        let out = {
+            let mut v = st.lock().expect("venue");
+            if let Some((t, subs)) = held.take() {
+                if v.spot_subscribes > subs {
+                    v.spot_ws(s, &t);
+                } else {
+                    held = Some((t, subs));
+                }
+            }
+            v.spot_out(s)
+        };
+        for b in &out {
+            if !p.send(b) {
+                return;
+            }
+        }
+        if p.read_once().is_none() {
+            return;
+        }
+        while held.is_none() {
+            let Some((op, payload)) = p.take_frame() else {
+                break;
+            };
+            match op {
+                1 => {
+                    let t = String::from_utf8_lossy(&payload).into_owned();
+                    let method = jfield(&t, "method").unwrap_or("").to_string();
+                    if method == "session.logon" {
+                        let d = st.lock().expect("venue").logon_delay_ms;
+                        if d > 0 {
+                            thread::sleep(Duration::from_millis(d));
+                        }
+                    }
+                    let mut v = st.lock().expect("venue");
+                    if method == "order.place" && core::mem::take(&mut v.spot_hold_place) {
+                        held = Some((t, v.spot_subscribes));
+                    } else {
+                        v.spot_ws(s, &t);
+                    }
+                }
+                9 => {
+                    if !p.send(&frame(10, &payload)) {
+                        return;
+                    }
+                }
+                8 => {
+                    let _ = p.send(&frame(8, &payload));
+                    return;
+                }
+                _ => {}
+            }
         }
     }
 }

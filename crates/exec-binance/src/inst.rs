@@ -30,7 +30,7 @@
 //! books its fills — but no order is ever sent on it.
 
 use core_types::{symbol_ordinal, symbol_venue_byte, InstrumentClass, SymbolId, VenueId};
-use ingress_binance::discovery::{BnStatus, BnSymbolRow};
+use ingress_binance::discovery::{BnPermissions, BnStatus, BnSymbolRow, BN_ASSET_MAX};
 
 use crate::num::{decimals_of, Magic};
 
@@ -252,6 +252,67 @@ impl BnInstWire {
     }
 }
 
+/// **A venue asset name** (BX8), as the venue spells it: 1 to
+/// [`BN_ASSET_MAX`] bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AssetName {
+    b: [u8; BN_ASSET_MAX],
+    n: u8,
+}
+
+impl AssetName {
+    /// No asset.
+    pub const EMPTY: Self = Self { b: [0; BN_ASSET_MAX], n: 0 };
+
+    /// `s` as an asset name: `None` when empty or past [`BN_ASSET_MAX`].
+    #[must_use]
+    pub fn of(s: &[u8]) -> Option<Self> {
+        if s.is_empty() || s.len() > BN_ASSET_MAX {
+            return None;
+        }
+        let mut a = Self::EMPTY;
+        // COPY: asset name ≤ 16 B — boot only: the row's facts outlive the
+        // discovery rows (dropped after boot) — rejected: borrowing the
+        // dropped rows.
+        a.b[..s.len()].copy_from_slice(s);
+        a.n = s.len() as u8;
+        Some(a)
+    }
+
+    /// The name's bytes.
+    #[inline(always)]
+    #[must_use]
+    pub fn get(&self) -> &[u8] {
+        &self.b[..self.n as usize]
+    }
+}
+
+/// **A spot row's cold facts** (BX8): its base and quote assets — the
+/// reconciliation's balance is the base's, a commission is charged in an
+/// asset — and the permission groups the venue requires (the bStock
+/// check). `EMPTY` on every other product's row.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SpotWire {
+    /// `baseAsset`.
+    pub base: AssetName,
+    /// `quoteAsset`.
+    pub quote: AssetName,
+    /// The row's `permissionSets`.
+    pub perm: BnPermissions,
+}
+
+const _: () = assert!(core::mem::size_of::<SpotWire>() == 112);
+
+impl SpotWire {
+    /// Not a spot row.
+    pub const EMPTY: Self = Self {
+        base: AssetName::EMPTY,
+        quote: AssetName::EMPTY,
+        perm: BnPermissions::EMPTY,
+    };
+}
+
 /// Why the boot refused to bind a row. Each refuses the boot.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BindErr {
@@ -265,6 +326,9 @@ pub enum BindErr {
     BadProduct,
     /// An empty or over-long wire symbol.
     BadSymbol,
+    /// A spot row whose discovery names no base or quote asset (BX8: its
+    /// balance could not be reconciled).
+    BadAsset,
 }
 
 /// One row to bind, as the boot hands it over.
@@ -297,11 +361,13 @@ pub struct InstTable {
 const SYM_IX: usize = 2 * INST_MAX;
 
 /// The gateway's table, with an index from (product, wire symbol) to row —
-/// how every user-data event finds its row.
+/// how every user-data event finds its row — and the spot rows' cold
+/// facts (BX8).
 pub struct WireTable {
     rows: Box<[BnInstWire; INST_MAX]>,
     n: usize,
     ix: Box<[u16; SYM_IX]>,
+    spot: Box<[SpotWire; INST_MAX]>,
 }
 
 /// FNV-1a over the product byte and the symbol.
@@ -325,6 +391,14 @@ impl WireTable {
     #[must_use]
     pub fn row(&self, row: u16) -> &BnInstWire {
         &self.rows[rx(row)]
+    }
+
+    /// A spot row's assets and permission groups ([`SpotWire::EMPTY`] on
+    /// any other row).
+    #[inline(always)]
+    #[must_use]
+    pub fn spot(&self, row: u16) -> &SpotWire {
+        &self.spot[rx(row)]
     }
 
     /// The row whose wire symbol is `symbol`, or [`ROW_NONE`]: one hash and
@@ -419,6 +493,7 @@ impl InstTable {
                 rows: Box::new([BnInstWire::EMPTY; INST_MAX]),
                 n: 0,
                 ix: Box::new([ROW_NONE; SYM_IX]),
+                spot: exec_gateway::boxed_array(SpotWire::EMPTY),
             },
         )
     }
@@ -449,6 +524,16 @@ impl InstTable {
         {
             return Err(BindErr::Duplicate);
         }
+        // BX8: a spot row's balance is its base asset's — a row naming no
+        // base or quote could not be reconciled.
+        let assets = if spec.product == PRODUCT_SPOT {
+            match (AssetName::of(r.base_asset()), AssetName::of(r.quote_asset())) {
+                (Some(base), Some(quote)) => Some((base, quote)),
+                _ => return Err(BindErr::BadAsset),
+            }
+        } else {
+            None
+        };
         let row_ix = self.n as u16;
 
         let tick = exact_1e6(r.filters.tick_size_1e9);
@@ -533,6 +618,13 @@ impl InstTable {
         // so the gateway must own its bytes — borrowing them was rejected.
         w.symbol[..symbol.len()].copy_from_slice(symbol);
         wire.rows[rx(row_ix)] = w;
+        // COPY: the spot row's cold facts (112 B: two asset names and the
+        // 72 B permission digest), boot only, once per spot row — the
+        // discovery rows are dropped after boot — rejected: borrowing them
+        // (as the symbol).
+        if let Some((base, quote)) = assets {
+            wire.spot[rx(row_ix)] = SpotWire { base, quote, perm: r.perm };
+        }
         wire.n += 1;
         wire.index(row_ix);
         if is_alias {
@@ -609,6 +701,12 @@ pub(crate) mod tests {
         d
     }
 
+    /// Spot `exchangeInfo` rows (BX8): BTCUSDT and BNBUSDT as the venue
+    /// lists them; TSLABUSDT a bStock whose one set names groups only (the
+    /// permission check's refusal); ETHBTC quoted in BTC (the asset law's);
+    /// DOGEUSDT with two sets (the venue ANDs them).
+    pub(crate) const SPOT: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.01000000","maxPrice":"1000000.00000000","tickSize":"0.01000000"},{"filterType":"LOT_SIZE","minQty":"0.00001000","maxQty":"9000.00000000","stepSize":"0.00001000"},{"filterType":"PERCENT_PRICE_BY_SIDE","bidMultiplierUp":"1.2","bidMultiplierDown":"0.5","askMultiplierUp":"2","askMultiplierDown":"0.8","avgPriceMins":5},{"filterType":"NOTIONAL","minNotional":"5.00000000","applyMinToMarket":true,"maxNotional":"9000000.00000000","applyMaxToMarket":false,"avgPriceMins":5},{"filterType":"MAX_NUM_ORDERS","maxNumOrders":200}],"permissionSets":[["SPOT","MARGIN","TRD_GRP_004","TRD_GRP_005"]]},{"symbol":"TSLABUSDT","status":"TRADING","baseAsset":"TSLAB","quoteAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.01000000","maxPrice":"100000.00000000","tickSize":"0.01000000"},{"filterType":"LOT_SIZE","minQty":"0.00100000","maxQty":"922327.00000000","stepSize":"0.00100000"},{"filterType":"NOTIONAL","minNotional":"5.00000000","maxNotional":"9000000.00000000","avgPriceMins":5},{"filterType":"MAX_NUM_ORDERS","maxNumOrders":200}],"permissionSets":[["TRD_GRP_004","TRD_GRP_261"]]},{"symbol":"BNBUSDT","status":"TRADING","baseAsset":"BNB","quoteAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.01000000","maxPrice":"100000.00000000","tickSize":"0.01000000"},{"filterType":"LOT_SIZE","minQty":"0.00100000","maxQty":"9000.00000000","stepSize":"0.00100000"},{"filterType":"NOTIONAL","minNotional":"5.00000000","maxNotional":"9000000.00000000","avgPriceMins":5}],"permissionSets":[["SPOT","MARGIN"]]},{"symbol":"ETHBTC","status":"TRADING","baseAsset":"ETH","quoteAsset":"BTC","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.00001000","maxPrice":"922327.00000000","tickSize":"0.00001000"},{"filterType":"LOT_SIZE","minQty":"0.00010000","maxQty":"100000.00000000","stepSize":"0.00010000"},{"filterType":"NOTIONAL","minNotional":"0.00010000","maxNotional":"9000000.00000000","avgPriceMins":5}],"permissionSets":[["SPOT"]]},{"symbol":"DOGEUSDT","status":"TRADING","baseAsset":"DOGE","quoteAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.00001000","maxPrice":"1000.00000000","tickSize":"0.00001000"},{"filterType":"LOT_SIZE","minQty":"1.00000000","maxQty":"9000000.00000000","stepSize":"1.00000000"},{"filterType":"NOTIONAL","minNotional":"1.00000000","maxNotional":"9000000.00000000","avgPriceMins":5}],"permissionSets":[["SPOT"],["TRD_GRP_002"]]}]}"#;
+
     pub(crate) const FAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","pair":"BTCUSDT","contractType":"PERPETUAL","status":"TRADING","pricePrecision":2,"quantityPrecision":3,"filters":[{"filterType":"PRICE_FILTER","minPrice":"0.10","maxPrice":"4529764","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","maxQty":"1000","minQty":"0.001"},{"filterType":"MAX_NUM_ORDERS","limit":200},{"filterType":"MIN_NOTIONAL","notional":"100"},{"filterType":"PERCENT_PRICE","multiplierUp":"1.0500","multiplierDown":"0.9500","multiplierDecimal":"4"}]},{"symbol":"SHIBUSDT","pair":"SHIBUSDT","contractType":"PERPETUAL","status":"TRADING","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.0000001"},{"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000"}]},{"symbol":"ETHUSDT_261225","pair":"ETHUSDT","contractType":"CURRENT_QUARTER","status":"SETTLING","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"100"}]}]}"#;
 
     #[test]
@@ -661,10 +759,10 @@ pub(crate) mod tests {
 
     #[test]
     fn the_alias_is_matched_by_the_full_id_first() {
-        let d = fapi_rows(FAPI);
+        let d = fapi_rows(SPOT);
         let (mut t, mut w) = InstTable::new(7);
         let row = d.find(b"BTCUSDT").unwrap();
-        let row6 = d.find(b"SHIBUSDT").unwrap();
+        let row6 = d.find(b"BNBUSDT").unwrap();
         // The anchor (flat id 7, venue byte 0) and spot[6] (Binance, ordinal 7).
         let anchor = t
             .bind(&mut w, &BindSpec { sym: 7, product: PRODUCT_SPOT, row, owned: true, maker_ok: false })
@@ -673,7 +771,7 @@ pub(crate) mod tests {
         let other = t
             .bind(&mut w, &BindSpec { sym: spot6, product: PRODUCT_SPOT, row: row6, owned: true, maker_ok: false })
             .unwrap();
-        assert_eq!(w.find(PRODUCT_SPOT, b"SHIBUSDT"), other);
+        assert_eq!(w.find(PRODUCT_SPOT, b"BNBUSDT"), other);
         assert_ne!(anchor, other);
         assert_eq!(t.row_of(7), anchor);
         assert_eq!(t.row_of(spot6), other);
@@ -681,6 +779,37 @@ pub(crate) mod tests {
         assert_eq!(t.row_of(8), ROW_NONE);
         assert_eq!(t.row_of(make_symbol_id(VenueId::Binance, 9)), ROW_NONE);
         assert_eq!(t.row_of(make_symbol_id(VenueId::Hyperliquid, 7)), ROW_NONE);
+    }
+
+    /// BX8: a spot row binds IoC-only (spot has no dead-man), as `Spot`,
+    /// carrying its assets and permission groups to the gateway; a spot row
+    /// naming no base or quote asset refuses — its balance could not be
+    /// reconciled.
+    #[test]
+    fn a_spot_row_binds_with_its_assets_and_groups() {
+        let d = fapi_rows(SPOT);
+        let (mut t, mut w) = InstTable::new(7);
+        let row = d.find(b"BTCUSDT").unwrap();
+        let ix = t.bind(&mut w, &BindSpec { sym: 7, product: PRODUCT_SPOT, row, owned: true, maker_ok: false }).unwrap();
+        let h = t.hot(ix);
+        assert!(h.has(INST_LIVE) && h.has(INST_NO_DEADMAN));
+        assert_eq!(h.class, InstrumentClass::Spot as u8);
+        assert_eq!((h.tick_1e6, h.step_1e6, h.min_notional_1e6), (10_000, 10, 5_000_000));
+        let s = w.spot(ix);
+        assert_eq!((s.base.get(), s.quote.get()), (&b"BTC"[..], &b"USDT"[..]));
+        assert_eq!(s.perm, row.perm);
+        // A futures row carries none.
+        let f = fapi_rows(FAPI);
+        let fx = t
+            .bind(&mut w, &BindSpec { sym: make_symbol_id(VenueId::Binance, 513), product: PRODUCT_USDM, row: f.find(b"BTCUSDT").unwrap(), owned: true, maker_ok: true })
+            .unwrap();
+        assert_eq!(*w.spot(fx), SpotWire::EMPTY);
+        // A spot row with no assets (a futures body's) refuses.
+        let bare = BindSpec { sym: make_symbol_id(VenueId::Binance, 9), product: PRODUCT_SPOT, row: f.find(b"SHIBUSDT").unwrap(), owned: true, maker_ok: false };
+        assert_eq!(t.bind(&mut w, &bare), Err(BindErr::BadAsset));
+        assert_eq!(AssetName::of(b""), None);
+        assert_eq!(AssetName::of(b"ABCDEFGHIJKLMNOPQ"), None, "past BN_ASSET_MAX");
+        assert_eq!(AssetName::of(b"1000SATS").map(|a| a.get().len()), Some(8));
     }
 
     #[test]

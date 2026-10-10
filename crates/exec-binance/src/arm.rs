@@ -76,8 +76,8 @@ use core_types::{
 use exec_gateway::stats::{HALT_NONE, PUBLISHED_WORDS, SWEEP_STRANDED, SWEEP_WORKING};
 
 use crate::cmd::*;
-use crate::gov::{classify, CodeClass, FuturesOrders, Qtr, QtrRow, ARM_WEIGHT_MAX_PER_MIN, QTR_DUST_USD_1E6};
-use crate::inst::{rx, InstTable, INST_INVERSE, INST_LIVE, INST_MAX, INST_NO_DEADMAN, INST_OWNED, PRODUCT_COINM, PRODUCT_USDM, ROW_NONE};
+use crate::gov::{classify, CodeClass, FuturesOrders, Qtr, QtrRow, SpotOrders, ARM_WEIGHT_MAX_PER_MIN, QTR_DUST_USD_1E6};
+use crate::inst::{rx, InstTable, INST_INVERSE, INST_LIVE, INST_MAX, INST_NO_DEADMAN, INST_OWNED, PRODUCT_COINM, PRODUCT_SPOT, PRODUCT_USDM, ROW_NONE};
 use crate::margin::{MarginBook, SLOTS};
 use crate::mode::AccountMode;
 use crate::num::{ceil_to, floor_to};
@@ -394,6 +394,8 @@ pub struct BnArm {
     rt: Box<[RowRt; INST_MAX]>,
     qtr_rows: Box<[QtrRow; INST_MAX]>,
     fut: FuturesOrders,
+    /// Spot's ORDERS pool and its unfilled-order mirror (BX8).
+    spot: SpotOrders,
     qtr: Qtr,
     knobs: ArmKnobs,
     margin: MarginBook,
@@ -427,12 +429,15 @@ const LAT_QUANTILES: usize = 6;
 /// The order flags this arm honours (BX7, the operator's ruling):
 /// reduce-only on any kind (`reduceOnly=true`); post-only on a maker
 /// (whose `GTX` already is post-only). An unknown bit, or a post-only IoC
-/// (a contradiction), is refused.
+/// (a contradiction), is refused — and a reduce-only on spot (BX8: the
+/// venue has no such order; a spot sell is bounded by the holding, the
+/// router's law).
 #[inline(always)]
-const fn admit_flags(flags: u8, maker: bool) -> Result<(), Refusal> {
+const fn admit_flags(flags: u8, maker: bool, spot: bool) -> Result<(), Refusal> {
     let unknown = flags & !(ORDER_FLAG_REDUCE_ONLY | ORDER_FLAG_POST_ONLY) != 0;
     let post_only_ioc = !maker && flags & ORDER_FLAG_POST_ONLY != 0;
-    if unknown || post_only_ioc {
+    let spot_reduce = spot && flags & ORDER_FLAG_REDUCE_ONLY != 0;
+    if unknown || post_only_ioc || spot_reduce {
         Err(Refusal::Flags)
     } else {
         Ok(())
@@ -458,6 +463,7 @@ impl BnArm {
             qtr_rows: Box::new([QtrRow::default(); INST_MAX]),
             inst,
             fut: FuturesOrders::new(knobs.orders_frac_1e6),
+            spot: SpotOrders::new(knobs.orders_frac_1e6),
             qtr: Qtr {
                 frac_1e6: knobs.qtr_frac_1e6,
             },
@@ -533,9 +539,11 @@ impl BnArm {
         r.open > 0 || r.pos_1e6 != 0
     }
 
-    /// Open-order count change on `row`, keeping the breadth and QTR `N`.
+    /// Open-order count change on `row`, keeping the breadth and QTR `N`
+    /// — futures rows' alone (BX8: neither is a spot rule).
     #[inline(always)]
     fn open_delta(&mut self, row: u16, up: bool) {
+        let futures = self.inst.hot(row).product != PRODUCT_SPOT;
         let was_active = self.active(row);
         let r = &mut self.rt[rx(row)];
         let was_open = r.open > 0;
@@ -546,9 +554,11 @@ impl BnArm {
             r.open = r.open.saturating_sub(1);
         }
         let is_open = r.open > 0;
-        self.rows_open = (self.rows_open + is_open as u32).saturating_sub(was_open as u32);
         let is_active = self.active(row);
-        self.active_rows = (self.active_rows + is_active as u32).saturating_sub(was_active as u32);
+        if futures {
+            self.rows_open = (self.rows_open + is_open as u32).saturating_sub(was_open as u32);
+            self.active_rows = (self.active_rows + is_active as u32).saturating_sub(was_active as u32);
+        }
     }
 
     /// Quantize and check the venue law for an order on `row` (BX-5).
@@ -660,28 +670,38 @@ impl BnArm {
         let now = core_time::now_ns();
         let row = self.admit(o.sym, o.strategy_id, o.kind, now)?;
         let maker = o.kind == ORDER_KIND_MAKER;
-        admit_flags(o.flags, maker)?;
+        let spot = self.inst.hot(row).product == PRODUCT_SPOT;
+        admit_flags(o.flags, maker, spot)?;
         if maker && o.ttl_ns != 0 && o.ttl_ns < self.knobs.min_maker_ttl_ns {
             return Err(Refusal::Ttl);
         }
         let buy = o.side == Side::Bid;
         let (px, qty, dust) = self.quantize(row, buy, o.px.raw(), o.qty.raw(), now)?;
         // ---- governors ----------------------------------------------------
-        if !self.fut.admits(now) {
-            return Err(Refusal::Orders);
-        }
         let r = rx(row);
         let wall_ms = self.knobs.anchor.wall_of(now) / 1_000_000;
-        Qtr::roll(&mut self.qtr_rows[r], wall_ms);
-        let n = self.rows_open + (self.rt[r].open == 0) as u32;
-        if !self.qtr.admits(&self.qtr_rows[r], n, maker, dust) {
-            return Err(Refusal::Qtr);
+        if spot {
+            // BX8: spot's own pool and its unfilled-order mirror — the UM
+            // quantitative rules and the breadth are futures' alone.
+            self.spot.roll(wall_ms);
+            if !self.spot.admits(now) {
+                return Err(Refusal::Orders);
+            }
+        } else {
+            if !self.fut.admits(now) {
+                return Err(Refusal::Orders);
+            }
+            Qtr::roll(&mut self.qtr_rows[r], wall_ms);
+            let n = self.rows_open + (self.rt[r].open == 0) as u32;
+            if !self.qtr.admits(&self.qtr_rows[r], n, maker, dust) {
+                return Err(Refusal::Qtr);
+            }
         }
         let max_orders = self.inst.cold(row).max_orders as i64;
         if max_orders > 0 && (self.rt[r].open as i64 + 1) * 1_000_000 > max_orders * self.knobs.orders_frac_1e6 {
             return Err(Refusal::MaxOrders);
         }
-        if !self.active(row) && self.active_rows >= self.knobs.max_symbols {
+        if !spot && !self.active(row) && self.active_rows >= self.knobs.max_symbols {
             return Err(Refusal::Breadth);
         }
         // ---- push -----------------------------------------------------------
@@ -690,8 +710,12 @@ impl BnArm {
         if !self.end.cmd.push(&cmd) {
             return Err(Refusal::QueueFull);
         }
-        self.fut.commit(now);
-        Qtr::on_place(&mut self.qtr_rows[r], maker, dust);
+        if spot {
+            self.spot.commit(now);
+        } else {
+            self.fut.commit(now);
+            Qtr::on_place(&mut self.qtr_rows[r], maker, dust);
+        }
         self.open_delta(row, true);
         self.in_flight += 1;
         self.c.submitted += 1;
@@ -713,8 +737,16 @@ impl BnArm {
         if (e.row as usize) < self.inst.len() {
             self.open_delta(e.row, false);
             let ioc = self.seen_kind_ioc(e);
-            let icr = e.flags & EVT_F_ICR != 0;
-            Qtr::on_end(&mut self.qtr_rows[rx(e.row)], filled, ioc, icr);
+            if self.inst.hot(e.row).product == PRODUCT_SPOT {
+                // BX8: the venue takes an order that filled off the day's
+                // unfilled count.
+                if filled {
+                    self.spot.filled(self.knobs.anchor.wall_of(e.ts_ns) / 1_000_000);
+                }
+            } else {
+                let icr = e.flags & EVT_F_ICR != 0;
+                Qtr::on_end(&mut self.qtr_rows[rx(e.row)], filled, ioc, icr);
+            }
             if ioc && !filled {
                 self.c.ioc_missed += 1;
             }
@@ -849,7 +881,10 @@ impl BnArm {
                     let was = self.active(e.row);
                     self.rt[rx(e.row)].pos_1e6 = e.a;
                     let is = self.active(e.row);
-                    self.active_rows = (self.active_rows + is as u32).saturating_sub(was as u32);
+                    // The breadth is futures' alone (BX8).
+                    if self.inst.hot(e.row).product != PRODUCT_SPOT {
+                        self.active_rows = (self.active_rows + is as u32).saturating_sub(was as u32);
+                    }
                 }
             }
             _ => self.c.evt_unknown += 1,
@@ -946,8 +981,9 @@ impl OrderDispatch for BnArm {
             Err(r) => return Err(self.refused(r)),
         };
         // A modify keeps the resting order's own flags at the venue (UM
-        // `order.modify` takes none): only an unknown bit is refused here.
-        if let Err(r) = admit_flags(o.flags, true) {
+        // `order.modify` takes none): only an unknown bit is refused here
+        // (a spot row has no modify: refused above, `Verb`).
+        if let Err(r) = admit_flags(o.flags, true, false) {
             return Err(self.refused(r));
         }
         let buy = o.side == Side::Bid;
@@ -1257,7 +1293,7 @@ impl OrderDispatch for BnArm {
 pub(crate) mod tests {
     use super::*;
     use crate::inst::tests::{fapi_rows, FAPI};
-    use crate::inst::{BindSpec, PRODUCT_USDM};
+    use crate::inst::{BindSpec, PRODUCT_SPOT, PRODUCT_USDM};
     use core_types::{make_symbol_id, Price, Qty};
     use exec_gateway::stats::{HALT_VENUE_BASE, SWEEP_CLEAR};
 
@@ -1361,6 +1397,83 @@ pub(crate) mod tests {
         assert_eq!(r.arm.counters().refused[Refusal::NotReady as usize], 1);
         r.healthy();
         assert!(r.arm.submit(&o).is_ok());
+    }
+
+    /// BX8: a spot row (here the anchor, under the alias) trades IoC only
+    /// — a maker is refused (no dead-man), and so is a reduce-only order —
+    /// on spot's own ORDERS pool: 80 IoCs in 10 s (80 % of 100) while the
+    /// futures' pool stays untouched; a spot order counts toward neither
+    /// the breadth nor the UM rules; an order that filled leaves the day's
+    /// unfilled count.
+    #[test]
+    fn a_spot_row_is_ioc_only_on_its_own_pool() {
+        let d = fapi_rows(crate::inst::tests::SPOT);
+        let f = fapi_rows(FAPI);
+        let (mut t, mut w) = InstTable::new(7);
+        t.bind(&mut w, &BindSpec { sym: 7, product: PRODUCT_SPOT, row: d.find(b"BTCUSDT").unwrap(), owned: true, maker_ok: false }).unwrap();
+        t.bind(&mut w, &BindSpec { sym: btc(), product: PRODUCT_USDM, row: f.find(b"BTCUSDT").unwrap(), owned: true, maker_ok: true }).unwrap();
+        let (eng, gw) = duplex();
+        let mut prod = [0u8; SLOTS];
+        prod[SLOT as usize] = 1 << PRODUCT_USDM;
+        let knobs = ArmKnobs {
+            orders_frac_1e6: 800_000,
+            qtr_frac_1e6: 800_000,
+            owner_slot: SLOT,
+            max_symbols: 1,
+            min_maker_ttl_ns: 5_000_000_000,
+            margin: MarginBook::new([600_000; SLOTS], prod),
+            anchor: WallAnchor::new(0, 1_790_000_000_000_000_000),
+            mode: AccountMode::Classic,
+            demo: false,
+        };
+        let mut r = Rig { arm: BnArm::new(eng, t, knobs), gw };
+        r.healthy();
+        let spot = |kind: u8, side: Side, flags: u8, oid: u64| {
+            let mut o = Order::new(0, VenueId::Binance, 7, side, kind, Price(65_000_000_000), Qty(1_000), oid);
+            o.strategy_id = SLOT;
+            o.flags = flags;
+            o
+        };
+        let mut m = spot(ORDER_KIND_MAKER, Side::Bid, 0, 1);
+        m.ttl_ns = 10_000_000_000;
+        assert_eq!(r.arm.submit(&m), Err(DispatchError::Unsupported));
+        assert_eq!(r.arm.submit(&spot(ORDER_KIND_IOC, Side::Ask, ORDER_FLAG_REDUCE_ONLY, 2)), Err(DispatchError::Unsupported));
+        let c = r.arm.counters();
+        assert_eq!((c.refused[Refusal::NoDeadman as usize], c.refused[Refusal::Flags as usize]), (1, 1));
+        let mut placed = 0u32;
+        let mut oid = 10;
+        loop {
+            match r.arm.submit(&spot(ORDER_KIND_IOC, Side::Bid, 0, oid)) {
+                Ok(()) => placed += 1,
+                Err(e) => {
+                    assert_eq!(e, DispatchError::SlotDisabled);
+                    break;
+                }
+            }
+            oid += 1;
+            let c = r.pop_cmd().expect("the IoC reached the ring");
+            assert_eq!((c.kind, c.flags, c.qty_1e6), (ORDER_KIND_IOC, 0, 1_000));
+        }
+        assert_eq!(placed, 80, "spot's 10 s window at 80 % of 100");
+        assert_eq!(r.arm.counters().refused[Refusal::Orders as usize], 1);
+        assert_eq!(r.arm.fut.w10s.used(core_time::now_ns()), 0, "spot drew nothing from the futures' pool");
+        assert_eq!((r.arm.active_rows, r.arm.rows_open), (0, 0), "no breadth, no UM rule");
+        // The futures' pool is its own: the USDⓈ-M row still trades — the
+        // one row the breadth (max_symbols 1) allows.
+        assert_eq!(r.arm.submit(&order(ORDER_KIND_IOC, Side::Bid, 65_000_000_000, 10_000, 500)), Ok(()));
+        assert_eq!(r.arm.rows_open, 1);
+        // An order that filled is off the day's unfilled count.
+        assert_eq!(r.arm.spot.unfilled(), 80);
+        let mut e = BnEvt::order(EVT_RETIRED, core_time::now_ns(), 10, 0, SLOT);
+        e.why = clob_dispatcher::RETIRED_FILLED;
+        e.flags = EVT_F_HAD_FILL | EVT_F_IOC;
+        r.send(e);
+        let mut x = BnEvt::order(EVT_RETIRED, core_time::now_ns(), 11, 0, SLOT);
+        x.why = clob_dispatcher::RETIRED_EXPIRED;
+        x.flags = EVT_F_IOC;
+        r.send(x);
+        r.arm.on_idle();
+        assert_eq!(r.arm.spot.unfilled(), 79, "the unfilled IoC stays counted");
     }
 
     #[test]

@@ -145,8 +145,7 @@ impl MainnetVerb {
     }
 }
 
-/// The hosts the futures × classic paths talk to (plan §3.3; COIN-M:
-/// BX7, C1).
+/// The hosts the arm talks to (plan §3.3; COIN-M: BX7, C1; spot: BX8).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hosts {
     /// The USDⓈ-M WS API (order entry): `ws-fapi.binance.com`.
@@ -170,8 +169,14 @@ pub struct Hosts {
     /// stream host's `/pm/ws/<listenKey>`.
     pub papi: String,
     /// The SAPI REST host (the boot assertions; in PM also the clock):
-    /// `api.binance.com`.
+    /// `api.binance.com` — spot's REST host too (BX8: the time, the open
+    /// orders, the day's trades, the adoption's price).
     pub sapi: String,
+    /// The spot WS API (BX8: order entry AND the user data, one session):
+    /// `ws-api.binance.com`.
+    pub spot_wsapi: String,
+    /// Its path.
+    pub spot_wsapi_path: String,
 }
 
 /// One futures product's hosts: a gateway lane's (BX7, M3).
@@ -205,6 +210,8 @@ impl Hosts {
                 cm_rest: s("dapi.binance.com"),
                 papi: s("papi.binance.com"),
                 sapi: s("api.binance.com"),
+                spot_wsapi: s("ws-api.binance.com"),
+                spot_wsapi_path: s("/ws-api/v3"),
             },
             Scope::Demo => Self {
                 fut_wsapi: s("testnet.binancefuture.com"),
@@ -219,15 +226,27 @@ impl Hosts {
                 // host is the only one the docs name for papi.
                 papi: s("testnet.binancefuture.com"),
                 sapi: s("demo-api.binance.com"),
+                // BX8: the spot Demo's documented WS API (demo-mode docs).
+                spot_wsapi: s("demo-ws-api.binance.com"),
+                spot_wsapi_path: s("/ws-api/v3"),
             },
         }
     }
 
-    /// The hosts of futures product `product` (`PRODUCT_COINM`: dapi;
-    /// otherwise fapi).
+    /// The hosts of product `product`'s lane (`PRODUCT_COINM`: dapi;
+    /// `PRODUCT_SPOT`: the spot WS API and REST — its user data rides the
+    /// order session, so the lane's stream socket names the WS API host and
+    /// is never dialled (BX8); otherwise fapi).
     #[must_use]
     pub fn lane(&self, product: u8) -> LaneHosts<'_> {
-        if product == crate::inst::PRODUCT_COINM {
+        if product == crate::inst::PRODUCT_SPOT {
+            LaneHosts {
+                wsapi: &self.spot_wsapi,
+                wsapi_path: &self.spot_wsapi_path,
+                user: &self.spot_wsapi,
+                rest: &self.sapi,
+            }
+        } else if product == crate::inst::PRODUCT_COINM {
             LaneHosts {
                 wsapi: &self.cm_wsapi,
                 wsapi_path: &self.cm_wsapi_path,
@@ -257,8 +276,18 @@ impl Hosts {
         }
     }
 
-    fn all(&self) -> [&str; 8] {
-        [&self.fut_wsapi, &self.fut_user, &self.fut_rest, &self.cm_wsapi, &self.cm_user, &self.cm_rest, &self.papi, &self.sapi]
+    fn all(&self) -> [&str; 9] {
+        [
+            &self.fut_wsapi,
+            &self.fut_user,
+            &self.fut_rest,
+            &self.cm_wsapi,
+            &self.cm_user,
+            &self.cm_rest,
+            &self.papi,
+            &self.sapi,
+            &self.spot_wsapi,
+        ]
     }
 }
 
@@ -614,6 +643,8 @@ impl BnConfig {
             cm_rest: l("localhost"),
             papi: l("localhost"),
             sapi: l("localhost"),
+            spot_wsapi: l("localhost"),
+            spot_wsapi_path: l("/ws-api/v3"),
         };
         if port == HTTPS_PORT {
             return Err(ConfigErr::LoopbackOnRealHost);

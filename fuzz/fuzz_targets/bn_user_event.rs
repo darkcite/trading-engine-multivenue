@@ -20,6 +20,9 @@
 //! scanner unescapes nothing), is judged by `journal::fee_asset` against
 //! five rows — USDⓈ-M's BTCUSDT, BTCUSDC and a dated BTCUSDT, COIN-M's
 //! BTCUSD_PERP and BNBUSD_PERP — as an independent oracle reads it.
+//! BX8 (the parser review's P2-1): an accepted order or trade event whose
+//! execution is a trade (`TRADE`, `CALCULATED`) is a trade of something at
+//! a price — its last quantity and price above zero.
 
 #![no_main]
 
@@ -29,7 +32,8 @@ use exec_binance::inst::{BindSpec, InstTable, WireTable, PRODUCT_COINM, PRODUCT_
 use exec_binance::journal::{fee_asset, FEE_ASSET_BNB, FEE_ASSET_NONE, FEE_ASSET_OTHER, FEE_ASSET_SETTLE};
 use exec_binance::userstream::{
     scan_user_event, NotCross, Span, UserEvent, CONFIG_LEVERAGE, CONFIG_MULTI_ASSETS_OFF, CONFIG_MULTI_ASSETS_ON,
-    ISOLATED_MAX, RISK_MARGIN_CALL, RISK_NORMAL, UE_ACCOUNT, UE_CONFIG, UE_ORDER, UE_RISK, UE_TRADE_LITE,
+    ISOLATED_MAX, RISK_MARGIN_CALL, RISK_NORMAL, UE_ACCOUNT, UE_CONFIG, UE_ORDER, UE_RISK, UE_TRADE_LITE, X_CALCULATED,
+    X_TRADE,
 };
 use ingress_binance::discovery::BnDiscovery;
 use libfuzzer_sys::fuzz_target;
@@ -124,6 +128,9 @@ fuzz_target!(|data: &[u8]| {
     }
     if e.kind == UE_ORDER || e.kind == UE_TRADE_LITE {
         assert!(!e.symbol.get(data).is_empty(), "an order event with no symbol");
+        if e.exec == X_TRADE || e.exec == X_CALCULATED {
+            assert!(e.last_qty_1e6 > 0 && e.last_px_1e6 > 0, "a trade of nothing or at no price");
+        }
     }
     if e.kind == UE_RISK {
         assert!((RISK_MARGIN_CALL..=RISK_NORMAL).contains(&e.risk), "a risk word no scan writes");

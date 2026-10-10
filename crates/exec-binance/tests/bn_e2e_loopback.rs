@@ -51,6 +51,37 @@
 //! (BX-7), a lost place answer never re-sent (BX-11), the stream's
 //! `MARGIN_CALL` to the halt (BX-20).
 //!
+//! BX8 arms **spot** alone (`Opts::spot_only`: BTCUSDT under the alias,
+//! IoC-only) on `/ws-api/v3`, whose sessions carry the account's user data:
+//!
+//! | test | asserts |
+//! |---|---|
+//! | the lane trades | no futures assertion and no listenKey; logon, then subscribe; IoCs filled, partly filled and expired, each trade a lane-4 fill at its own price; a sell past the account's holding refused; the cycles reconcile — the BTC commissions paid out of the explained balance |
+//! | the bStock check | a row whose permission groups the account lacks, an account that cannot trade, a key without spot: the boot refused |
+//! | a permission lost | a lock, raised once |
+//! | a lost place answer | never re-sent; `order.status` books it at the cumulative quote's average |
+//! | adoption | a balance held at boot adopted at the ticker's price, within the cap; past it, or unpriced, the boot refused |
+//! | the sweep | clear, nothing to cancel |
+//! | an overlap | two sessions subscribed: each trade booked and its commission journaled once |
+//! | the venue's own trades | a stranger's or a liquidation-named id: booked to no one, drift |
+//! | the subscription's end | the session dropped, a new one subscribed, trading resumed |
+//! | the BNB burn | a commission paid out of BNB's row: still reconciled |
+//! | a fill booked without its report | its commission read from the order's trades, once; reconciled; the late report books and pays nothing |
+//! | a report's `z` past a lost trade | the lost trade's commission from the order's trades, once |
+//! | sub-millionth dust | the explained balance starts at it: no drift |
+//! | the order's trades unread | asked three times — a second apart, then two — no more (counted dropped); the commission unpaid: drift (fail closed) |
+//! | the order's trades refused once | asked again behind the queue: the commission paid once; reconciled |
+//! | a cycle while the order's trades are read | the leg held: the cycle inconclusive (not reconciled, no drift); the read answers, paid once, the next cycle at once and clean |
+//! | an order's trades page short of its fill | read again a second later (an empty page; one trade of two): each commission paid once, nothing dropped, reconciled |
+//! | the burn's commission read while a cycle lands | every spot leg held, BNB's too: inconclusive, no drift; the read pays BNB's row once; reconciled |
+//! | the REST route; an HMAC key | refused at construction (`SpotRoute`; HMAC on the WS API: `Signing`) |
+//! | a base armed twice, or another row's quote | refused at construction (`SpotAsset`, naming the row) |
+//! | spot beside PM or PM Pro | refused at construction (`Product`); `mode::built` too |
+//! | an order of ours resting at boot | the boot refused at its first listing (`SpotStray`), the order never cancelled |
+//! | an in-doubt order REJECTED | ended at its status: nothing booked, never asked again |
+//! | a subscription answered without its id | that session dropped, the next carries the boot; none ever: refused in Connect |
+//! | a ticker naming another symbol | the balance unpriced: the boot refused (`Inventory`) |
+//!
 //! Offline-path doctrine: this test allocates freely.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,27 +98,32 @@ use core_config::SecretKeyBytes;
 use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
 use core_ring::{Consumer, Ring};
 use core_types::{
-    make_symbol_id, CancelReq, ExecRecord, Fill, ModifyReq, Order, Price, Qty, Side, SymbolId, VenueId, FILL_FLAG_SETTLEMENT,
+    make_symbol_id, CancelReq, ExecRecord, Fill, ModifyReq, Order, Price, Qty, Side, SymbolId, VenueId, FILL_FLAG_ADOPTED,
+    FILL_FLAG_SETTLEMENT,
 };
-use exec_binance::arm::{ArmKnobs, BnArm};
+use exec_binance::arm::{
+    ArmKnobs, BnArm, GW_CONNECT_FAILURES, GW_EVENTS_OTHER, GW_FILLS_FOREIGN, GW_JOBS_DROPPED, GW_RECON_DRIFT_LEGS, GW_RECON_OK,
+    GW_RECON_UNSEEN_LEGS,
+};
 use exec_binance::cmd::{duplex, BnEngineEnd};
 use exec_binance::config::{BnConfig, HmacSigner, Scope};
 use exec_binance::gateway::{
-    BootErr, BnGateway, GwKnobs, Phase, CODE_CONFIG, CODE_MARGIN_TYPE, CODE_PM_ACCOUNT, ROTATE_AFTER_NS,
+    BootErr, BnGateway, GwKnobs, Phase, CODE_CONFIG, CODE_MARGIN_TYPE, CODE_PERMISSION, CODE_PM_ACCOUNT, ROTATE_AFTER_NS,
 };
-use exec_binance::inst::{BindSpec, InstTable, PRODUCT_COINM, PRODUCT_USDM};
+use exec_binance::inst::{BindSpec, InstTable, PRODUCT_COINM, PRODUCT_SPOT, PRODUCT_USDM};
 use exec_binance::journal::{
-    fee_fields, JournalTx, FEE_ASSET_SETTLE, JOURNAL_RING, J_ACK, J_ANCHOR, J_ENDED, J_FEE, J_FILL, J_FILL_ADOPTED, J_FILL_UNSEEN,
-    J_RECON, J_REJECT, J_SWEEP, J_VENUE, TRADE_BY_ADL, TRADE_BY_LIQUIDATION, TRADE_BY_MEMBER, TRADE_BY_ORPHAN, TRADE_BY_SETTLEMENT,
+    fee_fields, JournalTx, FEE_ASSET_BNB, FEE_ASSET_OTHER, FEE_ASSET_SETTLE, JOURNAL_RING, J_ACK, J_ANCHOR, J_ENDED, J_FEE, J_FILL,
+    J_FILL_ADOPTED, J_FILL_UNSEEN, J_RECON, J_REJECT, J_SWEEP, J_VENUE, TRADE_BY_ADL, TRADE_BY_LIQUIDATION, TRADE_BY_MEMBER,
+    TRADE_BY_ORPHAN, TRADE_BY_SETTLEMENT,
 };
 use exec_binance::margin::{MarginBook, SLOTS};
 use exec_binance::mode::{AccountMode, AssertErr};
 use exec_binance::testvenue::{
-    cid, jfield, now_ms, venue_fee_1e8, VOrder, VState, Venue, CM_FACE_1E6, DAPI, EPOCH, FAPI, FAPI_DUST, HMAC_SECRET, KEY,
-    OLD_EPOCH, PX_MARK, SEED, SLOT,
+    cid, jfield, now_ms, venue_fee_1e8, SpotOrder, VOrder, VState, Venue, CM_FACE_1E6, DAPI, EPOCH, FAPI, FAPI_DUST, HMAC_SECRET,
+    KEY, OLD_EPOCH, PX_MARK, SEED, SLOT, SPOT,
 };
 use exec_router::{
-    ExecMode, ExecRoute, HaltLimits, HaltReason, InstrumentSpec, RoutedDispatcher, SlotCaps, LAW_INVERSE, LAW_LINEAR,
+    ExecMode, ExecRoute, HaltLimits, HaltReason, InstrumentSpec, RoutedDispatcher, SlotCaps, LAW_INVERSE, LAW_LINEAR, LAW_SPOT,
 };
 use ingress_binance::discovery::BnDiscovery;
 
@@ -101,6 +137,25 @@ const FILL_N: usize = 1_024;
 const CM_SYM: SymbolId = make_symbol_id(VenueId::Binance, 3_073);
 /// The dust row's engine id ([`FAPI_DUST`]).
 const DUST_SYM: SymbolId = make_symbol_id(VenueId::Binance, 514);
+/// BX8: spot's other rows' engine ids ([`SPOT`]; spot[0], BTCUSDT, trades
+/// under the alias).
+const BNB_SYM: SymbolId = make_symbol_id(VenueId::Binance, 2);
+const TSLAB_SYM: SymbolId = make_symbol_id(VenueId::Binance, 3);
+/// The rows no arm may bind beside BTCUSDT (`BootErr::SpotAsset`).
+const BTCUSDC_SYM: SymbolId = make_symbol_id(VenueId::Binance, 4);
+const BNBBTC_SYM: SymbolId = make_symbol_id(VenueId::Binance, 5);
+
+/// A spot row's engine id (BX8).
+fn spot_sym(symbol: &[u8]) -> SymbolId {
+    match symbol {
+        b"BTCUSDT" => ALIAS,
+        b"BNBUSDT" => BNB_SYM,
+        b"TSLABUSDT" => TSLAB_SYM,
+        b"BTCUSDC" => BTCUSDC_SYM,
+        b"BNBBTC" => BNBBTC_SYM,
+        _ => panic!("no spot row {}", String::from_utf8_lossy(symbol)),
+    }
+}
 
 // =========================================================================
 // The engine thread's side
@@ -165,6 +220,20 @@ impl Engine {
     fn retired(&self, why: u8) -> u64 {
         self.d.retired().by_why[why as usize]
     }
+
+    /// The gateway's tally `k` (`GW_*`), as of its last pulse.
+    fn gw(&self, k: usize) -> u64 {
+        self.d.live().counters().gw[k]
+    }
+}
+
+/// Every record the journal holds, in order (BX8's tests read it whole).
+fn records<const J: usize>(j: &mut Consumer<ExecRecord, J>) -> Vec<ExecRecord> {
+    let mut out = Vec::new();
+    while let Some(g) = j.try_pop_ref() {
+        out.push(*g);
+    }
+    out
 }
 
 fn order(oid: u64, side: Side, kind: u8, px_1e6: i64, qty_1e6: i64) -> Order {
@@ -197,6 +266,10 @@ struct Opts {
     rotate_after_ms: u64,
     /// The REST order route, HMAC-signed.
     rest_hmac: bool,
+    /// BX8: the REST order route with the Ed25519 key.
+    rest_ed25519: bool,
+    /// BX8: an HMAC key on the WS API route.
+    hmac_ws: bool,
     /// COIN-M armed beside USDⓈ-M.
     cm: bool,
     mode: AccountMode,
@@ -216,6 +289,10 @@ struct Opts {
     demo: bool,
     /// BX11: the dead-man's countdown (production: 30 s).
     countdown_ms: u64,
+    /// BX8: a spot-only arm — these [`SPOT`] rows bound in place of
+    /// USDⓈ-M's BTCUSDT, IoC-only (spot has no dead-man), the first under
+    /// the alias. Empty: the futures arm.
+    spot: &'static [&'static [u8]],
 }
 
 impl Opts {
@@ -225,6 +302,8 @@ impl Opts {
             recon_every_ms,
             rotate_after_ms: ROTATE_AFTER_NS / 1_000_000,
             rest_hmac: false,
+            rest_ed25519: false,
+            hmac_ws: false,
             cm: false,
             mode: AccountMode::Classic,
             shared: false,
@@ -234,7 +313,15 @@ impl Opts {
             boot_timeout_ms: 15_000,
             demo: false,
             countdown_ms: 30_000,
+            spot: &[],
         }
+    }
+
+    /// BX8: a spot-only arm on `rows` (BTCUSDT first: the alias).
+    const fn spot_only(rows: &'static [&'static [u8]]) -> Self {
+        let mut o = Self::new(60_000_000_000, 300);
+        o.spot = rows;
+        o
     }
 }
 
@@ -333,7 +420,7 @@ impl<const J: usize> Rig<J> {
         // Makers only where a dead-man of ours is proven: classic USDⓈ-M.
         let maker_ok = o.mode == AccountMode::Classic;
         let scope = if o.demo { Scope::Demo } else { Scope::Live };
-        let cfg = if o.rest_hmac {
+        let cfg = if o.rest_hmac || o.hmac_ws {
             let h = HmacSigner::from_secret(HMAC_SECRET).expect("the secret");
             BnConfig::loopback_hmac(scope, String::from(KEY), h, venue.port).expect("config")
         } else {
@@ -341,13 +428,24 @@ impl<const J: usize> Rig<J> {
             BnConfig::loopback(scope, String::from(KEY), seed, venue.port).expect("config")
         };
         let mut disc = BnDiscovery::new();
-        disc.ingest_body(FAPI).expect("discovery");
         let (mut table, mut wire) = InstTable::new(ALIAS);
-        let row = disc.find(b"BTCUSDT").expect("BTCUSDT");
-        // Portfolio Margin and PM Pro: IoC-only (K13, K14: no dead-man).
-        table
-            .bind(&mut wire, &BindSpec { sym: ALIAS, product: PRODUCT_USDM, row, owned: true, maker_ok })
-            .expect("bind");
+        if o.spot.is_empty() {
+            disc.ingest_body(FAPI).expect("discovery");
+            let row = disc.find(b"BTCUSDT").expect("BTCUSDT");
+            // Portfolio Margin and PM Pro: IoC-only (K13, K14: no dead-man).
+            table
+                .bind(&mut wire, &BindSpec { sym: ALIAS, product: PRODUCT_USDM, row, owned: true, maker_ok })
+                .expect("bind");
+        } else {
+            // BX8: spot's rows, IoC-only (spot has no dead-man).
+            disc.ingest_body(SPOT).expect("spot discovery");
+            for &s in o.spot {
+                let row = disc.find(s).expect("a spot row");
+                table
+                    .bind(&mut wire, &BindSpec { sym: spot_sym(s), product: PRODUCT_SPOT, row, owned: true, maker_ok: false })
+                    .expect("bind spot");
+            }
+        }
         let mut dapi = BnDiscovery::new();
         if o.cm {
             dapi.ingest_body(DAPI).expect("dapi discovery");
@@ -378,7 +476,7 @@ impl<const J: usize> Rig<J> {
             recon_every_ms: o.recon_every_ms,
             spin: false,
             rotate_after_ns: o.rotate_after_ms * 1_000_000,
-            rest_orders: o.rest_hmac,
+            rest_orders: o.rest_hmac || o.rest_ed25519,
             pnl_anchor_1e6: 0,
             boot_timeout_ns: o.boot_timeout_ms * 1_000_000,
             quiet_ns: o.quiet_ns,
@@ -397,7 +495,8 @@ impl<const J: usize> Rig<J> {
     }
 
     fn boot_full_n(venue: &Venue, o: Opts) -> Self {
-        let (cm, maker_ok, halts) = (o.cm, o.mode == AccountMode::Classic, o.halts);
+        // A spot-only arm has no row a maker may rest on (BX8).
+        let (cm, maker_ok, halts) = (o.cm, o.mode == AccountMode::Classic && o.spot.is_empty(), o.halts);
         let booted = Instant::now();
         let Ok(Booted { cfg, table, mut gw, eng_end, fill_rx, journal: j_rx }) = Self::boot_traced_n(venue, o) else {
             panic!("boot");
@@ -408,7 +507,7 @@ impl<const J: usize> Rig<J> {
         let mut lim = [0i64; SLOTS];
         lim[SLOT as usize] = 600_000;
         let mut prod = [0u8; SLOTS];
-        prod[SLOT as usize] = (1 << PRODUCT_USDM) | ((cm as u8) << PRODUCT_COINM);
+        prod[SLOT as usize] = if o.spot.is_empty() { (1 << PRODUCT_USDM) | ((cm as u8) << PRODUCT_COINM) } else { 1 << PRODUCT_SPOT };
         let arm = BnArm::new(
             eng_end,
             table,
@@ -436,7 +535,12 @@ impl<const J: usize> Rig<J> {
             .expect("route");
         let mut d = RoutedDispatcher::new(route, PaperDispatcher::new(), arm, core_time::WallAnchor::now());
         d.set_route_aliases(RouteAliases::NONE.with(ALIAS, VenueId::Binance as u8).expect("alias"));
-        d.bind_instrument(&InstrumentSpec::new(ALIAS, LAW_LINEAR, 0, 0, 0)).expect("ledger row");
+        if o.spot.is_empty() {
+            d.bind_instrument(&InstrumentSpec::new(ALIAS, LAW_LINEAR, 0, 0, 0)).expect("ledger row");
+        }
+        for &s in o.spot {
+            d.bind_instrument(&InstrumentSpec::new(spot_sym(s), LAW_SPOT, 0, 0, 0)).expect("spot ledger row");
+        }
         if cm {
             d.bind_instrument(&InstrumentSpec::new(CM_SYM, LAW_INVERSE, 0, CM_FACE_1E6, 0)).expect("COIN-M ledger row");
         }
@@ -455,8 +559,9 @@ impl<const J: usize> Rig<J> {
         let mut e = Engine { d, lane: fill_rx, fills: Vec::new() };
         // BX7: the slot is seeded only once the venue's position is in the
         // ledger (adopted at boot) — checked at the very moment the router
-        // seeds it, in the idle hook, before the lane's next drain.
-        let want = venue.with(|v| v.pos_1e6);
+        // seeds it, in the idle hook, before the lane's next drain. A spot
+        // anchor's position is its BTC balance (BX8).
+        let want = venue.with(|v| if o.spot.is_empty() { v.pos_1e6 } else { v.spot_balance("BTC").div_euclid(100) });
         let t0 = Instant::now();
         loop {
             e.d.on_idle();
@@ -2366,4 +2471,1074 @@ fn the_rest_route_trades_with_an_hmac_key() {
     });
     let rig = Rig { e, ..rig };
     let _journal = rig.shutdown();
+}
+
+// =========================================================================
+// BX8: spot
+// =========================================================================
+
+/// **BX8: the spot lane trades IoCs, and their fills reach lane 4.** A
+/// spot-only arm boots on `api/v3` and `/ws-api/v3` alone — the clock on
+/// `api/v3`, the key's spot permission and the account mode on SAPI; no
+/// futures assertion, no listenKey, no stream — its session logs on, THEN
+/// subscribes (only that makes it live), and the first cycle reads the
+/// balances, the listing and the day (`myTrades`). IoCs trade: a full fill
+/// in two trades, a partial and its expiry, one that expires unfilled —
+/// each trade one lane-4 fill under the anchor's id (7) at its own price.
+/// A sell of the ledger's whole holding is refused `-2010`: the holding is
+/// gross of the BTC the buys paid in commission, the account's is not; a
+/// sell of what the first IoC bought fills, its commission in USDT. The
+/// cycles then reconcile with no drift: each BTC commission was paid out of
+/// the row's explained balance (the balance law). Break-and-watch: the
+/// gross position compared, the BTC leg drifts by the commissions.
+#[test]
+fn the_spot_lane_trades_iocs_and_its_fills_reach_lane_4() {
+    let venue = Venue::start();
+    // The day before the boot, as the venue booked it: an earlier boot's
+    // round trip — bought 0.001 at 64 000, sold it at 64 100, both
+    // commissions burnt in BNB (held, not armed) — flat; 64 USD of
+    // increasing turnover.
+    venue.with(|v| {
+        v.spot_bal_1e8.insert(String::from("BNB"), 1_000_000);
+        v.spot_bnb_fee_1e8 = Some(8_000);
+        v.spot_trade(&cid(OLD_EPOCH, 1), "BTCUSDT", true, 1_000, 64_000_000_000);
+        v.spot_trade(&cid(OLD_EPOCH, 2), "BTCUSDT", false, 1_000, 64_100_000_000);
+        v.spot_bnb_fee_1e8 = None;
+    });
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT"]));
+    venue.with(|v| {
+        // The boot's order: the clock, the key and the mode, the session.
+        assert!(v.log[..4].iter().all(|l| l == "GET /api/v3/time"), "{:?}", v.log);
+        let at = |want: &str| v.log.iter().position(|l| l == want).unwrap_or_else(|| panic!("{want}: {:?}", v.log));
+        let (logon, sub, account) = (at("spot session.logon"), at("spot userDataStream.subscribe"), at("spot account.status"));
+        assert!(at("GET /sapi/v1/account/apiRestrictions") < logon && at("GET /sapi/v1/portfolio/account") < logon);
+        assert!(logon < sub && sub < account, "logged on, subscribed, then read: {:?}", v.log);
+        assert!(account < at("GET /api/v3/openOrders") && at("GET /api/v3/openOrders") < at("GET /api/v3/myTrades"));
+        assert!(
+            !v.log.iter().any(|l| l.contains("/fapi/") || l.contains("/dapi/") || l.contains("listenKey") || l.starts_with("ws")),
+            "nothing of futures': {:?}",
+            v.log
+        );
+        assert_eq!((v.spot_conns, v.spot_logons, v.spot_subscribes), (1, 1, 1));
+        assert_eq!((v.order_conns, v.user_conns, v.countdowns, v.spot_tickers), (0, 0, 0, 0), "no futures session, stream or dead-man; nothing to price");
+        let day = &v.spot_trade_reads[..];
+        assert!(day.len() == 1 && day[0].contains("startTime=") && !day[0].contains("orderId="), "the day read, since 00:00Z: {day:?}");
+    });
+    let mut e = rig.e;
+    // Obligation 8: the spot day, the venue's trades — 64 USD of increasing
+    // turnover.
+    assert_eq!(e.d.ledger().slot_day_turnover_1e6(SLOT as usize), 64_000_000);
+
+    // ---- a full fill in two trades --------------------------------------------
+    venue.with(|v| v.spot_plan.push_back(vec![1_000, 1_000]));
+    assert_eq!(e.d.submit(&order(101, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 2_000)), Ok(()));
+    e.until("FILLED", |e| e.retired(RETIRED_FILLED) == 1);
+    venue.with(|v| {
+        let p = v.spot_places.last().expect("the place");
+        assert_eq!((jfield(p, "symbol"), jfield(p, "side"), jfield(p, "type")), (Some("BTCUSDT"), Some("BUY"), Some("LIMIT")));
+        assert_eq!((jfield(p, "quantity"), jfield(p, "price")), (Some("0.00200"), Some("65000.00")), "the spot row's step and tick");
+        assert_eq!((jfield(p, "timeInForce"), jfield(p, "newOrderRespType"), jfield(p, "reduceOnly")), (Some("IOC"), Some("ACK"), None));
+        assert_eq!(jfield(p, "newClientOrderId"), Some(cid(EPOCH, 101).as_str()));
+    });
+    // ---- a partial fill and its expiry; an IoC that fills nothing -------------
+    venue.with(|v| v.spot_plan.push_back(vec![1_000]));
+    assert_eq!(e.d.submit(&order(102, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 3_000)), Ok(()));
+    e.until("the partial's EXPIRED", |e| e.retired(RETIRED_EXPIRED) == 1);
+    venue.with(|v| v.spot_plan.push_back(Vec::new()));
+    assert_eq!(e.d.submit(&order(103, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 1_000)), Ok(()));
+    e.until("EXPIRED unfilled", |e| e.retired(RETIRED_EXPIRED) == 2);
+    e.idle_for(100);
+    let got: Vec<(u64, SymbolId, Side, u8, i64, i64)> =
+        e.fills.iter().map(|f| (f.order_id, f.sym, f.side, f.strategy_id, f.qty.raw(), f.px.raw())).collect();
+    assert_eq!(
+        got,
+        vec![
+            (101, ALIAS, Side::Bid, SLOT, 1_000, 64_999_990_000),
+            (101, ALIAS, Side::Bid, SLOT, 1_000, 64_999_980_000),
+            (102, ALIAS, Side::Bid, SLOT, 1_000, 64_999_990_000),
+        ],
+        "a fill per trade, at its own price, under the anchor's id"
+    );
+    e.fills.iter().for_each(assert_wall);
+    assert_eq!(e.pos(), Some(3_000));
+    // Each buy's commission is its base asset's: 0.000001 BTC a trade.
+    assert_eq!(venue.with(|v| v.spot_balance("BTC")), 300_000 - 3 * 100);
+
+    // ---- the ledger's whole holding is more than the account's -----------------
+    assert_eq!(e.d.submit(&order(104, Side::Ask, ORDER_KIND_IOC, 64_000_000_000, 3_000)), Ok(()), "an exit, to the ledger");
+    e.until("refused -2010 by the venue", |e| e.retired(RETIRED_REJECTED) == 1);
+    // ---- a sell of what the first IoC bought: its commission in USDT -----------
+    assert_eq!(e.d.submit(&order(105, Side::Ask, ORDER_KIND_IOC, 64_000_000_000, 2_000)), Ok(()));
+    e.until("the sell FILLED", |e| e.retired(RETIRED_FILLED) == 2);
+    e.idle_for(100);
+    let f = e.fills.last().copied().expect("the sell");
+    assert_eq!((f.order_id, f.side, f.qty.raw(), f.px.raw()), (105, Side::Ask, 2_000, 64_000_010_000));
+    assert_eq!(e.pos(), Some(1_000));
+    assert_eq!(venue.with(|v| v.spot_balance("BTC")), 100_000 - 3 * 100);
+
+    // ---- the cycles reconcile: the commissions paid in BTC are no drift -------
+    let r0 = e.gw(GW_RECON_OK);
+    e.until("two cycles reconcile", |e| e.gw(GW_RECON_OK) >= r0 + 2);
+    assert_eq!((e.gw(GW_RECON_DRIFT_LEGS), e.gw(GW_RECON_UNSEEN_LEGS)), (0, 0));
+    let sig = e.d.live().halt_signal_for(SLOT);
+    assert_eq!((sig.reconciled, sig.recon_drift_usd_1e6), (1, 0));
+
+    let r = records(&mut Rig { e, ..rig }.shutdown());
+    venue.with(|v| {
+        assert_eq!((v.sig_bad, v.bad_ts, v.bad_key, v.key_in_line, v.unauth, v.unknown), (0, 0, 0, 0, 0, 0));
+        assert!(v.sig_ok >= 5, "{} signatures verified", v.sig_ok);
+        assert!(!v.spot_trade_reads.iter().any(|q| q.contains("orderId=")), "every commission rode its report: no order's trades read");
+    });
+    // Each trade's commission journaled once: the buys' in BTC (to the row,
+    // an asset not its settlement's), the sell's in USDT — 0.1 % of
+    // 128.00002, at the venue's 8 decimals.
+    let fees: Vec<(u64, i64, u8, u8)> =
+        r.iter().filter(|g| g.kind == J_FEE).map(|g| (g.client_oid, g.c, fee_fields(g.code).1, fee_fields(g.code).3)).collect();
+    assert_eq!(
+        fees,
+        vec![
+            (101, 1_000, FEE_ASSET_OTHER, PRODUCT_SPOT),
+            (101, 1_000, FEE_ASSET_OTHER, PRODUCT_SPOT),
+            (102, 1_000, FEE_ASSET_OTHER, PRODUCT_SPOT),
+            (105, 128_000_020, FEE_ASSET_SETTLE, PRODUCT_SPOT),
+        ]
+    );
+    assert_eq!(r.iter().filter(|g| g.kind == J_REJECT && g.code == -2010).count(), 1, "the oversized sell: the venue's refusal");
+    // The last cycle's report (`EVT_RECON`, journaled): reconciled, no drift.
+    let last = r.iter().rev().find(|g| g.kind == J_RECON).expect("a verdict");
+    assert_eq!((last.code, last.a, last.b), (1, 0, 0), "EVT_F_RECONCILED; no drift, nothing unseen");
+}
+
+/// **BX8 (BX-19, the bStock check): a spot row whose permission groups the
+/// account lacks refuses the boot.** TSLABUSDT's one set names TRD_GRP_004
+/// and TRD_GRP_261: an account holding `SPOT` alone may not trade it — the
+/// boot refused `SymbolNotPermitted` at its first account read, nothing
+/// placed — and one holding TRD_GRP_261 too boots. An account that cannot
+/// trade (`canTrade: false`) is refused `CannotTrade`; a key without spot
+/// trading `NoTradePermission`, on SAPI, before any session.
+/// Break-and-watch: judged on the names alone, the bStock row boots.
+#[test]
+fn a_spot_row_whose_groups_the_account_lacks_refuses_the_boot() {
+    let o = Opts::spot_only(&[b"BTCUSDT", b"TSLABUSDT"]);
+    let boot = |set: fn(&mut VState)| {
+        let venue = Venue::start();
+        venue.with(set);
+        let r = Rig::boot_gateway(&venue, o).err();
+        (r, venue.with(|v| (v.spot_conns, v.spot_places.len())))
+    };
+    let refused = |e: AssertErr| Some(BootErr::Assert(e));
+    assert_eq!(boot(|_| {}), (refused(AssertErr::SymbolNotPermitted), (1, 0)), "the account holds SPOT alone");
+    assert_eq!(boot(|v| v.spot_permissions.push(String::from("TRD_GRP_261"))), (None, (1, 0)), "and TRD_GRP_261: it boots");
+    let frozen = |v: &mut VState| {
+        v.spot_permissions.push(String::from("TRD_GRP_261"));
+        v.spot_can_trade = false;
+    };
+    assert_eq!(boot(frozen), (refused(AssertErr::CannotTrade), (1, 0)));
+    assert_eq!(boot(|v| v.key_spot = false), (refused(AssertErr::NoTradePermission), (0, 0)), "on SAPI, before any session");
+}
+
+/// **BX8 (BX-19 mid-session): a permission group lost once ready is a
+/// lock, raised once.** The account holds TSLABUSDT's TRD_GRP_261 at boot,
+/// then loses it: the next account read finds the row no longer the
+/// account's to trade — `EVT_LOCK` with [`CODE_PERMISSION`], the slot's
+/// venue lock — and the reads after it raise nothing more.
+/// Break-and-watch: judged at the boot alone, nothing locks.
+#[test]
+fn a_spot_permission_lost_mid_session_locks_the_venue() {
+    let venue = Venue::start();
+    venue.with(|v| v.spot_permissions.push(String::from("TRD_GRP_261")));
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT", b"TSLABUSDT"]));
+    let mut e = rig.e;
+    e.idle_for(400);
+    assert_eq!(e.d.live().halt_signal_for(SLOT).venue_lock, 0, "the account may trade both rows");
+    let reads = venue.with(|v| {
+        v.spot_permissions.retain(|p| p != "TRD_GRP_261");
+        v.spot_accounts
+    });
+    e.until("the lock", |e| e.d.live().halt_signal_for(SLOT).venue_lock == 1);
+    e.until("three reads more", |_| venue.with(|v| v.spot_accounts) >= reads + 3);
+    let r = records(&mut Rig { e, ..rig }.shutdown());
+    let codes: Vec<i32> = r.iter().filter(|g| g.kind == J_VENUE).map(|g| g.code).collect();
+    assert_eq!(codes, vec![CODE_PERMISSION], "one lock, the permission's");
+}
+
+/// **BX8 (BX-11 on spot): a place whose answer is lost is never re-sent.**
+/// The venue fills the IoC in two trades, but its answer is lost and its
+/// reports with it (the account's user data muted): the request's deadline
+/// drops the session, the order is in doubt, and the next session — logged
+/// on and subscribed — asks `order.status`: the executed quantity is booked
+/// ONCE (`J_FILL_UNSEEN`) at the implied average, the cumulative quote
+/// over the executed quantity (spot's answer has no `avgPrice`), and the
+/// order retires FILLED. The venue saw ONE `order.place`; the commissions no
+/// report carried come from the order's trades (the next test's subject).
+/// Break-and-watch: re-sent, the venue sees two.
+#[test]
+fn a_lost_spot_place_answer_is_never_resent() {
+    let venue = Venue::start();
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT"]));
+    let mut e = rig.e;
+    let conns = venue.with(|v| {
+        v.lose_place_answer = true;
+        v.spot_mute_events = true;
+        v.spot_plan.push_back(vec![1_000, 1_000]);
+        v.spot_conns
+    });
+    assert_eq!(e.d.submit(&order(401, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 2_000)), Ok(()));
+    let c = cid(EPOCH, 401);
+    e.until("filled at the venue", |_| venue.with(|v| v.spot_orders.iter().any(|o| o.cid == c && o.status == "FILLED")));
+    venue.with(|v| v.spot_mute_events = false);
+    e.idle_for(150);
+    assert!(e.fills.is_empty(), "the answer and the reports were lost");
+    e.until_within("a new session after the deadline", Duration::from_secs(15), |_| venue.with(|v| v.spot_conns) > conns);
+    e.until("FILLED, from the status", |e| e.retired(RETIRED_FILLED) == 1);
+    e.idle_for(100);
+    // (0.001 × 64 999.99 + 0.001 × 64 999.98) / 0.002: neither trade's
+    // price, nor the limit.
+    let got: Vec<(u64, i64, i64)> = e.fills.iter().map(|f| (f.order_id, f.qty.raw(), f.px.raw())).collect();
+    assert_eq!(got, vec![(401, 2_000, 64_999_985_000)], "booked once, at the cumulative quote's average");
+    venue.with(|v| {
+        assert_eq!(v.spot_places.iter().filter(|p| p.contains(&c)).count(), 1, "one order.place: a lost answer is never re-sent");
+        assert!(v.log.iter().any(|l| l == "spot order.status"));
+        assert!(v.spot_subscribes >= 2, "the new session subscribed");
+    });
+    let r = records(&mut Rig { e, ..rig }.shutdown());
+    assert_eq!(r.iter().filter(|g| g.kind == J_FILL && g.client_oid == 401 && g.code & J_FILL_UNSEEN != 0).count(), 1);
+    let fees: Vec<(u64, i64)> = r.iter().filter(|g| g.kind == J_FEE).map(|g| (g.client_oid, g.c)).collect();
+    assert_eq!(fees, vec![(0, 1_000), (0, 1_000)], "each trade's commission once, from the order's trades");
+}
+
+/// **BX8 (the operator's ruling, on spot): a balance held at boot is adopted
+/// at the ticker's price.** A balance carries no price: the boot's first
+/// cycle asks `ticker/price` for each balance it will adopt — ahead of the
+/// listing, so before the verdict — and values it there. 0.5 BTC at 65 000
+/// is 32 500 USD: within a 40 000 USD cap it is adopted as ONE fill on lane
+/// 4 (flagged adopted, the owner's, at the ticker's price), the row's
+/// explained balance the venue's own, and the cycles reconcile; past a
+/// 30 000 USD cap the boot is refused `Inventory` (the exposure); a price
+/// the venue will not give (no such symbol: 400) leaves the leg unpriced and
+/// the boot refused `Inventory(i64::MAX)` — fail closed. Break-and-watch: an
+/// unpriced leg valued at 0 would pass any cap.
+#[test]
+fn a_spot_balance_held_at_boot_is_adopted_at_the_ticker_price() {
+    let o = Opts { adopt_cap_usd_1e6: 40_000_000_000, ..Opts::spot_only(&[b"BTCUSDT"]) };
+    let hold = |v: &mut VState| {
+        v.spot_bal_1e8.insert(String::from("BTC"), 50_000_000);
+    };
+    let venue = Venue::start();
+    venue.with(hold);
+    let low = Opts { adopt_cap_usd_1e6: 30_000_000_000, ..o };
+    assert_eq!(Rig::boot_gateway(&venue, low).err(), Some(BootErr::Inventory(32_500_000_000)), "past the cap");
+    let venue = Venue::start();
+    venue.with(|v| {
+        hold(v);
+        v.spot_px_1e6.clear();
+    });
+    assert_eq!(Rig::boot_gateway(&venue, o).err(), Some(BootErr::Inventory(i64::MAX)), "unpriced");
+    assert_eq!(venue.with(|v| v.spot_tickers), 1, "asked, and refused");
+
+    let venue = Venue::start();
+    venue.with(hold);
+    let rig = Rig::boot_full(&venue, o);
+    let mut e = rig.e;
+    venue.with(|v| {
+        let at = |want: &str| v.log.iter().position(|l| l == want).unwrap_or_else(|| panic!("{want}: {:?}", v.log));
+        assert!(at("GET /api/v3/ticker/price") < at("GET /api/v3/openOrders"), "priced before the first verdict: {:?}", v.log);
+        assert_eq!(v.spot_tickers, 1);
+    });
+    let adopted: Vec<Fill> = e.fills.iter().filter(|f| f.is_adopted()).copied().collect();
+    assert_eq!(adopted.len(), 1, "one fill for the balance");
+    let f = adopted[0];
+    assert_eq!((f.sym, f.side, f.qty.raw(), f.px.raw(), f.strategy_id, f.order_id), (ALIAS, Side::Bid, 500_000, PX_MARK, SLOT, 0));
+    assert_ne!(f.flags & FILL_FLAG_ADOPTED, 0);
+    assert_eq!(e.pos(), Some(500_000), "the slot seeded holding it");
+    let r0 = e.gw(GW_RECON_OK);
+    e.until("two cycles reconcile", |e| e.gw(GW_RECON_OK) >= r0 + 2);
+    assert_eq!((e.gw(GW_RECON_DRIFT_LEGS), e.gw(GW_RECON_UNSEEN_LEGS)), (0, 0));
+    let r = records(&mut Rig { e, ..rig }.shutdown());
+    assert_eq!(r.iter().filter(|g| g.kind == J_FILL && g.code & J_FILL_ADOPTED != 0).count(), 1, "the adoption journaled");
+}
+
+/// **BX8: the spot sweep confirms clear with nothing to cancel.** A spot
+/// order never rests (IoC-only, BX-17): a halt's sweep has no cancel to
+/// send — none is — and the venue's listing confirms it clear; a stranger's
+/// order resting on the account is never ours to cancel, and is reported
+/// foreign every cycle. Break-and-watch: a sweep that waited for a cancel's
+/// answer would never confirm.
+#[test]
+fn the_spot_sweep_confirms_clear_with_nothing_to_cancel() {
+    let venue = Venue::start();
+    venue.with(|v| {
+        v.spot_orders.push(SpotOrder {
+            oid: 7_101,
+            cid: String::from("web_stranger_2"),
+            symbol: "BTCUSDT",
+            buy: false,
+            tif: "GTC",
+            qty: 100_000,
+            px: 9_000_000_000_000,
+            executed: 0,
+            quote: 0,
+            status: "NEW",
+        })
+    });
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT"]));
+    let mut e = rig.e;
+    assert_eq!(e.d.submit(&order(601, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 2_000)), Ok(()));
+    e.until("FILLED", |e| e.retired(RETIRED_FILLED) == 1);
+    let lists = |v: &VState| v.log.iter().filter(|l| l.as_str() == "GET /api/v3/openOrders").count();
+    let l0 = venue.with(|v| lists(v));
+    assert!(e.d.halt_slot(SLOT as usize, HaltReason::Operator));
+    assert_eq!(e.d.live().cancel_all_state(), CancelAllState::Working);
+    e.until("the sweep is confirmed clear", |e| !e.d.halt().cancel_outstanding());
+    assert_eq!(e.d.live().cancel_all_state(), CancelAllState::Clear);
+    venue.with(|v| {
+        assert!(lists(v) > l0, "confirmed by the venue's listing");
+        assert!(!v.log.iter().any(|l| l.contains("cancel") || l.starts_with("DELETE")), "nothing to cancel, none sent: {:?}", v.log);
+        assert!(v.spot_orders[0].open(), "a stranger's order is never ours to cancel");
+        assert_eq!(v.unknown, 0);
+    });
+    let r = records(&mut Rig { e, ..rig }.shutdown());
+    let sweeps: Vec<(i64, i64)> = r.iter().filter(|g| g.kind == J_SWEEP).map(|g| (g.a, g.b)).collect();
+    assert_eq!(sweeps, vec![(0, 0), (0, 0)], "the halt's and the shutdown's: nothing left, no cancel sent");
+    assert!(r.iter().filter(|g| g.kind == J_RECON).all(|g| g.c == 1), "the stranger's order reported every cycle");
+}
+
+/// **BX8: both spot sessions subscribed book each trade once.** The order
+/// session's planned rotation (its age, 1.5 s here) dials, logs on and
+/// SUBSCRIBES a new session while the old one still carries an IoC — the
+/// venue holds that place until another session has subscribed — so the
+/// trade's reports reach BOTH sessions, and the gateway reads both (the
+/// balances' event, counted, arrives twice). The trade books ONE lane-4
+/// fill and journals ONE commission, paid once out of the explained
+/// balance: the cycles reconcile. Break-and-watch: without the trade-id
+/// ring the second session's report books the trade again.
+#[test]
+fn both_spot_sessions_subscribed_book_each_trade_once() {
+    let venue = Venue::start();
+    let rig = Rig::boot_full(&venue, Opts { rotate_after_ms: 1_500, ..Opts::spot_only(&[b"BTCUSDT"]) });
+    let mut e = rig.e;
+    let other0 = e.gw(GW_EVENTS_OTHER);
+    let subs = venue.with(|v| {
+        v.spot_hold_place = true;
+        v.spot_subscribes
+    });
+    assert_eq!(e.d.submit(&order(701, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 2_000)), Ok(()));
+    e.until("FILLED, once another session subscribed", |e| e.retired(RETIRED_FILLED) == 1);
+    e.idle_for(300);
+    venue.with(|v| assert!(v.spot_subscribes > subs && v.spot_conns >= 2, "served past a new subscription"));
+    assert_eq!(e.gw(GW_EVENTS_OTHER), other0 + 2, "the trade's balances' event, read on both sessions");
+    let got: Vec<(u64, i64, i64)> = e.fills.iter().map(|f| (f.order_id, f.qty.raw(), f.px.raw())).collect();
+    assert_eq!(got, vec![(701, 2_000, 64_999_990_000)], "one fill");
+    assert_eq!(e.pos(), Some(2_000));
+    let r0 = e.gw(GW_RECON_OK);
+    e.until("two cycles reconcile", |e| e.gw(GW_RECON_OK) >= r0 + 2);
+    assert_eq!(e.gw(GW_RECON_DRIFT_LEGS), 0, "its BTC commission paid once");
+    let r = records(&mut Rig { e, ..rig }.shutdown());
+    let fees: Vec<(u64, i64)> = r.iter().filter(|g| g.kind == J_FEE).map(|g| (g.client_oid, g.c)).collect();
+    assert_eq!(fees, vec![(701, 2_000)], "one commission: 0.000002 BTC ×1e9");
+    assert_eq!(r.iter().filter(|g| g.kind == J_FILL).count(), 1);
+}
+
+/// **BX8 (BX-8 on spot): a foreign or liquidation-named spot fill is booked
+/// to no one.** Spot has no liquidation, ADL or settlement: an id spelling
+/// one (`autoclose-…`, `adl_autoclose`, `settlement_autoclose-…`) is
+/// someone else's order, as a stranger's (`web_…`) is — each trade counted
+/// (`GW_FILLS_FOREIGN`), none on lane 4 — and the BTC they moved is the
+/// reconciliation's: drift on the row the arm holds. Break-and-watch: classed
+/// as on futures, the liquidation-named trades book to the owner.
+#[test]
+fn a_foreign_or_liquidation_named_spot_fill_is_booked_to_no_one() {
+    let venue = Venue::start();
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT"]));
+    let mut e = rig.e;
+    // The arm holds BTC: what moves the balance next is drift, not unseen.
+    assert_eq!(e.d.submit(&order(801, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 2_000)), Ok(()));
+    e.until("FILLED", |e| e.retired(RETIRED_FILLED) == 1);
+    let f0 = e.gw(GW_FILLS_FOREIGN);
+    venue.with(|v| {
+        v.spot_trade("web_Xa9bQ3stranger", "BTCUSDT", true, 1_000, 65_000_000_000);
+        v.spot_trade("autoclose-1790000000123", "BTCUSDT", false, 1_000, 65_000_000_000);
+        v.spot_trade("adl_autoclose", "BTCUSDT", true, 1_000, 65_000_000_000);
+        v.spot_trade("settlement_autoclose-1790000000", "BTCUSDT", false, 500, 65_000_000_000);
+    });
+    e.until("the four counted", |e| e.gw(GW_FILLS_FOREIGN) == f0 + 4);
+    e.idle_for(150);
+    assert_eq!(e.fills.len(), 1, "booked to no one");
+    assert_eq!(e.pos(), Some(2_000));
+    e.until("the BTC they moved: drift", |e| e.gw(GW_RECON_DRIFT_LEGS) == 1);
+    assert_eq!(e.d.live().halt_signal_for(SLOT).reconciled, 0);
+    let r = records(&mut Rig { e, ..rig }.shutdown());
+    assert_eq!(r.iter().filter(|g| g.kind == J_FILL).count(), 1, "the arm's own trade alone");
+}
+
+/// **BX8: the subscription's end drops the session.** The venue ends the
+/// account's user data on the live session (`eventStreamTerminated`): a
+/// session that could place but not see its fills must not trade — the
+/// gateway drops it, and a new one logs on and SUBSCRIBES before it is
+/// live; trading resumes on it. Break-and-watch: read as an event of no
+/// kind, the session stays live and blind (no second subscription).
+#[test]
+fn the_subscription_ending_drops_the_session() {
+    let venue = Venue::start();
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT"]));
+    let mut e = rig.e;
+    let logons = venue.with(|v| {
+        v.spot_end_stream();
+        v.spot_logons
+    });
+    e.until("the ended session dropped", |_| venue.with(|v| v.spot_closed) == 1);
+    e.until("a new session subscribed", |_| venue.with(|v| v.spot_subscribes) == 2);
+    venue.with(|v| assert_eq!((v.spot_conns, v.spot_logons), (2, logons + 1), "logged on, then subscribed"));
+    // Trading resumes on the new session.
+    e.idle_for(300);
+    assert_eq!(e.d.submit(&order(901, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 2_000)), Ok(()));
+    e.until("FILLED", |e| e.retired(RETIRED_FILLED) == 1);
+    assert_eq!(e.pos(), Some(2_000));
+    venue.with(|v| assert_eq!((v.spot_conns, v.spot_places.len()), (2, 1), "placed on the new session"));
+    let _journal = Rig { e, ..rig }.shutdown();
+}
+
+/// **BX8 (the balance law, BNB): a commission paid in BNB on another row is
+/// BNB's.** BTCUSDT and BNBUSDT both armed; the account holds 1 BNB
+/// (adopted at boot, at BNBUSDT's price) and burns BNB for its commissions:
+/// a BTCUSDT trade charged 0.0005 BNB pays out of BNBUSDT's explained
+/// balance — once — the BTC leg the trade's whole quantity, and the cycles
+/// still reconcile both legs. Break-and-watch: a commission paid from the
+/// trade's own row leaves both legs drifting.
+#[test]
+fn a_bnb_commission_on_another_row_is_paid_from_bnb() {
+    let venue = Venue::start();
+    venue.with(|v| {
+        v.spot_bal_1e8.insert(String::from("BNB"), 100_000_000);
+        v.spot_px_1e6.insert(String::from("BNBUSDT"), 600_000_000);
+        v.spot_bnb_fee_1e8 = Some(50_000);
+    });
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT", b"BNBUSDT"]));
+    let mut e = rig.e;
+    let bnb = |e: &Engine| e.d.ledger().instrument_position_1e6(SLOT as usize, BNB_SYM);
+    assert_eq!(bnb(&e), Some(1_000_000), "1 BNB adopted at boot");
+    assert_eq!(e.d.submit(&order(1_001, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 2_000)), Ok(()));
+    e.until("FILLED", |e| e.retired(RETIRED_FILLED) == 1);
+    venue.with(|v| assert_eq!((v.spot_balance("BTC"), v.spot_balance("BNB")), (200_000, 99_950_000), "the BTC whole; the BNB charged"));
+    let r0 = e.gw(GW_RECON_OK);
+    e.until("two cycles reconcile", |e| e.gw(GW_RECON_OK) >= r0 + 2);
+    assert_eq!((e.gw(GW_RECON_DRIFT_LEGS), e.gw(GW_RECON_UNSEEN_LEGS)), (0, 0), "BNB's explained balance paid it");
+    assert_eq!((e.pos(), bnb(&e)), (Some(2_000), Some(1_000_000)), "the ledger's: the commission is no position");
+    let r = records(&mut Rig { e, ..rig }.shutdown());
+    let fees: Vec<(u64, i64, u8)> = r.iter().filter(|g| g.kind == J_FEE).map(|g| (g.client_oid, g.c, fee_fields(g.code).1)).collect();
+    assert_eq!(fees, vec![(1_001, 500_000, FEE_ASSET_BNB)], "0.0005 BNB ×1e9, once");
+}
+
+/// **BX8 (G1): a spot fill booked without its report pays its commission.**
+/// The venue fills an IoC whose answer and reports are lost (as above): the
+/// next session's `order.status` books the fill — and no report carried its
+/// commission, charged in BTC. The gateway reads the order's trades
+/// (`myTrades` by `orderId`, once), journals the commission (`J_FEE`, by the
+/// venue's order id: the member's has ended) and pays it out of the
+/// explained balance: the next cycles reconcile. The lost reports, delivered
+/// late after all, book nothing and pay nothing again (the trade-id ring).
+/// Break-and-watch: without the read the BTC leg drifts by the commission
+/// for good.
+#[test]
+fn a_spot_fill_booked_without_its_report_pays_its_commission() {
+    let venue = Venue::start();
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT"]));
+    let mut e = rig.e;
+    venue.with(|v| {
+        v.lose_place_answer = true;
+        v.spot_mute_events = true;
+    });
+    assert_eq!(e.d.submit(&order(451, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 2_000)), Ok(()));
+    let c = cid(EPOCH, 451);
+    let filled = |v: &VState| v.spot_orders.iter().find(|o| o.cid == c && o.status == "FILLED").map(|o| o.oid);
+    e.until("filled at the venue", |_| venue.with(|v| filled(v)).is_some());
+    let oid = venue
+        .with(|v| {
+            v.spot_mute_events = false;
+            filled(v)
+        })
+        .expect("the order");
+    e.until_within("FILLED, from the status", Duration::from_secs(15), |e| e.retired(RETIRED_FILLED) == 1);
+    let by_order = format!("orderId={oid}&");
+    e.until("the order's trades read", |_| venue.with(|v| v.spot_trade_reads.iter().any(|q| q.contains(&by_order))));
+    let r0 = e.gw(GW_RECON_OK);
+    e.until("the next cycles reconcile", |e| e.gw(GW_RECON_OK) >= r0 + 2);
+    assert_eq!((e.gw(GW_RECON_DRIFT_LEGS), e.gw(GW_RECON_UNSEEN_LEGS)), (0, 0), "the commission paid");
+    let sig = e.d.live().halt_signal_for(SLOT);
+    assert_eq!((sig.reconciled, sig.recon_drift_usd_1e6), (1, 0));
+
+    // ---- the lost reports, late: nothing booked or paid again ---------------
+    let other = e.gw(GW_EVENTS_OTHER);
+    venue.with(|v| v.spot_replay_lost());
+    e.until("the late reports read", |e| e.gw(GW_EVENTS_OTHER) == other + 1);
+    let r1 = e.gw(GW_RECON_OK);
+    e.until("the cycles still reconcile", |e| e.gw(GW_RECON_OK) >= r1 + 2);
+    assert_eq!(e.gw(GW_RECON_DRIFT_LEGS), 0);
+    let got: Vec<(u64, i64, i64)> = e.fills.iter().map(|f| (f.order_id, f.qty.raw(), f.px.raw())).collect();
+    assert_eq!(got, vec![(451, 2_000, 64_999_990_000)], "one fill, the status's");
+    venue.with(|v| assert_eq!(v.spot_trade_reads.iter().filter(|q| q.contains("orderId=")).count(), 1, "the order's trades read once"));
+    let r = records(&mut Rig { e, ..rig }.shutdown());
+    let fees: Vec<(u64, u64, i64, u8)> =
+        r.iter().filter(|g| g.kind == J_FEE).map(|g| (g.client_oid, g.venue_oid, g.c, fee_fields(g.code).1)).collect();
+    assert_eq!(fees, vec![(0, oid, 2_000, FEE_ASSET_OTHER)], "0.000002 BTC ×1e9, once, from the order's trades");
+    assert_eq!(r.iter().filter(|g| g.kind == J_FILL).count(), 1);
+}
+
+/// **BX8 (G1, the S1 path): a report whose cumulative quantity books a trade
+/// the stream lost pays that trade's commission from the order's trades.**
+/// The IoC fills in two trades and the first's report is lost: the second's
+/// books its own trade and — by its cumulative `z` — the lost one
+/// (`J_FILL_UNSEEN`, at the price the average leaves: the lost trade's own).
+/// The order's trades (`myTrades` by `orderId`) then pay the lost trade's
+/// commission, once — the second's was its report's — and the cycles
+/// reconcile; the lost report, delivered late, books and pays nothing again.
+/// Break-and-watch: without the read the BTC leg drifts by the lost
+/// commission.
+#[test]
+fn a_fill_whose_report_lost_its_trades_pays_their_commissions_from_the_order_trades() {
+    let venue = Venue::start();
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT"]));
+    let mut e = rig.e;
+    venue.with(|v| {
+        v.spot_plan.push_back(vec![1_000, 1_000]);
+        v.spot_drop_trade_reports = 1;
+    });
+    assert_eq!(e.d.submit(&order(461, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 2_000)), Ok(()));
+    e.until("FILLED", |e| e.retired(RETIRED_FILLED) == 1);
+    let c = cid(EPOCH, 461);
+    let oid = venue.with(|v| v.spot_orders.iter().find(|o| o.cid == c).map(|o| o.oid)).expect("the order");
+    let by_order = format!("orderId={oid}&");
+    e.until("the order's trades read", |_| venue.with(|v| v.spot_trade_reads.iter().any(|q| q.contains(&by_order))));
+    e.idle_for(100);
+    let got: Vec<(u64, i64, i64)> = e.fills.iter().map(|f| (f.order_id, f.qty.raw(), f.px.raw())).collect();
+    assert_eq!(got, vec![(461, 1_000, 64_999_980_000), (461, 1_000, 64_999_990_000)], "the second trade, then the lost one by `z`");
+    let r0 = e.gw(GW_RECON_OK);
+    e.until("the next cycles reconcile", |e| e.gw(GW_RECON_OK) >= r0 + 2);
+    assert_eq!(e.gw(GW_RECON_DRIFT_LEGS), 0, "both commissions paid");
+
+    // ---- the lost report, late: nothing booked or paid again ----------------
+    venue.with(|v| {
+        assert_eq!(v.spot_lost.len(), 1, "the first trade's report alone was lost");
+        v.spot_replay_lost();
+    });
+    e.idle_for(300);
+    let r1 = e.gw(GW_RECON_OK);
+    e.until("the cycles still reconcile", |e| e.gw(GW_RECON_OK) >= r1 + 2);
+    assert_eq!((e.fills.len(), e.gw(GW_RECON_DRIFT_LEGS)), (2, 0));
+    let r = records(&mut Rig { e, ..rig }.shutdown());
+    let fees: Vec<(u64, u64, i64)> = r.iter().filter(|g| g.kind == J_FEE).map(|g| (g.client_oid, g.venue_oid, g.c)).collect();
+    assert_eq!(fees, vec![(461, oid, 1_000), (0, oid, 1_000)], "the second trade's from its report, the lost one's from the order's trades");
+    assert_eq!(r.iter().filter(|g| g.kind == J_FILL && g.code & J_FILL_UNSEEN != 0).count(), 1);
+}
+
+/// **BX8 (G2): sub-millionth dust at boot never reads as drift.** The
+/// account holds 0.00000077 BTC: on a millionth's grid it reads 0 — nothing
+/// to adopt — yet the explained balance starts at it, to its last decimal,
+/// so after a buy of 0.00123 BTC (its 0.00000123 commission in BTC) the
+/// explained balance and the venue's agree on the millionth (1 229, not
+/// 1 228): the cycles reconcile. Break-and-watch: started at 0, the BTC leg
+/// drifts by one millionth for good.
+#[test]
+fn sub_millionth_dust_at_boot_never_reads_as_drift() {
+    let venue = Venue::start();
+    venue.with(|v| {
+        v.spot_bal_1e8.insert(String::from("BTC"), 77);
+    });
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT"]));
+    let mut e = rig.e;
+    assert!(e.fills.is_empty(), "dust: nothing adopted");
+    assert_eq!(e.d.submit(&order(471, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 1_230)), Ok(()));
+    e.until("FILLED", |e| e.retired(RETIRED_FILLED) == 1);
+    assert_eq!(venue.with(|v| v.spot_balance("BTC")), 77 + 123_000 - 123);
+    let r0 = e.gw(GW_RECON_OK);
+    e.until("the next cycles reconcile", |e| e.gw(GW_RECON_OK) >= r0 + 2);
+    assert_eq!((e.gw(GW_RECON_DRIFT_LEGS), e.gw(GW_RECON_UNSEEN_LEGS)), (0, 0));
+    assert_eq!(e.d.live().halt_signal_for(SLOT).reconciled, 1);
+    let _journal = Rig { e, ..rig }.shutdown();
+}
+
+/// The tries an order's trades get (the gateway's `ORDER_TRADES_TRIES`).
+const ORDER_TRADES_TRIES: usize = 3;
+/// The pause before an order's trades are asked again: this × the tries so
+/// far (the gateway's `ORDER_TRADES_BACKOFF_NS`, ms).
+const ORDER_TRADES_BACKOFF_MS: u64 = 1_000;
+
+/// The reads of an order's trades the venue served (`myTrades` by
+/// `orderId`, answered or refused).
+fn order_trade_reads(v: &VState) -> usize {
+    v.spot_trade_reads.iter().filter(|q| q.contains("orderId=")).count()
+}
+
+/// The pauses between consecutive reads of an order's trades, ms — by
+/// each request's own `timestamp` (the gateway's venue clock, at its
+/// sending).
+fn order_trade_pauses_ms(v: &VState) -> Vec<u64> {
+    let ms: Vec<u64> = v
+        .spot_trade_reads
+        .iter()
+        .filter(|q| q.contains("orderId="))
+        .map(|q| q.split('&').find_map(|kv| kv.strip_prefix("timestamp=")).and_then(|t| t.parse().ok()).expect("a timestamp"))
+        .collect();
+    ms.windows(2).map(|w| w[1] - w[0]).collect()
+}
+
+/// A spot IoC whose answer and reports are lost (the venue fills it whole,
+/// its BTC commission charged): the next session's `order.status` books
+/// the fill without its report — the order's trades owe its commission.
+/// The venue's order id.
+fn fill_without_its_report(venue: &Venue, e: &mut Engine, oid: u64) -> u64 {
+    let filled_before = e.retired(RETIRED_FILLED);
+    venue.with(|v| {
+        v.lose_place_answer = true;
+        v.spot_mute_events = true;
+    });
+    assert_eq!(e.d.submit(&order(oid, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 2_000)), Ok(()));
+    let c = cid(EPOCH, oid);
+    let filled = |v: &VState| v.spot_orders.iter().find(|o| o.cid == c && o.status == "FILLED").map(|o| o.oid);
+    e.until("filled at the venue", |_| venue.with(|v| filled(v)).is_some());
+    let venue_oid = venue
+        .with(|v| {
+            v.spot_mute_events = false;
+            filled(v)
+        })
+        .expect("the order");
+    e.until_within("FILLED, from the status", Duration::from_secs(15), |e| e.retired(RETIRED_FILLED) > filled_before);
+    venue_oid
+}
+
+/// **BX8 (G1, fail closed): an order's trades unread leave its commission
+/// unpaid — drift.** As above, a fill is booked from `order.status` without
+/// its report, but every read of the order's trades answers 500: asked
+/// [`ORDER_TRADES_TRIES`] times (the risk review's bound) — a second apart,
+/// then two — and no more after the third; the exhausted read counted
+/// (`GW_JOBS_DROPPED`), no commission journaled or paid, and the BTC leg
+/// reads as drift: the slot unreconciled, never a guessed commission
+/// (BX-15's posture). Break-and-watch: without the retry the read is
+/// asked once — the bound's three never come.
+#[test]
+fn a_failed_order_trades_read_leaves_the_commission_as_drift() {
+    let venue = Venue::start();
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT"]));
+    let mut e = rig.e;
+    venue.with(|v| v.spot_order_trades_500 = ORDER_TRADES_TRIES as u32);
+    let dropped = e.gw(GW_JOBS_DROPPED);
+    fill_without_its_report(&venue, &mut e, 481);
+    e.until("the order's trades asked for, refused each time", |_| venue.with(|v| order_trade_reads(v)) == ORDER_TRADES_TRIES);
+    let pauses = venue.with(|v| order_trade_pauses_ms(v));
+    assert!(
+        pauses.len() == 2 && pauses[0] >= ORDER_TRADES_BACKOFF_MS && pauses[1] >= 2 * ORDER_TRADES_BACKOFF_MS,
+        "asked again a second later, then two: {pauses:?} ms"
+    );
+    e.until("the unpaid commission: drift", |e| e.gw(GW_RECON_DRIFT_LEGS) == 1);
+    assert_eq!(e.d.live().halt_signal_for(SLOT).reconciled, 0);
+    assert_eq!(e.gw(GW_JOBS_DROPPED), dropped + 1, "the exhausted read counted");
+    let r1 = e.gw(GW_RECON_OK);
+    e.idle_for(1_000);
+    assert_eq!(venue.with(|v| order_trade_reads(v)), ORDER_TRADES_TRIES, "asked no more after the third: the commission stays unpaid");
+    assert_eq!((e.gw(GW_RECON_OK), e.gw(GW_RECON_DRIFT_LEGS)), (r1, 1), "the cycles still unreconciled");
+    let r = records(&mut Rig { e, ..rig }.shutdown());
+    assert!(!r.iter().any(|g| g.kind == J_FEE), "none read: none journaled");
+}
+
+/// **BX8 (the risk review): an order's trades read that failed is asked
+/// again.** The read answers 500 once: the job goes behind the queue for a
+/// second's pause and its second read pays the commission — once (`J_FEE`,
+/// by the venue's order id) — and the cycles reconcile; nothing is counted
+/// dropped.
+/// Break-and-watch: without the retry the commission stays unpaid (drift).
+#[test]
+fn a_failed_order_trades_read_is_asked_again_and_pays_once() {
+    let venue = Venue::start();
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT"]));
+    let mut e = rig.e;
+    venue.with(|v| v.spot_order_trades_500 = 1);
+    let dropped = e.gw(GW_JOBS_DROPPED);
+    let oid = fill_without_its_report(&venue, &mut e, 482);
+    e.until("read again, answered", |_| venue.with(|v| order_trade_reads(v)) == 2);
+    let pauses = venue.with(|v| order_trade_pauses_ms(v));
+    assert!(pauses[0] >= ORDER_TRADES_BACKOFF_MS, "asked again a second later: {pauses:?} ms");
+    let r0 = e.gw(GW_RECON_OK);
+    e.until("the next cycles reconcile", |e| e.gw(GW_RECON_OK) >= r0 + 2);
+    assert_eq!((e.gw(GW_RECON_DRIFT_LEGS), e.gw(GW_RECON_UNSEEN_LEGS), e.gw(GW_JOBS_DROPPED)), (0, 0, dropped), "paid, nothing dropped");
+    e.idle_for(300);
+    assert_eq!(venue.with(|v| order_trade_reads(v)), 2, "read twice: the refusal, then the answer");
+    let r = records(&mut Rig { e, ..rig }.shutdown());
+    let fees: Vec<(u64, u64, i64, u8)> =
+        r.iter().filter(|g| g.kind == J_FEE).map(|g| (g.client_oid, g.venue_oid, g.c, fee_fields(g.code).1)).collect();
+    assert_eq!(fees, vec![(0, oid, 2_000, FEE_ASSET_OTHER)], "0.000002 BTC ×1e9, once, from the second read");
+}
+
+/// **BX8 (the e2e review's finding; the risk review's R2-1): a cycle that
+/// lands while an order's trades are being read is inconclusive — held,
+/// never drift, never reconciled — and the next one runs at once.** A fill
+/// booked from `order.status` without its report owes its commission until
+/// the order's trades are read. Here the read is answered 1.5 s late (the
+/// venue's REST thread sleeps) and the cadence is 5 s: the session's
+/// recovery cycle reads the account while the read is pending — the
+/// explained balance a commission short — so its leg is held (not judged,
+/// its `differed` kept) and its verdict is neither reconciled nor drift.
+/// The read answers, the commission is paid once, and its end asks for
+/// the next cycle at once (`order_trades_done`): reconciled well inside the
+/// cadence. No verdict ever reads drift — every verdict's, from the journal
+/// (`J_RECON`: a verdict the next cycle overwrites within a pulse never
+/// shows in the tallies). Given up after its tries, the read leaves the
+/// leg judged — drift: the exhaustion test above. Break-and-watch: a held
+/// cycle counted reconciled, or no hold at all (one leg's drift, 0.13 USD),
+/// fails the held verdict; without `order_trades_done` the clean cycle
+/// waits for the cadence (3.5 s after the held one, against 3 ms).
+#[test]
+fn a_cycle_while_the_order_trades_read_is_pending_holds_the_leg() {
+    let venue = Venue::start();
+    let rig = Rig::boot_full(&venue, Opts { recon_every_ms: 5_000, ..Opts::spot_only(&[b"BTCUSDT"]) });
+    let mut e = rig.e;
+    venue.with(|v| v.rest_delay = Some(("/api/v3/myTrades", 1_500)));
+    let oid = fill_without_its_report(&venue, &mut e, 483);
+    // The held cycle, then the one the read's end asks for: reconciled.
+    let r0 = e.gw(GW_RECON_OK);
+    e.until("a cycle reconciled past the read", |e| e.gw(GW_RECON_OK) > r0);
+    venue.with(|v| {
+        assert_eq!(order_trade_reads(v), 1, "read once");
+        // An account read served after the status that booked the fill (on
+        // the same session: answered after it) and before the listing that
+        // follows the read (on the lane's one REST connection: sent once
+        // the read answered) was judged with the commission still owed.
+        let status = v.log.iter().rposition(|l| l == "spot order.status").expect("the status");
+        let read = v.log.iter().rposition(|l| l == "GET /api/v3/myTrades").expect("the read");
+        let listing = read + v.log[read..].iter().position(|l| l == "GET /api/v3/openOrders").expect("a listing after it");
+        assert!(status < read, "{:?}", &v.log[status..]);
+        assert!(v.log[status..listing].iter().any(|l| l == "spot account.status"), "a cycle landed while the read was pending: {:?}", &v.log[status..]);
+    });
+    assert_eq!((e.gw(GW_RECON_DRIFT_LEGS), e.gw(GW_RECON_UNSEEN_LEGS)), (0, 0));
+    assert_eq!(e.d.live().halt_signal_for(SLOT).reconciled, 1);
+    let r = records(&mut Rig { e, ..rig }.shutdown());
+    let drift: Vec<i64> = r.iter().filter(|g| g.kind == J_RECON && g.a != 0).map(|g| g.a).collect();
+    assert!(drift.is_empty(), "no verdict ever read drift: {drift:?}");
+    // The verdicts past the status's booking: the held one — not
+    // reconciled, no drift, nothing unseen — then a reconciled one, at once.
+    let booked = r.iter().position(|g| g.kind == J_FILL && g.code & J_FILL_UNSEEN != 0).expect("the status's booking");
+    let verdicts: Vec<(u64, i32, i64, i64)> =
+        r[booked..].iter().filter(|g| g.kind == J_RECON).map(|g| (g.ts_ns, g.code, g.a, g.b)).collect();
+    assert!(verdicts.len() >= 2, "{verdicts:?}");
+    let ((held_ns, held_ok, held_drift, held_unseen), (next_ns, next_ok, _, _)) = (verdicts[0], verdicts[1]);
+    assert_eq!((held_ok, held_drift, held_unseen), (0, 0, 0), "the held cycle: inconclusive — not reconciled, no drift");
+    assert_eq!(next_ok, 1, "the next cycle reconciled");
+    let gap_ms = (next_ns - held_ns) / 1_000_000;
+    assert!(gap_ms < 1_000, "the next cycle ran {gap_ms} ms after the held one: at once, not at the 5 s cadence");
+    let fees: Vec<(u64, u64, i64, u8)> =
+        r.iter().filter(|g| g.kind == J_FEE).map(|g| (g.client_oid, g.venue_oid, g.c, fee_fields(g.code).1)).collect();
+    assert_eq!(fees, vec![(0, oid, 2_000, FEE_ASSET_OTHER)], "0.000002 BTC ×1e9, once, when the read answered");
+}
+
+/// **BX8 (the risk review): a cycle while an order's trades are read holds
+/// every spot leg — BNB's too, when the burn pays.** BTCUSDT and BNBUSDT
+/// armed, 1 BNB held (adopted at boot) and the burn on: a BTCUSDT fill
+/// booked from `order.status` without its report owes 0.0005 BNB — on
+/// BNB's row, which only the read can say. The read is answered 1.5 s
+/// late, so the recovery cycle reads the account while it is pending and
+/// holds both legs: inconclusive — not reconciled, no drift on either row,
+/// though BNB's had differed since the trade (its report lost: drift until
+/// the status resolved the order). The read answers, pays the commission
+/// from BNB's explained balance once, and the next cycle reconciles both
+/// legs; the commission is no position. Break-and-watch: holding the
+/// order's row alone, BNB's leg reads drift in the held cycle.
+#[test]
+fn a_cycle_while_a_bnb_paid_commission_is_read_holds_bnbs_leg_too() {
+    let venue = Venue::start();
+    venue.with(|v| {
+        v.spot_bal_1e8.insert(String::from("BNB"), 100_000_000);
+        v.spot_px_1e6.insert(String::from("BNBUSDT"), 600_000_000);
+        v.spot_bnb_fee_1e8 = Some(50_000);
+    });
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT", b"BNBUSDT"]));
+    let mut e = rig.e;
+    let bnb = |e: &Engine| e.d.ledger().instrument_position_1e6(SLOT as usize, BNB_SYM);
+    assert_eq!(bnb(&e), Some(1_000_000), "1 BNB adopted at boot");
+    venue.with(|v| v.rest_delay = Some(("/api/v3/myTrades", 1_500)));
+    let oid = fill_without_its_report(&venue, &mut e, 489);
+    let r0 = e.gw(GW_RECON_OK);
+    e.until("a cycle reconciled past the read", |e| e.gw(GW_RECON_OK) > r0);
+    venue.with(|v| {
+        assert_eq!((v.spot_balance("BTC"), v.spot_balance("BNB")), (200_000, 99_950_000), "the BTC whole; the BNB charged");
+        assert_eq!(order_trade_reads(v), 1, "read once");
+        // As above: an account read between the status that booked the fill
+        // and the listing after the read was judged with the BNB owed.
+        let status = v.log.iter().rposition(|l| l == "spot order.status").expect("the status");
+        let read = v.log.iter().rposition(|l| l == "GET /api/v3/myTrades").expect("the read");
+        let listing = read + v.log[read..].iter().position(|l| l == "GET /api/v3/openOrders").expect("a listing after it");
+        assert!(status < read && v.log[status..listing].iter().any(|l| l == "spot account.status"), "{:?}", &v.log[status..]);
+    });
+    assert_eq!((e.gw(GW_RECON_DRIFT_LEGS), e.gw(GW_RECON_UNSEEN_LEGS)), (0, 0), "both legs explained");
+    assert_eq!(e.d.live().halt_signal_for(SLOT).reconciled, 1);
+    assert_eq!((e.pos(), bnb(&e)), (Some(2_000), Some(1_000_000)), "the commission is no position");
+    let r = records(&mut Rig { e, ..rig }.shutdown());
+    let booked = r.iter().position(|g| g.kind == J_FILL && g.code & J_FILL_UNSEEN != 0).expect("the status's booking");
+    let verdicts: Vec<(i32, i64, i64)> = r[booked..].iter().filter(|g| g.kind == J_RECON).map(|g| (g.code, g.a, g.b)).collect();
+    assert!(verdicts.len() >= 2, "{verdicts:?}");
+    assert_eq!(verdicts[0], (0, 0, 0), "the held cycle: both legs held — not reconciled, no drift on either row");
+    assert_eq!(verdicts[1].0, 1, "the next cycle reconciled both legs");
+    assert!(verdicts.iter().all(|v| v.1 == 0), "no drift once the order was booked: {verdicts:?}");
+    let fees: Vec<(u64, u64, i64, u8)> =
+        r.iter().filter(|g| g.kind == J_FEE).map(|g| (g.client_oid, g.venue_oid, g.c, fee_fields(g.code).1)).collect();
+    assert_eq!(fees, vec![(0, oid, 500_000, FEE_ASSET_BNB)], "0.0005 BNB ×1e9, once, from the read");
+}
+
+/// **BX8 (the risk review's R2-3): an order's trades page short of its
+/// fill is read again.** The venue's trade list can lag its match: a read
+/// by `orderId` naming less of the order than it executed — none (`[]`),
+/// or one of its two trades — pays what it names (once: the trade-id ring)
+/// and is asked again after a second's pause (a lagging list catches up);
+/// the next read names it all. Each trade's commission
+/// is paid once, nothing is counted dropped and the cycles reconcile —
+/// for both sources of the executed quantity: a report's cumulative `z`
+/// past a lost trade (S1), and a status's `executedQty` (a lost answer).
+/// Break-and-watch: a page taken whole however short is never read again
+/// (the empty page's second read never comes; the commission unpaid).
+#[test]
+fn an_order_trades_page_short_of_its_fill_is_read_again() {
+    let venue = Venue::start();
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT"]));
+    let mut e = rig.e;
+    let dropped = e.gw(GW_JOBS_DROPPED);
+    let settled = |e: &mut Engine, what: &str| {
+        let r0 = e.gw(GW_RECON_OK);
+        e.until(what, |e| e.gw(GW_RECON_OK) >= r0 + 2);
+        assert_eq!((e.gw(GW_RECON_DRIFT_LEGS), e.gw(GW_RECON_UNSEEN_LEGS), e.gw(GW_JOBS_DROPPED)), (0, 0, dropped), "{what}");
+    };
+    // ---- S1: the first trade's report lost; the first page empty ----------
+    venue.with(|v| {
+        v.spot_plan.push_back(vec![1_000, 1_000]);
+        v.spot_drop_trade_reports = 1;
+        v.spot_order_trades_lag = 1;
+    });
+    assert_eq!(e.d.submit(&order(487, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 2_000)), Ok(()));
+    e.until("FILLED", |e| e.retired(RETIRED_FILLED) == 1);
+    let c = cid(EPOCH, 487);
+    let oid_s1 = venue.with(|v| v.spot_orders.iter().find(|o| o.cid == c).map(|o| o.oid)).expect("the order");
+    e.until("read again: the empty page, then the order's", |_| venue.with(|v| order_trade_reads(v)) == 2);
+    settled(&mut e, "the lost trade's commission paid: reconciled");
+    // ---- a status's fill of two trades; the first page names one ----------
+    venue.with(|v| {
+        v.spot_plan.push_back(vec![1_000, 1_000]);
+        v.spot_order_trades_short = 1;
+    });
+    let oid_status = fill_without_its_report(&venue, &mut e, 488);
+    e.until("read again: one trade, then both", |_| venue.with(|v| order_trade_reads(v)) == 4);
+    settled(&mut e, "both commissions paid: reconciled");
+    e.idle_for(300);
+    assert_eq!(venue.with(|v| order_trade_reads(v)), 4, "two reads an order, no more");
+    let pauses = venue.with(|v| order_trade_pauses_ms(v));
+    assert!(pauses[0] >= ORDER_TRADES_BACKOFF_MS && pauses[2] >= ORDER_TRADES_BACKOFF_MS, "each read again a second later: {pauses:?} ms");
+    let r = records(&mut Rig { e, ..rig }.shutdown());
+    let fees: Vec<(u64, u64, i64)> = r.iter().filter(|g| g.kind == J_FEE).map(|g| (g.client_oid, g.venue_oid, g.c)).collect();
+    assert_eq!(
+        fees,
+        vec![(487, oid_s1, 1_000), (0, oid_s1, 1_000), (0, oid_status, 1_000), (0, oid_status, 1_000)],
+        "S1: the reported trade's from its report, the lost one's from the second read; the status's two, one a read"
+    );
+}
+
+/// **BX8 (`SpotRoute`): spot trades on the WS API with an Ed25519 key, or
+/// not at all.** Its user data exists only on a WS API session, whose logon
+/// takes Ed25519 keys only: a spot row on the REST order route — with the
+/// Ed25519 key, or an HMAC one — refuses the gateway's construction
+/// (`SpotRoute`) before any request; an HMAC key on the WS API is refused
+/// earlier, by the signing law (`Signing`, R22). Break-and-watch: without
+/// the check the REST route builds, blind to its fills, and its boot
+/// stalls in Recon to the timeout.
+#[test]
+fn a_spot_row_on_the_rest_route_or_with_an_hmac_key_is_refused() {
+    let spot = Opts::spot_only(&[b"BTCUSDT"]);
+    let cases = [
+        (Opts { rest_ed25519: true, ..spot }, BootErr::SpotRoute, "the REST route, Ed25519"),
+        (Opts { rest_hmac: true, ..spot }, BootErr::SpotRoute, "the REST route, HMAC"),
+        (Opts { hmac_ws: true, ..spot }, BootErr::Signing, "HMAC on the WS API"),
+    ];
+    for (o, want, what) in cases {
+        let venue = Venue::start();
+        venue.with(|v| v.hmac = Some(HMAC_SECRET.to_vec()));
+        assert_eq!(Rig::boot_gateway(&venue, o).err(), Some(want), "{what}");
+        venue.with(|v| assert!(v.log.is_empty() && v.spot_conns == 0, "{what}: refused before any request: {:?}", v.log));
+    }
+}
+
+/// **BX8 (`SpotAsset`): an armed base asset is one row's.** The
+/// reconciliation compares each armed row's base-asset balance against its
+/// bookings: BTC armed twice (BTCUSDT beside BTCUSDC), or BTCUSDT beside
+/// BNBBTC — whose every trade moves BTC, its quote — would set one balance
+/// against two rows' bookings. The gateway's construction refuses it, at
+/// the gateway itself (whatever the cli's rows law), naming the first
+/// spot row whose base is shared or quoted (`SpotAsset(row)`), before any
+/// request. Break-and-watch: without the check BTCUSDC beside BTCUSDT
+/// boots.
+#[test]
+fn a_spot_base_armed_twice_or_quoted_by_another_row_is_refused() {
+    let cases = [
+        (Opts::spot_only(&[b"BTCUSDT", b"BTCUSDC"]), BootErr::SpotAsset(0), "BTC armed twice"),
+        (Opts::spot_only(&[b"BTCUSDT", b"BNBBTC"]), BootErr::SpotAsset(0), "BTC, BNBBTC's quote"),
+        (Opts::spot_only(&[b"BNBBTC", b"BTCUSDT"]), BootErr::SpotAsset(1), "BTC, the first row's quote"),
+    ];
+    for (o, want, what) in cases {
+        let venue = Venue::start();
+        assert_eq!(Rig::boot_gateway(&venue, o).err(), Some(want), "{what}");
+        venue.with(|v| assert!(v.log.is_empty() && v.spot_conns == 0, "{what}: refused before any request: {:?}", v.log));
+    }
+}
+
+/// **BX8: spot is classic-only.** Spot beside Portfolio Margin or PM Pro is
+/// not built (unproven — no PM Demo exists — and outside the unified
+/// account's equity): `mode::built` says so for the cli, and the gateway's
+/// construction refuses a spot row in either mode
+/// (`Product(PRODUCT_SPOT)`), however its key and route, before any
+/// request. Break-and-watch: without the check the boot goes on — refused
+/// later, for another reason (Portfolio Margin's key assertion).
+#[test]
+fn spot_beside_portfolio_margin_or_pm_pro_is_refused() {
+    assert_eq!(exec_binance::mode::built(PRODUCT_SPOT, AccountMode::Classic), Ok(()));
+    assert!(exec_binance::mode::built(PRODUCT_SPOT, AccountMode::Pm).is_err());
+    assert!(exec_binance::mode::built(PRODUCT_SPOT, AccountMode::PmPro).is_err());
+    let spot = Opts::spot_only(&[b"BTCUSDT"]);
+    let cases = [
+        (Opts { mode: AccountMode::Pm, rest_hmac: true, ..spot }, "Portfolio Margin (papi, HMAC)"),
+        (Opts { mode: AccountMode::PmPro, ..spot }, "PM Pro (the classic routes)"),
+    ];
+    for (o, what) in cases {
+        let venue = Venue::start();
+        venue.with(|v| v.hmac = Some(HMAC_SECRET.to_vec()));
+        assert_eq!(Rig::boot_gateway(&venue, o).err(), Some(BootErr::Product(PRODUCT_SPOT)), "{what}");
+        venue.with(|v| assert!(v.log.is_empty(), "{what}: refused before any request: {:?}", v.log));
+    }
+}
+
+/// **BX8 (`SpotStray`): an order of ours resting on spot at boot refuses
+/// the boot by name.** No spot cancel is built (IoC-only, BX-17): the last
+/// epoch's order (an orphan) — or this epoch's, unknown to this boot (a
+/// ghost) — listed open by the boot's first cycle refuses the boot naming
+/// its row: never cancelled (the operator cancels it in the app), and
+/// refused at that first listing, never a cycle a second to the boot's
+/// timeout. A stranger's resting order is not ours: that boot proceeds
+/// (the sweep test's). Break-and-watch: counted alone, the boot holds in
+/// Recon to its timeout.
+#[test]
+fn a_spot_order_of_ours_resting_at_boot_refuses_the_boot() {
+    for c in [cid(OLD_EPOCH, 9), cid(EPOCH, 77)] {
+        let venue = Venue::start();
+        let rest = SpotOrder {
+            oid: 7_201,
+            cid: c.clone(),
+            symbol: "BTCUSDT",
+            buy: true,
+            tif: "GTC",
+            qty: 100_000,
+            px: 6_000_000_000_000,
+            executed: 0,
+            quote: 0,
+            status: "NEW",
+        };
+        venue.with(|v| v.spot_orders.push(rest));
+        let t0 = Instant::now();
+        assert_eq!(Rig::boot_gateway(&venue, Opts::spot_only(&[b"BTCUSDT"])).err(), Some(BootErr::SpotStray(0)), "{c}");
+        assert!(t0.elapsed() < Duration::from_secs(5), "{c}: refused at the first listing, not at the timeout");
+        venue.with(|v| {
+            assert!(v.spot_orders[0].open(), "{c}: never cancelled");
+            assert!(!v.log.iter().any(|l| l.contains("cancel") || l.starts_with("DELETE")), "{c}: no cancel: {:?}", v.log);
+            assert_eq!(v.log.iter().filter(|l| l.as_str() == "GET /api/v3/openOrders").count(), 1, "{c}: one listing");
+            assert!(v.spot_places.is_empty());
+        });
+    }
+}
+
+/// **BX8 (the risk review): an in-doubt order the venue names REJECTED is
+/// ended.** The IoC's answer and its reports are lost, and the venue holds
+/// it REJECTED (it never traded): the next session's `order.status`
+/// answers REJECTED and the order retires REJECTED — nothing booked,
+/// nothing owed, no streak (no venue code) — and is never asked about
+/// again (an end the gateway did not take would be queried every second,
+/// forever). Break-and-watch: without the REJECTED arm the order stays in
+/// doubt, asked each second.
+#[test]
+fn an_in_doubt_spot_order_the_venue_rejected_is_ended() {
+    let venue = Venue::start();
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT"]));
+    let mut e = rig.e;
+    venue.with(|v| {
+        v.lose_place_answer = true;
+        v.spot_mute_events = true;
+        v.spot_plan.push_back(Vec::new());
+    });
+    assert_eq!(e.d.submit(&order(491, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 2_000)), Ok(()));
+    let c = cid(EPOCH, 491);
+    e.until("held at the venue", |_| venue.with(|v| v.spot_orders.iter().any(|o| o.cid == c)));
+    venue.with(|v| {
+        if let Some(o) = v.spot_orders.iter_mut().find(|o| o.cid == c) {
+            o.status = "REJECTED";
+        }
+        v.spot_mute_events = false;
+    });
+    e.until_within("REJECTED, from the status", Duration::from_secs(15), |e| e.retired(RETIRED_REJECTED) == 1);
+    let statuses = |v: &VState| v.log.iter().filter(|l| l.as_str() == "spot order.status").count();
+    let asked = venue.with(|v| statuses(v));
+    e.idle_for(2_500);
+    assert_eq!(venue.with(|v| statuses(v)), asked, "never asked about again");
+    assert!(e.fills.is_empty(), "nothing booked");
+    assert_eq!((e.d.live().halt_signal_for(SLOT).reject_streak, e.resting()), (0, 0));
+    let r = records(&mut Rig { e, ..rig }.shutdown());
+    let ends: Vec<(u64, i64, i32)> = r.iter().filter(|g| g.kind == J_REJECT).map(|g| (g.client_oid, g.a, g.code)).collect();
+    assert_eq!(ends, vec![(491, 0, 0)], "refused, nothing filled, no venue code");
+    assert!(!r.iter().any(|g| g.kind == J_FILL || g.kind == J_FEE));
+}
+
+/// **BX8 (the risk review): a subscription answered without its id is no
+/// subscription.** The venue answers the boot session's
+/// `userDataStream.subscribe` 200 naming no `subscriptionId` (subscribing
+/// nothing): that session never goes live — it is dropped, a connect
+/// failure — and the next one, subscribed, carries the boot and the arm's
+/// IoC. Every subscription answered so: no session ever goes live — the
+/// boot is refused at its timeout, in Connect, nothing read or placed.
+/// Break-and-watch: a bare 200 taken for the subscription boots on the
+/// first session, blind to its fills.
+#[test]
+fn a_subscription_answered_without_its_id_is_never_live() {
+    let venue = Venue::start();
+    venue.with(|v| v.spot_sub_no_id = 1);
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT"]));
+    let mut e = rig.e;
+    venue.with(|v| {
+        assert_eq!((v.spot_conns, v.spot_logons, v.spot_subscribes), (2, 2, 2), "the first answer named no id: a second session");
+        assert_eq!(v.spot_closed, 1, "the first dropped");
+        let at = |want: &str| v.log.iter().position(|l| l == want).unwrap_or_else(|| panic!("{want}: {:?}", v.log));
+        let second = v.log.iter().rposition(|l| l == "spot userDataStream.subscribe").expect("the second subscription");
+        assert!(second < at("spot account.status"), "the cycle's account read rode the live session: {:?}", v.log);
+    });
+    assert!(e.gw(GW_CONNECT_FAILURES) >= 1, "the session that never went live: a connect failure");
+    assert_eq!(e.d.submit(&order(495, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 2_000)), Ok(()));
+    e.until("FILLED", |e| e.retired(RETIRED_FILLED) == 1);
+    assert_eq!(e.pos(), Some(2_000));
+    let _journal = Rig { e, ..rig }.shutdown();
+
+    let venue = Venue::start();
+    venue.with(|v| v.spot_sub_no_id = u32::MAX);
+    let o = Opts { boot_timeout_ms: 2_000, ..Opts::spot_only(&[b"BTCUSDT"]) };
+    assert_eq!(Rig::boot_gateway(&venue, o).err(), Some(BootErr::Timeout(Phase::Connect as u8)), "never live");
+    venue.with(|v| {
+        assert!(v.spot_subscribes >= 1 && v.spot_closed >= 1, "subscribed, dropped");
+        assert_eq!((v.spot_accounts, v.spot_places.len()), (0, 0), "nothing read or placed on a session not live");
+    });
+}
+
+/// **BX8 (the risk review): a ticker answer naming another symbol prices
+/// nothing.** The boot adopts a held balance at its row's price; an answer
+/// naming another symbol (ETHUSDT) is no price of BTCUSDT's: the leg stays
+/// unpriced and the boot is refused `Inventory(i64::MAX)` — fail closed —
+/// though the cap would take 0.5 BTC at the price it carries.
+/// Break-and-watch: read whatever it names, the balance is adopted.
+#[test]
+fn a_ticker_answer_naming_another_symbol_prices_nothing() {
+    let venue = Venue::start();
+    venue.with(|v| {
+        v.spot_bal_1e8.insert(String::from("BTC"), 50_000_000);
+        v.spot_ticker_names = Some("ETHUSDT");
+    });
+    let o = Opts { adopt_cap_usd_1e6: 40_000_000_000, ..Opts::spot_only(&[b"BTCUSDT"]) };
+    assert_eq!(Rig::boot_gateway(&venue, o).err(), Some(BootErr::Inventory(i64::MAX)), "unpriced: refused");
+    assert_eq!(venue.with(|v| v.spot_tickers), 1, "asked once");
 }

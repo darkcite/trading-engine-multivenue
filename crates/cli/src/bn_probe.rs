@@ -19,6 +19,17 @@
 //! | P8 | K11 | `session.logon` (Ed25519) on the futures testnet's WS API |
 //! | P9 | K4 | a TradFi IoC that cannot fill: `-4411` or an expiry |
 //!
+//! **Spot (BX8; `--binance-probe spot`, [`run_spot`])** — K1's Demo half,
+//! asked alone (the futures probes above are not run):
+//!
+//! | probe | K | asks |
+//! |---|---|---|
+//! | SP1 | — | the venue clock on Demo's spot REST host |
+//! | SP2 | K1 | `session.logon` (Ed25519) on Demo's spot WS API |
+//! | SP3 | K1 | `userDataStream.subscribe` on the same socket: the subscription's id |
+//!
+//! It places nothing and leaves nothing: the socket closes after SP3.
+//!
 //! **What it leaves.** Its orders are post-only, 4–5 % behind a touch read
 //! inside the PERCENT_PRICE band of the mark, at the minimum size and
 //! never over [`PROBE_MAX_USD_1E6`] of notional, and its IoC prices under
@@ -41,9 +52,10 @@
 //! **Verdicts.** Each probe is one JSON line on stdout as it lands. An
 //! answer either way closes a K-item and is not a failure. A failure
 //! ([`EXIT_PROBE`]) is a body-form DELETE refused, a wrong signature
-//! accepted, or a probe that could not run. No line ever carries a key, a
-//! signature, a listenKey or a WS API answer (`session.logon`'s echoes the
-//! key).
+//! accepted, or a probe that could not run — on spot, a logon or a
+//! subscription not accepted. No line ever carries a key, a signature, a
+//! listenKey or a WS API answer (`session.logon`'s echoes the key: SP2
+//! names its result's keys, never a value).
 //!
 //! COPY-DOCTRINE: an operator tool run by hand against Binance Demo, never
 //! reachable from the engine loop: it allocates and copies freely.
@@ -54,8 +66,8 @@ use std::time::{Duration, Instant};
 
 use core_types::Side;
 use exec_binance::config::{BnConfig, Signer};
-use exec_binance::inst::{BnInstHot, INST_LIVE, PRODUCT_COINM, PRODUCT_USDM};
-use exec_binance::json::{dec_1e6, field, str_of, Elems, Pairs};
+use exec_binance::inst::{BnInstHot, INST_LIVE, PRODUCT_COINM, PRODUCT_SPOT, PRODUCT_USDM};
+use exec_binance::json::{dec_1e6, field, str_of, u64_of, Elems, Pairs};
 use exec_binance::mode::{judge_mode, judge_one_way, judge_single_asset, judge_symbol_config, AccountMode};
 use exec_binance::rest::{
     render_account, render_by_cid, render_place, scan_countdown, scan_listen_key, QueryWriter, R_CANCEL, R_PLACE,
@@ -63,7 +75,7 @@ use exec_binance::rest::{
     T_SYMBOL_CONFIG,
 };
 use exec_binance::userstream::{scan_user_event, UserEvent, S_CANCELED, S_EXPIRED, UE_ORDER};
-use exec_binance::wsapi::{queue_logon, scan_answer, Part, Place, WsAnswer, WsStatic};
+use exec_binance::wsapi::{queue_logon, queue_subscribe, scan_answer, Part, Place, WsAnswer, WsStatic};
 use rustls::ClientConfig;
 use tracing::{error, info, warn};
 
@@ -979,6 +991,120 @@ fn p9_tradfi(ctx: &mut Ctx) -> Result<(), String> {
 }
 
 // -------------------------------------------------------------------------
+// Spot — K1's Demo half (BX8)
+// -------------------------------------------------------------------------
+
+/// The spot probe's request ids: the logon's, the subscription's.
+const SPOT_LOGON_ID: u64 = 1;
+const SPOT_SUBSCRIBE_ID: u64 = 2;
+
+/// **Run the spot probe** (`exec-smoke --binance-probe spot`; module docs,
+/// SP1–SP3): the exit code — 0 when Demo's spot WS API accepted the logon
+/// and the subscription, [`EXIT_PROBE`] otherwise. It places nothing.
+pub fn run_spot(tls: Arc<ClientConfig>) -> u8 {
+    let failed = spot_probes(&tls).err();
+    let code = if failed.is_some() { EXIT_PROBE } else { 0 };
+    probe("END", "-")
+        .n("exit", i64::from(code))
+        .s("failed", failed.as_deref().unwrap_or_default())
+        .s("left", "")
+        .emit();
+    match failed {
+        Some(e) => error!("binance-probe: spot FAILED — {e}"),
+        None => info!("binance-probe: spot — session.logon and userDataStream.subscribe accepted on Demo (K1's Demo half); nothing placed"),
+    }
+    code
+}
+
+/// SP1–SP3 (module docs), in order: the first refusal, or a probe that
+/// could not run, is the error. The socket closes as it drops.
+fn spot_probes(tls: &Arc<ClientConfig>) -> Result<(), String> {
+    let cfg = demo_config(false)?;
+    let signer = cfg.signer().map_err(|e| format!("the Ed25519 signer: {e:?}"))?;
+    let ed = signer.ed25519().ok_or("the Demo key is not Ed25519 — the WS API logon takes Ed25519 only")?;
+    let mut rest = Rest::new(&cfg, PRODUCT_SPOT, tls.clone())?;
+    let (offset, rtt) = rest.clock()?;
+    probe("SP1", "-").s("host", rest.host()).n("offset_ms", offset).n("rtt_ms", rtt as i64).emit();
+    if stopped() {
+        return Err(String::from(STOPPED));
+    }
+    let h = cfg.hosts();
+    let mut ws = Ws::open(&h.spot_wsapi, &h.spot_wsapi_path, tls.clone(), WS_OPEN)?;
+    queue_logon(ws.conn_mut(), SPOT_LOGON_ID, cfg.api_key().as_bytes(), rest.ts_ms(), ed).map_err(|e| format!("session.logon did not render: {e}"))?;
+    ws.flush()?;
+    let (f, a) = answer(&mut ws, SPOT_LOGON_ID)?;
+    probe("SP2", "K1")
+        .s("host", &h.spot_wsapi)
+        .s("path", &h.spot_wsapi_path)
+        .n("status", i64::from(a.status))
+        .n("code", i64::from(a.code))
+        // The result's keys alone: its values echo the key.
+        .s("result_keys", &if a.status == 200 { result_keys(a.result.get(&f)) } else { String::new() })
+        .s("verdict", if a.status == 200 { "session.logon ACCEPTED with the Demo Ed25519 key" } else { "session.logon REFUSED" })
+        .emit();
+    if a.status != 200 {
+        return Err(format!("session.logon was refused (status {} code {})", a.status, a.code));
+    }
+    queue_subscribe(ws.conn_mut(), SPOT_SUBSCRIBE_ID).map_err(|e| format!("userDataStream.subscribe did not render: {e}"))?;
+    ws.flush()?;
+    let (f, a) = answer(&mut ws, SPOT_SUBSCRIBE_ID)?;
+    let id = if a.status == 200 { subscription_id(a.result.get(&f)) } else { None };
+    probe("SP3", "K1")
+        .s("host", &h.spot_wsapi)
+        .n("status", i64::from(a.status))
+        .n("code", i64::from(a.code))
+        .n("subscription_id", id.map_or(-1, |v| i64::try_from(v).unwrap_or(i64::MAX)))
+        .s("verdict", if a.status == 200 { "userDataStream.subscribe ACCEPTED: the user data rides the order socket" } else { "userDataStream.subscribe REFUSED" })
+        .emit();
+    match (a.status, id) {
+        (200, Some(_)) => Ok(()),
+        (200, None) => Err(String::from("the subscription's answer named no subscriptionId")),
+        (s, _) => Err(format!("userDataStream.subscribe was refused (status {s} code {})", a.code)),
+    }
+}
+
+/// **The answer to request `id`** on `ws` within [`WS_ANSWER`] (in slices
+/// a signal ends): the frame and its scan (`wsapi::scan_answer`). A frame
+/// that is not it — a user event, an answer to another id — is passed
+/// over; one that does not scan ends the wait.
+fn answer(ws: &mut Ws, id: u64) -> Result<(Vec<u8>, WsAnswer), String> {
+    let until = Instant::now() + WS_ANSWER;
+    while Instant::now() < until {
+        if stopped() {
+            return Err(String::from(STOPPED));
+        }
+        let Some((_, f)) = ws.next(Duration::from_millis(250))? else {
+            continue;
+        };
+        let mut a = WsAnswer::default();
+        match scan_answer(&f, &mut a) {
+            Ok(()) if !a.user && !a.shutdown && a.id == id => return Ok((f, a)),
+            Ok(()) => {}
+            Err(e) => return Err(format!("a frame did not scan as a WS API answer ({e:?})")),
+        }
+    }
+    Err(format!("no answer to request {id} within {WS_ANSWER:?}"))
+}
+
+/// The keys of a result object, in order (`session.logon`'s: its values
+/// echo the key — never read); empty when it is no object.
+fn result_keys(obj: &[u8]) -> String {
+    let mut keys = Vec::new();
+    if let Ok(mut p) = Pairs::new(obj, 0) {
+        while let Ok(Some((k, _, _))) = p.next() {
+            keys.push(String::from_utf8_lossy(k).into_owned());
+        }
+    }
+    keys.join(",")
+}
+
+/// A subscription's id (`{"subscriptionId":N}`), named once.
+fn subscription_id(obj: &[u8]) -> Option<u64> {
+    let (a, z) = field(obj, b"subscriptionId")?;
+    u64_of(obj, a, z).ok()
+}
+
+// -------------------------------------------------------------------------
 // The end
 // -------------------------------------------------------------------------
 
@@ -1083,6 +1209,29 @@ mod tests {
         assert_eq!(indicator_names(br#"{"indicators":{},"updateTime":1}"#), Some(Vec::new()));
         assert_eq!(indicator_names(br#"{"indicators":{"BTCUSDT":{"indicator":"UFR"}}}"#), None, "not an array");
         assert_eq!(indicator_names(br#"{"indicators":{"BTCUSDT":[{"indicator":1}]}}"#), None, "not a name");
+    }
+
+    /// BX8 (SP2, SP3): a logon's result is named by its keys alone — the
+    /// key's value never read out — and a subscription's id is its own
+    /// field's, named once.
+    #[test]
+    fn the_spot_probe_names_keys_never_values() {
+        let logon = br#"{"apiKey":"vmPUZE6mv9SD5VNHk4HlWFsOr6aKE2zvsw0MuIgwCIPy6utIco14y7Ju91duEh8A","authorizedSince":1,"connectedSince":2,"returnRateLimits":false,"serverTime":3,"userId":4}"#;
+        let keys = result_keys(logon);
+        assert_eq!(keys, "apiKey,authorizedSince,connectedSince,returnRateLimits,serverTime,userId");
+        assert!(!keys.contains("vmPUZE"), "never a value");
+        assert_eq!(result_keys(b"[1]"), "", "no object, no keys");
+        assert_eq!(subscription_id(br#"{"subscriptionId":0}"#), Some(0));
+        assert_eq!(subscription_id(br#"{"subscriptionId":7,"subscriptionId":8}"#), None, "named twice");
+        assert_eq!(subscription_id(br#"{"x":{"subscriptionId":7}}"#), None, "a nested one is not the result's");
+        assert_eq!(subscription_id(br#"{"subscriptionId":"x"}"#), None);
+        // The frame the venue answers the subscription with scans as an
+        // answer to its id, and its result names the id.
+        let f = br#"{"id":2,"status":200,"result":{"subscriptionId":3},"rateLimits":[]}"#;
+        let mut a = WsAnswer::default();
+        scan_answer(f, &mut a).expect("an answer");
+        assert_eq!((a.id, a.status, a.user), (SPOT_SUBSCRIBE_ID, 200, false));
+        assert_eq!(subscription_id(a.result.get(f)), Some(3));
     }
 
     /// The risk review (BX7b round 1, R1-8): no probe order over its

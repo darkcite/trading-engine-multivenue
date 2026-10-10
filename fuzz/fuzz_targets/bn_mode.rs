@@ -6,7 +6,8 @@
 //! trades futures and cannot withdraw, the account mode) — and BX7's: the
 //! key in Portfolio Margin, a row's margin type and leverage
 //! (`judge_symbol_config`) — and Portfolio Margin's unified account
-//! (`exec_binance::recon::scan_pm_account`).
+//! (`exec_binance::recon::scan_pm_account`); BX8: the key judged for each
+//! product set armed (futures, spot, both).
 //!
 //! They must never panic; each judges fail closed — an answer it cannot
 //! read is a refusal, never a pass by default; an account it reads has a
@@ -25,7 +26,12 @@ fuzz_target!(|data: &[u8]| {
     let _ = judge_one_way(data);
     let _ = judge_single_asset(data);
     let _ = judge_key_futures(data);
-    let _ = judge_key(data, AccountMode::Pm);
+    // BX8: the key per product set armed, in each mode it is judged in.
+    for (futures, spot) in [(true, false), (false, true), (true, true)] {
+        for mode in [AccountMode::Classic, AccountMode::Pm] {
+            let _ = judge_key(data, mode, futures, spot);
+        }
+    }
     let _ = judge_symbol_config(data, b"BTCUSDT", 20);
     if let Ok(s) = scan_pm_account(data) {
         assert!(s.status <= PM_LOCKED, "an account status no read writes");
@@ -41,4 +47,5 @@ fuzz_target!(|data: &[u8]| {
     // Fail closed: no field at all is never a pass.
     assert!(judge_one_way(b"{}").is_err() && judge_single_asset(b"{}").is_err() && judge_key_futures(b"{}").is_err());
     assert!(judge_symbol_config(b"[]", b"BTCUSDT", 20).is_err() && scan_pm_account(b"{}").is_err());
+    assert!(judge_key(b"{}", AccountMode::Classic, false, true).is_err(), "a spot key with no fields passed");
 });

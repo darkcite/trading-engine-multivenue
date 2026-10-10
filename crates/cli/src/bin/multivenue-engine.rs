@@ -58,13 +58,13 @@ use tracing_subscriber::EnvFilter;
 /// and was ignored (`--bn-um-symbol ETHUSDT` beside a flatten closed every
 /// position). Each tool names all of these as conflicts instead; a test
 /// keeps the list whole for the flags to come.
-const BN_TOOL_CONFLICTS: [&str; 44] = [
+const BN_TOOL_CONFLICTS: [&str; 46] = [
     "asset", "offline", "lifecycle", "px", "px2", "sz", "sell", "hl_perp", "coins", "cycles",
     "fill_pairs", "usd", "rest_bps", "cross_bps", "ttl_ms", "sweep_every", "stall", "sweep_first",
     "dry_run", "fill", "fill_px", "fill_sz", "fill_slot", "fill_cloid", "fill_repeat", "sweep",
     "requote", "recon", "recon_secs", "watch", "binance_probe", "binance", "bn_rest", "bn_hmac",
     "bn_um_symbol", "bn_cm_symbol", "bn_cycles", "bn_fill_pairs", "bn_usd", "bn_rest_bps",
-    "bn_cross_bps", "bn_ttl_ms", "bn_rotate_s", "bn_drill",
+    "bn_cross_bps", "bn_ttl_ms", "bn_rotate_s", "bn_drill", "bn_spot_symbol", "bn_adopt_usd",
 ];
 
 const STRATEGY_SET_NAMES: &[&str] = &[
@@ -680,25 +680,38 @@ struct ExecSmokeArgs {
     /// mainnet. Its orders are post-only far behind the touch, or IoCs that
     /// cannot fill, each cancelled by the probe. Exit 58: something of the
     /// probe's is left on the Demo account; 59: a precondition probe failed
-    /// or a probe could not run.
+    /// or a probe could not run. BX8: `--binance-probe spot` probes spot
+    /// instead (K1's Demo half): Demo's spot WS API, `session.logon` then
+    /// `userDataStream.subscribe` on the one socket — the logon's result
+    /// keys (never a value) and the subscription's id printed — then the
+    /// socket closes; it places nothing (0, or 59).
     #[arg(
         long,
-        default_value_t = false,
+        value_name = "futures|spot",
+        num_args = 0..=1,
+        default_missing_value = "futures",
+        value_parser = ["futures", "spot"],
         conflicts_with_all = ["offline", "lifecycle", "fill", "sweep", "requote", "recon", "watch", "dry_run"]
     )]
-    binance_probe: bool,
+    binance_probe: Option<String>,
 
     /// **BX7b — the Binance DEMO battery** (`cli::bn_battery`), with
-    /// `--lifecycle`: the engine's own composition (router → `BnArm` →
-    /// `BnGateway`) on the named products — `um`, `cm` or `um,cm` — on
-    /// Demo's hosts with the Demo keys: maker cycles (place, two modifies,
-    /// cancel), a post-only refusal and a TTL on USDⓈ-M; IoC round
-    /// trips on each, each leg proven by a reconciliation that agrees; a
-    /// halt's sweep last; the end reads the account flat. Demo only. Exit
-    /// codes 50–58; 0 only when the plan's bar is met.
+    /// `--lifecycle`: the engine's own composition (router → venue split →
+    /// `BnArm` → `BnGateway`) on the named products — `um`, `cm`, `spot`,
+    /// comma-separated — on Demo's hosts with the Demo keys: maker cycles
+    /// (place, two modifies, cancel), a post-only refusal and a TTL on
+    /// USDⓈ-M; IoC round trips on each futures product, each leg proven by
+    /// a reconciliation that agrees; BX8: spot's IoC cycles (a BUY across
+    /// the ask, a SELL of it less the base-asset fee across the bid) on the
+    /// M1 anchor's id 7 routed by its alias, each cycle proven by a
+    /// reconciliation (spot rides the WS API: no `--bn-rest`); a halt's
+    /// sweep last; the end reads the account flat. Demo only. Exit codes
+    /// 50–58; 66: the permission check refused the boot (a spot row's group
+    /// the account lacks — the bStock check's verdict; nothing placed); 0
+    /// only when the plan's bar is met.
     #[arg(
         long,
-        value_name = "um|cm|um,cm",
+        value_name = "um,cm,spot",
         requires = "lifecycle",
         conflicts_with_all = ["hl_perp", "binance_probe", "offline", "fill", "sweep", "requote", "recon", "watch", "dry_run"]
     )]
@@ -721,13 +734,32 @@ struct ExecSmokeArgs {
     #[arg(long, default_value = "BNBUSD_PERP", requires = "binance")]
     bn_cm_symbol: String,
 
+    /// BX8: the spot symbol (`--binance spot`): the battery's one spot
+    /// symbol is the universe's first, the M1 anchor — bound under its flat
+    /// id 7 whatever its name, as the universe binds its first spot symbol,
+    /// and routed to Binance by its alias. A bStock (e.g. TSLABUSDT) puts
+    /// the permission check to the account: exit 66 when the account lacks
+    /// the row's group.
+    #[arg(long, default_value = "BTCUSDT", requires = "binance")]
+    bn_spot_symbol: String,
+
+    /// BX8: the most venue inventory the boot adopts, USD (at the ticker):
+    /// a Demo spot account is seeded with balances (e.g. 1 BTC) and the
+    /// boot adopts the held base balance as the slot's starting inventory
+    /// (the slot's instance cap carries it too). 0..=10000000; 0 adopts
+    /// nothing — a held base balance then refuses the boot (exit 51, naming
+    /// this flag).
+    #[arg(long, default_value_t = cli::bn_battery::DEFAULT_ADOPT_USD, requires = "binance")]
+    bn_adopt_usd: i64,
+
     /// BX7b: maker cycles on USDⓈ-M (the bar: 10 — fewer runs short of it
-    /// and exits non-zero).
+    /// and exits non-zero). BX8: spot's IoC cycles too (a BUY and its SELL
+    /// each; spot's bar: 4 fills, 2 agreeing reconciliations).
     #[arg(long, default_value_t = 10, requires = "binance")]
     bn_cycles: u32,
 
-    /// BX7b: IoC round trips per product, an open and its reduce-only close
-    /// (the bar: 3 on USDⓈ-M, 2 on COIN-M).
+    /// BX7b: IoC round trips per futures product, an open and its
+    /// reduce-only close (the bar: 3 on USDⓈ-M, 2 on COIN-M).
     #[arg(long, default_value_t = 3, requires = "binance")]
     bn_fill_pairs: u32,
 
@@ -1838,24 +1870,23 @@ fn evm_testnet(args: EvmTestnetArgs) -> ExitCode {
 
 /// BX7b: the Binance Demo battery (`exec-smoke --binance … --lifecycle`).
 fn exec_binance_battery(products: &str, args: &ExecSmokeArgs) -> ExitCode {
-    let (mut um, mut cm) = (false, false);
-    for p in products.split(',') {
-        match p.trim() {
-            "um" => um = true,
-            "cm" => cm = true,
-            other => {
-                error!("exec-smoke --binance: `{other}` is not a product (um, cm)");
-                return ExitCode::from(1);
-            }
+    let (um, cm, spot) = match cli::bn_battery::parse_products(products) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("exec-smoke --binance: {e}");
+            return ExitCode::from(1);
         }
-    }
+    };
     let spec = cli::bn_battery::BatterySpec {
         um,
         cm,
+        spot,
         rest: args.bn_rest,
         hmac: args.bn_hmac,
         um_symbol: args.bn_um_symbol.clone(),
         cm_symbol: args.bn_cm_symbol.clone(),
+        spot_symbol: args.bn_spot_symbol.clone(),
+        adopt_usd: args.bn_adopt_usd,
         cycles: args.bn_cycles,
         fill_pairs: args.bn_fill_pairs,
         usd: args.bn_usd,
@@ -1930,14 +1961,16 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
     if let Some(product) = args.binance_setup.as_deref().or(args.binance_flatten.as_deref()) {
         return exec_binance_ops(product, &args);
     }
-    if args.binance_probe {
+    if let Some(which) = args.binance_probe.as_deref() {
         // A SIGINT/SIGTERM stops the probes and still runs their end (the
-        // probe's orders cancelled, the account read).
+        // probe's orders cancelled, the account read; spot's places none).
         if let Err(e) = cli::sigint::install_sigint_handler() {
             error!("exec-smoke --binance-probe: the signal handler: {e}");
             return ExitCode::from(1);
         }
-        return ExitCode::from(cli::bn_probe::run(TlsTransport::default_client_config()));
+        let tls = TlsTransport::default_client_config();
+        let code = if which == "spot" { cli::bn_probe::run_spot(tls) } else { cli::bn_probe::run(tls) };
+        return ExitCode::from(code);
     }
     if let Some(products) = args.binance.as_deref() {
         return exec_binance_battery(products, &args);
@@ -5869,17 +5902,22 @@ fn run(args: RunArgs) -> ExitCode {
                             .chain(boot.allocated.bn_coinm_dated.iter())
                             .cloned()
                             .collect();
-                        let cm_armed = eb
-                            .binance
-                            .as_ref()
-                            .is_some_and(|b| b.products.iter().any(|p| p == "coinm"));
+                        let armed = |w: &str| {
+                            eb.binance.as_ref().is_some_and(|b| b.products.iter().any(|p| p == w))
+                        };
                         let mut md_hosts = vec![
                             cfg.binance_fut_ws_host.as_str(),
                             cfg.binance_fut_rest_host.as_str(),
                         ];
-                        if cm_armed {
+                        if armed("coinm") {
                             md_hosts.push(cfg.binance_coinm_ws_host.as_str());
                             md_hosts.push(cfg.binance_coinm_rest_host.as_str());
+                        }
+                        // BX8: spot's books and its discovery on the arm's
+                        // network too (BX-16).
+                        if armed("spot") {
+                            md_hosts.push(cfg.binance_ws_host.as_str());
+                            md_hosts.push(cfg.binance_rest_host.as_str());
                         }
                         let spec = cli::bn_live::BnSpec {
                             eb: &eb,
@@ -5887,6 +5925,8 @@ fn run(args: RunArgs) -> ExitCode {
                             usdm: &usdm,
                             cm_rows: &discovery.bn_dapi_rows,
                             coinm: &coinm,
+                            spot_rows: &discovery.bn_spot_rows,
+                            spot: &boot.allocated.bn_spot,
                             alias,
                             md_hosts: &md_hosts,
                             run_dir: &run_dir,
@@ -6526,5 +6566,38 @@ mod exec_smoke_args {
             argv.extend_from_slice(args);
             assert!(super::Cli::try_parse_from(&argv).is_ok(), "{argv:?} refused");
         }
+    }
+
+    /// `exec-smoke <args>`'s parse.
+    fn smoke(args: &[&str]) -> Result<super::ExecSmokeArgs, clap::Error> {
+        let mut argv = vec!["multivenue-engine", "exec-smoke"];
+        argv.extend_from_slice(args);
+        super::Cli::try_parse_from(&argv).map(|c| match c.cmd {
+            super::Cmd::ExecSmoke(a) => a,
+            _ => panic!("not exec-smoke"),
+        })
+    }
+
+    /// BX8: the probe's word is `futures` — alone, the K-probes as before —
+    /// or `spot`, nothing else; the battery's spot flags need `--binance`
+    /// (alone, each is refused) and default to BTCUSDT and the Demo
+    /// adoption cap; the product list's words are the battery's to judge.
+    #[test]
+    fn spots_flags_parse_where_they_belong() {
+        assert_eq!(smoke(&["--binance-probe"]).unwrap().binance_probe.as_deref(), Some("futures"));
+        assert_eq!(smoke(&["--binance-probe", "spot"]).unwrap().binance_probe.as_deref(), Some("spot"));
+        assert_eq!(smoke(&["--binance-probe=futures"]).unwrap().binance_probe.as_deref(), Some("futures"));
+        assert_eq!(smoke(&["--offline"]).unwrap().binance_probe, None);
+        assert!(smoke(&["--binance-probe", "coinm"]).is_err(), "an unknown probe word");
+        assert!(smoke(&["--binance-probe", "spot", "--lifecycle"]).is_err());
+        let a = smoke(&["--binance", "um,spot", "--lifecycle"]).unwrap();
+        assert_eq!((a.binance.as_deref(), a.bn_spot_symbol.as_str(), a.bn_adopt_usd), (Some("um,spot"), "BTCUSDT", cli::bn_battery::DEFAULT_ADOPT_USD));
+        let a = smoke(&["--binance", "spot", "--lifecycle", "--bn-spot-symbol", "TSLABUSDT", "--bn-adopt-usd", "0"]).unwrap();
+        assert_eq!((a.bn_spot_symbol.as_str(), a.bn_adopt_usd), ("TSLABUSDT", 0));
+        for orphan in [&["--bn-spot-symbol", "BTCUSDT"][..], &["--bn-adopt-usd", "5"][..]] {
+            assert!(smoke(orphan).is_err(), "{orphan:?} parsed without --binance");
+        }
+        assert_eq!(cli::bn_battery::parse_products("um,spot"), Ok((true, false, true)));
+        assert!(cli::bn_battery::parse_products("um,options").is_err(), "the battery refuses the word, as before");
     }
 }

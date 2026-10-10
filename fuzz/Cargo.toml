@@ -20,6 +20,8 @@ exec-hyperliquid = { path = "../crates/exec-hyperliquid" }
 # agreement law, raw ⇔ combined), bn_account (COIN-M and Portfolio Margin's
 # positions) and bn_mode (a row's margin type and leverage, PM's key and
 # unified account), and adds bn_rest_answer (the REST order route's answer).
+# BX8 adds bn_spot_event (spot's user-data frame, its event and the spot
+# account read, each judged by an oracle of the target's own).
 exec-binance     = { path = "../crates/exec-binance" }
 # cargo-fuzz runtime.
 libfuzzer-sys = "0.4"
@@ -470,6 +472,13 @@ bench  = false
 [[bin]]
 name   = "bn_rest_answer"
 path   = "fuzz_targets/bn_rest_answer.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_spot_event"
+path   = "fuzz_targets/bn_spot_event.rs"
 test   = false
 doc    = false
 bench  = false

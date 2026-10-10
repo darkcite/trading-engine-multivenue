@@ -41,11 +41,11 @@ use exec_binance::arm::{ArmKnobs, BnArm};
 use exec_binance::cmd::{duplex, EVT_F_SWEEP_DONE};
 use exec_binance::config::{BnConfig, Scope};
 use exec_binance::gateway::{BnGateway, GwKnobs, Phase, QUIET_NS, ROTATE_AFTER_NS};
-use exec_binance::inst::{BindSpec, InstTable, PRODUCT_COINM, PRODUCT_USDM};
+use exec_binance::inst::{BindSpec, InstTable, PRODUCT_COINM, PRODUCT_SPOT, PRODUCT_USDM};
 use exec_binance::journal::{spawn_writer, AnchorFile, JournalTx, JOURNAL_RING};
 use exec_binance::margin::{MarginBook, SLOTS};
 use exec_binance::mode::{maker_ok, AccountMode, AccountScope};
-use exec_router::{InstrumentSpec, LAW_INVERSE, LAW_LINEAR};
+use exec_router::{InstrumentSpec, LAW_INVERSE, LAW_LINEAR, LAW_SPOT};
 use ingress_binance::discovery::BnSymbolRow;
 use tracing::{error, info, warn};
 
@@ -79,6 +79,11 @@ pub struct BnSpec<'a> {
     pub cm_rows: &'a [(String, BnSymbolRow)],
     /// The universe's COIN-M instruments, perpetual then dated (BX7).
     pub coinm: &'a [Instrument],
+    /// The boot discovery's spot rows (BX8).
+    pub spot_rows: &'a [(String, BnSymbolRow)],
+    /// The universe's spot instruments — spot\[0\] the anchor, under the
+    /// alias's id (BX8).
+    pub spot: &'a [Instrument],
     /// The route alias's id (the M1 anchor), or `SYMBOL_ID_NONE`.
     pub alias: SymbolId,
     /// The market-data hosts the marks and books come from (BX-16).
@@ -99,16 +104,18 @@ pub struct BnBoot {
     pub tell: String,
 }
 
-/// One armed futures product's instruments to bind (BX7: USDⓈ-M, COIN-M).
+/// One armed product's instruments to bind (BX7: USDⓈ-M, COIN-M; BX8:
+/// spot).
 pub struct BindSet<'a> {
-    /// `PRODUCT_USDM` or `PRODUCT_COINM`.
+    /// `PRODUCT_USDM`, `PRODUCT_COINM` or `PRODUCT_SPOT`.
     pub product: u8,
     /// The universe's instruments of the product, perpetual then dated.
     pub insts: &'a [Instrument],
     /// The boot discovery's rows of the product, `(configured name, row)`.
     pub rows: &'a [(String, BnSymbolRow)],
-    /// On a shared account, the instruments it owns (`owned_usdm` /
-    /// `owned_coinm`).
+    /// On a shared account, what it owns: the instruments (`owned_usdm` /
+    /// `owned_coinm`) — spot's by their base assets (`owned_spot_assets`,
+    /// D3).
     pub owned: &'a [String],
 }
 
@@ -116,8 +123,8 @@ pub struct BindSet<'a> {
 /// its own discovery row, under its own engine id; ownership per the
 /// account scope (a shared account owns only what its owned list names);
 /// makers only where the product has a dead-man of ours (BX-17, O-BX3a);
-/// the ledger's law per product — linear, or inverse at the contract's
-/// face (COIN-M).
+/// the ledger's law per product — linear, inverse at the contract's face
+/// (COIN-M), or spot's (BX8: base units, never short).
 ///
 /// # Errors
 /// A configured instrument with no trading row, or a binding refusal
@@ -158,7 +165,27 @@ pub fn bind_table(
                     inst.name
                 ));
             }
-            let owned = !shared || set.owned.iter().any(|o| o.eq_ignore_ascii_case(&inst.name));
+            // A shared account owns spot by base asset (D3), the futures by
+            // instrument.
+            // BX8 (the risk review): every cap, the adoption and the drift
+            // halt are USD; a spot row's figures are its quote asset's — so
+            // a spot row binds only quoted in USDT (the classic arm's USD,
+            // as its futures are USDT-margined).
+            if set.product == PRODUCT_SPOT && row.quote_asset() != b"USDT" {
+                return Err(format!(
+                    "binance: spot `{}` is quoted in {} — the arm's caps, adoption and drift halt \
+                     are USD, which a spot row's figures are only when it is quoted in USDT. Drop \
+                     it from universe.toml's [binance] spot (the arm binds every symbol listed there)",
+                    inst.name,
+                    row.quote_asset().escape_ascii()
+                ));
+            }
+            let owned = !shared
+                || if set.product == PRODUCT_SPOT {
+                    set.owned.iter().any(|o| o.as_bytes().eq_ignore_ascii_case(row.base_asset()))
+                } else {
+                    set.owned.iter().any(|o| o.eq_ignore_ascii_case(&inst.name))
+                };
             let spec = BindSpec {
                 sym: inst.sym,
                 product: set.product,
@@ -173,6 +200,8 @@ pub fn bind_table(
                 // The face in USD ×1e6 (the discovery refuses a row without
                 // one): a contract's exposure whatever the price.
                 InstrumentSpec::new(inst.sym, LAW_INVERSE, 0, row.contract_size.saturating_mul(1_000_000), 0)
+            } else if set.product == PRODUCT_SPOT {
+                InstrumentSpec::new(inst.sym, LAW_SPOT, 0, 0, 0)
             } else {
                 InstrumentSpec::new(inst.sym, LAW_LINEAR, 0, 0, 0)
             });
@@ -234,38 +263,41 @@ pub fn boot_binance_arm(
         )
     })?;
 
-    // The table and the ledger rows: each armed futures product's
-    // instruments (`exec_boot` refused any product this gateway does not
-    // speak).
+    // The table and the ledger rows: each armed product's instruments
+    // (`exec_boot` refused any product this gateway does not speak).
     let armed = |w: &str| b.products.iter().any(|p| p == w);
-    let (um, cm) = (armed("usdm"), armed("coinm"));
-    let mut sets = Vec::with_capacity(2);
+    let (um, cm, sp) = (armed("usdm"), armed("coinm"), armed("spot"));
+    let mut sets = Vec::with_capacity(3);
     if um {
         sets.push(BindSet { product: PRODUCT_USDM, insts: spec.usdm, rows: spec.rows, owned: &b.owned_usdm });
     }
     if cm {
         sets.push(BindSet { product: PRODUCT_COINM, insts: spec.coinm, rows: spec.cm_rows, owned: &b.owned_coinm });
     }
+    if sp {
+        sets.push(BindSet { product: PRODUCT_SPOT, insts: spec.spot, rows: spec.spot_rows, owned: &b.owned_spot_assets });
+    }
     let (table, wire, specs) = bind_table(&sets, spec.alias, mode, shared)?;
     if specs.is_empty() {
         return Err(String::from(
-            "binance: a live Binance slot but no instrument of an armed futures product in the \
-             universe — nothing to trade",
+            "binance: a live Binance slot but no instrument of an armed product in the universe — \
+             nothing to trade",
         ));
     }
     // BX7: the E7 bound's USD equity is USDⓈ-M's on a classic account, and
     // COIN-M margins in each coin — exec_boot refuses a bounded classic arm
     // with `coinm` armed or `usdm` not (N1); this is the same law on what
     // was bound: some USDⓈ-M, no COIN-M.
+    // BX8: nor has the spot wallet one — the same law on spot's rows.
     let bound_on = |p: u8| (0..wire.len()).any(|i| wire.row(i as u16).product == p);
     if (s.halt_on_gain_usd_1e6 != 0 || s.halt_on_loss_usd_1e6 != 0)
         && mode == AccountMode::Classic
-        && (bound_on(PRODUCT_COINM) || !bound_on(PRODUCT_USDM))
+        && (bound_on(PRODUCT_COINM) || bound_on(PRODUCT_SPOT) || !bound_on(PRODUCT_USDM))
     {
         return Err(String::from(
-            "binance: the owner slot has a session bound, but its classic arm binds COIN-M (or \
-             no USDⓈ-M) — COIN-M margins in each coin and has no USD equity, so the bound would \
-             judge USDⓈ-M's alone (or nothing) while COIN-M's losses went unseen",
+            "binance: the owner slot has a session bound, but its classic arm binds COIN-M or \
+             spot (or no USDⓈ-M) — neither has a USD equity the bound reads, so it would judge \
+             USDⓈ-M's alone (or nothing) while their losses went unseen",
         ));
     }
 
@@ -360,7 +392,8 @@ pub fn boot_binance_arm(
             "binance: the account holds positions on {unseen} instrument(s) this boot did not \
              bind — the slot stays UNRECONCILED and refuses every order until they are flattened \
              (the engine stopped: the operator's `scripts/exec-smoke.sh --binance-flatten <um|cm> \
-             --bn-network mainnet --confirm`, or by hand)"
+             --bn-network mainnet --confirm` for a futures position, by hand in the app for a \
+             spot balance — no spot flatten tool exists)"
         );
     }
     let arm = BnArm::new(
@@ -420,8 +453,8 @@ pub fn boot_binance_arm(
         .map_err(|e| format!("binance: spawn bn-gateway: {e}"))?;
     // Each product as it trades here (BX7): makers only where a dead-man of
     // ours is proven (USDⓈ-M classic), IoC-only elsewhere.
-    let mut armed_words: Vec<String> = Vec::with_capacity(2);
-    for (on, product, word) in [(um, PRODUCT_USDM, "USDⓈ-M"), (cm, PRODUCT_COINM, "COIN-M")] {
+    let mut armed_words: Vec<String> = Vec::with_capacity(3);
+    for (on, product, word) in [(um, PRODUCT_USDM, "USDⓈ-M"), (cm, PRODUCT_COINM, "COIN-M"), (sp, PRODUCT_SPOT, "spot")] {
         if on {
             let how = if maker_ok(product, mode) { "makers and IoCs" } else { "IoC-only" };
             armed_words.push(format!("{word} ({how})"));
@@ -496,6 +529,46 @@ mod tests {
 
     fn um<'a>(insts: &'a [Instrument], rows: &'a [(String, BnSymbolRow)], owned: &'a [String]) -> BindSet<'a> {
         BindSet { product: PRODUCT_USDM, insts, rows, owned }
+    }
+
+    const SPOT: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01000000"},{"filterType":"LOT_SIZE","stepSize":"0.00001000","minQty":"0.00001000","maxQty":"9000.00000000"},{"filterType":"NOTIONAL","minNotional":"5.00000000"}],"permissionSets":[["SPOT"]]},{"symbol":"ETHBTC","status":"TRADING","baseAsset":"ETH","quoteAsset":"BTC","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.00001000"},{"filterType":"LOT_SIZE","stepSize":"0.00010000","minQty":"0.00010000","maxQty":"100000.00000000"}],"permissionSets":[["SPOT"]]},{"symbol":"BNBUSDT","status":"TRADING","baseAsset":"BNB","quoteAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01000000"},{"filterType":"LOT_SIZE","stepSize":"0.00100000","minQty":"0.00100000","maxQty":"9000.00000000"}],"permissionSets":[["SPOT"]]}]}"#;
+
+    fn spot_rows() -> Vec<(String, BnSymbolRow)> {
+        let mut d = ingress_binance::discovery::BnDiscovery::new();
+        d.ingest_body(SPOT).expect("fixture");
+        ["btcusdt", "ethbtc", "bnbusdt"]
+            .iter()
+            .map(|n| (String::from(*n), *d.find(n.to_ascii_uppercase().as_bytes()).expect("row")))
+            .collect()
+    }
+
+    /// BX8: spot binds IoC-only under `LAW_SPOT` — the anchor (spot\[0\],
+    /// the legacy flat id 7) under its alias — and only quoted in USDT:
+    /// every cap, the adoption and the drift halt are USD (the risk
+    /// review's BLOCK). A shared account owns spot by base asset (D3).
+    /// Break-and-watch: without the quote law ETHBTC binds.
+    #[test]
+    fn spot_binds_quoted_in_usdt_and_the_anchor_under_its_alias() {
+        let r = spot_rows();
+        let anchor = Instrument { sym: 7, name: String::from("btcusdt"), descriptor: String::from("binance:btcusdt") };
+        let bnb = Instrument { sym: core_types::make_symbol_id(core_types::VenueId::Binance, 2), name: String::from("bnbusdt"), descriptor: String::from("binance:bnbusdt") };
+        let insts = [anchor.clone(), bnb.clone()];
+        let (t, w, specs) = bind_table(&[BindSet { product: PRODUCT_SPOT, insts: &insts, rows: &r, owned: &[] }], 7, AccountMode::Classic, false).unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!((specs[0].sym, specs[0].law), (7, exec_router::LAW_SPOT), "the anchor's ledger row is spot's");
+        let row = t.row_of(7);
+        assert_ne!(row, exec_binance::inst::ROW_NONE, "binance:btcusdt routes through the alias to its row");
+        assert_eq!((w.row(row).product, w.row(row).symbol(), w.row(row).sym), (PRODUCT_SPOT, &b"BTCUSDT"[..], 7));
+        assert!(t.hot(row).has(exec_binance::inst::INST_NO_DEADMAN), "spot is IoC-only");
+        assert_eq!(w.spot(row).base.get(), &b"BTC"[..]);
+        let ethbtc = [Instrument { sym: core_types::make_symbol_id(core_types::VenueId::Binance, 3), name: String::from("ethbtc"), descriptor: String::from("binance:ethbtc") }];
+        let e = bind_table(&[BindSet { product: PRODUCT_SPOT, insts: &ethbtc, rows: &r, owned: &[] }], 7, AccountMode::Classic, false).err().unwrap();
+        assert!(e.contains("ethbtc") && e.contains("quoted in BTC"), "{e}");
+        // Shared: owned by base asset.
+        let owned = [String::from("bnb")];
+        let (t, _, _) = bind_table(&[BindSet { product: PRODUCT_SPOT, insts: &insts, rows: &r, owned: &owned }], 7, AccountMode::Classic, true).unwrap();
+        assert!(t.hot(t.row_of(bnb.sym)).has(exec_binance::inst::INST_OWNED));
+        assert!(!t.hot(t.row_of(7)).has(exec_binance::inst::INST_OWNED), "BTC is not on the owned list");
     }
 
     const DAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSD_PERP","pair":"BTCUSD","contractType":"PERPETUAL","contractStatus":"TRADING","contractSize":100,"filters":[{"filterType":"PRICE_FILTER","tickSize":"0.1"},{"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"}]},{"symbol":"ETHUSD_PERP","pair":"ETHUSD","contractType":"PERPETUAL","contractStatus":"TRADING","contractSize":10,"filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"}]}]}"#;

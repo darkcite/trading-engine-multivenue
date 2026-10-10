@@ -845,17 +845,37 @@ fn check_binance(
     // PM Pro. COIN-M margins in each coin and has none: on a classic arm
     // trading it the bound would judge USDⓈ-M's equity alone — or nothing —
     // while COIN-M's losses went unseen (the risk review's N1). Refused.
+    // BX8: nor does the spot wallet — spot is classic-only, and a bounded
+    // arm trading it would judge USDⓈ-M's equity while spot's losses went
+    // unseen. Refused alike.
     let bounded = owner.is_some_and(|s| s.halt_on_gain_usd_1e6 != 0 || s.halt_on_loss_usd_1e6 != 0);
     let armed = |w: &str| b.products.iter().any(|p| p == w);
-    if bounded && mode == exec_binance::mode::AccountMode::Classic && (armed("coinm") || !armed("usdm")) {
+    // BX8: spot's user data exists only on a WS API session, whose logon
+    // takes Ed25519 keys only — refused here by name, as the gateway would
+    // at its boot (`BootErr::SpotRoute`).
+    if armed("spot") && (b.order_transport == "rest" || b.signing == "hmac") {
+        return Err(format!(
+            "exec: [exec.binance] arms spot with order_transport = \"{}\" and signing = \"{}\" — \
+             spot's fills arrive only on a WS API session (no listenKey since 2026-02-20), whose \
+             logon takes an Ed25519 key. Arm spot on the WS API with an Ed25519 key.",
+            b.order_transport, b.signing
+        ));
+    }
+    if bounded && mode == exec_binance::mode::AccountMode::Classic && (armed("coinm") || armed("spot") || !armed("usdm")) {
+        let what = if armed("coinm") {
+            "trades COIN-M"
+        } else if armed("spot") {
+            "trades spot"
+        } else {
+            "trades no USDⓈ-M"
+        };
         return Err(format!(
             "exec: slot {} has a session bound (halt_on_gain_usd_1e6 / halt_on_loss_usd_1e6) but \
-             its classic Binance arm {} — COIN-M margins in each coin and has no USD equity, so \
-             the bound would judge USDⓈ-M's alone (or nothing) while COIN-M's losses went \
-             unseen. Run the account as pm or pm_pro (one unified USD equity), arm usdm alone, \
-             or drop the bound.",
-            live[0],
-            if armed("coinm") { "trades COIN-M" } else { "trades no USDⓈ-M" }
+             its classic Binance arm {what} — COIN-M margins in each coin and the spot wallet \
+             holds its own assets: no USD equity the bound reads for either, so the bound would \
+             judge USDⓈ-M's alone (or nothing) while their losses went unseen. Run the futures \
+             as pm or pm_pro (one unified USD equity), arm usdm alone, or drop the bound.",
+            live[0]
         ));
     }
     Ok(())
@@ -1259,7 +1279,8 @@ mod tests {
     /// BX11: the template's Binance recipe boots every product and account
     /// mode this binary builds, each by the edits its block's comments name
     /// — and refuses the two the comments forbid (PM, and an HMAC key, off
-    /// the REST route).
+    /// the REST route). BX8: spot classic boots, alone and beside USD-M;
+    /// spot beside PM Pro refuses (it waits on a ruling).
     #[test]
     fn the_templates_binance_recipe_boots_every_built_product_and_mode() {
         let src = std::fs::read_to_string(
@@ -1272,7 +1293,7 @@ mod tests {
         const WS: &str = "order_transport = \"ws\"";
         const REST: &str = "order_transport = \"rest\"";
         const ED25519: &str = "signing = \"ed25519\"";
-        let cases: [(&str, &[(&str, &str)], bool); 8] = [
+        let cases: [(&str, &[(&str, &str)], bool); 13] = [
             ("USD-M classic on the WS API", &[], true),
             ("COIN-M classic", &[(PRODUCTS, "products = [\"coinm\"]")], true),
             ("both products, classic", &[(PRODUCTS, "products = [\"usdm\", \"coinm\"]")], true),
@@ -1281,6 +1302,11 @@ mod tests {
             ("PM on REST, both products", &[(CLASSIC, "account_mode = \"pm\""), (WS, REST), (PRODUCTS, "products = [\"usdm\", \"coinm\"]")], true),
             ("PM Pro", &[(CLASSIC, "account_mode = \"pm_pro\"")], true),
             ("PM on the WS API", &[(CLASSIC, "account_mode = \"pm\"")], false),
+            ("spot classic", &[(PRODUCTS, "products = [\"spot\"]")], true),
+            ("USD-M and spot", &[(PRODUCTS, "products = [\"usdm\", \"spot\"]")], true),
+            ("spot beside PM Pro", &[(CLASSIC, "account_mode = \"pm_pro\""), (PRODUCTS, "products = [\"usdm\", \"spot\"]")], false),
+            ("spot on REST", &[(WS, REST), (PRODUCTS, "products = [\"usdm\", \"spot\"]")], false),
+            ("spot with an HMAC key on REST", &[(ED25519, "signing = \"hmac\""), (WS, REST), (PRODUCTS, "products = [\"spot\"]")], false),
         ];
         for (what, edits, boots) in cases {
             let mut src = base.clone();
@@ -1811,10 +1837,24 @@ mod tests {
         let e = resolve(Some(&p), Some("3")).unwrap_err();
         assert!(e.contains("[exec.binance]"), "{e}");
         // A product this gateway does not speak names its phase.
-        let src = format!("{}{}", bn_live(), BN_SECTION.replace("products = [\"usdm\"]", "products = [\"spot\"]"));
+        let src = format!("{}{}", bn_live(), BN_SECTION.replace("products = [\"usdm\"]", "products = [\"options\"]"));
         let p = write(&d, "unbuilt.toml", &src);
         let e = resolve(Some(&p), Some("3")).unwrap_err();
-        assert!(e.contains("BX8"), "spot: {e}");
+        assert!(e.contains("BX9"), "options: {e}");
+        // BX8: spot classic is built — alone, or beside the futures; beside
+        // Portfolio Margin it waits on a ruling.
+        for to in ["products = [\"spot\"]", "products = [\"usdm\", \"spot\"]"] {
+            let src = format!("{}{}", bn_live(), BN_SECTION.replace("products = [\"usdm\"]", to));
+            let p = write(&d, "spot.toml", &src);
+            let b = resolve(Some(&p), Some("3")).unwrap_or_else(|e| panic!("{to}: {e}")).unwrap();
+            assert!(b.binance.as_ref().is_some_and(|b| b.products.iter().any(|p| p == "spot")), "{to}");
+        }
+        let spot_pro = BN_SECTION
+            .replace("products = [\"usdm\"]", "products = [\"usdm\", \"spot\"]")
+            .replace("account_mode = \"classic\"", "account_mode = \"pm_pro\"");
+        let p = write(&d, "spot-pro.toml", &format!("{}{spot_pro}", bn_live()));
+        let e = resolve(Some(&p), Some("3")).unwrap_err();
+        assert!(e.contains("a ruling"), "spot beside PM Pro: {e}");
         // BX7 (C3): PM Pro is built — the classic routes.
         let pm_pro = BN_SECTION.replace("account_mode = \"classic\"", "account_mode = \"pm_pro\"");
         let p = write(&d, "pm-pro.toml", &format!("{}{pm_pro}", bn_live()));
@@ -1899,6 +1939,14 @@ mod tests {
         let pm_pro = cm.replace("account_mode = \"classic\"", "account_mode = \"pm_pro\"");
         let p = write(&d, "pm-pro.toml", &format!("{bounded}{pm_pro}"));
         assert!(resolve(Some(&p), Some("3")).is_ok(), "PM Pro: the unified account's equity");
+        // BX8: the spot wallet has no USD equity the bound reads — refused
+        // beside USDⓈ-M as alone; unbounded, it boots.
+        let spot = BN_SECTION.replace("products = [\"usdm\"]", "products = [\"usdm\", \"spot\"]");
+        let p = write(&d, "spot-bound.toml", &format!("{bounded}{spot}"));
+        let e = resolve(Some(&p), Some("3")).unwrap_err();
+        assert!(e.contains("no USD") && e.contains("trades spot"), "spot beside USDⓈ-M: {e}");
+        let p = write(&d, "spot.toml", &format!("{}{spot}", bn_live()));
+        assert!(resolve(Some(&p), Some("3")).is_ok(), "spot unbounded");
         std::fs::remove_dir_all(&d).ok();
     }
 

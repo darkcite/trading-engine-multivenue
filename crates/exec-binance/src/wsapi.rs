@@ -27,11 +27,21 @@
 //! **Maybe-sent** (BX5 carried): a request is in flight from the socket's
 //! `flush` onward; a connection that dies with requests in flight leaves
 //! them IN DOUBT, resolved by `order.status`, never resent (BX-11).
+//!
+//! **Spot (BX8)** speaks the same requests on `ws-api/v3` — the place
+//! without `reduceOnly` (spot has none; the arm refuses one), the account
+//! read `account.status` with `omitZeroBalances` — and its session
+//! subscribes to the user data after the logon
+//! ([`queue_subscribe`]): the events then share the socket with the
+//! answers, each framed `{"subscriptionId":N,"event":{…}}`, which
+//! [`scan_answer`] tells from an answer and hands on whole
+//! ([`WsAnswer::user`], [`WsAnswer::event`]). A spot order's answer has no
+//! `avgPrice`: its average is `cummulativeQuoteQty / executedQty`.
 
 use core_net::{WsConn, WsErr, WsPart};
 
 use crate::cid::{CidPrefix, CID_LEN};
-use crate::inst::PRODUCT_COINM;
+use crate::inst::{PRODUCT_COINM, PRODUCT_SPOT};
 use crate::json::{dec_1e6, i64_of, is_null, str_of, u64_of, Pairs};
 use crate::num::{fixed_len, render_fixed, render_u64, u64_len};
 use crate::userstream::{status_of, ScanErr, Span};
@@ -48,6 +58,9 @@ pub const REQ_MODIFY: u8 = 4;
 pub const REQ_STATUS: u8 = 5;
 /// `v2/account.status` (recon and margin).
 pub const REQ_ACCOUNT: u8 = 6;
+/// `userDataStream.subscribe` (BX8, spot): the session's user data, after
+/// its logon.
+pub const REQ_SUBSCRIBE: u8 = 7;
 
 /// What a WS API request id stands for: the verb, the open-order slot, the
 /// slot's generation and the placement id of the order it was sent for —
@@ -369,14 +382,26 @@ pub fn queue_modify<S: FrameSink>(s: &mut S, id: u64, st: &WsStatic, o: &Place<'
 }
 
 /// The account read's method: USDⓈ-M's `v2/account.status`, COIN-M's
-/// `account.status` (BX7: per-asset margins, positions in contracts).
+/// `account.status` (BX7: per-asset margins, positions in contracts),
+/// spot's `account.status` (BX8: the balances, the permissions).
 #[inline(always)]
 #[must_use]
 pub const fn account_method(product: u8) -> &'static [u8] {
-    if product == PRODUCT_COINM {
+    if product == PRODUCT_COINM || product == PRODUCT_SPOT {
         b"account.status"
     } else {
         b"v2/account.status"
+    }
+}
+
+/// The account read's parameters before `recvWindow`: spot's leave the
+/// zero balances out (BX8: a Demo account lists hundreds).
+#[inline(always)]
+const fn account_params(product: u8) -> &'static [u8] {
+    if product == PRODUCT_SPOT {
+        b"\",\"params\":{\"omitZeroBalances\":true,\"recvWindow\":"
+    } else {
+        b"\",\"params\":{\"recvWindow\":"
     }
 }
 
@@ -388,11 +413,49 @@ pub fn queue_account<S: FrameSink>(s: &mut S, id: u64, st: &WsStatic, product: u
         Part::U64(id),
         Part::Lit(b",\"method\":\""),
         Part::Lit(account_method(product)),
-        Part::Lit(b"\",\"params\":{\"recvWindow\":"),
+        Part::Lit(account_params(product)),
         Part::U64(st.recv_window_ms),
         Part::Lit(b",\"timestamp\":"),
         Part::U64(ts_ms),
         Part::Lit(b"}}"),
+    ])
+}
+
+/// **The subscription's answer** (BX8, spot): its `result` names a
+/// `subscriptionId` — once, an unsigned integer. A 200 without one is not
+/// the subscription it answers: the session never goes live on it.
+#[must_use]
+pub fn scan_subscribed(f: &[u8], result: Span) -> bool {
+    let Ok(mut r) = Pairs::new(f, result.at as usize) else {
+        return false;
+    };
+    let mut id = None;
+    loop {
+        match r.next() {
+            Ok(Some((b"subscriptionId", a, z))) => {
+                if id.is_some() {
+                    return false;
+                }
+                id = u64_of(f, a, z).ok();
+                if id.is_none() {
+                    return false;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return id.is_some(),
+            Err(()) => return false,
+        }
+    }
+}
+
+/// **`userDataStream.subscribe`** (BX8, spot): the logged-on session's
+/// user data on the session itself — no parameters (the logon names the
+/// account).
+pub fn queue_subscribe<S: FrameSink>(s: &mut S, id: u64) -> Result<(), WsErr> {
+    s.queue_parts(&[
+        Part::Lit(b"{\"id\":"),
+        Part::U64(id),
+        Part::Lit(b",\"method\":\"userDataStream.subscribe\"}"),
     ])
 }
 
@@ -431,6 +494,11 @@ pub struct WsAnswer {
     /// `error.data.retryAfter`: venue ms until which a budget or lock
     /// answer asks for silence (0 = not said).
     pub retry_after_ms: u64,
+    /// A spot user event's frame (BX8): `subscriptionId` with an `event`,
+    /// no `id`, no `status` — [`Self::event`] is the event object.
+    pub user: bool,
+    /// The `event` object's span (a user event's, or `serverShutdown`'s).
+    pub event: Span,
 }
 
 #[inline(always)]
@@ -451,6 +519,7 @@ const A_STATUS: u8 = 1 << 1;
 const A_RESULT: u8 = 1 << 2;
 const A_ERROR: u8 = 1 << 3;
 const A_EVENT: u8 = 1 << 4;
+const A_SUB: u8 = 1 << 5;
 
 /// **Scan one WS API frame** (module docs).
 pub fn scan_answer(f: &[u8], out: &mut WsAnswer) -> Result<(), ScanErr> {
@@ -507,20 +576,21 @@ pub fn scan_answer(f: &[u8], out: &mut WsAnswer) -> Result<(), ScanErr> {
                 }
                 A_ERROR
             }
+            // The object is read below, once the frame says whose it is.
             b"event" => {
-                let mut e = Pairs::new(f, a).map_err(malformed)?;
-                let mut named = false;
-                while let Some((ek, ea, ez)) = e.next().map_err(malformed)? {
-                    if ek == b"e" {
-                        // Read once: a second event name is refused.
-                        if named {
-                            return Err(ScanErr::Malformed);
-                        }
-                        named = true;
-                        out.shutdown = str_of(f, ea, ez).map_err(bad)? == b"serverShutdown";
-                    }
+                if f.get(a) != Some(&b'{') {
+                    return Err(ScanErr::BadField);
                 }
+                out.event = Span {
+                    at: a as u32,
+                    len: (z - a) as u32,
+                };
                 A_EVENT
+            }
+            // Spot's user data (BX8): the subscription the event is for.
+            b"subscriptionId" => {
+                let _ = u64_of(f, a, z).map_err(bad)?;
+                A_SUB
             }
             _ => 0,
         };
@@ -528,6 +598,36 @@ pub fn scan_answer(f: &[u8], out: &mut WsAnswer) -> Result<(), ScanErr> {
             return Err(ScanErr::Malformed);
         }
         seen |= bit;
+    }
+    // One object, whole (BX8, the parser review): bytes after it — a second
+    // frame run on — are no shape of the venue's, never left unread.
+    if !crate::rest::ends_whole(f, w.end()) {
+        return Err(ScanErr::Malformed);
+    }
+    if seen & A_SUB != 0 {
+        // A spot user event (BX8): its event and nothing of an answer's —
+        // the event is the caller's to read ([`crate::userstream::scan_spot_event`]),
+        // once.
+        if seen & (A_ID | A_STATUS | A_RESULT | A_ERROR) != 0 || seen & A_EVENT == 0 {
+            return Err(ScanErr::Malformed);
+        }
+        out.user = true;
+        return Ok(());
+    }
+    if seen & A_EVENT != 0 {
+        // A venue event outside a subscription: its name, read once — a
+        // second is refused.
+        let mut e = Pairs::new(f, out.event.at as usize).map_err(malformed)?;
+        let mut named = false;
+        while let Some((ek, ea, ez)) = e.next().map_err(malformed)? {
+            if ek == b"e" {
+                if named {
+                    return Err(ScanErr::Malformed);
+                }
+                named = true;
+                out.shutdown = str_of(f, ea, ez).map_err(bad)? == b"serverShutdown";
+            }
+        }
     }
     // An order's result AND a refusal in one answer is no shape of the
     // venue's: neither is read as the other's (BX7).
@@ -586,6 +686,9 @@ pub fn scan_rest_answer(status: u16, body: &[u8], out: &mut WsAnswer) -> Result<
 fn result_fields(f: &[u8], at: usize, out: &mut WsAnswer) -> Result<(), ScanErr> {
     let mut r = Pairs::new(f, at).map_err(malformed)?;
     let mut seen = 0u8;
+    // Spot's cumulative quote (BX8): its average's numerator; negative
+    // when the venue does not have it.
+    let mut quote_1e6 = 0i64;
     while let Some((k, a, z)) = r.next().map_err(malformed)? {
         let bit: u8 = match k {
             b"orderId" => {
@@ -616,12 +719,21 @@ fn result_fields(f: &[u8], at: usize, out: &mut WsAnswer) -> Result<(), ScanErr>
                 out.cid = Span::of(f, str_of(f, a, z).map_err(bad)?);
                 1 << 6
             }
+            b"cummulativeQuoteQty" => {
+                quote_1e6 = dec_1e6(f, a, z).map_err(bad)?;
+                1 << 7
+            }
             _ => 0,
         };
         if seen & bit != 0 {
             return Err(ScanErr::Malformed);
         }
         seen |= bit;
+    }
+    // Spot (BX8): no `avgPrice` — the average is the cumulative quote over
+    // the executed quantity, when the venue has both.
+    if seen & (1 << 3) == 0 && quote_1e6 > 0 && out.executed_1e6 > 0 {
+        out.avg_px_1e6 = (quote_1e6 as i128 * 1_000_000 / out.executed_1e6 as i128).min(i64::MAX as i128) as i64;
     }
     Ok(())
 }
@@ -742,6 +854,78 @@ pub(crate) mod tests {
             std::str::from_utf8(&t.0).unwrap(),
             r#"{"id":11,"method":"account.status","params":{"recvWindow":1000,"timestamp":8}}"#
         );
+        // BX8: spot's account read leaves its zero balances out; its
+        // session subscribes to the user data with no parameters.
+        let mut t = Text::default();
+        queue_account(&mut t, 12, &st(), PRODUCT_SPOT, 8).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&t.0).unwrap(),
+            r#"{"id":12,"method":"account.status","params":{"omitZeroBalances":true,"recvWindow":1000,"timestamp":8}}"#
+        );
+        let mut t = Text::default();
+        queue_subscribe(&mut t, 13).unwrap();
+        assert_eq!(std::str::from_utf8(&t.0).unwrap(), r#"{"id":13,"method":"userDataStream.subscribe"}"#);
+    }
+
+    /// BX8: a spot user event shares the order socket — read as one by its
+    /// `subscriptionId`, its event handed on whole and unread; never mixed
+    /// with an answer's keys. A spot order's answer has no `avgPrice`: the
+    /// average is its cumulative quote over its executed quantity.
+    #[test]
+    fn spot_user_events_are_told_from_answers() {
+        let mut a = WsAnswer::default();
+        let ev = br#"{"subscriptionId":0,"event":{"e":"executionReport","E":1,"s":"BTCUSDT"}}"#;
+        scan_answer(ev, &mut a).unwrap();
+        assert!(a.user && !a.shutdown);
+        assert_eq!(a.event.get(ev), &br#"{"e":"executionReport","E":1,"s":"BTCUSDT"}"#[..]);
+        // Key order is not relied on.
+        let rev = br#"{"event":{"e":"balanceUpdate"},"subscriptionId":3}"#;
+        scan_answer(rev, &mut a).unwrap();
+        assert!(a.user);
+        for bad in [
+            &br#"{"subscriptionId":0,"event":{"e":"x"},"id":7,"status":200}"#[..],
+            &br#"{"subscriptionId":0,"id":7,"status":200,"result":{}}"#[..],
+            &br#"{"subscriptionId":0,"subscriptionId":1,"event":{"e":"x"}}"#[..],
+            &br#"{"subscriptionId":0,"event":{"e":"x"},"event":{"e":"y"}}"#[..],
+            &br#"{"subscriptionId":0,"event":[1]}"#[..],
+            &br#"{"subscriptionId":"zero","event":{"e":"x"}}"#[..],
+        ] {
+            assert!(scan_answer(bad, &mut a).is_err(), "{}", std::str::from_utf8(bad).unwrap());
+        }
+        // The shutdown event (no subscription) is still the WS API's.
+        scan_answer(br#"{"event":{"e":"serverShutdown","E":1}}"#, &mut a).unwrap();
+        assert!(a.shutdown && !a.user);
+        let ok = br#"{"id":5,"status":200,"result":{"symbol":"BTCUSDT","orderId":4293153,"orderListId":-1,"clientOrderId":"mv6512ab0f2000000000000006500000","price":"65000.01000000","origQty":"0.00200000","executedQty":"0.00100000","cummulativeQuoteQty":"65.00000000","status":"EXPIRED","timeInForce":"IOC","type":"LIMIT","side":"BUY"}}"#;
+        scan_answer(ok, &mut a).unwrap();
+        assert_eq!((a.executed_1e6, a.avg_px_1e6, a.order_status), (1_000, 65_000_000_000, crate::userstream::S_EXPIRED));
+        let unknown = std::string::String::from_utf8(ok.to_vec()).unwrap().replace("\"65.00000000\"", "\"-1.00000000\"");
+        scan_answer(unknown.as_bytes(), &mut a).unwrap();
+        assert_eq!(a.avg_px_1e6, 0, "a negative quote is unavailable");
+        let twice = std::string::String::from_utf8(ok.to_vec()).unwrap().replace(r#""status":"EXPIRED","#, r#""status":"EXPIRED","cummulativeQuoteQty":"1","#);
+        assert_eq!(scan_answer(twice.as_bytes(), &mut a), Err(ScanErr::Malformed));
+        // BX8 parser review: a frame is one object, whole.
+        let run_on = br#"{"subscriptionId":0,"event":{"e":"x"}}{"subscriptionId":0,"event":{"e":"y"}}"#;
+        assert_eq!(scan_answer(run_on, &mut a), Err(ScanErr::Malformed));
+        assert_eq!(scan_answer(br#"{"id":1,"status":200,"result":{}} x"#, &mut a), Err(ScanErr::Malformed));
+        scan_answer(b"{\"id\":1,\"status\":200,\"result\":{}}\n", &mut a).unwrap();
+        // The subscription's answer names its id, once.
+        let sub = br#"{"id":2,"status":200,"result":{"subscriptionId":0}}"#;
+        scan_answer(sub, &mut a).unwrap();
+        assert!(scan_subscribed(sub, a.result));
+        for bad in [
+            &br#"{"id":2,"status":200,"result":{}}"#[..],
+            &br#"{"id":2,"status":200,"result":{"subscriptionId":0,"subscriptionId":1}}"#[..],
+            &br#"{"id":2,"status":200,"result":{"subscriptionId":"x"}}"#[..],
+            &br#"{"id":2,"status":200,"result":[]}"#[..],
+        ] {
+            scan_answer(bad, &mut a).unwrap();
+            assert!(!scan_subscribed(bad, a.result), "{}", std::str::from_utf8(bad).unwrap());
+        }
+        // The ACK (spot's has no status) names the order.
+        let ack = br#"{"id":6,"status":200,"result":{"symbol":"BTCUSDT","orderId":4293153,"orderListId":-1,"clientOrderId":"mv6512ab0f2000000000000006500000","transactTime":1790000000099}}"#;
+        scan_answer(ack, &mut a).unwrap();
+        assert_eq!((a.venue_oid, a.order_status), (4_293_153, 0));
+        assert_eq!(a.cid.get(ack), &b"mv6512ab0f2000000000000006500000"[..]);
     }
 
     #[test]
@@ -788,6 +972,17 @@ pub(crate) mod tests {
             let mut a = WsAnswer::default();
             if scan_answer(&bytes, &mut a).is_ok() {
                 let _ = (a.cid.get(&bytes), a.result.get(&bytes));
+                // BX8 (P2-6c): a subscribe's answer judged on any result.
+                let _ = scan_subscribed(&bytes, a.result);
+                // BX8: a user frame's event lies in the frame, and reads on.
+                prop_assert!(a.event.at as usize + a.event.len as usize <= bytes.len());
+                if a.user {
+                    let mut e = crate::userstream::UserEvent::default();
+                    if crate::userstream::scan_spot_event(&bytes, a.event.at as usize, &mut e).is_ok() {
+                        prop_assert!(e.symbol.at as usize + e.symbol.len as usize <= bytes.len());
+                        prop_assert!(e.cid.at as usize + e.cid.len as usize <= bytes.len());
+                    }
+                }
             }
         }
 

@@ -93,6 +93,9 @@
 #       flatten's own code (60-63); before the gateway stops, 57, 56 or 52.
 #       Once a drill stopped the gateway (and no signal came) the end runs
 #       the flatten on Demo, then reads the account (58 if not flat).
+#   66  BX8, the spot battery (`--binance spot`): the gateway's permission
+#       check refused the boot — the account lacks a group the spot row
+#       needs (the bStock check, `--bn-spot-symbol`); NOTHING was placed.
 # The diagnostics start at 20 because clap exits 2 on any argument
 # error: a release binary too old to have the arm would otherwise have
 # reported itself as a signing failure.
@@ -209,6 +212,7 @@ case "$rc" in
   63) echo "exec-smoke: *** BX11 FLATTEN: A POSITION IS STILL OPEN AFTER ITS TRIES *** — the report names it; close it by hand on the $account account" >&2 ;;
   64) echo "exec-smoke: BX11: mainnet without --confirm — the account was read and every change it would send is printed above; NOTHING was sent" >&2 ;;
   65) echo "exec-smoke: *** BX11 DRILL: THE VENUE'S DEAD-MAN WAS NOT SEEN TO CANCEL THE MAKERS *** — the report names why; the run cancelled any left by id and read the Demo account" >&2 ;;
+  66) echo "exec-smoke: BX8: the permission check refused the boot — the account lacks a group the spot row needs (the bStock check); NOTHING was placed" >&2 ;;
   *) echo "exec-smoke: could not run (exit $rc)" >&2
      # 1 (refused before anything was sent) and 2 (clap) left nothing.
      if [ "$hlperp" = 1 ] && [ "$rc" != 1 ] && [ "$rc" != 2 ]; then

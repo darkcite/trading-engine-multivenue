@@ -8,10 +8,11 @@
 //! sweep's fallback while the order session is down (`DELETE
 //! allOpenOrders`), the time, the open orders and the day's trades (recon,
 //! obligation 8), and the boot assertions (BX-19). USDⓈ-M's paths are
-//! fapi's, COIN-M's dapi's (BX7, C1), and in Portfolio Margin each
-//! product's papi paths (BX7, C2): one template table, indexed alike
-//! ([`fut_specs`], [`ord_specs`]); a slot a host has no endpoint for is
-//! never started there.
+//! fapi's, COIN-M's dapi's (BX7, C1), in Portfolio Margin each product's
+//! papi paths (BX7, C2), and spot's (BX8) the time, the open orders, the
+//! day's trades and the adoption's price (`/api/v3/…`): one template
+//! table, indexed alike ([`lane_specs`], [`ord_specs`]); a slot a host has
+//! no endpoint for is never started there.
 //!
 //! **Signing in place** (BX4 carried): the parameters are rendered
 //! contiguously into the connection's own template window
@@ -37,8 +38,8 @@
 use core_net::{Method, Params, ReqSpec};
 
 use crate::config::{hex_lower, HmacSigner, Signer, HMAC_SIG_HEX};
-use crate::inst::PRODUCT_COINM;
-use crate::json::{bool_of, dec_1e6, i64_of, str_of, u64_of, Elems, Pairs};
+use crate::inst::{PRODUCT_COINM, PRODUCT_SPOT};
+use crate::json::{bool_of, dec_1e6, dec_1e9, i64_of, str_of, u64_of, Elems, Pairs};
 use crate::num::{render_fixed, render_u64, RENDER_MAX};
 use crate::userstream::{side_of, status_of, ScanErr, Span};
 use crate::wsapi::{render_parts, side_word, Part, Place, WsStatic};
@@ -78,8 +79,12 @@ pub const T_ACCOUNT: usize = 9;
 /// account read carries both for every symbol, and Portfolio Margin is
 /// cross by construction — so the slot is never started elsewhere.
 pub const T_SYMBOL_CONFIG: usize = 10;
-/// The futures jobs connection's templates.
-pub const FUT_TEMPLATES: usize = 11;
+/// `GET /api/v3/ticker/price?symbol=…` (public; BX8): a spot row's price,
+/// read once at boot for a balance the boot adopts (a balance carries
+/// none). Spot only.
+pub const T_PRICE: usize = 11;
+/// A lane's jobs connection's templates.
+pub const LANE_TEMPLATES: usize = 12;
 
 /// papi's connectivity check: what a slot papi has no endpoint for names
 /// (the countdown — K13: no dead-man in PM — the time, multi-assets); it
@@ -87,7 +92,7 @@ pub const FUT_TEMPLATES: usize = 11;
 const PAPI_NONE: &str = "/papi/v1/ping";
 
 /// The jobs connection's paths by template, USDⓈ-M.
-const FAPI_PATHS: [&str; FUT_TEMPLATES] = [
+const FAPI_PATHS: [&str; LANE_TEMPLATES] = [
     "/fapi/v1/listenKey",
     "/fapi/v1/listenKey",
     "/fapi/v1/countdownCancelAll",
@@ -99,12 +104,13 @@ const FAPI_PATHS: [&str; FUT_TEMPLATES] = [
     "/fapi/v1/multiAssetsMargin",
     "/fapi/v3/account",
     "/fapi/v1/symbolConfig",
+    "/fapi/v1/ping",
 ];
 
 /// The jobs connection's paths by template, COIN-M. Its multi-assets and
 /// symbol-config slots name no dapi endpoint: never started, they would
 /// only ever be refused.
-const DAPI_PATHS: [&str; FUT_TEMPLATES] = [
+const DAPI_PATHS: [&str; LANE_TEMPLATES] = [
     "/dapi/v1/listenKey",
     "/dapi/v1/listenKey",
     "/dapi/v1/countdownCancelAll",
@@ -116,10 +122,11 @@ const DAPI_PATHS: [&str; FUT_TEMPLATES] = [
     "/dapi/v1/multiAssetsMargin",
     "/dapi/v1/account",
     "/dapi/v1/symbolConfig",
+    "/dapi/v1/ping",
 ];
 
 /// Portfolio Margin's paths by template, USDⓈ-M (papi `um/`).
-const PAPI_UM_PATHS: [&str; FUT_TEMPLATES] = [
+const PAPI_UM_PATHS: [&str; LANE_TEMPLATES] = [
     "/papi/v1/listenKey",
     "/papi/v1/listenKey",
     PAPI_NONE,
@@ -131,10 +138,11 @@ const PAPI_UM_PATHS: [&str; FUT_TEMPLATES] = [
     PAPI_NONE,
     "/papi/v1/account",
     PAPI_NONE,
+    PAPI_NONE,
 ];
 
 /// Portfolio Margin's paths by template, COIN-M (papi `cm/`).
-const PAPI_CM_PATHS: [&str; FUT_TEMPLATES] = [
+const PAPI_CM_PATHS: [&str; LANE_TEMPLATES] = [
     "/papi/v1/listenKey",
     "/papi/v1/listenKey",
     PAPI_NONE,
@@ -146,6 +154,29 @@ const PAPI_CM_PATHS: [&str; FUT_TEMPLATES] = [
     PAPI_NONE,
     "/papi/v1/account",
     PAPI_NONE,
+    PAPI_NONE,
+];
+
+/// Spot's connectivity check: a slot spot has no endpoint for (the
+/// listenKey — gone since 2026-02-20; the dead-man and the cancel-all —
+/// spot is IoC-only, BX-17; the futures assertions); never started.
+const SPOT_NONE: &str = "/api/v3/ping";
+
+/// Spot's paths by template (BX8): the time, the open orders, the day's
+/// trades, a symbol's price. Its account is read on the order session.
+const SPOT_PATHS: [&str; LANE_TEMPLATES] = [
+    SPOT_NONE,
+    SPOT_NONE,
+    SPOT_NONE,
+    "/api/v3/time",
+    "/api/v3/openOrders",
+    "/api/v3/myTrades",
+    SPOT_NONE,
+    SPOT_NONE,
+    SPOT_NONE,
+    SPOT_NONE,
+    SPOT_NONE,
+    "/api/v3/ticker/price",
 ];
 
 /// `GET /sapi/v1/account/apiRestrictions` (signed).
@@ -158,16 +189,18 @@ pub const S_TIME: usize = 2;
 /// The sapi templates.
 pub const SAPI_TEMPLATES: usize = 3;
 
-/// The futures jobs connection's templates for `product` (`PRODUCT_COINM`:
-/// dapi; otherwise fapi) — in Portfolio Margin (`pm`), the product's papi
-/// paths — every one carrying the key header.
+/// A lane's jobs connection's templates for `product` (`PRODUCT_COINM`:
+/// dapi; `PRODUCT_SPOT`: spot's, BX8; otherwise fapi) — in Portfolio
+/// Margin (`pm`), the futures product's papi paths — every one carrying
+/// the key header.
 #[must_use]
-pub fn fut_specs<'a>(product: u8, pm: bool, key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; FUT_TEMPLATES] {
-    let p = match (pm, product == PRODUCT_COINM) {
-        (false, false) => &FAPI_PATHS,
-        (false, true) => &DAPI_PATHS,
-        (true, false) => &PAPI_UM_PATHS,
-        (true, true) => &PAPI_CM_PATHS,
+pub fn lane_specs<'a>(product: u8, pm: bool, key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; LANE_TEMPLATES] {
+    let p = match (pm, product) {
+        (_, PRODUCT_SPOT) => &SPOT_PATHS,
+        (false, PRODUCT_COINM) => &DAPI_PATHS,
+        (false, _) => &FAPI_PATHS,
+        (true, PRODUCT_COINM) => &PAPI_CM_PATHS,
+        (true, _) => &PAPI_UM_PATHS,
     };
     let q = |method, t: usize| ReqSpec {
         method,
@@ -193,6 +226,7 @@ pub fn fut_specs<'a>(product: u8, pm: bool, key: &'a [(&'a str, &'a str)]) -> [R
         q(Method::Get, T_MULTI_ASSETS),
         q(Method::Get, T_ACCOUNT),
         q(Method::Get, T_SYMBOL_CONFIG),
+        q(Method::Get, T_PRICE),
     ]
 }
 
@@ -269,7 +303,7 @@ pub const SETUP_TEMPLATES: usize = 5;
 /// The account tool's templates for `product` (`PRODUCT_COINM`: dapi;
 /// otherwise fapi), every one carrying the key header. COIN-M names no
 /// multi-assets or agreement endpoint: those two slots are never started
-/// there (as [`fut_specs`]' unused ones).
+/// there (as [`lane_specs`]' unused ones).
 #[must_use]
 pub fn setup_specs<'a>(product: u8, key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; SETUP_TEMPLATES] {
     let p: [&'a str; SETUP_TEMPLATES] = if product == PRODUCT_COINM {
@@ -645,7 +679,7 @@ pub fn scan_server_time(body: &[u8]) -> Result<u64, ScanErr> {
 /// nesting cap (16) then applies to each value the walk passes, not to the
 /// body — nothing these readers read lies that deep.
 #[inline]
-fn ends_whole(body: &[u8], end: Option<usize>) -> bool {
+pub(crate) fn ends_whole(body: &[u8], end: Option<usize>) -> bool {
     end.is_some_and(|z| core_parse::skip_ws(body, z) == body.len())
 }
 
@@ -911,13 +945,35 @@ pub struct TradeRow {
     pub qty_1e6: i64,
     /// `time` ms.
     pub time_ms: u64,
+    /// `commission` ×1e9 (BX8: a spot trade's, paid once when no report
+    /// carried it).
+    pub commission_1e9: i64,
     /// `symbol`.
     pub symbol: Span,
     /// `Side` as its `u8`.
     pub side: u8,
     /// `maker`.
     pub maker: u8,
-    _r: [u8; 6],
+    /// `commissionAsset`'s span, packed (BX8: the row stays 64 B, copied
+    /// by value — [`Self::fee_asset`]).
+    fee_len: u16,
+    fee_at: u32,
+}
+
+// 64 B: the order's-trades read copies a row by value (BX8; CLAUDE.md's
+// ≤ 64 B POD law).
+const _: () = assert!(core::mem::size_of::<TradeRow>() == 64);
+
+impl TradeRow {
+    /// `commissionAsset` (empty when absent).
+    #[inline(always)]
+    #[must_use]
+    pub const fn fee_asset(&self) -> Span {
+        Span {
+            at: self.fee_at,
+            len: self.fee_len as u32,
+        }
+    }
 }
 
 const R_OID: u32 = 1 << 0;
@@ -927,6 +983,9 @@ const R_QTY: u32 = 1 << 3;
 const R_TIME: u32 = 1 << 4;
 const R_SIDE: u32 = 1 << 5;
 const R_SYM: u32 = 1 << 6;
+const R_MAKER: u32 = 1 << 7;
+const R_FEE: u32 = 1 << 8;
+const R_FEE_ASSET: u32 = 1 << 9;
 const R_NEED: u32 = R_OID | R_ID | R_PX | R_QTY | R_TIME | R_SIDE | R_SYM;
 
 /// An array of trades into `out`; the count (fail closed, as
@@ -943,45 +1002,125 @@ pub fn scan_trades(body: &[u8], out: &mut [TradeRow]) -> Result<usize, ArrErr> {
         let mut w = Pairs::new(body, a).map_err(malformed)?;
         let mut have = 0u32;
         while let Some((k, va, vz)) = w.next().map_err(malformed)? {
-            match k {
+            let bit = match k {
                 b"orderId" => {
                     r.venue_oid = u64_of(body, va, vz).map_err(bad)?;
-                    have |= R_OID;
+                    R_OID
                 }
                 b"id" => {
                     r.trade_id = u64_of(body, va, vz).map_err(bad)?;
-                    have |= R_ID;
+                    R_ID
                 }
+                // A trade of nothing, or at no price, is no trade (BX8, the
+                // parser review: a day would subtract it).
                 b"price" => {
                     r.px_1e6 = dec_1e6(body, va, vz).map_err(bad)?;
-                    have |= R_PX;
+                    if r.px_1e6 <= 0 {
+                        return Err(ArrErr::Scan(ScanErr::BadField));
+                    }
+                    R_PX
                 }
                 b"qty" => {
                     r.qty_1e6 = dec_1e6(body, va, vz).map_err(bad)?;
-                    have |= R_QTY;
+                    if r.qty_1e6 <= 0 {
+                        return Err(ArrErr::Scan(ScanErr::BadField));
+                    }
+                    R_QTY
                 }
                 b"time" => {
                     r.time_ms = u64_of(body, va, vz).map_err(bad)?;
-                    have |= R_TIME;
+                    R_TIME
                 }
                 b"side" => {
                     r.side = side_of(str_of(body, va, vz).map_err(bad)?)?;
-                    have |= R_SIDE;
+                    R_SIDE
+                }
+                // Spot's `myTrades` (BX8) names the buyer, not the side —
+                // one of the two, read once.
+                b"isBuyer" => {
+                    r.side = if bool_of(body, va, vz).map_err(bad)? { core_types::Side::Bid as u8 } else { core_types::Side::Ask as u8 };
+                    R_SIDE
                 }
                 b"symbol" => {
                     r.symbol = Span::of(body, str_of(body, va, vz).map_err(bad)?);
-                    have |= R_SYM;
+                    R_SYM
                 }
-                b"maker" => r.maker = bool_of(body, va, vz).map_err(bad)? as u8,
-                _ => {}
+                b"maker" | b"isMaker" => {
+                    r.maker = bool_of(body, va, vz).map_err(bad)? as u8;
+                    R_MAKER
+                }
+                b"commission" => {
+                    r.commission_1e9 = dec_1e9(body, va, vz).map_err(bad)?;
+                    R_FEE
+                }
+                b"commissionAsset" => {
+                    let s = Span::of(body, str_of(body, va, vz).map_err(bad)?);
+                    r.fee_at = s.at;
+                    r.fee_len = u16::try_from(s.len).map_err(|_| ArrErr::Scan(ScanErr::BadField))?;
+                    R_FEE_ASSET
+                }
+                _ => 0,
+            };
+            // A key read twice (BX8, as `scan_orders`' BX7b law): which
+            // copy would hold? Refused.
+            if have & bit != 0 {
+                return Err(ArrErr::Scan(ScanErr::Malformed));
             }
+            have |= bit;
         }
         if have & R_NEED != R_NEED {
             return Err(ArrErr::Scan(ScanErr::Missing));
         }
+        // A commission and its asset come together (BX8, the parser
+        // review's P2-3): one without the other would read a defaulted
+        // figure — a fee of 0 marked paid on the trade-id ring.
+        if (have & R_FEE == 0) != (have & R_FEE_ASSET == 0) {
+            return Err(ArrErr::Scan(ScanErr::Missing));
+        }
         n += 1;
     }
+    if !ends_whole(body, e.end()) {
+        return Err(ArrErr::Scan(ScanErr::Malformed));
+    }
     Ok(n)
+}
+
+/// **A spot symbol's price** (BX8: `GET /api/v3/ticker/price?symbol=…`,
+/// `{"symbol":…,"price":…}`) ×1e6 — the price a balance the boot adopts is
+/// valued at. Fail closed: one object read whole, its `symbol` `symbol`
+/// (another's price would value the balance wrongly) and its `price` each
+/// once, the price above zero.
+pub fn scan_ticker_price(body: &[u8], symbol: &[u8]) -> Result<i64, ScanErr> {
+    let mut w = Pairs::new(body, 0).map_err(malformed)?;
+    let (mut px, mut named) = (None, false);
+    while let Some((k, a, z)) = w.next().map_err(malformed)? {
+        match k {
+            b"price" => {
+                if px.is_some() {
+                    return Err(ScanErr::Malformed);
+                }
+                px = Some(dec_1e6(body, a, z).map_err(bad)?);
+            }
+            b"symbol" => {
+                if named {
+                    return Err(ScanErr::Malformed);
+                }
+                named = true;
+                if str_of(body, a, z).map_err(bad)? != symbol {
+                    return Err(ScanErr::BadField);
+                }
+            }
+            _ => {}
+        }
+    }
+    if !ends_whole(body, w.end()) {
+        return Err(ScanErr::Malformed);
+    }
+    match (px, named) {
+        (Some(p), true) if p > 0 => Ok(p),
+        (Some(_), true) => Err(ScanErr::BadField),
+        _ => Err(ScanErr::Missing),
+    }
 }
 
 #[cfg(test)]
@@ -1013,17 +1152,17 @@ mod tests {
                 assert!(matches!(o[t].params, Params::Body(FORM)), "template {t}");
             }
             assert!(matches!(o[R_STATUS].params, Params::Query), "a read stays a query");
-            assert!(matches!(fut_specs(product, pm, &key)[T_CANCEL_ALL].params, Params::Body(FORM)));
+            assert!(matches!(lane_specs(product, pm, &key)[T_CANCEL_ALL].params, Params::Body(FORM)));
         }
     }
 
     #[test]
     fn each_product_has_its_own_paths_by_the_same_template() {
         let key = [(KEY_HEADER, "k")];
-        let um = fut_specs(crate::inst::PRODUCT_USDM, false, &key);
-        let cm = fut_specs(PRODUCT_COINM, false, &key);
+        let um = lane_specs(crate::inst::PRODUCT_USDM, false, &key);
+        let cm = lane_specs(PRODUCT_COINM, false, &key);
         let mut t = 0;
-        while t < FUT_TEMPLATES {
+        while t < LANE_TEMPLATES {
             assert!(um[t].path.starts_with("/fapi/v"), "{}", um[t].path);
             assert!(cm[t].path.starts_with("/dapi/v1/"), "{}", cm[t].path);
             if t != T_ACCOUNT {
@@ -1037,13 +1176,13 @@ mod tests {
         assert_eq!((cm[R_PLACE].path, cm[R_ACCOUNT].path), ("/dapi/v1/order", "/dapi/v1/account"));
         // Portfolio Margin (BX7, C2): each product's papi paths; one
         // listenKey and one unified account for both.
-        let (pu, pc) = (fut_specs(crate::inst::PRODUCT_USDM, true, &key), fut_specs(PRODUCT_COINM, true, &key));
+        let (pu, pc) = (lane_specs(crate::inst::PRODUCT_USDM, true, &key), lane_specs(PRODUCT_COINM, true, &key));
         assert_eq!((pu[T_OPEN_ORDERS].path, pc[T_OPEN_ORDERS].path), ("/papi/v1/um/openOrders", "/papi/v1/cm/openOrders"));
         assert_eq!((pu[T_USER_TRADES].path, pc[T_DUAL].path), ("/papi/v1/um/userTrades", "/papi/v1/cm/positionSide/dual"));
         assert_eq!((pu[T_LISTEN_KEY_NEW].path, pc[T_LISTEN_KEY_NEW].path), ("/papi/v1/listenKey", "/papi/v1/listenKey"));
         assert_eq!((pu[T_ACCOUNT].path, pc[T_ACCOUNT].path), ("/papi/v1/account", "/papi/v1/account"));
         // BX7 (BX-19): the margin type is USDⓈ-M's to ask; papi never.
-        let um = fut_specs(crate::inst::PRODUCT_USDM, false, &key);
+        let um = lane_specs(crate::inst::PRODUCT_USDM, false, &key);
         assert_eq!((um[T_SYMBOL_CONFIG].path, um[T_SYMBOL_CONFIG].method), ("/fapi/v1/symbolConfig", Method::Get));
         assert_eq!((pu[T_SYMBOL_CONFIG].path, pc[T_SYMBOL_CONFIG].path), (PAPI_NONE, PAPI_NONE));
         let (pu, pc) = (ord_specs(crate::inst::PRODUCT_USDM, true, &key), ord_specs(PRODUCT_COINM, true, &key));
@@ -1270,6 +1409,68 @@ mod tests {
         assert_eq!(scan_trades(body, &mut out), Ok(1));
         assert_eq!((out[0].trade_id, out[0].venue_oid, out[0].px_1e6, out[0].qty_1e6), (698_759, 25_851_813, 7_819_010_000, 2_000));
         assert_eq!(out[0].symbol.get(body), b"BTCUSDT");
+        // BX8: spot's `myTrades` names the buyer and the maker, not the side.
+        let spot = br#"[{"symbol":"BTCUSDT","id":28457,"orderId":100234,"orderListId":-1,"price":"65000.00000000","qty":"0.00100000","quoteQty":"65.00000000","commission":"0.00000100","commissionAsset":"BTC","time":1790000000100,"isBuyer":true,"isMaker":false,"isBestMatch":true}]"#;
+        assert_eq!(scan_trades(spot, &mut out), Ok(1));
+        assert_eq!((out[0].side, out[0].maker, out[0].qty_1e6, out[0].time_ms), (core_types::Side::Bid as u8, 0, 1_000, 1_790_000_000_100));
+        assert_eq!((out[0].commission_1e9, out[0].fee_asset().get(spot)), (1_000, &b"BTC"[..]), "0.00000100 BTC ×1e9");
+        for bad in [r#""qty":"0.00000000""#, r#""qty":"-0.00100000""#, r#""price":"0.00000000""#] {
+            let what = if bad.contains("qty") { r#""qty":"0.00100000""# } else { r#""price":"65000.00000000""# };
+            let b = String::from_utf8(spot.to_vec()).unwrap().replace(what, bad);
+            assert_eq!(scan_trades(b.as_bytes(), &mut out), Err(ArrErr::Scan(ScanErr::BadField)), "{bad}");
+        }
+        for (what, gone) in [("a commission without its asset", r#""commissionAsset":"BTC","#), ("an asset without its commission", r#""commission":"0.00000100","#)] {
+            let b = String::from_utf8(spot.to_vec()).unwrap().replace(gone, "");
+            assert_eq!(scan_trades(b.as_bytes(), &mut out), Err(ArrErr::Scan(ScanErr::Missing)), "{what}");
+        }
+        let sell = String::from_utf8(spot.to_vec()).unwrap().replace(r#""isBuyer":true"#, r#""isBuyer":false"#);
+        assert_eq!(scan_trades(sell.as_bytes(), &mut out), Ok(1));
+        assert_eq!(out[0].side, core_types::Side::Ask as u8);
+        // One reading (BX8, as `scan_orders`): a side named twice — either
+        // spelling — or any key twice is refused; so are bytes after the
+        // array.
+        for bad in [
+            String::from_utf8(spot.to_vec()).unwrap().replace(r#""isBuyer":true"#, r#""isBuyer":true,"side":"SELL""#),
+            String::from_utf8(spot.to_vec()).unwrap().replace(r#""id":28457"#, r#""id":28457,"id":1"#),
+            String::from_utf8(spot.to_vec()).unwrap().replace(r#""isMaker":false"#, r#""isMaker":false,"isMaker":true"#),
+            String::from_utf8(spot.to_vec()).unwrap() + "]",
+        ] {
+            assert!(scan_trades(bad.as_bytes(), &mut out).is_err(), "{bad}");
+        }
+    }
+
+    /// BX8: a spot symbol's price, one object read whole, above zero.
+    #[test]
+    fn a_ticker_price() {
+        let s = b"BTCUSDT";
+        assert_eq!(scan_ticker_price(br#"{"symbol":"BTCUSDT","price":"65000.01000000"}"#, s), Ok(65_000_010_000));
+        assert_eq!(scan_ticker_price(br#"{"symbol":"BTCUSDT","price":"0.00000000"}"#, s), Err(ScanErr::BadField));
+        assert_eq!(scan_ticker_price(br#"{"symbol":"BTCUSDT"}"#, s), Err(ScanErr::Missing));
+        assert_eq!(scan_ticker_price(br#"{"symbol":"ETHUSDT","price":"3000.00"}"#, s), Err(ScanErr::BadField), "another's price");
+        assert_eq!(scan_ticker_price(br#"{"price":"3000.00"}"#, s), Err(ScanErr::Missing), "no symbol");
+        assert_eq!(scan_ticker_price(br#"{"symbol":"BTCUSDT","symbol":"BTCUSDT","price":"1"}"#, s), Err(ScanErr::Malformed));
+        assert_eq!(scan_ticker_price(br#"{"symbol":"BTCUSDT","price":"1","price":"2"}"#, s), Err(ScanErr::Malformed));
+        assert_eq!(scan_ticker_price(br#"{"symbol":"BTCUSDT","price":"1"} x"#, s), Err(ScanErr::Malformed));
+        assert_eq!(scan_ticker_price(br#"[{"price":"1"}]"#, s), Err(ScanErr::Malformed));
+    }
+
+    /// BX8: spot's lane speaks `api/v3`; every slot it has no endpoint for
+    /// names the ping, and the futures name none for the price.
+    #[test]
+    fn the_lanes_templates_by_product() {
+        let key = [(KEY_HEADER, "k")];
+        let s = lane_specs(PRODUCT_SPOT, false, &key);
+        assert_eq!(
+            (s[T_TIME].path, s[T_OPEN_ORDERS].path, s[T_USER_TRADES].path, s[T_PRICE].path),
+            ("/api/v3/time", "/api/v3/openOrders", "/api/v3/myTrades", "/api/v3/ticker/price")
+        );
+        for t in [T_LISTEN_KEY_NEW, T_LISTEN_KEY_KEEP, T_COUNTDOWN, T_CANCEL_ALL, T_DUAL, T_MULTI_ASSETS, T_ACCOUNT, T_SYMBOL_CONFIG] {
+            assert_eq!(s[t].path, SPOT_NONE, "spot has no {t}");
+        }
+        assert_eq!(lane_specs(PRODUCT_SPOT, true, &key)[T_TIME].path, "/api/v3/time", "spot is never papi's");
+        assert_eq!(lane_specs(crate::inst::PRODUCT_USDM, false, &key)[T_PRICE].path, "/fapi/v1/ping");
+        assert_eq!(lane_specs(PRODUCT_COINM, false, &key)[T_PRICE].path, "/dapi/v1/ping");
+        assert_eq!(lane_specs(crate::inst::PRODUCT_USDM, true, &key)[T_PRICE].path, PAPI_NONE);
     }
 
     proptest! {
@@ -1278,6 +1479,7 @@ mod tests {
             let _ = scan_error(&bytes);
             if let Ok(s) = scan_listen_key(&bytes) { let _ = s.get(&bytes); }
             let _ = scan_server_time(&bytes);
+            let _ = scan_ticker_price(&bytes, b"BTCUSDT");
             let _ = scan_countdown(&bytes);
             let _ = scan_touch(&bytes, b"BTCUSDT");
             let _ = scan_mark(&bytes, b"BTCUSDT");
@@ -1287,6 +1489,28 @@ mod tests {
             }
             let mut t = [TradeRow::default(); 8];
             let _ = scan_trades(&bytes, &mut t);
+        }
+
+        /// BX8 (the parser review's P2-6e): a spot `myTrades` row read back
+        /// whole — the buyer as the side, the maker, the commission ×1e9 and
+        /// its asset, the ids and figures.
+        #[test]
+        fn a_spot_trade_row_round_trips(id in 0u64..1_000_000_000_000_000_000, oid in any::<u32>(), px in 1i64..1_000_000_000, qty in 1i64..100_000_000_000, fee in 0i64..1_000_000_000, buyer in any::<bool>(), maker in any::<bool>()) {
+            let d8 = |v: i64, scale: i64| std::format!("{}.{:08}", v / scale, (v % scale) * (100_000_000 / scale));
+            let body = std::format!(
+                r#"[{{"symbol":"BTCUSDT","id":{id},"orderId":{oid},"orderListId":-1,"price":"{p}","qty":"{q}","quoteQty":"1.00000000","commission":"{n}","commissionAsset":"BNB","time":1790000000100,"isBuyer":{buyer},"isMaker":{maker},"isBestMatch":true}}]"#,
+                p = d8(px * 10_000, 1_000_000),
+                q = d8(qty, 1_000_000),
+                n = d8(fee, 100_000_000),
+            );
+            let mut out = [TradeRow::default(); 1];
+            prop_assert_eq!(scan_trades(body.as_bytes(), &mut out), Ok(1));
+            let r = out[0];
+            prop_assert_eq!((r.trade_id, r.venue_oid, r.px_1e6, r.qty_1e6), (id, u64::from(oid), px * 10_000, qty));
+            let side = if buyer { core_types::Side::Bid as u8 } else { core_types::Side::Ask as u8 };
+            prop_assert_eq!((r.side, r.maker, r.time_ms), (side, maker as u8, 1_790_000_000_100));
+            prop_assert_eq!((r.commission_1e9, r.fee_asset().get(body.as_bytes())), (fee * 10, &b"BNB"[..]));
+            prop_assert_eq!(r.symbol.get(body.as_bytes()), &b"BTCUSDT"[..]);
         }
     }
 }
