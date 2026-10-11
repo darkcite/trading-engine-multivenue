@@ -19,6 +19,13 @@
 //! only — the WS API's `session.logon` takes Ed25519 keys only — so an
 //! HMAC arm orders over the REST route.
 //!
+//! **Options (BX9, ruling Q-1)** sign with an HMAC key whatever the arm's
+//! own key: eapi refused the Ed25519 Demo key itself (`-2015`, even on an
+//! unsigned request — the K-probe, 2026-10-10). The scope's HMAC variables
+//! above are read for the options lane alone
+//! ([`BnConfig::with_options_hmac_env`]); an arm whose own key is HMAC
+//! signs options with it.
+//!
 //! The seed and the HMAC secret live in `core_config::SecretKeyBytes`
 //! (mlock'd, zeroized on drop) for the life of the process (BX4 departure
 //! 2); the signer is built ONCE, after its known-answer self-test passes
@@ -90,7 +97,9 @@ impl Scope {
 pub enum Network {
     /// `*.binance.com` (not `demo-*`), `*.binance.vision` is NOT mainnet.
     Mainnet,
-    /// `demo-*.binance.com` and the futures testnet host.
+    /// `demo-*.binance.com` and the futures testnet's hosts
+    /// (`*.binancefuture.com` — BX9: options' Demo REST is
+    /// `testnet.binancefuture.com`, its streams the testnet's).
     Demo,
     /// `localhost` / `127.0.0.1` — tests only.
     Loopback,
@@ -104,8 +113,15 @@ pub fn network_of(host: &str) -> Network {
     if host == "localhost" || host == "127.0.0.1" {
         return Network::Loopback;
     }
-    if host == "testnet.binancefuture.com" {
-        return Network::Demo;
+    // BX9: the futures testnet's whole domain is Demo's (options' Demo
+    // lives there: its REST on `testnet.`, its streams on the testnet's
+    // stream hosts).
+    if let Some(stem) = host.strip_suffix(".binancefuture.com") {
+        return if !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+            Network::Demo
+        } else {
+            Network::Unknown
+        };
     }
     let Some(stem) = host.strip_suffix(".binance.com") else {
         return Network::Unknown;
@@ -177,6 +193,13 @@ pub struct Hosts {
     pub spot_wsapi: String,
     /// Its path.
     pub spot_wsapi_path: String,
+    /// The options REST host (BX9: every order verb, read and listenKey —
+    /// options have no WS API): `eapi.binance.com`.
+    pub eapi: String,
+    /// The options user-stream host (BX9): `/private/ws/<listenKey>` on
+    /// `fstream.binance.com` — on Demo the testnet's `fstream.binancefuture.com`
+    /// (the K-probe: Demo's `demo-fstream` opens and carries nothing).
+    pub opt_user: String,
 }
 
 /// One futures product's hosts: a gateway lane's (BX7, M3).
@@ -212,6 +235,8 @@ impl Hosts {
                 sapi: s("api.binance.com"),
                 spot_wsapi: s("ws-api.binance.com"),
                 spot_wsapi_path: s("/ws-api/v3"),
+                eapi: s("eapi.binance.com"),
+                opt_user: s("fstream.binance.com"),
             },
             Scope::Demo => Self {
                 fut_wsapi: s("testnet.binancefuture.com"),
@@ -229,6 +254,12 @@ impl Hosts {
                 // BX8: the spot Demo's documented WS API (demo-mode docs).
                 spot_wsapi: s("demo-ws-api.binance.com"),
                 spot_wsapi_path: s("/ws-api/v3"),
+                // BX9 (the K-probe, 2026-10-10): options' Demo REST is the
+                // futures testnet's host — `demo-fapi` answers 403 to every
+                // `/eapi/` path, keyed or not, though the options
+                // general-info page names it; the order pages name this one.
+                eapi: s("testnet.binancefuture.com"),
+                opt_user: s("fstream.binancefuture.com"),
             },
         }
     }
@@ -236,10 +267,20 @@ impl Hosts {
     /// The hosts of product `product`'s lane (`PRODUCT_COINM`: dapi;
     /// `PRODUCT_SPOT`: the spot WS API and REST — its user data rides the
     /// order session, so the lane's stream socket names the WS API host and
-    /// is never dialled (BX8); otherwise fapi).
+    /// is never dialled (BX8); `PRODUCT_OPTIONS`: eapi's REST — options have
+    /// no WS API, so the pair names the REST host and is never dialled —
+    /// and the options stream host, whose `/private/ws/` path carries
+    /// options' user data (BX9); otherwise fapi).
     #[must_use]
     pub fn lane(&self, product: u8) -> LaneHosts<'_> {
-        if product == crate::inst::PRODUCT_SPOT {
+        if product == crate::inst::PRODUCT_OPTIONS {
+            LaneHosts {
+                wsapi: &self.eapi,
+                wsapi_path: "/ws",
+                user: &self.opt_user,
+                rest: &self.eapi,
+            }
+        } else if product == crate::inst::PRODUCT_SPOT {
             LaneHosts {
                 wsapi: &self.spot_wsapi,
                 wsapi_path: &self.spot_wsapi_path,
@@ -276,7 +317,7 @@ impl Hosts {
         }
     }
 
-    fn all(&self) -> [&str; 9] {
+    fn all(&self) -> [&str; 11] {
         [
             &self.fut_wsapi,
             &self.fut_user,
@@ -287,6 +328,8 @@ impl Hosts {
             &self.papi,
             &self.sapi,
             &self.spot_wsapi,
+            &self.eapi,
+            &self.opt_user,
         ]
     }
 }
@@ -523,14 +566,22 @@ enum Key {
     Hmac(HmacSigner),
 }
 
+/// BX9 (Q-1): the options lane's own key — an HMAC pair.
+struct OptKey {
+    api_key: String,
+    h: HmacSigner,
+}
+
 /// The arm's venue configuration: hosts, the API key and its key
-/// material (the Ed25519 seed, or the HMAC secret).
+/// material (the Ed25519 seed, or the HMAC secret) — and, for options, an
+/// HMAC pair of their own (BX9, Q-1).
 pub struct BnConfig {
     scope: Scope,
     hosts: Hosts,
     api_key: String,
     key: Key,
     port: u16,
+    opt: Option<OptKey>,
 }
 
 impl core::fmt::Debug for BnConfig {
@@ -542,6 +593,7 @@ impl core::fmt::Debug for BnConfig {
             .field("key", &"<redacted>")
             .field("signing", &self.signing())
             .field("port", &self.port)
+            .field("options_key", &self.opt.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -610,7 +662,75 @@ impl BnConfig {
             api_key,
             key,
             port: HTTPS_PORT,
+            opt: None,
         })
+    }
+
+    /// **BX9 (Q-1) — the options lane's HMAC key**, from the scope's HMAC
+    /// variables (R22's: `BINANCE_HMAC_API_KEY` / `BINANCE_HMAC_SECRET_KEY`,
+    /// Demo's `BINANCE_DEMO_HMAC_…`). Read only where options are armed.
+    ///
+    /// # Errors
+    /// A variable missing or malformed (its NAME, never its value).
+    pub fn with_options_hmac_env(self) -> Result<Self, ConfigErr> {
+        let (key_var, secret_var) = self.scope.hmac_vars();
+        let api_key = match std::env::var(key_var) {
+            Ok(v) if !v.is_empty() => v,
+            _ => return Err(ConfigErr::Missing(key_var)),
+        };
+        let h = HmacSigner::from_env(secret_var)?;
+        self.with_options_hmac(api_key, h)
+    }
+
+    /// [`BnConfig::with_options_hmac_env`] from parts (the battery, tests).
+    ///
+    /// # Errors
+    /// The API key is malformed.
+    pub fn with_options_hmac(mut self, api_key: String, h: HmacSigner) -> Result<Self, ConfigErr> {
+        if !valid_api_key(&api_key) {
+            return Err(ConfigErr::BadApiKey);
+        }
+        self.opt = Some(OptKey { api_key, h });
+        Ok(self)
+    }
+
+    /// **The options lane's key** (BX9, Q-1): its own HMAC pair — or, none
+    /// given, the arm's key when it is HMAC; `None` when the arm's key is
+    /// Ed25519 and no options pair was read (an options arm then refuses
+    /// the boot: eapi takes no Ed25519 key).
+    #[must_use]
+    pub fn opt_api_key(&self) -> Option<&str> {
+        match (&self.opt, &self.key) {
+            (Some(o), _) => Some(&o.api_key),
+            (None, Key::Hmac(_)) => Some(&self.api_key),
+            (None, Key::Ed25519(_)) => None,
+        }
+    }
+
+    /// The options lane's HMAC key ([`Self::opt_api_key`]'s), borrowed
+    /// where the configuration holds it — a cold read signs with it and
+    /// copies no secret (BX9, R2); `None` when there is none.
+    #[must_use]
+    pub fn opt_hmac(&self) -> Option<&HmacSigner> {
+        match (&self.opt, &self.key) {
+            (Some(o), _) => Some(&o.h),
+            (None, Key::Hmac(h)) => Some(h),
+            (None, Key::Ed25519(_)) => None,
+        }
+    }
+
+    /// The options lane's signer — the gateway's own copy of
+    /// [`Self::opt_hmac`] — after the HMAC self-test; `Ok(None)` when
+    /// there is none.
+    ///
+    /// # Errors
+    /// The self-test failed, or the secret could not be locked again.
+    pub fn opt_signer(&self) -> Result<Option<Signer>, ConfigErr> {
+        let Some(h) = self.opt_hmac() else {
+            return Ok(None);
+        };
+        hmac_self_test()?;
+        Ok(Some(Signer::Hmac(h.duplicate()?)))
     }
 
     /// **TEST-ONLY (feature `loopback`)**: every host `localhost` on `port`.
@@ -645,6 +765,8 @@ impl BnConfig {
             sapi: l("localhost"),
             spot_wsapi: l("localhost"),
             spot_wsapi_path: l("/ws-api/v3"),
+            eapi: l("localhost"),
+            opt_user: l("localhost"),
         };
         if port == HTTPS_PORT {
             return Err(ConfigErr::LoopbackOnRealHost);
@@ -655,6 +777,7 @@ impl BnConfig {
             api_key,
             key,
             port,
+            opt: None,
         })
     }
 
@@ -739,6 +862,11 @@ mod tests {
         assert_eq!(network_of("ws-fapi.binance.com"), Network::Mainnet);
         assert_eq!(network_of("demo-fapi.binance.com"), Network::Demo);
         assert_eq!(network_of("testnet.binancefuture.com"), Network::Demo);
+        assert_eq!(network_of("fstream.binancefuture.com"), Network::Demo);
+        assert_eq!(network_of("binancefuture.com"), Network::Unknown);
+        assert_eq!(network_of(".binancefuture.com"), Network::Unknown);
+        assert_eq!(network_of("a.b.binancefuture.com"), Network::Unknown);
+        assert_eq!(network_of("evil.binancefuture.com.example"), Network::Unknown);
         assert_eq!(network_of("localhost"), Network::Loopback);
         assert_eq!(network_of("binance.com"), Network::Unknown);
         assert_eq!(network_of("evil.binance.com.example"), Network::Unknown);
@@ -768,6 +896,16 @@ mod tests {
         assert_eq!((cm.wsapi, cm.wsapi_path, cm.user, cm.rest), ("ws-dapi.binance.com", "/ws-dapi/v1", "dstream.binance.com", "dapi.binance.com"));
         let um = h.lane(crate::inst::PRODUCT_USDM);
         assert_eq!((um.wsapi, um.wsapi_path, um.user, um.rest), ("ws-fapi.binance.com", "/ws-fapi/v1", "fstream.binance.com", "fapi.binance.com"));
+        // BX9: options — eapi's REST (the pair names it, never dialled) and
+        // fstream's `/private/ws/` stream; Demo's eapi is the testnet host.
+        let op = h.lane(crate::inst::PRODUCT_OPTIONS);
+        assert_eq!((op.wsapi, op.user, op.rest), ("eapi.binance.com", "fstream.binance.com", "eapi.binance.com"));
+        let d = Hosts::of(Scope::Demo);
+        let dop = d.lane(crate::inst::PRODUCT_OPTIONS);
+        assert_eq!((dop.user, dop.rest), ("fstream.binancefuture.com", "testnet.binancefuture.com"));
+        let mut mixed = Hosts::of(Scope::Live);
+        mixed.eapi = String::from("testnet.binancefuture.com");
+        assert!(matches!(BnConfig::new(Scope::Live, mixed, KEY.into(), seed()), Err(ConfigErr::WrongNetwork)));
         // Portfolio Margin (BX7): papi's REST, fstream's `/pm/ws/` stream.
         let pm = h.pm_lane();
         assert_eq!((pm.user, pm.rest), ("fstream.binance.com", "papi.binance.com"));
@@ -836,6 +974,28 @@ mod tests {
     /// R22: a secret that is not 64 letters and digits is refused, by its
     /// variable's NAME only; an HMAC configuration's signer is HMAC and
     /// carries no Ed25519 (so it can never log on).
+    /// BX9 (Q-1): an Ed25519 arm has no options key until a pair is read;
+    /// an HMAC arm signs options with its own; a pair read wins — and is
+    /// never printed.
+    #[test]
+    fn options_sign_with_an_hmac_key() {
+        let ed = BnConfig::new(Scope::Demo, Hosts::of(Scope::Demo), KEY.into(), seed()).unwrap();
+        assert_eq!(ed.opt_api_key(), None);
+        assert!(ed.opt_signer().unwrap().is_none());
+        const OPT_KEY: &str = "OptionsKey0123456789abcdefABCDEF";
+        let ed = ed.with_options_hmac(OPT_KEY.into(), HmacSigner::from_secret(SECRET).unwrap()).unwrap();
+        assert_eq!(ed.opt_api_key(), Some(OPT_KEY));
+        assert_eq!(ed.opt_signer().unwrap().map(|s| s.signing()), Some(Signing::Hmac));
+        assert_eq!(ed.signing(), Signing::Ed25519, "the arm's own key is unchanged");
+        let d = format!("{ed:?}");
+        assert!(!d.contains(OPT_KEY) && !d.contains("NhqPtmdSJYdKjVHjA7PZj4"));
+        let hm = BnConfig::new_hmac(Scope::Demo, Hosts::of(Scope::Demo), KEY.into(), HmacSigner::from_secret(SECRET).unwrap()).unwrap();
+        assert_eq!(hm.opt_api_key(), Some(KEY));
+        assert_eq!(hm.opt_signer().unwrap().map(|s| s.signing()), Some(Signing::Hmac));
+        let bad = BnConfig::new(Scope::Demo, Hosts::of(Scope::Demo), KEY.into(), seed()).unwrap();
+        assert!(matches!(bad.with_options_hmac(String::from("short"), HmacSigner::from_secret(SECRET).unwrap()), Err(ConfigErr::BadApiKey)));
+    }
+
     #[test]
     fn hmac_secrets_are_checked_and_never_printed() {
         let mut bad = SECRET;

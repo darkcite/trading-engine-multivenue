@@ -12,6 +12,7 @@
 //! |---|---|---|---|
 //! | ORDERS, USDⓈ-M + COIN-M (one pool since 2026-06-30) | account | 300 / 10 s, 1 200 / min | `orders_frac` of either |
 //! | ORDERS, spot (BX8): the unfilled-order count | account, every key and API | 100 / 10 s, 200 000 / UTC day; an order's first fill takes one off | `orders_frac` of either |
+//! | ORDERS, options (BX9; mainnet's `rateLimits`, read 2026-10-10) | account | 30 / 10 s, 100 / min | `orders_frac` of either |
 //! | UM quantitative rules (UFR · ICR · IFER · DR) | symbol, 10-minute cycle | ban at 0.99 (DR 0.9), recorded past 10 000 / 5 000 orders ÷ 1.2^(N−1) | `qtr_frac` of the ban ratio, once recorded |
 //! | open orders per symbol (`MAX_NUM_ORDERS`) | symbol | the row's filter | `orders_frac` of it |
 //! | breadth | account | < 50 symbols with positions or open orders | the slot's `max_symbols` |
@@ -22,7 +23,12 @@
 //! up one a place, down one an order that filled, never below zero, reset
 //! at 00:00Z; its 10 s window takes no fill off (it can only refuse
 //! earlier). The UM quantitative rules and the breadth are futures' alone.
-//! The other products' pools arrive with their phases.
+//! Binance Stocks' pool arrives with BX10.
+//!
+//! **Options' REQUEST_WEIGHT (BX9)** is eapi's own pool — 400 a minute per
+//! IP on mainnet (`rateLimits`, 2026-10-10; the docs' 2 400 is not the
+//! venue's) — so the gateway meters it in a window of its own, and the boot
+//! judges its steady load apart ([`opt_weight_per_min`]).
 //!
 //! **Venue codes** ([`classify`]): `-1015` / 429 / `-1003` are a budget
 //! observation; 418 / `-4400`…`-4402` a venue lock; `-1021` / `-5028` a
@@ -115,6 +121,41 @@ impl FuturesOrders {
         Self {
             w10s: Window::new(300, 10_000, frac_1e6),
             w1m: Window::new(1_200, 60_000, frac_1e6),
+        }
+    }
+
+    /// Both windows admit.
+    #[inline(always)]
+    #[must_use]
+    pub fn admits(&self, now_ns: u64) -> bool {
+        self.w10s.admits(now_ns) & self.w1m.admits(now_ns)
+    }
+
+    /// Record one placement.
+    #[inline(always)]
+    pub fn commit(&mut self, now_ns: u64) {
+        self.w10s.commit(now_ns);
+        self.w1m.commit(now_ns);
+    }
+}
+
+/// **Options' ORDERS pool** (BX9): 30 / 10 s and 100 / min — mainnet's
+/// `rateLimits` (2026-10-10; Demo's are 300 and 6 000: the arm keeps
+/// mainnet's everywhere, the stricter).
+pub struct OptionOrders {
+    /// The 10-second window.
+    pub w10s: Window,
+    /// The 1-minute window.
+    pub w1m: Window,
+}
+
+impl OptionOrders {
+    /// The pool at `frac_1e6` of the venue's limits.
+    #[must_use]
+    pub fn new(frac_1e6: i64) -> Self {
+        Self {
+            w10s: Window::new(30, 10_000, frac_1e6),
+            w1m: Window::new(100, 60_000, frac_1e6),
         }
     }
 
@@ -380,6 +421,44 @@ pub const fn arm_weight_per_min(max_symbols: u64, heartbeat_ms: u64, recon_every
 /// The weight the arm may take: [`ARM_WEIGHT_SHARE_1E6`] of the IP's.
 pub const ARM_WEIGHT_MAX_PER_MIN: u64 = IP_WEIGHT_PER_MIN * ARM_WEIGHT_SHARE_1E6 / 1_000_000;
 
+/// **eapi's** REQUEST_WEIGHT per minute per IP (BX9; mainnet's
+/// `rateLimits`, 2026-10-10).
+pub const OPT_IP_WEIGHT_PER_MIN: u64 = 400;
+/// The options lane's share of it (as the futures': the rest is the
+/// worker's, the boot's and the operator's tools').
+pub const OPT_ARM_WEIGHT_MAX_PER_MIN: u64 = OPT_IP_WEIGHT_PER_MIN * ARM_WEIGHT_SHARE_1E6 / 1_000_000;
+/// An options cycle at its worst: `marginAccount` (3) + `position` (5) +
+/// `openOrders` with no symbol (40) + `exerciseRecord` (5, while an expired
+/// leg is settling).
+pub const W_OPT_RECON: u64 = 53;
+/// An options margin re-read: `marginAccount` alone.
+pub const W_OPT_ACCOUNT: u64 = 3;
+
+/// **The options lane's worst-case steady weight per minute on eapi**
+/// (BX9): a cycle every `recon_every_ms`, the margin re-reads at their
+/// fastest, and the clock when the lane is the arm's first (an
+/// options-only arm measures the time on eapi). No dead-man (IoC-only):
+/// nothing per row. Judged at boot against [`OPT_ARM_WEIGHT_MAX_PER_MIN`].
+#[must_use]
+pub const fn opt_weight_per_min(recon_every_ms: u64, clock: bool) -> u64 {
+    let re = if recon_every_ms == 0 { 1 } else { recon_every_ms };
+    W_OPT_RECON * 60_000 / re + W_OPT_ACCOUNT * 60_000 / ACCOUNT_REREAD_MS + (clock as u64) * W_CLOCK_PER_MIN
+}
+
+/// **The day read's pace on eapi** (BX9, the risk review's R6): the ns one
+/// option row's `userTrades` (weight 5) takes at worst — eapi's share less
+/// the whole cycle the gateway keeps in hand ([`W_OPT_RECON`]; its
+/// `opt_day_room`) and the lane's steady weight ([`opt_weight_per_min`]).
+/// `None`: that leaves the day read nothing (the boot could never end).
+#[must_use]
+pub const fn opt_day_row_ns(recon_every_ms: u64, clock: bool) -> Option<u64> {
+    let used = W_OPT_RECON + opt_weight_per_min(recon_every_ms, clock);
+    if used >= OPT_ARM_WEIGHT_MAX_PER_MIN {
+        return None;
+    }
+    Some(60_000_000_000 * request_weight(Weighed::UserTrades) as u64 / (OPT_ARM_WEIGHT_MAX_PER_MIN - used))
+}
+
 /// Past this percent of [`ARM_WEIGHT_MAX_PER_MIN`] spent in the last
 /// minute the gateway is THROTTLED (an early reconciliation waits).
 pub const WEIGHT_THROTTLE_PCT: u64 = 80;
@@ -413,6 +492,10 @@ pub enum Weighed {
     Logon,
     /// Portfolio Margin's unified account, `GET /papi/v1/account` — 20.
     PmAccount,
+    /// BX9: options' `marginAccount` — 3.
+    OptAccount,
+    /// BX9: options' `position` and `exerciseRecord` — 5.
+    OptPosition,
 }
 
 /// [`Weighed`]'s weight.
@@ -429,6 +512,8 @@ pub const fn request_weight(w: Weighed) -> u32 {
         Weighed::Place => 0,
         Weighed::Logon => 2,
         Weighed::PmAccount => 20,
+        Weighed::OptAccount => 3,
+        Weighed::OptPosition => 5,
     }
 }
 
@@ -461,6 +546,10 @@ pub enum CodeClass {
     /// The instrument is closed to us for good this boot (the TradFi
     /// agreement, `-4411`).
     RowFatal = 6,
+    /// BX9 (BX-18): the account may not WRITE this option's underlying
+    /// (`-6057`: Long & Short mode off, or not eligible) — every row of the
+    /// underlying loses its writing; its longs still trade.
+    WriteFatal = 7,
 }
 
 /// Classify a refusal by its Binance `code` (0 if none) and HTTP status
@@ -478,6 +567,12 @@ pub const fn classify(code: i32, http: u16) -> CodeClass {
         -1007 => CodeClass::Unknown,
         -5022 => CodeClass::WouldTake,
         -4411 => CodeClass::RowFatal,
+        // BX9 — options: not eligible to write (the probes' and the docs'
+        // code). No other options code is sourced: an account the venue
+        // closed is read where it is documented — `marginAccount`'s
+        // `reduceOnly` / `canTrade`, `RISK_LEVEL_CHANGE` (a lock) — and any
+        // other refusal is an ordinary one (the risk review's R10).
+        -6057 => CodeClass::WriteFatal,
         _ => match http {
             418 => CodeClass::Lock,
             429 => CodeClass::Budget,
@@ -652,5 +747,48 @@ mod tests {
         assert_eq!(classify(-4411, 400), CodeClass::RowFatal);
         assert_eq!(classify(-2019, 400), CodeClass::Reject);
         assert_eq!(classify(-4403, 400), CodeClass::Reject);
+        // BX9 — options.
+        assert_eq!(classify(-6057, 400), CodeClass::WriteFatal);
+        assert_eq!(classify(-6055, 400), CodeClass::Reject, "unsourced: an ordinary refusal (R10)");
+        assert_eq!(classify(-6059, 400), CodeClass::Reject);
+        assert_eq!(classify(-2027, 400), CodeClass::Reject, "margin insufficient: an ordinary refusal");
+        assert_eq!(classify(-6052, 400), CodeClass::Reject, "a short past the symbol's maximum");
+        assert_eq!(classify(-6005, 400), CodeClass::Reject);
+    }
+
+    /// BX9: options' pool — 30 / 10 s and 100 / min at `frac`; the minute
+    /// binds after the 10 s windows fill it.
+    #[test]
+    fn the_options_pool_needs_both_windows() {
+        let mut p = OptionOrders::new(800_000);
+        assert_eq!((p.w10s.cap(), p.w1m.cap()), (24, 80));
+        let mut t = S;
+        let mut sent = 0;
+        for _ in 0..2_000 {
+            if p.admits(t) {
+                p.commit(t);
+                sent += 1;
+            }
+            t += 20_000_000;
+        }
+        assert_eq!(sent, 80, "40 s offered: the minute's 80 binds");
+        let q = OptionOrders::new(1);
+        assert!(!q.admits(S));
+    }
+
+    /// BX9: eapi's own pool — the defaults weigh 93 a minute of the
+    /// lane's 240; a 10 s cycle is past it. The day read (R6) gets what a
+    /// cycle in hand and the steady load leave: 98 a minute at the
+    /// defaults (a row each 3.06 s); a 20 s cycle leaves it nothing.
+    #[test]
+    fn the_options_weight_is_judged_apart() {
+        assert_eq!(OPT_ARM_WEIGHT_MAX_PER_MIN, 240);
+        assert_eq!(opt_weight_per_min(60_000, false), 53 + 36);
+        assert_eq!(opt_weight_per_min(60_000, true), 93);
+        assert!(opt_weight_per_min(10_000, true) > OPT_ARM_WEIGHT_MAX_PER_MIN);
+        assert_eq!(opt_day_row_ns(60_000, false), Some(60_000_000_000 * 5 / (240 - 53 - 89)));
+        assert_eq!(opt_day_row_ns(20_000, false), None);
+        assert_eq!(request_weight(Weighed::OptAccount), 3);
+        assert_eq!(request_weight(Weighed::OptPosition), 5);
     }
 }

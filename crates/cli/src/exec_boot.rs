@@ -751,8 +751,10 @@ fn check_bin15_gateway(slots: &[core_config::exec::ExecSlot], live_mask: u8) -> 
 /// slot (BX-7 as built — the one owner of every bound row), and only the
 /// products and account modes its gateway speaks (BX7: USDⓈ-M and COIN-M ×
 /// classic, Portfolio Margin and PM Pro — `exec_binance::mode::built`);
-/// anything else is refused naming the phase that builds it. A session
-/// bound on a classic arm needs it to trade USDⓈ-M alone (one USD equity).
+/// anything else is refused naming the phase that builds it (BX8: spot
+/// classic; BX9: options classic). A session bound on a classic arm needs
+/// it to trade USDⓈ-M and/or options alone (their USD equities, summed:
+/// BX9, Q-4).
 fn check_binance(
     slots: &[core_config::exec::ExecSlot],
     live_mask: u8,
@@ -800,16 +802,20 @@ fn check_binance(
     // symbol, each futures lane's reconciliation and margin re-reads at
     // their fastest — is judged here against the arm's share of the IP's
     // budget; at run time the gateway's governor (BX7) defers its
-    // discretionary reads past 80 % of that share.
+    // discretionary reads past 80 % of that share. A futures-less arm is
+    // judged as one futures lane, as before BX9 (spot's: a lane it does not
+    // build — carried) — but an arm of options alone weighs nothing here:
+    // eapi's pool is its own, judged below (BX9).
     let max_symbols = owner.map_or(0, |s| s.max_symbols);
     let lanes = b.products.iter().filter(|p| *p == "usdm" || *p == "coinm").count();
+    let options_alone = lanes == 0 && b.products.iter().all(|p| p == "options");
     let weight = exec_binance::gov::arm_weight_per_min(
         u64::try_from(max_symbols).unwrap_or(0),
         u64::try_from(b.heartbeat_ms).unwrap_or(0),
         u64::try_from(b.recon_every_ms).unwrap_or(0),
         u64::try_from(lanes.max(1)).unwrap_or(1),
     );
-    if weight > exec_binance::gov::ARM_WEIGHT_MAX_PER_MIN {
+    if !options_alone && weight > exec_binance::gov::ARM_WEIGHT_MAX_PER_MIN {
         return Err(format!(
             "exec: [exec.binance] heartbeat_ms = {} with slot {}'s max_symbols = {max_symbols} and \
              recon_every_ms = {} weighs up to {weight} per minute — over the arm's {} of the IP's \
@@ -822,6 +828,29 @@ fn check_binance(
             exec_binance::gov::IP_WEIGHT_PER_MIN,
             exec_binance::gov::W_COUNTDOWN
         ));
+    }
+    // BX9: eapi's REQUEST_WEIGHT is its own pool (400 a minute per IP): the
+    // options lane's worst steady load — a cycle every recon_every_ms with
+    // its exercise read, the margin re-reads at their fastest, the clock
+    // when options are the only lane — and a whole cycle kept in hand must
+    // leave the day read (paced at run time, Q-5) some of the arm's share:
+    // else the boot could never end (R6).
+    let opt_armed = b.products.iter().any(|p| p == "options");
+    if opt_armed {
+        let only = b.products.iter().all(|p| p == "options");
+        let re = u64::try_from(b.recon_every_ms).unwrap_or(0);
+        if exec_binance::gov::opt_day_row_ns(re, only).is_none() {
+            return Err(format!(
+                "exec: [exec.binance] recon_every_ms = {} weighs the options lane up to {} per minute \
+                 on eapi — with a cycle ({}) kept in hand that leaves the boot's day read nothing of \
+                 the arm's {} (the IP's {}). Raise recon_every_ms.",
+                b.recon_every_ms,
+                exec_binance::gov::opt_weight_per_min(re, only),
+                exec_binance::gov::W_OPT_RECON,
+                exec_binance::gov::OPT_ARM_WEIGHT_MAX_PER_MIN,
+                exec_binance::gov::OPT_IP_WEIGHT_PER_MIN
+            ));
+        }
     }
     let mode = exec_binance::mode::AccountMode::from_word(&b.account_mode)
         .ok_or_else(|| format!("exec: [exec.binance] account_mode `{}` is unknown", b.account_mode))?;
@@ -847,7 +876,9 @@ fn check_binance(
     // while COIN-M's losses went unseen (the risk review's N1). Refused.
     // BX8: nor does the spot wallet — spot is classic-only, and a bounded
     // arm trading it would judge USDⓈ-M's equity while spot's losses went
-    // unseen. Refused alike.
+    // unseen. Refused alike. BX9 (Q-4): the options account HAS a USD
+    // equity (`marginAccount`'s): the session equity is USDⓈ-M's margin
+    // balance plus it — a bounded arm may trade USDⓈ-M, options or both.
     let bounded = owner.is_some_and(|s| s.halt_on_gain_usd_1e6 != 0 || s.halt_on_loss_usd_1e6 != 0);
     let armed = |w: &str| b.products.iter().any(|p| p == w);
     // BX8: spot's user data exists only on a WS API session, whose logon
@@ -861,20 +892,30 @@ fn check_binance(
             b.order_transport, b.signing
         ));
     }
-    if bounded && mode == exec_binance::mode::AccountMode::Classic && (armed("coinm") || armed("spot") || !armed("usdm")) {
+    // BX9 (the risk review's R2-5): options are proven alone and beside
+    // USDⓈ-M (the lane order, the two signers, the summed equity); beside
+    // COIN-M or spot nothing has run them — refused until a test does.
+    if armed("options") && (armed("coinm") || armed("spot")) {
+        return Err(String::from(
+            "exec: [exec.binance] arms options beside COIN-M or spot — BX9 proves options alone \
+             and beside USDⓈ-M only. Arm options alone, or with usdm.",
+        ));
+    }
+    if bounded && mode == exec_binance::mode::AccountMode::Classic && (armed("coinm") || armed("spot") || !(armed("usdm") || armed("options"))) {
         let what = if armed("coinm") {
             "trades COIN-M"
         } else if armed("spot") {
             "trades spot"
         } else {
-            "trades no USDⓈ-M"
+            "trades neither USDⓈ-M nor options"
         };
         return Err(format!(
             "exec: slot {} has a session bound (halt_on_gain_usd_1e6 / halt_on_loss_usd_1e6) but \
              its classic Binance arm {what} — COIN-M margins in each coin and the spot wallet \
              holds its own assets: no USD equity the bound reads for either, so the bound would \
              judge USDⓈ-M's alone (or nothing) while their losses went unseen. Run the futures \
-             as pm or pm_pro (one unified USD equity), arm usdm alone, or drop the bound.",
+             as pm or pm_pro (one unified USD equity), arm usdm and/or options alone, or drop the \
+             bound.",
             live[0]
         ));
     }
@@ -1293,7 +1334,7 @@ mod tests {
         const WS: &str = "order_transport = \"ws\"";
         const REST: &str = "order_transport = \"rest\"";
         const ED25519: &str = "signing = \"ed25519\"";
-        let cases: [(&str, &[(&str, &str)], bool); 13] = [
+        let cases: [(&str, &[(&str, &str)], bool); 18] = [
             ("USD-M classic on the WS API", &[], true),
             ("COIN-M classic", &[(PRODUCTS, "products = [\"coinm\"]")], true),
             ("both products, classic", &[(PRODUCTS, "products = [\"usdm\", \"coinm\"]")], true),
@@ -1307,6 +1348,12 @@ mod tests {
             ("spot beside PM Pro", &[(CLASSIC, "account_mode = \"pm_pro\""), (PRODUCTS, "products = [\"usdm\", \"spot\"]")], false),
             ("spot on REST", &[(WS, REST), (PRODUCTS, "products = [\"usdm\", \"spot\"]")], false),
             ("spot with an HMAC key on REST", &[(ED25519, "signing = \"hmac\""), (WS, REST), (PRODUCTS, "products = [\"spot\"]")], false),
+            // BX9 (the risk review, round 3): the options variants it lists.
+            ("options classic", &[(PRODUCTS, "products = [\"options\"]")], true),
+            ("USD-M and options", &[(PRODUCTS, "products = [\"usdm\", \"options\"]")], true),
+            ("options written", &[(PRODUCTS, "products = [\"options\"]"), ("options_write = 0", "options_write = 1")], true),
+            ("options beside COIN-M", &[(PRODUCTS, "products = [\"coinm\", \"options\"]")], false),
+            ("options beside PM Pro", &[(CLASSIC, "account_mode = \"pm_pro\""), (PRODUCTS, "products = [\"usdm\", \"options\"]")], false),
         ];
         for (what, edits, boots) in cases {
             let mut src = base.clone();
@@ -1837,10 +1884,29 @@ mod tests {
         let e = resolve(Some(&p), Some("3")).unwrap_err();
         assert!(e.contains("[exec.binance]"), "{e}");
         // A product this gateway does not speak names its phase.
-        let src = format!("{}{}", bn_live(), BN_SECTION.replace("products = [\"usdm\"]", "products = [\"options\"]"));
-        let p = write(&d, "unbuilt.toml", &src);
+        let equity = BN_SECTION.replace("products = [\"usdm\"]", "products = [\"equity\"]\nequity_session = \"RTH\"\nequity_tokenize = 0\nequity_quote = \"USDC\"");
+        let p = write(&d, "unbuilt.toml", &format!("{}{equity}", bn_live()));
         let e = resolve(Some(&p), Some("3")).unwrap_err();
-        assert!(e.contains("BX9"), "options: {e}");
+        assert!(e.contains("BX10"), "equity: {e}");
+        // BX9: options classic are built — alone, or beside the futures;
+        // beside Portfolio Margin they wait on a ruling; eapi's weight is
+        // judged on its own pool.
+        for to in ["products = [\"options\"]", "products = [\"usdm\", \"options\"]"] {
+            let src = format!("{}{}", bn_live(), BN_SECTION.replace("products = [\"usdm\"]", to));
+            let p = write(&d, "options.toml", &src);
+            let b = resolve(Some(&p), Some("3")).unwrap_or_else(|e| panic!("{to}: {e}")).unwrap();
+            assert!(b.binance.as_ref().is_some_and(|b| b.products.iter().any(|p| p == "options")), "{to}");
+        }
+        let opt_pro = BN_SECTION
+            .replace("products = [\"usdm\"]", "products = [\"usdm\", \"options\"]")
+            .replace("account_mode = \"classic\"", "account_mode = \"pm_pro\"");
+        let p = write(&d, "options-pro.toml", &format!("{}{opt_pro}", bn_live()));
+        let e = resolve(Some(&p), Some("3")).unwrap_err();
+        assert!(e.contains("a ruling"), "options beside PM Pro: {e}");
+        let fast = BN_SECTION.replace("products = [\"usdm\"]", "products = [\"options\"]\nrecon_every_ms = 10000");
+        let p = write(&d, "options-fast.toml", &format!("{}{fast}", bn_live()));
+        let e = resolve(Some(&p), Some("3")).unwrap_err();
+        assert!(e.contains("on eapi"), "a 10 s options cycle: {e}");
         // BX8: spot classic is built — alone, or beside the futures; beside
         // Portfolio Margin it waits on a ruling.
         for to in ["products = [\"spot\"]", "products = [\"usdm\", \"spot\"]"] {
@@ -1890,6 +1956,15 @@ mod tests {
         let p = write(&d, "heavy.toml", &heavy);
         let e = resolve(Some(&p), Some("3")).unwrap_err();
         assert!(e.contains("weighs up to"), "{e}");
+        // BX9 (the risk review, round 3): spot alone keeps its one futures
+        // lane in that judgment (`lanes.max(1)`); options alone are judged
+        // on eapi's pool instead, never on fapi's.
+        for (to, judged) in [("products = [\"spot\"]", true), ("products = [\"options\"]", false)] {
+            let one = format!("{}{}heartbeat_ms = 1000\n", bn_live(), BN_SECTION.replace("products = [\"usdm\"]", to));
+            let p = write(&d, "heavy-one.toml", &one);
+            let got = resolve(Some(&p), Some("3"));
+            assert_eq!(got.as_ref().err().is_some_and(|e| e.contains("weighs up to")), judged, "{to}: {:?}", got.err());
+        }
         // A second live Binance slot.
         let two = format!(
             "{}{}{BN_SECTION}",
@@ -1947,6 +2022,21 @@ mod tests {
         assert!(e.contains("no USD") && e.contains("trades spot"), "spot beside USDⓈ-M: {e}");
         let p = write(&d, "spot.toml", &format!("{}{spot}", bn_live()));
         assert!(resolve(Some(&p), Some("3")).is_ok(), "spot unbounded");
+        // BX9 (Q-4): the options account has a USD equity — bounded beside
+        // USDⓈ-M or alone; beside COIN-M still refused.
+        for to in ["products = [\"usdm\", \"options\"]", "products = [\"options\"]"] {
+            let opt = BN_SECTION.replace("products = [\"usdm\"]", to);
+            let p = write(&d, "opt-bound.toml", &format!("{bounded}{opt}"));
+            assert!(resolve(Some(&p), Some("3")).is_ok(), "{to}, bounded");
+        }
+        // Beside COIN-M or spot: refused, bounded or not (R2-5: unproven).
+        for to in ["products = [\"coinm\", \"options\"]", "products = [\"spot\", \"options\"]"] {
+            let opt = BN_SECTION.replace("products = [\"usdm\"]", to);
+            for head in [bounded.as_str(), bn_live().as_str()] {
+                let p = write(&d, "opt-beside.toml", &format!("{head}{opt}"));
+                assert!(resolve(Some(&p), Some("3")).unwrap_err().contains("alone, or with usdm"), "{to}");
+            }
+        }
         std::fs::remove_dir_all(&d).ok();
     }
 

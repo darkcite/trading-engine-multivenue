@@ -31,6 +31,14 @@
 //! `canTrade` ([`scan_spot_account`]). Every other asset (the quote, BNB
 //! unless armed, dust) is the operator's, never compared (plan §3.10, D3).
 //!
+//! **Options (BX9)** read `marginAccount` on the order route — the margin
+//! (maintenance over adjusted equity), `canTrade` and `reduceOnly`
+//! ([`scan_opt_margin`]) — then `position` on the jobs connection
+//! ([`scan_opt_positions`]: the legs, signed by `side`, valued at the
+//! mark). An expired option leaves the position list at its expiry and
+//! settles by the exercise record ([`scan_exercise`]): its leg is HELD from
+//! the expiry until the record is read — never judged by its absence.
+//!
 //! **The day's spend** ([`day_increasing_1e6`]): the venue's own trades
 //! since 00:00Z on a row, replayed in time order from the position they
 //! started from (today's position minus today's net), adding for each
@@ -503,6 +511,351 @@ fn position(frame: &[u8], at: usize, cm: bool) -> Result<PosRow, ScanErr> {
     Ok(p)
 }
 
+// ---------------------------------------------------------------------------
+// Options (BX9)
+// ---------------------------------------------------------------------------
+
+/// The options account's figures (`GET /eapi/v1/marginAccount`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct OptMarginSnap {
+    /// The USDT asset's `maintMargin` ×1e6.
+    pub maint_1e6: i64,
+    /// Its `adjustedEquity` ×1e6 — the ratio's denominator (Clearing
+    /// Procedures 28: liquidation at a ratio of 0.95).
+    pub adj_equity_1e6: i64,
+    /// Its `equity` ×1e6.
+    pub equity_1e6: i64,
+    /// `canTrade`.
+    pub can_trade: bool,
+    /// `reduceOnly`: the venue restricts the account (a `VenueLock`).
+    pub reduce_only: bool,
+}
+
+// `scan_opt_margin`'s keys, a bit each.
+const OM_ASSET: u8 = 1 << 0;
+const OM_CAN_TRADE: u8 = 1 << 1;
+const OM_REDUCE: u8 = 1 << 2;
+// One asset's keys.
+const OA_NAME: u8 = 1 << 0;
+const OA_MAINT: u8 = 1 << 1;
+const OA_ADJ: u8 = 1 << 2;
+const OA_EQUITY: u8 = 1 << 3;
+
+/// **Scan an options account** (`GET /eapi/v1/marginAccount`, the order
+/// route's answer; the shape Demo answered on 2026-10-10:
+/// `{"asset":[{"asset":"USDT","marginBalance":…,"equity":…,"available":…,
+/// "initialMargin":…,"maintMargin":…,"unrealizedPNL":…,"adjustedEquity":…}],
+/// "time":…,"canTrade":true,…,"reduceOnly":false,"tradeGroupId":-1}`).
+/// Options settle in USDT alone (`optionAssets`): the USDT entry carries the
+/// margin. Fail closed: `asset`, `canTrade` and `reduceOnly` required, each
+/// once; exactly one USDT entry, carrying `maintMargin`, `adjustedEquity`
+/// and `equity`, each once; any other asset is refused (a margin in another
+/// asset is no shape this build reads); bytes after the object, within the
+/// result's span, refuse it.
+pub fn scan_opt_margin(frame: &[u8], result: Span) -> Result<OptMarginSnap, ScanErr> {
+    if result.len == 0 {
+        return Err(ScanErr::Missing);
+    }
+    let mut w = Pairs::new(frame, result.at as usize).map_err(malformed)?;
+    let mut snap = OptMarginSnap::default();
+    let mut seen = 0u8;
+    while let Some((k, a, z)) = w.next().map_err(malformed)? {
+        let bit = match k {
+            b"asset" => {
+                opt_assets(frame, a, &mut snap)?;
+                OM_ASSET
+            }
+            b"canTrade" => {
+                snap.can_trade = bool_of(frame, a, z).map_err(bad)?;
+                OM_CAN_TRADE
+            }
+            b"reduceOnly" => {
+                snap.reduce_only = bool_of(frame, a, z).map_err(bad)?;
+                OM_REDUCE
+            }
+            _ => 0,
+        };
+        if seen & bit != 0 {
+            return Err(ScanErr::Malformed);
+        }
+        seen |= bit;
+    }
+    if seen != OM_ASSET | OM_CAN_TRADE | OM_REDUCE {
+        return Err(ScanErr::Missing);
+    }
+    // The object is the whole answer (the parser review): nothing but
+    // whitespace after its brace, within the result's span.
+    let end = result.at as usize + result.len as usize;
+    if end > frame.len() || !crate::rest::ends_whole(&frame[..end], w.end()) {
+        return Err(ScanErr::Malformed);
+    }
+    Ok(snap)
+}
+
+/// `asset[]`: exactly one entry, USDT's, with its three figures.
+fn opt_assets(frame: &[u8], at: usize, snap: &mut OptMarginSnap) -> Result<(), ScanErr> {
+    let mut e = Elems::new(frame, at).map_err(malformed)?;
+    let mut usdt = false;
+    while let Some((ea, _)) = e.next().map_err(malformed)? {
+        if usdt {
+            return Err(ScanErr::Malformed);
+        }
+        let mut w = Pairs::new(frame, ea).map_err(malformed)?;
+        let mut seen = 0u8;
+        while let Some((k, a, z)) = w.next().map_err(malformed)? {
+            let bit = match k {
+                b"asset" => {
+                    if str_of(frame, a, z).map_err(bad)? != b"USDT" {
+                        return Err(ScanErr::BadField);
+                    }
+                    OA_NAME
+                }
+                b"maintMargin" => {
+                    snap.maint_1e6 = dec_1e6(frame, a, z).map_err(bad)?;
+                    OA_MAINT
+                }
+                b"adjustedEquity" => {
+                    snap.adj_equity_1e6 = dec_1e6(frame, a, z).map_err(bad)?;
+                    OA_ADJ
+                }
+                b"equity" => {
+                    snap.equity_1e6 = dec_1e6(frame, a, z).map_err(bad)?;
+                    OA_EQUITY
+                }
+                _ => 0,
+            };
+            if seen & bit != 0 {
+                return Err(ScanErr::Malformed);
+            }
+            seen |= bit;
+        }
+        if seen != OA_NAME | OA_MAINT | OA_ADJ | OA_EQUITY {
+            return Err(ScanErr::Missing);
+        }
+        if snap.maint_1e6 < 0 {
+            return Err(ScanErr::BadField);
+        }
+        usdt = true;
+    }
+    if !usdt {
+        return Err(ScanErr::Missing);
+    }
+    Ok(())
+}
+
+// `scan_opt_positions`' keys, a bit each.
+const OP_SYMBOL: u8 = 1 << 0;
+const OP_QTY: u8 = 1 << 1;
+const OP_SIDE: u8 = 1 << 2;
+const OP_MARK: u8 = 1 << 3;
+
+/// **Scan the options positions** (`GET /eapi/v1/position`: an array of
+/// `{"symbol":…,"side":"LONG"|"SHORT","quantity":…,"markPrice":…,…}`) into
+/// `pos`: each row's amount signed by its `side` — a SHORT is negative
+/// whether the venue signs `quantity` or not — and its notional at the
+/// mark, so the leg's price is the mark (per contract). Fail closed: the
+/// four keys required, each once; a `quantity` whose sign contradicts its
+/// `side`, or a negative mark, is refused; bytes after the array, or an
+/// element past `pos`, refuse the whole answer. A mark of 0 is a price
+/// (BX9 parser review: a worthless option near its expiry is no malformed
+/// answer — refusing it would leave every cycle inconclusive); its
+/// notional is 0 and the gateway keeps the leg's last price.
+pub fn scan_opt_positions(body: &[u8], pos: &mut [PosRow]) -> Result<usize, ArrErr> {
+    let mut e = Elems::new(body, 0).map_err(malformed)?;
+    let mut n = 0;
+    while let Some((pa, _)) = e.next().map_err(malformed)? {
+        if n == pos.len() {
+            return Err(ArrErr::Truncated);
+        }
+        pos[n] = opt_position(body, pa)?;
+        n += 1;
+    }
+    if !crate::rest::ends_whole(body, e.end()) {
+        return Err(ArrErr::Scan(ScanErr::Malformed));
+    }
+    Ok(n)
+}
+
+/// One options position (above).
+fn opt_position(frame: &[u8], at: usize) -> Result<PosRow, ScanErr> {
+    let mut w = Pairs::new(frame, at).map_err(malformed)?;
+    let mut p = PosRow::default();
+    let (mut seen, mut short, mut mark) = (0u8, false, 0i64);
+    while let Some((k, a, z)) = w.next().map_err(malformed)? {
+        let bit = match k {
+            b"symbol" => {
+                p.symbol = Span::of(frame, str_of(frame, a, z).map_err(bad)?);
+                OP_SYMBOL
+            }
+            b"quantity" => {
+                p.amt_1e6 = dec_1e6(frame, a, z).map_err(bad)?;
+                OP_QTY
+            }
+            b"side" => {
+                short = match str_of(frame, a, z).map_err(bad)? {
+                    b"LONG" => false,
+                    b"SHORT" => true,
+                    _ => return Err(ScanErr::BadField),
+                };
+                OP_SIDE
+            }
+            b"markPrice" => {
+                mark = dec_1e6(frame, a, z).map_err(bad)?;
+                OP_MARK
+            }
+            _ => 0,
+        };
+        if seen & bit != 0 {
+            return Err(ScanErr::Malformed);
+        }
+        seen |= bit;
+    }
+    if seen != OP_SYMBOL | OP_QTY | OP_SIDE | OP_MARK {
+        return Err(ScanErr::Missing);
+    }
+    // The side signs the amount (a SHORT's `quantity` may come signed or
+    // not); a LONG with a negative one is no shape this build reads.
+    if !short && p.amt_1e6 < 0 {
+        return Err(ScanErr::BadField);
+    }
+    let mag = p.amt_1e6.saturating_abs();
+    p.amt_1e6 = if short { -mag } else { mag };
+    if mark < 0 {
+        return Err(ScanErr::BadField);
+    }
+    p.notional_1e6 = ((p.amt_1e6 as i128 * mark as i128) / 1_000_000).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    Ok(p)
+}
+
+/// One exercise record (`GET /eapi/v1/exerciseRecord`): an expired
+/// option's settlement.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExerciseRow {
+    /// `symbol`.
+    pub symbol: Span,
+    /// `quantity` ×1e6, signed by `positionSide` (a SHORT negative).
+    pub qty_1e6: i64,
+    /// `amount` ×1e6: the settlement's cash, as the venue signs it.
+    pub amount_1e6: i64,
+    /// `exercisePrice` ×1e6: the underlying's settlement price.
+    pub exercise_px_1e6: i64,
+    /// `fee` ×1e6.
+    pub fee_1e6: i64,
+    /// `createDate`, ms.
+    pub time_ms: u64,
+}
+
+// `scan_exercise`'s keys, a bit each.
+const EX_SYMBOL: u8 = 1 << 0;
+const EX_QTY: u8 = 1 << 1;
+const EX_AMOUNT: u8 = 1 << 2;
+const EX_PX: u8 = 1 << 3;
+const EX_SIDE: u8 = 1 << 4;
+const EX_FEE: u8 = 1 << 5;
+const EX_TIME: u8 = 1 << 6;
+const EX_NEED: u8 = EX_SYMBOL | EX_QTY | EX_AMOUNT | EX_PX | EX_SIDE | EX_TIME;
+
+/// **Scan the exercise records** (an array of `{"symbol":…,"quantity":…,
+/// "amount":…,"exercisePrice":…,"positionSide":"LONG"|"SHORT","fee":…,
+/// "createDate":…,…}`) into `out`. Fail closed as
+/// [`scan_opt_positions`]: the symbol, the quantity (non-zero), the amount,
+/// the exercise price (positive), the side and the date required, each
+/// once; a quantity whose sign contradicts its side refused.
+pub fn scan_exercise(body: &[u8], out: &mut [ExerciseRow]) -> Result<usize, ArrErr> {
+    let mut e = Elems::new(body, 0).map_err(malformed)?;
+    let mut n = 0;
+    while let Some((ra, _)) = e.next().map_err(malformed)? {
+        if n == out.len() {
+            return Err(ArrErr::Truncated);
+        }
+        let r = &mut out[n];
+        *r = ExerciseRow::default();
+        let mut w = Pairs::new(body, ra).map_err(malformed)?;
+        let (mut seen, mut short) = (0u8, false);
+        while let Some((k, a, z)) = w.next().map_err(malformed)? {
+            let bit = match k {
+                b"symbol" => {
+                    r.symbol = Span::of(body, str_of(body, a, z).map_err(bad)?);
+                    EX_SYMBOL
+                }
+                b"quantity" => {
+                    r.qty_1e6 = dec_1e6(body, a, z).map_err(bad)?;
+                    EX_QTY
+                }
+                b"amount" => {
+                    r.amount_1e6 = dec_1e6(body, a, z).map_err(bad)?;
+                    EX_AMOUNT
+                }
+                b"exercisePrice" => {
+                    r.exercise_px_1e6 = dec_1e6(body, a, z).map_err(bad)?;
+                    EX_PX
+                }
+                b"positionSide" => {
+                    short = match str_of(body, a, z).map_err(bad)? {
+                        b"LONG" => false,
+                        b"SHORT" => true,
+                        _ => return Err(ArrErr::Scan(ScanErr::BadField)),
+                    };
+                    EX_SIDE
+                }
+                b"fee" => {
+                    r.fee_1e6 = dec_1e6(body, a, z).map_err(bad)?;
+                    EX_FEE
+                }
+                b"createDate" => {
+                    r.time_ms = u64_of(body, a, z).map_err(bad)?;
+                    EX_TIME
+                }
+                _ => 0,
+            };
+            if seen & bit != 0 {
+                return Err(ArrErr::Scan(ScanErr::Malformed));
+            }
+            seen |= bit;
+        }
+        if seen & EX_NEED != EX_NEED {
+            return Err(ArrErr::Scan(ScanErr::Missing));
+        }
+        if r.qty_1e6 == 0 || r.exercise_px_1e6 <= 0 || (!short && r.qty_1e6 < 0) {
+            return Err(ArrErr::Scan(ScanErr::BadField));
+        }
+        let mag = r.qty_1e6.saturating_abs();
+        r.qty_1e6 = if short { -mag } else { mag };
+        n += 1;
+    }
+    if !crate::rest::ends_whole(body, e.end()) {
+        return Err(ArrErr::Scan(ScanErr::Malformed));
+    }
+    Ok(n)
+}
+
+/// **An exercise record agrees with the booked leg** (BX9, the risk
+/// review's R4) — before a settlement fill is booked from it: its signed
+/// quantity IS the whole booked position (a long received, a short paid);
+/// the cash's sign is the side's (a long's `amount` never negative, a
+/// short's never positive — the docs' example: a short put's `-500`); and
+/// the cash per contract, `|amount| / |quantity|`, is the intrinsic value
+/// `intrinsic_1e6` the record's own `exercisePrice` gives, within the fee
+/// per contract (the venue may net it; counted to a tenth of the intrinsic
+/// at most — a fee is no licence for any cash), a thousandth of the
+/// intrinsic and 0.001 USDT. A record that disagrees books nothing (the leg stays
+/// settling; the gateway counts a scan failure). i128, never overflowing.
+#[must_use]
+pub fn settlement_agrees(x: &ExerciseRow, booked_1e6: i64, intrinsic_1e6: i64) -> bool {
+    if x.qty_1e6 != booked_1e6 || x.qty_1e6 == 0 || intrinsic_1e6 < 0 {
+        return false;
+    }
+    if (x.qty_1e6 > 0 && x.amount_1e6 < 0) || (x.qty_1e6 < 0 && x.amount_1e6 > 0) {
+        return false;
+    }
+    let q = i128::from(x.qty_1e6).abs();
+    let per = i128::from(x.amount_1e6).abs() * 1_000_000 / q;
+    let i = i128::from(intrinsic_1e6);
+    let fee = (i128::from(x.fee_1e6).abs() * 1_000_000 / q).min(i / 10);
+    (per - i).abs() <= fee + i / 1_000 + 1_000
+}
+
 /// One row's comparison state.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -524,6 +877,13 @@ pub struct Leg {
     /// The leg keeps its last judged `differed`, and the cycle is
     /// inconclusive: never drift, never reconciled ([`Verdict::held_legs`]).
     pub held: bool,
+    /// Not judged this cycle (BX9): an option past its expiry, awaiting its
+    /// settlement — the venue drops the position at expiry, the booked one
+    /// stays until the exercise record books its settlement fill. Bounded
+    /// (the gateway's `EXPIRY_HOLD_MAX_MS`: then judged, fail closed); the
+    /// cycle stays conclusive — the leg's exposure is still booked, and the
+    /// row trades no more.
+    pub settling: bool,
 }
 
 /// A cycle's verdict.
@@ -580,7 +940,7 @@ pub fn judge_positions(legs: &mut [Leg], v: &mut Verdict) {
     while i < legs.len() {
         let l = &mut legs[i];
         i += 1;
-        if !l.owned {
+        if !l.owned || l.settling {
             continue;
         }
         if l.held {
@@ -698,6 +1058,124 @@ mod tests {
             proptest::prop_assert_eq!(&bal[..3], &[btc + btc_l, bnb, 0]);
             let _ = scan_spot_account(&bytes, whole(&bytes), &assets, &mut bal, &mut perm);
         }
+
+        /// BX9 (the parser review, round 2): an options position rendered
+        /// from its figures reads back side-signed — a SHORT negative
+        /// whether its `quantity` comes signed or not — at its mark, the
+        /// notional exactly `amt × mark / 1e6`; any bytes, never a panic.
+        #[test]
+        fn an_options_position_round_trips(q in 0i64..100_000_000_000, mark in 0i64..10_000_000_000_000, short in proptest::prelude::any::<bool>(), signed in proptest::prelude::any::<bool>(), bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)) {
+            let qv = if short && signed { -q } else { q };
+            let f = std::format!(
+                r#"[{{"symbol":"BTC-261225-85000-C","side":"{}","quantity":"{}","markPrice":"{}"}}]"#,
+                if short { "SHORT" } else { "LONG" },
+                d6(qv),
+                d6(mark)
+            );
+            let mut pos = [PosRow::default(); 2];
+            proptest::prop_assert_eq!(scan_opt_positions(f.as_bytes(), &mut pos), Ok(1));
+            let amt = if short { -q } else { q };
+            proptest::prop_assert_eq!((pos[0].amt_1e6, pos[0].symbol.get(f.as_bytes())), (amt, &b"BTC-261225-85000-C"[..]));
+            proptest::prop_assert_eq!(i128::from(pos[0].notional_1e6), i128::from(amt) * i128::from(mark) / 1_000_000);
+            let _ = scan_opt_positions(&bytes, &mut pos);
+        }
+
+        /// BX9: an exercise record reads back its figures, the quantity
+        /// signed by `positionSide`; any bytes, never a panic.
+        #[test]
+        fn an_exercise_record_round_trips(q in 1i64..100_000_000_000, px in 1i64..10_000_000_000_000, amount in -1_000_000_000_000i64..1_000_000_000_000, fee in -1_000_000_000i64..1_000_000_000, t in 0u64..4_000_000_000_000, short in proptest::prelude::any::<bool>(), signed in proptest::prelude::any::<bool>(), bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)) {
+            let qv = if short && signed { -q } else { q };
+            let f = std::format!(
+                r#"[{{"symbol":"X","exercisePrice":"{}","quantity":"{}","amount":"{}","fee":"{}","positionSide":"{}","createDate":{t}}}]"#,
+                d6(px),
+                d6(qv),
+                d6(amount),
+                d6(fee),
+                if short { "SHORT" } else { "LONG" }
+            );
+            let mut out = [ExerciseRow::default(); 2];
+            proptest::prop_assert_eq!(scan_exercise(f.as_bytes(), &mut out), Ok(1));
+            let r = out[0];
+            proptest::prop_assert_eq!((r.qty_1e6, r.exercise_px_1e6, r.amount_1e6, r.fee_1e6, r.time_ms), (if short { -q } else { q }, px, amount, fee, t));
+            let _ = scan_exercise(&bytes, &mut out);
+        }
+
+        /// BX9: the options account reads back its USDT figures and its two
+        /// flags; one byte after the object refuses it; any bytes, never a
+        /// panic.
+        #[test]
+        fn an_options_account_round_trips(maint in 0i64..1_000_000_000_000_000, adj in -1_000_000_000_000_000i64..1_000_000_000_000_000, eq in -1_000_000_000_000_000i64..1_000_000_000_000_000, can_trade in proptest::prelude::any::<bool>(), reduce_only in proptest::prelude::any::<bool>(), bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)) {
+            let f = std::format!(
+                r#"{{"asset":[{{"asset":"USDT","marginBalance":"1","equity":"{}","maintMargin":"{}","adjustedEquity":"{}"}}],"canTrade":{can_trade},"reduceOnly":{reduce_only}}}"#,
+                d6(eq),
+                d6(maint),
+                d6(adj)
+            );
+            let b = f.as_bytes();
+            let m = scan_opt_margin(b, whole(b)).unwrap();
+            proptest::prop_assert_eq!((m.maint_1e6, m.adj_equity_1e6, m.equity_1e6, m.can_trade, m.reduce_only), (maint, adj, eq, can_trade, reduce_only));
+            let more = std::format!("{f} x");
+            proptest::prop_assert!(scan_opt_margin(more.as_bytes(), whole(more.as_bytes())).is_err());
+            let _ = scan_opt_margin(&bytes, whole(&bytes));
+        }
+
+        /// BX9 (R4): `settlement_agrees` is its law, restated here apart —
+        /// the whole booked position, the side's cash sign, the cash per
+        /// contract within the fee (at most a tenth of the intrinsic), a
+        /// thousandth and 0.001 USDT of the intrinsic — on records built
+        /// near the boundary: the cash per contract the intrinsic ± a gap
+        /// around the tolerance — a quarter of the cases one contract within
+        /// 3 µUSDT of the tolerance's edge, exact — the fee from nothing to
+        /// past its cap, the side's sign (7 in 8) or the other, the booked
+        /// position or another. Break-and-watch: dropping the fee's cap or
+        /// the sign law, `<=` read as `<`, or the 0.001 USDT floor dropped,
+        /// fails it (the parser review, round 3: F2).
+        #[test]
+        fn settlement_agreement_is_its_law(
+            q in 1i64..1_000_000_000,
+            intrinsic in -1i64..2_000_000_000,
+            gap in -400_000_000i64..400_000_000,
+            fee_per in 0i64..400_000_000,
+            short in proptest::prelude::any::<bool>(),
+            wrong_sign in 0u8..8,
+            booked_off in 0u8..8,
+            edge in 0u8..4,
+            delta in -3i64..=3,
+            above in proptest::prelude::any::<bool>(),
+        ) {
+            // At the edge: one contract (no rounding), the gap the
+            // tolerance ± a few µUSDT, either side of the intrinsic.
+            let q = if edge == 0 { 1_000_000 } else { q };
+            let i = intrinsic.max(0);
+            let tol = fee_per.min(i / 10) + i / 1_000 + 1_000;
+            let gap = if edge == 0 { if above { tol + delta } else { -(tol + delta) } } else { gap };
+            let qty = if short { -q } else { q };
+            let per = i + gap;
+            let cash = (i128::from(per.max(0)) * i128::from(q) / 1_000_000) as i64;
+            let right = if short { -cash } else { cash };
+            let amount = if wrong_sign == 0 { -right } else { right };
+            let fee = (i128::from(fee_per) * i128::from(q) / 1_000_000) as i64;
+            let booked = if booked_off == 0 { qty / 2 } else { qty };
+            let x = ExerciseRow { qty_1e6: qty, amount_1e6: amount, fee_1e6: fee, ..ExerciseRow::default() };
+            let reference = || -> bool {
+                let amount = x.amount_1e6;
+                if qty != booked || intrinsic < 0 || (qty > 0 && amount < 0) || (qty < 0 && amount > 0) {
+                    return false;
+                }
+                let (qa, a, f, i) = (i128::from(q), i128::from(amount.abs()), i128::from(fee.abs()), i128::from(intrinsic));
+                let per = a * 1_000_000 / qa;
+                let fee_per = core::cmp::min(f * 1_000_000 / qa, i / 10);
+                let gap = if per > i { per - i } else { i - per };
+                gap <= fee_per + i / 1_000 + 1_000
+            };
+            proptest::prop_assert_eq!(settlement_agrees(&x, booked, intrinsic), reference());
+        }
+    }
+
+    /// A ×1e6 figure as the venue writes it, six decimals.
+    fn d6(v: i64) -> std::string::String {
+        let a = v.unsigned_abs();
+        std::format!("{}{}.{:06}", if v < 0 { "-" } else { "" }, a / 1_000_000, a % 1_000_000)
     }
 
     fn names(n: &[&[u8]]) -> std::vec::Vec<AssetName> {
@@ -893,7 +1371,7 @@ mod tests {
 
     #[test]
     fn drift_needs_two_cycles_after_the_first() {
-        let mut legs = [Leg { booked_1e6: 10_000, venue_1e6: 10_000, px_1e6: 65_000_000_000, owned: true, differed: true, held: false }];
+        let mut legs = [Leg { booked_1e6: 10_000, venue_1e6: 10_000, px_1e6: 65_000_000_000, owned: true, differed: true, held: false, settling: false }];
         let mut v = Verdict::default();
         judge_positions(&mut legs, &mut v);
         assert!(v.reconciled());
@@ -910,8 +1388,8 @@ mod tests {
     #[test]
     fn a_boot_with_an_unbooked_venue_leg_is_not_reconciled() {
         let mut legs = [
-            Leg { booked_1e6: 0, venue_1e6: 5_000, px_1e6: 1, owned: true, differed: true, held: false },
-            Leg { booked_1e6: 0, venue_1e6: 9_000, px_1e6: 1, owned: false, differed: true, held: false },
+            Leg { booked_1e6: 0, venue_1e6: 5_000, px_1e6: 1, owned: true, differed: true, held: false, settling: false },
+            Leg { booked_1e6: 0, venue_1e6: 9_000, px_1e6: 1, owned: false, differed: true, held: false, settling: false },
         ];
         let mut v = Verdict::default();
         judge_positions(&mut legs, &mut v);
@@ -931,7 +1409,7 @@ mod tests {
 
     #[test]
     fn an_unpriced_drift_is_unbounded() {
-        let mut legs = [Leg { booked_1e6: 1, venue_1e6: 2, px_1e6: 0, owned: true, differed: true, held: false }];
+        let mut legs = [Leg { booked_1e6: 1, venue_1e6: 2, px_1e6: 0, owned: true, differed: true, held: false, settling: false }];
         let mut v = Verdict::default();
         judge_positions(&mut legs, &mut v);
         assert_eq!(v.drift_usd_1e6, i64::MAX);
@@ -942,7 +1420,7 @@ mod tests {
     /// the cycle after it judges again.
     #[test]
     fn a_held_leg_waits_for_its_commission() {
-        let mut legs = [Leg { booked_1e6: 2_000, venue_1e6: 1_998, px_1e6: 65_000_000_000, owned: true, differed: true, held: true }];
+        let mut legs = [Leg { booked_1e6: 2_000, venue_1e6: 1_998, px_1e6: 65_000_000_000, owned: true, differed: true, held: true, settling: false }];
         let mut v = Verdict::default();
         judge_positions(&mut legs, &mut v);
         assert_eq!((v.drift_legs, v.unseen_legs, v.held_legs, v.drift_usd_1e6), (0, 0, 1, 0), "held: no drift");
@@ -955,6 +1433,23 @@ mod tests {
         let mut v = Verdict::default();
         judge_positions(&mut legs, &mut v);
         assert!(v.reconciled() && !legs[0].differed);
+    }
+
+    /// BX9: a settling leg (an option past its expiry, awaiting its
+    /// exercise record) is not judged — no drift — and its cycle stays
+    /// conclusive. Break-and-watch: judging it reads the venue's dropped
+    /// position as drift.
+    #[test]
+    fn a_settling_leg_is_not_judged_and_the_cycle_stays_conclusive() {
+        let mut legs = [Leg { booked_1e6: 10_000, venue_1e6: 0, px_1e6: 500_000_000, owned: true, differed: true, held: false, settling: true }];
+        let mut v = Verdict::default();
+        judge_positions(&mut legs, &mut v);
+        assert_eq!((v.drift_legs, v.unseen_legs, v.held_legs), (0, 0, 0));
+        assert!(v.reconciled(), "settling: conclusive");
+        legs[0].settling = false;
+        let mut v = Verdict::default();
+        judge_positions(&mut legs, &mut v);
+        assert_eq!(v.drift_legs, 1, "past the bound: judged, drift");
     }
 
     #[test]
@@ -976,5 +1471,124 @@ mod tests {
         assert_eq!(day_increasing_1e6(&mut tr, -2_000_000, true, 100_000_000), 200_000_000);
         let mut none: [TradeRow; 0] = [];
         assert_eq!(day_increasing_1e6(&mut none, 7, false, 0), 0);
+    }
+
+    /// BX9: Demo's `marginAccount` answer, verbatim (2026-10-10).
+    const OPT_MARGIN: &[u8] = br#"{"asset":[{"asset":"USDT","marginBalance":"20000.00000000","equity":"20000.00000000","available":"20000.00000000","initialMargin":"0.00000000","maintMargin":"0.00000000","unrealizedPNL":"0.00000000","adjustedEquity":"20000.00000000"}],"time":1791639889917,"canTrade":true,"canDeposit":true,"canWithdraw":true,"reduceOnly":false,"tradeGroupId":-1}"#;
+
+    /// BX9: the options account reads its USDT figures, `canTrade` and
+    /// `reduceOnly`; every gap or second copy is refused.
+    #[test]
+    fn the_options_account_reads_its_usdt_figures() {
+        let s = scan_opt_margin(OPT_MARGIN, whole(OPT_MARGIN)).expect("Demo's answer");
+        assert_eq!(s, OptMarginSnap { maint_1e6: 0, adj_equity_1e6: 20_000_000_000, equity_1e6: 20_000_000_000, can_trade: true, reduce_only: false });
+        let b = br#"{"asset":[{"asset":"USDT","maintMargin":"150.5","adjustedEquity":"1000","equity":"1010"}],"canTrade":false,"reduceOnly":true}"#;
+        let s = scan_opt_margin(b, whole(b)).unwrap();
+        assert_eq!((s.maint_1e6, s.adj_equity_1e6, s.can_trade, s.reduce_only), (150_500_000, 1_000_000_000, false, true));
+        assert_eq!(scan_opt_margin(b, Span::default()), Err(ScanErr::Missing), "no result");
+        let bad: [&[u8]; 10] = [
+            br#"{"asset":[{"asset":"USDT","maintMargin":"1","adjustedEquity":"1","equity":"1"}],"canTrade":true,"reduceOnly":false} x"#,
+            br#"{"asset":[],"canTrade":true,"reduceOnly":false}"#,
+            br#"{"asset":[{"asset":"USDT","maintMargin":"1","adjustedEquity":"1","equity":"1"}],"canTrade":true}"#,
+            br#"{"asset":[{"asset":"USDT","maintMargin":"1","adjustedEquity":"1"}],"canTrade":true,"reduceOnly":false}"#,
+            br#"{"asset":[{"asset":"BTC","maintMargin":"1","adjustedEquity":"1","equity":"1"}],"canTrade":true,"reduceOnly":false}"#,
+            br#"{"asset":[{"asset":"USDT","maintMargin":"1","adjustedEquity":"1","equity":"1"},{"asset":"USDT","maintMargin":"9","adjustedEquity":"9","equity":"9"}],"canTrade":true,"reduceOnly":false}"#,
+            br#"{"asset":[{"asset":"USDT","maintMargin":"1","maintMargin":"0","adjustedEquity":"1","equity":"1"}],"canTrade":true,"reduceOnly":false}"#,
+            br#"{"asset":[{"asset":"USDT","maintMargin":"1","adjustedEquity":"1","equity":"1"}],"canTrade":true,"reduceOnly":false,"reduceOnly":true}"#,
+            br#"{"asset":[{"asset":"USDT","maintMargin":"-1","adjustedEquity":"1","equity":"1"}],"canTrade":true,"reduceOnly":false}"#,
+            br#"{"asset":[{"asset":"USDT","maintMargin":"1","adjustedEquity":"1","equity":"1"}],"canTrade":"yes","reduceOnly":false}"#,
+        ];
+        for b in bad {
+            assert!(scan_opt_margin(b, whole(b)).is_err(), "{}", String::from_utf8_lossy(b));
+        }
+    }
+
+    /// BX9: an options position is signed by its side — a SHORT negative
+    /// whether the venue signs `quantity` or not — and valued at its mark.
+    #[test]
+    fn options_positions_are_signed_by_their_side() {
+        let b = br#"[{"entryPrice":"1000","symbol":"BTC-261012-88000-C","side":"SHORT","quantity":"-0.1","markPrice":"1050.5","strikePrice":"88000","expiryDate":1791792000000},{"symbol":"BTC-261012-90000-P","side":"SHORT","quantity":"0.2","markPrice":"10"},{"symbol":"BTC-261012-86000-C","side":"LONG","quantity":"1.5","markPrice":"2000"}]"#;
+        let mut pos = [PosRow::default(); 4];
+        assert_eq!(scan_opt_positions(b, &mut pos), Ok(3));
+        assert_eq!((pos[0].symbol.get(b), pos[0].amt_1e6, pos[0].notional_1e6), (&b"BTC-261012-88000-C"[..], -100_000, -105_050_000));
+        assert_eq!(pos[1].amt_1e6, -200_000, "an unsigned SHORT reads short");
+        assert_eq!((pos[2].amt_1e6, pos[2].notional_1e6), (1_500_000, 3_000_000_000));
+        assert_eq!(scan_opt_positions(b"[]", &mut pos), Ok(0));
+        let mut one = [PosRow::default(); 1];
+        assert_eq!(scan_opt_positions(b, &mut one), Err(ArrErr::Truncated));
+        let bad: [&[u8]; 7] = [
+            br#"[{"symbol":"X","side":"LONG","quantity":"-1","markPrice":"1"}]"#,
+            br#"[{"symbol":"X","side":"BOTH","quantity":"1","markPrice":"1"}]"#,
+            br#"[{"symbol":"X","side":"LONG","quantity":"1"}]"#,
+            br#"[{"symbol":"X","side":"LONG","quantity":"1","markPrice":"-0.1"}]"#,
+            br#"[{"symbol":"X","side":"LONG","quantity":"1","quantity":"2","markPrice":"1"}]"#,
+            br#"[{"symbol":"X","side":"LONG","quantity":"1","markPrice":"1"}] x"#,
+            br#"{"symbol":"X"}"#,
+        ];
+        for b in bad {
+            assert!(scan_opt_positions(b, &mut pos).is_err(), "{}", String::from_utf8_lossy(b));
+        }
+        // A flat row is worth nothing whatever its mark (still required);
+        // an open one at a mark of 0 is worth nothing at it (no malformed
+        // answer).
+        let flat = br#"[{"symbol":"X","side":"LONG","quantity":"0","markPrice":"0"}]"#;
+        assert_eq!(scan_opt_positions(flat, &mut pos), Ok(1));
+        let worthless = br#"[{"symbol":"X","side":"SHORT","quantity":"1","markPrice":"0"}]"#;
+        assert_eq!(scan_opt_positions(worthless, &mut pos), Ok(1));
+        assert_eq!((pos[0].amt_1e6, pos[0].notional_1e6), (-1_000_000, 0));
+    }
+
+    /// BX9: an exercise record — the docs' shape — signed by its side; a
+    /// record of nothing, or at no price, is refused.
+    #[test]
+    fn exercise_records_read_signed_by_their_side() {
+        let b = br#"[{"id":"1125899906842624000","currency":"USDT","symbol":"BTC-220721-25000-C","exercisePrice":"25000.00000000","markPrice":"25000.00000000","quantity":"1.00000000","amount":"0.00000000","fee":"0.00000000","createDate":1658361600000,"priceScale":2,"quantityScale":2,"optionSide":"CALL","positionSide":"LONG","quoteAsset":"USDT"},{"symbol":"BTC-220721-20000-P","exercisePrice":"19000","quantity":"0.5","amount":"-500","positionSide":"SHORT","createDate":1658361600001}]"#;
+        let mut out = [ExerciseRow::default(); 3];
+        assert_eq!(scan_exercise(b, &mut out), Ok(2));
+        assert_eq!((out[0].symbol.get(b), out[0].qty_1e6, out[0].exercise_px_1e6, out[0].time_ms), (&b"BTC-220721-25000-C"[..], 1_000_000, 25_000_000_000, 1_658_361_600_000));
+        assert_eq!((out[1].qty_1e6, out[1].amount_1e6, out[1].fee_1e6), (-500_000, -500_000_000, 0));
+        assert_eq!(scan_exercise(b"[]", &mut out), Ok(0));
+        let bad: [&[u8]; 6] = [
+            br#"[{"symbol":"X","exercisePrice":"1","quantity":"0","amount":"0","positionSide":"LONG","createDate":1}]"#,
+            br#"[{"symbol":"X","exercisePrice":"0","quantity":"1","amount":"0","positionSide":"LONG","createDate":1}]"#,
+            br#"[{"symbol":"X","exercisePrice":"1","quantity":"-1","amount":"0","positionSide":"LONG","createDate":1}]"#,
+            br#"[{"symbol":"X","exercisePrice":"1","quantity":"1","amount":"0","createDate":1}]"#,
+            br#"[{"symbol":"X","exercisePrice":"1","quantity":"1","amount":"0","amount":"1","positionSide":"LONG","createDate":1}]"#,
+            // A byte after the page (the parser review, round 3: F1).
+            br#"[{"symbol":"X","exercisePrice":"1","quantity":"1","amount":"0","positionSide":"LONG","createDate":1}] x"#,
+        ];
+        for b in bad {
+            assert!(scan_exercise(b, &mut out).is_err(), "{}", String::from_utf8_lossy(b));
+        }
+    }
+
+    /// BX9 (R4): a settlement is booked only from a record that agrees —
+    /// the whole booked position, the side's cash sign, the cash per
+    /// contract the intrinsic value within the fee, a thousandth and a
+    /// tenth of a cent. Break-and-watch: dropping the cash cross-check
+    /// books the docs' short put at whatever `amount` says.
+    #[test]
+    fn a_settlement_is_booked_only_from_a_record_that_agrees() {
+        // The docs' short put: 0.5 at K 20 000, settled at 19 000 — 1 000 a
+        // contract, `-500` paid.
+        let x = ExerciseRow { qty_1e6: -500_000, amount_1e6: -500_000_000, exercise_px_1e6: 19_000_000_000, ..ExerciseRow::default() };
+        let i = 1_000_000_000;
+        assert!(settlement_agrees(&x, -500_000, i));
+        assert!(!settlement_agrees(&x, -400_000, i), "not the whole booked position");
+        assert!(!settlement_agrees(&x, 500_000, i), "the other side");
+        assert!(!settlement_agrees(&ExerciseRow { amount_1e6: 500_000_000, ..x }, -500_000, i), "a short paid nothing in");
+        assert!(!settlement_agrees(&x, -500_000, 2_000_000_000), "the cash is not the intrinsic value");
+        // Within the fee per contract (netted) and the tolerances.
+        let netted = ExerciseRow { amount_1e6: -499_000_000, fee_1e6: 1_000_000, ..x };
+        assert!(settlement_agrees(&netted, -500_000, i));
+        assert!(!settlement_agrees(&ExerciseRow { fee_1e6: 0, ..netted }, -500_000, i), "2 a contract off, no fee: refused");
+        assert!(settlement_agrees(&ExerciseRow { amount_1e6: -500_400_000, ..x }, -500_000, i), "0.8 a contract: under a thousandth");
+        // Out of the money: nothing paid, nothing owed.
+        let otm = ExerciseRow { qty_1e6: 1_000_000, amount_1e6: 0, ..x };
+        assert!(settlement_agrees(&otm, 1_000_000, 0));
+        assert!(!settlement_agrees(&ExerciseRow { amount_1e6: 5_000_000, ..otm }, 1_000_000, 0));
+        // Extremes never overflow; a giant fee licenses nothing.
+        let wide = ExerciseRow { qty_1e6: 1, amount_1e6: i64::MAX, fee_1e6: i64::MIN, ..x };
+        assert!(!settlement_agrees(&wide, 1, 0));
     }
 }

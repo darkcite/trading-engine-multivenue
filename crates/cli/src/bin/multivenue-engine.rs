@@ -684,13 +684,18 @@ struct ExecSmokeArgs {
     /// instead (K1's Demo half): Demo's spot WS API, `session.logon` then
     /// `userDataStream.subscribe` on the one socket — the logon's result
     /// keys (never a value) and the subscription's id printed — then the
-    /// socket closes; it places nothing (0, or 59).
+    /// socket closes; it places nothing (0, or 59). BX9: `--binance-probe
+    /// options` probes eapi on Demo (K3, K18, K19): which host serves it,
+    /// an Ed25519-signed read, the listenKey and the `/private` stream, one
+    /// IoC BUY under the book and one IoC SELL over it with the arm's own
+    /// 32-character id (neither can fill), the countdown (`-6005`), and the
+    /// reconciliation's read shapes (0, 58 or 59).
     #[arg(
         long,
-        value_name = "futures|spot",
+        value_name = "futures|spot|options",
         num_args = 0..=1,
         default_missing_value = "futures",
-        value_parser = ["futures", "spot"],
+        value_parser = ["futures", "spot", "options"],
         conflicts_with_all = ["offline", "lifecycle", "fill", "sweep", "requote", "recon", "watch", "dry_run"]
     )]
     binance_probe: Option<String>,
@@ -1870,7 +1875,7 @@ fn evm_testnet(args: EvmTestnetArgs) -> ExitCode {
 
 /// BX7b: the Binance Demo battery (`exec-smoke --binance … --lifecycle`).
 fn exec_binance_battery(products: &str, args: &ExecSmokeArgs) -> ExitCode {
-    let (um, cm, spot) = match cli::bn_battery::parse_products(products) {
+    let (um, cm, spot, options) = match cli::bn_battery::parse_products(products) {
         Ok(p) => p,
         Err(e) => {
             error!("exec-smoke --binance: {e}");
@@ -1881,6 +1886,7 @@ fn exec_binance_battery(products: &str, args: &ExecSmokeArgs) -> ExitCode {
         um,
         cm,
         spot,
+        options,
         rest: args.bn_rest,
         hmac: args.bn_hmac,
         um_symbol: args.bn_um_symbol.clone(),
@@ -1969,7 +1975,11 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
             return ExitCode::from(1);
         }
         let tls = TlsTransport::default_client_config();
-        let code = if which == "spot" { cli::bn_probe::run_spot(tls) } else { cli::bn_probe::run(tls) };
+        let code = match which {
+            "spot" => cli::bn_probe::run_spot(tls),
+            "options" => cli::bn_probe::run_options(tls),
+            _ => cli::bn_probe::run(tls),
+        };
         return ExitCode::from(code);
     }
     if let Some(products) = args.binance.as_deref() {
@@ -3712,6 +3722,67 @@ fn run(args: RunArgs) -> ExitCode {
         } else {
             None
         };
+    // E1: the execution route table. Resolved HERE — before the boot
+    // discovery, the metric registry, before any socket opens — for two
+    // reasons. (1) The registry is boot-only-insertion, and whether
+    // the `engine_exec_*` family exists at all depends on this
+    // artifact: no `--exec` registers NOTHING, which is what keeps
+    // `/metrics` byte-identical to a pre-E1 binary. (2) A disagreement
+    // between the two arming switches, or a live slot with no compiled
+    // arm, should abort before the engine has done anything at all,
+    // not after it is already streaming six venues.
+    // E6: parsed HERE, beside the artifact, for the same reason — a
+    // malformed kill switch must abort the boot, not be discovered at
+    // the moment someone reaches for it.
+    let halt_mask = match args
+        .halt_slot
+        .as_deref()
+        .map_or(Ok(0u8), cli::exec_boot::parse_halt_slots)
+    {
+        Ok(m) => m,
+        Err(reason) => {
+            error!(reason, "exec: --halt-slot refused — boot aborted");
+            return ExitCode::from(1);
+        }
+    };
+    // Said out loud rather than refused. An operator reaching for the
+    // kill switch on a boot that has no route table has asked for
+    // something that is already true — every slot is paper and
+    // nothing can reach a venue — and refusing to start would be
+    // punishing them for asking for MORE safety. Staying silent would
+    // be worse: it would let them believe a switch fired that did not.
+    if halt_mask != 0 && args.exec.is_none() {
+        warn!(
+            halted = %cli::exec_boot::render_slot_mask(halt_mask),
+            "--halt-slot named slots but there is no --exec artifact: \
+             every slot is already paper and no order can reach a venue, \
+             so this flag halted nothing"
+        );
+    }
+    let exec_boot = match cli::exec_boot::resolve(args.exec.as_deref(), args.arm_live.as_deref()) {
+        Ok(e) => e,
+        Err(reason) => {
+            error!(reason, "exec: artifact refused — boot aborted");
+            return ExitCode::from(1);
+        }
+    };
+    // (BX9: before the discovery too — a live Binance arm's options held
+    // outside the chain join it right after the discovery, before any
+    // table is built from the chain: the R3 ruling.)
+    // BX9 (the zero-copy review's ZC2-6): a live Binance arm's
+    // configuration — its keys — built ONCE, here: lent to the held read
+    // below, then owned by the arm's boot. A second build would stage the
+    // secrets again, and its drop `munlock` their pages.
+    let mut bn_arm_cfg = match exec_boot.as_ref().and_then(|b| b.binance_slot().and(b.binance.as_ref())) {
+        Some(b) => match cli::bn_live::arm_config(b) {
+            Ok(c) => Some(c),
+            Err(reason) => {
+                error!(reason, "binance: the arm cannot be configured — boot aborted");
+                return ExitCode::from(1);
+            }
+        },
+        None => None,
+    };
     let discovery = match cli::boot_discovery::run_all(
         &cfg,
         &tls_config,
@@ -3744,6 +3815,39 @@ fn run(args: RunArgs) -> ExitCode {
             "discovery: configured symbol(s) missing from venue universe — continuing in paper mode"
         );
     }
+    // BX9 (Q-5; the R3 ruling 2026-10-11): the options a live Binance
+    // arm's account holds OUTSIDE the paper-selected chain join it here —
+    // before the manifests, the descriptor table and the options lane's
+    // mark table are built from the chain — so the lane prices them and
+    // the arm binds them under the same ids. One signed read
+    // (`GET /eapi/v1/position`, the options HMAC key); none without a live
+    // options arm.
+    let mut discovery = discovery;
+    if let (Some(eb), Some(bn_cfg)) = (exec_boot.as_ref(), bn_arm_cfg.as_ref()) {
+        let selected = discovery.bn_options.len();
+        let universe = std::mem::take(&mut discovery.bn_option_universe);
+        match cli::bn_live::options_held_outside(
+            eb,
+            bn_cfg,
+            &mut discovery.bn_options,
+            &mut discovery.bn_option_rows,
+            &universe,
+            std::sync::Arc::clone(&tls_config),
+        ) {
+            Ok(n) => {
+                for (symbol, sym) in &discovery.bn_options[selected..] {
+                    info!(symbol = %symbol, sym, "binance: an option held outside the chain joins it (Q-5)");
+                }
+                info!(joined = n, chain = discovery.bn_options.len(), "binance: the options chain with the options held");
+            }
+            Err(reason) => {
+                error!(reason, "binance: the options held could not be read — boot aborted");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    // The universe's one use is the join above: dropped here, every boot.
+    drop(std::mem::take(&mut discovery.bn_option_universe));
 
     // -- M2-close: options manifest (per-run sym → instrument-name
     // sidecar; docs/wire-format.md "Capture files"). Options ordinals
@@ -4161,52 +4265,6 @@ fn run(args: RunArgs) -> ExitCode {
     // — Part B.4's two §6.5 capture gauges are set from inside each
     // spawn wrapper thread itself, so the registry + gauge ids must
     // already exist at spawn time.
-    // E1: the execution route table. Resolved HERE — before the
-    // metric registry is built, before any socket opens — for two
-    // reasons. (1) The registry is boot-only-insertion, and whether
-    // the `engine_exec_*` family exists at all depends on this
-    // artifact: no `--exec` registers NOTHING, which is what keeps
-    // `/metrics` byte-identical to a pre-E1 binary. (2) A disagreement
-    // between the two arming switches, or a live slot with no compiled
-    // arm, should abort before the engine has done anything at all,
-    // not after it is already streaming six venues.
-    // E6: parsed HERE, beside the artifact, for the same reason — a
-    // malformed kill switch must abort the boot, not be discovered at
-    // the moment someone reaches for it.
-    let halt_mask = match args
-        .halt_slot
-        .as_deref()
-        .map_or(Ok(0u8), cli::exec_boot::parse_halt_slots)
-    {
-        Ok(m) => m,
-        Err(reason) => {
-            error!(reason, "exec: --halt-slot refused — boot aborted");
-            join_reverse(handles);
-            return ExitCode::from(1);
-        }
-    };
-    // Said out loud rather than refused. An operator reaching for the
-    // kill switch on a boot that has no route table has asked for
-    // something that is already true — every slot is paper and
-    // nothing can reach a venue — and refusing to start would be
-    // punishing them for asking for MORE safety. Staying silent would
-    // be worse: it would let them believe a switch fired that did not.
-    if halt_mask != 0 && args.exec.is_none() {
-        warn!(
-            halted = %cli::exec_boot::render_slot_mask(halt_mask),
-            "--halt-slot named slots but there is no --exec artifact: \
-             every slot is already paper and no order can reach a venue, \
-             so this flag halted nothing"
-        );
-    }
-    let exec_boot = match cli::exec_boot::resolve(args.exec.as_deref(), args.arm_live.as_deref()) {
-        Ok(e) => e,
-        Err(reason) => {
-            error!(reason, "exec: artifact refused — boot aborted");
-            join_reverse(handles);
-            return ExitCode::from(1);
-        }
-    };
     // XMM XH5b-3: slot 6's gateway beside a mainnet-only arm (slot 0, a live
     // Binance slot) on mainnet alone — its network is the market data's (LAW
     // E-4), which the artifact does not state: asked before any arm boots.
@@ -5919,6 +5977,11 @@ fn run(args: RunArgs) -> ExitCode {
                             md_hosts.push(cfg.binance_ws_host.as_str());
                             md_hosts.push(cfg.binance_rest_host.as_str());
                         }
+                        // BX9: the options' marks and their discovery too.
+                        if armed("options") {
+                            md_hosts.push(cfg.binance_eapi_ws_host.as_str());
+                            md_hosts.push(cfg.binance_eapi_rest_host.as_str());
+                        }
                         let spec = cli::bn_live::BnSpec {
                             eb: &eb,
                             rows: &discovery.bn_fapi_rows,
@@ -5927,12 +5990,20 @@ fn run(args: RunArgs) -> ExitCode {
                             coinm: &coinm,
                             spot_rows: &discovery.bn_spot_rows,
                             spot: &boot.allocated.bn_spot,
+                            opt_chain: &discovery.bn_options,
+                            opt_rows: &discovery.bn_option_rows,
                             alias,
                             md_hosts: &md_hosts,
                             run_dir: &run_dir,
                         };
+                        let Some(bn_cfg) = bn_arm_cfg.take() else {
+                            error!("exec: binance arm: its configuration was not built — boot aborted");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        };
                         match cli::bn_live::boot_binance_arm(
                             &spec,
+                            bn_cfg,
                             TlsTransport::default_client_config(),
                             f4p,
                         ) {
@@ -6586,6 +6657,7 @@ mod exec_smoke_args {
     fn spots_flags_parse_where_they_belong() {
         assert_eq!(smoke(&["--binance-probe"]).unwrap().binance_probe.as_deref(), Some("futures"));
         assert_eq!(smoke(&["--binance-probe", "spot"]).unwrap().binance_probe.as_deref(), Some("spot"));
+        assert_eq!(smoke(&["--binance-probe", "options"]).unwrap().binance_probe.as_deref(), Some("options"));
         assert_eq!(smoke(&["--binance-probe=futures"]).unwrap().binance_probe.as_deref(), Some("futures"));
         assert_eq!(smoke(&["--offline"]).unwrap().binance_probe, None);
         assert!(smoke(&["--binance-probe", "coinm"]).is_err(), "an unknown probe word");
@@ -6597,7 +6669,9 @@ mod exec_smoke_args {
         for orphan in [&["--bn-spot-symbol", "BTCUSDT"][..], &["--bn-adopt-usd", "5"][..]] {
             assert!(smoke(orphan).is_err(), "{orphan:?} parsed without --binance");
         }
-        assert_eq!(cli::bn_battery::parse_products("um,spot"), Ok((true, false, true)));
-        assert!(cli::bn_battery::parse_products("um,options").is_err(), "the battery refuses the word, as before");
+        assert_eq!(cli::bn_battery::parse_products("um,spot"), Ok((true, false, true, false)));
+        assert_eq!(cli::bn_battery::parse_products("options"), Ok((false, false, false, true)), "BX9: the options battery");
+        let a = smoke(&["--binance", "options", "--lifecycle"]).unwrap();
+        assert_eq!(a.binance.as_deref(), Some("options"));
     }
 }

@@ -36,11 +36,17 @@ use core_ring::{Consumer, Producer, Ring};
 /// Failed establishments in a row before a host is resolved again (as the
 /// HL gateway's).
 pub const RERESOLVE_AFTER: u32 = 3;
-/// The distinct hosts one gateway dials: per futures lane its WS API, its
-/// stream host and its REST host, and SAPI's.
-pub const DNS_HOSTS: usize = 8;
-/// The rings' room: every host asked at once, twice over.
-const DNS_RING: usize = 16;
+/// The distinct hosts one gateway dials: per lane its WS API, its stream
+/// host and its REST host, and SAPI's — a full mainnet arm (USDⓈ-M,
+/// COIN-M, spot and options, BX9) dials nine: `ws-fapi`, `fstream`,
+/// `fapi`, `ws-dapi`, `dstream`, `dapi`, `ws-api`, `api` (spot's REST and
+/// SAPI's) and `eapi` (options' WS pair names it too; their stream is
+/// `fstream`'s). One spare.
+pub const DNS_HOSTS: usize = 10;
+/// The rings' room: every host asked at once, past twice over.
+const DNS_RING: usize = 32;
+// `Resolver::pending` holds a bit per host.
+const _: () = assert!(DNS_HOSTS <= 16);
 /// How long the cold thread sleeps when nothing is asked.
 const IDLE: Duration = Duration::from_millis(20);
 /// How long [`Resolver::spawn`] waits for the thread to serve.
@@ -106,10 +112,10 @@ impl Resolver {
         let (answer, answers) = Ring::<Answer, DNS_RING>::new().split();
         let state = Arc::new(AtomicU8::new(STARTING));
         let theirs = Arc::clone(&state);
-        // COPY: the host table (≤ 128 B of `&'static str`, no name's bytes)
+        // COPY: the host table (≤ 160 B of `&'static str`, no name's bytes)
         // moved into the thread's closure — boot only, once — rejected: a
         // table shared with the gateway (an `Arc` and a lock, or a lifetime
-        // the thread outlives, to save 128 B once).
+        // the thread outlives, to save 160 B once).
         thread::Builder::new()
             .name(String::from("bn-dns"))
             .spawn(move || serve(&names[..n], port, asked, answer, &theirs))

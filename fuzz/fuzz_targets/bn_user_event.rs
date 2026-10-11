@@ -23,12 +23,16 @@
 //! BX8 (the parser review's P2-1): an accepted order or trade event whose
 //! execution is a trade (`TRADE`, `CALCULATED`) is a trade of something at
 //! a price — its last quantity and price above zero.
+//! BX9: an option row's commission asset (its settle asset, USDT — the
+//! symbol names no quote) judged the same way; and options' event name
+//! for the risk level, `RISK_LEVEL_CHANGE`, scans as `riskLevelChange`
+//! does (an accepted frame, renamed, reads the same level and figures).
 
 #![no_main]
 
 use std::sync::OnceLock;
 
-use exec_binance::inst::{BindSpec, InstTable, WireTable, PRODUCT_COINM, PRODUCT_USDM};
+use exec_binance::inst::{BindSpec, InstTable, OptBindSpec, WireTable, PRODUCT_COINM, PRODUCT_USDM};
 use exec_binance::journal::{fee_asset, FEE_ASSET_BNB, FEE_ASSET_NONE, FEE_ASSET_OTHER, FEE_ASSET_SETTLE};
 use exec_binance::userstream::{
     scan_user_event, NotCross, Span, UserEvent, CONFIG_LEVERAGE, CONFIG_MULTI_ASSETS_OFF, CONFIG_MULTI_ASSETS_ON,
@@ -47,6 +51,9 @@ const WRAP: &[u8] = br#"{"stream":"s","data":"#;
 /// asset before BNB).
 const FAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","pair":"BTCUSDT","contractType":"PERPETUAL","status":"TRADING","marginAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"1000"}]},{"symbol":"BTCUSDC","pair":"BTCUSDC","contractType":"PERPETUAL","status":"TRADING","marginAsset":"USDC","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"1000"}]},{"symbol":"BTCUSDT_261225","pair":"BTCUSDT","contractType":"CURRENT_QUARTER","status":"TRADING","marginAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"1000"}]}]}"#;
 const DAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSD_PERP","pair":"BTCUSD","contractType":"PERPETUAL","contractStatus":"TRADING","marginAsset":"BTC","contractSize":100,"filters":[{"filterType":"PRICE_FILTER","tickSize":"0.1"},{"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"}]},{"symbol":"BNBUSD_PERP","pair":"BNBUSD","contractType":"PERPETUAL","contractStatus":"TRADING","marginAsset":"BNB","contractSize":10,"filters":[{"filterType":"PRICE_FILTER","tickSize":"0.001"},{"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"}]}]}"#;
+
+/// BX9: an option row (BTC's call): its commission settles in USDT.
+const EAPI: &[u8] = br#"{"optionContracts":[{"baseAsset":"BTC","quoteAsset":"USDT","underlying":"BTCUSDT","settleAsset":"USDT","nakedSell":true}],"optionAssets":[{"name":"USDT"}],"optionSymbols":[{"expiryDate":1798185600000,"filters":[{"filterType":"PRICE_FILTER","minPrice":"5.000","maxPrice":"23300.000","tickSize":"5.000"},{"filterType":"LOT_SIZE","minQty":"0.0001","maxQty":"200","stepSize":"0.0100"}],"symbol":"BTC-261225-85000-C","side":"CALL","strikePrice":"85000.000","underlying":"BTCUSDT","unit":1,"priceScale":3,"quantityScale":4,"quoteAsset":"USDT","status":"TRADING","contractType":"CRYPTO_OPTIONS","underlyingType":"CRYPTO"}]}"#;
 
 /// Those rows, bound once.
 fn rows() -> &'static WireTable {
@@ -72,6 +79,10 @@ fn rows() -> &'static WireTable {
             t.bind(&mut w, &BindSpec { sym, product, row, owned: true, maker_ok: true }).expect("bound");
             i += 1;
         }
+        let mut e = ingress_binance::eapi::EapiDiscovery::new();
+        e.ingest_exchange_info(EAPI).expect("the eapi fixture");
+        let sym = core_types::make_symbol_id(core_types::VenueId::Binance, 1_025);
+        t.bind_option(&mut w, &OptBindSpec { sym, row: &e.rows()[0], owned: true, writable: true }).expect("the option bound");
         w
     })
 }
@@ -125,6 +136,7 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(fee_asset(w.row(2), n), want(b"USDT"), "a dated row's asset");
         assert_eq!(fee_asset(w.row(3), n), want(b"BTC"), "a COIN-M row's coin");
         assert_eq!(fee_asset(w.row(4), n), want(b"BNB"), "BNB as a COIN-M row's own coin");
+        assert_eq!(fee_asset(w.row(5), n), want(b"USDT"), "an option's settle asset (BX9)");
     }
     if e.kind == UE_ORDER || e.kind == UE_TRADE_LITE {
         assert!(!e.symbol.get(data).is_empty(), "an order event with no symbol");
@@ -134,6 +146,22 @@ fuzz_target!(|data: &[u8]| {
     }
     if e.kind == UE_RISK {
         assert!((RISK_MARGIN_CALL..=RISK_NORMAL).contains(&e.risk), "a risk word no scan writes");
+        // BX9: options' name for the event reads alike.
+        const PM: &[u8] = b"\"riskLevelChange\"";
+        const OPT: &[u8] = b"\"RISK_LEVEL_CHANGE\"";
+        let at: Vec<usize> = data.windows(PM.len()).enumerate().filter(|(_, w)| *w == PM).map(|(i, _)| i).collect();
+        if at.len() == 1 {
+            let mut r = Vec::with_capacity(data.len() + 2);
+            r.extend_from_slice(&data[..at[0]]);
+            r.extend_from_slice(OPT);
+            r.extend_from_slice(&data[at[0] + PM.len()..]);
+            // Unconditional (the parser review, round 2): the renamed bytes
+            // are no key the scanner reads, so a correct one reads the
+            // renamed frame as the same risk event, whatever the name.
+            let mut o = UserEvent::default();
+            assert!(scan_user_event(&r, &mut o).is_ok() && o.kind == UE_RISK, "options' name read otherwise");
+            assert_eq!((o.risk, o.qty_1e6, o.px_1e6), (e.risk, e.qty_1e6, e.px_1e6), "the two names read alike");
+        }
     } else {
         assert_eq!(e.risk, 0);
     }

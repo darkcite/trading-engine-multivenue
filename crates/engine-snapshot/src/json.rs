@@ -1314,6 +1314,12 @@ fn binance_gw_json(c: &mut Cursor<'_>, b: &crate::BinanceGwSnapshot) {
     c.key("max");
     c.u64(b.weight_max);
     c.byte(b'}');
+    c.key("opt_weight");
+    c.put(b"{\"used\":");
+    c.u64(b.opt_weight_used);
+    c.key("max");
+    c.u64(b.opt_weight_max);
+    c.byte(b'}');
     c.key("orders_10s");
     c.put(b"{\"used\":");
     c.u64(b.orders_10s_used);
@@ -1330,6 +1336,8 @@ fn binance_gw_json(c: &mut Cursor<'_>, b: &crate::BinanceGwSnapshot) {
     c.i64(b.margin_usdm_1e6);
     c.key("margin_coinm_1e6");
     c.i64(b.margin_coinm_1e6);
+    c.key("margin_options_1e6");
+    c.i64(b.margin_options_1e6);
     c.key("owned_rows");
     c.u64(b.owned_rows);
     c.key("post_rtt_p99_ns");
@@ -1838,6 +1846,7 @@ mod tests {
         b.weight_max = 1_200;
         b.refused[0] = 4;
         b.refused[19] = 9;
+        b.refused[20] = 7;
         let mut buf = vec![0u8; STATE_JSON_MAX];
         let n = encode_state_json(&s, &mut buf).unwrap();
         let body = core::str::from_utf8(&buf[..n]).unwrap();
@@ -1850,9 +1859,9 @@ mod tests {
             ),
             "{body}"
         );
-        assert!(body.contains("\"heartbeat_age_ms\":-1,\"clock_offset_ms\":-12,\"weight\":{\"used\":100,\"max\":1200},"), "{body}");
+        assert!(body.contains("\"heartbeat_age_ms\":-1,\"clock_offset_ms\":-12,\"weight\":{\"used\":100,\"max\":1200},\"opt_weight\":{\"used\":0,\"max\":0},"), "{body}");
         assert!(
-            body.contains("\"refused\":{\"unbound\":4,\"not_live\":0,") && body.contains("\"deadman_down\":0,\"flags\":9}}},\"halted\":["),
+            body.contains("\"refused\":{\"unbound\":4,\"not_live\":0,") && body.contains("\"deadman_down\":0,\"flags\":9,\"not_writable\":7}}},\"halted\":["),
             "{body}"
         );
         // Between the other two: one comma each.
@@ -1861,7 +1870,7 @@ mod tests {
         let n = encode_state_json(&s, &mut buf).unwrap();
         let body = core::str::from_utf8(&buf[..n]).unwrap();
         assert!(body.contains("\"session_pnl_usd_1e6\":0},\"binance_gw\":{\"slot\":2,"), "{body}");
-        assert!(body.contains("\"flags\":9}},\"hyperliquid_gw\":{\"slot\":0,"), "{body}");
+        assert!(body.contains("\"not_writable\":7}},\"hyperliquid_gw\":{\"slot\":0,"), "{body}");
         assert_eq!(crate::bn_mode_word(2), "pm_pro");
         assert_eq!(crate::sweep_word(0), "clear");
         assert_eq!(crate::sweep_word(7), "unknown");

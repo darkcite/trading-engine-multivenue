@@ -256,14 +256,21 @@ fn exec_of(s: &[u8]) -> u8 {
     }
 }
 
-/// An order status word (`X`, and the `status` of an order answer).
+/// An order status word (`X`, and the `status` of an order answer). One
+/// table for every product (BX9, the parser review): eapi's two spellings
+/// are words no other venue route sends, so reading them on a futures or
+/// spot answer changes nothing — and a futures `ACCEPTED`, were one ever
+/// sent, would read as the working order it names.
 #[must_use]
 pub fn status_of(s: &[u8]) -> u8 {
     match s {
-        b"NEW" => S_NEW,
+        // eapi's open-order listing says `ACCEPTED` for a working order and
+        // its history `CANCELLED` (BX9; its answers and streams `NEW` and
+        // `CANCELED`, as the futures').
+        b"NEW" | b"ACCEPTED" => S_NEW,
         b"PARTIALLY_FILLED" => S_PARTIALLY_FILLED,
         b"FILLED" => S_FILLED,
-        b"CANCELED" => S_CANCELED,
+        b"CANCELED" | b"CANCELLED" => S_CANCELED,
         b"EXPIRED" => S_EXPIRED,
         b"EXPIRED_IN_MATCH" => S_EXPIRED_IN_MATCH,
         b"REJECTED" => S_REJECTED,
@@ -656,7 +663,10 @@ pub fn scan_user_event(frame: &[u8], out: &mut UserEvent) -> Result<(), ScanErr>
         }
         b"MARGIN_CALL" => out.kind = UE_MARGIN_CALL,
         b"listenKeyExpired" => out.kind = UE_KEY_EXPIRED,
-        b"riskLevelChange" => {
+        // BX9: options' stream names it `RISK_LEVEL_CHANGE` (`s`: `NORMAL`,
+        // `REDUCE_ONLY`, …; its figures `mb`/`mm` unread — the lane's last
+        // ratio stands).
+        b"riskLevelChange" | b"RISK_LEVEL_CHANGE" => {
             // Fail closed: the status is required; an unknown one reads as
             // a lock. The figures are optional (0 when absent).
             if top_s == usize::MAX {
@@ -1319,6 +1329,16 @@ mod tests {
         assert!(u.keepalive_due(10 + KEEPALIVE_NS));
         u.expire();
         assert_eq!((u.phase, u.key().len()), (UsPhase::NeedKey, 0));
+    }
+
+    /// BX9 (the parser review, round 2): eapi's two spellings read as the
+    /// words they name — `ACCEPTED` a working order, `CANCELLED` a cancel —
+    /// beside the futures' own.
+    #[test]
+    fn eapis_status_words_read_as_theirs() {
+        assert_eq!((status_of(b"ACCEPTED"), status_of(b"NEW")), (S_NEW, S_NEW));
+        assert_eq!((status_of(b"CANCELLED"), status_of(b"CANCELED")), (S_CANCELED, S_CANCELED));
+        assert_eq!(status_of(b"CANCELLE"), S_OTHER);
     }
 
     proptest! {

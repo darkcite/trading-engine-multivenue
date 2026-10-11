@@ -51,7 +51,10 @@
 //! COPY-DOCTRINE: operator tools run by hand — against Binance Demo, and
 //! the account tools against mainnet by the operator's word — never
 //! reachable from the engine loop: they allocate and copy freely (answers,
-//! frames, reports).
+//! frames, reports). One engine path borrows [`Rest`] (BX9, Q-5): the live
+//! arm's boot reads the options held (`bn_live::held_options`, one signed
+//! `GET /eapi/v1/position` before anything trades) — a boot read, cold and
+//! once, under the same doctrine; never the trading loop.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -69,7 +72,7 @@ use exec_binance::num::{ceil_to, floor_to};
 use exec_binance::recon::{scan_cm_account, scan_spot_account, scan_um_account, PosRow};
 use exec_binance::rest::{
     ord_specs, render_account, sapi_specs, scan_mark, scan_orders, scan_server_time, scan_touch, setup_specs,
-    OrderRow, QueryWriter, LANE_TEMPLATES, KEY_HEADER, ORD_TEMPLATES, R_ACCOUNT, SETUP_TEMPLATES, T_OPEN_ORDERS, T_TIME,
+    OrderRow, QuerySigner, QueryWriter, LANE_TEMPLATES, KEY_HEADER, ORD_TEMPLATES, R_ACCOUNT, SETUP_TEMPLATES, T_OPEN_ORDERS, T_TIME,
 };
 use exec_binance::userstream::ScanErr;
 use exec_binance::wsapi::{scan_rest_answer, WsAnswer};
@@ -200,9 +203,9 @@ pub(crate) fn demo_config(hmac: bool) -> Result<BnConfig, String> {
         )
     })?;
     let h = cfg.hosts();
-    // Every one of the nine (BX8: spot's WS API too; its REST host is
-    // SAPI's).
-    for host in [&h.fut_wsapi, &h.fut_user, &h.fut_rest, &h.cm_wsapi, &h.cm_user, &h.cm_rest, &h.papi, &h.sapi, &h.spot_wsapi] {
+    // Every one of the eleven (BX8: spot's WS API too; its REST host is
+    // SAPI's; BX9: eapi's and the options stream host).
+    for host in [&h.fut_wsapi, &h.fut_user, &h.fut_rest, &h.cm_wsapi, &h.cm_user, &h.cm_rest, &h.papi, &h.sapi, &h.spot_wsapi, &h.eapi, &h.opt_user] {
         demo_host(host)?;
     }
     Ok(cfg)
@@ -516,7 +519,35 @@ impl Rest {
         let host = cfg.hosts().sapi.as_str();
         demo_host(host)?;
         let key = [(KEY_HEADER, cfg.api_key())];
-        Self::on(host, cfg, tls, &sapi_specs(&key), clock.offset_ms)
+        Self::on(host, cfg, tls, &sapi_specs(&key, &key), clock.offset_ms)
+    }
+
+    /// **BX9 — the options probe's client** on `host` (a Demo host the
+    /// probe names: the docs disagree on options' Demo REST host, and the
+    /// probe asks each): eapi's templates ([`eapi_specs`]), the time at
+    /// `rest::T_TIME` so [`Rest::clock`] reads it.
+    ///
+    /// # Errors
+    /// The host is not Demo's, or the connection could not be prepared.
+    pub(crate) fn eapi(cfg: &BnConfig, host: &'static str, tls: Arc<ClientConfig>) -> Result<Self, String> {
+        demo_host(host)?;
+        let key = [(KEY_HEADER, cfg.api_key())];
+        Self::on(host, cfg, tls, &eapi_specs(&key), 0)
+    }
+
+    /// **BX9 (Q-5) — the live arm's boot read of the options the account
+    /// holds**: eapi's templates on `cfg`'s own options host, under the
+    /// options key's header (Q-1). It reads; a change there would need the
+    /// operator's word, which the engine never gives.
+    ///
+    /// # Errors
+    /// No options key, a host off the configuration's network, or the
+    /// connection could not be prepared.
+    pub(crate) fn eapi_ops(cfg: &BnConfig, tls: Arc<ClientConfig>) -> Result<Self, String> {
+        let host = cfg.hosts().eapi.as_str();
+        scope_host(host, cfg)?;
+        let key = [(KEY_HEADER, cfg.opt_api_key().ok_or("no options key (Q-1: the scope's HMAC pair)")?)];
+        Self::on(host, cfg, tls, &eapi_specs(&key), 0)
     }
 
     fn on(host: &str, cfg: &BnConfig, tls: Arc<ClientConfig>, specs: &[ReqSpec<'_>], offset_ms: i64) -> Result<Self, String> {
@@ -608,7 +639,7 @@ impl Rest {
     pub(crate) fn signed(
         &mut self,
         t: usize,
-        signer: &Signer,
+        signer: &impl QuerySigner,
         tamper: bool,
         render: impl FnOnce(&mut QueryWriter<'_>, &WsStatic, u64),
     ) -> Result<Answer, String> {
@@ -651,7 +682,8 @@ impl Rest {
     /// **Sign a request into template `t`'s window**, unsent: `render`
     /// writes the parameters (the gateway's renderers, or the tools' own,
     /// given the venue timestamp), the signer appends the signature in
-    /// place (`QueryWriter::sign_with`). With `tamper`, one character of
+    /// place ([`QuerySigner`]: the arm's signer, or a borrowed HMAC key).
+    /// With `tamper`, one character of
     /// the signature is changed after signing: the negative control (the
     /// venue must answer `-1022`). The rendered length.
     ///
@@ -660,7 +692,7 @@ impl Rest {
     pub(crate) fn sign(
         &mut self,
         t: usize,
-        signer: &Signer,
+        signer: &impl QuerySigner,
         tamper: bool,
         render: impl FnOnce(&mut QueryWriter<'_>, &WsStatic, u64),
     ) -> Result<usize, String> {
@@ -672,7 +704,7 @@ impl Rest {
         let mut q = QueryWriter::new(w);
         render(&mut q, &st, ts);
         let signed_from = q.rendered().map_err(|_| String::from("the parameters do not fit the window"))?;
-        let n = q.sign_with(signer).map_err(|_| String::from("the signature does not fit the window"))?;
+        let n = signer.sign_query(q).map_err(|_| String::from("the signature does not fit the window"))?;
         if tamper {
             let w = self.http.window_mut(t);
             let i = tamper_at(&w[..n], signed_from + b"&signature=".len())
@@ -712,6 +744,68 @@ fn lane_specs<'a>(product: u8, key: &'a [(&'a str, &'a str)]) -> Vec<ReqSpec<'a>
         });
     }
     specs
+}
+
+/// BX9 — the options probe's templates ([`Rest::eapi`]): `GET
+/// /eapi/v1/marginAccount`.
+pub(crate) const E_MARGIN: usize = 0;
+/// `GET /eapi/v1/position`.
+pub(crate) const E_POSITION: usize = 1;
+/// `GET /eapi/v1/openOrders`.
+pub(crate) const E_OPEN: usize = 2;
+/// `POST /eapi/v1/listenKey` (the key header alone).
+pub(crate) const E_LISTEN: usize = 4;
+/// `POST /eapi/v1/order` (signed, body form).
+pub(crate) const E_ORDER: usize = 5;
+/// `GET /eapi/v1/order` (signed): one order by its client id.
+pub(crate) const E_QUERY: usize = 6;
+/// `GET /eapi/v1/countdownCancelAll` (signed): the countdown's setting —
+/// a market maker's (`-6005` for anyone else, K3).
+pub(crate) const E_COUNTDOWN: usize = 7;
+/// `GET /eapi/v1/userTrades` (signed).
+pub(crate) const E_TRADES: usize = 8;
+/// `GET /eapi/v1/exerciseRecord` (signed).
+pub(crate) const E_EXERCISE: usize = 9;
+/// `GET /eapi/v1/historyOrders` (signed).
+pub(crate) const E_HISTORY: usize = 10;
+/// `GET /eapi/v1/depth` (public).
+pub(crate) const E_DEPTH: usize = 11;
+/// `GET /eapi/v1/index` (public).
+pub(crate) const E_INDEX: usize = 12;
+/// `GET /eapi/v1/mark` (public).
+pub(crate) const E_MARK: usize = 13;
+
+/// The options probe's templates: the paths eapi documents (the time at
+/// `T_TIME`), every one carrying the key header (a public read ignores it).
+fn eapi_specs<'a>(key: &'a [(&'a str, &'a str)]) -> Vec<ReqSpec<'a>> {
+    let q = |path| ReqSpec {
+        method: Method::Get,
+        path,
+        params: Params::Query,
+        headers: key,
+    };
+    let b = |path| ReqSpec {
+        method: Method::Post,
+        path,
+        params: Params::Body(exec_binance::rest::FORM),
+        headers: key,
+    };
+    vec![
+        q("/eapi/v1/marginAccount"),
+        q("/eapi/v1/position"),
+        q("/eapi/v1/openOrders"),
+        q("/eapi/v1/time"),
+        b("/eapi/v1/listenKey"),
+        b("/eapi/v1/order"),
+        q("/eapi/v1/order"),
+        q("/eapi/v1/countdownCancelAll"),
+        q("/eapi/v1/userTrades"),
+        q("/eapi/v1/exerciseRecord"),
+        q("/eapi/v1/historyOrders"),
+        q("/eapi/v1/depth"),
+        q("/eapi/v1/index"),
+        q("/eapi/v1/mark"),
+    ]
 }
 
 /// The signature character the negative control changes: the first
@@ -1554,9 +1648,10 @@ mod tests {
         for h in ["fapi.binance.com", "dapi.binance.com", "api.binance.com", "fstream.binance.com", "ws-api.binance.com", "localhost"] {
             assert!(demo_host(h).is_err(), "{h}");
         }
-        // BX8: every one of the Demo scope's nine hosts — spot's WS API too.
+        // BX8: every one of the Demo scope's eleven hosts — spot's WS API,
+        // and (BX9) eapi's and the options stream host.
         let h = exec_binance::config::Hosts::of(Scope::Demo);
-        for host in [&h.fut_wsapi, &h.fut_user, &h.fut_rest, &h.cm_wsapi, &h.cm_user, &h.cm_rest, &h.papi, &h.sapi, &h.spot_wsapi] {
+        for host in [&h.fut_wsapi, &h.fut_user, &h.fut_rest, &h.cm_wsapi, &h.cm_user, &h.cm_rest, &h.papi, &h.sapi, &h.spot_wsapi, &h.eapi, &h.opt_user] {
             assert!(demo_host(host).is_ok(), "{host}");
         }
     }

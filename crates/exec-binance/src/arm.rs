@@ -14,8 +14,16 @@
 //!    quantity and notional, the maximum quantity, and the percent-price
 //!    band while a fresh mark exists (each judged by cross-multiplying in
 //!    `i128`: no division on the submit path);
-//! 4. **the governors** ([`crate::gov`]): the ORDERS windows, the UM
-//!    quantitative rules, the open orders per symbol and the breadth;
+//! 4. **the governors** ([`crate::gov`]): the ORDERS windows (futures',
+//!    spot's or options' pool, by the row's product), the UM quantitative
+//!    rules, the open orders per symbol and the breadth (futures' alone);
+//!    **The writing law (BX9, BX-18)** rides this step: on an option row
+//!    the account may not write ([`crate::inst::INST_WRITABLE`] clear) a
+//!    SELL with no long of the owner's to reduce is refused
+//!    ([`Refusal::NotWritable`]); any other SELL there leaves REDUCE-ONLY,
+//!    so the venue itself refuses one that would open a short — the arm's
+//!    view of the position is the gateway's booked one ([`EVT_POSITION`]),
+//!    which lags orders in flight; the venue's flag does not;
 //! 5. **the push**: one [`BnCmd`] into the command ring (the kit's
 //!    duplex, [`crate::cmd::duplex`]), stamped with its push time. A full
 //!    ring is `QueueFull` and the router books nothing.
@@ -76,8 +84,14 @@ use core_types::{
 use exec_gateway::stats::{HALT_NONE, PUBLISHED_WORDS, SWEEP_STRANDED, SWEEP_WORKING};
 
 use crate::cmd::*;
-use crate::gov::{classify, CodeClass, FuturesOrders, Qtr, QtrRow, SpotOrders, ARM_WEIGHT_MAX_PER_MIN, QTR_DUST_USD_1E6};
-use crate::inst::{rx, InstTable, INST_INVERSE, INST_LIVE, INST_MAX, INST_NO_DEADMAN, INST_OWNED, PRODUCT_COINM, PRODUCT_SPOT, PRODUCT_USDM, ROW_NONE};
+use crate::gov::{
+    classify, CodeClass, FuturesOrders, OptionOrders, Qtr, QtrRow, SpotOrders, ARM_WEIGHT_MAX_PER_MIN, OPT_ARM_WEIGHT_MAX_PER_MIN,
+    QTR_DUST_USD_1E6,
+};
+use crate::inst::{
+    rx, InstTable, INST_INVERSE, INST_LIVE, INST_MAX, INST_NO_DEADMAN, INST_OWNED, INST_WRITABLE, PRODUCT_COINM, PRODUCT_OPTIONS,
+    PRODUCT_SPOT, PRODUCT_USDM, ROW_NONE,
+};
 use crate::margin::{MarginBook, SLOTS};
 use crate::mode::AccountMode;
 use crate::num::{ceil_to, floor_to};
@@ -139,10 +153,13 @@ pub enum Refusal {
     /// Order flags this arm does not honour (an unknown bit), or that
     /// contradict the kind (a post-only IoC) — BX7, the operator's ruling.
     Flags = 19,
+    /// BX9 (BX-18): a SELL on an option row this account may not write,
+    /// with no long of the owner's to reduce — it could only open a short.
+    NotWritable = 20,
 }
 
 /// Refusal reasons.
-pub const REFUSALS: usize = 20;
+pub const REFUSALS: usize = 21;
 /// The `/state` words, by [`Refusal`].
 pub const REFUSAL_WORDS: [&str; REFUSALS] = [
     "unbound",
@@ -165,6 +182,7 @@ pub const REFUSAL_WORDS: [&str; REFUSALS] = [
     "verb",
     "deadman_down",
     "flags",
+    "not_writable",
 ];
 
 /// The arm's counters (`/state` `exec.arms.binance`).
@@ -396,6 +414,8 @@ pub struct BnArm {
     fut: FuturesOrders,
     /// Spot's ORDERS pool and its unfilled-order mirror (BX8).
     spot: SpotOrders,
+    /// Options' ORDERS pool (BX9).
+    opt: OptionOrders,
     qtr: Qtr,
     knobs: ArmKnobs,
     margin: MarginBook,
@@ -444,6 +464,28 @@ const fn admit_flags(flags: u8, maker: bool, spot: bool) -> Result<(), Refusal> 
     }
 }
 
+/// The futures products (the UM quantitative rules, the breadth and the
+/// futures ORDERS pool are theirs alone).
+#[inline(always)]
+const fn is_futures(product: u8) -> bool {
+    product == PRODUCT_USDM || product == PRODUCT_COINM
+}
+
+/// **BX9 (BX-18) — the writing law** (module docs, step 4): the flags the
+/// order leaves with. On an option row not writable a SELL with no long to
+/// reduce (`pos_1e6` ≤ 0, the gateway's booked position) is refused; any
+/// other SELL there is sent reduce-only. Every other order keeps its flags.
+#[inline(always)]
+const fn writing_law(product: u8, row_flags: u8, side: Side, flags: u8, pos_1e6: i64) -> Result<u8, Refusal> {
+    if product != PRODUCT_OPTIONS || row_flags & INST_WRITABLE != 0 || !matches!(side, Side::Ask) {
+        return Ok(flags);
+    }
+    if pos_1e6 <= 0 {
+        return Err(Refusal::NotWritable);
+    }
+    Ok(flags | ORDER_FLAG_REDUCE_ONLY)
+}
+
 /// `⌊a · b / 1e6⌋ < m` for `a, b ≥ 0`, without the division:
 /// `⌊x / d⌋ < m ⇔ x < m · d`.
 #[inline(always)]
@@ -464,6 +506,7 @@ impl BnArm {
             inst,
             fut: FuturesOrders::new(knobs.orders_frac_1e6),
             spot: SpotOrders::new(knobs.orders_frac_1e6),
+            opt: OptionOrders::new(knobs.orders_frac_1e6),
             qtr: Qtr {
                 frac_1e6: knobs.qtr_frac_1e6,
             },
@@ -540,10 +583,11 @@ impl BnArm {
     }
 
     /// Open-order count change on `row`, keeping the breadth and QTR `N`
-    /// — futures rows' alone (BX8: neither is a spot rule).
+    /// — futures rows' alone (BX8: neither is a spot rule; BX9: nor an
+    /// options one).
     #[inline(always)]
     fn open_delta(&mut self, row: u16, up: bool) {
-        let futures = self.inst.hot(row).product != PRODUCT_SPOT;
+        let futures = is_futures(self.inst.hot(row).product);
         let was_active = self.active(row);
         let r = &mut self.rt[rx(row)];
         let was_open = r.open > 0;
@@ -655,7 +699,7 @@ impl BnArm {
                 DispatchError::NoLiveRoute
             }
             Refusal::NotOwner => DispatchError::NoLiveRoute,
-            Refusal::Kind | Refusal::NoDeadman | Refusal::Verb | Refusal::Flags => DispatchError::Unsupported,
+            Refusal::Kind | Refusal::NoDeadman | Refusal::Verb | Refusal::Flags | Refusal::NotWritable => DispatchError::Unsupported,
             Refusal::NotReady | Refusal::DeadmanDown => DispatchError::Disconnected,
             Refusal::Price | Refusal::MinQty | Refusal::MinNotional | Refusal::MaxQty | Refusal::Band | Refusal::Ttl => {
                 DispatchError::Unsupported
@@ -670,8 +714,11 @@ impl BnArm {
         let now = core_time::now_ns();
         let row = self.admit(o.sym, o.strategy_id, o.kind, now)?;
         let maker = o.kind == ORDER_KIND_MAKER;
-        let spot = self.inst.hot(row).product == PRODUCT_SPOT;
+        let product = self.inst.hot(row).product;
+        let spot = product == PRODUCT_SPOT;
         admit_flags(o.flags, maker, spot)?;
+        // BX9 (BX-18) — the writing law (module docs, step 4).
+        let flags = writing_law(product, self.inst.hot(row).flags, o.side, o.flags, self.rt[rx(row)].pos_1e6)?;
         if maker && o.ttl_ns != 0 && o.ttl_ns < self.knobs.min_maker_ttl_ns {
             return Err(Refusal::Ttl);
         }
@@ -685,6 +732,11 @@ impl BnArm {
             // quantitative rules and the breadth are futures' alone.
             self.spot.roll(wall_ms);
             if !self.spot.admits(now) {
+                return Err(Refusal::Orders);
+            }
+        } else if product == PRODUCT_OPTIONS {
+            // BX9: options' own pool; no quantitative rule, no breadth.
+            if !self.opt.admits(now) {
                 return Err(Refusal::Orders);
             }
         } else {
@@ -701,17 +753,19 @@ impl BnArm {
         if max_orders > 0 && (self.rt[r].open as i64 + 1) * 1_000_000 > max_orders * self.knobs.orders_frac_1e6 {
             return Err(Refusal::MaxOrders);
         }
-        if !spot && !self.active(row) && self.active_rows >= self.knobs.max_symbols {
+        if is_futures(product) && !self.active(row) && self.active_rows >= self.knobs.max_symbols {
             return Err(Refusal::Breadth);
         }
         // ---- push -----------------------------------------------------------
         let deadline = if maker && o.ttl_ns != 0 { now + o.ttl_ns } else { 0 };
-        let cmd = BnCmd::place(o.client_oid, px, qty, deadline, row, o.kind, o.side, o.strategy_id, o.flags).at(now);
+        let cmd = BnCmd::place(o.client_oid, px, qty, deadline, row, o.kind, o.side, o.strategy_id, flags).at(now);
         if !self.end.cmd.push(&cmd) {
             return Err(Refusal::QueueFull);
         }
         if spot {
             self.spot.commit(now);
+        } else if product == PRODUCT_OPTIONS {
+            self.opt.commit(now);
         } else {
             self.fut.commit(now);
             Qtr::on_place(&mut self.qtr_rows[r], maker, dust);
@@ -737,13 +791,14 @@ impl BnArm {
         if (e.row as usize) < self.inst.len() {
             self.open_delta(e.row, false);
             let ioc = self.seen_kind_ioc(e);
-            if self.inst.hot(e.row).product == PRODUCT_SPOT {
+            let product = self.inst.hot(e.row).product;
+            if product == PRODUCT_SPOT {
                 // BX8: the venue takes an order that filled off the day's
                 // unfilled count.
                 if filled {
                     self.spot.filled(self.knobs.anchor.wall_of(e.ts_ns) / 1_000_000);
                 }
-            } else {
+            } else if is_futures(product) {
                 let icr = e.flags & EVT_F_ICR != 0;
                 Qtr::on_end(&mut self.qtr_rows[rx(e.row)], filled, ioc, icr);
             }
@@ -780,6 +835,15 @@ impl BnArm {
                     CodeClass::WouldTake | CodeClass::Budget | CodeClass::Lock => {}
                     CodeClass::RowFatal => {
                         self.inst.retire_row(e.row);
+                        self.reject_streak += 1;
+                    }
+                    CodeClass::WriteFatal => {
+                        // BX9 (BX-18): no writing on the underlying, for
+                        // every row of it; its longs still trade.
+                        if (e.row as usize) < self.inst.len() {
+                            let uly = self.inst.hot(e.row).uly;
+                            self.inst.unwrite_underlying(uly);
+                        }
                         self.reject_streak += 1;
                     }
                     CodeClass::Reject | CodeClass::Clock | CodeClass::Unknown => {
@@ -881,8 +945,8 @@ impl BnArm {
                     let was = self.active(e.row);
                     self.rt[rx(e.row)].pos_1e6 = e.a;
                     let is = self.active(e.row);
-                    // The breadth is futures' alone (BX8).
-                    if self.inst.hot(e.row).product != PRODUCT_SPOT {
+                    // The breadth is futures' alone (BX8, BX9).
+                    if is_futures(self.inst.hot(e.row).product) {
                         self.active_rows = (self.active_rows + is as u32).saturating_sub(was as u32);
                     }
                 }
@@ -1199,7 +1263,7 @@ impl OrderDispatch for BnArm {
             _ => st.push_to_write.quantile_ns(0.99),
         });
         self.lat_next.set(((k + 1) % LAT_QUANTILES) as u8);
-        // COPY: the report (600 B) into the caller's — cold, once a second;
+        // COPY: the report (632 B) into the caller's — cold, once a second;
         // built whole, so no field is left from an earlier read — rejected:
         // field-by-field writes into `out` (the same bytes, less legible).
         *out = BinanceArmReport {
@@ -1242,6 +1306,8 @@ impl OrderDispatch for BnArm {
             sweep: self.cancel_all_state() as u64,
             weight_used: st.published(crate::gateway::PW_WEIGHT),
             weight_max: ARM_WEIGHT_MAX_PER_MIN,
+            opt_weight_used: st.published(crate::gateway::PW_OPT_WEIGHT),
+            opt_weight_max: OPT_ARM_WEIGHT_MAX_PER_MIN,
             orders_10s_used: self.fut.w10s.used(now_ns) as u64,
             orders_10s_cap: self.fut.w10s.cap() as u64,
             orders_1m_used: self.fut.w1m.used(now_ns) as u64,
@@ -1249,6 +1315,7 @@ impl OrderDispatch for BnArm {
             quiet_left_ms: seen.budget_until_ns.saturating_sub(now_ns) / 1_000_000,
             margin_usdm_1e6: self.margin.ratio(PRODUCT_USDM),
             margin_coinm_1e6: self.margin.ratio(PRODUCT_COINM),
+            margin_options_1e6: self.margin.ratio(PRODUCT_OPTIONS),
             owned_rows: owned,
             account_mode: self.knobs.mode as u64,
             demo: u64::from(self.knobs.demo),

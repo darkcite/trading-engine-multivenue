@@ -2,7 +2,7 @@
 // Copyright 2026 Anton (darkcite)
 
 //! **BX7b — the Binance Demo battery** (`exec-smoke --binance <um|cm|spot,
-//! comma-separated> --lifecycle`; the build plan
+//! comma-separated, or options alone> --lifecycle`; the build plan
 //! `claude/bx7b-build-plan-2026-10-08.md` §3.4, BX8's §3.7): the engine's
 //! arm, router and gateway — `RoutedDispatcher` → `VenueSplit` → `BnArm` →
 //! the command ring → `BnGateway` on its own thread → fill lane 4 and the
@@ -78,6 +78,21 @@
 //!    alias to the Binance arm and its fills on lane 4 carrying sym 7; each
 //!    cycle proven by a reconciliation journaled after its SELL that
 //!    agrees.
+//!    **Options' cycles** (BX9; `--bn-cycles` of them, alone on the
+//!    account — REST-only on eapi, the options HMAC key, Q-1): the row
+//!    is BTC's first call above the index × 1.05 a day out (`bn_probe`'s
+//!    pick); before each IoC the book's touch, the mark and the index are
+//!    read (`/eapi/v1/depth`, `mark`, `index`) and handed to the router as
+//!    an options summary (the ledger's Q-2 law prices the row). The cycles
+//!    alternate LONG and SHORT: with a two-sided book, an IoC through the
+//!    touch (a BUY at the ask; a SELL at the bid — an opening short on a
+//!    writable row) within `--bn-usd`, then a reduce-only IoC closing what
+//!    it filled through the other side, each fill's leg proven by an
+//!    agreeing reconciliation; with no two-sided book (Demo's options
+//!    books are often empty), an IoC at the band's far edge that the venue
+//!    must end unfilled — the place, the stream's NEW and EXPIRED, the
+//!    retirement — with an agreeing reconciliation every fourth cycle and
+//!    after the last.
 //! 4. *The halt's sweep* (USDⓈ-M, last — a halted slot refuses every order
 //!    after it): two quotes, then an operator halt of the slot; the router
 //!    asks the arm to cancel the slot: `Working`, then `Clear`, the venue
@@ -92,7 +107,10 @@
 //!    loudest.
 //!
 //! **The bar** is the plan's, absolute ([`bar_short`]): a clean run short
-//! of it exits with the short phase's code, never 0.
+//! of it exits with the short phase's code, never 0. Options' (BX9): two
+//! LONG and two SHORT IoCs answered, two agreeing reconciliations — fills
+//! reported, not required (a Demo book may be empty: the venue's own
+//! ending of an IoC is the lane's evidence then).
 //!
 //! **Signals.** Before the boot nothing of the battery's is on the account:
 //! a signal ends it there. After it, every wait and every growth reads the
@@ -127,8 +145,8 @@ use core_config::universe::{Instrument, LEGACY_BN_ANCHOR_SYM};
 use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
 use core_ring::{Consumer, Ring};
 use core_types::{
-    make_symbol_id, symbol_venue_byte, CancelReq, ChannelEvent, ChannelId, ExecRecord, Fill, ModifyReq, Order, Price,
-    Qty, Side, SymbolId, VenueId, ORDER_FLAG_POST_ONLY, ORDER_FLAG_REDUCE_ONLY, SYMBOL_ID_NONE,
+    make_symbol_id, symbol_venue_byte, CancelReq, ChannelEvent, ChannelId, ExecRecord, Fill, ModifyReq, OptSummary, Order,
+    Price, Qty, Side, SymbolId, VenueId, OPT_SUMMARY_FLAG_MARK_PX, ORDER_FLAG_POST_ONLY, ORDER_FLAG_REDUCE_ONLY, SYMBOL_ID_NONE,
 };
 use exec_binance::arm::{
     ArmKnobs, BnArm, Refusal, GW_CONNECT_FAILURES, GW_FILLS_LOST, GW_JOURNAL_DROPPED, GW_RECONNECTS, GW_RECON_DRIFT_LEGS,
@@ -138,18 +156,19 @@ use exec_binance::cid::{CidPrefix, CID_LEN};
 use exec_binance::cmd::{duplex, EVT_F_SWEEP_DONE};
 use exec_binance::config::{BnConfig, Signer};
 use exec_binance::gateway::{BnGateway, BootErr, GwKnobs, Phase, QUIET_NS, ROTATE_AFTER_NS};
-use exec_binance::inst::{AssetName, BnInstCold, BnInstHot, PRODUCT_COINM, PRODUCT_SPOT, PRODUCT_USDM};
+use exec_binance::inst::{AssetName, BnInstCold, BnInstHot, PRODUCT_COINM, PRODUCT_OPTIONS, PRODUCT_SPOT, PRODUCT_USDM};
 use exec_binance::journal::{
     fee_fields, JournalTx, FEE_ASSET_BNB, FEE_ASSET_OTHER, JOURNAL_RING, J_ACK, J_ENDED, J_FEE, J_FILL, J_RECON, J_REJECT,
 };
 use exec_binance::margin::{MarginBook, SLOTS};
 use exec_binance::mode::{judge_one_way, judge_permission, judge_single_asset, judge_symbol_config, AccountMode, AssertErr};
 use exec_binance::num::floor_to;
-use exec_binance::recon::MARGIN_CROSS;
+use exec_binance::recon::{scan_opt_margin, scan_opt_positions, PosRow, MARGIN_CROSS};
 use exec_binance::rest::{
-    render_account, render_by_cid, scan_listen_key, R_ACCOUNT, R_CANCEL, R_STATUS, T_DUAL, T_LISTEN_KEY_NEW,
+    render_account, render_by_cid, scan_listen_key, QuerySigner, R_ACCOUNT, R_CANCEL, R_STATUS, T_DUAL, T_LISTEN_KEY_NEW,
     T_MULTI_ASSETS, T_OPEN_ORDERS, T_SYMBOL_CONFIG,
 };
+use exec_binance::userstream::Span;
 use exec_binance::userstream::{scan_user_event, UserEvent, S_CANCELED, UE_ORDER, UE_TRADE_LITE, X_TRADE};
 use exec_binance::wsapi::{Part, WsStatic};
 use exec_router::{ExecMode, ExecRoute, HaltLimits, HaltReason, NullLiveDispatcher, RoutedDispatcher, SlotCaps, VenueSplit};
@@ -160,10 +179,12 @@ use tracing::{error, info, warn};
 use crate::bn_demo::{
     account_of, demo_config, discover, discover_spot, is_arms, notional_1e6, open_orders, order_state, orders_of,
     product_word, px_off, qty_for, read_account, read_spot_account, render_spot_account, spot_account_of, spot_symbol_ok,
-    wall_ms, Line, Public, Rest, Ws, EXIT_ACCOUNT, EXIT_BOOT, EXIT_CYCLE, EXIT_DRILL, EXIT_FILLS, EXIT_LEFTOVER,
-    EXIT_PERMISSION, EXIT_POST_ONLY, EXIT_RECON, EXIT_SWEEP, EXIT_TTL, ORD0, RECV_WINDOW_MS, SPOT_ACCOUNT, STP_MODE,
+    wall_ms, Answer, Line, Public, Rest, Ws, EXIT_ACCOUNT, EXIT_BOOT, EXIT_CYCLE, EXIT_DRILL, EXIT_FILLS, EXIT_LEFTOVER,
+    EXIT_PERMISSION, EXIT_POST_ONLY, EXIT_RECON, EXIT_SWEEP, EXIT_TTL, E_MARGIN, E_MARK, E_OPEN, E_POSITION, ORD0,
+    RECV_WINDOW_MS, SPOT_ACCOUNT, STP_MODE,
 };
-use crate::bn_live::{bind_table, BindSet};
+use crate::bn_probe::{ceil_tick, eapi_info, opt_index_1e6, opt_touch, pick_row, OptRow};
+use crate::bn_live::{bind_options, bind_table, BindSet, OptSet};
 use crate::bn_ops::{flatten, OpsSpec, Reach, DEFAULT_LEVERAGE_CAP};
 use crate::exec_boot::route_aliases;
 
@@ -214,6 +235,9 @@ const MOVE_BPS: i64 = 30;
 /// The reconciliation cadence the battery asks of the gateway (the
 /// `recon_every_ms` floor `exec.toml` allows).
 const RECON_EVERY_MS: u64 = 10_000;
+/// BX9: options' cycle — eapi's own weight (`gov::opt_day_row_ns`): a
+/// 10 s cycle is past the lane's share; 25 s leaves the day room.
+const RECON_EVERY_OPT_MS: u64 = 25_000;
 /// How long a verb's answer may take, and a reconciliation (two cycles and
 /// room).
 const STEP_WAIT: Duration = Duration::from_secs(15);
@@ -260,6 +284,14 @@ const BAR_FILLS_CM: u32 = 4;
 const BAR_RECONS_CM: u32 = 2;
 const BAR_FILLS_SPOT: u32 = 4;
 const BAR_RECONS_SPOT: u32 = 2;
+/// BX9: options' bar — LONG and SHORT IoCs answered each, and agreeing
+/// reconciliations (fills reported, not required: module docs).
+const BAR_OPT_SIDE: u32 = 2;
+const BAR_RECONS_OPT: u32 = 2;
+/// BX9: the options row's id (the chain's first, as the engine allocates).
+const OPT_SYM: SymbolId = make_symbol_id(VenueId::Binance, core_config::universe::BN_OPT_ORDINAL_BASE + 1);
+/// The options row's underlying (`bn_probe::pick_row`'s).
+const OPT_UNDERLYING: &str = "BTCUSDT";
 /// What a step that stopped for a signal says.
 const STOPPED: &str = "stopped by a signal";
 
@@ -289,6 +321,9 @@ pub struct BatterySpec {
     /// Spot armed (BX8: IoC-only, classic, on the WS API alone — its user
     /// data rides the order session).
     pub spot: bool,
+    /// BX9: options armed — alone (REST-only on eapi, the options HMAC
+    /// key: Q-1; IoC-only, no dead-man).
+    pub options: bool,
     /// The REST order route (`order_transport = "rest"`) instead of the WS
     /// API.
     pub rest: bool,
@@ -348,22 +383,23 @@ const HEARTBEAT_MS: u64 = 10_000;
 /// How long past the countdown the gap drill waits for the venue.
 const DRILL_MARGIN: Duration = Duration::from_secs(10);
 
-/// **`--binance`'s products** (`um`, `cm`, `spot`, comma-separated):
-/// `(um, cm, spot)` armed.
+/// **`--binance`'s products** (`um`, `cm`, `spot`, `options`,
+/// comma-separated): `(um, cm, spot, options)` armed.
 ///
 /// # Errors
-/// A word that is not one of the three — refused, never skipped.
-pub fn parse_products(list: &str) -> Result<(bool, bool, bool), String> {
-    let (mut um, mut cm, mut spot) = (false, false, false);
+/// A word that is not one of the four — refused, never skipped.
+pub fn parse_products(list: &str) -> Result<(bool, bool, bool, bool), String> {
+    let (mut um, mut cm, mut spot, mut options) = (false, false, false, false);
     for p in list.split(',') {
         match p.trim() {
             "um" => um = true,
             "cm" => cm = true,
             "spot" => spot = true,
-            other => return Err(format!("`{other}` is not a product (um, cm, spot)")),
+            "options" => options = true,
+            other => return Err(format!("`{other}` is not a product (um, cm, spot, options)")),
         }
     }
-    Ok((um, cm, spot))
+    Ok((um, cm, spot, options))
 }
 
 impl BatterySpec {
@@ -372,8 +408,13 @@ impl BatterySpec {
     /// # Errors
     /// What the operator must change.
     pub fn check(&self) -> Result<(), String> {
-        if !self.um && !self.cm && !self.spot {
-            return Err(String::from("--binance names no product (um, cm, spot — comma-separated)"));
+        if !self.um && !self.cm && !self.spot && !self.options {
+            return Err(String::from("--binance names no product (um, cm, spot — comma-separated — or options)"));
+        }
+        // BX9: options' lane runs alone — REST-only on eapi under the
+        // options key; no drill (no dead-man, no flatten tool of its own).
+        if self.options && (self.um || self.cm || self.spot || self.drill.is_some()) {
+            return Err(String::from("--binance options runs alone (no other product, no --bn-drill)"));
         }
         if self.hmac && !self.rest {
             return Err(String::from("--hmac needs --rest: HMAC signs REST only (the WS API logon takes Ed25519)"));
@@ -462,8 +503,12 @@ struct Report {
     why: String,
     left: Vec<String>,
     cycles: u32,
-    fills: [u32; 3],
-    recons: [u32; 3],
+    fills: [u32; 4],
+    recons: [u32; 4],
+    /// BX9: options' IoCs answered (ended or refused by the venue), LONG
+    /// and SHORT.
+    opt_long: u32,
+    opt_short: u32,
     sweeps: u32,
     ttl: u32,
     post_only: u32,
@@ -525,14 +570,15 @@ impl Report {
 /// maker cycles, a post-only refusal, a TTL cancel, 6 fills, 3 agreeing
 /// reconciliations, a halt's sweep. COIN-M: the maker refused, 4 fills, 2
 /// reconciliations. Spot (BX8): an order routed through the alias, 4
-/// fills, 2 reconciliations.
+/// fills, 2 reconciliations. Options (BX9): 2 LONG and 2 SHORT IoCs
+/// answered, 2 reconciliations.
 fn bar_short(spec: &BatterySpec, rep: &Report) -> Option<(u8, String)> {
     // A drill is its own bar: its verdict is the run's code.
     if spec.drill.is_some() {
         return None;
     }
-    let (um, cm, sp) = (PRODUCT_USDM as usize, PRODUCT_COINM as usize, PRODUCT_SPOT as usize);
-    let need: [(bool, u32, u32, u8, &str); 12] = [
+    let (um, cm, sp, op) = (PRODUCT_USDM as usize, PRODUCT_COINM as usize, PRODUCT_SPOT as usize, PRODUCT_OPTIONS as usize);
+    let need: [(bool, u32, u32, u8, &str); 15] = [
         (spec.um, rep.cycles, BAR_CYCLES, EXIT_CYCLE, "maker cycles"),
         (spec.um, rep.post_only, 1, EXIT_POST_ONLY, "post-only refusals"),
         (spec.um, rep.ttl, 1, EXIT_TTL, "TTL cancels"),
@@ -545,6 +591,9 @@ fn bar_short(spec: &BatterySpec, rep: &Report) -> Option<(u8, String)> {
         (spec.spot, rep.alias, 1, EXIT_FILLS, "spot orders routed through the alias"),
         (spec.spot, rep.fills[sp], BAR_FILLS_SPOT, EXIT_FILLS, "spot fills"),
         (spec.spot, rep.recons[sp], BAR_RECONS_SPOT, EXIT_RECON, "spot agreeing reconciliations"),
+        (spec.options, rep.opt_long, BAR_OPT_SIDE, EXIT_FILLS, "options LONG IoCs answered"),
+        (spec.options, rep.opt_short, BAR_OPT_SIDE, EXIT_FILLS, "options SHORT IoCs answered"),
+        (spec.options, rep.recons[op], BAR_RECONS_OPT, EXIT_RECON, "options agreeing reconciliations"),
     ];
     let mut i = 0;
     while i < need.len() {
@@ -655,13 +704,17 @@ struct LaneB {
     symbol: String,
     sym: SymbolId,
     rest: Rest,
-    public: Public,
+    /// The product's market data (BX9: `None` on the options lane — its
+    /// touch, mark and index are eapi reads on [`LaneB::rest`]).
+    public: Option<Public>,
     /// The arm's row (tick, step, minimums, decimals), read once bound.
     h: BnInstHot,
     /// Its PERCENT_PRICE band (a touch is judged against it).
     c: BnInstCold,
     /// Spot's own (BX8); `None` on a futures lane.
     spot: Option<SpotLeg>,
+    /// Options' own (BX9): the row's band and steps; `None` elsewhere.
+    opt: Option<OptRow>,
 }
 
 /// **A spot lane's own** (BX8): its base asset — whose balance is the leg —
@@ -698,9 +751,10 @@ type Router = RoutedDispatcher<PaperDispatcher, VenueSplit<NullLiveDispatcher, B
 
 struct Battery {
     spec: BatterySpec,
-    /// The key's configuration: held, never read again — the seed lives as
-    /// long as anything signs (`bn_live`'s law).
-    _cfg: BnConfig,
+    /// The key's configuration: held — the seed lives as long as anything
+    /// signs (`bn_live`'s law) — and, BX9, the options key it lends the
+    /// options lane's reads ([`BnConfig::opt_hmac`]).
+    cfg: BnConfig,
     signer: Signer,
     lanes: Vec<LaneB>,
     d: Router,
@@ -754,7 +808,7 @@ fn summary(spec: &BatterySpec, rep: &mut Report) -> u8 {
     phase("END")
         .n("exit", i64::from(code))
         .b("bar_met", code == 0)
-        .s("route", if spec.rest { "rest" } else { "ws" })
+        .s("route", if spec.rest || spec.options { "rest" } else { "ws" })
         .s("signing", if spec.hmac { "hmac" } else { "ed25519" })
         .n("cycles", i64::from(rep.cycles))
         .n("fills_usdm", i64::from(rep.fills[PRODUCT_USDM as usize]))
@@ -763,6 +817,10 @@ fn summary(spec: &BatterySpec, rep: &mut Report) -> u8 {
         .n("recons_usdm", i64::from(rep.recons[PRODUCT_USDM as usize]))
         .n("recons_coinm", i64::from(rep.recons[PRODUCT_COINM as usize]))
         .n("recons_spot", i64::from(rep.recons[PRODUCT_SPOT as usize]))
+        .n("fills_options", i64::from(rep.fills[PRODUCT_OPTIONS as usize]))
+        .n("recons_options", i64::from(rep.recons[PRODUCT_OPTIONS as usize]))
+        .n("options_long", i64::from(rep.opt_long))
+        .n("options_short", i64::from(rep.opt_short))
         .n("spot_cycles", i64::from(rep.spot_cycles))
         .n("alias_routed", i64::from(rep.alias))
         .s("last_recon", &rep.last_recon.map_or_else(|| String::from("none"), |(ok, drift)| format!("reconciled {ok} drift {drift} USD×1e6")))
@@ -821,6 +879,13 @@ impl Battery {
             }
         };
         let cfg = demo_config(spec.hmac).map_err(acct)?;
+        // BX9 (Q-1): options sign with the scope's HMAC pair — the arm's own
+        // key under `--bn-hmac`, else read for the options lane alone.
+        let cfg = if spec.options && !spec.hmac {
+            cfg.with_options_hmac_env().map_err(|e| acct(format!("the options key (the Demo HMAC pair): {e:?}")))?
+        } else {
+            cfg
+        };
         let signer = cfg.signer().map_err(|e| acct(format!("the signer: {e:?}")))?;
         let mut sets = Vec::with_capacity(3);
         let mut reads: Vec<(u8, String, SymbolId, Rest, Public, Option<SpotLeg>)> = Vec::with_capacity(3);
@@ -862,22 +927,59 @@ impl Battery {
             sets.push((*product, vec![Instrument { sym: *sym, name: symbol.clone(), descriptor }], vec![(symbol.clone(), row)]));
             reads.push((*product, symbol.clone(), *sym, rest, public, spot));
         }
+        // BX9: the options row (alone — the spec's law) and the options
+        // account, read with the options key (the self-test first, BX-3).
+        let mut opt_lane: Option<(OptRow, Rest)> = None;
+        if spec.options {
+            stopped()?;
+            let mut rest = Rest::eapi_ops(&cfg, tls.clone()).map_err(acct)?;
+            let (offset, rtt) = rest.clock().map_err(acct)?;
+            phase("clock").s("host", rest.host()).n("offset_ms", offset).n("rtt_ms", rtt as i64).emit();
+            let info = eapi_info(&tls, rest.host()).map_err(|e| acct(format!("eapi's exchangeInfo: {e}")))?;
+            let row = pick_row(&mut rest, &info).map_err(acct)?;
+            let h = cfg.opt_hmac().ok_or_else(|| acct(String::from("no options key (Q-1: the Demo HMAC pair)")))?;
+            exec_binance::config::hmac_self_test().map_err(|e| acct(format!("the options key's self-test: {e:?}")))?;
+            opt_account_check(&mut rest, h).map_err(acct)?;
+            phase("options_row")
+                .s("symbol", &row.symbol)
+                .n("expiry_ms", row.expiry_ms)
+                .n("strike", row.strike_1e9 / 1_000_000_000)
+                .n("tick_1e6", row.tick_1e6)
+                .n("step_1e6", row.step_1e6)
+                .n("min_qty_1e6", row.min_qty_1e6)
+                .n("band_lo_1e6", row.min_px_1e6)
+                .n("band_hi_1e6", row.max_px_1e6)
+                .b("writable", row.row.naked_sell)
+                .emit();
+            opt_lane = Some((row, rest));
+        }
         // The arm's table, bound as `bn_live` binds it (classic: USDT-margined
         // USDⓈ-M rows only; COIN-M IoC-only; spot IoC-only, its row under the
-        // alias, the ledger's row spot's law — BX8).
+        // alias, the ledger's row spot's law — BX8; BX9: the options row, its
+        // writability the underlying's `nakedSell`).
         let binds: Vec<BindSet<'_>> = sets
             .iter()
             .map(|(product, insts, rows)| BindSet { product: *product, insts, rows, owned: &[] })
             .collect();
         let alias = if spec.spot { LEGACY_BN_ANCHOR_SYM } else { SYMBOL_ID_NONE };
-        let (table, wire, specs) = bind_table(&binds, alias, AccountMode::Classic, false).map_err(|e| (EXIT_ACCOUNT, e))?;
+        let (mut table, mut wire, mut specs) = bind_table(&binds, alias, AccountMode::Classic, false).map_err(|e| (EXIT_ACCOUNT, e))?;
+        if let Some((row, _)) = opt_lane.as_ref() {
+            let chain = [(row.symbol.clone(), OPT_SYM)];
+            let set = OptSet { chain: &chain, rows: core::slice::from_ref(&row.row), owned: &[], write: true };
+            bind_options(&mut table, &mut wire, &mut specs, &set, false).map_err(|e| (EXIT_ACCOUNT, e))?;
+        }
         let mut lanes: Vec<LaneB> = reads
             .into_iter()
             .map(|(product, symbol, sym, rest, public, spot)| {
                 let row = table.row_of(sym);
-                LaneB { product, h: *table.hot(row), c: *table.cold(row), symbol, sym, rest, public, spot }
+                LaneB { product, h: *table.hot(row), c: *table.cold(row), symbol, sym, rest, public: Some(public), spot, opt: None }
             })
             .collect();
+        if let Some((row, rest)) = opt_lane {
+            let r = table.row_of(OPT_SYM);
+            let (h, c) = (*table.hot(r), *table.cold(r));
+            lanes.push(LaneB { product: PRODUCT_OPTIONS, symbol: row.symbol.clone(), sym: OPT_SYM, rest, public: None, h, c, spot: None, opt: Some(row) });
+        }
 
         // The tap first: the account's listenKey (the gateway's POST returns
         // the same one).
@@ -910,7 +1012,7 @@ impl Battery {
             stp_mode: String::from(STP_MODE),
             countdown_ms: COUNTDOWN_MS,
             heartbeat_ms: HEARTBEAT_MS,
-            recon_every_ms: RECON_EVERY_MS,
+            recon_every_ms: if spec.options { RECON_EVERY_OPT_MS } else { RECON_EVERY_MS },
             spin: false,
             rotate_after_ns: if spec.rotate_s == 0 { ROTATE_AFTER_NS } else { spec.rotate_s * 1_000_000_000 },
             rest_orders: spec.rest,
@@ -935,7 +1037,7 @@ impl Battery {
         phase("boot")
             .n("ms", t0.elapsed().as_millis() as i64)
             .n("epoch", i64::from(epoch))
-            .s("route", if spec.rest { "rest" } else { "ws" })
+            .s("route", if spec.rest || spec.options { "rest" } else { "ws" })
             .n("adopted", i64::from(adopted))
             .n("adopted_usd", adopted_usd / 1_000_000)
             .n("unseen_legs", i64::from(unseen))
@@ -951,7 +1053,8 @@ impl Battery {
         let mut lim = [0i64; SLOTS];
         lim[SLOT as usize] = 600_000;
         let mut prods = [0u8; SLOTS];
-        prods[SLOT as usize] = (u8::from(spec.um) << PRODUCT_USDM) | (u8::from(spec.cm) << PRODUCT_COINM);
+        prods[SLOT as usize] =
+            (u8::from(spec.um) << PRODUCT_USDM) | (u8::from(spec.cm) << PRODUCT_COINM) | (u8::from(spec.options) << PRODUCT_OPTIONS);
         let arm = BnArm::new(
             eng_end,
             table,
@@ -997,7 +1100,7 @@ impl Battery {
             .map_err(|e| boot(format!("the gateway thread: {e}")))?;
         Ok(Self {
             spec: spec.clone(),
-            _cfg: cfg,
+            cfg,
             signer,
             lanes,
             d,
@@ -1178,7 +1281,8 @@ impl Battery {
     /// bands against it; the ledger prices with it).
     fn priced(&mut self, l: usize) -> Result<(i64, i64), String> {
         let lane = &mut self.lanes[l];
-        let (t, mark, index) = lane.public.priced(lane.symbol.as_bytes(), &lane.c)?;
+        let public = lane.public.as_mut().ok_or("the options lane has no futures mark (`opt_priced`)")?;
+        let (t, mark, index) = public.priced(lane.symbol.as_bytes(), &lane.c)?;
         let ev = ChannelEvent::new(core_time::now_ns(), VenueId::Binance, ChannelId::Mark, lane.sym, 0, wall_ms(), mark, index);
         self.d.on_venue_event(&ev);
         Ok((t.bid_1e6, t.ask_1e6))
@@ -1318,6 +1422,13 @@ impl Battery {
             for i in 0..self.spec.cycles {
                 self.spot_cycle(l, i, rep)?;
                 rep.spot_cycles += 1;
+            }
+        }
+        // BX9: options' cycles (alone on the account).
+        if self.spec.options {
+            let l = self.lane(PRODUCT_OPTIONS);
+            for i in 0..self.spec.cycles {
+                self.opt_cycle(l, i, rep)?;
             }
         }
         if self.spec.um {
@@ -1761,6 +1872,130 @@ impl Battery {
         Ok((o.client_oid, n, end_ns))
     }
 
+    /// **BX9 — the options lane's touch, mark and index** (eapi's public
+    /// reads, as the mark lane would): the mark and the index handed to the
+    /// router as an options summary — the ledger's Q-2 law prices the row
+    /// with them, stamped fresh — and the book's best bid and ask (`None`
+    /// for an empty side).
+    fn opt_priced(&mut self, l: usize) -> Result<(Option<i64>, Option<i64>), String> {
+        let lane = &mut self.lanes[l];
+        let (bid, ask) = opt_touch(&mut lane.rest, &lane.symbol)?;
+        let a = lane.rest.plain(E_MARK, format!("symbol={}", lane.symbol).as_bytes())?;
+        let mark = opt_mark_1e6(&a, lane.symbol.as_bytes())?;
+        let index = opt_index_1e6(&mut lane.rest, OPT_UNDERLYING)?;
+        let s = OptSummary::new(core_time::now_ns(), VenueId::Binance, lane.sym, OPT_SUMMARY_FLAG_MARK_PX, mark.saturating_mul(1_000), 0, index.saturating_mul(1_000), 0, 0, 0, 0, 0);
+        self.d.on_opt_summary(&s);
+        Ok((bid, ask))
+    }
+
+    /// **One options IoC** (BX9) at `px` for `qty` — reduce-only when
+    /// `reduce` — through the growth gate (an opening order) or the reduce
+    /// gate (a close), waited to its end: (its fills, the signed quantity
+    /// filled, its end's time, its end). Filled or not: the venue ends an
+    /// IoC either way.
+    fn opt_ioc(&mut self, l: usize, side: Side, px: i64, qty: i64, reduce: bool) -> Result<(u32, i64, u64, (u8, i32)), String> {
+        let o = self.order(l, side, ORDER_KIND_IOC, px, qty, if reduce { ORDER_FLAG_REDUCE_ONLY } else { 0 }, 0);
+        if reduce {
+            self.may_reduce()?;
+        } else {
+            self.may_grow()?;
+        }
+        self.verb(false, |d| d.submit(&o))?;
+        let end = self.end_of(o.client_oid, STEP_WAIT)?;
+        let end_ns = self.end_rec(o.client_oid).map_or(0, |r| r.ts_ns);
+        // The fills reach lane 4 before the retirement (obligation 1).
+        let (n, q) = self.filled(o.client_oid);
+        phase("options_ioc")
+            .s("side", if side == Side::Bid { "buy" } else { "sell" })
+            .b("reduce_only", reduce)
+            .n("px", px)
+            .n("qty", qty)
+            .n("filled", q)
+            .n("fills", i64::from(n))
+            .s("end", &format!("{end:?}"))
+            .b("ack_journaled", self.rec(J_ACK, o.client_oid).is_some())
+            .emit();
+        if end.0 == J_REJECT {
+            return Err(format!("the venue refused the IoC: {}", end.1));
+        }
+        Ok((n, q, end_ns, end))
+    }
+
+    /// **One options cycle** (module docs, 3; BX9): LONG on an even `i`,
+    /// SHORT on an odd one — through the touch with a two-sided book within
+    /// `--bn-usd` (what it filled then closed reduce-only through the other
+    /// side, each fill's leg proven by an agreeing reconciliation), else at
+    /// the band's far edge (a BUY at its floor, a SELL at its ceiling), which
+    /// the venue ends unfilled — an agreeing reconciliation every fourth
+    /// cycle and after the last.
+    fn opt_cycle(&mut self, l: usize, i: u32, rep: &mut Report) -> Result<(), Fail> {
+        let fail = |e: String| (EXIT_FILLS, format!("options cycle {i}: {e}"));
+        let long = i % 2 == 0;
+        let (bid, ask) = self.opt_priced(l).map_err(fail)?;
+        let row = self.lanes[l].opt.as_ref().ok_or_else(|| fail(String::from("not the options lane")))?;
+        let (tick, step) = (row.tick_1e6.max(1), row.step_1e6.max(1));
+        let qty = ceil_tick(step.max(row.min_qty_1e6), step);
+        let (touch, other) = if long { (ask, bid) } else { (bid, ask) };
+        let cap = i128::from(self.spec.usd.saturating_mul(1_000_000));
+        let through = touch.filter(|px| other.is_some() && i128::from(*px) * i128::from(qty) / 1_000_000 <= cap);
+        let px = through.unwrap_or(if long { ceil_tick(row.min_px_1e6.max(tick), tick) } else { row.max_px_1e6 / tick * tick });
+        let (n, q, end_ns, end) = self.opt_ioc(l, if long { Side::Bid } else { Side::Ask }, px, qty, false).map_err(fail)?;
+        if long {
+            rep.opt_long += 1;
+        } else {
+            rep.opt_short += 1;
+        }
+        rep.fills[PRODUCT_OPTIONS as usize] += n;
+        if through.is_none() && q != 0 {
+            return Err(fail(format!("an IoC at the band's far edge filled {q} (ended {end:?})")));
+        }
+        let mut closed = true;
+        if q != 0 {
+            self.reconciled_after(end_ns, PRODUCT_OPTIONS, rep).map_err(|e| (EXIT_RECON, e))?;
+            if self.pos(self.lanes[l].sym) == 0 {
+                return Err(fail(String::from("the fill moved no position in the ledger")));
+            }
+            closed = self.opt_close(l, rep)?;
+        } else if i % 4 == 3 || i + 1 == self.spec.cycles {
+            self.reconciled_after(end_ns, PRODUCT_OPTIONS, rep).map_err(|e| (EXIT_RECON, e))?;
+        }
+        let left = self.pos(self.lanes[l].sym);
+        phase("options_cycle")
+            .n("i", i64::from(i))
+            .s("side", if long { "long" } else { "short" })
+            .b("through_the_touch", through.is_some())
+            .n("filled", q)
+            .n("left", left)
+            .emit();
+        if !closed || left != 0 {
+            return Err(fail(format!("the reduce-only close left {left} (closed {closed})")));
+        }
+        Ok(())
+    }
+
+    /// **Close the options position the ledger holds** (BX9): a reduce-only
+    /// IoC through the touch's closing side, its fill's leg proven by an
+    /// agreeing reconciliation — `false` while a position is left (the side
+    /// empty, or the IoC short of it).
+    fn opt_close(&mut self, l: usize, rep: &mut Report) -> Result<bool, Fail> {
+        let fills = |e: String| (EXIT_FILLS, format!("the options close: {e}"));
+        let sym = self.lanes[l].sym;
+        let pos = self.pos(sym);
+        if pos == 0 {
+            return Ok(true);
+        }
+        let (bid, ask) = self.opt_priced(l).map_err(fills)?;
+        let Some(px) = (if pos > 0 { bid } else { ask }) else {
+            return Ok(false);
+        };
+        let (n, _, end_ns, _) = self.opt_ioc(l, if pos > 0 { Side::Ask } else { Side::Bid }, px, pos.abs(), true).map_err(fills)?;
+        rep.fills[PRODUCT_OPTIONS as usize] += n;
+        if n > 0 {
+            self.reconciled_after(end_ns, PRODUCT_OPTIONS, rep).map_err(|e| (EXIT_RECON, e))?;
+        }
+        Ok(self.pos(sym) == 0)
+    }
+
     /// **One spot cycle** (module docs, 3; BX8): an IoC BUY of `--bn-usd`
     /// across the ask; its base-asset commission off its `J_FEE` records
     /// ([`base_fee_1e9`]: one a trade — every trade's, or no SELL is sized
@@ -1831,7 +2066,7 @@ impl Battery {
         let h = self.lanes[l].h;
         let t = {
             let lane = &mut self.lanes[l];
-            lane.public.touch(lane.symbol.as_bytes())?
+            lane.public.as_mut().ok_or("spot's lane has its market data")?.touch(lane.symbol.as_bytes())?
         };
         let (side, px, qty) = match sell {
             None => {
@@ -1911,6 +2146,18 @@ impl Battery {
         while l < self.lanes.len() {
             if self.lanes[l].spot.is_some() {
                 self.spot_close(l, rep);
+                l += 1;
+                continue;
+            }
+            // BX9: the options lane's — through its touch, while one exists.
+            if self.lanes[l].opt.is_some() {
+                let mut tries = 0;
+                while !self.gw_killed && tries < CLOSE_TRIES && self.pos(self.lanes[l].sym) != 0 && self.may_reduce().is_ok() {
+                    tries += 1;
+                    if let Err((_, e)) = self.opt_close(l, rep) {
+                        warn!("binance-battery: the end's options close: {e}");
+                    }
+                }
                 l += 1;
                 continue;
             }
@@ -2080,7 +2327,12 @@ impl Battery {
         let epoch_prefix = String::from_utf8_lossy(&ours[..10]).into_owned();
         let mut signed = Vec::with_capacity(self.lanes.len());
         for lane in &mut self.lanes {
-            signed.push(sign_flat(lane, &self.signer));
+            // BX9: the options lane's reads sign with the options key.
+            signed.push(match (lane.opt.is_some(), self.cfg.opt_hmac()) {
+                (false, _) => sign_flat(lane, &self.signer),
+                (true, Some(h)) => sign_flat(lane, h),
+                (true, None) => Err(String::from("no options key signs the flat read")),
+            });
         }
         let (lanes, prefix) = (&mut self.lanes, epoch_prefix.as_str());
         let found: Vec<Vec<String>> = std::thread::scope(|sc| {
@@ -2101,11 +2353,16 @@ impl Battery {
 }
 
 /// The flat read's two requests on `lane` — the account's open orders, its
-/// positions (spot's, BX8: its balances) — signed into their templates'
-/// windows under [`FLAT_RECV_WINDOW_MS`] (the second is sent only after the
-/// first is answered): their lengths.
-fn sign_flat(lane: &mut LaneB, signer: &Signer) -> Result<(usize, usize), String> {
+/// positions (spot's, BX8: its balances; options', BX9: eapi's) — signed
+/// into their templates' windows under [`FLAT_RECV_WINDOW_MS`] (the second
+/// is sent only after the first is answered): their lengths.
+fn sign_flat(lane: &mut LaneB, signer: &impl QuerySigner) -> Result<(usize, usize), String> {
     let long = WsStatic::new(STP_MODE, FLAT_RECV_WINDOW_MS);
+    if lane.opt.is_some() {
+        let orders = lane.rest.sign(E_OPEN, signer, false, |w, _, ts| render_account(w, &long, ts))?;
+        let positions = lane.rest.sign(E_POSITION, signer, false, |w, _, ts| render_account(w, &long, ts))?;
+        return Ok((orders, positions));
+    }
     let orders = lane.rest.sign(T_OPEN_ORDERS, signer, false, |w, _, ts| render_account(w, &long, ts))?;
     let account = if lane.spot.is_some() {
         lane.rest.sign(SPOT_ACCOUNT, signer, false, |w, _, ts| render_spot_account(w, &long, ts))?
@@ -2129,13 +2386,26 @@ fn flat_lane(lane: &mut LaneB, signed: Result<(usize, usize), String>, epoch_pre
             return left;
         }
     };
-    match lane.rest.send(T_OPEN_ORDERS, orders).and_then(|a| orders_of(&a)) {
+    let orders_t = if lane.opt.is_some() { E_OPEN } else { T_OPEN_ORDERS };
+    match lane.rest.send(orders_t, orders).and_then(|a| orders_of(&a)) {
         Ok(v) => {
             for o in v.iter().filter(|o| o.cid.starts_with(epoch_prefix)) {
                 left.push(format!("{pw}: order {} on {}", o.cid, o.symbol));
             }
         }
         Err(e) => left.push(format!("{pw}: the open orders could not be read ({e})")),
+    }
+    // BX9: the options row flat (eapi's positions).
+    if lane.opt.is_some() {
+        match lane.rest.send(E_POSITION, account).and_then(|a| opt_positions(&a)) {
+            Ok(held) => {
+                for (symbol, amt) in held.iter().filter(|(s, _)| *s == lane.symbol) {
+                    left.push(format!("{symbol}: a position of {amt}"));
+                }
+            }
+            Err(e) => left.push(format!("{}: the options position could not be read ({e})", lane.symbol)),
+        }
+        return left;
     }
     if let Some(s) = lane.spot {
         match lane.rest.send(SPOT_ACCOUNT, account).and_then(|a| spot_account_of(&a, s.base)) {
@@ -2162,6 +2432,105 @@ fn flat_lane(lane: &mut LaneB, signed: Result<(usize, usize), String>, epoch_pre
         Err(e) => left.push(format!("{}: the position could not be read ({e})", lane.symbol)),
     }
     left
+}
+
+/// **BX9 — the options account before the boot** (eapi, the options key):
+/// it can trade and is not reduce-only (`marginAccount`; the boot refuses
+/// either), it holds no option (one on a row the battery does not bind is
+/// an unseen leg — the boot would never reconcile), and no order rests on
+/// it (one of ours refuses the boot; the IoC-only lane sweeps none).
+fn opt_account_check(rest: &mut Rest, h: &impl QuerySigner) -> Result<(), String> {
+    let a = rest.signed(E_MARGIN, h, false, render_account)?;
+    if a.status != 200 {
+        return Err(format!("marginAccount answered {} {}", a.status, a.text()));
+    }
+    let m = scan_opt_margin(&a.body, Span { at: 0, len: a.body.len() as u32 }).map_err(|e| format!("marginAccount did not scan: {e:?}"))?;
+    phase("options_account")
+        .b("can_trade", m.can_trade)
+        .b("reduce_only", m.reduce_only)
+        .n("equity_1e6", m.equity_1e6)
+        .n("maint_1e6", m.maint_1e6)
+        .emit();
+    if !m.can_trade || m.reduce_only {
+        return Err(format!("the options account cannot open (canTrade {}, reduceOnly {})", m.can_trade, m.reduce_only));
+    }
+    let held = rest.signed(E_POSITION, h, false, render_account).and_then(|a| opt_positions(&a))?;
+    if !held.is_empty() {
+        return Err(format!("the options account holds {held:?} — close them first (the battery binds one row)"));
+    }
+    let open = rest.signed(E_OPEN, h, false, render_account).and_then(|a| orders_of(&a))?;
+    if let Some(o) = open.first() {
+        return Err(format!("{} order(s) rest on the options account ({} on {} first)", open.len(), o.cid, o.symbol));
+    }
+    Ok(())
+}
+
+/// **BX9 — the options held** (`/eapi/v1/position`, the gateway's scanner):
+/// each open position's symbol and side-signed amount ×1e6.
+///
+/// # Errors
+/// The read did not answer 200, or did not scan.
+fn opt_positions(a: &Answer) -> Result<Vec<(String, i64)>, String> {
+    if a.status != 200 {
+        return Err(format!("the options positions answered {} {}", a.status, a.text()));
+    }
+    let mut rows = vec![PosRow::default(); exec_binance::inst::INST_MAX];
+    let n = scan_opt_positions(&a.body, &mut rows).map_err(|e| format!("the options positions did not scan: {e:?}"))?;
+    Ok(rows[..n].iter().filter(|p| p.amt_1e6 != 0).map(|p| (String::from_utf8_lossy(p.symbol.get(&a.body)).into_owned(), p.amt_1e6)).collect())
+}
+
+/// **BX9 — a row's mark** in `/eapi/v1/mark`'s answer (an array of
+/// `{"symbol":…,"markPrice":…,…}`), ×1e6: the element naming `symbol`.
+/// Read as the gateway reads (BX7's one-reading law; the parser review,
+/// round 2): the answer whole, each element's keys once, one element
+/// naming the symbol, its mark positive.
+///
+/// # Errors
+/// The read did not answer 200, or is no such answer.
+fn opt_mark_1e6(a: &Answer, symbol: &[u8]) -> Result<i64, String> {
+    use exec_binance::json::{dec_1e6, str_of, Elems, Pairs};
+    if a.status != 200 {
+        return Err(format!("the mark read answered {} {}", a.status, a.text()));
+    }
+    let b = &a.body;
+    let bad = |what: &str| format!("the mark read: {what}");
+    let mut rows = Elems::new(b, 0).map_err(|()| bad("no array"))?;
+    let mut found: Option<i64> = None;
+    while let Some((ra, _)) = rows.next().map_err(|()| bad("a malformed element"))? {
+        let mut p = Pairs::new(b, ra).map_err(|()| bad("an element that is no object"))?;
+        let (mut name, mut mark, mut seen) = (None, None, 0u8);
+        while let Some((k, va, vz)) = p.next().map_err(|()| bad("a malformed pair"))? {
+            let bit = match k {
+                b"symbol" => {
+                    name = Some(str_of(b, va, vz).map_err(|()| bad("a symbol that is no string"))?);
+                    1
+                }
+                b"markPrice" => {
+                    mark = Some(dec_1e6(b, va, vz).map_err(|()| bad("a markPrice that is no number"))?);
+                    2
+                }
+                _ => 0,
+            };
+            if seen & bit != 0 {
+                return Err(bad("a key named twice"));
+            }
+            seen |= bit;
+        }
+        if name == Some(symbol) {
+            if found.is_some() {
+                return Err(bad("the symbol named twice"));
+            }
+            found = Some(mark.ok_or_else(|| bad("the element carries no markPrice"))?);
+        }
+    }
+    if rows.end().is_none_or(|z| b[z..].iter().any(|c| !c.is_ascii_whitespace())) {
+        return Err(bad("bytes after the array"));
+    }
+    match found {
+        Some(m) if m > 0 => Ok(m),
+        Some(m) => Err(bad(&format!("a mark of {m}"))),
+        None => Err(format!("the mark read names no {}", String::from_utf8_lossy(symbol))),
+    }
 }
 
 /// The arm's refusals that moved between two readings, by name.
@@ -2420,6 +2789,7 @@ mod tests {
             um: true,
             cm: true,
             spot: false,
+            options: false,
             rest: false,
             hmac: false,
             um_symbol: String::from("BTCUSDT"),
@@ -2466,8 +2836,8 @@ mod tests {
     fn full() -> Report {
         Report {
             cycles: 10,
-            fills: [0, 6, 4],
-            recons: [0, 6, 4],
+            fills: [0, 6, 4, 0],
+            recons: [0, 6, 4, 0],
             sweeps: 1,
             ttl: 1,
             post_only: 1,
@@ -2605,16 +2975,60 @@ mod tests {
     }
 
     /// The parse refuses an unknown word, as before; each product is armed
-    /// by its word, in any order, once or twice.
+    /// by its word, in any order, once or twice (BX9: `options` too).
     #[test]
-    fn the_product_list_names_um_cm_and_spot_only() {
-        assert_eq!(parse_products("um"), Ok((true, false, false)));
-        assert_eq!(parse_products("spot"), Ok((false, false, true)));
-        assert_eq!(parse_products("spot, um,cm"), Ok((true, true, true)));
-        assert_eq!(parse_products("um,um"), Ok((true, false, false)));
-        for bad in ["", "options", "um,", "SPOT", "um;cm"] {
+    fn the_product_list_names_um_cm_spot_and_options_only() {
+        assert_eq!(parse_products("um"), Ok((true, false, false, false)));
+        assert_eq!(parse_products("spot"), Ok((false, false, true, false)));
+        assert_eq!(parse_products("spot, um,cm"), Ok((true, true, true, false)));
+        assert_eq!(parse_products("um,um"), Ok((true, false, false, false)));
+        assert_eq!(parse_products("options"), Ok((false, false, false, true)));
+        for bad in ["", "option", "um,", "SPOT", "um;cm", "eapi"] {
             assert!(parse_products(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// BX9 (the parser review, round 2): the battery's mark read is the
+    /// gateway's law — the answer whole, keys once, one element naming the
+    /// symbol, its mark positive.
+    #[test]
+    fn the_battery_reads_a_mark_as_the_gateway_reads() {
+        let a = |body: &str| Answer { status: 200, body: body.as_bytes().to_vec() };
+        let ok = r#"[{"symbol":"X","markPrice":"12.5","bidIV":"0"},{"symbol":"Y","markPrice":"3"}]"#;
+        assert_eq!(opt_mark_1e6(&a(ok), b"X"), Ok(12_500_000));
+        assert_eq!(opt_mark_1e6(&a(ok), b"Y"), Ok(3_000_000));
+        assert!(opt_mark_1e6(&a(ok), b"Z").unwrap_err().contains("names no Z"));
+        for bad in [
+            r#"[{"symbol":"X","markPrice":"1"},{"symbol":"X","markPrice":"2"}]"#,
+            r#"[{"symbol":"X","markPrice":"1","markPrice":"2"}]"#,
+            r#"[{"symbol":"X","markPrice":"0"}]"#,
+            r#"[{"symbol":"X","markPrice":"1"}] x"#,
+            r#"[{"symbol":"X"}]"#,
+            r#"[{"symbol":"X","markPrice":"1"},{"symbol":"Y","markPrice":}]"#,
+        ] {
+            assert!(opt_mark_1e6(&a(bad), b"X").is_err(), "{bad}");
+        }
+    }
+
+    /// BX9: options run alone (no other product, no drill), on either key;
+    /// their bar is two LONG and two SHORT IoCs answered and two agreeing
+    /// reconciliations — fills reported, not required; the report's arrays
+    /// hold options' at its product index.
+    #[test]
+    fn options_run_alone_to_their_own_bar() {
+        let opt = BatterySpec { um: false, cm: false, options: true, ..spec() };
+        assert!(opt.check().is_ok());
+        assert!(BatterySpec { rest: true, hmac: true, ..opt.clone() }.check().is_ok(), "the arm's own HMAC key");
+        assert!(BatterySpec { um: true, ..opt.clone() }.check().is_err(), "beside USDⓈ-M");
+        assert!(BatterySpec { spot: true, ..opt.clone() }.check().is_err(), "beside spot");
+        assert!(BatterySpec { drill: Some(Drill::Flatten), ..opt.clone() }.check().is_err(), "a drill");
+        assert_eq!(PRODUCT_OPTIONS, 3, "the report's arrays are indexed by product");
+        let met = Report { opt_long: 2, opt_short: 2, recons: [0, 0, 0, 2], ..Report::default() };
+        assert_eq!(bar_short(&opt, &met), None, "no fill needed");
+        let short = Report { opt_short: 1, ..met };
+        assert_eq!(bar_short(&opt, &short).map(|(c, _)| c), Some(EXIT_FILLS));
+        let unreconciled = Report { recons: [0, 0, 0, 1], ..Report { opt_long: 2, opt_short: 2, ..Report::default() } };
+        assert_eq!(bar_short(&opt, &unreconciled).map(|(c, _)| c), Some(EXIT_RECON));
     }
 
     /// Spot rides the WS API (no REST route, so no HMAC key); its symbol
@@ -2644,10 +3058,10 @@ mod tests {
     #[test]
     fn spots_bar_is_the_alias_four_fills_and_two_reconciliations() {
         let sp = BatterySpec { um: false, cm: false, spot: true, ..spec() };
-        let met = Report { fills: [4, 0, 0], recons: [2, 0, 0], alias: 4, ..Report::default() };
+        let met = Report { fills: [4, 0, 0, 0], recons: [2, 0, 0, 0], alias: 4, ..Report::default() };
         assert_eq!(bar_short(&sp, &met), None);
         let short = |f: fn(&mut Report)| {
-            let mut r = Report { fills: [4, 0, 0], recons: [2, 0, 0], alias: 4, ..Report::default() };
+            let mut r = Report { fills: [4, 0, 0, 0], recons: [2, 0, 0, 0], alias: 4, ..Report::default() };
             f(&mut r);
             bar_short(&sp, &r).map(|(code, _)| code)
         };

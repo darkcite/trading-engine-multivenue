@@ -6,7 +6,9 @@
 //! user stream), COIN-M (`dapi`, ws-dapi, dstream), Portfolio Margin
 //! (`papi`, `/pm/ws/`), PM Pro's risk stream and SAPI's unified account —
 //! and spot (BX8: `api/v3`, and the `/ws-api/v3` sessions, which carry the
-//! account's user data beside their answers) — all on one listener. The
+//! account's user data beside their answers) — and options (BX9: `eapi`
+//! REST under the options key's own HMAC, the `/private/ws/` stream) — all
+//! on one listener. The
 //! gateway's end-to-end tests (`tests/bn_e2e_loopback.rs`) and allocation
 //! gate 94 run the real [`crate::gateway::BnGateway`] against it. Feature
 //! `testvenue` only; never in a production build.
@@ -25,6 +27,17 @@
 //! caused — on every subscribed session's queue (a make-before-break
 //! overlap's two sessions both carry each event); each session's thread
 //! sends its queue, then reads (2 ms at most), in turn.
+//!
+//! **Options (BX9)** keep their own store ([`OptOrder`]) and positions by
+//! symbol; every `/eapi/` request must name [`OPT_KEY`] (or, when the
+//! account's key is HMAC, [`KEY`]) and sign with its secret — an Ed25519
+//! key there is refused `-2015`, as the Demo answered (K-probe OP2). An
+//! IoC fills at its limit as [`VState::opt_ioc_plan`] says; the stream
+//! carries `ORDER_TRADE_UPDATE` (the futures letters, `er`, a NEGATIVE
+//! commission) and the options `ACCOUNT_UPDATE` (`B`/`P`, no `a`). A SELL
+//! that would open a short is refused `-6057` where the venue will not let
+//! the account write ([`VState::opt_writable`]), `-2022` when sent
+//! reduce-only past the holding.
 //!
 //! COPY-DOCTRINE: test fixture; allocates and copies freely.
 
@@ -93,6 +106,37 @@ const SPOT_PAIRS: [(&str, &str, &str); 5] = [
 /// Their tick ×1e8 (0.01): an IoC's k-th trade is k + 1 ticks better than
 /// its limit.
 const SPOT_TICK_1E8: i64 = 1_000_000;
+
+/// BX9 (Q-1): the options key — the scope's HMAC pair, not the arm's.
+pub const OPT_KEY: &str = "e2eOpTk3yE2Ek3ye2eK3yE2Ek3ye2eK3yE2Ek3ye2eK3yE2Ek3ye2eK3yE2EkOpT1";
+/// Its secret.
+pub const OPT_HMAC_SECRET: [u8; HMAC_SECRET_LEN] = *b"e2eOptSecret0123456789e2eOptSecret0123456789e2eOptSecret01234567";
+/// The options stream's listenKey (`/private/ws/<key>`).
+const OPT_LISTEN_KEY: &str = "opia91ma19a5s61cv6a81va65sdf19v8a65a1a5s61cv6a81va65sdf19v8a65op";
+/// eapi's `exchangeInfo`: BTC writable (`nakedSell`); a call at 85 000 and
+/// a put at 90 000, both expiring 2026-12-25 08:00Z (the discovery's own
+/// fixture's shape).
+pub const EAPI: &[u8] = br#"{"timezone":"UTC","serverTime":1791638168114,"optionContracts":[{"baseAsset":"BTC","quoteAsset":"USDT","underlying":"BTCUSDT","settleAsset":"USDT","nakedSell":true}],"optionAssets":[{"name":"USDT"}],"optionSymbols":[{"expiryDate":1798185600000,"filters":[{"filterType":"PRICE_FILTER","minPrice":"5.000","maxPrice":"23300.000","tickSize":"5.000"},{"filterType":"LOT_SIZE","minQty":"0.0001","maxQty":"200","stepSize":"0.0100"}],"symbol":"BTC-261225-85000-C","side":"CALL","strikePrice":"85000.000","underlying":"BTCUSDT","unit":1,"minQty":"0.0001","maxQty":"200","priceScale":3,"quantityScale":4,"quoteAsset":"USDT","status":"TRADING","contractType":"CRYPTO_OPTIONS","underlyingType":"CRYPTO"},{"expiryDate":1798185600000,"filters":[{"filterType":"PRICE_FILTER","minPrice":"5.000","maxPrice":"60000.000","tickSize":"5.000"},{"filterType":"LOT_SIZE","minQty":"0.0001","maxQty":"200","stepSize":"0.0100"}],"symbol":"BTC-261225-90000-P","side":"PUT","strikePrice":"90000.000","underlying":"BTCUSDT","unit":1,"minQty":"0.0001","maxQty":"200","priceScale":3,"quantityScale":4,"quoteAsset":"USDT","status":"TRADING","contractType":"CRYPTO_OPTIONS","underlyingType":"CRYPTO"}],"rateLimits":[{"rateLimitType":"REQUEST_WEIGHT","interval":"MINUTE","intervalNum":1,"limit":400}]}"#;
+/// [`EAPI`]'s call and put.
+pub const OPT_CALL: &str = "BTC-261225-85000-C";
+/// The put.
+pub const OPT_PUT: &str = "BTC-261225-90000-P";
+
+/// **An exercise record** (`/eapi/v1/exerciseRecord`'s row, BX9): `symbol`
+/// settled at `exercise_px_1e6`, `qty_1e6` of it held on `long`'s side,
+/// paying `amount_1e6` (the venue's sign) less `fee_1e6`.
+pub fn exercise_record(symbol: &str, long: bool, qty_1e6: i64, exercise_px_1e6: i64, amount_1e6: i64, fee_1e6: i64) -> String {
+    format!(
+        r#"{{"id":"1125899906842624000","currency":"USDT","symbol":"{symbol}","exercisePrice":"{}","markPrice":"{}","quantity":"{}","amount":"{}","fee":"{}","createDate":{},"priceScale":3,"quantityScale":4,"optionSide":"CALL","positionSide":"{}","quoteAsset":"USDT"}}"#,
+        fx(exercise_px_1e6, 3),
+        fx(exercise_px_1e6, 3),
+        fx(qty_1e6, 2),
+        fx(amount_1e6, 3),
+        fx(fee_1e6, 3),
+        now_ms(),
+        if long { "LONG" } else { "SHORT" }
+    )
+}
 
 // =========================================================================
 // Small codecs (the venue's side; independent of the crate under test)
@@ -473,6 +517,91 @@ impl Trade {
     }
 }
 
+/// **One options order the venue holds** (BX9), in options' own store
+/// ([`VState::opt_orders`]); its figures ×1e6.
+#[derive(Clone, Debug)]
+pub struct OptOrder {
+    /// The venue's order id.
+    pub oid: u64,
+    /// The client id it was placed with.
+    pub cid: String,
+    /// The option.
+    pub symbol: String,
+    /// A buy; else a sell.
+    pub buy: bool,
+    /// Sent reduce-only.
+    pub reduce_only: bool,
+    /// The quantity ×1e6 (contracts).
+    pub qty: i64,
+    /// The limit price ×1e6.
+    pub px: i64,
+    /// Filled so far ×1e6.
+    pub executed: i64,
+    /// `NEW`, `PARTIALLY_FILLED`, `FILLED` or `EXPIRED`.
+    pub status: &'static str,
+}
+
+impl OptOrder {
+    /// Still working.
+    pub fn open(&self) -> bool {
+        self.status == "NEW" || self.status == "PARTIALLY_FILLED"
+    }
+
+    fn side(&self) -> &'static str {
+        if self.buy {
+            "BUY"
+        } else {
+            "SELL"
+        }
+    }
+
+    /// eapi's order shape (`quantity`, never `origQty`) — the place's ACK,
+    /// the query's and the open listing's (where a working order reads
+    /// `ACCEPTED`).
+    fn result(&self, listing: bool) -> String {
+        let status = if listing && self.status == "NEW" { "ACCEPTED" } else { self.status };
+        format!(
+            r#"{{"orderId":{},"symbol":"{}","price":"{}","quantity":"{}","executedQty":"{}","fee":"0","side":"{}","type":"LIMIT","timeInForce":"IOC","reduceOnly":{},"postOnly":false,"createTime":{},"updateTime":{},"status":"{status}","avgPrice":"{}","clientOrderId":"{}","priceScale":3,"quantityScale":4,"optionSide":"CALL","quoteAsset":"USDT","mmp":false}}"#,
+            self.oid,
+            self.symbol,
+            fx(self.px, 3),
+            fx(self.qty, 2),
+            fx(self.executed, 2),
+            self.side(),
+            self.reduce_only,
+            now_ms(),
+            now_ms(),
+            fx(if self.executed > 0 { self.px } else { 0 }, 3),
+            self.cid
+        )
+    }
+
+    /// The options stream's `ORDER_TRADE_UPDATE` (K-probe OP5: the futures
+    /// letters, `er`, `b`/`a`; `N` USDT) — the commission NEGATIVE, as
+    /// eapi's `fee` is.
+    fn update(&self, x: &str, last: i64, tid: u64) -> Vec<u8> {
+        let now = now_ms();
+        let fee = (last as i128 * self.px as i128 * 3 / 10_000_000_000) as i64;
+        format!(
+            r#"{{"e":"ORDER_TRADE_UPDATE","E":{now},"T":{now},"o":{{"s":"{}","c":"{}","S":"{}","o":"LIMIT","f":"IOC","q":"{}","p":"{}","ap":"{}","sp":"0","x":"{x}","X":"{}","i":{},"l":"{}","z":"{}","L":"{}","N":"USDT","n":"{}","T":{now},"t":{tid},"b":"0","a":"0","m":false,"R":{},"ps":"BOTH","rp":"0","er":"0","V":"EXPIRE_MAKER"}}}}"#,
+            self.symbol,
+            self.cid,
+            self.side(),
+            fx(self.qty, 2),
+            fx(self.px, 3),
+            fx(if self.executed > 0 { self.px } else { 0 }, 3),
+            self.status,
+            self.oid,
+            fx(last, 2),
+            fx(self.executed, 2),
+            fx(if last > 0 { self.px } else { 0 }, 3),
+            fx(-fee, 6),
+            self.reduce_only
+        )
+        .into_bytes()
+    }
+}
+
 impl SpotOrder {
     /// Still working: `NEW` or `PARTIALLY_FILLED`.
     pub fn open(&self) -> bool {
@@ -836,6 +965,52 @@ pub struct VState {
     pub spot_accounts: u32,
     /// `ticker/price` reads served.
     pub spot_tickers: u32,
+    // ---- Options (BX9) ----------------------------------------------------
+    /// Every options order, open or ended, in placement order.
+    pub opt_orders: Vec<OptOrder>,
+    /// The options positions ×1e6 by symbol (a short negative).
+    pub opt_pos_1e6: BTreeMap<String, i64>,
+    /// Each option's mark ×1e6 (`position`'s `markPrice`).
+    pub opt_mark_1e6: BTreeMap<String, i64>,
+    /// BTCUSDT's index ×1e6 (`/eapi/v1/index`).
+    pub opt_index_1e6: i64,
+    /// The options account: equity, adjusted equity and maintenance ×1e6,
+    /// `canTrade`, `reduceOnly`.
+    pub opt_equity_1e6: i64,
+    /// Its adjusted equity.
+    pub opt_adj_equity_1e6: i64,
+    /// Its maintenance margin.
+    pub opt_maint_1e6: i64,
+    /// `canTrade`.
+    pub opt_can_trade: bool,
+    /// `reduceOnly`.
+    pub opt_reduce_only: bool,
+    /// The venue lets the account write (else an opening short: `-6057`).
+    pub opt_writable: bool,
+    /// A trade pushes the options `ACCOUNT_UPDATE` (gate 110 turns it off:
+    /// its paced margin re-read would land in a window at its own time).
+    pub opt_account_events: bool,
+    /// Per IoC, in order: the quantity it fills (none queued: all of it).
+    pub opt_ioc_plan: VecDeque<i64>,
+    /// The exercise records `exerciseRecord` answers (raw rows).
+    pub opt_exercise: Vec<String>,
+    /// The options stream's frames waiting to be sent.
+    pub opt_user_q: VecDeque<Vec<u8>>,
+    /// Options stream connections accepted.
+    pub opt_user_conns: u32,
+    /// Every options place, its parameters as received.
+    pub opt_places: Vec<String>,
+    /// Every `userTrades` read, its parameters as received.
+    pub opt_trade_reads: Vec<String>,
+    /// Every `exerciseRecord` read, its parameters as received.
+    pub opt_exercise_reads: Vec<String>,
+    /// `/eapi/v1/index` reads served.
+    pub opt_index_reads: u32,
+    /// `apiRestrictions`' `enableVanillaOptions`, under the arm's key and
+    /// under the options key.
+    pub key_options: bool,
+    /// Under the options key.
+    pub opt_key_options: bool,
     day_start_ms: u64,
 }
 
@@ -989,6 +1164,27 @@ impl VState {
             spot_subscribes: 0,
             spot_accounts: 0,
             spot_tickers: 0,
+            opt_orders: Vec::new(),
+            opt_pos_1e6: BTreeMap::new(),
+            opt_mark_1e6: BTreeMap::from([(String::from(OPT_CALL), 500_000_000), (String::from(OPT_PUT), 25_100_000_000)]),
+            opt_index_1e6: PX_MARK,
+            opt_equity_1e6: 2_000_000_000,
+            opt_adj_equity_1e6: 2_000_000_000,
+            opt_maint_1e6: 10_000_000,
+            opt_can_trade: true,
+            opt_reduce_only: false,
+            opt_writable: true,
+            opt_account_events: true,
+            opt_ioc_plan: VecDeque::new(),
+            opt_exercise: Vec::new(),
+            opt_user_q: VecDeque::new(),
+            opt_user_conns: 0,
+            opt_places: Vec::new(),
+            opt_trade_reads: Vec::new(),
+            opt_exercise_reads: Vec::new(),
+            opt_index_reads: 0,
+            key_options: false,
+            opt_key_options: true,
             day_start_ms,
         }
     }
@@ -1105,10 +1301,24 @@ impl VState {
         let target = parts.next().unwrap_or("");
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         self.log.push(format!("{method} {path}"));
-        if !head.lines().any(|l| l == format!("X-MBX-APIKEY: {KEY}")) {
+        // BX9 (Q-1): eapi's requests name the options key (or the arm's,
+        // when it is HMAC); the options key reads its own permissions too.
+        let named_key = head.lines().any(|l| l == format!("X-MBX-APIKEY: {KEY}"));
+        let named_opt = head.lines().any(|l| l == format!("X-MBX-APIKEY: {OPT_KEY}"));
+        let eapi = path.starts_with("/eapi/");
+        let key_ok = if eapi {
+            named_opt || (named_key && self.hmac.is_some())
+        } else {
+            named_key || (named_opt && path == "/sapi/v1/account/apiRestrictions")
+        };
+        if !key_ok {
             self.bad_key += 1;
         }
-        if target.contains(KEY) || body.contains(KEY) {
+        if eapi && named_key && self.hmac.is_none() {
+            // An Ed25519 key: eapi refuses the key itself (K-probe OP2).
+            return (401, String::from(r#"{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}"#));
+        }
+        if target.contains(KEY) || body.contains(KEY) || target.contains(OPT_KEY) || body.contains(OPT_KEY) {
             self.key_in_line += 1;
         }
         // BX7 (F1): every DELETE is body-form — the order route's cancel,
@@ -1119,7 +1329,8 @@ impl VState {
         let params = if method == "GET" { query } else { body };
         if let Some(at) = params.find("&signature=") {
             let msg = params.as_bytes()[..at].to_vec();
-            match self.hmac.clone() {
+            let secret = if named_opt { Some(OPT_HMAC_SECRET.to_vec()) } else { self.hmac.clone() };
+            match secret {
                 Some(secret) => {
                     let want: String = core_crypto::hmac_sha256(&secret, &msg).iter().map(|b| format!("{b:02x}")).collect();
                     if want == params[at + 11..] {
@@ -1161,10 +1372,76 @@ impl VState {
             ("GET", "/sapi/v1/account/apiRestrictions") => (
                 200,
                 format!(
-                    r#"{{"ipRestrict":true,"createTime":{now},"enableReading":true,"enableWithdrawals":false,"enableInternalTransfer":false,"enableMargin":false,"enableFutures":true,"permitsUniversalTransfer":false,"enableVanillaOptions":false,"enableFixApiTrade":false,"enableFixReadOnly":false,"enableSpotAndMarginTrading":{},"enablePortfolioMarginTrading":{}}}"#,
-                    self.key_spot, self.pm
+                    r#"{{"ipRestrict":true,"createTime":{now},"enableReading":true,"enableWithdrawals":false,"enableInternalTransfer":false,"enableMargin":false,"enableFutures":{},"permitsUniversalTransfer":false,"enableVanillaOptions":{},"enableFixApiTrade":false,"enableFixReadOnly":false,"enableSpotAndMarginTrading":{},"enablePortfolioMarginTrading":{}}}"#,
+                    !named_opt,
+                    if named_opt { self.opt_key_options } else { self.key_options },
+                    self.key_spot && !named_opt,
+                    self.pm && !named_opt
                 ),
             ),
+            // ---- Options (BX9): eapi -------------------------------------------
+            ("GET", "/eapi/v1/time") => (200, format!(r#"{{"serverTime":{now}}}"#)),
+            ("POST", "/eapi/v1/listenKey") | ("PUT", "/eapi/v1/listenKey") => (200, format!(r#"{{"listenKey":"{OPT_LISTEN_KEY}"}}"#)),
+            ("GET", "/eapi/v1/marginAccount") => (
+                200,
+                format!(
+                    r#"{{"asset":[{{"asset":"USDT","marginBalance":"{}","equity":"{}","available":"{}","initialMargin":"0","maintMargin":"{}","unrealizedPNL":"0","adjustedEquity":"{}"}}],"time":{now},"canTrade":{},"canDeposit":true,"canWithdraw":true,"reduceOnly":{},"tradeGroupId":-1}}"#,
+                    fx(self.opt_equity_1e6, 6),
+                    fx(self.opt_equity_1e6, 6),
+                    fx(self.opt_equity_1e6, 6),
+                    fx(self.opt_maint_1e6, 6),
+                    fx(self.opt_adj_equity_1e6, 6),
+                    self.opt_can_trade,
+                    self.opt_reduce_only
+                ),
+            ),
+            ("GET", "/eapi/v1/position") => {
+                let rows: Vec<String> = self
+                    .opt_pos_1e6
+                    .iter()
+                    .filter(|(_, q)| **q != 0)
+                    .map(|(s, q)| {
+                        let mark = self.opt_mark_1e6.get(s).copied().unwrap_or(1_000_000);
+                        format!(
+                            r#"{{"entryPrice":"{}","symbol":"{s}","side":"{}","quantity":"{}","reducibleQty":"{}","markValue":"0","ror":"0","unrealizedPNL":"0","markPrice":"{}","strikePrice":"0","positionCost":"0","expiryDate":1798185600000,"priceScale":3,"quantityScale":4,"optionSide":"CALL","quoteAsset":"USDT"}}"#,
+                            fx(mark, 3),
+                            if *q > 0 { "LONG" } else { "SHORT" },
+                            fx(*q, 2),
+                            fx(q.abs(), 2),
+                            fx(mark, 3)
+                        )
+                    })
+                    .collect();
+                (200, format!("[{}]", rows.join(",")))
+            }
+            ("GET", "/eapi/v1/openOrders") => {
+                let rows: Vec<String> = self.opt_orders.iter().filter(|o| o.open()).map(|o| o.result(true)).collect();
+                (200, format!("[{}]", rows.join(",")))
+            }
+            ("GET", "/eapi/v1/userTrades") => {
+                self.opt_trade_reads.push(String::from(params));
+                if qparam(params, "symbol").is_none() {
+                    return (400, String::from(r#"{"code":-1102,"msg":"Mandatory parameter 'symbol' was not sent."}"#));
+                }
+                (200, String::from("[]"))
+            }
+            ("GET", "/eapi/v1/exerciseRecord") => {
+                self.opt_exercise_reads.push(String::from(params));
+                (200, format!("[{}]", self.opt_exercise.join(",")))
+            }
+            ("GET", "/eapi/v1/index") => {
+                self.opt_index_reads += 1;
+                assert_eq!(qparam(params, "underlying"), Some("BTCUSDT"), "the index names its underlying");
+                (200, format!(r#"{{"time":{now},"indexPrice":"{}"}}"#, fx(self.opt_index_1e6, 6)))
+            }
+            ("POST", "/eapi/v1/order") => self.opt_place(params),
+            ("GET", "/eapi/v1/order") => {
+                let c = qparam(params, "clientOrderId").unwrap_or("");
+                match self.opt_orders.iter().find(|o| o.cid == c) {
+                    Some(o) => (200, o.result(false)),
+                    None => (400, String::from(r#"{"code":-2013,"msg":"Order does not exist."}"#)),
+                }
+            }
             ("GET", "/papi/v1/account") | ("GET", "/sapi/v1/portfolio/account")
                 if self.unified_down || (self.papi_account_down && path == "/papi/v1/account") =>
             (
@@ -1313,6 +1590,97 @@ impl VState {
                 self.unknown += 1;
                 (404, String::from(r#"{"code":-1000,"msg":"unknown path"}"#))
             }
+        }
+    }
+
+    /// **An options place** (BX9; `POST /eapi/v1/order`): LIMIT + IOC only,
+    /// its id `clientOrderId`; an opening short refused `-6057` where the
+    /// venue will not let the account write, a reduce-only SELL past the
+    /// holding `-2022`. Accepted, it answers its ACK (`NEW`), then the
+    /// stream carries its `NEW`, its trade (at its limit, as
+    /// `opt_ioc_plan` says) and the account's update, then its `EXPIRED`
+    /// for any rest.
+    fn opt_place(&mut self, params: &str) -> (u16, String) {
+        self.opt_places.push(String::from(params));
+        assert_eq!((qparam(params, "type"), qparam(params, "timeInForce")), (Some("LIMIT"), Some("IOC")), "options are IoC-only");
+        assert!(qparam(params, "newClientOrderId").is_none(), "eapi names the id clientOrderId");
+        if let Some(code) = self.refuse_place.take() {
+            return (400, format!(r#"{{"code":{code},"msg":"Refused by the script."}}"#));
+        }
+        let symbol = String::from(qparam(params, "symbol").unwrap_or(""));
+        let buy = qparam(params, "side") == Some("BUY");
+        let reduce_only = qparam(params, "reduceOnly") == Some("true");
+        let qty = d6(qparam(params, "quantity").unwrap_or("0"));
+        let held = self.opt_pos_1e6.get(&symbol).copied().unwrap_or(0);
+        if !buy && held - qty < 0 {
+            if reduce_only {
+                return (400, String::from(r#"{"code":-2022,"msg":"ReduceOnly Order is rejected."}"#));
+            }
+            if !self.opt_writable {
+                return (400, String::from(r#"{"code":-6057,"msg":"Naked sell is not allowed for this account."}"#));
+            }
+        }
+        let mut o = OptOrder {
+            oid: self.next_oid,
+            cid: String::from(qparam(params, "clientOrderId").unwrap_or("")),
+            symbol: symbol.clone(),
+            buy,
+            reduce_only,
+            qty,
+            px: d6(qparam(params, "price").unwrap_or("0")),
+            executed: 0,
+            status: "NEW",
+        };
+        self.next_oid += 1;
+        let answer = o.result(false);
+        self.opt_emit(o.update("NEW", 0, 0));
+        let fill = self.opt_ioc_plan.pop_front().unwrap_or(o.qty).min(o.qty);
+        if fill > 0 {
+            let tid = self.next_tid;
+            self.next_tid += 1;
+            o.executed = fill;
+            o.status = if fill == o.qty { "FILLED" } else { "PARTIALLY_FILLED" };
+            *self.opt_pos_1e6.entry(symbol.clone()).or_insert(0) += if buy { fill } else { -fill };
+            self.opt_emit(o.update("TRADE", fill, tid));
+            let pos = self.opt_pos_1e6.get(&symbol).copied().unwrap_or(0);
+            if !self.opt_account_events {
+                return self.opt_placed(o, answer);
+            }
+            let account = format!(
+                r#"{{"e":"ACCOUNT_UPDATE","E":{},"B":[{{"b":"{}","m":"{}","u":"0","U":0,"M":"{}","i":"0","a":"USDT"}}],"P":[{{"s":"{symbol}","c":"{}","r":"{}","p":"{}","a":"0"}}],"uid":1}}"#,
+                now_ms(),
+                fx(self.opt_equity_1e6, 6),
+                fx(self.opt_equity_1e6, 6),
+                fx(self.opt_maint_1e6, 6),
+                fx(pos, 2),
+                fx(pos.abs(), 2),
+                fx(o.px, 3)
+            );
+            self.opt_emit(account.into_bytes());
+        }
+        self.opt_placed(o, answer)
+    }
+
+    /// An options place's end: any rest EXPIRED, the order kept, its ACK
+    /// answered — or lost (`lose_place_answer`: a 503 `-1007`).
+    fn opt_placed(&mut self, mut o: OptOrder, answer: String) -> (u16, String) {
+        if o.executed < o.qty {
+            o.status = "EXPIRED";
+            self.opt_emit(o.update("EXPIRED", 0, 0));
+        }
+        self.opt_orders.push(o);
+        if core::mem::take(&mut self.lose_place_answer) {
+            return (503, String::from(r#"{"code":-1007,"msg":"Timeout waiting for response from backend server."}"#));
+        }
+        (200, answer)
+    }
+
+    /// An options stream event: sent, or lost while `lose_user`.
+    pub fn opt_emit(&mut self, f: Vec<u8>) {
+        if self.lose_user {
+            self.lost.push(f);
+        } else {
+            self.opt_user_q.push_back(f);
         }
     }
 
@@ -2137,7 +2505,11 @@ fn serve(sock: TcpStream, cfg: Arc<ServerConfig>, st: Arc<Mutex<VState>>, stop: 
         } else {
             ws_api(p, &head, &st, cm);
         }
-    } else if head.starts_with("GET /ws/") || head.starts_with("GET /pm/ws/") || head.starts_with("GET /pm-classic/ws/") {
+    } else if head.starts_with("GET /ws/")
+        || head.starts_with("GET /pm/ws/")
+        || head.starts_with("GET /pm-classic/ws/")
+        || head.starts_with("GET /private/ws/")
+    {
         user_stream(p, &head, &st);
     } else {
         rest(p, head, &st);
@@ -2324,7 +2696,9 @@ fn user_stream(mut p: Peer, head: &str, st: &Mutex<VState>) {
     let pm = path == format!("/pm/ws/{PM_LISTEN_KEY}");
     // PM Pro's risk stream rides the USDⓈ-M key.
     let pmc = path == format!("/pm-classic/ws/{LISTEN_KEY}");
-    if (!cm && !pm && !pmc && path != format!("/ws/{LISTEN_KEY}")) || !p.upgrade(head) {
+    // BX9: options' stream, `/private/ws/<its key>`.
+    let opt = path == format!("/private/ws/{OPT_LISTEN_KEY}");
+    if (!cm && !pm && !pmc && !opt && path != format!("/ws/{LISTEN_KEY}")) || !p.upgrade(head) {
         st.lock().expect("venue").unknown += 1;
         return;
     }
@@ -2332,6 +2706,8 @@ fn user_stream(mut p: Peer, head: &str, st: &Mutex<VState>) {
         let mut v = st.lock().expect("venue");
         if pmc {
             v.pmc_conns += 1;
+        } else if opt {
+            v.opt_user_conns += 1;
         } else {
             v.user_conns += 1;
         }
@@ -2341,6 +2717,8 @@ fn user_stream(mut p: Peer, head: &str, st: &Mutex<VState>) {
             let mut v = st.lock().expect("venue");
             if pmc {
                 (v.pmc_q.drain(..).collect(), false)
+            } else if opt {
+                (v.opt_user_q.drain(..).collect(), false)
             } else if pm {
                 (v.pm_user_q.drain(..).collect(), false)
             } else if cm {

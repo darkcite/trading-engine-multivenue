@@ -81,7 +81,8 @@ use tracing::{error, info, warn};
 
 use crate::bn_demo::{
     demo_config, discover, notional_1e6, open_orders, order_status, product_word, px_off, qty_for, read_account,
-    wall_ms, Account, Answer, Line, Public, Rest, Rows, Ws, EXIT_LEFTOVER, EXIT_PROBE, ORD0,
+    wall_ms, Account, Answer, Line, Public, Rest, Rows, Ws, E_COUNTDOWN, E_DEPTH, E_EXERCISE, E_HISTORY, E_INDEX,
+    E_LISTEN, E_MARGIN, E_MARK, E_OPEN, E_ORDER, E_POSITION, E_QUERY, E_TRADES, EXIT_LEFTOVER, EXIT_PROBE, ORD0,
     X_TRADING_STATUS,
 };
 
@@ -1102,6 +1103,573 @@ fn result_keys(obj: &[u8]) -> String {
 fn subscription_id(obj: &[u8]) -> Option<u64> {
     let (a, z) = field(obj, b"subscriptionId")?;
     u64_of(obj, a, z).ok()
+}
+
+// -------------------------------------------------------------------------
+// Options — BX9's K-probes (K3, K18, K19 on eapi)
+// -------------------------------------------------------------------------
+
+/// The hosts the docs name for options' Demo REST, each asked (OP0): the
+/// options general-info page's (`demo-fapi`) and the order pages'
+/// (`testnet.binancefuture.com`). The first that serves the options
+/// `exchangeInfo` is the probe's.
+const OPT_REST_CANDIDATES: [&str; 2] = ["demo-fapi.binance.com", "testnet.binancefuture.com"];
+/// The stream hosts asked for options' user data on Demo (the
+/// general-info page names `demo-fstream`'s `/private/`; a listenKey from
+/// the testnet's REST may belong to the testnet's streams).
+const OPT_STREAM_HOSTS: [&str; 3] = ["demo-fstream.binance.com", "fstream.binancefuture.com", "stream.binancefuture.com"];
+/// The underlying the probe orders on (BTC: writable, `nakedSell`).
+const OPT_UNDERLYING: &[u8] = b"BTCUSDT";
+/// The slot the probe's ids name: the arm's own 32-character shape (the
+/// id's charset and length are a K-item), classified an orphan of another
+/// boot — and it never rests (IoC).
+const OPT_SLOT: u8 = 7;
+/// The probe's member ids (inside its `mv` ids): recognisable.
+const OPT_OID_BASE: u64 = 0xb9b9_0000_0000_0000;
+/// An `exchangeInfo` page's room (testnet's ~0.4 MB, mainnet's ~1 MB).
+const OPT_INFO_MAX: usize = 8 * 1_024 * 1_024;
+/// How long the user-stream taps are read after the orders.
+const OPT_LISTEN: Duration = Duration::from_secs(8);
+/// The OTM strike the probe picks: the first above the index × this ×1e6.
+const OPT_OTM_1E6: i64 = 1_050_000;
+/// The nearest expiry at least this far ahead, ms (a day: Demo lists
+/// dailies; one expiring under the probe would settle mid-run).
+const OPT_MIN_TTE_MS: i64 = 20 * 3_600_000;
+
+/// One option row as the probe (and BX9's battery) uses it: the BX2
+/// discovery's row plus the `PRICE_FILTER` band the discovery does not keep
+/// (a finding: options' `minPrice`/`maxPrice` are a moving band, not a
+/// constant domain).
+pub(crate) struct OptRow {
+    pub(crate) symbol: String,
+    pub(crate) strike_1e9: i64,
+    pub(crate) expiry_ms: i64,
+    pub(crate) tick_1e6: i64,
+    pub(crate) step_1e6: i64,
+    pub(crate) min_qty_1e6: i64,
+    pub(crate) px_dec: u8,
+    pub(crate) qty_dec: u8,
+    pub(crate) min_px_1e6: i64,
+    pub(crate) max_px_1e6: i64,
+    /// The discovery's row itself (the battery binds it).
+    pub(crate) row: ingress_binance::eapi::EapiOptionRow,
+}
+
+/// **Run the options probe** (`exec-smoke --binance-probe options`): the
+/// exit code — 0 when every probe ran and nothing is left, [`EXIT_PROBE`]
+/// when one could not run, [`EXIT_LEFTOVER`] when something of the probe's
+/// is left. The venue's answers either way close K-items and are no
+/// failure: an `-6057` on the short is the Long & Short mode's answer.
+pub fn run_options(tls: Arc<ClientConfig>) -> u8 {
+    let mut r = Report::default();
+    if let Err(e) = opt_probes(&tls, &mut r) {
+        error!("binance-probe: options could not run — {e}");
+        r.failed.push(e);
+    }
+    let code = if !r.left.is_empty() {
+        EXIT_LEFTOVER
+    } else if !r.failed.is_empty() {
+        EXIT_PROBE
+    } else {
+        0
+    };
+    probe("END", "-")
+        .n("exit", i64::from(code))
+        .s("failed", &r.failed.join(" | "))
+        .s("left", &r.left.join(" | "))
+        .emit();
+    match code {
+        0 => info!("binance-probe: options — every probe ran; nothing left"),
+        EXIT_LEFTOVER => error!(left = ?r.left, "binance-probe: options — SOMETHING OF THE PROBE'S IS LEFT ON THE DEMO ACCOUNT"),
+        _ => error!(failed = ?r.failed, "binance-probe: options FAILED"),
+    }
+    code
+}
+
+/// OP0–OP9 in order; the end reads the account again whatever ran.
+fn opt_probes(tls: &Arc<ClientConfig>, r: &mut Report) -> Result<(), String> {
+    let ed = demo_config(false)?;
+    // OP0 — which host serves options' exchangeInfo on Demo.
+    let mut chosen: Option<(&'static str, Vec<u8>)> = None;
+    for host in OPT_REST_CANDIDATES {
+        match eapi_info(tls, host) {
+            Ok(body) => {
+                let mut d = ingress_binance::eapi::EapiDiscovery::new();
+                let parsed = d.ingest_exchange_info(&body);
+                probe("OP0", "K19")
+                    .s("host", host)
+                    .n("http", 200)
+                    .s("discovery", &parsed.map_or_else(|e| format!("REFUSED {e:?}"), |n| format!("{n} rows")))
+                    .s("rate_limits", &snippet_of(&body, b"rateLimits", 600))
+                    .s("contracts", &snippet_of(&body, b"optionContracts", 900))
+                    .emit();
+                if chosen.is_none() && parsed.is_ok() {
+                    chosen = Some((host, body));
+                }
+            }
+            Err(e) => {
+                // A host refusing the public page may still serve a keyed
+                // request (the key header): its time, with the key, says so.
+                let keyed = Rest::eapi(&ed, host, tls.clone()).and_then(|mut r| r.clock()).map_or_else(|e| e, |(o, t)| format!("time with the key header: offset {o} ms, rtt {t} ms"));
+                probe("OP0", "K19").s("host", host).s("http", &e).s("keyed", &keyed).emit();
+            }
+        }
+    }
+    let (host, info) = chosen.ok_or("no candidate host served options' exchangeInfo (OP0)")?;
+    let mut rest = Rest::eapi(&ed, host, tls.clone())?;
+    let (offset, rtt) = rest.clock()?;
+    probe("OP1", "-").s("host", host).n("offset_ms", offset).n("rtt_ms", rtt as i64).emit();
+
+    // OP2 — K19/K3: an Ed25519-signed eapi read; HMAC when it is refused.
+    let ed_signer = ed.signer().map_err(|e| format!("the Ed25519 signer: {e:?}"))?;
+    let a = rest.signed(E_MARGIN, &ed_signer, false, bare)?;
+    margin_line(&a, host, "ed25519");
+    let signer = if a.status == 200 {
+        ed_signer
+    } else {
+        // Which refused it — the key, or the signature's kind? The key
+        // alone (a listenKey takes no signature), then a signature known
+        // wrong: a key eapi takes answers the first and refuses the second
+        // as a bad signature (-1022).
+        let a = rest.plain(E_LISTEN, b"")?;
+        probe("OP2b", "K19").s("signing", "ed25519 key, unsigned (listenKey)").n("http", i64::from(a.status)).n("code", i64::from(a.code())).s("body", &whole(&a.body)).emit();
+        let a = rest.signed(E_MARGIN, &ed_signer, true, bare)?;
+        probe("OP2b", "K19").s("signing", "ed25519, a changed signature").n("http", i64::from(a.status)).n("code", i64::from(a.code())).s("body", &whole(&a.body)).emit();
+        let hm = demo_config(true).map_err(|e| format!("Ed25519 refused on eapi and no HMAC key to try: {e}"))?;
+        let hm_signer = hm.signer().map_err(|e| format!("the HMAC signer: {e:?}"))?;
+        let mut hrest = Rest::eapi(&hm, host, tls.clone())?;
+        hrest.clock()?;
+        let h = hrest.signed(E_MARGIN, &hm_signer, false, bare)?;
+        margin_line(&h, host, "hmac");
+        if h.status != 200 {
+            return Err(String::from("neither key is accepted on eapi (OP2) — nothing else can run"));
+        }
+        rest = hrest;
+        hm_signer
+    };
+
+    // OP3 — the positions at the start; OP4 — the open orders.
+    let a = rest.signed(E_POSITION, &signer, false, bare)?;
+    probe("OP3", "-").n("http", i64::from(a.status)).n("code", i64::from(a.code())).s("body", &snippet(&a.body)).emit();
+    let pos0 = if a.status == 200 { Some(a.body.clone()) } else { None };
+    let a = rest.signed(E_OPEN, &signer, false, bare)?;
+    probe("OP4", "-").n("http", i64::from(a.status)).n("code", i64::from(a.code())).s("body", &snippet(&a.body)).emit();
+
+    // The row: BTC, a call, the nearest expiry a day out, the first strike
+    // above the index × 1.05.
+    let row = pick_row(&mut rest, &info)?;
+    let (bid, ask) = opt_touch(&mut rest, &row.symbol)?;
+    let mark = opt_mark(&mut rest, &row.symbol);
+    probe("OP5", "-")
+        .s("symbol", &row.symbol)
+        .n("expiry_ms", row.expiry_ms)
+        .n("strike", row.strike_1e9 / 1_000_000_000)
+        .n("tick_1e6", row.tick_1e6)
+        .n("step_1e6", row.step_1e6)
+        .n("min_qty_1e6", row.min_qty_1e6)
+        .n("min_price_1e6", row.min_px_1e6)
+        .n("max_price_1e6", row.max_px_1e6)
+        .n("bid_1e6", bid.unwrap_or(-1))
+        .n("ask_1e6", ask.unwrap_or(-1))
+        .s("mark", &mark)
+        .emit();
+
+    // OP5 — the user stream: a listenKey and the stream's forms.
+    let mut taps = opt_streams(&mut rest, tls)?;
+
+    // OP6 — the long IoC under the book; OP7 — the short IoC over it (K18).
+    // The least quantity on the step at or above the minimum (Demo's BTC
+    // rows list a minimum under the step).
+    let qty = ceil_tick(row.step_1e6.max(row.min_qty_1e6), row.step_1e6);
+    let epoch = (wall_ms() / 1_000) as u32;
+    let prefix = exec_binance::cid::CidPrefix::new(epoch);
+    let mut cids: Vec<String> = Vec::new();
+    let buy_px = ceil_tick(row.min_px_1e6.max(row.tick_1e6), row.tick_1e6);
+    let sell_px = row.max_px_1e6 / row.tick_1e6.max(1) * row.tick_1e6.max(1);
+    for (n, side, px, k) in [(1u64, Side::Bid, buy_px, "K3"), (2, Side::Ask, sell_px, "K18")] {
+        if stopped() {
+            r.failed.push(String::from(STOPPED));
+            break;
+        }
+        let far = match side {
+            Side::Bid => ask.is_none_or(|a| px < a),
+            Side::Ask => bid.is_none_or(|b| px > b),
+        };
+        let usd = i128::from(px) * i128::from(qty) / 1_000_000;
+        if !far || usd > i128::from(PROBE_MAX_USD_1E6) || px <= 0 {
+            probe(if n == 1 { "OP6" } else { "OP7" }, k)
+                .s("verdict", "NOT RUN: the band's edge does not lie past the touch, or the order is over the ceiling")
+                .n("px_1e6", px)
+                .n("usd_1e6", usd as i64)
+                .emit();
+            r.failed.push(format!("OP{}: not run (price {px} not far from the touch, or {usd} over the ceiling)", 5 + n));
+            continue;
+        }
+        let mut cid = [0u8; exec_binance::cid::CID_LEN];
+        prefix.render(OPT_SLOT, OPT_OID_BASE + n, &mut cid);
+        let cid_s = String::from_utf8_lossy(&cid).into_owned();
+        cids.push(cid_s.clone());
+        let placed = rest.signed(E_ORDER, &signer, false, |w, st, ts| {
+            exec_binance::rest::render_opt_place(
+                w,
+                st,
+                &Place {
+                    symbol: row.symbol.as_bytes(),
+                    side: side as u8,
+                    maker: false,
+                    reduce_only: false,
+                    qty_1e6: qty,
+                    qty_dec: row.qty_dec,
+                    px_1e6: px,
+                    px_dec: row.px_dec,
+                    cid: Part::Lit(&cid),
+                    ts_ms: ts,
+                },
+            );
+        })?;
+        let q = rest.signed(E_QUERY, &signer, false, |w, st, ts| {
+            exec_binance::rest::render_opt_by_cid(w, st, row.symbol.as_bytes(), Part::Lit(&cid), ts);
+        })?;
+        probe(if n == 1 { "OP6" } else { "OP7" }, k)
+            .s("side", if side == Side::Bid { "BUY" } else { "SELL" })
+            .s("cid", &cid_s)
+            .n("cid_len", cid.len() as i64)
+            .n("px_1e6", px)
+            .n("qty_1e6", qty)
+            .n("http", i64::from(placed.status))
+            .n("code", i64::from(placed.code()))
+            .s("answer", &whole(&placed.body))
+            .n("query_http", i64::from(q.status))
+            .s("query", &whole(&q.body))
+            .s("verdict", &opt_verdict(&placed, side))
+            .emit();
+    }
+
+    // The streams' account of the orders.
+    tap_streams(&mut taps, &cids);
+
+    // OP8 — the countdown (K3: a market maker's; `-6005` expected).
+    let a = rest.signed(E_COUNTDOWN, &signer, false, bare)?;
+    probe("OP8", "K3")
+        .n("http", i64::from(a.status))
+        .n("code", i64::from(a.code()))
+        .s("body", &snippet(&a.body))
+        .s("verdict", if a.code() == -6_005 { "-6005: the countdown is a market maker's — no dead-man for this account" } else { "see the body" })
+        .emit();
+    // OP9 — the shapes the reconciliation reads: the order history, the
+    // trades, the exercise record.
+    for (t, name, sym) in [(E_HISTORY, "historyOrders", true), (E_TRADES, "userTrades", true), (E_EXERCISE, "exerciseRecord", false)] {
+        let a = rest.signed(t, &signer, false, |w, st, ts| {
+            if sym {
+                on_symbol(w, st, ts, row.symbol.as_bytes());
+            } else {
+                bare(w, st, ts);
+            }
+        })?;
+        probe("OP9", "-").s("read", name).n("http", i64::from(a.status)).n("code", i64::from(a.code())).s("body", &snippet(&a.body)).emit();
+    }
+
+    // The end: nothing of the probe's listed open; the positions as they were.
+    let a = rest.signed(E_OPEN, &signer, false, bare)?;
+    if a.status != 200 {
+        r.left.push(format!("the end's open-orders read failed ({}) — read it by hand", word(&a)));
+    } else {
+        for c in &cids {
+            if a.body.windows(c.len()).any(|w| w == c.as_bytes()) {
+                r.left.push(format!("order {c} is listed open"));
+            }
+        }
+    }
+    let a = rest.signed(E_POSITION, &signer, false, bare)?;
+    match (&pos0, a.status) {
+        (Some(p0), 200) if *p0 == a.body => {}
+        (Some(_), 200) => {
+            // The answer carries marks that move: only the probe's row is judged.
+            if position_of(&a.body, row.symbol.as_bytes()) != position_of(pos0.as_deref().unwrap_or_default(), row.symbol.as_bytes()) {
+                r.left.push(format!("{}: the position moved", row.symbol));
+            }
+        }
+        _ => r.left.push(String::from("the end's position read failed — read it by hand")),
+    }
+    Ok(())
+}
+
+/// **eapi's `exchangeInfo` page** on `host` (public; testnet's ~0.4 MB,
+/// mainnet's ~1 MB, within [`OPT_INFO_MAX`]).
+///
+/// # Errors
+/// The read failed.
+pub(crate) fn eapi_info(tls: &Arc<ClientConfig>, host: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(OPT_INFO_MAX);
+    let span = core_net::boot_http::https_get(
+        tls,
+        host,
+        exec_binance::config::HTTPS_PORT,
+        "/eapi/v1/exchangeInfo",
+        core_net::REQ_USER_AGENT,
+        &mut out,
+        OPT_INFO_MAX,
+        Duration::from_secs(30),
+    )
+    .map_err(|e| format!("{e}"))?;
+    // COPY: the page's span out of the read buffer (≤ `OPT_INFO_MAX`) — an
+    // operator tool, once; rejected: keeping the buffer and the span apart.
+    Ok(out.get(span).unwrap_or_default().to_vec())
+}
+
+/// An underlying's index (`GET /eapi/v1/index`), ×1e6.
+///
+/// # Errors
+/// The read failed or did not scan.
+pub(crate) fn opt_index_1e6(rest: &mut Rest, underlying: &str) -> Result<i64, String> {
+    let a = rest.plain(E_INDEX, format!("underlying={underlying}").as_bytes())?;
+    field(&a.body, b"indexPrice").and_then(|(x, y)| dec_1e6(&a.body, x, y).ok()).ok_or_else(|| format!("the index did not read: {}", snippet(&a.body)))
+}
+
+/// OP2's line: the verdict and the account's figures (never a key).
+fn margin_line(a: &Answer, host: &str, signing: &str) {
+    probe("OP2", "K19")
+        .s("host", host)
+        .s("signing", signing)
+        .n("http", i64::from(a.status))
+        .n("code", i64::from(a.code()))
+        .s("verdict", &word(a))
+        .s("body", &whole(&a.body))
+        .emit();
+}
+
+/// An options answer whole, up to 4 000 characters (the scanners' shapes;
+/// eapi's answers carry no key).
+fn whole(body: &[u8]) -> String {
+    String::from_utf8_lossy(body).chars().take(4_000).collect()
+}
+
+/// A top-level value of `body`, as text, at most `max` characters (a
+/// report).
+fn snippet_of(body: &[u8], key: &[u8], max: usize) -> String {
+    field(body, key).map_or_else(String::new, |(a, z)| String::from_utf8_lossy(&body[a..z]).chars().take(max).collect())
+}
+
+/// `v` up to the next multiple of `tick` (×1e6).
+pub(crate) fn ceil_tick(v: i64, tick: i64) -> i64 {
+    if tick <= 0 {
+        return v;
+    }
+    (v + tick - 1).div_euclid(tick) * tick
+}
+
+/// A verdict word for an order answer.
+fn opt_verdict(a: &Answer, side: Side) -> String {
+    match (a.status, a.code(), side) {
+        (200, _, _) => String::from("accepted"),
+        (_, -6_057, Side::Ask) => String::from("-6057: the account is not eligible to write options (Long & Short mode off)"),
+        (_, -2_027, _) => String::from("-2027: margin insufficient"),
+        (_, c, _) => format!("refused code {c}"),
+    }
+}
+
+/// The probe's row from the `exchangeInfo` page (module docs, OP5) — and
+/// BX9's battery's: BTC, a call, the nearest expiry a day out, the first
+/// strike above the index × 1.05.
+pub(crate) fn pick_row(rest: &mut Rest, info: &[u8]) -> Result<OptRow, String> {
+    let index_1e6 = opt_index_1e6(rest, "BTCUSDT")?;
+    let now = wall_ms() as i64;
+    let mut d = ingress_binance::eapi::EapiDiscovery::new();
+    d.ingest_exchange_info(info).map_err(|e| format!("the page did not parse ({e:?})"))?;
+    let mut best: Option<&ingress_binance::eapi::EapiOptionRow> = None;
+    for row in d.rows() {
+        if row.underlying() != OPT_UNDERLYING || !row.trading || !row.is_call || row.is_tradfi() || row.expiry_ms < now + OPT_MIN_TTE_MS {
+            continue;
+        }
+        if row.strike_1e9 / 1_000 < index_1e6 * OPT_OTM_1E6 / 1_000_000 {
+            continue;
+        }
+        best = match best {
+            Some(b) if (b.expiry_ms, b.strike_1e9) <= (row.expiry_ms, row.strike_1e9) => Some(b),
+            _ => Some(row),
+        };
+    }
+    let row = best.ok_or("no BTC call a day out above the index × 1.05")?;
+    let symbol = String::from_utf8_lossy(row.symbol()).into_owned();
+    let (min_px, max_px) = price_band(info, row.symbol()).ok_or("the row's PRICE_FILTER band did not read")?;
+    Ok(OptRow {
+        symbol,
+        strike_1e9: row.strike_1e9,
+        expiry_ms: row.expiry_ms,
+        tick_1e6: row.filters.tick_size_1e9 / 1_000,
+        step_1e6: row.filters.lot_step_1e9 / 1_000,
+        min_qty_1e6: row.filters.min_qty_1e9 / 1_000,
+        px_dec: row.price_scale,
+        qty_dec: row.qty_scale,
+        min_px_1e6: min_px,
+        max_px_1e6: max_px,
+        row: *row,
+    })
+}
+
+/// A symbol's `PRICE_FILTER` `minPrice` and `maxPrice` (×1e6) on the page.
+fn price_band(info: &[u8], symbol: &[u8]) -> Option<(i64, i64)> {
+    let (a, _) = field(info, b"optionSymbols")?;
+    let mut rows = Elems::new(info, a).ok()?;
+    while let Some((ra, _)) = rows.next().ok()? {
+        let mut p = Pairs::new(info, ra).ok()?;
+        let (mut name, mut filters) = (&b""[..], None);
+        while let Some((k, va, vz)) = p.next().ok()? {
+            match k {
+                b"symbol" => name = str_of(info, va, vz).ok()?,
+                b"filters" => filters = Some(va),
+                _ => {}
+            }
+        }
+        if name != symbol {
+            continue;
+        }
+        let mut fs = Elems::new(info, filters?).ok()?;
+        while let Some((fa, _)) = fs.next().ok()? {
+            let mut f = Pairs::new(info, fa).ok()?;
+            let (mut pf, mut lo, mut hi) = (false, None, None);
+            while let Some((k, va, vz)) = f.next().ok()? {
+                match k {
+                    b"filterType" => pf = str_of(info, va, vz).ok()? == b"PRICE_FILTER",
+                    b"minPrice" => lo = dec_1e6(info, va, vz).ok(),
+                    b"maxPrice" => hi = dec_1e6(info, va, vz).ok(),
+                    _ => {}
+                }
+            }
+            if pf {
+                return Some((lo?, hi?));
+            }
+        }
+    }
+    None
+}
+
+/// The book's best bid and ask (`GET /eapi/v1/depth`), ×1e6; `None` for an
+/// empty side.
+pub(crate) fn opt_touch(rest: &mut Rest, symbol: &str) -> Result<(Option<i64>, Option<i64>), String> {
+    let a = rest.plain(E_DEPTH, format!("symbol={symbol}&limit=10").as_bytes())?;
+    if a.status != 200 {
+        return Err(format!("the depth read: {} {}", word(&a), snippet(&a.body)));
+    }
+    let first = |key: &[u8]| -> Option<i64> {
+        let (x, _) = field(&a.body, key)?;
+        let mut lv = Elems::new(&a.body, x).ok()?;
+        let (la, _) = lv.next().ok()??;
+        let mut pq = Elems::new(&a.body, la).ok()?;
+        let (pa, pz) = pq.next().ok()??;
+        dec_1e6(&a.body, pa, pz).ok()
+    };
+    Ok((first(b"bids"), first(b"asks")))
+}
+
+/// The mark answer, as text (a report).
+fn opt_mark(rest: &mut Rest, symbol: &str) -> String {
+    match rest.plain(E_MARK, format!("symbol={symbol}").as_bytes()) {
+        Ok(a) => snippet(&a.body),
+        Err(e) => e,
+    }
+}
+
+/// A symbol's position quantity in a `/eapi/v1/position` answer, as text
+/// (the end's comparison; an absent row is `""`).
+fn position_of(body: &[u8], symbol: &[u8]) -> String {
+    let Ok(mut rows) = Elems::new(body, 0) else {
+        return String::from("unreadable");
+    };
+    while let Ok(Some((ra, _))) = rows.next() {
+        let Ok(mut p) = Pairs::new(body, ra) else { break };
+        let (mut name, mut qty) = (&b""[..], String::new());
+        while let Ok(Some((k, va, vz))) = p.next() {
+            match k {
+                b"symbol" => name = str_of(body, va, vz).unwrap_or_default(),
+                b"quantity" => qty = String::from_utf8_lossy(&body[va..vz]).into_owned(),
+                _ => {}
+            }
+        }
+        if name == symbol {
+            return qty;
+        }
+    }
+    String::new()
+}
+
+/// One user-stream socket under test (OP5).
+struct OptTap {
+    host: &'static str,
+    form: &'static str,
+    ws: Option<Ws>,
+    frames: u32,
+    events: Vec<String>,
+    order_frames: Vec<String>,
+}
+
+/// OP5 — a listenKey, then the stream's forms on the Demo stream host.
+fn opt_streams(rest: &mut Rest, tls: &Arc<ClientConfig>) -> Result<(Vec<OptTap>, String), String> {
+    let a = rest.plain(E_LISTEN, b"")?;
+    let key = match scan_listen_key(&a.body) {
+        Ok(span) if a.status == 200 => String::from_utf8_lossy(span.get(&a.body)).into_owned(),
+        _ => {
+            probe("OP5", "-").s("listen_key", &format!("refused: {} {}", word(&a), snippet(&a.body))).emit();
+            return Ok((Vec::new(), String::new()));
+        }
+    };
+    probe("OP5", "-").s("listen_key", "accepted").n("key_len", key.len() as i64).emit();
+    let forms: [(&'static str, String); 2] = [("/private/ws/<key>", format!("/private/ws/{key}")), ("/ws/<key>", format!("/ws/{key}"))];
+    let mut taps = Vec::with_capacity(forms.len() * OPT_STREAM_HOSTS.len());
+    for host in OPT_STREAM_HOSTS {
+        for (form, path) in &forms {
+            let ws = match Ws::open(host, path, tls.clone(), WS_OPEN) {
+                Ok(ws) => Some(ws),
+                Err(e) => {
+                    probe("OP5", "-").s("host", host).s("form", form).s("open", &e.replace(&key, "<key>")).emit();
+                    None
+                }
+            };
+            taps.push(OptTap { host, form, ws, frames: 0, events: Vec::new(), order_frames: Vec::new() });
+        }
+    }
+    Ok((taps, key))
+}
+
+/// The taps read for [`OPT_LISTEN`]: each frame's event name; the frames
+/// naming one of `cids` kept whole (the order update's shape — no key in
+/// it; the listenKey scrubbed whatever).
+fn tap_streams(taps: &mut (Vec<OptTap>, String), cids: &[String]) {
+    let (taps, key) = taps;
+    let until = Instant::now() + OPT_LISTEN;
+    while Instant::now() < until && !stopped() && taps.iter().any(|t| t.ws.is_some()) {
+        for t in taps.iter_mut() {
+            let Some(ws) = t.ws.as_mut() else { continue };
+            match ws.next(Duration::from_millis(30)) {
+                Ok(Some((_, f))) => {
+                    t.frames += 1;
+                    let name = field(&f, b"e").and_then(|(a, z)| str_of(&f, a, z).ok()).map_or_else(|| String::from("?"), |s| String::from_utf8_lossy(s).into_owned());
+                    if !t.events.contains(&name) {
+                        t.events.push(name);
+                    }
+                    if cids.iter().any(|c| f.windows(c.len()).any(|w| w == c.as_bytes())) && t.order_frames.len() < 6 {
+                        let text = String::from_utf8_lossy(&f).into_owned();
+                        t.order_frames.push(if key.is_empty() { text } else { text.replace(key.as_str(), "<key>") });
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(form = t.form, "binance-probe: the options stream ended: {}", e.replace(key.as_str(), "<key>"));
+                    t.ws = None;
+                }
+            }
+        }
+    }
+    for t in taps.iter() {
+        probe("OP5", "-")
+            .s("host", t.host)
+            .s("form", t.form)
+            .b("open_at_end", t.ws.is_some())
+            .n("frames", i64::from(t.frames))
+            .s("events", &t.events.join(","))
+            .s("order_frames", &t.order_frames.join(" ¦ "))
+            .emit();
+    }
 }
 
 // -------------------------------------------------------------------------

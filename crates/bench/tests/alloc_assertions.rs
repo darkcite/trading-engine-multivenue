@@ -6135,7 +6135,7 @@ fn state_snapshot_publish_read_encode_is_zero_alloc() {
         slot: u8::MAX,
         account_mode: u8::MAX,
         sweep: u8::MAX,
-        refused: [u32::MAX; 20],
+        refused: [u32::MAX; 21],
         halt_reason: u64::MAX,
         in_doubt: u64::MAX,
         events_other: u64::MAX,
@@ -6144,6 +6144,8 @@ fn state_snapshot_publish_read_encode_is_zero_alloc() {
         clock_offset_ms: i64::MIN,
         margin_usdm_1e6: i64::MIN,
         margin_coinm_1e6: i64::MIN,
+        margin_options_1e6: i64::MIN,
+        opt_weight_used: u64::MAX,
         ..engine_snapshot::BinanceGwSnapshot::default()
     };
     let mut server_scratch = Box::new(EngineSnapshot::empty());
@@ -13274,6 +13276,20 @@ const BX6_FAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","pair":"BTCUSDT","co
 /// `gov::tests::the_spot_pool_mirrors_the_unfilled_count` pin those. A
 /// break-and-watch (an 8-byte `Vec` in the arm's spot pool and in its fill
 /// decrement) failed it at 970: 937 IoCs at the pool, 33 fills' ends.
+///
+/// BX9 (the alloc review): two option rows beside them (eapi's BTC call,
+/// writable, and put, not — the arm's table; both `LAW_OPTION` rows of the
+/// ledger, priced by option summaries every 32nd turn and stamped fresh),
+/// the put held long by the gateway's `EVT_POSITION`. Every fourth turn an
+/// option IoC in turn: a call BUY, a call SELL (the first answered
+/// `-6057`: the arm unwrites the underlying, every later one refused
+/// `NotWritable` before the pool), a put SELL (leaving REDUCE-ONLY: the
+/// flag on the popped command), a put BUY — on options' own ORDERS pool,
+/// whose 10 s window takes 30. Pinned: 0 B; 30 options IoCs accepted, the
+/// rest refused (`NotWritable` and the pool's `Orders`, both counted in the
+/// report), every put SELL popped reduce-only, the one `-6057`. A
+/// break-and-watch (an 8-byte `Vec` before the arm's writing law) failed
+/// it at 1 000: every options attempt.
 #[test]
 fn binance_arm_steady_state() {
     use clob_dispatcher::{
@@ -13281,8 +13297,8 @@ fn binance_arm_steady_state() {
         RETIRED_EXPIRED, RETIRED_FILLED,
     };
     use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
-    use core_types::{CancelReq, ChannelEvent, ChannelId, ModifyReq, Order, Side};
-    use exec_binance::arm::{ArmKnobs, BnArm};
+    use core_types::{CancelReq, ChannelEvent, ChannelId, ModifyReq, Order, OptSummary, Side, OPT_SUMMARY_FLAG_MARK_PX, ORDER_FLAG_REDUCE_ONLY};
+    use exec_binance::arm::{ArmKnobs, BnArm, Refusal};
     use exec_binance::cmd::{
         duplex, BnCmd, BnEvt, EVT_ACK, EVT_BUDGET, EVT_CANCEL_FAILED, EVT_DAY, EVT_F_CLOCK_OK,
         EVT_F_DEADMAN_OK, EVT_F_HAD_FILL, EVT_F_IOC, EVT_F_ORDER_UP, EVT_F_RECONCILED, EVT_F_SWEEP_DONE,
@@ -13292,11 +13308,12 @@ fn binance_arm_steady_state() {
     };
     use exec_gateway::stats::SWEEP_CLEAR;
     use exec_gateway::EvtTx;
-    use exec_binance::inst::{BindSpec, InstTable, PRODUCT_SPOT, PRODUCT_USDM};
+    use exec_binance::inst::{BindSpec, InstTable, OptBindSpec, PRODUCT_OPTIONS, PRODUCT_SPOT, PRODUCT_USDM};
     use exec_binance::margin::{MarginBook, SLOTS};
+    use exec_binance::testvenue::{OPT_CALL, OPT_PUT};
     use exec_router::{
         ExecMode, ExecRoute, HaltLimits, InstrumentSpec, NullLiveDispatcher, RoutedDispatcher,
-        SlotCaps, SlotSplit, VenueSplit, LAW_LINEAR, LAW_SPOT,
+        SlotCaps, SlotSplit, VenueSplit, INST_CALL, INST_WRITABLE, LAW_LINEAR, LAW_OPTION, LAW_SPOT,
     };
 
     const SLOT: u8 = 2;
@@ -13330,11 +13347,23 @@ fn binance_arm_steady_state() {
             &BindSpec { sym: spot, product: PRODUCT_SPOT, row: spot_disc.find(b"BTCUSDT").expect("gate 92 spot row"), owned: true, maker_ok: false },
         )
         .expect("gate 92 spot bind");
+    // BX9: eapi's BTC call (writable) and put (not), a month ahead.
+    let mut eapi = ingress_binance::eapi::EapiDiscovery::new();
+    eapi.ingest_exchange_info(exec_binance::testvenue::EAPI).expect("gate 92 eapi discovery");
+    let ahead = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_millis() as i64 + 30 * 86_400_000;
+    let (call, put) = (core_types::make_symbol_id(VenueId::Binance, 1_025), core_types::make_symbol_id(VenueId::Binance, 1_026));
+    let mut opt_rows = [0u16; 2];
+    for (k, (sym, name)) in [(call, OPT_CALL), (put, OPT_PUT)].into_iter().enumerate() {
+        let mut row = *eapi.rows().iter().find(|r| r.symbol() == name.as_bytes()).expect("gate 92 option row");
+        row.expiry_ms = ahead;
+        opt_rows[k] = t.bind_option(&mut w, &OptBindSpec { sym, row: &row, owned: true, writable: k == 0 }).expect("gate 92 option bind");
+    }
+    let (call_row, put_row) = (opt_rows[0], opt_rows[1]);
     let (eng, mut gw) = duplex();
     let mut lim = [0i64; SLOTS];
     lim[SLOT as usize] = 600_000;
     let mut prod = [0u8; SLOTS];
-    prod[SLOT as usize] = (1 << PRODUCT_USDM) | (1 << PRODUCT_SPOT);
+    prod[SLOT as usize] = (1 << PRODUCT_USDM) | (1 << PRODUCT_SPOT) | (1 << PRODUCT_OPTIONS);
     let arm = BnArm::new(
         eng,
         t,
@@ -13372,6 +13401,14 @@ fn binance_arm_steady_state() {
         d.bind_instrument(&InstrumentSpec::new(sym, LAW_LINEAR, 0, 0, 0)).expect("gate 92 ledger row");
     }
     d.bind_instrument(&InstrumentSpec::new(spot, LAW_SPOT, 0, 0, 0)).expect("gate 92 spot ledger row");
+    // Both options writable in the ledger: the arm's law is the guard here.
+    d.bind_instrument(&InstrumentSpec::new(call, LAW_OPTION, INST_WRITABLE | INST_CALL, 1_000_000, 85_000_000_000)).expect("gate 92 call row");
+    d.bind_instrument(&InstrumentSpec::new(put, LAW_OPTION, INST_WRITABLE, 1_000_000, 90_000_000_000)).expect("gate 92 put row");
+    let summary = |now: u64, sym: SymbolId, mark_1e6: i64| {
+        OptSummary::new(now, VenueId::Binance, sym, OPT_SUMMARY_FLAG_MARK_PX, mark_1e6 * 1_000, 0, 65_000_000_000_000, 0, 0, 0, 0, 0)
+    };
+    const CALL_MARK: i64 = 500_000_000;
+    const PUT_MARK: i64 = 25_100_000_000;
     let healthy = |now: u64| {
         let mut s = BnEvt::new(EVT_STATUS, now);
         s.flags = EVT_F_ORDER_UP | EVT_F_USER_UP | EVT_F_CLOCK_OK | EVT_F_DEADMAN_OK;
@@ -13383,7 +13420,11 @@ fn binance_arm_steady_state() {
     let mut day = BnEvt::new(EVT_DAY, t0);
     day.slot = SLOT;
     day.a = (t0 / 86_400_000_000_000) as i64;
-    assert!(give(&mut gw.evt, &healthy(t0)) && give(&mut gw.evt, &r) && give(&mut gw.evt, &day));
+    // The put held long (the gateway's booked position).
+    let mut held = BnEvt::new(EVT_POSITION, t0);
+    held.row = put_row;
+    held.a = 10_000;
+    assert!(give(&mut gw.evt, &healthy(t0)) && give(&mut gw.evt, &r) && give(&mut gw.evt, &day) && give(&mut gw.evt, &held));
     d.on_idle();
     d.on_idle();
     assert!(d.ledger().is_slot_seeded(SLOT as usize), "gate 92: the slot is seeded from the arm's day");
@@ -13414,6 +13455,9 @@ fn binance_arm_steady_state() {
     d.on_idle();
     let (mut ok, mut refused, mut polls) = (0u64, 0u64, 0u64);
     let (mut spot_ok, mut spot_refused, mut spot_makers) = (0u64, 0u64, 0u64);
+    let (mut opt_ok, mut opt_refused, mut put_sells, mut reduce_only, mut unwritten) = (0u64, 0u64, 0u64, 0u64, false);
+    d.on_opt_summary(&summary(core_time::now_ns(), call, CALL_MARK));
+    d.on_opt_summary(&summary(core_time::now_ns(), put, PUT_MARK));
     let mut i = 0u64;
     while i < N {
         let now = core_time::now_ns();
@@ -13422,6 +13466,25 @@ fn binance_arm_steady_state() {
             for sym in [ALIAS, eth] {
                 let px = if sym == ALIAS { 65_000_000_000 } else { 3_000_000_000 };
                 d.on_venue_event(&ChannelEvent::new(now, VenueId::Binance, ChannelId::Mark, sym, i, 0, px, px + 10_000));
+            }
+            d.on_opt_summary(&summary(now, call, CALL_MARK));
+            d.on_opt_summary(&summary(now, put, PUT_MARK));
+        }
+        // BX9: an option IoC every fourth turn, in turn — a call BUY, a
+        // call SELL, a put SELL (reduce-only), a put BUY.
+        if i % 4 == 1 {
+            let (sym, side, px) = match (i / 4) % 4 {
+                0 => (call, Side::Bid, CALL_MARK),
+                1 => (call, Side::Ask, CALL_MARK),
+                2 => (put, Side::Ask, PUT_MARK),
+                _ => (put, Side::Bid, PUT_MARK),
+            };
+            let mut o = Order::new(now, VenueId::Binance, sym, side, ORDER_KIND_IOC, Price::from_raw(px), Qty::from_raw(10_000), 30_000 + i);
+            o.strategy_id = SLOT;
+            if d.submit(&o).is_ok() {
+                opt_ok += 1;
+            } else {
+                opt_refused += 1;
             }
         }
         // The gateway's cold reports, one kind in turn.
@@ -13499,7 +13562,18 @@ fn binance_arm_steady_state() {
         while let Some(gc) = gw.cmd.pop() {
             let c: BnCmd = *gc;
             drop(gc);
+            if c.verb == VERB_PLACE && c.row == put_row && c.side == Side::Ask as u8 {
+                put_sells += 1;
+                reduce_only += u64::from(c.flags & ORDER_FLAG_REDUCE_ONLY != 0);
+            }
             let e = match c.verb {
+                // BX9: the first call SELL — not eligible to write (`-6057`).
+                VERB_PLACE if c.row == call_row && c.side == Side::Ask as u8 && !unwritten => {
+                    unwritten = true;
+                    let mut x = BnEvt::order(EVT_REJECT, now, c.client_oid, c.row, c.slot);
+                    x.code = -6057;
+                    x
+                }
                 // An IoC refused (a maker's refusal would meet its cancel).
                 VERB_PLACE if i % 97 == 1 && c.kind != ORDER_KIND_MAKER => {
                     let mut x = BnEvt::order(EVT_REJECT, now, c.client_oid, c.row, c.slot);
@@ -13594,6 +13668,7 @@ fn binance_arm_steady_state() {
     }
     let state = d.live().cancel_all_state();
     let (allocs, bytes, _) = g.delta();
+    assert!(d.binance_arm_report(core_time::now_ns(), &mut bn_report), "gate 92: the arm's report");
 
     assert!(ok > 100 && refused > 0, "both halves of the gate ran: {ok} accepted, {refused} refused");
     assert_eq!(
@@ -13602,6 +13677,13 @@ fn binance_arm_steady_state() {
         "gate 92: spot's own pool took its 10 s window's 100 IoCs ({spot_refused} refused there); no spot maker"
     );
     assert!(spot_refused > 0, "gate 92: spot's pool was spent");
+    assert_eq!(opt_ok, 30, "gate 92: options' own pool took its 10 s window's 30 IoCs ({opt_refused} refused)");
+    assert!(
+        unwritten && bn_report.refused[Refusal::NotWritable as usize] > 0 && bn_report.refused[Refusal::Orders as usize] > 0,
+        "gate 92: the -6057 unwrote the call ({:?})",
+        bn_report.refused
+    );
+    assert!(put_sells > 0 && reduce_only == put_sells, "gate 92: every put SELL left reduce-only ({reduce_only} of {put_sells})");
     assert!(polls > 100, "the idle hook drained events: {polls}");
     let c = d.exec_counters();
     assert!(c.arm_bn.submitted > 100 && c.arm_bn.rejected > 0, "{:?}", c.arm_bn);
@@ -13908,7 +13990,8 @@ fn binance_gateway_render_and_scan_steady_state() {
 /// 108) spawns (it is `#[ignore]`d, and a no-op without
 /// `GATE94_VENUE_DIR`): the scripted Binance (`exec_binance::testvenue`) —
 /// with `GATE94_REST=1` holding the account's HMAC secret, for gate 94b's
-/// REST route; with `GATE94_SPOT=1` (BX8, gate 108) its spot account
+/// REST route; with `GATE94_OPT=1` (BX9, gate 110) no options
+/// `ACCOUNT_UPDATE`; with `GATE94_SPOT=1` (BX8, gate 108) its spot account
 /// holding 1 BNB and paying every trade's commission in it (the burn: the
 /// BTC a round buys is sold back whole, so no balance drifts and no SELL
 /// is refused), and an IoC of exactly 0.003 filling half
@@ -13930,6 +14013,11 @@ fn gate94_venue_helper() {
     let v = Venue::start();
     if std::env::var_os("GATE94_REST").is_some_and(|x| x == "1") {
         v.with(|s| s.hmac = Some(HMAC_SECRET.to_vec()));
+    }
+    if std::env::var_os("GATE94_OPT").is_some_and(|x| x == "1") {
+        // BX9, gate 110: no options `ACCOUNT_UPDATE` (its paced margin
+        // re-read would land in a window at its own time).
+        v.with(|s| s.opt_account_events = false);
     }
     if std::env::var_os("GATE94_SPOT").is_some_and(|x| x == "1") {
         v.with(|s| {
@@ -18339,4 +18427,614 @@ fn binance_spot_lane_render_and_scan_steady_state() {
     );
     std::hint::black_box(&table);
     assert_eq!(allocs, 0, "gate 109: spot's render and scans allocated {allocs} times ({bytes} B)");
+}
+
+/// Gate 110's round: two IoCs over the options lane's REST route — each
+/// one `POST /eapi/v1/order` sealed and its answer opened, and the
+/// stream's two frames for it (NEW, the TRADE that fills it), each its own
+/// record (the venue writes a frame a write).
+const G110_ROUND: u64 = 8;
+/// Gate 110's reconciliation cycle (the sweep's confirmation): the options
+/// account on the route, the positions and the listing on the jobs — each
+/// request sealed, its answer opened.
+const G110_RECON: u64 = 6;
+
+/// What the engine end saw (gate 110).
+#[derive(Clone, Copy, Default)]
+struct Seen110 {
+    acks: u64,
+    filled: u64,
+    retired_other: u64,
+    rejects: u64,
+    locks: u64,
+    scan_fails: u64,
+    positions: u64,
+    margins: u64,
+    fills: u64,
+    bought: i64,
+    sold: i64,
+    j_fill: u64,
+    j_fee: u64,
+    /// `J_FEE`s on an option row, in its settle asset, a charge (> 0).
+    j_fee_opt: u64,
+    pulses: u64,
+    sweeps_done: u64,
+    recons: u64,
+    reconciled: u64,
+}
+
+/// **BX9 gate 110 — the options lane's whole step, over a real rustls
+/// loopback, allocates only rustls' record buffers** (gate 108's harness,
+/// options' lane).
+///
+/// The REAL gateway (`BnGateway::step`, booted as the engine boots it)
+/// OPTIONS-ONLY — the call and the put of the scripted venue's eapi
+/// (`exec_binance::testvenue::EAPI`) bound IoC-only, the call writable —
+/// against the venue in gate 94's CHILD process (`GATE94_OPT=1`: a trade
+/// pushes no `ACCOUNT_UPDATE`, whose paced margin re-read would land in a
+/// window at its own time). The arm key Ed25519, the options key its own
+/// HMAC pair (Q-1): every eapi request under its header, HMAC-signed in
+/// place. Every round: an IoC BUY of 0.01 call at 500, then — once it
+/// ended — an IoC SELL of 0.01 at 500 (a long closed: the booked position
+/// long, then flat — an `EVT_POSITION` each way); each filled whole at its
+/// limit. Each IoC is ONE `POST /eapi/v1/order` on the lane's REST route
+/// (one record sealed, about 530 B) and its answer (one record opened,
+/// about 520 B), and the `/private/ws/` stream's two frames — the NEW and
+/// the TRADE (`FILLED`), each its own record: the trade booked once (lane
+/// 4, `J_FILL`), its commission — NEGATIVE on eapi's stream — journaled
+/// once as a charge in the settle asset (`J_FEE`), the IoC retired FILLED
+/// (its ACK when the route's answer beats the stream's end). Pinned like
+/// gates 94b and 108: rustls 0.23's buffered API allocates one `Vec` per
+/// record it seals and one per application-data record it opens —
+/// [`G110_ROUND`] a round. Then, measured alone, **a reconciliation
+/// cycle** — the halt's sweep: no order rests, so nothing is cancelled and
+/// the confirmation is the whole cycle — `marginAccount` on the route,
+/// `position` and `openOrders` on the jobs: [`G110_RECON`]; the sweep
+/// reported done, the cycle reconciled — the PUT held long through it
+/// (bought before the window: the position read values an open leg at its
+/// mark and judges it matched; the alloc review), the call flat — the
+/// options margin sampled (`EVT_MARGIN`).
+///
+/// NOT pinned here (the alloc review's list): the boot (the clock on
+/// eapi, the keys' permissions, the listenKey, the day a row at a time);
+/// the listenKey's keep-alive (periodic, after the boot; the generic job
+/// render, as the futures lanes' — unpinned there too);
+/// the paced margin re-read an `ACCOUNT_UPDATE` asks for (the same route
+/// request as the cycle's first); the exercise records and a settlement
+/// fill (REST, as the listing; its scan, price and agreement are gate
+/// 111's — not `exercise_answered`'s check of a page naming a row twice,
+/// span compares in place); an unfilled IoC's stream `EXPIRED` and a `RISK_LEVEL_CHANGE`
+/// (scanned at 0 B in gate 111; a lock is cold, once); a place on an
+/// expired row (`CODE_EXPIRED`: refused before a byte is rendered); an
+/// in-doubt order's `GET /eapi/v1/order` (rendered, signed and its answer
+/// scanned in gate 111; on a socket only after a lost answer); bursts over
+/// the 4 KiB window. A break-and-watch (an 8-byte `Vec` in the options commission's
+/// normalization — two order events an IoC — and one in
+/// `opt_account_answered`) failed the rounds at 3 600 and the cycle at 7.
+#[test]
+fn binance_options_lane_round_trip_allocates_only_rustls_record_buffers() {
+    use clob_dispatcher::RETIRED_FILLED;
+    use core_config::SecretKeyBytes;
+    use core_fill::ORDER_KIND_IOC;
+    use core_ring::{Consumer, Ring};
+    use core_types::{ExecRecord, Fill, Side};
+    use exec_binance::arm::{
+        GW_FILLS_BOOKED, GW_FILLS_DEFERRED, GW_FILLS_FOREIGN, GW_FILLS_LOST, GW_FILLS_UNOWNED, GW_FILLS_UNRESOLVED, GW_IN_DOUBT_RAISED,
+        GW_JOBS_DROPPED, GW_JOURNAL_DROPPED, GW_RECON_DRIFT_LEGS, GW_RECON_FAILED, GW_RECON_OK, GW_RECON_UNSEEN_LEGS, GW_TALLIES,
+    };
+    use exec_binance::cmd::{
+        duplex, BnCmd, BnEngineEnd, EVT_ACK, EVT_F_RECONCILED, EVT_F_SWEEP_DONE, EVT_LOCK, EVT_MARGIN, EVT_POSITION, EVT_RECON,
+        EVT_REJECT, EVT_RETIRED, EVT_SCAN_FAIL, EVT_STATUS, EVT_SWEEP,
+    };
+    use exec_binance::config::{BnConfig, HmacSigner, Scope};
+    use exec_binance::gateway::{BnGateway, GwKnobs, Phase};
+    use exec_binance::inst::{InstTable, OptBindSpec, PRODUCT_OPTIONS};
+    use exec_binance::journal::{fee_fields, JournalTx, FEE_ASSET_SETTLE, JOURNAL_RING, J_FEE, J_FILL};
+    use exec_binance::mode::AccountMode;
+    use exec_binance::testvenue::{EAPI, EPOCH, KEY, OPT_CALL, OPT_HMAC_SECRET, OPT_KEY, OPT_PUT, SEED, SLOT};
+    use exec_gateway::stats::SWEEP_CLEAR;
+    use std::time::{Duration, Instant};
+
+    const FILL_N: usize = 1_024;
+    const ROUNDS: u64 = 300;
+    const WARM: u64 = 50;
+    const LONG_MS: u64 = 3_600_000;
+    const PX: i64 = 500_000_000;
+    const QTY: i64 = 10_000;
+    const CLOCK_CLEAR: Duration = Duration::from_secs(50);
+
+    type Gw = BnGateway<FILL_N>;
+
+    fn pump(gw: &mut Gw, eng: &mut BnEngineEnd, lane: &mut Consumer<Fill, FILL_N>, journal: &mut Consumer<ExecRecord, JOURNAL_RING>, s: &mut Seen110) {
+        gw.step();
+        while let Some(g) = eng.evt.pop() {
+            let (kind, why, flags) = (g.kind, g.why, g.flags);
+            drop(g);
+            match kind {
+                EVT_ACK => s.acks += 1,
+                EVT_RETIRED if why == RETIRED_FILLED => s.filled += 1,
+                EVT_RETIRED => s.retired_other += 1,
+                EVT_REJECT => s.rejects += 1,
+                EVT_LOCK => s.locks += 1,
+                EVT_SCAN_FAIL => s.scan_fails += 1,
+                EVT_POSITION => s.positions += 1,
+                EVT_MARGIN => s.margins += 1,
+                EVT_STATUS => s.pulses += 1,
+                EVT_SWEEP => s.sweeps_done += u64::from(flags & EVT_F_SWEEP_DONE != 0),
+                EVT_RECON => {
+                    s.recons += 1;
+                    s.reconciled += u64::from(flags & EVT_F_RECONCILED != 0);
+                }
+                _ => {}
+            }
+        }
+        while let Some(g) = lane.try_pop_ref() {
+            if matches!(g.side, Side::Bid) {
+                s.bought += g.qty.0;
+            } else {
+                s.sold += g.qty.0;
+            }
+            drop(g);
+            s.fills += 1;
+        }
+        while let Some(g) = journal.try_pop_ref() {
+            s.j_fill += u64::from(g.kind == J_FILL);
+            if g.kind == J_FEE {
+                let (_, asset, _, product, _, _) = fee_fields(g.code);
+                s.j_fee += 1;
+                s.j_fee_opt += u64::from(asset == FEE_ASSET_SETTLE && product == PRODUCT_OPTIONS && g.c > 0);
+            }
+            drop(g);
+        }
+    }
+
+    fn tallies(gw: &mut Gw, eng: &mut BnEngineEnd, lane: &mut Consumer<Fill, FILL_N>, journal: &mut Consumer<ExecRecord, JOURNAL_RING>, s: &mut Seen110) -> [u64; GW_TALLIES] {
+        let (p0, t) = (s.pulses, Instant::now());
+        while s.pulses == p0 {
+            assert!(t.elapsed() < Duration::from_secs(2), "gate 110: no pulse");
+            pump(gw, eng, lane, journal, s);
+        }
+        let mut w = [0u64; GW_TALLIES];
+        let mut i = 0;
+        while i < GW_TALLIES {
+            w[i] = eng.stats.published(i);
+            i += 1;
+        }
+        w
+    }
+
+    // ---- the venue, in its own process (gate 94's helper, options' knob) ----
+    let dir = std::env::temp_dir().join(format!("mv-gate110-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("gate 110 dir");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("gate 110 exe"))
+        .args(["gate94_venue_helper", "--exact", "--ignored", "--test-threads=1"])
+        .env("GATE94_VENUE_DIR", &dir)
+        .env("GATE94_REST", "0")
+        .env("GATE94_OPT", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("gate 110 child");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let port: u16 = loop {
+        if let Ok(s) = std::fs::read_to_string(dir.join("port")) {
+            break s.trim().parse().expect("gate 110 port");
+        }
+        assert!(Instant::now() < deadline, "gate 110: the venue never came up");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let der = std::fs::read(dir.join("cert.der")).expect("gate 110 cert");
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(rustls::pki_types::CertificateDer::from(der)).expect("gate 110 anchor");
+    let tls = std::sync::Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+
+    // ---- the gateway, booted options-only as the engine boots it ----
+    let seed = SecretKeyBytes::new_locked(SEED).expect("gate 110 seed");
+    let h = HmacSigner::from_secret(OPT_HMAC_SECRET).expect("gate 110 secret");
+    let cfg = BnConfig::loopback(Scope::Live, String::from(KEY), seed, port)
+        .and_then(|c| c.with_options_hmac(String::from(OPT_KEY), h))
+        .expect("gate 110 config");
+    let mut d = ingress_binance::eapi::EapiDiscovery::new();
+    d.ingest_exchange_info(EAPI).expect("gate 110 discovery");
+    let ahead = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_millis() as i64 + 30 * 86_400_000;
+    let (mut table, mut wire) = InstTable::new(core_config::universe::LEGACY_BN_ANCHOR_SYM);
+    for (k, sym) in [OPT_CALL, OPT_PUT].into_iter().enumerate() {
+        let mut row = *d.rows().iter().find(|r| r.symbol() == sym.as_bytes()).expect("gate 110 row");
+        row.expiry_ms = ahead;
+        let id = core_types::make_symbol_id(VenueId::Binance, 1_025 + k as u32);
+        table.bind_option(&mut wire, &OptBindSpec { sym: id, row: &row, owned: true, writable: k == 0 }).expect("gate 110 bind");
+    }
+    let (mut eng, gw_end) = duplex();
+    let (fill_tx, mut lane) = Ring::<Fill, FILL_N>::new().split();
+    let (j_tx, mut journal) = Ring::<ExecRecord, JOURNAL_RING>::new().split();
+    let knobs = GwKnobs {
+        epoch: EPOCH,
+        owner_slot: SLOT,
+        shared: false,
+        mode: AccountMode::Classic,
+        recv_window_ms: 5_000,
+        stp_mode: String::from("EXPIRE_MAKER"),
+        countdown_ms: 2 * LONG_MS,
+        heartbeat_ms: LONG_MS,
+        recon_every_ms: LONG_MS,
+        spin: false,
+        rotate_after_ns: LONG_MS * 1_000_000,
+        rest_orders: false,
+        pnl_anchor_1e6: 0,
+        boot_timeout_ns: 20_000_000_000,
+        quiet_ns: 60_000_000_000,
+        anchor_unsaved: None,
+        max_leverage: 20,
+        adopt_cap_usd_1e6: 0,
+    };
+    let mut gw = Gw::new(&cfg, tls, knobs, wire, gw_end, fill_tx, JournalTx::new(j_tx)).expect("gate 110 gateway");
+    gw.boot().expect("gate 110 boot");
+    assert_eq!(gw.phase(), Phase::Ready);
+    let ready_at = Instant::now();
+    let mut s = Seen110::default();
+    let answers = |eng: &BnEngineEnd| eng.stats.io()[1];
+    let rest_jobs = |eng: &BnEngineEnd| eng.stats.rest_rtt.count();
+
+    // Until no REST answer for 300 ms: whatever the boot left queued.
+    let t = Instant::now();
+    let (mut seen, mut quiet) = (rest_jobs(&eng), Instant::now());
+    while quiet.elapsed() < Duration::from_millis(300) {
+        assert!(t.elapsed() < Duration::from_secs(10), "gate 110: the boot's REST never settled");
+        pump(&mut gw, &mut eng, &mut lane, &mut journal, &mut s);
+        if rest_jobs(&eng) != seen {
+            (seen, quiet) = (rest_jobs(&eng), Instant::now());
+        }
+    }
+
+    // One IoC on the call: pushed, then pumped until it ended — the route
+    // answered, booked on lane 4, its commission journaled, retired.
+    let mut oid = 1_000_000u64;
+    let mut ioc = |gw: &mut Gw, eng: &mut BnEngineEnd, lane: &mut Consumer<Fill, FILL_N>, journal: &mut Consumer<ExecRecord, JOURNAL_RING>, s: &mut Seen110, row: u16, side: Side| {
+        oid += 1;
+        let (a0, e0, l0, fee0) = (answers(eng), s.filled, s.fills, s.j_fee);
+        assert!(eng.cmd.push(&BnCmd::place(oid, PX, QTY, 0, row, ORDER_KIND_IOC, side, SLOT, 0).at(core_time::now_ns())));
+        let t = Instant::now();
+        while !(answers(eng) > a0 && s.filled > e0 && s.fills > l0 && s.j_fee > fee0) {
+            assert!(t.elapsed() < Duration::from_secs(5), "gate 110: an IoC stalled");
+            pump(gw, eng, lane, journal, s);
+        }
+    };
+    let mut w = 0u64;
+    while w < WARM {
+        ioc(&mut gw, &mut eng, &mut lane, &mut journal, &mut s, 0, Side::Bid);
+        ioc(&mut gw, &mut eng, &mut lane, &mut journal, &mut s, 0, Side::Ask);
+        w += 1;
+    }
+
+    // ---- the rounds ----
+    assert!(ready_at.elapsed() < CLOCK_CLEAR, "gate 110: the run neared the clock's 60 s round");
+    let t_warm = tallies(&mut gw, &mut eng, &mut lane, &mut journal, &mut s);
+    let (warm, jobs0) = (s, rest_jobs(&eng));
+    let g = AllocGuard::new();
+    let mut r = 0u64;
+    while r < ROUNDS {
+        ioc(&mut gw, &mut eng, &mut lane, &mut journal, &mut s, 0, Side::Bid);
+        ioc(&mut gw, &mut eng, &mut lane, &mut journal, &mut s, 0, Side::Ask);
+        r += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    let (rounds, jobs1) = (s, rest_jobs(&eng));
+    let t_rounds = tallies(&mut gw, &mut eng, &mut lane, &mut journal, &mut s);
+
+    // ---- a reconciliation cycle, measured alone: the sweep's confirmation ----
+    // The put bought first and held through it: an open leg in the read.
+    ioc(&mut gw, &mut eng, &mut lane, &mut journal, &mut s, 1, Side::Bid);
+    assert!(ready_at.elapsed() < CLOCK_CLEAR, "gate 110: the run neared the clock's 60 s round");
+    let (before, jobs2) = (s, rest_jobs(&eng));
+    let g = AllocGuard::new();
+    let swept = eng.stats.request_sweep();
+    let t = Instant::now();
+    while !(eng.stats.sweep() == (swept, SWEEP_CLEAR) && s.sweeps_done > before.sweeps_done && s.recons > before.recons) {
+        assert!(t.elapsed() < Duration::from_secs(5), "gate 110: the sweep's cycle never ran");
+        pump(&mut gw, &mut eng, &mut lane, &mut journal, &mut s);
+    }
+    let (recon_allocs, recon_bytes, _) = g.delta();
+    let (recon, jobs3) = (s, rest_jobs(&eng));
+    let t_recon = tallies(&mut gw, &mut eng, &mut lane, &mut journal, &mut s);
+    let verdict = gw.last_verdict();
+    child.kill().ok();
+    child.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
+
+    let both = 2 * ROUNDS;
+    assert_eq!(
+        (rounds.filled - warm.filled, rounds.fills - warm.fills, rounds.j_fill - warm.j_fill, rounds.j_fee_opt - warm.j_fee_opt),
+        (both, both, both, both),
+        "gate 110: every IoC filled whole, booked once on lane 4 and journaled once, its commission a charge in the settle asset"
+    );
+    assert_eq!(
+        (rounds.bought - warm.bought, rounds.sold - warm.sold, rounds.positions - warm.positions),
+        (ROUNDS as i64 * QTY, ROUNDS as i64 * QTY, both),
+        "gate 110: every round bought 0.01 and sold it back — the position long, then flat"
+    );
+    assert!(rounds.acks - warm.acks <= both, "gate 110: an ACK at most an IoC (the stream's end may beat it)");
+    assert_eq!(
+        (recon.sweeps_done - before.sweeps_done, recon.recons - before.recons, recon.reconciled - before.reconciled, recon.margins - before.margins),
+        (1, 1, 1, 1),
+        "gate 110: the sweep done, one cycle judged and reconciled, the options margin sampled"
+    );
+    assert_eq!(before.bought - rounds.bought, QTY, "gate 110: the put held long through the cycle");
+    assert_eq!(
+        (verdict.drift_legs, verdict.unseen_legs, verdict.ghosts, verdict.orphans, verdict.foreign),
+        (0, 0, 0, 0, 0),
+        "gate 110: the verdict"
+    );
+    assert_eq!(
+        (recon.rejects, recon.retired_other, recon.scan_fails, recon.locks),
+        (0, 0, 0, 0),
+        "gate 110: nothing refused, nothing else retired, no frame failed its scan, no lock"
+    );
+    assert_eq!(
+        (t_rounds[GW_FILLS_BOOKED] - t_warm[GW_FILLS_BOOKED], t_recon[GW_RECON_OK] - t_rounds[GW_RECON_OK]),
+        (both, 1),
+        "gate 110: a fill an IoC; the cycle reconciled once"
+    );
+    assert_eq!(
+        (t_recon[GW_RECON_FAILED] - t_rounds[GW_RECON_FAILED], t_recon[GW_RECON_DRIFT_LEGS], t_recon[GW_RECON_UNSEEN_LEGS]),
+        (0, 0, 0),
+        "gate 110: the cycle — not failed, no drift leg, no unseen leg"
+    );
+    let zero = [
+        GW_FILLS_FOREIGN,
+        GW_FILLS_UNOWNED,
+        GW_FILLS_DEFERRED,
+        GW_FILLS_UNRESOLVED,
+        GW_FILLS_LOST,
+        GW_JOBS_DROPPED,
+        GW_IN_DOUBT_RAISED,
+        GW_JOURNAL_DROPPED,
+    ]
+    .map(|k| t_recon[k]);
+    assert_eq!(zero, [0; 8], "gate 110: no foreign, unowned, deferred, unresolved or lost fill; no job, doubt or record dropped");
+    assert_eq!((jobs1 - jobs0, jobs3 - jobs2), (0, 2), "gate 110: no REST job in the rounds; the cycle's positions and listing");
+    assert_eq!(
+        (allocs, recon_allocs),
+        (G110_ROUND * ROUNDS, G110_RECON),
+        "gate 110: the rounds and the cycle allocated {allocs} ({bytes} B) and {recon_allocs} ({recon_bytes} B) — rustls' records only"
+    );
+}
+
+/// **BX9 gate 111 — options' renders and scans are 0 B/op** (gate 109's
+/// shape, eapi's frames; in-process, no socket). What the gateway does per
+/// option order and per options cycle that the other gates do not already
+/// measure: `POST /eapi/v1/order` (`clientOrderId`, LIMIT + IOC, the
+/// reduce-only of the writing law), the in-doubt `GET /eapi/v1/order` and
+/// `marginAccount` rendered and HMAC-signed in place (Q-1); the place's ACK
+/// and the query's answer (`quantity`, never `origQty`) scanned; the
+/// stream's `ORDER_TRADE_UPDATE` NEW, TRADE (a NEGATIVE commission, taken
+/// as a charge) and EXPIRED, the options `ACCOUNT_UPDATE` (`B`/`P`, no `a`)
+/// and `RISK_LEVEL_CHANGE` read in place, each order event's row found by
+/// product, its trade seen once by the dedupe ring, its commission
+/// classified (USDT: the settle asset) and noted into the journal's ring.
+/// At their own cadence: the options account (`scan_opt_margin`: the
+/// ratio, the equity, `canTrade`, `reduceOnly`), the positions
+/// (`scan_opt_positions`: side-signed, mark-valued) judged as legs — one
+/// SETTLING — the open orders (`ACCEPTED`), the day's trades (eapi's
+/// `userTrades`: `quantity`, `side`), the exercise records priced at their
+/// intrinsic value (`settle_px_1e6`) and judged against the booked leg
+/// (`settlement_agrees`, R4), the index (`scan_opt_index`). And the
+/// router's ledger on an option row (Q-2): a summary's mark judged sane
+/// (`option_mark_sane`) and stamped fresh, a long's and a short's probe,
+/// the staleness sweep — and, every 64th turn, the sweep past the stale
+/// age (`INST_STALE` raised) and both probes refused `Unpriced` (opening
+/// on a stale row), the next summary freshening it. Zero allocations. A
+/// break-and-watch (an 8-byte `Vec` in `render_opt_place` and one in
+/// `scan_opt_index`) failed it at 20 313 (20 000 places, 313 cycles).
+#[test]
+fn binance_options_lane_render_and_scan_steady_state() {
+    use exec_binance::cid::CidPrefix;
+    use exec_binance::config::{HmacSigner, Signer};
+    use exec_binance::gateway::settle_px_1e6;
+    use exec_binance::inst::{InstTable, OptBindSpec, PRODUCT_OPTIONS};
+    use exec_binance::journal::{fee_asset, fee_code, fee_notional_1e9, JournalTx, FEE_ASSET_SETTLE, JOURNAL_RING, J_FEE, TRADE_BY_MEMBER};
+    use exec_binance::margin::um_ratio_1e6;
+    use exec_binance::oot::TidRing;
+    use exec_binance::recon::{
+        day_increasing_1e6, judge_positions, scan_exercise, scan_opt_margin, scan_opt_positions, settlement_agrees, ExerciseRow, Leg, PosRow, Verdict,
+    };
+    use exec_binance::rest::{
+        render_account, render_opt_by_cid, render_opt_place, scan_opt_index, scan_orders, scan_trades, OrderRow, QueryWriter, TradeRow,
+    };
+    use exec_binance::userstream::{scan_user_event, UserEvent, RISK_NORMAL, S_NEW, UE_ACCOUNT, UE_ORDER, UE_RISK, X_EXPIRED, X_NEW, X_TRADE};
+    use exec_binance::wsapi::{scan_rest_answer, Part, Place, WsAnswer, WsStatic};
+    use exec_router::ledger::MARK_STALE_NS;
+    use exec_router::{InstRefusal, InstrumentSpec, Ledger, INST_CALL, INST_WRITABLE, LAW_OPTION};
+
+    const N: u64 = 20_000;
+    const PLACED: &[u8] = br#"{"orderId":8001,"symbol":"BTC-261225-85000-C","price":"500","quantity":"0.01","executedQty":"0","fee":"0","side":"BUY","type":"LIMIT","timeInForce":"IOC","reduceOnly":false,"postOnly":false,"createTime":1790000000000,"updateTime":1790000000000,"status":"NEW","avgPrice":"0","clientOrderId":"mv6512ab0f2000000000000006500000","priceScale":3,"quantityScale":4,"optionSide":"CALL","quoteAsset":"USDT","mmp":false}"#;
+    const STATUS: &[u8] = br#"{"orderId":8001,"symbol":"BTC-261225-85000-C","price":"500","quantity":"0.01","executedQty":"0.01","fee":"0.0015","side":"BUY","type":"LIMIT","timeInForce":"IOC","reduceOnly":false,"postOnly":false,"createTime":1790000000000,"updateTime":1790000000001,"status":"FILLED","avgPrice":"500","clientOrderId":"mv6512ab0f2000000000000006500000","priceScale":3,"quantityScale":4,"optionSide":"CALL","quoteAsset":"USDT","mmp":false}"#;
+    const NEW: &[u8] = br#"{"e":"ORDER_TRADE_UPDATE","E":1790000000123,"T":1790000000123,"o":{"s":"BTC-261225-85000-C","c":"mv6512ab0f2000000000000006500000","S":"BUY","o":"LIMIT","f":"IOC","q":"0.01","p":"500.000","ap":"0.000","sp":"0","x":"NEW","X":"NEW","i":8001,"l":"0.00","z":"0.00","L":"0.000","N":"USDT","n":"0","T":1790000000123,"t":0,"b":"0","a":"0","m":false,"R":false,"ps":"BOTH","rp":"0","er":"0","V":"EXPIRE_MAKER"}}"#;
+    const TRADE: &[u8] = br#"{"e":"ORDER_TRADE_UPDATE","E":1790000000124,"T":1790000000124,"o":{"s":"BTC-261225-85000-C","c":"mv6512ab0f2000000000000006500000","S":"BUY","o":"LIMIT","f":"IOC","q":"0.01","p":"500.000","ap":"500.000","sp":"0","x":"TRADE","X":"FILLED","i":8001,"l":"0.01","z":"0.01","L":"500.000","N":"USDT","n":"-0.001500","T":1790000000124,"t":9001,"b":"0","a":"0","m":false,"R":false,"ps":"BOTH","rp":"0","er":"0","V":"EXPIRE_MAKER"}}"#;
+    const EXPIRED: &[u8] = br#"{"e":"ORDER_TRADE_UPDATE","E":1790000000125,"T":1790000000125,"o":{"s":"BTC-261225-90000-P","c":"mv6512ab0f2000000000000006600000","S":"SELL","o":"LIMIT","f":"IOC","q":"0.01","p":"25100.000","ap":"0.000","sp":"0","x":"EXPIRED","X":"EXPIRED","i":8002,"l":"0.00","z":"0.00","L":"0.000","N":"USDT","n":"0","T":1790000000125,"t":0,"b":"0","a":"0","m":false,"R":false,"ps":"BOTH","rp":"0","er":"0","V":"EXPIRE_MAKER"}}"#;
+    const ACCOUNT: &[u8] = br#"{"e":"ACCOUNT_UPDATE","E":1790000000126,"B":[{"b":"2000.000000","m":"2000.000000","u":"0","U":0,"M":"10.000000","i":"0","a":"USDT"}],"P":[{"s":"BTC-261225-85000-C","c":"0.01","r":"0.01","p":"500.000","a":"0"}],"uid":1}"#;
+    const RISK: &[u8] = br#"{"e":"RISK_LEVEL_CHANGE","E":1790000000127,"s":"NORMAL","mb":"1534.11","mm":"254.78"}"#;
+    const MARGIN: &[u8] = br#"{"asset":[{"asset":"USDT","marginBalance":"2000.000000","equity":"2000.000000","available":"2000.000000","initialMargin":"0","maintMargin":"10.000000","unrealizedPNL":"0","adjustedEquity":"2000.000000"}],"time":1790000000000,"canTrade":true,"canDeposit":true,"canWithdraw":true,"reduceOnly":false,"tradeGroupId":-1}"#;
+    const POSITIONS: &[u8] = br#"[{"entryPrice":"500.000","symbol":"BTC-261225-85000-C","side":"LONG","quantity":"0.01","reducibleQty":"0.01","markValue":"5","ror":"0","unrealizedPNL":"0","markPrice":"500.000","strikePrice":"85000","positionCost":"5","expiryDate":1798185600000,"priceScale":3,"quantityScale":4,"optionSide":"CALL","quoteAsset":"USDT"},{"entryPrice":"25100.000","symbol":"BTC-261225-90000-P","side":"SHORT","quantity":"-0.01","reducibleQty":"0.01","markValue":"-251","ror":"0","unrealizedPNL":"0","markPrice":"25100.000","strikePrice":"90000","positionCost":"251","expiryDate":1798185600000,"priceScale":3,"quantityScale":4,"optionSide":"PUT","quoteAsset":"USDT"}]"#;
+    const OPEN: &[u8] = br#"[{"orderId":7101,"symbol":"BTC-261225-85000-C","price":"400","quantity":"0.01","executedQty":"0","fee":"0","side":"BUY","type":"LIMIT","timeInForce":"GTC","reduceOnly":false,"postOnly":false,"createTime":1790000000000,"updateTime":1790000000000,"status":"ACCEPTED","avgPrice":"0","clientOrderId":"web_stranger_9","priceScale":3,"quantityScale":4,"optionSide":"CALL","quoteAsset":"USDT","mmp":false}]"#;
+    const TRADES: &[u8] = br#"[{"id":4611875134427365377,"tradeId":239,"orderId":4611875134427365376,"symbol":"BTC-261225-85000-C","price":"500","quantity":"0.01","fee":"-0.0015","realizedProfit":"0","side":"BUY","type":"LIMIT","volatility":"0.5","liquidity":"TAKER","quoteAsset":"USDT","time":1790000000001,"priceScale":3,"quantityScale":4,"optionSide":"CALL"}]"#;
+    const EXERCISE: &[u8] = br#"[{"id":"1125899906842624000","currency":"USDT","symbol":"BTC-261225-85000-C","exercisePrice":"86000.000","markPrice":"86000.000","quantity":"0.01","amount":"10.000","fee":"0.015","createDate":1790000000000,"priceScale":3,"quantityScale":4,"optionSide":"CALL","positionSide":"LONG","quoteAsset":"USDT"}]"#;
+    const INDEX: &[u8] = br#"{"time":1790000000000,"indexPrice":"65000.000"}"#;
+
+    // Boot-time construction — outside the window.
+    let prefix = CidPrefix::new(0x6512_ab0f);
+    let st = WsStatic::new("EXPIRE_MAKER", 5_000);
+    let signer = Signer::Hmac(HmacSigner::from_secret(exec_binance::testvenue::OPT_HMAC_SECRET).expect("gate 111 secret"));
+    let mut d = ingress_binance::eapi::EapiDiscovery::new();
+    d.ingest_exchange_info(exec_binance::testvenue::EAPI).expect("gate 111 discovery");
+    let (mut table, mut wire) = InstTable::new(7);
+    let mut rows = [0u16; 2];
+    for (k, sym) in [&b"BTC-261225-85000-C"[..], &b"BTC-261225-90000-P"[..]].into_iter().enumerate() {
+        let row = d.rows().iter().find(|r| r.symbol() == sym).expect("gate 111 row");
+        rows[k] = table
+            .bind_option(&mut wire, &OptBindSpec { sym: core_types::make_symbol_id(VenueId::Binance, 1_025 + k as u32), row, owned: true, writable: true })
+            .expect("gate 111 bind");
+    }
+    let (call, put) = (rows[0], rows[1]);
+    let w = *wire.row(call);
+    let o_call = *wire.opt(call);
+    let mut win = [0u8; 2_048];
+    let mut tids = TidRing::<256>::new();
+    let (j_p, mut j_c) = core_ring::Ring::<core_types::ExecRecord, JOURNAL_RING>::new().split();
+    let mut journal = JournalTx::new(j_p);
+    let mut pos = [PosRow::default(); 8];
+    let mut orders = [OrderRow::default(); 8];
+    let mut trades = [TradeRow::default(); 8];
+    let mut ex = [ExerciseRow::default(); 8];
+    let mut legs = [Leg::default(); 2];
+    legs[0].owned = true;
+    legs[1].owned = true;
+    let mut a = WsAnswer::default();
+    let mut ev = UserEvent::default();
+    // The router's ledger, an option row bound (Q-2).
+    let (t0, sym_call) = (1_000_000_000u64, core_types::make_symbol_id(VenueId::Binance, 1_025));
+    let mut ledger = Box::new(Ledger::new(core_time::WallAnchor::new(t0, t0)));
+    ledger.mark_seeded();
+    ledger.bind_instrument(&InstrumentSpec::new(sym_call, LAW_OPTION, INST_WRITABLE | INST_CALL, 1_000_000, 85_000_000_000)).expect("gate 111 ledger row");
+
+    let g = AllocGuard::new();
+    let (mut rendered, mut fees, mut others, mut risks, mut settled, mut probes, mut stale) = (0usize, 0u64, 0u64, 0u64, 0i64, 0u64, 0u64);
+    let mut i = 0u64;
+    while i < N {
+        let now = core_time::now_ns();
+        let ts = 1_790_000_000_000 + i;
+        let cid = Part::Cid(&prefix, 2, 0x65 + i);
+        // The route's requests, HMAC-signed in place.
+        let o = Place {
+            symbol: w.symbol(),
+            side: (i & 1) as u8,
+            maker: false,
+            reduce_only: i & 2 != 0,
+            qty_1e6: 10_000,
+            qty_dec: w.qty_dec,
+            px_1e6: 500_000_000 + (i % 100) as i64 * 5_000_000,
+            px_dec: w.px_dec,
+            cid,
+            ts_ms: ts,
+        };
+        let mut q = QueryWriter::new(&mut win);
+        render_opt_place(&mut q, &st, &o);
+        rendered += q.sign_with(&signer).expect("gate 111 place");
+        let mut q = QueryWriter::new(&mut win);
+        render_opt_by_cid(&mut q, &st, w.symbol(), cid, ts);
+        rendered += q.sign_with(&signer).expect("gate 111 query");
+        // Their answers.
+        scan_rest_answer(200, PLACED, &mut a).expect("gate 111 ack");
+        assert_eq!((a.venue_oid, a.order_status), (8_001, S_NEW), "gate 111: the ACK names the order");
+        std::hint::black_box(prefix.classify(a.cid.get(PLACED)));
+        scan_rest_answer(200, STATUS, &mut a).expect("gate 111 status");
+        assert_eq!((a.executed_1e6, a.qty_1e6), (10_000, 10_000), "gate 111: eapi's `quantity`");
+        // The stream's frames, read in place.
+        for f in [NEW, TRADE, EXPIRED, ACCOUNT, RISK] {
+            scan_user_event(f, &mut ev).expect("gate 111 event");
+            match ev.kind {
+                UE_ORDER => {}
+                UE_ACCOUNT => {
+                    others += 1;
+                    continue;
+                }
+                UE_RISK => {
+                    risks += u64::from(ev.risk == RISK_NORMAL);
+                    continue;
+                }
+                _ => unreachable!("gate 111: no other event"),
+            }
+            std::hint::black_box(prefix.classify(ev.cid.get(f)));
+            let row = wire.find(PRODUCT_OPTIONS, ev.symbol.get(f));
+            assert!(row == call || row == put, "gate 111: the event's row, by product");
+            match ev.exec {
+                X_NEW | X_EXPIRED => {}
+                X_TRADE => {
+                    let tid = ev.trade_id + 10 * (i % 512);
+                    let seen = tids.see(row, tid, true);
+                    assert!(!seen.again && seen.fee_due, "gate 111: a fresh trade, its commission owed");
+                    // The gateway's normalization: a charge whatever its sign.
+                    let commission = ev.commission_1e9.saturating_abs();
+                    assert_eq!(commission, 1_500_000, "gate 111: 0.0015 USDT ×1e9");
+                    let wr = wire.row(row);
+                    let asset = fee_asset(wr, ev.fee_asset.get(f));
+                    assert_eq!(asset, FEE_ASSET_SETTLE, "gate 111: USDT, an option's settle asset");
+                    let fee = core_types::ExecRecord {
+                        ts_ns: now,
+                        wall_ms: ts,
+                        client_oid: 0x65 + i,
+                        venue_oid: ev.venue_oid,
+                        a: ev.last_px_1e6,
+                        b: fee_notional_1e9(wr, ev.last_px_1e6, ev.last_qty_1e6),
+                        c: commission,
+                        code: fee_code(ev.maker != 0, asset, TRADE_BY_MEMBER, wr),
+                        row,
+                        kind: J_FEE,
+                        slot: 2,
+                    };
+                    assert!(journal.note(&fee), "gate 111: the journal's ring has room");
+                    fees += 1;
+                }
+                _ => unreachable!("gate 111: no other execution"),
+            }
+        }
+        while let Some(x) = j_c.try_pop_ref() {
+            std::hint::black_box((x.b, x.c));
+        }
+        // The router's ledger: a fresh, sane mark; a long's and a short's
+        // probe; the staleness sweep.
+        let mark = 500_000_000 + (i % 7) as i64 * 5_000_000;
+        let s = core_types::OptSummary::new(t0 + i, VenueId::Binance, sym_call, core_types::OPT_SUMMARY_FLAG_MARK_PX, mark * 1_000, 0, 65_000_000_000_000, 0, 0, 0, 0, 0);
+        ledger.on_opt_summary(&s);
+        for buy in [true, false] {
+            let p = ledger.probe_instrument(sym_call, 2, 10_000, buy, mark, None).expect("gate 111 probe");
+            probes += u64::from(p.refusal == InstRefusal::None);
+        }
+        ledger.expire_marks(t0 + i);
+        // Now and then the feed falls silent past the stale age: opening
+        // refused either way until the next summary.
+        if i % 64 == 32 {
+            ledger.expire_marks(t0 + i + MARK_STALE_NS + 1);
+            for buy in [true, false] {
+                let p = ledger.probe_instrument(sym_call, 2, 10_000, buy, mark, None).expect("gate 111 stale probe");
+                stale += u64::from(p.refusal == InstRefusal::Unpriced);
+            }
+        }
+        // The cycle's reads, at their own cadence.
+        if i % 64 == 0 {
+            let mut q = QueryWriter::new(&mut win);
+            render_account(&mut q, &st, ts);
+            rendered += q.sign_with(&signer).expect("gate 111 account");
+            scan_rest_answer(200, MARGIN, &mut a).expect("gate 111 margin answer");
+            let m = scan_opt_margin(MARGIN, a.result).expect("gate 111 margin");
+            assert!(m.can_trade && !m.reduce_only && um_ratio_1e6(m.maint_1e6, m.adj_equity_1e6) == 5_000, "gate 111: the ratio, 0.5 %");
+            let n = scan_opt_positions(POSITIONS, &mut pos).expect("gate 111 positions");
+            assert_eq!((n, pos[1].amt_1e6), (2, -10_000), "gate 111: the short side-signed");
+            legs[0].venue_1e6 = pos[0].amt_1e6;
+            legs[0].booked_1e6 = 10_000;
+            legs[1].venue_1e6 = 0;
+            legs[1].booked_1e6 = -10_000;
+            legs[1].settling = true;
+            let mut v = Verdict::default();
+            judge_positions(&mut legs, &mut v);
+            assert!(v.reconciled(), "gate 111: one leg matched, one settling");
+            let n = scan_orders(OPEN, &mut orders).expect("gate 111 open orders");
+            std::hint::black_box(prefix.classify(orders[n - 1].cid.get(OPEN)));
+            let n = scan_trades(TRADES, &mut trades).expect("gate 111 trades");
+            assert_eq!(day_increasing_1e6(&mut trades[..n], 10_000, false, 1_000_000), 5_000_000, "gate 111: the day's 5 USD");
+            let n = scan_exercise(EXERCISE, &mut ex).expect("gate 111 exercise");
+            let px = settle_px_1e6(&o_call, w.unit_1e6, ex[n - 1].exercise_px_1e6);
+            assert!(settlement_agrees(&ex[n - 1], 10_000, px), "gate 111: the record agrees with the booked long");
+            settled += px;
+            assert_eq!(scan_opt_index(INDEX), Ok(65_000_000_000), "gate 111: the index");
+        }
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+
+    assert!(rendered > 0, "the gate rendered nothing");
+    assert_eq!((fees, others, risks, probes), (N, N, N, 2 * N), "gate 111: a fee a trade; the account and the risk counted; every probe priced");
+    assert_eq!(settled, N.div_ceil(64) as i64 * 1_000_000_000, "gate 111: 1 000 a contract at 86 000 over 85 000");
+    assert_eq!(stale, 2 * ((N + 31) / 64), "gate 111: every probe on the stale row refused Unpriced");
+    std::hint::black_box((&table, &ledger));
+    assert_eq!(allocs, 0, "gate 111: options' render and scans allocated {allocs} times ({bytes} B)");
 }

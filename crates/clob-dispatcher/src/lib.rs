@@ -1556,7 +1556,7 @@ const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 1_016);
 
 /// The Binance arm's local refusal reasons ([`BinanceArmReport::refused`]
 /// — `exec_binance::arm::Refusal`, pinned there).
-pub const BINANCE_REFUSALS: usize = 20;
+pub const BINANCE_REFUSALS: usize = 21;
 
 /// **BX11 — the Binance arm's own numbers**
 /// ([`OrderDispatch::binance_arm_report`]): its verbs, its gateway's
@@ -1652,6 +1652,11 @@ pub struct BinanceArmReport {
     pub weight_used: u64,
     /// See [`Self::weight_used`].
     pub weight_max: u64,
+    /// BX9: eapi's request weight spent in the last minute, and the
+    /// options lane's share of eapi's own minute (its pool, apart).
+    pub opt_weight_used: u64,
+    /// See [`Self::opt_weight_used`].
+    pub opt_weight_max: u64,
     /// The ORDERS pool's windows: placements in the last 10 s and minute,
     /// and their caps.
     pub orders_10s_used: u64,
@@ -1668,6 +1673,8 @@ pub struct BinanceArmReport {
     pub margin_usdm_1e6: i64,
     /// See [`Self::margin_usdm_1e6`].
     pub margin_coinm_1e6: i64,
+    /// BX9: the options account's (maintenance over adjusted equity).
+    pub margin_options_1e6: i64,
     /// Rows on the owned list.
     pub owned_rows: u64,
     /// The account mode (`exec_binance::mode::AccountMode` as its `u8`)
@@ -1694,7 +1701,8 @@ pub struct BinanceArmReport {
 }
 
 // BX11: 75 words — pinned, as the other blocks crossing this boundary are.
-const _: () = assert!(core::mem::size_of::<BinanceArmReport>() == 600);
+// BX9: + the `not_writable` refusal, options' margin and eapi's weight (79).
+const _: () = assert!(core::mem::size_of::<BinanceArmReport>() == 632);
 
 /// **BX3 (F9) — an accepted order that ended without a (further) fill**,
 /// as the arm tells the router ([`OrderDispatch::try_next_retired`]).

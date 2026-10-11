@@ -38,7 +38,7 @@
 use core_net::{Method, Params, ReqSpec};
 
 use crate::config::{hex_lower, HmacSigner, Signer, HMAC_SIG_HEX};
-use crate::inst::{PRODUCT_COINM, PRODUCT_SPOT};
+use crate::inst::{PRODUCT_COINM, PRODUCT_OPTIONS, PRODUCT_SPOT};
 use crate::json::{bool_of, dec_1e6, dec_1e9, i64_of, str_of, u64_of, Elems, Pairs};
 use crate::num::{render_fixed, render_u64, RENDER_MAX};
 use crate::userstream::{side_of, status_of, ScanErr, Span};
@@ -81,10 +81,18 @@ pub const T_ACCOUNT: usize = 9;
 pub const T_SYMBOL_CONFIG: usize = 10;
 /// `GET /api/v3/ticker/price?symbol=…` (public; BX8): a spot row's price,
 /// read once at boot for a balance the boot adopts (a balance carries
-/// none). Spot only.
+/// none) — on options (BX9) `GET /eapi/v1/index?underlying=…`, an
+/// underlying's index for a held short's adoption. Spot and options only.
 pub const T_PRICE: usize = 11;
+/// `GET /eapi/v1/position` (signed; BX9): the options account's positions
+/// — the cycle's legs (its margin is the order route's `marginAccount`).
+/// Options only.
+pub const T_POSITION: usize = 12;
+/// `GET /eapi/v1/exerciseRecord` (signed; BX9): the expired options'
+/// settlements — read while an expired leg is settling (§3.10). Options only.
+pub const T_EXERCISE: usize = 13;
 /// A lane's jobs connection's templates.
-pub const LANE_TEMPLATES: usize = 12;
+pub const LANE_TEMPLATES: usize = 14;
 
 /// papi's connectivity check: what a slot papi has no endpoint for names
 /// (the countdown — K13: no dead-man in PM — the time, multi-assets); it
@@ -105,6 +113,8 @@ const FAPI_PATHS: [&str; LANE_TEMPLATES] = [
     "/fapi/v3/account",
     "/fapi/v1/symbolConfig",
     "/fapi/v1/ping",
+    "/fapi/v1/ping",
+    "/fapi/v1/ping",
 ];
 
 /// The jobs connection's paths by template, COIN-M. Its multi-assets and
@@ -123,6 +133,8 @@ const DAPI_PATHS: [&str; LANE_TEMPLATES] = [
     "/dapi/v1/account",
     "/dapi/v1/symbolConfig",
     "/dapi/v1/ping",
+    "/dapi/v1/ping",
+    "/dapi/v1/ping",
 ];
 
 /// Portfolio Margin's paths by template, USDⓈ-M (papi `um/`).
@@ -139,6 +151,8 @@ const PAPI_UM_PATHS: [&str; LANE_TEMPLATES] = [
     "/papi/v1/account",
     PAPI_NONE,
     PAPI_NONE,
+    PAPI_NONE,
+    PAPI_NONE,
 ];
 
 /// Portfolio Margin's paths by template, COIN-M (papi `cm/`).
@@ -153,6 +167,8 @@ const PAPI_CM_PATHS: [&str; LANE_TEMPLATES] = [
     "/papi/v1/cm/positionSide/dual",
     PAPI_NONE,
     "/papi/v1/account",
+    PAPI_NONE,
+    PAPI_NONE,
     PAPI_NONE,
     PAPI_NONE,
 ];
@@ -177,6 +193,35 @@ const SPOT_PATHS: [&str; LANE_TEMPLATES] = [
     SPOT_NONE,
     SPOT_NONE,
     "/api/v3/ticker/price",
+    SPOT_NONE,
+    SPOT_NONE,
+];
+
+/// Options' connectivity check (BX9): what a slot eapi has no endpoint
+/// for, or the gateway never sends there (the countdown is a market
+/// maker's — `-6005`, K3; options are IoC-only: no cancel-all; the futures
+/// assertions); never started.
+const EAPI_NONE: &str = "/eapi/v1/ping";
+
+/// Options' paths by template (BX9): the listenKey, the time, the open
+/// orders, the day's trades, an underlying's index (the price slot: a held
+/// short's adoption), the positions, the exercise record. The margin is
+/// read on the order route (`marginAccount`).
+const EAPI_PATHS: [&str; LANE_TEMPLATES] = [
+    "/eapi/v1/listenKey",
+    "/eapi/v1/listenKey",
+    EAPI_NONE,
+    "/eapi/v1/time",
+    "/eapi/v1/openOrders",
+    "/eapi/v1/userTrades",
+    EAPI_NONE,
+    EAPI_NONE,
+    EAPI_NONE,
+    EAPI_NONE,
+    EAPI_NONE,
+    "/eapi/v1/index",
+    "/eapi/v1/position",
+    "/eapi/v1/exerciseRecord",
 ];
 
 /// `GET /sapi/v1/account/apiRestrictions` (signed).
@@ -186,17 +231,21 @@ pub const S_PORTFOLIO: usize = 1;
 /// `GET /api/v3/time`: the clock in Portfolio Margin, whose papi has no
 /// time endpoint (Binance's one server time; BX7, C2).
 pub const S_TIME: usize = 2;
+/// `GET /sapi/v1/account/apiRestrictions` under the OPTIONS key (BX9, Q-1:
+/// options sign with their own HMAC key — its permissions are its own).
+pub const S_API_RESTRICTIONS_OPT: usize = 3;
 /// The sapi templates.
-pub const SAPI_TEMPLATES: usize = 3;
+pub const SAPI_TEMPLATES: usize = 4;
 
 /// A lane's jobs connection's templates for `product` (`PRODUCT_COINM`:
-/// dapi; `PRODUCT_SPOT`: spot's, BX8; otherwise fapi) — in Portfolio
-/// Margin (`pm`), the futures product's papi paths — every one carrying
-/// the key header.
+/// dapi; `PRODUCT_SPOT`: spot's, BX8; `PRODUCT_OPTIONS`: eapi's, BX9;
+/// otherwise fapi) — in Portfolio Margin (`pm`), the futures product's
+/// papi paths — every one carrying the key header.
 #[must_use]
 pub fn lane_specs<'a>(product: u8, pm: bool, key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; LANE_TEMPLATES] {
     let p = match (pm, product) {
         (_, PRODUCT_SPOT) => &SPOT_PATHS,
+        (_, PRODUCT_OPTIONS) => &EAPI_PATHS,
         (false, PRODUCT_COINM) => &DAPI_PATHS,
         (false, _) => &FAPI_PATHS,
         (true, PRODUCT_COINM) => &PAPI_CM_PATHS,
@@ -227,6 +276,8 @@ pub fn lane_specs<'a>(product: u8, pm: bool, key: &'a [(&'a str, &'a str)]) -> [
         q(Method::Get, T_ACCOUNT),
         q(Method::Get, T_SYMBOL_CONFIG),
         q(Method::Get, T_PRICE),
+        q(Method::Get, T_POSITION),
+        q(Method::Get, T_EXERCISE),
     ]
 }
 
@@ -253,16 +304,22 @@ pub const R_ACCOUNT: usize = 4;
 pub const ORD_TEMPLATES: usize = 5;
 
 /// The order route's templates for `product` (`PRODUCT_COINM`: dapi;
+/// `PRODUCT_OPTIONS`: eapi's — BX9: the place, the query and the margin
+/// account; no cancel or modify is built, those slots are never started;
 /// otherwise fapi; in Portfolio Margin, `pm`, the product's papi paths),
 /// every one carrying the key header.
 #[must_use]
 pub fn ord_specs<'a>(product: u8, pm: bool, key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; ORD_TEMPLATES] {
-    let (order, account) = match (pm, product == PRODUCT_COINM) {
-        (false, false) => ("/fapi/v1/order", "/fapi/v3/account"),
-        (false, true) => ("/dapi/v1/order", "/dapi/v1/account"),
-        (true, false) => ("/papi/v1/um/order", "/papi/v2/um/account"),
-        (true, true) => ("/papi/v1/cm/order", "/papi/v1/cm/account"),
+    let (order, account) = match (pm, product) {
+        (_, PRODUCT_OPTIONS) => ("/eapi/v1/order", "/eapi/v1/marginAccount"),
+        (false, PRODUCT_COINM) => ("/dapi/v1/order", "/dapi/v1/account"),
+        (false, _) => ("/fapi/v1/order", "/fapi/v3/account"),
+        (true, PRODUCT_COINM) => ("/papi/v1/cm/order", "/papi/v1/cm/account"),
+        (true, _) => ("/papi/v1/um/order", "/papi/v2/um/account"),
     };
+    // Options build no cancel and no modify (IoC-only, BX-17): their slots
+    // name eapi's connectivity check, never started.
+    let (cancel, modify) = if product == PRODUCT_OPTIONS { (EAPI_NONE, EAPI_NONE) } else { (order, order) };
     let q = |method, path| ReqSpec {
         method,
         path,
@@ -277,8 +334,8 @@ pub fn ord_specs<'a>(product: u8, pm: bool, key: &'a [(&'a str, &'a str)]) -> [R
     };
     [
         b(Method::Post, order),
-        b(Method::Delete, order),
-        b(Method::Put, order),
+        b(Method::Delete, cancel),
+        b(Method::Put, modify),
         q(Method::Get, order),
         q(Method::Get, account),
     ]
@@ -414,21 +471,74 @@ pub fn render_by_order_id(w: &mut QueryWriter<'_>, st: &WsStatic, symbol: &[u8],
     ]);
 }
 
+/// **`POST /eapi/v1/order`** — an options place (BX9): eapi names the id
+/// `clientOrderId` (not `newClientOrderId`), takes `LIMIT` only, and
+/// answers with `newOrderRespType=ACK`. Options are IoC-only (BX-17: the
+/// countdown is a market maker's), so a maker is never sent here — the arm
+/// refuses it first.
+pub fn render_opt_place(w: &mut QueryWriter<'_>, st: &WsStatic, o: &Place<'_>) {
+    debug_assert!(!o.maker, "options are IoC-only: the arm refuses a maker");
+    let ro: &[u8] = if o.reduce_only { b"&reduceOnly=true" } else { b"" };
+    w.parts(&[
+        Part::Lit(b"symbol="),
+        Part::Lit(o.symbol),
+        Part::Lit(b"&side="),
+        Part::Lit(side_word(o.side)),
+        Part::Lit(b"&type=LIMIT&timeInForce=IOC"),
+        Part::Lit(ro),
+        Part::Lit(b"&quantity="),
+        Part::Fixed(o.qty_1e6, o.qty_dec),
+        Part::Lit(b"&price="),
+        Part::Fixed(o.px_1e6, o.px_dec),
+        Part::Lit(b"&clientOrderId="),
+        o.cid,
+        Part::Lit(b"&newOrderRespType=ACK"),
+        Part::Lit(if st.stp.is_empty() { b"" } else { b"&selfTradePreventionMode=" }),
+        Part::Lit(st.stp),
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(o.ts_ms),
+    ]);
+}
+
+/// **`GET /eapi/v1/order`** — one options order by its client id (BX9: the
+/// in-doubt query, BX-11): eapi names it `clientOrderId`.
+pub fn render_opt_by_cid(w: &mut QueryWriter<'_>, st: &WsStatic, symbol: &[u8], cid: Part<'_>, ts_ms: u64) {
+    w.parts(&[
+        Part::Lit(b"symbol="),
+        Part::Lit(symbol),
+        Part::Lit(b"&clientOrderId="),
+        cid,
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(ts_ms),
+    ]);
+}
+
 /// **`GET /fapi/v3/account`** — recon and margin.
 pub fn render_account(w: &mut QueryWriter<'_>, st: &WsStatic, ts_ms: u64) {
     w.parts(&[Part::Lit(b"recvWindow="), Part::U64(st.recv_window_ms), Part::Lit(b"&timestamp="), Part::U64(ts_ms)]);
 }
 
-/// The sapi connection's templates.
+/// The sapi connection's templates: the arm's key's, then the options
+/// key's permission read (BX9; `opt_key` is the arm's own where options sign
+/// with it, or none are armed — that slot is then never started).
 #[must_use]
-pub fn sapi_specs<'a>(key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; SAPI_TEMPLATES] {
-    let q = |path| ReqSpec {
+pub fn sapi_specs<'a>(key: &'a [(&'a str, &'a str)], opt_key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; SAPI_TEMPLATES] {
+    let q = |path, headers| ReqSpec {
         method: Method::Get,
         path,
         params: Params::Query,
-        headers: key,
+        headers,
     };
-    [q("/sapi/v1/account/apiRestrictions"), q("/sapi/v1/portfolio/account"), q("/api/v3/time")]
+    [
+        q("/sapi/v1/account/apiRestrictions", key),
+        q("/sapi/v1/portfolio/account", key),
+        q("/api/v3/time", key),
+        q("/sapi/v1/account/apiRestrictions", opt_key),
+    ]
 }
 
 /// A render that did not fit its window.
@@ -520,11 +630,37 @@ impl<'a> QueryWriter<'a> {
     pub fn sign_with(self, signer: &Signer) -> Result<usize, Overflow> {
         match signer {
             Signer::Ed25519(s) => self.sign(s),
-            Signer::Hmac(h) => {
-                let n = self.rendered()?;
-                sign_hmac_in_place(h, self.buf, n)
-            }
+            Signer::Hmac(h) => h.sign_query(self),
         }
+    }
+}
+
+/// **What signs a rendered query** (BX9, the risk review's R2): the arm's
+/// [`Signer`], or an HMAC key BORROWED where the configuration holds it —
+/// a cold boot read (the options held) signs with no copy of the secret: a
+/// throwaway copy's drop `munlock`s its whole page, which a live key's
+/// half may share (Linux locks do not stack).
+pub trait QuerySigner {
+    /// Sign `q`'s rendered bytes and append the signature; the request's
+    /// total length.
+    ///
+    /// # Errors
+    /// The request does not fit its window.
+    fn sign_query(&self, q: QueryWriter<'_>) -> Result<usize, Overflow>;
+}
+
+impl QuerySigner for Signer {
+    #[inline]
+    fn sign_query(&self, q: QueryWriter<'_>) -> Result<usize, Overflow> {
+        q.sign_with(self)
+    }
+}
+
+impl QuerySigner for HmacSigner {
+    #[inline]
+    fn sign_query(&self, q: QueryWriter<'_>) -> Result<usize, Overflow> {
+        let n = q.rendered()?;
+        sign_hmac_in_place(self, q.buf, n)
     }
 }
 
@@ -685,8 +821,8 @@ pub(crate) fn ends_whole(body: &[u8], end: Option<usize>) -> bool {
 
 /// `body` is one JSON value, whole: nothing but whitespace after it (the
 /// Demo tools' one-symbol reads, which must find the object before they
-/// walk it).
-fn whole(body: &[u8]) -> bool {
+/// walk it; the boot's boolean judges, BX9's parser review).
+pub(crate) fn whole(body: &[u8]) -> bool {
     match core_parse::skip_json_value(body, 0) {
         Some(end) => core_parse::skip_ws(body, end) == body.len(),
         None => false,
@@ -888,7 +1024,8 @@ pub fn scan_orders(body: &[u8], out: &mut [OrderRow]) -> Result<usize, ArrErr> {
                     r.status = status_of(str_of(body, va, vz).map_err(bad)?);
                     O_STATUS
                 }
-                b"origQty" => {
+                // eapi names it `quantity` (BX9): one or the other, read once.
+                b"origQty" | b"quantity" => {
                     r.qty_1e6 = dec_1e6(body, va, vz).map_err(bad)?;
                     O_QTY
                 }
@@ -1020,7 +1157,8 @@ pub fn scan_trades(body: &[u8], out: &mut [TradeRow]) -> Result<usize, ArrErr> {
                     }
                     R_PX
                 }
-                b"qty" => {
+                // eapi names it `quantity` (BX9): one or the other, read once.
+                b"qty" | b"quantity" => {
                     r.qty_1e6 = dec_1e6(body, va, vz).map_err(bad)?;
                     if r.qty_1e6 <= 0 {
                         return Err(ArrErr::Scan(ScanErr::BadField));
@@ -1123,8 +1261,45 @@ pub fn scan_ticker_price(body: &[u8], symbol: &[u8]) -> Result<i64, ScanErr> {
     }
 }
 
+/// **An option underlying's index** (BX9: `GET /eapi/v1/index?underlying=…`,
+/// `{"time":…,"indexPrice":…}`) ×1e6 — what a held short is adopted at
+/// (its initial margin's bound). Fail closed: one object read whole, its
+/// `indexPrice` named once and positive (the answer names no underlying:
+/// the request's is the job's own).
+pub fn scan_opt_index(body: &[u8]) -> Result<i64, ScanErr> {
+    let mut w = Pairs::new(body, 0).map_err(malformed)?;
+    let mut px = None;
+    while let Some((k, a, z)) = w.next().map_err(malformed)? {
+        if k == b"indexPrice" {
+            if px.is_some() {
+                return Err(ScanErr::Malformed);
+            }
+            px = Some(dec_1e6(body, a, z).map_err(bad)?);
+        }
+    }
+    if !ends_whole(body, w.end()) {
+        return Err(ScanErr::Malformed);
+    }
+    match px {
+        Some(p) if p > 0 => Ok(p),
+        Some(_) => Err(ScanErr::BadField),
+        None => Err(ScanErr::Missing),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// BX9: an underlying's index, read fail closed. Break-and-watch:
+    /// accepting a second `indexPrice` fails the third assertion.
+    #[test]
+    fn an_option_index_is_read_once_and_positive() {
+        assert_eq!(super::scan_opt_index(br#"{"time":1656647305000,"indexPrice":"105917.75"}"#), Ok(105_917_750_000));
+        assert_eq!(super::scan_opt_index(br#"{"time":1,"indexPrice":"0"}"#), Err(super::ScanErr::BadField));
+        assert_eq!(super::scan_opt_index(br#"{"indexPrice":"1","indexPrice":"2"}"#), Err(super::ScanErr::Malformed));
+        assert_eq!(super::scan_opt_index(br#"{"time":1}"#), Err(super::ScanErr::Missing));
+        assert_eq!(super::scan_opt_index(br#"{"indexPrice":"1"} {}"#), Err(super::ScanErr::Malformed));
+    }
+
     #[test]
     fn a_ban_names_its_end() {
         let b = br#"{"code":-1003,"msg":"Way too much request weight used; IP banned until 1790000600000. Please use WebSocket Streams for live updates to avoid bans."}"#;
@@ -1188,7 +1363,24 @@ mod tests {
         let (pu, pc) = (ord_specs(crate::inst::PRODUCT_USDM, true, &key), ord_specs(PRODUCT_COINM, true, &key));
         assert_eq!((pu[R_PLACE].path, pu[R_ACCOUNT].path), ("/papi/v1/um/order", "/papi/v2/um/account"));
         assert_eq!((pc[R_PLACE].path, pc[R_ACCOUNT].path), ("/papi/v1/cm/order", "/papi/v1/cm/account"));
-        assert_eq!(sapi_specs(&key)[S_TIME].path, "/api/v3/time");
+        assert_eq!(sapi_specs(&key, &key)[S_TIME].path, "/api/v3/time");
+        // BX9: eapi's paths — the countdown, the cancel-all, the modify and
+        // the cancel never started (IoC-only; `-6005`); the margin on the
+        // route, the positions and the exercise record on the jobs.
+        let op = lane_specs(PRODUCT_OPTIONS, false, &key);
+        assert_eq!((op[T_LISTEN_KEY_NEW].path, op[T_TIME].path, op[T_OPEN_ORDERS].path), ("/eapi/v1/listenKey", "/eapi/v1/time", "/eapi/v1/openOrders"));
+        assert_eq!((op[T_USER_TRADES].path, op[T_POSITION].path, op[T_EXERCISE].path), ("/eapi/v1/userTrades", "/eapi/v1/position", "/eapi/v1/exerciseRecord"));
+        assert_eq!((op[T_COUNTDOWN].path, op[T_CANCEL_ALL].path), (EAPI_NONE, EAPI_NONE));
+        let oo = ord_specs(PRODUCT_OPTIONS, false, &key);
+        assert_eq!((oo[R_PLACE].path, oo[R_STATUS].path, oo[R_ACCOUNT].path), ("/eapi/v1/order", "/eapi/v1/order", "/eapi/v1/marginAccount"));
+        assert_eq!((oo[R_CANCEL].path, oo[R_MODIFY].path), (EAPI_NONE, EAPI_NONE));
+        assert_eq!(op[T_PRICE].path, "/eapi/v1/index", "an underlying's index (a held short's adoption)");
+        // The other products name their connectivity checks at the new slots.
+        let pl = lane_specs(crate::inst::PRODUCT_USDM, true, &key);
+        assert_eq!((um[T_POSITION].path, pl[T_EXERCISE].path), ("/fapi/v1/ping", PAPI_NONE));
+        let opt_key = [(KEY_HEADER, "opt")];
+        let sp = sapi_specs(&key, &opt_key);
+        assert_eq!((sp[S_API_RESTRICTIONS_OPT].path, sp[S_API_RESTRICTIONS_OPT].headers[0].1), ("/sapi/v1/account/apiRestrictions", "opt"));
     }
     use proptest::prelude::*;
 
@@ -1216,6 +1408,44 @@ mod tests {
         let mut w = QueryWriter::new(&mut tiny);
         w.put(b"timestamp=");
         assert_eq!(w.rendered(), Err(Overflow));
+    }
+
+    /// BX9 (the risk review, round 3): eapi's words, pinned — the place
+    /// names its id `clientOrderId` (never `newClientOrderId`), and so does
+    /// the in-doubt status query (never futures' `origClientOrderId`: eapi
+    /// would answer it with an error that is not `-2013`, and the order
+    /// would stay in doubt). Break-and-watch: futures' word in either fails.
+    #[test]
+    fn the_options_place_and_status_query_name_eapis_client_id() {
+        const PREFIX: crate::cid::CidPrefix = crate::cid::CidPrefix::new(0x6512_ab0f);
+        let st = WsStatic::new("EXPIRE_TAKER", 1_000);
+        let o = Place {
+            symbol: b"BTC-261225-85000-C",
+            side: core_types::Side::Ask as u8,
+            maker: false,
+            reduce_only: true,
+            qty_1e6: 10_000,
+            qty_dec: 2,
+            px_1e6: 1_205_000_000,
+            px_dec: 0,
+            cid: Part::Cid(&PREFIX, 3, 0x0123_4567_89ab_cdef),
+            ts_ms: 1_790_000_000_000,
+        };
+        let text = |f: &dyn Fn(&mut QueryWriter<'_>)| {
+            let mut win = [0u8; 512];
+            let mut w = QueryWriter::new(&mut win);
+            f(&mut w);
+            let n = w.rendered().unwrap();
+            String::from_utf8(win[..n].to_vec()).unwrap()
+        };
+        assert_eq!(
+            text(&|w| render_opt_place(w, &st, &o)),
+            "symbol=BTC-261225-85000-C&side=SELL&type=LIMIT&timeInForce=IOC&reduceOnly=true&quantity=0.01&price=1205&clientOrderId=mv6512ab0f30123456789abcdef00000&newOrderRespType=ACK&selfTradePreventionMode=EXPIRE_TAKER&recvWindow=1000&timestamp=1790000000000"
+        );
+        assert_eq!(
+            text(&|w| render_opt_by_cid(w, &st, b"BTC-261225-85000-C", Part::Cid(&PREFIX, 3, 0x0123_4567_89ab_cdef), 5)),
+            "symbol=BTC-261225-85000-C&clientOrderId=mv6512ab0f30123456789abcdef00000&recvWindow=1000&timestamp=5"
+        );
     }
 
     /// BX7 (C5, R22): the REST route renders the WS API's parameters as a
@@ -1489,6 +1719,20 @@ mod tests {
             }
             let mut t = [TradeRow::default(); 8];
             let _ = scan_trades(&bytes, &mut t);
+            // BX9: the options index.
+            if let Ok(px) = scan_opt_index(&bytes) {
+                prop_assert!(px > 0);
+            }
+        }
+
+        /// BX9 (the parser review, round 2): an index answer reads back its
+        /// price, ×1e6; a byte after the object refuses it.
+        #[test]
+        fn an_option_index_round_trips(px in 1i64..1_000_000_000_000_000, t in 0u64..4_000_000_000_000) {
+            let body = std::format!(r#"{{"time":{t},"indexPrice":"{}.{:06}"}}"#, px / 1_000_000, px % 1_000_000);
+            prop_assert_eq!(scan_opt_index(body.as_bytes()), Ok(px));
+            let more = std::format!("{body}x");
+            prop_assert!(scan_opt_index(more.as_bytes()).is_err());
         }
 
         /// BX8 (the parser review's P2-6e): a spot `myTrades` row read back

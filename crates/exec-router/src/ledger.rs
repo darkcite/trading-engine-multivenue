@@ -148,6 +148,11 @@ pub const LAW_OPTION: u8 = 4;
 pub const INST_WRITABLE: u8 = 1 << 0;
 /// Instrument flag: a call (a put otherwise). Options only.
 pub const INST_CALL: u8 = 1 << 1;
+/// **BX9 (Q-2)** — the ledger's own bit, never a spec's: the option row's
+/// last sane mark is older than [`MARK_STALE_NS`] (or none arrived yet) —
+/// it OPENS nothing ([`InstRefusal::Unpriced`]; an exit passes), and its
+/// exposure keeps the last values until a fresh mark clears it.
+const INST_STALE: u8 = 1 << 7;
 
 /// **One row's exposure for one slot is clamped here**, USD ×1e6 (about
 /// $18 bn). Every sum over [`LEDGER_INSTRUMENTS`] rows then fits an
@@ -394,6 +399,19 @@ fn short_im_per_contract(index: i64, strike: i64, mark: i64, unit: i64, call: bo
     } else {
         v as i64
     }
+}
+
+/// **BX9 (Q-2) — an option mark's sanity**: positive, with an index, and
+/// within the no-arbitrage band per contract
+/// ([`core_types::option_mark_band`]). Warm: once per summary on the
+/// engine thread — 0 B (gates 92 and 111).
+#[must_use]
+pub fn option_mark_sane(mark: i64, index: i64, strike: i64, unit: i64, call: bool) -> bool {
+    if mark <= 0 || index <= 0 || unit <= 0 {
+        return false;
+    }
+    let (lo, hi) = core_types::option_mark_band(index, strike, unit, call);
+    i128::from(mark) >= lo && i128::from(mark) <= hi
 }
 
 /// Why an instrument law refused an order ([`InstProbe::refusal`]).
@@ -1378,6 +1396,7 @@ impl Ledger {
             || spec.law > LAW_OPTION
             || ((spec.law == LAW_INVERSE || option) && spec.unit_1e6 <= 0)
             || (option && spec.strike_1e6 <= 0)
+            || (option && spec.flags & !(INST_WRITABLE | INST_CALL) != 0)
             || (!option && (spec.flags != 0 || spec.strike_1e6 != 0))
             // XMM XH5a: an owner is a slot, or none — a byte past the slots
             // would refuse every slot on the row, silently.
@@ -1406,7 +1425,8 @@ impl Ledger {
         self.inst[at] = InstrumentRow {
             sym: spec.sym,
             law: spec.law,
-            flags: spec.flags,
+            // BX9 (Q-2): an option opens nothing until its first sane mark.
+            flags: spec.flags | if option { INST_STALE } else { 0 },
             unit_1e6: spec.unit_1e6,
             strike_1e6: spec.strike_1e6,
             owner: spec.owner,
@@ -1655,11 +1675,16 @@ impl Ledger {
                     p.refusal = InstRefusal::Unpriced;
                     return Some(p);
                 }
-                // The long side's one price: the mark, or — before the
-                // first summary — the order's own price (O-BX24: a sell's
-                // is the higher of its limit and the last fill), never
-                // zero (a zero would read a first long as no exposure).
-                let m = if r.mark_1e6 > 0 { r.mark_1e6 } else { px_at };
+                // BX9 (Q-2): no sane mark within MARK_STALE_NS opens
+                // nothing (the exit above passed).
+                if r.flags & INST_STALE != 0 {
+                    p.refusal = InstRefusal::Unpriced;
+                    return Some(p);
+                }
+                // The long side's one price: the mark — a fresh row holds a
+                // sane one (`on_opt_summary` clears the bit only with it).
+                let m = r.mark_1e6;
+                debug_assert!(m > 0, "a fresh option row without a mark");
                 let opens_short = !buy && next < 0;
                 if opens_short {
                     if r.flags & INST_WRITABLE == 0 {
@@ -1800,14 +1825,22 @@ impl Ledger {
 
     /// **BX6 (obligation 6): the staleness law** — a mark older than
     /// [`MARK_STALE_NS`] at `now_ns` stops pricing its row (the last fill
-    /// prices it, O-BX22) until a fresh one arrives. The router calls this
-    /// once a second.
+    /// prices it, O-BX22) until a fresh one arrives. An option's (BX9,
+    /// Q-2) keeps pricing — its exposure keeps the last values — but the
+    /// row opens nothing until a fresh one ([`INST_STALE`]). The router
+    /// calls this once a second.
     pub fn expire_marks(&mut self, now_ns: u64) {
         let n = self.inst_n as usize;
         let mut i = 0;
         while i < n {
             let r = &self.inst[i];
-            if r.law != LAW_OPTION && r.mark_1e6 > 0 && now_ns.saturating_sub(r.mark_ns) > MARK_STALE_NS {
+            let old = now_ns.saturating_sub(r.mark_ns) > MARK_STALE_NS;
+            if r.law == LAW_OPTION {
+                if r.flags & INST_STALE == 0 && old {
+                    self.inst[i].flags |= INST_STALE;
+                    self.counters.marks_expired = self.counters.marks_expired.saturating_add(1);
+                }
+            } else if r.mark_1e6 > 0 && old {
                 self.inst[i].mark_1e6 = 0;
                 self.counters.marks_expired = self.counters.marks_expired.saturating_add(1);
                 self.refresh_instrument(i);
@@ -1816,9 +1849,15 @@ impl Ledger {
         }
     }
 
-    /// **The price feed — an options summary**: an option row's mark (when
-    /// the summary carries one) and its underlying's index, both ×1e9 on
-    /// the lane, ×1e6 here.
+    /// **The price feed — an options summary**: an option row's underlying
+    /// index and mark (when the summary carries one), both ×1e9 on the
+    /// lane, ×1e6 here. **BX9 (Q-2): the sanity law** — a mark is taken only
+    /// within its no-arbitrage band per contract, `[intrinsic − 1 %·I, I]`
+    /// for a call and `[intrinsic − 1 %·I, K]` for a put, per unit × the
+    /// unit ([`option_mark_sane`]; the summary's index, else the row's);
+    /// one outside it — or with no index, or not positive — is refused and
+    /// counted (`marks_refused`), the row keeping its last price. A sane
+    /// mark stamps the row fresh (`ts_ns`, [`Self::expire_marks`]).
     pub fn on_opt_summary(&mut self, summary: &core_types::OptSummary) {
         let Some(i) = self.inst_find(summary.sym) else {
             return;
@@ -1828,13 +1867,20 @@ impl Ledger {
         }
         let r = &mut self.inst[i];
         let mut moved = false;
-        if summary.flags & core_types::OPT_SUMMARY_FLAG_MARK_PX != 0 && summary.mark_px_1e9 > 0 {
-            r.mark_1e6 = summary.mark_px_1e9 / 1_000;
-            moved = true;
-        }
         if summary.underlying_px_1e9 > 0 {
             r.index_1e6 = summary.underlying_px_1e9 / 1_000;
             moved = true;
+        }
+        if summary.flags & core_types::OPT_SUMMARY_FLAG_MARK_PX != 0 {
+            let mark = summary.mark_px_1e9 / 1_000;
+            if option_mark_sane(mark, r.index_1e6, r.strike_1e6, r.unit_1e6, r.flags & INST_CALL != 0) {
+                r.mark_1e6 = mark;
+                r.mark_ns = summary.ts_ns;
+                r.flags &= !INST_STALE;
+                moved = true;
+            } else {
+                self.counters.marks_refused = self.counters.marks_refused.saturating_add(1);
+            }
         }
         if moved {
             self.refresh_instrument(i);
@@ -3754,16 +3800,61 @@ mod tests {
         assert_eq!(p.measure_1e6, 200 * E6);
     }
 
-    /// Before the first summary a long is priced at its own order, never
-    /// at zero — zero would read a first long as no exposure at all.
+    /// BX9 (Q-2): an option row opens nothing before its first sane mark
+    /// or once its last is older than MARK_STALE_NS — an exit still passes
+    /// and the exposure keeps its last values; a fresh mark opens again.
+    /// Break-and-watch: dropping the staleness bit's check in the probe
+    /// fails the first assertion.
     #[test]
-    fn a_first_long_option_with_no_mark_is_priced_at_the_order() {
-        let l = inst();
-        let p = l
-            .probe_instrument(CALL, SLOT, 2 * E6, true, 700 * E6, None)
-            .unwrap();
-        assert_eq!(p.projected_1e6, 1_400 * E6);
-        assert_eq!(p.measure_1e6, 1_400 * E6);
+    fn a_stale_option_opens_nothing_and_an_exit_still_passes() {
+        let mut l = inst();
+        let p = l.probe_instrument(CALL, SLOT, 2 * E6, true, 700 * E6, None).unwrap();
+        assert_eq!(p.refusal, InstRefusal::Unpriced, "no mark yet");
+        l.on_opt_summary(&summary(CALL, 700 * E6, 100_000 * E6));
+        let p = l.probe_instrument(CALL, SLOT, 2 * E6, true, 700 * E6, None).unwrap();
+        assert_eq!((p.refusal, p.projected_1e6), (InstRefusal::None, 1_400 * E6));
+        l.book_fill(&fill(T0, CALL, true, 700 * E6, 2 * E6, 1));
+        let exp = l.instrument_exposure_1e6(SLOT);
+        l.expire_marks(T0 + MARK_STALE_NS);
+        assert_eq!(l.probe_instrument(CALL, SLOT, E6, true, 700 * E6, None).unwrap().refusal, InstRefusal::None, "not stale yet");
+        l.expire_marks(T0 + MARK_STALE_NS + 1);
+        assert_eq!(l.counters().marks_expired, 1);
+        assert_eq!(l.probe_instrument(CALL, SLOT, E6, true, 700 * E6, None).unwrap().refusal, InstRefusal::Unpriced, "stale: no opening");
+        assert!(l.probe_instrument(CALL, SLOT, E6, false, 700 * E6, None).unwrap().exit, "an exit passes");
+        assert_eq!(l.instrument_exposure_1e6(SLOT), exp, "the exposure keeps its last values");
+        l.expire_marks(T0 + 2 * MARK_STALE_NS);
+        assert_eq!(l.counters().marks_expired, 1, "counted once per staleness");
+        let mut fresh = summary(CALL, 710 * E6, 100_000 * E6);
+        fresh.ts_ns = T0 + 2 * MARK_STALE_NS;
+        l.on_opt_summary(&fresh);
+        assert_eq!(l.probe_instrument(CALL, SLOT, E6, true, 710 * E6, None).unwrap().refusal, InstRefusal::None, "fresh again");
+    }
+
+    /// BX9 (Q-2): an option mark outside its no-arbitrage band per contract
+    /// — `[intrinsic − 1 %·I, I]` (call), `[intrinsic − 1 %·I, K]` (put), per
+    /// unit × the unit — is refused and counted; the row keeps its last.
+    /// Break-and-watch: taking every positive mark fails the second
+    /// assertion.
+    #[test]
+    fn an_option_mark_outside_its_band_is_refused() {
+        let mut l = inst();
+        let i = l.inst_find(CALL).unwrap();
+        // Call K 100 000, I 110 000: intrinsic 10 000, band [8 900, 110 000].
+        l.on_opt_summary(&summary(CALL, 9_000 * E6, 110_000 * E6));
+        assert_eq!((l.inst[i].mark_1e6, l.counters().marks_refused), (9_000 * E6, 0));
+        l.on_opt_summary(&summary(CALL, 8_899 * E6, 110_000 * E6));
+        assert_eq!((l.inst[i].mark_1e6, l.counters().marks_refused), (9_000 * E6, 1), "below intrinsic − 1 %");
+        l.on_opt_summary(&summary(CALL, 110_001 * E6, 110_000 * E6));
+        assert_eq!(l.counters().marks_refused, 2, "above the index");
+        // DOGE put, K 0.084, unit 1 000, I 0.08: intrinsic 4, band [3.2, 84].
+        let j = l.inst_find(PUT).unwrap();
+        l.on_opt_summary(&summary(PUT, 84 * E6, 80_000));
+        assert_eq!(l.inst[j].mark_1e6, 84 * E6, "the strike's bound, per contract");
+        l.on_opt_summary(&summary(PUT, 84 * E6 + 1, 80_000));
+        assert_eq!(l.counters().marks_refused, 3, "above the strike × unit");
+        assert!(super::option_mark_sane(3_200_000, 80_000, 84_000, 1_000 * E6, false));
+        assert!(!super::option_mark_sane(3_199_999, 80_000, 84_000, 1_000 * E6, false));
+        assert!(!super::option_mark_sane(E6, 0, 84_000, 1_000 * E6, false), "no index");
     }
 
     #[test]

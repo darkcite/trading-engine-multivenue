@@ -24,7 +24,9 @@
 //! product it trades — `accountMaintMargin / accountEquity` from its
 //! account read, or a `riskLevelChange`'s own figures: the reciprocal of
 //! the venue's `uniMMR` (a 0.8 ratio is a `uniMMR` of 1.25). Options'
-//! (maintenance over adjusted equity) arrives with BX9.
+//! (BX9): the options account's USDT `maintMargin / adjustedEquity`
+//! (Clearing Procedure 28's ratio; [`um_ratio_1e6`]'s law — an account
+//! with no adjusted equity reads unbounded, fail closed).
 
 use crate::inst::PRODUCTS;
 

@@ -2,16 +2,16 @@
 
 Anton runs this. It covers the Binance arm's keys, the Demo tools, the
 account tools, the fee measurement, the halts, deploying after a merge,
-the arming preconditions and spot's own rules. The laws are in
+the arming preconditions, and spot's and options' own rules. The laws are in
 `docs/risk-policy.md`, "BX — the Binance execution laws (BX-1 …
 BX-20)"; the design is `docs/binance-exec-plan.md`.
 
-**Status (BX8, 2026-10-10).** The arm boots USDⓈ-M and COIN-M futures
+**Status (BX9, 2026-10-11).** The arm boots USDⓈ-M and COIN-M futures
 under the classic, Portfolio Margin (`pm`) and PM Pro (`pm_pro`) account
-modes, and spot — bStocks included — under classic alone: makers on
-USDⓈ-M classic only, IoC everywhere else. Options and Binance Stocks
-refuse the boot (BX9–BX10). **No member arms (O-BX6)** before BX13. Spot's
-own rules are §10.
+modes, and spot — bStocks included — and options under classic alone:
+makers on USDⓈ-M classic only, IoC everywhere else. Options arm alone or
+beside USDⓈ-M only. Binance Stocks refuse the boot (BX10). **No member
+arms (O-BX6)** before BX13. Spot's own rules are §10, options' §11.
 
 Every command below runs from the checkout whose release binary you
 vetted (`cargo build --release -p cli`), through `scripts/exec-smoke.sh`:
@@ -24,14 +24,20 @@ missing or too-old binary.
 | variables | read by | what |
 |---|---|---|
 | `BINANCE_API_KEY`, `BINANCE_ED25519_SEED` | the engine (a live Binance slot); the account tools on `--bn-network mainnet` | the live key: an Ed25519 key (the app's API management, "self-generated": you upload the public key), its 32-byte seed as 64 hex digits |
-| `BINANCE_HMAC_API_KEY`, `BINANCE_HMAC_SECRET_KEY` | the engine under `signing = "hmac"` (REST only); the account tools under `--bn-ops-hmac` | the live HMAC pair |
-| `BINANCE_DEMO_API_KEY`, `BINANCE_DEMO_ED25519_SEED`, `BINANCE_DEMO_HMAC_*` | the Demo tools only (probe, battery, drill, account tools on Demo) | Demo's keys (demo.binance.com) |
+| `BINANCE_HMAC_API_KEY`, `BINANCE_HMAC_SECRET_KEY` | the engine under `signing = "hmac"` (REST only), and its options lane whenever options are armed (BX9: eapi refuses the Ed25519 key); the account tools under `--bn-ops-hmac` | the live HMAC pair |
+| `BINANCE_DEMO_API_KEY`, `BINANCE_DEMO_ED25519_SEED`, `BINANCE_DEMO_HMAC_*` | the Demo tools only (probe, battery, drill, account tools on Demo; the options probe and battery sign eapi with the HMAC pair) | Demo's keys (demo.binance.com) |
 
 - The live key **trades what is armed and cannot withdraw** — futures
   trading when a futures product is armed, spot trading
   (`enableSpotAndMarginTrading`) when spot is: the boot asserts each and
   refuses otherwise. Spot needs the Ed25519 key (its fills arrive only on
   the WS API). Restrict the key to the engine host's IP.
+- **Options (BX9)** sign with the HMAC pair, whatever `signing` says: an
+  options arm without it refuses the boot. The pair's key must trade
+  options (`enableVanillaOptions`) and never withdraw — the boot asserts
+  both — and **must be the same account's as the arm's key**: nothing
+  the venue answers proves it (eapi names no UID; risk-policy BX-19).
+  The E7 anchor records the options key's tag (§6).
 - `.env` is mode 600. A file in the repo names the variables, never a
   value; no session reads `.env`.
 - Disabling the key in the app stops everything the arm sends, whatever
@@ -81,6 +87,25 @@ Demo orders are real orders on Demo's books; nothing reaches mainnet
   nothing sent). A bStock (`--bn-spot-symbol TSLABUSDT`) puts the
   permission check to the Demo account: **66** if the account lacks the
   row's group — the check's verdict, nothing placed.
+- **The options probe:** `scripts/exec-smoke.sh --binance-probe options`
+  — the options K-probes on Demo (OP0–OP9): which host serves eapi, the
+  HMAC key's answers, an IoC long and a short (a `-6057` on the short is
+  the account's Long & Short mode answering, not a failure), the reads
+  the lane makes; the end reads the account again. 0, 59 (a probe could
+  not run) or 58 (something of the probe's left).
+- **The options battery:** `scripts/exec-smoke.sh --binance options
+  --lifecycle` — options alone on the account (beside any other product
+  refused: 1, nothing sent), REST-only on eapi with the HMAC pair. The
+  row is BTC's first call above the index × 1.05 a day out; before each
+  IoC the touch, the mark and the index are read and handed to the
+  router as an options summary. `--bn-cycles` cycles alternate LONG and
+  SHORT: with a two-sided book an IoC through the touch within
+  `--bn-usd` and a reduce-only IoC closing what it filled, each fill's
+  leg proven by an agreeing reconciliation; with no two-sided book
+  (Demo's options books are usually empty) an IoC at the band's far edge
+  the venue must end unfilled. The bar: two LONG and two SHORT IoCs
+  answered and two agreeing reconciliations — fills reported, not
+  required. The end reads the options positions flat (58 if not).
 - **The gap drill:** `scripts/exec-smoke.sh --binance um --lifecycle
   --bn-drill gap` — two makers rest behind the touch under the dead-man;
   the gateway stops without its sweep; the venue's countdown must cancel
@@ -249,7 +274,8 @@ slot already halted (your switch).
 - **`UNRECONCILED: n unbound position(s)`:** the account holds a position
   on a symbol this boot did not bind; the slot refuses every order until
   it is flat: `--binance-flatten … --bn-symbol <it>` (engine stopped); a
-  spot balance is sold in the app.
+  spot balance is sold, an option closed, in the app (an option bought
+  after the boot's held read: a restart binds it, §11).
 - **Adoption past the cap:** positions on owned rows larger than the
   slot's `cap_instance_usd_1e6` refuse the boot: reduce them. On spot the
   held base balances count, valued at the ticker (§10).
@@ -259,8 +285,11 @@ slot already halted (your switch).
   a symbol this boot did not bind, and the gateway cancels only on bound
   rows (risk-policy BX-9). Cancel it in the app, then boot again.
 - **The E7 anchor refuses:** `binance-pnl-anchor.state` beside `exec.toml`
-  is another key's or another account mode's session. Deleting it ends
-  that session (the session bound starts again from the next boot).
+  is another key's or another account mode's session — or another equity
+  basis's (BX9: options armed into a USDⓈ-M session, dropped from one, or
+  under another options key). Deleting it ends that session (the session
+  bound starts again from the next boot).
+- **Options' own refusals** (BX9): §11.
 - **The self-test or the vectors fail:** the binary is not fit to sign;
   do not run it.
 
@@ -274,7 +303,9 @@ Deploying is yours, after you land `binance` on `main`:
 3. On that binary, the Binance Demo evidence: `--binance-probe`, the
    battery (`--binance um,cm --lifecycle`) and the gap drill — and, when
    spot is to be armed, `--binance-probe spot` and the spot battery
-   (`--binance spot --lifecycle`) — exit 0 each.
+   (`--binance spot --lifecycle`); when options are, `--binance-probe
+   options` and the options battery (`--binance options --lifecycle`) —
+   exit 0 each.
 4. Restart the engine the usual way (`docs/local-setup.md`, "Always-on
    standing engine"). The Binance arm stays dark unless `exec.toml` arms
    a Binance slot (`--arm-live`).
@@ -310,6 +341,17 @@ None of these is met by the code alone; each is yours.
   no spot mark reaches the router's ledger, so the slot's
   `cap_instance_usd_1e6` prices its other spot holdings at their last
   fill and an adopted one at the boot's ticker.
+- **Options** (BX9), when armed: the options Demo exit seen on the binary
+  (`--binance-probe options`, `--binance options --lifecycle`;
+  risk-policy "BX9"); gates 110 and 111 on the tree; the HMAC pair this
+  account's (§1). And what Demo has not yet shown (risk-policy "BX9",
+  Q-3): **an options fill, long and short, booked and reconciled** (the
+  BX9 runs filled nothing: Demo's books were empty); **an expiry**
+  settled through the exercise record across 08:00Z — the record's real
+  shape (which field is the settlement price; a short's `amount` signed
+  negative, else every short's record is refused and the slot halts
+  `recon-drift`); a mark of 0 on a live row; eapi's `-2013` for an
+  unknown order; the options equity on mainnet.
 - **`exec.toml`:** the slot names `binance`, `mode = "live"`, every halt
   key non-zero (`halt_on_margin_ratio_1e6` ≤ 799 999), `max_symbols`,
   `min_maker_ttl_ms` ≥ 5 000; the `[exec.binance]` block
@@ -416,3 +458,76 @@ The boot's spot refusals (the log names each):
 | `SpotStray(row)` | an order of ours rests on spot | cancel it in the app |
 | `Inventory(…)` | a held balance past the adoption cap, or one with no price | sell it, or raise the cap |
 | "the market-data hosts … are not on the order network" | with spot armed, `BINANCE_WS_HOST` or `BINANCE_REST_HOST` names a host outside `*.binance.com` (e.g. `data-api.binance.vision`) or carries a port: either reads as no network (a mirror inside `*.binance.com` is mainnet) | name `*.binance.com` hosts, without a port |
+
+## 11. Options (BX9)
+
+Options trade IoC-only on a classic account, REST-only on eapi with the
+HMAC pair (§1), alone or beside USDⓈ-M (beside COIN-M, spot, PM or PM Pro
+the boot refuses). The venue's countdown is a market maker's, so no
+maker rests and nothing is cancelled: **no options cancel exists** — an
+options order of ours resting at boot refuses it (`OptStray`): cancel it
+in the app, then boot again.
+
+- **What the arm binds:** the paper-selected chain (universe.toml's
+  `[binance] options_underlyings` and its selection, at most 64 rows)
+  and every option the account holds outside it — read once as the
+  engine boots (at most 16 more), bound, priced and adopted under their
+  own ids. A held option no listed row names, or more than 16, refuses
+  the boot by name or by count: close it in the app, or configure its
+  underlying. **Do not buy an option by hand while the engine boots or
+  runs:** one bought after that read is unbound. Bought during the boot,
+  the boot completes unreconciled (`UNRECONCILED` in its log line) and
+  the slot refuses every order until the option is closed in the app or
+  a restart binds it; bought while the engine runs, the cycles stop
+  agreeing and the slot halts `recon-stale` after
+  `halt_on_recon_stale_ms` (orders pass until then).
+- **Writing:** `options_write = 1` lets the arm open shorts where the
+  venue's `nakedSell` allows (BTC, ETH); elsewhere, or with 0, a SELL
+  with no long is refused (`NotWritable`) and any other SELL goes
+  reduce-only. The account must be in Long & Short Sell mode for writing:
+  the venue answers `-6057` otherwise, and that underlying stops writing
+  for the boot (its longs still trade).
+- **Adoption:** a held long at the venue's mark (a mark of 0 is worth
+  nothing); a held short at its initial margin's upper bound per contract
+  (the mark + 15 % of the index × the unit), within the slot's
+  `cap_instance_usd_1e6`. A held short on a row the arm may not write
+  refuses the boot (`OptionShort`); an index the venue's own mark
+  disagrees with prices nothing (`Inventory`).
+- **Expiry (08:00Z):** a booked leg past its expiry is settling — not
+  judged — while the arm reads the exercise records each cycle. A record
+  that agrees with the leg (its whole position, the cash's sign the
+  side's, the cash per contract the intrinsic value within the fee) books
+  one settlement fill at the intrinsic value; one that disagrees books
+  nothing and halts the slot `recon-drift`; no record within 2 h is drift
+  too. **Do not exercise or close an expiring leg by hand.** A boot
+  between an expiry and its settlement, with the expired option held, is
+  refused by name if the venue no longer lists it: boot again once it
+  has settled.
+- **Stale marks:** an option whose summary is older than 30 s takes no
+  opening order (`Unpriced`; an exit passes); a mark outside its
+  no-arbitrage band is refused and the row keeps its last price.
+- **eapi's weight** is its own (the arm's 240 of the IP's 400 a minute):
+  keep `recon_every_ms` at the default 60 000 or more — 20 000 refuses
+  the boot (its cycle leaves the day's read nothing). The boot's timeout
+  grows with the rows: up to about 5 minutes with 64.
+- **In session**, the options account reading `reduceOnly` or not
+  `canTrade`, or the options stream's `RISK_LEVEL_CHANGE` to
+  `REDUCE_ONLY`, is `venue-lock` (9 016, raised once).
+- **The session bound** (E7) reads the options account's `equity`, summed
+  with USDⓈ-M's margin balance when both are armed; no equity is judged
+  until every part is read.
+
+The boot's options refusals (the log names each):
+
+| refusal | means | what to do |
+|---|---|---|
+| "options are armed but their HMAC key cannot be read" | no `BINANCE_HMAC_*` pair in `.env` | add the pair (this account's) |
+| "BX9 proves options alone and beside USDⓈ-M only" / "a ruling (options beside Portfolio Margin or PM Pro)" | options armed with `coinm`, `spot`, `pm` or `pm_pro` | arm options alone, or with `usdm`, under classic |
+| "… leaves the boot's day read nothing …" | `recon_every_ms` too fast for eapi's weight | raise `recon_every_ms` |
+| "the account holds option `…`, which no listed row of the configured underlyings names" | a held option outside the configured underlyings (or expired, unlisted, unsettled) | close it in the app, configure its underlying, or wait for its settlement |
+| "the account holds more than 16 options outside the selected chain" | too many held outside the chain | close some, or widen the selection |
+| `Assert(NoTradePermission)` / `Assert(CanWithdraw)` | the options key does not trade options, or can withdraw | the key's settings, in the app |
+| `Assert(ReduceOnly)` / `Assert(CannotTrade)` | the options account is reduce-only or cannot trade | the account, in the app |
+| `OptStray(row)` | an options order of ours rests | cancel it in the app |
+| `OptionShort(row)` | a held short on a row the arm may not write | close it, or set `options_write = 1` where the venue allows |
+| `Inventory(…)` | held options past the adoption cap, or one with no price | close them, or raise the cap |

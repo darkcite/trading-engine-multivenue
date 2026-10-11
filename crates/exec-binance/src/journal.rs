@@ -25,7 +25,7 @@ use core_io::slot_capture::SlotCapture;
 use core_ring::{Consumer, Producer};
 use core_types::ExecRecord;
 
-use crate::inst::{BnInstWire, INST_DATED, INST_INVERSE, INST_TRADFI};
+use crate::inst::{BnInstWire, INST_DATED, INST_INVERSE, INST_TRADFI, PRODUCT_OPTIONS};
 use crate::mode::AccountMode;
 
 /// The ring between the gateway and the writer.
@@ -136,7 +136,8 @@ pub const fn fee_fields(code: i32) -> (bool, u8, u8, u8, bool, bool) {
 /// asset — USDⓈ-M's quote, USDT or USDC, whole (the symbol, before any `_`
 /// expiry, ends with it: `BTCUSDT`, `BTCUSDC`, `BTCUSDT_261225`; a part of
 /// it, `T` or `SDT`, is another asset), COIN-M's margin coin (the symbol
-/// is the coin then `USD`: `BTCUSD_PERP`) — or BNB, another, none.
+/// is the coin then `USD`: `BTCUSD_PERP`), an option's USDT (BX9) — or
+/// BNB, another, none.
 #[must_use]
 pub fn fee_asset(w: &BnInstWire, asset: &[u8]) -> u8 {
     if asset.is_empty() {
@@ -150,6 +151,10 @@ pub fn fee_asset(w: &BnInstWire, asset: &[u8]) -> u8 {
     let head = &sym[..n];
     let settles = if w.flags & INST_INVERSE != 0 {
         head.len() == asset.len() + 3 && head.starts_with(asset) && head.ends_with(b"USD")
+    } else if w.product == PRODUCT_OPTIONS {
+        // BX9: options settle in USDT alone (`optionAssets`); the symbol
+        // (`BTC-261030-60000-C`) names no quote.
+        asset == b"USDT"
     } else {
         (asset == b"USDT" || asset == b"USDC") && head.len() > asset.len() && head.ends_with(asset)
     };
@@ -282,9 +287,33 @@ pub fn spawn_writer<const N: usize>(
 /// How often the writer retries an anchor it could not store (F2).
 pub const ANCHOR_RETRY_NS: u64 = 1_000_000_000;
 
-/// The longest anchor file read (BX7): `store` writes ≤ 64 B; a longer
+/// The longest anchor file read (BX7): `store` writes ≤ 96 B; a longer
 /// file is no anchor line, refused unread past this.
 const ANCHOR_READ_MAX: u64 = 128;
+
+/// The longest equity basis (BX9): `um+opt-` and an options key's tag.
+const BASIS_MAX: usize = 24;
+
+/// A key's tag: the first 8 bytes of SHA-256 of the API key, in hex —
+/// never the key.
+fn key_tag(api_key: &str) -> [u8; 16] {
+    let h = core_crypto::sha256(api_key.as_bytes());
+    let hex = b"0123456789abcdef";
+    let mut tag = [0u8; 16];
+    let mut i = 0;
+    while i < 8 {
+        tag[2 * i] = hex[(h[i] >> 4) as usize];
+        tag[2 * i + 1] = hex[(h[i] & 0x0f) as usize];
+        i += 1;
+    }
+    tag
+}
+
+/// A basis without its options key's tag (`um+opt-<tag>` → `um+opt`): the
+/// words a refusal prints — the tag never.
+fn basis_parts(basis: &str) -> &str {
+    basis.split('-').next().unwrap_or("")
+}
 
 /// **The E7 session anchor, persisted** (`binance-pnl-anchor.state`).
 ///
@@ -292,8 +321,9 @@ const ANCHOR_READ_MAX: u64 = 128;
 /// reconciliation of the SESSION, and a session outlives a process (the
 /// restart lane relaunches the engine): the anchor is written once and read
 /// at every boot; the operator ends a session by deleting the file. One
-/// line: `<account tag>\t<equity ×1e6>\t<unix s>\t<account mode>`. The tag
-/// is the first 8 bytes of SHA-256 of the API key, in hex — never the key.
+/// line: `<account tag>\t<equity ×1e6>\t<unix s>\t<account mode>\t<basis>`.
+/// The tag is the first 8 bytes of SHA-256 of the API key, in hex — never
+/// the key.
 ///
 /// The file is ONE session's (BX7, the risk review's N2): the equity's
 /// basis is the account mode's — USDⓈ-M's margin balance on a classic
@@ -302,13 +332,27 @@ const ANCHOR_READ_MAX: u64 = 128;
 /// session: never inherited, never silently replaced (which would forget
 /// its losses). `signing = "hmac"` signs with another key: toggling it ends
 /// the session the same way. A line written before BX7 names no mode — a
-/// classic session's. Boot and one cold write only.
+/// classic session's.
+///
+/// **The basis (BX9, Q-4; the risk review's R1):** a classic session's
+/// equity is a SUM of the parts armed — USDⓈ-M's margin balance (`um`),
+/// the options account's equity (`opt-<the options key's tag>`), or both
+/// (`um+opt-<tag>`); PM and PM Pro read one unified equity (`unified`).
+/// Arming options into a USDⓈ-M session (or dropping them, or another
+/// options key) changes the sum without a trade: the boot refuses — "delete
+/// it to end that session" — as for another mode. A line written before
+/// BX9 names no basis: its mode's alone (`um` classic, `unified` PM).
+/// Boot and one cold write only.
 #[derive(Clone, Debug)]
 pub struct AnchorFile {
     path: std::path::PathBuf,
     tag: [u8; 16],
     /// The account mode the session's equity is read in.
     mode: AccountMode,
+    /// The equity's basis (see the type's docs): `basis[..basis_len]`.
+    basis: [u8; BASIS_MAX],
+    /// See [`Self::basis`].
+    basis_len: u8,
     /// The anchor could not be stored (yet): raised by the writer while
     /// its store fails, read by the gateway's pulse (F2).
     unsaved: Arc<AtomicBool>,
@@ -316,24 +360,59 @@ pub struct AnchorFile {
 
 impl AnchorFile {
     /// The file at `path`, for the account whose API key is `api_key`, in
-    /// account mode `mode`.
+    /// account mode `mode` — its basis the mode's alone (`um` classic,
+    /// `unified` PM / PM Pro) until [`Self::with_options`].
     #[must_use]
     pub fn new(path: std::path::PathBuf, api_key: &str, mode: AccountMode) -> Self {
-        let h = core_crypto::sha256(api_key.as_bytes());
-        let hex = b"0123456789abcdef";
-        let mut tag = [0u8; 16];
-        let mut i = 0;
-        while i < 8 {
-            tag[2 * i] = hex[(h[i] >> 4) as usize];
-            tag[2 * i + 1] = hex[(h[i] & 0x0f) as usize];
-            i += 1;
-        }
-        Self {
+        let mut f = Self {
             path,
-            tag,
+            tag: key_tag(api_key),
             mode,
+            basis: [0; BASIS_MAX],
+            basis_len: 0,
             unsaved: Arc::new(AtomicBool::new(false)),
+        };
+        f.set_basis(Self::mode_basis(mode).as_bytes());
+        f
+    }
+
+    /// **BX9 (Q-4)**: the session's equity sums the options account's,
+    /// read with the key `opt_api_key` — with USDⓈ-M's when `usdm`.
+    #[must_use]
+    pub fn with_options(mut self, usdm: bool, opt_api_key: &str) -> Self {
+        let tag = key_tag(opt_api_key);
+        let head: &[u8] = if usdm { b"um+opt-" } else { b"opt-" };
+        let n = head.len() + tag.len();
+        debug_assert!(n <= BASIS_MAX);
+        // COPY: the basis' head (≤ 7 B) and the key's tag (16 B) straight
+        // into the anchor's own field — boot only, once; rejected: two
+        // fields (the file's line and the comparison take the basis as one
+        // word).
+        self.basis[..head.len()].copy_from_slice(head);
+        self.basis[head.len()..n].copy_from_slice(&tag);
+        self.basis_len = n as u8;
+        self
+    }
+
+    /// The basis a line naming none was written in: its mode's alone.
+    const fn mode_basis(mode: AccountMode) -> &'static str {
+        match mode {
+            AccountMode::Classic => "um",
+            AccountMode::Pm | AccountMode::PmPro => "unified",
         }
+    }
+
+    fn set_basis(&mut self, b: &[u8]) {
+        debug_assert!(b.len() <= BASIS_MAX);
+        // COPY: the basis (≤ `BASIS_MAX` 24 B) into the anchor's own field —
+        // boot only, once; rejected: a borrowed `&'static str` (the tag is
+        // the key's, computed at boot).
+        self.basis[..b.len()].copy_from_slice(b);
+        self.basis_len = b.len() as u8;
+    }
+
+    fn basis(&self) -> &str {
+        core::str::from_utf8(&self.basis[..usize::from(self.basis_len)]).unwrap_or("")
     }
 
     /// The "could not be stored" flag, shared with the gateway (F2).
@@ -344,13 +423,13 @@ impl AnchorFile {
 
     /// The session's anchor (boot): `None` when no session is open (no
     /// file). `Err` — the boot refuses, naming the remedy and never the key
-    /// — when the file is another key's session or another account mode's,
-    /// or cannot be read as one.
+    /// — when the file is another key's session, another account mode's or
+    /// another basis's, or cannot be read as one.
     ///
     /// # Errors
     /// The file is not this session's, or not an anchor.
     pub fn load(&self) -> Result<Option<i64>, String> {
-        // COPY: the anchor file (one line: ≤ 64 B as `store` writes it; a
+        // COPY: the anchor file (one line: ≤ 96 B as `store` writes it; a
         // file past `ANCHOR_READ_MAX` is refused unread past it) into a
         // String — boot only, once; the file is closed before anything
         // trades — a stack buffer read was rejected: the boot may allocate,
@@ -367,7 +446,7 @@ impl AnchorFile {
             Err(e) => return Err(format!("cannot be read ({e}) — fix it, or delete it to end the session")),
         }
         let mut it = text.trim_end().split('\t');
-        let (tag, v, unix, mode, extra) = (it.next(), it.next(), it.next(), it.next(), it.next());
+        let (tag, v, unix, mode, basis, extra) = (it.next(), it.next(), it.next(), it.next(), it.next(), it.next());
         let tag = tag.filter(|t| t.len() == 16 && t.bytes().all(|b| b.is_ascii_hexdigit()));
         let v = v.and_then(|v| v.parse::<i64>().ok()).filter(|v| *v > 0);
         let unix = unix.and_then(|u| u.parse::<u64>().ok());
@@ -390,6 +469,16 @@ impl AnchorFile {
                 self.mode.word()
             ));
         }
+        // A line written before BX9 names no basis: its mode's alone.
+        let theirs = basis.unwrap_or(Self::mode_basis(self.mode));
+        if theirs != self.basis() {
+            let (t, o) = (basis_parts(theirs), basis_parts(self.basis()));
+            return Err(format!(
+                "holds a session whose equity is `{t}` and this boot's is `{o}`{} — the equity's \
+                 basis differs (BX9: options summed or not); delete it to end that session",
+                if t == o { " under another options key" } else { "" }
+            ));
+        }
         Ok(Some(v))
     }
 
@@ -400,7 +489,10 @@ impl AnchorFile {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let tag = core::str::from_utf8(&self.tag).unwrap_or("");
-        core_io::write_atomic(&self.path, &format!("{tag}\t{equity_1e6}\t{unix}\t{}\n", self.mode.word()))
+        core_io::write_atomic(
+            &self.path,
+            &format!("{tag}\t{equity_1e6}\t{unix}\t{}\t{}\n", self.mode.word(), self.basis()),
+        )
     }
 }
 
@@ -451,20 +543,23 @@ mod tests {
         assert_eq!(a.load(), Ok(Some(1_010_250_000)));
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("KEYAAAA"), "the key itself is never written");
-        assert!(text.ends_with("\tclassic\n"), "{text}");
+        assert!(text.ends_with("\tclassic\tum\n"), "{text}");
         let other = AnchorFile::new(path.clone(), "KEYBBBBBBBBBBBBBBBB", AccountMode::Classic);
         let e = other.load().unwrap_err();
         assert!(e.contains("another API key") && !e.contains("KEY"), "{e}");
         let pm = AnchorFile::new(path.clone(), "KEYAAAAAAAAAAAAAAAA", AccountMode::Pm);
         let e = pm.load().unwrap_err();
         assert!(e.contains("`classic` session") && e.contains("`pm`"), "{e}");
-        // A line written before BX7: a classic session's.
+        // A line written before BX7: a classic session's; before BX9: its
+        // mode's basis alone.
         let tag = text.split('\t').next().unwrap();
         std::fs::write(&path, format!("{tag}\t5000000\t1790000000\n")).unwrap();
         assert_eq!(a.load(), Ok(Some(5_000_000)));
         assert!(pm.load().is_err());
-        let (zero, five) = (format!("{tag}\t0\t1"), format!("{tag}\t5\t1\tpm_pro\tx"));
-        for bad in ["garbage", "", "\t5000000\t1", zero.as_str(), five.as_str()] {
+        std::fs::write(&path, format!("{tag}\t5000000\t1790000000\tpm\n")).unwrap();
+        assert_eq!(pm.load(), Ok(Some(5_000_000)), "a PM line before BX9: unified");
+        let (zero, six) = (format!("{tag}\t0\t1"), format!("{tag}\t5\t1\tpm_pro\tunified\tx"));
+        for bad in ["garbage", "", "\t5000000\t1", zero.as_str(), six.as_str()] {
             std::fs::write(&path, bad).unwrap();
             assert!(a.load().unwrap_err().contains("not an anchor line"), "{bad:?}");
         }
@@ -473,6 +568,42 @@ mod tests {
         // A file past the longest line is refused, never read whole.
         std::fs::write(&path, format!("{tag}\t5000000\t1790000000\tclassic{}\n", " ".repeat(200))).unwrap();
         assert!(a.load().unwrap_err().contains("not an anchor line"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// BX9 (Q-4, the risk review's R1): the anchor names the equity's
+    /// basis — the parts summed and the options key's tag. Arming options
+    /// into a USDⓈ-M session, dropping them, or another options key refuses
+    /// the boot; the tag is written, never the key, and a refusal prints
+    /// the parts alone. Break-and-watch: without the basis check a
+    /// `um+opt` boot reads a `um` session's anchor and the options
+    /// account's equity reads as that session's gain.
+    #[test]
+    fn the_anchor_records_its_equity_basis() {
+        let dir = std::env::temp_dir().join(format!("bn-anchor-basis-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("binance-pnl-anchor.state");
+        let key = "KEYAAAAAAAAAAAAAAAA";
+        let um = AnchorFile::new(path.clone(), key, AccountMode::Classic);
+        let both = AnchorFile::new(path.clone(), key, AccountMode::Classic).with_options(true, "OPTKEYOOOOOOOOOOOOO");
+        let opt = AnchorFile::new(path.clone(), key, AccountMode::Classic).with_options(false, "OPTKEYOOOOOOOOOOOOO");
+        let other = AnchorFile::new(path.clone(), key, AccountMode::Classic).with_options(true, "OPTKEYPPPPPPPPPPPPP");
+        um.store(2_000_000_000).unwrap();
+        let e = both.load().unwrap_err();
+        assert!(e.contains("`um` and this boot's is `um+opt`") && e.contains("delete it"), "{e}");
+        both.store(3_000_000_000).unwrap();
+        assert_eq!(both.load(), Ok(Some(3_000_000_000)));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("OPTKEY") && text.contains("\tclassic\tum+opt-"), "{text}");
+        assert!(um.load().unwrap_err().contains("`um+opt` and this boot's is `um`"));
+        assert!(opt.load().unwrap_err().contains("this boot's is `opt`"));
+        let e = other.load().unwrap_err();
+        assert!(e.contains("under another options key") && !e.contains(&text[..16]), "{e}");
+        // A line before BX9 (no basis): a classic session's USDⓈ-M alone.
+        let tag = text.split('\t').next().unwrap();
+        std::fs::write(&path, format!("{tag}\t5000000\t1790000000\tclassic\n")).unwrap();
+        assert_eq!(um.load(), Ok(Some(5_000_000)));
+        assert!(both.load().is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

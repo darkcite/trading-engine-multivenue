@@ -142,7 +142,7 @@ fn full_snapshot() -> Box<EngineSnapshot> {
         sweep: u8::MAX,
         account_mode: u8::MAX,
         demo: u8::MAX,
-        refused: [u32::MAX; 20],
+        refused: [u32::MAX; 21],
         halt_reason: u64::MAX,
         in_flight: u64::MAX,
         in_doubt: u64::MAX,
@@ -165,6 +165,8 @@ fn full_snapshot() -> Box<EngineSnapshot> {
         heartbeat_age_ms: i64::MAX as u64,
         weight_used: u64::MAX,
         weight_max: u64::MAX,
+        opt_weight_used: u64::MAX,
+        opt_weight_max: u64::MAX,
         orders_10s_used: u64::MAX,
         orders_10s_cap: u64::MAX,
         orders_1m_used: u64::MAX,
@@ -174,6 +176,7 @@ fn full_snapshot() -> Box<EngineSnapshot> {
         clock_offset_ms: i64::MIN,
         margin_usdm_1e6: i64::MIN,
         margin_coinm_1e6: i64::MIN,
+        margin_options_1e6: i64::MIN,
     };
     // XMM XH3: every perp row at its widest render.
     s.boot.xmm_hash = [0xFF; 32];

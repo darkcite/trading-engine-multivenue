@@ -296,7 +296,8 @@ impl Driver {
     pub fn new_eapi(nonce_seed: u64, table: crate::eapi::EapiSymbolTable) -> Self {
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
-        // COPY: the 2 568 B boot table (64 rows × 40 B + its length)
+        // COPY: the 3 208 B boot table (`EAPI_TABLE_MAX` 80 rows × 40 B —
+        // the chain's 64 and BX9's 16 held — and its length)
         // moves into the slot's lane at boot — after moving through the
         // spec, and before moving on with the Driver (`MultiConn::new`)
         // — the lane holds it INLINE so every per-element lookup walks
@@ -1172,8 +1173,9 @@ impl<'a, T: Transport> MultiConn<'a, T> {
         keepalive: core_net::Keepalive,
         backoff: core_net::Backoff,
     ) -> Self {
-        // COPY: the Driver (≈ 2.9 KB: every slot's `StreamLane` is sized
-        // for the options table it carries inline) moves into its slot
+        // COPY: the Driver (≈ 3.5 KB: every slot's `StreamLane` is sized
+        // for the options table it carries inline, 3 208 B since BX9's
+        // held rows) moves into its slot
         // here and, with the slot, into the boot's Vec — 2–4 moves per
         // connection, once, at boot, well under a millisecond for the
         // whole lane — rejected: a two-phase in-place init behind `&mut`

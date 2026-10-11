@@ -1169,7 +1169,7 @@ pub fn spawn_binance_multi(
                         d
                     }
                 };
-                // COPY: the slot (its Driver inline, ≈ 2.9 KB) moves into
+                // COPY: the slot (its Driver inline, ≈ 3.5 KB) moves into
                 // the Vec once at boot — see `MultiConn::new`.
                 conns.push(bwl::MultiConn::new(
                     drv,
@@ -6537,7 +6537,7 @@ fn mirror_hlgw_metrics(
 /// tallies, then the refusals by reason.
 const BNARM_COUNTERS: usize = 21 + clob_dispatcher::BINANCE_REFUSALS;
 /// Its level gauges.
-const BNARM_GAUGES: usize = 31;
+const BNARM_GAUGES: usize = 34;
 
 /// The counter rows, in [`bnarm_counter_values`] order — which is what
 /// pins the two together; the refusals' rows are
@@ -6584,12 +6584,13 @@ const BNARM_COUNTER_NAMES: [&str; BNARM_COUNTERS] = [
     "engine_exec_bn_refused_verb_total",
     "engine_exec_bn_refused_deadman_down_total",
     "engine_exec_bn_refused_flags_total",
+    "engine_exec_bn_refused_not_writable_total",
 ];
 
 /// `BinanceArmReport`'s totals in [`BNARM_COUNTER_NAMES`] order: one
 /// literal, built in place (the refusals by index — a change of their
 /// count fails to compile here).
-// COPY: [u64; 41] (328 B) returned by value — cold, the 5 s /metrics
+// COPY: [u64; 42] (336 B) returned by value — cold, the 5 s /metrics
 // mirror (then kept as the next delta's baseline); the fields are visited
 // once in the name order — a borrowed view would need the report to be an
 // array, which the POD is not.
@@ -6618,6 +6619,7 @@ fn bnarm_counter_values(r: &clob_dispatcher::BinanceArmReport) -> [u64; BNARM_CO
         r.dns_reresolved,
         r.events_other,
         f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15], f[16], f[17], f[18], f[19],
+        f[20],
     ]
 }
 
@@ -6638,6 +6640,8 @@ const BNARM_GAUGE_NAMES: [&str; BNARM_GAUGES] = [
     "engine_exec_bn_sweep",
     "engine_exec_bn_weight_used",
     "engine_exec_bn_weight_max",
+    "engine_exec_bn_opt_weight_used",
+    "engine_exec_bn_opt_weight_max",
     "engine_exec_bn_orders_10s_used",
     "engine_exec_bn_orders_10s_cap",
     "engine_exec_bn_orders_1m_used",
@@ -6645,6 +6649,7 @@ const BNARM_GAUGE_NAMES: [&str; BNARM_GAUGES] = [
     "engine_exec_bn_quiet_left_ms",
     "engine_exec_bn_margin_usdm_1e6",
     "engine_exec_bn_margin_coinm_1e6",
+    "engine_exec_bn_margin_options_1e6",
     "engine_exec_bn_owned_rows",
     "engine_exec_bn_account_mode",
     "engine_exec_bn_post_rtt_p50_ns",
@@ -6658,7 +6663,7 @@ const BNARM_GAUGE_NAMES: [&str; BNARM_GAUGES] = [
 
 /// `BinanceArmReport`'s levels in [`BNARM_GAUGE_NAMES`] order; an unsigned
 /// level past `i64::MAX` — a heartbeat not yet seen — reads −1.
-// COPY: [i64; 31] (248 B) returned by value — cold, as above.
+// COPY: [i64; 34] (272 B) returned by value — cold, as above.
 fn bnarm_gauge_values(r: &clob_dispatcher::BinanceArmReport) -> [i64; BNARM_GAUGES] {
     let g = |v: u64| i64::try_from(v).unwrap_or(-1);
     [
@@ -6677,6 +6682,8 @@ fn bnarm_gauge_values(r: &clob_dispatcher::BinanceArmReport) -> [i64; BNARM_GAUG
         g(r.sweep),
         g(r.weight_used),
         g(r.weight_max),
+        g(r.opt_weight_used),
+        g(r.opt_weight_max),
         g(r.orders_10s_used),
         g(r.orders_10s_cap),
         g(r.orders_1m_used),
@@ -6684,6 +6691,7 @@ fn bnarm_gauge_values(r: &clob_dispatcher::BinanceArmReport) -> [i64; BNARM_GAUG
         g(r.quiet_left_ms),
         r.margin_usdm_1e6,
         r.margin_coinm_1e6,
+        r.margin_options_1e6,
         g(r.owned_rows),
         g(r.account_mode),
         g(r.post_rtt_p50_ns),
@@ -8559,7 +8567,7 @@ fn update_tick_age(
 /// **BX11** — the Binance arm's report as `/state` shows it
 /// (`exec.arms.binance_gw`): the operator's subset, each word saturated
 /// into its narrower field rather than wrapped.
-// COPY: the 344 B block returned by value into the snapshot — cold, once a
+// COPY: the 368 B block returned by value into the snapshot — cold, once a
 // second; built whole — rejected: an out-param (the same bytes, and a
 // borrow of the snapshot through the call).
 fn binance_gw_snapshot(b: &clob_dispatcher::BinanceArmReport) -> engine_snapshot::BinanceGwSnapshot {
@@ -8606,6 +8614,8 @@ fn binance_gw_snapshot(b: &clob_dispatcher::BinanceArmReport) -> engine_snapshot
         heartbeat_age_ms: b.heartbeat_age_ms,
         weight_used: b.weight_used,
         weight_max: b.weight_max,
+        opt_weight_used: b.opt_weight_used,
+        opt_weight_max: b.opt_weight_max,
         orders_10s_used: b.orders_10s_used,
         orders_10s_cap: b.orders_10s_cap,
         orders_1m_used: b.orders_1m_used,
@@ -8615,6 +8625,7 @@ fn binance_gw_snapshot(b: &clob_dispatcher::BinanceArmReport) -> engine_snapshot
         clock_offset_ms: b.clock_offset_ms,
         margin_usdm_1e6: b.margin_usdm_1e6,
         margin_coinm_1e6: b.margin_coinm_1e6,
+        margin_options_1e6: b.margin_options_1e6,
     }
 }
 
@@ -10440,6 +10451,15 @@ pub mod boot_discovery {
         /// options lane table from these. Empty when the policy is
         /// disabled.
         pub bn_options: Vec<(String, SymbolId)>,
+        /// **BX9** — the selected chain's eapi rows, in [`Self::bn_options`]'
+        /// order: the arm binds its options lane from these (Q-5).
+        pub bn_option_rows: Vec<ingress_binance::eapi::EapiOptionRow>,
+        /// **BX9 (Q-5)** — every listed eapi row of the configured
+        /// underlyings: an option a live arm's account holds outside the
+        /// chain joins it from its row here, at the engine's boot
+        /// (`bn_live::options_held_outside`; none listed: the boot
+        /// refuses).
+        pub bn_option_universe: Vec<ingress_binance::eapi::EapiOptionRow>,
         /// WS9: Bybit coverage (instruments-info audit, spot + linear
         /// pages); `None` when the `[bybit]` section is empty.
         pub bybit: Option<VenueCoverage>,
@@ -11460,14 +11480,24 @@ pub mod boot_discovery {
     /// selection is MISSING semantics (reason `no_chain`). Returns
     /// `(symbol, sym)` — the lane needs nothing per underlying since
     /// BX0-F2: every element of the `<uly>@optionMarkPrice` array
-    /// carries its own index price.
+    /// carries its own index price — with (BX9) the selected rows in the
+    /// same order and every listed row of the configured underlyings (the
+    /// live arm's binding sources, Q-5).
+    #[allow(clippy::type_complexity)]
     fn run_bn_options(
         cfg: &Config,
         tls: &Arc<rustls::ClientConfig>,
         policy: &OptionsPolicy,
         buf: &mut Vec<u8>,
         any_missing: &mut bool,
-    ) -> Result<Vec<(String, SymbolId)>, &'static str> {
+    ) -> Result<
+        (
+            Vec<(String, SymbolId)>,
+            Vec<ingress_binance::eapi::EapiOptionRow>,
+            Vec<ingress_binance::eapi::EapiOptionRow>,
+        ),
+        &'static str,
+    > {
         let (host, port) = split_host_port(&cfg.binance_eapi_rest_host, 443)?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -11484,7 +11514,34 @@ pub mod boot_discovery {
             "bn: eapi exchangeInfo parse failed"
         })?;
 
-        let mut out: Vec<(String, SymbolId)> = Vec::new();
+        // Sized once for the chain and the held options that join it at the
+        // engine's boot (BX9, R3): no growth copy (the zero-copy review,
+        // round 3).
+        let mut out: Vec<(String, SymbolId)> = Vec::with_capacity(ingress_binance::eapi::EAPI_TABLE_MAX);
+        let mut rows: Vec<ingress_binance::eapi::EapiOptionRow> = Vec::with_capacity(ingress_binance::eapi::EAPI_TABLE_MAX);
+        // COPY: every listed row of the configured underlyings (160 B
+        // each; at most the discovery's own cap, `EAPI_DISCOVERY_ROWS_CAP`
+        // 8 192 rows ≤ 1.25 MiB, a chain's thousand-odd in practice),
+        // counted first so the vector is sized once — boot only, once, off
+        // the network path. It runs on every boot with an options policy,
+        // a paper one too, where nothing reads it: an option a live arm's
+        // account holds outside the chain joins it from here (BX9, R3) and
+        // the engine drops it right after that join. Rejected: handing the
+        // discovery's own row vector out (a header move) and filtering by
+        // underlying at each held lookup — it keeps every underlying's
+        // rows (the same cap) alive until the join and moves the
+        // configured-underlyings rule into the join.
+        let configured = |r: &ingress_binance::eapi::EapiOptionRow| policy.underlyings.iter().any(|u| u.as_bytes() == r.underlying());
+        let listed = d.rows();
+        let mut universe: Vec<ingress_binance::eapi::EapiOptionRow> =
+            Vec::with_capacity(listed.iter().filter(|r| configured(r)).count());
+        let mut i = 0;
+        while i < listed.len() {
+            if configured(&listed[i]) {
+                universe.push(listed[i]);
+            }
+            i += 1;
+        }
         let mut k = 0u32;
         for uly in &policy.underlyings {
             std::thread::sleep(Duration::from_millis(150));
@@ -11539,6 +11596,12 @@ pub mod boot_discovery {
                     "discovery: bn instrument rules"
                 );
                 out.push((symbol.to_string(), sym));
+                // COPY: the selected row (160 B, ≤ `EAPI_OPT_MAX` 64 of
+                // them: 10 KiB), boot only — the live arm binds the chain
+                // from it (BX9); rejected: indices into `universe` (the
+                // chain's order is the selection's, and a row index would
+                // tie the arm to this vector's filter order).
+                rows.push(*row);
             }
             tracing::info!(
                 venue = "bn",
@@ -11561,7 +11624,7 @@ pub mod boot_discovery {
             return Err("bn: selected options chain exceeds EAPI_OPT_MAX — shrink \
                  options_underlyings/options_expiries/options_strikes");
         }
-        Ok(out)
+        Ok((out, rows, universe))
     }
 
     /// Run the full boot discovery pass: OKX (if `okx_spec` is
@@ -11684,7 +11747,7 @@ pub mod boot_discovery {
 
         // M2.4: the eapi capped options chain — its own surface,
         // independent of the spot/usdm audit arm.
-        let bn_options = if bn_options_policy.enabled() {
+        let (bn_options, bn_option_rows, bn_option_universe) = if bn_options_policy.enabled() {
             run_bn_options(
                 cfg,
                 tls_config,
@@ -11693,7 +11756,7 @@ pub mod boot_discovery {
                 &mut any_missing,
             )?
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new(), Vec::new())
         };
 
         // WS9: the Bybit instruments-info audit (spot + linear pages,
@@ -11755,6 +11818,8 @@ pub mod boot_discovery {
             bn_dapi_rows,
             bn_spot_rows,
             bn_options,
+            bn_option_rows,
+            bn_option_universe,
             bybit: bybit_cov,
             mexc: mexc_cov,
             mexc_funding,

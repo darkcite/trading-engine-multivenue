@@ -111,9 +111,10 @@ pub const fn maker_ok(product: u8, mode: AccountMode) -> bool {
 /// What this phase's gateway speaks: `Ok` for UM and COIN-M × classic
 /// (BX7: COIN-M on its own lane, IoC-only — O-BX3a), × Portfolio Margin
 /// (BX7, C2: papi, IoC-only — K13) and × PM Pro (BX7, C3: the classic
-/// routes, IoC-only until K14 shows the dead-man there), and spot ×
-/// classic (BX8: IoC-only — spot has no dead-man); otherwise the phase or
-/// ruling that brings the product or mode.
+/// routes, IoC-only until K14 shows the dead-man there), spot × classic
+/// (BX8: IoC-only — spot has no dead-man) and options × classic (BX9:
+/// IoC-only — the countdown is a market maker's, `-6005`); otherwise the
+/// phase or ruling that brings the product or mode.
 pub const fn built(product: u8, mode: AccountMode) -> Result<(), &'static str> {
     match product {
         PRODUCT_USDM | PRODUCT_COINM => match mode {
@@ -125,7 +126,12 @@ pub const fn built(product: u8, mode: AccountMode) -> Result<(), &'static str> {
             // account's equity: not built.
             AccountMode::Pm | AccountMode::PmPro => Err("a ruling (spot beside Portfolio Margin or PM Pro)"),
         },
-        PRODUCT_OPTIONS => Err("BX9 (options)"),
+        PRODUCT_OPTIONS => match mode {
+            AccountMode::Classic => Ok(()),
+            // Options lie outside Portfolio Margin (the venue's FAQ) and no
+            // PM Demo exists: not built.
+            AccountMode::Pm | AccountMode::PmPro => Err("a ruling (options beside Portfolio Margin or PM Pro)"),
+        },
         PRODUCT_EQUITY => Err("BX10 (Binance Stocks)"),
         _ => Err("no phase: an unknown product"),
     }
@@ -161,14 +167,21 @@ pub enum AssertErr {
     /// An armed spot row's permission groups are not the account's (BX8,
     /// the bStock check; [`judge_permission`]).
     SymbolNotPermitted,
-    /// The spot account answers `canTrade: false` (BX8).
+    /// The spot account answers `canTrade: false` (BX8) — or the options
+    /// account does (BX9).
     CannotTrade,
+    /// BX9: the options account is reduce-only (`marginAccount.reduceOnly`).
+    ReduceOnly,
 }
 
 /// The answer's own boolean `key` — named once, at the top level
-/// ([`field`]: a nested key is not it, a second copy refuses; BX7) — or
-/// `None`.
+/// ([`field`]: a nested key is not it, a second copy refuses; BX7) of an
+/// answer that is that object whole (nothing after its brace: BX9's parser
+/// review) — or `None`.
 fn json_bool(body: &[u8], key: &[u8]) -> Option<bool> {
+    if !crate::rest::whole(body) {
+        return None;
+    }
     let (a, z) = field(body, key)?;
     bool_of(body, a, z).ok()
 }
@@ -258,10 +271,10 @@ pub fn symbol_config(body: &[u8], symbol: &[u8]) -> Result<(bool, u64), AssertEr
 
 /// `GET /sapi/v1/account/apiRestrictions` in `mode`: the key cannot
 /// withdraw and trades what is armed — futures (`enableFutures`) when a
-/// futures lane is, spot (`enableSpotAndMarginTrading`; BX8) when spot is
-/// — and in Portfolio Margin it trades PM (`enablePortfolioMarginTrading`;
-/// BX7, C2).
-pub fn judge_key(body: &[u8], mode: AccountMode, futures: bool, spot: bool) -> Result<(), AssertErr> {
+/// futures lane is, spot (`enableSpotAndMarginTrading`; BX8) when spot is,
+/// options (`enableVanillaOptions`; BX9) when the key signs options — and in
+/// Portfolio Margin it trades PM (`enablePortfolioMarginTrading`; BX7, C2).
+pub fn judge_key(body: &[u8], mode: AccountMode, futures: bool, spot: bool, options: bool) -> Result<(), AssertErr> {
     if futures {
         judge_key_futures(body)?;
     } else {
@@ -273,6 +286,13 @@ pub fn judge_key(body: &[u8], mode: AccountMode, futures: bool, spot: bool) -> R
     }
     if spot {
         match json_bool(body, b"enableSpotAndMarginTrading") {
+            Some(true) => {}
+            Some(false) => return Err(AssertErr::NoTradePermission),
+            None => return Err(AssertErr::Unreadable),
+        }
+    }
+    if options {
+        match json_bool(body, b"enableVanillaOptions") {
             Some(true) => {}
             Some(false) => return Err(AssertErr::NoTradePermission),
             None => return Err(AssertErr::Unreadable),
@@ -427,7 +447,10 @@ mod tests {
         assert!(built(PRODUCT_SPOT, AccountMode::Pm).unwrap_err().starts_with("a ruling"));
         assert!(built(PRODUCT_SPOT, AccountMode::PmPro).unwrap_err().starts_with("a ruling"));
         assert!(!maker_ok(PRODUCT_SPOT, AccountMode::Classic), "BX-17: spot has no dead-man");
-        assert!(built(PRODUCT_OPTIONS, AccountMode::Classic).unwrap_err().starts_with("BX9"));
+        assert_eq!(built(PRODUCT_OPTIONS, AccountMode::Classic), Ok(()), "BX9: options classic");
+        assert!(built(PRODUCT_OPTIONS, AccountMode::Pm).unwrap_err().starts_with("a ruling"));
+        assert!(built(PRODUCT_OPTIONS, AccountMode::PmPro).unwrap_err().starts_with("a ruling"));
+        assert!(!maker_ok(PRODUCT_OPTIONS, AccountMode::Classic), "BX-17: options have no dead-man of ours (-6005)");
         assert!(built(PRODUCT_EQUITY, AccountMode::Classic).unwrap_err().starts_with("BX10"));
         // O-BX3a: no maker rests on COIN-M (no dead-man of ours there yet).
         assert!(maker_ok(PRODUCT_USDM, AccountMode::Classic));
@@ -522,14 +545,24 @@ mod tests {
         let spot_only = br#"{"enableWithdrawals":false,"enableFutures":false,"enableSpotAndMarginTrading":true}"#;
         let fut_only = br#"{"enableWithdrawals":false,"enableFutures":true,"enableSpotAndMarginTrading":false}"#;
         let c = AccountMode::Classic;
-        assert_eq!(judge_key(both, c, true, true), Ok(()));
-        assert_eq!(judge_key(spot_only, c, false, true), Ok(()));
-        assert_eq!(judge_key(spot_only, c, true, true), Err(AssertErr::NoTradePermission));
-        assert_eq!(judge_key(fut_only, c, true, true), Err(AssertErr::NoTradePermission));
-        assert_eq!(judge_key(fut_only, c, true, false), Ok(()));
+        assert_eq!(judge_key(both, c, true, true, false), Ok(()));
+        assert_eq!(judge_key(spot_only, c, false, true, false), Ok(()));
+        assert_eq!(judge_key(spot_only, c, true, true, false), Err(AssertErr::NoTradePermission));
+        assert_eq!(judge_key(fut_only, c, true, true, false), Err(AssertErr::NoTradePermission));
+        assert_eq!(judge_key(fut_only, c, true, false, false), Ok(()));
         let w = br#"{"enableWithdrawals":true,"enableSpotAndMarginTrading":true}"#;
-        assert_eq!(judge_key(w, c, false, true), Err(AssertErr::CanWithdraw));
-        assert_eq!(judge_key(br#"{"enableWithdrawals":false}"#, c, false, true), Err(AssertErr::Unreadable));
+        assert_eq!(judge_key(w, c, false, true, false), Err(AssertErr::CanWithdraw));
+        assert_eq!(judge_key(br#"{"enableWithdrawals":false}"#, c, false, true, false), Err(AssertErr::Unreadable));
+        // BX9: the options key trades options and cannot withdraw.
+        let opt = br#"{"enableWithdrawals":false,"enableVanillaOptions":true}"#;
+        assert_eq!(judge_key(opt, c, false, false, true), Ok(()));
+        assert_eq!(judge_key(fut_only, c, false, false, true), Err(AssertErr::Unreadable), "no options flag: unread");
+        assert_eq!(judge_key(br#"{"enableWithdrawals":false,"enableVanillaOptions":false}"#, c, false, false, true), Err(AssertErr::NoTradePermission));
+        assert_eq!(judge_key(br#"{"enableWithdrawals":true,"enableVanillaOptions":true}"#, c, false, false, true), Err(AssertErr::CanWithdraw));
         assert_eq!(judge_one_way(br#"{"x":{"dualSidePosition":false}}"#), Err(AssertErr::Unreadable), "a nested key is not the answer's");
+        // BX9 (the parser review): the answer is the object, whole.
+        assert_eq!(judge_one_way(b"{\"dualSidePosition\":false} \n"), Ok(()));
+        assert_eq!(judge_one_way(br#"{"dualSidePosition":false} {"dualSidePosition":true}"#), Err(AssertErr::Unreadable));
+        assert_eq!(judge_key(br#"{"enableWithdrawals":false,"enableVanillaOptions":true}]"#, c, false, false, true), Err(AssertErr::Unreadable));
     }
 }

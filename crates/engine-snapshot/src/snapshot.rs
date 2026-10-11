@@ -651,7 +651,7 @@ pub fn deadman_availability_word(v: u8) -> &'static str {
 /// **BX11 — the Binance arm's local refusal reasons, spelled**, index =
 /// `exec_binance::arm::Refusal` (its `REFUSAL_WORDS`). A copy for the
 /// reason [`HALT_REASON_WORDS`] is one; `cli` pins the two together.
-pub const BN_REFUSAL_WORDS: [&str; 20] = [
+pub const BN_REFUSAL_WORDS: [&str; 21] = [
     "unbound",
     "not_live",
     "not_owner",
@@ -672,6 +672,7 @@ pub const BN_REFUSAL_WORDS: [&str; 20] = [
     "verb",
     "deadman_down",
     "flags",
+    "not_writable",
 ];
 
 /// BX11: the Binance account mode (`exec_binance::mode::AccountMode`, its
@@ -970,7 +971,7 @@ pub struct BinanceGwSnapshot {
     /// See [`Self::account_mode`].
     pub demo: u8,
     /// Local refusals by reason ([`BN_REFUSAL_WORDS`]).
-    pub refused: [u32; 20],
+    pub refused: [u32; 21],
     /// The gateway's halt word (0 = running).
     pub halt_reason: u64,
     /// Orders pushed and not terminal / in doubt now / ever put in doubt.
@@ -1017,6 +1018,11 @@ pub struct BinanceGwSnapshot {
     pub weight_used: u64,
     /// See [`Self::weight_used`].
     pub weight_max: u64,
+    /// BX9: eapi's weight in the last minute, and the options lane's share
+    /// (options' own pool).
+    pub opt_weight_used: u64,
+    /// See [`Self::opt_weight_used`].
+    pub opt_weight_max: u64,
     /// The ORDERS windows' placements and caps (10 s, 1 min).
     pub orders_10s_used: u64,
     /// See [`Self::orders_10s_used`].
@@ -1035,9 +1041,11 @@ pub struct BinanceGwSnapshot {
     pub margin_usdm_1e6: i64,
     /// See [`Self::margin_usdm_1e6`].
     pub margin_coinm_1e6: i64,
+    /// BX9: the options account's (maintenance over adjusted equity).
+    pub margin_options_1e6: i64,
 }
 
-const _: () = assert!(core::mem::size_of::<BinanceGwSnapshot>() == 344);
+const _: () = assert!(core::mem::size_of::<BinanceGwSnapshot>() == 368);
 
 /// The whole snapshot — see the module docs and plan §6.1.
 #[derive(Copy, Clone)]
@@ -1177,7 +1185,9 @@ mod tests {
         // Hypercall merge; HC11's `hcv` section and `boot.hcv_hash` add
         // 200 B, XMM XH4f's `exec.arms.hyperliquid_gw` 200 B more — 31,424
         // B at BX7b; BX11's `exec.arms.binance_gw` (344 B, and the rings'
-        // 64 B alignment after it) makes it 31,808 B: 960 B left.
+        // 64 B alignment after it) makes it 31,808 B: 960 B left. BX9's
+        // 24 B more in that block (368 B: the `not_writable` refusal,
+        // options' margin and eapi's weight) fit the same alignment.
         let n = core::mem::size_of::<EngineSnapshot>();
         assert!(n <= 32 * 1024, "EngineSnapshot grew to {n} B");
         assert_eq!(n, 31_808, "the BX11 figure: a change states its own");

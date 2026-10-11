@@ -538,6 +538,22 @@ pub const OPT_SUMMARY_FLAG_MARK_PX: u8 = 1;
 /// [`OptSummary::flags`] bit: the venue supplied `open_interest_1e6`.
 pub const OPT_SUMMARY_FLAG_OI: u8 = 2;
 
+/// **BX9 — an option's no-arbitrage band per contract** at the index
+/// `index` (all ×1e6; i128, never overflowing): at least the intrinsic
+/// value less 1 % of the index, at most the index (a call) or the strike
+/// (a put), each per underlying unit × `unit`. The ledger's mark sanity
+/// (Q-2), and the Binance gateway's check of the index it adopts a held
+/// short at against the venue's own mark (the risk review's R7). Warm on
+/// the ledger's path: once per options summary on the engine thread — 0 B
+/// (gates 92 and 111); the gateway's use is at boot, cold.
+#[must_use]
+pub fn option_mark_band(index: i64, strike: i64, unit: i64, call: bool) -> (i128, i128) {
+    let (i, k, u) = (i128::from(index), i128::from(strike), i128::from(unit));
+    let intrinsic = if call { i - k } else { k - i };
+    let intrinsic = if intrinsic > 0 { intrinsic } else { 0 };
+    ((intrinsic - i / 100) * u / 1_000_000, (if call { i } else { k }) * u / 1_000_000)
+}
+
 impl OptSummary {
     /// Construct in one shot; saturates the i32 greek conversions.
     #[allow(clippy::too_many_arguments)]

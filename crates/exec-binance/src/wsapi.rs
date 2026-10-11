@@ -707,7 +707,8 @@ fn result_fields(f: &[u8], at: usize, out: &mut WsAnswer) -> Result<(), ScanErr>
                 out.avg_px_1e6 = dec_1e6(f, a, z).map_err(bad)?;
                 1 << 3
             }
-            b"origQty" => {
+            // eapi names it `quantity` (BX9): one or the other, read once.
+            b"origQty" | b"quantity" => {
                 out.qty_1e6 = dec_1e6(f, a, z).map_err(bad)?;
                 1 << 4
             }

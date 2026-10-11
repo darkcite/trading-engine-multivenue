@@ -28,9 +28,20 @@
 //! products only); on a shared account, the instrument owned (O-BX2a).
 //! Anything else stays BOUND — a settling or cancel-only contract still
 //! books its fills — but no order is ever sent on it.
+//!
+//! **Options (BX9)** bind from eapi's own rows
+//! ([`ingress_binance::eapi::EapiOptionRow`], [`InstTable::bind_option`]):
+//! IoC-only (no dead-man is ours: the countdown is a market maker's, BX-17),
+//! WRITABLE ([`INST_WRITABLE`]) only where the boot judged the underlying's
+//! `nakedSell`, the artifact's `options_write` and a crypto underlying
+//! (BX-18, O-BX10), each row naming its underlying ([`BnInstHot::uly`]) so a
+//! `-6057` takes the writing away from every row of it at once
+//! ([`InstTable::unwrite_underlying`]), and the gateway's copy carrying the
+//! expiry, the strike and the right ([`OptWire`]: the settlement, §3.10).
 
 use core_types::{symbol_ordinal, symbol_venue_byte, InstrumentClass, SymbolId, VenueId};
 use ingress_binance::discovery::{BnPermissions, BnStatus, BnSymbolRow, BN_ASSET_MAX};
+use ingress_binance::eapi::EapiOptionRow;
 
 use crate::num::{decimals_of, Magic};
 
@@ -63,6 +74,15 @@ pub const INST_NO_DEADMAN: u8 = 1 << 4;
 /// On a shared account, the instrument is on the artifact's owned list
 /// (O-BX2a); always set on a dedicated account.
 pub const INST_OWNED: u8 = 1 << 5;
+/// BX9 — an option this account may WRITE: an opening short is admitted
+/// (BX-18). Otherwise every SELL on the row is sent reduce-only, so the
+/// venue itself refuses one that would open a short.
+pub const INST_WRITABLE: u8 = 1 << 6;
+
+/// BX9: the underlyings one boot's option rows may name ([`BnInstHot::uly`]).
+pub const OPT_ULY_MAX: usize = 16;
+/// [`BnInstHot::uly`] of a row that is no option.
+pub const ULY_NONE: u8 = u8::MAX;
 
 /// The most rows a boot binds: the ledger's instrument table
 /// (`exec_router::LEDGER_INSTRUMENTS`). More refuses the boot (BX3
@@ -101,7 +121,9 @@ pub struct BnInstHot {
     pub class: u8,
     /// `INST_*`.
     pub flags: u8,
-    _r0: u8,
+    /// BX9 — an option's underlying, the boot's index of it ([`ULY_NONE`]
+    /// on every other row).
+    pub uly: u8,
     tick_m: u64,
     step_m: u64,
     /// `LOT_SIZE.minQty` ×1e6 (ceiled from ×1e9).
@@ -130,7 +152,7 @@ impl BnInstHot {
         product: 0,
         class: 0,
         flags: 0,
-        _r0: 0,
+        uly: ULY_NONE,
         tick_m: 0,
         step_m: 0,
         min_qty_1e6: 0,
@@ -313,6 +335,36 @@ impl SpotWire {
     };
 }
 
+/// **An option row's cold facts** (BX9): the expiry — a leg past it is
+/// held until the exercise record settles it (§3.10) — the strike, the
+/// right and the underlying. `EMPTY` on every other product's row.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct OptWire {
+    /// `expiryDate`, ms since the epoch (0: not an option).
+    pub expiry_ms: i64,
+    /// The strike ×1e6, per underlying unit.
+    pub strike_1e6: i64,
+    /// The underlying's index ([`BnInstHot::uly`]).
+    pub uly: u8,
+    /// A call (a put otherwise).
+    pub call: bool,
+    _r: [u8; 6],
+}
+
+const _: () = assert!(core::mem::size_of::<OptWire>() == 24);
+
+impl OptWire {
+    /// Not an option row.
+    pub const EMPTY: Self = Self {
+        expiry_ms: 0,
+        strike_1e6: 0,
+        uly: ULY_NONE,
+        call: false,
+        _r: [0; 6],
+    };
+}
+
 /// Why the boot refused to bind a row. Each refuses the boot.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BindErr {
@@ -329,6 +381,10 @@ pub enum BindErr {
     /// A spot row whose discovery names no base or quote asset (BX8: its
     /// balance could not be reconciled).
     BadAsset,
+    /// BX9: an option row with no unit, strike or expiry, a strike past the
+    /// ×1e6 range, or an underlying past [`OPT_ULY_MAX`] — it could not be
+    /// margined, settled or written safely.
+    BadOption,
 }
 
 /// One row to bind, as the boot hands it over.
@@ -345,6 +401,20 @@ pub struct BindSpec<'a> {
     pub owned: bool,
     /// The product and mode have a working venue dead-man (BX-17).
     pub maker_ok: bool,
+}
+
+/// **BX9 — one option row to bind**, as the boot hands it over.
+#[derive(Copy, Clone, Debug)]
+pub struct OptBindSpec<'a> {
+    /// The engine id the universe allocated (an options ordinal).
+    pub sym: SymbolId,
+    /// The venue's row from eapi's boot discovery.
+    pub row: &'a EapiOptionRow,
+    /// On the owned list (a dedicated account owns everything).
+    pub owned: bool,
+    /// The boot's verdict: the underlying's `nakedSell`, the artifact's
+    /// `options_write`, a crypto underlying (BX-18, O-BX10).
+    pub writable: bool,
 }
 
 /// The arm's two tables and the lookup (module docs).
@@ -368,6 +438,13 @@ pub struct WireTable {
     n: usize,
     ix: Box<[u16; SYM_IX]>,
     spot: Box<[SpotWire; INST_MAX]>,
+    opt: Box<[OptWire; INST_MAX]>,
+    /// BX9: the underlyings the option rows name, by index
+    /// ([`BnInstHot::uly`], [`OptWire::uly`]) — the gateway asks their index
+    /// by name (`/eapi/v1/index`). Boxed as the other columns: the table
+    /// moves (into the gateway) as a handful of pointers.
+    ulys: Box<[AssetName; OPT_ULY_MAX]>,
+    n_uly: usize,
 }
 
 /// FNV-1a over the product byte and the symbol.
@@ -399,6 +476,43 @@ impl WireTable {
     #[must_use]
     pub fn spot(&self, row: u16) -> &SpotWire {
         &self.spot[rx(row)]
+    }
+
+    /// An option row's expiry, strike, right and underlying
+    /// ([`OptWire::EMPTY`] on any other row; BX9).
+    #[inline(always)]
+    #[must_use]
+    pub fn opt(&self, row: u16) -> &OptWire {
+        &self.opt[rx(row)]
+    }
+
+    /// The underlying of index `uly` (BX9; empty for none): cold — the
+    /// boot's index read, reports.
+    #[must_use]
+    pub fn underlying(&self, uly: u8) -> &[u8] {
+        if (uly as usize) < self.n_uly {
+            self.ulys[uly as usize].get()
+        } else {
+            b""
+        }
+    }
+
+    /// The index of underlying `name`, appended if new (boot); `None` past
+    /// [`OPT_ULY_MAX`] or for a name no [`AssetName`] holds.
+    fn uly_index(&mut self, name: &[u8]) -> Option<u8> {
+        let mut i = 0;
+        while i < self.n_uly {
+            if self.ulys[i].get() == name {
+                return Some(i as u8);
+            }
+            i += 1;
+        }
+        if self.n_uly == OPT_ULY_MAX {
+            return None;
+        }
+        self.ulys[self.n_uly] = AssetName::of(name)?;
+        self.n_uly += 1;
+        Some((self.n_uly - 1) as u8)
     }
 
     /// The row whose wire symbol is `symbol`, or [`ROW_NONE`]: one hash and
@@ -494,6 +608,9 @@ impl InstTable {
                 n: 0,
                 ix: Box::new([ROW_NONE; SYM_IX]),
                 spot: exec_gateway::boxed_array(SpotWire::EMPTY),
+                opt: exec_gateway::boxed_array(OptWire::EMPTY),
+                ulys: exec_gateway::boxed_array(AssetName::EMPTY),
+                n_uly: 0,
             },
         )
     }
@@ -574,7 +691,7 @@ impl InstTable {
             product: spec.product,
             class: class as u8,
             flags,
-            _r0: 0,
+            uly: ULY_NONE,
             tick_m: tm.m(),
             step_m: sm.m(),
             min_qty_1e6: ceil_1e6(r.filters.min_qty_1e9),
@@ -633,6 +750,122 @@ impl InstTable {
             self.flat[ord] = row_ix;
         }
         Ok(row_ix)
+    }
+
+    /// **BX9 — bind one option row** (boot; module docs): IoC-only, writable
+    /// as the boot judged, its underlying indexed. Returns the row index.
+    pub fn bind_option(&mut self, wire: &mut WireTable, spec: &OptBindSpec<'_>) -> Result<u16, BindErr> {
+        if self.n >= INST_MAX {
+            return Err(BindErr::TooMany);
+        }
+        let r = spec.row;
+        let symbol = r.symbol();
+        if symbol.is_empty() || symbol.len() > WIRE_SYMBOL_MAX {
+            return Err(BindErr::BadSymbol);
+        }
+        let ord = symbol_ordinal(spec.sym) as usize;
+        if spec.sym == self.alias_sym || symbol_venue_byte(spec.sym) != VenueId::Binance as u8 || ord >= FLAT_MAP_LEN {
+            return Err(BindErr::BadSym);
+        }
+        if self.flat[ord] != ROW_NONE || wire.find(PRODUCT_OPTIONS, symbol) != ROW_NONE {
+            return Err(BindErr::Duplicate);
+        }
+        // A row the margin, the settlement or the IM could not read.
+        let strike_1e6 = r.strike_1e9 / 1_000;
+        if r.unit == 0 || r.expiry_ms <= 0 || strike_1e6 <= 0 || r.strike_1e9 % 1_000 != 0 {
+            return Err(BindErr::BadOption);
+        }
+        let uly = wire.uly_index(r.underlying()).ok_or(BindErr::BadOption)?;
+        let row_ix = self.n as u16;
+        let tick = exact_1e6(r.filters.tick_size_1e9);
+        let step = exact_1e6(r.filters.lot_step_1e9);
+        let exact = tick.is_some() && step.is_some();
+        let tick_1e6 = tick.unwrap_or(1);
+        let step_1e6 = step.unwrap_or(1);
+        let live = exact && r.trading && r.status as u8 == BnStatus::Trading as u8 && spec.owned;
+        let tradfi = r.is_tradfi();
+        let mut flags = INST_NO_DEADMAN;
+        flags |= (live as u8) * INST_LIVE;
+        flags |= (tradfi as u8) * INST_TRADFI;
+        flags |= (spec.owned as u8) * INST_OWNED;
+        flags |= ((spec.writable && !tradfi) as u8) * INST_WRITABLE;
+        let unit_1e6 = i64::from(r.unit).saturating_mul(1_000_000);
+        let tm = Magic::new(tick_1e6);
+        let sm = Magic::new(step_1e6);
+        self.hot[rx(row_ix)] = BnInstHot {
+            sym: spec.sym,
+            tick_1e6,
+            step_1e6,
+            product: PRODUCT_OPTIONS,
+            class: InstrumentClass::Option as u8,
+            flags,
+            uly,
+            tick_m: tm.m(),
+            step_m: sm.m(),
+            min_qty_1e6: ceil_1e6(r.filters.min_qty_1e9),
+            // Options carry no minimum notional.
+            min_notional_1e6: 0,
+            unit_1e6,
+            px_dec: decimals_of(tick_1e6),
+            qty_dec: decimals_of(step_1e6),
+            tick_sh: tm.sh(),
+            step_sh: sm.sh(),
+            _r1: [0; 4],
+        };
+        // No percent-price band: eapi's PRICE_FILTER band moves with the
+        // mark and is the venue's to judge (the K-probe, 2026-10-10).
+        self.cold[rx(row_ix)] = BnInstCold {
+            max_qty_1e6: if r.filters.max_qty_1e9 > 0 { r.filters.max_qty_1e9 / 1_000 } else { 0 },
+            ..BnInstCold::EMPTY
+        };
+        self.n += 1;
+        let mut w = BnInstWire {
+            symbol: [0; WIRE_SYMBOL_MAX],
+            len: symbol.len() as u8,
+            product: PRODUCT_OPTIONS,
+            flags,
+            _r: 0,
+            sym: spec.sym,
+            unit_1e6,
+            px_dec: decimals_of(tick_1e6),
+            qty_dec: decimals_of(step_1e6),
+            _r1: [0; 14],
+        };
+        // COPY: the wire symbol (≤ 32 B) into the gateway's table — boot
+        // only, once per row (as `bind`'s) — rejected: borrowing the
+        // discovery rows, dropped after boot.
+        w.symbol[..symbol.len()].copy_from_slice(symbol);
+        wire.rows[rx(row_ix)] = w;
+        wire.opt[rx(row_ix)] = OptWire {
+            expiry_ms: r.expiry_ms,
+            strike_1e6,
+            uly,
+            call: r.is_call,
+            _r: [0; 6],
+        };
+        wire.n += 1;
+        wire.index(row_ix);
+        self.flat[ord] = row_ix;
+        Ok(row_ix)
+    }
+
+    /// **BX-18 — `-6057`**: the venue will not let this account write
+    /// `uly`'s options. Every row of it loses [`INST_WRITABLE`] at once:
+    /// from now on a SELL there is sent reduce-only (the venue refuses one
+    /// that would open a short) and the arm refuses one it knows would
+    /// (cold; once per such answer).
+    pub fn unwrite_underlying(&mut self, uly: u8) {
+        if uly == ULY_NONE {
+            return;
+        }
+        let mut i = 0;
+        while i < self.n {
+            let h = &mut self.hot[i];
+            if h.product == PRODUCT_OPTIONS && h.uly == uly {
+                h.flags &= !INST_WRITABLE;
+            }
+            i += 1;
+        }
     }
 
     /// **The alias-first lookup** (module docs): the row an engine id
@@ -850,6 +1083,101 @@ pub(crate) mod tests {
             let name = std::format!("S{i}USDT");
             assert_ne!(w.find(PRODUCT_USDM, name.as_bytes()), ROW_NONE);
         }
+    }
+
+    /// BX9: eapi's page as Demo listed it on 2026-10-10 (a BTC call — its
+    /// minimum under its step, as Demo lists every BTC row — and a TradFi
+    /// call), the underlyings' `nakedSell` in `optionContracts`.
+    pub(crate) const EAPI: &[u8] = br#"{"timezone":"UTC","serverTime":1791638168114,"optionContracts":[{"baseAsset":"BTC","quoteAsset":"USDT","underlying":"BTCUSDT","settleAsset":"USDT","nakedSell":true},{"baseAsset":"XAU","quoteAsset":"USDT","underlying":"XAUUSDT","settleAsset":"USDT","nakedSell":false}],"optionAssets":[{"name":"USDT"}],"optionSymbols":[{"expiryDate":1798185600000,"filters":[{"filterType":"PRICE_FILTER","minPrice":"7770.000","maxPrice":"23300.000","tickSize":"5.000"},{"filterType":"LOT_SIZE","minQty":"0.0001","maxQty":"200","stepSize":"0.0100"}],"symbol":"BTC-261225-85000-C","side":"CALL","strikePrice":"85000.000","underlying":"BTCUSDT","unit":1,"liquidationFeeRate":"0.001900","minQty":"0.0001","maxQty":"200","initialMargin":"0.15000000","maintenanceMargin":"0.07500000","minInitialMargin":"0.10000000","minMaintenanceMargin":"0.05000000","priceScale":3,"quantityScale":4,"quoteAsset":"USDT","status":"TRADING","contractType":"CRYPTO_OPTIONS","underlyingType":"CRYPTO"},{"expiryDate":1798185600000,"filters":[{"filterType":"PRICE_FILTER","minPrice":"5.000","maxPrice":"2000.000","tickSize":"5.000"},{"filterType":"LOT_SIZE","minQty":"0.0001","maxQty":"200","stepSize":"0.0100"}],"symbol":"BTC-261225-90000-P","side":"PUT","strikePrice":"90000.000","underlying":"BTCUSDT","unit":1,"minQty":"0.0001","maxQty":"200","priceScale":3,"quantityScale":4,"quoteAsset":"USDT","status":"TRADING","contractType":"CRYPTO_OPTIONS","underlyingType":"CRYPTO"},{"expiryDate":1815768000000,"filters":[{"filterType":"PRICE_FILTER","minPrice":"148.88","maxPrice":"1339.98","tickSize":"0.01"},{"filterType":"LOT_SIZE","minQty":"0.01","maxQty":"3000","stepSize":"0.10"}],"symbol":"XAU-270716-4000-C","side":"CALL","strikePrice":"4000.00","underlying":"XAUUSDT","unit":1,"minQty":"0.01","maxQty":"3000","priceScale":2,"quantityScale":2,"quoteAsset":"USDT","status":"CLOSED_MARKET","contractType":"TRADFI_OPTIONS","underlyingType":"COMMODITY"}],"rateLimits":[{"rateLimitType":"REQUEST_WEIGHT","interval":"MINUTE","intervalNum":1,"limit":6000}]}"#;
+
+    pub(crate) fn eapi_rows() -> ingress_binance::eapi::EapiDiscovery {
+        let mut d = ingress_binance::eapi::EapiDiscovery::new();
+        d.ingest_exchange_info(EAPI).expect("the fixture scans");
+        d
+    }
+
+    /// BX9: an option binds IoC-only, as `Option`, writable as the boot
+    /// judged (never a TradFi row), its underlying indexed and its expiry,
+    /// strike and right on the gateway's copy; `-6057` unwrites every row
+    /// of the underlying and no other.
+    #[test]
+    fn an_option_binds_ioc_only_writable_as_judged() {
+        let d = eapi_rows();
+        let (mut t, mut w) = InstTable::new(7);
+        let find = |name: &[u8]| d.rows().iter().find(|r| r.symbol() == name).expect("listed");
+        let call = OptBindSpec { sym: make_symbol_id(VenueId::Binance, 1025), row: find(b"BTC-261225-85000-C"), owned: true, writable: true };
+        let a = t.bind_option(&mut w, &call).unwrap();
+        let h = *t.hot(a);
+        assert!(h.has(INST_LIVE) && h.has(INST_NO_DEADMAN) && h.has(INST_WRITABLE) && h.has(INST_OWNED) && !h.has(INST_TRADFI));
+        assert_eq!(h.class, InstrumentClass::Option as u8);
+        assert_eq!((h.product, h.uly), (PRODUCT_OPTIONS, 0));
+        assert_eq!((h.tick_1e6, h.step_1e6, h.min_qty_1e6, h.min_notional_1e6, h.unit_1e6), (5_000_000, 10_000, 100, 0, 1_000_000));
+        assert_eq!((h.px_dec, h.qty_dec), (0, 2));
+        assert_eq!(t.cold(a).max_qty_1e6, 200_000_000);
+        assert_eq!((t.cold(a).bid_up_1e6, t.cold(a).ask_down_1e6), (0, 0), "no percent-price band");
+        let o = *w.opt(a);
+        assert_eq!((o.expiry_ms, o.strike_1e6, o.uly, o.call), (1_798_185_600_000, 85_000_000_000, 0, true));
+        assert_eq!(w.find(PRODUCT_OPTIONS, b"BTC-261225-85000-C"), a);
+        assert_eq!(w.find(PRODUCT_USDM, b"BTC-261225-85000-C"), ROW_NONE, "a product's own index");
+        let put = OptBindSpec { sym: make_symbol_id(VenueId::Binance, 1026), row: find(b"BTC-261225-90000-P"), owned: true, writable: true };
+        let b = t.bind_option(&mut w, &put).unwrap();
+        assert_eq!((t.hot(b).uly, w.opt(b).call), (0, false), "the same underlying, one index");
+        // TradFi: never writable, whatever the boot says; closed: not live.
+        let gold = OptBindSpec { sym: make_symbol_id(VenueId::Binance, 1027), row: find(b"XAU-270716-4000-C"), owned: true, writable: true };
+        let c = t.bind_option(&mut w, &gold).unwrap();
+        let g = t.hot(c);
+        assert!(g.has(INST_TRADFI) && !g.has(INST_WRITABLE) && !g.has(INST_LIVE));
+        assert_eq!((g.uly, w.underlying(g.uly)), (1, &b"XAUUSDT"[..]));
+        // -6057 on BTC: both BTC rows unwritten, the gold row untouched.
+        t.unwrite_underlying(0);
+        assert!(!t.hot(a).has(INST_WRITABLE) && !t.hot(b).has(INST_WRITABLE));
+        assert!(t.hot(a).has(INST_LIVE), "a long is still admitted");
+        t.unwrite_underlying(ULY_NONE);
+        // A futures row carries no option facts and no underlying.
+        let f = fapi_rows(FAPI);
+        let fx = t
+            .bind(&mut w, &BindSpec { sym: make_symbol_id(VenueId::Binance, 513), product: PRODUCT_USDM, row: f.find(b"BTCUSDT").unwrap(), owned: true, maker_ok: true })
+            .unwrap();
+        assert_eq!((*w.opt(fx), t.hot(fx).uly), (OptWire::EMPTY, ULY_NONE));
+        t.unwrite_underlying(0);
+        assert!(!t.hot(fx).has(INST_WRITABLE));
+    }
+
+    /// BX9: an option row the margin, the settlement or the IM could not
+    /// read refuses the boot; so do a duplicate and a 17th underlying.
+    #[test]
+    fn option_binding_refusals() {
+        let d = eapi_rows();
+        let row = d.rows()[0];
+        let (mut t, mut w) = InstTable::new(7);
+        let spec = |sym, row| OptBindSpec { sym: make_symbol_id(VenueId::Binance, sym), row, owned: true, writable: false };
+        let mut r = row;
+        r.unit = 0;
+        assert_eq!(t.bind_option(&mut w, &spec(1025, &r)), Err(BindErr::BadOption), "no unit");
+        let mut r = row;
+        r.expiry_ms = 0;
+        assert_eq!(t.bind_option(&mut w, &spec(1025, &r)), Err(BindErr::BadOption), "no expiry");
+        let mut r = row;
+        r.strike_1e9 = 85_000_000_000_001;
+        assert_eq!(t.bind_option(&mut w, &spec(1025, &r)), Err(BindErr::BadOption), "a strike finer than 1e-6");
+        assert_eq!(t.bind_option(&mut w, &OptBindSpec { sym: 7, row: &row, owned: true, writable: false }), Err(BindErr::BadSym), "the alias");
+        t.bind_option(&mut w, &spec(1025, &row)).unwrap();
+        assert_eq!(t.bind_option(&mut w, &spec(1025, &row)), Err(BindErr::Duplicate));
+        assert_eq!(t.bind_option(&mut w, &spec(1030, &row)), Err(BindErr::Duplicate), "the same symbol twice");
+        let mut rows = std::vec::Vec::new();
+        for i in 0..OPT_ULY_MAX {
+            let mut r = row;
+            let (sym, uly) = (std::format!("U{i}-261225-1-C"), std::format!("U{i}USDT"));
+            r.symbol[..sym.len()].copy_from_slice(sym.as_bytes());
+            r.symbol_len = sym.len() as u8;
+            r.underlying[..uly.len()].copy_from_slice(uly.as_bytes());
+            r.underlying_len = uly.len() as u8;
+            rows.push(r);
+        }
+        for (i, r) in rows.iter().enumerate().take(OPT_ULY_MAX - 1) {
+            t.bind_option(&mut w, &spec(1_100 + i as u32, r)).unwrap();
+        }
+        assert_eq!(t.bind_option(&mut w, &spec(1_200, &rows[OPT_ULY_MAX - 1])), Err(BindErr::BadOption), "a 17th underlying");
     }
 
     #[test]
