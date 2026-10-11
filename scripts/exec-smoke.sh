@@ -36,15 +36,19 @@
 # rejection naming OUR OWN recovered address is stronger evidence than
 # an acceptance.
 #
-# IT CANNOT REACH MAINNET — but for one tool, by the operator's hand.
+# IT CANNOT REACH MAINNET — but for two tools, by the operator's hand.
 # The binary refuses any Hyperliquid configuration that is not the
 # testnet host AND the testnet source, and it reads its own
 # HYPERLIQUID_TESTNET_* variables which are disjoint from the live
-# arm's; the Binance battery and probe dial Demo hosts only. The one
-# exception is BX11's account tools (`--binance-setup`,
-# `--binance-flatten`) under `--bn-network mainnet`: they READ the live
-# Binance account with the engine's own key and CHANGE it only with
-# `--confirm` — the operator's word, never a session's.
+# arm's; the Binance futures, spot and options battery and probe dial
+# Demo hosts only. The exceptions: BX11's account tools
+# (`--binance-setup`, `--binance-flatten`) under `--bn-network mainnet`
+# READ the live Binance account with the engine's own key and CHANGE it
+# only with `--confirm`; and BX10's Binance Stocks tools — Stocks has no
+# Demo — `--binance-probe equity` READS the live account (places
+# nothing) and `--binance equity --lifecycle` TRADES REAL MONEY only
+# with `--bn-confirm-mainnet`. The word is the operator's, never a
+# session's.
 #
 # EXIT CODES — pinned by `smoke::tests::the_exit_codes_are_pinned`.
 # Change them in one place and that test fails in the other.
@@ -74,7 +78,12 @@
 #       it (loudest). The probe
 #       (`--binance-probe`): 59 a probe failed (an arming-precondition
 #       probe refused, or a probe that could not run). They read only the
-#       BINANCE_DEMO_* variables and dial Demo hosts only.
+#       BINANCE_DEMO_* variables and dial Demo hosts only — but the
+#       Binance Stocks battery and probe (BX10, `--binance equity`,
+#       `--binance-probe equity`): MAINNET, the live key; their 50-59 are
+#       read for the LIVE account (docs/binance-runbook.md §12), 64 is
+#       the battery without --bn-confirm-mainnet and 66 its disclaimer
+#       unsigned (486410; nothing placed).
 #   60-64 BX11, the Binance ACCOUNT TOOLS (pinned by `bn_ops::tests`):
 #       `--binance-setup <um|cm>` and `--binance-flatten <um|cm>`. 60 a
 #       read failed (a setting, the account, the orders or the book), 61
@@ -152,17 +161,23 @@ binance=0
 bnops=0
 drill=0
 mainnet=0
+eqprobe=0
+eqbattery=0
 prev=""
 for a in "$@"; do
   [ "$a" = "--hl-perp" ] && hlperp=1
   # The account tools first: their names also start `--binance`.
   case "$a" in
     --binance-setup*|--binance-flatten*) bnops=1 ;;
+    --binance-probe=equity) binance=1; eqprobe=1 ;;
+    --binance=equity) binance=1; eqbattery=1 ;;
     --binance*) binance=1 ;;
     --bn-drill*) drill=1 ;;
     --bn-network=mainnet) mainnet=1 ;;
   esac
   [ "$prev" = "--bn-network" ] && [ "$a" = "mainnet" ] && mainnet=1
+  [ "$prev" = "--binance-probe" ] && [ "$a" = "equity" ] && eqprobe=1
+  [ "$prev" = "--binance" ] && [ "$a" = "equity" ] && eqbattery=1
   [ "$a" = "--offline" ] && offline=1
   # A dry run reaches no venue either, and must not inherit the
   # message that says one verified us. Same rule as --offline.
@@ -173,6 +188,13 @@ account="DEMO"
 if [ "$bnops" = 1 ] && [ "$mainnet" = 1 ]; then
   account="LIVE (mainnet)"
   echo "exec-smoke: *** --bn-network mainnet: the account tool READS THE LIVE BINANCE ACCOUNT with the engine's own key; it changes it only with --confirm ***" >&2
+fi
+if [ "$eqprobe" = 1 ]; then
+  echo "exec-smoke: *** --binance-probe equity: READS THE LIVE Binance Stocks account on MAINNET with the engine's own key (Stocks has no Demo); it places nothing — with --bn-stream-confirm it also opens a listenKey and watches the order stream ***" >&2
+fi
+if [ "$eqbattery" = 1 ]; then
+  account="LIVE Binance Stocks (mainnet)"
+  echo "exec-smoke: *** --binance equity: THE BINANCE STOCKS BATTERY TRADES ON MAINNET — REAL MONEY (Stocks has no Demo). With --bn-confirm-mainnet it places a resting BUY and cancels it, buys at the minimum size and sells it back (two fees at the \$0.35 floor, the spread twice); without it, it reads and prints its plan only. A dedicated account; one Ctrl-C only ***" >&2
 fi
 
 # One line of JSON on stdout for CI; the human report on stderr. A
@@ -190,6 +212,10 @@ case "$rc" in
         echo "exec-smoke: PASS (offline) — this binary reproduces the venue SDK's bytes for every action type; the venue was NOT contacted" >&2
       elif [ "$bnops" = 1 ]; then
         echo "exec-smoke: PASS (Binance account tool, $account account) — the report above names every read, change and answer" >&2
+      elif [ "$eqprobe" = 1 ]; then
+        echo "exec-smoke: PASS (Binance Stocks read-only probe, MAINNET) — the report above names every answer; nothing was placed" >&2
+      elif [ "$eqbattery" = 1 ]; then
+        echo "exec-smoke: PASS (Binance Stocks battery, MAINNET) — the bar is met; the report above names every order and answer; nothing rests on the LIVE account and its executions match what the run booked" >&2
       elif [ "$drill" = 1 ]; then
         echo "exec-smoke: PASS (Binance Demo drill) — the drill's bar held (the report names it); nothing was left on the Demo account" >&2
       elif [ "$binance" = 1 ]; then
@@ -203,22 +229,44 @@ case "$rc" in
   23) echo "exec-smoke: *** OFFLINE SELF-TEST FAILED *** this binary does not reproduce the venue SDK's bytes — do not ship it" >&2 ;;
   38) echo "exec-smoke: *** XH4g: THE BATTERY LEFT A POSITION OR AN ORDER ON THE TESTNET ACCOUNT *** — clear it before the next run (the arm holds a boot over a position)" >&2 ;;
   3[0-79]) echo "exec-smoke: XH4g battery FAILED (exit $rc) — the report above names the phase" >&2 ;;
-  58) echo "exec-smoke: *** BX7b: SOMETHING WAS LEFT ON THE BINANCE DEMO ACCOUNT, OR ITS END COULD NOT READ IT *** — the report names it; read the account by hand and clear it before the next run" >&2 ;;
-  59) echo "exec-smoke: *** BX7b: A BINANCE DEMO PROBE FAILED *** — the report above names it" >&2 ;;
-  5[0-7]) echo "exec-smoke: BX7b Binance Demo battery FAILED (exit $rc) — the report above names the phase" >&2 ;;
+  58) if [ "$eqbattery" = 1 ]; then
+        echo "exec-smoke: *** BX10: SOMETHING WAS LEFT ON THE LIVE (MAINNET) BINANCE STOCKS ACCOUNT, OR ITS END COULD NOT READ IT *** — REAL MONEY: the report's \`left\` names it; an order left rests WITHOUT its TTL until its session closes — cancel it, and sell a holding left, in the Binance app now" >&2
+      else
+        echo "exec-smoke: *** BX7b: SOMETHING WAS LEFT ON THE BINANCE DEMO ACCOUNT, OR ITS END COULD NOT READ IT *** — the report names it; read the account by hand and clear it before the next run" >&2
+      fi ;;
+  59) if [ "$eqprobe" = 1 ]; then
+        echo "exec-smoke: *** BX10: THE BINANCE STOCKS READ-ONLY PROBE FAILED *** — the report above names it; nothing was placed" >&2
+      else
+        echo "exec-smoke: *** BX7b: A BINANCE DEMO PROBE FAILED *** — the report above names it" >&2
+      fi ;;
+  5[0-7]) if [ "$eqbattery" = 1 ]; then
+        echo "exec-smoke: BX10 Binance Stocks battery (MAINNET) FAILED (exit $rc) — the report above names the phase. A refusal before the first order (the account check, the boot) placed nothing; past it, the end swept and read the LIVE account: \`left\` empty means no order rests and the ticker's executions net to what the run booked" >&2
+      else
+        echo "exec-smoke: BX7b Binance Demo battery FAILED (exit $rc) — the report above names the phase" >&2
+      fi ;;
   60) echo "exec-smoke: *** BX11: A BINANCE READ FAILED *** — the report names it and every change or order sent before it: read the $account account by hand" >&2 ;;
   61) echo "exec-smoke: *** BX11: THE VENUE REFUSED A SETUP CHANGE OR A FLATTEN'S CANCEL *** — the report names its answer; read the $account account before trying again" >&2 ;;
   62) echo "exec-smoke: BX11 flatten: an order of the arm's rests — is the engine running? NOTHING was sent; stop it first, or pass --bn-cancel-first" >&2 ;;
   63) echo "exec-smoke: *** BX11 FLATTEN: A POSITION IS STILL OPEN AFTER ITS TRIES *** — the report names it; close it by hand on the $account account" >&2 ;;
-  64) echo "exec-smoke: BX11: mainnet without --confirm — the account was read and every change it would send is printed above; NOTHING was sent" >&2 ;;
+  64) if [ "$eqbattery" = 1 ]; then
+        echo "exec-smoke: BX10: no --bn-confirm-mainnet — the Binance Stocks account was read and the battery's plan is printed above; NOTHING was sent" >&2
+      else
+        echo "exec-smoke: BX11: mainnet without --confirm — the account was read and every change it would send is printed above; NOTHING was sent" >&2
+      fi ;;
   65) echo "exec-smoke: *** BX11 DRILL: THE VENUE'S DEAD-MAN WAS NOT SEEN TO CANCEL THE MAKERS *** — the report names why; the run cancelled any left by id and read the Demo account" >&2 ;;
-  66) echo "exec-smoke: BX8: the permission check refused the boot — the account lacks a group the spot row needs (the bStock check); NOTHING was placed" >&2 ;;
+  66) if [ "$eqbattery" = 1 ]; then
+        echo "exec-smoke: BX10: the venue refused the first place — 486410, the US equity disclaimer is unsigned on this account: sign it in the Binance app (the tool never does); NOTHING was placed" >&2
+      else
+        echo "exec-smoke: BX8: the permission check refused the boot — the account lacks a group the spot row needs (the bStock check); NOTHING was placed" >&2
+      fi ;;
   *) echo "exec-smoke: could not run (exit $rc)" >&2
      # 1 (refused before anything was sent) and 2 (clap) left nothing.
      if [ "$hlperp" = 1 ] && [ "$rc" != 1 ] && [ "$rc" != 2 ]; then
        echo "exec-smoke: *** the XH4g battery ended abnormally — slot-6 orders or a position may remain on the TESTNET account; the next battery's account check refuses while slot 6's orders rest: clear them first ***" >&2
      fi
-     if [ "$binance" = 1 ] && [ "$rc" != 1 ] && [ "$rc" != 2 ]; then
+     if [ "$eqbattery" = 1 ] && [ "$rc" != 1 ] && [ "$rc" != 2 ]; then
+       echo "exec-smoke: *** the Binance Stocks battery ended abnormally — an order may rest on the LIVE (MAINNET) account WITHOUT its TTL until its session closes, or a holding remain: cancel and sell it in the Binance app now ***" >&2
+     elif [ "$binance" = 1 ] && [ "$rc" != 1 ] && [ "$rc" != 2 ]; then
        echo "exec-smoke: *** the Binance Demo tool ended abnormally — orders or a position may remain on the DEMO account: read it before the next run ***" >&2
      fi
      if [ "$bnops" = 1 ] && [ "$rc" != 1 ] && [ "$rc" != 2 ]; then

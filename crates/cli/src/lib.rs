@@ -41,6 +41,9 @@ pub mod bin15_boot;
 pub mod bin15_live;
 /// BX7b: the Binance Demo battery (`exec-smoke --binance … --lifecycle`).
 pub mod bn_battery;
+/// BX10: the Binance Stocks battery (`exec-smoke --binance equity
+/// --lifecycle`) — MAINNET, the operator's to run (ruling S-3).
+pub mod bn_equity_battery;
 /// BX7b: the Binance Demo tools' shared client (`exec-smoke --binance…`) —
 /// the crate's own: the binary reaches it only through the two tools.
 pub(crate) mod bn_demo;

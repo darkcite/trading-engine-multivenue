@@ -868,6 +868,16 @@ fn check_binance(
                 b.account_mode
             ));
         }
+        // BX10 (ruling S-3): Binance Stocks is built and battery-tested,
+        // never armed by the engine — no member exists to trade it (O-BX16)
+        // until R17's ruling.
+        if product == exec_binance::inst::PRODUCT_EQUITY {
+            return Err(String::from(
+                "exec: [exec.binance] arms `equity` — Binance Stocks is the operator's battery only \
+                 (ruling S-3: `exec-smoke --binance equity` carries the D5 keys); no member trades it \
+                 (O-BX16) until R17's ruling. Refusing the boot.",
+            ));
+        }
     }
     // BX7: the E7 session bound is judged on ONE USD equity — USDⓈ-M's
     // margin balance on a classic account, the unified account's in PM and
@@ -1883,11 +1893,12 @@ mod tests {
         let p = write(&d, "bare.toml", &bn_live());
         let e = resolve(Some(&p), Some("3")).unwrap_err();
         assert!(e.contains("[exec.binance]"), "{e}");
-        // A product this gateway does not speak names its phase.
+        // BX10 (S-3): Binance Stocks is the battery's alone — the engine
+        // refuses it by its rulings.
         let equity = BN_SECTION.replace("products = [\"usdm\"]", "products = [\"equity\"]\nequity_session = \"RTH\"\nequity_tokenize = 0\nequity_quote = \"USDC\"");
         let p = write(&d, "unbuilt.toml", &format!("{}{equity}", bn_live()));
         let e = resolve(Some(&p), Some("3")).unwrap_err();
-        assert!(e.contains("BX10"), "equity: {e}");
+        assert!(e.contains("S-3") && e.contains("O-BX16") && e.contains("R17"), "equity: {e}");
         // BX9: options classic are built — alone, or beside the futures;
         // beside Portfolio Margin they wait on a ruling; eapi's weight is
         // judged on its own pool.

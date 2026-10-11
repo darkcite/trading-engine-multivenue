@@ -57,7 +57,8 @@
 //! listenKey or a WS API answer (`session.logon`'s echoes the key: SP2
 //! names its result's keys, never a value).
 //!
-//! COPY-DOCTRINE: an operator tool run by hand against Binance Demo, never
+//! COPY-DOCTRINE: an operator tool run by hand — against Binance Demo, and
+//! (BX10, ruling S-1) read-only against Binance Stocks on MAINNET — never
 //! reachable from the engine loop: it allocates and copies freely.
 
 use std::fmt::Write as _;
@@ -65,14 +66,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use core_types::Side;
-use exec_binance::config::{BnConfig, Signer};
+use exec_binance::config::{BnConfig, MainnetVerb, Scope, Signer};
 use exec_binance::inst::{BnInstHot, INST_LIVE, PRODUCT_COINM, PRODUCT_SPOT, PRODUCT_USDM};
 use exec_binance::json::{dec_1e6, field, str_of, u64_of, Elems, Pairs};
 use exec_binance::mode::{judge_mode, judge_one_way, judge_single_asset, judge_symbol_config, AccountMode};
 use exec_binance::rest::{
-    render_account, render_by_cid, render_place, scan_countdown, scan_listen_key, QueryWriter, R_CANCEL, R_PLACE,
-    R_STATUS, S_API_RESTRICTIONS, S_PORTFOLIO, T_CANCEL_ALL, T_COUNTDOWN, T_DUAL, T_LISTEN_KEY_NEW, T_MULTI_ASSETS,
-    T_SYMBOL_CONFIG,
+    render_account, render_by_cid, render_eq_detail_cid, render_eq_window, render_place, scan_countdown, scan_listen_key,
+    QueryWriter, EQ_DETAIL, EQ_HISTORY, EQ_INFO, EQ_LISTEN_KEY, EQ_OPEN, EQ_QUOTE, EQ_TOKENIZED, EQ_TRADES, EQ_USER_PATH,
+    EQ_USER_SUFFIX, R_CANCEL, R_PLACE, R_STATUS, S_API_RESTRICTIONS, S_PORTFOLIO, T_CANCEL_ALL, T_COUNTDOWN, T_DUAL,
+    T_LISTEN_KEY_NEW, T_MULTI_ASSETS, T_SYMBOL_CONFIG,
 };
 use exec_binance::userstream::{scan_user_event, UserEvent, S_CANCELED, S_EXPIRED, UE_ORDER};
 use exec_binance::wsapi::{queue_logon, queue_subscribe, scan_answer, Part, Place, WsAnswer, WsStatic};
@@ -1740,6 +1742,264 @@ fn sweep_symbol(rest: &mut Rest, signer: &Signer, symbol: &[u8], r: &mut Report)
         }
         Err(e) => r.left.push(format!("{s}: the end's second read failed ({e}) — read it by hand")),
     }
+}
+
+// -------------------------------------------------------------------------
+// Binance Stocks — BX10's read-only probe, on MAINNET (ruling S-1)
+// -------------------------------------------------------------------------
+
+/// The tickers whose rules and quote the probe reads (public market data).
+const EQ_TICKERS: [&str; 2] = ["AAPL", "SPY"];
+/// How long the probe watches the order stream (EQ7).
+const EQ_STREAM_WATCH: Duration = Duration::from_secs(60);
+/// The history windows' span (EQ4, EQ5): the last seven days.
+const EQ_WINDOW_MS: u64 = 7 * 86_400_000;
+/// A client id no order of the account's carries (EQ6): the shape of the
+/// venue's "no such order", which an in-doubt query must read.
+const EQ_UNKNOWN_CID: &str = "bxprobe0000000000000000000000000";
+
+/// **Run the Binance Stocks probe** (`exec-smoke --binance-probe equity`;
+/// the operator's ruling S-1, 2026-10-11): READ-ONLY on MAINNET with the
+/// live key — Binance Stocks has no Demo (K15, R21). Its client holds the
+/// read templates alone ([`Rest::equity_read`]: no order, cancel or
+/// disclaimer template exists in it), and on a mainnet host it sends a
+/// POST only with the operator's word: with `--bn-stream-confirm`, the
+/// listenKey (it changes nothing tradable) and a minute of the order
+/// stream; without it, the reads alone.
+///
+/// | probe | asks |
+/// |---|---|
+/// | EQ0 | the venue clock on the SAPI host |
+/// | EQ1 | `market/exchangeInfo` for AAPL and SPY: the rules' shape, by value |
+/// | EQ2 | `market/tokenized-assets`: how many, and the first rows |
+/// | EQ3 | `market/quote` for AAPL |
+/// | EQ4 | `order/open-orders`, signed by the live Ed25519 key (the HMAC pair if `.env` names no Ed25519 key, or the Ed25519 key is refused): the answer's shape |
+/// | EQ5 | `order/history` and `trade/history` over the last 7 days: the totals and the rows' shapes |
+/// | EQ6 | `order/detail` by a client id no order carries: the venue's "no such order" |
+/// | EQ7 | (`--bn-stream-confirm`) the listenKey and `{key}@orderReport` for a minute: frames and pings |
+///
+/// The account's own rows are reported by their keys and their values'
+/// JSON types, never their values; the market data by value. No line
+/// carries a key, a signature or the listenKey. 0, or [`EXIT_PROBE`] (a
+/// read could not run).
+pub fn run_equity(tls: Arc<ClientConfig>, confirm: bool) -> u8 {
+    let mut r = Report::default();
+    if let Err(e) = eq_probes(&tls, confirm, &mut r) {
+        error!("binance-probe: equity could not run — {e}");
+        r.failed.push(e);
+    }
+    let code = if r.failed.is_empty() { 0 } else { EXIT_PROBE };
+    probe("END", "-").n("exit", i64::from(code)).s("failed", &r.failed.join(" | ")).emit();
+    if code == 0 {
+        info!("binance-probe: equity — every read ran; nothing was placed");
+    } else {
+        error!(failed = ?r.failed, "binance-probe: equity FAILED");
+    }
+    code
+}
+
+/// EQ0–EQ7 in order.
+fn eq_probes(tls: &Arc<ClientConfig>, confirm: bool, r: &mut Report) -> Result<(), String> {
+    // The live Ed25519 key, else the live HMAC pair (whichever `.env` names).
+    let (cfg, signing) = match BnConfig::from_env(Scope::Live) {
+        Ok(c) => (c, "ed25519"),
+        Err(ed) => match BnConfig::from_env_hmac(Scope::Live) {
+            Ok(c) => (c, "hmac"),
+            Err(hm) => return Err(format!("no live key in .env: the Ed25519 pair {ed:?}, the HMAC pair {hm:?}")),
+        },
+    };
+    let signer = cfg.signer().map_err(|e| format!("the {signing} signer: {e:?}"))?;
+    let mut rest = Rest::equity_read(&cfg, tls.clone())?;
+    // EQ0 — the clock.
+    let (offset, rtt) = rest.clock()?;
+    probe("EQ0", "-").s("host", rest.host()).s("signing", signing).n("offset_ms", offset).n("rtt_ms", rtt as i64).emit();
+    // EQ1 — the rules, by value (public market data).
+    for t in EQ_TICKERS {
+        let a = rest.plain(EQ_INFO, format!("symbol={t}").as_bytes())?;
+        let first = field(&a.body, b"symbols").and_then(|(s0, _)| Elems::new(&a.body, s0).ok()?.next().ok()?);
+        probe("EQ1", "K15")
+            .s("symbol", t)
+            .n("http", i64::from(a.status))
+            .s("keys", &top_keys(&a.body))
+            .s("row_shape", &first.map_or_else(String::new, |(e0, _)| shape(&a.body, e0)))
+            .s("body", &snippet(&a.body))
+            .emit();
+        if a.status != 200 {
+            r.failed.push(format!("EQ1 {t}: {} {}", word(&a), snippet(&a.body)));
+        }
+    }
+    // EQ2 — the tokenized assets.
+    let a = rest.plain(EQ_TOKENIZED, b"")?;
+    let (n, first) = elems_of(&a.body);
+    probe("EQ2", "K15")
+        .n("http", i64::from(a.status))
+        .n("rows", n as i64)
+        .s("row_shape", &first.map_or_else(String::new, |e0| shape(&a.body, e0)))
+        .s("body", &snippet(&a.body))
+        .emit();
+    // EQ3 — a quote.
+    let a = rest.plain(EQ_QUOTE, b"symbol=AAPL")?;
+    probe("EQ3", "-").n("http", i64::from(a.status)).n("len", a.body.len() as i64).s("body", &snippet(&a.body)).emit();
+    // EQ4 — the open orders under the key; under the HMAC pair (R22's
+    // fallback) only if an Ed25519 key was refused.
+    let a = rest.signed(EQ_OPEN, &signer, false, render_account)?;
+    let ok = a.status == 200;
+    eq_rows("EQ4", signing, &a);
+    if !ok && signing == "hmac" {
+        r.failed.push(format!("EQ4: the open orders refused under the HMAC pair ({})", word(&a)));
+        return Ok(());
+    }
+    if !ok {
+        match BnConfig::from_env_hmac(Scope::Live) {
+            Ok(h) => {
+                let hs = h.signer().map_err(|e| format!("the HMAC signer: {e:?}"))?;
+                let mut hrest = Rest::equity_read(&h, tls.clone())?;
+                hrest.clock()?;
+                let a = hrest.signed(EQ_OPEN, &hs, false, render_account)?;
+                eq_rows("EQ4", "hmac", &a);
+                if a.status != 200 {
+                    r.failed.push(format!("EQ4: the open orders refused under either key ({})", word(&a)));
+                }
+            }
+            Err(e) => r.failed.push(format!("EQ4: Ed25519 refused ({}) and no live HMAC pair ({e:?})", word(&a))),
+        }
+        return Ok(());
+    }
+    // EQ5 — the histories.
+    let end = rest.ts_ms();
+    let start = end.saturating_sub(EQ_WINDOW_MS);
+    for (t, what) in [(EQ_HISTORY, "order/history"), (EQ_TRADES, "trade/history")] {
+        let a = rest.signed(t, &signer, false, |w, st, ts| render_eq_window(w, st, start, end, 1, ts))?;
+        let rows = field(&a.body, b"rows").and_then(|(r0, _)| Elems::new(&a.body, r0).ok()?.next().ok()?);
+        probe("EQ5", "K15")
+            .s("read", what)
+            .n("http", i64::from(a.status))
+            .n("code", i64::from(a.code()))
+            .s("keys", &top_keys(&a.body))
+            .s("total", &field(&a.body, b"total").map_or_else(String::new, |(a0, a1)| String::from_utf8_lossy(&a.body[a0..a1]).into_owned()))
+            .s("row_shape", &rows.map_or_else(String::new, |(e0, _)| shape(&a.body, e0)))
+            .emit();
+        if a.status != 200 {
+            r.failed.push(format!("EQ5 {what}: {} {}", word(&a), snippet(&a.body)));
+        }
+    }
+    // EQ6 — an order no one placed.
+    let a = rest.signed(EQ_DETAIL, &signer, false, |w, st, ts| render_eq_detail_cid(w, st, Part::Lit(EQ_UNKNOWN_CID.as_bytes()), ts))?;
+    probe("EQ6", "K15").n("http", i64::from(a.status)).n("code", i64::from(a.code())).s("body", &snippet(&a.body)).emit();
+    // EQ7 — the order stream, on the operator's word.
+    if !confirm {
+        probe("EQ7", "K15").s("stream", "not asked: the listenKey is a POST, sent on a mainnet host only with --bn-stream-confirm").emit();
+        return Ok(());
+    }
+    let verb = MainnetVerb::operator_verb(confirm).map_err(String::from)?;
+    let n = rest.sign_change(EQ_LISTEN_KEY, &signer, Some(&verb), render_account)?;
+    let a = rest.send(EQ_LISTEN_KEY, n)?;
+    let key = match scan_listen_key(&a.body) {
+        Ok(span) if a.status == 200 => String::from_utf8_lossy(span.get(&a.body)).into_owned(),
+        _ => {
+            probe("EQ7", "K15").s("listen_key", &format!("refused: {} {}", word(&a), snippet(&a.body))).emit();
+            r.failed.push(String::from("EQ7: the listenKey refused"));
+            return Ok(());
+        }
+    };
+    probe("EQ7", "K15").s("listen_key", "accepted").n("key_len", key.len() as i64).emit();
+    let host = cfg.hosts().eq_user.as_str();
+    let path = format!("{EQ_USER_PATH}{key}{EQ_USER_SUFFIX}");
+    let mut ws = match Ws::open_on(&cfg, host, &path, tls.clone(), WS_OPEN) {
+        Ok(ws) => ws,
+        Err(e) => {
+            probe("EQ7", "K15").s("open", &e.replace(key.as_str(), "<key>")).emit();
+            r.failed.push(String::from("EQ7: the order stream did not open"));
+            return Ok(());
+        }
+    };
+    let (mut frames, mut events, mut first) = (0u32, Vec::<String>::new(), String::new());
+    let until = Instant::now() + EQ_STREAM_WATCH;
+    let mut open = true;
+    while Instant::now() < until && !stopped() {
+        match ws.next(Duration::from_millis(200)) {
+            Ok(Some((_, f))) => {
+                frames += 1;
+                let name = field(&f, b"e").and_then(|(a0, a1)| str_of(&f, a0, a1).ok()).map_or_else(|| String::from("?"), |s| String::from_utf8_lossy(s).into_owned());
+                if !events.contains(&name) {
+                    events.push(name);
+                }
+                if first.is_empty() {
+                    first = shape(&f, 0);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!("binance-probe: the equity stream ended: {}", e.replace(key.as_str(), "<key>"));
+                open = false;
+                break;
+            }
+        }
+    }
+    probe("EQ7", "K15")
+        .s("host", host)
+        .b("open_at_end", open)
+        .n("frames", i64::from(frames))
+        .s("events", &events.join(","))
+        .s("first_shape", &first)
+        .emit();
+    Ok(())
+}
+
+/// EQ4's line: an array answer's length and its first row's shape.
+fn eq_rows(p: &str, signing: &str, a: &Answer) {
+    let (n, first) = elems_of(&a.body);
+    probe(p, "K15")
+        .s("signing", signing)
+        .n("http", i64::from(a.status))
+        .n("code", i64::from(a.code()))
+        .n("rows", n as i64)
+        .s("row_shape", &first.map_or_else(String::new, |e0| shape(&a.body, e0)))
+        .s("refusal", &if a.status == 200 { String::new() } else { snippet(&a.body) })
+        .emit();
+}
+
+/// A top-level array's element count and its first element's start.
+fn elems_of(b: &[u8]) -> (usize, Option<usize>) {
+    let Ok(mut e) = Elems::new(b, 0) else { return (0, None) };
+    let (mut n, mut first) = (0, None);
+    while let Ok(Some((e0, _))) = e.next() {
+        if first.is_none() {
+            first = Some(e0);
+        }
+        n += 1;
+    }
+    (n, first)
+}
+
+/// A top-level object's keys, comma-separated (an array's: `[array]`).
+fn top_keys(b: &[u8]) -> String {
+    let at = b.iter().position(|c| !c.is_ascii_whitespace()).unwrap_or(0);
+    if b.get(at) == Some(&b'[') {
+        return String::from("[array]");
+    }
+    result_keys(b.get(at..).unwrap_or_default())
+}
+
+/// **An object's shape** — each key with its value's JSON type (`str`,
+/// `num`, `bool`, `null`, `arr`, `obj`), never the value: the account's own
+/// rows are reported so.
+fn shape(b: &[u8], at: usize) -> String {
+    let mut out = Vec::new();
+    if let Ok(mut p) = Pairs::new(b, at) {
+        while let Ok(Some((k, v0, _))) = p.next() {
+            let ty = match b.get(v0) {
+                Some(b'"') => "str",
+                Some(b'n') => "null",
+                Some(b't' | b'f') => "bool",
+                Some(b'[') => "arr",
+                Some(b'{') => "obj",
+                _ => "num",
+            };
+            out.push(format!("{}:{ty}", String::from_utf8_lossy(k)));
+        }
+    }
+    out.join(",")
 }
 
 #[cfg(test)]

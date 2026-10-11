@@ -200,6 +200,12 @@ pub struct Hosts {
     /// `fstream.binance.com` — on Demo the testnet's `fstream.binancefuture.com`
     /// (the K-probe: Demo's `demo-fstream` opens and carries nothing).
     pub opt_user: String,
+    /// BX10 — Binance Stocks' order-stream host (`/equity/ws/<listenKey>@orderReport`,
+    /// the probe's EQ7): `nbstream.binance.com`. Its REST is the SAPI host's
+    /// (`/sapi/v1/equity/…`). Binance Stocks has no Demo (K15, R21): Demo's
+    /// entry names the Demo SAPI host only to stay on the scope's network —
+    /// the gateway refuses an equity row on Demo, so it is never dialled.
+    pub eq_user: String,
 }
 
 /// One futures product's hosts: a gateway lane's (BX7, M3).
@@ -237,6 +243,7 @@ impl Hosts {
                 spot_wsapi_path: s("/ws-api/v3"),
                 eapi: s("eapi.binance.com"),
                 opt_user: s("fstream.binance.com"),
+                eq_user: s("nbstream.binance.com"),
             },
             Scope::Demo => Self {
                 fut_wsapi: s("testnet.binancefuture.com"),
@@ -260,6 +267,8 @@ impl Hosts {
                 // general-info page names it; the order pages name this one.
                 eapi: s("testnet.binancefuture.com"),
                 opt_user: s("fstream.binancefuture.com"),
+                // BX10: no Stocks Demo exists (K15) — never dialled.
+                eq_user: s("demo-api.binance.com"),
             },
         }
     }
@@ -273,7 +282,17 @@ impl Hosts {
     /// options' user data (BX9); otherwise fapi).
     #[must_use]
     pub fn lane(&self, product: u8) -> LaneHosts<'_> {
-        if product == crate::inst::PRODUCT_OPTIONS {
+        if product == crate::inst::PRODUCT_EQUITY {
+            // BX10: Binance Stocks — REST on SAPI (no WS API: the pair names
+            // the REST host and is never dialled) and the order stream on
+            // its own host.
+            LaneHosts {
+                wsapi: &self.sapi,
+                wsapi_path: "/ws",
+                user: &self.eq_user,
+                rest: &self.sapi,
+            }
+        } else if product == crate::inst::PRODUCT_OPTIONS {
             LaneHosts {
                 wsapi: &self.eapi,
                 wsapi_path: "/ws",
@@ -317,7 +336,7 @@ impl Hosts {
         }
     }
 
-    fn all(&self) -> [&str; 11] {
+    fn all(&self) -> [&str; 12] {
         [
             &self.fut_wsapi,
             &self.fut_user,
@@ -330,6 +349,7 @@ impl Hosts {
             &self.spot_wsapi,
             &self.eapi,
             &self.opt_user,
+            &self.eq_user,
         ]
     }
 }
@@ -767,6 +787,7 @@ impl BnConfig {
             spot_wsapi_path: l("/ws-api/v3"),
             eapi: l("localhost"),
             opt_user: l("localhost"),
+            eq_user: l("localhost"),
         };
         if port == HTTPS_PORT {
             return Err(ConfigErr::LoopbackOnRealHost);
@@ -900,6 +921,13 @@ mod tests {
         // fstream's `/private/ws/` stream; Demo's eapi is the testnet host.
         let op = h.lane(crate::inst::PRODUCT_OPTIONS);
         assert_eq!((op.wsapi, op.user, op.rest), ("eapi.binance.com", "fstream.binance.com", "eapi.binance.com"));
+        // BX10: Binance Stocks — SAPI's REST host, nbstream's order stream
+        // (K15: the probe opened `/equity/ws/<key>@orderReport` there).
+        let eq = h.lane(crate::inst::PRODUCT_EQUITY);
+        assert_eq!((eq.rest, eq.user), ("api.binance.com", "nbstream.binance.com"));
+        let mut mixed = Hosts::of(Scope::Live);
+        mixed.eq_user = String::from("demo-api.binance.com");
+        assert!(matches!(BnConfig::new(Scope::Live, mixed, KEY.into(), seed()), Err(ConfigErr::WrongNetwork)), "the equity stream's host is checked too");
         let d = Hosts::of(Scope::Demo);
         let dop = d.lane(crate::inst::PRODUCT_OPTIONS);
         assert_eq!((dop.user, dop.rest), ("fstream.binancefuture.com", "testnet.binancefuture.com"));

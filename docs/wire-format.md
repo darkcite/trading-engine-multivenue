@@ -637,7 +637,7 @@ carries the stream and then sends nothing.
   row). Instrument names and syms resolve through
   `options-manifest.tsv` / `instrument-manifest.tsv` as before.
 
-### The Binance execution journal — `binance-exec.pmlr` (BX6; refreshed at BX11, 2026-10-09)
+### The Binance execution journal — `binance-exec.pmlr` (BX6; refreshed at BX11, 2026-10-09; Binance Stocks at BX10, 2026-10-11)
 
 PMLR `slot_kind = 8` (`SlotKind::Exec`), one per run in the run directory,
 written by the arm's cold `bn-journal` thread from an SPSC ring (the
@@ -653,7 +653,7 @@ gateway offers again until the ring takes it (S8). A 64 B header, then
 | 0 | `ts_ns` | u64 | monotonic ns of the observation |
 | 8 | `wall_ms` | u64 | wall ms on the gateway's venue clock |
 | 16 | `client_oid` | u64 | the member's order id (0 if none) |
-| 24 | `venue_oid` | u64 | the venue's order id (0 if none) |
+| 24 | `venue_oid` | u64 | the venue's order id (0 if none); a Binance Stocks order's (BX10) is its UUID's key — `exec_binance::equity::eq_key`, FNV-1a over the case-folded 36 bytes, never 0 (the UUID is not a number) |
 | 32 | `a` | i64 | by kind |
 | 40 | `b` | i64 | by kind |
 | 48 | `c` | i64 | by kind |
@@ -664,16 +664,17 @@ gateway offers again until the ring takes it (S8). A 64 B header, then
 
 | kind | name | `a` | `b` | `c` | `code` |
 |---|---|---|---|---|---|
-| 1 | ACK | 0 | 0 | 0 | 0 (`venue_oid` set) |
-| 2 | REJECT | filled ×1e6 (0 when refused locally) | quantity ×1e6 (likewise) | 0 | the venue's code (negative), or the gateway's own: 9 001 table full · 9 002 duplicate id · 9 003 not ready · 9 004 render · 9 005 request ids full · 9 006 unknown order · 9 007 modify busy · 9 008 quiet · 9 009 deadline queue full · 9 014 swept unsent (BX7: a REST-route place or modify still held when a sweep began) |
+| 1 | ACK | 0 | 0 | 0 | 0 (`venue_oid` set; on Binance Stocks the venue's receipt, `status:"S"`) |
+| 2 | REJECT | filled ×1e6 (0 when refused locally) | quantity ×1e6 (likewise) | 0 | the venue's code (negative), or the gateway's own: 9 001 table full · 9 002 duplicate id · 9 003 not ready · 9 004 render · 9 005 request ids full · 9 006 unknown order · 9 007 modify busy · 9 008 quiet · 9 009 deadline queue full · 9 014 swept unsent (BX7: a REST-route place or modify still held when a sweep began) · 9 018 Binance Stocks refused a place without a code (`status:"F"`), or its detail read `REJECTED` (BX10; moves the reject streak) · 9 019 an equity place with no TTL (BX10; refused before rendering); Binance Stocks' own codes are six-digit positives (`486…`) |
 | 3 | FILL | price ×1e6 | quantity ×1e6, signed by side | **0 since BX11** (the trade's commission is its FEE; BX6–BX7b journals carry the update's commission ×1e6 here when the update booked first, else 0) | bits: 1 maker · 2 LOST (never reached lane 4; nothing booked) · 4 UNSEEN (booked without its trade: from a status answer or a cumulative `z`, at the implied average — no commission or maker flag; exclude from fee and markout work) · 8 ADOPTED (BX7: the venue's position adopted at boot as the owner slot's inventory — no trade; BX-14 excludes it) |
 | 4 | ENDED | filled ×1e6 | quantity ×1e6 | 0 | the `RETIRED_*` reason |
 | 5 | RECON | drift USD ×1e6 | unseen legs | foreign orders | 1 if reconciled |
 | 6 | MARGIN | ratio ×1e6 (the product's) | the session equity USD ×1e6 (USDⓈ-M's on a classic account, the unified account's in PM and PM Pro) | 1 on a margin call | the product (`PRODUCT_*`, BX7; 0 before) |
-| 7 | VENUE | 0 | 0 | 0 | the budget or lock code: the venue's (negative), or 9 010 PM risk level · 9 011 PM account status · 9 012 account reconfigured (`ACCOUNT_CONFIG_UPDATE`) · 9 013 an owned row not cross-margined (BX7) |
+| 7 | VENUE | 0 | 0 | 0 | the budget or lock code: the venue's (negative; or Binance Stocks' positive `486410`, the US-equity disclaimer unsigned, BX10), or 9 010 PM risk level · 9 011 PM account status · 9 012 account reconfigured (`ACCOUNT_CONFIG_UPDATE`) · 9 013 an owned row not cross-margined (BX7) |
 | 8 | SWEEP | orders left | cancels sent | 0 | 0 |
 | 9 | ANCHOR | the E7 session anchor, equity USD ×1e6 | 0 | 0 | 0 |
-| 10 | **FEE** (BX11) | the trade's price ×1e6 | its notional ×1e9 in the row's settlement asset (USDⓈ-M: price × quantity, the quote; COIN-M: contracts × face ÷ price, the coin) | the commission ×1e9 in its own asset (`n`; negative for a rebate) | bit 0 the maker · bits 1–2 the asset to the row (0 none named · 1 the row's settlement asset · 2 BNB · 3 another) · bits 4–6 whose order (0 the member's · 1 an earlier boot's · 2 settlement · 3 liquidation · 4 ADL) · bits 8–11 the product (`PRODUCT_*`) · bit 12 a dated row · bit 13 a TradFi row (`exec_binance::journal::fee_fields` reads them back) |
+| 10 | **FEE** (BX11) | the trade's price ×1e6 | its notional ×1e9 in the row's settlement asset (USDⓈ-M: price × quantity, the quote; COIN-M: contracts × face ÷ price, the coin) | the commission ×1e9 in its own asset (`n`; negative for a rebate) | bit 0 the maker · bits 1–2 the asset to the row (0 none named · 1 the row's settlement asset · 2 BNB · 3 another) · bits 4–6 whose order (0 the member's · 1 an earlier boot's · 2 settlement · 3 liquidation · 4 ADL) · bits 8–11 the product (`PRODUCT_*`) · bit 12 a dated row · bit 13 a TradFi row · bit 14 a Binance Stocks fee at the $0.35 per-order floor (BX10: the order's notional under $350 — no rate) (`exec_binance::journal::fee_fields` reads them back) |
+| 11 | **ACCEPTED** (BX10) | 0 | 0 | 0 | 0 — the broker accepted a Binance Stocks order (its `ACCEPTED`, after the venue's receipt, the ACK); `venue_oid` the UUID's key; once per order |
 
 A FILL's and a FEE's `client_oid` is the member's id, or 0 for a
 liquidation, ADL, settlement or older-epoch trade; a FEE's `venue_oid` is
@@ -684,6 +685,17 @@ first update that reports the trade, whichever report booked it — never
 twice for a replayed update. A trade the stream lost has no FEE (its fill
 is UNSEEN); a fee measurement (BX-14) reads FEE records alone: the rate is
 `c / b` where the asset is the row's settlement asset.
+
+**Binance Stocks (BX10)** has no per-trade commission: the order's detail
+carries a cumulative `fee` in USD. A FEE is journaled each time a detail
+raises it: `a` the order's average price ×1e6 (the row's last fill price
+when the detail names none), `b` the increase of the
+order's filled notional ×1e9 (USD), `c` the fee's increase ×1e9 (USD), the
+asset bits the row's settlement asset (USD); bit 14 while the order's
+notional is under $350 (the $0.35 minimum, no rate — `bn-fees` counts it
+apart). An equity FILL comes from the detail's executions (each once);
+the remainder its cumulative names past them is UNSEEN (bit 4), at the
+implied price.
 
 An ANCHOR record is also persisted by the writer to
 `binance-pnl-anchor.state` beside `exec.toml`: one line

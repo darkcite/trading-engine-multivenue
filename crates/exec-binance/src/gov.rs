@@ -174,6 +174,36 @@ impl OptionOrders {
     }
 }
 
+/// **Binance Stocks' ORDERS pool** (BX10): 200 places a minute per UID
+/// (the trade page; `order/cancel` and the reads are IP weight, 1 each).
+pub struct EquityOrders {
+    /// The 1-minute window.
+    pub w1m: Window,
+}
+
+impl EquityOrders {
+    /// The pool at `frac_1e6` of the venue's limit.
+    #[must_use]
+    pub fn new(frac_1e6: i64) -> Self {
+        Self {
+            w1m: Window::new(200, 60_000, frac_1e6),
+        }
+    }
+
+    /// The window admits.
+    #[inline(always)]
+    #[must_use]
+    pub fn admits(&self, now_ns: u64) -> bool {
+        self.w1m.admits(now_ns)
+    }
+
+    /// Record one placement.
+    #[inline(always)]
+    pub fn commit(&mut self, now_ns: u64) {
+        self.w1m.commit(now_ns);
+    }
+}
+
 /// A UTC day, ms.
 pub const DAY_MS: u64 = 86_400_000;
 
@@ -552,6 +582,37 @@ pub enum CodeClass {
     WriteFatal = 7,
 }
 
+/// BX10 — Binance Stocks: the ticker is not tradable.
+pub const EQ_NOT_TRADABLE: i32 = 486_207;
+/// The US-equity disclaimer is unsigned (`486410`): no Stocks order is
+/// taken until the operator signs it in the app — a `VenueLock`, raised
+/// once (the gateway never signs it, R21).
+pub const EQ_DISCLAIMER: i32 = 486_410;
+/// `order/detail` names no such order (`486218`, the probe's EQ6): the
+/// in-doubt query's "no such order" — final only after `recvWindow` + 5 s
+/// (BX-11, as `-2013`).
+pub const EQ_NOT_FOUND: i32 = 486_218;
+/// A duplicate `clientOrderId` (`486449`): an order under the id EXISTS —
+/// the place is in doubt, never re-sent (BX-11).
+pub const EQ_DUPLICATE_ID: i32 = 486_449;
+
+/// **A code is the venue's** — futures', spot's and options' are negative,
+/// Binance Stocks' (BX10) six-digit positives (`486…`), and
+/// [`CODE_EQ_REFUSED`] (the venue's code-less refusal of an equity order);
+/// the gateway's other local codes (`9 0xx`, positive) are not: only the
+/// venue's move the arm's reject streak.
+#[inline(always)]
+#[must_use]
+pub const fn is_venue_code(code: i32) -> bool {
+    code < 0 || code >= 100_000 || code == CODE_EQ_REFUSED
+}
+
+/// BX10: the venue refused an equity place without a code (its answer's
+/// `status: "F"`), or a detail named the order `REJECTED` — the venue's
+/// refusal, which moves the reject streak as a coded one does (the risk
+/// review's item 4).
+pub const CODE_EQ_REFUSED: i32 = 9_018;
+
 /// Classify a refusal by its Binance `code` (0 if none) and HTTP status
 /// (0 on a WS API answer without one). A 418 is a lock whatever its code
 /// says (the venue sends a ban as `-1003`, the budget's code).
@@ -564,7 +625,9 @@ pub const fn classify(code: i32, http: u16) -> CodeClass {
         -1015 | -1003 => CodeClass::Budget,
         -4402..=-4400 => CodeClass::Lock,
         -1021 | -5028 => CodeClass::Clock,
-        -1007 => CodeClass::Unknown,
+        // BX10: `-1006` (an unexpected bus response, its execution status
+        // unknown — Binance Stocks' error page names it beside `-1007`).
+        -1007 | -1006 => CodeClass::Unknown,
         -5022 => CodeClass::WouldTake,
         -4411 => CodeClass::RowFatal,
         // BX9 — options: not eligible to write (the probes' and the docs'
@@ -573,6 +636,10 @@ pub const fn classify(code: i32, http: u16) -> CodeClass {
         // `reduceOnly` / `canTrade`, `RISK_LEVEL_CHANGE` (a lock) — and any
         // other refusal is an ordinary one (the risk review's R10).
         -6057 => CodeClass::WriteFatal,
+        // BX10 — Binance Stocks (its error page): the ticker is not
+        // tradable (`486207`, `486426`–`486428`) or unknown (`-26004`) —
+        // closed to us this boot.
+        EQ_NOT_TRADABLE | 486_426..=486_428 | -26_004 => CodeClass::RowFatal,
         _ => match http {
             418 => CodeClass::Lock,
             429 => CodeClass::Budget,
@@ -754,6 +821,32 @@ mod tests {
         assert_eq!(classify(-2027, 400), CodeClass::Reject, "margin insufficient: an ordinary refusal");
         assert_eq!(classify(-6052, 400), CodeClass::Reject, "a short past the symbol's maximum");
         assert_eq!(classify(-6005, 400), CodeClass::Reject);
+        // BX10 — Binance Stocks.
+        assert_eq!(classify(-1006, 400), CodeClass::Unknown);
+        for c in [EQ_NOT_TRADABLE, 486_426, 486_427, 486_428, -26_004] {
+            assert_eq!(classify(c, 400), CodeClass::RowFatal, "{c}");
+        }
+        for c in [EQ_DISCLAIMER, EQ_NOT_FOUND, EQ_DUPLICATE_ID, 486_405, 486_437, 486_402, 486_407] {
+            assert_eq!(classify(c, 400), CodeClass::Reject, "{c}: the gateway's own law, or an ordinary refusal");
+        }
+        assert!(is_venue_code(-2010) && is_venue_code(EQ_DISCLAIMER) && !is_venue_code(9_012) && !is_venue_code(0));
+        assert!(is_venue_code(CODE_EQ_REFUSED) && !is_venue_code(9_019), "the venue's code-less equity refusal moves the streak; the TTL's local refusal does not");
+    }
+
+    /// BX10: Stocks' pool — 200 a minute at `frac`. Break-and-watch: a
+    /// 10-second window of 200 lets the 161st through.
+    #[test]
+    fn the_equity_pool_is_two_hundred_a_minute() {
+        let mut p = EquityOrders::new(800_000);
+        assert_eq!(p.w1m.cap(), 160);
+        let mut t = S;
+        for _ in 0..160 {
+            assert!(p.admits(t));
+            p.commit(t);
+            t += 1;
+        }
+        assert!(!p.admits(t + 30 * S), "160 a minute at 80 %");
+        assert!(p.admits(S + 60 * S), "the window slides");
     }
 
     /// BX9: options' pool — 30 / 10 s and 100 / min at `frac`; the minute

@@ -483,6 +483,7 @@ impl<const J: usize> Rig<J> {
             anchor_unsaved: None,
             max_leverage: 20,
             adopt_cap_usd_1e6: o.adopt_cap_usd_1e6,
+            equity: None,
         };
         let mut gw = match BnGateway::<FILL_N, J>::new(&cfg, venue.client_cfg.clone(), knobs, wire, gw_end, fill_tx, JournalTx::new(j_tx)) {
             Ok(gw) => gw,
@@ -521,6 +522,7 @@ impl<const J: usize> Rig<J> {
                 anchor: core_time::WallAnchor::now(),
                 mode: o.mode,
                 demo: false,
+                equity_ttl_ns: 0,
             },
         );
         let mut route = ExecRoute::all_paper();
@@ -2396,6 +2398,7 @@ fn the_rest_route_trades_with_an_hmac_key() {
             anchor_unsaved: None,
             max_leverage: 20,
             adopt_cap_usd_1e6: 0,
+            equity: None,
         };
         let r = BnGateway::<FILL_N>::new(&cfg, venue.client_cfg.clone(), knobs, wire, gw_end, fill_tx, JournalTx::new(j_tx));
         assert!(matches!(r, Err(exec_binance::gateway::BootErr::Signing)));

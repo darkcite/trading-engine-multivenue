@@ -494,6 +494,13 @@ doc    = false
 bench  = false
 
 [[bin]]
+name   = "bn_equity"
+path   = "fuzz_targets/bn_equity.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
 name   = "hypercall_ws_frame"
 path   = "fuzz_targets/hypercall_ws_frame.rs"
 test   = false

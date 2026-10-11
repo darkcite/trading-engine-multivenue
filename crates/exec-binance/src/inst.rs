@@ -205,7 +205,11 @@ pub struct BnInstCold {
     pub max_qty_1e6: i64,
     /// `MAX_NUM_ORDERS`; 0 = none.
     pub max_orders: u32,
-    _r: u32,
+    /// BX10 — an equity row's sides the venue takes (`tradability`:
+    /// `crate::equity::EQ_SIDE_*`); 0 on every other product's row (not
+    /// read there).
+    pub eq_sides: u8,
+    _r: [u8; 3],
 }
 
 const _: () = assert!(core::mem::size_of::<BnInstCold>() == 32);
@@ -219,7 +223,8 @@ impl BnInstCold {
         ask_down_1e6: 0,
         max_qty_1e6: 0,
         max_orders: 0,
-        _r: 0,
+        eq_sides: 0,
+        _r: [0; 3],
     };
 }
 
@@ -365,6 +370,26 @@ impl OptWire {
     };
 }
 
+/// **An equity row's cold facts** (BX10): the tokenized asset its fills
+/// settle as when `tokenize` is on (the bStock, `TSLAB` for `TSLA`, from
+/// `market/tokenized-assets`; empty when unknown). With spot armed, an
+/// armed spot row's base may not be it (the gateway refuses the boot,
+/// [`crate::gateway::BootErr::EqToken`]). `EMPTY` on every other row.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EqWire {
+    /// The bStock's asset code (`assetCode`).
+    pub bstock: AssetName,
+}
+
+impl EqWire {
+    /// Not an equity row.
+    pub const EMPTY: Self = Self { bstock: AssetName::EMPTY };
+}
+
+/// BX10 — an equity row's price grid: the venue takes at most two decimals
+/// (its rules name no tick), so 0.01 ×1e6.
+pub const EQ_TICK_1E6: u32 = 10_000;
+
 /// Why the boot refused to bind a row. Each refuses the boot.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BindErr {
@@ -385,6 +410,9 @@ pub enum BindErr {
     /// ×1e6 range, or an underlying past [`OPT_ULY_MAX`] — it could not be
     /// margined, settled or written safely.
     BadOption,
+    /// BX10: an equity row with no minimum notional (the arm could not
+    /// bound an order's size), or a bStock name no [`AssetName`] holds.
+    BadEquity,
 }
 
 /// One row to bind, as the boot hands it over.
@@ -417,6 +445,20 @@ pub struct OptBindSpec<'a> {
     pub writable: bool,
 }
 
+/// **BX10 — one equity row to bind**, as the battery hands it over (the
+/// engine binds none: ruling S-3 — no equity market data, R17).
+#[derive(Copy, Clone, Debug)]
+pub struct EqBindSpec<'a> {
+    /// The engine id (an equities ordinal, 4096 + k).
+    pub sym: SymbolId,
+    /// The ticker's rules (`market/exchangeInfo`).
+    pub row: &'a crate::equity::EqSymbolRow,
+    /// On the owned list (a dedicated account owns everything).
+    pub owned: bool,
+    /// The bStock its fills settle as with `tokenize` on (empty: unknown).
+    pub bstock: &'a [u8],
+}
+
 /// The arm's two tables and the lookup (module docs).
 pub struct InstTable {
     hot: Box<[BnInstHot; INST_MAX]>,
@@ -439,6 +481,8 @@ pub struct WireTable {
     ix: Box<[u16; SYM_IX]>,
     spot: Box<[SpotWire; INST_MAX]>,
     opt: Box<[OptWire; INST_MAX]>,
+    /// BX10: the equity rows' cold facts.
+    eq: Box<[EqWire; INST_MAX]>,
     /// BX9: the underlyings the option rows name, by index
     /// ([`BnInstHot::uly`], [`OptWire::uly`]) — the gateway asks their index
     /// by name (`/eapi/v1/index`). Boxed as the other columns: the table
@@ -484,6 +528,14 @@ impl WireTable {
     #[must_use]
     pub fn opt(&self, row: u16) -> &OptWire {
         &self.opt[rx(row)]
+    }
+
+    /// An equity row's cold facts ([`EqWire::EMPTY`] on any other row;
+    /// BX10).
+    #[inline(always)]
+    #[must_use]
+    pub fn eq(&self, row: u16) -> &EqWire {
+        &self.eq[rx(row)]
     }
 
     /// The underlying of index `uly` (BX9; empty for none): cold — the
@@ -609,6 +661,7 @@ impl InstTable {
                 ix: Box::new([ROW_NONE; SYM_IX]),
                 spot: exec_gateway::boxed_array(SpotWire::EMPTY),
                 opt: exec_gateway::boxed_array(OptWire::EMPTY),
+                eq: exec_gateway::boxed_array(EqWire::EMPTY),
                 ulys: exec_gateway::boxed_array(AssetName::EMPTY),
                 n_uly: 0,
             },
@@ -715,7 +768,8 @@ impl InstTable {
                 0
             },
             max_orders: f.max_num_orders,
-            _r: 0,
+            eq_sides: 0,
+            _r: [0; 3],
         };
         self.n += 1;
         let mut w = BnInstWire {
@@ -843,6 +897,112 @@ impl InstTable {
             call: r.is_call,
             _r: [0; 6],
         };
+        wire.n += 1;
+        wire.index(row_ix);
+        self.flat[ord] = row_ix;
+        Ok(row_ix)
+    }
+
+    /// **BX10 — bind one equity row** (boot; the battery's): Binance
+    /// Stocks' LIMIT DAY orders under the gateway's mandatory TTL — no
+    /// maker (no venue dead-man: [`INST_NO_DEADMAN`]), the price on the
+    /// 0.01 grid ([`EQ_TICK_1E6`]), the quantity on the venue's step where
+    /// the ×1e6 grid holds it — a billionth step trades on a millionth
+    /// (every millionth is a whole number of billionths), a non-fractional
+    /// ticker in whole shares — its minimum notional and maximum quantity,
+    /// the sides the venue takes ([`BnInstCold::eq_sides`]). Live when the
+    /// venue takes either side, the step fits the grid and the row is
+    /// owned. Class `Spot`: a cash holding, long-only (the ledger's spot
+    /// law). Returns the row index.
+    pub fn bind_equity(&mut self, wire: &mut WireTable, spec: &EqBindSpec<'_>) -> Result<u16, BindErr> {
+        if self.n >= INST_MAX {
+            return Err(BindErr::TooMany);
+        }
+        let r = spec.row;
+        let symbol = r.symbol();
+        if symbol.is_empty() || symbol.len() > WIRE_SYMBOL_MAX {
+            return Err(BindErr::BadSymbol);
+        }
+        let ord = symbol_ordinal(spec.sym) as usize;
+        if spec.sym == self.alias_sym || symbol_venue_byte(spec.sym) != VenueId::Binance as u8 || ord >= FLAT_MAP_LEN {
+            return Err(BindErr::BadSym);
+        }
+        if self.flat[ord] != ROW_NONE || wire.find(PRODUCT_EQUITY, symbol) != ROW_NONE {
+            return Err(BindErr::Duplicate);
+        }
+        if r.min_notional_1e9 <= 0 {
+            return Err(BindErr::BadEquity);
+        }
+        let bstock = if spec.bstock.is_empty() {
+            AssetName::EMPTY
+        } else {
+            AssetName::of(spec.bstock).ok_or(BindErr::BadEquity)?
+        };
+        // The venue's step on the ×1e6 grid: a whole share if the ticker
+        // trades no fractions; a step finer than a millionth that divides
+        // one trades on the millionth.
+        let venue_step = if r.fractionable { r.step_1e9 } else { r.step_1e9.max(1_000_000_000) };
+        let step = if venue_step >= 1_000 { exact_1e6(venue_step) } else if 1_000 % venue_step == 0 { Some(1) } else { None };
+        let step_1e6 = step.unwrap_or(1);
+        let sides = r.tradability & (crate::equity::EQ_SIDE_BUY | crate::equity::EQ_SIDE_SELL);
+        let live = step.is_some() && sides != 0 && spec.owned;
+        let row_ix = self.n as u16;
+        let mut flags = INST_NO_DEADMAN;
+        flags |= (live as u8) * INST_LIVE;
+        flags |= (spec.owned as u8) * INST_OWNED;
+        let tm = Magic::new(EQ_TICK_1E6);
+        let sm = Magic::new(step_1e6);
+        self.hot[rx(row_ix)] = BnInstHot {
+            sym: spec.sym,
+            tick_1e6: EQ_TICK_1E6,
+            step_1e6,
+            product: PRODUCT_EQUITY,
+            class: InstrumentClass::Spot as u8,
+            flags,
+            uly: ULY_NONE,
+            tick_m: tm.m(),
+            step_m: sm.m(),
+            min_qty_1e6: ceil_1e6(r.min_qty_1e9),
+            min_notional_1e6: ceil_1e6(r.min_notional_1e9),
+            unit_1e6: 1_000_000,
+            px_dec: decimals_of(EQ_TICK_1E6),
+            qty_dec: decimals_of(step_1e6),
+            tick_sh: tm.sh(),
+            step_sh: sm.sh(),
+            _r1: [0; 4],
+        };
+        // No mark exists for an equity (R17: no equity market data), so the
+        // band is never applied; the venue's multipliers are kept for the
+        // report.
+        self.cold[rx(row_ix)] = BnInstCold {
+            bid_up_1e6: band_1e6(r.up_1e9, true),
+            bid_down_1e6: band_1e6(r.down_1e9, false),
+            ask_up_1e6: band_1e6(r.up_1e9, true),
+            ask_down_1e6: band_1e6(r.down_1e9, false),
+            max_qty_1e6: if r.max_qty_1e9 > 0 { r.max_qty_1e9 / 1_000 } else { 0 },
+            max_orders: r.max_orders,
+            eq_sides: sides,
+            _r: [0; 3],
+        };
+        self.n += 1;
+        let mut w = BnInstWire {
+            symbol: [0; WIRE_SYMBOL_MAX],
+            len: symbol.len() as u8,
+            product: PRODUCT_EQUITY,
+            flags,
+            _r: 0,
+            sym: spec.sym,
+            unit_1e6: 1_000_000,
+            px_dec: decimals_of(EQ_TICK_1E6),
+            qty_dec: decimals_of(step_1e6),
+            _r1: [0; 14],
+        };
+        // COPY: the ticker (≤ 16 B) into the gateway's table — boot only,
+        // once per row (as `bind`'s) — rejected: borrowing the discovery
+        // row, dropped after boot.
+        w.symbol[..symbol.len()].copy_from_slice(symbol);
+        wire.rows[rx(row_ix)] = w;
+        wire.eq[rx(row_ix)] = EqWire { bstock };
         wire.n += 1;
         wire.index(row_ix);
         self.flat[ord] = row_ix;
@@ -1043,6 +1203,45 @@ pub(crate) mod tests {
         assert_eq!(AssetName::of(b""), None);
         assert_eq!(AssetName::of(b"ABCDEFGHIJKLMNOPQ"), None, "past BN_ASSET_MAX");
         assert_eq!(AssetName::of(b"1000SATS").map(|a| a.get().len()), Some(8));
+    }
+
+    /// BX10: an equity row — the cent, the step on the ×1e6 grid (a whole
+    /// share when the ticker trades no fractions), the minimum notional,
+    /// its sides, no dead-man; and its refusals.
+    #[test]
+    fn an_equity_row_binds_on_the_cent_and_its_step() {
+        let rules = |frac: bool, step: &str, trad: &str, minn: &str| {
+            let b = format!(r#"{{"symbols":[{{"symbol":"AAPL","tradability":"{trad}","fractionable":{frac},"stepSize":"{step}","minNotional":"{minn}"}}]}}"#);
+            crate::equity::scan_eq_symbol(b.as_bytes(), b"AAPL").expect("the rules")
+        };
+        let (mut t, mut w) = InstTable::new(7);
+        let sym = |k: u32| make_symbol_id(VenueId::Binance, 4_096 + k);
+        let r = rules(true, "0.000000001", "BUY_SELL", "5");
+        let ix = t.bind_equity(&mut w, &EqBindSpec { sym: sym(1), row: &r, owned: true, bstock: b"AAPLB" }).unwrap();
+        let h = *t.hot(ix);
+        assert!(h.has(INST_LIVE) && h.has(INST_NO_DEADMAN) && h.has(INST_OWNED));
+        assert_eq!((h.product, h.tick_1e6, h.step_1e6, h.min_notional_1e6, h.px_dec), (PRODUCT_EQUITY, 10_000, 1, 5_000_000, 2));
+        assert_eq!(t.cold(ix).eq_sides, crate::equity::EQ_SIDE_BUY | crate::equity::EQ_SIDE_SELL);
+        assert_eq!(w.eq(ix).bstock.get(), b"AAPLB");
+        assert_eq!(w.find(PRODUCT_EQUITY, b"AAPL"), ix);
+        // Whole shares; one side; none (not live).
+        let mut t2 = InstTable::new(7).0;
+        let mut w2 = InstTable::new(7).1;
+        let whole = rules(false, "0.000000001", "SELL", "5");
+        let ix = t2.bind_equity(&mut w2, &EqBindSpec { sym: sym(2), row: &whole, owned: true, bstock: b"" }).unwrap();
+        assert_eq!((t2.hot(ix).step_1e6, t2.cold(ix).eq_sides), (1_000_000, crate::equity::EQ_SIDE_SELL));
+        let none = rules(true, "0.000000001", "NONE", "5");
+        let (mut t3, mut w3) = InstTable::new(7);
+        let ix = t3.bind_equity(&mut w3, &EqBindSpec { sym: sym(3), row: &none, owned: true, bstock: b"" }).unwrap();
+        assert!(!t3.hot(ix).has(INST_LIVE), "a ticker closed both ways binds, not live");
+        // Refusals: no minimum notional, a bad bStock name, the same ticker
+        // twice, another venue's id.
+        let (mut t4, mut w4) = InstTable::new(7);
+        assert_eq!(t4.bind_equity(&mut w4, &EqBindSpec { sym: sym(4), row: &rules(true, "1", "BUY", "0"), owned: true, bstock: b"" }), Err(BindErr::BadEquity));
+        assert_eq!(t4.bind_equity(&mut w4, &EqBindSpec { sym: sym(4), row: &r, owned: true, bstock: b"ABCDEFGHIJKLMNOPQ" }), Err(BindErr::BadEquity));
+        t4.bind_equity(&mut w4, &EqBindSpec { sym: sym(4), row: &r, owned: true, bstock: b"" }).unwrap();
+        assert_eq!(t4.bind_equity(&mut w4, &EqBindSpec { sym: sym(5), row: &r, owned: true, bstock: b"" }), Err(BindErr::Duplicate));
+        assert_eq!(t4.bind_equity(&mut w4, &EqBindSpec { sym: make_symbol_id(VenueId::Okx, 4_097), row: &r, owned: true, bstock: b"" }), Err(BindErr::BadSym));
     }
 
     #[test]

@@ -39,6 +39,19 @@
 //! the account write ([`VState::opt_writable`]), `-2022` when sent
 //! reduce-only past the holding.
 //!
+//! **Binance Stocks (BX10)** keep their own store ([`EqOrder`]): SAPI's
+//! `/sapi/v1/equity/…` under the arm's key and signature (every order verb
+//! body-form), the order stream `/equity/ws/<key>@orderReport` (the docs'
+//! and the Go connector's `orderReport`: JSON NUMBERS, lowercase words, the
+//! base `EQ_`-prefixed, no client id, no execution id). A place answers
+//! `{status:"S", orderId: <UUID>, clientOrderId}` and the stream says
+//! `accepted`; an order then RESTS (DAY) until the script fills it
+//! ([`VState::eq_place_fills`] at once, [`VState::eq_fill`] later), cancels
+//! it by its UUID, or expires it ([`VState::eq_expire`]). Each fill is an
+//! execution with its own id (`order/detail`'s `trades`, latest first;
+//! `trade/history`'s rows) and the order's fee the platform's ($0.35 or
+//! 10 bps, whichever is more; cumulative). Unsigned disclaimer: `486410`.
+//!
 //! COPY-DOCTRINE: test fixture; allocates and copies freely.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -121,6 +134,15 @@ pub const EAPI: &[u8] = br#"{"timezone":"UTC","serverTime":1791638168114,"option
 pub const OPT_CALL: &str = "BTC-261225-85000-C";
 /// The put.
 pub const OPT_PUT: &str = "BTC-261225-90000-P";
+
+/// BX10: Binance Stocks' listenKey — 36 characters, a UUID's shape (the
+/// probe's EQ7 measured the length; the hyphens are the shape's).
+pub const EQ_LISTEN_KEY: &str = "3f1c2d4e-5a6b-4c7d-8e9f-0a1b2c3d4e5f";
+/// BX10: `market/exchangeInfo` for AAPL and SPY — the probe's EQ1 rows
+/// (2026-10-11), SPY made SELL-only and whole-share for the tests.
+pub const EQ_INFO: &[u8] = br#"{"timezone":"UTC","symbols":[{"symbol":"AAPL","tradability":"BUY_SELL","tradabilityUpdateTime":1778233101000,"overnightSupported":true,"fractionable":true,"fractionableEh":true,"extendedSession":true,"maxNumOrders":200,"stepSize":"0.000000001","multiplierUp":"1.1000","multiplierDown":"0.9000","maxQty":"1000000.000000000","minNotional":"5.00000000","maxNotional":"1000000.00000000","listingTime":1778000000000},{"symbol":"SPY","tradability":"SELL","tradabilityUpdateTime":1778734341000,"overnightSupported":true,"fractionable":false,"fractionableEh":false,"extendedSession":true,"maxNumOrders":200,"stepSize":"1","multiplierUp":"1.1000","multiplierDown":"0.9000","maxQty":"1000000","minNotional":"5.00000000","maxNotional":"1000000.00000000","listingTime":1778000000000}]}"#;
+/// The equity fee's floor, ×1e6 ($0.35: the greater of it and 10 bps).
+const EQ_FEE_MIN_1E6: i64 = 350_000;
 
 /// **An exercise record** (`/eapi/v1/exerciseRecord`'s row, BX9): `symbol`
 /// settled at `exercise_px_1e6`, `qty_1e6` of it held on `long`'s side,
@@ -515,6 +537,164 @@ impl Trade {
             self.buy
         )
     }
+}
+
+/// **One Binance Stocks execution** (BX10): its id, price and quantity
+/// ×1e6, time.
+#[derive(Clone, Debug)]
+pub struct EqExecV {
+    /// `executionId`.
+    pub id: String,
+    /// `price` ×1e6.
+    pub px: i64,
+    /// `qty` ×1e6.
+    pub qty: i64,
+    /// `executionAt`, ms.
+    pub at: u64,
+    /// Billionths past the sixth decimal (0…999): the venue's nine
+    /// decimals ([`VState::eq_exec_tail`]).
+    pub tail: i64,
+}
+
+/// **One Binance Stocks order the venue holds** (BX10), in Stocks' own
+/// store ([`VState::eq_orders`]).
+#[derive(Clone, Debug)]
+pub struct EqOrder {
+    /// The venue's UUID.
+    pub id: String,
+    /// The client id it was placed with (empty: another's).
+    pub cid: String,
+    /// The ticker.
+    pub symbol: String,
+    /// A buy; else a sell.
+    pub buy: bool,
+    /// The quantity ×1e6.
+    pub qty: i64,
+    /// The limit price ×1e6.
+    pub px: i64,
+    /// Filled ×1e6, and the filled notional ×1e6.
+    pub filled: i64,
+    /// The filled notional ×1e6.
+    pub total: i64,
+    /// The cumulative fee ×1e6 (USD).
+    pub fee: i64,
+    /// `NEW`, `ACCEPTED`, `PARTIALLY_FILLED`, `FILLED`, `CANCELED`,
+    /// `EXPIRED` or `REJECTED`.
+    pub status: &'static str,
+    /// The executions, oldest first.
+    pub execs: Vec<EqExecV>,
+    /// The place's parameters as received.
+    pub params: String,
+    /// Created, ms.
+    pub created: u64,
+}
+
+impl EqOrder {
+    /// Still working.
+    pub fn open(&self) -> bool {
+        matches!(self.status, "NEW" | "ACCEPTED" | "PARTIALLY_FILLED")
+    }
+
+    fn side(&self) -> &'static str {
+        if self.buy {
+            "BUY"
+        } else {
+            "SELL"
+        }
+    }
+
+    fn avg(&self) -> i64 {
+        if self.filled > 0 {
+            (self.total as i128 * 1_000_000 / self.filled as i128) as i64
+        } else {
+            0
+        }
+    }
+
+    /// `order/detail`: every field, the executions latest first, the
+    /// quantities at the venue's 9 decimals.
+    fn detail(&self) -> String {
+        let trades: Vec<String> = self
+            .execs
+            .iter()
+            .rev()
+            .map(|x| format!(r#"{{"executionId":"{}","executionAt":{},"price":"{}","qty":"{}"}}"#, x.id, x.at, fx(x.px, 2), fx9t(x.qty, x.tail)))
+            .collect();
+        let avg = if self.filled > 0 { format!("\"{}\"", fx(self.avg(), 4)) } else { String::from("null") };
+        let total = if self.filled > 0 { format!("\"{}\"", fx(self.total, 6)) } else { String::from("null") };
+        format!(
+            r#"{{"orderId":"{}","clientOrderId":"{}","symbol":"{}","quote":"USDC","side":"{}","orderType":"LIMIT","limitPrice":"{}","avgFilledPrice":{avg},"qty":"{}","notional":null,"filledQty":"{}","filledTotal":{total},"fee":"{}","session":"RTH","status":"{}","createdAt":{},"updatedAt":{},"trades":[{}]}}"#,
+            self.id,
+            self.cid,
+            self.symbol,
+            self.side(),
+            fx(self.px, 2),
+            fx9(self.qty),
+            self.filled9(),
+            fx(self.fee, 2),
+            self.status,
+            self.created,
+            now_ms(),
+            trades.join(",")
+        )
+    }
+
+    /// `order/open-orders`'s row (no client id).
+    fn open_row(&self) -> String {
+        format!(
+            r#"{{"orderId":"{}","symbol":"{}","quote":"USDC","side":"{}","orderType":"LIMIT","limitPrice":"{}","avgFilledPrice":null,"qty":"{}","notional":null,"filledQty":"{}","filledTotal":null,"fee":"{}","session":"RTH","status":"{}","createdAt":{},"updatedAt":{}}}"#,
+            self.id,
+            self.symbol,
+            self.side(),
+            fx(self.px, 2),
+            fx9(self.qty),
+            self.filled9(),
+            fx(self.fee, 2),
+            self.status,
+            self.created,
+            now_ms()
+        )
+    }
+
+    /// The cumulative fill at the venue's nine decimals (each execution's
+    /// own billionths past the sixth summed in).
+    fn filled9(&self) -> String {
+        let tails: i64 = self.execs.iter().map(|x| x.tail).sum();
+        fx9t(self.filled, tails)
+    }
+
+    /// The stream's `orderReport` (JSON numbers, lowercase words, `EQ_`).
+    pub fn report(&self, terminal: bool) -> Vec<u8> {
+        let now = now_ms();
+        format!(
+            r#"{{"e":"orderReport","E":{now},"x":"{}","i":"{}","ai":"a{}","b":"EQ_{}","q":"USD","S":"{}","o":"limit","p":{},"Q":{},"N":null,"fq":{},"FN":{},"tc":{},"Z":{},"n":"Regular","s":"{}","T":{},"U":{now}}}"#,
+            if terminal { "ORDER_TERMINAL" } else { "ORDER_UPDATE" },
+            self.id,
+            self.symbol.len(),
+            self.symbol,
+            if self.buy { "buy" } else { "sell" },
+            fx(self.px, 2),
+            fx9(self.qty),
+            self.filled9(),
+            fx(self.total, 6),
+            fx(self.total + self.fee, 6),
+            if self.qty > 0 { self.filled * 100 / self.qty } else { 0 },
+            self.status.to_ascii_lowercase(),
+            self.created,
+        )
+        .into_bytes()
+    }
+}
+
+/// A ×1e6 quantity at the venue's 9 decimals.
+fn fx9(v: i64) -> String {
+    format!("{}{}", fx(v, 6), "000")
+}
+
+/// ×1e6 and its billionths past the sixth decimal, at nine decimals.
+fn fx9t(v_1e6: i64, tail: i64) -> String {
+    let t = v_1e6 * 1_000 + tail;
+    format!("{}.{:09}", t / 1_000_000_000, t % 1_000_000_000)
 }
 
 /// **One options order the venue holds** (BX9), in options' own store
@@ -1011,6 +1191,62 @@ pub struct VState {
     pub key_options: bool,
     /// Under the options key.
     pub opt_key_options: bool,
+    // ---- Binance Stocks (BX10) ----------------------------------------------
+    /// Every equity order, open or ended (a stranger's too), in order.
+    pub eq_orders: Vec<EqOrder>,
+    /// The US-equity disclaimer is signed (else every place: `486410`).
+    pub eq_disclaimer: bool,
+    /// Per place, in order: the executions it makes at once (none queued:
+    /// it rests `ACCEPTED` — or fills whole, [`Self::eq_fill_from_1e6`]).
+    pub eq_place_fills: VecDeque<Vec<i64>>,
+    /// Every place none of [`Self::eq_place_fills`] scripts, priced at or
+    /// above this, fills whole at its limit as it is placed; one under it
+    /// rests (gate 112).
+    pub eq_fill_from_1e6: Option<i64>,
+    /// Answer the next place 503 `-1007` WITHOUT applying it (no order
+    /// exists under the id).
+    pub eq_drop_place: bool,
+    /// Answer the next places `{"status":"F"}` (200), this many.
+    pub eq_answer_f: u32,
+    /// Answer the next cancels `S` WITHOUT carrying them out, this many
+    /// (a receipt the broker never acted on).
+    pub eq_ignore_cancels: u32,
+    /// `trade/history` answers page 1 whatever page is asked.
+    pub eq_history_page_ignored: bool,
+    /// `trade/history` names one more row in `total` past its first page
+    /// (an execution landed between the pages).
+    pub eq_history_total_drift: bool,
+    /// Every execution's billionths past the sixth decimal (0…999).
+    pub eq_exec_tail: i64,
+    /// Refuse the next place once with this code (400).
+    pub eq_refuse_place: Option<i32>,
+    /// Answer the next place 403 with a CDN's HTML page, WITHOUT applying
+    /// it (a body no scanner reads: no code under 500).
+    pub eq_place_html: bool,
+    /// Apply the next place but answer it 503 `-1007` (its outcome
+    /// unknown to the arm).
+    pub eq_lose_place_answer: bool,
+    /// Apply the next cancel but answer it 503 `-1007`.
+    pub eq_lose_cancel_answer: bool,
+    /// Refuse every cancel by id with this code (400) while set.
+    pub eq_refuse_cancel: Option<i32>,
+    /// The stream's frames waiting to be sent.
+    pub eq_user_q: VecDeque<Vec<u8>>,
+    /// Stream frames LOST (kept, never sent) while set.
+    pub eq_lose_user: bool,
+    /// The lost frames.
+    pub eq_lost: Vec<Vec<u8>>,
+    /// Close the stream once (it reconnects).
+    pub eq_drop_user: bool,
+    /// Stream connections accepted.
+    pub eq_user_conns: u32,
+    /// `order/open-orders` answers 500 (the listing withheld).
+    pub eq_open_down: bool,
+    /// Every request's parameters, by path's last segment.
+    pub eq_reads: Vec<(String, String)>,
+    /// `cancel-all`s served.
+    pub eq_cancel_alls: u32,
+    eq_next: u64,
     day_start_ms: u64,
 }
 
@@ -1185,6 +1421,30 @@ impl VState {
             opt_index_reads: 0,
             key_options: false,
             opt_key_options: true,
+            eq_orders: Vec::new(),
+            eq_disclaimer: true,
+            eq_place_fills: VecDeque::new(),
+            eq_fill_from_1e6: None,
+            eq_drop_place: false,
+            eq_answer_f: 0,
+            eq_ignore_cancels: 0,
+            eq_history_page_ignored: false,
+            eq_history_total_drift: false,
+            eq_exec_tail: 0,
+            eq_refuse_place: None,
+            eq_place_html: false,
+            eq_lose_place_answer: false,
+            eq_lose_cancel_answer: false,
+            eq_refuse_cancel: None,
+            eq_user_q: VecDeque::new(),
+            eq_lose_user: false,
+            eq_lost: Vec::new(),
+            eq_drop_user: false,
+            eq_user_conns: 0,
+            eq_open_down: false,
+            eq_reads: Vec::new(),
+            eq_cancel_alls: 0,
+            eq_next: 0,
             day_start_ms,
         }
     }
@@ -1586,10 +1846,265 @@ impl VState {
                     None => (400, String::from(r#"{"code":-1121,"msg":"Invalid symbol."}"#)),
                 }
             }
+            // ---- Binance Stocks (BX10): SAPI's equity paths -----------------
+            ("POST" | "GET", eq) if eq.starts_with("/sapi/v1/equity/") => {
+                let tail = String::from(&eq["/sapi/v1/equity/".len()..]);
+                self.eq_reads.push((tail.clone(), String::from(params)));
+                assert!(params.contains("&signature="), "every Stocks request is signed: {tail}");
+                self.eq_rest(method, &tail, params)
+            }
             _ => {
                 self.unknown += 1;
                 (404, String::from(r#"{"code":-1000,"msg":"unknown path"}"#))
             }
+        }
+    }
+
+    /// **Binance Stocks' REST** (BX10; module docs).
+    fn eq_rest(&mut self, method: &str, tail: &str, params: &str) -> (u16, String) {
+        let not_found = || (400, String::from(r#"{"code":486218,"msg":"Order not found"}"#));
+        match (method, tail) {
+            ("POST", "listenKey") => (200, format!(r#"{{"listenKey":"{EQ_LISTEN_KEY}"}}"#)),
+            ("POST", "order/place") => self.eq_place(params),
+            ("POST", "order/cancel") => {
+                let id = qparam(params, "orderId").unwrap_or("");
+                assert!(qparam(params, "clientOrderId").is_none(), "a cancel names the UUID alone");
+                if let Some(code) = self.eq_refuse_cancel {
+                    return (400, format!(r#"{{"code":{code},"msg":"Refused by the script."}}"#));
+                }
+                let Some(k) = self.eq_orders.iter().position(|o| o.id == id) else {
+                    return not_found();
+                };
+                if !self.eq_orders[k].open() {
+                    return (400, String::from(r#"{"code":486219,"msg":"Order cannot be canceled"}"#));
+                }
+                if self.eq_ignore_cancels > 0 {
+                    self.eq_ignore_cancels -= 1;
+                    return (200, format!(r#"{{"orderId":"{id}","status":"S"}}"#));
+                }
+                self.eq_orders[k].status = "CANCELED";
+                let f = self.eq_orders[k].report(true);
+                self.eq_emit(f);
+                if std::mem::take(&mut self.eq_lose_cancel_answer) {
+                    return (503, String::from(r#"{"code":-1007,"msg":"Timeout waiting for response from backend server."}"#));
+                }
+                (200, format!(r#"{{"orderId":"{id}","status":"S"}}"#))
+            }
+            ("POST", "order/cancel-all") => {
+                self.eq_cancel_alls += 1;
+                let mut frames = Vec::new();
+                for o in self.eq_orders.iter_mut().filter(|o| o.open()) {
+                    o.status = "CANCELED";
+                    frames.push(o.report(true));
+                }
+                for f in frames {
+                    self.eq_emit(f);
+                }
+                (200, String::from(r#"{"success":true}"#))
+            }
+            ("GET", "order/open-orders") => {
+                if self.eq_open_down {
+                    return (500, String::from(r#"{"code":-1001,"msg":"Internal error."}"#));
+                }
+                let rows: Vec<String> = self.eq_orders.iter().filter(|o| o.open()).map(EqOrder::open_row).collect();
+                (200, format!("[{}]", rows.join(",")))
+            }
+            ("GET", "order/detail") => {
+                let (id, c) = (qparam(params, "orderId"), qparam(params, "clientOrderId"));
+                let o = match (id, c) {
+                    (Some(id), None) => self.eq_orders.iter().find(|o| o.id == id),
+                    (None, Some(c)) => self.eq_orders.iter().find(|o| o.cid == c),
+                    _ => panic!("a detail names one of orderId and clientOrderId: {params}"),
+                };
+                o.map_or_else(not_found, |o| (200, o.detail()))
+            }
+            ("GET", "trade/history") => {
+                let start: u64 = qparam(params, "startTime").and_then(|v| v.parse().ok()).expect("startTime");
+                let end: u64 = qparam(params, "endTime").and_then(|v| v.parse().ok()).expect("endTime");
+                let asked: usize = qparam(params, "current").and_then(|v| v.parse().ok()).unwrap_or(1);
+                let page = if self.eq_history_page_ignored { 1 } else { asked };
+                let size: usize = qparam(params, "size").and_then(|v| v.parse().ok()).unwrap_or(20);
+                assert!(size <= 100, "a page holds at most 100");
+                let sym = qparam(params, "symbol");
+                // Latest first, as the venue lists them.
+                let mut rows: Vec<String> = Vec::new();
+                for o in self.eq_orders.iter() {
+                    if sym.is_some_and(|s| s != o.symbol) {
+                        continue;
+                    }
+                    for x in o.execs.iter().filter(|x| x.at >= start && x.at <= end) {
+                        rows.push(format!(
+                            r#"{{"executionId":"{}","orderId":"{}","symbol":"{}","quote":"USDC","side":"{}","orderType":"LIMIT","price":"{}","qty":"{}","total":"{}","executionAt":{},"updatedAt":{}}}"#,
+                            x.id,
+                            o.id,
+                            o.symbol,
+                            o.side(),
+                            fx(x.px, 2),
+                            fx9t(x.qty, x.tail),
+                            fx(x.px * x.qty / 1_000_000, 6),
+                            x.at,
+                            x.at
+                        ));
+                    }
+                }
+                rows.reverse();
+                let total = rows.len() + usize::from(self.eq_history_total_drift && page > 1);
+                let at = (page - 1) * size;
+                let slice: Vec<String> = rows.into_iter().skip(at).take(size).collect();
+                (200, format!(r#"{{"page":{page},"size":{size},"total":{total},"rows":[{}]}}"#, slice.join(",")))
+            }
+            ("GET", "order/history") => (200, String::from(r#"{"page":1,"size":100,"total":0,"rows":[]}"#)),
+            _ => {
+                self.unknown += 1;
+                (404, String::from(r#"{"code":-1000,"msg":"unknown path"}"#))
+            }
+        }
+    }
+
+    /// **An equity place** (BX10): LIMIT DAY, the D5 statics named, our
+    /// 32-character id; the disclaimer unsigned `486410`; a duplicate id
+    /// `486449`. Accepted: the receipt (`S`), the stream's `accepted`, then
+    /// the executions [`Self::eq_place_fills`] queues for it.
+    fn eq_place(&mut self, params: &str) -> (u16, String) {
+        let q = |k: &str| qparam(params, k).unwrap_or("");
+        assert_eq!((q("orderType"), q("timeInForce")), ("LIMIT", "DAY"), "Stocks are LIMIT DAY: {params}");
+        assert!(["RTH", "EXTENDED", "24H"].contains(&q("tradingSession")), "the session named: {params}");
+        assert!(!q("quoteAsset").is_empty() && ["true", "false"].contains(&q("tokenize")), "the D5 statics: {params}");
+        assert_eq!(q("walletType") == "MAIN", q("side") == "BUY", "a BUY pays from MAIN; a SELL names none");
+        assert!(q("price").split('.').nth(1).is_none_or(|f| f.len() <= 2), "at most two decimals: {params}");
+        if let Some(code) = self.eq_refuse_place.take() {
+            return (400, format!(r#"{{"code":{code},"msg":"Refused by the script."}}"#));
+        }
+        if std::mem::take(&mut self.eq_place_html) {
+            return (403, String::from("<html><head><title>403 Forbidden</title></head><body>Request blocked.</body></html>"));
+        }
+        if !self.eq_disclaimer {
+            return (400, String::from(r#"{"code":486410,"msg":"Please sign the US equity disclaimer first"}"#));
+        }
+        let cid = String::from(q("clientOrderId"));
+        assert!((32..=36).contains(&cid.len()), "the venue's id rule");
+        if std::mem::take(&mut self.eq_drop_place) {
+            return (503, String::from(r#"{"code":-1007,"msg":"Timeout waiting for response from backend server."}"#));
+        }
+        if self.eq_answer_f > 0 {
+            self.eq_answer_f -= 1;
+            return (200, String::from(r#"{"status":"F"}"#));
+        }
+        if self.eq_orders.iter().any(|o| o.cid == cid) {
+            return (400, String::from(r#"{"code":486449,"msg":"Duplicate clientOrderId"}"#));
+        }
+        self.eq_next += 1;
+        let n = self.eq_next;
+        let o = EqOrder {
+            id: format!("{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}", 0x5eed_0000 + n, n & 0xffff, n & 0xfff, (n * 7) & 0xfff, n * 0x1_0001),
+            cid: cid.clone(),
+            symbol: String::from(q("symbol")),
+            buy: q("side") == "BUY",
+            qty: d6(q("quantity")),
+            px: d6(q("price")),
+            filled: 0,
+            total: 0,
+            fee: 0,
+            status: "ACCEPTED",
+            execs: Vec::new(),
+            params: String::from(params),
+            created: now_ms(),
+        };
+        let answer = format!(r#"{{"status":"S","orderId":"{}","clientOrderId":"{cid}"}}"#, o.id);
+        let accepted = o.report(false);
+        self.eq_orders.push(o);
+        self.eq_emit(accepted);
+        let (px, qty) = self.eq_orders.last().map_or((0, 0), |o| (o.px, o.qty));
+        let whole = self.eq_fill_from_1e6.is_some_and(|from| px >= from);
+        let fills = self.eq_place_fills.pop_front().unwrap_or_else(|| if whole { vec![qty] } else { Vec::new() });
+        for f in fills {
+            self.eq_fill(&cid, f, px);
+        }
+        if std::mem::take(&mut self.eq_lose_place_answer) {
+            return (503, String::from(r#"{"code":-1007,"msg":"Timeout waiting for response from backend server."}"#));
+        }
+        (200, answer)
+    }
+
+    /// **Fill `qty` of the equity order placed as `cid` at `px`** (BX10):
+    /// one execution, the order's figures, its fee ($0.35 or 10 bps of the
+    /// notional, whichever is more), and its report.
+    pub fn eq_fill(&mut self, cid: &str, qty: i64, px: i64) {
+        let k = self.eq_orders.iter().position(|o| o.cid == cid).expect("an equity order");
+        self.eq_next += 1;
+        let id = format!("x{:06}", self.eq_next);
+        let tail = self.eq_exec_tail;
+        let o = &mut self.eq_orders[k];
+        assert!(o.open(), "a fill of an ended order");
+        let qty = qty.min(o.qty - o.filled);
+        o.execs.push(EqExecV { id, px, qty, at: now_ms(), tail });
+        o.filled += qty;
+        o.total += px * qty / 1_000_000;
+        o.fee = EQ_FEE_MIN_1E6.max(o.total / 1_000);
+        o.status = if o.filled == o.qty { "FILLED" } else { "PARTIALLY_FILLED" };
+        let f = o.report(o.status == "FILLED");
+        self.eq_emit(f);
+    }
+
+    /// **Forget the equity order placed as `cid`** — the venue no longer
+    /// knows it (its every read answers `486218`).
+    pub fn eq_forget(&mut self, cid: &str) {
+        self.eq_orders.retain(|o| o.cid != cid);
+    }
+
+    /// **Expire the equity order placed as `cid`** (its session closed).
+    pub fn eq_expire(&mut self, cid: &str) {
+        let o = self.eq_orders.iter_mut().find(|o| o.cid == cid).expect("an equity order");
+        o.status = "EXPIRED";
+        let f = o.report(true);
+        self.eq_emit(f);
+    }
+
+    /// **A stranger's equity order** — another client's, on the same
+    /// account: `qty` of `symbol` filled at `px` (an execution the arm
+    /// never booked), or resting when `rest`.
+    pub fn eq_foreign(&mut self, symbol: &str, buy: bool, qty: i64, px: i64, rest: bool) {
+        self.eq_next += 1;
+        let n = self.eq_next;
+        let mut o = EqOrder {
+            id: format!("{:08x}-{:04x}-4{:03x}-9{:03x}-{:012x}", 0xf0e1_0000 + n, n & 0xffff, n & 0xfff, n & 0xfff, n),
+            cid: String::new(),
+            symbol: String::from(symbol),
+            buy,
+            qty,
+            px,
+            filled: 0,
+            total: 0,
+            fee: 0,
+            status: "ACCEPTED",
+            execs: Vec::new(),
+            params: String::new(),
+            created: now_ms(),
+        };
+        if !rest {
+            o.execs.push(EqExecV { id: format!("f{n:06}"), px, qty, at: now_ms(), tail: 0 });
+            o.filled = qty;
+            o.total = px * qty / 1_000_000;
+            o.status = "FILLED";
+        }
+        self.eq_orders.push(o);
+    }
+
+    /// **An equity order the venue already holds under `cid`** (resting,
+    /// no report): what a duplicate id names.
+    pub fn eq_seed(&mut self, cid: &str, symbol: &str, buy: bool, qty: i64, px: i64) {
+        self.eq_foreign(symbol, buy, qty, px, true);
+        if let Some(o) = self.eq_orders.last_mut() {
+            o.cid = String::from(cid);
+        }
+    }
+
+    /// An equity stream frame, queued (or lost while the stream is "down").
+    pub fn eq_emit(&mut self, f: Vec<u8>) {
+        if self.eq_lose_user {
+            self.eq_lost.push(f);
+        } else {
+            self.eq_user_q.push_back(f);
         }
     }
 
@@ -2509,6 +3024,7 @@ fn serve(sock: TcpStream, cfg: Arc<ServerConfig>, st: Arc<Mutex<VState>>, stop: 
         || head.starts_with("GET /pm/ws/")
         || head.starts_with("GET /pm-classic/ws/")
         || head.starts_with("GET /private/ws/")
+        || head.starts_with("GET /equity/ws/")
     {
         user_stream(p, &head, &st);
     } else {
@@ -2698,7 +3214,9 @@ fn user_stream(mut p: Peer, head: &str, st: &Mutex<VState>) {
     let pmc = path == format!("/pm-classic/ws/{LISTEN_KEY}");
     // BX9: options' stream, `/private/ws/<its key>`.
     let opt = path == format!("/private/ws/{OPT_LISTEN_KEY}");
-    if (!cm && !pm && !pmc && !opt && path != format!("/ws/{LISTEN_KEY}")) || !p.upgrade(head) {
+    // BX10: Binance Stocks' order stream, `/equity/ws/<its key>@orderReport`.
+    let eq = path == format!("/equity/ws/{EQ_LISTEN_KEY}@orderReport");
+    if (!cm && !pm && !pmc && !opt && !eq && path != format!("/ws/{LISTEN_KEY}")) || !p.upgrade(head) {
         st.lock().expect("venue").unknown += 1;
         return;
     }
@@ -2708,6 +3226,8 @@ fn user_stream(mut p: Peer, head: &str, st: &Mutex<VState>) {
             v.pmc_conns += 1;
         } else if opt {
             v.opt_user_conns += 1;
+        } else if eq {
+            v.eq_user_conns += 1;
         } else {
             v.user_conns += 1;
         }
@@ -2719,6 +3239,9 @@ fn user_stream(mut p: Peer, head: &str, st: &Mutex<VState>) {
                 (v.pmc_q.drain(..).collect(), false)
             } else if opt {
                 (v.opt_user_q.drain(..).collect(), false)
+            } else if eq {
+                let d = core::mem::take(&mut v.eq_drop_user);
+                (v.eq_user_q.drain(..).collect(), d)
             } else if pm {
                 (v.pm_user_q.drain(..).collect(), false)
             } else if cm {

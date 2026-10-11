@@ -15,7 +15,7 @@
 //!    band while a fresh mark exists (each judged by cross-multiplying in
 //!    `i128`: no division on the submit path);
 //! 4. **the governors** ([`crate::gov`]): the ORDERS windows (futures',
-//!    spot's or options' pool, by the row's product), the UM quantitative
+//!    spot's, options' or Binance Stocks' pool, by the row's product), the UM quantitative
 //!    rules, the open orders per symbol and the breadth (futures' alone);
 //!    **The writing law (BX9, BX-18)** rides this step: on an option row
 //!    the account may not write ([`crate::inst::INST_WRITABLE`] clear) a
@@ -23,7 +23,15 @@
 //!    ([`Refusal::NotWritable`]); any other SELL there leaves REDUCE-ONLY,
 //!    so the venue itself refuses one that would open a short — the arm's
 //!    view of the position is the gateway's booked one ([`EVT_POSITION`]),
-//!    which lags orders in flight; the venue's flag does not;
+//!    which lags orders in flight; the venue's flag does not.
+//!    **The equity law (BX10)** rides it too: on a Binance Stocks row the
+//!    side the venue takes (`tradability`, else [`Refusal::NotLive`]), a
+//!    SELL only of a booked holding ([`Refusal::NotWritable`] — the router's
+//!    spot law bounds its size), Stocks' own pool (200 / min per UID), and
+//!    the mandatory TTL: every equity order is a DAY LIMIT whose deadline
+//!    the arm stamps at `equity_ttl_ns` (none set: [`Refusal::Ttl`]) — an
+//!    IoC by kind (no maker: no venue dead-man), resting until it fills or
+//!    the gateway cancels it; its cancel verb is built, its modify not;
 //! 5. **the push**: one [`BnCmd`] into the command ring (the kit's
 //!    duplex, [`crate::cmd::duplex`]), stamped with its push time. A full
 //!    ring is `QueueFull` and the router books nothing.
@@ -84,13 +92,14 @@ use core_types::{
 use exec_gateway::stats::{HALT_NONE, PUBLISHED_WORDS, SWEEP_STRANDED, SWEEP_WORKING};
 
 use crate::cmd::*;
+use crate::equity::{EQ_SIDE_BUY, EQ_SIDE_SELL};
 use crate::gov::{
-    classify, CodeClass, FuturesOrders, OptionOrders, Qtr, QtrRow, SpotOrders, ARM_WEIGHT_MAX_PER_MIN, OPT_ARM_WEIGHT_MAX_PER_MIN,
-    QTR_DUST_USD_1E6,
+    classify, is_venue_code, CodeClass, EquityOrders, FuturesOrders, OptionOrders, Qtr, QtrRow, SpotOrders, ARM_WEIGHT_MAX_PER_MIN,
+    OPT_ARM_WEIGHT_MAX_PER_MIN, QTR_DUST_USD_1E6,
 };
 use crate::inst::{
-    rx, InstTable, INST_INVERSE, INST_LIVE, INST_MAX, INST_NO_DEADMAN, INST_OWNED, INST_WRITABLE, PRODUCT_COINM, PRODUCT_OPTIONS,
-    PRODUCT_SPOT, PRODUCT_USDM, ROW_NONE,
+    rx, InstTable, INST_INVERSE, INST_LIVE, INST_MAX, INST_NO_DEADMAN, INST_OWNED, INST_WRITABLE, PRODUCT_COINM, PRODUCT_EQUITY,
+    PRODUCT_OPTIONS, PRODUCT_SPOT, PRODUCT_USDM, ROW_NONE,
 };
 use crate::margin::{MarginBook, SLOTS};
 use crate::mode::AccountMode;
@@ -311,6 +320,10 @@ pub struct ArmKnobs {
     pub mode: AccountMode,
     /// Demo Mode (the battery; the engine trades mainnet only, BX-16).
     pub demo: bool,
+    /// BX10 — Binance Stocks' mandatory gateway TTL, ns (BX-17's exception:
+    /// every equity order is a DAY LIMIT the gateway cancels at this
+    /// deadline). 0: none — an equity order is refused ([`Refusal::Ttl`]).
+    pub equity_ttl_ns: u64,
 }
 
 /// A fixed FIFO on the engine thread. `mark` lets a producer hold back
@@ -416,6 +429,8 @@ pub struct BnArm {
     spot: SpotOrders,
     /// Options' ORDERS pool (BX9).
     opt: OptionOrders,
+    /// Binance Stocks' ORDERS pool (BX10).
+    eq: EquityOrders,
     qtr: Qtr,
     knobs: ArmKnobs,
     margin: MarginBook,
@@ -486,6 +501,28 @@ const fn writing_law(product: u8, row_flags: u8, side: Side, flags: u8, pos_1e6:
     Ok(flags | ORDER_FLAG_REDUCE_ONLY)
 }
 
+/// **BX10 — the equity law** (module docs, step 4): the side the venue
+/// takes on the ticker (`tradability`, `sides`: else [`Refusal::NotLive`]
+/// — closed to that side), a SELL only of a holding (`pos_1e6`, the
+/// gateway's booked position: none, and the SELL could only short —
+/// [`Refusal::NotWritable`]; the router's spot law bounds its size), and
+/// the mandatory TTL set (`ttl_ns`: else [`Refusal::Ttl`] — an equity
+/// order rests until it is cancelled, BX-17's exception).
+#[inline(always)]
+const fn equity_law(sides: u8, buy: bool, pos_1e6: i64, ttl_ns: u64) -> Result<(), Refusal> {
+    let side = if buy { EQ_SIDE_BUY } else { EQ_SIDE_SELL };
+    if sides & side == 0 {
+        return Err(Refusal::NotLive);
+    }
+    if !buy && pos_1e6 <= 0 {
+        return Err(Refusal::NotWritable);
+    }
+    if ttl_ns == 0 {
+        return Err(Refusal::Ttl);
+    }
+    Ok(())
+}
+
 /// `⌊a · b / 1e6⌋ < m` for `a, b ≥ 0`, without the division:
 /// `⌊x / d⌋ < m ⇔ x < m · d`.
 #[inline(always)]
@@ -507,6 +544,7 @@ impl BnArm {
             fut: FuturesOrders::new(knobs.orders_frac_1e6),
             spot: SpotOrders::new(knobs.orders_frac_1e6),
             opt: OptionOrders::new(knobs.orders_frac_1e6),
+            eq: EquityOrders::new(knobs.orders_frac_1e6),
             qtr: Qtr {
                 frac_1e6: knobs.qtr_frac_1e6,
             },
@@ -716,13 +754,20 @@ impl BnArm {
         let maker = o.kind == ORDER_KIND_MAKER;
         let product = self.inst.hot(row).product;
         let spot = product == PRODUCT_SPOT;
-        admit_flags(o.flags, maker, spot)?;
+        let equity = product == PRODUCT_EQUITY;
+        // A cash holding takes no reduce-only (spot, BX8; Binance Stocks,
+        // BX10): a SELL is bounded by the holding instead.
+        admit_flags(o.flags, maker, spot || equity)?;
         // BX9 (BX-18) — the writing law (module docs, step 4).
         let flags = writing_law(product, self.inst.hot(row).flags, o.side, o.flags, self.rt[rx(row)].pos_1e6)?;
         if maker && o.ttl_ns != 0 && o.ttl_ns < self.knobs.min_maker_ttl_ns {
             return Err(Refusal::Ttl);
         }
         let buy = o.side == Side::Bid;
+        // BX10 — the equity law (module docs, step 4).
+        if equity {
+            equity_law(self.inst.cold(row).eq_sides, buy, self.rt[rx(row)].pos_1e6, self.knobs.equity_ttl_ns)?;
+        }
         let (px, qty, dust) = self.quantize(row, buy, o.px.raw(), o.qty.raw(), now)?;
         // ---- governors ----------------------------------------------------
         let r = rx(row);
@@ -737,6 +782,11 @@ impl BnArm {
         } else if product == PRODUCT_OPTIONS {
             // BX9: options' own pool; no quantitative rule, no breadth.
             if !self.opt.admits(now) {
+                return Err(Refusal::Orders);
+            }
+        } else if equity {
+            // BX10: Stocks' own pool (200 / min per UID).
+            if !self.eq.admits(now) {
                 return Err(Refusal::Orders);
             }
         } else {
@@ -757,7 +807,16 @@ impl BnArm {
             return Err(Refusal::Breadth);
         }
         // ---- push -----------------------------------------------------------
-        let deadline = if maker && o.ttl_ns != 0 { now + o.ttl_ns } else { 0 };
+        // BX10: every equity order rests (DAY, no IoC exists) under the
+        // mandatory TTL — the gateway cancels it at the deadline (BX-17's
+        // exception).
+        let deadline = if equity {
+            now + self.knobs.equity_ttl_ns
+        } else if maker && o.ttl_ns != 0 {
+            now + o.ttl_ns
+        } else {
+            0
+        };
         let cmd = BnCmd::place(o.client_oid, px, qty, deadline, row, o.kind, o.side, o.strategy_id, flags).at(now);
         if !self.end.cmd.push(&cmd) {
             return Err(Refusal::QueueFull);
@@ -766,6 +825,8 @@ impl BnArm {
             self.spot.commit(now);
         } else if product == PRODUCT_OPTIONS {
             self.opt.commit(now);
+        } else if equity {
+            self.eq.commit(now);
         } else {
             self.fut.commit(now);
             Qtr::on_place(&mut self.qtr_rows[r], maker, dust);
@@ -828,9 +889,10 @@ impl BnArm {
                     CodeClass::WouldTake => RETIRED_EXPIRED,
                     _ => RETIRED_REJECTED,
                 };
-                // Only the VENUE's refusals (negative codes) move the
-                // streak; the gateway's local ones (positive) are races the
-                // arm's own readiness check already counts.
+                // Only the VENUE's refusals (negative codes; Binance
+                // Stocks' six-digit positives, BX10 — `is_venue_code`) move
+                // the streak; the gateway's local ones (9 0xx) are races
+                // the arm's own readiness check already counts.
                 match class {
                     CodeClass::WouldTake | CodeClass::Budget | CodeClass::Lock => {}
                     CodeClass::RowFatal => {
@@ -847,7 +909,7 @@ impl BnArm {
                         self.reject_streak += 1;
                     }
                     CodeClass::Reject | CodeClass::Clock | CodeClass::Unknown => {
-                        self.reject_streak += (e.code < 0) as u32;
+                        self.reject_streak += is_venue_code(e.code) as u32;
                     }
                 }
                 self.ended(e, why, false);
@@ -874,7 +936,7 @@ impl BnArm {
             }
             EVT_MODIFY_FAILED => {
                 self.c.modifies_refused += 1;
-                if e.code < 0 && classify(e.code, 0) == CodeClass::Reject {
+                if is_venue_code(e.code) && classify(e.code, 0) == CodeClass::Reject {
                     self.reject_streak += 1;
                 }
             }
@@ -1017,8 +1079,11 @@ impl OrderDispatch for BnArm {
             self.refuse(Refusal::Unbound);
             return Err(DispatchError::NoLiveRoute);
         }
-        if self.inst.hot(row).has(INST_NO_DEADMAN) {
+        let h = self.inst.hot(row);
+        if h.has(INST_NO_DEADMAN) && h.product != PRODUCT_EQUITY {
             // IoC-only: nothing rests, so no cancel verb is built (§3.8).
+            // BX10: an equity order rests (DAY under the TTL) — its cancel
+            // is built.
             self.refuse(Refusal::Verb);
             return Err(DispatchError::Unsupported);
         }
@@ -1396,6 +1461,7 @@ pub(crate) mod tests {
             anchor: WallAnchor::new(0, 1_790_000_000_000_000_000),
             mode: AccountMode::Classic,
             demo: false,
+            equity_ttl_ns: 0,
         };
         Rig { arm: BnArm::new(eng, t, knobs), gw }
     }
@@ -1492,6 +1558,7 @@ pub(crate) mod tests {
             anchor: WallAnchor::new(0, 1_790_000_000_000_000_000),
             mode: AccountMode::Classic,
             demo: false,
+            equity_ttl_ns: 0,
         };
         let mut r = Rig { arm: BnArm::new(eng, t, knobs), gw };
         r.healthy();
@@ -1541,6 +1608,102 @@ pub(crate) mod tests {
         r.send(x);
         r.arm.on_idle();
         assert_eq!(r.arm.spot.unfilled(), 79, "the unfilled IoC stays counted");
+    }
+
+    /// BX10: a Binance Stocks row — an IoC by kind, sent as a DAY LIMIT
+    /// under the mandatory TTL (the arm stamps the deadline); no maker (no
+    /// dead-man), no reduce-only, no post-only; the venue's sides; a SELL
+    /// only of a booked holding; Stocks' own pool; its cancel verb built,
+    /// its modify not. Break-and-watch: dropping the holding check sends
+    /// the first SELL.
+    #[test]
+    fn an_equity_row_rests_under_the_ttl_long_only() {
+        let info = br#"{"symbols":[{"symbol":"AAPL","tradability":"BUY_SELL","fractionable":true,"stepSize":"0.000000001","minNotional":"5","maxQty":"1000","maxNumOrders":200},{"symbol":"SPY","tradability":"SELL","fractionable":false,"stepSize":"1","minNotional":"5"}]}"#;
+        let (aapl, spy) = (make_symbol_id(VenueId::Binance, 4_097), make_symbol_id(VenueId::Binance, 4_098));
+        let (mut t, mut w) = InstTable::new(7);
+        let a = crate::equity::scan_eq_symbol(info, b"AAPL").unwrap();
+        let b = crate::equity::scan_eq_symbol(info, b"SPY").unwrap();
+        let ra = t.bind_equity(&mut w, &crate::inst::EqBindSpec { sym: aapl, row: &a, owned: true, bstock: b"AAPLB" }).unwrap();
+        t.bind_equity(&mut w, &crate::inst::EqBindSpec { sym: spy, row: &b, owned: true, bstock: b"" }).unwrap();
+        let h = t.hot(ra);
+        assert_eq!((h.tick_1e6, h.step_1e6, h.px_dec, h.qty_dec, h.min_notional_1e6), (10_000, 1, 2, 6, 5_000_000), "0.01 and a millionth");
+        assert!(h.has(INST_LIVE) && h.has(INST_NO_DEADMAN) && h.product == PRODUCT_EQUITY);
+        assert_eq!(t.hot(ra + 1).step_1e6, 1_000_000, "SPY trades whole shares");
+        assert_eq!(w.eq(ra).bstock.get(), b"AAPLB");
+        let (eng, gw) = duplex();
+        let mut prod = [0u8; SLOTS];
+        prod[SLOT as usize] = 1 << PRODUCT_EQUITY;
+        let knobs = |ttl: u64| ArmKnobs {
+            orders_frac_1e6: 800_000,
+            qtr_frac_1e6: 800_000,
+            owner_slot: SLOT,
+            max_symbols: 1,
+            min_maker_ttl_ns: 5_000_000_000,
+            margin: MarginBook::new([600_000; SLOTS], prod),
+            anchor: WallAnchor::new(0, 1_790_000_000_000_000_000),
+            mode: AccountMode::Classic,
+            demo: false,
+            equity_ttl_ns: ttl,
+        };
+        let mut r = Rig { arm: BnArm::new(eng, t, knobs(30_000_000_000)), gw };
+        r.healthy();
+        let eq = |sym, kind: u8, side: Side, flags: u8, qty: i64, oid: u64| {
+            let mut o = Order::new(0, VenueId::Binance, sym, side, kind, Price(336_097_000), Qty(qty), oid);
+            o.strategy_id = SLOT;
+            o.flags = flags;
+            o
+        };
+        // A BUY of 0.03 at 336.097 → 336.09 (floored): a DAY order whose
+        // deadline is the TTL's.
+        let t0 = core_time::now_ns();
+        assert_eq!(r.arm.submit(&eq(aapl, ORDER_KIND_IOC, Side::Bid, 0, 30_000, 1)), Ok(()));
+        let c = r.pop_cmd().expect("pushed");
+        assert_eq!((c.px_1e6, c.qty_1e6, c.kind), (336_090_000, 30_000, ORDER_KIND_IOC));
+        assert!(c.ttl_deadline_ns >= t0 + 30_000_000_000 && c.ttl_deadline_ns < t0 + 31_000_000_000, "the TTL stamped");
+        let mut m = eq(aapl, ORDER_KIND_MAKER, Side::Bid, 0, 30_000, 2);
+        m.ttl_ns = 10_000_000_000;
+        assert_eq!(r.arm.submit(&m), Err(DispatchError::Unsupported), "no maker: no dead-man");
+        assert_eq!(r.arm.submit(&eq(aapl, ORDER_KIND_IOC, Side::Bid, ORDER_FLAG_REDUCE_ONLY, 30_000, 3)), Err(DispatchError::Unsupported));
+        assert_eq!(r.arm.submit(&eq(aapl, ORDER_KIND_IOC, Side::Ask, 0, 30_000, 4)), Err(DispatchError::Unsupported), "no holding: no SELL");
+        assert_eq!(r.arm.submit(&eq(aapl, ORDER_KIND_IOC, Side::Bid, 0, 10_000, 5)), Err(DispatchError::Unsupported), "$3.36 < $5");
+        assert_eq!(r.arm.submit(&eq(spy, ORDER_KIND_IOC, Side::Bid, 0, 1_000_000, 6)), Err(DispatchError::NoLiveRoute), "SPY is SELL-only");
+        let k = r.arm.counters().refused;
+        assert_eq!(
+            (k[Refusal::NoDeadman as usize], k[Refusal::Flags as usize], k[Refusal::NotWritable as usize], k[Refusal::MinNotional as usize], k[Refusal::NotLive as usize]),
+            (1, 1, 1, 1, 1)
+        );
+        // A holding booked: the SELL goes.
+        let mut p = BnEvt::new(EVT_POSITION, core_time::now_ns());
+        p.row = ra;
+        p.a = 30_000;
+        r.send(p);
+        r.arm.on_idle();
+        assert_eq!(r.arm.submit(&eq(aapl, ORDER_KIND_IOC, Side::Ask, 0, 30_000, 7)), Ok(()));
+        assert!(r.pop_cmd().is_some());
+        // The cancel verb is built; the modify is not.
+        let cr = CancelReq::of(&eq(aapl, ORDER_KIND_IOC, Side::Bid, 0, 30_000, 1), 0);
+        assert_eq!(r.arm.cancel(&cr), Ok(()));
+        assert_eq!(r.pop_cmd().map(|c| c.verb), Some(VERB_CANCEL));
+        let mo = ModifyReq::new(1, eq(aapl, ORDER_KIND_MAKER, Side::Bid, 0, 30_000, 8));
+        assert_eq!(r.arm.modify(&mo), Err(DispatchError::Unsupported));
+        // Stocks' own pool: 160 a minute at 80 % of 200, the others' untouched.
+        let mut placed = 2u32;
+        let mut oid = 100;
+        while r.arm.submit(&eq(aapl, ORDER_KIND_IOC, Side::Bid, 0, 30_000, oid)).is_ok() {
+            placed += 1;
+            oid += 1;
+            let _ = r.pop_cmd();
+        }
+        assert_eq!(placed, 160);
+        assert_eq!((r.arm.fut.w10s.used(core_time::now_ns()), r.arm.spot.w10s.used(core_time::now_ns())), (0, 0));
+        // No TTL configured: refused (an equity order would rest unbounded).
+        let (eng, gw) = duplex();
+        let (mut t2, mut w2) = InstTable::new(7);
+        t2.bind_equity(&mut w2, &crate::inst::EqBindSpec { sym: aapl, row: &a, owned: true, bstock: b"" }).unwrap();
+        let mut r2 = Rig { arm: BnArm::new(eng, t2, knobs(0)), gw };
+        r2.healthy();
+        assert_eq!(r2.arm.submit(&eq(aapl, ORDER_KIND_IOC, Side::Bid, 0, 30_000, 1)), Err(DispatchError::Unsupported));
+        assert_eq!(r2.arm.counters().refused[Refusal::Ttl as usize], 1);
     }
 
     #[test]

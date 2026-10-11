@@ -237,6 +237,188 @@ pub const S_API_RESTRICTIONS_OPT: usize = 3;
 /// The sapi templates.
 pub const SAPI_TEMPLATES: usize = 4;
 
+/// **BX10 — Binance Stocks' order stream's path**, before the listenKey
+/// (`wss://<Hosts::eq_user>/equity/ws/<listenKey>@orderReport`; the probe's
+/// EQ7). Mainnet only: Binance Stocks has no Demo (K15, R21).
+pub const EQ_USER_PATH: &str = "/equity/ws/";
+/// Its path's suffix, after the listenKey.
+pub const EQ_USER_SUFFIX: &str = "@orderReport";
+
+/// BX10 — Binance Stocks' templates (`/sapi/v1/equity/`, on the SAPI host,
+/// the arm's key): `GET …/market/exchangeInfo` (the key's header,
+/// unsigned: MARKET_DATA).
+pub const EQ_INFO: usize = 0;
+/// `GET …/market/tokenized-assets` (MARKET_DATA).
+pub const EQ_TOKENIZED: usize = 1;
+/// `GET …/market/quote` (MARKET_DATA; ≤ 5 s stale, an empty body when none).
+pub const EQ_QUOTE: usize = 2;
+/// `GET /api/v3/time` (Binance's one server time), at the lanes' own
+/// [`T_TIME`] so a client's clock reads it there too.
+pub const EQ_TIME: usize = 3;
+const _: () = assert!(EQ_TIME == T_TIME);
+/// `GET …/order/open-orders` (signed).
+pub const EQ_OPEN: usize = 4;
+/// `GET …/order/history` (signed; a window and a page).
+pub const EQ_HISTORY: usize = 5;
+/// `GET …/trade/history` (signed; a window and a page): one row an execution.
+pub const EQ_TRADES: usize = 6;
+/// `GET …/order/detail` (signed; by `orderId` or `clientOrderId`).
+pub const EQ_DETAIL: usize = 7;
+/// `POST …/equity/listenKey` (signed): creates or renews the stream's key.
+pub const EQ_LISTEN_KEY: usize = 8;
+/// The templates that read (and the listenKey's): the read-only probe's.
+pub const EQ_READ_TEMPLATES: usize = 9;
+/// `POST …/order/place` (signed, body form).
+pub const EQ_PLACE: usize = 9;
+/// `POST …/order/cancel` (signed, body form): by the venue's `orderId`.
+pub const EQ_CANCEL: usize = 10;
+/// `POST …/order/cancel-all` (signed, body form).
+pub const EQ_CANCEL_ALL: usize = 11;
+/// Binance Stocks' templates.
+pub const EQ_TEMPLATES: usize = 12;
+
+/// Binance Stocks' paths, by template (`EQ_*` above).
+pub const EQ_PATHS: [&str; EQ_TEMPLATES] = [
+    "/sapi/v1/equity/market/exchangeInfo",
+    "/sapi/v1/equity/market/tokenized-assets",
+    "/sapi/v1/equity/market/quote",
+    "/api/v3/time",
+    "/sapi/v1/equity/order/open-orders",
+    "/sapi/v1/equity/order/history",
+    "/sapi/v1/equity/trade/history",
+    "/sapi/v1/equity/order/detail",
+    "/sapi/v1/equity/listenKey",
+    "/sapi/v1/equity/order/place",
+    "/sapi/v1/equity/order/cancel",
+    "/sapi/v1/equity/order/cancel-all",
+];
+
+/// **BX10 — Binance Stocks' templates** on the SAPI host, every one
+/// carrying the key header; the reads as queries, the listenKey and the
+/// order verbs as form bodies.
+#[must_use]
+pub fn equity_specs<'a>(key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; EQ_TEMPLATES] {
+    let q = |t: usize| ReqSpec {
+        method: Method::Get,
+        path: EQ_PATHS[t],
+        params: Params::Query,
+        headers: key,
+    };
+    let b = |t: usize| ReqSpec {
+        method: Method::Post,
+        path: EQ_PATHS[t],
+        params: Params::Body(FORM),
+        headers: key,
+    };
+    [
+        q(EQ_INFO),
+        q(EQ_TOKENIZED),
+        q(EQ_QUOTE),
+        q(EQ_TIME),
+        q(EQ_OPEN),
+        q(EQ_HISTORY),
+        q(EQ_TRADES),
+        q(EQ_DETAIL),
+        b(EQ_LISTEN_KEY),
+        b(EQ_PLACE),
+        b(EQ_CANCEL),
+        b(EQ_CANCEL_ALL),
+    ]
+}
+
+/// **`GET …/order/history` or `…/trade/history`** — the window
+/// `[start_ms, end_ms]` (both required), page `page` (1-based) of 100
+/// (the venue's most).
+pub fn render_eq_window(w: &mut QueryWriter<'_>, st: &WsStatic, start_ms: u64, end_ms: u64, page: u64, ts_ms: u64) {
+    render_eq_trades(w, st, b"", start_ms, end_ms, page, ts_ms);
+}
+
+/// **`GET …/trade/history`** of one ticker (`symbol`; empty: every ticker)
+/// over `[start_ms, end_ms]`, page `page` of [`EQ_PAGE`].
+#[allow(clippy::too_many_arguments)]
+pub fn render_eq_trades(w: &mut QueryWriter<'_>, st: &WsStatic, symbol: &[u8], start_ms: u64, end_ms: u64, page: u64, ts_ms: u64) {
+    if !symbol.is_empty() {
+        w.parts(&[Part::Lit(b"symbol="), Part::Lit(symbol), Part::Lit(b"&")]);
+    }
+    w.parts(&[
+        Part::Lit(b"startTime="),
+        Part::U64(start_ms),
+        Part::Lit(b"&endTime="),
+        Part::U64(end_ms),
+        Part::Lit(b"&current="),
+        Part::U64(page),
+        Part::Lit(b"&size="),
+        Part::U64(EQ_PAGE as u64),
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(ts_ms),
+    ]);
+}
+
+/// A history page's rows: the venue's most (`size` ≤ 100).
+pub const EQ_PAGE: usize = 100;
+
+/// **`POST …/order/place`** (BX10) — a LIMIT DAY order on the order's own
+/// terms (`o`: the ticker, the side, the price on the 0.01 grid, the
+/// quantity on the row's step, our 32-character id) and the D5 statics
+/// (`eq`: the trading session, the quote asset, `tokenize`). A BUY pays
+/// from the spot wallet (`walletType=MAIN`); a SELL names none — the venue
+/// settles it to the funding wallet whatever it says (its trade page).
+/// `timeInForce=DAY` always: a GTC order outlives any gateway TTL (BX-17's
+/// exception is DAY under the TTL).
+pub fn render_eq_place(w: &mut QueryWriter<'_>, st: &WsStatic, eq: &crate::equity::EqKnobs, o: &Place<'_>) {
+    let buy = o.side == core_types::Side::Bid as u8;
+    w.parts(&[
+        Part::Lit(b"symbol="),
+        Part::Lit(o.symbol),
+        Part::Lit(b"&side="),
+        Part::Lit(side_word(o.side)),
+        Part::Lit(b"&orderType=LIMIT&quoteAsset="),
+        Part::Lit(eq.quote.as_bytes()),
+        Part::Lit(b"&price="),
+        Part::Fixed(o.px_1e6, o.px_dec),
+        Part::Lit(b"&quantity="),
+        Part::Fixed(o.qty_1e6, o.qty_dec),
+        Part::Lit(b"&timeInForce=DAY&tradingSession="),
+        Part::Lit(eq.session.word()),
+        Part::Lit(if buy { b"&walletType=MAIN" } else { b"" }),
+        Part::Lit(b"&clientOrderId="),
+        o.cid,
+        Part::Lit(if eq.tokenize { b"&tokenize=true" } else { b"&tokenize=false" }),
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(o.ts_ms),
+    ]);
+}
+
+/// **`POST …/order/cancel` · `GET …/order/detail`** by the venue's order
+/// id (BX10: a UUID — the cancel takes nothing else).
+pub fn render_eq_by_id(w: &mut QueryWriter<'_>, st: &WsStatic, id: &[u8], ts_ms: u64) {
+    w.parts(&[
+        Part::Lit(b"orderId="),
+        Part::Lit(id),
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(ts_ms),
+    ]);
+}
+
+/// **`GET …/order/detail`** by our client id (BX10: the in-doubt query —
+/// the venue's own UUID is unknown until the place's answer names it).
+pub fn render_eq_detail_cid(w: &mut QueryWriter<'_>, st: &WsStatic, cid: Part<'_>, ts_ms: u64) {
+    w.parts(&[
+        Part::Lit(b"clientOrderId="),
+        cid,
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(ts_ms),
+    ]);
+}
+
 /// A lane's jobs connection's templates for `product` (`PRODUCT_COINM`:
 /// dapi; `PRODUCT_SPOT`: spot's, BX8; `PRODUCT_OPTIONS`: eapi's, BX9;
 /// otherwise fapi) — in Portfolio Margin (`pm`), the futures product's
@@ -1415,6 +1597,61 @@ mod tests {
     /// the in-doubt status query (never futures' `origClientOrderId`: eapi
     /// would answer it with an error that is not `-2013`, and the order
     /// would stay in doubt). Break-and-watch: futures' word in either fails.
+    #[test]
+    fn the_equity_requests_carry_the_d5_keys_and_the_uuid() {
+        const PREFIX: crate::cid::CidPrefix = crate::cid::CidPrefix::new(0x6512_ab0f);
+        let st = WsStatic::new("EXPIRE_TAKER", 1_000);
+        let eq = crate::equity::EqKnobs::new(crate::equity::EqSession::Rth, false, "USDC").expect("the D5 keys");
+        let mut o = Place {
+            symbol: b"AAPL",
+            side: core_types::Side::Bid as u8,
+            maker: false,
+            reduce_only: false,
+            qty_1e6: 30_000,
+            qty_dec: 6,
+            px_1e6: 336_100_000,
+            px_dec: 2,
+            cid: Part::Cid(&PREFIX, 3, 0x0123_4567_89ab_cdef),
+            ts_ms: 1_790_000_000_000,
+        };
+        let text = |f: &dyn Fn(&mut QueryWriter<'_>)| {
+            let mut win = [0u8; 512];
+            let mut w = QueryWriter::new(&mut win);
+            f(&mut w);
+            let n = w.rendered().unwrap();
+            String::from_utf8(win[..n].to_vec()).unwrap()
+        };
+        assert_eq!(
+            text(&|w| render_eq_place(w, &st, &eq, &o)),
+            "symbol=AAPL&side=BUY&orderType=LIMIT&quoteAsset=USDC&price=336.10&quantity=0.030000&timeInForce=DAY&tradingSession=RTH&walletType=MAIN&clientOrderId=mv6512ab0f30123456789abcdef00000&tokenize=false&recvWindow=1000&timestamp=1790000000000"
+        );
+        // A SELL names no wallet (the venue settles it to the funding one);
+        // the other session words and tokenize render as asked.
+        o.side = core_types::Side::Ask as u8;
+        let eq2 = crate::equity::EqKnobs::new(crate::equity::EqSession::H24, true, "USDT").expect("the D5 keys");
+        let s = text(&|w| render_eq_place(w, &st, &eq2, &o));
+        assert!(s.starts_with("symbol=AAPL&side=SELL&orderType=LIMIT&quoteAsset=USDT&") && s.contains("&tradingSession=24H&clientOrderId=") && s.contains("&tokenize=true&"));
+        assert!(!s.contains("walletType"), "{s}");
+        let id = b"8b1f3a52-7c0e-4d55-9a8e-1f2b3c4d5e6f";
+        assert_eq!(text(&|w| render_eq_by_id(w, &st, id, 5)), "orderId=8b1f3a52-7c0e-4d55-9a8e-1f2b3c4d5e6f&recvWindow=1000&timestamp=5");
+        assert_eq!(
+            text(&|w| render_eq_detail_cid(w, &st, Part::Cid(&PREFIX, 3, 0x0123_4567_89ab_cdef), 5)),
+            "clientOrderId=mv6512ab0f30123456789abcdef00000&recvWindow=1000&timestamp=5"
+        );
+        // A page of the window, and a ticker's day: the page and its size
+        // named (the cycle judges both on the answer).
+        let w0 = text(&|w| render_eq_trades(w, &st, b"", 10, 20, 2, 5));
+        assert!(w0.starts_with("startTime=10&endTime=20&") && w0.contains("current=2") && w0.contains("size=100"), "{w0}");
+        let d = text(&|w| render_eq_trades(w, &st, b"AAPL", 10, 20, 1, 5));
+        assert!(d.starts_with("symbol=AAPL&startTime=10&"), "{d}");
+        assert_eq!(text(&|w| render_eq_window(w, &st, 10, 20, 2, 5)), w0, "the window is the trades' render with no ticker");
+        // EqKnobs refuses a quote it could not render.
+        for q in ["", "usdc", "TOOLONGQUOTE", "US-C"] {
+            assert!(crate::equity::EqKnobs::new(crate::equity::EqSession::Rth, false, q).is_none(), "{q}");
+        }
+        assert_eq!(crate::equity::EqSession::from_word("rth"), None, "the words as the venue spells them");
+    }
+
     #[test]
     fn the_options_place_and_status_query_name_eapis_client_id() {
         const PREFIX: crate::cid::CidPrefix = crate::cid::CidPrefix::new(0x6512_ab0f);

@@ -25,7 +25,7 @@ use core_io::slot_capture::SlotCapture;
 use core_ring::{Consumer, Producer};
 use core_types::ExecRecord;
 
-use crate::inst::{BnInstWire, INST_DATED, INST_INVERSE, INST_TRADFI, PRODUCT_OPTIONS};
+use crate::inst::{BnInstWire, INST_DATED, INST_INVERSE, INST_TRADFI, PRODUCT_EQUITY, PRODUCT_OPTIONS};
 use crate::mode::AccountMode;
 
 /// The ring between the gateway and the writer.
@@ -80,6 +80,11 @@ pub const J_ANCHOR: u8 = 9;
 /// (`crate::oot::TidRing`). A trade the stream lost has none; neither has
 /// a fill booked without its trade ([`J_FILL_UNSEEN`], [`J_FILL_ADOPTED`]).
 pub const J_FEE: u8 = 10;
+/// **BX10 — the broker accepted an equity order** (Binance Stocks'
+/// `ACCEPTED`: its own acknowledgement, after the venue's receipt — the
+/// [`J_ACK`]): `venue_oid` the order id's key (`crate::equity::eq_key` —
+/// the UUID itself is not a number), `a` = 0. Once per order.
+pub const J_ACCEPTED: u8 = 11;
 
 /// [`J_FEE`] `code` bits 1–2, the commission's asset to its row
 /// ([`fee_asset`]): `N` absent.
@@ -102,6 +107,17 @@ pub const TRADE_BY_SETTLEMENT: u8 = 2;
 pub const TRADE_BY_LIQUIDATION: u8 = 3;
 /// An auto-deleveraging.
 pub const TRADE_BY_ADL: u8 = 4;
+
+/// [`J_FEE`] `code` bit 14 (BX10, BX-14): a Binance Stocks order's fee is
+/// at the platform's per-order minimum ($0.35 — the fee is the greater of
+/// it and 10 bps, so every order under $350 of notional pays the floor,
+/// not the rate): its `c / b` is no rate; a measurement excludes it.
+pub const FEE_FLAG_EQ_FLOOR: i32 = 1 << 14;
+/// The platform's per-order minimum fee, USD ×1e6.
+pub const EQ_FEE_MIN_USD_1E6: i64 = 350_000;
+/// The notional under which the minimum applies (10 bps of it is the
+/// minimum), USD ×1e6.
+pub const EQ_FEE_FLOOR_NOTIONAL_1E6: i64 = 350_000_000;
 
 /// **[`J_FEE`]'s `code`**: bit 0 the trade was a maker · bits 1–2 the
 /// asset (`FEE_ASSET_*`) · bits 4–6 whose order (`TRADE_BY_*`) · bits 8–11
@@ -155,6 +171,10 @@ pub fn fee_asset(w: &BnInstWire, asset: &[u8]) -> u8 {
         // BX9: options settle in USDT alone (`optionAssets`); the symbol
         // (`BTC-261030-60000-C`) names no quote.
         asset == b"USDT"
+    } else if w.product == PRODUCT_EQUITY {
+        // BX10: Binance Stocks' fee is in USD (the detail's `fee`); the
+        // ticker names no quote.
+        asset == b"USD"
     } else {
         (asset == b"USDT" || asset == b"USDC") && head.len() > asset.len() && head.ends_with(asset)
     };
@@ -717,6 +737,17 @@ mod tests {
             assert_eq!(fee_asset(w.row(row), asset), want, "{:?} on row {row}", core::str::from_utf8(asset));
             i += 1;
         }
+        // BX10: an equity row's fee is in USD, its settlement asset.
+        let rules = crate::equity::scan_eq_symbol(
+            br#"{"symbols":[{"symbol":"AAPL","tradability":"BUY_SELL","fractionable":true,"stepSize":"0.000000001","minNotional":"5"}]}"#,
+            b"AAPL",
+        )
+        .expect("the rules");
+        let (mut t, mut we) = crate::inst::InstTable::new(7);
+        let r = t
+            .bind_equity(&mut we, &crate::inst::EqBindSpec { sym: core_types::make_symbol_id(core_types::VenueId::Binance, 4_097), row: &rules, owned: true, bstock: b"" })
+            .expect("bound");
+        assert_eq!((fee_asset(we.row(r), b"USD"), fee_asset(we.row(r), b"USDC"), fee_asset(we.row(r), b"")), (FEE_ASSET_SETTLE, FEE_ASSET_OTHER, FEE_ASSET_NONE));
     }
 
     /// BX11: the notional is the quote's (price × quantity) on a linear

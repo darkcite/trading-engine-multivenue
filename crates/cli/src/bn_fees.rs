@@ -12,7 +12,9 @@
 //! and counted apart: a settlement's, a liquidation's or an ADL's (not the
 //! maker/taker schedule); a commission in another asset than the row's
 //! settlement asset (BNB — the BNB burn is on — or another: no rate without
-//! a price for it) or naming none; a trade of no notional. Fills booked
+//! a price for it) or naming none; a trade of no notional; a Binance Stocks
+//! order's fee at the platform's $0.35 minimum (BX10: `FEE_FLAG_EQ_FLOOR`
+//! — a floor, not a rate). Fills booked
 //! without their trade (`J_FILL_UNSEEN`, `J_FILL_ADOPTED`) or lost
 //! (`J_FILL_LOST`) carry no `J_FEE`: nothing to exclude.
 //!
@@ -39,7 +41,7 @@ use core_io::PmlrReader;
 use core_types::ExecRecord;
 use exec_binance::inst::PRODUCT_COINM;
 use exec_binance::journal::{
-    fee_fields, FEE_ASSET_BNB, FEE_ASSET_NONE, FEE_ASSET_SETTLE, J_FEE, TRADE_BY_MEMBER, TRADE_BY_ORPHAN,
+    fee_fields, FEE_ASSET_BNB, FEE_ASSET_NONE, FEE_ASSET_SETTLE, FEE_FLAG_EQ_FLOOR, J_FEE, TRADE_BY_MEMBER, TRADE_BY_ORPHAN,
 };
 
 use crate::bn_demo::{product_word, Line};
@@ -122,6 +124,8 @@ pub struct Excluded {
     pub other_asset: u64,
     /// A trade of no notional.
     pub no_notional: u64,
+    /// BX10: a Binance Stocks fee at the $0.35 minimum — a floor, no rate.
+    pub eq_floor: u64,
 }
 
 /// The measurement over every journal read.
@@ -157,6 +161,8 @@ impl Measure {
             x.other_asset += 1;
         } else if r.b <= 0 {
             x.no_notional += 1;
+        } else if r.code & FEE_FLAG_EQ_FLOOR != 0 {
+            x.eq_floor += 1;
         } else {
             let class = Class { product, dated, tradfi, maker };
             let t = match self.classes.binary_search_by(|(c, _)| c.cmp(&class)) {
@@ -286,6 +292,7 @@ pub fn run(dirs: &[PathBuf], n: u64) -> Result<Measure, String> {
         .n("bnb", x.bnb as i64)
         .n("other_asset", x.other_asset as i64)
         .n("no_notional", x.no_notional as i64)
+        .n("eq_floor", x.eq_floor as i64)
         .emit();
     let rows = m.rows(n);
     Line::new("fees", "fees_toml")
@@ -339,7 +346,7 @@ mod tests {
         // USDⓈ-M dated: maker only.
         m.add(&fee(true, FEE_ASSET_SETTLE, TRADE_BY_MEMBER, PRODUCT_USDM, true, 100_000_000_000, 20_000_000));
         assert_eq!((m.records, m.fees), (69, 68));
-        assert_eq!(m.excluded, Excluded { not_ours: 2, no_asset: 1, bnb: 1, other_asset: 1, no_notional: 1 });
+        assert_eq!(m.excluded, Excluded { not_ours: 2, no_asset: 1, bnb: 1, other_asset: 1, no_notional: 1, eq_floor: 0 });
         let maker = m.tally(Class { product: PRODUCT_USDM, dated: false, tradfi: false, maker: true }).unwrap();
         let taker = m.tally(Class { product: PRODUCT_USDM, dated: false, tradfi: false, maker: false }).unwrap();
         assert_eq!((maker.n, maker.rate_bps_1e4(), maker.ceil_bps()), (30, Some(20_000), Some(2)));
@@ -382,6 +389,21 @@ mod tests {
         assert_eq!((t.rate_bps_1e4(), t.ceil_bps()), (Some(-5_000), Some(0)), "-0.5 bp → 0");
         assert_eq!(Tally::default().rate_bps_1e4(), None);
         assert_eq!(Tally::default().ceil_bps(), None);
+    }
+
+    /// BX10: a Binance Stocks fee at the $0.35 minimum is a floor, never a
+    /// rate — counted apart; one past $350 of notional is the class's.
+    /// Break-and-watch: counting the floored fee makes the rate 350 bp.
+    #[test]
+    fn an_equity_fee_at_the_floor_is_no_rate() {
+        let mut m = Measure::default();
+        let mut floored = fee(false, FEE_ASSET_SETTLE, TRADE_BY_MEMBER, exec_binance::inst::PRODUCT_EQUITY, false, 10_000_000_000, 350_000_000);
+        floored.code |= FEE_FLAG_EQ_FLOOR;
+        m.add(&floored);
+        m.add(&fee(false, FEE_ASSET_SETTLE, TRADE_BY_MEMBER, exec_binance::inst::PRODUCT_EQUITY, false, 1_000_000_000_000, 1_000_000_000));
+        assert_eq!(m.excluded.eq_floor, 1);
+        let t = m.tally(Class { product: exec_binance::inst::PRODUCT_EQUITY, dated: false, tradfi: false, maker: false }).unwrap();
+        assert_eq!((t.n, t.ceil_bps()), (1, Some(10)), "10 bps past the floor");
     }
 
     /// A journal file is read whole, and refused when it is another kind.

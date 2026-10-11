@@ -936,9 +936,11 @@ impl UserStream {
 
     /// Adopt a key from a `POST` answer: `Some(changed)`, or `None` — the
     /// key is refused whole, never truncated — if it is empty, too long or
-    /// not `[A-Za-z0-9]` (it goes into a URL path).
+    /// not `[A-Za-z0-9-]` (it goes into a URL path; BX10: Binance Stocks'
+    /// key is 36 characters, the probe's EQ7 — a UUID's shape, whose
+    /// hyphens a path carries as they are).
     pub fn set_key(&mut self, key: &[u8], now_ns: u64) -> Option<bool> {
-        if key.is_empty() || key.len() > LISTEN_KEY_MAX || !key.iter().all(|b| b.is_ascii_alphanumeric()) {
+        if key.is_empty() || key.len() > LISTEN_KEY_MAX || !key.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-') {
             return None;
         }
         let changed = self.key() != key;
@@ -1329,6 +1331,13 @@ mod tests {
         assert!(u.keepalive_due(10 + KEEPALIVE_NS));
         u.expire();
         assert_eq!((u.phase, u.key().len()), (UsPhase::NeedKey, 0));
+        // BX10: Binance Stocks' 36-character key, hyphens and all; nothing
+        // else a path would have to escape.
+        assert_eq!(u.set_key(b"3f1c2d4e-5a6b-4c7d-8e9f-0a1b2c3d4e5f", 20), Some(true));
+        assert_eq!(u.key().len(), 36);
+        assert_eq!(u.set_key(b"a/b", 21), None, "a slash would leave the path");
+        assert_eq!(u.set_key(b"a%2Fb", 21), None);
+        assert_eq!(u.set_key(b"a?b", 21), None);
     }
 
     /// BX9 (the parser review, round 2): eapi's two spellings read as the

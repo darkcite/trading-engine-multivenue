@@ -187,8 +187,9 @@
 //! Portfolio Margin and × PM Pro** (BX7: IoC-only), and **spot × classic**
 //! (BX8: IoC-only — spot has no dead-man, so no maker, cancel or modify is
 //! built for it; its balances are reconciled at the venue's 8 decimals,
-//! every armed row's permission groups judged at every account read), and
-//! **options × classic** (BX9: IoC-only, below); stocks arrive with BX10.
+//! every armed row's permission groups judged at every account read),
+//! **options × classic** (BX9: IoC-only, below) and **Binance Stocks ×
+//! classic** (BX10: DAY orders under the gateway's TTL, below).
 //!
 //! **Options (BX9, O-BX10).** eapi has no WS API: the lane's order route is
 //! the REST route, always (its WS pair is never dialled), every request
@@ -218,6 +219,48 @@
 //! day read (`userTrades`, a row at a time) waits while that window cannot
 //! take it beside a cycle (Q-5). A commission on the options stream is a
 //! charge whatever its sign (IoC: always a taker's).
+//!
+//! **Binance Stocks (BX10, O-BX1, O-BX16).** A broker path (Nest Trading
+//! → Alpaca) on SAPI REST (`/sapi/v1/equity/…`), signed by the arm's one
+//! signer (HMAC proven there, the probe's EQ4; Ed25519 unproven): the
+//! lane's order route is the REST route, always (no WS API: its pair is
+//! never dialled); its user stream is the order stream
+//! `/equity/ws/<listenKey>@orderReport` on its own host (the key `POST
+//! /sapi/v1/equity/listenKey`, signed, which also renews it). No Demo
+//! exists (K15, R21): an equity row on Demo refuses the construction. The
+//! orders are **LIMIT DAY under the gateway's TTL** (BX-17's one exception:
+//! the venue has no IoC and no dead-man) — the arm stamps the deadline
+//! (`equity_ttl_ms`), and a deadline-less equity place is refused
+//! ([`CODE_EQ_TTL`]). The venue names an order by a UUID
+//! ([`crate::equity::EqOrderId`], held per open order beside the table;
+//! the table's `venue_oid` its key): the place's answer (`status: "S"`) is
+//! the receipt ([`J_ACK`]), the broker's `ACCEPTED` its acceptance
+//! ([`J_ACCEPTED`], once); a cancel goes by the UUID alone, so an order
+//! whose UUID no answer has named yet cannot be cancelled — its cancel is
+//! owed until one does. The order stream is the TRIGGER only (it carries
+//! no client id and no execution id, its figures cumulative): a report of
+//! a fill or an end asks the order's detail (`order/detail`), whose
+//! executions book the fills — each once, by its `executionId` (the
+//! trade-id ring), never past the detail's cumulative quantity; the rest
+//! of that quantity at the implied price ([`J_FILL_UNSEEN`]) — whose fee
+//! (cumulative, USD) is journaled by its increase ([`J_FEE`], flagged at
+//! the $0.35 per-order floor, BX-14), and whose status ends the order. An
+//! order in doubt is asked by its UUID, or by our id while none is held
+//! (`486218` "Order not found" final after `recvWindow` + 5 s, as
+//! `-2013`); a disclaimer refusal (`486410`) is ONE `VenueLock`.
+//! **Recon (ruling S-2: no positions or balance endpoint):** the venue's
+//! executions over the session's window (`trade/history`, paged at 100,
+//! the window's `total` fixed by the first page) — each owned ticker's net
+//! against what this gateway booked since its boot (an execution on a
+//! ticker no row binds is an unseen leg on a dedicated account) — then the
+//! open orders, ours by UUID (the listing names no client id): an order
+//! no UUID of ours names is a stray — at boot it refuses the boot by name
+//! ([`BootErr::EqStray`]; the operator cancels it in the app), after it a
+//! foreign order. Holdings are not read (a residual: an equity held
+//! before the boot is outside the session). The day's spend: each owned
+//! ticker's buys since 00:00Z. The sweep cancels every equity order of
+//! ours by its UUID, and from its second round (a dedicated account) the
+//! account's `cancel-all`.
 //!
 //! **Spot's balance law (BX8).** A spot row's position IS its base asset's
 //! balance, and a BUY's commission is charged in that asset: each spot row
@@ -252,18 +295,22 @@ use crate::clock::VenueClock;
 use crate::cmd::*;
 use crate::config::{BnConfig, Scope, Signer, Signing};
 use crate::dns::{Resolver, DNS_HOSTS};
+use crate::equity::{
+    eq_key, eq_terminal, exec_key, scan_eq_ack, scan_eq_cancel, scan_eq_detail, scan_eq_open, scan_eq_trades, scan_order_report, EqAck, EqDetail, EqExec,
+    EqOpenRow, EqOrderId, EqReport, EQ_EV_ORDER, EQ_S_ACCEPTED, EQ_S_CANCELED, EQ_S_EXPIRED, EQ_S_FILLED, EQ_S_NEW, EQ_S_PARTIAL, EQ_S_REJECTED,
+};
 use crate::gov::{
-    classify, request_weight, CodeClass, Weighed, ACCOUNT_REREAD_MS, ARM_WEIGHT_MAX_PER_MIN, OPT_ARM_WEIGHT_MAX_PER_MIN, QTR_ICR_NS, W_OPT_RECON,
-    WEIGHT_THROTTLE_PCT,
+    classify, request_weight, CodeClass, Weighed, ACCOUNT_REREAD_MS, ARM_WEIGHT_MAX_PER_MIN, EQ_DISCLAIMER, EQ_DUPLICATE_ID, EQ_NOT_FOUND,
+    OPT_ARM_WEIGHT_MAX_PER_MIN, QTR_ICR_NS, W_OPT_RECON, WEIGHT_THROTTLE_PCT,
 };
 use crate::inst::{
-    AssetName, WireTable, INST_DATED, INST_INVERSE, INST_LIVE, INST_NO_DEADMAN, INST_OWNED, INST_WRITABLE, OPT_ULY_MAX, PRODUCT_COINM, PRODUCT_OPTIONS,
-    PRODUCT_SPOT, PRODUCT_USDM, ROW_NONE, OptWire,
+    AssetName, WireTable, INST_DATED, INST_INVERSE, INST_LIVE, INST_NO_DEADMAN, INST_OWNED, INST_WRITABLE, OPT_ULY_MAX, PRODUCT_COINM, PRODUCT_EQUITY,
+    PRODUCT_OPTIONS, PRODUCT_SPOT, PRODUCT_USDM, ROW_NONE, OptWire,
 };
 use crate::journal::{
-    fee_asset, fee_code, fee_notional_1e9, JournalTx, FEE_ASSET_NONE, JOURNAL_RING, J_ACK, J_ANCHOR, J_ENDED, J_FEE, J_FILL, J_FILL_ADOPTED,
-    J_FILL_LOST, J_FILL_UNSEEN, J_MARGIN, J_RECON, J_REJECT, J_SWEEP, J_VENUE, TRADE_BY_ADL, TRADE_BY_LIQUIDATION, TRADE_BY_MEMBER,
-    TRADE_BY_ORPHAN, TRADE_BY_SETTLEMENT,
+    fee_asset, fee_code, fee_notional_1e9, JournalTx, EQ_FEE_FLOOR_NOTIONAL_1E6, FEE_ASSET_NONE, FEE_FLAG_EQ_FLOOR, JOURNAL_RING, J_ACCEPTED, J_ACK,
+    J_ANCHOR, J_ENDED, J_FEE, J_FILL, J_FILL_ADOPTED, J_FILL_LOST, J_FILL_UNSEEN, J_MARGIN, J_RECON, J_REJECT, J_SWEEP, J_VENUE, TRADE_BY_ADL,
+    TRADE_BY_LIQUIDATION, TRADE_BY_MEMBER, TRADE_BY_ORPHAN, TRADE_BY_SETTLEMENT,
 };
 use crate::margin::um_ratio_1e6;
 use crate::mode::{judge_key, judge_mode, judge_one_way, judge_permission, judge_single_asset, judge_symbol_config, AccountMode, AssertErr};
@@ -295,10 +342,10 @@ const TK_RISK: usize = 5;
 const TOKEN_SAPI: Token = Token(LANE_TOKENS - 1);
 const _: () = assert!(TK_ORD < LANE_TOKENS - 1 && TK_RISK < LANE_TOKENS - 1);
 /// The lanes one gateway serves (BX7, M3: USDⓈ-M and COIN-M; BX8: spot;
-/// BX9: options).
-pub const LANES: usize = 4;
+/// BX9: options; BX10: Binance Stocks).
+pub const LANES: usize = 5;
 /// The lanes' order, by product.
-const LANE_ORDER: [u8; LANES] = [PRODUCT_USDM, PRODUCT_COINM, PRODUCT_SPOT, PRODUCT_OPTIONS];
+const LANE_ORDER: [u8; LANES] = [PRODUCT_USDM, PRODUCT_COINM, PRODUCT_SPOT, PRODUCT_OPTIONS, PRODUCT_EQUITY];
 
 /// Every WS connection's buffers and clocks.
 const WS_CFG: WsCfg = WsCfg {
@@ -440,6 +487,14 @@ pub const CODE_OPT_ACCOUNT: i32 = 9_016;
 /// BX9: a place on an option row past its expiry — refused locally (the
 /// venue would refuse it; the leg waits for its settlement).
 pub const CODE_EXPIRED: i32 = 9_017;
+/// BX10: the venue refused an equity place without a code (its answer's
+/// `status: "F"`), or a detail named the order `REJECTED` — the venue's
+/// refusal: it moves the reject streak ([`crate::gov::is_venue_code`]).
+pub use crate::gov::CODE_EQ_REFUSED;
+/// BX10: an equity place carried no deadline — the mandatory TTL (BX-17's
+/// exception): refused locally, never sent (an equity order rests until
+/// it is cancelled).
+pub const CODE_EQ_TTL: i32 = 9_019;
 /// How long the gateway sends nothing after a budget or lock answer (the
 /// production [`GwKnobs::quiet_ns`]): no order, no cancel, no heartbeat
 /// (the dead-man then cancels the makers), no REST, no reconnect.
@@ -481,6 +536,32 @@ pub const EXPIRY_HOLD_MAX_MS: u64 = 2 * 3_600_000;
 /// expiry): their legs stay settling and are judged at
 /// [`EXPIRY_HOLD_MAX_MS`] — drift, fail closed (the risk review's R11).
 const EXERCISE_PAGE: usize = 256;
+/// BX10: the executions one equity detail lists that the gateway reads
+/// (more refuses the answer whole — never cut short: a scan failure, the
+/// slot's drift halt; an order of the battery's size has one or two).
+const EQ_EXEC_MAX: usize = 256;
+/// BX10: after a cancel the venue answered `S` (a receipt, as a place's),
+/// how long the order may still be listed working before the cancel goes
+/// again (the risk review's S1: a receipt is not the broker's cancel).
+const EQ_CANCEL_CHECK_NS: u64 = 5 * S;
+/// BX10: the cancels of ours the venue may take (`S`) for one order before
+/// the next take is a scan failure (the risk review's round-2 m5: a venue
+/// that answers `S` and never cancels — two re-checks, ~10 s).
+const EQ_CANCEL_TAKES_MAX: u8 = 3;
+/// BX10: the open equity orders one listing holds (more refuses it).
+const EQ_OPEN_MAX: usize = 1_024;
+/// BX10: the `ACCEPTED` reports ahead of their order's answer kept (a
+/// power of two; more in flight at once than the arm's open-order cap
+/// never are).
+const EQ_ACC_N: usize = 8;
+const _: () = assert!(EQ_ACC_N.is_power_of_two());
+/// BX10: the execution pages one cycle reads (100 rows each); a window
+/// holding more fails the cycle (fail closed: no verdict on a partial sum).
+pub const EQ_PAGES_MAX: u64 = 20;
+/// BX10: how far past the venue clock's now an executions read reaches (an
+/// execution stamped a little ahead of our clock is still in the window).
+const EQ_WINDOW_AHEAD_MS: u64 = 60_000;
+
 /// BX9: a short option's initial margin is at most the mark plus this
 /// share of the index per contract (Binance's formula, D8: the rate of
 /// `max(10 %·I, 15 %·I − OTM)` is at most 15 %) — the exposure a held
@@ -538,6 +619,10 @@ pub struct GwKnobs {
     /// instance cap, USD ×1e6 (`cap_instance_usd_1e6`). `0` adopts nothing
     /// (a position on an owned row refuses the boot).
     pub adopt_cap_usd_1e6: i64,
+    /// BX10 — Binance Stocks' D5 keys (the session, `tokenize`, the quote:
+    /// required, no default). `None`: an equity row refuses the boot
+    /// ([`BootErr::Product`]).
+    pub equity: Option<crate::equity::EqKnobs>,
 }
 
 /// Why the boot was refused.
@@ -589,6 +674,18 @@ pub enum BootErr {
     /// may not write (BX-18: not writable, or not owned to be adopted): the
     /// boot is refused (BX9) — the operator closes it, or arms writing.
     OptionShort(u16),
+    /// BX10: an equity order rests at boot that no UUID of this boot's
+    /// names, on a bound ticker (its row) — or, on a dedicated account, on
+    /// any (`ROW_NONE`: a ticker no row binds): Binance Stocks' listing
+    /// names no client id, so it cannot be read as ours or another's. The
+    /// operator cancels it in the app.
+    EqStray(u16),
+    /// BX10: with `tokenize` on, an equity row's fills settle as its bStock
+    /// — the base asset of an armed spot row (that row's index), or a
+    /// bStock not named beside a spot lane (the equity row's index: the
+    /// check cannot be made). The spot balance would move under the spot
+    /// row's reconciliation. Refused.
+    EqToken(u16),
 }
 
 /// Where the gateway is.
@@ -652,6 +749,13 @@ enum JobKind {
     /// BX9 (Q-1): the options key's own permissions (`apiRestrictions`
     /// under its header) when it is not the arm's: boot only, SAPI.
     RestrictionsOpt = 18,
+    /// BX10: an equity order's detail (`order/detail` by its UUID) — its
+    /// executions, fee and status; `oid` packs the order's table slot and
+    /// generation (a slot reused since is not this order).
+    EqDetail = 19,
+    /// BX10: a page of the session's executions (`trade/history`) — the
+    /// cycle's equity legs; `oid` is the page (1-based).
+    EqTrades = 20,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -789,6 +893,9 @@ enum ReconStep {
     /// BX9: the options positions (`/eapi/v1/position`), between the
     /// options account and the open orders.
     Positions,
+    /// BX10: the session's executions (`trade/history`, page by page), the
+    /// equity lane's legs, before its open orders.
+    Executions,
 }
 
 /// The sweep in progress.
@@ -854,6 +961,43 @@ impl InFlight {
     };
 }
 
+/// **BX10 — an equity order's own facts**, beside its open-order slot:
+/// the venue's UUID (none until an answer names it), whether the broker's
+/// `ACCEPTED` was journaled, whether a detail read is queued or in flight,
+/// whether a report came before any answer named the order (its detail is
+/// asked once one does), whose cancel the venue took, and the cumulative
+/// fee and notional its journaled fees cover.
+#[derive(Copy, Clone, Debug)]
+struct EqSlot {
+    id: EqOrderId,
+    accepted: bool,
+    detail_q: bool,
+    report_q: bool,
+    /// A cancel of ours the venue answered `S` (`OWE_MEMBER` / `OWE_TTL`;
+    /// 0 none): whose the order's `CANCELED` is.
+    cancelled: u8,
+    /// How many cancels of ours the venue took (`S`) for this order —
+    /// [`EQ_CANCEL_TAKES_MAX`] with it still working is a scan failure.
+    takes: u8,
+    fee_1e9: i64,
+    fee_notional_1e6: i64,
+}
+
+const _: () = assert!(core::mem::size_of::<EqSlot>() <= 64);
+
+impl EqSlot {
+    const NONE: Self = Self {
+        id: EqOrderId::NONE,
+        accepted: false,
+        detail_q: false,
+        report_q: false,
+        cancelled: 0,
+        takes: 0,
+        fee_1e9: 0,
+        fee_notional_1e6: 0,
+    };
+}
+
 /// One request the REST order route carries (BX7, C5): the order it is
 /// for — rendered when its turn comes — and, once on the wire, when.
 #[derive(Copy, Clone, Debug)]
@@ -884,7 +1028,8 @@ struct RestRoute {
 /// lane 4, the journal, the stats block, the signer, the clock, the desk
 /// and the weight window (one IP pool).
 struct Lane {
-    /// `PRODUCT_USDM`, `PRODUCT_COINM`, `PRODUCT_SPOT` or `PRODUCT_OPTIONS`.
+    /// `PRODUCT_USDM`, `PRODUCT_COINM`, `PRODUCT_SPOT`, `PRODUCT_OPTIONS` or
+    /// `PRODUCT_EQUITY`.
     product: u8,
     /// Its hosts' indices in the resolver (BX7, DNS): the WS API's, the
     /// stream host's (the user stream and PM Pro's risk stream), the REST
@@ -903,9 +1048,11 @@ struct Lane {
     /// Margin: the first — the account has ONE, its events naming their
     /// product; spot: none — its user data rides the order sessions).
     has_us: bool,
-    /// The stream's path before the key: `/ws/`, PM's `/pm/ws/`, or
-    /// options' `/private/ws/` (BX9).
+    /// The stream's path before the key: `/ws/`, PM's `/pm/ws/`, options'
+    /// `/private/ws/` (BX9) or Binance Stocks' `/equity/ws/` (BX10).
     us_prefix: &'static [u8],
+    /// After the key (BX10: Binance Stocks' `@orderReport`; empty else).
+    us_suffix: &'static [u8],
     /// The lane's request statics (papi's COIN-M order takes no STP mode).
     st: WsStatic,
     /// The order sessions' two slots (make-before-break, [`Mbb`]).
@@ -1010,6 +1157,9 @@ const fn job_weight(k: JobKind, product: u8) -> Weighed {
         JobKind::PmAccount => Weighed::PmAccount,
         JobKind::SymbolConfig => Weighed::SymbolConfig,
         JobKind::OptPositions | JobKind::Exercise => Weighed::OptPosition,
+        // BX10: SAPI's own pools — never metered in the futures window
+        // (`BnGateway::weigh`): the class is nominal.
+        JobKind::EqDetail | JobKind::EqTrades => Weighed::One,
         JobKind::Time
         | JobKind::Restrictions
         | JobKind::RestrictionsOpt
@@ -1306,6 +1456,35 @@ pub struct BnGateway<const FILL_N: usize, const J_N: usize = JOURNAL_RING> {
     acct_perm: BnPermissions,
     /// A permission lock was raised this process (once: [`CODE_PERMISSION`]).
     perm_locked: bool,
+    /// BX10: each open order's equity facts, by its table slot (blank on
+    /// every other product's).
+    eq: Box<[EqSlot; OOT_CAP]>,
+    /// BX10: the session's executions window's start, venue ms (the boot's
+    /// first cycle) — what this gateway booked since is compared with it —
+    /// and the cycle's end (fixed at its first page).
+    eq_window_ms: u64,
+    eq_end_ms: u64,
+    /// BX10: the cycle's executions per row (signed ×1e6), the window's
+    /// `total` (the first page's), the rows read so far, and whether an
+    /// execution named a ticker no row binds.
+    eq_exec: Box<[i64; crate::inst::INST_MAX]>,
+    eq_total: u64,
+    eq_seen: u64,
+    eq_unbound: bool,
+    /// BX10: the scanners' arrays — a page, a detail's executions, a listing.
+    eq_page: Box<[EqExec; crate::rest::EQ_PAGE]>,
+    eq_x: Box<[EqExec; EQ_EXEC_MAX]>,
+    eq_open: Box<[EqOpenRow; EQ_OPEN_MAX]>,
+    /// BX10: the disclaimer's lock was raised this process (once).
+    eq_locked: bool,
+    /// BX10: the sweep's account-wide `cancel-all` is queued or in flight.
+    eq_cancel_all_q: bool,
+    /// BX10: the keys (`eq_key`) of the last `ACCEPTED` reports no answer
+    /// had named yet — journaled ([`J_ACCEPTED`]) once an answer names the
+    /// order (a report ahead of the place's answer; the order may end
+    /// before any detail reads it `ACCEPTED`).
+    eq_acc: [u64; EQ_ACC_N],
+    eq_acc_head: usize,
 }
 
 impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
@@ -1348,7 +1527,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         while i < wire.len() {
             let p = wire.row(i as u16).product;
             let spot = p == PRODUCT_SPOT;
-            let classic_only = spot || p == PRODUCT_OPTIONS;
+            let classic_only = spot || p == PRODUCT_OPTIONS || p == PRODUCT_EQUITY;
             if (p != PRODUCT_USDM && p != PRODUCT_COINM && !classic_only) || (classic_only && (pm || pm_pro)) {
                 return Err(BootErr::Product(p));
             }
@@ -1380,7 +1559,35 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             a += 1;
         }
         let opts = want[PRODUCT_OPTIONS as usize];
-        if !want[PRODUCT_USDM as usize] && !want[PRODUCT_COINM as usize] && !want[PRODUCT_SPOT as usize] && !opts {
+        // BX10: Binance Stocks has no Demo (K15, R21), and its orders need
+        // the D5 keys (no default).
+        let eqs = want[PRODUCT_EQUITY as usize];
+        if eqs && (demo || knobs.equity.is_none()) {
+            return Err(BootErr::Product(PRODUCT_EQUITY));
+        }
+        // ...and with `tokenize` on its fills settle as the bStock: not an
+        // armed spot row's base (the spot balance law would read them).
+        if eqs && knobs.equity.as_ref().is_some_and(|e| e.tokenize) {
+            let mut i = 0;
+            while i < wire.len() {
+                let b = wire.eq(i as u16).bstock;
+                if wire.row(i as u16).product == PRODUCT_EQUITY && b == AssetName::EMPTY && n_spot > 0 {
+                    // The risk review's S9: no token named, no check made.
+                    return Err(BootErr::EqToken(i as u16));
+                }
+                if wire.row(i as u16).product == PRODUCT_EQUITY && b != AssetName::EMPTY {
+                    let mut k = 0;
+                    while k < n_spot {
+                        if spot_assets[k] == b {
+                            return Err(BootErr::EqToken(spot_rows[k]));
+                        }
+                        k += 1;
+                    }
+                }
+                i += 1;
+            }
+        }
+        if !want[PRODUCT_USDM as usize] && !want[PRODUCT_COINM as usize] && !want[PRODUCT_SPOT as usize] && !opts && !eqs {
             want[PRODUCT_USDM as usize] = true;
         }
         // R22: HMAC signs REST only — the WS API's `session.logon` takes
@@ -1584,6 +1791,20 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             spot_bal_1e8: exec_gateway::boxed_array(0),
             acct_perm: BnPermissions::EMPTY,
             perm_locked: false,
+            eq: exec_gateway::boxed_array(EqSlot::NONE),
+            eq_window_ms: 0,
+            eq_end_ms: 0,
+            eq_exec: exec_gateway::boxed_array(0i64),
+            eq_total: 0,
+            eq_seen: 0,
+            eq_unbound: false,
+            eq_page: exec_gateway::boxed_array(EqExec::default()),
+            eq_x: exec_gateway::boxed_array(EqExec::default()),
+            eq_open: exec_gateway::boxed_array(EqOpenRow::default()),
+            eq_locked: false,
+            eq_cancel_all_q: false,
+            eq_acc: [0; EQ_ACC_N],
+            eq_acc_head: 0,
         })
     }
 
@@ -1620,20 +1841,28 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             .map_err(|_| BootErr::Transport)?;
         // The user stream's path is the listenKey's, set once it exists.
         let opt = product == PRODUCT_OPTIONS;
-        let (us_path, us_prefix): (&str, &'static [u8]) = if pm {
-            ("/pm/ws/pending", b"/pm/ws/")
+        let eq = product == PRODUCT_EQUITY;
+        let (us_path, us_prefix, us_suffix): (&str, &'static [u8], &'static [u8]) = if pm {
+            ("/pm/ws/pending", b"/pm/ws/", b"")
         } else if opt {
-            ("/private/ws/pending", b"/private/ws/")
+            ("/private/ws/pending", b"/private/ws/", b"")
+        } else if eq {
+            ("/equity/ws/pending", b"/equity/ws/", b"@orderReport")
         } else {
-            ("/ws/pending", b"/ws/")
+            ("/ws/pending", b"/ws/", b"")
         };
         let us = WsConn::new(h.user, port, us_path, tls.clone(), WS_CFG, lane_token(l, TK_US), 0x6273_7573 ^ seed)
             .map_err(|_| BootErr::Transport)?;
-        let rest = HttpsConn::new(h.rest, port, tls.clone(), &lane_specs(product, pm, key_header), CONN_CFG, lane_token(l, TK_REST))
+        // BX10: Binance Stocks' jobs and route speak its own templates
+        // (`equity_specs`: the reads, the listenKey, the order verbs).
+        let eq_specs = equity_specs(key_header);
+        let jobs_specs = lane_specs(product, pm, key_header);
+        let rest = HttpsConn::new(h.rest, port, tls.clone(), if eq { &eq_specs[..] } else { &jobs_specs[..] }, CONN_CFG, lane_token(l, TK_REST))
             .map_err(|_| BootErr::Transport)?;
-        let rest_route = knobs.rest_orders || pm || opt;
+        let rest_route = knobs.rest_orders || pm || opt || eq;
         let route = if rest_route {
-            let conn = HttpsConn::new(h.rest, port, tls.clone(), &ord_specs(product, pm, key_header), CONN_CFG, lane_token(l, TK_ORD))
+            let route_specs = ord_specs(product, pm, key_header);
+            let conn = HttpsConn::new(h.rest, port, tls.clone(), if eq { &eq_specs[..] } else { &route_specs[..] }, CONN_CFG, lane_token(l, TK_ORD))
                 .map_err(|_| BootErr::Transport)?;
             Some(RestRoute {
                 conn,
@@ -1666,6 +1895,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             risk,
             has_us: product != PRODUCT_SPOT && (!pm || l == 0),
             us_prefix,
+            us_suffix,
             st: if pm && product == PRODUCT_COINM { st.without_stp() } else { st },
             ws: [ws0, ws1],
             mbb: Mbb::new(Backoff::new(250 * MS, 30 * S, 7 + j), WS_HEALTHY_NS, WS_DIAL_BUDGET_NS, WS_DRAIN_BUDGET_NS),
@@ -2159,6 +2389,9 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
     /// Render, sign and start `r` on the REST route's connection — an
     /// options lane's in eapi's words, with its own signer (BX9).
     fn start_rest_order(&mut self, l: usize, r: WsReq, now: u64) -> RestStart {
+        if self.lanes[l].product == PRODUCT_EQUITY {
+            return self.eq_start_order(l, r, now);
+        }
         let ts = self.clock.venue_ms(now);
         let st = self.lanes[l].st;
         let opt = self.lanes[l].product == PRODUCT_OPTIONS;
@@ -2307,6 +2540,12 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         };
         self.lanes[l].ord_down_ns = 0;
         self.stats.note_reply();
+        // BX10: Binance Stocks' answers are its own shapes.
+        if self.lanes[l].product == PRODUCT_EQUITY {
+            self.eq_answered(l, q.req, q.sent_ns, status, span.start, span.end, now);
+            self.pump_route(l, now);
+            return;
+        }
         let mut a = WsAnswer::default();
         let scanned = scan_rest_answer(status, self.frame(Frame::Rest(l, span.start, span.end)), &mut a);
         match scanned {
@@ -2351,7 +2590,10 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
     #[inline]
     fn weigh(&mut self, l: usize, w: Weighed, now: u64) {
         match self.lanes[l].product {
-            PRODUCT_SPOT => {}
+            // BX10: Binance Stocks is SAPI's (its own IP pool, 12 000 a
+            // minute; the places are the UID's 200 a minute, the arm's
+            // pool): never the futures' window.
+            PRODUCT_SPOT | PRODUCT_EQUITY => {}
             PRODUCT_OPTIONS => self.opt_weight.add(now, request_weight(w)),
             _ => self.weight.add(now, request_weight(w)),
         }
@@ -2440,6 +2682,11 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         if self.lanes[l].product == PRODUCT_OPTIONS && self.expired(c.row, now) {
             return self.refuse_place(c, CODE_EXPIRED, now);
         }
+        // BX10: an equity order rests until it is cancelled (DAY; BX-17's
+        // exception) — never sent without the TTL that cancels it.
+        if self.lanes[l].product == PRODUCT_EQUITY && c.ttl_deadline_ns == 0 {
+            return self.refuse_place(c, CODE_EQ_TTL, now);
+        }
         // S7: an id the ring remembers ending is not placed again — a late
         // answer or event of the ended order would reach the new one
         // ("unique per slot per boot" is a member's arming law).
@@ -2457,6 +2704,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             return self.refuse_place(c, CODE_TIMER_FULL, now);
         }
         self.oot.aux_mut(ix).place_flags = c.flags;
+        self.eq[ix as usize] = EqSlot::NONE;
         let gen = self.oot.aux(ix).gen;
         if let Err(code) = self.post(l, WsReq::on(REQ_PLACE, ix, gen, c.client_oid), now) {
             self.disarm_order(ix);
@@ -2532,6 +2780,12 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         };
         let l = self.lane_of_row(row);
         if flags & OF_CANCEL_SENT != 0 || !self.ready_to_send(l, now) {
+            return false;
+        }
+        // BX10: Binance Stocks cancels by the venue's UUID alone — none held
+        // yet (the place's answer is still to come), and the cancel waits,
+        // owed.
+        if self.lanes[l].product == PRODUCT_EQUITY && !self.eq[ix as usize].id.is_some() {
             return false;
         }
         let gen = self.oot.aux(ix).gen;
@@ -2623,10 +2877,22 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
     fn sweep_round(&mut self, now: u64) {
         // Every maker of ours over the order session (an IoC ends on its
         // own).
+        // BX10: and every equity order of ours (each rests, DAY, whatever
+        // its kind) — by its UUID; one no answer has named yet waits for
+        // the next round.
         let mut ix = 0u16;
+        let mut eq_open = false;
         while (ix as usize) < OOT_CAP {
-            if self.oot.is_open(ix) && self.oot.get(ix).kind == ORDER_KIND_MAKER && self.send_cancel(ix, now, false) {
-                self.sweep.cancels += 1;
+            if self.oot.is_open(ix) {
+                let equity = self.wire.row(self.oot.get(ix).row).product == PRODUCT_EQUITY;
+                eq_open |= equity;
+                // An equity cancel the venue took (`S`) is re-sent by its
+                // own re-check (EQ_CANCEL_CHECK_NS), not each round: a slow
+                // broker's receipts are no failure to count.
+                let taken = equity && self.eq[ix as usize].cancelled != 0;
+                if (self.oot.get(ix).kind == ORDER_KIND_MAKER || equity) && !taken && self.send_cancel(ix, now, false) {
+                    self.sweep.cancels += 1;
+                }
             }
             ix += 1;
         }
@@ -2637,6 +2903,20 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         // cancelled over REST (unless the gateway is quiet: the dead-man
         // then does it).
         let every_row = self.sweep.round >= 1 || self.sweep_streak > 0;
+        // BX10: Binance Stocks' `cancel-all` is the ACCOUNT's (it names no
+        // ticker): from the second round, on a dedicated account only.
+        let eql = self.lane_ix[PRODUCT_EQUITY as usize];
+        if eq_open
+            && every_row
+            && eql != NO_LANE
+            && !self.knobs.shared
+            && now >= self.quiet_until_ns
+            && !self.eq_cancel_all_q
+            && self.queue_job(eql as usize, JobKind::CancelAll, ROW_NONE)
+        {
+            self.eq_cancel_all_q = true;
+            self.sweep.cancels += 1;
+        }
         let mut r = 0;
         while r < self.rows.len() {
             if self.rows[r].makers > 0
@@ -2917,6 +3197,9 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
     }
 
     fn drain_us(&mut self, l: usize, now: u64) {
+        if self.lanes[l].product == PRODUCT_EQUITY {
+            return self.drain_eq(l, now);
+        }
         loop {
             let span = match self.lanes[l].us.next_frame() {
                 WsNext::Idle => return,
@@ -3585,6 +3868,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         let jk = if kind == EVT_REJECT { J_REJECT } else { J_ENDED };
         self.note(jk, now, cur, venue_oid, filled, qty, 0, if kind == EVT_REJECT { code } else { why as i32 }, row, slot);
         self.disarm_order(ix);
+        self.eq[ix as usize] = EqSlot::NONE;
         self.ended.record(slot, cid, now, filled, quote, flags & OF_STATUS_BOOKED != 0);
         let r = &mut self.rows[row as usize];
         debug_assert!(r.open > 0, "an order ended on a row with none open");
@@ -4117,6 +4401,17 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         self.probe_queued &= j.kind != JobKind::Probe;
         self.pm_account_queued &= j.kind != JobKind::PmAccount;
         self.exercise_queued &= j.kind != JobKind::Exercise;
+        // BX10: an equity detail's flag; the account-wide cancel-all's.
+        if j.kind == JobKind::EqDetail {
+            let ix = (j.oid & 0xFFFF) as usize;
+            if ix < OOT_CAP {
+                self.eq[ix].detail_q = false;
+            }
+        }
+        if j.kind == JobKind::CancelAll && self.lanes[j.lane as usize].product == PRODUCT_EQUITY {
+            self.eq_cancel_all_q = false;
+            return;
+        }
         if let Some(r) = self.rows.get_mut(j.row as usize) {
             match j.kind {
                 JobKind::Countdown => r.cd_queued = false,
@@ -4172,6 +4467,9 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
     }
 
     fn start_rest(&mut self, l: usize, mut j: Job, now: u64, sapi: bool) {
+        if !sapi && self.lanes[l].product == PRODUCT_EQUITY {
+            return self.eq_start_job(l, j, now);
+        }
         if j.kind == JobKind::Countdown && !self.ready_to_send(l, now) {
             // N2: a renewal queued while the session could cancel is not
             // sent once it cannot (B1).
@@ -4200,6 +4498,11 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             JobKind::OptPositions => (T_POSITION, true),
             JobKind::Exercise => (T_EXERCISE, true),
             JobKind::RestrictionsOpt => (S_API_RESTRICTIONS_OPT, true),
+            // BX10: the equity lane's own (`eq_start_job`): never here.
+            JobKind::EqDetail | JobKind::EqTrades => {
+                debug_assert!(false, "an equity job on another lane");
+                return self.rest_failed(j, now);
+            }
         };
         // BX9 (Q-1): the options lane's jobs, and the options key's own
         // permission read, sign with the options signer.
@@ -4361,6 +4664,19 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 }
             }
             JobKind::Exercise => {}
+            // BX10: an unread detail — the order in doubt: its query (by its
+            // UUID) asks again within a second.
+            JobKind::EqDetail => {
+                let ix = (j.oid & 0xFFFF) as u16;
+                if (ix as usize) < OOT_CAP && self.oot.is_open(ix) && u64::from(self.oot.aux(ix).gen) == j.oid >> 16 {
+                    self.doubt(ix);
+                }
+            }
+            JobKind::EqTrades => {
+                if self.recon == ReconStep::Executions {
+                    self.recon_failed();
+                }
+            }
             JobKind::Time => {
                 self.clock_pending = self.clock_pending.saturating_sub(1);
                 if self.clock_pending == 0 && !self.clock.measured() {
@@ -4409,6 +4725,11 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
     fn rest_answered(&mut self, j: Job, status: u16, b0: usize, b1: usize, now: u64, sapi: bool) {
         let l = j.lane as usize;
         self.job_done(&j);
+        // BX10: Binance Stocks' answers are its own shapes (the clock's is
+        // Binance's one server time, read below).
+        if !sapi && self.lanes[l].product == PRODUCT_EQUITY && j.kind != JobKind::Time {
+            return self.eq_job_answered(l, j, status, b0, b1, now);
+        }
         match j.kind {
             JobKind::Time => {
                 let t = scan_server_time(self.body(l, sapi, b0, b1));
@@ -4530,6 +4851,8 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             // The orders' ends arrive on the user stream, or the next
             // listing puts them in doubt.
             JobKind::CancelAll => {}
+            // BX10: the equity lane's alone (above).
+            JobKind::EqDetail | JobKind::EqTrades => {}
         }
     }
 
@@ -4555,11 +4878,11 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             // key, laid straight into the socket's own path (cold, once per
             // key) — and PM Pro's risk stream, on the same key.
             let ln = &mut self.lanes[l];
-            let (pre, key) = (ln.us_prefix, ln.user.key());
+            let (pre, key, post) = (ln.us_prefix, ln.user.key(), ln.us_suffix);
             if !ln.us.is_down() {
                 ln.us.close();
             }
-            let _ = ln.us.set_path_parts(&[pre, key]);
+            let _ = ln.us.set_path_parts(&[pre, key, post]);
             if let Some(r) = ln.risk.as_mut() {
                 if !r.ws.is_down() {
                     r.ws.close();
@@ -4597,6 +4920,9 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
 
     /// Lane `l`'s account read: a cycle's step, or a margin re-read.
     fn recon_account(&mut self, l: usize, now: u64, account_only: bool) -> bool {
+        if self.lanes[l].product == PRODUCT_EQUITY {
+            return self.eq_recon_start(l, now, account_only);
+        }
         if !self.ready_to_send(l, now) || self.post(l, WsReq::on(REQ_ACCOUNT, IX_NONE, 0, 0), now).is_err() {
             return false;
         }
@@ -5161,6 +5487,9 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         if status != 200 {
             return self.recon_failed();
         }
+        if self.lanes[l].product == PRODUCT_EQUITY {
+            return self.eq_orders_answered(l, b0, b1, sent_ns, now);
+        }
         let n = {
             let body = self.lanes[l].rest.resp().get(b0..b1).unwrap_or(&[]);
             scan_orders(body, &mut self.orders[..])
@@ -5256,6 +5585,16 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 let _ = self.rest_cancel_all(row, now);
             }
         }
+        self.listed(l, sent_ns, ours_open, v, listing_only, now);
+    }
+
+    /// **Lane `l`'s listing was read** (asked for at `sent_ns`; `ours_open`
+    /// of ours named open; the cycle's verdict so far `v`): the working
+    /// orders it should have named and did not are in doubt, the cycle goes
+    /// on to the next lane — or, the last, to the sweep's confirmation and
+    /// the verdict. Shared by every product's listing (BX10: Binance
+    /// Stocks' too).
+    fn listed(&mut self, l: usize, sent_ns: u64, ours_open: u32, v: Verdict, listing_only: bool, now: u64) {
         // Working orders the listing should have named and did not: their
         // end was lost (BX-11) — in doubt, resolved by `order.status`. And
         // the backstop of F1: a listed order whose cancel `-2011` parked is
@@ -5663,6 +6002,927 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
     }
 
     // ---------------------------------------------------------------------
+    // Binance Stocks (BX10; module docs)
+    // ---------------------------------------------------------------------
+
+    /// **An equity request on the REST route**: the place (LIMIT DAY, the
+    /// D5 statics), the cancel (by the UUID), the in-doubt detail (by the
+    /// UUID, else by our id) — rendered from the table, signed by the arm's
+    /// signer, started.
+    fn eq_start_order(&mut self, l: usize, r: WsReq, now: u64) -> RestStart {
+        let ts = self.clock.venue_ms(now);
+        let st = self.lanes[l].st;
+        let t = match r.verb {
+            REQ_PLACE => EQ_PLACE,
+            REQ_CANCEL => EQ_CANCEL,
+            REQ_STATUS => EQ_DETAIL,
+            _ => {
+                // No modify (Binance Stocks has none) and no account read
+                // (the cycle reads the executions): never posted here.
+                debug_assert!(false, "an equity verb that is not built");
+                return RestStart::Unrendered;
+            }
+        };
+        if r.ix == IX_NONE || (r.verb == REQ_CANCEL && !self.eq[r.ix as usize].id.is_some()) {
+            // A stray's cancel is never posted (its UUID is not ours), nor a
+            // cancel before the UUID (`send_cancel`): unrendered, owed again.
+            return RestStart::Unrendered;
+        }
+        let Some(eqk) = self.knobs.equity.as_ref() else {
+            // The construction refuses an equity row without the D5 keys.
+            return RestStart::Unrendered;
+        };
+        let Some(rt) = self.lanes[l].route.as_mut() else {
+            return RestStart::Later;
+        };
+        let win = rt.conn.window_mut(t);
+        if win.is_empty() {
+            return RestStart::Later;
+        }
+        let mut w = QueryWriter::new(win);
+        let e = self.oot.get(r.ix);
+        let id = &self.eq[r.ix as usize].id;
+        match r.verb {
+            REQ_PLACE => {
+                let row = self.wire.row(e.row);
+                let o = Place {
+                    symbol: row.symbol(),
+                    side: e.side,
+                    maker: false,
+                    reduce_only: false,
+                    qty_1e6: e.qty_1e6,
+                    qty_dec: row.qty_dec,
+                    px_1e6: e.px_1e6,
+                    px_dec: row.px_dec,
+                    cid: Part::Cid(&self.prefix, e.slot, e.cid_oid),
+                    ts_ms: ts,
+                };
+                render_eq_place(&mut w, &st, eqk, &o);
+            }
+            REQ_CANCEL => render_eq_by_id(&mut w, &st, id.get(), ts),
+            _ if id.is_some() => render_eq_by_id(&mut w, &st, id.get(), ts),
+            _ => render_eq_detail_cid(&mut w, &st, Part::Cid(&self.prefix, e.slot, e.cid_oid), ts),
+        }
+        let Ok(len) = w.sign_with(&self.signer) else {
+            return RestStart::Unrendered;
+        };
+        match rt.conn.start(t, len, self.poll.registry(), now) {
+            Ok(()) => RestStart::Started,
+            Err(_) => {
+                rt.up = false;
+                RestStart::Down
+            }
+        }
+    }
+
+    /// **An equity answer on the REST route** (`r`, sent at `sent`; the
+    /// body `b0..b1` of lane `l`'s route): a refusal's budget, lock or
+    /// clock side effects as every product's, then by verb.
+    #[allow(clippy::too_many_arguments)]
+    fn eq_answered(&mut self, l: usize, r: WsReq, sent: u64, status: u16, b0: usize, b1: usize, now: u64) {
+        let rtt = now.saturating_sub(sent);
+        match r.verb {
+            REQ_PLACE => self.stats.post_rtt.record(rtt),
+            REQ_CANCEL => self.stats.cancel_rtt.record(rtt),
+            _ => {}
+        }
+        let fr = Frame::Rest(l, b0, b1);
+        if status != 200 {
+            let (code, until) = {
+                let b = self.frame(fr);
+                (scan_error(b), if status == 418 || status == 429 { scan_ban_until(b) } else { 0 })
+            };
+            if code == 0 && status < 500 {
+                // No code under 500 — a body not one readable object (a
+                // CDN's page, a code named twice), or a 2xx we do not know:
+                // no answer (BX-15, every product's law; the risk review's
+                // round-2 m1). The request lost: a place in doubt, a cancel
+                // owed. A 418 or a 429 is still the ban or the budget.
+                self.scan_failed(SCAN_REST, ScanErr::Missing, now);
+                if status == 418 || status == 429 {
+                    self.venue_code(0, status, until, now);
+                }
+                if !self.for_open(&r) {
+                    return;
+                }
+                // A cancel is owed as an unread one is (paced, the order in
+                // doubt — never re-sent at once into a page that keeps
+                // answering: the risk review's round-3 MINOR).
+                match r.verb {
+                    REQ_PLACE => self.doubt(r.ix),
+                    REQ_CANCEL => self.eq_cancel_refused(r.ix, 0, now),
+                    _ => {}
+                }
+                return;
+            }
+            self.venue_code(code, status, until, now);
+            if !self.for_open(&r) {
+                return;
+            }
+            match r.verb {
+                REQ_PLACE => self.eq_place_refused(r.ix, code, status, now),
+                REQ_CANCEL => self.eq_cancel_refused(r.ix, code, now),
+                // `486218`: no such order. Final only once no copy of the
+                // place can still arrive (BX-11, as `-2013`) — and never for
+                // an order the venue's own receipt named (its UUID held: the
+                // answers disagree — a scan failure, the drift halt and its
+                // sweep; the risk review's item 3).
+                _ => {
+                    let age = now.saturating_sub(self.oot.aux(r.ix).placed_ns);
+                    if code == EQ_NOT_FOUND && age > self.knobs.recv_window_ms * MS + 5 * S {
+                        if self.eq[r.ix as usize].id.is_some() {
+                            self.scan_failed(SCAN_REST, ScanErr::BadField, now);
+                        } else {
+                            self.end_order(r.ix, EVT_REJECT, RETIRED_REJECTED, code, now);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if !self.for_open(&r) {
+            return;
+        }
+        match r.verb {
+            REQ_PLACE => self.eq_placed(r.ix, fr, now),
+            REQ_CANCEL => {
+                let scanned = scan_eq_cancel(self.frame(fr));
+                let named = match scanned {
+                    Ok((id, _)) => self.eq[r.ix as usize].id.is(id.get(self.frame(fr))),
+                    Err(_) => false,
+                };
+                match scanned {
+                    // Taken — a receipt, as the place's: the order's end
+                    // arrives on the stream; still listed working past
+                    // EQ_CANCEL_CHECK_NS, the cancel goes again.
+                    Ok((_, true)) if named => self.eq_cancel_taken(r.ix, now),
+                    Ok((_, true)) => {
+                        // The answer names another order: no answer we know.
+                        self.scan_failed(SCAN_REST, ScanErr::BadField, now);
+                        self.eq_cancel_refused(r.ix, 0, now);
+                    }
+                    Ok((_, false)) => self.eq_cancel_refused(r.ix, 0, now),
+                    Err(e) => {
+                        // An answer we cannot read: the cancel may or may
+                        // not have landed — owed again, the order in doubt.
+                        self.scan_failed(SCAN_REST, e, now);
+                        self.eq_cancel_refused(r.ix, 0, now);
+                    }
+                }
+            }
+            _ => self.eq_detail(r.ix, l, false, b0, b1, now),
+        }
+    }
+
+    /// The venue refused an equity place (`code`, HTTP `http`): the
+    /// disclaimer unsigned is ONE lock; a duplicate id or an unknown
+    /// outcome leaves the order in doubt (an order under the id may exist);
+    /// anything else ends it refused.
+    fn eq_place_refused(&mut self, ix: u16, code: i32, http: u16, now: u64) {
+        if code == EQ_DISCLAIMER && !self.eq_locked {
+            self.eq_locked = true;
+            self.venue_lock(EQ_DISCLAIMER, now);
+        }
+        if code == EQ_DUPLICATE_ID || classify(code, http) == CodeClass::Unknown {
+            return self.doubt(ix);
+        }
+        self.end_order(ix, EVT_REJECT, RETIRED_REJECTED, code, now);
+    }
+
+    /// **The place's receipt** (`status: "S"`): the order exists under the
+    /// UUID it names — held, the order live, `J_ACK` — and, a report having
+    /// come before it ([`Self::eq_unnamed`]), its detail asked now. `"F"`
+    /// refuses it; an answer that does not echo our id or name a UUID is no
+    /// answer we know (BX-15): in doubt, asked by our id.
+    fn eq_placed(&mut self, ix: u16, fr: Frame, now: u64) {
+        let mut a = EqAck::default();
+        if let Err(e) = scan_eq_ack(self.frame(fr), &mut a) {
+            self.scan_failed(SCAN_REST, e, now);
+            return self.doubt(ix);
+        }
+        if !a.ok {
+            return self.end_order(ix, EVT_REJECT, RETIRED_REJECTED, CODE_EQ_REFUSED, now);
+        }
+        let (slot, oid, cur, row) = {
+            let e = self.oot.get(ix);
+            (e.slot, e.cid_oid, e.current_oid, e.row)
+        };
+        let id = {
+            let b = self.frame(fr);
+            // The UUID copied only for an answer that echoes our id.
+            if self.prefix.classify(a.cid.get(b)) == (CidClass::Ours { slot, client_oid: oid }) {
+                EqOrderId::of(a.id.get(b))
+            } else {
+                None
+            }
+        };
+        let Some(id) = id else {
+            return self.doubt(ix);
+        };
+        self.eq_set_id(ix, id);
+        self.oot.set_live(ix);
+        let key = self.oot.get(ix).venue_oid;
+        self.emit(&BnEvt::order(EVT_ACK, now, cur, row, slot));
+        self.note(J_ACK, now, cur, key, 0, 0, 0, 0, row, slot);
+        self.eq_acc_take(ix, now);
+        self.live_again(ix, now);
+        if core::mem::take(&mut self.eq[ix as usize].report_q) {
+            self.queue_eq_detail(ix);
+        }
+    }
+
+    /// The venue refused an equity cancel (`code`; 0: its `status: "F"`, or
+    /// an answer unread): told to the arm, and — as `-2011` — the order in
+    /// doubt (it may have ended, filled or expired; its detail decides)
+    /// with the cancel owed until the venue shows it working.
+    fn eq_cancel_refused(&mut self, ix: u16, code: i32, now: u64) {
+        let (cur, row, slot) = {
+            let e = self.oot.get(ix);
+            (e.current_oid, e.row, e.slot)
+        };
+        let mut x = BnEvt::order(EVT_CANCEL_FAILED, now, cur, row, slot);
+        x.code = code;
+        self.emit(&x);
+        let m = self.oot.get_mut(ix);
+        let owe = if m.flags & OF_TTL != 0 { OWE_TTL } else { OWE_MEMBER };
+        m.flags &= !(OF_CANCEL_SENT | OF_TTL);
+        self.t[crate::arm::GW_CANCELS_OWED] += (self.oot.get(ix).owe & (OWE_MEMBER | OWE_TTL) == 0) as u64;
+        self.oot.get_mut(ix).owe |= owe | OWE_UNKNOWN;
+        self.doubt(ix);
+    }
+
+    /// **The venue took a cancel of ours** (`S`): whose it was is kept for
+    /// the order's `CANCELED`, and the cancel is owed again at
+    /// [`EQ_CANCEL_CHECK_NS`] — its end disarms that (every end does); an
+    /// order still working then is cancelled again (the risk review's S1).
+    fn eq_cancel_taken(&mut self, ix: u16, now: u64) {
+        // The venue took this order's cancel EQ_CANCEL_TAKES_MAX times and
+        // it still works: its receipts mean nothing we know — a scan
+        // failure (the drift halt and its sweep), never an endless retry
+        // (the risk review's round-2 m5).
+        let s = &mut self.eq[ix as usize];
+        s.takes = s.takes.saturating_add(1);
+        if s.takes >= EQ_CANCEL_TAKES_MAX {
+            self.scan_failed(SCAN_REST, ScanErr::BadField, now);
+        }
+        let m = self.oot.get_mut(ix);
+        let owe = if m.flags & OF_TTL != 0 { OWE_TTL } else { OWE_MEMBER };
+        m.flags &= !(OF_CANCEL_SENT | OF_TTL);
+        m.owe |= owe;
+        self.eq[ix as usize].cancelled = owe;
+        let at = now + EQ_CANCEL_CHECK_NS;
+        if !(self.order_tid[ix as usize].is_some() && self.order_at[ix as usize] <= at) {
+            let _ = self.arm_order(ix, at);
+        }
+    }
+
+    /// Hold the order's UUID: the slot's id, the table's `venue_oid` its key.
+    #[inline]
+    fn eq_set_id(&mut self, ix: u16, id: EqOrderId) {
+        self.oot.get_mut(ix).venue_oid = eq_key(id.get());
+        self.eq[ix as usize].id = id;
+    }
+
+    /// The order in slot `ix` just got its UUID: an `ACCEPTED` report that
+    /// came ahead of the answer naming it is journaled now — once.
+    fn eq_acc_take(&mut self, ix: u16, now: u64) {
+        let key = self.oot.get(ix).venue_oid;
+        let mut i = 0;
+        while i < EQ_ACC_N {
+            if self.eq_acc[i] == key {
+                self.eq_acc[i] = 0;
+                return self.eq_accepted(ix, now);
+            }
+            i += 1;
+        }
+    }
+
+    /// The broker's `ACCEPTED`, journaled once an order.
+    fn eq_accepted(&mut self, ix: u16, now: u64) {
+        if self.eq[ix as usize].accepted {
+            return;
+        }
+        self.eq[ix as usize].accepted = true;
+        let e = self.oot.get(ix);
+        let (cur, key, row, slot) = (e.current_oid, e.venue_oid, e.row, e.slot);
+        self.note(J_ACCEPTED, now, cur, key, 0, 0, 0, 0, row, slot);
+    }
+
+    /// An equity answer's body: the jobs connection's (`jobs`) or the REST
+    /// route's.
+    #[inline]
+    fn eq_body(&self, l: usize, jobs: bool, b0: usize, b1: usize) -> &[u8] {
+        if jobs {
+            self.lanes[l].rest.resp().get(b0..b1).unwrap_or(&[])
+        } else {
+            frame_of(&self.lanes, Frame::Rest(l, b0, b1))
+        }
+    }
+
+    /// The open equity order the venue's id `id` names: its key, then the
+    /// whole id (a key alone never decides).
+    fn eq_find(&self, id: &[u8]) -> Option<u16> {
+        let key = eq_key(id);
+        let mut ix = 0u16;
+        while (ix as usize) < OOT_CAP {
+            if self.oot.is_open(ix) && self.oot.get(ix).venue_oid == key && self.eq[ix as usize].id.is(id) {
+                return Some(ix);
+            }
+            ix += 1;
+        }
+        None
+    }
+
+    /// Open equity orders of ours whose UUID no answer has named yet — a
+    /// place still in flight (`mark`: a report that would ask its order's
+    /// detail came unnamed — each such order asks its own once its answer
+    /// names it; a lost or unread answer puts it in doubt, whose query by
+    /// our id names it).
+    fn eq_unnamed(&mut self, mark: bool) -> bool {
+        let mut any = false;
+        let mut ix = 0u16;
+        while (ix as usize) < OOT_CAP {
+            if self.oot.is_open(ix) && !self.eq[ix as usize].id.is_some() && self.wire.row(self.oot.get(ix).row).product == PRODUCT_EQUITY {
+                any = true;
+                self.eq[ix as usize].report_q |= mark;
+            }
+            ix += 1;
+        }
+        any
+    }
+
+    /// **The order's detail** (`order/detail`; from the jobs connection or
+    /// the route): its executions book the fills — oldest first, each once
+    /// (its `executionId` on the trade-id ring), never past the cumulative
+    /// `filledQty`; the rest of that quantity at the implied price,
+    /// [`J_FILL_UNSEEN`] — then its fee, its acceptance and its state. A
+    /// detail that does not name this order (another UUID; our id not
+    /// echoed while none is held; another side) is a scan failure (BX-15),
+    /// as is one that does not read: the order stays as it is.
+    fn eq_detail(&mut self, ix: u16, l: usize, jobs: bool, b0: usize, b1: usize, now: u64) {
+        let mut d = EqDetail::default();
+        let scanned = {
+            let body = if jobs { self.lanes[l].rest.resp().get(b0..b1).unwrap_or(&[]) } else { frame_of(&self.lanes, Frame::Rest(l, b0, b1)) };
+            scan_eq_detail(body, &mut d, &mut self.eq_x[..])
+        };
+        let n = match scanned {
+            Ok(n) => n,
+            Err(_) => return self.scan_failed(SCAN_REST, ScanErr::Malformed, now),
+        };
+        let (slot, oid, cur, row, side, own_px, qty) = {
+            let e = self.oot.get(ix);
+            (e.slot, e.cid_oid, e.current_oid, e.row, e.side, e.px_1e6, e.qty_1e6)
+        };
+        let held = self.eq[ix as usize].id.is_some();
+        let (ours, id) = {
+            let body = self.eq_body(l, jobs, b0, b1);
+            let ours = if held {
+                self.eq[ix as usize].id.is(d.id.get(body))
+            } else {
+                self.prefix.classify(d.cid.get(body)) == (CidClass::Ours { slot, client_oid: oid })
+            };
+            let ours = ours && d.side == side && self.wire.find(PRODUCT_EQUITY, d.symbol.get(body)) == row;
+            // The UUID copied only for an answer that is ours and while
+            // none is held: once an order.
+            (ours, if ours && !held { EqOrderId::of(d.id.get(body)) } else { None })
+        };
+        // A detail of another order, one filled past the order's own
+        // quantity (the risk review's S5), or FILLED short of it (its B1:
+        // an end with less booked than the venue holds) is no answer we
+        // know.
+        if !ours || d.filled_1e6 > qty || (d.status == EQ_S_FILLED && d.filled_1e6 != qty) {
+            return self.scan_failed(SCAN_REST, ScanErr::BadField, now);
+        }
+        if let Some(id) = id {
+            self.eq_set_id(ix, id);
+            self.eq_acc_take(ix, now);
+        }
+        // The executions, oldest first (the venue lists the latest first).
+        let mut k = n;
+        while k > 0 {
+            k -= 1;
+            let room = d.filled_1e6.saturating_sub(self.oot.get(ix).filled_1e6);
+            if room <= 0 {
+                break;
+            }
+            let key = exec_key(self.eq_x[k].exec.get(self.eq_body(l, jobs, b0, b1)));
+            if self.tids.see(row, key, false).again {
+                continue;
+            }
+            // COPY: one execution (≤ 64 B) off the read's array, once it
+            // books — booking borrows the whole gateway — rejected:
+            // re-reading each field through the array around the booking.
+            let x = self.eq_x[k];
+            let ts = self.fill_ts_ns(x.at_ms, now);
+            self.book_fill(Some(ix), None, row, slot, side, x.px_1e6, x.qty_1e6.min(room), 0, 0, ts, now, cur);
+        }
+        // The cumulative quantity past the executions listed — a list that
+        // lags its fills: booked at the implied price, never twice. Not the
+        // rounding residue: each execution's nine decimals are cut to six,
+        // as the history's rows are (the cycle sums those), so up to one
+        // millionth an execution past the first is the cut, never booked
+        // (the risk review's S3: booking it reads as drift).
+        let excess = d.filled_1e6.saturating_sub(self.oot.get(ix).filled_1e6);
+        if excess > (n as i64 - 1).max(0) {
+            let avg = if d.avg_1e6 > 0 {
+                d.avg_1e6
+            } else if d.filled_total_1e6 > 0 && d.filled_1e6 > 0 {
+                ((d.filled_total_1e6 as i128 * 1_000_000) / d.filled_1e6 as i128).min(i64::MAX as i128) as i64
+            } else {
+                own_px
+            };
+            let px = implied_px_1e6(d.filled_1e6, avg, self.oot.aux(ix).booked_quote_1e12, excess);
+            let ts = self.fill_ts_ns(d.updated_ms, now);
+            if self.book_fill(Some(ix), None, row, slot, side, px, excess, J_FILL_UNSEEN, 0, ts, now, cur) {
+                self.oot.get_mut(ix).flags |= OF_STATUS_BOOKED;
+            }
+        }
+        self.eq_fee(ix, &d, now);
+        if matches!(d.status, EQ_S_ACCEPTED | EQ_S_PARTIAL | EQ_S_FILLED | EQ_S_EXPIRED) {
+            self.eq_accepted(ix, now);
+        }
+        match d.status {
+            EQ_S_NEW | EQ_S_ACCEPTED | EQ_S_PARTIAL => {
+                self.oot.set_live(ix);
+                self.live_again(ix, now);
+            }
+            EQ_S_FILLED => self.end_order(ix, EVT_RETIRED, RETIRED_FILLED, 0, now),
+            EQ_S_CANCELED => {
+                // Ours if the venue took a cancel of ours (S1: the flag is
+                // cleared once taken), else the table's own word.
+                let why = match self.eq[ix as usize].cancelled {
+                    _ if self.oot.get(ix).flags & OF_CANCEL_SENT != 0 => self.cancel_why(ix),
+                    OWE_TTL => RETIRED_CANCELED_TTL,
+                    OWE_MEMBER => RETIRED_CANCELED_MEMBER,
+                    _ => self.cancel_why(ix),
+                };
+                self.end_order(ix, EVT_RETIRED, why, 0, now);
+            }
+            EQ_S_EXPIRED => self.end_order(ix, EVT_RETIRED, RETIRED_EXPIRED, 0, now),
+            EQ_S_REJECTED => self.end_order(ix, EVT_REJECT, RETIRED_REJECTED, CODE_EQ_REFUSED, now),
+            // A word this build does not know: no transition — the next
+            // report, the listing or the in-doubt query asks again.
+            _ => {}
+        }
+    }
+
+    /// **An equity order's fee** (BX-14): the detail's `fee` is the
+    /// order's cumulative commission, USD — journaled by its increase
+    /// ([`J_FEE`]: `b` the filled notional the increase covers ×1e9, `c`
+    /// the increase ×1e9), flagged [`FEE_FLAG_EQ_FLOOR`] while the order's
+    /// notional is under $350 (its fee is the platform's $0.35 minimum, no
+    /// rate).
+    fn eq_fee(&mut self, ix: u16, d: &EqDetail, now: u64) {
+        let (cur, key, row, slot) = {
+            let e = self.oot.get(ix);
+            (e.current_oid, e.venue_oid, e.row, e.slot)
+        };
+        let (fee0, notional0) = {
+            let s = &self.eq[ix as usize];
+            (s.fee_1e9, s.fee_notional_1e6)
+        };
+        let fee = d.fee_1e9.saturating_sub(fee0);
+        if fee <= 0 {
+            return;
+        }
+        let total = if d.filled_total_1e6 > 0 {
+            d.filled_total_1e6
+        } else {
+            (self.oot.aux(ix).booked_quote_1e12 / 1_000_000).min(i64::MAX as i128) as i64
+        };
+        let notional = total.saturating_sub(notional0).max(0);
+        self.eq[ix as usize].fee_1e9 = d.fee_1e9;
+        self.eq[ix as usize].fee_notional_1e6 = total;
+        let w = self.wire.row(row);
+        let mut code = fee_code(false, fee_asset(w, b"USD"), TRADE_BY_MEMBER, w);
+        if total < EQ_FEE_FLOOR_NOTIONAL_1E6 {
+            code |= FEE_FLAG_EQ_FLOOR;
+        }
+        let px = if d.avg_1e6 > 0 { d.avg_1e6 } else { self.rows[row as usize].last_px_1e6 };
+        self.note(J_FEE, now, cur, key, px, notional.saturating_mul(1_000), fee, code, row, slot);
+    }
+
+    /// **The order stream** (`/equity/ws/<key>@orderReport`): each frame
+    /// read in place — an `orderReport` is the trigger for its order's
+    /// detail; any other event is counted.
+    fn drain_eq(&mut self, l: usize, now: u64) {
+        loop {
+            let span = match self.lanes[l].us.next_frame() {
+                WsNext::Idle => return,
+                WsNext::Text(s) | WsNext::Binary(s) => s,
+                WsNext::Failed(_) => return self.us_failed(l, now),
+            };
+            self.lanes[l].user.last_rx_ns = now;
+            let mut rep = EqReport::default();
+            let (scanned, ix, row, key) = {
+                let frame = self.lanes[l].us.payload(span);
+                let scanned = scan_order_report(frame, &mut rep);
+                let order = scanned.is_ok() && rep.kind == EQ_EV_ORDER;
+                let ix = if order { self.eq_find(rep.id.get(frame)) } else { None };
+                let row = if order { self.wire.find(PRODUCT_EQUITY, rep.ticker.get(frame)) } else { ROW_NONE };
+                let key = if order && ix.is_none() { eq_key(rep.id.get(frame)) } else { 0 };
+                (scanned, ix, row, key)
+            };
+            match scanned {
+                Err(e) => self.scan_failed(SCAN_USER, e, now),
+                Ok(()) if rep.kind != EQ_EV_ORDER => self.t[crate::arm::GW_EVENTS_OTHER] += 1,
+                Ok(()) => self.eq_on_report(&rep, ix, row, key, now),
+            }
+        }
+    }
+
+    /// **One `orderReport`** of the order in slot `ix` (if the table knows
+    /// its UUID) on row `row`: `ACCEPTED` journaled at once; a fill past
+    /// what is booked, or the end, asks the order's detail. A report the
+    /// table cannot name is one of ours whose place has not answered yet
+    /// (each such order asks its detail once its answer names it — a fill
+    /// or an end in the report; the broker's `ACCEPTED` alone, nothing) —
+    /// or, none being so, another's (BX-8: the reconciliation's fact; a
+    /// fill counted foreign, or unowned on a ticker no row binds). An
+    /// unnamed report's `ACCEPTED` is kept by its UUID's key (`key`) until
+    /// an answer names the order ([`Self::eq_acc_take`]).
+    fn eq_on_report(&mut self, rep: &EqReport, ix: Option<u16>, row: u16, key: u64, now: u64) {
+        let Some(ix) = ix else {
+            let due = rep.terminal || eq_terminal(rep.status) || rep.filled_1e6 > 0;
+            let unnamed = self.eq_unnamed(due);
+            if unnamed && rep.status == EQ_S_ACCEPTED {
+                self.eq_acc[self.eq_acc_head & (EQ_ACC_N - 1)] = key;
+                self.eq_acc_head = self.eq_acc_head.wrapping_add(1);
+            }
+            if !unnamed && rep.filled_1e6 > 0 {
+                let k = if row == ROW_NONE { crate::arm::GW_FILLS_UNOWNED } else { crate::arm::GW_FILLS_FOREIGN };
+                self.t[k] += 1;
+            }
+            return;
+        };
+        if rep.status == EQ_S_ACCEPTED {
+            self.eq_accepted(ix, now);
+            if self.oot.get(ix).state == ST_SENT {
+                self.oot.set_live(ix);
+            }
+            self.live_again(ix, now);
+        }
+        if rep.terminal || eq_terminal(rep.status) || rep.filled_1e6 > self.oot.get(ix).filled_1e6 {
+            self.queue_eq_detail(ix);
+        }
+    }
+
+    /// Ask order `ix`'s detail on the lane's jobs connection — once at a
+    /// time (a report while one is queued or in flight is answered by it).
+    fn queue_eq_detail(&mut self, ix: u16) {
+        let i = ix as usize;
+        if self.eq[i].detail_q {
+            return;
+        }
+        let row = self.oot.get(ix).row;
+        let l = self.lane_of_row(row);
+        let oid = u64::from(ix) | (u64::from(self.oot.aux(ix).gen) << 16);
+        let j = Job { kind: JobKind::EqDetail, row, lane: l as u8, sent_ns: 0, oid, tries: 0, qty_1e6: 0, not_before_ns: 0 };
+        if self.lanes[l].jobs.push(j) {
+            self.eq[i].detail_q = true;
+        } else {
+            // A full queue: the order in doubt asks again (counted).
+            self.t[crate::arm::GW_JOBS_DROPPED] += 1;
+            self.doubt(ix);
+        }
+    }
+
+    /// **An equity lane's REST job** (module docs): the clock (Binance's
+    /// one server time, unsigned), the listenKey (created and renewed by one
+    /// signed `POST`), the open orders, a ticker's day (its executions since
+    /// 00:00Z), a page of the session's executions, an order's detail, the
+    /// account's `cancel-all` — every one signed by the arm's signer but
+    /// the clock.
+    fn eq_start_job(&mut self, l: usize, mut j: Job, now: u64) {
+        let ts = self.clock.venue_ms(now);
+        let st = self.lanes[l].st;
+        let t = match j.kind {
+            JobKind::Time => EQ_TIME,
+            JobKind::ListenNew | JobKind::ListenKeep => EQ_LISTEN_KEY,
+            JobKind::OpenOrders => EQ_OPEN,
+            JobKind::UserTrades | JobKind::EqTrades => EQ_TRADES,
+            JobKind::CancelAll => EQ_CANCEL_ALL,
+            JobKind::EqDetail => EQ_DETAIL,
+            _ => {
+                // Nothing else is queued on an equity lane.
+                debug_assert!(false, "a job an equity lane does not run: {:?}", j.kind);
+                return self.rest_failed(j, now);
+            }
+        };
+        // A detail for an order that ended (or a slot reused) since it was
+        // queued is not asked.
+        let ix = (j.oid & 0xFFFF) as u16;
+        if j.kind == JobKind::EqDetail
+            && ((ix as usize) >= OOT_CAP || !self.oot.is_open(ix) || u64::from(self.oot.aux(ix).gen) != j.oid >> 16 || !self.eq[ix as usize].id.is_some())
+        {
+            return self.job_done(&j);
+        }
+        if j.kind == JobKind::UserTrades && (j.row as usize) >= self.wire.len() {
+            debug_assert!(false, "a day read for no row");
+            return self.rest_failed(j, now);
+        }
+        let signed = j.kind != JobKind::Time;
+        let end = ts.saturating_add(EQ_WINDOW_AHEAD_MS);
+        let conn = &mut self.lanes[l].rest;
+        let win = conn.window_mut(t);
+        if win.is_empty() && signed {
+            let _ = self.lanes[l].jobs.push(j);
+            return;
+        }
+        let mut w = QueryWriter::new(win);
+        match j.kind {
+            JobKind::Time => {}
+            JobKind::UserTrades => {
+                let day_start = ts / 86_400_000 * 86_400_000;
+                render_eq_trades(&mut w, &st, self.wire.row(j.row).symbol(), day_start, end, 1, ts);
+            }
+            JobKind::EqTrades => render_eq_trades(&mut w, &st, b"", self.eq_window_ms, self.eq_end_ms, j.oid, ts),
+            JobKind::EqDetail => render_eq_by_id(&mut w, &st, self.eq[ix as usize].id.get(), ts),
+            _ => render_account(&mut w, &st, ts),
+        }
+        let len = if signed { w.sign_with(&self.signer) } else { w.rendered() };
+        let Ok(len) = len else {
+            return self.rest_failed(j, now);
+        };
+        j.sent_ns = now;
+        match conn.start(t, len, self.poll.registry(), now) {
+            Ok(()) => self.lanes[l].job = Some(j),
+            Err(_) => {
+                let _ = self.lanes[l].jobs.push(j);
+            }
+        }
+    }
+
+    /// An equity lane's job answered (the clock's is read as every lane's).
+    fn eq_job_answered(&mut self, l: usize, j: Job, status: u16, b0: usize, b1: usize, now: u64) {
+        match j.kind {
+            // A renewal may name a new key: either answer adopts it (a new
+            // one re-dials the stream).
+            JobKind::ListenNew | JobKind::ListenKeep => self.listen_key_answered(l, status, b0, b1, now),
+            JobKind::OpenOrders => {
+                if status != 200 {
+                    return self.recon_failed();
+                }
+                self.eq_orders_answered(l, b0, b1, j.sent_ns, now);
+            }
+            JobKind::UserTrades => self.eq_day_answered(l, j.row, status, b0, b1, now),
+            JobKind::EqTrades => self.eq_trades_answered(l, j, status, b0, b1, now),
+            JobKind::EqDetail => {
+                let ix = (j.oid & 0xFFFF) as u16;
+                let same = (ix as usize) < OOT_CAP && self.oot.is_open(ix) && u64::from(self.oot.aux(ix).gen) == j.oid >> 16;
+                if same && status == 200 {
+                    self.eq_detail(ix, l, true, b0, b1, now);
+                } else if same {
+                    // Unread: in doubt, its query asks again.
+                    self.doubt(ix);
+                }
+            }
+            // The orders' ends arrive on the stream, or the listing puts
+            // them in doubt.
+            _ => {}
+        }
+    }
+
+    /// **The equity lane's step of a cycle** (S-2): the session's
+    /// executions, page by page, then the open orders. The session's window
+    /// starts at the boot's first cycle; each cycle's end is fixed at its
+    /// first page (every page reads one window). No margin exists to
+    /// re-read: an account-only read is a no-op.
+    fn eq_recon_start(&mut self, l: usize, now: u64, account_only: bool) -> bool {
+        if account_only {
+            return true;
+        }
+        if !self.ready_to_send(l, now) {
+            return false;
+        }
+        let venue_ms = self.clock.venue_ms(now);
+        if self.eq_window_ms == 0 {
+            self.eq_window_ms = venue_ms;
+        }
+        self.eq_end_ms = venue_ms.saturating_add(EQ_WINDOW_AHEAD_MS);
+        let j = Job { kind: JobKind::EqTrades, row: ROW_NONE, lane: l as u8, sent_ns: 0, oid: 1, tries: 0, qty_1e6: 0, not_before_ns: 0 };
+        if !self.lanes[l].jobs.push(j) {
+            self.t[crate::arm::GW_JOBS_DROPPED] += 1;
+            return false;
+        }
+        self.recon = ReconStep::Executions;
+        self.recon_lane = l as u8;
+        self.recon_account_only = false;
+        self.lanes[l].account_read_ns = now;
+        self.eq_total = 0;
+        self.eq_seen = 0;
+        self.eq_unbound = false;
+        let mut i = 0;
+        while i < self.rows.len() {
+            self.eq_exec[i] = 0;
+            i += 1;
+        }
+        true
+    }
+
+    /// **A page of the session's executions**: each row's signed net
+    /// (a BUY adds, a SELL takes) into the cycle's sums; the window's
+    /// `total` fixed by the first page — a later page naming another (an
+    /// execution landed between the pages) fails the cycle, never a sum over
+    /// shifted pages; past [`EQ_PAGES_MAX`] pages the cycle fails (fail
+    /// closed). The last page sets every equity leg: the venue's net since
+    /// the window's start against what this gateway booked since its boot,
+    /// valued at the row's last fill; a leg is HELD while an order of ours
+    /// on the row is in doubt or its detail is being read (an execution
+    /// the venue lists may not be booked yet). An execution on a ticker no
+    /// row binds is an unseen leg on a dedicated account.
+    fn eq_trades_answered(&mut self, l: usize, j: Job, status: u16, b0: usize, b1: usize, now: u64) {
+        if self.recon != ReconStep::Executions {
+            return;
+        }
+        if status != 200 {
+            return self.recon_failed();
+        }
+        let page = {
+            let body = self.lanes[l].rest.resp().get(b0..b1).unwrap_or(&[]);
+            scan_eq_trades(body, &mut self.eq_page[..])
+        };
+        let Ok(page) = page else {
+            self.scan_failed(SCAN_REST, ScanErr::Malformed, now);
+            return self.recon_failed();
+        };
+        // The page asked for, at the size asked for — a venue ignoring the
+        // page's parameter would hand page 1 again, summed twice (the risk
+        // review's item 2): no verdict.
+        if page.page != j.oid || page.size != crate::rest::EQ_PAGE as u64 {
+            self.scan_failed(SCAN_REST, ScanErr::BadField, now);
+            return self.recon_failed();
+        }
+        if j.oid == 1 {
+            self.eq_total = page.total;
+        } else if page.total != self.eq_total {
+            return self.recon_failed();
+        }
+        let buy = Side::Bid as u8;
+        let mut k = 0;
+        while k < page.n {
+            let x = &self.eq_page[k];
+            k += 1;
+            let row = {
+                let body = self.lanes[l].rest.resp().get(b0..b1).unwrap_or(&[]);
+                self.wire.find(PRODUCT_EQUITY, x.symbol.get(body))
+            };
+            if row == ROW_NONE {
+                self.eq_unbound |= !self.knobs.shared;
+                continue;
+            }
+            let q = if x.side == buy { x.qty_1e6 } else { -x.qty_1e6 };
+            let r = row as usize;
+            self.eq_exec[r] = self.eq_exec[r].saturating_add(q);
+        }
+        self.eq_seen += page.n as u64;
+        // The window's rows exactly — past its total is no page of it.
+        if self.eq_seen > self.eq_total {
+            return self.recon_failed();
+        }
+        if self.eq_seen < self.eq_total {
+            // A short page before the window's end, or past the pages a
+            // cycle may read: no verdict on a partial sum.
+            if page.n < crate::rest::EQ_PAGE || j.oid >= EQ_PAGES_MAX {
+                return self.recon_failed();
+            }
+            let next = Job { oid: j.oid + 1, sent_ns: 0, ..j };
+            if !self.lanes[l].jobs.push(next) {
+                self.t[crate::arm::GW_JOBS_DROPPED] += 1;
+                self.recon_failed();
+            }
+            return;
+        }
+        let mut i = 0;
+        while i < self.legs.len() {
+            if self.wire.row(i as u16).product == PRODUCT_EQUITY {
+                let g = &mut self.legs[i];
+                g.venue_1e6 = self.eq_exec[i];
+                g.booked_1e6 = self.rows[i].booked_1e6;
+                g.px_1e6 = self.rows[i].last_px_1e6;
+                g.held = false;
+            }
+            i += 1;
+        }
+        let mut ix = 0u16;
+        while (ix as usize) < OOT_CAP {
+            if self.oot.is_open(ix) {
+                let e = self.oot.get(ix);
+                if self.wire.row(e.row).product == PRODUCT_EQUITY && (e.state == ST_IN_DOUBT || self.eq[ix as usize].detail_q) {
+                    self.legs[e.row as usize].held = true;
+                }
+            }
+            ix += 1;
+        }
+        if self.eq_unbound {
+            self.verdict.unseen_legs += 1;
+        }
+        self.recon = ReconStep::Orders;
+        if !self.queue_job(l, JobKind::OpenOrders, 0) {
+            self.recon_failed();
+        }
+    }
+
+    /// **The open equity orders** (asked for at `sent_ns`): ours by UUID —
+    /// the listing names no client id; one of ours listed with more filled
+    /// than booked asks its detail (a fill the stream lost). An order no
+    /// UUID of ours names, on a bound ticker (or any, on a dedicated
+    /// account), is a stray: before Ready it refuses the boot by name
+    /// ([`BootErr::EqStray`] — the operator cancels it in the app); after,
+    /// a foreign order (BX-8). None is judged while an order of ours has no
+    /// UUID yet (its place still in flight: it may be that one). Then the
+    /// listing's common end ([`Self::listed`]).
+    fn eq_orders_answered(&mut self, l: usize, b0: usize, b1: usize, sent_ns: u64, now: u64) {
+        let listing_only = self.recon_listing_only;
+        let n = {
+            let body = self.lanes[l].rest.resp().get(b0..b1).unwrap_or(&[]);
+            scan_eq_open(body, &mut self.eq_open[..])
+        };
+        let Ok(n) = n else {
+            self.scan_failed(SCAN_REST, ScanErr::Malformed, now);
+            return self.recon_failed();
+        };
+        let mut ix = 0u16;
+        while (ix as usize) < OOT_CAP {
+            if self.oot.is_open(ix) && self.lane_of_row(self.oot.get(ix).row) == l {
+                self.oot.get_mut(ix).flags &= !OF_LISTED;
+            }
+            ix += 1;
+        }
+        let unnamed = self.eq_unnamed(false);
+        let mut v = Verdict {
+            shared: self.knobs.shared,
+            ..self.verdict
+        };
+        let mut ours_open = 0u32;
+        let mut i = 0;
+        while i < n {
+            let (k, row, filled) = {
+                let body = self.lanes[l].rest.resp().get(b0..b1).unwrap_or(&[]);
+                let o = &self.eq_open[i];
+                (self.eq_find(o.id.get(body)), self.wire.find(PRODUCT_EQUITY, o.symbol.get(body)), o.filled_1e6)
+            };
+            i += 1;
+            if let Some(k) = k {
+                self.oot.get_mut(k).flags |= OF_LISTED;
+                ours_open += 1;
+                // A fill the stream lost on an order still working (the
+                // risk review's S4): its detail books it.
+                if filled > self.oot.get(k).filled_1e6 {
+                    self.queue_eq_detail(k);
+                }
+                continue;
+            }
+            if unnamed {
+                continue;
+            }
+            let owned = row != ROW_NONE && self.wire.row(row).flags & INST_OWNED != 0;
+            if owned || (row == ROW_NONE && !self.knobs.shared) {
+                v.foreign += 1;
+                if self.phase != Phase::Ready && self.boot_err.is_none() {
+                    self.boot_err = Some(BootErr::EqStray(row));
+                }
+            }
+        }
+        self.listed(l, sent_ns, ours_open, v, listing_only, now);
+    }
+
+    /// **An equity ticker's day** (obligation 8): its executions since
+    /// 00:00Z — its BUYs' notional is the day's spend (a cash holding:
+    /// every BUY grows it, no SELL does). A window holding more than one
+    /// page is unread this time (the day retries each cycle, S7-L1).
+    fn eq_day_answered(&mut self, l: usize, row: u16, status: u16, b0: usize, b1: usize, now: u64) {
+        let page = if status == 200 {
+            let body = self.lanes[l].rest.resp().get(b0..b1).unwrap_or(&[]);
+            scan_eq_trades(body, &mut self.eq_page[..]).ok()
+        } else {
+            None
+        };
+        let r = row as usize;
+        match page {
+            Some(p) if p.page == 1 && p.total == p.n as u64 && r < self.rows.len() => {
+                let buy = Side::Bid as u8;
+                let mut spent = 0i64;
+                let mut k = 0;
+                while k < p.n {
+                    let x = &self.eq_page[k];
+                    if x.side == buy {
+                        spent = spent.saturating_add((x.qty_1e6 as i128 * x.px_1e6 as i128 / 1_000_000).min(i64::MAX as i128) as i64);
+                    }
+                    k += 1;
+                }
+                self.rows[r].day_spent_1e6 = spent;
+                self.rows[r].day_read = true;
+            }
+            _ => {}
+        }
+        self.day_left = self.day_left.saturating_sub(1);
+        if self.day_left == 0 {
+            self.day_done(now);
+        }
+    }
+
+    // ---------------------------------------------------------------------
     // Timers
     // ---------------------------------------------------------------------
 
@@ -5874,13 +7134,15 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
     /// no SAPI: classic by construction (`new`; module docs). Spot's lane
     /// asserts nothing here (BX8): its account's permissions are judged at
     /// every account read — nor does options' (BX9): its account's
-    /// `canTrade` and `reduceOnly` are. None to ask (a spot- or options-only
-    /// Demo arm): held now.
+    /// `canTrade` and `reduceOnly` are — nor does equity's (BX10): it has
+    /// no account mode, its classic account is the portfolio read's, and
+    /// its disclaimer is judged at the first place. None to ask (a spot- or
+    /// options-only Demo arm): held now.
     fn queue_asserts(&mut self) {
         self.asserts_left = if self.demo { 0 } else { 2 + u16::from(self.opt_own_key) };
         let mut l = 0;
         while l < self.lanes.len() {
-            if matches!(self.lanes[l].product, PRODUCT_SPOT | PRODUCT_OPTIONS) {
+            if matches!(self.lanes[l].product, PRODUCT_SPOT | PRODUCT_OPTIONS | PRODUCT_EQUITY) {
                 l += 1;
                 continue;
             }

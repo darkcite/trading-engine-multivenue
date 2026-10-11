@@ -31,6 +31,7 @@
 //! | [`oot`] | the open-order table (1 024, keyed from submit time, in-doubt set) |
 //! | [`clock`] | the venue clock offset, minimum-RTT (BX-6) |
 //! | [`dns`] | DNS re-resolve on a dial-failure streak, on a cold thread (BX7) |
+//! | [`equity`] | Binance Stocks (BX10): the venue's UUID order id, its answers' and its order stream's scanners, a ticker's rules |
 //! | [`json`] | the one in-place JSON walker the scanners share — and the cli's Demo tools (BX7b) |
 //! | [`userstream`] | the user-data event scanner (BX-2, BX-15); the listenKey lifecycle |
 //! | [`wsapi`] | the WS API session: `session.logon`, the order verbs, the answer scanner |
@@ -67,6 +68,7 @@ pub mod clock;
 pub mod cmd;
 pub mod config;
 pub mod dns;
+pub mod equity;
 pub mod gateway;
 pub mod gov;
 pub mod inst;

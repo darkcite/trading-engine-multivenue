@@ -6689,14 +6689,16 @@ release build and an `exec-smoke`-gated restart — Anton's word.
 
 The plan's §4 laws (`docs/binance-exec-plan.md`), carried here by BX11 and
 restated **as built** on branch `binance` through BX8 (2026-10-10, after
-BX12; options since BX9, 2026-10-11). The arm is ARMABLE for USDⓈ-M and
-COIN-M under classic, PM and PM Pro, for spot (bStocks included) under
-classic, IoC-only, and for options under classic, IoC-only (BX9); **no
-member arms (O-BX6)** before BX13; Binance Stocks refuse the boot
-(BX10). Each law gives its text, where it is enforced, what proves it
-and what stays open; "**As built**" marks where the build departs from
-the plan's wording. The phase entries after the laws (BX3, BX6, BX7,
-BX7b, BX11, BX12, BX8, BX9) are the history: where an entry and a law
+BX12; options since BX9; Binance Stocks since BX10, 2026-10-11). The arm
+is ARMABLE for USDⓈ-M and COIN-M under classic, PM and PM Pro, for spot
+(bStocks included) under classic, IoC-only, and for options under
+classic, IoC-only (BX9); **no member arms (O-BX6)** before BX13. Binance
+Stocks (BX10) is built and battery-tested but the ENGINE refuses it
+(ruling S-3; O-BX16, R17): only the operator's mainnet battery drives it.
+Each law gives its text, where it is enforced, what proves it and what
+stays open; "**As built**" marks where the build departs from the plan's
+wording. The phase entries after the laws (BX3, BX6, BX7, BX7b, BX11,
+BX12, BX8, BX9, BX10) are the history: where an entry and a law
 disagree, the law is the current statement. The operator's procedures
 are `docs/binance-runbook.md`.
 
@@ -6749,8 +6751,32 @@ are `docs/binance-runbook.md`.
   `a_subscription_answered_without_its_id_is_never_live`,
   `the_subscription_ending_drops_the_session`; gates 108 and 109; fuzz
   `bn_spot_event`.
+* **As built — Stocks (BX10):** a fourth fill source, and the only one on
+  Stocks: the order's detail (`order/detail`). The stream's `orderReport`
+  names no execution and no client id: it is the TRIGGER only — a report
+  that ends the order or names more filled than booked asks the detail,
+  and so does a listing that shows more filled than booked (a report the
+  stream lost). The place's answer is a receipt (`J_ACK`, the order's
+  UUID); the broker's `ACCEPTED` is journaled once (`J_ACCEPTED`, kind 11)
+  — a report's `ACCEPTED` that came before the answer named the order is
+  kept by its key and journaled once it does. Each execution books once —
+  its `executionId` on the trade-id ring, exact (`equity::exec_key`) —
+  never past the cumulative `filledQty`; a cumulative past the executions
+  listed books at the implied price (`J_FILL_UNSEEN`), except the cut the
+  venue's nine decimals make to six (never booked). Tested: e2e
+  `the_equity_lane_places_fills_and_reconciles`,
+  `the_stream_before_the_answer_waits_for_the_answers_id`,
+  `an_acceptance_ahead_of_its_answer_is_journaled_once_named`,
+  `a_fill_the_stream_lost_is_booked_once_the_stream_reopens`,
+  `a_lost_fill_on_a_working_order_is_booked_from_the_listing`,
+  `the_cut_past_the_sixth_decimal_is_never_drift`; `equity.rs`
+  `an_order_report_is_the_trigger`,
+  `a_detail_reads_its_executions_and_its_cumulative_figures`; gates 112
+  and 113; fuzz `bn_equity`.
 * **Open.** The dedup horizon, 256 trade ids ("BX6"). A mainnet fill seen
-  on the stream is BX13's to prove; Demo's is met ("BX7b").
+  on the stream is BX13's to prove; Demo's is met ("BX7b"). Stocks'
+  report, detail and execution shapes are the docs' and the connector's
+  until the operator's battery places an order ("BX10", residuals).
 
 #### BX-3 (E-3) — signatures proved by known answers
 
@@ -6766,6 +6792,13 @@ are `docs/binance-runbook.md`.
   `every_vector_holds`; `config.rs`
   `hmac_signs_binances_documented_example`; every e2e test (`sig_bad ==
   0`); gates 86 and 104. Demo verified every rendered payload ("BX7b").
+* **As built — Stocks (BX10):** `/sapi/v1/equity/*` is signed as SAPI is —
+  Ed25519 or HMAC over the query rendered in place (gate 113 signs with
+  Ed25519). The read-only mainnet probe proved HMAC there (S-1); Ed25519
+  on mainnet waits for the operator's battery. Tested: e2e
+  `the_equity_lane_places_fills_and_reconciles` (Ed25519),
+  `an_hmac_key_signs_the_equity_lane`; `rest.rs`
+  `the_equity_requests_carry_the_d5_keys_and_the_uuid`.
 * **Open — short of the law:** the official connectors' own vectors,
   deferred by BX4 to BX6's renderer, never landed (the payload vectors in
   `selftest.rs` were computed with Python `cryptography`); the HMAC
@@ -6810,6 +6843,14 @@ are `docs/binance-runbook.md`.
   `inst.rs` `an_option_binds_ioc_only_writable_as_judged`,
   `option_binding_refusals`; `bn_live.rs`
   `options_held_outside_the_chain_join_it_and_bind`.
+* **As built — Stocks (BX10):** an equity row binds from its ticker's
+  `exchangeInfo` row (`InstTable::bind_equity`: the cent tick, the step,
+  the minimum notional and the venue's sides — `tradability` — fixed at
+  boot); the engine's `bind_table` binds none (S-3): only the battery
+  binds one. Tested: `inst.rs`
+  `an_equity_row_binds_on_the_cent_and_its_step`; `equity.rs`
+  `a_tickers_rules_read_from_exchange_info`; proptest
+  `a_tickers_rules_round_trip`.
 * **Open.** A row the venue closes in session is learnt only from its
   refusals (BX-5's streak), never from a re-read. BX9: the held read is
   one read at boot — an option bought between it and the arm's boot is
@@ -6847,6 +6888,12 @@ are `docs/binance-runbook.md`.
   tick 0.01, step 0.00001, a 5 USDT minimum notional); e2e
   `the_spot_lane_trades_iocs_and_its_fills_reach_lane_4` (the place on
   the row's step and tick); gate 109 (spot's place rendered).
+* **As built — Stocks (BX10):** the price on the cent (a BUY floors, a
+  SELL ceils), the quantity on the row's step at the arm's six decimals
+  (the venue's step is 1e-9), the $5 minimum notional refused locally;
+  there is no `minQty` (S-1). Tested: `inst.rs`
+  `an_equity_row_binds_on_the_cent_and_its_step`; `bn_equity_battery.rs`
+  `prices_and_quantities_are_cut_the_venues_way`; gate 92.
 * **Open.** The risk gate judges the order before quantization: a SELL
   may price one tick above what it judged ("BX6").
 
@@ -6937,8 +6984,22 @@ are `docs/binance-runbook.md`.
   foreign spot trades counted, none booked; the BTC they moved reads as
   drift), `the_spot_sweep_confirms_clear_with_nothing_to_cancel` (a
   stranger's resting spot order reported every cycle).
+* **As built — Stocks (BX10):** dedicated only, reconciled from executions
+  (S-2): each ticker's net over the session's window (`trade/history`)
+  against what the gateway booked since its boot — a foreign execution on
+  a bound ticker is drift (an unseen leg where the arm booked nothing), on
+  a ticker no row binds an unseen leg. Holdings are never read. Another's
+  open order before Ready refuses the boot by name (`BootErr::EqStray`:
+  any ticker on the dedicated account, `ROW_NONE` when unbound); after
+  Ready it is foreign (counted, never cancelled). Tested: e2e
+  `an_execution_the_arm_never_booked_drifts_and_an_unbound_one_is_unseen`,
+  `a_stray_at_boot_refuses_it_by_name`,
+  `a_stray_on_an_unbound_ticker_refuses_the_boot`.
 * **Open.** The shared scope (O-BX2a); the drift halt a foreign fill
-  raises, end to end (BX8 drives the drift on spot, not the halt).
+  raises, end to end (BX8 drives the drift on spot, not the halt). Stocks
+  (BX10): net only — a foreign BUY and SELL of one size inside the window
+  cancel out — and holdings unread (a deposit, a transfer or a corporate
+  action is invisible).
 
 #### BX-9 (E-9) — the client order id
 
@@ -6962,6 +7023,17 @@ are `docs/binance-runbook.md`.
   e2e `the_arm_trades_end_to_end_against_a_scripted_venue`; gate 93. BX8:
   e2e `a_spot_order_of_ours_resting_at_boot_refuses_the_boot` (an orphan
   and a ghost, each refusing the boot at the listing, never cancelled).
+* **As built — Stocks (BX10):** the place carries our 32-character id; the
+  venue's own id is a UUID, held whole per order (`EqOrderId`) and keyed
+  in the table by its FNV-1a (`equity::eq_key`, case-folded). The listing
+  and the stream name no client id: ours are told by UUID, so a previous
+  boot's order is a stray (it refuses the boot by name, BX-8), never an
+  orphan swept. A cancel goes by the UUID only; the in-doubt detail by our
+  id while no UUID is held; a duplicate id (`486449`) is in doubt, never
+  re-sent. Tested: e2e `a_member_cancel_goes_by_the_uuid`,
+  `a_lost_place_answer_is_resolved_by_our_id_and_never_resent`,
+  `a_duplicate_id_is_in_doubt_and_never_resent`; `equity.rs`
+  `an_order_id_is_a_uuid_held_whole`; fuzz `bn_equity` (the UUID's shape).
 * **Open.** (a) Past the dedup horizon a late event can reach a reused id
   before its ACK; the next listing heals it ("BX6"). (b) **Found in BX11:**
   an orphan on a row this boot did not bind is counted but never
@@ -6982,7 +7054,9 @@ are `docs/binance-runbook.md`.
   their `PUT` templates go unused. Spot (BX8) is IoC-only: no requote
   verb (amend, cancelReplace) is built for it. Options (BX9) are
   IoC-only too: no cancel and so no cancel plus new — the exception is
-  unused. Stocks are not built. The venue keeps the order's first client
+  unused. Stocks (BX10) have no modify either: an equity row refuses
+  modify (`Refusal::Verb`), and no cancel plus new is built — no member
+  requotes there (S-3). The venue keeps the order's first client
   id; the rename is the engine's own.
 * **Enforced.** `BnArm::modify` (one command, counted in the order
   windows); `BnGateway::on_modify` sends one `order.modify` (WS API) or
@@ -7039,13 +7113,31 @@ are `docs/binance-runbook.md`.
   `each_product_has_its_own_paths_by_the_same_template` (the options
   status route), `the_options_place_and_status_query_name_eapis_client_id`
   (eapi's `clientOrderId` on the place and the in-doubt query, pinned).
+* **As built — Stocks (BX10):** an equity order goes in doubt on a lost or
+  unreadable place answer (an answer under 500 naming no code a scanner
+  reads included — also a scan failure), one not echoing our id, `486449`,
+  a cancel answered `F`, `486219`, unreadably or naming another UUID, and
+  the stream's reopen; one `order/detail` a second (by the UUID, or by our
+  id while none is held). `486218` ends it only past `recvWindow` + 5 s
+  and only while no UUID is held — with one held it is a scan failure
+  (BX-15). A cancel's `S` is a receipt: the cancel is owed again 5 s on
+  (`EQ_CANCEL_CHECK_NS`), and the third `S` for an order still working is
+  a scan failure (`EQ_CANCEL_TAKES_MAX`). Tested: e2e
+  `a_lost_place_answer_is_resolved_by_our_id_and_never_resent`,
+  `a_place_answered_by_a_page_no_scanner_reads_is_in_doubt`,
+  `a_lost_cancel_answer_is_resolved_by_the_detail`,
+  `not_found_ends_only_an_order_never_receipted`,
+  `a_cancel_taken_but_never_carried_out_goes_again`,
+  `a_cancel_taken_again_and_again_is_a_scan_failure`,
+  `a_duplicate_id_is_in_doubt_and_never_resent`.
 * **Open.** The REST order route's unknown outcome on a place (a 503
   `-1007`), not driven end to end. The daily stream reopen doubts every
   order (up to 256 status queries, "BX6"). BX9: the options in-doubt
   query is not driven end to end (gate 110's list of what no socket
   pins), and eapi's `-2013` for an unknown order is the docs' and the
   scripted venue's — Demo confirms it before arming (BX13, with the
-  expiry run).
+  expiry run). BX10: when `486218` is final and what a cancel's `S` means
+  are the docs' until the operator's battery (Stocks has no Demo).
 
 #### BX-12 (governed budgets)
 
@@ -7120,6 +7212,16 @@ are `docs/binance-runbook.md`.
   `a_live_binance_slot_resolves_with_its_section_and_nothing_else_does`
   (a 10 s options cycle refused "on eapi"); gate 92 (options' pool takes
   its window's 30).
+* **As built — Stocks (BX10):** equity's own ORDERS pool, 200 a minute at
+  `orders_frac` (`gov::EquityOrders`); its REST reads are SAPI's own IP
+  pool (12 000 a minute), never the futures' window — unmetered, as
+  spot's. The venue's code-less refusal (`F`, `CODE_EQ_REFUSED` 9 018)
+  moves the reject streak as a coded one does; `486410` (the disclaimer
+  unsigned) is one `VenueLock`; `486207` and `486426`–`486428` retire the
+  row. Every product: `-1006` is now unknown (in doubt), `-26004`
+  row-fatal. Tested: `gov.rs` `the_equity_pool_is_two_hundred_a_minute`,
+  `codes_classify`; e2e `the_venues_refusals_move_the_reject_streak`,
+  `the_unsigned_disclaimer_refuses_and_locks_once`; gate 92.
 * **Open.** A 418 on the WS upgrade is a transport failure (a redial at
   its backoff, ≤ 30 s; "BX6"). The 429 drill is loopback-only: a
   deliberate breach on Demo risks an IP ban that the running engine's
@@ -7146,6 +7248,16 @@ are `docs/binance-runbook.md`.
   `arm.rs` `the_refusals_are_counted_by_reason`; e2e
   `the_arm_trades_end_to_end_against_a_scripted_venue`; gate 93; the Demo
   battery's TTL phase ("BX7b").
+* **As built — Stocks (BX10):** every equity order carries the gateway's
+  TTL — mandatory, not a maker's option (`ArmKnobs::equity_ttl_ns`: 0
+  refuses every equity order, `Refusal::Ttl`; a place with no deadline is
+  refused before a byte is rendered, `CODE_EQ_TTL` 9 019). A TTL that
+  falls before the UUID is known is owed until an answer names it. The
+  battery's TTL: 5 000 … 300 000 ms. Tested: `arm.rs`
+  `an_equity_row_rests_under_the_ttl_long_only`; e2e
+  `the_ttl_cancels_a_resting_day_order_and_the_close_expires_one`,
+  `the_ttl_before_the_uuid_is_owed_until_the_answer_names_it`; gate 112
+  (its TTL rounds).
 * **Open.** The timer wheel's capacity ("BX7").
 
 #### BX-14 (fees measured)
@@ -7196,12 +7308,20 @@ are `docs/binance-runbook.md`.
   `a_failed_order_trades_read_is_asked_again_and_pays_once`,
   `a_failed_order_trades_read_leaves_the_commission_as_drift`; gates 108
   and 109; fuzz `bn_spot_event`.
+* **As built — Stocks (BX10):** the fee is the detail's cumulative `fee`
+  (USD), journaled by its increase (`J_FEE`); while the order's notional
+  is under $350 it is the $0.35 minimum, flagged `FEE_FLAG_EQ_FLOOR` (bit
+  14) — `bn-fees` counts it apart (`eq_floor`), never as a rate. Tested:
+  `journal.rs` `a_commissions_asset_is_judged_against_its_row`;
+  `bn_fees.rs` `an_equity_fee_at_the_floor_is_no_rate`; e2e
+  `the_equity_lane_places_fills_and_reconciles`.
 * **Open.** BNB burn is neither asserted at boot nor set by the setup
   tool: a commission paid in BNB is detected and excluded (burn off is an
-  arming precondition, the runbook). The Stocks per-order minimum waits
-  for BX10. Spot's burn (BX8) is the operator's setting, kept fixed while
-  armed (the runbook's §10); a spot commission in BNB measures nothing,
-  as on futures; Q3 (a burn option in the account tools) is open.
+  arming precondition, the runbook). Stocks' $0.35 per-order minimum is
+  flagged, not a rate (BX10). Spot's burn (BX8) is the operator's
+  setting, kept fixed while armed (the runbook's §10); a spot commission
+  in BNB measures nothing, as on futures; Q3 (a burn option in the
+  account tools) is open.
 
 #### BX-15 (scan failure)
 
@@ -7254,6 +7374,27 @@ are `docs/binance-runbook.md`.
   `a_rows_assets_are_read_once_and_never_cut`; fuzz `bn_spot_event`,
   `bn_user_event` (an accepted trade is of something at a price),
   `bn_rest_body` (trade rows, the pair rule, the ticker); gate 109.
+* **As built — Stocks (BX10):** every equity answer is read whole by
+  `exec_binance::equity` — each key once (a nested execution's too), no
+  figure negative (refused on its sign: `-0` and a negative below the
+  scale too), no ticker empty, no execution id twice, a page within its
+  `total` and its `size`, `filledQty` named, a filled word (`FILLED`,
+  `PARTIALLY_FILLED`) never with nothing filled, a fill never without its
+  `trades` key, a report's values judged once it is an `orderReport`. Scan
+  failures too: a detail filled past its order's quantity, `FILLED` short
+  of it, or naming another UUID or side; a page not the one asked for, or
+  a window's `total` that moves; `486218` for an order the venue's receipt
+  named; an answer under 500 naming no code; a cancel taken a third time
+  with the order still working. Tested: `equity.rs`
+  `every_refusal_is_its_own_case`,
+  `the_round_two_refusals_are_each_their_own_case`; proptests
+  `a_key_read_twice_is_refused`,
+  `the_equity_scanners_never_panic_on_arbitrary_bytes`; e2e
+  `the_cycle_reads_every_page_and_refuses_one_it_did_not_ask_for`,
+  `not_found_ends_only_an_order_never_receipted`,
+  `a_detail_past_or_short_of_its_order_is_a_scan_failure`,
+  `a_place_answered_by_a_page_no_scanner_reads_is_in_doubt`,
+  `a_cancel_taken_again_and_again_is_a_scan_failure`; fuzz `bn_equity`.
 * **Open.** The scan failure holds until a restart; a mid-session switch
   to hedge mode reads as a scan failure, not `VenueLock` ("BX7").
   `scan_trades` accepts `"commissionAsset":""` beside a commission (every
@@ -7288,6 +7429,14 @@ are `docs/binance-runbook.md`.
   `a_mainnet_host_sends_no_change_without_the_word` (on a mainnet host a
   change leaves only signed with the word); e2e
   `a_demo_boot_reads_no_sapi_and_a_live_one_refuses_without_it`.
+* **As built — Stocks (BX10):** the order stream's `nbstream.binance.com`
+  joins the host table (`Hosts::eq_user`; `DNS_HOSTS` 11); Stocks' REST is
+  SAPI's host. Stocks has no Demo (R21): an equity row on Demo refuses the
+  boot, never dialled. The read-only probe and the battery are mainnet, by
+  the operator's hand (the battery sends only with
+  `--bn-confirm-mainnet`). Tested: `config.rs`
+  `hosts_must_be_on_the_scopes_network`; e2e
+  `equity_needs_its_keys_mainnet_and_a_classic_account`.
 * **Open.** The `loopback` feature links into `--all-targets` builds,
   inert in the engine ("BX6").
 
@@ -7303,7 +7452,10 @@ are `docs/binance-runbook.md`.
   made it a maker product. Spot (BX8) is IoC-only — it has no dead-man
   (K8): no maker, cancel, modify, amend or cancel-all is built for it, a
   reduce-only order is refused (`Flags`), and a halt's sweep has nothing
-  to cancel there. Stocks are not built. **Options (BX9)** are IoC-only:
+  to cancel there. **Stocks (BX10)** are the one exception: no IoC
+  exists, so an equity order is LIMIT DAY under the gateway's mandatory
+  TTL (BX-13); the row is flagged `INST_NO_DEADMAN` (no maker, no modify)
+  but its cancel is built. **Options (BX9)** are IoC-only:
   the venue's countdown is a market maker's (`-6005` for any other
   account), so no dead-man is ours — no maker, cancel, batch, amend, MMP
   or countdown is built; `bind_option` flags every row `INST_NO_DEADMAN`;
@@ -7420,6 +7572,17 @@ are `docs/binance-runbook.md`.
   `a_live_binance_slot_resolves_with_its_section_and_nothing_else_does`
   (beside PM Pro), `a_session_bound_needs_a_usd_equity` (beside COIN-M or
   spot); fuzz `bn_mode` (the options key, the answer whole).
+* **As built — Stocks (BX10):** an equity row needs the D5 keys
+  (`GwKnobs::equity`), a classic account and mainnet — else
+  `BootErr::Product`; with `tokenize` on, an armed spot row's base must
+  not be the ticker's bStock, and a bStock left unnamed beside an armed
+  spot row refuses the boot (`EqToken`: the check cannot be made). No
+  Stocks permission is asserted (`apiRestrictions` names none): a key that
+  cannot trade Stocks is refused at the first place. The disclaimer is
+  judged at the first place (`486410`, one `VenueLock`), never read.
+  Tested: e2e `equity_needs_its_keys_mainnet_and_a_classic_account`,
+  `an_unnamed_bstock_beside_spot_refuses_the_boot`,
+  `the_unsigned_disclaimer_refuses_and_locks_once`.
 * **Open.** The `-2015` and account-mode gaps above. PM's leverage is not
   asserted ("BX7"); a mid-session hedge-mode switch reads as a scan
   failure (BX-15); a Demo key's permissions are never asserted ("BX7b");
@@ -7484,12 +7647,16 @@ are `docs/binance-runbook.md`.
   threshold halts `MarginRisk`),
   `the_options_account_refuses_the_boot_or_locks_once`;
   `recon.rs` `the_options_account_reads_its_usdt_figures`.
+* **As built — Stocks (BX10):** a cash holding, not margined: no ratio,
+  long-only (a SELL past the booked holding is `NotWritable`); the engine
+  never arms it (S-3). The battery sells its own holding; what it leaves
+  is sold in the app (its exit 58).
 * **Open.** Driven end to end only on the classic USDⓈ-M stream: COIN-M's
   `MARGIN_CALL`, PM's and PM Pro's (`riskLevelChange` `MARGIN_CALL`, the
   unified account's `MARGIN_CALL` / `SUPPLY_MARGIN`) are not. Options'
   ratio is driven past the threshold end to end (BX9); their
   `RISK_LEVEL_CHANGE` `MARGIN_CALL` is read but no test drives it. Stocks
-  have no ratio (not built).
+  have no ratio (BX10).
 
 ### BX3 — router, ledger, lanes (2026-09-26) — DARK until BX6
 
@@ -9812,6 +9979,334 @@ on 2026-10-10; the runs were retried through it.
 | 3 | parser | PASS; F1 (MINOR) a byte after the exercise page refused by no test; F2 (NIT) the proptest's sign drawn wrong 7 in 8, its edge never sampled | F1: the unit test's refusals and the fuzz oracle (break-and-watched: dropping `ends_whole` in `scan_exercise` fails it); F2: the side's sign 7 in 8, a quarter of the cases one contract within 3 µUSDT of the tolerance's edge — `<=` read as `<`, the 0.001 USDT floor dropped, the fee cap dropped and the sign law dropped each fail it |
 | 3 | zero-copy | PASS; cold: the universe copy's rejected alternative circular and its growth unstated; the chain's vectors grown by push past 64 | the `// COPY:` line restated — counted first, sized once; the alternative (the discovery's own vector out, filtered at the lookup) named and why rejected; the chain's vectors sized `EAPI_TABLE_MAX` at once |
 | 3 | alloc | PASS (debug: 123 passed, 4 ignored; release on the Mac); notes: the duplicate check's n², its absence from gate 110's list, `option_mark_band`'s doc | the check stops at its second sight; named in gate 110's unpinned list; the doc: warm on the ledger's path, cold in the gateway |
+
+### BX10 — the Binance Stocks arm, battery-only (2026-10-11) — no member arms (O-BX6, O-BX16); the engine refuses it (S-3)
+
+Built on branch `binance` (plan §5 BX10; the BX10 build plan of
+2026-10-11, the project doc `claude/bx10-build-plan-2026-10-11.md`, and
+the operator's rulings S-1 … S-3 of 06:15Z). The code was built and its
+tests run in the cloud; the Mac's gates and the one `BX10:` commit came
+after. **Binance Stocks has no Demo and no testnet (R21): every order is
+real money.** The session placed none: the arm is proven on the scripted
+venue alone, the shapes the read-only mainnet probe could pin are pinned
+(S-1, plan doc §1a), and the mainnet battery is built for the operator to
+run. **Scope:** `/sapi/v1/equity/*` × classic, LIMIT DAY under a
+mandatory gateway TTL, long-only, on a dedicated account, one owner slot.
+The laws are restated as built above ("BX — the Binance execution
+laws"); their BX10 bullets carry this entry.
+
+#### The rulings (2026-10-11)
+
+| ruling | what it fixed |
+|---|---|
+| S-1 the scripted venue + a read-only probe | No Demo exists: the arm is built and proven against `exec_binance::testvenue`'s `/sapi/v1/equity/*` and its order stream; the read-only keyed probe on mainnet (`exec-smoke --binance-probe equity [--bn-stream-confirm]`, EQ0–EQ7, PASS 06:48Z) pinned the hosts, the rules' shape (no `minQty`; `minNotional` $5; a 1e-9 step), the history pages' envelope, `486218` for an unknown order, HMAC on `/sapi/v1/equity/*` and the listenKey and stream address. |
+| S-2 reconciliation from executions | No positions endpoint: a cycle compares the venue's executions since the session's window opened (`trade/history`, paged) with what the gateway booked since its boot, ticker by ticker, and judges the open orders (ours by UUID, strays). Holdings are never read (a residual). |
+| S-3 battery-only | The ENGINE keeps refusing `equity` (now naming S-3, O-BX16 and R17: no member trades it and no equity market data exists); the arm is exercised only by the operator's battery, `exec-smoke --binance equity --lifecycle`, which carries the D5 keys as flags. |
+| (the session's calls, the plan doc §2) | LIMIT only (a MARKET BUY needs `notional`, which the arm's quantity law cannot bound); DAY only (a GTC order outlives any TTL); a mandatory gateway TTL on every equity order (BX-17's one exception); `walletType=MAIN` on a BUY (a SELL settles to the funding wallet by the venue's rule); the fills booked from `order/detail`'s executions, the stream the trigger only; the fee from the detail's cumulative `fee`, journaled with the $0.35 floor's flag (BX-14). |
+
+#### What is built, and how it is kept from the engine
+
+* **The gateway** (`crates/exec-binance`) gains the equity lane:
+  `LANES` = 5, `LANE_ORDER` = `[USDM, COINM, SPOT, OPTIONS, EQUITY]`.
+  REST-only on SAPI (`api.binance.com`): the place, the cancel and the
+  in-doubt detail on the lane's REST route; the detail after a report,
+  the listenKey (a signed `POST /sapi/v1/equity/listenKey`, its renewal
+  the same `POST`), the open orders, the pages of executions and a
+  ticker's day as jobs; the order stream on
+  `nbstream.binance.com/equity/ws/<listenKey>@orderReport` (the key a
+  36-character UUID; `DNS_HOSTS` 11). The scanners are
+  `exec_binance::equity` (each answer read whole; numbers from their
+  text, never through `f64`).
+* **The arm** admits an equity row LIMIT DAY under its TTL
+  (`ArmKnobs::equity_ttl_ns`, stamped on every equity order; 0 refuses
+  every one, `Refusal::Ttl`), long-only (a SELL with no booked holding is
+  `NotWritable`), on the venue's sides (`tradability`, bound at boot: a
+  closed side is `NotLive`), on equity's own ORDERS pool (200 a minute at
+  `orders_frac`); no reduce-only, no maker, no modify. The cancel passes
+  despite the row's `INST_NO_DEADMAN` (an equity order rests).
+* **The ledger** binds an equity row `LAW_SPOT` (long-only, a cash
+  holding; priced at its last fill or its limit — no equity market data,
+  R17).
+* **The engine refuses it, three ways:** `exec_boot::check_binance`
+  refuses `products` naming `equity` (S-3, O-BX16, R17); `bn_live` builds
+  the gateway with no D5 keys (`GwKnobs::equity: None`, an equity row
+  then refuses the boot — `BootErr::Product`) and the arm with no TTL
+  (`equity_ttl_ns: 0` — every equity order `Refusal::Ttl`); and
+  `bind_table` binds no equity row.
+* **The operator's tools**, reached only through `exec-smoke`: the
+  read-only probe (`--binance-probe equity`, S-1) and the battery
+  (`--binance equity --lifecycle`, `cli::bn_equity_battery`, below).
+
+#### An equity order's life
+
+* **The place** (`POST …/order/place`): `symbol`, `side`, `orderType=LIMIT`,
+  `quoteAsset`, `price` (the cent), `quantity` (the row's step),
+  `timeInForce=DAY`, `tradingSession`, `walletType=MAIN` on a BUY, our
+  32-character id, `tokenize`. A place with no deadline is refused before
+  a byte is rendered (`CODE_EQ_TTL` 9 019). Its answer is a RECEIPT
+  (`status:"S"`, the order's UUID, our id echoed — `J_ACK`); `"F"` is the
+  venue's refusal (`CODE_EQ_REFUSED` 9 018, which moves the reject streak
+  as a coded refusal does — the risk review's item 4); an answer that does
+  not echo our id or name a UUID is no answer we know (in doubt). The UUID
+  is held whole per order (`EqOrderId`, 36 bytes); the table's
+  `venue_oid` is its FNV-1a key (`eq_key`, case-folded, never 0), a key
+  match confirmed against the whole id, either case.
+* **The broker's `ACCEPTED`** is journaled once an order (`J_ACCEPTED`,
+  kind 11), from a report or a detail.
+* **The stream** (`orderReport`: JSON numbers, lowercase words, `EQ_` +
+  the ticker; no client id, no execution id) is the TRIGGER: a report
+  that ends the order or names more filled than booked asks the order's
+  detail (once at a time). A report that arrives before the place's
+  answer names no order we hold: the UUID-less orders in flight are
+  marked, and each asks its detail when its answer names it (a lost or
+  unread answer puts it in doubt instead); such a report's `ACCEPTED` is
+  kept by its UUID's key (the last 8) and journaled once an answer names
+  the order — an order can end before any detail reads it `ACCEPTED`
+  (round 2: gate 112 under load).
+* **The detail** (`order/detail` by the UUID, or by our id while none is
+  held) books the executions — oldest first, each once (its
+  `executionId` keyed on the trade-id ring, exact: `exec_key`), never
+  past the cumulative `filledQty`; a cumulative past the executions
+  listed books at the implied price (`J_FILL_UNSEEN`) — except the cut the
+  venue's nine decimals make to six on each execution (up to a millionth
+  an execution past the first, never booked: the history's rows are cut
+  the same way — the risk review's S3). A detail filled past the order's
+  own quantity, `FILLED` short of it, of another UUID, or of another side
+  is a scan failure (BX-15; the round-2 B1: an end must never leave the
+  venue's holding unbooked); so is a detail that does not name
+  `filledQty`, names a filled word (`FILLED`, `PARTIALLY_FILLED`) with
+  nothing filled, or a fill with no `trades` key (`null` is no execution:
+  the cumulative books at the implied price). The fee: the detail's cumulative `fee` (USD), journaled by its
+  increase (`J_FEE`; `FEE_FLAG_EQ_FLOOR`, bit 14, while the order's
+  notional is under $350 — the $0.35 minimum, no rate).
+* **The ends:** `FILLED`; `CANCELED` (ours, `CANCELED_MEMBER` /
+  `CANCELED_TTL`, when the venue took a cancel of ours; else
+  `CANCELED_VENUE`); `EXPIRED` (a DAY order at its session's close);
+  `REJECTED` (`CODE_EQ_REFUSED`). Only a detail ends an order.
+* **The TTL and the cancel:** at the TTL's deadline the gateway cancels
+  the order by its UUID (`POST …/order/cancel`; owed until a UUID is
+  known — the cancel goes once the place's answer, or the detail, names
+  it). The cancel's `S` is a receipt too (the risk review's S1): the
+  cancel is owed again 5 s on (`EQ_CANCEL_CHECK_NS`) and goes again if
+  the order is still working then — its end disarms that; the third `S`
+  for one order still working is a scan failure (`EQ_CANCEL_TAKES_MAX`,
+  round 2's m5: never an endless retry); a halt's sweep leaves a taken
+  cancel to that re-check (a slow broker's receipts are no failure to
+  count). A cancel answered `F`, `486219`,
+  unreadably, or naming another UUID leaves the order in doubt with the
+  cancel owed.
+* **In doubt** (BX-11): one detail query a second; `486218` ("no such
+  order") ends an order only past `recvWindow` + 5 s and only while no
+  UUID is held — for an order the venue's receipt named it is a scan
+  failure (the risk review's item 3). `486449` (a duplicate id) is in
+  doubt, never re-sent. An answer under 500 naming no code a scanner
+  reads (a CDN's page, a code named twice, a 2xx we do not know) is a
+  scan failure — a place in doubt, a cancel owed as an unread one (the
+  order in doubt, the cancel re-sent once its detail shows it working,
+  never at once into a page that keeps answering; round 2's m1, round
+  3's MINOR). No path re-sends a place.
+
+#### Reconciliation (S-2)
+
+* **The window** opens at the boot's first cycle and never moves. A
+  cycle reads the session's executions page by page (`trade/history`,
+  100 a page, `current=<n>`): **the page law** (the risk review's item 2)
+  — each page must be the one asked for at the size asked for (a venue
+  that ignores the page parameter would hand page 1 twice: a scan
+  failure), the window's `total` fixed by the first page (another
+  `total` later fails the cycle), the rows summing exactly to it, at most
+  `EQ_PAGES_MAX` (20) pages — else the cycle fails, no verdict. Each
+  ticker's net (a BUY adds, a SELL takes) is its leg's venue figure,
+  against what the gateway booked since its boot; a ticker no row binds
+  is an unseen leg. A leg is HELD (the cycle inconclusive) while an order
+  of ours on its row is in doubt or its detail is being read.
+* **The open orders** (no client id): ours by UUID; one of ours listed
+  with more filled than booked asks its detail (a fill the stream lost,
+  the risk review's S4); nothing is judged while an order of ours has no
+  UUID yet. Another's order is a stray: before Ready it refuses the boot
+  by name (`EqStray`: on a bound ticker, or — on a dedicated account — on
+  any, `ROW_NONE`; the operator cancels it in the app), after it foreign
+  (counted, never cancelled).
+* **The sweep** (a halt's, the shutdown's) cancels every equity order of
+  ours by its UUID each round; from the second round (or after a sweep
+  stranded), on a dedicated account and while an equity order of ours is
+  open, the account's `cancel-all` too; the confirmation is a cycle.
+
+#### The battery (`exec-smoke --binance equity --lifecycle`; MAINNET, the operator's)
+
+* **Flags:** the D5 keys `--bn-eq-session` (RTH / EXTENDED / 24H),
+  `--bn-eq-tokenize` (0 / 1), `--bn-eq-quote` — required, no default;
+  `--bn-eq-symbol` (AAPL), `--bn-eq-ttl-ms` (5 000 … 300 000; 60 000),
+  `--bn-usd` (6 … 25 for Stocks), `--bn-rest-bps` (50 … 900),
+  `--bn-cross-bps` (1 … 300); `--bn-confirm-mainnet`, the operator's word
+  (the sealed `MainnetVerb`) — without it the battery reads (the clock,
+  the ticker's rules, its quote, the open orders: none may rest) and
+  prints its plan, and sends nothing (exit 64). The key is `.env`'s live
+  Ed25519 pair, else its live HMAC pair; it must trade Stocks.
+* **The router's clamps** on its slot: one order $50, the holding $50,
+  the day $200, two orders working; the halts `exec.toml.example`'s (5
+  rejects, $5 of drift, 30 s of a silent route, 3 local refusals, 300 s
+  unreconciled).
+* **The run:** a BUY at `--bn-rest-bps` under the bid — `ACCEPTED`, then
+  cancelled by its member (`CANCELED_MEMBER`); a marketable BUY at
+  `--bn-cross-bps` over the ask at `--bn-usd` (at least the minimum
+  notional) — filled, or ended by its TTL; the SELL of the holding the
+  ledger booked (floored to the step) through a fresh bid; three
+  reconciliations in a row after the SELL that agree (a cycle read before
+  the SELL was booked can land after it, and a leg's first differing
+  cycle still reads reconciled — the risk review's S2 and round-2 m2).
+  The end, always: the holding not sold offered once more; the shutdown
+  sweep; the open orders read empty, and the ticker's executions since
+  the run began (`trade/history`) netting to what the run booked (round
+  2's B1: else the difference may be held, unreported) — else 58.
+* **Exits:** 0 the bar met; 50 the account (a resting order — `EqStray`
+  — or a ticker not tradable both ways or not at all; also a place
+  refused not tradable later in the run); 51 the boot; 52 the rest phase
+  (never `ACCEPTED` — the session may be closed — or not cancelled by its
+  member), or a place refused with a code the tool does not map; 56 no
+  three agreeing cycles; 57 a fill missing; 58 something left (an order
+  rests WITHOUT its TTL until its session closes — cancel it, and sell a
+  holding, in the app) or the executions disagree with the booking; 64
+  no word; 66 `486410` — the disclaimer unsigned (signed in the app,
+  never by the tool; nothing placed). `scripts/exec-smoke.sh`
+  prints a MAINNET banner before the run and the MAINNET reading of each
+  code.
+* **Preconditions:** a dedicated account (no manual Stocks order during
+  the run — a halt's `cancel-all` takes the account's every equity
+  order); `--bn-eq-tokenize 1` lands the fill as a bStock — never one an
+  armed engine's spot row holds; one Ctrl-C (a second kills at once). Cost
+  at the minimum: two fees at the $0.35 floor and the spread twice.
+
+#### Gates
+
+* **Alloc 125** (+ 4 ignored helpers; was 123): gate 112 — the equity
+  lane over a real rustls loopback (the scripted venue in a child): a BUY
+  and its SELL a round, `G112_ROUND` = 12 rustls records (each order's
+  place and answer, the stream's `accepted` and `filled`, its detail);
+  TTL rounds — a resting order the gateway's TTL cancels by its UUID,
+  `G112_TTL` = 8; the halt's sweep with an order resting — its cancel by
+  the UUID, then the confirmation cycle over one page — `G112_RECON` = 9,
+  measured BEFORE the rounds (a cycle reads every execution since the
+  boot: a page over rustls' 4 KiB read buffer grows and shrinks it in
+  arrival-dependent steps — rustls' allocations, not pinnable to an exact
+  count; a full page's scan is gate 113's). Gate 113 — the renders (the
+  place, the cancel and detail by UUID, the in-doubt detail by our id, a
+  page of the window or a ticker's day), Ed25519-signed in place, and the
+  scans (the receipt, the reports, the detail, the cancel, the listing, a
+  FULL 100-row page) at 0 B. Gate 92 — the arm with AAPL (both sides) and
+  SPY (SELL-only): 200 equity orders on equity's pool, each under the
+  TTL and cancelled by its member, every seventh from the third refused
+  by the venue with a six-digit code (29, asserted, each a reject the arm
+  counts), SPY's BUYs `NotLive`; 0 B. Not pinned on a socket (each
+  allocation-free by inspection, built of what the gates pin): the boot;
+  the listenKey's renewal; a non-empty listing's found row (scanned in
+  gate 113); the multi-page cycle's hand-off; the implied-price
+  remainder; the route's in-doubt detail; the account's `cancel-all`;
+  the gateway's refusals (a place answered `F`, coded, unreadable or
+  `486218`; a cancel answered `F`, unreadably or naming another UUID);
+  a cancel's re-check firing on an order still working; the
+  `CANCELED_VENUE`, `EXPIRED` and `REJECTED` ends; a stray or foreign
+  listing row; the over-fill, page and total guards; an early report's
+  kept `ACCEPTED`; bursts over rustls' 4 KiB window.
+* **Copy:** the UUID copied once an order into its slot, only from an
+  answer of ours (marked); one execution (≤ 64 B) off the read's array,
+  only once it books (marked); the asked ticker and its rules' row (80 B,
+  moved by value) at boot (marked, cold); copy-audit new=0.
+* **Fuzz:** `bn_equity` (new) — every equity scanner against oracles: an
+  accepted answer whole, executions whole and summing ≤ `filledQty`, no
+  id named twice, no figure negative, a page within its `total` and its
+  `size`, the rules for a ticker the input names, `json_num_1e6` against
+  an independent textual oracle (agreeing on 5 M cross-checked inputs),
+  the UUID shape against a byte-wise model.
+* **Proptests:** `tests/bn_equity_proptest.rs` (11) — round trips of every
+  scanner, the one-reading law (nested keys included), arbitrary bytes.
+
+#### Departures (from plan §5 BX10 and the build plan)
+
+| departure | from | as built, and why |
+|---|---|---|
+| no 1 s poll | the plan: the stream, or a 1 s poll while it is down | the stream's reopen puts every order in doubt (one detail a second each) and the listing books a lost fill: the poll adds nothing |
+| reconciliation | the plan: open orders + positions (K15) | executions (S-2): no positions endpoint exists |
+| the session | the plan: per order, from the artifact | the D5 flag, one for the run (no member, S-3) |
+| the disclaimer assertion | the plan: asserted | judged at the first place (`486410`: one `VenueLock`; the battery's exit 66): no endpoint reads it |
+| the engine | the plan: a full arm | built in full, battery-only (S-3) |
+| gate 112's cycle | the gates' habit: after the rounds | before them, on one page (above) |
+
+#### Residuals
+
+* **The live shapes are the docs' and the connector's** until the
+  operator's battery places an order (BX13): the `orderReport` payload,
+  the detail's executions, the history rows (and how they name their
+  ticker), the place and cancel answers, the page parameter's name
+  (`current`), what `S` means on a cancel, when `486218` is final, Ed25519
+  on `/sapi/v1/equity/*` (HMAC is proven), the 9-decimal executions.
+* **The window never moves:** past `EQ_PAGES_MAX` × 100 (2 000)
+  executions since the boot every cycle fails (fail closed: the slot
+  halts `recon-stale`); a restart opens a new window.
+* **Net only:** a foreign BUY and SELL of one size inside the window
+  cancel out (BX-8); holdings are never read — a deposit, a transfer or a
+  corporate action is invisible.
+* **A side the venue closes** counts as a local refusal (`NotLive`)
+  toward the asset-refusal halt.
+* **No Stocks permission is asserted at boot** (`apiRestrictions` names
+  none): a key that cannot trade Stocks is refused at the first place.
+* **`maxNumOrders` is not enforced locally**; the venue refuses past it.
+* **`eq_find` scans the open-order table** (1 024 slots) per report and
+  per listed row, and the one-reading check on a listing (`named_twice`)
+  is quadratic in its rows (a 1 024-row listing ~1–2 ms on the gateway
+  thread): allocation-free, a latency cost on a broker path whose answers
+  take ~100 ms.
+* **A lost place answer, then `486218` by our id** past the window,
+  ends the order `REJECTED`. Had the venue placed it after all (its
+  lookup by our id not finding it), it rests with no TTL: the listing
+  counts it foreign (on a dedicated account that does not block
+  `reconciled`), and the sweep's `cancel-all` runs only while an order
+  of ours is open — the battery's end read catches it (58). A place
+  answered `F` is final, as the venue's refusal.
+* **Below a millionth:** a positive execution under a millionth of a
+  share (legal at the venue's 1e-9 step) is refused — a scan failure,
+  the slot's halt; so is a `PARTIALLY_FILLED` (or `FILLED`) with less
+  than a millionth filled. The arm's own quantities are on the 1e-6 grid: only a partial
+  could be so small (fail closed).
+* **The cut, twice more:** a working order whose executions carry the
+  nine-to-six cut asks its detail every cycle (its listing's `filledQty`
+  past the booked by the residue); and when the executions list lags the
+  cumulative, the implied-price remainder books the cut too — a
+  permanent sub-cent difference to the history (fail closed: the leg's
+  drift).
+* **A `CANCELED` or `EXPIRED` detail naming `filledQty` `null`** after
+  a partial fill the arm never booked books nothing more: the cycle's
+  drift and the battery's end read (58) catch it (keeping the stream's
+  highest `fq` would need room `EqSlot` does not have).
+* **Escaped strings are compared raw** (keys with escapes are refused):
+  an escaped `orderReport` event name is counted as another event — its
+  trigger lost (the listing and the reopen catch up); an escaped
+  execution id reads as another id (booking stays capped by the
+  cumulative `filledQty`).
+* **The fee grammar** (`fees.toml`) cannot express the per-order minimum:
+  `bn-fees` counts a floored fee apart (`eq_floor`), never as a rate.
+* `-1006` is now `Unknown` on every product (a tightening: an unknown
+  outcome is in doubt everywhere); `-26004` is row-fatal everywhere
+  (only SAPI's Stocks names it).
+* **CLAUDE.md's gate line** (121; 125 at this phase's merge) is the
+  operator's word.
+
+#### The reviews
+
+| round | reviewer | verdict | disposition |
+|---|---|---|---|
+| 1 | risk | BLOCK: (1) `exec-smoke.sh` read the MAINNET battery as Demo; (2) the page law could sum page 1 twice; (3) `486218` could end a receipted order; (4) the venue's code-less refusal never moved the streak; S1 a cancel's `S` taken as done; S2 the battery's bar on a first differing cycle; S3 the 9-decimal cut as drift; S4 a fill the stream lost on a working order; S5 no over-fill guard; S6 a comment against the code; S7 `EqStray` narrower than its doc; S8 `-1006` / `-26004` everywhere; S9 an unnamed bStock beside spot; S10 the word a plain bool; S11 tests; NITs | all four fixed in code with e2e tests, each break-and-watched (`the_cycle_reads_every_page_and_refuses_one_it_did_not_ask_for`, `not_found_ends_only_an_order_never_receipted`, `the_venues_refusals_move_the_reject_streak`, the wrapper's MAINNET texts); S1, S3, S4, S5, S7, S9 fixed in code (`a_cancel_taken_but_never_carried_out_goes_again`, `the_cut_past_the_sixth_decimal_is_never_drift`, each break-and-watched); S2 two agreeing cycles in a row; S6 the comment; S8 documented; S10 `MainnetVerb`; S11 `the_ttl_before_the_uuid_is_owed_until_the_answer_names_it` and the above; the NITs residuals |
+| 1 | alloc | PASS (125 debug); findings: gate 112 without the TTL path; gate 92's equity branches; a few renders and paths unpinned; the UUID copied on every detail; the slot copied for two fields; `EqSlot` unasserted; bounds checks; `eq_find`'s scan | gate 112's TTL rounds and the sweep's cancel by UUID; gate 92's cancels and a six-digit refusal; gate 113's day render; the UUID copied only while none is held; two fields read; `EqSlot` ≤ 64 B asserted; `eq_find` a residual |
+| 1 | zero-copy | FINDINGS (copy-audit new=0): the UUID's copy on every detail; the slot's copy; the marker's wording; the rules' ticker copied per row | fixed as the alloc review's; the marker restated; only the asked ticker copied |
+| 1 | parser | FINDINGS: the rules' fuzz path never ran; ~15 refusals untested; `inside()` could not fail; `page`/`size` dropped; negatives clamped or passed; `orderReport` judged other events' values; ids named twice; a UUID's case; the shared walker's brackets; `filledQty`/`trades` null refused | the fuzz input's first byte the ticker's length (and AAPL, A), with oracles, and a rules round-trip property; a test per refusal (17 mutations killed); `inside()` on the span's own bounds; `page` and `size` returned and judged; negatives refused; the report's values judged once it is an `orderReport` (nulls allowed but `fq`); ids twice refused (an order's UUID case-folded, an execution's exact); `null` / absent read as none; the walker's brackets a residual (core-parse, shared) |
+| 2 | risk | BLOCK: B1 (new) a `FILLED` detail with no `filledQty` booked nothing and ended FILLED — the venue's holding unreported; MINOR m1 an unreadable 4xx ended a place REJECTED (code 0), m2 the two-cycle bar raced a cycle read before the SELL, m3 S4, S5, S7, S9 untested, m4 a lost answer then `486218` leaves an order resting untracked, m5 cancel receipts retried without bound, m6 the wrapper's header and PASS order, m7 the runbook's exit table; NITs | B1: `filledQty` required, a filled word with nothing filled refused, a fill with no `trades` key refused, a `FILLED` detail short of the order a scan failure, and the battery's end reads the ticker's executions against the booking (58) — each break-and-watched (`a_detail_past_or_short_of_its_order_is_a_scan_failure`; unit cases in `a_detail_reads_its_executions_and_its_cumulative_figures`); m1 a scan failure and the request lost (`a_place_answered_by_a_page_no_scanner_reads_is_in_doubt`); m2 three agreeing cycles; m3 `a_lost_fill_on_a_working_order_is_booked_from_the_listing`, `a_stray_on_an_unbound_ticker_refuses_the_boot`, `an_unnamed_bstock_beside_spot_refuses_the_boot` and the S5 case above, each break-and-watched; m4 a residual; m5 `EQ_CANCEL_TAKES_MAX` (`a_cancel_taken_again_and_again_is_a_scan_failure`); m6, m7 and the NITs fixed (the stray's message names the ticker, not a count) |
+| 2 | alloc | PASS; L1 gate 112's stale comments, L2 its "not pinned" list short, L3 round 1's bounds checks without a disposition; I1 `named_twice` quadratic, I2 gate 92's six-digit branch unasserted, I3 `EqSlot` at exactly 64 B, I4 the report's key slots unasserted | L1, L2 fixed; L3 accepted — `gateway.rs` uses checked indexing throughout, none can fire under the table invariants; I1 a residual; I2 asserted (29); I3 noted (the new `takes` sits in its padding); I4 a const assert |
+| 2 | zero-copy | PASS; cold notes: the rules' row (80 B) moved by value under a marker naming the ticker; each execution copied before the room and seen checks; the §6 listenKey row (64 B vs 96); `bn_probe`'s doctrine header (Demo only); the UUID copied before the echo check | the marker names the row; the execution copied only once it books; the row ≤ 96 B; the header names the MAINNET probe; the UUID copied only for an answer that is ours |
+| 2 | parser | FINDINGS: F1 `-0` and negatives below the scale read 0 in the never-negative helpers (MEDIUM); F2 refusals no test pinned (two fail open); F3 `E` / `U` `null` refused against the doc; F4 a filled word with nothing filled accepted; F5 an execution under a millionth refused; INFO: leading zeros, escaped values compared raw, the walker's brackets confined, no seed corpus, `cancel-all`'s answer unread | F1 refused on the sign (`signed`), with unit and fuzz oracles; F2 `the_round_two_refusals_are_each_their_own_case` (eight mutations killed); F3 `null` reads 0; F4 refused (B1); F5, escapes a residual; empty tickers refused; the fuzz run seeded from the unit tests' bodies |
+| 3 | risk | APPROVE; MINOR: a cancel answered by an unreadable 4xx re-sent every 10 ms (the shared lost-request path); NITs: `venue_net` trusted the venue's symbol filter and its window, read the holding before a last drain; a `CANCELED` detail with `filledQty` `null` after an unbooked partial; the plan's test count; the runbook's stray wording | the cancel owed as an unread one (paced through the doubt); `venue_net` refuses another ticker's row, a moving `total`, an empty page short of it, and drains the rings first; the null case a residual; the docs fixed |
+| 3 | alloc | PASS; info: the gate's "not pinned" list one item short; the key-slot assert on its highest bit only; the sweep's re-sent cancels could reach the take bound in ~2 s | the item added; the assert over every key bit; a halt's sweep leaves a taken cancel to its re-check (`the_sweep_leaves_a_taken_cancel_to_its_recheck`, break-and-watched) |
+| 3 | zero-copy | PASS (copy-audit emulation: 0 unmarked); nits: "of ours" untrue for the place's receipt; a rejected alternative without its reason; the Copy bullet without the cold row | the receipt's UUID copied only for an answer echoing our id; the reason given; the bullet completed |
+| 3 | parser | PASS; info: no `-0` case for the listing's fill or the report's `FN`; F5 widened by the filled-word refusal | both cases added; F5's residual names it |
 
 ## XMM — slot 6: the Hyperliquid maker, DARK at XH1 (2026-09-26)
 

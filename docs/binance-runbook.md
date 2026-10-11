@@ -2,16 +2,19 @@
 
 Anton runs this. It covers the Binance arm's keys, the Demo tools, the
 account tools, the fee measurement, the halts, deploying after a merge,
-the arming preconditions, and spot's and options' own rules. The laws are in
+the arming preconditions, spot's and options' own rules, and the Binance
+Stocks tools. The laws are in
 `docs/risk-policy.md`, "BX — the Binance execution laws (BX-1 …
 BX-20)"; the design is `docs/binance-exec-plan.md`.
 
-**Status (BX9, 2026-10-11).** The arm boots USDⓈ-M and COIN-M futures
+**Status (BX10, 2026-10-11).** The arm boots USDⓈ-M and COIN-M futures
 under the classic, Portfolio Margin (`pm`) and PM Pro (`pm_pro`) account
 modes, and spot — bStocks included — and options under classic alone:
 makers on USDⓈ-M classic only, IoC everywhere else. Options arm alone or
-beside USDⓈ-M only. Binance Stocks refuse the boot (BX10). **No member
-arms (O-BX6)** before BX13. Spot's own rules are §10, options' §11.
+beside USDⓈ-M only. Binance Stocks is built but the engine refuses it
+(ruling S-3): only the operator's MAINNET battery drives it (§12).
+**No member arms (O-BX6)** before BX13. Spot's own rules are §10,
+options' §11, Binance Stocks' §12.
 
 Every command below runs from the checkout whose release binary you
 vetted (`cargo build --release -p cli`), through `scripts/exec-smoke.sh`:
@@ -23,8 +26,8 @@ missing or too-old binary.
 
 | variables | read by | what |
 |---|---|---|
-| `BINANCE_API_KEY`, `BINANCE_ED25519_SEED` | the engine (a live Binance slot); the account tools on `--bn-network mainnet` | the live key: an Ed25519 key (the app's API management, "self-generated": you upload the public key), its 32-byte seed as 64 hex digits |
-| `BINANCE_HMAC_API_KEY`, `BINANCE_HMAC_SECRET_KEY` | the engine under `signing = "hmac"` (REST only), and its options lane whenever options are armed (BX9: eapi refuses the Ed25519 key); the account tools under `--bn-ops-hmac` | the live HMAC pair |
+| `BINANCE_API_KEY`, `BINANCE_ED25519_SEED` | the engine (a live Binance slot); the account tools on `--bn-network mainnet`; the Binance Stocks probe and battery (§12) | the live key: an Ed25519 key (the app's API management, "self-generated": you upload the public key), its 32-byte seed as 64 hex digits |
+| `BINANCE_HMAC_API_KEY`, `BINANCE_HMAC_SECRET_KEY` | the engine under `signing = "hmac"` (REST only), and its options lane whenever options are armed (BX9: eapi refuses the Ed25519 key); the account tools under `--bn-ops-hmac`; the Binance Stocks probe and battery when `.env` names no Ed25519 key (§12) | the live HMAC pair |
 | `BINANCE_DEMO_API_KEY`, `BINANCE_DEMO_ED25519_SEED`, `BINANCE_DEMO_HMAC_*` | the Demo tools only (probe, battery, drill, account tools on Demo; the options probe and battery sign eapi with the HMAC pair) | Demo's keys (demo.binance.com) |
 
 - The live key **trades what is armed and cannot withdraw** — futures
@@ -48,7 +51,8 @@ missing or too-old binary.
 ## 2. The Demo tools
 
 Demo orders are real orders on Demo's books; nothing reaches mainnet
-(the binary refuses any other host).
+(the binary refuses any other host). Binance Stocks has no Demo: its
+probe and battery are §12's, on MAINNET.
 
 - **The probe:** `scripts/exec-smoke.sh --binance-probe` (or
   `--binance-probe futures`) — the K-probes and the arming preconditions
@@ -231,6 +235,9 @@ target/release/multivenue-engine bn-fees <log-root or run-dir>…
   settlement asset (BNB above all) or naming none, a trade of no
   notional. A foreign trade carries no fee record at all. **Keep BNB burn off** in the app's fee settings: a commission
   paid in BNB measures nothing.
+- Binance Stocks' fee (BX10) is USD per order with a $0.35 minimum: a fee
+  journaled at that floor (notional under $350) is no rate — counted
+  apart (`eq_floor`), never in a class.
 - Journals written before BX11 carry no fee records.
 
 ## 5. Halts
@@ -290,6 +297,8 @@ slot already halted (your switch).
   under another options key). Deleting it ends that session (the session
   bound starts again from the next boot).
 - **Options' own refusals** (BX9): §11.
+- **`products` names `equity`:** the engine refuses Binance Stocks
+  (ruling S-3; O-BX16, R17) — drop it; Stocks run only as §12's battery.
 - **The self-test or the vectors fail:** the binary is not fit to sign;
   do not run it.
 
@@ -316,7 +325,7 @@ None of these is met by the code alone; each is yours.
 
 - **The ruling:** O-BX6 lifted for the slot (BX13).
 - **The gates, on the tree you arm:** gates 94, 94b and 108 and the
-  loopback set pass — `make alloc-assert` (the Mac, release: 121/121) and
+  loopback set pass — `make alloc-assert` (the Mac, release: 125/125) and
   `cargo nextest run -p exec-binance` (`bn_e2e_loopback`, 64 tests).
   Gates 94 and 94b pin USDⓈ-M classic's allocations, gate 108 spot's;
   the loopback set also exercises COIN-M, Portfolio Margin, PM Pro and
@@ -361,6 +370,9 @@ None of these is met by the code alone; each is yours.
 - **The members:** every member trading the slot reads
   `FILL_FLAG_ADOPTED` as opening inventory, never a trade (risk-policy
   "BX7").
+- **Binance Stocks** (BX10): not armable — the engine refuses it (S-3).
+  Arming it needs R17's ruling (a member and an equity market-data
+  source) and a build; §12's battery is its only driver.
 - **The binary:** the Demo evidence of §7 on the very binary you arm.
 - **The boot:** `--arm-live <slot>`; the boot tells
   `binance: LIVE ARM ARMED — …` (or names what refused it). The first
@@ -370,12 +382,12 @@ None of these is met by the code alone; each is yours.
 
 | codes | tool |
 |---|---|
-| 50–57 | the battery's phases (account, boot, cycle, post-only, TTL, sweep, reconciliation, fills) |
-| 58 | something left on the Demo account, or an end that could not read it |
-| 59 | the probe |
-| 60–64 | the account tools: a read, a refusal, the arm's orders resting, a position still open, mainnet without `--confirm` |
+| 50–57 | the battery's phases (account, boot, cycle, post-only, TTL, sweep, reconciliation, fills); the Binance Stocks battery's are §12's |
+| 58 | something left on the Demo account, or an end that could not read it — on the Binance Stocks battery, on the **LIVE** account (§12: clear it in the app at once) |
+| 59 | the probe (the Binance Stocks probe too) |
+| 60–64 | the account tools: a read, a refusal, the arm's orders resting, a position still open, mainnet without `--confirm`; 64 is also the Binance Stocks battery without `--bn-confirm-mainnet` (its plan printed, nothing sent) |
 | 65 | the gap drill: the dead-man was not seen to cancel the makers |
-| 66 | the spot battery: the permission check refused the boot — the account lacks a group the spot row needs (the bStock check); nothing placed |
+| 66 | the spot battery: the permission check refused the boot — the account lacks a group the spot row needs (the bStock check); the Binance Stocks battery: `486410`, the US-equity disclaimer unsigned (§12); nothing placed either way |
 
 Every non-zero code means: read the report above it before anything
 else.
@@ -531,3 +543,103 @@ The boot's options refusals (the log names each):
 | `OptStray(row)` | an options order of ours rests | cancel it in the app |
 | `OptionShort(row)` | a held short on a row the arm may not write | close it, or set `options_write = 1` where the venue allows |
 | `Inventory(…)` | held options past the adoption cap, or one with no price | close them, or raise the cap |
+
+## 12. Binance Stocks (BX10)
+
+**Binance Stocks has no Demo and no testnet: every order is real money on
+your live account.** The arm is built and tested on the scripted venue;
+the ENGINE refuses it (ruling S-3; no member trades it, O-BX16, and no
+equity market data exists, R17): `products` naming `equity` refuses the
+boot. Two operator tools reach it, both on MAINNET with the live key
+(§1: the Ed25519 pair, else the HMAC pair), both through
+`scripts/exec-smoke.sh`, which prints a MAINNET banner first.
+
+**The read-only probe** — `scripts/exec-smoke.sh --binance-probe equity`
+(add `--bn-stream-confirm` to open a listenKey and watch the order
+stream for a minute): EQ0–EQ7 — the clock, AAPL's and SPY's rules, the
+tokenized assets, AAPL's quote, the open orders, the last 7 days' orders
+and executions (their shapes, never their values), an unknown order's
+answer. It places nothing. 0 or 59. Its PASS of 2026-10-11 06:48Z pinned
+the shapes the arm reads before any order.
+
+**The battery** — the operator's alone. First without the word (it reads
+and prints its plan; nothing is sent; exit 64), then, the plan read, the
+same line with `--bn-confirm-mainnet`:
+
+```
+scripts/exec-smoke.sh --binance equity --lifecycle \
+  --bn-eq-session RTH --bn-eq-tokenize 0 --bn-eq-quote USDC --bn-usd 6 \
+  [--bn-eq-symbol AAPL] [--bn-eq-ttl-ms 60000] \
+  [--bn-rest-bps 300] [--bn-cross-bps 50]
+# the plan read:  … the same flags … --bn-confirm-mainnet
+```
+
+- **The D5 keys are required, no default:** `--bn-eq-session` (`RTH`,
+  `EXTENDED` or `24H` — run it while that session is open: outside it the
+  broker ends a DAY order unfilled or refuses it, and the run is short),
+  `--bn-eq-tokenize` (`0`: the fill settles as the share; `1`: as its
+  bStock — never one an armed engine's spot row holds) and
+  `--bn-eq-quote` (the quote asset the ticker trades in). The values
+  above are an example; the account and the ticker decide. **`--bn-usd`
+  too** (6 … 25 for Stocks): the futures batteries' default, 60, is
+  refused before anything is sent (exit 1). The bracketed flags show
+  their defaults; `--bn-rest-bps` 50 … 900, `--bn-cross-bps` 1 … 300.
+- **Without `--bn-confirm-mainnet`** it reads — the clock, the ticker's
+  rules, its quote, the open orders (none may rest) — prints its plan
+  (the two prices and quantities) and sends nothing (exit 64). Read the
+  plan, then run it again with the word.
+- **The run:** a BUY `--bn-rest-bps` under the bid — `ACCEPTED` by the
+  broker, then cancelled by its member; a marketable BUY `--bn-cross-bps`
+  over the ask, `--bn-usd` of notional (6 … 25; at least the ticker's
+  minimum, $5; on a ticker that trades in whole shares, one share — the
+  router's $50 clamp refuses a dearer one) — filled, or ended by its TTL;
+  the SELL of what it
+  bought (floored to the step: the dust stays, reported); three
+  reconciliations in a row that agree. Every order is LIMIT DAY under the
+  gateway's TTL (`--bn-eq-ttl-ms`, 5 000 … 300 000): the gateway cancels
+  it at expiry.
+- **The end, always** (after a failure or a Ctrl-C too): what it bought
+  and did not sell offered once more (not after a signal, not once
+  halted); every order of the run cancelled by its id; the open orders
+  read empty, and the ticker's executions since the run began netting to
+  what the run booked — else 58.
+- **Its clamps:** one order $50, the holding $50, the day $200, two
+  orders working; the halts `exec.toml.example`'s.
+- **Cost at the minimum:** two fees at the $0.35 floor and the spread
+  crossed twice — about a dollar.
+
+**Before you run it:**
+
+- **A dedicated account:** no manual Stocks order during the run, and
+  none resting before it (the boot refuses a resting order by name,
+  `EqStray`: cancel it in the app). A halt's sweep cancels the account's
+  every equity order (`cancel-all`).
+- **The US-equity disclaimer signed** in the Binance app: unsigned, the
+  first place is refused `486410` — exit 66, nothing placed. The tool
+  never signs it.
+- **The key trades Stocks:** nothing at boot can assert it (the key's
+  restrictions name no Stocks permission); a key that cannot is refused
+  at the first place.
+- **One Ctrl-C:** it ends the run short and lets the end sweep; a second
+  kills at once — and an order left then rests WITHOUT its TTL until its
+  session closes.
+
+**When it does not end 0:**
+
+| exit | means | what to do |
+|---|---|---|
+| 50 | the account: an order rests before the run (the boot's `EqStray`: on the run's ticker, or on one it does not trade), or the ticker is not tradable both ways (or at all) — or a place refused as not tradable later in the run | cancel it in the app; pick another ticker; past the first order, read the end's `left` |
+| 51 | the boot (the log names the `BootErr`: an assertion, a timeout) | as named |
+| 52 | the rest phase: the order was never `ACCEPTED` (the session may be closed) or not cancelled by its member — or any place refused with a code the tool does not map | run it while `--bn-eq-session` is open; read the refusal |
+| 56 | no three agreeing reconciliations in a row after the SELL | read the report's legs; read the account's executions in the app |
+| 57 | a fill missing (the BUY or the SELL ended unfilled) | widen `--bn-cross-bps`, or run inside the session; the end's `left` is empty only when nothing rests and the executions match the booking |
+| 58 | **something left on the LIVE account** — an order resting, a holding not sold, or the ticker's executions since the run began disagreeing with what it booked — or its end could not read it | **at once:** cancel the order in the app (it rests WITHOUT its TTL until its session closes) and sell a holding left |
+| 64 | no `--bn-confirm-mainnet`: the plan printed, nothing sent | read the plan; add the word |
+| 66 | `486410`: the disclaimer is unsigned; nothing placed | sign it in the app |
+
+**What the battery proves, and what it does not.** Its PASS is the first
+sight of the live shapes the arm reads (the order stream's report, the
+detail's executions, the history rows, a cancel's answer, Ed25519 on
+`/sapi/v1/equity/*`) — risk-policy "BX10", the residuals. It does not arm
+anything: an engine that trades Stocks needs R17's ruling (a member and
+a market-data source) and a build.

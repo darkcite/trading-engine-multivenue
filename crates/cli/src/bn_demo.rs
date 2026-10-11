@@ -203,9 +203,10 @@ pub(crate) fn demo_config(hmac: bool) -> Result<BnConfig, String> {
         )
     })?;
     let h = cfg.hosts();
-    // Every one of the eleven (BX8: spot's WS API too; its REST host is
-    // SAPI's; BX9: eapi's and the options stream host).
-    for host in [&h.fut_wsapi, &h.fut_user, &h.fut_rest, &h.cm_wsapi, &h.cm_user, &h.cm_rest, &h.papi, &h.sapi, &h.spot_wsapi, &h.eapi, &h.opt_user] {
+    // Every one of the twelve (BX8: spot's WS API too; its REST host is
+    // SAPI's; BX9: eapi's and the options stream host; BX10: the equity
+    // stream's, never dialled on Demo — Stocks has none).
+    for host in [&h.fut_wsapi, &h.fut_user, &h.fut_rest, &h.cm_wsapi, &h.cm_user, &h.cm_rest, &h.papi, &h.sapi, &h.spot_wsapi, &h.eapi, &h.opt_user, &h.eq_user] {
         demo_host(host)?;
     }
     Ok(cfg)
@@ -548,6 +549,25 @@ impl Rest {
         scope_host(host, cfg)?;
         let key = [(KEY_HEADER, cfg.opt_api_key().ok_or("no options key (Q-1: the scope's HMAC pair)")?)];
         Self::on(host, cfg, tls, &eapi_specs(&key), 0)
+    }
+
+    /// **BX10 — the Binance Stocks probe's client** (the operator's ruling
+    /// S-1: read-only, on MAINNET — Stocks has no Demo): the equity
+    /// templates on `cfg`'s SAPI host, the reads and the listenKey's alone
+    /// (`rest::EQ_READ_TEMPLATES`) — no order, cancel or disclaimer
+    /// template exists in this client, and on a mainnet host its one POST
+    /// (the listenKey) leaves only as [`Rest::sign_change`] signs it with
+    /// the operator's word.
+    ///
+    /// # Errors
+    /// A host off the configuration's network, or the connection could
+    /// not be prepared.
+    pub(crate) fn equity_read(cfg: &BnConfig, tls: Arc<ClientConfig>) -> Result<Self, String> {
+        let host = cfg.hosts().sapi.as_str();
+        scope_host(host, cfg)?;
+        let key = [(KEY_HEADER, cfg.api_key())];
+        let specs = exec_binance::rest::equity_specs(&key);
+        Self::on(host, cfg, tls, &specs[..exec_binance::rest::EQ_READ_TEMPLATES], 0)
     }
 
     fn on(host: &str, cfg: &BnConfig, tls: Arc<ClientConfig>, specs: &[ReqSpec<'_>], offset_ms: i64) -> Result<Self, String> {
@@ -1381,6 +1401,21 @@ impl Ws {
     /// timeout).
     pub(crate) fn open(host: &str, path: &str, tls: Arc<ClientConfig>, within: Duration) -> Result<Self, String> {
         demo_host(host)?;
+        Self::dial(host, path, tls, within)
+    }
+
+    /// **BX10 — a stream on `cfg`'s own network** (the Binance Stocks
+    /// probe's order stream, on mainnet by the operator's ruling S-1: a
+    /// stream only carries what the venue pushes — nothing is sent on it).
+    ///
+    /// # Errors
+    /// The host is off the configuration's network, or as [`Ws::open`].
+    pub(crate) fn open_on(cfg: &BnConfig, host: &str, path: &str, tls: Arc<ClientConfig>, within: Duration) -> Result<Self, String> {
+        scope_host(host, cfg)?;
+        Self::dial(host, path, tls, within)
+    }
+
+    fn dial(host: &str, path: &str, tls: Arc<ClientConfig>, within: Duration) -> Result<Self, String> {
         let cfg = WsCfg {
             rx_cap: WS_RX,
             tx_cap: WS_TX,
@@ -1648,10 +1683,11 @@ mod tests {
         for h in ["fapi.binance.com", "dapi.binance.com", "api.binance.com", "fstream.binance.com", "ws-api.binance.com", "localhost"] {
             assert!(demo_host(h).is_err(), "{h}");
         }
-        // BX8: every one of the Demo scope's eleven hosts — spot's WS API,
-        // and (BX9) eapi's and the options stream host.
+        // BX8: every one of the Demo scope's twelve hosts — spot's WS API,
+        // (BX9) eapi's and the options stream host, (BX10) the equity
+        // stream's.
         let h = exec_binance::config::Hosts::of(Scope::Demo);
-        for host in [&h.fut_wsapi, &h.fut_user, &h.fut_rest, &h.cm_wsapi, &h.cm_user, &h.cm_rest, &h.papi, &h.sapi, &h.spot_wsapi, &h.eapi, &h.opt_user] {
+        for host in [&h.fut_wsapi, &h.fut_user, &h.fut_rest, &h.cm_wsapi, &h.cm_user, &h.cm_rest, &h.papi, &h.sapi, &h.spot_wsapi, &h.eapi, &h.opt_user, &h.eq_user] {
             assert!(demo_host(host).is_ok(), "{host}");
         }
     }

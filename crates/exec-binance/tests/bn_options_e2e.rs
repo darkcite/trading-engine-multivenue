@@ -166,6 +166,7 @@ fn boot_gateway(venue: &Venue, o: Opts) -> Result<Booted, BootErr> {
         anchor_unsaved: None,
         max_leverage: 20,
         adopt_cap_usd_1e6: o.adopt_cap_usd_1e6,
+        equity: None,
     };
     let mut gw = BnGateway::<FILL_N, JOURNAL_RING>::new(&cfg, venue.client_cfg.clone(), knobs, wire, gw_end, fill_tx, JournalTx::new(j_tx))?;
     gw.boot()?;
@@ -262,6 +263,7 @@ impl Rig {
                 anchor: core_time::WallAnchor::now(),
                 mode: o.mode,
                 demo: false,
+                equity_ttl_ns: 0,
             },
         );
         let mut route = ExecRoute::all_paper();

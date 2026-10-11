@@ -38,11 +38,12 @@ use core_ring::{Consumer, Producer, Ring};
 pub const RERESOLVE_AFTER: u32 = 3;
 /// The distinct hosts one gateway dials: per lane its WS API, its stream
 /// host and its REST host, and SAPI's — a full mainnet arm (USDⓈ-M,
-/// COIN-M, spot and options, BX9) dials nine: `ws-fapi`, `fstream`,
-/// `fapi`, `ws-dapi`, `dstream`, `dapi`, `ws-api`, `api` (spot's REST and
-/// SAPI's) and `eapi` (options' WS pair names it too; their stream is
-/// `fstream`'s). One spare.
-pub const DNS_HOSTS: usize = 10;
+/// COIN-M, spot, options and Binance Stocks, BX10) dials ten: `ws-fapi`,
+/// `fstream`, `fapi`, `ws-dapi`, `dstream`, `dapi`, `ws-api`, `api`
+/// (spot's REST, SAPI's and Stocks', whose WS pair names it too), `eapi`
+/// (options' WS pair names it too; their stream is `fstream`'s) and
+/// `nbstream` (Stocks' order stream). One spare.
+pub const DNS_HOSTS: usize = 11;
 /// The rings' room: every host asked at once, past twice over.
 const DNS_RING: usize = 32;
 // `Resolver::pending` holds a bit per host.

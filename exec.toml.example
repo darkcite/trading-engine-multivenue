@@ -452,8 +452,10 @@ mode = "paper"
 # BX9) x classic alone — makers on USD-M classic only, IoC-only
 # elsewhere. Spot or options beside pm / pm_pro refuse the boot (each
 # waits on a ruling); options beside "coinm" or "spot" refuse it too
-# (proven alone and beside "usdm" only); Binance Stocks ("equity") refuse
-# it, naming BX10. At most ONE live slot may name binance — it owns every
+# (proven alone and beside "usdm" only); Binance Stocks ("equity", BX10)
+# refuse it, naming ruling S-3 (O-BX16, R17): the arm is built, but only
+# the operator's MAINNET battery (`exec-smoke --binance equity
+# --lifecycle`) drives it. At most ONE live slot may name binance — it owns every
 # bound instrument (BX-7). A session bound (halt_on_gain/loss_usd_1e6) is
 # judged on ONE USD equity: a classic arm trading "usdm", "options" or
 # both (BX9: USD-M's margin balance plus the options account's equity,

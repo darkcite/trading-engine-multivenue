@@ -113,8 +113,9 @@ pub const fn maker_ok(product: u8, mode: AccountMode) -> bool {
 /// (BX7, C2: papi, IoC-only — K13) and × PM Pro (BX7, C3: the classic
 /// routes, IoC-only until K14 shows the dead-man there), spot × classic
 /// (BX8: IoC-only — spot has no dead-man) and options × classic (BX9:
-/// IoC-only — the countdown is a market maker's, `-6005`); otherwise the
-/// phase or ruling that brings the product or mode.
+/// IoC-only — the countdown is a market maker's, `-6005`) and Binance
+/// Stocks × classic (BX10: DAY orders under the gateway's TTL); otherwise
+/// the phase or ruling that brings the product or mode.
 pub const fn built(product: u8, mode: AccountMode) -> Result<(), &'static str> {
     match product {
         PRODUCT_USDM | PRODUCT_COINM => match mode {
@@ -132,7 +133,15 @@ pub const fn built(product: u8, mode: AccountMode) -> Result<(), &'static str> {
             // PM Demo exists: not built.
             AccountMode::Pm | AccountMode::PmPro => Err("a ruling (options beside Portfolio Margin or PM Pro)"),
         },
-        PRODUCT_EQUITY => Err("BX10 (Binance Stocks)"),
+        // BX10: Binance Stocks — LIMIT DAY under the gateway's mandatory TTL
+        // (BX-17's exception), REST on SAPI. The gateway speaks it; the
+        // ENGINE still refuses it (ruling S-3, O-BX16: no equity market
+        // data, R17 — `cli::exec_boot`): only the operator's battery arms it.
+        PRODUCT_EQUITY => match mode {
+            AccountMode::Classic => Ok(()),
+            // A broker path outside every margin program: not built.
+            AccountMode::Pm | AccountMode::PmPro => Err("a ruling (Binance Stocks beside Portfolio Margin or PM Pro)"),
+        },
         _ => Err("no phase: an unknown product"),
     }
 }
@@ -451,7 +460,12 @@ mod tests {
         assert!(built(PRODUCT_OPTIONS, AccountMode::Pm).unwrap_err().starts_with("a ruling"));
         assert!(built(PRODUCT_OPTIONS, AccountMode::PmPro).unwrap_err().starts_with("a ruling"));
         assert!(!maker_ok(PRODUCT_OPTIONS, AccountMode::Classic), "BX-17: options have no dead-man of ours (-6005)");
-        assert!(built(PRODUCT_EQUITY, AccountMode::Classic).unwrap_err().starts_with("BX10"));
+        // BX10: the gateway speaks Binance Stocks on a classic account (the
+        // engine refuses it apart: S-3).
+        assert_eq!(built(PRODUCT_EQUITY, AccountMode::Classic), Ok(()), "BX10: Binance Stocks classic");
+        assert!(built(PRODUCT_EQUITY, AccountMode::Pm).unwrap_err().starts_with("a ruling"));
+        assert!(built(PRODUCT_EQUITY, AccountMode::PmPro).unwrap_err().starts_with("a ruling"));
+        assert!(!maker_ok(PRODUCT_EQUITY, AccountMode::Classic), "BX-17: Stocks has no dead-man (DAY under the TTL)");
         // O-BX3a: no maker rests on COIN-M (no dead-man of ours there yet).
         assert!(maker_ok(PRODUCT_USDM, AccountMode::Classic));
         assert!(!maker_ok(PRODUCT_COINM, AccountMode::Classic));

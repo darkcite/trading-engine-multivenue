@@ -58,13 +58,15 @@ use tracing_subscriber::EnvFilter;
 /// and was ignored (`--bn-um-symbol ETHUSDT` beside a flatten closed every
 /// position). Each tool names all of these as conflicts instead; a test
 /// keeps the list whole for the flags to come.
-const BN_TOOL_CONFLICTS: [&str; 46] = [
+const BN_TOOL_CONFLICTS: [&str; 53] = [
     "asset", "offline", "lifecycle", "px", "px2", "sz", "sell", "hl_perp", "coins", "cycles",
     "fill_pairs", "usd", "rest_bps", "cross_bps", "ttl_ms", "sweep_every", "stall", "sweep_first",
     "dry_run", "fill", "fill_px", "fill_sz", "fill_slot", "fill_cloid", "fill_repeat", "sweep",
     "requote", "recon", "recon_secs", "watch", "binance_probe", "binance", "bn_rest", "bn_hmac",
     "bn_um_symbol", "bn_cm_symbol", "bn_cycles", "bn_fill_pairs", "bn_usd", "bn_rest_bps",
     "bn_cross_bps", "bn_ttl_ms", "bn_rotate_s", "bn_drill", "bn_spot_symbol", "bn_adopt_usd",
+    "bn_stream_confirm", "bn_eq_symbol", "bn_eq_session", "bn_eq_tokenize", "bn_eq_quote", "bn_eq_ttl_ms",
+    "bn_confirm_mainnet",
 ];
 
 const STRATEGY_SET_NAMES: &[&str] = &[
@@ -689,13 +691,19 @@ struct ExecSmokeArgs {
     /// an Ed25519-signed read, the listenKey and the `/private` stream, one
     /// IoC BUY under the book and one IoC SELL over it with the arm's own
     /// 32-character id (neither can fill), the countdown (`-6005`), and the
-    /// reconciliation's read shapes (0, 58 or 59).
+    /// reconciliation's read shapes (0, 58 or 59). BX10 (the operator's
+    /// ruling S-1): `--binance-probe equity` READS the live Binance Stocks
+    /// account on MAINNET with the engine's own key — Stocks has no Demo —
+    /// and places nothing: its client holds no order, cancel or disclaimer
+    /// template; the account's rows are reported by their shapes, never
+    /// their values; with `--bn-stream-confirm` also the listenKey and a
+    /// minute of the order stream (0, or 59).
     #[arg(
         long,
-        value_name = "futures|spot|options",
+        value_name = "futures|spot|options|equity",
         num_args = 0..=1,
         default_missing_value = "futures",
-        value_parser = ["futures", "spot", "options"],
+        value_parser = ["futures", "spot", "options", "equity"],
         conflicts_with_all = ["offline", "lifecycle", "fill", "sweep", "requote", "recon", "watch", "dry_run"]
     )]
     binance_probe: Option<String>,
@@ -713,10 +721,15 @@ struct ExecSmokeArgs {
     /// sweep last; the end reads the account flat. Demo only. Exit codes
     /// 50–58; 66: the permission check refused the boot (a spot row's group
     /// the account lacks — the bStock check's verdict; nothing placed); 0
-    /// only when the plan's bar is met.
+    /// only when the plan's bar is met. BX10: `equity`, alone — the Binance
+    /// Stocks battery (`cli::bn_equity_battery`, ruling S-3), on MAINNET
+    /// (Stocks has no Demo: REAL MONEY), the operator's to run: the D5 keys
+    /// (`--bn-eq-session`, `--bn-eq-tokenize`, `--bn-eq-quote`) and
+    /// `--bn-confirm-mainnet`, without which it reads, prints its plan and
+    /// sends nothing (exit 64).
     #[arg(
         long,
-        value_name = "um,cm,spot",
+        value_name = "um,cm,spot|equity",
         requires = "lifecycle",
         conflicts_with_all = ["hl_perp", "binance_probe", "offline", "fill", "sweep", "requote", "recon", "watch", "dry_run"]
     )]
@@ -839,6 +852,44 @@ struct ExecSmokeArgs {
     /// and sends nothing (exit 64).
     #[arg(long, default_value_t = false, requires = "binance_tool")]
     confirm: bool,
+
+    /// BX10 (ruling S-3): `--binance equity`'s ticker — Binance Stocks on
+    /// MAINNET (real money: no Demo exists).
+    #[arg(long, default_value = "AAPL", requires = "binance")]
+    bn_eq_symbol: String,
+
+    /// BX10: `tradingSession` (D5 — required with `--binance equity`, no
+    /// default): RTH, EXTENDED or 24H.
+    #[arg(long, value_parser = ["RTH", "EXTENDED", "24H"], requires = "binance")]
+    bn_eq_session: Option<String>,
+
+    /// BX10: `tokenize` (D5 — required, no default): 1 settles the fill as
+    /// the tokenized bStock, 0 as the equity in the broker's custody.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=1), requires = "binance")]
+    bn_eq_tokenize: Option<u8>,
+
+    /// BX10: `quoteAsset` (D5 — required, no default), e.g. USDC.
+    #[arg(long, requires = "binance")]
+    bn_eq_quote: Option<String>,
+
+    /// BX10: the arm's TTL on every equity order, ms (5000..=300000): the
+    /// gateway cancels a DAY order still resting at it (BX-17's one
+    /// exception).
+    #[arg(long, default_value_t = 60_000, requires = "binance")]
+    bn_eq_ttl_ms: u64,
+
+    /// BX10: the operator's word for the Binance Stocks battery's orders on
+    /// MAINNET — real money. Without it `--binance equity` reads, prints
+    /// its plan and sends nothing (exit 64).
+    #[arg(long = "bn-confirm-mainnet", default_value_t = false, requires = "binance")]
+    bn_confirm_mainnet: bool,
+
+    /// BX10 (the operator's ruling S-1): the operator's word for the
+    /// Binance Stocks probe's one POST on MAINNET — the listenKey, which
+    /// changes nothing tradable — and a minute of the order stream. Without
+    /// it `--binance-probe equity` reads alone.
+    #[arg(long = "bn-stream-confirm", default_value_t = false, requires = "binance_probe")]
+    bn_stream_confirm: bool,
 
     /// BX11: a symbol (repeatable): the setup's to set, the flatten's one
     /// to close.
@@ -1873,8 +1924,29 @@ fn evm_testnet(args: EvmTestnetArgs) -> ExitCode {
     }
 }
 
-/// BX7b: the Binance Demo battery (`exec-smoke --binance … --lifecycle`).
+/// BX7b: the Binance Demo battery (`exec-smoke --binance … --lifecycle`);
+/// BX10: `--binance equity`, the Binance Stocks battery on MAINNET.
 fn exec_binance_battery(products: &str, args: &ExecSmokeArgs) -> ExitCode {
+    if products.trim() == "equity" {
+        let spec = cli::bn_equity_battery::EquitySpec {
+            symbol: args.bn_eq_symbol.to_ascii_uppercase(),
+            session: args.bn_eq_session.clone().unwrap_or_default(),
+            tokenize: args.bn_eq_tokenize,
+            quote: args.bn_eq_quote.clone().unwrap_or_default(),
+            ttl_ms: args.bn_eq_ttl_ms,
+            usd: args.bn_usd,
+            rest_bps: args.bn_rest_bps,
+            cross_bps: args.bn_cross_bps,
+            confirm: args.bn_confirm_mainnet,
+        };
+        info!(?spec, "exec-smoke: BX10 — the Binance Stocks battery (MAINNET)");
+        // SIGINT/SIGTERM end it through its end — the sweep and the read.
+        if let Err(e) = cli::sigint::install_sigint_handler() {
+            error!("exec-smoke --binance equity: the signal handler: {e}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::from(cli::bn_equity_battery::run(&spec, TlsTransport::default_client_config()));
+    }
     let (um, cm, spot, options) = match cli::bn_battery::parse_products(products) {
         Ok(p) => p,
         Err(e) => {
@@ -1978,6 +2050,7 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
         let code = match which {
             "spot" => cli::bn_probe::run_spot(tls),
             "options" => cli::bn_probe::run_options(tls),
+            "equity" => cli::bn_probe::run_equity(tls, args.bn_stream_confirm),
             _ => cli::bn_probe::run(tls),
         };
         return ExitCode::from(code);
@@ -6658,6 +6731,10 @@ mod exec_smoke_args {
         assert_eq!(smoke(&["--binance-probe"]).unwrap().binance_probe.as_deref(), Some("futures"));
         assert_eq!(smoke(&["--binance-probe", "spot"]).unwrap().binance_probe.as_deref(), Some("spot"));
         assert_eq!(smoke(&["--binance-probe", "options"]).unwrap().binance_probe.as_deref(), Some("options"));
+        assert_eq!(smoke(&["--binance-probe", "equity"]).unwrap().binance_probe.as_deref(), Some("equity"), "BX10 (S-1)");
+        assert!(smoke(&["--binance-probe", "equity", "--bn-stream-confirm"]).unwrap().bn_stream_confirm);
+        assert!(smoke(&["--bn-stream-confirm"]).is_err(), "the probe's word, with the probe only");
+        assert!(smoke(&["--binance-probe", "equity", "--confirm"]).is_err(), "the account tools' word is theirs");
         assert_eq!(smoke(&["--binance-probe=futures"]).unwrap().binance_probe.as_deref(), Some("futures"));
         assert_eq!(smoke(&["--offline"]).unwrap().binance_probe, None);
         assert!(smoke(&["--binance-probe", "coinm"]).is_err(), "an unknown probe word");
@@ -6673,5 +6750,30 @@ mod exec_smoke_args {
         assert_eq!(cli::bn_battery::parse_products("options"), Ok((false, false, false, true)), "BX9: the options battery");
         let a = smoke(&["--binance", "options", "--lifecycle"]).unwrap();
         assert_eq!(a.binance.as_deref(), Some("options"));
+    }
+
+    /// BX10 (S-3): the Binance Stocks battery's flags parse with
+    /// `--binance` only; the D5 keys have no default; the session and
+    /// tokenize take their words alone; equity runs alone.
+    #[test]
+    fn the_equity_batterys_flags_parse_where_they_belong() {
+        let a = smoke(&[
+            "--binance", "equity", "--lifecycle", "--bn-eq-session", "RTH", "--bn-eq-tokenize", "0", "--bn-eq-quote", "USDC", "--bn-usd", "6",
+            "--bn-confirm-mainnet",
+        ])
+        .unwrap();
+        assert_eq!(
+            (a.binance.as_deref(), a.bn_eq_symbol.as_str(), a.bn_eq_session.as_deref(), a.bn_eq_tokenize, a.bn_eq_quote.as_deref(), a.bn_eq_ttl_ms),
+            (Some("equity"), "AAPL", Some("RTH"), Some(0), Some("USDC"), 60_000)
+        );
+        assert!(a.bn_confirm_mainnet);
+        let a = smoke(&["--binance", "equity", "--lifecycle"]).unwrap();
+        assert_eq!((a.bn_eq_session, a.bn_eq_tokenize, a.bn_eq_quote, a.bn_confirm_mainnet), (None, None, None, false), "no D5 default; no word");
+        assert!(smoke(&["--binance", "equity", "--lifecycle", "--bn-eq-tokenize", "2"]).is_err());
+        assert!(smoke(&["--binance", "equity", "--lifecycle", "--bn-eq-session", "rth"]).is_err());
+        for orphan in [&["--bn-confirm-mainnet"][..], &["--bn-eq-session", "RTH"][..], &["--bn-eq-quote", "USDC"][..]] {
+            assert!(smoke(orphan).is_err(), "{orphan:?} parsed without --binance");
+        }
+        assert!(cli::bn_battery::parse_products("um,equity").is_err(), "equity runs alone");
     }
 }

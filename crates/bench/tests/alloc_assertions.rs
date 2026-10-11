@@ -13290,6 +13290,20 @@ const BX6_FAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","pair":"BTCUSDT","co
 /// report), every put SELL popped reduce-only, the one `-6057`. A
 /// break-and-watch (an 8-byte `Vec` before the arm's writing law) failed
 /// it at 1 000: every options attempt.
+///
+/// BX10: two Binance Stocks rows beside them (the scripted venue's AAPL,
+/// `BUY_SELL`, and SPY, SELL-only — the arm's table; both `LAW_SPOT` rows
+/// of the ledger). Every fourth turn an equity order in turn: an AAPL BUY
+/// — on equity's own pool, whose minute takes 200, each popped under the
+/// arm's TTL (an equity order rests, DAY), acknowledged and cancelled by
+/// its member (equity's cancel passes the arm despite `NO_DEADMAN`); every
+/// seventh refused by the venue `486405` (a six-digit code: the reject
+/// streak's, `is_venue_code`) — and a SPY BUY, refused `NotLive` (the
+/// venue takes no BUY there) before the pool. Pinned: 0 B; 200 equity
+/// orders accepted, every one popped with its deadline and cancelled, the
+/// rest refused (the pool's `Orders`, SPY's `NotLive`, both counted in the
+/// report). A break-and-watch (an 8-byte `Vec` before the arm's equity
+/// law) failed it at 1 000: every equity attempt.
 #[test]
 fn binance_arm_steady_state() {
     use clob_dispatcher::{
@@ -13308,9 +13322,10 @@ fn binance_arm_steady_state() {
     };
     use exec_gateway::stats::SWEEP_CLEAR;
     use exec_gateway::EvtTx;
-    use exec_binance::inst::{BindSpec, InstTable, OptBindSpec, PRODUCT_OPTIONS, PRODUCT_SPOT, PRODUCT_USDM};
+    use exec_binance::equity::scan_eq_symbol;
+    use exec_binance::inst::{BindSpec, EqBindSpec, InstTable, OptBindSpec, PRODUCT_EQUITY, PRODUCT_OPTIONS, PRODUCT_SPOT, PRODUCT_USDM};
     use exec_binance::margin::{MarginBook, SLOTS};
-    use exec_binance::testvenue::{OPT_CALL, OPT_PUT};
+    use exec_binance::testvenue::{EQ_INFO, OPT_CALL, OPT_PUT};
     use exec_router::{
         ExecMode, ExecRoute, HaltLimits, InstrumentSpec, NullLiveDispatcher, RoutedDispatcher,
         SlotCaps, SlotSplit, VenueSplit, INST_CALL, INST_WRITABLE, LAW_LINEAR, LAW_OPTION, LAW_SPOT,
@@ -13359,11 +13374,18 @@ fn binance_arm_steady_state() {
         opt_rows[k] = t.bind_option(&mut w, &OptBindSpec { sym, row: &row, owned: true, writable: k == 0 }).expect("gate 92 option bind");
     }
     let (call_row, put_row) = (opt_rows[0], opt_rows[1]);
+    // BX10: AAPL (both sides) and SPY (SELL-only), Binance Stocks.
+    let (aapl, spy) = (core_types::make_symbol_id(VenueId::Binance, 4_097), core_types::make_symbol_id(VenueId::Binance, 4_098));
+    let mut eq_rows = [0u16; 2];
+    for (k, (sym, name)) in [(aapl, &b"AAPL"[..]), (spy, &b"SPY"[..])].into_iter().enumerate() {
+        let row = scan_eq_symbol(EQ_INFO, name).expect("gate 92 equity rules");
+        eq_rows[k] = t.bind_equity(&mut w, &EqBindSpec { sym, row: &row, owned: true, bstock: b"" }).expect("gate 92 equity bind");
+    }
     let (eng, mut gw) = duplex();
     let mut lim = [0i64; SLOTS];
     lim[SLOT as usize] = 600_000;
     let mut prod = [0u8; SLOTS];
-    prod[SLOT as usize] = (1 << PRODUCT_USDM) | (1 << PRODUCT_SPOT) | (1 << PRODUCT_OPTIONS);
+    prod[SLOT as usize] = (1 << PRODUCT_USDM) | (1 << PRODUCT_SPOT) | (1 << PRODUCT_OPTIONS) | (1 << PRODUCT_EQUITY);
     let arm = BnArm::new(
         eng,
         t,
@@ -13377,6 +13399,7 @@ fn binance_arm_steady_state() {
             anchor: core_time::WallAnchor::now(),
             mode: exec_binance::mode::AccountMode::Classic,
             demo: false,
+            equity_ttl_ns: 30_000_000_000,
         },
     );
     let bn = VenueId::Binance.to_u8();
@@ -13404,6 +13427,9 @@ fn binance_arm_steady_state() {
     // Both options writable in the ledger: the arm's law is the guard here.
     d.bind_instrument(&InstrumentSpec::new(call, LAW_OPTION, INST_WRITABLE | INST_CALL, 1_000_000, 85_000_000_000)).expect("gate 92 call row");
     d.bind_instrument(&InstrumentSpec::new(put, LAW_OPTION, INST_WRITABLE, 1_000_000, 90_000_000_000)).expect("gate 92 put row");
+    for sym in [aapl, spy] {
+        d.bind_instrument(&InstrumentSpec::new(sym, LAW_SPOT, 0, 0, 0)).expect("gate 92 equity ledger row");
+    }
     let summary = |now: u64, sym: SymbolId, mark_1e6: i64| {
         OptSummary::new(now, VenueId::Binance, sym, OPT_SUMMARY_FLAG_MARK_PX, mark_1e6 * 1_000, 0, 65_000_000_000_000, 0, 0, 0, 0, 0)
     };
@@ -13456,6 +13482,8 @@ fn binance_arm_steady_state() {
     let (mut ok, mut refused, mut polls) = (0u64, 0u64, 0u64);
     let (mut spot_ok, mut spot_refused, mut spot_makers) = (0u64, 0u64, 0u64);
     let (mut opt_ok, mut opt_refused, mut put_sells, mut reduce_only, mut unwritten) = (0u64, 0u64, 0u64, 0u64, false);
+    let (mut eq_ok, mut eq_refused, mut eq_popped, mut eq_ttl, mut eq_cancels, mut eq_rejected) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut eq_six = 0u64;
     d.on_opt_summary(&summary(core_time::now_ns(), call, CALL_MARK));
     d.on_opt_summary(&summary(core_time::now_ns(), put, PUT_MARK));
     let mut i = 0u64;
@@ -13485,6 +13513,23 @@ fn binance_arm_steady_state() {
                 opt_ok += 1;
             } else {
                 opt_refused += 1;
+            }
+        }
+        // BX10: an equity order every fourth turn, in turn — an AAPL BUY, a
+        // SPY BUY (SELL-only there).
+        if i % 4 == 2 {
+            let (sym, px) = if (i / 4) % 2 == 0 { (aapl, 336_100_000) } else { (spy, 650_000_000) };
+            let mut o = Order::new(now, VenueId::Binance, sym, Side::Bid, ORDER_KIND_IOC, Price::from_raw(px), Qty::from_raw(30_000), 40_000 + i);
+            o.strategy_id = SLOT;
+            if d.submit(&o).is_ok() {
+                eq_ok += 1;
+                // It rests (DAY): the member cancels it — equity's cancel
+                // passes the arm despite its row's NO_DEADMAN.
+                if d.cancel(&CancelReq::of(&o, now)).is_ok() {
+                    eq_cancels += 1;
+                }
+            } else {
+                eq_refused += 1;
             }
         }
         // The gateway's cold reports, one kind in turn.
@@ -13566,7 +13611,25 @@ fn binance_arm_steady_state() {
                 put_sells += 1;
                 reduce_only += u64::from(c.flags & ORDER_FLAG_REDUCE_ONLY != 0);
             }
+            if c.verb == VERB_PLACE && (c.row == eq_rows[0] || c.row == eq_rows[1]) {
+                eq_popped += 1;
+                eq_ttl += u64::from(c.ttl_deadline_ns > c.pushed_ns && c.pushed_ns != 0);
+            }
+            let equity = c.row == eq_rows[0] || c.row == eq_rows[1];
             let e = match c.verb {
+                // BX10: an equity order rests (DAY): acknowledged, its
+                // member's cancel retires it; every seventh refused by the
+                // venue with a positive six-digit code (the streak's).
+                VERB_PLACE if equity && eq_popped % 7 == 3 => {
+                    eq_rejected = c.client_oid;
+                    eq_six += 1;
+                    let mut x = BnEvt::order(EVT_REJECT, now, c.client_oid, c.row, c.slot);
+                    x.code = 486_405;
+                    x
+                }
+                VERB_PLACE if equity => BnEvt::order(EVT_ACK, now, c.client_oid, c.row, c.slot),
+                // The refused order's cancel finds nothing to end.
+                VERB_CANCEL if equity && c.client_oid == eq_rejected => BnEvt::new(0, now),
                 // BX9: the first call SELL — not eligible to write (`-6057`).
                 VERB_PLACE if c.row == call_row && c.side == Side::Ask as u8 && !unwritten => {
                     unwritten = true;
@@ -13684,9 +13747,23 @@ fn binance_arm_steady_state() {
         bn_report.refused
     );
     assert!(put_sells > 0 && reduce_only == put_sells, "gate 92: every put SELL left reduce-only ({reduce_only} of {put_sells})");
+    assert_eq!(
+        (eq_ok, eq_popped, eq_ttl, eq_cancels),
+        (200, 200, 200, 200),
+        "gate 92: equity's own pool took its minute's 200 orders ({eq_refused} refused), each popped under the arm's TTL and cancelled"
+    );
+    // The alloc review's round-2 I2: the six-digit refusal's branch ran —
+    // every seventh equity order from the third — and the arm counted each
+    // as a venue reject.
+    assert_eq!(eq_six, 29, "gate 92: the venue's six-digit refusals");
+    assert!(
+        bn_report.refused[Refusal::NotLive as usize] > 0 && eq_refused + eq_ok == N / 4,
+        "gate 92: SPY's BUYs refused NotLive ({:?})",
+        bn_report.refused
+    );
     assert!(polls > 100, "the idle hook drained events: {polls}");
     let c = d.exec_counters();
-    assert!(c.arm_bn.submitted > 100 && c.arm_bn.rejected > 0, "{:?}", c.arm_bn);
+    assert!(c.arm_bn.submitted > 100 && c.arm_bn.rejected >= eq_six, "{:?}", c.arm_bn);
     assert!(d.ledger().counters().marks_expired > expired_before, "the stale mark was swept");
     assert_eq!((swept, state), (1, CancelAllState::Clear), "the lock halted the slot and the sweep cleared it");
     assert_eq!(allocs, 0, "gate 92: the Binance arm allocated {allocs} times ({bytes} B)");
@@ -14019,6 +14096,11 @@ fn gate94_venue_helper() {
         // re-read would land in a window at its own time).
         v.with(|s| s.opt_account_events = false);
     }
+    if std::env::var_os("GATE94_EQ").is_some_and(|x| x == "1") {
+        // BX10, gate 112: every equity place at or over 300 USD fills
+        // whole at its limit; one under it rests.
+        v.with(|s| s.eq_fill_from_1e6 = Some(300_000_000));
+    }
     if std::env::var_os("GATE94_SPOT").is_some_and(|x| x == "1") {
         v.with(|s| {
             s.spot_bal_1e8.insert(String::from("BNB"), 100_000_000);
@@ -14286,6 +14368,7 @@ fn gate94(rest: bool) {
         anchor_unsaved: None,
         max_leverage: 20,
         adopt_cap_usd_1e6: 0,
+        equity: None,
     };
     let mut gw = Gw::new(&cfg, tls, knobs, wire, gw_end, fill_tx, JournalTx::new(j_tx)).expect("gate 94 gateway");
     gw.boot().expect("gate 94 boot");
@@ -17893,6 +17976,7 @@ fn binance_spot_lane_round_trip_allocates_only_rustls_record_buffers() {
         anchor_unsaved: None,
         max_leverage: 20,
         adopt_cap_usd_1e6: 0,
+        equity: None,
     };
     let mut gw = Gw::new(&cfg, tls, knobs, wire, gw_end, fill_tx, JournalTx::new(j_tx)).expect("gate 108 gateway");
     gw.boot().expect("gate 108 boot");
@@ -18666,6 +18750,7 @@ fn binance_options_lane_round_trip_allocates_only_rustls_record_buffers() {
         anchor_unsaved: None,
         max_leverage: 20,
         adopt_cap_usd_1e6: 0,
+        equity: None,
     };
     let mut gw = Gw::new(&cfg, tls, knobs, wire, gw_end, fill_tx, JournalTx::new(j_tx)).expect("gate 110 gateway");
     gw.boot().expect("gate 110 boot");
@@ -19037,4 +19122,669 @@ fn binance_options_lane_render_and_scan_steady_state() {
     assert_eq!(stale, 2 * ((N + 31) / 64), "gate 111: every probe on the stale row refused Unpriced");
     std::hint::black_box((&table, &ledger));
     assert_eq!(allocs, 0, "gate 111: options' render and scans allocated {allocs} times ({bytes} B)");
+}
+
+/// Gate 112's round: a BUY and the SELL of it over the equity lane — each
+/// one `POST /sapi/v1/equity/order/place` sealed on the route and its
+/// answer opened; the stream's two reports (`accepted`, `filled`), each its
+/// own record (the venue writes a frame a write); and the order's detail
+/// (`GET …/order/detail` by its UUID on the jobs connection) sealed and
+/// its answer opened.
+const G112_ROUND: u64 = 12;
+/// Gate 112's sweep (the halt's): the resting order's cancel by its UUID
+/// and its answer on the route, the stream's `canceled`, the order's detail
+/// and its answer; then the confirmation — the reconciliation cycle: the
+/// session's executions (one page of `trade/history`, nine executions) and
+/// `open-orders`, each on the jobs connection. Each request sealed, each
+/// answer and frame opened.
+const G112_RECON: u64 = 9;
+/// Gate 112's TTL round: a resting DAY order the gateway's TTL cancels —
+/// the place and its answer, the stream's `accepted`, the cancel by the
+/// UUID and its answer, the stream's `canceled`, the order's detail and
+/// its answer: each request sealed, each answer and frame opened.
+const G112_TTL: u64 = 8;
+
+/// What the engine end saw (gate 112).
+#[derive(Clone, Copy, Default)]
+struct Seen112 {
+    acks: u64,
+    filled: u64,
+    retired_other: u64,
+    rejects: u64,
+    locks: u64,
+    scan_fails: u64,
+    positions: u64,
+    fills: u64,
+    bought: i64,
+    sold: i64,
+    j_fill: u64,
+    j_ack: u64,
+    j_accepted: u64,
+    j_fee: u64,
+    /// `J_FEE`s on an equity row in its settle asset (USD), a charge at
+    /// the $0.35 floor, flagged [`exec_binance::journal::FEE_FLAG_EQ_FLOOR`].
+    j_fee_floor: u64,
+    pulses: u64,
+    sweeps_done: u64,
+    recons: u64,
+    reconciled: u64,
+    /// Orders retired by the gateway's TTL, and by a member's cancel.
+    ttl: u64,
+    member: u64,
+}
+
+/// **BX10 gate 112 — the equity lane's whole step, over a real rustls
+/// loopback, allocates only rustls' record buffers** (gate 110's harness,
+/// Binance Stocks' lane).
+///
+/// The REAL gateway (`BnGateway::step`, booted as the engine boots it)
+/// EQUITY-ONLY — AAPL of the scripted venue's `exchangeInfo`
+/// (`exec_binance::testvenue::EQ_INFO`) bound and owned, the D5 keys `RTH`,
+/// no tokenize, USDC — against the venue in gate 94's CHILD process
+/// (`GATE94_EQ=1`: a place at or above 300 USD fills whole at its limit as
+/// it is placed; one under it rests).
+/// The arm key Ed25519; every SAPI request signed in place. Every round: a
+/// BUY of 0.03 AAPL at 336.10 (LIMIT DAY under the gateway's TTL), then —
+/// once it ended — the SELL of it: the booked position long, then flat (an
+/// `EVT_POSITION` each way). Each order is ONE `POST …/order/place` on the
+/// lane's REST route and its answer (`J_ACK`); the stream's `accepted` and
+/// `filled` reports, each its own record — the report the TRIGGER: the
+/// order's detail read once by its UUID on the jobs connection (whichever
+/// came first, the report or the answer: one read) — its execution booked
+/// once (lane 4, `J_FILL`), the broker's `ACCEPTED` journaled once
+/// (`J_ACCEPTED`), its fee — the $0.35 floor on $10.08 — journaled once,
+/// flagged (`J_FEE`), the order retired FILLED. Pinned like gates 94b, 108
+/// and 110: rustls 0.23's buffered API allocates one `Vec` per record it
+/// seals and one per application-data record it opens — [`G112_ROUND`] a
+/// round. Then **TTL rounds** (the alloc review: Stocks has no IoC — a DAY
+/// limit that does not cross ends only so): a BUY under the venue's
+/// filling price rests, its 20 ms TTL falls due, the gateway cancels it by
+/// its UUID, the venue's `S` arms the cancel's re-check, the stream's
+/// `canceled` asks the detail, the order retired `CANCELED_TTL` (its
+/// re-check disarmed): [`G112_TTL`] a round. Measured alone, BEFORE the
+/// rounds, **the halt's sweep** with one order of ours resting: cancelled
+/// by its UUID (`CANCELED_MEMBER`), then the confirmation — a
+/// reconciliation cycle over the session's executions (four rounds and one
+/// more BUY: nine, one page) and the open orders: [`G112_RECON`]; the
+/// sweep reported done, the cycle reconciled — AAPL held long
+/// through it, every execution since the boot's first cycle matching what
+/// the arm booked — then the held lot sold. Before the
+/// rounds because the cycle reads EVERY execution since the boot: a page
+/// over rustls' 4 KiB read buffer (a full one is 23 KiB) grows it in steps
+/// that depend on how the bytes arrive, then shrinks it — rustls'
+/// allocations, not pinnable to an exact count (a full page's scan is
+/// gate 113's, at 0 B).
+///
+/// NOT pinned here (each allocation-free by inspection, built of what the
+/// gates pin): the boot (the clock, the key's permissions and the account
+/// mode on SAPI, the listenKey, the day a ticker at a time, the first
+/// cycle and its stray judgement); the listenKey's keep-alive (periodic,
+/// the generic job render); the in-doubt detail by our id (rendered,
+/// signed and its answer scanned in gate 113; on a socket only after a
+/// lost answer); the account's `cancel-all` (a sweep's second round on a
+/// dedicated account); the gateway's refusals — a place answered `F`, a
+/// coded non-200, an unreadable one, `486218` — and a cancel answered
+/// `F`, unreadably or naming another UUID; a cancel's re-check firing on
+/// an order still working; the `CANCELED_VENUE`, `EXPIRED` and `REJECTED`
+/// ends; a stray or foreign row in a listing; the over-fill, page and
+/// total guards; an early report's kept `ACCEPTED` (taken only when the
+/// stream beats the place's answer); bursts over the 4 KiB window. A break-and-watch (an 8-byte
+/// `Vec` in the gateway's detail reading and one in its page reading)
+/// failed the rounds at 4 200 and the cycle at 5.
+#[test]
+fn binance_equity_lane_round_trip_allocates_only_rustls_record_buffers() {
+    use clob_dispatcher::{RETIRED_CANCELED_MEMBER, RETIRED_CANCELED_TTL, RETIRED_FILLED};
+    use core_config::SecretKeyBytes;
+    use core_fill::ORDER_KIND_IOC;
+    use core_ring::{Consumer, Ring};
+    use core_types::{ExecRecord, Fill, Side};
+    use exec_binance::arm::{
+        GW_FILLS_BOOKED, GW_FILLS_DEFERRED, GW_FILLS_FOREIGN, GW_FILLS_LOST, GW_FILLS_UNOWNED, GW_FILLS_UNRESOLVED, GW_IN_DOUBT_RAISED,
+        GW_JOBS_DROPPED, GW_JOURNAL_DROPPED, GW_RECON_DRIFT_LEGS, GW_RECON_FAILED, GW_RECON_OK, GW_RECON_UNSEEN_LEGS, GW_TALLIES,
+    };
+    use exec_binance::cmd::{
+        duplex, BnCmd, BnEngineEnd, EVT_ACK, EVT_F_RECONCILED, EVT_F_SWEEP_DONE, EVT_LOCK, EVT_POSITION, EVT_RECON, EVT_REJECT, EVT_RETIRED,
+        EVT_SCAN_FAIL, EVT_STATUS, EVT_SWEEP,
+    };
+    use exec_binance::config::{BnConfig, Scope};
+    use exec_binance::equity::{scan_eq_symbol, EqKnobs, EqSession};
+    use exec_binance::gateway::{BnGateway, GwKnobs, Phase};
+    use exec_binance::inst::{EqBindSpec, InstTable, PRODUCT_EQUITY};
+    use exec_binance::journal::{
+        fee_fields, JournalTx, EQ_FEE_MIN_USD_1E6, FEE_ASSET_SETTLE, FEE_FLAG_EQ_FLOOR, JOURNAL_RING, J_ACCEPTED, J_ACK, J_FEE, J_FILL,
+    };
+    use exec_binance::mode::AccountMode;
+    use exec_binance::testvenue::{EPOCH, EQ_INFO, KEY, SEED, SLOT};
+    use exec_gateway::stats::SWEEP_CLEAR;
+    use std::time::{Duration, Instant};
+
+    const FILL_N: usize = 1_024;
+    const ROUNDS: u64 = 300;
+    const WARM: u64 = 50;
+    /// The rounds before the cycle: with the held BUY, nine executions —
+    /// one page under rustls' 4 KiB read buffer.
+    const RECON_WARM: u64 = 4;
+    const LONG_MS: u64 = 3_600_000;
+    const PX: i64 = 336_100_000;
+    /// Under the scripted venue's filling price (300 USD): it rests.
+    const REST_PX: i64 = 200_000_000;
+    const TTL_ROUNDS: u64 = 50;
+    const QTY: i64 = 30_000;
+    const CLOCK_CLEAR: Duration = Duration::from_secs(50);
+
+    type Gw = BnGateway<FILL_N>;
+
+    fn pump(gw: &mut Gw, eng: &mut BnEngineEnd, lane: &mut Consumer<Fill, FILL_N>, journal: &mut Consumer<ExecRecord, JOURNAL_RING>, s: &mut Seen112) {
+        gw.step();
+        while let Some(g) = eng.evt.pop() {
+            let (kind, why, flags) = (g.kind, g.why, g.flags);
+            drop(g);
+            match kind {
+                EVT_ACK => s.acks += 1,
+                EVT_RETIRED if why == RETIRED_FILLED => s.filled += 1,
+                EVT_RETIRED if why == RETIRED_CANCELED_TTL => s.ttl += 1,
+                EVT_RETIRED if why == RETIRED_CANCELED_MEMBER => s.member += 1,
+                EVT_RETIRED => s.retired_other += 1,
+                EVT_REJECT => s.rejects += 1,
+                EVT_LOCK => s.locks += 1,
+                EVT_SCAN_FAIL => s.scan_fails += 1,
+                EVT_POSITION => s.positions += 1,
+                EVT_STATUS => s.pulses += 1,
+                EVT_SWEEP => s.sweeps_done += u64::from(flags & EVT_F_SWEEP_DONE != 0),
+                EVT_RECON => {
+                    s.recons += 1;
+                    s.reconciled += u64::from(flags & EVT_F_RECONCILED != 0);
+                }
+                _ => {}
+            }
+        }
+        while let Some(g) = lane.try_pop_ref() {
+            if matches!(g.side, Side::Bid) {
+                s.bought += g.qty.0;
+            } else {
+                s.sold += g.qty.0;
+            }
+            drop(g);
+            s.fills += 1;
+        }
+        while let Some(g) = journal.try_pop_ref() {
+            s.j_fill += u64::from(g.kind == J_FILL);
+            s.j_ack += u64::from(g.kind == J_ACK);
+            s.j_accepted += u64::from(g.kind == J_ACCEPTED);
+            if g.kind == J_FEE {
+                let (_, asset, _, product, _, _) = fee_fields(g.code);
+                s.j_fee += 1;
+                s.j_fee_floor += u64::from(
+                    asset == FEE_ASSET_SETTLE && product == PRODUCT_EQUITY && g.code & FEE_FLAG_EQ_FLOOR != 0 && g.c == EQ_FEE_MIN_USD_1E6 * 1_000,
+                );
+            }
+            drop(g);
+        }
+    }
+
+    fn tallies(gw: &mut Gw, eng: &mut BnEngineEnd, lane: &mut Consumer<Fill, FILL_N>, journal: &mut Consumer<ExecRecord, JOURNAL_RING>, s: &mut Seen112) -> [u64; GW_TALLIES] {
+        let (p0, t) = (s.pulses, Instant::now());
+        while s.pulses == p0 {
+            assert!(t.elapsed() < Duration::from_secs(2), "gate 112: no pulse");
+            pump(gw, eng, lane, journal, s);
+        }
+        let mut w = [0u64; GW_TALLIES];
+        let mut i = 0;
+        while i < GW_TALLIES {
+            w[i] = eng.stats.published(i);
+            i += 1;
+        }
+        w
+    }
+
+    // ---- the venue, in its own process (gate 94's helper, equity's knob) ----
+    let dir = std::env::temp_dir().join(format!("mv-gate112-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("gate 112 dir");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("gate 112 exe"))
+        .args(["gate94_venue_helper", "--exact", "--ignored", "--test-threads=1"])
+        .env("GATE94_VENUE_DIR", &dir)
+        .env("GATE94_REST", "0")
+        .env("GATE94_EQ", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("gate 112 child");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let port: u16 = loop {
+        if let Ok(s) = std::fs::read_to_string(dir.join("port")) {
+            break s.trim().parse().expect("gate 112 port");
+        }
+        assert!(Instant::now() < deadline, "gate 112: the venue never came up");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let der = std::fs::read(dir.join("cert.der")).expect("gate 112 cert");
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(rustls::pki_types::CertificateDer::from(der)).expect("gate 112 anchor");
+    let tls = std::sync::Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+
+    // ---- the gateway, booted equity-only as the engine boots it ----
+    let seed = SecretKeyBytes::new_locked(SEED).expect("gate 112 seed");
+    let cfg = BnConfig::loopback(Scope::Live, String::from(KEY), seed, port).expect("gate 112 config");
+    let (mut table, mut wire) = InstTable::new(core_config::universe::LEGACY_BN_ANCHOR_SYM);
+    let aapl = scan_eq_symbol(EQ_INFO, b"AAPL").expect("gate 112 rules");
+    let sym = core_types::make_symbol_id(VenueId::Binance, 4_097);
+    table.bind_equity(&mut wire, &EqBindSpec { sym, row: &aapl, owned: true, bstock: b"" }).expect("gate 112 bind");
+    let (mut eng, gw_end) = duplex();
+    let (fill_tx, mut lane) = Ring::<Fill, FILL_N>::new().split();
+    let (j_tx, mut journal) = Ring::<ExecRecord, JOURNAL_RING>::new().split();
+    let knobs = GwKnobs {
+        epoch: EPOCH,
+        owner_slot: SLOT,
+        shared: false,
+        mode: AccountMode::Classic,
+        recv_window_ms: 5_000,
+        stp_mode: String::from("EXPIRE_MAKER"),
+        countdown_ms: 2 * LONG_MS,
+        heartbeat_ms: LONG_MS,
+        recon_every_ms: LONG_MS,
+        spin: false,
+        rotate_after_ns: LONG_MS * 1_000_000,
+        rest_orders: false,
+        pnl_anchor_1e6: 0,
+        boot_timeout_ns: 20_000_000_000,
+        quiet_ns: 60_000_000_000,
+        anchor_unsaved: None,
+        max_leverage: 20,
+        adopt_cap_usd_1e6: 0,
+        equity: EqKnobs::new(EqSession::Rth, false, "USDC"),
+    };
+    let mut gw = Gw::new(&cfg, tls, knobs, wire, gw_end, fill_tx, JournalTx::new(j_tx)).expect("gate 112 gateway");
+    gw.boot().expect("gate 112 boot");
+    assert_eq!(gw.phase(), Phase::Ready);
+    let ready_at = Instant::now();
+    let mut s = Seen112::default();
+    let rest_jobs = |eng: &BnEngineEnd| eng.stats.rest_rtt.count();
+
+    // Until no REST answer for 300 ms: whatever the boot left queued.
+    let t = Instant::now();
+    let (mut seen, mut quiet) = (rest_jobs(&eng), Instant::now());
+    while quiet.elapsed() < Duration::from_millis(300) {
+        assert!(t.elapsed() < Duration::from_secs(10), "gate 112: the boot's REST never settled");
+        pump(&mut gw, &mut eng, &mut lane, &mut journal, &mut s);
+        if rest_jobs(&eng) != seen {
+            (seen, quiet) = (rest_jobs(&eng), Instant::now());
+        }
+    }
+
+    // One order: pushed under its TTL, then pumped until it ended — its
+    // receipt, its execution booked on lane 4, its fee journaled, retired.
+    // The fills' ids, and (from 2 000 000) the resting orders'.
+    let mut oid = 2_000_000u64;
+    let mut next = 1_000_000u64;
+    let mut order = |gw: &mut Gw, eng: &mut BnEngineEnd, lane: &mut Consumer<Fill, FILL_N>, journal: &mut Consumer<ExecRecord, JOURNAL_RING>, s: &mut Seen112, side: Side| {
+        next += 1;
+        let (a0, e0, l0, fee0) = (s.acks, s.filled, s.fills, s.j_fee);
+        let now = core_time::now_ns();
+        assert!(eng.cmd.push(&BnCmd::place(next, PX, QTY, now + LONG_MS * 1_000_000, 0, ORDER_KIND_IOC, side, SLOT, 0).at(now)));
+        let t = Instant::now();
+        while !(s.acks > a0 && s.filled > e0 && s.fills > l0 && s.j_fee > fee0) {
+            assert!(t.elapsed() < Duration::from_secs(5), "gate 112: an order stalled");
+            pump(gw, eng, lane, journal, s);
+        }
+    };
+    // ---- a reconciliation cycle, measured alone: the sweep's confirmation ----
+    // Four rounds and one more BUY, held through it: an open leg.
+    let mut w = 0u64;
+    while w < RECON_WARM {
+        order(&mut gw, &mut eng, &mut lane, &mut journal, &mut s, Side::Bid);
+        order(&mut gw, &mut eng, &mut lane, &mut journal, &mut s, Side::Ask);
+        w += 1;
+    }
+    order(&mut gw, &mut eng, &mut lane, &mut journal, &mut s, Side::Bid);
+    // One order of ours resting as the sweep begins: the sweep cancels it
+    // by its UUID; the confirmation cycle runs once it has ended (the
+    // listing then empty — a non-empty listing's found row is gate 113's
+    // scan).
+    oid += 1;
+    let (a0, acc0) = (s.acks, s.j_accepted);
+    let now = core_time::now_ns();
+    assert!(eng.cmd.push(&BnCmd::place(oid, REST_PX, QTY, now + LONG_MS * 1_000_000, 0, ORDER_KIND_IOC, Side::Bid, SLOT, 0).at(now)));
+    let t = Instant::now();
+    while !(s.acks > a0 && s.j_accepted > acc0) {
+        assert!(t.elapsed() < Duration::from_secs(5), "gate 112: the resting order was never accepted");
+        pump(&mut gw, &mut eng, &mut lane, &mut journal, &mut s);
+    }
+    let (before, jobs2) = (s, rest_jobs(&eng));
+    let g = AllocGuard::new();
+    let swept = eng.stats.request_sweep();
+    let t = Instant::now();
+    while !(eng.stats.sweep() == (swept, SWEEP_CLEAR) && s.sweeps_done > before.sweeps_done && s.recons > before.recons && s.member > before.member) {
+        assert!(t.elapsed() < Duration::from_secs(5), "gate 112: the sweep's cycle never ran");
+        pump(&mut gw, &mut eng, &mut lane, &mut journal, &mut s);
+    }
+    let (recon_allocs, recon_bytes, _) = g.delta();
+    let (recon, jobs3) = (s, rest_jobs(&eng));
+    let verdict = gw.last_verdict();
+    // The held lot sold: flat again.
+    order(&mut gw, &mut eng, &mut lane, &mut journal, &mut s, Side::Ask);
+    let mut w = 0u64;
+    while w < WARM {
+        order(&mut gw, &mut eng, &mut lane, &mut journal, &mut s, Side::Bid);
+        order(&mut gw, &mut eng, &mut lane, &mut journal, &mut s, Side::Ask);
+        w += 1;
+    }
+
+    // ---- the rounds ----
+    assert!(ready_at.elapsed() < CLOCK_CLEAR, "gate 112: the run neared the clock's 60 s round");
+    let t_warm = tallies(&mut gw, &mut eng, &mut lane, &mut journal, &mut s);
+    let (warm, jobs0) = (s, rest_jobs(&eng));
+    let g = AllocGuard::new();
+    let mut r = 0u64;
+    while r < ROUNDS {
+        order(&mut gw, &mut eng, &mut lane, &mut journal, &mut s, Side::Bid);
+        order(&mut gw, &mut eng, &mut lane, &mut journal, &mut s, Side::Ask);
+        r += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    let (rounds, jobs1) = (s, rest_jobs(&eng));
+
+    // ---- the TTL rounds: a resting order the gateway's TTL cancels ----
+    let ttl_round = |gw: &mut Gw, eng: &mut BnEngineEnd, lane: &mut Consumer<Fill, FILL_N>, journal: &mut Consumer<ExecRecord, JOURNAL_RING>, s: &mut Seen112, oid: u64| {
+        let t0 = s.ttl;
+        let now = core_time::now_ns();
+        assert!(eng.cmd.push(&BnCmd::place(oid, REST_PX, QTY, now + 20_000_000, 0, ORDER_KIND_IOC, Side::Bid, SLOT, 0).at(now)));
+        let t = Instant::now();
+        while s.ttl == t0 {
+            assert!(t.elapsed() < Duration::from_secs(5), "gate 112: a TTL round stalled");
+            pump(gw, eng, lane, journal, s);
+        }
+    };
+    let mut w = 0u64;
+    while w < 5 {
+        oid += 1;
+        ttl_round(&mut gw, &mut eng, &mut lane, &mut journal, &mut s, oid);
+        w += 1;
+    }
+    let (ttl_warm, jobs4) = (s, rest_jobs(&eng));
+    let g = AllocGuard::new();
+    let mut r = 0u64;
+    while r < TTL_ROUNDS {
+        oid += 1;
+        ttl_round(&mut gw, &mut eng, &mut lane, &mut journal, &mut s, oid);
+        r += 1;
+    }
+    let (ttl_allocs, ttl_bytes, _) = g.delta();
+    let (ttls, jobs5) = (s, rest_jobs(&eng));
+    let t_rounds = tallies(&mut gw, &mut eng, &mut lane, &mut journal, &mut s);
+    assert!(ready_at.elapsed() < CLOCK_CLEAR, "gate 112: the run neared the clock's 60 s round");
+    child.kill().ok();
+    child.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
+    std::hint::black_box(&table);
+
+    let both = 2 * ROUNDS;
+    assert_eq!(
+        (rounds.filled - warm.filled, rounds.fills - warm.fills, rounds.j_fill - warm.j_fill),
+        (both, both, both),
+        "gate 112: every order filled whole, booked once on lane 4 and journaled once"
+    );
+    assert_eq!(
+        (rounds.acks - warm.acks, rounds.j_ack - warm.j_ack, rounds.j_accepted - warm.j_accepted),
+        (both, both, both),
+        "gate 112: a receipt an order (`EVT_ACK`, `J_ACK`); the broker's ACCEPTED journaled once an order"
+    );
+    assert_eq!(
+        (rounds.j_fee - warm.j_fee, rounds.j_fee_floor - warm.j_fee_floor),
+        (both, both),
+        "gate 112: a fee an order — USD, the $0.35 floor, flagged"
+    );
+    assert_eq!(
+        (rounds.bought - warm.bought, rounds.sold - warm.sold, rounds.positions - warm.positions),
+        (ROUNDS as i64 * QTY, ROUNDS as i64 * QTY, both),
+        "gate 112: every round bought 0.03 and sold it back — the position long, then flat"
+    );
+    assert_eq!(
+        (recon.sweeps_done - before.sweeps_done, recon.recons - before.recons, recon.reconciled - before.reconciled, recon.member - before.member),
+        (1, 1, 1, 1),
+        "gate 112: the sweep done — the resting order cancelled by its UUID — one cycle judged and reconciled"
+    );
+    assert_eq!(
+        (ttls.ttl - ttl_warm.ttl, ttls.acks - ttl_warm.acks, ttls.j_accepted - ttl_warm.j_accepted, ttls.fills - ttl_warm.fills),
+        (TTL_ROUNDS, TTL_ROUNDS, TTL_ROUNDS, 0),
+        "gate 112: every TTL round's order receipted, ACCEPTED once, cancelled by its TTL, nothing filled"
+    );
+    assert_eq!(before.bought - before.sold, QTY, "gate 112: AAPL held long through the cycle");
+    assert_eq!(
+        (verdict.drift_legs, verdict.unseen_legs, verdict.ghosts, verdict.orphans, verdict.foreign),
+        (0, 0, 0, 0, 0),
+        "gate 112: the verdict"
+    );
+    assert_eq!(
+        (recon.rejects, recon.retired_other, recon.scan_fails, recon.locks),
+        (0, 0, 0, 0),
+        "gate 112: nothing refused, nothing else retired, no frame failed its scan, no lock"
+    );
+    assert_eq!((ttls.rejects, ttls.retired_other, ttls.scan_fails, ttls.locks), (0, 0, 0, 0), "gate 112: the TTL rounds — nothing else");
+    assert_eq!(
+        (t_rounds[GW_FILLS_BOOKED] - t_warm[GW_FILLS_BOOKED], t_rounds[GW_RECON_OK]),
+        (both, 2),
+        "gate 112: a fill an order; the boot's cycle and the sweep's reconciled"
+    );
+    assert_eq!(
+        (t_rounds[GW_RECON_FAILED], t_rounds[GW_RECON_DRIFT_LEGS], t_rounds[GW_RECON_UNSEEN_LEGS]),
+        (0, 0, 0),
+        "gate 112: no cycle failed, no drift leg, no unseen leg"
+    );
+    let zero = [
+        GW_FILLS_FOREIGN,
+        GW_FILLS_UNOWNED,
+        GW_FILLS_DEFERRED,
+        GW_FILLS_UNRESOLVED,
+        GW_FILLS_LOST,
+        GW_JOBS_DROPPED,
+        GW_IN_DOUBT_RAISED,
+        GW_JOURNAL_DROPPED,
+    ]
+    .map(|k| t_rounds[k]);
+    assert_eq!(zero, [0; 8], "gate 112: no foreign, unowned, deferred, unresolved or lost fill; no job, doubt or record dropped");
+    assert_eq!(
+        (jobs1 - jobs0, jobs3 - jobs2, jobs5 - jobs4),
+        (both, 3, TTL_ROUNDS),
+        "gate 112: a detail an order in the rounds; the sweep's detail, the cycle's page and its listing; a detail a TTL round"
+    );
+    assert_eq!(
+        (allocs, recon_allocs, ttl_allocs),
+        (G112_ROUND * ROUNDS, G112_RECON, G112_TTL * TTL_ROUNDS),
+        "gate 112: the rounds, the sweep and the TTL rounds allocated {allocs} ({bytes} B), {recon_allocs} ({recon_bytes} B) and {ttl_allocs} ({ttl_bytes} B) — rustls' records only"
+    );
+}
+
+/// **BX10 gate 113 — Binance Stocks' renders and scans are 0 B/op** (gate
+/// 111's shape, the equity lane's frames; in-process, no socket). What the
+/// gateway does per equity order and per equity cycle that gate 112 does
+/// not already measure on a socket: `POST …/order/place` (LIMIT DAY, the D5
+/// statics, our id), the cancel and the detail by the venue's UUID, the
+/// in-doubt detail by our id and a page of `trade/history` — the cycle's
+/// window, or a ticker's day — rendered and Ed25519-signed in place; the place's receipt read (our id classified,
+/// the UUID held whole — `EqOrderId::of` — and keyed, `eq_key`), the
+/// cancel's; the stream's `accepted` and `filled` reports read in place
+/// (their JSON numbers exactly, the ticker found by product); the order's
+/// detail with its executions — each seen once by the dedupe ring under
+/// its execution id's key, booked no further than `filledQty` — its fee
+/// classified (USD: the settle asset), flagged under $350 and noted into
+/// the journal's ring; the venue's codes classified (`486207` row-fatal,
+/// `486410` and `486449` venue codes). At their own cadence: the open
+/// orders (no client id) and a FULL page of the session's executions (100
+/// rows, 23 KiB — the page gate 112's cycle keeps under rustls' read
+/// buffer), and the account's `cancel-all` answer. Zero allocations. A
+/// break-and-watch (an 8-byte `Vec` in `render_eq_place` and one in
+/// `scan_eq_trades`) failed it at 20 313 (20 000 places, 313 pages).
+#[test]
+fn binance_equity_lane_render_and_scan_steady_state() {
+    use exec_binance::cid::{CidClass, CidPrefix};
+    use exec_binance::config::Signer;
+    use exec_binance::equity::{
+        eq_key, eq_status_of, eq_terminal, exec_key, scan_eq_ack, scan_eq_cancel, scan_eq_cancel_all, scan_eq_detail, scan_eq_open, scan_eq_symbol,
+        scan_eq_trades, scan_order_report, EqAck, EqDetail, EqExec, EqKnobs, EqOpenRow, EqOrderId, EqReport, EqSession, EQ_EV_ORDER, EQ_S_ACCEPTED,
+        EQ_S_FILLED,
+    };
+    use exec_binance::gov::{classify, is_venue_code, CodeClass, EQ_DISCLAIMER, EQ_DUPLICATE_ID, EQ_NOT_TRADABLE};
+    use exec_binance::inst::{EqBindSpec, InstTable, PRODUCT_EQUITY};
+    use exec_binance::journal::{
+        fee_asset, fee_code, JournalTx, EQ_FEE_FLOOR_NOTIONAL_1E6, FEE_ASSET_SETTLE, FEE_FLAG_EQ_FLOOR, JOURNAL_RING, J_FEE, TRADE_BY_MEMBER,
+    };
+    use exec_binance::oot::TidRing;
+    use exec_binance::rest::{render_eq_by_id, render_eq_detail_cid, render_eq_place, render_eq_trades, QueryWriter, EQ_PAGE};
+    use exec_binance::testvenue::EQ_INFO;
+    use exec_binance::wsapi::{Part, Place, WsStatic};
+
+    const N: u64 = 20000;
+    const ID: &str = "8b1f3a52-7c0e-4d55-9a8e-1f2b3c4d5e6f";
+    const ACK: &[u8] = br#"{"status":"S","orderId":"8b1f3a52-7c0e-4d55-9a8e-1f2b3c4d5e6f","clientOrderId":"mv6512ab0f2000000000000006500000"}"#;
+    const CANCEL: &[u8] = br#"{"orderId":"8b1f3a52-7c0e-4d55-9a8e-1f2b3c4d5e6f","status":"S"}"#;
+    const CANCEL_ALL: &[u8] = br#"{"success":true}"#;
+    const ACCEPTED: &[u8] = br#"{"e":"orderReport","E":1791700000000,"x":"ORDER_UPDATE","i":"8b1f3a52-7c0e-4d55-9a8e-1f2b3c4d5e6f","ai":1,"b":"EQ_AAPL","q":"USDC","S":"buy","o":"limit","p":336.1,"Q":0.03,"N":null,"fq":0,"FN":0,"tc":0,"Z":0,"n":0,"s":"accepted","T":1791700000000,"U":1791700000000}"#;
+    const FILLED: &[u8] = br#"{"e":"orderReport","E":1791700000400,"x":"ORDER_TERMINAL","i":"8b1f3a52-7c0e-4d55-9a8e-1f2b3c4d5e6f","ai":1,"b":"EQ_AAPL","q":"USDC","S":"buy","o":"limit","p":336.1,"Q":0.03,"N":null,"fq":0.03,"FN":10.083,"tc":2,"Z":1.0083e1,"n":0.35,"s":"filled","T":1791700000000,"U":1791700000400}"#;
+    const DETAIL: &[u8] = br#"{"orderId":"8b1f3a52-7c0e-4d55-9a8e-1f2b3c4d5e6f","clientOrderId":"mv6512ab0f2000000000000006500000","symbol":"AAPL","quote":"USDC","side":"BUY","orderType":"LIMIT","limitPrice":"336.10","avgFilledPrice":"336.10","qty":"0.03","notional":null,"filledQty":"0.030000000","filledTotal":"10.083","fee":"0.35","session":"RTH","status":"FILLED","createdAt":1791700000000,"updatedAt":1791700000400,"trades":[{"executionId":"x000002","executionAt":1791700000400,"price":"336.10","qty":"0.010000000"},{"executionId":"x000001","executionAt":1791700000300,"price":"336.10","qty":"0.020000000"}]}"#;
+    const OPEN: &[u8] = br#"[{"orderId":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","symbol":"AAPL","quote":"USDC","side":"BUY","orderType":"LIMIT","limitPrice":"300.00","qty":"0.03","filledQty":"0","status":"ACCEPTED","createdAt":1791700000000}]"#;
+
+    // Boot-time construction — outside the window.
+    let mut page = String::from(r#"{"page":1,"size":100,"total":241,"rows":["#);
+    let mut k = 0;
+    while k < EQ_PAGE {
+        if k > 0 {
+            page.push(',');
+        }
+        page.push_str(&format!(
+            r#"{{"executionId":"x{k:06}","orderId":"{ID}","symbol":"AAPL","quote":"USDC","side":"{}","orderType":"LIMIT","price":"336.10","qty":"0.030000000","total":"10.083000","executionAt":{},"updatedAt":{}}}"#,
+            if k % 2 == 0 { "BUY" } else { "SELL" },
+            1_791_700_000_000u64 + k as u64,
+            1_791_700_000_000u64 + k as u64
+        ));
+        k += 1;
+    }
+    page.push_str("]}");
+    let page = page.into_bytes();
+    assert!(page.len() > 20_000, "gate 113: a full page ({} B)", page.len());
+    let prefix = CidPrefix::new(0x6512_ab0f);
+    let st = WsStatic::new("EXPIRE_MAKER", 5_000);
+    let signer = Signer::Ed25519(signer_ed25519::Ed25519Signer::from_seed(&[0x5a; 32]).expect("gate 113 signer"));
+    let eq = EqKnobs::new(EqSession::Rth, false, "USDC").expect("gate 113 D5 keys");
+    let (mut table, mut wire) = InstTable::new(7);
+    let rules = scan_eq_symbol(EQ_INFO, b"AAPL").expect("gate 113 rules");
+    let row = table
+        .bind_equity(&mut wire, &EqBindSpec { sym: core_types::make_symbol_id(VenueId::Binance, 4_097), row: &rules, owned: true, bstock: b"" })
+        .expect("gate 113 bind");
+    let w = *wire.row(row);
+    let mut win = [0u8; 2_048];
+    let mut tids = TidRing::<256>::new();
+    let (j_p, mut j_c) = core_ring::Ring::<core_types::ExecRecord, JOURNAL_RING>::new().split();
+    let mut journal = JournalTx::new(j_p);
+    let mut x = [EqExec::default(); 256];
+    let mut rows = [EqExec::default(); EQ_PAGE];
+    let mut open = [EqOpenRow::default(); 16];
+    let (mut a, mut d, mut rep) = (EqAck::default(), EqDetail::default(), EqReport::default());
+
+    let g = AllocGuard::new();
+    let (mut rendered, mut fees, mut booked, mut pages, mut lists) = (0usize, 0u64, 0i64, 0u64, 0u64);
+    let mut i = 0u64;
+    while i < N {
+        let now = core_time::now_ns();
+        let ts = 1_791_700_000_000 + i;
+        let cid = Part::Cid(&prefix, 2, 0x65 + i);
+        // The route's requests and the jobs', Ed25519-signed in place.
+        let o = Place {
+            symbol: w.symbol(),
+            side: (i & 1) as u8,
+            maker: false,
+            reduce_only: false,
+            qty_1e6: 30_000,
+            qty_dec: w.qty_dec,
+            px_1e6: 336_100_000 + (i % 100) as i64 * 10_000,
+            px_dec: w.px_dec,
+            cid,
+            ts_ms: ts,
+        };
+        let mut q = QueryWriter::new(&mut win);
+        render_eq_place(&mut q, &st, &eq, &o);
+        rendered += q.sign_with(&signer).expect("gate 113 place");
+        let mut q = QueryWriter::new(&mut win);
+        render_eq_by_id(&mut q, &st, ID.as_bytes(), ts);
+        rendered += q.sign_with(&signer).expect("gate 113 by id");
+        let mut q = QueryWriter::new(&mut win);
+        render_eq_detail_cid(&mut q, &st, cid, ts);
+        rendered += q.sign_with(&signer).expect("gate 113 by our id");
+        let mut q = QueryWriter::new(&mut win);
+        // The cycle's window, and (every other turn) a ticker's day.
+        let day: &[u8] = if i & 1 == 0 { b"" } else { w.symbol() };
+        render_eq_trades(&mut q, &st, day, ts - 3_600_000, ts + 60_000, 1 + i % 20, ts);
+        rendered += q.sign_with(&signer).expect("gate 113 page");
+        // The receipt: our id, the UUID held whole and keyed.
+        scan_eq_ack(ACK, &mut a).expect("gate 113 receipt");
+        assert!(a.ok && matches!(prefix.classify(a.cid.get(ACK)), CidClass::Ours { .. }), "gate 113: the receipt echoes our id");
+        let id = EqOrderId::of(a.id.get(ACK)).expect("gate 113 UUID");
+        let key = eq_key(id.get());
+        // The stream's reports, read in place.
+        for f in [ACCEPTED, FILLED] {
+            scan_order_report(f, &mut rep).expect("gate 113 report");
+            assert!(rep.kind == EQ_EV_ORDER && rep.id.get(f) == id.get(), "gate 113: the report names the order");
+            assert_eq!(wire.find(PRODUCT_EQUITY, rep.ticker.get(f)), row, "gate 113: the ticker's row, by product");
+            std::hint::black_box((rep.status == EQ_S_ACCEPTED, eq_terminal(rep.status), rep.filled_1e6, key));
+        }
+        assert_eq!((rep.filled_1e6, rep.filled_notional_1e6), (30_000, 10_083_000), "gate 113: the stream's numbers, exactly");
+        // The detail: each execution once, no further than `filledQty`.
+        let n = scan_eq_detail(DETAIL, &mut d, &mut x).expect("gate 113 detail");
+        assert!(n == 2 && d.status == EQ_S_FILLED && eq_status_of(b"filled") == EQ_S_FILLED && d.id.get(DETAIL) == id.get());
+        let mut filled = 0i64;
+        let mut k = n;
+        while k > 0 {
+            k -= 1;
+            let seen = tids.see(row, exec_key(x[k].exec.get(DETAIL)) ^ (i << 24), false);
+            if !seen.again && filled + x[k].qty_1e6 <= d.filled_1e6 {
+                filled += x[k].qty_1e6;
+            }
+        }
+        booked += filled;
+        // Its fee: USD, the settle asset; the floor under $350.
+        let asset = fee_asset(&w, b"USD");
+        assert_eq!(asset, FEE_ASSET_SETTLE, "gate 113: USD, an equity's settle asset");
+        let mut code = fee_code(false, asset, TRADE_BY_MEMBER, &w);
+        if d.filled_total_1e6 < EQ_FEE_FLOOR_NOTIONAL_1E6 {
+            code |= FEE_FLAG_EQ_FLOOR;
+        }
+        let fee = core_types::ExecRecord {
+            ts_ns: now,
+            wall_ms: ts,
+            client_oid: 0x65 + i,
+            venue_oid: key,
+            a: d.avg_1e6,
+            b: d.filled_total_1e6 * 1_000,
+            c: d.fee_1e9,
+            code,
+            row,
+            kind: J_FEE,
+            slot: 2,
+        };
+        assert!(journal.note(&fee), "gate 113: the journal's ring has room");
+        fees += u64::from(code & FEE_FLAG_EQ_FLOOR != 0);
+        while let Some(r) = j_c.try_pop_ref() {
+            std::hint::black_box((r.b, r.c));
+        }
+        // The cancel's answer; the venue's codes.
+        let (cid_span, ok) = scan_eq_cancel(CANCEL).expect("gate 113 cancel");
+        assert!(ok && cid_span.get(CANCEL) == id.get());
+        assert!(
+            classify(EQ_NOT_TRADABLE, 400) == CodeClass::RowFatal && is_venue_code(EQ_DISCLAIMER) && is_venue_code(EQ_DUPLICATE_ID),
+            "gate 113: the venue's codes"
+        );
+        // At their own cadence: the listing, a full page, the cancel-all.
+        if i % 64 == 0 {
+            lists += scan_eq_open(OPEN, &mut open).expect("gate 113 open orders") as u64;
+            let p = scan_eq_trades(&page, &mut rows).expect("gate 113 page");
+            assert_eq!((p.total, p.n), (241, EQ_PAGE), "gate 113: a full page of the window's 241");
+            pages += 1;
+            assert_eq!(scan_eq_cancel_all(CANCEL_ALL), Ok(true));
+        }
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    std::hint::black_box((&table, rendered));
+    assert_eq!((fees, booked), (N, N as i64 * 30_000), "gate 113: a floored fee and 0.03 booked an order");
+    assert_eq!((pages, lists), (N.div_ceil(64), N.div_ceil(64)), "gate 113: the page and the listing at their cadence");
+    assert_eq!(allocs, 0, "gate 113: equity's render and scans allocated {allocs} times ({bytes} B)");
 }

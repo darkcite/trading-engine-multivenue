@@ -612,6 +612,7 @@ pub fn boot_binance_arm(
         anchor_unsaved: Some(Arc::clone(&anchor_unsaved)),
         max_leverage: u8::try_from(b.max_leverage).unwrap_or(1),
         adopt_cap_usd_1e6: adopt_cap_usd_1e6(s),
+        equity: None,
     };
     // The kit's duplex: both rings and the stats block (BX7, O-XH13).
     let (eng_end, gw_end) = duplex();
@@ -666,6 +667,7 @@ pub fn boot_binance_arm(
             anchor: core_time::WallAnchor::now(),
             mode,
             demo: false,
+            equity_ttl_ns: 0,
         },
     );
     let handle = std::thread::Builder::new()

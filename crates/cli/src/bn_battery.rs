@@ -396,7 +396,8 @@ pub fn parse_products(list: &str) -> Result<(bool, bool, bool, bool), String> {
             "cm" => cm = true,
             "spot" => spot = true,
             "options" => options = true,
-            other => return Err(format!("`{other}` is not a product (um, cm, spot, options)")),
+            "equity" => return Err(String::from("--binance equity runs alone (the Binance Stocks battery, on MAINNET)")),
+            other => return Err(format!("`{other}` is not a product (um, cm, spot, options; equity alone)")),
         }
     }
     Ok((um, cm, spot, options))
@@ -1022,6 +1023,7 @@ impl Battery {
             anchor_unsaved: None,
             max_leverage: MAX_LEVERAGE,
             adopt_cap_usd_1e6: spec.adopt_usd.saturating_mul(1_000_000),
+            equity: None,
         };
         let boot = |e: String| (EXIT_BOOT, e);
         let mut gw = BnGateway::<FILL_N>::new(&cfg, tls.clone(), knobs, wire, gw_end, fill_tx, JournalTx::new(j_tx))
@@ -1068,6 +1070,7 @@ impl Battery {
                 anchor: core_time::WallAnchor::now(),
                 mode: exec_binance::mode::AccountMode::Classic,
                 demo: true,
+                equity_ttl_ns: 0,
             },
         );
         let mut route = ExecRoute::all_paper();
