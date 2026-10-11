@@ -6146,6 +6146,14 @@ fn state_snapshot_publish_read_encode_is_zero_alloc() {
         margin_coinm_1e6: i64::MIN,
         margin_options_1e6: i64::MIN,
         opt_weight_used: u64::MAX,
+        // BX13: spot's pool, spot's day and the held cycles, at their widest.
+        spot_weight_used: u64::MAX,
+        spot_weight_max: u64::MAX,
+        spot_day_unfilled: u64::MAX,
+        spot_day_cap: u64::MAX,
+        spot_sell_cap: u64::MAX,
+        spot_day_seeded: u64::MAX,
+        recon_held: u64::MAX,
         ..engine_snapshot::BinanceGwSnapshot::default()
     };
     let mut server_scratch = Box::new(EngineSnapshot::empty());
@@ -13304,6 +13312,14 @@ const BX6_FAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","pair":"BTCUSDT","co
 /// rest refused (the pool's `Orders`, SPY's `NotLive`, both counted in the
 /// report). A break-and-watch (an 8-byte `Vec` before the arm's equity
 /// law) failed it at 1 000: every equity attempt.
+///
+/// BX13 (R2-2): the arm admits no spot order before the venue's day count
+/// is read: the gate gives `EVT_SPOT_DAY` before the window (its spot IoCs
+/// would otherwise all be `NotReady`) and again every 64th turn inside it
+/// (`SpotOrders::seed`, the caps). Pinned: 0 B; the report's day seeded,
+/// its caps 200 000 at `orders_frac` 1.0. A spot SELL needs a holding the
+/// ledger never books here (no fill reaches lane 4): the reserve's branch
+/// is `arm::tests::a_spot_sell_keeps_its_reserve_past_the_days_share`'s.
 #[test]
 fn binance_arm_steady_state() {
     use clob_dispatcher::{
@@ -13317,7 +13333,7 @@ fn binance_arm_steady_state() {
         duplex, BnCmd, BnEvt, EVT_ACK, EVT_BUDGET, EVT_CANCEL_FAILED, EVT_DAY, EVT_F_CLOCK_OK,
         EVT_F_DEADMAN_OK, EVT_F_HAD_FILL, EVT_F_IOC, EVT_F_ORDER_UP, EVT_F_RECONCILED, EVT_F_SWEEP_DONE,
         EVT_F_USER_UP, EVT_LOCK, EVT_MARGIN, EVT_MODIFIED, EVT_MODIFY_FAILED, EVT_POSITION,
-        EVT_RECON, EVT_REJECT, EVT_RETIRED, EVT_RING, EVT_SCAN_FAIL, EVT_STATUS, EVT_SWEEP,
+        EVT_RECON, EVT_REJECT, EVT_RETIRED, EVT_RING, EVT_SCAN_FAIL, EVT_SPOT_DAY, EVT_STATUS, EVT_SWEEP,
         VERB_CANCEL, VERB_MODIFY, VERB_PLACE,
     };
     use exec_gateway::stats::SWEEP_CLEAR;
@@ -13450,9 +13466,31 @@ fn binance_arm_steady_state() {
     let mut held = BnEvt::new(EVT_POSITION, t0);
     held.row = put_row;
     held.a = 10_000;
-    assert!(give(&mut gw.evt, &healthy(t0)) && give(&mut gw.evt, &r) && give(&mut gw.evt, &day) && give(&mut gw.evt, &held));
+    // BX13 (R2-2): spot's day as the venue counts it — no spot order before
+    // — for the UTC day it was asked on.
+    let today = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_millis() / 86_400_000) as i64;
+    // The venue's limit — 150 000 at the boot, 160 000 in the window (not
+    // the 200 000 the pool assumes before a read): the caps are the last
+    // read's (the alloc review's rounds 2 and 3).
+    let spot_day = |now: u64, limit: i64| {
+        let mut e = BnEvt::new(EVT_SPOT_DAY, now);
+        e.a = 0;
+        e.b = limit;
+        e.c = today;
+        e
+    };
+    assert!(
+        give(&mut gw.evt, &healthy(t0))
+            && give(&mut gw.evt, &r)
+            && give(&mut gw.evt, &day)
+            && give(&mut gw.evt, &held)
+            && give(&mut gw.evt, &spot_day(t0, 150_000))
+    );
     d.on_idle();
     d.on_idle();
+    let mut boot = clob_dispatcher::BinanceArmReport::default();
+    assert!(d.binance_arm_report(t0, &mut boot), "gate 92: the arm's report");
+    assert_eq!((boot.spot_day_cap, boot.spot_sell_cap), (150_000, 150_000), "gate 92: the boot's read seeded the caps");
     assert!(d.ledger().is_slot_seeded(SLOT as usize), "gate 92: the slot is seeded from the arm's day");
     // A mark already stale when the window opens: the router's next sweep
     // (once a second) expires it inside the window.
@@ -13481,6 +13519,8 @@ fn binance_arm_steady_state() {
     d.on_idle();
     let (mut ok, mut refused, mut polls) = (0u64, 0u64, 0u64);
     let (mut spot_ok, mut spot_refused, mut spot_makers) = (0u64, 0u64, 0u64);
+    // BX13: the day's reads given inside the window.
+    let mut days_given = 0u32;
     let (mut opt_ok, mut opt_refused, mut put_sells, mut reduce_only, mut unwritten) = (0u64, 0u64, 0u64, 0u64, false);
     let (mut eq_ok, mut eq_refused, mut eq_popped, mut eq_ttl, mut eq_cancels, mut eq_rejected) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut eq_six = 0u64;
@@ -13557,6 +13597,11 @@ fn binance_arm_steady_state() {
                 e.a = (now / 86_400_000_000_000) as i64;
             }
             let _ = give(&mut gw.evt, &e);
+        }
+        // BX13 (R2-2): the day's read again now and then (a new venue day's
+        // first cycle): the arm's seed, in the window.
+        if i % 64 == 48 {
+            days_given += u32::from(give(&mut gw.evt, &spot_day(now, 160_000)));
         }
         let btc = i & 4 == 0;
         let buy = i & 1 == 0;
@@ -13740,6 +13785,12 @@ fn binance_arm_steady_state() {
         "gate 92: spot's own pool took its 10 s window's 100 IoCs ({spot_refused} refused there); no spot maker"
     );
     assert!(spot_refused > 0, "gate 92: spot's pool was spent");
+    assert_eq!(
+        (bn_report.spot_day_seeded, bn_report.spot_day_cap, bn_report.spot_sell_cap),
+        (1, 160_000, 160_000),
+        "gate 92: spot's day seeded from the venue's reads (BX13), its caps the window's read's limit at orders_frac 1.0"
+    );
+    assert!(days_given > 0, "gate 92: the day's read given inside the window");
     assert_eq!(opt_ok, 30, "gate 92: options' own pool took its 10 s window's 30 IoCs ({opt_refused} refused)");
     assert!(
         unwritten && bn_report.refused[Refusal::NotWritable as usize] > 0 && bn_report.refused[Refusal::Orders as usize] > 0,
@@ -17680,6 +17731,8 @@ struct Seen108 {
     /// `EVT_RECON`: the cycles judged, and those reconciled.
     recons: u64,
     reconciled: u64,
+    /// BX13 (R2-2): `EVT_SPOT_DAY` — the venue's day count read.
+    spot_days: u64,
 }
 
 /// **BX8 gate 108 — the spot lane's whole step, over a real rustls
@@ -17759,7 +17812,11 @@ struct Seen108 {
 /// scan.
 ///
 /// NOT pinned here: the boot (the logon, the subscription, the day's
-/// trades, `ticker/price`); the order's-trades read of a fill booked
+/// trades, `ticker/price`); BX13's day read (`account.rateLimits.orders`:
+/// asked, answered and carried to the arm at each venue UTC day's first
+/// cycle — the boot's here, outside every window; its render and scan are
+/// gate 109's, and the request's post, its weight and the event's emit
+/// are the cycle's own, pinned here); the order's-trades read of a fill booked
 /// without its report (REST, as the listing; its scan is gate 109's); a
 /// commission charged in the base asset (a BUY without the burn) — the
 /// same path but for the explained balance's subtraction, classified in
@@ -17782,11 +17839,11 @@ fn binance_spot_lane_round_trip_allocates_only_rustls_record_buffers() {
     use exec_binance::arm::{
         GW_EVENTS_OTHER, GW_FILLS_BOOKED, GW_FILLS_DEFERRED, GW_FILLS_FOREIGN, GW_FILLS_LOST, GW_FILLS_UNOWNED,
         GW_FILLS_UNRESOLVED, GW_IN_DOUBT_RAISED, GW_JOBS_DROPPED, GW_JOURNAL_DROPPED, GW_RECON_DRIFT_LEGS, GW_RECON_FAILED,
-        GW_RECON_OK, GW_RECON_UNSEEN_LEGS, GW_TALLIES,
+        GW_RECON_HELD, GW_RECON_OK, GW_RECON_UNSEEN_LEGS, GW_TALLIES,
     };
     use exec_binance::cmd::{
         duplex, BnCmd, BnEngineEnd, EVT_ACK, EVT_F_RECONCILED, EVT_F_SWEEP_DONE, EVT_LOCK, EVT_POSITION, EVT_RECON, EVT_REJECT,
-        EVT_RETIRED, EVT_SCAN_FAIL, EVT_STATUS, EVT_SWEEP,
+        EVT_RETIRED, EVT_SCAN_FAIL, EVT_SPOT_DAY, EVT_STATUS, EVT_SWEEP,
     };
     use exec_binance::config::{BnConfig, Scope};
     use exec_binance::gateway::{BnGateway, GwKnobs, Phase};
@@ -17851,6 +17908,7 @@ fn binance_spot_lane_round_trip_allocates_only_rustls_record_buffers() {
                     s.recons += 1;
                     s.reconciled += u64::from(flags & EVT_F_RECONCILED != 0);
                 }
+                EVT_SPOT_DAY => s.spot_days += 1,
                 _ => {}
             }
         }
@@ -18041,6 +18099,9 @@ fn binance_spot_lane_round_trip_allocates_only_rustls_record_buffers() {
     // ---- the rounds ----
     assert!(ready_at.elapsed() < CLOCK_CLEAR, "gate 108: the run neared the clock's 60 s round");
     let t_warm = tallies(&mut gw, &mut eng, &mut lane, &mut journal, &mut s);
+    // BX13 (R2-2): the venue's day count was read once, by the boot's first
+    // cycle — outside every window.
+    assert_eq!(s.spot_days, 1, "gate 108: spot's day count read once, before the windows");
     let (warm, io0) = (s, io(&eng));
     let g = AllocGuard::new();
     let mut r = 0u64;
@@ -18204,9 +18265,13 @@ fn binance_spot_lane_round_trip_allocates_only_rustls_record_buffers() {
         GW_JOBS_DROPPED,
         GW_IN_DOUBT_RAISED,
         GW_JOURNAL_DROPPED,
+        GW_RECON_HELD,
     ]
     .map(|k| t_recon[k]);
-    assert_eq!(zero, [0; 8], "gate 108: no foreign, unowned, deferred, unresolved or lost fill; no job, doubt or record dropped");
+    assert_eq!(zero, [0; 9], "gate 108: no foreign, unowned, deferred, unresolved or lost fill; no job, doubt or record dropped; no held cycle");
+    // BX13: the same venue day — the sweep's cycle asked nothing more (a run
+    // across 00:00Z on the venue's clock asks again there: rerun it).
+    assert_eq!(s.spot_days, 1, "gate 108: spot's day count read once in the run");
     // ---- the sockets ----
     let d = |a: (u64, u64), b: (u64, u64)| (b.0 - a.0, b.1 - a.1);
     assert_eq!(
@@ -18252,7 +18317,9 @@ fn binance_spot_lane_round_trip_allocates_only_rustls_record_buffers() {
 /// `myTrades` (`isBuyer`, the commission and its asset) summed as the
 /// day's buys (`day_buys_1e6`) and read as the order's-trades answer
 /// (its order's trade's fee owed once, another order's not paid); and
-/// `ticker/price` (the adoption's price). NOT in-process: the booking —
+/// `ticker/price` (the adoption's price); BX13 (R2-2):
+/// `account.rateLimits.orders` rendered and its answer's one DAY entry
+/// read (`scan_day_orders`). NOT in-process: the booking —
 /// `spot_event` → `on_user_event` → `book_event` → `book_fill` (lane 4,
 /// the explained balance, the position event) — is the gateway's
 /// private path, reachable only through `BnGateway::step` reading a
@@ -18273,8 +18340,8 @@ fn binance_spot_lane_render_and_scan_steady_state() {
         scan_spot_event, UserEvent, S_EXPIRED, S_FILLED, S_NEW, UE_ORDER, UE_OTHER, UE_STREAM_END, X_EXPIRED, X_NEW, X_TRADE,
     };
     use exec_binance::wsapi::{
-        queue_account, queue_place, queue_status, queue_subscribe, scan_answer, scan_subscribed, FrameSink, Part, Place, WsAnswer,
-        WsStatic,
+        queue_account, queue_place, queue_rate_limits, queue_status, queue_subscribe, scan_answer, scan_day_orders, scan_subscribed,
+        FrameSink, Part, Place, WsAnswer, WsStatic,
     };
     use ingress_binance::discovery::BnPermissions;
 
@@ -18293,6 +18360,8 @@ fn binance_spot_lane_render_and_scan_steady_state() {
     const ENDED: &[u8] = br#"{"subscriptionId":0,"event":{"e":"eventStreamTerminated","E":1790000000127}}"#;
     // The subscription's answer: live only on the id it names.
     const SUBSCRIBED: &[u8] = br#"{"id":21,"status":200,"result":{"subscriptionId":0},"rateLimits":[{"rateLimitType":"REQUEST_WEIGHT","interval":"MINUTE","intervalNum":1,"limit":6000,"count":4}]}"#;
+    // BX13 (R2-2): `account.rateLimits.orders`' answer, the docs' shape.
+    const RATE_LIMITS: &[u8] = br#"{"id":23,"status":200,"result":[{"rateLimitType":"ORDERS","interval":"SECOND","intervalNum":10,"limit":100,"count":0},{"rateLimitType":"ORDERS","interval":"DAY","intervalNum":1,"limit":200000,"count":1234}],"rateLimits":[{"rateLimitType":"REQUEST_WEIGHT","interval":"MINUTE","intervalNum":1,"limit":6000,"count":40}]}"#;
     // The reconciliation's reads: the account over the session, then REST.
     const ACCOUNT: &[u8] = br#"{"id":19,"status":200,"result":{"makerCommission":10,"takerCommission":10,"buyerCommission":0,"sellerCommission":0,"commissionRates":{"maker":"0.00100000","taker":"0.00100000","buyer":"0.00000000","seller":"0.00000000"},"canTrade":true,"canWithdraw":false,"canDeposit":true,"brokered":false,"requireSelfTradePrevention":false,"preventSor":false,"updateTime":1790000000000,"accountType":"SPOT","balances":[{"asset":"BNB","free":"0.99999000","locked":"0.00000000"},{"asset":"BTC","free":"0.00199800","locked":"0.00000000"},{"asset":"USDT","free":"9870.00002000","locked":"0.00000000"}],"permissions":["SPOT"],"uid":354937868}}"#;
     const OPEN: &[u8] = br#"[{"symbol":"BTCUSDT","orderId":7002,"orderListId":-1,"clientOrderId":"web_stranger_1","price":"90000.00000000","origQty":"0.00100000","executedQty":"0.00000000","cummulativeQuoteQty":"0.00000000","status":"NEW","timeInForce":"GTC","type":"LIMIT","side":"SELL","stopPrice":"0.00000000","icebergQty":"0.00000000","time":1790000000000,"updateTime":1790000000000,"isWorking":true,"workingTime":1790000000000,"origQuoteOrderQty":"0.00000000","selfTradePreventionMode":"EXPIRE_MAKER"}]"#;
@@ -18348,6 +18417,7 @@ fn binance_spot_lane_render_and_scan_steady_state() {
     let g = AllocGuard::new();
     let (mut rendered, mut fees, mut paid, mut again) = (0usize, [0u64; 4], 0u64, 0u64);
     let (mut others, mut ends, mut order_fees, mut not_paid) = (0u64, 0u64, 0u64, 0u64);
+    let mut days = 0u64;
     // The explained balance ×1e8 (the gateway's `spot_1e8`): what the
     // base-asset BUY booked, less its commission.
     let mut explained_1e8 = 0i64;
@@ -18458,6 +18528,12 @@ fn binance_spot_lane_render_and_scan_steady_state() {
             assert!(scan_subscribed(SUBSCRIBED, a.result), "gate 109: the subscription names its id");
             queue_account(&mut win, 22 + i, &st, PRODUCT_SPOT, ts).expect("gate 109 account");
             rendered += win.n;
+            // BX13 (R2-2): spot's day count — asked, and its one DAY entry
+            // read from the answer in place.
+            queue_rate_limits(&mut win, 23 + i, &st, ts).expect("gate 109 rate limits");
+            rendered += win.n;
+            scan_answer(RATE_LIMITS, &mut a).expect("gate 109 rate limits answer");
+            days += u64::from(scan_day_orders(RATE_LIMITS, a.result) == Some((1_234, 200_000)));
             scan_answer(ENDED, &mut a).expect("gate 109 end");
             scan_spot_event(ENDED, a.event.at as usize, &mut ev).expect("gate 109 end event");
             ends += u64::from(a.user && ev.kind == UE_STREAM_END);
@@ -18509,6 +18585,7 @@ fn binance_spot_lane_render_and_scan_steady_state() {
         (N.div_ceil(64), N.div_ceil(64), N.div_ceil(64)),
         "gate 109: the subscription's end read; the order's trade paid, another order's not"
     );
+    assert_eq!(days, N.div_ceil(64), "gate 109: spot's day count read, every cadence (BX13)");
     std::hint::black_box(&table);
     assert_eq!(allocs, 0, "gate 109: spot's render and scans allocated {allocs} times ({bytes} B)");
 }

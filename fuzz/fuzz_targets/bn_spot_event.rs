@@ -73,6 +73,10 @@ use ingress_binance::discovery::{
 };
 use libfuzzer_sys::fuzz_target;
 
+#[path = "common/jsonref.rs"]
+mod jsonref;
+use jsonref::{count, elems, id, num, one, pairs, past_string, text, ws};
+
 /// A report's keys, each named exactly once (the venue's shape).
 const REPORT_KEYS: [&str; 20] = ["e", "E", "s", "c", "S", "x", "X", "i", "l", "L", "z", "t", "q", "p", "n", "N", "T", "m", "Z", "C"];
 
@@ -96,127 +100,9 @@ const PERM_NAMES: [(&[u8], u16); 7] = [
     (b"RPI", BN_PERM_RPI),
 ];
 
-/// An object's top-level pairs, in order: (key, raw value), slices of the
-/// frame.
-type Members<'a> = Vec<(&'a [u8], &'a [u8])>;
-
 // -------------------------------------------------------------------------
-// The oracle's walk
+// The oracle's spans and its strict walk (the shared walk: `common/jsonref.rs`)
 // -------------------------------------------------------------------------
-
-/// JSON's whitespace from `i`.
-fn ws(b: &[u8], mut i: usize) -> usize {
-    while matches!(b.get(i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-        i += 1;
-    }
-    i
-}
-
-/// Past the string whose opening quote is at `i` (a backslash takes the
-/// byte after it).
-fn past_string(b: &[u8], mut i: usize) -> Option<usize> {
-    i += 1;
-    loop {
-        match b.get(i)? {
-            b'"' => return Some(i + 1),
-            b'\\' => i += 2,
-            _ => i += 1,
-        }
-    }
-}
-
-/// Past the value at `i`, read loosely — a string; a container to its
-/// matching bracket, the strings inside it skipped; a scalar to the next
-/// delimiter: the bounds the scanners see in any frame they accept.
-fn past_value(b: &[u8], i: usize) -> Option<usize> {
-    match b.get(i)? {
-        b'"' => past_string(b, i),
-        b'{' | b'[' => {
-            let (mut depth, mut j) = (0usize, i);
-            loop {
-                match b.get(j)? {
-                    b'"' => {
-                        j = past_string(b, j)?;
-                        continue;
-                    }
-                    b'{' | b'[' => depth += 1,
-                    b'}' | b']' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return Some(j + 1);
-                        }
-                    }
-                    _ => {}
-                }
-                j += 1;
-            }
-        }
-        _ => {
-            let mut j = i;
-            while !matches!(b.get(j), None | Some(b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')) {
-                j += 1;
-            }
-            (j > i).then_some(j)
-        }
-    }
-}
-
-/// The top-level pairs of the object at `at` (whitespace before it
-/// allowed), or `None` if no object starts there.
-fn pairs(b: &[u8], at: usize) -> Option<Members<'_>> {
-    let mut i = ws(b, at);
-    if b.get(i) != Some(&b'{') {
-        return None;
-    }
-    let mut out = Vec::new();
-    i = ws(b, i + 1);
-    if b.get(i) == Some(&b'}') {
-        return Some(out);
-    }
-    loop {
-        if b.get(i) != Some(&b'"') {
-            return None;
-        }
-        let k1 = past_string(b, i)?;
-        let key = b.get(i + 1..k1 - 1)?;
-        i = ws(b, k1);
-        if b.get(i) != Some(&b':') {
-            return None;
-        }
-        let v0 = ws(b, i + 1);
-        let v1 = past_value(b, v0)?;
-        out.push((key, b.get(v0..v1)?));
-        i = ws(b, v1);
-        match b.get(i)? {
-            b',' => i = ws(b, i + 1),
-            b'}' => return Some(out),
-            _ => return None,
-        }
-    }
-}
-
-/// The elements of the array at `at`, or `None` if no array starts there.
-fn elems(b: &[u8], at: usize) -> Option<Vec<&[u8]>> {
-    let mut i = ws(b, at);
-    if b.get(i) != Some(&b'[') {
-        return None;
-    }
-    let mut out = Vec::new();
-    i = ws(b, i + 1);
-    if b.get(i) == Some(&b']') {
-        return Some(out);
-    }
-    loop {
-        let e = past_value(b, i)?;
-        out.push(b.get(i..e)?);
-        i = ws(b, e);
-        match b.get(i)? {
-            b',' => i = ws(b, i + 1),
-            b']' => return Some(out),
-            _ => return None,
-        }
-    }
-}
 
 /// Where `inner`, a slice of `frame`, starts in it.
 fn offset(frame: &[u8], inner: &[u8]) -> usize {
@@ -323,32 +209,6 @@ fn well_formed(frame: &[u8], p: &[(&[u8], &[u8])]) -> bool {
 // The oracle's readers (module docs)
 // -------------------------------------------------------------------------
 
-/// How many times the object names `key`.
-fn count(p: &[(&[u8], &[u8])], key: &str) -> usize {
-    p.iter().filter(|(k, _)| *k == key.as_bytes()).count()
-}
-
-/// The raw value of `key` when the object names it exactly once.
-fn one<'a>(p: &[(&'a [u8], &'a [u8])], key: &str) -> Option<&'a [u8]> {
-    let mut named = p.iter().filter(|(k, _)| *k == key.as_bytes());
-    let v = named.next()?.1;
-    named.next().is_none().then_some(v)
-}
-
-/// A string value's raw bytes (nothing unescaped), or `None`.
-fn text(v: &[u8]) -> Option<&[u8]> {
-    (v.len() >= 2 && v.first() == Some(&b'"') && v.last() == Some(&b'"')).then(|| &v[1..v.len() - 1])
-}
-
-/// A number's bytes: a string's, or the bare value's.
-fn num(v: &[u8]) -> Option<&[u8]> {
-    if v.first() == Some(&b'"') {
-        text(v)
-    } else {
-        Some(v)
-    }
-}
-
 /// A decimal ×10^`scale`, or `None` where the scanners refuse it.
 fn dec(v: &[u8], scale: u32) -> Option<i64> {
     let n = num(v)?;
@@ -371,15 +231,6 @@ fn dec(v: &[u8], scale: u32) -> Option<i64> {
     let frac = (0..scale as usize).fold(0u64, |v, k| v * 10 + frac.get(k).map_or(0, |c| u64::from(c - b'0')));
     let mag = i64::try_from(whole.checked_mul(10u64.pow(scale))?.checked_add(frac)?).ok()?;
     Some(if neg { -mag } else { mag })
-}
-
-/// An id: 1 to 19 digits.
-fn id(v: &[u8]) -> Option<u64> {
-    let n = num(v)?;
-    if n.is_empty() || n.len() > 19 || !n.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    Some(n.iter().fold(0, |v, c| v * 10 + u64::from(c - b'0')))
 }
 
 /// A signed integer: `-` optional, 1 to 18 digits.

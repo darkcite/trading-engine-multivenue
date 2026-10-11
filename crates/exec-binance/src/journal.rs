@@ -55,8 +55,13 @@ pub const J_FILL_ADOPTED: i32 = 8;
 /// An order ended without a further fill: `code` = the `RETIRED_*` why.
 pub const J_ENDED: u8 = 4;
 /// A reconciliation verdict: `a` = drift USD ×1e6, `b` = unseen legs,
-/// `c` = foreign orders; `code` = 1 if reconciled.
+/// `c` = foreign orders; `code` = 1 if reconciled, plus [`J_RECON_HELD`]
+/// for a cycle held inconclusive (BX13, R3-1).
 pub const J_RECON: u8 = 5;
+/// [`J_RECON`] `code` bit (BX13, R3-1): the cycle was held inconclusive — a
+/// leg's order's trades still being read (never drift, never reconciled;
+/// `arm::GW_RECON_HELD` counts them).
+pub const J_RECON_HELD: i32 = 2;
 /// A margin sample: `a` = ratio ×1e6 (the product's), `b` = the session
 /// equity USD ×1e6 (USDⓈ-M's on a classic account, the unified account's
 /// in PM and PM Pro), `c` = 1 for a margin call, `code` = the product

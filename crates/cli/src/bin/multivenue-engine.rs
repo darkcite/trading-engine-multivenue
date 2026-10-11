@@ -58,7 +58,7 @@ use tracing_subscriber::EnvFilter;
 /// and was ignored (`--bn-um-symbol ETHUSDT` beside a flatten closed every
 /// position). Each tool names all of these as conflicts instead; a test
 /// keeps the list whole for the flags to come.
-const BN_TOOL_CONFLICTS: [&str; 53] = [
+const BN_TOOL_CONFLICTS: [&str; 54] = [
     "asset", "offline", "lifecycle", "px", "px2", "sz", "sell", "hl_perp", "coins", "cycles",
     "fill_pairs", "usd", "rest_bps", "cross_bps", "ttl_ms", "sweep_every", "stall", "sweep_first",
     "dry_run", "fill", "fill_px", "fill_sz", "fill_slot", "fill_cloid", "fill_repeat", "sweep",
@@ -66,7 +66,7 @@ const BN_TOOL_CONFLICTS: [&str; 53] = [
     "bn_um_symbol", "bn_cm_symbol", "bn_cycles", "bn_fill_pairs", "bn_usd", "bn_rest_bps",
     "bn_cross_bps", "bn_ttl_ms", "bn_rotate_s", "bn_drill", "bn_spot_symbol", "bn_adopt_usd",
     "bn_stream_confirm", "bn_eq_symbol", "bn_eq_session", "bn_eq_tokenize", "bn_eq_quote", "bn_eq_ttl_ms",
-    "bn_confirm_mainnet",
+    "bn_confirm_mainnet", "bn_mainnet",
 ];
 
 const STRATEGY_SET_NAMES: &[&str] = &[
@@ -718,7 +718,8 @@ struct ExecSmokeArgs {
     /// the ask, a SELL of it less the base-asset fee across the bid) on the
     /// M1 anchor's id 7 routed by its alias, each cycle proven by a
     /// reconciliation (spot rides the WS API: no `--bn-rest`); a halt's
-    /// sweep last; the end reads the account flat. Demo only. Exit codes
+    /// sweep last; the end reads the account flat. Demo — BX13: on MAINNET
+    /// with `--bn-mainnet` (the R0 ramp). Exit codes
     /// 50–58; 66: the permission check refused the boot (a spot row's group
     /// the account lacks — the bStock check's verdict; nothing placed); 0
     /// only when the plan's bar is met. BX10: `equity`, alone — the Binance
@@ -764,11 +765,13 @@ struct ExecSmokeArgs {
     /// BX8: the most venue inventory the boot adopts, USD (at the ticker):
     /// a Demo spot account is seeded with balances (e.g. 1 BTC) and the
     /// boot adopts the held base balance as the slot's starting inventory
-    /// (the slot's instance cap carries it too). 0..=10000000; 0 adopts
-    /// nothing — a held base balance then refuses the boot (exit 51, naming
-    /// this flag).
-    #[arg(long, default_value_t = cli::bn_battery::DEFAULT_ADOPT_USD, requires = "binance")]
-    bn_adopt_usd: i64,
+    /// (the slot's instance cap carries it too). 0..=10000000 (default
+    /// 250000 on Demo); 0 adopts nothing — a held base balance then refuses
+    /// the boot (exit 51, naming this flag). BX13: on MAINNET
+    /// (`--bn-mainnet`) the default is 0 — the live account's balance is
+    /// adopted only as far as the operator names it.
+    #[arg(long, requires = "binance")]
+    bn_adopt_usd: Option<i64>,
 
     /// BX7b: maker cycles on USDⓈ-M (the bar: 10 — fewer runs short of it
     /// and exits non-zero). BX8: spot's IoC cycles too (a BUY and its SELL
@@ -880,9 +883,20 @@ struct ExecSmokeArgs {
 
     /// BX10: the operator's word for the Binance Stocks battery's orders on
     /// MAINNET — real money. Without it `--binance equity` reads, prints
-    /// its plan and sends nothing (exit 64).
+    /// its plan and sends nothing (exit 64). BX13: the word for the R0
+    /// ramp too (`--bn-mainnet`).
     #[arg(long = "bn-confirm-mainnet", default_value_t = false, requires = "binance")]
     bn_confirm_mainnet: bool,
+
+    /// **BX13 — the R0 ramp on MAINNET** (`cli::bn_battery`, `--binance
+    /// um,cm,spot | options --lifecycle --bn-mainnet`): the battery on the
+    /// LIVE account with the engine's own key (`BINANCE_*`) — REAL MONEY,
+    /// the operator's to run. R0's counts are fixed (no `--bn-cycles`, no
+    /// `--bn-fill-pairs`); every R0 bar is one `phase:"r0"` line. Without
+    /// `--bn-confirm-mainnet` it reads the account, prints its plan and
+    /// sends nothing (exit 64).
+    #[arg(long, default_value_t = false, requires = "binance", conflicts_with_all = ["bn_cycles", "bn_fill_pairs"])]
+    bn_mainnet: bool,
 
     /// BX10 (the operator's ruling S-1): the operator's word for the
     /// Binance Stocks probe's one POST on MAINNET — the listenKey, which
@@ -1924,10 +1938,22 @@ fn evm_testnet(args: EvmTestnetArgs) -> ExitCode {
     }
 }
 
+/// BX13: Stocks is mainnet by nature — the reach flag is the R0 battery's;
+/// beside equity it would be read as nothing: refused, with why.
+fn equity_reach_refused(args: &ExecSmokeArgs) -> Option<&'static str> {
+    args.bn_mainnet.then_some(
+        "exec-smoke --binance equity: --bn-mainnet is the R0 battery's (um, cm, spot, options); the Stocks battery is MAINNET by nature",
+    )
+}
+
 /// BX7b: the Binance Demo battery (`exec-smoke --binance … --lifecycle`);
 /// BX10: `--binance equity`, the Binance Stocks battery on MAINNET.
 fn exec_binance_battery(products: &str, args: &ExecSmokeArgs) -> ExitCode {
     if products.trim() == "equity" {
+        if let Some(why) = equity_reach_refused(args) {
+            error!("{why}");
+            return ExitCode::from(1);
+        }
         let spec = cli::bn_equity_battery::EquitySpec {
             symbol: args.bn_eq_symbol.to_ascii_uppercase(),
             session: args.bn_eq_session.clone().unwrap_or_default(),
@@ -1964,7 +1990,7 @@ fn exec_binance_battery(products: &str, args: &ExecSmokeArgs) -> ExitCode {
         um_symbol: args.bn_um_symbol.clone(),
         cm_symbol: args.bn_cm_symbol.clone(),
         spot_symbol: args.bn_spot_symbol.clone(),
-        adopt_usd: args.bn_adopt_usd,
+        adopt_usd: args.bn_adopt_usd.unwrap_or(if args.bn_mainnet { 0 } else { cli::bn_battery::DEFAULT_ADOPT_USD }),
         cycles: args.bn_cycles,
         fill_pairs: args.bn_fill_pairs,
         usd: args.bn_usd,
@@ -1981,8 +2007,14 @@ fn exec_binance_battery(products: &str, args: &ExecSmokeArgs) -> ExitCode {
                 return ExitCode::from(1);
             }
         },
+        mainnet: args.bn_mainnet,
+        confirm: args.bn_confirm_mainnet,
     };
-    info!(?spec, "exec-smoke: BX7b — the Binance Demo battery");
+    if spec.mainnet {
+        info!(?spec, "exec-smoke: BX13 — the R0 ramp battery (MAINNET)");
+    } else {
+        info!(?spec, "exec-smoke: BX7b — the Binance Demo battery");
+    }
     // SIGINT/SIGTERM end the battery through its end — the cancel-all, the
     // closes and the flat read — never mid-run with orders left.
     if let Err(e) = cli::sigint::install_sigint_handler() {
@@ -6740,9 +6772,9 @@ mod exec_smoke_args {
         assert!(smoke(&["--binance-probe", "coinm"]).is_err(), "an unknown probe word");
         assert!(smoke(&["--binance-probe", "spot", "--lifecycle"]).is_err());
         let a = smoke(&["--binance", "um,spot", "--lifecycle"]).unwrap();
-        assert_eq!((a.binance.as_deref(), a.bn_spot_symbol.as_str(), a.bn_adopt_usd), (Some("um,spot"), "BTCUSDT", cli::bn_battery::DEFAULT_ADOPT_USD));
+        assert_eq!((a.binance.as_deref(), a.bn_spot_symbol.as_str(), a.bn_adopt_usd), (Some("um,spot"), "BTCUSDT", None), "Demo's default at the spec");
         let a = smoke(&["--binance", "spot", "--lifecycle", "--bn-spot-symbol", "TSLABUSDT", "--bn-adopt-usd", "0"]).unwrap();
-        assert_eq!((a.bn_spot_symbol.as_str(), a.bn_adopt_usd), ("TSLABUSDT", 0));
+        assert_eq!((a.bn_spot_symbol.as_str(), a.bn_adopt_usd), ("TSLABUSDT", Some(0)));
         for orphan in [&["--bn-spot-symbol", "BTCUSDT"][..], &["--bn-adopt-usd", "5"][..]] {
             assert!(smoke(orphan).is_err(), "{orphan:?} parsed without --binance");
         }
@@ -6775,5 +6807,35 @@ mod exec_smoke_args {
             assert!(smoke(orphan).is_err(), "{orphan:?} parsed without --binance");
         }
         assert!(cli::bn_battery::parse_products("um,equity").is_err(), "equity runs alone");
+    }
+
+    /// BX13: the R0 ramp's reach parses with `--binance` only, takes the
+    /// battery's word, and refuses the counts R0 fixes (a count passed
+    /// beside the reach would be read as nothing); the account tools'
+    /// reach and word stay theirs.
+    #[test]
+    fn the_r0_reach_parses_where_it_belongs() {
+        let a = smoke(&["--binance", "um,cm,spot", "--lifecycle", "--bn-mainnet", "--bn-confirm-mainnet"]).unwrap();
+        assert!(a.bn_mainnet && a.bn_confirm_mainnet);
+        let a = smoke(&["--binance", "options", "--lifecycle", "--bn-mainnet"]).unwrap();
+        assert!(a.bn_mainnet && !a.bn_confirm_mainnet, "the plan only: no word");
+        let a = smoke(&["--binance", "um", "--lifecycle", "--bn-mainnet", "--bn-drill", "gap", "--bn-confirm-mainnet"]).unwrap();
+        assert_eq!(a.bn_drill.as_deref(), Some("gap"), "the dead-man's R0 bar is the gap drill's run");
+        assert!(!smoke(&["--binance", "um", "--lifecycle"]).unwrap().bn_mainnet, "Demo by default");
+        // The parser review's round 2: beside equity (mainnet by nature)
+        // the reach is refused before anything runs.
+        let eq = smoke(&["--binance", "equity", "--lifecycle", "--bn-mainnet"]).unwrap();
+        assert!(super::equity_reach_refused(&eq).is_some(), "the R0 reach beside the Stocks battery");
+        assert!(super::equity_reach_refused(&smoke(&["--binance", "equity", "--lifecycle"]).unwrap()).is_none());
+        for refused in [
+            &["--bn-mainnet"][..],
+            &["--binance", "um", "--lifecycle", "--bn-mainnet", "--bn-cycles", "20"][..],
+            &["--binance", "cm", "--lifecycle", "--bn-mainnet", "--bn-fill-pairs", "20"][..],
+            &["--binance", "um", "--lifecycle", "--bn-network", "mainnet"][..],
+            &["--binance", "um", "--lifecycle", "--bn-mainnet", "--confirm"][..],
+            &["--binance-flatten", "um", "--bn-mainnet"][..],
+        ] {
+            assert!(smoke(refused).is_err(), "{refused:?} parsed");
+        }
     }
 }

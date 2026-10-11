@@ -95,7 +95,7 @@ use crate::cmd::*;
 use crate::equity::{EQ_SIDE_BUY, EQ_SIDE_SELL};
 use crate::gov::{
     classify, is_venue_code, CodeClass, EquityOrders, FuturesOrders, OptionOrders, Qtr, QtrRow, SpotOrders, ARM_WEIGHT_MAX_PER_MIN,
-    OPT_ARM_WEIGHT_MAX_PER_MIN, QTR_DUST_USD_1E6,
+    OPT_ARM_WEIGHT_MAX_PER_MIN, QTR_DUST_USD_1E6, SPOT_ARM_WEIGHT_MAX_PER_MIN,
 };
 use crate::inst::{
     rx, InstTable, INST_INVERSE, INST_LIVE, INST_MAX, INST_NO_DEADMAN, INST_OWNED, INST_WRITABLE, PRODUCT_COINM, PRODUCT_EQUITY,
@@ -249,7 +249,7 @@ const _: () = assert!(REFUSALS == BINANCE_REFUSALS);
 /// The gateway tallies mirrored in [`BnArmCounters::gw`]: the gateway
 /// publishes tally `i` as the stats block's word `i` (BX7) and the arm
 /// copies them on each pulse ([`EVT_STATUS`]).
-pub const GW_TALLIES: usize = 20;
+pub const GW_TALLIES: usize = 21;
 // The tallies' words, then the gateway's weight word (`PW_WEIGHT`).
 const _: () = assert!(GW_TALLIES < PUBLISHED_WORDS);
 /// [`BnArmCounters::gw`] index: fills booked onto lane 4.
@@ -298,6 +298,10 @@ pub const GW_DNS_RERESOLVED: usize = 18;
 /// kind newer than this build) — scanned, counted, never booked (BX11:
 /// BX-15's "never a silent skip").
 pub const GW_EVENTS_OTHER: usize = 19;
+/// **BX13 (R3-1)** — reconciliation cycles held inconclusive: a leg whose
+/// order's trades were still being read (`Verdict::held_legs`) — neither
+/// drift nor reconciled; journaled with [`crate::journal::J_RECON_HELD`].
+pub const GW_RECON_HELD: usize = 20;
 
 /// The knobs the arm is booted with.
 #[derive(Clone, Debug)]
@@ -774,9 +778,14 @@ impl BnArm {
         let wall_ms = self.knobs.anchor.wall_of(now) / 1_000_000;
         if spot {
             // BX8: spot's own pool and its unfilled-order mirror — the UM
-            // quantitative rules and the breadth are futures' alone.
+            // quantitative rules and the breadth are futures' alone. BX13
+            // (R2-2): nothing before the venue's own count is read (a
+            // restart's 0 is not the venue's); a SELL to its reserve.
+            if !self.spot.seeded() {
+                return Err(Refusal::NotReady);
+            }
             self.spot.roll(wall_ms);
-            if !self.spot.admits(now) {
+            if !self.spot.admits(now, !buy) {
                 return Err(Refusal::Orders);
             }
         } else if product == PRODUCT_OPTIONS {
@@ -1001,6 +1010,22 @@ impl BnArm {
             EVT_SCAN_FAIL => {
                 self.c.scan_failed += 1;
                 self.seen.scan_failed = true;
+            }
+            // BX13 (R2-2): the venue's count of spot's day — seeded into the
+            // day the read was asked on (`c`).
+            EVT_SPOT_DAY => {
+                let count = u32::try_from(e.a).unwrap_or(u32::MAX);
+                let limit = u32::try_from(e.b).unwrap_or(0);
+                let day = u64::try_from(e.c).unwrap_or(0);
+                // The day asked on is the gateway's venue clock's; one more
+                // than a day from the arm's own is no day this boot can
+                // seed (the risk review's round 2: a first seed of day 0
+                // would be rolled away, a far one would freeze the roll) —
+                // taken for nothing, the lane stays `NotReady`.
+                let today = self.knobs.anchor.wall_of(e.ts_ns) / 1_000_000 / crate::gov::DAY_MS;
+                if day.abs_diff(today) <= 1 {
+                    self.spot.seed(day.saturating_mul(crate::gov::DAY_MS), count, limit);
+                }
             }
             EVT_POSITION => {
                 if (e.row as usize) < self.inst.len() {
@@ -1328,7 +1353,7 @@ impl OrderDispatch for BnArm {
             _ => st.push_to_write.quantile_ns(0.99),
         });
         self.lat_next.set(((k + 1) % LAT_QUANTILES) as u8);
-        // COPY: the report (632 B) into the caller's — cold, once a second;
+        // COPY: the report (688 B) into the caller's — cold, once a second;
         // built whole, so no field is left from an earlier read — rejected:
         // field-by-field writes into `out` (the same bytes, less legible).
         *out = BinanceArmReport {
@@ -1373,6 +1398,13 @@ impl OrderDispatch for BnArm {
             weight_max: ARM_WEIGHT_MAX_PER_MIN,
             opt_weight_used: st.published(crate::gateway::PW_OPT_WEIGHT),
             opt_weight_max: OPT_ARM_WEIGHT_MAX_PER_MIN,
+            spot_weight_used: st.published(crate::gateway::PW_SPOT_WEIGHT),
+            spot_weight_max: SPOT_ARM_WEIGHT_MAX_PER_MIN,
+            spot_day_unfilled: u64::from(self.spot.unfilled_on(self.knobs.anchor.wall_of(now_ns) / 1_000_000)),
+            spot_day_cap: u64::from(self.spot.caps().0),
+            spot_sell_cap: u64::from(self.spot.caps().1),
+            spot_day_seeded: u64::from(self.spot.seeded()),
+            recon_held: c.gw[GW_RECON_HELD],
             orders_10s_used: self.fut.w10s.used(now_ns) as u64,
             orders_10s_cap: self.fut.w10s.cap() as u64,
             orders_1m_used: self.fut.w1m.used(now_ns) as u64,
@@ -1532,14 +1564,9 @@ pub(crate) mod tests {
         assert!(r.arm.submit(&o).is_ok());
     }
 
-    /// BX8: a spot row (here the anchor, under the alias) trades IoC only
-    /// — a maker is refused (no dead-man), and so is a reduce-only order —
-    /// on spot's own ORDERS pool: 80 IoCs in 10 s (80 % of 100) while the
-    /// futures' pool stays untouched; a spot order counts toward neither
-    /// the breadth nor the UM rules; an order that filled leaves the day's
-    /// unfilled count.
-    #[test]
-    fn a_spot_row_is_ioc_only_on_its_own_pool() {
+    /// BX8: the rig with a spot row (the anchor, under the alias) and a
+    /// USDⓈ-M row, healthy; BX13: spot's day not yet read.
+    fn spot_rig() -> Rig {
         let d = fapi_rows(crate::inst::tests::SPOT);
         let f = fapi_rows(FAPI);
         let (mut t, mut w) = InstTable::new(7);
@@ -1562,12 +1589,42 @@ pub(crate) mod tests {
         };
         let mut r = Rig { arm: BnArm::new(eng, t, knobs), gw };
         r.healthy();
-        let spot = |kind: u8, side: Side, flags: u8, oid: u64| {
-            let mut o = Order::new(0, VenueId::Binance, 7, side, kind, Price(65_000_000_000), Qty(1_000), oid);
-            o.strategy_id = SLOT;
-            o.flags = flags;
-            o
-        };
+        r
+    }
+
+    /// An order on the spot row (sym 7).
+    fn spot(kind: u8, side: Side, flags: u8, oid: u64) -> Order {
+        let mut o = Order::new(0, VenueId::Binance, 7, side, kind, Price(65_000_000_000), Qty(1_000), oid);
+        o.strategy_id = SLOT;
+        o.flags = flags;
+        o
+    }
+
+    /// BX13 (R2-2): spot's day as the venue counts it, sent to the arm.
+    fn spot_day(r: &mut Rig, count: i64, limit: i64) {
+        let now = core_time::now_ns();
+        let mut d = BnEvt::new(EVT_SPOT_DAY, now);
+        d.a = count;
+        d.b = limit;
+        // The day asked on: the arm's own (the rig's anchor).
+        d.c = (r.arm.knobs.anchor.wall_of(now) / 1_000_000 / crate::gov::DAY_MS) as i64;
+        r.send(d);
+        r.arm.on_idle();
+    }
+
+    /// BX8: a spot row (here the anchor, under the alias) trades IoC only
+    /// — a maker is refused (no dead-man), and so is a reduce-only order —
+    /// on spot's own ORDERS pool: 80 IoCs in 10 s (80 % of 100) while the
+    /// futures' pool stays untouched; a spot order counts toward neither
+    /// the breadth nor the UM rules; an order that filled leaves the day's
+    /// unfilled count. BX13 (R2-2): nothing before the venue's day is read.
+    #[test]
+    fn a_spot_row_is_ioc_only_on_its_own_pool() {
+        let mut r = spot_rig();
+        assert_eq!(r.arm.submit(&spot(ORDER_KIND_IOC, Side::Bid, 0, 3)), Err(DispatchError::Disconnected), "the day unread");
+        assert_eq!(r.arm.counters().refused[Refusal::NotReady as usize], 1);
+        spot_day(&mut r, 0, 200_000);
+        assert!(r.arm.spot.seeded());
         let mut m = spot(ORDER_KIND_MAKER, Side::Bid, 0, 1);
         m.ttl_ns = 10_000_000_000;
         assert_eq!(r.arm.submit(&m), Err(DispatchError::Unsupported));
@@ -1608,6 +1665,50 @@ pub(crate) mod tests {
         r.send(x);
         r.arm.on_idle();
         assert_eq!(r.arm.spot.unfilled(), 79, "the unfilled IoC stays counted");
+    }
+
+    /// BX13 (the risk review's round 2): a read asked more than a day from
+    /// the arm's own day seeds nothing — day 0 (rolled away at once) and a
+    /// far day (the roll frozen) alike; the lane stays `NotReady` until a
+    /// read of the day comes. Break-and-watch: unbounded, day 0 seeds.
+    #[test]
+    fn a_day_far_from_the_arms_own_seeds_nothing() {
+        let mut r = spot_rig();
+        let now = core_time::now_ns();
+        let today = (r.arm.knobs.anchor.wall_of(now) / 1_000_000 / crate::gov::DAY_MS) as i64;
+        for c in [0, today - 2, today + 2] {
+            let mut d = BnEvt::new(EVT_SPOT_DAY, now);
+            (d.a, d.b, d.c) = (1, 200_000, c);
+            r.send(d);
+            r.arm.on_idle();
+            assert!(!r.arm.spot.seeded(), "day {c} of {today}");
+        }
+        assert_eq!(r.arm.submit(&spot(ORDER_KIND_IOC, Side::Bid, 0, 1)), Err(DispatchError::Disconnected));
+        assert_eq!(r.arm.counters().refused[Refusal::NotReady as usize], 1);
+        spot_day(&mut r, 1, 200_000);
+        assert!(r.arm.spot.seeded(), "today's read");
+    }
+
+    /// BX13 (R2-2): the venue's count seeds the day — a BUY stops at the
+    /// share (160 000 of 200 000 at 80 %), a SELL goes on into its reserve
+    /// (to 170 000) and stops there; a later read never lowers the count.
+    #[test]
+    fn a_spot_sell_keeps_its_reserve_past_the_days_share() {
+        let mut r = spot_rig();
+        spot_day(&mut r, 159_999, 200_000);
+        assert_eq!(r.arm.spot.unfilled(), 159_999, "the venue's count, not 0");
+        assert_eq!(r.arm.submit(&spot(ORDER_KIND_IOC, Side::Bid, 0, 1)), Ok(()));
+        r.pop_cmd().expect("the BUY");
+        assert_eq!(r.arm.submit(&spot(ORDER_KIND_IOC, Side::Bid, 0, 2)), Err(DispatchError::SlotDisabled), "the BUYs' share");
+        assert_eq!(r.arm.counters().refused[Refusal::Orders as usize], 1);
+        assert_eq!(r.arm.submit(&spot(ORDER_KIND_IOC, Side::Ask, 0, 3)), Ok(()), "a SELL into the reserve");
+        assert_eq!(r.pop_cmd().expect("the SELL").side, Side::Ask as u8);
+        spot_day(&mut r, 169_999, 0);
+        assert_eq!(r.arm.submit(&spot(ORDER_KIND_IOC, Side::Ask, 0, 4)), Ok(()));
+        r.pop_cmd().expect("the last SELL the reserve takes");
+        assert_eq!(r.arm.submit(&spot(ORDER_KIND_IOC, Side::Ask, 0, 5)), Err(DispatchError::SlotDisabled), "the reserve spent");
+        spot_day(&mut r, 5, 0);
+        assert_eq!(r.arm.spot.unfilled(), 170_000, "a read never lowers the mirror");
     }
 
     /// BX10: a Binance Stocks row — an IoC by kind, sent as a DAY LIMIT

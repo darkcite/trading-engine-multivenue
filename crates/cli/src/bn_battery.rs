@@ -7,12 +7,15 @@
 //! arm, router and gateway — `RoutedDispatcher` → `VenueSplit` → `BnArm` →
 //! the command ring → `BnGateway` on its own thread → fill lane 4 and the
 //! event ring → the router's ledger — on Binance **Demo**'s hosts with the
-//! Demo keys, driven through `OrderDispatch` as the engine loop drives it
-//! (the idle hook, then the fill lane).
+//! Demo keys (BX13: or MAINNET's with the engine's key, `--bn-mainnet`, by
+//! the operator's word), driven through `OrderDispatch` as the engine loop
+//! drives it (the idle hook, then the fill lane).
 //!
-//! COPY-DOCTRINE: an operator tool run by hand against Binance Demo, never
-//! reachable from the engine loop: it allocates and copies freely (the
-//! report, the tap's frames, the journal's records, the reads' answers).
+//! COPY-DOCTRINE: an operator tool run by hand against Binance Demo — or,
+//! BX13, the live account under `--bn-mainnet` by the operator's word —
+//! never reachable from the engine loop: it allocates and copies freely
+//! (the report, the tap's frames, the journal's records, the reads'
+//! answers, the bars' arrays).
 //!
 //! **Where it departs from the engine's composition** (`bn_live`): the
 //! router over `VenueSplit<NullLiveDispatcher, BnArm>` — the engine's
@@ -129,8 +132,42 @@
 //! `J_ACK`) against `TRADE_LITE` and the `ORDER_TRADE_UPDATE` trade:
 //! evidence across two sockets, not proof.
 //!
+//! **BX13 — the R0 ramp on MAINNET** (`--bn-mainnet`; plan §5 BX13, the
+//! operator's rulings R-1…R-3). The same composition, the same phases and
+//! the same end, on the live account with the engine's own key (`.env`'s
+//! `BINANCE_*`: Ed25519, or the HMAC pair under `--bn-hmac`; options sign
+//! with the scope's HMAC pair, Q-1) — **REAL MONEY**, the operator's to
+//! run (O-BX6: a session never does). The reach is the configuration's
+//! (`Scope::Live`, every host checked mainnet's); the clients are the
+//! account tools' (`Rest::ops`, `Public::ops`), which read freely and send
+//! a change only signed with the operator's sealed word ([`MainnetVerb`]).
+//! WITHOUT `--bn-confirm-mainnet` the run reads the account (the checks of
+//! phase 0, the rows, the options row), prints its plan
+//! (`phase:"mainnet_plan"`) and ends with nothing sent:
+//! `bn_ops::EXIT_OPS_UNCONFIRMED` (64). With it, the word is held for the
+//! run: the tap's listenKey, the drill's cancels and the end's flatten
+//! are its only REST changes; every order goes through the gateway as the
+//! engine sends it. The counts are R0's, fixed ([`Counts::of`]; the CLI
+//! refuses `--bn-cycles` and `--bn-fill-pairs` beside the reach): 20
+//! USDⓈ-M maker cycles and 3 round trips, 20 COIN-M round trips, 20 spot
+//! cycles, 4 options round trips (2 LONG, 2 SHORT — ruling R-2). The
+//! router's day cap is [`CAP_DAY_MAINNET_USD_1E6`].
+//!
+//! **The R0 bar** ([`r0_bars`], one JSON line each, met or short — the
+//! operator's run IS the R0 record): per product armed, its cycles or
+//! round trips, ≥ 5 fills, the Demo bar's own proofs (the post-only
+//! refusal, the TTL, the halt's sweep, COIN-M's maker refused, the alias);
+//! for the run, the journal whole (no record dropped), ≥ 3 consecutive
+//! clean reconciliations (reconciled, no drift, no unseen leg, no foreign
+//! order — the gateway's verdict covers every lane), every fill booked
+//! from its trade report, one `J_FEE` a trade — order by order
+//! ([`fee_gaps`]) — with its asset judged (none `FEE_ASSET_NONE`), a
+//! `J_MARGIN` for each futures product and options, and zero scan
+//! failures and fills lost. The dead-man's bar is the gap
+//! drill's own run (`--binance um --bn-drill gap --bn-mainnet`).
+//!
 //! Exit codes: `bn_demo::EXIT_*` (50–58; the drill's 65; the permission
-//! check's 66, BX8), pinned there.
+//! check's 66, BX8), pinned there; 64 (BX13) mainnet without the word.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -149,16 +186,17 @@ use core_types::{
     Price, Qty, Side, SymbolId, VenueId, OPT_SUMMARY_FLAG_MARK_PX, ORDER_FLAG_POST_ONLY, ORDER_FLAG_REDUCE_ONLY, SYMBOL_ID_NONE,
 };
 use exec_binance::arm::{
-    ArmKnobs, BnArm, Refusal, GW_CONNECT_FAILURES, GW_FILLS_LOST, GW_JOURNAL_DROPPED, GW_RECONNECTS, GW_RECON_DRIFT_LEGS,
-    GW_RECON_FAILED, GW_RECON_OK, SHUTDOWN_WAIT_NS,
+    ArmKnobs, BnArm, Refusal, EVT_DRAIN_MAX, GW_CONNECT_FAILURES, GW_FILLS_LOST, GW_JOURNAL_DROPPED, GW_RECONNECTS,
+    GW_RECON_DRIFT_LEGS, GW_RECON_FAILED, GW_RECON_OK, SHUTDOWN_WAIT_NS,
 };
 use exec_binance::cid::{CidPrefix, CID_LEN};
-use exec_binance::cmd::{duplex, EVT_F_SWEEP_DONE};
-use exec_binance::config::{BnConfig, Signer};
+use exec_binance::cmd::{duplex, EVT_F_SWEEP_DONE, EVT_RING};
+use exec_binance::config::{BnConfig, MainnetVerb, Network, Scope, Signer};
 use exec_binance::gateway::{BnGateway, BootErr, GwKnobs, Phase, QUIET_NS, ROTATE_AFTER_NS};
 use exec_binance::inst::{AssetName, BnInstCold, BnInstHot, PRODUCT_COINM, PRODUCT_OPTIONS, PRODUCT_SPOT, PRODUCT_USDM};
 use exec_binance::journal::{
-    fee_fields, JournalTx, FEE_ASSET_BNB, FEE_ASSET_OTHER, JOURNAL_RING, J_ACK, J_ENDED, J_FEE, J_FILL, J_RECON, J_REJECT,
+    fee_fields, JournalTx, FEE_ASSET_BNB, FEE_ASSET_NONE, FEE_ASSET_OTHER, JOURNAL_RING, J_ACK, J_ENDED, J_FEE, J_FILL,
+    J_FILL_ADOPTED, J_FILL_LOST, J_FILL_UNSEEN, J_MARGIN, J_RECON, J_RECON_HELD, J_REJECT,
 };
 use exec_binance::margin::{MarginBook, SLOTS};
 use exec_binance::mode::{judge_one_way, judge_permission, judge_single_asset, judge_symbol_config, AccountMode, AssertErr};
@@ -177,7 +215,7 @@ use rustls::ClientConfig;
 use tracing::{error, info, warn};
 
 use crate::bn_demo::{
-    account_of, demo_config, discover, discover_spot, is_arms, notional_1e6, open_orders, order_state, orders_of,
+    account_of, demo_config, discover_ops, discover_spot, hosts_on, is_arms, notional_1e6, open_orders, order_state, orders_of,
     product_word, px_off, qty_for, read_account, read_spot_account, render_spot_account, spot_account_of, spot_symbol_ok,
     wall_ms, Answer, Line, Public, Rest, Ws, EXIT_ACCOUNT, EXIT_BOOT, EXIT_CYCLE, EXIT_DRILL, EXIT_FILLS, EXIT_LEFTOVER,
     EXIT_PERMISSION, EXIT_POST_ONLY, EXIT_RECON, EXIT_SWEEP, EXIT_TTL, E_MARGIN, E_MARK, E_OPEN, E_POSITION, ORD0,
@@ -185,11 +223,15 @@ use crate::bn_demo::{
 };
 use crate::bn_probe::{ceil_tick, eapi_info, opt_index_1e6, opt_touch, pick_row, OptRow};
 use crate::bn_live::{bind_options, bind_table, BindSet, OptSet};
-use crate::bn_ops::{flatten, OpsSpec, Reach, DEFAULT_LEVERAGE_CAP};
+use crate::bn_ops::{flatten, OpsSpec, Reach, DEFAULT_LEVERAGE_CAP, EXIT_OPS_UNCONFIRMED};
 use crate::exec_boot::route_aliases;
 
 /// The slot the battery's orders carry (the arm's ids name it, E-9): the
-/// slot the loopback rig uses; Demo is the battery's alone.
+/// slot the loopback rig uses. Demo's account is the battery's alone; on
+/// mainnet (`--bn-mainnet`) it is the live account the engine trades —
+/// shared with no order of the engine's while its Binance arm is dark
+/// (O-BX6; runbook §13's checklist), and the end judges the run's epoch
+/// alone.
 pub const SLOT: u8 = 2;
 /// The engine's fill-lane size (lane 4 as the engine builds it).
 const FILL_N: usize = engine::FILL_RING_SIZE;
@@ -288,6 +330,27 @@ const BAR_RECONS_SPOT: u32 = 2;
 /// reconciliations (fills reported, not required: module docs).
 const BAR_OPT_SIDE: u32 = 2;
 const BAR_RECONS_OPT: u32 = 2;
+/// **BX13 — R0's counts on mainnet** (plan §5 BX13; the operator's ruling
+/// R-2 for options): USDⓈ-M's maker cycles (the product that rests) and
+/// its round trips (≥ [`R0_FILLS`] fills); the IoC-only products' round
+/// trips — COIN-M's and spot's 20, options' 4 (2 LONG, 2 SHORT).
+const R0_UM_CYCLES: u32 = 20;
+const R0_UM_PAIRS: u32 = 3;
+const R0_CM_PAIRS: u32 = 20;
+const R0_SPOT_CYCLES: u32 = 20;
+const R0_OPT_CYCLES: u32 = 4;
+/// R0's fills per product, and its consecutive clean reconciliations.
+const R0_FILLS: u32 = 5;
+const R0_STREAK: u32 = 3;
+/// BX13: the router's day cap on mainnet, USD ×1e6 — R0's buying at the
+/// rows' minimums is some 3 000 USD; the Demo cap (100 000) is Demo's.
+const CAP_DAY_MAINNET_USD_1E6: i64 = 20_000_000_000;
+// BX13: mainnet's day cap is tighter than Demo's, and R0's round trips
+// fill R0's fills (two a round trip) on the products whose bar counts both.
+const _: () = {
+    assert!(CAP_DAY_MAINNET_USD_1E6 > 0 && CAP_DAY_MAINNET_USD_1E6 < CAP_DAY_USD_1E6);
+    assert!(2 * R0_UM_PAIRS >= R0_FILLS && 2 * R0_OPT_CYCLES >= R0_FILLS);
+};
 /// BX9: the options row's id (the chain's first, as the engine allocates).
 const OPT_SYM: SymbolId = make_symbol_id(VenueId::Binance, core_config::universe::BN_OPT_ORDINAL_BASE + 1);
 /// The options row's underlying (`bn_probe::pick_row`'s).
@@ -362,6 +425,45 @@ pub struct BatterySpec {
     pub rotate_s: u64,
     /// BX11: a drill instead of the phases (`--bn-drill`).
     pub drill: Option<Drill>,
+    /// BX13: the R0 ramp on MAINNET (`--bn-mainnet`) — the live key, the
+    /// live account, R0's counts and bar (module docs).
+    pub mainnet: bool,
+    /// BX13: the operator's word (`--bn-confirm-mainnet`): without it a
+    /// mainnet run reads, prints its plan and sends nothing (exit 64).
+    pub confirm: bool,
+}
+
+/// **The run's counts** (BX13): Demo's are the operator's flags; mainnet's
+/// are R0's ([`Counts::of`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Counts {
+    um_cycles: u32,
+    um_pairs: u32,
+    cm_pairs: u32,
+    spot_cycles: u32,
+    opt_cycles: u32,
+}
+
+impl Counts {
+    const fn of(spec: &BatterySpec) -> Self {
+        if spec.mainnet {
+            Self {
+                um_cycles: R0_UM_CYCLES,
+                um_pairs: R0_UM_PAIRS,
+                cm_pairs: R0_CM_PAIRS,
+                spot_cycles: R0_SPOT_CYCLES,
+                opt_cycles: R0_OPT_CYCLES,
+            }
+        } else {
+            Self {
+                um_cycles: spec.cycles,
+                um_pairs: spec.fill_pairs,
+                cm_pairs: spec.fill_pairs,
+                spot_cycles: spec.cycles,
+                opt_cycles: spec.cycles,
+            }
+        }
+    }
 }
 
 /// **BX11 — the battery's drills** (`--bn-drill`).
@@ -451,6 +553,14 @@ impl BatterySpec {
         if self.drill == Some(Drill::Flatten) && (self.um == self.cm || self.spot) {
             return Err(String::from("--bn-drill flatten takes one futures product (`--binance um` or `--binance cm`)"));
         }
+        // BX13: the word names the reach — never a word without it; and the
+        // flatten drill is no R0 bar (ruling R-1): Demo's alone.
+        if self.confirm && !self.mainnet {
+            return Err(String::from("--bn-confirm-mainnet is the word for --bn-mainnet: without the reach there is nothing to confirm"));
+        }
+        if self.mainnet && self.drill == Some(Drill::Flatten) {
+            return Err(String::from("--bn-drill flatten is Demo's: R0's drill on mainnet is the gap drill's"));
+        }
         Ok(())
     }
 }
@@ -461,6 +571,40 @@ impl BatterySpec {
 /// BUY is judged on the whole holding, the adopted balance included.
 const fn instance_cap_1e6(adopt_usd: i64) -> i64 {
     CAP_INSTANCE_USD_1E6.saturating_add(adopt_usd.saturating_mul(1_000_000))
+}
+
+/// BX13: the router's day cap — mainnet's ([`CAP_DAY_MAINNET_USD_1E6`]) or
+/// Demo's.
+const fn day_cap_1e6(spec: &BatterySpec) -> i64 {
+    if spec.mainnet {
+        CAP_DAY_MAINNET_USD_1E6
+    } else {
+        CAP_DAY_USD_1E6
+    }
+}
+
+/// **The battery's key and hosts** (BX13): Demo's (`demo_config`) or,
+/// with `--bn-mainnet`, the engine's own key (`BINANCE_*`: Ed25519, or the
+/// HMAC pair under `--bn-hmac`) on mainnet's hosts — every one checked
+/// mainnet's here, where the battery dials (BX-16), as `demo_config`
+/// checks Demo's.
+///
+/// # Errors
+/// A variable missing or malformed (its NAME, never its value), or a host
+/// off the network.
+fn battery_config(spec: &BatterySpec) -> Result<BnConfig, String> {
+    if !spec.mainnet {
+        return demo_config(spec.hmac);
+    }
+    let kind = if spec.hmac { "HMAC" } else { "Ed25519" };
+    let cfg = if spec.hmac { BnConfig::from_env_hmac(Scope::Live) } else { BnConfig::from_env(Scope::Live) }.map_err(|e| {
+        format!(
+            "the live {kind} key: {e:?} — scripts/exec-smoke.sh exports the BINANCE_* variables from the operator's .env \
+             (MULTIVENUE_ENV_FILE)"
+        )
+    })?;
+    hosts_on(&cfg, Network::Mainnet)?;
+    Ok(cfg)
 }
 
 /// **The boot's refusal as the battery reports it**: the permission
@@ -484,7 +628,7 @@ fn boot_refused(e: BootErr, adopt_usd: i64) -> Fail {
             EXIT_BOOT,
             format!(
                 "the boot refused to adopt {} USD of held balance or positions past the adoption cap ({adopt_usd} USD) — \
-                 raise --bn-adopt-usd, or move the asset off the Demo account",
+                 raise --bn-adopt-usd, or move the asset off the account",
                 usd / 1_000_000
             ),
         ),
@@ -546,6 +690,36 @@ struct Report {
     /// ×1e6 — and the drift legs of the gateway's last verdict.
     last_recon: Option<(bool, i64)>,
     drift_legs: u64,
+    /// BX13: round trips completed whole, by product (an open and its
+    /// close, each leg proven by an agreeing reconciliation).
+    trips: [u32; 4],
+    /// BX13: options' round trips that filled, LONG and SHORT (R-2).
+    opt_trips_long: u32,
+    opt_trips_short: u32,
+    /// BX13: the longest run of consecutive clean reconciliations
+    /// ([`clean_streak`]).
+    streak: u32,
+    /// BX13: the `J_MARGIN` samples, by product.
+    margins: [u32; 4],
+    /// BX13: the trades journaled (a `J_FILL` that is a trade: not
+    /// booked unseen, adopted or lost) and the `J_FEE` records whose asset
+    /// is unjudged ([`FEE_ASSET_NONE`]) or BNB.
+    trades: u64,
+    fees_unjudged: u64,
+    fees_bnb: u64,
+    /// BX13 (the risk review's round 2): per order, its trades past its
+    /// `J_FEE` rows and its rows past its trades, summed ([`fee_gaps`]) —
+    /// a fee missing on one order and doubled on another never cancel.
+    fees_short: u64,
+    fees_extra: u64,
+    /// BX13: the arm's scan failures at the end.
+    scan_failed: u64,
+    /// BX13 (the risk review): fills booked without their trade report
+    /// (`J_FILL_UNSEEN`) — the streams lost a trade; R0 wants none.
+    unseen: u64,
+    /// BX13: a mainnet run without the word — read, the plan printed,
+    /// nothing sent (exit 64).
+    unconfirmed: bool,
 }
 
 impl Report {
@@ -566,45 +740,185 @@ impl Report {
     }
 }
 
-/// **The plan's bar, absolute** (BX7b §3.4) — whatever the spec asked: the
-/// first short count's phase code and why, `None` when met. USDⓈ-M: 10
-/// maker cycles, a post-only refusal, a TTL cancel, 6 fills, 3 agreeing
-/// reconciliations, a halt's sweep. COIN-M: the maker refused, 4 fills, 2
-/// reconciliations. Spot (BX8): an order routed through the alias, 4
-/// fills, 2 reconciliations. Options (BX9): 2 LONG and 2 SHORT IoCs
-/// answered, 2 reconciliations.
+/// **One bar** (BX13): its product's word, what it counts, the count and
+/// its bound — at least `want`, or at most it (`most`) — and the code of
+/// the phase it belongs to.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Bar {
+    on: bool,
+    product: &'static str,
+    what: &'static str,
+    have: u64,
+    want: u64,
+    most: bool,
+    code: u8,
+}
+
+impl Bar {
+    const fn least(on: bool, product: &'static str, what: &'static str, have: u64, want: u32, code: u8) -> Self {
+        Self { on, product, what, have, want: want as u64, most: false, code }
+    }
+
+    const fn most(on: bool, product: &'static str, what: &'static str, have: u64, want: u64, code: u8) -> Self {
+        Self { on, product, what, have, want, most: true, code }
+    }
+
+    const fn met(&self) -> bool {
+        if self.most {
+            self.have <= self.want
+        } else {
+            self.have >= self.want
+        }
+    }
+}
+
+/// **The plan's Demo bar, absolute** (BX7b §3.4) — whatever the spec
+/// asked. USDⓈ-M: 10 maker cycles, a post-only refusal, a TTL cancel, 6
+/// fills, 3 agreeing reconciliations, a halt's sweep. COIN-M: the maker
+/// refused, 4 fills, 2 reconciliations. Spot (BX8): an order routed
+/// through the alias, 4 fills, 2 reconciliations. Options (BX9): 2 LONG
+/// and 2 SHORT IoCs answered, 2 reconciliations.
+fn demo_bars(spec: &BatterySpec, rep: &Report) -> [Bar; 15] {
+    let (um, cm, sp, op) = (PRODUCT_USDM as usize, PRODUCT_COINM as usize, PRODUCT_SPOT as usize, PRODUCT_OPTIONS as usize);
+    let n = |v: u32| u64::from(v);
+    [
+        Bar::least(spec.um, "usdm", "maker cycles", n(rep.cycles), BAR_CYCLES, EXIT_CYCLE),
+        Bar::least(spec.um, "usdm", "post-only refusals", n(rep.post_only), 1, EXIT_POST_ONLY),
+        Bar::least(spec.um, "usdm", "TTL cancels", n(rep.ttl), 1, EXIT_TTL),
+        Bar::least(spec.um, "usdm", "USDⓈ-M fills", n(rep.fills[um]), BAR_FILLS_UM, EXIT_FILLS),
+        Bar::least(spec.um, "usdm", "USDⓈ-M agreeing reconciliations", n(rep.recons[um]), BAR_RECONS_UM, EXIT_RECON),
+        Bar::least(spec.um, "usdm", "halt sweeps", n(rep.sweeps), 1, EXIT_SWEEP),
+        Bar::least(spec.cm, "coinm", "COIN-M maker refusals", u64::from(rep.cm_maker_refused), 1, EXIT_FILLS),
+        Bar::least(spec.cm, "coinm", "COIN-M fills", n(rep.fills[cm]), BAR_FILLS_CM, EXIT_FILLS),
+        Bar::least(spec.cm, "coinm", "COIN-M agreeing reconciliations", n(rep.recons[cm]), BAR_RECONS_CM, EXIT_RECON),
+        Bar::least(spec.spot, "spot", "spot orders routed through the alias", n(rep.alias), 1, EXIT_FILLS),
+        Bar::least(spec.spot, "spot", "spot fills", n(rep.fills[sp]), BAR_FILLS_SPOT, EXIT_FILLS),
+        Bar::least(spec.spot, "spot", "spot agreeing reconciliations", n(rep.recons[sp]), BAR_RECONS_SPOT, EXIT_RECON),
+        Bar::least(spec.options, "options", "options LONG IoCs answered", n(rep.opt_long), BAR_OPT_SIDE, EXIT_FILLS),
+        Bar::least(spec.options, "options", "options SHORT IoCs answered", n(rep.opt_short), BAR_OPT_SIDE, EXIT_FILLS),
+        Bar::least(spec.options, "options", "options agreeing reconciliations", n(rep.recons[op]), BAR_RECONS_OPT, EXIT_RECON),
+    ]
+}
+
+/// **BX13 — the R0 bar on mainnet** (plan §5 BX13; module docs): per
+/// product armed, its count and ≥ [`R0_FILLS`] fills beside the Demo
+/// bar's own proofs; for the run, the journal whole (no record dropped),
+/// ≥ [`R0_STREAK`] consecutive clean reconciliations, every fill booked
+/// from its trade report (none unseen), one `J_FEE` a trade, order by
+/// order ([`fee_gaps`]), with its asset judged, a margin sample for each
+/// futures product and options, no scan failure, no fill lost.
+fn r0_bars(spec: &BatterySpec, rep: &Report) -> [Bar; 26] {
+    let (um, cm, sp, op) = (PRODUCT_USDM as usize, PRODUCT_COINM as usize, PRODUCT_SPOT as usize, PRODUCT_OPTIONS as usize);
+    let n = |v: u32| u64::from(v);
+    let any = spec.um || spec.cm || spec.spot || spec.options;
+    [
+        Bar::least(spec.um, "usdm", "maker cycles", n(rep.cycles), R0_UM_CYCLES, EXIT_CYCLE),
+        Bar::least(spec.um, "usdm", "post-only refusals", n(rep.post_only), 1, EXIT_POST_ONLY),
+        Bar::least(spec.um, "usdm", "TTL cancels", n(rep.ttl), 1, EXIT_TTL),
+        Bar::least(spec.um, "usdm", "fills", n(rep.fills[um]), R0_FILLS, EXIT_FILLS),
+        Bar::least(spec.um, "usdm", "halt sweeps", n(rep.sweeps), 1, EXIT_SWEEP),
+        Bar::least(spec.um, "usdm", "margin samples", n(rep.margins[um]), 1, EXIT_RECON),
+        Bar::least(spec.cm, "coinm", "maker refusals", u64::from(rep.cm_maker_refused), 1, EXIT_FILLS),
+        Bar::least(spec.cm, "coinm", "IoC round trips", n(rep.trips[cm]), R0_CM_PAIRS, EXIT_FILLS),
+        Bar::least(spec.cm, "coinm", "fills", n(rep.fills[cm]), R0_FILLS, EXIT_FILLS),
+        Bar::least(spec.cm, "coinm", "margin samples", n(rep.margins[cm]), 1, EXIT_RECON),
+        Bar::least(spec.spot, "spot", "orders routed through the alias", n(rep.alias), 1, EXIT_FILLS),
+        Bar::least(spec.spot, "spot", "IoC round trips", n(rep.spot_cycles), R0_SPOT_CYCLES, EXIT_FILLS),
+        Bar::least(spec.spot, "spot", "fills", n(rep.fills[sp]), R0_FILLS, EXIT_FILLS),
+        Bar::least(spec.options, "options", "LONG round trips", n(rep.opt_trips_long), R0_OPT_CYCLES / 2, EXIT_FILLS),
+        Bar::least(spec.options, "options", "SHORT round trips", n(rep.opt_trips_short), R0_OPT_CYCLES / 2, EXIT_FILLS),
+        Bar::least(spec.options, "options", "fills", n(rep.fills[op]), R0_FILLS, EXIT_FILLS),
+        Bar::least(spec.options, "options", "margin samples", n(rep.margins[op]), 1, EXIT_RECON),
+        // The journal whole first: every other run bar reads it.
+        Bar::most(any, "run", "records dropped (the journal, the battery's own)", rep.journal_dropped + rep.recs_dropped + rep.fills_dropped, 0, EXIT_RECON),
+        Bar::least(any, "run", "consecutive clean reconciliations", n(rep.streak), R0_STREAK, EXIT_RECON),
+        Bar::least(any, "run", "trades journaled", rep.trades, 1, EXIT_FILLS),
+        Bar::most(any, "run", "fills booked without their trade report", rep.unseen, 0, EXIT_FILLS),
+        Bar::most(any, "run", "trades past their order's J_FEE rows", rep.fees_short, 0, EXIT_FILLS),
+        Bar::most(any, "run", "J_FEE rows past their order's trades", rep.fees_extra, 0, EXIT_FILLS),
+        Bar::most(any, "run", "J_FEE rows with the asset unjudged", rep.fees_unjudged, 0, EXIT_FILLS),
+        Bar::most(any, "run", "scan failures", rep.scan_failed, 0, EXIT_RECON),
+        Bar::most(any, "run", "fills lost", rep.fills_lost, 0, EXIT_FILLS),
+    ]
+}
+
+/// **The bar, absolute** — Demo's ([`demo_bars`]) or, on mainnet, R0's
+/// ([`r0_bars`]): the first short bar's phase code and why, `None` when
+/// met. A drill is its own bar: its verdict is the run's code.
 fn bar_short(spec: &BatterySpec, rep: &Report) -> Option<(u8, String)> {
-    // A drill is its own bar: its verdict is the run's code.
     if spec.drill.is_some() {
         return None;
     }
-    let (um, cm, sp, op) = (PRODUCT_USDM as usize, PRODUCT_COINM as usize, PRODUCT_SPOT as usize, PRODUCT_OPTIONS as usize);
-    let need: [(bool, u32, u32, u8, &str); 15] = [
-        (spec.um, rep.cycles, BAR_CYCLES, EXIT_CYCLE, "maker cycles"),
-        (spec.um, rep.post_only, 1, EXIT_POST_ONLY, "post-only refusals"),
-        (spec.um, rep.ttl, 1, EXIT_TTL, "TTL cancels"),
-        (spec.um, rep.fills[um], BAR_FILLS_UM, EXIT_FILLS, "USDⓈ-M fills"),
-        (spec.um, rep.recons[um], BAR_RECONS_UM, EXIT_RECON, "USDⓈ-M agreeing reconciliations"),
-        (spec.um, rep.sweeps, 1, EXIT_SWEEP, "halt sweeps"),
-        (spec.cm, u32::from(rep.cm_maker_refused), 1, EXIT_FILLS, "COIN-M maker refusals"),
-        (spec.cm, rep.fills[cm], BAR_FILLS_CM, EXIT_FILLS, "COIN-M fills"),
-        (spec.cm, rep.recons[cm], BAR_RECONS_CM, EXIT_RECON, "COIN-M agreeing reconciliations"),
-        (spec.spot, rep.alias, 1, EXIT_FILLS, "spot orders routed through the alias"),
-        (spec.spot, rep.fills[sp], BAR_FILLS_SPOT, EXIT_FILLS, "spot fills"),
-        (spec.spot, rep.recons[sp], BAR_RECONS_SPOT, EXIT_RECON, "spot agreeing reconciliations"),
-        (spec.options, rep.opt_long, BAR_OPT_SIDE, EXIT_FILLS, "options LONG IoCs answered"),
-        (spec.options, rep.opt_short, BAR_OPT_SIDE, EXIT_FILLS, "options SHORT IoCs answered"),
-        (spec.options, rep.recons[op], BAR_RECONS_OPT, EXIT_RECON, "options agreeing reconciliations"),
-    ];
+    if spec.mainnet {
+        first_short(&r0_bars(spec, rep))
+    } else {
+        first_short(&demo_bars(spec, rep))
+    }
+}
+
+/// The first bar armed and short: its code and why.
+fn first_short(bars: &[Bar]) -> Option<(u8, String)> {
     let mut i = 0;
-    while i < need.len() {
-        let (on, have, want, code, what) = need[i];
-        if on && have < want {
-            return Some((code, format!("short of the bar: {have} {what} of {want}")));
+    while i < bars.len() {
+        let b = &bars[i];
+        if b.on && !b.met() {
+            let bound = if b.most { "at most" } else { "of" };
+            return Some((b.code, format!("short of the bar: {} {} {} {bound} {}", b.have, b.product, b.what, b.want)));
         }
         i += 1;
     }
     None
+}
+
+/// **BX13 — the longest run of consecutive clean reconciliations** in the
+/// journal: reconciled (`code` 1), no drift (`a`), no unseen leg (`b`),
+/// no foreign order (`c`). Any other verdict ends a run — a held one
+/// (`J_RECON_HELD`) too: inconclusive is not clean.
+fn clean_streak(recs: &[ExecRecord]) -> u32 {
+    let (mut run, mut best) = (0u32, 0u32);
+    for r in recs.iter().filter(|r| r.kind == J_RECON) {
+        if r.code == 1 && r.a == 0 && r.b == 0 && r.c == 0 {
+            run += 1;
+            best = best.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    best
+}
+
+/// **BX13 — a `J_FILL` that is a trade**: not booked without its trade
+/// (unseen), not adopted at boot, not lost (BX-14's trade statistics; a
+/// trade has exactly one `J_FEE`).
+const fn is_trade(r: &ExecRecord) -> bool {
+    r.kind == J_FILL && r.code & (J_FILL_UNSEEN | J_FILL_ADOPTED | J_FILL_LOST) == 0
+}
+
+/// **BX13 — each order's trades against its `J_FEE` rows** (the risk
+/// review's round 2): per order — its placement id, a modify's new id read
+/// as it (`renames`: an order in the table books under its current id, an
+/// ended one under its placement id — the risk review's round 3); a
+/// settlement's fill and fee both name 0; a fee read from `myTrades`
+/// names 0 and its fill is booked unseen, short on its own bar — the
+/// trades past their fees and the fees past their trades, summed over the
+/// orders. Run totals would let one order's missing fee and another's
+/// doubled one cancel.
+fn fee_gaps(recs: &[ExecRecord], renames: &[(u64, u64)]) -> (u64, u64) {
+    let mut by: std::collections::BTreeMap<u64, (u64, u64)> = std::collections::BTreeMap::new();
+    for r in recs {
+        if is_trade(r) {
+            by.entry(placement_of(renames, r.client_oid)).or_default().0 += 1;
+        } else if r.kind == J_FEE {
+            by.entry(placement_of(renames, r.client_oid)).or_default().1 += 1;
+        }
+    }
+    by.values().fold((0, 0), |(short, extra), &(trades, fees)| (short + trades.saturating_sub(fees), extra + fees.saturating_sub(trades)))
+}
+
+/// The placement id an order's `oid` names: its own, or — a modify's new
+/// id — the one it renamed.
+fn placement_of(renames: &[(u64, u64)], oid: u64) -> u64 {
+    renames.iter().find(|r| r.0 == oid).map_or(oid, |r| r.1)
 }
 
 /// One JSON line on stdout: `{"phase":…, …}` (the exec-smoke law).
@@ -652,8 +966,10 @@ struct Tap {
 }
 
 impl Tap {
-    fn spawn(host: &str, path: String, tls: Arc<ClientConfig>) -> Result<Self, String> {
-        let mut ws = Ws::open(host, &path, tls, Duration::from_secs(10)).map_err(|e| format!("the tap: {e}"))?;
+    /// On `host` of `cfg`'s network (BX13: mainnet's on the R0 run — a
+    /// stream carries what the venue pushes; nothing is sent on it).
+    fn spawn(cfg: &BnConfig, host: &str, path: String, tls: Arc<ClientConfig>) -> Result<Self, String> {
+        let mut ws = Ws::open_on(cfg, host, &path, tls, Duration::from_secs(10)).map_err(|e| format!("the tap: {e}"))?;
         let log = Arc::new(Mutex::new(TapLog { frames: Vec::with_capacity(4_096), ..TapLog::default() }));
         let stop = Arc::new(AtomicBool::new(false));
         let (kept, s) = (Arc::clone(&log), Arc::clone(&stop));
@@ -777,6 +1093,16 @@ struct Battery {
     gw_killed: bool,
     /// The TLS configuration (BX11: the flatten drill's own client).
     tls: Arc<ClientConfig>,
+    /// BX13: the operator's sealed word, held for a mainnet run — the
+    /// REST changes the battery makes itself (the tap's listenKey, the
+    /// drill's cancels) leave only signed with it. `None` on Demo.
+    word: Option<MainnetVerb>,
+    /// BX13: the run's counts ([`Counts::of`]).
+    counts: Counts,
+    /// BX13 (the risk review's round 3): each modify's new id and its
+    /// order's placement id — a modified order's fill and fee may name
+    /// either ([`fee_gaps`] reads them as one order).
+    renames: Vec<(u64, u64)>,
 }
 
 /// **Run the battery** (module docs): the exit code.
@@ -786,13 +1112,22 @@ pub fn run(spec: &BatterySpec, tls: Arc<ClientConfig>) -> u8 {
         error!("binance-battery: {e}");
         return 1;
     }
+    if spec.mainnet {
+        warn!("binance-battery: MAINNET — the R0 ramp on the LIVE account with the engine's key: every order is real money");
+    }
     match Battery::prepare(spec, tls) {
-        Ok(mut b) => {
+        Ok(Some(mut b)) => {
             if let Err((code, why)) = b.phases(&mut rep) {
                 let why = if crate::sigint::shutdown_requested() { format!("{STOPPED} ({why})") } else { why };
                 rep.fail(code, why);
             }
             b.end(&mut rep);
+        }
+        // BX13: mainnet without the word — read, planned, nothing sent.
+        Ok(None) => {
+            rep.unconfirmed = true;
+            rep.code = EXIT_OPS_UNCONFIRMED;
+            rep.why = String::from("no --bn-confirm-mainnet: the reads and the plan only; nothing was sent");
         }
         Err((code, why)) => rep.fail(code, why),
     }
@@ -806,9 +1141,40 @@ fn summary(spec: &BatterySpec, rep: &mut Report) -> u8 {
         }
     }
     let code = rep.exit();
+    // BX13: the R0 record — one line a bar armed, met or short.
+    if spec.mainnet && !rep.unconfirmed {
+        if spec.drill.is_none() {
+            let bars = r0_bars(spec, rep);
+            let mut i = 0;
+            while i < bars.len() {
+                let b = &bars[i];
+                if b.on {
+                    phase("r0")
+                        .s("product", b.product)
+                        .s("bar", b.what)
+                        .n("have", count(b.have))
+                        .n("want", count(b.want))
+                        .s("bound", if b.most { "at_most" } else { "at_least" })
+                        .b("met", b.met())
+                        .emit();
+                }
+                i += 1;
+            }
+        } else if spec.drill == Some(Drill::Gap) {
+            phase("r0")
+                .s("product", "usdm")
+                .s("bar", "the dead-man fired")
+                .n("have", rep.drill_fired_ms.map_or(-1, |ms| ms as i64))
+                .n("want", COUNTDOWN_MS as i64)
+                .s("bound", "fired_after_ms")
+                .b("met", rep.drill_fired_ms.is_some() && code == 0)
+                .emit();
+        }
+    }
     phase("END")
         .n("exit", i64::from(code))
         .b("bar_met", code == 0)
+        .s("network", if spec.mainnet { "mainnet" } else { "demo" })
         .s("route", if spec.rest || spec.options { "rest" } else { "ws" })
         .s("signing", if spec.hmac { "hmac" } else { "ed25519" })
         .n("cycles", i64::from(rep.cycles))
@@ -843,14 +1209,35 @@ fn summary(spec: &BatterySpec, rep: &mut Report) -> u8 {
         .n("fills_journaled", count(rep.fills_journaled))
         .n("fees_journaled", count(rep.fees_journaled))
         .n("drill_fired_ms", rep.drill_fired_ms.map_or(-1, |ms| ms as i64))
+        .n("trips_usdm", i64::from(rep.trips[PRODUCT_USDM as usize]))
+        .n("trips_coinm", i64::from(rep.trips[PRODUCT_COINM as usize]))
+        .n("options_trips_long", i64::from(rep.opt_trips_long))
+        .n("options_trips_short", i64::from(rep.opt_trips_short))
+        .n("clean_streak", i64::from(rep.streak))
+        .n("margins_usdm", i64::from(rep.margins[PRODUCT_USDM as usize]))
+        .n("margins_coinm", i64::from(rep.margins[PRODUCT_COINM as usize]))
+        .n("margins_options", i64::from(rep.margins[PRODUCT_OPTIONS as usize]))
+        .n("trades", count(rep.trades))
+        .n("fees_short", count(rep.fees_short))
+        .n("fees_extra", count(rep.fees_extra))
+        .n("fees_unjudged", count(rep.fees_unjudged))
+        .n("fees_bnb", count(rep.fees_bnb))
+        .n("scan_failed", count(rep.scan_failed))
+        .n("fills_unseen", count(rep.unseen))
         .s("why", &rep.why)
         .s("left", &rep.left.join(" | "))
         .emit();
     for k in &rep.k2 {
         info!("binance-battery K2: {k}");
     }
-    if code == EXIT_LEFTOVER {
-        error!(left = ?rep.left, "binance-battery: SOMETHING WAS LEFT ON THE DEMO ACCOUNT");
+    let account = if spec.mainnet { "LIVE (MAINNET) ACCOUNT — REAL MONEY" } else { "DEMO ACCOUNT" };
+    if rep.unconfirmed {
+        warn!(
+            "binance-battery: MAINNET without --bn-confirm-mainnet — the live account was read and the plan is printed above; \
+             NOTHING was sent (exit 64)"
+        );
+    } else if code == EXIT_LEFTOVER {
+        error!(left = ?rep.left, "binance-battery: SOMETHING WAS LEFT ON THE {account}");
     } else if code == EXIT_PERMISSION {
         warn!(
             why = %rep.why,
@@ -859,6 +1246,8 @@ fn summary(spec: &BatterySpec, rep: &mut Report) -> u8 {
         );
     } else if code != 0 {
         error!(code, why = %rep.why, "binance-battery: FAILED");
+    } else if spec.mainnet {
+        info!("binance-battery: PASSED — R0's bar is met (the `r0` lines above are its record); nothing left on the {account}");
     } else {
         info!("binance-battery: PASSED — the plan's bar is met; nothing left on the Demo account");
     }
@@ -870,7 +1259,9 @@ impl Battery {
     // 0–1. The account, the composition, the boot
     // ---------------------------------------------------------------------
 
-    fn prepare(spec: &BatterySpec, tls: Arc<ClientConfig>) -> Result<Self, Fail> {
+    /// The account, the composition and the boot — `None` for a mainnet
+    /// run without the operator's word: read and planned, nothing sent.
+    fn prepare(spec: &BatterySpec, tls: Arc<ClientConfig>) -> Result<Option<Self>, Fail> {
         let acct = |e: String| (EXIT_ACCOUNT, e);
         let stopped = || {
             if crate::sigint::shutdown_requested() {
@@ -879,11 +1270,12 @@ impl Battery {
                 Ok(())
             }
         };
-        let cfg = demo_config(spec.hmac).map_err(acct)?;
+        let cfg = battery_config(spec).map_err(acct)?;
         // BX9 (Q-1): options sign with the scope's HMAC pair — the arm's own
         // key under `--bn-hmac`, else read for the options lane alone.
         let cfg = if spec.options && !spec.hmac {
-            cfg.with_options_hmac_env().map_err(|e| acct(format!("the options key (the Demo HMAC pair): {e:?}")))?
+            let (k, _) = cfg.scope().hmac_vars();
+            cfg.with_options_hmac_env().map_err(|e| acct(format!("the options key (the scope's HMAC pair, {k}): {e:?}")))?
         } else {
             cfg
         };
@@ -896,7 +1288,7 @@ impl Battery {
                 continue;
             }
             stopped()?;
-            let d = discover(&cfg, product, &tls).map_err(acct)?;
+            let d = discover_ops(&cfg, product, &tls).map_err(acct)?;
             discs.push((product, symbol.to_ascii_uppercase(), d, make_symbol_id(VenueId::Binance, ord)));
         }
         // BX8: the spot symbol is the battery's spot[0] — the M1 anchor,
@@ -912,11 +1304,11 @@ impl Battery {
         let mut to_adopt = 0u32;
         for (product, symbol, d, sym) in &discs {
             stopped()?;
-            let row = *d.find(symbol.as_bytes()).ok_or_else(|| acct(format!("Demo lists no {symbol}")))?;
-            let mut rest = Rest::new(&cfg, *product, tls.clone()).map_err(acct)?;
+            let row = *d.find(symbol.as_bytes()).ok_or_else(|| acct(format!("the venue lists no {symbol}")))?;
+            let mut rest = Rest::ops(&cfg, *product, tls.clone()).map_err(acct)?;
             let (offset, rtt) = rest.clock().map_err(acct)?;
             phase("clock").s("host", rest.host()).n("offset_ms", offset).n("rtt_ms", rtt as i64).emit();
-            let public = Public::new(&cfg, *product, tls.clone()).map_err(acct)?;
+            let public = Public::ops(&cfg, *product, tls.clone()).map_err(acct)?;
             let (spot, descriptor) = if *product == PRODUCT_SPOT {
                 let leg = spot_account_check(&mut rest, &signer, symbol, &row).map_err(acct)?;
                 to_adopt += u32::from(leg.base0_1e8 >= 100);
@@ -938,7 +1330,7 @@ impl Battery {
             phase("clock").s("host", rest.host()).n("offset_ms", offset).n("rtt_ms", rtt as i64).emit();
             let info = eapi_info(&tls, rest.host()).map_err(|e| acct(format!("eapi's exchangeInfo: {e}")))?;
             let row = pick_row(&mut rest, &info).map_err(acct)?;
-            let h = cfg.opt_hmac().ok_or_else(|| acct(String::from("no options key (Q-1: the Demo HMAC pair)")))?;
+            let h = cfg.opt_hmac().ok_or_else(|| acct(String::from("no options key (Q-1: the scope's HMAC pair)")))?;
             exec_binance::config::hmac_self_test().map_err(|e| acct(format!("the options key's self-test: {e:?}")))?;
             opt_account_check(&mut rest, h).map_err(acct)?;
             phase("options_row")
@@ -982,13 +1374,45 @@ impl Battery {
             lanes.push(LaneB { product: PRODUCT_OPTIONS, symbol: row.symbol.clone(), sym: OPT_SYM, rest, public: None, h, c, spot: None, opt: Some(row) });
         }
 
+        // BX13: the plan — and on mainnet without the operator's word,
+        // nothing more: the reads above sent nothing.
+        let counts = Counts::of(spec);
+        for lane in &lanes {
+            phase("plan")
+                .s("network", if spec.mainnet { "mainnet" } else { "demo" })
+                .s("product", product_word(lane.product))
+                .s("symbol", &lane.symbol)
+                .n("tick_1e6", i64::from(lane.h.tick_1e6))
+                .n("step_1e6", i64::from(lane.h.step_1e6))
+                .n("min_notional_1e6", lane.h.min_notional_1e6)
+                .n("usd", spec.usd)
+                .n("um_cycles", i64::from(counts.um_cycles))
+                .n("um_pairs", i64::from(counts.um_pairs))
+                .n("cm_pairs", i64::from(counts.cm_pairs))
+                .n("spot_cycles", i64::from(counts.spot_cycles))
+                .n("options_cycles", i64::from(counts.opt_cycles))
+                .n("cap_order_usd", CAP_ORDER_USD_1E6 / 1_000_000)
+                .n("cap_instance_usd", instance_cap_1e6(spec.adopt_usd) / 1_000_000)
+                .n("cap_day_usd", day_cap_1e6(spec) / 1_000_000)
+                .n("adopt_usd", spec.adopt_usd)
+                .emit();
+        }
+        let word = if spec.mainnet {
+            match MainnetVerb::operator_verb(spec.confirm) {
+                Ok(w) => Some(w),
+                Err(_) => return Ok(None),
+            }
+        } else {
+            None
+        };
+
         // The tap first: the account's listenKey (the gateway's POST returns
-        // the same one).
+        // the same one) — on mainnet a change, sent with the word.
         stopped()?;
         let tap = if spec.um {
-            let lk = lanes[0].rest.plain(T_LISTEN_KEY_NEW, b"").map_err(acct)?;
+            let lk = lanes[0].rest.plain_change(T_LISTEN_KEY_NEW, b"", word.as_ref()).map_err(acct)?;
             let key = scan_listen_key(&lk.body).map(|s| String::from_utf8_lossy(s.get(&lk.body)).into_owned()).map_err(|e| acct(format!("the tap's listenKey: {e:?}")))?;
-            match Tap::spawn(&cfg.hosts().fut_user, format!("/ws/{key}"), tls.clone()) {
+            match Tap::spawn(&cfg, &cfg.hosts().fut_user, format!("/ws/{key}"), tls.clone()) {
                 Ok(t) => Some(t),
                 Err(e) => {
                     warn!("binance-battery: {e} — K2 is not measured this run");
@@ -1069,7 +1493,7 @@ impl Battery {
                 margin: MarginBook::new(lim, prods),
                 anchor: core_time::WallAnchor::now(),
                 mode: exec_binance::mode::AccountMode::Classic,
-                demo: true,
+                demo: !spec.mainnet,
                 equity_ttl_ns: 0,
             },
         );
@@ -1079,7 +1503,7 @@ impl Battery {
                 SLOT as usize,
                 ExecMode::Live,
                 &[VenueId::Binance.to_u8()],
-                SlotCaps::new(CAP_ORDER_USD_1E6, instance_cap_1e6(spec.adopt_usd), CAP_DAY_USD_1E6, MAX_OPEN_ORDERS),
+                SlotCaps::new(CAP_ORDER_USD_1E6, instance_cap_1e6(spec.adopt_usd), day_cap_1e6(spec), MAX_OPEN_ORDERS),
                 HALT_LIMITS,
             )
             .map_err(|e| boot(format!("the route: {e:?}")))?;
@@ -1101,7 +1525,7 @@ impl Battery {
                 (gw.phase(), gw.last_sweep())
             })
             .map_err(|e| boot(format!("the gateway thread: {e}")))?;
-        Ok(Self {
+        Ok(Some(Self {
             spec: spec.clone(),
             cfg,
             signer,
@@ -1121,7 +1545,10 @@ impl Battery {
             k2_oids: Vec::with_capacity(16),
             gw_killed: false,
             tls,
-        })
+            word,
+            counts,
+            renames: Vec::with_capacity(64),
+        }))
     }
 
     // ---------------------------------------------------------------------
@@ -1355,7 +1782,10 @@ impl Battery {
             let last = self.recs.iter().rev().find(|r| r.kind == J_RECON && r.ts_ns > after_ns);
             return Err(format!(
                 "no reconciliation agreed within {RECON_WAIT:?} (last after the leg: {})",
-                last.map_or_else(|| String::from("none"), |r| format!("reconciled {} drift {} unseen {} foreign {}", r.code, r.a, r.b, r.c))
+                last.map_or_else(
+                    || String::from("none"),
+                    |r| format!("reconciled {} held {} drift {} unseen {} foreign {}", r.code & 1, r.code & J_RECON_HELD != 0, r.a, r.b, r.c)
+                )
             ));
         }
         rep.recons[product as usize] += 1;
@@ -1395,7 +1825,7 @@ impl Battery {
         }
         if self.spec.um {
             let l = self.lane(PRODUCT_USDM);
-            for i in 0..self.spec.cycles {
+            for i in 0..self.counts.um_cycles {
                 self.maker_cycle(l, i).map_err(|e| (EXIT_CYCLE, format!("cycle {i}: {e}")))?;
                 rep.cycles += 1;
             }
@@ -1415,14 +1845,15 @@ impl Battery {
                 continue;
             }
             let l = self.lane(product);
-            for k in 0..self.spec.fill_pairs {
+            let pairs = if product == PRODUCT_USDM { self.counts.um_pairs } else { self.counts.cm_pairs };
+            for k in 0..pairs {
                 self.round_trip(l, k, rep)?;
             }
         }
         // BX8: spot's cycles — before the halt's sweep, which ends ordering.
         if self.spec.spot {
             let l = self.lane(PRODUCT_SPOT);
-            for i in 0..self.spec.cycles {
+            for i in 0..self.counts.spot_cycles {
                 self.spot_cycle(l, i, rep)?;
                 rep.spot_cycles += 1;
             }
@@ -1430,7 +1861,7 @@ impl Battery {
         // BX9: options' cycles (alone on the account).
         if self.spec.options {
             let l = self.lane(PRODUCT_OPTIONS);
-            for i in 0..self.spec.cycles {
+            for i in 0..self.counts.opt_cycles {
                 self.opt_cycle(l, i, rep)?;
             }
         }
@@ -1537,12 +1968,16 @@ impl Battery {
                 } else {
                     format!("the dead-man did not cancel {left} maker(s) within {} s", deadline.as_secs())
                 };
+                // BX13: a change — on mainnet sent with the operator's word.
                 for c in &cids {
                     let lane = &mut self.lanes[l];
                     let sym = lane.symbol.clone();
-                    let a = lane.rest.signed(ORD0 + R_CANCEL, &self.signer, false, |w, st, ts| {
-                        render_by_cid(w, st, sym.as_bytes(), Part::Lit(c.as_bytes()), ts);
-                    });
+                    let a = lane
+                        .rest
+                        .sign_change(ORD0 + R_CANCEL, &self.signer, self.word.as_ref(), |w, st, ts| {
+                            render_by_cid(w, st, sym.as_bytes(), Part::Lit(c.as_bytes()), ts);
+                        })
+                        .and_then(|n| lane.rest.send(ORD0 + R_CANCEL, n));
                     warn!("binance-battery: the drill's cancel of {c}: {}", a.map_or_else(|e| e, |a| a.text()));
                 }
                 return Err(drill(why));
@@ -1587,8 +2022,8 @@ impl Battery {
         let gateway = self.kill_gateway().map_err(|e| (EXIT_CYCLE, e))?;
         phase("drill").s("drill", "flatten").s("gateway", &format!("{gateway:?}")).n("opened", opened).emit();
         let spec = OpsSpec {
-            reach: Reach::Demo,
-            confirm: false,
+            reach: if self.spec.mainnet { Reach::Mainnet } else { Reach::Demo },
+            confirm: self.word.is_some(),
             hmac: self.spec.hmac,
             product,
             symbols: vec![self.lanes[l].symbol.clone()],
@@ -1689,6 +2124,8 @@ impl Battery {
         let before = *self.arm().counters();
         let req = ModifyReq::new(prev.client_oid, m);
         self.verb(false, |d| d.modify(&req)).map_err(|e| format!("the modify: {e}"))?;
+        // The new id names the same order (refused, it names nothing).
+        self.renames.push((m.client_oid, placement_of(&self.renames, prev.client_oid)));
         let done = self.until(STEP_WAIT, |b| {
             let c = b.arm().counters();
             c.modified > before.modified || c.modifies_refused > before.modifies_refused
@@ -1822,6 +2259,7 @@ impl Battery {
         if left != 0 {
             return Err(fills(format!("the reduce-only close left {left}")));
         }
+        rep.trips[product as usize] += 1;
         Ok(())
     }
 
@@ -1959,7 +2397,7 @@ impl Battery {
                 return Err(fail(String::from("the fill moved no position in the ledger")));
             }
             closed = self.opt_close(l, rep)?;
-        } else if i % 4 == 3 || i + 1 == self.spec.cycles {
+        } else if i % 4 == 3 || i + 1 == self.counts.opt_cycles {
             self.reconciled_after(end_ns, PRODUCT_OPTIONS, rep).map_err(|e| (EXIT_RECON, e))?;
         }
         let left = self.pos(self.lanes[l].sym);
@@ -1972,6 +2410,14 @@ impl Battery {
             .emit();
         if !closed || left != 0 {
             return Err(fail(format!("the reduce-only close left {left} (closed {closed})")));
+        }
+        // BX13 (R-2): a round trip that filled, and closed whole.
+        if q != 0 {
+            if long {
+                rep.opt_trips_long += 1;
+            } else {
+                rep.opt_trips_short += 1;
+            }
         }
         Ok(())
     }
@@ -2227,13 +2673,14 @@ impl Battery {
         // A drill stopped the gateway: what the arm can no longer close or
         // cancel — a maker that filled before the dead-man fired, a
         // position the flatten drill left — the operator's own tool does,
-        // on Demo (the arm's orders by id first; a flat account is one
+        // on the battery's network (BX13: on mainnet under the word the
+        // run holds; the arm's orders by id first; a flat account is one
         // read). The flat read then judges.
         if self.gw_killed && !crate::sigint::shutdown_requested() {
             for i in 0..self.lanes.len() {
                 let spec = OpsSpec {
-                    reach: Reach::Demo,
-                    confirm: false,
+                    reach: if self.spec.mainnet { Reach::Mainnet } else { Reach::Demo },
+                    confirm: self.word.is_some(),
                     hmac: self.spec.hmac,
                     product: self.lanes[i].product,
                     symbols: vec![self.lanes[i].symbol.clone()],
@@ -2251,7 +2698,15 @@ impl Battery {
         if gw_phase != Phase::Exiting && !self.gw_killed {
             rep.fail(EXIT_SWEEP, format!("the shutdown sweep did not complete (the gateway ended {gw_phase:?})"));
         }
-        self.turn();
+        // The gateway has ended: every event it left — its exit's pulse,
+        // the tallies as they end, among them — drained before the counters
+        // are read (the risk review's round 3: one turn drains 64; the ring
+        // holds 4 096).
+        let mut k = 0;
+        while k <= EVT_RING / EVT_DRAIN_MAX {
+            self.turn();
+            k += 1;
+        }
         let c = *self.arm().counters();
         rep.reconnects = c.gw[GW_RECONNECTS];
         rep.connect_failures = c.gw[GW_CONNECT_FAILURES];
@@ -2267,6 +2722,23 @@ impl Battery {
         // `J_FEE` beside its fill (a fill booked without its trade has none).
         rep.fees_journaled = self.recs.iter().filter(|r| r.kind == J_FEE).count() as u64;
         rep.fills_journaled = self.recs.iter().filter(|r| r.kind == J_FILL).count() as u64;
+        // BX13: R0's — the trades, each fee's asset judged, the margin
+        // samples by product, the clean streak, the arm's scan failures.
+        rep.trades = self.recs.iter().filter(|r| is_trade(r)).count() as u64;
+        (rep.fees_short, rep.fees_extra) = fee_gaps(&self.recs, &self.renames);
+        for r in self.recs.iter().filter(|r| r.kind == J_FEE) {
+            let (_, asset, ..) = fee_fields(r.code);
+            rep.fees_unjudged += u64::from(asset == FEE_ASSET_NONE);
+            rep.fees_bnb += u64::from(asset == FEE_ASSET_BNB);
+        }
+        for r in self.recs.iter().filter(|r| r.kind == J_MARGIN) {
+            if let Some(m) = usize::try_from(r.code).ok().and_then(|p| rep.margins.get_mut(p)) {
+                *m += 1;
+            }
+        }
+        rep.streak = clean_streak(&self.recs);
+        rep.scan_failed = c.scan_failed;
+        rep.unseen = self.recs.iter().filter(|r| r.kind == J_FILL && r.code & J_FILL_UNSEEN != 0).count() as u64;
         let log = self.tap.take().map(|tap| {
             let (log, ended) = tap.finish();
             if let Some(e) = ended {
@@ -2807,7 +3279,176 @@ mod tests {
             ttl_ms: 5_000,
             rotate_s: 0,
             drill: None,
+            mainnet: false,
+            confirm: false,
         }
+    }
+
+    /// BX13: a mainnet spec of `products`.
+    fn mainnet(um: bool, cm: bool, spot: bool, options: bool) -> BatterySpec {
+        BatterySpec { um, cm, spot, options, mainnet: true, confirm: true, ..spec() }
+    }
+
+    /// BX13: a report as a full R0 run on every product leaves it.
+    fn r0_full() -> Report {
+        Report {
+            cycles: R0_UM_CYCLES,
+            fills: [40, 6, 40, 8],
+            recons: [20, 6, 40, 8],
+            trips: [0, 3, R0_CM_PAIRS, 0],
+            sweeps: 1,
+            ttl: 1,
+            post_only: 1,
+            cm_maker_refused: true,
+            alias: 40,
+            spot_cycles: R0_SPOT_CYCLES,
+            opt_trips_long: 2,
+            opt_trips_short: 2,
+            streak: 3,
+            margins: [0, 1, 1, 1],
+            trades: 94,
+            fees_journaled: 94,
+            ..Report::default()
+        }
+    }
+
+    /// BX13: R0's counts are fixed on mainnet whatever the flags; Demo's
+    /// are the flags'. The word names the reach; the day cap is mainnet's.
+    #[test]
+    fn the_r0_counts_and_the_word_are_mainnets() {
+        assert_eq!(
+            Counts::of(&BatterySpec { cycles: 7, fill_pairs: 2, ..spec() }),
+            Counts { um_cycles: 7, um_pairs: 2, cm_pairs: 2, spot_cycles: 7, opt_cycles: 7 }
+        );
+        assert_eq!(
+            Counts::of(&BatterySpec { cycles: 7, fill_pairs: 2, ..mainnet(true, true, true, false) }),
+            Counts { um_cycles: 20, um_pairs: 3, cm_pairs: 20, spot_cycles: 20, opt_cycles: 4 },
+            "R0's, plan §5 BX13 and ruling R-2"
+        );
+        assert!(mainnet(true, true, true, false).check().is_ok());
+        assert!(BatterySpec { confirm: false, ..mainnet(true, false, false, false) }.check().is_ok(), "the plan only");
+        assert!(BatterySpec { confirm: true, ..spec() }.check().is_err(), "a word without the reach");
+        assert!(mainnet(false, false, false, true).check().is_ok(), "options alone, on mainnet too");
+        assert!(BatterySpec { cm: false, drill: Some(Drill::Gap), ..mainnet(true, false, false, false) }.check().is_ok(), "R0's gap drill");
+        assert!(BatterySpec { cm: false, drill: Some(Drill::Flatten), ..mainnet(true, false, false, false) }.check().is_err(), "the flatten drill is Demo's");
+        assert!(mainnet(true, false, false, true).check().is_err(), "options run alone");
+        assert_eq!((day_cap_1e6(&spec()), day_cap_1e6(&mainnet(true, false, false, false))), (CAP_DAY_USD_1E6, CAP_DAY_MAINNET_USD_1E6));
+    }
+
+    /// BX13: the R0 bar, absolute — each short count its phase's code; a
+    /// product not armed is not judged; Demo's bar on Demo.
+    #[test]
+    fn the_r0_bar_is_r0s_whatever_the_spec_asked() {
+        let all = mainnet(true, true, true, false);
+        assert_eq!(bar_short(&all, &r0_full()), None);
+        let opt = mainnet(false, false, false, true);
+        assert_eq!(bar_short(&opt, &r0_full()), None);
+        let short = |sp: &BatterySpec, f: fn(&mut Report)| {
+            let mut r = r0_full();
+            f(&mut r);
+            bar_short(sp, &r).map(|(code, _)| code)
+        };
+        assert_eq!(short(&all, |r| r.cycles = R0_UM_CYCLES - 1), Some(EXIT_CYCLE));
+        assert_eq!(short(&all, |r| r.post_only = 0), Some(EXIT_POST_ONLY));
+        assert_eq!(short(&all, |r| r.ttl = 0), Some(EXIT_TTL));
+        assert_eq!(short(&all, |r| r.fills[PRODUCT_USDM as usize] = 4), Some(EXIT_FILLS));
+        assert_eq!(short(&all, |r| r.sweeps = 0), Some(EXIT_SWEEP));
+        assert_eq!(short(&all, |r| r.margins[PRODUCT_USDM as usize] = 0), Some(EXIT_RECON));
+        assert_eq!(short(&all, |r| r.cm_maker_refused = false), Some(EXIT_FILLS));
+        assert_eq!(short(&all, |r| r.trips[PRODUCT_COINM as usize] = R0_CM_PAIRS - 1), Some(EXIT_FILLS));
+        assert_eq!(short(&all, |r| r.fills[PRODUCT_COINM as usize] = 4), Some(EXIT_FILLS));
+        assert_eq!(short(&all, |r| r.margins[PRODUCT_COINM as usize] = 0), Some(EXIT_RECON));
+        assert_eq!(short(&all, |r| r.alias = 0), Some(EXIT_FILLS));
+        assert_eq!(short(&all, |r| r.spot_cycles = R0_SPOT_CYCLES - 1), Some(EXIT_FILLS));
+        assert_eq!(short(&all, |r| r.fills[PRODUCT_SPOT as usize] = 4), Some(EXIT_FILLS));
+        assert_eq!(short(&opt, |r| r.opt_trips_long = 1), Some(EXIT_FILLS));
+        assert_eq!(short(&opt, |r| r.opt_trips_short = 1), Some(EXIT_FILLS));
+        assert_eq!(short(&opt, |r| r.fills[PRODUCT_OPTIONS as usize] = 4), Some(EXIT_FILLS));
+        assert_eq!(short(&opt, |r| r.margins[PRODUCT_OPTIONS as usize] = 0), Some(EXIT_RECON));
+        // The run's own: the streak, a fee a trade with its asset judged,
+        // no scan failure, no fill lost.
+        for sp in [&all, &opt] {
+            assert_eq!(short(sp, |r| r.streak = 2), Some(EXIT_RECON));
+            assert_eq!(short(sp, |r| r.trades = 0), Some(EXIT_FILLS), "no trade journaled");
+            assert_eq!(short(sp, |r| r.fees_short = 1), Some(EXIT_FILLS), "a trade without its fee");
+            assert_eq!(short(sp, |r| r.fees_extra = 1), Some(EXIT_FILLS), "a fee twice");
+            assert_eq!(short(sp, |r| r.fees_unjudged = 1), Some(EXIT_FILLS));
+            assert_eq!(short(sp, |r| r.scan_failed = 1), Some(EXIT_RECON));
+            assert_eq!(short(sp, |r| r.fills_lost = 1), Some(EXIT_FILLS));
+            assert_eq!(short(sp, |r| r.unseen = 1), Some(EXIT_FILLS), "a fill booked without its trade report");
+            assert_eq!(short(sp, |r| r.journal_dropped = 1), Some(EXIT_RECON), "the journal not whole");
+            assert_eq!(short(sp, |r| r.recs_dropped = 1), Some(EXIT_RECON));
+            assert_eq!(short(sp, |r| r.fills_dropped = 1), Some(EXIT_RECON));
+            assert_eq!(short(sp, |r| r.fees_bnb = 3), None, "BNB is a judged asset (reported)");
+        }
+        // Not armed: not judged.
+        assert_eq!(short(&mainnet(true, false, false, false), |r| r.trips[PRODUCT_COINM as usize] = 0), None);
+        // The Demo bar stays Demo's: a full Demo run is short of R0.
+        let demo_full = Report { cycles: 10, fills: [0, 6, 4, 0], recons: [0, 6, 4, 0], sweeps: 1, ttl: 1, post_only: 1, cm_maker_refused: true, ..Report::default() };
+        assert_eq!(bar_short(&spec(), &demo_full), None);
+        assert_eq!(bar_short(&mainnet(true, true, false, false), &demo_full).map(|(c, _)| c), Some(EXIT_CYCLE));
+        // A drill is its own bar on mainnet too.
+        assert_eq!(bar_short(&BatterySpec { drill: Some(Drill::Gap), ..mainnet(true, false, false, false) }, &Report::default()), None);
+    }
+
+    /// BX13: a mainnet run without the word ends 64 — no bar judged, no
+    /// R0 line; with it, a clean run short of R0 is that phase's code.
+    #[test]
+    fn a_mainnet_run_without_the_word_is_64_and_judges_nothing() {
+        let mut r = Report { unconfirmed: true, code: EXIT_OPS_UNCONFIRMED, ..Report::default() };
+        assert_eq!(summary(&BatterySpec { confirm: false, ..mainnet(true, true, false, false) }, &mut r), EXIT_OPS_UNCONFIRMED);
+        let mut r = Report::default();
+        assert_eq!(summary(&mainnet(true, true, false, false), &mut r), EXIT_CYCLE);
+        assert!(r.why.contains("usdm maker cycles"), "{}", r.why);
+        let mut r = r0_full();
+        assert_eq!(summary(&mainnet(true, true, true, false), &mut r), 0);
+    }
+
+    /// BX13: the clean streak counts consecutive clean verdicts only — any
+    /// drift, unseen leg, foreign order or failure ends a run; other
+    /// records do not.
+    #[test]
+    fn a_clean_streak_is_consecutive_clean_verdicts() {
+        let rec = |kind: u8, code: i32, a: i64, b: i64, c: i64| ExecRecord { kind, code, a, b, c, ..ExecRecord::default() };
+        let ok = rec(J_RECON, 1, 0, 0, 0);
+        assert_eq!(clean_streak(&[]), 0);
+        assert_eq!(clean_streak(&[ok, rec(J_FILL, 0, 1, 1, 0), ok, ok]), 3, "a fill between verdicts ends nothing");
+        for bad in [rec(J_RECON, 0, 0, 0, 0), rec(J_RECON, J_RECON_HELD, 0, 0, 0), rec(J_RECON, 1, 5, 0, 0), rec(J_RECON, 1, 0, 1, 0), rec(J_RECON, 1, 0, 0, 1)] {
+            assert_eq!(clean_streak(&[ok, ok, bad, ok, ok]), 2, "{bad:?} ends a run");
+        }
+        assert_eq!(clean_streak(&[ok, rec(J_RECON, 0, 0, 0, 0), ok, ok, ok, ok]), 4);
+    }
+
+    /// BX13: a trade is a `J_FILL` booked with its trade — not unseen,
+    /// adopted or lost; its maker bit is a trade's.
+    #[test]
+    fn a_trade_is_a_fill_with_its_trade() {
+        let fill = |code: i32| ExecRecord { kind: J_FILL, code, ..ExecRecord::default() };
+        assert!(is_trade(&fill(0)) && is_trade(&fill(1)), "taker and maker");
+        for bit in [J_FILL_UNSEEN, J_FILL_ADOPTED, J_FILL_LOST] {
+            assert!(!is_trade(&fill(bit)) && !is_trade(&fill(bit | 1)), "{bit}");
+        }
+        assert!(!is_trade(&ExecRecord { kind: J_FEE, ..ExecRecord::default() }));
+    }
+
+    /// BX13 (the risk review's round 2): the fee bar is per order — one
+    /// order's missing fee and another's doubled one never cancel; a
+    /// settlement's fill and fee (both order 0) pair; a fill booked unseen
+    /// is no trade.
+    #[test]
+    fn each_orders_trades_meet_its_fees() {
+        let rec = |kind: u8, oid: u64, code: i32| ExecRecord { kind, client_oid: oid, code, ..ExecRecord::default() };
+        let (fill, fee) = (|oid| rec(J_FILL, oid, 0), |oid| rec(J_FEE, oid, 0));
+        assert_eq!(fee_gaps(&[fill(1), fee(1), fill(2), fill(2), fee(2), fee(2)], &[]), (0, 0));
+        assert_eq!(fee_gaps(&[fill(1), fill(2), fee(2), fee(2)], &[]), (1, 1), "a missing fee and a doubled one");
+        assert_eq!(fee_gaps(&[fill(0), fee(0)], &[]), (0, 0), "a settlement's pair");
+        assert_eq!(fee_gaps(&[rec(J_FILL, 3, J_FILL_UNSEEN), fee(0)], &[]), (0, 1), "a fee read from myTrades beside an unseen fill");
+        assert_eq!(fee_gaps(&[], &[]), (0, 0));
+        // The risk review's round 3: order 5 modified twice (to 6, then 7)
+        // fills under 7 in the table, its fee booked under 5 once ended.
+        let renames = [(6, 5), (7, 5)];
+        assert_eq!(fee_gaps(&[fill(7), fee(5), fill(6), fee(6)], &renames), (0, 0), "one order under its three ids");
+        assert_eq!(fee_gaps(&[fill(7), fee(5)], &[]), (1, 1), "unrenamed, a clean order reads short");
     }
 
     #[test]

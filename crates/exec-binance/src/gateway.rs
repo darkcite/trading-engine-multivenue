@@ -300,8 +300,9 @@ use crate::equity::{
     EqOpenRow, EqOrderId, EqReport, EQ_EV_ORDER, EQ_S_ACCEPTED, EQ_S_CANCELED, EQ_S_EXPIRED, EQ_S_FILLED, EQ_S_NEW, EQ_S_PARTIAL, EQ_S_REJECTED,
 };
 use crate::gov::{
-    classify, request_weight, CodeClass, Weighed, ACCOUNT_REREAD_MS, ARM_WEIGHT_MAX_PER_MIN, EQ_DISCLAIMER, EQ_DUPLICATE_ID, EQ_NOT_FOUND,
-    OPT_ARM_WEIGHT_MAX_PER_MIN, QTR_ICR_NS, W_OPT_RECON, WEIGHT_THROTTLE_PCT,
+    classify, day_read_room, request_weight, spot_request_weight, CodeClass, Weighed, ACCOUNT_REREAD_MS, ARM_WEIGHT_MAX_PER_MIN, DAY_MS, EQ_DISCLAIMER,
+    EQ_DUPLICATE_ID, EQ_NOT_FOUND, OPT_ARM_WEIGHT_MAX_PER_MIN, QTR_ICR_NS, SPOT_ARM_WEIGHT_MAX_PER_MIN, W_OPT_RECON, W_SPOT_RECON,
+    WEIGHT_THROTTLE_PCT,
 };
 use crate::inst::{
     AssetName, WireTable, INST_DATED, INST_INVERSE, INST_LIVE, INST_NO_DEADMAN, INST_OWNED, INST_WRITABLE, OPT_ULY_MAX, PRODUCT_COINM, PRODUCT_EQUITY,
@@ -309,8 +310,8 @@ use crate::inst::{
 };
 use crate::journal::{
     fee_asset, fee_code, fee_notional_1e9, JournalTx, EQ_FEE_FLOOR_NOTIONAL_1E6, FEE_ASSET_NONE, FEE_FLAG_EQ_FLOOR, JOURNAL_RING, J_ACCEPTED, J_ACK,
-    J_ANCHOR, J_ENDED, J_FEE, J_FILL, J_FILL_ADOPTED, J_FILL_LOST, J_FILL_UNSEEN, J_MARGIN, J_RECON, J_REJECT, J_SWEEP, J_VENUE, TRADE_BY_ADL,
-    TRADE_BY_LIQUIDATION, TRADE_BY_MEMBER, TRADE_BY_ORPHAN, TRADE_BY_SETTLEMENT,
+    J_ANCHOR, J_ENDED, J_FEE, J_FILL, J_FILL_ADOPTED, J_FILL_LOST, J_FILL_UNSEEN, J_MARGIN, J_RECON, J_RECON_HELD, J_REJECT, J_SWEEP, J_VENUE,
+    TRADE_BY_ADL, TRADE_BY_LIQUIDATION, TRADE_BY_MEMBER, TRADE_BY_ORPHAN, TRADE_BY_SETTLEMENT,
 };
 use crate::margin::um_ratio_1e6;
 use crate::mode::{judge_key, judge_mode, judge_one_way, judge_permission, judge_single_asset, judge_symbol_config, AccountMode, AssertErr};
@@ -420,9 +421,16 @@ pub const PW_WEIGHT: usize = crate::arm::GW_TALLIES;
 /// BX9: the stats block's word carrying eapi's weight spent in the last
 /// minute (options' own pool).
 pub const PW_OPT_WEIGHT: usize = crate::arm::GW_TALLIES + 1;
-const _: () = assert!(PW_OPT_WEIGHT < exec_gateway::stats::PUBLISHED_WORDS);
+/// BX13 (R2-4): the stats block's word carrying spot's weight spent in the
+/// last minute (spot's own pool).
+pub const PW_SPOT_WEIGHT: usize = crate::arm::GW_TALLIES + 2;
+const _: () = assert!(PW_SPOT_WEIGHT < exec_gateway::stats::PUBLISHED_WORDS);
 /// The pulse.
 pub const STATUS_EVERY_NS: u64 = 100 * MS;
+/// BX13 (R2-2): spot's day count asked again after this while
+/// unanswered (a cycle's room); a refused read is asked again at the next
+/// cycle.
+pub const SPOT_DAY_RETRY_NS: u64 = 30 * S;
 /// The clock round.
 pub const CLOCK_EVERY_NS: u64 = 60 * S;
 /// The 23 h rotation (connections live at most 24 h): the production
@@ -1141,6 +1149,7 @@ const fn verb_weight(verb: u8, product: u8) -> Weighed {
         REQ_ACCOUNT if product == PRODUCT_OPTIONS => Weighed::OptAccount,
         REQ_ACCOUNT => Weighed::Account,
         REQ_LOGON => Weighed::Logon,
+        REQ_RATE_LIMITS => Weighed::RateLimits,
         _ => Weighed::OrderVerb,
     }
 }
@@ -1315,6 +1324,9 @@ pub struct BnGateway<const FILL_N: usize, const J_N: usize = JOURNAL_RING> {
     /// eapi's REQUEST_WEIGHT spent in the last minute (BX9: options' own
     /// pool, metered apart).
     opt_weight: RateWindow,
+    /// BX13 (R2-4): spot's weight spent in the last minute — spot's own
+    /// pool, metered as eapi's.
+    spot_weight: RateWindow,
     /// The arm's one signer: Ed25519, or HMAC on the REST route (R22).
     signer: Signer,
     api_key: String,
@@ -1334,6 +1346,12 @@ pub struct BnGateway<const FILL_N: usize, const J_N: usize = JOURNAL_RING> {
     /// The configuration is `Scope::Demo` (BX7b): classic by construction,
     /// no SAPI reads at boot (module docs).
     demo: bool,
+    /// BX13 (R2-2): the venue UTC day spot's unfilled-order count was read
+    /// for (0: never), the day the read in flight was asked on, and when it
+    /// may be asked again.
+    spot_day_read: u64,
+    spot_day_asked: u64,
+    spot_day_next_ns: u64,
     prefix: CidPrefix,
     wire: WireTable,
     oot: Oot,
@@ -1708,6 +1726,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             sweep_seq: 0,
             weight: RateWindow::new(),
             opt_weight: RateWindow::new(),
+            spot_weight: RateWindow::new(),
             signer,
             api_key: String::from(cfg.api_key()),
             opt_signer,
@@ -1716,6 +1735,9 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             pm_pro,
             pm_account_queued: false,
             demo,
+            spot_day_read: 0,
+            spot_day_asked: 0,
+            spot_day_next_ns: 0,
             prefix: CidPrefix::new(knobs.epoch),
             wire,
             oot: Oot::new(),
@@ -2010,7 +2032,13 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 }
             }
         }
+        // The held events first, then the last pulse: the tallies as they
+        // end — a fill lost or a record dropped after the last beat reaches
+        // the arm (the risk review of BX13, rounds 2 and 3: the R0 record
+        // reads them at the end; a pulse with no room is dropped, never
+        // held).
         self.drain_held();
+        self.pulse(core_time::now_ns());
     }
 
     /// One pass of the loop (module docs).
@@ -2282,7 +2310,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
     fn render_ws(&mut self, l: usize, r: WsReq, a: usize, id: u64, now: u64) -> Result<(), core_net::WsErr> {
         let ts = self.clock.venue_ms(now);
         let st = self.lanes[l].st;
-        if r.ix == IX_NONE && r.verb != REQ_ACCOUNT {
+        if r.ix == IX_NONE && r.verb != REQ_ACCOUNT && r.verb != REQ_RATE_LIMITS {
             // Only the REST route posts an order-less verb (a stray's
             // cancel by its venue id); the WS API renders its own.
             debug_assert!(false, "an order-less WS API post");
@@ -2321,6 +2349,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                     queue_status(&mut self.lanes[l].ws[a], id, &st, sym, cid, ts)
                 }
             }
+            REQ_RATE_LIMITS => queue_rate_limits(&mut self.lanes[l].ws[a], id, &st, ts),
             _ => queue_account(&mut self.lanes[l].ws[a], id, &st, self.lanes[l].product, ts),
         }
     }
@@ -2584,29 +2613,39 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
     }
 
     /// Count lane `l`'s request of weight `w` in the IP's one-minute window
-    /// (BX7: the run-time governor) — never a spot lane's: spot's
-    /// REQUEST_WEIGHT is its own pool (BX8, `gov::arm_weight_per_min`); an
-    /// options lane's in eapi's own window (BX9).
+    /// (BX7: the run-time governor); an options lane's in eapi's own window
+    /// (BX9); BX13 (R2-4): a spot lane's in spot's own, at spot's weights.
     #[inline]
     fn weigh(&mut self, l: usize, w: Weighed, now: u64) {
         match self.lanes[l].product {
             // BX10: Binance Stocks is SAPI's (its own IP pool, 12 000 a
             // minute; the places are the UID's 200 a minute, the arm's
             // pool): never the futures' window.
-            PRODUCT_SPOT | PRODUCT_EQUITY => {}
+            PRODUCT_EQUITY => {}
+            PRODUCT_SPOT => self.spot_weight.add(now, spot_request_weight(w)),
             PRODUCT_OPTIONS => self.opt_weight.add(now, request_weight(w)),
             _ => self.weight.add(now, request_weight(w)),
         }
     }
 
     /// The weight spent reached [`WEIGHT_THROTTLE_PCT`] of the arm's
-    /// share — in the IP's futures pool or eapi's (BX9) — a reconciliation
-    /// asked for before its cadence waits (the one read the boot's weight
-    /// model does not count).
+    /// share — in the IP's futures pool, eapi's (BX9) or spot's (BX13,
+    /// R2-4) — a reconciliation asked for before its cadence waits (the one
+    /// read the boot's weight model does not count).
     #[inline]
     fn throttled(&self) -> bool {
         self.weight.at_least(ARM_WEIGHT_MAX_PER_MIN, WEIGHT_THROTTLE_PCT)
             || self.opt_weight.at_least(OPT_ARM_WEIGHT_MAX_PER_MIN, WEIGHT_THROTTLE_PCT)
+            || self.spot_weight.at_least(SPOT_ARM_WEIGHT_MAX_PER_MIN, WEIGHT_THROTTLE_PCT)
+    }
+
+    /// **BX13 (R2-4)**: spot's window can take one more of the day's reads
+    /// (`myTrades`, 20) and still a whole cycle within the share — an
+    /// unread day is retried at the pool's pace, never every cycle past it.
+    #[inline]
+    fn spot_day_room(&mut self, now: u64) -> bool {
+        self.spot_weight.advance(now);
+        day_read_room(self.spot_weight.sum(), u64::from(spot_request_weight(Weighed::UserTrades)), W_SPOT_RECON, SPOT_ARM_WEIGHT_MAX_PER_MIN)
     }
 
     /// BX9 (Q-5): eapi's window can take one more of the day's reads
@@ -2615,7 +2654,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
     #[inline]
     fn opt_day_room(&mut self, now: u64) -> bool {
         self.opt_weight.advance(now);
-        self.opt_weight.sum() + u64::from(request_weight(Weighed::UserTrades)) + W_OPT_RECON <= OPT_ARM_WEIGHT_MAX_PER_MIN
+        day_read_room(self.opt_weight.sum(), u64::from(request_weight(Weighed::UserTrades)), W_OPT_RECON, OPT_ARM_WEIGHT_MAX_PER_MIN)
     }
 
     /// A command's push time, for the burst's `push_to_write`.
@@ -3095,7 +3134,9 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 };
                 if let Ok(id) = self.desk.issue(&self.stats, WsReq::on(REQ_LOGON, IX_NONE, 0, 0), sess(l, s), now) {
                     // Field by field (the signer is lent): `weigh`'s law.
-                    if self.lanes[l].product != PRODUCT_SPOT {
+                    if self.lanes[l].product == PRODUCT_SPOT {
+                        self.spot_weight.add(now, spot_request_weight(Weighed::Logon));
+                    } else {
                         self.weight.add(now, request_weight(Weighed::Logon));
                     }
                     let key = self.api_key.as_bytes();
@@ -3571,8 +3612,50 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             REQ_MODIFY if self.for_open(&r) => self.modify_answered(r.ix, a, now),
             REQ_STATUS if self.for_open(&r) => self.status_answered(r.ix, a, now),
             REQ_ACCOUNT => self.account_answered(fr, a, now),
+            REQ_RATE_LIMITS => self.spot_day_answered(fr, a, now),
             _ => {}
         }
+    }
+
+    /// **BX13 (R2-2) — spot's day count asked of the venue**
+    /// (`account.rateLimits.orders`, weight 40 of spot's own pool): once per
+    /// venue UTC day — the boot's first cycle, then each new day's — on the
+    /// spot lane's live session beside its account read; asked again after
+    /// [`SPOT_DAY_RETRY_NS`] while unanswered, and at the next cycle once
+    /// refused. Until the arm has it, no spot order is admitted.
+    fn ask_spot_day(&mut self, l: usize, now: u64) {
+        let day = self.clock.venue_ms(now) / DAY_MS;
+        if self.lanes[l].product != PRODUCT_SPOT || self.spot_day_read == day || now < self.spot_day_next_ns {
+            return;
+        }
+        if self.post(l, WsReq::on(REQ_RATE_LIMITS, IX_NONE, 0, 0), now).is_ok() {
+            self.spot_day_asked = day;
+            self.spot_day_next_ns = now + SPOT_DAY_RETRY_NS;
+        }
+    }
+
+    /// BX13 (R2-2): `account.rateLimits.orders` answered — the day's count
+    /// and limit to the arm (`EVT_SPOT_DAY`), for the venue day the read was
+    /// asked on (`c`; the risk review: a read straddling 00:00Z seeds the
+    /// day it asked about, and the next day's first cycle asks again). A
+    /// 200 that does not scan is a scan failure (BX-15) — the slot halts
+    /// on unbounded drift until a restart — never a count of 0; a refusal
+    /// (its code judged above) is asked again at the next cycle.
+    fn spot_day_answered(&mut self, fr: Frame, a: &WsAnswer, now: u64) {
+        if a.status != 200 {
+            self.spot_day_next_ns = 0;
+            return;
+        }
+        let Some((count, limit)) = scan_day_orders(self.frame(fr), a.result) else {
+            return self.scan_failed(SCAN_SPOT_DAY, ScanErr::Missing, now);
+        };
+        let mut e = BnEvt::new(EVT_SPOT_DAY, now);
+        e.a = i64::from(count);
+        e.b = i64::from(limit);
+        e.c = self.spot_day_asked as i64;
+        self.emit(&e);
+        self.spot_day_read = self.spot_day_asked;
+        self.spot_day_next_ns = 0;
     }
 
     /// Nothing is sent before `now + quiet_ns` — or before the end the
@@ -4450,8 +4533,14 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 if !self.is_sapi(j.kind) {
                     self.lanes[l].jobs.pop();
                     // BX9 (Q-5): an options day read waits while eapi's
-                    // window could not take it beside a whole cycle.
-                    let paced = j.kind == JobKind::UserTrades && self.lanes[l].product == PRODUCT_OPTIONS && !self.opt_day_room(now);
+                    // window could not take it beside a whole cycle; BX13
+                    // (R2-4): a spot day read while spot's could not.
+                    let paced = j.kind == JobKind::UserTrades
+                        && match self.lanes[l].product {
+                            PRODUCT_OPTIONS => !self.opt_day_room(now),
+                            PRODUCT_SPOT => !self.spot_day_room(now),
+                            _ => false,
+                        };
                     if now < j.not_before_ns || paced {
                         // A spot order's trades asked again after a pause
                         // (BX8), an options day read paced (BX9): behind the
@@ -4926,6 +5015,8 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         if !self.ready_to_send(l, now) || self.post(l, WsReq::on(REQ_ACCOUNT, IX_NONE, 0, 0), now).is_err() {
             return false;
         }
+        // BX13 (R2-2): spot's day count, once a venue day, beside it.
+        self.ask_spot_day(l, now);
         self.recon = ReconStep::Account;
         self.recon_lane = l as u8;
         self.recon_account_only = account_only;
@@ -5682,13 +5773,17 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             self.t[crate::arm::GW_RECON_OK] += 1;
             self.set_anchor_once(now);
         }
+        // BX13 (R3-1): a held cycle is its own — counted, and marked in the
+        // journal — never one more unreconciled cycle.
+        let held = v.held_legs > 0;
+        self.t[crate::arm::GW_RECON_HELD] += held as u64;
         let mut e = BnEvt::new(EVT_RECON, now);
         e.a = v.drift_reported();
         e.b = v.unseen_legs as i64;
         e.c = v.foreign as i64;
         e.flags = ok as u8 * EVT_F_RECONCILED;
         self.emit(&e);
-        self.note(J_RECON, now, 0, 0, e.a, e.b, e.c, ok as i32, 0, 0);
+        self.note(J_RECON, now, 0, 0, e.a, e.b, e.c, ok as i32 | (held as i32 * J_RECON_HELD), 0, 0);
         if self.phase == Phase::Recon {
             if v.orphans == 0 && v.ghosts == 0 {
                 self.phase = Phase::Day;
@@ -7515,7 +7610,11 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         // The weight windows move with the clock; their words with the beat.
         self.weight.advance(now);
         self.opt_weight.advance(now);
-        let level = if self.weight.at_least(ARM_WEIGHT_MAX_PER_MIN, 100) || self.opt_weight.at_least(OPT_ARM_WEIGHT_MAX_PER_MIN, 100) {
+        self.spot_weight.advance(now);
+        let level = if self.weight.at_least(ARM_WEIGHT_MAX_PER_MIN, 100)
+            || self.opt_weight.at_least(OPT_ARM_WEIGHT_MAX_PER_MIN, 100)
+            || self.spot_weight.at_least(SPOT_ARM_WEIGHT_MAX_PER_MIN, 100)
+        {
             CONGESTION_RATE_LIMITED
         } else if self.throttled() {
             CONGESTION_THROTTLED
@@ -7525,6 +7624,7 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
         self.stats.set_congestion(level);
         self.stats.publish(PW_WEIGHT, self.weight.sum());
         self.stats.publish(PW_OPT_WEIGHT, self.opt_weight.sum());
+        self.stats.publish(PW_SPOT_WEIGHT, self.spot_weight.sum());
         self.stats.beat(now);
         self.emit(&e);
     }
@@ -7586,6 +7686,9 @@ pub const SCAN_USER: i32 = 2;
 pub const SCAN_REST: i32 = 3;
 /// The account snapshot.
 pub const SCAN_ACCOUNT: i32 = 4;
+/// BX13 (R2-2): spot's `account.rateLimits.orders` answer named no DAY
+/// entry the scanner could read whole.
+pub const SCAN_SPOT_DAY: i32 = 5;
 
 #[cfg(test)]
 mod tests {

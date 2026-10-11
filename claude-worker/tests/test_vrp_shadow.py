@@ -39,8 +39,9 @@ def _fill(  # noqa: PLR0913, PLR0917 - one parameter per wire field, deliberatel
     px: int,
     qty: int,
     oid: int,
+    flags: int = 0,
 ) -> bytes:
-    return claude_worker.pmlr._FILL.pack(ts, sym, side, strategy_id, origin, px, qty, oid)
+    return claude_worker.pmlr._FILL.pack(ts, sym, side, strategy_id, origin, flags, px, qty, oid)
 
 
 def _order(  # noqa: PLR0913, PLR0917 - one parameter per wire field, deliberately
@@ -217,3 +218,23 @@ def test_a_run_with_no_fill_log_is_an_error_not_a_disagreement(tmp_path):
         assert "engine-fills.pmlr" in str(exc)
     else:  # pragma: no cover - the guard above must fire
         raise AssertionError("a missing fill log must refuse, not reconcile")
+
+
+def test_an_adopted_fill_or_a_settlement_moves_the_leg_but_is_no_fill(tmp_path):
+    """BX13 (the BX7 arming precondition): byte 15 is the fill's flags. An
+    adopted fill (the venue's position at boot) and a settlement (an
+    expiry's exercise) each move the member's position, but neither is a
+    fill the member ordered: the leg's count is its trades."""
+    paper = claude_worker.pmlr.FILL_ORIGIN_PAPER
+    run = _run(
+        tmp_path,
+        [
+            _fill(1, OPT_SYM, 0, 1, 0, 0, 2_000_000, 0, claude_worker.pmlr.FILL_FLAG_ADOPTED),
+            _fill(2, OPT_SYM, 1, 1, paper, 395_000_000, 1_000_000, 11),
+            _fill(3, OPT_SYM, 1, 1, 0, 0, 1_000_000, 0, claude_worker.pmlr.FILL_FLAG_SETTLEMENT),
+        ],
+        [_order(2, OPT_SYM, 1, 300_200_000, 1_000_000, 11, 1)],
+    )
+    legs = claude_worker.vrp_shadow.engine_legs(run)
+    want = claude_worker.vrp_shadow.Leg(1, 0)
+    assert legs[OPT_SYM] == want, "adopted 2, sold 1, settled 1: one trade, flat"

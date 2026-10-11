@@ -298,6 +298,13 @@ pub const EVT_SCAN_FAIL: u8 = 14;
 /// A row's net position changed sign or left zero (breadth, BX-7):
 /// `row`, `a` = the net position ×1e6 the gateway has booked.
 pub const EVT_POSITION: u8 = 15;
+/// **BX13 (R2-2) — spot's day, as the venue counts it**
+/// (`account.rateLimits.orders`): `a` = the account's unfilled orders
+/// that day, `b` = the day's limit (positive — the scanner refuses 0; a 0
+/// would keep the arm's caps), `c` = the venue's UTC day the read was
+/// asked on (`venue_ms / 86 400 000`; the arm takes one within a day of
+/// its own).
+pub const EVT_SPOT_DAY: u8 = 16;
 
 /// [`EVT_RETIRED`]: some quantity filled before the order ended.
 pub const EVT_F_HAD_FILL: u8 = 1 << 0;

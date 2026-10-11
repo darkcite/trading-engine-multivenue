@@ -2062,6 +2062,17 @@ const _: () = {
     assert!(::core::mem::offset_of!(Order, verb) == 42);
     assert!(::core::mem::offset_of!(Order, ab_arm) == 43);
     assert!(::core::mem::offset_of!(Order, alo_priority_1e8) == 44);
+    // BX13 (the parser review's round 2): the fill's first 40 bytes are
+    // the PMLR fill record the worker reads (`pmlr._FILL`, `<QIBBBBqqQ`:
+    // the flags at byte 15).
+    assert!(::core::mem::offset_of!(Fill, ts_ns) == 0);
+    assert!(::core::mem::offset_of!(Fill, sym) == 8);
+    assert!(::core::mem::offset_of!(Fill, side) == 12);
+    assert!(::core::mem::offset_of!(Fill, strategy_id) == 13);
+    assert!(::core::mem::offset_of!(Fill, origin) == 14);
+    assert!(::core::mem::offset_of!(Fill, flags) == 15);
+    assert!(::core::mem::offset_of!(Fill, px) == 16);
+    assert!(::core::mem::offset_of!(Fill, qty) == 24);
     assert!(::core::mem::offset_of!(Fill, order_id) == 32);
     assert!(::core::mem::offset_of!(Fill, tid) == 40);
     assert!(::core::mem::offset_of!(Fill, _pad1) == 48);

@@ -61,6 +61,9 @@ pub const REQ_ACCOUNT: u8 = 6;
 /// `userDataStream.subscribe` (BX8, spot): the session's user data, after
 /// its logon.
 pub const REQ_SUBSCRIBE: u8 = 7;
+/// **BX13 (R2-2)** — `account.rateLimits.orders` (spot): the account's
+/// unfilled-order count of the UTC day, read at each day's first cycle.
+pub const REQ_RATE_LIMITS: u8 = 8;
 
 /// What a WS API request id stands for: the verb, the open-order slot, the
 /// slot's generation and the placement id of the order it was sent for —
@@ -457,6 +460,66 @@ pub fn queue_subscribe<S: FrameSink>(s: &mut S, id: u64) -> Result<(), WsErr> {
         Part::U64(id),
         Part::Lit(b",\"method\":\"userDataStream.subscribe\"}"),
     ])
+}
+
+/// **BX13 (R2-2) — `account.rateLimits.orders`** (spot, weight 40): the
+/// logged-on session's account; the timestamp alone.
+pub fn queue_rate_limits<S: FrameSink>(s: &mut S, id: u64, st: &WsStatic, ts_ms: u64) -> Result<(), WsErr> {
+    s.queue_parts(&[
+        Part::Lit(b"{\"id\":"),
+        Part::U64(id),
+        Part::Lit(b",\"method\":\"account.rateLimits.orders\",\"params\":{\"recvWindow\":"),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b",\"timestamp\":"),
+        Part::U64(ts_ms),
+        Part::Lit(b"}}"),
+    ])
+}
+
+/// **BX13 (R2-2) — the spot day's count** in `account.rateLimits.orders`'
+/// `result`: the one `ORDERS` entry of `"interval":"DAY"` and
+/// `intervalNum` 1 — `(count, limit)`. Every entry names all five keys
+/// (`rateLimitType`, `interval`, `intervalNum`, `limit`, `count` — the
+/// documented shape), each once, its numbers whole, the day's within
+/// `u32` and its limit positive. `None` — never a guess (BX-15): `result`
+/// not an array, an entry malformed, keyed twice or short of a key (a
+/// reader that defaults a missing `intervalNum` would see a second DAY
+/// entry — the parser review, round 2), a word escaped (`\` in a type or
+/// an interval: what it spells is not read raw), a DAY entry naming a
+/// limit of 0, two DAY entries, or none.
+#[must_use]
+pub fn scan_day_orders(f: &[u8], result: Span) -> Option<(u32, u32)> {
+    let mut el = crate::json::Elems::new(f, result.at as usize).ok()?;
+    let mut day = None;
+    while let Some((a, _)) = el.next().ok()? {
+        let mut p = Pairs::new(f, a).ok()?;
+        let (mut kind, mut interval, mut num, mut limit, mut count) = (None, None, None, None, None);
+        while let Some((k, v0, v1)) = p.next().ok()? {
+            let word = |v0: usize, v1: usize| str_of(f, v0, v1).ok().filter(|w| !w.contains(&b'\\'));
+            let fresh = match k {
+                b"rateLimitType" => kind.replace(word(v0, v1)?).is_none(),
+                b"interval" => interval.replace(word(v0, v1)?).is_none(),
+                b"intervalNum" => num.replace(u64_of(f, v0, v1).ok()?).is_none(),
+                b"limit" => limit.replace(u64_of(f, v0, v1).ok()?).is_none(),
+                b"count" => count.replace(u64_of(f, v0, v1).ok()?).is_none(),
+                _ => true,
+            };
+            if !fresh {
+                return None;
+            }
+        }
+        let (Some(kind), Some(interval), Some(num), Some(limit), Some(count)) = (kind, interval, num, limit, count) else {
+            return None;
+        };
+        if kind == b"ORDERS" && interval == b"DAY" && num == 1 {
+            if day.is_some() {
+                return None;
+            }
+            let limit = u32::try_from(limit).ok().filter(|l| *l > 0)?;
+            day = Some((u32::try_from(count).ok()?, limit));
+        }
+    }
+    day
 }
 
 // -------------------------------------------------------------------------
@@ -866,6 +929,78 @@ pub(crate) mod tests {
         let mut t = Text::default();
         queue_subscribe(&mut t, 13).unwrap();
         assert_eq!(std::str::from_utf8(&t.0).unwrap(), r#"{"id":13,"method":"userDataStream.subscribe"}"#);
+        // BX13 (R2-2): spot's day count, on the logged-on session.
+        let mut t = Text::default();
+        queue_rate_limits(&mut t, 14, &st(), 9).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&t.0).unwrap(),
+            r#"{"id":14,"method":"account.rateLimits.orders","params":{"recvWindow":1000,"timestamp":9}}"#
+        );
+    }
+
+    /// BX13 (R2-2): the day's count is the one ORDERS / DAY / 1 entry —
+    /// the docs' shape read whole; anything else refused, never guessed.
+    #[test]
+    fn the_spot_days_count_is_its_one_day_entry() {
+        let scan = |body: &str| {
+            let f = body.as_bytes();
+            let mut a = WsAnswer::default();
+            scan_answer(f, &mut a).expect("an answer");
+            scan_day_orders(f, a.result)
+        };
+        let ten = r#"{"rateLimitType":"ORDERS","interval":"SECOND","intervalNum":10,"limit":50,"count":3}"#;
+        let day = r#"{"rateLimitType":"ORDERS","interval":"DAY","intervalNum":1,"limit":200000,"count":1234}"#;
+        let ok = format!(r#"{{"id":7,"status":200,"result":[{ten},{day}],"rateLimits":[{{"rateLimitType":"REQUEST_WEIGHT","interval":"MINUTE","intervalNum":1,"limit":6000,"count":40}}]}}"#);
+        assert_eq!(scan(&ok), Some((1_234, 200_000)));
+        let wrap = |inner: &str| format!(r#"{{"id":7,"status":200,"result":[{inner}]}}"#);
+        assert_eq!(scan(&wrap(&format!("{day},{ten}"))), Some((1_234, 200_000)), "order is not meaning");
+        assert_eq!(scan(&wrap(ten)), None, "no DAY entry");
+        assert_eq!(scan(&wrap(&format!("{day},{day}"))), None, "two DAY entries");
+        assert_eq!(scan(&wrap(&day.replace(r#","count":1234"#, ""))), None, "no count");
+        assert_eq!(scan(&wrap(&day.replace(r#""limit":200000,"#, ""))), None, "no limit");
+        assert_eq!(scan(&wrap(&day.replace("1234", "-1"))), None, "a negative count");
+        assert_eq!(scan(&wrap(&day.replace("1234", "4294967296"))), None, "past u32");
+        assert_eq!(scan(&wrap(&day.replace(r#""count":1234"#, r#""count":1,"count":2"#))), None, "a key twice");
+        assert_eq!(scan(&wrap(&day.replace(r#""intervalNum":1"#, r#""intervalNum":2"#))), None, "two days is not the day");
+        assert_eq!(scan(&wrap(&day.replace("ORDERS", "RAW_REQUESTS"))), None);
+        assert_eq!(scan(r#"{"id":7,"status":200,"result":{"count":1}}"#), None, "not an array");
+        assert_eq!(scan(&wrap(&format!("{day},1"))), None, "an element not an object");
+        let extra = day.replace(r#""count":1234"#, r#""count":1234,"note":"x""#);
+        assert_eq!(scan(&wrap(&extra)), Some((1_234, 200_000)), "an unknown key is skipped");
+        // The parser review's cases: each one a mutation of the scanner
+        // fails (the interval unjudged; a key twice on each; a limit cut to
+        // u32; a limit of 0; an escaped word read raw).
+        let minute = r#"{"rateLimitType":"ORDERS","interval":"MINUTE","intervalNum":1,"limit":1200,"count":7}"#;
+        assert_eq!(scan(&wrap(&format!("{minute},{day}"))), Some((1_234, 200_000)), "a minute's entry is not the day's");
+        assert_eq!(scan(&wrap(minute)), None, "a minute alone is no day");
+        for (once, twice) in [
+            (r#""rateLimitType":"ORDERS""#, r#""rateLimitType":"ORDERS","rateLimitType":"ORDERS""#),
+            (r#""interval":"DAY""#, r#""interval":"SECOND","interval":"DAY""#),
+            (r#""intervalNum":1"#, r#""intervalNum":1,"intervalNum":1"#),
+            (r#""limit":200000"#, r#""limit":200000,"limit":200000"#),
+        ] {
+            assert_eq!(scan(&wrap(&day.replacen(once, twice, 1))), None, "a key twice: {twice}");
+        }
+        assert_eq!(scan(&wrap(&day.replace("200000", "4294967297"))), None, "a limit past u32 (cut to u32 it reads 1)");
+        assert_eq!(scan(&wrap(&day.replace("200000", "0"))), None, "a limit of 0");
+        assert_eq!(scan(&wrap(&day.replace(r#""intervalNum":1,"#, ""))), None, "no intervalNum");
+        assert_eq!(scan(&wrap(&day.replace("1234", "\"0001234\""))), Some((1_234, 200_000)), "a quoted, padded figure reads whole");
+        assert_eq!(scan(&wrap(&format!("{},{day}", ten.replace(r#""count":3"#, r#""count":null"#)))), None, "a malformed figure anywhere");
+        let escaped = day.replace("DAY", "D\\u0041Y").replace("1234", "199999");
+        assert_eq!(scan(&wrap(&format!("{day},{escaped}"))), None, "an escaped DAY is not read raw");
+        // Round 2's cases: each a mutant the cases above let live (an
+        // element's or a member's walk error read as the end, the type read
+        // raw, the limit's floor at 2), and an entry short of a key.
+        assert_eq!(scan(&wrap(&format!("{day} {ten}"))), None, "elements without their comma");
+        assert_eq!(scan(&wrap(&day.replace("1234}", "1234,}"))), None, "a member's trailing comma");
+        let orders = day.replace("ORDERS", "ORD\\u0045RS").replace("1234", "199999");
+        assert_eq!(scan(&wrap(&format!("{day},{orders}"))), None, "an escaped ORDERS is not read raw");
+        assert_eq!(scan(&wrap(&day.replace("200000", "1"))), Some((1_234, 1)), "a limit of 1 is a limit");
+        for key in [r#""rateLimitType":"ORDERS","#, r#""interval":"DAY","#, r#""intervalNum":1,"#, r#""limit":200000,"#, r#","count":1234"#] {
+            let short = day.replace(key, "").replace("1234", "199999");
+            assert_eq!(scan(&wrap(&format!("{day},{short}"))), None, "an entry without {key} hides nothing");
+        }
+        assert_eq!(scan(&wrap(&format!("{day},{}", ten.replace(r#""intervalNum":10,"#, "")))), None, "every entry names its five keys");
     }
 
     /// BX8: a spot user event shares the order socket — read as one by its
@@ -968,6 +1103,73 @@ pub(crate) mod tests {
     }
 
     proptest! {
+        // 2 048 cases: about 1.7 % of the generated answers name a day, and
+        // each mutant of the scanner is killed whatever the seed (the
+        // parser review's round 3: at 256 cases, 51–94 % of runs).
+        #![proptest_config(ProptestConfig::with_cases(2_048))]
+
+        /// BX13 (R2-2, the parser review's round 2): spot's day count over
+        /// generated `account.rateLimits.orders` answers — each entry's
+        /// type and interval plain or escaped, its figures in and past
+        /// range, a key left out or named twice — against the scanner's
+        /// documented reading, computed from the entries themselves.
+        #[test]
+        fn the_spot_days_count_is_read_as_documented(entries in proptest::collection::vec((0usize..5, 0usize..5, 0usize..4, 0usize..5, 0usize..4, 0usize..20, 0usize..20), 0..5)) {
+            // Weighted toward the day's own entry (a key's index past 4 is
+            // no key: one left out or named twice a quarter of the time).
+            const KINDS: [&str; 5] = ["ORDERS", "ORDERS", "ORDERS", "RAW_REQUESTS", "ORD\\u0045RS"];
+            const INTERVALS: [&str; 5] = ["DAY", "DAY", "DAY", "SECOND", "D\\u0041Y"];
+            const NUMS: [u64; 4] = [1, 1, 2, 10];
+            const LIMITS: [u64; 5] = [0, 1, 200_000, 200_000, 4_294_967_297];
+            const COUNTS: [u64; 4] = [0, 1_234, 1_234, 4_294_967_296];
+            let mut body = std::string::String::from(r#"{"id":7,"status":200,"result":["#);
+            let mut want = Some(None);
+            for (i, &(k, v, n, l, c, omit, twice)) in entries.iter().enumerate() {
+                if i > 0 {
+                    body.push(',');
+                }
+                let members = [
+                    format!(r#""rateLimitType":"{}""#, KINDS[k]),
+                    format!(r#""interval":"{}""#, INTERVALS[v]),
+                    format!(r#""intervalNum":{}"#, NUMS[n]),
+                    format!(r#""limit":{}"#, LIMITS[l]),
+                    format!(r#""count":{}"#, COUNTS[c]),
+                ];
+                let mut first = true;
+                body.push('{');
+                for (j, m) in members.iter().enumerate() {
+                    let times = usize::from(j != omit) + usize::from(j == twice && j != omit);
+                    for _ in 0..times {
+                        if !first {
+                            body.push(',');
+                        }
+                        body.push_str(m);
+                        first = false;
+                    }
+                }
+                body.push('}');
+                want = want.and_then(|day: Option<(u32, u32)>| {
+                    if omit < 5 || twice < 5 || KINDS[k].contains('\\') || INTERVALS[v].contains('\\') {
+                        return None;
+                    }
+                    if KINDS[k] != "ORDERS" || INTERVALS[v] != "DAY" || NUMS[n] != 1 {
+                        return Some(day);
+                    }
+                    if day.is_some() || LIMITS[l] == 0 {
+                        return None;
+                    }
+                    Some(Some((u32::try_from(COUNTS[c]).ok()?, u32::try_from(LIMITS[l]).ok()?)))
+                });
+            }
+            body.push_str("]}");
+            let f = body.as_bytes();
+            let mut a = WsAnswer::default();
+            prop_assert!(scan_answer(f, &mut a).is_ok(), "{}", body);
+            prop_assert_eq!(scan_day_orders(f, a.result), want.flatten(), "{}", body);
+        }
+    }
+
+    proptest! {
         #[test]
         fn never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
             let mut a = WsAnswer::default();
@@ -975,6 +1177,8 @@ pub(crate) mod tests {
                 let _ = (a.cid.get(&bytes), a.result.get(&bytes));
                 // BX8 (P2-6c): a subscribe's answer judged on any result.
                 let _ = scan_subscribed(&bytes, a.result);
+                // BX13 (R2-2): spot's day count read from any result.
+                let _ = scan_day_orders(&bytes, a.result);
                 // BX8: a user frame's event lies in the frame, and reads on.
                 prop_assert!(a.event.at as usize + a.event.len as usize <= bytes.len());
                 if a.user {

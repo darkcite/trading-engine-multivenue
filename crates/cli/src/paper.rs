@@ -6535,9 +6535,9 @@ fn mirror_hlgw_metrics(
 
 /// The `engine_exec_bn_*` family's counters: the arm's, the gateway's
 /// tallies, then the refusals by reason.
-const BNARM_COUNTERS: usize = 21 + clob_dispatcher::BINANCE_REFUSALS;
+const BNARM_COUNTERS: usize = 22 + clob_dispatcher::BINANCE_REFUSALS;
 /// Its level gauges.
-const BNARM_GAUGES: usize = 34;
+const BNARM_GAUGES: usize = 40;
 
 /// The counter rows, in [`bnarm_counter_values`] order — which is what
 /// pins the two together; the refusals' rows are
@@ -6564,6 +6564,7 @@ const BNARM_COUNTER_NAMES: [&str; BNARM_COUNTERS] = [
     "engine_exec_bn_quiet_total",
     "engine_exec_bn_dns_reresolved_total",
     "engine_exec_bn_events_other_total",
+    "engine_exec_bn_recon_held_total",
     "engine_exec_bn_refused_unbound_total",
     "engine_exec_bn_refused_not_live_total",
     "engine_exec_bn_refused_not_owner_total",
@@ -6590,7 +6591,7 @@ const BNARM_COUNTER_NAMES: [&str; BNARM_COUNTERS] = [
 /// `BinanceArmReport`'s totals in [`BNARM_COUNTER_NAMES`] order: one
 /// literal, built in place (the refusals by index — a change of their
 /// count fails to compile here).
-// COPY: [u64; 42] (336 B) returned by value — cold, the 5 s /metrics
+// COPY: [u64; 43] (344 B) returned by value — cold, the 5 s /metrics
 // mirror (then kept as the next delta's baseline); the fields are visited
 // once in the name order — a borrowed view would need the report to be an
 // array, which the POD is not.
@@ -6618,6 +6619,7 @@ fn bnarm_counter_values(r: &clob_dispatcher::BinanceArmReport) -> [u64; BNARM_CO
         r.quiet,
         r.dns_reresolved,
         r.events_other,
+        r.recon_held,
         f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15], f[16], f[17], f[18], f[19],
         f[20],
     ]
@@ -6642,6 +6644,12 @@ const BNARM_GAUGE_NAMES: [&str; BNARM_GAUGES] = [
     "engine_exec_bn_weight_max",
     "engine_exec_bn_opt_weight_used",
     "engine_exec_bn_opt_weight_max",
+    "engine_exec_bn_spot_weight_used",
+    "engine_exec_bn_spot_weight_max",
+    "engine_exec_bn_spot_day_unfilled",
+    "engine_exec_bn_spot_day_cap",
+    "engine_exec_bn_spot_sell_cap",
+    "engine_exec_bn_spot_day_seeded",
     "engine_exec_bn_orders_10s_used",
     "engine_exec_bn_orders_10s_cap",
     "engine_exec_bn_orders_1m_used",
@@ -6663,7 +6671,7 @@ const BNARM_GAUGE_NAMES: [&str; BNARM_GAUGES] = [
 
 /// `BinanceArmReport`'s levels in [`BNARM_GAUGE_NAMES`] order; an unsigned
 /// level past `i64::MAX` — a heartbeat not yet seen — reads −1.
-// COPY: [i64; 34] (272 B) returned by value — cold, as above.
+// COPY: [i64; 40] (320 B) returned by value — cold, as above.
 fn bnarm_gauge_values(r: &clob_dispatcher::BinanceArmReport) -> [i64; BNARM_GAUGES] {
     let g = |v: u64| i64::try_from(v).unwrap_or(-1);
     [
@@ -6684,6 +6692,12 @@ fn bnarm_gauge_values(r: &clob_dispatcher::BinanceArmReport) -> [i64; BNARM_GAUG
         g(r.weight_max),
         g(r.opt_weight_used),
         g(r.opt_weight_max),
+        g(r.spot_weight_used),
+        g(r.spot_weight_max),
+        g(r.spot_day_unfilled),
+        g(r.spot_day_cap),
+        g(r.spot_sell_cap),
+        g(r.spot_day_seeded),
         g(r.orders_10s_used),
         g(r.orders_10s_cap),
         g(r.orders_1m_used),
@@ -6737,7 +6751,7 @@ fn register_bnarm_metrics(
             .map_err(|_| "register bn arm gauge")?;
         k += 1;
     }
-    // COPY: the 288 B id block ((41 + 31) × 4 B), returned by value once at
+    // COPY: the 332 B id block ((43 + 40) × 4 B), returned by value once at
     // boot — rejected: an out-param for a one-time move.
     Ok(ExecBnArmMetricIds { counters, gauges })
 }
@@ -6763,7 +6777,7 @@ fn mirror_bnarm_metrics(
         reg.gauge(ids.gauges[k]).set(g[k]);
         k += 1;
     }
-    // COPY: the 41 totals (328 B) kept as the next delta's baseline — 5 s
+    // COPY: the 43 totals (344 B) kept as the next delta's baseline — 5 s
     // cadence, cold; a delta needs the previous value.
     *last = c;
 }
@@ -8567,7 +8581,7 @@ fn update_tick_age(
 /// **BX11** — the Binance arm's report as `/state` shows it
 /// (`exec.arms.binance_gw`): the operator's subset, each word saturated
 /// into its narrower field rather than wrapped.
-// COPY: the 368 B block returned by value into the snapshot — cold, once a
+// COPY: the 424 B block returned by value into the snapshot — cold, once a
 // second; built whole — rejected: an out-param (the same bytes, and a
 // borrow of the snapshot through the call).
 fn binance_gw_snapshot(b: &clob_dispatcher::BinanceArmReport) -> engine_snapshot::BinanceGwSnapshot {
@@ -8616,6 +8630,13 @@ fn binance_gw_snapshot(b: &clob_dispatcher::BinanceArmReport) -> engine_snapshot
         weight_max: b.weight_max,
         opt_weight_used: b.opt_weight_used,
         opt_weight_max: b.opt_weight_max,
+        spot_weight_used: b.spot_weight_used,
+        spot_weight_max: b.spot_weight_max,
+        spot_day_unfilled: b.spot_day_unfilled,
+        spot_day_cap: b.spot_day_cap,
+        spot_sell_cap: b.spot_sell_cap,
+        spot_day_seeded: b.spot_day_seeded,
+        recon_held: b.recon_held,
         orders_10s_used: b.orders_10s_used,
         orders_10s_cap: b.orders_10s_cap,
         orders_1m_used: b.orders_1m_used,

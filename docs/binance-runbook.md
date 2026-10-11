@@ -1,20 +1,21 @@
-# Binance execution — the operator's runbook (BX11)
+# Binance execution — the operator's runbook (BX11; BX13)
 
 Anton runs this. It covers the Binance arm's keys, the Demo tools, the
 account tools, the fee measurement, the halts, deploying after a merge,
-the arming preconditions, spot's and options' own rules, and the Binance
-Stocks tools. The laws are in
+the arming preconditions, spot's and options' own rules, the Binance
+Stocks tools and the R0 ramp on mainnet (§13). The laws are in
 `docs/risk-policy.md`, "BX — the Binance execution laws (BX-1 …
 BX-20)"; the design is `docs/binance-exec-plan.md`.
 
-**Status (BX10, 2026-10-11).** The arm boots USDⓈ-M and COIN-M futures
+**Status (BX13, 2026-10-11).** The arm boots USDⓈ-M and COIN-M futures
 under the classic, Portfolio Margin (`pm`) and PM Pro (`pm_pro`) account
 modes, and spot — bStocks included — and options under classic alone:
 makers on USDⓈ-M classic only, IoC everywhere else. Options arm alone or
 beside USDⓈ-M only. Binance Stocks is built but the engine refuses it
 (ruling S-3): only the operator's MAINNET battery drives it (§12).
-**No member arms (O-BX6)** before BX13. Spot's own rules are §10,
-options' §11, Binance Stocks' §12.
+**No member arms (O-BX6).** BX13 builds the R0 ramp — the battery on
+MAINNET, yours to run (§13); a member's arming stays a ruling of its own.
+Spot's own rules are §10, options' §11, Binance Stocks' §12.
 
 Every command below runs from the checkout whose release binary you
 vetted (`cargo build --release -p cli`), through `scripts/exec-smoke.sh`:
@@ -271,6 +272,13 @@ slot already halted (your switch).
   tallies), `/metrics` `engine_exec_bn_*`, the TUI's `bn` chip. Non-zero
   `in_doubt`, `anchor_unsaved`, `journal_dropped`, `jobs_dropped`,
   `fills_deferred` or `events_other` deserve a look.
+- **A held cycle** (BX13, R3-1: `/state` `recon_held`; `J_RECON` code
+  2): a reconciliation that landed while an order's trades were still
+  being read is inconclusive — neither drift nor reconciled; the next
+  runs at once when the read answers. Not a halt of its own: one now and
+  then is normal on spot; a count that keeps climbing while
+  `recon-stale` nears means the trades reads are not answering — read
+  the log's `myTrades` answers.
 
 ## 6. A boot that does not arm
 
@@ -326,7 +334,7 @@ None of these is met by the code alone; each is yours.
 - **The ruling:** O-BX6 lifted for the slot (BX13).
 - **The gates, on the tree you arm:** gates 94, 94b and 108 and the
   loopback set pass — `make alloc-assert` (the Mac, release: 125/125) and
-  `cargo nextest run -p exec-binance` (`bn_e2e_loopback`, 64 tests).
+  `cargo nextest run -p exec-binance` (`bn_e2e_loopback`, 71 tests).
   Gates 94 and 94b pin USDⓈ-M classic's allocations, gate 108 spot's;
   the loopback set also exercises COIN-M, Portfolio Margin, PM Pro and
   spot (not the futures' margin calls beyond USDⓈ-M's); none is a WAN
@@ -341,12 +349,10 @@ None of these is met by the code alone; each is yours.
 - **Spot** (BX8), when armed: the spot Demo exit seen on the binary
   (`--binance-probe spot`, `--binance spot --lifecycle`; risk-policy
   "BX8"); gate 108 on the tree; spot instruments quoted in USDT, one per
-  base asset; no session bound on the slot; §10's rules kept. And the
-  code still owed (risk-policy "BX8", the risk review's R2-2 and R2-4):
-  spot's day count seeded at boot from the WS API's
-  `account.rateLimits.orders` and a reserve below 200 000 for a spot SELL;
-  spot's request weight metered in a window of its own, or an unread day
-  retried at most once a minute. And O-BX22 ruled, or a spot price feed:
+  base asset; no session bound on the slot; §10's rules kept (BX13 built
+  the code R2-2 and R2-4 owed: the venue's day count read before the
+  first spot order, a SELL's reserve, spot's own weight window). And
+  O-BX22 ruled, or a spot price feed:
   no spot mark reaches the router's ledger, so the slot's
   `cap_instance_usd_1e6` prices its other spot holdings at their last
   fill and an adopted one at the boot's ticker.
@@ -366,7 +372,9 @@ None of these is met by the code alone; each is yours.
   `min_maker_ttl_ms` ≥ 5 000; the `[exec.binance]` block
   (`exec.toml.example` lists the variants this binary boots).
 - **The worker:** its PMLR reader reads the adopted and settlement fill
-  flags before any surface folds Binance fills (risk-policy "BX7").
+  flags before any surface folds Binance fills (risk-policy "BX7") —
+  built in BX13 (`FillRec.flags`; the position fold, the dashboard and
+  `vrp_shadow` count neither as a trade).
 - **The members:** every member trading the slot reads
   `FILL_FLAG_ADOPTED` as opening inventory, never a trade (risk-policy
   "BX7").
@@ -374,18 +382,19 @@ None of these is met by the code alone; each is yours.
   Arming it needs R17's ruling (a member and an equity market-data
   source) and a build; §12's battery is its only driver.
 - **The binary:** the Demo evidence of §7 on the very binary you arm.
+- **R0** (BX13): the ramp's record on this account, every bar met
+  (§13).
 - **The boot:** `--arm-live <slot>`; the boot tells
-  `binance: LIVE ARM ARMED — …` (or names what refused it). The first
-  mainnet fill seen on the user stream is BX13's first bar.
+  `binance: LIVE ARM ARMED — …` (or names what refused it).
 
 ## 9. Exit codes (`scripts/exec-smoke.sh`)
 
 | codes | tool |
 |---|---|
-| 50–57 | the battery's phases (account, boot, cycle, post-only, TTL, sweep, reconciliation, fills); the Binance Stocks battery's are §12's |
-| 58 | something left on the Demo account, or an end that could not read it — on the Binance Stocks battery, on the **LIVE** account (§12: clear it in the app at once) |
+| 50–57 | the battery's phases (account, boot, cycle, post-only, TTL, sweep, reconciliation, fills); the Binance Stocks battery's are §12's, the R0 ramp's §13's |
+| 58 | something left on the Demo account, or an end that could not read it — on the Binance Stocks battery and the R0 ramp, on the **LIVE** account (§12, §13: clear it at once) |
 | 59 | the probe (the Binance Stocks probe too) |
-| 60–64 | the account tools: a read, a refusal, the arm's orders resting, a position still open, mainnet without `--confirm`; 64 is also the Binance Stocks battery without `--bn-confirm-mainnet` (its plan printed, nothing sent) |
+| 60–64 | the account tools: a read, a refusal, the arm's orders resting, a position still open, mainnet without `--confirm`; 64 is also the Binance Stocks battery and the R0 ramp without `--bn-confirm-mainnet` (the plan printed, nothing sent) |
 | 65 | the gap drill: the dead-man was not seen to cancel the makers |
 | 66 | the spot battery: the permission check refused the boot — the account lacks a group the spot row needs (the bStock check); the Binance Stocks battery: `486410`, the US-equity disclaimer unsigned (§12); nothing placed either way |
 
@@ -417,16 +426,26 @@ compared.
   asset: Simple Earn's auto-subscribe, Auto-Invest and Convert. Each moves
   the balance outside the arm: drift.
 - **The day's unfilled-order count** (the venue's ORDERS pool: 200 000 a
-  UTC day, an order that fills taking one off). The arm mirrors it at
-  `orders_frac` and refuses past its share — 160 000 at 80 % — every spot
-  order, sells included, until 00:00Z: the exit is then by hand, in the
-  app. The count is not in `/state`; an IoC member placing 80 orders every
-  10 s, most of them unfilled, reaches the share in about 6 h. The mirror
-  starts at 0 at every boot (the venue's own count is not read): after a
-  restart the venue may refuse first, with `-1015`, which the gateway
-  reads as the budget — the whole gateway goes quiet, futures included
-  (no heartbeat: the venue's dead-man cancels the futures' makers), and
-  the slot halts `budget-floor`. Both are carried to BX13 (§8).
+  UTC day, an order that fills taking one off). BX13 (R2-2): the gateway
+  reads the venue's own count and limit (`account.rateLimits.orders`) at
+  each venue day's first cycle, and no spot order goes before it is read
+  (the arm's `NotReady`; a refused read is asked again each cycle, a
+  malformed one is a scan failure — and a scan failure halts the slot
+  `recon-drift`, futures included, until a restart: §5). The arm then
+  mirrors it at
+  `orders_frac`: BUYs stop at the share — 160 000 at 80 % — and a SELL
+  goes on into a reserve past it (half of what the limit leaves, at most
+  10 000: to 170 000), so a sell-down is never starved by the day's buys;
+  past the reserve every spot order waits for 00:00Z, the rest of the
+  limit yours by hand. `/state` `spot_day` shows the count, both caps and
+  whether the venue's count was read. An IoC member placing 80 orders
+  every 10 s, most of them unfilled, reaches the share in about 6 h.
+- **Spot's request weight** (BX13, R2-4): metered in a window of its own
+  — the venue's spot pool, 6 000 a minute per IP, the arm's share 3 600 —
+  at spot's weights (`account.status` 20, `openOrders` 80, `myTrades`
+  20). Past 80 % an early reconciliation waits (the throttle), and an
+  unread day's `myTrades` is retried only while the window holds it and a
+  whole cycle more. `/state` `spot_weight`.
 - **Keep the BNB-burn setting fixed while armed.** It decides the asset
   each commission is charged in: the base asset on a BUY with it off, BNB
   with it on. The reconciliation follows each trade's own asset either
@@ -643,3 +662,143 @@ detail's executions, the history rows, a cancel's answer, Ed25519 on
 `/sapi/v1/equity/*`) — risk-policy "BX10", the residuals. It does not arm
 anything: an engine that trades Stocks needs R17's ruling (a member and
 a market-data source) and a build.
+
+## 13. The R0 ramp on MAINNET (BX13)
+
+**Real money, on your live account.** The battery of §2 — the engine's
+own composition: the router, the venue split, the arm, the gateway on its
+thread, fill lane 4 — run on MAINNET with the engine's own key, to the
+R0 bars (plan §5 BX13). Its PASS is the R0 record a member's arming
+reads (§8). It arms no slot of the running engine and needs none: the
+engine's Binance arm stays dark. The rulings (2026-10-11): R-1 USDⓈ-M,
+COIN-M, spot and options, each at its minimum size; R-2 options' bar 4
+round trips (2 LONG, 2 SHORT); R-3 the account classic — Portfolio Margin
+and PM Pro are not run (K13, K14 carried).
+
+**The command lines** — each first WITHOUT the word: it reads the live
+account (the checks of §2's phase 0, the rows, the options row), prints
+one `phase:"plan"` line per product (the row's tick, step and minimum
+notional, R0's counts, the clamps) and sends nothing — exit 64. The plan
+read, the same line with `--bn-confirm-mainnet`:
+
+```
+# 1. USDⓈ-M, COIN-M and spot (the WS API; Ed25519):
+scripts/exec-smoke.sh --binance um,cm,spot --lifecycle --bn-mainnet \
+  --bn-cm-symbol BTCUSD_PERP --bn-usd 12
+#    the plan read: … the same flags … --bn-confirm-mainnet
+
+# 2. Options, alone (eapi, the HMAC pair — Q-1):
+scripts/exec-smoke.sh --binance options --lifecycle --bn-mainnet --bn-usd 50
+#    … --bn-confirm-mainnet
+
+# 3. The dead-man (USDⓈ-M on the WS API; two makers rest, the gateway
+#    dies, the venue's countdown must cancel them):
+scripts/exec-smoke.sh --binance um --lifecycle --bn-mainnet --bn-drill gap
+#    … --bn-confirm-mainnet
+```
+
+- **R0's counts are fixed** on mainnet: 20 USDⓈ-M maker cycles (behind
+  the touch: they never fill) and 3 round trips; 20 COIN-M round trips;
+  20 spot round trips; 4 options round trips. `--bn-cycles` and
+  `--bn-fill-pairs` are refused beside `--bn-mainnet`, and so is the
+  flatten drill (R0's drill is the gap drill).
+- **Adoption is 0 on mainnet** unless you name it: a spot base balance
+  the account holds refuses the boot (exit 51, naming `--bn-adopt-usd`)
+  — pass its value (USD) to adopt it as the run's starting inventory,
+  never sold by the run; the plan line prints `adopt_usd` and the
+  instance cap it makes.
+- **Sizes:** every order is `--bn-usd` raised to its row's minimum
+  notional — so the futures trade their minimum (USDⓈ-M's 100 USDT,
+  COIN-M's one contract). Spot's BUY must leave a SELL above the minimum
+  after the base-asset fee: 12 USD is about twice spot's minimum. Options'
+  `--bn-usd` is the most premium an IoC through the touch may cost (a
+  dearer touch ends unfilled at the band's edge — short of R0): read the
+  options row and its book in the plan first.
+- **`--bn-cm-symbol`:** Demo's default is `BNBUSD_PERP` (Demo's coin
+  wallet holds BNB); on mainnet name a contract whose coin the account
+  holds as margin.
+- **The clamps:** one order 600 USD; the instance 2 000 USD past the
+  adopted spot balance (none unless named); the day's buying 20 000 USD (mainnet's own,
+  `CAP_DAY_MAINNET_USD_1E6`); 16 orders working; the halts
+  `exec.toml.example`'s.
+- **The order of runs:** 1, then 2, then 3 — each exit 0 before the next.
+  Stop at the first non-zero and read its report.
+- **The cost, roughly:** each futures round trip pays two taker fees on
+  its minimum and the spread twice — USDⓈ-M's 3 and COIN-M's 20 some
+  2–5 USD together; spot's 20 at 12 USD some 0.5–1 USD; options' 4 cross
+  the options spread eight times on the row's minimum quantity (the
+  plan's band says how wide) — the largest share.
+
+**Before you run it (the checklist):**
+
+- [ ] The binary: the deployed release that carries BX13, its §7 Demo
+  evidence passed (`--binance um,cm --lifecycle`, the gap drill, spot's,
+  options').
+- [ ] Those Demo runs' `END` lines read for what R0 judges first on
+  mainnet (Demo's bar does not): `journal_dropped`, `recs_dropped`,
+  `fills_dropped`, `fills_unseen`, `fees_short`, `fees_extra`,
+  `fees_unjudged`, `scan_failed` and `fills_lost` all 0; `clean_streak`
+  ≥ 3; the margin samples ≥ 1 for the futures products and options the
+  run armed (`margins_usdm`, `margins_coinm`, `margins_options`; spot
+  has none) — the drills judge none of these: their own line is their
+  bar. One that is not: stop and read why before mainnet.
+- [ ] The engine's Binance arm dark: no `--arm-live`, no Binance slot
+  armed in `exec.toml` — an armed engine and the battery on one account
+  read each other's orders as orphans or strangers.
+- [ ] The account dedicated and quiet: nothing resting anywhere; flat on
+  the run's futures symbols; no manual trading during the run.
+- [ ] `--binance-setup um --bn-network mainnet` and `… cm …` read, then
+  applied with `--confirm`: one-way, single-asset (USDⓈ-M), each symbol
+  CROSSED at a leverage within 20.
+- [ ] Margin: USDT in USDⓈ-M; the contract's coin in COIN-M; USDT in spot
+  for the BUYs (the base asset held is adopted, never sold by the run);
+  the options account funded in USDT, its writing enabled for the SHORT
+  round trips (`nakedSell`).
+- [ ] The key (§1): Ed25519 with futures and spot trading, withdrawals
+  off, IP-restricted; the HMAC pair for options (`BINANCE_HMAC_*`).
+- [ ] BNB burn off for futures (a fee paid in BNB is reported, not
+  refused); spot's as set, kept fixed during the run.
+- [ ] The clock: clear of 00:00Z (the venue's day roll: spot's count, the
+  day reads) and of options' 08:00Z expiry by half an hour; 30 minutes
+  free.
+- [ ] One Ctrl-C only: it ends the run short through its end (closes,
+  sweep, the flat read); a second kills at once — USDⓈ-M's dead-man then
+  cancels the makers within 30 s, and anything else is yours to clear.
+
+**When it does not end 0 — on the LIVE account:**
+
+| exit | means | what to do |
+|---|---|---|
+| 50 | the account check: not flat, an order resting, a setting BX-19 refuses, a key or a balance missing — nothing placed | `--binance-setup … --bn-network mainnet`; clear the account; read the line it names |
+| 51 | the boot (the log names the `BootErr`) — nothing placed but the tap's listenKey | as named; a held spot balance past `--bn-adopt-usd` is named too |
+| 52–55 | a maker cycle, the post-only refusal, the TTL, the halt's sweep — or R0's count short in that phase | read the report; the end closed, swept and read the account: `left` empty means flat with nothing resting |
+| 56 | a reconciliation that never agreed, a halt — or R0 short of 3 clean reconciliations in a row, the journal not whole (a record dropped), a margin sample missing, a scan failure | read the legs in the report and the account's trades in the app |
+| 57 | a fill missing, a round trip short of R0, a fill booked without its trade report (the streams lost a trade), an order's fee row missing or twice (order by order: `fees_short`, `fees_extra`) or unjudged, a fill lost | read the `r0` lines; widen nothing on mainnet without reading why |
+| 58 | **something left on the LIVE account** — a position, an order — or its end could not read it | **at once:** `--binance-flatten <um\|cm> --bn-network mainnet --confirm --bn-cancel-first`, or the app; spot's and options' in the app |
+| 64 | no `--bn-confirm-mainnet`: the plan printed, nothing sent | read the plan; add the word |
+| 65 | the gap drill: the dead-man was not seen to cancel the makers (the run cancelled them by id) | read the drill's line; do not arm a USDⓈ-M maker until it passes |
+| 66 | the spot permission check refused the boot — nothing placed | the account's spot permissions, in the app |
+
+**The R0 record.** Every run prints one `{"phase":"r0",…}` line per bar
+armed — `product`, `bar`, `have`, `want`, `bound` (`at_least` /
+`at_most`), `met` — and the gap drill one for the dead-man. Copy them
+into the vault (`docs/research/bx/r0-<date>.md`, never git) under this
+head, one table per run:
+
+```
+# R0 — <date>, binary <git sha>, account classic, key <Ed25519|HMAC>
+| run | exit | product | bar | have | want | met |
+|---|---|---|---|---|---|---|
+| um,cm,spot | 0 | usdm | maker cycles | 20 | 20 | true |
+| …          |   |      |              |    |    |      |
+Notes: the END line's fills, fees (and any `fees_bnb`), streak, the
+venue's first fee rates (bn-fees), anything the plan or the run showed
+that the docs did not.
+```
+
+R0 is met when every line of the three runs reads `met: true` and each
+exit is 0 — among them, for each run: the journal whole (no record
+dropped), three clean reconciliations in a row, every fill booked from
+its trade report, exactly one `J_FEE` a trade — order by order — with
+its asset judged, no scan failure, no fill lost. It changes nothing by itself: arming a
+member is a ruling of its own (§8).

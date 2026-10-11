@@ -317,13 +317,27 @@ class Position:
     net_qty: int = 0
     open_cost: int = 0
     realized: int = 0
+    #: Trades folded — never an adopted fill nor a settlement (BX13).
     fills: int = 0
+    #: Adopted fills (the venue's position at boot: opening inventory).
+    adopted: int = 0
+    #: Settlements (a payout or an exercise: the position's end).
+    settlements: int = 0
 
-    def apply(self, side: int, px: int, qty: int) -> None:
+    def apply(self, side: int, px: int, qty: int, flags: int = 0) -> None:
+        """Fold one fill. ``flags`` (``FillRec.flags``) says what it is: an
+        adopted fill opens the position at its price and a settlement
+        closes it at its price, as any fill does — but neither counts as a
+        trade (``fills``)."""
         if qty <= 0:
             raise ValueError(f"fill qty must be positive: {qty}")
         delta = qty if side == SIDE_BID else -qty
-        self.fills += 1
+        if flags & claude_worker.pmlr.FILL_FLAG_ADOPTED:
+            self.adopted += 1
+        elif flags & claude_worker.pmlr.FILL_FLAG_SETTLEMENT:
+            self.settlements += 1
+        else:
+            self.fills += 1
         if self.net_qty == 0 or (self.net_qty > 0) == (delta > 0):
             self.net_qty += delta
             self.open_cost += px * delta
@@ -345,15 +359,39 @@ class Position:
 def reconstruct_positions(
     fills: typing.Iterable[claude_worker.pmlr.FillRec],
 ) -> dict[int, Position]:
-    """Fold fills (file order = time order) into per-symbol positions."""
+    """Fold fills (file order = time order) into per-symbol positions — an
+    adopted fill as opening inventory, a settlement as the position's
+    settlement, each a trade otherwise (:meth:`Position.apply`)."""
     positions: dict[int, Position] = {}
     for fill in fills:
         pos = positions.get(fill.sym)
         if pos is None:
             pos = Position(sym=fill.sym)
             positions[fill.sym] = pos
-        pos.apply(fill.side, fill.px, fill.qty)
+        pos.apply(fill.side, fill.px, fill.qty, fill.flags)
     return positions
+
+
+class FillCounts(typing.NamedTuple):
+    """What a run's fills were (BX13): trades, adopted inventory,
+    settlements — the three never summed into one count of trades."""
+
+    trades: int
+    adopted: int
+    settlements: int
+
+
+def count_fills(fills: typing.Iterable[claude_worker.pmlr.FillRec]) -> FillCounts:
+    """Count ``fills`` by what each is (``FillRec.flags``)."""
+    trades = adopted = settlements = 0
+    for f in fills:
+        if f.flags & claude_worker.pmlr.FILL_FLAG_ADOPTED:
+            adopted += 1
+        elif f.flags & claude_worker.pmlr.FILL_FLAG_SETTLEMENT:
+            settlements += 1
+        else:
+            trades += 1
+    return FillCounts(trades, adopted, settlements)
 
 
 class PositionView(typing.NamedTuple):

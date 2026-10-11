@@ -304,6 +304,8 @@ fn bn_chip(s: &EngineSnapshot) -> String {
         (b.scan_failed, "scan_failed"),
         (b.events_other, "events_other"),
         (b.locks, "locks"),
+        // BX13 (R3-1): cycles held inconclusive — rare, and named.
+        (b.recon_held, "recon_held"),
     ] {
         if n != 0 {
             let _ = write!(out, "  !{what} {n}");

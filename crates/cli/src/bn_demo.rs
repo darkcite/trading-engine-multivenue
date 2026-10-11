@@ -3,14 +3,14 @@
 
 //! **BX7b — the Demo client** (plan §5 "BX7b"; the build plan
 //! `claude/bx7b-build-plan-2026-10-08.md` §3.2): the cold pieces the
-//! K-probes ([`crate::bn_probe`]) and the Demo battery
-//! ([`crate::bn_battery`]) share.
+//! K-probes ([`crate::bn_probe`]) and the battery ([`crate::bn_battery`]:
+//! Demo's, and BX13's R0 on mainnet) share.
 //!
 //! * [`demo_config`] — the Demo key (Ed25519, or HMAC by its word) on the
-//!   Demo hosts. Every host the probes and the battery dial must be Demo's
-//!   ([`demo_host`], BX-16): no flag points them at mainnet, and they read
-//!   only the `BINANCE_DEMO_*` variables `scripts/exec-smoke.sh` exports.
-//!   (BX11's account tools alone reach mainnet, below.)
+//!   Demo hosts. Every host the probes dial must be Demo's ([`demo_host`],
+//!   BX-16): no flag points them at mainnet, and they read only the
+//!   `BINANCE_DEMO_*` variables `scripts/exec-smoke.sh` exports. (BX11's
+//!   account tools and BX13's R0 battery reach mainnet, below.)
 //! * [`Rest`] — one product's signed REST client, speaking **the gateway's
 //!   own templates** (`rest::lane_specs` at 0, a futures product's
 //!   `rest::ord_specs` at [`ORD0`]) and parameter renderers. So a request
@@ -45,16 +45,20 @@
 //!   [`Rest::sign_change`], which refuses a mainnet host without the
 //!   operator's sealed word (`MainnetVerb`); and on a mainnet host the
 //!   client sends no request that changes anything (a template not a GET)
-//!   unless it was signed so, whatever path rendered it. The probes and the
-//!   battery keep the Demo-only constructors.
+//!   unless it was signed so, whatever path rendered it — or, BX13, sent
+//!   unsigned by [`Rest::plain_change`] holding the word (the listenKey).
+//!   The probes keep the Demo-only constructors; the battery (BX13) takes
+//!   these, on the network its configuration names: Demo's, or mainnet's
+//!   under `--bn-mainnet`.
 //!
 //! COPY-DOCTRINE: operator tools run by hand — against Binance Demo, and
-//! the account tools against mainnet by the operator's word — never
-//! reachable from the engine loop: they allocate and copy freely (answers,
-//! frames, reports). One engine path borrows [`Rest`] (BX9, Q-5): the live
-//! arm's boot reads the options held (`bn_live::held_options`, one signed
-//! `GET /eapi/v1/position` before anything trades) — a boot read, cold and
-//! once, under the same doctrine; never the trading loop.
+//! the account tools and the R0 battery against mainnet by the operator's
+//! word — never reachable from the engine loop: they allocate and copy
+//! freely (answers, frames, reports). One engine path borrows [`Rest`]
+//! (BX9, Q-5): the live arm's boot reads the options held
+//! (`bn_live::held_options`, one signed `GET /eapi/v1/position` before
+//! anything trades) — a boot read, cold and once, under the same doctrine;
+//! never the trading loop.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -160,6 +164,25 @@ pub(crate) fn demo_host(host: &str) -> Result<(), String> {
     }
 }
 
+/// **Every one of the configuration's hosts on `net`** ([`exec_binance::config::Hosts::all`],
+/// the twelve) — checked again here, where the tools dial (BX-16; the
+/// configuration checked them at its construction): Demo's for the Demo
+/// tools, mainnet's for the R0 battery.
+///
+/// # Errors
+/// The first host off `net`.
+pub(crate) fn hosts_on(cfg: &BnConfig, net: Network) -> Result<(), String> {
+    let all = cfg.hosts().all();
+    let mut i = 0;
+    while i < all.len() {
+        if network_of(all[i]) != net {
+            return Err(format!("`{}` is not a {net:?} host — these tools dial {net:?}'s alone (BX-16)", all[i]));
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 /// An id the arm owns or sweeps: `cid::classify` reads it as this boot's
 /// or as an orphan of an earlier one (the battery's account check, the
 /// flatten's refusal).
@@ -202,13 +225,10 @@ pub(crate) fn demo_config(hmac: bool) -> Result<BnConfig, String> {
             if hmac { "HMAC" } else { "Ed25519" }
         )
     })?;
-    let h = cfg.hosts();
     // Every one of the twelve (BX8: spot's WS API too; its REST host is
     // SAPI's; BX9: eapi's and the options stream host; BX10: the equity
     // stream's, never dialled on Demo — Stocks has none).
-    for host in [&h.fut_wsapi, &h.fut_user, &h.fut_rest, &h.cm_wsapi, &h.cm_user, &h.cm_rest, &h.papi, &h.sapi, &h.spot_wsapi, &h.eapi, &h.opt_user, &h.eq_user] {
-        demo_host(host)?;
-    }
+    hosts_on(&cfg, Network::Demo)?;
     Ok(cfg)
 }
 
@@ -440,6 +460,15 @@ impl WordGuard {
         Self { live, writes, worded: 0 }
     }
 
+    /// A change may be signed or sent from this client: on a host off
+    /// Demo's network only holding the operator's sealed word.
+    fn may_change(&self, verb: Option<&MainnetVerb>) -> Result<(), &'static str> {
+        if self.live && verb.is_none() {
+            return Err(MainnetVerb::operator_verb(false).err().unwrap_or("unconfirmed"));
+        }
+        Ok(())
+    }
+
     /// Window `t` rendered without the word (`sign`, `plain`).
     fn rendered(&mut self, t: usize) {
         if t < 64 {
@@ -640,15 +669,41 @@ impl Rest {
     /// # Errors
     /// The parameters do not fit, or the request failed.
     pub(crate) fn plain(&mut self, t: usize, params: &[u8]) -> Result<Answer, String> {
+        self.put_params(t, params)?;
+        self.call(t, params.len())
+    }
+
+    /// `params` rendered into template `t`'s window as they are, holding no
+    /// word ([`Rest::plain`], [`Rest::plain_change`]).
+    ///
+    /// # Errors
+    /// The parameters do not fit the window.
+    fn put_params(&mut self, t: usize, params: &[u8]) -> Result<(), String> {
         self.guard.rendered(t);
         let w = self.http.window_mut(t);
         if params.len() > w.len() {
             return Err(String::from("the parameters do not fit the template's window"));
         }
         // COPY: the parameters into the request window — at most `WIN`
-        // (2 KiB), checked above — the render itself: the template's
-        // window is the only way onto the wire.
+        // (2 KiB), checked above — the render itself; rejected: callers
+        // rendering into the window themselves (they hold literals and
+        // the time — the one copy is this render).
         w[..params.len()].copy_from_slice(params);
+        Ok(())
+    }
+
+    /// **BX13 — an unsigned change sent** (the listenKey's POST, which takes
+    /// the API key alone): [`Rest::plain`]'s render, on a mainnet host only
+    /// holding the operator's sealed word — refused unsent without it, as
+    /// [`Rest::sign_change`] refuses. Demo's need none.
+    ///
+    /// # Errors
+    /// A mainnet host and no word, the parameters do not fit, or the
+    /// request failed.
+    pub(crate) fn plain_change(&mut self, t: usize, params: &[u8], verb: Option<&MainnetVerb>) -> Result<Answer, String> {
+        self.word_held(verb)?;
+        self.put_params(t, params)?;
+        self.guard.worded(t);
         self.call(t, params.len())
     }
 
@@ -681,13 +736,20 @@ impl Rest {
         verb: Option<&MainnetVerb>,
         render: impl FnOnce(&mut QueryWriter<'_>, &WsStatic, u64),
     ) -> Result<usize, String> {
-        if self.guard.live && verb.is_none() {
-            let why = MainnetVerb::operator_verb(false).err().unwrap_or("unconfirmed");
-            return Err(format!("{}: {why}", self.host()));
-        }
+        self.word_held(verb)?;
         let n = self.sign(t, signer, false, render)?;
         self.guard.worded(t);
         Ok(n)
+    }
+
+    /// **A change's reach**: a mainnet host only holding the operator's
+    /// sealed word ([`Rest::sign_change`], [`Rest::plain_change`]); Demo's
+    /// need none.
+    ///
+    /// # Errors
+    /// A mainnet host and no word.
+    fn word_held(&self, verb: Option<&MainnetVerb>) -> Result<(), String> {
+        self.guard.may_change(verb).map_err(|why| format!("{}: {why}", self.host()))
     }
 
     /// Send the `n` bytes [`Rest::sign`] rendered into template `t`'s
@@ -1026,17 +1088,19 @@ fn discover_on(cfg: &BnConfig, product: u8, tls: &Arc<ClientConfig>) -> Result<B
 }
 
 /// **BX8 — one spot symbol's `exchangeInfo`** (`GET
-/// /api/v3/exchangeInfo?symbol=`) from the Demo REST host (SAPI's) into a
-/// discovery table: the whole spot page — every symbol, the bStocks'
-/// permission sets of some 200 groups each — is past the read's room.
+/// /api/v3/exchangeInfo?symbol=`) from `cfg`'s spot REST host (SAPI's —
+/// Demo's, or mainnet's for the R0 battery by the operator's word, BX13)
+/// into a discovery table: the whole spot page — every symbol, the
+/// bStocks' permission sets of some 200 groups each — is past the read's
+/// room.
 ///
 /// # Errors
-/// The host is not Demo's, `symbol` is not one ([`spot_symbol_ok`]: it
+/// The host is not on the configuration's network, `symbol` is not one ([`spot_symbol_ok`]: it
 /// rides the path), the read failed (the venue answers `-1121` for a
 /// symbol it does not list) or the page did not parse.
 pub(crate) fn discover_spot(cfg: &BnConfig, symbol: &str, tls: &Arc<ClientConfig>) -> Result<BnDiscovery, String> {
     let host = cfg.hosts().lane(PRODUCT_SPOT).rest;
-    demo_host(host)?;
+    scope_host(host, cfg)?;
     if !spot_symbol_ok(symbol) {
         return Err(format!("`{symbol}` is not a spot symbol (1 to {WIRE_SYMBOL_MAX} upper-case letters and digits)"));
     }
@@ -1673,6 +1737,30 @@ mod tests {
             }
         }
         assert!(!WordGuard::new(false, 0).send(64), "past the guard's templates: refused anywhere");
+        // BX13 (the risk review's round 2): the word's check before any
+        // change is signed or sent (`sign_change`, `plain_change` — the
+        // tap's listenKey: the guard's bit is set by the change itself).
+        let verb = MainnetVerb::operator_verb(true).expect("the word");
+        assert!(WordGuard::new(true, 0).may_change(None).is_err(), "mainnet, no word: refused");
+        assert!(WordGuard::new(true, 0).may_change(Some(&verb)).is_ok(), "mainnet, the word");
+        assert!(WordGuard::new(false, 0).may_change(None).is_ok(), "Demo needs none");
+    }
+
+    /// BX13 (the risk and zero-copy reviews' round 2): one host list
+    /// ([`hosts_on`], the configuration's twelve) — the Demo tools on
+    /// Demo's, the R0 battery on mainnet's; a configuration on the other
+    /// network refused.
+    #[test]
+    fn every_host_is_checked_on_its_network() {
+        let key = "vmPUZE6mv9SD5VNHk4HlWFsOr6aKE2zvsw0MuIgwCIPy6utIco14y7Ju91duEh8A";
+        let cfg = |scope: Scope| {
+            let seed = core_config::SecretKeyBytes::new_locked([7u8; 32]).expect("mlock in tests");
+            BnConfig::new(scope, exec_binance::config::Hosts::of(scope), String::from(key), seed).expect("a configuration")
+        };
+        let (live, demo) = (cfg(Scope::Live), cfg(Scope::Demo));
+        assert_eq!((hosts_on(&live, Network::Mainnet), hosts_on(&demo, Network::Demo)), (Ok(()), Ok(())));
+        assert!(hosts_on(&demo, Network::Mainnet).is_err(), "Demo's hosts are not mainnet's");
+        assert!(hosts_on(&live, Network::Demo).is_err(), "mainnet's are not Demo's");
     }
 
     #[test]
@@ -1686,8 +1774,7 @@ mod tests {
         // BX8: every one of the Demo scope's twelve hosts — spot's WS API,
         // (BX9) eapi's and the options stream host, (BX10) the equity
         // stream's.
-        let h = exec_binance::config::Hosts::of(Scope::Demo);
-        for host in [&h.fut_wsapi, &h.fut_user, &h.fut_rest, &h.cm_wsapi, &h.cm_user, &h.cm_rest, &h.papi, &h.sapi, &h.spot_wsapi, &h.eapi, &h.opt_user, &h.eq_user] {
+        for host in exec_binance::config::Hosts::of(Scope::Demo).all() {
             assert!(demo_host(host).is_ok(), "{host}");
         }
     }

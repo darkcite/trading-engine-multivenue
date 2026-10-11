@@ -1087,6 +1087,17 @@ fn i32_array(c: &mut Cursor<'_>, a: &[i32]) {
     c.put(b"]");
 }
 
+/// A weight pool as `,"<key>":{"used":…,"max":…}` (the gateway's three:
+/// the futures', options' and, BX13, spot's).
+fn used_max(c: &mut Cursor<'_>, key: &str, used: u64, max: u64) {
+    c.key(key);
+    c.put(b"{\"used\":");
+    c.u64(used);
+    c.key("max");
+    c.u64(max);
+    c.byte(b'}');
+}
+
 /// A per-tenor bit mask as `[0|1, …]`, tenor order.
 fn bits(c: &mut Cursor<'_>, mask: u16) {
     c.put(b"[");
@@ -1308,18 +1319,22 @@ fn binance_gw_json(c: &mut Cursor<'_>, b: &crate::BinanceGwSnapshot) {
     c.i64(i64::try_from(b.heartbeat_age_ms).unwrap_or(-1));
     c.key("clock_offset_ms");
     c.i64(b.clock_offset_ms);
-    c.key("weight");
-    c.put(b"{\"used\":");
-    c.u64(b.weight_used);
-    c.key("max");
-    c.u64(b.weight_max);
+    used_max(c, "weight", b.weight_used, b.weight_max);
+    used_max(c, "opt_weight", b.opt_weight_used, b.opt_weight_max);
+    // BX13 (R2-4, R2-2, R3-1): spot's own pool, spot's day, held cycles.
+    used_max(c, "spot_weight", b.spot_weight_used, b.spot_weight_max);
+    c.key("spot_day");
+    c.put(b"{\"unfilled\":");
+    c.u64(b.spot_day_unfilled);
+    c.key("cap");
+    c.u64(b.spot_day_cap);
+    c.key("sell_cap");
+    c.u64(b.spot_sell_cap);
+    c.key("seeded");
+    c.u64(b.spot_day_seeded);
     c.byte(b'}');
-    c.key("opt_weight");
-    c.put(b"{\"used\":");
-    c.u64(b.opt_weight_used);
-    c.key("max");
-    c.u64(b.opt_weight_max);
-    c.byte(b'}');
+    c.key("recon_held");
+    c.u64(b.recon_held);
     c.key("orders_10s");
     c.put(b"{\"used\":");
     c.u64(b.orders_10s_used);
@@ -1860,6 +1875,11 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("\"heartbeat_age_ms\":-1,\"clock_offset_ms\":-12,\"weight\":{\"used\":100,\"max\":1200},\"opt_weight\":{\"used\":0,\"max\":0},"), "{body}");
+        // BX13: spot's pool, spot's day and the held cycles, after eapi's.
+        assert!(
+            body.contains("\"opt_weight\":{\"used\":0,\"max\":0},\"spot_weight\":{\"used\":0,\"max\":0},\"spot_day\":{\"unfilled\":0,\"cap\":0,\"sell_cap\":0,\"seeded\":0},\"recon_held\":0,\"orders_10s\":"),
+            "{body}"
+        );
         assert!(
             body.contains("\"refused\":{\"unbound\":4,\"not_live\":0,") && body.contains("\"deadman_down\":0,\"flags\":9,\"not_writable\":7}}},\"halted\":["),
             "{body}"

@@ -1657,6 +1657,23 @@ pub struct BinanceArmReport {
     pub opt_weight_used: u64,
     /// See [`Self::opt_weight_used`].
     pub opt_weight_max: u64,
+    /// BX13 (R2-4): spot's request weight spent in the last minute, and the
+    /// spot lane's share of spot's own minute (its pool, apart).
+    pub spot_weight_used: u64,
+    /// See [`Self::spot_weight_used`].
+    pub spot_weight_max: u64,
+    /// BX13 (R2-2): spot's unfilled orders today as the arm mirrors them,
+    /// the BUYs' share and a SELL's ceiling, and `1` once the venue's own
+    /// count was read (no spot order before).
+    pub spot_day_unfilled: u64,
+    /// See [`Self::spot_day_unfilled`].
+    pub spot_day_cap: u64,
+    /// See [`Self::spot_day_unfilled`].
+    pub spot_sell_cap: u64,
+    /// See [`Self::spot_day_unfilled`].
+    pub spot_day_seeded: u64,
+    /// BX13 (R3-1): reconciliation cycles held inconclusive.
+    pub recon_held: u64,
     /// The ORDERS pool's windows: placements in the last 10 s and minute,
     /// and their caps.
     pub orders_10s_used: u64,
@@ -1702,7 +1719,8 @@ pub struct BinanceArmReport {
 
 // BX11: 75 words — pinned, as the other blocks crossing this boundary are.
 // BX9: + the `not_writable` refusal, options' margin and eapi's weight (79).
-const _: () = assert!(core::mem::size_of::<BinanceArmReport>() == 632);
+// BX13: + spot's weight, spot's day and the held cycles (86).
+const _: () = assert!(core::mem::size_of::<BinanceArmReport>() == 688);
 
 /// **BX3 (F9) — an accepted order that ended without a (further) fill**,
 /// as the arm tells the router ([`OrderDispatch::try_next_retired`]).

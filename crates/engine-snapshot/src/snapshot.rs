@@ -1023,6 +1023,22 @@ pub struct BinanceGwSnapshot {
     pub opt_weight_used: u64,
     /// See [`Self::opt_weight_used`].
     pub opt_weight_max: u64,
+    /// BX13 (R2-4): spot's weight in the last minute, and the spot lane's
+    /// share (spot's own pool).
+    pub spot_weight_used: u64,
+    /// See [`Self::spot_weight_used`].
+    pub spot_weight_max: u64,
+    /// BX13 (R2-2): spot's unfilled orders today, the BUYs' share, a
+    /// SELL's ceiling, and `1` once the venue's count was read.
+    pub spot_day_unfilled: u64,
+    /// See [`Self::spot_day_unfilled`].
+    pub spot_day_cap: u64,
+    /// See [`Self::spot_day_unfilled`].
+    pub spot_sell_cap: u64,
+    /// See [`Self::spot_day_unfilled`].
+    pub spot_day_seeded: u64,
+    /// BX13 (R3-1): reconciliation cycles held inconclusive.
+    pub recon_held: u64,
     /// The ORDERS windows' placements and caps (10 s, 1 min).
     pub orders_10s_used: u64,
     /// See [`Self::orders_10s_used`].
@@ -1045,7 +1061,7 @@ pub struct BinanceGwSnapshot {
     pub margin_options_1e6: i64,
 }
 
-const _: () = assert!(core::mem::size_of::<BinanceGwSnapshot>() == 368);
+const _: () = assert!(core::mem::size_of::<BinanceGwSnapshot>() == 424);
 
 /// The whole snapshot — see the module docs and plan §6.1.
 #[derive(Copy, Clone)]
@@ -1187,10 +1203,12 @@ mod tests {
         // B at BX7b; BX11's `exec.arms.binance_gw` (344 B, and the rings'
         // 64 B alignment after it) makes it 31,808 B: 960 B left. BX9's
         // 24 B more in that block (368 B: the `not_writable` refusal,
-        // options' margin and eapi's weight) fit the same alignment.
+        // options' margin and eapi's weight) fit the same alignment. BX13's
+        // 56 B more (424 B: spot's weight, spot's day, the held cycles)
+        // cross it: 31,872 B, 896 B left.
         let n = core::mem::size_of::<EngineSnapshot>();
         assert!(n <= 32 * 1024, "EngineSnapshot grew to {n} B");
-        assert_eq!(n, 31_808, "the BX11 figure: a change states its own");
+        assert_eq!(n, 31_872, "the BX13 figure: a change states its own");
         assert_eq!(core::mem::size_of::<VmRowView>(), 48);
         assert_eq!(core::mem::size_of::<HarSnapshot>(), 2_216);
     }

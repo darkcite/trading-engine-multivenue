@@ -336,7 +336,11 @@ impl Hosts {
         }
     }
 
-    fn all(&self) -> [&str; 12] {
+    /// **Every host the scope names** — the twelve, one list: the
+    /// configuration's check here and the tools' where they dial (BX-16;
+    /// the zero-copy review of BX13: a thirteenth host is one edit).
+    #[must_use]
+    pub fn all(&self) -> [&str; 12] {
         [
             &self.fut_wsapi,
             &self.fut_user,

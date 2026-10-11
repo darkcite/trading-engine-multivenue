@@ -1143,6 +1143,17 @@ pub struct VState {
     pub spot_subscribes: u32,
     /// Their `account.status` reads served.
     pub spot_accounts: u32,
+    /// BX13 (R2-2): `account.rateLimits.orders`' DAY entry — the account's
+    /// unfilled orders today and the day's limit.
+    pub spot_day_count: u32,
+    /// See [`Self::spot_day_count`].
+    pub spot_day_limit: u32,
+    /// The next this-many reads answer 200 naming no DAY entry.
+    pub spot_day_malformed: u32,
+    /// The next this-many reads are refused (400, `-1000`).
+    pub spot_day_refused: u32,
+    /// `account.rateLimits.orders` reads served (refused ones too).
+    pub spot_day_reads: u32,
     /// `ticker/price` reads served.
     pub spot_tickers: u32,
     // ---- Options (BX9) ----------------------------------------------------
@@ -1399,6 +1410,11 @@ impl VState {
             spot_logons: 0,
             spot_subscribes: 0,
             spot_accounts: 0,
+            spot_day_count: 0,
+            spot_day_limit: 200_000,
+            spot_day_malformed: 0,
+            spot_day_refused: 0,
+            spot_day_reads: 0,
             spot_tickers: 0,
             opt_orders: Vec::new(),
             opt_pos_1e6: BTreeMap::new(),
@@ -2685,6 +2701,27 @@ impl VState {
                 self.spot_accounts += 1;
                 let r = self.spot_account();
                 self.spot_reply(s, ws_ok(id, &r));
+            }
+            // BX13 (R2-2): the account's unfilled orders, the docs' shape.
+            "account.rateLimits.orders" => {
+                self.spot_day_reads += 1;
+                let a = if self.spot_day_refused > 0 {
+                    self.spot_day_refused -= 1;
+                    ws_err(id, 400, -1000, "An unknown error occurred while processing the request.")
+                } else {
+                    let ten = r#"{"rateLimitType":"ORDERS","interval":"SECOND","intervalNum":10,"limit":100,"count":0}"#;
+                    let day = if self.spot_day_malformed > 0 {
+                        self.spot_day_malformed -= 1;
+                        String::new()
+                    } else {
+                        format!(
+                            r#",{{"rateLimitType":"ORDERS","interval":"DAY","intervalNum":1,"limit":{},"count":{}}}"#,
+                            self.spot_day_limit, self.spot_day_count
+                        )
+                    };
+                    ws_ok(id, &format!("[{ten}{day}]"))
+                };
+                self.spot_reply(s, a);
             }
             _ => {
                 self.unknown += 1;

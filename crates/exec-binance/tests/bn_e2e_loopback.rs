@@ -82,6 +82,19 @@
 //! | a subscription answered without its id | that session dropped, the next carries the boot; none ever: refused in Connect |
 //! | a ticker naming another symbol | the balance unpriced: the boot refused (`Inventory`) |
 //!
+//! BX13 adds:
+//!
+//! | test | asserts |
+//! |---|---|
+//! | spot's day and pool (R2-2, R2-4) | the venue's count read beside the first cycle's account read, once a venue day; the mirror starts at it, the caps from its limit; an unfilled IoC stays counted; spot's weight in its own window, none in the futures' |
+//! | no spot order before the day is read (R2-2) | `NotReady` while unread; a refused read asked again each next cycle; a malformed one a scan failure, never a count of 0 |
+//! | a held cycle (R3-1) | marked `J_RECON_HELD` in the journal and counted `GW_RECON_HELD` |
+//! | `-5028` (BX-6) | the clock's round, the place never re-sent |
+//! | a REST place answered 503 `-1007` (BX-11) | in doubt, resolved by its status (the stream held), never re-sent; it cancels |
+//! | the same beside its stream's `NEW` | resolved by whichever names it first, never a refusal, never re-sent; it cancels |
+//! | the gateway's last tallies | the exit's pulse carries them: the arm's agreeing cycles are the journal's |
+//! | the margin call on COIN-M, PM and PM Pro (BX-20) | `MarginRisk` with a healthy ratio, a `J_MARGIN` marked a call, the lane's (or the unified) account re-read at once |
+//!
 //! Offline-path doctrine: this test allocates freely.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,7 +103,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clob_dispatcher::{
-    CancelAllState, DispatchError, OrderDispatch, PaperDispatcher, RouteAliases, RETIRED_CANCELED_MEMBER,
+    BinanceArmReport, CancelAllState, DispatchError, OrderDispatch, PaperDispatcher, RouteAliases, RETIRED_CANCELED_MEMBER,
     RETIRED_CANCELED_TTL, RETIRED_CANCELED_VENUE, RETIRED_EXPIRED, RETIRED_FILLED, RETIRED_REJECTED,
 };
 use core_config::universe::LEGACY_BN_ANCHOR_SYM;
@@ -102,8 +115,8 @@ use core_types::{
     FILL_FLAG_SETTLEMENT,
 };
 use exec_binance::arm::{
-    ArmKnobs, BnArm, GW_CONNECT_FAILURES, GW_EVENTS_OTHER, GW_FILLS_FOREIGN, GW_JOBS_DROPPED, GW_RECON_DRIFT_LEGS, GW_RECON_OK,
-    GW_RECON_UNSEEN_LEGS,
+    ArmKnobs, BnArm, GW_CONNECT_FAILURES, GW_EVENTS_OTHER, GW_FILLS_FOREIGN, GW_JOBS_DROPPED, GW_RECON_DRIFT_LEGS,
+    GW_RECON_HELD, GW_RECON_OK, GW_RECON_UNSEEN_LEGS,
 };
 use exec_binance::cmd::{duplex, BnEngineEnd};
 use exec_binance::config::{BnConfig, HmacSigner, Scope};
@@ -113,7 +126,7 @@ use exec_binance::gateway::{
 use exec_binance::inst::{BindSpec, InstTable, PRODUCT_COINM, PRODUCT_SPOT, PRODUCT_USDM};
 use exec_binance::journal::{
     fee_fields, JournalTx, FEE_ASSET_BNB, FEE_ASSET_OTHER, FEE_ASSET_SETTLE, JOURNAL_RING, J_ACK, J_ANCHOR, J_ENDED, J_FEE, J_FILL,
-    J_FILL_ADOPTED, J_FILL_UNSEEN, J_RECON, J_REJECT, J_SWEEP, J_VENUE, TRADE_BY_ADL, TRADE_BY_LIQUIDATION, TRADE_BY_MEMBER,
+    J_FILL_ADOPTED, J_FILL_UNSEEN, J_MARGIN, J_RECON, J_RECON_HELD, J_REJECT, J_SWEEP, J_VENUE, TRADE_BY_ADL, TRADE_BY_LIQUIDATION, TRADE_BY_MEMBER,
     TRADE_BY_ORPHAN, TRADE_BY_SETTLEMENT,
 };
 use exec_binance::margin::{MarginBook, SLOTS};
@@ -219,6 +232,13 @@ impl Engine {
 
     fn retired(&self, why: u8) -> u64 {
         self.d.retired().by_why[why as usize]
+    }
+
+    /// The arm's report (BX13: spot's day and pool), as `/state` reads it.
+    fn report(&self) -> BinanceArmReport {
+        let mut r = BinanceArmReport::default();
+        assert!(self.d.live().binance_arm_report(core_time::now_ns(), &mut r));
+        r
     }
 
     /// The gateway's tally `k` (`GW_*`), as of its last pulse.
@@ -586,7 +606,13 @@ impl<const J: usize> Rig<J> {
     }
 
     /// The shutdown sweep ends the gateway thread.
-    fn shutdown(mut self) -> Consumer<ExecRecord, J> {
+    fn shutdown(self) -> Consumer<ExecRecord, J> {
+        self.shutdown_counted().0
+    }
+
+    /// [`Rig::shutdown`], and the arm's reconciliations agreed once the
+    /// gateway has ended (its events drained).
+    fn shutdown_counted(mut self) -> (Consumer<ExecRecord, J>, u64) {
         self.e.d.on_shutdown();
         let t0 = Instant::now();
         while !self.gw_thread.is_finished() {
@@ -597,7 +623,9 @@ impl<const J: usize> Rig<J> {
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(self.gw_thread.join().expect("gateway"), Phase::Exiting);
-        self.journal
+        self.e.turn();
+        let ok = self.e.gw(GW_RECON_OK);
+        (self.journal, ok)
     }
 }
 
@@ -1611,6 +1639,166 @@ fn a_stream_margin_call_halts_the_slot_and_rereads_the_account() {
     assert_eq!(reads, 2, "the call's own re-read, then the confirming cycle's");
     let rig = Rig { e, ..rig };
     let _journal = rig.shutdown();
+}
+
+/// **BX13 (BX-6's open line): a `-5028` resyncs the clock as a `-1021`
+/// does, and its place is never re-sent.** The venue refuses a place with
+/// `-5028` ("outside of the ME recvWindow"): the order is rejected and
+/// counted, the clock's round starts (four reads), and the next place
+/// trades — each sent once. Break-and-watch: `-5028` classified an
+/// ordinary refusal leaves the clock unread (the round never comes).
+#[test]
+fn a_5028_resyncs_the_clock_and_its_place_is_never_resent() {
+    let venue = Venue::start();
+    let rig = Rig::boot(&venue, 60_000_000_000, 60_000);
+    let mut e = rig.e;
+    let times = |v: &VState| v.log.iter().filter(|l| l.as_str() == "GET /fapi/v1/time").count();
+    let t0 = venue.with(|v| times(v));
+    venue.with(|v| v.refuse_place = Some(-5028));
+    assert_eq!(e.d.submit(&order(511, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 2_000)), Ok(()));
+    e.until("the refusal", |e| e.retired(RETIRED_REJECTED) == 1);
+    e.until("the clock's round", |_| venue.with(|v| times(v)) == t0 + 4);
+    assert_eq!(e.d.live().counters().rejected, 1);
+    e.idle_for(300);
+    assert_eq!(e.d.submit(&order(512, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 2_000)), Ok(()));
+    e.until("the next IoC fills", |e| e.pos() == Some(2_000));
+    e.idle_for(150);
+    let sent = |oid: u64| venue.with(|v| v.places.iter().filter(|p| p.contains(&cid(EPOCH, oid))).count());
+    assert_eq!((sent(511), sent(512)), (1, 1), "each place sent once: the refused one never again");
+    let rig = Rig { e, ..rig };
+    let _journal = rig.shutdown();
+}
+
+/// **BX13 (BX-11's open line): on the REST order route, a place answered
+/// 503 `-1007` is an unknown outcome — in doubt, resolved by the order's
+/// status, never re-sent.** The venue applies the place (it rests) and
+/// answers 503 with `-1007`; the order is put in doubt, `GET
+/// /fapi/v1/order` names it NEW, and it works as any other: it cancels.
+/// The venue saw ONE place. Break-and-watch: the place's unknown outcome
+/// read as a refusal retires the order the venue rests (the status is
+/// never asked). The 503 alone makes it unknown, whatever its code. The
+/// stream's `NEW` is held while the place is out (the risk review's round
+/// 2: read in the same turn as the 503 it resolves the doubt first, and
+/// the status is never asked) — only the status may resolve it here.
+#[test]
+fn a_rest_place_answered_503_1007_is_in_doubt_and_never_resent() {
+    let venue = Venue::start();
+    let rig = Rig::boot_rest_hmac(&venue, 60_000_000_000, 60_000);
+    let mut e = rig.e;
+    venue.with(|v| {
+        v.lose_place_answer = true;
+        v.lose_user = true;
+    });
+    let o = order(621, Side::Bid, ORDER_KIND_MAKER, 60_000_000_000, 2_000);
+    assert_eq!(e.d.submit(&o), Ok(()));
+    e.until("it rests at the venue", |_| venue.rests(621));
+    e.until("the doubt resolved by its status", |_| venue.with(|v| v.log.iter().any(|l| l == "GET /fapi/v1/order")));
+    assert_eq!(e.retired(RETIRED_REJECTED), 0, "an unknown outcome is no refusal");
+    venue.with(|v| v.lose_user = false);
+    e.idle_for(150);
+    assert_eq!(e.d.cancel(&CancelReq::of(&o, core_time::now_ns())), Ok(()));
+    e.until("it is cancelled", |e| !venue.rests(621) && e.retired(RETIRED_CANCELED_MEMBER) == 1);
+    let sent = venue.with(|v| v.places.iter().filter(|p| p.contains(&cid(EPOCH, 621))).count());
+    assert_eq!(sent, 1, "one place: an unknown outcome is never re-sent");
+    let rig = Rig { e, ..rig };
+    let _journal = rig.shutdown();
+}
+
+/// **BX13 (the risk review's round 3): the 503 `-1007`'s other branch** —
+/// the stream's `NEW` free to come before, with or after the answer: the
+/// doubt resolved by whichever names the order first (the status or the
+/// stream), never a refusal, never re-sent, and the order cancels.
+#[test]
+fn a_rest_place_answered_503_1007_beside_its_streams_new_is_never_resent() {
+    let venue = Venue::start();
+    let rig = Rig::boot_rest_hmac(&venue, 60_000_000_000, 60_000);
+    let mut e = rig.e;
+    venue.with(|v| v.lose_place_answer = true);
+    let o = order(622, Side::Bid, ORDER_KIND_MAKER, 60_000_000_000, 2_000);
+    assert_eq!(e.d.submit(&o), Ok(()));
+    e.until("it rests at the venue", |_| venue.rests(622));
+    e.idle_for(1_500);
+    assert_eq!(e.retired(RETIRED_REJECTED), 0, "an unknown outcome is no refusal");
+    assert_eq!(e.d.cancel(&CancelReq::of(&o, core_time::now_ns())), Ok(()));
+    e.until("it is cancelled", |e| !venue.rests(622) && e.retired(RETIRED_CANCELED_MEMBER) == 1);
+    let sent = venue.with(|v| v.places.iter().filter(|p| p.contains(&cid(EPOCH, 622))).count());
+    assert_eq!(sent, 1, "one place: an unknown outcome is never re-sent");
+    let rig = Rig { e, ..rig };
+    let _journal = rig.shutdown();
+}
+
+/// **BX13 (the risk review's round 2): the gateway's last tallies reach
+/// the arm.** The R0 record reads the arm's tallies at the end (records
+/// dropped, fills lost, the reconciliations); the shutdown sweep's
+/// confirming cycle is counted after the last beat, and the exit's own
+/// pulse carries it: the arm's agreeing reconciliations are the
+/// journal's. Break-and-watch: no pulse at the exit leaves the arm short.
+#[test]
+fn the_gateways_last_tallies_reach_the_arm() {
+    let venue = Venue::start();
+    let rig = Rig::boot(&venue, 60_000_000_000, 300);
+    let mut e = rig.e;
+    e.idle_for(700);
+    let (mut journal, counted) = Rig { e, ..rig }.shutdown_counted();
+    let agreed = records(&mut journal).iter().filter(|r| r.kind == J_RECON && r.code & 1 == 1).count() as u64;
+    assert!(agreed > 0, "the run reconciled");
+    assert_eq!(counted, agreed, "every agreeing cycle the gateway journaled, the arm counted");
+}
+
+/// **BX13 (BX-20's open lines): the margin call halts the slot on every
+/// account kind.** COIN-M's dstream `MARGIN_CALL`, Portfolio Margin's
+/// `riskLevelChange` (`/pm/ws/`) and PM Pro's (the risk stream
+/// `/pm-classic/ws/`) each halt the slot `MarginRisk` with a healthy
+/// ratio — the call is the venue's own verdict — journal a `J_MARGIN`
+/// marked a call (`c` = 1) and re-read the lane's account at once. The
+/// halt's sweep confirms clear. Break-and-watch: the call's flag dropped
+/// leaves the slot running; the immediate re-read dropped leaves the
+/// account unread before the halt's confirming cycle.
+#[test]
+fn a_margin_call_halts_the_slot_on_coin_m_pm_and_pm_pro() {
+    struct Case {
+        what: &'static str,
+        mode: AccountMode,
+        event: &'static [u8],
+        read: &'static str,
+    }
+    let call = br#"{"e":"riskLevelChange","E":1790000000000,"u":"1.10","s":"MARGIN_CALL","eq":"1000.0","ae":"1000.0","m":"909.0"}"#;
+    let cases = [
+        Case {
+            what: "COIN-M",
+            mode: AccountMode::Classic,
+            event: br#"{"e":"MARGIN_CALL","E":1790000000000,"i":"","cw":"0.5","p":[{"s":"BTCUSD_PERP","ps":"BOTH","pa":"1","mt":"CROSSED","iw":"0","mp":"65000","up":"-0.0001","mm":"0.0001"}]}"#,
+            read: "wsd account.status",
+        },
+        Case { what: "Portfolio Margin", mode: AccountMode::Pm, event: call, read: "GET /papi/v1/account" },
+        Case { what: "PM Pro", mode: AccountMode::PmPro, event: call, read: "GET /sapi/v1/portfolio/account" },
+    ];
+    for c in cases {
+        let venue = Venue::start();
+        let rig = match c.mode {
+            AccountMode::Pm => Rig::boot_pm(&venue, 60_000_000_000, 60_000),
+            AccountMode::PmPro => Rig::boot_pm_pro(&venue, 60_000_000_000, 60_000),
+            AccountMode::Classic => Rig::boot_cm(&venue, 60_000_000_000, 60_000),
+        };
+        let mut e = rig.e;
+        e.idle_for(300);
+        assert_eq!(e.d.halt().reason(SLOT as usize), HaltReason::None, "{}: a healthy account, no halt", c.what);
+        let at = venue.with(|v| {
+            let q = match c.mode {
+                AccountMode::Pm => &mut v.pm_user_q,
+                AccountMode::PmPro => &mut v.pmc_q,
+                AccountMode::Classic => &mut v.cm_user_q,
+            };
+            q.push_back(c.event.to_vec());
+            v.log.len()
+        });
+        e.until(c.what, |e| e.d.halt().reason(SLOT as usize) == HaltReason::MarginRisk);
+        e.until("its sweep is confirmed clear", |e| !e.d.halt().cancel_outstanding());
+        let first = venue.with(|v| v.log.get(at).cloned().unwrap_or_default());
+        assert_eq!(first, c.read, "{}: the call's own re-read, at once — before the halt's confirming cycle", c.what);
+        let r = records(&mut Rig { e, ..rig }.shutdown());
+        assert!(r.iter().any(|g| g.kind == J_MARGIN && g.c == 1), "{}: a J_MARGIN marked a call", c.what);
+    }
 }
 
 /// BX7 (C2): **Portfolio Margin** — both products on papi, REST only and
@@ -3212,6 +3400,7 @@ fn a_cycle_while_the_order_trades_read_is_pending_holds_the_leg() {
         assert!(v.log[status..listing].iter().any(|l| l == "spot account.status"), "a cycle landed while the read was pending: {:?}", &v.log[status..]);
     });
     assert_eq!((e.gw(GW_RECON_DRIFT_LEGS), e.gw(GW_RECON_UNSEEN_LEGS)), (0, 0));
+    assert_eq!(e.gw(GW_RECON_HELD), 1, "BX13 (R3-1): the held cycle counted apart");
     assert_eq!(e.d.live().halt_signal_for(SLOT).reconciled, 1);
     let r = records(&mut Rig { e, ..rig }.shutdown());
     let drift: Vec<i64> = r.iter().filter(|g| g.kind == J_RECON && g.a != 0).map(|g| g.a).collect();
@@ -3223,7 +3412,8 @@ fn a_cycle_while_the_order_trades_read_is_pending_holds_the_leg() {
         r[booked..].iter().filter(|g| g.kind == J_RECON).map(|g| (g.ts_ns, g.code, g.a, g.b)).collect();
     assert!(verdicts.len() >= 2, "{verdicts:?}");
     let ((held_ns, held_ok, held_drift, held_unseen), (next_ns, next_ok, _, _)) = (verdicts[0], verdicts[1]);
-    assert_eq!((held_ok, held_drift, held_unseen), (0, 0, 0), "the held cycle: inconclusive — not reconciled, no drift");
+    // BX13 (R3-1): the held cycle is marked so, and counted apart.
+    assert_eq!((held_ok, held_drift, held_unseen), (J_RECON_HELD, 0, 0), "the held cycle: inconclusive — not reconciled, no drift");
     assert_eq!(next_ok, 1, "the next cycle reconciled");
     let gap_ms = (next_ns - held_ns) / 1_000_000;
     assert!(gap_ms < 1_000, "the next cycle ran {gap_ms} ms after the held one: at once, not at the 5 s cadence");
@@ -3277,7 +3467,7 @@ fn a_cycle_while_a_bnb_paid_commission_is_read_holds_bnbs_leg_too() {
     let booked = r.iter().position(|g| g.kind == J_FILL && g.code & J_FILL_UNSEEN != 0).expect("the status's booking");
     let verdicts: Vec<(i32, i64, i64)> = r[booked..].iter().filter(|g| g.kind == J_RECON).map(|g| (g.code, g.a, g.b)).collect();
     assert!(verdicts.len() >= 2, "{verdicts:?}");
-    assert_eq!(verdicts[0], (0, 0, 0), "the held cycle: both legs held — not reconciled, no drift on either row");
+    assert_eq!(verdicts[0], (J_RECON_HELD, 0, 0), "the held cycle: both legs held — not reconciled, no drift on either row");
     assert_eq!(verdicts[1].0, 1, "the next cycle reconciled both legs");
     assert!(verdicts.iter().all(|v| v.1 == 0), "no drift once the order was booked: {verdicts:?}");
     let fees: Vec<(u64, u64, i64, u8)> =
@@ -3544,4 +3734,80 @@ fn a_ticker_answer_naming_another_symbol_prices_nothing() {
     let o = Opts { adopt_cap_usd_1e6: 40_000_000_000, ..Opts::spot_only(&[b"BTCUSDT"]) };
     assert_eq!(Rig::boot_gateway(&venue, o).err(), Some(BootErr::Inventory(i64::MAX)), "unpriced: refused");
     assert_eq!(venue.with(|v| v.spot_tickers), 1, "asked once");
+}
+
+/// **BX13 (the risk review's R2-2 and R2-4): spot's day is the venue's own
+/// count, read before the first order, and spot's weight is metered in a
+/// pool of its own.** The venue counts 1 234 unfilled orders today against
+/// a limit of 100 000: the boot's first cycle asks `account.rateLimits.orders`
+/// beside its account read, and the arm's mirror starts there — the BUYs'
+/// share 80 000 (80 %), a SELL's 85 000 (its reserve) — never at 0. An IoC
+/// that fills nothing stays on the count. The cycle's reads and the day's
+/// weigh in spot's own window (100 a cycle, 40 the day's read), none in the
+/// futures'; later cycles of the same venue day ask nothing more.
+/// Break-and-watch: the read unasked (no seed) times the first wait out;
+/// spot weighed in the futures' window fails the pools' split.
+#[test]
+fn spots_day_is_the_venues_count_and_its_weight_its_own_pool() {
+    let venue = Venue::start();
+    venue.with(|v| {
+        v.spot_day_count = 1_234;
+        v.spot_day_limit = 100_000;
+    });
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT"]));
+    let mut e = rig.e;
+    e.until("the venue's day read", |e| e.report().spot_day_seeded == 1);
+    venue.with(|v| {
+        assert_eq!(v.spot_day_reads, 1, "once a venue day");
+        let at = |want: &str| v.log.iter().position(|l| l == want).unwrap_or_else(|| panic!("{want}: {:?}", v.log));
+        assert!(at("spot account.status") < at("spot account.rateLimits.orders"), "beside the first cycle's account read");
+    });
+    let r = e.report();
+    assert_eq!((r.spot_day_unfilled, r.spot_day_cap, r.spot_sell_cap), (1_234, 80_000, 85_000), "the venue's count and limit");
+    venue.with(|v| v.spot_plan.push_back(Vec::new()));
+    assert_eq!(e.d.submit(&order(601, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 1_000)), Ok(()));
+    e.until("EXPIRED unfilled", |e| e.retired(RETIRED_EXPIRED) == 1);
+    assert_eq!(e.report().spot_day_unfilled, 1_235, "an IoC that filled nothing stays on the day's count");
+    // Two more cycles: the day is not asked again.
+    let c0 = venue.with(|v| v.spot_accounts);
+    e.until("two more cycles", |_| venue.with(|v| v.spot_accounts) >= c0 + 2);
+    e.idle_for(150);
+    let r = e.report();
+    assert!(r.spot_weight_used >= 2 + 20 + 40 + 2 * 100, "the logon, the cycles and the day read in spot's own window: {}", r.spot_weight_used);
+    assert_eq!((r.spot_weight_max, r.weight_used), (3_600, 0), "spot's share of its own pool; nothing of spot's in the futures'");
+    venue.with(|v| assert_eq!(v.spot_day_reads, 1, "the same venue day: read once"));
+}
+
+/// **BX13 (R2-2): no spot order before the venue's count is read — a
+/// refused read is asked again, and a read that does not scan is a scan
+/// failure, never a count of 0.** The first two reads are refused (400):
+/// the arm answers a spot order `NotReady` (`Disconnected`), each next
+/// cycle asks again, and the order goes once the third is read. A 200
+/// naming no DAY entry: a scan failure (BX-15) and still no spot order.
+/// Break-and-watch: an unseeded mirror admitting at 0 places the first
+/// order; a refusal waiting out the 30 s retry times the third read out;
+/// a malformed answer taken for a count of 0 seeds the arm.
+#[test]
+fn no_spot_order_goes_before_the_venues_day_is_read() {
+    let venue = Venue::start();
+    venue.with(|v| v.spot_day_refused = 2);
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT"]));
+    let mut e = rig.e;
+    e.until("the first refused read", |_| venue.with(|v| v.spot_day_reads) >= 1);
+    assert_eq!(e.d.submit(&order(611, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 1_000)), Err(DispatchError::Disconnected), "the day unread");
+    e.until("asked again, and read", |e| e.report().spot_day_seeded == 1);
+    venue.with(|v| assert_eq!(v.spot_day_reads, 3, "refused twice, asked again each next cycle"));
+    venue.with(|v| v.spot_plan.push_back(Vec::new()));
+    assert_eq!(e.d.submit(&order(612, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 1_000)), Ok(()));
+    e.until("EXPIRED", |e| e.retired(RETIRED_EXPIRED) == 1);
+    drop(Rig { e, ..rig }.shutdown());
+
+    let venue = Venue::start();
+    venue.with(|v| v.spot_day_malformed = u32::MAX);
+    let rig = Rig::boot_full(&venue, Opts::spot_only(&[b"BTCUSDT"]));
+    let mut e = rig.e;
+    e.until("the malformed read", |e| e.d.live().counters().scan_failed >= 1);
+    assert_eq!(e.report().spot_day_seeded, 0, "never a count of 0");
+    assert_eq!(e.d.submit(&order(613, Side::Bid, ORDER_KIND_IOC, 65_000_000_000, 1_000)), Err(DispatchError::Disconnected));
+    venue.with(|v| assert!(v.spot_places.is_empty(), "nothing placed"));
 }
