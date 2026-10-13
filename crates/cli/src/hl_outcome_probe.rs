@@ -301,8 +301,8 @@ pub fn plan(
     if fav.ask_1e8 < E8 / 2 {
         return Plan::Skip("the favourite's ask is under 0.50");
     }
-    if fav.ask_1e8 > OutcomeRules::PX_MAX_1E8 {
-        return Plan::Skip("the favourite's ask is above 0.999 — not buyable on this venue");
+    if fav.ask_1e8 >= E8 {
+        return Plan::Skip("the favourite's ask is 1.0 — nothing to buy");
     }
     let n = contracts_for(fav.ask_1e8);
     let sz = n * E8;
@@ -312,14 +312,33 @@ pub fn plan(
     if spent_1e8.saturating_add(n * fav.ask_1e8) > MAX_TOTAL_1E8 {
         return Plan::Skip("the $10 total cap");
     }
-    if OutcomeRules::check(fav.ask_1e8, sz).is_err() {
-        return Plan::Skip("off the venue's outcome rules (tick, lot, $1)");
+    if !venue_price(fav.ask_1e8) || sz % OutcomeRules::LOT_1E8 != 0 {
+        return Plan::Skip("off the venue's price law (5 significant figures, whole contracts)");
     }
     Plan::Buy {
         yes: is_yes,
         px_1e8: fav.ask_1e8,
         sz_1e8: sz,
     }
+}
+
+/// Whether `px_1e8` is a price the venue's own book can carry: inside
+/// (0, 1) and at most 5 significant figures — Hyperliquid's general price
+/// law. Mainnet's late books quote 0.99909, 0.9928, 0.0072 and 0.00091
+/// (2026-10-13), finer than the 1e-4 tick and outside the [0.001, 0.999]
+/// range `OutcomeRules` holds from its testnet measurement; the probe buys
+/// the favourite's real ask and lets the venue judge it — a refusal is an
+/// answer and places nothing.
+#[must_use]
+pub const fn venue_price(px_1e8: i64) -> bool {
+    if px_1e8 <= 0 || px_1e8 >= E8 {
+        return false;
+    }
+    let mut n = px_1e8;
+    while n % 10 == 0 {
+        n /= 10;
+    }
+    n < 100_000
 }
 
 /// The probe's client id: [`PROBE_MAGIC`], the run's second-of-start, the
@@ -1184,7 +1203,7 @@ mod tests {
             (yes, yes, 0, 0, "no favourite"),
             (touch(96_000_000, 0, 50), no, 0, 0, "no ask"),
             (touch(40_000_000, 45_000_000, 50), touch(30_000_000, 35_000_000, 50), 0, 0, "under 0.50"),
-            (touch(99_900_000, 100_000_000, 50), no, 0, 0, "above 0.999"),
+            (touch(99_900_000, 100_000_000, 50), no, 0, 0, "1.0"),
             (touch(96_000_000, 97_000_000, 1), no, 0, 0, "under a dollar"),
             (yes, no, 9 * E8, 0, "$10 total cap"),
         ];
@@ -1194,9 +1213,9 @@ mod tests {
                 p @ Plan::Buy { .. } => panic!("{want}: planned {p:?}"),
             }
         }
-        // Off the tick is refused, never rounded.
-        let off = touch(96_000_000, 97_005_000, 50);
-        assert!(matches!(plan(off, no, None, 0, 0, 4), Plan::Skip(w) if w.contains("rules")));
+        // Off the venue's price law (6 significant figures) is refused, never rounded.
+        let off = touch(96_000_000, 97_000_500, 50);
+        assert!(matches!(plan(off, no, None, 0, 0, 4), Plan::Skip(w) if w.contains("price law")));
     }
 
     #[test]
@@ -1308,6 +1327,25 @@ mod tests {
         let yes = touch(96_000_000, 97_000_000, 50);
         let no = touch(3_000_000, 4_000_000, 50);
         assert!(matches!(plan(yes, no, Some(false), 0, 0, 4), Plan::Buy { yes: true, .. }));
+        // Mainnet 12:00:00Z: the favourite (No, by price) asked 0.99909 -- 5
+        // significant figures, a price the venue's own book carries.
+        let yes_late = touch(91_000, 99_280_000, 2_778);
+        let no_late = touch(720_000, 99_909_000, 1_099);
+        assert_eq!(
+            plan(yes_late, no_late, Some(false), 0, 0, 4),
+            Plan::Buy { yes: false, px_1e8: 99_909_000, sz_1e8: 2 * E8 }
+        );
+        for (px, ok) in [
+            (99_909_000, true),
+            (99_280_000, true),
+            (91_000, true),
+            (720_000, true),
+            (97_000_500, false),
+            (E8, false),
+            (0, false),
+        ] {
+            assert_eq!(venue_price(px), ok, "{px}");
+        }
         let mids = br##"{"BTC":"83578.5","ETH":"4101.25","#123450":"0.5"}"##;
         assert_eq!(mid_of(mids, "BTC"), Some(8_357_850_000_000));
         assert_eq!(mid_of(mids, "SOL"), None);
