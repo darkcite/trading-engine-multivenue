@@ -14831,3 +14831,86 @@ opens either file.
   Its re-verification confirmed all six and found one regression — the
   boot's own write erased every hedge's mark before the first oracle —
   fixed: the last known mark is carried until the feed brings one.
+
+## BIN15 H90 — the late-window entry (PAPER) and its live dust test (rulings O-H90-1..10, 2026-10-13)
+
+**Evidence:** vault doc 32 (pre-registered, out-of-sample PASS for τ ∈ [2, 30) s;
+independent rebuild exact). **Plan:** vault doc 33. **Nothing here arms a slot.**
+
+- **The law (strategy-bin15 `late.rs`, `late_reprice`).** For a 15 m family whose
+  time to expiry is inside [`late_tau_min_ns`, `late_tau_max_ns`) (2–30 s), at
+  every reprice — a mark, either leg's snapshot:
+  - **The price (P1b).** A 1-s grid of the mark (fresh < 5 s) and of the HL perp
+    BBO mid (fresh < 3 s), kept per underlying. σ is the RMS of the 1-s mark
+    returns over 900 s, and the price holds below 300 valid returns. The nowcast
+    is the perp mid × the 60-s median of mark/perp. The venue's settlement
+    average (LAW E-11) has a known part, the observed seconds, and an unknown
+    part with `Var = (k·σ·m)²(a·n² + n(n−1)(2n−1)/6)/3600`, k = 1.55. Then
+    `p_yes = Φ(z)` from `late_phi_lut`, an artifact table that reaches 1.0, so
+    near-certain instances are priced as such.
+  - **The entry.** The favourite side, when `p ≥ late_p_min_1e6` (0.90) and its
+    ask ≤ p − `late_e_1e6` (2 c) on `late_persist_polls` (2) consecutive
+    snapshots of that leg. One IoC at that ask, sized at the whole resting ask
+    up to `late_usd_1e6` ($100) and the caps. One entry per instance; a gateway
+    refusal re-arms it.
+  - **Integer only, zero allocation.** Alloc gate 52b covers three families, 90
+    instances, fills and refusals at 0 B. Parity with the worker's mirror is
+    held at tolerance 0 (parity-3).
+- **The bypass, and why.** The late entry is NOT held by `tail_refuse_ns`
+  (10 s) or `tau_min_take_ns`; its own floor is `late_tau_min_ns`.
+  - The S-law's tail hold exists because the production pricer's error near
+    expiry exceeds any edge.
+  - The late pricer is a different law: it prices the settlement average with
+    most of it already observed. Doc 32 measured its hit rate exactly in that
+    window, out of sample.
+  - Every other bound still binds: caps, the grid, one pending take, no short,
+    and fills that move positions.
+- **Counterfactuals (logged, never traded).**
+  - `late_ff_*`: P1b's first pass, with persistence 1.
+  - `late_ctl_*`: the production p̂'s first pass under the same test, where it
+    priced.
+- **Paper only (O-H90-1).** Absent keys mean `late_enabled = 0`, which is
+  today's member bit for bit.
+  - `late_enabled = 1` requires `late_phi_lut`.
+  - Every stated value is bounded.
+  - An absent stake is clamped to the artifact's own per-instance cap.
+  - Today's early coverage entry keeps running on paper as the control
+    (O-H90-2).
+- **Paper bars (pre-registered, doc 33 §3).**
+  - KILL: EV/$ ≤ 0 after 100 settled late entries.
+  - PASS: ≥ 200 settled late entries with hit ≥ 95 %, EV/$ > 0 and day-t ≥ 2.
+  - Always reported: the ≥ 0.97 and < 0.97 ask subsets, per family and per τ
+    band.
+  - A PASS arms nothing. Live is a separate ruling, after the dust test.
+- **The dust test (`multivenue-engine hl-outcome-probe`,
+  `scripts/bin15-late-dust.sh`, O-H90-3), run by the operator before the
+  mainnet agent's approval expires (2026-10-19).**
+  - **What it does.** On the live `out:BTC:15m` instance, at each offset
+    (default 25 / 15 / 8 / 3 s): read both legs' `l2Book`, then buy the
+    favourite at its ask, ⌈$1 / ask⌉ whole contracts, IoC, `expiresAfter` 2 s.
+    Each offset writes one JSON line (the touches and their ages, the answer,
+    the round trip). After expiry it reads back the account's fills and the
+    settlement rows.
+  - **Hard caps.** $10 total notional per invocation (a constant, counted on
+    every order that left the process) and `--max-orders` ≤ 8.
+  - **Network guards.** Mainnet sends need `--confirm`. `--dry-run` signs
+    nothing. `--network testnet` rehearses on the smoke's account.
+  - **Account checks.** The account must have no open order, free spot USDC
+    for every planned order, budget headroom, and the agent listed in
+    `extraAgents` and valid for an hour more.
+  - **Its own client ids.** Probe orders carry `H90D` client ids, which
+    `cloid::decode` reads as `Foreign`, so no slot books a probe fill.
+  - **Unexpected answers.** An IoC that rests is cancelled by client id and
+    fails the run. An answer in doubt stops it.
+  - **Script guards.** The script refuses while `strategy.conf` arms slot 3
+    (two signers as one agent) and while another probe runs.
+  - **The instance it trades.** It is the one the engine's own boot binding
+    adopts (`best_live_spec` over a fresh `outcomeMeta`), read seconds before
+    the first order and checked to expire after every offset.
+  - **What its answer moves.** `late_tau_min_ns` (for example to 8 s), before
+    any live ruling.
+- **Still gated:** arming the late law live, which needs its own ruling
+  after the dust test and the paper bars, and the L6 install on paper (a
+  safe-minute restart, O-H90-10). The harness blocks (`bin15_late_entries`,
+  `bin15_late_fires`, `bin15_late_law`) and the stores
+  (`claude_worker.bin15_late`) landed with L3.

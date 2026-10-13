@@ -95,6 +95,14 @@ in the script; `ai` = 48 is the floor every name includes).
   cost, exits exempt from the order caps, `request_topup_*`). Arming is
   the operator's `scripts/bin15-flip.sh live` (the S7-L1 entry in
   `docs/risk-policy.md`); `bin15-flip.sh paper` disarms. R0's record:
+- **BIN15 H90 — the late-window entry (τ 2–30 s, the P1b TWAP-lock pricer)
+  is BUILT, PAPER ONLY, and OFF until `bin15.toml` carries `late_enabled = 1`
+  with its `late_phi_lut`** (vault docs 32/33, rulings O-H90-1..10;
+  risk-policy "BIN15 H90"; commits `82d3b97` L1+L2, `d3914b5` L3, `8df4515`
+  L4). Its stores are `late_entries.tsv` / `late_fires.tsv`; `bin15_accrue
+  report` scores doc 33 §3's bars. The live dust test is the operator's:
+  `scripts/bin15-late-dust.sh --dry-run`, then `--confirm` (≤ $10, before
+  the mainnet agent approval expires 2026-10-19).
 - **E7 R0 was LIVE ON MAINNET 2026-09-19 13:04Z — slot 3 (bin15)
   armed** (operator ruling; testnet has no 15-minute family, so R0 ran
   there only as the exec battery, vault doc 23). The launchd engine
@@ -332,7 +340,8 @@ in the script; `ai` = 48 is the floor every name includes).
   nextest 3583 (6
   skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`,
   `hyperevm_live_smoke` and `hypercall_live_smoke` among them) · alloc
-  125/125 at the gates' pins (0 B/op; the Binance arm's 94/94b (BX12),
+  126/126 at the gates' pins (0 B/op; BIN15 H90's late window 52b, the
+  Binance arm's 94/94b (BX12),
   108/109 (BX8), 110/111 (BX9) and 112/113 (BX10) among them; gate 85
   is slot 7 over the
   held-quote law, its book handed to the writer's mailbox inside the

@@ -6,6 +6,50 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-13 — `bin15.toml`: nine optional `late_*` keys; `engine_bin15_late_*`; the sidecar's late blocks; `multivenue-engine hl-outcome-probe` (BIN15 H90)
+
+**What changed**
+- `bin15.toml` gains nine OPTIONAL keys (`BIN15_KEYS` 27 → 36):
+  - `late_enabled`;
+  - `late_tau_min_ns` / `late_tau_max_ns` (2 s / 30 s);
+  - `late_p_min_1e6` (900 000) and `late_e_1e6` (20 000);
+  - `late_persist_polls` (2);
+  - `late_usd_1e6` ($100, clamped to `cap_instance_usd_1e6` when absent);
+  - `late_sigma_k_1e3` (1 550);
+  - `late_phi_lut` (4 097 points).
+
+  Absent means `late_enabled = 0`, which is the member as it was, bit for
+  bit. `late_enabled = 1` requires `late_phi_lut`; cut it with
+  `python -m claude_worker.bin15_fit … --late`, which appends the block with
+  the law ON. Every stated value is bounded; the bounds are in
+  `core-config/src/bin15.rs`.
+- The boot line gains `late=<law>`, which reads `off` or
+  `2-30s:p>=0.90:ask<=p-2c:persist2:$100:k1.550`.
+- `/metrics` gains 8 counters: `engine_bin15_late_{reprices, submitted,
+  filled, skipped_stale, skipped_book, skipped_price, skipped_persist,
+  skipped_cap}_total`. The bin15 family now has 41 counters.
+- `backtest --member bin15 --emit-detail` adds three blocks when the law is
+  on: `bin15_late_entries`, `bin15_late_fires` and `bin15_late_law`. They
+  are written in the same branch as `bin15_ledger`. A sidecar of an
+  artifact without the law is byte-identical to before.
+- `claude_worker.bin15_accrue` writes two more stores, through
+  `claude_worker.bin15_late`:
+  - `~/multivenue/worker/bin15/late_entries.tsv` (15 columns);
+  - `~/multivenue/worker/bin15/late_fires.tsv` (13 columns).
+
+  Each lane takes optional `--late-entries` / `--late-fires`, and `report`
+  also takes `--late-fee-bps` (default 14). No verb is added and the 0020
+  line is unchanged. The stores are written only when a sidecar carries the
+  late blocks.
+- `multivenue-engine hl-outcome-probe` is new: the operator's live dust
+  test of the late window, run through `scripts/bin15-late-dust.sh`. It
+  reads `HYPERLIQUID_*` (or `HYPERLIQUID_TESTNET_*` with `--network
+  testnet`) from the environment and never opens `.env`.
+
+**Operator action:** none until the late law is installed on paper (doc 33
+L6). To install it, back up `~/multivenue/bin15.toml`, then append the
+`--late` block.
+
 ## 2026-10-05 — exec-hyperliquid: `HlHttp` on `core_net::HttpsPost`; the shared parser's `204` / `1xx` (XMM HD2)
 
 **What changed**
