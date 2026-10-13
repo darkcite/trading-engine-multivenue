@@ -15476,3 +15476,21 @@ reference legs, and orders on them stay unroutable (the O-HC17 shape).
   - alloc 127/127 at 0 B/op (a fresh `Compiling bench`);
   - copy-audit hits 27, new 0;
   - license-check OK.
+
+### HK8c — nextest test groups (`.config/nextest.toml`)
+
+- The workspace had no nextest configuration. It now has one, with one
+  group, `load-sensitive` (`max-threads = 1`): the six debug-profile
+  allocation tests and `scrape_hammer_all_succeed_without_conn_errors`.
+  These were the standing "isolation-disproven flakes".
+  - Each test already runs in its own process; what they share is the
+    machine.
+  - The allocation tests count through the process-global
+    `CountingAllocator`, where lazy runtime initialisation and scheduler
+    timing can land inside the measured window under load.
+  - The hammer opens many loopback connections at once.
+- `cargo nextest show-config test-groups` lists exactly the seven.
+- `hl_userws_loopback`'s entry is gone: HK4 found a race in that test and
+  fixed it.
+- The file's own rule: a test is added only with the reason it is
+  load-sensitive, never to hide a test that fails alone.
