@@ -15404,3 +15404,27 @@ not reformatted:
   and the int allowance recorded as an assumption.
 - **Gates:** `make py-lint` all checks passed; worker pytest 1 722
   passed, 3 skipped.
+
+### HK8b — the worker's UDS-fixture "flakes" (`claude-worker` tests)
+
+Test-only. Two races in the fixture and its tests, not a parallel-load
+property of the code under test.
+
+- **The listener's backlog.**
+  - `FakeUdsServer` listened with a backlog of one. A CLI invocation's
+    `connect` could be refused while the previous invocation's connection
+    still waited to be accepted.
+  - That is the shape of `test_commit_ruleset_happy_by_hash_then_by_file`
+    (stage, then commit, back to back).
+  - The backlog is 8 now. The fake must not be stricter than the engine,
+    which never meets back-to-back clients.
+- **Frames read on the server's own thread.**
+  - The `test_recommit` family asserted the frame count the moment the
+    client returned, while the fake still read on its own thread.
+  - `FakeUdsServer.wait_for_frames(count)` waits first. The test that
+    asserts the absence of a commit frame waits, then gives a 50 ms grace.
+  - The three copies of `_wait_for_frames` (`test_cli`, `test_commander`,
+    `test_daemon`) are now that one method.
+- **Gates:** worker pytest 1 722 passed, 3 skipped; `make py-lint` all
+  checks passed. The race cannot be forced from here, so the fix rests on
+  the mechanism, not a reproduction.

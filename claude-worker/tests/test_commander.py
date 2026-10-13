@@ -23,15 +23,6 @@ import tests.conftest
 _Wired = tuple[tests.conftest.FakeUdsServer, claude_worker.uds.UdsClient, claude_worker.state.State]
 
 
-def _wait_for_frames(server: tests.conftest.FakeUdsServer, count: int) -> None:
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        if len(server.frames) >= count:
-            return
-        time.sleep(0.01)
-    raise AssertionError(f"expected {count} frames, got {len(server.frames)}")
-
-
 @pytest.fixture
 def wired(
     fake_uds: tests.conftest.FakeUdsServer,
@@ -59,7 +50,7 @@ def test_heartbeat_cadence(wired: _Wired) -> None:
     assert commander.maybe_heartbeat(0) is True  # first call always due
     assert commander.maybe_heartbeat(4_999_999_999) is False
     assert commander.maybe_heartbeat(5_000_000_000) is True
-    _wait_for_frames(server, 2)
+    server.wait_for_frames(2)
     assert server.cmd_field(0, "kind") == claude_worker.frames.KIND_HEARTBEAT
     assert server.cmd_field(1, "kind") == claude_worker.frames.KIND_HEARTBEAT
     assert server.errors == []
@@ -71,7 +62,7 @@ def test_reset_cadence_on_reconnect(wired: _Wired) -> None:
     assert commander.maybe_heartbeat(0) is True
     commander.reset_cadence()
     assert commander.maybe_heartbeat(1) is True  # immediately due again
-    _wait_for_frames(server, 2)
+    server.wait_for_frames(2)
 
 
 def test_emit_set_bias_frame_shape(wired: _Wired) -> None:
@@ -81,7 +72,7 @@ def test_emit_set_bias_frame_shape(wired: _Wired) -> None:
     seq = commander.emit(_label(confidence=0.9, direction="up", half_life_s=600.0))
     assert seq is not None
     assert commander.emitted_total == 1
-    _wait_for_frames(server, 2)
+    server.wait_for_frames(2)
     # §3 SetBias row: sym, signed px, qty 0, ttl required, 0xFF slots.
     assert server.cmd_field(1, "kind") == claude_worker.frames.KIND_SET_BIAS
     assert server.cmd_field(1, "sym") == 7
@@ -102,7 +93,7 @@ def test_emit_down_direction_negative_bias(wired: _Wired) -> None:
     commander = claude_worker.commander.Commander(client, claude_worker.commander.Policy())
     commander.maybe_heartbeat(0)
     commander.emit(_label(confidence=1.0, direction="down"))
-    _wait_for_frames(server, 2)
+    server.wait_for_frames(2)
     assert server.cmd_field(1, "px") == -20_000
 
 
@@ -112,7 +103,7 @@ def test_emit_without_expire_on_silence(wired: _Wired) -> None:
     commander = claude_worker.commander.Commander(client, policy)
     commander.maybe_heartbeat(0)
     commander.emit(_label())
-    _wait_for_frames(server, 2)
+    server.wait_for_frames(2)
     assert server.cmd_field(1, "flags") == 0
 
 
@@ -123,7 +114,7 @@ def test_low_confidence_refused(wired: _Wired) -> None:
     assert commander.emit(_label(confidence=0.5)) is None
     assert commander.refused_low_confidence_total == 1
     assert commander.emitted_total == 0
-    _wait_for_frames(server, 1)  # heartbeat only, no payload
+    server.wait_for_frames(1)  # heartbeat only, no payload
     time.sleep(0.05)  # grace: a stray payload frame would still be in flight
     assert len(server.frames) == 1
 

@@ -16,6 +16,7 @@ import pathlib
 import shutil
 import socket
 import threading
+import time
 
 import pytest
 
@@ -98,6 +99,7 @@ def test_recommit_restages_and_recommits_active_row(
     assert rc == claude_worker.recommit.EXIT_OK
     assert any(full_hash in line for line in lines)
     # heartbeat + RulesetStage + RulesetCommit all reached the engine.
+    fake_uds.wait_for_frames(3)
     assert len(fake_uds.frames) == 3
     assert fake_uds.errors == []
     state = claude_worker.state.State(cfg.db_path)
@@ -126,6 +128,8 @@ def test_drifted_bound_file_refuses_before_commit(
     assert rc == claude_worker.recommit.EXIT_GATE
     assert any("drifted" in line for line in lines)
     # Heartbeat + the stage frame went out; NO commit frame followed.
+    fake_uds.wait_for_frames(2)
+    time.sleep(0.05)  # a stray commit frame would still be in flight
     assert len(fake_uds.frames) == 2
     state = claude_worker.state.State(cfg.db_path)
     try:

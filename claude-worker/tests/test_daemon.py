@@ -17,7 +17,6 @@ import pathlib
 import random
 import signal
 import threading
-import time
 import typing
 
 import anthropic
@@ -84,15 +83,6 @@ def _patch_llm(monkeypatch: pytest.MonkeyPatch, fake: tests.conftest.FakeClient)
     )
 
 
-def _wait_for_frames(server: tests.conftest.FakeUdsServer, count: int) -> None:
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        if len(server.frames) >= count:
-            return
-        time.sleep(0.01)
-    raise AssertionError(f"expected {count} frames, got {len(server.frames)}")
-
-
 def test_serve_one_composed_iteration(
     fake_uds: tests.conftest.FakeUdsServer,
     tmp_path: pathlib.Path,
@@ -123,7 +113,7 @@ def test_serve_one_composed_iteration(
     assert signal.getsignal(signal.SIGTERM) is prev_term  # handlers restored
 
     # Heartbeat + two SetBias frames (g3 real, g4 via cache).
-    _wait_for_frames(fake_uds, 3)
+    fake_uds.wait_for_frames(3)
     assert fake_uds.errors == []
     assert fake_uds.cmd_field(0, "kind") == claude_worker.frames.KIND_HEARTBEAT
     assert fake_uds.cmd_field(1, "kind") == claude_worker.frames.KIND_SET_BIAS
@@ -177,7 +167,7 @@ def test_serve_sigterm_clean_shutdown(
 
     # Shutdown flushed SQLite and closed the UDS: at least the first
     # heartbeat made it out and is recorded.
-    _wait_for_frames(fake_uds, 1)
+    fake_uds.wait_for_frames(1)
     assert fake_uds.cmd_field(0, "kind") == claude_worker.frames.KIND_HEARTBEAT
     reopened = claude_worker.state.State(cfg.db_path)
     assert len(reopened.events(claude_worker.state.EVENT_FRAME_SENT)) >= 1

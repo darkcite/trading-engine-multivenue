@@ -54,17 +54,6 @@ def _invoke(*args: str) -> typer.testing.Result:
     return _RUNNER.invoke(claude_worker.cli.app, list(args))
 
 
-def _wait_for_frames(server: tests.conftest.FakeUdsServer, count: int) -> None:
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        if len(server.frames) >= count:
-            return
-        time.sleep(0.01)
-    raise AssertionError(
-        f"fake server saw {len(server.frames)} frames, wanted {count}; errors={server.errors}"
-    )
-
-
 @pytest.fixture
 def cli_env(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
@@ -138,7 +127,7 @@ def test_push_set_bias_happy(uds_env: tests.conftest.FakeUdsServer) -> None:
         "--expire-on-silence",
     )
     assert result.exit_code == 0, result.output
-    _wait_for_frames(uds_env, 2)
+    uds_env.wait_for_frames(2)
     assert uds_env.errors == []
     # Implicit heartbeat first (§5.4), then the payload.
     assert uds_env.cmd_field(0, "kind") == claude_worker.frames.KIND_HEARTBEAT
@@ -157,7 +146,7 @@ def test_push_set_bias_happy(uds_env: tests.conftest.FakeUdsServer) -> None:
 def test_push_heartbeat_sends_exactly_one_frame(uds_env: tests.conftest.FakeUdsServer) -> None:
     result = _invoke("push", "--kind", "heartbeat")
     assert result.exit_code == 0, result.output
-    _wait_for_frames(uds_env, 1)
+    uds_env.wait_for_frames(1)
     time.sleep(0.05)  # grace: a stray second frame would still be in flight
     assert len(uds_env.frames) == 1
     assert uds_env.cmd_field(0, "kind") == claude_worker.frames.KIND_HEARTBEAT
@@ -181,7 +170,7 @@ def test_push_enable_and_symbol_resolution(
         "60",
     )
     assert result.exit_code == 0, result.output
-    _wait_for_frames(uds_env, 4)
+    uds_env.wait_for_frames(4)
     assert uds_env.cmd_field(1, "kind") == claude_worker.frames.KIND_ENABLE_STRATEGY
     assert uds_env.cmd_field(1, "strategy_id") == 4
     assert uds_env.cmd_field(1, "sym") == claude_worker.frames.SYMBOL_ID_NONE
@@ -210,7 +199,7 @@ def test_push_order_intent_pins_ai_exec_slot(uds_env: tests.conftest.FakeUdsServ
         "5",
     )
     assert result.exit_code == 0, result.output
-    _wait_for_frames(uds_env, 2)
+    uds_env.wait_for_frames(2)
     assert uds_env.cmd_field(1, "kind") == claude_worker.frames.KIND_ORDER_INTENT
     assert uds_env.cmd_field(1, "venue") == claude_worker.frames.VENUE_POLYMARKET
     assert uds_env.cmd_field(1, "side") == claude_worker.frames.SIDE_BID
@@ -245,7 +234,7 @@ def test_push_order_intent_accepts_bybit_venue(
         "5",
     )
     assert result.exit_code == 0, result.output
-    _wait_for_frames(uds_env, 2)
+    uds_env.wait_for_frames(2)
     assert uds_env.cmd_field(1, "kind") == claude_worker.frames.KIND_ORDER_INTENT
     assert uds_env.cmd_field(1, "venue") == claude_worker.frames.VENUE_BYBIT
     assert uds_env.cmd_field(1, "strategy_id") == claude_worker.frames.STRATEGY_SLOT_AI_EXEC
@@ -275,7 +264,7 @@ def test_push_order_intent_accepts_mexc_venue(
         "5",
     )
     assert result.exit_code == 0, result.output
-    _wait_for_frames(uds_env, 2)
+    uds_env.wait_for_frames(2)
     assert uds_env.cmd_field(1, "kind") == claude_worker.frames.KIND_ORDER_INTENT
     assert uds_env.cmd_field(1, "venue") == claude_worker.frames.VENUE_MEXC
 
@@ -287,7 +276,7 @@ def test_push_set_param_and_halt(uds_env: tests.conftest.FakeUdsServer) -> None:
     assert result.exit_code == 0, result.output
     result = _invoke("push", "--kind", "halt")
     assert result.exit_code == 0, result.output
-    _wait_for_frames(uds_env, 4)
+    uds_env.wait_for_frames(4)
     assert uds_env.cmd_field(1, "kind") == claude_worker.frames.KIND_SET_PARAM
     assert uds_env.cmd_field(1, "strategy_id") == 1
     assert uds_env.cmd_field(1, "param_id") == 3
@@ -741,7 +730,7 @@ def test_stage_ruleset_happy_records_and_sends_hash128(
     ruleset, report, full_hash = _mk_passing_pair(cli_env)
     result = _invoke("stage-ruleset", "--ruleset", str(ruleset), "--report", str(report))
     assert result.exit_code == 0, result.output
-    _wait_for_frames(uds_env, 2)
+    uds_env.wait_for_frames(2)
     assert uds_env.cmd_field(0, "kind") == claude_worker.frames.KIND_HEARTBEAT
     assert uds_env.cmd_field(1, "kind") == claude_worker.frames.KIND_RULESET_STAGE
     px, qty = _hash128_halves(full_hash)
@@ -829,7 +818,7 @@ def test_commit_ruleset_happy_by_hash_then_by_file(
     )
     result = _invoke("commit-ruleset", "--hash", full_hash)
     assert result.exit_code == 0, result.output
-    _wait_for_frames(uds_env, 4)
+    uds_env.wait_for_frames(4)
     assert uds_env.cmd_field(3, "kind") == claude_worker.frames.KIND_RULESET_COMMIT
     px, qty = _hash128_halves(full_hash)
     assert uds_env.cmd_field(3, "px") == px
