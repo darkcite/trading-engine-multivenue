@@ -1503,7 +1503,14 @@ impl FillEngine {
             kind_ok,
             "strategies emit maker (0) or IoC (1) on a book venue, an AMM swap (2) on a pool only"
         );
-        if !tradeable_venue_byte(venue) || px <= 0 || qty <= 0 || !kind_ok {
+        // HK-R4: a Binance option is a signal leg only — the paper
+        // matcher refuses it by the same predicate.
+        if !tradeable_venue_byte(venue)
+            || core_fill::signal_only_sym(order.sym)
+            || px <= 0
+            || qty <= 0
+            || !kind_ok
+        {
             self.unroutable += 1;
             return;
         }
@@ -4353,6 +4360,24 @@ mod tests {
         assert!(out.is_empty(), "a refused MEXC order never fills");
         let o = e.finish();
         assert_eq!(o.unroutable, 2);
+    }
+
+    /// HK-R4: a Binance option is a signal leg only — an order on one is
+    /// refused as unroutable and a crossing tick fills nothing, while a
+    /// Binance perp's order beside it rests as before.
+    #[test]
+    fn a_binance_option_order_is_refused_signal_only() {
+        let mut e = engine_zero_delta(u64::MAX);
+        let opt = make_symbol_id(VenueId::Binance, core_config::universe::BN_OPT_ORDINAL_BASE + 1);
+        let perp =
+            make_symbol_id(VenueId::Binance, core_config::universe::BN_USDM_ORDINAL_BASE + 1);
+        e.intake(&order(opt, Side::Bid, 100_000, 1_000_000, 1), 0);
+        e.intake(&order(perp, Side::Bid, 100_000, 1_000_000, 2), 0);
+        assert_eq!(e.open_orders().len(), 1, "the perp rests");
+        let mut out = Vec::new();
+        e.on_record(&tick(opt, 50_000, 5_000_000, 90_000, 5_000_000), 10, 10, &mut out);
+        assert!(out.is_empty(), "a refused option order never fills");
+        assert_eq!(e.finish().unroutable, 1);
     }
 
     // -------------- fees (§4.3) --------------

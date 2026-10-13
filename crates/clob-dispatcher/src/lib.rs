@@ -2676,8 +2676,11 @@ impl PaperMatcher {
         } else {
             order.kind == core_fill::ORDER_KIND_MAKER || order.kind == core_fill::ORDER_KIND_IOC
         };
+        // HK-R4: a Binance option is a signal leg only (the harness
+        // refuses it the same way, `core_fill::signal_only_sym`).
         if venue as usize >= core_fill::ACTIVATION_NS_DEFAULT.len()
             || venue == core_types::VenueId::Mexc.to_u8()
+            || core_fill::signal_only_sym(order.sym)
             || px <= 0
             || qty <= 0
             || !kind_ok
@@ -3731,6 +3734,36 @@ mod tests {
         assert_eq!(m.counters.unroutable, 1);
         assert_eq!(m.counters.intake, 0);
         assert_eq!(m.open_len(), 0);
+    }
+
+    /// HK-R4: a Binance option (the eapi ordinal block) is a signal leg
+    /// only — an order on one is refused as `unroutable` and a crossing
+    /// tick fills nothing; a Binance perp beside it is still modelled.
+    #[test]
+    fn a_binance_option_order_is_unroutable_signal_only() {
+        let mut m = PaperMatcher::new();
+        let opt = core_types::make_symbol_id(VenueId::Binance, core_fill::BN_OPTION_ORDINALS.start);
+        let perp = core_types::make_symbol_id(VenueId::Binance, 513);
+        let order = |sym: SymbolId, cid: u64| {
+            Order::new(
+                1_000,
+                VenueId::Binance,
+                sym,
+                Side::Bid,
+                core_fill::ORDER_KIND_IOC,
+                Price::from_raw(1_000_000),
+                Qty::from_raw(1_000_000),
+                cid,
+            )
+        };
+        m.submit(&order(opt, 1), 1_000);
+        assert_eq!((m.counters.unroutable, m.counters.intake, m.open_len()), (1, 0, 0));
+        let mut crossing = mk_tick(990_000, 5_000_000, 1_000_000, 5_000_000);
+        crossing.sym = opt;
+        m.observe_tick(&crossing, AFTER_DELTA);
+        assert!(m.try_next_fill().is_none(), "a crossing tick fills nothing");
+        m.submit(&order(perp, 2), 1_000);
+        assert_eq!((m.counters.unroutable, m.counters.intake), (1, 1), "the perp is modelled");
     }
 
     /// HC11 (O-HC21): a Hypercall IoC is taken by the held-quote law (the

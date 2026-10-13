@@ -15428,3 +15428,51 @@ property of the code under test.
 - **Gates:** worker pytest 1 722 passed, 3 skipped; `make py-lint` all
   checks passed. The race cannot be forced from here, so the fix rests on
   the mechanism, not a reproduction.
+
+### HK7b — Binance options: signal legs only (`core-fill`, `clob-dispatcher`, `cli`)
+
+Ruling HK-R4: the Binance options join the AI boot universe as signal and
+reference legs, and orders on them stay unroutable (the O-HC17 shape).
+
+- **The gap this closes.**
+  - The v2 grammar resolves descriptors through `DescriptorTable`, which
+    has carried `binance-opt:` (caps `CAP_OPT | CAP_PRICE`) since M2.4.
+  - So a v2 row could already name a Binance option as its order
+    instrument.
+  - The paper matcher modelled that order against the option's BBO ticks
+    (ingress-binance emits a `Tick` per quoted option): a fill the venue
+    never saw.
+- **The law, once, for both consumers.**
+  - `core_fill::signal_only_sym`: the Binance venue byte and the eapi
+    ordinal block. `BN_OPTION_ORDINALS` is restated below core-config and
+    const-asserted equal in `cli::paper`.
+  - `PaperMatcher::submit` and the harness's `FillEngine::intake` both
+    count such an order `unroutable` before any other state change.
+  - `modify` cannot bypass it: identity includes the sym.
+- **Paper only.** A LIVE Binance slot's option order goes to its arm and
+  never meets the predicate. No member arms one (O-BX6).
+- **The universe.** `build_ai_universe` takes the Hypercall and Binance
+  options as one `option_syms` slice. The chain plus the held options
+  stay inside the block (≤ 64 + 16 ordinals).
+- **Tests:**
+  - the block's edges (core-fill);
+  - an option order unroutable, with a crossing tick that fills nothing,
+    beside a perp that is modelled (matcher);
+  - the same in the harness at zero Δ;
+  - the universe's order and dedupe.
+- **Review:** one combined pass. Risk, alloc and zero-copy PASS: no
+  current member trades Binance options in paper, and no live path
+  reaches the matcher. Docs NEEDS-DOCS, acted on:
+  - these records and the migration entry;
+  - the core-fill doc and ai-strategy-pipeline (the live arm is not
+    operator-verbs-only, O-BX6);
+  - research-universe's stale "venue-dark" lines (BX0 made them live);
+  - the Hypercall wording.
+
+  Tests: the crossing tick added; the harness at zero Δ.
+- **Gates (before the review's test edits):**
+  - clippy clean;
+  - nextest 4 639 passed (10 skipped), with HK8c's test groups;
+  - alloc 127/127 at 0 B/op (a fresh `Compiling bench`);
+  - copy-audit hits 27, new 0;
+  - license-check OK.

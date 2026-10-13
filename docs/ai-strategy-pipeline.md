@@ -376,10 +376,17 @@ syms, the OKX / Deribit / Hyperliquid discovery tables and — since 2026-09-23 
 MEXC instrument the boot allocated, spot and perp; Bybit stays out by its WS9 precedent. Since
 2026-09-26 (ruling O-HC17) it also holds every Hypercall option the boot selected
 (`hypercall:<U>-<YYYYMMDD>-<K>-<C|P>`, caps `CAP_OPT | CAP_PRICE`, HC4); the `hypercall-idx:<U>`
-index syms stay out — capture-only `Mark`s, caps 0, nothing could read them. Both data-only venues
-enter as signal or reference legs: an order on one is `unroutable` in the paper matcher and the
-harness. (The v2 grammar resolves descriptors through the `DescriptorTable`, which already carried
-Hypercall since HC4; the snapshot is the v1 arm's sym universe.) Rule 10
+index syms stay out — capture-only `Mark`s, caps 0, nothing could read them. Since HK7b (ruled
+HK-R4, 2026-10-13) it also holds every Binance option the boot selected (`binance-opt:<SYMBOL>`,
+caps `CAP_OPT | CAP_PRICE`, M2.4). MEXC and the Binance options enter as signal or reference legs
+only: an order on one is `unroutable` in the paper matcher and the harness (venue byte 7; for the
+options `core_fill::signal_only_sym`, the eapi ordinal block — paper only: a live Binance slot's
+option order goes to its arm, and no member arms one, O-BX6). On Hypercall the paper matcher judges
+an IoC by the held-quote law since HC11 (slot 7 is the only IoC emitter; an AI door's maker on venue
+9 is unroutable) and the harness refuses venue byte 9. (The v2 grammar resolves
+descriptors through the `DescriptorTable`, which already carried Hypercall since HC4 and the Binance
+options since M2.4 — so before HK-R4 a v2 row could name a Binance option as its instrument and the
+paper matcher modelled the order; the snapshot is the v1 arm's sym universe.) Rule 10
 reads the per-descriptor channel caps, mirrored Rust↔Python (`caps_of_descriptor`): `mexc:<SYM>`
 (spot, xStocks included) → `CAP_PRICE`; `mexc-perp:<SYM>` (every MEXC perp, TradFi included) →
 `CAP_PRICE | CAP_FUNDING`. MEXC has no depth or options lane, so no depth or option feature validates

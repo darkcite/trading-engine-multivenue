@@ -6,6 +6,34 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-13 — Binance options: in the AI boot universe; an order on one is unroutable in paper and the harness (HK7b)
+
+**What changed**
+- `core_fill::signal_only_sym` marks the Binance options' ordinal block
+  (`BN_OPT_ORDINAL_BASE + 1` … `BN_DATED_ORDINAL_BASE − 1`). The paper
+  matcher and the harness now count an order on one as `unroutable` and
+  never fill it. Before, a v2 ruleset row could already name a
+  `binance-opt:` descriptor as its order instrument (the descriptor table
+  has carried them since M2.4), and the matcher filled it against the
+  option's BBO.
+- The AI boot universe (the v1 grammar's sym list) holds every Binance
+  option the boot selected, beside the Hypercall options.
+- A LIVE Binance slot's option order goes to its arm as before: the
+  predicate is paper-only, and no member arms one (O-BX6).
+
+**Impact**
+- After the next release build and restart, a committed ruleset row whose
+  order leg is `binance-opt:` stops filling in paper. The refusal is
+  silent: `unroutable` counts it, and no REJECTED event is emitted.
+- `audit-pnl` / `backtest` over an old root that holds such orders now
+  count them unroutable.
+
+**Migration steps**
+1. Before the restart, check the committed ruleset for an order leg on
+   `binance-opt:` (`claude-worker` `library list`, or the active table's
+   JSON). A row that is meant to trade one needs its own ruling.
+2. The routine restart of a binary built from this change.
+
 ## 2026-10-13 — candles.db: no future bars, `--repair-future`, the Hypercall index as 1 m capture bars (HK7)
 
 **What changed**

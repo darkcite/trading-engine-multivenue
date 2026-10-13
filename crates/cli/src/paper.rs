@@ -3004,6 +3004,13 @@ fn mirror_ai_capture_metrics(metrics: &CaptureMetrics, capture: &AiCmdCapture) {
     }
 }
 
+// HK-R4: core-fill restates the Binance options' ordinal block (it sits
+// below core-config); the pair cannot drift.
+const _: () = assert!(
+    core_fill::BN_OPTION_ORDINALS.start == core_config::universe::BN_OPT_ORDINAL_BASE + 1
+        && core_fill::BN_OPTION_ORDINALS.end == core_config::universe::BN_DATED_ORDINAL_BASE
+);
+
 /// Build the §4.3 boot-universe snapshot for the ruleset validator:
 /// every SymbolId the boot wired into a venue ingress — the PM/BN
 /// pair flags plus each discovery-gated venue table, plus (MX6,
@@ -3011,11 +3018,13 @@ fn mirror_ai_capture_metrics(metrics: &CaptureMetrics, capture: &AiCmdCapture) {
 /// (spot + perp; Bybit stays out by its own WS9 precedent), plus
 /// (ruling O-HC17) every Hypercall option the boot selected — its
 /// `hypercall-idx:<U>` index syms stay out (capture-only `Mark`s, caps
-/// 0: nothing could read them) — **sorted strict-ascending and
-/// deduped** (binary-searched per §4.2 rule-6 check;
+/// 0: nothing could read them) — plus (HK-R4) every Binance option the
+/// boot selected, both through `option_syms` — **sorted strict-ascending
+/// and deduped** (binary-searched per §4.2 rule-6 check;
 /// `RulesetSidePath::new` debug-asserts the ordering). Data-only venues
-/// (MEXC, Hypercall) enter as signal or reference legs: an order on one
-/// stays unroutable in the paper matcher and the harness.
+/// (MEXC) and the Binance options (`core_fill::signal_only_sym`) enter as
+/// signal or reference legs: an order on one stays unroutable in the
+/// paper matcher and the harness.
 ///
 /// Universe membership is a boot-time fact: a symbol that later
 /// loses its feed still validates — the row just never triggers
@@ -3029,7 +3038,7 @@ pub fn build_ai_universe(
     deribit: Option<&ingress_deribit::DeribitSymbolTable>,
     hl: Option<&ingress_hyperliquid::HlCoinTable>,
     mexc_syms: &[SymbolId],
-    hypercall_option_syms: &[SymbolId],
+    option_syms: &[SymbolId],
 ) -> Arc<[u32]> {
     let mut v: Vec<u32> = Vec::with_capacity(
         polymarket_syms.len()
@@ -3038,12 +3047,12 @@ pub fn build_ai_universe(
             + deribit.map_or(0, |t| t.len())
             + hl.map_or(0, |t| t.len())
             + mexc_syms.len()
-            + hypercall_option_syms.len(),
+            + option_syms.len(),
     );
     v.extend_from_slice(polymarket_syms);
     v.extend_from_slice(binance_syms);
     v.extend_from_slice(mexc_syms);
-    v.extend_from_slice(hypercall_option_syms);
+    v.extend_from_slice(option_syms);
     if let Some(t) = okx {
         let mut i = 0usize;
         while let Some((_, sym, _)) = t.get(i) {
@@ -12870,10 +12879,13 @@ mod tests {
         assert_eq!(&u[..], &[2, 3, 7, 42, 16_777_218]);
 
         // O-HC17: the Hypercall options sort among the rest, a duplicate
-        // collapses; the caller passes no index sym.
+        // collapses; the caller passes no index sym. HK-R4: the Binance
+        // options ride the same slice.
         let o = make_symbol_id(VenueId::Hypercall, 600);
-        let u = build_ai_universe(&[42], &[7], None, None, None, &[], &[o, o]);
-        assert_eq!(&u[..], &[7, 42, o]);
+        let b = make_symbol_id(VenueId::Binance, core_config::universe::BN_OPT_ORDINAL_BASE + 1);
+        let u = build_ai_universe(&[42], &[7], None, None, None, &[], &[o, b, o]);
+        assert_eq!(&u[..], &[7, 42, b, o]);
+        assert!(core_fill::signal_only_sym(b), "an order on it stays unroutable");
     }
 
     #[test]
