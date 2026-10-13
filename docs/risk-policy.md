@@ -144,21 +144,25 @@ open, stop ingesting rules) on any of the following:
 5. `core-alloc::CountingAllocator` reports any allocation in a tick-loop
    iteration. (debug builds only; release aborts via `panic = "abort"`.)
 6. A `debug_assert!` fails in a strategy's `on_tick`/`on_signal`/`on_fill`.
-7. **(E6, NOT YET ENFORCED)** `halt_on_reject_streak` consecutive venue
-   rejections on a live slot ⇒ sticky per-slot halt.
-8. **(E6, NOT YET ENFORCED)** reconciliation drift between our position and
-   the venue's above `halt_on_recon_drift_usd_1e6` ⇒ sticky per-slot halt.
-9. **(BX3, DARK until BX6)** the venue restricted a Binance account
+7. **(E6)** `halt_on_reject_streak` consecutive venue rejections on a live
+   slot (`RejectStreak`) ⇒ sticky per-slot halt.
+8. **(E6)** reconciliation drift between our position and the venue's above
+   `halt_on_recon_drift_usd_1e6` (`ReconDrift`) ⇒ sticky per-slot halt.
+9. **(BX3, enforced since BX6)** the venue restricted a Binance account
    (`VenueLock`) ⇒ sticky halt of every slot whose venues name binance.
-10. **(BX3, DARK until BX6)** a Binance account's margin ratio reached a
+10. **(BX3, enforced since BX6)** a Binance account's margin ratio reached a
     slot's own `halt_on_margin_ratio_1e6` (`MarginRisk`) ⇒ sticky halt of
     that slot; a `MARGIN_CALL` ⇒ of every slot whose venues name binance.
-    Neither 9 nor 10 can fire before BX6 builds the Binance arm — "BX3"
-    below.
 
-Triggers 7 and 8 are PARSED from `exec.toml` today (E1) and enforced by
-nothing. E6 adds the enforcement, cancel-all-on-halt and the
-operator-restart requirement; until then neither number is a control.
+Triggers 7–10 are enforced by `exec_router::halt` (`trigger_for`): 7 and 8
+since E6, with the halted slot's cancel (per slot since XH5a) and
+`exec.HALT`, which only the operator clears; 9 and 10 since BX6 built the
+Binance arm that reports them (armable, though no member arms it, O-BX6) —
+"E6" and "BX3" below. `HaltReason` also names the budget floor, the
+user-WS gap, the asset-refusal streak, the operator (`exec.HALT`),
+recon-STALE, the E7 session bound (P&L gain / loss) and the ALO reject rate;
+the full table is the `exec_router::halt` module docs. (Until 2026-10-13 this list still read
+"NOT YET ENFORCED" and "DARK until BX6"; HK10 brought it current.)
 
 Halt is **sticky**: it requires a manual engine restart. No "auto-resume"
 logic is permitted — a halted engine means a human investigates.
@@ -15511,3 +15515,81 @@ reference legs, and orders on them stay unroutable (the O-HC17 shape).
   across runs.
 - **Gate:** `make bench-check` "OK: all 14 samples within 15 % of the
   baseline".
+
+### HK10 — the docs, and the lane's close
+
+- **`CLAUDE.md`'s CURRENT STATE** is cut to current facts: 356 lines → 172.
+  - The merge and go-live paragraphs moved verbatim to
+    `docs/arch/claude-md-state-log-2026-10-13.md` (README indexed). The
+    lane records stay here and in `migration.md`, so every citation still
+    resolves.
+  - Stale lines fixed:
+    - the heading's date;
+    - the engine's binary and mask;
+    - the slot-3 bullet's dangling "R0's record:";
+    - the gate line, restated from this lane's final gates;
+    - `make py-lint` no longer RED;
+    - the flake list (root-caused or grouped);
+    - the open operator items (the disk, `--repair-future`, Bybit's edge).
+  - New current-state lines: the Binance arm (BX0–BX13, dark) and slot 6
+    (XMM; the `xmm` branch unmerged).
+- **This file's kill-switch list:** triggers 7–10 lose "NOT YET ENFORCED"
+  and "DARK until BX6". `exec_router::halt::trigger_for` enforces all four,
+  with the halted slot's cancel (per slot since XH5a) and `exec.HALT`. The
+  list now names the module docs for the other `HaltReason`s (budget
+  floor, user-WS gap, asset-refusal streak, operator, recon-STALE, the E7
+  session bound, ALO reject rate).
+- **The lane, closed — Section A of the 2026-10-13 survey.**
+
+  | cut | commit |
+  |---|---|
+  | HK1 | `1af7e45` |
+  | HK2 | `da535cd` |
+  | HK3 | `9eedffb` |
+  | HK4 | `1286ed4` |
+  | HK5 | `38e777a` |
+  | HK6 | `f195c7b` |
+  | HK7a | `6324819` |
+  | HK7b | `74c9ac6` |
+  | HK8a | `4b6306e` |
+  | HK8b | `4829d6e` |
+  | HK8c | `2f842e6` |
+  | HK9 | `c3e38dc` |
+  | HK10 | this commit |
+
+  - Nothing pushed. No engine binary was built (HK-R3).
+  - The operator's steps:
+    - the release build and the restart (HK1, HK2, HK6, HK7b reach the
+      engine only through it);
+    - `--repair-future` once;
+    - before the restart, a check of the committed ruleset for
+      `binance-opt:` order legs (migration.md "HK7b").
+  - Moved to Section B: A-S7-100's loopback `run()` (it needs the `xmm`
+    branch). Recorded, not closable from public material: a Binance
+    Ed25519 vector (HK5).
+- **Review:** one pass, NEEDS-CHANGES, all acted on:
+  - `LIVE_ARM_VENUES` includes Binance (since BX6);
+  - five live smokes, not three or four;
+  - the halt list's cancel is per slot (XH5a) and `exec.HALT` survives a
+    restart;
+  - the release build and restart added as an open item;
+  - the current facts the first cut dropped restored, one line each:
+    - unverified fees;
+    - HYPARB's verbs, executor and stop;
+    - where the keys live;
+    - HC11c's third defect;
+    - the HL venue law;
+    - H90's scoring;
+    - the doctest note;
+    - bench-check's staleness;
+    - the rustls pin;
+  - the directory guide names `exec-binance`.
+- **Final gates (`c3e38dc`):**
+  - clippy clean;
+  - nextest 4 639 passed (10 skipped);
+  - alloc 127/127 (at `74c9ac6`; nothing it links changed since);
+  - copy-audit 27 / new 0;
+  - license-check OK;
+  - `make bench-check` 14 OK;
+  - worker pytest 1 722 passed, 3 skipped;
+  - `make py-lint` all checks passed.

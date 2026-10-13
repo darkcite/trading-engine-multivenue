@@ -42,8 +42,9 @@ provenance) — never for orientation; the live doc set is `CLAUDE.md` +
 | `regime-and-dashboard-plan.md` | RG0–RG8 regime detection + labels + dashboard + funding seed | CLOSED 2026-09-08 (RG7 soak PASS); archived 2026-09-19. Its RG laws (regime is a GATE, exits never gated, the ≤ 2 h soak law) are restated in `docs/risk-policy.md` |
 | `ai-strategy-pipeline.svg` | the 2026-09-05 (v1) pipeline sheet | superseded by `docs/ai-strategy-pipeline.svg` v2 (2026-09-19); kept unmodified as that record |
 | `claude-md-state-log-2026-09-19.md` | the CURRENT STATE bullets + the M2/M3 protocol lifted out of `CLAUDE.md` | archived 2026-09-19 when CLAUDE.md was cut to state + laws |
+| `claude-md-state-log-2026-10-13.md` | the CURRENT STATE bullets lifted out of `CLAUDE.md` (the merge and go-live paragraphs of the execution, BIN15, MEXC, BX0/ZC, HYPARB, HL-reconnect and Hypercall/HAR lanes) | archived 2026-10-13 by the HK lane (ruling HK-R2) when CLAUDE.md's state was cut to current facts |
 
-Note: this archive grew in waves (2026-08-16, 2026-08-29, 2026-09-02, 2026-09-19). In-tree doc
+Note: this archive grew in waves (2026-08-16, 2026-08-29, 2026-09-02, 2026-09-19, 2026-10-13). In-tree doc
 comments and older docs cite pre-move paths (`docs/phase-8-plan.md`,
 `docs/phase-8h-*`, `docs/prompts/8h-kickoff.md`,
 `docs/capture-remediation-plan-2026-08-28.md`, `docs/regime-and-dashboard-plan.md`, …) — those are historical
