@@ -71,6 +71,19 @@ BINDING laws (docs/mvp-completion-plan.md §9, verbatim inheritance):
   upserted ONLY when it connects to the stored frontier — a
   budget-truncated backward walk is discarded whole, otherwise
   ``max(open_ts)`` would leap over a permanent hole.
+- **No future bars (HK7, 2026-10-13)**: a real bar never opens after the
+  moment it is fetched. A fetched bar opening more than ``FUTURE_SKEW_MS``
+  after the fetch (the wall clock at the page, or the cycle's ``now``
+  where no clock is passed) is refused, never stored: such rows froze a
+  series' frontier until their date passed, and the placeholder minutes
+  behind a jumped frontier were never fetched again (MEXC's TradFi perps
+  answered flat bars ahead of time — 1 d rows to 2028). The MEXC request
+  ends at ``now`` (the Deribit and HL shape). ``--repair-future`` deletes
+  the rows already stored.
+- **The Hypercall index capture (HK7, H3 plan §5 W1)**: ``Mark`` prints
+  on ``hypercall-idx:<U>`` in ``hypercall-events.pmlr`` fold into 1 m
+  ``capture`` bars (venue 9), placed by the index's own time; idempotent
+  per (descriptor, minute) like the PM capture lane.
 
 Best-effort discipline throughout (fetchers pattern): transport
 failure / unusable body = counted + skipped, never a crash; the
@@ -92,11 +105,13 @@ import tomllib
 import typing
 
 import httpx
+import numpy
 
 import claude_worker.cli
 import claude_worker.features
 import claude_worker.fetchers
 import claude_worker.frames
+import claude_worker.iv_digest
 import claude_worker.pmlr
 
 CANDLES_DB_ENV: str = "CLAUDE_WORKER_CANDLES_DB"
@@ -165,6 +180,17 @@ SOURCE_REST: str = "rest"
 SOURCE_DERIVED: str = "derived"
 SOURCE_CAPTURE: str = "capture"
 
+#: HK7: how far after the moment of its fetch a bar may open — a venue
+#: clock a little ahead of ours — before it is refused as future-stamped.
+#: A real bar never opens after it is fetched; the defect this guards
+#: against stamped flat bars minutes to years ahead.
+FUTURE_SKEW_MS: int = MS_1M
+
+
+def _wall_ms() -> int:
+    """The wall clock, ms: when a page was fetched (HK7's bound)."""
+    return int(time.time() * 1000)
+
 _SCHEMA: str = """
 CREATE TABLE IF NOT EXISTS candles (
   venue      INTEGER NOT NULL,
@@ -199,6 +225,8 @@ class UpsertStats(typing.NamedTuple):
     conflicts: int
     unchanged: int
     superseded_capture: int
+    #: HK7: bars opening more than one bar after ``now`` — never stored.
+    refused_future: int
 
 
 class LaneTarget(typing.NamedTuple):
@@ -445,16 +473,28 @@ def upsert_rest(
     tf_ms: int,
     bars: list[claude_worker.fetchers.Candle],
     now_ms: int,
+    fetched_ms: int | None = None,
 ) -> UpsertStats:
     """§9.6 upsert of one fetched page. Closed ``rest`` bars are
     immutable (disagreement → ``candle_conflicts``); the open bar
-    updates in place; ``capture`` rows are superseded by rest."""
+    updates in place; ``capture`` rows are superseded by rest.
+
+    HK7: a bar opening more than ``FUTURE_SKEW_MS`` after the page was
+    fetched (``fetched_ms``; ``now_ms`` when not given) is refused, never
+    stored — a real bar never opens after its fetch. MEXC's TradFi perps
+    answered such bars (1 d rows to 2028); one froze the lane's frontier
+    (``max_open_ts``) until its date passed."""
+    latest_open = (now_ms if fetched_ms is None else fetched_ms) + FUTURE_SKEW_MS
     inserted = 0
     updated_open = 0
     conflicts = 0
     unchanged = 0
     superseded = 0
+    refused_future = 0
     for bar in bars:
+        if bar.ts_ms > latest_open:
+            refused_future += 1
+            continue
         row = conn.execute(
             "SELECT o,h,l,c,v,source,fetched_ts FROM candles"
             " WHERE venue=? AND descriptor=? AND tf=? AND open_ts=?",
@@ -537,7 +577,35 @@ def upsert_rest(
         else:
             updated_open += 1
     conn.commit()
-    return UpsertStats(inserted, updated_open, conflicts, unchanged, superseded)
+    return UpsertStats(inserted, updated_open, conflicts, unchanged, superseded, refused_future)
+
+
+def purge_future(
+    conn: sqlite3.Connection, now_ms: int
+) -> list[tuple[int, str, str, int]]:
+    """HK7 (``--repair-future``): delete every candle row — any source,
+    any timeframe this module writes — that opens more than
+    ``FUTURE_SKEW_MS`` after ``now_ms`` (``upsert_rest``'s bound), so the
+    series' frontier falls back to its real newest bar and the next cycle
+    fetches it — and the placeholder bars behind it — again. Returns
+    ``(venue, descriptor, tf, rows)`` per purged series, sorted. A
+    timeframe outside ``FETCHED_TFS`` and ``DERIVED_TFS`` is left alone."""
+    tfs = sorted([*FETCHED_TFS, *(d[0] for d in DERIVED_TFS)])
+    bound = now_ms + FUTURE_SKEW_MS
+    out: list[tuple[int, str, str, int]] = []
+    for tf in tfs:
+        rows = conn.execute(
+            "SELECT venue, descriptor, count(*) FROM candles"
+            " WHERE tf=? AND open_ts > ? GROUP BY venue, descriptor",
+            (tf, bound),
+        ).fetchall()
+        if not rows:
+            continue
+        conn.execute("DELETE FROM candles WHERE tf=? AND open_ts > ?", (tf, bound))
+        out.extend((venue, descriptor, tf, n) for venue, descriptor, n in rows)
+    conn.commit()
+    out.sort()
+    return out
 
 
 # ---- universe → lanes ----------------------------------------------------
@@ -784,21 +852,24 @@ def parse_mexc_kline(raw: str) -> tuple[list[claude_worker.fetchers.Candle], int
     return out, malformed
 
 
-def _mexc_url(host: str, lane_name: str, symbol: str, tf: str, start_ms: int) -> str:
-    """MX7: one forward page ``[start, start + page]`` for either MEXC
-    lane. Both endpoints need an explicit END — without ``endTime`` spot
-    ignores ``startTime`` and answers the newest 500 bars — and both
-    accept an end in the future, answering up to the open bar (measured
-    2026-09-23). Spot's end is exclusive and ms; perp's is inclusive and
-    SECONDS."""
+def _mexc_url(host: str, lane_name: str, symbol: str, tf: str, span: tuple[int, int]) -> str:
+    """MX7: one forward page ``[start, min(start + page, now)]`` (``span =
+    (start, now)``) for either MEXC lane. Both endpoints need an explicit
+    END — without ``endTime`` spot ignores ``startTime`` and answers the
+    newest 500 bars. Both
+    accept an end in the future (measured 2026-09-23), but the TradFi
+    perps then answer flat placeholder bars ahead of time, so the end is
+    ``now`` (HK7; the Deribit and HL shape). Spot's end is exclusive and
+    ms; perp's is inclusive and SECONDS."""
+    start_ms, now_ms = span
     tf_ms = FETCHED_TFS[tf]
     if lane_name == "mexc":
-        end_ms = start_ms + MEXC_SPOT_PAGE_BARS * tf_ms
+        end_ms = min(start_ms + MEXC_SPOT_PAGE_BARS * tf_ms, now_ms)
         return (
             f"https://{host}/api/v3/klines?symbol={symbol}&interval={MEXC_SPOT_INTERVAL[tf]}"
             f"&startTime={start_ms}&endTime={end_ms}&limit={MEXC_SPOT_PAGE_BARS}"
         )
-    end_ms = start_ms + MEXC_PERP_PAGE_BARS * tf_ms
+    end_ms = min(start_ms + MEXC_PERP_PAGE_BARS * tf_ms, now_ms)
     return (
         f"https://{host}/api/v1/contract/kline/{symbol}?interval={MEXC_PERP_INTERVAL[tf]}"
         f"&start={start_ms // 1000}&end={end_ms // 1000}"
@@ -939,7 +1010,9 @@ def _fetch_forward_page(
         return None if parsed_bb is None else parsed_bb[0]
     if lane.name in ("mexc", "mexc-perp"):
         # MX7: forward-paged; each class owns its host AND endpoint.
-        raw = http.get(_mexc_url(http.hosts[lane.name], lane.name, target.instrument, tf, lo_ms))
+        raw = http.get(
+            _mexc_url(http.hosts[lane.name], lane.name, target.instrument, tf, (lo_ms, now_ms))
+        )
         if raw is None:
             return None
         parsed_mx = parse_mexc_kline(raw)
@@ -1015,7 +1088,7 @@ class FillStats(typing.NamedTuple):
     failed: bool
 
 
-_ZERO_UPSERT = UpsertStats(0, 0, 0, 0, 0)
+_ZERO_UPSERT = UpsertStats(0, 0, 0, 0, 0, 0)
 
 
 def _merge(a: UpsertStats, b: UpsertStats) -> UpsertStats:
@@ -1025,6 +1098,7 @@ def _merge(a: UpsertStats, b: UpsertStats) -> UpsertStats:
         a.conflicts + b.conflicts,
         a.unchanged + b.unchanged,
         a.superseded_capture + b.superseded_capture,
+        a.refused_future + b.refused_future,
     )
 
 
@@ -1038,9 +1112,12 @@ def fill_forward(
     budget: claude_worker.features.RestBudget,
     env: collections.abc.Mapping[str, str],
     hours_1m: int | None = None,
+    clock: collections.abc.Callable[[], int] | None = None,
 ) -> FillStats:
     """Forward §9.6 fill: page-by-page upsert, monotone frontier.
-    ``hours_1m``: the lane's ``backfill_1m_h`` (``backfill_start_ms``)."""
+    ``hours_1m``: the lane's ``backfill_1m_h`` (``backfill_start_ms``).
+    ``clock`` (HK7): read after each page to bound its bars' opens (the
+    cycle passes the wall clock; ``None`` = ``now_ms``)."""
     tf_ms = FETCHED_TFS[tf]
     last = max_open_ts(conn, target.venue, target.descriptor, tf)
     lo = last if last is not None else backfill_start_ms(tf, now_ms, lane.name, env, hours_1m)
@@ -1057,7 +1134,13 @@ def fill_forward(
         if not page:
             break
         bars += len(page)
-        stats = _merge(stats, upsert_rest(conn, target.venue, target.descriptor, tf, tf_ms, page, now_ms))
+        fetched = None if clock is None else max(now_ms, clock())
+        stats = _merge(
+            stats,
+            upsert_rest(
+                conn, target.venue, target.descriptor, tf, tf_ms, page, now_ms, fetched
+            ),
+        )
         new_lo = page[-1].ts_ms + tf_ms
         if new_lo <= lo:
             break  # progress guard: a stuck venue never loops us
@@ -1271,7 +1354,13 @@ def fold_capture_minutes(
     tick files only) → per (descriptor, minute) mid-price OHLC +
     tick-count. Wall mapping is the harness law:
     ``wall = epoch_ns + (ts − run_anchor)``. One-sided ticks (a zero
-    bid or ask) are skipped — a fabricated mid is worse than a gap."""
+    bid or ask) are skipped — a fabricated mid is worse than a gap.
+
+    HK7: ``lo`` rounds UP to a whole minute. An unaligned ``lo`` (the
+    hourly cycle's ``now - 26 h``) folded the window's first minute from
+    its tail alone, and ``upsert_capture`` then overwrote the complete
+    minute a day-old cycle had stored."""
+    lo_ms += -lo_ms % MS_1M
     out: dict[tuple[str, int], MinuteBar] = {}
     for run_dir in claude_worker.features.run_dirs(replay_root):
         try:
@@ -1319,6 +1408,84 @@ def fold_capture_minutes(
                             )
             except (claude_worker.pmlr.PmlrError, OSError, ValueError):
                 continue
+    return out
+
+
+#: HK7 (H3 plan §5 W1): the Hypercall lane's events file and the index's
+#: descriptor namespace (``hypercall-idx:<U>``, one ``Mark`` per print).
+HC_EVENTS_FILE: str = "hypercall-events.pmlr"
+HC_INDEX_PREFIX: str = "hypercall-idx:"
+
+
+def _print_time(row: tuple[int, int]) -> int:
+    """A ``(source ms, px)`` print's sort key: its time alone (stable)."""
+    return row[0]
+
+
+def fold_index_minutes(
+    replay_root: pathlib.Path, lo_ms: int, now_ms: int
+) -> dict[tuple[str, int], MinuteBar]:
+    """HK7 (H3 plan §5 W1): the Hypercall index into 1 m bars. Every
+    ``Mark`` on a ``hypercall-idx:<U>`` sym (named by the run's
+    ``instrument-manifest.tsv``) in ``hypercall-events.pmlr`` across the
+    runs overlapping ``[lo, now)`` → per (descriptor, minute) OHLC of the
+    index and its print count. A print is placed by the index's OWN time
+    (``venue_time_ms`` — the settlement's basis, ``hypercall_settle``),
+    never the arrival clock, and folded in that time's order whatever the
+    arrival order (arrival order breaks a tie). A print repeated with the
+    same time and price counts once; non-positive prints are skipped.
+    ``lo`` rounds up to a whole minute (``fold_capture_minutes``)."""
+    lo_ms += -lo_ms % MS_1M
+    prints: dict[str, list[tuple[int, int]]] = {}
+    for run_dir in claude_worker.features.run_dirs(replay_root):
+        try:
+            epoch_ns = int(run_dir.name[len("run-") :])
+        except ValueError:
+            continue
+        if epoch_ns // 1_000_000 + 36 * MS_1H < lo_ms:
+            continue
+        path = run_dir / HC_EVENTS_FILE
+        manifest = claude_worker.iv_digest.read_manifest(run_dir)
+        if manifest is None or not path.is_file():
+            continue
+        idx = {
+            sym: desc
+            for (_venue, sym), desc in manifest[0].items()
+            if desc.startswith(HC_INDEX_PREFIX)
+        }
+        if not idx:
+            continue
+        try:
+            ev = claude_worker.pmlr.channel_event_array(path)
+        except (claude_worker.pmlr.PmlrError, OSError, ValueError):
+            continue
+        keep = (
+            (ev["channel"] == claude_worker.pmlr.CHANNEL_MARK)
+            & numpy.isin(ev["sym"], numpy.fromiter(idx, dtype=numpy.uint32, count=len(idx)))
+            & (ev["vt"] >= lo_ms)
+            & (ev["vt"] < now_ms)
+            & (ev["v0"] > 0)
+        )
+        marks = ev[keep]
+        for sym, vt, v0 in zip(
+            marks["sym"].tolist(), marks["vt"].tolist(), marks["v0"].tolist(), strict=True
+        ):
+            prints.setdefault(idx[sym], []).append((vt, v0))
+    out: dict[tuple[str, int], MinuteBar] = {}
+    for desc, rows in prints.items():
+        rows.sort(key=_print_time)
+        prev = (-1, -1)
+        for vt, v0 in rows:
+            if (vt, v0) == prev:
+                continue
+            prev = (vt, v0)
+            key = (desc, vt - vt % MS_1M)
+            px = v0 / 1_000_000
+            bar = out.get(key)
+            if bar is None:
+                out[key] = MinuteBar(px, px, px, px, 1)
+            else:
+                out[key] = MinuteBar(bar.o, max(bar.h, px), min(bar.low, px), px, bar.n + 1)
     return out
 
 
@@ -1430,9 +1597,9 @@ def capture_and_derive(
     report: collections.abc.Callable[[str], None],
     capture_backfill: bool = False,
 ) -> None:
-    """The C5 tail of one cycle: PM capture store lane → BN drift
-    check → §9.5 derive pass. Missing replay root / empty map =
-    reported skip, never an error (best-effort law)."""
+    """The C5 tail of one cycle: PM capture store lane → the Hypercall
+    index fold (HK7) → BN drift check → §9.5 derive pass. Missing replay
+    root / empty map = reported skip, never an error (best-effort law)."""
     if not replay_root.is_dir():
         report(f"candles: capture lane skipped — no replay root {replay_root}")
         derive_pass(conn, now_ms, report, now_ms - DERIVE_WINDOW_D * MS_1D)
@@ -1453,6 +1620,15 @@ def capture_and_derive(
         )
     else:
         report("candles: capture pm: no PM token names in the market map — skipped")
+    # HK7: the Hypercall index, named by each run's own manifest (the
+    # market map does not carry the index syms).
+    hc_lo = 0 if capture_backfill else now_ms - cap_h * MS_1H
+    hc_bars = fold_index_minutes(replay_root, hc_lo, now_ms)
+    ins, ref, kept = upsert_capture(conn, claude_worker.frames.VENUE_HYPERCALL, hc_bars, now_ms)
+    report(
+        f"candles: capture hypercall-idx: minutes={len(hc_bars)} +{ins} refreshed={ref}"
+        f" rest_kept={kept}"
+    )
     if bn_map:
         bn_bars = fold_capture_minutes(
             replay_root, bn_map, ("bn",), now_ms - drift_h * MS_1H, now_ms
@@ -1531,12 +1707,15 @@ def run_cycle(
                 if lane.backward:
                     st = fill_okx_backward(conn, http, target, tf, now_ms, budget, env, hours_1m)
                 else:
-                    st = fill_forward(conn, http, lane, target, tf, now_ms, budget, env, hours_1m)
+                    st = fill_forward(
+                        conn, http, lane, target, tf, now_ms, budget, env, hours_1m, _wall_ms
+                    )
                 u = st.upsert
                 report(
                     f"candles: {target.descriptor} {tf}: pages={st.pages} bars={st.bars}"
                     f" +{u.inserted} open~{u.updated_open} conflicts={u.conflicts}"
                     f" unchanged={u.unchanged} capture->rest={u.superseded_capture}"
+                    f"{f' future-refused={u.refused_future}' if u.refused_future else ''}"
                     f"{' BUDGET' if st.budget_out else ''}{' FAILED' if st.failed else ''}"
                 )
 
@@ -1600,8 +1779,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--capture-backfill",
         action="store_true",
-        help="one-shot: fold PM capture minutes over the WHOLE replay"
-        " root, not just the rolling window (operator-invoked)",
+        help="one-shot: fold PM capture minutes and the Hypercall index over the"
+        " WHOLE replay root, not just the rolling window (operator-invoked)",
+    )
+    parser.add_argument(
+        "--repair-future",
+        action="store_true",
+        help="one-shot (HK7): first delete every row opening more than a minute after"
+        " now, so frozen series fetch again; then the cycle (operator-invoked)",
     )
     args = parser.parse_args(argv)
     env = os.environ
@@ -1640,6 +1825,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     conn = open_db(db_path)
     try:
+        if args.repair_future:
+            purged = purge_future(conn, now_ms)
+            for venue, descriptor, tf, n in purged:
+                print(
+                    f"candles: repair-future: {descriptor} {tf}: -{n} (venue {venue})",
+                    file=sys.stderr,
+                )
+            print(
+                f"candles: repair-future: {sum(p[3] for p in purged)} rows in {len(purged)} series",
+                file=sys.stderr,
+            )
         with httpx.Client() as client:
             run_cycle(
                 conn,
@@ -1651,7 +1847,7 @@ def main(argv: list[str] | None = None) -> int:
                 lambda line: print(line, file=sys.stderr),
                 policy,
             )
-        # C5 tail: PM capture store + BN drift + §9.5 derive.
+        # C5 tail: PM capture store + the Hypercall index fold + BN drift + §9.5 derive.
         replay_root = pathlib.Path(
             env.get("CLAUDE_WORKER_REPLAY_DIR", "") or "~/multivenue/logs"
         ).expanduser()

@@ -8,6 +8,7 @@ expect (Binance klines fixtures mirror the venue docs)."""
 import json
 import pathlib
 import sqlite3
+import struct
 import typing
 
 import httpx
@@ -18,6 +19,7 @@ import claude_worker.candles
 import claude_worker.features
 import claude_worker.fetchers
 import claude_worker.frames
+import claude_worker.pmlr
 
 
 MS_1M = claude_worker.candles.MS_1M
@@ -382,19 +384,28 @@ def test_parse_mexc_kline_failure_modes() -> None:
 
 def test_mexc_url_per_class_host_endpoint_and_window() -> None:
     start = 1_790_000_000_000
-    assert claude_worker.candles._mexc_url("mx.test", "mexc", "BTCUSDT", "1h", start) == (
+    far = start + 10_000 * MS_1D  # a ``now`` past every page end
+    assert claude_worker.candles._mexc_url("mx.test", "mexc", "BTCUSDT", "1h", (start, far)) == (
         "https://mx.test/api/v3/klines?symbol=BTCUSDT&interval=60m"
         f"&startTime={start}&endTime={start + 500 * MS_1H}&limit=500"
     )
     assert claude_worker.candles._mexc_url(
-        "mxf.test", "mexc-perp", "BTC_USDT", "1m", 1_790_000_040_000
+        "mxf.test", "mexc-perp", "BTC_USDT", "1m", (1_790_000_040_000, far)
     ) == (
         "https://mxf.test/api/v1/contract/kline/BTC_USDT?interval=Min1"
         "&start=1790000040&end=1790060040"
     )
-    assert claude_worker.candles._mexc_url("mxf.test", "mexc-perp", "XAU_USDT", "1d", start).count(
-        "interval=Day1"
-    ) == 1
+    assert claude_worker.candles._mexc_url(
+        "mxf.test", "mexc-perp", "XAU_USDT", "1d", (start, far)
+    ).count("interval=Day1") == 1
+    # HK7: the page ends at ``now`` — never asks for the future, where the
+    # TradFi perps answer placeholder bars.
+    now = start + 90 * MS_1M
+    spot = claude_worker.candles._mexc_url("mx.test", "mexc", "SPYXUSDT", "1m", (start, now))
+    assert spot.endswith(f"&startTime={start}&endTime={now}&limit=500")
+    assert claude_worker.candles._mexc_url(
+        "mxf.test", "mexc-perp", "SPY_USDT", "1d", (start, now)
+    ).endswith(f"&start={start // 1000}&end={now // 1000}")
 
 
 def test_mexc_lanes_read_from_universe(tmp_path: pathlib.Path) -> None:
@@ -1625,3 +1636,295 @@ def test_main_runs_the_extras_of_a_universe_without_lanes(
     assert set(coins) == {"xyz:SP500"}
     err = typing.cast(typing.Any, capsys).readouterr().err
     assert "extra=1" in err
+
+
+# ---- HK7: no future bars; the Hypercall index capture ---------------------
+
+
+def test_a_bar_opening_after_its_fetch_is_refused_never_stored(tmp_path: pathlib.Path) -> None:
+    conn = db(tmp_path)
+    t = claude_worker.candles.LaneTarget(
+        claude_worker.frames.VENUE_MEXC, "mexc-perp:SPY_USDT", "SPY_USDT"
+    )
+    skew = claude_worker.candles.FUTURE_SKEW_MS
+    bars = [
+        mk_candle(NOW - MS_1M),
+        mk_candle(NOW + skew),  # a venue clock a little ahead: kept
+        mk_candle(NOW + skew + 1),  # opens after its fetch: refused
+        mk_candle(NOW + 400 * MS_1D),  # MEXC's TradFi kind: refused
+    ]
+    st = claude_worker.candles.upsert_rest(conn, t.venue, t.descriptor, "1m", MS_1M, bars, NOW)
+    assert (st.inserted, st.refused_future) == (2, 2)
+    assert claude_worker.candles.max_open_ts(conn, t.venue, t.descriptor, "1m") == NOW + skew
+    # Tomorrow's 1 d placeholder is refused like any other: the bound is
+    # the fetch, never one bar of the page's timeframe.
+    pair = [mk_candle(NOW - 5), mk_candle(NOW + MS_1D)]
+    day = claude_worker.candles.upsert_rest(conn, t.venue, t.descriptor, "1d", MS_1D, pair, NOW)
+    assert (day.inserted, day.refused_future) == (1, 1)
+    # A page fetched later than the cycle's ``now`` keeps what opened by then.
+    opened = NOW + 20 * MS_1M
+    late = claude_worker.candles.upsert_rest(
+        conn, t.venue, t.descriptor, "1h", MS_1H, [mk_candle(opened)], NOW, opened
+    )
+    assert (late.inserted, late.refused_future) == (1, 0)
+
+
+def test_a_late_lane_keeps_its_open_bar_and_refuses_placeholders(tmp_path: pathlib.Path) -> None:
+    conn = db(tmp_path)
+    t = bn_target()
+    bars = [
+        mk_candle(NOW - 3 * MS_1M),
+        mk_candle(NOW + 5 * MS_1M),  # opened while the cycle ran: a real open bar
+        mk_candle(NOW + 30 * MS_1D),  # a placeholder
+    ]
+    venue = ForwardVenue(bars, page=5)
+    st = claude_worker.candles.fill_forward(
+        conn,
+        http_forward(venue),
+        bn_lane(t),
+        t,
+        "1m",
+        NOW,
+        budget(10),
+        {},
+        clock=lambda: NOW + 5 * MS_1M,
+    )
+    assert (st.upsert.inserted, st.upsert.refused_future) == (2, 1)
+    assert claude_worker.candles.max_open_ts(conn, t.venue, t.descriptor, "1m") == NOW + 5 * MS_1M
+    # Without the clock the cycle's ``now`` bounds the page: the frontier
+    # stays real, the open bar waits for the next cycle.
+    conn2 = db(tmp_path / "b")
+    st2 = claude_worker.candles.fill_forward(
+        conn2, http_forward(ForwardVenue(bars, page=5)), bn_lane(t), t, "1m", NOW, budget(10), {}
+    )
+    assert (st2.upsert.inserted, st2.upsert.refused_future) == (1, 2)
+    assert claude_worker.candles.max_open_ts(conn2, t.venue, t.descriptor, "1m") == NOW - 3 * MS_1M
+
+
+def test_repair_future_purges_only_rows_opening_after_now(tmp_path: pathlib.Path) -> None:
+    conn = db(tmp_path)
+    mx = claude_worker.frames.VENUE_MEXC
+    skew = claude_worker.candles.FUTURE_SKEW_MS
+    rows = [
+        (mx, "mexc-perp:SPY_USDT", "1m", NOW - 5 * MS_1M, "rest"),
+        (mx, "mexc-perp:SPY_USDT", "1m", NOW + skew, "rest"),  # at the bound: kept
+        (mx, "mexc-perp:SPY_USDT", "1m", NOW + 105 * MS_1M, "rest"),  # 05:32Z at 03:47Z
+        (mx, "mexc-perp:SPY_USDT", "1h", NOW + 15 * MS_1D, "rest"),
+        (mx, "mexc-perp:SPY_USDT", "1d", NOW + 500 * MS_1D, "rest"),
+        (mx, "mexc-perp:SPY_USDT", "4h", NOW + 15 * MS_1D, "derived"),
+        (mx, "mexc-perp:USOIL_USDT", "1d", NOW + MS_1D, "rest"),  # tomorrow's
+        (mx, "mexc-perp:USOIL_USDT", "1w", NOW + 900 * MS_1D, "rest"),  # unknown tf: left
+        (claude_worker.frames.VENUE_BINANCE, "binance:btcusdt", "1m", NOW - MS_1M, "capture"),
+    ]
+    for venue, desc, tf, ts, source in rows:
+        conn.execute(
+            "INSERT INTO candles (venue,descriptor,tf,open_ts,o,h,l,c,v,source,fetched_ts)"
+            " VALUES (?,?,?,?, 1,1,1,1, NULL, ?, 1)",
+            (venue, desc, tf, ts, source),
+        )
+    conn.commit()
+    purged = claude_worker.candles.purge_future(conn, NOW)
+    assert purged == [
+        (mx, "mexc-perp:SPY_USDT", "1d", 1),
+        (mx, "mexc-perp:SPY_USDT", "1h", 1),
+        (mx, "mexc-perp:SPY_USDT", "1m", 1),
+        (mx, "mexc-perp:SPY_USDT", "4h", 1),
+        (mx, "mexc-perp:USOIL_USDT", "1d", 1),
+    ]
+    left = conn.execute("SELECT tf, open_ts FROM candles ORDER BY tf, open_ts").fetchall()
+    assert left == [
+        ("1m", NOW - 5 * MS_1M),
+        ("1m", NOW - MS_1M),
+        ("1m", NOW + skew),
+        ("1w", NOW + 900 * MS_1D),
+    ]
+    assert claude_worker.candles.purge_future(conn, NOW) == [], "idempotent"
+
+
+IDX_SYM = (claude_worker.frames.VENUE_HYPERCALL << 24) | 1
+IDX_DESC = "hypercall-idx:SP500"
+#: ChannelId::Trade — another event on the same sym, never a print.
+CHANNEL_TRADE = 3
+
+
+def craft_hc_run(
+    root: pathlib.Path,
+    epoch_ns: int,
+    events: list[tuple[int, int, int, int]],
+    manifest: str | None,
+) -> pathlib.Path:
+    """A run dir holding ``hypercall-events.pmlr`` — ``(sym, channel,
+    source_ms, v0)`` slots in the given (arrival) order — and, unless
+    ``None``, an ``instrument-manifest.tsv``."""
+    run_dir = root / f"run-{epoch_ns}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    header = struct.pack("<4sHBxQ", b"PMLR", 3, 5, epoch_ns).ljust(64, b"\0")
+    slot = struct.Struct("<QIBB2xQQqq16x")
+    body = b"".join(
+        slot.pack(i, sym, claude_worker.frames.VENUE_HYPERCALL, ch, 0, ms, v0, ms)
+        for i, (sym, ch, ms, v0) in enumerate(events)
+    )
+    (run_dir / claude_worker.candles.HC_EVENTS_FILE).write_bytes(header + body)
+    if manifest is not None:
+        (run_dir / "instrument-manifest.tsv").write_text(manifest, encoding="utf-8")
+    return run_dir
+
+
+def test_fold_index_minutes_places_prints_by_the_index_s_own_time(tmp_path: pathlib.Path) -> None:
+    root = tmp_path / "logs"
+    m0 = NOW - (NOW % MS_1M) - 10 * MS_1M
+    opt_sym = (claude_worker.frames.VENUE_HYPERCALL << 24) | 2
+    mark = claude_worker.pmlr.CHANNEL_MARK
+    events = [
+        (IDX_SYM, mark, m0 + 30_000, 7_742_500_000),  # arrives first, prints second
+        (IDX_SYM, mark, m0 + 2_000, 7_742_000_000),  # the minute's open
+        (IDX_SYM, mark, m0 + 40_000, 7_745_000_000),  # high
+        (IDX_SYM, mark, m0 + 50_000, 7_741_000_000),  # low, close
+        (IDX_SYM, CHANNEL_TRADE, m0 + 51_000, 7_900_000_000),  # a trade: not a print
+        (opt_sym, mark, m0 + 52_000, 9_000_000),  # an option's mark: not the index
+        (IDX_SYM, mark, m0 + 53_000, 0),  # non-positive: skipped
+        (IDX_SYM, mark, m0 + MS_1M + 1_000, 7_746_000_000),  # the next minute
+        (IDX_SYM, mark, NOW + 1_000, 7_747_000_000),  # at or after now: not yet
+    ]
+    manifest = f"{IDX_SYM}\t{IDX_DESC}\n{opt_sym}\thypercall:SP500-20261016-7700-C\n"
+    craft_hc_run(root, NOW * 1_000_000 - 3_600_000_000_000, events, manifest)
+    # A run without a manifest names nothing; a run too old to reach the
+    # window is never opened.
+    craft_hc_run(root, (NOW - 3 * MS_1H) * 1_000_000, events, None)
+    craft_hc_run(root, (NOW - 40 * MS_1H) * 1_000_000, [(IDX_SYM, mark, m0, 1)], manifest)
+    bars = claude_worker.candles.fold_index_minutes(root, NOW - 2 * MS_1H, NOW)
+    assert sorted(bars) == [(IDX_DESC, m0), (IDX_DESC, m0 + MS_1M)]
+    b = bars[(IDX_DESC, m0)]
+    assert (b.o, b.h, b.low, b.c, b.n) == (7742.0, 7745.0, 7741.0, 7741.0, 4)
+    assert bars[(IDX_DESC, m0 + MS_1M)].n == 1
+    assert claude_worker.candles.fold_index_minutes(root, m0 + MS_1M, NOW) == {
+        (IDX_DESC, m0 + MS_1M): claude_worker.candles.MinuteBar(7746.0, 7746.0, 7746.0, 7746.0, 1)
+    }, "a print before the window is left out"
+
+
+def test_capture_and_derive_folds_the_hypercall_index_idempotently(tmp_path: pathlib.Path) -> None:
+    conn = db(tmp_path)
+    root = tmp_path / "logs"
+    w = (NOW // (5 * MS_1M)) * (5 * MS_1M) - 10 * MS_1M  # a closed 5 m window
+    events = [
+        (IDX_SYM, claude_worker.pmlr.CHANNEL_MARK, w + i * MS_1M + 1_000, 7_742_000_000 + i)
+        for i in range(5)
+    ]
+    craft_hc_run(root, (NOW - MS_1H) * 1_000_000, events, f"{IDX_SYM}\t{IDX_DESC}\n")
+    lines: list[str] = []
+    claude_worker.candles.capture_and_derive(conn, root, {}, NOW, {}, lines.append)
+    rows = conn.execute(
+        "SELECT venue, tf, source, n FROM candles WHERE descriptor=? ORDER BY tf, open_ts",
+        (IDX_DESC,),
+    ).fetchall()
+    hc = claude_worker.frames.VENUE_HYPERCALL
+    assert rows[:5] == [(hc, "1m", "capture", 1)] * 5
+    assert (hc, "5m", "derived", None) in rows, "the derive pass reads capture bases"
+    assert "candles: capture hypercall-idx: minutes=5 +5 refreshed=0 rest_kept=0" in lines
+    again: list[str] = []
+    claude_worker.candles.capture_and_derive(conn, root, {}, NOW, {}, again.append)
+    assert "candles: capture hypercall-idx: minutes=5 +0 refreshed=0 rest_kept=0" in again
+
+
+def test_a_window_starting_mid_minute_never_refolds_that_minute_from_its_tail(
+    tmp_path: pathlib.Path,
+) -> None:
+    """HK7: the hourly window starts at ``now - 26 h``, mid-minute. The
+    minute it cuts is left out — never folded from its tail and stored
+    over the whole minute a day-old cycle wrote."""
+    root = tmp_path / "logs"
+    m0 = NOW - (NOW % MS_1M) - 10 * MS_1M
+    mark = claude_worker.pmlr.CHANNEL_MARK
+    events = [
+        (IDX_SYM, mark, m0 + 1_000, 7_742_000_000),
+        (IDX_SYM, mark, m0 + 50_000, 7_743_000_000),
+    ]
+    craft_hc_run(root, (NOW - MS_1H) * 1_000_000, events, f"{IDX_SYM}\t{IDX_DESC}\n")
+    whole = claude_worker.candles.fold_index_minutes(root, m0, NOW)
+    assert whole[(IDX_DESC, m0)].n == 2
+    assert claude_worker.candles.fold_index_minutes(root, m0 + 30_000, NOW) == {}
+    # The PM tick fold, the same law.
+    pm_root = tmp_path / "pm"
+    craft_pm_run(pm_root, m0 * 1_000_000, [(1_000, 42, 400_000, 420_000, 0)])
+    assert (TOKEN, m0) in claude_worker.candles.fold_capture_minutes(
+        pm_root, {42: TOKEN}, ("pm",), m0, NOW
+    )
+    assert claude_worker.candles.fold_capture_minutes(
+        pm_root, {42: TOKEN}, ("pm",), m0 + 1, NOW
+    ) == {}
+
+
+def test_a_repeated_print_counts_once_and_a_tie_keeps_arrival_order(tmp_path: pathlib.Path) -> None:
+    root = tmp_path / "logs"
+    m0 = NOW - (NOW % MS_1M) - 10 * MS_1M
+    mark = claude_worker.pmlr.CHANNEL_MARK
+    events = [
+        (IDX_SYM, mark, m0 + 1_000, 7_750_000_000),
+        (IDX_SYM, mark, m0 + 1_000, 7_750_000_000),  # the same print again
+        (IDX_SYM, mark, m0 + 2_000, 7_760_000_000),  # same time, higher price, first
+        (IDX_SYM, mark, m0 + 2_000, 7_740_000_000),  # ... then lower: the close
+    ]
+    craft_hc_run(root, (NOW - MS_1H) * 1_000_000, events, f"{IDX_SYM}\t{IDX_DESC}\n")
+    b = claude_worker.candles.fold_index_minutes(root, m0, NOW)[(IDX_DESC, m0)]
+    assert (b.o, b.h, b.low, b.c, b.n) == (7750.0, 7760.0, 7740.0, 7740.0, 3)
+
+
+def test_channel_event_array_maps_whole_slots_of_its_kind_only(tmp_path: pathlib.Path) -> None:
+    run = craft_hc_run(
+        tmp_path,
+        1,
+        [(IDX_SYM, claude_worker.pmlr.CHANNEL_MARK, 5, 6), (IDX_SYM, 3, 7, 8)],
+        None,
+    )
+    path = run / claude_worker.candles.HC_EVENTS_FILE
+    with path.open("ab") as f:
+        f.write(b"\x01" * 10)  # the engine mid-flush: a torn tail
+    ev = claude_worker.pmlr.channel_event_array(path)
+    assert len(ev) == 2, "the torn tail is left out"
+    assert (int(ev[0]["sym"]), int(ev[0]["channel"]), int(ev[0]["vt"]), int(ev[0]["v0"])) == (
+        IDX_SYM,
+        claude_worker.pmlr.CHANNEL_MARK,
+        5,
+        6,
+    )
+    assert (int(ev[1]["channel"]), int(ev[1]["v1"])) == (3, 7)
+    empty = tmp_path / "empty.pmlr"
+    empty.write_bytes(struct.pack("<4sHBxQ", b"PMLR", 3, 5, 0).ljust(64, b"\0"))
+    assert len(claude_worker.pmlr.channel_event_array(empty)) == 0
+    ticks = tmp_path / "ticks.pmlr"
+    ticks.write_bytes(struct.pack("<4sHBxQ", b"PMLR", 3, 0, 0).ljust(64, b"\0"))
+    try:
+        claude_worker.pmlr.channel_event_array(ticks)
+    except claude_worker.pmlr.PmlrError:
+        pass
+    else:
+        raise AssertionError("a Tick file is refused")
+
+
+def test_main_repair_future_purges_then_runs_the_cycle(
+    tmp_path: pathlib.Path, capsys: object, monkeypatch: object
+) -> None:
+    universe = tmp_path / "u.toml"
+    universe.write_text('[binance]\nusdm = ["cotiusdt"]\n', encoding="utf-8")
+    db_path = tmp_path / "c.db"
+    conn = claude_worker.candles.open_db(db_path)
+    conn.execute(
+        "INSERT INTO candles (venue,descriptor,tf,open_ts,o,h,l,c,v,source,fetched_ts)"
+        " VALUES (?, 'mexc-perp:SPY_USDT', '1d', ?, 1,1,1,1, NULL, 'rest', 1)",
+        (claude_worker.frames.VENUE_MEXC, NOW + 500 * MS_1D),
+    )
+    conn.commit()
+    conn.close()
+    mp = typing.cast(typing.Any, monkeypatch)
+    mp.setattr(claude_worker.candles, "make_http", lambda client, env: http_none())
+    mp.setenv("CLAUDE_WORKER_REPLAY_DIR", str(tmp_path / "no-logs"))
+    mp.setenv("CLAUDE_WORKER_MARKET_MAP", str(tmp_path / "no-map.json"))
+    argv = ["--universe", str(universe), "--db", str(db_path), "--now-ms", str(NOW)]
+    argv += ["--policy", str(tmp_path / "none.toml"), "--repair-future"]
+    assert claude_worker.candles.main(argv) == 0
+    err = typing.cast(typing.Any, capsys).readouterr().err
+    assert "candles: repair-future: mexc-perp:SPY_USDT 1d: -1" in err
+    assert "candles: repair-future: 1 rows in 1 series" in err
+    assert "cycle done" in err, "the cycle runs after the purge"
+    left = sqlite3.connect(db_path).execute("SELECT count(*) FROM candles").fetchone()[0]
+    assert left == 0

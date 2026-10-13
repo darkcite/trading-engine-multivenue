@@ -6,6 +6,64 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-13 — candles.db: no future bars, `--repair-future`, the Hypercall index as 1 m capture bars (HK7)
+
+**What changed**
+- **Future bars are refused.** A real bar never opens after the moment
+  it is fetched. The candles lane refuses a fetched bar that opens more
+  than `FUTURE_SKEW_MS` (one minute) after the wall clock at its page
+  (the cycle's `now` where no clock is passed: OKX's backward walk, the
+  HAR backfill). The lane's report line gains ` future-refused=N` when
+  it refuses any.
+  - The MEXC request now ends at `now`, as Deribit's and HL's do. Asked
+    for the future, the MEXC TradFi perps (`mexc-perp:AAPLSTOCK_USDT`,
+    `SPY_USDT`, `USOIL_USDT`) answered flat placeholder bars ahead of
+    time: 1 m bars hours ahead, 1 h bars weeks ahead, 1 d bars to 2028.
+    Stored, they froze each series' gap-fill frontier until their date
+    passed (`pages=0`), and the placeholder minutes behind a jumped
+    frontier were never fetched again — the flat 1 m days the H3 plan
+    §1.6 found.
+- **`python -m claude_worker.candles --repair-future`** (one-shot,
+  operator-invoked): deletes every stored row, of any source and any
+  timeframe this lane writes, that opens more than a minute after now;
+  prints each purged series and its row count; then runs the normal
+  cycle, so those series fetch again.
+- **Capture windows start on a whole minute.** The hourly window
+  (`now − 26 h`) used to start mid-minute, so its first minute was
+  folded from its tail and stored over the whole minute a day-old cycle
+  had written. This affected the PM tick capture lane too (about one
+  minute per series per cycle; its 5 m / 15 m derivations followed).
+- **The Hypercall index capture (H3 plan §5 W1).** Every hourly cycle
+  folds the `Mark` prints on `hypercall-idx:<U>` from each run's
+  `hypercall-events.pmlr` into 1 m `capture` bars (venue 9, descriptor
+  `hypercall-idx:<U>`).
+  - Prints are placed by the index's own source time; `n` counts
+    distinct prints in the minute.
+  - 5 m and 15 m bars derive from them like any capture base.
+  - `--capture-backfill` folds the whole replay root.
+  - Report line: `candles: capture hypercall-idx: minutes=… +…
+    refreshed=… rest_kept=…`.
+- `claude_worker.pmlr` imports numpy (`channel_event_array` maps a
+  ChannelEvent file as one array), so every worker verb loads numpy at
+  start: about 50–100 ms, and numpy is already a dependency.
+
+**Impact**
+- candles.db grows by about 12 × (1 440 + 288 + 96) ≈ 22 k rows a day
+  (1 m bars plus the 5 m and 15 m derivations, one series per configured
+  underlying).
+- `har_seed compare --descriptor hypercall-idx:<U> --against <desc>`
+  judges the index against the trade candles per full day both cover
+  (≥ 1 380 minutes each). The H3 plan picks each series' primary after
+  ≥ 7 such days.
+
+**Migration steps**
+1. The worker runs from the working tree, so the hourly cycle picks this
+   up at once; nothing restarts.
+2. Once, from the repo root, outside a cycle:
+   `pgrep -f 'claude[-_]worke[r]' || (set -a; . ./.env; set +a; cd claude-worker && uv run python -m claude_worker.candles --repair-future)`.
+   Expect the three MEXC TradFi series' future rows to be purged and
+   their series fetched again.
+
 ## 2026-10-13 — A failed boot removes its empty `run-<epoch_ns>/` capture directory (HK6)
 
 **What changed**

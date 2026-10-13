@@ -16,7 +16,9 @@ a clock: ``ts_ns`` stays the ordering key.
 
 The file is mapped read-only (``mmap.ACCESS_READ``) and decoded in place
 with ``struct.unpack_from`` straight off the map — no per-record byte-slice
-copies; the only objects built are the returned record tuples.
+copies; the only objects built are the returned record tuples. A bulk scan
+of a ChannelEvent file maps it as one numpy array instead
+([`channel_event_array`], HK7).
 
 Deliberate divergence from the Rust reader (``core-io::PmlrReader``), per
 design §11: the Rust offline auditor REJECTS a payload that is not a
@@ -35,6 +37,8 @@ import mmap
 import pathlib
 import struct
 import typing
+
+import numpy
 
 MAGIC: bytes = b"PMLR"
 HEADER_SIZE: int = 64
@@ -381,6 +385,32 @@ CHANNEL_OUTCOME_META: int = 7
 CHANNEL_INSTRUMENT_ROLL: int = 13
 #: ``ChannelEventRec.channel``: mark price.
 CHANNEL_MARK: int = 2
+
+#: HK7: the ChannelEvent slot as a numpy dtype (``_CHANNEL_EVENT``, field
+#: for field: ``vt`` = ``venue_time_ms``, ``seq`` = ``venue_seq``), so a
+#: multi-hour events file is scanned as one memory map, not 64-byte records
+#: decoded one by one. ``bin15_tape.EV_DT`` is the same layout.
+CHANNEL_EVENT_DT: numpy.dtype = numpy.dtype(
+    [
+        ("ts", "<u8"), ("sym", "<u4"), ("venue", "u1"), ("channel", "u1"), ("pad", "V2"),
+        ("seq", "<u8"), ("vt", "<u8"), ("v0", "<i8"), ("v1", "<i8"), ("pad2", "V16"),
+    ]
+)
+assert CHANNEL_EVENT_DT.itemsize == SLOT_SIZE
+
+
+def channel_event_array(path: pathlib.Path) -> numpy.ndarray:
+    """HK7: the file's whole ChannelEvent slots as a read-only memory map
+    (``CHANNEL_EVENT_DT``), after the house reader has checked the header —
+    a trailing partial slot (the engine mid-flush) is left out, as
+    [`Reader.torn`] says. Raises [`PmlrError`] for any other slot kind."""
+    with Reader(path) as reader:
+        if reader.slot_kind != SLOT_KIND_CHANNEL_EVENT:
+            raise PmlrError(f"{path}: slot kind {reader.slot_kind}, not a ChannelEvent file")
+        n = len(reader)
+    if n == 0:
+        return numpy.zeros(0, dtype=CHANNEL_EVENT_DT)
+    return numpy.memmap(path, dtype=CHANNEL_EVENT_DT, mode="r", offset=HEADER_SIZE, shape=(n,))
 
 
 # ---------------------------------------------------------------------------

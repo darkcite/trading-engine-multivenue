@@ -15308,3 +15308,51 @@ Two test files. No shipped code changes.
     unchanged);
   - copy-audit new 0 (neither file is in its reading);
   - license-check OK.
+
+### HK7a — candles.db: no future bars; the Hypercall index as 1 m capture (`claude-worker`)
+
+Worker only; no engine code. The worker runs from the working tree, so
+the hourly candles cycle ran the first draft of this cut before its
+commit. That run surfaced the false refusals described below.
+
+- **No bar opens after its fetch.**
+  - The MEXC TradFi perps answered flat placeholder bars ahead of time
+    when asked for the future: 1 m bars hours ahead, 1 h bars weeks
+    ahead, 1 d bars to 2028.
+  - Stored, they froze each series' gap-fill frontier until their date
+    passed. The placeholder minutes behind a jumped frontier were never
+    fetched again (the H3 plan §1.6's flat 1 m days).
+  - Now the MEXC request ends at `now`, as Deribit's and HL's do.
+  - `upsert_rest` refuses any bar opening more than `FUTURE_SKEW_MS` (one
+    minute) after the wall clock at its page (`fill_forward`'s `clock`;
+    the cycle passes the wall clock).
+  - The first draft bounded by "the cycle's `now` + one bar". Live, that
+    refused the real open 1 m bar of every lane fetched minutes into the
+    cycle. The review then showed that "+ one bar" also admits tomorrow's
+    1 d placeholder.
+- **`--repair-future`** (module flag, operator-invoked; not a frozen
+  verb) purges the stored future rows, then runs the cycle. Running it is
+  the operator's: it deletes rows from the live store.
+- **Capture windows start on a whole minute.** Both capture folds, the PM
+  ticks and the new index, used to fold the hourly window's first minute
+  from its tail and store it over the whole minute. That was a
+  pre-existing defect of the PM lane.
+- **The Hypercall index fold (H3 plan §5 W1).**
+  - Input: the `Mark` prints on `hypercall-idx:<U>` (named by each run's
+    manifest) from `hypercall-events.pmlr`, mapped as one numpy array
+    (`pmlr.channel_event_array`).
+  - Placement: each print by its own source time. A tie keeps arrival
+    order, and a repeated print counts once.
+  - Output: 1 m `capture` bars, venue 9, written by `upsert_capture` (rest
+    supersedes; idempotent per minute).
+  - Live: 18 648 minutes on the first cycle (12 underlyings × ~26 h).
+- **Review:** one pass, NEEDS-CHANGES, all acted on:
+  - the bound, from "+ one bar" to the fetch;
+  - MEXC's request end;
+  - minute alignment, in both folds;
+  - tie order and repeats;
+  - tests for the array reader and `main --repair-future`;
+  - the migration entry's numbers and steps.
+- **Gates:** worker pytest 1 722 passed, 3 skipped (the time-bombed
+  funnel test is fixed under HK8); ruff reports nothing new on the added
+  lines.
