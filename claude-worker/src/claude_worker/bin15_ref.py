@@ -440,14 +440,6 @@ SIGMA_MAX_1E9: int = 100_000_000
 _I64_MAX: int = 2**63 - 1
 
 
-def isqrt_i128(v: int) -> int:
-    """``core_regime::math::isqrt_i128``: 0 at or under 0, the floor root
-    above, saturated at ``i64::MAX``."""
-    if v <= 0:
-        return 0
-    return min(math.isqrt(v), _I64_MAX)
-
-
 @dataclasses.dataclass(frozen=True)
 class LateLut:
     """``late::LateLut``: ``Φ(z) ×1e6`` on ``z = 0 … 8.192``."""
@@ -599,7 +591,7 @@ class LateGrid:
         return (vals[k // 2 - 1] + vals[k // 2]) // 2
 
 
-def late_fair(  # noqa: PLR0911 — one return per named hold, as the Rust
+def late_fair(  # one return per named hold, as the Rust
     grid: LateGrid,
     lut: LateLut,
     strike_1e6: int,
@@ -686,13 +678,15 @@ def replay(lines: typing.Iterable[str]) -> list[str]:
     ``G<TAB>px_1e6<TAB>tick_1e6``               ``G floor ceil``
     ``T<TAB>to_expiry<TAB>twap``                ``T horizon`` (S3)
     ``M<TAB>a<TAB>mark<TAB>strike<TAB>tau<TAB>w``  ``M m_1e9`` or ``M -`` (S3)
-    ``W<TAB>mark<TAB>strike<TAB>tau<TAB>w<TAB>a<TAB>sig2``  ``W p_hat p_raw d den horizon`` or ``W - - - - -`` (S3)
+    ``W<TAB>mark<TAB>strike<TAB>tau<TAB>w<TAB>a<TAB>sig2``  ``W p_hat p_raw d den horizon``
+                                                  or ``W - - - - -`` (S3)
     ``S<TAB>px<TAB>from<TAB>to<TAB>open<TAB>close``  ``S area dt`` (S3)
     ``LPHI<TAB>v0<TAB>…``                       load the late Φ (H90)
     ``LG``                                      a fresh late grid (H90)
     ``LM<TAB>wall<TAB>mark``                    ``LateGrid.on_mark`` (H90)
     ``LP<TAB>wall<TAB>bid_plus_ask``            ``LateGrid.on_perp`` (H90)
-    ``LQ<TAB>wall<TAB>strike<TAB>expiry<TAB>k``  ``LQ p z sigma basis m_now n_obs`` or ``LQ HOLD reason`` (H90)
+    ``LQ<TAB>wall<TAB>strike<TAB>expiry<TAB>k``  ``LQ p z sigma basis m_now n_obs``
+                                                 or ``LQ HOLD reason`` (H90)
     ==========================================  ===========================
 
     The tables travel IN the fixture rather than being rebuilt on each

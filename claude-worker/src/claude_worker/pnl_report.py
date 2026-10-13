@@ -379,7 +379,10 @@ def _merge_regime(acc: dict, section: dict) -> None:
         words = acc["profiles"].setdefault(pname, {})
         for w in prof.get("words") or []:
             bits = str(w.get("bits", "?"))
-            wacc = words.setdefault(bits, {"word": str(w.get("word", "?")), "bits": bits, "minutes": 0, "strategies": {}})
+            wacc = words.setdefault(
+                bits,
+                {"word": str(w.get("word", "?")), "bits": bits, "minutes": 0, "strategies": {}},
+            )
             wacc["minutes"] += int(w.get("minutes", 0) or 0)
             for srow in w.get("strategies") or []:
                 sid = int(srow.get("strategy_id", 255))
@@ -394,13 +397,18 @@ def _merge_regime(acc: dict, section: dict) -> None:
                 # one summing a modelled fill with a real one, in the
                 # same document, for the slot that arms first.
                 sorigin = int(srow["origin"])
-                sacc = wacc["strategies"].setdefault((sid, sorigin), {
-                    "strategy_id": sid, "origin": sorigin,
-                    "accounting": claude_worker.fill_origin.name_of(sorigin),
-                    "label": srow.get("label", "unknown"),
-                    **{k: 0 for k in _REGIME_ROW_KEYS}, "net_usd": 0.0,
-                    "fee_ladder_net_usd": [0.0, 0.0, 0.0],
-                })
+                sacc = wacc["strategies"].setdefault(
+                    (sid, sorigin),
+                    {
+                        "strategy_id": sid,
+                        "origin": sorigin,
+                        "accounting": claude_worker.fill_origin.name_of(sorigin),
+                        "label": srow.get("label", "unknown"),
+                        **{k: 0 for k in _REGIME_ROW_KEYS},
+                        "net_usd": 0.0,
+                        "fee_ladder_net_usd": [0.0, 0.0, 0.0],
+                    },
+                )
                 for k in _REGIME_ROW_KEYS:
                     sacc[k] += int(srow.get(k, 0) or 0)
                 sacc["net_usd"] += _usd(srow.get("net_usd", "0"))
@@ -416,18 +424,23 @@ def _render_regime(acc: dict) -> dict:
     profiles = []
     for pname in sorted(acc["profiles"], key=lambda n: (n != "fast", n)):
         words = []
-        for wacc in sorted(acc["profiles"][pname].values(), key=lambda w: (-w["minutes"], w["bits"])):
+        for wacc in sorted(
+            acc["profiles"][pname].values(), key=lambda w: (-w["minutes"], w["bits"])
+        ):
             strategies = [
                 {
-                    **{k: s[k] for k in
-                       ("strategy_id", "origin", "accounting", "label",
-                        *_REGIME_ROW_KEYS)},
+                    **{
+                        k: s[k]
+                        for k in ("strategy_id", "origin", "accounting", "label", *_REGIME_ROW_KEYS)
+                    },
                     "net_usd": f"{s['net_usd']:.6f}",
                     "fee_ladder_net_usd": [f"{v:.6f}" for v in s["fee_ladder_net_usd"]],
                 }
                 for s in (wacc["strategies"][key] for key in sorted(wacc["strategies"]))
             ]
-            words.append({**{k: wacc[k] for k in ("word", "bits", "minutes")}, "strategies": strategies})
+            words.append(
+                {**{k: wacc[k] for k in ("word", "bits", "minutes")}, "strategies": strategies}
+            )
         profiles.append({"profile": pname, "words": words})
     return {"modes": acc["modes"], **{k: acc[k] for k in _REGIME_SUM_KEYS}, "profiles": profiles}
 
@@ -550,20 +563,29 @@ def merge_reports(day: str, runs: list[tuple[str, dict]]) -> dict:
                     "predates the PAPER/VENUE split (plan §6.4). Rebuild it."
                 )
             origin = int(row["origin"])
-            acc = by_sid.setdefault((sid, origin), {
-                "strategy_id": sid, "origin": origin,
-                "accounting": claude_worker.fill_origin.name_of(origin),
-                "label": row.get("label", "unknown"),
-                **{k: 0 for k in _SUM_KEYS}, **{k: 0.0 for k in _SUM_USD_KEYS},
-                "max_drawdown_usd": 0.0, "trading_days": 1, "runs": 0,
-                "fee_ladder_net_usd": [0.0, 0.0, 0.0],
-            })
+            acc = by_sid.setdefault(
+                (sid, origin),
+                {
+                    "strategy_id": sid,
+                    "origin": origin,
+                    "accounting": claude_worker.fill_origin.name_of(origin),
+                    "label": row.get("label", "unknown"),
+                    **{k: 0 for k in _SUM_KEYS},
+                    **{k: 0.0 for k in _SUM_USD_KEYS},
+                    "max_drawdown_usd": 0.0,
+                    "trading_days": 1,
+                    "runs": 0,
+                    "fee_ladder_net_usd": [0.0, 0.0, 0.0],
+                },
+            )
             acc["runs"] += 1
             for k in _SUM_KEYS:
                 acc[k] += int(row.get(k, 0) or 0)
             for k in _SUM_USD_KEYS:
                 acc[k] += _usd(row.get(k, "0"))
-            acc["max_drawdown_usd"] = max(acc["max_drawdown_usd"], _usd(row.get("max_drawdown_usd", "0")))
+            acc["max_drawdown_usd"] = max(
+                acc["max_drawdown_usd"], _usd(row.get("max_drawdown_usd", "0"))
+            )
             ladder = row.get("fee_ladder_net_usd") or []
             for i in range(min(3, len(ladder))):
                 acc["fee_ladder_net_usd"][i] += _usd(ladder[i])
@@ -576,30 +598,41 @@ def merge_reports(day: str, runs: list[tuple[str, dict]]) -> dict:
                 )
             # Dollars again, merged by ruleset hash across runs.
             vorigin = int(row["origin"])
-            acc = vm.setdefault((h, vorigin), {
-                "hash128": h, "origin": vorigin,
-                "accounting": claude_worker.fill_origin.name_of(vorigin),
-                "orders": 0, "trades": 0, "net_usd": 0.0, "max_drawdown_usd": 0.0})
+            acc = vm.setdefault(
+                (h, vorigin),
+                {
+                    "hash128": h,
+                    "origin": vorigin,
+                    "accounting": claude_worker.fill_origin.name_of(vorigin),
+                    "orders": 0,
+                    "trades": 0,
+                    "net_usd": 0.0,
+                    "max_drawdown_usd": 0.0,
+                },
+            )
             acc["orders"] += int(row.get("orders", 0) or 0)
             acc["trades"] += int(row.get("trades", 0) or 0)
             acc["net_usd"] += _usd(row.get("net_usd", "0"))
-            acc["max_drawdown_usd"] = max(acc["max_drawdown_usd"], _usd(row.get("max_drawdown_usd", "0")))
+            acc["max_drawdown_usd"] = max(
+                acc["max_drawdown_usd"], _usd(row.get("max_drawdown_usd", "0"))
+            )
         section = obj.get("regime")
         if isinstance(section, dict):
             _merge_regime(regime_acc, section)
     strategies = []
     for key in sorted(by_sid):
         acc = by_sid[key]
-        strategies.append({
-            **{k: acc[k] for k in
-               ("strategy_id", "origin", "accounting", "label", "runs")},
-            **{k: acc[k] for k in _SUM_KEYS},
-            **{k: f"{acc[k]:.6f}" for k in _SUM_USD_KEYS},
-            "max_drawdown_usd": f"{acc['max_drawdown_usd']:.6f}",
-            "trading_days": 1,
-            "fee_ladder_net_usd": [f"{v:.6f}" for v in acc["fee_ladder_net_usd"]],
-            "per_day_net_usd": [{"day": 0, "net_usd": f"{acc['net_usd']:.6f}"}],
-        })
+        strategies.append(
+            {
+                **{k: acc[k] for k in ("strategy_id", "origin", "accounting", "label", "runs")},
+                **{k: acc[k] for k in _SUM_KEYS},
+                **{k: f"{acc[k]:.6f}" for k in _SUM_USD_KEYS},
+                "max_drawdown_usd": f"{acc['max_drawdown_usd']:.6f}",
+                "trading_days": 1,
+                "fee_ladder_net_usd": [f"{v:.6f}" for v in acc["fee_ladder_net_usd"]],
+                "per_day_net_usd": [{"day": 0, "net_usd": f"{acc['net_usd']:.6f}"}],
+            }
+        )
     binary_fills = _merge_binary_fills(runs)
     return {
         "audit_pnl_version": AUDIT_PNL_VERSION,
@@ -610,7 +643,11 @@ def merge_reports(day: str, runs: list[tuple[str, dict]]) -> dict:
         "paper": {"fills": paper_fills, "net_usd": f"{paper_net:.6f}"},
         "strategies": strategies,
         "vm_by_ruleset": [
-            {**v, "net_usd": f"{v['net_usd']:.6f}", "max_drawdown_usd": f"{v['max_drawdown_usd']:.6f}"}
+            {
+                **v,
+                "net_usd": f"{v['net_usd']:.6f}",
+                "max_drawdown_usd": f"{v['max_drawdown_usd']:.6f}",
+            }
             for v in (vm[h] for h in sorted(vm))
         ],
         "regime": _render_regime(regime_acc),
@@ -637,10 +674,14 @@ def regime_head_lines(merged: dict) -> list[str]:
     for prof in profiles:
         for w in prof.get("words") or []:
             rows = " ".join(
-                f"{s['label']}[fills={s['fills']} net={s['net_usd']} ladder={s['fee_ladder_net_usd']}]"
+                f"{s['label']}[fills={s['fills']} net={s['net_usd']} "
+                f"ladder={s['fee_ladder_net_usd']}]"
                 for s in w.get("strategies") or []
             )
-            out.append(f"regime {prof['profile']} [{w['word']}] minutes={w['minutes']}: {rows or '(no fills)'}")
+            out.append(
+                f"regime {prof['profile']} [{w['word']}] minutes={w['minutes']}: "
+                f"{rows or '(no fills)'}"
+            )
     return out
 
 
@@ -667,7 +708,7 @@ def latest_report_regimes(reports_dir: pathlib.Path) -> list[dict[str, object]]:
         return []
     try:
         obj = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return []
     section = obj.get("regime") if isinstance(obj, dict) else None
     profiles = section.get("profiles") if isinstance(section, dict) else None
@@ -710,9 +751,7 @@ def _iter_units(
         report(f"pnl-report: {run_dir.name}: cannot window ({exc}) — auditing whole")
         yield (run_dir.name, run_dir, False)
         return
-    carried = (
-        claude_worker.window_root.carry_wanted(run_dir) if next_run is not None else False
-    )
+    carried = claude_worker.window_root.carry_wanted(run_dir) if next_run is not None else False
     if len(windows) <= 1 and not carried:
         # The fast path: nothing open, one window — audit the run in
         # place and copy nothing.
@@ -831,7 +870,7 @@ def run_day(
         _sweep_stale_units(window_root, report)
     ladder_units: list[list[dict[str, object]]] = []
     for label, unit_dir, temporary in _units_of_day(runs, window_root, report):
-        argv = [claude_worker.backtest.ENGINE_BINARY, "audit-pnl", "--dir", str(unit_dir)] + flags
+        argv = [claude_worker.backtest.ENGINE_BINARY, "audit-pnl", "--dir", str(unit_dir), *flags]
         scratch = (window_root or reports_dir) / f"hyparb-ladder-{pathlib.Path(label).name}"
         try:
             code, out, err = fn(argv)
@@ -857,7 +896,10 @@ def run_day(
                 obj = None
         if not isinstance(obj, dict) or obj.get("audit_pnl_version") != AUDIT_PNL_VERSION:
             failed.append(run_dir.name)
-            report(f"pnl-report: {run_dir.name}: audit-pnl exited {code} / bad stdout; stderr tail: {err.strip()[-300:]}")
+            report(
+                f"pnl-report: {run_dir.name}: audit-pnl exited {code} / bad stdout; stderr tail: "
+                f"{err.strip()[-300:]}"
+            )
             summaries.append(f"== {run_dir.name}: FAILED (exit {code})\n{err}")
             continue
         ok.append((run_dir.name, obj))
@@ -886,7 +928,8 @@ def run_day(
     json_path.write_text(json.dumps(merged, separators=(",", ":")) + "\n", encoding="utf-8")
     head = [
         f"pnl-report: day {day}: runs audited {len(ok)} failed {len(failed)}",
-        f"fee tier flags: {' '.join(flags) if flags else '(none — harness defaults 0/0; read the ladder)'}",
+        "fee tier flags: "
+        f"{' '.join(flags) if flags else '(none — harness defaults 0/0; read the ladder)'}",
     ]
     for row in merged["strategies"]:
         # §6.4 — the accounting word sits between the label and the
@@ -899,7 +942,8 @@ def run_day(
         head.append(
             f"strategy {row['strategy_id']} ({row['label']}) {row['accounting']}: "
             f"runs={row['runs']} orders={row['orders']} "
-            f"fills={row['fills']} trades={row['trades']} net={row['net_usd']} fees={row['fees_usd']} "
+            f"fills={row['fills']} trades={row['trades']} net={row['net_usd']} "
+            f"fees={row['fees_usd']} "
             f"worst_run_dd={row['max_drawdown_usd']} ioc_fills={row['ioc_fills']} "
             f"ioc_canceled={row['ioc_canceled']} ttl_expired={row['ttl_expired']} "
             f"ladder(0/1/2 bps)={row['fee_ladder_net_usd']}{tag}"
@@ -926,7 +970,10 @@ def run_day(
     if "hyparb" in merged:
         head.extend(claude_worker.hyparb_ladder.summary_lines(merged["hyparb"]))
     summary_path.write_text("\n".join(head) + "\n\n" + "\n".join(summaries), encoding="utf-8")
-    report(f"pnl-report: {day}: strategies={len(merged['strategies'])} runs={len(ok)} failed={len(failed)} -> {json_path} (+ summary)")
+    report(
+        f"pnl-report: {day}: strategies={len(merged['strategies'])} runs={len(ok)} "
+        f"failed={len(failed)} -> {json_path} (+ summary)"
+    )
     return 0 if ok else 1
 
 
@@ -936,28 +983,44 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--replay-dir", default=None)
     parser.add_argument("--reports-dir", default=None)
     parser.add_argument("--now-ms", type=int, default=None, help="tests only")
-    parser.add_argument("--closed-day", action="store_true",
-                        help="day mode for the UTC day before now (the nightly lane)")
+    parser.add_argument(
+        "--closed-day",
+        action="store_true",
+        help="day mode for the UTC day before now (the nightly lane)",
+    )
     parser.add_argument("--day", default=None, help="day mode for this UTC day (YYYY-MM-DD)")
-    parser.add_argument("--window-root", default=WINDOW_ROOT_DEFAULT,
-                        help="day mode: where the ≤ 2 h window cuts are materialised (deleted after each audit)")
-    parser.add_argument("--no-windows", action="store_true",
-                        help="day mode: audit each run whole (tests / tiny runs only — the 2 h law)")
-    parser.add_argument("--fees", default=None,
-                        help=f"fees.toml with the operator's tier (default {FEES_PATH_DEFAULT} in day mode when present)")
-    parser.add_argument("--hyparb-ladder", default=None, nargs="?", const=HYPARB_ARTIFACT_DEFAULT,
-                        help="day mode: also replay each unit through the slot-0 correction ladder "
-                             f"(the artifact; default {HYPARB_ARTIFACT_DEFAULT})")
+    parser.add_argument(
+        "--window-root",
+        default=WINDOW_ROOT_DEFAULT,
+        help="day mode: where the ≤ 2 h window cuts are materialised (deleted after each audit)",
+    )
+    parser.add_argument(
+        "--no-windows",
+        action="store_true",
+        help="day mode: audit each run whole (tests / tiny runs only — the 2 h law)",
+    )
+    parser.add_argument(
+        "--fees",
+        default=None,
+        help=(
+            f"fees.toml with the operator's tier (default {FEES_PATH_DEFAULT} in day mode when "
+            "present)"
+        ),
+    )
+    parser.add_argument(
+        "--hyparb-ladder",
+        default=None,
+        nargs="?",
+        const=HYPARB_ARTIFACT_DEFAULT,
+        help="day mode: also replay each unit through the slot-0 correction ladder "
+        f"(the artifact; default {HYPARB_ARTIFACT_DEFAULT})",
+    )
     args = parser.parse_args(argv)
     replay_dir = (
-        pathlib.Path(args.replay_dir).expanduser()
-        if args.replay_dir
-        else resolve_replay_dir()
+        pathlib.Path(args.replay_dir).expanduser() if args.replay_dir else resolve_replay_dir()
     )
     reports_dir = (
-        pathlib.Path(args.reports_dir).expanduser()
-        if args.reports_dir
-        else resolve_reports_dir()
+        pathlib.Path(args.reports_dir).expanduser() if args.reports_dir else resolve_reports_dir()
     )
     now_ms = args.now_ms if args.now_ms is not None else int(time.time() * 1000)
 
@@ -972,7 +1035,11 @@ def main(argv: list[str] | None = None) -> int:
                 datetime.datetime.fromtimestamp(now_ms / 1000, tz=datetime.timezone.utc)
                 - datetime.timedelta(days=1)
             ).strftime("%Y-%m-%d")
-        fees_path = pathlib.Path(args.fees).expanduser() if args.fees else pathlib.Path(FEES_PATH_DEFAULT).expanduser()
+        fees_path = (
+            pathlib.Path(args.fees).expanduser()
+            if args.fees
+            else pathlib.Path(FEES_PATH_DEFAULT).expanduser()
+        )
         fee_flags: list[str] = []
         if args.fees or fees_path.is_file():
             fee_flags = load_fee_flags(fees_path)

@@ -340,11 +340,18 @@ def test_probe_records_a_fixture_that_is_its_own_reduction(
     assert claude_worker.news.sources.reduce_payload("instruments-okx", body) == body
 
 
+#: HK8: the clock the funnel test runs on — an hour after the fixture
+#: feed's newest item (Sat, 19 Sep 2026 12:05Z). On the wall clock the
+#: report's 24 h window lost the fixture a day after it was written.
+FUNNEL_NOW_S = 1_789_823_100  # 2026-09-19T13:05:00Z
+
+
 def test_report_prints_the_funnel(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _env(monkeypatch, tmp_path, _TOML)
     _install_transport(monkeypatch)
+    monkeypatch.setattr(time, "time", lambda: float(FUNNEL_NOW_S))
     claude_worker.news.__main__.main(["cycle"])
     capsys.readouterr()
     assert claude_worker.news.__main__.main(["report", "--hours", "24"]) == 0

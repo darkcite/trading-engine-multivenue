@@ -86,9 +86,9 @@ import httpx
 
 import claude_worker.candles
 import claude_worker.config
-import claude_worker.frames
 import claude_worker.features
 import claude_worker.fetchers
+import claude_worker.frames
 import claude_worker.state
 import claude_worker.uds
 import claude_worker.window_root
@@ -291,7 +291,7 @@ def rv_over(ring: list[int], m: int, w: int) -> int | None:
     return isqrt_i128(total)
 
 
-def judge_trend(  # noqa: PLR0913, PLR0917 — the engine's argument list, mirrored
+def judge_trend(  # the engine's argument list, mirrored
     cur: int, r: int, up: int, dn: int, present: int, n_members: int, pp: ProfileParams
 ) -> int:
     if pp.trend_exit_bps_1e9 > 0:
@@ -397,7 +397,7 @@ def word_with_source(word: int, source: int) -> int:
 def any_known(word: int) -> bool:
     for d in range(DIM_SOURCE):
         b = word_dim(word, d)
-        if b != 0 and b != DIM_UNKNOWN_BIT:
+        if b not in (0, DIM_UNKNOWN_BIT):
             return True
     return False
 
@@ -422,7 +422,7 @@ def declared_disagrees(declared: int, measured: int) -> bool:
 class Judge:
     """Per-dimension confirm state (``core_regime::Judge``)."""
 
-    __slots__ = ("cur", "pending", "pend_n")
+    __slots__ = ("cur", "pend_n", "pending")
 
     def __init__(self) -> None:
         self.cur = ABSENT
@@ -440,7 +440,7 @@ class Judge:
             self.pending = candidate
             self.pend_n = 1
         if self.pend_n >= confirm_min:
-            flip = self.cur != ABSENT and candidate != ABSENT
+            flip = ABSENT not in (self.cur, candidate)
             self.cur = candidate
             self.pend_n = 0
             return flip
@@ -489,14 +489,18 @@ class RegimeEvaluator:
                 or not 0 <= pp.stretch_exit_k_1e9 <= pp.stretch_k_1e9
             ):
                 raise ValueError("exit bands inside their entry thresholds (§3.5)")
-        if len(params.members) > REGIME_MAX_MEMBERS or len(set(params.members)) != len(params.members):
+        if len(params.members) > REGIME_MAX_MEMBERS or len(set(params.members)) != len(
+            params.members
+        ):
             raise ValueError("members: ≤ 31, unique")
         if params.btc_ref in params.members:
             raise ValueError("btc_ref must not be a member")
         self.params = params
         self.syms: list[int] = [params.btc_ref, *params.members]
         self.rings: dict[int, list[int]] = {s: [0] * REGIME_RING_MIN for s in self.syms}
-        self.judges: list[list[Judge]] = [[Judge() for _ in range(8)] for _ in range(REGIME_PROFILES)]
+        self.judges: list[list[Judge]] = [
+            [Judge() for _ in range(8)] for _ in range(REGIME_PROFILES)
+        ]
         self.rel_judges: list[dict[int, Judge]] = [
             {s: Judge() for s in params.members} for _ in range(REGIME_PROFILES)
         ]
@@ -599,7 +603,11 @@ class RegimeEvaluator:
                 ring = self.rings[sym]
                 a = ret_over(ring, m, pp.rel_w_min)
                 b = ret_over(btc, m, pp.rel_w_min)
-                rel_cand = judge_rel(a - b, pp.rel_thr_bps_1e9) if a is not None and b is not None else ABSENT
+                rel_cand = (
+                    judge_rel(a - b, pp.rel_thr_bps_1e9)
+                    if a is not None and b is not None
+                    else ABSENT
+                )
                 self.rel_judges[p][sym].feed(rel_cand, confirm)
                 r = ret_over(ring, m, pp.trend_w_min)
                 if r is not None:
@@ -641,7 +649,11 @@ class RegimeEvaluator:
                 byte = DIM_UNKNOWN_BIT if cur == ABSENT else (1 << cur)
                 w |= byte << (8 * d)
             measured = word_with_source(w, SOURCE_MEASURED)
-            if count and self.declared_fresh(p, now_ns) and declared_disagrees(self.declared[p], measured):
+            if (
+                count
+                and self.declared_fresh(p, now_ns)
+                and declared_disagrees(self.declared[p], measured)
+            ):
                 self.disagree[p] += 1
             self.measured[p] = measured
             self.raw[p] = raw
@@ -673,7 +685,9 @@ def describe(word: int) -> str:
 # ---- RG2: the seed lane (plan §4.3) ----
 
 SEED_MINUTES_DEFAULT: int = 1536  # == core_regime::REGIME_RING_MIN
-SEED_HEADER: str = "# regime-seed.tsv — descriptor\tminute\tclose_1e6 (claude_worker.regime seed-out)\n"
+SEED_HEADER: str = (
+    "# regime-seed.tsv — descriptor\tminute\tclose_1e6 (claude_worker.regime seed-out)\n"
+)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -713,7 +727,7 @@ def seed_rows_from_candles(
         for open_ts, c in cur.fetchall():
             if c is None or c <= 0:
                 continue
-            close_1e6 = int(round(float(c) * 1_000_000))
+            close_1e6 = round(float(c) * 1_000_000)
             if close_1e6 <= 0:
                 continue
             rows.append(SeedRow(d, int(open_ts) // 60_000, close_1e6))
@@ -848,6 +862,7 @@ MIN_FUND_SAMPLES: int = 3
 _METRIC_NAME_PARTS: int = 4  # engine_regime_<profile>_<kind>
 _TERM_PARTS_PREFIXED: int = 3
 _TERM_PARTS: int = 2
+
 
 def regime_dir(env: typing.Mapping[str, str] | None = None) -> pathlib.Path:
     """``~/multivenue/worker/regime`` (``$CLAUDE_WORKER_REGIME_DIR``) — the
@@ -1270,9 +1285,7 @@ def repush_declared(
     if not sent:
         report("regime repush: no fresh declaration persisted — nothing to re-send")
         return 0
-    report(
-        f"regime repush: re-sent {len(sent)} declaration(s) {left_by_name} s left (seqs {sent})"
-    )
+    report(f"regime repush: re-sent {len(sent)} declaration(s) {left_by_name} s left (seqs {sent})")
     return len(sent)
 
 
@@ -1289,7 +1302,7 @@ def _dim_any_mask(dim: str) -> int:
     return known if dim == "source" else known | DIM_UNKNOWN_BIT
 
 
-def parse_label_term(term: str) -> tuple[int, str, int]:  # noqa: PLR0912 — one branch per grammar arm
+def parse_label_term(term: str) -> tuple[int, str, int]:  # one branch per grammar arm
     """``[fast:|slow:]<dim>:<values>`` → ``(profile, dim, mask)`` — the Rust
     ``parse_label_term`` law (``*`` = any incl. the unknown mark, ``!v`` =
     known values but ``v``, ``v1|v2|unknown`` = exactly those). ``rel`` is
@@ -1413,7 +1426,10 @@ def lane_gate(
         source = "given"
     open_ = regime_allows(terms, words)
     shown = " ".join(f"{n}=[{describe(words.get(n, UNKNOWN_WORD))}]" for n in PROFILE_NAMES)
-    return open_, f"regime: {'open' if open_ else 'ENTRIES BLOCKED'} label={list(terms)} ({source}) {shown}"
+    return (
+        open_,
+        f"regime: {'open' if open_ else 'ENTRIES BLOCKED'} label={list(terms)} ({source}) {shown}",
+    )
 
 
 # ---- history (24 h of worker words under ~/multivenue/worker/regime/) ----
@@ -1679,7 +1695,7 @@ def judge_window(
     )
 
 
-def run_soak(  # noqa: PLR0913 — one parameter per input source, deliberately
+def run_soak(  # one parameter per input source, deliberately
     directory: pathlib.Path,
     windows: list[SoakWindow],
     reports_dir: pathlib.Path | None,
@@ -1995,7 +2011,7 @@ def regime_digest_from(
 # ---- one cron cycle ----
 
 
-def run_cycle(  # noqa: PLR0913, PLR0917 — one argument per input source
+def run_cycle(  # one argument per input source
     regime_path: pathlib.Path,
     db_path: pathlib.Path,
     directory: pathlib.Path,
@@ -2058,7 +2074,8 @@ def regime_inputs(env: typing.Mapping[str, str] | None = None) -> tuple[pathlib.
     return (
         pathlib.Path(source.get(REGIME_TOML_ENV, "") or REGIME_PATH_DEFAULT).expanduser(),
         pathlib.Path(
-            source.get(claude_worker.candles.CANDLES_DB_ENV, "") or claude_worker.candles.DEFAULT_DB_PATH
+            source.get(claude_worker.candles.CANDLES_DB_ENV, "")
+            or claude_worker.candles.DEFAULT_DB_PATH
         ).expanduser(),
     )
 
@@ -2081,7 +2098,9 @@ def parse_verdict(verdict: typing.Mapping[str, object]) -> dict[str, str]:
     structurally — declaration grammar or the ``measured`` token.
     ``ValueError`` on anything else (the caller archives the proposal)."""
     if not verdict or any(k not in PROFILE_NAMES for k in verdict):
-        raise ValueError(f"regime verdict: profiles must be among {PROFILE_NAMES}: {sorted(verdict)}")
+        raise ValueError(
+            f"regime verdict: profiles must be among {PROFILE_NAMES}: {sorted(verdict)}"
+        )
     out: dict[str, str] = {}
     for name in PROFILE_NAMES:
         spec = verdict.get(name)
@@ -2099,12 +2118,14 @@ def verdict_words(verdict: typing.Mapping[str, str], measured: dict[str, int]) -
     """Resolve a parsed verdict to wire words (``measured`` = the
     confirm-the-measurement word)."""
     return {
-        name: measured[name] if spec == VERDICT_MEASURED else declaration_word(parse_declaration(spec))
+        name: measured[name]
+        if spec == VERDICT_MEASURED
+        else declaration_word(parse_declaration(spec))
         for name, spec in verdict.items()
     }
 
 
-def declare_words(  # noqa: PLR0913, PLR0917 — one argument per input source
+def declare_words(  # one argument per input source
     client: typing.Any,
     directory: pathlib.Path,
     words: dict[str, int],
@@ -2135,7 +2156,7 @@ class ServeRegimeOutcome:
     digest: str
 
 
-def serve_regime_step(  # noqa: PLR0913, PLR0917 — one argument per input source
+def serve_regime_step(  # one argument per input source
     regime_path: pathlib.Path,
     db_path: pathlib.Path,
     directory: pathlib.Path,
@@ -2153,11 +2174,15 @@ def serve_regime_step(  # noqa: PLR0913, PLR0917 — one argument per input sour
     Never raises: absent inputs / a failed measurement / a transport
     error are reported in ``skipped`` and the digest says so."""
     if not regime_path.is_file() or not db_path.is_file():
-        return ServeRegimeOutcome(None, {}, [], "no regime artifact / candles.db", REGIME_UNMEASURED_TEXT)
+        return ServeRegimeOutcome(
+            None, {}, [], "no regime artifact / candles.db", REGIME_UNMEASURED_TEXT
+        )
     try:
         m = measure(regime_path, db_path, now_ms)
     except (ValueError, sqlite3.Error) as exc:
-        return ServeRegimeOutcome(None, {}, [], f"measure failed: {exc}", f"  (regime measurement failed: {exc})")
+        return ServeRegimeOutcome(
+            None, {}, [], f"measure failed: {exc}", f"  (regime measurement failed: {exc})"
+        )
     append_history(directory, history_entry(m, now_ms))
     entries = load_declared(directory)
     words = {
@@ -2173,7 +2198,9 @@ def serve_regime_step(  # noqa: PLR0913, PLR0917 — one argument per input sour
     skipped = "" if words else "fresher ruling in force on every profile"
     if words:
         try:
-            seqs = declare_words(client, directory, words, now_ms, ttl_s, SOURCE_SERVE, measured_words(m))
+            seqs = declare_words(
+                client, directory, words, now_ms, ttl_s, SOURCE_SERVE, measured_words(m)
+            )
         except claude_worker.uds.UdsError as exc:
             skipped = f"transport: {exc} (persisted; repush re-sends while fresh)"
     digest = regime_digest_from(m, directory, now_ms, pnl_regimes, url)
@@ -2198,7 +2225,7 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--now-ms", type=int, default=None, help="tests only")
 
 
-def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911, PLR0915 — one dispatcher per lane
+def main(argv: list[str] | None = None) -> int:  # one dispatcher per lane
     parser = argparse.ArgumentParser(prog="claude_worker.regime")
     sub = parser.add_subparsers(dest="lane", required=True)
     seed = sub.add_parser("seed-out", help="export the engine's warm-up seed from candles.db")
@@ -2406,7 +2433,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911, PLR0915 — on
     return 2
 
 
-def _declare_main(  # noqa: PLR0911 — one exit code per refusal
+def _declare_main(  # one exit code per refusal
     args: argparse.Namespace,
     regime_path: pathlib.Path,
     db_path: pathlib.Path,
@@ -2422,7 +2449,9 @@ def _declare_main(  # noqa: PLR0911 — one exit code per refusal
         return 2
     m = measure(regime_path, db_path, now_ms)
     try:
-        verdict = parse_verdict({k: v for k, v in (("fast", args.fast), ("slow", args.slow)) if v is not None})
+        verdict = parse_verdict(
+            {k: v for k, v in (("fast", args.fast), ("slow", args.slow)) if v is not None}
+        )
         words = verdict_words(verdict, measured_declaration_words(m))
     except ValueError as exc:
         print(f"regime declare: {exc}", file=sys.stderr)

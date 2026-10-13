@@ -18,7 +18,7 @@ _SLOT = claude_worker.pmlr.SLOT_SIZE
 _HDR = claude_worker.pmlr.HEADER_SIZE
 
 
-def write_ticks(  # noqa: PLR0913 — one parameter per header/slot field, deliberately
+def write_ticks(  # one parameter per header/slot field, deliberately
     path: pathlib.Path,
     ts_list: list[int],
     epoch_ns: int,
@@ -31,12 +31,12 @@ def write_ticks(  # noqa: PLR0913 — one parameter per header/slot field, delib
     (flags, venue_time_ms) are packed as 0 — byte-identical to a v2
     writer's zeroed tail pad; ``version`` only stamps the header (RG4's
     window pool refuses stale-blind v2 runs, so its tests write 3)."""
-    header = claude_worker.pmlr._HEADER.pack(  # noqa: SLF001 — reader-defined layout, deliberately
+    header = claude_worker.pmlr._HEADER.pack(  # reader-defined layout, deliberately
         claude_worker.pmlr.MAGIC, version, claude_worker.pmlr.SLOT_KIND_TICK, epoch_ns
     )
     blob = bytearray(header + bytes(_HDR - len(header)))
     for i, ts in enumerate(ts_list):
-        slot = claude_worker.pmlr._TICK.pack(  # noqa: SLF001
+        slot = claude_worker.pmlr._TICK.pack(
             ts, sym, i + 1, 400_000, 1_000_000, 420_000, 1_000_000, venue, 0, 0
         )
         blob.extend(slot + bytes(_SLOT - len(slot)))
@@ -67,12 +67,12 @@ def write_ticks_px(
     """M3-C5 builder: one v2 tick file with EXPLICIT per-slot prices —
     ``rows`` = (ts_ns, sym, bid_px, ask_px, venue), fixed-point 1e6
     (the capture-derived candle tests need controlled mids)."""
-    header = claude_worker.pmlr._HEADER.pack(  # noqa: SLF001 — reader-defined layout, deliberately
+    header = claude_worker.pmlr._HEADER.pack(  # reader-defined layout, deliberately
         claude_worker.pmlr.MAGIC, 2, claude_worker.pmlr.SLOT_KIND_TICK, epoch_ns
     )
     blob = bytearray(header + bytes(_HDR - len(header)))
     for i, (ts, sym, bid_px, ask_px, venue) in enumerate(rows):
-        slot = claude_worker.pmlr._TICK.pack(  # noqa: SLF001
+        slot = claude_worker.pmlr._TICK.pack(
             ts, sym, i + 1, bid_px, 1_000_000, ask_px, 1_000_000, venue, 0, 0
         )
         blob.extend(slot + bytes(_SLOT - len(slot)))

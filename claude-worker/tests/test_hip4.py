@@ -244,8 +244,8 @@ def test_the_first_n_law_ignores_unstamped_ticks_and_survives_a_stale_head() -> 
     assert claude_worker.hip4.venue_offset_first_n([]) is None
     assert claude_worker.hip4.venue_offset_first_n([(0, 5)]) is None
     # Even count: the mean of the two middles, integer.
-    assert claude_worker.hip4.venue_offset_first_n([(1_010, 1_000_000_000), (2_030, 2_000_000_000)]) == 20_000_000
-
+    pairs = [(1_010, 1_000_000_000), (2_030, 2_000_000_000)]
+    assert claude_worker.hip4.venue_offset_first_n(pairs) == 20_000_000
 
 
 # --- BIN15 S4: the settlement law, mirrored (LAW E-11) --------------------

@@ -9,7 +9,6 @@ only with the other in the same commit.
 Convention: full ``import x`` only.
 """
 
-import pathlib
 
 import claude_worker.channel_map
 import claude_worker.iv_digest

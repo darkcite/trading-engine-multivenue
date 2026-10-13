@@ -282,8 +282,8 @@ def parse_markets_entries(text: str) -> list[ResolvedMarket] | None:
                 # single-line form: markets = ["a", "b"]
                 if "]" in stripped:
                     inner = stripped.split("[", 1)[1].rsplit("]", 1)[0]
-                    for tok in inner.split(","):
-                        tok = tok.strip().strip('"')
+                    for raw in inner.split(","):
+                        tok = raw.strip().strip('"')
                         if tok:
                             out.append(ResolvedMarket(entry=tok, question="(carried)"))
                     return out

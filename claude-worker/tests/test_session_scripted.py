@@ -188,8 +188,13 @@ def test_scripted_session_happy_path(
     the durable allocator."""
     # 0a. the regime report degrades honestly without an artifact (exit 2, a tell, no frame)
     proc = _run_lane(
-        session_env, "regime", "report",
-        "--regime", session_env["CLAUDE_WORKER_REGIME_TOML"], "--db", session_env["CLAUDE_WORKER_CANDLES_DB"],
+        session_env,
+        "regime",
+        "report",
+        "--regime",
+        session_env["CLAUDE_WORKER_REGIME_TOML"],
+        "--db",
+        session_env["CLAUDE_WORKER_CANDLES_DB"],
     )
     assert proc.returncode == 2, proc.stderr + proc.stdout
     assert "absent" in proc.stderr
@@ -212,7 +217,17 @@ def test_scripted_session_happy_path(
     # 3. author the member rows, add them to the library, compose for the words
     authored = tmp_path / "R.json"
     authored.write_text(json.dumps(_MEMBER_ROWS))
-    proc = _run_lane(session_env, "library", "add", "--from", str(authored), "--name", "xv-vlow", "--thesis", "calm-market xv")
+    proc = _run_lane(
+        session_env,
+        "library",
+        "add",
+        "--from",
+        str(authored),
+        "--name",
+        "xv-vlow",
+        "--thesis",
+        "calm-market xv",
+    )
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "library add: added candidate" in proc.stdout and "labels=[vol:low]" in proc.stdout
     member_id = proc.stdout.split()[4]
@@ -229,10 +244,14 @@ def test_scripted_session_happy_path(
     assert "added candidate" in proc.stdout and "labels=ANY" in proc.stdout
     proc = _run_lane(session_env, "library", "validate", "xv-bare")
     assert proc.returncode != 0 and "RG8" in (proc.stderr + proc.stdout)
-    proc = _run_lane(session_env, "compose", "--dry-run", "--regime", "vol:low", "--include-candidates", "--json")
+    proc = _run_lane(
+        session_env, "compose", "--dry-run", "--regime", "vol:low", "--include-candidates", "--json"
+    )
     assert proc.returncode == 0, proc.stderr + proc.stdout
     composed = json.loads(proc.stdout)
-    assert composed["members"] == [{"member_id": member_id, "name": "xv-vlow", "fit": "word", "rows": 1}]
+    assert composed["members"] == [
+        {"member_id": member_id, "name": "xv-vlow", "fit": "word", "rows": 1}
+    ]
     assert composed["hash"] == member_id, "a single-member table hashes to its member id"
     ruleset = pathlib.Path(composed["path"])
     assert ruleset.is_file() and ruleset.parent == tmp_path / "compositions"

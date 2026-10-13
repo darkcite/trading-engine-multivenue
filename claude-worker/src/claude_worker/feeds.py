@@ -201,7 +201,7 @@ class NewsWatcher:
     11). The verb path (item 12) uses only the mechanical layer above.
     """
 
-    def __init__(  # noqa: PLR0913 — composition root: every collaborator injected (§11 testability)
+    def __init__(  # composition root: every collaborator injected (§11 testability)
         self,
         *,
         state: claude_worker.state.State,

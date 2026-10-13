@@ -392,19 +392,35 @@ def read_tf_policy(path: pathlib.Path) -> tuple[TfPolicy, str | None]:
         for key, val in section.items():
             if key == "extra":
                 if lane_name not in LANE_FORMS:
-                    return DEFAULT_POLICY, f"[{lane_name}] extra: not a candle lane {sorted(LANE_FORMS)}"
+                    return (
+                        DEFAULT_POLICY,
+                        f"[{lane_name}] extra: not a candle lane {sorted(LANE_FORMS)}",
+                    )
                 syms = _policy_syms(val)
                 if syms is None:
-                    return DEFAULT_POLICY, f"[{lane_name}] extra must be a non-empty list of distinct symbols"
+                    return (
+                        DEFAULT_POLICY,
+                        f"[{lane_name}] extra must be a non-empty list of distinct symbols",
+                    )
                 extras[lane_name] = syms
             elif key == "backfill_1m_h":
-                if isinstance(val, bool) or not isinstance(val, int) or not 1 <= val <= BACKFILL_1M_H_MAX:
-                    return DEFAULT_POLICY, f"[{lane_name}] backfill_1m_h must be an integer 1..{BACKFILL_1M_H_MAX}"
+                if (
+                    isinstance(val, bool)
+                    or not isinstance(val, int)
+                    or not 1 <= val <= BACKFILL_1M_H_MAX
+                ):
+                    return (
+                        DEFAULT_POLICY,
+                        f"[{lane_name}] backfill_1m_h must be an integer 1..{BACKFILL_1M_H_MAX}",
+                    )
                 backfill_1m_h[lane_name] = val
             elif key == "tfs":
                 tfs = _policy_tfs(val)
                 if tfs is None:
-                    return DEFAULT_POLICY, f"[{lane_name}] tfs must be a non-empty list of {list(ALL_TFS)}"
+                    return (
+                        DEFAULT_POLICY,
+                        f"[{lane_name}] tfs must be a non-empty list of {list(ALL_TFS)}",
+                    )
                 lanes[lane_name] = tfs
             elif key == "instruments":
                 if not isinstance(val, dict):
@@ -414,7 +430,8 @@ def read_tf_policy(path: pathlib.Path) -> tuple[TfPolicy, str | None]:
                     if tfs is None:
                         return (
                             DEFAULT_POLICY,
-                            f"[{lane_name}.instruments] {sym} must be a non-empty list of {list(ALL_TFS)}",
+                            f"[{lane_name}.instruments] {sym} must be a non-empty list of "
+                            f"{list(ALL_TFS)}",
                         )
                     instruments[(lane_name, sym)] = tfs
             else:
@@ -520,9 +537,13 @@ def upsert_rest(
             )
             inserted += 1
             continue
-        o, h, l, c, v, source, stored_fetched_ts = row
+        o, h, low, c, v, source, stored_fetched_ts = row
         same = (
-            o == bar.open and h == bar.high and l == bar.low and c == bar.close and v == bar.volume
+            o == bar.open
+            and h == bar.high
+            and low == bar.low
+            and c == bar.close
+            and v == bar.volume
         )
         if source == SOURCE_REST and same:
             unchanged += 1
@@ -580,9 +601,7 @@ def upsert_rest(
     return UpsertStats(inserted, updated_open, conflicts, unchanged, superseded, refused_future)
 
 
-def purge_future(
-    conn: sqlite3.Connection, now_ms: int
-) -> list[tuple[int, str, str, int]]:
+def purge_future(conn: sqlite3.Connection, now_ms: int) -> list[tuple[int, str, str, int]]:
     """HK7 (``--repair-future``): delete every candle row — any source,
     any timeframe this module writes — that opens more than
     ``FUTURE_SKEW_MS`` after ``now_ms`` (``upsert_rest``'s bound), so the
@@ -617,7 +636,7 @@ def read_universe_lanes(universe_path: pathlib.Path) -> list[Lane] | None:
     ``None`` on unusable file (best-effort law)."""
     try:
         obj = tomllib.loads(universe_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+    except OSError, UnicodeDecodeError, tomllib.TOMLDecodeError:
         return None
 
     def str_list(section: str, key: str) -> list[str]:
@@ -979,16 +998,16 @@ def _fetch_forward_page(
     transport/parse failure (skip target this cycle)."""
     tf_ms = FETCHED_TFS[tf]
     if lane.name == "binance":
-        raw = http.get(_bn_url(http.hosts["binance"], "/api/v3/klines", target.instrument, tf, lo_ms))
+        raw = http.get(
+            _bn_url(http.hosts["binance"], "/api/v3/klines", target.instrument, tf, lo_ms)
+        )
         if raw is None:
             return None
         parsed = parse_binance_klines(raw)
         return None if parsed is None else parsed[0]
     if lane.name in _BN_FUT_KLINES:
         raw = http.get(
-            _bn_url(
-                http.hosts[lane.name], _BN_FUT_KLINES[lane.name], target.instrument, tf, lo_ms
-            )
+            _bn_url(http.hosts[lane.name], _BN_FUT_KLINES[lane.name], target.instrument, tf, lo_ms)
         )
         if raw is None:
             return None
@@ -1000,7 +1019,7 @@ def _fetch_forward_page(
         if raw is None:
             return None
         return claude_worker.fetchers.parse_deribit_chart(raw)
-    if lane.name == "bybit" or lane.name == "bybit-linear":
+    if lane.name in {"bybit", "bybit-linear"}:
         # WS9: forward-paged; the category rides the lane name.
         category = "spot" if lane.name == "bybit" else "linear"
         raw = http.get(_bybit_url(http.hosts["bybit"], category, target.instrument, tf, lo_ms))
@@ -1137,9 +1156,7 @@ def fill_forward(
         fetched = None if clock is None else max(now_ms, clock())
         stats = _merge(
             stats,
-            upsert_rest(
-                conn, target.venue, target.descriptor, tf, tf_ms, page, now_ms, fetched
-            ),
+            upsert_rest(conn, target.venue, target.descriptor, tf, tf_ms, page, now_ms, fetched),
         )
         new_lo = page[-1].ts_ms + tf_ms
         if new_lo <= lo:
@@ -1324,9 +1341,7 @@ def derive_pass(
             bucket.append((open_ts, o, h, low, c, v))
         flush()
         conn.commit()
-        report(
-            f"candles: derive {tf_out}: +{made} refreshed={refreshed} unchanged={unchanged}"
-        )
+        report(f"candles: derive {tf_out}: +{made} refreshed={refreshed} unchanged={unchanged}")
 
 
 class MinuteBar(typing.NamedTuple):
@@ -1380,10 +1395,7 @@ def fold_capture_minutes(
                 continue
             try:
                 with claude_worker.pmlr.Reader(path) as reader:
-                    if (
-                        reader.slot_kind != claude_worker.pmlr.SLOT_KIND_TICK
-                        or len(reader) == 0
-                    ):
+                    if reader.slot_kind != claude_worker.pmlr.SLOT_KIND_TICK or len(reader) == 0:
                         continue
                     for tick in reader.ticks():
                         desc = sym_to_desc.get(tick.sym)
@@ -1406,7 +1418,7 @@ def fold_capture_minutes(
                                 mid,
                                 bar.n + 1,
                             )
-            except (claude_worker.pmlr.PmlrError, OSError, ValueError):
+            except claude_worker.pmlr.PmlrError, OSError, ValueError:
                 continue
     return out
 
@@ -1457,7 +1469,7 @@ def fold_index_minutes(
             continue
         try:
             ev = claude_worker.pmlr.channel_event_array(path)
-        except (claude_worker.pmlr.PmlrError, OSError, ValueError):
+        except claude_worker.pmlr.PmlrError, OSError, ValueError:
             continue
         keep = (
             (ev["channel"] == claude_worker.pmlr.CHANNEL_MARK)
@@ -1515,7 +1527,18 @@ def upsert_capture(
                 "INSERT INTO candles"
                 " (venue,descriptor,tf,open_ts,o,h,l,c,v,n,source,fetched_ts)"
                 " VALUES (?,?,'1m',?,?,?,?,?,NULL,?,?,?)",
-                (venue, descriptor, minute, bar.o, bar.h, bar.low, bar.c, bar.n, SOURCE_CAPTURE, now_ms),
+                (
+                    venue,
+                    descriptor,
+                    minute,
+                    bar.o,
+                    bar.h,
+                    bar.low,
+                    bar.c,
+                    bar.n,
+                    SOURCE_CAPTURE,
+                    now_ms,
+                ),
             )
             inserted += 1
             continue
@@ -1615,8 +1638,7 @@ def capture_and_derive(
             conn, claude_worker.frames.VENUE_POLYMARKET, pm_bars, now_ms
         )
         report(
-            f"candles: capture pm: minutes={len(pm_bars)} +{ins} refreshed={ref}"
-            f" rest_kept={kept}"
+            f"candles: capture pm: minutes={len(pm_bars)} +{ins} refreshed={ref} rest_kept={kept}"
         )
     else:
         report("candles: capture pm: no PM token names in the market map — skipped")

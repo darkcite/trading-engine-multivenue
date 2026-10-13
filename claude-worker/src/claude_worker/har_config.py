@@ -129,7 +129,7 @@ def _parse_int(t: str, ln: int) -> int:
 def _parse_str(t: str, ln: int) -> str:
     if not t.startswith('"'):
         raise HarConfigError(f"line {ln}: expected a quoted string")
-    if len(t) < 2 or not t.endswith('"'):  # noqa: PLR2004 - the two quotes
+    if len(t) < 2 or not t.endswith('"'):  # the two quotes
         raise HarConfigError(f"line {ln}: unterminated string")
     body = t[1:-1]
     if '"' in body or "\\" in body:

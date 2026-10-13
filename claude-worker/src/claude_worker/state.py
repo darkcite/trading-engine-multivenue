@@ -340,7 +340,7 @@ class State:
 
     # ---- ruleset registry (§5.3; consumers arrive with item 12) ----
 
-    def stage_ruleset(  # noqa: PLR0913 — registry row fields, deliberately
+    def stage_ruleset(  # registry row fields, deliberately
         self,
         full_hash: str,
         path: str,
@@ -493,7 +493,7 @@ class State:
 
     # ---- RG4: strategy library (plan §5.2) ----
 
-    def library_insert(  # noqa: PLR0913, PLR0917 — one parameter per column, deliberately
+    def library_insert(  # one parameter per column, deliberately
         self,
         member_id: str,
         name: str,
@@ -624,7 +624,7 @@ class State:
         by_name = [m for m in self.library_members() if m.name == key]
         if len(by_name) == 1:
             return by_name[0]
-        if len(key) >= 8:  # noqa: PLR2004 — the documented prefix floor
+        if len(key) >= 8:  # the documented prefix floor
             by_prefix = [m for m in self.library_members() if m.member_id.startswith(key)]
             if len(by_prefix) == 1:
                 return by_prefix[0]
@@ -703,7 +703,7 @@ class State:
             )
         return out
 
-    def composition_insert(  # noqa: PLR0913, PLR0917 — one parameter per column, deliberately
+    def composition_insert(  # one parameter per column, deliberately
         self,
         table_hash: str,
         hash128: str,
@@ -733,7 +733,9 @@ class State:
                     json.dumps(member_ids, separators=(",", ":")),
                     json.dumps(words, sort_keys=True, separators=(",", ":")),
                     path,
-                    None if gate is None else json.dumps(gate, sort_keys=True, separators=(",", ":")),
+                    None
+                    if gate is None
+                    else json.dumps(gate, sort_keys=True, separators=(",", ":")),
                     stamp,
                 ),
             )
@@ -745,7 +747,8 @@ class State:
         stamp = int(time.time()) if ts is None else ts
         with self._conn:
             cur = self._conn.execute(
-                f"UPDATE compositions SET {column} = ? WHERE table_hash = ?",  # column whitelisted above
+                # the column is whitelisted above
+                f"UPDATE compositions SET {column} = ? WHERE table_hash = ?",
                 (stamp, table_hash),
             )
         if cur.rowcount != 1:
@@ -760,7 +763,9 @@ class State:
             table_hash=str(row[0]),
             hash128=str(row[1]),
             member_ids=[str(i) for i in ids_raw] if isinstance(ids_raw, list) else [],
-            words={str(k): str(v) for k, v in words_raw.items()} if isinstance(words_raw, dict) else {},
+            words={str(k): str(v) for k, v in words_raw.items()}
+            if isinstance(words_raw, dict)
+            else {},
             path=str(row[4]),
             gate=gate_raw if isinstance(gate_raw, dict) else None,
             composed_ts=int(row[6]),

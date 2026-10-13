@@ -46,7 +46,6 @@ UNKNOWN (a constrained profile then fails closed).
 import argparse
 import dataclasses
 import datetime
-import glob
 import json
 import os
 import pathlib
@@ -188,7 +187,10 @@ def run_cycle(
         if not feed_live:
             continue
         if ms is None or mr is None:
-            lines.append(f"  {tag:14s} missing mids ({'sym' if ms is None else ''}{'ref' if mr is None else ''}) — hold")
+            lines.append(
+                f"  {tag:14s} missing mids"
+                f" ({'sym' if ms is None else ''}{'ref' if mr is None else ''}) — hold"
+            )
             continue
         # Relative guard: monotonic ts vs the newest tick this cycle.
         newest_ts = max(m[2] for m in mids.values())
@@ -209,7 +211,9 @@ def run_cycle(
                 legs, skips = pair_legs_for(f"{tag}-entry", rich, cheap, market_map, marks)
                 if skips:
                     notes.extend(skips)
-                    lines.append(f"  {tag:14s} dev={dev_bps:+.1f}bps ENTRY-BLOCKED: {'; '.join(skips)}")
+                    lines.append(
+                        f"  {tag:14s} dev={dev_bps:+.1f}bps ENTRY-BLOCKED: {'; '.join(skips)}"
+                    )
                     continue
                 intents.extend(legs)
                 positions[tag] = {
@@ -233,13 +237,16 @@ def run_cycle(
                 )
                 if skips:
                     notes.extend(skips)
-                    lines.append(f"  {tag:14s} dev={dev_bps:+.1f}bps EXIT-BLOCKED: {'; '.join(skips)}")
+                    lines.append(
+                        f"  {tag:14s} dev={dev_bps:+.1f}bps EXIT-BLOCKED: {'; '.join(skips)}"
+                    )
                     continue
                 intents.extend(legs)
                 del positions[tag]
                 age_h = (now - pos["entered_ns"]) / 3.6e12
                 lines.append(
-                    f"  {tag:14s} dev={dev_bps:+.1f}bps EXIT (entry {entry_dev:+.1f}, held {age_h:.1f}h)"
+                    f"  {tag:14s} dev={dev_bps:+.1f}bps EXIT (entry {entry_dev:+.1f}, held "
+                    f"{age_h:.1f}h)"
                 )
             else:
                 lines.append(f"  {tag:14s} dev={dev_bps:+.1f}bps HELD (entry {entry_dev:+.1f})")
@@ -256,7 +263,8 @@ def run_cycle(
     (out_dir / "push.sh").write_text(claude_worker.carry_signal.render_push_sh(intents))
     digest = out_dir / f"digest-{stamp}.txt"
     body = [
-        f"xv_signal digest {stamp} (entry ≥{ENTRY_BPS}bps, exit ≤{EXIT_BPS}bps, ${LEG_NOTIONAL_USD:.0f}/leg, 1 position/pair)",
+        f"xv_signal digest {stamp} (entry ≥{ENTRY_BPS}bps, exit ≤{EXIT_BPS}bps, "
+        f"${LEG_NOTIONAL_USD:.0f}/leg, 1 position/pair)",
         *lines,
         f"intents: {len(intents)}" + (" — push.sh ready" if intents else " — nothing to push"),
     ]
@@ -269,10 +277,13 @@ def run_cycle(
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="claude_worker.xv_signal")
-    ap.add_argument("--logs", default=os.environ.get(
-        "CLAUDE_WORKER_REPLAY_DIR", "~/multivenue/logs"))
-    ap.add_argument("--market-map", default=os.environ.get(
-        "CLAUDE_WORKER_MARKET_MAP", "~/multivenue/worker/market-map.json"))
+    ap.add_argument(
+        "--logs", default=os.environ.get("CLAUDE_WORKER_REPLAY_DIR", "~/multivenue/logs")
+    )
+    ap.add_argument(
+        "--market-map",
+        default=os.environ.get("CLAUDE_WORKER_MARKET_MAP", "~/multivenue/worker/market-map.json"),
+    )
     ap.add_argument("--out", default="~/multivenue/worker/xv")
     args = ap.parse_args(argv)
     digest = run_cycle(

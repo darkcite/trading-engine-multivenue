@@ -920,7 +920,7 @@ def _epoch_s(value: object, *, unit_ms: bool) -> int:
     return int(number) // MS_PER_S if unit_ms else int(number)
 
 
-def _mk(  # noqa: PLR0913
+def _mk(
     source: Source,
     *,
     guid: str,

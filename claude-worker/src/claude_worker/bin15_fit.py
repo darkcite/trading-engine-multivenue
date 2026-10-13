@@ -814,7 +814,7 @@ def phi_lut_1e6(
     raise ValueError(f"phi must be one of {', '.join(PHI_KINDS)}, got {phi!r}")
 
 
-def render_tables(  # noqa: PLR0913 — the four knobs, then the four fit arguments
+def render_tables(  # the four knobs, then the four fit arguments
     slope_early: int = SLOPE_EARLY_MILLI,
     slope_mid: int = SLOPE_MID_MILLI,
     slope_late: int = SLOPE_LATE_MILLI,

@@ -15,7 +15,6 @@ import claude_worker.fetchers
 import claude_worker.frames
 import claude_worker.refdata
 
-
 MS_1H = claude_worker.refdata.MS_1H
 NOW = 1_787_400_123_456  # mid-hour wall ms
 
@@ -222,7 +221,7 @@ def test_cycle_bn_usdm_stores_vol_and_oi(tmp_path: pathlib.Path) -> None:
             ),
         }
     )
-    lines, report = report_sink()
+    _lines, report = report_sink()
     claude_worker.refdata.run_cycle(conn, lanes_bn_usdm(), http, NOW, 30, report)
     kinds = {(r[2], r[4]) for r in all_rows(conn)}
     assert kinds == {("vol24h_quote", 9e6), ("oi", 10659.5)}
@@ -239,7 +238,7 @@ def test_cycle_deribit_one_call_two_kinds(tmp_path: pathlib.Path) -> None:
             )
         }
     )
-    lines, report = report_sink()
+    _lines, report = report_sink()
     claude_worker.refdata.run_cycle(conn, lanes_deribit(), http, NOW, 30, report)
     kinds = {(r[2], r[4]) for r in all_rows(conn)}
     assert kinds == {("vol24h_quote", 219994260.0), ("oi", 686269060.0)}
@@ -316,7 +315,9 @@ def test_cycle_okx_vol_always_oi_derivatives_only(tmp_path: pathlib.Path) -> Non
             claude_worker.frames.VENUE_OKX, "okx:ETH-USDT-SWAP", "ETH-USDT-SWAP"
         ),
     ]
-    lanes = [claude_worker.candles.Lane("okx", claude_worker.frames.VENUE_OKX, targets, backward=True)]
+    lanes = [
+        claude_worker.candles.Lane("okx", claude_worker.frames.VENUE_OKX, targets, backward=True)
+    ]
     http, calls = http_map(
         {
             "https://okx.test/api/v5/market/ticker?instId=BTC-USDT": json.dumps(
@@ -397,7 +398,9 @@ def test_cycle_bybit_linear_one_call_vol_and_oi(tmp_path: pathlib.Path) -> None:
         claude_worker.frames.VENUE_BYBIT, "bybit-linear:BTCUSDT", "BTCUSDT"
     )
     lanes = [
-        claude_worker.candles.Lane("bybit", claude_worker.frames.VENUE_BYBIT, [spot_t], backward=False),
+        claude_worker.candles.Lane(
+            "bybit", claude_worker.frames.VENUE_BYBIT, [spot_t], backward=False
+        ),
         claude_worker.candles.Lane(
             "bybit-linear", claude_worker.frames.VENUE_BYBIT, [lin_t], backward=False
         ),
@@ -410,14 +413,12 @@ def test_cycle_bybit_linear_one_call_vol_and_oi(tmp_path: pathlib.Path) -> None:
             "https://bybit.test/v5/market/tickers?category=linear&symbol=BTCUSDT": json.dumps(
                 {
                     "retCode": 0,
-                    "result": {
-                        "list": [{"turnover24h": "222.5", "openInterest": "68744.761"}]
-                    },
+                    "result": {"list": [{"turnover24h": "222.5", "openInterest": "68744.761"}]},
                 }
             ),
         }
     )
-    lines, report = report_sink()
+    _lines, report = report_sink()
     claude_worker.refdata.run_cycle(conn, lanes, http, NOW, 30, report)
     assert len(calls) == 2
     rows = {(r[1], r[2], r[4]) for r in all_rows(conn)}

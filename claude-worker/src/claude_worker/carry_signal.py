@@ -55,7 +55,6 @@ import pathlib
 import sqlite3
 import sys
 import time
-import typing
 
 import claude_worker.regime
 
@@ -326,7 +325,7 @@ def leg_intents(
     return intents, []
 
 
-def decide_cvfc(  # noqa: PLR0913, PLR0917 — one argument per input source + the RG5 gate
+def decide_cvfc(  # one argument per input source + the RG5 gate
     conn: sqlite3.Connection,
     state: dict,
     market_map: dict[str, int],
@@ -467,7 +466,7 @@ def explicit_leg_intents(
     return intents, []
 
 
-def decide_s1(  # noqa: PLR0913, PLR0917 — one argument per input source + the RG5 gate
+def decide_s1(  # one argument per input source + the RG5 gate
     conn: sqlite3.Connection,
     state: dict,
     market_map: dict[str, int],
@@ -618,7 +617,7 @@ def batch_dict(intents: list[Intent], now_ms: int) -> dict:
     }
 
 
-def run_cycle(  # noqa: PLR0913, PLR0917 — one argument per input source + the RG5 words
+def run_cycle(  # one argument per input source + the RG5 words
     db_path: pathlib.Path,
     features_dir: pathlib.Path,
     map_path: pathlib.Path,
@@ -666,7 +665,7 @@ def run_cycle(  # noqa: PLR0913, PLR0917 — one argument per input source + the
         "S1 pilot (BN vs Bybit; executable since the bybit unfreeze):",
         *s1_lines,
         f"intents: {len(intents)}"
-        + (f" — push.sh ready" if intents else " — nothing to push"),
+        + (" — push.sh ready" if intents else " — nothing to push"),
     ]
     if notes:
         body.append("skips: " + "; ".join(sorted(set(notes))))

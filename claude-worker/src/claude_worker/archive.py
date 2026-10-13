@@ -364,7 +364,7 @@ def catalog_venues(catalog: object) -> tuple[str, ...]:
 # --------------------------------------------------------------------------
 
 
-def build_manifest(  # noqa: PLR0913 — one parameter per manifest input, deliberately
+def build_manifest(  # one parameter per manifest input, deliberately
     cfg: claude_worker.archive_config.ArchiveConfig,
     run_dir: pathlib.Path,
     files: list[dict[str, typing.Any]],
@@ -474,7 +474,7 @@ class Archiver:
 
     # -- push ------------------------------------------------------------
 
-    def push_run(  # noqa: PLR0912, PLR0915 — the commit order is one flat sequence
+    def push_run(  # the commit order is one flat sequence
         self,
         run_dir: pathlib.Path,
         *,
@@ -1036,7 +1036,7 @@ def main(argv: collections.abc.Sequence[str] | None = None) -> int:
         return EXIT_FAILED
 
 
-def _dispatch(  # noqa: PLR0911, PLR0912 — one branch per verb, deliberately flat
+def _dispatch(  # one branch per verb, deliberately flat
     args: argparse.Namespace,
     cfg: claude_worker.archive_config.ArchiveConfig,
     archiver: Archiver,

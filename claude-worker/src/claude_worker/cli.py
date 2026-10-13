@@ -535,7 +535,7 @@ def _resolve_sym(
     return sym
 
 
-def _provided_options(  # noqa: PLR0913, PLR0917 — one parameter per §6 push option, deliberately
+def _provided_options(  # one parameter per §6 push option, deliberately
     sym: int | None,
     symbol: str | None,
     venue: str | None,

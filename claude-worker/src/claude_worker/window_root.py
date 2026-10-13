@@ -51,8 +51,8 @@ import sys
 import time
 import typing
 
-import claude_worker.iv_digest
 import claude_worker.hip4
+import claude_worker.iv_digest
 import claude_worker.regime
 import claude_worker.seeds
 import claude_worker.vrp_seed
@@ -203,7 +203,9 @@ def _ts_at_bytes(slot_bytes: bytes) -> int:
     return struct.unpack_from("<Q", slot_bytes, 0)[0]
 
 
-def _cut_file(src: pathlib.Path, dst: pathlib.Path, lo_ts: int, hi_ts: int, epoch_ns: int) -> tuple[int, int]:
+def _cut_file(
+    src: pathlib.Path, dst: pathlib.Path, lo_ts: int, hi_ts: int, epoch_ns: int
+) -> tuple[int, int]:
     """Copy the slots with ``lo_ts <= ts < hi_ts``; header epoch rewritten.
     An ``ai-cmds.pmlr`` additionally carries the pre-window ``SetRegime``
     declarations still in force at ``lo_ts`` (module docs)."""
@@ -292,7 +294,10 @@ def cut_run(
         a, b = (hi_ts, hi_ts) if p.name in empty else (lo_ts, hi_ts)
         total, kept = _cut_file(p, out_dir / p.name, a, b, new_epoch)
         if report is not None:
-            report(f"window-root: {run_dir.name} {p.name} {total} -> {kept} ({from_s:.0f}..{to_s:.0f} s)")
+            report(
+                f"window-root: {run_dir.name} {p.name} {total} -> {kept} ({from_s:.0f}..{to_s:.0f} "
+                "s)"
+            )
     if seed is not None and seed[0].is_file() and seed[1].is_file():
         n_desc, n_rows = claude_worker.regime.seed_out(
             seed[0],
@@ -302,7 +307,9 @@ def cut_run(
             now_ms=new_epoch // 1_000_000,
         )
         if report is not None:
-            report(f"window-root: {run_dir.name} {SEED_FILE} {n_rows} rows for {n_desc} descriptors")
+            report(
+                f"window-root: {run_dir.name} {SEED_FILE} {n_rows} rows for {n_desc} descriptors"
+            )
     if seed is not None and seed[1].is_file():
         n_desc, n_rows = funding_seed_out(out_dir, seed[1], new_epoch // 1_000_000)
         if report is not None:
@@ -435,7 +442,9 @@ def carry_head(
     return cut
 
 
-def complete_windows(run_dir: pathlib.Path, window_s: float = WINDOW_MAX_S) -> list[tuple[float, float]]:
+def complete_windows(
+    run_dir: pathlib.Path, window_s: float = WINDOW_MAX_S
+) -> list[tuple[float, float]]:
     """The FULL ``window_s`` slices a run holds (``windows_of`` minus the
     partial tail) — the only windows a pool may cut."""
     span = run_span(run_dir)
@@ -495,7 +504,7 @@ def pool_windows(pool_dir: pathlib.Path) -> list[pathlib.Path]:
     return sorted((p for p in pool_dir.glob("run-*") if p.is_dir()), key=lambda p: p.name)
 
 
-def pool_ensure(  # noqa: PLR0913 — one parameter per pool knob, deliberately
+def pool_ensure(  # one parameter per pool knob, deliberately
     logs_dir: pathlib.Path,
     pool_dir: pathlib.Path,
     k: int,
@@ -672,7 +681,7 @@ def _run_covering(logs_dir: pathlib.Path, wall_ns: int) -> tuple[pathlib.Path, i
     return best
 
 
-def campaign_cut(  # noqa: PLR0913 - one parameter per cut input, deliberately
+def campaign_cut(  # one parameter per cut input, deliberately
     logs_dir: pathlib.Path,
     pool_dir: pathlib.Path,
     day_ms: int,

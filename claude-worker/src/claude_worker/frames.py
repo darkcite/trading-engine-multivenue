@@ -150,7 +150,7 @@ def regime_word_is_wire_declared(word: int) -> bool:
         if name == "source":
             continue
         b = (word >> (8 * byte_index)) & 0xFF
-        if b == 0 or b == REGIME_DIM_UNKNOWN_BIT:
+        if b in (0, REGIME_DIM_UNKNOWN_BIT):
             continue
         if b & (b - 1) or b.bit_length() > len(REGIME_VALUES[name]):
             return False

@@ -30,7 +30,7 @@ def _pack(kind: int, slots: list[bytes]) -> bytes:
     return bytes(blob)
 
 
-def _fill(  # noqa: PLR0913, PLR0917 - one parameter per wire field, deliberately
+def _fill(  # one parameter per wire field, deliberately
     ts: int,
     sym: int,
     side: int,
@@ -44,7 +44,7 @@ def _fill(  # noqa: PLR0913, PLR0917 - one parameter per wire field, deliberatel
     return claude_worker.pmlr._FILL.pack(ts, sym, side, strategy_id, origin, flags, px, qty, oid)
 
 
-def _order(  # noqa: PLR0913, PLR0917 - one parameter per wire field, deliberately
+def _order(  # one parameter per wire field, deliberately
     ts: int,
     sym: int,
     side: int,

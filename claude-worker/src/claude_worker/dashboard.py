@@ -722,7 +722,9 @@ def _xmm_summary(path: pathlib.Path) -> dict[str, object]:
             section = {}
         if isinstance(section, dict):
             quoted = sorted(
-                k[len("quote_"):].upper() for k, v in section.items() if k.startswith("quote_") and v == 1
+                k[len("quote_") :].upper()
+                for k, v in section.items()
+                if k.startswith("quote_") and v == 1
             )
     return {"hash": _sha256_file(path), "quoted": quoted}
 
@@ -761,7 +763,7 @@ def _seed_spans(path: pathlib.Path) -> list[dict[str, object]] | None:
     try:
         with path.open("r", encoding="utf-8") as f:
             head = f.read(_HAR_SEED_HEAD)
-    except (OSError, UnicodeDecodeError):
+    except OSError, UnicodeDecodeError:
         return None
     spans: list[dict[str, object]] = []
     for line in head.splitlines():
@@ -793,7 +795,7 @@ def _har_drift(path: pathlib.Path) -> dict[str, object] | None:
     it is absent, torn or another version -- never a guess."""
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError):
+    except OSError, UnicodeDecodeError, ValueError:
         return None
     if (
         not isinstance(doc, dict)

@@ -46,7 +46,9 @@ SCENARIOS: tuple[tuple[int, int, int, int, int, int], ...] = (
 KS: tuple[int, ...] = (1_550, 1_000, 2_500, 250, 4_000)
 
 
-def scenario(out: list[str], seed: int, base: int, tick: int, sd_1e9: int, first_exp: int, n_inst: int) -> None:
+def scenario(
+    out: list[str], seed: int, base: int, tick: int, sd_1e9: int, first_exp: int, n_inst: int
+) -> None:
     rng = random.Random(seed)
     out.append("LG")
     start = first_exp - 1_200
@@ -95,7 +97,11 @@ def scenario(out: list[str], seed: int, base: int, tick: int, sd_1e9: int, first
         exp = first_exp + 900 * i
         qt = (exp - 120) * S + rng.randrange(0, S)
         while qt < (exp + 3) * S:
-            strike_off = rng.choice((-60, -20, -5, -2, -1, 0, 1, 2, 5, 20, 60)) * tick * (1 if tick > 1_000 else 50)
+            strike_off = (
+                rng.choice((-60, -20, -5, -2, -1, 0, 1, 2, 5, 20, 60))
+                * tick
+                * (1 if tick > 1_000 else 50)
+            )
             rel = "N" if rng.random() < 0.5 else "S"
             events.append((qt, f"Q\t{qt}\t{exp}\t{strike_off}\t{KS[q % len(KS)]}\t{rel}"))
             q += 1

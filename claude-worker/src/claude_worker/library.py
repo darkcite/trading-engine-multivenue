@@ -180,7 +180,7 @@ def word_terms(terms: typing.Iterable[str]) -> list[str]:
     out: list[str] = []
     for t in terms:
         parts = t.split(":")
-        dim = parts[1] if len(parts) == 3 else parts[0]  # noqa: PLR2004 — [profile:]dim:values
+        dim = parts[1] if len(parts) == 3 else parts[0]  # [profile:]dim:values
         if dim != "rel":
             out.append(t)
     return out
@@ -338,7 +338,9 @@ def load_member(directory: pathlib.Path, row: claude_worker.state.LibraryMember)
             origin=row.origin,
             status=row.status,
         )
-    file_member = read_member(pathlib.Path(row.path) if row.path else member_file(directory, row.member_id))
+    file_member = read_member(
+        pathlib.Path(row.path) if row.path else member_file(directory, row.member_id)
+    )
     return file_member._replace(
         name=row.name,
         labels=row.labels,
@@ -351,7 +353,7 @@ def load_member(directory: pathlib.Path, row: claude_worker.state.LibraryMember)
 # ---- add / status / labels ----
 
 
-def add_member(  # noqa: PLR0913 — one parameter per member field, deliberately
+def add_member(  # one parameter per member field, deliberately
     state: claude_worker.state.State,
     directory: pathlib.Path,
     rows: typing.Iterable[object],
@@ -407,7 +409,7 @@ def add_member(  # noqa: PLR0913 — one parameter per member field, deliberatel
     return member, inserted
 
 
-def add_coded_member(  # noqa: PLR0913 — one parameter per member field, deliberately
+def add_coded_member(  # one parameter per member field, deliberately
     state: claude_worker.state.State,
     member_id: str,
     name: str,
@@ -500,7 +502,7 @@ def _name_for(rows: list[dict[str, object]]) -> str:
 def _rows_of_file(path: pathlib.Path) -> list[object] | None:
     try:
         obj = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return None
     rows = obj.get("rows") if isinstance(obj, dict) else None
     return rows if isinstance(rows, list) else None
@@ -517,7 +519,9 @@ def active_hash(state: claude_worker.state.State) -> str | None:
     return committed[0][0] if committed else None
 
 
-def active_canonical_hash(state: claude_worker.state.State, artifacts_dir: pathlib.Path) -> str | None:
+def active_canonical_hash(
+    state: claude_worker.state.State, artifacts_dir: pathlib.Path
+) -> str | None:
     """The active table's hash over its CANONICAL rows — what a
     composition of exactly those rows would hash to. A hand-written
     artifact (the smoke-era `fde6f733…`) carries the same rows in another
@@ -543,14 +547,16 @@ def active_canonical_hash(state: claude_worker.state.State, artifacts_dir: pathl
         return None
 
 
-def coded_labels_from_regime_toml(regime_path: pathlib.Path, member: str) -> tuple[list[list[str]], str | None]:
+def coded_labels_from_regime_toml(
+    regime_path: pathlib.Path, member: str
+) -> tuple[list[list[str]], str | None]:
     """``[labels.<member>]`` of ``regime.toml`` (``off`` + ``term1..term4``,
     plan §4.2) → ``(labels, off)``; an absent table = ANY / None."""
     if not regime_path.is_file():
         return [], None
     try:
         obj = tomllib.loads(regime_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return [], None
     coded = obj.get("labels")
     entry = coded.get(member) if isinstance(coded, dict) else None
@@ -565,7 +571,7 @@ def coded_labels_from_regime_toml(regime_path: pathlib.Path, member: str) -> tup
     return labels, (str(off) if isinstance(off, str) else None)
 
 
-def import_catalog(  # noqa: PLR0912, PLR0913, PLR0915 — one linear pass over three sources
+def import_catalog(  # one linear pass over three sources
     state: claude_worker.state.State,
     directory: pathlib.Path,
     artifacts_dir: pathlib.Path,
@@ -597,7 +603,10 @@ def import_catalog(  # noqa: PLR0912, PLR0913, PLR0915 — one linear pass over 
         source = path if path.is_file() else installed if installed.is_file() else None
         if source is None:
             missing += 1
-            report(f"{_TELL} import: {hash128_hex(full_hash)} — no artifact file (registry path gone, not installed) — skipped")
+            report(
+                f"{_TELL} import: {hash128_hex(full_hash)} — no artifact file (registry path gone, "
+                "not installed) — skipped"
+            )
             continue
         rows = _rows_of_file(source)
         if rows is None:
@@ -626,9 +635,15 @@ def import_catalog(  # noqa: PLR0912, PLR0913, PLR0915 — one linear pass over 
             # only when it carries labels — an unlabelled one is a
             # candidate the operator must label + evidence first.
             status = STATUS_CANDIDATE
-            report(f"{_TELL} import: {hash128_hex(full_hash)} is the ACTIVE table but unlabelled — candidate (RG8)")
+            report(
+                f"{_TELL} import: {hash128_hex(full_hash)} is the ACTIVE table but unlabelled — "
+                "candidate (RG8)"
+            )
         if dry_run:
-            report(f"{_TELL} import (dry-run): {status:9} {member_id_of(canon)[:12]} {name} <- {hash128_hex(full_hash)}")
+            report(
+                f"{_TELL} import (dry-run): {status:9} {member_id_of(canon)[:12]} {name} <- "
+                f"{hash128_hex(full_hash)}"
+            )
             continue
         member, new = add_member(
             state,
@@ -644,7 +659,10 @@ def import_catalog(  # noqa: PLR0912, PLR0913, PLR0915 — one linear pass over 
             inserted += 1
             if status == STATUS_VALIDATED:
                 validated.append(member.member_id)
-        report(f"{_TELL} import: {'added' if new else 'kept '} {status:9} {member.member_id[:12]} {name} <- {hash128_hex(full_hash)}")
+        report(
+            f"{_TELL} import: {'added' if new else 'kept '} {status:9} {member.member_id[:12]} "
+            f"{name} <- {hash128_hex(full_hash)}"
+        )
 
     n_candidates = 0
     if candidates_dir.is_dir():
@@ -674,21 +692,36 @@ def import_catalog(  # noqa: PLR0912, PLR0913, PLR0915 — one linear pass over 
             }
             name = _name_for(canon)
             if dry_run:
-                report(f"{_TELL} import (dry-run): candidate {member_id_of(canon)[:12]} {name} <- {path.name}")
+                report(
+                    f"{_TELL} import (dry-run): candidate {member_id_of(canon)[:12]} {name} <- "
+                    f"{path.name}"
+                )
                 continue
-            member, new = add_member(state, directory, canon, name, origin=origin, status=STATUS_CANDIDATE, ts=ts)
+            member, new = add_member(
+                state, directory, canon, name, origin=origin, status=STATUS_CANDIDATE, ts=ts
+            )
             if new:
                 inserted += 1
-            report(f"{_TELL} import: {'added' if new else 'kept '} candidate {member.member_id[:12]} {name} <- {path.name}")
+            report(
+                f"{_TELL} import: {'added' if new else 'kept '} candidate {member.member_id[:12]} "
+                f"{name} <- {path.name}"
+            )
 
     coded = 0
     if icdp_toml is not None and icdp_toml.is_file():
         coded = 1
         sha = _file_hash(icdp_toml)
         member_id = f"icdp@{sha}"
-        labels, off = coded_labels_from_regime_toml(regime_toml, "icdp") if regime_toml is not None else ([], None)
+        labels, off = (
+            coded_labels_from_regime_toml(regime_toml, "icdp")
+            if regime_toml is not None
+            else ([], None)
+        )
         if dry_run:
-            report(f"{_TELL} import (dry-run): coded {member_id[:17]} icdp labels={describe_labels(labels)}")
+            report(
+                f"{_TELL} import (dry-run): coded {member_id[:17]} icdp "
+                f"labels={describe_labels(labels)}"
+            )
         elif add_coded_member(
             state,
             member_id,
@@ -696,7 +729,10 @@ def import_catalog(  # noqa: PLR0912, PLR0913, PLR0915 — one linear pass over 
             labels=labels,
             regime_off=off,
             origin={"source": "coded", "artifact": str(icdp_toml), "sha256": sha},
-            thesis="slot-6 intrabar candle-direction member (ICDP); enabled by the engine mask, never composed",
+            thesis=(
+                "slot-6 intrabar candle-direction member (ICDP); enabled by the engine mask, never "
+                "composed"
+            ),
             ts=ts,
         ):
             inserted += 1
@@ -744,7 +780,11 @@ def _lane_stale_blind(detail: dict[str, object]) -> bool:
         if not isinstance(lanes, dict):
             continue
         for lane in lanes.values():
-            if isinstance(lane, dict) and lane.get("stale_blind") is True and int(lane.get("ticks", 0)) > 0:
+            if (
+                isinstance(lane, dict)
+                and lane.get("stale_blind") is True
+                and int(lane.get("ticks", 0)) > 0
+            ):
                 return True
     return False
 
@@ -800,7 +840,7 @@ def evidence_from_detail(
     )
 
 
-def run_evidence(  # noqa: PLR0913 — one parameter per harness knob, deliberately
+def run_evidence(  # one parameter per harness knob, deliberately
     state: claude_worker.state.State,
     member: Member,
     window_dir: pathlib.Path,
@@ -818,7 +858,13 @@ def run_evidence(  # noqa: PLR0913 — one parameter per harness knob, deliberat
     if member.kind != KIND_VM_ROWS or not member.rows:
         raise LibraryError(f"{member.name}: coded members carry no rows to run")
     artifact = member_artifact(work_dir, member)
-    detail_path = work_dir / f"{member.member_id[:_HASH128_HEX]}.{window_dir.name}{claude_worker.backtest.DETAIL_SUFFIX}"
+    detail_path = (
+        work_dir
+        / (
+            f"{member.member_id[:_HASH128_HEX]}.{window_dir.name}"
+            f"{claude_worker.backtest.DETAIL_SUFFIX}"
+        )
+    )
     result = claude_worker.backtest.run_harness_extra(
         artifact,
         window_dir,
@@ -869,7 +915,9 @@ def evidence_summary(rows: list[claude_worker.state.EvidenceRow]) -> EvidenceSum
 # ---- regime query (`list --regime`) ----
 
 
-def query_words(spec: str, now_ms: int, *, directory: pathlib.Path | None = None, url: str | None = None) -> tuple[dict[str, int], str]:
+def query_words(
+    spec: str, now_ms: int, *, directory: pathlib.Path | None = None, url: str | None = None
+) -> tuple[dict[str, int], str]:
     """``current`` = the engine → fresh declaration → UNKNOWN chain (RG5
     ``current_words``); else ``"<fast-decl>[;<slow-decl>]"`` in the
     declaration grammar (``trend:bull,vol:low``) — unnamed market
@@ -915,11 +963,14 @@ def member_line(
     return (
         f"{fit}{row.status:9} {row.member_id[:12]} {row.kind:7} {row.name}"
         f" labels={describe_labels(row.labels)} off={row.regime_off or 'soft'}"
-        f" evidence={s.windows}w/{s.judged}j tier={s.net_usd_tier:+.2f} zero={s.net_usd_0:+.2f}{thesis}"
+        f" evidence={s.windows}w/{s.judged}j tier={s.net_usd_tier:+.2f} "
+        f"zero={s.net_usd_0:+.2f}{thesis}"
     )
 
 
-def member_json(row: claude_worker.state.LibraryMember, evidence: list[claude_worker.state.EvidenceRow]) -> dict[str, object]:
+def member_json(
+    row: claude_worker.state.LibraryMember, evidence: list[claude_worker.state.EvidenceRow]
+) -> dict[str, object]:
     s = evidence_summary(evidence)
     return {
         "member_id": row.member_id,
@@ -951,42 +1002,80 @@ def _split_terms(spec: str) -> list[str]:
 def _resolve(state: claude_worker.state.State, key: str) -> claude_worker.state.LibraryMember:
     row = state.library_find(key)
     if row is None:
-        raise LibraryError(f"no member {key!r} (id, ≥{_ID_PREFIX_MIN}-char id prefix or exact name)")
+        raise LibraryError(
+            f"no member {key!r} (id, ≥{_ID_PREFIX_MIN}-char id prefix or exact name)"
+        )
     return row
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--db", default=None, help=f"state.db (default ${DB_ENV} or {DEFAULT_DB})")
-    p.add_argument("--dir", default=None, help=f"library dir (default ${LIBRARY_DIR_ENV} or {DEFAULT_LIBRARY_DIR})")
+    p.add_argument(
+        "--dir",
+        default=None,
+        help=f"library dir (default ${LIBRARY_DIR_ENV} or {DEFAULT_LIBRARY_DIR})",
+    )
 
 
-def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915 — one dispatcher per lane
+def main(argv: list[str] | None = None) -> int:  # one dispatcher per lane
     parser = argparse.ArgumentParser(prog="claude_worker.library")
     sub = parser.add_subparsers(dest="lane", required=True)
 
     add = sub.add_parser("add", help="add a member from a rows artifact")
     _add_common(add)
-    add.add_argument("--from", dest="source", required=True, help="ruleset JSON ({\"rows\": [...]})")
+    add.add_argument("--from", dest="source", required=True, help='ruleset JSON ({"rows": [...]})')
     add.add_argument("--name", required=True)
     add.add_argument("--thesis", default=None)
-    add.add_argument("--regimes", action="append", default=None, help='one label per flag: "t1,t2" (∃ across flags); absent = derived from the rows')
+    add.add_argument(
+        "--regimes",
+        action="append",
+        default=None,
+        help='one label per flag: "t1,t2" (∃ across flags); absent = derived from the rows',
+    )
     add.add_argument("--regime-off", default=None, choices=REGIME_OFF_VALUES)
     add.add_argument("--status", default=STATUS_CANDIDATE, choices=STATUSES)
-    add.add_argument("--split-by-name-prefix", action="store_true", help="one member per row-name prefix (before the last '-')")
+    add.add_argument(
+        "--split-by-name-prefix",
+        action="store_true",
+        help="one member per row-name prefix (before the last '-')",
+    )
 
-    imp = sub.add_parser("import-catalog", help="every registry row + candidate becomes a member (active table validated)")
+    imp = sub.add_parser(
+        "import-catalog",
+        help="every registry row + candidate becomes a member (active table validated)",
+    )
     _add_common(imp)
-    imp.add_argument("--artifacts", default=None, help=f"installed artifacts dir (default ${RULESET_DIR_ENV} or {DEFAULT_RULESET_DIR})")
-    imp.add_argument("--candidates", default=None, help="candidates dir (default <worker dir>/candidates)")
-    imp.add_argument("--icdp", default=None, help=f"icdp.toml for the coded member (default ${ICDP_PATH_ENV} or {DEFAULT_ICDP_PATH})")
-    imp.add_argument("--regime", default=claude_worker.regime.REGIME_PATH_DEFAULT, help="regime.toml ([labels.icdp])")
+    imp.add_argument(
+        "--artifacts",
+        default=None,
+        help=f"installed artifacts dir (default ${RULESET_DIR_ENV} or {DEFAULT_RULESET_DIR})",
+    )
+    imp.add_argument(
+        "--candidates", default=None, help="candidates dir (default <worker dir>/candidates)"
+    )
+    imp.add_argument(
+        "--icdp",
+        default=None,
+        help=f"icdp.toml for the coded member (default ${ICDP_PATH_ENV} or {DEFAULT_ICDP_PATH})",
+    )
+    imp.add_argument(
+        "--regime",
+        default=claude_worker.regime.REGIME_PATH_DEFAULT,
+        help="regime.toml ([labels.icdp])",
+    )
     imp.add_argument("--dry-run", action="store_true")
 
     lst = sub.add_parser("list", help="members (+ evidence); --regime filters by fit")
     _add_common(lst)
-    lst.add_argument("--regime", default=None, help='current | "<fast-decl>[;<slow-decl>]" (e.g. "trend:bull,vol:low")')
+    lst.add_argument(
+        "--regime",
+        default=None,
+        help='current | "<fast-decl>[;<slow-decl>]" (e.g. "trend:bull,vol:low")',
+    )
     lst.add_argument("--status", default=None, choices=STATUSES)
-    lst.add_argument("--all", action="store_true", help="with --regime: show non-fitting members too")
+    lst.add_argument(
+        "--all", action="store_true", help="with --regime: show non-fitting members too"
+    )
     lst.add_argument("--json", action="store_true")
     lst.add_argument("--now-ms", type=int, default=None, help="tests only")
 
@@ -997,7 +1086,11 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915 — one dispatc
     lab.add_argument("--any", action="store_true")
     lab.add_argument("--regime-off", default=None, choices=REGIME_OFF_VALUES)
 
-    for lane, target in (("retire", STATUS_RETIRED), ("validate", STATUS_VALIDATED), ("candidate", STATUS_CANDIDATE)):
+    for lane, target in (
+        ("retire", STATUS_RETIRED),
+        ("validate", STATUS_VALIDATED),
+        ("candidate", STATUS_CANDIDATE),
+    ):
         p = sub.add_parser(lane, help=f"set status {target}")
         _add_common(p)
         p.add_argument("member")
@@ -1006,9 +1099,17 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915 — one dispatc
     ev = sub.add_parser("evidence", help="run a member on ≤ 2 h seeded windows and record the rows")
     _add_common(ev)
     ev.add_argument("member")
-    ev.add_argument("--window", action="append", required=True, help="a cut window run dir (repeatable)")
-    ev.add_argument("--fees", default=claude_worker.pnl_report.FEES_PATH_DEFAULT, help="fees.toml (or 'none' for zero fees)")
-    ev.add_argument("--work-dir", default=None, help="artifact/detail scratch (default <library dir>/work)")
+    ev.add_argument(
+        "--window", action="append", required=True, help="a cut window run dir (repeatable)"
+    )
+    ev.add_argument(
+        "--fees",
+        default=claude_worker.pnl_report.FEES_PATH_DEFAULT,
+        help="fees.toml (or 'none' for zero fees)",
+    )
+    ev.add_argument(
+        "--work-dir", default=None, help="artifact/detail scratch (default <library dir>/work)"
+    )
     ev.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
@@ -1024,7 +1125,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915 — one dispatc
         state.close()
 
 
-def _dispatch(  # noqa: PLR0911, PLR0912, PLR0915 — one branch per lane
+def _dispatch(  # one branch per lane
     args: argparse.Namespace,
     state: claude_worker.state.State,
     db: pathlib.Path,
@@ -1036,7 +1137,11 @@ def _dispatch(  # noqa: PLR0911, PLR0912, PLR0915 — one branch per lane
         if rows is None:
             raise LibraryError(f"{source}: not a rows artifact")
         labels = None if args.regimes is None else [_split_terms(s) for s in args.regimes]
-        origin: dict[str, object] = {"source": "add", "file": str(source), "source_hash": _file_hash(source)}
+        origin: dict[str, object] = {
+            "source": "add",
+            "file": str(source),
+            "source_hash": _file_hash(source),
+        }
         groups: list[tuple[str, list[object]]] = [(args.name, rows)]
         if args.split_by_name_prefix:
             by_prefix: dict[str, list[object]] = {}
@@ -1044,14 +1149,25 @@ def _dispatch(  # noqa: PLR0911, PLR0912, PLR0915 — one branch per lane
                 name = str(raw.get("name", "")) if isinstance(raw, dict) else ""
                 prefix = name.rsplit("-", 1)[0] if "-" in name else name
                 by_prefix.setdefault(prefix, []).append(raw)
-            groups = [(f"{args.name}-{p}" if len(by_prefix) > 1 else args.name, g) for p, g in by_prefix.items()]
+            groups = [
+                (f"{args.name}-{p}" if len(by_prefix) > 1 else args.name, g)
+                for p, g in by_prefix.items()
+            ]
         for name, group in groups:
             member, new = add_member(
-                state, directory, group, name,
-                labels=labels, regime_off=args.regime_off, thesis=args.thesis, origin=origin, status=args.status,
+                state,
+                directory,
+                group,
+                name,
+                labels=labels,
+                regime_off=args.regime_off,
+                thesis=args.thesis,
+                origin=origin,
+                status=args.status,
             )
             print(
-                f"{_TELL} add: {'added' if new else 'exists'} {member.status} {member.member_id} {member.name}"
+                f"{_TELL} add: {'added' if new else 'exists'} {member.status} {member.member_id} "
+                f"{member.name}"
                 f" rows={len(member.rows)} labels={describe_labels(member.labels)}"
             )
         return 0
@@ -1061,7 +1177,9 @@ def _dispatch(  # noqa: PLR0911, PLR0912, PLR0915 — one branch per lane
             state,
             directory,
             pathlib.Path(args.artifacts).expanduser() if args.artifacts else ruleset_dir(),
-            pathlib.Path(args.candidates).expanduser() if args.candidates else candidates_dir_for(db),
+            pathlib.Path(args.candidates).expanduser()
+            if args.candidates
+            else candidates_dir_for(db),
             icdp_toml=pathlib.Path(args.icdp).expanduser() if args.icdp else icdp_path(),
             regime_toml=pathlib.Path(args.regime).expanduser(),
             dry_run=args.dry_run,
@@ -1084,7 +1202,8 @@ def _dispatch(  # noqa: PLR0911, PLR0912, PLR0915 — one branch per lane
         out: list[dict[str, object]] = []
         if words is not None and not args.json:
             shown = " ".join(
-                f"{n}=[{claude_worker.regime.describe(words[n])}]" for n in claude_worker.regime.PROFILE_NAMES
+                f"{n}=[{claude_worker.regime.describe(words[n])}]"
+                for n in claude_worker.regime.PROFILE_NAMES
             )
             print(f"{_TELL} list: regime ({source}) {shown}")
         for row in rows:
@@ -1100,7 +1219,20 @@ def _dispatch(  # noqa: PLR0911, PLR0912, PLR0915 — one branch per lane
             else:
                 print(member_line(row, evidence, fits))
         if args.json:
-            print(json.dumps({"members": out, "regime": None if words is None else {"source": source, **{n: f"{words[n]:016x}" for n in claude_worker.regime.PROFILE_NAMES}}}, sort_keys=True))
+            print(
+                json.dumps(
+                    {
+                        "members": out,
+                        "regime": None
+                        if words is None
+                        else {
+                            "source": source,
+                            **{n: f"{words[n]:016x}" for n in claude_worker.regime.PROFILE_NAMES},
+                        },
+                    },
+                    sort_keys=True,
+                )
+            )
         elif not rows:
             print(f"{_TELL} list: empty — run import-catalog or add")
         return 0
@@ -1110,7 +1242,13 @@ def _dispatch(  # noqa: PLR0911, PLR0912, PLR0915 — one branch per lane
         if args.any == (args.regimes is not None):
             raise LibraryError("give exactly one of --regimes (repeatable) / --any")
         labels = [] if args.any else [_split_terms(s) for s in args.regimes]
-        set_labels(state, directory, row, labels, args.regime_off if args.regime_off is not None else row.regime_off)
+        set_labels(
+            state,
+            directory,
+            row,
+            labels,
+            args.regime_off if args.regime_off is not None else row.regime_off,
+        )
         print(f"{_TELL} label: {row.member_id[:12]} {row.name} labels={describe_labels(labels)}")
         return 0
 
@@ -1134,7 +1272,8 @@ def _dispatch(  # noqa: PLR0911, PLR0912, PLR0915 — one branch per lane
             results.append(ev._asdict())
             if not args.json:
                 print(
-                    f"{_TELL} evidence: {member.name} {ev.window_id} fills={ev.n_fills} ticks={ev.n_ticks}"
+                    f"{_TELL} evidence: {member.name} {ev.window_id} fills={ev.n_fills} "
+                    f"ticks={ev.n_ticks}"
                     f" tier={ev.net_usd_tier:+.2f} zero={ev.net_usd_0:+.2f} dd={ev.max_dd_usd:.2f}"
                     f" word={ev.regime_word_mode or '-'} judged={ev.judged}"
                 )

@@ -41,7 +41,9 @@ def _cfg_env(tmp_path: pathlib.Path, sock: pathlib.Path) -> dict[str, str]:
     }
 
 
-def _write_bound_pair(tmp_path: pathlib.Path, body: bytes) -> tuple[pathlib.Path, pathlib.Path, str]:
+def _write_bound_pair(
+    tmp_path: pathlib.Path, body: bytes
+) -> tuple[pathlib.Path, pathlib.Path, str]:
     """A ruleset file + a schema-1 gates-passed report bound to it."""
     ruleset = tmp_path / "r.json"
     ruleset.write_bytes(body)
@@ -59,7 +61,9 @@ def _write_bound_pair(tmp_path: pathlib.Path, body: bytes) -> tuple[pathlib.Path
     return ruleset, report, full_hash
 
 
-def _seed_committed(db: pathlib.Path, ruleset: pathlib.Path, report: pathlib.Path, full_hash: str) -> None:
+def _seed_committed(
+    db: pathlib.Path, ruleset: pathlib.Path, report: pathlib.Path, full_hash: str
+) -> None:
     state = claude_worker.state.State(db)
     try:
         state.stage_ruleset(full_hash, str(ruleset), str(report), "session")
@@ -71,9 +75,7 @@ def _seed_committed(db: pathlib.Path, ruleset: pathlib.Path, report: pathlib.Pat
 def test_no_committed_row_is_honest_noop(tmp_path: pathlib.Path) -> None:
     # Failure-mode-of-absence: fresh install — no registry rows, no
     # socket ever touched (the sock path does not even exist).
-    cfg = claude_worker.config.load_base_from_env(
-        _cfg_env(tmp_path, tmp_path / "absent.sock")
-    )
+    cfg = claude_worker.config.load_base_from_env(_cfg_env(tmp_path, tmp_path / "absent.sock"))
     lines: list[str] = []
     rc = claude_worker.recommit.recommit_active(cfg, report=lines.append)
     assert rc == claude_worker.recommit.EXIT_OK
@@ -136,9 +138,7 @@ def test_drifted_bound_file_refuses_before_commit(
 
 def test_missing_bound_paths_refuse(tmp_path: pathlib.Path) -> None:
     # Failure mode: registry points at deleted files.
-    cfg = claude_worker.config.load_base_from_env(
-        _cfg_env(tmp_path, tmp_path / "absent.sock")
-    )
+    cfg = claude_worker.config.load_base_from_env(_cfg_env(tmp_path, tmp_path / "absent.sock"))
     ruleset, report, full_hash = _write_bound_pair(tmp_path, b'{"rows":[3]}')
     _seed_committed(cfg.db_path, ruleset, report, full_hash)
     ruleset.unlink()

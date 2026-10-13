@@ -292,7 +292,7 @@ def report_path_for(ruleset_path: pathlib.Path) -> pathlib.Path:
     return ruleset_path.with_suffix(REPORT_SUFFIX)
 
 
-def write_report(  # noqa: PLR0913 — one parameter per report input, deliberately
+def write_report(  # one parameter per report input, deliberately
     ruleset_path: pathlib.Path,
     full_hash: str,
     harness: HarnessReport,
@@ -528,7 +528,7 @@ class HarnessDetail(typing.NamedTuple):
     detail: dict[str, object]
 
 
-def run_harness_extra(  # noqa: PLR0913 — one parameter per harness knob, deliberately
+def run_harness_extra(  # one parameter per harness knob, deliberately
     ruleset_path: pathlib.Path,
     replay_dir: pathlib.Path,
     *,

@@ -120,10 +120,14 @@ def test_seed_law_and_a_dislocation_enters_then_reverts() -> None:
 def test_parity_fixture_matches_the_engine() -> None:
     inp: pathlib.Path = FIXTURES / "parity-1.input.tsv"
     exp: pathlib.Path = FIXTURES / "parity-1.expected.tsv"
-    assert exp.exists(), "regenerate with XSD_PARITY_WRITE=1 cargo nextest run -p strategy-xsd --test parity"
+    assert exp.exists(), (
+        "regenerate with XSD_PARITY_WRITE=1 cargo nextest run -p strategy-xsd --test parity"
+    )
     fx: xsd_ref.Fixture = xsd_ref.parse_fixture(inp.read_text())
     got: list[str] = xsd_ref.run_fixture(fx)
-    want: list[str] = [l for l in exp.read_text().splitlines() if l and not l.startswith("#")]
+    want: list[str] = [
+        line for line in exp.read_text().splitlines() if line and not line.startswith("#")
+    ]
     assert len(got) == len(want)
     for i, (g, w) in enumerate(zip(got, want)):
         assert g == w, "line %d differs" % (i + 1)
@@ -132,7 +136,9 @@ def test_parity_fixture_matches_the_engine() -> None:
 def test_parity_fixture_covers_the_decision_table() -> None:
     fx: xsd_ref.Fixture = xsd_ref.parse_fixture((FIXTURES / "parity-1.input.tsv").read_text())
     lines: list[str] = xsd_ref.run_fixture(fx)
-    counts: dict[str, int] = dict(zip(xsd_ref.COUNTER_NAMES, (int(x) for x in lines[-1].split()[1:])))
+    counts: dict[str, int] = dict(
+        zip(xsd_ref.COUNTER_NAMES, (int(x) for x in lines[-1].split()[1:]))
+    )
     assert counts["entries"] >= 8
     assert counts["adds"] >= 2
     assert counts["exits_revert"] >= 3
@@ -140,5 +146,5 @@ def test_parity_fixture_covers_the_decision_table() -> None:
     assert counts["exits_maxhold"] >= 1
     assert counts["intents_carried"] >= 1
     assert counts["holds_absent"] >= 1
-    sides: set[str] = {l.split()[3] for l in lines if l.startswith("O ")}
+    sides: set[str] = {line.split()[3] for line in lines if line.startswith("O ")}
     assert sides == {"0", "1"}

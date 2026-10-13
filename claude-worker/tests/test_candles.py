@@ -13,14 +13,12 @@ import typing
 
 import httpx
 
-import tests.craft
-
 import claude_worker.candles
 import claude_worker.features
 import claude_worker.fetchers
 import claude_worker.frames
 import claude_worker.pmlr
-
+import tests.craft
 
 MS_1M = claude_worker.candles.MS_1M
 MS_1H = claude_worker.candles.MS_1H
@@ -539,7 +537,8 @@ def test_read_universe_lanes_missing_or_empty(tmp_path: pathlib.Path) -> None:
 def test_backfill_bounds() -> None:
     f = claude_worker.candles.backfill_start_ms
     assert f("1m", NOW, "binance", {}) == NOW - 48 * MS_1H
-    assert f("1m", NOW, "binance", {"CLAUDE_WORKER_CANDLES_BACKFILL_1M_H": "24"}) == NOW - 24 * MS_1H
+    env_24h = {"CLAUDE_WORKER_CANDLES_BACKFILL_1M_H": "24"}
+    assert f("1m", NOW, "binance", env_24h) == NOW - 24 * MS_1H
     assert f("1h", NOW, "binance", {}) == NOW - 90 * MS_1D
     assert f("1d", NOW, "binance", {}) == 0, "listing lifetime"
     assert f("1d", NOW, "okx", {}) == NOW - 400 * MS_1D, "OKX cheapness carve-out"
@@ -559,7 +558,7 @@ class ForwardVenue:
         self.calls: list[int] = []
 
     def get(self, url: str) -> str | None:
-        start = int(url.split("startTime=")[1].split("&")[0])
+        start = int(url.split("startTime=")[1].split("&", maxsplit=1)[0])
         self.calls.append(start)
         out = [b for b in self.bars if b.ts_ms >= start][: self.page]
         return klines_json(out)
@@ -653,9 +652,7 @@ def test_fill_forward_failure_and_progress_guard(tmp_path: pathlib.Path) -> None
 
     base = http_none()
     http = claude_worker.candles.Http(get=stuck_get, post=base.post, hosts=base.hosts)
-    st2 = claude_worker.candles.fill_forward(
-        conn, http, bn_lane(t), t, "1m", NOW, budget(50), {}
-    )
+    st2 = claude_worker.candles.fill_forward(conn, http, bn_lane(t), t, "1m", NOW, budget(50), {})
     assert not st2.failed and st2.pages <= 2, "no infinite loop on a stuck venue"
 
 
@@ -674,7 +671,7 @@ class OkxVenue:
 
     def get(self, url: str) -> str | None:
         self.calls += 1
-        after = int(url.split("after=")[1].split("&")[0])
+        after = int(url.split("after=")[1].split("&", maxsplit=1)[0])
         older = [b for b in self.bars if b.ts_ms < after]
         return okx_json(older[-self.page :])
 
@@ -705,10 +702,7 @@ def test_okx_backward_multipage_connects_to_bound(tmp_path: pathlib.Path) -> Non
     assert venue.calls == 2, "second page's oldest lands ON the bound"
     assert st.bars == 200, "bars older than the §9.6 bound dropped"
     assert st.upsert.inserted == 200
-    assert (
-        claude_worker.candles.max_open_ts(conn, t.venue, t.descriptor, "1m")
-        == bars[-1].ts_ms
-    )
+    assert claude_worker.candles.max_open_ts(conn, t.venue, t.descriptor, "1m") == bars[-1].ts_ms
 
 
 def test_okx_backward_short_page_is_listing_edge(tmp_path: pathlib.Path) -> None:
@@ -733,9 +727,7 @@ def test_okx_backward_budget_truncation_discards_whole_walk(
     bound = NOW - 48 * MS_1H
     bars = [mk_candle(bound + i * MS_1M) for i in range(250)]
     venue = OkxVenue(bars)
-    st = claude_worker.candles.fill_okx_backward(
-        conn, http_okx(venue), t, "1m", NOW, budget(1), {}
-    )
+    st = claude_worker.candles.fill_okx_backward(conn, http_okx(venue), t, "1m", NOW, budget(1), {})
     assert st.budget_out and st.bars == 0
     assert claude_worker.candles.max_open_ts(conn, t.venue, t.descriptor, "1m") is None, (
         "a truncated backward walk must never advance the frontier"
@@ -846,7 +838,7 @@ def test_run_cycle_rotates_targets_by_hour(tmp_path: pathlib.Path) -> None:
     seen: list[str] = []
 
     def get(url: str) -> str:
-        seen.append(url.split("symbol=")[1].split("&")[0])
+        seen.append(url.split("symbol=")[1].split("&", maxsplit=1)[0])
         return klines_json([])
 
     base = http_none()
@@ -927,9 +919,7 @@ def test_derive_null_volume_poisons_and_refreshes(tmp_path: pathlib.Path) -> Non
     v = conn.execute("SELECT v FROM candles WHERE tf='5m' AND open_ts=?", (w,)).fetchone()
     assert v == (None,), "volume never fabricated (§9.7)"
     # A base bar changes (late finalization): the derived row refreshes.
-    conn.execute(
-        "UPDATE candles SET c=0.9 WHERE tf='1m' AND open_ts=?", (w + 4 * MS_1M,)
-    )
+    conn.execute("UPDATE candles SET c=0.9 WHERE tf='1m' AND open_ts=?", (w + 4 * MS_1M,))
     conn.commit()
     lines: list[str] = []
     claude_worker.candles.derive_pass(conn, NOW, lines.append)
@@ -953,9 +943,7 @@ def test_derive_4h_from_1h(tmp_path: pathlib.Path) -> None:
         )
     conn.commit()
     claude_worker.candles.derive_pass(conn, NOW, lambda _line: None)
-    row = conn.execute(
-        "SELECT o,h,l,c,v FROM candles WHERE tf='4h' AND open_ts=?", (w,)
-    ).fetchone()
+    row = conn.execute("SELECT o,h,l,c,v FROM candles WHERE tf='4h' AND open_ts=?", (w,)).fetchone()
     assert row == (10.0, 12.0, 8.0, 11.0, 8.0)
 
 
@@ -979,17 +967,18 @@ def test_fold_capture_minutes_mid_ohlc_and_skips(tmp_path: pathlib.Path) -> None
     m0 = NOW - (NOW % MS_1M) + MS_1M  # first full minute after NOW... anchor maps ts0->NOW
     # Build ticks relative to the anchor: wall = NOW + (ts - ts0)/1e6.
     ts0 = 1_000
+
     def at(wall_ms: int) -> int:
         return ts0 + (wall_ms - NOW) * 1_000_000
 
     rows = [
-        (ts0, 42, 400_000, 420_000, 0),                     # anchor tick (mid .41)
-        (at(m0), 42, 400_000, 440_000, 0),                  # minute m0 open  mid .42
-        (at(m0 + 10_000), 42, 500_000, 520_000, 0),         # high .51
-        (at(m0 + 20_000), 42, 300_000, 320_000, 0),         # low .31
-        (at(m0 + 30_000), 42, 440_000, 460_000, 0),         # close .45
-        (at(m0 + 40_000), 42, 0, 460_000, 0),               # one-sided: SKIP
-        (at(m0 + 50_000), 7, 400_000, 420_000, 1),          # unmapped sym: SKIP
+        (ts0, 42, 400_000, 420_000, 0),  # anchor tick (mid .41)
+        (at(m0), 42, 400_000, 440_000, 0),  # minute m0 open  mid .42
+        (at(m0 + 10_000), 42, 500_000, 520_000, 0),  # high .51
+        (at(m0 + 20_000), 42, 300_000, 320_000, 0),  # low .31
+        (at(m0 + 30_000), 42, 440_000, 460_000, 0),  # close .45
+        (at(m0 + 40_000), 42, 0, 460_000, 0),  # one-sided: SKIP
+        (at(m0 + 50_000), 7, 400_000, 420_000, 1),  # unmapped sym: SKIP
     ]
     craft_pm_run(root, epoch_ns, rows)
     bars = claude_worker.candles.fold_capture_minutes(
@@ -1048,9 +1037,7 @@ def test_drift_check_reports_and_warns(tmp_path: pathlib.Path) -> None:
         (desc, minute),
     )
     conn.commit()
-    capture = {
-        (desc, minute): claude_worker.candles.MinuteBar(100.0, 101.0, 99.0, 100.5, 30)
-    }
+    capture = {(desc, minute): claude_worker.candles.MinuteBar(100.0, 101.0, 99.0, 100.5, 30)}
     lines: list[str] = []
     claude_worker.candles.drift_check(conn, 1, capture, 20.0, lines.append)
     assert len(lines) == 1
@@ -1086,9 +1073,7 @@ def test_capture_and_derive_end_to_end(tmp_path: pathlib.Path) -> None:
     ]
     craft_pm_run(root, epoch_ns, rows)
     lines: list[str] = []
-    claude_worker.candles.capture_and_derive(
-        conn, root, {TOKEN: 42}, NOW, {}, lines.append
-    )
+    claude_worker.candles.capture_and_derive(conn, root, {TOKEN: 42}, NOW, {}, lines.append)
     caps = conn.execute(
         "SELECT count(*) FROM candles WHERE source='capture' AND tf='1m'"
     ).fetchone()[0]
@@ -1288,8 +1273,7 @@ def test_coinm_lists_build_one_dapi_lane(tmp_path: pathlib.Path) -> None:
     venue-case symbol, its own host and so its own budget."""
     p = tmp_path / "universe.toml"
     p.write_text(
-        '[binance]\nspot = ["btcusdt"]\ncoinm = ["btcusd_perp"]\n'
-        'coinm_dated = ["btcusd_261225"]\n',
+        '[binance]\nspot = ["btcusdt"]\ncoinm = ["btcusd_perp"]\ncoinm_dated = ["btcusd_261225"]\n',
         encoding="utf-8",
     )
     lanes = claude_worker.candles.read_universe_lanes(p)
@@ -1375,7 +1359,9 @@ def hl_json(coin: str, candles: list[claude_worker.fetchers.Candle]) -> str:
 def xyz_policy_text() -> str:
     names = ", ".join(f'"{c}"' for c in XYZ_COINS)
     narrow = "".join(f'"{c}" = ["1m", "1h"]\n' for c in XYZ_COINS)
-    return f"[hyperliquid]\nextra = [{names}]\nbackfill_1m_h = 96\n[hyperliquid.instruments]\n{narrow}"
+    return (
+        f"[hyperliquid]\nextra = [{names}]\nbackfill_1m_h = 96\n[hyperliquid.instruments]\n{narrow}"
+    )
 
 
 def test_policy_reads_extra_and_backfill_1m_h(tmp_path: pathlib.Path) -> None:
@@ -1407,7 +1393,9 @@ def test_the_example_file_parses_and_its_w1_block_is_the_w1_policy(tmp_path: pat
     assert policy.extras == {} and policy.backfill_1m_h == {}
     text = example.read_text(encoding="utf-8")
     block = text[text.index("# [hyperliquid]\n") :]
-    live = "".join(line[2:] + "\n" if line.startswith("# ") else line + "\n" for line in block.splitlines())
+    live = "".join(
+        line[2:] + "\n" if line.startswith("# ") else line + "\n" for line in block.splitlines()
+    )
     f = tmp_path / "w1.toml"
     f.write_text(live, encoding="utf-8")
     w1, problem = claude_worker.candles.read_tf_policy(f)
@@ -1465,7 +1453,10 @@ def test_extras_join_their_lane_or_make_one() -> None:
         {"hyperliquid": ("xyz:SP500", "BTC"), "okx": ("MU-USDT-SWAP",), "binance": ("ethusdt",)},
         {},
     )
-    assert claude_worker.candles.with_extras(universe, claude_worker.candles.DEFAULT_POLICY) is universe
+    assert (
+        claude_worker.candles.with_extras(universe, claude_worker.candles.DEFAULT_POLICY)
+        is universe
+    )
     by_name = {lane.name: lane for lane in claude_worker.candles.with_extras(universe, policy)}
     assert list(by_name) == ["binance", "hyperliquid", "okx"]
     assert [t.descriptor for t in by_name["hyperliquid"].targets] == [
@@ -1479,7 +1470,9 @@ def test_extras_join_their_lane_or_make_one() -> None:
     okx = by_name["okx"]
     assert okx.backward and okx.venue == claude_worker.frames.VENUE_OKX
     assert okx.targets == [
-        claude_worker.candles.LaneTarget(claude_worker.frames.VENUE_OKX, "okx:MU-USDT-SWAP", "MU-USDT-SWAP")
+        claude_worker.candles.LaneTarget(
+            claude_worker.frames.VENUE_OKX, "okx:MU-USDT-SWAP", "MU-USDT-SWAP"
+        )
     ]
     assert len(universe[1].targets) == 1, "the universe's lane is not mutated"
 
@@ -1581,7 +1574,10 @@ def test_the_hl_lane_books_what_each_page_weighed(tmp_path: pathlib.Path) -> Non
         def record(self, weight: int) -> None:
             booked.append(weight)
 
-    answers = [hl_json("xyz:MU", [mk_candle(NOW - 48 * MS_1H + k * MS_1M) for k in range(125)]), None]
+    answers = [
+        hl_json("xyz:MU", [mk_candle(NOW - 48 * MS_1H + k * MS_1M) for k in range(125)]),
+        None,
+    ]
     base = http_none()
     http = claude_worker.candles.Http(
         get=base.get,
@@ -1849,9 +1845,9 @@ def test_a_window_starting_mid_minute_never_refolds_that_minute_from_its_tail(
     assert (TOKEN, m0) in claude_worker.candles.fold_capture_minutes(
         pm_root, {42: TOKEN}, ("pm",), m0, NOW
     )
-    assert claude_worker.candles.fold_capture_minutes(
-        pm_root, {42: TOKEN}, ("pm",), m0 + 1, NOW
-    ) == {}
+    assert (
+        claude_worker.candles.fold_capture_minutes(pm_root, {42: TOKEN}, ("pm",), m0 + 1, NOW) == {}
+    )
 
 
 def test_a_repeated_print_counts_once_and_a_tie_keeps_arrival_order(tmp_path: pathlib.Path) -> None:

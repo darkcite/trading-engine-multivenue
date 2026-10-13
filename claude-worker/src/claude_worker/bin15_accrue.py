@@ -1171,7 +1171,7 @@ def needed_n(p: float, edge: float, z: float = 2.0) -> int:
     """Settled entries to resolve ``edge`` at ``z`` SE, at hit rate p."""
     if edge <= 0:
         return 0
-    return int(math.ceil(z * z * p * (1 - p) / (edge * edge)))
+    return math.ceil(z * z * p * (1 - p) / (edge * edge))
 
 
 def on_label(entries: typing.Sequence[Entry], label: str) -> tuple[list[Entry], int]:
@@ -1235,7 +1235,7 @@ def render(entries: typing.Sequence[Entry], fee_bps: int) -> list[str]:
         "edge or a restart gap (counted, never guessed)"
     )
     if not settled:
-        return out + ["no settled entry yet: nothing to score"]
+        return [*out, "no settled entry yet: nothing to score"]
 
     n = len(settled)
     k = sum(1 for e in settled if e.won)

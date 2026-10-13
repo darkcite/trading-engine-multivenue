@@ -105,7 +105,9 @@ def test_v3_marks_skip_stale_ticks_and_keep_the_last_good_mid() -> None:
     assert ticks[1].sym == okx and ticks[1].is_stale()
     assert marks[okx] == ticks[0].mid()
     assert ticks[3].sym == PM7 and ticks[3].is_stale()
-    assert marks[PM7] == ticks[4].mid(), "the v2-shape PM tick (fresh) is the last good mid for sym 7"
+    assert marks[PM7] == ticks[4].mid(), (
+        "the v2-shape PM tick (fresh) is the last good mid for sym 7"
+    )
     # v2 files keep the v2 law: every tick marks.
     marks_v2: dict[int, int] = {}
     with claude_worker.pmlr.Reader(FIXTURES / "ticks_v2.pmlr") as r:

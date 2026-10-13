@@ -161,7 +161,7 @@ def spend_of(completion: object) -> Spend:
 # ------------------------------------------------- the ONE call path (§9)
 
 
-def complete_cached(  # noqa: PLR0913, PLR0917 — the single gate: every collaborator is named
+def complete_cached(  # the single gate: every collaborator is named
     state: claude_worker.state.State,
     store: claude_worker.news.store.Store,
     ceilings: typing.Mapping[str, int],
