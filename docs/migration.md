@@ -6,6 +6,27 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-13 — HL ingress: `engine_ingress_hyperliquid_unsub_acks_total`; the roll's second ack strike (HK1)
+
+**What changed**
+- New gauge `engine_ingress_hyperliquid_unsub_acks_total`: the venue's
+  echoes of a roll's `unsubscribe`s (six a roll). They used to count in
+  `engine_ingress_hyperliquid_parse_errors_total` and were tapped as parse
+  rejects; now they count in `…_msgs_total` and this gauge, with no reject
+  tap.
+- A roll whose hot subscribes go unacknowledged twice now gets its second
+  strike (`…_family_ack_timeouts_total` +2 for that family). The family
+  stays bound and is not counted in `…_families_dormant`.
+
+**Impact**
+- Metrics: HL `…_parse_errors_total` falls by six per mid-session roll
+  (≈ 24 an hour per 15-minute family). Frames in flight for retired coins
+  still count there.
+- Captures: with the raw tap on, the echoes stop appearing as rejects.
+
+**Migration steps**
+1. None: the routine restart of a binary built from this change.
+
 ## 2026-10-13 — `bin15.toml`: nine optional `late_*` keys; `engine_bin15_late_*`; the sidecar's late blocks; `multivenue-engine hl-outcome-probe` (BIN15 H90)
 
 **What changed**
@@ -757,7 +778,8 @@ supervised restart and the post-boot checks.
 - Metrics: HL `…_parse_errors_total` falls by ≈ 1.5/s — its whole steady
   rate on 2026-09-26 — and `…_msgs_total` rises by the same. It does not
   go to zero: each mid-session roll still adds its unsubscribe echoes and
-  the frames in flight for the retired coins.
+  the frames in flight for the retired coins (the echoes: no longer since
+  HK1, the entry above).
 - Captures: with the raw tap on, these frames stop appearing as rejects.
 
 **Migration steps**

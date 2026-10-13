@@ -998,6 +998,15 @@ pub(crate) fn outcome_venue_field(payload: &[u8]) -> Option<&[u8]> {
     Some(&payload[start..end])
 }
 
+/// A `subscriptionResponse` echo of an `unsubscribe` — the venue's
+/// answer to a roll retiring an instance's coins (BIN15 O2). No ack mask
+/// awaits it; the run loop counts it on its own, never as a rejection.
+#[inline]
+#[must_use]
+pub fn is_unsub_response(payload: &[u8]) -> bool {
+    memchr::memmem::find(payload, b"\"method\":\"unsubscribe\"").is_some()
+}
+
 /// Parse a `subscriptionResponse` echo: returns the acknowledged
 /// channel and (for per-coin channels) the echoed coin bytes.
 /// `None` when the echo is not a `subscribe` ack (e.g. unsubscribe)
@@ -1935,6 +1944,10 @@ mod tests {
         assert!(parse_sub_response(unknown).is_none());
         let missing_coin = br#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"bbo"}}}"#;
         assert!(parse_sub_response(missing_coin).is_none());
+        // HK1: of the three, only the unsubscribe is an answer.
+        assert!(is_unsub_response(unsub));
+        assert!(!is_unsub_response(unknown));
+        assert!(!is_unsub_response(missing_coin));
     }
 
     // ---- coin table ----------------------------------------------

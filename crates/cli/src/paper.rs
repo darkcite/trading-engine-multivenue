@@ -4216,6 +4216,11 @@ impl Observability {
             let ingress_hl_outcome_bbo_one_sided = reg
                 .register_gauge("engine_ingress_hyperliquid_outcome_bbo_one_sided_total")
                 .map_err(|_| "register engine_ingress_hyperliquid_outcome_bbo_one_sided_total")?;
+            // HK1: a roll's `unsubscribe` echoes — answers, out of
+            // `parse_errors_total`.
+            let ingress_hl_unsub_acks = reg
+                .register_gauge("engine_ingress_hyperliquid_unsub_acks_total")
+                .map_err(|_| "register engine_ingress_hyperliquid_unsub_acks_total")?;
             let ingress_bybit_state = reg
                 .register_gauge("engine_ingress_bybit_state")
                 .map_err(|_| "register engine_ingress_bybit_state")?;
@@ -4445,6 +4450,7 @@ impl Observability {
                 ingress_hl_family_ack_timeouts,
                 ingress_hl_families_dormant,
                 ingress_hl_outcome_bbo_one_sided,
+                ingress_hl_unsub_acks,
                 ingress_bybit_state,
                 ingress_rpc_state,
                 ingress_mexc_state,
@@ -4832,6 +4838,8 @@ pub struct EngineCounters {
     pub ingress_hl_families_dormant: core_metrics::GaugeId,
     /// BIN15 O8: `engine_ingress_hyperliquid_outcome_bbo_one_sided_total`.
     pub ingress_hl_outcome_bbo_one_sided: core_metrics::GaugeId,
+    /// HK1: `engine_ingress_hyperliquid_unsub_acks_total`.
+    pub ingress_hl_unsub_acks: core_metrics::GaugeId,
     /// WS9: per-ingress state gauge, Bybit v5 public WS.
     pub ingress_bybit_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: Polygon JSON-RPC.
@@ -9844,6 +9852,8 @@ where
                         .set(ing.hl_roll.families_dormant() as i64);
                     reg.gauge(ids.ingress_hl_outcome_bbo_one_sided)
                         .set(ing.hl_roll.outcome_bbo_one_sided() as i64);
+                    reg.gauge(ids.ingress_hl_unsub_acks)
+                        .set(ing.hl_roll.unsub_acks() as i64);
                     reg.gauge(ids.ingress_hyperliquid_state)
                         .set(ing.hyperliquid.state() as i64);
                     reg.gauge(ids.ingress_bybit_state)

@@ -2779,7 +2779,7 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     // no chains to maintain; staleness budgets are generous (boot).
     // `inject_incoming` may compact/copy; all of it happens here,
     // before the guard.
-    const CYCLES: usize = 199; // 9 acks + 5 × 199 = 1 004 frames
+    const CYCLES: usize = 199; // 9 acks + 3 unsubs + 5 × 199 = 1 007 frames
     const BBO_BTC: &[u8] = br#"{"channel":"bbo","data":{"coin":"BTC","time":1708622398623,"bbo":[{"px":"64437.0","sz":"1.4491","n":2},{"px":"64438.0","sz":"0.541","n":3}]}}"#;
     // XMM XH1: two DEEP perp books (7 levels a side, past `DEPTH_K`),
     // alternated so every cycle's perp `l2Book` is a CHANGED top-K: the
@@ -2815,9 +2815,21 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
         stream.extend_from_slice(body);
     }
 
+    // HK1: a roll's unsubscribe echoes — answers, counted as messages
+    // (`HlRollStatus::unsub_acks`), never as parse errors — ride the
+    // measured window too.
+    const UNSUBS: [&[u8]; 3] = [
+        br##"{"channel":"subscriptionResponse","data":{"method":"unsubscribe","subscription":{"type":"bbo","coin":"#330"}}}"##,
+        br##"{"channel":"subscriptionResponse","data":{"method":"unsubscribe","subscription":{"type":"l2Book","coin":"#330"}}}"##,
+        br##"{"channel":"subscriptionResponse","data":{"method":"unsubscribe","subscription":{"type":"trades","coin":"#330"}}}"##,
+    ];
+
     let mut stream: Vec<u8> = Vec::with_capacity(256 * 1024);
     for ack in ACKS {
         push_text_frame(&mut stream, ack);
+    }
+    for unsub in UNSUBS {
+        push_text_frame(&mut stream, unsub);
     }
     for c in 0..CYCLES {
         push_text_frame(&mut stream, BBO_BTC);
@@ -2902,9 +2914,10 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     assert_eq!(prints, 2 * CYCLES);
     assert_eq!(status.trade_ring_drops_total(), 0);
     assert!(driver.is_verified());
-    // 9 acks + per cycle: bbo(1) + l2Book(1) + trades rows(2) +
-    // bbo(1) + l2Book(1) = 6. WS Pings are activity, not messages.
-    assert_eq!(status.msgs_total(), (9 + 6 * CYCLES) as u64);
+    // 9 acks + 3 unsubscribe echoes (HK1) + per cycle: bbo(1) +
+    // l2Book(1) + trades rows(2) + bbo(1) + l2Book(1) = 6. WS Pings are
+    // activity, not messages.
+    assert_eq!(status.msgs_total(), (9 + UNSUBS.len() + 6 * CYCLES) as u64);
     assert_eq!(status.parse_errors_total(), 0);
     assert_eq!(status.gaps_total(), 0);
     assert_eq!(status.resubscribes_total(), 0);

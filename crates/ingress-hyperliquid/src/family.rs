@@ -148,8 +148,13 @@ pub struct HlFamily {
     /// reconnect re-discovers it over `/info`, or the venue's next
     /// `outcomeCreated` push adopts it. Cleared by [`HlFamilyTable::bind`].
     pub awaiting: bool,
+    /// The roll's hot subscribes timed out once and were re-queued under
+    /// a fresh [`Self::ack_deadline_ns`]; a second timeout stops the
+    /// asking until the family's next roll (`run_loop::roll_health`).
+    /// Cleared wherever the deadline is.
+    pub ack_retried: bool,
     /// Explicit tail padding.
-    _pad: [u8; 5],
+    _pad: [u8; 4],
 }
 
 const _: () = assert!(::core::mem::size_of::<HlFamily>() == 112);
@@ -257,7 +262,8 @@ const EMPTY_FAMILY: HlFamily = HlFamily {
     dormant: true,
     settled: false,
     awaiting: false,
-    _pad: [0; 5],
+    ack_retried: false,
+    _pad: [0; 4],
 };
 
 impl HlFamilyTable {
@@ -483,6 +489,7 @@ impl HlFamilyTable {
         f.awaiting = true;
         f.pending_ack = 0;
         f.ack_deadline_ns = 0;
+        f.ack_retried = false;
         Ok(())
     }
 
@@ -1004,6 +1011,7 @@ pub struct HlRollStatus {
     family_ack_timeouts: ::core::sync::atomic::AtomicU64,
     families_dormant: ::core::sync::atomic::AtomicU64,
     outcome_bbo_one_sided: ::core::sync::atomic::AtomicU64,
+    unsub_acks: ::core::sync::atomic::AtomicU64,
 }
 
 impl HlRollStatus {
@@ -1017,7 +1025,16 @@ impl HlRollStatus {
             family_ack_timeouts: AtomicU64::new(0),
             families_dormant: AtomicU64::new(0),
             outcome_bbo_one_sided: AtomicU64::new(0),
+            unsub_acks: AtomicU64::new(0),
         }
+    }
+
+    /// A roll's `unsubscribe` was echoed by the venue — a well-formed
+    /// answer no ack mask awaits, never a parse error (six a roll).
+    #[inline]
+    pub fn inc_unsub_acks(&self) {
+        self.unsub_acks
+            .fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
     }
 
     /// BIN15 O8: an outcome leg's `bbo` came one-sided (its ask `null`)
@@ -1096,6 +1113,14 @@ impl HlRollStatus {
     #[must_use]
     pub fn outcome_bbo_one_sided(&self) -> u64 {
         self.outcome_bbo_one_sided
+            .load(::core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `engine_ingress_hyperliquid_unsub_acks_total`.
+    #[inline]
+    #[must_use]
+    pub fn unsub_acks(&self) -> u64 {
+        self.unsub_acks
             .load(::core::sync::atomic::Ordering::Relaxed)
     }
 }

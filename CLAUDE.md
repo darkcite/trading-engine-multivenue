@@ -267,9 +267,12 @@ in the script; `ai` = 48 is the floor every name includes).
   Its ~1.5/s "parse errors" were BIN15 O8's one-sided outcome `bbo` drops,
   counted on their own from the next release build + restart
   (`engine_ingress_hyperliquid_outcome_bbo_one_sided_total`; risk-policy
-  "The one-sided outcome `bbo` is not a parse error"). Open:
-  `roll_health`'s second strike is unreachable (pre-existing); each roll's
-  unsubscribe echoes still count as parse errors.
+  "The one-sided outcome `bbo` is not a parse error"). HK1 (2026-10-13)
+  closed its two open items: `roll_health`'s retry runs under a fresh
+  deadline, so the second strike is reachable (it stops the asking; the
+  instance stays bound, never marked dormant), and a roll's unsubscribe
+  echoes count in `engine_ingress_hyperliquid_unsub_acks_total`, not as
+  parse errors (risk-policy "HK1").
 - **HYPERCALL — the eighth market-data venue, MERGED to main 2026-09-26
   (branch `hypercall`: HC0–HC7, HAR H1–H3, O-HC8), LIVE since the 20:15Z
   restart of 2026-09-26 — the data, the HAR set and slot 7 in PAPER** (vault `docs/research/hypercall/hypercall-integration-plan-2026-09-26.md`,

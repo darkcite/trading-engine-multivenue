@@ -14,7 +14,8 @@
 //! 3. All six channel parsers (`parse_bbo`, `parse_l2book_header`,
 //!    `parse_trade`, `parse_active_asset_ctx`, `parse_all_mids`,
 //!    `parse_outcome_meta`).
-//! 4. The subscribe-ack parser (`parse_sub_response`).
+//! 4. The subscribe-ack parser (`parse_sub_response`) and the
+//!    unsubscribe-echo test (`is_unsub_response`, HK1).
 //!
 //! None of these may panic, allocate, or read out of bounds on any
 //! input — results are consumed and otherwise ignored.
@@ -72,4 +73,5 @@ fuzz_target!(|data: &[u8]| {
 
     // --- subscribe acks ---------------------------------------------
     std::hint::black_box(ingress_hyperliquid::parse_sub_response(data));
+    std::hint::black_box(ingress_hyperliquid::is_unsub_response(data));
 });

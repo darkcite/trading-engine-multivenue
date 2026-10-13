@@ -3540,7 +3540,9 @@ the module title and error docs, `WssEndpoint`'s doc narrowed to the HL
 thread, the guard's remaining trigger, the wire-format note, and a
 duplicated `#[allow]` on `run`. Left open: `roll_health`'s retry sets
 `ack_deadline_ns = u64::MAX`, so its second strike (dormant) is
-unreachable — pre-existing, its own change; a successor listed between
+unreachable — pre-existing, its own change (**closed by HK1, 2026-10-13**:
+the second strike stops the asking and never marks the family dormant —
+see "HK1" at the end); a successor listed between
 the `/info` snapshot and the new session's `outcomeMetaUpdates` ack is
 missed until the family's next instance (at most one 15-minute instance;
 a daily's successor is listed a day ahead); the `/info` host is resolved
@@ -3625,7 +3627,9 @@ need a rename. Left open: the parse count is not zero after this — each
 mid-session roll's six unsubscribe echoes still land in `Nothing`
 (`parse_sub_response` takes only `"subscribe"`, though `lib.rs` calls the
 echo deliberately ignored), and so do frames in flight for the retired
-coins; the same class, its own change. Only a `null` ask is guarded, which
+coins; the same class, its own change. (**The echoes: closed by HK1,
+2026-10-13** — see "HK1" at the end. The in-flight frames for retired
+coins still count.) Only a `null` ask is guarded, which
 is what the venue does (2026-09-12: 194 of 194 outcome ticks had a zero
 ask, none a zero bid).
 
@@ -14914,3 +14918,63 @@ independent rebuild exact). **Plan:** vault doc 33. **Nothing here arms a slot.*
   safe-minute restart, O-H90-10). The harness blocks (`bin15_late_entries`,
   `bin15_late_fires`, `bin15_late_law`) and the stores
   (`claude_worker.bin15_late`) landed with L3.
+
+## HK — the housekeeping lane (2026-10-13)
+
+Section A of the 2026-10-13 survey, one `HK:` commit per cut on `main`
+(rulings HK-R1..R4: never pushed; the session builds and tests, the deploy is
+the operator's). Plan: project doc `claude/hk-housekeeping-plan-2026-10-13.md`.
+**Nothing here arms a slot or changes a cap, a halt or an order path** unless
+its entry says so.
+
+### HK1 — the HL roll's two counters (`ingress-hyperliquid`)
+
+- **The second strike is reachable.** `roll_health` re-queues a roll's hot
+  subscribes once when they go unacknowledged past `sub_ack_budget_ns`. The
+  retry used to store `ack_deadline_ns = u64::MAX` as its "retried" mark, and
+  the overdue test `now > ack_deadline_ns` can never pass against it. So a
+  family whose retry also went unanswered waited forever with its acks
+  pending (the "Left open" items above). Now `HlFamily::ack_retried` (from the
+  row's tail padding; the 112 B size assert holds) marks the retry, which runs
+  under a fresh, whole budget. The flag is cleared wherever the deadline is:
+  the roll's bind, the last ack, the reconnect reset, `retire`, and the
+  strike.
+- **The second strike stops the asking and nothing else.** The row keeps its
+  bound instance and is **not** marked `dormant`, because dormant means "no
+  live instance". The 2026-09-26 review above records why the flag must not
+  be set on a bound row: `rebind_dormant` selects by `live.outcome == 0`, the
+  `families_dormant` gauge and the family log would lie, and nothing but a
+  bind clears the flag. The bound coins' data stays the staleness monitor's to
+  judge, as every bound coin's is: no ticks ⇒ `Stale` ⇒ reconnect, whose sweep
+  re-subscribes under the session-fatal mask. A strike with data flowing
+  means acks unconfirmed on a live feed — nothing to act on until the next
+  roll. Counted in `engine_ingress_hyperliquid_family_ack_timeouts_total`
+  (twice for such a family).
+- **An unsubscribe echo is an answer.** The six
+  `subscriptionResponse` echoes of a roll's `unsubscribe`s were counted as
+  parse errors and tapped as rejects. They are now `Dispatch::UnsubAck`:
+  one message, plus the new gauge
+  `engine_ingress_hyperliquid_unsub_acks_total`, and no reject tap. A
+  `subscriptionResponse` that names no known channel is still a rejection.
+- **Unchanged and recorded (review):** if the first acks were only late, the
+  retry re-subscribes coins the venue already holds. Its "Already
+  subscribed" answer is an `error` frame, which is fatal, so the session
+  reconnects. That is pre-existing behaviour, not widened by HK1.
+- **Tests (red on the old code, green now):**
+  `a_roll_whose_retry_also_times_out_stops_asking` and
+  `a_rolls_unsubscribe_echoes_are_counted_not_rejected`. The `lib.rs` echo
+  test covers `is_unsub_response`. Alloc gate `hl_run_loop_steady_state_is_zero_alloc`
+  carries three unsubscribe echoes inside its measured window (0 B/op). Fuzz
+  `hl_ws_frame` calls `is_unsub_response`.
+- **Reviews:**
+  - risk: NEEDS-DOCS (these records), and the dormant-on-a-bound-row hazard,
+    which led to the design above;
+  - alloc: PASS;
+  - zero-copy: PASS (no new copy; one more ≤ 130 B scan per echo, a cold class).
+- **Gates:**
+  - clippy clean;
+  - nextest 4 603 passed (10 skipped);
+  - alloc 126/126 at 0 B/op (a fresh `Compiling bench`);
+  - copy-audit hits 28, new 0;
+  - license-check OK;
+  - fuzz `hl_ws_frame` 60 s clean (2.05 M runs).

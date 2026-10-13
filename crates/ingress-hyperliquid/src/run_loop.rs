@@ -95,7 +95,7 @@ use crate::discovery::{parse_outcome_spec, HlOutcomeSpec};
 use crate::family::{pack_roll_seq, HlFamilyTable, HlRollStatus, ROLL_ACK_ALL, ROLL_CHANNELS};
 use crate::{
     bit_of, classify, coin_wants_asset_ctx, expected_mask, extract_coin, is_outcome_coin,
-    outcome_meta_description, parse_active_asset_ctx, parse_all_mids, parse_bbo,
+    is_unsub_response, outcome_meta_description, parse_active_asset_ctx, parse_all_mids, parse_bbo,
     parse_l2book_depth, parse_l2book_header, parse_outcome_meta, parse_sub_response, parse_trade,
     sub_id_of, subscription_parts, GlobalBits, HlChannel, HlCoinTable, HlMsgKind, HlStaleness,
     HlSubVerb, MaskBits, ALL_MIDS_BIT, CHANNELS_PER_COIN, HL_MAX_COINS, OUTCOME_CREATED,
@@ -473,6 +473,7 @@ impl Driver {
             if let Some(row) = self.families.get_mut(f) {
                 row.pending_ack = 0;
                 row.ack_deadline_ns = 0;
+                row.ack_retried = false;
             }
             f += 1;
         }
@@ -979,6 +980,7 @@ fn perform_roll<C: Capture>(
         if let Some(row) = drv.families.get_mut(family_idx) {
             row.pending_ack = ROLL_ACK_ALL;
             row.ack_deadline_ns = now.saturating_add(drv.sub_ack_budget_ns);
+            row.ack_retried = false;
         }
         // (d) The new coins inherit no cadence from the dead ones.
         drv.staleness.reset(coin_idx[0], now);
@@ -1015,9 +1017,12 @@ fn perform_roll<C: Capture>(
 /// A fresh coin has nothing to drop, so a timeout here is a venue
 /// hiccup rather than a misconfiguration, and killing a session that
 /// is happily serving every other instrument would cost more than the
-/// one family it would fix. The retry is single-shot: a second
-/// timeout leaves the family dormant until its next roll, which is at
-/// most one period away.
+/// one family it would fix. The retry is single-shot, under the whole
+/// budget again (`HlFamily::ack_retried`): a second timeout stops the
+/// asking until the family's next roll, which is at most one period
+/// away. The family stays bound and is NOT marked dormant — dormant
+/// means no live instance — and its data is the staleness monitor's to
+/// judge, as every bound coin's is (HK1, 2026-10-13).
 pub fn roll_health<C: Capture>(
     drv: &mut Driver,
     status: &IngressStatus,
@@ -1032,7 +1037,7 @@ pub fn roll_health<C: Capture>(
         let (overdue, retried, coin_idx, sym_yes) = match drv.families.get(f) {
             Some(row) => (
                 row.pending_ack != 0 && row.ack_deadline_ns != 0 && now_ns > row.ack_deadline_ns,
-                row.ack_deadline_ns == u64::MAX,
+                row.ack_retried,
                 [row.coin_idx[0] as usize, row.coin_idx[1] as usize],
                 row.sym[0],
             ),
@@ -1052,18 +1057,17 @@ pub fn roll_health<C: Capture>(
                 -1,
             ));
             if retried {
-                // Second strike: stop asking until the next roll.
+                // Second strike: stop asking until the next roll. The
+                // instance stays bound (not dormant: dormant means no
+                // live instance); staleness judges its data.
                 if let Some(row) = drv.families.get_mut(f) {
                     row.pending_ack = 0;
                     row.ack_deadline_ns = 0;
-                    row.dormant = true;
+                    row.ack_retried = false;
                 }
-                drv.roll_status
-                    .set_dormant(drv.families.dormant_count() as u64);
             } else {
-                // Re-queue both sides' three channels once. The
-                // deadline sentinel `u64::MAX` marks "already retried"
-                // without widening the row.
+                // Re-queue both sides' three channels once
+                // (`HlFamily::ack_retried` marks it).
                 let mut side = 0usize;
                 while side < 2 {
                     if let Some((coin, _sym)) = drv.coins.get(coin_idx[side]) {
@@ -1073,8 +1077,13 @@ pub fn roll_health<C: Capture>(
                     }
                     side += 1;
                 }
+                // The retry gets the whole budget again; a second
+                // timeout is the strike above. (The `u64::MAX` sentinel
+                // this replaced could never be overdue, so a family whose
+                // retry also went unanswered waited forever.)
                 if let Some(row) = drv.families.get_mut(f) {
-                    row.ack_deadline_ns = u64::MAX;
+                    row.ack_deadline_ns = now_ns.saturating_add(drv.sub_ack_budget_ns);
+                    row.ack_retried = true;
                 }
             }
         }
@@ -1256,6 +1265,10 @@ enum Dispatch {
     },
     /// Venue `error` frame — fatal (fail-fast).
     VenueError,
+    /// The venue echoed one of a roll's `unsubscribe`s — well-formed,
+    /// awaited by no mask, counted on its own
+    /// (`HlRollStatus::unsub_acks`), never as a rejection.
+    UnsubAck,
     /// `bbo` push became the phase-1 tick.
     Bbo,
     /// BIN15 O8: a HIP-4 outcome leg's one-sided `bbo` (its ask
@@ -1541,6 +1554,7 @@ fn handle_data_frame<C: Capture>(
                     },
                     None => Dispatch::Nothing,
                 },
+                None if is_unsub_response(payload) => Dispatch::UnsubAck,
                 None => Dispatch::Nothing,
             },
             HlMsgKind::Data(channel) => match channel {
@@ -1941,6 +1955,10 @@ fn handle_data_frame<C: Capture>(
             capture.parse_reject(now_ns(), &drv.rx.filled()[reject_range]);
         }
         Dispatch::Quiet => {}
+        Dispatch::UnsubAck => {
+            status.add_msgs(1);
+            drv.roll_status.inc_unsub_acks();
+        }
         Dispatch::OutcomeBboOneSided => {
             status.add_msgs(1);
             drv.roll_status.inc_outcome_bbo_one_sided();
@@ -1963,6 +1981,7 @@ fn handle_data_frame<C: Capture>(
                             row.pending_ack &= !crate::family::roll_ack_bit(side, channel);
                             if row.pending_ack == 0 {
                                 row.ack_deadline_ns = 0;
+                                row.ack_retried = false;
                             }
                         }
                     }
@@ -2927,6 +2946,47 @@ mod tests {
         assert_eq!(tick.venue, VenueId::Hyperliquid as u8);
         assert_eq!(tick.bid_px.raw(), 400_000);
         assert_eq!(tick.ask_px.raw(), 600_000);
+    }
+
+    /// HK1: a roll's `unsubscribe` echoes are answers, not rejections.
+    /// Before, each counted one `parse_errors_total` and was tapped as a
+    /// reject — six a roll, every 15 minutes per family. A
+    /// `subscriptionResponse` naming no channel we know is still one.
+    #[test]
+    fn a_rolls_unsubscribe_echoes_are_counted_not_rejected() {
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = verified_driver();
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+        let mut cap = CountingCapture::default();
+        inject_text(
+            &mut t,
+            br##"{"channel":"subscriptionResponse","data":{"method":"unsubscribe","subscription":{"type":"bbo","coin":"#330"}}}"##,
+        );
+        inject_text(
+            &mut t,
+            br##"{"channel":"subscriptionResponse","data":{"method":"unsubscribe","subscription":{"type":"l2Book","coin":"#330"}}}"##,
+        );
+        inject_text(
+            &mut t,
+            br##"{"channel":"subscriptionResponse","data":{"method":"unsubscribe","subscription":{"type":"trades","coin":"#330"}}}"##,
+        );
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(d.roll_status.unsub_acks(), 3);
+        assert_eq!(status.parse_errors_total(), 0);
+        assert_eq!(status.msgs_total(), 3);
+        assert_eq!(status.ticks_total(), 0);
+        assert_eq!(cap.rejects, 0, "an answer is never tapped as a reject");
+        assert!(cons.try_pop_ref().is_none());
+
+        inject_text(
+            &mut t,
+            br#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"candle","coin":"BTC"}}}"#,
+        );
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(status.parse_errors_total(), 1, "an unknown channel is still a rejection");
+        assert_eq!(cap.rejects, 1);
+        assert_eq!(d.roll_status.unsub_acks(), 3);
     }
 
     /// BIN15 O8: a HIP-4 outcome leg's touch comes from `l2Book`,
@@ -3987,6 +4047,98 @@ mod tests {
             "the rolled successor is unwatched at its own expiry"
         );
         assert_eq!(status.gaps_total(), 0);
+    }
+
+    /// HK1: a roll whose hot subscribes go unanswered TWICE. The first
+    /// timeout re-queues them under a fresh, whole budget; the second
+    /// stops the asking until the next roll, the instance still bound and
+    /// NOT dormant (dormant means no live instance). Before, the retry's
+    /// `u64::MAX` deadline sentinel could never be overdue, so the second
+    /// strike was unreachable and the family waited forever with its acks
+    /// pending.
+    #[test]
+    fn a_roll_whose_retry_also_times_out_stops_asking() {
+        let t0 = now_ns();
+        let mut d = family_driver(WallAnchor::new(t0, spec_2649().expiry_ns - 1_000));
+        d.set_state(State::Steady);
+        d.subscribed = true;
+        let status = IngressStatus::new();
+        let (mut etx, _erx) = event_ring_pair();
+        let mask = core_types::event_lane_bit(ChannelId::InstrumentRoll);
+        perform_roll(
+            &mut d,
+            0,
+            &spec_2650(),
+            false,
+            &mut etx,
+            mask,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
+        let b = HL_SUB_ACK_BUDGET_NS;
+        let row = *d.families().get(0).unwrap();
+        assert_eq!(row.pending_ack, ROLL_ACK_ALL);
+        assert!(!row.ack_retried && !row.dormant);
+        let deadline = row.ack_deadline_ns;
+
+        // Inside the budget: nothing.
+        roll_health(&mut d, &status, &mut NullCapture, deadline).unwrap();
+        assert_eq!(d.roll_status.family_ack_timeouts(), 0);
+
+        // The first strike re-queues, under the whole budget again.
+        let t1 = deadline + 1;
+        let tx_before = d.tx.len();
+        roll_health(&mut d, &status, &mut NullCapture, t1).unwrap();
+        assert_eq!(d.roll_status.family_ack_timeouts(), 1);
+        let row = *d.families().get(0).unwrap();
+        assert!(row.ack_retried && !row.dormant);
+        assert_eq!(row.pending_ack, ROLL_ACK_ALL);
+        assert_eq!(row.ack_deadline_ns, t1 + b, "the retry gets the whole budget");
+        assert!(d.tx.len() > tx_before, "the hot subscribes are re-queued");
+
+        // Nothing more inside the retry's budget …
+        roll_health(&mut d, &status, &mut NullCapture, t1 + b).unwrap();
+        assert_eq!(d.roll_status.family_ack_timeouts(), 1);
+
+        // … then the second strike: no more asking until the next roll,
+        // the instance still bound.
+        let tx_before = d.tx.len();
+        roll_health(&mut d, &status, &mut NullCapture, t1 + b + 1).unwrap();
+        assert_eq!(d.roll_status.family_ack_timeouts(), 2);
+        let row = *d.families().get(0).unwrap();
+        assert!(!row.dormant && !row.ack_retried);
+        assert_eq!(row.live.outcome, 2650, "the instance stays bound");
+        assert_eq!(row.pending_ack, 0);
+        assert_eq!(row.ack_deadline_ns, 0);
+        assert_eq!(d.tx.len(), tx_before, "nothing re-queued a second time");
+        assert_eq!(d.roll_status.families_dormant(), 0);
+
+        // Silent from then on.
+        roll_health(&mut d, &status, &mut NullCapture, t1 + 10 * b).unwrap();
+        assert_eq!(d.roll_status.family_ack_timeouts(), 2);
+
+        // The next roll starts the count afresh.
+        let mut spec_2651 = parse_outcome_spec(
+            2651,
+            b"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77250|time:20260912-0700",
+        );
+        spec_2651.set_venue(Some(crate::family::OUT_VENUE));
+        perform_roll(
+            &mut d,
+            0,
+            &spec_2651,
+            false,
+            &mut etx,
+            mask,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
+        let row = *d.families().get(0).unwrap();
+        assert!(!row.dormant && !row.ack_retried);
+        assert_eq!(row.live.outcome, 2651);
+        assert_eq!(row.pending_ack, ROLL_ACK_ALL);
     }
 
     /// The FIRST connect takes the same path: a boot binding that
