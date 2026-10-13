@@ -15494,3 +15494,20 @@ reference legs, and orders on them stay unroutable (the O-HC17 shape).
   fixed it.
 - The file's own rule: a test is added only with the reason it is
   load-sensitive, never to hide a test that fails alone.
+
+### HK9 — three hot-path benches baselined (`crates/bench/baselines/hot_path.json`)
+
+- `vol/long_day_close_warm` (37 460 ns), `vol/long_state_copy_warm`
+  (2 490 ns) and `signer/hypercall_place_order` (19 950 ns) are now gated.
+  Before, they were measured and not baselined.
+- Method (D2's): each value is the median of three `make bench-check` runs
+  on the M4, with the engine running (load 9.4–11.3, under the 12 that
+  would have forced a re-run).
+- The eleven older samples were left as they are. All three runs passed
+  them within 15 %, and none moved on purpose (`book/apply_n8_middle`
+  −11.7 % and `strategy/latency_arb_on_tick_no_fire` −8.6 % are faster).
+- `bin15/late_fair_in_window` and `bin15/late_grid_mark_and_perp_1s` (BIN15
+  H90's) stay unbaselined for that lane. The second spread 1.6–2.3 ns
+  across runs.
+- **Gate:** `make bench-check` "OK: all 14 samples within 15 % of the
+  baseline".
