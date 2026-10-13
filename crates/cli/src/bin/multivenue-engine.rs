@@ -212,6 +212,47 @@ enum Cmd {
     /// the identities it checks are those its environment states. Exit 0
     /// PASS (the report on stdout), 1 refused (the reason on stderr).
     XmmPreflight(XmmPreflightArgs),
+    /// BIN15 H90 L4 (ruling O-H90-3): the late window's LIVE dust test on
+    /// the `out:BTC:15m` instance — at each `--offsets` second before its
+    /// expiry, buy the favourite leg at its ask, ⌈$1 / ask⌉ whole contracts,
+    /// IoC (`expiresAfter` 2 s); then the account's fills and the
+    /// settlement read back. $10 total per invocation (a constant). Mainnet
+    /// sends need `--confirm`; `--dry-run` signs nothing; `--network
+    /// testnet` rehearses on the smoke's account. Reads keys from the
+    /// environment and never opens `.env` — `scripts/bin15-late-dust.sh`
+    /// sources it. JSON lines on stdout.
+    HlOutcomeProbe(HlOutcomeProbeArgs),
+}
+
+/// `hl-outcome-probe --network`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ProbeNet {
+    /// Slot 3's account (`HYPERLIQUID_*`, `Scope::Live`).
+    Mainnet,
+    /// The smoke's account (`HYPERLIQUID_TESTNET_*`, `Scope::Testnet`).
+    Testnet,
+}
+
+#[derive(Debug, Parser)]
+struct HlOutcomeProbeArgs {
+    /// Which account and venue.
+    #[arg(long, value_enum, default_value = "mainnet")]
+    network: ProbeNet,
+    /// Seconds before expiry, a comma list, each 1 ..= 60.
+    #[arg(long, default_value = "25,15,8,3")]
+    offsets: String,
+    /// At most this many orders (1 ..= 8); the $10 total cap binds as well.
+    #[arg(long, default_value_t = 4)]
+    max_orders: u32,
+    /// Consecutive instances to probe (1 ..= 3).
+    #[arg(long, default_value_t = 1)]
+    instances: u32,
+    /// Read the account, the instance and the books; sign and send nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Required for a MAINNET run that sends.
+    #[arg(long)]
+    confirm: bool,
 }
 
 /// `hypercall-live` verbs.
@@ -1629,7 +1670,54 @@ fn main() -> ExitCode {
             init_tracing_stderr();
             xmm_preflight(args)
         }
+        Cmd::HlOutcomeProbe(args) => {
+            // JSON lines only on stdout.
+            init_tracing_stderr();
+            hl_outcome_probe(&args)
+        }
     }
+}
+
+/// BIN15 H90 L4: `hl-outcome-probe` — the statement checked, `--confirm`
+/// enforced for a mainnet send, then `cli::hl_outcome_probe::run`.
+fn hl_outcome_probe(args: &HlOutcomeProbeArgs) -> ExitCode {
+    use cli::hl_outcome_probe::{run, ProbeSpec, EXIT_REFUSED};
+    let scope = match args.network {
+        ProbeNet::Mainnet => exec_hyperliquid::Scope::Live,
+        ProbeNet::Testnet => exec_hyperliquid::Scope::Testnet,
+    };
+    let cfg = match exec_hyperliquid::HlConfig::from_env(scope) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hl-outcome-probe: the {scope:?} configuration: {e:?}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    let offsets_s = match ProbeSpec::parse_offsets(&args.offsets) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("hl-outcome-probe: {e}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    let mut spec = ProbeSpec {
+        offsets_s,
+        max_orders: args.max_orders,
+        instances: args.instances,
+        dry_run: args.dry_run,
+    };
+    if let Err(e) = spec.validate() {
+        eprintln!("hl-outcome-probe: {e}");
+        return ExitCode::from(EXIT_REFUSED);
+    }
+    if !cfg.is_testnet() && !spec.dry_run && !args.confirm {
+        eprintln!(
+            "hl-outcome-probe: a MAINNET send ({}) needs --confirm (or --dry-run to read only)",
+            cfg.host
+        );
+        return ExitCode::from(EXIT_REFUSED);
+    }
+    ExitCode::from(run(&cfg, TlsTransport::default_client_config(), &spec))
 }
 
 /// XMM XH5e: a `--strategy` the boot accepts (`STRATEGY_SET_NAMES`) whose

@@ -61,6 +61,9 @@ pub mod exec_boot;
 pub mod har_boot;
 /// HAR H3.7: the long-tenor state files, rendered and written off the engine thread.
 pub mod har_writer;
+/// BIN15 H90 L4: the late window's live dust test (`hl-outcome-probe`) —
+/// MAINNET, the operator's to run (ruling O-H90-3).
+pub mod hl_outcome_probe;
 /// HYPARB H5: `hyparb.toml` → the slot-0 member's params.
 pub mod hyparb_boot;
 pub mod hyparb_live;
