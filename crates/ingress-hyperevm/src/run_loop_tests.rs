@@ -638,3 +638,42 @@ fn a_snapshot_stalls_only_with_reads_out_and_no_answer() {
         "a clock behind progress is not a stall"
     );
 }
+
+/// HK2: a swap that arrives in the same read as the node's FIN is
+/// published before the session closes. Before, the EOF set `Closed`
+/// ahead of the state machine and the swap was dropped.
+#[test]
+fn a_frame_that_arrives_with_the_fin_is_published_then_the_session_closes() {
+    let ps = pools();
+    let ring = Ring::<Signal, CAP>::new();
+    let (mut prod, mut cons) = ring.split();
+    let mut r = to_await_head(&ps, &mut prod);
+    r.t.inject_incoming(&head_push(B));
+    r.step(&mut prod).unwrap();
+    to_live(&mut r, &ps, &mut prod, &[]);
+    let _ = drain(&mut cons);
+    r.t.inject_incoming(&swap_push([0x10; 20], B + 5, 0, false, 1));
+    r.t.mark_closed();
+    assert!(!r.step(&mut prod).unwrap());
+    assert!(!drain(&mut cons).is_empty(), "published before the close");
+    assert_eq!(r.d.state(), State::Closed);
+}
+
+/// HK2: a frame larger than rx fails the session at once
+/// (`core_net::incomplete_frame`). Before, the drain returned `Ok` on
+/// every poll and the session stalled until the idle timeout.
+#[test]
+fn a_frame_larger_than_rx_fails_the_session_instead_of_stalling() {
+    let ps = pools();
+    let ring = Ring::<Signal, CAP>::new();
+    let (mut prod, _cons) = ring.split();
+    let mut r = to_await_head(&ps, &mut prod);
+    let huge = (RX_BUF_SIZE as u64 + 4096).to_be_bytes();
+    let mut frame = vec![0u8; RX_BUF_SIZE + 512];
+    frame[0] = 0x81;
+    frame[1] = 127;
+    frame[2..10].copy_from_slice(&huge);
+    r.t.inject_incoming(&frame);
+    let e = r.step(&mut prod).unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+}

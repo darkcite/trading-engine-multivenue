@@ -35,6 +35,7 @@
 //! | ttl ends | XH4f (D9): an end while the TTL cancel is out — a plain `canceled` reads `EXPIRED`, the dead man's `scheduledCancel` keeps its reason |
 //! | outcome sweep | XH4i-1: on an outcome map an order of ours on a `#<enc>` leg is cancelled by cloid with `ASSET_BASE + enc` — another slot's and a stranger's on the same leg never — and the sweep reads clear; on a perps-only map it is unmapped and never cancelled |
 //! | outcome streams | XH4i-1: on an outcome map a `#<enc>` fill, `orderUpdates` row and open-order row carry `ASSET_BASE + enc`; on a perps-only map `ASSET_UNKNOWN`, as before |
+//! | fin | HK2: an answer that arrives in the same read as the socket's FIN is ACKed, not stranded; the gateway then redials |
 //!
 //! `Answer::Later` defers a post's answer without pausing the socket: the
 //! TTL races above see their stream rows while the cancel is still out.
@@ -921,6 +922,41 @@ fn a_dropped_socket_strands_its_posts_and_the_gateway_redials() {
     );
     assert!(eng.stats.io()[5] >= 1, "the reconnect is counted");
     assert!(gw.counters().conn_drops >= 1);
+}
+
+/// HK2: an answer that arrives in the same read as the socket's FIN is the
+/// stream's too: the post is ACKed, not stranded as unanswered, and the
+/// gateway then redials. Before, the EOF closed the connection before the
+/// frames in rx were parsed.
+#[test]
+fn an_answer_that_arrives_with_the_fin_is_delivered_before_the_close() {
+    let v = Venue::start();
+    let first = Arc::new(AtomicBool::new(true));
+    let f2 = Arc::clone(&first);
+    v.policy(move |s| {
+        if f2.swap(false, Ordering::SeqCst) {
+            Answer::ActionThenDrop(resting(items_in(&s.body), 500))
+        } else {
+            Answer::Action(resting(items_in(&s.body), 600))
+        }
+    });
+    let (mut gw, mut eng) = gateway(&v, 5_000_000_000);
+    let mut evs = Vec::new();
+    live(&mut gw, &mut eng, &mut evs);
+    assert!(eng.cmd.push(&alo(1)));
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, _| !v.posts().is_empty()));
+    // The answer and the FIN both land before the gateway reads again.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| count(e, EV_ACK)
+        + count(e, EV_UNANSWERED)
+        >= 1));
+    assert_eq!(count(&evs, EV_ACK), 1, "the answer behind the FIN is delivered");
+    assert_eq!(count(&evs, EV_UNANSWERED), 0);
+    assert!(
+        drive(&mut gw, &mut eng, &mut evs, 15, |g, e| g.ws_live()
+            && count(e, EV_GAP) >= 1),
+        "no redial, or no gap reported"
+    );
 }
 
 #[test]

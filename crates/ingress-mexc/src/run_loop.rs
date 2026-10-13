@@ -424,9 +424,6 @@ pub fn drive_one<T: Transport, C: Capture>(
 ) -> io::Result<bool> {
     flush_tx(transport, drv)?;
     let fill = core_net::fill_rx(transport, &mut drv.rx)?;
-    if fill == RxFill::Eof {
-        drv.state = State::Closed;
-    }
 
     match drv.state {
         State::Connecting => {}
@@ -446,6 +443,13 @@ pub fn drive_one<T: Transport, C: Capture>(
         State::Closed => {}
     }
 
+    // HK2: an EOF closes the session only now — the frames that arrived
+    // with the FIN were parsed above — and nothing is flushed to a peer
+    // that has closed.
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+        return Ok(false);
+    }
     flush_tx(transport, drv)?;
     Ok(fill == RxFill::Full)
 }
@@ -722,16 +726,8 @@ fn drain_ws_frames<C: Capture>(
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
         match read_result {
-            WsReadResult::Incomplete => {
-                // Oversize guard (fail-fast rather than livelock).
-                if drv.rx.free_mut().is_empty() && !drv.rx.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "ws frame exceeds rx buffer capacity",
-                    ));
-                }
-                return Ok(());
-            }
+            // Oversize guard (fail-fast rather than livelock).
+            WsReadResult::Incomplete => return core_net::incomplete_frame(&mut drv.rx),
             WsReadResult::Malformed => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -2818,6 +2814,24 @@ mod tests {
     }
 
     // ---- the healthy-session law, per slot (O-HC16) -------------------------
+
+    /// HK2: a push that arrives in the same read as the venue's FIN is
+    /// published before the session closes. Before, the EOF set `Closed`
+    /// ahead of the state machine and the push was dropped.
+    #[test]
+    fn a_frame_that_arrives_with_the_fin_is_published_then_the_session_closes() {
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = steady(MexcClass::Spot);
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+        let frame = enc::wrapper(enc::CHANNEL_BOOK, b"BTCUSDT", 315, &enc::book_body());
+        t.inject_incoming(&binary(&frame));
+        t.mark_closed();
+        assert!(!drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap());
+        assert!(cons.try_pop_ref().is_some(), "published before the close");
+        assert_eq!(status.ticks_total(), 1);
+        assert_eq!(d.state(), State::Closed);
+    }
 
     /// A slot's published ticks are ITS session's: counted per driver,
     /// cleared when the next session begins.

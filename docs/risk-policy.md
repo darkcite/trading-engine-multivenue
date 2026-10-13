@@ -3250,7 +3250,8 @@ pre-existing, each its own change: Binance (its 2 MiB options slot
 included), OKX, Polymarket, RPC and HyperEVM stall on a frame larger than
 rx until the idle timeout (Bybit, Deribit, Hyperliquid and MEXC fail fast
 on one); every `drive_one` marks `Closed` on EOF before parsing the
-complete frames that arrived with it; the multi-connection re-poll is
+complete frames that arrived with it (**both closed by HK2, 2026-10-13** —
+the EOF one for an EOF the read itself meets; see "HK2" at the end); the multi-connection re-poll is
 tested through the drain, not end to end (a `TestTransport` slot cannot
 finish a handshake inside `run_multi`); and the exec lane's user-WS fill
 (`exec-hyperliquid` `userws_conn`) reads only on a readiness event, the
@@ -10974,7 +10975,7 @@ its budget accounting is unchanged); `UserFill` gains `crossed`
 |---|---|
 | a status per item, each one its item's kind can have | `resting`/`filled`/`success` → ACK; `error` → REJECTED with the venue's reason |
 | `status: err` (the exchange refused the action) | REJECTED, every item — unless the post is a re-send |
-| deadline passed (5 s); an answer that does not scan, miscounts its items or answers an item with a status its kind cannot have; a post stranded on a socket that died or was retired | UNANSWERED |
+| deadline passed (5 s); an answer that does not scan, miscounts its items or answers an item with a status its kind cannot have; a post stranded on a socket that died or was retired (an answer read whole before the socket's close is delivered first, since HK2) | UNANSWERED |
 | a WebSocket `"type":"error"` answer (the venue's API layer, not the exchange) | UNANSWERED, the message's reason carried |
 | REST: 2xx → as above; 429 on a first send → REJECTED (rate limit); any other status, or a 429 on a re-send → UNANSWERED; a failure before the request left the host → REJECTED (transport), unless a re-send | |
 | a WebSocket write that died → the SAME signed bytes re-sent by REST (the mask XORs back, never re-signed); **only a per-item answer settles a re-send — any refusal of it is UNANSWERED** | |
@@ -14978,3 +14979,79 @@ its entry says so.
   - copy-audit hits 28, new 0;
   - license-check OK;
   - fuzz `hl_ws_frame` 60 s clean (2.05 M runs).
+
+### HK2 — the drain's two gaps (`core-net`, the ten ingress crates, `exec-hyperliquid` `gwconn`)
+
+**This entry changes an order path:** a post's answer that is read whole
+before its socket's close is now ACK or REJECT, where it used to be
+stranded UNANSWERED (`REASON_TRANSPORT`). No cap, halt or refusal changes.
+
+- **One oversize guard.** `core_net::incomplete_frame` is called on every
+  `WsReadResult::Incomplete` by all ten ingress drains. If rx is full after
+  the compaction `free_mut` performs, the partial frame can never complete,
+  and the session fails with `InvalidData` (`Error::from(kind)`, which
+  allocates nothing).
+  - HL, Bybit, MEXC, Deribit and Hypercall lose their private copies.
+  - Binance, OKX, Polymarket, RPC and HyperEVM used to return `Ok` and stall
+    until the idle timeout; they now fail fast too (the I-3 "Left open"
+    item above).
+  - Margins: Binance frames < 1 KiB against 64 KiB (the eapi slot 2 MiB
+    against a ~246 KB chain); OKX ≈ 600 KiB `opt-summary` against 4 MiB;
+    RPC `newHeads` < 2 KiB; HyperEVM ≈ 1 KiB pushes against 256 KiB.
+    **Polymarket's book frames are unmeasured against 64 KiB.** A frame
+    past it was already a dead session (the re-snapshot stalled again), so
+    fail-fast turns it into a logged reconnect. Measuring the largest PM
+    frame from a capture is a follow-up.
+- **A read-detected EOF closes after the parse.** Every ingress `drive_one`
+  set `State::Closed` on `RxFill::Eof` before its state machine ran, which
+  dropped the frames that arrived in the same read as the FIN. Now the state
+  machine runs first, and then the EOF closes the session. On EOF the final
+  `flush_tx` is skipped: nothing goes to a closed peer, and the reconnect
+  redoes pongs, subscribes and reads. A Close frame that arrives with the
+  FIN is now parsed, so HL records `peer-close` with its code where it said
+  `peer-eof`.
+- **`gwconn` reads to the close.** When the TLS pump met the peer's close,
+  `on_event` returned `Closed` while decrypted plaintext sat unread in
+  rustls, and every post's answer in it was lost. Now:
+  - `on_event` notes `peer_closed`;
+  - `service` reads the buffered bytes. A FIN without `close_notify` (rustls'
+    `UnexpectedEof`) is an end, not a fault: every byte before it is
+    authentic (the BX5 reading);
+  - `service` hands their frames on, then reports `Closed`;
+  - on that closing path no pong is written and the socket never turns
+    Ready.
+  - Safe by construction:
+    - post ids are gateway-wide and monotonic;
+    - fills dedupe on the `tids` ring, so a fill delivered before the close
+      is not re-booked from the reconnect's snapshot;
+    - `conn_down` strands only what is still out, after `service` returns;
+    - an answer is a whole length-prefixed frame inside authenticated
+      records, so E-5 holds.
+- **Residuals (recorded, not changed):**
+  - For TLS ingress the pump usually meets the FIN first: `drive_tls` reads
+    the socket to EOF on each readiness event and
+    `note_transport_ready(Closed)` closes before `drive_one` runs. So the
+    ingress half covers the FINs met in `read`'s pull-through (after a
+    16 KiB rustls wave). The loss is market data, re-snapshotted on
+    reconnect.
+  - `userws_conn` (the blocking arm's `userFills` stream) still stops at
+    the pump's `Closed`. The venue re-sends a `userFills` snapshot on
+    resubscribe, and fills dedupe by `tid`.
+- **Tests (red on the old code, checked on Binance and on `gwconn`):**
+  - every ingress crate's
+    `a_frame_that_arrives_with_the_fin_is_published_then_the_session_closes`;
+  - `a_frame_larger_than_rx_fails_the_session_instead_of_stalling` for the
+    five stalling crates, Bybit and Hypercall;
+  - core-net's two guard tests;
+  - the gateway loopback
+    `an_answer_that_arrives_with_the_fin_is_delivered_before_the_close`
+    (the test venue's `Answer::ActionThenDrop`).
+- **Reviews:**
+  - risk: NEEDS-DOCS (these records). Its nits were acted on: no pong on
+    the closing path, and no Ready on a closed socket.
+  - alloc: PASS. Its nit was acted on: `Error::from(kind)`.
+  - zero-copy: PASS. No new copy site; the guard's compaction is the copy
+    the next `fill_rx` paid before, one step earlier.
+- **Gates:** clippy clean; nextest 4 623 passed (10 skipped); alloc 126/126
+  at 0 B/op (a fresh `Compiling bench`); copy-audit hits 28, new 0;
+  license-check OK; `cargo +nightly fuzz build` OK.

@@ -415,9 +415,6 @@ pub fn drive_one<T: Transport, C: Capture, const CAP: usize>(
 ) -> io::Result<bool> {
     flush_tx(transport, drv)?;
     let fill = core_net::fill_rx(transport, &mut drv.rx)?;
-    if fill == RxFill::Eof {
-        drv.state = State::Closed;
-    }
 
     match drv.state {
         State::Connecting | State::Closed => {}
@@ -444,6 +441,13 @@ pub fn drive_one<T: Transport, C: Capture, const CAP: usize>(
         }
     }
 
+    // HK2: an EOF closes the session only now — the frames that arrived
+    // with the FIN were parsed above — and nothing is flushed to a peer
+    // that has closed.
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+        return Ok(false);
+    }
     flush_tx(transport, drv)?;
     Ok(fill == RxFill::Full)
 }
@@ -836,7 +840,7 @@ fn drain_ws_frames<C: Capture, const CAP: usize>(
 ) -> io::Result<()> {
     loop {
         match ws_read_frame(drv.rx.filled()) {
-            WsReadResult::Incomplete => return Ok(()),
+            WsReadResult::Incomplete => return core_net::incomplete_frame(&mut drv.rx),
             WsReadResult::Malformed => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,

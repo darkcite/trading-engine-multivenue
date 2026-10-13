@@ -200,7 +200,12 @@ in the script; `ai` = 48 is the floor every name includes).
   on the M4. The I-3 drain loops (risk-policy "The I-3 drain loops read
   past a full rx") share `core_net::drain`: a step whose read filled rx is
   driven again, as one that published or moved its state; at most 8 steps
-  per connection per poll, then a poll that does not sleep. Batch
+  per connection per poll, then a poll that does not sleep. Since HK2
+  (2026-10-13) all ten drains share one oversize guard
+  (`core_net::incomplete_frame`: a frame larger than rx fails the session),
+  a `drive_one` parses what arrived with an EOF its read met before it
+  closes, and the HL order gateway reads a closing socket's last answers
+  (risk-policy "HK2"). Batch
   subscribes render straight into tx (2026-09-26, risk-policy "Batch
   subscribes render straight into tx"): `core_net::queue_masked_text_frame_rendered`
   counts the payload, writes the header, renders behind it and masks in

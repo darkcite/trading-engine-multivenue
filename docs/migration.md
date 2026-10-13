@@ -6,6 +6,29 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-13 — Ingress: oversize frames fail fast everywhere; frames before a FIN are parsed; the HL gateway reads to the close (HK2)
+
+**What changed**
+- **Oversize frames.** Binance, OKX, Polymarket, RPC and HyperEVM now end
+  a session whose next frame is larger than rx with `InvalidData`, as HL,
+  Bybit, MEXC, Deribit and Hypercall already did. Before, they idled until
+  the idle timeout.
+- **Frames before a FIN.** Every ingress `drive_one` parses the frames
+  that arrived with an EOF its own read met, then closes. HL's session-end
+  log can now say `peer-close` (with the code) where it said `peer-eof`,
+  when the Close frame rides in with the FIN.
+- **The HL WebSocket order gateway.** It reads a closing socket's last
+  bytes before it drops the socket. A post answered just before a drop is
+  ACKed or REJECTed instead of UNANSWERED (`REASON_TRANSPORT`).
+
+**Impact**
+- Metrics: on socket drops, the gateway's UNANSWERED events fall. A
+  venue's oversize frame shows as a reconnect with `io_kind`
+  `invalid-data`, not as an idle timeout.
+
+**Migration steps**
+1. None: the routine restart of a binary built from this change.
+
 ## 2026-10-13 — HL ingress: `engine_ingress_hyperliquid_unsub_acks_total`; the roll's second ack strike (HK1)
 
 **What changed**

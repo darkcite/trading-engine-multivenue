@@ -385,9 +385,6 @@ pub fn drive_one<T: Transport, C: Capture>(
 
     // 2. Read whatever plaintext the transport has for us.
     let fill = core_net::fill_rx(transport, &mut drv.rx)?;
-    if fill == RxFill::Eof {
-        drv.state = State::Closed;
-    }
 
     // 3. Advance the state machine.
     match drv.state {
@@ -408,6 +405,14 @@ pub fn drive_one<T: Transport, C: Capture>(
             drain_ws_frames(drv, producer, symbol_map, status, capture)?;
         }
         State::Closed => {}
+    }
+
+    // HK2: an EOF closes the session only now — the frames that arrived
+    // with the FIN were parsed above — and nothing is flushed to a peer
+    // that has closed.
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+        return Ok(false);
     }
 
     // 4. Push any bytes the state machine produced (handshake, pong,
@@ -562,7 +567,7 @@ fn drain_ws_frames<C: Capture>(
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
         match read_result {
-            WsReadResult::Incomplete => return Ok(()),
+            WsReadResult::Incomplete => return core_net::incomplete_frame(&mut drv.rx),
             WsReadResult::Malformed => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1165,6 +1170,51 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// HK2: a push that arrives in the same read as the venue's FIN is
+    /// published before the session closes. Before, the EOF set `Closed`
+    /// ahead of the state machine and the push was dropped.
+    #[test]
+    fn a_frame_that_arrives_with_the_fin_is_published_then_the_session_closes() {
+        let mut t = TestTransport::with_capacity(16 * 1024);
+        let mut d = build_driver_with_seed(7);
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let map = SymbolMap::from_pairs(std::iter::once((b"0xABC".to_vec(), 42u32)));
+        let status = IngressStatus::new();
+        let book = br#"[{"market":"0x60c2","asset_id":"0xABC","timestamp":"1713000000000","hash":"h","bids":[{"price":"0.517","size":"200.0"},{"price":"0.518","size":"100.0"}],"asks":[{"price":"0.521","size":"150.0"},{"price":"0.520","size":"50.0"}],"event_type":"book"}]"#;
+        inject_unmasked_text(&mut t, book);
+        t.mark_closed();
+        let full = drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture)
+            .unwrap();
+        assert!(!full);
+        assert_eq!(cons.try_pop_ref().map(|t| t.sym), Some(42), "published before the close");
+        assert_eq!(d.state(), State::Closed);
+    }
+
+    /// HK2: a frame larger than rx fails the session at once
+    /// (`core_net::incomplete_frame`). Before, the drain returned `Ok` on
+    /// every poll and the session stalled until the idle timeout.
+    #[test]
+    fn a_frame_larger_than_rx_fails_the_session_instead_of_stalling() {
+        let mut t = TestTransport::with_capacity(RX_BUF_SIZE + 1024);
+        let mut d = build_driver_with_seed(7);
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let map = SymbolMap::from_pairs(std::iter::once((b"0xABC".to_vec(), 42u32)));
+        let status = IngressStatus::new();
+        let huge = (RX_BUF_SIZE as u64 + 4096).to_be_bytes();
+        let mut frame = vec![0u8; RX_BUF_SIZE + 512];
+        frame[0] = 0x81;
+        frame[1] = 127;
+        frame[2..10].copy_from_slice(&huge);
+        t.inject_incoming(&frame);
+        let e = drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture)
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

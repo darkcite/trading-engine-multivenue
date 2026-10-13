@@ -293,9 +293,6 @@ pub fn drive_one<T: Transport, C: Capture>(
 ) -> io::Result<bool> {
     flush_tx(transport, drv)?;
     let fill = core_net::fill_rx(transport, &mut drv.rx)?;
-    if fill == RxFill::Eof {
-        drv.state = State::Closed;
-    }
 
     match drv.state {
         State::Connecting => {}
@@ -315,6 +312,13 @@ pub fn drive_one<T: Transport, C: Capture>(
         State::Closed => {}
     }
 
+    // HK2: an EOF closes the session only now — the frames that arrived
+    // with the FIN were parsed above — and nothing is flushed to a peer
+    // that has closed.
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+        return Ok(false);
+    }
     flush_tx(transport, drv)?;
     Ok(fill == RxFill::Full)
 }
@@ -486,16 +490,8 @@ fn drain_ws_frames<C: Capture>(
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
         match read_result {
-            WsReadResult::Incomplete => {
-                // Oversize guard (fail-fast rather than livelock).
-                if drv.rx.free_mut().is_empty() && !drv.rx.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "ws frame exceeds rx buffer capacity",
-                    ));
-                }
-                return Ok(());
-            }
+            // Oversize guard (fail-fast rather than livelock).
+            WsReadResult::Incomplete => return core_net::incomplete_frame(&mut drv.rx),
             WsReadResult::Malformed => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1350,6 +1346,44 @@ mod tests {
         assert!(memchr::memmem::find(&body, b"\"op\":\"subscribe\"").is_some());
         assert!(memchr::memmem::find(&body, b"\"orderbook.1.BTCUSDT\"").is_some());
         assert!(memchr::memmem::find(&body, b"\"tickers.ETHUSDT\"").is_some());
+    }
+
+    /// HK2: a push that arrives in the same read as the venue's FIN is
+    /// published before the session closes. Before, the EOF set `Closed`
+    /// ahead of the state machine and the push was dropped.
+    #[test]
+    fn a_frame_that_arrives_with_the_fin_is_published_then_the_session_closes() {
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+        let snap = br#"{"topic":"orderbook.1.BTCUSDT","type":"snapshot","ts":1,"data":{"s":"BTCUSDT","b":[["50005.12","1.5"]],"a":[["50006.34","2.0"]],"u":100,"seq":1}}"#;
+        t.inject_incoming(&ws_text_frame(snap));
+        t.mark_closed();
+        let full = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture)
+            .unwrap();
+        assert!(!full);
+        assert_eq!(cons.try_pop_ref().map(|t| t.sym), Some(SYM_BTC), "published before the close");
+        assert_eq!(d.state(), State::Closed);
+    }
+
+    /// HK2: the oversize guard, now the shared `core_net::incomplete_frame`:
+    /// a frame larger than rx fails the session at once.
+    #[test]
+    fn a_frame_larger_than_rx_fails_the_session_instead_of_stalling() {
+        let mut t = TestTransport::with_capacity(RX_BUF_SIZE + 1024);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let huge = (RX_BUF_SIZE as u64 + 4096).to_be_bytes();
+        let mut frame = vec![0u8; RX_BUF_SIZE + 512];
+        frame[0] = 0x81;
+        frame[1] = 127;
+        frame[2..10].copy_from_slice(&huge);
+        t.inject_incoming(&frame);
+        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture)
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
     /// I-3: a burst of non-tick frames past a full rx no longer strands
