@@ -6,6 +6,35 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-13 — A failed boot removes its empty `run-<epoch_ns>/` capture directory (HK6)
+
+**What changed**
+- The engine creates `<MULTIVENUE_LOG_DIR>/run-<epoch_ns>/` before boot
+  discovery. A boot that failed before its engine loop used to leave the
+  directory behind empty (one per failed launchd relaunch). It now removes
+  it again with `remove_dir`, which refuses a directory holding anything:
+  - a boot that fails before its manifests are written (boot discovery,
+    the `--halt-slot` / exec / Binance-arm refusals) leaves no directory;
+  - a boot that fails later keeps its directory, with
+    `instrument-manifest.tsv` and any capture, as before;
+  - a boot that reaches its engine loop keeps its directory.
+- Logs: `capture: the failed boot's empty run directory removed`, or
+  `… run directory kept` (with the `io` error kind) at `info`, or `… could
+  not be removed` at `warn` for any error other than not-empty or
+  not-found.
+
+**Impact**
+- Capture tooling (`capture-catalog`, `audit-pnl`, `backtest`, `archive`,
+  `retention`) sees fewer empty `run-*` directories. None depends on one:
+  `archive` passes an empty run over, and `retention` already `rmdir`s one
+  it reaches.
+- The empty directories already on disk stay until removed by hand
+  (`find ~/multivenue/logs -maxdepth 1 -type d -name 'run-*' -empty`
+  lists them).
+
+**Migration steps**
+1. None: the routine restart of a binary built from this change.
+
 ## 2026-10-13 — Ingress: oversize frames fail fast everywhere; frames before a FIN are parsed; the HL gateway reads to the close (HK2)
 
 **What changed**

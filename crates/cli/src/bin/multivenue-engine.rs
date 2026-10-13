@@ -3803,6 +3803,9 @@ fn run(args: RunArgs) -> ExitCode {
         }
     };
     info!(dir = %run_dir.display(), "capture: run directory");
+    // HK6: a boot that fails before the engine loop removes the directory
+    // again if it is still empty (`remove_dir`, never `remove_dir_all`).
+    let mut run_dir_guard = cli::RunDirGuard::new(&run_dir);
 
     // -- Phase-8e boot REST discovery (plan §6.1) --
     // Runs BEFORE any ingress thread spawns: validates every
@@ -5382,6 +5385,8 @@ fn run(args: RunArgs) -> ExitCode {
     };
 
     // -- Main thread: real engine loop until SIGINT --
+    // HK6: the captures are open — the run directory stays from here on.
+    run_dir_guard.commit();
     let cons = Consumers {
         tick_lanes: [
             pm_lane_cons,

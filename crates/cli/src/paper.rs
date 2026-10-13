@@ -527,6 +527,73 @@ pub fn new_capture_run_dir(log_dir: &str) -> io::Result<(PathBuf, u64)> {
     Ok((dir, epoch_ns))
 }
 
+/// HK6: the capture run directory's boot guard.
+///
+/// [`new_capture_run_dir`] creates `run-<ns>` before boot discovery, so a
+/// boot that dies there (a venue's REST down, a bad config row) used to
+/// leave an empty directory behind — one per failed launchd relaunch. The
+/// boot holds this guard from the directory's creation and [`commit`]s it
+/// once its captures are open, before the engine loop; a guard dropped
+/// uncommitted (every `return ExitCode` of the failing boot) removes the
+/// directory with [`std::fs::remove_dir`], which refuses a directory
+/// holding anything — so it only ever removes an EMPTY one (a boot that
+/// failed before its manifests were written) and never deletes capture.
+///
+/// [`commit`]: RunDirGuard::commit
+#[must_use = "a guard dropped at once removes the directory"]
+pub struct RunDirGuard<'a> {
+    dir: &'a Path,
+    committed: bool,
+}
+
+impl<'a> RunDirGuard<'a> {
+    /// Guard `dir`, uncommitted.
+    pub const fn new(dir: &'a Path) -> Self {
+        Self {
+            dir,
+            committed: false,
+        }
+    }
+
+    /// The boot reached its engine loop: the directory stays.
+    pub fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for RunDirGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        match std::fs::remove_dir(self.dir) {
+            Ok(()) => tracing::info!(
+                dir = %self.dir.display(),
+                "capture: the failed boot's empty run directory removed"
+            ),
+            // Not empty (the boot wrote its manifests or opened a capture
+            // before it failed) or already gone: kept as it is.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::NotFound
+                ) =>
+            {
+                tracing::info!(
+                    dir = %self.dir.display(),
+                    error = ?e.kind(),
+                    "capture: the failed boot's run directory kept"
+                );
+            }
+            Err(e) => tracing::warn!(
+                dir = %self.dir.display(),
+                error = ?e,
+                "capture: the failed boot's run directory could not be removed"
+            ),
+        }
+    }
+}
+
 // ---------------------------------------------------------------
 // Ring + Producer/Consumer alias bundles
 // ---------------------------------------------------------------
@@ -12477,6 +12544,56 @@ pub mod boot_discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh directory under the system temp dir, unique per test.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let (dir, _) = new_capture_run_dir(
+            std::env::temp_dir()
+                .join(format!("hk6-{tag}-{}", std::process::id()))
+                .to_str()
+                .expect("utf-8 temp dir"),
+        )
+        .expect("run dir");
+        dir
+    }
+
+    /// HK6: a boot that fails before its engine loop leaves no empty
+    /// `run-<ns>` behind.
+    #[test]
+    fn an_uncommitted_guard_removes_its_empty_run_dir() {
+        let dir = scratch_dir("empty");
+        assert!(dir.is_dir());
+        drop(RunDirGuard::new(&dir));
+        assert!(!dir.exists(), "the failed boot's empty dir is gone");
+        let _ = std::fs::remove_dir(dir.parent().expect("parent"));
+    }
+
+    /// HK6: `remove_dir` only — a directory holding capture is never
+    /// deleted, committed or not.
+    #[test]
+    fn an_uncommitted_guard_keeps_a_run_dir_that_holds_capture() {
+        let dir = scratch_dir("full");
+        let file = dir.join("bn-ticks.pmlr");
+        std::fs::write(&file, b"capture").expect("write");
+        drop(RunDirGuard::new(&dir));
+        assert!(file.is_file(), "capture is never deleted");
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&dir);
+        let _ = std::fs::remove_dir(dir.parent().expect("parent"));
+    }
+
+    /// HK6: a boot that reached its engine loop keeps its directory, even
+    /// an empty one.
+    #[test]
+    fn a_committed_guard_keeps_its_run_dir() {
+        let dir = scratch_dir("committed");
+        let mut g = RunDirGuard::new(&dir);
+        g.commit();
+        drop(g);
+        assert!(dir.is_dir(), "committed: kept");
+        let _ = std::fs::remove_dir(&dir);
+        let _ = std::fs::remove_dir(dir.parent().expect("parent"));
+    }
 
     /// BX0-F1: the markPrice slot dials fstream's ROUTED `/market`
     /// path — the legacy `/ws/` form answers 101 and then stays silent

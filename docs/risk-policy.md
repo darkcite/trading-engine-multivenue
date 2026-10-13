@@ -15246,3 +15246,65 @@ Two test files. No shipped code changes.
   - license-check OK.
   - Alloc was not re-run: the cut adds tests only, and no library code
     the alloc suite links changed.
+
+### HK6 — a failed boot leaves no empty capture directory (`cli`)
+
+- **The defect.**
+  - `new_capture_run_dir` creates `run-<epoch_ns>` before boot discovery,
+    so a boot that died there left the directory empty.
+  - Under launchd's relaunch that is one directory per failed boot: 40 of
+    the 55 in `~/multivenue/logs` between 10-11 and 10-13 came from the
+    Bybit edge loop.
+- **The fix: `cli::RunDirGuard`.**
+  - `run` creates the guard right after the directory and `commit`s it
+    once the fills, orders and events captures are open, before the
+    engine loop. About thirty member-boot refusals run after the commit;
+    by then the directory holds the manifest and those captures, so it
+    would be kept anyway.
+  - Every failing boot returns an `ExitCode` from `run`, so the
+    uncommitted guard drops and calls `std::fs::remove_dir`.
+  - `remove_dir` refuses a directory holding anything. The guard therefore
+    removes an EMPTY directory only and never deletes capture.
+  - What it removes: the directory of a boot that failed before the
+    instrument manifest was written. That covers boot discovery (the
+    Bybit loop's case) and the `--halt-slot`, exec and Binance-arm
+    refusals.
+  - What it keeps: a boot that failed after the manifest was written (the
+    DNS, endpoint, gateway-network and observability refusals, and
+    later) keeps its directory with the manifest, as before.
+  - It deletes no data, so S-DOCTRINE is unaffected (A-HK-4).
+  - `#[must_use]`: a guard dropped at once would remove the directory.
+- **Not covered:**
+  - a boot that dies by `panic = "abort"`;
+  - a boot killed by `SIGKILL` (SIGINT and SIGTERM are handled, and the
+    boot runs on to a `return`);
+  - a boot whose `join_reverse` hangs until the join watchdog's
+    `process::exit`.
+
+  None of these unwinds, so their empty directory stays, as before.
+- **Tests (`paper.rs`):**
+  - `an_uncommitted_guard_removes_its_empty_run_dir`;
+  - `an_uncommitted_guard_keeps_a_run_dir_that_holds_capture`;
+  - `a_committed_guard_keeps_its_run_dir`.
+- **The empty directories already on disk are the operator's to remove.**
+  `migration.md` "HK6" has the listing command; the session deletes
+  nothing there.
+- **Review:** one combined pass. Risk, alloc and zero-copy: PASS. All 49
+  exits between the guard and the commit are `return ExitCode`. Every
+  capture opens on the main thread, so no thread races the removal. Docs:
+  NEEDS-DOCS, acted on:
+  - the manifests' reach stated (above);
+  - `migration.md`'s tooling line corrected;
+  - `retention.sh`'s comment updated;
+  - `warn` for an unexpected removal error;
+  - `#[must_use]`;
+  - "SIGKILL", not "a signal".
+- **Gates:**
+  - clippy clean;
+  - nextest 4 636 passed (10 skipped; `amm_walk_and_arb_solve_are_zero_alloc`
+    flagged leaky by nextest, which is not a failure), then cli 612 passed
+    after the review's edits;
+  - alloc 127/127 (the bench crate links no `cli` code, so its build was
+    unchanged);
+  - copy-audit new 0 (neither file is in its reading);
+  - license-check OK.

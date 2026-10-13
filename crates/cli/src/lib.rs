@@ -108,7 +108,7 @@ pub use paper::{
     BybitConnSpec, CaptureGaugeIds, CaptureMetrics, Consumers, EngineConfig, EngineCounters,
     EngineLoopResult, EngineLoopStats, ExecObs, HcMetricIds, HypercallSpec, IngressCounterIds,
     IngressStatusSet, LatencyDump, LiveDispatcher, LiveDispatcherErr, MexcConnSpec, Observability,
-    RawTapConfig, Rings, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
+    RawTapConfig, Rings, RunDirGuard, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
 };
 pub use pinning::{pin_current_thread_to_core, PinError};
 pub use sigint::{install_sigint_handler, shutdown_requested, SHUTDOWN};
