@@ -103,6 +103,17 @@ pub const MIN_BUDGET_LEFT: i64 = 50;
 pub const AGENT_MARGIN_MS: u64 = 3_600_000;
 /// The probe's client-id prefix: NOT the engine's `MV` magic.
 pub const PROBE_MAGIC: [u8; 4] = *b"H90D";
+/// The book names the favourite only when its two legs' levels differ by at
+/// least this, x1e8 (0.10). A late book is often empty but for one wide
+/// quote mirrored on both legs (`0.0021 / 0.9979`, measured on mainnet
+/// 2026-10-13), and its mids then say nothing.
+pub const BOOK_LEAN_1E8: i64 = 10_000_000;
+/// With a level book, the underlying's mid must stand this far from the
+/// strike, bps, before its side is the favourite — nearer is too close to
+/// call with most of the settlement minute observed but unknown here.
+pub const PRICE_MARGIN_BPS: i64 = 10;
+/// The underlying whose mid decides a level book (the family's).
+const UNDERLYING: &str = "BTC";
 /// PASS: every order answered, nothing rested, nothing in doubt.
 pub const EXIT_PASS: u8 = 0;
 /// FAIL: an answer in doubt, an IoC that rested, or no order sent.
@@ -233,18 +244,56 @@ pub const fn contracts_for(px_1e8: i64) -> i64 {
     (E8 + px_1e8 - 1) / px_1e8
 }
 
+/// The favourite by the underlying against the strike: `Some(true)` Yes
+/// when the mid stands at least [`PRICE_MARGIN_BPS`] above it, `Some(false)`
+/// No when as far below, `None` nearer — too close to call.
+#[must_use]
+pub const fn side_by_price(mid_1e8: i64, strike_1e8: i64) -> Option<bool> {
+    if mid_1e8 <= 0 || strike_1e8 <= 0 {
+        return None;
+    }
+    let gap = (mid_1e8 - strike_1e8) as i128 * 10_000;
+    let margin = strike_1e8 as i128 * PRICE_MARGIN_BPS as i128;
+    if gap >= margin {
+        Some(true)
+    } else if -gap >= margin {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// The order an offset places on the books it read, under the run's caps:
 /// `spent_1e8` already left the process in `placed` orders.
+///
+/// The favourite is the leg the BOOK leans to when its two legs' levels
+/// differ by at least [`BOOK_LEAN_1E8`]; a level book (one wide quote
+/// mirrored on both legs) defers to `by_price` ([`side_by_price`]).
 #[must_use]
-pub fn plan(yes: Touch, no: Touch, spent_1e8: i64, placed: u32, max_orders: u32) -> Plan {
+pub fn plan(
+    yes: Touch,
+    no: Touch,
+    by_price: Option<bool>,
+    spent_1e8: i64,
+    placed: u32,
+    max_orders: u32,
+) -> Plan {
     if placed >= max_orders {
         return Plan::Skip("the run's order count is spent");
     }
     let (ly, ln) = (yes.level_1e8(), no.level_1e8());
-    if ly == ln {
-        return Plan::Skip("no favourite: both legs trade at one level");
-    }
-    let is_yes = ly > ln;
+    let is_yes = if (ly - ln).abs() >= BOOK_LEAN_1E8 {
+        ly > ln
+    } else {
+        match by_price {
+            Some(y) => y,
+            None => {
+                return Plan::Skip(
+                    "no favourite: the book is level and the price is too close to the strike",
+                )
+            }
+        }
+    };
     let fav = if is_yes { yes } else { no };
     if fav.ask_1e8 <= 0 {
         return Plan::Skip("the favourite has no ask");
@@ -318,6 +367,16 @@ pub fn dec_1e8(s: &[u8]) -> Option<i64> {
     }
     let v = int.checked_mul(E8)?.checked_add(frac)?;
     Some(if neg { -v } else { v })
+}
+
+/// `"<coin>":"<decimal>"` out of an `allMids` answer, x1e8.
+#[must_use]
+pub fn mid_of(body: &[u8], coin: &str) -> Option<i64> {
+    let key = format!("\"{coin}\":\"");
+    let k = key.as_bytes();
+    let at = body.windows(k.len()).position(|w| w == k)? + k.len();
+    let end = body[at..].iter().position(|&c| c == b'"')? + at;
+    dec_1e8(&body[at..end])
 }
 
 /// ×1e8 as a plain decimal (`97120000` → `"0.9712"`).
@@ -531,6 +590,12 @@ impl Venue {
             ask_sz_1e8: f.best_ask_sz_1e6 * 100,
             time_ms: f.ts_ns / 1_000_000,
         })
+    }
+
+    /// The underlying perp's mid x1e8, from `allMids`.
+    fn mid(&mut self, coin: &str) -> Result<i64, String> {
+        let b = self.read(br#"{"type":"allMids"}"#)?;
+        mid_of(&b, coin).ok_or_else(|| format!("allMids: no mid for {coin}"))
     }
 
     /// The `out:BTC:15m` instance the engine's boot binding would adopt now.
@@ -891,7 +956,17 @@ pub fn run(cfg: &HlConfig, tls: Arc<ClientConfig>, spec: &ProbeSpec) -> u8 {
                 fmt_1e8(no.ask_sz_1e8),
                 t_books.saturating_sub(no.time_ms),
             );
-            let (is_yes, px, sz) = match plan(yes, no, t.spent_1e8, t.sent, spec.max_orders) {
+            // A level book defers to the underlying against the strike: one
+            // more read, after the books, so the books stay the freshest.
+            let mid = v.mid(UNDERLYING).unwrap_or(0);
+            let by_price = side_by_price(mid, inst.strike_1e6 * 100);
+            let _ = write!(
+                line,
+                r#","mid":"{}","by_price":{}"#,
+                fmt_1e8(mid),
+                by_price.map_or("null", |y| if y { "\"yes\"" } else { "\"no\"" })
+            );
+            let (is_yes, px, sz) = match plan(yes, no, by_price, t.spent_1e8, t.sent, spec.max_orders) {
                 Plan::Skip(why) => {
                     println!(r#"{line},"kind":"skip","why":"{why}"}}"#);
                     continue;
@@ -1083,7 +1158,7 @@ mod tests {
         assert_eq!(contracts_for(E8), 1);
         assert_eq!(contracts_for(0), 0);
         // The favourite is the leg with the higher mid; No here.
-        let p = plan(touch(2_000_000, 3_000_000, 50), touch(97_000_000, 98_000_000, 50), 0, 0, 4);
+        let p = plan(touch(2_000_000, 3_000_000, 50), touch(97_000_000, 98_000_000, 50), None, 0, 0, 4);
         assert_eq!(
             p,
             Plan::Buy {
@@ -1103,7 +1178,7 @@ mod tests {
     fn the_plan_refuses_what_the_test_must_not_send() {
         let yes = touch(96_000_000, 97_000_000, 50);
         let no = touch(3_000_000, 4_000_000, 50);
-        assert!(matches!(plan(yes, no, 0, 0, 4), Plan::Buy { yes: true, .. }));
+        assert!(matches!(plan(yes, no, None, 0, 0, 4), Plan::Buy { yes: true, .. }));
         let cases: [(Touch, Touch, i64, u32, &str); 7] = [
             (yes, no, 0, 4, "order count"),
             (yes, yes, 0, 0, "no favourite"),
@@ -1114,14 +1189,14 @@ mod tests {
             (yes, no, 9 * E8, 0, "$10 total cap"),
         ];
         for (y, n, spent, placed, want) in cases {
-            match plan(y, n, spent, placed, 4) {
+            match plan(y, n, None, spent, placed, 4) {
                 Plan::Skip(why) => assert!(why.contains(want), "{want}: {why}"),
                 p @ Plan::Buy { .. } => panic!("{want}: planned {p:?}"),
             }
         }
         // Off the tick is refused, never rounded.
         let off = touch(96_000_000, 97_005_000, 50);
-        assert!(matches!(plan(off, no, 0, 0, 4), Plan::Skip(w) if w.contains("rules")));
+        assert!(matches!(plan(off, no, None, 0, 0, 4), Plan::Skip(w) if w.contains("rules")));
     }
 
     #[test]
@@ -1131,13 +1206,13 @@ mod tests {
         let no = touch(3_000_000, 4_000_000, 50);
         let mut spent = 0i64;
         let mut placed = 0u32;
-        while let Plan::Buy { px_1e8, sz_1e8, .. } = plan(yes, no, spent, placed, MAX_ORDERS) {
+        while let Plan::Buy { px_1e8, sz_1e8, .. } = plan(yes, no, None, spent, placed, MAX_ORDERS) {
             spent += px_1e8 * (sz_1e8 / E8);
             placed += 1;
         }
         assert_eq!(placed, 5, "five orders of $1.94 fit under $10");
         assert!(spent <= MAX_TOTAL_1E8);
-        assert!(matches!(plan(yes, no, spent, placed, MAX_ORDERS), Plan::Skip(w) if w.contains("cap")));
+        assert!(matches!(plan(yes, no, None, spent, placed, MAX_ORDERS), Plan::Skip(w) if w.contains("cap")));
     }
 
     #[test]
@@ -1213,5 +1288,28 @@ mod tests {
         assert_eq!(touch(90_000_000, 0, 1).level_1e8(), 90_000_000);
         assert_eq!(touch(0, 94_000_000, 1).level_1e8(), 94_000_000);
         assert_eq!(Touch::default().level_1e8(), 0);
+    }
+
+    #[test]
+    fn a_level_book_defers_to_the_underlying_against_the_strike() {
+        // Mainnet 2026-10-13 11:44:45Z: one wide quote mirrored on both legs.
+        let wide = touch(210_000, 99_790_000, 477);
+        let strike = 8_349_500_000_000i64; // $83 495
+        assert_eq!(side_by_price(strike + strike / 1_000, strike), Some(true), "10 bps above");
+        assert_eq!(side_by_price(strike - strike / 1_000, strike), Some(false), "10 bps below");
+        assert_eq!(side_by_price(strike + strike / 2_000, strike), None, "5 bps: too close");
+        assert_eq!(side_by_price(0, strike), None, "no mid, no side");
+        assert!(matches!(plan(wide, wide, None, 0, 0, 4), Plan::Skip(w) if w.contains("level")));
+        assert_eq!(
+            plan(wide, wide, Some(false), 0, 0, 4),
+            Plan::Buy { yes: false, px_1e8: 99_790_000, sz_1e8: 2 * E8 }
+        );
+        // A book that leans 0.10 or more decides by itself, whatever the price says.
+        let yes = touch(96_000_000, 97_000_000, 50);
+        let no = touch(3_000_000, 4_000_000, 50);
+        assert!(matches!(plan(yes, no, Some(false), 0, 0, 4), Plan::Buy { yes: true, .. }));
+        let mids = br##"{"BTC":"83578.5","ETH":"4101.25","#123450":"0.5"}"##;
+        assert_eq!(mid_of(mids, "BTC"), Some(8_357_850_000_000));
+        assert_eq!(mid_of(mids, "SOL"), None);
     }
 }
