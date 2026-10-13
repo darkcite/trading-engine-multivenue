@@ -17152,7 +17152,15 @@ fn gate96_venue_helper() {
     // The port last: its presence says the rest is written.
     std::fs::write(dir.join("port.tmp"), v.port.to_string()).expect("gate 96 port");
     std::fs::rename(dir.join("port.tmp"), dir.join("port")).expect("gate 96 port");
-    std::thread::sleep(std::time::Duration::from_secs(120));
+    // HK4 (gate 114): once the parent writes `refuse_ws` into the dir, every
+    // WebSocket upgrade is refused — the parent's posts go REST.
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < std::time::Duration::from_secs(120) {
+        if dir.join("refuse_ws").exists() {
+            v.refuse_ws(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// **XMM gate 96b (XH4b) — the HL gateway's whole turn, over a real
@@ -17226,45 +17234,32 @@ fn hl_gateway_outcome_round_trip_allocates_only_rustls_record_buffers() {
     gate96b(true);
 }
 
-/// Gate 96b, on a perps-only map (`outcomes` false, slot 6's) or one that
-/// names outcome legs.
-fn gate96b(outcomes: bool) {
+/// Gate 96b's harness, shared with gate 114 (HK4): the scripted venue in a
+/// CHILD process (`gate96_venue_helper`; a `refuse_ws` file written into
+/// the dir makes it refuse every WebSocket upgrade from then on), and the
+/// REAL gateway booted against it as the engine boots it — the agent's
+/// shared nonce stream included (XH4h S3). The caller kills the child and
+/// removes the dir.
+fn gate96_boot(
+    tag: &str,
+    outcomes: bool,
+) -> (
+    std::process::Child,
+    std::path::PathBuf,
+    exec_hyperliquid::gateway::HlGateway,
+    exec_hyperliquid::gateway::HlEngineEnd,
+) {
     use exec_gateway::Idle;
-    use exec_hyperliquid::event::{
-        ExecEvent, EV_ACK, EV_BALANCE, EV_FILL, EV_FILL_META, EV_OPEN_ORDER, EV_POSITION,
-        EV_READ_DONE, EV_REJECTED, EV_RESTING, EV_SNAPSHOT, READ_DAY, READ_LIMIT, READ_SPOT,
-    };
-    use exec_hyperliquid::gateway::{GatewayCfg, HlEngineEnd, HlGateway};
-    use exec_hyperliquid::{hl_duplex, CoinMap, HlCmd, Network, Tif};
+    use exec_hyperliquid::gateway::{GatewayCfg, HlGateway};
+    use exec_hyperliquid::{hl_duplex, CoinMap, Network};
 
-    /// XH4i: the outcome variant's leg, `#1941` / `+1941`.
-    const LEG: u32 = exec_hyperliquid::asset::ASSET_BASE + 1941;
-    const ROUNDS: u64 = 300;
-    /// Signed posts a round (the reads are posted, unsigned, uncounted).
-    const POSTS_PER_ROUND: u64 = 3;
-    const EVENTS_PER_ROUND: u64 = 12;
-    const RUSTLS_ALLOCS_PER_ROUND: u64 = 12;
-    /// One sweep round: the read and the cancel sealed, their answers
-    /// opened.
-    const RUSTLS_ALLOCS_PER_SWEEP_ROUND: u64 = 4;
-    /// XH4e: the budget and day reads, and XH5b-1's spot sheet — each
-    /// sealed, each answer opened.
-    const RUSTLS_ALLOCS_PER_ACCOUNT_READS: u64 = 6;
-    /// XH4f: the places' post and the TTL cancel sealed; the places'
-    /// answer, the two pushes and the cancel's answer opened.
-    const RUSTLS_ALLOCS_PER_TTL: u64 = 6;
-    /// XMM XH5c-2: the purchase sealed, its answer opened.
-    const RUSTLS_ALLOCS_PER_RESERVE: u64 = 2;
-    /// XMM XH5c-2: the purchase's client id (the arm's range: bit 63 set,
-    /// bit 62 clear, bit 60).
-    const RESERVE_OID: u64 = (1 << 63) | (1 << 60) | 1;
     let dir = std::env::temp_dir().join(format!(
-        "mv-gate96-{}-{}",
+        "mv-{tag}-{}-{}",
         std::process::id(),
         u8::from(outcomes)
     ));
     std::fs::create_dir_all(&dir).expect("gate 96 dir");
-    let mut child = std::process::Command::new(std::env::current_exe().expect("gate 96 exe"))
+    let child = std::process::Command::new(std::env::current_exe().expect("gate 96 exe"))
         .args([
             "gate96_venue_helper",
             "--exact",
@@ -17298,7 +17293,7 @@ fn gate96b(outcomes: bool) {
             .with_root_certificates(roots)
             .with_no_client_auth(),
     );
-    let (mut eng, gw_end) = hl_duplex();
+    let (eng, gw_end) = hl_duplex();
     let mut coins = if outcomes {
         CoinMap::with_outcomes()
     } else {
@@ -17326,6 +17321,41 @@ fn gate96b(outcomes: bool) {
             .stream(&[0x58; 20])
             .expect("a stream"),
     );
+    (child, dir, gw, eng)
+}
+
+/// Gate 96b, on a perps-only map (`outcomes` false, slot 6's) or one that
+/// names outcome legs.
+fn gate96b(outcomes: bool) {
+    use exec_hyperliquid::event::{
+        ExecEvent, EV_ACK, EV_BALANCE, EV_FILL, EV_FILL_META, EV_OPEN_ORDER, EV_POSITION,
+        EV_READ_DONE, EV_REJECTED, EV_RESTING, EV_SNAPSHOT, READ_DAY, READ_LIMIT, READ_SPOT,
+    };
+    use exec_hyperliquid::gateway::{HlEngineEnd, HlGateway};
+    use exec_hyperliquid::{HlCmd, Tif};
+
+    /// XH4i: the outcome variant's leg, `#1941` / `+1941`.
+    const LEG: u32 = exec_hyperliquid::asset::ASSET_BASE + 1941;
+    const ROUNDS: u64 = 300;
+    /// Signed posts a round (the reads are posted, unsigned, uncounted).
+    const POSTS_PER_ROUND: u64 = 3;
+    const EVENTS_PER_ROUND: u64 = 12;
+    const RUSTLS_ALLOCS_PER_ROUND: u64 = 12;
+    /// One sweep round: the read and the cancel sealed, their answers
+    /// opened.
+    const RUSTLS_ALLOCS_PER_SWEEP_ROUND: u64 = 4;
+    /// XH4e: the budget and day reads, and XH5b-1's spot sheet — each
+    /// sealed, each answer opened.
+    const RUSTLS_ALLOCS_PER_ACCOUNT_READS: u64 = 6;
+    /// XH4f: the places' post and the TTL cancel sealed; the places'
+    /// answer, the two pushes and the cancel's answer opened.
+    const RUSTLS_ALLOCS_PER_TTL: u64 = 6;
+    /// XMM XH5c-2: the purchase sealed, its answer opened.
+    const RUSTLS_ALLOCS_PER_RESERVE: u64 = 2;
+    /// XMM XH5c-2: the purchase's client id (the arm's range: bit 63 set,
+    /// bit 62 clear, bit 60).
+    const RESERVE_OID: u64 = (1 << 63) | (1 << 60) | 1;
+    let (mut child, dir, mut gw, mut eng) = gate96_boot("gate96", outcomes);
     let mut kinds = [0u64; 256];
     let t0 = std::time::Instant::now();
     while !gw.ws_live() || kinds[usize::from(EV_SNAPSHOT)] == 0 {
@@ -17666,6 +17696,134 @@ fn gate96b(outcomes: bool) {
         "HL gateway weight purchase: {reserve_allocs} allocations ({reserve_bytes} B) — \
          rustls' buffered API accounts for exactly {RUSTLS_ALLOCS_PER_RESERVE} (one sealed, \
          one opened); anything above is the gateway's"
+    );
+}
+
+/// **HK4 gate 114 — the HL gateway's REST path allocates only rustls'
+/// record buffers.** Gate 96b's harness: the gateway goes live on the
+/// WebSocket (its fills snapshot in — before it, growth is refused), then
+/// the venue refuses every upgrade and the socket dies under a post's
+/// write (the test seam `kill_ws_after_next_send`, `testvenue` only): that
+/// post is re-sent by REST, and from then on every post goes REST — sealed
+/// straight into the REST client's `/exchange` window (XMM HD2: no copy),
+/// posted on its one keep-alive connection, the answer mapped onto the
+/// items and emitted. Every round: gate 96b's two ALO places (one bid
+/// resting, one post-only cross), pushed together — counted by what the
+/// gateway posts, not assumed batched. Pinned like gate 101 (`HlHttp`, 2 a
+/// post): rustls seals one record and opens one — exactly 2 a REST post;
+/// everything the gateway does around them is 0 B, and a regression there
+/// shows as one more. The gateway keeps redialling the refused socket on
+/// its backoff (a dial builds its TLS session: cold, and it allocates), so
+/// a window is judged only when no connection is between its dial and
+/// Ready as it opens (`HlGateway::dialing`) and no dial started inside it
+/// (`dials` unchanged); any other window is measured again.
+#[test]
+fn hl_gateway_rest_path_allocates_only_rustls_record_buffers() {
+    use exec_hyperliquid::event::{EV_ACK, EV_REJECTED, EV_SNAPSHOT};
+    use exec_hyperliquid::gateway::{HlEngineEnd, HlGateway};
+    use exec_hyperliquid::{HlCmd, Tif};
+
+    const ROUNDS: u64 = 20;
+    /// One record sealed, one opened, per REST post.
+    const RUSTLS_ALLOCS_PER_REST_POST: u64 = 2;
+    /// `io()`'s REST-fallback slot.
+    const IO_REST_POSTS: usize = 4;
+    let (mut child, dir, mut gw, mut eng) = gate96_boot("gate114", false);
+    let t0 = std::time::Instant::now();
+    let mut snapshot = false;
+    while !gw.ws_live() || !snapshot {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "gate 114: the socket never came up with its snapshot"
+        );
+        gw.turn();
+        while let Some(e) = eng.evt.pop() {
+            snapshot |= e.kind == EV_SNAPSHOT;
+        }
+    }
+    // From now on the venue refuses every upgrade; the live socket dies
+    // under the next post's write.
+    std::fs::write(dir.join("refuse_ws"), b"1").expect("gate 114 flag");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    gw.kill_ws_after_next_send();
+    let mut oid = 0u64;
+    let mut answered = 0u64;
+    let mut round = |gw: &mut HlGateway, eng: &mut HlEngineEnd, answered: &mut u64| {
+        oid += 2;
+        let want = *answered + 2;
+        assert!(eng.cmd.push(&HlCmd::place(
+            6,
+            oid,
+            1,
+            true,
+            250_000_000_000,
+            1_000_000,
+            Tif::Alo
+        )));
+        assert!(eng.cmd.push(&HlCmd::place(
+            6,
+            oid + 1,
+            1,
+            false,
+            251_000_000_000,
+            1_000_000,
+            Tif::Alo
+        )));
+        let t = std::time::Instant::now();
+        while *answered < want {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(5),
+                "gate 114: a round stalled at {answered}/{want}"
+            );
+            gw.turn();
+            while let Some(e) = eng.evt.pop() {
+                *answered += u64::from(e.kind == EV_ACK || e.kind == EV_REJECTED);
+            }
+        }
+    };
+    // The killed post (re-sent by REST), then the warm-up: the REST
+    // connection's dial and handshake, session tickets, rustls' queues at
+    // their working size.
+    let mut w = 0;
+    while w < 20 {
+        round(&mut gw, &mut eng, &mut answered);
+        w += 1;
+    }
+    assert!(!gw.ws_live(), "gate 114: no socket may come back");
+    assert!(eng.stats.io()[IO_REST_POSTS] >= 20, "gate 114: the warm-up went REST");
+    let mut tries = 0u32;
+    let (allocs, bytes, posts) = loop {
+        tries += 1;
+        assert!(tries <= 50, "gate 114: no dial-free window in 50 tries");
+        if gw.dialing() {
+            // A dial is still out: let it end (refused) before measuring.
+            gw.turn();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
+        }
+        let dials = gw.counters().dials;
+        let posts0 = eng.stats.io()[IO_REST_POSTS];
+        let g = AllocGuard::new();
+        let mut r = 0u64;
+        while r < ROUNDS {
+            round(&mut gw, &mut eng, &mut answered);
+            r += 1;
+        }
+        let (a, b, _) = g.delta();
+        if gw.counters().dials == dials {
+            break (a, b, eng.stats.io()[IO_REST_POSTS] - posts0);
+        }
+    };
+    child.kill().ok();
+    child.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(posts >= ROUNDS, "gate 114: every round posted ({posts} REST posts)");
+    assert_eq!(
+        allocs,
+        RUSTLS_ALLOCS_PER_REST_POST * posts,
+        "HL gateway REST path: {allocs} allocations ({bytes} B) over {posts} REST posts — \
+         rustls' buffered API accounts for exactly {RUSTLS_ALLOCS_PER_REST_POST} a post (one \
+         sealed, one opened); anything above is the gateway's"
     );
 }
 

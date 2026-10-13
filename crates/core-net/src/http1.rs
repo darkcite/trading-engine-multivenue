@@ -426,6 +426,12 @@ fn push(dst: &mut [u8], cursor: &mut usize, src: &[u8]) -> Result<(), HttpErr> {
     if end > dst.len() {
         return Err(HttpErr::BufferTooSmall);
     }
+    // COPY: one request part into the final request buffer, ≤ `dst` — a
+    // head constant, the host, the path, a header value, or (`write_request`)
+    // a boot-time POST's whole body — the render into the wire buffer —
+    // rejected: rendering that body behind a `request_head_len`-sized head
+    // (the `https_req` shape) for the boot path: cold, once per boot request
+    // (HK4: the marker HD1 left owed).
     dst[*cursor..end].copy_from_slice(src);
     *cursor = end;
     Ok(())
@@ -997,6 +1003,29 @@ mod tests {
                 assert_eq!(body_end, raw.len());
                 assert_eq!(framing, BodyFraming::ContentLength(5));
                 assert_eq!(&raw[body_start..body_end], b"hello");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// HK4: the contract the `http1_response` fuzz target now holds — a
+    /// Content-Length body only partly buffered still reports its whole end
+    /// (`body_start + n`, past the buffer); the caller reads more while
+    /// `body_end > buf.len()`.
+    #[test]
+    fn read_response_partly_buffered_content_length_reports_its_whole_end() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc";
+        match read_response(raw) {
+            HttpResult::Complete {
+                body_start,
+                body_end,
+                framing,
+                ..
+            } => {
+                assert_eq!(framing, BodyFraming::ContentLength(10));
+                assert_eq!(body_start, raw.len() - 3);
+                assert_eq!(body_end, body_start + 10);
+                assert!(body_end > raw.len(), "the caller must read more");
             }
             other => panic!("unexpected {other:?}"),
         }

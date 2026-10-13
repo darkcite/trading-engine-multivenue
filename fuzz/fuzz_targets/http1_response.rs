@@ -6,9 +6,12 @@
 //! `write_get_request`.
 //!
 //! Validates the HTTP/1.1 response scanner never panics, never reads
-//! past the end of `buf`, and yields offsets that are always in-bounds
-//! with `header_end <= body_start <= body_end <= data.len()` when a
-//! response is `Complete`. When the response advertises
+//! past the end of `buf`, and yields offsets ordered
+//! `header_end <= body_start <= body_end` when a response is `Complete`,
+//! the head in bounds, and the body in bounds for chunked and
+//! close-delimited framing — a Content-Length body's end is
+//! `body_start + n` whether or not it is all buffered (the parser's
+//! contract; HK4). When the response advertises
 //! `Transfer-Encoding: chunked`, we also feed the body region through
 //! the in-place dechunker and assert its outcome is one of the three
 //! documented variants without panicking or invalidating the buffer.
@@ -32,19 +35,26 @@ fuzz_target!(|data: &[u8]| {
             body_end,
             framing,
         } => {
-            // Every offset is in-bounds and correctly ordered.
+            // Every offset is correctly ordered, and the head is in bounds.
             assert!(header_end <= body_start);
             assert!(body_start <= body_end);
-            assert!(body_end <= data.len());
+            assert!(body_start <= data.len());
 
             match framing {
                 core_net::BodyFraming::ContentLength(n) => {
-                    // Body length agrees with the reported u64, clamped
-                    // to buffer-available bytes on the wire.
+                    // The parser's contract (`read_response` docs): a
+                    // Content-Length body's end is `body_start + n`
+                    // (saturating) whether or not it is all buffered — the
+                    // caller reads more while `body_end > buf.len()`. HK4:
+                    // the target asserted `body_end <= data.len()` for
+                    // every framing and aborted on any partly buffered
+                    // body (an `abc` short of `Content-Length: 10`).
                     let got = (body_end - body_start) as u64;
                     assert!(got <= n);
+                    assert_eq!(body_end, body_start.saturating_add(n as usize));
                 }
                 core_net::BodyFraming::Chunked => {
+                    assert!(body_end <= data.len());
                     // Dechunk a private copy so a malformed chunk
                     // framing can't corrupt the caller's buffer. We
                     // cap the copy at 4 KiB to keep the fuzzer fast
@@ -61,7 +71,9 @@ fuzz_target!(|data: &[u8]| {
                         core_net::DechunkResult::Malformed => {}
                     }
                 }
-                core_net::BodyFraming::CloseDelimited => {}
+                core_net::BodyFraming::CloseDelimited => {
+                    assert!(body_end <= data.len());
+                }
             }
         }
         core_net::HttpResult::Incomplete => {}

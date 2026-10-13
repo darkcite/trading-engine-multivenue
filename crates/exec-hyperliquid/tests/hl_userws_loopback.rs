@@ -441,15 +441,19 @@ fn a_refused_upgrade_is_an_upgrade_error_not_a_hang() {
     assert!(!ws.is_connected());
 }
 
+/// The server floods the oversize frame right behind its 101, so the
+/// refusal can surface from `connect` (whose read after the upgrade meets
+/// the full buffer) as well as from a later `pump` — either is the law.
+/// HK4: the test took only the second, and failed ~1 run in 5 even alone
+/// (the listed "parallel-load flake" — it was this race).
 #[test]
 fn a_frame_larger_than_the_buffer_is_refused_not_grown() {
     let (port, cfg, _rx) = boot(Script::Oversize);
     let mut ws = client(port, cfg);
-    ws.connect().expect("connect");
     let delivered = AtomicUsize::new(0);
     let until = Instant::now() + Duration::from_secs(10);
-    let mut outcome = Ok(0usize);
-    while Instant::now() < until {
+    let mut outcome = ws.connect().map(|()| 0usize);
+    while outcome.is_ok() && Instant::now() < until {
         match ws.pump(Duration::from_millis(5), |_| {
             delivered.fetch_add(1, Ordering::Relaxed);
         }) {

@@ -1968,6 +1968,31 @@ impl HlGateway {
         self.mbb.active().is_some()
     }
 
+    /// HK4, TEST-ONLY (`testvenue`, never in a shipping build): the active
+    /// socket dies under its next write, after the frame left — for a post,
+    /// the re-send branch (the SAME signed bytes by REST).
+    #[cfg(feature = "testvenue")]
+    pub fn kill_ws_after_next_send(&mut self) {
+        if let Some(a) = self.mbb.active() {
+            self.conns[usize::from(a)].die_after_next_send();
+        }
+    }
+
+    /// Whether a connection is between its dial and Ready (TLS, upgrade,
+    /// subscribing) — gate 114 judges only windows with none (HK4).
+    #[must_use]
+    pub fn dialing(&self) -> bool {
+        let mut s = 0usize;
+        while s < 2 {
+            let p = self.conns[s].phase();
+            if p != Phase::Down && p != Phase::Ready {
+                return true;
+            }
+            s += 1;
+        }
+        false
+    }
+
     /// Completed make-before-break swaps.
     #[must_use]
     pub fn swaps(&self) -> u64 {

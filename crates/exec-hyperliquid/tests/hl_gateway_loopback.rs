@@ -36,6 +36,7 @@
 //! | outcome sweep | XH4i-1: on an outcome map an order of ours on a `#<enc>` leg is cancelled by cloid with `ASSET_BASE + enc` — another slot's and a stranger's on the same leg never — and the sweep reads clear; on a perps-only map it is unmapped and never cancelled |
 //! | outcome streams | XH4i-1: on an outcome map a `#<enc>` fill, `orderUpdates` row and open-order row carry `ASSET_BASE + enc`; on a perps-only map `ASSET_UNKNOWN`, as before |
 //! | fin | HK2: an answer that arrives in the same read as the socket's FIN is ACKed, not stranded; the gateway then redials |
+//! | re-send | HK4: a socket that dies under a post's write after the frame left — the same signed bytes re-sent by REST (the WebSocket payload, byte for byte), the REST answer ACKs it |
 //!
 //! `Answer::Later` defers a post's answer without pausing the socket: the
 //! TTL races above see their stream rows while the cancel is still out.
@@ -957,6 +958,51 @@ fn an_answer_that_arrives_with_the_fin_is_delivered_before_the_close() {
             && count(e, EV_GAP) >= 1),
         "no redial, or no gap reported"
     );
+}
+
+/// HK4: the socket dies under a post's write after the frame left. The
+/// gateway re-sends the SAME signed bytes by REST — the mask XORed back,
+/// never re-signed: the venue's REST body is, byte for byte, the payload of
+/// the post that left on the WebSocket — and the REST answer ACKs it.
+#[test]
+fn a_post_whose_socket_dies_under_the_write_is_re_sent_by_rest_unchanged() {
+    let v = Venue::start();
+    v.policy(|s| Answer::Action(resting(items_in(&s.body), 700)));
+    let (mut gw, mut eng) = gateway(&v, 5_000_000_000);
+    let mut evs = Vec::new();
+    live(&mut gw, &mut eng, &mut evs);
+    let ws_posts_before = v.posts().len();
+    gw.kill_ws_after_next_send();
+    assert!(eng.cmd.push(&alo(1)));
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| count(e, EV_ACK)
+        + count(e, EV_UNANSWERED)
+        >= 1));
+    assert_eq!(count(&evs, EV_ACK), 1, "the REST re-send's answer ACKs the post");
+    assert_eq!(count(&evs, EV_UNANSWERED), 0);
+    // The WebSocket copy reaches the venue too (it left before the "death").
+    let t0 = Instant::now();
+    let posts = loop {
+        let p = v.posts();
+        if p.iter().any(|s| s.conn == 0 && s.body.contains(r#""method":"post""#))
+            && p.len() > ws_posts_before
+        {
+            break p;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(2), "the WebSocket post never arrived");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let rest: Vec<_> = posts.iter().filter(|s| s.conn == usize::MAX).collect();
+    assert_eq!(rest.len(), 1, "one REST re-send");
+    let ws = posts
+        .iter()
+        .rev()
+        .find(|s| s.conn == 0 && s.body.contains(r#""type":"action""#))
+        .expect("the post on the socket");
+    assert!(
+        ws.body.contains(&rest[0].body),
+        "the REST body is the WebSocket post's payload, byte for byte (never re-signed)"
+    );
+    assert!(gw.counters().conn_drops >= 1, "the socket is dropped");
 }
 
 #[test]

@@ -6627,7 +6627,9 @@ API changes are in migration.md.
   its envelope (≤ 16 KiB; the TX buffer is const-asserted to fit the
   window) into the window: the cut's one new `// COPY:`, on the coldest
   path. Before HD2 the old client sent the envelope from the TX buffer
-  as it lay, in two records.
+  as it lay, in two records. (Since HK4 the re-send is tested end to end —
+  the REST body is the WebSocket post's payload, byte for byte — and the
+  REST path is alloc gate 114.)
 * **Copies the old client made are gone:** the per-post head render (the
   head is now rendered once at boot and moved by a marked `copy_within`
   only when the body's digit count changes), and the boot-time copy of
@@ -15112,3 +15114,64 @@ changes.
   - copy-audit hits 28, new 0;
   - license-check OK;
   - fuzz `deribit_vol_index` 60 s clean (12.2 M runs).
+
+### HK4 — the HD lane's follow-ups (`core-net`, `exec-hyperliquid`, `fuzz/`, the alloc suite)
+
+Tests, a marker, a fuzz target and a gate. No shipped behaviour changes.
+
+- **`http1::push` carries its `// COPY:` marker.** The marker states the
+  copy's real extent: request-head parts, and the whole body of a boot-time
+  POST through `write_request`. The copy-audit baseline drops the entry
+  (27 baselined, 0 new). The ratchet only shrinks.
+- **The `http1_response` fuzz target holds the parser's contract.** It
+  used to assert `body_end <= data.len()` for every framing, which aborted
+  on any Content-Length body only partly buffered.
+  - `read_response` reports such a body's end as
+    `body_start.saturating_add(n)`, and the target now asserts exactly
+    that.
+  - In-bounds stays the rule for chunked and close-delimited bodies.
+  - A unit test pins the contract: `fuzz/corpus` is git-ignored, so no seed
+    can.
+- **The gateway's re-send branch is tested.** The test seam
+  `kill_ws_after_next_send` / `die_after_next_send` exists only under
+  `testvenue`, a dev-dependency feature everywhere. Under resolver 2 it
+  never reaches `cargo build --release -p cli`. The G0 rebuild covers a
+  release test run.
+  - The seam lets the next write on the active socket leave, then reports
+    the socket dead.
+  - The gateway unmasks, copies the envelope into the REST window and
+    re-sends. The venue's REST body is the WebSocket post's payload, byte
+    for byte (never re-signed), and the REST answer ACKs it
+    (`a_post_whose_socket_dies_under_the_write_is_re_sent_by_rest_unchanged`).
+- **Alloc gate 114: the gateway's REST path allocates only rustls' record
+  buffers.**
+  - Setup: gate 96b's harness (now `gate96_boot`, shared). The gateway goes
+    live, the venue starts refusing upgrades (a `refuse_ws` file), and the
+    seam kills the socket. Every post then goes REST.
+  - The pin: exactly 2 allocations per REST post (one record sealed, one
+    opened — the gate-101 pin).
+  - Judged windows: only those that open with no connection dialing
+    (`HlGateway::dialing`, a cold accessor) and see no dial start. A
+    refused redial's TLS session is cold, and never counted.
+- **Review:** one combined pass. Risk: NEEDS-DOCS (these records). Alloc
+  and zero-copy: PASS. Acted on:
+  - the gate's window judged on `dialing` (a dial that fails synchronously
+    no longer jams it);
+  - the seam cleared by `close`;
+  - the marker's wording;
+  - the unit test.
+- **Found while gating: the listed `hl_userws_loopback` "parallel-load
+  flake" was a race in the test.** It failed 1 run in 5 even alone. The
+  server floods the oversize frame right behind its 101, so the client's
+  refusal (`BadFrame`) can surface from `connect` as well as from a later
+  `pump`, and the test accepted only the second. It now accepts either:
+  10/10 alone, green in the full run. The client's law is unchanged.
+- **Gates:**
+  - clippy clean;
+  - nextest 4 630 passed (10 skipped);
+  - alloc 127/127 at 0 B/op, gate 114 new (a fresh `Compiling bench` in the
+    run that built it);
+  - copy-audit hits 27, baselined 27, new 0;
+  - license-check OK;
+  - fuzz `http1_response` 60 s clean (2.39 M runs; it used to abort on
+    trivial input).

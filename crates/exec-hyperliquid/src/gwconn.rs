@@ -97,6 +97,12 @@ pub struct GwConn {
     /// rustls; [`Self::service`] reads them, hands their frames on, then
     /// reports [`ConnErr::Closed`].
     peer_closed: bool,
+    /// HK4, TEST-ONLY (`testvenue`, never in a shipping build): the next
+    /// [`Self::send`] on this connection writes its frame, then reports the
+    /// socket dead — for a post, the gateway's re-send branch (it may have
+    /// left); a read takes the read branch. Cleared by [`Self::close`].
+    #[cfg(feature = "testvenue")]
+    die_after_send: bool,
 }
 
 impl GwConn {
@@ -118,7 +124,16 @@ impl GwConn {
             last_rx_ns: 0,
             keepalive: Keepalive::new(keepalive),
             peer_closed: false,
+            #[cfg(feature = "testvenue")]
+            die_after_send: false,
         }
+    }
+
+    /// HK4, TEST-ONLY: the next [`Self::send`] writes, then reports the
+    /// socket dead.
+    #[cfg(feature = "testvenue")]
+    pub fn die_after_next_send(&mut self) {
+        self.die_after_send = true;
     }
 
     /// The connection's phase.
@@ -206,6 +221,10 @@ impl GwConn {
         self.rx.clear();
         self.posts = 0;
         self.peer_closed = false;
+        #[cfg(feature = "testvenue")]
+        {
+            self.die_after_send = false;
+        }
     }
 
     /// A readiness event for this connection's token. A peer close is
@@ -392,7 +411,12 @@ impl GwConn {
     pub fn send(&mut self, frame: &[u8]) -> Result<(), ConnErr> {
         debug_assert_eq!(self.phase, Phase::Ready, "a post on a connection not ready");
         let t = self.t.as_mut().ok_or(ConnErr::Closed)?;
-        write_all(t, frame)
+        write_all(t, frame)?;
+        #[cfg(feature = "testvenue")]
+        if core::mem::take(&mut self.die_after_send) {
+            return Err(ConnErr::Io);
+        }
+        Ok(())
     }
 
     /// The keepalive step for a ready connection: ping when quiet.
