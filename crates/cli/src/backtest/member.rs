@@ -1338,6 +1338,10 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                 strat
                     .configure(boot.params, luts, WallAnchor::new(0, 0))
                     .map_err(|e| HarnessError::Usage(format!("bin15: configure refused: {e}")))?;
+                // BIN15 H90: the late Φ table, as at boot.
+                if let Some(l) = &boot.late_lut {
+                    strat.configure_late(Box::new((**l).clone()));
+                }
                 let mut u = 0usize;
                 while u < boot.seeds.len() {
                     let seed = &boot.seeds[u];

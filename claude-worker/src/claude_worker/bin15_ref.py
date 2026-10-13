@@ -409,6 +409,260 @@ def ceil_grid_1e6(px_1e6: int, tick_1e6: int) -> int:
     return px_1e6 if r == 0 else px_1e6 + (tick_1e6 - r)
 
 
+# --- BIN15 H90: the late-window pricer (``late.rs``) ----------------
+
+#: Points in the late Φ table: ``z = 0, 0.002, …, 8.192``.
+LATE_PHI_POINTS: int = 4097
+#: The late table's step in ``z`` ×1e6.
+LATE_PHI_STEP_1E6: int = 2_000
+#: Widest ``|z|`` the late table covers ×1e6.
+LATE_Z_CLAMP_1E6: int = 8_192_000
+#: One second, ns.
+SEC_NS: int = 1_000_000_000
+#: A grid second's mark is fresh while younger than this.
+MARK_FRESH_NS: int = 5_000_000_000
+#: A grid second's perp mid is fresh while younger than this.
+PERP_FRESH_NS: int = 3_000_000_000
+#: σ's window, grid seconds.
+SIGMA_WINDOW_S: int = 900
+#: The fewest valid 1-s returns σ is computed from.
+SIGMA_MIN_OBS: int = 300
+#: The basis median's window, grid seconds.
+BASIS_WINDOW_S: int = 60
+#: Samples in the 15 m settlement average.
+TWAP_SAMPLES: int = 60
+#: Seconds the return ring holds.
+R2_RING: int = 1024
+#: Seconds the short rings hold.
+SHORT_RING: int = 64
+#: The largest σ accepted ×1e9 per √s.
+SIGMA_MAX_1E9: int = 100_000_000
+_I64_MAX: int = 2**63 - 1
+
+
+def isqrt_i128(v: int) -> int:
+    """``core_regime::math::isqrt_i128``: 0 at or under 0, the floor root
+    above, saturated at ``i64::MAX``."""
+    if v <= 0:
+        return 0
+    return min(math.isqrt(v), _I64_MAX)
+
+
+@dataclasses.dataclass(frozen=True)
+class LateLut:
+    """``late::LateLut``: ``Φ(z) ×1e6`` on ``z = 0 … 8.192``."""
+
+    phi: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.phi) != LATE_PHI_POINTS:
+            raise ValueError(f"late phi needs {LATE_PHI_POINTS} points, got {len(self.phi)}")
+
+    def phi_1e6(self, z_abs_1e6: int) -> int:
+        idx = z_abs_1e6 // LATE_PHI_STEP_1E6
+        if idx >= LATE_PHI_POINTS - 1:
+            return self.phi[LATE_PHI_POINTS - 1]
+        lo = self.phi[idx]
+        hi = self.phi[idx + 1]
+        frac = z_abs_1e6 - idx * LATE_PHI_STEP_1E6
+        return lo + ((hi - lo) * frac) // LATE_PHI_STEP_1E6
+
+    def p_of_z(self, z_1e6: int) -> int:
+        z = max(-LATE_Z_CLAMP_1E6, min(LATE_Z_CLAMP_1E6, z_1e6))
+        if z >= 0:
+            return self.phi_1e6(z)
+        return 1_000_000 - self.phi_1e6(-z)
+
+
+@dataclasses.dataclass
+class LateFair:
+    """``late::LateFair``."""
+
+    p_yes_1e6: int
+    z_1e6: int
+    sigma_1e9: int
+    basis_1e9: int
+    m_now_1e6: int
+    n_obs: int
+
+
+class LateGrid:
+    """``late::LateGrid``: the 1-s grid of one underlying, transcribed."""
+
+    def __init__(self) -> None:
+        self.mark = [0] * SHORT_RING
+        self.ratio = [0] * SHORT_RING
+        self.r2 = [0] * R2_RING
+        self.r_ok = [False] * R2_RING
+        self.sum_r2 = 0
+        self.n_r = 0
+        self.sec = 0
+        self.cur_mark_1e6 = 0
+        self.cur_mark_wall = 0
+        self.cur_perp_x2_1e6 = 0
+        self.cur_perp_wall = 0
+
+    def _clear_rings(self) -> None:
+        self.mark = [0] * SHORT_RING
+        self.ratio = [0] * SHORT_RING
+        self.r2 = [0] * R2_RING
+        self.r_ok = [False] * R2_RING
+        self.sum_r2 = 0
+        self.n_r = 0
+
+    def _fill_second(self, s: int) -> None:
+        t = s * SEC_NS
+        m = (
+            self.cur_mark_1e6
+            if self.cur_mark_1e6 > 0
+            and self.cur_mark_wall <= t
+            and t - self.cur_mark_wall < MARK_FRESH_NS
+            else 0
+        )
+        p = (
+            self.cur_perp_x2_1e6
+            if self.cur_perp_x2_1e6 > 0
+            and self.cur_perp_wall <= t
+            and t - self.cur_perp_wall < PERP_FRESH_NS
+            else 0
+        )
+        i = s % SHORT_RING
+        prev = self.mark[(s + SHORT_RING - 1) % SHORT_RING]
+        self.mark[i] = m
+        self.ratio[i] = (m * 2_000_000_000) // p if m > 0 and p > 0 else 0
+        if s >= SIGMA_WINDOW_S:
+            o = (s - SIGMA_WINDOW_S) % R2_RING
+            if self.r_ok[o]:
+                self.sum_r2 -= self.r2[o]
+                self.n_r -= 1
+                self.r_ok[o] = False
+        j = s % R2_RING
+        self.r_ok[j] = False
+        self.r2[j] = 0
+        if m > 0 and prev > 0:
+            r = ((m - prev) * 1_000_000_000) // prev
+            sq = min(r * r, _I64_MAX)
+            self.r2[j] = sq
+            self.r_ok[j] = True
+            self.sum_r2 += sq
+            self.n_r += 1
+
+    def advance_to(self, target: int) -> None:
+        if self.sec == 0:
+            if self.cur_mark_1e6 <= 0:
+                return
+            self.sec = max(target - 1, 0)
+        if target <= self.sec:
+            return
+        if target - self.sec > R2_RING:
+            self._clear_rings()
+            self.sec = target - 1
+        s = self.sec + 1
+        while s <= target:
+            self._fill_second(s)
+            s += 1
+        self.sec = target
+
+    def on_mark(self, wall_ns: int, mark_1e6: int) -> None:
+        if mark_1e6 <= 0:
+            return
+        self.advance_to(max(wall_ns - 1, 0) // SEC_NS)
+        self.cur_mark_1e6 = mark_1e6
+        self.cur_mark_wall = wall_ns
+
+    def on_perp(self, wall_ns: int, bid_plus_ask_1e6: int) -> None:
+        if bid_plus_ask_1e6 <= 0:
+            return
+        self.advance_to(max(wall_ns - 1, 0) // SEC_NS)
+        self.cur_perp_x2_1e6 = bid_plus_ask_1e6
+        self.cur_perp_wall = wall_ns
+
+    def sigma_1e9(self) -> int | None:
+        if self.n_r < SIGMA_MIN_OBS:
+            return None
+        return min(isqrt_i128(self.sum_r2 // self.n_r), SIGMA_MAX_1E9)
+
+    def basis_1e9(self, sec: int) -> int | None:
+        vals: list[int] = []
+        back = 0
+        while back < BASIS_WINDOW_S and back <= sec:
+            v = self.ratio[(sec - back) % SHORT_RING]
+            if v > 0:
+                vals.append(v)
+            back += 1
+        if not vals:
+            return None
+        vals.sort()
+        k = len(vals)
+        if k % 2 == 1:
+            return vals[k // 2]
+        return (vals[k // 2 - 1] + vals[k // 2]) // 2
+
+
+def late_fair(  # noqa: PLR0911 — one return per named hold, as the Rust
+    grid: LateGrid,
+    lut: LateLut,
+    strike_1e6: int,
+    expiry_ns: int,
+    wall_ns: int,
+    k_1e3: int,
+) -> LateFair | str:
+    """``late::late_fair``: the price, or the hold's name (``LateHold``'s
+    Debug spelling). The grid must already be advanced to the query."""
+    if strike_1e6 <= 0 or k_1e3 <= 0 or expiry_ns < TWAP_SAMPLES * SEC_NS:
+        return "Shape"
+    sec_d = wall_ns // SEC_NS
+    last = expiry_ns // SEC_NS
+    if sec_d > last or grid.sec < sec_d:
+        return "Shape"
+    if (
+        grid.cur_mark_1e6 <= 0
+        or grid.cur_mark_wall > wall_ns
+        or wall_ns - grid.cur_mark_wall >= MARK_FRESH_NS
+    ):
+        return "MarkStale"
+    if (
+        grid.cur_perp_x2_1e6 <= 0
+        or grid.cur_perp_wall > wall_ns
+        or wall_ns - grid.cur_perp_wall >= PERP_FRESH_NS
+    ):
+        return "NoNowcast"
+    sigma = grid.sigma_1e9()
+    if sigma is None:
+        return "NoSigma"
+    basis = grid.basis_1e9(sec_d)
+    if basis is None:
+        return "NoNowcast"
+    m_now = (grid.cur_perp_x2_1e6 * basis) // 2_000_000_000
+    if m_now <= 0 or m_now > _I64_MAX:
+        return "Shape"
+    first = last + 1 - TWAP_SAMPLES
+    n_obs = 0 if sec_d < first else min(sec_d - first + 1, TWAP_SAMPLES)
+    obs = 0
+    s = first
+    while s < first + n_obs:
+        v = grid.mark[s % SHORT_RING]
+        if v <= 0:
+            return "ObservedStale"
+        obs += v
+        s += 1
+    n = TWAP_SAMPLES - n_obs
+    first_fut = sec_d + 1 if sec_d + 1 > first else first
+    a_ns = first_fut * SEC_NS - wall_ns
+    var_1e9 = (a_ns * n * n + (n * (n - 1) * (2 * n - 1) // 6) * 1_000_000_000) // 3_600
+    sqrt_v_1e9 = isqrt_i128(var_1e9 * 1_000_000_000)
+    sd_1e6 = (k_1e3 * sigma * m_now * sqrt_v_1e9) // 1_000_000_000_000_000_000_000
+    num = obs + n * m_now - TWAP_SAMPLES * strike_1e6
+    if sd_1e6 > 0:
+        z = (num * 1_000_000) // (TWAP_SAMPLES * sd_1e6)
+        z = max(-LATE_Z_CLAMP_1E6, min(LATE_Z_CLAMP_1E6, z))
+    elif num >= 0:
+        z = LATE_Z_CLAMP_1E6
+    else:
+        z = -LATE_Z_CLAMP_1E6
+    return LateFair(lut.p_of_z(z), z, sigma, basis, m_now, n_obs)
+
+
 # --- the shared fixture -------------------------------------------
 
 def _opt(v: int | None) -> str:
@@ -434,6 +688,11 @@ def replay(lines: typing.Iterable[str]) -> list[str]:
     ``M<TAB>a<TAB>mark<TAB>strike<TAB>tau<TAB>w``  ``M m_1e9`` or ``M -`` (S3)
     ``W<TAB>mark<TAB>strike<TAB>tau<TAB>w<TAB>a<TAB>sig2``  ``W p_hat p_raw d den horizon`` or ``W - - - - -`` (S3)
     ``S<TAB>px<TAB>from<TAB>to<TAB>open<TAB>close``  ``S area dt`` (S3)
+    ``LPHI<TAB>v0<TAB>…``                       load the late Φ (H90)
+    ``LG``                                      a fresh late grid (H90)
+    ``LM<TAB>wall<TAB>mark``                    ``LateGrid.on_mark`` (H90)
+    ``LP<TAB>wall<TAB>bid_plus_ask``            ``LateGrid.on_perp`` (H90)
+    ``LQ<TAB>wall<TAB>strike<TAB>expiry<TAB>k``  ``LQ p z sigma basis m_now n_obs`` or ``LQ HOLD reason`` (H90)
     ==========================================  ===========================
 
     The tables travel IN the fixture rather than being rebuilt on each
@@ -443,6 +702,8 @@ def replay(lines: typing.Iterable[str]) -> list[str]:
     phi: tuple[int, ...] | None = None
     recal: list[tuple[int, ...] | None] = [None, None, None]
     luts: Bin15Luts | None = None
+    late_lut: LateLut | None = None
+    grid = LateGrid()
     out: list[str] = []
 
     def need() -> Bin15Luts:
@@ -501,6 +762,27 @@ def replay(lines: typing.Iterable[str]) -> list[str]:
         elif tag == "S":
             area, dt = binary_twap_segment(int(f[1]), int(f[2]), int(f[3]), int(f[4]), int(f[5]))
             out.append(f"S\t{area}\t{dt}")
+        elif tag == "LPHI":
+            late_lut = LateLut(tuple(int(v) for v in f[1:]))
+        elif tag == "LG":
+            grid = LateGrid()
+        elif tag == "LM":
+            grid.on_mark(int(f[1]), int(f[2]))
+        elif tag == "LP":
+            grid.on_perp(int(f[1]), int(f[2]))
+        elif tag == "LQ":
+            if late_lut is None:
+                raise ValueError("the tape priced late before loading LPHI")
+            wall = int(f[1])
+            grid.advance_to(wall // SEC_NS)
+            lf = late_fair(grid, late_lut, int(f[2]), int(f[3]), wall, int(f[4]))
+            if isinstance(lf, str):
+                out.append(f"LQ\tHOLD\t{lf}")
+            else:
+                out.append(
+                    f"LQ\t{lf.p_yes_1e6}\t{lf.z_1e6}\t{lf.sigma_1e9}\t{lf.basis_1e9}"
+                    f"\t{lf.m_now_1e6}\t{lf.n_obs}"
+                )
         else:
             raise ValueError(f"unknown fixture record `{tag}`")
     return out

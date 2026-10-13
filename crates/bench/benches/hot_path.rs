@@ -463,6 +463,60 @@ fn bench_long_vol_day_close(c: &mut Criterion) {
     });
 }
 
+// -----------------------------------------------------------------
+// 12. BIN15 H90 — the late-window pricer (vault doc 33 §L2): the grid's
+//     per-mark advance and one `late_fair` inside the window, on a grid
+//     warmed with 900 s of marks and perp BBOs (σ, the basis and the
+//     observed half of the settlement minute all live). Measured, not
+//     baselined; the 0 B law is alloc gate 52b's.
+// -----------------------------------------------------------------
+
+fn bench_bin15_late(c: &mut Criterion) {
+    use strategy_bin15::late::{late_fair, LateGrid, LateLut, LATE_PHI_POINTS, LATE_PHI_STEP_1E6};
+    const WALL0: u64 = 1_789_171_200_000_000_000;
+    const SEC: u64 = 1_000_000_000;
+    let mut lut = Box::new(LateLut::flat());
+    let mut i = 0usize;
+    while i < LATE_PHI_POINTS {
+        let z = i as i64 * LATE_PHI_STEP_1E6;
+        lut.phi[i] = (500_000 + z.min(4_000_000) / 8) as u32;
+        i += 1;
+    }
+    let mut g = Box::new(LateGrid::new());
+    let (mut s, mut px) = (0x2545_F491_4F6C_DD1Du64, 79_000_000_000i64);
+    let step = |s: &mut u64, px: &mut i64| {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *px += (*s % 19_750_001) as i64 - 9_875_000;
+        *px
+    };
+    let mut t = 0u64;
+    while t < 930 {
+        let m = step(&mut s, &mut px);
+        g.on_mark(WALL0 + t * SEC + 200_000_000, m);
+        g.on_perp(WALL0 + t * SEC + 300_000_000, 2 * m);
+        t += 1;
+    }
+    // An instance expiring 20 s after the last second: 40 of its 60
+    // settlement seconds observed, 20 to come.
+    let expiry = WALL0 + (t + 20) * SEC;
+    let now = WALL0 + t * SEC - 500_000_000;
+    c.bench_function("bin15/late_fair_in_window", |b| {
+        b.iter(|| black_box(late_fair(&g, &lut, black_box(79_000_000_000), expiry, now, 1_550)));
+    });
+    let mut wall = WALL0 + t * SEC;
+    c.bench_function("bin15/late_grid_mark_and_perp_1s", |b| {
+        b.iter(|| {
+            let m = step(&mut s, &mut px);
+            wall += SEC;
+            g.on_mark(wall + 200_000_000, m);
+            g.on_perp(wall + 300_000_000, 2 * m);
+            black_box(g.sec());
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_clock,
@@ -476,5 +530,6 @@ criterion_group!(
     bench_signer_sign_order,
     bench_signer_hypercall_place_order,
     bench_long_vol_day_close,
+    bench_bin15_late,
 );
 criterion_main!(benches);

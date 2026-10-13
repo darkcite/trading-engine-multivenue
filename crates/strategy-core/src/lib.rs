@@ -1637,6 +1637,27 @@ pub struct Bin15Counters {
     /// longer exists — and they move no member position, because the
     /// roll's own `clear_instance` is what flattens the family.
     pub settlement_fills: u64,
+    /// BIN15 H90: re-prices inside the late window that ran the late
+    /// pricer (the grid advanced and a price was attempted).
+    pub late_reprices: u64,
+    /// BIN15 H90: late entries SUBMITTED (one per instance at most).
+    pub late_submitted: u64,
+    /// BIN15 H90: late entries that filled (any quantity).
+    pub late_filled: u64,
+    /// BIN15 H90: late re-prices the late pricer HELD (no σ, no nowcast, a
+    /// stale mark or observed second, a shape refusal).
+    pub late_skipped_stale: u64,
+    /// BIN15 H90: late re-prices whose favoured leg had no usable ask.
+    pub late_skipped_book: u64,
+    /// BIN15 H90: late re-prices whose test failed (belief under `p_min`,
+    /// or the ask not `e` under it).
+    pub late_skipped_price: u64,
+    /// BIN15 H90: late re-prices whose test held but not yet on
+    /// `persist_polls` consecutive snapshots.
+    pub late_skipped_persist: u64,
+    /// BIN15 H90: late entries refused for size — the caps or the resting
+    /// size left under one contract.
+    pub late_skipped_cap: u64,
 }
 
 /// Families one BIN15 view carries. Mirrors

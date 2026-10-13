@@ -3707,6 +3707,11 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             tracing::error!(error = %e, "bin15: configure failed");
             return EngineLoopResult::Failed("engine_loop_set: bin15 configure rejected");
         }
+        // BIN15 H90: the late Φ table, when the artifact carries one (16 KiB,
+        // once, at boot). `on_start` refuses a late law with no table.
+        if let Some(l) = &boot.late_lut {
+            set.bin15_mut().configure_late(Box::new((**l).clone()));
+        }
         let mut u = 0usize;
         while u < boot.seeds.len() {
             let seed = &boot.seeds[u];
@@ -7741,6 +7746,22 @@ pub struct Bin15MetricIds {
     /// move them from a visible series to a field only a unit test can
     /// see — a regression dressed as a fix.
     pub settlement_fills: core_metrics::CounterId,
+    /// `engine_bin15_late_reprices_total` (BIN15 H90)
+    pub late_reprices: core_metrics::CounterId,
+    /// `engine_bin15_late_submitted_total` (BIN15 H90)
+    pub late_submitted: core_metrics::CounterId,
+    /// `engine_bin15_late_filled_total` (BIN15 H90)
+    pub late_filled: core_metrics::CounterId,
+    /// `engine_bin15_late_skipped_stale_total` (BIN15 H90)
+    pub late_skipped_stale: core_metrics::CounterId,
+    /// `engine_bin15_late_skipped_book_total` (BIN15 H90)
+    pub late_skipped_book: core_metrics::CounterId,
+    /// `engine_bin15_late_skipped_price_total` (BIN15 H90)
+    pub late_skipped_price: core_metrics::CounterId,
+    /// `engine_bin15_late_skipped_persist_total` (BIN15 H90)
+    pub late_skipped_persist: core_metrics::CounterId,
+    /// `engine_bin15_late_skipped_cap_total` (BIN15 H90)
+    pub late_skipped_cap: core_metrics::CounterId,
     /// Per family: `p_hat_1e6`, `pos_yes_1e6`, `pos_no_1e6`,
     /// `live_outcome`, in that order.
     pub families: [[core_metrics::GaugeId; BIN15_FAMILY_GAUGES]; BIN15_METRIC_FAMILIES],
@@ -7905,6 +7926,14 @@ fn register_bin15_metrics(
     let fills = one("engine_bin15_fills_total")?;
     let unknown_fills = one("engine_bin15_unknown_fills_total")?;
     let settlement_fills = one("engine_bin15_settlement_fills_total")?;
+    let late_reprices = one("engine_bin15_late_reprices_total")?;
+    let late_submitted = one("engine_bin15_late_submitted_total")?;
+    let late_filled = one("engine_bin15_late_filled_total")?;
+    let late_skipped_stale = one("engine_bin15_late_skipped_stale_total")?;
+    let late_skipped_book = one("engine_bin15_late_skipped_book_total")?;
+    let late_skipped_price = one("engine_bin15_late_skipped_price_total")?;
+    let late_skipped_persist = one("engine_bin15_late_skipped_persist_total")?;
+    let late_skipped_cap = one("engine_bin15_late_skipped_cap_total")?;
     let mut families = [[core_metrics::GaugeId::default(); BIN15_FAMILY_GAUGES];
         BIN15_METRIC_FAMILIES];
     let mut f = 0usize;
@@ -7952,6 +7981,14 @@ fn register_bin15_metrics(
         fills,
         unknown_fills,
         settlement_fills,
+        late_reprices,
+        late_submitted,
+        late_filled,
+        late_skipped_stale,
+        late_skipped_book,
+        late_skipped_price,
+        late_skipped_persist,
+        late_skipped_cap,
         families,
     })
 }
@@ -8036,6 +8073,22 @@ fn mirror_bin15_metrics<S: strategy_core::StrategyCounters>(
         .inc(cur.unknown_fills.saturating_sub(last.unknown_fills));
     reg.counter(ids.settlement_fills)
         .inc(cur.settlement_fills.saturating_sub(last.settlement_fills));
+    reg.counter(ids.late_reprices)
+        .inc(cur.late_reprices.saturating_sub(last.late_reprices));
+    reg.counter(ids.late_submitted)
+        .inc(cur.late_submitted.saturating_sub(last.late_submitted));
+    reg.counter(ids.late_filled)
+        .inc(cur.late_filled.saturating_sub(last.late_filled));
+    reg.counter(ids.late_skipped_stale)
+        .inc(cur.late_skipped_stale.saturating_sub(last.late_skipped_stale));
+    reg.counter(ids.late_skipped_book)
+        .inc(cur.late_skipped_book.saturating_sub(last.late_skipped_book));
+    reg.counter(ids.late_skipped_price)
+        .inc(cur.late_skipped_price.saturating_sub(last.late_skipped_price));
+    reg.counter(ids.late_skipped_persist)
+        .inc(cur.late_skipped_persist.saturating_sub(last.late_skipped_persist));
+    reg.counter(ids.late_skipped_cap)
+        .inc(cur.late_skipped_cap.saturating_sub(last.late_skipped_cap));
     *last = cur;
     // The levels. A family the member does not configure keeps its row
     // at zero rather than disappearing: a missing series reads as a
@@ -12778,6 +12831,11 @@ mod tests {
     /// `the_bin15_family_is_33_counters_and_80_gauges`); the gauge side
     /// did not move.
     ///
+    /// BIN15 H90 (2026-10-13) added the late block, `late_reprices` …
+    /// `late_skipped_cap`: 33 → **41 counters** (pinned by
+    /// `the_bin15_family_is_41_counters_and_80_gauges`); the gauge side did
+    /// not move.
+    ///
     /// HYPARB H6: the family's size is pinned — `RegErr::Full` is a
     /// refused boot, and the registry is shared by every family.
     /// HC5: the Hypercall family is 31 gauges, every name distinct and
@@ -13150,12 +13208,12 @@ mod tests {
     }
 
     #[test]
-    fn the_bin15_family_is_33_counters_and_80_gauges() {
+    fn the_bin15_family_is_41_counters_and_80_gauges() {
         let mut reg = core_metrics::MetricsRegistry::new();
         let before_c = reg.counters_len();
         let before_g = reg.gauges_len();
         let ids = register_bin15_metrics(&mut reg).expect("register bin15");
-        assert_eq!(reg.counters_len() - before_c, 33, "the counter block");
+        assert_eq!(reg.counters_len() - before_c, 41, "the counter block");
         assert_eq!(reg.gauges_len() - before_g, 80, "8 families x 10 levels");
         assert!(
             reg.gauges_len() <= core_metrics::MAX_GAUGES,

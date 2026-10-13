@@ -45,7 +45,7 @@ def _shipped_luts() -> claude_worker.bin15_ref.Bin15Luts:
     )
 
 
-@pytest.mark.parametrize("name", ["parity-1", "parity-2"])
+@pytest.mark.parametrize("name", ["parity-1", "parity-2", "parity-3"])
 def test_the_shared_fixture_matches_the_engine_bit_for_bit(name: str) -> None:
     """The parity gate. Regenerate with
     ``BIN15_PARITY_WRITE=<name> cargo nextest run -p strategy-bin15 --test parity``
@@ -92,6 +92,36 @@ def test_parity_2_covers_every_s3_record_and_its_refusals() -> None:
     ws = [row.split("\t") for row in got if row.startswith("W\t") and "-" not in row.split("\t")[1]]
     assert any(int(w[3]) == d_clamp and int(w[4]) == 0 for w in ws), "nothing-left: + clamp"
     assert any(int(w[3]) == -d_clamp and int(w[4]) == 0 for w in ws), "nothing-left: - clamp"
+
+
+def test_parity_3_covers_the_late_pricer_and_every_hold() -> None:
+    """BIN15 H90: the late tape prices across the whole interval and
+    exercises every named hold."""
+    got = claude_worker.bin15_ref.replay(
+        (_FIXTURES / "parity-3.input.tsv").read_text(encoding="utf-8").splitlines()
+    )
+    assert {row.split("\t")[0] for row in got} == {"LQ"}
+    holds = {row.split("\t")[2] for row in got if row.split("\t")[1] == "HOLD"}
+    assert holds == {"MarkStale", "ObservedStale", "NoSigma", "Shape", "NoNowcast"}
+    ps = [int(row.split("\t")[1]) for row in got if row.split("\t")[1] != "HOLD"]
+    assert any(p == 1_000_000 for p in ps), "a decided Yes"
+    assert any(p == 0 for p in ps), "a decided No"
+    assert sum(1 for p in ps if 200_000 < p < 800_000) >= 50, "the open middle"
+
+
+def test_the_late_table_is_phi_to_certainty() -> None:
+    """BIN15 H90: the shipped late table is the Gaussian CDF on z = 0 …
+    8.192 — Φ(1) and Φ(1.96) as the S-law table has them, certainty at the
+    end."""
+    t = claude_worker.bin15_fit.late_phi_table_1e6()
+    assert len(t) == claude_worker.bin15_ref.LATE_PHI_POINTS
+    assert t[0] == 500_000
+    assert t[500] == claude_worker.bin15_fit.phi_table_1e6()[1_000], "Φ(1) on both grids"
+    assert t[980] == claude_worker.bin15_fit.phi_table_1e6()[1_960], "Φ(1.96) on both grids"
+    assert t[-1] == 1_000_000
+    lut = claude_worker.bin15_ref.LateLut(t)
+    assert lut.p_of_z(0) == 500_000
+    assert lut.p_of_z(1_000_000) + lut.p_of_z(-1_000_000) == 1_000_000
 
 
 # --- BIN15 S3: the venue's settlement law in the pricer ----------------

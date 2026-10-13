@@ -7503,6 +7503,316 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
     assert_eq!(bytes, 0, "strategy-bin15 hot bytes should be zero: saw {bytes}");
 }
 
+/// Gate 52b (BIN15 H90, vault doc 33 §L1–L2): the bin15 member's
+/// LATE-WINDOW entry under gate 52's law — after `configure` the member
+/// never allocates — at the law's own width: the three 15 m families
+/// (BTC, ETH, HYPE) on their own underlyings, a `Mark` AND a perp BBO per
+/// underlying every second for an hour, 90 instances of two minutes, and
+/// every late order answered (a full fill, or — once in four instances —
+/// the gateway's refusal, which re-arms the entry).
+///
+/// What runs under the guard: the 1-s grid on every mark and every perp
+/// tick (`advance_to`, the r² ring and its running sum, the basis ring),
+/// `late_fair` on every reprice inside the `[2, 30)` s window (the
+/// integer square root, the Φ lookup), the S5 poll's run on the favoured
+/// leg — Yes instances, No instances, and at-the-money ones whose books
+/// the price test refuses — both counterfactuals (P1b's and the
+/// production p̂'s, which the seeded S-law pricer stamps at τ ≥ 10 s), the
+/// σ-cold holds of the first 300 s, the take, its fill or refusal, and the
+/// settle that resets the family's `LateState`.
+///
+/// The S-law's own arms are held off (a 200 s take floor on two-minute
+/// instances, no maker) so every order in the window is the late law's —
+/// gate 52 measures those arms. Not measured: `configure`, the two boxed
+/// Φ tables (`Box<Bin15Luts>`, `Box<LateLut>`: 16 KiB each, built once at
+/// boot) and the HAR seeds.
+#[test]
+fn bin15_late_window_entry_is_zero_alloc() {
+    use core_types::{make_symbol_id, ChannelEvent, ChannelId, Order};
+    use strategy_bin15::{late, price, Bin15Params, Bin15Strategy, FAMILY_OUT_15M};
+    use strategy_core::{Ctx, Strategy, StrategyCounters, SubmitErr};
+
+    const MONO0: u64 = 4_200_000_000_000_000;
+    const WALL0: u64 = 1_789_171_200_000_000_000; // 2026-09-12 00:00:00Z
+    const FAMS: usize = 3;
+    /// One instance's life, bind to expiry, in seconds.
+    const LIFE: u64 = 120;
+    /// The tape's length in seconds.
+    const SECS: u64 = 3_600;
+    /// The instances' starts, staggered per family.
+    const STAGGER: u64 = 10;
+    /// BTC, ETH and HYPE's marks ×1e6 at the start of the tape.
+    const BASE: [i64; FAMS] = [79_000_000_000, 2_500_000_000, 40_000_000];
+
+    struct SinkCtx {
+        n: u64,
+        n_yes: u64,
+        last: Option<Order>,
+        now: u64,
+        yes: [SymbolId; FAMS],
+    }
+    impl Ctx for SinkCtx {
+        fn submit(&mut self, order: Order) -> Result<(), SubmitErr> {
+            self.n += 1;
+            let mut f = 0usize;
+            while f < FAMS {
+                self.n_yes += u64::from(order.sym == self.yes[f]);
+                f += 1;
+            }
+            self.last = Some(order);
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    /// Answer the order the last callback emitted, if any: the gateway's
+    /// refusal when its family is marked to refuse one, else a full fill.
+    /// Returns `1` for a refusal.
+    fn answer(m: &mut Bin15Strategy, ctx: &mut SinkCtx, refuse_next: &mut [u8; FAMS]) -> u64 {
+        let Some(o) = ctx.last.take() else {
+            return 0;
+        };
+        let mut f = 0usize;
+        while f < FAMS && o.sym != ctx.yes[f] && o.sym != ctx.yes[f] + 1 {
+            f += 1;
+        }
+        assert!(f < FAMS, "a late order names one of the three families' legs");
+        if refuse_next[f] == 1 {
+            refuse_next[f] = 0;
+            let mut ev = core_types::OrderEvent::ZERO;
+            ev.client_oid = o.client_oid;
+            ev.kind = core_types::ORDER_EVENT_REJECTED;
+            m.on_order_event(&ev, ctx);
+            return 1;
+        }
+        let fill = core_types::Fill::new(ctx.now, o.sym, o.side, o.px, o.qty, o.client_oid);
+        m.on_fill(&fill, ctx);
+        0
+    }
+
+    let under_sym = |u: usize| make_symbol_id(VenueId::Hyperliquid, 3 + u as u32);
+    let yes_sym = |f: usize| make_symbol_id(VenueId::Hyperliquid, 400 + 2 * f as u32);
+
+    let mut params = Bin15Params::default();
+    let mut f = 0usize;
+    while f < FAMS {
+        params.sym_yes[f] = yes_sym(f);
+        params.sym_no[f] = yes_sym(f) + 1;
+        params.family_underlying[f] = f as u8;
+        params.family_kind[f] = FAMILY_OUT_15M;
+        params.underlying_sym[f] = under_sym(f);
+        f += 1;
+    }
+    params.n_families = FAMS;
+    params.n_underlyings = FAMS;
+    params.tau_min_take_ns = [200_000_000_000, 3_600_000_000_000];
+    params.maker_enabled = 0;
+    params.cap_instance_usd_1e6 = 1_000_000_000;
+    params.cap_day_usd_1e6 = 1_000_000_000_000;
+    // The ruled law (O-H90-5..7): [2, 30) s, p ≥ 0.90, 2 c, two polls, $100.
+    params.late.enabled = 1;
+
+    // Real CDF shapes, boxed before the guard: the S-law's ramp (gate 52's)
+    // and the late table rising from 0.5 at z = 0 to certainty at z = 4.
+    let mut luts = Box::new(price::Bin15Luts::identity());
+    let mut i = 0usize;
+    while i < price::PHI_POINTS {
+        luts.phi[i] = (500_000 + (i as i64 * 499_950) / (price::PHI_POINTS as i64 - 1)) as u32;
+        i += 1;
+    }
+    let mut late_lut = Box::new(late::LateLut::flat());
+    let mut i = 0usize;
+    while i < late::LATE_PHI_POINTS {
+        let z = i as i64 * late::LATE_PHI_STEP_1E6;
+        late_lut.phi[i] = (500_000 + z.min(4_000_000) / 8) as u32;
+        i += 1;
+    }
+    let mut m = Bin15Strategy::new();
+    m.configure(params, luts, core_time::WallAnchor::new(MONO0, WALL0))
+        .expect("configure");
+    m.configure_late(late_lut);
+
+    // Boot seeds (not measured), gate 52's: the HAR window and the line,
+    // so the S-law pricer stamps p̂ and the production counterfactual runs.
+    let mut u = 0usize;
+    while u < FAMS {
+        let mut rets: Vec<(u64, i64)> = Vec::with_capacity(1_441);
+        let mut k = 0u64;
+        while k < 1_441 {
+            let r = if k % 2 == 0 { 5_164_000_000 } else { -5_164_000_000 };
+            rets.push((WALL0 / 1_000_000 - (1_441 - k) * 60_000, r));
+            k += 1;
+        }
+        m.seed_returns(u, &rets);
+        let mut pairs: Vec<(u64, i64, i64)> = Vec::with_capacity(60);
+        let mut k = 0i64;
+        while k < 60 {
+            let x = 23_000_000_000 + k * 100_000_000;
+            pairs.push((WALL0 / 1_000_000 - (60 - k as u64) * 900_000, x, x));
+            k += 1;
+        }
+        m.seed_pairs(u, FAMILY_OUT_15M, &pairs);
+        u += 1;
+    }
+
+    let at = |secs: u64| MONO0 + secs * 1_000_000_000;
+    let mark_ev = |u: usize, px_1e6: i64, ts: u64| {
+        ChannelEvent::new(ts, VenueId::Hyperliquid, ChannelId::Mark, under_sym(u), 0, 0, px_1e6, 0)
+    };
+    let roll_ev = |fam: usize, outcome: u32, strike_1e6: i64, expiry_wall: u64, settled: bool, ts: u64| {
+        let seq = u64::from(outcome) | (60u64 << 32) | ((fam as u64) << 48) | (u64::from(settled) << 56);
+        ChannelEvent::new(
+            ts,
+            VenueId::Hyperliquid,
+            ChannelId::InstrumentRoll,
+            yes_sym(fam),
+            seq,
+            0,
+            strike_1e6,
+            expiry_wall as i64,
+        )
+    };
+    let book = |sym: SymbolId, ts: u64, bid_1e6: i64, ask_1e6: i64| {
+        Tick::new(
+            ts,
+            VenueId::Hyperliquid,
+            sym,
+            0,
+            Price::from_raw(bid_1e6),
+            Qty::from_raw(100_000_000),
+            Price::from_raw(ask_1e6),
+            Qty::from_raw(100_000_000),
+        )
+    };
+
+    let mut ctx = SinkCtx {
+        n: 0,
+        n_yes: 0,
+        last: None,
+        now: at(0),
+        yes: [yes_sym(0), yes_sym(1), yes_sym(2)],
+    };
+
+    // Measured.
+    let g = AllocGuard::new();
+    let mut s_rng: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut next = || {
+        s_rng ^= s_rng << 13;
+        s_rng ^= s_rng >> 7;
+        s_rng ^= s_rng << 17;
+        s_rng
+    };
+    let mut mark = BASE;
+    let mut inst = [0u32; FAMS];
+    let mut bound_at = [0u64; FAMS];
+    // 0 = Yes decided, 1 = No decided, 2 = at the money behind 0.99 asks.
+    let mut shape = [0u8; FAMS];
+    let mut refuse_next = [0u8; FAMS];
+    let mut refused = 0u64;
+    let mut polls = 0u64;
+    let mut s = 1u64;
+    while s <= SECS {
+        // Rolls: the outgoing instance settles, then the successor binds.
+        let mut f = 0usize;
+        while f < FAMS {
+            if (s + f as u64 * STAGGER) % LIFE == 0 {
+                let ts = at(s);
+                ctx.now = ts;
+                let k = inst[f];
+                if k > 0 {
+                    m.on_venue_event(&roll_ev(f, 5_000 + 1_000 * f as u32 + k - 1, 0, 0, true, ts), &mut ctx);
+                }
+                shape[f] = (k % 4) as u8 % 3;
+                let strike = match shape[f] {
+                    0 => mark[f] / 10 * 9,
+                    1 => mark[f] / 10 * 11,
+                    _ => mark[f],
+                };
+                m.on_venue_event(
+                    &roll_ev(f, 5_000 + 1_000 * f as u32 + k, strike, WALL0 + (s + LIFE) * 1_000_000_000, false, ts),
+                    &mut ctx,
+                );
+                refuse_next[f] = u8::from(k % 4 == 3);
+                bound_at[f] = s;
+                inst[f] = k + 1;
+            }
+            f += 1;
+        }
+        // Each underlying: its mark at +0.2 s, its perp BBO at +0.3 s.
+        let mut u = 0usize;
+        while u < FAMS {
+            let step = BASE[u] / 8_000;
+            mark[u] += (next() % (2 * step as u64 + 1)) as i64 - step;
+            let ts = at(s) + 200_000_000;
+            ctx.now = ts;
+            m.on_venue_event(&mark_ev(u, mark[u], ts), &mut ctx);
+            refused += answer(&mut m, &mut ctx, &mut refuse_next);
+            let half = BASE[u] / 160_000;
+            let ts = at(s) + 300_000_000;
+            ctx.now = ts;
+            m.on_tick(&book(under_sym(u), ts, mark[u] - half, mark[u] + half), &mut ctx);
+            refused += answer(&mut m, &mut ctx, &mut refuse_next);
+            u += 1;
+        }
+        // The legs' polls, every 2 s through the window (τ from 29.6 s
+        // down to 1.6 s — the last one under the 2 s floor).
+        let mut f = 0usize;
+        while f < FAMS {
+            let e = s.wrapping_sub(bound_at[f]);
+            if inst[f] > 0 && (90..=118).contains(&e) && e % 2 == 0 {
+                let ts = at(s) + 400_000_000;
+                ctx.now = ts;
+                let (yb, ya, nb, na) = match shape[f] {
+                    0 => (800_000, 850_000, 150_000, 200_000),
+                    1 => (150_000, 200_000, 800_000, 850_000),
+                    _ => (10_000, 990_000, 10_000, 990_000),
+                };
+                m.on_tick(&book(yes_sym(f), ts, yb, ya), &mut ctx);
+                refused += answer(&mut m, &mut ctx, &mut refuse_next);
+                m.on_tick(&book(yes_sym(f) + 1, ts, nb, na), &mut ctx);
+                refused += answer(&mut m, &mut ctx, &mut refuse_next);
+                polls += 1;
+            }
+            f += 1;
+        }
+        if s % 10 == 0 {
+            let ts = at(s) + 500_000_000;
+            ctx.now = ts;
+            m.on_timer(ts, &mut ctx);
+            refused += answer(&mut m, &mut ctx, &mut refuse_next);
+        }
+        s += 1;
+    }
+    let counters = m.bin15_counters();
+    std::hint::black_box((ctx.n, counters));
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(polls > 1_000, "the legs polled through every window: {polls}");
+    assert!(counters.late_reprices > 2_000, "the late pricer ran: {counters:?}");
+    assert!(counters.late_skipped_stale > 0, "the σ-cold first windows held");
+    assert!(counters.late_skipped_persist > 0, "one poll is not two");
+    assert!(counters.late_skipped_price > 0, "the 0.99 asks were refused");
+    assert!(counters.late_submitted > 30, "real late entries: {counters:?}");
+    assert!(refused > 0, "and gateway refusals that re-armed the entry");
+    assert_eq!(
+        counters.late_filled + refused,
+        counters.late_submitted,
+        "every late order was answered once"
+    );
+    assert_eq!(ctx.n, counters.late_submitted, "every order on the tape was the late law's");
+    assert_eq!(counters.takes_submitted, counters.late_submitted, "the S-law arms stayed off");
+    assert!(
+        ctx.n_yes > 0 && ctx.n_yes < ctx.n,
+        "Yes AND No entries: {} of {}",
+        ctx.n_yes,
+        ctx.n
+    );
+    assert_eq!(allocs, 0, "the bin15 late entry allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "the bin15 late entry's hot bytes should be zero: saw {bytes}");
+}
+
 /// E1 gate 53 — the execution router's steady state allocates nothing.
 ///
 /// `RoutedDispatcher::submit` is on the engine's hot path: every order
