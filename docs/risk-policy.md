@@ -6811,7 +6811,9 @@ are `docs/binance-runbook.md`.
   deferred by BX4 to BX6's renderer, never landed (the payload vectors in
   `selftest.rs` were computed with Python `cryptography`); the HMAC
   example runs as a unit test and at boot, not in `tests/`. No RSA (no
-  product needs it).
+  product needs it). (**HK5, 2026-10-13:** the docs' two HMAC vectors are
+  in `tests/` on the arm's signing path; Binance's API documentation
+  gives no checkable Ed25519 vector — see "HK5" at the end.)
 
 #### BX-4 (E-4) — bound at boot, never named at runtime
 
@@ -15175,3 +15177,72 @@ Tests, a marker, a fuzz target and a gate. No shipped behaviour changes.
   - license-check OK;
   - fuzz `http1_response` 60 s clean (2.39 M runs; it used to abort on
     trivial input).
+
+### HK5 — the missing tests: BX-3's vectors and LAW E-4 from the cli (`exec-binance`, `cli`)
+
+Two test files. No shipped code changes.
+
+- **BX-3: the venue's own vectors, in `tests/`**
+  (`crates/exec-binance/tests/official_vectors.rs`).
+  - Binance's API documentation publishes, for `POST /api/v3/order`, one
+    HMAC secret with two signed requests: the ASCII `LTCBTC` order
+    (`c8db5682…6b71`) and the same order with a non-ASCII symbol
+    percent-encoded before signing (`e1353ec6…3ef3`).
+  - Both are pinned byte for byte on the arm's own signing path,
+    `rest::sign_hmac_in_place`: the signature is appended in the request's
+    window and the request bytes are untouched.
+  - The boot self-tests (`config::hmac_self_test`, `selftest::run`) now
+    also run from outside the crate.
+  - Before this the docs' vector was checked only by the boot self-test;
+    `hmac_signs_binances_documented_example` signs a request of its own.
+- **Ed25519 has no public Binance vector.**
+  - The documentation's Ed25519 example publishes the API key, the payload
+    and the signature, but not the private key that signed it. Its public
+    key is not published either, so the signature cannot be checked.
+  - The signer's authority stays RFC 8032 §7.1, pinned in `signer-ed25519`.
+    `selftest`'s payload vectors stay the renders' authority.
+  - BX-3's vectors item is therefore closed for HMAC and **not closable**
+    for Ed25519 from Binance's API documentation. The official connectors'
+    own test suites were not searched for an Ed25519 key pair; that is the
+    one place left to look.
+- **A-S7-100, its cli half: LAW E-4 end to end through the router**
+  (`exec_composition_loopback`
+  `slot_three_s_outcome_arm_refuses_an_unbound_leg_through_the_router`).
+  - Setup: slot 3's gateway arm in outcome mode (`outcomes`, no perps)
+    behind `SlotSplit(3, …)` in the `RoutedDispatcher`, booted through the
+    router's idle. The boot includes the outcome map's spot sheet, whose
+    end carries `SPOT_LEGS_READ`.
+  - Before any roll, a submit on the family's YES leg is refused
+    (`NoLiveRoute`) and nothing leaves the arm. The arm's
+    `refused_unbound` counts it, so the refusal is the binding's, not the
+    router's.
+  - The roll, an `InstrumentRoll` through the router's `on_venue_event`,
+    binds both legs. The same order then leaves as a place on
+    `ASSET_BASE + 10 × outcome` (YES), and a NO-leg order on `… + 1`.
+  - The boot's scripted venue answers only the reads it expects; any other
+    command panics the test.
+  - The next roll retires the instance. An order naming it is refused as
+    stale (`refused_stale`) and feeds the arm's E-4 streak (1; the unbound
+    refusal does not). The successor's order leaves on the successor's
+    asset. After the router's next idle, nothing has halted (the streak's
+    limit is 3).
+- **A-S7-100's second half moves to Section B (A-HK-6).** That half is a
+  loopback `run()` of the outcome battery, and it needs
+  `cli::outcome_battery`, which is only on the unmerged `xmm` branch.
+- **Review:** one combined pass. Risk: NEEDS-CHANGES (test-only), acted on:
+  - the "nothing halts" check now follows an idle (the router latches a
+    halt only there) and pins the E-4 streak directly;
+  - the NO leg is tested;
+  - the boot loop panics on an unexpected command instead of answering it
+    as a read.
+
+  Alloc and zero-copy: PASS. Docs: the Ed25519 statement narrowed to
+  Binance's API documentation.
+- **Gates:**
+  - clippy clean;
+  - nextest 4 633 passed (10 skipped), on HK5's tree alone — HK6's edits
+    landed after that run had compiled;
+  - copy-audit hits 27, new 0 (`tests/` is outside its reading);
+  - license-check OK.
+  - Alloc was not re-run: the cut adds tests only, and no library code
+    the alloc suite links changed.
