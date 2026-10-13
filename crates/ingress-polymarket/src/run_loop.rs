@@ -61,9 +61,19 @@ pub const RX_BUF_SIZE: usize = 64 * 1024;
 
 /// Size of the tx byte buffer. Holds the handshake, pong replies and
 /// the market subscribe — which since M1 multi-market can carry up to
-/// [`crate::PM_SUBSCRIBE_IDS_MAX`] ids (≈ 10.7 KiB payload worst
-/// case, plus WS framing), so 16 KiB.
+/// [`crate::PM_SUBSCRIBE_IDS_MAX`] ids ([`SUB_PAYLOAD_MAX`]). The worst
+/// case fits — const-asserted where the subscribe is queued (HK3).
 pub const TX_BUF_SIZE: usize = 16 * 1024;
+
+/// The handshake's allowance in the tx budget (the MEXC shape).
+const HANDSHAKE_TX_MAX: usize = 1024;
+
+/// The longest market subscribe payload (`crate::render_market_subscribe`):
+/// the envelope, then every id at [`crate::PM_ASSET_ID_MAX`] with its
+/// quotes and comma — 10 657 B at [`crate::PM_SUBSCRIBE_IDS_MAX`] = 128
+/// (HK3).
+pub const SUB_PAYLOAD_MAX: usize = br#"{"assets_ids":[],"type":"market"}"#.len()
+    + crate::PM_SUBSCRIBE_IDS_MAX * (br#","""#.len() + crate::PM_ASSET_ID_MAX);
 
 /// Compile-time guard that the tick-ring capacity is a power of two.
 /// Ring construction itself checks this, but we restate it here because
@@ -507,6 +517,11 @@ fn queue_market_subscribe(drv: &mut Driver) -> io::Result<()> {
     if !crate::market_subscribe_ids_valid(ids) {
         return Err(io::Error::other("polymarket: bad asset ids for subscribe"));
     }
+    // HK3: the handshake, the worst market subscribe and its frame header
+    // fit in tx together.
+    const {
+        assert!(HANDSHAKE_TX_MAX + SUB_PAYLOAD_MAX + core_net::WS_CLIENT_HDR_MAX <= TX_BUF_SIZE);
+    };
     queue_masked_text_frame_rendered(&mut drv.tx, &mut drv.mask_counter, |p| {
         crate::render_market_subscribe(p, ids)
     })?;
@@ -1170,6 +1185,22 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// HK3: the worst market subscribe — every id at its longest —
+    /// renders within [`SUB_PAYLOAD_MAX`], which the tx sizing assert is
+    /// built on.
+    #[test]
+    fn the_worst_market_subscribe_fits_its_bound() {
+        let big = [b'7'; crate::PM_ASSET_ID_MAX];
+        let ids = [&big[..]; crate::PM_SUBSCRIBE_IDS_MAX];
+        let mut tx = IoBuf::with_capacity(TX_BUF_SIZE);
+        let mut ctr = 0u64;
+        queue_masked_text_frame_rendered(&mut tx, &mut ctr, |p| {
+            crate::render_market_subscribe(p, &ids)
+        })
+        .unwrap();
+        assert!(tx.len() <= SUB_PAYLOAD_MAX + core_net::WS_CLIENT_HDR_MAX);
     }
 
     /// HK2: a push that arrives in the same read as the venue's FIN is

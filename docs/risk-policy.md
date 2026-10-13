@@ -3394,7 +3394,8 @@ Bybit and Hyperliquid — Hyperliquid's since pass B — OKX's `write_op` and
 its tx sizing, the `put` marker's bound). Left open:
 Deribit's subscribe-result check (`found_mask`) builds its needle apart
 from `render_channel_name`, and OKX, Deribit, Bybit and Polymarket size
-tx for their worst batch in docs, not in a const assert as MEXC does.
+tx for their worst batch in docs, not in a const assert as MEXC does
+(**both closed by HK3, 2026-10-13** — see "HK3" at the end).
 
 Gates: clippy clean; nextest 3158 passed (5 skipped); alloc 73/73 at 0 B/op
 (fresh `Compiling bench`); core-net's tests in release (the torn-frame
@@ -15055,3 +15056,59 @@ stranded UNANSWERED (`REASON_TRANSPORT`). No cap, halt or refusal changes.
 - **Gates:** clippy clean; nextest 4 623 passed (10 skipped); alloc 126/126
   at 0 B/op (a fresh `Compiling bench`); copy-audit hits 28, new 0;
   license-check OK; `cargo +nightly fuzz build` OK.
+
+### HK3 — D3's leftovers: one channel-name spelling, the tx sizing asserted (`ingress-{deribit,okx,bybit,polymarket}`)
+
+Ingress code only: no order path, cap or halt changes, and no wire byte
+changes.
+
+- **One spelling of a Deribit channel name.** The subscribe request
+  (`render_channel_name`) and the subscribe-result check (`found_mask`)
+  both read `channel_name_parts`. The parts are laid into the caller's
+  slot, never returned by value (the ZC pass B rule).
+  - `CHANNEL_NAME_MAX` (47 B) is computed from the channel prefixes and
+    suffixes and `DERIBIT_INSTR_MAX`, and is const-asserted against the
+    64 B needle scratch.
+  - The needle bytes are unchanged, and the `// COPY:` marker moved with
+    the copy.
+  - `DERIBIT_DVOL_NAME_MAX` (16) names the one DVOL width read by the
+    table, the boot check, the push parser and the sizing.
+- **The tx sizing is asserted, not argued.** Each crate gets a
+  `SUB_PAYLOAD_MAX`, built from its render's literal lengths and its
+  table's maxima:
+
+  | crate | bound | tx |
+  |---|---|---|
+  | OKX | 12 028 B at 160 args | 16 KiB |
+  | Deribit | 9 664 B at 192 channels + 8 DVOL | 24 KiB |
+  | Bybit | 7 516 B at 192 topics | 16 KiB |
+  | Polymarket | 10 657 B at 128 ids | 16 KiB |
+
+  - A `const { assert!(…) }` at the subscribe's queue site, the MEXC shape,
+    checks the handshake allowance (1 KiB) + the bound + the 14 B frame
+    header against tx.
+  - Each crate has a worst-case render test (the real output fits the
+    bound). Deribit's also feeds its own rendered request, unmasked, to
+    `found_mask` and gets `expected_mask` back.
+- **Deviation from the plan, recorded:**
+  - The plan named MEXC's `≤ TX_BUF_SIZE / 2`. Half of a 16 KiB tx cannot
+    hold the worst case on OKX (13 066 B), Polymarket (11 695 B) or Bybit
+    (8 554 B), so those three assert `≤ TX_BUF_SIZE` — what their docs
+    claimed.
+  - Deribit asserts the handshake + 2 × the bound + the header ≤ 24 KiB,
+    its doc's "≥ 2× margin".
+  - Growing tx was not taken: no frame needs it.
+- **Residual:** the channel maxima are taken over hand-listed variants
+  (`OKX_CHANNEL_NAME_MAX`, `CHANNEL_NAME_MAX`, Bybit's `OrderbookL1`). A new
+  longer channel would fall outside the bound, and only Bybit's test
+  renders every channel.
+- **Review:** one combined pass (risk NEEDS-DOCS, done; alloc PASS;
+  zero-copy PASS). Acted on: the parts array filled in place, the named
+  DVOL width, and the Deribit test reading the real render.
+- **Gates:**
+  - clippy clean;
+  - nextest 4 627 passed (10 skipped);
+  - alloc 126/126 at 0 B/op;
+  - copy-audit hits 28, new 0;
+  - license-check OK;
+  - fuzz `deribit_vol_index` 60 s clean (12.2 M runs).
