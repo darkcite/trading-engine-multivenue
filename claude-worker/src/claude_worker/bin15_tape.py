@@ -41,15 +41,9 @@ import claude_worker.hip4
 import claude_worker.pmlr
 import claude_worker.window_root
 
-#: ``ChannelEvent`` -- ``claude_worker.pmlr``'s ``<QIBB2xQQqq16x``, as a
-#: numpy dtype so a multi-hour events file is one ``fromfile``.
-EV_DT: numpy.dtype = numpy.dtype(
-    [
-        ("ts", "<u8"), ("sym", "<u4"), ("venue", "u1"), ("channel", "u1"), ("pad", "V2"),
-        ("seq", "<u8"), ("vt", "<u8"), ("v0", "<i8"), ("v1", "<i8"), ("pad2", "V16"),
-    ]
-)
-assert EV_DT.itemsize == claude_worker.pmlr.SLOT_SIZE
+#: ``ChannelEvent`` as a numpy dtype: the house one (HK17 -- one layout, kept
+#: where the reader is; this name stays for the lane's scripts).
+EV_DT: numpy.dtype = claude_worker.pmlr.CHANNEL_EVENT_DT
 
 #: The events file of the Hyperliquid lane.
 EVENTS_FILE: str = "hl-events.pmlr"
@@ -91,20 +85,6 @@ def read_manifest(run_dir: pathlib.Path) -> dict[int, str]:
         if len(cols) >= 2 and cols[0].isdigit():
             out[int(cols[0])] = cols[1]
     return out
-
-
-def _events(path: pathlib.Path) -> numpy.ndarray:
-    """The file's ChannelEvent slots, memory-mapped read-only (no copy of a
-    multi-hour file) after the house reader has checked its header."""
-    with claude_worker.pmlr.Reader(path) as reader:
-        if reader.slot_kind != claude_worker.pmlr.SLOT_KIND_CHANNEL_EVENT:
-            raise claude_worker.pmlr.PmlrError(f"{path}: not a ChannelEvent file")
-        n = len(reader)
-    if n == 0:
-        return numpy.zeros(0, dtype=EV_DT)
-    return numpy.memmap(
-        path, dtype=EV_DT, mode="r", offset=claude_worker.pmlr.HEADER_SIZE, shape=(n,)
-    )
 
 
 class VenueTape(typing.NamedTuple):
@@ -165,7 +145,7 @@ def load(run_dir: pathlib.Path) -> VenueTape | None:
     by_desc = {d: sym for sym, d in manifest.items()}
     perps = {u: by_desc[u] for u in {underlying_of(d) for d in slots.values()} if u in by_desc}
     try:
-        ev = _events(events)
+        ev = claude_worker.pmlr.channel_event_array(events)
     except (claude_worker.pmlr.PmlrError, OSError, ValueError):
         return None
     marks: dict[str, tuple[numpy.ndarray, numpy.ndarray]] = {}

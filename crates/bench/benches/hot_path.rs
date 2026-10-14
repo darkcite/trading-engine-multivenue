@@ -467,8 +467,8 @@ fn bench_long_vol_day_close(c: &mut Criterion) {
 // 12. BIN15 H90 — the late-window pricer (vault doc 33 §L2): the grid's
 //     per-mark advance and one `late_fair` inside the window, on a grid
 //     warmed with 900 s of marks and perp BBOs (σ, the basis and the
-//     observed half of the settlement minute all live). Measured, not
-//     baselined; the 0 B law is alloc gate 52b's.
+//     observed half of the settlement minute all live). Baselined since
+//     HK16 (hot_path.json); the 0 B law is alloc gate 52b's.
 // -----------------------------------------------------------------
 
 fn bench_bin15_late(c: &mut Criterion) {
