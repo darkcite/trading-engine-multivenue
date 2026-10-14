@@ -838,22 +838,6 @@ struct OutcomeState {
 /// 16 KiB, boxed with the state once at boot).
 const PARKED: usize = 256;
 
-/// A-S7-83: `outcome`'s legs are the ones bound to `sym_yes` and the next
-/// ordinal now.
-fn repeats_live_roll(assets: &AssetTable, sym_yes: u32, outcome: u32) -> bool {
-    let Some(sym_no) = sym_yes.checked_add(1) else {
-        return false;
-    };
-    let (Some(yes), Some(no)) = (
-        AssetTable::asset_id(outcome, 0),
-        AssetTable::asset_id(outcome, 1),
-    ) else {
-        return false;
-    };
-    matches!(assets.bound(sym_yes), Some((a, _, _)) if a == yes)
-        && matches!(assets.bound(sym_no), Some((a, _, _)) if a == no)
-}
-
 /// XH4i-4: one spot read's leg rows, taken as they come (none stored): the
 /// rows taken (the marked end must count them), their cost (every row, as
 /// `recon::account_view` sums it), each live leg's holding (the first row of
@@ -3873,12 +3857,10 @@ impl OrderDispatch for HlGatewayArm {
                 RollOf::Created { sym_yes, outcome } => (sym_yes, outcome),
             };
             // A-S7-83: a REPEAT of the live roll — both legs already bound
-            // to the ids it names — changes nothing here: a rebind in place
-            // would zero the legs' ledgers (a drift the reconciler halts
-            // on) and overwrite the generation a roll retired (a settlement
-            // of the old instance would name no leg). The shared binder's
-            // own fix (A-S7-81) is Anton's call; this arm guards itself.
-            if repeats_live_roll(&st.assets, sym_yes, outcome) {
+            // to the ids it names — changes nothing. The shared binder
+            // refuses to rebind it too (A-S7-81); asking first is what lets
+            // this arm count it as a repeat rather than a bind.
+            if st.assets.repeats_live_roll(sym_yes, outcome) {
                 st.counters.rolls_repeated += 1;
                 return;
             }

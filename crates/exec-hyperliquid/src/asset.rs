@@ -677,6 +677,22 @@ impl AssetTable {
         None
     }
 
+    /// A-S7-81 (A-S7-83 before it, in the gateway arm only): `outcome`'s
+    /// legs are the ones bound to `sym_yes` and the next ordinal now — the
+    /// roll repeats the live one. Two table scans; a roll is a once-per-
+    /// instance event, never a hot-path one.
+    #[must_use]
+    pub(crate) fn repeats_live_roll(&self, sym_yes: u32, outcome: u32) -> bool {
+        let Some(sym_no) = sym_yes.checked_add(1) else {
+            return false;
+        };
+        let (Some(yes), Some(no)) = (Self::asset_id(outcome, 0), Self::asset_id(outcome, 1)) else {
+            return false;
+        };
+        matches!(self.bound(sym_yes), Some((a, _, _)) if a == yes)
+            && matches!(self.bound(sym_no), Some((a, _, _)) if a == no)
+    }
+
     /// **XH4i-3a — BOTH LEGS OR NEITHER** (moved out of
     /// `HlExchange::on_venue_event`, so both arms bind a roll the same
     /// way): `sym_yes` to `outcome`'s YES leg and the next ordinal to its
@@ -695,12 +711,22 @@ impl AssetTable {
     /// Returns what the roll RETIRED ([`RollRetired`], read before the
     /// rebind overwrites the slots); `None` — nothing bound — when the
     /// symbol, the ids or the names do not fit, or the table has no room
-    /// for both legs.
+    /// for both legs. A REPEAT of the live roll (A-S7-81) returns
+    /// `Some([None, None])` and leaves the table exactly as it was.
     #[must_use]
     pub(crate) fn bind_roll(&mut self, sym_yes: u32, outcome: u32) -> Option<RollRetired> {
         let ord = core_types::symbol_ordinal(sym_yes);
         if sym_yes == core_types::SYMBOL_ID_NONE || ord >= core_types::SYMBOL_ORDINAL_MASK {
             return None;
+        }
+        // A-S7-81: a REPEAT of the live roll — both legs already bound to
+        // the ids it names — changes nothing. Rebinding in place would zero
+        // the legs' ledgers (a drift the reconciler halts on) and overwrite
+        // the generation a roll retired with the live one (a settlement of
+        // the old instance would then name no leg). Both arms bind through
+        // here, so both are covered. Asked before any name is rendered.
+        if self.repeats_live_roll(sym_yes, outcome) {
+            return Some([None, None]);
         }
         let syms = [sym_yes, sym_yes + 1];
         let mut coins = [[0u8; COIN_MAX]; 2];
@@ -716,11 +742,10 @@ impl AssetTable {
             return None;
         }
         // LAW E-8: what the roll retires, recorded before the bind
-        // overwrites the slot. A REPEAT of the live roll retires nothing:
-        // the venue pushes `outcomeCreated` once and replays none on a
-        // reconnect (probed 2026-09-26), but a replayed ring entry carries
-        // one — and a sweep of the LIVE leg would cancel every quote on it
-        // the moment the member quotes it.
+        // overwrites the slot. A whole repeat returned above (A-S7-81); a
+        // leg already bound to the id it is given is still not retired — a
+        // sweep of the LIVE leg would cancel every quote on it the moment
+        // the member quotes it.
         let mut retired: RollRetired = [None, None];
         side = 0;
         while side < 2 {
@@ -1222,6 +1247,23 @@ mod tests {
         t.bind(4_098, b, 3_254, b"#32540")
             .expect("a second slot on one asset");
         assert_eq!(t.sym_of_asset_gen(b), None, "two answers are none");
+    }
+
+    /// A-S7-81: a repeat of the live roll changes nothing — the legs'
+    /// ledgers and the generation a roll retired survive it.
+    #[test]
+    fn a_repeated_roll_keeps_the_ledgers_and_the_retired_generation() {
+        let mut t = AssetTable::new();
+        let a = AssetTable::asset_id(3_253, 0).expect("id");
+        assert!(t.bind_roll(4_096, 3_253).is_some());
+        assert!(t.bind_roll(4_096, 3_254).is_some());
+        t.book_qty(4_096, 3_000_000);
+        assert!(t.repeats_live_roll(4_096, 3_254));
+        assert!(!t.repeats_live_roll(4_096, 3_253));
+        assert_eq!(t.bind_roll(4_096, 3_254), Some([None, None]));
+        assert_eq!(t.booked_qty(4_096), Some(3_000_000));
+        assert_eq!(t.sym_of_asset_gen(a), Some((4_096, false)));
+        assert_eq!(t.sym_of_coin_gen(b"#32530"), Some((4_096, false)));
     }
 
     #[test]

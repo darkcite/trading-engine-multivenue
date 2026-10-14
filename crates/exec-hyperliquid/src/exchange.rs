@@ -3823,6 +3823,7 @@ mod tests {
         let mut x = exchange();
         x.on_venue_event(&roll(3253, 0, false, 4096));
         assert_eq!(x.sweeps_n, 0);
+        x.assets.book_qty(4096, 3_000_000);
 
         // The SAME outcome again, twice.
         x.on_venue_event(&roll(3253, 0, false, 4096));
@@ -3831,6 +3832,10 @@ mod tests {
             x.sweeps_n, 0,
             "the leg the bind re-establishes as live is not retired"
         );
+        // A-S7-81 on the blocking arm: the repeats rebind nothing, so the
+        // leg's ledger survives them; they still count as binds here.
+        assert_eq!(x.assets.booked_qty(4096), Some(3_000_000));
+        assert_eq!(x.counters.rolls_bound, 3);
 
         // A genuinely NEW outcome still retires the old one.
         x.on_venue_event(&roll(3254, 0, false, 4096));
