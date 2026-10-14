@@ -180,10 +180,12 @@ dependencies = [
  "core-ring",
  "core-time",
  "core-types",
+ "exec-gateway",
  "ingress-binance",
  "mio",
  "rustls",
  "signer-ed25519",
+ "zeroize",
 ]
 
 [[package]]

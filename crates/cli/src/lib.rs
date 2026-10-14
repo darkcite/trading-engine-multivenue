@@ -39,7 +39,19 @@ pub mod audit_replay;
 pub mod backtest;
 pub mod bin15_boot;
 pub mod bin15_live;
+/// BX7b: the Binance Demo battery (`exec-smoke --binance … --lifecycle`).
+pub mod bn_battery;
+/// BX10: the Binance Stocks battery (`exec-smoke --binance equity
+/// --lifecycle`) — MAINNET, the operator's to run (ruling S-3).
+pub mod bn_equity_battery;
+/// BX7b: the Binance Demo tools' shared client (`exec-smoke --binance…`) —
+/// the crate's own: the binary reaches it only through the two tools.
+pub(crate) mod bn_demo;
+pub mod bn_fees;
 pub mod bn_live;
+pub mod bn_ops;
+/// BX7b: the K-probes on Binance Demo (`exec-smoke --binance-probe`).
+pub mod bn_probe;
 pub mod capture_catalog;
 pub mod evm_live;
 pub mod evm_shadow;
@@ -49,6 +61,9 @@ pub mod exec_boot;
 pub mod har_boot;
 /// HAR H3.7: the long-tenor state files, rendered and written off the engine thread.
 pub mod har_writer;
+/// BIN15 H90 L4: the late window's live dust test (`hl-outcome-probe`) —
+/// MAINNET, the operator's to run (ruling O-H90-3).
+pub mod hl_outcome_probe;
 /// HYPARB H5: `hyparb.toml` → the slot-0 member's params.
 pub mod hyparb_boot;
 pub mod hyparb_live;
@@ -96,7 +111,7 @@ pub use paper::{
     BybitConnSpec, CaptureGaugeIds, CaptureMetrics, Consumers, EngineConfig, EngineCounters,
     EngineLoopResult, EngineLoopStats, ExecObs, HcMetricIds, HypercallSpec, IngressCounterIds,
     IngressStatusSet, LatencyDump, LiveDispatcher, LiveDispatcherErr, MexcConnSpec, Observability,
-    RawTapConfig, Rings, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
+    RawTapConfig, Rings, RunDirGuard, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
 };
 pub use pinning::{pin_current_thread_to_core, PinError};
 pub use sigint::{install_sigint_handler, shutdown_requested, SHUTDOWN};

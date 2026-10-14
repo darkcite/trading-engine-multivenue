@@ -1,16 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! The two rings' records (plan §3.1, §3.2; §13.3-8).
+//! The two rings' records (plan §3.1, §3.2; §13.3-8) and the duplex that
+//! carries them (BX7: the `exec-gateway` kit, O-XH13).
 //!
 //! Exactly two threads touch Binance: the **engine thread** (the arm,
 //! [`crate::arm::BnArm`]) writes [`BnCmd`] and reads [`BnEvt`]; the
 //! **gateway thread** ([`crate::gateway`]) reads [`BnCmd`] and writes
 //! [`BnEvt`] — and fills, which cross on the engine's fill lane 4. Each
 //! record is ONE cache line, `repr(C, align(64))`, `Copy`, no heap field
-//! and no destructor: `core-ring`'s `try_push_ref` copies it into its
-//! slot (the designed ring-slot copy) and the reader borrows it in place
-//! through `try_pop_ref`.
+//! and no destructor: the ring's push copies it into its slot (the
+//! designed ring-slot copy) and the reader borrows it in place through
+//! the pop guard.
+//!
+//! What is not a record crosses in the kit's shared stats block
+//! ([`exec_gateway::GatewayStats`]): the halt's sweep request and its
+//! outcome (XG-1: a cancel-all never waits on ring room), the halt word
+//! (XG-2, XG-5), the gateway's heartbeat, gauges and tallies
+//! ([`crate::arm::GW_TALLIES`], published words) and the latencies.
 //!
 //! Nothing here allocates, and nothing here is `dyn`.
 
@@ -19,8 +26,23 @@ use core_types::Side;
 /// The command ring's capacity (plan §3.1). A full ring refuses the
 /// submit with `DispatchError::QueueFull` and the router books nothing.
 pub const CMD_RING: usize = 1_024;
-/// The event ring's capacity (plan §3.1).
-pub const EVT_RING: usize = 1_024;
+/// The event ring's capacity: four command rings (XG-2, const-asserted by
+/// the kit) — the gateway also stops taking commands while the ring has
+/// less than [`crate::gateway::EVT_ROOM_MIN`] free.
+pub const EVT_RING: usize = 4_096;
+
+/// The engine thread's end: the command ring's producer, the event ring's
+/// consumer and the stats block.
+pub type BnEngineEnd = exec_gateway::EngineEnd<BnCmd, BnEvt, CMD_RING, EVT_RING>;
+/// The gateway thread's end.
+pub type BnGatewayEnd = exec_gateway::GatewayEnd<BnCmd, BnEvt, CMD_RING, EVT_RING>;
+
+/// The two ends, built once at boot (both rings and the stats block on
+/// the heap).
+#[must_use]
+pub fn duplex() -> (BnEngineEnd, BnGatewayEnd) {
+    exec_gateway::duplex::<BnCmd, BnEvt, CMD_RING, EVT_RING>()
+}
 
 // -------------------------------------------------------------------------
 // BnCmd — engine → gateway
@@ -33,20 +55,15 @@ pub const VERB_PLACE: u8 = 0;
 pub const VERB_CANCEL: u8 = 1;
 /// Replace one resting order's price and quantity (UM `order.modify`).
 pub const VERB_MODIFY: u8 = 2;
-/// A halt's sweep: cancel every order of ours on every armed product and
-/// report the result (O-BX8, plan §3.11 switch 1). Never a flatten (O-BX9).
-pub const VERB_CANCEL_ALL: u8 = 3;
-/// `Engine::stop`: the sweep of [`VERB_CANCEL_ALL`], then the gateway
-/// leaves its loop.
+/// `Engine::stop`: the gateway leaves its loop once the sweep the arm
+/// asked for alongside (the stats word) has ended. A halt's sweep has no
+/// verb (BX7, XG-1): it is [`exec_gateway::GatewayStats::request_sweep`].
 pub const VERB_SHUTDOWN: u8 = 4;
 
 /// **Engine → gateway, one per verb.** 64 B, one cache line (plan §3.2).
 ///
 /// Prices and quantities are already on the row's tick and step when the
-/// arm pushes (BX-5): the gateway renders digits and never rounds. The
-/// plan's `flags` byte (@46: spot amend-eligible, options opens-short)
-/// belongs to verbs that are not built (spot amend, BX8; options, BX9), so
-/// it stays folded into the padding until a phase gives it a reader.
+/// arm pushes (BX-5): the gateway renders digits and never rounds.
 #[repr(C, align(64))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BnCmd {
@@ -71,7 +88,15 @@ pub struct BnCmd {
     pub side: u8,
     /// The strategy slot (`strategy_id`).
     pub slot: u8,
-    _pad: [u8; 18],
+    /// [`VERB_PLACE`]: the order's `core_types::ORDER_FLAG_*` bits the arm
+    /// admitted (BX7: reduce-only → `reduceOnly=true`; post-only is a
+    /// maker's `GTX` already). 0 for every other verb.
+    pub flags: u8,
+    _pad0: [u8; 1],
+    /// `CLOCK_MONOTONIC_RAW` when the arm pushed it: the gateway's
+    /// `push_to_write` latency (0 = unstamped).
+    pub pushed_ns: u64,
+    _pad: [u8; 8],
 }
 
 const _: () = assert!(core::mem::size_of::<BnCmd>() == 64);
@@ -90,10 +115,13 @@ impl BnCmd {
         kind: 0,
         side: 0,
         slot: 0,
-        _pad: [0; 18],
+        flags: 0,
+        _pad0: [0; 1],
+        pushed_ns: 0,
+        _pad: [0; 8],
     };
 
-    /// A [`VERB_PLACE`].
+    /// A [`VERB_PLACE`] carrying the admitted order flags.
     #[inline(always)]
     #[must_use]
     #[allow(clippy::too_many_arguments)]
@@ -106,6 +134,7 @@ impl BnCmd {
         kind: u8,
         side: Side,
         slot: u8,
+        flags: u8,
     ) -> Self {
         Self {
             client_oid,
@@ -118,7 +147,10 @@ impl BnCmd {
             kind,
             side: side as u8,
             slot,
-            _pad: [0; 18],
+            flags,
+            _pad0: [0; 1],
+            pushed_ns: 0,
+            _pad: [0; 8],
         }
     }
 
@@ -137,7 +169,10 @@ impl BnCmd {
             kind: 0,
             side: 0,
             slot,
-            _pad: [0; 18],
+            flags: 0,
+            _pad0: [0; 1],
+            pushed_ns: 0,
+            _pad: [0; 8],
         }
     }
 
@@ -167,17 +202,28 @@ impl BnCmd {
             kind: core_fill::ORDER_KIND_MAKER,
             side: side as u8,
             slot,
-            _pad: [0; 18],
+            flags: 0,
+            _pad0: [0; 1],
+            pushed_ns: 0,
+            _pad: [0; 8],
         }
     }
 
-    /// A [`VERB_CANCEL_ALL`] or [`VERB_SHUTDOWN`].
+    /// A [`VERB_SHUTDOWN`].
     #[inline(always)]
     #[must_use]
-    pub const fn sweep(verb: u8) -> Self {
+    pub const fn shutdown() -> Self {
         let mut c = Self::ZERO;
-        c.verb = verb;
+        c.verb = VERB_SHUTDOWN;
         c
+    }
+
+    /// Stamped with the push time (`push_to_write`).
+    #[inline(always)]
+    #[must_use]
+    pub const fn at(mut self, now_ns: u64) -> Self {
+        self.pushed_ns = now_ns;
+        self
     }
 
     /// The side, decoded.
@@ -218,6 +264,8 @@ pub const EVT_MODIFY_FAILED: u8 = 6;
 /// of the order session's and the user stream's last frame), `b` = the
 /// measured clock offset ms, `c` = the in-doubt count; `flags` =
 /// `EVT_F_ORDER_UP | EVT_F_USER_UP | EVT_F_DEADMAN_OK | EVT_F_CLOCK_OK`.
+/// The gateway publishes its tallies into the stats block's words just
+/// before (the arm reads them on this event).
 pub const EVT_STATUS: u8 = 7;
 /// A reconciliation verdict (plan §3.10): `a` = drift USD ×1e6 (legs that
 /// differed across two cycles), `b` = unseen venue legs, `c` = foreign
@@ -234,9 +282,11 @@ pub const EVT_BUDGET: u8 = 10;
 /// a mid-session mode or permission change; BX-12, BX-19): `code`. Sticky
 /// for the life of the boot.
 pub const EVT_LOCK: u8 = 11;
-/// A sweep's result (plan §3.11): `a` = our orders still open after the
+/// A sweep's report (plan §3.11): `a` = our orders still open after the
 /// confirmation query, `b` = cancels sent; `flags` bit [`EVT_F_SWEEP_DONE`]
-/// when confirmed clear, [`EVT_F_SWEEP_STRANDED`] when it gave up.
+/// when confirmed clear, [`EVT_F_SWEEP_STRANDED`] when it gave up. The
+/// outcome the router waits on is the stats block's sweep word, set
+/// before this is emitted.
 pub const EVT_SWEEP: u8 = 12;
 /// The day's turnover per slot, read from the venue (BX3 obligation 8):
 /// `slot`, `a` = UTC day (`wall_ms / 86 400 000`), `b` = the increasing
@@ -248,12 +298,13 @@ pub const EVT_SCAN_FAIL: u8 = 14;
 /// A row's net position changed sign or left zero (breadth, BX-7):
 /// `row`, `a` = the net position ×1e6 the gateway has booked.
 pub const EVT_POSITION: u8 = 15;
-
-/// The gateway's cumulative tallies, three per event: `why` = the group
-/// (0: fills booked, foreign, unowned; 1: fills deferred, unresolved, recon
-/// ok; 2: recon failed, drift legs, unseen legs; 3: reconnects, connect
-/// failures, sweep orders left), `a` / `b` / `c` = the values.
-pub const EVT_TALLY: u8 = 16;
+/// **BX13 (R2-2) — spot's day, as the venue counts it**
+/// (`account.rateLimits.orders`): `a` = the account's unfilled orders
+/// that day, `b` = the day's limit (positive — the scanner refuses 0; a 0
+/// would keep the arm's caps), `c` = the venue's UTC day the read was
+/// asked on (`venue_ms / 86 400 000`; the arm takes one within a day of
+/// its own).
+pub const EVT_SPOT_DAY: u8 = 16;
 
 /// [`EVT_RETIRED`]: some quantity filled before the order ended.
 pub const EVT_F_HAD_FILL: u8 = 1 << 0;
@@ -272,7 +323,9 @@ pub const EVT_F_DEADMAN_OK: u8 = 1 << 2;
 /// [`EVT_STATUS`]: the clock offset is measured (BX-6).
 pub const EVT_F_CLOCK_OK: u8 = 1 << 3;
 /// [`EVT_STATUS`] flag: an output was lost (both rings and the held queue
-/// full) — the arm raises unbounded drift.
+/// full) — the arm raises unbounded drift. The gateway set the halt word
+/// at the loss ([`crate::gateway::HALT_OUTPUT_LOST`]): the router halts on
+/// it before this pulse can arrive.
 pub const EVT_F_LOST: u8 = 1 << 4;
 /// [`EVT_STATUS`] flag: the E7 session anchor is not persisted yet — the
 /// journal ring has not taken it, or its store failed (S8, F2): a restart
@@ -383,6 +436,8 @@ mod tests {
         assert_eq!(core::mem::offset_of!(BnCmd, kind), 43);
         assert_eq!(core::mem::offset_of!(BnCmd, side), 44);
         assert_eq!(core::mem::offset_of!(BnCmd, slot), 45);
+        assert_eq!(core::mem::offset_of!(BnCmd, flags), 46);
+        assert_eq!(core::mem::offset_of!(BnCmd, pushed_ns), 48);
         assert_eq!(core::mem::offset_of!(BnEvt, ts_ns), 32);
         assert_eq!(core::mem::offset_of!(BnEvt, code), 40);
         assert_eq!(core::mem::offset_of!(BnEvt, row), 44);
@@ -392,13 +447,15 @@ mod tests {
 
     #[test]
     fn constructors_stamp_the_verb_and_side() {
-        let p = BnCmd::place(9, 100, 2, 7, 3, core_fill::ORDER_KIND_IOC, Side::Ask, 5);
+        let p = BnCmd::place(9, 100, 2, 7, 3, core_fill::ORDER_KIND_IOC, Side::Ask, 5, core_types::ORDER_FLAG_REDUCE_ONLY);
         assert_eq!((p.verb, p.side(), p.slot, p.row), (VERB_PLACE, Side::Ask, 5, 3));
+        assert_eq!(p.flags, core_types::ORDER_FLAG_REDUCE_ONLY);
         let m = BnCmd::modify(10, 9, 101, 1, 0, 3, Side::Bid, 5);
         assert_eq!((m.verb, m.prev_client_oid, m.side()), (VERB_MODIFY, 9, Side::Bid));
         assert_eq!(m.kind, core_fill::ORDER_KIND_MAKER);
         assert_eq!(BnCmd::cancel(9, 3, 5).verb, VERB_CANCEL);
-        assert_eq!(BnCmd::sweep(VERB_SHUTDOWN).verb, VERB_SHUTDOWN);
+        assert_eq!(BnCmd::shutdown().verb, VERB_SHUTDOWN);
+        assert_eq!(BnCmd::cancel(9, 3, 5).at(77).pushed_ns, 77);
         let e = BnEvt::order(EVT_ACK, 1, 9, 3, 5);
         assert_eq!((e.kind, e.client_oid, e.row, e.slot), (EVT_ACK, 9, 3, 5));
     }

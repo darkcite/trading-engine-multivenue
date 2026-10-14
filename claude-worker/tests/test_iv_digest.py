@@ -14,11 +14,10 @@ import pathlib
 import sqlite3
 import struct
 
-import tests.craft
-
 import claude_worker.frames
 import claude_worker.iv_digest
 import claude_worker.pmlr
+import tests.craft
 
 _HDR = claude_worker.pmlr.HEADER_SIZE
 _SLOT = claude_worker.pmlr.SLOT_SIZE
@@ -45,18 +44,18 @@ def write_opt(
     mark_px_1e9, mark_iv_1e9, underlying_px_1e9, oi_1e6); greeks are
     stamped with distinct constants (decode covered by the layout
     pin test)."""
-    header = claude_worker.pmlr._HEADER.pack(  # noqa: SLF001 — reader-defined layout, deliberately (craft.py precedent)
-        claude_worker.pmlr.MAGIC,
-        2,
-        claude_worker.iv_digest.SLOT_KIND_OPT_SUMMARY,
-        epoch_ns,
+    header = (
+        claude_worker.pmlr._HEADER.pack(  # reader-defined layout, deliberately (craft.py precedent)
+            claude_worker.pmlr.MAGIC,
+            2,
+            claude_worker.iv_digest.SLOT_KIND_OPT_SUMMARY,
+            epoch_ns,
+        )
     )
     blob = bytearray(header + bytes(_HDR - len(header)))
     for ts, sym, venue, flags, mark, iv, uly, oi in recs:
         blob.extend(
-            claude_worker.iv_digest._OPT.pack(  # noqa: SLF001
-                ts, sym, venue, flags, mark, iv, uly, oi, 7, 8, 9, 10
-            )
+            claude_worker.iv_digest._OPT.pack(ts, sym, venue, flags, mark, iv, uly, oi, 7, 8, 9, 10)
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(bytes(blob))
@@ -83,9 +82,7 @@ def make_run(
 
 def fold(root: pathlib.Path, lo_ms: int = 0, now_ms: int = EPOCH_MS + MS_1H):
     lines: list[str] = []
-    snaps, stats = claude_worker.iv_digest.fold_iv_snapshots(
-        root, lo_ms, now_ms, lines.append
-    )
+    snaps, stats = claude_worker.iv_digest.fold_iv_snapshots(root, lo_ms, now_ms, lines.append)
     return snaps, stats, lines
 
 
@@ -113,11 +110,13 @@ def test_layout_pin_matches_wire_format_offsets(tmp_path):
     struct.pack_into("<i", slot, 52, 8)  # gamma_1e9
     struct.pack_into("<i", slot, 56, 9)  # vega_1e6
     struct.pack_into("<i", slot, 60, -10)  # theta_1e6
-    header = claude_worker.pmlr._HEADER.pack(  # noqa: SLF001
-        claude_worker.pmlr.MAGIC,
-        2,
-        claude_worker.iv_digest.SLOT_KIND_OPT_SUMMARY,
-        EPOCH_NS,
+    header = (
+        claude_worker.pmlr._HEADER.pack(  # reader-defined layout, deliberately (craft.py precedent)
+            claude_worker.pmlr.MAGIC,
+            2,
+            claude_worker.iv_digest.SLOT_KIND_OPT_SUMMARY,
+            EPOCH_NS,
+        )
     )
     path = tmp_path / "deribit-opt-summary.pmlr"
     path.write_bytes(header + bytes(_HDR - len(header)) + bytes(slot))
@@ -125,8 +124,18 @@ def test_layout_pin_matches_wire_format_offsets(tmp_path):
         assert reader.version == 2 and reader.epoch_ns == EPOCH_NS
         rec = reader.record(0)
     assert rec == claude_worker.iv_digest.OptRec(
-        111, DERIBIT_SYM, 3, 3, 51_200_000, 400_000_000,
-        77_000_000_000_000, 1_234_500_000, -7, 8, 9, -10,
+        111,
+        DERIBIT_SYM,
+        3,
+        3,
+        51_200_000,
+        400_000_000,
+        77_000_000_000_000,
+        1_234_500_000,
+        -7,
+        8,
+        9,
+        -10,
     )
 
 
@@ -197,8 +206,26 @@ def test_fold_happy_path_deribit_1m_and_1h(tmp_path):
     bucket; both timeframes."""
     recs = [
         (ANCHOR_TS, DERIBIT_SYM, 3, 3, 51_200_000, 400_000_000, 77_000_000_000_000, 1_000_000_000),
-        (ANCHOR_TS + 30_000_000_000, DERIBIT_SYM, 3, 3, 52_000_000, 500_000_000, 77_100_000_000_000, 1_100_000_000),
-        (ANCHOR_TS + 90_000_000_000, DERIBIT_SYM, 3, 3, 49_000_000, 450_000_000, 76_900_000_000_000, 1_200_000_000),
+        (
+            ANCHOR_TS + 30_000_000_000,
+            DERIBIT_SYM,
+            3,
+            3,
+            52_000_000,
+            500_000_000,
+            77_100_000_000_000,
+            1_100_000_000,
+        ),
+        (
+            ANCHOR_TS + 90_000_000_000,
+            DERIBIT_SYM,
+            3,
+            3,
+            49_000_000,
+            450_000_000,
+            76_900_000_000_000,
+            1_200_000_000,
+        ),
     ]
     root = make_run(
         tmp_path,
@@ -227,10 +254,8 @@ def test_fold_okx_flags_zero_means_null_context(tmp_path):
     """The venue-asymmetry law: OKX supplies neither mark px nor OI —
     flags 0 ⇒ NULL columns; fwdPx still fills underlying."""
     recs = [(ANCHOR_TS, OKX_SYM, 2, 0, 0, 387_806_395, 77_100_000_000_000, 0)]
-    root = make_run(
-        tmp_path, [f"okx\t{OKX_SYM}\tBTC-USD-260327-100000-C"], "okx", recs
-    )
-    snaps, stats, _ = fold(root)
+    root = make_run(tmp_path, [f"okx\t{OKX_SYM}\tBTC-USD-260327-100000-C"], "okx", recs)
+    snaps, _stats, _ = fold(root)
     key = next(k for k in snaps if k[2] == "1m")
     assert key[0] == claude_worker.frames.VENUE_OKX
     assert key[1] == "okx:BTC-USD-260327-100000-C"
@@ -266,15 +291,10 @@ def test_instrument_manifest_is_preferred_and_two_col_strict(tmp_path):
     venue derives from the SymbolId namespace byte; malformed 2-col
     lines counted."""
     recs = [(ANCHOR_TS, DERIBIT_SYM, 3, 3, 1, 400_000_000, 1, 1)]
-    root = make_run(
-        tmp_path, [f"deribit\t{DERIBIT_SYM}\tOLD-NAME"], "deribit", recs
-    )
+    root = make_run(tmp_path, [f"deribit\t{DERIBIT_SYM}\tOLD-NAME"], "deribit", recs)
     run_dir = root / f"run-{EPOCH_NS}"
     (run_dir / claude_worker.iv_digest.INSTRUMENT_MANIFEST_FILE).write_text(
-        f"{DERIBIT_SYM}\tderibit:BTC-27MAR26-100000-C\n"
-        "notanumber\tx\n"
-        f"{DERIBIT_SYM}\n"
-        "42\t\n",
+        f"{DERIBIT_SYM}\tderibit:BTC-27MAR26-100000-C\nnotanumber\tx\n{DERIBIT_SYM}\n42\t\n",
         encoding="utf-8",
     )
     parsed = claude_worker.iv_digest.read_manifest(run_dir)
@@ -292,9 +312,7 @@ def test_instrument_manifest_is_preferred_and_two_col_strict(tmp_path):
 
 def test_legacy_options_manifest_still_resolves_when_new_file_absent(tmp_path):
     recs = [(ANCHOR_TS, OKX_SYM, 2, 0, 0, 400_000_000, 1, 0)]
-    root = make_run(
-        tmp_path, [f"okx\t{OKX_SYM}\tBTC-USD-260327-100000-C"], "okx", recs
-    )
+    root = make_run(tmp_path, [f"okx\t{OKX_SYM}\tBTC-USD-260327-100000-C"], "okx", recs)
     snaps, stats, _ = fold(root)
     assert stats.unresolved_records == 0
     assert all(k[1] == "okx:BTC-USD-260327-100000-C" for k in snaps)
@@ -302,9 +320,7 @@ def test_legacy_options_manifest_still_resolves_when_new_file_absent(tmp_path):
 
 def test_fold_no_anchor_run_is_skipped_and_counted(tmp_path):
     recs = [(ANCHOR_TS, DERIBIT_SYM, 3, 3, 1, 400_000_000, 1, 1)]
-    root = make_run(
-        tmp_path, [f"deribit\t{DERIBIT_SYM}\tX"], "deribit", recs
-    )
+    root = make_run(tmp_path, [f"deribit\t{DERIBIT_SYM}\tX"], "deribit", recs)
     (root / f"run-{EPOCH_NS}" / "deribit-ticks.pmlr").unlink()
     snaps, stats, _ = fold(root)
     assert snaps == {} and stats.runs_no_anchor == 1
@@ -312,9 +328,7 @@ def test_fold_no_anchor_run_is_skipped_and_counted(tmp_path):
 
 def test_fold_unresolved_sym_is_counted_not_stored(tmp_path):
     recs = [(ANCHOR_TS, DERIBIT_SYM + 1, 3, 3, 1, 400_000_000, 1, 1)]
-    root = make_run(
-        tmp_path, [f"deribit\t{DERIBIT_SYM}\tX"], "deribit", recs
-    )
+    root = make_run(tmp_path, [f"deribit\t{DERIBIT_SYM}\tX"], "deribit", recs)
     snaps, stats, _ = fold(root)
     assert snaps == {} and stats.unresolved_records == 1
 
@@ -342,7 +356,9 @@ def test_fold_header_only_file_is_clean_skip(tmp_path):
 
 
 def test_upsert_insert_refresh_unchanged_cycle(tmp_path):
-    recs = [(ANCHOR_TS, DERIBIT_SYM, 3, 3, 51_200_000, 400_000_000, 77_000_000_000_000, 1_000_000_000)]
+    recs = [
+        (ANCHOR_TS, DERIBIT_SYM, 3, 3, 51_200_000, 400_000_000, 77_000_000_000_000, 1_000_000_000)
+    ]
     root = make_run(tmp_path, [f"deribit\t{DERIBIT_SYM}\tBTC-27MAR26-100000-C"], "deribit", recs)
     db = tmp_path / "candles.db"
     conn = claude_worker.iv_digest.open_db(db)
@@ -356,13 +372,23 @@ def test_upsert_insert_refresh_unchanged_cycle(tmp_path):
         write_opt(
             root / f"run-{EPOCH_NS}" / "deribit-opt-summary.pmlr",
             EPOCH_NS,
-            recs + [(ANCHOR_TS + 1_000_000_000, DERIBIT_SYM, 3, 3, 51_000_000, 420_000_000, 77_000_000_000_000, 1_000_000_000)],
+            [
+                *recs,
+                (
+                    ANCHOR_TS + 1_000_000_000,
+                    DERIBIT_SYM,
+                    3,
+                    3,
+                    51_000_000,
+                    420_000_000,
+                    77_000_000_000_000,
+                    1_000_000_000,
+                ),
+            ],
         )
         snaps, _, _ = fold(root)
         assert claude_worker.iv_digest.upsert_snapshots(conn, snaps, 3) == (0, 2, 0)
-        row = conn.execute(
-            "SELECT iv_c, n FROM iv_digest WHERE tf='1m'"
-        ).fetchone()
+        row = conn.execute("SELECT iv_c, n FROM iv_digest WHERE tf='1m'").fetchone()
         assert row == (0.42, 2)
     finally:
         conn.close()
@@ -379,12 +405,7 @@ def test_open_db_is_additive_beside_candles_schema(tmp_path):
     pre.close()
     conn = claude_worker.iv_digest.open_db(db)
     try:
-        names = {
-            r[0]
-            for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
-        }
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert "iv_digest" in names and "candles" in names
         assert conn.execute("SELECT x FROM candles").fetchone() == ("keep",)
     finally:
@@ -392,14 +413,19 @@ def test_open_db_is_additive_beside_candles_schema(tmp_path):
 
 
 def test_main_end_to_end(tmp_path):
-    recs = [(ANCHOR_TS, DERIBIT_SYM, 3, 3, 51_200_000, 400_000_000, 77_000_000_000_000, 1_000_000_000)]
+    recs = [
+        (ANCHOR_TS, DERIBIT_SYM, 3, 3, 51_200_000, 400_000_000, 77_000_000_000_000, 1_000_000_000)
+    ]
     root = make_run(tmp_path, [f"deribit\t{DERIBIT_SYM}\tBTC-27MAR26-100000-C"], "deribit", recs)
     db = tmp_path / "candles.db"
     rc = claude_worker.iv_digest.main(
         [
-            "--db", str(db),
-            "--replay-dir", str(root),
-            "--now-ms", str(EPOCH_MS + MS_1H),
+            "--db",
+            str(db),
+            "--replay-dir",
+            str(root),
+            "--now-ms",
+            str(EPOCH_MS + MS_1H),
             "--backfill",
         ]
     )

@@ -88,6 +88,29 @@ pub const ORDER_KIND_IOC: u8 = 1;
 /// against pool state, never rests — the law is module [`amm`]'s.
 pub const ORDER_KIND_AMM_SWAP: u8 = 2;
 
+/// HK-R4: the Binance European options' ordinal block —
+/// `core_config::universe::BN_OPT_ORDINAL_BASE` + 1 up to
+/// `BN_DATED_ORDINAL_BASE` (the cli const-asserts the pair; this crate
+/// stays below `core-config`).
+pub const BN_OPTION_ORDINALS: core::ops::Range<u32> = 1_025..2_048;
+
+/// HK-R4: a symbol that is a signal and reference leg only, never an
+/// order this model executes — the Binance European options. They are in
+/// the AI boot universe as signal legs (the O-HC17 shape), and the v2
+/// grammar's descriptor table resolved them before that; their BBO ticks
+/// would otherwise fill a paper order the venue never saw. The paper
+/// matcher and the harness refuse an order on one as `unroutable`. Paper
+/// only: a LIVE Binance slot's option order goes to the arm and never
+/// meets this predicate — and no member arms one (ruling O-BX6).
+#[inline]
+#[must_use]
+pub const fn signal_only_sym(sym: core_types::SymbolId) -> bool {
+    let ord = core_types::symbol_ordinal(sym);
+    core_types::symbol_venue_byte(sym) == core_types::VenueId::Binance as u8
+        && ord >= BN_OPTION_ORDINALS.start
+        && ord < BN_OPTION_ORDINALS.end
+}
+
 /// Open orders one sym may hold at once.
 pub const MAX_OPEN_PER_SYM: usize = 8;
 /// Open orders the whole table may hold at once.
@@ -351,6 +374,21 @@ pub fn judge_maker(
 mod tests {
     use super::*;
     use core_types::{Price, Qty, SymbolId, VenueId};
+
+    /// HK-R4: exactly the Binance options block is signal-only — its
+    /// neighbours (usdm below, dated futures above), another venue's
+    /// option block and the legacy flat anchor are not.
+    #[test]
+    fn only_the_binance_option_block_is_signal_only() {
+        let bn = |o: u32| core_types::make_symbol_id(VenueId::Binance, o);
+        assert!(signal_only_sym(bn(1_025)));
+        assert!(signal_only_sym(bn(2_047)));
+        assert!(!signal_only_sym(bn(1_024)));
+        assert!(!signal_only_sym(bn(2_048)), "a dated future");
+        assert!(!signal_only_sym(bn(513)), "a usdm perp");
+        assert!(!signal_only_sym(core_types::make_symbol_id(VenueId::Deribit, 1_025)));
+        assert!(!signal_only_sym(7), "the legacy flat anchor");
+    }
 
     const SYM: SymbolId = 7;
 

@@ -102,10 +102,45 @@ use crate::{
 pub const RX_BUF_SIZE: usize = 4 * 1024 * 1024;
 
 /// Tx buffer: handshake + one batched subscribe op, rendered straight
-/// into it (~46 B per arg; ≤ 71 B at the longest channel name, key and
-/// instrument id — × [`MAX_SUB_ARGS`] = 160 args ≤ 11.2 KiB) + resync
-/// pairs + pings. 16 KiB holds the worst case (boot-time allocation).
+/// into it ([`SUB_PAYLOAD_MAX`]) + resync pairs + pings. The worst case
+/// fits — const-asserted where the subscribe is queued (HK3). Boot-time
+/// allocation.
 pub const TX_BUF_SIZE: usize = 16 * 1024;
+
+/// The handshake's allowance in the tx budget (the MEXC shape).
+const HANDSHAKE_TX_MAX: usize = 1024;
+
+/// The longest `arg.channel` wire name (`funding-rate`).
+const OKX_CHANNEL_NAME_MAX: usize = {
+    let ch = [
+        crate::OkxChannel::BboTbt,
+        crate::OkxChannel::Trades,
+        crate::OkxChannel::MarkPrice,
+        crate::OkxChannel::FundingRate,
+        crate::OkxChannel::Books,
+        crate::OkxChannel::OptSummary,
+    ];
+    let mut m = 0;
+    let mut i = 0;
+    while i < ch.len() {
+        let l = ch[i].wire_name().len();
+        if l > m {
+            m = l;
+        }
+        i += 1;
+    }
+    m
+};
+
+/// The longest batched subscribe payload (`render_subscribe_batch`):
+/// the envelope, then per arg the separators, the longer key
+/// (`instFamily`), the longest channel name and the longest id —
+/// 12 028 B at [`MAX_SUB_ARGS`] = 160 (HK3).
+pub const SUB_PAYLOAD_MAX: usize = br#"{"op":"subscribe","args":[]}"#.len()
+    + MAX_SUB_ARGS
+        * (br#",{"channel":"","instFamily":""}"#.len()
+            + OKX_CHANNEL_NAME_MAX
+            + crate::OKX_INST_ID_MAX);
 
 /// Tick-ring capacity. Must equal `engine::TICK_RING_SIZE` — the cli
 /// const-asserts the equality when wiring lanes (8a §3.3 pattern).
@@ -470,9 +505,6 @@ pub fn drive_one<T: Transport, C: Capture>(
 ) -> io::Result<bool> {
     flush_tx(transport, drv)?;
     let fill = core_net::fill_rx(transport, &mut drv.rx)?;
-    if fill == RxFill::Eof {
-        drv.state = State::Closed;
-    }
 
     match drv.state {
         State::Connecting => {}
@@ -494,6 +526,13 @@ pub fn drive_one<T: Transport, C: Capture>(
         State::Closed => {}
     }
 
+    // HK2: an EOF closes the session only now — the frames that arrived
+    // with the FIN were parsed above — and nothing is flushed to a peer
+    // that has closed.
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+        return Ok(false);
+    }
     flush_tx(transport, drv)?;
     Ok(fill == RxFill::Full)
 }
@@ -708,6 +747,11 @@ fn queue_subscribe_all(drv: &mut Driver) -> io::Result<()> {
         args[i] = args_buf[i].expect("contiguous prefix");
         i += 1;
     }
+    // HK3: the handshake, the worst batched subscribe and its frame header
+    // fit in tx together.
+    const {
+        assert!(HANDSHAKE_TX_MAX + SUB_PAYLOAD_MAX + core_net::WS_CLIENT_HDR_MAX <= TX_BUF_SIZE);
+    };
     // Header first, the batch rendered straight into tx: no scratch.
     let args = &args[..n_args];
     queue_masked_text_frame_rendered(&mut drv.tx, &mut drv.mask_counter, |p| {
@@ -795,7 +839,7 @@ fn drain_ws_frames<C: Capture>(
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
         match read_result {
-            WsReadResult::Incomplete => return Ok(()),
+            WsReadResult::Incomplete => return core_net::incomplete_frame(&mut drv.rx),
             WsReadResult::Malformed => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -2119,6 +2163,68 @@ mod tests {
             memchr::memmem::find_iter(&body, b"\"op\":\"subscribe\"").count(),
             1
         );
+    }
+
+    /// HK3: the worst batched subscribe — every arg at the longer key and
+    /// the longest id — renders within [`SUB_PAYLOAD_MAX`], which the
+    /// tx sizing assert is built on.
+    #[test]
+    fn the_worst_batched_subscribe_fits_its_bound() {
+        let id = [b'X'; crate::OKX_INST_ID_MAX];
+        let mut args = [SubArg {
+            channel: OkxChannel::OptSummary,
+            inst_id: &id,
+        }; MAX_SUB_ARGS];
+        args[0].channel = OkxChannel::FundingRate;
+        let mut tx = IoBuf::with_capacity(TX_BUF_SIZE);
+        let mut ctr = 0u64;
+        queue_masked_text_frame_rendered(&mut tx, &mut ctr, |p| {
+            render_subscribe_batch(p, &args)
+        })
+        .unwrap();
+        assert!(tx.len() <= SUB_PAYLOAD_MAX + core_net::WS_CLIENT_HDR_MAX);
+    }
+
+    /// HK2: a push that arrives in the same read as the venue's FIN is
+    /// published before the session closes. Before, the EOF set `Closed`
+    /// ahead of the state machine and the push was dropped.
+    #[test]
+    fn a_frame_that_arrives_with_the_fin_is_published_then_the_session_closes() {
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+        let bbo = br#"{"arg":{"channel":"bbo-tbt","instId":"BTC-USDT"},"data":[{"asks":[["111.06","5","0","2"]],"bids":[["111.05","7","0","2"]],"ts":"1670324386802","seqId":363996337}]}"#;
+        let mut frame = [0u8; 512];
+        let n = wrap_text_frame(bbo, &mut frame);
+        t.inject_incoming(&frame[..n]);
+        t.mark_closed();
+        let full = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture)
+            .unwrap();
+        assert!(!full);
+        assert!(cons.try_pop_ref().is_some(), "published before the close");
+        assert_eq!(status.ticks_total(), 1);
+        assert_eq!(d.state(), State::Closed);
+    }
+
+    /// HK2: a frame larger than rx fails the session at once
+    /// (`core_net::incomplete_frame`). Before, the drain returned `Ok` on
+    /// every poll and the session stalled until the idle timeout.
+    #[test]
+    fn a_frame_larger_than_rx_fails_the_session_instead_of_stalling() {
+        let mut t = TestTransport::with_capacity(RX_BUF_SIZE + 1024);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let huge = (RX_BUF_SIZE as u64 + 4096).to_be_bytes();
+        let mut frame = vec![0u8; RX_BUF_SIZE + 512];
+        frame[0] = 0x81;
+        frame[1] = 127;
+        frame[2..10].copy_from_slice(&huge);
+        t.inject_incoming(&frame);
+        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture)
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

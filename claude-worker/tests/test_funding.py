@@ -7,11 +7,11 @@ each venue's real wire shape."""
 import json
 import pathlib
 import sqlite3
+import typing
 
 import claude_worker.candles
 import claude_worker.frames
 import claude_worker.funding
-
 
 NOW = 1_787_400_123_456
 
@@ -103,7 +103,11 @@ def test_parsers_cover_all_five_wire_shapes() -> None:
         {
             "code": "0",
             "data": [
-                {"instId": "ETH-USDT-SWAP", "fundingRate": "-0.0002", "fundingTime": "1700000000000"}
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "fundingRate": "-0.0002",
+                    "fundingTime": "1700000000000",
+                }
             ],
         }
     )
@@ -114,14 +118,27 @@ def test_parsers_cover_all_five_wire_shapes() -> None:
     )
     assert claude_worker.funding.parse_deribit_funding(dbt) == [(1_700_000_000_000, 0.00042)]
     hl = json.dumps(
-        [{"coin": "BTC", "fundingRate": "0.0000125", "premium": "0.0003", "time": 1_700_000_000_000}]
+        [
+            {
+                "coin": "BTC",
+                "fundingRate": "0.0000125",
+                "premium": "0.0003",
+                "time": 1_700_000_000_000,
+            }
+        ]
     )
     assert claude_worker.funding.parse_hl_funding(hl) == [(1_700_000_000_000, 0.0000125)]
     bb = json.dumps(
         {
             "retCode": 0,
             "result": {
-                "list": [{"symbol": "ETHUSDT", "fundingRate": "0.0001", "fundingRateTimestamp": "1700000000000"}]
+                "list": [
+                    {
+                        "symbol": "ETHUSDT",
+                        "fundingRate": "0.0001",
+                        "fundingRateTimestamp": "1700000000000",
+                    }
+                ]
             },
         }
     )
@@ -234,7 +251,7 @@ def test_cycle_fetches_and_stores_per_lane(tmp_path: pathlib.Path) -> None:
     ]
     http, calls = http_map(
         {
-            "https://okx.test/api/v5/public/funding-rate-history?instId=ETH-USDT-SWAP&limit=100": json.dumps(
+            "https://okx.test/api/v5/public/funding-rate-history?instId=ETH-USDT-SWAP&limit=100": json.dumps(  # noqa: E501 — a URL
                 {
                     "code": "0",
                     "data": [
@@ -298,7 +315,7 @@ def test_hl_fetch_resumes_from_newest_stored_point(tmp_path: pathlib.Path) -> No
     seen_bodies: list[str] = []
 
     class Http:
-        hosts = {"hyperliquid": "api.hyperliquid.xyz"}
+        hosts: typing.ClassVar[dict[str, str]] = {"hyperliquid": "api.hyperliquid.xyz"}
 
         def get(self, url: str) -> str | None:
             raise AssertionError("HL lane must POST")

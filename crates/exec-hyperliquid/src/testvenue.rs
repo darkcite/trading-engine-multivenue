@@ -62,6 +62,9 @@ pub enum Answer {
     Silent,
     /// Close the socket without answering.
     Drop,
+    /// [`Answer::Action`], then close the socket at once, so the answer
+    /// and the FIN can arrive in one read (HK2). REST: [`Answer::Action`].
+    ActionThenDrop(String),
 }
 
 /// The test's answer to each post.
@@ -309,7 +312,7 @@ fn serve(mut sock: TcpStream, cfg: Arc<ServerConfig>, sh: &Shared) {
         sh.posts.lock().unwrap().push(seen.clone());
         let answer = (sh.policy.lock().unwrap())(&seen);
         let body = match answer {
-            Answer::Action(p) | Answer::Later(_, p) | Answer::Info(p) => p,
+            Answer::Action(p) | Answer::Later(_, p) | Answer::Info(p) | Answer::ActionThenDrop(p) => p,
             Answer::Error(m) => format!(r#"{{"status":"err","response":"{m}"}}"#),
             Answer::Silent | Answer::Drop => return,
         };
@@ -440,6 +443,11 @@ fn serve_ws(
                     Answer::Info(p) => Some(post_frame(id, "info", &p)),
                     Answer::Silent => None,
                     Answer::Drop => return,
+                    Answer::ActionThenDrop(p) => {
+                        let f = post_frame(id, "action", &p);
+                        let _ = write(conn, sock, &server_frame(0x1, f.as_bytes()));
+                        return;
+                    }
                 }
             } else {
                 None

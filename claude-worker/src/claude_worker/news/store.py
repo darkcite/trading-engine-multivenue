@@ -685,7 +685,7 @@ class Store:
 
     # ---- events --------------------------------------------------------
 
-    def insert_event(  # noqa: PLR0913 — one row of the events table, field for field
+    def insert_event(  # one row of the events table, field for field
         self,
         *,
         kind: str,
@@ -948,7 +948,7 @@ class Store:
 
     # ---- budget / counters ---------------------------------------------
 
-    def budget_add(  # noqa: PLR0913
+    def budget_add(
         self,
         day: str,
         tier: str,

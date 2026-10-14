@@ -69,7 +69,9 @@ pub mod ws_handshake;
 pub use backoff::{
     should_reset_backoff, Backoff, BACKOFF_BASE_NS, BACKOFF_CAP_NS, HEALTHY_SESSION_MIN_NS,
 };
-pub use drain::{fill_rx, poll_timeout, Drained, RxFill, DRAIN_STEP_CAP, POLL_IDLE};
+pub use drain::{
+    fill_rx, incomplete_frame, poll_timeout, Drained, RxFill, DRAIN_STEP_CAP, POLL_IDLE,
+};
 pub use error::{NetworkErr, NetworkErrKind, NetworkSource};
 pub use iobuf::IoBuf;
 pub use keepalive::{
@@ -78,7 +80,7 @@ pub use keepalive::{
 pub use subs::{
     queue_masked_binary_frame, queue_masked_binary_frame_parts, queue_masked_text_frame,
     queue_masked_text_frame_parts, queue_masked_text_frame_rendered, PendingErr, PendingReq,
-    PendingTable, ReqIds, ReqKind, SubErr, SubId, SubTable,
+    PendingTable, ReqKind, SubErr, SubId, SubTable,
 };
 
 pub use http1::{

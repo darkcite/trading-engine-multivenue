@@ -1007,7 +1007,7 @@ class SecondaryReport(typing.NamedTuple):
     lines: list[str]
 
 
-def run_secondary(  # noqa: PLR0913 — one injected seam per §6 element, deliberately
+def run_secondary(  # noqa: PLR0913, PLR0917 — one injected seam per §6 element, deliberately
     universe: dict[int, int],
     markets: dict[str, int],
     hip4_pairs: tuple[tuple[int, int], ...],

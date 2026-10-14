@@ -14,15 +14,12 @@ Convention: full ``import x`` only. No ``from x import y``.
 """
 
 import dataclasses
-import json
-import pathlib
 
 import pytest
 
 import claude_worker.frames
 import claude_worker.regime
 import claude_worker.uds
-
 import tests.regime_fixture
 
 EXAMPLE = tests.regime_fixture.EXAMPLE
@@ -102,7 +99,11 @@ def test_report_history_and_cycle(tmp_path, monkeypatch):
     m = claude_worker.regime.measure(art, db, NOW_MS)
     text = claude_worker.regime.render_report(m, {}, None, [], NOW_MS)
     assert "[fast] measured: trend=bull shape=trend" in text
-    assert "declared: none" in text and "engine: unreachable" in text and "24h: (no history yet)" in text
+    assert (
+        "declared: none" in text
+        and "engine: unreachable" in text
+        and "24h: (no history yet)" in text
+    )
     # The cycle appends one history line and refreshes the percentiles
     # once per UTC day (a stamp file), never declares.
     lines: list[str] = []
@@ -110,11 +111,11 @@ def test_report_history_and_cycle(tmp_path, monkeypatch):
     assert m1 is not None
     assert (directory / claude_worker.regime.HISTORY_FILE).is_file()
     assert (directory / "params-refreshed-utc-day").is_file()
-    assert any("percentiles refreshed" in l for l in lines)
+    assert any("percentiles refreshed" in line for line in lines)
     assert (tmp_path / "regime.toml.bak").is_file(), "the refresh keeps a backup"
     lines.clear()
     claude_worker.regime.run_cycle(art, db, directory, NOW_MS + 60_000, lines.append)
-    assert not any("percentiles refreshed" in l for l in lines), "once per day"
+    assert not any("percentiles refreshed" in line for line in lines), "once per day"
     tail = claude_worker.regime.history_tail(directory, NOW_MS + 60_000)
     assert len(tail) == 2 and tail[0]["minute"] == m.minute
     timeline = claude_worker.regime.words_timeline(tail, "fast")
@@ -129,7 +130,10 @@ def test_report_history_and_cycle(tmp_path, monkeypatch):
     assert "24h: trend=bull" in text and " -> " in text
     assert not (directory / claude_worker.regime.DECLARED_FILE).exists(), "the cycle never declares"
     # Absent inputs are honest no-ops.
-    assert claude_worker.regime.run_cycle(tmp_path / "nope.toml", db, directory, NOW_MS, lines.append) is None
+    assert (
+        claude_worker.regime.run_cycle(tmp_path / "nope.toml", db, directory, NOW_MS, lines.append)
+        is None
+    )
 
 
 def test_refresh_params_rewrites_only_the_six_lines(tmp_path):
@@ -145,13 +149,11 @@ def test_refresh_params_rewrites_only_the_six_lines(tmp_path):
     # Funding percentiles over the signed rates (nearest rank).
     assert values["fast"]["fund_p30_1e9"] < values["fast"]["fund_p70_1e9"]
     # Only the six percentile lines changed; comments beside them survive.
-    diff = [
-        (a, b) for a, b in zip(before.splitlines(), after.splitlines(), strict=True) if a != b
-    ]
+    diff = [(a, b) for a, b in zip(before.splitlines(), after.splitlines(), strict=True) if a != b]
     assert len(diff) == 8, diff  # 4 keys × 2 profiles (fast + slow)
     for a, b in diff:
         key = a.split("=")[0].strip()
-        assert key in claude_worker.regime._PERCENTILE_KEYS  # noqa: SLF001
+        assert key in claude_worker.regime._PERCENTILE_KEYS
         assert b.startswith(f"{key} = ")
         if "#" in a:
             assert "#" in b, "the comment survived"
@@ -161,7 +163,9 @@ def test_refresh_params_rewrites_only_the_six_lines(tmp_path):
     m = claude_worker.regime.measure(art, db, NOW_MS)
     assert claude_worker.frames.regime_word_dims(m.evaluator.measured[0])["vol"] == "normal"
     # Too few samples keep zeros (dimension stays ABSENT), honestly.
-    tiny = claude_worker.regime.compute_percentiles(art, _db(tmp_path / "tiny", minutes=100), NOW_MS)
+    tiny = claude_worker.regime.compute_percentiles(
+        art, _db(tmp_path / "tiny", minutes=100), NOW_MS
+    )
     assert tiny["fast"]["rv_p30_bps_1e9"] == 0 and tiny["fast"]["rv_samples"] == 1
     assert tiny["fast"]["rv_p70_bps_1e9"] == 0
 
@@ -193,7 +197,15 @@ def test_declarations_persist_send_and_repush_with_remaining_ttl(tmp_path):
     word = claude_worker.regime.declaration_word(dims)
     assert claude_worker.frames.regime_word_is_wire_declared(word)
     assert claude_worker.frames.regime_word_dims(word) == dims
-    for bad in ("", "trend", "trend:sideways", "source:declared", "trend:bull,trend:bear", "rel:lagging", "trend:bull|neutral"):
+    for bad in (
+        "",
+        "trend",
+        "trend:sideways",
+        "source:declared",
+        "trend:bull,trend:bear",
+        "rel:lagging",
+        "trend:bull|neutral",
+    ):
         with pytest.raises(ValueError):
             claude_worker.regime.parse_declaration(bad)
     path = claude_worker.regime.persist_declared(directory, {"fast": word}, NOW_MS, 900, "operator")
@@ -206,7 +218,9 @@ def test_declarations_persist_send_and_repush_with_remaining_ttl(tmp_path):
     assert not claude_worker.regime.declared_is_fresh(entries["fast"], NOW_MS - 1)
     # A second profile merges; the first entry survives.
     slow = claude_worker.regime.declaration_word({"trend": "neutral"})
-    claude_worker.regime.persist_declared(directory, {"slow": slow}, NOW_MS + 60_000, 600, "strategist")
+    claude_worker.regime.persist_declared(
+        directory, {"slow": slow}, NOW_MS + 60_000, 600, "strategist"
+    )
     entries = claude_worker.regime.load_declared(directory)
     assert set(entries) == {"fast", "slow"} and entries["slow"]["source"] == "strategist"
     # Frames: one SetRegime per profile, px = the word, qty = the audit word.
@@ -229,14 +243,19 @@ def test_declarations_persist_send_and_repush_with_remaining_ttl(tmp_path):
     assert n == 2 and len(client.sent) == 2
     assert client.sent[0]["ttl_ns"] == 600 * S and client.sent[1]["ttl_ns"] == 360 * S
     assert client.sent[0]["px"] == word and client.sent[1]["px"] == slow
-    assert any("re-sent 2" in l for l in lines)
+    assert any("re-sent 2" in line for line in lines)
     # slow expires first (NOW+660 s): after it only fast goes, with its
     # remaining 239 s; after both expired, nothing.
     client = _RecordingClient()
-    assert claude_worker.regime.repush_declared(client, directory, NOW_MS + 661_000, lines.append) == 1
+    assert (
+        claude_worker.regime.repush_declared(client, directory, NOW_MS + 661_000, lines.append) == 1
+    )
     assert client.sent[0]["param_id"] == 0 and client.sent[0]["ttl_ns"] == 239 * S
     client = _RecordingClient()
-    assert claude_worker.regime.repush_declared(client, directory, NOW_MS + 2_000_000, lines.append) == 0
+    assert (
+        claude_worker.regime.repush_declared(client, directory, NOW_MS + 2_000_000, lines.append)
+        == 0
+    )
     assert client.sent == []
     # A torn file is a fresh start, never a crash.
     path.write_text("{not json", encoding="utf-8")
@@ -259,26 +278,48 @@ def test_label_grammar_mirror_and_regime_allows():
     assert (r.label_masks(["vol:low|unknown"])["fast"] >> 16) & 0xFF == 0b001 | r.DIM_UNKNOWN_BIT
     assert (r.label_masks(["source:*"])["fast"] >> 48) & 0xFF == 0b111
     for bad in (
-        ["trend:sideways"], ["mood:happy"], ["medium:trend:bull"], ["trend:bull", "fast:trend:bear"],
-        ["rel:lagging"], ["trend"], ["trend:"], ["source:unknown|nope"],
+        ["trend:sideways"],
+        ["mood:happy"],
+        ["medium:trend:bull"],
+        ["trend:bull", "fast:trend:bear"],
+        ["rel:lagging"],
+        ["trend"],
+        ["trend:"],
+        ["source:unknown|nope"],
     ):
         with pytest.raises(ValueError):
             r.label_masks(bad)
     # The gate: a measured bull word passes a bull label, a bear word does
     # not, UNKNOWN fails every constrained label and passes ANY.
     bull_word = claude_worker.frames.regime_word(
-        trend="bull", shape="trend", vol="normal", fund="pos", level="normal", stretch="neutral", source="measured"
+        trend="bull",
+        shape="trend",
+        vol="normal",
+        fund="pos",
+        level="normal",
+        stretch="neutral",
+        source="measured",
     )
     bear_word = claude_worker.frames.regime_word(
-        trend="bear", shape="trend", vol="normal", fund="pos", level="normal", stretch="neutral", source="measured"
+        trend="bear",
+        shape="trend",
+        vol="normal",
+        fund="pos",
+        level="normal",
+        stretch="neutral",
+        source="measured",
     )
     assert r.regime_allows(["trend:bull"], {"fast": bull_word, "slow": r.UNKNOWN_WORD})
     assert not r.regime_allows(["trend:bull"], {"fast": bear_word, "slow": r.UNKNOWN_WORD})
     assert not r.regime_allows(["trend:bull"], {"fast": r.UNKNOWN_WORD, "slow": r.UNKNOWN_WORD})
     assert not r.regime_allows(["trend:bull"], {})
     assert r.regime_allows([], {}), "an unlabelled lane is always open"
-    assert not r.regime_allows(["trend:bull", "slow:trend:bull"], {"fast": bull_word, "slow": r.UNKNOWN_WORD})
-    assert r.regime_allows(["trend:bull", "slow:trend:bull"], {"fast": bull_word, "slow": bull_word})
+    assert not r.regime_allows(
+        ["trend:bull", "slow:trend:bull"], {"fast": bull_word, "slow": r.UNKNOWN_WORD}
+    )
+    assert r.regime_allows(
+        ["trend:bull", "slow:trend:bull"], {"fast": bull_word, "slow": bull_word}
+    )
     # An unknown-marked VOL passes a label that omits VOL and fails one that names it.
     marked = claude_worker.frames.regime_word(trend="bull", vol="unknown", source="measured")
     assert r.regime_allows(["trend:bull"], {"fast": marked})
@@ -318,7 +359,16 @@ def test_main_lanes_exit_codes(tmp_path, monkeypatch, capsys):
     db = _db(tmp_path)
     directory = tmp_path / "regime"
     monkeypatch.setenv(claude_worker.regime.METRICS_URL_ENV, DEAD_URL)
-    common = ["--regime", str(art), "--db", str(db), "--dir", str(directory), "--now-ms", str(NOW_MS)]
+    common = [
+        "--regime",
+        str(art),
+        "--db",
+        str(db),
+        "--dir",
+        str(directory),
+        "--now-ms",
+        str(NOW_MS),
+    ]
     assert claude_worker.regime.main(["report", *common]) == 0
     out = capsys.readouterr().out
     assert "[fast] measured: trend=bull" in out and "engine: unreachable" in out
@@ -327,22 +377,70 @@ def test_main_lanes_exit_codes(tmp_path, monkeypatch, capsys):
     assert "fast=trend=bull" in capsys.readouterr().out
     assert claude_worker.regime.main(["refresh-params", "--dry-run", *common]) == 0
     assert "(dry-run)" in capsys.readouterr().out
-    assert claude_worker.regime.main(["declare", "--fast", "trend:bull", "--slow", "measured", "--ttl", "60", "--no-send", *common]) == 0
+    assert (
+        claude_worker.regime.main(
+            [
+                "declare",
+                "--fast",
+                "trend:bull",
+                "--slow",
+                "measured",
+                "--ttl",
+                "60",
+                "--no-send",
+                *common,
+            ]
+        )
+        == 0
+    )
     out = capsys.readouterr().out
-    assert "fast=trend=bull" in out and "slow=trend=bull shape=trend" in out and "no frame sent" in out
+    assert (
+        "fast=trend=bull" in out and "slow=trend=bull shape=trend" in out and "no frame sent" in out
+    )
     entries = claude_worker.regime.load_declared(directory)
     assert entries["fast"]["ttl_s"] == 60 and entries["slow"]["dims"]["trend"] == "bull"
     assert "source" not in entries["slow"]["dims"], "measured declares WITHOUT the SOURCE byte"
     assert claude_worker.regime.main(["declare", "--ttl", "60", "--no-send", *common]) == 2
-    assert claude_worker.regime.main(["declare", "--fast", "trend:sideways", "--no-send", *common]) == 2
-    assert claude_worker.regime.main(["report", "--regime", str(tmp_path / "nope.toml"), "--db", str(db), "--dir", str(directory)]) == 2
-    assert claude_worker.regime.main(["cycle", "--regime", str(art), "--db", str(tmp_path / "nope.db"), "--dir", str(directory)]) == 2
+    assert (
+        claude_worker.regime.main(["declare", "--fast", "trend:sideways", "--no-send", *common])
+        == 2
+    )
+    assert (
+        claude_worker.regime.main(
+            [
+                "report",
+                "--regime",
+                str(tmp_path / "nope.toml"),
+                "--db",
+                str(db),
+                "--dir",
+                str(directory),
+            ]
+        )
+        == 2
+    )
+    assert (
+        claude_worker.regime.main(
+            [
+                "cycle",
+                "--regime",
+                str(art),
+                "--db",
+                str(tmp_path / "nope.db"),
+                "--dir",
+                str(directory),
+            ]
+        )
+        == 2
+    )
     # The report shows the persisted declaration.
     assert claude_worker.regime.main(["report", *common]) == 0
     assert "declared: trend=bull" in capsys.readouterr().out
 
 
-def test_lane_gate_any_label_is_open_without_any_source_and_labels_judge_words(tmp_path, monkeypatch):
+def test_lane_gate_any_label_is_open_without_any_source_and_labels_judge_words(
+    tmp_path, monkeypatch
+):
     r = claude_worker.regime
     monkeypatch.setenv(r.METRICS_URL_ENV, DEAD_URL)
     assert r.lane_gate((), NOW_MS) == (True, "regime: any")
@@ -368,10 +466,20 @@ def test_verdict_parse_words_and_the_serve_step(tmp_path, monkeypatch):
     m = r.measure(art, db, NOW_MS)
     measured = r.measured_declaration_words(m)
     assert set(measured) == {"fast", "slow"}
-    assert all((w >> (8 * r.DIM_SOURCE)) & 0xFF == 0 for w in measured.values()), "SOURCE byte stripped"
+    assert all((w >> (8 * r.DIM_SOURCE)) & 0xFF == 0 for w in measured.values()), (
+        "SOURCE byte stripped"
+    )
     assert r.parse_verdict({"fast": "measured"}) == {"fast": "measured"}
-    assert r.parse_verdict({"slow": "trend:neutral, vol:unknown"}) == {"slow": "trend:neutral, vol:unknown"}
-    for bad in ({}, {"mid": "measured"}, {"fast": 1}, {"fast": "trend:up"}, {"fast": "trend:bull|bear"}):
+    assert r.parse_verdict({"slow": "trend:neutral, vol:unknown"}) == {
+        "slow": "trend:neutral, vol:unknown"
+    }
+    for bad in (
+        {},
+        {"mid": "measured"},
+        {"fast": 1},
+        {"fast": "trend:up"},
+        {"fast": "trend:bull|bear"},
+    ):
         with pytest.raises(ValueError):
             r.parse_verdict(bad)
     words = r.verdict_words({"fast": "measured", "slow": "trend:neutral"}, measured)
@@ -392,7 +500,13 @@ def test_verdict_parse_words_and_the_serve_step(tmp_path, monkeypatch):
     out = r.serve_regime_step(art, db, directory, NOW_MS + 60_000, client, 600)
     assert set(out.declared) == {"fast", "slow"} and out.seqs == [1, 2]
     assert client.sent[0]["ttl_ns"] == 600 * S and client.sent[0]["qty"] == m.evaluator.measured[0]
-    r.persist_declared(directory, {"fast": r.declaration_word({"trend": "bear"})}, NOW_MS + 120_000, 900, r.SOURCE_OPERATOR)
+    r.persist_declared(
+        directory,
+        {"fast": r.declaration_word({"trend": "bear"})},
+        NOW_MS + 120_000,
+        900,
+        r.SOURCE_OPERATOR,
+    )
     client = _RecordingClient()
     out = r.serve_regime_step(art, db, directory, NOW_MS + 180_000, client, 600)
     assert set(out.declared) == {"slow"} and [s["param_id"] for s in client.sent] == [1]
@@ -402,12 +516,22 @@ def test_verdict_parse_words_and_the_serve_step(tmp_path, monkeypatch):
     assert set(out.declared) == {"fast", "slow"}
     # Absent inputs / a transport failure never raise.
     out = r.serve_regime_step(tmp_path / "nope.toml", db, directory, NOW_MS, None, 600)
-    assert out.measurement is None and out.skipped.startswith("no regime artifact") and out.digest == r.REGIME_UNMEASURED_TEXT
+    assert (
+        out.measurement is None
+        and out.skipped.startswith("no regime artifact")
+        and out.digest == r.REGIME_UNMEASURED_TEXT
+    )
 
     class _Refusing:
         def send_cmd(self, **kwargs):
             raise claude_worker.uds.UdsError("refused")
 
     out = r.serve_regime_step(art, db, directory, NOW_MS + 2_000_000, _Refusing(), 600)
-    assert out.measurement is not None and out.skipped.startswith("transport: refused") and out.seqs == []
-    assert r.load_declared(directory)["fast"]["source"] == r.SOURCE_SERVE, "persisted before the send"
+    assert (
+        out.measurement is not None
+        and out.skipped.startswith("transport: refused")
+        and out.seqs == []
+    )
+    assert r.load_declared(directory)["fast"]["source"] == r.SOURCE_SERVE, (
+        "persisted before the send"
+    )

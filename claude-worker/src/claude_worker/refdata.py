@@ -426,7 +426,7 @@ def _fetch_target(
                 upsert_snapshot(conn, target.venue, target.descriptor, KIND_OI, now_ms, oi)
                 rows += 1
         return rows, failed, False
-    if lane.name == "bybit" or lane.name == "bybit-linear":
+    if lane.name in {"bybit", "bybit-linear"}:
         # WS9: one tickers body carries vol (+ OI on linear).
         if not budget.try_acquire():
             return 0, False, True

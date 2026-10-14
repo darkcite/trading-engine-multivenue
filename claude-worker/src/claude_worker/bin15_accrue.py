@@ -62,6 +62,14 @@ Lanes (``python -m claude_worker.bin15_accrue <lane>``):
   filled the same way.
 - ``status`` — rows, instances, settled entries, days covered.
 
+BIN15 H90 (vault doc 33 §L3): when the artifact switches the LATE-window
+entry on, the sidecar's ``bin15_late_entries`` / ``bin15_late_fires`` /
+``bin15_late_law`` blocks land in two more stores (``late_entries.tsv``,
+``late_fires.tsv``, :mod:`claude_worker.bin15_late`): every lane takes
+optional ``--late-entries`` / ``--late-fires`` paths, ``report`` adds the
+late law's verdict against doc 33 §3's bars, ``relabel`` fills their
+unknown labels. No verb is added; an artifact without the law writes none.
+
 Convention: full ``import x`` only. No ``from x import y``.
 """
 
@@ -81,6 +89,7 @@ import tempfile
 import typing
 
 import claude_worker.backtest
+import claude_worker.bin15_late
 import claude_worker.bin15_ledger
 import claude_worker.bin15_ref
 import claude_worker.bin15_tape
@@ -787,12 +796,14 @@ def relabel(
     report: typing.Callable[[str], None],
     dry_run: bool = False,
     first_fires: pathlib.Path | None = None,
+    late: tuple[pathlib.Path, pathlib.Path] | None = None,
 ) -> tuple[RelabelCount, RelabelCount]:
     """The ``relabel`` lane: load the captures, label every instance on
     them on LAW E-11, correct both stores (a timestamped backup of each
     changed file first), and say what moved. BIN15 S5: the first-fire
     store, when given, has its unknown labels filled the same way (its
-    rows are venue-clocked by construction, so nothing else moves)."""
+    rows are venue-clocked by construction, so nothing else moves); BIN15
+    H90: so do the two late stores, ``late = (entries, fires)``."""
     tapes = claude_worker.bin15_tape.load_all(dirs, report)
     if tapes:
         deltas = sorted(t.delta_ns / 1e9 for t in tapes)
@@ -818,6 +829,7 @@ def relabel(
     # between would be lost. Their stat at read time is checked again just
     # before each replace, and a change aborts that write (rerun).
     seen = (_stat(ledger), _stat(entries), None if first_fires is None else _stat(first_fires))
+    late_seen = None if late is None else (_stat(late[0]), _stat(late[1]))
     led_rows = claude_worker.bin15_ledger.read_ledger(ledger)
     ent_rows = read_entries(entries)
     ff_rows = [] if first_fires is None else read_first_fires(first_fires)
@@ -829,6 +841,22 @@ def relabel(
     cf = RelabelCount(len(ff_rows), 0, len(ff_rows), 0, 0, filled_ff)
     if first_fires is not None:
         report(f"  first fires: rows {cf.rows}: unknown labels filled {cf.filled}")
+    late_le: list = []
+    late_lf: list = []
+    late_counts = (RelabelCount(0, 0, 0, 0, 0), RelabelCount(0, 0, 0, 0, 0))
+    if late is not None:
+        le_rows = claude_worker.bin15_late.read_late_entries(late[0])
+        lf_rows = claude_worker.bin15_late.read_late_fires(late[1])
+        late_le, f_le = claude_worker.bin15_late.fill_labels(le_rows, labels)
+        late_lf, f_lf = claude_worker.bin15_late.fill_labels(lf_rows, labels)
+        late_counts = (
+            RelabelCount(len(le_rows), 0, len(le_rows), 0, 0, f_le),
+            RelabelCount(len(lf_rows), 0, len(lf_rows), 0, 0, f_lf),
+        )
+        report(
+            f"  late entries: rows {len(le_rows)}: unknown labels filled {f_le}; late fires: "
+            f"rows {len(lf_rows)}: unknown labels filled {f_lf}"
+        )
     for name, c in (("ledger", cl), ("entries", ce)):
         report(
             f"  {name}: rows {c.rows}: converted {c.converted}, already on the venue "
@@ -861,6 +889,15 @@ def relabel(
     ]
     if first_fires is not None:
         stores.append((first_fires, cf, seen[2], lambda p: write_first_fires(p, new_ff)))
+    if late is not None and late_seen is not None:
+        stores.append(
+            (late[0], late_counts[0], late_seen[0],
+             lambda p: claude_worker.bin15_late.write_late_entries(p, late_le))
+        )
+        stores.append(
+            (late[1], late_counts[1], late_seen[1],
+             lambda p: claude_worker.bin15_late.write_late_fires(p, late_lf))
+        )
     for path, count, before, write in stores:
         if not (count.converted or count.collided or count.filled):
             continue
@@ -1001,9 +1038,11 @@ def accrue(
     first_fires: pathlib.Path,
     fee_flag: str,
     report: typing.Callable[[str], None] = lambda s: None,
+    late: tuple[pathlib.Path, pathlib.Path] | None = None,
 ) -> tuple[int, int, int, int]:
     """``(windows driven, ledger rows added, entries added, first fires
-    added)``."""
+    added)``. BIN15 H90: with ``late = (entries, fires)`` the sidecars'
+    late blocks merge into those stores too (what they added is reported)."""
     runs = hip4_runs(replay_dir, day)
     if not runs:
         report(f"bin15-accrue: no HIP-4 run for {day or 'any day'}")
@@ -1012,6 +1051,9 @@ def accrue(
     new_entries: list[tuple[Entry, tuple[int, int]]] = []
     new_fires: list[FirstFire] = []
     dropped_fires = 0
+    new_late_e: list = []
+    new_late_f: list = []
+    dropped_late = 0
     units = 0
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp)
@@ -1046,6 +1088,11 @@ def accrue(
                     fires, dropped = first_fires_from_sidecar(text)
                     new_fires.extend(fires)
                     dropped_fires += dropped
+                    if late is not None:
+                        le, lf, ld = claude_worker.bin15_late.late_from_sidecar(text)
+                        new_late_e.extend(le)
+                        new_late_f.extend(lf)
+                        dropped_late += ld
                 shutil.rmtree(unit, ignore_errors=True)
                 shutil.rmtree(seed_dir, ignore_errors=True)
     merged_l, added_l = claude_worker.bin15_ledger.merge(
@@ -1071,7 +1118,37 @@ def accrue(
     merged_f, added_f = merge_first_fires(read_first_fires(first_fires), new_fires)
     if merged_f:
         write_first_fires(first_fires, merged_f)
+    if late is not None:
+        _merge_late(late, new_late_e, new_late_f, dropped_late, report)
     return (units, added_l, added_e, added_f)
+
+
+def _merge_late(
+    late: tuple[pathlib.Path, pathlib.Path],
+    new_e: typing.Sequence[claude_worker.bin15_late.LateEntry],
+    new_f: typing.Sequence[claude_worker.bin15_late.LateFire],
+    dropped: int,
+    report: typing.Callable[[str], None],
+) -> None:
+    """BIN15 H90: the late blocks into their stores; nothing is written
+    when neither store has a row (an artifact without the law)."""
+    if dropped:
+        report(
+            f"bin15-accrue: {dropped} late row(s) dropped -- their run has no venue clock "
+            "(the late stores are on the venue's law only)"
+        )
+    me, ae = claude_worker.bin15_late.merge_late_entries(
+        claude_worker.bin15_late.read_late_entries(late[0]), new_e
+    )
+    mf, af = claude_worker.bin15_late.merge_late_fires(
+        claude_worker.bin15_late.read_late_fires(late[1]), new_f
+    )
+    if me:
+        claude_worker.bin15_late.write_late_entries(late[0], me)
+    if mf:
+        claude_worker.bin15_late.write_late_fires(late[1], mf)
+    if me or mf:
+        report(f"bin15-accrue: +{ae} late entr(ies) -> {late[0]}; +{af} late fire(s) -> {late[1]}")
 
 
 # ---------------------------------------------------------------------
@@ -1094,7 +1171,7 @@ def needed_n(p: float, edge: float, z: float = 2.0) -> int:
     """Settled entries to resolve ``edge`` at ``z`` SE, at hit rate p."""
     if edge <= 0:
         return 0
-    return int(math.ceil(z * z * p * (1 - p) / (edge * edge)))
+    return math.ceil(z * z * p * (1 - p) / (edge * edge))
 
 
 def on_label(entries: typing.Sequence[Entry], label: str) -> tuple[list[Entry], int]:
@@ -1158,7 +1235,7 @@ def render(entries: typing.Sequence[Entry], fee_bps: int) -> list[str]:
         "edge or a restart gap (counted, never guessed)"
     )
     if not settled:
-        return out + ["no settled entry yet: nothing to score"]
+        return [*out, "no settled entry yet: nothing to score"]
 
     n = len(settled)
     k = sum(1 for e in settled if e.won)
@@ -1415,15 +1492,25 @@ def main(argv: list[str] | None = None) -> int:
     ac.add_argument("--entries", default=None)
     ac.add_argument("--first-fires", default=None)
     ac.add_argument("--fee-bps", default="hl.prediction:0:0")
+    ac.add_argument("--late-entries", default=None, help="BIN15 H90: the late entry store")
+    ac.add_argument("--late-fires", default=None, help="BIN15 H90: the late first-fire store")
 
     rp = sub.add_parser("report", help="the three questions, with the error bar")
     rp.add_argument("--entries", default=None)
     rp.add_argument("--first-fires", default=None)
     rp.add_argument("--fee-bps-exit", type=int, default=0)
+    rp.add_argument("--late-entries", default=None)
+    rp.add_argument("--late-fires", default=None)
+    rp.add_argument(
+        "--late-fee-bps", type=int, default=claude_worker.bin15_late.SETTLE_FEE_BPS,
+        help="the settlement fee the late bars are scored net of (bps of the payout)",
+    )
 
     st = sub.add_parser("status", help="rows, instances, settled, days")
     st.add_argument("--entries", default=None)
     st.add_argument("--first-fires", default=None)
+    st.add_argument("--late-entries", default=None)
+    st.add_argument("--late-fires", default=None)
 
     rl = sub.add_parser(
         "relabel", help="BIN15 S4: correct both stores in place onto the venue's law and clock"
@@ -1435,9 +1522,15 @@ def main(argv: list[str] | None = None) -> int:
     rl.add_argument("--ledger", default=None)
     rl.add_argument("--entries", default=None)
     rl.add_argument("--first-fires", default=None)
+    rl.add_argument("--late-entries", default=None)
+    rl.add_argument("--late-fires", default=None)
     rl.add_argument("--dry-run", action="store_true")
 
     args = ap.parse_args(argv)
+    late = (
+        claude_worker.bin15_late.late_entries_path(args.late_entries),
+        claude_worker.bin15_late.late_fires_path(args.late_fires),
+    )
 
     if args.lane == "relabel":
         dirs = tape_dirs(args.pull, args.runs)
@@ -1448,6 +1541,7 @@ def main(argv: list[str] | None = None) -> int:
             print,
             dry_run=args.dry_run,
             first_fires=first_fires_path(args.first_fires),
+            late=late,
         )
         return 0
 
@@ -1467,7 +1561,8 @@ def main(argv: list[str] | None = None) -> int:
         ent = entries_path(args.entries)
         ff = first_fires_path(args.first_fires)
         units, dl, de, df = accrue(
-            replay, bin15, day, led, ent, ff, args.fee_bps, lambda s: print(s, file=sys.stderr)
+            replay, bin15, day, led, ent, ff, args.fee_bps, lambda s: print(s, file=sys.stderr),
+            late=late,
         )
         print(
             f"bin15-accrue: day {day}: {units} window(s) <= 2 h driven; "
@@ -1479,8 +1574,16 @@ def main(argv: list[str] | None = None) -> int:
     ent = entries_path(args.entries)
     rows = read_entries(ent)
     fires = read_first_fires(first_fires_path(args.first_fires))
+    late_e = claude_worker.bin15_late.read_late_entries(late[0])
+    late_f = claude_worker.bin15_late.read_late_fires(late[1])
     if args.lane == "status":
         print(f"bin15-accrue: {ent} entries={len(rows)} first_fires={len(fires)}")
+        if late_e or late_f:
+            print(
+                f"  LATE (H90): entries={len(late_e)} "
+                f"settled={sum(1 for e in late_e if e.settled)} fires={len(late_f)} "
+                f"laws={len({e.law for e in late_e} | {f.law for f in late_f})}"
+            )
         for origin, group in by_origin(rows):
             settled = [e for e in group if e.settled]
             venue = sum(1 for e in group if e.venue)
@@ -1494,6 +1597,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print(f"bin15-accrue: {ent}")
+    if late_e or late_f:
+        # BIN15 H90: the late law first -- it is the one being scored now.
+        for line in claude_worker.bin15_late.render_late(late_e, late_f, args.late_fee_bps):
+            print(f"  {line}")
     groups = by_origin(rows)
     if not groups:
         print("  no entries yet")

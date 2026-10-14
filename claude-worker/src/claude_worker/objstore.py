@@ -188,7 +188,7 @@ def canonical_query(pairs: collections.abc.Sequence[tuple[str, str]]) -> str:
     return "&".join(name + "=" + value for name, value in encoded)
 
 
-def sign(  # noqa: PLR0913 — one parameter per SigV4 input, deliberately
+def sign(  # one parameter per SigV4 input, deliberately
     *,
     method: str,
     path: str,
@@ -295,7 +295,7 @@ def _file_sha256_and_md5(path: pathlib.Path) -> tuple[str, str]:
 class ObjectStore:
     """The verbs this archive needs, and no others."""
 
-    def __init__(  # noqa: PLR0913 — one parameter per injected seam, deliberately
+    def __init__(  # one parameter per injected seam, deliberately
         self,
         endpoint: Endpoint,
         creds: Credentials,
@@ -319,7 +319,7 @@ class ObjectStore:
     def _amz_date(self) -> str:
         return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(self._clock()))
 
-    def _build(  # noqa: PLR0913 — one parameter per request component, deliberately
+    def _build(  # one parameter per request component, deliberately
         self,
         method: str,
         key: str,

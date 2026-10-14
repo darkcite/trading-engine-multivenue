@@ -777,6 +777,218 @@ fn render_bin15_first_fires(
     s
 }
 
+/// BIN15 H90 (vault doc 33 §L3): one LATE-window entry, as the member
+/// submitted it — caught on the late law's own `covered` 0 -> 1 edge, so it
+/// is an order that really went to the ring. `p_late_1e6` / `sigma_1e9` are
+/// what P1b priced it at; `ctl_p_1e6` the production p̂ on the same side at
+/// the same reprice (`-1`: it did not price there, inside its tail).
+#[derive(Copy, Clone, Debug)]
+struct Bin15LateEntryRow {
+    ts_ns: u64,
+    family: u8,
+    outcome: u32,
+    expiry_ns: u64,
+    /// `1` the member bought YES, `0` NO.
+    is_yes: u8,
+    px_1e6: i64,
+    qty_1e6: i64,
+    p_late_1e6: i32,
+    sigma_1e9: u32,
+    ctl_p_1e6: i32,
+    /// PAPER, by construction: a replay models every fill.
+    origin: u8,
+}
+
+/// BIN15 H90: one instance's two LATE counterfactuals — P1b's test at
+/// persistence 1 (`ff_*`) and the production p̂ under the same test
+/// (`ctl_*`) — each its FIRST hold, logged and never traded; `entered` once
+/// the member placed a late entry on the instance. Held per family while
+/// its instance holds the slot (the member's `LateState` resets at the
+/// settle), flushed when another takes it.
+#[derive(Copy, Clone, Debug)]
+struct Bin15LateFireRow {
+    family: u8,
+    outcome: u32,
+    expiry_ns: u64,
+    ff_ts_ns: u64,
+    ff_is_yes: u8,
+    ff_px_1e6: i32,
+    ctl_ts_ns: u64,
+    ctl_is_yes: u8,
+    ctl_px_1e6: i32,
+    entered: u8,
+}
+
+impl Bin15LateFireRow {
+    /// A live instance's row, before either test held.
+    fn of(family: u8, fam: &strategy_bin15::FamilyState) -> Self {
+        Self {
+            family,
+            outcome: fam.live.outcome,
+            expiry_ns: fam.live.expiry_ns,
+            ff_ts_ns: 0,
+            ff_is_yes: 0,
+            ff_px_1e6: 0,
+            ctl_ts_ns: 0,
+            ctl_is_yes: 0,
+            ctl_px_1e6: 0,
+            entered: 0,
+        }
+    }
+
+    /// Each stamp written once (`0` -> a stamp), never moved after.
+    fn observe(&mut self, st: &strategy_bin15::LateState) {
+        if self.ff_ts_ns == 0 && st.ff_ts != 0 {
+            self.ff_ts_ns = st.ff_ts;
+            self.ff_is_yes = st.ff_yes;
+            self.ff_px_1e6 = st.ff_px_1e6;
+        }
+        if self.ctl_ts_ns == 0 && st.ctl_ts != 0 {
+            self.ctl_ts_ns = st.ctl_ts;
+            self.ctl_is_yes = st.ctl_yes;
+            self.ctl_px_1e6 = st.ctl_px_1e6;
+        }
+        self.entered |= st.covered;
+    }
+
+    /// Whether either test ever held — a row worth keeping.
+    const fn fired(&self) -> bool {
+        self.ff_ts_ns != 0 || self.ctl_ts_ns != 0
+    }
+}
+
+/// BIN15 H90: one family's late step of the harness observer, as
+/// [`track_first_fire`]'s.
+fn track_late_fire(
+    rows: &mut Vec<Bin15LateFireRow>,
+    open: &mut Option<Bin15LateFireRow>,
+    family: u8,
+    fam: &strategy_bin15::FamilyState,
+    st: &strategy_bin15::LateState,
+) {
+    if !fam.is_live() {
+        return;
+    }
+    let outcome = fam.live.outcome;
+    if open.as_ref().is_some_and(|r| r.outcome != outcome) {
+        flush_late_fire(rows, open);
+    }
+    open.get_or_insert_with(|| Bin15LateFireRow::of(family, fam)).observe(st);
+}
+
+/// Moves an ended instance's late row into the block when either test held.
+fn flush_late_fire(rows: &mut Vec<Bin15LateFireRow>, open: &mut Option<Bin15LateFireRow>) {
+    if let Some(r) = open.take().filter(Bin15LateFireRow::fired) {
+        rows.push(r);
+    }
+}
+
+/// BIN15 H90: the `bin15_late_entries` block of the detail sidecar —
+/// additive, written only when the artifact switched the late law on.
+/// `tau_ms` is the time to expiry at the submit; the settlement fields are
+/// every entry block's ([`label_of`]).
+fn render_bin15_late_entries(
+    rows: &[Bin15LateEntryRow],
+    labels: &BTreeMap<u32, crate::backtest::binary::BinaryLabel>,
+) -> String {
+    use core::fmt::Write as _;
+    let mut s = String::with_capacity(32 + rows.len() * 320);
+    s.push_str("\"bin15_late_entries\":[");
+    for (i, r) in rows.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let (y, y_next, settle_px) = label_of(labels, r.outcome);
+        let ctl = OrNull((r.ctl_p_1e6 >= 0).then_some(i64::from(r.ctl_p_1e6)));
+        // Writing into a `String` cannot fail.
+        let _ = write!(
+            s,
+            "{{\"ts_ns\":{},\"family\":{},\"outcome\":{},\"expiry_ns\":{},\"tau_ms\":{},\
+             \"is_yes\":{},\"px_1e6\":{},\"qty_1e6\":{},\"p_late_1e6\":{},\"sigma_1e9\":{},\
+             \"ctl_p_1e6\":{ctl},\"origin\":{},\"y\":{},\"y_next_strike\":{},\"settle_px_1e6\":{}}}",
+            r.ts_ns,
+            r.family,
+            r.outcome,
+            r.expiry_ns,
+            r.expiry_ns.saturating_sub(r.ts_ns) / 1_000_000,
+            r.is_yes,
+            r.px_1e6,
+            r.qty_1e6,
+            r.p_late_1e6,
+            r.sigma_1e9,
+            r.origin,
+            y,
+            y_next,
+            settle_px
+        );
+    }
+    s.push(']');
+    s
+}
+
+/// BIN15 H90: the `bin15_late_fires` block — every instance on which either
+/// late counterfactual held, each four `null`s where it never did.
+fn render_bin15_late_fires(
+    rows: &[Bin15LateFireRow],
+    labels: &BTreeMap<u32, crate::backtest::binary::BinaryLabel>,
+) -> String {
+    use core::fmt::Write as _;
+    let cols = |ts: u64, yes: u8, px: i32| {
+        if ts == 0 {
+            (OrNull(None), OrNull(None), OrNull(None))
+        } else {
+            (
+                OrNull(i64::try_from(ts).ok()),
+                OrNull(Some(i64::from(yes))),
+                OrNull(Some(i64::from(px))),
+            )
+        }
+    };
+    let mut s = String::with_capacity(32 + rows.len() * 280);
+    s.push_str("\"bin15_late_fires\":[");
+    for (i, r) in rows.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let (y, y_next, _) = label_of(labels, r.outcome);
+        let (fts, fyes, fpx) = cols(r.ff_ts_ns, r.ff_is_yes, r.ff_px_1e6);
+        let (cts, cyes, cpx) = cols(r.ctl_ts_ns, r.ctl_is_yes, r.ctl_px_1e6);
+        // Writing into a `String` cannot fail.
+        let _ = write!(
+            s,
+            "{{\"family\":{},\"outcome\":{},\"expiry_ns\":{},\"ff_ts_ns\":{fts},\
+             \"ff_is_yes\":{fyes},\"ff_px_1e6\":{fpx},\"ctl_ts_ns\":{cts},\"ctl_is_yes\":{cyes},\
+             \"ctl_px_1e6\":{cpx},\"entered\":{},\"y\":{},\"y_next_strike\":{}}}",
+            r.family,
+            r.outcome,
+            r.expiry_ns,
+            r.entered,
+            y,
+            y_next
+        );
+    }
+    s.push(']');
+    s
+}
+
+/// BIN15 H90: the `bin15_late_law` block — the late law the member ran
+/// under, so a reader never scores two laws in one number.
+fn render_bin15_late_law(l: &strategy_bin15::late::LateParams) -> String {
+    format!(
+        "\"bin15_late_law\":{{\"enabled\":{},\"tau_min_ns\":{},\"tau_max_ns\":{},\
+         \"p_min_1e6\":{},\"e_1e6\":{},\"persist_polls\":{},\"usd_1e6\":{},\
+         \"sigma_k_1e3\":{}}}",
+        l.enabled,
+        l.tau_min_ns,
+        l.tau_max_ns,
+        l.p_min_1e6,
+        l.e_1e6,
+        l.persist_polls,
+        l.usd_1e6,
+        l.sigma_k_1e3
+    )
+}
+
 /// The `bin15_ledger` block of the detail sidecar (O4b; spec §6.6).
 ///
 /// `y` is `null` for an instance whose settlement this window cannot
@@ -911,6 +1123,11 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
     // stamped on the sidecar so a reader never pairs two laws in one number;
     // S5b: with the control's bound, the law its `ctl_*` columns record.
     let mut bin15_entry_law: (u8, u64, i64) = (1, 0, core_config::bin15::E_ENTRY_1E6_DEFAULT);
+    // BIN15 H90: the late law's rows and the law itself, `None` when the
+    // artifact keeps it off (then no late block is written at all).
+    let mut bin15_late_entries: Vec<Bin15LateEntryRow> = Vec::new();
+    let mut bin15_late_fires: Vec<Bin15LateFireRow> = Vec::new();
+    let mut bin15_late_law: Option<strategy_bin15::late::LateParams> = None;
     // HYPARB H6: the gas ledger. The fill model has no gas lane, so the
     // member's per-ATTEMPT charge is the ledger; the OOS share comes
     // off the reported OOS net (0 for every other member).
@@ -1338,6 +1555,10 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                 strat
                     .configure(boot.params, luts, WallAnchor::new(0, 0))
                     .map_err(|e| HarnessError::Usage(format!("bin15: configure refused: {e}")))?;
+                // BIN15 H90: the late Φ table, as at boot.
+                if let Some(l) = &boot.late_lut {
+                    strat.configure_late(Box::new((**l).clone()));
+                }
                 let mut u = 0usize;
                 while u < boot.seeds.len() {
                     let seed = &boot.seeds[u];
@@ -1361,6 +1582,7 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     boot.params.entry_elapsed_max_ns,
                     boot.params.entry_control_e_1e6,
                 );
+                bin15_late_law = (boot.params.late.enabled == 1).then_some(boot.params.late);
                 let line = format!(
                     "member: bin15 params={} hash={} families={} underlyings={} \
                      instances={} seeds={} seed_dir={} entry={} anchor=wall (identity)",
@@ -1396,6 +1618,14 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                 let mut first_fires: Vec<Bin15FirstFireRow> = Vec::new();
                 let mut open_fires =
                     [None::<Bin15FirstFireRow>; strategy_bin15::BIN15_MAX_FAMILIES];
+                // BIN15 H90: the late entries, on the late law's own `covered`
+                // edge, and its counterfactuals per instance.
+                let mut late_entries: Vec<Bin15LateEntryRow> = Vec::new();
+                let mut late_cov: [u8; strategy_bin15::BIN15_MAX_FAMILIES] =
+                    [0; strategy_bin15::BIN15_MAX_FAMILIES];
+                let mut late_fires: Vec<Bin15LateFireRow> = Vec::new();
+                let mut open_late =
+                    [None::<Bin15LateFireRow>; strategy_bin15::BIN15_MAX_FAMILIES];
                 let out = {
                     let ledger_ref = &mut ledger;
                     let last_ref = &mut last_sample;
@@ -1403,6 +1633,10 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     let cov_ref = &mut was_covered;
                     let first_ref = &mut first_fires;
                     let open_ref = &mut open_fires;
+                    let late_entries_ref = &mut late_entries;
+                    let late_cov_ref = &mut late_cov;
+                    let late_fires_ref = &mut late_fires;
+                    let open_late_ref = &mut open_late;
                     let mut observe = |rec: &MergedRec, s: &strategy_bin15::Bin15Strategy| {
                         let mut f = 0usize;
                         while f < s.n_families() {
@@ -1492,6 +1726,33 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                             }
                             cov_ref[f] = fam.covered;
                             track_first_fire(first_ref, &mut open_ref[f], f as u8, fam);
+                            // BIN15 H90: the late entry edge. `pend_take`
+                            // holds the order that set the flag (the emit
+                            // books it before returning), so the price and
+                            // size are the ones submitted.
+                            if let Some(st) = s.late_state(f) {
+                                if fam.is_live()
+                                    && st.covered == 1
+                                    && late_cov_ref[f] == 0
+                                    && fam.pend_take.live()
+                                {
+                                    late_entries_ref.push(Bin15LateEntryRow {
+                                        ts_ns: rec.wall_ns,
+                                        family: f as u8,
+                                        outcome: fam.live.outcome,
+                                        expiry_ns: fam.live.expiry_ns,
+                                        is_yes: fam.pend_take.is_yes,
+                                        px_1e6: fam.pend_take.px_1e6,
+                                        qty_1e6: fam.pend_take.qty_1e6,
+                                        p_late_1e6: st.entry_p_1e6,
+                                        sigma_1e9: st.entry_sigma_1e9,
+                                        ctl_p_1e6: st.entry_ctl_p_1e6,
+                                        origin: core_types::FILL_ORIGIN_PAPER,
+                                    });
+                                }
+                                late_cov_ref[f] = st.covered;
+                                track_late_fire(late_fires_ref, &mut open_late_ref[f], f as u8, fam, st);
+                            }
                             f += 1;
                         }
                     };
@@ -1515,6 +1776,14 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                 // which interleaves the families.
                 first_fires.sort_unstable_by_key(|r| (r.start_ns, r.family));
                 bin15_first_fires = first_fires;
+                let mut slot = 0usize;
+                while slot < open_late.len() {
+                    flush_late_fire(&mut late_fires, &mut open_late[slot]);
+                    slot += 1;
+                }
+                late_fires.sort_unstable_by_key(|r| (r.expiry_ns, r.family));
+                bin15_late_fires = late_fires;
+                bin15_late_entries = late_entries;
                 let c = strat.counters();
                 let counters = format!(
                     "member: bin15 reprices={} rolls={} rolls_settled={} spec_overrides={} \
@@ -1805,9 +2074,18 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     &binary_underlying,
                     window_end_wall_ns,
                 );
+                // BIN15 H90: additive, and only when the late law was on.
+                let late = bin15_late_law.map_or_else(String::new, |l| {
+                    format!(
+                        ",{},{},{}",
+                        render_bin15_late_entries(&bin15_late_entries, &y),
+                        render_bin15_late_fires(&bin15_late_fires, &y),
+                        render_bin15_late_law(&l)
+                    )
+                });
                 format!(
                     "{},{},{},\"bin15_entry_law\":{{\"persist_polls\":{},\"elapsed_max_ns\":{},\
-                     \"control_e_entry_1e6\":{}}}",
+                     \"control_e_entry_1e6\":{}}}{late}",
                     render_bin15_ledger(&bin15_ledger, &y),
                     render_bin15_entries(&bin15_entries, &bin15_first_fires, &y),
                     render_bin15_first_fires(&bin15_first_fires, &bin15_entries, &y),
@@ -2225,5 +2503,95 @@ mod tests {
         let mut open = Some(row);
         flush_first_fire(&mut rows, &mut open);
         assert_eq!((rows.len(), open.is_none()), (1, true));
+    }
+
+    /// BIN15 H90: the late blocks are the wire to `claude_worker.bin15_late`,
+    /// which reads them by key — the entry row with its PAPER stamp, its
+    /// beliefs and its settlement, the fires with `null` for a test that
+    /// never held, and the law the member ran under.
+    #[test]
+    fn the_late_blocks_carry_the_entry_its_counterfactuals_and_the_law() {
+        let row = Bin15LateEntryRow {
+            ts_ns: 880_000_000_000,
+            family: 0,
+            outcome: 7,
+            expiry_ns: 900_000_000_000,
+            is_yes: 1,
+            px_1e6: 950_000,
+            qty_1e6: 105_000_000,
+            p_late_1e6: 991_000,
+            sigma_1e9: 120_000,
+            ctl_p_1e6: -1,
+            origin: core_types::FILL_ORIGIN_PAPER,
+        };
+        let mut y = BTreeMap::new();
+        y.insert(
+            7u32,
+            crate::backtest::binary::BinaryLabel {
+                value_1e6: Some(1_000_000),
+                px_1e6: Some(77_083_333_333),
+                y_next_strike: 1_000_000,
+            },
+        );
+        let s = render_bin15_late_entries(&[row], &y);
+        for want in [
+            "\"bin15_late_entries\":[{",
+            "\"tau_ms\":20000",
+            "\"p_late_1e6\":991000",
+            "\"sigma_1e9\":120000",
+            "\"ctl_p_1e6\":null",
+            "\"origin\":1",
+            "\"y\":1000000",
+            "\"settle_px_1e6\":77083333333",
+        ] {
+            assert!(s.contains(want), "{want} in {s}");
+        }
+        let with_ctl = render_bin15_late_entries(&[Bin15LateEntryRow { ctl_p_1e6: 930_000, ..row }], &y);
+        assert!(with_ctl.contains("\"ctl_p_1e6\":930000"), "{with_ctl}");
+
+        // The fire row: P1b held, the production pricer never did.
+        let mut fam = strategy_bin15::FamilyState::default();
+        fam.live.outcome = 7;
+        fam.live.expiry_ns = 900_000_000_000;
+        fam.live.strike_1e6 = 1;
+        let mut st = strategy_bin15::LateState::default();
+        let mut rows = Vec::new();
+        let mut open = None;
+        track_late_fire(&mut rows, &mut open, 0, &fam, &st);
+        st.ff_ts = 875_000_000_000;
+        st.ff_yes = 1;
+        st.ff_px_1e6 = 940_000;
+        st.covered = 1;
+        track_late_fire(&mut rows, &mut open, 0, &fam, &st);
+        // A later stamp never moves the first.
+        st.ff_ts = 885_000_000_000;
+        track_late_fire(&mut rows, &mut open, 0, &fam, &st);
+        flush_late_fire(&mut rows, &mut open);
+        assert_eq!(rows.len(), 1);
+        let f = render_bin15_late_fires(&rows, &y);
+        for want in [
+            "\"ff_ts_ns\":875000000000",
+            "\"ff_is_yes\":1",
+            "\"ff_px_1e6\":940000",
+            "\"ctl_ts_ns\":null",
+            "\"ctl_is_yes\":null",
+            "\"entered\":1",
+            "\"y\":1000000",
+        ] {
+            assert!(f.contains(want), "{want} in {f}");
+        }
+        // An instance where neither test held is not a row.
+        let mut none = Vec::new();
+        let mut open2 = Some(Bin15LateFireRow::of(0, &fam));
+        flush_late_fire(&mut none, &mut open2);
+        assert!(none.is_empty());
+
+        let law = strategy_bin15::late::LateParams {
+            enabled: 1,
+            ..Default::default()
+        };
+        let l = render_bin15_late_law(&law);
+        assert!(l.starts_with("\"bin15_late_law\":{\"enabled\":1,"), "{l}");
+        assert!(l.contains("\"tau_min_ns\":2000000000") && l.contains("\"sigma_k_1e3\":1550"), "{l}");
     }
 }

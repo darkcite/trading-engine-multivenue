@@ -6,6 +6,209 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-13 — Binance options: in the AI boot universe; an order on one is unroutable in paper and the harness (HK7b)
+
+**What changed**
+- `core_fill::signal_only_sym` marks the Binance options' ordinal block
+  (`BN_OPT_ORDINAL_BASE + 1` … `BN_DATED_ORDINAL_BASE − 1`). The paper
+  matcher and the harness now count an order on one as `unroutable` and
+  never fill it. Before, a v2 ruleset row could already name a
+  `binance-opt:` descriptor as its order instrument (the descriptor table
+  has carried them since M2.4), and the matcher filled it against the
+  option's BBO.
+- The AI boot universe (the v1 grammar's sym list) holds every Binance
+  option the boot selected, beside the Hypercall options.
+- A LIVE Binance slot's option order goes to its arm as before: the
+  predicate is paper-only, and no member arms one (O-BX6).
+
+**Impact**
+- After the next release build and restart, a committed ruleset row whose
+  order leg is `binance-opt:` stops filling in paper. The refusal is
+  silent: `unroutable` counts it, and no REJECTED event is emitted.
+- `audit-pnl` / `backtest` over an old root that holds such orders now
+  count them unroutable.
+
+**Migration steps**
+1. Before the restart, check the committed ruleset for an order leg on
+   `binance-opt:` (`claude-worker` `library list`, or the active table's
+   JSON). A row that is meant to trade one needs its own ruling.
+2. The routine restart of a binary built from this change.
+
+## 2026-10-13 — candles.db: no future bars, `--repair-future`, the Hypercall index as 1 m capture bars (HK7)
+
+**What changed**
+- **Future bars are refused.** A real bar never opens after the moment
+  it is fetched. The candles lane refuses a fetched bar that opens more
+  than `FUTURE_SKEW_MS` (one minute) after the wall clock at its page
+  (the cycle's `now` where no clock is passed: OKX's backward walk, the
+  HAR backfill). The lane's report line gains ` future-refused=N` when
+  it refuses any.
+  - The MEXC request now ends at `now`, as Deribit's and HL's do. Asked
+    for the future, the MEXC TradFi perps (`mexc-perp:AAPLSTOCK_USDT`,
+    `SPY_USDT`, `USOIL_USDT`) answered flat placeholder bars ahead of
+    time: 1 m bars hours ahead, 1 h bars weeks ahead, 1 d bars to 2028.
+    Stored, they froze each series' gap-fill frontier until their date
+    passed (`pages=0`), and the placeholder minutes behind a jumped
+    frontier were never fetched again — the flat 1 m days the H3 plan
+    §1.6 found.
+- **`python -m claude_worker.candles --repair-future`** (one-shot,
+  operator-invoked): deletes every stored row, of any source and any
+  timeframe this lane writes, that opens more than a minute after now;
+  prints each purged series and its row count; then runs the normal
+  cycle, so those series fetch again.
+- **Capture windows start on a whole minute.** The hourly window
+  (`now − 26 h`) used to start mid-minute, so its first minute was
+  folded from its tail and stored over the whole minute a day-old cycle
+  had written. This affected the PM tick capture lane too (about one
+  minute per series per cycle; its 5 m / 15 m derivations followed).
+- **The Hypercall index capture (H3 plan §5 W1).** Every hourly cycle
+  folds the `Mark` prints on `hypercall-idx:<U>` from each run's
+  `hypercall-events.pmlr` into 1 m `capture` bars (venue 9, descriptor
+  `hypercall-idx:<U>`).
+  - Prints are placed by the index's own source time; `n` counts
+    distinct prints in the minute.
+  - 5 m and 15 m bars derive from them like any capture base.
+  - `--capture-backfill` folds the whole replay root.
+  - Report line: `candles: capture hypercall-idx: minutes=… +…
+    refreshed=… rest_kept=…`.
+- `claude_worker.pmlr` imports numpy (`channel_event_array` maps a
+  ChannelEvent file as one array), so every worker verb loads numpy at
+  start: about 50–100 ms, and numpy is already a dependency.
+
+**Impact**
+- candles.db grows by about 12 × (1 440 + 288 + 96) ≈ 22 k rows a day
+  (1 m bars plus the 5 m and 15 m derivations, one series per configured
+  underlying).
+- `har_seed compare --descriptor hypercall-idx:<U> --against <desc>`
+  judges the index against the trade candles per full day both cover
+  (≥ 1 380 minutes each). The H3 plan picks each series' primary after
+  ≥ 7 such days.
+
+**Migration steps**
+1. The worker runs from the working tree, so the hourly cycle picks this
+   up at once; nothing restarts.
+2. Once, from the repo root, outside a cycle:
+   `pgrep -f 'claude[-_]worke[r]' || (set -a; . ./.env; set +a; cd claude-worker && uv run python -m claude_worker.candles --repair-future)`.
+   Expect the three MEXC TradFi series' future rows to be purged and
+   their series fetched again.
+
+## 2026-10-13 — A failed boot removes its empty `run-<epoch_ns>/` capture directory (HK6)
+
+**What changed**
+- The engine creates `<MULTIVENUE_LOG_DIR>/run-<epoch_ns>/` before boot
+  discovery. A boot that failed before its engine loop used to leave the
+  directory behind empty (one per failed launchd relaunch). It now removes
+  it again with `remove_dir`, which refuses a directory holding anything:
+  - a boot that fails before its manifests are written (boot discovery,
+    the `--halt-slot` / exec / Binance-arm refusals) leaves no directory;
+  - a boot that fails later keeps its directory, with
+    `instrument-manifest.tsv` and any capture, as before;
+  - a boot that reaches its engine loop keeps its directory.
+- Logs: `capture: the failed boot's empty run directory removed`, or
+  `… run directory kept` (with the `io` error kind) at `info`, or `… could
+  not be removed` at `warn` for any error other than not-empty or
+  not-found.
+
+**Impact**
+- Capture tooling (`capture-catalog`, `audit-pnl`, `backtest`, `archive`,
+  `retention`) sees fewer empty `run-*` directories. None depends on one:
+  `archive` passes an empty run over, and `retention` already `rmdir`s one
+  it reaches.
+- The empty directories already on disk stay until removed by hand
+  (`find ~/multivenue/logs -maxdepth 1 -type d -name 'run-*' -empty`
+  lists them).
+
+**Migration steps**
+1. None: the routine restart of a binary built from this change.
+
+## 2026-10-13 — Ingress: oversize frames fail fast everywhere; frames before a FIN are parsed; the HL gateway reads to the close (HK2)
+
+**What changed**
+- **Oversize frames.** Binance, OKX, Polymarket, RPC and HyperEVM now end
+  a session whose next frame is larger than rx with `InvalidData`, as HL,
+  Bybit, MEXC, Deribit and Hypercall already did. Before, they idled until
+  the idle timeout.
+- **Frames before a FIN.** Every ingress `drive_one` parses the frames
+  that arrived with an EOF its own read met, then closes. HL's session-end
+  log can now say `peer-close` (with the code) where it said `peer-eof`,
+  when the Close frame rides in with the FIN.
+- **The HL WebSocket order gateway.** It reads a closing socket's last
+  bytes before it drops the socket. A post answered just before a drop is
+  ACKed or REJECTed instead of UNANSWERED (`REASON_TRANSPORT`).
+
+**Impact**
+- Metrics: on socket drops, the gateway's UNANSWERED events fall. A
+  venue's oversize frame shows as a reconnect with `io_kind`
+  `invalid-data`, not as an idle timeout.
+
+**Migration steps**
+1. None: the routine restart of a binary built from this change.
+
+## 2026-10-13 — HL ingress: `engine_ingress_hyperliquid_unsub_acks_total`; the roll's second ack strike (HK1)
+
+**What changed**
+- New gauge `engine_ingress_hyperliquid_unsub_acks_total`: the venue's
+  echoes of a roll's `unsubscribe`s (six a roll). They used to count in
+  `engine_ingress_hyperliquid_parse_errors_total` and were tapped as parse
+  rejects; now they count in `…_msgs_total` and this gauge, with no reject
+  tap.
+- A roll whose hot subscribes go unacknowledged twice now gets its second
+  strike (`…_family_ack_timeouts_total` +2 for that family). The family
+  stays bound and is not counted in `…_families_dormant`.
+
+**Impact**
+- Metrics: HL `…_parse_errors_total` falls by six per mid-session roll
+  (≈ 24 an hour per 15-minute family). Frames in flight for retired coins
+  still count there.
+- Captures: with the raw tap on, the echoes stop appearing as rejects.
+
+**Migration steps**
+1. None: the routine restart of a binary built from this change.
+
+## 2026-10-13 — `bin15.toml`: nine optional `late_*` keys; `engine_bin15_late_*`; the sidecar's late blocks; `multivenue-engine hl-outcome-probe` (BIN15 H90)
+
+**What changed**
+- `bin15.toml` gains nine OPTIONAL keys (`BIN15_KEYS` 27 → 36):
+  - `late_enabled`;
+  - `late_tau_min_ns` / `late_tau_max_ns` (2 s / 30 s);
+  - `late_p_min_1e6` (900 000) and `late_e_1e6` (20 000);
+  - `late_persist_polls` (2);
+  - `late_usd_1e6` ($100, clamped to `cap_instance_usd_1e6` when absent);
+  - `late_sigma_k_1e3` (1 550);
+  - `late_phi_lut` (4 097 points).
+
+  Absent means `late_enabled = 0`, which is the member as it was, bit for
+  bit. `late_enabled = 1` requires `late_phi_lut`; cut it with
+  `python -m claude_worker.bin15_fit … --late`, which appends the block with
+  the law ON. Every stated value is bounded; the bounds are in
+  `core-config/src/bin15.rs`.
+- The boot line gains `late=<law>`, which reads `off` or
+  `2-30s:p>=0.90:ask<=p-2c:persist2:$100:k1.550`.
+- `/metrics` gains 8 counters: `engine_bin15_late_{reprices, submitted,
+  filled, skipped_stale, skipped_book, skipped_price, skipped_persist,
+  skipped_cap}_total`. The bin15 family now has 41 counters.
+- `backtest --member bin15 --emit-detail` adds three blocks when the law is
+  on: `bin15_late_entries`, `bin15_late_fires` and `bin15_late_law`. They
+  are written in the same branch as `bin15_ledger`. A sidecar of an
+  artifact without the law is byte-identical to before.
+- `claude_worker.bin15_accrue` writes two more stores, through
+  `claude_worker.bin15_late`:
+  - `~/multivenue/worker/bin15/late_entries.tsv` (15 columns);
+  - `~/multivenue/worker/bin15/late_fires.tsv` (13 columns).
+
+  Each lane takes optional `--late-entries` / `--late-fires`, and `report`
+  also takes `--late-fee-bps` (default 14). No verb is added and the 0020
+  line is unchanged. The stores are written only when a sidecar carries the
+  late blocks.
+- `multivenue-engine hl-outcome-probe` is new: the operator's live dust
+  test of the late window, run through `scripts/bin15-late-dust.sh`. It
+  reads `HYPERLIQUID_*` (or `HYPERLIQUID_TESTNET_*` with `--network
+  testnet`) from the environment and never opens `.env`.
+
+**Operator action:** none until the late law is installed on paper (doc 33
+L6). To install it, back up `~/multivenue/bin15.toml`, then append the
+`--late` block.
+
 ## 2026-10-05 — exec-hyperliquid: `HlHttp` on `core_net::HttpsPost`; the shared parser's `204` / `1xx` (XMM HD2)
 
 **What changed**
@@ -713,7 +916,8 @@ supervised restart and the post-boot checks.
 - Metrics: HL `…_parse_errors_total` falls by ≈ 1.5/s — its whole steady
   rate on 2026-09-26 — and `…_msgs_total` rises by the same. It does not
   go to zero: each mid-session roll still adds its unsubscribe echoes and
-  the frames in flight for the retired coins.
+  the frames in flight for the retired coins (the echoes: no longer since
+  HK1, the entry above).
 - Captures: with the raw tap on, these frames stop appearing as rejects.
 
 **Migration steps**

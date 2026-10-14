@@ -648,6 +648,54 @@ pub fn deadman_availability_word(v: u8) -> &'static str {
     word(&DEADMAN_AVAILABILITY_WORDS, v)
 }
 
+/// **BX11 — the Binance arm's local refusal reasons, spelled**, index =
+/// `exec_binance::arm::Refusal` (its `REFUSAL_WORDS`). A copy for the
+/// reason [`HALT_REASON_WORDS`] is one; `cli` pins the two together.
+pub const BN_REFUSAL_WORDS: [&str; 21] = [
+    "unbound",
+    "not_live",
+    "not_owner",
+    "kind",
+    "no_deadman",
+    "not_ready",
+    "price",
+    "min_qty",
+    "min_notional",
+    "max_qty",
+    "band",
+    "ttl",
+    "orders",
+    "qtr",
+    "max_orders",
+    "breadth",
+    "queue_full",
+    "verb",
+    "deadman_down",
+    "flags",
+    "not_writable",
+];
+
+/// BX11: the Binance account mode (`exec_binance::mode::AccountMode`, its
+/// `exec.toml` word), spelled — `cli` pins the order.
+const BN_MODE_WORDS: [&str; 3] = ["classic", "pm", "pm_pro"];
+
+/// BX11: a sweep's state (`clob_dispatcher::CancelAllState`), spelled —
+/// `cli` pins the order.
+const SWEEP_WORDS: [&str; 3] = ["clear", "working", "stranded"];
+
+/// BX11: the word for a Binance account mode byte, `"unknown"` past the
+/// table.
+#[must_use]
+pub fn bn_mode_word(v: u8) -> &'static str {
+    word(&BN_MODE_WORDS, v)
+}
+
+/// BX11: the word for a sweep state byte, `"unknown"` past the table.
+#[must_use]
+pub fn sweep_word(v: u8) -> &'static str {
+    word(&SWEEP_WORDS, v)
+}
+
 /// **E6 commit 4 — what the execution router is refusing, and why.**
 ///
 /// `/metrics` answers this for a monitoring system; this answers it
@@ -744,6 +792,9 @@ pub struct ExecSnapshot {
     /// **XMM XH4f (D11)** — slot 6's Hyperliquid gateway arm
     /// (`exec.arms.hyperliquid_gw`; rendered only when `present`).
     pub arms_hyperliquid_gw: GatewayArmSnapshot,
+    /// **BX11** — the Binance arm's own words (`exec.arms.binance_gw`;
+    /// rendered only when `present`).
+    pub arms_binance_gw: BinanceGwSnapshot,
 }
 
 /// **BX6 — one venue arm's numbers** in `/state` `exec.arms.<venue>`:
@@ -763,9 +814,12 @@ pub struct ArmSnapshot {
     pub ioc_missed: u64,
     /// Orders the arm refused before the wire (every local reason).
     pub refused_local: u64,
-    /// Orders refused because the gateway was not ready.
+    /// Orders naming an instrument the table no longer trades (LAW E-4;
+    /// Binance: a row bound but not live — BX11, was "not ready").
     pub refused_stale: u64,
-    /// Requests whose answer never came (in doubt, BX-11).
+    /// Requests that reached the wire and whose answer never came
+    /// (Binance: orders put in doubt, BX-11 — BX11, was every order in
+    /// flight).
     pub sent_unanswered: u64,
     /// Fills booked onto the lane.
     pub fills_booked: u64,
@@ -773,7 +827,9 @@ pub struct ArmSnapshot {
     pub fills_unresolved: u64,
     /// Fills on orders the engine did not place (BX-8).
     pub fills_foreign: u64,
-    /// Fills held back because the lane was full.
+    /// Fills the lane could not take: a position the engine does not know
+    /// it has (Binance: LOST — the deferred ones, delivered later, are
+    /// `exec.arms.binance_gw.fills_deferred`).
     pub fills_dropped: u64,
     /// Fills on an instrument no row was bound for.
     pub fills_unowned: u64,
@@ -787,7 +843,7 @@ pub struct ArmSnapshot {
     pub recon_unseen_legs: u64,
     /// Orders a sweep left resting (a level).
     pub sweep_left: u64,
-    /// Sweeps that gave up.
+    /// Sweeps that gave up (Binance: ended stranded — BX11, was 0).
     pub sweep_stalled: u64,
     /// Cancel-alls the command ring would not take.
     pub cancel_all_unqueued: u64,
@@ -878,6 +934,134 @@ pub struct GatewayArmSnapshot {
 }
 
 const _: () = assert!(core::mem::size_of::<GatewayArmSnapshot>() == 200);
+
+/// **BX11 — the Binance arm's own words** in `/state`
+/// `exec.arms.binance_gw`, beside `exec.arms.binance` (the counters every
+/// venue arm has): whether it takes orders and why not, what is in doubt,
+/// what its gateway dropped or owes, its refusals by reason, the
+/// governor's headroom, the margin ratios, the clock. The operator's
+/// subset of the dispatcher's `BinanceArmReport` — `/metrics`
+/// (`engine_exec_bn_*`) carries all of it.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BinanceGwSnapshot {
+    /// `1` when the arm exists in this boot.
+    pub present: u8,
+    /// The owner slot.
+    pub slot: u8,
+    /// It admits orders now.
+    pub ready: u8,
+    /// The order route / the user stream / the venue's dead-man / the
+    /// clock, as the last status said.
+    pub order_up: u8,
+    /// See [`Self::order_up`].
+    pub user_up: u8,
+    /// See [`Self::order_up`].
+    pub deadman_ok: u8,
+    /// See [`Self::order_up`].
+    pub clock_ok: u8,
+    /// The E7 anchor could not be stored (yet).
+    pub anchor_unsaved: u8,
+    /// The gateway's congestion level (`congestion_word`).
+    pub congestion: u8,
+    /// The sweep's state (`sweep_word`).
+    pub sweep: u8,
+    /// The account mode (`bn_mode_word`); `1` on Demo.
+    pub account_mode: u8,
+    /// See [`Self::account_mode`].
+    pub demo: u8,
+    /// Local refusals by reason ([`BN_REFUSAL_WORDS`]).
+    pub refused: [u32; 21],
+    /// The gateway's halt word (0 = running).
+    pub halt_reason: u64,
+    /// Orders pushed and not terminal / in doubt now / ever put in doubt.
+    pub in_flight: u64,
+    /// See [`Self::in_flight`].
+    pub in_doubt: u64,
+    /// See [`Self::in_flight`].
+    pub in_doubt_raised: u64,
+    /// The gateway's jobs dropped, fills deferred, journal records dropped,
+    /// cancels owed.
+    pub jobs_dropped: u64,
+    /// See [`Self::jobs_dropped`].
+    pub fills_deferred: u64,
+    /// See [`Self::jobs_dropped`].
+    pub journal_dropped: u64,
+    /// See [`Self::jobs_dropped`].
+    pub cancels_owed: u64,
+    /// Quiet periods begun, and what is left of the current one (ms).
+    pub quiet: u64,
+    /// See [`Self::quiet`].
+    pub quiet_left_ms: u64,
+    /// Hosts resolved again.
+    pub dns_reresolved: u64,
+    /// User-stream events of a kind the arm does not act on.
+    pub events_other: u64,
+    /// Budget observations, venue locks, frames that did not scan, events
+    /// of no known kind.
+    pub budget_obs: u64,
+    /// See [`Self::budget_obs`].
+    pub locks: u64,
+    /// See [`Self::budget_obs`].
+    pub scan_failed: u64,
+    /// See [`Self::budget_obs`].
+    pub evt_unknown: u64,
+    /// Cancels and modifies the venue refused; sweeps that ended stranded.
+    pub cancels_refused: u64,
+    /// See [`Self::cancels_refused`].
+    pub modifies_refused: u64,
+    /// See [`Self::cancels_refused`].
+    pub sweeps_stranded: u64,
+    /// Since the gateway's heartbeat, ms (`u64::MAX`: none yet).
+    pub heartbeat_age_ms: u64,
+    /// The request weight in the last minute, and the arm's share.
+    pub weight_used: u64,
+    /// See [`Self::weight_used`].
+    pub weight_max: u64,
+    /// BX9: eapi's weight in the last minute, and the options lane's share
+    /// (options' own pool).
+    pub opt_weight_used: u64,
+    /// See [`Self::opt_weight_used`].
+    pub opt_weight_max: u64,
+    /// BX13 (R2-4): spot's weight in the last minute, and the spot lane's
+    /// share (spot's own pool).
+    pub spot_weight_used: u64,
+    /// See [`Self::spot_weight_used`].
+    pub spot_weight_max: u64,
+    /// BX13 (R2-2): spot's unfilled orders today, the BUYs' share, a
+    /// SELL's ceiling, and `1` once the venue's count was read.
+    pub spot_day_unfilled: u64,
+    /// See [`Self::spot_day_unfilled`].
+    pub spot_day_cap: u64,
+    /// See [`Self::spot_day_unfilled`].
+    pub spot_sell_cap: u64,
+    /// See [`Self::spot_day_unfilled`].
+    pub spot_day_seeded: u64,
+    /// BX13 (R3-1): reconciliation cycles held inconclusive.
+    pub recon_held: u64,
+    /// The ORDERS windows' placements and caps (10 s, 1 min).
+    pub orders_10s_used: u64,
+    /// See [`Self::orders_10s_used`].
+    pub orders_10s_cap: u64,
+    /// See [`Self::orders_10s_used`].
+    pub orders_1m_used: u64,
+    /// See [`Self::orders_10s_used`].
+    pub orders_1m_cap: u64,
+    /// Rows on the owned list.
+    pub owned_rows: u64,
+    /// The order route's round trip p99, ns.
+    pub post_rtt_p99_ns: u64,
+    /// The venue clock's offset, ms.
+    pub clock_offset_ms: i64,
+    /// The margin ratios ×1e6, USDⓈ-M's and COIN-M's.
+    pub margin_usdm_1e6: i64,
+    /// See [`Self::margin_usdm_1e6`].
+    pub margin_coinm_1e6: i64,
+    /// BX9: the options account's (maintenance over adjusted equity).
+    pub margin_options_1e6: i64,
+}
+
+const _: () = assert!(core::mem::size_of::<BinanceGwSnapshot>() == 424);
 
 /// The whole snapshot — see the module docs and plan §6.1.
 #[derive(Copy, Clone)]
@@ -1015,9 +1199,16 @@ mod tests {
         // a layout regression. HAR H3.5's `har` section (twelve 176 B
         // series rows + identity and counters) makes it 30,656 B at the
         // Hypercall merge; HC11's `hcv` section and `boot.hcv_hash` add
-        // 200 B, XMM XH4f's `exec.arms.hyperliquid_gw` 200 B more.
+        // 200 B, XMM XH4f's `exec.arms.hyperliquid_gw` 200 B more — 31,424
+        // B at BX7b; BX11's `exec.arms.binance_gw` (344 B, and the rings'
+        // 64 B alignment after it) makes it 31,808 B: 960 B left. BX9's
+        // 24 B more in that block (368 B: the `not_writable` refusal,
+        // options' margin and eapi's weight) fit the same alignment. BX13's
+        // 56 B more (424 B: spot's weight, spot's day, the held cycles)
+        // cross it: 31,872 B, 896 B left.
         let n = core::mem::size_of::<EngineSnapshot>();
         assert!(n <= 32 * 1024, "EngineSnapshot grew to {n} B");
+        assert_eq!(n, 31_872, "the BX13 figure: a change states its own");
         assert_eq!(core::mem::size_of::<VmRowView>(), 48);
         assert_eq!(core::mem::size_of::<HarSnapshot>(), 2_216);
     }

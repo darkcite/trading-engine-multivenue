@@ -92,7 +92,7 @@ class FakeS3:
 
     # -- the handler -----------------------------------------------------
 
-    def handle(  # noqa: PLR0911, PLR0912 — one branch per S3 verb, deliberately flat
+    def handle(  # one branch per S3 verb, deliberately flat
         self, request: httpx.Request
     ) -> httpx.Response:
         key = self.key_of(request)

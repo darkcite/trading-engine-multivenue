@@ -65,12 +65,12 @@ def write_orders(
 ) -> None:
     """One v2 kind-3 file. ``recs`` = (ts_ns, sym, side, px_1e6,
     qty_1e6, strategy_id)."""
-    header = claude_worker.pmlr._HEADER.pack(  # noqa: SLF001 — reader-defined layout, deliberately
+    header = claude_worker.pmlr._HEADER.pack(  # reader-defined layout, deliberately
         claude_worker.pmlr.MAGIC, 2, claude_worker.pmlr.SLOT_KIND_ORDER, epoch_ns
     )
     blob = bytearray(header + bytes(_HDR - len(header)))
     for i, (ts, sym, side, px, qty, strategy_id) in enumerate(recs):
-        slot = claude_worker.pmlr._ORDER.pack(  # noqa: SLF001
+        slot = claude_worker.pmlr._ORDER.pack(
             ts, sym, side, 0, px, qty, i + 1, 5, strategy_id
         )
         blob.extend(slot + bytes(_SLOT - len(slot)))
@@ -92,7 +92,7 @@ def test_order_layout_pin_matches_wire_format_offsets(tmp_path):
     struct.pack_into("<Q", slot, 32, 77)  # client_oid
     struct.pack_into("<B", slot, 40, 1)  # venue
     struct.pack_into("<B", slot, 41, 5)  # strategy_id (VM)
-    header = claude_worker.pmlr._HEADER.pack(  # noqa: SLF001
+    header = claude_worker.pmlr._HEADER.pack(  # reader-defined layout, deliberately
         claude_worker.pmlr.MAGIC, 2, claude_worker.pmlr.SLOT_KIND_ORDER, EPOCH_NS
     )
     path = tmp_path / "engine-orders.pmlr"
@@ -211,14 +211,18 @@ def test_funding_seed_rows_and_tsv_carry_the_harness_shape(tmp_path):
     conn.close()
     assert stats == fstats == claude_worker.seeds.FundingStats(1, 2, 0)
     assert rows == [
-        claude_worker.seeds.FundingSeedRow(USDM_SYM, "binance-usdm:btcusdt", now_ms - 2 * MS_1H, 100_000),
-        claude_worker.seeds.FundingSeedRow(USDM_SYM, "binance-usdm:btcusdt", now_ms - MS_1H, -50_000),
+        claude_worker.seeds.FundingSeedRow(
+            USDM_SYM, "binance-usdm:btcusdt", now_ms - 2 * MS_1H, 100_000
+        ),
+        claude_worker.seeds.FundingSeedRow(
+            USDM_SYM, "binance-usdm:btcusdt", now_ms - MS_1H, -50_000
+        ),
     ]
     assert [(f.sym, f.px, f.qty) for f in frames] == [(r.sym, r.rate_1e9, r.ts_ms) for r in rows]
     out = tmp_path / claude_worker.seeds.FUNDING_SEED_FILE
     claude_worker.seeds.write_funding_seed_tsv(out, rows)
     text = out.read_text("utf-8")
-    body = [l for l in text.splitlines() if l and not l.startswith("#")]
+    body = [line for line in text.splitlines() if line and not line.startswith("#")]
     assert text.startswith("# funding-seed.tsv")
     assert body == [
         f"binance-usdm:btcusdt\t{now_ms - 2 * MS_1H}\t100000",
@@ -228,10 +232,7 @@ def test_funding_seed_rows_and_tsv_carry_the_harness_shape(tmp_path):
 
 def test_funding_frames_window_and_order(tmp_path):
     now_ms = EPOCH_MS
-    rows = [
-        (1, "binance-usdm:btcusdt", now_ms - i * MS_1H, 0.0001 * (i + 1))
-        for i in range(100)
-    ]
+    rows = [(1, "binance-usdm:btcusdt", now_ms - i * MS_1H, 0.0001 * (i + 1)) for i in range(100)]
     _db, conn = _funding_db(tmp_path, rows)
     manifest = {(1, USDM_SYM): "binance-usdm:btcusdt"}
     frames, stats = claude_worker.seeds.funding_seed_frames(conn, manifest, now_ms)
@@ -269,26 +270,31 @@ def test_funding_frames_engine_capacity_cap_keeps_newest(tmp_path):
 
 ARTIFACT = {
     "rows": [
-        {"name": "refire", "instrument": "okx:BTC-USDT-SWAP", "feature": "mid",
-         "enter": 1.0},
-        {"name": "carry", "instrument": "binance-usdm:btcusdt",
-         "ref": "okx:BTC-USDT-SWAP", "feature": "apr24", "combine": "diff",
-         "enter": 0.2, "exit": 0.0, "max_risk_usd": 100.0},
+        {"name": "refire", "instrument": "okx:BTC-USDT-SWAP", "feature": "mid", "enter": 1.0},
+        {
+            "name": "carry",
+            "instrument": "binance-usdm:btcusdt",
+            "ref": "okx:BTC-USDT-SWAP",
+            "feature": "apr24",
+            "combine": "diff",
+            "enter": 0.2,
+            "exit": 0.0,
+            "max_risk_usd": 100.0,
+        },
     ]
 }
 
 
 def test_position_rows_are_the_exit_key_rows():
     rows = claude_worker.seeds.position_rows_of_artifact(json.dumps(ARTIFACT))
-    assert rows == [claude_worker.seeds._Row(1, "binance-usdm:btcusdt")]  # noqa: SLF001
+    assert rows == [claude_worker.seeds._Row(1, "binance-usdm:btcusdt")]
 
 
 def test_position_rows_refuse_malformed_artifact():
     assert claude_worker.seeds.position_rows_of_artifact("]{") is None
     assert claude_worker.seeds.position_rows_of_artifact('{"rows": 3}') is None
     assert (
-        claude_worker.seeds.position_rows_of_artifact('{"rows": [{"exit": 0.0}]}')
-        is None
+        claude_worker.seeds.position_rows_of_artifact('{"rows": [{"exit": 0.0}]}') is None
     )  # position row without instrument
 
 
@@ -367,7 +373,7 @@ def test_position_seed_reresolves_sym_and_computes_age(tmp_path):
         [(entry_ts, USDM_SYM, 0, 100_000_000, 2_000_000, 5)],
         cur_sym=USDM_SYM + 3,  # ordinals reshuffle per boot (§1.4)
     )
-    rows = [claude_worker.seeds._Row(1, "binance-usdm:btcusdt")]  # noqa: SLF001
+    rows = [claude_worker.seeds._Row(1, "binance-usdm:btcusdt")]
     now_ns = EPOCH_NS + 7_200 * 1_000_000_000
     lines: list[str] = []
     frames, stats = claude_worker.seeds.position_seed_frames(
@@ -396,8 +402,8 @@ def test_position_seed_ambiguous_action_descriptor_skips_both(tmp_path):
         cur_sym=USDM_SYM,
     )
     rows = [
-        claude_worker.seeds._Row(0, "binance-usdm:btcusdt"),  # noqa: SLF001
-        claude_worker.seeds._Row(2, "binance-usdm:btcusdt"),  # noqa: SLF001
+        claude_worker.seeds._Row(0, "binance-usdm:btcusdt"),
+        claude_worker.seeds._Row(2, "binance-usdm:btcusdt"),
     ]
     lines: list[str] = []
     frames, stats = claude_worker.seeds.position_seed_frames(
@@ -422,7 +428,7 @@ def test_position_seed_descriptor_gone_from_current_universe(tmp_path):
     (cur_run / claude_worker.iv_digest.INSTRUMENT_MANIFEST_FILE).write_text(
         f"{OKX_SYM}\tokx:ETH-USDT-SWAP\n", encoding="utf-8"
     )
-    rows = [claude_worker.seeds._Row(1, "binance-usdm:btcusdt")]  # noqa: SLF001
+    rows = [claude_worker.seeds._Row(1, "binance-usdm:btcusdt")]
     lines: list[str] = []
     frames, stats = claude_worker.seeds.position_seed_frames(
         rows,
@@ -442,24 +448,26 @@ def test_position_seed_descriptor_gone_from_current_universe(tmp_path):
 
 def test_main_dry_run_end_to_end(tmp_path, capsys):
     entry_ts = ANCHOR_TS + 1_000_000_000
-    prev_run, cur_run = _two_runs(
+    _prev_run, _cur_run = _two_runs(
         tmp_path,
         [(entry_ts, USDM_SYM, 0, 100_000_000, 2_000_000, 5)],
         cur_sym=USDM_SYM,
     )
-    db, conn = _funding_db(
-        tmp_path, [(1, "binance-usdm:btcusdt", EPOCH_MS + 3_600_000, 0.0002)]
-    )
+    db, conn = _funding_db(tmp_path, [(1, "binance-usdm:btcusdt", EPOCH_MS + 3_600_000, 0.0002)])
     conn.close()
     artifact = tmp_path / "ruleset.json"
     artifact.write_text(json.dumps(ARTIFACT), encoding="utf-8")
     now_ms = EPOCH_MS + 2 * 3_600_000
     rc = claude_worker.seeds.main(
         [
-            "--db", str(db),
-            "--replay-dir", str(tmp_path / "logs"),
-            "--ruleset", str(artifact),
-            "--now-ms", str(now_ms),
+            "--db",
+            str(db),
+            "--replay-dir",
+            str(tmp_path / "logs"),
+            "--ruleset",
+            str(artifact),
+            "--now-ms",
+            str(now_ms),
             "--dry-run",
         ]
     )

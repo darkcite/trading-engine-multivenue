@@ -355,7 +355,9 @@ class ResearchCycle:
                 break
         return active, prior
 
-    def _monitor_skip(self, active_hash: str, reason: str, coverage_ns: int, **extra: object) -> None:
+    def _monitor_skip(
+        self, active_hash: str, reason: str, coverage_ns: int, **extra: object
+    ) -> None:
         detail: dict[str, object] = {
             "active": active_hash,
             "reason": reason,
@@ -401,9 +403,7 @@ class ResearchCycle:
                 copy_path, window_dir, split=claude_worker.monitor.MONITOR_SPLIT
             )
         except claude_worker.backtest.BacktestError as exc:
-            self._monitor_skip(
-                active_hash, "backtest_error", selection.coverage_ns, error=str(exc)
-            )
+            self._monitor_skip(active_hash, "backtest_error", selection.coverage_ns, error=str(exc))
             return
         triggered, metrics = claude_worker.monitor.breach(outcome.harness)
         self._performance = claude_worker.monitor.summary_line(
@@ -635,11 +635,9 @@ class ResearchCycle:
         try:
             latest = claude_worker.features.latest_run_dir(self._cfg.replay_dir)
             universe = (
-                None
-                if latest is None
-                else sorted(claude_worker.fetchers.observed_universe(latest))
+                None if latest is None else sorted(claude_worker.fetchers.observed_universe(latest))
             )
-        except (OSError, ValueError):
+        except OSError, ValueError:
             universe = None
         # Ruling #7(a): the inventory sections. HIP-4 pairs are not
         # plumbed into the daemon (the map file's pairs stay a cli
@@ -657,9 +655,7 @@ class ResearchCycle:
         # DESCRIPTOR string, never by SymbolId — ordinals reshuffle every
         # boot. Without this section the strategist can only author the
         # legacy v1 sugar, so it rides beside the #7a inventory.
-        instruments_text = claude_worker.strategist.instruments_digest_text(
-            self._cfg.replay_dir
-        )
+        instruments_text = claude_worker.strategist.instruments_digest_text(self._cfg.replay_dir)
         self._digest = claude_worker.strategist.build_digest(
             self._cfg.features_dir,
             self._run_name,
@@ -838,7 +834,7 @@ class ResearchCycle:
         if self._phase == _FETCH:
             try:
                 fetch_ok = bool(future.result())
-            except Exception as exc:  # noqa: BLE001 — bg fetch is best-effort by doctrine
+            except Exception as exc:  # bg fetch is best-effort by doctrine
                 _log.warning("research_fetch_raised", error=str(exc))
                 fetch_ok = False
             self._after_fetch(fetch_ok, uds_client)
@@ -846,7 +842,7 @@ class ResearchCycle:
         # _CALL
         try:
             result = typing.cast(claude_worker.strategist.CallResult, future.result())
-        except Exception as exc:  # noqa: BLE001 — API/transport failure is an expected mode (§5.1 no-crash)
+        except Exception as exc:  # API/transport failure is an expected mode (§5.1 no-crash)
             self._event(
                 claude_worker.strategist.EVENT_CALL_FAILED,
                 {"error": str(exc), "purpose": self._purpose},

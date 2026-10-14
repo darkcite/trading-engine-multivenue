@@ -105,7 +105,9 @@ def test_v3_marks_skip_stale_ticks_and_keep_the_last_good_mid() -> None:
     assert ticks[1].sym == okx and ticks[1].is_stale()
     assert marks[okx] == ticks[0].mid()
     assert ticks[3].sym == PM7 and ticks[3].is_stale()
-    assert marks[PM7] == ticks[4].mid(), "the v2-shape PM tick (fresh) is the last good mid for sym 7"
+    assert marks[PM7] == ticks[4].mid(), (
+        "the v2-shape PM tick (fresh) is the last good mid for sym 7"
+    )
     # v2 files keep the v2 law: every tick marks.
     marks_v2: dict[int, int] = {}
     with claude_worker.pmlr.Reader(FIXTURES / "ticks_v2.pmlr") as r:
@@ -200,11 +202,31 @@ def test_positions_from_golden_fills(tmp_path: pathlib.Path) -> None:
     assert positions[HL_NO].realized == 0
 
 
+def test_an_adopted_fill_opens_and_a_settlement_ends_but_neither_is_a_trade() -> None:
+    """BX13: the fold reads ``FillRec.flags`` — an adopted fill opens the
+    position at its price (inventory at boot), a settlement closes it at
+    its price, and only trades are counted as fills."""
+    adopted = claude_worker.pmlr.FILL_FLAG_ADOPTED
+    settled = claude_worker.pmlr.FILL_FLAG_SETTLEMENT
+    fills = [
+        claude_worker.pmlr.FillRec(1, PM7, 0, 2, 0, adopted, 400_000, 10_000_000, 0),
+        claude_worker.pmlr.FillRec(2, PM7, 0, 2, 0, 0, 500_000, 10_000_000, 7),
+        claude_worker.pmlr.FillRec(3, PM7, 1, 2, 0, settled, 1_000_000, 20_000_000, 0),
+    ]
+    pos = claude_worker.features.reconstruct_positions(fills)[PM7]
+    assert (pos.fills, pos.adopted, pos.settlements) == (1, 1, 1)
+    assert pos.net_qty == 0
+    # Bought 10 at 0.40 (adopted) and 10 at 0.50; settled 20 at 1.00.
+    assert pos.realized == 20 * 1_000_000 * 1_000_000 - (10 * 400_000 + 10 * 500_000) * 1_000_000
+    assert claude_worker.features.count_fills(fills) == claude_worker.features.FillCounts(1, 1, 1)
+    assert claude_worker.features.count_fills([]) == claude_worker.features.FillCounts(0, 0, 0)
+
+
 def test_position_views_marked() -> None:
     fills = [
-        claude_worker.pmlr.FillRec(1, PM7, 0, 0xFF, 0, 480_000, 20_000_000, 1),
-        claude_worker.pmlr.FillRec(2, PM7, 0, 0xFF, 0, 500_000, 10_000_000, 2),
-        claude_worker.pmlr.FillRec(3, PM7, 1, 0xFF, 0, 520_000, 15_000_000, 3),
+        claude_worker.pmlr.FillRec(1, PM7, 0, 0xFF, 0, 0, 480_000, 20_000_000, 1),
+        claude_worker.pmlr.FillRec(2, PM7, 0, 0xFF, 0, 0, 500_000, 10_000_000, 2),
+        claude_worker.pmlr.FillRec(3, PM7, 1, 0xFF, 0, 0, 520_000, 15_000_000, 3),
     ]
     positions = claude_worker.features.reconstruct_positions(fills)
     views = claude_worker.features.position_views(positions, {PM7: 510_000})
@@ -219,7 +241,7 @@ def test_position_views_marked() -> None:
 
 
 def test_position_view_no_mark_carried_at_cost() -> None:
-    fills = [claude_worker.pmlr.FillRec(1, PM7, 0, 0xFF, 0, 486_667, 3_000_000, 1)]
+    fills = [claude_worker.pmlr.FillRec(1, PM7, 0, 0xFF, 0, 0, 486_667, 3_000_000, 1)]
     positions = claude_worker.features.reconstruct_positions(fills)
     views = claude_worker.features.position_views(positions, {})
     view = views[PM7]

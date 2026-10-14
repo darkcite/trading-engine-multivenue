@@ -1,6 +1,5 @@
 crates/clob-dispatcher/src/json_encoder.rs:self.buf[self.pos..end].copy_from_slice(src);
 crates/core-net/src/boot_http.rs:out.extend_from_slice(&chunk[..n]);
-crates/core-net/src/http1.rs:dst[*cursor..end].copy_from_slice(src);
 crates/core-net/src/lib.rs:self.data.copy_within(n..self.len, 0);
 crates/core-net/src/transport.rs:.map(|n| n.to_owned())
 crates/core-net/src/transport.rs:dst[..n].copy_from_slice(&self.data[self.head..self.head + n]);

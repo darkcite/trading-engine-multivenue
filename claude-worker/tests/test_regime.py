@@ -17,6 +17,7 @@ import pathlib
 
 import pytest
 
+import claude_worker.candles
 import claude_worker.frames
 import claude_worker.regime
 
@@ -87,7 +88,12 @@ def load_input(name: str = "parity-1") -> Input:
             funding.append((int(parts[1]), int(parts[2]), int(parts[3])))
         elif parts[0] == "D":
             declared.append(
-                (int(parts[1]), int(parts[2]), int(parts[3], 16), int(parts[4]) * claude_worker.regime.MINUTE_NS)
+                (
+                    int(parts[1]),
+                    int(parts[2]),
+                    int(parts[3], 16),
+                    int(parts[4]) * claude_worker.regime.MINUTE_NS,
+                )
             )
         else:
             raise ValueError(f"unknown record {parts[0]}")
@@ -132,8 +138,10 @@ def run(name: str = "parity-1") -> list[str]:
             out.append(
                 f"E {m} {p} {claude_worker.regime.word_hex(ev.measured[p])} "
                 f"{claude_worker.regime.word_hex(ev.effective[p])} "
-                f"{_fmt(raw.ret_bps_1e9)} {_fmt(raw.er_1e9)} {_fmt(raw.rv_bps_1e9)} {_fmt(raw.stretch_1e9)} "
-                f"{rel} {raw.breadth_up},{raw.breadth_dn},{raw.breadth_n} {flips} {ev.disagree[p]} {ev.minutes_judged}"
+                f"{_fmt(raw.ret_bps_1e9)} {_fmt(raw.er_1e9)} {_fmt(raw.rv_bps_1e9)} "
+                f"{_fmt(raw.stretch_1e9)} "
+                f"{rel} {raw.breadth_up},{raw.breadth_dn},{raw.breadth_n} {flips} {ev.disagree[p]} "
+                f"{ev.minutes_judged}"
             )
     return out
 
@@ -241,7 +249,13 @@ def test_shape_bands_and_merge() -> None:
     assert r.judge_shape(r.SHAPE_TREND, 570_000_000, pp) == r.SHAPE_TREND
     assert r.judge_shape(r.ABSENT, 700_000_000, pp) == r.SHAPE_TREND
     m = claude_worker.frames.regime_word(
-        trend="bull", shape="trend", vol="low", fund="pos", level="low", stretch="neutral", source="measured"
+        trend="bull",
+        shape="trend",
+        vol="low",
+        fund="pos",
+        level="low",
+        stretch="neutral",
+        source="measured",
     )
     d = claude_worker.frames.regime_word(vol="high")
     e = r.merge_declared(d, m)
@@ -275,8 +289,6 @@ def test_evaluator_refuses_bad_params() -> None:
 
 
 def test_seed_out_exports_member_closes_as_integer_minutes(tmp_path: pathlib.Path) -> None:
-    import claude_worker.candles
-
     r = claude_worker.regime
     regime_toml = tmp_path / "regime.toml"
     regime_toml.write_text(
@@ -285,21 +297,81 @@ def test_seed_out_exports_member_closes_as_integer_minutes(tmp_path: pathlib.Pat
         "[profile.fast]\ntrend_w_min = 60\n[profile.slow]\ntrend_w_min = 240\n",
         encoding="utf-8",
     )
-    assert r.read_regime_descriptors(regime_toml) == ["binance-usdm:btcusdt", "binance-usdm:ethusdt"]
+    assert r.read_regime_descriptors(regime_toml) == [
+        "binance-usdm:btcusdt",
+        "binance-usdm:ethusdt",
+    ]
     db = tmp_path / "candles.db"
     conn = claude_worker.candles.open_db(db)
     now_ms = 1_800_000_000_000
     rows = []
     for k in range(10):
         open_ts = now_ms - (10 - k) * 60_000
-        rows.append((1, "binance-usdm:btcusdt", "1m", open_ts, 100.0, 101.0, 99.0, 100.0 + k * 0.5, 1.0, "rest", now_ms))
-        rows.append((1, "binance-usdm:ethusdt", "1m", open_ts, 3000.0, 3001.0, 2999.0, 3000.0 + k, 1.0, "rest", now_ms))
+        rows.append(
+            (
+                1,
+                "binance-usdm:btcusdt",
+                "1m",
+                open_ts,
+                100.0,
+                101.0,
+                99.0,
+                100.0 + k * 0.5,
+                1.0,
+                "rest",
+                now_ms,
+            )
+        )
+        rows.append(
+            (
+                1,
+                "binance-usdm:ethusdt",
+                "1m",
+                open_ts,
+                3000.0,
+                3001.0,
+                2999.0,
+                3000.0 + k,
+                1.0,
+                "rest",
+                now_ms,
+            )
+        )
     # A foreign descriptor, an hourly bar and a NULL close are all skipped.
     rows.append((2, "okx:BTC-USDT", "1m", now_ms - 60_000, 1.0, 1.0, 1.0, 1.0, 1.0, "rest", now_ms))
-    rows.append((1, "binance-usdm:btcusdt", "1h", now_ms - 3_600_000, 1.0, 1.0, 1.0, 1.0, 1.0, "rest", now_ms))
-    rows.append((1, "binance-usdm:btcusdt", "1m", now_ms - 11 * 60_000, 1.0, 1.0, 1.0, None, 1.0, "capture", now_ms))
+    rows.append(
+        (
+            1,
+            "binance-usdm:btcusdt",
+            "1h",
+            now_ms - 3_600_000,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            "rest",
+            now_ms,
+        )
+    )
+    rows.append(
+        (
+            1,
+            "binance-usdm:btcusdt",
+            "1m",
+            now_ms - 11 * 60_000,
+            1.0,
+            1.0,
+            1.0,
+            None,
+            1.0,
+            "capture",
+            now_ms,
+        )
+    )
     conn.executemany(
-        "INSERT INTO candles (venue,descriptor,tf,open_ts,o,h,l,c,v,source,fetched_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO candles (venue,descriptor,tf,open_ts,o,h,l,c,v,source,fetched_ts) VALUES "
+        "(?,?,?,?,?,?,?,?,?,?,?)",
         rows,
     )
     conn.commit()
@@ -307,7 +379,9 @@ def test_seed_out_exports_member_closes_as_integer_minutes(tmp_path: pathlib.Pat
     out = tmp_path / "regime-seed.tsv"
     n_desc, n_rows = r.seed_out(regime_toml, db, out, minutes=1536, now_ms=now_ms + 30_000)
     assert (n_desc, n_rows) == (2, 20)
-    lines = [line for line in out.read_text("utf-8").splitlines() if line and not line.startswith("#")]
+    lines = [
+        line for line in out.read_text("utf-8").splitlines() if line and not line.startswith("#")
+    ]
     assert len(lines) == 20
     first = lines[0].split("\t")
     assert first[0] == "binance-usdm:btcusdt"
@@ -318,7 +392,8 @@ def test_seed_out_exports_member_closes_as_integer_minutes(tmp_path: pathlib.Pat
     # The accumulating minute is excluded: a close AT now's minute is not exported.
     conn = claude_worker.candles.open_db(db)
     conn.execute(
-        "INSERT INTO candles (venue,descriptor,tf,open_ts,o,h,l,c,v,source,fetched_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO candles (venue,descriptor,tf,open_ts,o,h,l,c,v,source,fetched_ts) VALUES "
+        "(?,?,?,?,?,?,?,?,?,?,?)",
         (1, "binance-usdm:btcusdt", "1m", now_ms, 1.0, 1.0, 1.0, 5.0, 1.0, "rest", now_ms),
     )
     conn.commit()
@@ -326,6 +401,34 @@ def test_seed_out_exports_member_closes_as_integer_minutes(tmp_path: pathlib.Pat
     _, n_rows = r.seed_out(regime_toml, db, out, minutes=1536, now_ms=now_ms + 30_000)
     assert n_rows == 20
     # The CLI lane: exit 0 with a summary; missing inputs exit 2.
-    assert r.main(["seed-out", "--regime", str(regime_toml), "--out", str(out), "--db", str(db)]) == 0
-    assert r.main(["seed-out", "--regime", str(tmp_path / "nope.toml"), "--out", str(out), "--db", str(db)]) == 2
-    assert r.main(["seed-out", "--regime", str(regime_toml), "--out", str(out), "--db", str(tmp_path / "nope.db")]) == 2
+    assert (
+        r.main(["seed-out", "--regime", str(regime_toml), "--out", str(out), "--db", str(db)]) == 0
+    )
+    assert (
+        r.main(
+            [
+                "seed-out",
+                "--regime",
+                str(tmp_path / "nope.toml"),
+                "--out",
+                str(out),
+                "--db",
+                str(db),
+            ]
+        )
+        == 2
+    )
+    assert (
+        r.main(
+            [
+                "seed-out",
+                "--regime",
+                str(regime_toml),
+                "--out",
+                str(out),
+                "--db",
+                str(tmp_path / "nope.db"),
+            ]
+        )
+        == 2
+    )

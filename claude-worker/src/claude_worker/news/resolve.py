@@ -434,7 +434,7 @@ def resolve_due(
     return stats
 
 
-def _resolve_one(  # noqa: PLR0913, PLR0917 — one row, every collaborator it needs
+def _resolve_one(  # one row, every collaborator it needs
     store: claude_worker.news.store.Store,
     paths: claude_worker.news.NewsPaths,
     conn: sqlite3.Connection | None,

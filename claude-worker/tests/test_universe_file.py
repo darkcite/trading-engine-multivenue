@@ -111,7 +111,6 @@ def test_cex_sections_seed_descriptor_names(tmp_path: pathlib.Path) -> None:
     bn = claude_worker.frames.VENUE_BINANCE
     okx = claude_worker.frames.VENUE_OKX
     dbt = claude_worker.frames.VENUE_DERIBIT
-    hl = claude_worker.frames.VENUE_HYPERLIQUID
     universe = {
         42: PM,
         7: bn,

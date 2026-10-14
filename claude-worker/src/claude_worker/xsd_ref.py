@@ -158,7 +158,7 @@ class Order(typing.NamedTuple):
 
 
 class _Pair:
-    __slots__ = ("partner", "beta_1e9", "z_1e9", "z_valid", "n")
+    __slots__ = ("beta_1e9", "n", "partner", "z_1e9", "z_valid")
 
     def __init__(self, partner: int, beta_1e9: int) -> None:
         self.partner: int = partner
@@ -169,9 +169,24 @@ class _Pair:
 
 
 class _Target:
-    __slots__ = ("sym", "pairs", "state", "side", "d", "intent", "exit_reason",
-                 "grid_units", "nfin", "zbar_1e9", "zmag_1e9", "pos_qty_1e6",
-                 "pos_notional_1e6", "entry_hour", "last_exit_hour", "last_add_hour")
+    __slots__ = (
+        "d",
+        "entry_hour",
+        "exit_reason",
+        "grid_units",
+        "intent",
+        "last_add_hour",
+        "last_exit_hour",
+        "nfin",
+        "pairs",
+        "pos_notional_1e6",
+        "pos_qty_1e6",
+        "side",
+        "state",
+        "sym",
+        "zbar_1e9",
+        "zmag_1e9",
+    )
 
     def __init__(self, sym: int) -> None:
         self.sym: int = sym
@@ -193,8 +208,16 @@ class _Target:
 
 
 class _Sym:
-    __slots__ = ("sym", "ring", "newest_h", "last_mid", "last_bid", "last_ask", "last_ts",
-                 "target")
+    __slots__ = (
+        "last_ask",
+        "last_bid",
+        "last_mid",
+        "last_ts",
+        "newest_h",
+        "ring",
+        "sym",
+        "target",
+    )
 
     def __init__(self, sym: int) -> None:
         self.sym: int = sym
@@ -353,7 +376,7 @@ class XsdRef:
                     h: int = closed - j
                     la: int = ring_t.get(h, LN_EMPTY)
                     lb: int = ring_p.get(h, LN_EMPTY)
-                    if la != LN_EMPTY and lb != LN_EMPTY:
+                    if LN_EMPTY not in (la, lb):
                         sp: int = spread_1e9(la, lb, pr.beta_1e9)
                         total += sp
                         total2 += sp * sp
@@ -626,7 +649,9 @@ def parse_fixture(text: str) -> Fixture:
     return Fixture(params, wall0, syms, rows, seeds, sorted_live(live))
 
 
-def sorted_live(live: dict[int, list[tuple[int, int, int]]]) -> dict[int, list[tuple[int, int, int]]]:
+def sorted_live(
+    live: dict[int, list[tuple[int, int, int]]],
+) -> dict[int, list[tuple[int, int, int]]]:
     return {h: live[h] for h in sorted(live)}
 
 
@@ -648,8 +673,17 @@ def run_fixture(fx: Fixture) -> list[str]:
             for ts, px in ((open_ns + 1_000_000_000, opn), (open_ns + 3_599_000_000_000, close)):
                 order: typing.Optional[Order] = ref.on_tick(sym, ts, px, px)
                 if order is not None:
-                    out.append("O %d %d %d %d %d %d %d" % (
-                        hour, order.sym, order.side, order.px_1e6, order.qty_1e6,
-                        order.ttl_ns, order.kind))
+                    out.append(
+                        "O %d %d %d %d %d %d %d"
+                        % (
+                            hour,
+                            order.sym,
+                            order.side,
+                            order.px_1e6,
+                            order.qty_1e6,
+                            order.ttl_ns,
+                            order.kind,
+                        )
+                    )
     out.append(ref.summary_row())
     return out

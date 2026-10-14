@@ -1,0 +1,30 @@
+# HK8c (2026-10-13): the workspace's nextest configuration.
+#
+# The tests below were the standing "isolation-disproven flakes": red under
+# full-workspace parallel load, green alone. Each runs in its own process
+# already; what they share is the machine. The six allocation tests count
+# through the process-global `CountingAllocator` in the DEBUG profile, where
+# lazy runtime initialisation and scheduler timing can land inside the
+# measured window under load; the scrape hammer opens many loopback
+# connections at once. Run one at a time, a red among them is a red.
+#
+# Add a test here only with the reason it is load-sensitive; never to hide
+# a test that fails alone.
+
+[test-groups]
+load-sensitive = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = """
+(package(bench) & binary(alloc_assertions) & (
+    test(/(^|::)ai_exec_on_ai_is_zero_alloc$/)
+  | test(/(^|::)hl_outcome_meta_parsers_are_zero_alloc$/)
+  | test(/(^|::)settlement_window_and_median_of_means_are_zero_alloc$/)
+  | test(/(^|::)ws_frame_roundtrip_is_zero_alloc$/)
+  | test(/(^|::)guard_reports_zero_when_nothing_allocates$/)
+  | test(/(^|::)xmm_queue_law_place_land_fill_modify_cancel_are_zero_alloc$/)
+))
+| (package(core-metrics) & binary(server_loopback)
+    & test(/(^|::)scrape_hammer_all_succeed_without_conn_errors$/))
+"""
+test-group = "load-sensitive"

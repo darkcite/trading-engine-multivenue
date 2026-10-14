@@ -95,6 +95,16 @@ pub const EAPI_ULY_MAX: usize = 16;
 /// Deribit/OKX precedent.
 pub const EAPI_OPT_MAX: usize = 64;
 
+/// **BX9 (Q-5; the R3 ruling, 2026-10-11)** — the options a live Binance
+/// arm's account holds OUTSIDE the selected chain that the boot adds to
+/// it, so the lane prices them too: at most this many (more refuses the
+/// boot, naming the count).
+pub const EAPI_HELD_MAX: usize = 16;
+
+/// The options lane's symbol table: the chain and the held options
+/// beside it ([`EAPI_OPT_MAX`] + [`EAPI_HELD_MAX`]).
+pub const EAPI_TABLE_MAX: usize = EAPI_OPT_MAX + EAPI_HELD_MAX;
+
 /// Hard cap on parsed exchangeInfo option rows. Live eapi universe is
 /// order-1k symbols across all underlyings; 8× headroom.
 pub const EAPI_DISCOVERY_ROWS_CAP: usize = 8192;
@@ -684,21 +694,22 @@ pub fn select_capped_chain(
 pub const EAPI_MARK_STREAM: &str = "@optionMarkPrice";
 
 /// Fixed-capacity `venue symbol → SymbolId` map for the options lane.
-/// Built at boot from the selected chain; read once per array element
-/// on the Binance ingress thread (a length-gated linear scan of ≤ 64
-/// rows — the Deribit-table cost note applies). Keys are the symbols
+/// Built at boot from the selected chain (and, BX9, the options a live
+/// arm's account holds beside it); read once per array element on the
+/// Binance ingress thread (a length-gated linear scan of ≤ 64 rows, ≤ 80
+/// with held options — the Deribit-table cost note applies). Keys are the symbols
 /// AS LISTED (`BTC-260925-86000-C`): the mark array's `"s"` carries
 /// the venue's own case, so a lookup compares the wire bytes where
 /// they lie — no lowercasing, no copy.
 pub struct EapiSymbolTable {
-    rows: [(u8, [u8; EAPI_SYM_MAX], SymbolId); EAPI_OPT_MAX],
+    rows: [(u8, [u8; EAPI_SYM_MAX], SymbolId); EAPI_TABLE_MAX],
     len: usize,
 }
 
 /// Why an [`EapiSymbolTable::insert`] failed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum EapiTableErr {
-    /// All [`EAPI_OPT_MAX`] rows in use.
+    /// All [`EAPI_TABLE_MAX`] rows in use.
     Full,
     /// Symbol longer than [`EAPI_SYM_MAX`] or empty.
     BadSymbol,
@@ -708,7 +719,7 @@ impl EapiSymbolTable {
     /// Empty table.
     pub const fn new() -> Self {
         Self {
-            rows: [(0, [0; EAPI_SYM_MAX], 0); EAPI_OPT_MAX],
+            rows: [(0, [0; EAPI_SYM_MAX], 0); EAPI_TABLE_MAX],
             len: 0,
         }
     }
@@ -719,7 +730,7 @@ impl EapiSymbolTable {
         if symbol.is_empty() || symbol.len() > EAPI_SYM_MAX {
             return Err(EapiTableErr::BadSymbol);
         }
-        if self.len >= EAPI_OPT_MAX {
+        if self.len >= EAPI_TABLE_MAX {
             return Err(EapiTableErr::Full);
         }
         let row = &mut self.rows[self.len];
@@ -738,7 +749,7 @@ impl EapiSymbolTable {
     /// path: length gate, then a bytewise compare.
     #[inline]
     pub fn lookup(&self, wire_sym: &[u8]) -> Option<SymbolId> {
-        debug_assert!(self.len <= EAPI_OPT_MAX);
+        debug_assert!(self.len <= EAPI_TABLE_MAX);
         let n = wire_sym.len();
         let mut i = 0;
         while i < self.len {
@@ -1524,12 +1535,14 @@ mod tests {
         assert_eq!(t.lookup(b"BTC-260925-86000-C2"), None);
         assert_eq!(t.insert(b"", 1), Err(EapiTableErr::BadSymbol));
         assert_eq!(t.insert(&[b'X'; EAPI_SYM_MAX + 1], 1), Err(EapiTableErr::BadSymbol));
+        // BX9: the chain's 64 and the held options' 16 beside it.
         let mut full = EapiSymbolTable::new();
-        for i in 0..EAPI_OPT_MAX {
+        for i in 0..EAPI_TABLE_MAX {
             full.insert(format!("S{i}").as_bytes(), i as u32).unwrap();
         }
         assert_eq!(full.insert(b"OVER", 99), Err(EapiTableErr::Full));
-        assert_eq!(full.len(), EAPI_OPT_MAX);
+        assert_eq!((full.len(), EAPI_TABLE_MAX), (EAPI_TABLE_MAX, 80));
+        assert_eq!(full.lookup(b"S79"), Some(79), "the last held row resolves");
     }
 
     /// BX0-F2: the live frame splits, walks element by element, and

@@ -129,6 +129,7 @@ dependencies = [
  "clob-dispatcher",
  "core-alloc",
  "core-amm",
+ "core-config",
  "core-crypto",
  "core-fill",
  "core-io",
@@ -776,6 +777,7 @@ dependencies = [
  "core-time",
  "core-types",
  "exec-binance",
+ "exec-gateway",
  "exec-router",
  "ingress-binance",
  "mio 0.8.11",
@@ -784,6 +786,7 @@ dependencies = [
  "ring",
  "rustls",
  "signer-ed25519",
+ "zeroize",
 ]
 
 [[package]]

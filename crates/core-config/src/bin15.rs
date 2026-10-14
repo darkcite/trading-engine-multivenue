@@ -73,7 +73,7 @@ fn err(msg: impl Into<String>) -> Bin15Error {
 /// Every key the grammar accepts. An unknown key is a REFUSAL: a
 /// typo'd `e_take_1e6` that silently took the default is a member
 /// trading an edge nobody chose.
-const BIN15_KEYS: [&str; 27] = [
+const BIN15_KEYS: [&str; 36] = [
     "families",
     "underlying",
     "tau_ns",
@@ -127,6 +127,18 @@ const BIN15_KEYS: [&str; 27] = [
     // instance's start (expiry − the tenor), that a run of passing
     // snapshots may begin, ns. Optional; absent = 0 = no ceiling.
     "entry_elapsed_max_ns",
+    // BIN15 H90 (2026-10-13, rulings O-H90-1..8): the LATE-WINDOW entry.
+    // Every key optional; absent `late_enabled` = 0 = the member exactly
+    // as it was. `late_enabled = 1` requires `late_phi_lut`.
+    "late_enabled",
+    "late_tau_min_ns",
+    "late_tau_max_ns",
+    "late_p_min_1e6",
+    "late_e_1e6",
+    "late_persist_polls",
+    "late_usd_1e6",
+    "late_sigma_k_1e3",
+    "late_phi_lut",
 ];
 
 /// `bin15.toml` as parsed. The strings stay descriptors: resolving them
@@ -191,6 +203,34 @@ pub struct Bin15File {
     /// BIN15 S5: the latest a run of passing snapshots may begin, ns after
     /// the instance's start; `0` or under `tau_ns`. Absent = 0 = no ceiling.
     pub entry_elapsed_max_ns: u64,
+    /// BIN15 H90: `1` = the late-window entry is on. Absent = 0.
+    pub late_enabled: u8,
+    /// BIN15 H90: consecutive distinct snapshots of the favoured leg the
+    /// late test must hold on, `[1, ENTRY_PERSIST_POLLS_MAX]`. Absent =
+    /// [`LATE_PERSIST_POLLS_DEFAULT`].
+    pub late_persist_polls: u8,
+    /// BIN15 H90: the window's floor, ns to expiry. Absent =
+    /// [`LATE_TAU_MIN_NS_DEFAULT`].
+    pub late_tau_min_ns: u64,
+    /// BIN15 H90: the window's ceiling, ns to expiry, at most
+    /// [`LATE_TAU_MAX_NS_LIMIT`]. Absent = [`LATE_TAU_MAX_NS_DEFAULT`].
+    pub late_tau_max_ns: u64,
+    /// BIN15 H90: the least belief on the favoured side ×1e6. Absent =
+    /// [`LATE_P_MIN_1E6_DEFAULT`].
+    pub late_p_min_1e6: i64,
+    /// BIN15 H90: the margin the ask must leave under that belief ×1e6.
+    /// Absent = [`LATE_E_1E6_DEFAULT`].
+    pub late_e_1e6: i64,
+    /// BIN15 H90: the most one late entry spends ×1e6 USD — the whole
+    /// resting ask up to this. Absent = [`LATE_USD_1E6_DEFAULT`].
+    pub late_usd_1e6: i64,
+    /// BIN15 H90: the late pricer's σ scale ×1e3. Absent =
+    /// [`LATE_SIGMA_K_1E3_DEFAULT`].
+    pub late_sigma_k_1e3: i64,
+    /// BIN15 H90: `Φ(z) ×1e6` for `z = 0, 0.002, …, 8.192` — the late
+    /// pricer's Gaussian table, cut by `claude_worker.bin15_fit late`.
+    /// Empty when absent, which `late_enabled = 1` refuses.
+    pub late_phi_lut: Vec<u32>,
 }
 
 /// Read and parse the artifact, returning it with its RAW BYTES so the
@@ -268,6 +308,145 @@ pub const E_ENTRY_1E6_DEFAULT: i64 = 20_000;
 /// apart, so eight is ~40 s of an instance's 900: past it the entry is a
 /// different (late) strategy, not a filter on this one.
 pub const ENTRY_PERSIST_POLLS_MAX: u8 = 8;
+
+/// BIN15 H90: points in the late Φ table, `z = 0, 0.002, …, 8.192`.
+/// Mirrors `strategy_bin15::late::LATE_PHI_POINTS`.
+pub const LATE_PHI_POINTS: usize = 4097;
+
+/// BIN15 H90: the smallest `late_phi_lut[4096]` the grammar admits — the
+/// table must run out to certainty within a ppm, or a decided instance's
+/// 0.98 offer could never clear a 2 c margin.
+pub const LATE_PHI_LAST_MIN_1E6: u32 = 999_999;
+
+/// BIN15 H90 (ruling O-H90-7): the late window's stated floor, ns.
+pub const LATE_TAU_MIN_NS_DEFAULT: u64 = 2_000_000_000;
+
+/// BIN15 H90 (ruling O-H90-7): the late window's stated ceiling, ns.
+pub const LATE_TAU_MAX_NS_DEFAULT: u64 = 30_000_000_000;
+
+/// BIN15 H90: the late law prices inside the venue's settlement minute
+/// and nowhere else; a ceiling past it is a different strategy.
+pub const LATE_TAU_MAX_NS_LIMIT: u64 = 60_000_000_000;
+
+/// BIN15 H90: the late window's least floor — one second, inside which
+/// no order reaches the venue before the book clears.
+pub const LATE_TAU_MIN_NS_LIMIT: u64 = 1_000_000_000;
+
+/// BIN15 H90: the stated least belief, ×1e6 (0.90).
+pub const LATE_P_MIN_1E6_DEFAULT: i64 = 900_000;
+
+/// BIN15 H90: the stated margin, ×1e6 (2 c).
+pub const LATE_E_1E6_DEFAULT: i64 = 20_000;
+
+/// BIN15 H90: the stated persistence (ruling O-H90-5's F3 law).
+pub const LATE_PERSIST_POLLS_DEFAULT: u8 = 2;
+
+/// BIN15 H90 (ruling O-H90-6): the stated spend per late entry — the
+/// whole resting ask up to $100.
+pub const LATE_USD_1E6_DEFAULT: i64 = 100_000_000;
+
+/// BIN15 H90: the stated σ scale ×1e3 (1.55, fitted in sample, vault doc 32).
+pub const LATE_SIGMA_K_1E3_DEFAULT: i64 = 1_550;
+
+/// BIN15 H90: the σ scale's bounds ×1e3 — a quarter to four times the
+/// short-horizon RMS.
+pub const LATE_SIGMA_K_1E3_RANGE: (i64, i64) = (250, 4_000);
+
+/// One optional 0/1 flag; absent = 0.
+fn opt_flag(kv: &[(String, Value, usize)], key: &str) -> Result<u8, Bin15Error> {
+    match opt_int(kv, key, 0)? {
+        0 => Ok(0),
+        1 => Ok(1),
+        v => Err(err(format!("`{key}` must be 0 or 1 (got {v}); absent means 0"))),
+    }
+}
+
+/// BIN15 H90: the late keys, parsed and bounded. Every STATED value is
+/// bounded whether or not the law is on, so an artifact that turns it on
+/// later cannot discover a bad value at that moment. One default depends
+/// on the artifact: absent `late_usd_1e6` is the ruled $100 or the
+/// artifact's own per-instance cap, whichever is smaller — an artifact
+/// with no late key at all is today's member and must parse as it did.
+fn late_keys(kv: &[(String, Value, usize)], file: &mut Bin15File) -> Result<(), Bin15Error> {
+    file.late_enabled = opt_flag(kv, "late_enabled")?;
+    let persist = opt_int(kv, "late_persist_polls", i64::from(LATE_PERSIST_POLLS_DEFAULT))?;
+    file.late_persist_polls = match u8::try_from(persist) {
+        Ok(p) if (1..=ENTRY_PERSIST_POLLS_MAX).contains(&p) => p,
+        _ => {
+            return Err(err(format!(
+                "`late_persist_polls` must be in [1, {ENTRY_PERSIST_POLLS_MAX}] (got {persist})"
+            )))
+        }
+    };
+    file.late_tau_min_ns = opt_pos_u64(kv, "late_tau_min_ns", LATE_TAU_MIN_NS_DEFAULT)?;
+    file.late_tau_max_ns = opt_pos_u64(kv, "late_tau_max_ns", LATE_TAU_MAX_NS_DEFAULT)?;
+    if file.late_tau_min_ns < LATE_TAU_MIN_NS_LIMIT
+        || file.late_tau_min_ns >= file.late_tau_max_ns
+        || file.late_tau_max_ns > LATE_TAU_MAX_NS_LIMIT
+    {
+        return Err(err(format!(
+            "`late_tau_min_ns` {} and `late_tau_max_ns` {} must satisfy \
+             {LATE_TAU_MIN_NS_LIMIT} <= min < max <= {LATE_TAU_MAX_NS_LIMIT} — the late \
+             law lives inside the venue's settlement minute",
+            file.late_tau_min_ns, file.late_tau_max_ns
+        )));
+    }
+    file.late_p_min_1e6 = opt_int(kv, "late_p_min_1e6", LATE_P_MIN_1E6_DEFAULT)?;
+    if !(500_000..1_000_000).contains(&file.late_p_min_1e6) {
+        return Err(err(format!(
+            "`late_p_min_1e6` must be in [500000, 1000000) (got {}) — the favoured side \
+             is believed at least even",
+            file.late_p_min_1e6
+        )));
+    }
+    file.late_e_1e6 = opt_int(kv, "late_e_1e6", LATE_E_1E6_DEFAULT)?;
+    if !(100..500_000).contains(&file.late_e_1e6) {
+        return Err(err(format!(
+            "`late_e_1e6` must be in [100, 500000) (got {}) — one tick to half the interval",
+            file.late_e_1e6
+        )));
+    }
+    let usd_stated = kv.iter().any(|(k, _, _)| k == "late_usd_1e6");
+    file.late_usd_1e6 = opt_int(
+        kv,
+        "late_usd_1e6",
+        LATE_USD_1E6_DEFAULT.min(file.cap_instance_usd_1e6),
+    )?;
+    if (usd_stated || file.late_enabled == 1)
+        && (file.late_usd_1e6 < 1_000_000 || file.late_usd_1e6 > file.cap_instance_usd_1e6)
+    {
+        return Err(err(format!(
+            "`late_usd_1e6` {} must be in [1000000, cap_instance_usd_1e6 {}] — the venue's \
+             $1 minimum to the per-instance cap",
+            file.late_usd_1e6, file.cap_instance_usd_1e6
+        )));
+    }
+    file.late_sigma_k_1e3 = opt_int(kv, "late_sigma_k_1e3", LATE_SIGMA_K_1E3_DEFAULT)?;
+    let (klo, khi) = LATE_SIGMA_K_1E3_RANGE;
+    if !(klo..=khi).contains(&file.late_sigma_k_1e3) {
+        return Err(err(format!(
+            "`late_sigma_k_1e3` must be in [{klo}, {khi}] (got {})",
+            file.late_sigma_k_1e3
+        )));
+    }
+    if kv.iter().any(|(k, _, _)| k == "late_phi_lut") {
+        file.late_phi_lut = table(
+            kv,
+            "late_phi_lut",
+            LATE_PHI_POINTS,
+            Some(500_000),
+            Some(LATE_PHI_LAST_MIN_1E6),
+            false,
+        )?;
+    }
+    if file.late_enabled == 1 && file.late_phi_lut.is_empty() {
+        return Err(err(
+            "`late_enabled = 1` without `late_phi_lut` — the late pricer has no Φ. Cut \
+             it with `python -m claude_worker.bin15_fit late`",
+        ));
+    }
+    Ok(())
+}
 
 /// BIN15 S5: `entry_persist_polls`, absent = 1, bounded to
 /// `[1, ENTRY_PERSIST_POLLS_MAX]`. Zero is refused rather than read as
@@ -422,7 +601,7 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
         }
     }
 
-    let file = Bin15File {
+    let mut file = Bin15File {
         families,
         underlying,
         tau_ns: pos_u64(&kv, "tau_ns")?,
@@ -452,6 +631,15 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
         entry_min_px_1e6: opt_int(&kv, "entry_min_px_1e6", 0)?,
         entry_persist_polls: persist_polls(&kv)?,
         entry_elapsed_max_ns: opt_pos_u64(&kv, "entry_elapsed_max_ns", 0)?,
+        late_enabled: 0,
+        late_persist_polls: LATE_PERSIST_POLLS_DEFAULT,
+        late_tau_min_ns: LATE_TAU_MIN_NS_DEFAULT,
+        late_tau_max_ns: LATE_TAU_MAX_NS_DEFAULT,
+        late_p_min_1e6: LATE_P_MIN_1E6_DEFAULT,
+        late_e_1e6: LATE_E_1E6_DEFAULT,
+        late_usd_1e6: LATE_USD_1E6_DEFAULT,
+        late_sigma_k_1e3: LATE_SIGMA_K_1E3_DEFAULT,
+        late_phi_lut: Vec::new(),
     };
 
     if file.families.is_empty() || file.families.len() > BIN15_MAX_FAMILIES {
@@ -605,6 +793,7 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
             file.scale_1e9
         )));
     }
+    late_keys(&kv, &mut file)?;
     Ok(file)
 }
 
@@ -1024,5 +1213,108 @@ mod tests {
         let src = format!("{}hour_ln_off_1e9 = [{}]\n", artifact(), hours.join(", "));
         let f = parse(&src).expect("24 hours");
         assert_eq!(f.hour_ln_off_1e9[23], 23_000_000);
+    }
+
+    /// BIN15 H90: a late Φ table of the shipped SHAPE — 0.5 at z = 0,
+    /// monotone, certainty at the end.
+    fn late_lut_line() -> String {
+        let mut v: Vec<String> = Vec::with_capacity(LATE_PHI_POINTS);
+        let mut i = 0usize;
+        while i < LATE_PHI_POINTS {
+            let x = 500_000 + (i as i64 * 500_000) / (LATE_PHI_POINTS as i64 - 1);
+            v.push(x.to_string());
+            i += 1;
+        }
+        format!("late_phi_lut = [{}]\n", v.join(", "))
+    }
+
+    /// BIN15 H90: every late key is optional and absent is the member as it
+    /// was — the law off, the ruled values stated, no table.
+    #[test]
+    fn the_late_keys_are_absent_by_default_and_off() {
+        let f = parse(&artifact()).expect("parse");
+        assert_eq!(f.late_enabled, 0, "absent = off, bit for bit");
+        assert_eq!(f.late_tau_min_ns, LATE_TAU_MIN_NS_DEFAULT);
+        assert_eq!(f.late_tau_max_ns, LATE_TAU_MAX_NS_DEFAULT);
+        assert_eq!(f.late_p_min_1e6, 900_000);
+        assert_eq!(f.late_e_1e6, 20_000);
+        assert_eq!(f.late_persist_polls, 2);
+        assert_eq!(f.late_usd_1e6, 100_000_000);
+        assert_eq!(f.late_sigma_k_1e3, 1_550);
+        assert!(f.late_phi_lut.is_empty());
+        // The committed example carries none of them, so it is off too.
+        let ex = parse(EXAMPLE).expect("example");
+        assert_eq!(ex.late_enabled, 0);
+    }
+
+    /// BIN15 H90: switched on with its table, every key round-trips.
+    #[test]
+    fn the_late_law_round_trips_when_switched_on_with_its_table() {
+        let src = format!(
+            "{}late_enabled = 1\nlate_tau_min_ns = 8000000000\nlate_tau_max_ns = 30000000000\n\
+             late_p_min_1e6 = 920000\nlate_e_1e6 = 10000\nlate_persist_polls = 3\n\
+             late_usd_1e6 = 50000000\nlate_sigma_k_1e3 = 1250\n{}",
+            artifact(),
+            late_lut_line()
+        );
+        let f = parse(&src).expect("the late law parses");
+        assert_eq!(f.late_enabled, 1);
+        assert_eq!((f.late_tau_min_ns, f.late_tau_max_ns), (8_000_000_000, 30_000_000_000));
+        assert_eq!((f.late_p_min_1e6, f.late_e_1e6), (920_000, 10_000));
+        assert_eq!(f.late_persist_polls, 3);
+        assert_eq!(f.late_usd_1e6, 50_000_000);
+        assert_eq!(f.late_sigma_k_1e3, 1_250);
+        assert_eq!(f.late_phi_lut.len(), LATE_PHI_POINTS);
+        assert_eq!(f.late_phi_lut[LATE_PHI_POINTS - 1], 1_000_000);
+    }
+
+    /// BIN15 H90: on without a table is a refusal, and every bound holds
+    /// whether or not the law is on.
+    #[test]
+    fn the_late_law_refuses_a_missing_table_and_every_bound() {
+        let e = parse(&format!("{}late_enabled = 1\n", artifact())).expect_err("no table");
+        assert!(e.0.contains("without `late_phi_lut`"), "{}", e.0);
+        let bad: [(&str, &str); 14] = [
+            ("late_enabled = 2", "0 or 1"),
+            ("late_tau_min_ns = 999999999", "must satisfy"),
+            ("late_tau_min_ns = 30000000000", "must satisfy"),
+            ("late_tau_max_ns = 60000000001", "must satisfy"),
+            ("late_tau_max_ns = 2000000000", "must satisfy"),
+            ("late_p_min_1e6 = 499999", "[500000, 1000000)"),
+            ("late_p_min_1e6 = 1000000", "[500000, 1000000)"),
+            ("late_e_1e6 = 99", "[100, 500000)"),
+            ("late_e_1e6 = 500000", "[100, 500000)"),
+            ("late_persist_polls = 0", "[1, 8]"),
+            ("late_persist_polls = 9", "[1, 8]"),
+            ("late_usd_1e6 = 999999", "cap_instance_usd_1e6"),
+            ("late_usd_1e6 = 1000000001", "cap_instance_usd_1e6"),
+            ("late_sigma_k_1e3 = 249", "[250, 4000]"),
+        ];
+        let mut i = 0usize;
+        while i < bad.len() {
+            let (line, want) = bad[i];
+            let e = parse(&format!("{}{line}\n", artifact())).expect_err(line);
+            assert!(e.0.contains(want), "{line}: got {}", e.0);
+            i += 1;
+        }
+        // A table that stops short of certainty is refused.
+        let short = late_lut_line().replace("1000000]", "999998]");
+        let e = parse(&format!("{}{short}", artifact())).expect_err("short table");
+        assert!(e.0.contains("late_phi_lut"), "{}", e.0);
+    }
+
+    /// BIN15 H90: an artifact whose per-instance cap is under the ruled $100
+    /// and that names no late key is today's member — it parses, the absent
+    /// stake clamped to the cap. A STATED stake over the cap is refused.
+    #[test]
+    fn a_cap_under_the_ruled_stake_parses_with_the_law_absent() {
+        let small = artifact().replace(
+            "cap_instance_usd_1e6 = 1000000000",
+            "cap_instance_usd_1e6 = 40000000",
+        );
+        let f = parse(&small).expect("a $40 cap with no late key parses as it did");
+        assert_eq!((f.late_enabled, f.late_usd_1e6), (0, 40_000_000));
+        let e = parse(&format!("{small}late_usd_1e6 = 100000000\n")).expect_err("over the cap");
+        assert!(e.0.contains("cap_instance_usd_1e6 40000000"), "{}", e.0);
     }
 }

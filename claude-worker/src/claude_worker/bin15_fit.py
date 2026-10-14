@@ -370,6 +370,79 @@ def phi_table_1e6() -> tuple[int, ...]:
     return tuple(out)
 
 
+#: BIN15 H90: points in ``late_phi_lut``: ``z = 0, 0.002, …, 8.192``.
+#: Mirrors ``core_config::bin15::LATE_PHI_POINTS`` and
+#: ``strategy_bin15::late::LATE_PHI_POINTS``.
+LATE_PHI_POINTS: int = 4097
+
+#: BIN15 H90: the late table's step in ``z`` ×1e6.
+LATE_PHI_STEP_1E6: int = 2_000
+
+#: BIN15 H90 (2026-10-13, rulings O-H90-1..8): the late-window entry's
+#: knobs at their ruled values, written ON by ``--late``. Order is the
+#: artifact order. ``late_sigma_k_1e3`` (1.55) and the window are the
+#: pre-registered study's (vault doc 32); they are operator knobs here, not
+#: a fit this module makes.
+LATE_KNOBS: tuple[tuple[str, int], ...] = (
+    ("late_enabled", 1),
+    ("late_tau_min_ns", 2_000_000_000),
+    ("late_tau_max_ns", 30_000_000_000),
+    ("late_p_min_1e6", 900_000),
+    ("late_e_1e6", 20_000),
+    ("late_persist_polls", 2),
+    ("late_usd_1e6", 100_000_000),
+    ("late_sigma_k_1e3", 1_550),
+)
+
+
+@functools.lru_cache(maxsize=1)
+def late_phi_table_1e6() -> tuple[int, ...]:
+    """``Φ(z) ×1e6`` for ``z = 0, 0.002, …, 8.192`` — the late pricer's
+    Gaussian table (BIN15 H90).
+
+    The same exact :mod:`decimal` series as :func:`phi_table_1e6`, on a
+    grid twice as wide, so a decided instance's belief can reach 1.000000:
+    the S-law table stops at 0.999979, under which a 0.98 offer can never
+    clear a 2 c margin. ``[0] == 500_000`` and the last entry is 1 000 000.
+    """
+    with decimal.localcontext() as ctx:
+        ctx.prec = PRECISION
+        root2 = decimal.Decimal(2).sqrt()
+        half = decimal.Decimal(1) / 2
+        out: list[int] = []
+        i = 0
+        while i < LATE_PHI_POINTS:
+            z = decimal.Decimal(i * LATE_PHI_STEP_1E6) / 1_000_000
+            phi = (1 + _erf(z / root2)) * half
+            scaled = phi * 1_000_000
+            whole = int(scaled)
+            frac = scaled - whole
+            out.append(whole + 1 if frac >= half else whole)
+            i += 1
+    table = tuple(out)
+    if table[0] != 500_000 or table[-1] != 1_000_000:
+        raise ArithmeticError("the late table must run from 0.5 to certainty")
+    k = 1
+    while k < LATE_PHI_POINTS:
+        if table[k] < table[k - 1]:
+            raise ArithmeticError(f"the late table dips at [{k}]")
+        k += 1
+    return table
+
+
+def render_late() -> str:
+    """The BIN15 H90 block: the late knobs ON and ``late_phi_lut``, for
+    appending to an artifact (``--late``)."""
+    text = (
+        "# BIN15 H90 (2026-10-13): the late-window entry (vault doc 33). The\n"
+        "# knobs are the ruled values; late_phi_lut is Phi on z = 0..8.192,\n"
+        "# computed exactly in `decimal`, not fitted.\n"
+    )
+    for key, value in LATE_KNOBS:
+        text += f"{key:<15} = {value}\n"
+    return text + _line("late_phi_lut", late_phi_table_1e6())
+
+
 @functools.lru_cache(maxsize=1)
 def _bernoulli_even() -> tuple[fractions.Fraction, ...]:
     """``B_2, B_4, ..., B_60`` as exact fractions, for Stirling's series.
@@ -741,7 +814,7 @@ def phi_lut_1e6(
     raise ValueError(f"phi must be one of {', '.join(PHI_KINDS)}, got {phi!r}")
 
 
-def render_tables(  # noqa: PLR0913 — the four knobs, then the four fit arguments
+def render_tables(  # the four knobs, then the four fit arguments
     slope_early: int = SLOPE_EARLY_MILLI,
     slope_mid: int = SLOPE_MID_MILLI,
     slope_late: int = SLOPE_LATE_MILLI,
@@ -876,6 +949,11 @@ def _hour_arg(text: str) -> tuple[int, ...]:
 
 
 def _add_fit_args(ap: argparse.ArgumentParser) -> None:
+    ap.add_argument(
+        "--late",
+        action="store_true",
+        help="BIN15 H90: append the late-window block (the law ON, its Phi table)",
+    )
     ap.add_argument("--slope-early", type=int, default=SLOPE_EARLY_MILLI)
     ap.add_argument("--slope-mid", type=int, default=SLOPE_MID_MILLI)
     ap.add_argument("--slope-late", type=int, default=SLOPE_LATE_MILLI)
@@ -953,6 +1031,8 @@ def main(argv: list[str] | None = None) -> int:
             phi_s=args.phi_s,
             hour_ln_off_1e9=args.hour_ln_off_1e9,
         )
+    if args.late:
+        text += render_late()
     if getattr(args, "out", None) is None:
         sys.stdout.write(text)
         return 0

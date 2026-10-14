@@ -11,7 +11,12 @@ import pathlib
 import claude_worker.candles
 
 EXAMPLE = pathlib.Path(__file__).resolve().parents[2] / "regime.toml.example"
-MEMBERS = ("binance-usdm:ethusdt", "binance-usdm:solusdt", "binance-usdm:bnbusdt", "binance-usdm:xrpusdt")
+MEMBERS = (
+    "binance-usdm:ethusdt",
+    "binance-usdm:solusdt",
+    "binance-usdm:bnbusdt",
+    "binance-usdm:xrpusdt",
+)
 BTC = "binance-usdm:btcusdt"
 NOW_MS = 1_800_000_000_000  # a minute boundary (÷ 60_000)
 
@@ -42,7 +47,8 @@ def candles_db(
         for desc in (BTC, *MEMBERS):
             rows.append((1, desc, "1m", minute * 60_000, px, px, px, px, 1.0, "rest", NOW_MS))
     conn.executemany(
-        "INSERT INTO candles (venue,descriptor,tf,open_ts,o,h,l,c,v,source,fetched_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO candles (venue,descriptor,tf,open_ts,o,h,l,c,v,source,fetched_ts) VALUES "
+        "(?,?,?,?,?,?,?,?,?,?,?)",
         rows,
     )
     conn.executescript(

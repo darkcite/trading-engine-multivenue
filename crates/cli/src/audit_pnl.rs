@@ -1562,6 +1562,10 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     let mut paper_qty: BTreeMap<u32, i64> = BTreeMap::new();
     let mut paper_cash_1e12: i128 = 0;
     let mut paper_fills: u64 = 0;
+    // BX7: the venue positions a Binance boot adopted (opening inventory),
+    // and those adopted without a price, by symbol: opened at its next mark.
+    let mut paper_adopted: u64 = 0;
+    let mut paper_unpriced: BTreeMap<u32, i64> = BTreeMap::new();
     let mut marks_1e6: BTreeMap<u32, i64> = BTreeMap::new();
 
     // Per-UTC-day equity snapshots per strategy engine.
@@ -1597,6 +1601,9 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                 }
                 if t.bid_px.raw() > 0 && t.ask_px.raw() > 0 {
                     marks_1e6.insert(t.sym, t.mid().raw());
+                    if let Some(q) = paper_unpriced.remove(&t.sym) {
+                        paper_cash_1e12 -= t.mid().raw() as i128 * q as i128;
+                    }
                 }
                 for eng in engines.values_mut() {
                     eng.on_record(t, ev.virt_ns, ev.wall_ns, &mut scratch);
@@ -1658,6 +1665,28 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                         *regime_orders.entry(key).or_insert(0) += 1;
                         p += 1;
                     }
+                }
+            }
+            // BX7: the venue's position adopted at a boot is opening
+            // inventory, not a trade. Held already (carried from an earlier
+            // run of the window: a restart adopts what it left), it changes
+            // nothing; otherwise the difference opens at the fill's price —
+            // the boot's mark — or, adopted without one (an inverse leg: its
+            // face carries none), at the symbol's last mark, else its next
+            // (the risk review's N7: opened at 0, the exit's whole flow read
+            // as paper P&L). Break-and-watch: folding it as a trade buys the
+            // same inventory again at every restart.
+            Payload::Fill(f) if f.is_adopted() => {
+                paper_adopted += 1;
+                let held = paper_qty.entry(f.sym).or_default();
+                let venue = if f.side == Side::Bid { f.qty.raw() } else { -f.qty.raw() };
+                let opened = venue - *held;
+                *held = venue;
+                let px = if f.px.raw() != 0 { f.px.raw() } else { marks_1e6.get(&f.sym).copied().unwrap_or(0) };
+                if px == 0 {
+                    *paper_unpriced.entry(f.sym).or_default() += opened;
+                } else {
+                    paper_cash_1e12 -= px as i128 * opened as i128;
                 }
             }
             Payload::Fill(f) => {
@@ -1804,10 +1833,11 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         params.latency_ns[4],
     ));
     report(&format!(
-        "audit-pnl: paper view: fills={paper_fills} net={} (cash={} markout={}; fees none in paper)",
+        "audit-pnl: paper view: fills={paper_fills} adopted={paper_adopted} net={} (cash={} markout={}; fees none in paper; {} adopted leg(s) never marked)",
         fmt_usd_1e6(usd_1e12_to_1e6_floor(paper_net_1e12)),
         fmt_usd_1e6(usd_1e12_to_1e6_floor(paper_cash_1e12)),
         fmt_usd_1e6(usd_1e12_to_1e6_floor(paper_mark_value_1e12)),
+        paper_unpriced.len(),
     ));
     for (sid, row) in &rows {
         let o = &row.outcome;

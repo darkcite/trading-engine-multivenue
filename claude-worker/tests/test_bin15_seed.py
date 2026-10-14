@@ -19,9 +19,9 @@ import sqlite3
 import pytest
 
 import claude_worker.bin15_seed
-import claude_worker.xsd_author
 import claude_worker.vol_ref
 import claude_worker.vrp_seed
+import claude_worker.xsd_author
 
 _MINUTE_MS: int = 60_000
 _DAY_MS: int = 86_400_000

@@ -38,10 +38,16 @@
 //!   express "Yes is rich" is to BUY No, not to sell Yes. The only sell
 //!   this member ever emits is a CLOSING take against inventory it can
 //!   prove it holds from fills.
-//! * **It never takes in the last `tail_refuse_ns`.** At the very end
-//!   of a binary's life the fair value is a step function of the next
-//!   tick of the underlying, and the model's own error is larger than
-//!   any edge it can measure. The venue also clears the book at expiry.
+//! * **It never takes in the last `tail_refuse_ns`** — the arms priced
+//!   by the S-law pricer. At the very end of a binary's life that
+//!   pricer's fair value is a step function of the next tick of the
+//!   underlying, and its own error is larger than any edge it can
+//!   measure. The venue also clears the book at expiry. **BIN15 H90's
+//!   late entry is the one exception, and it is its own law** (`late`
+//!   module, rulings O-H90-1..8): inside the settlement minute it prices
+//!   the partially observed TWAP from a short horizon and the perp's
+//!   book, takes one IoC per instance in `[late_tau_min, late_tau_max)`,
+//!   and is OFF unless the artifact switches it on.
 //! * **It never quotes inside `tau_min_quote_ns`.** A resting quote
 //!   near expiry is pure gamma to whoever crosses it.
 //! * **It does not consult the regime word.** The HORIZON law: the
@@ -82,6 +88,7 @@ use strategy_core::{
     Bin15Counters, Ctx, RegimeGate, Strategy, StrategyCounters, StrategyError, SubmitErr,
 };
 
+pub mod late;
 pub mod price;
 
 /// Families one member instance can carry. Mirrors
@@ -652,6 +659,9 @@ pub struct Bin15Params {
     pub hour_ln_off_1e9: [i64; 24],
     /// Variance-ratio scale on σ̂ ×1e9; `1e9` = no scaling.
     pub scale_1e9: i64,
+    /// BIN15 H90: the late-window entry's law. `late.enabled == 0` = the
+    /// member exactly as it was.
+    pub late: late::LateParams,
 }
 
 impl Default for Bin15Params {
@@ -689,9 +699,58 @@ impl Default for Bin15Params {
             _pad: [0; 5],
             hour_ln_off_1e9: [0; 24],
             scale_1e9: 1_000_000_000,
+            late: late::LateParams::default(),
         }
     }
 }
+
+/// BIN15 H90: one family's late-window entry — the run, the in-flight id,
+/// the counterfactuals and what the entry was priced at. Its own cache
+/// line per family, beside [`FamilyState`] (which stays eight lines).
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LateState {
+    /// `1` once this instance's late entry was SUBMITTED.
+    pub covered: u8,
+    /// The persistence run (consecutive distinct polls that passed).
+    pub hits: u8,
+    /// The run's side, `1` Yes / `0` No.
+    pub yes: u8,
+    /// The P1b counterfactual's side (valid while `ff_ts != 0`).
+    pub ff_yes: u8,
+    /// The production-pricer counterfactual's side (valid while
+    /// `ctl_ts != 0`).
+    pub ctl_yes: u8,
+    /// Explicit padding — always zero.
+    pub _pad: [u8; 3],
+    /// The favoured leg's snapshot (`TouchState::ts_ns`) the run last
+    /// counted.
+    pub last_touch_ts: u64,
+    /// The in-flight late IoC's client id; `0` = none. A venue refusal of
+    /// it (a gateway's late `REJECTED`) lets the entry retry.
+    pub oid: u64,
+    /// When P1b's test FIRST held on this instance (persist 1), engine ns;
+    /// `0` = never. Logged, never traded.
+    pub ff_ts: u64,
+    /// When the PRODUCTION p̂ first passed the same test, engine ns; `0` =
+    /// never (or it never priced in the window). Logged, never traded.
+    pub ctl_ts: u64,
+    /// The favoured ask at `ff_ts` ×1e6.
+    pub ff_px_1e6: i32,
+    /// The production counterfactual's favoured ask at `ctl_ts` ×1e6.
+    pub ctl_px_1e6: i32,
+    /// P1b's belief on the side the entry bought ×1e6.
+    pub entry_p_1e6: i32,
+    /// σ behind that belief ×1e9 per √s.
+    pub entry_sigma_1e9: u32,
+    /// The production p̂ on that side at the entry ×1e6, or `-1` when it
+    /// did not price at that reprice.
+    pub entry_ctl_p_1e6: i32,
+    /// Explicit padding — always zero.
+    pub _pad2: [u8; 4],
+}
+
+const _: () = assert!(::core::mem::size_of::<LateState>() == 64);
 
 /// The BIN15 member.
 #[repr(C, align(64))]
@@ -726,6 +785,14 @@ pub struct Bin15Strategy {
     /// XH4i-6 (Q1): what a gateway arm's late refusal restores (its own
     /// cache lines).
     undo: QuoteUndo,
+    /// BIN15 H90: per-family late-entry state.
+    late_fam: [LateState; BIN15_MAX_FAMILIES],
+    /// BIN15 H90: per-underlying 1-s grids (≈ 9.4 KiB each), boxed at boot.
+    late_grid: Box<[late::LateGrid; BIN15_MAX_UNDERLYINGS]>,
+    /// BIN15 H90: the late Φ table, boxed at boot.
+    late_lut: Box<late::LateLut>,
+    /// `1` once [`Bin15Strategy::configure_late`] installed the table.
+    late_lut_set: u8,
 }
 
 /// XH4i-6 (Q1) — what a gateway arm's late refusal restores. A gateway arm
@@ -777,6 +844,10 @@ impl Bin15Strategy {
                 centre_1e6: [[0; QUOTE_SIDES]; BIN15_MAX_FAMILIES],
                 cover_oid: [0; BIN15_MAX_FAMILIES],
             },
+            late_fam: [LateState::default(); BIN15_MAX_FAMILIES],
+            late_grid: Box::new(core::array::from_fn(|_| late::LateGrid::new())),
+            late_lut: Box::new(late::LateLut::flat()),
+            late_lut_set: 0,
         }
     }
 
@@ -852,6 +923,29 @@ impl Bin15Strategy {
         if params.requote_ttl_ns == 0 {
             return Err(StrategyError::Config("bin15: requote_ttl_ns is zero"));
         }
+        // BIN15 H90: core-config's own bounds, held here too — the member is
+        // configured by more than one caller.
+        let lp = params.late;
+        if lp.enabled > 1
+            || lp.persist_polls == 0
+            || lp.tau_min_ns < 1_000_000_000
+            || lp.tau_min_ns >= lp.tau_max_ns
+            || lp.tau_max_ns > 60_000_000_000
+            || !(ONE_1E6 / 2..ONE_1E6).contains(&lp.p_min_1e6)
+            || lp.e_1e6 < GRID_TICK_1E6
+            || lp.e_1e6 >= ONE_1E6 / 2
+            // The stake is bounded by the cap only where it is spent: an
+            // artifact with the law off and a cap under $100 is today's
+            // member (core-config clamps the absent default the same way).
+            || (lp.enabled == 1
+                && (lp.usd_1e6 < GRID_MIN_NOTIONAL_1E6 as i64
+                    || lp.usd_1e6 > params.cap_instance_usd_1e6))
+            || !(250..=4_000).contains(&lp.sigma_k_1e3)
+        {
+            return Err(StrategyError::Config(
+                "bin15: a late-entry parameter is outside core-config's bounds",
+            ));
+        }
         let mut u = 0usize;
         while u < params.n_underlyings {
             if params.underlying_sym[u] == SYMBOL_ID_NONE {
@@ -892,6 +986,24 @@ impl Bin15Strategy {
         self.configured = 1;
         self.refresh_dormant();
         Ok(())
+    }
+
+    /// BIN15 H90: install the late Φ table (boot only). Required before
+    /// `on_start` when `params.late.enabled == 1`; harmless otherwise.
+    pub fn configure_late(&mut self, lut: Box<late::LateLut>) {
+        self.late_lut = lut;
+        self.late_lut_set = 1;
+    }
+
+    /// BIN15 H90: one family's late-entry state (observability, the harness).
+    #[inline]
+    #[must_use]
+    pub fn late_state(&self, idx: usize) -> Option<&LateState> {
+        if idx >= self.params.n_families {
+            None
+        } else {
+            Some(&self.late_fam[idx])
+        }
     }
 
     /// Seed one underlying's forecast window and fitted pairs (boot
@@ -1109,6 +1221,8 @@ impl Bin15Strategy {
         debug_assert!(spec.outcome != 0);
         self.release_pendings(idx);
         self.fam[idx].clear_instance();
+        // BIN15 H90: the successor gets its own late entry.
+        self.late_fam[idx] = LateState::default();
         self.fam[idx].live = spec;
         // The null arm alternates by instance parity, so a session's
         // model and null samples are interleaved in time rather than
@@ -1163,6 +1277,7 @@ impl Bin15Strategy {
         }
         self.release_pendings(idx);
         self.fam[idx].clear_instance();
+        self.late_fam[idx] = LateState::default();
         self.counters.rolls_settled = self.counters.rolls_settled.wrapping_add(1);
         self.refresh_dormant();
     }
@@ -1253,6 +1368,11 @@ impl Bin15Strategy {
         }
         let prev_mark = self.marks[u].mark_1e6;
         let wall_now = self.bar.anchor.wall_of(now);
+        // BIN15 H90: the late grid writes the seconds before this mark with
+        // the one it replaces, then takes it. Off = untouched.
+        if self.params.late.enabled == 1 {
+            self.late_grid[u].on_mark(wall_now, mark_1e6);
+        }
         // BIN15 S3: the mark being replaced has been the mark since its
         // own stamp; fold that interval into every live window on this
         // underlying before it is gone.
@@ -1439,7 +1559,14 @@ impl Bin15Strategy {
     /// decision. Never on a timer: a re-price with no new evidence is
     /// the same number.
     fn reprice<C: Ctx>(&mut self, ctx: &mut C, idx: usize, now: NsTs) {
-        let Err(reason) = self.try_reprice(ctx, idx, now) else {
+        let res = self.try_reprice(ctx, idx, now);
+        // BIN15 H90: the late law has its own window and its own holds; it
+        // runs whatever the S-law pricer did, after it, so a fresh p̂ (the
+        // production counterfactual) is this reprice's.
+        if self.params.late.enabled == 1 {
+            self.late_reprice(ctx, idx, now);
+        }
+        let Err(reason) = res else {
             return;
         };
         match reason {
@@ -1541,6 +1668,142 @@ impl Bin15Strategy {
             self.arm_quote(ctx, idx, to_expiry, now);
         }
         Ok(())
+    }
+
+    /// BIN15 H90 — the LATE-WINDOW ENTRY (vault doc 33 §1).
+    ///
+    /// Inside `[late_tau_min, late_tau_max)` to expiry: advance the
+    /// underlying's 1-s grid, price with [`late::late_fair`], record both
+    /// counterfactuals (P1b's own and the production p̂'s, persist 1), then
+    /// — once per instance — buy the favoured side at its ask when the
+    /// belief clears `p_min` and the ask sits `e` under it on
+    /// `persist_polls` consecutive snapshots of that leg (the S5 poll),
+    /// sized at the whole resting ask up to `usd` and the caps. Not held
+    /// by `tail_refuse_ns` or `tau_min_take_ns`: the window floor is its
+    /// own. Everything else binds: one pending take, the grid, the caps.
+    fn late_reprice<C: Ctx>(&mut self, ctx: &mut C, idx: usize, now: NsTs) {
+        let lp = self.params.late;
+        if self.fam[idx].kind != FAMILY_OUT_15M || !self.fam[idx].is_live() {
+            return;
+        }
+        let wall = self.bar.anchor.wall_of(now);
+        let expiry = self.fam[idx].live.expiry_ns;
+        if wall >= expiry {
+            return;
+        }
+        let tte = expiry - wall;
+        if tte < lp.tau_min_ns || tte >= lp.tau_max_ns {
+            return;
+        }
+        let u = self.fam[idx].underlying as usize;
+        self.late_grid[u].advance_to(wall / late::SEC_NS);
+        self.counters.late_reprices = self.counters.late_reprices.wrapping_add(1);
+        let fair = match late::late_fair(
+            &self.late_grid[u],
+            &self.late_lut,
+            self.fam[idx].live.strike_1e6,
+            expiry,
+            wall,
+            lp.sigma_k_1e3,
+        ) {
+            Ok(f) => f,
+            Err(_) => {
+                self.counters.late_skipped_stale = self.counters.late_skipped_stale.wrapping_add(1);
+                return;
+            }
+        };
+        let want_yes = fair.p_yes_1e6 >= ONE_1E6 / 2;
+        let p_side = if want_yes { fair.p_yes_1e6 } else { ONE_1E6 - fair.p_yes_1e6 };
+        let touch = if want_yes { self.fam[idx].touch_yes } else { self.fam[idx].touch_no };
+        let px = touch.touch.ask_1e6;
+        let book_ok = touch.stale == 0 && px > 0 && px < ONE_1E6 && touch.touch.ask_qty_1e6 > 0;
+        let ok = book_ok && p_side >= lp.p_min_1e6 && px <= p_side - lp.e_1e6;
+        // The production pricer's counterfactual, where it priced at THIS
+        // reprice (inside the tail it does not).
+        let ctl_p = if self.fam[idx].p_ts_ns == now { self.fam[idx].p_hat_1e6 } else { -1 };
+        let ctl_side_p = if ctl_p < 0 {
+            -1
+        } else if want_yes {
+            ctl_p
+        } else {
+            ONE_1E6 - ctl_p
+        };
+        let st = &mut self.late_fam[idx];
+        if ok && st.ff_ts == 0 {
+            st.ff_ts = now;
+            st.ff_px_1e6 = px as i32;
+            st.ff_yes = u8::from(want_yes);
+        }
+        if ctl_p >= 0 && st.ctl_ts == 0 {
+            let c_yes = ctl_p >= ONE_1E6 / 2;
+            let c_p = if c_yes { ctl_p } else { ONE_1E6 - ctl_p };
+            let c_touch = if c_yes { self.fam[idx].touch_yes } else { self.fam[idx].touch_no };
+            let c_px = c_touch.touch.ask_1e6;
+            if c_touch.stale == 0
+                && c_px > 0
+                && c_touch.touch.ask_qty_1e6 > 0
+                && c_p >= lp.p_min_1e6
+                && c_px <= c_p - lp.e_1e6
+            {
+                st.ctl_ts = now;
+                st.ctl_px_1e6 = c_px as i32;
+                st.ctl_yes = u8::from(c_yes);
+            }
+        }
+        if st.covered != 0 || self.fam[idx].pend_take.live() {
+            return;
+        }
+        if !book_ok {
+            self.counters.late_skipped_book = self.counters.late_skipped_book.wrapping_add(1);
+            return;
+        }
+        // The S5 poll on the favoured leg's own snapshots.
+        let yes = u8::from(want_yes);
+        let pass = u8::from(ok);
+        let same_side = yes == st.yes;
+        let fresh = touch.ts_ns != st.last_touch_ts || !same_side;
+        let run = if same_side { st.hits } else { 0 };
+        let poll = lp.persist_polls == 1 || (fresh && now == touch.ts_ns);
+        let next = if !poll {
+            run
+        } else if fresh {
+            run.saturating_add(1) * pass
+        } else {
+            run.max(pass)
+        };
+        if poll {
+            st.hits = next;
+            st.yes = yes;
+            st.last_touch_ts = touch.ts_ns;
+        }
+        if !ok {
+            self.counters.late_skipped_price = self.counters.late_skipped_price.wrapping_add(1);
+            return;
+        }
+        if next < lp.persist_polls {
+            self.counters.late_skipped_persist =
+                self.counters.late_skipped_persist.wrapping_add(1);
+            return;
+        }
+        let want = (lp.usd_1e6 as i128 * 1_000_000) / px as i128;
+        let want = i64::try_from(want).unwrap_or(i64::MAX);
+        let qty = want.min(touch.touch.ask_qty_1e6).min(self.cap_room_1e6(idx, px));
+        if qty < GRID_LOT_1E6 {
+            self.counters.late_skipped_cap = self.counters.late_skipped_cap.wrapping_add(1);
+            return;
+        }
+        let before = self.counters.takes_submitted;
+        self.emit_take(ctx, idx, want_yes, Side::Bid, px, qty, now, false);
+        if self.counters.takes_submitted != before {
+            let oid = self.fam[idx].pend_take.oid;
+            let st = &mut self.late_fam[idx];
+            st.covered = 1;
+            st.oid = oid;
+            st.entry_p_1e6 = p_side as i32;
+            st.entry_sigma_1e9 = u32::try_from(fair.sigma_1e9).unwrap_or(u32::MAX);
+            st.entry_ctl_p_1e6 = ctl_side_p as i32;
+            self.counters.late_submitted = self.counters.late_submitted.wrapping_add(1);
+        }
     }
 
     /// Room left under both notional caps ×1e6, at `px_1e6` per
@@ -2455,6 +2718,9 @@ impl Bin15Strategy {
                 // `fills`, so partials stay visible as the difference.
                 if first {
                     self.counters.takes_filled = self.counters.takes_filled.wrapping_add(1);
+                    if self.late_fam[i].oid == fill.order_id {
+                        self.counters.late_filled = self.counters.late_filled.wrapping_add(1);
+                    }
                 }
                 self.counters.fills = self.counters.fills.wrapping_add(1);
                 return;
@@ -2603,6 +2869,11 @@ impl Bin15Strategy {
                 if self.undo.cover_oid[i] == oid {
                     self.undo.cover_oid[i] = 0;
                     self.fam[i].covered = 0;
+                }
+                // BIN15 H90: a refused late entry retries inside its window.
+                if self.late_fam[i].oid == oid {
+                    self.late_fam[i].oid = 0;
+                    self.late_fam[i].covered = 0;
                 }
                 return;
             }
@@ -2815,18 +3086,37 @@ impl Strategy for Bin15Strategy {
                 "bin15: on_start before configure — a member with no families would run silent",
             ));
         }
+        if self.params.late.enabled == 1 && self.late_lut_set == 0 {
+            return Err(StrategyError::Config(
+                "bin15: the late entry is on without its Φ table (configure_late)",
+            ));
+        }
         Ok(())
     }
 
     /// A tick on one of the binary legs updates that leg's touch and
-    /// re-prices. Ticks on anything else — including the underlying's
-    /// own BBO — are ignored: the MARK is the price source for the
-    /// pricer, and the perp's book is not part of the law.
+    /// re-prices. Ticks on anything else are ignored — the MARK is the
+    /// price source for the S-law pricer — with ONE exception (BIN15 H90):
+    /// with the late entry on, the underlying's own BBO feeds the late
+    /// grid's nowcast, and nothing else.
     fn on_tick<C: Ctx>(&mut self, tick: &Tick, ctx: &mut C) {
         if self.configured == 0 {
             return;
         }
         let Some((idx, is_yes)) = self.family_of_sym(tick.sym) else {
+            // BIN15 H90: the underlying's own book is part of the LATE law
+            // (the nowcast), and of nothing else. No reprice: a perp tick is
+            // not a poll.
+            if self.params.late.enabled == 1 && !tick.is_stale() {
+                if let Some(u) = self.underlying_of_sym(tick.sym) {
+                    let bid = tick.bid_px.raw();
+                    let ask = tick.ask_px.raw();
+                    if bid > 0 && ask > 0 {
+                        let wall = self.bar.anchor.wall_of(tick.ts_ns);
+                        self.late_grid[u].on_perp(wall, bid + ask);
+                    }
+                }
+            }
             return;
         };
         let state = TouchState {
@@ -5396,5 +5686,197 @@ mod tests {
             m.counters().takes_submitted > before,
             "a 15-minute binary is not one of the regime lane's cells"
         );
+    }
+
+    // ---- BIN15 H90: the late-window entry ----------------------------
+
+    /// A late Φ that is a CDF shape: 0.5 at z = 0 rising to 1.0 at z = 4.
+    fn late_ramp() -> Box<late::LateLut> {
+        let mut l = late::LateLut::flat();
+        let mut i = 0usize;
+        while i < late::LATE_PHI_POINTS {
+            let z = i as i64 * late::LATE_PHI_STEP_1E6;
+            l.phi[i] = (500_000 + z.min(4_000_000) / 8) as u32;
+            i += 1;
+        }
+        Box::new(l)
+    }
+
+    /// A 15 m member with the late law ON at the ruled values.
+    fn late_member(persist: u8) -> Bin15Strategy {
+        let mut p = params_1(FAMILY_OUT_15M);
+        p.late.enabled = 1;
+        p.late.persist_polls = persist;
+        let mut m = Bin15Strategy::new();
+        m.configure(p, ramp_luts(), core_time::WallAnchor::new(MONO0, WALL0))
+            .expect("configure");
+        m.configure_late(late_ramp());
+        m
+    }
+
+    /// Marks and perp BBOs once a second over `[from, to)` seconds after the
+    /// anchor, around $79 000 ±$1, the perp a dollar wide around the mark.
+    fn late_feed(m: &mut Bin15Strategy, c: &mut RecCtx, from: u64, to: u64) {
+        let mut s = from;
+        while s < to {
+            let mark = 79_000_000_000 + if s % 2 == 0 { 1_000_000 } else { -1_000_000 };
+            m.on_venue_event(&mark_event(mark, at(s) + 200_000_000), c);
+            m.on_tick(
+                &tick(btc_sym(), mark - 500_000, mark + 500_000, 1_000_000_000, at(s) + 300_000_000, false),
+                c,
+            );
+            s += 1;
+        }
+    }
+
+    /// One book poll: the Yes snapshot and its No mirror, at `secs + 0.4 s`.
+    fn late_poll(m: &mut Bin15Strategy, c: &mut RecCtx, secs: u64, yes_bid: i64, yes_ask: i64) {
+        let t = at(secs) + 400_000_000;
+        m.on_tick(&tick(yes_sym(0), yes_bid, yes_ask, 1_000_000_000, t, false), c);
+        m.on_tick(&tick(no_sym(0), ONE_1E6 - yes_ask, ONE_1E6 - yes_bid, 1_000_000_000, t, false), c);
+    }
+
+    /// The instance: struck $100 under the mark, expiring 600 s after the
+    /// anchor — Yes is decided by the last half-minute.
+    fn late_bind(m: &mut Bin15Strategy, c: &mut RecCtx) {
+        m.on_venue_event(&roll_event(0, 7001, 60, 78_900_000_000, expiry(600), false), c);
+    }
+
+    #[test]
+    fn the_late_entry_buys_the_decided_side_after_two_polls_at_the_whole_ask_capped() {
+        let mut m = late_member(2);
+        let mut c = ctx();
+        late_bind(&mut m, &mut c);
+        late_feed(&mut m, &mut c, 0, 570);
+        assert_eq!(m.counters().late_reprices, 0, "nothing priced before the window");
+        // Inside the window with no book yet: priced, and held on the book.
+        late_feed(&mut m, &mut c, 570, 580);
+        assert_eq!(m.counters().late_reprices, 10);
+        assert!(m.counters().late_skipped_book > 0, "no ask to buy");
+        // First poll at τ ≈ 19.6 s: the test holds, the run is one.
+        late_poll(&mut m, &mut c, 580, 800_000, 850_000);
+        assert!(c.orders.is_empty(), "one poll is not two");
+        assert!(m.counters().late_skipped_persist > 0);
+        // Marks between polls are not polls.
+        late_feed(&mut m, &mut c, 581, 585);
+        assert!(c.orders.is_empty(), "a mark never extends the run");
+        // Second poll: it fires — one IoC bid on Yes at the ask, $100 / 0.85
+        // = 117 whole contracts (the resting size is larger).
+        late_poll(&mut m, &mut c, 585, 800_000, 850_000);
+        assert_eq!(c.orders.len(), 1, "exactly one late entry");
+        let o = c.orders[0];
+        assert_eq!(o.sym, yes_sym(0));
+        assert_eq!(o.side, Side::Bid);
+        assert_eq!(o.px.raw(), 850_000);
+        assert_eq!(o.qty.raw(), 117_000_000);
+        assert_eq!(m.counters().late_submitted, 1);
+        let st = *m.late_state(0).expect("family 0");
+        assert_eq!(st.covered, 1);
+        assert_eq!(st.oid, o.client_oid);
+        assert!(st.entry_p_1e6 >= 980_000, "a decided belief: {}", st.entry_p_1e6);
+        assert!(st.ff_ts != 0 && st.ff_yes == 1, "the P1b counterfactual is the first poll");
+        // Once per instance: further polls emit nothing.
+        late_feed(&mut m, &mut c, 586, 590);
+        late_poll(&mut m, &mut c, 590, 800_000, 850_000);
+        assert_eq!(c.orders.len(), 1, "one late entry per instance");
+    }
+
+    #[test]
+    fn the_late_law_waits_for_its_window_and_holds_the_tail_the_s_law_refuses() {
+        let mut m = late_member(1);
+        let mut c = ctx();
+        late_bind(&mut m, &mut c);
+        late_feed(&mut m, &mut c, 0, 560);
+        // τ ≈ 39.6 s: outside [2, 30) — nothing; and a book the late test
+        // refuses (0.99 is not 2 c under a decided belief) until the tail.
+        late_poll(&mut m, &mut c, 560, 980_000, 990_000);
+        assert!(c.orders.is_empty());
+        assert_eq!(m.counters().late_reprices, 0);
+        // τ ≈ 5.6 s: inside the S-law's 10 s tail, inside the late window —
+        // the late law prices and (persist 1) fires on the cheaper ask.
+        late_feed(&mut m, &mut c, 560, 594);
+        late_poll(&mut m, &mut c, 594, 800_000, 850_000);
+        assert_eq!(c.orders.len(), 1, "the late window is its own floor");
+        assert!(m.counters().skipped_tail > 0, "the S-law still held there");
+    }
+
+    #[test]
+    fn an_ask_that_does_not_clear_the_margin_or_a_cold_grid_holds() {
+        // The ask at 0.99 against a belief ~1.0: under the 2 c margin? 1.0 −
+        // 0.02 = 0.98 < 0.99, so refused on price.
+        let mut m = late_member(1);
+        let mut c = ctx();
+        late_bind(&mut m, &mut c);
+        late_feed(&mut m, &mut c, 0, 585);
+        late_poll(&mut m, &mut c, 585, 980_000, 990_000);
+        assert!(c.orders.is_empty());
+        assert!(m.counters().late_skipped_price > 0);
+        // A grid with under 300 returns holds (σ).
+        let mut m = late_member(1);
+        let mut c = ctx();
+        late_bind(&mut m, &mut c);
+        late_feed(&mut m, &mut c, 400, 585);
+        late_poll(&mut m, &mut c, 585, 800_000, 850_000);
+        assert!(c.orders.is_empty());
+        assert!(m.counters().late_skipped_stale > 0);
+    }
+
+    #[test]
+    fn a_refused_late_entry_retries_inside_its_window_and_a_roll_resets_it() {
+        let mut m = late_member(1);
+        let mut c = ctx();
+        late_bind(&mut m, &mut c);
+        late_feed(&mut m, &mut c, 0, 585);
+        late_poll(&mut m, &mut c, 585, 800_000, 850_000);
+        assert_eq!(c.orders.len(), 1);
+        let oid = c.orders[0].client_oid;
+        // The venue refuses it late (a gateway's REJECTED).
+        let mut ev = core_types::OrderEvent::ZERO;
+        ev.client_oid = oid;
+        ev.kind = core_types::ORDER_EVENT_REJECTED;
+        ev.ts_ns = at(586);
+        m.on_order_event(&ev, &mut c);
+        assert_eq!(m.late_state(0).expect("f").covered, 0, "the entry may retry");
+        late_feed(&mut m, &mut c, 586, 588);
+        late_poll(&mut m, &mut c, 588, 800_000, 850_000);
+        assert_eq!(c.orders.len(), 2, "it retried");
+        // The successor instance starts clean.
+        m.on_venue_event(&roll_event(0, 7002, 60, 79_000_000_000, expiry(1_500), false), &mut c);
+        assert_eq!(*m.late_state(0).expect("f"), LateState::default());
+    }
+
+    #[test]
+    fn with_the_late_law_off_nothing_is_priced_or_fed() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        late_bind(&mut m, &mut c);
+        late_feed(&mut m, &mut c, 0, 585);
+        late_poll(&mut m, &mut c, 585, 800_000, 850_000);
+        assert!(c.orders.is_empty());
+        let k = m.counters();
+        assert_eq!(
+            (k.late_reprices, k.late_submitted, k.late_skipped_stale),
+            (0, 0, 0),
+            "off is the member as it was"
+        );
+    }
+
+    #[test]
+    fn on_start_refuses_a_late_law_without_its_table() {
+        let mut p = params_1(FAMILY_OUT_15M);
+        p.late.enabled = 1;
+        let mut m = Bin15Strategy::new();
+        m.configure(p, ramp_luts(), core_time::WallAnchor::new(MONO0, WALL0))
+            .expect("configure");
+        let mut c = ctx();
+        assert!(m.on_start(&mut c).is_err(), "no table, no start");
+        m.configure_late(late_ramp());
+        assert!(m.on_start(&mut c).is_ok());
+        // And configure holds core-config's bounds.
+        let mut bad = params_1(FAMILY_OUT_15M);
+        bad.late.tau_max_ns = 61_000_000_000;
+        assert!(Bin15Strategy::new()
+            .configure(bad, ramp_luts(), core_time::WallAnchor::new(MONO0, WALL0))
+            .is_err());
     }
 }

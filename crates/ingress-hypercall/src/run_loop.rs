@@ -375,9 +375,6 @@ pub fn drive_one<T: Transport, C: Capture>(
 ) -> io::Result<bool> {
     flush_tx(transport, drv)?;
     let fill = core_net::fill_rx(transport, &mut drv.rx)?;
-    if fill == RxFill::Eof {
-        drv.state = State::Closed;
-    }
     match drv.state {
         State::Connecting | State::Closed => {}
         State::NeedsWsWrite => {
@@ -394,6 +391,13 @@ pub fn drive_one<T: Transport, C: Capture>(
             }
         }
         State::Steady => drain_ws_frames(drv, lanes, status, counters, capture)?,
+    }
+    // HK2: an EOF closes the session only now — the frames that arrived
+    // with the FIN were parsed above — and nothing is flushed to a peer
+    // that has closed.
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+        return Ok(false);
     }
     flush_tx(transport, drv)?;
     Ok(fill == RxFill::Full)
@@ -530,15 +534,7 @@ fn drain_ws_frames<C: Capture>(
 ) -> io::Result<()> {
     loop {
         match ws_read_frame(drv.rx.filled()) {
-            WsReadResult::Incomplete => {
-                if drv.rx.free_mut().is_empty() && !drv.rx.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "ws frame exceeds rx buffer capacity",
-                    ));
-                }
-                return Ok(());
-            }
+            WsReadResult::Incomplete => return core_net::incomplete_frame(&mut drv.rx),
             WsReadResult::Malformed => {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed ws frame"));
             }

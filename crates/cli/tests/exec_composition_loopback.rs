@@ -675,12 +675,13 @@ mod slot_six {
     use exec_hyperliquid::arm::{ArmCfg, HlGatewayArm, PerpBind, ARM_PERPS};
     use exec_hyperliquid::cmd::{
         CMD_CANCEL, CMD_MODIFY, CMD_PLACE, CMD_READ_DAY, CMD_READ_LIMIT, CMD_READ_ORDERS,
-        CMD_READ_STATE, CMD_SCHEDULE_CANCEL,
+        CMD_READ_SPOT, CMD_READ_STATE, CMD_SCHEDULE_CANCEL,
     };
     use exec_hyperliquid::deadman::DeadManCfg;
     use exec_hyperliquid::event::{
         EVF_BUY, EVF_CMD_SHIFT, EVF_POST_ITEM, EVF_RESTING, EV_ACK, EV_CANCELED, EV_FILL,
-        EV_READ_DONE, EV_REJECTED, EV_SNAPSHOT, READ_DAY, READ_LIMIT, READ_ORDERS, READ_STATE,
+        EV_READ_DONE, EV_REJECTED, EV_SNAPSHOT, READ_DAY, READ_LIMIT, READ_ORDERS, READ_SPOT,
+        READ_STATE, SPOT_LEGS_READ,
     };
     use exec_hyperliquid::gateway::{hl_duplex, HlGatewayEnd};
     use exec_hyperliquid::rules::PerpRules;
@@ -1056,5 +1057,215 @@ mod slot_six {
         for s in 0..8usize {
             assert!(!d.halt().reason(s).is_halted(), "slot {s} halted");
         }
+    }
+
+    /// HK5 (A-S7-100, its cli half): **LAW E-4 end to end — slot 3's
+    /// outcome arm behind the router.** BIN15's gateway arm in outcome mode
+    /// (`outcomes`, no perps) behind `SlotSplit(3, …)`, driven as the engine
+    /// drives it. Before any roll, a submit on the family's YES leg is
+    /// refused by the arm (`NoLiveRoute`: no binding for the instance) and
+    /// nothing leaves; the roll (an `InstrumentRoll` venue event, through
+    /// the router) binds both legs; the same order then leaves as a place
+    /// on the leg's own asset (`ASSET_BASE + 10 × outcome + leg`, YES 0, NO
+    /// 1); an order
+    /// naming the instance the next roll retired is refused again.
+    #[test]
+    fn slot_three_s_outcome_arm_refuses_an_unbound_leg_through_the_router() {
+        const SLOT3: u8 = 3;
+        const LEG_YES: u32 = ((VenueId::Hyperliquid as u32) << 24) | 4_096;
+        const INST_A: u32 = 3_253;
+        const INST_B: u32 = 3_254;
+        let hl = VenueId::Hyperliquid as u8;
+        let unbound = PerpBind {
+            sym: make_symbol_id(VenueId::Hyperliquid, 950),
+            asset: ASSET,
+            rules: PerpRules::new(4).expect("rules"),
+        };
+        let cfg = ArmCfg {
+            slot: SLOT3,
+            perps: [unbound; ARM_PERPS],
+            n_perps: 0,
+            expires_after_ms: 5_000,
+            post_timeout_ms: 5_000,
+            skew_ms: 2_000,
+            recon_ms: 5_000,
+            join_ms: 1_000,
+            gone_ms: 3_000,
+            shutdown_ms: 300,
+            own_account: false,
+            anchor_1e6: 0,
+            deadman: DeadManCfg::DEFAULT,
+            budget_floor: 2_000,
+            limit_ms: 600_000,
+            leverage: 0,
+            outcomes: true,
+        };
+        let (eng, end) = hl_duplex();
+        let arm = HlGatewayArm::new(&cfg, eng).expect("arm");
+        let mut gw = Gw {
+            end,
+            cmds: Vec::new(),
+        };
+        let mut route = ExecRoute::all_paper();
+        route
+            .set_slot(
+                usize::from(SLOT3),
+                ExecMode::Live,
+                &[hl],
+                SlotCaps::new(10 * E6, 100 * E6, 1_000 * E6, 4),
+                HaltLimits::new(5, 5_000_000, 30_000, 3, 300_000),
+            )
+            .expect("slot 3");
+        let mut d: Slot6 = RoutedDispatcher::new(
+            route,
+            PaperDispatcher::new(),
+            SlotSplit::new(SLOT3, NullLiveDispatcher::new(), arm),
+            core_time::WallAnchor::now(),
+        );
+        let slot = usize::from(SLOT3);
+
+        // --- The boot, through the router's idle: every read answered
+        // empty, the snapshot in, the sweep clear, until the slot is seeded.
+        gw.end.stats.set_gauges(0, true);
+        gw.end.stats.beat(core_time::now_ns());
+        let mut snapshot = false;
+        let mut turns = 0;
+        while !d.ledger().is_slot_seeded(slot) {
+            turns += 1;
+            assert!(turns < 50, "slot 3's boot never seeded");
+            d.on_idle();
+            while let Some(c) = gw.end.cmd.pop() {
+                gw.cmds.push(*c);
+            }
+            let cmds: Vec<HlCmd> = gw.cmds.drain(..).collect();
+            for c in &cmds {
+                match c.kind {
+                    CMD_SCHEDULE_CANCEL => gw.item(c, EV_ACK, 0, 0),
+                    CMD_READ_STATE => gw.read_end(c, 1_000 * E8, 0, 1),
+                    CMD_READ_DAY => gw.read_end(c, 0, 0, c.time_ms),
+                    CMD_READ_LIMIT => gw.read_end(c, 0, 100, 0),
+                    // XH4i-2: the outcome map's spot sheet — USDC listed,
+                    // no leg held, the map's mark on its end.
+                    CMD_READ_SPOT => gw.send(ExecEvent {
+                        client_oid: c.client_oid,
+                        px_1e8: 1_000 * E8,
+                        sz_1e8: 1,
+                        asset: SPOT_LEGS_READ,
+                        kind: EV_READ_DONE,
+                        reason: READ_SPOT,
+                        slot: c.slot,
+                        ..ExecEvent::default()
+                    }),
+                    CMD_READ_ORDERS => gw.read_end(c, 0, 0, 0),
+                    k => panic!("slot 3's boot sent command {k}"),
+                }
+            }
+            if !snapshot {
+                gw.send(ExecEvent {
+                    kind: EV_SNAPSHOT,
+                    ..ExecEvent::default()
+                });
+                snapshot = true;
+            }
+            let asked = gw.end.stats.sweep_requested();
+            gw.end.stats.set_sweep(asked, SWEEP_CLEAR);
+        }
+        d.on_idle();
+        while let Some(c) = gw.end.cmd.pop() {
+            gw.cmds.push(*c);
+        }
+        gw.cmds.clear();
+
+        // BIN15's order on leg `sym` of instance `inst`: the instance in
+        // the client id's low 32 bits, the null arm's bit 63.
+        let leg_order = |seq: u64, sym: u32, inst: u32| {
+            let cid = (1u64 << 63) | (seq << 49) | u64::from(inst);
+            let mut o = Order::new(
+                core_time::now_ns(),
+                VenueId::Hyperliquid,
+                sym,
+                Side::Bid,
+                core_fill::ORDER_KIND_MAKER,
+                Price::from_raw(300_000),
+                Qty::from_raw(4_000_000),
+                cid,
+            );
+            o.strategy_id = SLOT3;
+            o.ttl_ns = 1_000_000_000;
+            o
+        };
+        let roll = |outcome: u32| {
+            let seq = u64::from(outcome) | (60u64 << 32);
+            ChannelEvent::new(
+                1,
+                VenueId::Hyperliquid,
+                ChannelId::InstrumentRoll,
+                LEG_YES,
+                seq,
+                0,
+                1_000_000,
+                2_000_000_000,
+            )
+        };
+
+        // --- LAW E-4: no roll has bound the instance — refused, unsent.
+        assert_eq!(
+            d.submit(&leg_order(1, LEG_YES, INST_A)),
+            Err(DispatchError::NoLiveRoute),
+            "an unbound instance is refused, never derived"
+        );
+        d.on_idle();
+        assert!(
+            gw.end.cmd.pop().is_none(),
+            "nothing left the arm for an unbound leg"
+        );
+        let refused = |d: &Slot6| {
+            let c = d.live().b().outcome_counters().expect("an outcome arm");
+            (c.refused_unbound, c.refused_stale)
+        };
+        assert_eq!(refused(&d), (1, 0), "the arm's binding refused it, not the router");
+
+        // --- The roll binds both legs; the same order leaves on its asset.
+        d.on_venue_event(&roll(INST_A));
+        assert_eq!(d.submit(&leg_order(2, LEG_YES, INST_A)), Ok(()));
+        let place = gw.take(CMD_PLACE);
+        assert_eq!(
+            (place.slot, place.asset),
+            (SLOT3, exec_hyperliquid::asset::ASSET_BASE + 10 * INST_A),
+            "the YES leg's own asset, as the roll bound it"
+        );
+        assert_eq!(d.submit(&leg_order(3, LEG_YES + 1, INST_A)), Ok(()));
+        assert_eq!(
+            gw.take(CMD_PLACE).asset,
+            exec_hyperliquid::asset::ASSET_BASE + 10 * INST_A + 1,
+            "the NO leg's, bound by the same roll"
+        );
+
+        // --- The next roll retires INST_A: an order naming it is stale.
+        d.on_venue_event(&roll(INST_B));
+        assert_eq!(
+            d.submit(&leg_order(4, LEG_YES, INST_A)),
+            Err(DispatchError::NoLiveRoute),
+            "an instance a roll retired is refused"
+        );
+        assert_eq!(refused(&d), (1, 1), "refused as stale by the arm");
+        assert_eq!(
+            d.live().b().halt_signal().asset_refusal_streak,
+            1,
+            "a stale refusal feeds the E-4 streak, an unbound one does not"
+        );
+        // ... and the successor's order leaves on the successor's asset.
+        assert_eq!(d.submit(&leg_order(5, LEG_YES, INST_B)), Ok(()));
+        let place = gw.take(CMD_PLACE);
+        assert_eq!(
+            place.asset,
+            exec_hyperliquid::asset::ASSET_BASE + 10 * INST_B,
+            "the roll rebound the leg"
+        );
+        d.on_idle();
+        assert!(
+            !d.halt().reason(slot).is_halted(),
+            "one stale refusal halts nothing (the streak's limit is 3)"
+        );
     }
 }

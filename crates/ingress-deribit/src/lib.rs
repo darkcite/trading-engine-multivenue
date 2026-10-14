@@ -886,7 +886,7 @@ fn parse_vol_index_fill(payload: &[u8], out: &mut DeribitVolIndexFrame) -> Optio
     let start = skip_byte(payload, pos, b'"');
     let rel_end = memchr::memchr(b'"', payload.get(start..)?)?;
     let name = payload.get(start..start + rel_end)?;
-    if name.is_empty() || name.len() > 16 {
+    if name.is_empty() || name.len() > DERIBIT_DVOL_NAME_MAX {
         return None;
     }
     *out = DeribitVolIndexFrame {
@@ -1545,17 +1545,62 @@ pub(crate) fn fmt_u64(v: u64, scratch: &mut [u8; 20]) -> &[u8] {
 /// Every request's head, up to its id.
 const REQ_HEAD: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":";
 
+/// A channel name as it is quoted on the wire, in parts: `"`, the
+/// prefix, the instrument, the suffix, `"`. The ONE spelling of a channel
+/// name: the subscribe render writes it, and the run loop's subscribe-
+/// result check searches for it (HK3; the quotes keep `quote.BTC-PERP`
+/// from aliasing `quote.BTC-PERPETUAL`).
+/// The parts are laid into the caller's slot (an 80 B array is never
+/// returned by value — the ZC pass B rule).
+#[inline]
+pub fn channel_name_parts<'a>(
+    channel: DeribitChannel,
+    instrument: &'a [u8],
+    parts: &mut [&'a [u8]; 5],
+) {
+    parts[0] = b"\"";
+    parts[1] = channel.wire_prefix();
+    parts[2] = instrument;
+    parts[3] = channel.wire_suffix();
+    parts[4] = b"\"";
+}
+
+/// The longest quoted channel name [`channel_name_parts`] spells: the two
+/// quotes, the longest prefix, [`DERIBIT_INSTR_MAX`] and the longest
+/// suffix — 47 B.
+pub const CHANNEL_NAME_MAX: usize = {
+    let ch = [
+        DeribitChannel::Quote,
+        DeribitChannel::Ticker,
+        DeribitChannel::Trades,
+        DeribitChannel::Book,
+    ];
+    let mut m = 0;
+    let mut i = 0;
+    while i < ch.len() {
+        let l = ch[i].wire_prefix().len() + ch[i].wire_suffix().len();
+        if l > m {
+            m = l;
+        }
+        i += 1;
+    }
+    2 + m + DERIBIT_INSTR_MAX
+};
+
 #[inline]
 fn render_channel_name(
     p: &mut WsPayload<'_>,
     channel: DeribitChannel,
     instrument: &[u8],
 ) -> Result<(), WsWriteErr> {
-    p.put(b"\"")?;
-    p.put(channel.wire_prefix())?;
-    p.put(instrument)?;
-    p.put(channel.wire_suffix())?;
-    p.put(b"\"")
+    let mut parts: [&[u8]; 5] = [b""; 5];
+    channel_name_parts(channel, instrument, &mut parts);
+    let mut k = 0;
+    while k < parts.len() {
+        p.put(parts[k])?;
+        k += 1;
+    }
+    Ok(())
 }
 
 /// WS6: max DVOL index subscriptions per session (`[deribit]
@@ -1563,8 +1608,13 @@ fn render_channel_name(
 /// currencies — 8 is generous headroom).
 pub const DERIBIT_DVOL_MAX: usize = 8;
 
+/// WS6: the longest DVOL index name (`btc_usd`) — the one width the
+/// driver's table, the boot check, the push parser and the tx sizing read
+/// (HK3).
+pub const DERIBIT_DVOL_NAME_MAX: usize = 16;
+
 /// WS6: one configured DVOL index name (`(len, bytes)`; `btc_usd`).
-pub type DvolName = (u8, [u8; 16]);
+pub type DvolName = (u8, [u8; DERIBIT_DVOL_NAME_MAX]);
 
 /// Serialize the single batched `public/subscribe` covering every
 /// configured `(channel × instrument)` pair per the

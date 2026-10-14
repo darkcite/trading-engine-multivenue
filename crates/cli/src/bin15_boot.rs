@@ -84,6 +84,8 @@ pub struct Bin15Boot {
     pub params: strategy_bin15::Bin15Params,
     /// The lookup tables, boxed once here and moved into the member.
     pub luts: Box<strategy_bin15::price::Bin15Luts>,
+    /// BIN15 H90: the late Φ table, when the artifact carries one.
+    pub late_lut: Option<Box<strategy_bin15::late::LateLut>>,
     /// sha256 of the artifact BYTES — the boot tell's identity.
     pub hash: [u8; 32],
     /// Per-underlying seeds, in `underlying` order.
@@ -301,6 +303,30 @@ pub fn load_bin15_boot(
     params.null_arm = file.null_arm;
     params.hour_ln_off_1e9 = file.hour_ln_off_1e9;
     params.scale_1e9 = file.scale_1e9;
+    // BIN15 H90: absent keys = `late_enabled = 0` = the member as it was;
+    // the parser has bounded every value and refused "on" without a table.
+    params.late = strategy_bin15::late::LateParams {
+        enabled: file.late_enabled,
+        persist_polls: file.late_persist_polls,
+        _pad: [0; 6],
+        tau_min_ns: file.late_tau_min_ns,
+        tau_max_ns: file.late_tau_max_ns,
+        p_min_1e6: file.late_p_min_1e6,
+        e_1e6: file.late_e_1e6,
+        usd_1e6: file.late_usd_1e6,
+        sigma_k_1e3: file.late_sigma_k_1e3,
+    };
+    let late_lut = if file.late_phi_lut.len() == core_config::bin15::LATE_PHI_POINTS {
+        let mut l = Box::new(strategy_bin15::late::LateLut::flat());
+        let mut i = 0usize;
+        while i < core_config::bin15::LATE_PHI_POINTS {
+            l.phi[i] = file.late_phi_lut[i];
+            i += 1;
+        }
+        Some(l)
+    } else {
+        None
+    };
 
     let mut luts = Box::new(strategy_bin15::price::Bin15Luts::identity());
     let mut i = 0usize;
@@ -388,6 +414,7 @@ pub fn load_bin15_boot(
     Ok(Some(Bin15Boot {
         params,
         luts,
+        late_lut,
         hash,
         seeds,
         path,
@@ -409,9 +436,10 @@ pub fn render_boot_tell(boot: &Bin15Boot, dormant: usize) -> String {
         hex.push_str(&format!("{b:02x}"));
     }
     let entry = entry_law(&boot.params);
+    let late = late_law(&boot.params);
     format!(
         "bin15: artifact configured hash={hex} families={} dormant={dormant} \
-         seeds={seeded} daily_seeds={daily} entry={entry} \
+         seeds={seeded} daily_seeds={daily} entry={entry} late={late} \
          cap_instance=${} cap_day=${} mark_stale_ms={}{}",
         boot.resolved,
         boot.params.cap_instance_usd_1e6 / 1_000_000,
@@ -454,6 +482,29 @@ pub fn entry_law(p: &strategy_bin15::Bin15Params) -> String {
         let _ = write!(law, "&el<={}s", p.entry_elapsed_max_ns / 1_000_000_000);
     }
     law
+}
+
+/// BIN15 H90: the LATE law as the boot line spells it — `off`, or the
+/// window, the belief floor, the margin, the persistence, the spend and
+/// the σ scale: `2-30s:p>=0.90:ask<=p-2c:persist2:$100:k1.550`.
+#[must_use]
+pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
+    let l = &p.late;
+    if l.enabled == 0 {
+        return String::from("off");
+    }
+    format!(
+        "{}-{}s:p>={}.{:02}:ask<=p-{}c:persist{}:${}:k{}.{:03}",
+        l.tau_min_ns / 1_000_000_000,
+        l.tau_max_ns / 1_000_000_000,
+        l.p_min_1e6 / 1_000_000,
+        (l.p_min_1e6 % 1_000_000) / 10_000,
+        l.e_1e6 / 10_000,
+        l.persist_polls,
+        l.usd_1e6 / 1_000_000,
+        l.sigma_k_1e3 / 1_000,
+        l.sigma_k_1e3 % 1_000
+    )
 }
 
 /// Instances a 15 m family opens in one UTC day: 96 quarter-hours.
@@ -714,6 +765,20 @@ mod tests {
             }
             ph += 1;
         }
+    }
+
+    /// BIN15 H90: the late law on the boot line — `off` when absent, else
+    /// every term that changes which instances it buys.
+    #[test]
+    fn the_boot_line_spells_the_late_law() {
+        let mut p = strategy_bin15::Bin15Params::default();
+        assert_eq!(late_law(&p), "off", "absent keys = the member as it was");
+        p.late.enabled = 1;
+        assert_eq!(late_law(&p), "2-30s:p>=0.90:ask<=p-2c:persist2:$100:k1.550");
+        p.late.tau_min_ns = 8_000_000_000;
+        p.late.p_min_1e6 = 925_000;
+        p.late.e_1e6 = 10_000;
+        assert_eq!(late_law(&p), "8-30s:p>=0.92:ask<=p-1c:persist2:$100:k1.550");
     }
 
     /// BIN15 S5: the entry law on the boot line — every term that changes

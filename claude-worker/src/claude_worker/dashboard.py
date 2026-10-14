@@ -653,7 +653,15 @@ def positions_section(replay_dir: pathlib.Path) -> dict[str, object]:
     ``/state`` carries the live marks the page needs for a quote)."""
     run_dir = claude_worker.features.latest_run_dir(replay_dir)
     if run_dir is None:
-        return {"run_dir": None, "positions": [], "fills": 0, "fills_torn": False}
+        return {
+            "run_dir": None,
+            "positions": [],
+            "fills": 0,
+            "trades": 0,
+            "fills_adopted": 0,
+            "fills_settlement": 0,
+            "fills_torn": False,
+        }
     fills, torn = claude_worker.features.read_fills(run_dir)
     reconstructed = claude_worker.features.reconstruct_positions(fills)
     views = claude_worker.features.position_views(reconstructed, {})
@@ -671,10 +679,16 @@ def positions_section(replay_dir: pathlib.Path) -> dict[str, object]:
                 "exposure_usd": to_usd(v.exposure),
             }
         )
+    counts = claude_worker.features.count_fills(fills)
     return {
         "run_dir": str(run_dir),
         "positions": rows,
         "fills": len(fills),
+        # BX13: what they were — an adopted fill and a settlement are never
+        # trades.
+        "trades": counts.trades,
+        "fills_adopted": counts.adopted,
+        "fills_settlement": counts.settlements,
         "fills_torn": torn,
         "realized_usd": round(sum(float(r["realized_usd"]) for r in rows), 6),
     }
@@ -708,7 +722,9 @@ def _xmm_summary(path: pathlib.Path) -> dict[str, object]:
             section = {}
         if isinstance(section, dict):
             quoted = sorted(
-                k[len("quote_"):].upper() for k, v in section.items() if k.startswith("quote_") and v == 1
+                k[len("quote_") :].upper()
+                for k, v in section.items()
+                if k.startswith("quote_") and v == 1
             )
     return {"hash": _sha256_file(path), "quoted": quoted}
 
@@ -747,7 +763,7 @@ def _seed_spans(path: pathlib.Path) -> list[dict[str, object]] | None:
     try:
         with path.open("r", encoding="utf-8") as f:
             head = f.read(_HAR_SEED_HEAD)
-    except (OSError, UnicodeDecodeError):
+    except OSError, UnicodeDecodeError:
         return None
     spans: list[dict[str, object]] = []
     for line in head.splitlines():
@@ -779,7 +795,7 @@ def _har_drift(path: pathlib.Path) -> dict[str, object] | None:
     it is absent, torn or another version -- never a guess."""
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError):
+    except OSError, UnicodeDecodeError, ValueError:
         return None
     if (
         not isinstance(doc, dict)

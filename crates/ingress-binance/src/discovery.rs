@@ -44,6 +44,10 @@ pub const BN_DISCOVERY_ROWS_CAP: usize = 8_192;
 /// included).
 pub const BN_DISCOVERY_SYMBOL_MAX: usize = 32;
 
+/// The longest asset name a row keeps (BX8: `baseAsset`, `quoteAsset`);
+/// a longer one is kept as unknown (length 0), never cut.
+pub const BN_ASSET_MAX: usize = 16;
+
 /// Spot `TRD_GRP_n` permission groups a row records exactly (`n` below
 /// this); a higher group sets [`BN_PERM_GROUP_OVERFLOW`].
 pub const BN_PERM_GROUPS_MAX: usize = 512;
@@ -54,6 +58,14 @@ pub const BN_ROW_TRADFI: u8 = 1 << 0;
 /// [`BnSymbolRow::flags`]: an inverse (coin-margined) contract — the row
 /// carries a `contractSize` (COIN-M).
 pub const BN_ROW_INVERSE: u8 = 1 << 1;
+/// [`BnSymbolRow::flags`] (BX7): the row names its `marginAsset` (futures).
+pub const BN_ROW_MARGIN_NAMED: u8 = 1 << 2;
+/// [`BnSymbolRow::flags`] (BX7): the margin asset it names is USDT.
+pub const BN_ROW_MARGIN_USDT: u8 = 1 << 3;
+
+/// An asset length (BX8) for a name the row saw but cannot keep (empty, or
+/// longer than [`BN_ASSET_MAX`]): named, unknown.
+const BN_ASSET_LONG: u8 = u8::MAX;
 
 /// [`BnPermissions::names`]: `SPOT`.
 pub const BN_PERM_SPOT: u16 = 1 << 0;
@@ -74,6 +86,11 @@ pub const BN_PERM_RPI: u16 = 1 << 6;
 /// their union, so a check against it would pass what the venue
 /// refuses — BX8 refuses the symbol while this bit is set.
 pub const BN_PERM_MULTI_SET: u16 = 1 << 13;
+/// [`BnPermissions::names`]: a name outside any inner set — a flat list, or
+/// one mixing names and sets. Spot's shape always nests, so BX8 refuses a
+/// spot symbol while this bit is set (the parser review's P2-5); the
+/// futures' flat lists carry it too, never judged.
+pub const BN_PERM_FLAT: u16 = 1 << 12;
 /// [`BnPermissions::names`]: a name this table does not know.
 pub const BN_PERM_OTHER: u16 = 1 << 14;
 /// [`BnPermissions::names`]: a `TRD_GRP_n` with `n` ≥
@@ -262,7 +279,9 @@ impl BnPermissions {
         }
     }
 
-    fn add(&mut self, name: &[u8]) {
+    /// Record one permission name (a set's member, or one of an account's
+    /// `permissions` — BX8's check reads both alike).
+    pub fn add(&mut self, name: &[u8]) {
         let bit = match name {
             b"SPOT" => BN_PERM_SPOT,
             b"MARGIN" => BN_PERM_MARGIN,
@@ -291,10 +310,13 @@ impl BnPermissions {
     }
 }
 
-/// `TRD_GRP_<n>` → `n` (decimal, ≤ 5 digits); anything else `None`.
+/// `TRD_GRP_<n>` → `n` (decimal, ≤ 5 digits) in the venue's own spelling —
+/// three digits, zero-padded, or more without a leading zero (BX8, the
+/// parser review: the venue compares names as strings, so `TRD_GRP_4` is
+/// not `TRD_GRP_004`); anything else `None` (an unknown name).
 fn trd_group(name: &[u8]) -> Option<u32> {
     let digits = name.strip_prefix(b"TRD_GRP_")?;
-    if digits.is_empty() || digits.len() > 5 {
+    if digits.len() < 3 || digits.len() > 5 || (digits.len() > 3 && digits[0] == b'0') {
         return None;
     }
     let mut n = 0u32;
@@ -344,6 +366,16 @@ pub struct BnSymbolRow {
     pub delivery_ms: i64,
     /// `permissionSets`.
     pub perm: BnPermissions,
+    /// `baseAsset` (BX8: a spot row's balance is its base asset's).
+    pub base: [u8; BN_ASSET_MAX],
+    /// Valid prefix length of `base`: 0 absent; `u8::MAX` named but empty
+    /// or longer than [`BN_ASSET_MAX`] (unknown — read through
+    /// [`Self::base_asset`]).
+    pub base_len: u8,
+    /// `quoteAsset` (BX8), as `base`.
+    pub quote: [u8; BN_ASSET_MAX],
+    /// Valid prefix length of `quote`.
+    pub quote_len: u8,
 }
 
 // The row is parsed in place and never crosses a call by value; the
@@ -351,7 +383,8 @@ pub struct BnSymbolRow {
 // reservation (8 192 rows) under 2 MiB.
 const _: () = assert!(core::mem::size_of::<BnFilters>() == 80);
 const _: () = assert!(core::mem::size_of::<BnPermissions>() == 72);
-const _: () = assert!(core::mem::size_of::<BnSymbolRow>() == 208);
+const _: () = assert!(core::mem::size_of::<BnSymbolRow>() == 248);
+const _: () = assert!(BN_DISCOVERY_ROWS_CAP * core::mem::size_of::<BnSymbolRow>() < 2 * 1_024 * 1_024);
 
 /// WS5: futures `contractType` classes (spot rows carry none).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -419,12 +452,28 @@ impl BnSymbolRow {
         contract_size: 0,
         delivery_ms: 0,
         perm: BnPermissions::EMPTY,
+        base: [0; BN_ASSET_MAX],
+        base_len: 0,
+        quote: [0; BN_ASSET_MAX],
+        quote_len: 0,
     };
 
     /// The venue symbol as a byte slice.
     #[inline]
     pub fn symbol(&self) -> &[u8] {
         &self.symbol[..self.symbol_len as usize]
+    }
+
+    /// `baseAsset` (empty when absent or longer than [`BN_ASSET_MAX`]).
+    #[inline]
+    pub fn base_asset(&self) -> &[u8] {
+        self.base.get(..self.base_len as usize).unwrap_or(&[])
+    }
+
+    /// `quoteAsset` (empty when absent or longer than [`BN_ASSET_MAX`]).
+    #[inline]
+    pub fn quote_asset(&self) -> &[u8] {
+        self.quote.get(..self.quote_len as usize).unwrap_or(&[])
     }
 
     /// An inverse (coin-margined) contract.
@@ -437,6 +486,14 @@ impl BnSymbolRow {
     #[inline]
     pub fn is_tradfi(&self) -> bool {
         self.flags & BN_ROW_TRADFI != 0
+    }
+
+    /// BX7: a futures row that names `marginAsset` `USDT` — the one asset
+    /// a classic USDⓈ-M account's single-asset totals (its margin ratio,
+    /// its session equity) count. A row naming none is not.
+    #[inline]
+    pub fn is_usdt_margined(&self) -> bool {
+        self.flags & BN_ROW_MARGIN_USDT != 0
     }
 }
 
@@ -560,6 +617,9 @@ impl Default for BnDiscovery {
 fn parse_row(body: &[u8], pos: usize, out: &mut BnSymbolRow) -> Result<usize, BnDiscoveryErr> {
     debug_assert_eq!(body[pos], b'{');
     let mut i = pos + 1;
+    // BX8 (the parser review): `permissionSets` read once — a second copy,
+    // walked into the same digest, would lose the several-sets mark.
+    let mut perm_named = false;
 
     loop {
         i = skip_ws(body, i);
@@ -669,12 +729,49 @@ fn parse_row(body: &[u8], pos: usize, out: &mut BnSymbolRow) -> Result<usize, Bn
                         out.underlying = BnUnderlying::of(s);
                         i = end;
                     }
+                    // BX7: a futures row's margin asset, named once — a
+                    // second copy, agreeing or not, refuses the row (as a
+                    // second lifecycle does).
+                    b"marginAsset" => {
+                        if out.flags & BN_ROW_MARGIN_NAMED != 0 {
+                            return Err(BnDiscoveryErr::BadRow);
+                        }
+                        let (s, end) = quoted_span(body, i)?;
+                        out.flags |= BN_ROW_MARGIN_NAMED | if s == b"USDT" { BN_ROW_MARGIN_USDT } else { 0 };
+                        i = end;
+                    }
                     b"underlyingSubType" => {
                         i = walk_names(body, i, NameList::SubType, out)?;
                     }
+                    // BX8: the assets a spot row trades, each named once
+                    // (a second copy refuses the row, as a second
+                    // lifecycle does). A name past BN_ASSET_MAX is kept as
+                    // unknown — a spot row without its base is never bound.
+                    b"baseAsset" | b"quoteAsset" => {
+                        let (s, end) = quoted_span(body, i)?;
+                        let (dst, len) = if key == b"baseAsset" { (&mut out.base, &mut out.base_len) } else { (&mut out.quote, &mut out.quote_len) };
+                        if *len != 0 {
+                            return Err(BnDiscoveryErr::BadRow);
+                        }
+                        if !s.is_empty() && s.len() <= BN_ASSET_MAX {
+                            // COPY: ≤ 16 B asset name into its row, once per
+                            // row at boot — the row outlives the body —
+                            // rejected: borrowing the body (as `symbol`).
+                            dst[..s.len()].copy_from_slice(s);
+                            *len = s.len() as u8;
+                        } else {
+                            *len = BN_ASSET_LONG;
+                        }
+                        i = end;
+                    }
                     b"permissionSets" => {
                         // Spot: an array of arrays of names; futures: an
-                        // array of names.
+                        // array of names. Named once (a second copy refuses
+                        // the row, as a second lifecycle does).
+                        if perm_named {
+                            return Err(BnDiscoveryErr::BadRow);
+                        }
+                        perm_named = true;
                         i = walk_names(body, i, NameList::Permissions, out)?;
                     }
                     _ => {
@@ -748,7 +845,12 @@ fn walk_names(
                             out.flags |= BN_ROW_TRADFI;
                         }
                     }
-                    NameList::Permissions => out.perm.add(s),
+                    NameList::Permissions => {
+                        if depth == 1 {
+                            out.perm.names |= BN_PERM_FLAT;
+                        }
+                        out.perm.add(s);
+                    }
                 }
                 i = end;
             }
@@ -1352,7 +1454,7 @@ mod tests {
             f.max_num_orders, 200,
             "MAX_NUM_ALGO_ORDERS' 20 is not the cap"
         );
-        assert_eq!(perp.perm.names, BN_PERM_GRID);
+        assert_eq!(perp.perm.names, BN_PERM_GRID | BN_PERM_FLAT, "a flat list (futures')");
         let dated = d.find(b"BTCUSD_261225").expect("dated");
         assert_eq!(dated.contract_type, BnContractType::CurrentQuarter);
         assert!(dated.contract_type.is_dated());
@@ -1365,6 +1467,7 @@ mod tests {
     fn a_tradfi_usdm_row_keeps_notional_band_and_flags() {
         let mut d = BnDiscovery::new();
         d.ingest_body(FAPI_TRADFI_ROW).expect("tradfi row");
+        assert!(d.find(b"XAUUSDT").expect("row").is_usdt_margined(), "BX7: margined in USDT");
         let r = d.find(b"XAUUSDT").expect("row");
         assert_eq!(r.contract_type, BnContractType::Perpetual);
         assert!(r.is_tradfi());
@@ -1382,9 +1485,63 @@ mod tests {
         assert_eq!(f.max_num_orders, 200);
         assert_eq!(
             r.perm.names,
-            BN_PERM_GRID | BN_PERM_COPY | BN_PERM_RPI | BN_PERM_DCA | BN_PERM_PSB
+            BN_PERM_GRID | BN_PERM_COPY | BN_PERM_RPI | BN_PERM_DCA | BN_PERM_PSB | BN_PERM_FLAT
         );
         assert_eq!(r.perm.group_count, 0);
+    }
+
+    /// BX7: a futures row's margin asset is kept — USDT, another (USDC's,
+    /// COIN-M's coin), or none named — and a second copy refuses the row.
+    /// Break-and-watch: without the key every row reads as named none.
+    #[test]
+    fn a_futures_row_keeps_its_margin_asset() {
+        let mut d = BnDiscovery::new();
+        d.ingest_body(DAPI_ROWS).expect("dapi rows");
+        let perp = d.find(b"BTCUSD_PERP").expect("row");
+        assert!(perp.flags & BN_ROW_MARGIN_NAMED != 0 && !perp.is_usdt_margined(), "COIN-M margins in its coin");
+        let usdc = br#"{"symbols":[{"symbol":"BTCUSDC","status":"TRADING","marginAsset":"USDC","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.1"},{"filterType":"LOT_SIZE","stepSize":"0.001"}]}]}"#;
+        d.ingest_body(usdc).expect("usdc row");
+        assert!(!d.find(b"BTCUSDC").expect("row").is_usdt_margined());
+        let none = br#"{"symbols":[{"symbol":"ETHUSDT","status":"TRADING","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"0.001"}]}]}"#;
+        d.ingest_body(none).expect("a row naming none");
+        assert_eq!(d.find(b"ETHUSDT").expect("row").flags & (BN_ROW_MARGIN_NAMED | BN_ROW_MARGIN_USDT), 0);
+        let twice = br#"{"symbols":[{"symbol":"SOLUSDT","status":"TRADING","marginAsset":"USDT","marginAsset":"USDT"}]}"#;
+        assert_eq!(BnDiscovery::new().ingest_body(twice), Err(BnDiscoveryErr::BadRow));
+    }
+
+    /// BX8: an asset is named once — a second copy, agreeing or not,
+    /// refuses the row and so its body, as a second lifecycle does; one
+    /// empty or past `BN_ASSET_MAX` is kept as unknown — no name, never a
+    /// cut one.
+    #[test]
+    fn a_rows_assets_are_read_once_and_never_cut() {
+        let body = |assets: &str| {
+            std::format!(
+                r#"{{"symbols":[{{"symbol":"ABCUSDT","status":"TRADING",{assets},"filters":[{{"filterType":"PRICE_FILTER","tickSize":"0.01"}},{{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"10"}}]}}]}}"#
+            )
+        };
+        let read = |assets: &str| {
+            let mut d = BnDiscovery::new();
+            d.ingest_body(body(assets).as_bytes()).map(|_| {
+                let r = d.find(b"ABCUSDT").expect("row");
+                (r.base_asset().to_vec(), r.quote_asset().to_vec())
+            })
+        };
+        assert_eq!(read(r#""baseAsset":"ABC","quoteAsset":"USDT""#).unwrap(), (b"ABC".to_vec(), b"USDT".to_vec()));
+        let long = read(r#""baseAsset":"ABCDEFGHIJKLMNOPQ","quoteAsset":"USDT""#).unwrap();
+        assert_eq!(long.0, b"".to_vec(), "past BN_ASSET_MAX: unknown, not cut");
+        assert_eq!(read(r#""baseAsset":"","quoteAsset":"USDT""#).unwrap().0, b"".to_vec());
+        for twice in [
+            r#""baseAsset":"ABC","quoteAsset":"USDT","permissionSets":[["SPOT"]],"permissionSets":[["TRD_GRP_009"]]"#,
+            r#""baseAsset":"ABC","baseAsset":"ABC","quoteAsset":"USDT""#,
+            r#""baseAsset":"ABC","quoteAsset":"USDT","quoteAsset":"BUSD""#,
+            r#""baseAsset":"ABCDEFGHIJKLMNOPQ","baseAsset":"ABC""#,
+            r#""baseAsset":"","baseAsset":"ABC""#,
+        ] {
+            let mut d = BnDiscovery::new();
+            let _ = d.ingest_body(body(twice).as_bytes());
+            assert!(d.ingest_body(body(twice).as_bytes()).is_err() && d.find(b"ABCUSDT").is_none(), "{twice}: refused");
+        }
     }
 
     #[test]
@@ -1401,6 +1558,8 @@ mod tests {
             "absent"
         );
         assert_eq!(r.flags, 0);
+        // BX8: the assets a spot row's balance and fees are counted in.
+        assert_eq!((r.base_asset(), r.quote_asset()), (&b"TSLAB"[..], &b"USDT"[..]));
         let f = r.filters;
         assert_eq!(f.tick_size_1e9, 10_000_000);
         assert_eq!((f.lot_step_1e9, f.min_qty_1e9), (1_000_000, 1_000_000));
@@ -1554,7 +1713,10 @@ mod tests {
             perm(r#"[["SPOT","MARGIN"]]"#).names,
             BN_PERM_SPOT | BN_PERM_MARGIN
         );
-        assert_eq!(perm(r#"["GRID","DCA"]"#).names, BN_PERM_GRID | BN_PERM_DCA);
+        // A name outside any set (P2-5): flat, or mixed with a set.
+        assert_eq!(perm(r#"["SPOT","TRD_GRP_009"]"#).names, BN_PERM_SPOT | BN_PERM_FLAT);
+        assert_eq!(perm(r#"[["SPOT"],"TRD_GRP_009"]"#).names, BN_PERM_SPOT | BN_PERM_FLAT);
+        assert_eq!(perm(r#"["GRID","DCA"]"#).names, BN_PERM_GRID | BN_PERM_DCA | BN_PERM_FLAT);
         assert_eq!(perm("[]"), BnPermissions::EMPTY);
         assert_eq!(perm("[[]]"), BnPermissions::EMPTY);
     }
@@ -1986,6 +2148,10 @@ mod proptests {
             let mut want_names = 0u16;
             for &n in &names {
                 want_names |= NAMES[n].1;
+            }
+            // COIN-M's list is flat: its names lie outside any set (BX8).
+            if coinm && !(names.is_empty() && groups.is_empty()) {
+                want_names |= BN_PERM_FLAT;
             }
             let mut exact = [0u64; BN_PERM_GROUPS_MAX / 64];
             for &g in &groups {

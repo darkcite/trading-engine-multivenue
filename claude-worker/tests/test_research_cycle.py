@@ -8,8 +8,8 @@ beyond the fixture (house rules).
 Convention: full ``import x`` only. No ``from x import y``.
 """
 
-import concurrent.futures
 import collections.abc
+import concurrent.futures
 import json
 import pathlib
 import threading
@@ -79,7 +79,9 @@ _REVISION = json.dumps(
 )
 
 
-def _mk_cfg(tmp_path: pathlib.Path, sock: pathlib.Path | None = None) -> claude_worker.config.BaseConfig:
+def _mk_cfg(
+    tmp_path: pathlib.Path, sock: pathlib.Path | None = None
+) -> claude_worker.config.BaseConfig:
     (tmp_path / "replay" / "run-1").mkdir(parents=True, exist_ok=True)
     return claude_worker.config.BaseConfig(
         ai_ingress_sock=tmp_path / "ai.sock" if sock is None else sock,
@@ -151,7 +153,7 @@ def _fake_run_backtest(
     return run
 
 
-def _mk_cycle(  # noqa: PLR0913 — test composition root
+def _mk_cycle(  # test composition root
     cfg: claude_worker.config.BaseConfig,
     state: claude_worker.state.State,
     executor: concurrent.futures.Executor,
@@ -273,7 +275,11 @@ def test_budget_cap_zero_is_a_kill_switch(
     clock = _Clock()
     complete = _CompleteFake([_PROPOSAL])
     cycle = _mk_cycle(
-        cfg, state, executor, complete, clock,
+        cfg,
+        state,
+        executor,
+        complete,
+        clock,
         env={
             "CLAUDE_WORKER_STRATEGIST_INTERVAL_S": "1",
             "CLAUDE_WORKER_STRATEGIST_DAILY_CAP": "0",
@@ -361,7 +367,11 @@ def test_call_failure_is_an_event_not_a_crash(
         raise RuntimeError("api down")
 
     cycle = claude_worker.daemon.ResearchCycle(
-        state, cfg, {}, boom, executor,
+        state,
+        cfg,
+        {},
+        boom,
+        executor,
         fetch_fn=lambda: True,
         run_backtest_fn=_fake_run_backtest(True),
         env={"CLAUDE_WORKER_STRATEGIST_INTERVAL_S": "1"},
@@ -392,7 +402,11 @@ def test_backtest_error_ends_cycle_without_revision(
         raise claude_worker.backtest.BacktestError("validator reject")
 
     cycle = claude_worker.daemon.ResearchCycle(
-        state, cfg, {"btc-daily": 42}, complete, executor,
+        state,
+        cfg,
+        {"btc-daily": 42},
+        complete,
+        executor,
         fetch_fn=lambda: True,
         run_backtest_fn=untrusted,
         env={"CLAUDE_WORKER_STRATEGIST_INTERVAL_S": "1"},
@@ -447,7 +461,9 @@ def test_gates_fail_revision_then_final_no_third_call(
     client = _disconnected_client(cfg, state)
     clock.now_ns = 2_000_000_000
     _drive(
-        cycle, clock, client,
+        cycle,
+        clock,
+        client,
         lambda: len(state.events(kind=claude_worker.strategist.EVENT_CANDIDATE_REJECTED)) == 1,
     )
     assert len(complete.calls) == 2, "hard cap: proposal + one revision"
@@ -459,9 +475,7 @@ def test_gates_fail_revision_then_final_no_third_call(
     assert '"all_passed": false' in revision_prompt
     assert '"auto-buy-low"' in revision_prompt, "prior rows ride the revision call"
     # Cycle over: archived with report, NO install, NO frames.
-    final = json.loads(
-        state.events(kind=claude_worker.strategist.EVENT_CANDIDATE_REJECTED)[0][3]
-    )
+    final = json.loads(state.events(kind=claude_worker.strategist.EVENT_CANDIDATE_REJECTED)[0][3])
     assert final["reason"] == "gates_failed_final"
     assert pathlib.Path(final["report"]).is_file()
     assert not cfg.ai_ruleset_dir.exists()
@@ -570,7 +584,9 @@ def test_promote_waits_for_connection_then_delivers(
     # frames only ride the serve loop's live connection).
     clock.now_ns = 2_000_000_000
     _drive(
-        cycle, clock, client,
+        cycle,
+        clock,
+        client,
         lambda: cfg.ai_ruleset_dir.exists() and any(cfg.ai_ruleset_dir.glob("*.json")),
     )
     for _ in range(10):
@@ -581,9 +597,7 @@ def test_promote_waits_for_connection_then_delivers(
     client.connect()
     client.send_heartbeat()
     _drive(cycle, clock, client, lambda: cycle.stats.promotions == 1)
-    row_hashes = [
-        p.stem for p in cfg.ai_ruleset_dir.glob("*.json")
-    ]
+    row_hashes = [p.stem for p in cfg.ai_ruleset_dir.glob("*.json")]
     assert len(row_hashes) == 1
     client.close()
     state.close()
@@ -600,7 +614,9 @@ class _ServeFakeMessages:
         self.calls.append(kwargs)
         block = anthropic.types.TextBlock(type="text", text=_PROPOSAL, citations=None)
         usage = types.SimpleNamespace(
-            input_tokens=500, output_tokens=90, cache_read_input_tokens=0,
+            input_tokens=500,
+            output_tokens=90,
+            cache_read_input_tokens=0,
             cache_creation_input_tokens=450,
         )
         return types.SimpleNamespace(content=[block], usage=usage)
@@ -683,9 +699,7 @@ def test_serve_composes_research_cycle_end_to_end(
     )
     row = state.ruleset_row(full_hash)
     assert row is not None and row[6] is not None, "committed"
-    detail = json.loads(
-        state.events(kind=claude_worker.strategist.EVENT_STRATEGIST_CALL)[0][3]
-    )
+    detail = json.loads(state.events(kind=claude_worker.strategist.EVENT_STRATEGIST_CALL)[0][3])
     assert detail["input_tokens"] == 500 and detail["cache_read"] is False
     state.close()
 
@@ -746,7 +760,7 @@ class _DispatchBacktest:
         )
 
 
-def _mk_monitor_cycle(  # noqa: PLR0913 — test composition root
+def _mk_monitor_cycle(  # test composition root
     cfg: claude_worker.config.BaseConfig,
     state: claude_worker.state.State,
     executor: concurrent.futures.Executor,
@@ -842,8 +856,14 @@ def test_promote_arm_check_triggers_full_rollback(
     cfg = _mk_cfg(tmp_path, sock=fake_uds.sock_path)
     state = claude_worker.state.State(cfg.db_path)
     prior_hash, _prior_path, prior_report = tests.craft.seed_committed_ruleset(
-        state, tmp_path, "prior", "prior-row", staged_ts=100, committed_ts=200,
-        model="claude-fable-5", thesis="prior thesis",
+        state,
+        tmp_path,
+        "prior",
+        "prior-row",
+        staged_ts=100,
+        committed_ts=200,
+        model="claude-fable-5",
+        thesis="prior thesis",
     )
     prior_report_bytes = prior_report.read_bytes()
     # >= 6 h of capture in one recent run (default run-1 stays tickless).
@@ -909,14 +929,14 @@ def test_promote_arm_check_triggers_full_rollback(
     # Clobber protection held: the prior's PROMOTION report is byte-identical,
     # and the candidate's own gates-passed report still says 70/30 PASS.
     assert prior_report.read_bytes() == prior_report_bytes
-    cand_reports = list(
-        claude_worker.strategist.candidates_dir(cfg.db_path).glob("*.report.json")
-    )
+    cand_reports = list(claude_worker.strategist.candidates_dir(cfg.db_path).glob("*.report.json"))
     assert len(cand_reports) == 1
     cand_report = json.loads(cand_reports[0].read_text())
     assert cand_report["split"] == "70/30" and cand_report["gates"]["all_passed"] is True
     monitor_report = json.loads(
-        next(claude_worker.monitor.monitor_dir(cfg.db_path).glob("active-*.report.json")).read_text()
+        next(
+            claude_worker.monitor.monitor_dir(cfg.db_path).glob("active-*.report.json")
+        ).read_text()
     )
     assert monitor_report["split"] == "0/100"
 
@@ -955,9 +975,7 @@ def test_rollback_no_prior_is_disable_only_then_dark(
         claude_worker.frames.KIND_RULESET_COMMIT,
         claude_worker.frames.KIND_DISABLE_STRATEGY,
     ]
-    trig = json.loads(
-        state.events(kind=claude_worker.strategist.EVENT_ROLLBACK_TRIGGERED)[0][3]
-    )
+    trig = json.loads(state.events(kind=claude_worker.strategist.EVENT_ROLLBACK_TRIGGERED)[0][3])
     assert trig["restaged"] is None
     no_prior = state.events(kind=claude_worker.strategist.EVENT_ROLLBACK_NO_PRIOR)
     assert len(no_prior) == 1
@@ -1089,7 +1107,12 @@ def _regime_words(fake_uds: tests.conftest.FakeUdsServer, start: int) -> list[tu
     out: list[tuple[int, str]] = []
     for i in range(start, len(fake_uds.frames)):
         if fake_uds.cmd_field(i, "kind") == claude_worker.frames.KIND_SET_REGIME:
-            out.append((fake_uds.cmd_field(i, "param_id"), claude_worker.regime.describe(fake_uds.cmd_field(i, "px"))))
+            out.append(
+                (
+                    fake_uds.cmd_field(i, "param_id"),
+                    claude_worker.regime.describe(fake_uds.cmd_field(i, "px")),
+                )
+            )
     return out
 
 
@@ -1106,10 +1129,20 @@ def test_regime_phase_measures_auto_confirms_and_the_verdict_overrides(
     complete = _CompleteFake([_PROPOSAL_WITH_VERDICT])
     inputs = (tests.regime_fixture.artifact(tmp_path), tests.regime_fixture.candles_db(tmp_path))
     cycle = claude_worker.daemon.ResearchCycle(
-        state, cfg, {"btc-daily": 42}, complete, executor,
-        fetch_fn=lambda: True, run_backtest_fn=_fake_run_backtest(True),
-        env={"CLAUDE_WORKER_STRATEGIST_INTERVAL_S": "1", claude_worker.regime.DECLARE_TTL_S_ENV: "600"},
-        clock_ns=clock, wall_ns=lambda: _REGIME_NOW_NS, regime_inputs=inputs,
+        state,
+        cfg,
+        {"btc-daily": 42},
+        complete,
+        executor,
+        fetch_fn=lambda: True,
+        run_backtest_fn=_fake_run_backtest(True),
+        env={
+            "CLAUDE_WORKER_STRATEGIST_INTERVAL_S": "1",
+            claude_worker.regime.DECLARE_TTL_S_ENV: "600",
+        },
+        clock_ns=clock,
+        wall_ns=lambda: _REGIME_NOW_NS,
+        regime_inputs=inputs,
     )
     client = claude_worker.uds.UdsClient(cfg.ai_ingress_sock, cfg.ai_ingress_hmac_key, state)
     client.connect()
@@ -1145,7 +1178,10 @@ def test_regime_phase_measures_auto_confirms_and_the_verdict_overrides(
     verdict_ev = state.events(kind=claude_worker.strategist.EVENT_REGIME_VERDICT)
     assert len(measured_ev) == 1 and len(verdict_ev) == 1
     assert json.loads(measured_ev[0][3])["declared"] == ["fast", "slow"]
-    assert json.loads(verdict_ev[0][3])["verdict"] == {"fast": "trend:bear,shape:chop", "slow": "measured"}
+    assert json.loads(verdict_ev[0][3])["verdict"] == {
+        "fast": "trend:bear,shape:chop",
+        "slow": "measured",
+    }
     # Stage + Commit still rode the same connection after the verdict.
     kinds = [fake_uds.cmd_field(i, "kind") for i in range(len(fake_uds.frames))]
     assert kinds.count(claude_worker.frames.KIND_RULESET_STAGE) == 1
@@ -1194,9 +1230,15 @@ def test_regime_phase_absent_artifact_is_a_counted_skip_with_an_honest_digest(
     clock = _Clock()
     complete = _CompleteFake([_PROPOSAL_WITH_VERDICT])
     cycle = claude_worker.daemon.ResearchCycle(
-        state, cfg, {"btc-daily": 42}, complete, executor,
-        fetch_fn=lambda: True, run_backtest_fn=_fake_run_backtest(False),
-        env={"CLAUDE_WORKER_STRATEGIST_INTERVAL_S": "1"}, clock_ns=clock,
+        state,
+        cfg,
+        {"btc-daily": 42},
+        complete,
+        executor,
+        fetch_fn=lambda: True,
+        run_backtest_fn=_fake_run_backtest(False),
+        env={"CLAUDE_WORKER_STRATEGIST_INTERVAL_S": "1"},
+        clock_ns=clock,
         wall_ns=lambda: _REGIME_NOW_NS,
         regime_inputs=(tmp_path / "missing.toml", tmp_path / "missing.db"),
     )
@@ -1208,5 +1250,7 @@ def test_regime_phase_absent_artifact_is_a_counted_skip_with_an_honest_digest(
     # A "measured" verdict without a measurement is a counted failure, not
     # a declaration of nothing.
     assert cycle.stats.regime_verdict_failures == 1 and cycle.stats.regime_verdicts == 0
-    assert claude_worker.regime.load_declared(claude_worker.regime.regime_dir_for(cfg.db_path)) == {}
+    assert (
+        claude_worker.regime.load_declared(claude_worker.regime.regime_dir_for(cfg.db_path)) == {}
+    )
     state.close()

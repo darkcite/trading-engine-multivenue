@@ -14,7 +14,7 @@
 
 #![no_main]
 
-use ingress_binance::discovery::{BnDiscovery, BnStatus};
+use ingress_binance::discovery::{BnDiscovery, BnStatus, BN_ROW_MARGIN_NAMED};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -27,6 +27,8 @@ fuzz_target!(|data: &[u8]| {
             assert_ne!(r.status, BnStatus::Absent);
             assert_eq!(r.trading, r.status == BnStatus::Trading);
             assert_eq!(r.is_inverse(), r.contract_size > 0);
+            // BX7: a row margined in USDT names its margin asset.
+            assert!(!r.is_usdt_margined() || r.flags & BN_ROW_MARGIN_NAMED != 0);
             let f = r.filters;
             for v in [
                 f.tick_size_1e9,

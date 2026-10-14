@@ -446,17 +446,80 @@ mode = "paper"
 # ---- [exec.binance] — the Binance arm (BX6) -----------------------------
 #
 # REQUIRED when a live slot names binance (the parser refuses the boot
-# without it). This binary's gateway speaks USD-M futures x the classic
-# account only: a `products` word other than "usdm", or an
-# `account_mode` other than "classic", refuses the boot naming the phase
-# that builds it (BX7 COIN-M / PM / PM Pro, BX8 spot, BX9 options, BX10
-# Binance Stocks). At most ONE live slot may name binance — it owns every
-# bound instrument (BX-7).
+# without it). This binary's gateway speaks USD-M and COIN-M futures
+# ("usdm", "coinm") x the classic, Portfolio Margin ("pm") and PM Pro
+# ("pm_pro") accounts, and spot ("spot", BX8) and options ("options",
+# BX9) x classic alone — makers on USD-M classic only, IoC-only
+# elsewhere. Spot or options beside pm / pm_pro refuse the boot (each
+# waits on a ruling); options beside "coinm" or "spot" refuse it too
+# (proven alone and beside "usdm" only); Binance Stocks ("equity", BX10)
+# refuse it, naming ruling S-3 (O-BX16, R17): the arm is built, but only
+# the operator's MAINNET battery (`exec-smoke --binance equity
+# --lifecycle`) drives it. At most ONE live slot may name binance — it owns every
+# bound instrument (BX-7). A session bound (halt_on_gain/loss_usd_1e6) is
+# judged on ONE USD equity: a classic arm trading "usdm", "options" or
+# both (BX9: USD-M's margin balance plus the options account's equity,
+# none until every part is read; COIN-M margins in each coin and the spot
+# wallet holds its own assets — a bounded classic arm with "coinm" or
+# "spot" refuses the boot), or pm / pm_pro (the unified account's). A
+# classic arm binds only USD-M contracts margined in USDT (the account's
+# single-asset totals count USDT's alone); a USDC-margined one refuses
+# the boot there — trade it under pm / pm_pro. Its anchor file is one
+# session's — this key's, this account mode's and its equity's basis
+# (BX9: USD-M's, the options key's, or both): a boot under another key
+# (toggling `signing` changes it), another mode, or with options armed or
+# dropped refuses until you delete the file, which ends the session.
 #
 # The key comes from .env: BINANCE_API_KEY and BINANCE_ED25519_SEED (the
-# names only — never a value in this file). Before any order the boot
-# asserts one-way mode, single-asset margin, `account_mode`, and a key
-# that trades futures and cannot withdraw (BX-19); any miss refuses.
+# names only — never a value in this file); `signing = "hmac"` reads
+# BINANCE_HMAC_API_KEY and BINANCE_HMAC_SECRET_KEY instead (REST only: it
+# needs `order_transport = "rest"`, which pm needs in any case). Before
+# any order the boot asserts one-way mode, single-asset margin (USD-M
+# classic), `account_mode`, a key that trades what is armed (futures;
+# spot) and cannot withdraw, and every owned row cross-margined at or
+# under `max_leverage` (1..=125, default 20; BX-19) — except the leverage
+# under pm, which papi's reads do not carry (not asserted there: a
+# residual); any miss refuses. Later, any leverage change on an owned row
+# locks the slot. A restart finding the account holding positions on
+# owned rows (a dedicated account, a slot naming binance alone) adopts
+# them as the owner slot's starting inventory if they fit its
+# `cap_instance_usd_1e6` — past it the boot refuses; on a slot naming
+# another venue too, any such position refuses the boot.
+#
+# Spot (BX8): the rows are universe.toml's `[binance] spot` list —
+# spot[0] (the M1 anchor) under SymbolId 7 whatever its name, routed to
+# Binance by its boot-fixed alias; the rest under Binance's own ids.
+# IoC-only: spot has no dead-man, so no maker rests and nothing is
+# cancelled or modified. Its user data rides a WS API session alone:
+# spot with order_transport = "rest" or signing = "hmac" refuses the
+# boot. One armed spot row per base asset, and no armed base another
+# row's quote — a row's position IS its base asset's balance, reconciled
+# at the venue's 8 decimals net of every commission charged in it; a
+# balance already held at boot is adopted as a position is (above). The
+# boot judges each spot row's permission groups against the account's
+# (the bStock check): a pair the account may not trade refuses it. No
+# session bound with spot (above).
+#
+# Options (BX9): European options on eapi, REST only. They sign with the
+# HMAC pair, BINANCE_HMAC_API_KEY and BINANCE_HMAC_SECRET_KEY, whatever
+# `signing` says (eapi refuses the Ed25519 key) — an options arm without
+# the pair refuses the boot; the pair's key must trade options and never
+# withdraw, and must be this account's. The rows are the paper-selected
+# chain (universe.toml's [binance] options_underlyings and its selection,
+# at most 64) plus every option the account holds outside it (at most 16
+# more, read once as the engine boots). IoC-only: the venue's countdown
+# is a market maker's, so no maker rests and nothing is cancelled — an
+# options order of ours resting at boot refuses it (cancel it in the
+# app). `options_write = 1` (default 0) lets the arm open shorts where the
+# venue's `nakedSell` allows (BTC, ETH); elsewhere, or with 0, a SELL with
+# no long is refused and any other SELL goes reduce-only, and a `-6057`
+# ends writing on that underlying for the boot. Held options are adopted
+# (a long at its mark, a short at its initial margin's upper bound); an
+# expired leg settles on the venue's exercise record. eapi's weight is
+# its own (the arm's 240 of the IP's 400 a minute): a `recon_every_ms`
+# whose cycle, kept in hand, leaves the boot's day read nothing refuses
+# the boot (20000 does; the default 60000 leaves 94 a minute, 98 beside
+# "usdm").
 #
 # `network` is "mainnet": market data and orders on one network (BX-16).
 # `account_scope` is "dedicated": this binary refuses "shared" (its
@@ -475,6 +538,15 @@ mode = "paper"
 # (the defaults weigh 1 309).
 # `orders_frac_1e6` / `qtr_frac_1e6`: the share of each venue order
 # window and quantitative-rule threshold the arm may use.
+#
+# The variants this binary boots, each one edit of the block below (BX11:
+# a test resolves every one): products = ["coinm"] or ["usdm", "coinm"];
+# products = ["spot"] or ["usdm", "spot"] (BX8: on the WS API with the
+# Ed25519 key, as below); products = ["options"] or ["usdm", "options"]
+# (BX9: the HMAC pair in .env; options_write = 1 to write);
+# order_transport = "rest"; signing = "hmac" with order_transport =
+# "rest"; account_mode = "pm" with order_transport = "rest";
+# account_mode = "pm_pro". Before arming, docs/binance-runbook.md.
 # [exec.binance]
 # network = "mainnet"
 # account_mode = "classic"
@@ -488,3 +560,7 @@ mode = "paper"
 # orders_frac_1e6 = 800000
 # qtr_frac_1e6 = 800000
 # spin = 1
+# order_transport = "ws"
+# signing = "ed25519"
+# max_leverage = 20
+# options_write = 0

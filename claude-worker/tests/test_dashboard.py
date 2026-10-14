@@ -731,7 +731,8 @@ def test_news_red_rules_name_a_dead_source_and_an_invalid_policy(
 
 def test_the_xmm_summary_reads_the_quoted_perps_and_survives_absence(tmp_path):
     # XMM XH3: the config panel's slot-6 block (it replaced icdp.toml).
-    assert claude_worker.dashboard._xmm_summary(tmp_path / "xmm.toml") == {"hash": None, "quoted": []}
+    summary = claude_worker.dashboard._xmm_summary(tmp_path / "xmm.toml")
+    assert summary == {"hash": None, "quoted": []}
     bad = tmp_path / "bad.toml"
     bad.write_text("[xmm\nquote_btc = 1\n", encoding="utf-8")
     assert claude_worker.dashboard._xmm_summary(bad)["quoted"] == []

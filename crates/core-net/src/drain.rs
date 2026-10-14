@@ -119,6 +119,25 @@ pub fn fill_rx<T: Transport>(transport: &mut T, rx: &mut IoBuf) -> io::Result<Rx
     }
 }
 
+/// The oversize guard every ingress frame drain shares (HK2): the frame
+/// reader said `Incomplete`. If rx is still full after the compaction
+/// [`IoBuf::free_mut`] performs, the partial frame is larger than rx. It
+/// can never complete, and re-driving would only wait out the idle
+/// timeout, so the session fails fast instead (fail-fast over livelock).
+///
+/// # Errors
+/// [`io::ErrorKind::InvalidData`] when rx holds one incomplete frame that
+/// fills it.
+#[inline]
+pub fn incomplete_frame(rx: &mut IoBuf) -> io::Result<()> {
+    if rx.free_mut().is_empty() && !rx.is_empty() {
+        // `Error::from(kind)`, never `Error::new(kind, "…")`, which boxes
+        // a String: the drain keeps only the kind.
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+    Ok(())
+}
+
 /// The I-3 drain ([module docs](crate::drain)), one body for every ingress
 /// crate: evaluate `step` — a `drive_one` call, `io::Result<bool>`, `true`
 /// when its read stopped on a full rx — until a step makes no progress
@@ -308,5 +327,27 @@ mod tests {
         t.mark_closed();
         assert_eq!(fill_rx(&mut t, &mut rx).unwrap(), RxFill::Eof);
         assert_eq!(rx.len(), 5, "bytes before the close stay in rx");
+    }
+
+    #[test]
+    fn an_incomplete_frame_that_fills_rx_fails_the_session() {
+        let mut rx = IoBuf::with_capacity(64);
+        assert!(incomplete_frame(&mut rx).is_ok(), "empty rx: wait for bytes");
+        rx.advance(10);
+        assert!(incomplete_frame(&mut rx).is_ok(), "room left: wait for the rest");
+        rx.advance(54);
+        let e = incomplete_frame(&mut rx).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_full_rx_with_consumed_bytes_in_front_compacts_and_waits() {
+        // Dead bytes in front are reclaimed by the compaction, so the
+        // incomplete tail still has room: not an oversize frame.
+        let mut rx = IoBuf::with_capacity(64);
+        rx.advance(64);
+        rx.consume(40);
+        assert!(incomplete_frame(&mut rx).is_ok());
+        assert_eq!(rx.len(), 24);
     }
 }

@@ -92,6 +92,17 @@ pub struct GwConn {
     posts: u32,
     last_rx_ns: u64,
     keepalive: Keepalive,
+    /// HK2: the TLS drive met the peer's close while a readiness event was
+    /// pumped. The bytes before the close may still sit decrypted in
+    /// rustls; [`Self::service`] reads them, hands their frames on, then
+    /// reports [`ConnErr::Closed`].
+    peer_closed: bool,
+    /// HK4, TEST-ONLY (`testvenue`, never in a shipping build): the next
+    /// [`Self::send`] on this connection writes its frame, then reports the
+    /// socket dead — for a post, the gateway's re-send branch (it may have
+    /// left); a read takes the read branch. Cleared by [`Self::close`].
+    #[cfg(feature = "testvenue")]
+    die_after_send: bool,
 }
 
 impl GwConn {
@@ -112,7 +123,17 @@ impl GwConn {
             posts: 0,
             last_rx_ns: 0,
             keepalive: Keepalive::new(keepalive),
+            peer_closed: false,
+            #[cfg(feature = "testvenue")]
+            die_after_send: false,
         }
+    }
+
+    /// HK4, TEST-ONLY: the next [`Self::send`] writes, then reports the
+    /// socket dead.
+    #[cfg(feature = "testvenue")]
+    pub fn die_after_next_send(&mut self) {
+        self.die_after_send = true;
     }
 
     /// The connection's phase.
@@ -186,6 +207,7 @@ impl GwConn {
         self.posts = 0;
         self.last_rx_ns = now_ns;
         self.keepalive.reset();
+        self.peer_closed = false;
         Ok(())
     }
 
@@ -198,18 +220,28 @@ impl GwConn {
         self.acks = 0;
         self.rx.clear();
         self.posts = 0;
+        self.peer_closed = false;
+        #[cfg(feature = "testvenue")]
+        {
+            self.die_after_send = false;
+        }
     }
 
-    /// A readiness event for this connection's token.
+    /// A readiness event for this connection's token. A peer close is
+    /// noted, not reported: [`Self::service`] first reads what arrived
+    /// before it (HK2), then reports [`ConnErr::Closed`].
     ///
     /// # Errors
-    /// [`ConnErr::Closed`] or [`ConnErr::Io`].
+    /// [`ConnErr::Io`].
     pub fn on_event(&mut self, ev: &Event) -> Result<(), ConnErr> {
         let Some(t) = self.t.as_mut() else {
             return Ok(());
         };
         match t.pump(ev) {
-            Ok(Status::Closed) => Err(ConnErr::Closed),
+            Ok(Status::Closed) => {
+                self.peer_closed = true;
+                Ok(())
+            }
             Ok(Status::Ready) => {
                 self.tls_ready = true;
                 Ok(())
@@ -250,9 +282,26 @@ impl GwConn {
                 let Some(t) = self.t.as_mut() else {
                     return Ok(moved);
                 };
-                fill_rx(t, &mut self.rx).map_err(|_| ConnErr::Io)?
+                match fill_rx(t, &mut self.rx) {
+                    Ok(f) => f,
+                    // HK2: a FIN without `close_notify`, once rustls has
+                    // seen it. Every byte before it is authentic (the
+                    // BX5 reading, RFC 9112 §9.8): an end, not a fault.
+                    Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => RxFill::Eof,
+                    Err(_) => return Err(ConnErr::Io),
+                }
             };
-            if fill == RxFill::Eof {
+            if fill == RxFill::Eof || (self.peer_closed && fill == RxFill::Drained) {
+                // HK2: the frames that arrived with the FIN are the
+                // stream's too — a post's answer, a fill or an order
+                // update among them is delivered before the close. Their
+                // own failure (a pong to the closed peer, a torn last
+                // frame) changes nothing: the connection is closed either
+                // way.
+                self.peer_closed = true;
+                if self.phase == Phase::Subscribing || self.phase == Phase::Ready {
+                    let _ = self.parse_frames(on_text);
+                }
                 return Err(ConnErr::Closed);
             }
             if self.rx.len() != before {
@@ -317,12 +366,18 @@ impl GwConn {
                     let frame = &self.rx.filled()[span.start..span.end];
                     if self.phase == Phase::Subscribing && classify(frame) == Ok(WsIn::SubAck) {
                         self.acks += 1;
-                        if self.acks as usize == CHANNELS.len() {
+                        // HK2: a socket the peer closed never turns Ready
+                        // (its last subscribe ack can ride in with the FIN).
+                        if self.acks as usize == CHANNELS.len() && !self.peer_closed {
                             self.phase = Phase::Ready;
                         }
                     } else {
                         on_text(frame);
                     }
+                }
+                WsOpcode::Ping if self.peer_closed => {
+                    // HK2: no pong to a peer that has closed — a failed
+                    // write would drop the frames behind the ping.
                 }
                 WsOpcode::Ping => {
                     if span.end - span.start > 125 {
@@ -356,7 +411,12 @@ impl GwConn {
     pub fn send(&mut self, frame: &[u8]) -> Result<(), ConnErr> {
         debug_assert_eq!(self.phase, Phase::Ready, "a post on a connection not ready");
         let t = self.t.as_mut().ok_or(ConnErr::Closed)?;
-        write_all(t, frame)
+        write_all(t, frame)?;
+        #[cfg(feature = "testvenue")]
+        if core::mem::take(&mut self.die_after_send) {
+            return Err(ConnErr::Io);
+        }
+        Ok(())
     }
 
     /// The keepalive step for a ready connection: ping when quiet.

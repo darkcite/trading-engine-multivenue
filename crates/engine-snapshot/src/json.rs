@@ -475,23 +475,25 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.u64(ex.ledger_marks_refused);
     c.key("ledger_marks_expired");
     c.u64(ex.ledger_marks_expired);
-    // XMM XH4f (D11): and slot 6's gateway arm, beside it.
+    // XMM XH4f (D11): and slot 6's gateway arm, beside it; BX11: and the
+    // Binance arm's own words.
     let bn = ex.arms_binance.present != 0;
     let gw = ex.arms_hyperliquid_gw.present != 0;
-    if bn || gw {
+    let bngw = ex.arms_binance_gw.present != 0;
+    if bn || gw || bngw {
         c.key("arms");
         c.byte(b'{');
+        let mut first = true;
         if bn {
-            c.quoted(b"binance");
-            c.byte(b':');
+            member(&mut c, &mut first, b"binance");
             arm_json(&mut c, &ex.arms_binance);
         }
+        if bngw {
+            member(&mut c, &mut first, b"binance_gw");
+            binance_gw_json(&mut c, &ex.arms_binance_gw);
+        }
         if gw {
-            if bn {
-                c.byte(b',');
-            }
-            c.quoted(b"hyperliquid_gw");
-            c.byte(b':');
+            member(&mut c, &mut first, b"hyperliquid_gw");
             gateway_arm_json(&mut c, &ex.arms_hyperliquid_gw);
         }
         c.byte(b'}');
@@ -1085,6 +1087,17 @@ fn i32_array(c: &mut Cursor<'_>, a: &[i32]) {
     c.put(b"]");
 }
 
+/// A weight pool as `,"<key>":{"used":…,"max":…}` (the gateway's three:
+/// the futures', options' and, BX13, spot's).
+fn used_max(c: &mut Cursor<'_>, key: &str, used: u64, max: u64) {
+    c.key(key);
+    c.put(b"{\"used\":");
+    c.u64(used);
+    c.key("max");
+    c.u64(max);
+    c.byte(b'}');
+}
+
 /// A per-tenor bit mask as `[0|1, …]`, tenor order.
 fn bits(c: &mut Cursor<'_>, mask: u16) {
     c.put(b"[");
@@ -1226,6 +1239,138 @@ fn arm_json(c: &mut Cursor<'_>, a: &crate::ArmSnapshot) {
     c.key("session_pnl_usd_1e6");
     c.i64(a.session_pnl_usd_1e6);
     c.put(b"}");
+}
+
+/// One member's key in an object whose members are optional: a comma
+/// before every one but the first.
+fn member(c: &mut Cursor<'_>, first: &mut bool, name: &[u8]) {
+    if !*first {
+        c.byte(b',');
+    }
+    *first = false;
+    c.quoted(name);
+    c.byte(b':');
+}
+
+/// BX11: the Binance arm's own words — the words spelled, a heartbeat not
+/// yet seen as `-1`, the refusals by reason as one object.
+fn binance_gw_json(c: &mut Cursor<'_>, b: &crate::BinanceGwSnapshot) {
+    c.put(b"{\"slot\":");
+    c.u64(u64::from(b.slot));
+    c.key("ready");
+    c.u64(u64::from(b.ready));
+    c.key("order_up");
+    c.u64(u64::from(b.order_up));
+    c.key("user_up");
+    c.u64(u64::from(b.user_up));
+    c.key("deadman_ok");
+    c.u64(u64::from(b.deadman_ok));
+    c.key("clock_ok");
+    c.u64(u64::from(b.clock_ok));
+    c.key("anchor_unsaved");
+    c.u64(u64::from(b.anchor_unsaved));
+    c.key("mode");
+    c.quoted(crate::bn_mode_word(b.account_mode).as_bytes());
+    c.key("demo");
+    c.u64(u64::from(b.demo));
+    c.key("congestion");
+    c.quoted(crate::congestion_word(b.congestion).as_bytes());
+    c.key("halt_reason");
+    c.u64(b.halt_reason);
+    c.key("sweep");
+    c.quoted(crate::sweep_word(b.sweep).as_bytes());
+    c.key("in_flight");
+    c.u64(b.in_flight);
+    c.key("in_doubt");
+    c.u64(b.in_doubt);
+    c.key("in_doubt_raised");
+    c.u64(b.in_doubt_raised);
+    c.key("jobs_dropped");
+    c.u64(b.jobs_dropped);
+    c.key("fills_deferred");
+    c.u64(b.fills_deferred);
+    c.key("journal_dropped");
+    c.u64(b.journal_dropped);
+    c.key("cancels_owed");
+    c.u64(b.cancels_owed);
+    c.key("quiet");
+    c.u64(b.quiet);
+    c.key("quiet_left_ms");
+    c.u64(b.quiet_left_ms);
+    c.key("dns_reresolved");
+    c.u64(b.dns_reresolved);
+    c.key("events_other");
+    c.u64(b.events_other);
+    c.key("budget_obs");
+    c.u64(b.budget_obs);
+    c.key("locks");
+    c.u64(b.locks);
+    c.key("scan_failed");
+    c.u64(b.scan_failed);
+    c.key("evt_unknown");
+    c.u64(b.evt_unknown);
+    c.key("cancels_refused");
+    c.u64(b.cancels_refused);
+    c.key("modifies_refused");
+    c.u64(b.modifies_refused);
+    c.key("sweeps_stranded");
+    c.u64(b.sweeps_stranded);
+    c.key("heartbeat_age_ms");
+    c.i64(i64::try_from(b.heartbeat_age_ms).unwrap_or(-1));
+    c.key("clock_offset_ms");
+    c.i64(b.clock_offset_ms);
+    used_max(c, "weight", b.weight_used, b.weight_max);
+    used_max(c, "opt_weight", b.opt_weight_used, b.opt_weight_max);
+    // BX13 (R2-4, R2-2, R3-1): spot's own pool, spot's day, held cycles.
+    used_max(c, "spot_weight", b.spot_weight_used, b.spot_weight_max);
+    c.key("spot_day");
+    c.put(b"{\"unfilled\":");
+    c.u64(b.spot_day_unfilled);
+    c.key("cap");
+    c.u64(b.spot_day_cap);
+    c.key("sell_cap");
+    c.u64(b.spot_sell_cap);
+    c.key("seeded");
+    c.u64(b.spot_day_seeded);
+    c.byte(b'}');
+    c.key("recon_held");
+    c.u64(b.recon_held);
+    c.key("orders_10s");
+    c.put(b"{\"used\":");
+    c.u64(b.orders_10s_used);
+    c.key("cap");
+    c.u64(b.orders_10s_cap);
+    c.byte(b'}');
+    c.key("orders_1m");
+    c.put(b"{\"used\":");
+    c.u64(b.orders_1m_used);
+    c.key("cap");
+    c.u64(b.orders_1m_cap);
+    c.byte(b'}');
+    c.key("margin_usdm_1e6");
+    c.i64(b.margin_usdm_1e6);
+    c.key("margin_coinm_1e6");
+    c.i64(b.margin_coinm_1e6);
+    c.key("margin_options_1e6");
+    c.i64(b.margin_options_1e6);
+    c.key("owned_rows");
+    c.u64(b.owned_rows);
+    c.key("post_rtt_p99_ns");
+    c.u64(b.post_rtt_p99_ns);
+    c.key("refused");
+    c.byte(b'{');
+    let mut i = 0;
+    while i < b.refused.len() {
+        if i > 0 {
+            c.byte(b',');
+        }
+        c.quoted(crate::BN_REFUSAL_WORDS[i].as_bytes());
+        c.byte(b':');
+        c.u64(u64::from(b.refused[i]));
+        i += 1;
+    }
+    c.byte(b'}');
+    c.byte(b'}');
 }
 
 /// XMM XH4f (D11): slot 6's gateway arm — its words spelled, a heartbeat
@@ -1691,6 +1836,64 @@ mod tests {
         );
         assert_eq!(crate::congestion_word(9), "unknown");
         assert_eq!(crate::deadman_availability_word(3), "exhausted");
+    }
+
+    /// BX11: the Binance arm's own words ride in `exec.arms.binance_gw` —
+    /// alone, or between `binance` and `hyperliquid_gw` (one comma each) —
+    /// its words spelled, a heartbeat not yet seen as `-1`, the refusals by
+    /// reason as one object in `Refusal` order. Break-and-watch: a comma
+    /// placed for two members only doubles or drops one here.
+    #[test]
+    fn the_exec_object_carries_the_binance_gateway_words() {
+        let mut s = EngineSnapshot::empty();
+        let b = &mut s.exec.arms_binance_gw;
+        b.present = 1;
+        b.slot = 2;
+        b.ready = 1;
+        b.order_up = 1;
+        b.account_mode = 1;
+        b.sweep = 2;
+        b.congestion = 1;
+        b.in_doubt = 3;
+        b.heartbeat_age_ms = u64::MAX;
+        b.clock_offset_ms = -12;
+        b.weight_used = 100;
+        b.weight_max = 1_200;
+        b.refused[0] = 4;
+        b.refused[19] = 9;
+        b.refused[20] = 7;
+        let mut buf = vec![0u8; STATE_JSON_MAX];
+        let n = encode_state_json(&s, &mut buf).unwrap();
+        let body = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            body.contains(
+                "\"arms\":{\"binance_gw\":{\"slot\":2,\"ready\":1,\"order_up\":1,\"user_up\":0,\
+                 \"deadman_ok\":0,\"clock_ok\":0,\"anchor_unsaved\":0,\"mode\":\"pm\",\"demo\":0,\
+                 \"congestion\":\"busy\",\"halt_reason\":0,\"sweep\":\"stranded\",\"in_flight\":0,\
+                 \"in_doubt\":3,"
+            ),
+            "{body}"
+        );
+        assert!(body.contains("\"heartbeat_age_ms\":-1,\"clock_offset_ms\":-12,\"weight\":{\"used\":100,\"max\":1200},\"opt_weight\":{\"used\":0,\"max\":0},"), "{body}");
+        // BX13: spot's pool, spot's day and the held cycles, after eapi's.
+        assert!(
+            body.contains("\"opt_weight\":{\"used\":0,\"max\":0},\"spot_weight\":{\"used\":0,\"max\":0},\"spot_day\":{\"unfilled\":0,\"cap\":0,\"sell_cap\":0,\"seeded\":0},\"recon_held\":0,\"orders_10s\":"),
+            "{body}"
+        );
+        assert!(
+            body.contains("\"refused\":{\"unbound\":4,\"not_live\":0,") && body.contains("\"deadman_down\":0,\"flags\":9,\"not_writable\":7}}},\"halted\":["),
+            "{body}"
+        );
+        // Between the other two: one comma each.
+        s.exec.arms_binance.present = 1;
+        s.exec.arms_hyperliquid_gw.present = 1;
+        let n = encode_state_json(&s, &mut buf).unwrap();
+        let body = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(body.contains("\"session_pnl_usd_1e6\":0},\"binance_gw\":{\"slot\":2,"), "{body}");
+        assert!(body.contains("\"not_writable\":7}},\"hyperliquid_gw\":{\"slot\":0,"), "{body}");
+        assert_eq!(crate::bn_mode_word(2), "pm_pro");
+        assert_eq!(crate::sweep_word(0), "clear");
+        assert_eq!(crate::sweep_word(7), "unknown");
     }
 
     #[test]

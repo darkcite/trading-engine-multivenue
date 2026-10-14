@@ -47,6 +47,13 @@
 //! | `M a mark strike to_expiry twap` | `twap_moneyness_1e9` (S3) | `M m_1e9` or `M -` |
 //! | `W mark strike to_expiry twap a sig2` | `fair_value_twap` (S3) | `W p_hat p_raw d den horizon` or `W - - - - -` |
 //! | `S px from to open close` | `core_types::binary_twap_segment` (S3) | `S area dt` |
+//! | `LPHI v0 … v4096` | load the late Φ (H90) | — |
+//! | `LG` | a fresh `late::LateGrid` (H90) | — |
+//! | `LM wall mark` | `LateGrid::on_mark` (H90) | — |
+//! | `LP wall bid_plus_ask` | `LateGrid::on_perp` (H90) | — |
+//! | `LQ wall strike expiry k` | advance + `late::late_fair` (H90) | `LQ p z sigma basis m_now n_obs` or `LQ HOLD reason` |
+//!
+//! `parity-3` carries BIN15 H90's late-window pricer (`late.rs`).
 //!
 //! `parity-1` is the O4b tape and is pinned as it was; the BIN15 S3
 //! records (the venue's settlement law in the pricer, ruling O-2) travel
@@ -54,6 +61,7 @@
 //!
 //! Test-only code: allocation and `unwrap` are fine here.
 
+use strategy_bin15::late::{late_fair, LateGrid, LateLut, LATE_PHI_POINTS, SEC_NS};
 use strategy_bin15::price::{
     ceil_grid_1e6, fair_value, fair_value_twap, floor_grid_1e6, log_moneyness_1e9, phase_of,
     pricing_horizon_ns, twap_moneyness_1e9, Bin15Luts, PHASES, PHI_POINTS, RECAL_POINTS,
@@ -63,7 +71,7 @@ const FIXTURE_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../claude-worker/tests/fixtures/bin15/"
 );
-const FIXTURES: [&str; 2] = ["parity-1", "parity-2"];
+const FIXTURES: [&str; 3] = ["parity-1", "parity-2", "parity-3"];
 
 /// Replay one fixture, returning the emitted rows.
 fn run(name: &str) -> Vec<String> {
@@ -73,6 +81,8 @@ fn run(name: &str) -> Vec<String> {
     // Boxed for the same reason the member boxes it: 4 097 + 3 × 65
     // `u32`s is 17 KiB and a stack frame is not the place for it.
     let mut luts = Box::new(Bin15Luts::identity());
+    let mut late_lut = Box::new(LateLut::flat());
+    let mut grid = Box::new(LateGrid::new());
     let mut out: Vec<String> = Vec::new();
 
     for line in src.lines() {
@@ -179,6 +189,36 @@ fn run(name: &str) -> Vec<String> {
                     f[5].parse().unwrap(),
                 );
                 out.push(format!("S\t{area}\t{dt}"));
+            }
+            "LPHI" => {
+                assert_eq!(f.len() - 1, LATE_PHI_POINTS, "LPHI record length");
+                let mut i = 0usize;
+                while i < LATE_PHI_POINTS {
+                    late_lut.phi[i] = f[i + 1].parse().unwrap();
+                    i += 1;
+                }
+            }
+            "LG" => grid = Box::new(LateGrid::new()),
+            "LM" => grid.on_mark(f[1].parse().unwrap(), f[2].parse().unwrap()),
+            "LP" => grid.on_perp(f[1].parse().unwrap(), f[2].parse().unwrap()),
+            "LQ" => {
+                let wall: u64 = f[1].parse().unwrap();
+                grid.advance_to(wall / SEC_NS);
+                let row = match late_fair(
+                    &grid,
+                    &late_lut,
+                    f[2].parse().unwrap(),
+                    f[3].parse().unwrap(),
+                    wall,
+                    f[4].parse().unwrap(),
+                ) {
+                    Ok(v) => format!(
+                        "LQ\t{}\t{}\t{}\t{}\t{}\t{}",
+                        v.p_yes_1e6, v.z_1e6, v.sigma_1e9, v.basis_1e9, v.m_now_1e6, v.n_obs
+                    ),
+                    Err(h) => format!("LQ\tHOLD\t{h:?}"),
+                };
+                out.push(row);
             }
             other => panic!("unknown fixture record `{other}`"),
         }

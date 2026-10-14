@@ -60,9 +60,23 @@ use crate::{
 /// multi-symbol burst with a large margin (boot-time allocation).
 pub const RX_BUF_SIZE: usize = 256 * 1024;
 
-/// Tx buffer: handshake + one batched subscribe (~30 B/topic × 192
-/// topics ≈ 5.8 KiB) + pings. 16 KiB keeps ≥2× margin.
+/// Tx buffer: handshake + one batched subscribe ([`SUB_PAYLOAD_MAX`])
+/// + pings. The worst case fits — const-asserted where the subscribe is queued (HK3).
 pub const TX_BUF_SIZE: usize = 16 * 1024;
+
+/// The handshake's allowance in the tx budget (the MEXC shape).
+const HANDSHAKE_TX_MAX: usize = 1024;
+
+/// The longest batched subscribe payload (`crate::render_subscribe`):
+/// the envelope, then three topics per symbol, each at the longest
+/// prefix (`orderbook.1.`) and the longest symbol with its quotes and
+/// comma — 7 516 B at [`BYBIT_MAX_SYMBOLS`] = 64 (HK3).
+pub const SUB_PAYLOAD_MAX: usize = br#"{"op":"subscribe","args":[]}"#.len()
+    + BYBIT_MAX_SYMBOLS
+        * 3
+        * (br#","""#.len()
+            + crate::BybitChannel::OrderbookL1.topic_prefix().len()
+            + crate::BYBIT_SYMBOL_MAX);
 
 /// Tick-ring capacity. Must equal `engine::TICK_RING_SIZE` — the cli
 /// const-asserts the equality when wiring lanes (8a §3.3 pattern).
@@ -293,9 +307,6 @@ pub fn drive_one<T: Transport, C: Capture>(
 ) -> io::Result<bool> {
     flush_tx(transport, drv)?;
     let fill = core_net::fill_rx(transport, &mut drv.rx)?;
-    if fill == RxFill::Eof {
-        drv.state = State::Closed;
-    }
 
     match drv.state {
         State::Connecting => {}
@@ -315,6 +326,13 @@ pub fn drive_one<T: Transport, C: Capture>(
         State::Closed => {}
     }
 
+    // HK2: an EOF closes the session only now — the frames that arrived
+    // with the FIN were parsed above — and nothing is flushed to a peer
+    // that has closed.
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+        return Ok(false);
+    }
     flush_tx(transport, drv)?;
     Ok(fill == RxFill::Full)
 }
@@ -433,6 +451,11 @@ fn queue_subscribe_all(drv: &mut Driver) -> io::Result<()> {
     if drv.symbols.is_empty() {
         return Err(io::Error::other("bybit: no symbols configured"));
     }
+    // HK3: the handshake, the worst batched subscribe and its frame header
+    // fit in tx together.
+    const {
+        assert!(HANDSHAKE_TX_MAX + SUB_PAYLOAD_MAX + core_net::WS_CLIENT_HDR_MAX <= TX_BUF_SIZE);
+    };
     let (symbols, want_tickers) = (&drv.symbols, drv.want_tickers);
     queue_masked_text_frame_rendered(&mut drv.tx, &mut drv.mask_counter, |p| {
         render_subscribe(p, symbols, want_tickers)
@@ -486,16 +509,8 @@ fn drain_ws_frames<C: Capture>(
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
         match read_result {
-            WsReadResult::Incomplete => {
-                // Oversize guard (fail-fast rather than livelock).
-                if drv.rx.free_mut().is_empty() && !drv.rx.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "ws frame exceeds rx buffer capacity",
-                    ));
-                }
-                return Ok(());
-            }
+            // Oversize guard (fail-fast rather than livelock).
+            WsReadResult::Incomplete => return core_net::incomplete_frame(&mut drv.rx),
             WsReadResult::Malformed => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1350,6 +1365,67 @@ mod tests {
         assert!(memchr::memmem::find(&body, b"\"op\":\"subscribe\"").is_some());
         assert!(memchr::memmem::find(&body, b"\"orderbook.1.BTCUSDT\"").is_some());
         assert!(memchr::memmem::find(&body, b"\"tickers.ETHUSDT\"").is_some());
+    }
+
+    /// HK3: the worst batched subscribe — every row at the longest
+    /// symbol, tickers on — renders within [`SUB_PAYLOAD_MAX`], which the
+    /// tx sizing assert is built on.
+    #[test]
+    fn the_worst_batched_subscribe_fits_its_bound() {
+        let mut syms = BybitSymbolTable::new();
+        let mut i = 0u32;
+        while (i as usize) < BYBIT_MAX_SYMBOLS {
+            let mut name = [b'S'; crate::BYBIT_SYMBOL_MAX];
+            name[0] = b'A' + (i / 26) as u8;
+            name[1] = b'A' + (i % 26) as u8;
+            syms.insert(&name, (6 << 24) | (1 + i)).unwrap();
+            i += 1;
+        }
+        let mut tx = IoBuf::with_capacity(TX_BUF_SIZE);
+        let mut ctr = 0u64;
+        queue_masked_text_frame_rendered(&mut tx, &mut ctr, |p| {
+            render_subscribe(p, &syms, true)
+        })
+        .unwrap();
+        assert!(tx.len() <= SUB_PAYLOAD_MAX + core_net::WS_CLIENT_HDR_MAX);
+    }
+
+    /// HK2: a push that arrives in the same read as the venue's FIN is
+    /// published before the session closes. Before, the EOF set `Closed`
+    /// ahead of the state machine and the push was dropped.
+    #[test]
+    fn a_frame_that_arrives_with_the_fin_is_published_then_the_session_closes() {
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+        let snap = br#"{"topic":"orderbook.1.BTCUSDT","type":"snapshot","ts":1,"data":{"s":"BTCUSDT","b":[["50005.12","1.5"]],"a":[["50006.34","2.0"]],"u":100,"seq":1}}"#;
+        t.inject_incoming(&ws_text_frame(snap));
+        t.mark_closed();
+        let full = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture)
+            .unwrap();
+        assert!(!full);
+        assert_eq!(cons.try_pop_ref().map(|t| t.sym), Some(SYM_BTC), "published before the close");
+        assert_eq!(d.state(), State::Closed);
+    }
+
+    /// HK2: the oversize guard, now the shared `core_net::incomplete_frame`:
+    /// a frame larger than rx fails the session at once.
+    #[test]
+    fn a_frame_larger_than_rx_fails_the_session_instead_of_stalling() {
+        let mut t = TestTransport::with_capacity(RX_BUF_SIZE + 1024);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let huge = (RX_BUF_SIZE as u64 + 4096).to_be_bytes();
+        let mut frame = vec![0u8; RX_BUF_SIZE + 512];
+        frame[0] = 0x81;
+        frame[1] = 127;
+        frame[2..10].copy_from_slice(&huge);
+        t.inject_incoming(&frame);
+        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture)
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
     /// I-3: a burst of non-tick frames past a full rx no longer strands

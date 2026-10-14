@@ -320,9 +320,6 @@ pub fn drive_one<T: Transport, C: Capture>(
 ) -> io::Result<bool> {
     flush_tx(transport, drv)?;
     let fill = core_net::fill_rx(transport, &mut drv.rx)?;
-    if fill == RxFill::Eof {
-        drv.state = State::Closed;
-    }
 
     match drv.state {
         State::Connecting => {}
@@ -346,6 +343,13 @@ pub fn drive_one<T: Transport, C: Capture>(
         State::Closed => {}
     }
 
+    // HK2: an EOF closes the session only now — the frames that arrived
+    // with the FIN were parsed above — and nothing is flushed to a peer
+    // that has closed.
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+        return Ok(false);
+    }
     flush_tx(transport, drv)?;
     Ok(fill == RxFill::Full)
 }
@@ -511,7 +515,7 @@ fn drain_ws_frames<C: Capture>(
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
         match read_result {
-            WsReadResult::Incomplete => return Ok(()),
+            WsReadResult::Incomplete => return core_net::incomplete_frame(&mut drv.rx),
             WsReadResult::Malformed => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1193,6 +1197,56 @@ mod tests {
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.parse_errors_total(), 0);
         assert_eq!(status.bytes_total(), n as u64);
+    }
+
+    /// HK2: a notification that arrives in the same read as the node's
+    /// FIN is published before the session closes. Before, the EOF set
+    /// `Closed` ahead of the state machine and the notification was
+    /// dropped.
+    #[test]
+    fn a_frame_that_arrives_with_the_fin_is_published_then_the_session_closes() {
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = Driver::new(7);
+        d.set_state(State::Steady);
+        d.suppress_polling_for_test();
+        d.subscribed = true;
+        let ring = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let status = IngressStatus::new();
+        let body = br#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0xab","result":{"number":"0x2a","timestamp":"0x65","gasUsed":"0x1"}}}"#;
+        let mut frame_buf = [0u8; 512];
+        let n = wrap_text_frame(body, &mut frame_buf);
+        t.inject_incoming(&frame_buf[..n]);
+        t.mark_closed();
+        let full = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture)
+            .unwrap();
+        assert!(!full);
+        assert!(cons.try_pop_ref().is_some(), "published before the close");
+        assert_eq!(d.state(), State::Closed);
+    }
+
+    /// HK2: a frame larger than rx fails the session at once
+    /// (`core_net::incomplete_frame`). Before, the drain returned `Ok` on
+    /// every poll and the session stalled until the idle timeout.
+    #[test]
+    fn a_frame_larger_than_rx_fails_the_session_instead_of_stalling() {
+        let mut t = TestTransport::with_capacity(RX_BUF_SIZE + 1024);
+        let mut d = Driver::new(7);
+        d.set_state(State::Steady);
+        d.suppress_polling_for_test();
+        d.subscribed = true;
+        let ring = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let status = IngressStatus::new();
+        let huge = (RX_BUF_SIZE as u64 + 4096).to_be_bytes();
+        let mut frame = vec![0u8; RX_BUF_SIZE + 512];
+        frame[0] = 0x81;
+        frame[1] = 127;
+        frame[2..10].copy_from_slice(&huge);
+        t.inject_incoming(&frame);
+        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture)
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

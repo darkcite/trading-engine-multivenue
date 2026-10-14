@@ -135,10 +135,24 @@ use crate::{
 pub const RX_BUF_SIZE: usize = 4 * 1024 * 1024;
 
 /// Tx buffer: handshake + set_heartbeat + one batched subscribe
-/// (≤ ~48 B/channel × [`MAX_CHANNELS`] = 192 ≈ 9.2 KiB with a full
-/// M2.3 options block) + resync pairs + test replies. 24 KiB keeps
-/// ≥2× margin (boot-time allocation).
+/// ([`SUB_PAYLOAD_MAX`]) + resync pairs + test replies, with ≥ 2× margin
+/// on the subscribe — const-asserted where it is queued (HK3). Boot-time
+/// allocation.
 pub const TX_BUF_SIZE: usize = 24 * 1024;
+
+/// The handshake's allowance in the tx budget (the MEXC shape).
+const HANDSHAKE_TX_MAX: usize = 1024;
+
+/// The longest batched subscribe payload (`crate::render_subscribe_all`):
+/// the request head with a 20-digit id, every channel at
+/// [`crate::CHANNEL_NAME_MAX`] plus its comma, every DVOL index at its
+/// longest, the close — 9 664 B at [`MAX_CHANNELS`] = 192 (HK3).
+pub const SUB_PAYLOAD_MAX: usize = br#"{"jsonrpc":"2.0","id":"#.len()
+    + 20
+    + br#","method":"public/subscribe","params":{"channels":[]}}"#.len()
+    + MAX_CHANNELS * (crate::CHANNEL_NAME_MAX + 1)
+    + crate::DERIBIT_DVOL_MAX
+        * (br#","deribit_volatility_index.""#.len() + crate::DERIBIT_DVOL_NAME_MAX);
 
 /// Tick-ring capacity. Must equal `engine::TICK_RING_SIZE` — the cli
 /// const-asserts the equality when wiring lanes (8a §3.3 pattern).
@@ -169,9 +183,10 @@ pub const MAX_CHANNELS: usize =
 /// Subscription-table capacity (≥ [`MAX_CHANNELS`]).
 pub const SUB_CAP: usize = MAX_CHANNELS;
 
-/// Stack scratch for one rendered channel name
-/// (`"` + prefix ≤ 7 + instrument ≤ 32 + `.100ms` + `"` = 47 max).
+/// Stack scratch for one rendered channel name ([`crate::CHANNEL_NAME_MAX`]
+/// = 47 B, asserted).
 const CHANNEL_NAME_SCRATCH: usize = 64;
+const _: () = assert!(crate::CHANNEL_NAME_MAX <= CHANNEL_NAME_SCRATCH);
 
 /// Minimum interval between emitted gap log lines (operator-terminal
 /// budget; increments beyond it are counted into `suppressed=` on the
@@ -394,12 +409,14 @@ impl Driver {
     ) -> Self {
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
-        let mut dvol: [DvolName; DERIBIT_DVOL_MAX] = [(0, [0; 16]); DERIBIT_DVOL_MAX];
+        let mut dvol: [DvolName; DERIBIT_DVOL_MAX] =
+            [(0, [0; crate::DERIBIT_DVOL_NAME_MAX]); DERIBIT_DVOL_MAX];
         let mut n_dvol = 0usize;
         let mut i = 0;
         while i < dvol_names.len() {
             let name = dvol_names[i];
-            if name.is_empty() || name.len() > 16 || n_dvol >= DERIBIT_DVOL_MAX {
+            if name.is_empty() || name.len() > crate::DERIBIT_DVOL_NAME_MAX || n_dvol >= DERIBIT_DVOL_MAX
+            {
                 debug_assert!(
                     false,
                     "dvol entry dropped (len/cap) — config layer caps this"
@@ -584,9 +601,6 @@ pub fn drive_one<T: Transport, C: Capture>(
 ) -> io::Result<bool> {
     flush_tx(transport, drv)?;
     let fill = core_net::fill_rx(transport, &mut drv.rx)?;
-    if fill == RxFill::Eof {
-        drv.state = State::Closed;
-    }
 
     match drv.state {
         State::Connecting => {}
@@ -608,6 +622,13 @@ pub fn drive_one<T: Transport, C: Capture>(
         State::Closed => {}
     }
 
+    // HK2: an EOF closes the session only now — the frames that arrived
+    // with the FIN were parsed above — and nothing is flushed to a peer
+    // that has closed.
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+        return Ok(false);
+    }
     flush_tx(transport, drv)?;
     Ok(fill == RxFill::Full)
 }
@@ -773,6 +794,13 @@ fn queue_session_start(drv: &mut Driver) -> io::Result<()> {
     // 2. One batched subscribe for every (channel × instrument)
     //    (+ WS6 DVOL indices).
     //    Header first, rendered straight into tx: no scratch.
+    // HK3: the handshake, the worst batched subscribe twice over and a
+    // frame header fit in tx.
+    const {
+        assert!(
+            HANDSHAKE_TX_MAX + 2 * SUB_PAYLOAD_MAX + core_net::WS_CLIENT_HDR_MAX <= TX_BUF_SIZE
+        );
+    };
     let sub_id = drv.alloc_req_id();
     let (symbols, depth_enabled, dvol) = (&drv.symbols, drv.depth_enabled, &drv.dvol[..drv.n_dvol]);
     queue_masked_text_frame_rendered(&mut drv.tx, &mut drv.mask_counter, |p| {
@@ -912,24 +940,22 @@ fn found_mask(payload: &[u8], symbols: &DeribitSymbolTable, depth_enabled: bool)
                 continue;
             }
             wanted += 1;
-            let ch = CHANNEL_ORDER[c];
+            // HK3: the subscribe render's own spelling, never a second one.
+            let mut parts: [&[u8]; 5] = [b""; 5];
+            crate::channel_name_parts(CHANNEL_ORDER[c], instr, &mut parts);
             let mut name = [0u8; CHANNEL_NAME_SCRATCH];
             let mut n = 0usize;
-            name[n] = b'"';
-            n += 1;
-            let p = ch.wire_prefix();
-            // COPY: the quoted channel name (≤ 64 B) as one memmem needle, once per wanted
-            // channel per subscribe RESULT (once per session) — memmem needs a contiguous needle
-            // — rejected: find-then-verify per hit of the bare instrument (more work per hit).
-            name[n..n + p.len()].copy_from_slice(p);
-            n += p.len();
-            name[n..n + instr.len()].copy_from_slice(instr);
-            n += instr.len();
-            let s = ch.wire_suffix();
-            name[n..n + s.len()].copy_from_slice(s);
-            n += s.len();
-            name[n] = b'"';
-            n += 1;
+            let mut k = 0usize;
+            while k < parts.len() {
+                let part = parts[k];
+                // COPY: the quoted channel name (≤ CHANNEL_NAME_MAX = 47 B) as one memmem
+                // needle, once per wanted channel per subscribe RESULT (once per session) —
+                // memmem needs a contiguous needle — rejected: find-then-verify per hit of
+                // the bare instrument (more work per hit).
+                name[n..n + part.len()].copy_from_slice(part);
+                n += part.len();
+                k += 1;
+            }
             if memchr::memmem::find(payload, &name[..n]).is_some() {
                 if is_tail_row(symbols, i) {
                     found_in_row += 1;
@@ -1072,18 +1098,10 @@ fn drain_ws_frames<C: Capture>(
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
         match read_result {
-            WsReadResult::Incomplete => {
-                // Oversize guard: a frame that cannot fit the rx
-                // buffer never completes — fail the session instead
-                // of livelocking (module doc).
-                if drv.rx.free_mut().is_empty() && !drv.rx.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "ws frame exceeds rx buffer capacity",
-                    ));
-                }
-                return Ok(());
-            }
+            // Oversize guard: a frame that cannot fit the rx buffer never
+            // completes — fail the session instead of livelocking (module
+            // doc; the shared guard since HK2).
+            WsReadResult::Incomplete => return core_net::incomplete_frame(&mut drv.rx),
             WsReadResult::Malformed => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -4002,6 +4020,74 @@ mod tests {
         .unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
+    }
+
+    /// HK3: the worst batched subscribe — every static and option row at
+    /// the longest instrument, depth on, every DVOL index at its longest —
+    /// renders within [`SUB_PAYLOAD_MAX`], which the tx sizing assert is
+    /// built on. And `found_mask` reads the render's own spelling: the
+    /// subscribe result that echoes every rendered name confirms every row.
+    #[test]
+    fn the_worst_batched_subscribe_fits_its_bound_and_confirms_itself() {
+        let mut syms = DeribitSymbolTable::new();
+        let mut i = 0u32;
+        while (i as usize) < crate::DERIBIT_STATIC_MAX {
+            // A dash makes it a future (four channels), not spot (two).
+            let mut name = [b'F'; crate::DERIBIT_INSTR_MAX];
+            name[0] = b'A' + (i as u8);
+            name[1] = b'-';
+            syms.insert(&name, (3 << 24) | (1 + i)).unwrap();
+            i += 1;
+        }
+        let mut j = 0u32;
+        while (j as usize) < crate::DERIBIT_OPT_MAX {
+            let mut name = [b'O'; crate::DERIBIT_INSTR_MAX];
+            name[0] = b'A' + (j / 26) as u8;
+            name[1] = b'A' + (j % 26) as u8;
+            syms.insert_option(&name, (3 << 24) | (512 + j)).unwrap();
+            j += 1;
+        }
+        let dvol = [(16u8, [b'v'; 16]); crate::DERIBIT_DVOL_MAX];
+        let mut tx = IoBuf::with_capacity(TX_BUF_SIZE);
+        let mut ctr = 0u64;
+        queue_masked_text_frame_rendered(&mut tx, &mut ctr, |p| {
+            render_subscribe_all(p, u64::MAX, &syms, true, &dvol)
+        })
+        .unwrap();
+        assert!(tx.len() <= SUB_PAYLOAD_MAX + core_net::WS_CLIENT_HDR_MAX);
+
+        // The render read back by the result check: the request itself,
+        // unmasked, names every channel it subscribed, so it confirms
+        // every row (statics: four bits each; options: one folded bit each).
+        let WsReadResult::Frame { header, payload } = ws_read_frame(tx.filled()) else {
+            panic!("one whole frame in tx");
+        };
+        let mut request = tx.filled()[payload.start..payload.end].to_vec();
+        if header.masked {
+            ws_unmask_in_place(&mut request, header.mask);
+        }
+        let m = found_mask(&request, &syms, true);
+        assert_eq!(m, expected_mask(&syms, true));
+        assert_eq!(m.count_ones() as usize, 4 * crate::DERIBIT_STATIC_MAX + crate::DERIBIT_OPT_MAX);
+    }
+
+    /// HK2: a push that arrives in the same read as the venue's FIN is
+    /// published before the session closes. Before, the EOF set `Closed`
+    /// ahead of the state machine and the push was dropped.
+    #[test]
+    fn a_frame_that_arrives_with_the_fin_is_published_then_the_session_closes() {
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+        let quote = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC-PERPETUAL","data":{"timestamp":1550658624149,"instrument_name":"BTC-PERPETUAL","best_bid_price":3914.97,"best_bid_amount":40,"best_ask_price":3996.61,"best_ask_amount":50}}}"#;
+        inject_text(&mut t, quote);
+        t.mark_closed();
+        let full = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture)
+            .unwrap();
+        assert!(!full);
+        assert_eq!(cons.try_pop_ref().map(|t| t.sym), Some(SYM_BTC), "published before the close");
+        assert_eq!(d.state(), State::Closed);
     }
 
     #[test]

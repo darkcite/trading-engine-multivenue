@@ -11,7 +11,6 @@ import pathlib
 
 import claude_worker.universe_refresh
 
-
 UTC = datetime.timezone.utc
 
 # The live M1 universe.toml shape (abbreviated ids for readability —

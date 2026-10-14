@@ -15,10 +15,13 @@
 //! slot, and a plain allocator would collide with it `N` ids later however
 //! few posts are in flight. With the skip, a free slot exists whenever
 //! fewer than `N` posts are in flight (the venue caps them well below:
-//! Hyperliquid 100 against 256). A refused claim
-//! ([`PendingErr::SlotBusy`]) is a driver bug. The owner must also retire a
-//! post whose reply is long overdue (its deadline, then a sweep at twice
-//! it) — otherwise its slot leaks until the process restarts.
+//! Hyperliquid 100 against 256). [`Pending::claim_next`] is that
+//! allocator (BX7: the Binance gateway's WS API ids); an owner that numbers
+//! its posts itself skips with [`Pending::is_free`] and claims with
+//! [`Pending::claim`] — one or the other per table, never both. A refused
+//! claim ([`PendingErr::SlotBusy`]) is a driver bug. The owner must also
+//! retire a post whose reply is long overdue (its deadline, then a sweep
+//! at twice it) — otherwise its slot leaks until the process restarts.
 
 /// Why a [`Pending`] operation refused.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -35,6 +38,8 @@ pub struct Pending<T: Copy, const N: usize> {
     sent_ns: Box<[u64; N]>,
     slots: Box<[T; N]>,
     live: usize,
+    /// [`Pending::claim_next`]'s cursor: the next id it tries (never 0).
+    next: u64,
 }
 
 impl<T: Copy, const N: usize> Pending<T, N> {
@@ -55,12 +60,39 @@ impl<T: Copy, const N: usize> Pending<T, N> {
             sent_ns: crate::boxed_array(0u64),
             slots: crate::boxed_array(blank),
             live: 0,
+            next: 1,
         }
     }
 
     #[inline(always)]
     const fn ix(id: u64) -> usize {
         (id as usize) & (N - 1)
+    }
+
+    /// The allocator (module docs): the first id from the cursor whose slot
+    /// is free, claimed at `now_ns` — its record lent in place, as
+    /// [`Pending::claim`] lends it. `None` when all `N` slots are busy: the
+    /// session's back-pressure (the caller refuses or waits; never a
+    /// collision).
+    #[inline]
+    pub fn claim_next(&mut self, now_ns: u64) -> Option<(u64, &mut T)> {
+        let mut id = self.next;
+        let mut tries = 0usize;
+        while tries < N {
+            let i = Self::ix(id);
+            if self.ids[i] == 0 {
+                // Never 0 (the free marker), even after a wrap no session
+                // lives to see.
+                self.next = id.wrapping_add(1).max(1);
+                self.ids[i] = id;
+                self.sent_ns[i] = now_ns;
+                self.live += 1;
+                return Some((id, &mut self.slots[i]));
+            }
+            id = id.wrapping_add(1).max(1);
+            tries += 1;
+        }
+        None
     }
 
     /// Take the slot for post `id`, stamped `now_ns`, and lend it for the
@@ -236,6 +268,32 @@ mod tests {
             s += 1;
         }
         assert_eq!(seen, 1 + 3 + 4 + 5);
+    }
+
+    /// `claim_next` is the module's allocator: monotonic from 1, a busy
+    /// slot skipped (not reused), `None` only with every slot busy.
+    /// Break-and-watch: without the skip, the fifth claim takes id 5 onto
+    /// id 1's still-busy slot.
+    #[test]
+    fn claim_next_skips_a_busy_slot_and_refuses_only_when_full() {
+        let mut p: Pending<Rec, 4> = Pending::new(BLANK);
+        let mut got = [0u64; 4];
+        let mut k = 0usize;
+        while k < 4 {
+            let (id, r) = p.claim_next(10 + k as u64).expect("a free slot");
+            r.oids[0] = id;
+            got[k] = id;
+            k += 1;
+        }
+        assert_eq!(got, [1, 2, 3, 4]);
+        assert!(p.claim_next(20).is_none(), "every slot busy: back-pressure");
+        // Id 1's reply never comes; ids 2..4 are answered.
+        assert!(p.release(2) && p.release(3) && p.release(4));
+        let (id, _) = p.claim_next(30).expect("a free slot");
+        assert_eq!(id, 6, "5 would land on id 1's busy slot: skipped");
+        assert_eq!(p.sent_ns(6), Some(30));
+        assert_eq!(p.get(1).map(|r| r.oids[0]), Some(1), "the busy post is untouched");
+        assert_eq!(p.live(), 2);
     }
 
     proptest! {

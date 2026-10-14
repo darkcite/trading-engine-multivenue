@@ -93,8 +93,14 @@ def test_a_pre_split_row_reads_as_paper_and_a_split_row_keeps_its_origin(
     Guessing between the two is the mislabelling the split exists to
     prevent, so 11 and 12 are the ONLY widths accepted."""
     p = tmp_path / "entries.tsv"
-    legacy = "\t".join(str(v) for v in (1, 7, 0, 0, 900_000_000_000, 12, 1, 640_000, 78_000_000, 700_000, 1_000_000))
-    live = "\t".join(str(v) for v in (2, 8, 0, 0, 900_000_000_000, 12, 1, 640_000, 78_000_000, 700_000, 1_000_000, 0))
+    legacy = "\t".join(
+        str(v)
+        for v in (1, 7, 0, 0, 900_000_000_000, 12, 1, 640_000, 78_000_000, 700_000, 1_000_000)
+    )
+    live = "\t".join(
+        str(v)
+        for v in (2, 8, 0, 0, 900_000_000_000, 12, 1, 640_000, 78_000_000, 700_000, 1_000_000, 0)
+    )
     p.write_text(f"# head\n{legacy}\n{live}\n", encoding="utf-8")
 
     rows = claude_worker.bin15_accrue.read_entries(p)
@@ -160,7 +166,7 @@ def test_by_origin_puts_the_account_first_and_omits_what_has_none() -> None:
     ]
     assert claude_worker.bin15_accrue.by_origin([]) == []
 
-    both = paper_only + [_e(outcome=8, origin=claude_worker.bin15_accrue.ORIGIN_VENUE)]
+    both = [*paper_only, _e(outcome=8, origin=claude_worker.bin15_accrue.ORIGIN_VENUE)]
     assert [o for o, _ in claude_worker.bin15_accrue.by_origin(both)] == [
         claude_worker.bin15_accrue.ORIGIN_VENUE,
         claude_worker.bin15_accrue.ORIGIN_PAPER,
@@ -168,11 +174,26 @@ def test_by_origin_puts_the_account_first_and_omits_what_has_none() -> None:
 
 
 def test_the_sidecar_block_is_read_and_a_null_payout_is_unknown() -> None:
-    text = json.dumps({"bin15_entries": [
-        {"ts_ns": 1, "outcome": 7, "family": 0, "start_ns": 0, "expiry_ns": 900_000_000_000,
-         "offset_s": 12, "is_yes": 1, "px_1e6": 640_000, "qty_1e6": 78_000_000,
-         "p_hat_1e6": 700_000, "origin": 1, "y": None},
-    ]})
+    text = json.dumps(
+        {
+            "bin15_entries": [
+                {
+                    "ts_ns": 1,
+                    "outcome": 7,
+                    "family": 0,
+                    "start_ns": 0,
+                    "expiry_ns": 900_000_000_000,
+                    "offset_s": 12,
+                    "is_yes": 1,
+                    "px_1e6": 640_000,
+                    "qty_1e6": 78_000_000,
+                    "p_hat_1e6": 700_000,
+                    "origin": 1,
+                    "y": None,
+                },
+            ]
+        }
+    )
     rows = claude_worker.bin15_accrue.entries_from_sidecar(text)
     assert len(rows) == 1
     assert rows[0].y == claude_worker.bin15_accrue.Y_UNKNOWN
@@ -188,12 +209,25 @@ def test_a_sidecar_without_an_origin_is_refused_not_defaulted() -> None:
     here would make the FIRST live day inherit "paper" in silence,
     which is precisely the failure the split exists to prevent. The
     answer is to rebuild the harness, not to guess."""
-    text = json.dumps({"bin15_entries": [
-        {"ts_ns": 1, "outcome": 7, "family": 0, "start_ns": 0,
-         "expiry_ns": 900_000_000_000, "offset_s": 12, "is_yes": 1,
-         "px_1e6": 640_000, "qty_1e6": 78_000_000, "p_hat_1e6": 700_000,
-         "y": None},
-    ]})
+    text = json.dumps(
+        {
+            "bin15_entries": [
+                {
+                    "ts_ns": 1,
+                    "outcome": 7,
+                    "family": 0,
+                    "start_ns": 0,
+                    "expiry_ns": 900_000_000_000,
+                    "offset_s": 12,
+                    "is_yes": 1,
+                    "px_1e6": 640_000,
+                    "qty_1e6": 78_000_000,
+                    "p_hat_1e6": 700_000,
+                    "y": None,
+                },
+            ]
+        }
+    )
     with pytest.raises(ValueError, match="predates"):
         claude_worker.bin15_accrue.entries_from_sidecar(text)
 
@@ -225,7 +259,7 @@ def test_the_verdict_is_dollars_and_it_can_disagree_with_the_hit_rate() -> None:
     mean price of 0.50 — apparently break-even — while the account is
     down, because the stake sizes differ."""
     rows = [
-        _e(1, px=200_000, qty=250_000_000, y=1_000_000, is_yes=1),   # win, $50 staked
+        _e(1, px=200_000, qty=250_000_000, y=1_000_000, is_yes=1),  # win, $50 staked
         _e(2, px=800_000, qty=62_000_000, y=0, is_yes=1, ts=2_000),  # loss, $49.60
     ]
     text = "\n".join(claude_worker.bin15_accrue.render(rows, fee_bps=0))
@@ -343,9 +377,13 @@ def _capture(root: pathlib.Path) -> pathlib.Path:
     events.append((_ANCHOR + 909 * _S, _YES, 13, seq2, _K + 100_000_000, expiry + 900 * _S))
     events.sort()
     ev = bytearray(
-        struct.pack("<4sHBxQ", claude_worker.pmlr.MAGIC, 3,
-                    claude_worker.pmlr.SLOT_KIND_CHANNEL_EVENT, _EPOCH)
-        .ljust(claude_worker.pmlr.HEADER_SIZE, b"\x00")
+        struct.pack(
+            "<4sHBxQ",
+            claude_worker.pmlr.MAGIC,
+            3,
+            claude_worker.pmlr.SLOT_KIND_CHANNEL_EVENT,
+            _EPOCH,
+        ).ljust(claude_worker.pmlr.HEADER_SIZE, b"\x00")
     )
     for ts, sym, channel, sq, v0, v1 in events:
         ev.extend(struct.pack("<QIBB2xQQqq16x", ts, sym, 4, channel, sq, 0, v0, v1))
@@ -372,10 +410,18 @@ def test_relabel_corrects_both_stores_in_place_and_a_rerun_converts_nothing(tmp_
         entries,
         [
             claude_worker.bin15_accrue.Entry(
-                ts_ns=old(_ANCHOR + 50 * _S), outcome=100, family=0,
-                start_ns=expiry - claude_worker.bin15_accrue.TAU_15M_NS, expiry_ns=expiry,
-                offset_s=25, is_yes=1, px_1e6=600_000, qty_1e6=10_000_000,
-                p_hat_1e6=700_000, y=0, origin=claude_worker.bin15_accrue.ORIGIN_PAPER,
+                ts_ns=old(_ANCHOR + 50 * _S),
+                outcome=100,
+                family=0,
+                start_ns=expiry - claude_worker.bin15_accrue.TAU_15M_NS,
+                expiry_ns=expiry,
+                offset_s=25,
+                is_yes=1,
+                px_1e6=600_000,
+                qty_1e6=10_000_000,
+                p_hat_1e6=700_000,
+                y=0,
+                origin=claude_worker.bin15_accrue.ORIGIN_PAPER,
             )
         ],
     )
@@ -385,9 +431,9 @@ def test_relabel_corrects_both_stores_in_place_and_a_rerun_converts_nothing(tmp_
     assert (cl.converted, cl.uncovered, ce.converted) == (2, 1, 1), lines
     rows = claude_worker.bin15_ledger.read_ledger(ledger)
     moved = [r for r in rows if r.venue]
-    assert [r.ts_ns for r in moved] == [
-        _venue(_ANCHOR + 100 * _S), _venue(_ANCHOR + 130 * _S)
-    ], "onto the venue clock: +25 s"
+    assert [r.ts_ns for r in moved] == [_venue(_ANCHOR + 100 * _S), _venue(_ANCHOR + 130 * _S)], (
+        "onto the venue clock: +25 s"
+    )
     assert all((r.y, r.y_engine, r.y_next_strike) == (1_000_000, 0, 1_000_000) for r in moved)
     assert next(r for r in rows if not r.venue).y == 1_000_000, "uncovered: kept, untouched"
     e = claude_worker.bin15_accrue.read_entries(entries)[0]
@@ -428,8 +474,16 @@ def test_relabel_refuses_to_replace_a_store_that_changed_under_it(tmp_path, monk
 
 def _row_l(ts: int, outcome: int, y: int):
     return claude_worker.bin15_ledger.Row(
-        ts_ns=ts, family=0, outcome=outcome, tau_ns=300_000_000_000,
-        p_hat_1e6=600_000, p_raw_1e6=600_000, arm=0, y=y, entered=1, mid_1e6=-1,
+        ts_ns=ts,
+        family=0,
+        outcome=outcome,
+        tau_ns=300_000_000_000,
+        p_hat_1e6=600_000,
+        p_raw_1e6=600_000,
+        arm=0,
+        y=y,
+        entered=1,
+        mid_1e6=-1,
     )
 
 
@@ -441,21 +495,46 @@ _VENUE: dict = {"runs": [{"epoch_ns": 1, "lanes": {}, "wall": "venue"}]}
 _LAW: dict = {"persist_polls": 3, "elapsed_max_ns": 240 * _S}
 
 
-def _ff(outcome: int, ts: int = 1_000, px: int = 600_000, y: int = 1_000_000,
-        is_yes: int = 1, entered: int = 0, law: tuple[int, int] = (3, 240 * _S),
-        ctl: tuple[int, int, int] | None = None, fired: bool = True):
+def _ff(
+    outcome: int,
+    ts: int = 1_000,
+    px: int = 600_000,
+    y: int = 1_000_000,
+    is_yes: int = 1,
+    entered: int = 0,
+    law: tuple[int, int] = (3, 240 * _S),
+    ctl: tuple[int, int, int] | None = None,
+    fired: bool = True,
+):
     """A first-fire row. ``ctl``: the control's ``(ts, px, is_yes)`` --
     ``None``, none recorded; ``fired=False``: the artifact's test never held."""
     expiry = ts + 800_000_000_000
     start = expiry - claude_worker.bin15_accrue.TAU_15M_NS
-    c = {} if ctl is None else {
-        "ctl_ts_ns": ctl[0], "ctl_offset_s": max(ctl[0] - start, 0) // 1_000_000_000,
-        "ctl_is_yes": ctl[2], "ctl_px_1e6": ctl[1],
-    }
+    c = (
+        {}
+        if ctl is None
+        else {
+            "ctl_ts_ns": ctl[0],
+            "ctl_offset_s": max(ctl[0] - start, 0) // 1_000_000_000,
+            "ctl_is_yes": ctl[2],
+            "ctl_px_1e6": ctl[1],
+        }
+    )
     f = claude_worker.bin15_accrue.FirstFire(
-        ts_ns=ts, outcome=outcome, family=0, start_ns=start, expiry_ns=expiry,
-        offset_s=(ts - start) // 1_000_000_000, is_yes=is_yes, px_1e6=px, y=y,
-        y_next_strike=y, entered=entered, persist_polls=law[0], elapsed_max_ns=law[1], **c,
+        ts_ns=ts,
+        outcome=outcome,
+        family=0,
+        start_ns=start,
+        expiry_ns=expiry,
+        offset_s=(ts - start) // 1_000_000_000,
+        is_yes=is_yes,
+        px_1e6=px,
+        y=y,
+        y_next_strike=y,
+        entered=entered,
+        persist_polls=law[0],
+        elapsed_max_ns=law[1],
+        **c,
     )
     return f if fired else f._replace(ts_ns=0, offset_s=0, is_yes=-1, px_1e6=0)
 
@@ -468,24 +547,60 @@ def test_first_fires_come_from_the_entry_columns_and_the_block() -> None:
     pre-S5b one rows without a control; one off the venue clock yields
     nothing and counts what it dropped."""
     entry = {
-        "ts_ns": 130 * _S, "outcome": 7, "family": 0, "start_ns": 0,
-        "expiry_ns": 900 * _S, "offset_s": 130, "is_yes": 1, "px_1e6": 650_000,
-        "qty_1e6": 76_000_000, "p_hat_1e6": 700_000, "origin": 1, "y": 1_000_000,
-        "y_next_strike": 1_000_000, "settle_px_1e6": 77_000_000_000,
-        "first_fire_ts_ns": 95 * _S, "first_fire_px_1e6": 640_000, "first_fire_is_yes": 1,
-        "ctl_fire_ts_ns": 60 * _S, "ctl_fire_px_1e6": 660_000, "ctl_fire_is_yes": 1,
+        "ts_ns": 130 * _S,
+        "outcome": 7,
+        "family": 0,
+        "start_ns": 0,
+        "expiry_ns": 900 * _S,
+        "offset_s": 130,
+        "is_yes": 1,
+        "px_1e6": 650_000,
+        "qty_1e6": 76_000_000,
+        "p_hat_1e6": 700_000,
+        "origin": 1,
+        "y": 1_000_000,
+        "y_next_strike": 1_000_000,
+        "settle_px_1e6": 77_000_000_000,
+        "first_fire_ts_ns": 95 * _S,
+        "first_fire_px_1e6": 640_000,
+        "first_fire_is_yes": 1,
+        "ctl_fire_ts_ns": 60 * _S,
+        "ctl_fire_px_1e6": 660_000,
+        "ctl_fire_is_yes": 1,
     }
     declined = {
-        "ts_ns": 40 * _S, "family": 1, "outcome": 9, "start_ns": 0, "expiry_ns": 900 * _S,
-        "offset_s": 40, "is_yes": 0, "px_1e6": 410_000, "ctl_ts_ns": 30 * _S,
-        "ctl_offset_s": 30, "ctl_is_yes": 0, "ctl_px_1e6": 430_000, "y": None,
-        "y_next_strike": -1, "settle_px_1e6": None,
+        "ts_ns": 40 * _S,
+        "family": 1,
+        "outcome": 9,
+        "start_ns": 0,
+        "expiry_ns": 900 * _S,
+        "offset_s": 40,
+        "is_yes": 0,
+        "px_1e6": 410_000,
+        "ctl_ts_ns": 30 * _S,
+        "ctl_offset_s": 30,
+        "ctl_is_yes": 0,
+        "ctl_px_1e6": 430_000,
+        "y": None,
+        "y_next_strike": -1,
+        "settle_px_1e6": None,
     }
     control_only = {
-        "ts_ns": None, "family": 2, "outcome": 10, "start_ns": 0, "expiry_ns": 900 * _S,
-        "offset_s": None, "is_yes": None, "px_1e6": None, "ctl_ts_ns": 70 * _S,
-        "ctl_offset_s": 70, "ctl_is_yes": 1, "ctl_px_1e6": 450_000, "y": 1_000_000,
-        "y_next_strike": 1_000_000, "settle_px_1e6": 77_000_000_000,
+        "ts_ns": None,
+        "family": 2,
+        "outcome": 10,
+        "start_ns": 0,
+        "expiry_ns": 900 * _S,
+        "offset_s": None,
+        "is_yes": None,
+        "px_1e6": None,
+        "ctl_ts_ns": 70 * _S,
+        "ctl_offset_s": 70,
+        "ctl_is_yes": 1,
+        "ctl_px_1e6": 450_000,
+        "y": 1_000_000,
+        "y_next_strike": 1_000_000,
+        "settle_px_1e6": 77_000_000_000,
     }
     blocks = {
         "bin15_entries": [entry],
@@ -510,8 +625,13 @@ def test_first_fires_come_from_the_entry_columns_and_the_block() -> None:
     assert fires[0].won and not fires[1].settled
     assert fires[2].ctl_fired and not fires[2].fired and fires[2].control().won
     lost = dict(
-        entry, first_fire_ts_ns=None, first_fire_px_1e6=None, first_fire_is_yes=None,
-        ctl_fire_ts_ns=None, ctl_fire_px_1e6=None, ctl_fire_is_yes=None,
+        entry,
+        first_fire_ts_ns=None,
+        first_fire_px_1e6=None,
+        first_fire_is_yes=None,
+        ctl_fire_ts_ns=None,
+        ctl_fire_px_1e6=None,
+        ctl_fire_is_yes=None,
     )
     assert claude_worker.bin15_accrue.first_fires_from_sidecar(
         json.dumps({"stale": _VENUE, "bin15_entries": [lost]})
@@ -559,9 +679,7 @@ def test_the_first_fire_store_keeps_the_earliest_fire_and_never_mixes_two_laws(
     a = _ff(30, ts=40 * _S, ctl=(35 * _S, 610_000, 1))
     b = _ff(30, ts=30 * _S, ctl=(50 * _S, 620_000, 0))
     (m2,), _ = claude_worker.bin15_accrue.merge_first_fires([a], [b])
-    assert (m2.ts_ns, m2.ctl_ts_ns, m2.ctl_px_1e6, m2.ctl_is_yes) == (
-        30 * _S, 35 * _S, 610_000, 1
-    )
+    assert (m2.ts_ns, m2.ctl_ts_ns, m2.ctl_px_1e6, m2.ctl_is_yes) == (30 * _S, 35 * _S, 610_000, 1)
     only_ctl = _ff(31, ts=30 * _S, fired=False, ctl=(20 * _S, 600_000, 1))
     (m3,), _ = claude_worker.bin15_accrue.merge_first_fires([only_ctl], [_ff(31, ts=45 * _S)])
     assert (m3.ts_ns, m3.ctl_ts_ns) == (45 * _S, 20 * _S)
@@ -696,8 +814,10 @@ def test_relabel_fills_an_unknown_first_fire_label_and_nothing_else(tmp_path) ->
     lines: list[str] = []
     dirs = claude_worker.bin15_accrue.tape_dirs([str(pull)], [])
     claude_worker.bin15_accrue.relabel(ledger, entries, dirs, lines.append, first_fires=fires)
-    got = {f.outcome: (f.y, f.y_next_strike) for f in
-           claude_worker.bin15_accrue.read_first_fires(fires)}
+    got = {
+        f.outcome: (f.y, f.y_next_strike)
+        for f in claude_worker.bin15_accrue.read_first_fires(fires)
+    }
     assert got == {100: (1_000_000, 1_000_000), 7: (0, 0)}, lines
     assert any("first fires: rows 2: unknown labels filled 1" in line for line in lines), lines
     assert len(list(tmp_path.glob("first_fires.tsv.bak-relabel-*"))) == 1

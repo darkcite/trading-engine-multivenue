@@ -419,6 +419,15 @@ Operational laws:
   dependency since this lane; a plain `uv sync` drops the optional
   `kronos` group, so forecaster hosts re-run `uv sync --group kronos`.
 
+## Binance execution (BX)
+
+The Binance arm's keys, its Demo tools (`scripts/exec-smoke.sh
+--binance-probe`, `--binance … --lifecycle`, `--bn-drill gap`), the
+account tools (`--binance-setup`, `--binance-flatten`), the fee
+measurement (`multivenue-engine bn-fees`), its halts and its arming
+preconditions: `docs/binance-runbook.md`. No Binance slot arms a member
+before BX13 (O-BX6).
+
 ## Troubleshooting
 
 - **Build fails with "unknown target-feature"**: the Apple Silicon target

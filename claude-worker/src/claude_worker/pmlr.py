@@ -16,7 +16,9 @@ a clock: ``ts_ns`` stays the ordering key.
 
 The file is mapped read-only (``mmap.ACCESS_READ``) and decoded in place
 with ``struct.unpack_from`` straight off the map — no per-record byte-slice
-copies; the only objects built are the returned record tuples.
+copies; the only objects built are the returned record tuples. A bulk scan
+of a ChannelEvent file maps it as one numpy array instead
+([`channel_event_array`], HK7).
 
 Deliberate divergence from the Rust reader (``core-io::PmlrReader``), per
 design §11: the Rust offline auditor REJECTS a payload that is not a
@@ -35,6 +37,8 @@ import mmap
 import pathlib
 import struct
 import typing
+
+import numpy
 
 MAGIC: bytes = b"PMLR"
 HEADER_SIZE: int = 64
@@ -114,6 +118,14 @@ FILL_ORIGIN_VENUE: int = 0
 FILL_ORIGIN_PAPER: int = 1
 #: ``FillRec.strategy_id``: the fill carries no member attribution.
 STRATEGY_ID_NONE: int = 0xFF
+#: ``FillRec.flags`` bit (byte 15; ``core_types::FILL_FLAG_SETTLEMENT``): a
+#: settlement — a binary's payout, an option's exercise — that the venue
+#: placed, not an order of ours. It ends a position; it is never a trade.
+FILL_FLAG_SETTLEMENT: int = 1 << 0
+#: ``FillRec.flags`` bit (``core_types::FILL_FLAG_ADOPTED``, BX7): the
+#: venue's position ADOPTED at boot as the slot's starting inventory — no
+#: trade happened; it opens the position, at the read's price.
+FILL_FLAG_ADOPTED: int = 1 << 1
 
 
 class FillRec(typing.NamedTuple):
@@ -125,6 +137,11 @@ class FillRec(typing.NamedTuple):
     ``(STRATEGY_ID_NONE, FILL_ORIGIN_VENUE)`` there — wire-additive, and
     the reader-compat surface is zero because paper mode never
     persisted a fill at all.
+
+    BX13 (the BX7 arming precondition): ``flags`` at offset 15
+    (:data:`FILL_FLAG_SETTLEMENT`, :data:`FILL_FLAG_ADOPTED`) was zeroed
+    padding the same way — every older capture reads as an ordinary
+    trade. :attr:`is_trade` is what every fold counts as one.
     """
 
     ts_ns: int
@@ -132,9 +149,15 @@ class FillRec(typing.NamedTuple):
     side: int
     strategy_id: int
     origin: int
+    flags: int
     px: int
     qty: int
     order_id: int
+
+    @property
+    def is_trade(self) -> bool:
+        """A trade: neither adopted inventory nor a settlement."""
+        return self.flags & (FILL_FLAG_SETTLEMENT | FILL_FLAG_ADOPTED) == 0
 
 
 class AiCmdRec(typing.NamedTuple):
@@ -177,7 +200,9 @@ _HEADER: struct.Struct = struct.Struct("<4sHBxQ")
 # ts u64 · sym u32 · venue_seq u32 · 4×i64 · venue u8 · flags u8 (VT1) ·
 # pad 6 · venue_time_ms u64 (VT1) — the whole 64-B slot is field-covered.
 _TICK: struct.Struct = struct.Struct("<QIIqqqqBB6xQ")
-_FILL: struct.Struct = struct.Struct("<QIBBBxqqQ")
+# ts u64 · sym u32 · side u8 · strategy_id u8 (X1) · origin u8 (X1) ·
+# flags u8 (BX13) · px i64 · qty i64 · order_id u64.
+_FILL: struct.Struct = struct.Struct("<QIBBBBqqQ")
 _AI_CMD: struct.Struct = struct.Struct("<QIIqqQBBBBHH")
 # VM2 V6: kind-3 Order (engine-orders.pmlr, M4.1) — ts u64 · sym u32 ·
 # side u8 · kind u8 · pad2 · px i64 · qty i64 · client_oid u64 ·
@@ -360,6 +385,32 @@ CHANNEL_OUTCOME_META: int = 7
 CHANNEL_INSTRUMENT_ROLL: int = 13
 #: ``ChannelEventRec.channel``: mark price.
 CHANNEL_MARK: int = 2
+
+#: HK7: the ChannelEvent slot as a numpy dtype (``_CHANNEL_EVENT``, field
+#: for field: ``vt`` = ``venue_time_ms``, ``seq`` = ``venue_seq``), so a
+#: multi-hour events file is scanned as one memory map, not 64-byte records
+#: decoded one by one. ``bin15_tape.EV_DT`` is the same layout.
+CHANNEL_EVENT_DT: numpy.dtype = numpy.dtype(
+    [
+        ("ts", "<u8"), ("sym", "<u4"), ("venue", "u1"), ("channel", "u1"), ("pad", "V2"),
+        ("seq", "<u8"), ("vt", "<u8"), ("v0", "<i8"), ("v1", "<i8"), ("pad2", "V16"),
+    ]
+)
+assert CHANNEL_EVENT_DT.itemsize == SLOT_SIZE
+
+
+def channel_event_array(path: pathlib.Path) -> numpy.ndarray:
+    """HK7: the file's whole ChannelEvent slots as a read-only memory map
+    (``CHANNEL_EVENT_DT``), after the house reader has checked the header —
+    a trailing partial slot (the engine mid-flush) is left out, as
+    [`Reader.torn`] says. Raises [`PmlrError`] for any other slot kind."""
+    with Reader(path) as reader:
+        if reader.slot_kind != SLOT_KIND_CHANNEL_EVENT:
+            raise PmlrError(f"{path}: slot kind {reader.slot_kind}, not a ChannelEvent file")
+        n = len(reader)
+    if n == 0:
+        return numpy.zeros(0, dtype=CHANNEL_EVENT_DT)
+    return numpy.memmap(path, dtype=CHANNEL_EVENT_DT, mode="r", offset=HEADER_SIZE, shape=(n,))
 
 
 # ---------------------------------------------------------------------------
