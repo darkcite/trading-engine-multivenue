@@ -389,7 +389,7 @@ CHANNEL_MARK: int = 2
 #: HK7: the ChannelEvent slot as a numpy dtype (``_CHANNEL_EVENT``, field
 #: for field: ``vt`` = ``venue_time_ms``, ``seq`` = ``venue_seq``), so a
 #: multi-hour events file is scanned as one memory map, not 64-byte records
-#: decoded one by one. ``bin15_tape.EV_DT`` is this dtype (HK17).
+#: decoded one by one. ``bin15_tape.EV_DT`` is this dtype (HK16).
 CHANNEL_EVENT_DT: numpy.dtype = numpy.dtype(
     [
         ("ts", "<u8"), ("sym", "<u4"), ("venue", "u1"), ("channel", "u1"), ("pad", "V2"),

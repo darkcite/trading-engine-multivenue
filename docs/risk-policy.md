@@ -15700,3 +15700,194 @@ reference legs, and orders on them stay unroutable (the O-HC17 shape).
   - `make bench-check` 14 OK;
   - worker pytest 1 722 passed, 3 skipped;
   - `make py-lint` all checks passed.
+
+## HK, part 2 — Section B and the 2026-10-14 findings
+
+The operator's ask of 2026-10-14 ("do these"), one `HK:` commit per cut on
+`main` (HK-R5: nothing pushed). Rulings HK-R5..R10 and the plan: project doc
+`claude/hk-sectionb-plan-2026-10-14.md`; the plan numbers the cuts one higher
+(its HK12, the features key, landed in HK11, so its HK13–HK18 are HK12–HK17
+here). The session also runs the deploy this time (HK-R8): the release build
+and SIGTERM restart HK1–HK10's got at 04:21Z. **Nothing here arms a slot
+or changes a cap or a halt.** HK13 changes what the outcome binder does on a
+repeated roll (both arms; nothing armed today).
+
+### HK11 — the S3 archiver: a measured upload cap (`claude-worker` objstore, archive)
+
+- **The finding.** The first `candles.db` push (4.4 GB, uncompressed,
+  uncapped) filled this Mac's uplink, and the feeds' ACKs queued behind it.
+  Deribit's `feed_delay_ema_ms` reached its 65 535 ms ceiling, MEXC 52 s and
+  Hypercall 11 s. Binance's stale ticks went from 38 k to 1.14 M. Delays
+  were back to 30–100 ms within a minute of each push ending.
+  - `taskpolicy -b` did not throttle the push: ~3.3 MB/s by `nettop`, where
+    `archive-cycle.sh` recorded ~0.3 MiB/s in September.
+- **The measurement** (HK-R6). The run closed at 08:33Z was pushed at three
+  caps, 300 s each, with every venue's delay EMA sampled every 15 s:
+
+  | phase | samples | > 500 ms | worst |
+  |---|---|---|---|
+  | no upload | 12 | 0 | 186 ms (Bybit) |
+  | 0.5 MiB/s | 22 | 9 | two all-venue spikes (~1.1–1.3 s), not network-bound at this rate |
+  | 1 MiB/s | 20 | 1 | 748 ms (Hypercall, one sample) |
+  | 2 MiB/s | 20 | 6 | 2 842 ms (Deribit) and two all-venue spikes |
+
+  1 MiB/s is the default: its medians stayed in the no-upload band.
+- **What changed.**
+  - `objstore.RateLimiter`: a token bucket over every upload byte. File
+    streams go in 64 KiB pieces (`PACE_CHUNK`, burst 256 KiB); in-memory
+    bodies (manifests, the Complete XML) take one piece. Retries pass it
+    too. `MULTIVENUE_S3_MAX_UPLOAD_MIBPS` (default 1; 0 = uncapped).
+    Downloads are not capped.
+  - `archive.main` traps SIGTERM: SystemExit(143), one-shot, so
+    `multipart_put`'s abort runs (a killed push left an incomplete upload
+    this morning). The previous handler is restored.
+  - A `BudgetSpent` inside a multipart exits 5 (resumable), not 1.
+  - `push-derived` keys by the path under the store's root. Features repeat
+    basenames across run dirs (1 694 files), so the basename key let one
+    run's file stand for another's. The candles snapshot is zstd'd
+    (4.40 GB → 816 MiB), and neither it nor the staged `.zst` outlives the
+    push, on any exit (a budget spent before the upload included).
+  - `archive-cycle.sh`'s budget fallback 600 → 3600 s, and
+    `local-setup.md` likewise: a day's capture (~2.2 GB stored) takes
+    ~35 min at the cap. The live `retention.conf` already says 3600.
+- **Not closed:** a SIGTERM during the initiate POST still orphans an upload
+  (its id is not known yet). The backstop is the bucket's
+  `AbortIncompleteMultipartUpload` rule, the operator's item.
+- **The bucket, 2026-10-14:** the three incomplete uploads aborted (this
+  morning's and the two of 2026-09-05); 304 runs complete;
+  `candles-20261014.db.zst` pushed; the features (1 694 files) pushing under
+  their run paths at the lane's close.
+- **Review:** one pass, NEEDS CHANGES, all acted on: the nightly budget,
+  the staged candles leak on failure, the body-pacing comment, a clock seam
+  for the limiter's tests, the handler assertions, the one-shot handler.
+- **Gates:** worker pytest (the archiver's, the config's, the store's,
+  candles, pmlr) 237 passed; ruff clean.
+
+### HK12 — retention's window, the session model, `_wtest`
+
+- `retention.sh` protects a run whose floored age is `< PROTECT_DAYS`
+  (was `<=`). With `PROTECT_DAYS=1` it kept every run under 48 h, not the
+  24 h `retention.conf.example` states. Deletion is still gated on S3
+  `verify` (S-LAW 3).
+- `.claude/settings.json`: `claude-opus-4-6` → `claude-opus-5-5` (O-8).
+- `_wtest`: an empty write-test file committed by a sandbox on 2026-08-14.
+
+### HK13 — A-S7-81: the shared binder leaves a repeat of the live roll alone (`exec-hyperliquid`)
+
+- **Ruling:** HK-R10 (2026-10-14), Q5 of the XH4i plan.
+- **The bug.** A roll naming the ids both legs are already bound to rebound
+  them in place: the legs' ledgers zeroed (a drift the reconciler halts
+  on) and the retired generation overwritten (a settlement of the old
+  instance then named no leg). The gateway arm guarded itself (A-S7-83);
+  the blocking arm did not.
+- **The fix.** `AssetTable::repeats_live_roll` (moved from `arm.rs`; one
+  copy). `bind_roll` asks it before rendering a name and returns
+  `Some([None, None])` with the table untouched. Both arms bind through it.
+  - The gateway arm keeps asking first, to count `rolls_repeated`.
+  - The blocking arm still counts a repeat as `rolls_bound`
+    (`engine_exec_hl_rolls_bound_total`). Nothing gates or halts on it.
+  - LAW E-8 is unchanged: a repeat retired nothing before and retires
+    nothing now.
+- **Limits:** one leg matching is still a full rebind (rolls bind pairs, so
+  it is unreachable); a stale replay of an OLDER roll is still a genuine
+  roll (ingress never re-announces a family that holds an instance).
+- **Discharged:** A-S7-81 as a precondition of XH4i-5, the C7 flip and any
+  live re-arm of BIN15. The XH4i-3b-2b note "the blocking arm keeps the bug
+  until he rules" is superseded.
+- **Tests:** `a_repeated_roll_keeps_the_ledgers_and_the_retired_generation`
+  (the binder); the blocking arm's
+  `a_repeated_roll_never_queues_a_sweep_of_the_live_leg` now pins the
+  ledger and the counter.
+- **Reviews:** risk APPROVE WITH NITS; alloc/zero-copy APPROVE WITH NITS
+  (the check moved above the name rendering, `#[must_use]`, the docs). No
+  allocation, no copy, nothing per tick.
+
+### HK14 — A-S7-101: the counting allocator does not count libtest's runner (`core-alloc`, `.config/nextest.toml`)
+
+- **Root cause.** `CountingAllocator` counts process-wide. libtest runs each
+  test on a thread it spawns (under nextest too), and right after the spawn
+  its MAIN thread allocates six times: the `running_tests` insert (140 B),
+  the timeout queue (608 B), its `Thread` handle (56 B), the mpmc
+  `Context` (48 B), the waker's mutex (64 B) and selectors (96 B) =
+  1 012 B. Under load the test thread opened its window first. Proved with a
+  probe allocator's backtraces (9 red in 7 200, every allocation on the main
+  thread). A-S7-14 (5 / 872 B) and A-S7-40 were tails of the same sequence.
+- **The fix.** The main thread is not counted on Apple (`pthread_main_np`)
+  and Linux (`gettid == getpid`), cached in a `const`, drop-free
+  thread-local; elsewhere no thread-local is read and every thread counts
+  (it can flake red, never pass wrongly). On Apple and Linux,
+  `AllocGuard::new` panics on the main thread. Every other thread counts as before, including the threads
+  the code under test spawns. No threshold moved.
+- `core-alloc` is linked only into `bench`'s `alloc_assertions`.
+- The six alloc tests leave nextest's `load-sensitive` group; the scrape
+  hammer stays.
+- **Evidence:** under 24 CPU hogs, 8 red in 14 400 before and 0 in 14 400
+  after; nextest `--stress-count` 0 red in 6 000. Break-and-watch: one
+  `Vec::with_capacity(8)` inside the window fails the gate.
+- **Reviews:** risk and alloc APPROVE WITH NITS (the cfg on the non-native
+  path, the cold classification, the doc example).
+
+### HK15 — A-S7-100's second half: the outcome battery on loopback (`cli` tests)
+
+- `outcome_battery_loopback.rs` drives `cli::outcome_battery::run` against
+  `exec_hyperliquid::testvenue` on 127.0.0.1 (real rustls), the way
+  `xmm_battery_loopback` drives the perps battery. The scripted venue lists
+  outcome 21406 (`#214060` / `#214061`) with fixed books; rests, refuses,
+  fills, modifies and cancels as the venue does; and pushes every reply to
+  the gateway and the battery's tap.
+- **The happy path:** the account, the boot (`rolls_bound` 1), the verbs on
+  YES, the NO leg, the IoCs and their reconciliations, the sweep, the end
+  read clear; exit 0 and the bar met. The happy path also asserts nothing
+  unserved was posted (no `updateLeverage` from an outcome arm).
+- **A failure path:** an account holding a YES leg at the start ends with
+  exit 40 and sends no order.
+- **Not on loopback:** a non-empty first snapshot (A-S7-96, exit 41), the
+  dead man's refusal below $1M traded, the signal stop, sales that do not
+  fill first time, the leftover exit 48.
+- Green 2/2; `--stress-count 10` 20/20; clippy clean.
+
+### HK16 — H90's leftovers (`crates/bench`, `claude-worker`)
+
+- `bin15/late_fair_in_window` (340 ns) and `bin15/late_grid_mark_and_perp_1s`
+  (1.6 ns) baselined: the median of five runs with bench-check's settings,
+  engine running (load 9.6), 335.2–342.9 ns and 1.597–1.621 ns. HK9's
+  1.6–2.3 ns spread did not recur. `make bench-check`: 16 OK (load 11.3).
+- `bin15_tape.EV_DT` is `pmlr.CHANNEL_EVENT_DT`; its private copy of the
+  events reader is gone for `pmlr.channel_event_array`.
+
+### HK17 — the docs, the operator files, and the lane's close
+
+- **Operator files (no commit):**
+  - `~/multivenue/strategy.conf` exports `BYBIT_REST_HOST=api.bytick.com`
+    (backup `strategy.conf.bak-20261014T102233Z-hk`): boot discovery looped
+    on `api.bybit.com` from this Mac.
+  - The ten empty run dirs of 2026-10-12 (nine at 00:11–00:23Z, one at
+    20:15Z) removed with `rmdir`.
+  - The finished lanes' 108 `tools_*` one-shots moved to `docs/research/<lane>/tools/`
+    (HK-R7; list in `docs/research/tools-moved-2026-10-14.txt`); 86 stay
+    (BIN15, XMM, `pmlr_symfilter`, `all_trades_csv`).
+- **Watched: Polymarket's parse errors.** After the 08:33Z restart, 58 in
+  32 min with 0 reconnects: a steady ~0.1 % of messages, not a FIN path.
+  What they are needs `--raw-tap pm` (rejects only), which the wrapper does
+  not pass today.
+- **The lane's commits:**
+
+  | cut | commit |
+  |---|---|
+  | HK11 | `1edacf4` |
+  | HK12 | `38ad1fd` |
+  | HK13 | `b8b4f1c` |
+  | HK14 | `9c390fa` |
+  | HK15 | `c24557d` |
+  | HK16 | `c24f7c1` |
+  | HK17 | this commit |
+
+  - Nothing pushed (HK-R5). The deploy follows this commit (HK-R8).
+- **Final gates (`c24f7c1`):**
+  - clippy clean;
+  - nextest 4 652 passed, 10 skipped (one nextest `LEAK`, a pass);
+  - alloc 127/127;
+  - copy-audit 27 / new 0;
+  - license-check OK (689 files);
+  - `make bench-check` 16 OK;
+  - worker pytest (HK11's suites) 237 passed; ruff clean on every touched file.

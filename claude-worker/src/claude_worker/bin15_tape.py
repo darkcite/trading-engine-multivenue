@@ -41,7 +41,7 @@ import claude_worker.hip4
 import claude_worker.pmlr
 import claude_worker.window_root
 
-#: ``ChannelEvent`` as a numpy dtype: the house one (HK17 -- one layout, kept
+#: ``ChannelEvent`` as a numpy dtype: the house one (HK16 -- one layout, kept
 #: where the reader is; this name stays for the lane's scripts).
 EV_DT: numpy.dtype = claude_worker.pmlr.CHANNEL_EVENT_DT
 

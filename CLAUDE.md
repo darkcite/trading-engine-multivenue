@@ -62,7 +62,7 @@ in the script; `ai` = 48 is the floor every name includes).
 - Working notes for a lane: a dated log in the vault (`docs/research/…`) —
   never in git, never in this file.
 
-## CURRENT STATE (2026-10-13)
+## CURRENT STATE (2026-10-14)
 
 Each lane's merge and go-live paragraphs, as this section carried them until
 2026-10-13, are in `docs/arch/claude-md-state-log-2026-10-13.md`, verbatim.
@@ -78,9 +78,11 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   - Beside it: `caffeinate`, hourly `candles`, 5-min `regime`, nightly
     `retention` (PROTECT_DAYS 1, every delete gated on S3 `verify`),
     `archive` (04:30 local) and the read-only `dashboard`.
-  - It runs the release build of `cf3ac1f` (built 2026-10-14 04:19Z, booted
-    04:21Z) with the mask `strategy.conf` names
-    (`ai+vrp+xsd+bin15+hyparb+xmm+hcv`). `/state` `exec.configured` is 0 (no
+  - It runs the release build of the HK lane's close (HK17, built and booted
+    2026-10-14; `/state` `boot.git_sha` names the commit) with the mask
+    `strategy.conf` names (`ai+vrp+xsd+bin15+hyparb+xmm+hcv`).
+    `strategy.conf` also exports `BYBIT_REST_HOST=api.bytick.com`
+    (HK17). `/state` `exec.configured` is 0 (no
     route table): nothing is armed.
   - After ANY restart, verify `vm_rows_active ≥ 1` on `/state`.
   - The worker runs from the working tree, so a worker edit is live at its
@@ -140,7 +142,11 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   - Nothing is armed on mainnet: no `HYPERLIQUID_XMM_*` keys exist.
   - XH4i-8, the outcome battery (`exec-smoke --hl-outcome --lifecycle
     --outcome <id>`, exit codes 40–48; testnet only, nothing armed), merged
-    from `xmm` on 2026-10-14 (the operator's word; risk-policy "XH4i-8").
+    from `xmm` on 2026-10-14 (the operator's word; risk-policy "XH4i-8"); its
+    loopback `run()` test is HK15.
+  - A-S7-81 (Q5) is fixed in the shared binder (HK13): a repeat of the live
+    roll leaves the legs alone on both arms. Left before BIN15 rides the
+    gateway live: the operator's `bin15-flip.sh live --gateway`.
 - **Slot 7 (hcv) and Hypercall, the eighth venue** (live since the
   2026-09-26 go-live; risk-policy "HYPERCALL — slot 7", "HYPERCALL — the
   order arm").
@@ -193,52 +199,49 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   it is published as `/state.har`. The worker's `har_backfill` / `har_seed`
   ride `candles-cycle.sh`. Since HK7a the Hypercall index lands in
   candles.db as 1 m capture bars, a candidate primary per `har_seed compare`.
-- **The HK housekeeping lane (2026-10-13; risk-policy "HK").** HK1–HK10 closed
-  Section A of the 2026-10-13 survey.
-- **Gates at HEAD (the XH4i-8 merge, 2026-10-14; the HK lane's close the day
-  before):**
+- **The HK housekeeping lane (risk-policy "HK", "HK, part 2").** HK1–HK10
+  (2026-10-13) closed Section A of that day's survey; HK11–HK17 (2026-10-14)
+  Section B and the day's findings.
+- **The S3 archive (HK11).** Uploads are capped at 1 MiB/s
+  (`MULTIVENUE_S3_MAX_UPLOAD_MIBPS`): uncapped, a push filled the uplink and
+  the feeds' delay EMAs went to seconds. The nightly budget is 3600 s; a
+  SIGTERM aborts the upload in flight. `push-derived` keys keep their path
+  under the store's root, and candles go up zstd'd.
+- **Gates at HEAD (the HK lane's close, 2026-10-14):**
   - clippy clean.
-  - nextest 4 648 run (10 skipped: the five `#[ignore]`d live smokes,
-    four alloc child helpers and a fixture regenerator): 4 647 passed, and
-    the load-sensitive `ws_frame_roundtrip_is_zero_alloc` was red once in
-    the full run (6 allocations, 1 012 B, debug) and green alone three
-    times and in the alloc gate — open (A-S7-101). The seven
-    load-sensitive tests run one at a time (`.config/nextest.toml`, HK8c).
-    nextest runs no doctests: core-ring's `Mailbox` `compile_fail` doctest
-    needs `cargo test --doc -p core-ring`.
+  - nextest 4 652 passed (10 skipped: the five `#[ignore]`d live smokes,
+    four alloc child helpers and a fixture regenerator; one nextest `LEAK`
+    is a pass). Only the scrape hammer runs alone (`.config/nextest.toml`):
+    the alloc tests' reds under load were libtest's runner thread, no longer
+    counted (A-S7-101, HK14). nextest runs no doctests: core-ring's
+    `Mailbox` `compile_fail` doctest needs `cargo test --doc -p core-ring`.
   - alloc 127/127 at the gates' pins (0 B/op, +4 ignored child helpers).
     `--test-threads=1` and a fresh `Compiling bench` are required.
   - `make copy-audit`: 27 baselined, new 0 (self-test OK).
   - `make license-check` OK.
-  - `make bench-check` OK: 14 samples within 15 % on the M4 (HK9); a
+  - `make bench-check` OK: 16 samples within 15 % on the M4 (HK9, HK16); a
     missing or stale result fails.
   - worker pytest 1 722 passed, 3 skipped (the three need the release
-    binary on PATH) — at HK10; the merge touches no Python.
+    binary on PATH) at HK10; HK11's suites (archive, config, store, candles,
+    pmlr) 237 passed.
   - `make py-lint` all checks passed (HK8a). `make lint` means clippy.
   - fuzz: each HK cut's touched targets 60 s, clean (risk-policy "HK1",
     "HK2", "HK4"). The longer runs are in each lane's record.
-  - A red is a red: the old flake list was root-caused (HK4, HK8b) or runs
-    one at a time (HK8c).
+  - A red is a red: the old flake list was root-caused (HK4, HK8b, HK14) or
+    runs one at a time (HK8c).
 - **Open operator items (non-gating):**
-  - **Release build + restart:** brings HK1, HK2, HK6 and HK7b live. Before
-    it, check the committed ruleset for `binance-opt:` order legs
-    (migration.md "HK7b").
-  - **Disk:** the Data volume was at 98 % (12 GiB free) on 2026-10-13.
-    Writers do not retry after ENOSPC; a restart is the recovery.
-  - **`--repair-future`, once:** `python -m claude_worker.candles
-    --repair-future` purges the MEXC TradFi series' future-stamped rows
-    (migration.md "HK7").
-  - **Bybit's REST edge** is intermittent from this Mac. A restart may loop
-    on boot discovery; the remedy is `export BYBIT_REST_HOST=api.bytick.com`
-    in `strategy.conf`.
+  - **Disk:** 26 GiB free on 2026-10-14 after the worktree cleanup. Writers
+    do not retry after ENOSPC; a restart is the recovery.
   - **S3:** bucket versioning and `AbortIncompleteMultipartUpload` are not
-    set. The `s3.env` credential pair was once pasted in chat: rotate it.
+    set; once set, that lifecycle rule is the only backstop for an upload
+    orphaned by a SIGTERM during its initiate POST (HK11). The `s3.env`
+    credential pair was once pasted in chat: rotate it.
+  - **Polymarket parse errors** trickle at ~0.1 % of messages with no
+    reconnects (58 in 32 min after a restart). Naming them needs
+    `--raw-tap pm`, which the wrapper does not pass.
   - **Memory:** a whole-root `audit-pnl` / `backtest` OOMs above ~27 GB; use
     bounded ≤ 2 h window roots.
   - **Regime:** `regime.toml [labels] require = 1` is NOT flipped live.
-  - **Session model:** `.claude/settings.json` still names
-    `claude-opus-4-6`. The review agents are pinned to `claude-opus-5-5`
-    (O-8).
 - **Reminder: upgrade to rustls 0.24 once 0.24.0 is released** (operator,
   2026-09-26: the only rustls work needed). 0.24 decrypts records in place,
   which fixes gate 72's copy and allocation. Pinned 0.23.38; as of

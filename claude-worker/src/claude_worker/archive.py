@@ -856,7 +856,7 @@ class Archiver:
         Derived data is reproducible in principle and precious in practice —
         it is what the gates were computed against. Same index-last law.
         ``name`` is the key under the kind's prefix — the path relative to
-        the store's root (HK12: features repeat basenames across runs, so a
+        the store's root (HK11: features repeat basenames across runs, so a
         basename key let one run's file stand for another's).
         """
         started = self._clock()
@@ -1140,10 +1140,10 @@ def _dispatch(  # one branch per verb, deliberately flat
     if args.verb == "push-derived":
         budget = _budget(args.budget_s)
         for path, name in _derived_paths(args.kind, args.path, cfg.zstd_level):
-            if budget is not None and budget.spent():
-                print("archive: budget spent between files", file=sys.stderr)
-                return EXIT_BUDGET
             try:
+                if budget is not None and budget.spent():
+                    print("archive: budget spent between files", file=sys.stderr)
+                    return EXIT_BUDGET
                 print(archiver.push_derived(args.kind, path, name).tell(), file=sys.stderr)
             finally:
                 if args.kind == "candles" and not args.path:
@@ -1157,7 +1157,7 @@ def _dispatch(  # one branch per verb, deliberately flat
 def _derived_paths(
     kind: str, explicit: str, zstd_level: int, home: pathlib.Path | None = None
 ) -> list[tuple[pathlib.Path, str]]:
-    """(file, key name) pairs; the name is relative to the kind's root (HK12)."""
+    """(file, key name) pairs; the name is relative to the kind's root (HK11)."""
     if explicit:
         path = pathlib.Path(explicit).expanduser()
         return [(path, path.name)]

@@ -85,7 +85,7 @@ for d in ${(f)candidates}; do
   case "$epoch_ns" in (*[!0-9]*|'') continue ;; esac
   age_days=$(( (now_s - epoch_ns / 1000000000) / 86400 ))
   # Whole days, floored: `-lt` protects exactly what the window says — a run
-  # younger than PROTECT_DAYS. `-le` (until HK13) protected a whole extra day:
+  # younger than PROTECT_DAYS. `-le` (until HK12) protected a whole extra day:
   # PROTECT_DAYS=1 kept every run under 48 h, not 24 h.
   if [ "$age_days" -lt "$PROTECT_DAYS" ]; then
     echo "retention: $name is ${age_days}d old (< protect ${PROTECT_DAYS}d) — stopping" >&2

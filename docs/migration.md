@@ -6,6 +6,68 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-14 — The outcome binder leaves a repeat of the live roll alone, on both arms (HK13, A-S7-81)
+
+**What changed**
+- `AssetTable::bind_roll` returns `Some([None, None])` and changes nothing
+  when both legs are already bound to the ids the roll names. Before, it
+  rebound them in place: the legs' ledgers zeroed and the retired generation
+  overwritten. The gateway arm already skipped a repeat (A-S7-83); the
+  blocking arm (`HlExchange`) did not.
+
+**Impact**
+- Metrics: the blocking arm still counts a repeat in
+  `engine_exec_hl_rolls_bound_total`; the gateway arm counts it in
+  `rolls_repeated` (`engine_exec_hlgw_outcome_rolls_repeated_total`), as
+  before.
+- No armed slot today; on a live slot 3 a replayed roll no longer reads as a
+  ledger drift.
+
+**Migration steps**
+1. None: the routine restart of a binary built from this change.
+
+## 2026-10-14 — retention protects exactly `PROTECT_DAYS` (HK12)
+
+**What changed**
+- `scripts/retention.sh` keeps a run whose floored age in days is
+  `< PROTECT_DAYS` (was `<=`).
+
+**Impact**
+- With `PROTECT_DAYS=1`, runs aged 24–48 h become eligible at the 00:10Z
+  slot. Each delete is still gated on S3 `verify` exiting 0.
+
+**Migration steps**
+1. None. To keep 48 h, set `PROTECT_DAYS=2` in `~/multivenue/retention.conf`.
+
+## 2026-10-14 — S3 archiver: a 1 MiB/s upload cap; SIGTERM aborts the upload in flight; derived keys keep their path (HK11)
+
+**What changed**
+- New knob `MULTIVENUE_S3_MAX_UPLOAD_MIBPS` (env or `s3.env`; default 1,
+  0 = uncapped): every upload byte is paced by a token bucket.
+- SIGTERM to an archiver run exits 143 after aborting a multipart upload in
+  flight. A budget spent inside a multipart exits 5 (resumable), not 1.
+- `push-derived` keys are the path under the store's root:
+  `<prefix>/derived/<host>/features/<path under features/>` (e.g.
+  `v1/…/features/<run>/<file>`, `…/features/news/<file>`), no longer
+  `…/features/<basename>`. The candles snapshot is stored as
+  `candles-YYYYMMDD.db.zst` (zstd), not `.db`.
+- `scripts/archive-cycle.sh` defaults `S3_CYCLE_BUDGET_S` to 3600 (was 600).
+
+**Impact**
+- A day's capture (~2.2 GB stored) takes ~35 min at the cap; a 600 s budget
+  would leave a growing backlog. The live `retention.conf` says 3600.
+- Feed delays stay in their no-upload band during the nightly push (measured
+  2026-10-14, risk-policy "HK11").
+- Bucket: `…/features/<file>` objects from before this change do not exist
+  (the verb was never run); `candles-20261014.db.zst` is the first candles
+  object written this way (an uncompressed `.db` push of the same day was
+  aborted).
+
+**Migration steps**
+1. If `retention.conf` sets `S3_CYCLE_BUDGET_S` below ~2400, raise it.
+2. To pull a candles snapshot: `pull` is for runs; fetch the `.zst` object and
+   `zstd -d` it.
+
 ## 2026-10-13 — Binance options: in the AI boot universe; an order on one is unroutable in paper and the harness (HK7b)
 
 **What changed**
