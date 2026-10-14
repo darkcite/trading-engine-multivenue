@@ -78,7 +78,8 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   - Beside it: `caffeinate`, hourly `candles`, 5-min `regime`, nightly
     `retention` (PROTECT_DAYS 1, every delete gated on S3 `verify`),
     `archive` (04:30 local) and the read-only `dashboard`.
-  - It runs `0e99a99` (BIN15 H90 L4b) with the mask `strategy.conf` names
+  - It runs the release build of `cf3ac1f` (built 2026-10-14 04:19Z, booted
+    04:21Z) with the mask `strategy.conf` names
     (`ai+vrp+xsd+bin15+hyparb+xmm+hcv`). `/state` `exec.configured` is 0 (no
     route table): nothing is armed.
   - After ANY restart, verify `vm_rows_active ≥ 1` on `/state`.
@@ -113,11 +114,15 @@ The lane records stay where they always were: `docs/risk-policy.md` and
     harness `--fee-bps hl.prediction.settle`).
   - **The mainnet agent approval EXPIRES 2026-10-19.**
   - **BIN15 H90, the late-window entry** (τ 2–30 s; risk-policy "BIN15
-    H90"): built, paper only, and OFF until `bin15.toml` carries
-    `late_enabled = 1` with its `late_phi_lut`. The live dust test is the
-    operator's (`scripts/bin15-late-dust.sh --dry-run`, then `--confirm`,
-    ≤ $10, before 2026-10-19). `bin15_accrue report` scores doc 33 §3's
-    bars from `late_entries.tsv` / `late_fires.tsv`.
+    H90"): ON in PAPER since 2026-10-13 11:22Z (`bin15.toml`
+    `late_enabled = 1`; the boot line reads
+    `late=2-30s:p>=0.90:ask<=p-2c:persist2:$100:k1.550`). Not live.
+  - The live dust test (`scripts/bin15-late-dust.sh`) PASSED twice on
+    mainnet, 2026-10-13 and 2026-10-14: 8/8 IoCs filled at the ask and
+    settled at 1 (vault doc 33 §9 / §9b).
+  - `bin15_accrue report` scores doc 33 §3's bars from
+    `late_entries.tsv` / `late_fires.tsv`. Doc 34 (OOS2) runs on or after
+    2026-10-19.
 - **Slot 0 (HYPARB; `docs/hyparb-build-plan.md` §16–§17, risk-policy
   "HYPARB — slot 0").**
   - The HyperEVM AMM ↔ HL Core arb, in PAPER with the TESTNET shadow (chain
