@@ -32,7 +32,7 @@ cd "$REPO" || exit 78
 export PATH="$REPO/target/release:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 CONF="$HOME/multivenue/retention.conf"
-S3_CYCLE_BUDGET_S=600
+S3_CYCLE_BUDGET_S=3600 # HK11: a day's capture at the 1 MiB/s cap is ~35 min
 ARCHIVE_MODE="compress"
 [ -f "$CONF" ] && . "$CONF"
 
@@ -78,6 +78,17 @@ fi
 #
 # Set S3_NICE_NETWORK=1 in retention.conf to put the background class back: the
 # upload then takes hours instead of minutes but is invisible to the feeds.
+#
+# HK11 (2026-10-14): neither holds any more, and the archiver caps itself.
+#   * The background class no longer throttles here: a push under
+#     `taskpolicy -b` ran at ~3.3 MB/s (nettop), not ~0.3 MiB/s.
+#   * Uncapped, the push filled the uplink and the feeds' ACKs queued behind
+#     it: Deribit's delay EMA reached its 65 535 ms ceiling, MEXC 52 s, and
+#     Binance's stale ticks went from 38 k to 1.14 M — not ~200 ms.
+#   So the archiver paces every upload byte itself (objstore's token bucket,
+#   `MULTIVENUE_S3_MAX_UPLOAD_MIBPS`, default 1 MiB/s: the measured rate at
+#   which the delays stay in their no-upload band). A SIGTERM mid-push now
+#   aborts the multipart upload in flight instead of leaving its parts.
 NET_PREFIX=""
 if [ "${S3_NICE_NETWORK:-0}" = "1" ]; then
   NET_PREFIX="taskpolicy -b"

@@ -76,6 +76,15 @@ MAX_PARTS: typing.Final[int] = 10_000
 #: Streaming chunk size for uploads and downloads.
 CHUNK_SIZE: typing.Final[int] = 8 * 1024 * 1024
 
+#: Upload piece size under a rate cap. A capped FILE upload hands the socket at
+#: most this much at a time, so what sits queued ahead of the feeds' ACKs on
+#: the uplink is bounded by the cap, not by CHUNK_SIZE (HK11). An in-memory
+#: body (a manifest, the Complete XML) is paced as one piece: it is small.
+PACE_CHUNK: typing.Final[int] = 64 * 1024
+
+#: The cap's burst: bytes an idle bucket may send back to back.
+PACE_BURST: typing.Final[int] = 4 * PACE_CHUNK
+
 #: Headers that are never signed. ``content-length`` is excluded because httpx
 #: may normalise it; the others are transport-managed.
 UNSIGNED_HEADERS: typing.Final[frozenset[str]] = frozenset(
@@ -162,6 +171,41 @@ class Budget:
 
     def spent(self) -> bool:
         return self.clock() >= self.deadline
+
+
+@dataclasses.dataclass(slots=True)
+class RateLimiter:
+    """A token bucket over upload bytes (HK11).
+
+    An uncapped upload saturated this Mac's uplink on 2026-10-14 and the
+    feeds' ACKs queued behind it: Deribit's delay EMA hit its 65 535 ms
+    ceiling and Binance went from 38 k to 1.14 M stale ticks. ``take`` sleeps
+    until ``n`` more bytes fit under ``rate_bps``; an idle bucket holds at
+    most ``burst`` bytes. The stamp advances by the time it asked to sleep,
+    so the pacing does not depend on how long the sleep really took.
+    """
+
+    rate_bps: float
+    burst: int
+    clock: collections.abc.Callable[[], float] = time.monotonic
+    sleep: collections.abc.Callable[[float], None] = time.sleep
+    _tokens: float = dataclasses.field(default=-1.0, init=False)
+    _stamp: float = dataclasses.field(default=0.0, init=False)
+
+    def take(self, n: int) -> None:
+        now = self.clock()
+        if self._tokens < 0.0:
+            self._tokens = float(self.burst)
+            self._stamp = now
+        elapsed = max(0.0, now - self._stamp)
+        self._tokens = min(float(self.burst), self._tokens + elapsed * self.rate_bps)
+        self._stamp = max(self._stamp, now)
+        self._tokens -= n
+        if self._tokens < 0.0:
+            wait = -self._tokens / self.rate_bps
+            self.sleep(wait)
+            self._stamp += wait
+            self._tokens = 0.0
 
 
 class SignedRequest(typing.NamedTuple):
@@ -305,6 +349,8 @@ class ObjectStore:
         clock: collections.abc.Callable[[], float] = time.time,
         sleep: collections.abc.Callable[[float], None] = time.sleep,
         rng: random.Random | None = None,
+        max_upload_bps: float = 0.0,
+        monotonic: collections.abc.Callable[[], float] = time.monotonic,
     ) -> None:
         self.endpoint = endpoint
         self._creds = creds
@@ -313,6 +359,12 @@ class ObjectStore:
         self._clock = clock
         self._sleep = sleep
         self._rng = rng if rng is not None else random.Random(0)
+        # 0 = uncapped. Every upload byte, retries included, passes the bucket.
+        self._limiter: RateLimiter | None = (
+            RateLimiter(max_upload_bps, PACE_BURST, clock=monotonic, sleep=sleep)
+            if max_upload_bps > 0.0
+            else None
+        )
 
     # -- request plumbing ---------------------------------------------------
 
@@ -391,10 +443,18 @@ class ObjectStore:
             content: bytes | collections.abc.Iterable[bytes] | None = None
             length: int | None = None
             if body is not None:
+                if self._limiter is not None:
+                    self._limiter.take(len(body))
                 content = body
                 length = len(body)
             elif stream_path is not None:
-                content = _file_chunks(stream_path, stream_offset, stream_length)
+                if self._limiter is None:
+                    content = _file_chunks(stream_path, stream_offset, stream_length)
+                else:
+                    content = _paced_chunks(
+                        _file_chunks(stream_path, stream_offset, stream_length, PACE_CHUNK),
+                        self._limiter,
+                    )
                 length = stream_length
 
             request = self._build(
@@ -710,9 +770,9 @@ def _response_chunks(response: httpx.Response) -> collections.abc.Iterator[bytes
 
 
 def _file_chunks(
-    path: pathlib.Path, offset: int, length: int
+    path: pathlib.Path, offset: int, length: int, chunk_size: int = CHUNK_SIZE
 ) -> collections.abc.Iterator[bytes]:
-    """Yield ``length`` bytes of ``path`` from ``offset`` in CHUNK_SIZE pieces.
+    """Yield ``length`` bytes of ``path`` from ``offset`` in ``chunk_size`` pieces.
 
     Copy ledger: one copy per chunk inside httpx/h11 (``h11.Connection.send``
     joins its data list into a fresh ``bytes``) plus the TLS record copy in
@@ -723,11 +783,24 @@ def _file_chunks(
     with path.open("rb") as handle:
         handle.seek(offset)
         while remaining > 0:
-            chunk = handle.read(min(CHUNK_SIZE, remaining))
+            chunk = handle.read(min(chunk_size, remaining))
             if not chunk:
                 return
             remaining -= len(chunk)
             yield chunk
+
+
+def _paced_chunks(
+    chunks: collections.abc.Iterable[bytes], limiter: RateLimiter
+) -> collections.abc.Iterator[bytes]:
+    """Hand each piece to the socket only once the bucket admits it.
+
+    No copy: the pieces are the reads themselves (``_file_chunks`` at
+    PACE_CHUNK), passed through.
+    """
+    for chunk in chunks:
+        limiter.take(len(chunk))
+        yield chunk
 
 
 def _slice_digests(path: pathlib.Path, offset: int, length: int) -> tuple[str, str]:

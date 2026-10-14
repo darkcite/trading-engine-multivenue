@@ -16,6 +16,8 @@ Convention: full ``import x`` only. No ``from x import y``.
 import json
 import pathlib
 import random
+import signal
+import sqlite3
 import struct
 import subprocess
 import typing
@@ -707,3 +709,88 @@ def test_run_id_accepts_a_path_or_an_id() -> None:
     assert claude_worker.archive._run_id("run-123") == "run-123"
     assert claude_worker.archive._run_id("/a/b/run-123") == "run-123"
     assert claude_worker.archive._run_id("/a/b/run-123/") == "run-123"
+
+
+def test_sigterm_handler_unwinds_with_the_terminated_code() -> None:
+    """HK11: SIGTERM raises SystemExit so multipart_put's abort still runs,
+    and a second SIGTERM during that abort is ignored (one-shot)."""
+    before = signal.getsignal(signal.SIGTERM)
+    try:
+        with pytest.raises(SystemExit) as caught:
+            claude_worker.archive._terminate(signal.SIGTERM, None)
+        assert caught.value.code == claude_worker.archive.EXIT_TERMINATED == 143
+        assert signal.getsignal(signal.SIGTERM) is signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGTERM, before)
+
+
+def test_main_installs_the_handler_and_restores_the_previous_one(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = signal.getsignal(signal.SIGTERM)
+    seen: list[object] = []
+
+    def dispatch(*_args: object, **_kwargs: object) -> int:
+        seen.append(signal.getsignal(signal.SIGTERM))
+        return claude_worker.archive.EXIT_OK
+
+    monkeypatch.setenv("MULTIVENUE_S3_ENV_FILE", str(tmp_path / "absent.env"))
+    monkeypatch.setattr(claude_worker.archive, "build", lambda _cfg: object())
+    monkeypatch.setattr(claude_worker.archive, "_dispatch", dispatch)
+    assert claude_worker.archive.main(["list"]) == claude_worker.archive.EXIT_OK
+    assert seen == [claude_worker.archive._terminate]
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_budget_spent_mid_object_exits_resumable(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HK11: a budget spent inside a multipart is EXIT_BUDGET, not a failure."""
+
+    def spent(*_args: object, **_kwargs: object) -> int:
+        raise claude_worker.objstore.BudgetSpent("k: budget spent after part 1/2")
+
+    monkeypatch.setenv("MULTIVENUE_S3_ENV_FILE", str(tmp_path / "absent.env"))
+    monkeypatch.setattr(claude_worker.archive, "build", lambda _cfg: object())
+    monkeypatch.setattr(claude_worker.archive, "_dispatch", spent)
+    assert claude_worker.archive.main(["list"]) == claude_worker.archive.EXIT_BUDGET
+
+
+def test_features_keys_keep_the_run_directory(tmp_path: pathlib.Path) -> None:
+    """HK12: two runs' same-named feature files get two keys, not one."""
+    root = tmp_path / "worker" / "features"
+    for run in ("run-1", "run-2"):
+        (root / run).mkdir(parents=True)
+        (root / run / "16777842.json").write_text(run, encoding="utf-8")
+    pairs = claude_worker.archive._derived_paths("features", "", 3, home=tmp_path)
+    assert [name for _p, name in pairs] == ["run-1/16777842.json", "run-2/16777842.json"]
+
+
+def test_push_derived_keys_by_the_name_given(tmp_path: pathlib.Path) -> None:
+    fake = tests.fake_s3.FakeS3()
+    cfg = make_cfg(tmp_path)
+    archiver = make_archiver(cfg, fake)
+    src = tmp_path / "16777842.json"
+    src.write_text("{}", encoding="utf-8")
+    archiver.push_derived("features", src, "run-1/16777842.json")
+    archiver.push_derived("features", src, "run-2/16777842.json")
+    prefix = cfg.derived_prefix("features")
+    assert prefix + "run-1/16777842.json" in fake.objects
+    assert prefix + "run-2/16777842.json" in fake.objects
+
+
+def test_candles_snapshot_is_staged_compressed_and_the_raw_one_removed(
+    tmp_path: pathlib.Path,
+) -> None:
+    """HK11: the candles push stages a `.zst` and never leaves the raw copy."""
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    with sqlite3.connect(worker / "candles.db") as conn:
+        conn.execute("CREATE TABLE bars (ts INTEGER, px INTEGER)")
+        conn.executemany("INSERT INTO bars VALUES (?, ?)", [(i, i * 2) for i in range(1000)])
+    pairs = claude_worker.archive._derived_paths("candles", "", 3, home=tmp_path)
+    assert len(pairs) == 1
+    staged, name = pairs[0]
+    assert name.endswith(".db.zst") and staged.is_file()
+    staging = tmp_path / "s3-cache" / "staging"
+    assert sorted(p.name for p in staging.iterdir()) == [name]

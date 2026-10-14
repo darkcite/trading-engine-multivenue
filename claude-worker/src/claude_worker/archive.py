@@ -42,6 +42,7 @@ import json
 import os
 import pathlib
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -95,6 +96,9 @@ EXIT_REFUSED: typing.Final[int] = 2  # newest run without --force, or guard hit
 EXIT_DISABLED: typing.Final[int] = 3  # subsystem off on a GATING lane
 EXIT_NO_SPACE: typing.Final[int] = 4  # free-space floor would be breached
 EXIT_BUDGET: typing.Final[int] = 5  # budget spent mid-run — resumable
+EXIT_TERMINATED: typing.Final[int] = 143  # SIGTERM; any multipart in flight is aborted
+
+MIB: typing.Final[int] = 1024 * 1024
 
 
 class ArchiveError(Exception):
@@ -846,25 +850,29 @@ class Archiver:
         )
         return final
 
-    def push_derived(self, kind: str, path: pathlib.Path) -> PushResult:
+    def push_derived(self, kind: str, path: pathlib.Path, name: str = "") -> PushResult:
         """A derived store (candles db, a report, a features day).
 
         Derived data is reproducible in principle and precious in practice —
         it is what the gates were computed against. Same index-last law.
+        ``name`` is the key under the kind's prefix — the path relative to
+        the store's root (HK12: features repeat basenames across runs, so a
+        basename key let one run's file stand for another's).
         """
         started = self._clock()
-        key = f"{self.cfg.derived_prefix(kind)}{path.name}"
+        name = name or path.name
+        key = f"{self.cfg.derived_prefix(kind)}{name}"
         sha256_hex, md5_hex, size = _digests(path)
         head = self.store.head(key)
         if head is not None and head.size == size:
-            return PushResult(path.name, 0, 0, 0, 0, self._clock() - started, skipped=True)
+            return PushResult(name, 0, 0, 0, 0, self._clock() - started, skipped=True)
         if size >= self.cfg.part_size:
             self.store.multipart_put(key, path, part_size=self.cfg.part_size)
             parts = (size + self.cfg.part_size - 1) // self.cfg.part_size
         else:
             self.store.put(key, path, sha256_hex=sha256_hex, md5_hex=md5_hex)
             parts = 1
-        return PushResult(path.name, 1, size, size, parts, self._clock() - started)
+        return PushResult(name, 1, size, size, parts, self._clock() - started)
 
     def pull(self, run_id: str, into: pathlib.Path) -> pathlib.Path:
         """Materialise a run. Verifies every file's ORIGINAL sha256.
@@ -918,6 +926,7 @@ def build(
         cfg.creds,
         client if client is not None else httpx.Client(),
         timeout_s=cfg.timeout_s,
+        max_upload_bps=cfg.max_upload_mibps * MIB,
     )
     return Archiver(cfg, store)
 
@@ -1025,15 +1034,36 @@ def main(argv: collections.abc.Sequence[str] | None = None) -> int:
         print(cfg.tell(), file=sys.stderr)
         return EXIT_OK
 
+    # SIGTERM (launchd's unload, an operator's kill) must not leave a multipart
+    # upload's parts in the bucket: the default action ends the process before
+    # `multipart_put`'s abort runs, which is how 2026-10-14's orphan happened.
+    # Raised as SystemExit, it unwinds through that abort instead (HK11).
+    previous = signal.signal(signal.SIGTERM, _terminate)
     try:
         archiver = build(cfg)
         return _dispatch(args, cfg, archiver)
     except ArchiveError as exc:
         print(str(exc), file=sys.stderr)
         return exc.code
+    except claude_worker.objstore.BudgetSpent as exc:
+        # Mid-object, the multipart aborted: resumable, like a budget spent
+        # between files — not a failure (HK11; it read as 1 until then).
+        print(f"archive: {exc}", file=sys.stderr)
+        return EXIT_BUDGET
     except claude_worker.objstore.ObjStoreError as exc:
         print(f"archive: {exc}", file=sys.stderr)
         return EXIT_FAILED
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def _terminate(_signum: int, _frame: object) -> None:
+    """The SIGTERM handler: unwind, so every ``finally`` and abort runs.
+
+    One-shot: a second SIGTERM while the abort itself is in flight is
+    ignored rather than cutting the abort short."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise SystemExit(EXIT_TERMINATED)
 
 
 def _dispatch(  # one branch per verb, deliberately flat
@@ -1109,21 +1139,31 @@ def _dispatch(  # one branch per verb, deliberately flat
         return EXIT_OK
     if args.verb == "push-derived":
         budget = _budget(args.budget_s)
-        for path in _derived_paths(args.kind, args.path):
+        for path, name in _derived_paths(args.kind, args.path, cfg.zstd_level):
             if budget is not None and budget.spent():
                 print("archive: budget spent between files", file=sys.stderr)
                 return EXIT_BUDGET
-            print(archiver.push_derived(args.kind, path).tell(), file=sys.stderr)
+            try:
+                print(archiver.push_derived(args.kind, path, name).tell(), file=sys.stderr)
+            finally:
+                if args.kind == "candles" and not args.path:
+                    # The staged snapshot: in the bucket, or to be taken again
+                    # (a snapshot is never resumed). Never left in staging/.
+                    path.unlink(missing_ok=True)
         return EXIT_OK
     return EXIT_OK
 
 
-def _derived_paths(kind: str, explicit: str) -> list[pathlib.Path]:
+def _derived_paths(
+    kind: str, explicit: str, zstd_level: int, home: pathlib.Path | None = None
+) -> list[tuple[pathlib.Path, str]]:
+    """(file, key name) pairs; the name is relative to the kind's root (HK12)."""
     if explicit:
-        return [pathlib.Path(explicit).expanduser()]
-    home = pathlib.Path.home() / "multivenue"
+        path = pathlib.Path(explicit).expanduser()
+        return [(path, path.name)]
+    home = home if home is not None else pathlib.Path.home() / "multivenue"
     if kind == "reports":
-        return sorted((home / "worker" / "reports").glob("pnl-*.json"))
+        return [(p, p.name) for p in sorted((home / "worker" / "reports").glob("pnl-*.json"))]
     if kind == "candles":
         # A live sqlite file is not a file you copy. `.backup` is the only
         # snapshot that is guaranteed internally consistent.
@@ -1133,13 +1173,27 @@ def _derived_paths(kind: str, explicit: str) -> list[pathlib.Path]:
         stamp = time.strftime("%Y%m%d", time.gmtime())
         snapshot = home / "s3-cache" / "staging" / f"candles-{stamp}.db"
         snapshot.parent.mkdir(parents=True, exist_ok=True)
-        done = subprocess.run(
-            ["sqlite3", str(source), f".backup '{snapshot}'"], capture_output=True, check=False
-        )
-        if done.returncode != 0 or not snapshot.is_file():
-            raise ArchiveError("candles: sqlite3 .backup failed", EXIT_FAILED)
-        return [snapshot]
-    return sorted(p for p in (home / "worker" / "features").rglob("*") if p.is_file())
+        # HK11: stored compressed (4.40 GB -> 816 MiB on 2026-10-14). The raw
+        # snapshot never outlives this call — it is the size of the db — and
+        # a failed or killed compress leaves no partial `.zst` behind.
+        staged = snapshot.with_name(snapshot.name + ".zst")
+        try:
+            done = subprocess.run(
+                ["sqlite3", str(source), f".backup '{snapshot}'"],
+                capture_output=True,
+                check=False,
+            )
+            if done.returncode != 0 or not snapshot.is_file():
+                raise ArchiveError("candles: sqlite3 .backup failed", EXIT_FAILED)
+            compress_to(snapshot, staged, zstd_level)
+        except BaseException:
+            staged.unlink(missing_ok=True)
+            raise
+        finally:
+            snapshot.unlink(missing_ok=True)
+        return [(staged, staged.name)]
+    root = home / "worker" / "features"
+    return [(p, p.relative_to(root).as_posix()) for p in sorted(root.rglob("*")) if p.is_file()]
 
 
 def _gc_limit(

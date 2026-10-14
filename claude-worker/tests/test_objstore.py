@@ -117,7 +117,12 @@ def test_valueless_subresource_is_name_equals() -> None:
 
 
 def make_store(
-    fake: tests.fake_s3.FakeS3, *, addressing: str = "virtual"
+    fake: tests.fake_s3.FakeS3,
+    *,
+    addressing: str = "virtual",
+    sleep: typing.Callable[[float], None] = lambda _s: None,
+    max_upload_bps: float = 0.0,
+    monotonic: typing.Callable[[], float] = lambda: 0.0,
 ) -> claude_worker.objstore.ObjectStore:
     endpoint = claude_worker.objstore.Endpoint(
         host="fsn1.your-objectstorage.com",
@@ -129,7 +134,13 @@ def make_store(
         access_key_id="AKIAEXAMPLEARCHIVE00", secret_access_key="archive-golden-secret"
     )
     return claude_worker.objstore.ObjectStore(
-        endpoint, creds, fake.client(), timeout_s=5.0, sleep=lambda _s: None
+        endpoint,
+        creds,
+        fake.client(),
+        timeout_s=5.0,
+        sleep=sleep,
+        max_upload_bps=max_upload_bps,
+        monotonic=monotonic,
     )
 
 
@@ -414,3 +425,105 @@ def test_secret_never_appears_in_repr_or_exception_text() -> None:
         store.head("v1/index/mbp-m4/run-1.json")
     assert secret not in str(caught.value)
     assert secret not in repr(caught.value)
+
+
+# -- HK11: the upload cap ----------------------------------------------------
+
+
+class _FakeTime:
+    """A clock that only moves when the limiter sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 100.0
+        self.slept: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def test_rate_limiter_paces_bytes_to_the_rate_after_the_burst() -> None:
+    fake = _FakeTime()
+    limiter = claude_worker.objstore.RateLimiter(1000.0, 500, clock=fake.clock, sleep=fake.sleep)
+    for _ in range(10):
+        limiter.take(250)
+    # 2 500 bytes at 1 000 B/s with a 500 B burst: the first two takes ride
+    # the burst, the other eight each wait a quarter second.
+    assert fake.slept == pytest.approx([0.25] * 8)
+
+
+def test_rate_limiter_does_not_rely_on_the_sleep_being_honoured() -> None:
+    fake = _FakeTime()
+    limiter = claude_worker.objstore.RateLimiter(
+        1000.0, 0, clock=fake.clock, sleep=fake.slept.append
+    )
+    for _ in range(4):
+        limiter.take(1000)
+    # The clock never moved, yet each take still owes exactly one second.
+    assert fake.slept == pytest.approx([1.0, 1.0, 1.0, 1.0])
+
+
+def test_rate_limiter_refills_while_idle_up_to_the_burst_only() -> None:
+    fake = _FakeTime()
+    limiter = claude_worker.objstore.RateLimiter(1000.0, 500, clock=fake.clock, sleep=fake.sleep)
+    limiter.take(500)
+    fake.now += 60.0  # a minute idle refills to the burst, not to 60 000 bytes
+    limiter.take(1500)
+    assert sum(fake.slept) == pytest.approx(1.0)
+
+
+def test_capped_upload_is_paced_in_small_pieces(tmp_path: pathlib.Path) -> None:
+    fake = _FakeTime()
+    fake_s3 = tests.fake_s3.FakeS3()
+    rate = 1024.0 * 1024.0
+    store = make_store(
+        fake_s3, sleep=fake.sleep, max_upload_bps=rate, monotonic=fake.clock
+    )
+    size = 3 * 1024 * 1024
+    src = tmp_path / "obj.bin"
+    src.write_bytes(b"c" * size)
+    store.put("v1/runs/mbp-m4/run-1/obj.bin", src)
+    assert fake_s3.objects["v1/runs/mbp-m4/run-1/obj.bin"] == src.read_bytes()
+    # Everything past the burst waits for the bucket, one PACE_CHUNK at a time.
+    piece = claude_worker.objstore.PACE_CHUNK / rate
+    pieces = (size - claude_worker.objstore.PACE_BURST) // claude_worker.objstore.PACE_CHUNK
+    assert fake.slept == pytest.approx([piece] * pieces)
+
+
+def test_uncapped_store_never_sleeps_on_upload(tmp_path: pathlib.Path) -> None:
+    slept: list[float] = []
+    fake_s3 = tests.fake_s3.FakeS3()
+    store = make_store(fake_s3, sleep=slept.append)
+    src = tmp_path / "obj.bin"
+    src.write_bytes(b"d" * (2 * 1024 * 1024))
+    store.put("v1/runs/mbp-m4/run-1/obj.bin", src)
+    assert slept == []
+
+
+def test_systemexit_mid_part_aborts_the_multipart_upload(tmp_path: pathlib.Path) -> None:
+    """A SIGTERM arrives as SystemExit (archive._terminate); the parts must go."""
+    fake = _FakeTime()
+    fake_s3 = tests.fake_s3.FakeS3()
+
+    def sleep_then_terminate(seconds: float) -> None:
+        fake.sleep(seconds)
+        if len(fake.slept) == 120:  # mid-way through the second part
+            raise SystemExit(143)
+
+    store = make_store(
+        fake_s3,
+        sleep=sleep_then_terminate,
+        max_upload_bps=1024.0 * 1024.0,
+        monotonic=fake.clock,
+    )
+    part = 5 * 1024 * 1024
+    src = tmp_path / "obj.bin"
+    src.write_bytes(b"e" * (part * 2 + 16))
+    with pytest.raises(SystemExit):
+        store.multipart_put("v1/runs/mbp-m4/run-1/obj.bin", src, part_size=part)
+    assert fake_s3.uploads == {}
+    assert any(m == "DELETE" and "uploadId" in q for m, _p, q in fake_s3.requests)
+    assert "v1/runs/mbp-m4/run-1/obj.bin" not in fake_s3.objects

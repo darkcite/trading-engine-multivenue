@@ -87,6 +87,15 @@ DEFAULTS: typing.Final[dict[str, str]] = {
     "MULTIVENUE_S3_PART_SIZE_MIB": "32",
     "MULTIVENUE_S3_CONCURRENCY": "1",
     "MULTIVENUE_S3_TIMEOUT_S": "900",
+    # The upload cap, MiB/s (HK11; 0 = uncapped). An uncapped push filled this
+    # Mac's uplink on 2026-10-14 and the feeds' delay EMAs went to seconds
+    # (Deribit's to its 65 535 ms ceiling). Measured the same day on a real
+    # run, feed-delay EMAs sampled every 15 s: at 1 MiB/s they stayed in the
+    # no-upload band (medians 8-118 ms, one sample over 500 ms in twenty);
+    # at 2 MiB/s six samples went over 500 ms (Deribit 2.8 s). A day's
+    # capture (~2.2 GB stored) takes ~35 min at 1 MiB/s, inside the nightly
+    # budget. docs/risk-policy.md "HK11".
+    "MULTIVENUE_S3_MAX_UPLOAD_MIBPS": "1",
     "MULTIVENUE_S3_SKIP_GLOBS": "",
 }
 
@@ -107,6 +116,7 @@ class ArchiveConfig:
     concurrency: int
     timeout_s: float
     skip_globs: tuple[str, ...]
+    max_upload_mibps: float
 
     @property
     def part_size(self) -> int:
@@ -213,6 +223,7 @@ def _disabled(reason: str, merged: collections.abc.Mapping[str, str]) -> Archive
         concurrency=_int(merged, "MULTIVENUE_S3_CONCURRENCY"),
         timeout_s=_float(merged, "MULTIVENUE_S3_TIMEOUT_S"),
         skip_globs=_globs(merged.get("MULTIVENUE_S3_SKIP_GLOBS", "")),
+        max_upload_mibps=max(0.0, _float(merged, "MULTIVENUE_S3_MAX_UPLOAD_MIBPS")),
     )
 
 
