@@ -14555,6 +14555,113 @@ fixes (s9-g1) was green too (nextest 4 250).
 - bench: gates 103 (+ legs, repeats, report), 99 (the engine's composition)
   and the bin15 gate (+ refusal and cancel).
 
+### XH4i-8 amendment (2026-10-08): the outcome battery — slot 3's gateway arm on testnet HIP-4 (an operator tool; nothing armed)
+
+- **Anton's ask (2026-10-08):** "sell E3's leftover +154150 leg on testnet,
+  then run the outcome test battery on testnet HIP-4." The leg was sold
+  first (09:34:43Z, `exec-smoke --fill`: 25 at 0.39583); E3 holds no leg.
+- **`exec-smoke --hl-outcome --lifecycle --outcome <id> [--outcome-usd N]`**
+  (`cli::outcome_battery`): slot 3's arm in its outcome mode and its
+  gateway, built as `bin15_live` builds them but on E3's TESTNET account
+  (`own_account = false`), driven as the engine drives it. Testnet only:
+  the host and the network are checked, and the exec-smoke binary reads
+  `HYPERLIQUID_TESTNET_*` alone. No arming switch: the wrapper is the only
+  way in.
+- **A-S7-92 — a stated outcome:** testnet has no recurring `out` family (its
+  `out` outcomes are dated and past), so the operator states the outcome and
+  the battery feeds the roll the ingress publishes (family 0's YES symbol,
+  `pack_roll_seq`). LAW E-4 holds: the legs bind from a roll alone, and no
+  id is derived. Prices come from the outcome's own book, read before each
+  step (A-S7-94).
+- **What stands in for the router:**
+  - every bid is sized at its own price to the stated notional (2 ..= 25
+    USD) and refused locally above it plus a contract; a sale is sized by
+    what this run holds and only shrinks it, so no bound refuses it;
+  - growth stops at the first halt word — a drift, an unknown order of the
+    slot, the gateway's halt, the budget floor, an asset-refusal streak
+    (`xmm_battery::Drive::halt_word`, shared with the perps battery, whose
+    halt gains the budget floor and the asset-refusal streak here; not the
+    reject streak, which the batteries provoke on purpose);
+  - the start refuses a held HIP-4 leg, a perp position or an order of slot
+    3 (A-S7-93), and USDC under four times the stated notional ($20 at
+    least);
+  - a take goes out only when the bid can buy it back whole, three steps
+    deeper, within the venue's $1 minimum; a sale never steps under the
+    price that keeps it;
+  - the end cancels everything, sells what this run holds — the smaller of
+    the venue's `+<enc>` total and this run's own fills, after the boot's
+    first agreement only — shuts the arm down (its sweep, the dead man's
+    clear) and reads the account: any HIP-4 leg or slot-3 order left exits
+    48, the loudest.
+- **This run's rows only:** fills, positions and spellings count slot 3's
+  cloids whose client-id sequence the run issued (above its start, at most
+  its last) — never the first snapshot's rows or a co-signer's.
+- **A-S7-96:** the arm books its slot's first-snapshot rows of the last day
+  and an hour on the legs a roll binds (BIN15's instances live a day at most).
+  On an older outcome a leg bought before that window and sold inside it books
+  a short the venue does not hold, and the legs never agree: the battery runs
+  on an outcome the account has not traded in the window (15415 was sold
+  09:34Z, so the run uses 21406).
+- **The dead man:** E3 has traded under the venue's $1 000 000, so
+  `scheduleCancel` is refused there (O-XH4, A-S7-57): the battery reports
+  `dm_refused` and the availability word, and does not fail on them.
+- **The run:**
+  - the verbs on YES — a rest, a reprice, a crossing modify (refused
+    `BAD_ALO_PX`; the original's fate recorded), a cancel, a crossing place
+    (refused);
+  - a quote on the NO leg, cancelled;
+  - IoCs — a miss, a take and its sale — each reconciled on two spot reads
+    of the legs after it;
+  - the cancel-all word;
+  - measured: the legs' `#<enc>` spellings on the open orders read and on the
+    tap's `orderUpdates` and `userFills`, and the arm's outcome counters.
+  - Exit codes 40–48 (A-S7-95).
+- **Shared, not copied:** `xmm_battery`'s `/info` reader (slot-generic now,
+  with `spot` and `budget_left`), its tap and its driver (`Drive::new`).
+
+**Reviews (one combined round, frozen `review-xh4i8-r1`; a re-verification on
+`review-xh4i8-r2`):**
+- **Risk: REQUEST CHANGES**, then fixed:
+  - MAJOR: the crossing modify and place were sized at the lowest resting
+    price (on a wide book, many times the stated notional) — each order is
+    now sized at its own price and every bid bounded;
+  - MAJOR: a take the bid could not buy back within the venue's $1 minimum
+    (a stranded leg, exit 48 on every later run) — the take now goes out only
+    when it is sellable, and a sale never steps under the minimum's price;
+  - the re-verification's MAJOR: the bound refused sales — a sale only
+    shrinks, so it is exempt;
+  - MINORs: sales sized by the venue and this run's fills, after the first
+    agreement only; every `+` leg counted at the end; the miss judged
+    (`IOC_MISS`); this run's rows only (a sequence the run issued); the
+    cancel verb on a fresh quote; the halt word widened; USDC scaled; the
+    flags' conflicts; the leftover message.
+- **Allocation and zero-copy (one reviewer, a cold change): APPROVE WITH
+  NITS**, then fixed: a book in range or an error (never an empty book read
+  off a bad answer); the duplicated helpers moved onto `Drive`; the tap
+  labelled, `finish` returning its gap; `spot_rows` pinned by a test; the
+  budget's arithmetic saturating; the doctrine line naming what allocates.
+- Deferred (A-S7-100): an end-to-end E-4 submit test from the cli (the arm
+  refuses submits until its gateway readies it; exec-hyperliquid's own test
+  covers the lookup) and a loopback `run()`.
+
+**Gates:** s10-g3 (2026-10-08, 10:43Z): clippy clean; nextest 4 261 passed (9
+skipped); alloc 113; copy-audit 28 baselined, 0 new; license 664 (+1, the new
+module); release builds; replay 7× IDENTICAL against main's release binary on
+the 10-07 20:16Z hour (A-S7-98: the 10-04 root rotated out); fmt clean.
+
+**Testnet (10:43:39–10:44:46Z, this tree's release binary, outcome 21406,
+$5): PASS, the bar met.**
+- Verbs 3/0, `BAD_ALO_PX` 2/0 (the refused modify's original ended
+  CANCELED / `CANCEL_REQUESTED` within 3 s), NO leg 1/0, IoCs 3/0 (the miss
+  REJECTED / `IOC_MISS`), sweep 1/0, clean reconciliations 2/0, fills 2.
+- This run's rows name the legs `#<enc>`: openOrders yes; `orderUpdates`
+  YES 13, NO 4; `userFills` YES 2; another coin 0.
+- The arm: one roll, 7 leg reads, none drifting or unseen, no settlement, no
+  unresolved fill, the shutdown confirmed; the dead man refused (5) on E3, as
+  O-XH4 expects; fees $0.0065.
+- Nothing left on E3. Its address budget read 2 637 requests left (the
+  start needs 2 000).
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

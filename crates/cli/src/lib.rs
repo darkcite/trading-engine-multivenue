@@ -69,6 +69,9 @@ pub mod hyparb_boot;
 pub mod hyparb_live;
 pub mod hyparb_rehearsal;
 pub mod options_manifest;
+/// XMM XH4i-8: the outcome battery — slot 3's gateway arm on testnet HIP-4
+/// (`exec-smoke --hl-outcome --lifecycle --outcome <id>`).
+pub mod outcome_battery;
 pub mod paper;
 /// HC11b: a member's persisted state, rendered and written off the engine
 /// thread (the long-tenor series' and slot 7's book).

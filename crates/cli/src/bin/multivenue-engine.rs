@@ -58,15 +58,64 @@ use tracing_subscriber::EnvFilter;
 /// and was ignored (`--bn-um-symbol ETHUSDT` beside a flatten closed every
 /// position). Each tool names all of these as conflicts instead; a test
 /// keeps the list whole for the flags to come.
-const BN_TOOL_CONFLICTS: [&str; 54] = [
-    "asset", "offline", "lifecycle", "px", "px2", "sz", "sell", "hl_perp", "coins", "cycles",
-    "fill_pairs", "usd", "rest_bps", "cross_bps", "ttl_ms", "sweep_every", "stall", "sweep_first",
-    "dry_run", "fill", "fill_px", "fill_sz", "fill_slot", "fill_cloid", "fill_repeat", "sweep",
-    "requote", "recon", "recon_secs", "watch", "binance_probe", "binance", "bn_rest", "bn_hmac",
-    "bn_um_symbol", "bn_cm_symbol", "bn_cycles", "bn_fill_pairs", "bn_usd", "bn_rest_bps",
-    "bn_cross_bps", "bn_ttl_ms", "bn_rotate_s", "bn_drill", "bn_spot_symbol", "bn_adopt_usd",
-    "bn_stream_confirm", "bn_eq_symbol", "bn_eq_session", "bn_eq_tokenize", "bn_eq_quote", "bn_eq_ttl_ms",
-    "bn_confirm_mainnet", "bn_mainnet",
+const BN_TOOL_CONFLICTS: [&str; 57] = [
+    "asset",
+    "offline",
+    "lifecycle",
+    "px",
+    "px2",
+    "sz",
+    "sell",
+    "hl_perp",
+    "coins",
+    "cycles",
+    "fill_pairs",
+    "usd",
+    "rest_bps",
+    "cross_bps",
+    "ttl_ms",
+    "sweep_every",
+    "stall",
+    "sweep_first",
+    "hl_outcome",
+    "outcome",
+    "outcome_usd",
+    "dry_run",
+    "fill",
+    "fill_px",
+    "fill_sz",
+    "fill_slot",
+    "fill_cloid",
+    "fill_repeat",
+    "sweep",
+    "requote",
+    "recon",
+    "recon_secs",
+    "watch",
+    "binance_probe",
+    "binance",
+    "bn_rest",
+    "bn_hmac",
+    "bn_um_symbol",
+    "bn_cm_symbol",
+    "bn_cycles",
+    "bn_fill_pairs",
+    "bn_usd",
+    "bn_rest_bps",
+    "bn_cross_bps",
+    "bn_ttl_ms",
+    "bn_rotate_s",
+    "bn_drill",
+    "bn_spot_symbol",
+    "bn_adopt_usd",
+    "bn_stream_confirm",
+    "bn_eq_symbol",
+    "bn_eq_session",
+    "bn_eq_tokenize",
+    "bn_eq_quote",
+    "bn_eq_ttl_ms",
+    "bn_confirm_mainnet",
+    "bn_mainnet",
 ];
 
 const STRATEGY_SET_NAMES: &[&str] = &[
@@ -504,7 +553,7 @@ struct ExecSmokeArgs {
         long,
         default_value_t = false,
         requires = "lifecycle",
-        conflicts_with = "dry_run"
+        conflicts_with_all = ["dry_run", "offline", "watch", "recon", "fill", "requote", "sweep"]
     )]
     hl_perp: bool,
 
@@ -552,6 +601,35 @@ struct ExecSmokeArgs {
     /// signer's.
     #[arg(long, default_value_t = false, requires = "hl_perp")]
     sweep_first: bool,
+
+    /// **XMM XH4i-8 — the outcome battery.** With `--lifecycle`: slot 3's
+    /// Hyperliquid gateway arm in its outcome mode and its gateway, composed
+    /// in-process as the engine composes them, rolled onto `--outcome` and
+    /// driven through an ALO place, a reprice, `BadAloPx` refusals, a quote
+    /// on the NO leg, IoCs (a miss, a take and its sale), reconciliations of
+    /// the legs and the cancel-all word on its HIP-4 legs — after phases A
+    /// and B, on the testnet host only. Prices come from the outcome's book;
+    /// each order's notional is `--outcome-usd` (≤ $25). Exit codes 40–48
+    /// (`outcome_battery`).
+    #[arg(
+        long,
+        default_value_t = false,
+        requires_all = ["lifecycle", "outcome"],
+        conflicts_with_all = [
+            "dry_run", "hl_perp", "binance", "offline", "watch", "recon", "fill", "requote",
+            "sweep"
+        ]
+    )]
+    hl_outcome: bool,
+
+    /// XH4i-8: the outcome the battery rolls onto — its id, NOT `enc` (the
+    /// YES leg is `#<id × 10>`). The operator states it (LAW E-4).
+    #[arg(long, requires = "hl_outcome")]
+    outcome: Option<u32>,
+
+    /// XH4i-8: each order's notional, USD (2 ..= 25).
+    #[arg(long, default_value_t = 5, requires = "hl_outcome")]
+    outcome_usd: i64,
 
     /// Show exactly what phase C WOULD send, and send nothing.
     ///
@@ -2209,6 +2287,7 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
     // venue round-trips have already run.
     if args.lifecycle
         && !args.hl_perp
+        && !args.hl_outcome
         && (args.px.is_none() || args.px2.is_none() || args.sz.is_none())
     {
         error!("exec-smoke: --lifecycle needs --px, --px2 and --sz (all 1e8-scaled)");
@@ -2356,6 +2435,9 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
             );
             if args.lifecycle && args.hl_perp {
                 return exec_hl_perp(&cfg, &args);
+            }
+            if args.lifecycle && args.hl_outcome {
+                return exec_hl_outcome(&cfg, &args);
             }
             if args.lifecycle {
                 return exec_lifecycle(&cfg, &args);
@@ -3025,6 +3107,59 @@ fn exec_hl_perp(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitC
     }
     let report = cli::xmm_battery::run(&spec, gcfg, sk);
     cli::xmm_battery::log_report(&report);
+    println!("{}", report.to_json());
+    ExitCode::from(report.exit)
+}
+
+/// XMM XH4i-8: the outcome battery on slot 3's gateway arm
+/// (`cli::outcome_battery`). Runs only after phases A and B, like phase C,
+/// and only against the testnet host.
+fn exec_hl_outcome(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {
+    if !cfg.is_testnet() {
+        error!("exec-smoke --hl-outcome: the battery runs on TESTNET only");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+    let Some(outcome) = args.outcome else {
+        error!("exec-smoke --hl-outcome needs --outcome <id> (the outcome id, not enc)");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    };
+    let spec = cli::outcome_battery::OutcomeSpec {
+        outcome,
+        usd: args.outcome_usd,
+        recon_ms: cli::xmm_live::RECON_MS,
+    };
+    if let Err(e) = spec.validate() {
+        error!("exec-smoke --hl-outcome: {e}");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+    let sk = match cfg.secret_key() {
+        Ok(k) => k,
+        Err(e) => {
+            error!("exec-smoke --hl-outcome: {e}");
+            return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+        }
+    };
+    let gcfg = exec_hyperliquid::GatewayCfg::production(
+        cfg.host.clone(),
+        TlsTransport::default_client_config(),
+        cfg.network,
+        cfg.master_addr,
+        cli::exec_boot::BIN15_SLOT as u8,
+    );
+    info!(
+        host = %cfg.host,
+        outcome,
+        usd = args.outcome_usd,
+        "exec-smoke: XH4i-8 — the outcome battery on slot 3's gateway arm"
+    );
+    // SIGINT/SIGTERM end the battery through its end — the cancel-all and
+    // the account read — never mid-run with quotes left resting.
+    if let Err(e) = cli::sigint::install_sigint_handler() {
+        error!("exec-smoke --hl-outcome: the signal handler: {e}");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+    let report = cli::outcome_battery::run(&spec, gcfg, sk);
+    cli::outcome_battery::log_report(&report);
     println!("{}", report.to_json());
     ExitCode::from(report.exit)
 }

@@ -133,8 +133,9 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   - Its gateway arm is wired (XH4f), and slot 3 can ride a gateway too
     (XH4i). One Hyperliquid gateway arm per engine (A-S7-85).
   - Nothing is armed on mainnet: no `HYPERLIQUID_XMM_*` keys exist.
-  - The `xmm` branch (`e3a3dd1`, `38501f1`: the outcome battery and its
-    docs) is NOT merged — the operator's word.
+  - XH4i-8, the outcome battery (`exec-smoke --hl-outcome --lifecycle
+    --outcome <id>`, exit codes 40–48; testnet only, nothing armed), merged
+    from `xmm` on 2026-10-14 (the operator's word; risk-policy "XH4i-8").
 - **Slot 7 (hcv) and Hypercall, the eighth venue** (live since the
   2026-09-26 go-live; risk-policy "HYPERCALL — slot 7", "HYPERCALL — the
   order arm").
@@ -189,10 +190,14 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   candles.db as 1 m capture bars, a candidate primary per `har_seed compare`.
 - **The HK housekeeping lane (2026-10-13; risk-policy "HK").** HK1–HK10 closed
   Section A of the 2026-10-13 survey.
-- **Gates at HEAD (the HK lane's close, 2026-10-13):**
+- **Gates at HEAD (the XH4i-8 merge, 2026-10-14; the HK lane's close the day
+  before):**
   - clippy clean.
-  - nextest 4 639 passed (10 skipped: the five `#[ignore]`d live smokes,
-    four alloc child helpers and a fixture regenerator). The seven
+  - nextest 4 648 run (10 skipped: the five `#[ignore]`d live smokes,
+    four alloc child helpers and a fixture regenerator): 4 647 passed, and
+    the load-sensitive `ws_frame_roundtrip_is_zero_alloc` was red once in
+    the full run (6 allocations, 1 012 B, debug) and green alone three
+    times and in the alloc gate — open (A-S7-101). The seven
     load-sensitive tests run one at a time (`.config/nextest.toml`, HK8c).
     nextest runs no doctests: core-ring's `Mailbox` `compile_fail` doctest
     needs `cargo test --doc -p core-ring`.
@@ -203,7 +208,7 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   - `make bench-check` OK: 14 samples within 15 % on the M4 (HK9); a
     missing or stale result fails.
   - worker pytest 1 722 passed, 3 skipped (the three need the release
-    binary on PATH).
+    binary on PATH) — at HK10; the merge touches no Python.
   - `make py-lint` all checks passed (HK8a). `make lint` means clippy.
   - fuzz: each HK cut's touched targets 60 s, clean (risk-policy "HK1",
     "HK2", "HK4"). The longer runs are in each lane's record.
