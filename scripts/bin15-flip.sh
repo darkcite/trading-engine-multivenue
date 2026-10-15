@@ -126,7 +126,10 @@ kv_off() {
     { print }' "$2" > "$2.new" && mv "$2.new" "$2" || die "cannot edit $2"
 }
 
-# ARM_LIVE is a comma list of slots 0-7 (anything else: refuse, never guess).
+# ARM_LIVE is a comma list of BUILT slots 0-7 (anything else: refuse, never
+# guess). 8-15 are reserved since S16 (no member): the engine would refuse
+# to arm one at boot, AFTER this script restarts it (a launchd relaunch
+# loop), so the script refuses first. A member's own lane widens this.
 arm_ok() {
   print -r -- "$(kv_get ARM_LIVE)" | tr ',' '\n' | awk 'NF && $1 !~ /^[0-7]$/ { bad = 1 } END { exit bad }'
 }
@@ -135,7 +138,7 @@ arm_ok() {
 arm_with() {
   print -r -- "$(kv_get ARM_LIVE)" | tr ',' '\n' | awk -v op="$1" '
     NF && $1 != "3" { s[$1 + 0] = 1 }
-    END { if (op == "add") s[3] = 1; out = ""; for (i = 0; i < 8; i++) if (i in s) out = out (out == "" ? "" : ",") i; print out }'
+    END { if (op == "add") s[3] = 1; out = ""; for (i = 0; i < 16; i++) if (i in s) out = out (out == "" ? "" : ",") i; print out }'
 }
 
 arm_has_3() { print -r -- "$(kv_get ARM_LIVE)" | tr ',' '\n' | awk 'NF && $1 == "3" { f = 1 } END { exit !f }'; }
@@ -576,7 +579,7 @@ live_checks() {
   git -C "$REPO_DIR" show HEAD:docs/risk-policy.md 2>/dev/null | grep -q '^### S7-L1 — slot 3 LIVE' \
     || die "no S7-L1 entry in the committed docs/risk-policy.md (phased loosening: no arming without it)"
   case "+$(kv_get STRATEGY)+" in *+bin15+*) ;; *) die "STRATEGY=$(kv_get STRATEGY) does not run bin15" ;; esac
-  arm_ok || die "ARM_LIVE=$(kv_get ARM_LIVE) is not a comma list of slots 0-7 — fix it by hand"
+  arm_ok || die "ARM_LIVE=$(kv_get ARM_LIVE) is not a comma list of built slots 0-7 (8-15 are reserved) — fix it by hand"
   check_exec_toml
   if [ "$GATEWAY" = 1 ]; then
     # XMM XH4i-5: the binary must carry slot 3's gateway arm, and slot 3
@@ -650,7 +653,7 @@ flip_paper() {
     [ -f "$PAPER_COPY" ] || die "bin15.toml is a LIVE cut and $PAPER_COPY is missing — restore bin15.toml from a .bak by hand"
     is_live_cut "$PAPER_COPY" && die "$PAPER_COPY is itself a LIVE cut — restore by hand"
   fi
-  arm_ok || die "ARM_LIVE=$(kv_get ARM_LIVE) is not a comma list of slots 0-7 — fix it by hand"
+  arm_ok || die "ARM_LIVE=$(kv_get ARM_LIVE) is not a comma list of built slots 0-7 (8-15 are reserved) — fix it by hand"
   check_exec_toml
   [ "$switch_only" = 1 ] && [ "$was_live" = 1 ] && die "slot 3 runs LIVE — run: bin15-flip.sh paper (it halts slot 3 first)"
   [ "$switch_only" = 1 ] || engine_up

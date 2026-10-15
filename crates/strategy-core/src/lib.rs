@@ -587,7 +587,8 @@ pub trait StrategyCounters {
 }
 
 /// RG6: one strategy-set slot's dashboard counters — POD, embedded in
-/// the `/state` snapshot (`engine-snapshot`) eight times.
+/// the `/state` snapshot (`engine-snapshot`) once per slot (16 since
+/// schema 3, S16-5).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct SlotCounters {

@@ -2295,12 +2295,16 @@ mod tests {
     /// map — the very failure that check exists to prevent.
     #[test]
     fn the_slot_map_matches_the_one_state_publishes() {
-        // S16-5: `/state` publishes eight slots until its schema 3; the
-        // slots past them are the unbuilt ones (S16-R5).
-        assert_eq!(engine_snapshot::SLOT_NAMES.len(), 8, "S16-5 widens this");
-        assert!(SLOT_NAMES[engine_snapshot::SLOT_NAMES.len()..]
-            .iter()
-            .all(|n| *n == UNBUILT_SLOT_NAME));
+        // Schema 3 (S16-5): `/state` publishes all sixteen slots — the
+        // binding fails to compile if the two tables' lengths part — and
+        // names the unbuilt ones (8–15, S16-R5) with this module's word.
+        let published: &[&str; EXEC_SLOTS] = &engine_snapshot::SLOT_NAMES;
+        assert_eq!(engine_snapshot::RESERVED_SLOT_NAME, UNBUILT_SLOT_NAME);
+        for (i, n) in published.iter().enumerate() {
+            if !slot_in(strategy_set::BUILT_MASK, i) {
+                assert_eq!(*n, UNBUILT_SLOT_NAME, "unbuilt slot {i}");
+            }
+        }
         for (i, (mine, theirs)) in SLOT_NAMES
             .iter()
             .zip(engine_snapshot::SLOT_NAMES.iter())

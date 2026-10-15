@@ -40,7 +40,9 @@ use std::time::{Duration, Instant};
 
 use core_types::regime::{DIM_COUNT, DIM_SOURCE};
 use core_types::{RegimeWord, SlotMask, REGIME_PROFILES};
-use engine_snapshot::{EngineSnapshot, SnapshotCell, SLOT_NAMES, SNAPSHOT_SLOTS, VENUE_NAMES};
+use engine_snapshot::{
+    EngineSnapshot, SnapshotCell, RESERVED_SLOT_NAME, SLOT_NAMES, SNAPSHOT_SLOTS, VENUE_NAMES,
+};
 use ratatui::layout::Constraint;
 
 /// Tick period for the TUI redraw loop.
@@ -409,6 +411,7 @@ fn render_strategies(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s:
         Cell::from("drop"),
     ]);
     let rows: Vec<Row> = (0..SNAPSHOT_SLOTS)
+        .filter(|&i| slot_shown(s, i))
         .map(|i| {
             let c = &s.slots[i];
             Row::new(vec![
@@ -431,10 +434,30 @@ fn render_strategies(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s:
         Constraint::Length(8),
         Constraint::Length(6),
     ];
+    let hidden = SNAPSHOT_SLOTS - rows.len();
+    let title = if hidden == 0 {
+        " strategies ".to_owned()
+    } else {
+        format!(" strategies (+{hidden} reserved, idle) ")
+    };
     let t = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(" strategies "));
+        .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(t, area);
+}
+
+/// S16-5: a reserved slot (8–15, no member) earns a row only when
+/// something is set on it — a mask bit, a gate, an order — so the panel
+/// keeps its member rows on a normal boot while an anomaly on a
+/// reserved slot still shows. A member's row always shows.
+fn slot_shown(s: &EngineSnapshot, i: usize) -> bool {
+    let c = &s.slots[i];
+    SLOT_NAMES[i] != RESERVED_SLOT_NAME
+        || ((s.boot.requested_mask | s.boot.configured_mask | s.enabled_mask) >> i) & 1 != 0
+        || s.regime.gates[i] != 0
+        || s.exec.halted[i] != 0
+        || c.orders_emitted != 0
+        || c.orders_dropped != 0
 }
 
 /// E5: the lifecycle verb of one captured intent, for the `recent
@@ -765,6 +788,26 @@ mod tests {
     use core_types::regime::{
         FUND_POS, LEVEL_HIGH, SHAPE_CHOP, SOURCE_DECLARED, STRETCH_EXT_UP, TREND_BULL, VOL_LOW,
     };
+
+    #[test]
+    fn reserved_slots_show_only_when_something_is_set_on_them() {
+        let mut s = Box::new(EngineSnapshot::empty());
+        let shown = |s: &EngineSnapshot| (0..SNAPSHOT_SLOTS).filter(|&i| slot_shown(s, i)).count();
+        assert_eq!(SNAPSHOT_SLOTS, 16);
+        assert_eq!(shown(&s), 8, "an idle boot shows the eight members");
+        s.boot.configured_mask = 1 << 9;
+        assert!(slot_shown(&s, 9));
+        s.boot.configured_mask = 0;
+        s.enabled_mask = 1 << 15;
+        assert!(slot_shown(&s, 15));
+        s.enabled_mask = 0;
+        s.regime.gates[12] = 1;
+        assert!(slot_shown(&s, 12));
+        s.regime.gates[12] = 0;
+        s.slots[8] = strategy_core::SlotCounters::new(0, 1, 0, 0);
+        assert!(slot_shown(&s, 8));
+        assert_eq!(shown(&s), 9);
+    }
 
     #[test]
     fn format_px_pads_micros() {

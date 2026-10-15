@@ -2524,6 +2524,13 @@ pub const STRATEGY_SLOT_NONE: u8 = 0xFF;
 /// halt latch's line). The slot byte itself (`Order::strategy_id`,
 /// `AiCmd::strategy_id`, …) was always a full `u8` on every wire and in
 /// every capture, so the change moved no format.
+///
+/// Slots 0–7 are the built members (hyparb, vrp, xsd, bin15, ai-exec,
+/// vm, xmm, hcv); 8–15 are RESERVED (S16-R5): no member stands there,
+/// `strategy_set::BUILT_MASK` (`0x00FF`) never sets their bits, and an
+/// enable, a command or a live arm naming one is refused. `/state`
+/// carries all sixteen since its schema 3 (S16-5), the reserved ones
+/// named `reserved`.
 pub const MAX_STRATEGY_SLOTS: u8 = 16;
 
 /// A set of strategy slots, bit `s` = slot `s` (S16-2): the strategy
@@ -2534,6 +2541,8 @@ pub const MAX_STRATEGY_SLOTS: u8 = 16;
 /// false`, where a `u8` shift by a slot ≥ 8 silently lands on slot
 /// `s & 7` (slot 11 → slot 3, BIN15) — debug builds panic on it instead,
 /// which is why every mask path has tests at slots 8, 11 and 15.
+/// Bits 8–15 name the reserved slots (see [`MAX_STRATEGY_SLOTS`]): a
+/// set built from members alone never has them.
 pub type SlotMask = u16;
 
 const _: () = assert!(

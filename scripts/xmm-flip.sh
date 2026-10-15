@@ -116,7 +116,10 @@ kv_off() {
     { print }' "$2" > "$2.new" && mv "$2.new" "$2" || die "cannot edit $2"
 }
 
-# ARM_LIVE is a comma list of slots 0-7 (anything else: refuse, never guess).
+# ARM_LIVE is a comma list of BUILT slots 0-7 (anything else: refuse, never
+# guess). 8-15 are reserved since S16 (no member): the engine would refuse
+# to arm one at boot, AFTER this script restarts it (a launchd relaunch
+# loop), so the script refuses first. A member's own lane widens this.
 arm_ok() {
   print -r -- "$(kv_get ARM_LIVE)" | tr ',' '\n' | awk 'NF && $1 !~ /^[0-7]$/ { bad = 1 } END { exit bad }'
 }
@@ -125,7 +128,7 @@ arm_ok() {
 arm_with() {
   print -r -- "$(kv_get ARM_LIVE)" | tr ',' '\n' | awk -v op="$1" '
     NF && $1 != "6" { s[$1 + 0] = 1 }
-    END { if (op == "add") s[6] = 1; out = ""; for (i = 0; i < 8; i++) if (i in s) out = out (out == "" ? "" : ",") i; print out }'
+    END { if (op == "add") s[6] = 1; out = ""; for (i = 0; i < 16; i++) if (i in s) out = out (out == "" ? "" : ",") i; print out }'
 }
 
 arm_has_6() { print -r -- "$(kv_get ARM_LIVE)" | tr ',' '\n' | awk 'NF && $1 == "6" { f = 1 } END { exit !f }'; }
@@ -375,7 +378,7 @@ case "${1:-}" in
   status) status ;;
   live)
     [ -f "$SRC_XMM" ] && [ -f "$SRC_SEC" ] || die "the probe's artifacts are missing from $REPO_DIR (XMM XH5e-1)"
-    arm_ok || die "ARM_LIVE=$(kv_get ARM_LIVE) is not a list of slots 0-7"
+    arm_ok || die "ARM_LIVE=$(kv_get ARM_LIVE) is not a list of built slots 0-7 (8-15 are reserved)"
     check_exec_toml
     exec_shape_ok "$EXEC" || die "$EXEC is not shaped as this script edits it ([exec] enabled = 1; [exec.slot.6] spelled exactly) — flip by hand"
     case "$(slot6_mode "$EXEC")" in
@@ -416,7 +419,7 @@ case "${1:-}" in
     say "LIVE at the next restart (backups: *.bak-$TS-xmmflip). Restart by hand with the checklist open (§B10): pkill -TERM -f 'multivenue-engine run'"
     ;;
   paper)
-    arm_ok || die "ARM_LIVE=$(kv_get ARM_LIVE) is not a list of slots 0-7"
+    arm_ok || die "ARM_LIVE=$(kv_get ARM_LIVE) is not a list of built slots 0-7 (8-15 are reserved)"
     check_exec_toml
     exec_shape_ok "$EXEC" || die "$EXEC is not shaped as this script edits it — flip by hand (halt slot 6 first: echo 'slot=6 reason=operator' >> $HALT)"
     # The safe side: halt unless the file says paper AND the engine answers

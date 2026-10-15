@@ -8,7 +8,7 @@
 //! engine thread.
 //!
 //! * [`EngineSnapshot`] — ONE `#[repr(C, align(64))]` `Copy` POD
-//!   (≈ 28 KB) holding every dashboard-facing datum: boot identity,
+//!   (≈ 32 KB) holding every dashboard-facing datum: boot identity,
 //!   loop counters, latency percentiles, the regime detector's
 //!   observables, per-slot strategy counters, the vm's active table
 //!   row-by-row, the xmm member, the AI plane, per-venue ingress
@@ -58,7 +58,8 @@ pub use snapshot::{
     HcvSnapshot, HyparbSnapshot, IngressSnapshot, LatencySnapshot, LoopCounters, RecentRing,
     VmSnapshot, XmmSnapshot, BN_REFUSAL_WORDS, BOOT_TEXT_MAX, HALT_REASON_WORDS, RECENT_FILLS,
     RECENT_ORDERS,
-    RETIRED_WHY_UNKNOWN, RETIRED_WHY_WORDS, RUN_DIR_MAX, SLOT_NAMES, SNAPSHOT_HYPARB_COINS,
+    RESERVED_SLOT_NAME, RETIRED_WHY_UNKNOWN, RETIRED_WHY_WORDS, RUN_DIR_MAX, SLOT_NAMES,
+    SNAPSHOT_HYPARB_COINS,
     SNAPSHOT_HYPARB_POOLS, SNAPSHOT_SCHEMA, SNAPSHOT_SLOTS, SNAPSHOT_VENUES, SNAPSHOT_XMM_PERPS,
     VENUE_NAMES,
 };
