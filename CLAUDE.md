@@ -209,7 +209,7 @@ The lane records stay where they always were: `docs/risk-policy.md` and
 - **The HK housekeeping lane (risk-policy "HK", "HK, part 2").** HK1–HK10
   (2026-10-13) closed Section A of that day's survey; HK11–HK17 (2026-10-14)
   Section B and the day's findings; HK18–HK23 (2026-10-15) the follow-ups;
-  HK24–HK28 ("HK, part 3", 2026-10-15) the rest of the housekeeping.
+  HK24–HK33 ("HK, part 3", 2026-10-15) the rest of the housekeeping.
 - **The S3 archive (HK11, HK18, HK20).** Uploads are paced in 64 KiB pieces
   under `MULTIVENUE_S3_MAX_UPLOAD_MIBPS`, 20 MiB/s since HK20 (the link's
   ~5 MB/s binds; the feed delays stayed near their no-upload band). An
@@ -222,7 +222,7 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   `--path` too, and candles go up zstd'd.
 - **Gates at HEAD (HK, part 3, 2026-10-15):**
   - clippy clean.
-  - nextest 4 662 passed (10 skipped: the five `#[ignore]`d live smokes,
+  - nextest 4 693 passed (10 skipped: the five `#[ignore]`d live smokes,
     four alloc child helpers and a fixture regenerator), under nextest
     0.9.148. A random `LEAK` at ~0.2 s under nextest < 0.9.145 on macOS is
     nextest's pipe race, not the test (HK23). Only the scrape hammer runs alone (`.config/nextest.toml`):
@@ -252,10 +252,17 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   - **Format drift:** ~208 Rust files and ~106 worker files outside the HK
     lane's are not rustfmt/ruff-format clean (HK28); formatting them all is
     `cargo fmt --all` in effect — the operator's call.
-  - **Polymarket parse errors** trickle at ~0.17 % of messages with no
-    reconnects (420 in 243 658 over 08:34–10:46Z on 2026-10-14). Since HK19
-    `strategy.conf`'s `RAW_TAP=pm` makes the wrapper pass `--raw-tap pm`
-    (rejects only, ≤ 64 MiB): each run dir's `pm-raw.tap` holds them.
+  - **Polymarket parse errors: resolved (HK30).** They were the venue's
+    post-trade `book` re-snapshots (", " separators); 0 since 13:46Z
+    2026-10-15. `RAW_TAP=pm` stays as the standing rejects tap
+    (`pm-raw.tap`, ≤ 64 MiB a run). Largest frame seen: 10 152 B against the
+    64 KiB RX buffer (982 584 frames, 3.5 h; risk-policy "HK, part 3").
+  - **`venue_seq` (HK31, HK32):** pm, hl (`bbo` + outcome `l2Book` touch)
+    and deribit (`quote`) ticks carry a per-instrument arrival ordinal
+    (`core_types::ArrivalSeq`), not ms bits; 0 = an older tick, counted on
+    `seq_regressions_total` (baselines pm ~0, hl ~0, deribit ~115 an hour).
+    Rulings open: BIN15 O8's touch source (l2Book vs bbo); the u32
+    truncation of Binance/Bybit/MEXC seqs (no live book reads them).
   - **Memory:** a whole-root `audit-pnl` / `backtest` OOMs above ~27 GB; use
     bounded ≤ 2 h window roots.
   - **Regime:** `regime.toml [labels] require = 1` is NOT flipped live.

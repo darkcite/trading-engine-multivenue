@@ -16222,3 +16222,118 @@ stay the operator's (HK-R20); the lost `-dotnet/PLAN.md` is let go (HK-R21).
   (ruff's line-length 100 against code wrapped narrower). Formatting all of it
   is `cargo fmt --all` in effect, which the house rule bans; it stays as is
   unless the operator rules otherwise.
+
+### HK30 — Polymarket's post-trade `book` re-snapshots parse (`ingress-polymarket`), 2026-10-15
+
+- **Cause.** Every Polymarket parse error (~0.2 % of messages; 46 in the first
+  hour of the all-frames tap) was one shape: after subscribe the venue
+  re-sends a book as a SINGLE object with ", " separators (`{"price":"0.01",
+  "size":"…"}, {…}`), bids/asks before hash/timestamp, no `tick_size`.
+  `scan_best_level` matched compact bytes (`","size":"`, `{` right after `,`),
+  so every re-snapshot was rejected; only the subscribe-time array form
+  parsed.
+- **Fix.** The level walk skips JSON whitespace after `[`, between `",` and
+  `"size":"`, after each `}` and `,` (core-parse `skip_ws`), returns at `]`,
+  and now rejects leading/trailing/doubled/missing commas (the old walker
+  accepted `[,{…}]`, `[{…},]`, `},,{`, `}{`).
+- **What it buys.** A quiet parse-error counter and the touch sizes in the
+  capture. Each re-snapshot is post-trade: the same `timestamp` and best
+  bid/ask as the `price_change` just before it (122/122) — no fresher touch.
+- **Evidence.** 46/46 rejects parse and match a Python json decode; 17 279
+  accepted events/rows identical before/after; 126/126 book events in both
+  forms match an independent max-bid/min-ask. Fuzz ~5–6 M runs clean; the
+  compact path's A/B unchanged; copy-audit new 0. Reviews: SHIP.
+- **Deployed** at `ddc1d6a`, `pkill -TERM` 13:46:38Z: Polymarket parse errors
+  0 since (0 rejects in the 13:46Z, 16:05Z and 16:31Z taps).
+
+### HK31 — Polymarket `venue_seq` is a per-asset arrival ordinal (`ingress-polymarket`), 2026-10-15
+
+- **Defect** (found in HK30's review). `Tick.venue_seq` was the low 32 bits of
+  the frame's ms timestamp and book-builder's `TopOfBook::apply` drops
+  `venue_seq <= last` as Stale, so every update sharing its asset's previous
+  millisecond was dropped — 8–10 % of `price_change` rows, 172 touch changes
+  an hour, every post-trade re-snapshot — and at the low-32 wrap (next
+  2026-11-21 21:25:29.728Z) every pm tick would have been Stale until a
+  restart.
+- **Fix.** A per-asset `{ last_ms, seq }` in the PM driver (a fixed array by
+  SymbolMap row, owned by the ingress thread): a frame at or after the asset's
+  newest ms takes the next ordinal (arrival order on the one connection = the
+  venue's order); an older frame gets 0 — dropped by every book, counted on
+  `engine_ingress_polymarket_seq_regressions_total`. A reconnect zeroes
+  `last_ms` (a poisoned clock clears) and keeps `seq` (monotone per process).
+  Parsers emit 0; the run loop stamps after a successful parse.
+- **Evidence.** Only `TopOfBook::apply` interprets pm `venue_seq`; nothing
+  reads it as a time; one PM connection; 0 timestamp decreases in 164 372
+  rows. An hour's tap through the real `drive_one` into `TopOfBook`: new law
+  164 666 applied, 0 stale, 0 gaps, 0 older applied; old law 13 372 stale, the
+  touch lagging in 170 episodes (3.57 s, worst 430 ms); 184 touch prices
+  recovered. Reviews: SHIP.
+
+### HK32 — Hyperliquid `bbo` / outcome `l2Book` touch and Deribit `quote`: the shared arrival ordinal (`core-types`, `ingress-hyperliquid`, `ingress-deribit`), 2026-10-15
+
+- **Ruling.** The operator chose to fix HL and Deribit the same way (both used
+  `venue_seq = ms as u32`; same collapse, same 2026-11-21 wrap for all three
+  venues).
+- **What.** `core_types::ArrivalSeq` (HK31's sequencer, shared; PM moved onto
+  it). HL: one sequencer per coin row for `bbo` AND the outcome-leg `l2Book`
+  touch — one book needs one sequence. The two are different views: within a
+  block the l2Book touch is never looser than the bbo, and the venue sends it
+  second (115/115 on outcome legs, 4 798/4 800 on perps), so it wins the
+  block; the rare reversed order lets the looser bbo win, accepted. A roll
+  rebinds the row under the same SymbolId and keeps the ordinal. Deribit: one
+  per symbol index. `IngressStatus::note_arrival_seq` counts a 0 on
+  `seq_regressions_total` (cold path).
+- **Measured** (one closed hour, captured ticks rebuilt to wire frames through
+  the real `drive_one`): HL 368 687 applied, 0 stale — old law 116 stale (the
+  block's l2Book touch right behind its bbo), 84 touch prices lost, 137 s of
+  lag on the outcome legs (perps had no same-ms pairs: the change there is the
+  wrap). Deribit 821 405 applied, 115 older quotes dropped and counted
+  (backlogs after multi-second host stalls) — old law 80 more stale, 3 touch
+  prices.
+- **Baselines for `seq_regressions_total`:** pm ~0/h, hl ~0/h (an HL re-send
+  carries the last-change stamp, so an occasional count is not a stuck clock),
+  deribit ~115/h.
+- Reviews: SHIP (both), findings applied; fuzz `hl_ws_frame` /
+  `deribit_jsonrpc_frame` clean; bench-check 16/16; copy-audit new 0.
+
+### Deploys of HK30–HK32, 2026-10-15
+
+| at | binary | how | checked |
+|---|---|---|---|
+| 13:46:38Z | `ddc1d6a` (HK30) | release build, `exec-smoke --offline` PASS, `pkill -TERM` after the 13:45 settlement minute | 9 feeds, halted 0, `vm_rows_active 2`, PM parse errors 0 |
+| 16:05Z | `ddc1d6a` | the daily-restart slot | — |
+| 16:31:36Z | `9f5bc8c` (HK31+HK32) | release build, `exec-smoke --offline` PASS, `pkill -TERM` after the 16:30 settlement minute | 9 feeds, halted 0, `vm_rows_active 2`, PM parse errors 0, `seq_regressions_total` 0/0/0 |
+
+Gates at `9f5bc8c`: clippy clean; nextest 4 693 passed (10 skipped); alloc
+127/127; copy-audit 27 / new 0; license OK.
+
+### Polymarket's largest frame (the all-frames window, 2026-10-15 12:46–~18:30Z)
+
+- `--raw-tap pm --raw-tap-mode all --raw-tap-budget-mb 512` over four runs
+  (12:46Z, 13:46Z — its tap filled the 512 MiB budget after 1.85 h —, 16:05Z,
+  16:31Z): **982 584 frames in 3.53 h; max 10 152 B; p99 623 B, p99.9 2 394 B,
+  p99.99 3 180 B; none over 16 KiB.**
+- Against `RX_BUF_SIZE` = 64 KiB (`ingress-polymarket/src/run_loop.rs:60`),
+  where a larger frame is refused by the HK2 oversize guard (test at
+  `run_loop.rs` ~1296): the largest frame uses 15.5 % of the buffer, a 6.5×
+  margin. The theoretical worst case is a full 0.001-tick ladder (~74 KB),
+  which these markets (0.01 ticks, ≤ 99 levels a side, ~7 KB) do not reach.
+- The tap is back to rejects-only from the next boot: `strategy.conf` keeps
+  `RAW_TAP=pm` (backup `strategy.conf.bak-…-hk-tapoff`); the wrapper block
+  yields `--raw-tap pm --raw-tap-mode rejects`.
+
+### Open after HK30–HK32 (rulings)
+
+- **BIN15 O8, which source is the outcome touch.** Across blocks the
+  outcome-leg touch alternates between the tighter `l2Book` view and the
+  looser `bbo` view; BIN15 reads ticks raw, last-arrival-wins (under both
+  laws). Which source is the truth when both sides are quoted is a BIN15
+  ruling.
+- **Other u32 truncations.** Binance bookTicker `u`, Bybit `update_id` and
+  MEXC `version` are also cut to u32 in `Tick.venue_seq`. No live `TopOfBook`
+  reads those venues today; a later HK.
+- **Hyperliquid `parse_errors_total`** reads 8 in the first ~20 min after the
+  16:31Z boot (137 782 messages). HK32 did not touch HL's dispatch; whether
+  this is the old rate is unknown (no counter history). `RAW_TAP=pm,hl`
+  (rejects only) at a boot would name them.
+

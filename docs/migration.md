@@ -6,6 +6,28 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-15 — `Tick.venue_seq` for pm / hl / deribit is a per-instrument arrival ordinal (HK31, HK32)
+
+**What changed**
+- Polymarket ticks, Hyperliquid `bbo` and outcome-leg `l2Book` touch ticks,
+  and Deribit `quote` ticks carry `venue_seq` = the ingress's per-instrument
+  arrival ordinal (`core_types::ArrivalSeq`), restarting at 1 with each
+  process; 0 = a tick older than the instrument's newest (counted on
+  `engine_ingress_<venue>_seq_regressions_total`). It was the low 32 bits of
+  the venue's ms timestamp.
+
+**Impact**
+- `TopOfBook` / `MultiBook` no longer drop same-ms updates as Stale, and the
+  2026-11-21 21:25:29Z low-32 wrap is gone. The full ms time is unchanged in
+  `venue_time_ms`.
+- Captures (`pm-ticks.pmlr`, `hl-ticks.pmlr`, `deribit-ticks.pmlr`) from
+  before these cuts hold ms-low-32 values in the seq column; from after,
+  ordinals. Nothing in the repo reads that column as a time.
+
+**Migration steps**
+1. None. Anyone replaying several `run-*` cuts through a `TopOfBook` must
+   reset the books per run (the ordinal restarts at each boot).
+
 ## 2026-10-15 — HYPARB G1 tally: `claude_worker.hyparb_g1`, nightly; `backtest` counters `pnl_session_usd=` (HK26)
 
 **What changed**
