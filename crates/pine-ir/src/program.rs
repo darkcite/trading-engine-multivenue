@@ -296,7 +296,7 @@ pub struct SubProgram {
 
 /// Everything the host, the broker and the harnesses need to know about a
 /// program, computed by `pine-sema`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ProgramMeta {
     /// SHA-256 of the `.pine` source bytes.
     pub source_sha256: [u8; 32],
@@ -305,6 +305,10 @@ pub struct ProgramMeta {
     pub spec_sha256: [u8; 32],
     /// What the script declared itself to be.
     pub kind: ScriptKind,
+    /// The dialect the script declared (`//@version=`); equal to
+    /// `PineProgram::dialect`. Hosts and `pine-broker` read it here (W23
+    /// differs by dialect; the broker never sees `PineProgram`). Amendment A4.5.
+    pub dialect: Dialect,
     /// Deepest history any slot or window needs.
     pub max_bars_back: u32,
     /// Bars before the script's outputs stop being provisional.
@@ -330,6 +334,30 @@ pub struct ProgramMeta {
     pub inputs: Vec<InputDesc>,
     /// Every captured plot index; `plots[i].index == i`.
     pub plots: Vec<PlotDesc>,
+}
+
+impl Default for ProgramMeta {
+    /// All-zero / empty, with `dialect` = [`Dialect::V6`] (`Dialect` has no
+    /// zero value; sema always writes the declared one).
+    fn default() -> Self {
+        Self {
+            source_sha256: [0; 32],
+            spec_sha256: [0; 32],
+            kind: ScriptKind::default(),
+            dialect: Dialect::V6,
+            max_bars_back: 0,
+            warmup_bars: 0,
+            insn_budget_per_eval: 0,
+            max_intents_per_eval: 0,
+            uses_lookahead: false,
+            uses_intrabar: false,
+            nonstandard_chart: false,
+            chart: ChartInfo::default(),
+            decl: StrategyDecl::default(),
+            inputs: Vec::new(),
+            plots: Vec::new(),
+        }
+    }
 }
 
 /// A compiled, not yet verified program. Immutable once built and shared

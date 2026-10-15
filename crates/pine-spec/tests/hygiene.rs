@@ -117,12 +117,15 @@ fn codegen_is_deterministic() {
     let a = generate();
     let b = generate();
     assert_eq!(a, b);
+    // COPY: the generated spec_gen.rs (≈ 1.3 MB) — kernel→user read of the build's output, the
+    // OS-boundary copy; cold (test) — mmap rejected: std only, and the test compares once.
     let built = std::fs::read_to_string(concat!(env!("OUT_DIR"), "/spec_gen.rs")).expect("out");
     assert_eq!(a, built);
     assert!(a.starts_with(emit::HEADER));
     let csrc = read(CHART);
     let c = chart::read(&csrc).expect("chart");
     let cg = emit::chart(&c, &core_crypto::sha256(&csrc));
+    // COPY: chart_gen.rs (< 2 KiB) — kernel→user read, as above; cold (test).
     let cbuilt = std::fs::read_to_string(concat!(env!("OUT_DIR"), "/chart_gen.rs")).expect("out");
     assert_eq!(cg, cbuilt);
 }
@@ -226,7 +229,10 @@ fn each_invalid_chart_names_its_rule() {
 #[test]
 fn builtins_has_no_merger_placeholder() {
     let src = String::from_utf8(read("spec/builtins.json")).expect("utf-8");
-    assert!(!src.contains("TODO:"), "spec/builtins.json holds a TODO: string");
+    assert!(
+        !src.contains("TODO:"),
+        "spec/builtins.json holds a TODO: string"
+    );
     assert!(
         !src.contains("validation-only fallback"),
         "spec/builtins.json holds the merger note"

@@ -63,6 +63,8 @@ fn worked_example_lowers() {
     ];
     assert_eq!(ids, want);
     // Every rule but R10 holds on it; R10 refuses its "§" (impl-00 open question, report).
+    // COPY: worked.json (< 16 KiB) into an ASCII twin — R10 refuses the "§" the §4.2 text
+    // carries, and the fixture must stay §4.2 verbatim; cold (test) — editing the fixture rejected.
     let ascii = String::from_utf8(src)
         .expect("utf-8")
         .replace('\u{a7}', "section");

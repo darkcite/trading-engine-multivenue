@@ -211,6 +211,20 @@ fn elem_encoding_separates_scalars_enums_and_udts() {
 }
 
 #[test]
+fn program_meta_carries_the_dialect() {
+    // Amendment A4.5: hosts and pine-broker read the dialect from the meta (W23).
+    let m = ProgramMeta::default();
+    assert_eq!(m.dialect, Dialect::V6);
+    assert_eq!((m.max_bars_back, m.inputs.len(), m.plots.len()), (0, 0, 0));
+    assert_eq!((m.source_sha256, m.spec_sha256), ([0; 32], [0; 32]));
+    let v5 = ProgramMeta {
+        dialect: Dialect::V5,
+        ..ProgramMeta::default()
+    };
+    assert_eq!(v5.dialect, Dialect::V5);
+}
+
+#[test]
 fn plot_and_hline_handles_are_frozen() {
     // Amendment A4.2: two i64-lane handle types after `Enum`; 13.. stay unassigned.
     assert_eq!((Ty::Plot as u8, Ty::Hline as u8), (11, 12));

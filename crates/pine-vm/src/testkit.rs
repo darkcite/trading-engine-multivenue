@@ -251,6 +251,7 @@ impl Tb {
 
         let mut meta = ProgramMeta {
             spec_sha256: self.spec,
+            dialect: self.dialect,
             insn_budget_per_eval: self.budget,
             max_bars_back: self.max_bars_back,
             ..ProgramMeta::default()
