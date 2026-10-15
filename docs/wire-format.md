@@ -44,7 +44,7 @@ files predate it (see `docs/migration.md`).
 | -----: | ----: | ------------- | ---------------- | -------------------------------------- |
 |      0 |     8 | ts_ns         | `u64` NsTs       | monotonic ns from `core-time::now_ns` — the ordering key everywhere; venue time never re-times a record |
 |      8 |     4 | sym           | `u32` SymbolId   | venue-namespaced; `SYMBOL_ID_NONE = u32::MAX` invalid |
-|     12 |     4 | venue_seq     | `u32`            | venue-provided sequence, monotonic (`pm`: the ingress's per-asset arrival ordinal since HK31 — "Capture files") |
+|     12 |     4 | venue_seq     | `u32`            | venue-provided sequence, monotonic (`pm` since HK31, `hl` and `deribit` since HK32: the ingress's per-instrument arrival ordinal, and 0 = a tick older than the instrument's newest — "Capture files") |
 |     16 |     8 | bid_px        | `i64` Price      | fixed-point ×1e6                       |
 |     24 |     8 | bid_qty       | `i64` Qty        | fixed-point ×1e6                       |
 |     32 |     8 | ask_px        | `i64` Price      | fixed-point ×1e6                       |
@@ -567,6 +567,24 @@ wrapping every ~49.7 days). No reader keys on either today, but anyone
 replaying several `run-*` cuts through a `TopOfBook` must reset the
 books per run: a later run's ordinals start below the earlier run's,
 and below any pre-HK31 value.
+
+HK32, appended 2026-10-15 — **`hl` and `deribit` `Tick.venue_seq` are
+the ingress's per-instrument arrival ordinal too; no layout change**
+(`crates/ingress-hyperliquid/src/lib.rs`,
+`crates/ingress-deribit/src/lib.rs`, crate docs; the sequencer is
+`core_types::ArrivalSeq`, shared with `pm`). Hyperliquid `bbo` and the
+outcome-leg `l2Book` touch (BIN15 O8) and Deribit `quote` carry no
+sequence number, only a ms stamp (`time` / `timestamp`, in full in
+`venue_time_ms`); until HK32 `venue_seq` held its low 32 bits. Now each
+instrument's ticks are numbered exactly as `pm`'s above: 1, 2, 3, … in
+arrival order while the stamp does not go back, 0 for a tick older than
+the instrument's newest (counted on
+`engine_ingress_<venue>_seq_regressions_total`), dense per instrument
+and per process, surviving reconnects. One Hyperliquid outcome leg has
+ONE sequence across its two tick sources (one book, one block clock).
+Only `Tick` rows change: `hl-events` / `deribit-events` rows keep their
+venue ids (`tid`, `trade_seq`, `change_id`, the roll codec). The same
+per-run book reset applies when replaying cuts.
 
 MX2, appended 2026-09-23 — `mexc` (VenueId 7; spot + futures share
 one label; data-only, ruling O-MX1). The per-venue law

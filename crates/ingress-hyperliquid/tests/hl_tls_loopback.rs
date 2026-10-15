@@ -402,8 +402,9 @@ fn happy_path_hip4_coin_roundtrip() {
     let tick = *cons.try_pop_ref().expect("BTC tick must be on the ring");
     assert_eq!(tick.venue, VenueId::Hyperliquid as u8);
     assert_eq!(tick.sym, SYM_BTC);
-    // venue_seq = time (ms) truncated to u32 (crate-header policy).
-    assert_eq!(tick.venue_seq, 1_708_622_398_623u64 as u32);
+    // HK32: venue_seq = the coin row's arrival ordinal (crate docs).
+    assert_eq!(tick.venue_seq, 1);
+    assert_eq!(tick.venue_time_ms, 1_708_622_398_623);
     // Prices ×1e6 — 64437.0 → 64_437_000_000; 64438.0 → 64_438_000_000.
     assert_eq!(tick.bid_px.raw(), 64_437_000_000);
     assert_eq!(tick.ask_px.raw(), 64_438_000_000);
@@ -415,7 +416,8 @@ fn happy_path_hip4_coin_roundtrip() {
         .expect("HIP-4 tick must flow the same path");
     assert_eq!(tick.venue, VenueId::Hyperliquid as u8);
     assert_eq!(tick.sym, SYM_HIP4);
-    assert_eq!(tick.venue_seq, 1_723_600_000_001u64 as u32);
+    assert_eq!(tick.venue_seq, 1, "each coin counts from 1");
+    assert_eq!(tick.venue_time_ms, 1_723_600_000_001);
     // Outcome prices in [0, 1] collateral units ×1e6.
     assert_eq!(tick.bid_px.raw(), 400_000);
     assert_eq!(tick.ask_px.raw(), 600_000);

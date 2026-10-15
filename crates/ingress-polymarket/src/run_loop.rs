@@ -45,7 +45,7 @@ use core_net::{
 };
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock};
-use core_types::{Capture, NsTs, SymbolId, Tick, TICK_FLAG_STALE};
+use core_types::{ArrivalSeq, Capture, NsTs, SymbolId, Tick, TICK_FLAG_STALE};
 
 use crate::{
     classify, parse_book_update, parse_price_change_row, scan_venue_time_ms, FrameKind,
@@ -226,53 +226,6 @@ pub enum RunResult {
     Error,
 }
 
-/// HK31: one asset's arrival sequencer — the `Tick.venue_seq` law for
-/// this venue (crate docs). CLOB frames carry no sequence number and the
-/// venue sends several per asset inside one millisecond, so the ingress
-/// numbers them: a frame not older than the asset's newest
-/// (`venue_time_ms >= last_ms`) takes the next ordinal in arrival order
-/// — one TCP stream, so the venue's own order — and an OLDER one takes
-/// 0, which `book_builder::TopOfBook` drops as `Stale` at every book (the
-/// current ordinal would not: a book that missed the newest tick to a
-/// ring drop would apply the older touch). Every 0 is counted on
-/// `seq_regressions_total` (`judge_and_push_tick`): `last_ms` only
-/// rises within a connection, so one far-future stamp would otherwise
-/// drop the asset silently until [`Driver::reset_for_reconnect`] clears
-/// it.
-#[derive(Copy, Clone, Debug)]
-struct AssetSeq {
-    /// Venue `timestamp` (ms) of the newest frame sequenced on this
-    /// connection; 0 = none (fresh, or zeroed by a reconnect).
-    last_ms: u64,
-    /// The last ordinal handed out; 0 = none yet (the book's "never
-    /// seen"). Never reset: monotone for the life of the process.
-    seq: u32,
-}
-
-impl AssetSeq {
-    /// No frame sequenced yet.
-    const ZERO: Self = Self { last_ms: 0, seq: 0 };
-
-    /// The `venue_seq` of a frame stamped `venue_time_ms`: the next
-    /// ordinal (from 1) unless the stamp is older than the newest, then
-    /// 0. Branch-free.
-    #[inline(always)]
-    fn next(&mut self, venue_time_ms: u64) -> u32 {
-        // Unreachable within a process lifetime: 2^32 ticks of one asset
-        // take ~76 days even at the measured one-asset peak of 655
-        // ticks/s (the tap's busiest asset averages 11.5/s).
-        debug_assert!(self.seq != u32::MAX, "polymarket asset ordinal exhausted");
-        let fresh = venue_time_ms >= self.last_ms;
-        self.seq = self.seq.wrapping_add(fresh as u32);
-        self.last_ms = self.last_ms.max(venue_time_ms);
-        if fresh {
-            self.seq
-        } else {
-            0
-        }
-    }
-}
-
 /// Mutable per-connection state owned by the run-loop. Preallocated at
 /// construction; never reallocates in steady state.
 ///
@@ -305,11 +258,12 @@ pub struct Driver {
     /// Reset on reconnect; threshold = venue default or
     /// `--stale-after-ms pm:<ms>` via [`Self::set_stale_after_ms`].
     feed_clock: FeedClock,
-    /// HK31: each mapped asset's arrival sequencer, indexed by its
-    /// [`SymbolMap`] row. Its `seq` is process-lifetime, so the ordinal
-    /// never falls under a book; its `last_ms` is per connection
+    /// HK31: each mapped asset's arrival sequencer (the venue_seq law,
+    /// crate docs; the shared [`ArrivalSeq`] since HK32), indexed by its
+    /// [`SymbolMap`] row. Its ordinal is process-lifetime, so it never
+    /// falls under a book; its clock is per connection
     /// ([`Self::reset_for_reconnect`]).
-    asset_seq: [AssetSeq; crate::PM_SUBSCRIBE_IDS_MAX],
+    asset_seq: [ArrivalSeq; crate::PM_SUBSCRIBE_IDS_MAX],
     /// `!Sync` marker — keeps `Driver: Send` but blocks `&Driver`
     /// from crossing threads.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
@@ -358,7 +312,7 @@ impl Driver {
             asset_id_count: count as u16,
             subscribed: false,
             feed_clock: FeedClock::new(core_types::VenueId::Polymarket.default_stale_after_ms()),
-            asset_seq: [AssetSeq::ZERO; crate::PM_SUBSCRIBE_IDS_MAX],
+            asset_seq: [ArrivalSeq::ZERO; crate::PM_SUBSCRIBE_IDS_MAX],
             _not_sync: ::core::marker::PhantomData,
         };
         let mut i = 0usize;
@@ -419,18 +373,14 @@ impl Driver {
         self.subscribed = false;
         // VT2: a new connection is a new offset; the threshold stays.
         self.feed_clock.reset();
-        // HK31: every asset's `seq` stays, so the ordinal stays monotone
-        // and no book sees it fall; its `last_ms` is zeroed, so a
-        // reconnect clears a clock a far-future stamp poisoned. Safe: rx
-        // was cleared above and the old socket is gone, so no frame of the
-        // old connection can follow — the first per asset is the new
-        // subscribe snapshot, stamped with the book's last-change time,
-        // i.e. the current state, and it applies.
-        let mut i = 0usize;
-        while i < crate::PM_SUBSCRIBE_IDS_MAX {
-            self.asset_seq[i].last_ms = 0;
-            i += 1;
-        }
+        // HK31: every asset's ordinal stays, so it stays monotone and no
+        // book sees it fall; its clock is zeroed, so a reconnect clears a
+        // clock a far-future stamp poisoned. Safe: rx was cleared above and
+        // the old socket is gone, so no frame of the old connection can
+        // follow — the first per asset is the new subscribe snapshot,
+        // stamped with the book's last-change time, i.e. the current
+        // state, and it applies.
+        ArrivalSeq::reset_clocks(&mut self.asset_seq);
     }
 }
 
@@ -747,7 +697,7 @@ fn drain_ws_frames<C: Capture>(
 /// silent.
 #[inline]
 fn judge_and_push_tick<C: Capture>(
-    asset_seq: &mut [AssetSeq; crate::PM_SUBSCRIBE_IDS_MAX],
+    asset_seq: &mut [ArrivalSeq; crate::PM_SUBSCRIBE_IDS_MAX],
     slot: usize,
     clock: &mut FeedClock,
     mut tick: Tick,
@@ -759,9 +709,10 @@ fn judge_and_push_tick<C: Capture>(
     // caps the map); the `%` (a power of two: a mask) only drops the
     // bounds check.
     tick.venue_seq = asset_seq[slot % crate::PM_SUBSCRIBE_IDS_MAX].next(tick.venue_time_ms);
-    if tick.venue_seq == 0 {
-        count_older_frame(status);
-    }
+    // An older frame (`venue_seq` 0, dropped by every book) is counted, so
+    // a stuck asset (a far-future stamp) shows. None on the 2026-10-15
+    // tap: the count is cold.
+    status.note_arrival_seq(tick.venue_seq);
     let judged = clock.judge(tick.venue_time_ms, tick.ts_ns);
     tick.flags = (judged.stale as u8) * TICK_FLAG_STALE;
     if judged.stale {
@@ -777,15 +728,6 @@ fn judge_and_push_tick<C: Capture>(
     if !producer.try_push_ref(&tick) {
         status.inc_ring_drops();
     }
-}
-
-/// HK31: a frame older than its asset's newest stamp (`venue_seq` 0, dropped
-/// by every book) — counted on `seq_regressions_total` so a stuck asset
-/// (a far-future stamp) shows. None on the 2026-10-15 tap: cold.
-#[cold]
-#[inline(never)]
-fn count_older_frame(status: &IngressStatus) {
-    status.inc_seq_regressions();
 }
 
 /// Handle one market-channel text frame (live wire shapes verified

@@ -384,6 +384,12 @@ pub struct Driver {
     /// threshold = venue default or `--stale-after-ms deribit:<ms>` via
     /// [`Self::set_stale_after_ms`].
     feed_clock: FeedClock,
+    /// HK32: each instrument's `quote` arrival sequencer — the
+    /// `Tick.venue_seq` law (crate docs) — indexed by symbol-table row like
+    /// `book_chains`. Its ordinal is process-lifetime, so it never falls
+    /// under a book; its clock is per connection
+    /// ([`Self::reset_for_reconnect`]).
+    quote_seq: [core_types::ArrivalSeq; DERIBIT_MAX_SYMBOLS],
     /// `!Sync` marker — see struct doc.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
 }
@@ -447,7 +453,7 @@ impl Driver {
             (Vec::new(), Vec::new())
         };
         // COPY: the 3 224 B symbol table and the ≤ 136 B DVOL table above move
-        // into the driver, and the 9 520 B driver returns by value — once per
+        // into the driver, and the 10 800 B driver returns by value — once per
         // connection, at boot — the driver holds its tables INLINE so every
         // hot lookup walks contiguous rows with no pointer to chase —
         // rejected: a `Box` per table (a heap hop on the hot lookup) and a
@@ -480,6 +486,7 @@ impl Driver {
             drop_log_last_ns: 0,
             drop_log_suppressed: 0,
             feed_clock: FeedClock::new(VenueId::Deribit.default_stale_after_ms()),
+            quote_seq: [core_types::ArrivalSeq::ZERO; DERIBIT_MAX_SYMBOLS],
             _not_sync: ::core::marker::PhantomData,
         }
     }
@@ -567,6 +574,11 @@ impl Driver {
         self.session_started = false;
         // VT2: a new connection is a new offset; the threshold stays.
         self.feed_clock.reset();
+        // HK32: every instrument's ordinal stays (monotone — no book sees
+        // it fall); its clock is zeroed, so a reconnect clears a clock a
+        // far-future stamp poisoned. rx is cleared and the old socket gone:
+        // no quote of the old connection can follow.
+        core_types::ArrivalSeq::reset_clocks(&mut self.quote_seq);
     }
 }
 
@@ -1375,9 +1387,10 @@ fn handle_data_frame<C: Capture>(
                                     now,
                                     VenueId::Deribit,
                                     sym,
-                                    // No seq on quotes: venue ms
-                                    // timestamp, truncated (crate doc).
-                                    f.ts_ms as u32,
+                                    // HK32: no seq on quotes — the
+                                    // instrument's arrival ordinal
+                                    // (crate doc).
+                                    drv.quote_seq[sym_idx].next(f.ts_ms),
                                     Price::from_raw(f.bid_px_1e6),
                                     Qty::from_raw(f.bid_qty_1e6),
                                     Price::from_raw(f.ask_px_1e6),
@@ -1731,6 +1744,10 @@ fn handle_data_frame<C: Capture>(
             if tick.is_stale() {
                 status.inc_stale_ticks();
             }
+            // HK32: older than its instrument's newest (`venue_seq` 0,
+            // dropped by every book) — counted; ~100 an hour in the
+            // backlog after a host stall, a steady count is a stuck clock.
+            status.note_arrival_seq(tick.venue_seq);
             status.set_feed_delay_ema_ms(drv.feed_clock.delay_ema_ms());
             // §6.5 capture BEFORE the push — a ring-dropped tick must
             // still reach the replay log (the audit pairs capture
@@ -2362,6 +2379,7 @@ pub fn run<T: Transport, C: Capture>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use book_builder::{ApplyOutcome, TopOfBook};
     use core_net::{
         expected_accept as expected_accept_pub, sec_websocket_key_from_seed as sec_key_pub,
         KeepaliveCfg, TestTransport,
@@ -2999,7 +3017,7 @@ mod tests {
     }
 
     #[test]
-    fn quote_push_emits_tick_with_venue_byte_and_ms_seq() {
+    fn quote_push_emits_tick_with_venue_byte_and_ordinal_seq() {
         let mut t = TestTransport::with_capacity(8192);
         let mut d = steady_driver(false);
         let status = IngressStatus::new();
@@ -3024,16 +3042,246 @@ mod tests {
         let tick = *cons.try_pop_ref().expect("tick must be pushed");
         assert_eq!(tick.sym, SYM_BTC);
         assert_eq!(tick.venue, VenueId::Deribit as u8);
-        // venue_seq = venue ms timestamp truncated to u32 (crate doc).
-        assert_eq!(tick.venue_seq, 1_550_658_624_149u64 as u32);
+        // HK32: venue_seq = the instrument's arrival ordinal (crate doc).
+        assert_eq!(tick.venue_seq, 1);
         assert_eq!(tick.bid_px.raw(), 3_914_970_000);
         assert_eq!(tick.ask_px.raw(), 3_996_610_000);
         assert_eq!(tick.bid_qty.raw(), 40_000_000);
         assert_eq!(tick.ask_qty.raw(), 50_000_000);
         assert!(tick.ts_ns > 0);
-        // VT2: the venue stamp rides the slot in full (venue_seq keeps
-        // its truncated-u32 law).
+        // VT2: the venue stamp rides the slot in full.
         assert_eq!(tick.venue_time_ms, 1_550_658_624_149);
+    }
+
+    /// HK32 rig: a steady driver over the test symbols (`BTC-PERPETUAL`,
+    /// `ETH-PERPETUAL`); `feed` drives one payload and returns its ticks
+    /// in ring order.
+    struct SeqRig {
+        t: TestTransport,
+        d: Driver,
+        prod: Producer<Tick, TICK_RING_CAP>,
+        cons: core_ring::Consumer<Tick, TICK_RING_CAP>,
+        status: IngressStatus,
+    }
+
+    impl SeqRig {
+        fn new() -> Self {
+            let (prod, cons) = ring_pair();
+            Self {
+                t: TestTransport::with_capacity(16 * 1024),
+                d: steady_driver(false),
+                prod,
+                cons,
+                status: IngressStatus::new(),
+            }
+        }
+
+        fn feed(&mut self, payload: &str) -> Vec<Tick> {
+            inject_text(&mut self.t, payload.as_bytes());
+            drive_one(
+                &mut self.t,
+                &mut self.d,
+                b"h",
+                b"/",
+                &mut self.prod,
+                &self.status,
+                &mut NullCapture,
+            )
+            .unwrap();
+            let mut out = Vec::new();
+            while let Some(t) = self.cons.try_pop_ref() {
+                out.push(*t);
+            }
+            out
+        }
+
+        /// A reconnect, then the steady shape `steady_driver` builds.
+        fn reconnect(&mut self) {
+            self.d.reset_for_reconnect(9);
+            self.d.set_state(State::Steady);
+            self.d.session_started = true;
+            self.d.next_req_id = 3;
+            self.d.subscribe_req_id = 2;
+        }
+    }
+
+    /// A live-shape `quote` push for `instr` stamped `ms`: `bid` × 40 /
+    /// `ask` × 50.
+    fn quote_frame(instr: &str, ms: u64, bid: &str, ask: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"subscription","params":{{"channel":"quote.{instr}","data":{{"timestamp":{ms},"instrument_name":"{instr}","best_bid_price":{bid},"best_bid_amount":40.0,"best_ask_price":{ask},"best_ask_amount":50.0}}}}}}"#
+        )
+    }
+
+    /// A live stamp (the 2026-10-15 hour).
+    const T0: u64 = 1_792_071_174_266;
+
+    /// HK32: two quotes for one instrument in one millisecond (67 in the
+    /// 2026-10-15 hour) are two updates — both apply and the second's
+    /// touch is the book's. Old law: one seq, the second `Stale`.
+    #[test]
+    fn same_ms_quotes_both_apply_and_the_second_is_the_touch() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        let a = r.feed(&quote_frame("BTC-PERPETUAL", T0, "80384.5", "80389.0"));
+        let b = r.feed(&quote_frame("BTC-PERPETUAL", T0, "80385.0", "80388.5"));
+        assert_eq!(book.apply(&a[0]), ApplyOutcome::Applied);
+        assert_eq!(
+            book.apply(&b[0]),
+            ApplyOutcome::Applied,
+            "same ms, later arrival"
+        );
+        assert_eq!(
+            (book.bid_px.raw(), book.ask_px.raw()),
+            (80_385_000_000, 80_388_500_000)
+        );
+        assert_eq!(book.stale_drops(), 0);
+    }
+
+    /// HK32: a quote OLDER than its instrument's newest (115 in the
+    /// 2026-10-15 hour, all in the backlog after a host stall) carries 0 —
+    /// `Stale` at every book, one that missed the newest quote included —
+    /// takes no ordinal and is counted; the quote back at the newest stamp
+    /// applies (old law: `Stale`, its seq equal to the newest's). Old law
+    /// also: a book that missed the newest applied the older touch, and
+    /// nothing was counted.
+    #[test]
+    fn an_older_quote_is_stale_at_every_book_counted_and_the_ordinal_holds() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        // Never sees the newest quote (a ring drop, a late slot claim).
+        let mut missed = TopOfBook::empty(SYM_BTC);
+        let newest = r.feed(&quote_frame("BTC-PERPETUAL", T0, "80384.5", "80389.0"));
+        let older = r.feed(&quote_frame(
+            "BTC-PERPETUAL",
+            T0 - 220,
+            "80384.5",
+            "80390.0",
+        ));
+        let back = r.feed(&quote_frame("BTC-PERPETUAL", T0, "80385.0", "80389.0"));
+        assert_eq!(book.apply(&newest[0]), ApplyOutcome::Applied);
+        assert_eq!(book.apply(&older[0]), ApplyOutcome::Stale);
+        assert_eq!(missed.apply(&older[0]), ApplyOutcome::Stale);
+        assert!(!missed.has_quotes());
+        assert_eq!(
+            book.apply(&back[0]),
+            ApplyOutcome::Applied,
+            "back at the newest stamp"
+        );
+        assert_eq!(book.bid_px.raw(), 80_385_000_000);
+        assert_eq!(book.gaps(), 0, "the older quote took no ordinal");
+        assert_eq!(r.status.seq_regressions_total(), 1);
+    }
+
+    /// HK32: each instrument counts from 1 on its own. Old law: every
+    /// quote carried its stamp's low 32 bits.
+    #[test]
+    fn interleaved_instruments_keep_independent_ordinals_from_1() {
+        let mut r = SeqRig::new();
+        let mut seqs = Vec::new();
+        for (instr, ms) in [
+            ("BTC-PERPETUAL", T0),
+            ("ETH-PERPETUAL", T0),
+            ("BTC-PERPETUAL", T0),
+            ("ETH-PERPETUAL", T0 + 1),
+            ("BTC-PERPETUAL", T0 + 1),
+        ] {
+            let t = r.feed(&quote_frame(instr, ms, "100.0", "101.0"));
+            seqs.extend(t.iter().map(|t| (t.sym, t.venue_seq)));
+        }
+        const SYM_ETH: u32 = (3 << 24) | 2;
+        assert_eq!(
+            seqs,
+            [
+                (SYM_BTC, 1),
+                (SYM_ETH, 1),
+                (SYM_BTC, 2),
+                (SYM_ETH, 2),
+                (SYM_BTC, 3)
+            ]
+        );
+    }
+
+    /// HK32: a reconnect keeps the ordinal — the subscribe-time quote of the
+    /// new connection in the same ms as the last one of the old applies (3
+    /// after 1, 2) and the stream goes on from it, dense. Old law: that
+    /// quote was `Stale`.
+    #[test]
+    fn the_ordinal_stays_monotone_across_a_reconnect() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        let mut ticks = r.feed(&quote_frame("BTC-PERPETUAL", T0, "80384.5", "80389.0"));
+        ticks.extend(r.feed(&quote_frame("BTC-PERPETUAL", T0, "80385.0", "80389.0")));
+        r.reconnect();
+        ticks.extend(r.feed(&quote_frame("BTC-PERPETUAL", T0, "80385.5", "80389.0")));
+        ticks.extend(r.feed(&quote_frame("BTC-PERPETUAL", T0 + 1, "80385.5", "80388.0")));
+        for t in &ticks {
+            assert_eq!(book.apply(t), ApplyOutcome::Applied);
+        }
+        let seqs: Vec<u32> = ticks.iter().map(|t| t.venue_seq).collect();
+        assert_eq!(seqs, [1, 2, 3, 4]);
+        assert_eq!(book.ask_px.raw(), 80_388_000_000);
+        assert_eq!(book.gaps(), 0, "dense: no tick lost");
+    }
+
+    /// HK32: one far-future stamp poisons its instrument's clock — later
+    /// normal quotes are older, take 0, are `Stale` and COUNTED (the stuck
+    /// instrument shows); the other instrument's clock is its own; a
+    /// reconnect clears the clock and keeps the ordinal. Old law: nothing
+    /// counted, and no reconnect could clear it.
+    #[test]
+    fn a_far_future_stamp_is_counted_until_a_reconnect_clears_it() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        let mut ticks = r.feed(&quote_frame("BTC-PERPETUAL", T0, "80384.5", "80389.0"));
+        ticks.extend(r.feed(&quote_frame(
+            "BTC-PERPETUAL",
+            T0 + 86_400_000,
+            "80384.5",
+            "80389.0",
+        )));
+        for ms in [T0 + 1, T0 + 2] {
+            ticks.extend(r.feed(&quote_frame("BTC-PERPETUAL", ms, "80385.0", "80389.0")));
+        }
+        assert_eq!(r.status.seq_regressions_total(), 2);
+        let eth = r.feed(&quote_frame("ETH-PERPETUAL", T0 + 3, "2340.0", "2341.0"));
+        assert_eq!(eth[0].venue_seq, 1);
+        assert_eq!(r.status.seq_regressions_total(), 2);
+        r.reconnect();
+        ticks.extend(r.feed(&quote_frame("BTC-PERPETUAL", T0 + 4, "80386.0", "80389.0")));
+        let seqs: Vec<u32> = ticks.iter().map(|t| t.venue_seq).collect();
+        assert_eq!(seqs, [1, 2, 0, 0, 3]);
+        let outcomes: Vec<ApplyOutcome> = ticks.iter().map(|t| book.apply(t)).collect();
+        assert_eq!(
+            outcomes,
+            [
+                ApplyOutcome::Applied,
+                ApplyOutcome::Applied,
+                ApplyOutcome::Stale,
+                ApplyOutcome::Stale,
+                ApplyOutcome::Applied
+            ]
+        );
+        assert_eq!(book.bid_px.raw(), 80_386_000_000);
+        assert_eq!(r.status.seq_regressions_total(), 2);
+    }
+
+    /// HK32: no wrap — across the low-32-bit ms boundary (next at
+    /// 2026-11-21 21:25:29.728Z) the stream keeps applying. Old law: the
+    /// seq fell from `u32::MAX` to 0 and every later quote was `Stale`
+    /// until a restart.
+    #[test]
+    fn the_low_32_bit_ms_boundary_does_not_wrap_the_ordinal() {
+        const WRAP: u64 = 418 << 32; // 1 795 296 329 728 ms
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        let mut seqs = Vec::new();
+        for ms in [WRAP - 1, WRAP, WRAP + 1] {
+            let t = r.feed(&quote_frame("BTC-PERPETUAL", ms, "80384.5", "80389.0"));
+            assert_eq!(book.apply(&t[0]), ApplyOutcome::Applied, "{ms}");
+            seqs.push(t[0].venue_seq);
+        }
+        assert_eq!(seqs, [1, 2, 3]);
     }
 
     /// I-3: a burst of non-tick frames past a full rx no longer strands

@@ -44,6 +44,10 @@ pub mod instrument_class;
 /// sizes a hedge and the arm that sends it.
 pub mod hl_px;
 pub use instrument_class::{InstrumentClass, ALL_CLASSES, INSTRUMENT_CLASSES};
+/// HK31/HK32: the per-instrument arrival sequencer — `Tick.venue_seq` on
+/// the top-of-book streams that carry no sequence number.
+pub mod arrival_seq;
+pub use arrival_seq::ArrivalSeq;
 
 // ---------------------------------------------------------------
 // Identifiers
@@ -363,9 +367,11 @@ pub struct Tick {
     pub ts_ns: NsTs,
     /// Resolved symbol ID (not a string).
     pub sym: SymbolId,
-    /// Sequence number emitted by the venue. Polymarket (`pm`) emits none:
-    /// there it is the ingress's per-asset arrival ordinal (HK31 — 1, 2,
-    /// 3, … per process; 0 = a frame older than its asset's newest).
+    /// Sequence number emitted by the venue. Polymarket (`pm`, HK31),
+    /// Hyperliquid (`hl` `bbo` + outcome `l2Book` touch) and Deribit
+    /// (`quote`) (HK32) emit none: there it is the ingress's per-instrument
+    /// arrival ordinal ([`ArrivalSeq`] — 1, 2, 3, … per process; 0 = a
+    /// tick older than its instrument's newest).
     pub venue_seq: u32,
     /// Best bid price (fixed-point).
     pub bid_px: Price,

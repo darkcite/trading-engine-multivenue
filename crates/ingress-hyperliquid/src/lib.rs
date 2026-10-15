@@ -71,12 +71,38 @@
 //!
 //! ## Decisions documented (crate-header policy, mirrors 8b/8c)
 //!
-//! * **`Tick.venue_seq` = `time` (ms) truncated to `u32`.** `bbo`
-//!   pushes carry no sequence number, only the venue event time in
-//!   milliseconds. Same policy as Deribit quotes: monotonic across
-//!   reconnects, wraps every ~49.7 days; same-ms updates collapse at
-//!   `TopOfBook`. Full-width times live in the staleness monitor —
-//!   truncation happens only at the `Tick` boundary.
+//! * **`Tick.venue_seq` = the coin row's arrival ordinal (HK32,
+//!   2026-10-15).** `bbo` and `l2Book` carry no sequence number, only
+//!   the block `time` in milliseconds (in full in `Tick.venue_time_ms`,
+//!   VT2). The run loop's per-row `core_types::ArrivalSeq` stamps each
+//!   tick it builds: 1, 2, 3, … in arrival order (one connection: the
+//!   venue's order) while the `time` does not go back; a tick OLDER than
+//!   its row's newest carries 0 — every `book_builder::TopOfBook` drops
+//!   it — and is counted on `seq_regressions_total` (baseline ~0/h; an
+//!   HL re-send carries the last-change stamp, so an occasional count is
+//!   not a stuck clock). ONE sequencer per row serves both tick sources
+//!   of an outcome leg (`bbo` and the O8 `l2Book` touch): one book takes
+//!   one ordinal stream — two would collide in its `TopOfBook` — on one
+//!   clock (0 `time` decreases in arrival order on the 2026-10-15 hour,
+//!   across sources included). The two are different VIEWS of the book,
+//!   not one view at two moments: within a block the `l2Book` touch is
+//!   never looser than the `bbo` (ask lower in 75 of 115 same-block
+//!   pairs, equal in 40; bid higher in 23, equal in 92), and the venue
+//!   sends a block's `bbo` before its `l2Book` (115/115 on outcome legs,
+//!   4 798/4 800 on perps), so the later arrival — the tighter `l2Book`
+//!   view — wins the block. Accepted: in the rare reversed order (~0.05/h
+//!   on outcome legs) the looser `bbo` wins that block, where the old
+//!   law kept the `l2Book`. The ordinal is monotone for the life of the
+//!   process (reconnects and rolls included — a roll rebinds the row
+//!   under the same `SymbolId`, a reconnect zeroes only the clock). Until
+//!   HK32 it
+//!   was `time` truncated to `u32`: on that hour 116 outcome-leg ticks
+//!   shared their row's previous `time` — 115 of them the block's
+//!   `l2Book` touch right behind its `bbo` — and were `Stale` (84 moved
+//!   the touch price); perps never repeat a `time` (one push per block),
+//!   but the low 32 bits wrap every ~49.7 days (next 2026-11-21
+//!   21:25:29Z), after which every tick would have been `Stale` until a
+//!   restart.
 //! * **Units:** prices are USD (outcome coins: collateral units in
 //!   \[0, 1\]) ×1e6; sizes are **base-coin units** ×1e6 (unlike
 //!   Deribit's USD notionals). Funding is ×1e9 — 1e6 would truncate

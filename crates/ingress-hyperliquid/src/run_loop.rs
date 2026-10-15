@@ -314,6 +314,14 @@ pub struct Driver {
     /// [`HlStaleness`] monitor, which watches `l2Book` cadence per coin
     /// and kills the session — this one flags individual ticks.
     feed_clock: FeedClock,
+    /// HK32: each coin row's arrival sequencer — the `Tick.venue_seq`
+    /// law (crate docs) — indexed like the [`HlCoinTable`] rows. ONE per
+    /// row across both tick sources of an outcome leg (`bbo` and the
+    /// `l2Book` touch: one book, one block clock). Its ordinal is
+    /// process-lifetime and survives a roll (the row's `SymbolId` is the
+    /// family's, fixed), so it never falls under a book; its clock is per
+    /// connection ([`Self::reset_for_reconnect`]).
+    coin_seq: [core_types::ArrivalSeq; HL_MAX_COINS],
     /// XMM XH1: the engine's trade-print lane, attached by
     /// [`Self::set_trade_lane`] (boot). `None` = prints are captured and
     /// go nowhere else — every driver before XH1, and every test that
@@ -365,6 +373,7 @@ impl Driver {
             subscribed: false,
             verified: false,
             feed_clock: FeedClock::new(VenueId::Hyperliquid.default_stale_after_ms()),
+            coin_seq: [core_types::ArrivalSeq::ZERO; HL_MAX_COINS],
             trade_tx: None,
             _not_sync: ::core::marker::PhantomData,
         }
@@ -483,6 +492,11 @@ impl Driver {
         self.verified = false;
         // VT2: a new connection is a new offset; the threshold stays.
         self.feed_clock.reset();
+        // HK32: every row's ordinal stays (monotone — no book sees it
+        // fall); its clock is zeroed, so a reconnect clears a clock a
+        // far-future stamp poisoned. rx is cleared and the old socket gone:
+        // no tick of the old connection can follow.
+        core_types::ArrivalSeq::reset_clocks(&mut self.coin_seq);
         self.retire_dead_families(self.wall.wall_of(now_ns()))
     }
 
@@ -1737,13 +1751,13 @@ fn handle_data_frame<C: Capture>(
                                         let now = now_ns();
                                         let venue_time_ms = f.ts_ns / 1_000_000;
                                         let judged = drv.feed_clock.judge(venue_time_ms, now);
-                                        // venue_seq = time (ms) as u32 —
-                                        // crate-header policy.
+                                        // HK32: venue_seq = the coin row's
+                                        // arrival ordinal (crate docs).
                                         tick = Tick::new_stamped(
                                             now,
                                             VenueId::Hyperliquid,
                                             sym,
-                                            venue_time_ms as u32,
+                                            drv.coin_seq[coin_idx].next(venue_time_ms),
                                             Price::from_raw(f.bid_px_1e6),
                                             Qty::from_raw(f.bid_qty_1e6),
                                             Price::from_raw(f.ask_px_1e6),
@@ -1823,11 +1837,17 @@ fn handle_data_frame<C: Capture>(
                                         let venue_time_ms = f.ts_ns / 1_000_000;
                                         let judged =
                                             drv.feed_clock.judge(venue_time_ms, now);
+                                        // HK32: the leg's bbo sequencer —
+                                        // one book, one ordinal stream. A
+                                        // block's l2Book follows its bbo and
+                                        // is never the looser view, so this
+                                        // later arrival wins the block
+                                        // (crate docs).
                                         tick = Tick::new_stamped(
                                             now,
                                             VenueId::Hyperliquid,
                                             sym,
-                                            venue_time_ms as u32,
+                                            drv.coin_seq[coin_idx].next(venue_time_ms),
                                             Price::from_raw(f.best_bid_px_1e6),
                                             Qty::from_raw(f.best_bid_sz_1e6),
                                             Price::from_raw(f.best_ask_px_1e6),
@@ -2033,6 +2053,9 @@ fn handle_data_frame<C: Capture>(
             if tick.is_stale() {
                 status.inc_stale_ticks();
             }
+            // HK32: older than its coin's newest (`venue_seq` 0, dropped
+            // by every book) — counted, so a stuck coin shows.
+            status.note_arrival_seq(tick.venue_seq);
             status.set_feed_delay_ema_ms(drv.feed_clock.delay_ema_ms());
             // §6.5 capture BEFORE the push — a ring-dropped tick must
             // still reach the replay log (the audit pairs capture
@@ -2059,6 +2082,7 @@ fn handle_data_frame<C: Capture>(
                 if tick.is_stale() {
                     status.inc_stale_ticks();
                 }
+                status.note_arrival_seq(tick.venue_seq);
                 status.set_feed_delay_ema_ms(drv.feed_clock.delay_ema_ms());
                 capture.tick(&tick);
                 if !producer.try_push_ref(&tick) {
@@ -2232,6 +2256,7 @@ fn session_err(status: &IngressStatus, site: u8, kind: io::ErrorKind) -> RunResu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use book_builder::{ApplyOutcome, TopOfBook};
     use core_net::{
         expected_accept as expected_accept_pub, sec_websocket_key_from_seed as sec_key_pub,
         KeepaliveCfg, TestTransport,
@@ -2641,7 +2666,7 @@ mod tests {
     }
 
     #[test]
-    fn bbo_push_emits_tick_with_venue_byte_and_time_ms_seq() {
+    fn bbo_push_emits_tick_with_venue_byte_and_ordinal_seq() {
         let mut t = TestTransport::with_capacity(8192);
         let mut d = steady_driver();
         let status = IngressStatus::new();
@@ -2667,8 +2692,8 @@ mod tests {
         let tick = *cons.try_pop_ref().expect("tick must be pushed");
         assert_eq!(tick.sym, SYM_BTC);
         assert_eq!(tick.venue, VenueId::Hyperliquid as u8);
-        // venue_seq = time (ms) truncated to u32 (crate-header policy).
-        assert_eq!(tick.venue_seq, 1_708_622_398_623u64 as u32);
+        // HK32: venue_seq = the coin row's arrival ordinal (crate docs).
+        assert_eq!(tick.venue_seq, 1);
         assert_eq!(tick.bid_px.raw(), 64_437_000_000);
         assert_eq!(tick.ask_px.raw(), 64_438_000_000);
         assert_eq!(tick.bid_qty.raw(), 1_449_100);
@@ -2789,6 +2814,307 @@ mod tests {
         let after = push_bbo_with_time(&mut t, &mut d, &mut prod, &mut cons, &status, t0 - 60_000);
         assert!(!after.is_stale(), "a reconnect starts a fresh offset");
         assert_eq!(after.venue_time_ms, t0 - 60_000);
+    }
+
+    /// HK32 rig: a steady driver over the test coins (`BTC` perp, `#330`
+    /// outcome leg); `feed` drives one payload and returns its ticks in
+    /// ring order.
+    struct SeqRig {
+        t: TestTransport,
+        d: Driver,
+        prod: Producer<Tick, TICK_RING_CAP>,
+        cons: core_ring::Consumer<Tick, TICK_RING_CAP>,
+        status: IngressStatus,
+    }
+
+    impl SeqRig {
+        fn new() -> Self {
+            Self::with_driver(steady_driver())
+        }
+
+        fn with_driver(d: Driver) -> Self {
+            let (prod, cons) = ring_pair();
+            Self {
+                t: TestTransport::with_capacity(16 * 1024),
+                d,
+                prod,
+                cons,
+                status: IngressStatus::new(),
+            }
+        }
+
+        fn feed(&mut self, payload: &str) -> Vec<Tick> {
+            inject_text(&mut self.t, payload.as_bytes());
+            drive_one(
+                &mut self.t,
+                &mut self.d,
+                b"h",
+                b"/",
+                &mut self.prod,
+                &self.status,
+                &mut NullCapture,
+            )
+            .unwrap();
+            let mut out = Vec::new();
+            while let Some(t) = self.cons.try_pop_ref() {
+                out.push(*t);
+            }
+            out
+        }
+
+        /// A reconnect, then the steady shape again.
+        fn reconnect(&mut self) {
+            self.d.reset_for_reconnect(9);
+            self.d.set_state(State::Steady);
+            self.d.subscribed = true;
+            let (e, g) = expected_mask(&self.d.coins);
+            self.d.expected = e;
+            self.d.expected_global = g;
+            self.d.steady_since_ns = now_ns();
+        }
+    }
+
+    /// A live-shape `bbo` push for `coin` at block `time` `ms`: touch
+    /// `bid` × 1.5 / `ask` × 2.5.
+    fn bbo_frame(coin: &str, ms: u64, bid: &str, ask: &str) -> String {
+        format!(
+            r#"{{"channel":"bbo","data":{{"coin":"{coin}","time":{ms},"bbo":[{{"px":"{bid}","sz":"1.5","n":2}},{{"px":"{ask}","sz":"2.5","n":3}}]}}}}"#
+        )
+    }
+
+    /// A live-shape `l2Book` snapshot for `coin` at `time` `ms`: touch
+    /// `bid` × 64 / `ask` × 69, one level behind each.
+    fn l2book_frame(coin: &str, ms: u64, bid: &str, ask: &str) -> String {
+        format!(
+            r#"{{"channel":"l2Book","data":{{"coin":"{coin}","time":{ms},"levels":[[{{"px":"{bid}","sz":"64.0","n":1}},{{"px":"0.01","sz":"64.0","n":1}}],[{{"px":"{ask}","sz":"69.0","n":1}},{{"px":"0.99","sz":"69.0","n":1}}]]}}}}"#
+        )
+    }
+
+    /// A live block time (the 2026-10-15 hour).
+    const T0: u64 = 1_792_068_605_354;
+
+    /// HK32, the measured case (115 in the 2026-10-15 hour): an outcome
+    /// leg's `l2Book` touch right behind its `bbo` in the same block —
+    /// both apply and the snapshot's touch is the book's. Old law: one
+    /// seq, the snapshot `Stale` (84 of the 115 moved the touch price).
+    #[test]
+    fn an_outcome_legs_l2book_touch_in_its_bbos_block_applies() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(SYM_HIP4);
+        let b = r.feed(&bbo_frame("#330", T0, "0.21", "0.25098"));
+        let l2 = r.feed(&l2book_frame("#330", T0, "0.21", "0.25"));
+        assert_eq!(book.apply(&b[0]), ApplyOutcome::Applied);
+        assert_eq!(
+            book.apply(&l2[0]),
+            ApplyOutcome::Applied,
+            "same block, later arrival"
+        );
+        assert_eq!((book.bid_px.raw(), book.ask_px.raw()), (210_000, 250_000));
+        assert_eq!(book.ask_qty.raw(), 69_000_000);
+        assert_eq!(
+            (b[0].venue_seq, l2[0].venue_seq),
+            (1, 2),
+            "one sequencer per leg"
+        );
+    }
+
+    /// HK32: two `bbo` pushes for one coin in one millisecond are two
+    /// updates — both apply and the second's touch is the book's. Old law:
+    /// one seq, the second `Stale`.
+    #[test]
+    fn same_ms_bbo_pushes_both_apply_and_the_second_is_the_touch() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        let a = r.feed(&bbo_frame("BTC", T0, "64437.0", "64438.0"));
+        let b = r.feed(&bbo_frame("BTC", T0, "64437.5", "64438.0"));
+        assert_eq!(book.apply(&a[0]), ApplyOutcome::Applied);
+        assert_eq!(
+            book.apply(&b[0]),
+            ApplyOutcome::Applied,
+            "same ms, later arrival"
+        );
+        assert_eq!(book.bid_px.raw(), 64_437_500_000);
+        assert_eq!(book.stale_drops(), 0);
+    }
+
+    /// HK32: a tick OLDER than its coin's newest carries 0 — `Stale` at
+    /// every book, one that missed the newest tick included — takes no
+    /// ordinal and is counted on `seq_regressions_total`; an outcome
+    /// leg's `l2Book` touch older than its `bbo` is one too. Old law: the
+    /// low-32-bit stamp, so a book that missed the newest applied the
+    /// older touch, and nothing was counted.
+    #[test]
+    fn an_older_tick_is_stale_at_every_book_counted_and_the_ordinal_holds() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        // Never sees the newest tick (a ring drop, a late slot claim).
+        let mut missed = TopOfBook::empty(SYM_BTC);
+        let newest = r.feed(&bbo_frame("BTC", T0 + 5, "64437.0", "64438.0"));
+        let older = r.feed(&bbo_frame("BTC", T0, "64400.0", "64500.0"));
+        let next = r.feed(&bbo_frame("BTC", T0 + 5, "64437.5", "64438.0"));
+        assert_eq!(book.apply(&newest[0]), ApplyOutcome::Applied);
+        assert_eq!(book.apply(&older[0]), ApplyOutcome::Stale);
+        assert_eq!(missed.apply(&older[0]), ApplyOutcome::Stale);
+        assert!(!missed.has_quotes());
+        assert_eq!(
+            book.apply(&next[0]),
+            ApplyOutcome::Applied,
+            "same ms as the newest"
+        );
+        assert_eq!(book.bid_px.raw(), 64_437_500_000);
+        assert_eq!(book.gaps(), 0, "the older tick took no ordinal");
+        assert_eq!(r.status.seq_regressions_total(), 1);
+        let b = r.feed(&bbo_frame("#330", T0 + 5, "0.4", "0.6"));
+        let l2 = r.feed(&l2book_frame("#330", T0, "0.4", "0.5"));
+        assert_eq!((b[0].venue_seq, l2[0].venue_seq), (1, 0));
+        assert_eq!(r.status.seq_regressions_total(), 2);
+    }
+
+    /// HK32: each coin counts from 1 on its own, and a one-sided outcome
+    /// `bbo` (dropped by policy, BIN15 O8) takes no ordinal. Old law: every
+    /// tick carried its stamp's low 32 bits.
+    #[test]
+    fn interleaved_coins_keep_independent_ordinals_from_1() {
+        let mut r = SeqRig::new();
+        let mut seqs = Vec::new();
+        for frame in [
+            bbo_frame("BTC", T0, "64437.0", "64438.0"),
+            bbo_frame("#330", T0, "0.4", "0.6"),
+            bbo_frame("BTC", T0, "64437.5", "64438.0"),
+            r##"{"channel":"bbo","data":{"coin":"#330","time":1792068605355,"bbo":[{"px":"0.5","sz":"64.0","n":1},null]}}"##.to_owned(),
+            l2book_frame("#330", T0 + 1, "0.4", "0.5"),
+            bbo_frame("BTC", T0 + 1, "64437.0", "64438.0"),
+        ] {
+            seqs.extend(r.feed(&frame).iter().map(|t| (t.sym, t.venue_seq)));
+        }
+        assert_eq!(
+            seqs,
+            [
+                (SYM_BTC, 1),
+                (SYM_HIP4, 1),
+                (SYM_BTC, 2),
+                (SYM_HIP4, 2),
+                (SYM_BTC, 3)
+            ]
+        );
+        assert_eq!(r.d.roll_status.outcome_bbo_one_sided(), 1);
+    }
+
+    /// HK32: a reconnect keeps the ordinal — the first push of the new
+    /// connection in the same ms as the last one of the old applies (3
+    /// after 1, 2) and the stream goes on from it, dense. Old law: that
+    /// push was `Stale`.
+    #[test]
+    fn the_ordinal_stays_monotone_across_a_reconnect() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        let mut ticks = r.feed(&bbo_frame("BTC", T0, "64437.0", "64438.0"));
+        ticks.extend(r.feed(&bbo_frame("BTC", T0, "64437.5", "64438.0")));
+        r.reconnect();
+        ticks.extend(r.feed(&bbo_frame("BTC", T0, "64438.0", "64439.0")));
+        ticks.extend(r.feed(&bbo_frame("BTC", T0 + 1, "64438.0", "64440.0")));
+        for t in &ticks {
+            assert_eq!(book.apply(t), ApplyOutcome::Applied);
+        }
+        let seqs: Vec<u32> = ticks.iter().map(|t| t.venue_seq).collect();
+        assert_eq!(seqs, [1, 2, 3, 4]);
+        assert_eq!(book.ask_px.raw(), 64_440_000_000);
+        assert_eq!(book.gaps(), 0, "dense: no tick lost");
+    }
+
+    /// HK32: one far-future stamp poisons its coin's clock — later normal
+    /// ticks are older, take 0, are `Stale` and COUNTED (the stuck coin
+    /// shows); the other coin's clock is its own; a reconnect clears the
+    /// clock and keeps the ordinal. Old law: nothing counted, and no
+    /// reconnect could clear it.
+    #[test]
+    fn a_far_future_stamp_is_counted_until_a_reconnect_clears_it() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        let mut ticks = r.feed(&bbo_frame("BTC", T0, "64437.0", "64438.0"));
+        ticks.extend(r.feed(&bbo_frame("BTC", T0 + 86_400_000, "64437.0", "64438.0")));
+        for ms in [T0 + 1, T0 + 2] {
+            ticks.extend(r.feed(&bbo_frame("BTC", ms, "64437.5", "64438.0")));
+        }
+        assert_eq!(r.status.seq_regressions_total(), 2);
+        assert_eq!(
+            r.feed(&bbo_frame("#330", T0 + 3, "0.4", "0.6"))[0].venue_seq,
+            1
+        );
+        assert_eq!(r.status.seq_regressions_total(), 2);
+        r.reconnect();
+        ticks.extend(r.feed(&bbo_frame("BTC", T0 + 4, "64438.0", "64439.0")));
+        let seqs: Vec<u32> = ticks.iter().map(|t| t.venue_seq).collect();
+        assert_eq!(seqs, [1, 2, 0, 0, 3]);
+        let outcomes: Vec<ApplyOutcome> = ticks.iter().map(|t| book.apply(t)).collect();
+        assert_eq!(
+            outcomes,
+            [
+                ApplyOutcome::Applied,
+                ApplyOutcome::Applied,
+                ApplyOutcome::Stale,
+                ApplyOutcome::Stale,
+                ApplyOutcome::Applied
+            ]
+        );
+        assert_eq!(book.bid_px.raw(), 64_438_000_000);
+        assert_eq!(r.status.seq_regressions_total(), 2);
+    }
+
+    /// HK32: a mid-session roll rebinds the leg's row to the successor coin
+    /// under the SAME `SymbolId` (`rebind_outcome`), and the row keeps its
+    /// sequencer — the successor's first tick takes the next ordinal and
+    /// applies; the book never sees the ordinal fall or restart.
+    #[test]
+    fn a_mid_session_roll_keeps_the_rows_ordinal() {
+        let t0 = now_ns();
+        let mut d = family_driver(WallAnchor::new(t0, spec_2649().expiry_ns - 1_000));
+        d.set_state(State::Steady);
+        d.subscribed = true;
+        let (e, g) = expected_mask(&d.coins);
+        d.expected = e;
+        d.expected_global = g;
+        d.steady_since_ns = t0;
+        let mut r = SeqRig::with_driver(d);
+        let yes = crate::family::rolling_sym(0, 0);
+        let mut book = TopOfBook::empty(yes);
+        let before = r.feed(&bbo_frame("#26490", T0, "0.4", "0.6"));
+        let (mut etx, _erx) = event_ring_pair();
+        perform_roll(
+            &mut r.d,
+            0,
+            &spec_2650(),
+            false,
+            &mut etx,
+            core_types::event_lane_bit(ChannelId::InstrumentRoll),
+            &r.status,
+            &mut NullCapture,
+        )
+        .unwrap();
+        let after = r.feed(&bbo_frame("#26500", T0 + 1, "0.5", "0.6"));
+        assert_eq!((before[0].sym, after[0].sym), (yes, yes), "one SymbolId");
+        assert_eq!((before[0].venue_seq, after[0].venue_seq), (1, 2));
+        assert_eq!(book.apply(&before[0]), ApplyOutcome::Applied);
+        assert_eq!(book.apply(&after[0]), ApplyOutcome::Applied);
+        assert_eq!(book.bid_px.raw(), 500_000);
+    }
+
+    /// HK32: no wrap — across the low-32-bit ms boundary (next at
+    /// 2026-11-21 21:25:29.728Z) the stream keeps applying. Old law: the
+    /// seq fell from `u32::MAX` to 0 and every later tick was `Stale`
+    /// until a restart.
+    #[test]
+    fn the_low_32_bit_ms_boundary_does_not_wrap_the_ordinal() {
+        const WRAP: u64 = 418 << 32; // 1 795 296 329 728 ms
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        let mut seqs = Vec::new();
+        for ms in [WRAP - 1, WRAP, WRAP + 1] {
+            let t = r.feed(&bbo_frame("BTC", ms, "64437.0", "64438.0"));
+            assert_eq!(book.apply(&t[0]), ApplyOutcome::Applied, "{ms}");
+            seqs.push(t[0].venue_seq);
+        }
+        assert_eq!(seqs, [1, 2, 3]);
     }
 
     /// WS10-B for outcome legs (2026-09-19): an outcome coin's `l2Book`

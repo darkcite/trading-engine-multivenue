@@ -19,8 +19,9 @@
 //! CLOB frames carry no sequence number, only the quoted-ms
 //! `timestamp`, and the venue sends several frames per asset inside one
 //! millisecond (8.0 % of the rows on the 2026-10-15 tap). The parsers
-//! leave `venue_seq` 0; the run loop's per-asset sequencer (`AssetSeq`)
-//! stamps it: a frame whose `timestamp` is not older than its asset's
+//! leave `venue_seq` 0; the run loop's per-asset sequencer
+//! (`core_types::ArrivalSeq`, shared with Hyperliquid and Deribit since
+//! HK32) stamps it: a frame whose `timestamp` is not older than its asset's
 //! newest takes the next ordinal — 1, 2, 3, … in arrival order, which on
 //! the one TCP stream is the venue's order — and an OLDER one takes 0,
 //! which every `book_builder::TopOfBook` drops as `Stale` and the run loop

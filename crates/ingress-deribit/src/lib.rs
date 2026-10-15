@@ -56,14 +56,26 @@
 //!
 //! ## Sequence numbers on the Tick lane
 //!
-//! `quote` pushes carry **no venue sequence number**. Decision (8c):
-//! `Tick.venue_seq = timestamp_ms as u32` — venue-provided, monotonic
-//! across reconnects, wraps every ~49.7 days. Two quotes inside the
-//! same millisecond collapse at the `TopOfBook` boundary (equal seq =
-//! stale) — acceptable at BBO granularity. Books use full-width
-//! `change_id` and trades full-width `trade_seq` inside the monitors;
-//! u32 truncation only ever happens at the Tick boundary (same policy
-//! as OKX).
+//! `quote` pushes carry **no venue sequence number**, only the ms
+//! `timestamp` (in full in `Tick.venue_time_ms`, VT2). HK32
+//! (2026-10-15): `Tick.venue_seq` is the instrument's **arrival
+//! ordinal** — the run loop's per-row `core_types::ArrivalSeq` stamps
+//! each parsed quote 1, 2, 3, … in arrival order (one connection: the
+//! venue's order) while its `timestamp` does not go back; a quote OLDER
+//! than its instrument's newest carries 0 — every
+//! `book_builder::TopOfBook` drops it — and is counted on
+//! `seq_regressions_total`. The ordinal is monotone for the life of the
+//! process (a reconnect zeroes only the clock). The 2026-10-15 hour
+//! (821 520 quotes): 115 older quotes, all in the backlog the venue
+//! flushes after a multi-second host stall (up to 529 ms back), so the
+//! counter's baseline is not 0; 67 quotes shared their instrument's
+//! previous millisecond. Until HK32 the seq was `timestamp_ms as u32`
+//! (decision 8c): those 67, and 13 quotes back at the newest stamp after
+//! an older one, were `Stale`, and the low 32 bits wrap every ~49.7
+//! days (next 2026-11-21 21:25:29Z), after which every quote would have
+//! been `Stale` until a restart. Books keep the full-width `change_id`
+//! and trades the full-width `trade_seq` inside the monitors (and in the
+//! `ChannelEvent` capture).
 //!
 //! ## Amount normalization
 //!
@@ -357,8 +369,9 @@ pub fn extract_instrument(payload: &[u8], channel: DeribitChannel) -> Option<&[u
 pub struct DeribitQuoteFrame {
     /// Venue event time (`timestamp`, ms) converted to ns.
     pub ts_ns: NsTs,
-    /// Venue `timestamp` in raw milliseconds (source of
-    /// `Tick.venue_seq` — see crate header).
+    /// Venue `timestamp` in raw milliseconds — `Tick.venue_time_ms`,
+    /// and the clock the run loop's arrival sequencer orders quotes by
+    /// (`Tick.venue_seq` — see crate header).
     pub ts_ms: u64,
     /// Best bid price ×1e6 (0 = side empty).
     pub bid_px_1e6: i64,

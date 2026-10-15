@@ -203,9 +203,13 @@ pub struct IngressStatus {
     /// streams where the §6.2 chain law does not apply (MEXC) — a
     /// value strictly below the last-seen one for the same symbol ×
     /// stream. Never folded into `gaps_total` (a skipped version is
-    /// normal there; only a step BACK is news). HK31: Polymarket counts
-    /// a frame whose stamp is older than its asset's newest (the
-    /// sequencer's 0, dropped by every book).
+    /// normal there; only a step BACK is news). HK31/HK32: Polymarket,
+    /// Hyperliquid and Deribit count a top-of-book tick whose stamp is
+    /// older than its instrument's newest (the `core_types::ArrivalSeq`
+    /// 0, dropped by every book; [`Self::note_arrival_seq`]). Baselines
+    /// (2026-10-15 hour): HL ~0/h, Deribit ~115/h (the backlog after a
+    /// host stall); an HL re-send carries the last-change stamp, so an
+    /// occasional HL count is not a stuck clock.
     seq_regressions_total: AtomicU64,
     /// Channel resubscribes triggered by integrity monitors.
     resubscribes_total: AtomicU64,
@@ -325,10 +329,26 @@ impl IngressStatus {
     }
 
     /// Count one venue seq regression (MX3 — see
-    /// `seq_regressions_total` field docs).
-    #[inline(always)]
+    /// `seq_regressions_total` field docs). Cold: a regression is news,
+    /// never the steady state, so every caller's hot path keeps only the
+    /// predicted branch (HK32 — it was Polymarket's private
+    /// `count_older_frame`).
+    #[cold]
+    #[inline(never)]
     pub fn inc_seq_regressions(&self) {
         self.seq_regressions_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// HK32: judge one top-of-book tick's `venue_seq` as stamped by
+    /// `core_types::ArrivalSeq` (Polymarket, Hyperliquid, Deribit): 0 is
+    /// a tick older than its instrument's newest, dropped by every book,
+    /// and counted. One predicted compare inline; the count stays cold
+    /// ([`Self::inc_seq_regressions`]).
+    #[inline(always)]
+    pub fn note_arrival_seq(&self, venue_seq: u32) {
+        if venue_seq == 0 {
+            self.inc_seq_regressions();
+        }
     }
 
     /// Count one integrity-driven resubscribe.
