@@ -112,7 +112,7 @@ pub struct BootInfo {
     pub hcv_hash: [u8; 32],
     /// Process id.
     pub pid: u32,
-    /// `--strategy` mask as requested (`mask_for_name`).
+    /// `--strategy` mask as requested (`strategy_set::parse_strategy`).
     pub requested_mask: u8,
     /// Members whose boot config was present (the set builder's
     /// `configured`); `enabled = requested & configured` at boot.

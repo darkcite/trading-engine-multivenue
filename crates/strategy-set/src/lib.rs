@@ -138,7 +138,7 @@
 //! ## Boot semantics
 //!
 //! [`StrategySet::new`] takes the initial enable mask (`--strategy`,
-//! see [`mask_for_name`]). The cli configures members through the
+//! see [`parse_strategy`]). The cli configures members through the
 //! `*_mut` accessors, then the engine calls `on_start`, which is
 //! forwarded ONLY to initially-enabled members — their config
 //! validation stays as fail-fast as the single-strategy paths. A
@@ -203,8 +203,8 @@ pub struct Member {
     pub slot: u8,
     /// The member's enable-mask bit, `1 << slot`.
     pub bit: u8,
-    /// The member's own `--strategy` name: the [`MASK_TABLE`] name that
-    /// composes its bit alone.
+    /// The member's own `--strategy` name: the [`parse_strategy`] segment
+    /// that composes its bit alone.
     pub name: &'static str,
     /// The `regime.toml [labels.<key>]` section the cli resolves for this
     /// member; `None` where the cli resolves none (vm's rows gate
@@ -395,8 +395,8 @@ macro_rules! member_gen {
 /// row each, in slot order —
 /// `(SLOT const = slot, BIT const, field: type, --strategy name, labels key)`.
 /// Every per-member site in this crate is a `member_table!(@arm ..)` that
-/// hands these rows to `member_gen!`. A new member is one row here, plus
-/// its [`MASK_TABLE`] names and its `*_mut` accessor.
+/// hands these rows to `member_gen!`. A new member is one row here (its
+/// `--strategy` name comes with the row) plus its `*_mut` accessor.
 macro_rules! member_table {
     ($($arm:tt)*) => {
         member_gen! {
@@ -437,104 +437,102 @@ pub const SET_AI_EXEC_SLOTS: usize = 64;
 // engine's fixed sym slots — so the old `SET_VM_SLOTS = 512` law
 // retired with it.)
 
-/// Every `--strategy` name the engine resolves, with the enable mask
-/// it composes.
-///
-/// This table is the ONE source of truth for the name set:
-/// `mask_for_name` scans it and the cli's boot arm pins itself against
-/// it, so a name can never again resolve here while refusing to boot.
-/// Boot-only — a linear scan over a handful of entries, never hot.
-pub const MASK_TABLE: &[(&str, u8)] = &[
-    // HYPARB H0 (2026-09-23): slot 0 is the hyparb member;
-    // `latency-arb` is GONE as a name (O-H1) — an operator who types
-    // the old one gets a boot refusal, not a different strategy than
-    // the one asked for. Lands DARK (O-H8): the live strategy.conf
-    // names none of these until HZ and H8 are green.
-    ("hyparb", BIT_HYPARB),
-    ("ai+hyparb", BIT_AI_EXEC | BIT_VM | BIT_HYPARB),
-    (
-        "ai+vrp+xsd+bin15+hyparb",
-        BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD | BIT_BIN15 | BIT_HYPARB,
-    ),
-    // XSD-S/XSD-3 (2026-09-12): slot 2 is the xsd member; `cross-arb`
-    // is GONE as a name — an operator who types the old one gets a
-    // boot refusal, not a different strategy than the one asked for.
-    ("xsd", BIT_XSD),
-    ("ai+xsd", BIT_AI_EXEC | BIT_VM | BIT_XSD),
-    ("ai+vrp+xsd", BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD),
-    // BIN15 O4b (2026-09-12): slot 3 is the bin15 member;
-    // `rule-tree` is GONE as a name — an operator who types the old
-    // one gets a boot refusal, not a different strategy than the
-    // one asked for. The same law XSD-S and VRP V7 applied.
-    ("bin15", BIT_BIN15),
-    ("ai+bin15", BIT_AI_EXEC | BIT_VM | BIT_BIN15),
-    ("ai+vrp+bin15", BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_BIN15),
-    ("ai+xsd+bin15", BIT_AI_EXEC | BIT_VM | BIT_XSD | BIT_BIN15),
-    (
-        "ai+vrp+xsd+bin15",
-        BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD | BIT_BIN15,
-    ),
-    ("ai-exec", BIT_AI_EXEC),
-    ("vm", BIT_VM),
-    // AI-pushed lanes only (operator ruling 2026-09-02: Rust-coded
-    // strategies disabled at boot; the engine executes only what
-    // the AI command plane pushes — ai-exec intents + VM rulesets).
-    ("ai", BIT_AI_EXEC | BIT_VM),
-    // XMM XH1 (2026-09-26, O-XH1): slot 6 is the xmm member; `icdp`
-    // and `ai+icdp` are GONE as names — an operator who types the old
-    // one gets a boot refusal, not a different strategy than the one
-    // asked for. The member boots only with its artifact
-    // (`~/multivenue/xmm.toml`), paper only; the last name is the live
-    // set plus xmm, for the XH3 paper run.
-    ("xmm", BIT_XMM),
-    ("ai+xmm", BIT_AI_EXEC | BIT_VM | BIT_XMM),
-    (
-        "ai+vrp+xsd+bin15+hyparb+xmm",
-        BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD | BIT_BIN15 | BIT_HYPARB | BIT_XMM,
-    ),
-    // XMM XH5e: the testnet engine-instance check's set — slot 3's member
-    // beside slot 6's, nothing else (the wrapper's allow-list keeps it out
-    // of the launchd engine).
-    ("bin15+xmm", BIT_BIN15 | BIT_XMM),
-    // HC11 (2026-09-26, O-HC18): slot 7 is the hcv member — Hypercall
-    // S1, DARK: paper only and in no configured mask. It boots only with
-    // its artifact (`~/multivenue/hcv.toml`); the last name is the live
-    // set plus xmm and hcv, so switching it on is one `STRATEGY=` line.
-    ("hcv", BIT_HCV),
-    ("ai+hcv", BIT_AI_EXEC | BIT_VM | BIT_HCV),
-    (
-        "ai+vrp+xsd+bin15+hyparb+xmm+hcv",
-        BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD | BIT_BIN15 | BIT_HYPARB | BIT_XMM | BIT_HCV,
-    ),
-    // VRP V7: slot 1 is the VRP member. `ev` is GONE as a name —
-    // an operator who types it must get a boot refusal, not a
-    // different strategy than the one they asked for.
-    ("vrp", BIT_VRP),
-    ("ai+vrp", BIT_AI_EXEC | BIT_VM | BIT_VRP),
-    ("all", BUILT_MASK),
-];
+/// The `ai` group: the AI-pushed lanes, ai-exec + vm (operator ruling
+/// 2026-09-02 — Rust-coded strategies disabled at boot; the engine
+/// executes only what the AI command plane pushes: ai-exec intents and VM
+/// rulesets). The one [`parse_strategy`] segment that names more than one
+/// member.
+pub const AI_MASK: u8 = BIT_AI_EXEC | BIT_VM;
 
-/// Map a `--strategy` value to an initial enable mask (design §7:
-/// single name = single bit, back-compatible; `all` = all built
-/// members). `None` for unknown names — the cli rejects those at
-/// boot exactly as before.
-///
-/// BIN15 O5 (2026-09-12): this body was a `match` whose arms the cli
-/// duplicated as boot-arm literals. The two drifted — the five bin15
-/// names landed here and in the wrapper allow-list but never in the
-/// arm — and `--strategy ai+vrp+xsd+bin15` refused the boot with every
-/// member dark behind a capture that still looked healthy.
-/// `MASK_TABLE` above is now the only list.
-pub fn mask_for_name(name: &str) -> Option<u8> {
-    let mut i = 0;
-    while i < MASK_TABLE.len() {
-        let (candidate, mask) = MASK_TABLE[i];
-        if candidate == name {
-            return Some(mask);
+/// Why [`parse_strategy`] refused a `--strategy` value. Its `Display`
+/// names the fault, then the valid names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrategyParseErr<'a> {
+    /// The value is empty.
+    Empty,
+    /// A `+` with nothing on one side: a leading, trailing or doubled `+`.
+    EmptySegment,
+    /// A segment that is neither a member's name nor `ai`, compared byte
+    /// for byte: case-sensitive, nothing trimmed. The gone names
+    /// (`latency-arb`, `ev`, `cross-arb`, `rule-tree`, `icdp`) land here.
+    Unknown(&'a str),
+    /// `all` beside another segment: it stands alone.
+    AllNotAlone,
+}
+
+impl core::fmt::Display for StrategyParseErr<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("empty strategy")?,
+            Self::EmptySegment => {
+                f.write_str("empty segment (a leading, trailing or doubled `+`)")?
+            }
+            Self::Unknown(s) => write!(f, "unknown name `{s}`")?,
+            Self::AllNotAlone => f.write_str("`all` must stand alone")?,
         }
-        i += 1;
+        f.write_str(" — valid: `+`-joined names from")?;
+        for m in MEMBERS {
+            write!(f, " {},", m.name)?;
+        }
+        write!(f, " ai (= {}); or `all` alone", MaskNames(AI_MASK))
     }
-    None
+}
+
+/// Parse a `--strategy` value into its initial enable mask (S16-1c,
+/// ruling S16-R3) — the ONE parser: the engine's boot, its
+/// `strategy-mask` subcommand and, through that, the launchd wrapper.
+///
+/// `all` alone is every built member ([`BUILT_MASK`]). Anything else is
+/// `+`-joined segments in any order, each a member's name ([`MEMBERS`])
+/// or `ai` ([`AI_MASK`]); the mask is the OR of theirs, so an overlap or a
+/// repeat is the union (`ai+vm` = `ai`, `vrp+vrp` = `vrp`). Refused: the
+/// empty value, an empty segment, an unknown segment (case-sensitive,
+/// untrimmed) and `all` beside anything. `Ok` is never 0.
+///
+/// BIN15 O5 (2026-09-12): the names once lived in three whole-string
+/// allow-lists — this crate's table, the engine's boot arm and the
+/// wrapper's `case` — and they drifted: `--strategy ai+vrp+xsd+bin15`
+/// refused the boot with every member dark behind a capture that still
+/// looked healthy. Every reader now calls this. Boot-only.
+pub fn parse_strategy(s: &str) -> Result<u8, StrategyParseErr<'_>> {
+    if s.is_empty() {
+        return Err(StrategyParseErr::Empty);
+    }
+    if s == "all" {
+        return Ok(BUILT_MASK);
+    }
+    let mut mask = 0;
+    for seg in s.split('+') {
+        mask |= match seg {
+            "" => return Err(StrategyParseErr::EmptySegment),
+            "all" => return Err(StrategyParseErr::AllNotAlone),
+            "ai" => AI_MASK,
+            _ => match MEMBERS.iter().find(|m| m.name == seg) {
+                Some(m) => m.bit,
+                None => return Err(StrategyParseErr::Unknown(seg)),
+            },
+        };
+    }
+    Ok(mask)
+}
+
+/// A mask's member names, `+`-joined in slot order: the canonical
+/// spelling of a [`parse_strategy`] result (`ai+vrp` → `vrp+ai-exec+vm`).
+/// A bit with no member shows nothing; mask 0 is the empty string.
+#[derive(Clone, Copy, Debug)]
+pub struct MaskNames(pub u8);
+
+impl core::fmt::Display for MaskNames {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut sep = "";
+        for m in MEMBERS {
+            if self.0 & m.bit != 0 {
+                write!(f, "{sep}{}", m.name)?;
+                sep = "+";
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------
@@ -621,7 +619,7 @@ impl StrategySet {
     /// given initial enable mask. Reserved/unknown bits in
     /// `initial_mask` are silently cleared to `BUILT_MASK` — the wire
     /// cannot express them and the cli builds masks via
-    /// [`mask_for_name`], so anything else is caller error contained
+    /// [`parse_strategy`], so anything else is caller error contained
     /// at boot. Boot-only.
     pub fn new(initial_mask: u8) -> Self {
         let m = initial_mask & BUILT_MASK;
@@ -1840,80 +1838,102 @@ mod tests {
         s
     }
 
+    /// S16-1c: the legacy oracle — the 24 strings the whole-string table
+    /// (`MASK_TABLE`, retired by S16-1c) resolved, each with the mask it
+    /// composed. Every string accepted before the parser parses to the
+    /// same mask.
     #[test]
     fn initial_mask_from_names() {
-        // HYPARB H0 (O-H1): slot 0 is the hyparb member and
-        // `latency-arb` is gone as a NAME — the old name refuses the
-        // boot rather than composing a different member.
-        assert_eq!(mask_for_name("latency-arb"), None);
-        assert_eq!(mask_for_name("hyparb"), Some(BIT_HYPARB));
-        assert_eq!(
-            mask_for_name("hyparb"),
-            Some(1),
-            "slot 0's bit is wire-stable across the swap"
-        );
-        assert_eq!(mask_for_name("ai+hyparb"), Some(49));
-        assert_eq!(mask_for_name("ai+vrp+xsd+bin15+hyparb"), Some(63));
-        // VRP V7: slot 1 is the VRP member and `ev` is gone as a NAME.
-        // An operator who types the old one gets a boot refusal rather
-        // than a different strategy than the one they asked for.
-        assert_eq!(mask_for_name("ev"), None);
-        assert_eq!(mask_for_name("vrp"), Some(BIT_VRP));
-        assert_eq!(mask_for_name("vrp"), Some(2), "the slot NUMBER is wire-stable");
-        assert_eq!(
-            mask_for_name("ai+vrp"),
-            Some(BIT_AI_EXEC | BIT_VM | BIT_VRP)
-        );
-        assert_eq!(mask_for_name("ai+vrp"), Some(50));
-        // XSD-S/XSD-3 (2026-09-12): slot 2 is the xsd member; `cross-arb`
-        // is gone as a NAME and refuses the boot. The live masks do not
-        // move.
-        assert_eq!(mask_for_name("cross-arb"), None);
-        assert_eq!(mask_for_name("xsd"), Some(BIT_XSD));
-        assert_eq!(mask_for_name("xsd"), Some(4), "slot 2's bit is wire-stable across the swap");
-        assert_eq!(mask_for_name("ai+xsd"), Some(BIT_AI_EXEC | BIT_VM | BIT_XSD));
-        assert_eq!(mask_for_name("ai+xsd"), Some(52));
-        assert_eq!(mask_for_name("ai+vrp+xsd"), Some(54));
-        assert_eq!(mask_for_name("ai"), Some(48));
-        assert_eq!(mask_for_name("ai+vrp"), Some(50));
-        // XMM XH1 (O-XH1): slot 6 is the xmm member; `icdp` and
-        // `ai+icdp` are gone as NAMES and refuse the boot.
-        assert_eq!(mask_for_name("icdp"), None);
-        assert_eq!(mask_for_name("ai+icdp"), None);
-        assert_eq!(mask_for_name("xmm"), Some(BIT_XMM));
-        assert_eq!(mask_for_name("xmm"), Some(64), "slot 6's bit is wire-stable across the swap");
-        assert_eq!(mask_for_name("ai+xmm"), Some(112));
-        assert_eq!(mask_for_name("bin15+xmm"), Some(BIT_BIN15 | BIT_XMM));
-        assert_eq!(mask_for_name("ai+vrp+xsd+bin15+hyparb+xmm"), Some(127));
-        // HC11 (O-HC18): slot 7 is the hcv member.
-        assert_eq!(mask_for_name("hcv"), Some(BIT_HCV));
-        assert_eq!(mask_for_name("hcv"), Some(128), "slot 7's bit");
-        assert_eq!(mask_for_name("ai+hcv"), Some(176));
-        assert_eq!(mask_for_name("ai+vrp+xsd+bin15+hyparb+xmm+hcv"), Some(255));
-        assert_eq!(mask_for_name("bin15"), Some(BIT_BIN15));
-        assert_eq!(mask_for_name("rule-tree"), None, "the old name is GONE");
-        assert_eq!(
-            mask_for_name("ai+vrp+xsd+bin15"),
-            Some(BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD | BIT_BIN15)
-        );
-        assert_eq!(mask_for_name("ai-exec"), Some(BIT_AI_EXEC));
-        assert_eq!(mask_for_name("vm"), Some(BIT_VM));
-        assert_eq!(mask_for_name("ai"), Some(BIT_AI_EXEC | BIT_VM));
-        assert_eq!(mask_for_name("all"), Some(BUILT_MASK));
-        assert_eq!(mask_for_name("all"), Some(255), "every slot 0..=7 is built since HC11");
+        const ORACLE: [(&str, u8); 24] = [
+            ("hyparb", 1),
+            ("ai+hyparb", 49),
+            ("ai+vrp+xsd+bin15+hyparb", 63),
+            ("xsd", 4),
+            ("ai+xsd", 52),
+            ("ai+vrp+xsd", 54),
+            ("bin15", 8),
+            ("ai+bin15", 56),
+            ("ai+vrp+bin15", 58),
+            ("ai+xsd+bin15", 60),
+            ("ai+vrp+xsd+bin15", 62),
+            ("all", 255),
+            ("ai-exec", 16),
+            ("vm", 32),
+            ("ai", 48),
+            ("xmm", 64),
+            ("ai+xmm", 112),
+            ("ai+vrp+xsd+bin15+hyparb+xmm", 127),
+            ("bin15+xmm", 72),
+            ("hcv", 128),
+            ("ai+hcv", 176),
+            ("ai+vrp+xsd+bin15+hyparb+xmm+hcv", 255),
+            ("vrp", 2),
+            ("ai+vrp", 50),
+        ];
+        for (name, mask) in ORACLE {
+            assert_eq!(parse_strategy(name), Ok(mask), "{name}");
+        }
         // `ai` = AI-pushed lanes only — NO Rust-coded strategy bit
-        // (operator ruling 2026-09-02).
+        // (operator ruling 2026-09-02). Const pins — checked at compile
+        // time (clippy: a runtime `assert!` on consts folds away).
         const _: () = assert!(
-            (BIT_AI_EXEC | BIT_VM) & BIT_HYPARB == 0,
-            "`ai` excludes hyparb"
+            AI_MASK == BIT_AI_EXEC | BIT_VM,
+            "`ai` is ai-exec + vm alone"
         );
-        // Const pins — checked at compile time (clippy: a runtime
-        // `assert!` on consts folds away; this makes the pin official).
         const _: () = assert!(BUILT_MASK & BIT_AI_EXEC != 0, "`all` includes ai-exec");
         const _: () = assert!(BUILT_MASK & BIT_VM != 0, "`all` composes vm (8g item 6)");
         assert_eq!(BIT_VM, 1 << STRATEGY_SLOT_VM, "wire slot pinned");
-        assert_eq!(mask_for_name("nope"), None);
-        assert_eq!(mask_for_name(""), None);
+    }
+
+    /// S16-1c: what the parser refuses, variant by variant. The gone names
+    /// — `latency-arb` (HYPARB O-H1), `ev` (VRP V7), `cross-arb` (XSD-S),
+    /// `rule-tree` (BIN15 O4b), `icdp` (XMM O-XH1) — refuse the boot
+    /// rather than compose a different member than the one asked for.
+    #[test]
+    fn malformed_and_gone_names_are_refused() {
+        use StrategyParseErr::{AllNotAlone, Empty, EmptySegment, Unknown};
+        let want = [
+            ("", Empty),
+            ("+", EmptySegment),
+            ("ai+", EmptySegment),
+            ("+ai", EmptySegment),
+            ("ai++vrp", EmptySegment),
+            ("all+ai", AllNotAlone),
+            ("ai+all", AllNotAlone),
+            ("all+all", AllNotAlone),
+            ("AI", Unknown("AI")),
+            (" ai", Unknown(" ai")),
+            ("ai ", Unknown("ai ")),
+            ("xmmx", Unknown("xmmx")),
+            ("nope", Unknown("nope")),
+            ("latency-arb", Unknown("latency-arb")),
+            ("ev", Unknown("ev")),
+            ("cross-arb", Unknown("cross-arb")),
+            ("rule-tree", Unknown("rule-tree")),
+            ("icdp", Unknown("icdp")),
+            ("ai+icdp", Unknown("icdp")),
+        ];
+        for (s, err) in want {
+            assert_eq!(parse_strategy(s), Err(err), "{s:?}");
+        }
+        assert_eq!(
+            Unknown("nope").to_string(),
+            "unknown name `nope` — valid: `+`-joined names from hyparb, vrp, xsd, bin15, \
+             ai-exec, vm, xmm, hcv, ai (= ai-exec+vm); or `all` alone",
+            "the refusal names the valid set"
+        );
+    }
+
+    /// S16-1c (ruling S16-R3): segments come in any order, and overlapping
+    /// or repeated ones compose the union.
+    #[test]
+    fn overlapping_segments_are_the_union() {
+        assert_eq!(parse_strategy("ai+vm"), Ok(48));
+        assert_eq!(parse_strategy("vrp+vrp"), Ok(2));
+        assert_eq!(parse_strategy("ai-exec+ai"), Ok(48));
+        assert_eq!(parse_strategy("ai+ai"), Ok(48));
+        assert_eq!(parse_strategy("vm+ai-exec"), Ok(AI_MASK));
+        assert_eq!(parse_strategy("xmm+bin15"), Ok(72), "refused before S16-1c");
     }
 
     #[test]
@@ -2953,44 +2973,46 @@ mod tests {
         }
     }
 
-    /// BIN15 O5: `MASK_TABLE` is the only name list, so it must not
-    /// carry a name twice — a duplicate would silently shadow the
-    /// second mask under the linear scan.
+    /// S16-1c: each member's name is one parser segment — non-empty,
+    /// distinct, free of `+`, and neither `ai` nor `all` (the parser reads
+    /// those two first, so a member under either could never be named).
     #[test]
-    fn mask_table_has_no_duplicate_names() {
-        let mut i = 0;
-        while i < MASK_TABLE.len() {
-            let mut j = i + 1;
-            while j < MASK_TABLE.len() {
-                assert_ne!(MASK_TABLE[i].0, MASK_TABLE[j].0, "duplicate name in MASK_TABLE");
-                j += 1;
+    fn member_names_are_distinct_segments() {
+        for (i, m) in MEMBERS.iter().enumerate() {
+            assert!(!m.name.is_empty() && !m.name.contains('+'), "{}", m.name);
+            assert!(m.name != "ai" && m.name != "all", "{}", m.name);
+            for n in &MEMBERS[i + 1..] {
+                assert_ne!(m.name, n.name, "duplicate member name");
             }
-            i += 1;
         }
     }
 
-    /// Every table row must resolve through `mask_for_name` to its own
-    /// mask — the scan and the table cannot disagree.
+    /// S16-1c: every mask the members compose parses back from its names
+    /// in slot order (= [`MaskNames`]), reversed, and with `ai` standing
+    /// for ai-exec + vm at either end.
     #[test]
-    fn mask_table_and_mask_for_name_agree() {
-        let mut i = 0;
-        while i < MASK_TABLE.len() {
-            let (name, mask) = MASK_TABLE[i];
-            assert_eq!(mask_for_name(name), Some(mask), "{name}");
-            assert!(!name.is_empty(), "an empty name would shadow the None case");
-            i += 1;
-        }
-    }
-
-    /// Every mask in the table must be built — a name that composes a
-    /// reserved slot would boot a member that does not exist.
-    #[test]
-    fn every_table_mask_is_built() {
-        let mut i = 0;
-        while i < MASK_TABLE.len() {
-            let (name, mask) = MASK_TABLE[i];
-            assert_eq!(mask & !BUILT_MASK, 0, "{name} composes an unbuilt slot");
-            i += 1;
+    fn every_mask_round_trips_through_the_parser() {
+        for mask in 1..=BUILT_MASK {
+            let names: Vec<&str> = MEMBERS
+                .iter()
+                .filter(|m| mask & m.bit != 0)
+                .map(|m| m.name)
+                .collect();
+            let fwd = names.join("+");
+            assert_eq!(MaskNames(mask).to_string(), fwd);
+            assert_eq!(parse_strategy(&fwd), Ok(mask), "{fwd}");
+            let rev: Vec<&str> = names.iter().rev().copied().collect();
+            assert_eq!(parse_strategy(&rev.join("+")), Ok(mask), "{rev:?}");
+            if mask & AI_MASK == AI_MASK {
+                let rest = MaskNames(mask & !AI_MASK).to_string();
+                let (first, last) = if rest.is_empty() {
+                    ("ai".to_owned(), "ai".to_owned())
+                } else {
+                    (format!("ai+{rest}"), format!("{rest}+ai"))
+                };
+                assert_eq!(parse_strategy(&first), Ok(mask), "{first}");
+                assert_eq!(parse_strategy(&last), Ok(mask), "{last}");
+            }
         }
     }
 
@@ -3010,7 +3032,7 @@ mod tests {
         let mut or = 0u8;
         for m in MEMBERS {
             assert_eq!(m.bit, 1 << m.slot, "{}", m.name);
-            assert_eq!(mask_for_name(m.name), Some(m.bit), "{}", m.name);
+            assert_eq!(parse_strategy(m.name), Ok(m.bit), "{}", m.name);
             or |= m.bit;
         }
         assert_eq!(or, BUILT_MASK);

@@ -43,34 +43,19 @@ pub struct ResolvedRegime {
     pub require_labels: bool,
 }
 
-/// Map a `[labels.<member>]` name to its strategy-set slot.
+/// Map a `[labels.<member>]` name to its strategy-set slot: a scan of the
+/// member table's label keys (`strategy_set::MEMBERS`, S16-1c). vm and hcv
+/// carry none. A gone member's key — `latency_arb` (HYPARB H0), `ev` (VRP
+/// V7), `cross_arb` (XSD-S), `rule_tree` (BIN15 O4b), `icdp` (XMM XH1) —
+/// is unknown on purpose: a label evidenced for the old member must not
+/// silently gate the new one, so an old `regime.toml` carrying one
+/// refuses the boot with "unknown coded member". xmm carries its key so
+/// `require = 1` can boot it (XH3; never consulted — the HORIZON law).
 fn coded_member_slot(name: &str) -> Option<u8> {
-    Some(match name {
-        // HYPARB H0 (2026-09-23): slot 0 is hyparb. `latency_arb` is
-        // GONE as a label name for the same reason `ev` is — a label
-        // evidenced for the old member must not gate the new one.
-        "hyparb" => strategy_set::SLOT_HYPARB,
-        // VRP V7: slot 1 is the VRP member. `ev` is deliberately GONE:
-        // a label evidenced for the EV member must not silently gate a
-        // different strategy, so an old `regime.toml` carrying
-        // `[labels.ev]` refuses the boot with "unknown coded member"
-        // rather than applying to the VRP member.
-        "vrp" => strategy_set::SLOT_VRP,
-        // XSD-S/XSD-3 (2026-09-12): slot 2 is the xsd member; `cross_arb`
-        // is gone for the same reason `ev` is.
-        "xsd" => strategy_set::SLOT_XSD,
-        // BIN15 O4b (2026-09-12): slot 3 is bin15. `rule_tree` is
-        // GONE as a label name — a `regime.toml [labels.rule_tree]`
-        // section now refuses the boot rather than labelling a
-        // member that no longer sits there.
-        "bin15" => strategy_set::SLOT_BIN15,
-        "ai_exec" => strategy_set::SLOT_AI_EXEC,
-        // XMM XH1 (2026-09-26): slot 6 is xmm; `icdp` is GONE as a label
-        // name for the same reason `ev` is. XH3: xmm carries its label
-        // (never consulted — the HORIZON law), so `require = 1` can boot it.
-        "xmm" => strategy_set::SLOT_XMM,
-        _ => return None,
-    })
+    strategy_set::MEMBERS
+        .iter()
+        .find(|m| m.regime_key == Some(name))
+        .map(|m| m.slot)
 }
 
 /// Resolve a parsed artifact through `resolve` (descriptor → sym).
@@ -285,5 +270,36 @@ mod tests {
         f.labels[0].member = "ai_exec".to_owned();
         let r = resolve_regime_file(&f, b"x", &resolver, false).unwrap();
         assert_eq!(r.labels[0].0, strategy_set::SLOT_AI_EXEC);
+    }
+
+    /// S16-1c: the label keys are the member table's — the six coded
+    /// members by key; vm, hcv, member names and the gone keys by none.
+    #[test]
+    fn coded_member_keys_are_the_member_tables() {
+        let want = [
+            ("hyparb", strategy_set::SLOT_HYPARB),
+            ("vrp", strategy_set::SLOT_VRP),
+            ("xsd", strategy_set::SLOT_XSD),
+            ("bin15", strategy_set::SLOT_BIN15),
+            ("ai_exec", strategy_set::SLOT_AI_EXEC),
+            ("xmm", strategy_set::SLOT_XMM),
+        ];
+        for (key, slot) in want {
+            assert_eq!(coded_member_slot(key), Some(slot), "{key}");
+        }
+        for none in [
+            "vm",
+            "hcv",
+            "ai-exec",
+            "ai",
+            "latency_arb",
+            "ev",
+            "cross_arb",
+            "rule_tree",
+            "icdp",
+            "",
+        ] {
+            assert_eq!(coded_member_slot(none), None, "{none}");
+        }
     }
 }

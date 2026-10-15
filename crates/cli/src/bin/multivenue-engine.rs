@@ -16,6 +16,9 @@
 //!   drain consumers on the main thread until SIGINT.
 //! * `print-config` — load `.env` + env and print the resolved
 //!   (non-secret) config.
+//! * `strategy-mask <STRATEGY>` — S16-1c: resolve a `--strategy` value
+//!   as `run` does and print `<mask>\t<members>`; the launchd wrapper's
+//!   check. No `.env`, no tracing.
 //! * `exec-smoke` — the E3 TESTNET-ONLY signature gate. Proves this
 //!   binary can produce a signature the venue verifies AND that the
 //!   venue rejects a corrupted one. It cannot reach mainnet: it reads
@@ -40,17 +43,6 @@ use core_net::TlsTransport;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-/// BIN15 O5 (2026-09-12): the composed-set names this binary will boot.
-///
-/// This list MUST mirror `strategy_set::mask_for_name` exactly (HYPARB
-/// H0 retired the one exemption: `latency-arb` and its standalone arm
-/// left with the member, O-H1). It lives here as a named const rather than as match literals so the
-/// `strategy_name_pin` tests below can read it: the arm and the mask
-/// table DID drift once. The five bin15 names reached `mask_for_name`
-/// and the wrapper allow-list but never the match arm, so
-/// `--strategy ai+vrp+xsd+bin15` refused the boot at 2026-09-12T20:04:42Z
-/// and the whole set — ai-exec, vm, vrp, xsd and bin15 — went dark
-/// behind a live capture that looked healthy.
 /// BX11 (the parser review's P-2): every `exec-smoke` flag that is not the
 /// account tools' own. clap waives a `requires` whose target conflicts with
 /// an argument present — every battery flag `requires = "binance"`, and the
@@ -116,44 +108,6 @@ const BN_TOOL_CONFLICTS: [&str; 57] = [
     "bn_eq_ttl_ms",
     "bn_confirm_mainnet",
     "bn_mainnet",
-];
-
-const STRATEGY_SET_NAMES: &[&str] = &[
-    "all",
-    "ai",
-    "ai-exec",
-    "vm",
-    "vrp",
-    "ai+vrp",
-    "xsd",
-    "ai+xsd",
-    "ai+vrp+xsd",
-    "bin15",
-    "ai+bin15",
-    "ai+vrp+bin15",
-    "ai+xsd+bin15",
-    "ai+vrp+xsd+bin15",
-    // HYPARB H0: slot 0. Resolves, but refuses the boot as "no
-    // requested member is configured" until H5 lands its artifact
-    // (lands DARK — O-H8).
-    "hyparb",
-    "ai+hyparb",
-    "ai+vrp+xsd+bin15+hyparb",
-    // XMM XH1 (O-XH1): slot 6. Resolves, but refuses the boot as "no
-    // requested member is configured" without `~/multivenue/xmm.toml`
-    // (or `--xmm`); `icdp` and `ai+icdp` are gone with the unlink.
-    "xmm",
-    "ai+xmm",
-    "ai+vrp+xsd+bin15+hyparb+xmm",
-    // XMM XH5e: the testnet engine-instance check's set (slot 3 beside slot
-    // 6, nothing else); the wrapper's allow-list keeps it off launchd.
-    "bin15+xmm",
-    // HC11 (O-HC18): slot 7, DARK. Resolves, but refuses the boot as "no
-    // requested member is configured" without `~/multivenue/hcv.toml`
-    // (or `--hcv`); in no configured mask until the operator names it.
-    "hcv",
-    "ai+hcv",
-    "ai+vrp+xsd+bin15+hyparb+xmm+hcv",
 ];
 
 /// Top-level CLI.
@@ -271,6 +225,14 @@ enum Cmd {
     /// environment and never opens `.env` — `scripts/bin15-late-dust.sh`
     /// sources it. JSON lines on stdout.
     HlOutcomeProbe(HlOutcomeProbeArgs),
+    /// S16-1c (ruling S16-R3): resolve a `--strategy` value exactly as
+    /// `run` does (`strategy_set::parse_strategy`) and print
+    /// `<mask>\t<members>`, the members `+`-joined in slot order. The
+    /// launchd wrapper's check: it reads no `.env`, starts no tracing and
+    /// touches nothing but stdout and stderr. Exit 0, or 78 (EX_CONFIG,
+    /// the wrapper's refusal code) with the refusal and the valid names
+    /// on stderr.
+    StrategyMask(StrategyMaskArgs),
 }
 
 /// `hl-outcome-probe --network`.
@@ -1482,9 +1444,11 @@ struct RunArgs {
     /// `/state` serves. Implies `--metrics`.
     #[arg(long, default_value_t = false)]
     tui: bool,
-    /// Strategy selector. `ai` (default since HYPARB H0 retired the
-    /// standalone `latency-arb` arm) composes ai-exec + vm through the
-    /// set path. `ev` uses Strategy A:
+    /// Strategy selector. A set is `+`-joined member names in any order,
+    /// or `all` alone (S16-1c: `strategy_set::parse_strategy`, whose
+    /// refusal lists the names; `strategy-mask` resolves one). `ai`
+    /// (default since HYPARB H0 retired the standalone `latency-arb` arm)
+    /// composes ai-exec + vm through the set path. `ev` uses Strategy A:
     /// model-vs-market mispricing against claude-worker artifacts.
     /// `ai-exec` (Phase 8f item 8) runs the AI-driven fair-value/
     /// intent strategy alone via the set path (no boot symbol
@@ -1676,6 +1640,22 @@ struct RunArgs {
 }
 
 #[derive(Debug, Parser)]
+// No help flag: `-h` / `--help` must reach the parser and its exit 78, or
+// the wrapper would read clap's help text (exit 0) as a resolved set.
+#[command(disable_help_flag = true)]
+struct StrategyMaskArgs {
+    /// The `--strategy` value: `+`-joined member names in any order (`ai`
+    /// = ai-exec + vm), or `all` alone. Hyphen-led values reach the
+    /// parser (and its refusal) instead of clap's.
+    #[arg(allow_hyphen_values = true)]
+    strategy: String,
+}
+
+/// sysexits `EX_CONFIG`: the launchd wrapper's refusal code, which
+/// `strategy-mask` shares so a refusal reads the same from either.
+const EX_CONFIG: u8 = 78;
+
+#[derive(Debug, Parser)]
 struct ConfigArgs {
     /// Path to a .env file; defaults to `./.env` via dotenvy.
     #[arg(long)]
@@ -1690,6 +1670,8 @@ fn main() -> ExitCode {
     // arms keep their historical stdout logging unchanged.
     let cli = Cli::parse();
     match cli.cmd {
+        // No tracing: stdout is the wrapper's `<mask>\t<members>` line.
+        Cmd::StrategyMask(args) => strategy_mask(&args),
         Cmd::Run(args) => {
             init_tracing();
             run(args)
@@ -1756,6 +1738,21 @@ fn main() -> ExitCode {
     }
 }
 
+/// S16-1c: `strategy-mask` — `strategy_set::parse_strategy` for the
+/// launchd wrapper (the `Cmd` variant's docs).
+fn strategy_mask(args: &StrategyMaskArgs) -> ExitCode {
+    match strategy_set::parse_strategy(&args.strategy) {
+        Ok(mask) => {
+            println!("{mask}\t{}", strategy_set::MaskNames(mask));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("strategy-mask: refusing `{}`: {e}", args.strategy);
+            ExitCode::from(EX_CONFIG)
+        }
+    }
+}
+
 /// BIN15 H90 L4: `hl-outcome-probe` — the statement checked, `--confirm`
 /// enforced for a mainnet send, then `cli::hl_outcome_probe::run`.
 fn hl_outcome_probe(args: &HlOutcomeProbeArgs) -> ExitCode {
@@ -1798,11 +1795,10 @@ fn hl_outcome_probe(args: &HlOutcomeProbeArgs) -> ExitCode {
     ExitCode::from(run(&cfg, TlsTransport::default_client_config(), &spec))
 }
 
-/// XMM XH5e: a `--strategy` the boot accepts (`STRATEGY_SET_NAMES`) whose
-/// mask boots the xmm member — the boot's own test (`xmm_wanted`).
+/// XMM XH5e: a `--strategy` the boot accepts (`strategy_set::parse_strategy`)
+/// whose mask boots the xmm member — the boot's own test (`xmm_wanted`).
 fn holds_xmm(strategy: &str) -> bool {
-    STRATEGY_SET_NAMES.contains(&strategy)
-        && strategy_set::mask_for_name(strategy).is_some_and(cli::xmm_boot::xmm_wanted)
+    strategy_set::parse_strategy(strategy).is_ok_and(cli::xmm_boot::xmm_wanted)
 }
 
 /// XMM XH5e: `xmm-preflight` — slot 6's boot checks, nothing sent: the
@@ -3835,6 +3831,10 @@ fn boot_queued_live(
 }
 
 fn run(args: RunArgs) -> ExitCode {
+    // S16-1c (ruling S16-R3): `--strategy` parsed ONCE, here, for every
+    // reader below. `Err` is a legacy standalone arm (`rule-tree`, `ev`)
+    // or the refusal at the arm match, which logs the error.
+    let set_mask = strategy_set::parse_strategy(&args.strategy);
     let cfg = match Config::load(args.env_file.as_deref()) {
         Ok(c) => c,
         Err(e) => {
@@ -5081,8 +5081,7 @@ fn run(args: RunArgs) -> ExitCode {
             hl_wall_anchor,
             // HC11: slot 7 reads each underlying's oracle off the MARK;
             // XMM XH4f: the router prices slot 6's perps off it (XH2-C).
-            strategy_set::mask_for_name(&args.strategy)
-                .is_some_and(|m| m & strategy_set::BIT_HCV != 0)
+            set_mask.is_ok_and(|m| m & strategy_set::BIT_HCV != 0)
                 || exec_boot
                     .as_ref()
                     .is_some_and(|b| b.gateway_live().is_some()),
@@ -5634,7 +5633,7 @@ fn run(args: RunArgs) -> ExitCode {
     // flag for `rule-tree` / `ev` and then routing
     // nothing would be the worst kind of silent no-op: the operator
     // passed an arming artifact and the engine ignored it.
-    if args.exec.is_some() && !STRATEGY_SET_NAMES.contains(&args.strategy.as_str()) {
+    if args.exec.is_some() && set_mask.is_err() {
         error!(
             strategy = %args.strategy,
             "exec: --exec is only supported by the composed strategy set \
@@ -5649,14 +5648,14 @@ fn run(args: RunArgs) -> ExitCode {
     let mut xmm_stop: Option<cli::xmm_live::GatewayStop> = None;
     // XMM XH4i-5: slot 3's gateway thread's owner, alike.
     let mut bin15_stop: Option<cli::xmm_live::GatewayStop> = None;
-    let result = match (strategy_choice, args.live) {
+    let result = match (strategy_choice, args.live, set_mask) {
         // HYPARB H0 (O-H1): `latency-arb` has no arm any more — slot 0
         // is the hyparb set member and the old name falls through to
         // the "unknown --strategy" refusal below, on purpose.
         // XSD-S (2026-09-12): `cross-arb` has no arm any more — slot 2 is
         // vacant until `strategy-xsd` lands (XSD-3) and the name falls
         // through to the "unknown --strategy" refusal below, on purpose.
-        ("rule-tree", _live) => {
+        ("rule-tree", _live, _) => {
             let rp = match args.rules_path.as_deref() {
                 Some(p) => p,
                 None => {
@@ -5681,7 +5680,7 @@ fn run(args: RunArgs) -> ExitCode {
                 &mapping,
             )
         }
-        ("ev", live_flag) => {
+        ("ev", live_flag, _) => {
             let path = match args.artifacts_path.as_deref() {
                 Some(p) => p,
                 None => {
@@ -5710,7 +5709,7 @@ fn run(args: RunArgs) -> ExitCode {
                 )
             }
         }
-        (name, _live) if STRATEGY_SET_NAMES.contains(&name) => {
+        (_, _live, Ok(requested)) => {
             // Phase 8f item 7: the composed StrategySet. `all` means
             // "every built member the given flags can boot" —
             // hyparb only when `hyparb.toml` resolves (H5), bin15 only
@@ -5726,8 +5725,6 @@ fn run(args: RunArgs) -> ExitCode {
             // staged + committed (8g §7.3 — normal, not an error).
             // PAPER-only until the 8i RiskGate lands — the set has no
             // live arm.
-            let requested =
-                strategy_set::mask_for_name(name).expect("matched names are valid mask names");
             // XMM XH1: slot 6's artifact, resolved against the SAME
             // descriptor table the ruleset validator uses (D-6 truth).
             // Only when the bit is requested — `--strategy ai` never
@@ -6654,8 +6651,8 @@ fn run(args: RunArgs) -> ExitCode {
                 }
             }
         }
-        (other, _) => {
-            error!(strategy = other, "unknown --strategy value");
+        (other, _, Err(e)) => {
+            error!(strategy = other, error = %e, "unknown --strategy value");
             join_reverse(handles);
             return ExitCode::from(1);
         }
@@ -6694,35 +6691,32 @@ fn run(args: RunArgs) -> ExitCode {
 
 #[cfg(test)]
 mod strategy_name_pin {
-    //! BIN15 O5: the regression pin for the arm/mask drift recorded on
-    //! `STRATEGY_SET_NAMES`. A name that the mask table accepts but this
-    //! binary will not boot is a silent dark-engine bug — the wrapper
-    //! passes the name, the process starts, capture runs, and only the
-    //! mask gauge says the strategies never composed.
+    //! BIN15 O5: the regression pin for the arm/mask drift of 2026-09-12 —
+    //! a name the mask table accepted that this binary would not boot.
+    //! S16-1c retired both lists: the set arm boots whatever
+    //! `strategy_set::parse_strategy` accepts (its tests carry the names
+    //! and the legacy oracle), so what stays pinned here is this binary's
+    //! own use of the parser.
 
-    /// Every bootable name must be a name the mask table can resolve —
-    /// the arm body `expect`s exactly this.
+    /// The legacy standalone arms match BEFORE the set arm, so neither
+    /// name may parse as a set — it would shadow that set.
     #[test]
-    fn every_bootable_name_resolves_to_a_mask() {
-        let mut i = 0;
-        while i < super::STRATEGY_SET_NAMES.len() {
-            let name = super::STRATEGY_SET_NAMES[i];
-            assert!(
-                strategy_set::mask_for_name(name).is_some(),
-                "{name} is bootable but mask_for_name does not know it"
-            );
-            i += 1;
+    fn the_legacy_arms_shadow_no_set() {
+        for legacy in ["rule-tree", "ev"] {
+            assert!(strategy_set::parse_strategy(legacy).is_err(), "{legacy}");
         }
     }
 
     /// XMM XH5e: the preflight's `--strategy` is a bootable set holding the
-    /// xmm member — the engine-instance check's `bin15+xmm` among them.
+    /// xmm member — the engine-instance check's `bin15+xmm` among them, and
+    /// since S16-1c in any order (`xmm+bin15` was refused before).
     #[test]
     fn the_preflight_takes_a_bootable_set_holding_xmm() {
         for ok in [
             "xmm",
             "ai+xmm",
             "bin15+xmm",
+            "xmm+bin15",
             "ai+vrp+xsd+bin15+hyparb+xmm+hcv",
             "all",
         ] {
@@ -6732,155 +6726,13 @@ mod strategy_name_pin {
             "bin15",
             "ai",
             "ai+vrp+xsd+bin15+hyparb",
-            "xmm+bin15",
             "xmmx",
+            "XMM",
+            "xmm+",
+            "all+xmm",
             "",
         ] {
             assert!(!super::holds_xmm(no), "{no}");
-        }
-    }
-
-    /// Every name the mask table accepts must be bootable. This is the
-    /// direction that failed on 2026-09-12. (HYPARB H0 retired the one
-    /// exemption, `latency-arb`, with its standalone arm — O-H1.)
-    #[test]
-    fn every_mask_name_is_bootable() {
-        let mut i = 0;
-        while i < strategy_set::MASK_TABLE.len() {
-            let (name, _mask) = strategy_set::MASK_TABLE[i];
-            assert!(
-                super::STRATEGY_SET_NAMES.contains(&name),
-                "mask_for_name accepts {name} but the boot arm refuses it"
-            );
-            i += 1;
-        }
-    }
-
-    /// HYPARB H0 (O-H1): `latency-arb` is gone as a name — neither the
-    /// mask table nor the boot arm knows it, so the old wrapper line
-    /// refuses the boot instead of composing a different member — and
-    /// the three slot-0 names resolve to bit 0.
-    #[test]
-    fn latency_arb_is_refused_and_the_hyparb_names_resolve() {
-        assert_eq!(strategy_set::mask_for_name("latency-arb"), None);
-        assert!(!super::STRATEGY_SET_NAMES.contains(&"latency-arb"));
-        let want = [
-            ("hyparb", strategy_set::BIT_HYPARB),
-            (
-                "ai+hyparb",
-                strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_HYPARB,
-            ),
-            (
-                "ai+vrp+xsd+bin15+hyparb",
-                strategy_set::BIT_AI_EXEC
-                    | strategy_set::BIT_VM
-                    | strategy_set::BIT_VRP
-                    | strategy_set::BIT_XSD
-                    | strategy_set::BIT_BIN15
-                    | strategy_set::BIT_HYPARB,
-            ),
-        ];
-        let mut i = 0;
-        while i < want.len() {
-            let (name, mask) = want[i];
-            assert!(super::STRATEGY_SET_NAMES.contains(&name), "{name}");
-            assert_eq!(strategy_set::mask_for_name(name), Some(mask), "{name}");
-            i += 1;
-        }
-    }
-
-    /// XMM XH1 (O-XH1): `icdp` and `ai+icdp` are gone as names — the
-    /// old wrapper line refuses the boot instead of composing a different
-    /// member — and the three slot-6 names resolve to bit 6.
-    #[test]
-    fn icdp_is_refused_and_the_xmm_names_resolve() {
-        assert_eq!(strategy_set::mask_for_name("icdp"), None);
-        assert_eq!(strategy_set::mask_for_name("ai+icdp"), None);
-        assert!(!super::STRATEGY_SET_NAMES.contains(&"icdp"));
-        assert!(!super::STRATEGY_SET_NAMES.contains(&"ai+icdp"));
-        let want = [
-            ("xmm", strategy_set::BIT_XMM),
-            (
-                "ai+xmm",
-                strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_XMM,
-            ),
-            (
-                "ai+vrp+xsd+bin15+hyparb+xmm",
-                strategy_set::BUILT_MASK & !strategy_set::BIT_HCV,
-            ),
-        ];
-        let mut i = 0;
-        while i < want.len() {
-            let (name, mask) = want[i];
-            assert!(super::STRATEGY_SET_NAMES.contains(&name), "{name}");
-            assert_eq!(strategy_set::mask_for_name(name), Some(mask), "{name}");
-            i += 1;
-        }
-    }
-
-    /// HC11 (O-HC18): the three slot-7 names resolve to bit 7, and the
-    /// widest one composes every slot.
-    #[test]
-    fn the_hcv_names_resolve() {
-        let want = [
-            ("hcv", strategy_set::BIT_HCV),
-            (
-                "ai+hcv",
-                strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_HCV,
-            ),
-            ("ai+vrp+xsd+bin15+hyparb+xmm+hcv", strategy_set::BUILT_MASK),
-        ];
-        let mut i = 0;
-        while i < want.len() {
-            let (name, mask) = want[i];
-            assert!(super::STRATEGY_SET_NAMES.contains(&name), "{name}");
-            assert_eq!(strategy_set::mask_for_name(name), Some(mask), "{name}");
-            i += 1;
-        }
-    }
-
-    /// The bin15 names specifically, spelled out, so the 2026-09-12
-    /// omission cannot come back unnoticed even if both lists are edited.
-    #[test]
-    fn the_five_bin15_names_boot() {
-        let want = [
-            ("bin15", strategy_set::BIT_BIN15),
-            (
-                "ai+bin15",
-                strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_BIN15,
-            ),
-            (
-                "ai+vrp+bin15",
-                strategy_set::BIT_AI_EXEC
-                    | strategy_set::BIT_VM
-                    | strategy_set::BIT_VRP
-                    | strategy_set::BIT_BIN15,
-            ),
-            (
-                "ai+xsd+bin15",
-                strategy_set::BIT_AI_EXEC
-                    | strategy_set::BIT_VM
-                    | strategy_set::BIT_XSD
-                    | strategy_set::BIT_BIN15,
-            ),
-            (
-                "ai+vrp+xsd+bin15",
-                strategy_set::BIT_AI_EXEC
-                    | strategy_set::BIT_VM
-                    | strategy_set::BIT_VRP
-                    | strategy_set::BIT_XSD
-                    | strategy_set::BIT_BIN15,
-            ),
-        ];
-        let mut i = 0;
-        while i < want.len() {
-            let (name, mask) = want[i];
-            assert!(
-                super::STRATEGY_SET_NAMES.contains(&name),
-                "{name} is not in STRATEGY_SET_NAMES"
-            );
-            assert_eq!(strategy_set::mask_for_name(name), Some(mask), "{name}");
-            i += 1;
         }
     }
 }

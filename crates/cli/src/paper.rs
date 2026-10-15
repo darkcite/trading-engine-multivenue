@@ -3539,7 +3539,7 @@ fn configure_rule_tree<const N: usize>(
 /// its `on_start` validates parameters only; vm boots inert until a
 /// ruleset table is staged + committed — 8g §7.3, normal, not an
 /// error). `requested_mask` (from
-/// [`strategy_set::mask_for_name`]) is intersected with that
+/// [`strategy_set::parse_strategy`]) is intersected with that
 /// configured mask, so `--strategy all` means "all built members the
 /// given flags can boot" — every enabled member still validates
 /// fail-fast in `on_start`. An AI `EnableStrategy` may later switch
