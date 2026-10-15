@@ -20352,3 +20352,67 @@ fn binance_equity_lane_render_and_scan_steady_state() {
     assert_eq!((pages, lists), (N.div_ceil(64), N.div_ceil(64)), "gate 113: the page and the listing at their cadence");
     assert_eq!(allocs, 0, "gate 113: equity's render and scans allocated {allocs} times ({bytes} B)");
 }
+
+/// Gate PVM-1 (the PVM lane's own gate label — PVM-prefixed so it can never
+/// collide with main's numbered gates): `pine-lang`'s read paths allocate
+/// nothing (impl-01 §7.11, D1-e). Outside the guard, every fixture script of
+/// `crates/pine-lang/tests/scripts` (together they produce all 38 non-`Error`
+/// node kinds, pinned by pine-lang's `api::view_covers_every_kind`) is parsed
+/// twice into two symbol tables. Inside the guard: every node's `node`,
+/// `kind`, `span`, `height`, `children`, `subtree` and `doc`, `resolve` on
+/// every `Ident` / `Name`, `annotations()`, a full `walk`, and
+/// `structurally_eq` of the two parses.
+#[test]
+fn pine_lang_ast_read_is_zero_alloc() {
+    use pine_ir::{FileId, NodeId, SymTable};
+    use pine_lang::{parse, structurally_eq, Node, Visit};
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../pine-lang/tests/scripts");
+    let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .expect("gate PVM-1: the pine-lang fixture dir")
+        .map(|e| e.expect("gate PVM-1: a dir entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "pine"))
+        .collect();
+    names.sort();
+    assert!(names.len() >= 12, "gate PVM-1: {} fixture scripts", names.len());
+    let mut nodes_read = 0u64;
+    for path in &names {
+        let src = std::fs::read_to_string(path).expect("gate PVM-1: read a fixture");
+        let mut ta = SymTable::new();
+        let a = parse(&src, FileId::ROOT, &mut ta).expect("gate PVM-1: a fixture parses");
+        let mut tb = SymTable::new();
+        let b = parse(&src, FileId::ROOT, &mut tb).expect("gate PVM-1: a fixture parses twice");
+
+        let g = AllocGuard::new();
+        let mut acc = 0u64;
+        let mut i = 0u32;
+        while (i as usize) < a.len() {
+            let id = NodeId(i);
+            acc = acc.wrapping_add(a.kind(id) as u64);
+            let sp = a.span(id);
+            acc = acc.wrapping_add(u64::from(sp.hi - sp.lo));
+            acc = acc.wrapping_add(u64::from(a.height(id)));
+            if let Node::Ident { sym } | Node::Name { sym } = a.node(id) {
+                acc = acc.wrapping_add(ta.resolve(sym).len() as u64);
+            }
+            for c in a.children(id) {
+                acc = acc.wrapping_add(u64::from(c.0));
+            }
+            let r = a.subtree(id);
+            acc = acc.wrapping_add(u64::from(r.end - r.start) + a.doc(id).len() as u64);
+            i += 1;
+        }
+        acc = acc.wrapping_add(a.annotations().len() as u64);
+        for v in a.walk(a.root()) {
+            if let Visit::Enter(id) = v {
+                acc = acc.wrapping_add(u64::from(id.0));
+            }
+        }
+        let eq = structurally_eq(&a, &ta, &b, &tb);
+        let (allocs, bytes, _) = g.delta();
+        assert_eq!(allocs, 0, "gate PVM-1: reading {} allocated {allocs} times ({bytes} B)", path.display());
+        assert!(eq && acc > 0, "gate PVM-1: {} read back", path.display());
+        nodes_read += a.len() as u64;
+    }
+    assert!(nodes_read > 500, "gate PVM-1: only {nodes_read} nodes read");
+}

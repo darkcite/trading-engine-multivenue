@@ -501,6 +501,17 @@ name = "options-select"
 version = "0.1.0"
 
 [[package]]
+name = "pine-ir"
+version = "0.1.0"
+
+[[package]]
+name = "pine-lang"
+version = "0.1.0"
+dependencies = [
+ "pine-ir",
+]
+
+[[package]]
 name = "polymarket-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -529,6 +540,8 @@ dependencies = [
  "ingress-polymarket",
  "ingress-rpc",
  "libfuzzer-sys",
+ "pine-ir",
+ "pine-lang",
  "signer-eip712",
  "signer-evm",
 ]

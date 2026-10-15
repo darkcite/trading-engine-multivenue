@@ -77,6 +77,9 @@ ingress-hyperevm     = { workspace = true }
 core-fill            = { workspace = true }
 # HYPARB H4 gate 68: the slot-0 member — decision, carry, hedge, timer.
 strategy-hyparb      = { workspace = true }
+# gate PVM-1: the Pine front end's read paths (impl-01 section 7.11, D1-e).
+pine-ir              = { workspace = true }
+pine-lang            = { workspace = true }
 # XMM XH4a gate 95: the order-gateway kit (duplex, in-flight table,
 # deadline queue, reconnect machine, wait policy, latency trackers).
 exec-gateway         = { workspace = true }
