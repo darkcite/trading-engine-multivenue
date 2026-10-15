@@ -6,6 +6,21 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-15 — S3 archiver: the nightly budget 3600 → 8400 s (HK18)
+
+**What changed**
+- `scripts/archive-cycle.sh`'s fallback, `retention.conf.example` and
+  `local-setup.md` say `S3_CYCLE_BUDGET_S=8400` (was 3600, HK11).
+
+**Impact**
+- At the 1 MiB/s cap a weekday's capture (6.0–6.4 GB stored) takes ~1 h
+  45 min; 3600 s moved ~3.5 GB and left the rest for the next night.
+- From 04:30 local (21:30Z on this Mac) the cycle ends by 23:50Z.
+
+**Migration steps**
+1. Set `S3_CYCLE_BUDGET_S=8400` in `~/multivenue/retention.conf` (done on
+   this Mac, 2026-10-15).
+
 ## 2026-10-14 — The outcome binder leaves a repeat of the live roll alone, on both arms (HK13, A-S7-81)
 
 **What changed**
@@ -54,8 +69,9 @@ Each entry is atomic: one version bump per section. Do not batch.
 - `scripts/archive-cycle.sh` defaults `S3_CYCLE_BUDGET_S` to 3600 (was 600).
 
 **Impact**
-- A day's capture (~2.2 GB stored) takes ~35 min at the cap; a 600 s budget
-  would leave a growing backlog. The live `retention.conf` says 3600.
+- A day's capture takes ~1 h 45 min at the cap (6.0–6.4 GB stored on a
+  weekday; corrected by HK18 — this entry first said ~2.2 GB and ~35 min).
+  3600 s still leaves a backlog: see the HK18 entry above.
 - Feed delays stay in their no-upload band during the nightly push (measured
   2026-10-14, risk-policy "HK11").
 - Bucket: `…/features/<file>` objects from before this change do not exist

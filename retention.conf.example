@@ -54,13 +54,15 @@ ARCHIVE_MODE="compress"
 # Wall budget for one run of the upload cycle (stage A). The cycle stops
 # cleanly when it is spent and resumes where it left off next time — a
 # half-uploaded run has no manifest and no index, so no reader can see it.
-S3_CYCLE_BUDGET_S=3600
+# Sized for the 1 MiB/s upload cap (HK11): a weekday's capture is 6.0-6.4 GB
+# stored, ~1 h 45 min; 8400 s leaves room for a backlog (HK18).
+S3_CYCLE_BUDGET_S=8400
 
 # 1 puts the uploader in macOS's BACKGROUND network traffic class. Measured in
 # September at ~0.3 MiB/s; on 2026-10-14 it no longer throttled (~3.3 MB/s),
 # and an uncapped push stalled the feeds for minutes. Since HK11 the archiver
 # caps itself (MULTIVENUE_S3_MAX_UPLOAD_MIBPS, default 1 MiB/s: a day's
-# capture in ~35 min with the feed delays in their no-upload band), so this
+# capture in ~1 h 45 min with the feed delays in their no-upload band), so this
 # switch is no longer the protection. Default 0.
 S3_NICE_NETWORK=0
 

@@ -74,7 +74,7 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   `docs/arch/` and the vault; nothing there is open work.
 - **Live operation.**
   - One launchd engine (`com.multivenue.engine`) in PAPER, restarted at
-    00:10/08:30/16:05Z by `daily-restart`.
+    00:10/08:33/16:05/20:15/21:15Z by `daily-restart`.
   - Beside it: `caffeinate`, hourly `candles`, 5-min `regime`, nightly
     `retention` (PROTECT_DAYS 1, every delete gated on S3 `verify`),
     `archive` (04:30 local) and the read-only `dashboard`.
@@ -202,11 +202,12 @@ The lane records stay where they always were: `docs/risk-policy.md` and
 - **The HK housekeeping lane (risk-policy "HK", "HK, part 2").** HK1–HK10
   (2026-10-13) closed Section A of that day's survey; HK11–HK17 (2026-10-14)
   Section B and the day's findings.
-- **The S3 archive (HK11).** Uploads are capped at 1 MiB/s
+- **The S3 archive (HK11, HK18).** Uploads are capped at 1 MiB/s
   (`MULTIVENUE_S3_MAX_UPLOAD_MIBPS`): uncapped, a push filled the uplink and
-  the feeds' delay EMAs went to seconds. The nightly budget is 3600 s; a
-  SIGTERM aborts the upload in flight. `push-derived` keys keep their path
-  under the store's root, and candles go up zstd'd.
+  the feeds' delay EMAs went to seconds. The nightly budget is 8400 s: a
+  weekday's capture (6.0–6.4 GB stored) takes ~1 h 45 min. A SIGTERM aborts
+  the upload in flight. `push-derived` keys keep their path under the
+  store's root, and candles go up zstd'd.
 - **Gates at HEAD (the HK lane's close, 2026-10-14):**
   - clippy clean.
   - nextest 4 652 passed (10 skipped: the five `#[ignore]`d live smokes,

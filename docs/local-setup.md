@@ -611,12 +611,12 @@ restart lane, add to `~/multivenue/retention.conf`:
 
 ```sh
 ARCHIVE_MODE="s3"
-S3_CYCLE_BUDGET_S=3600
+S3_CYCLE_BUDGET_S=8400
 ```
 
-(3600, not 600, since HK11: uploads are capped at 1 MiB/s, and a day's capture
-is ~2.2 GB stored — ~35 min. A budget spent mid-file aborts that file's
-multipart upload and the next cycle restarts it.)
+(8400, not 600, since HK11/HK18: uploads are capped at 1 MiB/s, and a weekday's
+capture is 6.0–6.4 GB stored — ~1 h 45 min. A budget spent mid-file aborts that
+file's multipart upload and the next cycle restarts it.)
 
 Retention then deletes a run **only** after `verify` exits 0 — index object
 present, manifest byte-identical to the index, every object `HEAD`ing with the

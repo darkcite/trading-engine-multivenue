@@ -32,7 +32,10 @@ cd "$REPO" || exit 78
 export PATH="$REPO/target/release:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 CONF="$HOME/multivenue/retention.conf"
-S3_CYCLE_BUDGET_S=3600 # HK11: a day's capture at the 1 MiB/s cap is ~35 min
+# HK18: a weekday's capture is 6.0-6.4 GB stored (2026-10-12..14), ~1 h 45 min
+# at the 1 MiB/s cap. 8400 s from 04:30 local (21:30Z on this Mac) ends by
+# 23:50Z, before the 00:10Z restart slot, with room for a night's backlog.
+S3_CYCLE_BUDGET_S=8400
 ARCHIVE_MODE="compress"
 [ -f "$CONF" ] && . "$CONF"
 

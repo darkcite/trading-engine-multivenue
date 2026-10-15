@@ -15748,8 +15748,8 @@ repeated roll (both arms; nothing armed today).
     (4.40 GB → 816 MiB), and neither it nor the staged `.zst` outlives the
     push, on any exit (a budget spent before the upload included).
   - `archive-cycle.sh`'s budget fallback 600 → 3600 s, and
-    `local-setup.md` likewise: a day's capture (~2.2 GB stored) takes
-    ~35 min at the cap. The live `retention.conf` already says 3600.
+    `local-setup.md` likewise. **Corrected by HK18:** a weekday's capture
+    is 6.0–6.4 GB stored, not ~2.2 GB, so 3600 s was short — 8400 s now.
 - **Not closed:** a SIGTERM during the initiate POST still orphans an upload
   (its id is not known yet). The backstop is the bucket's
   `AbortIncompleteMultipartUpload` rule, the operator's item.
@@ -15891,3 +15891,26 @@ repeated roll (both arms; nothing armed today).
   - license-check OK (689 files);
   - `make bench-check` 16 OK;
   - worker pytest (HK11's suites) 237 passed; ruff clean on every touched file.
+
+### HK18 — the nightly upload budget, sized from a measured day (2026-10-15)
+
+- **The finding.** The first nightly cycle under the 1 MiB/s cap (2026-10-14,
+  04:30 local = 21:30Z) spent its 3600 s on three runs (0.48, 1.83 and
+  0.97 GB stored, each at ~0.9 MiB/s) and stopped inside a fourth's
+  `bn-ticks` (exit 5, resumable). HK11 had sized the budget from ~2.2 GB a
+  day; the bucket's own manifests say a weekday is 6.0–6.4 GB stored
+  (2026-10-12: 5.95 GB over 23.6 h; 10-13: 6.38 over 23.9 h; 10-14: 6.35 per
+  24 h), the weekend 3.2–3.9. 3600 s at the cap moves ~3.5 GB: the backlog
+  would have grown every weekday.
+- **The change.** `S3_CYCLE_BUDGET_S` 8400 in `archive-cycle.sh`'s fallback,
+  `retention.conf.example`, `local-setup.md` and the live
+  `~/multivenue/retention.conf` (backup `retention.conf.bak-20261015T083615Z-hk18`).
+  8400 s moves ~8.8 GB, a weekday plus a night's backlog, and ends by
+  23:50Z — before the 00:10Z restart slot, which also runs retention.
+- **Backlog, 2026-10-15:** pushed by hand at the cap the same morning, so
+  the first 8400 s night starts level.
+- The rate stays 1 MiB/s: 2 MiB/s failed HK11's measurement.
+- Also corrected: CLAUDE.md's restart slots (00:10/08:33/16:05/20:15/21:15Z;
+  the 20:15/21:15 pair is BST3.5's equity-dailies refresh), and HK11's
+  ~2.2 GB / ~35 min in its record, its migration entry and the config
+  comment.

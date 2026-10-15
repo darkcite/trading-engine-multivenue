@@ -92,9 +92,10 @@ DEFAULTS: typing.Final[dict[str, str]] = {
     # (Deribit's to its 65 535 ms ceiling). Measured the same day on a real
     # run, feed-delay EMAs sampled every 15 s: at 1 MiB/s they stayed in the
     # no-upload band (medians 8-118 ms, one sample over 500 ms in twenty);
-    # at 2 MiB/s six samples went over 500 ms (Deribit 2.8 s). A day's
-    # capture (~2.2 GB stored) takes ~35 min at 1 MiB/s, inside the nightly
-    # budget. docs/risk-policy.md "HK11".
+    # at 2 MiB/s six samples went over 500 ms (Deribit 2.8 s). A weekday's
+    # capture (6.0-6.4 GB stored since 2026-10-12) takes ~1 h 45 min at
+    # 1 MiB/s, inside the nightly budget (8400 s, HK18). docs/risk-policy.md
+    # "HK11", "HK18".
     "MULTIVENUE_S3_MAX_UPLOAD_MIBPS": "1",
     "MULTIVENUE_S3_SKIP_GLOBS": "",
 }
