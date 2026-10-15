@@ -155,7 +155,7 @@ fi
 # handing it the fleet.
 #
 # TWO HALVES, AND ONLY ONE OF THEM COSTS ANYTHING
-#   offline  the binary reproduces the 25 SDK known-answer vectors and
+#   offline  the binary reproduces the 36 SDK known-answer vectors and
 #            rebuilds one action per TYPE from inputs. This is the half
 #            that covers LAW E-3 for ORDERS — the network probe sends a
 #            cancel, so it structurally cannot. Free, no venue, no key.
@@ -404,9 +404,12 @@ if [ "$rotate" = 1 ] && [ -f "$HOME/multivenue/xsd.toml" ] && [ -f "$HOME/multiv
     (
       cd "$REPO_DIR/claude-worker" || exit 0
       export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
-      status="$(uv run python -m claude_worker.xsd_author status --table "$HOME/multivenue/xsd-table.tsv" 2>/dev/null)"
-      echo "daily-restart: $status" >&2
-      case "$status" in
+      # xsd_status, NOT status: zsh's $status is read-only (it is $?), and
+      # assigning it killed this subshell at every 0010 slot until
+      # 2026-09-27 (restart.log: "read-only variable: status").
+      xsd_status="$(uv run python -m claude_worker.xsd_author status --table "$HOME/multivenue/xsd-table.tsv" 2>/dev/null)"
+      echo "daily-restart: $xsd_status" >&2
+      case "$xsd_status" in
         *rotation_due=yes*|*"table absent"*)
           echo "daily-restart: xsd table rotation — re-running the screen" >&2
           uv run python -m claude_worker.xsd_author author \
@@ -478,10 +481,36 @@ if slot_ready 0020; then
       # nothing and can never un-settle a row. Non-fatal like the report
       # above — a failed night is retried by tomorrow's, because the
       # capture is what is precious, not the derivation.
+      #
+      # S7-L1: once slot 3 trades live, ~/multivenue/bin15.toml is the
+      # LIVE-sized artifact, and the replay must keep scoring the PAPER
+      # law — the arming step copies the paper artifact to
+      # bin15.paper-s7.toml first, and the replay reads that copy when
+      # it exists.
       if [ -f "$HOME/multivenue/bin15.toml" ]; then
-        echo "daily-restart: 0020 bin15 accrual (closed UTC day)" >&2
-        uv run python -m claude_worker.bin15_accrue accrue >&2 ||
+        b15="$HOME/multivenue/bin15.toml"
+        [ -f "$HOME/multivenue/bin15.paper-s7.toml" ] && b15="$HOME/multivenue/bin15.paper-s7.toml"
+        echo "daily-restart: 0020 bin15 accrual (closed UTC day, $b15)" >&2
+        uv run python -m claude_worker.bin15_accrue accrue --bin15 "$b15" >&2 ||
           echo "daily-restart: bin15 accrual failed (non-fatal; tomorrow retries)" >&2
+      fi
+      # HYPARB G1 (operator 2026-10-15): the gate's tally. Fold the closed
+      # day's slot-0 sessions under the member's own P&L law into
+      # ~/multivenue/worker/hyparb/g1-sessions.tsv (each run dir is one
+      # session; /state's level dies with it), then replay the day's lean
+      # <= 2 h windows at r3 and at the judge's 2-block delta into
+      # g1-replay.tsv. Here for the same reason as the bin15 accrual: the
+      # run dirs are still local. The replay is cheap enough to ride the
+      # slot -- one lean 2 h unit measured 0.4 s to cut and 0.4 s per rung
+      # (2026-10-15) -- and BOUNDED, because a live worker process holds
+      # off the engine's boot recommit: 120 s a rung, 300 s for the whole
+      # replay; units past the budget stay pending (no row) for the next
+      # night or a manual `backfill --replay`. Idempotent and non-fatal like
+      # the two above.
+      if [ -f "$HOME/multivenue/hyparb.toml" ]; then
+        echo "daily-restart: 0020 hyparb G1 accrual (closed UTC day)" >&2
+        uv run python -m claude_worker.hyparb_g1 accrue >&2 ||
+          echo "daily-restart: hyparb G1 accrual failed (non-fatal; tomorrow retries)" >&2
       fi
     )
   fi

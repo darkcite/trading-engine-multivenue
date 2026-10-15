@@ -87,6 +87,20 @@ DEFAULTS: typing.Final[dict[str, str]] = {
     "MULTIVENUE_S3_PART_SIZE_MIB": "32",
     "MULTIVENUE_S3_CONCURRENCY": "1",
     "MULTIVENUE_S3_TIMEOUT_S": "900",
+    # The upload cap, MiB/s (HK11; 0 = uncapped). An uncapped push filled this
+    # Mac's uplink on 2026-10-14 and the feeds' delay EMAs went to seconds
+    # (Deribit's to its 65 535 ms ceiling). Measured the same day on a real
+    # run, feed-delay EMAs sampled every 15 s: at 1 MiB/s they stayed in the
+    # no-upload band (medians 8-118 ms, one sample over 500 ms in twenty);
+    # at 2 MiB/s six samples went over 500 ms (Deribit 2.8 s). HK20
+    # (2026-10-15, the operator's 20): measured again with the paced client
+    # at 20 MiB/s, the link's own ~5 MB/s is the limit and the delays stayed
+    # at 1 MiB/s's level (one sample in eighteen over 500 ms, worst 551 ms).
+    # 2026-10-14's stall did not recur: the uncapped push's 8 MiB writes, or
+    # that hour's link. A capped upload still hands the socket 64 KiB at a
+    # time; 0 (uncapped) does not. A weekday (6.0-6.4 GB stored) takes ~20 min.
+    # docs/risk-policy.md "HK11", "HK18", "HK20".
+    "MULTIVENUE_S3_MAX_UPLOAD_MIBPS": "20",
     "MULTIVENUE_S3_SKIP_GLOBS": "",
 }
 
@@ -107,6 +121,7 @@ class ArchiveConfig:
     concurrency: int
     timeout_s: float
     skip_globs: tuple[str, ...]
+    max_upload_mibps: float
 
     @property
     def part_size(self) -> int:
@@ -156,7 +171,7 @@ def read_env_file(path: pathlib.Path) -> dict[str, str]:
     out: dict[str, str] = {}
     try:
         text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+    except OSError, UnicodeDecodeError:
         # An unreadable credential file means "disabled", never a crash — and
         # never an error message that could echo a line of the file.
         return out
@@ -213,6 +228,7 @@ def _disabled(reason: str, merged: collections.abc.Mapping[str, str]) -> Archive
         concurrency=_int(merged, "MULTIVENUE_S3_CONCURRENCY"),
         timeout_s=_float(merged, "MULTIVENUE_S3_TIMEOUT_S"),
         skip_globs=_globs(merged.get("MULTIVENUE_S3_SKIP_GLOBS", "")),
+        max_upload_mibps=max(0.0, _float(merged, "MULTIVENUE_S3_MAX_UPLOAD_MIBPS")),
     )
 
 
@@ -231,9 +247,7 @@ def load(
     """
     source: collections.abc.Mapping[str, str] = os.environ if env is None else env
     if env_file is None:
-        env_file = pathlib.Path(
-            source.get(ENV_FILE_KEY, "") or DEFAULT_ENV_FILE
-        ).expanduser()
+        env_file = pathlib.Path(source.get(ENV_FILE_KEY, "") or DEFAULT_ENV_FILE).expanduser()
 
     merged: dict[str, str] = read_env_file(env_file)
     for key, value in source.items():

@@ -197,7 +197,7 @@ def answers_fn(mapping: typing.Mapping[str, str]) -> typing.Callable[[str, str],
     return complete
 
 
-def build_watcher(  # noqa: PLR0913 — composition root: every collaborator named
+def build_watcher(  # composition root: every collaborator named
     *,
     state: claude_worker.state.State,
     store: claude_worker.news.store.Store,
@@ -363,7 +363,7 @@ def _tier2_map(
     return mapping, matched
 
 
-def ingest_tier12(  # noqa: PLR0913 — composition root: every collaborator named
+def ingest_tier12(  # composition root: every collaborator named
     *,
     state: claude_worker.state.State,
     store: claude_worker.news.store.Store,
@@ -417,7 +417,7 @@ def ingest_tier12(  # noqa: PLR0913 — composition root: every collaborator nam
     return stats
 
 
-def ingest_tier3(  # noqa: PLR0913 — composition root: every collaborator named
+def ingest_tier3(  # composition root: every collaborator named
     *,
     state: claude_worker.state.State,
     store: claude_worker.news.store.Store,

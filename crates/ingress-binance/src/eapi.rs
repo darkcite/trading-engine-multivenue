@@ -1,52 +1,83 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! # Binance European options — the M2.4 eapi half-ingress
+//! # Binance European options — the M2.4 options half-ingress
 //!
-//! Options live on a DEDICATED endpoint family (`eapi.binance.com`
-//! REST + the `nbstream.binance.com` WS host), not the spot WS this
-//! crate speaks — hence "half-ingress": a second LANE inside the
-//! Binance venue (the M1c usdm precedent), not a new venue. Market
-//! data only (mvp-plan §4-M2 step 4): capped-chain discovery, option
-//! BBO → `Tick`, mark/IV/greeks → `OptSummary` (M2.3 channel). No
-//! order path anywhere in M2.
+//! Options live on their own endpoint family: `eapi.binance.com` REST
+//! for discovery, and the WS streams the 2025-12 options migration
+//! moved onto fstream's ROUTED paths (BX0-F2) — hence "half-ingress":
+//! a second LANE inside the Binance venue (the M1c usdm precedent),
+//! not a new venue. Market data only (mvp-plan §4-M2 step 4):
+//! capped-chain discovery, option BBO → `Tick`, mark/IV/greeks plus
+//! the underlying's index → `OptSummary` (the M2.3 channel). No order
+//! path here.
 //!
 //! ## Boot/offline doctrine
 //!
 //! Discovery + selection run at boot only — allocation permitted,
-//! same as every 8e discovery module. The WS-lane parsers below the
-//! discovery section are HOT (per-push on the Binance ingress
-//! thread): zero-alloc flat scans over `&[u8]`, quoted-decimal
-//! numbers exactly like the spot `bookTicker` wire.
+//! same as every 8e discovery module. The WS-lane scanners below the
+//! discovery section are HOT (per push on the Binance ingress
+//! thread): zero-alloc, zero-copy flat scans over `&[u8]` that return
+//! borrowed spans, quoted decimals exactly like the spot `bookTicker`
+//! wire.
 //!
-//! ## Wire shapes (documented; live-verified at the M2.4 smoke —
-//! pitfall #11, raw tap armed)
+//! ## Wire shapes (live-verified 2026-09-23, BX0 K6 — pitfall #11)
 //!
 //! REST `GET /eapi/v1/exchangeInfo` (ONE page, ALL underlyings):
-//! `{"optionSymbols":[{"symbol":"BTC-260327-100000-C",
+//! `{"optionContracts":[{"underlying":"BTCUSDT","nakedSell":true,…},…],
+//!   "optionSymbols":[{"symbol":"BTC-260327-100000-C",
 //!   "underlying":"BTCUSDT","strikePrice":"100000.00000000",
-//!   "expiryDate":1774598400000,"side":"CALL","filters":[…],…},…]}`
+//!   "expiryDate":1774598400000,"side":"CALL","status":"TRADING",
+//!   "unit":1,"priceScale":3,"quantityScale":2,
+//!   "contractType":"CRYPTO_OPTIONS","underlyingType":"CRYPTO",
+//!   "filters":[…],…},…]}`
 //! — `strikePrice` QUOTED decimal, `expiryDate` BARE ms integer,
-//! `side` `"CALL"|"PUT"`; `filters`/noise skipped structurally.
+//! `side` `"CALL"|"PUT"`, `status` `TRADING|CLOSED_MARKET` (BX2,
+//! 2026-09-26: 1 558 rows, the TradFi `XAU`/`XAG` week closed);
+//! `filters` (`PRICE_FILTER`, `LOT_SIZE`) walk through the discovery
+//! module's reader; the row's own `minQty`/`maxQty` repeat `LOT_SIZE`
+//! on every live row and are skipped with the rest of the noise.
 //!
 //! REST `GET /eapi/v1/index?underlying=BTCUSDT`:
-//! `{"time":…,"indexPrice":"77000.12"}` — quoted decimal.
+//! `{"time":…,"indexPrice":"77000.12"}` — quoted decimal; the boot
+//! ATM reference.
 //!
-//! WS combined stream (`/stream?streams=a/b/…` — NO subscribe
-//! frames, the crate's standing no-ack pattern):
-//! `{"stream":"btc-260327-100000-c@ticker","data":{…}}` with ticker
-//! data carrying quoted decimals: `bo`/`ao`/`bq`/`aq` (BBO),
-//! `mp` (mark px), `vo` (mark IV, fraction), `d`/`g`/`v`/`t`
-//! (greeks). `{"stream":"btcusdt@index","data":{"p":"77000.1"}}`
-//! feeds the per-underlying index cache (the record's underlying px).
-//! eapi has NO open-interest stream — `OptSummary.flags` carries
-//! MARK_PX only (the OKX-asymmetry mechanism, docs/wire-format.md).
+//! WS: `wss://fstream.binance.com/market/stream?streams=`
+//! `btcusdt@optionMarkPrice/ethusdt@optionMarkPrice` — combined, no
+//! subscribe frames (the crate's standing direct-URL pattern). Each
+//! push is the WHOLE listed chain of one underlying, about once a
+//! second, as ONE unfragmented text frame (measured: 752 BTC
+//! elements ≈ 246 KB, 600 ETH ≈ 194 KB, no element over 336 B):
+//!
+//! ```text
+//! {"stream":"btcusdt@optionMarkPrice","data":[{"s":"BTC-260925-86000-C",
+//!  "mp":"809.784","E":1790161477974,"e":"markPrice","i":"85879.82826087",
+//!  "P":"0.000","bo":"800.000","ao":"810.000","bq":"5.08","aq":"1.10",
+//!  "b":"0.34500957","a":"0.34908772","hl":"1455.000","ll":"165.000",
+//!  "vo":"0.349","rf":"0.0558","d":"0.48723426","t":"-227.33432684",
+//!  "g":"0.00018682","v":"24.52223767"},…]}
+//! ```
+//!
+//! Every value is a quoted decimal. `vo` is the mark IV (fraction);
+//! `b`/`a` are the bid/ask IVs (not read); `i` is the underlying's
+//! index, one value per push. The lane keeps the elements whose `s`
+//! is in its boot table and skips the rest after one symbol compare.
+//! Not subscribed, both measured: `!index@arr` (redundant with `i`)
+//! and the real-time per-option `<symbol>@bookTicker` on `/public`
+//! (the lane keeps the ~1 s BBO cadence it always had). A wrong route
+//! is SILENT — `/stream?…` and `/public/stream?…@optionMarkPrice`
+//! upgrade (101) and carry nothing — and the retired nbstream
+//! `/eoptions/…` `@ticker`/`@index` streams answer HTTP 404. The
+//! stream carries no open interest: `OptSummary.flags` is MARK_PX
+//! only (the OKX-asymmetry mechanism, docs/wire-format.md).
 
 use core_parse::{
     find_field, scan_number_sci_1e9, scan_price_1e6, scan_u64, skip_json_value, skip_string,
     skip_ws,
 };
 use core_types::SymbolId;
+
+use crate::discovery::{BnDiscoveryErr, BnFilters, BnStatus, BnUnderlying, BN_ROW_TRADFI};
 
 // ---------------------------------------------------------------
 // Constants
@@ -64,8 +95,15 @@ pub const EAPI_ULY_MAX: usize = 16;
 /// Deribit/OKX precedent.
 pub const EAPI_OPT_MAX: usize = 64;
 
-/// Max configured underlyings (core-config caps at 16).
-pub const EAPI_ULYS_MAX: usize = 16;
+/// **BX9 (Q-5; the R3 ruling, 2026-10-11)** — the options a live Binance
+/// arm's account holds OUTSIDE the selected chain that the boot adds to
+/// it, so the lane prices them too: at most this many (more refuses the
+/// boot, naming the count).
+pub const EAPI_HELD_MAX: usize = 16;
+
+/// The options lane's symbol table: the chain and the held options
+/// beside it ([`EAPI_OPT_MAX`] + [`EAPI_HELD_MAX`]).
+pub const EAPI_TABLE_MAX: usize = EAPI_OPT_MAX + EAPI_HELD_MAX;
 
 /// Hard cap on parsed exchangeInfo option rows. Live eapi universe is
 /// order-1k symbols across all underlyings; 8× headroom.
@@ -76,6 +114,7 @@ pub const EAPI_DISCOVERY_ROWS_CAP: usize = 8192;
 // ---------------------------------------------------------------
 
 /// One discovered eapi option instrument.
+#[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct EapiOptionRow {
     /// `symbol` bytes as listed (venue case; `symbol_len` valid).
@@ -88,13 +127,67 @@ pub struct EapiOptionRow {
     pub underlying_len: u8,
     /// `side == "CALL"`.
     pub is_call: bool,
+    /// BX2: `status == TRADING` — the only selectable state.
+    pub trading: bool,
+    /// BX2: `status` (`TRADING`, `CLOSED_MARKET` → `Close`).
+    pub status: BnStatus,
+    /// BX2: [`BN_ROW_TRADFI`] when `contractType` is `TRADFI_OPTIONS`.
+    pub flags: u8,
+    /// BX2: `underlyingType` (`CRYPTO` → `Coin`, `COMMODITY`).
+    pub underlying_type: BnUnderlying,
+    /// BX2: `priceScale`, a price's decimals (`u8::MAX` = absent).
+    pub price_scale: u8,
+    /// BX2: `quantityScale`, a quantity's decimals (`u8::MAX` = absent).
+    pub qty_scale: u8,
+    /// BX2: the underlying's `optionContracts[].nakedSell` — false when
+    /// the page lists no contract for it (a short then needs cover).
+    pub naked_sell: bool,
+    /// BX2: `unit`, underlying units per contract (1, 100 on `XRP`,
+    /// 1 000 on `DOGE` live); 0 = absent.
+    pub unit: u32,
     /// `strikePrice` ×1e9 (quoted decimal on this wire).
     pub strike_1e9: i64,
     /// `expiryDate` ms since epoch (bare integer on this wire).
     pub expiry_ms: i64,
+    /// BX2: the venue's rules (`PRICE_FILTER` tick, `LOT_SIZE` step and
+    /// bounds; F11 retention).
+    pub filters: BnFilters,
 }
 
+// Parsed in place and never passed by value on a hot path; the layout
+// is pinned (declaration order, `repr(C)`) and keeps the boot
+// reservation (8 192 rows) under 1.5 MiB and the selected chain (64
+// rows) under 11 KiB.
+const _: () = assert!(core::mem::size_of::<EapiOptionRow>() == 160);
+
 impl EapiOptionRow {
+    /// The empty row a table slot starts as; [`parse_option_row`] fills
+    /// it in place.
+    const EMPTY: Self = Self {
+        symbol: [0; EAPI_SYM_MAX],
+        symbol_len: 0,
+        underlying: [0; EAPI_ULY_MAX],
+        underlying_len: 0,
+        is_call: false,
+        trading: false,
+        status: BnStatus::Absent,
+        flags: 0,
+        underlying_type: BnUnderlying::Absent,
+        price_scale: u8::MAX,
+        qty_scale: u8::MAX,
+        naked_sell: false,
+        unit: 0,
+        strike_1e9: 0,
+        expiry_ms: 0,
+        filters: BnFilters::EMPTY,
+    };
+
+    /// A TradFi option (`TRADFI_OPTIONS`).
+    #[inline]
+    pub fn is_tradfi(&self) -> bool {
+        self.flags & BN_ROW_TRADFI != 0
+    }
+
     /// The symbol as a byte slice.
     #[inline]
     pub fn symbol(&self) -> &[u8] {
@@ -114,7 +207,8 @@ pub enum EapiDiscoveryErr {
     /// Missing `"optionSymbols":[` array.
     Envelope,
     /// A row violated the option-object contract (missing required
-    /// key, over-long symbol/underlying, bad side, malformed value).
+    /// key, over-long symbol/underlying, bad side, malformed value) —
+    /// or an `optionContracts` entry did (BX2).
     BadRow,
     /// Body ended inside the array.
     Truncated,
@@ -137,8 +231,10 @@ impl EapiDiscovery {
     }
 
     /// Parse one `exchangeInfo` body into the table. Returns rows
-    /// added.
+    /// added. BX2: the body's `optionContracts` then stamp each new
+    /// row's [`EapiOptionRow::naked_sell`].
     pub fn ingest_exchange_info(&mut self, body: &[u8]) -> Result<u32, EapiDiscoveryErr> {
+        let first = self.rows.len();
         let arr_pos = find_field(body, b"\"optionSymbols\":").ok_or(EapiDiscoveryErr::Envelope)?;
         let mut i = skip_ws(body, arr_pos);
         if i >= body.len() || body[i] != b'[' {
@@ -155,15 +251,34 @@ impl EapiDiscovery {
                 b']' => break,
                 b',' => i += 1,
                 b'{' => {
-                    let (row, end) = parse_option_row(body, i)?;
-                    if self.rows.len() >= EAPI_DISCOVERY_ROWS_CAP {
+                    // The row (≤ 160 B) is parsed IN PLACE into its table
+                    // slot rather than returned by value past the 64 B
+                    // bound; so the cap is checked before the row parses,
+                    // and a row that fails leaves no slot behind.
+                    let idx = self.rows.len();
+                    if idx >= EAPI_DISCOVERY_ROWS_CAP {
                         return Err(EapiDiscoveryErr::TooMany);
                     }
-                    self.rows.push(row);
+                    self.rows.push(EapiOptionRow::EMPTY);
+                    i = match parse_option_row(body, i, &mut self.rows[idx]) {
+                        Ok(end) => end,
+                        Err(e) => {
+                            self.rows.truncate(idx);
+                            return Err(e);
+                        }
+                    };
                     added += 1;
-                    i = end;
                 }
                 _ => return Err(EapiDiscoveryErr::BadRow),
+            }
+        }
+        // BX2: no `optionContracts` leaves every row's naked_sell false
+        // — the conservative reading. A malformed entry refuses the page
+        // with its new rows (fail fast; nothing half-stamped is kept).
+        if let Some(pos) = find_field(body, b"\"optionContracts\":") {
+            if let Err(e) = stamp_naked_sell(body, pos, &mut self.rows[first..]) {
+                self.rows.truncate(first);
+                return Err(e);
             }
         }
         Ok(added)
@@ -188,16 +303,17 @@ impl Default for EapiDiscovery {
     }
 }
 
-/// Parse one option object at `pos` (must point at `{`). Returns the
-/// row and the position after the closing `}`.
-fn parse_option_row(body: &[u8], pos: usize) -> Result<(EapiOptionRow, usize), EapiDiscoveryErr> {
+/// Parse one option object at `pos` (must point at `{`) INTO `out`, a
+/// fresh [`EapiOptionRow::EMPTY`] slot. Returns the position after the
+/// closing `}`; on `Err` the slot is half-filled and the caller drops
+/// it.
+fn parse_option_row(
+    body: &[u8],
+    pos: usize,
+    out: &mut EapiOptionRow,
+) -> Result<usize, EapiDiscoveryErr> {
     debug_assert_eq!(body[pos], b'{');
     let mut i = pos + 1;
-
-    let mut symbol = [0u8; EAPI_SYM_MAX];
-    let mut symbol_len = 0u8;
-    let mut underlying = [0u8; EAPI_ULY_MAX];
-    let mut underlying_len = 0u8;
     let mut is_call: Option<bool> = None;
     let mut strike: Option<i64> = None;
     let mut expiry: Option<i64> = None;
@@ -218,18 +334,31 @@ fn parse_option_row(body: &[u8], pos: usize) -> Result<(EapiOptionRow, usize), E
                 let key_end_q = skip_string(body, key_start).ok_or(EapiDiscoveryErr::Truncated)?;
                 let key = &body[key_start..key_end_q - 1];
                 i = skip_ws(body, key_end_q);
-                if i >= body.len() || body[i] != b':' {
+                // End-of-buffer after a key or its colon is a truncation,
+                // not a malformed row (as `crate::discovery`).
+                if i >= body.len() {
+                    return Err(EapiDiscoveryErr::Truncated);
+                }
+                if body[i] != b':' {
                     return Err(EapiDiscoveryErr::BadRow);
                 }
                 i = skip_ws(body, i + 1);
+                if i >= body.len() {
+                    return Err(EapiDiscoveryErr::Truncated);
+                }
                 match key {
                     b"symbol" => {
                         let (s, end) = quoted_span(body, i)?;
                         if s.is_empty() || s.len() > EAPI_SYM_MAX {
                             return Err(EapiDiscoveryErr::BadRow);
                         }
-                        symbol[..s.len()].copy_from_slice(s);
-                        symbol_len = s.len() as u8;
+                        // COPY: ≤ 32 B option symbol into its table row,
+                        // once per row at boot — the row outlives the
+                        // exchangeInfo body it was scanned from — rejected:
+                        // rows borrowing the body (pinned for the table's
+                        // life, a lifetime threaded through the boot).
+                        out.symbol[..s.len()].copy_from_slice(s);
+                        out.symbol_len = s.len() as u8;
                         i = end;
                     }
                     b"underlying" => {
@@ -237,8 +366,10 @@ fn parse_option_row(body: &[u8], pos: usize) -> Result<(EapiOptionRow, usize), E
                         if s.is_empty() || s.len() > EAPI_ULY_MAX {
                             return Err(EapiDiscoveryErr::BadRow);
                         }
-                        underlying[..s.len()].copy_from_slice(s);
-                        underlying_len = s.len() as u8;
+                        // COPY: ≤ 16 B underlying into the same row, same
+                        // reason and rejected alternative as the symbol.
+                        out.underlying[..s.len()].copy_from_slice(s);
+                        out.underlying_len = s.len() as u8;
                         i = end;
                     }
                     b"side" => {
@@ -274,6 +405,53 @@ fn parse_option_row(body: &[u8], pos: usize) -> Result<(EapiOptionRow, usize), E
                         expiry = Some(v as i64);
                         i = end;
                     }
+                    b"status" => {
+                        // One lifecycle per row, as on the other pages
+                        // (`crate::discovery`): a repeat is ambiguous and
+                        // refused, never last-wins.
+                        if out.status != BnStatus::Absent {
+                            return Err(EapiDiscoveryErr::BadRow);
+                        }
+                        let (s, end) = quoted_span(body, i)?;
+                        out.status = BnStatus::of(s);
+                        i = end;
+                    }
+                    b"contractType" => {
+                        let (s, end) = quoted_span(body, i)?;
+                        if s == b"TRADFI_OPTIONS" {
+                            out.flags |= BN_ROW_TRADFI;
+                        }
+                        i = end;
+                    }
+                    b"underlyingType" => {
+                        let (s, end) = quoted_span(body, i)?;
+                        out.underlying_type = BnUnderlying::of(s);
+                        i = end;
+                    }
+                    b"unit" => {
+                        let (v, end) = scan_u64(body, i).ok_or(EapiDiscoveryErr::BadRow)?;
+                        if v == 0 || v > u32::MAX as u64 {
+                            return Err(EapiDiscoveryErr::BadRow);
+                        }
+                        out.unit = v as u32;
+                        i = end;
+                    }
+                    b"priceScale" | b"quantityScale" => {
+                        let (v, end) = scan_u64(body, i).ok_or(EapiDiscoveryErr::BadRow)?;
+                        if v >= u8::MAX as u64 {
+                            return Err(EapiDiscoveryErr::BadRow);
+                        }
+                        if key == b"priceScale" {
+                            out.price_scale = v as u8;
+                        } else {
+                            out.qty_scale = v as u8;
+                        }
+                        i = end;
+                    }
+                    b"filters" => {
+                        i = crate::discovery::parse_filters(body, i, &mut out.filters)
+                            .map_err(eapi_err)?;
+                    }
                     _ => {
                         i = skip_json_value(body, i).ok_or(EapiDiscoveryErr::BadRow)?;
                     }
@@ -283,19 +461,142 @@ fn parse_option_row(body: &[u8], pos: usize) -> Result<(EapiOptionRow, usize), E
         }
     }
 
-    if symbol_len == 0 || underlying_len == 0 {
+    if out.symbol_len == 0 || out.underlying_len == 0 || out.status == BnStatus::Absent {
         return Err(EapiDiscoveryErr::BadRow);
     }
-    let row = EapiOptionRow {
-        symbol,
-        symbol_len,
-        underlying,
-        underlying_len,
-        is_call: is_call.ok_or(EapiDiscoveryErr::BadRow)?,
-        strike_1e9: strike.ok_or(EapiDiscoveryErr::BadRow)?,
-        expiry_ms: expiry.ok_or(EapiDiscoveryErr::BadRow)?,
-    };
-    Ok((row, i))
+    out.is_call = is_call.ok_or(EapiDiscoveryErr::BadRow)?;
+    out.strike_1e9 = strike.ok_or(EapiDiscoveryErr::BadRow)?;
+    out.expiry_ms = expiry.ok_or(EapiDiscoveryErr::BadRow)?;
+    out.trading = out.status == BnStatus::Trading;
+    Ok(i)
+}
+
+/// The discovery module's filter reader speaks its own error; only its
+/// row-level kinds can come back from a filter walk.
+fn eapi_err(e: BnDiscoveryErr) -> EapiDiscoveryErr {
+    match e {
+        BnDiscoveryErr::Truncated => EapiDiscoveryErr::Truncated,
+        BnDiscoveryErr::Envelope | BnDiscoveryErr::BadRow | BnDiscoveryErr::TooMany => {
+            EapiDiscoveryErr::BadRow
+        }
+    }
+}
+
+/// BX2: walk `"optionContracts":[{"underlying":…,"nakedSell":…},…]` at
+/// `pos` and stamp `naked_sell` on every row of `rows` whose underlying
+/// an entry names. An entry needs both keys (`nakedSell` a bare JSON
+/// bool); anything else in it skips structurally. Two passes — the
+/// `true` entries, then the `false` ones — so an underlying the page
+/// names both ways ends up covered-only, the conservative reading,
+/// rather than whichever entry came last (BX2 review). Boot-only.
+fn stamp_naked_sell(
+    body: &[u8],
+    pos: usize,
+    rows: &mut [EapiOptionRow],
+) -> Result<(), EapiDiscoveryErr> {
+    stamp_pass(body, pos, rows, true)?;
+    stamp_pass(body, pos, rows, false)
+}
+
+/// One [`stamp_naked_sell`] pass: every entry is validated, and the ones
+/// whose `nakedSell` is `pass` stamp their rows.
+fn stamp_pass(
+    body: &[u8],
+    pos: usize,
+    rows: &mut [EapiOptionRow],
+    pass: bool,
+) -> Result<(), EapiDiscoveryErr> {
+    let mut i = skip_ws(body, pos);
+    if i >= body.len() || body[i] != b'[' {
+        return Err(EapiDiscoveryErr::BadRow);
+    }
+    i += 1;
+    loop {
+        i = skip_ws(body, i);
+        if i >= body.len() {
+            return Err(EapiDiscoveryErr::Truncated);
+        }
+        match body[i] {
+            b']' => return Ok(()),
+            b',' => i += 1,
+            b'{' => {
+                let mut uly: &[u8] = &[];
+                let mut naked: Option<bool> = None;
+                i += 1;
+                loop {
+                    i = skip_ws(body, i);
+                    if i >= body.len() {
+                        return Err(EapiDiscoveryErr::Truncated);
+                    }
+                    match body[i] {
+                        b'}' => {
+                            i += 1;
+                            break;
+                        }
+                        b',' => i += 1,
+                        b'"' => {
+                            let key_end_q =
+                                skip_string(body, i + 1).ok_or(EapiDiscoveryErr::Truncated)?;
+                            let key = &body[i + 1..key_end_q - 1];
+                            i = skip_ws(body, key_end_q);
+                            if i >= body.len() {
+                                return Err(EapiDiscoveryErr::Truncated);
+                            }
+                            if body[i] != b':' {
+                                return Err(EapiDiscoveryErr::BadRow);
+                            }
+                            i = skip_ws(body, i + 1);
+                            if i >= body.len() {
+                                return Err(EapiDiscoveryErr::Truncated);
+                            }
+                            match key {
+                                b"underlying" => {
+                                    let (s, end) = quoted_span(body, i)?;
+                                    uly = s;
+                                    i = end;
+                                }
+                                b"nakedSell" => {
+                                    let rest = &body[i..];
+                                    if rest.starts_with(b"true") {
+                                        naked = Some(true);
+                                        i += 4;
+                                    } else if rest.starts_with(b"false") {
+                                        naked = Some(false);
+                                        i += 5;
+                                    } else if b"true".starts_with(rest)
+                                        || b"false".starts_with(rest)
+                                    {
+                                        // The body ends inside the bool.
+                                        return Err(EapiDiscoveryErr::Truncated);
+                                    } else {
+                                        return Err(EapiDiscoveryErr::BadRow);
+                                    }
+                                }
+                                _ => {
+                                    i = skip_json_value(body, i).ok_or(EapiDiscoveryErr::BadRow)?;
+                                }
+                            }
+                        }
+                        _ => return Err(EapiDiscoveryErr::BadRow),
+                    }
+                }
+                let naked = naked.ok_or(EapiDiscoveryErr::BadRow)?;
+                if uly.is_empty() {
+                    return Err(EapiDiscoveryErr::BadRow);
+                }
+                if naked == pass {
+                    let mut k = 0usize;
+                    while k < rows.len() {
+                        if rows[k].underlying() == uly {
+                            rows[k].naked_sell = naked;
+                        }
+                        k += 1;
+                    }
+                }
+            }
+            _ => return Err(EapiDiscoveryErr::BadRow),
+        }
+    }
 }
 
 /// Read a quoted string value at `pos` (must point at `"`).
@@ -356,10 +657,11 @@ impl options_select::ChainRow for EapiOptionRow {
 /// invariants keep pinning all three venue surfaces) — here lives only
 /// the VENUE candidacy predicate, which for eapi adds the `underlying`
 /// filter because ONE exchangeInfo page carries every family
-/// (`row.underlying == underlying && expiry_ms > now_ms`; eapi lists
-/// tradable symbols only — no per-row state field). Deterministic
-/// order = the allocation order; ≤ `E × K × 2` by construction.
-/// Boot-only: allocates freely.
+/// (`row.trading && row.underlying == underlying && expiry_ms >
+/// now_ms`; BX2: rows carry a `status` — a `CLOSED_MARKET` series
+/// before its expiry never selects). Deterministic order = the
+/// allocation order; ≤ `E × K × 2` by construction. Boot-only:
+/// allocates freely.
 pub fn select_capped_chain(
     rows: &[EapiOptionRow],
     underlying: &[u8],
@@ -368,9 +670,14 @@ pub fn select_capped_chain(
     strikes_k: u32,
     now_ms: i64,
 ) -> Vec<EapiOptionRow> {
+    // COPY: each selected row (≤ 160 B) into the returned Vec, ≤ E × K
+    // × 2 rows (64 by default), once at boot — the shared selection law
+    // (`options-select`, three venues) hands back POD rows by value —
+    // rejected: references into the discovery table (an API change to
+    // the three-venue law, for ≤ 10 KB copied once at boot).
     options_select::select_capped_chain(
         rows,
-        |r: &EapiOptionRow| r.underlying() == underlying && r.expiry_ms > now_ms,
+        |r: &EapiOptionRow| r.trading && r.underlying() == underlying && r.expiry_ms > now_ms,
         index_px_1e9,
         expiries_e,
         strikes_k,
@@ -381,89 +688,78 @@ pub fn select_capped_chain(
 // WS-lane state (boot-built, hot-read)
 // ---------------------------------------------------------------
 
-/// Fixed-capacity `lowercased stream symbol → (SymbolId, uly idx)`
-/// map for the eapi combined stream. Built at boot; read per push on
-/// the Binance ingress thread (linear scan ≤ 64 rows — the
-/// Deribit-table cost note applies).
+/// The per-underlying stream name suffix on fstream's `/market` path
+/// (`btcusdt@optionMarkPrice`) — shared by the boot's path builder
+/// and the lane's stream check.
+pub const EAPI_MARK_STREAM: &str = "@optionMarkPrice";
+
+/// Fixed-capacity `venue symbol → SymbolId` map for the options lane.
+/// Built at boot from the selected chain (and, BX9, the options a live
+/// arm's account holds beside it); read once per array element on the
+/// Binance ingress thread (a length-gated linear scan of ≤ 64 rows, ≤ 80
+/// with held options — the Deribit-table cost note applies). Keys are the symbols
+/// AS LISTED (`BTC-260925-86000-C`): the mark array's `"s"` carries
+/// the venue's own case, so a lookup compares the wire bytes where
+/// they lie — no lowercasing, no copy.
 pub struct EapiSymbolTable {
-    rows: [(u8, [u8; EAPI_SYM_MAX], SymbolId, u8); EAPI_OPT_MAX],
+    rows: [(u8, [u8; EAPI_SYM_MAX], SymbolId); EAPI_TABLE_MAX],
     len: usize,
 }
 
 /// Why an [`EapiSymbolTable::insert`] failed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum EapiTableErr {
-    /// All [`EAPI_OPT_MAX`] rows in use.
+    /// All [`EAPI_TABLE_MAX`] rows in use.
     Full,
     /// Symbol longer than [`EAPI_SYM_MAX`] or empty.
     BadSymbol,
-    /// `uly_idx` out of the configured-underlyings range.
-    BadUly,
 }
 
 impl EapiSymbolTable {
     /// Empty table.
     pub const fn new() -> Self {
         Self {
-            rows: [(0, [0; EAPI_SYM_MAX], 0, 0); EAPI_OPT_MAX],
+            rows: [(0, [0; EAPI_SYM_MAX], 0); EAPI_TABLE_MAX],
             len: 0,
         }
     }
 
-    /// Register `symbol → (sym, uly_idx)`, LOWERCASING the symbol to
-    /// the stream-name form. Boot-time only.
-    pub fn insert(
-        &mut self,
-        symbol: &[u8],
-        sym: SymbolId,
-        uly_idx: u8,
-    ) -> Result<(), EapiTableErr> {
+    /// Register `symbol → sym`, the symbol exactly as the venue lists
+    /// it. Boot-time only.
+    pub fn insert(&mut self, symbol: &[u8], sym: SymbolId) -> Result<(), EapiTableErr> {
         if symbol.is_empty() || symbol.len() > EAPI_SYM_MAX {
             return Err(EapiTableErr::BadSymbol);
         }
-        if uly_idx as usize >= EAPI_ULYS_MAX {
-            return Err(EapiTableErr::BadUly);
-        }
-        if self.len >= EAPI_OPT_MAX {
+        if self.len >= EAPI_TABLE_MAX {
             return Err(EapiTableErr::Full);
         }
         let row = &mut self.rows[self.len];
         row.0 = symbol.len() as u8;
-        let mut j = 0;
-        while j < symbol.len() {
-            row.1[j] = symbol[j].to_ascii_lowercase();
-            j += 1;
-        }
+        // COPY: ≤ 32 B symbol into its boot-table row, once per
+        // selected option at boot — the table moves to the ingress
+        // thread and cannot borrow the discovery strings — rejected: a
+        // 'static intern pool, for 64 keys built once.
+        row.1[..symbol.len()].copy_from_slice(symbol);
         row.2 = sym;
-        row.3 = uly_idx;
         self.len += 1;
         Ok(())
     }
 
-    /// Resolve a lowercased stream symbol. Hot path: length gate then
-    /// bytewise compare.
+    /// Resolve a wire symbol (an element's `"s"`, venue case). Hot
+    /// path: length gate, then a bytewise compare.
     #[inline]
-    pub fn lookup(&self, stream_sym: &[u8]) -> Option<(SymbolId, u8)> {
-        let n = stream_sym.len();
+    pub fn lookup(&self, wire_sym: &[u8]) -> Option<SymbolId> {
+        debug_assert!(self.len <= EAPI_TABLE_MAX);
+        let n = wire_sym.len();
         let mut i = 0;
         while i < self.len {
             let row = &self.rows[i];
-            if row.0 as usize == n && &row.1[..n] == stream_sym {
-                return Some((row.2, row.3));
+            if row.0 as usize == n && &row.1[..n] == wire_sym {
+                return Some(row.2);
             }
             i += 1;
         }
         None
-    }
-
-    /// Row accessor (combined-path building): `(stream_sym, sym)`.
-    #[inline]
-    pub fn get(&self, idx: usize) -> Option<(&[u8], SymbolId)> {
-        if idx >= self.len {
-            return None;
-        }
-        let row = &self.rows[idx];
-        Some((&row.1[..row.0 as usize], row.2))
     }
 
     /// Registered rows.
@@ -486,11 +782,11 @@ impl Default for EapiSymbolTable {
 }
 
 // ---------------------------------------------------------------
-// WS-lane parsers (HOT: zero-alloc flat scans)
+// WS-lane scanners (HOT: zero-alloc, zero-copy flat scans)
 // ---------------------------------------------------------------
 
 /// Split a combined-stream envelope into `(stream_name, data_tail)`.
-/// The tail starts at the `data` value — parsers scan within it.
+/// The tail starts at the `data` value — the scanners work within it.
 /// Returns `None` when either key is absent (control frames etc.).
 #[inline]
 pub fn split_combined(payload: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -505,11 +801,130 @@ pub fn split_combined(payload: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((name, &payload[d_pos..]))
 }
 
-/// Parsed eapi option `<symbol>@ticker` data (the ONE stream carrying
-/// BOTH the BBO and the mark/IV/greeks surface). `Copy` POD.
+/// One step of an [`EapiArrayCursor`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ArrayStep<'a> {
+    /// The next element, `{` … `}` inclusive, borrowed from the frame.
+    Elem(&'a [u8]),
+    /// The closing `]`: every element has been seen.
+    End,
+    /// The bytes stopped being an array of flat objects (or ended
+    /// inside it). Terminal, like `End`.
+    Malformed,
+}
+
+/// Zero-alloc, zero-copy cursor over a `<uly>@optionMarkPrice` array:
+/// each step borrows ONE element's bytes from the frame and nothing is
+/// ever copied out. Every step either advances strictly or is
+/// terminal (`End`/`Malformed`), so a walk ends in at most one step
+/// per input byte.
+///
+/// The elements are FLAT objects — every value is a quoted decimal, a
+/// symbol or a bare integer, with no nested object and no brace inside
+/// a string — so the first `}` after an element's `{` closes it, found
+/// with `memchr` at SIMD speed over the ~330 B element (a full JSON
+/// skipper would walk every byte of the ~246 KB push on the ingress
+/// thread). Were a string ever to hold a `}`, the element would be cut
+/// short: every field before the cut still parses to its true value,
+/// a required one after it rejects the element, and the cursor turns
+/// `Malformed` at the cut — it cannot yield a wrong row.
+#[derive(Copy, Clone, Debug)]
+pub struct EapiArrayCursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+    after_elem: bool,
+}
+
+impl<'a> EapiArrayCursor<'a> {
+    /// A cursor over the array at the start of `data` (a combined
+    /// frame's tail from [`split_combined`], or a raw-stream payload);
+    /// leading whitespace tolerated. `None` when no array starts there.
+    #[inline]
+    pub fn new(data: &'a [u8]) -> Option<Self> {
+        let i = skip_ws(data, 0);
+        if i >= data.len() || data[i] != b'[' {
+            return None;
+        }
+        Some(Self {
+            buf: data,
+            pos: i + 1,
+            after_elem: false,
+        })
+    }
+
+    /// The unwalked bytes from the cursor on — after a `Malformed`
+    /// step, the bytes the walk stopped at (what a bounded reject tap
+    /// records instead of the whole push).
+    #[inline]
+    pub fn rest(&self) -> &'a [u8] {
+        let buf = self.buf;
+        &buf[self.pos.min(buf.len())..]
+    }
+
+    /// The next element, or the end of the array.
+    #[inline]
+    pub fn next_elem(&mut self) -> ArrayStep<'a> {
+        let buf = self.buf;
+        let mut i = skip_ws(buf, self.pos);
+        if i >= buf.len() {
+            return ArrayStep::Malformed;
+        }
+        if buf[i] == b']' {
+            self.pos = i + 1;
+            return ArrayStep::End;
+        }
+        if self.after_elem {
+            if buf[i] != b',' {
+                return ArrayStep::Malformed;
+            }
+            i = skip_ws(buf, i + 1);
+            if i >= buf.len() {
+                return ArrayStep::Malformed;
+            }
+        }
+        if buf[i] != b'{' {
+            return ArrayStep::Malformed;
+        }
+        match memchr::memchr(b'}', &buf[i + 1..]) {
+            Some(off) => {
+                let end = i + off + 2;
+                self.pos = end;
+                self.after_elem = true;
+                ArrayStep::Elem(&buf[i..end])
+            }
+            None => ArrayStep::Malformed,
+        }
+    }
+}
+
+/// The `"s"` symbol of one array element, borrowed in place (venue
+/// case). `None` when the key is absent, its value is not a string, or
+/// the string holds an escape — a listed symbol never does (discovery
+/// refuses one too), and an escape-blind span would be a truncated
+/// name rather than a refusal.
+#[inline]
+pub fn eapi_elem_symbol(elem: &[u8]) -> Option<&[u8]> {
+    let pos = find_field(elem, b"\"s\":")?;
+    let i = skip_ws(elem, pos);
+    if i >= elem.len() || elem[i] != b'"' {
+        return None;
+    }
+    let end_q = skip_string(elem, i + 1)?;
+    let span = &elem[i + 1..end_q - 1];
+    if memchr::memchr(b'\\', span).is_some() {
+        return None;
+    }
+    Some(span)
+}
+
+/// One parsed element of a `<uly>@optionMarkPrice` array: the BBO, the
+/// mark/IV/greeks surface and the underlying's index, from ONE venue
+/// push. `Copy` POD, 88 B — over the one-line by-value budget, so
+/// [`parse_eapi_mark`] FILLS a caller-owned frame instead of returning
+/// one (the lane keeps a single frame for its whole walk).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-pub struct EapiTickerFrame {
+pub struct EapiMarkFrame {
     /// `bo`/`bq` best bid ×1e6 (USDT premium).
     pub bid_px_1e6: i64,
     /// Best bid quantity ×1e6.
@@ -522,6 +937,8 @@ pub struct EapiTickerFrame {
     pub mark_px_1e9: i64,
     /// `vo` mark implied volatility, fraction ×1e9.
     pub mark_iv_1e9: i64,
+    /// `i` the underlying's index price ×1e9.
+    pub index_px_1e9: i64,
     /// `d` delta ×1e9.
     pub delta_1e9: i64,
     /// `g` gamma ×1e9.
@@ -532,29 +949,57 @@ pub struct EapiTickerFrame {
     pub theta_1e6: i64,
 }
 
-/// Parse one eapi option ticker `data` object. Every captured value
-/// is a QUOTED decimal (this venue quotes its numbers); single-char
-/// keys are anchored `"x":` so they can never alias the two-char
-/// forms (`"b":` ≠ `"bo":`/`"bq":`). The mark/IV/greeks surface is
-/// REQUIRED (missing/malformed ⇒ `None`); the four BBO fields are
-/// OPTIONAL — a quiet far option can carry empty/absent quotes, which
-/// parse as 0 (the one-sided/empty-book precedent; the lane skips the
-/// `Tick` when both sides are zero and still captures the summary).
+const _: () = assert!(core::mem::size_of::<EapiMarkFrame>() == 88);
+
+impl EapiMarkFrame {
+    /// All-zero frame — the lane's reusable parse target.
+    pub const ZERO: Self = Self {
+        bid_px_1e6: 0,
+        bid_qty_1e6: 0,
+        ask_px_1e6: 0,
+        ask_qty_1e6: 0,
+        mark_px_1e9: 0,
+        mark_iv_1e9: 0,
+        index_px_1e9: 0,
+        delta_1e9: 0,
+        gamma_1e9: 0,
+        vega_1e6: 0,
+        theta_1e6: 0,
+    };
+}
+
+/// Parse one mark-array element (an [`ArrayStep::Elem`] span — the
+/// field lookups never leave it) INTO `out`, field by field; `false`
+/// when the element fails its contract (then `out` holds a partial
+/// parse and must not be read). Every captured value is a QUOTED
+/// decimal; single-char keys are anchored `"x":` so they can never
+/// alias the two-char forms (`"b":` ≠ `"bo":`/`"bq":`, `"v":` ≠
+/// `"vo":`). The mark/IV/index/greeks surface is REQUIRED (the index
+/// must be positive); the four BBO fields are OPTIONAL — an unquoted
+/// side reads `"0.000"`, which parses as 0 like an absent or empty one
+/// (the one-sided/empty-book precedent: the lane skips the `Tick` when
+/// both sides are zero and still captures the summary).
 #[inline]
-pub fn parse_eapi_ticker(data: &[u8]) -> Option<EapiTickerFrame> {
+pub fn parse_eapi_mark(elem: &[u8], out: &mut EapiMarkFrame) -> bool {
+    parse_mark_fields(elem, out).is_some()
+}
+
+/// [`parse_eapi_mark`]'s body, `?`-shaped.
+#[inline]
+fn parse_mark_fields(elem: &[u8], out: &mut EapiMarkFrame) -> Option<()> {
     #[inline]
-    fn q_span<'a>(data: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
-        let pos = find_field(data, key)?;
-        let i = skip_ws(data, pos);
-        if i >= data.len() || data[i] != b'"' {
+    fn q_span<'a>(elem: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+        let pos = find_field(elem, key)?;
+        let i = skip_ws(elem, pos);
+        if i >= elem.len() || elem[i] != b'"' {
             return None;
         }
-        let end_q = skip_string(data, i + 1)?;
-        Some(&data[i + 1..end_q - 1])
+        let end_q = skip_string(elem, i + 1)?;
+        Some(&elem[i + 1..end_q - 1])
     }
     #[inline]
-    fn q_1e9(data: &[u8], key: &[u8]) -> Option<i64> {
-        let span = q_span(data, key)?;
+    fn q_1e9(elem: &[u8], key: &[u8]) -> Option<i64> {
+        let span = q_span(elem, key)?;
         if span.is_empty() {
             return None;
         }
@@ -565,8 +1010,8 @@ pub fn parse_eapi_ticker(data: &[u8]) -> Option<EapiTickerFrame> {
         Some(v)
     }
     #[inline]
-    fn q_1e6_or_zero(data: &[u8], key: &[u8]) -> i64 {
-        match q_span(data, key) {
+    fn q_1e6_or_zero(elem: &[u8], key: &[u8]) -> i64 {
+        match q_span(elem, key) {
             None | Some([]) => 0,
             Some(span) => match scan_price_1e6(span, 0) {
                 Some((v, used)) if used == span.len() => v,
@@ -574,123 +1019,21 @@ pub fn parse_eapi_ticker(data: &[u8]) -> Option<EapiTickerFrame> {
             },
         }
     }
-    Some(EapiTickerFrame {
-        bid_px_1e6: q_1e6_or_zero(data, b"\"bo\":"),
-        bid_qty_1e6: q_1e6_or_zero(data, b"\"bq\":"),
-        ask_px_1e6: q_1e6_or_zero(data, b"\"ao\":"),
-        ask_qty_1e6: q_1e6_or_zero(data, b"\"aq\":"),
-        mark_px_1e9: q_1e9(data, b"\"mp\":")?,
-        mark_iv_1e9: q_1e9(data, b"\"vo\":")?,
-        delta_1e9: q_1e9(data, b"\"d\":")?,
-        gamma_1e9: q_1e9(data, b"\"g\":")?,
-        vega_1e6: q_1e9(data, b"\"v\":")? / 1000,
-        theta_1e6: q_1e9(data, b"\"t\":")? / 1000,
-    })
-}
-
-// ---------------------------------------------------------------
-// WS lane state (boot-built; index cache written on index pushes)
-// ---------------------------------------------------------------
-
-/// The eapi combined-stream lane state carried by a Binance `Driver`
-/// slot (M2.4): the option symbol table + the per-underlying index
-/// cache that fills `OptSummary.underlying_px_1e9`. Boot-built;
-/// single-writer on the Binance ingress thread. The index cache
-/// PERSISTS across reconnects (last-known reference; refreshed by the
-/// first index push of the new session).
-pub struct EapiLane {
-    /// Lowercased stream-symbol → (sym, uly idx).
-    pub table: EapiSymbolTable,
-    ulys: [(u8, [u8; EAPI_ULY_MAX]); EAPI_ULYS_MAX],
-    n_ulys: u8,
-    idx_px_1e9: [i64; EAPI_ULYS_MAX],
-}
-
-impl EapiLane {
-    /// Build from the boot table + configured underlyings (lowercased
-    /// to the stream form). Over-long/overflowing entries are dropped
-    /// with a debug assert (config caps both upstream).
-    pub fn new(table: EapiSymbolTable, ulys: &[&[u8]]) -> Self {
-        let mut u: [(u8, [u8; EAPI_ULY_MAX]); EAPI_ULYS_MAX] =
-            [(0, [0; EAPI_ULY_MAX]); EAPI_ULYS_MAX];
-        let mut n = 0usize;
-        let mut i = 0;
-        while i < ulys.len() {
-            let s = ulys[i];
-            if s.is_empty() || s.len() > EAPI_ULY_MAX || n >= EAPI_ULYS_MAX {
-                debug_assert!(false, "uly entry dropped (len/cap) — config caps this");
-                i += 1;
-                continue;
-            }
-            u[n].0 = s.len() as u8;
-            let mut j = 0;
-            while j < s.len() {
-                u[n].1[j] = s[j].to_ascii_lowercase();
-                j += 1;
-            }
-            n += 1;
-            i += 1;
-        }
-        Self {
-            table,
-            ulys: u,
-            n_ulys: n as u8,
-            idx_px_1e9: [0; EAPI_ULYS_MAX],
-        }
-    }
-
-    /// Resolve a lowercased stream underlying (`btcusdt` from
-    /// `btcusdt@index`) to its cache index.
-    #[inline]
-    pub fn uly_lookup(&self, stream_uly: &[u8]) -> Option<u8> {
-        let n = stream_uly.len();
-        let mut i = 0;
-        while (i as u8) < self.n_ulys {
-            let row = &self.ulys[i];
-            if row.0 as usize == n && &row.1[..n] == stream_uly {
-                return Some(i as u8);
-            }
-            i += 1;
-        }
-        None
-    }
-
-    /// Last-known index price ×1e9 for `uly_idx` (0 = none seen yet —
-    /// the record carries 0 until the first index push).
-    #[inline]
-    pub fn index_px(&self, uly_idx: u8) -> i64 {
-        debug_assert!((uly_idx as usize) < EAPI_ULYS_MAX);
-        self.idx_px_1e9[(uly_idx as usize) & (EAPI_ULYS_MAX - 1)]
-    }
-
-    /// Record an index push.
-    #[inline]
-    pub fn set_index_px(&mut self, uly_idx: u8, px_1e9: i64) {
-        debug_assert!((uly_idx as usize) < EAPI_ULYS_MAX);
-        self.idx_px_1e9[(uly_idx as usize) & (EAPI_ULYS_MAX - 1)] = px_1e9;
-    }
-}
-
-/// Parse an eapi `<underlying>@index` data object into the index
-/// price ×1e9 (`p`, quoted decimal). Feeds the per-underlying cache
-/// that fills `OptSummary.underlying_px_1e9`.
-#[inline]
-pub fn parse_eapi_index(data: &[u8]) -> Option<i64> {
-    let pos = find_field(data, b"\"p\":")?;
-    let i = skip_ws(data, pos);
-    if i >= data.len() || data[i] != b'"' {
+    out.index_px_1e9 = q_1e9(elem, b"\"i\":")?;
+    if out.index_px_1e9 <= 0 {
         return None;
     }
-    let end_q = skip_string(data, i + 1)?;
-    let span = &data[i + 1..end_q - 1];
-    if span.is_empty() {
-        return None;
-    }
-    let (v, used) = scan_number_sci_1e9(span, 0)?;
-    if used != span.len() || v <= 0 {
-        return None;
-    }
-    Some(v)
+    out.mark_px_1e9 = q_1e9(elem, b"\"mp\":")?;
+    out.mark_iv_1e9 = q_1e9(elem, b"\"vo\":")?;
+    out.delta_1e9 = q_1e9(elem, b"\"d\":")?;
+    out.gamma_1e9 = q_1e9(elem, b"\"g\":")?;
+    out.vega_1e6 = q_1e9(elem, b"\"v\":")? / 1000;
+    out.theta_1e6 = q_1e9(elem, b"\"t\":")? / 1000;
+    out.bid_px_1e6 = q_1e6_or_zero(elem, b"\"bo\":");
+    out.bid_qty_1e6 = q_1e6_or_zero(elem, b"\"bq\":");
+    out.ask_px_1e6 = q_1e6_or_zero(elem, b"\"ao\":");
+    out.ask_qty_1e6 = q_1e6_or_zero(elem, b"\"aq\":");
+    Some(())
 }
 
 // ---------------------------------------------------------------
@@ -700,6 +1043,12 @@ pub fn parse_eapi_index(data: &[u8]) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test convenience over the out-param parser.
+    fn mark(elem: &[u8]) -> Option<EapiMarkFrame> {
+        let mut f = EapiMarkFrame::ZERO;
+        parse_eapi_mark(elem, &mut f).then_some(f)
+    }
 
     fn info(rows: &str) -> Vec<u8> {
         let mut b = Vec::with_capacity(rows.len() + 128);
@@ -711,7 +1060,7 @@ mod tests {
 
     fn opt_row(sym: &str, uly: &str, side: &str, strike: &str, exp: i64) -> String {
         format!(
-            r#"{{"contractId":3,"expiryDate":{exp},"filters":[{{"filterType":"PRICE_FILTER","minPrice":"0.02","maxPrice":"80000.01","tickSize":"0.01"}},{{"filterType":"LOT_SIZE","minQty":"0.01","maxQty":"100","stepSize":"0.01"}}],"id":2474,"symbol":"{sym}","side":"{side}","strikePrice":"{strike}","underlying":"{uly}","unit":1,"makerFeeRate":"0.0002","takerFeeRate":"0.0002","minQty":"0.01","maxQty":"100","initialMargin":"0.15","maintenanceMargin":"0.075","minInitialMargin":"0.1","minMaintenanceMargin":"0.05","priceScale":2,"quantityScale":2,"quoteAsset":"USDT"}}"#
+            r#"{{"contractId":3,"expiryDate":{exp},"filters":[{{"filterType":"PRICE_FILTER","minPrice":"0.02","maxPrice":"80000.01","tickSize":"0.01"}},{{"filterType":"LOT_SIZE","minQty":"0.01","maxQty":"100","stepSize":"0.01"}}],"id":2474,"symbol":"{sym}","side":"{side}","strikePrice":"{strike}","underlying":"{uly}","unit":1,"makerFeeRate":"0.0002","takerFeeRate":"0.0002","minQty":"0.01","maxQty":"100","initialMargin":"0.15","maintenanceMargin":"0.075","minInitialMargin":"0.1","minMaintenanceMargin":"0.05","priceScale":2,"quantityScale":2,"quoteAsset":"USDT","status":"TRADING","contractType":"CRYPTO_OPTIONS","underlyingType":"CRYPTO"}}"#
         )
     }
 
@@ -875,57 +1224,515 @@ mod tests {
         assert_eq!(names(&all), names(&again));
     }
 
-    #[test]
-    fn symbol_table_lowercases_and_resolves() {
-        let mut t = EapiSymbolTable::new();
-        t.insert(b"BTC-260327-100000-C", (1 << 24) | 1025, 0)
-            .unwrap();
-        assert_eq!(
-            t.lookup(b"btc-260327-100000-c"),
-            Some(((1 << 24) | 1025, 0))
-        );
-        assert_eq!(t.lookup(b"BTC-260327-100000-C"), None); // stream form only
-        assert_eq!(t.lookup(b"missing"), None);
-        assert_eq!(t.insert(b"", 1, 0), Err(EapiTableErr::BadSymbol));
-        assert_eq!(t.insert(b"X", 1, 16), Err(EapiTableErr::BadUly));
-        let mut full = EapiSymbolTable::new();
-        for i in 0..EAPI_OPT_MAX {
-            full.insert(format!("S{i}").as_bytes(), i as u32, 0)
-                .unwrap();
-        }
-        assert_eq!(full.insert(b"OVER", 99, 0), Err(EapiTableErr::Full));
+    // -----------------------------------------------------------
+    // BX2 (F11 retention): live rows and contracts, verbatim from
+    // `/eapi/v1/exchangeInfo` (2026-09-26 05:45Z).
+    // -----------------------------------------------------------
+
+    /// The live `optionContracts` array, verbatim.
+    const LIVE_CONTRACTS: &str = r#""optionContracts":[{"baseAsset":"XAG","quoteAsset":"USDT","underlying":"XAGUSDT","settleAsset":"USDT","nakedSell":false},{"baseAsset":"BTC","quoteAsset":"USDT","underlying":"BTCUSDT","settleAsset":"USDT","nakedSell":true},{"baseAsset":"CL","quoteAsset":"USDT","underlying":"CLUSDT","settleAsset":"USDT","nakedSell":false},{"baseAsset":"ETH","quoteAsset":"USDT","underlying":"ETHUSDT","settleAsset":"USDT","nakedSell":true},{"baseAsset":"BZ","quoteAsset":"USDT","underlying":"BZUSDT","settleAsset":"USDT","nakedSell":false},{"baseAsset":"BNB","quoteAsset":"USDT","underlying":"BNBUSDT","settleAsset":"USDT","nakedSell":false},{"baseAsset":"SOL","quoteAsset":"USDT","underlying":"SOLUSDT","settleAsset":"USDT","nakedSell":false},{"baseAsset":"XRP","quoteAsset":"USDT","underlying":"XRPUSDT","settleAsset":"USDT","nakedSell":false},{"baseAsset":"DOGE","quoteAsset":"USDT","underlying":"DOGEUSDT","settleAsset":"USDT","nakedSell":false},{"baseAsset":"XAU","quoteAsset":"USDT","underlying":"XAUUSDT","settleAsset":"USDT","nakedSell":false}]"#;
+
+    /// Three live rows, verbatim: a BTC call, a closed TradFi XAU call
+    /// and a DOGE call (unit 1 000).
+    const LIVE_ROWS: &str = r#"{"expiryDate":1798185600000,"filters":[{"filterType":"PRICE_FILTER","minPrice":"1245.000","maxPrice":"11165.000","tickSize":"5.000"},{"filterType":"LOT_SIZE","minQty":"0.01","maxQty":"200","stepSize":"0.01"}],"symbol":"BTC-261225-85000-C","side":"CALL","strikePrice":"85000.000","underlying":"BTCUSDT","unit":1,"liquidationFeeRate":"0.001900","minQty":"0.01","maxQty":"200","initialMargin":"0.15000000","maintenanceMargin":"0.07500000","minInitialMargin":"0.10000000","minMaintenanceMargin":"0.05000000","priceScale":3,"quantityScale":2,"quoteAsset":"USDT","status":"TRADING","contractType":"CRYPTO_OPTIONS","underlyingType":"CRYPTO"},{"expiryDate":1790974800000,"filters":[{"filterType":"PRICE_FILTER","minPrice":"69.73","maxPrice":"627.63","tickSize":"0.01"},{"filterType":"LOT_SIZE","minQty":"0.01","maxQty":"2000","stepSize":"0.01"}],"symbol":"XAU-261002-3950-C","side":"CALL","strikePrice":"3950.00","underlying":"XAUUSDT","unit":1,"liquidationFeeRate":"0.001900","minQty":"0.01","maxQty":"2000","initialMargin":"0.15000000","maintenanceMargin":"0.07500000","minInitialMargin":"0.10000000","minMaintenanceMargin":"0.05000000","priceScale":2,"quantityScale":2,"quoteAsset":"USDT","status":"CLOSED_MARKET","contractType":"TRADFI_OPTIONS","underlyingType":"COMMODITY"},{"expiryDate":1790928000000,"filters":[{"filterType":"PRICE_FILTER","minPrice":"2.8000","maxPrice":"25.1200","tickSize":"0.0100"},{"filterType":"LOT_SIZE","minQty":"0.01","maxQty":"4000","stepSize":"0.01"}],"symbol":"DOGE-261002-0.084-C","side":"CALL","strikePrice":"0.0840","underlying":"DOGEUSDT","unit":1000,"liquidationFeeRate":"0.001900","minQty":"0.01","maxQty":"4000","initialMargin":"0.15000000","maintenanceMargin":"0.07500000","minInitialMargin":"0.10000000","minMaintenanceMargin":"0.05000000","priceScale":4,"quantityScale":2,"quoteAsset":"USDT","status":"TRADING","contractType":"CRYPTO_OPTIONS","underlyingType":"CRYPTO"}"#;
+
+    /// The live envelope's order: contracts, assets, then the rows.
+    fn live_page(contracts: &str, rows: &str) -> Vec<u8> {
+        format!(
+            r#"{{"timezone":"UTC","serverTime":1790401849637,{contracts},"optionAssets":[{{"name":"USDT"}}],"optionSymbols":[{rows}],"rateLimits":[]}}"#
+        )
+        .into_bytes()
     }
 
     #[test]
-    fn combined_split_and_ticker_parse() {
-        let payload = br#"{"stream":"btc-260327-100000-c@ticker","data":{"e":"24hrTicker","E":1774000001000,"T":1774000000900,"s":"BTC-260327-100000-C","o":"2000","h":"2100","l":"1900","c":"2050","V":"10","A":"20000","P":"0.025","p":"50","Q":"0.5","F":"1","L":"99","n":99,"bo":"2040.5","ao":"2060.1","bq":"1.25","aq":"0.75","b":"0.62","a":"0.68","d":"0.512","t":"-85.3","g":"0.0000123","v":"152.3","vo":"0.6543","mp":"2051.2","hl":"4000","ll":"100","eep":"77000"}}"#;
-        let (stream, data) = split_combined(payload).expect("splits");
-        assert_eq!(stream, b"btc-260327-100000-c@ticker");
-        let f = parse_eapi_ticker(data).expect("parses");
-        assert_eq!(f.bid_px_1e6, 2_040_500_000);
-        assert_eq!(f.ask_px_1e6, 2_060_100_000);
-        assert_eq!(f.bid_qty_1e6, 1_250_000);
-        assert_eq!(f.ask_qty_1e6, 750_000);
-        assert_eq!(f.mark_px_1e9, 2_051_200_000_000);
-        assert_eq!(f.mark_iv_1e9, 654_300_000); // vo — NOT b/a (bid/ask IV)
-        assert_eq!(f.delta_1e9, 512_000_000);
-        assert_eq!(f.gamma_1e9, 12_300);
-        assert_eq!(f.vega_1e6, 152_300_000);
-        assert_eq!(f.theta_1e6, -85_300_000);
-        // Missing any required field rejects.
-        let no_mp = payload.to_vec();
-        let no_mp = String::from_utf8(no_mp)
-            .unwrap()
-            .replacen(r#""mp":"2051.2","#, "", 1);
-        let (_, data2) = split_combined(no_mp.as_bytes()).unwrap();
-        assert!(parse_eapi_ticker(data2).is_none());
-        // Index push.
-        let idx = br#"{"stream":"btcusdt@index","data":{"e":"index","E":1774000001000,"s":"BTCUSDT","p":"77000.15"}}"#;
-        let (s2, d2) = split_combined(idx).unwrap();
-        assert_eq!(s2, b"btcusdt@index");
-        assert_eq!(parse_eapi_index(d2), Some(77_000_150_000_000));
-        assert!(parse_eapi_index(br#"{"p":"0"}"#).is_none());
-        assert!(parse_eapi_index(br#"{"p":77000}"#).is_none());
+    fn live_rows_keep_rules_status_and_naked_sell() {
+        let mut d = EapiDiscovery::new();
+        assert_eq!(
+            d.ingest_exchange_info(&live_page(LIVE_CONTRACTS, LIVE_ROWS))
+                .unwrap(),
+            3
+        );
+        let btc = &d.rows()[0];
+        assert_eq!(btc.symbol(), b"BTC-261225-85000-C");
+        assert_eq!(btc.status, BnStatus::Trading);
+        assert!(btc.trading);
+        assert!(btc.naked_sell, "BTCUSDT: nakedSell true");
+        assert!(!btc.is_tradfi());
+        assert_eq!(btc.underlying_type, BnUnderlying::Coin);
+        assert_eq!((btc.unit, btc.price_scale, btc.qty_scale), (1, 3, 2));
+        assert_eq!(btc.strike_1e9, 85_000_000_000_000);
+        let f = btc.filters;
+        assert_eq!(f.tick_size_1e9, 5_000_000_000);
+        assert_eq!((f.lot_step_1e9, f.min_qty_1e9), (10_000_000, 10_000_000));
+        assert_eq!(f.max_qty_1e9, 200_000_000_000);
+        assert_eq!(f.min_notional_1e9, 0);
+        let xau = &d.rows()[1];
+        assert_eq!(xau.status, BnStatus::Close, "CLOSED_MARKET");
+        assert!(!xau.trading);
+        assert!(xau.is_tradfi());
+        assert_eq!(xau.underlying_type, BnUnderlying::Commodity);
+        assert!(!xau.naked_sell);
+        assert_eq!(xau.filters.tick_size_1e9, 10_000_000);
+        let doge = &d.rows()[2];
+        assert_eq!(doge.unit, 1_000);
+        assert_eq!(doge.price_scale, 4);
+        assert_eq!(doge.strike_1e9, 84_000_000);
+        assert_eq!(doge.filters.max_qty_1e9, 4_000_000_000_000);
+        assert!(!doge.naked_sell);
+    }
+
+    #[test]
+    fn a_closed_series_never_selects() {
+        let mut d = EapiDiscovery::new();
+        d.ingest_exchange_info(&live_page(LIVE_CONTRACTS, LIVE_ROWS))
+            .unwrap();
+        // The XAU call is unexpired and on the chain, but CLOSED_MARKET.
+        let sel = select_capped_chain(
+            d.rows(),
+            b"XAUUSDT",
+            3_950_000_000_000,
+            4,
+            32,
+            1_790_401_849_637,
+        );
+        assert!(sel.is_empty());
+        let sel = select_capped_chain(
+            d.rows(),
+            b"BTCUSDT",
+            85_000_000_000_000,
+            4,
+            32,
+            1_790_401_849_637,
+        );
+        assert_eq!(names(&sel), vec!["BTC-261225-85000-C"]);
+    }
+
+    #[test]
+    fn option_contracts_stamp_only_their_own_page() {
+        // No contracts array: nothing is naked-sellable.
+        let mut d = EapiDiscovery::new();
+        d.ingest_exchange_info(&info(&opt_row("BTC-1-C", "BTCUSDT", "CALL", "1", EXP1)))
+            .unwrap();
+        assert!(!d.rows()[0].naked_sell);
+        // Contracts AFTER the rows stamp the same (field order is not
+        // assumed); a second page stamps its rows, not the first's.
+        let rows = opt_row("BTC-2-C", "BTCUSDT", "CALL", "2", EXP1);
+        let page = format!(
+            r#"{{"optionSymbols":[{rows}],"optionContracts":[{{"underlying":"BTCUSDT","nakedSell":true}}]}}"#
+        );
+        d.ingest_exchange_info(page.as_bytes()).unwrap();
+        assert!(!d.rows()[0].naked_sell, "the first page had no contracts");
+        assert!(d.rows()[1].naked_sell);
+        // An entry for an unlisted underlying stamps nothing.
+        let mut d = EapiDiscovery::new();
+        let page = format!(
+            r#"{{"optionContracts":[{{"underlying":"CLUSDT","nakedSell":true}}],"optionSymbols":[{rows}]}}"#
+        );
+        d.ingest_exchange_info(page.as_bytes()).unwrap();
+        assert!(!d.rows()[0].naked_sell);
+    }
+
+    /// BX2 review: an underlying the page names both ways is covered-only
+    /// whatever the order; agreeing repeats stamp as one.
+    #[test]
+    fn a_false_contract_entry_wins_over_a_true_one() {
+        let rows = opt_row("BTC-1-C", "BTCUSDT", "CALL", "1", EXP1);
+        for (contracts, naked) in [
+            (
+                r#""optionContracts":[{"underlying":"BTCUSDT","nakedSell":true},{"underlying":"BTCUSDT","nakedSell":false}]"#,
+                false,
+            ),
+            (
+                r#""optionContracts":[{"underlying":"BTCUSDT","nakedSell":false},{"underlying":"BTCUSDT","nakedSell":true}]"#,
+                false,
+            ),
+            (
+                r#""optionContracts":[{"underlying":"BTCUSDT","nakedSell":true},{"nakedSell":true,"underlying":"BTCUSDT"}]"#,
+                true,
+            ),
+        ] {
+            let mut d = EapiDiscovery::new();
+            d.ingest_exchange_info(&live_page(contracts, &rows))
+                .unwrap();
+            assert_eq!(d.rows()[0].naked_sell, naked, "{contracts}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_contract_refuses_the_page_and_keeps_no_rows() {
+        let rows = opt_row("BTC-1-C", "BTCUSDT", "CALL", "1", EXP1);
+        let cases: [(&str, EapiDiscoveryErr); 7] = [
+            (
+                r#""optionContracts":[{"underlying":"BTCUSDT","nakedSell":"true"}]"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""optionContracts":[{"underlying":"BTCUSDT","nakedSell":1}]"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""optionContracts":[{"underlying":"BTCUSDT"}]"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""optionContracts":[{"nakedSell":true}]"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""optionContracts":[{"underlying":"","nakedSell":true}]"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""optionContracts":{"underlying":"BTCUSDT"}"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (r#""optionContracts":[7]"#, EapiDiscoveryErr::BadRow),
+        ];
+        for (contracts, want) in cases {
+            let mut d = EapiDiscovery::new();
+            d.ingest_exchange_info(&info(&rows)).unwrap();
+            assert_eq!(
+                d.ingest_exchange_info(&live_page(contracts, &rows))
+                    .unwrap_err(),
+                want,
+                "{contracts}"
+            );
+            assert_eq!(
+                d.universe_total(),
+                1,
+                "the refused page left no rows: {contracts}"
+            );
+        }
+        // A body cut inside the contracts array (they precede the rows
+        // on the wire, but the rows parse first): a truncation — also
+        // inside a bool, or right after its colon.
+        let mut d = EapiDiscovery::new();
+        for tail in ["tr", "fals", ""] {
+            let page = format!(
+                r#"{{"optionSymbols":[{rows}],"optionContracts":[{{"underlying":"BTCUSDT","nakedSell":{tail}"#
+            );
+            assert_eq!(
+                d.ingest_exchange_info(page.as_bytes()).unwrap_err(),
+                EapiDiscoveryErr::Truncated,
+                "{tail}"
+            );
+        }
+        let page = format!(
+            r#"{{"optionSymbols":[{rows}],"optionContracts":[{{"underlying":"BTCUSDT","nakedSell":tru}}]}}"#
+        );
+        assert_eq!(
+            d.ingest_exchange_info(page.as_bytes()).unwrap_err(),
+            EapiDiscoveryErr::BadRow
+        );
+        for tail in [
+            r#""underlying":"BTCUSDT""#,
+            r#""underlying""#,
+            r#""underlying":"#,
+        ] {
+            let page = format!(r#"{{"optionSymbols":[{rows}],"optionContracts":[{{{tail}"#);
+            assert_eq!(
+                d.ingest_exchange_info(page.as_bytes()).unwrap_err(),
+                EapiDiscoveryErr::Truncated,
+                "{tail}"
+            );
+        }
+        assert_eq!(d.universe_total(), 0);
+    }
+
+    #[test]
+    fn malformed_bx2_row_fields_refuse_the_row() {
+        let base = opt_row("BTC-1-C", "BTCUSDT", "CALL", "1", EXP1);
+        let cases: [(&str, &str, EapiDiscoveryErr); 10] = [
+            (r#""unit":1"#, r#""unit":0"#, EapiDiscoveryErr::BadRow),
+            (r#""unit":1"#, r#""unit":"1""#, EapiDiscoveryErr::BadRow),
+            (
+                r#""unit":1"#,
+                r#""unit":4294967296"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""priceScale":2"#,
+                r#""priceScale":255"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""quantityScale":2"#,
+                r#""quantityScale":-2"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (r#""status":"TRADING","#, "", EapiDiscoveryErr::BadRow),
+            (
+                r#""status":"TRADING""#,
+                r#""status":1"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""status":"TRADING""#,
+                r#""status":"TRADING","status":"TRADING""#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""tickSize":"0.01""#,
+                r#""tickSize":"0.0000000001""#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (r#""filters":["#, r#""filters":{"#, EapiDiscoveryErr::BadRow),
+        ];
+        for (from, to, want) in cases {
+            assert_eq!(base.matches(from).count(), 1, "{from}");
+            let bad = base.replacen(from, to, 1);
+            let mut d = EapiDiscovery::new();
+            assert_eq!(
+                d.ingest_exchange_info(&info(&bad)).unwrap_err(),
+                want,
+                "{to}"
+            );
+            assert_eq!(d.universe_total(), 0);
+        }
+        // A body cut inside a row's filters, or right after a key or its
+        // colon, is a truncation.
+        let at = base.find("stepSize").unwrap();
+        let sym = base.find(r#""symbol""#).unwrap();
+        for cut in [
+            &base[..at],
+            &base[..sym + 8],
+            &base[..sym + 9],
+            &base[..at + 9],
+        ] {
+            let mut d = EapiDiscovery::new();
+            let page = format!(r#"{{"optionSymbols":[{cut}"#);
+            assert_eq!(
+                d.ingest_exchange_info(page.as_bytes()).unwrap_err(),
+                EapiDiscoveryErr::Truncated,
+                "{cut}"
+            );
+        }
+        // An unknown status is Other: parsed, not tradable, never selected.
+        let other = base.replacen(r#""status":"TRADING""#, r#""status":"PENDING_LIST""#, 1);
+        let mut d = EapiDiscovery::new();
+        d.ingest_exchange_info(&info(&other)).unwrap();
+        assert_eq!(d.rows()[0].status, BnStatus::Other);
+        assert!(!d.rows()[0].trading);
+    }
+
+    /// The K6 frame (2026-09-23, fstream `/market/stream`), trimmed to
+    /// three of its 752 elements: the push's first row and the ATM
+    /// pair — byte-for-byte as they arrived.
+    const LIVE_BTC: &[u8] = br#"{"stream":"btcusdt@optionMarkPrice","data":[{"s":"BTC-261225-92000-C","mp":"4696.169","E":1790161477975,"e":"markPrice","i":"85879.82826087","P":"0.000","bo":"4670.000","ao":"4760.000","bq":"3.52","aq":"3.52","b":"0.38545907","a":"0.39075673","hl":"8450.000","ll":"940.000","vo":"0.387","rf":"0.0529","d":"0.42618971","t":"-35.49083602","g":"0.00002332","v":"169.85468453"},{"s":"BTC-260925-86000-P","mp":"905.351","E":1790161477974,"e":"markPrice","i":"85879.82826087","P":"0.000","bo":"905.000","ao":"920.000","bq":"4.43","aq":"12.00","b":"0.34885705","a":"0.35497367","hl":"1625.000","ll":"185.000","vo":"0.349","rf":"0.0558","d":"-0.51276574","t":"-230.5222729","g":"0.00018424","v":"24.52223767"},{"s":"BTC-260925-86000-C","mp":"809.784","E":1790161477974,"e":"markPrice","i":"85879.82826087","P":"0.000","bo":"800.000","ao":"810.000","bq":"5.08","aq":"1.10","b":"0.34500957","a":"0.34908772","hl":"1455.000","ll":"165.000","vo":"0.349","rf":"0.0558","d":"0.48723426","t":"-227.33432684","g":"0.00018682","v":"24.52223767"}]}"#;
+
+    #[test]
+    fn symbol_table_resolves_the_venue_case_only() {
+        let mut t = EapiSymbolTable::new();
+        t.insert(b"BTC-260925-86000-C", (1 << 24) | 1025).unwrap();
+        assert_eq!(t.lookup(b"BTC-260925-86000-C"), Some((1 << 24) | 1025));
+        // The mark array carries the listed case; nothing else resolves.
+        assert_eq!(t.lookup(b"btc-260925-86000-c"), None);
+        assert_eq!(t.lookup(b"BTC-260925-86000-P"), None);
+        assert_eq!(t.lookup(b""), None);
+        // Length-gated: neither a prefix of a key nor a key's extension
+        // resolves.
+        assert_eq!(t.lookup(b"BTC-260925-86000-"), None);
+        assert_eq!(t.lookup(b"BTC-260925-86000-C2"), None);
+        assert_eq!(t.insert(b"", 1), Err(EapiTableErr::BadSymbol));
+        assert_eq!(t.insert(&[b'X'; EAPI_SYM_MAX + 1], 1), Err(EapiTableErr::BadSymbol));
+        // BX9: the chain's 64 and the held options' 16 beside it.
+        let mut full = EapiSymbolTable::new();
+        for i in 0..EAPI_TABLE_MAX {
+            full.insert(format!("S{i}").as_bytes(), i as u32).unwrap();
+        }
+        assert_eq!(full.insert(b"OVER", 99), Err(EapiTableErr::Full));
+        assert_eq!((full.len(), EAPI_TABLE_MAX), (EAPI_TABLE_MAX, 80));
+        assert_eq!(full.lookup(b"S79"), Some(79), "the last held row resolves");
+    }
+
+    /// BX0-F2: the live frame splits, walks element by element, and
+    /// each element parses to its own values — the ATM call checked
+    /// field by field.
+    #[test]
+    fn the_live_mark_array_walks_and_parses() {
+        let (stream, data) = split_combined(LIVE_BTC).expect("combined envelope");
+        assert_eq!(stream, b"btcusdt@optionMarkPrice");
+        assert!(stream.ends_with(EAPI_MARK_STREAM.as_bytes()));
+        let mut cur = EapiArrayCursor::new(data).expect("an array");
+        let mut syms: Vec<&[u8]> = Vec::new();
+        let mut rows: Vec<EapiMarkFrame> = Vec::new();
+        loop {
+            match cur.next_elem() {
+                ArrayStep::Elem(e) => {
+                    assert!(e.starts_with(b"{") && e.ends_with(b"}"));
+                    syms.push(eapi_elem_symbol(e).expect("every element names itself"));
+                    rows.push(mark(e).expect("every live element parses"));
+                }
+                ArrayStep::End => break,
+                ArrayStep::Malformed => panic!("the live frame walked as malformed"),
+            }
+        }
+        assert_eq!(
+            syms,
+            [&b"BTC-261225-92000-C"[..], b"BTC-260925-86000-P", b"BTC-260925-86000-C"]
+        );
+        let c = &rows[2];
+        assert_eq!(c.bid_px_1e6, 800_000_000);
+        assert_eq!(c.ask_px_1e6, 810_000_000);
+        assert_eq!(c.bid_qty_1e6, 5_080_000);
+        assert_eq!(c.ask_qty_1e6, 1_100_000);
+        assert_eq!(c.mark_px_1e9, 809_784_000_000);
+        assert_eq!(c.mark_iv_1e9, 349_000_000, "vo — NOT b/a (bid/ask IV)");
+        assert_eq!(c.index_px_1e9, 85_879_828_260_870);
+        assert_eq!(c.delta_1e9, 487_234_260);
+        assert_eq!(c.gamma_1e9, 186_820);
+        assert_eq!(c.vega_1e6, 24_522_237);
+        assert_eq!(c.theta_1e6, -227_334_326);
+        assert_eq!(rows[1].delta_1e9, -512_765_740, "the put's delta keeps its sign");
+        // One push, one index.
+        assert!(rows.iter().all(|r| r.index_px_1e9 == 85_879_828_260_870));
+    }
+
+    /// The cursor walks only an array of flat objects and says where
+    /// that stops; every refusal is terminal and nothing is guessed.
+    #[test]
+    fn the_cursor_refuses_what_is_not_an_array_of_flat_objects() {
+        assert!(EapiArrayCursor::new(b"").is_none());
+        assert!(EapiArrayCursor::new(br#"{"s":"A"}"#).is_none());
+        let mut c = EapiArrayCursor::new(b" [ ] ").unwrap();
+        assert_eq!(c.next_elem(), ArrayStep::End);
+        let mut c = EapiArrayCursor::new(br#"[{"s":"A"}, {"s":"B"}]"#).unwrap();
+        assert_eq!(c.next_elem(), ArrayStep::Elem(br#"{"s":"A"}"#));
+        assert_eq!(c.next_elem(), ArrayStep::Elem(br#"{"s":"B"}"#));
+        assert_eq!(c.next_elem(), ArrayStep::End);
+        for bad in [
+            &br#"[{"s":"A"}{"s":"B"}]"#[..], // no separator
+            br#"[{"s":"A"},]"#,              // trailing comma
+            br#"[,{"s":"A"}]"#,              // leading comma
+            br#"[{"s":"A""#,                 // truncated inside an element
+            br#"[{"s":"A"},"#,               // truncated after a separator
+            b"[1,2]",                        // not objects
+        ] {
+            let mut c = EapiArrayCursor::new(bad).unwrap();
+            let mut steps = 0;
+            loop {
+                match c.next_elem() {
+                    ArrayStep::Elem(_) => steps += 1,
+                    ArrayStep::End => panic!("{:?} walked to a clean end", String::from_utf8_lossy(bad)),
+                    ArrayStep::Malformed => break,
+                }
+                assert!(steps <= 2);
+            }
+        }
+    }
+
+    /// The symbol is read where it lies — a span of the element, not a
+    /// copy of it.
+    #[test]
+    fn a_symbol_is_borrowed_from_its_element() {
+        let e = br#"{"s":"BTC-260925-86000-C","mp":"1"}"#;
+        let s = eapi_elem_symbol(e).unwrap();
+        assert_eq!(s, b"BTC-260925-86000-C");
+        assert!(e.as_ptr_range().contains(&s.as_ptr()), "the span must point into the frame");
+        assert_eq!(eapi_elem_symbol(br#"{"mp":"1"}"#), None);
+        assert_eq!(eapi_elem_symbol(br#"{"s":7}"#), None);
+        assert_eq!(eapi_elem_symbol(br#"{"s":"unterminated}"#), None);
+        // An escape is refused outright — never a truncated name.
+        assert_eq!(eapi_elem_symbol(br#"{"s":"AB\"C","mp":"1"}"#), None);
+        assert_eq!(eapi_elem_symbol(br#"{"s":"AB\\","mp":"1"}"#), None);
+    }
+
+    /// The cursor's one design bet, pinned: elements are FLAT, so the
+    /// first `}` closes one. A brace inside a string (never on this
+    /// wire) cuts that element short — and the walk then turns
+    /// `Malformed` at the cut instead of reading on, so the handler
+    /// counts one rejection and the rest of that push is dropped. No
+    /// row is invented: the cut element still names the symbol it
+    /// carried and lacks its required fields.
+    #[test]
+    fn a_brace_inside_a_string_stops_the_walk_and_invents_nothing() {
+        let data = br#"[{"s":"A}B","mp":"1","i":"1","vo":"1","d":"1","g":"1","v":"1","t":"1"},{"s":"C","mp":"2","i":"1","vo":"1","d":"1","g":"1","v":"1","t":"1"}]"#;
+        let mut c = EapiArrayCursor::new(data).unwrap();
+        let ArrayStep::Elem(cut) = c.next_elem() else {
+            panic!("the cut element is still an element");
+        };
+        assert_eq!(cut, br#"{"s":"A}"#);
+        assert_eq!(eapi_elem_symbol(cut), None, "the cut string is unterminated");
+        assert!(mark(cut).is_none());
+        assert_eq!(c.next_elem(), ArrayStep::Malformed);
+        assert!(c.rest().starts_with(br#"B","mp""#), "rest() is where the walk stopped");
+    }
+
+    /// Whitespace around the array's tokens and after each colon (the
+    /// venue sends none) walks and parses exactly like the compact
+    /// form. The one place it is NOT tolerated is between a key and its
+    /// colon: the house `find_field` anchors `"key":` as one token, on
+    /// this wire as on every other.
+    #[test]
+    fn a_pretty_printed_push_walks_like_a_compact_one() {
+        let data = b"[\n  {\n    \"s\": \"X\",\n    \"mp\": \"1.5\",\n    \"i\":\t\"100\",\n    \"vo\": \"0.5\",\n    \"d\": \"0.1\",\n    \"g\": \"0.001\",\n    \"v\": \"3.0\",\n    \"t\": \"-2.0\"\n  } ,\n  { \"s\": \"Y\" }\n]\n";
+        let mut c = EapiArrayCursor::new(data).unwrap();
+        let ArrayStep::Elem(e) = c.next_elem() else {
+            panic!("first element");
+        };
+        assert_eq!(eapi_elem_symbol(e), Some(&b"X"[..]));
+        let f = mark(e).expect("parses across whitespace");
+        assert_eq!((f.mark_px_1e9, f.index_px_1e9, f.theta_1e6), (1_500_000_000, 100_000_000_000, -2_000_000));
+        let ArrayStep::Elem(e2) = c.next_elem() else {
+            panic!("second element");
+        };
+        assert_eq!(eapi_elem_symbol(e2), Some(&b"Y"[..]));
+        assert_eq!(c.next_elem(), ArrayStep::End);
+    }
+
+    /// Build one element from `(key, value)` pairs, leaving out `skip`.
+    fn elem_without(skip: &str, pairs: &[(&str, &str)]) -> String {
+        let mut s = String::from("{");
+        for (k, v) in pairs {
+            if *k == skip {
+                continue;
+            }
+            if s.len() > 1 {
+                s.push(',');
+            }
+            s.push_str(&format!("\"{k}\":{v}"));
+        }
+        s.push('}');
+        s
+    }
+
+    /// The mark/IV/index/greeks surface is REQUIRED; the book is not.
+    #[test]
+    fn a_mark_element_needs_its_surface_and_tolerates_an_empty_book() {
+        let pairs = [
+            ("s", "\"X\""),
+            ("mp", "\"1.5\""),
+            ("i", "\"100.0\""),
+            ("bo", "\"0.000\""),
+            ("ao", "\"0.000\""),
+            ("bq", "\"0.00\""),
+            ("aq", "\"0.00\""),
+            ("vo", "\"0.5\""),
+            ("d", "\"0.1\""),
+            ("t", "\"-2.0\""),
+            ("g", "\"0.001\""),
+            ("v", "\"3.0\""),
+        ];
+        let f = mark(elem_without("", &pairs).as_bytes()).expect("complete");
+        assert_eq!((f.bid_px_1e6, f.ask_px_1e6, f.bid_qty_1e6, f.ask_qty_1e6), (0, 0, 0, 0));
+        assert_eq!(f.mark_px_1e9, 1_500_000_000);
+        assert_eq!(f.theta_1e6, -2_000_000);
+        for optional in ["bo", "ao", "bq", "aq"] {
+            assert!(
+                mark(elem_without(optional, &pairs).as_bytes()).is_some(),
+                "`{optional}` is optional"
+            );
+        }
+        for required in ["mp", "vo", "i", "d", "g", "v", "t"] {
+            assert!(
+                mark(elem_without(required, &pairs).as_bytes()).is_none(),
+                "`{required}` is required"
+            );
+        }
+        let zero_index = elem_without("", &pairs).replace("\"i\":\"100.0\"", "\"i\":\"0\"");
+        assert!(mark(zero_index.as_bytes()).is_none(), "an index must be positive");
+        let bare_mark = elem_without("", &pairs).replace("\"mp\":\"1.5\"", "\"mp\":1.5");
+        assert!(mark(bare_mark.as_bytes()).is_none(), "an unquoted mark is a contract change");
     }
 }
 
@@ -934,17 +1741,408 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
+    /// Test convenience over the out-param parser.
+    fn mark(elem: &[u8]) -> Option<EapiMarkFrame> {
+        let mut f = EapiMarkFrame::ZERO;
+        parse_eapi_mark(elem, &mut f).then_some(f)
+    }
+
+    /// `m` with `d` (≤ 9) fraction digits: its text and ×1e9 value.
+    fn dec(m: u64, d: u32) -> (String, i64) {
+        let p = 10u64.pow(d);
+        let text = if d == 0 {
+            m.to_string()
+        } else {
+            format!("{}.{:0w$}", m / p, m % p, w = d as usize)
+        };
+        (text, (m * 10u64.pow(9 - d)) as i64)
+    }
+
+    /// Deterministic Fisher-Yates (xorshift64): proptest shrinks the
+    /// seed like any other input.
+    fn shuffle<T>(v: &mut [T], x: &mut u64) {
+        for j in (1..v.len()).rev() {
+            *x ^= *x << 13;
+            *x ^= *x >> 7;
+            *x ^= *x << 17;
+            v.swap(j, (*x % (j as u64 + 1)) as usize);
+        }
+    }
+
+    /// `{"k":v,…}` from key/raw-value pairs, in their order.
+    fn object(pairs: &[(String, String)]) -> String {
+        let mut s = String::from("{");
+        for (j, (k, v)) in pairs.iter().enumerate() {
+            if j > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("\"{k}\":{v}"));
+        }
+        s.push('}');
+        s
+    }
+
+    /// Row underlyings; the last is never listed (a contract entry for
+    /// it stamps nothing).
+    const ULYS: [&str; 5] = ["BTCUSDT", "ETHUSDT", "XAUUSDT", "DOGEUSDT", "CLUSDT"];
+    const STATUSES: [(&str, BnStatus); 5] = [
+        ("TRADING", BnStatus::Trading),
+        ("CLOSED_MARKET", BnStatus::Close),
+        ("HALT", BnStatus::Halt),
+        ("PENDING_LIST", BnStatus::Other),
+        ("DELIVERING", BnStatus::Delivering),
+    ];
+    const CONTRACT_TYPES: [(Option<&str>, u8); 3] = [
+        (None, 0),
+        (Some("CRYPTO_OPTIONS"), 0),
+        (Some("TRADFI_OPTIONS"), BN_ROW_TRADFI),
+    ];
+    const ULY_TYPES: [(Option<&str>, BnUnderlying); 3] = [
+        (None, BnUnderlying::Absent),
+        (Some("CRYPTO"), BnUnderlying::Coin),
+        (Some("COMMODITY"), BnUnderlying::Commodity),
+    ];
+
     proptest! {
-        /// §21.3: none of the eapi byte scanners panic on arbitrary
-        /// bytes.
+        /// §21.3: no eapi scanner panics on arbitrary bytes, and a
+        /// cursor walk always terminates within one step per byte.
         #[test]
-        fn eapi_parsers_never_panic(input in proptest::collection::vec(any::<u8>(), 0..2048)) {
+        fn eapi_scanners_never_panic(input in proptest::collection::vec(any::<u8>(), 0..2048)) {
             let mut d = EapiDiscovery::new();
             let _ = d.ingest_exchange_info(&input);
             let _ = parse_index_price(&input);
-            let _ = split_combined(&input);
-            let _ = parse_eapi_ticker(&input);
-            let _ = parse_eapi_index(&input);
+            let _ = eapi_elem_symbol(&input);
+            let _ = mark(&input);
+            let tail = split_combined(&input).map_or(&input[..], |(_, t)| t);
+            for data in [tail, &input[..]] {
+                if let Some(mut c) = EapiArrayCursor::new(data) {
+                    let mut steps = 0usize;
+                    while let ArrayStep::Elem(e) = c.next_elem() {
+                        let braced = e.first() == Some(&b'{') && e.last() == Some(&b'}');
+                        prop_assert!(braced, "an element must be brace-delimited");
+                        let _ = eapi_elem_symbol(e);
+                        let _ = mark(e);
+                        steps += 1;
+                        prop_assert!(steps <= data.len(), "the walk failed to advance");
+                    }
+                }
+            }
+        }
+
+        /// Numeric edges the element parser meets only through its
+        /// spans: signs, `+`, huge digit runs and exponents never
+        /// panic, and a value that is not wholly a number never parses.
+        #[test]
+        fn mark_numbers_at_the_edges_never_panic(
+            sign in "[-+]?",
+            digits in "[0-9]{0,400}",
+            frac in "[0-9]{0,40}",
+            exp in "([eE][-+]?[0-9]{0,6})?",
+            tail in "[ a-z]{0,2}",
+        ) {
+            let num = format!("{sign}{digits}.{frac}{exp}{tail}");
+            let elem = format!(
+                r#"{{"s":"X","mp":"{num}","i":"{num}","vo":"1","d":"{num}","g":"1","v":"{num}","t":"{num}","bo":"{num}"}}"#
+            );
+            let parsed = mark(elem.as_bytes());
+            if !tail.is_empty() {
+                prop_assert!(parsed.is_none(), "a trailing non-digit must refuse the field");
+            }
+            if let Some(f) = parsed {
+                prop_assert!(f.index_px_1e9 > 0);
+            }
+        }
+
+        /// BX0-F2 round trip: any chain, in any key order, with any
+        /// subset selected — the walk visits every element exactly
+        /// once, and exactly the selected ones parse back to the values
+        /// that were written.
+        #[test]
+        fn mark_array_roundtrips_in_any_key_order(
+            rows in proptest::collection::vec(
+                (
+                    (0u32..100_000, 0u32..1_000, 1u32..200_000, 0u32..100_000_000),
+                    (0u32..100_000, 0u32..1_000, 0u32..100_000, 0u32..1_000),
+                    (0u32..100_000, 0u32..100, 0u32..100_000, 0u32..100),
+                    (0u32..10_000, any::<bool>(), 0u32..100_000_000, 0u32..100_000_000),
+                    (0u32..1_000, 0u32..100_000_000, 0u32..1_000, 0u32..100_000_000),
+                    any::<u64>(),
+                ),
+                1..24,
+            ),
+            mask in any::<u32>(),
+        ) {
+            let n = rows.len();
+            let mut table = EapiSymbolTable::new();
+            let mut frame = String::from(r#"{"stream":"btcusdt@optionMarkPrice","data":["#);
+            let mut expect: Vec<Option<EapiMarkFrame>> = Vec::with_capacity(n);
+            for (k, row) in rows.iter().enumerate() {
+                let ((mp_i, mp_f, ix_i, ix_f), (bo_i, bo_f, ao_i, ao_f), (bq_i, bq_f, aq_i, aq_f),
+                    (vo_f, d_neg, d_f, g_f), (v_i, v_f, t_i, t_f), seed) = *row;
+                let name = format!("BTC-2609{:02}-{}-C", k % 30, 10_000 + k);
+                let mut pairs: Vec<(String, String)> = vec![
+                    ("s".into(), format!("\"{name}\"")),
+                    ("mp".into(), format!("\"{mp_i}.{mp_f:03}\"")),
+                    ("E".into(), "1790161477974".into()),
+                    ("e".into(), "\"markPrice\"".into()),
+                    ("i".into(), format!("\"{ix_i}.{ix_f:08}\"")),
+                    ("P".into(), "\"0.000\"".into()),
+                    ("bo".into(), format!("\"{bo_i}.{bo_f:03}\"")),
+                    ("ao".into(), format!("\"{ao_i}.{ao_f:03}\"")),
+                    ("bq".into(), format!("\"{bq_i}.{bq_f:02}\"")),
+                    ("aq".into(), format!("\"{aq_i}.{aq_f:02}\"")),
+                    ("b".into(), "\"0.34\"".into()),
+                    ("a".into(), "\"-1.0\"".into()),
+                    ("hl".into(), "\"1.000\"".into()),
+                    ("ll".into(), "\"0.500\"".into()),
+                    ("vo".into(), format!("\"0.{vo_f:04}\"")),
+                    ("rf".into(), "\"0.05\"".into()),
+                    ("d".into(), format!("\"{}0.{d_f:08}\"", if d_neg { "-" } else { "" })),
+                    ("t".into(), format!("\"-{t_i}.{t_f:08}\"")),
+                    ("g".into(), format!("\"0.{g_f:08}\"")),
+                    ("v".into(), format!("\"{v_i}.{v_f:08}\"")),
+                ];
+                // Deterministic Fisher-Yates from the row's own seed
+                // (proptest shrinks the seed like any other input).
+                let mut x = seed | 1;
+                for j in (1..pairs.len()).rev() {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    pairs.swap(j, (x % (j as u64 + 1)) as usize);
+                }
+                if k > 0 {
+                    frame.push(',');
+                }
+                frame.push('{');
+                for (j, (key, val)) in pairs.iter().enumerate() {
+                    if j > 0 {
+                        frame.push(',');
+                    }
+                    frame.push_str(&format!("\"{key}\":{val}"));
+                }
+                frame.push('}');
+                let selected = k < 32 && mask & (1u32 << k) != 0;
+                if selected {
+                    table.insert(name.as_bytes(), 1_000 + k as u32).unwrap();
+                }
+                let d_1e9 = i64::from(d_f) * 10;
+                expect.push(selected.then_some(EapiMarkFrame {
+                    bid_px_1e6: i64::from(bo_i) * 1_000_000 + i64::from(bo_f) * 1_000,
+                    bid_qty_1e6: i64::from(bq_i) * 1_000_000 + i64::from(bq_f) * 10_000,
+                    ask_px_1e6: i64::from(ao_i) * 1_000_000 + i64::from(ao_f) * 1_000,
+                    ask_qty_1e6: i64::from(aq_i) * 1_000_000 + i64::from(aq_f) * 10_000,
+                    mark_px_1e9: i64::from(mp_i) * 1_000_000_000 + i64::from(mp_f) * 1_000_000,
+                    mark_iv_1e9: i64::from(vo_f) * 100_000,
+                    index_px_1e9: i64::from(ix_i) * 1_000_000_000 + i64::from(ix_f) * 10,
+                    delta_1e9: if d_neg { -d_1e9 } else { d_1e9 },
+                    gamma_1e9: i64::from(g_f) * 10,
+                    vega_1e6: (i64::from(v_i) * 1_000_000_000 + i64::from(v_f) * 10) / 1000,
+                    theta_1e6: -(i64::from(t_i) * 1_000_000_000 + i64::from(t_f) * 10) / 1000,
+                }));
+            }
+            frame.push_str("]}");
+
+            let (_, data) = split_combined(frame.as_bytes()).unwrap();
+            let mut cur = EapiArrayCursor::new(data).unwrap();
+            let mut seen = 0usize;
+            let mut hits = 0usize;
+            loop {
+                match cur.next_elem() {
+                    ArrayStep::Elem(e) => {
+                        let sym = eapi_elem_symbol(e).unwrap();
+                        if let Some(id) = table.lookup(sym) {
+                            let k = (id - 1_000) as usize;
+                            prop_assert_eq!(k, seen, "the lookup resolved another row");
+                            let want = expect[k].expect("only a selected row resolves");
+                            let got = mark(e).unwrap();
+                            prop_assert_eq!(got.bid_px_1e6, want.bid_px_1e6);
+                            prop_assert_eq!(got.bid_qty_1e6, want.bid_qty_1e6);
+                            prop_assert_eq!(got.ask_px_1e6, want.ask_px_1e6);
+                            prop_assert_eq!(got.ask_qty_1e6, want.ask_qty_1e6);
+                            prop_assert_eq!(got.mark_px_1e9, want.mark_px_1e9);
+                            prop_assert_eq!(got.mark_iv_1e9, want.mark_iv_1e9);
+                            prop_assert_eq!(got.index_px_1e9, want.index_px_1e9);
+                            prop_assert_eq!(got.delta_1e9, want.delta_1e9);
+                            prop_assert_eq!(got.gamma_1e9, want.gamma_1e9);
+                            prop_assert_eq!(got.vega_1e6, want.vega_1e6);
+                            prop_assert_eq!(got.theta_1e6, want.theta_1e6);
+                            hits += 1;
+                        } else {
+                            prop_assert!(expect[seen].is_none(), "a selected row did not resolve");
+                        }
+                        seen += 1;
+                    }
+                    ArrayStep::End => break,
+                    ArrayStep::Malformed => prop_assert!(false, "a generated chain walked as malformed"),
+                }
+            }
+            prop_assert_eq!(seen, n);
+            prop_assert_eq!(hits, expect.iter().filter(|e| e.is_some()).count());
+        }
+
+        /// BX2 review: an option row — status, contractType,
+        /// underlyingType, unit, scales and filters, each present or not,
+        /// in any key order beside noise keys — parses back to exactly
+        /// what was written; and the page's `optionContracts`, before or
+        /// after the rows, stamp `naked_sell` on exactly the underlyings
+        /// with a `true` entry and no `false` one.
+        #[test]
+        fn option_rows_roundtrip_in_any_key_order(
+            rows in proptest::collection::vec(
+                (
+                    (0usize..4, any::<bool>(), (1u64..100_000_000, 0u32..=4), 1u64..4_000_000_000_000),
+                    (0usize..5, 0usize..3, 0usize..3, proptest::option::of(1u32..=u32::MAX)),
+                    (proptest::option::of(0u8..255), proptest::option::of(0u8..255)),
+                    proptest::option::of((
+                        (1u64..100_000, 0u32..=9),
+                        (1u64..100_000, 0u32..=9),
+                        (1u64..100_000, 0u32..=9),
+                        (1u64..100_000, 0u32..=9),
+                    )),
+                    any::<u64>(),
+                ),
+                1..12,
+            ),
+            contracts in proptest::collection::vec((0usize..5, any::<bool>(), any::<bool>()), 0..8),
+            contracts_first in any::<bool>(),
+            seed in any::<u64>(),
+        ) {
+            let mut objs: Vec<String> = Vec::with_capacity(rows.len());
+            let mut want: Vec<EapiOptionRow> = Vec::with_capacity(rows.len());
+            for (k, row) in rows.iter().enumerate() {
+                let ((u, call, (strike_m, strike_d), exp), (st, ct, ut, unit), (px_scale, qty_scale),
+                    filters, row_seed) = *row;
+                let mut x = row_seed | 1;
+                let symbol = format!("R{k}-{}-{}", ULYS[u], if call { 'C' } else { 'P' });
+                let (strike, strike_1e9) = dec(strike_m, strike_d);
+                let mut pairs: Vec<(String, String)> = vec![
+                    ("symbol".into(), format!("\"{symbol}\"")),
+                    ("underlying".into(), format!("\"{}\"", ULYS[u])),
+                    ("side".into(), (if call { "\"CALL\"" } else { "\"PUT\"" }).into()),
+                    ("strikePrice".into(), format!("\"{strike}\"")),
+                    ("expiryDate".into(), exp.to_string()),
+                    ("status".into(), format!("\"{}\"", STATUSES[st].0)),
+                    // Noise the walk skips: row-level twins of filter
+                    // keys in shapes a filter would refuse, fee and
+                    // margin strings, a nested value.
+                    ("minQty".into(), "\"junk\"".into()),
+                    ("maxQty".into(), "7".into()),
+                    ("liquidationFeeRate".into(), "\"0.001900\"".into()),
+                    ("quoteAsset".into(), "\"USDT\"".into()),
+                    ("extra".into(), r#"{"a":[1,-2.5e3,{"b":null}],"c":true}"#.into()),
+                ];
+                if let Some(t) = CONTRACT_TYPES[ct].0 {
+                    pairs.push(("contractType".into(), format!("\"{t}\"")));
+                }
+                if let Some(t) = ULY_TYPES[ut].0 {
+                    pairs.push(("underlyingType".into(), format!("\"{t}\"")));
+                }
+                if let Some(v) = unit {
+                    pairs.push(("unit".into(), v.to_string()));
+                }
+                if let Some(v) = px_scale {
+                    pairs.push(("priceScale".into(), v.to_string()));
+                }
+                if let Some(v) = qty_scale {
+                    pairs.push(("quantityScale".into(), v.to_string()));
+                }
+                let mut f_want = BnFilters::EMPTY;
+                if let Some((tick, step, min_q, max_q)) = filters {
+                    let (tick_s, tick_v) = dec(tick.0, tick.1);
+                    let (step_s, step_v) = dec(step.0, step.1);
+                    let (min_s, min_v) = dec(min_q.0, min_q.1);
+                    let (max_s, max_v) = dec(max_q.0, max_q.1);
+                    let mut price: Vec<(String, String)> = vec![
+                        ("filterType".into(), "\"PRICE_FILTER\"".into()),
+                        ("minPrice".into(), "\"0.02\"".into()),
+                        ("maxPrice".into(), "\"80000.01\"".into()),
+                        ("tickSize".into(), format!("\"{tick_s}\"")),
+                    ];
+                    let mut lot: Vec<(String, String)> = vec![
+                        ("filterType".into(), "\"LOT_SIZE\"".into()),
+                        ("minQty".into(), format!("\"{min_s}\"")),
+                        ("maxQty".into(), format!("\"{max_s}\"")),
+                        ("stepSize".into(), format!("\"{step_s}\"")),
+                    ];
+                    shuffle(&mut price, &mut x);
+                    shuffle(&mut lot, &mut x);
+                    let (a, b) = (object(&price), object(&lot));
+                    let arr = if x & 1 == 0 { format!("[{a},{b}]") } else { format!("[{b},{a}]") };
+                    pairs.push(("filters".into(), arr));
+                    f_want = BnFilters {
+                        tick_size_1e9: tick_v,
+                        lot_step_1e9: step_v,
+                        min_qty_1e9: min_v,
+                        max_qty_1e9: max_v,
+                        ..BnFilters::EMPTY
+                    };
+                }
+                shuffle(&mut pairs, &mut x);
+                objs.push(object(&pairs));
+
+                let mut w = EapiOptionRow::EMPTY;
+                w.symbol[..symbol.len()].copy_from_slice(symbol.as_bytes());
+                w.symbol_len = symbol.len() as u8;
+                w.underlying[..ULYS[u].len()].copy_from_slice(ULYS[u].as_bytes());
+                w.underlying_len = ULYS[u].len() as u8;
+                w.is_call = call;
+                w.status = STATUSES[st].1;
+                w.trading = STATUSES[st].1 == BnStatus::Trading;
+                w.flags = CONTRACT_TYPES[ct].1;
+                w.underlying_type = ULY_TYPES[ut].1;
+                w.price_scale = px_scale.unwrap_or(u8::MAX);
+                w.qty_scale = qty_scale.unwrap_or(u8::MAX);
+                w.unit = unit.unwrap_or(0);
+                w.strike_1e9 = strike_1e9;
+                w.expiry_ms = exp as i64;
+                w.filters = f_want;
+                let named_true = contracts.iter().any(|&(cu, naked, _)| cu == u && naked);
+                let named_false = contracts.iter().any(|&(cu, naked, _)| cu == u && !naked);
+                w.naked_sell = named_true && !named_false;
+                want.push(w);
+            }
+            let mut x = seed | 1;
+            let mut entries: Vec<String> = Vec::with_capacity(contracts.len());
+            for &(cu, naked, noise) in &contracts {
+                let mut pairs: Vec<(String, String)> = vec![
+                    ("underlying".into(), format!("\"{}\"", ULYS[cu])),
+                    ("nakedSell".into(), naked.to_string()),
+                ];
+                if noise {
+                    pairs.push(("settleAsset".into(), "\"USDT\"".into()));
+                    pairs.push(("id".into(), r#"[1,{"x":false}]"#.into()));
+                }
+                shuffle(&mut pairs, &mut x);
+                entries.push(object(&pairs));
+            }
+            let contracts_json = format!("\"optionContracts\":[{}]", entries.join(","));
+            let rows_json = format!("\"optionSymbols\":[{}]", objs.join(","));
+            let page = if contracts_first {
+                format!("{{\"timezone\":\"UTC\",{contracts_json},{rows_json}}}")
+            } else {
+                format!("{{{rows_json},{contracts_json},\"rateLimits\":[]}}")
+            };
+
+            let mut d = EapiDiscovery::new();
+            prop_assert_eq!(d.ingest_exchange_info(page.as_bytes()), Ok(rows.len() as u32));
+            prop_assert_eq!(d.rows().len(), want.len());
+            for (got, w) in d.rows().iter().zip(want.iter()) {
+                prop_assert_eq!(got.symbol(), w.symbol());
+                prop_assert_eq!(got.underlying(), w.underlying());
+                prop_assert_eq!(got.is_call, w.is_call);
+                prop_assert_eq!(got.status, w.status);
+                prop_assert_eq!(got.trading, w.trading);
+                prop_assert_eq!(got.flags, w.flags);
+                prop_assert_eq!(got.underlying_type, w.underlying_type);
+                prop_assert_eq!(got.price_scale, w.price_scale);
+                prop_assert_eq!(got.qty_scale, w.qty_scale);
+                prop_assert_eq!(got.unit, w.unit);
+                prop_assert_eq!(got.strike_1e9, w.strike_1e9);
+                prop_assert_eq!(got.expiry_ms, w.expiry_ms);
+                prop_assert_eq!(got.filters, w.filters);
+                prop_assert_eq!(got.naked_sell, w.naked_sell);
+            }
         }
 
         /// M2 selection invariants — the SAME properties pinning the
@@ -958,6 +2156,7 @@ mod proptests {
             e in 1u32..=4,
             k_half in 1u32..=16,
             idx in 1i64..2_000_000,
+            closed in prop_oneof![Just(0u64), any::<u64>()],
         ) {
             let now_ms = 500_000i64;
             let mut rows: Vec<EapiOptionRow> = Vec::new();
@@ -971,14 +2170,19 @@ mod proptests {
                         symbol[..n].copy_from_slice(&tb[..n]);
                         let mut underlying = [0u8; EAPI_ULY_MAX];
                         underlying[..7].copy_from_slice(b"BTCUSDT");
+                        // BX2: a random subset is closed; it never selects.
+                        let open = closed & (1u64 << (rows.len() % 64)) == 0;
                         rows.push(EapiOptionRow {
                             symbol,
                             symbol_len: n as u8,
                             underlying,
                             underlying_len: 7,
                             is_call: call,
+                            trading: open,
+                            status: if open { BnStatus::Trading } else { BnStatus::Close },
                             strike_1e9: s,
                             expiry_ms: exp,
+                            ..EapiOptionRow::EMPTY
                         });
                     }
                 }
@@ -989,6 +2193,7 @@ mod proptests {
             for r in &sel {
                 prop_assert!(r.expiry_ms > now_ms);
                 prop_assert_eq!(r.underlying(), b"BTCUSDT");
+                prop_assert!(r.trading, "a closed series selected");
             }
             for w in sel.windows(2) {
                 let (a, b) = (&w[0], &w[1]);

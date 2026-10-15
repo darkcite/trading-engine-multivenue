@@ -869,7 +869,7 @@ fn render_json(
         s.push_str(&format!(
             concat!(
                 "{{\"date\":\"{}\",\"day_index\":{},\"covered_ns\":{},\"dark_ns\":{},",
-                "\"ticks\":{},\"runs\":{},\"gap_free\":{},\"venue_ticks\":[{},{},{},{},{},{}]}}"
+                "\"ticks\":{},\"runs\":{},\"gap_free\":{},\"venue_ticks\":["
             ),
             fmt_date(d.day_index),
             d.day_index,
@@ -877,14 +877,19 @@ fn render_json(
             d.dark_ns,
             d.ticks,
             d.runs,
-            d.gap_free,
-            d.venue_ticks[0],
-            d.venue_ticks[1],
-            d.venue_ticks[2],
-            d.venue_ticks[3],
-            d.venue_ticks[4],
-            d.venue_ticks[5]
+            d.gap_free
         ));
+        // MX2: one entry per VENUE_LABELS slot, in label order — the
+        // width is the label list's, never a literal. (Before MX2 six
+        // fixed placeholders rendered 6 of the 7 labels and bybit's
+        // per-day count was silently dropped.)
+        for (lord, n) in d.venue_ticks.iter().enumerate() {
+            if lord > 0 {
+                s.push(',');
+            }
+            s.push_str(&n.to_string());
+        }
+        s.push_str("]}");
     }
     s.push_str("],");
 

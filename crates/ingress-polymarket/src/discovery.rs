@@ -232,6 +232,10 @@ impl Default for PmDiscovery {
 
 /// Parse one market object starting at `pos` (must point at `{`).
 /// Returns the row and the position after the closing `}`.
+// COPY: `Result<(PmMarketRow, usize), _>` ≥ 264 B by value, once per
+// row of the boot-time REST discovery (cold; the row is pushed into the
+// discovery table next) — rejected: an out-param into the table's next
+// slot, bookkeeping a boot-once path does not earn.
 fn parse_row(body: &[u8], pos: usize) -> Result<(PmMarketRow, usize), PmDiscoveryErr> {
     debug_assert_eq!(body[pos], b'{');
     let mut i = pos + 1;
@@ -284,6 +288,10 @@ fn parse_row(body: &[u8], pos: usize) -> Result<(PmMarketRow, usize), PmDiscover
                         if s.len() < 2 || s.len() > 66 || &s[..2] != b"0x" {
                             return Err(PmDiscoveryErr::BadRow);
                         }
+                        // COPY: ≤ 66 B `conditionId` into its discovery row, once per market row
+                        // at boot — the row outlives the Gamma REST body it was scanned from —
+                        // rejected: rows borrowing the body (the Gamma body pinned for the table's
+                        // life and a lifetime threaded through the boot, to save ≤ 66 B a row).
                         condition_id[..s.len()].copy_from_slice(s);
                         condition_id_len = s.len() as u8;
                         i = end;
@@ -359,6 +367,10 @@ fn parse_row(body: &[u8], pos: usize) -> Result<(PmMarketRow, usize), PmDiscover
 /// `clobTokenIds`: every maximal ASCII-digit run of ≥
 /// [`PM_TOKEN_RUN_MIN`] digits is one id, in wire order. Zero runs, a
 /// run over [`PM_TOKEN_MAX`], or more than 2 runs ⇒ `BadRow`.
+// COPY: `Result<([([u8; PM_TOKEN_MAX], u8); 2], u8), _>` ≥ 164 B by
+// value, once per market row of the boot-time REST discovery (cold) —
+// rejected: out-params into the row under construction, bookkeeping a
+// boot-once path does not earn.
 fn extract_tokens(span: &[u8]) -> Result<([([u8; PM_TOKEN_MAX], u8); 2], u8), PmDiscoveryErr> {
     let mut tokens = [([0u8; PM_TOKEN_MAX], 0u8); 2];
     let mut n: u8 = 0;
@@ -379,6 +391,9 @@ fn extract_tokens(span: &[u8]) -> Result<([([u8; PM_TOKEN_MAX], u8); 2], u8), Pm
         if run.len() > PM_TOKEN_MAX || n == 2 {
             return Err(PmDiscoveryErr::BadRow);
         }
+        // COPY: ≤ 80 B CLOB token id (PM_TOKEN_MAX), ≤ 2 per market row at boot —
+        // the row outlives the Gamma REST body it was extracted from — rejected: a
+        // span into the body (pinned for the table's life, a boot-wide lifetime).
         tokens[n as usize].0[..run.len()].copy_from_slice(run);
         tokens[n as usize].1 = run.len() as u8;
         n += 1;

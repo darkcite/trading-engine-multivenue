@@ -9,16 +9,18 @@ torn trailing slot dropped, empty files kept as header-only.
 Convention: full ``import x`` only. No ``from x import y``.
 """
 
+import itertools
 import pathlib
 import struct
 
 import pytest
 
-import tests.craft
-
+import claude_worker.candles
 import claude_worker.frames
 import claude_worker.pmlr
+import claude_worker.seeds
 import claude_worker.window_root
+import tests.craft
 
 S = 10**9
 EPOCH = 1_788_000_000_000_000_000
@@ -28,7 +30,9 @@ def _mk_run(tmp_path: pathlib.Path, ts_list: list[int]) -> pathlib.Path:
     run = tests.craft.write_run(tmp_path / "logs", EPOCH, ts_list)
     (run / "instrument-manifest.tsv").write_text("42\tPMTOK\n")
     # a second lane starting later, plus an empty file
-    tests.craft.write_ticks(run / "bn-ticks.pmlr", [t + 7 for t in ts_list[1:]], EPOCH, sym=7, venue=1)
+    tests.craft.write_ticks(
+        run / "bn-ticks.pmlr", [t + 7 for t in ts_list[1:]], EPOCH, sym=7, venue=1
+    )
     tests.craft.write_ticks(run / "okx-ticks.pmlr", [], EPOCH, sym=9, venue=2)
     return run
 
@@ -37,7 +41,10 @@ def test_windows_cover_the_run_in_two_hour_steps(tmp_path):
     run = _mk_run(tmp_path, [1_000, 3 * 3600 * S, 5 * 3600 * S + 1])
     w = claude_worker.window_root.windows_of(run)
     assert w == [(0.0, 7200.0), (7200.0, 14400.0), (14400.0, 21600.0)]
-    assert claude_worker.window_root.windows_of(run, 3600.0)[:2] == [(0.0, 3600.0), (3600.0, 7200.0)]
+    assert claude_worker.window_root.windows_of(run, 3600.0)[:2] == [
+        (0.0, 3600.0),
+        (3600.0, 7200.0),
+    ]
     with pytest.raises(claude_worker.window_root.WindowError):
         claude_worker.window_root.windows_of(run, 7201.0)
     empty = tests.craft.write_run(tmp_path / "logs2", EPOCH, [])
@@ -45,7 +52,14 @@ def test_windows_cover_the_run_in_two_hour_steps(tmp_path):
 
 
 def test_cut_run_slices_every_file_and_advances_the_epoch(tmp_path):
-    ts = [1_000, 1_000 + 30 * S, 1_000 + 3_000 * S, 1_000 + 7_199 * S, 1_000 + 7_200 * S, 1_000 + 9_000 * S]
+    ts = [
+        1_000,
+        1_000 + 30 * S,
+        1_000 + 3_000 * S,
+        1_000 + 7_199 * S,
+        1_000 + 7_200 * S,
+        1_000 + 9_000 * S,
+    ]
     run = _mk_run(tmp_path, ts)
     lines: list[str] = []
     out = claude_worker.window_root.cut_run(run, tmp_path / "roots", 0.0, 7200.0, lines.append)
@@ -56,7 +70,7 @@ def test_cut_run_slices_every_file_and_advances_the_epoch(tmp_path):
     assert [t.ts_ns for t in r.ticks()] == [t + 7 for t in ts[1:4]]
     assert (out / "okx-ticks.pmlr").stat().st_size == claude_worker.window_root.HEADER_SIZE
     assert (out / "instrument-manifest.tsv").read_text() == "42\tPMTOK\n"
-    assert any("pm-ticks.pmlr 6 -> 4" in l for l in lines)
+    assert any("pm-ticks.pmlr 6 -> 4" in line for line in lines)
     # Second window: epoch advanced by 7200 s, dir renamed, the rest kept.
     out2 = claude_worker.window_root.cut_run(run, tmp_path / "roots", 7200.0, 14400.0)
     assert out2.name == f"run-{EPOCH + 7200 * S}"
@@ -66,7 +80,10 @@ def test_cut_run_slices_every_file_and_advances_the_epoch(tmp_path):
     assert [t.ts_ns for t in r.ticks()] == ts[4:]
     # Re-cutting an existing window replaces it.
     out2b = claude_worker.window_root.cut_run(run, tmp_path / "roots", 7200.0, 14400.0)
-    assert out2b == out2 and [t.ts_ns for t in claude_worker.pmlr.Reader(out2 / "pm-ticks.pmlr").ticks()] == ts[4:]
+    assert (
+        out2b == out2
+        and [t.ts_ns for t in claude_worker.pmlr.Reader(out2 / "pm-ticks.pmlr").ticks()] == ts[4:]
+    )
 
 
 def test_cut_run_refuses_over_long_windows_and_tickless_runs(tmp_path):
@@ -89,6 +106,33 @@ def test_torn_trailing_slot_is_dropped(tmp_path):
     assert [t.ts_ns for t in r.ticks()] == [1_000, 2_000, 3_000]
 
 
+def test_run_span_skips_files_whose_header_never_landed(tmp_path):
+    """A boot that dies between creating a capture file and writing its 64-byte
+    header leaves a 0-byte (or torn) file. It holds no slot, so it must not stop
+    every SWEEP that asks a run for its span — the archive push (the 2026-09-22
+    cycle aborted on a 0-byte `okx-events.pmlr` and stranded every run behind
+    it), the window pools, the pnl-report windowing. `run_pmlr_version`'s law."""
+    run = _mk_run(tmp_path, [1_000, 3 * 3600 * S])
+    expected = claude_worker.window_root.run_span(run)
+    (run / "okx-events.pmlr").write_bytes(b"")  # the header never landed
+    (run / "deribit-events.pmlr").write_bytes(b"PMLR\x03")  # torn inside the header
+    (run / "hl-events.pmlr").write_bytes(b"JUNK" + b"\x00" * 60)  # 64 B, bad magic
+    assert claude_worker.window_root.run_span(run) == expected
+    assert claude_worker.window_root.windows_of(run) == [(0.0, 7200.0), (7200.0, 14400.0)]
+    assert claude_worker.window_root.complete_windows(run) == [(0.0, 7200.0)]
+    # A run whose only capture file is unreadable has no span — not an error.
+    dead = tmp_path / "logs3" / f"run-{EPOCH}"
+    dead.mkdir(parents=True)
+    (dead / "okx-events.pmlr").write_bytes(b"")
+    assert claude_worker.window_root.run_span(dead) is None
+    assert claude_worker.window_root.windows_of(dead) == []
+    assert claude_worker.window_root.complete_windows(dead) == []
+    # CUTTING stays strict: a cut is replayed by the harness, and a file it
+    # cannot read is an error there, not a hole to paper over.
+    with pytest.raises(claude_worker.window_root.WindowError):
+        claude_worker.window_root.cut_run(run, tmp_path / "roots", 0.0, 60.0)
+
+
 # ---- RG3: ai-cmds.pmlr — cut by ts_ns + the SetRegime carry-over ----
 
 _AI = struct.Struct("<QIIqqQBBBBHH")  # AiCmd head (48 B) — frames.py _HEAD without the len prefix
@@ -100,10 +144,12 @@ def _ai_frame(ts: int, kind: int, ttl: int = 0, profile: int = 0) -> bytes:
 
 
 def _write_ai_cmds(path: pathlib.Path, frames: list[bytes], epoch_ns: int) -> None:
-    header = claude_worker.pmlr._HEADER.pack(  # noqa: SLF001 — reader-defined layout, deliberately
+    header = claude_worker.pmlr._HEADER.pack(  # reader-defined layout, deliberately
         claude_worker.pmlr.MAGIC, 2, claude_worker.window_root.SLOT_KIND_AI_CMD, epoch_ns
     )
-    path.write_bytes(header + bytes(claude_worker.window_root.HEADER_SIZE - len(header)) + b"".join(frames))
+    path.write_bytes(
+        header + bytes(claude_worker.window_root.HEADER_SIZE - len(header)) + b"".join(frames)
+    )
 
 
 def _ai_slots(path: pathlib.Path) -> list[tuple[int, int, int, int]]:
@@ -144,7 +190,7 @@ def test_ai_cmds_are_cut_by_ts_and_the_live_declaration_is_carried(tmp_path):
         (ts0 + 6600 * S, sr, 900 * S, 1),  # carried: the slow declaration still in force at lo
         (lo + 30 * S, sr, 900 * S, 0),
     ]
-    assert any("ai-cmds.pmlr 7 -> 2" in l for l in lines), lines
+    assert any("ai-cmds.pmlr 7 -> 2" in line for line in lines), lines
     # The first window carries nothing (no declaration precedes ts0).
     out0 = claude_worker.window_root.cut_run(run, tmp_path / "roots", 0.0, 7200.0)
     assert [s[1] for s in _ai_slots(out0 / "ai-cmds.pmlr")] == [hb, sr, sr, sr, hb]
@@ -155,8 +201,6 @@ def test_ai_cmds_are_cut_by_ts_and_the_live_declaration_is_carried(tmp_path):
 
 
 def test_cut_run_writes_the_windows_own_regime_seed_from_candles(tmp_path):
-    import claude_worker.candles
-
     ts = [1_000, 1_000 + 30 * S, 1_000 + 7_200 * S, 1_000 + 9_000 * S]
     run = _mk_run(tmp_path, ts)
     regime_toml = tmp_path / "regime.toml"
@@ -173,10 +217,15 @@ def test_cut_run_writes_the_windows_own_regime_seed_from_candles(tmp_path):
     rows = []
     for k in range(5):
         open_ts = w2_ms - (5 - k) * 60_000
-        rows.append((1, "binance-usdm:btcusdt", "1m", open_ts, 1.0, 1.0, 1.0, 100.0 + k, 1.0, "rest", w2_ms))
-    rows.append((1, "binance-usdm:btcusdt", "1m", w2_ms, 1.0, 1.0, 1.0, 999.0, 1.0, "rest", w2_ms))  # at the cut: excluded
+        rows.append(
+            (1, "binance-usdm:btcusdt", "1m", open_ts, 1.0, 1.0, 1.0, 100.0 + k, 1.0, "rest", w2_ms)
+        )
+    rows.append(
+        (1, "binance-usdm:btcusdt", "1m", w2_ms, 1.0, 1.0, 1.0, 999.0, 1.0, "rest", w2_ms)
+    )  # at the cut: excluded
     conn.executemany(
-        "INSERT INTO candles (venue,descriptor,tf,open_ts,o,h,l,c,v,source,fetched_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO candles (venue,descriptor,tf,open_ts,o,h,l,c,v,source,fetched_ts) VALUES "
+        "(?,?,?,?,?,?,?,?,?,?,?)",
         rows,
     )
     conn.commit()
@@ -186,10 +235,16 @@ def test_cut_run_writes_the_windows_own_regime_seed_from_candles(tmp_path):
         run, tmp_path / "roots", 7200.0, 14400.0, lines.append, seed=(regime_toml, db)
     )
     seed = out / claude_worker.window_root.SEED_FILE
-    body = [l for l in seed.read_text("utf-8").splitlines() if l and not l.startswith("#")]
+    body = [
+        line for line in seed.read_text("utf-8").splitlines() if line and not line.startswith("#")
+    ]
     assert len(body) == 5, body
-    assert body[-1].split("\t") == ["binance-usdm:btcusdt", str((w2_ms - 60_000) // 60_000), "104000000"]
-    assert any("regime-seed.tsv 5 rows for 2 descriptors" in l for l in lines), lines
+    assert body[-1].split("\t") == [
+        "binance-usdm:btcusdt",
+        str((w2_ms - 60_000) // 60_000),
+        "104000000",
+    ]
+    assert any("regime-seed.tsv 5 rows for 2 descriptors" in line for line in lines), lines
     # Either input absent ⇒ no seed file, no error.
     out_no = claude_worker.window_root.cut_run(
         run, tmp_path / "roots", 0.0, 7200.0, seed=(tmp_path / "nope.toml", db)
@@ -202,8 +257,6 @@ def test_cut_run_writes_the_windows_own_funding_seed_from_the_funding_table(tmp_
     table, prints strictly before the window's first instant (the boot
     lane's 73 h law), rate ×1e9 RAW; spot descriptors never seed; a
     print AT the cut is excluded. No funding table ⇒ no file."""
-    import claude_worker.candles
-    import claude_worker.seeds
 
     ts = [1_000, 1_000 + 30 * S, 1_000 + 7_200 * S, 1_000 + 9_000 * S]
     run = _mk_run(tmp_path, ts)
@@ -234,19 +287,25 @@ def test_cut_run_writes_the_windows_own_funding_seed_from_the_funding_table(tmp_
         run, tmp_path / "roots", 7200.0, 14400.0, lines.append, seed=(tmp_path / "nope.toml", db)
     )
     seed = out / claude_worker.seeds.FUNDING_SEED_FILE
-    body = [l for l in seed.read_text("utf-8").splitlines() if l and not l.startswith("#")]
+    body = [
+        line for line in seed.read_text("utf-8").splitlines() if line and not line.startswith("#")
+    ]
     assert body == [
         f"binance-usdm:btcusdt\t{w2_ms - 16 * h}\t100000",
         f"binance-usdm:btcusdt\t{w2_ms - 8 * h}\t-200000",
     ]
-    assert any("funding-seed.tsv 2 prints for 1 descriptors" in l for l in lines), lines
+    assert any("funding-seed.tsv 2 prints for 1 descriptors" in line for line in lines), lines
     assert not (out / claude_worker.window_root.SEED_FILE).exists()
     # A window with no print before it gets no file (the harness warms from the window).
-    out_first = claude_worker.window_root.cut_run(run, tmp_path / "roots2", 0.0, 7200.0, seed=(tmp_path / "nope.toml", db))
+    out_first = claude_worker.window_root.cut_run(
+        run, tmp_path / "roots2", 0.0, 7200.0, seed=(tmp_path / "nope.toml", db)
+    )
     assert (out_first / claude_worker.seeds.FUNDING_SEED_FILE).exists()  # 2 prints precede it too
     db2 = tmp_path / "bare.db"
     claude_worker.candles.open_db(db2).close()
-    out_bare = claude_worker.window_root.cut_run(run, tmp_path / "roots3", 0.0, 7200.0, seed=(tmp_path / "nope.toml", db2))
+    out_bare = claude_worker.window_root.cut_run(
+        run, tmp_path / "roots3", 0.0, 7200.0, seed=(tmp_path / "nope.toml", db2)
+    )
     assert not (out_bare / claude_worker.seeds.FUNDING_SEED_FILE).exists()
 
 
@@ -299,7 +358,7 @@ def test_campaign_cut_emits_nine_windows_all_under_two_hours(tmp_path):
     # Every slice is far below the 2 h law, and they are in wall order.
     for w in ws:
         assert 0 < (w.to_ns - w.from_ns) <= claude_worker.window_root.WINDOW_MAX_S * 1e9
-    assert all(a.from_ns < b.from_ns for a, b in zip(ws[:-1], ws[1:], strict=True))
+    assert all(a.from_ns < b.from_ns for a, b in itertools.pairwise(ws))
     # The decision slice brackets the entry instant on both sides.
     entry_ns = expiry_ns - TAU_8H_NS
     assert ws[0].from_ns < entry_ns - SELECTION_NS

@@ -29,7 +29,7 @@
 //!
 //! Zero-alloc: everything writes into a caller-owned buffer.
 
-use crate::action::{CancelByCloidWire, CancelWire, ModifyWire, OrderWire, Tif};
+use crate::action::{CancelByCloidWire, CancelWire, Grouping, ModifyWire, OrderWire, Tif};
 use crate::msgpack::MsgPackErr;
 use crate::wire::WireNum;
 
@@ -61,9 +61,10 @@ impl<'a> Json<'a> {
         if end > self.buf.len() {
             return Err(MsgPackErr::Overflow);
         }
-        // COPY: the JSON renderer's own write — literals and ≤ 24 B
-        // rendered numbers into the request body IN PLACE (behind the
-        // envelope head, `envelope_open`). As with `msgpack::put_all`,
+        // COPY: the JSON renderer's own write — literals, ≤ 24 B
+        // rendered numbers and ≤ 42 B caller tokens (a channel name, the
+        // master's hex) into the body IN PLACE (behind a head or the
+        // frame-header room, `envelope_open`). As with `msgpack::put_all`,
         // the body must exist contiguously once; it is written here
         // and read by the TLS layer, with no staging buffer between.
         self.buf[self.len..end].copy_from_slice(bytes);
@@ -140,6 +141,16 @@ pub fn order_json(
     orders: &[OrderWire],
     grouping: &[u8],
 ) -> Result<usize, MsgPackErr> {
+    order_json_grouped(dst, orders, Grouping::Named(grouping))
+}
+
+/// [`order_json`] under any [`Grouping`]: XMM XH5d's ALO priority as
+/// `"grouping":{"p":N}`.
+pub fn order_json_grouped(
+    dst: &mut [u8],
+    orders: &[OrderWire],
+    grouping: Grouping<'_>,
+) -> Result<usize, MsgPackErr> {
     let mut j = Json::new(dst);
     j.put(b"{\"type\":\"order\",\"orders\":[")?;
     for (i, o) in orders.iter().enumerate() {
@@ -148,9 +159,18 @@ pub fn order_json(
         }
         order_wire_json(&mut j, o)?;
     }
-    j.put(b"],\"grouping\":\"")?;
-    j.put(grouping)?;
-    j.put(b"\"}")?;
+    match grouping {
+        Grouping::Named(g) => {
+            j.put(b"],\"grouping\":\"")?;
+            j.put(g)?;
+            j.put(b"\"}")?;
+        }
+        Grouping::Priority(p) => {
+            j.put(b"],\"grouping\":{\"p\":")?;
+            j.u64(u64::from(p))?;
+            j.put(b"}}")?;
+        }
+    }
     Ok(j.len)
 }
 
@@ -212,6 +232,57 @@ pub fn batch_modify_json(dst: &mut [u8], modifies: &[ModifyWire]) -> Result<usiz
         j.put(b"}")?;
     }
     j.put(b"]}")?;
+    Ok(j.len)
+}
+
+/// `{"type":"reserveRequestWeight","weight":…}` as JSON — the twin of
+/// [`crate::action::encode_reserve_weight`].
+pub fn reserve_weight_json(dst: &mut [u8], weight: u64) -> Result<usize, MsgPackErr> {
+    let mut j = Json::new(dst);
+    j.put(b"{\"type\":\"reserveRequestWeight\",\"weight\":")?;
+    j.u64(weight)?;
+    j.put(b"}")?;
+    Ok(j.len)
+}
+
+/// `{"type":"updateLeverage","asset":…,"isCross":…,"leverage":…}` as JSON
+/// — the twin of [`crate::action::encode_update_leverage`].
+pub fn update_leverage_json(
+    dst: &mut [u8],
+    asset: u32,
+    is_cross: bool,
+    leverage: u32,
+) -> Result<usize, MsgPackErr> {
+    let mut j = Json::new(dst);
+    j.put(b"{\"type\":\"updateLeverage\",\"asset\":")?;
+    j.u64(u64::from(asset))?;
+    j.put(if is_cross {
+        b",\"isCross\":true,\"leverage\":" as &[u8]
+    } else {
+        b",\"isCross\":false,\"leverage\":" as &[u8]
+    })?;
+    j.u64(u64::from(leverage))?;
+    j.put(b"}")?;
+    Ok(j.len)
+}
+
+/// `{"type":"scheduleCancel"[,"time":…]}` as JSON — the twin of
+/// [`crate::action::encode_schedule_cancel`].
+pub fn schedule_cancel_json(dst: &mut [u8], time_ms: Option<u64>) -> Result<usize, MsgPackErr> {
+    let mut j = Json::new(dst);
+    j.put(b"{\"type\":\"scheduleCancel\"")?;
+    if let Some(t) = time_ms {
+        j.put(b",\"time\":")?;
+        j.u64(t)?;
+    }
+    j.put(b"}")?;
+    Ok(j.len)
+}
+
+/// `{"type":"noop"}` as JSON — the twin of [`crate::action::encode_noop`].
+pub fn noop_json(dst: &mut [u8]) -> Result<usize, MsgPackErr> {
+    let mut j = Json::new(dst);
+    j.put(b"{\"type\":\"noop\"}")?;
     Ok(j.len)
 }
 
@@ -289,7 +360,9 @@ pub fn envelope(
     expires_after: Option<u64>,
 ) -> Result<usize, MsgPackErr> {
     let head = envelope_open(dst)?;
-    let end = head.checked_add(action_json.len()).ok_or(MsgPackErr::Overflow)?;
+    let end = head
+        .checked_add(action_json.len())
+        .ok_or(MsgPackErr::Overflow)?;
     if end > dst.len() {
         return Err(MsgPackErr::Overflow);
     }
@@ -299,6 +372,107 @@ pub fn envelope(
     // action bytes on their own to print and compare.
     dst[head..end].copy_from_slice(action_json);
     envelope_close(dst, end, nonce, sig, vault, expires_after)
+}
+
+/// **Open a WebSocket post** (XH4b): writes
+/// `{"method":"post","id":<id>,"request":{"type":"action","payload":` at
+/// the start of `dst` and returns the offset at which the caller renders
+/// the envelope IN PLACE ([`envelope_open`] … [`envelope_close`] on
+/// `&mut dst[n..]`). Close with [`ws_post_close`]. The post is the
+/// `/exchange` body wrapped, byte for byte: the envelope inside it is the
+/// one a REST fallback sends (a re-send copies it out; a post sealed for
+/// REST renders it alone, XMM HD2).
+pub fn ws_post_open(dst: &mut [u8], id: u64) -> Result<usize, MsgPackErr> {
+    let mut j = Json::new(dst);
+    j.put(b"{\"method\":\"post\",\"id\":")?;
+    j.u64(id)?;
+    j.put(b",\"request\":{\"type\":\"action\",\"payload\":")?;
+    Ok(j.len)
+}
+
+/// **Open a WebSocket read** (XH4d): writes
+/// `{"method":"post","id":<id>,"request":{"type":"info","payload":` at the
+/// start of `dst` and returns the offset at which the caller renders the
+/// read's body in place (`recon::open_orders_request` /
+/// `perp_state_request`). Close with [`ws_post_close`]. Unsigned: a read
+/// spends no nonce and no address request.
+pub fn ws_info_open(dst: &mut [u8], id: u64) -> Result<usize, MsgPackErr> {
+    let mut j = Json::new(dst);
+    j.put(b"{\"method\":\"post\",\"id\":")?;
+    j.u64(id)?;
+    j.put(b",\"request\":{\"type\":\"info\",\"payload\":")?;
+    Ok(j.len)
+}
+
+/// **Close a WebSocket post**: the post occupies `dst[..end]`, envelope
+/// included; appends the two closing braces and returns its length.
+pub fn ws_post_close(dst: &mut [u8], end: usize) -> Result<usize, MsgPackErr> {
+    if end > dst.len() {
+        return Err(MsgPackErr::Overflow);
+    }
+    let mut j = Json::at(dst, end);
+    j.put(b"}}")?;
+    Ok(j.len)
+}
+
+/// `{"method":"subscribe","subscription":{"type":"<channel>","user":"<user_hex>"}}`
+/// — a user-channel subscription; `user_hex` is the `0x…` MASTER
+/// address. ONE renderer for the blocking `UserWs` and the gateway's
+/// connections.
+pub fn subscribe_json(
+    dst: &mut [u8],
+    channel: &[u8],
+    user_hex: &[u8],
+) -> Result<usize, MsgPackErr> {
+    let mut j = Json::new(dst);
+    j.put(b"{\"method\":\"subscribe\",\"subscription\":{\"type\":\"")?;
+    j.put(channel)?;
+    j.put(b"\",\"user\":\"")?;
+    j.put(user_hex)?;
+    j.put(b"\"}}")?;
+    Ok(j.len)
+}
+
+#[cfg(test)]
+mod ws_post_tests {
+    use super::*;
+
+    #[test]
+    fn a_ws_post_wraps_the_envelope_byte_for_byte() {
+        let mut dst = [0u8; 512];
+        let p = ws_post_open(&mut dst, 42).unwrap();
+        assert_eq!(
+            &dst[..p],
+            br#"{"method":"post","id":42,"request":{"type":"action","payload":"#
+        );
+        let head = envelope_open(&mut dst[p..]).unwrap();
+        let body = br#"{"type":"noop"}"#;
+        dst[p + head..p + head + body.len()].copy_from_slice(body);
+        let sig = [0u8; 65];
+        let env = envelope_close(&mut dst[p..], head + body.len(), 7, &sig, None, None).unwrap();
+        let mut rest = [0u8; 512];
+        let n = envelope(&mut rest, body, 7, &sig, None, None).unwrap();
+        assert_eq!(
+            &dst[p..p + env],
+            &rest[..n],
+            "the REST body is the post's sub-slice"
+        );
+        let total = ws_post_close(&mut dst, p + env).unwrap();
+        assert_eq!(total, p + env + 2);
+        assert!(dst[..total].ends_with(b"}}}"));
+        assert_eq!(ws_post_close(&mut dst[..4], 5), Err(MsgPackErr::Overflow));
+        assert_eq!(ws_post_open(&mut [0u8; 8], 1), Err(MsgPackErr::Overflow));
+    }
+
+    #[test]
+    fn a_subscription_names_the_channel_and_the_master() {
+        let mut dst = [0u8; 256];
+        let n = subscribe_json(&mut dst, b"orderUpdates", b"0xabc").unwrap();
+        assert_eq!(
+            &dst[..n],
+            br#"{"method":"subscribe","subscription":{"type":"orderUpdates","user":"0xabc"}}"#
+        );
+    }
 }
 
 #[cfg(test)]
@@ -323,15 +497,19 @@ mod tests {
 
     #[test]
     fn a_cloid_renders_as_the_venues_raw_form() {
-        let cloid = [
-            0x4d, 0x56, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a,
-        ];
+        let cloid = [0x4d, 0x56, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a];
         let o = OrderWire::new(0, false, 50_000_000, 100_000_000, Tif::Alo)
             .with_cloid(cloid)
             .reduce_only();
         let j = s(|d| order_json(d, &[o], b"na"));
-        assert!(j.contains(r#""c":"0x4d56030000000000000000000000002a""#), "{j}");
-        assert!(j.contains(r#""b":false"#) && j.contains(r#""r":true"#), "{j}");
+        assert!(
+            j.contains(r#""c":"0x4d56030000000000000000000000002a""#),
+            "{j}"
+        );
+        assert!(
+            j.contains(r#""b":false"#) && j.contains(r#""r":true"#),
+            "{j}"
+        );
         assert!(j.contains(r#""tif":"Alo""#), "{j}");
     }
 
@@ -342,15 +520,15 @@ mod tests {
     #[test]
     fn the_price_and_size_strings_are_identical_in_both_encodings() {
         let cases: [(i64, i64); 9] = [
-            (50_000_000, 1_000_000_000),   // 0.5   / 10
-            (45_670_000, 2_500_000_000),   // 0.4567/ 25
-            (100_000, 1_000_000_000),      // 0.001 / 10
-            (99_900_000, 100_000_000),     // 0.999 / 1
-            (50_000_000, 10_000_000_000),  // 0.5   / 100  (trailing zeros)
-            (1, 1),                        // the smallest representable
-            (50_000_001, 333_000_000),     // a real 8th digit
-            (25_000_000, 300_000_000),     // 0.25  / 3
-            (60_100_000, 500_000_000),     // 0.601 / 5
+            (50_000_000, 1_000_000_000),  // 0.5   / 10
+            (45_670_000, 2_500_000_000),  // 0.4567/ 25
+            (100_000, 1_000_000_000),     // 0.001 / 10
+            (99_900_000, 100_000_000),    // 0.999 / 1
+            (50_000_000, 10_000_000_000), // 0.5   / 100  (trailing zeros)
+            (1, 1),                       // the smallest representable
+            (50_000_001, 333_000_000),    // a real 8th digit
+            (25_000_000, 300_000_000),    // 0.25  / 3
+            (60_100_000, 500_000_000),    // 0.601 / 5
         ];
         for (px, sz) in cases {
             let o = OrderWire::new(7, true, px, sz, Tif::Gtc);
@@ -375,13 +553,22 @@ mod tests {
     #[test]
     fn cancels_and_modifies_render() {
         assert_eq!(
-            s(|d| cancel_json(d, &[CancelWire { asset: 0, oid: 12_345 }])),
+            s(|d| cancel_json(
+                d,
+                &[CancelWire {
+                    asset: 0,
+                    oid: 12_345
+                }]
+            )),
             r#"{"type":"cancel","cancels":[{"a":0,"o":12345}]}"#
         );
         assert_eq!(
             s(|d| cancel_by_cloid_json(
                 d,
-                &[CancelByCloidWire { asset: 5, cloid: [0u8; 16] }]
+                &[CancelByCloidWire {
+                    asset: 5,
+                    cloid: [0u8; 16]
+                }]
             )),
             r#"{"type":"cancelByCloid","cancels":[{"asset":5,"cloid":"0x00000000000000000000000000000000"}]}"#
         );
@@ -392,7 +579,10 @@ mod tests {
             oid_is_cloid: false,
         };
         let j = s(|d| batch_modify_json(d, &[m]));
-        assert!(j.starts_with(r#"{"type":"batchModify","modifies":[{"oid":99,"order":{"#), "{j}");
+        assert!(
+            j.starts_with(r#"{"type":"batchModify","modifies":[{"oid":99,"order":{"#),
+            "{j}"
+        );
     }
 
     #[test]
@@ -403,7 +593,10 @@ mod tests {
         sig[64] = 28;
         let action = br#"{"type":"cancel","cancels":[]}"#;
         let j = s(|d| envelope(d, action, 1_789_000_000_000, &sig, None, None));
-        assert!(j.starts_with(r#"{"action":{"type":"cancel","cancels":[]},"nonce":1789000000000,"#), "{j}");
+        assert!(
+            j.starts_with(r#"{"action":{"type":"cancel","cancels":[]},"nonce":1789000000000,"#),
+            "{j}"
+        );
         assert!(j.contains(r#""r":"0xab00"#), "{j}");
         assert!(j.contains(r#""s":"0xcd00"#), "{j}");
         assert!(j.ends_with(r#""v":28}}"#), "{j}");
@@ -430,7 +623,10 @@ mod tests {
     fn an_oversized_body_is_refused_not_truncated() {
         let mut tiny = [0u8; 8];
         let o = OrderWire::new(0, true, 50_000_000, 100_000_000, Tif::Gtc);
-        assert_eq!(order_json(&mut tiny, &[o], b"na"), Err(MsgPackErr::Overflow));
+        assert_eq!(
+            order_json(&mut tiny, &[o], b"na"),
+            Err(MsgPackErr::Overflow)
+        );
         assert_eq!(
             envelope(&mut tiny, b"{}", 1, &[0u8; 65], None, None),
             Err(MsgPackErr::Overflow)
@@ -464,5 +660,24 @@ mod tests {
 
         assert_eq!(&a[..a_len], &b[..b_len]);
         assert!(a[..a_len].starts_with(b"{\"action\":{\"type\":\"order\""));
+    }
+
+    /// XMM XH5d: the ALO priority grouping renders as an object, a named
+    /// one as a string — the rest of the body the same.
+    #[test]
+    fn the_priority_grouping_is_an_object_a_named_one_a_string() {
+        let o = OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Alo);
+        let mut a = [0u8; 512];
+        let mut b = [0u8; 512];
+        let na = order_json(&mut a, &[o], b"na").unwrap();
+        let pr = order_json_grouped(&mut b, &[o], Grouping::Priority(10_000)).unwrap();
+        let sa = std::str::from_utf8(&a[..na]).unwrap();
+        let sb = std::str::from_utf8(&b[..pr]).unwrap();
+        assert!(sa.ends_with(r#"],"grouping":"na"}"#), "{sa}");
+        assert!(sb.ends_with(r#"],"grouping":{"p":10000}}"#), "{sb}");
+        assert_eq!(
+            sa.split(r#"],"grouping""#).next(),
+            sb.split(r#"],"grouping""#).next()
+        );
     }
 }

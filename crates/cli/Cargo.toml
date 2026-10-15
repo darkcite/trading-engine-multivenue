@@ -34,9 +34,14 @@ opt-registry         = { workspace = true }
 engine               = { workspace = true }
 engine-snapshot      = { workspace = true }
 strategy-core        = { workspace = true }
-strategy-latency-arb = { workspace = true }
+# HYPARB H3b: the HyperEVM pool-event ingress.
+ingress-hyperevm     = { workspace = true }
+# HYPARB H2/H3b: the pool-event codec (bounds shared with the universe).
+core-amm             = { workspace = true }
 strategy-ev          = { workspace = true }
 strategy-bin15       = { workspace = true }
+# HYPARB H5: the slot-0 member's params, built by `hyparb_boot`.
+strategy-hyparb      = { workspace = true }
 strategy-rule-tree   = { workspace = true }
 strategy-icdp        = { workspace = true }
 strategy-set         = { workspace = true }
@@ -45,14 +50,29 @@ strategy-set         = { workspace = true }
 strategy-vm          = { workspace = true }
 strategy-vrp         = { workspace = true }
 strategy-xsd         = { workspace = true }
+# XMM XH1: the slot-6 member's params, built by `xmm_boot`.
+strategy-xmm         = { workspace = true }
+# HC11: the slot-7 member (Hypercall S1 — DARK, paper only).
+strategy-hcv         = { workspace = true }
 core-crypto          = { workspace = true }
 research-artifacts   = { workspace = true }
 clob-dispatcher      = { workspace = true }
 exec-router          = { workspace = true }
-# E3: the `exec-smoke` arm — the TESTNET-ONLY signature gate. This is
-# the crate's ONLY caller in the binary; the engine's dispatch path
-# does not reach it (LIVE_ARM_VENUES is empty and asserted so).
+# E3: the `exec-smoke` arm (the TESTNET-ONLY signature gate); since E7
+# also the engine's live Hyperliquid arm (`HlExchange`, LIVE_ARM_VENUES)
+# and HYPARB L5's hedge leg.
 exec-hyperliquid     = { workspace = true }
+# HC9 (O-HC19): the Hypercall order arm, driven by the `hypercall-live`
+# operator verbs (the engine does not arm it before slot 7's ruling).
+exec-hypercall       = { workspace = true }
+# HYPARB H8: the HyperEVM write path, TESTNET ONLY (O-H5) — the shadow of
+# each paper AMM decision (O-H12) and the `evm-testnet` operator verbs.
+exec-hyperevm        = { workspace = true }
+# BX6: the engine's live Binance arm (`BnArm` + its gateway thread;
+# LIVE_ARM_VENUES), USDⓈ-M × classic.
+exec-binance         = { workspace = true }
+signer-eip712        = { workspace = true }
+zeroize              = { workspace = true }
 book-builder         = { workspace = true }
 core-metrics         = { workspace = true }
 core-latency         = { workspace = true }
@@ -62,6 +82,9 @@ ingress-binance      = { workspace = true }
 ingress-okx          = { workspace = true }
 ingress-deribit      = { workspace = true }
 ingress-bybit        = { workspace = true }
+ingress-mexc         = { workspace = true }
+# HC4: the Hypercall boot discovery (HC5: the ingress spawn).
+ingress-hypercall    = { workspace = true }
 ingress-hyperliquid  = { workspace = true }
 ingress-rpc          = { workspace = true }
 ingress-ai           = { workspace = true }
@@ -74,6 +97,20 @@ rustls-pki-types     = { workspace = true }
 libc                 = "0.2"
 
 [dev-dependencies]
+# HYPARB H8: the scripted JSON-RPC node the shadow tests run against.
+exec-hyperevm        = { workspace = true, features = ["testnode"] }
+# BX3 (O-BX20): `HlConfig::with_port` — the real Hyperliquid arm in front
+# of a scripted TLS venue (tests/exec_composition_loopback.rs). Test-only:
+# resolver 2 turns it on only in builds that build the dev-dependencies
+# (`cargo test`), so `cargo build` of the engine never has it, and no
+# code outside tests calls `with_port`. XMM XH4g: `testvenue`, the
+# scripted rustls Hyperliquid the battery's loopback test runs against
+# (tests/xmm_battery_loopback.rs) — test-only the same way.
+exec-hyperliquid     = { workspace = true, features = ["loopback", "testvenue"] }
+# BX3: the scripted venue's self-signed certificate.
+rcgen                = { workspace = true }
+# XMM XH4f: the sweep word the composition test's scripted gateway end sets.
+exec-gateway         = { workspace = true }
 # core-crypto moved to [dependencies] with the 8h backtest harness —
 # ruleset_engine_wiring keeps hashing artifacts through it unchanged.
 # backtest_harness merge ordering proptests (8h design §12).

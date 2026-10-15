@@ -29,19 +29,21 @@
 //!
 //! ## Layout
 //!
-//! `#[repr(C, align(64))]`, 640 bytes = ten cache lines, with
+//! `#[repr(C, align(64))]`, 832 bytes = thirteen cache lines, with
 //! **both hot arrays in the first 16 bytes** so the per-submit lookup
 //! touches one line and never pointer-chases; the E6 clamps sit on
-//! lines 2–4 and the halt thresholds on lines 5–10, none of which a
-//! paper submit ever reads. (512 B until E7's session bound grew
-//! `HaltLimits` 32 → 48 B; the halt table is read on the halt poll,
-//! never per submit, so the two extra lines cost nothing hot.)
+//! lines 2–4, the halt thresholds on lines 5–11 and XH4e's perp limits
+//! on lines 12–13, none of which a paper submit ever reads. (512 B until
+//! E7's session bound grew `HaltLimits` 32 → 48 B, 640 B until XH4d's
+//! ALO threshold grew it to 56 B, 704 B until XH4e's `PerpLimits`; the
+//! halt table is read on the halt poll and the perp limits on a live
+//! order only, so the extra lines cost nothing hot.)
 
 use crate::mode::ExecMode;
 
 /// Strategy slots the table covers. Matches `strategy_set`'s slot
-/// count (0 latency-arb · 1 vrp · 2 xsd · 3 bin15 · 4 ai-exec ·
-/// 5 vm · 6 icdp · 7 reserved) and is a power of two so the
+/// count (0 hyparb · 1 vrp · 2 xsd · 3 bin15 · 4 ai-exec ·
+/// 5 vm · 6 xmm · 7 reserved) and is a power of two so the
 /// range mask is a single `&`.
 pub const EXEC_SLOTS: usize = 8;
 
@@ -54,11 +56,16 @@ pub const EXEC_SLOTS: usize = 8;
 const _: () = assert!(EXEC_SLOTS.is_power_of_two());
 const _: () = assert!(EXEC_SLOTS <= u8::MAX as usize + 1);
 
-/// Venues a `venue_mask` byte can express — `core_types::VenueId` is
-/// 0..=6 today (Polymarket · Binance · Okx · Deribit · Hyperliquid ·
-/// Ai · Bybit), so one `u8` covers the domain with a bit to spare.
-/// A `venue` byte at or above this fails closed (not allowed).
-pub const EXEC_VENUES: u8 = 8;
+/// Venues a `venue_mask` word can express. `core_types::VenueId` is
+/// 0..=8 since HYPARB (O-H11: … · Bybit · Mexc · HyperEvm), which
+/// overflowed the original `u8` mask — `mask >> (venue & 7)` would have
+/// aliased venue 8 onto 0 (Polymarket). The mask is a `u16` and this is
+/// 16: a power of two, so the masked shift below stays a single `&`,
+/// with seven venues of headroom. A `venue` byte at or above this fails
+/// closed (not allowed).
+pub const EXEC_VENUES: u8 = 16;
+const _: () = assert!((EXEC_VENUES as u32).is_power_of_two() && EXEC_VENUES as u32 <= u16::BITS);
+const _: () = assert!(core_types::VENUE_COUNT <= EXEC_VENUES as usize);
 
 /// Why a slot could not be written into the table. Boot-time only.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -67,6 +74,9 @@ pub enum ExecRouteErr {
     SlotOutOfRange(usize),
     /// A venue byte at or above [`EXEC_VENUES`].
     VenueOutOfRange(u8),
+    /// XH4e: a slot's perp limits set one clamp and not the other, or a
+    /// negative one — a perp slot is judged by both, or it is none.
+    PerpLimitsPartial(usize),
 }
 
 impl core::fmt::Display for ExecRouteErr {
@@ -77,6 +87,9 @@ impl core::fmt::Display for ExecRouteErr {
             }
             ExecRouteErr::VenueOutOfRange(v) => {
                 write!(f, "venue id {v} is out of range (0..{EXEC_VENUES})")
+            }
+            ExecRouteErr::PerpLimitsPartial(s) => {
+                write!(f, "slot {s}'s perp limits must set both clamps or neither")
             }
         }
     }
@@ -192,7 +205,15 @@ pub struct HaltLimits {
     /// E7 session bound: spot-USDC loss under the anchor, USD ×1e6,
     /// at which the slot halts (judged flat only). `0` = no bound.
     pub pnl_loss_usd_1e6: i64,
+    /// XH4d, XH-7: post-only crosses among the arm's last ALO answers,
+    /// permille, at which the slot halts. `0` = off (XH4f maps
+    /// `halt_on_alo_reject_pct` here, ×10).
+    pub alo_reject_permille: u16,
+    /// Explicit padding.
+    _pad: [u8; 6],
 }
+
+const _: () = assert!(core::mem::size_of::<HaltLimits>() == 56);
 
 impl HaltLimits {
     /// Every threshold unset. Usable in `const`.
@@ -207,6 +228,8 @@ impl HaltLimits {
             asset_refusal_streak: 0,
             pnl_gain_usd_1e6: 0,
             pnl_loss_usd_1e6: 0,
+            alo_reject_permille: 0,
+            _pad: [0; 6],
         }
     }
 
@@ -229,6 +252,8 @@ impl HaltLimits {
             asset_refusal_streak,
             pnl_gain_usd_1e6: 0,
             pnl_loss_usd_1e6: 0,
+            alo_reject_permille: 0,
+            _pad: [0; 6],
         }
     }
 
@@ -240,6 +265,68 @@ impl HaltLimits {
         self.pnl_gain_usd_1e6 = gain_usd_1e6;
         self.pnl_loss_usd_1e6 = loss_usd_1e6;
         self
+    }
+
+    /// XH4d, XH-7: halt at `permille` post-only crosses among the arm's
+    /// last ALO answers; `0` = off.
+    #[inline]
+    #[must_use]
+    pub const fn with_alo_reject_permille(mut self, permille: u16) -> Self {
+        self.alo_reject_permille = permille;
+        self
+    }
+}
+
+/// **XH4e — a perp slot's two extra clamps** (plan §8.8), USD ×1e6,
+/// `0` = unset.
+///
+/// A slot that sets both is a **perp slot** ([`ExecRoute::set_perp_limits`]
+/// refuses one without the other): every order must be on a bound linear
+/// instrument row (never the HIP-4 family clamps), and while any linear
+/// row holds a position of the slot that no mark prices, only exits pass
+/// (XH2-C). A slot that sets neither — every slot but a maker on perps —
+/// is judged exactly as before. 16 B; the table's eight are its last two
+/// lines.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PerpLimits {
+    /// Per-perp inventory: the position plus every order working on the
+    /// order's side plus the order, at the higher of the limit and the
+    /// mark (`Ledger::probe_perp`).
+    pub cap_perp_usd_1e6: i64,
+    /// The slot's resting notional: Σ remaining × limit over its working
+    /// orders (`Ledger::resting_usd_1e6`).
+    pub max_resting_usd_1e6: i64,
+}
+
+const _: () = assert!(core::mem::size_of::<PerpLimits>() == 16);
+
+impl PerpLimits {
+    /// Both clamps unset: not a perp slot. Usable in `const`.
+    #[inline]
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            cap_perp_usd_1e6: 0,
+            max_resting_usd_1e6: 0,
+        }
+    }
+
+    /// A perp slot's two clamps.
+    #[inline]
+    #[must_use]
+    pub const fn new(cap_perp_usd_1e6: i64, max_resting_usd_1e6: i64) -> Self {
+        Self {
+            cap_perp_usd_1e6,
+            max_resting_usd_1e6,
+        }
+    }
+
+    /// Whether the slot is a perp slot: either clamp set.
+    #[inline]
+    #[must_use]
+    pub const fn is_set(&self) -> bool {
+        self.cap_perp_usd_1e6 > 0 || self.max_resting_usd_1e6 > 0
     }
 }
 
@@ -254,7 +341,7 @@ pub struct ExecRoute {
     /// Index = `strategy_id`. Bit `i` set = the slot may trade
     /// `VenueId(i)`. **Hot.** Only consulted on the `Live` arm: a
     /// paper slot's venue is the paper matcher's business.
-    venue_mask: [u8; EXEC_SLOTS],
+    venue_mask: [u16; EXEC_SLOTS],
     /// Per-slot single-order notional clamp, USD x1e6. Carried by E1
     /// for the boot tell and `/state`; **enforced in E6** (the risk
     /// gate), which is the phase that owns clamping.
@@ -266,7 +353,8 @@ pub struct ExecRoute {
     cap_instance_usd_1e6: [i64; EXEC_SLOTS],
     /// **E6** — per-slot day clamp, USD x1e6, filled buy turnover.
     cap_day_usd_1e6: [i64; EXEC_SLOTS],
-    /// Pad the clamp fields (240 B) to a whole number of lines
+    /// Pad the hot arrays + clamp fields (248 B since HYPARB widened
+    /// `venue_mask` to `u16`; 240 B before) to a whole number of lines
     /// (256 B, four of them), so the halt table that follows starts
     /// on a line boundary — which this field only achieves by sitting
     /// BEFORE `halts`; an earlier layout declared it after and the
@@ -278,11 +366,18 @@ pub struct ExecRoute {
     /// line, and the E6 clamps — read only on the live arm, after the
     /// mode branch has already resolved — sit on lines 2 and 3 where
     /// a paper boot never touches them.
-    _pad: [u8; 16],
-    /// **E6 commit 3** — per-slot halt thresholds. 48 B each (32 B
-    /// before E7's session bound), eight of them: lines 5–10.
+    _pad: [u8; 8],
+    /// **E6 commit 3** — per-slot halt thresholds. 56 B each (32 B
+    /// before E7's session bound, 48 B before XH4d's ALO threshold),
+    /// eight of them: lines 5–11.
     halts: [HaltLimits; EXEC_SLOTS],
+    /// **XH4e** — per-slot perp limits, 16 B each: lines 12–13.
+    perp: [PerpLimits; EXEC_SLOTS],
 }
+
+const _: () = assert!(core::mem::size_of::<ExecRoute>() == 832);
+const _: () = assert!(core::mem::offset_of!(ExecRoute, halts) == 256);
+const _: () = assert!(core::mem::offset_of!(ExecRoute, perp) == 704);
 
 impl Default for ExecRoute {
     #[inline]
@@ -300,13 +395,14 @@ impl ExecRoute {
     pub const fn all_paper() -> Self {
         Self {
             modes: [ExecMode::Paper as u8; EXEC_SLOTS],
-            venue_mask: [0u8; EXEC_SLOTS],
+            venue_mask: [0u16; EXEC_SLOTS],
             max_order_usd_1e6: [0i64; EXEC_SLOTS],
             max_open_orders: [0u32; EXEC_SLOTS],
             cap_instance_usd_1e6: [0i64; EXEC_SLOTS],
             cap_day_usd_1e6: [0i64; EXEC_SLOTS],
             halts: [HaltLimits::none(); EXEC_SLOTS],
-            _pad: [0u8; 16],
+            _pad: [0u8; 8],
+            perp: [PerpLimits::none(); EXEC_SLOTS],
         }
     }
 
@@ -329,14 +425,14 @@ impl ExecRoute {
         if slot >= EXEC_SLOTS {
             return Err(ExecRouteErr::SlotOutOfRange(slot));
         }
-        let mut mask = 0u8;
+        let mut mask = 0u16;
         let mut i = 0usize;
         while i < venues.len() {
             let v = venues[i];
             if v >= EXEC_VENUES {
                 return Err(ExecRouteErr::VenueOutOfRange(v));
             }
-            mask |= 1u8 << v;
+            mask |= 1u16 << v;
             i += 1;
         }
         self.modes[slot] = mode.as_u8();
@@ -385,9 +481,9 @@ impl ExecRoute {
         let venue_ok = (venue < EXEC_VENUES) as u8;
         // SAFETY: as in `mode` — `idx` is masked into range.
         let mask = unsafe { *self.venue_mask.get_unchecked(idx) };
-        // Masked shift: `venue & 7` is always a legal shift distance
-        // for u8, so no UB and no debug panic on a wild venue byte.
-        let bit = (mask >> (venue & (EXEC_VENUES - 1))) & 1;
+        // Masked shift: `venue & 15` is always a legal shift distance
+        // for u16, so no UB and no debug panic on a wild venue byte.
+        let bit = ((mask >> (venue & (EXEC_VENUES - 1))) & 1) as u8;
         (bit & slot_ok & venue_ok) == 1
     }
 
@@ -440,7 +536,7 @@ impl ExecRoute {
         }
         let mut i = 0usize;
         while i < EXEC_SLOTS {
-            if self.modes[i] == ExecMode::Live as u8 && self.venue_mask[i] & (1u8 << venue) != 0 {
+            if self.modes[i] == ExecMode::Live as u8 && self.venue_mask[i] & (1u16 << venue) != 0 {
                 return true;
             }
             i += 1;
@@ -451,7 +547,7 @@ impl ExecRoute {
     /// The slot's venue bitmask. Cold; boot tell + `/state`.
     #[inline]
     #[must_use]
-    pub fn venue_mask_at(&self, slot: usize) -> Option<u8> {
+    pub fn venue_mask_at(&self, slot: usize) -> Option<u16> {
         if slot >= EXEC_SLOTS {
             return None;
         }
@@ -527,6 +623,35 @@ impl ExecRoute {
         Some(self.halts[slot])
     }
 
+    /// **XH4e** — write one slot's perp limits. Boot-only, cold,
+    /// bounds-checked, like [`Self::set_slot`]. Both clamps or neither: a
+    /// perp slot with one clamp silently off is refused.
+    ///
+    /// # Errors
+    /// [`ExecRouteErr::SlotOutOfRange`], [`ExecRouteErr::PerpLimitsPartial`].
+    pub fn set_perp_limits(&mut self, slot: usize, lim: PerpLimits) -> Result<(), ExecRouteErr> {
+        if slot >= EXEC_SLOTS {
+            return Err(ExecRouteErr::SlotOutOfRange(slot));
+        }
+        let none = lim.cap_perp_usd_1e6 == 0 && lim.max_resting_usd_1e6 == 0;
+        let both = lim.cap_perp_usd_1e6 > 0 && lim.max_resting_usd_1e6 > 0;
+        if !none && !both {
+            return Err(ExecRouteErr::PerpLimitsPartial(slot));
+        }
+        self.perp[slot] = lim;
+        Ok(())
+    }
+
+    /// **XH4e** — the slot's perp limits. Read on a live order.
+    #[inline]
+    #[must_use]
+    pub fn perp_at(&self, slot: usize) -> Option<PerpLimits> {
+        if slot >= EXEC_SLOTS {
+            return None;
+        }
+        Some(self.perp[slot])
+    }
+
     /// Is any slot live? Cold; decides whether the engine needs a live
     /// arm at all.
     #[inline]
@@ -541,10 +666,61 @@ mod tests {
     use super::*;
     use core_types::{STRATEGY_ID_NONE, STRATEGY_SLOT_BIN15};
 
+    /// XH4e: a perp slot is one that sets either clamp; the default table
+    /// has none, and an out-of-range slot is refused, never dropped.
     #[test]
-    fn layout_is_ten_cache_lines_with_the_hot_arrays_first() {
-        assert_eq!(core::mem::size_of::<ExecRoute>(), 640, "ten cache lines");
-        assert_eq!(core::mem::size_of::<HaltLimits>(), 48, "HaltLimits is 48 B (E7)");
+    fn perp_limits_are_per_slot_and_unset_by_default() {
+        let mut r = ExecRoute::all_paper();
+        let mut s = 0usize;
+        while s < EXEC_SLOTS {
+            assert!(!r.perp_at(s).unwrap().is_set());
+            s += 1;
+        }
+        r.set_perp_limits(6, PerpLimits::new(150_000_000, 300_000_000))
+            .unwrap();
+        assert!(r.perp_at(6).unwrap().is_set());
+        assert!(!r.perp_at(5).unwrap().is_set());
+        assert!(PerpLimits::new(0, 1).is_set() && PerpLimits::new(1, 0).is_set());
+        assert!(
+            !PerpLimits::new(-5, 0).is_set(),
+            "a negative number is no clamp"
+        );
+        assert_eq!(
+            r.set_perp_limits(EXEC_SLOTS, PerpLimits::none()),
+            Err(ExecRouteErr::SlotOutOfRange(EXEC_SLOTS))
+        );
+        assert_eq!(r.perp_at(EXEC_SLOTS), None);
+        // Both clamps or neither.
+        assert_eq!(
+            r.set_perp_limits(5, PerpLimits::new(150_000_000, 0)),
+            Err(ExecRouteErr::PerpLimitsPartial(5))
+        );
+        assert_eq!(
+            r.set_perp_limits(5, PerpLimits::new(-1, 300_000_000)),
+            Err(ExecRouteErr::PerpLimitsPartial(5))
+        );
+        assert!(!r.perp_at(5).unwrap().is_set(), "a refusal writes nothing");
+        assert_eq!(r.set_perp_limits(6, PerpLimits::none()), Ok(()));
+        assert!(!r.perp_at(6).unwrap().is_set());
+    }
+
+    #[test]
+    fn layout_is_thirteen_cache_lines_with_the_hot_arrays_first() {
+        assert_eq!(
+            core::mem::size_of::<ExecRoute>(),
+            832,
+            "thirteen cache lines"
+        );
+        assert_eq!(
+            core::mem::size_of::<PerpLimits>(),
+            16,
+            "PerpLimits is 16 B (XH4e)"
+        );
+        assert_eq!(
+            core::mem::size_of::<HaltLimits>(),
+            56,
+            "HaltLimits is 56 B (XH4d)"
+        );
         assert_eq!(core::mem::size_of::<SlotCaps>(), 32, "SlotCaps is 32 B");
         assert_eq!(core::mem::align_of::<ExecRoute>(), 64);
         assert_eq!(
@@ -559,7 +735,10 @@ mod tests {
         let modes = core::ptr::addr_of!(r.modes) as usize - base;
         let venues = core::ptr::addr_of!(r.venue_mask) as usize - base;
         assert!(modes + EXEC_SLOTS <= 64, "modes at {modes} spills line 0");
-        assert!(venues + EXEC_SLOTS <= 64, "venue_mask at {venues} spills line 0");
+        assert!(
+            venues + 2 * EXEC_SLOTS <= 64,
+            "venue_mask at {venues} spills line 0"
+        );
     }
 
     #[test]
@@ -643,11 +822,50 @@ mod tests {
     fn a_wild_venue_byte_never_panics_and_never_allows() {
         let mut r = ExecRoute::all_paper();
         r.set_slot(3, ExecMode::Live, &[4], SlotCaps::none(), HaltLimits::none()).unwrap();
-        // Bit 4 is set; without the `venue_ok` term, venue 12
-        // (12 & 7 == 4) would alias onto it.
+        // Bit 4 is set; without the `venue_ok` term, venue 20
+        // (20 & 15 == 4) would alias onto it.
         for v in EXEC_VENUES..=255 {
             assert!(!r.venue_allowed(3, v), "venue byte {v} must fail closed");
         }
+    }
+
+    /// HYPARB H9 pin: venue 8 (`HyperEvm`, O-H11) is its OWN bit. Under
+    /// the old `u8` mask `mask >> (8 & 7)` read bit 0 — Polymarket's —
+    /// so a slot live on Polymarket would have "allowed" HyperEVM and a
+    /// slot live on HyperEVM would have allowed Polymarket.
+    #[test]
+    fn venue_8_is_its_own_bit_and_never_aliases_onto_venue_0() {
+        let hyperevm = core_types::VenueId::HyperEvm as u8;
+        assert_eq!(hyperevm, 8);
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            3,
+            ExecMode::Live,
+            &[0],
+            SlotCaps::none(),
+            HaltLimits::none(),
+        )
+        .unwrap();
+        assert!(r.venue_allowed(3, 0));
+        assert!(
+            !r.venue_allowed(3, hyperevm),
+            "venue 0 live does not allow venue 8"
+        );
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            3,
+            ExecMode::Live,
+            &[hyperevm],
+            SlotCaps::none(),
+            HaltLimits::none(),
+        )
+        .unwrap();
+        assert!(r.venue_allowed(3, hyperevm));
+        assert!(
+            !r.venue_allowed(3, 0),
+            "venue 8 live does not allow venue 0"
+        );
+        assert_eq!(r.venue_mask_at(3), Some(1 << 8));
     }
 
     #[test]

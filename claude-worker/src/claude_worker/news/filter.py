@@ -65,6 +65,7 @@ VENUE_WORDS: tuple[str, ...] = (
     "deribit",
     "hyperliquid",
     "bybit",
+    "mexc",
     "polymarket",
     "kraken",
     "coinbase",
@@ -471,7 +472,7 @@ def is_unconditional(item: claude_worker.news.sources.Item) -> bool:
     return item.class_ != "C" or bool(item.venue)
 
 
-def tier0(  # noqa: PLR0913
+def tier0(
     item: claude_worker.news.sources.Item,
     *,
     vocab: Vocabulary,

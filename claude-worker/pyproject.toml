@@ -102,7 +102,27 @@ target-version = "py314"
 select = ["E", "F", "I", "PL", "RUF"]
 
 # ICN001 would force short aliases; we forbid aliasing too. Keep imports literal.
-ignore = []
+# PLR0402 (manual-from-import) asks for `from pkg import mod` in place of an
+# aliased import — the very form this codebase forbids (HK8).
+ignore = ["PLR0402"]
+
+# HK8: the deliberate unicode of the worker's prose — σ, ×, the minus sign and
+# the en dash — is notation, not a confusable.
+allowed-confusables = ["σ", "×", "−", "–"]
+
+[tool.ruff.lint.pylint]
+# HK8: a CEILING at today's worst un-annotated function (2026-10-13): no
+# function may grow past it without its own `# noqa` and reason (the larger
+# ones keep theirs). Lower each limit as the worst offender is split.
+max-args = 10
+max-positional-args = 10
+max-branches = 36
+max-returns = 21
+max-statements = 90
+# Integer literals in comparisons are the house style for field counts and
+# fixed-point scales (tests ignore PLR2004 outright); strings and bytes as
+# ruff's default.
+allow-magic-value-types = ["int", "str", "bytes"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 # Ban relative imports entirely.

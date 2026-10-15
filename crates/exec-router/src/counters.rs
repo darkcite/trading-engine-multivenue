@@ -32,6 +32,33 @@ pub enum RiskRefusal {
     Unseeded,
     /// The slot is halted. See `crate::halt`.
     Halted,
+    /// **BX3** — the instrument's law forbids the position the order
+    /// would open: a spot sell past the holding (no margin short), or a
+    /// short on an option the venue does not let this account write.
+    Short,
+    /// **BX3** — an order on a Binance instrument row that cannot be
+    /// priced under its law: a price at or below zero (spot, linear,
+    /// option; an inverse row is priced by its face and an exit is never
+    /// priced), a short option with no index yet (the venue's IM formula
+    /// needs one), or a Binance-routed order on an instrument no row was
+    /// bound for. Hyperliquid orders never reach it: their arm refuses a
+    /// non-positive price itself, as before. **XH4e:** also a perp slot's
+    /// order on an unbound id, and a perp slot's growing order while one
+    /// of its positions has no mark (XH2-C).
+    Unpriced,
+    /// **XH4e** — a perp slot's per-perp inventory, working orders
+    /// included (`PerpLimits::cap_perp_usd_1e6`).
+    CapPerp,
+    /// **XH4e** — a perp slot's resting notional
+    /// (`PerpLimits::max_resting_usd_1e6`).
+    MaxResting,
+    /// **XMM XH5a** — an order on a row another slot owns (slot 6's
+    /// gateway perps): one engine id has one row, which judges every
+    /// live slot's orders on it, so a second slot's order there would
+    /// read as the owner's drift and move its leverage. Closes the
+    /// runtime gap XH4h-2 recorded (ai-exec and vm pick their symbols
+    /// at runtime).
+    ForeignRow,
 }
 
 /// Router counters. `Copy` POD; every field saturates rather than
@@ -114,6 +141,18 @@ pub struct RouteCounters {
     /// contributes: it does not go through the risk gate at all, so a
     /// halted slot can always get flat.
     pub refused_halted: u64,
+    /// **BX3** — refused by an instrument law: a spot sell past the
+    /// holding, or a short on an option that is not writable.
+    pub refused_short: u64,
+    /// **BX3** — refused because the order could not be priced under its
+    /// instrument's law (see [`RiskRefusal::Unpriced`]).
+    pub refused_unpriced: u64,
+    /// **XH4e** — refused by a perp slot's per-perp inventory cap
+    /// ([`RiskRefusal::CapPerp`]). Published with slot 6's block (XH4f).
+    pub refused_cap_perp: u64,
+    /// **XH4e** — refused by a perp slot's resting-notional cap
+    /// ([`RiskRefusal::MaxResting`]). Published with slot 6's block (XH4f).
+    pub refused_max_resting: u64,
     /// **E7 review ruling** — cancels routed to the live arm from an
     /// `Off` slot. Not a refusal: `off` stops PLACING, and a cancel is
     /// the one verb that can only reduce risk, so it passes (the halt
@@ -130,6 +169,11 @@ pub struct RouteCounters {
     /// reads it for is "which slot is being refused"; the aggregate
     /// fields above say why.
     pub refused_by_slot: [u64; EXEC_SLOTS],
+    /// **XMM XH5a** — another slot's order refused on an owned row
+    /// ([`RiskRefusal::ForeignRow`]). Published with slot 6's block, the
+    /// rows' owner. Last, on a fifth line of its own: the per-slot arrays
+    /// keep their lines.
+    pub refused_foreign_row: u64,
 }
 
 impl RouteCounters {
@@ -149,9 +193,14 @@ impl RouteCounters {
             refused_open_orders: 0,
             refused_unseeded: 0,
             refused_halted: 0,
+            refused_short: 0,
+            refused_unpriced: 0,
+            refused_cap_perp: 0,
+            refused_max_resting: 0,
             cancel_on_off: 0,
             live_submits_by_slot: [0; EXEC_SLOTS],
             refused_by_slot: [0; EXEC_SLOTS],
+            refused_foreign_row: 0,
         }
     }
 
@@ -217,6 +266,11 @@ impl RouteCounters {
             RiskRefusal::OpenOrders => &mut self.refused_open_orders,
             RiskRefusal::Unseeded => &mut self.refused_unseeded,
             RiskRefusal::Halted => &mut self.refused_halted,
+            RiskRefusal::Short => &mut self.refused_short,
+            RiskRefusal::Unpriced => &mut self.refused_unpriced,
+            RiskRefusal::CapPerp => &mut self.refused_cap_perp,
+            RiskRefusal::MaxResting => &mut self.refused_max_resting,
+            RiskRefusal::ForeignRow => &mut self.refused_foreign_row,
         };
         *field = field.saturating_add(1);
         Self::bump_slot(&mut self.refused_by_slot, strategy_id);
@@ -243,17 +297,79 @@ impl RouteCounters {
     }
 }
 
+/// **BX3 (F9) — the retirements the router drained, by
+/// [`clob_dispatcher::Retired::why`].** One cache line: a bucket per
+/// defined code and the last for a code no arm should send. Written on
+/// the idle path only; read by `/metrics` and `/state`.
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetireCounters {
+    /// Index = `why`; [`clob_dispatcher::RETIRED_WHY_UNKNOWN`] counts
+    /// every undefined code.
+    pub by_why: [u64; clob_dispatcher::RETIRED_WHY_SLOTS],
+}
+
+impl RetireCounters {
+    /// Count one retirement.
+    #[inline]
+    pub fn count(&mut self, why: u8) {
+        let i = if why <= clob_dispatcher::RETIRED_FILLED {
+            why as usize
+        } else {
+            clob_dispatcher::RETIRED_WHY_UNKNOWN
+        };
+        self.by_why[i] = self.by_why[i].saturating_add(1);
+    }
+
+    /// Every retirement drained.
+    #[inline]
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        let mut t = 0u64;
+        let mut i = 0usize;
+        while i < clob_dispatcher::RETIRED_WHY_SLOTS {
+            t = t.saturating_add(self.by_why[i]);
+            i += 1;
+        }
+        t
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<RetireCounters>() == 64);
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use core_types::STRATEGY_ID_NONE;
 
     #[test]
+    fn retirements_count_by_why_and_an_undefined_code_is_unknown() {
+        let mut c = RetireCounters::default();
+        c.count(clob_dispatcher::RETIRED_EXPIRED);
+        c.count(clob_dispatcher::RETIRED_EXPIRED);
+        c.count(clob_dispatcher::RETIRED_FILLED);
+        c.count(6);
+        c.count(255);
+        assert_eq!(c.by_why[clob_dispatcher::RETIRED_EXPIRED as usize], 2);
+        assert_eq!(c.by_why[clob_dispatcher::RETIRED_FILLED as usize], 1);
+        assert_eq!(
+            c.by_why[6], 0,
+            "6 is undefined: it lands in the unknown bucket"
+        );
+        assert_eq!(c.by_why[clob_dispatcher::RETIRED_WHY_UNKNOWN], 2);
+        assert_eq!(c.total(), 5);
+    }
+
+    #[test]
     fn counters_are_cache_line_aligned() {
         assert_eq!(core::mem::align_of::<RouteCounters>(), 64);
-        // Four lines: 12 aggregates + two per-slot arrays of 8 = 28
-        // u64 = 224 B, rounded up. Growing past 256 is a decision.
-        assert_eq!(core::mem::size_of::<RouteCounters>(), 256);
+        // Four lines were full (16 aggregates + two per-slot arrays of 8 =
+        // 32 u64 = 256 B; XH4e's XH2-C refusals shared `refused_unpriced`
+        // rather than grow it). XMM XH5a grew it to FIVE on purpose: the
+        // foreign-row refusal is its own operator action (folded into
+        // another clamp's count it would send the operator to the wrong
+        // number), and it takes a cold fifth line after the arrays.
+        assert_eq!(core::mem::size_of::<RouteCounters>(), 320);
     }
 
     #[test]

@@ -38,14 +38,14 @@ use std::io;
 
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{
-    constant_time_eq, expected_accept, queue_masked_text_frame, read_server_handshake,
+    constant_time_eq, expected_accept, queue_masked_text_frame_rendered, read_server_handshake,
     sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
-    ws_unmask_in_place, ws_write_ping, ws_write_pong, HandshakeResult, IoBuf, Keepalive,
-    KeepaliveAction, Status, Transport, WsOpcode, WsReadResult,
+    ws_unmask_in_place, ws_write_ping, ws_write_pong, Drained, HandshakeResult, IoBuf, Keepalive,
+    KeepaliveAction, RxFill, Status, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock};
-use core_types::{Capture, NsTs, SymbolId, Tick, TICK_FLAG_STALE};
+use core_types::{ArrivalSeq, Capture, NsTs, SymbolId, Tick, TICK_FLAG_STALE};
 
 use crate::{
     classify, parse_book_update, parse_price_change_row, scan_venue_time_ms, FrameKind,
@@ -61,13 +61,19 @@ pub const RX_BUF_SIZE: usize = 64 * 1024;
 
 /// Size of the tx byte buffer. Holds the handshake, pong replies and
 /// the market subscribe — which since M1 multi-market can carry up to
-/// [`crate::PM_SUBSCRIBE_IDS_MAX`] ids (≈ 10.7 KiB payload worst
-/// case, plus WS framing), so 16 KiB.
+/// [`crate::PM_SUBSCRIBE_IDS_MAX`] ids ([`SUB_PAYLOAD_MAX`]). The worst
+/// case fits — const-asserted where the subscribe is queued (HK3).
 pub const TX_BUF_SIZE: usize = 16 * 1024;
 
-/// Worst-case market-subscribe payload: every id maximal, full cap.
-/// `{"assets_ids":[…]}` envelope + 128 × (80 + 3) bytes < 11 KiB.
-const SUBSCRIBE_SCRATCH: usize = 11 * 1024;
+/// The handshake's allowance in the tx budget (the MEXC shape).
+const HANDSHAKE_TX_MAX: usize = 1024;
+
+/// The longest market subscribe payload (`crate::render_market_subscribe`):
+/// the envelope, then every id at [`crate::PM_ASSET_ID_MAX`] with its
+/// quotes and comma — 10 657 B at [`crate::PM_SUBSCRIBE_IDS_MAX`] = 128
+/// (HK3).
+pub const SUB_PAYLOAD_MAX: usize = br#"{"assets_ids":[],"type":"market"}"#.len()
+    + crate::PM_SUBSCRIBE_IDS_MAX * (br#","""#.len() + crate::PM_ASSET_ID_MAX);
 
 /// Compile-time guard that the tick-ring capacity is a power of two.
 /// Ring construction itself checks this, but we restate it here because
@@ -114,7 +120,11 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 
 impl SymbolMap {
     /// Build a map from `(asset_id, sym_id)` pairs. Allocation
-    /// happens once here at boot; `lookup` is zero-alloc.
+    /// happens once here at boot; `lookup` is zero-alloc. A row
+    /// indexes the driver's per-asset sequencer (HK31), so the map
+    /// holds at most [`crate::PM_SUBSCRIBE_IDS_MAX`] pairs — the
+    /// subscribe's cap, which the cli validates upstream (debug-asserted;
+    /// [`Driver::new_multi`] keeps the same first ids).
     pub fn from_pairs<I>(pairs: I) -> Self
     where
         I: IntoIterator<Item = (Vec<u8>, SymbolId)>,
@@ -128,6 +138,13 @@ impl SymbolMap {
                 sym,
             });
         }
+        debug_assert!(
+            out.len() <= crate::PM_SUBSCRIBE_IDS_MAX,
+            "polymarket symbol map holds at most {} ids",
+            crate::PM_SUBSCRIBE_IDS_MAX
+        );
+        out.truncate(crate::PM_SUBSCRIBE_IDS_MAX);
+        hashes.truncate(crate::PM_SUBSCRIBE_IDS_MAX);
         Self {
             entries: out.into_boxed_slice(),
             hashes: hashes.into_boxed_slice(),
@@ -137,9 +154,11 @@ impl SymbolMap {
     /// O(N) lookup with hash pre-filter. Hash-mismatch entries are
     /// skipped on a single `u64` compare; on hash hit we still
     /// verify the full asset_id to handle the (negligible) FNV
-    /// collision case.
+    /// collision case. Returns the asset's row — below
+    /// [`crate::PM_SUBSCRIBE_IDS_MAX`], the index of its sequencer
+    /// (HK31) — and its engine symbol.
     #[inline]
-    pub fn lookup(&self, asset_id: &[u8]) -> Option<SymbolId> {
+    pub fn lookup(&self, asset_id: &[u8]) -> Option<(usize, SymbolId)> {
         let target = fnv1a_64(asset_id);
         let n = self.hashes.len();
         let mut i = 0usize;
@@ -147,7 +166,7 @@ impl SymbolMap {
             if self.hashes[i] == target {
                 let e = &self.entries[i];
                 if e.asset_id.as_ref() == asset_id {
-                    return Some(e.sym);
+                    return Some((i, e.sym));
                 }
             }
             i += 1;
@@ -239,6 +258,12 @@ pub struct Driver {
     /// Reset on reconnect; threshold = venue default or
     /// `--stale-after-ms pm:<ms>` via [`Self::set_stale_after_ms`].
     feed_clock: FeedClock,
+    /// HK31: each mapped asset's arrival sequencer (the venue_seq law,
+    /// crate docs; the shared [`ArrivalSeq`] since HK32), indexed by its
+    /// [`SymbolMap`] row. Its ordinal is process-lifetime, so it never
+    /// falls under a book; its clock is per connection
+    /// ([`Self::reset_for_reconnect`]).
+    asset_seq: [ArrivalSeq; crate::PM_SUBSCRIBE_IDS_MAX],
     /// `!Sync` marker — keeps `Driver: Send` but blocks `&Driver`
     /// from crossing threads.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
@@ -269,20 +294,12 @@ impl Driver {
         );
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
-        let mut id_bufs = [[0u8; crate::PM_ASSET_ID_MAX]; crate::PM_SUBSCRIBE_IDS_MAX];
-        let mut id_lens = [0u8; crate::PM_SUBSCRIBE_IDS_MAX];
         let count = ids.len().min(crate::PM_SUBSCRIBE_IDS_MAX);
-        for i in 0..count {
-            debug_assert!(
-                !ids[i].is_empty() && ids[i].len() <= crate::PM_ASSET_ID_MAX,
-                "polymarket asset id must be 1..={} bytes",
-                crate::PM_ASSET_ID_MAX
-            );
-            let len = ids[i].len().min(crate::PM_ASSET_ID_MAX);
-            id_bufs[i][..len].copy_from_slice(&ids[i][..len]);
-            id_lens[i] = len as u8;
-        }
-        Self {
+        // COPY: the 12 584 B driver (its id table inline) returns by value,
+        // once per connection at boot — rejected: a two-phase in-place init
+        // behind `&mut` (every constructor split, for a boot-only cost). The
+        // id table itself is filled in place below, never built beside it.
+        let mut d = Self {
             state: State::Connecting,
             rx: IoBuf::with_capacity(RX_BUF_SIZE),
             tx: IoBuf::with_capacity(TX_BUF_SIZE),
@@ -290,13 +307,32 @@ impl Driver {
             expected_accept_val: accept,
             last_activity_ns: 0,
             mask_counter: 0,
-            asset_ids: id_bufs,
-            asset_id_lens: id_lens,
+            asset_ids: [[0u8; crate::PM_ASSET_ID_MAX]; crate::PM_SUBSCRIBE_IDS_MAX],
+            asset_id_lens: [0u8; crate::PM_SUBSCRIBE_IDS_MAX],
             asset_id_count: count as u16,
             subscribed: false,
             feed_clock: FeedClock::new(core_types::VenueId::Polymarket.default_stale_after_ms()),
+            asset_seq: [ArrivalSeq::ZERO; crate::PM_SUBSCRIBE_IDS_MAX],
             _not_sync: ::core::marker::PhantomData,
+        };
+        let mut i = 0usize;
+        while i < count {
+            debug_assert!(
+                !ids[i].is_empty() && ids[i].len() <= crate::PM_ASSET_ID_MAX,
+                "polymarket asset id must be 1..={} bytes",
+                crate::PM_ASSET_ID_MAX
+            );
+            let len = ids[i].len().min(crate::PM_ASSET_ID_MAX);
+            // COPY: each ≤ 80 B CLOB token id into the driver's id table (≤ 128 ids,
+            // ≤ 10 240 B), once at boot — the driver re-sends them in every
+            // connection's market subscribe — rejected: a lifetime on `Driver`
+            // (threaded through drive_one, the run loop, the spawn wrapper and the alloc
+            // gate) to borrow the boot's id list.
+            d.asset_ids[i][..len].copy_from_slice(&ids[i][..len]);
+            d.asset_id_lens[i] = len as u8;
+            i += 1;
         }
+        d
     }
 
     /// VT2: override the staleness threshold (operator
@@ -337,6 +373,14 @@ impl Driver {
         self.subscribed = false;
         // VT2: a new connection is a new offset; the threshold stays.
         self.feed_clock.reset();
+        // HK31: every asset's ordinal stays, so it stays monotone and no
+        // book sees it fall; its clock is zeroed, so a reconnect clears a
+        // clock a far-future stamp poisoned. Safe: rx was cleared above and
+        // the old socket is gone, so no frame of the old connection can
+        // follow — the first per asset is the new subscribe snapshot,
+        // stamped with the book's last-change time, i.e. the current
+        // state, and it applies.
+        ArrivalSeq::reset_clocks(&mut self.asset_seq);
     }
 }
 
@@ -346,9 +390,10 @@ impl Driver {
 
 /// Pump the transport once and consume any buffered frames.
 ///
-/// Zero-alloc once the handshake has completed. Returns `Ok(true)` if
-/// the caller should reregister with mio (because [`Transport::interest`]
-/// may have shifted); `Ok(false)` if readiness is unchanged.
+/// Zero-alloc once the handshake has completed. Returns `Ok(true)` when
+/// this step's read stopped on a full rx ([`RxFill::Full`]): input may
+/// still wait below it, so the caller drives again
+/// ([`core_net::drain`]).
 ///
 /// * `transport`: any [`Transport`] implementation.
 /// * `drv`: per-connection driver state.
@@ -372,12 +417,12 @@ pub fn drive_one<T: Transport, C: Capture>(
     symbol_map: &SymbolMap,
     status: &IngressStatus,
     capture: &mut C,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     // 1. Flush any pending outbound bytes.
     flush_tx(transport, drv)?;
 
     // 2. Read whatever plaintext the transport has for us.
-    fill_rx(transport, drv)?;
+    let fill = core_net::fill_rx(transport, &mut drv.rx)?;
 
     // 3. Advance the state machine.
     match drv.state {
@@ -400,10 +445,40 @@ pub fn drive_one<T: Transport, C: Capture>(
         State::Closed => {}
     }
 
+    // HK2: an EOF closes the session only now — the frames that arrived
+    // with the FIN were parsed above — and nothing is flushed to a peer
+    // that has closed.
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+        return Ok(false);
+    }
+
     // 4. Push any bytes the state machine produced (handshake, pong,
     //    close-ack, ...) out onto the wire.
     flush_tx(transport, drv)?;
-    Ok(())
+    Ok(fill == RxFill::Full)
+}
+
+/// I-3 ([`core_net::drain`]): drive the connection until a step makes no
+/// progress — its read did not stop on a full rx, it published no tick,
+/// its state held — or [`core_net::DRAIN_STEP_CAP`] steps have run.
+#[allow(clippy::too_many_arguments)]
+fn drive_until_idle<T: Transport, C: Capture>(
+    transport: &mut T,
+    drv: &mut Driver,
+    host: &[u8],
+    path: &[u8],
+    producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
+    symbol_map: &SymbolMap,
+    status: &IngressStatus,
+    capture: &mut C,
+) -> Drained {
+    core_net::drain_until_idle!(
+        step: drive_one(transport, drv, host, path, producer, symbol_map, status, capture),
+        published: producer.published(),
+        key: drv.state(),
+        closed: drv.state() == State::Closed,
+    )
 }
 
 /// Transition the driver from `Connecting` → `NeedsWsWrite` once the
@@ -448,31 +523,11 @@ fn flush_tx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()>
     Ok(())
 }
 
-fn fill_rx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> {
-    loop {
-        if drv.rx.free_mut().is_empty() {
-            // rx is full — nothing to do until the consumer drains it.
-            break;
-        }
-        let result = transport.read(drv.rx.free_mut());
-        match result {
-            Ok(0) => {
-                drv.state = State::Closed;
-                break;
-            }
-            Ok(n) => drv.rx.advance(n),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
 /// Queue the market-channel subscribe for the configured assets —
 /// the venue sends nothing until it arrives (8d live fix; see
-/// [`crate::write_market_subscribe_multi`]). One frame lists every
-/// configured id (M1 multi-market). Runs exactly once per
-/// connection, on the upgrade→Steady edge.
+/// [`crate::render_market_subscribe`]). One frame lists every
+/// configured id (M1 multi-market), rendered straight into tx.
+/// Runs exactly once per connection, on the upgrade→Steady edge.
 // Doctrine: raw indices, not iterator adapters (CLAUDE.md hot-path rules;
 // `i` indexes three parallel fixed arrays).
 #[allow(clippy::needless_range_loop)]
@@ -486,10 +541,18 @@ fn queue_market_subscribe(drv: &mut Driver) -> io::Result<()> {
     for i in 0..count {
         refs[i] = &drv.asset_ids[i][..drv.asset_id_lens[i] as usize];
     }
-    let mut scratch = [0u8; SUBSCRIBE_SCRATCH];
-    let n = crate::write_market_subscribe_multi(&mut scratch, &refs[..count])
-        .ok_or_else(|| io::Error::other("polymarket: bad asset ids for subscribe"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
+    let ids = &refs[..count];
+    if !crate::market_subscribe_ids_valid(ids) {
+        return Err(io::Error::other("polymarket: bad asset ids for subscribe"));
+    }
+    // HK3: the handshake, the worst market subscribe and its frame header
+    // fit in tx together.
+    const {
+        assert!(HANDSHAKE_TX_MAX + SUB_PAYLOAD_MAX + core_net::WS_CLIENT_HDR_MAX <= TX_BUF_SIZE);
+    };
+    queue_masked_text_frame_rendered(&mut drv.tx, &mut drv.mask_counter, |p| {
+        crate::render_market_subscribe(p, ids)
+    })?;
     drv.subscribed = true;
     Ok(())
 }
@@ -547,7 +610,7 @@ fn drain_ws_frames<C: Capture>(
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
         match read_result {
-            WsReadResult::Incomplete => return Ok(()),
+            WsReadResult::Incomplete => return core_net::incomplete_frame(&mut drv.rx),
             WsReadResult::Malformed => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -587,18 +650,14 @@ fn drain_ws_frames<C: Capture>(
                         // frame per RFC 6455 §5.3.
                         let mask = ws_mask_from_counter(drv.mask_counter);
                         drv.mask_counter = drv.mask_counter.wrapping_add(1);
-                        let payload_start = payload.start;
-                        let payload_end = payload.end;
-                        let payload_len = payload_end - payload_start;
-                        // Split-borrow: copy payload into a small stack
-                        // scratch so we can hand &mut drv.tx.free_mut()
-                        // into the writer without aliasing rx.
-                        let mut scratch = [0u8; 125];
-                        debug_assert!(payload_len <= scratch.len());
-                        scratch[..payload_len]
-                            .copy_from_slice(&drv.rx.filled()[payload_start..payload_end]);
-                        let dst = drv.tx.free_mut();
-                        if let Ok(n) = ws_write_pong(dst, &scratch[..payload_len], mask) {
+                        // The echo goes straight from rx into tx (disjoint
+                        // field borrows) — no scratch; `ws_read_frame`
+                        // already refused a control payload over 125 B.
+                        if let Ok(n) = ws_write_pong(
+                            drv.tx.free_mut(),
+                            &drv.rx.filled()[payload.start..payload.end],
+                            mask,
+                        ) {
                             drv.tx.advance(n);
                         }
                     }
@@ -630,18 +689,30 @@ fn drain_ws_frames<C: Capture>(
     }
 }
 
-/// VT2: judge the parsed tick's venue stamp against THIS connection's
-/// estimator (the parsers carry the stamp but own no estimator), set
-/// the flag, count, then push. Loss-accounts a full ring (D4) —
-/// ring-full is back-pressure, not an error, but it is never silent.
+/// HK31 + VT2: stamp the parsed tick's `venue_seq` from the sequencer of
+/// its asset (`slot`, its [`SymbolMap`] row), judge its venue stamp
+/// against THIS connection's estimator (the parsers carry the stamp but
+/// own neither), set the flag, count, then push. Loss-accounts a full
+/// ring (D4) — ring-full is back-pressure, not an error, but it is never
+/// silent.
 #[inline]
 fn judge_and_push_tick<C: Capture>(
+    asset_seq: &mut [ArrivalSeq; crate::PM_SUBSCRIBE_IDS_MAX],
+    slot: usize,
     clock: &mut FeedClock,
     mut tick: Tick,
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     status: &IngressStatus,
     capture: &mut C,
 ) {
+    // `slot < PM_SUBSCRIBE_IDS_MAX` by construction (`SymbolMap::from_pairs`
+    // caps the map); the `%` (a power of two: a mask) only drops the
+    // bounds check.
+    tick.venue_seq = asset_seq[slot % crate::PM_SUBSCRIBE_IDS_MAX].next(tick.venue_time_ms);
+    // An older frame (`venue_seq` 0, dropped by every book) is counted, so
+    // a stuck asset (a far-future stamp) shows. None on the 2026-10-15
+    // tap: the count is cold.
+    status.note_arrival_seq(tick.venue_seq);
     let judged = clock.judge(tick.venue_time_ms, tick.ts_ns);
     tick.flags = (judged.stale as u8) * TICK_FLAG_STALE;
     if judged.stale {
@@ -654,7 +725,7 @@ fn judge_and_push_tick<C: Capture>(
     // reach the replay log (the audit pairs capture counts with
     // ring_drops_total).
     capture.tick(&tick);
-    if producer.try_push(tick).is_err() {
+    if !producer.try_push_ref(&tick) {
         status.inc_ring_drops();
     }
 }
@@ -663,15 +734,17 @@ fn judge_and_push_tick<C: Capture>(
 /// 2026-08-14; see [`crate::FrameKind`]).
 ///
 /// * `book` frames are **array-wrapped**, one event per asset in the
-///   market — events are walked at `{"market":"` boundaries; events
+///   market (the subscribe-time snapshot), or one plain object (the
+///   post-trade re-snapshots, live 2026-10-15) — either way
+///   events are walked at `{"market":"` boundaries; events
 ///   for sibling assets we never configured are skipped silently
 ///   (the venue groups by market, not by subscribed token — they
 ///   are not parse failures, and §6.5 deliberately does not tap them
 ///   as rejects).
 /// * `price_change` frames carry rows walked at `"asset_id":"`
-///   markers; the event-level `timestamp` seeds every row's
-///   `venue_seq`. Sibling-asset rows are skipped silently, same §6.5
-///   carve-out.
+///   markers; the event-level `timestamp` is every row's
+///   `venue_time_ms`, which orders its asset's sequencer (HK31).
+///   Sibling-asset rows are skipped silently, same §6.5 carve-out.
 fn handle_text_frame<C: Capture>(
     drv: &mut Driver,
     payload_range: core::ops::Range<usize>,
@@ -681,8 +754,14 @@ fn handle_text_frame<C: Capture>(
     capture: &mut C,
 ) {
     // Disjoint field borrows: the payload is a view into `drv.rx`; the
-    // VT2 judge mutates `drv.feed_clock` only.
-    let Driver { rx, feed_clock, .. } = drv;
+    // VT2 judge mutates `drv.feed_clock`, the HK31 sequencer
+    // `drv.asset_seq`.
+    let Driver {
+        rx,
+        feed_clock,
+        asset_seq,
+        ..
+    } = drv;
     let payload = &rx.filled()[payload_range];
     // §6.5 capture: raw tap fires before classification.
     capture.raw_frame(now_ns(), payload);
@@ -702,15 +781,16 @@ fn handle_text_frame<C: Capture>(
                 // Lookup miss = sibling asset in the same market — not
                 // ours, and not tapped (§6.5): the venue groups by
                 // market, not by subscribed token.
-                if let Some(sym) = extract_asset_id(ev).and_then(|id| symbol_map.lookup(id)) {
-                    match parse_book_update(ev, sym, ts_ns) {
-                        Some(tick) => {
-                            judge_and_push_tick(feed_clock, tick, producer, status, capture)
-                        }
-                        None => {
-                            status.inc_parse_errors();
-                            capture.parse_reject(now_ns(), ev);
-                        }
+                if let Some((slot, sym)) = extract_asset_id(ev).and_then(|id| symbol_map.lookup(id))
+                {
+                    let mut tick = core_types::Tick::ZERO;
+                    if parse_book_update(ev, sym, ts_ns, &mut tick) {
+                        judge_and_push_tick(
+                            asset_seq, slot, feed_clock, tick, producer, status, capture,
+                        )
+                    } else {
+                        status.inc_parse_errors();
+                        capture.parse_reject(now_ns(), ev);
                     }
                 }
                 at = ev_end;
@@ -739,15 +819,17 @@ fn handle_text_frame<C: Capture>(
                 let row = &payload[row_start..row_end];
                 // Lookup miss = sibling-asset row — not ours, not
                 // tapped (§6.5).
-                if let Some(sym) = extract_asset_id(row).and_then(|id| symbol_map.lookup(id)) {
-                    match parse_price_change_row(row, sym, ts_ns, venue_time_ms) {
-                        Some(tick) => {
-                            judge_and_push_tick(feed_clock, tick, producer, status, capture)
-                        }
-                        None => {
-                            status.inc_parse_errors();
-                            capture.parse_reject(now_ns(), row);
-                        }
+                if let Some((slot, sym)) =
+                    extract_asset_id(row).and_then(|id| symbol_map.lookup(id))
+                {
+                    let mut tick = core_types::Tick::ZERO;
+                    if parse_price_change_row(row, sym, ts_ns, venue_time_ms, &mut tick) {
+                        judge_and_push_tick(
+                            asset_seq, slot, feed_clock, tick, producer, status, capture,
+                        )
+                    } else {
+                        status.inc_parse_errors();
+                        capture.parse_reject(now_ns(), row);
                     }
                 }
                 at = row_end;
@@ -829,9 +911,10 @@ pub fn run<T: Transport, C: Capture>(
     // state the transport keeps the same readable+writable set,
     // so this is near-zero overhead.
     let mut last_interest = transport.interest();
+    let mut repoll_now = false;
 
     while !stop.load(Ordering::Relaxed) {
-        if let Err(_e) = poll.poll(events, Some(std::time::Duration::from_millis(50))) {
+        if let Err(_e) = poll.poll(events, Some(core_net::poll_timeout(repoll_now))) {
             return RunResult::Error;
         }
 
@@ -846,30 +929,15 @@ pub fn run<T: Transport, C: Capture>(
             note_transport_ready(drv, status);
         }
 
-        // I-3: tight inner drain loop. After mio wakes us, keep
-        // calling drive_one as long as we either produced a tick
-        // or transitioned state. The loop terminates the moment a
-        // call makes no observable progress — at which point the
-        // outer mio poll handles the next readiness event. This
-        // removes the 50 ms mio-poll wakeup cap on first-after-
-        // idle bursts where one poll surfaces multiple frames'
-        // worth of buffered bytes.
-        loop {
-            let n_before = producer.len();
-            let state_before = drv.state();
-            if let Err(_e) = drive_one(
-                transport, drv, host, path, producer, symbol_map, status, capture,
-            ) {
-                return RunResult::Error;
-            }
-            if drv.state() == State::Closed {
-                return RunResult::Disconnected;
-            }
-            // Progress iff we produced a tick OR moved the
-            // driver's state machine forward.
-            if producer.len() == n_before && drv.state() == state_before {
-                break;
-            }
+        // I-3 (core_net::drain): drive until a step leaves nothing
+        // behind — a full rx's backlog included, which no readiness edge
+        // announces again — and re-poll at once if the step cap cut a
+        // backlog short.
+        match drive_until_idle(transport, drv, host, path, producer, symbol_map, status, capture) {
+            Drained::Idle => repoll_now = false,
+            Drained::Capped => repoll_now = true,
+            Drained::Closed => return RunResult::Disconnected,
+            Drained::Failed(_) => return RunResult::Error,
         }
 
         // §6.5: staged capture reaches disk within the flush interval
@@ -931,6 +999,7 @@ pub fn run<T: Transport, C: Capture>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use book_builder::{ApplyOutcome, TopOfBook};
     use core_net::{
         expected_accept as expected_accept_pub, sec_websocket_key_from_seed as sec_key_pub,
         ws_write_text_frame, KeepaliveCfg, TestTransport,
@@ -1174,6 +1243,67 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
+    /// HK3: the worst market subscribe — every id at its longest —
+    /// renders within [`SUB_PAYLOAD_MAX`], which the tx sizing assert is
+    /// built on.
+    #[test]
+    fn the_worst_market_subscribe_fits_its_bound() {
+        let big = [b'7'; crate::PM_ASSET_ID_MAX];
+        let ids = [&big[..]; crate::PM_SUBSCRIBE_IDS_MAX];
+        let mut tx = IoBuf::with_capacity(TX_BUF_SIZE);
+        let mut ctr = 0u64;
+        queue_masked_text_frame_rendered(&mut tx, &mut ctr, |p| {
+            crate::render_market_subscribe(p, &ids)
+        })
+        .unwrap();
+        assert!(tx.len() <= SUB_PAYLOAD_MAX + core_net::WS_CLIENT_HDR_MAX);
+    }
+
+    /// HK2: a push that arrives in the same read as the venue's FIN is
+    /// published before the session closes. Before, the EOF set `Closed`
+    /// ahead of the state machine and the push was dropped.
+    #[test]
+    fn a_frame_that_arrives_with_the_fin_is_published_then_the_session_closes() {
+        let mut t = TestTransport::with_capacity(16 * 1024);
+        let mut d = build_driver_with_seed(7);
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let map = SymbolMap::from_pairs(std::iter::once((b"0xABC".to_vec(), 42u32)));
+        let status = IngressStatus::new();
+        let book = br#"[{"market":"0x60c2","asset_id":"0xABC","timestamp":"1713000000000","hash":"h","bids":[{"price":"0.517","size":"200.0"},{"price":"0.518","size":"100.0"}],"asks":[{"price":"0.521","size":"150.0"},{"price":"0.520","size":"50.0"}],"event_type":"book"}]"#;
+        inject_unmasked_text(&mut t, book);
+        t.mark_closed();
+        let full = drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture)
+            .unwrap();
+        assert!(!full);
+        assert_eq!(cons.try_pop_ref().map(|t| t.sym), Some(42), "published before the close");
+        assert_eq!(d.state(), State::Closed);
+    }
+
+    /// HK2: a frame larger than rx fails the session at once
+    /// (`core_net::incomplete_frame`). Before, the drain returned `Ok` on
+    /// every poll and the session stalled until the idle timeout.
+    #[test]
+    fn a_frame_larger_than_rx_fails_the_session_instead_of_stalling() {
+        let mut t = TestTransport::with_capacity(RX_BUF_SIZE + 1024);
+        let mut d = build_driver_with_seed(7);
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let map = SymbolMap::from_pairs(std::iter::once((b"0xABC".to_vec(), 42u32)));
+        let status = IngressStatus::new();
+        let huge = (RX_BUF_SIZE as u64 + 4096).to_be_bytes();
+        let mut frame = vec![0u8; RX_BUF_SIZE + 512];
+        frame[0] = 0x81;
+        frame[1] = 127;
+        frame[2..10].copy_from_slice(&huge);
+        t.inject_incoming(&frame);
+        let e = drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture)
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
     #[test]
     fn steady_state_parses_book_frame_into_tick_ring() {
         let mut t = TestTransport::with_capacity(16 * 1024);
@@ -1205,14 +1335,16 @@ mod tests {
         )
         .unwrap();
 
-        let tick = cons.try_pop().expect("book tick must be pushed");
+        let tick = *cons.try_pop_ref().expect("book tick must be pushed");
         assert_eq!(tick.sym, 42);
         // Worst→best ordering: top-of-book is the LAST level.
         assert_eq!(tick.bid_px.raw(), 518_000);
         assert_eq!(tick.bid_qty.raw(), 100_000_000);
         assert_eq!(tick.ask_px.raw(), 520_000);
         assert_eq!(tick.ask_qty.raw(), 50_000_000);
-        let tick2 = cons.try_pop().expect("price_change tick must be pushed");
+        let tick2 = *cons
+            .try_pop_ref()
+            .expect("price_change tick must be pushed");
         assert_eq!(tick2.sym, 42);
         assert_eq!(tick2.bid_px.raw(), 519_000);
         assert_eq!(
@@ -1226,7 +1358,11 @@ mod tests {
             0,
             "far-side size unknown on price_change"
         );
-        assert_eq!(tick2.venue_seq, (1_713_000_000_456u64 & 0xFFFF_FFFF) as u32);
+        assert_eq!(
+            (tick.venue_seq, tick2.venue_seq),
+            (1, 2),
+            "HK31: the asset's ordinal"
+        );
         // VT2: both frames carry their stamp; the book frame defined the
         // offset (fresh), the price_change 456 ms LATER is fresh too.
         assert_eq!(tick.venue_time_ms, 1_713_000_000_000);
@@ -1234,7 +1370,7 @@ mod tests {
         assert!(!tick.is_stale());
         assert!(!tick2.is_stale());
         assert_eq!(status.stale_ticks_total(), 0);
-        assert!(cons.try_pop().is_none());
+        assert!(cons.try_pop_ref().is_none());
         // §6.4 accounting: two parsed+dispatched messages, frame bytes
         // counted, nothing rejected, nothing dropped.
         assert_eq!(status.msgs_total(), 2);
@@ -1242,6 +1378,105 @@ mod tests {
         assert_eq!(status.parse_errors_total(), 0);
         assert_eq!(status.ring_drops_total(), 0);
         let _ = ws_write_text_frame; // quiet unused-import lint on tests that don't call it
+    }
+
+    /// I-3: a burst of non-tick frames past a full rx no longer strands
+    /// what follows it until the next readiness edge — one drain reads it
+    /// all, the tick behind it included; a backlog past `DRAIN_STEP_CAP`
+    /// full-rx steps ends `Capped` (the loop re-polls at once) and the
+    /// next drain finishes it.
+    #[test]
+    fn drive_until_idle_reads_past_a_full_rx_and_caps_a_backlog() {
+        let book = br#"[{"market":"0x60c2","asset_id":"0xABC","timestamp":"1713000000000","hash":"h","bids":[{"price":"0.518","size":"100.0"}],"asks":[{"price":"0.520","size":"50.0"}],"event_type":"book"}]"#;
+        let map = SymbolMap::from_pairs(std::iter::once((b"0xABC".to_vec(), 42u32)));
+        for (fills, first) in [(2, Drained::Idle), (core_net::DRAIN_STEP_CAP as usize, Drained::Capped)] {
+            let mut t = TestTransport::with_capacity((fills + 1) * RX_BUF_SIZE);
+            let mut d = build_driver_with_seed(7);
+            d.set_state(State::Steady);
+            let (mut prod, mut cons) = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new().split();
+            let status = IngressStatus::new();
+            t.inject_server_pongs(fills * RX_BUF_SIZE);
+            inject_unmasked_text(&mut t, book);
+            assert_eq!(
+                drive_until_idle(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture),
+                first
+            );
+            if first == Drained::Capped {
+                assert!(cons.try_pop_ref().is_none(), "the tick still waits below the cap");
+                assert_eq!(
+                    drive_until_idle(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture),
+                    Drained::Idle
+                );
+            }
+            assert_eq!(cons.try_pop_ref().expect("the tick behind the burst").sym, 42);
+            assert_eq!(t.incoming_len(), 0, "every byte was read");
+        }
+    }
+
+    /// I-3 in `run`: a capped drain re-polls at once. A backlog one rx past
+    /// the cap is already queued when `run` starts, so no readiness edge
+    /// will ever announce its tail; a woken waker spares the first poll's
+    /// wait, and the tick must arrive well inside one `POLL_IDLE` — with
+    /// `Capped` not wired to the zero-timeout poll, the second poll sleeps
+    /// the full 50 ms first.
+    #[test]
+    fn run_re_polls_at_once_after_a_capped_drain() {
+        let book = br#"[{"market":"0x60c2","asset_id":"0xABC","timestamp":"1713000000000","hash":"h","bids":[{"price":"0.518","size":"100.0"}],"asks":[{"price":"0.520","size":"50.0"}],"event_type":"book"}]"#;
+        let map = SymbolMap::from_pairs(std::iter::once((b"0xABC".to_vec(), 42u32)));
+        let cap = core_net::DRAIN_STEP_CAP as usize;
+        let mut t = TestTransport::with_capacity((cap + 2) * RX_BUF_SIZE);
+        t.inject_server_pongs((cap + 1) * RX_BUF_SIZE);
+        inject_unmasked_text(&mut t, book);
+        let mut d = build_driver_with_seed(7);
+        d.set_state(State::Steady);
+        let (mut prod, mut cons) = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new().split();
+        let status = IngressStatus::new();
+        let mut keepalive = Keepalive::new(KeepaliveCfg {
+            ping_interval_ns: u64::MAX / 4,
+            idle_timeout_ns: u64::MAX / 2,
+        });
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(8);
+        // Another token, woken once: the first poll returns at once.
+        let waker = mio::Waker::new(poll.registry(), mio::Token(1)).unwrap();
+        waker.wake().unwrap();
+        let stop = StopFlag::new(false);
+        let start = std::time::Instant::now();
+        let (sym, elapsed) = std::thread::scope(|s| {
+            let runner = s.spawn(|| {
+                run(
+                    &mut t,
+                    &mut d,
+                    b"host",
+                    b"/",
+                    &mut prod,
+                    &map,
+                    &mut poll,
+                    &mut events,
+                    mio::Token(0),
+                    &stop,
+                    &status,
+                    &mut keepalive,
+                    &mut NullCapture,
+                )
+            });
+            let sym = loop {
+                if let Some(slot) = cons.try_pop_ref() {
+                    break slot.sym;
+                }
+                assert!(start.elapsed() < std::time::Duration::from_secs(5), "no tick");
+                std::thread::yield_now();
+            };
+            let elapsed = start.elapsed();
+            stop.store(true, Ordering::Relaxed);
+            assert_eq!(runner.join().unwrap(), RunResult::Stopped);
+            (sym, elapsed)
+        });
+        assert_eq!(sym, 42);
+        assert!(
+            elapsed < core_net::POLL_IDLE,
+            "the tick came after {elapsed:?}: the capped drain waited out a poll"
+        );
     }
 
     /// VT2 helper: one book frame for asset `0xABC` stamped `ts_ms`
@@ -1260,7 +1495,7 @@ mod tests {
         );
         inject_unmasked_text(t, s.as_bytes());
         drive_one(t, d, b"host", b"/", prod, map, status, &mut NullCapture).unwrap();
-        cons.try_pop().expect("book must produce a tick")
+        *cons.try_pop_ref().expect("book must produce a tick")
     }
 
     #[test]
@@ -1318,49 +1553,32 @@ mod tests {
         assert_eq!(after.venue_time_ms, t0 - 60_000);
     }
 
+    /// The WS Ping echo goes rx → tx with no scratch (the BX0 shape): an
+    /// empty, a 4 B and a 125 B (control-frame cap) ping each come back
+    /// as exactly one masked pong carrying the same bytes.
     #[test]
     fn steady_state_replies_pong_to_ping() {
-        let mut t = TestTransport::with_capacity(4096);
-        let mut d = build_driver_with_seed(7);
-        d.set_state(State::Steady);
-
-        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
-        let (mut prod, _cons) = ring.split();
-        let map = SymbolMap::from_pairs(std::iter::empty());
-        let status = IngressStatus::new();
-
-        // Unmasked Ping with a 4-byte payload.
-        let mut frame = [0u8; 16];
-        frame[0] = 0x89; // FIN + Ping
-        frame[1] = 4;
-        frame[2..6].copy_from_slice(b"PING");
-        t.inject_incoming(&frame[..6]);
-
-        drive_one(
-            &mut t,
-            &mut d,
-            b"host",
-            b"/",
-            &mut prod,
-            &map,
-            &status,
-            &mut NullCapture,
-        )
-        .unwrap();
-        assert!(t.outgoing_len() > 0, "driver should have emitted a pong");
-
-        let mut out = [0u8; 64];
-        let n = t.drain_outgoing(&mut out);
-        // Pong is 0x8A + (0x80|4) + 4-byte mask + 4-byte XORed payload.
-        assert_eq!(out[0], 0x8A);
-        assert_eq!(out[1], 0x80 | 4);
-        let mask = [out[2], out[3], out[4], out[5]];
-        let mut unmasked = [0u8; 4];
-        for i in 0..4 {
-            unmasked[i] = out[6 + i] ^ mask[i & 3];
+        for payload in TestTransport::PING_ECHO_CASES {
+            let mut t = TestTransport::with_capacity(4096);
+            let mut d = build_driver_with_seed(7);
+            d.set_state(State::Steady);
+            let (mut prod, _cons) = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new().split();
+            let map = SymbolMap::from_pairs(std::iter::empty());
+            let status = IngressStatus::new();
+            t.inject_server_ping(payload);
+            drive_one(
+                &mut t,
+                &mut d,
+                b"host",
+                b"/",
+                &mut prod,
+                &map,
+                &status,
+                &mut NullCapture,
+            )
+            .unwrap();
+            t.expect_pong_echo(payload);
         }
-        assert_eq!(&unmasked, b"PING");
-        assert_eq!(n, 10);
     }
 
     /// Inject an unmasked (server-side) text frame (short or 16-bit
@@ -1442,7 +1660,7 @@ mod tests {
             core_types::Price::from_raw(2),
             core_types::Qty::from_raw(1),
         );
-        while prod.try_push(filler).is_ok() {}
+        while prod.try_push_ref(&filler) {}
         let good = br#"[{"market":"0x1","asset_id":"0xABC","timestamp":"1713000000000","hash":"h","bids":[{"price":"0.518","size":"100.0"}],"asks":[{"price":"0.520","size":"50.0"}],"event_type":"book"}]"#;
         inject_unmasked_text(&mut t, good);
         drive_one(
@@ -1564,12 +1782,305 @@ mod tests {
             (b"bar".to_vec(), 2),
             (b"baz".to_vec(), 3),
         ]);
-        assert_eq!(map.lookup(b"foo"), Some(1));
-        assert_eq!(map.lookup(b"bar"), Some(2));
-        assert_eq!(map.lookup(b"baz"), Some(3));
+        assert_eq!(map.lookup(b"foo"), Some((0, 1)));
+        assert_eq!(map.lookup(b"bar"), Some((1, 2)));
+        assert_eq!(map.lookup(b"baz"), Some((2, 3)));
         assert_eq!(map.lookup(b"qux"), None);
         assert_eq!(map.len(), 3);
         assert!(!map.is_empty());
+    }
+
+    /// HK31: a map row indexes the driver's `PM_SUBSCRIBE_IDS_MAX`
+    /// sequencers — a map past the subscribe's cap is a boot bug.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "holds at most 128 ids")]
+    fn symbol_map_past_the_subscribe_cap_is_refused() {
+        let _ = SymbolMap::from_pairs(
+            (0..=crate::PM_SUBSCRIBE_IDS_MAX as u32).map(|i| (i.to_string().into_bytes(), i)),
+        );
+    }
+
+    /// HK31 rig: a steady driver over a two-asset map (`0xA` → 42,
+    /// `0xB` → 43); `feed` drives one payload and returns its ticks in
+    /// ring order.
+    struct SeqRig {
+        t: TestTransport,
+        d: Driver,
+        prod: Producer<Tick, DEFAULT_TICK_RING_CAP>,
+        cons: core_ring::Consumer<Tick, DEFAULT_TICK_RING_CAP>,
+        map: SymbolMap,
+        status: IngressStatus,
+    }
+
+    impl SeqRig {
+        fn new() -> Self {
+            let mut d = Driver::new_multi(7, &[b"0xA", b"0xB"]);
+            d.set_state(State::Steady);
+            let (prod, cons) = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new().split();
+            Self {
+                t: TestTransport::with_capacity(16 * 1024),
+                d,
+                prod,
+                cons,
+                map: SymbolMap::from_pairs(vec![(b"0xA".to_vec(), 42), (b"0xB".to_vec(), 43)]),
+                status: IngressStatus::new(),
+            }
+        }
+
+        fn feed(&mut self, payload: &str) -> Vec<Tick> {
+            inject_unmasked_text(&mut self.t, payload.as_bytes());
+            drive_one(
+                &mut self.t,
+                &mut self.d,
+                b"host",
+                b"/",
+                &mut self.prod,
+                &self.map,
+                &self.status,
+                &mut NullCapture,
+            )
+            .unwrap();
+            let mut out = Vec::new();
+            while let Some(t) = self.cons.try_pop_ref() {
+                out.push(*t);
+            }
+            out
+        }
+    }
+
+    /// A live-shape `price_change` stamped `ms`, one row per
+    /// `(asset, best_bid, best_ask)` — a BUY at the bid, so the bid size
+    /// is known (5) and the ask size is not (0).
+    fn pc_frame(ms: u64, rows: &[(&str, &str, &str)]) -> String {
+        let rows: Vec<String> = rows
+            .iter()
+            .map(|(asset, bid, ask)| {
+                format!(
+                    r#"{{"asset_id":"{asset}","price":"{bid}","size":"5","side":"BUY","hash":"h","best_bid":"{bid}","best_ask":"{ask}"}}"#
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"market":"0x1","price_changes":[{}],"timestamp":"{ms}","event_type":"price_change"}}"#,
+            rows.join(",")
+        )
+    }
+
+    /// The post-trade `book` re-snapshot (the live single-object shape)
+    /// for `asset` at `ms`: touch `bid` × 7 / `ask` × 9.
+    fn resnap(asset: &str, ms: u64, bid: &str, ask: &str) -> String {
+        format!(
+            r#"{{"market":"0x1", "asset_id":"{asset}", "bids":[{{"price":"0.01", "size":"100"}}, {{"price":"{bid}", "size":"7"}}], "asks":[{{"price":"0.99", "size":"100"}}, {{"price":"{ask}", "size":"9"}}], "hash":"h", "timestamp":"{ms}", "event_type":"book"}}"#
+        )
+    }
+
+    /// The subscribe-time `book` snapshot (array form) for `asset` at
+    /// `ms`: touch `bid` × 7 / `ask` × 9.
+    fn snapshot(asset: &str, ms: u64, bid: &str, ask: &str) -> String {
+        format!(
+            r#"[{{"market":"0x1","asset_id":"{asset}","timestamp":"{ms}","hash":"h","bids":[{{"price":"{bid}","size":"7"}}],"asks":[{{"price":"{ask}","size":"9"}}],"event_type":"book"}}]"#
+        )
+    }
+
+    /// A live stamp (2026-10-15 tap).
+    const T0: u64 = 1_792_068_702_614;
+
+    /// HK31: two `price_change`s for one asset in one millisecond (8 %
+    /// of the live rows) are two updates — both apply and the second's
+    /// touch is the book's. Old law: one seq, the second `Stale`.
+    #[test]
+    fn same_ms_price_changes_both_apply_and_the_second_is_the_touch() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(42);
+        let a = r.feed(&pc_frame(T0, &[("0xA", "0.5", "0.52")]));
+        let b = r.feed(&pc_frame(T0, &[("0xA", "0.51", "0.52")]));
+        assert_eq!(book.apply(&a[0]), ApplyOutcome::Applied);
+        assert_eq!(
+            book.apply(&b[0]),
+            ApplyOutcome::Applied,
+            "same ms, later arrival"
+        );
+        assert_eq!((book.bid_px.raw(), book.ask_px.raw()), (510_000, 520_000));
+        assert_eq!(book.stale_drops(), 0);
+    }
+
+    /// HK31: a frame OLDER than its asset's newest carries 0 — `Stale`
+    /// at every book, one that missed the newest tick included — and
+    /// does not advance the ordinal. Old law: the low-32-bit stamp, so a
+    /// book that missed the newest applied the older touch, and the
+    /// newest's same-ms successor was `Stale`.
+    #[test]
+    fn an_older_frame_is_stale_at_every_book_and_the_ordinal_holds() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(42);
+        // Never sees the newest tick (a ring drop, a late slot claim).
+        let mut missed = TopOfBook::empty(42);
+        let newest = r.feed(&pc_frame(T0 + 5, &[("0xA", "0.51", "0.52")]));
+        let older = r.feed(&pc_frame(T0, &[("0xA", "0.4", "0.6")]));
+        let next = r.feed(&pc_frame(T0 + 5, &[("0xA", "0.52", "0.53")]));
+        assert_eq!(book.apply(&newest[0]), ApplyOutcome::Applied);
+        assert_eq!(book.apply(&older[0]), ApplyOutcome::Stale);
+        assert_eq!(missed.apply(&older[0]), ApplyOutcome::Stale);
+        assert!(!missed.has_quotes());
+        assert_eq!(
+            book.apply(&next[0]),
+            ApplyOutcome::Applied,
+            "same ms as the newest"
+        );
+        assert_eq!(book.bid_px.raw(), 520_000);
+        assert_eq!(book.gaps(), 0, "the older frame took no ordinal");
+    }
+
+    /// HK31: the post-trade `book` re-snapshot shares the preceding
+    /// `price_change`'s ms (288 of 288 live) — it applies and brings the
+    /// touch sizes the row left 0. Old law: `Stale`.
+    #[test]
+    fn a_post_trade_resnapshot_in_the_same_ms_applies() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(42);
+        let pc = r.feed(&pc_frame(T0, &[("0xA", "0.17", "0.19")]));
+        let snap = r.feed(&resnap("0xA", T0, "0.17", "0.19"));
+        assert_eq!(book.apply(&pc[0]), ApplyOutcome::Applied);
+        assert_eq!(
+            book.ask_qty.raw(),
+            0,
+            "a BUY row leaves the ask size unknown"
+        );
+        assert_eq!(book.apply(&snap[0]), ApplyOutcome::Applied);
+        assert_eq!((book.bid_px.raw(), book.ask_px.raw()), (170_000, 190_000));
+        assert_eq!(
+            (book.bid_qty.raw(), book.ask_qty.raw()),
+            (7_000_000, 9_000_000)
+        );
+    }
+
+    /// HK31: each asset counts from 1 on its own — a live `price_change`
+    /// carries one row for each of a market's two tokens. Old law: both
+    /// rows carried the stamp's low 32 bits.
+    #[test]
+    fn interleaved_assets_keep_independent_ordinals_from_1() {
+        let mut r = SeqRig::new();
+        let seqs = |ts: Vec<Tick>| -> Vec<(SymbolId, u32)> {
+            ts.iter().map(|t| (t.sym, t.venue_seq)).collect()
+        };
+        let both = r.feed(&pc_frame(
+            T0,
+            &[("0xA", "0.5", "0.52"), ("0xB", "0.48", "0.5")],
+        ));
+        assert_eq!(seqs(both), [(42, 1), (43, 1)]);
+        assert_eq!(
+            seqs(r.feed(&pc_frame(T0, &[("0xA", "0.51", "0.52")]))),
+            [(42, 2)]
+        );
+        let both = r.feed(&pc_frame(
+            T0 + 1,
+            &[("0xB", "0.47", "0.49"), ("0xA", "0.5", "0.53")],
+        ));
+        assert_eq!(seqs(both), [(43, 2), (42, 3)]);
+    }
+
+    /// HK31: a reconnect keeps the ordinal — the venue's subscribe-time
+    /// snapshot in the same ms as the last update applies (3 after 1, 2)
+    /// and the stream goes on from it, dense. Old law: that snapshot was
+    /// `Stale`.
+    #[test]
+    fn the_ordinal_stays_monotone_across_a_reconnect() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(42);
+        let mut ticks = r.feed(&pc_frame(T0, &[("0xA", "0.5", "0.52")]));
+        ticks.extend(r.feed(&pc_frame(T0, &[("0xA", "0.51", "0.52")])));
+        r.d.reset_for_reconnect(9);
+        r.d.set_state(State::Steady);
+        r.d.subscribed = true;
+        ticks.extend(r.feed(&snapshot("0xA", T0, "0.52", "0.53")));
+        ticks.extend(r.feed(&pc_frame(T0 + 1, &[("0xA", "0.52", "0.54")])));
+        for t in &ticks {
+            assert_eq!(book.apply(t), ApplyOutcome::Applied);
+        }
+        let seqs: Vec<u32> = ticks.iter().map(|t| t.venue_seq).collect();
+        assert_eq!(seqs, [1, 2, 3, 4]);
+        assert_eq!((book.bid_px.raw(), book.ask_px.raw()), (520_000, 540_000));
+        assert_eq!(book.gaps(), 0, "dense: no tick lost");
+    }
+
+    /// HK31 follow-up: one far-future stamp poisons the asset's clock —
+    /// every later normal frame is older, takes 0, is `Stale` at the book
+    /// and is COUNTED on `seq_regressions_total`, so the stuck asset shows.
+    #[test]
+    fn a_far_future_stamp_drops_later_frames_and_counts_them() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(42);
+        let mut ticks = r.feed(&pc_frame(T0, &[("0xA", "0.5", "0.52")]));
+        ticks.extend(r.feed(&pc_frame(T0 + 86_400_000, &[("0xA", "0.5", "0.52")])));
+        for ms in [T0 + 1, T0 + 2] {
+            ticks.extend(r.feed(&pc_frame(ms, &[("0xA", "0.51", "0.53")])));
+        }
+        let seqs: Vec<u32> = ticks.iter().map(|t| t.venue_seq).collect();
+        assert_eq!(seqs, [1, 2, 0, 0]);
+        let outcomes: Vec<ApplyOutcome> = ticks.iter().map(|t| book.apply(t)).collect();
+        assert_eq!(
+            outcomes,
+            [
+                ApplyOutcome::Applied,
+                ApplyOutcome::Applied,
+                ApplyOutcome::Stale,
+                ApplyOutcome::Stale
+            ]
+        );
+        assert_eq!(r.status.seq_regressions_total(), 2);
+        // The other asset's clock is its own.
+        let b = r.feed(&pc_frame(T0 + 3, &[("0xB", "0.48", "0.5")]));
+        assert_eq!(b[0].venue_seq, 1);
+        assert_eq!(r.status.seq_regressions_total(), 2);
+    }
+
+    /// HK31 follow-up: a reconnect zeroes every asset's clock but keeps
+    /// its ordinal — after a far-future stamp, the new subscribe snapshot
+    /// and the normal frames behind it apply again, numbered on from
+    /// where the old connection stopped, and nothing more is counted.
+    #[test]
+    fn a_reconnect_clears_a_poisoned_clock_and_keeps_the_ordinal() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(42);
+        let mut ticks = r.feed(&pc_frame(T0, &[("0xA", "0.5", "0.52")]));
+        ticks.extend(r.feed(&pc_frame(T0 + 86_400_000, &[("0xA", "0.5", "0.52")])));
+        ticks.extend(r.feed(&pc_frame(T0 + 1, &[("0xA", "0.51", "0.53")])));
+        assert_eq!(r.status.seq_regressions_total(), 1);
+        r.d.reset_for_reconnect(9);
+        r.d.set_state(State::Steady);
+        r.d.subscribed = true;
+        ticks.extend(r.feed(&snapshot("0xA", T0 + 2, "0.52", "0.53")));
+        ticks.extend(r.feed(&pc_frame(T0 + 3, &[("0xA", "0.52", "0.54")])));
+        let seqs: Vec<u32> = ticks.iter().map(|t| t.venue_seq).collect();
+        assert_eq!(seqs, [1, 2, 0, 3, 4]);
+        for t in &ticks[..2] {
+            assert_eq!(book.apply(t), ApplyOutcome::Applied);
+        }
+        assert_eq!(book.apply(&ticks[2]), ApplyOutcome::Stale);
+        for t in &ticks[3..] {
+            assert_eq!(book.apply(t), ApplyOutcome::Applied);
+        }
+        assert_eq!((book.bid_px.raw(), book.ask_px.raw()), (520_000, 540_000));
+        assert_eq!(r.status.seq_regressions_total(), 1);
+    }
+
+    /// HK31: no wrap — across the low-32-bit ms boundary (next at
+    /// 2026-11-21 21:25:29.728Z) the stream keeps applying. Old law: the
+    /// seq fell from `u32::MAX` to 0 and every later tick was `Stale`
+    /// until a restart.
+    #[test]
+    fn the_low_32_bit_ms_boundary_does_not_wrap_the_ordinal() {
+        const WRAP: u64 = 418 << 32; // 1 795 296 329 728 ms
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(42);
+        let mut seqs = Vec::new();
+        for ms in [WRAP - 1, WRAP, WRAP + 1] {
+            let t = r.feed(&pc_frame(ms, &[("0xA", "0.5", "0.52")]));
+            assert_eq!(book.apply(&t[0]), ApplyOutcome::Applied, "{ms}");
+            seqs.push(t[0].venue_seq);
+        }
+        assert_eq!(seqs, [1, 2, 3]);
     }
 
     #[test]
@@ -1610,6 +2121,35 @@ mod tests {
         fn maybe_flush(&mut self, _now_ns: u64) {
             self.flushes += 1;
         }
+    }
+
+    /// Live wire 2026-10-15: the single-object, `", "`-separated `book`
+    /// re-snapshot (every one tapped as a reject before the fix) ticks
+    /// like the array-wrapped snapshot — one tick, no reject.
+    #[test]
+    fn single_object_spaced_book_ticks_without_reject() {
+        let mut t = TestTransport::with_capacity(16 * 1024);
+        let mut d = build_driver_with_seed(7);
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let map = SymbolMap::from_pairs(std::iter::once((b"0xABC".to_vec(), 42u32)));
+        let status = IngressStatus::new();
+        let mut cap = CountingCapture::default();
+        let spaced = br#"{"market":"0x1", "asset_id":"0xABC", "bids":[{"price":"0.17", "size":"10"}, {"price":"0.18", "size":"5.5"}], "asks":[{"price":"0.2", "size":"7"}, {"price":"0.19", "size":"3"}], "hash":"h", "timestamp":"1792068514889", "event_type":"book"}"#;
+        inject_unmasked_text(&mut t, spaced);
+        drive_one(
+            &mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut cap,
+        )
+        .unwrap();
+        assert_eq!(cap.rejects, 0);
+        assert_eq!(status.parse_errors_total(), 0);
+        let tick = *cons.try_pop_ref().expect("the spaced book must tick");
+        assert_eq!(tick.sym, 42);
+        assert_eq!((tick.bid_px.raw(), tick.bid_qty.raw()), (180_000, 5_500_000));
+        assert_eq!((tick.ask_px.raw(), tick.ask_qty.raw()), (190_000, 3_000_000));
+        assert_eq!(tick.venue_time_ms, 1_792_068_514_889);
+        assert!(cons.try_pop_ref().is_none(), "exactly one event");
     }
 
     #[test]
@@ -1670,7 +2210,7 @@ mod tests {
             core_types::Price::from_raw(2),
             core_types::Qty::from_raw(1),
         );
-        while prod.try_push(filler).is_ok() {}
+        while prod.try_push_ref(&filler) {}
         inject_unmasked_text(&mut t, good);
         drive_one(
             &mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut cap,

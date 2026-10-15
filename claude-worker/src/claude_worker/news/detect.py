@@ -1034,6 +1034,7 @@ def write_xsd_proposals(
 
 
 _YM_PARTS: int = 2
+_MONTHS_PER_YEAR: int = 12
 _HOURS_HALF_DAY: int = 12
 _HOURS_PER_DAY: int = 24
 _MINUTES_PER_HOUR: int = 60
@@ -1085,26 +1086,37 @@ def _fed_at(row: typing.Mapping[str, object]) -> int:
 
     ``days`` is a RANGE for a two-day FOMC meeting (``"16-17"``) and the
     decision lands on its second day, so the last day is the one that
-    matters to anything trading around it.
+    matters to anything trading around it. A range that crosses a month
+    end (``"31-1"``) ends in the NEXT month — the scheduled-events feed
+    places a macro jump by this instant, so a month's error is not
+    display-only.
     """
     month = _text(row.get("month"))
     days = _text(row.get("days"))
     if not month or not days:
         return 0
+    first = days.split("-")[0].strip()
     day = days.split("-")[-1].strip()
     parts = month.split("-")
-    if len(parts) != _YM_PARTS or not day.isdigit():
+    if len(parts) != _YM_PARTS or not day.isdigit() or not first.isdigit():
         return 0
     if not parts[0].isdigit() or not parts[1].isdigit():
         return 0
+    year, mon = int(parts[0]), int(parts[1])
+    if int(day) < int(first):
+        year, mon = (year + 1, 1) if mon == _MONTHS_PER_YEAR else (year, mon + 1)
     hour, minute = _fed_clock(_text(row.get("time")))
     try:
-        local = datetime.datetime(
-            int(parts[0]), int(parts[1]), int(day), hour, minute, tzinfo=_fed_zone()
-        )
+        local = datetime.datetime(year, mon, int(day), hour, minute, tzinfo=_fed_zone())
     except ValueError:
         return 0
     return int(local.timestamp())
+
+
+def fed_timed(row: typing.Mapping[str, object]) -> bool:
+    """Whether a Fed row states a time of day (a row without one is placed
+    at midnight ET, which is a DATE, not an instant)."""
+    return _fed_clock(_text(row.get("time"))) != (0, 0)
 
 
 def fed_kind(row: typing.Mapping[str, object]) -> str:
@@ -1171,15 +1183,26 @@ def _pinned_entries(
     return out
 
 
-def _fed_entries(
+class FedRow(typing.NamedTuple):
+    """One §8.3 row of a ``calendar-fed`` snapshot. ``timed`` is whether
+    the row stated its time of day ([`fed_timed`])."""
+
+    kind: str
+    at_ts: int
+    source: str
+    title: str
+    timed: bool
+
+
+def fed_rows(
     registry: claude_worker.news.sources.Registry,
     store: claude_worker.news.store.Store,
-    now_ts: int,
-    horizon: int,
-) -> list[dict[str, object]]:
-    out: list[dict[str, object]] = []
-    pinned: dict[str, dict[str, object]] = {}
-    in_window: set[str] = set()
+) -> list[FedRow]:
+    """Every row the newest ``calendar-fed`` snapshots carry that §8.3
+    names (FOMC statement, minutes, speeches), past and future, in source
+    then key order — the one reading both the 7-day calendar and the
+    scheduled-events feed (O-HC8) take."""
+    out: list[FedRow] = []
     sources = registry.sources
     for i in range(len(sources)):
         if sources[i].kind != CALENDAR_KIND:
@@ -1192,39 +1215,67 @@ def _fed_entries(
                 continue
             kind = fed_kind(row)
             at_ts = _fed_at(row)
-            if not kind or at_ts < now_ts:
-                continue
-            entry = _entry(kind, at_ts, sources[i].name, _text(row.get("title")))
-            if at_ts <= horizon:
-                out.append(entry)
-                in_window.add(kind)
-            elif kind in _PINNED_KINDS:
-                _keep_earliest(pinned, kind, entry)
+            if kind and at_ts > 0:
+                title = _text(row.get("title"))
+                out.append(FedRow(kind, at_ts, sources[i].name, title, fed_timed(row)))
+    return out
+
+
+def _fed_entries(
+    registry: claude_worker.news.sources.Registry,
+    store: claude_worker.news.store.Store,
+    now_ts: int,
+    horizon: int,
+) -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    pinned: dict[str, dict[str, object]] = {}
+    in_window: set[str] = set()
+    rows = fed_rows(registry, store)
+    for i in range(len(rows)):
+        row = rows[i]
+        if row.at_ts < now_ts:
+            continue
+        entry = _entry(row.kind, row.at_ts, row.source, row.title)
+        if row.at_ts <= horizon:
+            out.append(entry)
+            in_window.add(row.kind)
+        elif row.kind in _PINNED_KINDS:
+            _keep_earliest(pinned, row.kind, entry)
     out.extend(_pinned_entries(pinned, in_window))
+    return out
+
+
+def bls_rows(registry: claude_worker.news.sources.Registry) -> list[tuple[int, str]]:
+    """``[calendar] bls_releases`` as ``(at_ts, detail)``, in file order —
+    ISO stamps the operator maintains, because no keyless JSON publishes
+    the BLS schedule.
+
+    An entry is a stamp, optionally followed by a space and a label:
+    ``"2026-10-14T12:30:00Z CPI (September)"``. The label becomes the
+    ``detail``, so an entry reads as something rather than as a bare
+    number. A stamp alone still works and is its own detail; a bare date
+    lands at midnight UTC, so write the time to place it. An entry that is
+    not a stamp is skipped.
+    """
+    out: list[tuple[int, str]] = []
+    releases = registry.calendar.bls_releases
+    for i in range(len(releases)):
+        stamp, _, label = releases[i].strip().partition(" ")
+        at_ts = parse_iso(stamp)
+        if at_ts > 0:
+            out.append((at_ts, label.strip() or stamp))
     return out
 
 
 def _bls_entries(
     registry: claude_worker.news.sources.Registry, now_ts: int, horizon: int
 ) -> list[dict[str, object]]:
-    """``[calendar] bls_releases`` — ISO stamps the operator maintains,
-    because no keyless JSON publishes the BLS schedule.
-
-    An entry is a stamp, optionally followed by a space and a label:
-    ``"2026-10-14T12:30:00Z CPI (September)"``. The label becomes the
-    calendar's ``detail``, so an entry reads as something rather than as a
-    bare number. A stamp alone still works and is its own detail; a bare
-    date lands at midnight UTC, so write the time to place it.
-    """
     out: list[dict[str, object]] = []
-    releases = registry.calendar.bls_releases
-    for i in range(len(releases)):
-        stamp, _, label = releases[i].strip().partition(" ")
-        at_ts = parse_iso(stamp)
-        if at_ts <= 0 or at_ts < now_ts or at_ts > horizon:
-            continue
-        detail = label.strip() or stamp
-        out.append(_entry(CAL_BLS_RELEASE, at_ts, "news.toml [calendar]", detail))
+    rows = bls_rows(registry)
+    for i in range(len(rows)):
+        at_ts, detail = rows[i]
+        if now_ts <= at_ts <= horizon:
+            out.append(_entry(CAL_BLS_RELEASE, at_ts, "news.toml [calendar]", detail))
     return out
 
 

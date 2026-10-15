@@ -162,7 +162,9 @@ def parse_family(key: str) -> Family:
     """
     parts = key.split(":")
     if len(parts) != 3:
-        raise ValueError(f"`{key}` is not a family key (want `out:<COIN>:15m` or `native:<COIN>:1d`)")
+        raise ValueError(
+            f"`{key}` is not a family key (want `out:<COIN>:15m` or `native:<COIN>:1d`)"
+        )
     head, coin, period = parts
     if not coin:
         raise ValueError(f"`{key}` names no coin")

@@ -190,7 +190,7 @@ fn rpc_tls_loopback_yields_expected_signal() {
             &mut NullCapture,
         )
         .expect("drive_one");
-        got = cons.try_pop();
+        got = cons.try_pop_ref().as_deref().copied();
         transport
             .reregister(poll.registry(), token)
             .expect("reregister");

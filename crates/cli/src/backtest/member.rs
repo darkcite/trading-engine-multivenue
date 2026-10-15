@@ -67,15 +67,16 @@ use super::fill::{
 };
 use super::{
     derive_universe, discover_runs, hex_lower, load_and_merge, manifest_descriptor_table,
-    parse_model_params, parse_split, render_detail, render_schema1, BacktestConfig,
-    BacktestCtx, BacktestOutput, HarnessError, HarnessStats, MergedRec, RecPayload,
-    RegimeReport, ReportValues, RunSummary,
+    parse_model_params, parse_split, render_detail, render_schema1, BacktestConfig, BacktestCtx,
+    BacktestOutput, HarnessError, HarnessStats, MergeLanes, MergedRec, RecPayload, RegimeReport,
+    ReportValues, RunSummary,
 };
 
 /// The coded members the arm can drive.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MemberKind {
-    /// Slot 6, `crates/strategy-icdp` — params from `icdp.toml`.
+    /// `crates/strategy-icdp` — params from `icdp.toml`. Unlinked from
+    /// the set at XMM XH1 (slot 6 is xmm's); the offline arm stays.
     Icdp,
     /// Slot 2, `crates/strategy-xsd` — params from `xsd.toml`, the
     /// table from `xsd-table.tsv`, an optional seed (XSD-3).
@@ -88,6 +89,14 @@ pub enum MemberKind {
     /// `bin15.toml`, the per-underlying forecast seeds from
     /// `bin15-seed-<COIN>[-1d].tsv` (BIN15 O4b).
     Bin15,
+    /// Slot 0, `crates/strategy-hyparb` — params from `hyparb.toml`, the
+    /// pools from the universe's `[hyperevm]` list, the pool events from
+    /// the capture's `hyperevm-signals.pmlr` (HYPARB H6).
+    Hyparb,
+    /// Slot 6, `crates/strategy-xmm` — params from `xmm.toml`, each
+    /// quoted perp and its Binance leader resolved against the capture's
+    /// newest manifest (XMM XH1: the member is dark — it places nothing).
+    Xmm,
 }
 
 impl MemberKind {
@@ -98,6 +107,8 @@ impl MemberKind {
             "xsd" => Some(Self::Xsd),
             "vrp" => Some(Self::Vrp),
             "bin15" => Some(Self::Bin15),
+            "hyparb" => Some(Self::Hyparb),
+            "xmm" => Some(Self::Xmm),
             _ => None,
         }
     }
@@ -109,6 +120,8 @@ impl MemberKind {
             Self::Xsd => "xsd",
             Self::Vrp => "vrp",
             Self::Bin15 => "bin15",
+            Self::Hyparb => "hyparb",
+            Self::Xmm => "xmm",
         }
     }
 }
@@ -119,7 +132,7 @@ pub struct MemberSpec {
     /// Which member.
     pub kind: MemberKind,
     /// Its parameter artifact (`--icdp <path>` for icdp, `--xsd <path>`
-    /// for xsd).
+    /// for xsd, `--xmm <path>` for xmm).
     pub params: PathBuf,
     /// xsd only: `--xsd-table <path>` (default `~/multivenue/xsd-table.tsv`).
     pub table: Option<PathBuf>,
@@ -143,6 +156,11 @@ pub struct MemberSpec {
     /// forecast that had not been fitted yet comes to price it. Pass
     /// `--bin15-seed-dir ~/multivenue` to use the live cut deliberately.
     pub bin15_seed_dir: Option<PathBuf>,
+    /// hyparb only: `--hyparb-universe <path>` — the `universe.toml`
+    /// whose `[hyperevm] pools` list names the pools (default
+    /// `~/multivenue/universe.toml`). The list is append-only, so the
+    /// live file names every pool any older capture carries.
+    pub hyparb_universe: Option<PathBuf>,
 }
 
 /// Round-trip counter over synthesized fills, member-agnostic: a
@@ -251,6 +269,15 @@ fn drive_with<S: Strategy, O: FnMut(&MergedRec, &S)>(
                 strat.on_venue_event(&ev, ctx);
                 fills_scratch.clear();
             }
+            RecPayload::Trade(p) => {
+                // XMM XH1: the trade lane, merged for `--member xmm` only.
+                // XH2: the model sees the print first — the engine's
+                // order — so the queue law's fills land in the scratch.
+                let mut print = *p;
+                print.ts_ns = rec.wall_ns;
+                engine.on_trade(&print, rec.virt_ns, rec.wall_ns, &mut fills_scratch);
+                strat.on_trade(&print, ctx);
+            }
             RecPayload::Depth(d) => {
                 let mut depth = *d;
                 depth.ts_ns = rec.wall_ns;
@@ -266,6 +293,21 @@ fn drive_with<S: Strategy, O: FnMut(&MergedRec, &S)>(
             RecPayload::Regime(_) => {
                 // v1: no regime replay for members (module docs).
                 fills_scratch.clear();
+            }
+            RecPayload::Signal(g) => {
+                // HYPARB H6 — the engine's order: the paper matcher
+                // observes (a HEAD judges the open swaps, their fills
+                // land in the scratch), then the member's `on_signal`.
+                let mut sig = *g;
+                sig.ts_ns = rec.wall_ns;
+                engine.on_amm_signal(
+                    sig.sym,
+                    &sig.payload,
+                    rec.virt_ns,
+                    rec.wall_ns,
+                    &mut fills_scratch,
+                );
+                strat.on_signal(&sig, ctx);
             }
         }
         while consumed < ctx.orders().len() {
@@ -284,6 +326,18 @@ fn drive_with<S: Strategy, O: FnMut(&MergedRec, &S)>(
                 f.client_oid,
             );
             strat.on_fill(&fill, ctx);
+            while consumed < ctx.orders().len() {
+                let order = ctx.orders()[consumed];
+                engine.intake(&order, rec.virt_ns);
+                consumed += 1;
+            }
+        }
+        // XMM XH2: the model's order events AFTER the record's fills —
+        // the engine pumps fills before order events, so a member sees a
+        // fill before the FILLED it causes. Only the queue law emits any.
+        let mut ev = core_types::OrderEvent::ZERO;
+        while engine.pop_order_event(&mut ev) {
+            strat.on_order_event(&ev, ctx);
             while consumed < ctx.orders().len() {
                 let order = ctx.orders()[consumed];
                 engine.intake(&order, rec.virt_ns);
@@ -432,25 +486,230 @@ struct Bin15EntryRow {
     origin: u8,
 }
 
+/// BIN15 S5 (ruling O-4) + S5b: the two COUNTERFACTUALS on one instance,
+/// logged and never traded — each the first reprice whose price test held
+/// (persist 1, no ceiling), the preferred-side ask then and its side:
+///
+/// * `ff_*` at the ARTIFACT's own test (`FamilyState::entry_first_ok_*`) —
+///   against it the member's law differs in persistence and the ceiling
+///   alone;
+/// * `ctl_*` at TODAY'S law, the control (`FamilyState::entry_ctl_ok_*`) —
+///   doc 27 §5's "over today's law on the same instances".
+///
+/// A `*_ts_ns` of `0` is a test that never held. A cap, grid or ring refusal
+/// at that reprice would have moved the old law's real entry later; the $50
+/// entry sits far under the caps, so that is the rare case.
+///
+/// Held per family while its instance holds the slot and flushed when
+/// another takes it (or the window ends), so both are whole however far
+/// apart they fired. An entry row carries its own instance's as
+/// `first_fire_*` / `ctl_fire_*` columns; the rest form the
+/// `bin15_first_fires` block — each instance exactly once.
+#[derive(Copy, Clone, Debug)]
+struct Bin15FirstFireRow {
+    family: u8,
+    outcome: u32,
+    /// The instance's start, as [`Bin15EntryRow::start_ns`].
+    start_ns: u64,
+    expiry_ns: u64,
+    ff_ts_ns: u64,
+    /// `1` YES, `0` NO.
+    ff_is_yes: u8,
+    ff_px_1e6: i64,
+    ctl_ts_ns: u64,
+    ctl_is_yes: u8,
+    ctl_px_1e6: i64,
+}
+
+impl Bin15FirstFireRow {
+    /// A live instance's row, before either test held.
+    fn of(family: u8, fam: &strategy_bin15::FamilyState) -> Self {
+        Self {
+            family,
+            outcome: fam.live.outcome,
+            start_ns: fam
+                .live
+                .expiry_ns
+                .saturating_sub(strategy_bin15::TAU_15M_NS),
+            expiry_ns: fam.live.expiry_ns,
+            ff_ts_ns: 0,
+            ff_is_yes: 0,
+            ff_px_1e6: 0,
+            ctl_ts_ns: 0,
+            ctl_is_yes: 0,
+            ctl_px_1e6: 0,
+        }
+    }
+
+    /// Refreshed from the member's state: each counterfactual is written
+    /// once (`0` → a stamp) and never moves after.
+    fn observe(&mut self, fam: &strategy_bin15::FamilyState) {
+        if self.ff_ts_ns == 0 && fam.entry_first_ok_ts != 0 {
+            self.ff_ts_ns = fam.entry_first_ok_ts;
+            self.ff_is_yes = fam.entry_first_ok_yes;
+            self.ff_px_1e6 = i64::from(fam.entry_first_ok_px_1e6);
+        }
+        if self.ctl_ts_ns == 0 && fam.entry_ctl_ok_ts != 0 {
+            self.ctl_ts_ns = fam.entry_ctl_ok_ts;
+            self.ctl_is_yes = fam.entry_ctl_ok_yes;
+            self.ctl_px_1e6 = i64::from(fam.entry_ctl_ok_px_1e6);
+        }
+    }
+
+    /// Whether either test ever held — a row worth keeping.
+    const fn fired(&self) -> bool {
+        self.ff_ts_ns != 0 || self.ctl_ts_ns != 0
+    }
+
+    /// The artifact's own test, as the sidecar writes it.
+    fn fire_cols(&self) -> FireCols {
+        FireCols::of(self.ff_ts_ns, self.start_ns, self.ff_is_yes, self.ff_px_1e6)
+    }
+
+    /// Today's law — the control — as the sidecar writes it.
+    fn ctl_cols(&self) -> FireCols {
+        FireCols::of(
+            self.ctl_ts_ns,
+            self.start_ns,
+            self.ctl_is_yes,
+            self.ctl_px_1e6,
+        )
+    }
+}
+
+/// One family's step of the harness observer, after every record: a new
+/// outcome on the slot flushes the ended instance's row, and the live one's
+/// row is refreshed. A dormant slot keeps its row, so an instance's row is
+/// whole however its slot idles.
+fn track_first_fire(
+    rows: &mut Vec<Bin15FirstFireRow>,
+    open: &mut Option<Bin15FirstFireRow>,
+    family: u8,
+    fam: &strategy_bin15::FamilyState,
+) {
+    if !fam.is_live() {
+        return;
+    }
+    let outcome = fam.live.outcome;
+    // By reference: the observer runs per record, and the row is copied
+    // only when its instance ends.
+    if open.as_ref().is_some_and(|r| r.outcome != outcome) {
+        flush_first_fire(rows, open);
+    }
+    open.get_or_insert_with(|| Bin15FirstFireRow::of(family, fam))
+        .observe(fam);
+}
+
+/// Moves an ended instance's row into the block — when either of its tests
+/// ever held; a row on which neither did records nothing.
+fn flush_first_fire(rows: &mut Vec<Bin15FirstFireRow>, open: &mut Option<Bin15FirstFireRow>) {
+    if let Some(r) = open.take().filter(Bin15FirstFireRow::fired) {
+        rows.push(r);
+    }
+}
+
+/// BIN15 S1: a sidecar number that may be absent — `null` or the value,
+/// rendered straight into the row being written (no owned temporary).
+struct OrNull(Option<i64>);
+
+impl core::fmt::Display for OrNull {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(v) => write!(f, "{v}"),
+            None => f.write_str("null"),
+        }
+    }
+}
+
+/// BIN15 S1: the settlement fields every sidecar row carries — `y` (the
+/// venue's law, `null` when this window cannot derive it),
+/// `y_next_strike` (the venue-published label, `-1` unknown or a tie)
+/// and `settle_px_1e6` (the TWAP `y` was read from, `null` with `y`).
+fn label_of(
+    labels: &BTreeMap<u32, crate::backtest::binary::BinaryLabel>,
+    outcome: u32,
+) -> (OrNull, i64, OrNull) {
+    match labels.get(&outcome) {
+        Some(l) => (OrNull(l.value_1e6), l.y_next_strike, OrNull(l.px_1e6)),
+        None => (
+            OrNull(None),
+            crate::backtest::binary::Y_NEXT_STRIKE_UNKNOWN,
+            OrNull(None),
+        ),
+    }
+}
+
+/// BIN15 S5b: one counterfactual as the sidecar writes it — the stamp, its
+/// offset from the instance's start in seconds, the side and the ask; all
+/// four `null` when its test never held (`ts_ns == 0`).
+struct FireCols {
+    ts_ns: OrNull,
+    offset_s: OrNull,
+    is_yes: OrNull,
+    px_1e6: OrNull,
+}
+
+impl FireCols {
+    const NONE: Self = Self {
+        ts_ns: OrNull(None),
+        offset_s: OrNull(None),
+        is_yes: OrNull(None),
+        px_1e6: OrNull(None),
+    };
+
+    fn of(ts_ns: u64, start_ns: u64, is_yes: u8, px_1e6: i64) -> Self {
+        if ts_ns == 0 {
+            return Self::NONE;
+        }
+        Self {
+            ts_ns: OrNull(i64::try_from(ts_ns).ok()),
+            offset_s: OrNull(i64::try_from(ts_ns.saturating_sub(start_ns) / 1_000_000_000).ok()),
+            is_yes: OrNull(Some(i64::from(is_yes))),
+            px_1e6: OrNull(Some(px_1e6)),
+        }
+    }
+}
+
 /// The `bin15_entries` block of the detail sidecar.
+///
+/// BIN15 S1: `y_next_strike` and `settle_px_1e6` are ADDITIVE keys; a
+/// reader that predates them ignores them (the worker's reads by key).
+/// Each row is written straight into `s` — the reservation covers a
+/// realistic row (~440 B of the 480 reserved), so the block renders in
+/// one buffer without regrowth in practice.
 fn render_bin15_entries(
     rows: &[Bin15EntryRow],
-    y_by_outcome: &BTreeMap<u32, i64>,
+    first_fires: &[Bin15FirstFireRow],
+    labels: &BTreeMap<u32, crate::backtest::binary::BinaryLabel>,
 ) -> String {
-    let mut s = String::with_capacity(64 + rows.len() * 160);
+    use core::fmt::Write as _;
+    let mut s = String::with_capacity(64 + rows.len() * 480);
     s.push_str("\"bin15_entries\":[");
     for (i, r) in rows.iter().enumerate() {
         if i > 0 {
             s.push(',');
         }
-        let y = match y_by_outcome.get(&r.outcome) {
-            Some(v) => v.to_string(),
-            None => "null".to_owned(),
-        };
-        s.push_str(&format!(
+        let (y, y_next, settle_px) = label_of(labels, r.outcome);
+        // BIN15 S5/S5b: the instance's two counterfactuals, joined by
+        // outcome. The gate cannot pass a reprice whose price test failed,
+        // so an entry always has its first fire (`null` would mean the
+        // harness lost it); the control is `null` when today's law never
+        // held on the instance — an artifact whose test is looser than it.
+        let (ff, ctl) = first_fires
+            .iter()
+            .find(|f| f.outcome == r.outcome)
+            .map_or((FireCols::NONE, FireCols::NONE), |f| {
+                (f.fire_cols(), f.ctl_cols())
+            });
+        // Writing into a `String` cannot fail.
+        let _ = write!(
+            s,
             "{{\"ts_ns\":{},\"family\":{},\"outcome\":{},\"start_ns\":{},\
              \"expiry_ns\":{},\"offset_s\":{},\"is_yes\":{},\"px_1e6\":{},\
-             \"qty_1e6\":{},\"p_hat_1e6\":{},\"origin\":{},\"y\":{}}}",
+             \"qty_1e6\":{},\"p_hat_1e6\":{},\"origin\":{},\"y\":{},\
+             \"y_next_strike\":{},\"settle_px_1e6\":{},\"first_fire_ts_ns\":{},\
+             \"first_fire_px_1e6\":{},\"first_fire_is_yes\":{},\"ctl_fire_ts_ns\":{},\
+             \"ctl_fire_px_1e6\":{},\"ctl_fire_is_yes\":{}}}",
             r.ts_ns,
             r.family,
             r.outcome,
@@ -462,11 +721,279 @@ fn render_bin15_entries(
             r.qty_1e6,
             r.p_hat_1e6,
             r.origin,
-            y
-        ));
+            y,
+            y_next,
+            settle_px,
+            ff.ts_ns,
+            ff.px_1e6,
+            ff.is_yes,
+            ctl.ts_ns,
+            ctl.px_1e6,
+            ctl.is_yes
+        );
     }
     s.push(']');
     s
+}
+
+/// The `bin15_first_fires` block of the detail sidecar (BIN15 S5, ruling
+/// O-4; S5b): both counterfactuals on every instance where either test held
+/// and this window's member did not enter — an instance that carries an
+/// entry row is left out here, because that row carries its own as
+/// `first_fire_*` / `ctl_fire_*` columns. `ts_ns` .. `px_1e6` are the
+/// artifact's own test and `ctl_*` today's law, each four `null`s when it
+/// never held. Additive: a reader that predates it ignores it.
+fn render_bin15_first_fires(
+    rows: &[Bin15FirstFireRow],
+    entries: &[Bin15EntryRow],
+    labels: &BTreeMap<u32, crate::backtest::binary::BinaryLabel>,
+) -> String {
+    use core::fmt::Write as _;
+    let entered: std::collections::BTreeSet<u32> = entries.iter().map(|e| e.outcome).collect();
+    let mut s = String::with_capacity(64 + rows.len() * 360);
+    s.push_str("\"bin15_first_fires\":[");
+    let mut first = true;
+    for r in rows.iter().filter(|r| !entered.contains(&r.outcome)) {
+        if !first {
+            s.push(',');
+        }
+        first = false;
+        let (y, y_next, settle_px) = label_of(labels, r.outcome);
+        let (ff, ctl) = (r.fire_cols(), r.ctl_cols());
+        // Writing into a `String` cannot fail.
+        let _ = write!(
+            s,
+            "{{\"ts_ns\":{},\"family\":{},\"outcome\":{},\"start_ns\":{},\
+             \"expiry_ns\":{},\"offset_s\":{},\"is_yes\":{},\"px_1e6\":{},\
+             \"ctl_ts_ns\":{},\"ctl_offset_s\":{},\"ctl_is_yes\":{},\"ctl_px_1e6\":{},\
+             \"y\":{},\"y_next_strike\":{},\"settle_px_1e6\":{}}}",
+            ff.ts_ns,
+            r.family,
+            r.outcome,
+            r.start_ns,
+            r.expiry_ns,
+            ff.offset_s,
+            ff.is_yes,
+            ff.px_1e6,
+            ctl.ts_ns,
+            ctl.offset_s,
+            ctl.is_yes,
+            ctl.px_1e6,
+            y,
+            y_next,
+            settle_px
+        );
+    }
+    s.push(']');
+    s
+}
+
+/// BIN15 H90 (vault doc 33 §L3): one LATE-window entry, as the member
+/// submitted it — caught on the late law's own `covered` 0 -> 1 edge, so it
+/// is an order that really went to the ring. `p_late_1e6` / `sigma_1e9` are
+/// what P1b priced it at; `ctl_p_1e6` the production p̂ on the same side at
+/// the same reprice (`-1`: it did not price there, inside its tail).
+#[derive(Copy, Clone, Debug)]
+struct Bin15LateEntryRow {
+    ts_ns: u64,
+    family: u8,
+    outcome: u32,
+    expiry_ns: u64,
+    /// `1` the member bought YES, `0` NO.
+    is_yes: u8,
+    px_1e6: i64,
+    qty_1e6: i64,
+    p_late_1e6: i32,
+    sigma_1e9: u32,
+    ctl_p_1e6: i32,
+    /// PAPER, by construction: a replay models every fill.
+    origin: u8,
+}
+
+/// BIN15 H90: one instance's two LATE counterfactuals — P1b's test at
+/// persistence 1 (`ff_*`) and the production p̂ under the same test
+/// (`ctl_*`) — each its FIRST hold, logged and never traded; `entered` once
+/// the member placed a late entry on the instance. Held per family while
+/// its instance holds the slot (the member's `LateState` resets at the
+/// settle), flushed when another takes it.
+#[derive(Copy, Clone, Debug)]
+struct Bin15LateFireRow {
+    family: u8,
+    outcome: u32,
+    expiry_ns: u64,
+    ff_ts_ns: u64,
+    ff_is_yes: u8,
+    ff_px_1e6: i32,
+    ctl_ts_ns: u64,
+    ctl_is_yes: u8,
+    ctl_px_1e6: i32,
+    entered: u8,
+}
+
+impl Bin15LateFireRow {
+    /// A live instance's row, before either test held.
+    fn of(family: u8, fam: &strategy_bin15::FamilyState) -> Self {
+        Self {
+            family,
+            outcome: fam.live.outcome,
+            expiry_ns: fam.live.expiry_ns,
+            ff_ts_ns: 0,
+            ff_is_yes: 0,
+            ff_px_1e6: 0,
+            ctl_ts_ns: 0,
+            ctl_is_yes: 0,
+            ctl_px_1e6: 0,
+            entered: 0,
+        }
+    }
+
+    /// Each stamp written once (`0` -> a stamp), never moved after.
+    fn observe(&mut self, st: &strategy_bin15::LateState) {
+        if self.ff_ts_ns == 0 && st.ff_ts != 0 {
+            self.ff_ts_ns = st.ff_ts;
+            self.ff_is_yes = st.ff_yes;
+            self.ff_px_1e6 = st.ff_px_1e6;
+        }
+        if self.ctl_ts_ns == 0 && st.ctl_ts != 0 {
+            self.ctl_ts_ns = st.ctl_ts;
+            self.ctl_is_yes = st.ctl_yes;
+            self.ctl_px_1e6 = st.ctl_px_1e6;
+        }
+        self.entered |= st.covered;
+    }
+
+    /// Whether either test ever held — a row worth keeping.
+    const fn fired(&self) -> bool {
+        self.ff_ts_ns != 0 || self.ctl_ts_ns != 0
+    }
+}
+
+/// BIN15 H90: one family's late step of the harness observer, as
+/// [`track_first_fire`]'s.
+fn track_late_fire(
+    rows: &mut Vec<Bin15LateFireRow>,
+    open: &mut Option<Bin15LateFireRow>,
+    family: u8,
+    fam: &strategy_bin15::FamilyState,
+    st: &strategy_bin15::LateState,
+) {
+    if !fam.is_live() {
+        return;
+    }
+    let outcome = fam.live.outcome;
+    if open.as_ref().is_some_and(|r| r.outcome != outcome) {
+        flush_late_fire(rows, open);
+    }
+    open.get_or_insert_with(|| Bin15LateFireRow::of(family, fam))
+        .observe(st);
+}
+
+/// Moves an ended instance's late row into the block when either test held.
+fn flush_late_fire(rows: &mut Vec<Bin15LateFireRow>, open: &mut Option<Bin15LateFireRow>) {
+    if let Some(r) = open.take().filter(Bin15LateFireRow::fired) {
+        rows.push(r);
+    }
+}
+
+/// BIN15 H90: the `bin15_late_entries` block of the detail sidecar —
+/// additive, written only when the artifact switched the late law on.
+/// `tau_ms` is the time to expiry at the submit; the settlement fields are
+/// every entry block's ([`label_of`]).
+fn render_bin15_late_entries(
+    rows: &[Bin15LateEntryRow],
+    labels: &BTreeMap<u32, crate::backtest::binary::BinaryLabel>,
+) -> String {
+    use core::fmt::Write as _;
+    let mut s = String::with_capacity(32 + rows.len() * 320);
+    s.push_str("\"bin15_late_entries\":[");
+    for (i, r) in rows.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let (y, y_next, settle_px) = label_of(labels, r.outcome);
+        let ctl = OrNull((r.ctl_p_1e6 >= 0).then_some(i64::from(r.ctl_p_1e6)));
+        // Writing into a `String` cannot fail.
+        let _ = write!(
+            s,
+            "{{\"ts_ns\":{},\"family\":{},\"outcome\":{},\"expiry_ns\":{},\"tau_ms\":{},\
+             \"is_yes\":{},\"px_1e6\":{},\"qty_1e6\":{},\"p_late_1e6\":{},\"sigma_1e9\":{},\
+             \"ctl_p_1e6\":{ctl},\"origin\":{},\"y\":{},\"y_next_strike\":{},\"settle_px_1e6\":{}}}",
+            r.ts_ns,
+            r.family,
+            r.outcome,
+            r.expiry_ns,
+            r.expiry_ns.saturating_sub(r.ts_ns) / 1_000_000,
+            r.is_yes,
+            r.px_1e6,
+            r.qty_1e6,
+            r.p_late_1e6,
+            r.sigma_1e9,
+            r.origin,
+            y,
+            y_next,
+            settle_px
+        );
+    }
+    s.push(']');
+    s
+}
+
+/// BIN15 H90: the `bin15_late_fires` block — every instance on which either
+/// late counterfactual held, each four `null`s where it never did.
+fn render_bin15_late_fires(
+    rows: &[Bin15LateFireRow],
+    labels: &BTreeMap<u32, crate::backtest::binary::BinaryLabel>,
+) -> String {
+    use core::fmt::Write as _;
+    let cols = |ts: u64, yes: u8, px: i32| {
+        if ts == 0 {
+            (OrNull(None), OrNull(None), OrNull(None))
+        } else {
+            (
+                OrNull(i64::try_from(ts).ok()),
+                OrNull(Some(i64::from(yes))),
+                OrNull(Some(i64::from(px))),
+            )
+        }
+    };
+    let mut s = String::with_capacity(32 + rows.len() * 280);
+    s.push_str("\"bin15_late_fires\":[");
+    for (i, r) in rows.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let (y, y_next, _) = label_of(labels, r.outcome);
+        let (fts, fyes, fpx) = cols(r.ff_ts_ns, r.ff_is_yes, r.ff_px_1e6);
+        let (cts, cyes, cpx) = cols(r.ctl_ts_ns, r.ctl_is_yes, r.ctl_px_1e6);
+        // Writing into a `String` cannot fail.
+        let _ = write!(
+            s,
+            "{{\"family\":{},\"outcome\":{},\"expiry_ns\":{},\"ff_ts_ns\":{fts},\
+             \"ff_is_yes\":{fyes},\"ff_px_1e6\":{fpx},\"ctl_ts_ns\":{cts},\"ctl_is_yes\":{cyes},\
+             \"ctl_px_1e6\":{cpx},\"entered\":{},\"y\":{},\"y_next_strike\":{}}}",
+            r.family, r.outcome, r.expiry_ns, r.entered, y, y_next
+        );
+    }
+    s.push(']');
+    s
+}
+
+/// BIN15 H90: the `bin15_late_law` block — the late law the member ran
+/// under, so a reader never scores two laws in one number.
+fn render_bin15_late_law(l: &strategy_bin15::late::LateParams) -> String {
+    format!(
+        "\"bin15_late_law\":{{\"enabled\":{},\"tau_min_ns\":{},\"tau_max_ns\":{},\
+         \"p_min_1e6\":{},\"e_1e6\":{},\"persist_polls\":{},\"usd_1e6\":{},\
+         \"sigma_k_1e3\":{}}}",
+        l.enabled,
+        l.tau_min_ns,
+        l.tau_max_ns,
+        l.p_min_1e6,
+        l.e_1e6,
+        l.persist_polls,
+        l.usd_1e6,
+        l.sigma_k_1e3
+    )
 }
 
 /// The `bin15_ledger` block of the detail sidecar (O4b; spec §6.6).
@@ -477,22 +1004,22 @@ fn render_bin15_entries(
 /// inventing a payout is how a calibration table comes out flattering.
 fn render_bin15_ledger(
     rows: &[Bin15LedgerRow],
-    y_by_outcome: &BTreeMap<u32, i64>,
+    labels: &BTreeMap<u32, crate::backtest::binary::BinaryLabel>,
 ) -> String {
-    let mut s = String::with_capacity(64 + rows.len() * 112);
+    use core::fmt::Write as _;
+    let mut s = String::with_capacity(64 + rows.len() * 256);
     s.push_str("\"bin15_ledger\":[");
     for (i, r) in rows.iter().enumerate() {
         if i > 0 {
             s.push(',');
         }
-        let y = match y_by_outcome.get(&r.outcome) {
-            Some(v) => v.to_string(),
-            None => "null".to_owned(),
-        };
-        s.push_str(&format!(
+        let (y, y_next, _) = label_of(labels, r.outcome);
+        // Writing into a `String` cannot fail.
+        let _ = write!(
+            s,
             "{{\"ts_ns\":{},\"family\":{},\"outcome\":{},\"tau_ns\":{},\
              \"p_hat_1e6\":{},\"p_raw_1e6\":{},\"arm\":{},\"entered\":{},\
-             \"mid_1e6\":{},\"y\":{}}}",
+             \"mid_1e6\":{},\"y\":{},\"y_next_strike\":{}}}",
             r.ts_ns,
             r.family,
             r.outcome,
@@ -502,8 +1029,9 @@ fn render_bin15_ledger(
             r.arm,
             r.entered,
             r.mid_1e6,
-            y
-        ));
+            y,
+            y_next
+        );
     }
     s.push(']');
     s
@@ -531,6 +1059,10 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
         &mut opt_out,
         &mut sym_class,
         &mut binary_underlying,
+        MergeLanes {
+            pool_signals: spec.kind == MemberKind::Hyparb,
+            hl_trades: spec.kind == MemberKind::Xmm,
+        },
     )?;
     let universe = derive_universe(&merged);
     let descriptors = manifest_descriptor_table(&runs);
@@ -593,23 +1125,41 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
     // empty for every other member.
     let mut bin15_ledger: Vec<Bin15LedgerRow> = Vec::new();
     let mut bin15_entries: Vec<Bin15EntryRow> = Vec::new();
-    let (hash_hex, member_line, drive_out, member_counters): (String, String, DriveOutcome, String) =
-        match spec.kind {
-            MemberKind::Icdp => {
-                let (params, bytes) = load_icdp_params(&spec.params, &descriptors)?;
-                let hash_hex = hex_lower(&core_crypto::sha256(&bytes));
-                let mut strat: Box<strategy_icdp::IcdpStrategy> =
-                    Box::new(strategy_icdp::IcdpStrategy::new());
-                // Identity anchor: the member reads WALL instants from
-                // every payload (the drive rewrites `ts_ns`), so
-                // mono == wall and the bar clock lands on UTC boundaries.
-                strat
-                    .configure(WallAnchor::new(0, 0), &params)
-                    .map_err(|e| HarnessError::Usage(format!("icdp: configure refused: {e}")))?;
-                strat
-                    .on_start(&mut ctx)
-                    .map_err(|e| HarnessError::Internal(format!("icdp on_start failed: {e}")))?;
-                let line = format!(
+    let mut bin15_first_fires: Vec<Bin15FirstFireRow> = Vec::new();
+    // BIN15 S5: the entry law the member ran under (persistence, ceiling),
+    // stamped on the sidecar so a reader never pairs two laws in one number;
+    // S5b: with the control's bound, the law its `ctl_*` columns record.
+    let mut bin15_entry_law: (u8, u64, i64) = (1, 0, core_config::bin15::E_ENTRY_1E6_DEFAULT);
+    // BIN15 H90: the late law's rows and the law itself, `None` when the
+    // artifact keeps it off (then no late block is written at all).
+    let mut bin15_late_entries: Vec<Bin15LateEntryRow> = Vec::new();
+    let mut bin15_late_fires: Vec<Bin15LateFireRow> = Vec::new();
+    let mut bin15_late_law: Option<strategy_bin15::late::LateParams> = None;
+    // HYPARB H6: the gas ledger. The fill model has no gas lane, so the
+    // member's per-ATTEMPT charge is the ledger; the OOS share comes
+    // off the reported OOS net (0 for every other member).
+    let mut gas_oos_usd_1e6: i64 = 0;
+    let (hash_hex, member_line, drive_out, member_counters): (
+        String,
+        String,
+        DriveOutcome,
+        String,
+    ) = match spec.kind {
+        MemberKind::Icdp => {
+            let (params, bytes) = load_icdp_params(&spec.params, &descriptors)?;
+            let hash_hex = hex_lower(&core_crypto::sha256(&bytes));
+            let mut strat: Box<strategy_icdp::IcdpStrategy> =
+                Box::new(strategy_icdp::IcdpStrategy::new());
+            // Identity anchor: the member reads WALL instants from
+            // every payload (the drive rewrites `ts_ns`), so
+            // mono == wall and the bar clock lands on UTC boundaries.
+            strat
+                .configure(WallAnchor::new(0, 0), &params)
+                .map_err(|e| HarnessError::Usage(format!("icdp: configure refused: {e}")))?;
+            strat
+                .on_start(&mut ctx)
+                .map_err(|e| HarnessError::Internal(format!("icdp on_start failed: {e}")))?;
+            let line = format!(
                     "member: icdp params={} hash={} instruments={} tf_ms={} delta_ms={} anchor=wall (identity)",
                     spec.params.display(),
                     hash_hex,
@@ -617,9 +1167,9 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     params.tf_ns / 1_000_000,
                     params.delta_ns / 1_000_000,
                 );
-                let out = drive(&mut *strat, &mut ctx, &mut engine, &merged, boundary_virt);
-                let c = strat.counters();
-                let counters = format!(
+            let out = drive(&mut *strat, &mut ctx, &mut engine, &merged, boundary_virt);
+            let c = strat.counters();
+            let counters = format!(
                     "member: icdp decisions={} signals={} intents={} exits={} exit_on_stale={} rolls={} late_bars={} \
                      skipped_spread={} skipped_stale_open={} skipped_stale_dec={} skipped_prev={} caps_rejected={} \
                      orders_emitted={} regime=not-replayed(v1)",
@@ -637,43 +1187,116 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     c.caps_rejected,
                     out.orders_emitted,
                 );
-                (hash_hex, line, out, counters)
+            (hash_hex, line, out, counters)
+        }
+        MemberKind::Xmm => {
+            // The boot's own builder, offline: every quoted perp and
+            // its leader resolve against the capture's newest manifest,
+            // so the harness refuses exactly the artifacts the boot does.
+            let (file, bytes) = core_config::xmm::load(&spec.params).map_err(|e| {
+                HarnessError::Usage(format!("--xmm {}: {e}", spec.params.display()))
+            })?;
+            let hash_hex = hex_lower(&core_crypto::sha256(&bytes));
+            let (params, coins) = crate::xmm_boot::build_params(&file, &|d: &str| {
+                descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym)
+            })
+            .map_err(HarnessError::Usage)?;
+            let mut strat = strategy_xmm::XmmStrategy::new();
+            strat
+                .configure(&params)
+                .map_err(|e| HarnessError::Usage(format!("xmm: configure refused: {e}")))?;
+            strat
+                .on_start(&mut ctx)
+                .map_err(|e| HarnessError::Internal(format!("xmm on_start failed: {e}")))?;
+            let line = format!(
+                "member: xmm params={} hash={} coins={} maker_enabled={} theta_bps_1e6={} \
+                     lifetime_ms={} clip_usd_1e6={} ab_mode={} anchor=wall (identity)",
+                spec.params.display(),
+                hash_hex,
+                coins.join(","),
+                params.maker_enabled,
+                params.theta_bps_1e6,
+                params.lifetime_ms,
+                params.clip_usd_1e6,
+                params.ab_mode,
+            );
+            // XH2: the queue law tracks the quoted perps from the first
+            // record, as the boot does on the engine's dispatcher.
+            let mut k = 0usize;
+            while k < params.n_perps as usize {
+                engine.track_queue_sym(params.perps[k].hl_sym);
+                k += 1;
             }
-            MemberKind::Xsd => {
-                // The boot bundle law, offline: descriptors resolve against
-                // the capture's newest manifest; the seed keeps only hours
-                // before the replay's first wall hour (the boot-hour rule);
-                // no state file — a replay always starts flat.
-                let boot_hour = (merged[0].wall_ns / strategy_xsd::HOUR_NS) as i64;
-                let no_state = std::path::Path::new("/nonexistent/xsd-state.tsv");
-                let bundle = crate::xsd_boot::load_xsd_boot(
-                    Some(&spec.params),
-                    spec.table.as_deref(),
-                    spec.seed.as_deref(),
-                    Some(no_state),
-                    &|d: &str| descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
-                    boot_hour,
-                )
-                // The harness replays a FIXED capture, so an empty
-                // chain there is a property of the window the caller
-                // chose, not a transient venue condition to route
-                // around: both causes are a usage error here.
-                .map_err(|e| HarnessError::Usage(e.to_string()))?
-                .ok_or_else(|| {
-                    HarnessError::Usage("xsd: table absent — nothing to drive".to_owned())
-                })?;
-                let hash_hex = hex_lower(&bundle.params.hash);
-                let mut strat = strategy_xsd::XsdStrategy::new();
-                strat
-                    .configure(WallAnchor::new(0, 0), &bundle.params, &bundle.table)
-                    .map_err(|e| HarnessError::Usage(format!("xsd: configure refused: {e}")))?;
-                for (sym, hour, close) in &bundle.seed {
-                    strat.seed_close(*sym, *hour, *close);
-                }
-                strat
-                    .on_start(&mut ctx)
-                    .map_err(|e| HarnessError::Internal(format!("xsd on_start failed: {e}")))?;
-                let line = format!(
+            let out = drive(&mut strat, &mut ctx, &mut engine, &merged, boundary_virt);
+            let hl_trades: u64 = run_summaries.iter().map(|r| r.hl_trades).sum();
+            let q = engine.queue_replay();
+            let m = strat.counters();
+            let counters = format!(
+                    "member: xmm hl_trades={hl_trades} orders_emitted={} queue_placed={} \
+                     queue_rested={} queue_rejected_alo={} queue_stale_modify={} queue_canceled={} \
+                     queue_fills={} queue_filled={} order_events={} queue_open_at_end={} \
+                     modifies={} lead_cancels={} requote_cancels={} pull_cancels={} expiry_cancels={} \
+                     gated={} gate_overflow={} capped={} unmatched={} ctx_refused={} stuck={} \
+                     regime=not-replayed(v1)",
+                    out.orders_emitted,
+                    q.book.placed,
+                    q.book.rested,
+                    q.book.rejected_alo,
+                    q.book.stale_modify,
+                    q.book.canceled,
+                    q.fills,
+                    q.book.filled,
+                    q.events,
+                    q.open_at_end,
+                    m.modifies,
+                    m.lead_cancels,
+                    m.requote_cancels,
+                    m.pull_cancels,
+                    m.expiry_cancels,
+                    m.gated,
+                    m.gate_overflow,
+                    m.capped,
+                    m.unmatched,
+                    m.ctx_refused,
+                    m.stuck,
+                );
+            (hash_hex, line, out, counters)
+        }
+        MemberKind::Xsd => {
+            // The boot bundle law, offline: descriptors resolve against
+            // the capture's newest manifest; the seed keeps only hours
+            // before the replay's first wall hour (the boot-hour rule);
+            // no state file — a replay always starts flat.
+            let boot_hour = (merged[0].wall_ns / strategy_xsd::HOUR_NS) as i64;
+            let no_state = std::path::Path::new("/nonexistent/xsd-state.tsv");
+            let bundle = crate::xsd_boot::load_xsd_boot(
+                Some(&spec.params),
+                spec.table.as_deref(),
+                spec.seed.as_deref(),
+                Some(no_state),
+                &|d: &str| descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                boot_hour,
+            )
+            // The harness replays a FIXED capture, so an empty
+            // chain there is a property of the window the caller
+            // chose, not a transient venue condition to route
+            // around: both causes are a usage error here.
+            .map_err(|e| HarnessError::Usage(e.to_string()))?
+            .ok_or_else(|| {
+                HarnessError::Usage("xsd: table absent — nothing to drive".to_owned())
+            })?;
+            let hash_hex = hex_lower(&bundle.params.hash);
+            let mut strat = strategy_xsd::XsdStrategy::new();
+            strat
+                .configure(WallAnchor::new(0, 0), &bundle.params, &bundle.table)
+                .map_err(|e| HarnessError::Usage(format!("xsd: configure refused: {e}")))?;
+            for (sym, hour, close) in &bundle.seed {
+                strat.seed_close(*sym, *hour, *close);
+            }
+            strat
+                .on_start(&mut ctx)
+                .map_err(|e| HarnessError::Internal(format!("xsd on_start failed: {e}")))?;
+            let line = format!(
                     "member: xsd params={} hash={} table={} table_hash={} targets={} pairs={} syms={} \
                      rows_dropped={} seed_rows={} seed_dropped={} z_window_h={} grid_n={} boot_hour={} \
                      anchor=wall (identity)",
@@ -691,9 +1314,9 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     bundle.params.grid_n,
                     boot_hour,
                 );
-                let out = drive(&mut strat, &mut ctx, &mut engine, &merged, boundary_virt);
-                let c = *strat.counters();
-                let counters = format!(
+            let out = drive(&mut strat, &mut ctx, &mut engine, &merged, boundary_virt);
+            let c = *strat.counters();
+            let counters = format!(
                     "member: xsd rolls={} decisions={} entries={} adds={} exits_revert={} exits_stop={} \
                      exits_maxhold={} exits_regime={} intents_carried={} entries_cancelled={} caps_rejected={} \
                      holds_absent={} pairs_warm={} positions_open={} orders_emitted={} regime=not-replayed(v1)",
@@ -713,108 +1336,107 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     strat.positions(),
                     out.orders_emitted,
                 );
-                (hash_hex, line, out, counters)
-            }
-            MemberKind::Vrp => {
-                // The boot bundle law, offline (Q10): params from the
-                // artifact, the fitted pairs from the worker's seed,
-                // the option chain from the capture's NEWEST manifest —
-                // and NO state, because a replay always starts flat
-                // (the XSD law, same reason).
-                //
-                // V0 C2: an expiry the newest manifest does not carry is
-                // not replayable — its ordinals are gone and no row can
-                // be built for it — so the chain row count is printed
-                // and a campaign on a missing expiry simply never
-                // selects.
-                // P5.2: a capture's options manifest carries the
-                // instrument NAME and nothing else, so the registry
-                // builds these rows by parsing it — zeros here are
-                // "discovery told us nothing", which is the truth
-                // offline, and `rows_from_name` counts them.
-                let chain: Vec<crate::paper::DiscoveredOption> = super::read_manifest_rows(
-                    &runs[runs.len() - 1].path,
-                )
-                .into_iter()
-                .filter(|(_, d)| d.starts_with("deribit:"))
-                .map(|(sym, d)| (d, sym, 0i64, 0i64, 0u8))
-                .collect();
-                let seed = match spec.vrp_seed.clone() {
-                    Some(p) => Some(p),
-                    None => {
-                        // The window cut writes one per window; the
-                        // first run dir's is the campaign's own.
-                        let p = runs[0].path.join("vrp-seed.tsv");
-                        p.exists().then_some(p)
-                    }
-                };
-                let no_state = std::path::Path::new("/nonexistent/vrp-state.tsv");
-                let boot = crate::vrp_boot::load_vrp_boot(
-                    Some(&spec.params),
-                    seed.as_deref(),
-                    Some(no_state),
-                    &|d: &str| descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
-                    &chain,
-                )
-                // The harness replays a FIXED capture, so an empty
-                // chain there is a property of the window the caller
-                // chose, not a transient venue condition to route
-                // around: both causes are a usage error here.
-                .map_err(|e| HarnessError::Usage(e.to_string()))?
-                .ok_or_else(|| {
-                    HarnessError::Usage("vrp: artifact absent — nothing to drive".to_owned())
-                })?;
-                let hash_hex = hex_lower(&boot.hash);
-                let mut strat = strategy_vrp::VrpStrategy::new();
-                // Identity anchor: the member reads WALL instants from
-                // every payload (the drive rewrites `ts_ns`), so
-                // mono == wall and every expiry compare is in the same
-                // clock as the capture's.
-                strat
-                    .configure(
-                        boot.params,
-                        boot.registry.clone(),
-                        boot.underlying_sym,
-                        boot.hedge_sym,
-                        WallAnchor::new(0, 0),
-                        boot.hash,
-                    )
-                    .map_err(|e| HarnessError::Usage(format!("vrp: configure refused: {e}")))?;
-                // F2: the MERGED pairs, pushed exactly once.
-                for (ts_ms, x, y) in &boot.pairs {
-                    strat.seed_pair_at(*ts_ms, *x, *y);
+            (hash_hex, line, out, counters)
+        }
+        MemberKind::Vrp => {
+            // The boot bundle law, offline (Q10): params from the
+            // artifact, the fitted pairs from the worker's seed,
+            // the option chain from the capture's NEWEST manifest —
+            // and NO state, because a replay always starts flat
+            // (the XSD law, same reason).
+            //
+            // V0 C2: an expiry the newest manifest does not carry is
+            // not replayable — its ordinals are gone and no row can
+            // be built for it — so the chain row count is printed
+            // and a campaign on a missing expiry simply never
+            // selects.
+            // P5.2: a capture's options manifest carries the
+            // instrument NAME and nothing else, so the registry
+            // builds these rows by parsing it — zeros here are
+            // "discovery told us nothing", which is the truth
+            // offline, and `rows_from_name` counts them.
+            let chain: Vec<crate::paper::DiscoveredOption> =
+                super::read_manifest_rows(&runs[runs.len() - 1].path)
+                    .into_iter()
+                    .filter(|(_, d)| d.starts_with("deribit:"))
+                    .map(|(sym, d)| (d, sym, 0i64, 0i64, 0u8))
+                    .collect();
+            let seed = match spec.vrp_seed.clone() {
+                Some(p) => Some(p),
+                None => {
+                    // The window cut writes one per window; the
+                    // first run dir's is the campaign's own.
+                    let p = runs[0].path.join("vrp-seed.tsv");
+                    p.exists().then_some(p)
                 }
-                let seeded_minutes = strat.seed_returns(&boot.window);
-                strat
-                    .on_start(&mut ctx)
-                    .map_err(|e| HarnessError::Internal(format!("vrp on_start failed: {e}")))?;
-                let line = format!(
-                    "member: vrp params={} hash={} chain_rows={} chain_refused={} \
+            };
+            let no_state = std::path::Path::new("/nonexistent/vrp-state.tsv");
+            let boot = crate::vrp_boot::load_vrp_boot(
+                Some(&spec.params),
+                seed.as_deref(),
+                Some(no_state),
+                &|d: &str| descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                &chain,
+            )
+            // The harness replays a FIXED capture, so an empty
+            // chain there is a property of the window the caller
+            // chose, not a transient venue condition to route
+            // around: both causes are a usage error here.
+            .map_err(|e| HarnessError::Usage(e.to_string()))?
+            .ok_or_else(|| {
+                HarnessError::Usage("vrp: artifact absent — nothing to drive".to_owned())
+            })?;
+            let hash_hex = hex_lower(&boot.hash);
+            let mut strat = strategy_vrp::VrpStrategy::new();
+            // Identity anchor: the member reads WALL instants from
+            // every payload (the drive rewrites `ts_ns`), so
+            // mono == wall and every expiry compare is in the same
+            // clock as the capture's.
+            strat
+                .configure(
+                    boot.params,
+                    boot.registry.clone(),
+                    boot.underlying_sym,
+                    boot.hedge_sym,
+                    WallAnchor::new(0, 0),
+                    boot.hash,
+                )
+                .map_err(|e| HarnessError::Usage(format!("vrp: configure refused: {e}")))?;
+            // F2: the MERGED pairs, pushed exactly once.
+            for (ts_ms, x, y) in &boot.pairs {
+                strat.seed_pair_at(*ts_ms, *x, *y);
+            }
+            let seeded_minutes = strat.seed_returns(&boot.window);
+            strat
+                .on_start(&mut ctx)
+                .map_err(|e| HarnessError::Internal(format!("vrp on_start failed: {e}")))?;
+            let line = format!(
+                "member: vrp params={} hash={} chain_rows={} chain_refused={} \
                      chain_from_name={} seed={} \
                      seed_pairs={} pairs={} window_minutes={} warm={} tau_ns={} theta_1e9={} \
                      sides={} root=run-dirs (Q3) anchor=wall (identity)",
-                    spec.params.display(),
-                    hash_hex,
-                    boot.registry.len(),
-                    boot.rows_refused,
-                    boot.rows_from_name,
-                    boot.seed_path.display(),
-                    boot.pairs_from_seed,
-                    strat.n_pairs(),
-                    seeded_minutes,
-                    strat.vol_is_warm(),
-                    boot.params.tau_ns,
-                    boot.params.theta_1e9,
-                    match boot.params.sides {
-                        strategy_vrp::SIDES_SHORT => "short",
-                        strategy_vrp::SIDES_LONG => "long",
-                        _ => "both",
-                    },
-                );
-                let out = drive(&mut strat, &mut ctx, &mut engine, &merged, boundary_virt);
-                let c = strat.vrp_counters();
-                let counters = format!(
-                    "member: vrp decisions={} decisions_late={} entries={} entries_submitted={} \
+                spec.params.display(),
+                hash_hex,
+                boot.registry.len(),
+                boot.rows_refused,
+                boot.rows_from_name,
+                boot.seed_path.display(),
+                boot.pairs_from_seed,
+                strat.n_pairs(),
+                seeded_minutes,
+                strat.vol_is_warm(),
+                boot.params.tau_ns,
+                boot.params.theta_1e9,
+                match boot.params.sides {
+                    strategy_vrp::SIDES_SHORT => "short",
+                    strategy_vrp::SIDES_LONG => "long",
+                    _ => "both",
+                },
+            );
+            let out = drive(&mut strat, &mut ctx, &mut engine, &merged, boundary_virt);
+            let c = strat.vrp_counters();
+            let counters = format!(
+                "member: vrp decisions={} decisions_late={} entries={} entries_submitted={} \
                      entries_unfilled={} hedges={} hedge_unfilled={} hedge_abandoned={} exits={} \
                      holds={} holds_side={} no_bounds={} no_selection={} select_scans={} \
                      records_ignored={} stale_skips={} regime_blocked={} regime_exits={} \
@@ -826,312 +1448,508 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                      holds_cost={} vol_minutes={} vol_warm={} \
                      vol_gaps={} pairs={} \
                      regime=not-replayed(v1)",
-                    c.decisions,
-                    c.decisions_late,
-                    c.entries,
-                    c.entries_submitted,
-                    c.entries_unfilled,
-                    c.hedges,
-                    c.hedge_unfilled,
-                    c.hedge_abandoned,
-                    c.exits,
-                    c.holds,
-                    c.holds_side,
-                    c.no_bounds,
-                    c.no_selection,
-                    c.select_scans,
-                    c.records_ignored,
-                    c.stale_skips,
-                    c.regime_blocked,
-                    c.regime_exits,
-                    c.settlements,
-                    c.settled_itm,
-                    c.settled_otm,
-                    c.settled_unpriced,
-                    c.qlike_har_beats_iv,
-                    c.killed,
-                    c.caps_rejected,
-                    c.fills,
-                    c.fills_ignored,
-                    out.orders_emitted,
-                    c.entry_maker_submitted,
-                    c.entry_crossed,
-                    c.entry_cost_refused,
-                    c.hedge_crossed,
-                    c.settle_index_fallback,
-                    c.iv_median_fallback,
-                    c.holds_cost,
-                    strat.vol_minutes(),
-                    strat.vol_is_warm(),
-                    strat.vol_gaps(),
-                    strat.n_pairs(),
-                );
-                (hash_hex, line, out, counters)
+                c.decisions,
+                c.decisions_late,
+                c.entries,
+                c.entries_submitted,
+                c.entries_unfilled,
+                c.hedges,
+                c.hedge_unfilled,
+                c.hedge_abandoned,
+                c.exits,
+                c.holds,
+                c.holds_side,
+                c.no_bounds,
+                c.no_selection,
+                c.select_scans,
+                c.records_ignored,
+                c.stale_skips,
+                c.regime_blocked,
+                c.regime_exits,
+                c.settlements,
+                c.settled_itm,
+                c.settled_otm,
+                c.settled_unpriced,
+                c.qlike_har_beats_iv,
+                c.killed,
+                c.caps_rejected,
+                c.fills,
+                c.fills_ignored,
+                out.orders_emitted,
+                c.entry_maker_submitted,
+                c.entry_crossed,
+                c.entry_cost_refused,
+                c.hedge_crossed,
+                c.settle_index_fallback,
+                c.iv_median_fallback,
+                c.holds_cost,
+                strat.vol_minutes(),
+                strat.vol_is_warm(),
+                strat.vol_gaps(),
+                strat.n_pairs(),
+            );
+            (hash_hex, line, out, counters)
+        }
+        MemberKind::Bin15 => {
+            // OFFLINE THE UNIVERSE IS THE ARTIFACT. There is no
+            // `universe.toml` in a replay, and a rolling slot has no
+            // stable descriptor to resolve — its venue coin is
+            // rebound per instance. But the Yes ordinals are a pure
+            // function of the family INDEX (`family::rolling_sym`),
+            // which is the same reserved pool the boot universe
+            // allocates and the same index `InstrumentRoll` carries
+            // in its `venue_seq`. So the artifact's own list plays
+            // the part `[hyperliquid] rolling` plays at boot, and
+            // the order check below still has something real to
+            // check: the CAPTURE's family indices.
+            let (file, _) = core_config::bin15::load(&spec.params).map_err(|e| {
+                HarnessError::Usage(format!("--bin15 {}: {e}", spec.params.display()))
+            })?;
+            let rolling: Vec<String> = file.families.clone();
+            let rolling_syms: Vec<u32> = (0..rolling.len())
+                .map(|f| ingress_hyperliquid::family::rolling_sym(f, 0))
+                .collect();
+            // THE MISMATCH CHECK. A capture that rolled family 5
+            // against an artifact configuring four families would
+            // bind nothing for it and report a clean zero — the
+            // member would look correct and be blind. Refuse.
+            let instances = crate::backtest::binary::instances_from_events(&merged);
+            let mut named: BTreeSet<usize> = BTreeSet::new();
+            for inst in &instances {
+                named.insert(inst.family as usize);
             }
-            MemberKind::Bin15 => {
-                // OFFLINE THE UNIVERSE IS THE ARTIFACT. There is no
-                // `universe.toml` in a replay, and a rolling slot has no
-                // stable descriptor to resolve — its venue coin is
-                // rebound per instance. But the Yes ordinals are a pure
-                // function of the family INDEX (`family::rolling_sym`),
-                // which is the same reserved pool the boot universe
-                // allocates and the same index `InstrumentRoll` carries
-                // in its `venue_seq`. So the artifact's own list plays
-                // the part `[hyperliquid] rolling` plays at boot, and
-                // the order check below still has something real to
-                // check: the CAPTURE's family indices.
-                let (file, _) = core_config::bin15::load(&spec.params).map_err(|e| {
-                    HarnessError::Usage(format!("--bin15 {}: {e}", spec.params.display()))
-                })?;
-                let rolling: Vec<String> = file.families.clone();
-                let rolling_syms: Vec<u32> = (0..rolling.len())
-                    .map(|f| ingress_hyperliquid::family::rolling_sym(f, 0))
-                    .collect();
-                // THE MISMATCH CHECK. A capture that rolled family 5
-                // against an artifact configuring four families would
-                // bind nothing for it and report a clean zero — the
-                // member would look correct and be blind. Refuse.
-                let instances = crate::backtest::binary::instances_from_events(&merged);
-                let mut named: BTreeSet<usize> = BTreeSet::new();
-                for inst in &instances {
-                    named.insert(inst.family as usize);
-                }
-                if let Some(&top) = named.iter().next_back() {
-                    if top >= rolling.len() {
-                        return Err(HarnessError::Usage(format!(
-                            "bin15: the capture rolls family index {top} but \
+            if let Some(&top) = named.iter().next_back() {
+                if top >= rolling.len() {
+                    return Err(HarnessError::Usage(format!(
+                        "bin15: the capture rolls family index {top} but \
                              `{}` configures only {} families ({:?}) — the member \
                              indexes families by the ingress's own index, so a \
                              short list binds nothing for the missing ones and \
                              reports a clean zero",
-                            spec.params.display(),
-                            rolling.len(),
-                            rolling,
-                        )));
-                    }
+                        spec.params.display(),
+                        rolling.len(),
+                        rolling,
+                    )));
                 }
-                // A replay is a closed world: the seeds come from the
-                // window unless the operator names a directory.
-                let seed_dir: PathBuf = spec
-                    .bin15_seed_dir
-                    .clone()
-                    .unwrap_or_else(|| runs[0].path.clone());
-                let boot = crate::bin15_boot::load_bin15_boot(
-                    Some(&spec.params),
-                    Some(&seed_dir),
-                    &|d: &str| descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
-                    &rolling,
-                    &rolling_syms,
-                )
-                // The harness replays a FIXED capture, so an empty
-                // chain there is a property of the window the caller
-                // chose, not a transient venue condition to route
-                // around: both causes are a usage error here.
-                .map_err(|e| HarnessError::Usage(e.to_string()))?
-                .ok_or_else(|| {
-                    HarnessError::Usage("bin15: artifact absent — nothing to drive".to_owned())
-                })?;
-                let hash_hex = hex_lower(&boot.hash);
-                let mut strat: Box<strategy_bin15::Bin15Strategy> =
-                    Box::new(strategy_bin15::Bin15Strategy::new());
-                let luts = Box::new((*boot.luts).clone());
-                // Identity anchor: the member reads WALL instants from
-                // every payload (the drive rewrites `ts_ns`), so
-                // mono == wall and every expiry compare — which is an
-                // EPOCH instant on this venue — is in the capture's own
-                // clock.
-                strat
-                    .configure(boot.params, luts, WallAnchor::new(0, 0))
-                    .map_err(|e| HarnessError::Usage(format!("bin15: configure refused: {e}")))?;
-                let mut u = 0usize;
-                while u < boot.seeds.len() {
-                    let seed = &boot.seeds[u];
-                    strat.seed_returns(u, &seed.returns);
-                    // Per tenor, as at boot: a quarter-hour pair is not
-                    // an eight-hour pair.
-                    strat.seed_pairs(u, strategy_bin15::FAMILY_OUT_15M, &seed.pairs_15m);
-                    strat.seed_pairs(
-                        u,
-                        strategy_bin15::FAMILY_NATIVE_DAILY,
-                        &seed.pairs_daily,
-                    );
-                    u += 1;
-                }
-                strat
-                    .on_start(&mut ctx)
-                    .map_err(|e| HarnessError::Internal(format!("bin15 on_start failed: {e}")))?;
-                let seeded = boot.seeds.iter().filter(|s| !s.is_empty()).count();
-                let line = format!(
-                    "member: bin15 params={} hash={} families={} underlyings={} \
-                     instances={} seeds={} seed_dir={} anchor=wall (identity)",
-                    spec.params.display(),
-                    hash_hex,
-                    boot.params.n_families,
-                    boot.params.n_underlyings,
-                    instances.len(),
-                    seeded,
-                    seed_dir.display(),
-                );
-                // The calibration ledger (spec §6.6): one sample per
-                // live instance per 30 s, recorded from inside the
-                // drive because it is a time series of belief.
-                let mut ledger: Vec<Bin15LedgerRow> = Vec::new();
-                let mut last_sample: [u64; strategy_bin15::BIN15_MAX_FAMILIES] =
-                    [0; strategy_bin15::BIN15_MAX_FAMILIES];
-                // The coverage entries, caught on the `covered` 0 -> 1
-                // edge. That flag is set ONLY after a submitted emit
-                // (BIN15 P3/F6), so an edge is an order that really
-                // went to the ring — not an attempt the caps refused.
-                let mut entries: Vec<Bin15EntryRow> = Vec::new();
-                let mut was_covered: [u8; strategy_bin15::BIN15_MAX_FAMILIES] =
-                    [0; strategy_bin15::BIN15_MAX_FAMILIES];
-                let out = {
-                    let ledger_ref = &mut ledger;
-                    let last_ref = &mut last_sample;
-                    let entries_ref = &mut entries;
-                    let cov_ref = &mut was_covered;
-                    let mut observe = |rec: &MergedRec, s: &strategy_bin15::Bin15Strategy| {
-                        let mut f = 0usize;
-                        while f < s.n_families() {
-                            let Some(fam) = s.family(f) else { break };
-                            // Only a FRESH price, and that is the whole
-                            // discipline of the row. `p_hat` survives a
-                            // held re-price — inside the tail, on a cold
-                            // forecast, on a one-sided book — so a
-                            // sample taken whenever one merely EXISTS
-                            // records what the member believed minutes
-                            // ago against a `tau` it no longer has. The
-                            // calibration table would then be fitted on
-                            // beliefs nobody acted on. `p_ts_ns ==
-                            // rec.wall_ns` is exactly "this record
-                            // re-priced it".
+            }
+            // A replay is a closed world: the seeds come from the
+            // window unless the operator names a directory.
+            let seed_dir: PathBuf = spec
+                .bin15_seed_dir
+                .clone()
+                .unwrap_or_else(|| runs[0].path.clone());
+            let boot = crate::bin15_boot::load_bin15_boot(
+                Some(&spec.params),
+                Some(&seed_dir),
+                &|d: &str| descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                &rolling,
+                &rolling_syms,
+            )
+            // The harness replays a FIXED capture, so an empty
+            // chain there is a property of the window the caller
+            // chose, not a transient venue condition to route
+            // around: both causes are a usage error here.
+            .map_err(|e| HarnessError::Usage(e.to_string()))?
+            .ok_or_else(|| {
+                HarnessError::Usage("bin15: artifact absent — nothing to drive".to_owned())
+            })?;
+            let hash_hex = hex_lower(&boot.hash);
+            let mut strat: Box<strategy_bin15::Bin15Strategy> =
+                Box::new(strategy_bin15::Bin15Strategy::new());
+            let luts = Box::new((*boot.luts).clone());
+            // Identity anchor: the member reads WALL instants from
+            // every payload (the drive rewrites `ts_ns`), so
+            // mono == wall and every expiry compare — which is an
+            // EPOCH instant on this venue — is in the capture's own
+            // clock.
+            strat
+                .configure(boot.params, luts, WallAnchor::new(0, 0))
+                .map_err(|e| HarnessError::Usage(format!("bin15: configure refused: {e}")))?;
+            // BIN15 H90: the late Φ table, as at boot.
+            if let Some(l) = &boot.late_lut {
+                strat.configure_late(Box::new((**l).clone()));
+            }
+            let mut u = 0usize;
+            while u < boot.seeds.len() {
+                let seed = &boot.seeds[u];
+                strat.seed_returns(u, &seed.returns);
+                // Per tenor, as at boot: a quarter-hour pair is not
+                // an eight-hour pair.
+                strat.seed_pairs(u, strategy_bin15::FAMILY_OUT_15M, &seed.pairs_15m);
+                strat.seed_pairs(u, strategy_bin15::FAMILY_NATIVE_DAILY, &seed.pairs_daily);
+                u += 1;
+            }
+            strat
+                .on_start(&mut ctx)
+                .map_err(|e| HarnessError::Internal(format!("bin15 on_start failed: {e}")))?;
+            let seeded = boot.seeds.iter().filter(|s| !s.is_empty()).count();
+            bin15_entry_law = (
+                boot.params.entry_persist_polls,
+                boot.params.entry_elapsed_max_ns,
+                boot.params.entry_control_e_1e6,
+            );
+            bin15_late_law = (boot.params.late.enabled == 1).then_some(boot.params.late);
+            let line = format!(
+                "member: bin15 params={} hash={} families={} underlyings={} \
+                     instances={} seeds={} seed_dir={} entry={} anchor=wall (identity)",
+                spec.params.display(),
+                hash_hex,
+                boot.params.n_families,
+                boot.params.n_underlyings,
+                instances.len(),
+                seeded,
+                seed_dir.display(),
+                crate::bin15_boot::entry_law(&boot.params),
+            );
+            // The calibration ledger (spec §6.6): one sample per
+            // live instance per 30 s, recorded from inside the
+            // drive because it is a time series of belief.
+            let mut ledger: Vec<Bin15LedgerRow> = Vec::new();
+            let mut last_sample: [u64; strategy_bin15::BIN15_MAX_FAMILIES] =
+                [0; strategy_bin15::BIN15_MAX_FAMILIES];
+            // The coverage entries, caught on the `covered` 0 -> 1
+            // edge. That flag is set ONLY after a submitted emit
+            // (BIN15 P3/F6), so an edge is an order that really
+            // went to the ring — not an attempt the caps refused.
+            let mut entries: Vec<Bin15EntryRow> = Vec::new();
+            let mut was_covered: [u8; strategy_bin15::BIN15_MAX_FAMILIES] =
+                [0; strategy_bin15::BIN15_MAX_FAMILIES];
+            // BIN15 S5/S5b: the two counterfactuals, one row per
+            // instance — held per family while its instance holds the
+            // slot and flushed when another takes it (or the window
+            // ends), so each stamp is its own test's FIRST hold however
+            // far apart the two fired. Keyed on the OUTCOME rather than
+            // an edge, so a roll and a fire landing between two
+            // observations cannot hide the successor's.
+            let mut first_fires: Vec<Bin15FirstFireRow> = Vec::new();
+            let mut open_fires = [None::<Bin15FirstFireRow>; strategy_bin15::BIN15_MAX_FAMILIES];
+            // BIN15 H90: the late entries, on the late law's own `covered`
+            // edge, and its counterfactuals per instance.
+            let mut late_entries: Vec<Bin15LateEntryRow> = Vec::new();
+            let mut late_cov: [u8; strategy_bin15::BIN15_MAX_FAMILIES] =
+                [0; strategy_bin15::BIN15_MAX_FAMILIES];
+            let mut late_fires: Vec<Bin15LateFireRow> = Vec::new();
+            let mut open_late = [None::<Bin15LateFireRow>; strategy_bin15::BIN15_MAX_FAMILIES];
+            let out = {
+                let ledger_ref = &mut ledger;
+                let last_ref = &mut last_sample;
+                let entries_ref = &mut entries;
+                let cov_ref = &mut was_covered;
+                let first_ref = &mut first_fires;
+                let open_ref = &mut open_fires;
+                let late_entries_ref = &mut late_entries;
+                let late_cov_ref = &mut late_cov;
+                let late_fires_ref = &mut late_fires;
+                let open_late_ref = &mut open_late;
+                let mut observe = |rec: &MergedRec, s: &strategy_bin15::Bin15Strategy| {
+                    let mut f = 0usize;
+                    while f < s.n_families() {
+                        let Some(fam) = s.family(f) else { break };
+                        // Only a FRESH price, and that is the whole
+                        // discipline of the row. `p_hat` survives a
+                        // held re-price — inside the tail, on a cold
+                        // forecast, on a one-sided book — so a
+                        // sample taken whenever one merely EXISTS
+                        // records what the member believed minutes
+                        // ago against a `tau` it no longer has. The
+                        // calibration table would then be fitted on
+                        // beliefs nobody acted on. `p_ts_ns ==
+                        // rec.wall_ns` is exactly "this record
+                        // re-priced it".
+                        if fam.is_live()
+                            && fam.p_ts_ns == rec.wall_ns
+                            && rec.wall_ns >= last_ref[f].saturating_add(BIN15_LEDGER_PERIOD_NS)
+                        {
+                            last_ref[f] = rec.wall_ns;
+                            ledger_ref.push(Bin15LedgerRow {
+                                ts_ns: rec.wall_ns,
+                                family: f as u8,
+                                outcome: fam.live.outcome,
+                                // The PRICING horizon, not the time
+                                // to expiry: it is what `p̂` was
+                                // computed at and which
+                                // recalibration phase applied, and a
+                                // calibration table keyed on
+                                // anything else is keyed on the
+                                // wrong thing. The member's own
+                                // (`last_tau_ns`, BIN15 S3 —
+                                // `price::pricing_horizon_ns`), READ
+                                // rather than re-derived here, so
+                                // the row can never disagree with
+                                // the price it records.
+                                tau_ns: fam.last_tau_ns,
+                                p_hat_1e6: fam.p_hat_1e6,
+                                p_raw_1e6: fam.p_raw_1e6,
+                                arm: fam.arm,
+                                entered: fam.covered,
+                                // The Yes book's mid, or -1 when
+                                // the venue is not two-sided. A
+                                // one-sided book has no mid, and
+                                // inventing one would flatter the
+                                // benchmark the model is scored
+                                // against.
+                                mid_1e6: if fam.touch_yes.actionable() {
+                                    (fam.touch_yes.touch.bid_1e6 + fam.touch_yes.touch.ask_1e6) / 2
+                                } else {
+                                    -1
+                                },
+                            });
+                        }
+                        // The entry edge. `pend_take` still holds
+                        // the order that set the flag — the emit
+                        // books the pending before returning — so
+                        // the price and size are the ones actually
+                        // submitted, not a re-derivation.
+                        if fam.is_live()
+                            && fam.covered == 1
+                            && cov_ref[f] == 0
+                            && fam.pend_take.live()
+                        {
+                            entries_ref.push(Bin15EntryRow {
+                                ts_ns: rec.wall_ns,
+                                family: f as u8,
+                                outcome: fam.live.outcome,
+                                start_ns: fam
+                                    .live
+                                    .expiry_ns
+                                    .saturating_sub(strategy_bin15::TAU_15M_NS),
+                                expiry_ns: fam.live.expiry_ns,
+                                is_yes: fam.pend_take.is_yes,
+                                px_1e6: fam.pend_take.px_1e6,
+                                qty_1e6: fam.pend_take.qty_1e6,
+                                p_hat_1e6: fam.p_hat_1e6,
+                                // A REPLAY models its fills. There
+                                // is no venue here and there never
+                                // can be, so this is a fact about
+                                // the harness, not a default.
+                                origin: core_types::FILL_ORIGIN_PAPER,
+                            });
+                        }
+                        cov_ref[f] = fam.covered;
+                        track_first_fire(first_ref, &mut open_ref[f], f as u8, fam);
+                        // BIN15 H90: the late entry edge. `pend_take`
+                        // holds the order that set the flag (the emit
+                        // books it before returning), so the price and
+                        // size are the ones submitted.
+                        if let Some(st) = s.late_state(f) {
                             if fam.is_live()
-                                && fam.p_ts_ns == rec.wall_ns
-                                && rec.wall_ns
-                                    >= last_ref[f].saturating_add(BIN15_LEDGER_PERIOD_NS)
-                            {
-                                last_ref[f] = rec.wall_ns;
-                                ledger_ref.push(Bin15LedgerRow {
-                                    ts_ns: rec.wall_ns,
-                                    family: f as u8,
-                                    outcome: fam.live.outcome,
-                                    // The PRICING horizon, not the time
-                                    // to expiry: it is what `p̂` was
-                                    // computed at and which
-                                    // recalibration phase applied, and a
-                                    // calibration table keyed on
-                                    // anything else is keyed on the
-                                    // wrong thing.
-                                    tau_ns: fam
-                                        .live
-                                        .expiry_ns
-                                        .saturating_sub(rec.wall_ns)
-                                        .saturating_add(fam.live.twap_ns / 3),
-                                    p_hat_1e6: fam.p_hat_1e6,
-                                    p_raw_1e6: fam.p_raw_1e6,
-                                    arm: fam.arm,
-                                    entered: fam.covered,
-                                    // The Yes book's mid, or -1 when
-                                    // the venue is not two-sided. A
-                                    // one-sided book has no mid, and
-                                    // inventing one would flatter the
-                                    // benchmark the model is scored
-                                    // against.
-                                    mid_1e6: if fam.touch_yes.actionable() {
-                                        (fam.touch_yes.touch.bid_1e6
-                                            + fam.touch_yes.touch.ask_1e6)
-                                            / 2
-                                    } else {
-                                        -1
-                                    },
-                                });
-                            }
-                            // The entry edge. `pend_take` still holds
-                            // the order that set the flag — the emit
-                            // books the pending before returning — so
-                            // the price and size are the ones actually
-                            // submitted, not a re-derivation.
-                            if fam.is_live()
-                                && fam.covered == 1
-                                && cov_ref[f] == 0
+                                && st.covered == 1
+                                && late_cov_ref[f] == 0
                                 && fam.pend_take.live()
                             {
-                                entries_ref.push(Bin15EntryRow {
+                                late_entries_ref.push(Bin15LateEntryRow {
                                     ts_ns: rec.wall_ns,
                                     family: f as u8,
                                     outcome: fam.live.outcome,
-                                    start_ns: fam
-                                        .live
-                                        .expiry_ns
-                                        .saturating_sub(strategy_bin15::TAU_15M_NS),
                                     expiry_ns: fam.live.expiry_ns,
                                     is_yes: fam.pend_take.is_yes,
                                     px_1e6: fam.pend_take.px_1e6,
                                     qty_1e6: fam.pend_take.qty_1e6,
-                                    p_hat_1e6: fam.p_hat_1e6,
-                                    // A REPLAY models its fills. There
-                                    // is no venue here and there never
-                                    // can be, so this is a fact about
-                                    // the harness, not a default.
+                                    p_late_1e6: st.entry_p_1e6,
+                                    sigma_1e9: st.entry_sigma_1e9,
+                                    ctl_p_1e6: st.entry_ctl_p_1e6,
                                     origin: core_types::FILL_ORIGIN_PAPER,
                                 });
                             }
-                            cov_ref[f] = fam.covered;
-                            f += 1;
+                            late_cov_ref[f] = st.covered;
+                            track_late_fire(
+                                late_fires_ref,
+                                &mut open_late_ref[f],
+                                f as u8,
+                                fam,
+                                st,
+                            );
                         }
-                    };
-                    drive_with(
-                        &mut *strat,
-                        &mut ctx,
-                        &mut engine,
-                        &merged,
-                        boundary_virt,
-                        &mut observe,
-                    )
+                        f += 1;
+                    }
                 };
-                bin15_ledger = ledger;
-                bin15_entries = entries;
-                let c = strat.counters();
-                let counters = format!(
-                    "member: bin15 reprices={} rolls={} rolls_settled={} spec_overrides={} \
+                drive_with(
+                    &mut *strat,
+                    &mut ctx,
+                    &mut engine,
+                    &merged,
+                    boundary_virt,
+                    &mut observe,
+                )
+            };
+            bin15_ledger = ledger;
+            bin15_entries = entries;
+            let mut slot = 0usize;
+            while slot < open_fires.len() {
+                flush_first_fire(&mut first_fires, &mut open_fires[slot]);
+                slot += 1;
+            }
+            // Instance order: a row flushes when its instance ENDS,
+            // which interleaves the families.
+            first_fires.sort_unstable_by_key(|r| (r.start_ns, r.family));
+            bin15_first_fires = first_fires;
+            let mut slot = 0usize;
+            while slot < open_late.len() {
+                flush_late_fire(&mut late_fires, &mut open_late[slot]);
+                slot += 1;
+            }
+            late_fires.sort_unstable_by_key(|r| (r.expiry_ns, r.family));
+            bin15_late_fires = late_fires;
+            bin15_late_entries = late_entries;
+            let c = strat.counters();
+            let counters = format!(
+                "member: bin15 reprices={} rolls={} rolls_settled={} spec_overrides={} \
                      spec_refused={} takes_submitted={} takes_filled={} takes_unfilled={} \
                      quotes_submitted={} quotes_filled={} quotes_expired={} closes_submitted={} \
                      skipped_tau={} skipped_tail={} skipped_stale={} \
                      skipped_mark_stale={} skipped_book={} \
                      skipped_inventory={} skipped_cap={} skipped_grid={} \
-                     skipped_entry_price={} families_dormant={} \
+                     skipped_entry_price={} skipped_entry_persist={} \
+                     skipped_entry_elapsed={} families_dormant={} \
                      fills={} unknown_fills={} ledger_rows={} orders_emitted={} \
                      regime=not-replayed(v1)",
-                    c.reprices,
-                    c.rolls,
-                    c.rolls_settled,
-                    c.spec_overrides,
-                    c.spec_refused,
-                    c.takes_submitted,
-                    c.takes_filled,
-                    c.takes_unfilled,
-                    c.quotes_submitted,
-                    c.quotes_filled,
-                    c.quotes_expired,
-                    c.closes_submitted,
-                    c.skipped_tau,
-                    c.skipped_tail,
-                    c.skipped_stale,
-                    c.skipped_mark_stale,
-                    c.skipped_book,
-                    c.skipped_inventory,
-                    c.skipped_cap,
-                    c.skipped_grid,
-                    c.skipped_entry_price,
-                    c.families_dormant,
-                    c.fills,
-                    c.unknown_fills,
-                    bin15_ledger.len(),
-                    out.orders_emitted,
-                );
-                (hash_hex, line, out, counters)
-            }
-        };
+                c.reprices,
+                c.rolls,
+                c.rolls_settled,
+                c.spec_overrides,
+                c.spec_refused,
+                c.takes_submitted,
+                c.takes_filled,
+                c.takes_unfilled,
+                c.quotes_submitted,
+                c.quotes_filled,
+                c.quotes_expired,
+                c.closes_submitted,
+                c.skipped_tau,
+                c.skipped_tail,
+                c.skipped_stale,
+                c.skipped_mark_stale,
+                c.skipped_book,
+                c.skipped_inventory,
+                c.skipped_cap,
+                c.skipped_grid,
+                c.skipped_entry_price,
+                c.skipped_entry_persist,
+                c.skipped_entry_elapsed,
+                c.families_dormant,
+                c.fills,
+                c.unknown_fills,
+                bin15_ledger.len(),
+                out.orders_emitted,
+            );
+            (hash_hex, line, out, counters)
+        }
+        MemberKind::Hyparb => {
+            // Pools resolve against the universe's `[hyperevm]` list
+            // (append-only: the live file names every pool an older
+            // capture carries), coins against the capture's newest
+            // manifest — the boot's own resolver, offline.
+            let upath: PathBuf = match &spec.hyparb_universe {
+                Some(p) => p.clone(),
+                None => PathBuf::from(
+                    core_config::universe::default_universe_path()
+                        .map_err(|e| HarnessError::Usage(e.to_string()))?,
+                ),
+            };
+            let uni = core_config::universe::load(&upath)
+                .and_then(|u| core_config::universe::allocate(&u))
+                .map_err(|e| HarnessError::Usage(format!("hyparb: {}: {e}", upath.display())))?;
+            let boot = crate::hyparb_boot::load_hyparb_boot(
+                Some(&spec.params),
+                &|d: &str| descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                &uni.hyperevm,
+                false,
+            )
+            .map_err(HarnessError::Usage)?
+            .ok_or_else(|| HarnessError::Usage("hyparb: artifact absent".to_owned()))?;
+            let hash_hex = hex_lower(&boot.hash);
+            let mut strat = Box::new(strategy_hyparb::HyparbStrategy::new());
+            strat
+                .configure(boot.params.clone(), WallAnchor::new(0, 0))
+                .map_err(|e| HarnessError::Usage(format!("hyparb: configure refused: {e}")))?;
+            strat
+                .on_start(&mut ctx)
+                .map_err(|e| HarnessError::Internal(format!("hyparb on_start failed: {e}")))?;
+            let pool_signals: u64 = run_summaries.iter().map(|r| r.pool_signals).sum();
+            let line = format!(
+                "member: hyparb params={} hash={} universe={} pools={} traded={} coins={} \
+                     pool_signals={} anchor=wall (identity)",
+                spec.params.display(),
+                hash_hex,
+                upath.display(),
+                boot.params.n_pools,
+                boot.traded,
+                boot.params.n_coins,
+                pool_signals,
+            );
+            // The gas charged BEFORE the first OOS record: the
+            // observer runs after each record, so the value it saw
+            // on the previous record is the IS total.
+            let mut gas_prev: i64 = 0;
+            let mut gas_is: Option<i64> = None;
+            let out = {
+                let mut observe = |rec: &MergedRec, st: &strategy_hyparb::HyparbStrategy| {
+                    if gas_is.is_none() && rec.virt_ns >= boundary_virt {
+                        gas_is = Some(gas_prev);
+                    }
+                    gas_prev = st.counters().gas_charged_usd_1e6;
+                };
+                drive_with(
+                    &mut *strat,
+                    &mut ctx,
+                    &mut engine,
+                    &merged,
+                    boundary_virt,
+                    &mut observe,
+                )
+            };
+            let c = strat.counters();
+            gas_oos_usd_1e6 = c.gas_charged_usd_1e6 - gas_is.unwrap_or(c.gas_charged_usd_1e6);
+            let amm = engine.amm_replay();
+            let counters = format!(
+                "member: hyparb pool_events={} pool_refused={} maps_loaded={} maps_refused={} \
+                     evaluations={} arbs={} side_buy={} side_sell={} skipped_below_min={} \
+                     skipped_not_live={} skipped_no_hedge={} skipped_inflight={} \
+                     skipped_cooldown={} skipped_halted={} size_capped={} amm_fills={} \
+                     hedges={} hedges_perp={} hedges_spot={} hedge_fills={} hedges_missed={} \
+                     flattens={} inventory_breaches={} amm_judged_fills={} amm_canceled={} \
+                     amm_partial={} amm_not_live={} gas_usd={} gas_oos_usd={} \
+                     pnl_predicted_usd={} funding_earned_usd={} pnl_session_usd={} \
+                     orders_emitted={} regime=not-replayed(v1)",
+                c.pool_events,
+                c.pool_refused,
+                c.maps_loaded,
+                c.maps_refused,
+                c.evaluations,
+                c.arbs_submitted,
+                c.arbs_buy,
+                c.arbs_sell,
+                c.skipped_below_min,
+                c.skipped_not_live,
+                c.skipped_no_hedge,
+                c.skipped_inflight,
+                c.skipped_cooldown,
+                c.skipped_halted,
+                c.size_capped,
+                c.amm_fills,
+                c.hedges_submitted,
+                c.hedges_perp,
+                c.hedges_spot,
+                c.hedge_fills,
+                c.hedges_missed,
+                c.flattens_submitted,
+                c.inventory_breaches,
+                amm.fills,
+                amm.canceled,
+                amm.partial,
+                amm.not_live,
+                super::fmt_usd_1e6(c.gas_charged_usd_1e6),
+                super::fmt_usd_1e6(gas_oos_usd_1e6),
+                super::fmt_usd_1e6(c.pnl_predicted_usd_1e6),
+                super::fmt_usd_1e6(c.funding_earned_usd_1e6),
+                // HYPARB G1: the member's own session level (cash + marks
+                // + funding − gas), the gate's measure at any judge Δ.
+                super::fmt_usd_1e6(c.pnl_session_usd_1e6),
+                out.orders_emitted,
+            );
+            (hash_hex, line, out, counters)
+        }
+    };
     let outcome: ModelOutcome = engine.finish();
     // BIN15 P4a + P5 (F3, F7): the post-run binary numbers, on the same
     // stderr the pre-run census already went to.
@@ -1143,7 +1961,8 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
     let oos_round_trips = drive_out.round_trips - drive_out.rt_at_boundary;
 
     let vals = ReportValues {
-        oos_net_pnl_1e6: usd_1e12_to_1e6_floor(outcome.oos_net_1e12),
+        // HYPARB H6: after the OOS gas ledger (0 for every other member).
+        oos_net_pnl_1e6: usd_1e12_to_1e6_floor(outcome.oos_net_1e12) - gas_oos_usd_1e6,
         oos_trades: outcome.oos_trades,
         oos_trading_days: outcome.oos_trading_days,
         oos_max_drawdown_1e6: usd_1e12_to_1e6_ceil(outcome.oos_max_dd_1e12),
@@ -1198,7 +2017,10 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
         opts_unconverted: run_summaries.iter().map(|r| r.opts_unconverted).sum(),
         opt_quotes_converted: run_summaries.iter().map(|r| r.opt_quotes_converted).sum(),
         opt_quotes_dropped: run_summaries.iter().map(|r| r.opt_quotes_dropped).sum(),
-        opt_quotes_unregistered: run_summaries.iter().map(|r| r.opt_quotes_unregistered).sum(),
+        opt_quotes_unregistered: run_summaries
+            .iter()
+            .map(|r| r.opt_quotes_unregistered)
+            .sum(),
         opt_registry_refused: run_summaries.iter().map(|r| r.opt_registry_refused).sum(),
         remapped_syms: run_summaries.iter().map(|r| r.remapped_syms).sum(),
         dropped_foreign: run_summaries.iter().map(|r| r.dropped_foreign).sum(),
@@ -1260,15 +2082,29 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
             &if bin15_ledger.is_empty() {
                 String::new()
             } else {
-                let y = crate::backtest::binary::settle_values_by_outcome(
+                let y = crate::backtest::binary::settle_labels_by_outcome(
                     &merged,
                     &binary_underlying,
                     window_end_wall_ns,
                 );
+                // BIN15 H90: additive, and only when the late law was on.
+                let late = bin15_late_law.map_or_else(String::new, |l| {
+                    format!(
+                        ",{},{},{}",
+                        render_bin15_late_entries(&bin15_late_entries, &y),
+                        render_bin15_late_fires(&bin15_late_fires, &y),
+                        render_bin15_late_law(&l)
+                    )
+                });
                 format!(
-                    "{},{}",
+                    "{},{},{},\"bin15_entry_law\":{{\"persist_polls\":{},\"elapsed_max_ns\":{},\
+                     \"control_e_entry_1e6\":{}}}{late}",
                     render_bin15_ledger(&bin15_ledger, &y),
-                    render_bin15_entries(&bin15_entries, &y)
+                    render_bin15_entries(&bin15_entries, &bin15_first_fires, &y),
+                    render_bin15_first_fires(&bin15_first_fires, &bin15_entries, &y),
+                    bin15_entry_law.0,
+                    bin15_entry_law.1,
+                    bin15_entry_law.2
                 )
             },
         );
@@ -1339,6 +2175,12 @@ fn render_member_summary(
     for r in runs {
         s.push_str(&format!("  run-{}: ", r.epoch_ns));
         s.push_str(&super::render_stale_line(&r.stale));
+        // BIN15 S2: which clock this run's wall instants are on.
+        if r.wall_tell != super::clock::ClockTell::Silent {
+            use std::fmt::Write as _;
+            // Writing into a `String` cannot fail.
+            let _ = write!(s, " {}", r.wall_tell);
+        }
         s.push('\n');
     }
     s.push_str(&format!(
@@ -1437,6 +2279,10 @@ mod tests {
         assert_eq!(MemberKind::Icdp.label(), "icdp");
         assert_eq!(MemberKind::Xsd.label(), "xsd");
         assert_eq!(MemberKind::Vrp.label(), "vrp");
+        // XMM XH1: slot 6's member is drivable offline; icdp stays too.
+        assert_eq!(MemberKind::parse("xmm"), Some(MemberKind::Xmm));
+        assert_eq!(MemberKind::Xmm.label(), "xmm");
+        assert_eq!(MemberKind::parse("XMM"), None);
     }
 
     #[test]
@@ -1466,12 +2312,34 @@ mod tests {
             p_hat_1e6: 700_000,
             origin: core_types::FILL_ORIGIN_PAPER,
         };
+        let ff = Bin15FirstFireRow {
+            family: 0,
+            outcome: 7,
+            start_ns: 100,
+            expiry_ns: 900_000_000_100,
+            ff_ts_ns: 900,
+            ff_is_yes: 1,
+            ff_px_1e6: 620_000,
+            ctl_ts_ns: 800,
+            ctl_is_yes: 1,
+            ctl_px_1e6: 630_000,
+        };
         let mut y = BTreeMap::new();
-        y.insert(7u32, 1_000_000i64);
-        let s = render_bin15_entries(&[row], &y);
+        y.insert(
+            7u32,
+            crate::backtest::binary::BinaryLabel {
+                value_1e6: Some(1_000_000),
+                px_1e6: Some(77_083_333_333),
+                y_next_strike: 1_000_000,
+            },
+        );
+        let s = render_bin15_entries(&[row], &[ff], &y);
 
         assert!(s.contains("\"origin\":1"), "{s}");
         assert!(s.contains("\"y\":1000000"), "{s}");
+        // BIN15 S1: the two additive settlement keys ride every row.
+        assert!(s.contains("\"y_next_strike\":1000000"), "{s}");
+        assert!(s.contains("\"settle_px_1e6\":77083333333"), "{s}");
         // PAPER is 1 and VENUE is 0 — pinned here because the Python
         // reader mirrors those two integers and nothing else connects
         // them.
@@ -1480,8 +2348,294 @@ mod tests {
 
         // An unsettled row still carries the stamp: `y` being null is
         // about the payout, never about which accounting it belongs to.
-        let s2 = render_bin15_entries(&[row], &BTreeMap::new());
+        let s2 = render_bin15_entries(&[row], &[], &BTreeMap::new());
         assert!(s2.contains("\"origin\":1"), "{s2}");
         assert!(s2.contains("\"y\":null"), "{s2}");
+        assert!(s2.contains("\"y_next_strike\":-1"), "{s2}");
+        assert!(s2.contains("\"settle_px_1e6\":null"), "{s2}");
+        // BIN15 S5/S5b: both counterfactuals ride the entry row they pair
+        // with, joined by outcome; with none recorded the keys are null.
+        assert!(
+            s.ends_with(
+                "\"first_fire_ts_ns\":900,\"first_fire_px_1e6\":620000,\"first_fire_is_yes\":1,\
+                 \"ctl_fire_ts_ns\":800,\"ctl_fire_px_1e6\":630000,\"ctl_fire_is_yes\":1}]"
+            ),
+            "{s}"
+        );
+        assert!(
+            s2.ends_with(
+                "\"first_fire_ts_ns\":null,\"first_fire_px_1e6\":null,\"first_fire_is_yes\":null,\
+                 \"ctl_fire_ts_ns\":null,\"ctl_fire_px_1e6\":null,\"ctl_fire_is_yes\":null}]"
+            ),
+            "{s2}"
+        );
+        // A control that never held is null on its own — an artifact whose
+        // test is looser than today's law.
+        let loose = Bin15FirstFireRow { ctl_ts_ns: 0, ..ff };
+        let s3 = render_bin15_entries(&[row], &[loose], &y);
+        assert!(
+            s3.ends_with(
+                "\"first_fire_ts_ns\":900,\"first_fire_px_1e6\":620000,\"first_fire_is_yes\":1,\
+                 \"ctl_fire_ts_ns\":null,\"ctl_fire_px_1e6\":null,\"ctl_fire_is_yes\":null}]"
+            ),
+            "{s3}"
+        );
+    }
+
+    /// BIN15 S5 (ruling O-4) + S5b: the `bin15_first_fires` block carries
+    /// both counterfactuals on every instance the member did NOT enter,
+    /// labelled like an entry, each `null` where its test never held — and
+    /// leaves out an entered one, whose row already carries them, so every
+    /// instance appears exactly once.
+    #[test]
+    fn the_first_fires_block_carries_both_counterfactuals_on_the_instances_not_entered() {
+        let row = |outcome: u32, ff_ts_ns: u64, is_yes: u8, px_1e6: i64| Bin15FirstFireRow {
+            family: 0,
+            outcome,
+            start_ns: 1_000_000_000_000,
+            expiry_ns: 1_900_000_000_000,
+            ff_ts_ns,
+            ff_is_yes: is_yes,
+            ff_px_1e6: px_1e6,
+            ctl_ts_ns: 1_000_000_000_000 + 60_000_000_000,
+            ctl_is_yes: is_yes,
+            ctl_px_1e6: px_1e6 + 20_000,
+        };
+        let entered = Bin15EntryRow {
+            ts_ns: 1_000_000_000_000 + 130_000_000_000,
+            family: 0,
+            outcome: 8,
+            start_ns: 1_000_000_000_000,
+            expiry_ns: 1_900_000_000_000,
+            is_yes: 1,
+            px_1e6: 650_000,
+            qty_1e6: 76_000_000,
+            p_hat_1e6: 700_000,
+            origin: core_types::FILL_ORIGIN_PAPER,
+        };
+        let mut y = BTreeMap::new();
+        y.insert(
+            9u32,
+            crate::backtest::binary::BinaryLabel {
+                value_1e6: Some(0),
+                px_1e6: Some(2_500_000_000),
+                y_next_strike: 0,
+            },
+        );
+        let fired = 1_000_000_000_000 + 95_000_000_000;
+        let s = render_bin15_first_fires(
+            &[
+                row(8, fired, 1, 640_000),
+                row(9, fired, 0, 410_000),
+                row(10, 0, 1, 700_000),
+            ],
+            &[entered],
+            &y,
+        );
+        assert_eq!(
+            s,
+            "\"bin15_first_fires\":[{\"ts_ns\":1095000000000,\"family\":0,\"outcome\":9,\
+             \"start_ns\":1000000000000,\"expiry_ns\":1900000000000,\"offset_s\":95,\
+             \"is_yes\":0,\"px_1e6\":410000,\"ctl_ts_ns\":1060000000000,\"ctl_offset_s\":60,\
+             \"ctl_is_yes\":0,\"ctl_px_1e6\":430000,\"y\":0,\"y_next_strike\":0,\
+             \"settle_px_1e6\":2500000000},{\"ts_ns\":null,\"family\":0,\"outcome\":10,\
+             \"start_ns\":1000000000000,\"expiry_ns\":1900000000000,\"offset_s\":null,\
+             \"is_yes\":null,\"px_1e6\":null,\"ctl_ts_ns\":1060000000000,\"ctl_offset_s\":60,\
+             \"ctl_is_yes\":1,\"ctl_px_1e6\":720000,\"y\":null,\"y_next_strike\":-1,\
+             \"settle_px_1e6\":null}]"
+        );
+        assert_eq!(
+            render_bin15_first_fires(&[], &[], &y),
+            "\"bin15_first_fires\":[]"
+        );
+    }
+
+    /// BIN15 S5b: the observer's step — a dormant slot records nothing, a
+    /// roll flushes the ended instance's row (the successor's control can
+    /// fire in the same record), and a row on which neither test held is
+    /// dropped at the window's end.
+    #[test]
+    fn a_roll_flushes_the_ended_instance_and_the_window_end_the_rest() {
+        let mut rows = Vec::new();
+        let mut open = None;
+        let mut fam = strategy_bin15::FamilyState::default();
+        track_first_fire(&mut rows, &mut open, 1, &fam);
+        assert!(open.is_none(), "a dormant slot opens no row");
+        fam.live.outcome = 7;
+        fam.live.expiry_ns = 1_900_000_000_000;
+        track_first_fire(&mut rows, &mut open, 1, &fam);
+        fam.entry_first_ok_ts = 1_095_000_000_000;
+        fam.entry_first_ok_yes = 1;
+        fam.entry_first_ok_px_1e6 = 620_000;
+        track_first_fire(&mut rows, &mut open, 1, &fam);
+        // The roll: 7 settles and 8 binds, its control firing in the same
+        // record — the member's slot is already the successor's.
+        let mut next = strategy_bin15::FamilyState::default();
+        next.live.outcome = 8;
+        next.live.expiry_ns = 2_800_000_000_000;
+        next.entry_ctl_ok_ts = 1_950_000_000_000;
+        next.entry_ctl_ok_px_1e6 = 700_000;
+        track_first_fire(&mut rows, &mut open, 1, &next);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].outcome, rows[0].ff_ts_ns, rows[0].family),
+            (7, 1_095_000_000_000, 1)
+        );
+        assert_eq!(
+            open.map(|r| (r.outcome, r.ctl_ts_ns)),
+            Some((8, 1_950_000_000_000))
+        );
+        // 9 binds and neither test ever holds on it: the window's end drops it.
+        let mut idle = strategy_bin15::FamilyState::default();
+        idle.live.outcome = 9;
+        idle.live.expiry_ns = 3_700_000_000_000;
+        track_first_fire(&mut rows, &mut open, 1, &idle);
+        flush_first_fire(&mut rows, &mut open);
+        assert_eq!(rows.iter().map(|r| r.outcome).collect::<Vec<_>>(), [7, 8]);
+    }
+
+    /// BIN15 S5b: a row keeps each counterfactual's FIRST stamp — written
+    /// once, whichever test held first — and reaches the block only when
+    /// either test ever held.
+    #[test]
+    fn a_first_fire_row_keeps_each_first_stamp_and_flushes_only_when_fired() {
+        let mut fam = strategy_bin15::FamilyState::default();
+        fam.live.outcome = 7;
+        fam.live.expiry_ns = 1_900_000_000_000;
+        let mut rows = Vec::new();
+        let mut open = Some(Bin15FirstFireRow::of(2, &fam));
+        flush_first_fire(&mut rows, &mut open);
+        assert!(
+            rows.is_empty() && open.is_none(),
+            "neither test held: nothing to keep"
+        );
+
+        let mut row = Bin15FirstFireRow::of(2, &fam);
+        assert_eq!(
+            (row.family, row.outcome, row.start_ns),
+            (2, 7, 1_000_000_000_000)
+        );
+        fam.entry_ctl_ok_ts = 1_060_000_000_000;
+        fam.entry_ctl_ok_yes = 1;
+        fam.entry_ctl_ok_px_1e6 = 640_000;
+        row.observe(&fam);
+        assert!(row.fired() && row.ff_ts_ns == 0, "the control alone held");
+        fam.entry_first_ok_ts = 1_095_000_000_000;
+        fam.entry_first_ok_yes = 1;
+        fam.entry_first_ok_px_1e6 = 620_000;
+        // The member never rewrites a stamp within an instance; the row
+        // holds its first regardless.
+        fam.entry_ctl_ok_ts = 1_200_000_000_000;
+        row.observe(&fam);
+        assert_eq!(
+            (row.ff_ts_ns, row.ff_is_yes, row.ff_px_1e6),
+            (1_095_000_000_000, 1, 620_000)
+        );
+        assert_eq!(
+            (row.ctl_ts_ns, row.ctl_is_yes, row.ctl_px_1e6),
+            (1_060_000_000_000, 1, 640_000)
+        );
+        let mut open = Some(row);
+        flush_first_fire(&mut rows, &mut open);
+        assert_eq!((rows.len(), open.is_none()), (1, true));
+    }
+
+    /// BIN15 H90: the late blocks are the wire to `claude_worker.bin15_late`,
+    /// which reads them by key — the entry row with its PAPER stamp, its
+    /// beliefs and its settlement, the fires with `null` for a test that
+    /// never held, and the law the member ran under.
+    #[test]
+    fn the_late_blocks_carry_the_entry_its_counterfactuals_and_the_law() {
+        let row = Bin15LateEntryRow {
+            ts_ns: 880_000_000_000,
+            family: 0,
+            outcome: 7,
+            expiry_ns: 900_000_000_000,
+            is_yes: 1,
+            px_1e6: 950_000,
+            qty_1e6: 105_000_000,
+            p_late_1e6: 991_000,
+            sigma_1e9: 120_000,
+            ctl_p_1e6: -1,
+            origin: core_types::FILL_ORIGIN_PAPER,
+        };
+        let mut y = BTreeMap::new();
+        y.insert(
+            7u32,
+            crate::backtest::binary::BinaryLabel {
+                value_1e6: Some(1_000_000),
+                px_1e6: Some(77_083_333_333),
+                y_next_strike: 1_000_000,
+            },
+        );
+        let s = render_bin15_late_entries(&[row], &y);
+        for want in [
+            "\"bin15_late_entries\":[{",
+            "\"tau_ms\":20000",
+            "\"p_late_1e6\":991000",
+            "\"sigma_1e9\":120000",
+            "\"ctl_p_1e6\":null",
+            "\"origin\":1",
+            "\"y\":1000000",
+            "\"settle_px_1e6\":77083333333",
+        ] {
+            assert!(s.contains(want), "{want} in {s}");
+        }
+        let with_ctl = render_bin15_late_entries(
+            &[Bin15LateEntryRow {
+                ctl_p_1e6: 930_000,
+                ..row
+            }],
+            &y,
+        );
+        assert!(with_ctl.contains("\"ctl_p_1e6\":930000"), "{with_ctl}");
+
+        // The fire row: P1b held, the production pricer never did.
+        let mut fam = strategy_bin15::FamilyState::default();
+        fam.live.outcome = 7;
+        fam.live.expiry_ns = 900_000_000_000;
+        fam.live.strike_1e6 = 1;
+        let mut st = strategy_bin15::LateState::default();
+        let mut rows = Vec::new();
+        let mut open = None;
+        track_late_fire(&mut rows, &mut open, 0, &fam, &st);
+        st.ff_ts = 875_000_000_000;
+        st.ff_yes = 1;
+        st.ff_px_1e6 = 940_000;
+        st.covered = 1;
+        track_late_fire(&mut rows, &mut open, 0, &fam, &st);
+        // A later stamp never moves the first.
+        st.ff_ts = 885_000_000_000;
+        track_late_fire(&mut rows, &mut open, 0, &fam, &st);
+        flush_late_fire(&mut rows, &mut open);
+        assert_eq!(rows.len(), 1);
+        let f = render_bin15_late_fires(&rows, &y);
+        for want in [
+            "\"ff_ts_ns\":875000000000",
+            "\"ff_is_yes\":1",
+            "\"ff_px_1e6\":940000",
+            "\"ctl_ts_ns\":null",
+            "\"ctl_is_yes\":null",
+            "\"entered\":1",
+            "\"y\":1000000",
+        ] {
+            assert!(f.contains(want), "{want} in {f}");
+        }
+        // An instance where neither test held is not a row.
+        let mut none = Vec::new();
+        let mut open2 = Some(Bin15LateFireRow::of(0, &fam));
+        flush_late_fire(&mut none, &mut open2);
+        assert!(none.is_empty());
+
+        let law = strategy_bin15::late::LateParams {
+            enabled: 1,
+            ..Default::default()
+        };
+        let l = render_bin15_late_law(&law);
+        assert!(l.starts_with("\"bin15_late_law\":{\"enabled\":1,"), "{l}");
+        assert!(
+            l.contains("\"tau_min_ns\":2000000000") && l.contains("\"sigma_k_1e3\":1550"),
+            "{l}"
+        );
     }
 }

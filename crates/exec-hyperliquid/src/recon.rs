@@ -56,7 +56,7 @@ use core_parse::{find_field, skip_ws};
 /// So this is deliberately far above anything observed: overflow is
 /// correctly an error (a position nobody saw reconciles by not being
 /// there), which makes an undersized buffer a self-inflicted outage.
-/// 256 rows is 6 KiB.
+/// 256 rows is 8 KiB (32 B a row, pinned below [`SpotBalance`]).
 pub const MAX_SPOT_BALANCES: usize = 256;
 
 // Real headroom above what the venue has actually been observed to
@@ -65,7 +65,7 @@ pub const MAX_SPOT_BALANCES: usize = 256;
 // that must fail the build rather than a test run.
 const _: () = assert!(MAX_SPOT_BALANCES >= 14 * 4);
 
-use crate::json::{decimal_field, object_end, string_field};
+use crate::json::{decimal_field, object_end, object_field, string_field};
 use crate::response::{ScanErr, Span};
 
 /// One row of the venue's spot balance sheet.
@@ -81,7 +81,15 @@ pub struct SpotBalance {
     pub total_1e8: i64,
     /// Amount held against open orders, 1e8.
     pub hold_1e8: i64,
+    /// The venue's cost basis of the holding (`entryNtl`), USDC 1e8.
+    /// What an outcome leg is valued at by [`account_view`]; `0` when
+    /// the row has none (the quote token, a husk).
+    pub entry_ntl_1e8: i64,
 }
+
+// The reconciler's table: 256 rows of 32 B, 8 KiB (the gateway boxes one,
+// XH5b-1).
+const _: () = assert!(core::mem::size_of::<[SpotBalance; MAX_SPOT_BALANCES]>() == 8_192);
 
 impl SpotBalance {
     /// Total minus what is already committed to resting orders.
@@ -143,6 +151,8 @@ pub fn scan_spot_state(body: &[u8], out: &mut [SpotBalance]) -> Result<usize, Sc
         // `hold` is absent on some rows; absent means nothing is held,
         // which is a STATED default rather than a guess.
         let hold = decimal_field(obj, b"\"hold\"").unwrap_or(0);
+        // `entryNtl` likewise: absent is no cost basis, a stated zero.
+        let entry_ntl = decimal_field(obj, b"\"entryNtl\"").unwrap_or(0);
 
         if n >= out.len() {
             return Err(ScanErr::Malformed);
@@ -157,6 +167,7 @@ pub fn scan_spot_state(body: &[u8], out: &mut [SpotBalance]) -> Result<usize, Sc
             },
             total_1e8: total,
             hold_1e8: hold,
+            entry_ntl_1e8: entry_ntl,
         };
         n += 1;
         i = obj_end;
@@ -286,38 +297,96 @@ pub fn unreconciled_venue_legs(
     n
 }
 
-/// **E7 session bound** — the two numbers the bound is judged from,
-/// read off one scanned balance sheet: the account's spot USDC (×1e6)
-/// and how many outcome legs it holds.
+/// **E7 session bound** — one balance sheet, read for the account's
+/// worth. See [`account_view`].
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub struct AccountView {
+    /// Spot USDC, `total` (held-against-orders USDC is still USDC, so a
+    /// resting bid does not read as a loss), ×1e6.
+    pub usdc_1e6: i64,
+    /// What the held outcome legs COST — the sum of their `entryNtl`,
+    /// ×1e6.
+    pub held_cost_1e6: i64,
+    /// Outcome legs with a non-zero holding.
+    pub legs: u32,
+    /// Explicit padding.
+    _pad: u32,
+}
+
+impl AccountView {
+    /// A view from its three readings.
+    #[inline]
+    #[must_use]
+    pub const fn new(usdc_1e6: i64, held_cost_1e6: i64, legs: u32) -> Self {
+        Self {
+            usdc_1e6,
+            held_cost_1e6,
+            legs,
+            _pad: 0,
+        }
+    }
+
+    /// The account's worth AT COST: USDC plus what the held legs cost.
+    #[inline]
+    #[must_use]
+    pub const fn equity_at_cost_1e6(&self) -> i64 {
+        self.usdc_1e6.saturating_add(self.held_cost_1e6)
+    }
+}
+
+/// **E7 session bound** — the numbers the bound is judged from, read
+/// off one scanned balance sheet: spot USDC, the cost of the held
+/// outcome legs, and how many there are.
 ///
-/// `USDC` is the venue's quote row and the only balance whose change
-/// IS realised P&L once no leg is held — fees and settlements
-/// included, from the one source this arm already trusts over its
-/// own ledger. A `+` row with a non-zero total is a position worth
-/// anything from 0 to 1 USDC until the venue settles it, and the bound
-/// is not judged while one exists (`exec_router::halt::trigger_for`
-/// reads `pnl_flat`). Held-against-orders USDC is still USDC: `total`,
-/// not `free`, so a resting bid does not read as a loss.
+/// **A held leg is valued at COST (`entryNtl`).** Buying one moves
+/// nothing — USDC falls by the premium and the cost rises by it, fees
+/// aside — so the equity changes only when the venue REALISES P&L: a
+/// settlement pays 0 or 1 USDC and the leg's cost leaves the sheet, a
+/// sale returns its price. That makes the bound judgeable at every
+/// reconciliation. The first cut valued nothing and judged only while
+/// flat, and a book that is never flat — overlapping 15-minute
+/// instances, the daily families — was never judged at all (risk
+/// review 2026-09-24, gap B). An open leg's unrealised loss is not in
+/// the figure: the instance and day caps bound it, and it is realised
+/// at the leg's settlement.
 ///
-/// A sheet without a `USDC` row reports `0`, which the arm treats as
-/// "nothing to anchor" — never as a $-anchor loss.
+/// A sheet without a `USDC` row reports `usdc_1e6 = 0`, which the arm
+/// treats as "nothing to anchor" — never as a $-anchor loss.
 #[must_use]
-pub fn account_view(bal: &[SpotBalance], body: &[u8]) -> (i64, u32) {
-    let mut usdc_1e6 = 0i64;
-    let mut legs = 0u32;
+pub fn account_view(bal: &[SpotBalance], body: &[u8]) -> AccountView {
+    let mut v = AccountView::default();
     let mut i = 0usize;
     while i < bal.len() {
         let coin = bal[i].coin.of(body);
+        // The scanner is ×1e8; the bound, like every USD figure the
+        // router compares, is ×1e6.
         if coin == b"USDC" {
-            // The scanner is ×1e8; the bound, like every USD figure
-            // the router compares, is ×1e6.
-            usdc_1e6 = bal[i].total_1e8 / 100;
+            v.usdc_1e6 = bal[i].total_1e8 / 100;
         } else if matches!(coin.first(), Some(b'+')) && bal[i].total_1e8 != 0 {
-            legs = legs.saturating_add(1);
+            v.legs = v.legs.saturating_add(1);
+            v.held_cost_1e6 = v
+                .held_cost_1e6
+                .saturating_add(leg_cost_1e6(bal[i].total_1e8, bal[i].entry_ntl_1e8));
         }
         i += 1;
     }
-    (usdc_1e6, legs)
+    v
+}
+
+/// **E7 / XH4i-2 — one held outcome leg AT COST**, ×1e6: the venue's
+/// `entryNtl` clamped to what the holding can EVER pay — 1 USDC a
+/// contract, so `total` in USDC — and never below zero. A buy's basis is
+/// always under that; a partial sale whose basis the venue did not reduce
+/// pro rata (unmeasured) must not read as a leg worth more than it could
+/// settle for. [`account_view`] sums it over a sheet's held `+<enc>` rows;
+/// an outcome arm on the gateway sums it over the spot read's `EV_BALANCE`
+/// rows (XH4i-4) — one formula for both arms.
+#[inline]
+#[must_use]
+pub fn leg_cost_1e6(total_1e8: i64, entry_ntl_1e8: i64) -> i64 {
+    // The sheet is ×1e8; every USD figure the router compares is ×1e6.
+    entry_ntl_1e8.min(total_1e8).max(0) / 100
 }
 
 /// The most one HIP-4 outcome contract can ever be worth, 1e6.
@@ -424,14 +493,33 @@ pub(crate) fn user_info_request(
     master: &[u8; 20],
 ) -> Result<usize, ScanErr> {
     const TAIL: &[u8] = br#""}"#;
-    let n = head.len() + 40 + TAIL.len();
-    if out.len() < n {
+    let i = user_info_open(out, head, master, TAIL.len())?;
+    // COPY: the 2 B closing literal of the render `user_info_open` began,
+    // into the same final body (a literal is written by a copy); rejected:
+    // nothing — this IS the render, once per request.
+    out[i..i + TAIL.len()].copy_from_slice(TAIL);
+    Ok(i + TAIL.len())
+}
+
+/// `<head><40 hex>` into `out` with `room` more bytes free behind it —
+/// the part every per-user request shares. Returns where it ends.
+fn user_info_open(
+    out: &mut [u8],
+    head: &[u8],
+    master: &[u8; 20],
+    room: usize,
+) -> Result<usize, ScanErr> {
+    let n = head.len() + 40;
+    if out.len() < n + room {
         return Err(ScanErr::Malformed);
     }
-    // COPY: ≤ 64 B request literal + 40 hex chars into the caller's
-    // boot-owned body — the RENDER of the `/info` request (once per
-    // reconcile / sweep / boot, ≥ seconds apart); the body must exist
-    // once.
+    // COPY: ≤ 64 B request literal + 40 hex chars into the caller's final
+    // body — the RENDER of the `/info` request, once per request at its
+    // caller's cadence (e.g. the gateway arm's sheet and orders every read
+    // period, its spot sheet after each perp sheet, its budget every
+    // `limit_ms`, a day page a read period apart, a sweep round's read; the
+    // blocking arm's and HYPARB's reads); the body must exist once.
+    // Rejected: nothing — the render's own write, no staging between.
     out[..head.len()].copy_from_slice(head);
     let mut i = head.len();
     for b in master {
@@ -439,9 +527,66 @@ pub(crate) fn user_info_request(
         out[i + 1] = HEX[usize::from(b & 0x0F)];
         i += 2;
     }
-    // COPY: the 2 B closing literal of the same render.
-    out[i..i + TAIL.len()].copy_from_slice(TAIL);
     Ok(n)
+}
+
+/// **XH4e — the day's fills**: render
+/// `{"type":"userFillsByTime","user":"0x<40 hex>","startTime":<ms>,"endTime":<ms>}`
+/// once, into the caller's buffer, the digits written in place.
+///
+/// # Errors
+/// `out` is shorter than the render.
+pub fn fills_by_time_request(
+    out: &mut [u8],
+    master: &[u8; 20],
+    start_ms: u64,
+    end_ms: u64,
+) -> Result<usize, ScanErr> {
+    const START: &[u8] = br#"","startTime":"#;
+    const END: &[u8] = br#","endTime":"#;
+    let (ds, de) = (digits(start_ms), digits(end_ms));
+    let i = user_info_open(
+        out,
+        crate::dayspend::HEAD,
+        master,
+        START.len() + ds + END.len() + de + 1,
+    )?;
+    // COPY: the 14 B key literal of the render `user_info_open` began, into
+    // the same final body (the digits follow in place, backwards);
+    // rejected: nothing — this IS the render.
+    out[i..i + START.len()].copy_from_slice(START);
+    let i = put_digits(out, i + START.len(), start_ms, ds);
+    // COPY: the 11 B key literal of the same render, into the same final
+    // body; rejected: nothing — this IS the render.
+    out[i..i + END.len()].copy_from_slice(END);
+    let i = put_digits(out, i + END.len(), end_ms, de);
+    out[i] = b'}';
+    Ok(i + 1)
+}
+
+/// The number of decimal digits of `v` (1 for 0) — the day reads' renders
+/// (this module's and `dayspend`'s).
+#[inline]
+pub(crate) const fn digits(mut v: u64) -> usize {
+    let mut n = 1usize;
+    while v >= 10 {
+        v /= 10;
+        n += 1;
+    }
+    n
+}
+
+/// `v`'s `n` decimal digits written at `out[at..at + n]`, backwards, in
+/// place (no staging); returns where they end.
+#[inline]
+pub(crate) fn put_digits(out: &mut [u8], at: usize, mut v: u64, n: usize) -> usize {
+    let mut k = at + n;
+    while k > at {
+        k -= 1;
+        out[k] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    at + n
 }
 
 /// Scan a `frontendOpenOrders` answer.
@@ -513,10 +658,18 @@ pub fn scan_open_orders(body: &[u8], out: &mut [OpenOrder]) -> Result<usize, Sca
     }
 }
 
+/// **Every slot** — the mask a sweep of a retired leg carries (LAW E-8:
+/// a leg whose instance ended is nobody's to keep). A halted slot's
+/// sweep carries `1 << slot` (XMM XH5a).
+pub const ALL_SLOTS: u8 = u8::MAX;
+
+// A slot mask is one byte: one bit per value of the cloid's slot byte.
+const _: () = assert!(core_config::exec::EXEC_SLOTS <= 8);
+
 /// Of the orders the venue says are resting, which are **ours, on this
-/// leg** — returns how many oids were written to `out`.
+/// leg, of these slots** — returns how many oids were written to `out`.
 ///
-/// Two filters, and both matter:
+/// Three filters, and all three matter:
 ///
 /// - **The coin must match exactly.** The answer covers the whole
 ///   account, and a sweep of one retired leg must not touch another.
@@ -524,25 +677,38 @@ pub fn scan_open_orders(body: &[u8], out: &mut [OpenOrder]) -> Result<usize, Sca
 ///   the venue UI carries no cloid and a stranger's carries someone
 ///   else's magic; cancelling either would be the mirror image of
 ///   booking a stranger's fill.
+/// - **Its slot byte must be in `slots`** (XMM XH5a). One account
+///   serves several slots, and a halt cancels the halted slot's orders
+///   while a sibling slot's quotes stay. [`ALL_SLOTS`] takes every
+///   slot's.
 ///
 /// Pure, so the arm and the testnet probe run the SAME selection — the
 /// same reason [`compare_booked`] lives here rather than on
 /// `HlExchange`. A sweep whose selection was only ever exercised
 /// behind a socket is a claim about source code.
 #[must_use]
-pub fn ours_on_leg(rows: &[OpenOrder], body: &[u8], coin: &[u8], out: &mut [u64]) -> usize {
+pub fn ours_on_leg(
+    rows: &[OpenOrder],
+    body: &[u8],
+    coin: &[u8],
+    slots: u8,
+    out: &mut [u64],
+) -> usize {
     let mut n = 0usize;
     let mut i = 0usize;
     while i < rows.len() {
-        let row = rows[i];
+        let row = &rows[i];
         i += 1;
         if row.coin.of(body) != coin {
             continue;
         }
-        if !matches!(
-            row.cloid.as_ref().map(crate::cloid::decode),
-            Some(crate::cloid::Owner::Ours { .. })
-        ) {
+        let Some(crate::cloid::Owner::Ours { strategy_id, .. }) =
+            row.cloid.as_ref().map(crate::cloid::decode)
+        else {
+            continue;
+        };
+        // `strategy_id < EXEC_SLOTS` (≤ 8) by `decode`: the shift is exact.
+        if slots & (1u8 << strategy_id) == 0 {
             continue;
         }
         if n >= out.len() {
@@ -560,6 +726,56 @@ pub fn ours_on_leg(rows: &[OpenOrder], body: &[u8], coin: &[u8], out: &mut [u64]
         n += 1;
     }
     n
+}
+
+/// **S7-L1 — every resting order of OURS on the account, whatever the
+/// leg**, as `(asset, oid)` pairs for the cancel action. Returns
+/// `(written, unmapped)`: `unmapped` counts orders of ours on a coin
+/// that is not an outcome leg's `#<enc>` — this crate cannot name an
+/// asset id for one, so it cannot cancel it, and says so rather than
+/// skipping it in silence.
+///
+/// The boot and shutdown sweeps' selection. The cloid filter is
+/// [`ours_on_leg`]'s (LAW E-9: an order placed from the venue UI, or a
+/// stranger's, is never touched); there is no coin filter, because
+/// what these sweeps exist for is the order no leg of this process
+/// knows about — one a previous process left on an instance that has
+/// rolled since. The asset id comes off the venue's own coin name
+/// (`asset::asset_of_fill_coin` says why a cancel may do that and an
+/// order may not). `written == out.len()` means there may be more, as
+/// there.
+#[must_use]
+pub fn ours_everywhere(
+    rows: &[OpenOrder],
+    body: &[u8],
+    out: &mut [crate::action::CancelWire],
+) -> (usize, u32) {
+    let mut n = 0usize;
+    let mut unmapped = 0u32;
+    let mut i = 0usize;
+    while i < rows.len() {
+        let row = &rows[i];
+        i += 1;
+        if !matches!(
+            row.cloid.as_ref().map(crate::cloid::decode),
+            Some(crate::cloid::Owner::Ours { .. })
+        ) {
+            continue;
+        }
+        let Some(asset) = crate::asset::asset_of_fill_coin(row.coin.of(body)) else {
+            unmapped = unmapped.saturating_add(1);
+            continue;
+        };
+        if n >= out.len() {
+            return (n, unmapped);
+        }
+        out[n] = crate::action::CancelWire {
+            asset,
+            oid: row.oid,
+        };
+        n += 1;
+    }
+    (n, unmapped)
 }
 
 /// An unsigned integer field, for `oid`. `decimal_field` is for the
@@ -596,7 +812,151 @@ pub const MAX_STATE_REQ: usize = 96;
 /// # Errors
 /// The buffer is shorter than [`MAX_STATE_REQ`].
 pub fn spot_state_request(out: &mut [u8], master: &[u8; 20]) -> Result<usize, ScanErr> {
-    user_info_request(out, br#"{"type":"spotClearinghouseState","user":"0x"#, master)
+    user_info_request(
+        out,
+        br#"{"type":"spotClearinghouseState","user":"0x"#,
+        master,
+    )
+}
+
+/// HYPARB L3: render `{"type":"clearinghouseState","user":"0x<40 hex>"}`
+/// — the PERP account (margin, positions), which the spot sheet above
+/// does not show. Zero-alloc; the buffer needs [`MAX_STATE_REQ`].
+///
+/// # Errors
+/// The buffer is too short.
+pub fn perp_state_request(out: &mut [u8], master: &[u8; 20]) -> Result<usize, ScanErr> {
+    user_info_request(out, br#"{"type":"clearinghouseState","user":"0x"#, master)
+}
+
+/// **XMM XH5b-2**: render `{"type":"userRole","user":"0x<40 hex>"}` — what
+/// the venue knows an address as: a master, or an API wallet and the master
+/// it signs for. Zero-alloc; the buffer needs [`MAX_STATE_REQ`].
+///
+/// # Errors
+/// The buffer is too short.
+pub fn user_role_request(out: &mut [u8], user: &[u8; 20]) -> Result<usize, ScanErr> {
+    user_info_request(out, br#"{"type":"userRole","user":"0x"#, user)
+}
+
+/// **XMM XH5b-2** — what a `userRole` answer says an address is.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// A master account (`"role":"user"`): it signs as itself.
+    User,
+    /// An API wallet and the master that approved it
+    /// (`"role":"agent","data":{"user":…}`) — where its orders land.
+    Agent([u8; 20]),
+    /// Any other answer (`missing`, `vault`, `subAccount`), or one that
+    /// does not scan.
+    Other,
+}
+
+/// **XMM XH5b-2** — scan a `userRole` answer in place (boot only). The
+/// venue's answer for an API wallet, measured (`userws_conn`):
+/// `{"role":"agent","data":{"user":"0x<master>"}}`.
+#[must_use]
+pub fn scan_user_role(b: &[u8]) -> Role {
+    let Some(r) = string_field(b, b"\"role\"") else {
+        return Role::Other;
+    };
+    match r.of(b) {
+        b"user" => Role::User,
+        b"agent" => {
+            let Some((s, e)) = object_field(b, b"\"data\"") else {
+                return Role::Other;
+            };
+            let d = &b[s..e];
+            string_field(d, b"\"user\"")
+                .and_then(|u| core::str::from_utf8(u.of(d)).ok())
+                .and_then(crate::config::parse_hex20)
+                .map_or(Role::Other, Role::Agent)
+        }
+        _ => Role::Other,
+    }
+}
+
+/// One perp position from a `clearinghouseState` body.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PerpPosition {
+    /// The coin (`"HYPE"`), a span into the scanned body.
+    pub coin: Span,
+    /// Signed size, coin × 1e8 (negative = short).
+    pub szi_1e8: i64,
+    /// `positionValue`: the position at the venue's mark, USD × 1e8 (0
+    /// when the row omits it) — the mark a reconciliation prices its
+    /// drift with (XH4d).
+    pub value_1e8: i64,
+}
+
+/// Scan a `clearinghouseState` body: `marginSummary.accountValue`
+/// (USD × 1e8 — margin plus every position's unrealised P&L at the
+/// venue's marks) and each `assetPositions[].position{coin, szi}` into
+/// `out`. Returns `(account value, positions written)`.
+///
+/// # Errors
+/// A missing `marginSummary` / `accountValue` / `assetPositions`, a
+/// row without a `coin` or an `szi`, a truncated array, or more rows
+/// than `out` holds — every one a refusal, never "no positions" (a
+/// reconciler that read a broken sheet as flat would anchor on it).
+pub fn scan_perp_state(body: &[u8], out: &mut [PerpPosition]) -> Result<(i64, usize), ScanErr> {
+    let ms = find_field(body, b"\"marginSummary\"").ok_or(ScanErr::Malformed)?;
+    let mut i = skip_ws(body, ms);
+    if i >= body.len() || body[i] != b':' {
+        return Err(ScanErr::Malformed);
+    }
+    i = skip_ws(body, i + 1);
+    if i >= body.len() || body[i] != b'{' {
+        return Err(ScanErr::Malformed);
+    }
+    let ms_end = object_end(body, i).ok_or(ScanErr::Malformed)?;
+    let value = decimal_field(&body[i..ms_end], b"\"accountValue\"").ok_or(ScanErr::Malformed)?;
+
+    let pos = find_field(body, b"\"assetPositions\"").ok_or(ScanErr::Malformed)?;
+    let mut i = skip_ws(body, pos);
+    if i >= body.len() || body[i] != b':' {
+        return Err(ScanErr::Malformed);
+    }
+    i = skip_ws(body, i + 1);
+    if i >= body.len() || body[i] != b'[' {
+        return Err(ScanErr::Malformed);
+    }
+    i += 1;
+    let mut n = 0usize;
+    loop {
+        i = skip_ws(body, i);
+        if i >= body.len() {
+            return Err(ScanErr::Malformed);
+        }
+        if body[i] == b']' {
+            return Ok((value, n));
+        }
+        if body[i] == b',' {
+            i += 1;
+            continue;
+        }
+        if body[i] != b'{' {
+            return Err(ScanErr::Malformed);
+        }
+        let end = object_end(body, i).ok_or(ScanErr::Malformed)?;
+        let row = &body[i..end];
+        let coin = string_field(row, b"\"coin\"").ok_or(ScanErr::Malformed)?;
+        let szi = decimal_field(row, b"\"szi\"").ok_or(ScanErr::Malformed)?;
+        let value = decimal_field(row, b"\"positionValue\"").unwrap_or(0);
+        if n >= out.len() {
+            return Err(ScanErr::Malformed);
+        }
+        out[n] = PerpPosition {
+            coin: Span {
+                start: coin.start + i as u32,
+                end: coin.end + i as u32,
+            },
+            szi_1e8: szi,
+            value_1e8: value,
+        };
+        n += 1;
+        i = end;
+    }
 }
 
 const HEX: [u8; 16] = *b"0123456789abcdef";
@@ -642,6 +1002,45 @@ mod tests {
         assert!(spot_state_request(&mut small, &[0xAB; 20]).is_err());
     }
 
+    /// HYPARB L3: the perp sheet, in the venue's documented shape.
+    /// `crossMarginSummary` carries its own `accountValue`; the one read
+    /// is `marginSummary`'s. Short sizes are negative.
+    #[test]
+    fn the_perp_sheet_reads_the_account_value_and_every_position() {
+        let body = br#"{"marginSummary":{"accountValue":"13109.482328","totalNtlPos":"1.1","totalRawUsd":"13108.3","totalMarginUsed":"0.1"},"crossMarginSummary":{"accountValue":"999.0","totalNtlPos":"0.0","totalRawUsd":"0.0","totalMarginUsed":"0.0"},"crossMaintenanceMarginUsed":"0.0","withdrawable":"13104.5","assetPositions":[{"type":"oneWay","position":{"coin":"ETH","cumFunding":{"allTime":"514.08","sinceChange":"0.0","sinceOpen":"0.0"},"entryPx":"2986.3","leverage":{"rawUsd":"-95.06","type":"isolated","value":20},"liquidationPx":"2866.26","marginUsed":"4.97","maxLeverage":50,"positionValue":"100.02","returnOnEquity":"-0.0026","szi":"0.0335","unrealizedPnl":"-0.0134"}},{"type":"oneWay","position":{"coin":"HYPE","entryPx":"92.1","szi":"-0.5","unrealizedPnl":"0.1"}}],"time":1708622398623}"#;
+        let mut out = [PerpPosition::default(); 4];
+        let (value, n) = scan_perp_state(body, &mut out).expect("scans");
+        assert_eq!(value, 1_310_948_232_800);
+        assert_eq!(n, 2);
+        assert_eq!(out[0].coin.of(body), b"ETH");
+        assert_eq!(out[0].szi_1e8, 3_350_000);
+        assert_eq!(out[1].coin.of(body), b"HYPE");
+        assert_eq!(out[1].szi_1e8, -50_000_000);
+        // Measured shape of an empty account (testnet, 2026-09-24).
+        let empty = br#"{"marginSummary":{"accountValue":"0.0","totalNtlPos":"0.0","totalRawUsd":"0.0","totalMarginUsed":"0.0"},"crossMarginSummary":{"accountValue":"0.0","totalNtlPos":"0.0","totalRawUsd":"0.0","totalMarginUsed":"0.0"},"crossMaintenanceMarginUsed":"0.0","withdrawable":"0.0","assetPositions":[],"time":1790230894391}"#;
+        assert_eq!(scan_perp_state(empty, &mut out), Ok((0, 0)));
+        // Refusals: too many rows, a row without szi, a truncated array,
+        // no margin summary.
+        let mut one = [PerpPosition::default(); 1];
+        assert!(scan_perp_state(body, &mut one).is_err());
+        let s = core::str::from_utf8(body).unwrap();
+        assert!(
+            scan_perp_state(s.replacen("\"szi\":\"-0.5\",", "", 1).as_bytes(), &mut out).is_err()
+        );
+        assert!(scan_perp_state(&body[..body.len() - 30], &mut out).is_err());
+        assert!(scan_perp_state(
+            s.replacen("\"marginSummary\"", "\"x\"", 1).as_bytes(),
+            &mut out
+        )
+        .is_err());
+        let mut buf = [0u8; MAX_STATE_REQ];
+        let n = perp_state_request(&mut buf, &[0xAB; 20]).expect("fits");
+        assert_eq!(
+            core::str::from_utf8(&buf[..n]).unwrap(),
+            "{\"type\":\"clearinghouseState\",\"user\":\"0xabababababababababababababababababababab\"}"
+        );
+    }
+
     /// The two namespaces meet in exactly one function, and it
     /// compares BYTES — parsing either side into a number would make
     /// `+032530` and `#32530` compare equal.
@@ -649,8 +1048,14 @@ mod tests {
     fn the_two_namespaces_match_on_the_enc_and_nothing_else() {
         assert!(same_leg(b"+32530", b"#32530"));
         assert!(!same_leg(b"+32530", b"#32531"), "different leg");
-        assert!(!same_leg(b"+032530", b"#32530"), "a leading zero is a different name");
-        assert!(!same_leg(b"#32530", b"#32530"), "a fill name is not a balance name");
+        assert!(
+            !same_leg(b"+032530", b"#32530"),
+            "a leading zero is a different name"
+        );
+        assert!(
+            !same_leg(b"#32530", b"#32530"),
+            "a fill name is not a balance name"
+        );
         assert!(!same_leg(b"+32530", b"+32530"), "and vice versa");
         assert!(!same_leg(b"USDC", b"#32530"));
         assert!(!same_leg(b"+", b"#"), "an empty enc matches nothing");
@@ -700,9 +1105,9 @@ mod tests {
             b"{}",
             b"not json at all",
             br#"{"balances":}"#,
-            br#"{"balances":[{"coin":"USDC"}]}"#,          // no total
-            br#"{"balances":[{"total":"1.0"}]}"#,          // no coin
-            br#"{"balances":[{"coin":"USDC","total":"1"#,  // truncated
+            br#"{"balances":[{"coin":"USDC"}]}"#, // no total
+            br#"{"balances":[{"total":"1.0"}]}"#, // no coin
+            br#"{"balances":[{"coin":"USDC","total":"1"#, // truncated
             br#"{"balances":[{"coin":"USDC","total":"1.0"},"#, // no close
         ] {
             assert!(
@@ -712,10 +1117,7 @@ mod tests {
             );
         }
         // An explicitly EMPTY sheet is legitimate and is not an error.
-        assert_eq!(
-            scan_spot_state(br#"{"balances":[]}"#, &mut out),
-            Ok(0)
-        );
+        assert_eq!(scan_spot_state(br#"{"balances":[]}"#, &mut out), Ok(0));
     }
 
     /// A position the caller never saw is a position that reconciles
@@ -816,38 +1218,97 @@ mod tests {
 
         // USDC is not a position this arm's ledger ever claimed to
         // track, so it is skipped rather than counted forever.
-        let only_quote = br#"{"balances":[{"coin":"USDC","token":0,"total":"968.0","hold":"0.0"}]}"#;
+        let only_quote =
+            br#"{"balances":[{"coin":"USDC","token":0,"total":"968.0","hold":"0.0"}]}"#;
         let mut b2 = [SpotBalance::default(); MAX_SPOT_BALANCES];
         let n2 = scan_spot_state(only_quote, &mut b2).expect("scans");
         let empty = crate::asset::AssetTable::new();
         assert_eq!(unreconciled_venue_legs(&empty, &b2[..n2], only_quote), 0);
     }
 
+    /// XH4i-2: one leg at cost — `entryNtl` clamped to the holding ($1 a
+    /// contract) and never below zero; the formula `account_view` sums.
+    #[test]
+    fn a_leg_at_cost_is_its_basis_clamped_to_what_it_can_pay() {
+        assert_eq!(leg_cost_1e6(2_500_000_000, 1_025_000_000), 10_250_000);
+        assert_eq!(
+            leg_cost_1e6(200_000_000, 300_000_000),
+            2_000_000,
+            "never above $1 a contract"
+        );
+        assert_eq!(
+            leg_cost_1e6(200_000_000, -150_000_000),
+            0,
+            "never below zero"
+        );
+        assert_eq!(
+            leg_cost_1e6(-200_000_000, 100_000_000),
+            0,
+            "a negative holding is worth nothing"
+        );
+        assert_eq!(leg_cost_1e6(400_000_000, 0), 0, "no basis");
+    }
+
     /// **E7 session bound.** The account view is the USDC row (×1e6,
-    /// total not free) and a count of legs with a non-zero holding —
-    /// the venue's zero husks do not count, and a sheet without USDC
+    /// total not free), the held legs' cost (`entryNtl`) and a count of
+    /// legs with a non-zero holding — the venue's zero husks do not
+    /// count (nor does a husk's stale cost), and a sheet without USDC
     /// reads zero rather than inventing a balance.
     #[test]
-    fn the_account_view_is_the_usdc_row_and_the_held_legs() {
+    fn the_account_view_is_the_usdc_row_and_the_held_legs_at_cost() {
+        // The `+194180` row is the shape mainnet sent (2026-09-19):
+        // 2 contracts, cost basis 1.36.
         let body = br#"{"balances":[
-            {"coin":"USDC","token":0,"total":"997.64","hold":"2.0"},
-            {"coin":"+194180","token":2,"total":"2.0","hold":"0.0"},
-            {"coin":"+195720","token":3,"total":"0.0","hold":"0.0"}
+            {"coin":"USDC","token":0,"total":"997.64","hold":"2.0","entryNtl":"0.0"},
+            {"coin":"+194180","token":2,"total":"2.0","hold":"0.0","entryNtl":"1.36"},
+            {"coin":"+195720","token":3,"total":"0.0","hold":"0.0","entryNtl":"0.9"}
         ]}"#;
         let mut bal = [SpotBalance::default(); MAX_SPOT_BALANCES];
         let n = scan_spot_state(body, &mut bal).expect("scans");
-        assert_eq!(account_view(&bal[..n], body), (997_640_000, 1));
+        assert_eq!(bal[1].entry_ntl_1e8, 136_000_000);
+        let v = account_view(&bal[..n], body);
+        assert_eq!(
+            (v.usdc_1e6, v.legs, v.held_cost_1e6),
+            (997_640_000, 1, 1_360_000)
+        );
+        assert_eq!(
+            v.equity_at_cost_1e6(),
+            999_000_000,
+            "USDC plus the legs at cost"
+        );
 
         let flat = br#"{"balances":[
             {"coin":"USDC","token":0,"total":"8.63","hold":"0.0"},
             {"coin":"+195720","token":3,"total":"0.0","hold":"0.0"}
         ]}"#;
         let n2 = scan_spot_state(flat, &mut bal).expect("scans");
-        assert_eq!(account_view(&bal[..n2], flat), (8_630_000, 0), "a husk is not a leg");
+        let v2 = account_view(&bal[..n2], flat);
+        assert_eq!(
+            (v2.usdc_1e6, v2.legs, v2.held_cost_1e6),
+            (8_630_000, 0, 0),
+            "a husk"
+        );
+        assert_eq!(v2.equity_at_cost_1e6(), 8_630_000);
 
         let no_quote = br#"{"balances":[{"coin":"+195720","token":3,"total":"1.0","hold":"0.0"}]}"#;
         let n3 = scan_spot_state(no_quote, &mut bal).expect("scans");
-        assert_eq!(account_view(&bal[..n3], no_quote), (0, 1), "no USDC row reads zero");
+        let v3 = account_view(&bal[..n3], no_quote);
+        assert_eq!((v3.usdc_1e6, v3.legs), (0, 1), "no USDC row reads zero");
+        assert_eq!(
+            v3.held_cost_1e6, 0,
+            "a row without entryNtl has no cost basis"
+        );
+
+        // A basis above what the holding can pay (2 contracts pay at
+        // most $2) is clamped to it; a negative one to zero.
+        let over = br#"{"balances":[
+            {"coin":"USDC","token":0,"total":"5.0","hold":"0.0"},
+            {"coin":"+194180","token":2,"total":"2.0","hold":"0.0","entryNtl":"3.0"},
+            {"coin":"+195720","token":3,"total":"1.0","hold":"0.0","entryNtl":"-1.0"}
+        ]}"#;
+        let n4 = scan_spot_state(over, &mut bal).expect("scans");
+        let v4 = account_view(&bal[..n4], over);
+        assert_eq!((v4.legs, v4.held_cost_1e6), (2, 2_000_000));
     }
 
     /// The shape a sweep reads. `frontendOpenOrders` is a TOP-LEVEL
@@ -880,6 +1341,49 @@ mod tests {
         // sweep must leave it alone.
         assert_eq!(out[1].oid, 60_246_216_460);
         assert!(out[1].cloid.is_none());
+    }
+
+    /// **S7-L1 — the boot and shutdown sweeps' selection.** Ours, on
+    /// every leg, with the asset id read off the venue's coin name; a
+    /// UI order and a stranger's are left alone; an order of ours on a
+    /// coin that is not `#<enc>` is COUNTED, not dropped; and a full
+    /// buffer stops at its length, which the caller reads as "maybe
+    /// more".
+    #[test]
+    fn the_account_wide_selection_is_ours_on_every_leg_and_nothing_else() {
+        let body = br##"[
+          {"coin":"#194180","oid":101,"side":"B","cloid":"0x4d560300000000000000000000000065"},
+          {"coin":"#195721","oid":102,"side":"A","cloid":"0x4d560300000000000000000000000066"},
+          {"coin":"#194180","oid":103,"side":"B"},
+          {"coin":"#194180","oid":104,"side":"B","cloid":"0x00000000000000000000000000000001"},
+          {"coin":"BTC","oid":105,"side":"B","cloid":"0x4d560300000000000000000000000067"}
+        ]"##;
+        let mut rows = [OpenOrder::default(); 8];
+        let n = scan_open_orders(body, &mut rows).expect("scans");
+        assert_eq!(n, 5);
+        let mut out = [crate::action::CancelWire { asset: 0, oid: 0 }; 8];
+        let (k, unmapped) = ours_everywhere(&rows[..n], body, &mut out);
+        assert_eq!(
+            (k, unmapped),
+            (2, 1),
+            "two outcome legs of ours; the BTC one counted"
+        );
+        assert_eq!(
+            (out[0].asset, out[0].oid),
+            (crate::asset::ASSET_BASE + 194_180, 101)
+        );
+        assert_eq!(
+            (out[1].asset, out[1].oid),
+            (crate::asset::ASSET_BASE + 195_721, 102)
+        );
+
+        let mut one = [crate::action::CancelWire { asset: 0, oid: 0 }; 1];
+        let (k1, _) = ours_everywhere(&rows[..n], body, &mut one);
+        assert_eq!(
+            k1,
+            one.len(),
+            "a full buffer reports its length: maybe more"
+        );
     }
 
     /// An account with nothing resting answers `[]`. That is a real
@@ -982,7 +1486,7 @@ mod tests {
         assert_eq!(n, 5);
 
         let mut out = [0u64; MAX_OPEN_ORDERS];
-        let k = ours_on_leg(&rows[..n], &body, b"#195641", &mut out);
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", ALL_SLOTS, &mut out);
         assert_eq!(&out[..k], &[11, 15], "ours on THIS leg, and nothing else");
 
         // 12 is a foreign cloid, 13 has none (placed from the UI), and
@@ -994,13 +1498,50 @@ mod tests {
 
         // The other leg selects its own, which is the same statement
         // from the other side.
-        let k2 = ours_on_leg(&rows[..n], &body, b"#195640", &mut out);
+        let k2 = ours_on_leg(&rows[..n], &body, b"#195640", ALL_SLOTS, &mut out);
         assert_eq!(&out[..k2], &[14]);
 
         // A leg with nothing of ours selects nothing rather than
         // falling back to "cancel what is there".
-        let k3 = ours_on_leg(&rows[..n], &body, b"#999999", &mut out);
+        let k3 = ours_on_leg(&rows[..n], &body, b"#999999", ALL_SLOTS, &mut out);
         assert_eq!(k3, 0);
+    }
+
+    /// **XMM XH5a — a halt's sweep takes its own slot's orders.** One
+    /// account, two slots' quotes on one leg: slot 3's sweep selects
+    /// slot 3's alone, slot 7's its own, and a roll's every slot's —
+    /// the selection the arm's per-slot cancel runs.
+    #[test]
+    fn a_slot_s_sweep_selects_that_slot_s_orders_alone() {
+        let hex = |slot: u8, oid: u64| {
+            let c = crate::cloid::encode(slot, oid);
+            let mut h = [0u8; 34];
+            let n = crate::cloid::to_hex(&c, &mut h);
+            String::from_utf8(h[..n].to_vec()).expect("ascii")
+        };
+        let (three, seven) = (hex(3, 0x65), hex(7, 0x66));
+        let body = format!(
+            r##"[
+              {{"coin":"#195641","oid":11,"cloid":"{three}"}},
+              {{"coin":"#195641","oid":12,"cloid":"{seven}"}},
+              {{"coin":"#195641","oid":13,"cloid":"{three}"}}
+            ]"##
+        )
+        .into_bytes();
+        let mut rows = [OpenOrder::default(); MAX_OPEN_ORDERS];
+        let n = scan_open_orders(&body, &mut rows).expect("scans");
+        assert_eq!(n, 3);
+        let mut out = [0u64; MAX_OPEN_ORDERS];
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", 1 << 3, &mut out);
+        assert_eq!(&out[..k], &[11, 13], "slot 3's, and not slot 7's");
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", 1 << 7, &mut out);
+        assert_eq!(&out[..k], &[12]);
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", (1 << 3) | (1 << 7), &mut out);
+        assert_eq!(&out[..k], &[11, 12, 13], "two halted slots, one pass");
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", ALL_SLOTS, &mut out);
+        assert_eq!(k, 3, "a roll takes every slot's");
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", 1 << 5, &mut out);
+        assert_eq!(k, 0, "a slot with nothing resting selects nothing");
     }
 
     #[test]
@@ -1088,7 +1629,10 @@ mod tests {
     fn a_drift_is_never_valued_below_what_it_could_settle_for() {
         let qty_1e6 = 40_000_000i64; // 40 contracts
         let ceiling = drift_qty_to_usd_1e6(qty_1e6);
-        assert_eq!(ceiling, 40_000_000, "40 contracts settle for at most 40 USDC");
+        assert_eq!(
+            ceiling, 40_000_000,
+            "40 contracts settle for at most 40 USDC"
+        );
 
         let mut px_1e6 = 0i64;
         while px_1e6 <= 1_000_000 {
@@ -1128,5 +1672,48 @@ mod tests {
         assert_eq!(drift_qty_to_usd_1e6(i64::MAX), i64::MAX);
         assert_eq!(drift_qty_to_usd_1e6(i64::MIN), i64::MIN);
         assert!(drift_qty_to_usd_1e6(i64::MAX) > 5_000_000, "still halts");
+    }
+
+    /// XH4e: the day read renders its start and end times in place, and a
+    /// buffer one byte short is refused.
+    #[test]
+    fn the_fills_by_time_request_renders_its_start_and_end_in_place() {
+        let mut out = [0u8; 160];
+        let n = fills_by_time_request(&mut out, &[0xAB; 20], 1_790_380_800_000, 1_790_401_234_567)
+            .unwrap();
+        let want = format!(
+            r#"{{"type":"userFillsByTime","user":"0x{}","startTime":1790380800000,"endTime":1790401234567}}"#,
+            "ab".repeat(20)
+        );
+        assert_eq!(&out[..n], want.as_bytes());
+        let n = fills_by_time_request(&mut out, &[0; 20], 0, 9).unwrap();
+        assert!(out[..n].ends_with(br#""startTime":0,"endTime":9}"#));
+        assert!(fills_by_time_request(&mut out[..n - 1], &[0; 20], 0, 9).is_err());
+    }
+
+    /// XMM XH5b-2: `userRole` — the request, and the answers slot 6's boot
+    /// reads: an API wallet and its master (the venue's measured shape), a
+    /// master, and everything else.
+    #[test]
+    fn the_user_role_answer_names_the_api_wallet_s_master() {
+        let mut buf = [0u8; MAX_STATE_REQ];
+        let n = user_role_request(&mut buf, &[0xAB; 20]).expect("fits");
+        assert_eq!(
+            &buf[..n],
+            br#"{"type":"userRole","user":"0xabababababababababababababababababababab"}"#
+        );
+        let mut small = [0u8; 8];
+        assert!(user_role_request(&mut small, &[0xAB; 20]).is_err());
+        let agent =
+            br#"{"role":"agent","data":{"user":"0xCDcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}}"#;
+        assert_eq!(scan_user_role(agent), Role::Agent([0xCD; 20]));
+        assert_eq!(scan_user_role(br#"{"role":"user"}"#), Role::User);
+        assert_eq!(scan_user_role(br#"{"role":"missing"}"#), Role::Other);
+        let sub = br#"{"role":"subAccount","data":{"master":"0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}}"#;
+        assert_eq!(scan_user_role(sub), Role::Other);
+        let short = br#"{"role":"agent","data":{"user":"0xcd"}}"#;
+        assert_eq!(scan_user_role(short), Role::Other);
+        assert_eq!(scan_user_role(br#"{"role":"agent"}"#), Role::Other);
+        assert_eq!(scan_user_role(b"<html>"), Role::Other);
     }
 }

@@ -35,7 +35,8 @@
 //! It publishes a description string, and the family has to recognise
 //! its own next instance from the grammar
 //! ([`crate::discovery::HlOutcomeSpec`]): the same deployer grammar,
-//! the same underlying, and an expiry inside one period of now. That
+//! the same deployer (A-S7-47: the row's `venue`), the same
+//! underlying, and an expiry inside one period of now. That
 //! last clause is what stops a family from adopting an instance it
 //! cannot be — the venue lists other deployers' markets and, for the
 //! daily families, tomorrow's instance as well. A row that matches
@@ -43,7 +44,9 @@
 //!
 //! Everything here is fixed-capacity, `#[repr(C)]`, allocation-free
 //! and integer-only; `match_spec` and the rebind run on the ingress
-//! thread inside the `outcomeMetaUpdates` arm.
+//! thread — inside the `outcomeMetaUpdates` arm, or between sessions
+//! when a reconnect retires a dead instance and re-discovers its
+//! successor ([`HlFamilyTable::retire`], [`HlFamilyTable::best_live_spec`]).
 
 use core_types::{make_symbol_id, SymbolId, VenueId};
 
@@ -71,6 +74,12 @@ pub const HL_OUTCOME_COIN_MAX: usize = 11;
 /// `activeAssetCtx`: an outcome coin has no funding or open interest
 /// (`coin_wants_asset_ctx` already says so for `#<enc>`).
 pub const ROLL_CHANNELS: [HlChannel; 3] = [HlChannel::Bbo, HlChannel::L2Book, HlChannel::Trades];
+
+/// **A-S7-47 — the `out` family's deployer** as the venue names it: the
+/// `venue` of its rows and pushes (`outcomeMeta.deployers[].venue` — one
+/// name, one deployer: `0x0c46…819e` on mainnet, `0x295b…d33f` on testnet,
+/// 2026-10-06).
+pub const OUT_VENUE: &[u8] = b"out";
 
 /// Which deployer grammar a family tracks. The name encodes the
 /// pairing: only `out:*:15m` and `native:*:1d` exist on the venue
@@ -128,8 +137,24 @@ pub struct HlFamily {
     /// No live instance: the slots are reserved but bound to nothing
     /// and nothing is subscribed for them.
     pub dormant: bool,
+    /// The bound instance SETTLED — an `outcomeSettled` push named it.
+    /// Its coins stay bound and subscribed on the session that saw the
+    /// push (the venue keeps an existing subscription), but a NEW
+    /// subscribe to a settled coin makes the venue drop the whole
+    /// socket, so the next reconnect retires the family first
+    /// ([`Self::instance_dead`], [`HlFamilyTable::retire`]).
+    pub settled: bool,
+    /// Retired at a reconnect and waiting for its successor: the
+    /// reconnect re-discovers it over `/info`, or the venue's next
+    /// `outcomeCreated` push adopts it. Cleared by [`HlFamilyTable::bind`].
+    pub awaiting: bool,
+    /// The roll's hot subscribes timed out once and were re-queued under
+    /// a fresh [`Self::ack_deadline_ns`]; a second timeout stops the
+    /// asking until the family's next roll (`run_loop::roll_health`).
+    /// Cleared wherever the deadline is.
+    pub ack_retried: bool,
     /// Explicit tail padding.
-    _pad: [u8; 7],
+    _pad: [u8; 4],
 }
 
 const _: () = assert!(::core::mem::size_of::<HlFamily>() == 112);
@@ -201,6 +226,18 @@ impl HlFamily {
         debug_assert!(n <= HL_OUTCOME_UNDERLYING_MAX);
         &self.underlying[..n.min(HL_OUTCOME_UNDERLYING_MAX)]
     }
+
+    /// Whether the bound instance must never be subscribed again: it
+    /// settled, or its expiry (a WALL instant) is at or before
+    /// `wall_now_ns`. The venue answers a subscribe to such a coin by
+    /// dropping the whole socket — no error frame, no close frame
+    /// (probed 2026-09-26) — so a reconnect that re-subscribed one would
+    /// die within a second, forever. `false` for a dormant family.
+    #[inline]
+    #[must_use]
+    pub fn instance_dead(&self, wall_now_ns: u64) -> bool {
+        self.live.outcome != 0 && (self.settled || self.live.expiry_ns <= wall_now_ns)
+    }
 }
 
 /// Fixed-capacity table of rolling families. Built at boot from the
@@ -223,7 +260,10 @@ const EMPTY_FAMILY: HlFamily = HlFamily {
     underlying: [0; HL_OUTCOME_UNDERLYING_MAX],
     pending_ack: 0,
     dormant: true,
-    _pad: [0; 7],
+    settled: false,
+    awaiting: false,
+    ack_retried: false,
+    _pad: [0; 4],
 };
 
 impl HlFamilyTable {
@@ -307,12 +347,16 @@ impl HlFamilyTable {
 
     /// Which family, if any, an outcome spec belongs to.
     ///
-    /// Three clauses, all required: the spec's grammar pairs with the
+    /// Four clauses, all required: the spec's grammar pairs with the
     /// family's kind (and carries that kind's settlement signature —
     /// `seconds:60` for the `out` 15-minute instrument, the family's
-    /// own `period:` for a native recurring one); the underlying is
-    /// the same; and the expiry lies ahead of `now_ns` by no more
-    /// than one period plus a minute of slack.
+    /// own `period:` for a native recurring one); the deployer is the
+    /// kind's (A-S7-47: the [`OUT_VENUE`]'s rows for the `out` family,
+    /// rows naming no venue — HyperCore's own — for a native one: the
+    /// venue lists other deployers' markets in the very same grammar,
+    /// eleven testnet venues' `perp:BTC` rows on 2026-10-06); the
+    /// underlying is the same; and the expiry lies ahead of `now_ns` by
+    /// no more than one period plus a minute of slack.
     ///
     /// The window is the clause that matters in practice: the venue
     /// lists other deployers' markets and, for a daily family,
@@ -327,9 +371,11 @@ impl HlFamilyTable {
         while i < self.len {
             let f = &self.rows[i];
             let kind_ok = match (spec.grammar, f.kind) {
-                (HlOutcomeGrammar::OutBinaryPrice, HlFamilyKind::Out15m) => spec.twap_s == 60,
+                (HlOutcomeGrammar::OutBinaryPrice, HlFamilyKind::Out15m) => {
+                    spec.twap_s == 60 && spec.venue_bytes() == OUT_VENUE
+                }
                 (HlOutcomeGrammar::NativePriceBinary, HlFamilyKind::NativeDaily) => {
-                    spec.period_s == f.period_s
+                    spec.period_s == f.period_s && spec.is_native()
                 }
                 _ => false,
             };
@@ -344,10 +390,10 @@ impl HlFamilyTable {
         None
     }
 
-    /// Boot binding: for each family, adopt the LATEST-expiring spec
-    /// discovery found that the family matches, and write its two
-    /// coins into the reserved rows so the first `Steady` subscribes
-    /// them like any coin.
+    /// Boot binding: for each family, adopt the instance trading now —
+    /// [`Self::best_live_spec`], the EARLIEST-expiring spec discovery
+    /// found that the family matches — and write its two coins into the
+    /// reserved rows so the first `Steady` subscribes them like any coin.
     ///
     /// Returns the number of families bound. A family with no match
     /// stays dormant — the next `outcomeCreated` push adopts it.
@@ -360,25 +406,7 @@ impl HlFamilyTable {
         let mut bound = 0usize;
         let mut i = 0usize;
         while i < self.len {
-            let mut best: Option<HlOutcomeSpec> = None;
-            let mut j = 0usize;
-            while j < specs.len() {
-                let s = specs[j];
-                if self.match_spec(&s, now_ns) == Some(i) {
-                    let take = match best {
-                        // The venue can list the current instance and
-                        // its successor; the family wants the one
-                        // trading now, i.e. the EARLIEST still ahead.
-                        Some(b) => s.expiry_ns < b.expiry_ns,
-                        None => true,
-                    };
-                    if take {
-                        best = Some(s);
-                    }
-                }
-                j += 1;
-            }
-            if let Some(spec) = best {
+            if let Some(spec) = self.best_live_spec(i, specs, now_ns) {
                 if self.bind(i, &spec, coins).is_ok() {
                     bound += 1;
                 }
@@ -386,6 +414,99 @@ impl HlFamilyTable {
             i += 1;
         }
         bound
+    }
+
+    /// The instance family `idx` should hold at WALL instant `now_ns`
+    /// out of a discovery body's `specs`: the EARLIEST-expiring spec
+    /// the family matches ([`Self::match_spec`]). The venue can list
+    /// the current instance and its successor; the family wants the
+    /// one trading now. Shared by the boot binding
+    /// ([`Self::bind_live`]) and the reconnect re-discovery.
+    #[must_use]
+    pub fn best_live_spec(
+        &self,
+        idx: usize,
+        specs: &[HlOutcomeSpec],
+        now_ns: u64,
+    ) -> Option<HlOutcomeSpec> {
+        let mut best: Option<HlOutcomeSpec> = None;
+        // A-S7-47: two instances of the family expiring at one instant are
+        // no deployer's shape — the family adopts neither (it stays dormant,
+        // which the boot tells; the next push decides).
+        let mut tied = false;
+        let mut j = 0usize;
+        while j < specs.len() {
+            let s = specs[j];
+            if self.match_spec(&s, now_ns) == Some(idx) {
+                match best {
+                    Some(b) if s.expiry_ns > b.expiry_ns => {}
+                    Some(b) if s.expiry_ns == b.expiry_ns => tied |= s.outcome != b.outcome,
+                    _ => {
+                        best = Some(s);
+                        tied = false;
+                    }
+                }
+            }
+            j += 1;
+        }
+        if tied {
+            None
+        } else {
+            best
+        }
+    }
+
+    /// Retire family `idx`'s bound instance: both reserved rows go
+    /// EMPTY again — off the wire and out of the ack mask, exactly like
+    /// a family that booted dormant — and the family is marked
+    /// `awaiting` its successor.
+    ///
+    /// For a RECONNECT only (between sessions, before the subscribe
+    /// sweep): the venue drops the whole socket on a subscribe to a
+    /// settled or expired coin, and `outcomeMetaUpdates` never replays
+    /// the `outcomeCreated` a dead session missed, so re-subscribing the
+    /// old binding looped a reconnect every ~1.2 s until the process
+    /// restarted (2026-09-25/26). Does NOT touch the wire.
+    pub fn retire(
+        &mut self,
+        idx: usize,
+        coins: &mut HlCoinTable,
+    ) -> Result<(), crate::CoinTableErr> {
+        debug_assert!(idx < self.len);
+        if idx >= self.len {
+            return Err(crate::CoinTableErr::NoSuchRow);
+        }
+        let (yes_idx, no_idx) = {
+            let f = &self.rows[idx];
+            (f.coin_idx[0] as usize, f.coin_idx[1] as usize)
+        };
+        coins.unbind(yes_idx)?;
+        coins.unbind(no_idx)?;
+        let f = &mut self.rows[idx];
+        f.live = HlOutcomeSpec::empty(0);
+        f.dormant = true;
+        f.settled = false;
+        f.awaiting = true;
+        f.pending_ack = 0;
+        f.ack_deadline_ns = 0;
+        f.ack_retried = false;
+        Ok(())
+    }
+
+    /// Families retired at a reconnect and still waiting for a
+    /// successor ([`HlFamily::awaiting`]).
+    #[inline]
+    #[must_use]
+    pub fn awaiting_count(&self) -> usize {
+        let mut n = 0usize;
+        let mut i = 0usize;
+        while i < self.len {
+            if self.rows[i].awaiting {
+                n += 1;
+            }
+            i += 1;
+        }
+        n
     }
 
     /// Bind `spec`'s two coins into family `idx`'s reserved rows and
@@ -405,14 +526,13 @@ impl HlFamilyTable {
             let f = &self.rows[idx];
             (f.coin_idx[0] as usize, f.coin_idx[1] as usize)
         };
-        let mut buf = [0u8; HL_OUTCOME_COIN_MAX];
-        let n = render_outcome_coin(&mut buf, spec.outcome, 0);
-        coins.rebind(yes_idx, &buf[..n])?;
-        let n = render_outcome_coin(&mut buf, spec.outcome, 1);
-        coins.rebind(no_idx, &buf[..n])?;
+        coins.rebind_outcome(yes_idx, spec.outcome, 0)?;
+        coins.rebind_outcome(no_idx, spec.outcome, 1)?;
         let f = &mut self.rows[idx];
         f.live = *spec;
         f.dormant = false;
+        f.settled = false;
+        f.awaiting = false;
         Ok(())
     }
 
@@ -621,11 +741,11 @@ mod tests {
     #[test]
     fn match_spec_needs_grammar_underlying_and_the_expiry_window() {
         let t = table_with(&[b"out:BTC:15m", b"native:ETH:1d"]);
-        let spec = parse_outcome_spec(2649, DESC_2649);
+        let spec = out_spec(2649, DESC_2649);
         assert_eq!(t.match_spec(&spec, NOW_NS), Some(0));
 
         // Wrong underlying.
-        let other = parse_outcome_spec(
+        let other = out_spec(
             3000,
             b"perp:SOL|priceDescription:x|seconds:60|threshold:200|time:20260912-0630",
         );
@@ -633,7 +753,7 @@ mod tests {
 
         // Right underlying, wrong settlement signature (not the 15 m
         // instrument even though the grammar matches).
-        let long_twap = parse_outcome_spec(
+        let long_twap = out_spec(
             3001,
             b"perp:BTC|priceDescription:x|seconds:300|threshold:77000|time:20260912-0630",
         );
@@ -663,8 +783,48 @@ mod tests {
         let unknown = parse_outcome_spec(5, b"whatever");
         assert_eq!(t.match_spec(&unknown, NOW_NS), None);
         // And so does a spec with no id.
-        let no_id = parse_outcome_spec(0, DESC_2649);
+        let no_id = out_spec(0, DESC_2649);
         assert_eq!(t.match_spec(&no_id, NOW_NS), None);
+    }
+
+    /// The `out` deployer's row (A-S7-47: its venue named).
+    fn out_spec(id: u32, desc: &[u8]) -> HlOutcomeSpec {
+        let mut s = parse_outcome_spec(id, desc);
+        s.set_venue(Some(OUT_VENUE));
+        s
+    }
+
+    /// A-S7-47: the deployer is the fourth clause — the `out` family adopts
+    /// the `out` venue's rows alone, the native family rows naming no
+    /// venue; a stranger's look-alike in the very same grammar is nobody's;
+    /// and two instances expiring together are adopted by no family.
+    #[test]
+    fn match_spec_needs_the_family_s_deployer() {
+        let t = table_with(&[b"out:BTC:15m", b"native:ETH:1d"]);
+        let mut kelp = parse_outcome_spec(2649, DESC_2649);
+        kelp.set_venue(Some(&b"kelp"[..]));
+        assert_eq!(t.match_spec(&kelp, NOW_NS), None, "a stranger's look-alike");
+        let bare = parse_outcome_spec(2649, DESC_2649);
+        assert_eq!(t.match_spec(&bare, NOW_NS), None, "no venue: not out's");
+        assert_eq!(t.match_spec(&out_spec(2649, DESC_2649), NOW_NS), Some(0));
+        let mut daily = parse_outcome_spec(
+            4211,
+            b"class:priceBinary|underlying:ETH|expiry:20260913-0600|targetPrice:2510.5|period:1d",
+        );
+        let day_before = daily.expiry_ns - 3_600_000_000_000;
+        assert_eq!(t.match_spec(&daily, day_before), Some(1));
+        daily.set_venue(Some(OUT_VENUE));
+        assert_eq!(
+            t.match_spec(&daily, day_before),
+            None,
+            "native rows name none"
+        );
+        let pair = [out_spec(2649, DESC_2649), out_spec(2700, DESC_2649)];
+        assert_eq!(t.best_live_spec(0, &pair, NOW_NS), None, "a tie: neither");
+        assert_eq!(
+            t.best_live_spec(0, &pair[..1], NOW_NS).map(|s| s.outcome),
+            Some(2649)
+        );
     }
 
     #[test]
@@ -675,8 +835,8 @@ mod tests {
         let b = coins.reserve(rolling_sym(0, 1)).unwrap();
         assert_eq!((a, b), (0, 1));
 
-        let current = parse_outcome_spec(2649, DESC_2649);
-        let next = parse_outcome_spec(
+        let current = out_spec(2649, DESC_2649);
+        let next = out_spec(
             2650,
             b"perp:BTC|priceDescription:x|seconds:60|threshold:77201|time:20260912-0645",
         );
@@ -757,10 +917,7 @@ mod tests {
             assert_eq!(unpack_roll_seq(seq), (outcome, twap, f, settled));
         }
         // The event the §2 created frame produces.
-        assert_eq!(
-            pack_roll_seq(2649, 60, 0, false),
-            2649 | (60u64 << 32)
-        );
+        assert_eq!(pack_roll_seq(2649, 60, 0, false), 2649 | (60u64 << 32));
 
         let mut all = 0u8;
         for side in 0..2usize {
@@ -776,6 +933,63 @@ mod tests {
         // A channel a rolling slot never subscribes has no bit.
         assert_eq!(roll_ack_bit(0, HlChannel::ActiveAssetCtx), 0);
     }
+
+    /// 2026-09-26 reconnect loop: a dead instance (settled, or past its
+    /// expiry) is recognised; `retire` takes it off the wire exactly
+    /// like a boot-dormant family and marks it awaiting; `bind` clears
+    /// both flags.
+    #[test]
+    fn a_dead_instance_is_retired_off_the_wire_and_bind_revives_the_family() {
+        let mut t = table_with(&[b"out:BTC:15m"]);
+        let mut coins = HlCoinTable::new();
+        coins.reserve(rolling_sym(0, 0)).unwrap();
+        coins.reserve(rolling_sym(0, 1)).unwrap();
+        let spec = out_spec(2649, DESC_2649);
+        t.bind(0, &spec, &mut coins).unwrap();
+        assert_eq!(coins.lookup(b"#26490"), Some(rolling_sym(0, 0)));
+
+        // Alive one minute before expiry; dead at and after it; dead
+        // whenever settled; never "dead" while dormant.
+        let row = *t.get(0).unwrap();
+        assert!(!row.instance_dead(NOW_NS));
+        assert!(row.instance_dead(spec.expiry_ns));
+        assert!(row.instance_dead(spec.expiry_ns + 1));
+        t.get_mut(0).unwrap().settled = true;
+        assert!(t.get(0).unwrap().instance_dead(NOW_NS));
+
+        t.retire(0, &mut coins).unwrap();
+        let row = *t.get(0).unwrap();
+        assert!(row.dormant && row.awaiting && !row.settled);
+        assert_eq!(row.live.outcome, 0);
+        assert!(
+            !row.instance_dead(u64::MAX),
+            "a retired family names nothing"
+        );
+        assert_eq!(t.awaiting_count(), 1);
+        // Both rows are EMPTY again: never looked up, never subscribed,
+        // never waited on — but the slots keep their syms.
+        assert_eq!(coins.lookup(b"#26490"), None);
+        assert_eq!(coins.lookup(b"#26491"), None);
+        assert!(!coins.is_named(0) && !coins.is_named(1));
+        assert_eq!(coins.get(0), Some((&b""[..], rolling_sym(0, 0))));
+        assert_eq!(crate::expected_mask(&coins).0, 0);
+
+        // The successor binds like any roll and clears the flags.
+        let next = out_spec(
+            2650,
+            b"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77201|time:20260912-0645",
+        );
+        assert_eq!(
+            t.best_live_spec(0, &[spec, next], spec.expiry_ns),
+            Some(next)
+        );
+        t.bind(0, &next, &mut coins).unwrap();
+        let row = *t.get(0).unwrap();
+        assert!(!row.dormant && !row.awaiting && !row.settled);
+        assert_eq!(t.awaiting_count(), 0);
+        assert_eq!(coins.lookup(b"#26500"), Some(rolling_sym(0, 0)));
+        assert_eq!(coins.lookup(b"#26501"), Some(rolling_sym(0, 1)));
+    }
 }
 
 // ---------------------------------------------------------------
@@ -783,18 +997,21 @@ mod tests {
 // ---------------------------------------------------------------
 
 /// Roll counters shared between the ingress thread (single writer)
-/// and the metrics reader.
+/// and the metrics reader — plus the one other HIP-4 venue fact
+/// counted here, the outcome legs' one-sided `bbo` drop (BIN15 O8).
 ///
 /// These could not go in `core_metrics::IngressStatus`: that slot is
-/// size-locked at 128 B (two cache lines, asserted), and it is
+/// size-locked at 192 B (three cache lines, asserted), and it is
 /// venue-generic by design. They are venue facts, so they get their
-/// own `Arc` — written from the roll path, read by `/metrics`.
+/// own `Arc` — written from the ingress thread, read by `/metrics`.
 #[derive(Debug, Default)]
 pub struct HlRollStatus {
     rolls_total: ::core::sync::atomic::AtomicU64,
     rolls_ignored_unmatched: ::core::sync::atomic::AtomicU64,
     family_ack_timeouts: ::core::sync::atomic::AtomicU64,
     families_dormant: ::core::sync::atomic::AtomicU64,
+    outcome_bbo_one_sided: ::core::sync::atomic::AtomicU64,
+    unsub_acks: ::core::sync::atomic::AtomicU64,
 }
 
 impl HlRollStatus {
@@ -807,7 +1024,26 @@ impl HlRollStatus {
             rolls_ignored_unmatched: AtomicU64::new(0),
             family_ack_timeouts: AtomicU64::new(0),
             families_dormant: AtomicU64::new(0),
+            outcome_bbo_one_sided: AtomicU64::new(0),
+            unsub_acks: AtomicU64::new(0),
         }
+    }
+
+    /// A roll's `unsubscribe` was echoed by the venue — a well-formed
+    /// answer no ack mask awaits, never a parse error (six a roll).
+    #[inline]
+    pub fn inc_unsub_acks(&self) {
+        self.unsub_acks
+            .fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// BIN15 O8: an outcome leg's `bbo` came one-sided (its ask `null`)
+    /// and was dropped by policy — a well-formed frame, not a parse
+    /// error (the leg's touch comes from its `l2Book`).
+    #[inline]
+    pub fn inc_outcome_bbo_one_sided(&self) {
+        self.outcome_bbo_one_sided
+            .fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
     }
 
     /// A family adopted a new instance.
@@ -869,6 +1105,22 @@ impl HlRollStatus {
     #[must_use]
     pub fn families_dormant(&self) -> u64 {
         self.families_dormant
+            .load(::core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `engine_ingress_hyperliquid_outcome_bbo_one_sided_total`.
+    #[inline]
+    #[must_use]
+    pub fn outcome_bbo_one_sided(&self) -> u64 {
+        self.outcome_bbo_one_sided
+            .load(::core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `engine_ingress_hyperliquid_unsub_acks_total`.
+    #[inline]
+    #[must_use]
+    pub fn unsub_acks(&self) -> u64 {
+        self.unsub_acks
             .load(::core::sync::atomic::Ordering::Relaxed)
     }
 }

@@ -113,6 +113,7 @@ fn member_cfg(replay: &Path, toml: &Path) -> BacktestConfig {
             seed: None,
             vrp_seed: None,
             bin15_seed_dir: None,
+            hyparb_universe: None,
         }),
     }
 }
@@ -371,6 +372,7 @@ fn xsd_member_enters_and_reverts_on_the_wall_hour_grid() {
         seed: Some(seed),
         vrp_seed: None,
         bin15_seed_dir: None,
+        hyparb_universe: None,
     });
     let out = run_member(&cfg, cfg.member.as_ref().unwrap()).expect("member run");
     let hash = core_crypto::sha256(XSD_TOML.as_bytes());
@@ -418,6 +420,7 @@ fn xsd_member_without_a_table_is_refused_with_a_reason() {
         seed: Some(seed),
         vrp_seed: None,
         bin15_seed_dir: None,
+        hyparb_universe: None,
     });
     let msg = match run_member(&cfg, cfg.member.as_ref().unwrap()) {
         Ok(_) => panic!("an explicit absent table must refuse the run"),
@@ -681,6 +684,7 @@ fn vrp_cfg(replay: &Path, toml: &Path, seed: Option<PathBuf>) -> BacktestConfig 
         seed: None,
         vrp_seed: seed,
         bin15_seed_dir: None,
+        hyparb_universe: None,
     });
     cfg
 }
@@ -899,7 +903,35 @@ fn bin15_seed_text() -> String {
 /// `(replay root, bin15.toml)`. `family` is the byte the roll carries —
 /// 0 for the happy path, anything else for the mismatch test.
 fn build_bin15_capture(root: &Path, family: u8, families_toml: &str) -> (PathBuf, PathBuf) {
-    let run = root.join(format!("run-{BIN15_EPOCH_NS}"));
+    build_bin15_capture_clocked(root, family, families_toml, None)
+}
+
+/// BIN15 S2: the capture's clock. `None` = the identity fixture (every
+/// stamp IS the wall instant, no venue stamps — the old anchor law).
+/// `Some(early_ns)` = a v3 capture as the engine really writes one:
+/// MONOTONIC stamps, Hyperliquid ticks carrying the venue's own time,
+/// and a run directory named `early_ns` BEFORE the first record (the
+/// boot names the directory; the first tick lands seconds later).
+fn build_bin15_capture_clocked(
+    root: &Path,
+    family: u8,
+    families_toml: &str,
+    early_ns: Option<u64>,
+) -> (PathBuf, PathBuf) {
+    // Mono stamp of the venue instant `BIN15_EPOCH_NS` on the v3 path.
+    const MONO0: u64 = 7_000_000_000_000;
+    let dir_epoch = match early_ns {
+        Some(e) => BIN15_EPOCH_NS - e,
+        None => BIN15_EPOCH_NS,
+    };
+    // venue instant → capture stamp
+    let stamp = |venue_ns: u64| -> u64 {
+        match early_ns {
+            Some(_) => venue_ns - BIN15_EPOCH_NS + MONO0,
+            None => venue_ns,
+        }
+    };
+    let run = root.join(format!("run-{dir_epoch}"));
     std::fs::create_dir_all(&run).expect("mkdir run");
     std::fs::write(
         run.join("instrument-manifest.tsv"),
@@ -914,16 +946,20 @@ fn build_bin15_capture(root: &Path, family: u8, families_toml: &str) -> (PathBuf
 
     // The events: the roll that binds the instance, then the marks.
     // Two marks in different minutes are what publish σ̂ (the
-    // transcendentals run once a minute, never per tick), and the four
-    // after expiry are the settlement TWAP.
+    // transcendentals run once a minute, never per tick), and the ones
+    // every 5 s through the minute ENDING at the expiry are the
+    // settlement TWAP (BIN15 S1, LAW E-11: `[expiry − twap, expiry]`,
+    // covered from its open with no hole over 10 s).
     let mut events = vec![bin15_roll(family, false), bin15_mark(1), bin15_mark(61)];
-    for at in [600u64, 620, 640, 660] {
+    for at in (540u64..=600).step_by(5) {
         events.push(bin15_mark(at));
     }
-    let mut w = PmlrWriter::open(run.join("hl-events.pmlr"), SlotKind::Event, BIN15_EPOCH_NS)
+    let mut w = PmlrWriter::open(run.join("hl-events.pmlr"), SlotKind::Event, dir_epoch)
         .expect("open events");
     for e in &events {
-        w.append(e).expect("append event");
+        let mut e = *e;
+        e.ts_ns = stamp(e.ts_ns);
+        w.append(&e).expect("append event");
     }
     w.flush().expect("flush events");
 
@@ -936,13 +972,35 @@ fn build_bin15_capture(root: &Path, family: u8, families_toml: &str) -> (PathBuf
         bin15_tick(bin15_no_sym(), 62_000, 390_000, 600_000, 1),
         bin15_tick(bin15_yes_sym(), 63_000, 300_000, 400_000, 2), // 60 c wrong ⇒ take
         bin15_tick(bin15_yes_sym(), 63_300, 300_000, 400_000, 3), // the IoC fills here
+        // BIN15 S1: the settlement marks now sit in the minute BEFORE the
+        // expiry, and every mark re-prices — so the book is moved to a
+        // price with no edge first, or those re-prices would ask the
+        // exhausted cap for a second take (`skipped_cap`) and blur what
+        // this test pins: ONE take, held by the pending, not by the cap.
+        bin15_tick(bin15_yes_sym(), 500_000, 980_000, 990_000, 4),
         // Past the settlement instant, so the window HOLDS the payout.
-        bin15_tick(bin15_yes_sym(), 661_000, 300_000, 400_000, 4),
+        bin15_tick(bin15_yes_sym(), 661_000, 300_000, 400_000, 5),
     ];
-    let mut w = PmlrWriter::open(run.join("hl-ticks.pmlr"), SlotKind::Tick, BIN15_EPOCH_NS)
+    let mut w = PmlrWriter::open(run.join("hl-ticks.pmlr"), SlotKind::Tick, dir_epoch)
         .expect("open ticks");
     for t in &ticks {
-        w.append(t).expect("append tick");
+        let mut t = *t;
+        if early_ns.is_some() {
+            // The venue's own clock rides the tick; the stamp is ours.
+            t = Tick::new_stamped(
+                stamp(t.ts_ns),
+                VenueId::Hyperliquid,
+                t.sym,
+                t.venue_seq,
+                t.bid_px,
+                t.bid_qty,
+                t.ask_px,
+                t.ask_qty,
+                t.ts_ns / 1_000_000,
+                0,
+            );
+        }
+        w.append(&t).expect("append tick");
     }
     w.flush().expect("flush ticks");
 
@@ -984,6 +1042,7 @@ fn bin15_cfg(replay: &Path, toml: &Path) -> BacktestConfig {
         seed: None,
         vrp_seed: None,
         bin15_seed_dir: None,
+        hyparb_universe: None,
     });
     cfg
 }
@@ -1051,9 +1110,84 @@ fn member_bin15_prices_takes_and_settles_on_a_synthetic_root() {
     // `y` is the payout the fill model actually used, not a second
     // derivation of it — this instance settled in the money.
     assert!(detail.contains("\"y\":1000000"), "ledger y: {detail}");
+    // BIN15 S2: an anchor-law run's sidecar carries no clock key at all.
+    assert!(!detail.contains("\"wall\":"), "{detail}");
     // A priced row carries a fair value nowhere near a coin flip: the
     // strike is 11 % below the mark, so Φ saturates its clamp.
     assert!(detail.contains("\"p_raw_1e6\":999979"), "ledger p_raw: {detail}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// BIN15 S2: a v3 capture is replayed on the VENUE's clock. The run
+/// directory is named 23 s before its first record (as a boot names it),
+/// so the old anchor law put every instant 23 s early — a different
+/// minute against a settlement window that ENDS at the expiry. On the
+/// venue's clock every sidecar stamp is an instant the venue put a record
+/// at, and the summary says which clock it used.
+#[test]
+fn member_bin15_replays_a_v3_capture_on_the_venue_clock() {
+    const EARLY: u64 = 23_000_000_000;
+    let root = unique_root("bin15-venue-clock");
+    let (replay, toml) = build_bin15_capture_clocked(&root, 0, "[\"out:BTC:15m\"]", Some(EARLY));
+    let mut cfg = bin15_cfg(&replay, &toml);
+    cfg.emit_detail = Some(root.join("detail.json"));
+    let out = run_member(&cfg, cfg.member.as_ref().unwrap()).expect("member run");
+    assert!(
+        out.summary.contains("wall=venue offset_ns=") && out.summary.contains("(the anchor law ran 23.000 s early)"),
+        "{}",
+        out.summary
+    );
+    // The same trade and the same settlement as the identity fixture.
+    assert!(out.summary.contains(" takes_submitted=1 takes_filled=1 "), "{}", out.summary);
+    let key = "\"net_pnl_usd\":";
+    let i = out.schema1.find(key).expect("net field") + key.len();
+    let j = out.schema1[i..].find(',').expect("comma") + i;
+    let net: f64 = out.schema1[i..j].parse().expect("json number");
+    assert!((59.0..=61.0).contains(&net), "net {net}: {}", out.schema1);
+    // Every ledger stamp is a VENUE instant the capture holds a record at
+    // (on the old law each would sit 23 s earlier — none of them).
+    let detail = std::fs::read_to_string(root.join("detail.json")).expect("detail");
+    let block = &detail[detail.find("\"bin15_ledger\":[").expect("ledger")..];
+    // The ledger's own rows only (flat objects: its array ends at the
+    // first `]`).
+    let block = &block[..block.find(']').expect("ledger end")];
+    let mut instants: Vec<u64> = vec![bin15_at(0), bin15_at(1), bin15_at(61)];
+    for ms in [62_000u64, 63_000, 63_300, 500_000, 661_000] {
+        instants.push(bin15_at_ms(ms));
+    }
+    for s in (540u64..=600).step_by(5) {
+        instants.push(bin15_at(s));
+    }
+    let mut rows = 0usize;
+    let mut inside = 0usize;
+    let twap_ns = u64::from(BIN15_TWAP_S) * 1_000_000_000;
+    let mut rest = block;
+    while let Some(k) = rest.find("\"ts_ns\":") {
+        let from = k + "\"ts_ns\":".len();
+        let to = from + rest[from..].find(',').expect("comma");
+        let ts: u64 = rest[from..to].parse().expect("ts");
+        assert!(instants.contains(&ts), "ledger ts {ts} is not a venue instant of the capture");
+        // BIN15 S3: the row's τ is the horizon the member priced at — the
+        // variance-time of the venue's window `[T − W, T]` seen from this
+        // venue instant, on both sides of the window's open.
+        let t0 = to + rest[to..].find("\"tau_ns\":").expect("tau") + "\"tau_ns\":".len();
+        let t1 = t0 + rest[t0..].find(',').expect("comma");
+        let tau: u64 = rest[t0..t1].parse().expect("tau");
+        let to_expiry = BIN15_EXPIRY_NS - ts;
+        assert_eq!(
+            tau,
+            strategy_bin15::price::pricing_horizon_ns(to_expiry, twap_ns),
+            "row at {ts}: the sidecar τ must be the member's horizon"
+        );
+        inside += usize::from(to_expiry < twap_ns);
+        rows += 1;
+        rest = &rest[t1..];
+    }
+    assert!(rows > 0, "the ledger wrote rows: {detail}");
+    assert!(inside > 0, "the member priced inside the window on its running average: {detail}");
+    assert!(detail.contains("\"y\":1000000"), "settled on the venue clock: {detail}");
+    // The sidecar says which clock the run is on (the accrual reads it).
+    assert!(detail.contains("\"wall\":\"venue\""), "{detail}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1088,5 +1222,222 @@ fn member_bin15_refuses_a_permuted_family_list() {
         Err(e) => format!("{e}"),
     };
     assert!(msg.contains("crossed forms are refused"), "{msg}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------
+// XMM XH1 — `backtest --member xmm`
+// ---------------------------------------------------------------
+//
+// One synthetic Hyperliquid run: BTC ticks, two BTC trade prints, one
+// AssetCtx row, one print the trade lane's constructor refuses (no
+// size), and two depth rows — the BTC perp's (research capture since
+// XH1) and a HIP-4 leg's. The member is dark at XH1, so what the arm
+// pins is the plumbing: the artifact resolves against the manifest the
+// boot would use, the prints reach the member as the live trade lane
+// carries them (and only for `--member xmm`), perp depth reaches no
+// replay, and nothing is placed.
+
+/// 2026-09-26T00:00:00Z.
+const XMM_EPOCH_NS: u64 = 1_790_380_800_000_000_000;
+const XMM_EXAMPLE: &str = include_str!("../../../xmm.toml.example");
+
+fn xmm_hl_btc() -> u32 {
+    core_types::make_symbol_id(VenueId::Hyperliquid, 0)
+}
+
+fn xmm_bn_btc() -> u32 {
+    core_types::make_symbol_id(VenueId::Binance, 9)
+}
+
+fn xmm_hl_leg() -> u32 {
+    core_types::make_symbol_id(VenueId::Hyperliquid, 7)
+}
+
+fn xmm_depth(at_ms: u64, sym: u32) -> core_types::DepthTopK {
+    let mut bids = [core_types::DepthLevel::EMPTY; core_types::DEPTH_K];
+    bids[0] = core_types::DepthLevel {
+        px_1e6: 400_000,
+        qty_1e6: 1_000_000,
+    };
+    let mut asks = [core_types::DepthLevel::EMPTY; core_types::DEPTH_K];
+    asks[0] = core_types::DepthLevel {
+        px_1e6: 600_000,
+        qty_1e6: 1_000_000,
+    };
+    core_types::DepthTopK::new(
+        XMM_EPOCH_NS + at_ms * 1_000_000,
+        VenueId::Hyperliquid,
+        sym,
+        0,
+        bids,
+        asks,
+    )
+}
+
+fn xmm_event(
+    at_ms: u64,
+    channel: core_types::ChannelId,
+    seq: u64,
+    v0: i64,
+    v1: i64,
+) -> core_types::ChannelEvent {
+    core_types::ChannelEvent::new(
+        XMM_EPOCH_NS + at_ms * 1_000_000,
+        VenueId::Hyperliquid,
+        channel,
+        xmm_hl_btc(),
+        seq,
+        XMM_EPOCH_NS / 1_000_000 + at_ms,
+        v0,
+        v1,
+    )
+}
+
+/// BTC only: the probe's other three perps are not in this manifest.
+fn xmm_btc_only() -> String {
+    XMM_EXAMPLE
+        .replace("quote_eth = 1", "quote_eth = 0")
+        .replace("quote_sol = 1", "quote_sol = 0")
+        .replace("quote_xrp = 1", "quote_xrp = 0")
+}
+
+fn build_xmm_capture(root: &Path, artifact: &str) -> (PathBuf, PathBuf) {
+    let run = root.join(format!("run-{XMM_EPOCH_NS}"));
+    std::fs::create_dir_all(&run).expect("mkdir run");
+    std::fs::write(
+        run.join("instrument-manifest.tsv"),
+        format!(
+            "{}\thyperliquid:BTC\n{}\tbinance-usdm:btcusdt\n{}\thyperliquid:#330\n",
+            xmm_hl_btc(),
+            xmm_bn_btc(),
+            xmm_hl_leg()
+        ),
+    )
+    .expect("manifest");
+    let events = [
+        // A sell-aggressor print: the capture signs the size by side.
+        xmm_event(1_000, core_types::ChannelId::Trade, 11, 100_000_000_000, -2_000_000),
+        xmm_event(1_500, core_types::ChannelId::AssetCtx, 0, 100_000_000_000, 0),
+        // No size: the lane's constructor refuses it, so it is no print.
+        xmm_event(2_000, core_types::ChannelId::Trade, 12, 100_010_000_000, 0),
+        xmm_event(2_500, core_types::ChannelId::Trade, 13, 100_010_000_000, 3_000_000),
+    ];
+    let mut w = PmlrWriter::open(run.join("hl-events.pmlr"), SlotKind::Event, XMM_EPOCH_NS)
+        .expect("open events");
+    for e in &events {
+        w.append(e).expect("append event");
+    }
+    w.flush().expect("flush events");
+    let mut w = PmlrWriter::open(run.join("hl-depth.pmlr"), SlotKind::Depth, XMM_EPOCH_NS)
+        .expect("open depth");
+    w.append(&xmm_depth(1_100, xmm_hl_btc())).expect("append perp depth");
+    w.append(&xmm_depth(1_300, xmm_hl_leg())).expect("append leg depth");
+    w.flush().expect("flush depth");
+    let mut w = PmlrWriter::open(run.join("hl-ticks.pmlr"), SlotKind::Tick, XMM_EPOCH_NS)
+        .expect("open ticks");
+    for (i, at_ms) in [0u64, 1_200, 2_200, 3_000].iter().enumerate() {
+        let t = Tick::new(
+            XMM_EPOCH_NS + at_ms * 1_000_000,
+            VenueId::Hyperliquid,
+            xmm_hl_btc(),
+            i as u32 + 1,
+            Price::from_raw(99_990_000_000),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(100_010_000_000),
+            Qty::from_raw(1_000_000),
+        );
+        w.append(&t).expect("append tick");
+    }
+    w.flush().expect("flush ticks");
+    let toml = root.join("xmm.toml");
+    std::fs::write(&toml, artifact).expect("write xmm.toml");
+    (root.to_path_buf(), toml)
+}
+
+fn xmm_cfg(replay: &Path, toml: &Path) -> BacktestConfig {
+    let mut cfg = member_cfg(replay, toml);
+    cfg.fee_bps = vec!["hl:0:0".to_owned()];
+    cfg.stale_after_ms = vec!["hl:0".to_owned()];
+    cfg.member = Some(MemberSpec {
+        kind: MemberKind::Xmm,
+        params: toml.to_path_buf(),
+        table: None,
+        seed: None,
+        vrp_seed: None,
+        bin15_seed_dir: None,
+        hyparb_universe: None,
+    });
+    cfg
+}
+
+#[test]
+fn xmm_member_is_dark_and_the_trade_lane_is_merged_for_it_only() {
+    let root = unique_root("xmm");
+    let artifact = xmm_btc_only();
+    let (replay, toml) = build_xmm_capture(&root, &artifact);
+    let cfg = xmm_cfg(&replay, &toml);
+    let out = run_member(&cfg, cfg.member.as_ref().unwrap()).expect("member run");
+    let hash = core_crypto::sha256(artifact.as_bytes());
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    assert!(
+        out.schema1.starts_with(&format!("{{\"schema_version\":1,\"ruleset_hash\":\"{hex}\",")),
+        "schema1: {}",
+        out.schema1
+    );
+    assert!(out.summary.contains("member: xmm params="), "{}", out.summary);
+    assert!(out.summary.contains(" coins=BTC "), "{}", out.summary);
+    // Two prints; the sizeless row is not one.
+    assert!(out.summary.contains(" hl_trades=2 "), "{}", out.summary);
+    // XH1 is dark: nothing is placed, nothing fills.
+    assert!(out.summary.contains(" orders_emitted=0 "), "{}", out.summary);
+    assert_eq!(out.stats.fills_total, 0, "{}", out.summary);
+    assert_eq!(out.stats.vm_orders_emitted, 0, "{}", out.summary);
+    // The HIP-4 leg's depth replays; the perp's is research capture.
+    assert_eq!(out.stats.merged_depths, 1, "{}", out.summary);
+
+    // Another member over the SAME root merges no print: its record
+    // count is the ticks, the AssetCtx row and the leg's depth — exactly
+    // what the same root replayed before XH1.
+    let mut other = member_cfg(&replay, &root.join("icdp.toml"));
+    other.fee_bps = vec!["hl:0:0".to_owned()];
+    other.stale_after_ms = vec!["hl:0".to_owned()];
+    std::fs::write(
+        root.join("icdp.toml"),
+        ICDP_TOML.replace("binance:btcusdt", "hyperliquid:BTC"),
+    )
+    .expect("write icdp.toml");
+    let icdp = run_member(&other, other.member.as_ref().unwrap()).expect("icdp run");
+    assert_eq!(icdp.stats.merged_records + 2, out.stats.merged_records, "{}", icdp.summary);
+    assert_eq!(icdp.stats.merged_depths, 1, "{}", icdp.summary);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn xmm_member_refuses_a_leader_the_manifest_does_not_carry() {
+    let root = unique_root("xmm-no-leader");
+    // XRP is quoted, and neither its perp nor its leader was captured.
+    let artifact = xmm_btc_only().replace("quote_xrp = 0", "quote_xrp = 1");
+    let (replay, toml) = build_xmm_capture(&root, &artifact);
+    let cfg = xmm_cfg(&replay, &toml);
+    let msg = match run_member(&cfg, cfg.member.as_ref().unwrap()) {
+        Ok(_) => panic!("an unresolvable perp must refuse the run"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(msg.contains("hyperliquid:XRP") && msg.contains("quote_xrp"), "{msg}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn xmm_member_refuses_a_malformed_artifact() {
+    let root = unique_root("xmm-bad");
+    let artifact = xmm_btc_only().replace("skew_kappa_1e6 = 0", "skew_kappa_1e6 = 5");
+    let (replay, toml) = build_xmm_capture(&root, &artifact);
+    let cfg = xmm_cfg(&replay, &toml);
+    let msg = match run_member(&cfg, cfg.member.as_ref().unwrap()) {
+        Ok(_) => panic!("a refused knob must refuse the run"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(msg.contains("--xmm") && msg.contains("skew_kappa_1e6"), "{msg}");
     let _ = std::fs::remove_dir_all(&root);
 }

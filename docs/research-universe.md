@@ -40,12 +40,95 @@ gate. Caps law for both (the 2026-08-29 $50k research tier):
 |---|---|---|---|
 | **Polymarket** | Crypto up/down dailies (BTC, ETH; 16:00Z) + equity up/down dailies (NVDA; 20:00Z EDT/21:00Z EST, trading days; auto-refreshed) | CLOB book ticks | **The Stage-3 execution venue.** ≤6 tokens TOTAL today (M1 allocation cap — see §5) |
 | **Binance spot** | Crypto pairs + **bStocks tokenized equities** (`<ticker>busdt`; 40+ listed, 3 configured: NVDAB/TSLAB/SPYB) | bookTicker ticks | 24/7 incl. market-closed hours |
-| **Binance USDⓈ-M** | Crypto perps (14) + **TradFi stock perps** (148 listed, 8 configured: NVDA/TSLA/SPY/AAPL/TEM/MARA/IONQ/PDD) + dated futures (config-in) | bookTicker ticks; markPrice/funding STREAM venue-dark from this egress (REST fills funding) | TradFi = `TRADIFI_PERPETUAL`, 8h funding ±2% cap, 24/7 |
-| **Binance options** | eapi REST discovery live (E2×K8 chains); WS venue-dark | (capture idles, armed) | `.env` lever when venue clears |
+| **Binance USDⓈ-M** | Crypto perps (14) + **TradFi stock perps** (148 listed, 8 configured: NVDA/TSLA/SPY/AAPL/TEM/MARA/IONQ/PDD) + dated futures (config-in) | bookTicker ticks; markPrice/funding on fstream's routed `/market/ws/` path since BX0 F1 (2026-09-23; REST also fills funding) | TradFi = `TRADIFI_PERPETUAL`, 8h funding ±2% cap, 24/7 |
+| **Binance options** | eapi REST discovery (E2×K8 chains) | `optionMarkPrice` on fstream's routed `/market/stream` (BX0, 2026-09-23): BBO ticks + opt-summary (mark/IV/greeks/index) | Rulesets may NAME them (HK-R4, caps `CAP_OPT \| CAP_PRICE`) as signal or reference legs; an order on one is unroutable in the paper matcher and the harness |
 | **OKX** | Spot + swaps + futures + options (E2×K8) | bbo-tbt, trades, mark, funding, **L2 depth (books)**, opt-summary (full-family mark/IV/greeks) | Subscribe budget at 4,064/4,096 B — additions need arg-count care |
 | **Deribit** | Perps + **USDC linear alt perps** (7 CVFC coins) + spot + options (E2×K8) + combos (config-in) | quote, book.100ms → **L2 depth**, trades, ticker+funding (hourly interest_8h), **DVOL** index, option ticker → opt-summary | The CVFC edge venue |
 | **Hyperliquid** | Perp coins (7: BTC/ETH/SOL/XRP/DOGE/ADA/LTC; spot @idx + HIP-4 config-in) | bbo, l2Book, ctx (premium/funding hourly), allMids, outcomeMeta | Hourly funding = fastest funding signal |
 | **Bybit** | Spot + linear perps (14: majors + CVFC coins + S1 pilot alts) | orderbook.1 ticks, publicTrade, tickers (mark/funding/OI) | Data-only sixth venue; intent-addressable since the 2026-08-29 unfreeze |
+| **MEXC** | Spot (crypto + **xStocks** tokenized equities) + USDT perps (crypto + **TradFi**: equities, indices, metals, energy, FX); first universe 5 spot + 7 perp (config-in) | spot aggre.bookTicker ticks + deals (protobuf); futures depth.full ticks, deal, ticker (mark/index/funding/OI) | Data-only seventh venue (2026-09-23) — capture only, §2.1 |
+| **Hypercall** | Options on 12 underlyings (crypto, US single names, SP500 — `[hypercall]`, E ≤ 3 × K ≤ 8 × {C,P}) + each underlying's settlement index (live since the 2026-09-26 go-live) | indicative BBO ticks, per-provider sides (`ProviderQuote`), index `Mark`s; REST `/options-summary` poll → opt-summary | Eighth venue (merged 2026-09-26); slot 7 trades its options in PAPER, §2.2 |
+
+### 2.1 MEXC — the seventh venue (landed 2026-09-23, `docs/mexc-ingress-plan.md`)
+
+Product facts only; the plan's §1 / §1.7 carry the measurements.
+
+- **Four classes on two keys.** `[mexc] spot` holds crypto spot AND the
+  xStocks tokenized equities (`AAPLXUSDT` "Apple xStock", `SPYXUSDT`) —
+  ordinary `mexc:` Spot rows. `[mexc] perp` holds crypto perps AND the
+  TradFi plane — single-name equities (`AAPLSTOCK_USDT`), indices
+  (`SPY_USDT`), metals (`XAU_USDT`), energy (`USOIL_USDT`), FX
+  (`EUR_USDT`) — ordinary `mexc-perp:` Perp rows. No new instrument
+  class, no equity branch (the BST ruling).
+- **Size.** 2026-09-20 (plan §1.3): 1 966 spot symbols (79 xStocks), 1 174
+  perps (431 on the TradFi plate: 400 single-name, 66 index, 60 ETF,
+  commodities / metals / oil / FX). 2026-09-23 discovery: 1 954 spot rows
+  (all live), 1 185 perp rows (1 134 live). MEXC lists and delists
+  aggressively; the news lane watches its delistings section.
+- **First universe (ruling Q-MX5):** spot `BTCUSDT ETHUSDT SOLUSDT
+  AAPLXUSDT SPYXUSDT`, perp `BTC_USDT ETH_USDT XAU_USDT USOIL_USDT
+  EUR_USDT SPY_USDT AAPLSTOCK_USDT`. It is captured only once `[mexc]`
+  is in `~/multivenue/universe.toml` and the engine has restarted — the
+  run's `instrument-manifest.tsv` is the truth.
+- **Channels.** Spot: BBO + prints only — incremental depth is `Blocked!`
+  on the public tier, so there is no MEXC book and no depth feature.
+  Futures: BBO = the top of `depth.full` (limit 5; ~270 ms on BTC, 4–5 s
+  between pushes on a quiet perp — it pushes on change), prints, and
+  `push.ticker` (~2.75 s) → Mark (`fairPrice` / `indexPrice`), Funding,
+  open interest. Ticks are BBO CHANGES (MEXC republishes unchanged
+  quotes; the ingress drops them). **Futures sizes are CONTRACTS**
+  (`contractSize`: BTC_USDT 0.0001, XAU_USDT 0.001, EUR_USDT 1, …).
+- **Funding cycle is per symbol:** 8 h on BTC / ETH / SPY / AAPLSTOCK,
+  **4 h on XAU, USOIL and EUR**. The worker funding lane (`mexc-perp`)
+  stores each settled print at its own settle time; the live `Funding`
+  event's next-settle `v1` rides a boot REST seed. Funding on gold, oil
+  and FX exists nowhere else in the universe (equity-perp funding also
+  exists on Binance's TradFi perps).
+- **Fees are UNVERIFIED** (the venue's published per-symbol REST rates,
+  2026-09-20; no fill has ever measured them): spot 0 / 5 bps (xStocks
+  included); perps crypto 0 / 2, the TradFi `0fees` plate 0 / 0, XAU 0 / 2,
+  USOIL 0 / 1, FX 1 / 4. `fees.toml` charges MEXC perps the dearest
+  configured plate (1:4).
+- **`indexOrigin` caveat.** MEXC's equity-perp index derives partly from
+  Binance's TradFi perp (`AAPLSTOCK_USDT` lists `BINANCE_FUTURE,
+  BITGET_FUTURE, BINANCETICKER, PYTH, KAIKO`), which this engine already
+  ingests. A MEXC↔Binance equity pair is therefore INDEX-LINKED, not
+  independent — what looks like a basis is a lead/lag on a shared
+  reference — and the `xv` authoring laws apply to it (entry at ≥ ~4.5σ
+  of the pair's deviation; the family's standing verdict is in §4).
+- **Capture only.** MEXC is data-only (ruling O-MX1): no exec arm, no fill
+  lane, and the harness fill model counts an order on venue byte 7
+  unroutable. Rulesets may NAME its descriptors (ruling Q-MX6; channel
+  caps `mexc:` price, `mexc-perp:` price + funding) as signal or
+  reference legs. From this host its REST RTT is 131–134 ms (Δ 150 ms,
+  `docs/venue-latency.md` §3): nothing latency-sensitive belongs on it.
+
+### 2.2 Hypercall — the eighth venue (merged 2026-09-26)
+
+- **Instruments.** Options, settled at expiry against each underlying's
+  index, on the twelve underlyings `[hypercall]` names — a boot-selected
+  E ≤ 3 × K ≤ 8 × {C,P} chain each:
+  descriptors `hypercall:<U>-<YYYYMMDD>-<K>-<C|P>`; each underlying's
+  settlement index is `hypercall-idx:<U>` (index `Mark` events only).
+- **Channels.** The venue's indicative BBO is the tick — kept crossed or
+  one-sided as published; the providers' own sides ride
+  `ChannelId::ProviderQuote`; a REST `/options-summary` poller fills the
+  opt-summary lane. The settlement law is replicated in
+  `crates/core-settle` (the shadow: worker `hypercall_settle`); the
+  research store is the worker's `hypercall_history`. Since HK7
+  (2026-10-13) the candles lane folds the index `Mark`s into 1 m
+  `capture` bars in candles.db (`hypercall-idx:<U>`, venue 9), placed by
+  the index's own time — the HAR series' candidate primary once
+  `har_seed compare` has ≥ 7 overlapping days against the trade candles.
+- **Paper only.** Data live since the 2026-09-26 go-live (O-HC25). Slot 7
+  (`hcv`) trades its options in PAPER: the paper matcher judges a
+  Hypercall IoC by the held-quote law (HC11); the harness has no held law
+  and refuses an order on venue byte 9. The HC9 order arm
+  (`crates/exec-hypercall`) runs only as the operator's `hypercall-live`
+  verbs; the engine refuses a live slot on it. Rulesets may NAME its
+  options (ruling O-HC17; caps `CAP_OPT | CAP_PRICE`) as signal or
+  reference legs; the index syms are capture-only (caps 0). Fees
+  `[fees.hypercall] option = "0:0"` are UNVERIFIED (O-HC7).
 
 ## 3. Derived/offline data (what research actually reads)
 
@@ -74,8 +157,9 @@ gate. Caps law for both (the 2026-08-29 $50k research tier):
   legacy tarballs and pulls back the same way.
 - **candles.db**: 1m/1h/1d candles keyed venue+descriptor (all
   configured instruments incl. equities via klines) · `funding` table
-  (5 venues, per-print rates — cadence law: deribit rows are hourly
-  samples of interest_8h, ÷8 on daily sums) · `iv_digest` (per-sym
+  (6 venues incl. `mexc-perp`, per-print rates — cadence law: deribit
+  rows are hourly samples of interest_8h, ÷8 on daily sums; MEXC prints
+  at each symbol's own 4 h / 8 h cycle) · `iv_digest` (per-sym
   1m/1h IV from opt-summary) · `depth_digest` (VM2 V6: hourly
   imbalance-OHLC / spread-bps / near-notional per depth-capable
   descriptor).
@@ -151,8 +235,9 @@ gate. Caps law for both (the 2026-08-29 $50k research tier):
   whole-root merge exceeds 24 GiB RAM.
 - Strict-cross fill law = taker-floor economics; maker fill ratios
   are unmeasurable in paper.
-- BN real-time markPrice/funding + options WS: venue-dark from this
-  egress; REST lanes cover both at native cadence.
+- BN real-time markPrice/funding and the options stream ran venue-dark
+  from this egress until BX0 (2026-09-23) moved both onto fstream's
+  routed paths; the REST lanes still cover both at native cadence.
 - Equity sessions: bStocks/TradFi perps trade 24/7 but PM equity
   dailies exist only for US trading days — session-segment any
   equity study (weekend prints are thin and drifty).
@@ -217,10 +302,10 @@ signal = combine( feat_a(instrument, window_a), feat_b(ref, window_b) )
   a regime change never flips the table. Rule 11 refuses malformed
   terms; the rule-8 duplicate law admits DISJOINT regime variants of
   one signal (e.g. one row `vol:low`, its twin `vol:!low`) and still
-  refuses intersecting ones. UNKNOWN dimensions (warm-up, or FUND on
-  this host — Binance markPrice is venue-dark) fail a constrained row
-  CLOSED, so `fund:` / `level:` labels are unusable until the `.env`
-  lever. Every labelled table must earn its label: the harness's
+  refuses intersecting ones. UNKNOWN dimensions (warm-up) fail a
+  constrained row CLOSED; FUND was UNKNOWN on this host until BX0 F1
+  made Binance's markPrice stream live (2026-09-23), so `fund:` /
+  `level:` labels are usable since. Every labelled table must earn its label: the harness's
   `--regime off` delta and leave-one-window-out on the standing ≤ 2 h
   window pool are the RG4 composer's gate (the live `fde6f733…` did
   not earn its vol split — kept as the soak shape by ruling).

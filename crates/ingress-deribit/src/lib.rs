@@ -21,7 +21,7 @@
 //! One `public/subscribe` call costs **3000 credits of a 30 000 pool**
 //! (~3.3 calls/s refill) — the run loop batches **all** configured
 //! `(channel × instrument)` pairs into a single call
-//! ([`write_subscribe_all`]). The subscribe *result* echoes the list of
+//! ([`render_subscribe_all`]). The subscribe *result* echoes the list of
 //! successfully-subscribed channels; any expected channel missing from
 //! the result is a misconfiguration and fails the session (fail-fast)
 //! — at BOOT. Once one full verification has ever succeeded, missing
@@ -56,14 +56,26 @@
 //!
 //! ## Sequence numbers on the Tick lane
 //!
-//! `quote` pushes carry **no venue sequence number**. Decision (8c):
-//! `Tick.venue_seq = timestamp_ms as u32` — venue-provided, monotonic
-//! across reconnects, wraps every ~49.7 days. Two quotes inside the
-//! same millisecond collapse at the `TopOfBook` boundary (equal seq =
-//! stale) — acceptable at BBO granularity. Books use full-width
-//! `change_id` and trades full-width `trade_seq` inside the monitors;
-//! u32 truncation only ever happens at the Tick boundary (same policy
-//! as OKX).
+//! `quote` pushes carry **no venue sequence number**, only the ms
+//! `timestamp` (in full in `Tick.venue_time_ms`, VT2). HK32
+//! (2026-10-15): `Tick.venue_seq` is the instrument's **arrival
+//! ordinal** — the run loop's per-row `core_types::ArrivalSeq` stamps
+//! each parsed quote 1, 2, 3, … in arrival order (one connection: the
+//! venue's order) while its `timestamp` does not go back; a quote OLDER
+//! than its instrument's newest carries 0 — every
+//! `book_builder::TopOfBook` drops it — and is counted on
+//! `seq_regressions_total`. The ordinal is monotone for the life of the
+//! process (a reconnect zeroes only the clock). The 2026-10-15 hour
+//! (821 520 quotes): 115 older quotes, all in the backlog the venue
+//! flushes after a multi-second host stall (up to 529 ms back), so the
+//! counter's baseline is not 0; 67 quotes shared their instrument's
+//! previous millisecond. Until HK32 the seq was `timestamp_ms as u32`
+//! (decision 8c): those 67, and 13 quotes back at the newest stamp after
+//! an older one, were `Stale`, and the low 32 bits wrap every ~49.7
+//! days (next 2026-11-21 21:25:29Z), after which every quote would have
+//! been `Stale` until a restart. Books keep the full-width `change_id`
+//! and trades the full-width `trade_seq` inside the monitors (and in the
+//! `ChannelEvent` capture).
 //!
 //! ## Amount normalization
 //!
@@ -78,10 +90,11 @@
 //! ## Zero-copy note (house doctrine)
 //!
 //! All parsing is in-place over `&[u8]` in the rx buffer. The one
-//! unavoidable copy per event is the 64-byte parsed POD moved into the
-//! SPSC ring by `try_push` (ownership transfer) — same as every
-//! ingress. Requests render into fixed stack scratch; no heap after
-//! construction.
+//! unavoidable copy per event is the 64-byte parsed POD copied into its
+//! SPSC ring slot by `try_push_ref` (the ring publish) — same as every
+//! ingress. Requests go straight into the tx buffer: the batch subscribe
+//! renders there header first, the fixed-shape requests are masked in
+//! from parts; no heap after construction.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -101,7 +114,7 @@ pub use run_loop::{
     RX_BUF_SIZE, TX_BUF_SIZE,
 };
 
-use core_net::SubId;
+use core_net::{SubId, WsPayload, WsWriteErr};
 use core_parse::{
     find_field, scan_i64, scan_number_sci_1e6, scan_number_sci_1e9, scan_u64, skip_byte,
 };
@@ -356,8 +369,9 @@ pub fn extract_instrument(payload: &[u8], channel: DeribitChannel) -> Option<&[u
 pub struct DeribitQuoteFrame {
     /// Venue event time (`timestamp`, ms) converted to ns.
     pub ts_ns: NsTs,
-    /// Venue `timestamp` in raw milliseconds (source of
-    /// `Tick.venue_seq` — see crate header).
+    /// Venue `timestamp` in raw milliseconds — `Tick.venue_time_ms`,
+    /// and the clock the run loop's arrival sequencer orders quotes by
+    /// (`Tick.venue_seq` — see crate header).
     pub ts_ms: u64,
     /// Best bid price ×1e6 (0 = side empty).
     pub bid_px_1e6: i64,
@@ -371,6 +385,20 @@ pub struct DeribitQuoteFrame {
     pub sym: SymbolId,
     // Explicit tail padding — keeps the slot exactly 64 B.
     _pad: [u8; 12],
+}
+
+impl DeribitQuoteFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        ts_ns: 0,
+        ts_ms: 0,
+        bid_px_1e6: 0,
+        bid_qty_1e6: 0,
+        ask_px_1e6: 0,
+        ask_qty_1e6: 0,
+        sym: 0,
+        _pad: [0; 12],
+    };
 }
 
 /// Parsed `ticker.{instr}.100ms` push — mark/index/funding/limits/OI
@@ -413,6 +441,24 @@ pub struct DeribitTickerFrame {
     _pad: [u8; 58],
 }
 
+impl DeribitTickerFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        ts_ns: 0,
+        mark_px_1e6: 0,
+        index_px_1e6: 0,
+        current_funding_1e9: 0,
+        open_interest_1e6: 0,
+        min_px_1e6: 0,
+        max_px_1e6: 0,
+        funding_8h_1e9: 0,
+        sym: 0,
+        has_funding: 0,
+        has_funding_8h: 0,
+        _pad: [0; 58],
+    };
+}
+
 /// Parsed `trades.{instr}.100ms` row.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(C, align(64))]
@@ -436,6 +482,20 @@ pub struct DeribitTradeFrame {
     pub side: u8,
     // Explicit tail padding.
     _pad: [u8; 15],
+}
+
+impl DeribitTradeFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        trade_seq: 0,
+        ts_ns: 0,
+        px_1e6: 0,
+        qty_1e6: 0,
+        trade_id: 0,
+        sym: 0,
+        side: 0,
+        _pad: [0; 15],
+    };
 }
 
 /// Parsed `book.{instr}.100ms` push **header** — §4.5: depth is
@@ -464,6 +524,22 @@ pub struct DeribitBookFrame {
     pub action: u8,
     // Explicit tail padding.
     _pad: [u8; 27],
+}
+
+impl DeribitBookFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        change_id: 0,
+        prev_change_id: 0,
+        ts_ns: 0,
+        sym: 0,
+        n_bids: 0,
+        n_asks: 0,
+        excess_bids: 0,
+        excess_asks: 0,
+        action: 0,
+        _pad: [0; 27],
+    };
 }
 
 /// `action` value for a book snapshot (`"type":"snapshot"`).
@@ -559,7 +635,8 @@ mod book_walk_tests {
         let mut l = DepthLadder::new();
         let snap = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"book.BTC-PERPETUAL.100ms","data":{"type":"snapshot","timestamp":1554373962454,"instrument_name":"BTC-PERPETUAL","change_id":297217,"bids":[["new",5042.34,30.0],["new",5041.94,175.0]],"asks":[["new",5042.64,350.0],["new",5043.3,40.0]]}}}"#;
         assert_eq!(walk_book_levels(snap, &mut l), Some(4));
-        let s = l.snapshot(1, VenueId::Deribit, 7, 0);
+        let mut s = core_types::DepthTopK::EMPTY;
+        l.snapshot_into(1, VenueId::Deribit, 7, 0, &mut s);
         assert_eq!(s.bids[0].px_1e6, 5_042_340_000);
         assert_eq!(s.bids[0].qty_1e6, 30_000_000);
         assert_eq!(s.asks[0].px_1e6, 5_042_640_000);
@@ -567,7 +644,8 @@ mod book_walk_tests {
         // delete forces qty 0 even when the row carries an amount.
         let delta = br#"{"params":{"data":{"type":"change","change_id":297218,"prev_change_id":297217,"bids":[["change",5042.34,55.0]],"asks":[["delete",5042.64,350.0]]}}}"#;
         assert_eq!(walk_book_levels(delta, &mut l), Some(2));
-        let s = l.snapshot(2, VenueId::Deribit, 7, 0);
+        let mut s = core_types::DepthTopK::EMPTY;
+        l.snapshot_into(2, VenueId::Deribit, 7, 0, &mut s);
         assert_eq!(s.bids[0].qty_1e6, 55_000_000);
         assert_eq!(s.asks[0].px_1e6, 5_043_300_000, "old best deleted");
         assert_eq!(l.asks.len(), 1);
@@ -579,8 +657,10 @@ mod book_walk_tests {
         let mut l = DepthLadder::new();
         let sci = br#"{"data":{"bids":[["new",5.0e3,1.0e3]],"asks":[]}}"#;
         assert_eq!(walk_book_levels(sci, &mut l), Some(1));
-        assert_eq!(l.bids.top_k()[0].px_1e6, 5_000_000_000);
-        assert_eq!(l.bids.top_k()[0].qty_1e6, 1_000_000_000);
+        let mut k = [core_types::DepthLevel::EMPTY; core_types::DEPTH_K];
+        l.bids.top_k_into(&mut k);
+        assert_eq!(k[0].px_1e6, 5_000_000_000);
+        assert_eq!(k[0].qty_1e6, 1_000_000_000);
         // Quoted price (OKX shape on the Deribit walker) rejects.
         let mut l2 = DepthLadder::new();
         assert_eq!(
@@ -631,9 +711,21 @@ fn scan_px_field_1e6(buf: &[u8], key: &[u8]) -> Option<i64> {
 
 /// Parse a `quote` push into a [`DeribitQuoteFrame`]. `sym` is the
 /// caller-resolved symbol (from [`extract_instrument`] + the symbol
-/// table). Returns `None` on malformed input — caller counts it.
+/// table). Returns `false` on malformed input — caller counts it.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_quote(payload: &[u8], sym: SymbolId) -> Option<DeribitQuoteFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_quote(payload: &[u8], sym: SymbolId, out: &mut DeribitQuoteFrame) -> bool {
+    parse_quote_fill(payload, sym, out).is_some()
+}
+
+/// [`parse_quote`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_quote_fill(payload: &[u8], sym: SymbolId, out: &mut DeribitQuoteFrame) -> Option<()> {
     let bid_px_1e6 = scan_px_field_1e6(payload, b"\"best_bid_price\":")?;
     let bid_qty_1e6 = scan_px_field_1e6(payload, b"\"best_bid_amount\":")?;
     let ask_px_1e6 = scan_px_field_1e6(payload, b"\"best_ask_price\":")?;
@@ -643,7 +735,7 @@ pub fn parse_quote(payload: &[u8], sym: SymbolId) -> Option<DeribitQuoteFrame> {
     if bid_px_1e6 == 0 && ask_px_1e6 == 0 {
         return None;
     }
-    Some(DeribitQuoteFrame {
+    *out = DeribitQuoteFrame {
         ts_ns,
         ts_ms,
         bid_px_1e6,
@@ -652,7 +744,8 @@ pub fn parse_quote(payload: &[u8], sym: SymbolId) -> Option<DeribitQuoteFrame> {
         ask_qty_1e6,
         sym,
         _pad: [0; 12],
-    })
+    };
+    Some(())
 }
 
 /// Parsed OPTION `ticker.{instr}.100ms` push (M2.3) — the mark/IV /
@@ -661,7 +754,7 @@ pub fn parse_quote(payload: &[u8], sym: SymbolId) -> Option<DeribitQuoteFrame> {
 /// px/IV/underlying ×1e9 (IV normalized percent→fraction), OI ×1e6,
 /// delta/gamma ×1e9, vega/theta ×1e6. `Copy` POD, stack-only.
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct DeribitOptTickerFrame {
     /// `mark_price` ×1e9 (coin-denominated on this venue).
     pub mark_px_1e9: i64,
@@ -681,13 +774,39 @@ pub struct DeribitOptTickerFrame {
     pub theta_1e6: i64,
 }
 
+impl DeribitOptTickerFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        mark_px_1e9: 0,
+        mark_iv_1e9: 0,
+        underlying_px_1e9: 0,
+        open_interest_1e6: 0,
+        delta_1e9: 0,
+        gamma_1e9: 0,
+        vega_1e6: 0,
+        theta_1e6: 0,
+    };
+}
+
 /// Parse an OPTION ticker push payload (M2.3). Zero-alloc flat scans
 /// — every captured key appears exactly once in an option ticker
 /// (the `greeks` sub-object keys are unique payload-wide). Any
-/// missing/malformed field ⇒ `None` (the venue contract changed).
+/// missing/malformed field ⇒ `false` (the venue contract changed).
 /// The futures/perp ticker path is [`parse_ticker`], unchanged.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_option_ticker(payload: &[u8]) -> Option<DeribitOptTickerFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_option_ticker(payload: &[u8], out: &mut DeribitOptTickerFrame) -> bool {
+    parse_option_ticker_fill(payload, out).is_some()
+}
+
+/// [`parse_option_ticker`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_option_ticker_fill(payload: &[u8], out: &mut DeribitOptTickerFrame) -> Option<()> {
     #[inline]
     fn field_1e9(payload: &[u8], key: &[u8]) -> Option<i64> {
         let pos = find_field(payload, key)?;
@@ -703,7 +822,7 @@ pub fn parse_option_ticker(payload: &[u8]) -> Option<DeribitOptTickerFrame> {
     let gamma_1e9 = field_1e9(payload, b"\"gamma\":")?;
     let vega_1e6 = field_1e9(payload, b"\"vega\":")? / 1000;
     let theta_1e6 = field_1e9(payload, b"\"theta\":")? / 1000;
-    Some(DeribitOptTickerFrame {
+    *out = DeribitOptTickerFrame {
         mark_px_1e9,
         mark_iv_1e9,
         underlying_px_1e9,
@@ -712,7 +831,8 @@ pub fn parse_option_ticker(payload: &[u8]) -> Option<DeribitOptTickerFrame> {
         gamma_1e9,
         vega_1e6,
         theta_1e6,
-    })
+    };
+    Some(())
 }
 
 /// WS6: one parsed `deribit_volatility_index.{index}` (DVOL) push.
@@ -724,19 +844,54 @@ pub struct DeribitVolIndexFrame {
     /// `volatility` POINTS ×1e9 (venue sends percent points, e.g.
     /// `84.71`).
     pub vol_1e9: i64,
-    /// Length of the index name captured into `index_name`.
+    /// Byte offset of the `index_name` value (`btc_usd`) in the payload
+    /// the frame was parsed from — the name stays in the rx buffer;
+    /// read it with [`Self::index_name`].
+    pub index_name_off: u32,
+    /// Length of that value, 1..=16.
     pub index_name_len: u8,
-    /// `index_name` bytes (`btc_usd`), `index_name_len` valid.
-    pub index_name: [u8; 16],
     // Explicit tail padding.
-    _pad: [u8; 31],
+    _pad: [u8; 43],
+}
+
+impl DeribitVolIndexFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        ts_ns: 0,
+        vol_1e9: 0,
+        index_name_off: 0,
+        index_name_len: 0,
+        _pad: [0; 43],
+    };
+
+    /// The index name as a span of `payload` — the payload this frame
+    /// was parsed from; `None` if the span does not lie inside it.
+    #[inline]
+    #[must_use]
+    pub fn index_name<'a>(&self, payload: &'a [u8]) -> Option<&'a [u8]> {
+        payload
+            .get(self.index_name_off as usize..)?
+            .get(..usize::from(self.index_name_len))
+    }
 }
 
 /// WS6: parse one DVOL push. The index name resolves to a
 /// boot-configured ordinal at the capture site (never the symbol
-/// table — DVOL is venue-global). `None` on malformed input.
+/// table — DVOL is venue-global). `false` on malformed input.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_vol_index(payload: &[u8]) -> Option<DeribitVolIndexFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_vol_index(payload: &[u8], out: &mut DeribitVolIndexFrame) -> bool {
+    parse_vol_index_fill(payload, out).is_some()
+}
+
+/// [`parse_vol_index`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_vol_index_fill(payload: &[u8], out: &mut DeribitVolIndexFrame) -> Option<()> {
     let (ts_ns, _) = scan_ms_field(payload, b"\"timestamp\":")?;
     let pos = find_field(payload, b"\"volatility\":")?;
     let (vol_1e9, _) = scan_number_sci_1e9(payload, pos)?;
@@ -744,18 +899,17 @@ pub fn parse_vol_index(payload: &[u8]) -> Option<DeribitVolIndexFrame> {
     let start = skip_byte(payload, pos, b'"');
     let rel_end = memchr::memchr(b'"', payload.get(start..)?)?;
     let name = payload.get(start..start + rel_end)?;
-    if name.is_empty() || name.len() > 16 {
+    if name.is_empty() || name.len() > DERIBIT_DVOL_NAME_MAX {
         return None;
     }
-    let mut index_name = [0u8; 16];
-    index_name[..name.len()].copy_from_slice(name);
-    Some(DeribitVolIndexFrame {
+    *out = DeribitVolIndexFrame {
         ts_ns,
         vol_1e9,
+        index_name_off: u32::try_from(start).ok()?,
         index_name_len: name.len() as u8,
-        index_name,
-        _pad: [0; 31],
-    })
+        _pad: [0; 43],
+    };
+    Some(())
 }
 
 /// Parse a futures/perp `ticker.{instr}.100ms` push into a
@@ -767,8 +921,20 @@ pub fn parse_vol_index(payload: &[u8]) -> Option<DeribitVolIndexFrame> {
 /// rejected every dated-future ticker as a parse error). Presence is
 /// reported through `has_funding` so the capture site can gate the
 /// funding emit on venue truth.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_ticker(payload: &[u8], sym: SymbolId) -> Option<DeribitTickerFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_ticker(payload: &[u8], sym: SymbolId, out: &mut DeribitTickerFrame) -> bool {
+    parse_ticker_fill(payload, sym, out).is_some()
+}
+
+/// [`parse_ticker`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_ticker_fill(payload: &[u8], sym: SymbolId, out: &mut DeribitTickerFrame) -> Option<()> {
     // `"mark_price":`/`"index_price":` cannot false-match inside
     // `"settlement_price":` etc. — the leading quote anchors the key.
     let mark_px_1e6 = scan_px_field_1e6(payload, b"\"mark_price\":")?;
@@ -793,7 +959,7 @@ pub fn parse_ticker(payload: &[u8], sym: SymbolId) -> Option<DeribitTickerFrame>
         }
         None => (0, 0u8),
     };
-    Some(DeribitTickerFrame {
+    *out = DeribitTickerFrame {
         ts_ns,
         mark_px_1e6,
         index_px_1e6,
@@ -806,14 +972,27 @@ pub fn parse_ticker(payload: &[u8], sym: SymbolId) -> Option<DeribitTickerFrame>
         has_funding,
         has_funding_8h,
         _pad: [0; 58],
-    })
+    };
+    Some(())
 }
 
 /// Parse one `trades` **row slice** into a [`DeribitTradeFrame`]. The
 /// run loop slices rows at successive `"trade_seq":` markers; every
 /// key here is matched inside the row slice only.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_trade(row: &[u8], sym: SymbolId) -> Option<DeribitTradeFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_trade(row: &[u8], sym: SymbolId, out: &mut DeribitTradeFrame) -> bool {
+    parse_trade_fill(row, sym, out).is_some()
+}
+
+/// [`parse_trade`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_trade_fill(row: &[u8], sym: SymbolId, out: &mut DeribitTradeFrame) -> Option<()> {
     let pos = find_field(row, b"\"trade_seq\":")?;
     let (trade_seq, _) = scan_i64(row, pos)?;
     let pos = find_field(row, b"\"price\":")?;
@@ -835,7 +1014,7 @@ pub fn parse_trade(row: &[u8], sym: SymbolId) -> Option<DeribitTradeFrame> {
         .and_then(|p| scan_u64(row, p))
         .map(|(v, _)| v)
         .unwrap_or(0);
-    Some(DeribitTradeFrame {
+    *out = DeribitTradeFrame {
         trade_seq,
         ts_ns,
         px_1e6,
@@ -844,7 +1023,8 @@ pub fn parse_trade(row: &[u8], sym: SymbolId) -> Option<DeribitTradeFrame> {
         sym,
         side,
         _pad: [0; 15],
-    })
+    };
+    Some(())
 }
 
 /// Count the level entries of one side array (`"bids":[["new",px,amt],…]`)
@@ -894,8 +1074,20 @@ fn count_side_levels(buf: &[u8], pos: usize) -> Option<(u16, u16)> {
 /// Parse a `book.{instr}.100ms` push **header** (chain fields, event
 /// time, capped level counts). Levels are deliberately not lifted
 /// (§4.5). Snapshots have no `prev_change_id` on the wire → `-1`.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_book_header(payload: &[u8], sym: SymbolId) -> Option<DeribitBookFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_book_header(payload: &[u8], sym: SymbolId, out: &mut DeribitBookFrame) -> bool {
+    parse_book_header_fill(payload, sym, out).is_some()
+}
+
+/// [`parse_book_header`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_book_header_fill(payload: &[u8], sym: SymbolId, out: &mut DeribitBookFrame) -> Option<()> {
     let action = if memchr::memmem::find(payload, b"\"type\":\"snapshot\"").is_some() {
         BOOK_ACTION_SNAPSHOT
     } else if memchr::memmem::find(payload, b"\"type\":\"change\"").is_some() {
@@ -919,7 +1111,7 @@ pub fn parse_book_header(payload: &[u8], sym: SymbolId) -> Option<DeribitBookFra
     let (n_bids, excess_bids) = count_side_levels(payload, bids_pos)?;
     let asks_pos = find_field(payload, b"\"asks\":")?;
     let (n_asks, excess_asks) = count_side_levels(payload, asks_pos)?;
-    Some(DeribitBookFrame {
+    *out = DeribitBookFrame {
         change_id,
         prev_change_id,
         ts_ns,
@@ -930,7 +1122,8 @@ pub fn parse_book_header(payload: &[u8], sym: SymbolId) -> Option<DeribitBookFra
         excess_asks,
         action,
         _pad: [0; 27],
-    })
+    };
+    Some(())
 }
 
 // ---------------------------------------------------------------
@@ -1010,6 +1203,11 @@ impl DeribitSymbolTable {
     fn push_row(&mut self, instrument: &[u8], sym: SymbolId) {
         let row = &mut self.rows[self.len];
         row.0 = instrument.len() as u8;
+        // COPY: ≤ 32 B instrument (DERIBIT_INSTR_MAX) into its symbol-table row,
+        // once per instrument at boot — the table owns fixed rows so the hot lookup
+        // compares in place with no pointer chase — rejected: borrowing the boot
+        // strings (the table moves onto the ingress thread and must not pin boot
+        // allocations).
         row.1[..instrument.len()].copy_from_slice(instrument);
         row.2 = sym;
         self.len += 1;
@@ -1340,13 +1538,6 @@ impl Default for DeribitTradeSeq {
 // JSON-RPC request writers + SubId derivation
 // ---------------------------------------------------------------
 
-#[inline]
-pub(crate) fn push_bytes(dst: &mut [u8], at: usize, src: &[u8]) -> Option<usize> {
-    let end = at.checked_add(src.len())?;
-    dst.get_mut(at..end)?.copy_from_slice(src);
-    Some(end)
-}
-
 /// Render `v` as decimal ASCII into `scratch`, returning the digit
 /// slice (right-aligned internally; no allocation).
 #[inline]
@@ -1364,34 +1555,65 @@ pub(crate) fn fmt_u64(v: u64, scratch: &mut [u8; 20]) -> &[u8] {
     &scratch[i..]
 }
 
-/// `{"jsonrpc":"2.0","id":<id>,"method":"<method>","params":` — the
-/// shared request head. Caller appends the params body and `}`.
+/// Every request's head, up to its id.
+const REQ_HEAD: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":";
+
+/// A channel name as it is quoted on the wire, in parts: `"`, the
+/// prefix, the instrument, the suffix, `"`. The ONE spelling of a channel
+/// name: the subscribe render writes it, and the run loop's subscribe-
+/// result check searches for it (HK3; the quotes keep `quote.BTC-PERP`
+/// from aliasing `quote.BTC-PERPETUAL`).
+/// The parts are laid into the caller's slot (an 80 B array is never
+/// returned by value — the ZC pass B rule).
 #[inline]
-fn write_req_head(dst: &mut [u8], id: u64, method: &[u8]) -> Option<usize> {
-    let mut n = 0;
-    n = push_bytes(dst, n, b"{\"jsonrpc\":\"2.0\",\"id\":")?;
-    let mut digits = [0u8; 20];
-    n = push_bytes(dst, n, fmt_u64(id, &mut digits))?;
-    n = push_bytes(dst, n, b",\"method\":\"")?;
-    n = push_bytes(dst, n, method)?;
-    n = push_bytes(dst, n, b"\",\"params\":")?;
-    Some(n)
+pub fn channel_name_parts<'a>(
+    channel: DeribitChannel,
+    instrument: &'a [u8],
+    parts: &mut [&'a [u8]; 5],
+) {
+    parts[0] = b"\"";
+    parts[1] = channel.wire_prefix();
+    parts[2] = instrument;
+    parts[3] = channel.wire_suffix();
+    parts[4] = b"\"";
 }
 
+/// The longest quoted channel name [`channel_name_parts`] spells: the two
+/// quotes, the longest prefix, [`DERIBIT_INSTR_MAX`] and the longest
+/// suffix — 47 B.
+pub const CHANNEL_NAME_MAX: usize = {
+    let ch = [
+        DeribitChannel::Quote,
+        DeribitChannel::Ticker,
+        DeribitChannel::Trades,
+        DeribitChannel::Book,
+    ];
+    let mut m = 0;
+    let mut i = 0;
+    while i < ch.len() {
+        let l = ch[i].wire_prefix().len() + ch[i].wire_suffix().len();
+        if l > m {
+            m = l;
+        }
+        i += 1;
+    }
+    2 + m + DERIBIT_INSTR_MAX
+};
+
 #[inline]
-fn write_channel_name(
-    dst: &mut [u8],
-    at: usize,
+fn render_channel_name(
+    p: &mut WsPayload<'_>,
     channel: DeribitChannel,
     instrument: &[u8],
-) -> Option<usize> {
-    let mut n = at;
-    n = push_bytes(dst, n, b"\"")?;
-    n = push_bytes(dst, n, channel.wire_prefix())?;
-    n = push_bytes(dst, n, instrument)?;
-    n = push_bytes(dst, n, channel.wire_suffix())?;
-    n = push_bytes(dst, n, b"\"")?;
-    Some(n)
+) -> Result<(), WsWriteErr> {
+    let mut parts: [&[u8]; 5] = [b""; 5];
+    channel_name_parts(channel, instrument, &mut parts);
+    let mut k = 0;
+    while k < parts.len() {
+        p.put(parts[k])?;
+        k += 1;
+    }
+    Ok(())
 }
 
 /// WS6: max DVOL index subscriptions per session (`[deribit]
@@ -1399,8 +1621,13 @@ fn write_channel_name(
 /// currencies — 8 is generous headroom).
 pub const DERIBIT_DVOL_MAX: usize = 8;
 
+/// WS6: the longest DVOL index name (`btc_usd`) — the one width the
+/// driver's table, the boot check, the push parser and the tx sizing read
+/// (HK3).
+pub const DERIBIT_DVOL_NAME_MAX: usize = 16;
+
 /// WS6: one configured DVOL index name (`(len, bytes)`; `btc_usd`).
-pub type DvolName = (u8, [u8; 16]);
+pub type DvolName = (u8, [u8; DERIBIT_DVOL_NAME_MAX]);
 
 /// Serialize the single batched `public/subscribe` covering every
 /// configured `(channel × instrument)` pair per the
@@ -1412,18 +1639,23 @@ pub type DvolName = (u8, [u8; 16]);
 /// index (WS6 — OUTSIDE the verification mask: an absent echo shows
 /// up as a missing capture series, never a session verdict).
 /// **One call** — subscribe costs 3000 of 30 000 credits (§4.2), so
-/// batching is mandatory. Returns the byte length, `None` if `dst`
-/// is too small.
+/// batching is mandatory. Rendered through `p` straight into its frame,
+/// header first (`core_net::queue_masked_text_frame_rendered`).
+///
+/// # Errors
+/// [`WsWriteErr::BufferTooSmall`] when `p` runs out of room.
 #[inline]
-pub fn write_subscribe_all(
-    dst: &mut [u8],
+pub fn render_subscribe_all(
+    p: &mut WsPayload<'_>,
     id: u64,
     symbols: &DeribitSymbolTable,
     depth_enabled: bool,
     dvol: &[DvolName],
-) -> Option<usize> {
-    let mut n = write_req_head(dst, id, b"public/subscribe")?;
-    n = push_bytes(dst, n, b"{\"channels\":[")?;
+) -> Result<(), WsWriteErr> {
+    p.put(REQ_HEAD)?;
+    let mut digits = [0u8; 20];
+    p.put(fmt_u64(id, &mut digits))?;
+    p.put(b",\"method\":\"public/subscribe\",\"params\":{\"channels\":[")?;
     let mut first = true;
     let mut i = 0;
     while let Some((instr, _sym)) = symbols.get(i) {
@@ -1437,10 +1669,10 @@ pub fn write_subscribe_all(
         while c < channels.len() {
             if row_wants_channel(symbols, i, c, depth_enabled) {
                 if !first {
-                    n = push_bytes(dst, n, b",")?;
+                    p.put(b",")?;
                 }
                 first = false;
-                n = write_channel_name(dst, n, channels[c], instr)?;
+                render_channel_name(p, channels[c], instr)?;
             }
             c += 1;
         }
@@ -1450,49 +1682,85 @@ pub fn write_subscribe_all(
     while d < dvol.len() {
         let (len, ref bytes) = dvol[d];
         if !first {
-            n = push_bytes(dst, n, b",")?;
+            p.put(b",")?;
         }
         first = false;
-        n = push_bytes(dst, n, b"\"deribit_volatility_index.")?;
-        n = push_bytes(dst, n, &bytes[..len as usize])?;
-        n = push_bytes(dst, n, b"\"")?;
+        p.put(b"\"deribit_volatility_index.")?;
+        p.put(&bytes[..len as usize])?;
+        p.put(b"\"")?;
         d += 1;
     }
-    n = push_bytes(dst, n, b"]}}")?;
-    Some(n)
+    p.put(b"]}}")
 }
 
-/// Serialize a one-channel `public/subscribe` or `public/unsubscribe`
-/// for `book.{instr}.100ms` — the §6.2 resync action after a chain
-/// break (unsubscribe + subscribe ⇒ fresh snapshot).
-#[inline]
-pub fn write_book_op(dst: &mut [u8], id: u64, method: &[u8], instrument: &[u8]) -> Option<usize> {
-    let mut n = write_req_head(dst, id, method)?;
-    n = push_bytes(dst, n, b"{\"channels\":[")?;
-    n = write_channel_name(dst, n, DeribitChannel::Book, instrument)?;
-    n = push_bytes(dst, n, b"]}}")?;
-    Some(n)
+/// A book resync request's verb.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeribitBookOp {
+    /// `public/subscribe`.
+    Subscribe,
+    /// `public/unsubscribe`.
+    Unsubscribe,
 }
 
-/// Serialize `public/set_heartbeat {"interval": <secs>}` — queued
-/// once per connection, immediately after the WS upgrade.
+/// A one-channel `public/(un)subscribe` for `book.{instr}.100ms` — the
+/// §6.2 resync after a chain break (unsubscribe + subscribe ⇒ a fresh
+/// snapshot) — as wire parts laid into the caller's `parts` in place,
+/// for `core_net::queue_masked_text_frame_parts`: the id's digits
+/// render into `digits`; the request is never assembled first.
 #[inline]
-pub fn write_set_heartbeat(dst: &mut [u8], id: u64, interval_secs: u64) -> Option<usize> {
-    let mut n = write_req_head(dst, id, b"public/set_heartbeat")?;
-    n = push_bytes(dst, n, b"{\"interval\":")?;
-    let mut digits = [0u8; 20];
-    n = push_bytes(dst, n, fmt_u64(interval_secs, &mut digits))?;
-    n = push_bytes(dst, n, b"}}")?;
-    Some(n)
+pub fn book_op_parts<'a>(
+    op: DeribitBookOp,
+    id: u64,
+    instrument: &'a [u8],
+    digits: &'a mut [u8; 20],
+    parts: &mut [&'a [u8]; 5],
+) {
+    parts[0] = REQ_HEAD;
+    parts[1] = fmt_u64(id, digits);
+    parts[2] = match op {
+        DeribitBookOp::Subscribe => {
+            b",\"method\":\"public/subscribe\",\"params\":{\"channels\":[\"book."
+        }
+        DeribitBookOp::Unsubscribe => {
+            b",\"method\":\"public/unsubscribe\",\"params\":{\"channels\":[\"book."
+        }
+    };
+    parts[3] = instrument;
+    parts[4] = b".100ms\"]}}";
 }
 
-/// Serialize `public/test {}` — the mandatory `test_request` answer
-/// and our proactive idle probe.
+/// `public/set_heartbeat {"interval": <secs>}` — queued once per
+/// connection, right after the WS upgrade — as wire parts laid into the
+/// caller's `parts` in place: the id and the interval render into their
+/// digit buffers; the request is never assembled first.
 #[inline]
-pub fn write_test(dst: &mut [u8], id: u64) -> Option<usize> {
-    let mut n = write_req_head(dst, id, b"public/test")?;
-    n = push_bytes(dst, n, b"{}}")?;
-    Some(n)
+pub fn set_heartbeat_parts<'a>(
+    id: u64,
+    interval_secs: u64,
+    id_digits: &'a mut [u8; 20],
+    secs_digits: &'a mut [u8; 20],
+    parts: &mut [&'a [u8]; 5],
+) {
+    parts[0] = REQ_HEAD;
+    parts[1] = fmt_u64(id, id_digits);
+    parts[2] = b",\"method\":\"public/set_heartbeat\",\"params\":{\"interval\":";
+    parts[3] = fmt_u64(interval_secs, secs_digits);
+    parts[4] = b"}}";
+}
+
+/// `public/test {}` — the mandatory `test_request` answer and our
+/// proactive idle probe, so THE steady-state request — as wire parts
+/// for `core_net::queue_masked_text_frame_parts`: the id's digits
+/// render into `digits`, and the frame serialiser masks each part
+/// straight into tx; the request is never assembled first.
+#[inline]
+#[must_use]
+pub fn test_request_parts(id: u64, digits: &mut [u8; 20]) -> [&[u8]; 3] {
+    [
+        REQ_HEAD,
+        fmt_u64(id, digits),
+        b",\"method\":\"public/test\",\"params\":{}}",
+    ]
 }
 
 /// FNV-1a 64-bit over the channel tag byte + instrument bytes — a
@@ -1519,9 +1787,74 @@ pub fn sub_id_of(channel: DeribitChannel, instrument: &[u8]) -> SubId {
 // Tests
 // ---------------------------------------------------------------
 
+/// Test views in the old by-value shape, shared by the unit and the
+/// property tests: each wraps one in-place parser and hands back its
+/// frame's `Option`, so assertions read naturally. Cold — production
+/// callers parse in place.
+#[cfg(test)]
+mod views {
+    // COPY: `Option<DeribitQuoteFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_quote_view(payload: &[u8], sym: core_types::SymbolId) -> Option<crate::DeribitQuoteFrame> {
+        let mut f = crate::DeribitQuoteFrame::ZERO;
+        crate::parse_quote(payload, sym, &mut f).then_some(f)
+    }
+    // COPY: `Option<DeribitOptTickerFrame>` 72 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_option_ticker_view(payload: &[u8]) -> Option<crate::DeribitOptTickerFrame> {
+        let mut f = crate::DeribitOptTickerFrame::ZERO;
+        crate::parse_option_ticker(payload, &mut f).then_some(f)
+    }
+    // COPY: `Option<DeribitVolIndexFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_vol_index_view(payload: &[u8]) -> Option<crate::DeribitVolIndexFrame> {
+        let mut f = crate::DeribitVolIndexFrame::ZERO;
+        crate::parse_vol_index(payload, &mut f).then_some(f)
+    }
+    // COPY: `Option<DeribitTickerFrame>` 192 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_ticker_view(payload: &[u8], sym: core_types::SymbolId) -> Option<crate::DeribitTickerFrame> {
+        let mut f = crate::DeribitTickerFrame::ZERO;
+        crate::parse_ticker(payload, sym, &mut f).then_some(f)
+    }
+    // COPY: `Option<DeribitTradeFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_trade_view(row: &[u8], sym: core_types::SymbolId) -> Option<crate::DeribitTradeFrame> {
+        let mut f = crate::DeribitTradeFrame::ZERO;
+        crate::parse_trade(row, sym, &mut f).then_some(f)
+    }
+    // COPY: `Option<DeribitBookFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_book_header_view(payload: &[u8], sym: core_types::SymbolId) -> Option<crate::DeribitBookFrame> {
+        let mut f = crate::DeribitBookFrame::ZERO;
+        crate::parse_book_header(payload, sym, &mut f).then_some(f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::views::*;
+
+    /// The subscribe rendered into a plain buffer — exactly what the
+    /// frame's payload span receives; `None` when it does not fit.
+    fn write_subscribe_all(
+        buf: &mut [u8],
+        id: u64,
+        symbols: &DeribitSymbolTable,
+        depth_enabled: bool,
+        dvol: &[DvolName],
+    ) -> Option<usize> {
+        let mut p = WsPayload::writing(buf);
+        render_subscribe_all(&mut p, id, symbols, depth_enabled, dvol).ok()?;
+        Some(p.len())
+    }
 
     const QUOTE: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC-PERPETUAL","data":{"timestamp":1550658624149,"instrument_name":"BTC-PERPETUAL","best_bid_price":3914.97,"best_bid_amount":40.0,"best_ask_price":3996.61,"best_ask_amount":50.0}}}"#;
     const TICKER: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.BTC-PERPETUAL.100ms","data":{"timestamp":1550652954406,"state":"open","settlement_price":3925.85,"open_interest":18918470,"min_price":3943.21,"max_price":3982.84,"mark_price":3940.06,"last_price":3906.0,"instrument_name":"BTC-PERPETUAL","index_price":3931.73,"funding_8h":0.00655,"current_funding":0.00042,"best_bid_price":3914.97,"best_bid_amount":40.0,"best_ask_price":3996.61,"best_ask_amount":50.0}}}"#;
@@ -1616,7 +1949,7 @@ mod tests {
 
     #[test]
     fn parse_quote_extracts_both_sides() {
-        let f = parse_quote(QUOTE, 7).unwrap();
+        let f = parse_quote_view(QUOTE, 7).unwrap();
         assert_eq!(f.sym, 7);
         assert_eq!(f.bid_px_1e6, 3_914_970_000);
         assert_eq!(f.bid_qty_1e6, 40_000_000);
@@ -1629,25 +1962,25 @@ mod tests {
     #[test]
     fn parse_quote_null_side_and_double_null() {
         let one_sided = br#"{"timestamp":1000,"best_bid_price":null,"best_bid_amount":null,"best_ask_price":1.5,"best_ask_amount":2.0}"#;
-        let f = parse_quote(one_sided, 1).unwrap();
+        let f = parse_quote_view(one_sided, 1).unwrap();
         assert_eq!(f.bid_px_1e6, 0);
         assert_eq!(f.bid_qty_1e6, 0);
         assert_eq!(f.ask_px_1e6, 1_500_000);
         let empty = br#"{"timestamp":1000,"best_bid_price":null,"best_bid_amount":null,"best_ask_price":null,"best_ask_amount":null}"#;
-        assert!(parse_quote(empty, 1).is_none());
+        assert!(parse_quote_view(empty, 1).is_none());
     }
 
     #[test]
     fn parse_quote_rejects_missing_timestamp() {
         let b = br#"{"best_bid_price":1.0,"best_bid_amount":1.0,"best_ask_price":2.0,"best_ask_amount":1.0}"#;
-        assert!(parse_quote(b, 0).is_none());
+        assert!(parse_quote_view(b, 0).is_none());
     }
 
     // ---- parse_ticker --------------------------------------------
 
     #[test]
     fn parse_ticker_extracts_all_seven_fields() {
-        let f = parse_ticker(TICKER, 9).unwrap();
+        let f = parse_ticker_view(TICKER, 9).unwrap();
         assert_eq!(f.sym, 9);
         assert_eq!(f.mark_px_1e6, 3_940_060_000);
         assert_eq!(f.index_px_1e6, 3_931_730_000);
@@ -1665,12 +1998,12 @@ mod tests {
     #[test]
     fn parse_ticker_negative_funding_and_rejects_garbage() {
         let b = br#"{"timestamp":2000,"mark_price":1.0,"index_price":1.0,"current_funding":-0.000375,"open_interest":5,"min_price":0.9,"max_price":1.1}"#;
-        let f = parse_ticker(b, 0).unwrap();
+        let f = parse_ticker_view(b, 0).unwrap();
         assert_eq!(f.current_funding_1e9, -375_000);
         assert_eq!(f.has_funding_8h, 0, "no funding_8h in this frame");
         assert_eq!(f.funding_8h_1e9, 0);
         assert_eq!(f.has_funding, 1);
-        assert!(parse_ticker(b"{}", 0).is_none());
+        assert!(parse_ticker_view(b"{}", 0).is_none());
     }
 
     #[test]
@@ -1679,13 +2012,13 @@ mod tests {
         // pre-WS3 parser rejected every one of them. They must parse
         // with has_funding = 0 / rate 0.
         let dated = br#"{"timestamp":2000,"mark_price":65100.5,"index_price":65099.0,"open_interest":1234.0,"min_price":64000.0,"max_price":66000.0,"instrument_name":"BTC-26DEC26"}"#;
-        let f = parse_ticker(dated, 7).unwrap();
+        let f = parse_ticker_view(dated, 7).unwrap();
         assert_eq!(f.has_funding, 0, "no current_funding on a dated future");
         assert_eq!(f.current_funding_1e9, 0);
         assert_eq!(f.mark_px_1e6, 65_100_500_000);
         // The other required fields still gate the parse.
         let broken = br#"{"timestamp":2000,"mark_price":65100.5}"#;
-        assert!(parse_ticker(broken, 7).is_none());
+        assert!(parse_ticker_view(broken, 7).is_none());
     }
 
     // ---- parse_trade ---------------------------------------------
@@ -1694,7 +2027,7 @@ mod tests {
     fn parse_trade_extracts_fields() {
         // Row slice as the run loop cuts it (from "trade_seq" on).
         let row = br#""trade_seq":30289442,"trade_id":"48079269","timestamp":1590484512188,"tick_direction":2,"price":8950.0,"mark_price":8948.9,"instrument_name":"BTC-PERPETUAL","index_price":8955.88,"direction":"sell","amount":10.0}"#;
-        let t = parse_trade(row, 3).unwrap();
+        let t = parse_trade_view(row, 3).unwrap();
         assert_eq!(t.sym, 3);
         assert_eq!(t.trade_seq, 30_289_442);
         assert_eq!(t.trade_id, 48_079_269);
@@ -1707,18 +2040,18 @@ mod tests {
     #[test]
     fn parse_trade_buy_side_missing_direction_and_nonnumeric_id() {
         let buy = br#""trade_seq":1,"trade_id":"9","timestamp":1000,"price":1.0,"direction":"buy","amount":2.0}"#;
-        assert_eq!(parse_trade(buy, 0).unwrap().side, 0);
+        assert_eq!(parse_trade_view(buy, 0).unwrap().side, 0);
         let no_dir = br#""trade_seq":1,"trade_id":"9","timestamp":1000,"price":1.0,"amount":2.0}"#;
-        assert!(parse_trade(no_dir, 0).is_none());
+        assert!(parse_trade_view(no_dir, 0).is_none());
         let odd_id = br#""trade_seq":2,"trade_id":"ETH-88","timestamp":1000,"price":1.0,"direction":"buy","amount":2.0}"#;
-        assert_eq!(parse_trade(odd_id, 0).unwrap().trade_id, 0);
+        assert_eq!(parse_trade_view(odd_id, 0).unwrap().trade_id, 0);
     }
 
     // ---- parse_book_header ---------------------------------------
 
     #[test]
     fn parse_book_header_snapshot_and_change() {
-        let s = parse_book_header(BOOK_SNAP, 2).unwrap();
+        let s = parse_book_header_view(BOOK_SNAP, 2).unwrap();
         assert_eq!(s.action, BOOK_ACTION_SNAPSHOT);
         assert_eq!(s.change_id, 297_217_105);
         assert_eq!(s.prev_change_id, -1);
@@ -1726,7 +2059,7 @@ mod tests {
         assert_eq!(s.n_asks, 1);
         assert_eq!(s.excess_bids, 0);
         assert_eq!(s.excess_asks, 0);
-        let c = parse_book_header(BOOK_CHANGE, 2).unwrap();
+        let c = parse_book_header_view(BOOK_CHANGE, 2).unwrap();
         assert_eq!(c.action, BOOK_ACTION_CHANGE);
         assert_eq!(c.change_id, 297_217_107);
         assert_eq!(c.prev_change_id, 297_217_105);
@@ -1747,7 +2080,7 @@ mod tests {
             i += 1;
         }
         b.extend_from_slice(br#"],"asks":[]}"#);
-        let f = parse_book_header(&b, 0).unwrap();
+        let f = parse_book_header_view(&b, 0).unwrap();
         assert_eq!(f.n_bids, DEPTH_CAP as u16);
         assert_eq!(f.excess_bids, 10);
         assert_eq!(f.n_asks, 0);
@@ -1757,12 +2090,12 @@ mod tests {
     #[test]
     fn parse_book_header_rejects_change_without_prev_and_missing_type() {
         let no_prev = br#"{"timestamp":1000,"change_id":5,"type":"change","bids":[],"asks":[]}"#;
-        assert!(parse_book_header(no_prev, 0).is_none());
+        assert!(parse_book_header_view(no_prev, 0).is_none());
         let no_type = br#"{"timestamp":1000,"change_id":5,"bids":[],"asks":[]}"#;
-        assert!(parse_book_header(no_type, 0).is_none());
+        assert!(parse_book_header_view(no_type, 0).is_none());
         // Truncated side array never panics, just fails.
         let trunc = br#"{"timestamp":1000,"change_id":5,"type":"snapshot","bids":[["new",1.0"#;
-        assert!(parse_book_header(trunc, 0).is_none());
+        assert!(parse_book_header_view(trunc, 0).is_none());
     }
 
     // ---- symbol table --------------------------------------------
@@ -1941,21 +2274,25 @@ mod tests {
     fn parse_vol_index_extracts_and_rejects() {
         // WS6: the DVOL push shape.
         let b = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"deribit_volatility_index.btc_usd","data":{"timestamp":1619777946007,"volatility":84.71,"index_name":"btc_usd"}}}"#;
-        let f = parse_vol_index(b).expect("parses");
+        let f = parse_vol_index_view(b).expect("parses");
         assert_eq!(f.ts_ns, 1_619_777_946_007 * 1_000_000);
         assert_eq!(f.vol_1e9, 84_710_000_000, "points ×1e9");
-        assert_eq!(&f.index_name[..f.index_name_len as usize], b"btc_usd");
+        assert_eq!(
+            f.index_name(b),
+            Some(&b"btc_usd"[..]),
+            "a span of the payload"
+        );
         assert_eq!(
             classify(b),
             DeribitMsgKind::VolIndexPush,
             "classify routes DVOL past the instrument channels"
         );
-        assert!(parse_vol_index(b"{}").is_none());
+        assert!(parse_vol_index_view(b"{}").is_none());
         let no_name = br#"{"timestamp":1,"volatility":50.0}"#;
-        assert!(parse_vol_index(no_name).is_none());
+        assert!(parse_vol_index_view(no_name).is_none());
         let long_name = br#"{"timestamp":1,"volatility":50.0,"index_name":"aaaaaaaaaaaaaaaaa"}"#;
         assert!(
-            parse_vol_index(long_name).is_none(),
+            parse_vol_index_view(long_name).is_none(),
             "17-byte name rejected"
         );
     }
@@ -1965,7 +2302,7 @@ mod tests {
         // Live wire shape (percent mark_iv, coin mark px, nested
         // greeks, sci-notation gamma).
         let b = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.BTC-27MAR26-100000-C.100ms","data":{"timestamp":1774000000123,"instrument_name":"BTC-27MAR26-100000-C","state":"open","mark_price":0.0523,"mark_iv":65.43,"bid_iv":64.0,"ask_iv":66.8,"greeks":{"delta":0.512,"gamma":1.234e-5,"vega":152.3,"theta":-85.3,"rho":12.1},"open_interest":1234.5,"index_price":77216.94,"underlying_price":77300.12,"underlying_index":"BTC-27MAR26","best_bid_price":0.052,"best_ask_price":0.0526}}}"#;
-        let f = parse_option_ticker(b).expect("parses");
+        let f = parse_option_ticker_view(b).expect("parses");
         assert_eq!(f.mark_px_1e9, 52_300_000); // 0.0523 × 1e9
         assert_eq!(f.mark_iv_1e9, 654_300_000); // 65.43% → 0.6543 × 1e9
         assert_eq!(f.underlying_px_1e9, 77_300_120_000_000);
@@ -1977,10 +2314,10 @@ mod tests {
         // Missing any required field rejects (futures tickers carry
         // no greeks/mark_iv — they can never alias into this parser).
         let fut = br#"{"timestamp":2000,"mark_price":1.0,"index_price":1.0,"current_funding":0.0,"open_interest":5,"min_price":0.9,"max_price":1.1}"#;
-        assert!(parse_option_ticker(fut).is_none());
+        assert!(parse_option_ticker_view(fut).is_none());
         let no_greeks =
             br#"{"mark_price":0.05,"mark_iv":65.0,"underlying_price":77000.0,"open_interest":1.0}"#;
-        assert!(parse_option_ticker(no_greeks).is_none());
+        assert!(parse_option_ticker_view(no_greeks).is_none());
     }
 
     mod opt_ticker_props {
@@ -1994,7 +2331,7 @@ mod tests {
             fn parse_option_ticker_never_panics(
                 input in proptest::collection::vec(any::<u8>(), 0..2048),
             ) {
-                let _ = parse_option_ticker(&input);
+                let _ = parse_option_ticker_view(&input);
             }
         }
     }
@@ -2129,27 +2466,51 @@ mod tests {
     }
 
     #[test]
-    fn write_book_op_heartbeat_and_test_exact_bytes() {
-        let mut dst = [0u8; 512];
-        let n = write_book_op(&mut dst, 9, b"public/unsubscribe", b"BTC-PERPETUAL").unwrap();
+    fn book_op_heartbeat_and_test_parts_spell_the_exact_bytes() {
+        let mut digits = [0u8; 20];
+        let mut parts: [&[u8]; 5] = [b""; 5];
+        book_op_parts(
+            DeribitBookOp::Unsubscribe,
+            9,
+            b"BTC-PERPETUAL",
+            &mut digits,
+            &mut parts,
+        );
         assert_eq!(
-            &dst[..n],
+            parts.concat(),
             br#"{"jsonrpc":"2.0","id":9,"method":"public/unsubscribe","params":{"channels":["book.BTC-PERPETUAL.100ms"]}}"#
-                as &[u8]
         );
-        let n = write_set_heartbeat(&mut dst, 1, HEARTBEAT_INTERVAL_SECS).unwrap();
+        let mut digits = [0u8; 20];
+        let mut parts: [&[u8]; 5] = [b""; 5];
+        book_op_parts(
+            DeribitBookOp::Subscribe,
+            10,
+            b"ETH-PERPETUAL",
+            &mut digits,
+            &mut parts,
+        );
         assert_eq!(
-            &dst[..n],
+            parts.concat(),
+            br#"{"jsonrpc":"2.0","id":10,"method":"public/subscribe","params":{"channels":["book.ETH-PERPETUAL.100ms"]}}"#
+        );
+        let (mut id_digits, mut secs_digits) = ([0u8; 20], [0u8; 20]);
+        let mut parts: [&[u8]; 5] = [b""; 5];
+        set_heartbeat_parts(
+            1,
+            HEARTBEAT_INTERVAL_SECS,
+            &mut id_digits,
+            &mut secs_digits,
+            &mut parts,
+        );
+        assert_eq!(
+            parts.concat(),
             br#"{"jsonrpc":"2.0","id":1,"method":"public/set_heartbeat","params":{"interval":15}}"#
-                as &[u8]
         );
-        let n = write_test(&mut dst, 12345).unwrap();
+        let mut digits = [0u8; 20];
         assert_eq!(
-            &dst[..n],
-            br#"{"jsonrpc":"2.0","id":12345,"method":"public/test","params":{}}"# as &[u8]
+            test_request_parts(12345, &mut digits).concat(),
+            br#"{"jsonrpc":"2.0","id":12345,"method":"public/test","params":{}}"#
         );
-        let mut tiny = [0u8; 8];
-        assert!(write_test(&mut tiny, 1).is_none());
     }
 
     // ---- sub ids --------------------------------------------------
@@ -2173,6 +2534,7 @@ mod tests {
 mod proptests {
     use super::*;
     use proptest::prelude::*;
+    use super::views::*;
 
     proptest! {
         // WS6: the DVOL scanner tolerates arbitrary bytes and
@@ -2181,7 +2543,7 @@ mod proptests {
         fn vol_index_never_panics_on_arbitrary_bytes(
             buf in proptest::collection::vec(any::<u8>(), 0..=300)
         ) {
-            let _ = parse_vol_index(&buf);
+            let _ = parse_vol_index_view(&buf);
         }
 
         #[test]
@@ -2196,13 +2558,13 @@ mod proptests {
                 &mut buf,
                 r#"{{"timestamp":{ts},"volatility":{points}.{frac:02},"index_name":"btc_usd"}}"#,
             ).unwrap();
-            let f = parse_vol_index(buf.as_bytes()).unwrap();
+            let f = parse_vol_index_view(buf.as_bytes()).unwrap();
             prop_assert_eq!(f.ts_ns, ts * 1_000_000);
             prop_assert_eq!(
                 f.vol_1e9,
                 (points as i64) * 1_000_000_000 + (frac as i64) * 10_000_000
             );
-            prop_assert_eq!(&f.index_name[..f.index_name_len as usize], b"btc_usd");
+            prop_assert_eq!(f.index_name(buf.as_bytes()), Some(&b"btc_usd"[..]));
         }
 
         #[test]
@@ -2219,7 +2581,7 @@ mod proptests {
                 &mut buf,
                 r#"{{"timestamp":{ts},"best_bid_price":0.{bp:06},"best_bid_amount":{bq},"best_ask_price":0.{ap:06},"best_ask_amount":{aq}}}"#,
             ).unwrap();
-            let f = parse_quote(buf.as_bytes(), 5).unwrap();
+            let f = parse_quote_view(buf.as_bytes(), 5).unwrap();
             prop_assert_eq!(f.sym, 5);
             prop_assert_eq!(f.bid_px_1e6, bp as i64);
             prop_assert_eq!(f.bid_qty_1e6, (bq as i64) * 1_000_000);
@@ -2264,10 +2626,10 @@ mod proptests {
             let _ = classify(&buf);
             let _ = extract_instrument(&buf, DeribitChannel::Quote);
             let _ = extract_instrument(&buf, DeribitChannel::Book);
-            let _ = parse_quote(&buf, 0);
-            let _ = parse_ticker(&buf, 0);
-            let _ = parse_trade(&buf, 0);
-            let _ = parse_book_header(&buf, 0);
+            let _ = parse_quote_view(&buf, 0);
+            let _ = parse_ticker_view(&buf, 0);
+            let _ = parse_trade_view(&buf, 0);
+            let _ = parse_book_header_view(&buf, 0);
         }
     }
 }

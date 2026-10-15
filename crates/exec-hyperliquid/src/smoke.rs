@@ -64,7 +64,7 @@ use std::sync::Arc;
 
 use crate::action::{encode_cancel, CancelWire, MAX_ACTION};
 use crate::config::HlConfig;
-use crate::http::{HlHttp, MAX_REQ_BODY};
+use crate::http::HlHttp;
 use crate::nonce::now_ms;
 use crate::request::{cancel_json, envelope};
 use crate::response::{scan, HlResponse};
@@ -262,13 +262,25 @@ impl SmokeReport {
         s.push_str("\",\"agent\":\"");
         json_escape(&mut s, &self.agent);
         s.push_str("\",\"signature_verified\":");
-        s.push_str(if self.signature_verified { "true" } else { "false" });
+        s.push_str(if self.signature_verified {
+            "true"
+        } else {
+            "false"
+        });
         s.push_str(",\"agent_registered\":");
-        s.push_str(if self.agent_registered { "true" } else { "false" });
+        s.push_str(if self.agent_registered {
+            "true"
+        } else {
+            "false"
+        });
         s.push_str(",\"selftest_rows\":");
         push_u32(&mut s, self.selftest_rows);
         s.push_str(",\"corruption_rejected\":");
-        s.push_str(if self.corruption_rejected { "true" } else { "false" });
+        s.push_str(if self.corruption_rejected {
+            "true"
+        } else {
+            "false"
+        });
         s.push_str(",\"corruption_message\":\"");
         json_escape(&mut s, &self.corruption_message);
         s.push_str("\",\"passed\":");
@@ -326,7 +338,11 @@ const NONEXISTENT_OID: u64 = 1;
 /// `asset` is the venue asset id the probe cancel names; it need not
 /// exist for the probe to be meaningful, because the cancel is
 /// expected to fail on the ORDER, not on the signature.
-pub fn run(cfg: &HlConfig, tls: Arc<rustls::ClientConfig>, asset: u32) -> Result<SmokeReport, SmokeErr> {
+pub fn run(
+    cfg: &HlConfig,
+    tls: Arc<rustls::ClientConfig>,
+    asset: u32,
+) -> Result<SmokeReport, SmokeErr> {
     // THE GUARD. Nothing below can run against mainnet.
     if !cfg.is_testnet() {
         return Err(SmokeErr::NotTestnet(cfg.host.clone()));
@@ -338,7 +354,7 @@ pub fn run(cfg: &HlConfig, tls: Arc<rustls::ClientConfig>, asset: u32) -> Result
     let st = crate::selftest::run().map_err(SmokeErr::SelfTest)?;
 
     let sk = cfg.secret_key().map_err(SmokeErr::Config)?;
-    let mut http = HlHttp::new(&cfg.host, 443, tls).map_err(SmokeErr::Http)?;
+    let mut http = HlHttp::new(&cfg.host, cfg.port(), tls).map_err(SmokeErr::Http)?;
 
     let cancels = [CancelWire {
         asset,
@@ -357,10 +373,9 @@ pub fn run(cfg: &HlConfig, tls: Arc<rustls::ClientConfig>, asset: u32) -> Result
     let nonce_a = nonces.next(now_ms());
     let sig = sign_action(&sk, &mp[..mp_n], nonce_a, Vault::None, None, cfg.network)
         .map_err(|_| SmokeErr::Sign)?;
-    let mut body = [0u8; MAX_REQ_BODY];
-    let n = envelope(&mut body, &aj[..aj_n], nonce_a, &sig, None, None)
+    let n = envelope(http.body_mut(), &aj[..aj_n], nonce_a, &sig, None, None)
         .map_err(|_| SmokeErr::Encode)?;
-    let (_status, range) = http.post(&body[..n]).map_err(|e| SmokeErr::Http(e.err))?;
+    let (_status, range) = http.post(n).map_err(|e| SmokeErr::Http(e.err))?;
     let resp = http.resp();
     let slice = &resp[range];
     let agent_hex = crate::config::hex20(&cfg.agent_addr);
@@ -395,9 +410,9 @@ pub fn run(cfg: &HlConfig, tls: Arc<rustls::ClientConfig>, asset: u32) -> Result
     let mut bad = sign_action(&sk, &mp[..mp_n], nonce_b, Vault::None, None, cfg.network)
         .map_err(|_| SmokeErr::Sign)?;
     bad[40] ^= 0x01;
-    let n = envelope(&mut body, &aj[..aj_n], nonce_b, &bad, None, None)
+    let n = envelope(http.body_mut(), &aj[..aj_n], nonce_b, &bad, None, None)
         .map_err(|_| SmokeErr::Encode)?;
-    let (_status, range) = http.post(&body[..n]).map_err(|e| SmokeErr::Http(e.err))?;
+    let (_status, range) = http.post(n).map_err(|e| SmokeErr::Http(e.err))?;
     let resp = http.resp();
     let slice = &resp[range];
     let (corruption_rejected, corruption_message) =
@@ -570,14 +585,16 @@ mod tests {
         let tls = core_net::TlsTransport::default_client_config();
 
         // Mainnet host + mainnet source: a valid config, refused here.
-        let m = HlConfig::new(Scope::Live, HOST_MAINNET, 'a', KEY, ADDR).expect("valid mainnet cfg");
+        let m =
+            HlConfig::new(Scope::Live, HOST_MAINNET, 'a', KEY, ADDR).expect("valid mainnet cfg");
         let e = run(&m, tls.clone(), 0).expect_err("mainnet must be refused");
         assert!(matches!(e, SmokeErr::NotTestnet(_)), "{e:?}");
         assert!(e.to_string().contains("TESTNET ONLY"), "{e}");
 
         // A local double is not the testnet venue either — the smoke
         // asserts against the real one or not at all.
-        let l = HlConfig::new(Scope::Testnet, "localhost", 'b', KEY, ADDR).expect("valid local cfg");
+        let l =
+            HlConfig::new(Scope::Testnet, "localhost", 'b', KEY, ADDR).expect("valid local cfg");
         assert!(matches!(
             run(&l, tls, 0).expect_err("a double is not testnet"),
             SmokeErr::NotTestnet(_)
@@ -628,7 +645,9 @@ mod tests {
     #[test]
     fn the_failure_messages_say_what_to_do() {
         let a = SmokeErr::SignatureNotVerified("Unable to recover signer.".to_owned());
-        assert!(a.to_string().contains("must not be allowed to sign a mainnet order"));
+        assert!(a
+            .to_string()
+            .contains("must not be allowed to sign a mainnet order"));
         let b = SmokeErr::CorruptSignatureAccepted;
         assert!(b.to_string().contains("meaningless"));
     }

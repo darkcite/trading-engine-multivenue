@@ -180,6 +180,27 @@ def test_torn_final_record_tolerated(tmp_path: pathlib.Path) -> None:
             r.fill(2)
 
 
+def test_fill_flags_are_byte_15(tmp_path: pathlib.Path) -> None:
+    """BX13: byte 15 is the fill's flags — a settlement, an adoption, or
+    neither (a trade); every older capture's zeroed byte reads a trade."""
+    buf = _header(2, claude_worker.pmlr.SLOT_KIND_FILL)
+    for flags in (0, claude_worker.pmlr.FILL_FLAG_SETTLEMENT, claude_worker.pmlr.FILL_FLAG_ADOPTED):
+        slot = bytearray(claude_worker.pmlr.SLOT_SIZE)
+        claude_worker.pmlr._FILL.pack_into(slot, 0, 7, PM7, 1, 3, 0, flags, 480_000, 2_000_000, 9)
+        buf.extend(slot)
+    p = tmp_path / "flags.pmlr"
+    p.write_bytes(bytes(buf))
+    assert claude_worker.pmlr._FILL.size == 40
+    with claude_worker.pmlr.Reader(p) as r:
+        f = list(r.fills())
+    assert [x.flags for x in f] == [0, 1, 2]
+    assert [x.is_trade for x in f] == [True, False, False]
+    head = (f[0].strategy_id, f[0].origin, f[0].px, f[0].qty, f[0].order_id)
+    assert head == (3, 0, 480_000, 2_000_000, 9)
+    third = claude_worker.pmlr.HEADER_SIZE + 2 * claude_worker.pmlr.SLOT_SIZE
+    assert buf[third + 15] == claude_worker.pmlr.FILL_FLAG_ADOPTED
+
+
 # ---- container validation --------------------------------------------------
 
 

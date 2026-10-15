@@ -71,6 +71,19 @@ pub const BN_OPT_ORDINAL_BASE: u32 = 1024;
 /// ≤ 500, usdm ends at 1013, eapi options end well under 2048.
 pub const BN_DATED_ORDINAL_BASE: u32 = 2048;
 
+/// BX2 (O-BX3): ordinal base for `[binance] coinm` COIN-M perpetual
+/// ids: `make_symbol_id(Binance, BN_COINM_ORDINAL_BASE + j + 1)`.
+/// Disjoint by construction: the dated block ends at 2048 + 500 + 1 =
+/// 2549 < 3072, and [`VENUE_LIST_MAX`] = 500 keeps this block under
+/// [`BN_COINM_DATED_ORDINAL_BASE`].
+pub const BN_COINM_ORDINAL_BASE: u32 = 3072;
+
+/// BX2 (O-BX3): ordinal base for `[binance] coinm_dated` COIN-M
+/// delivery-future ids: `make_symbol_id(Binance,
+/// BN_COINM_DATED_ORDINAL_BASE + j + 1)`; ends at 3584 + 500 + 1 = 4085,
+/// under the equity block the plan reserves at 4096 (§3.6).
+pub const BN_COINM_DATED_ORDINAL_BASE: u32 = 3584;
+
 /// WS6: ordinal base for `[deribit] combos` option-combo ids:
 /// `make_symbol_id(Deribit, DERIBIT_COMBO_ORDINAL_BASE + j + 1)`.
 /// Disjoint from statics (≤ 500) and discovered options
@@ -88,6 +101,143 @@ pub const DERIBIT_COMBOS_MAX: usize = 64;
 /// Binance spot/usdm split applied to the sixth venue (spot ordinals
 /// are file-order from 1).
 pub const BYBIT_LINEAR_ORDINAL_BASE: u32 = 512;
+
+/// MX2/MX5 (plan §4 D9): ordinal base for `[mexc] perp` ids:
+/// `make_symbol_id(Mexc, MEXC_PERP_ORDINAL_BASE + j + 1)`; spot ids
+/// are file-order from 1. [`VENUE_LIST_MAX`] = 500 < 512 keeps the two
+/// blocks disjoint by construction (the Binance spot/usdm split,
+/// reused verbatim). Append, never reorder: `SymbolId`s are file-order
+/// ordinals, and a reordered `[mexc]` list silently re-keys history.
+pub const MEXC_PERP_ORDINAL_BASE: u32 = 512;
+
+/// MX2/MX5: cap on each `[mexc]` list (spot, perp). The venue forces
+/// the connection count, not the engine: spot rides 15 symbols per
+/// socket at the measured 30-subscription cap (2 channels/symbol),
+/// futures ~13 per socket (plan §4 D1) — 128 per list is ≤ 9 spot +
+/// ≤ 10 futures sockets.
+pub const MEXC_LIST_MAX: usize = 128;
+
+/// HC4: cap on the Hypercall universe, `underlyings × expiries ×
+/// strikes × 2`. MIRRORS `ingress_hypercall::HC_MAX_INSTRUMENTS` (the
+/// symbol table the ONE indicative subscribe frame names — the venue's
+/// D3 law); this crate cannot depend on an ingress crate, so the number
+/// lives twice and the boot's own table insert refuses anything this
+/// check let through.
+pub const HC_INSTRUMENTS_MAX: u32 = 1024;
+
+/// HC4: longest Hypercall underlying name (`SP500`, `SNDK`, …). MIRRORS
+/// `ingress_hypercall::HC_UNDERLYING_MAX`.
+pub const HC_UNDERLYING_LEN_MAX: usize = 12;
+
+/// HC4: default `[hypercall] summary_every_s` — each underlying's REST
+/// `/options-summary` refresh period. MIRRORS
+/// `ingress_hypercall::rest::DEFAULT_SUMMARY_EVERY_S`.
+pub const HC_SUMMARY_EVERY_S_DEFAULT: u32 = 300;
+
+/// HC4: bounds on `summary_every_s`. The bodies are large (SNDK's was
+/// 4.8 MB on 2026-09-25): below a minute the poller would spend its
+/// life downloading; above an hour the mark row is too stale to judge
+/// the WS quotes against.
+pub const HC_SUMMARY_EVERY_S_MIN: u32 = 60;
+/// Upper bound on `summary_every_s`.
+pub const HC_SUMMARY_EVERY_S_MAX: u32 = 3600;
+
+/// HYPARB H3b: cap on `[hyperevm] pools` — the HyperEVM ingress's pool
+/// table (`ingress_hyperevm::HYPEREVM_MAX_POOLS`) and the AMM book
+/// (`core_fill::AMM_MAX_POOLS`); the cli const-asserts all three agree.
+pub const HYPEREVM_POOLS_MAX: usize = 128;
+
+/// HYPARB H3b: largest token `decimals()` a pool entry may carry —
+/// `core_amm::payload::MAX_TOKEN_DECIMALS` (10^36 fits `u128`).
+pub const HYPEREVM_DECIMALS_MAX: u8 = 36;
+
+/// HYPARB H3b: a HyperEVM pool's contract family — decides its
+/// discovery reads, its log decoders and its swap loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HyperEvmFamily {
+    /// Uniswap V3 ABI (`v3`) — Hyperswap V3 included: the same reads,
+    /// events and word counts; only its swap callback is renamed (the
+    /// executor answers it, H9d).
+    V3 = 0,
+    /// Aerodrome Slipstream fork (`slipstream`).
+    Slipstream = 1,
+    /// Algebra Integral v1.0 / v1.2 (`algebra`).
+    Algebra = 2,
+}
+
+/// HYPARB H3b: one `[hyperevm] pools` entry,
+/// `"0x<40 lowercase hex>:<v3|slipstream|algebra>:<dec0>:<dec1>"`.
+///
+/// The decimals are the operator's claim; the ingress checks them
+/// against `decimals()` on chain before a pool's first snapshot, so a
+/// typo is a refused pool, never a price off by 10^12.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HyperEvmPool {
+    /// Pool contract address.
+    pub address: [u8; 20],
+    /// Contract family.
+    pub family: HyperEvmFamily,
+    /// token0 decimals.
+    pub dec0: u8,
+    /// token1 decimals.
+    pub dec1: u8,
+}
+
+/// Parse one `[hyperevm] pools` entry (grammar on [`HyperEvmPool`]).
+/// `None` for anything else — including UPPERCASE hex: the address is
+/// the pool's identity (and its descriptor), so it has one spelling.
+#[must_use]
+pub fn parse_hyperevm_pool(s: &str) -> Option<HyperEvmPool> {
+    let mut parts = s.split(':');
+    let addr = parts.next()?;
+    let fam = parts.next()?;
+    let d0 = parts.next()?;
+    let d1 = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let hex = addr.strip_prefix("0x")?;
+    let hb = hex.as_bytes();
+    if hb.len() != 40 {
+        return None;
+    }
+    let mut address = [0u8; 20];
+    let mut i = 0usize;
+    while i < 20 {
+        let hi = lower_hex_nibble(hb[2 * i])?;
+        let lo = lower_hex_nibble(hb[2 * i + 1])?;
+        address[i] = (hi << 4) | lo;
+        i += 1;
+    }
+    let family = match fam {
+        "v3" => HyperEvmFamily::V3,
+        "slipstream" => HyperEvmFamily::Slipstream,
+        "algebra" => HyperEvmFamily::Algebra,
+        _ => return None,
+    };
+    let dec = |t: &str| -> Option<u8> {
+        if t.is_empty() || t.len() > 2 || !t.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let v: u8 = t.parse().ok()?;
+        (v <= HYPEREVM_DECIMALS_MAX).then_some(v)
+    };
+    Some(HyperEvmPool {
+        address,
+        family,
+        dec0: dec(d0)?,
+        dec1: dec(d1)?,
+    })
+}
+
+const fn lower_hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
+}
 
 /// Default E — nearest expiries per options underlying (mvp-plan §8
 /// proposal, adopted in the M2 design entry).
@@ -264,6 +414,14 @@ pub struct Universe {
     /// discovery audit can enforce dated-ness and ordinals get their
     /// own block ([`BN_DATED_ORDINAL_BASE`]).
     pub binance_usdm_dated: Vec<String>,
+    /// BX2: `[binance] coinm` — COIN-M perpetual stream symbols
+    /// (`btcusd_perp`: `<base>usd_perp`) in file order, own ordinal
+    /// block ([`BN_COINM_ORDINAL_BASE`]).
+    pub binance_coinm: Vec<String>,
+    /// BX2: `[binance] coinm_dated` — COIN-M delivery stream symbols
+    /// (`btcusd_261225`: `<base>usd_<yymmdd>`) in file order, own
+    /// ordinal block ([`BN_COINM_DATED_ORDINAL_BASE`]).
+    pub binance_coinm_dated: Vec<String>,
     /// `[binance] options_underlyings` / `options_expiries` /
     /// `options_strikes` — the M2.4 capped options-chain policy
     /// (underlyings are eapi names, e.g. `"BTCUSDT"`; see
@@ -311,6 +469,28 @@ pub struct Universe {
     /// WS9: `[bybit] linear` — UPPERCASE linear-perp symbols in file
     /// order (own ordinal block, [`BYBIT_LINEAR_ORDINAL_BASE`]).
     pub bybit_linear: Vec<String>,
+    /// MX2/MX5: `[mexc] spot` — UPPERCASE spot symbols (`BTCUSDT`,
+    /// tokenized xStocks such as `AAPLXUSDT` are ordinary rows) in file
+    /// order.
+    pub mexc_spot: Vec<String>,
+    /// MX2/MX5: `[mexc] perp` — `BASE_QUOTE` contract symbols
+    /// (`BTC_USDT`, TradFi `XAU_USDT` / `AAPLSTOCK_USDT` are ordinary
+    /// rows) in file order (own ordinal block,
+    /// [`MEXC_PERP_ORDINAL_BASE`]).
+    pub mexc_perp: Vec<String>,
+    /// HYPARB H3b: `[hyperevm] pools` — pool entries in file order
+    /// (grammar on [`HyperEvmPool`]); ordinal `i + 1` of venue byte 8.
+    pub hyperevm_pools: Vec<String>,
+    /// HC4: `[hypercall] underlyings` / `expiries` / `strikes` — the
+    /// O-HC2 capped chain per underlying, boot-DISCOVERED from `/markets`
+    /// (see [`OptionsPolicy`]; underlyings are Hypercall's names, e.g.
+    /// `"SP500"`, `"BTC"`). Each underlying also names its settlement
+    /// index, `hypercall-idx:<U>` at ordinal `i + 1`.
+    pub hypercall: OptionsPolicy,
+    /// HC4: `[hypercall] summary_every_s` — the REST poller's refresh
+    /// period per underlying ([`HC_SUMMARY_EVERY_S_DEFAULT`] when the
+    /// key is absent; 0 while the lane is off).
+    pub hypercall_summary_every_s: u32,
     /// `[pairs] map` — latency-arb pairs as
     /// `(pm market index, binance spot index)`, both 0-based file
     /// order. Empty = the default pair (0,0) is injected at
@@ -363,6 +543,12 @@ pub struct AllocatedUniverse {
     /// same `binance-usdm:` descriptor prefix (one fapi lane for
     /// every offline consumer), own ordinal block.
     pub bn_dated: Vec<Instrument>,
+    /// BX2: Binance COIN-M perpetuals (`binance-coinm:` descriptors,
+    /// own ordinal block).
+    pub bn_coinm: Vec<Instrument>,
+    /// BX2: Binance COIN-M delivery futures — the same `binance-coinm:`
+    /// namespace (the class law reads the suffix), own ordinal block.
+    pub bn_coinm_dated: Vec<Instrument>,
     /// OKX instruments.
     pub okx: Vec<Instrument>,
     /// Deribit instruments.
@@ -375,6 +561,22 @@ pub struct AllocatedUniverse {
     pub bybit_spot: Vec<Instrument>,
     /// WS9: Bybit linear-perp instruments (`bybit-linear:<sym>`).
     pub bybit_linear: Vec<Instrument>,
+    /// MX2/MX5: MEXC spot instruments (`mexc:<SYM>` descriptors).
+    pub mexc_spot: Vec<Instrument>,
+    /// MX2/MX5: MEXC perp instruments (`mexc-perp:<SYM>` — MEXC lists
+    /// no dated futures, so this prefix is always `Perp`).
+    pub mexc_perp: Vec<Instrument>,
+    /// HYPARB H3b: HyperEVM pools (`hyperevm:0x<address>` descriptors,
+    /// `Spot` class), file order.
+    pub hyperevm: Vec<Instrument>,
+    /// HYPARB H3b: the parsed pool entries, index-parallel to
+    /// [`Self::hyperevm`].
+    pub hyperevm_pools: Vec<HyperEvmPool>,
+    /// HC4: the Hypercall settlement indices (`hypercall-idx:<U>`,
+    /// `Spot` class, capture-only), ordinal `i + 1` in `underlyings`
+    /// order. The options are boot-discovered and allocated by the cli
+    /// from [`OPT_ORDINAL_BASE`].
+    pub hypercall_idx: Vec<Instrument>,
     /// Latency-arb pairs as `(pm YES-token sym, bn spot sym)`.
     pub pairs: Vec<(SymbolId, SymbolId)>,
 }
@@ -411,6 +613,9 @@ enum Section {
     Deribit,
     Hyperliquid,
     Bybit,
+    Mexc,
+    HyperEvm,
+    Hypercall,
     Pairs,
 }
 
@@ -421,6 +626,8 @@ enum Slot {
     BnSpot,
     BnUsdm,
     BnUsdmDated,
+    BnCoinm,
+    BnCoinmDated,
     BnOptUnderlyings,
     BnOptExpiries,
     BnOptStrikes,
@@ -439,6 +646,13 @@ enum Slot {
     HlRolling,
     BybitSpot,
     BybitLinear,
+    MexcSpot,
+    MexcPerp,
+    HyperEvmPools,
+    HcUnderlyings,
+    HcExpiries,
+    HcStrikes,
+    HcSummaryEveryS,
     PairsMap,
 }
 
@@ -450,13 +664,27 @@ enum ElemKind {
     /// WS5: dated-future stream symbols (`btcusdt_260327`) — the
     /// spot/usdm alphabet plus the delivery-name underscore.
     BnDatedSymbol,
+    /// BX2: COIN-M perpetual stream symbols (`btcusd_perp`).
+    BnCoinmSymbol,
+    /// BX2: COIN-M delivery stream symbols (`btcusd_261225`).
+    BnCoinmDatedSymbol,
     /// WS9: Bybit venue symbols (`BTCUSDT` — uppercase [A-Z0-9]).
     BybitSymbol,
+    /// MX2/MX5: MEXC spot symbols (`BTCUSDT` — uppercase [A-Z0-9]).
+    MexcSpotSymbol,
+    /// MX2/MX5: MEXC contract symbols (`BTC_USDT` — uppercase
+    /// [A-Z0-9_], at least one `_`).
+    MexcPerpSymbol,
+    /// HYPARB H3b: `"0x<addr>:<family>:<dec0>:<dec1>"`.
+    HyperEvmPool,
     Instrument,
     HlCoin,
     /// BIN15 O2: a rolling-family key, `<out|native>:<COIN>:<15m|1d>`.
     HlRolling,
     OptUnderlying,
+    /// HC4: a Hypercall underlying (`SP500`, `BTC` — UPPERCASE
+    /// `[A-Z0-9]`, 1..=[`HC_UNDERLYING_LEN_MAX`]).
+    HcUnderlying,
     PairRef,
 }
 
@@ -477,6 +705,8 @@ struct Builder {
     bn_spot: Option<Vec<String>>,
     bn_usdm: Option<Vec<String>>,
     bn_usdm_dated: Option<Vec<String>>,
+    bn_coinm: Option<Vec<String>>,
+    bn_coinm_dated: Option<Vec<String>>,
     bn_opt_underlyings: Option<Vec<String>>,
     bn_opt_expiries: Option<u32>,
     bn_opt_strikes: Option<u32>,
@@ -495,6 +725,13 @@ struct Builder {
     hl_rolling: Option<Vec<String>>,
     bybit_spot: Option<Vec<String>>,
     bybit_linear: Option<Vec<String>>,
+    mexc_spot: Option<Vec<String>>,
+    mexc_perp: Option<Vec<String>>,
+    hyperevm_pools: Option<Vec<String>>,
+    hc_underlyings: Option<Vec<String>>,
+    hc_expiries: Option<u32>,
+    hc_strikes: Option<u32>,
+    hc_summary_every_s: Option<u32>,
     pairs_map: Option<Vec<String>>,
 }
 
@@ -536,6 +773,9 @@ pub fn parse(src: &str) -> Result<Universe, UniverseError> {
                 "deribit" => Section::Deribit,
                 "hyperliquid" => Section::Hyperliquid,
                 "bybit" => Section::Bybit,
+                "mexc" => Section::Mexc,
+                "hyperevm" => Section::HyperEvm,
+                "hypercall" => Section::Hypercall,
                 "pairs" => Section::Pairs,
                 other => {
                     return Err(err(line_no, format!("unknown section `[{other}]`")));
@@ -578,7 +818,10 @@ pub fn parse(src: &str) -> Result<Universe, UniverseError> {
             | Slot::OkxOptExpiries
             | Slot::OkxOptStrikes
             | Slot::DeribitOptExpiries
-            | Slot::DeribitOptStrikes => {
+            | Slot::DeribitOptStrikes
+            | Slot::HcExpiries
+            | Slot::HcStrikes
+            | Slot::HcSummaryEveryS => {
                 let v = parse_uint(key, value, line_no)?;
                 store_int(&mut b, slot, v, line_no)?;
             }
@@ -637,6 +880,8 @@ fn slot_for(section: Section, key: &str) -> Option<Slot> {
         (Section::Binance, "spot") => Some(Slot::BnSpot),
         (Section::Binance, "usdm") => Some(Slot::BnUsdm),
         (Section::Binance, "usdm_dated") => Some(Slot::BnUsdmDated),
+        (Section::Binance, "coinm") => Some(Slot::BnCoinm),
+        (Section::Binance, "coinm_dated") => Some(Slot::BnCoinmDated),
         (Section::Binance, "options_underlyings") => Some(Slot::BnOptUnderlyings),
         (Section::Binance, "options_expiries") => Some(Slot::BnOptExpiries),
         (Section::Binance, "options_strikes") => Some(Slot::BnOptStrikes),
@@ -655,6 +900,13 @@ fn slot_for(section: Section, key: &str) -> Option<Slot> {
         (Section::Hyperliquid, "rolling") => Some(Slot::HlRolling),
         (Section::Bybit, "spot") => Some(Slot::BybitSpot),
         (Section::Bybit, "linear") => Some(Slot::BybitLinear),
+        (Section::Mexc, "spot") => Some(Slot::MexcSpot),
+        (Section::Mexc, "perp") => Some(Slot::MexcPerp),
+        (Section::HyperEvm, "pools") => Some(Slot::HyperEvmPools),
+        (Section::Hypercall, "underlyings") => Some(Slot::HcUnderlyings),
+        (Section::Hypercall, "expiries") => Some(Slot::HcExpiries),
+        (Section::Hypercall, "strikes") => Some(Slot::HcStrikes),
+        (Section::Hypercall, "summary_every_s") => Some(Slot::HcSummaryEveryS),
         (Section::Pairs, "map") => Some(Slot::PairsMap),
         _ => None,
     }
@@ -672,13 +924,19 @@ fn elem_kind(slot: Slot) -> ElemKind {
         Slot::PmMarkets => ElemKind::PmMarket,
         Slot::BnSpot | Slot::BnUsdm => ElemKind::BnSymbol,
         Slot::BnUsdmDated => ElemKind::BnDatedSymbol,
+        Slot::BnCoinm => ElemKind::BnCoinmSymbol,
+        Slot::BnCoinmDated => ElemKind::BnCoinmDatedSymbol,
         Slot::BybitSpot | Slot::BybitLinear => ElemKind::BybitSymbol,
+        Slot::MexcSpot => ElemKind::MexcSpotSymbol,
+        Slot::MexcPerp => ElemKind::MexcPerpSymbol,
+        Slot::HyperEvmPools => ElemKind::HyperEvmPool,
         Slot::OkxInstr | Slot::DeribitInstr | Slot::DeribitCombos => ElemKind::Instrument,
         Slot::HlCoins => ElemKind::HlCoin,
         Slot::HlRolling => ElemKind::HlRolling,
         Slot::BnOptUnderlyings | Slot::OkxOptUnderlyings | Slot::DeribitOptUnderlyings => {
             ElemKind::OptUnderlying
         }
+        Slot::HcUnderlyings => ElemKind::HcUnderlying,
         Slot::PairsMap => ElemKind::PairRef,
         Slot::OkxDepth
         | Slot::DeribitDepth
@@ -687,7 +945,10 @@ fn elem_kind(slot: Slot) -> ElemKind {
         | Slot::OkxOptExpiries
         | Slot::OkxOptStrikes
         | Slot::DeribitOptExpiries
-        | Slot::DeribitOptStrikes => {
+        | Slot::DeribitOptStrikes
+        | Slot::HcExpiries
+        | Slot::HcStrikes
+        | Slot::HcSummaryEveryS => {
             unreachable!("bool/int slots have no elements")
         }
     }
@@ -792,13 +1053,31 @@ fn validate_elem(kind: ElemKind, s: &str, line_no: usize) -> Result<(), Universe
         ElemKind::PmMarket => validate_pm_entry(s, line_no),
         ElemKind::BnSymbol => validate_bn_symbol(s, line_no),
         ElemKind::BnDatedSymbol => validate_bn_dated_symbol(s, line_no),
+        ElemKind::BnCoinmSymbol => validate_bn_coinm_symbol(s, false, line_no),
+        ElemKind::BnCoinmDatedSymbol => validate_bn_coinm_symbol(s, true, line_no),
         ElemKind::BybitSymbol => validate_bybit_symbol(s, line_no),
+        ElemKind::MexcSpotSymbol => validate_mexc_spot_symbol(s, line_no),
+        ElemKind::MexcPerpSymbol => validate_mexc_perp_symbol(s, line_no),
+        ElemKind::HyperEvmPool => {
+            if parse_hyperevm_pool(s).is_some() {
+                Ok(())
+            } else {
+                Err(err(
+                    line_no,
+                    format!(
+                        "bad HyperEVM pool `{s}` (want \"0x<40 lowercase hex>:\
+                         <v3|slipstream|algebra>:<dec0>:<dec1>\", decimals 0..={HYPEREVM_DECIMALS_MAX})"
+                    ),
+                ))
+            }
+        }
         ElemKind::Instrument => validate_name(s, INSTRUMENT_LEN_MAX, "instrument", line_no),
         ElemKind::HlCoin => validate_name(s, HL_COIN_LEN_MAX, "coin", line_no),
         ElemKind::HlRolling => validate_hl_rolling(s, line_no),
         ElemKind::OptUnderlying => {
             validate_name(s, OPT_UNDERLYING_LEN_MAX, "options underlying", line_no)
         }
+        ElemKind::HcUnderlying => validate_hc_underlying(s, line_no),
         ElemKind::PairRef => validate_pair_ref(s, line_no).map(|_| ()),
     }
 }
@@ -880,6 +1159,47 @@ fn validate_bybit_symbol(s: &str, line_no: usize) -> Result<(), UniverseError> {
     }
 }
 
+/// MX2/MX5: MEXC spot symbols are UPPERCASE `[A-Z0-9]`, no separator
+/// (`BTCUSDT`, xStocks `AAPLXUSDT`) — the venue's `exchangeInfo` and
+/// the PB channel suffix carry them verbatim.
+fn validate_mexc_spot_symbol(s: &str, line_no: usize) -> Result<(), UniverseError> {
+    let ok = !s.is_empty()
+        && s.len() <= BN_SYMBOL_LEN_MAX
+        && s.bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    if ok {
+        Ok(())
+    } else {
+        Err(err(
+            line_no,
+            format!("bad MEXC spot symbol `{s}` (want UPPERCASE [A-Z0-9], 1..={BN_SYMBOL_LEN_MAX})"),
+        ))
+    }
+}
+
+/// MX2/MX5: MEXC contract symbols are `BASE_QUOTE` — UPPERCASE
+/// `[A-Z0-9_]` with at least one `_` (`BTC_USDT`, `XAU_USDT`,
+/// `AAPLSTOCK_USDT`). The underscore is REQUIRED: a separator-less
+/// name here is almost certainly a misfiled `spot` entry.
+fn validate_mexc_perp_symbol(s: &str, line_no: usize) -> Result<(), UniverseError> {
+    let ok = !s.is_empty()
+        && s.len() <= BN_SYMBOL_LEN_MAX
+        && s.bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        && s.contains('_');
+    if ok {
+        Ok(())
+    } else {
+        Err(err(
+            line_no,
+            format!(
+                "bad MEXC perp symbol `{s}` (want UPPERCASE [A-Z0-9_] with a `_`, \
+                 1..={BN_SYMBOL_LEN_MAX})"
+            ),
+        ))
+    }
+}
+
 /// WS5: dated delivery names are `<base>_<yymmdd>` — the usdm
 /// alphabet plus exactly the underscore. The underscore is REQUIRED:
 /// a plain perp symbol here is almost certainly a misfiled `usdm`
@@ -900,6 +1220,44 @@ fn validate_bn_dated_symbol(s: &str, line_no: usize) -> Result<(), UniverseError
             format!(
                 "bad Binance dated symbol `{s}` (want `<base>_<yymmdd>` lowercase, 1..={BN_SYMBOL_LEN_MAX})"
             ),
+        ))
+    }
+}
+
+/// BX2: COIN-M stream symbols are `<coin>usd_perp` (perpetual) or
+/// `<coin>usd_<yymmdd>` (delivery) — lowercase `[a-z0-9]`, exactly one
+/// `_`. The suffix is REQUIRED to match the list: a `_perp` name in
+/// `coinm_dated` (or a dated one in `coinm`) is refused here, before
+/// the discovery audit would refuse it as the wrong class — and the
+/// `usd` quote keeps a USDⓈ-M name (`btcusdt_261225`) out of both.
+fn validate_bn_coinm_symbol(s: &str, dated: bool, line_no: usize) -> Result<(), UniverseError> {
+    let shape_ok = match s.split_once('_') {
+        Some((base, tail)) => {
+            let base_ok = base.len() > 3
+                && base.ends_with("usd")
+                && base
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+            let tail_ok = if dated {
+                tail.len() == 6 && tail.bytes().all(|b| b.is_ascii_digit())
+            } else {
+                tail == "perp"
+            };
+            base_ok && tail_ok
+        }
+        None => false,
+    };
+    if shape_ok && s.len() <= BN_SYMBOL_LEN_MAX {
+        Ok(())
+    } else {
+        let want = if dated {
+            "`<coin>usd_<yymmdd>`"
+        } else {
+            "`<coin>usd_perp`"
+        };
+        Err(err(
+            line_no,
+            format!("bad Binance COIN-M symbol `{s}` (want {want} lowercase, 1..={BN_SYMBOL_LEN_MAX})"),
         ))
     }
 }
@@ -945,6 +1303,23 @@ fn validate_hl_rolling(s: &str, line_no: usize) -> Result<(), UniverseError> {
         ));
     }
     Ok(())
+}
+
+/// HC4: Hypercall underlyings are its own UPPERCASE names (`SP500`,
+/// `SPCX`, `BTC`) — the `/markets` `underlying` field and the instrument
+/// names' first segment carry them verbatim, and `-` would split a name.
+fn validate_hc_underlying(s: &str, line_no: usize) -> Result<(), UniverseError> {
+    let ok = !s.is_empty()
+        && s.len() <= HC_UNDERLYING_LEN_MAX
+        && s.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    if ok {
+        Ok(())
+    } else {
+        Err(err(
+            line_no,
+            format!("bad Hypercall underlying `{s}` (want UPPERCASE [A-Z0-9], 1..={HC_UNDERLYING_LEN_MAX})"),
+        ))
+    }
 }
 
 fn validate_name(s: &str, max: usize, what: &str, line_no: usize) -> Result<(), UniverseError> {
@@ -1011,6 +1386,16 @@ fn store_array(
                 return Err(dup("usdm_dated"));
             }
         }
+        Slot::BnCoinm => {
+            if b.bn_coinm.replace(items).is_some() {
+                return Err(dup("coinm"));
+            }
+        }
+        Slot::BnCoinmDated => {
+            if b.bn_coinm_dated.replace(items).is_some() {
+                return Err(dup("coinm_dated"));
+            }
+        }
         Slot::OkxInstr => {
             if b.okx_instr.replace(items).is_some() {
                 return Err(dup("instruments"));
@@ -1061,6 +1446,26 @@ fn store_array(
                 return Err(dup("linear"));
             }
         }
+        Slot::MexcSpot => {
+            if b.mexc_spot.replace(items).is_some() {
+                return Err(dup("spot"));
+            }
+        }
+        Slot::MexcPerp => {
+            if b.mexc_perp.replace(items).is_some() {
+                return Err(dup("perp"));
+            }
+        }
+        Slot::HyperEvmPools => {
+            if b.hyperevm_pools.replace(items).is_some() {
+                return Err(dup("pools"));
+            }
+        }
+        Slot::HcUnderlyings => {
+            if b.hc_underlyings.replace(items).is_some() {
+                return Err(dup("underlyings"));
+            }
+        }
         Slot::PairsMap => {
             if b.pairs_map.replace(items).is_some() {
                 return Err(dup("map"));
@@ -1073,7 +1478,10 @@ fn store_array(
         | Slot::OkxOptExpiries
         | Slot::OkxOptStrikes
         | Slot::DeribitOptExpiries
-        | Slot::DeribitOptStrikes => {
+        | Slot::DeribitOptStrikes
+        | Slot::HcExpiries
+        | Slot::HcStrikes
+        | Slot::HcSummaryEveryS => {
             unreachable!("bool/int slots never store arrays")
         }
     }
@@ -1152,6 +1560,21 @@ fn store_int(b: &mut Builder, slot: Slot, v: u32, line_no: usize) -> Result<(), 
                 return Err(err(line_no, "duplicate key `options_strikes`"));
             }
         }
+        Slot::HcExpiries => {
+            if b.hc_expiries.replace(v).is_some() {
+                return Err(err(line_no, "duplicate key `expiries`"));
+            }
+        }
+        Slot::HcStrikes => {
+            if b.hc_strikes.replace(v).is_some() {
+                return Err(err(line_no, "duplicate key `strikes`"));
+            }
+        }
+        Slot::HcSummaryEveryS => {
+            if b.hc_summary_every_s.replace(v).is_some() {
+                return Err(err(line_no, "duplicate key `summary_every_s`"));
+            }
+        }
         _ => unreachable!("non-integer slots never store integers"),
     }
     Ok(())
@@ -1192,6 +1615,8 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     let binance_spot = b.bn_spot.unwrap_or_default();
     let binance_usdm = b.bn_usdm.unwrap_or_default();
     let binance_usdm_dated = b.bn_usdm_dated.unwrap_or_default();
+    let binance_coinm = b.bn_coinm.unwrap_or_default();
+    let binance_coinm_dated = b.bn_coinm_dated.unwrap_or_default();
     let okx_instruments = b.okx_instr.unwrap_or_default();
     let deribit_instruments = b.deribit_instr.unwrap_or_default();
     let deribit_combos = b.deribit_combos.unwrap_or_default();
@@ -1199,6 +1624,9 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     let hl_rolling = b.hl_rolling.unwrap_or_default();
     let bybit_spot = b.bybit_spot.unwrap_or_default();
     let bybit_linear = b.bybit_linear.unwrap_or_default();
+    let mexc_spot = b.mexc_spot.unwrap_or_default();
+    let mexc_perp = b.mexc_perp.unwrap_or_default();
+    let hyperevm_pools = b.hyperevm_pools.unwrap_or_default();
 
     // Caps.
     check_cap(pm_markets.len(), PM_MARKETS_MAX, "PM markets")?;
@@ -1208,6 +1636,12 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
         binance_usdm_dated.len(),
         VENUE_LIST_MAX,
         "Binance usdm_dated symbols",
+    )?;
+    check_cap(binance_coinm.len(), VENUE_LIST_MAX, "Binance coinm symbols")?;
+    check_cap(
+        binance_coinm_dated.len(),
+        VENUE_LIST_MAX,
+        "Binance coinm_dated symbols",
     )?;
     check_cap(okx_instruments.len(), VENUE_LIST_MAX, "OKX instruments")?;
     check_cap(
@@ -1226,6 +1660,11 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     // list max (crates/ingress-bybit BYBIT_MAX_SYMBOLS = 64).
     check_cap(bybit_spot.len(), 64, "Bybit spot symbols")?;
     check_cap(bybit_linear.len(), 64, "Bybit linear symbols")?;
+    // MX2/MX5: see [`MEXC_LIST_MAX`] (spot 15 symbols/socket at the
+    // measured 30-sub cap, futures ~13/socket — plan §4 D1).
+    check_cap(mexc_spot.len(), MEXC_LIST_MAX, "MEXC spot symbols")?;
+    check_cap(mexc_perp.len(), MEXC_LIST_MAX, "MEXC perp symbols")?;
+    check_cap(hyperevm_pools.len(), HYPEREVM_POOLS_MAX, "HyperEVM pools")?;
 
     // Within-list duplicates (a duplicate = double subscribe + two
     // ids for one stream — always a config mistake).
@@ -1243,6 +1682,8 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     check_unique(&binance_spot, "Binance spot symbol")?;
     check_unique(&binance_usdm, "Binance usdm symbol")?;
     check_unique(&binance_usdm_dated, "Binance usdm_dated symbol")?;
+    check_unique(&binance_coinm, "Binance coinm symbol")?;
+    check_unique(&binance_coinm_dated, "Binance coinm_dated symbol")?;
     check_unique(&okx_instruments, "OKX instrument")?;
     check_unique(&deribit_instruments, "Deribit instrument")?;
     check_unique(&deribit_combos, "Deribit combo")?;
@@ -1260,29 +1701,102 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     check_unique(&hl_rolling, "Hyperliquid rolling family")?;
     check_unique(&bybit_spot, "Bybit spot symbol")?;
     check_unique(&bybit_linear, "Bybit linear symbol")?;
+    check_unique(&mexc_spot, "MEXC spot symbol")?;
+    check_unique(&mexc_perp, "MEXC perp symbol")?;
+    // HYPARB H3b: one pool, one entry — keyed on the ADDRESS, so the
+    // same pool listed twice with different decimals is still refused.
+    let pool_addrs: Vec<String> = hyperevm_pools
+        .iter()
+        .map(|p| p.split(':').next().unwrap_or_default().to_owned())
+        .collect();
+    check_unique(&pool_addrs, "HyperEVM pool address")?;
+    // MX2: `spot` and `perp` cannot overlap BY ALPHABET — spot rejects
+    // `_`, perp requires one — so no cross-list check is needed.
     // WS5 note: `usdm` and `usdm_dated` cannot overlap BY ALPHABET —
     // plain usdm symbols reject `_`, dated symbols require exactly
     // one — so no cross-list check is needed here.
+    // BX2: `coinm` and `coinm_dated` cannot overlap each other (`_perp`
+    // against six digits) or `usdm` (no `_`) — but both fit
+    // `usdm_dated`'s wider alphabet (`btcusd_261225` has its one `_`),
+    // and one name in two lists would mint two ids for one stream.
+    for s in binance_coinm.iter().chain(binance_coinm_dated.iter()) {
+        if binance_usdm_dated.contains(s) {
+            return Err(err(
+                0,
+                format!("`{s}` appears in both `usdm_dated` and a COIN-M list — pick one"),
+            ));
+        }
+    }
 
     // Options policies (M2.1 deribit, M2.2 okx) — one law, per venue.
     let deribit_options = finalize_options_policy(
         "Deribit",
+        "options_",
         b.deribit_opt_underlyings.unwrap_or_default(),
         b.deribit_opt_expiries,
         b.deribit_opt_strikes,
     )?;
     let okx_options = finalize_options_policy(
         "OKX",
+        "options_",
         b.okx_opt_underlyings.unwrap_or_default(),
         b.okx_opt_expiries,
         b.okx_opt_strikes,
     )?;
     let bn_options = finalize_options_policy(
         "Binance",
+        "options_",
         b.bn_opt_underlyings.unwrap_or_default(),
         b.bn_opt_expiries,
         b.bn_opt_strikes,
     )?;
+    // HC4: the same law under the section's own key names, plus the
+    // one-frame subscribe's table cap and the poller cadence.
+    let hypercall = finalize_options_policy(
+        "Hypercall",
+        "",
+        b.hc_underlyings.unwrap_or_default(),
+        b.hc_expiries,
+        b.hc_strikes,
+    )?;
+    let hc_rows = hypercall.underlyings.len() as u32 * hypercall.per_underlying_cap();
+    if hc_rows > HC_INSTRUMENTS_MAX {
+        return Err(err(
+            0,
+            format!(
+                "Hypercall universe {} underlyings × {} expiries × {} strikes × 2 = {hc_rows} \
+                 instruments exceeds the one-frame subscribe cap {HC_INSTRUMENTS_MAX}",
+                hypercall.underlyings.len(),
+                hypercall.expiries,
+                hypercall.strikes
+            ),
+        ));
+    }
+    if hypercall.underlyings.is_empty() && b.hc_summary_every_s.is_some() {
+        return Err(err(
+            0,
+            "Hypercall `summary_every_s` set but `underlyings` is empty — remove the knob or \
+             configure underlyings",
+        ));
+    }
+    // 0 while the lane is off, so a file without `[hypercall]` parses to
+    // the pre-HC4 universe bit for bit.
+    let hypercall_summary_every_s = if hypercall.enabled() {
+        b.hc_summary_every_s.unwrap_or(HC_SUMMARY_EVERY_S_DEFAULT)
+    } else {
+        0
+    };
+    if hypercall.enabled()
+        && !(HC_SUMMARY_EVERY_S_MIN..=HC_SUMMARY_EVERY_S_MAX).contains(&hypercall_summary_every_s)
+    {
+        return Err(err(
+            0,
+            format!(
+                "Hypercall `summary_every_s` {hypercall_summary_every_s} out of range \
+                 {HC_SUMMARY_EVERY_S_MIN}..={HC_SUMMARY_EVERY_S_MAX}"
+            ),
+        ));
+    }
 
     // Pairs: re-parse (validated per element already), range-check.
     let mut pairs: Vec<(u32, u32)> = Vec::new();
@@ -1318,6 +1832,8 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
         binance_spot,
         binance_usdm,
         binance_usdm_dated,
+        binance_coinm,
+        binance_coinm_dated,
         okx_instruments,
         okx_depth: b.okx_depth.unwrap_or(false),
         deribit_instruments,
@@ -1330,6 +1846,11 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
         hl_rolling,
         bybit_spot,
         bybit_linear,
+        mexc_spot,
+        mexc_perp,
+        hyperevm_pools,
+        hypercall,
+        hypercall_summary_every_s,
         pairs,
     })
 }
@@ -1338,9 +1859,12 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
 /// integer knobs are meaningless without underlyings (fail-fast);
 /// underlyings dup-checked and capped; E 1..=[`OPT_EXPIRIES_MAX`];
 /// K EVEN, 2..=[`OPT_STRIKES_MAX`]. Defaults apply when the integer
-/// keys are absent.
+/// keys are absent. `key` is the section's key prefix — `options_` in
+/// a mixed venue's section, empty in `[hypercall]` (options-only) — so
+/// every message names the key the operator actually wrote.
 fn finalize_options_policy(
     venue: &str,
+    key: &str,
     underlyings: Vec<String>,
     expiries_key: Option<u32>,
     strikes_key: Option<u32>,
@@ -1355,8 +1879,8 @@ fn finalize_options_policy(
         return Err(err(
             0,
             format!(
-                "{venue} `options_expiries`/`options_strikes` set but \
-                 `options_underlyings` is empty — remove the knobs or configure underlyings"
+                "{venue} `{key}expiries`/`{key}strikes` set but \
+                 `{key}underlyings` is empty — remove the knobs or configure underlyings"
             ),
         ));
     }
@@ -1365,14 +1889,14 @@ fn finalize_options_policy(
     if expiries == 0 || expiries > OPT_EXPIRIES_MAX {
         return Err(err(
             0,
-            format!("{venue} `options_expiries` {expiries} out of range 1..={OPT_EXPIRIES_MAX}"),
+            format!("{venue} `{key}expiries` {expiries} out of range 1..={OPT_EXPIRIES_MAX}"),
         ));
     }
     if !(2..=OPT_STRIKES_MAX).contains(&strikes) || strikes % 2 != 0 {
         return Err(err(
             0,
             format!(
-                "{venue} `options_strikes` {strikes} must be EVEN and in 2..={OPT_STRIKES_MAX} \
+                "{venue} `{key}strikes` {strikes} must be EVEN and in 2..={OPT_STRIKES_MAX} \
                  (K/2 strikes each side of ATM)"
             ),
         ));
@@ -1484,6 +2008,28 @@ pub fn allocate_with_anchors(
             name,
         });
     }
+    // BX2 (O-BX3): COIN-M perpetuals and delivery futures — two
+    // blocks, one `binance-coinm:` namespace (the class law reads the
+    // `_perp` / `_yymmdd` suffix; inverse is a discovery-row flag,
+    // never a class).
+    for j in 0..u.binance_coinm.len() {
+        let sym = make_symbol_id(VenueId::Binance, BN_COINM_ORDINAL_BASE + j as u32 + 1);
+        let name = u.binance_coinm[j].clone();
+        out.bn_coinm.push(Instrument {
+            sym,
+            descriptor: format!("binance-coinm:{name}"),
+            name,
+        });
+    }
+    for j in 0..u.binance_coinm_dated.len() {
+        let sym = make_symbol_id(VenueId::Binance, BN_COINM_DATED_ORDINAL_BASE + j as u32 + 1);
+        let name = u.binance_coinm_dated[j].clone();
+        out.bn_coinm_dated.push(Instrument {
+            sym,
+            descriptor: format!("binance-coinm:{name}"),
+            name,
+        });
+    }
 
     // OKX / Deribit / HL — the standing per-venue convention.
     for i in 0..u.okx_instruments.len() {
@@ -1556,6 +2102,52 @@ pub fn allocate_with_anchors(
             name,
         });
     }
+    // MX2/MX5 (plan §4 D9): MEXC — spot from ordinal 1, perp from its
+    // own block (venue byte 7). `mexc-perp:` is always Perp: MEXC lists
+    // no dated futures.
+    for i in 0..u.mexc_spot.len() {
+        let name = u.mexc_spot[i].clone();
+        out.mexc_spot.push(Instrument {
+            sym: make_symbol_id(VenueId::Mexc, i as u32 + 1),
+            descriptor: format!("mexc:{name}"),
+            name,
+        });
+    }
+    for j in 0..u.mexc_perp.len() {
+        let name = u.mexc_perp[j].clone();
+        out.mexc_perp.push(Instrument {
+            sym: make_symbol_id(VenueId::Mexc, MEXC_PERP_ORDINAL_BASE + j as u32 + 1),
+            descriptor: format!("mexc-perp:{name}"),
+            name,
+        });
+    }
+    // HYPARB H3b: HyperEVM pools — ordinal i + 1 of venue byte 8, the
+    // pool's book slot (`core_fill::amm_pool_index`). Append, never
+    // reorder: a reordered list re-keys every pool on the tape.
+    for i in 0..u.hyperevm_pools.len() {
+        let entry = &u.hyperevm_pools[i];
+        let Some(pool) = parse_hyperevm_pool(entry) else {
+            return Err(err(0, format!("bad HyperEVM pool `{entry}`")));
+        };
+        let name = entry.split(':').next().unwrap_or_default().to_owned();
+        out.hyperevm.push(Instrument {
+            sym: make_symbol_id(VenueId::HyperEvm, i as u32 + 1),
+            descriptor: format!("hyperevm:{name}"),
+            name,
+        });
+        out.hyperevm_pools.push(pool);
+    }
+    // HC4: one settlement-index sym per Hypercall underlying, ordinal
+    // i + 1 of venue byte 9 (the options sit above, from
+    // OPT_ORDINAL_BASE, allocated by the cli after discovery).
+    for i in 0..u.hypercall.underlyings.len() {
+        let name = u.hypercall.underlyings[i].clone();
+        out.hypercall_idx.push(Instrument {
+            sym: make_symbol_id(VenueId::Hypercall, i as u32 + 1),
+            descriptor: format!("hypercall-idx:{name}"),
+            name,
+        });
+    }
 
     // Universe-wide duplicate-id check (fail fast, name both sides).
     let mut all: Vec<(SymbolId, &str)> = Vec::new();
@@ -1566,12 +2158,18 @@ pub fn allocate_with_anchors(
         &out.bn_spot,
         &out.bn_usdm,
         &out.bn_dated,
+        &out.bn_coinm,
+        &out.bn_coinm_dated,
         &out.okx,
         &out.deribit,
         &out.deribit_combos,
         &out.hl,
         &out.bybit_spot,
         &out.bybit_linear,
+        &out.mexc_spot,
+        &out.mexc_perp,
+        &out.hyperevm,
+        &out.hypercall_idx,
     ] {
         for inst in group {
             all.push((inst.sym, inst.descriptor.as_str()));
@@ -1832,6 +2430,96 @@ map = ["0:0", "1:1"]
     }
 
     #[test]
+    fn coinm_lists_parse_allocate_own_blocks_and_share_one_namespace() {
+        // BX2 (O-BX3): perps from 3072, delivery from 3584, one
+        // `binance-coinm:` namespace for both (the class law reads the
+        // suffix).
+        let src = "[binance]\nspot=[\"btcusdt\"]\nusdm=[\"btcusdt\"]\n\
+                   coinm=[\"btcusd_perp\",\"ethusd_perp\"]\ncoinm_dated=[\"btcusd_261225\"]\n";
+        let u = parse(src).unwrap();
+        assert_eq!(u.binance_coinm, vec!["btcusd_perp", "ethusd_perp"]);
+        assert_eq!(u.binance_coinm_dated, vec!["btcusd_261225"]);
+        let a = allocate(&u).unwrap();
+        assert_eq!(
+            a.bn_coinm[0].sym,
+            make_symbol_id(VenueId::Binance, BN_COINM_ORDINAL_BASE + 1)
+        );
+        assert_eq!(
+            a.bn_coinm[1].sym,
+            make_symbol_id(VenueId::Binance, BN_COINM_ORDINAL_BASE + 2)
+        );
+        assert_eq!(a.bn_coinm[1].descriptor, "binance-coinm:ethusd_perp");
+        assert_eq!(
+            a.bn_coinm_dated[0].sym,
+            make_symbol_id(VenueId::Binance, BN_COINM_DATED_ORDINAL_BASE + 1)
+        );
+        assert_eq!(a.bn_coinm_dated[0].descriptor, "binance-coinm:btcusd_261225");
+        // The blocks stay disjoint at the list cap: the last dated USDⓈ-M
+        // ordinal sits under the first COIN-M one, the last COIN-M perp
+        // under the first COIN-M delivery, and that block under 4096.
+        let cap = VENUE_LIST_MAX as u32;
+        assert!(BN_DATED_ORDINAL_BASE + cap + 1 < BN_COINM_ORDINAL_BASE);
+        assert!(BN_COINM_ORDINAL_BASE + cap + 1 < BN_COINM_DATED_ORDINAL_BASE);
+        assert!(BN_COINM_DATED_ORDINAL_BASE + cap + 1 < 4096);
+        // Duplicate key law, per key.
+        for key in ["coinm", "coinm_dated"] {
+            let item = if key == "coinm" { "btcusd_perp" } else { "btcusd_261225" };
+            let dup = format!("[binance]\n{key}=[\"{item}\"]\n{key}=[\"{item}\"]\n");
+            assert!(parse(&dup).unwrap_err().msg.contains("duplicate key"), "{key}");
+            let twice = format!("[binance]\n{key}=[\"{item}\",\"{item}\"]\n");
+            assert!(parse(&twice).unwrap_err().msg.contains("duplicate"), "{key}");
+        }
+    }
+
+    #[test]
+    fn coinm_symbols_must_match_their_list() {
+        // A perp list wants `_perp`; a delivery list wants six digits;
+        // both want the `usd` quote and the lowercase alphabet.
+        for bad in [
+            "btcusd_261225",
+            "btcusdt_perp",
+            "btcusd",
+            "usd_perp",
+            "btcusd_perp_x",
+            "BTCUSD_PERP",
+            "btc-usd_perp",
+            "btcusd_",
+        ] {
+            let src = format!("[binance]\ncoinm=[\"{bad}\"]\n");
+            assert!(
+                parse(&src).unwrap_err().msg.contains("COIN-M symbol"),
+                "coinm `{bad}` must be rejected"
+            );
+        }
+        for bad in [
+            "btcusd_perp",
+            "btcusdt_261225",
+            "btcusd_2612",
+            "btcusd_2612251",
+            "btcusd_26122a",
+            "BTCUSD_261225",
+        ] {
+            let src = format!("[binance]\ncoinm_dated=[\"{bad}\"]\n");
+            assert!(
+                parse(&src).unwrap_err().msg.contains("COIN-M symbol"),
+                "coinm_dated `{bad}` must be rejected"
+            );
+        }
+        // Digits in the coin are fine (`1000shibusd` is a shape the
+        // venue could list).
+        parse("[binance]\ncoinm=[\"1000shibusd_perp\"]\n").unwrap();
+        // A COIN-M name also fits `usdm_dated`'s wider alphabet: one
+        // name in both lists is refused, naming it.
+        for list in ["coinm=[\"btcusd_perp\"]", "coinm_dated=[\"btcusd_261225\"]"] {
+            let name = if list.starts_with("coinm=") { "btcusd_perp" } else { "btcusd_261225" };
+            let src = format!("[binance]\nusdm_dated=[\"{name}\"]\n{list}\n");
+            let msg = parse(&src).unwrap_err().msg;
+            assert!(msg.contains("both `usdm_dated` and a COIN-M list"), "{msg}");
+            assert!(msg.contains(name), "{msg}");
+        }
+    }
+
+    #[test]
     fn bybit_section_parses_allocates_and_validates() {
         // WS9: the sixth venue's grammar + the venue-byte-6 blocks.
         let src = "[binance]\nspot=[\"btcusdt\"]\n[bybit]\nspot=[\"BTCUSDT\"]\nlinear=[\"BTCUSDT\",\"ETHUSDT\"]\n";
@@ -1854,6 +2542,219 @@ map = ["0:0", "1:1"]
         // Unknown key law holds for the new section.
         let unk = "[bybit]\nusdm=[\"BTCUSDT\"]\n";
         assert!(parse(unk).unwrap_err().msg.contains("unknown key"));
+    }
+
+    #[test]
+    fn hyperevm_section_parses_allocates_and_validates() {
+        // HYPARB H3b: pools are ordinals of venue byte 8 in file order;
+        // the address is the descriptor and the identity.
+        const A: &str = "0x6c9a33e3b592c0d65b3ba59355d5be0d38259285";
+        const B: &str = "0x3e8b6fcdbc5f23b1b35a8c6b6ab0c5f8f2d1e4a7";
+        let src = format!("[hyperevm]\npools=[\"{A}:v3:18:6\",\"{B}:algebra:6:18\"]\n");
+        let u = parse(&src).unwrap();
+        assert_eq!(u.hyperevm_pools.len(), 2);
+        let a = allocate(&u).unwrap();
+        assert_eq!(a.hyperevm[0].sym, make_symbol_id(VenueId::HyperEvm, 1));
+        assert_eq!(a.hyperevm[0].descriptor, format!("hyperevm:{A}"));
+        assert_eq!(a.hyperevm[1].sym, make_symbol_id(VenueId::HyperEvm, 2));
+        assert_eq!(a.hyperevm_pools[0].family, HyperEvmFamily::V3);
+        assert_eq!(
+            (a.hyperevm_pools[0].dec0, a.hyperevm_pools[0].dec1),
+            (18, 6)
+        );
+        assert_eq!(a.hyperevm_pools[1].family, HyperEvmFamily::Algebra);
+        assert_eq!(a.hyperevm_pools[0].address[0], 0x6c);
+        assert_eq!(a.hyperevm_pools[0].address[19], 0x85);
+        // The same pool twice — even with other decimals — is refused.
+        let dup = format!("[hyperevm]\npools=[\"{A}:v3:18:6\",\"{A}:v3:6:6\"]\n");
+        assert!(parse(&dup)
+            .unwrap_err()
+            .msg
+            .contains("HyperEVM pool address"));
+        // One spelling: uppercase hex, a short address, an unknown family,
+        // decimals past 36, a missing field — each refused at the grammar.
+        for bad in [
+            "0x6C9A33E3B592C0D65B3BA59355D5BE0D38259285:v3:18:6",
+            "0x6c9a33e3b592c0d65b3ba59355d5be0d3825928:v3:18:6",
+            "6c9a33e3b592c0d65b3ba59355d5be0d38259285:v3:18:6",
+            "0x6c9a33e3b592c0d65b3ba59355d5be0d38259285:v2:18:6",
+            "0x6c9a33e3b592c0d65b3ba59355d5be0d38259285:v3:37:6",
+            "0x6c9a33e3b592c0d65b3ba59355d5be0d38259285:v3:18",
+            "0x6c9a33e3b592c0d65b3ba59355d5be0d38259285:v3:18:6:1",
+        ] {
+            let src = format!("[hyperevm]\npools=[\"{bad}\"]\n");
+            assert!(
+                parse(&src).unwrap_err().msg.contains("bad HyperEVM pool"),
+                "{bad}"
+            );
+        }
+        assert!(parse("[hyperevm]\ncoins=[\"x\"]\n")
+            .unwrap_err()
+            .msg
+            .contains("unknown key"));
+    }
+
+    #[test]
+    fn mexc_section_parses_allocates_and_validates() {
+        // MX2/MX5: the seventh venue's grammar + the venue-byte-7
+        // blocks. xStocks and TradFi perps are ordinary rows.
+        let src = "[binance]\nspot=[\"btcusdt\"]\n[mexc]\nspot=[\"BTCUSDT\",\"AAPLXUSDT\"]\n\
+                   perp=[\"BTC_USDT\",\"XAU_USDT\",\"AAPLSTOCK_USDT\"]\n";
+        let u = parse(src).unwrap();
+        assert_eq!(u.mexc_spot, vec!["BTCUSDT", "AAPLXUSDT"]);
+        assert_eq!(u.mexc_perp, vec!["BTC_USDT", "XAU_USDT", "AAPLSTOCK_USDT"]);
+        let a = allocate(&u).unwrap();
+        assert_eq!(a.mexc_spot[0].sym, make_symbol_id(VenueId::Mexc, 1));
+        assert_eq!(a.mexc_spot[0].descriptor, "mexc:BTCUSDT");
+        assert_eq!(a.mexc_spot[1].sym, make_symbol_id(VenueId::Mexc, 2));
+        assert_eq!(a.mexc_spot[1].descriptor, "mexc:AAPLXUSDT");
+        assert_eq!(
+            a.mexc_perp[0].sym,
+            make_symbol_id(VenueId::Mexc, MEXC_PERP_ORDINAL_BASE + 1)
+        );
+        assert_eq!(a.mexc_perp[0].descriptor, "mexc-perp:BTC_USDT");
+        assert_eq!(a.mexc_perp[2].name, "AAPLSTOCK_USDT");
+        assert_eq!(
+            a.mexc_perp[2].sym,
+            make_symbol_id(VenueId::Mexc, MEXC_PERP_ORDINAL_BASE + 3)
+        );
+        // Venue namespacing: MEXC `BTCUSDT` never collides with
+        // Bybit's or Binance's (plan §6 R9).
+        let both = "[bybit]\nspot=[\"BTCUSDT\"]\n[mexc]\nspot=[\"BTCUSDT\"]\n";
+        let a2 = allocate(&parse(both).unwrap()).unwrap();
+        assert_ne!(a2.bybit_spot[0].sym, a2.mexc_spot[0].sym);
+        // Lowercase rejects on both keys (the venue takes the wire form).
+        let bad = "[mexc]\nspot=[\"btcusdt\"]\n";
+        assert!(parse(bad).unwrap_err().msg.contains("bad MEXC spot symbol"));
+        let bad = "[mexc]\nperp=[\"btc_usdt\"]\n";
+        assert!(parse(bad).unwrap_err().msg.contains("bad MEXC perp symbol"));
+        // Spot rejects the separator; perp REQUIRES one (a misfiled
+        // spot row is caught by alphabet, so the lists cannot overlap).
+        let bad = "[mexc]\nspot=[\"BTC_USDT\"]\n";
+        assert!(parse(bad).unwrap_err().msg.contains("bad MEXC spot symbol"));
+        let bad = "[mexc]\nperp=[\"BTCUSDT\"]\n";
+        assert!(parse(bad).unwrap_err().msg.contains("bad MEXC perp symbol"));
+        // Unknown key law holds for the new section (`linear` is Bybit's).
+        let unk = "[mexc]\nlinear=[\"BTC_USDT\"]\n";
+        assert!(parse(unk).unwrap_err().msg.contains("unknown key"));
+        // Duplicate key is fatal, per key.
+        let dup = "[mexc]\nspot=[\"BTCUSDT\"]\nspot=[\"ETHUSDT\"]\n";
+        assert!(parse(dup).unwrap_err().msg.contains("duplicate key `spot`"));
+        let dup = "[mexc]\nperp=[\"BTC_USDT\"]\nperp=[\"ETH_USDT\"]\n";
+        assert!(parse(dup).unwrap_err().msg.contains("duplicate key `perp`"));
+        // Duplicate symbol within a list is fatal.
+        let dup = "[mexc]\nperp=[\"BTC_USDT\",\"BTC_USDT\"]\n";
+        assert!(parse(dup).unwrap_err().msg.contains("duplicate MEXC perp symbol"));
+        // An empty section is the pre-MX2 universe, bit for bit.
+        let empty = parse("[mexc]\nspot = []\nperp = []\n").unwrap();
+        assert_eq!(empty, Universe::default());
+        assert_eq!(allocate(&empty).unwrap(), AllocatedUniverse::default());
+    }
+
+    #[test]
+    fn mexc_lists_cap_at_128_and_blocks_stay_disjoint() {
+        let mut spot = String::from("[mexc]\nspot=[");
+        let mut perp = String::from("perp=[");
+        for i in 0..MEXC_LIST_MAX {
+            if i > 0 {
+                spot.push(',');
+                perp.push(',');
+            }
+            spot.push_str(&format!("\"S{i}USDT\""));
+            perp.push_str(&format!("\"P{i}_USDT\""));
+        }
+        let at_cap = format!("{spot}]\n{perp}]\n");
+        let a = allocate(&parse(&at_cap).expect("at cap parses")).unwrap();
+        // The last spot ordinal stays below the perp block's first.
+        assert!(a.mexc_spot[MEXC_LIST_MAX - 1].sym < a.mexc_perp[0].sym);
+        assert_eq!(
+            a.mexc_spot[MEXC_LIST_MAX - 1].sym,
+            make_symbol_id(VenueId::Mexc, MEXC_LIST_MAX as u32)
+        );
+        let over_spot = format!("{spot},\"EXTRAUSDT\"]\n");
+        let e = parse(&over_spot).unwrap_err();
+        assert!(e.msg.contains("too many MEXC spot symbols"), "{e}");
+        let over_perp = format!("[mexc]\n{perp},\"EXTRA_USDT\"]\n");
+        let e = parse(&over_perp).unwrap_err();
+        assert!(e.msg.contains("too many MEXC perp symbols"), "{e}");
+        // The D9 law: any list is ≤ VENUE_LIST_MAX < the perp base.
+        const { assert!(VENUE_LIST_MAX < MEXC_PERP_ORDINAL_BASE as usize) };
+        const { assert!(MEXC_LIST_MAX <= VENUE_LIST_MAX) };
+    }
+
+    #[test]
+    fn hypercall_section_parses_allocates_and_validates() {
+        // HC4 (O-HC2): all twelve underlyings, E3 × K8 — 576 options,
+        // discovered at boot; the file allocates only the indices.
+        let src = "[hypercall]\nunderlyings = [\"SP500\", \"SPCX\", \"MU\", \"NVDA\", \"MSFT\", \"META\", \
+                   \"AAPL\", \"BABA\", \"SNDK\", \"BOT\", \"BTC\", \"ETH\"]\nexpiries = 3\nstrikes = 8\n\
+                   summary_every_s = 600\n";
+        let u = parse(src).unwrap();
+        assert!(u.hypercall.enabled());
+        assert_eq!(u.hypercall.underlyings.len(), 12);
+        assert_eq!((u.hypercall.expiries, u.hypercall.strikes), (3, 8));
+        assert_eq!(u.hypercall.underlyings.len() as u32 * u.hypercall.per_underlying_cap(), 576);
+        assert_eq!(u.hypercall_summary_every_s, 600);
+        let a = allocate(&u).unwrap();
+        assert_eq!(a.hypercall_idx.len(), 12);
+        assert_eq!(a.hypercall_idx[0].sym, make_symbol_id(VenueId::Hypercall, 1));
+        assert_eq!(a.hypercall_idx[0].descriptor, "hypercall-idx:SP500");
+        assert_eq!(a.hypercall_idx[11].sym, make_symbol_id(VenueId::Hypercall, 12));
+        assert_eq!(a.hypercall_idx[11].name, "ETH");
+        // The index block stays below the options' ordinal base.
+        const { assert!((HC_INSTRUMENTS_MAX as usize) <= 1024 && OPT_UNDERLYINGS_MAX < OPT_ORDINAL_BASE as usize) };
+        // Defaults: the shared law's E/K, the poller's period.
+        let d = parse("[hypercall]\nunderlyings = [\"BTC\"]\n").unwrap();
+        assert_eq!((d.hypercall.expiries, d.hypercall.strikes), (OPT_EXPIRIES_DEFAULT, OPT_STRIKES_DEFAULT));
+        assert_eq!(d.hypercall_summary_every_s, HC_SUMMARY_EVERY_S_DEFAULT);
+        // Venue namespacing: Hypercall `BTC` never collides with HL's.
+        let both = "[hyperliquid]\ncoins = [\"BTC\"]\n[hypercall]\nunderlyings = [\"BTC\"]\n";
+        let a2 = allocate(&parse(both).unwrap()).unwrap();
+        assert_ne!(a2.hl[0].sym, a2.hypercall_idx[0].sym);
+        // Names are the venue's own: UPPERCASE [A-Z0-9], ≤ 12 bytes.
+        for bad in ["btc", "SP-500", "ABCDEFGHIJKLM", ""] {
+            let e = parse(&format!("[hypercall]\nunderlyings = [\"{bad}\"]\n")).unwrap_err();
+            assert!(e.msg.contains("bad Hypercall underlying"), "{bad}: {e}");
+        }
+        // The shared policy law, under THIS section's key names.
+        let e = parse("[hypercall]\nexpiries = 2\n").unwrap_err();
+        assert!(e.msg.contains("Hypercall") && e.msg.contains("`underlyings`"), "{e}");
+        assert!(!e.msg.contains("options_"), "{e}");
+        let e = parse("[hypercall]\nunderlyings = [\"BTC\"]\nstrikes = 7\n").unwrap_err();
+        assert!(e.msg.contains("`strikes` 7 must be EVEN"), "{e}");
+        let e = parse("[hypercall]\nunderlyings = [\"BTC\"]\nexpiries = 5\n").unwrap_err();
+        assert!(e.msg.contains("`expiries` 5 out of range"), "{e}");
+        let e = parse("[hypercall]\nunderlyings = [\"BTC\", \"BTC\"]\n").unwrap_err();
+        assert!(e.msg.contains("duplicate Hypercall options underlying"), "{e}");
+        // The poller cadence: bounded, and meaningless without the lane.
+        for (v, ok) in [(59u32, false), (60, true), (3600, true), (3601, false)] {
+            let r = parse(&format!("[hypercall]\nunderlyings = [\"BTC\"]\nsummary_every_s = {v}\n"));
+            assert_eq!(r.is_ok(), ok, "summary_every_s = {v}: {r:?}");
+        }
+        let e = parse("[hypercall]\nsummary_every_s = 300\n").unwrap_err();
+        assert!(e.msg.contains("`summary_every_s` set but `underlyings` is empty"), "{e}");
+        // The one-frame subscribe cap: 16 × 4 × 8 × 2 = 1024 fits, one
+        // more strike pair does not.
+        let mut sixteen = String::from("[hypercall]\nunderlyings = [");
+        for i in 0..16 {
+            if i > 0 {
+                sixteen.push(',');
+            }
+            sixteen.push_str(&format!("\"U{i}\""));
+        }
+        sixteen.push_str("]\nexpiries = 4\n");
+        assert!(parse(&format!("{sixteen}strikes = 8\n")).is_ok());
+        let e = parse(&format!("{sixteen}strikes = 10\n")).unwrap_err();
+        assert!(e.msg.contains("exceeds the one-frame subscribe cap 1024"), "{e}");
+        // Other sections' key names are unknown here.
+        let e = parse("[hypercall]\noptions_underlyings = [\"BTC\"]\n").unwrap_err();
+        assert!(e.msg.contains("unknown key"), "{e}");
+        let e = parse("[hypercall]\nunderlyings = [\"BTC\"]\nunderlyings = [\"ETH\"]\n").unwrap_err();
+        assert!(e.msg.contains("duplicate key `underlyings`"), "{e}");
+        // An empty section is the pre-HC4 universe, bit for bit.
+        let empty = parse("[hypercall]\nunderlyings = []\n").unwrap();
+        assert_eq!(empty, Universe::default());
+        assert_eq!(allocate(&empty).unwrap(), AllocatedUniverse::default());
     }
 
     #[test]

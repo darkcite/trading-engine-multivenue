@@ -50,18 +50,18 @@ use std::io;
 
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{
-    constant_time_eq, expected_accept, queue_masked_binary_frame, read_server_handshake,
+    constant_time_eq, expected_accept, queue_masked_binary_frame_parts, read_server_handshake,
     sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
-    ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf, Keepalive, KeepaliveAction,
-    PendingTable, ReqKind, Status, SubErr, SubTable, Transport, WsOpcode, WsReadResult,
+    ws_unmask_in_place, ws_write_pong, Drained, HandshakeResult, IoBuf, Keepalive, KeepaliveAction,
+    PendingTable, ReqKind, RxFill, Status, SubErr, SubTable, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::now_ns;
 use core_types::{Capture, LatencyClass, NsTs, Signal, SignalSource, SymbolId, SYMBOL_ID_NONE};
 
 use crate::{
-    classify_rpc, parse_block_number_result, parse_hex_u64, parse_new_head_notification,
-    parse_rpc_error, write_request_eth_block_number, write_request_subscribe_new_heads, NewHead,
+    classify_rpc, eth_block_number_request_parts, parse_block_number_result, parse_hex_u64,
+    parse_new_head_notification, parse_rpc_error, subscribe_new_heads_request_parts, NewHead,
     RequestIds, RpcFrameKind,
 };
 
@@ -301,6 +301,10 @@ impl Driver {
 /// * `capture`: §6.5 replay/tap sink — raw frames pre-classify,
 ///   signals pre-push, parse rejects at the reject site.
 ///
+/// Returns `Ok(true)` when this step's read stopped on a full rx
+/// ([`RxFill::Full`]): input may still wait below it, so the caller
+/// drives again ([`core_net::drain`]).
+///
 /// # Errors
 ///
 /// Any transport error is surfaced so the outer scheduler can close +
@@ -313,9 +317,9 @@ pub fn drive_one<T: Transport, C: Capture>(
     producer: &mut Producer<Signal, DEFAULT_SIGNAL_RING_CAP>,
     status: &IngressStatus,
     capture: &mut C,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     flush_tx(transport, drv)?;
-    fill_rx(transport, drv)?;
+    let fill = core_net::fill_rx(transport, &mut drv.rx)?;
 
     match drv.state {
         State::Connecting => {}
@@ -339,8 +343,35 @@ pub fn drive_one<T: Transport, C: Capture>(
         State::Closed => {}
     }
 
+    // HK2: an EOF closes the session only now — the frames that arrived
+    // with the FIN were parsed above — and nothing is flushed to a peer
+    // that has closed.
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+        return Ok(false);
+    }
     flush_tx(transport, drv)?;
-    Ok(())
+    Ok(fill == RxFill::Full)
+}
+
+/// I-3 ([`core_net::drain`]): drive the connection until a step makes no
+/// progress — its read did not stop on a full rx, it published no signal,
+/// its state held — or [`core_net::DRAIN_STEP_CAP`] steps have run.
+fn drive_until_idle<T: Transport, C: Capture>(
+    transport: &mut T,
+    drv: &mut Driver,
+    host: &[u8],
+    path: &[u8],
+    producer: &mut Producer<Signal, DEFAULT_SIGNAL_RING_CAP>,
+    status: &IngressStatus,
+    capture: &mut C,
+) -> Drained {
+    core_net::drain_until_idle!(
+        step: drive_one(transport, drv, host, path, producer, status, capture),
+        published: producer.published(),
+        key: drv.state(),
+        closed: drv.state() == State::Closed,
+    )
 }
 
 /// Bump `Connecting → NeedsWsWrite` once the transport is TLS-ready.
@@ -378,24 +409,6 @@ fn flush_tx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()>
         drv.tx.clear();
     } else if written > 0 {
         drv.tx.consume(written);
-    }
-    Ok(())
-}
-
-fn fill_rx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> {
-    loop {
-        if drv.rx.free_mut().is_empty() {
-            break;
-        }
-        match transport.read(drv.rx.free_mut()) {
-            Ok(0) => {
-                drv.state = State::Closed;
-                break;
-            }
-            Ok(n) => drv.rx.advance(n),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
     }
     Ok(())
 }
@@ -452,10 +465,9 @@ fn queue_subscribe_new_heads(drv: &mut Driver) -> io::Result<()> {
     debug_assert!(!drv.subscribed, "subscribe must only be fired once");
     let id = drv.ids.allocate();
     record_pending(drv, id, RpcKind::SubscribeNewHeads)?;
-    let mut scratch = [0u8; 96];
-    let n = write_request_subscribe_new_heads(&mut scratch, id)
-        .map_err(|_| io::Error::other("subscribe request buffer too small"))?;
-    queue_masked_binary_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
+    let mut digits = [0u8; 20];
+    let parts = subscribe_new_heads_request_parts(id, &mut digits);
+    queue_masked_binary_frame_parts(&mut drv.tx, &mut drv.mask_counter, &parts)?;
     drv.subscribed = true;
     Ok(())
 }
@@ -468,10 +480,9 @@ fn maybe_queue_block_number_poll(drv: &mut Driver) -> io::Result<()> {
     drv.next_poll_at_ns = now.saturating_add(RPC_POLL_NS);
     let id = drv.ids.allocate();
     record_pending(drv, id, RpcKind::BlockNumber)?;
-    let mut scratch = [0u8; 96];
-    let n = write_request_eth_block_number(&mut scratch, id)
-        .map_err(|_| io::Error::other("blockNumber request buffer too small"))?;
-    queue_masked_binary_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])
+    let mut digits = [0u8; 20];
+    let parts = eth_block_number_request_parts(id, &mut digits);
+    queue_masked_binary_frame_parts(&mut drv.tx, &mut drv.mask_counter, &parts)
 }
 
 fn record_pending(drv: &mut Driver, id: u64, kind: RpcKind) -> io::Result<()> {
@@ -504,7 +515,7 @@ fn drain_ws_frames<C: Capture>(
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
         match read_result {
-            WsReadResult::Incomplete => return Ok(()),
+            WsReadResult::Incomplete => return core_net::incomplete_frame(&mut drv.rx),
             WsReadResult::Malformed => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -535,14 +546,14 @@ fn drain_ws_frames<C: Capture>(
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
                         drv.mask_counter = drv.mask_counter.wrapping_add(1);
-                        let start = payload.start;
-                        let end = payload.end;
-                        let plen = end - start;
-                        let mut scratch = [0u8; 125];
-                        debug_assert!(plen <= scratch.len());
-                        scratch[..plen].copy_from_slice(&drv.rx.filled()[start..end]);
-                        let dst = drv.tx.free_mut();
-                        if let Ok(n) = ws_write_pong(dst, &scratch[..plen], mask) {
+                        // The echo goes straight from rx into tx (disjoint
+                        // field borrows) — no scratch; `ws_read_frame`
+                        // already refused a control payload over 125 B.
+                        if let Ok(n) = ws_write_pong(
+                            drv.tx.free_mut(),
+                            &drv.rx.filled()[payload.start..payload.end],
+                            mask,
+                        ) {
                             drv.tx.advance(n);
                         }
                     }
@@ -578,7 +589,8 @@ fn drain_ws_frames<C: Capture>(
 #[derive(Copy, Clone)]
 enum Dispatch {
     Nothing,
-    EmitNewHead(NewHead),
+    /// A `newHeads` notification parsed into the phase-1 head.
+    EmitNewHead,
     Response {
         id: u64,
         block: Option<u64>,
@@ -589,6 +601,10 @@ enum Dispatch {
     },
 }
 
+// The dispatch value crosses phase 1 → phase 2 by value: pinned
+// within the 64 B by-value bound (frames ride in phase-1 scratch).
+const _: () = assert!(core::mem::size_of::<Dispatch>() <= 64);
+
 fn handle_json_frame<C: Capture>(
     drv: &mut Driver,
     payload_range: core::ops::Range<usize>,
@@ -598,6 +614,10 @@ fn handle_json_frame<C: Capture>(
 ) {
     // Retained for the phase-2 reject re-borrow (Range is not Copy).
     let reject_range = payload_range.clone();
+    // Phase 1's head, parsed in place: riding inside the dispatch value
+    // it would widen every dispatch past the 64 B bound and cross phase
+    // 1 → phase 2 by value. `Dispatch::EmitNewHead` says it was written.
+    let mut head = crate::NewHead::ZERO;
     // Phase 1: immutable-borrow phase — classify and pre-parse
     // everything we might need. Zero-alloc scanners over `&[u8]`.
     // The §6.5 raw tap sees every data payload pre-classify.
@@ -605,9 +625,13 @@ fn handle_json_frame<C: Capture>(
         let payload = &drv.rx.filled()[payload_range];
         capture.raw_frame(now_ns(), payload);
         match classify_rpc(payload) {
-            RpcFrameKind::Subscription => parse_new_head_notification(payload)
-                .map(Dispatch::EmitNewHead)
-                .unwrap_or(Dispatch::Nothing),
+            RpcFrameKind::Subscription => {
+                if parse_new_head_notification(payload, &mut head) {
+                    Dispatch::EmitNewHead
+                } else {
+                    Dispatch::Nothing
+                }
+            }
             RpcFrameKind::Response => match extract_id_decimal(payload) {
                 Some((id, _)) => Dispatch::Response {
                     id,
@@ -647,7 +671,7 @@ fn handle_json_frame<C: Capture>(
             // §6.5 raw-tap differential audit consumes these.
             capture.parse_reject(now_ns(), &drv.rx.filled()[reject_range]);
         }
-        Dispatch::EmitNewHead(head) => {
+        Dispatch::EmitNewHead => {
             status.add_msgs(1);
             status.add_ticks(1);
             emit_new_head_signal(producer, status, head, capture);
@@ -713,6 +737,11 @@ fn register_subscription(drv: &mut Driver, id: SubId, kind: SubKind) {
 #[inline]
 fn pack_new_head_into_payload(head: NewHead) -> [u8; 40] {
     let mut out = [0u8; 40];
+    // COPY: three 8 B little-endian words (number, timestamp, gasUsed) into the
+    // 40 B signal payload, per newHeads notification — the Signal contract
+    // carries its payload as bytes and this IS the encode (one 8-byte store per
+    // word) — rejected: typed payload fields (a core-types wire change for three
+    // stores).
     out[0..8].copy_from_slice(&head.number.to_le_bytes());
     out[8..16].copy_from_slice(&head.ts_sec.to_le_bytes());
     out[16..24].copy_from_slice(&head.gas_used.to_le_bytes());
@@ -726,6 +755,8 @@ fn pack_new_head_into_payload(head: NewHead) -> [u8; 40] {
 #[inline]
 fn pack_block_number_into_payload(block: u64) -> [u8; 40] {
     let mut out = [0u8; 40];
+    // COPY: one 8 B little-endian block number into the 40 B signal payload, per
+    // blockNumber answer — the same encode as the newHeads pack above.
     out[0..8].copy_from_slice(&block.to_le_bytes());
     out
 }
@@ -748,7 +779,7 @@ fn emit_new_head_signal<C: Capture>(
     // counts with ring_drops_total).
     capture.signal(&sig);
     // D4: a full ring is data loss — count it, never block.
-    if producer.try_push(sig).is_err() {
+    if !producer.try_push_ref(&sig) {
         status.inc_ring_drops();
     }
 }
@@ -771,7 +802,7 @@ fn emit_block_number_signal<C: Capture>(
     // counts with ring_drops_total).
     capture.signal(&sig);
     // D4: a full ring is data loss — count it, never block.
-    if producer.try_push(sig).is_err() {
+    if !producer.try_push_ref(&sig) {
         status.inc_ring_drops();
     }
 }
@@ -861,10 +892,11 @@ pub fn run<T: Transport, C: Capture>(
     // See ingress-polymarket for rationale — skip `epoll_ctl`
     // when the readable+writable bitmask is unchanged.
     let mut last_interest = transport.interest();
+    let mut repoll_now = false;
 
     while !stop.load(Ordering::Relaxed) {
         if poll
-            .poll(events, Some(std::time::Duration::from_millis(50)))
+            .poll(events, Some(core_net::poll_timeout(repoll_now)))
             .is_err()
         {
             return RunResult::Error;
@@ -881,20 +913,13 @@ pub fn run<T: Transport, C: Capture>(
             note_transport_ready(drv, transport_status);
         }
 
-        // I-3: tight inner drain loop. See ingress-polymarket
-        // for rationale.
-        loop {
-            let n_before = producer.len();
-            let state_before = drv.state();
-            if drive_one(transport, drv, host, path, producer, status, capture).is_err() {
-                return RunResult::Error;
-            }
-            if drv.state() == State::Closed {
-                return RunResult::Disconnected;
-            }
-            if producer.len() == n_before && drv.state() == state_before {
-                break;
-            }
+        // I-3 (core_net::drain): drive until a step leaves nothing
+        // behind; re-poll at once if the step cap cut a backlog short.
+        match drive_until_idle(transport, drv, host, path, producer, status, capture) {
+            Drained::Idle => repoll_now = false,
+            Drained::Capped => repoll_now = true,
+            Drained::Closed => return RunResult::Disconnected,
+            Drained::Failed(_) => return RunResult::Error,
         }
 
         // §6.5: staged capture reaches disk within the flush interval
@@ -1080,6 +1105,61 @@ mod tests {
         let _ = n;
     }
 
+    /// The WS Ping echo goes rx → tx with no scratch (the BX0 shape): an
+    /// empty, a 4 B and a 125 B (control-frame cap) ping each come back
+    /// as exactly one masked pong carrying the same bytes.
+    #[test]
+    fn a_ws_ping_is_echoed_straight_from_rx() {
+        for payload in TestTransport::PING_ECHO_CASES {
+            let mut t = TestTransport::with_capacity(4096);
+            let mut d = Driver::new(7);
+            d.set_state(State::Steady);
+            d.suppress_polling_for_test();
+            d.subscribed = true;
+            let (mut prod, _cons) = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new().split();
+            let status = IngressStatus::new();
+            t.inject_server_ping(payload);
+            drive_one(
+                &mut t,
+                &mut d,
+                b"host",
+                b"/",
+                &mut prod,
+                &status,
+                &mut NullCapture,
+            )
+            .unwrap();
+            t.expect_pong_echo(payload);
+        }
+    }
+
+    #[test]
+    fn a_block_number_poll_queues_one_masked_binary_frame() {
+        let mut d = Driver::new(7);
+        d.set_state(State::Steady);
+        let before = d.ids.allocate();
+        d.next_poll_at_ns = 0;
+        maybe_queue_block_number_poll(&mut d).unwrap();
+        let mut wire = d.tx.filled().to_vec();
+        let WsReadResult::Frame { header, payload } = ws_read_frame(&wire) else {
+            panic!("the poll queued one whole frame");
+        };
+        assert_eq!(header.opcode, WsOpcode::Binary);
+        assert!(header.masked, "client frames are masked");
+        assert_eq!(
+            header.header_len as usize + header.payload_len as usize,
+            wire.len(),
+            "exactly one frame"
+        );
+        ws_unmask_in_place(&mut wire[payload.start..payload.end], header.mask);
+        let expected = format!(
+            r#"{{"jsonrpc":"2.0","id":{},"method":"eth_blockNumber","params":[]}}"#,
+            before + 1
+        );
+        assert_eq!(&wire[payload.start..payload.end], expected.as_bytes());
+        assert_eq!(d.pending_count(), 1);
+    }
+
     #[test]
     fn subscribe_response_registers_sub_id() {
         let mut t = TestTransport::with_capacity(8192);
@@ -1119,6 +1199,56 @@ mod tests {
         assert_eq!(status.bytes_total(), n as u64);
     }
 
+    /// HK2: a notification that arrives in the same read as the node's
+    /// FIN is published before the session closes. Before, the EOF set
+    /// `Closed` ahead of the state machine and the notification was
+    /// dropped.
+    #[test]
+    fn a_frame_that_arrives_with_the_fin_is_published_then_the_session_closes() {
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = Driver::new(7);
+        d.set_state(State::Steady);
+        d.suppress_polling_for_test();
+        d.subscribed = true;
+        let ring = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let status = IngressStatus::new();
+        let body = br#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0xab","result":{"number":"0x2a","timestamp":"0x65","gasUsed":"0x1"}}}"#;
+        let mut frame_buf = [0u8; 512];
+        let n = wrap_text_frame(body, &mut frame_buf);
+        t.inject_incoming(&frame_buf[..n]);
+        t.mark_closed();
+        let full = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture)
+            .unwrap();
+        assert!(!full);
+        assert!(cons.try_pop_ref().is_some(), "published before the close");
+        assert_eq!(d.state(), State::Closed);
+    }
+
+    /// HK2: a frame larger than rx fails the session at once
+    /// (`core_net::incomplete_frame`). Before, the drain returned `Ok` on
+    /// every poll and the session stalled until the idle timeout.
+    #[test]
+    fn a_frame_larger_than_rx_fails_the_session_instead_of_stalling() {
+        let mut t = TestTransport::with_capacity(RX_BUF_SIZE + 1024);
+        let mut d = Driver::new(7);
+        d.set_state(State::Steady);
+        d.suppress_polling_for_test();
+        d.subscribed = true;
+        let ring = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let status = IngressStatus::new();
+        let huge = (RX_BUF_SIZE as u64 + 4096).to_be_bytes();
+        let mut frame = vec![0u8; RX_BUF_SIZE + 512];
+        frame[0] = 0x81;
+        frame[1] = 127;
+        frame[2..10].copy_from_slice(&huge);
+        t.inject_incoming(&frame);
+        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture)
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
     #[test]
     fn new_head_notification_emits_warm_signal() {
         let mut t = TestTransport::with_capacity(8192);
@@ -1150,7 +1280,7 @@ mod tests {
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.ring_drops_total(), 0);
 
-        let sig = cons.try_pop().expect("signal must be pushed");
+        let sig = *cons.try_pop_ref().expect("signal must be pushed");
         assert_eq!(sig.sym, SYMBOL_ID_NONE);
         assert!(matches!(sig.class, LatencyClass::Warm));
         assert_eq!(sig.source, SignalSource::Rpc as u8);
@@ -1160,6 +1290,42 @@ mod tests {
         assert_eq!(number, 0x2A);
         assert_eq!(ts, 0x65);
         assert_eq!(gas, 0x1);
+    }
+
+    /// I-3: a burst of non-signal frames past a full rx no longer strands
+    /// what follows it until the next readiness edge — one drain reads it
+    /// all, the head behind it included; a backlog past `DRAIN_STEP_CAP`
+    /// full-rx steps ends `Capped` (the loop re-polls at once) and the
+    /// next drain finishes it.
+    #[test]
+    fn drive_until_idle_reads_past_a_full_rx_and_caps_a_backlog() {
+        let body = br#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0xab","result":{"number":"0x2a","timestamp":"0x65","gasUsed":"0x1"}}}"#;
+        let mut frame_buf = [0u8; 512];
+        let n = wrap_text_frame(body, &mut frame_buf);
+        for (fills, first) in [(2, Drained::Idle), (core_net::DRAIN_STEP_CAP as usize, Drained::Capped)] {
+            let mut t = TestTransport::with_capacity((fills + 1) * RX_BUF_SIZE);
+            let mut d = Driver::new(7);
+            d.set_state(State::Steady);
+            d.suppress_polling_for_test();
+            d.subscribed = true;
+            let (mut prod, mut cons) = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new().split();
+            let status = IngressStatus::new();
+            t.inject_server_pongs(fills * RX_BUF_SIZE);
+            t.inject_incoming(&frame_buf[..n]);
+            assert_eq!(
+                drive_until_idle(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture),
+                first
+            );
+            if first == Drained::Capped {
+                assert!(cons.try_pop_ref().is_none(), "the head still waits below the cap");
+                assert_eq!(
+                    drive_until_idle(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture),
+                    Drained::Idle
+                );
+            }
+            assert_eq!(cons.try_pop_ref().expect("the head behind the burst").sym, SYMBOL_ID_NONE);
+            assert_eq!(t.incoming_len(), 0, "every byte was read");
+        }
     }
 
     #[test]
@@ -1193,7 +1359,7 @@ mod tests {
         .unwrap();
         assert_eq!(status.msgs_total(), 1);
 
-        let sig = cons.try_pop().expect("signal must be pushed");
+        let sig = *cons.try_pop_ref().expect("signal must be pushed");
         assert!(matches!(sig.class, LatencyClass::Warm));
         assert_eq!(sig.source, SignalSource::Rpc as u8);
         let block = u64::from_le_bytes(sig.payload[0..8].try_into().unwrap());
@@ -1547,7 +1713,7 @@ mod tests {
             SignalSource::Rpc as u8,
             [0u8; 40],
         );
-        while prod.try_push(filler).is_ok() {}
+        while prod.try_push_ref(&filler) {}
         let n = wrap_text_frame(head, &mut frame_buf);
         t.inject_incoming(&frame_buf[..n]);
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();

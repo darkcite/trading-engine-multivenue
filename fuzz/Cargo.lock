@@ -21,7 +21,6 @@ checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 name = "book-builder"
 version = "0.1.0"
 dependencies = [
- "core-ring",
  "core-time",
  "core-types",
 ]
@@ -55,10 +54,13 @@ dependencies = [
  "core-time",
  "core-types",
  "memchr",
- "mio",
  "rustls",
  "signer-eip712",
 ]
+
+[[package]]
+name = "core-amm"
+version = "0.1.0"
 
 [[package]]
 name = "core-config"
@@ -80,6 +82,7 @@ version = "0.1.0"
 name = "core-fill"
 version = "0.1.0"
 dependencies = [
+ "core-amm",
  "core-types",
 ]
 
@@ -90,6 +93,10 @@ dependencies = [
  "core-types",
  "libc",
 ]
+
+[[package]]
+name = "core-latency"
+version = "0.1.0"
 
 [[package]]
 name = "core-metrics"
@@ -143,6 +150,8 @@ name = "core-vol"
 version = "0.1.0"
 dependencies = [
  "core-regime",
+ "core-time",
+ "core-types",
 ]
 
 [[package]]
@@ -158,6 +167,68 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
+name = "exec-binance"
+version = "0.1.0"
+dependencies = [
+ "clob-dispatcher",
+ "core-config",
+ "core-crypto",
+ "core-fill",
+ "core-io",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "exec-gateway",
+ "ingress-binance",
+ "mio",
+ "rustls",
+ "signer-ed25519",
+ "zeroize",
+]
+
+[[package]]
+name = "exec-gateway"
+version = "0.1.0"
+dependencies = [
+ "core-latency",
+ "core-net",
+ "core-ring",
+]
+
+[[package]]
+name = "exec-hypercall"
+version = "0.1.0"
+dependencies = [
+ "clob-dispatcher",
+ "core-config",
+ "core-fill",
+ "core-net",
+ "core-parse",
+ "core-time",
+ "core-types",
+ "mio",
+ "rustls",
+ "secp256k1",
+ "signer-eip712",
+ "zeroize",
+]
+
+[[package]]
+name = "exec-hyperevm"
+version = "0.1.0"
+dependencies = [
+ "core-config",
+ "core-net",
+ "core-parse",
+ "ingress-hyperevm",
+ "ingress-rpc",
+ "signer-eip712",
+ "signer-evm",
+]
+
+[[package]]
 name = "exec-hyperliquid"
 version = "0.1.0"
 dependencies = [
@@ -168,7 +239,9 @@ dependencies = [
  "core-net",
  "core-parse",
  "core-ring",
+ "core-time",
  "core-types",
+ "exec-gateway",
  "mio",
  "rustls",
  "secp256k1",
@@ -265,7 +338,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "ingress-hypercall"
+version = "0.1.0"
+dependencies = [
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "memchr",
+ "mio",
+ "options-select",
+]
+
+[[package]]
+name = "ingress-hyperevm"
+version = "0.1.0"
+dependencies = [
+ "core-amm",
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "ingress-rpc",
+ "memchr",
+ "mio",
+]
+
+[[package]]
 name = "ingress-hyperliquid"
+version = "0.1.0"
+dependencies = [
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "memchr",
+ "mio",
+]
+
+[[package]]
+name = "ingress-mexc"
 version = "0.1.0"
 dependencies = [
  "core-metrics",
@@ -388,22 +506,31 @@ version = "0.0.0"
 dependencies = [
  "book-builder",
  "clob-dispatcher",
+ "core-amm",
  "core-config",
  "core-crypto",
+ "core-fill",
  "core-net",
  "core-parse",
  "core-types",
+ "exec-binance",
+ "exec-hypercall",
+ "exec-hyperevm",
  "exec-hyperliquid",
  "ingress-ai",
  "ingress-binance",
  "ingress-bybit",
  "ingress-deribit",
+ "ingress-hypercall",
+ "ingress-hyperevm",
  "ingress-hyperliquid",
+ "ingress-mexc",
  "ingress-okx",
  "ingress-polymarket",
  "ingress-rpc",
  "libfuzzer-sys",
  "signer-eip712",
+ "signer-evm",
 ]
 
 [[package]]
@@ -503,6 +630,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "signer-ed25519"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "libc",
+ "ring",
+]
+
+[[package]]
 name = "signer-eip712"
 version = "0.1.0"
 dependencies = [
@@ -511,6 +647,13 @@ dependencies = [
  "secp256k1",
  "tiny-keccak",
  "zeroize",
+]
+
+[[package]]
+name = "signer-evm"
+version = "0.1.0"
+dependencies = [
+ "signer-eip712",
 ]
 
 [[package]]

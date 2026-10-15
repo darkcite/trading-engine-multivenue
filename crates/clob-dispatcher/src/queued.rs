@@ -5,8 +5,9 @@
 //!
 //! Decouples the engine's hot path from network I/O. The strategy
 //! calls `QueuedDispatcher::submit(&order)`, which is a single SPSC
-//! ring push — never blocks. A dedicated worker thread pops from
-//! the ring and calls the real inner [`OrderDispatch::submit`].
+//! ring push (one copy, `&order` → the slot) — never blocks. A
+//! dedicated worker thread reads each order in its slot and calls the
+//! real inner [`OrderDispatch::submit`].
 //!
 //! ## Why
 //!
@@ -47,7 +48,7 @@
 //! the inline dispatcher's QueueFull bucket.
 
 use core_ring::{Consumer, Producer, Ring};
-use core_types::{Fill, Order};
+use core_types::{CancelReq, Fill, ModifyReq, Order};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -110,9 +111,24 @@ impl OrderDispatch for QueuedDispatcher {
     /// Never touches the network; zero-alloc.
     #[inline]
     fn submit(&mut self, order: &Order) -> Result<(), DispatchError> {
-        self.producer
-            .try_push(*order)
-            .map_err(|_| DispatchError::QueueFull)
+        if self.producer.try_push_ref(order) {
+            Ok(())
+        } else {
+            Err(DispatchError::QueueFull)
+        }
+    }
+
+    /// The ring carries orders only: a lifecycle verb cannot reach the
+    /// worker, so it is refused here, in writing (BX3, O-BX19).
+    #[inline]
+    fn cancel(&mut self, _req: &CancelReq) -> Result<(), DispatchError> {
+        Err(DispatchError::Unsupported)
+    }
+
+    /// As [`Self::cancel`].
+    #[inline]
+    fn modify(&mut self, _req: &ModifyReq) -> Result<(), DispatchError> {
+        Err(DispatchError::Unsupported)
     }
 
     /// Fills flow through a separate path (engine fill ring); the
@@ -138,12 +154,14 @@ impl<D: OrderDispatch + Send + 'static> DispatcherWorker<D> {
     /// flips to true. This is the thread entry point — call from
     /// `std::thread::spawn`.
     ///
-    /// Hot loop: try_pop → inner.submit → mirror stats via
-    /// `DispatchStatsAtomic::store_from`. No lock, no contention.
+    /// Hot loop: try_pop_ref → inner.submit (the order read in its
+    /// slot, which goes back to the engine once the submit returns) →
+    /// mirror stats via `DispatchStatsAtomic::store_from`. No lock, no
+    /// contention.
     /// On empty, sleep [`WORKER_IDLE_BACKOFF`] to avoid CPU burn.
     pub fn run(mut self, stop: &AtomicBool) {
         while !stop.load(Ordering::Acquire) {
-            match self.consumer.try_pop() {
+            match self.consumer.try_pop_ref() {
                 Some(order) => {
                     let _ = self.inner.submit(&order);
                     self.stats.store_from(&self.inner.stats());
@@ -165,7 +183,7 @@ impl<D: OrderDispatch + Send + 'static> DispatcherWorker<D> {
         // Drain anything left in the ring on shutdown so an
         // operator-visible "5 orders still queued at SIGINT"
         // doesn't silently disappear into the void.
-        while let Some(order) = self.consumer.try_pop() {
+        while let Some(order) = self.consumer.try_pop_ref() {
             let _ = self.inner.submit(&order);
         }
         self.stats.store_from(&self.inner.stats());

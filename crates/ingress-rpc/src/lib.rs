@@ -202,6 +202,16 @@ pub struct NewHead {
 }
 
 impl NewHead {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        number: 0,
+        ts_sec: 0,
+        gas_used: 0,
+        _pad: [0; 40],
+    };
+}
+
+impl NewHead {
     /// Field-free constructor. `pub(crate)` so the run-loop and tests
     /// can synthesise heads without exposing the private `_pad`.
     #[inline(always)]
@@ -231,8 +241,20 @@ impl NewHead {
 ///    "result":{"number":"0x1a","timestamp":"0x65a...","gasUsed":"0x7a12","hash":"0x...", ...}
 /// }}
 /// ```
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_new_head_notification(buf: &[u8]) -> Option<NewHead> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_new_head_notification(buf: &[u8], out: &mut NewHead) -> bool {
+    parse_new_head_notification_fill(buf, out).is_some()
+}
+
+/// [`parse_new_head_notification`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_new_head_notification_fill(buf: &[u8], out: &mut NewHead) -> Option<()> {
     let pos = find_field(buf, b"\"number\":")?;
     let pos = skip_byte(buf, pos, b'"');
     let (number, _) = parse_hex_u64(buf, pos)?;
@@ -250,7 +272,8 @@ pub fn parse_new_head_notification(buf: &[u8]) -> Option<NewHead> {
         .map(|(v, _)| v)
         .unwrap_or(0);
 
-    Some(NewHead::new(number, ts_sec, gas_used))
+    *out = NewHead::new(number, ts_sec, gas_used);
+    Some(())
 }
 
 // ---------------------------------------------------------------
@@ -304,104 +327,87 @@ pub fn parse_rpc_error(buf: &[u8]) -> Option<RpcError> {
 }
 
 // ---------------------------------------------------------------
-// Request serializers (zero-alloc; write into caller's buffer)
+// Requests as wire parts (zero-alloc, zero-copy)
 // ---------------------------------------------------------------
 
-/// Serialization error. Mirrors the shape used in core-net.
+/// Serialization error of the JSON-RPC request writers built on this
+/// crate's envelope (`ingress-hyperevm`, `exec-hyperevm`). Mirrors the
+/// shape used in core-net.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RpcWriteErr {
     /// Destination slice too small.
     BufferTooSmall,
 }
 
-/// Write an `eth_blockNumber` request into `dst`. Returns bytes
-/// written. Zero-alloc.
-///
-/// Shape:
-/// ```text
-/// {"jsonrpc":"2.0","id":<id>,"method":"eth_blockNumber","params":[]}
-/// ```
+/// Every request's head, up to its id.
+const REQ_HEAD: &[u8] = br#"{"jsonrpc":"2.0","id":"#;
+
+/// `{"jsonrpc":"2.0","id":<id>,"method":"eth_blockNumber","params":[]}`
+/// as wire parts for `core_net::queue_masked_binary_frame_parts`: the
+/// id's digits render into `digits`, and the frame serialiser masks each
+/// part straight into tx — the request is never assembled first.
 #[inline]
-pub fn write_request_eth_block_number(dst: &mut [u8], id: u64) -> Result<usize, RpcWriteErr> {
-    const PREFIX: &[u8] = br#"{"jsonrpc":"2.0","id":"#;
-    const SUFFIX: &[u8] = br#","method":"eth_blockNumber","params":[]}"#;
-
-    // Worst-case id length: 20 digits (u64::MAX).
-    let mut tmp = [0u8; 20];
-    let id_len = format_u64(&mut tmp, id);
-
-    let total = PREFIX.len() + id_len + SUFFIX.len();
-    if dst.len() < total {
-        return Err(RpcWriteErr::BufferTooSmall);
-    }
-
-    let mut o = 0usize;
-    dst[o..o + PREFIX.len()].copy_from_slice(PREFIX);
-    o += PREFIX.len();
-    dst[o..o + id_len].copy_from_slice(&tmp[..id_len]);
-    o += id_len;
-    dst[o..o + SUFFIX.len()].copy_from_slice(SUFFIX);
-    o += SUFFIX.len();
-    debug_assert_eq!(o, total);
-    Ok(total)
+#[must_use]
+pub fn eth_block_number_request_parts(id: u64, digits: &mut [u8; 20]) -> [&[u8]; 3] {
+    [
+        REQ_HEAD,
+        format_u64(id, digits),
+        br#","method":"eth_blockNumber","params":[]}"#,
+    ]
 }
 
-/// Write an `eth_subscribe(newHeads)` request into `dst`.
-///
-/// Shape:
-/// ```text
-/// {"jsonrpc":"2.0","id":<id>,"method":"eth_subscribe","params":["newHeads"]}
-/// ```
+/// `{"jsonrpc":"2.0","id":<id>,"method":"eth_subscribe","params":["newHeads"]}`
+/// as wire parts — the contract of [`eth_block_number_request_parts`].
 #[inline]
-pub fn write_request_subscribe_new_heads(dst: &mut [u8], id: u64) -> Result<usize, RpcWriteErr> {
-    const PREFIX: &[u8] = br#"{"jsonrpc":"2.0","id":"#;
-    const SUFFIX: &[u8] = br#","method":"eth_subscribe","params":["newHeads"]}"#;
-
-    let mut tmp = [0u8; 20];
-    let id_len = format_u64(&mut tmp, id);
-
-    let total = PREFIX.len() + id_len + SUFFIX.len();
-    if dst.len() < total {
-        return Err(RpcWriteErr::BufferTooSmall);
-    }
-
-    let mut o = 0usize;
-    dst[o..o + PREFIX.len()].copy_from_slice(PREFIX);
-    o += PREFIX.len();
-    dst[o..o + id_len].copy_from_slice(&tmp[..id_len]);
-    o += id_len;
-    dst[o..o + SUFFIX.len()].copy_from_slice(SUFFIX);
-    debug_assert_eq!(o + SUFFIX.len(), total);
-    Ok(total)
+#[must_use]
+pub fn subscribe_new_heads_request_parts(id: u64, digits: &mut [u8; 20]) -> [&[u8]; 3] {
+    [
+        REQ_HEAD,
+        format_u64(id, digits),
+        br#","method":"eth_subscribe","params":["newHeads"]}"#,
+    ]
 }
 
-/// Format a u64 into a byte buffer; returns number of bytes written.
-/// Zero-alloc. Max output length is 20 bytes.
+/// `v` in decimal, rendered right-aligned into `digits` (20 = the digit
+/// count of `u64::MAX`); the returned tail IS the number — nothing is
+/// copied. Zero-alloc.
 #[inline]
-fn format_u64(buf: &mut [u8], mut v: u64) -> usize {
-    if v == 0 {
-        buf[0] = b'0';
-        return 1;
-    }
-    let mut tmp = [0u8; 20];
-    let mut i = tmp.len();
-    while v > 0 {
+fn format_u64(mut v: u64, digits: &mut [u8; 20]) -> &[u8] {
+    let mut i = digits.len();
+    loop {
         i -= 1;
-        tmp[i] = b'0' + (v % 10) as u8;
+        digits[i] = b'0' + (v % 10) as u8;
         v /= 10;
+        if v == 0 {
+            break;
+        }
     }
-    let n = tmp.len() - i;
-    buf[..n].copy_from_slice(&tmp[i..]);
-    n
+    &digits[i..]
 }
 
 // ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
 
+/// Test views in the old by-value shape, shared by the unit and the
+/// property tests: each wraps one in-place parser and hands back its
+/// frame's `Option`, so assertions read naturally. Cold — production
+/// callers parse in place.
+#[cfg(test)]
+mod views {
+    // COPY: `Option<NewHead>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_new_head_notification_view(buf: &[u8]) -> Option<crate::NewHead> {
+        let mut f = crate::NewHead::ZERO;
+        crate::parse_new_head_notification(buf, &mut f).then_some(f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::views::*;
 
     #[test]
     fn request_ids_are_monotonic() {
@@ -491,7 +497,7 @@ mod tests {
     fn parse_new_head_happy() {
         let b = br#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0xab",
             "result":{"number":"0x1a","timestamp":"0x65a1","gasUsed":"0x7a12","hash":"0xdeadbeef"}}}"#;
-        let h = parse_new_head_notification(b).unwrap();
+        let h = parse_new_head_notification_view(b).unwrap();
         assert_eq!(h.number, 0x1A);
         assert_eq!(h.ts_sec, 0x65A1);
         assert_eq!(h.gas_used, 0x7A12);
@@ -501,7 +507,7 @@ mod tests {
     fn parse_new_head_tolerates_missing_optional_fields() {
         // No timestamp or gasUsed.
         let b = br#"{"params":{"result":{"number":"0x2a","hash":"0xabc"}}}"#;
-        let h = parse_new_head_notification(b).unwrap();
+        let h = parse_new_head_notification_view(b).unwrap();
         assert_eq!(h.number, 0x2A);
         assert_eq!(h.ts_sec, 0);
         assert_eq!(h.gas_used, 0);
@@ -510,7 +516,7 @@ mod tests {
     #[test]
     fn parse_new_head_requires_number() {
         let b = br#"{"params":{"result":{"hash":"0xabc"}}}"#;
-        assert!(parse_new_head_notification(b).is_none());
+        assert!(parse_new_head_notification_view(b).is_none());
     }
 
     #[test]
@@ -545,49 +551,32 @@ mod tests {
         assert!(parse_rpc_error(b).is_none());
     }
 
-    // ---- Request writers ----
+    // ---- Requests as wire parts ----
 
     #[test]
-    fn write_eth_block_number_roundtrip() {
-        let mut dst = [0u8; 128];
-        let n = write_request_eth_block_number(&mut dst, 7).unwrap();
+    fn eth_block_number_request_parts_pin_the_bytes() {
+        let mut digits = [0u8; 20];
         assert_eq!(
-            &dst[..n],
+            eth_block_number_request_parts(7, &mut digits).concat(),
             br#"{"jsonrpc":"2.0","id":7,"method":"eth_blockNumber","params":[]}"#
         );
     }
 
     #[test]
-    fn write_eth_block_number_buffer_too_small() {
-        let mut dst = [0u8; 10];
+    fn subscribe_new_heads_request_parts_pin_the_bytes() {
+        let mut digits = [0u8; 20];
         assert_eq!(
-            write_request_eth_block_number(&mut dst, 1),
-            Err(RpcWriteErr::BufferTooSmall)
-        );
-    }
-
-    #[test]
-    fn write_subscribe_new_heads_roundtrip() {
-        let mut dst = [0u8; 128];
-        let n = write_request_subscribe_new_heads(&mut dst, 99).unwrap();
-        assert_eq!(
-            &dst[..n],
+            subscribe_new_heads_request_parts(99, &mut digits).concat(),
             br#"{"jsonrpc":"2.0","id":99,"method":"eth_subscribe","params":["newHeads"]}"#
         );
     }
 
     #[test]
-    fn format_u64_zero() {
-        let mut buf = [0u8; 20];
-        let n = format_u64(&mut buf, 0);
-        assert_eq!(&buf[..n], b"0");
-    }
-
-    #[test]
-    fn format_u64_max() {
-        let mut buf = [0u8; 20];
-        let n = format_u64(&mut buf, u64::MAX);
-        assert_eq!(&buf[..n], b"18446744073709551615");
+    fn format_u64_renders_zero_one_and_max() {
+        let mut digits = [0u8; 20];
+        assert_eq!(format_u64(0, &mut digits), b"0");
+        assert_eq!(format_u64(1, &mut digits), b"1");
+        assert_eq!(format_u64(u64::MAX, &mut digits), b"18446744073709551615");
     }
 }
 
@@ -600,6 +589,7 @@ mod tests {
 mod proptests {
     use super::*;
     use proptest::prelude::*;
+    use super::views::*;
 
     proptest! {
         #[test]
@@ -623,7 +613,7 @@ mod proptests {
                 &mut buf,
                 r#"{{"params":{{"result":{{"number":"0x{number:x}","timestamp":"0x{ts:x}"}}}}}}"#,
             ).unwrap();
-            let h = parse_new_head_notification(buf.as_bytes()).unwrap();
+            let h = parse_new_head_notification_view(buf.as_bytes()).unwrap();
             prop_assert_eq!(h.number, number);
             prop_assert_eq!(h.ts_sec, ts);
         }
@@ -633,15 +623,15 @@ mod proptests {
             let _ = classify_rpc(&buf);
             let _ = parse_hex_u64(&buf, 0);
             let _ = parse_block_number_result(&buf);
-            let _ = parse_new_head_notification(&buf);
+            let _ = parse_new_head_notification_view(&buf);
             let _ = parse_rpc_error(&buf);
         }
 
         #[test]
         fn eth_block_number_request_contains_id(id in 0u64..u64::MAX) {
-            let mut dst = [0u8; 128];
-            let n = write_request_eth_block_number(&mut dst, id).unwrap();
-            let frame = &dst[..n];
+            let mut digits = [0u8; 20];
+            let request = eth_block_number_request_parts(id, &mut digits).concat();
+            let frame = &request[..];
             // Frame contains `"id":<id>,"`
             let mut expected = String::new();
             use std::fmt::Write;

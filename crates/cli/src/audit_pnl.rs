@@ -69,10 +69,11 @@
 use std::collections::BTreeMap;
 use std::io;
 
-/// VX-A: one underlying observation awaiting a wall stamp. The rebase
-/// `wall = run.epoch_ns + (raw_ts − ts_first)` needs the run's first
-/// tick, which is only known once the run's events are sorted, so the
-/// observations are collected first and resolved after.
+/// VX-A: one underlying observation awaiting a wall stamp. The run's
+/// wall clock (`backtest::clock::RunClock`, BIN15 S2) needs the run's
+/// first tick and its venue offset, which are only known once the run's
+/// events are loaded and sorted, so the observations are collected first
+/// and resolved after.
 #[derive(Copy, Clone, Debug)]
 struct OptSettleCand {
     sym: u32,
@@ -84,8 +85,8 @@ use std::path::{Path, PathBuf};
 
 use core_io::{PmlrReader, SlotKind};
 use core_types::{
-    AiCmd, AiCmdKind, ChannelEvent, ChannelId, Fill, OptSummary, Order, Price, Qty, Side, Tick,
-    VenueId, REGIME_PROFILES, SYMBOL_ID_NONE,
+    AiCmd, AiCmdKind, ChannelEvent, ChannelId, Fill, OptSummary, Order, OrderEvent, Price, Qty,
+    Side, Tick, TradePrint, VenueId, REGIME_PROFILES, SYMBOL_ID_NONE,
 };
 
 use crate::backtest::fill::{usd_1e12_to_1e6_ceil, usd_1e12_to_1e6_floor};
@@ -132,9 +133,20 @@ pub const AUDIT_PNL_VERSION: u32 = 2;
 /// was unlinked and the slot is held for `strategy-xsd`: rows under slot
 /// 2 in a capture taken BEFORE that date are cross-arb rows wearing this
 /// label; between XSD-S and the XSD-3 wiring the slot emits nothing.
+///
+/// **Slot 0 changed meaning on 2026-09-23 (HYPARB H0).**
+/// `strategy-latency-arb` was unlinked (O-H1) and the slot is the
+/// hyparb member: rows under slot 0 in a capture taken BEFORE that date
+/// are latency-arb rows wearing this label (it was OFF in every wrapper
+/// mask, so a live capture carries none).
+///
+/// **Slot 6 changed meaning on 2026-09-26 (XMM XH1).** `strategy-icdp`
+/// was unlinked (it keeps its offline `backtest --member icdp`) and the
+/// slot is the xmm member: rows under slot 6 in a capture taken BEFORE
+/// that date are icdp paper rows wearing this label.
 fn strategy_label(id: u8) -> &'static str {
     match id {
-        0 => "latency-arb",
+        0 => "hyparb",
         1 => "vrp",
         2 => "xsd",
         // BIN15 O4b (2026-09-12): slot 3 is bin15. The NUMBER is
@@ -145,7 +157,9 @@ fn strategy_label(id: u8) -> &'static str {
         3 => "bin15",
         4 => "ai-exec",
         5 => "vm",
-        6 => "icdp",
+        6 => "xmm",
+        // HC11 (2026-09-26): slot 7 was reserved until the hcv member.
+        7 => "hcv",
         0xFF => "unattributed",
         _ => "unknown",
     }
@@ -187,10 +201,14 @@ pub struct AuditPnlConfig {
 /// declarations land between ticks and fills — the detector sees them
 /// before the intents of the same instant are bucketed).
 const CLASS_TICK: u8 = 0;
-const CLASS_REGIME: u8 = 1;
-const CLASS_FILL: u8 = 2;
-const CLASS_COMMIT: u8 = 3;
-const CLASS_ORDER: u8 = 4;
+/// XMM XH3: a queue venue's trade print — after the books of its
+/// instant (the engine's trade lane runs after the tick lanes), before
+/// anything else. Renumbering the classes below it keeps their order.
+const CLASS_TRADE: u8 = 1;
+const CLASS_REGIME: u8 = 2;
+const CLASS_FILL: u8 = 3;
+const CLASS_COMMIT: u8 = 4;
+const CLASS_ORDER: u8 = 5;
 
 #[derive(Copy, Clone, Debug)]
 enum Payload {
@@ -202,6 +220,9 @@ enum Payload {
     Funding(ChannelEvent),
     /// RG3: a captured `SetRegime` frame.
     Regime(AiCmd),
+    /// XMM XH3: a queue venue's trade print (sym dense) — what fills a
+    /// post-only maker under the queue law.
+    Trade(TradePrint),
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -471,6 +492,16 @@ struct RunLoad {
     funding_events: u64,
     regime_cmds: u64,
     regime_cmds_dropped: u64,
+    /// XMM XH3: queue-venue trade prints loaded (the queue law's input)
+    /// and the post-only placements they can fill.
+    trades: u64,
+    queue_orders: u64,
+    /// BIN15 S2: `(venue_time − ts, first sampled stamp)` over the run's
+    /// first Hyperliquid stamps — the SAME fit and law as `backtest`
+    /// (`backtest::clock`); `None` = the old anchor law (or a refused fit).
+    venue_fit: Option<(i64, u64)>,
+    /// BIN15 S2: the clock tell (silent on the anchor law).
+    wall_tell: crate::backtest::clock::ClockTell,
 }
 
 /// Load one run: every §9.9 input, syms rewritten to root-dense ids,
@@ -480,7 +511,7 @@ fn load_run_events(
     interner: &mut SymInterner,
     opt_out: &mut AuditOptOut,
     bin_out: &mut AuditBinOut,
-    stale_after_ms: [u32; 7],
+    stale_after_ms: [u32; core_types::VENUE_COUNT],
 ) -> Result<(Vec<Ev>, RunLoad), HarnessError> {
     let mut load = RunLoad {
         epoch_ns: run.epoch_ns,
@@ -539,6 +570,8 @@ fn load_run_events(
         };
 
     let mut evs: Vec<Ev> = Vec::new();
+    // BIN15 S2: the run's venue clock, from its first Hyperliquid stamps.
+    let mut venue_fit = crate::backtest::clock::VenueOffsetFit::new();
 
     // Ticks (per-venue files, harness acceptance law).
     for (lord, label) in VENUE_LABELS.iter().enumerate() {
@@ -547,7 +580,11 @@ fn load_run_events(
             continue;
         };
         let has_venue_time = reader.has_venue_time();
+        let fit_here = has_venue_time && *label == "hl";
         for (i, t) in reader.records().iter().enumerate() {
+            if fit_here {
+                venue_fit.observe(t);
+            }
             if t.sym == SYMBOL_ID_NONE {
                 continue;
             }
@@ -742,6 +779,11 @@ fn load_run_events(
         for (i, o) in reader.records().iter().enumerate() {
             let mut order = *o;
             order.sym = resolve(o.sym, interner, &mut load)?;
+            if o.verb == core_types::ORDER_VERB_PLACE
+                && core_fill::judged_by_queue(core_types::symbol_venue_byte(o.sym), o.kind, o.flags)
+            {
+                load.queue_orders += 1;
+            }
             evs.push(Ev {
                 ts_ns: o.ts_ns,
                 class: CLASS_ORDER,
@@ -798,6 +840,14 @@ fn load_run_events(
         .map(|e| e.ts_ns)
         .min()
         .unwrap_or(0);
+    // XMM XH3: the run's last tick — a print past it can fill nothing
+    // this surface would still mark, and must not move the window's end.
+    let tick_last = evs
+        .iter()
+        .filter(|e| e.class == CLASS_TICK)
+        .map(|e| e.ts_ns)
+        .max()
+        .unwrap_or(0);
     for (lord_off, label) in VENUE_LABELS.iter().enumerate() {
         let path = run.path.join(format!("{label}-events.pmlr"));
         let Some(reader) = open_checked::<ChannelEvent>(&path, SlotKind::Event, run.epoch_ns)?
@@ -805,6 +855,36 @@ fn load_run_events(
             continue;
         };
         for (i, e) in reader.records().iter().enumerate() {
+            // XMM XH3: a queue venue's prints fill its post-only makers
+            // (`core_fill::queue`); without them a slot-6 order could
+            // never fill here and its shadow P&L would read flat. Loaded
+            // only for a run that HAS such an order (the order file is
+            // read above), and only inside its ticks — so every other
+            // run, and every other member's window, reports exactly as
+            // before.
+            if e.channel == ChannelId::Trade as u8 {
+                if load.queue_orders == 0
+                    || !core_fill::queue_venue(e.venue)
+                    || e.sym == SYMBOL_ID_NONE
+                    || e.ts_ns < tick_anchor
+                    || e.ts_ns > tick_last
+                {
+                    continue;
+                }
+                let mut p = TradePrint::ZERO;
+                if TradePrint::read_trade_event(e, &mut p) {
+                    p.sym = resolve(e.sym, interner, &mut load)?;
+                    evs.push(Ev {
+                        ts_ns: p.ts_ns,
+                        class: CLASS_TRADE,
+                        lord: 100 + lord_off as u8,
+                        idx: i as u64,
+                        payload: Payload::Trade(p),
+                    });
+                    load.trades += 1;
+                }
+                continue;
+            }
             let keep =
                 e.channel == ChannelId::Funding as u8 || e.channel == ChannelId::AssetCtx as u8;
             if !keep || e.sym == SYMBOL_ID_NONE {
@@ -842,21 +922,36 @@ fn load_run_events(
     // §3.2 total order, extended: (ts, class, lord, idx) — unique by
     // construction, so sort_unstable stays deterministic.
     evs.sort_unstable_by_key(|e| (e.ts_ns, e.class, e.lord, e.idx));
+    // BIN15 S2: the run's WALL clock — the venue's when its HL ticks
+    // carry it, else the old anchor law bit for bit. ONE mapping for the
+    // merge below, the option settlement index, the fee book and the
+    // HIP-4 schedule (`backtest::clock`, shared with `backtest`).
+    load.venue_fit = venue_fit.fit();
+    let (run_clock, tell) = crate::backtest::clock::RunClock::choose(
+        run.epoch_ns,
+        evs.first().map_or(0, |e| e.ts_ns),
+        load.venue_fit,
+    );
+    load.wall_tell = tell;
+    // The merge re-derives the clock from the fit; a refused fit must not
+    // come back there as the venue law.
+    if matches!(tell, crate::backtest::clock::ClockTell::Refused { .. }) {
+        load.venue_fit = None;
+    }
     // VX-A: stamp every settlement candidate with its WALL instant and
     // keep, per contract, the latest one at or before its own expiry.
-    // `wall = run.epoch_ns + (raw_ts − ts_first)` is the same rebase
-    // the merge applies, so the two clocks agree by construction rather
-    // than by coincidence. Deribit keeps printing an expired instrument
-    // for 9–19 min after settlement, and on a $79k index the drift over
-    // that lag is worth more than the option's whole premium — so the
-    // cut-off is the point of the rung, not a nicety.
+    // `run_clock` is the same rebase the merge applies, so the two
+    // clocks agree by construction rather than by coincidence. Deribit
+    // keeps printing an expired instrument for 9–19 min after
+    // settlement, and on a $79k index the drift over that lag is worth
+    // more than the option's whole premium — so the cut-off is the point
+    // of the rung, not a nicety.
     if !evs.is_empty() {
-        let ts_first = evs[0].ts_ns;
         for c in &settle_cand {
             let Some(r) = opt_out.settle_ref.get_mut(&c.sym) else {
                 continue;
             };
-            let wall = run.epoch_ns + c.raw_ts_ns.saturating_sub(ts_first);
+            let wall = run_clock.wall_of(c.raw_ts_ns);
             if wall <= r.expiry_ns && wall >= r.index_wall_ns {
                 r.index_1e6 = c.index_1e6;
                 r.index_wall_ns = wall;
@@ -867,7 +962,7 @@ fn load_run_events(
         // fee reads back, so the number the fee sees is exactly the
         // number the summary carried.
         for c in &fee_cand {
-            let wall = run.epoch_ns + c.raw_ts_ns.saturating_sub(ts_first);
+            let wall = run_clock.wall_of(c.raw_ts_ns);
             opt_out.index_book.observe(
                 c.sym,
                 wall,
@@ -888,8 +983,7 @@ fn load_run_events(
     // also OKX's mark-price channel, which every historical root
     // carries in bulk.
     if !evs.is_empty() {
-        let ts_first = evs[0].ts_ns;
-        let wall_of = |raw: u64| run.epoch_ns + raw.saturating_sub(ts_first);
+        let wall_of = |raw: u64| run_clock.wall_of(raw);
         // The underlyings this run's manifest actually names, by
         // descriptor — built from the manifest, which is read at the
         // top of this function, so the filter never needs a sym it has
@@ -971,6 +1065,7 @@ fn load_run_events(
                         created_ns: wall_of(e.ts_ns),
                         expiry_ns: e.v1 as u64,
                         twap_ns: u64::from(twap_s) * 1_000_000_000,
+                        next_strike_1e6: 0,
                     });
                 } else if e.channel == ChannelId::Mark as u8 && e.v0 > 0 {
                     let Some(d) = desc else { continue };
@@ -1000,7 +1095,7 @@ fn load_and_merge_events(
     interner: &mut SymInterner,
     opt_out: &mut AuditOptOut,
     bin_out: &mut AuditBinOut,
-    stale_after_ms: [u32; 7],
+    stale_after_ms: [u32; core_types::VENUE_COUNT],
 ) -> Result<(Vec<MergedEv>, Vec<RunLoad>), HarnessError> {
     let epoch_0 = runs[0].epoch_ns;
     let mut merged: Vec<MergedEv> = Vec::new();
@@ -1023,6 +1118,10 @@ fn load_and_merge_events(
         }
         debug_assert!(matches!(evs[0].payload, Payload::Tick(_)));
         let ts_first = evs[0].ts_ns;
+        // BIN15 S2: the same clock `load_run_events` stamped the option
+        // and HIP-4 schedules with (`backtest::clock`).
+        let (run_clock, _) =
+            crate::backtest::clock::RunClock::choose(run.epoch_ns, ts_first, load.venue_fit);
         merged.reserve(evs.len());
         for e in &evs {
             // Defensive: an order/fill logged before the first tick
@@ -1037,11 +1136,12 @@ fn load_and_merge_events(
                 Payload::Tick(ref mut t) => t.ts_ns = base + delta,
                 Payload::Funding(ref mut f) => f.ts_ns = base + delta,
                 Payload::Regime(ref mut c) => c.ts_ns = base + delta,
+                Payload::Trade(ref mut p) => p.ts_ns = base + delta,
                 _ => {}
             }
             merged.push(MergedEv {
                 virt_ns: base + delta,
-                wall_ns: run.epoch_ns + delta,
+                wall_ns: run_clock.wall_of(e.ts_ns),
                 payload,
             });
         }
@@ -1115,9 +1215,15 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     // before the expiry" on a zero-TWAP instance, and a scan that
     // trusts an invariant should not have to trust that nothing ever
     // reorders the loader.
+    // BIN15 S1: a STABLE sort, as `binary::marks_by_sym` does — two marks
+    // on one stamp must carry forward in the same order on both surfaces,
+    // or the harness and the audit settle one minute two ways.
     for v in bin_out.marks.values_mut() {
-        v.sort_unstable_by_key(|(ts, _)| *ts);
+        v.sort_by_key(|(ts, _)| *ts);
     }
+    // BIN15 S1: each instance's successor strike — the venue's own
+    // settlement price — linked across runs, once every run is in.
+    crate::backtest::binary::link_successors(&mut bin_out.instances);
     for l in &loads {
         report(&format!(
             "audit-pnl: run-{}: ticks={} orders={} fills={} commits={} manifest={}{}{}{}",
@@ -1147,10 +1253,23 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                 String::new()
             },
         ));
+        // BIN15 S2: silent on the anchor law, so a root without venue
+        // stamps reports exactly as before.
+        if l.wall_tell != crate::backtest::clock::ClockTell::Silent {
+            report(&format!("audit-pnl: run-{}: {}", l.epoch_ns, l.wall_tell));
+        }
         if l.opt_synth_ticks > 0 {
             report(&format!(
                 "audit-pnl: run-{}: opt-synth-ticks={} (D-7 mark books)",
                 l.epoch_ns, l.opt_synth_ticks
+            ));
+        }
+        // XMM XH3: emitted only when a post-only maker traded, so a run
+        // without one reports exactly as before.
+        if l.queue_orders > 0 {
+            report(&format!(
+                "audit-pnl: run-{}: queue-orders={} queue-prints={} (post-only makers                  fill from prints after the displayed queue — core_fill::queue)",
+                l.epoch_ns, l.queue_orders, l.trades
             ));
         }
         // VRP V2a: emitted only when it fires, so a run carrying no
@@ -1218,31 +1337,40 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     // slot 3 goes live — an unconditional zero line on every nightly
     // report would be noise.
     if bin_out.rolls > 0 {
-        let bin_reaches = bin_out
-            .instances
-            .iter()
-            .filter(|i| i.settle_ns() <= window_end_ns)
-            .count();
+        // BIN15 S1: an instance REACHES its settlement instant at its
+        // expiry — the TWAP ends there (LAW E-11).
+        let mut bin_reaches = 0usize;
         // SETTLEABLE is the number that matters: an instance can reach
         // its settlement instant inside the window and still have no
         // payout, because the window does not hold enough of its
         // underlying's marks to average. Those mark out, and the gap
         // between these two numbers is where a report quietly stops
         // being about settlements.
-        let bin_settleable = bin_out
-            .instances
-            .iter()
-            .filter(|i| {
-                i.settle_ns() <= window_end_ns
-                    && i.expiry_ns != 0
-                    && bin_out
-                        .underlying_of
-                        .get(&i.sym_yes)
-                        .and_then(|u| bin_out.marks.get(u))
-                        .and_then(|m| crate::backtest::binary::settle_value(m, i))
-                        .is_some()
-            })
-            .count();
+        let mut bin_settleable = 0usize;
+        // BIN15 S1: the venue-published cross-check — the successor's
+        // strike IS the venue's settlement price (rounded to the strike
+        // grid), so `next_strike > strike` is the venue's own label. A
+        // disagreement with our TWAP is a FINDING, printed, never
+        // absorbed; a tie (the rounding hides the side) is not judged.
+        let mut next_checked = 0u64;
+        let mut next_disagree = 0u64;
+        for i in &bin_out.instances {
+            if !i.settle_reached(window_end_ns) {
+                continue;
+            }
+            bin_reaches += 1;
+            let value = bin_out
+                .underlying_of
+                .get(&i.sym_yes)
+                .and_then(|u| bin_out.marks.get(u))
+                .and_then(|m| crate::backtest::binary::settle_value(m, i));
+            if let Some(v) = value {
+                bin_settleable += 1;
+                let (c, d) = crate::backtest::binary::next_strike_check(i, v);
+                next_checked += c;
+                next_disagree += d;
+            }
+        }
         // An unpaired roll's positions MARK OUT instead of settling:
         // its manifest is missing the [no] leg or the underlying.
         let unpaired = if bin_out.rolls_unpaired > 0 {
@@ -1251,7 +1379,7 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             ""
         };
         report(&format!(
-            "audit-pnl: bin15 settlement table: {} of {} instance(s) settleable ({} reaching their instant) from {} roll row(s), marks={} unpaired_rolls={}{}",
+            "audit-pnl: bin15 settlement table: {} of {} instance(s) settleable ({} reaching their instant) from {} roll row(s), marks={} unpaired_rolls={}{} law=twap[T-w,T] next_strike_checked={} settle_disagree_next_strike={}",
             bin_settleable,
             bin_out.instances.len(),
             bin_reaches,
@@ -1259,6 +1387,8 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             bin_out.marks_kept,
             bin_out.rolls_unpaired,
             unpaired,
+            next_checked,
+            next_disagree,
         ));
     }
 
@@ -1307,6 +1437,28 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             ));
         }
     }
+
+    // XMM XH3: every sym a post-only maker ever placed on under the queue
+    // law, tracked by every engine from its birth (the boot's
+    // `track_queue_sym`), so an engine built at its first intent still
+    // meets a known book for the orders after it. Ascending — a
+    // deterministic order.
+    let queue_syms: std::collections::BTreeSet<u32> = merged
+        .iter()
+        .filter_map(|ev| match &ev.payload {
+            Payload::Order(o)
+                if o.verb == core_types::ORDER_VERB_PLACE
+                    && core_fill::judged_by_queue(
+                        core_types::symbol_venue_byte(o.sym),
+                        o.kind,
+                        o.flags,
+                    ) =>
+            {
+                Some(o.sym)
+            }
+            _ => None,
+        })
+        .collect();
 
     // Engines: per strategy_id, plus per (vm, hash128). ModelParams
     // fields are Copy arrays — rebuild per engine (derive-agnostic).
@@ -1376,6 +1528,9 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             &bin_out.underlying_of,
             window_end_ns,
         );
+        for sym in &queue_syms {
+            e.track_queue_sym(*sym);
+        }
         e
     };
     let mut engines: BTreeMap<u8, FillEngine> = BTreeMap::new();
@@ -1407,6 +1562,10 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     let mut paper_qty: BTreeMap<u32, i64> = BTreeMap::new();
     let mut paper_cash_1e12: i128 = 0;
     let mut paper_fills: u64 = 0;
+    // BX7: the venue positions a Binance boot adopted (opening inventory),
+    // and those adopted without a price, by symbol: opened at its next mark.
+    let mut paper_adopted: u64 = 0;
+    let mut paper_unpriced: BTreeMap<u32, i64> = BTreeMap::new();
     let mut marks_1e6: BTreeMap<u32, i64> = BTreeMap::new();
 
     // Per-UTC-day equity snapshots per strategy engine.
@@ -1416,6 +1575,7 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     let wall_first = merged[0].wall_ns;
     let wall_last = merged[merged.len() - 1].wall_ns;
     let mut scratch = Vec::new();
+    let mut order_event = OrderEvent::ZERO;
 
     for ev in &merged {
         let day = ev.wall_ns / DAY_NS;
@@ -1441,6 +1601,9 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                 }
                 if t.bid_px.raw() > 0 && t.ask_px.raw() > 0 {
                     marks_1e6.insert(t.sym, t.mid().raw());
+                    if let Some(q) = paper_unpriced.remove(&t.sym) {
+                        paper_cash_1e12 -= t.mid().raw() as i128 * q as i128;
+                    }
                 }
                 for eng in engines.values_mut() {
                     eng.on_record(t, ev.virt_ns, ev.wall_ns, &mut scratch);
@@ -1455,6 +1618,19 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             Payload::Funding(f) => {
                 if let Some(rg) = regime.as_mut() {
                     rg.on_event(f);
+                }
+            }
+            // XMM XH3: prints consume the queue ahead of the post-only
+            // makers and fill them (every engine: the law is venue-wide).
+            Payload::Trade(p) => {
+                for eng in engines.values_mut() {
+                    eng.on_trade(p, ev.virt_ns, ev.wall_ns, &mut scratch);
+                }
+                for eng in vm_hash_engines.values_mut() {
+                    eng.on_trade(p, ev.virt_ns, ev.wall_ns, &mut scratch);
+                }
+                for eng in regime_engines.values_mut() {
+                    eng.on_trade(p, ev.virt_ns, ev.wall_ns, &mut scratch);
                 }
             }
             Payload::Regime(c) => {
@@ -1491,6 +1667,28 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                     }
                 }
             }
+            // BX7: the venue's position adopted at a boot is opening
+            // inventory, not a trade. Held already (carried from an earlier
+            // run of the window: a restart adopts what it left), it changes
+            // nothing; otherwise the difference opens at the fill's price —
+            // the boot's mark — or, adopted without one (an inverse leg: its
+            // face carries none), at the symbol's last mark, else its next
+            // (the risk review's N7: opened at 0, the exit's whole flow read
+            // as paper P&L). Break-and-watch: folding it as a trade buys the
+            // same inventory again at every restart.
+            Payload::Fill(f) if f.is_adopted() => {
+                paper_adopted += 1;
+                let held = paper_qty.entry(f.sym).or_default();
+                let venue = if f.side == Side::Bid { f.qty.raw() } else { -f.qty.raw() };
+                let opened = venue - *held;
+                *held = venue;
+                let px = if f.px.raw() != 0 { f.px.raw() } else { marks_1e6.get(&f.sym).copied().unwrap_or(0) };
+                if px == 0 {
+                    *paper_unpriced.entry(f.sym).or_default() += opened;
+                } else {
+                    paper_cash_1e12 -= px as i128 * opened as i128;
+                }
+            }
             Payload::Fill(f) => {
                 paper_fills += 1;
                 let flow = f.px.raw() as i128 * f.qty.raw() as i128;
@@ -1508,6 +1706,18 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             Payload::Commit(h) => {
                 active_hash = Some(*h);
             }
+        }
+        // XMM XH3: the queue law's order events answer a member this
+        // surface does not run — drained as they come, so they never
+        // pile up across a day of intents.
+        for eng in engines.values_mut() {
+            while eng.pop_order_event(&mut order_event) {}
+        }
+        for eng in vm_hash_engines.values_mut() {
+            while eng.pop_order_event(&mut order_event) {}
+        }
+        for eng in regime_engines.values_mut() {
+            while eng.pop_order_event(&mut order_event) {}
         }
     }
     // Final day snapshot.
@@ -1623,10 +1833,11 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         params.latency_ns[4],
     ));
     report(&format!(
-        "audit-pnl: paper view: fills={paper_fills} net={} (cash={} markout={}; fees none in paper)",
+        "audit-pnl: paper view: fills={paper_fills} adopted={paper_adopted} net={} (cash={} markout={}; fees none in paper; {} adopted leg(s) never marked)",
         fmt_usd_1e6(usd_1e12_to_1e6_floor(paper_net_1e12)),
         fmt_usd_1e6(usd_1e12_to_1e6_floor(paper_cash_1e12)),
         fmt_usd_1e6(usd_1e12_to_1e6_floor(paper_mark_value_1e12)),
+        paper_unpriced.len(),
     ));
     for (sid, row) in &rows {
         let o = &row.outcome;

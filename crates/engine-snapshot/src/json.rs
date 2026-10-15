@@ -21,11 +21,14 @@
 //! byte-exact test in `tests/encode.rs`.
 
 use core_types::{Fill, Order, RegimeWord, REGIME_PROFILES};
-use strategy_core::{RegimeCounters, RegimeRelView, VmRowView};
+use strategy_core::{
+    HarSeriesView, RegimeCounters, RegimeRelView, VmRowView, HAR_VIEW_SERIES, HAR_VIEW_TENORS,
+    HAR_VIEW_TENORS_D, HAR_VIEW_WEEKDAYS,
+};
 
 use crate::snapshot::{
-    EngineSnapshot, IngressSnapshot, RecentRing, SLOT_NAMES, SNAPSHOT_SLOTS, SNAPSHOT_VENUES,
-    VENUE_NAMES,
+    EngineSnapshot, HarSnapshot, IngressSnapshot, RecentRing, SLOT_NAMES, SNAPSHOT_SLOTS,
+    SNAPSHOT_VENUES, VENUE_NAMES,
 };
 
 /// The destination buffer was too small for the body. The caller's
@@ -95,8 +98,10 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.hex(&s.vm.active_hash);
     c.key("ruleset_staged_hash");
     c.hex(&s.vm.staged_hash);
-    c.key("icdp_hash");
-    c.hex(&s.icdp.hash);
+    c.key("xmm_hash");
+    c.hex(&b.xmm_hash);
+    c.key("xmm_coins");
+    c.text(b.xmm_coins());
     c.key("regime_hash");
     c.hex(&b.regime_hash);
     c.key("regime_configured");
@@ -221,44 +226,169 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     }
     c.put(b"]}");
 
-    // --- icdp ---
-    let ic = &s.icdp;
-    c.key("icdp");
+    // --- xmm (XMM XH3; schema 2 — it replaced `icdp`) ---
+    //
+    // The counters sit flat in the object (the hyparb precedent); one row
+    // per quoted perp, its feed ages against this publish's clock.
+    let xm = &s.xmm;
+    let xc = &xm.counters;
+    c.key("xmm");
     c.put(b"{\"configured\":");
-    c.u64(u64::from(ic.instruments > 0));
+    c.u64(u64::from(xm.n_perps > 0));
+    c.key("n_perps");
+    c.u64(u64::from(xm.n_perps));
+    c.key("placed");
+    c.u64(xc.placed);
+    c.key("modifies");
+    c.u64(xc.modifies);
+    c.key("lead_cancels");
+    c.u64(xc.lead_cancels);
+    c.key("requote_cancels");
+    c.u64(xc.requote_cancels);
+    c.key("pull_cancels");
+    c.u64(xc.pull_cancels);
+    c.key("expiry_cancels");
+    c.u64(xc.expiry_cancels);
+    c.key("gated");
+    c.u64(xc.gated);
+    c.key("gate_overflow");
+    c.u64(xc.gate_overflow);
+    c.key("capped");
+    c.u64(xc.capped);
+    c.key("rejected_alo");
+    c.u64(xc.rejected_alo);
+    c.key("rejected_other");
+    c.u64(xc.rejected_other);
+    c.key("canceled");
+    c.u64(xc.canceled);
+    c.key("filled");
+    c.u64(xc.filled);
+    c.key("fills");
+    c.u64(xc.fills);
+    c.key("unmatched");
+    c.u64(xc.unmatched);
+    c.key("ctx_refused");
+    c.u64(xc.ctx_refused);
+    c.key("stuck");
+    c.u64(xc.stuck);
+    // XMM XH4f (D8): the health pulls.
+    c.key("blocked_cancels");
+    c.u64(xc.blocked_cancels);
+    c.key("rtt_cancels");
+    c.u64(xc.rtt_cancels);
+    c.key("congestion_cancels");
+    c.u64(xc.congestion_cancels);
+    c.key("health_held");
+    c.u64(xc.health_held);
+    c.key("busy_deferred");
+    c.u64(xc.busy_deferred);
+    // XMM XH5d: the ALO priority's bids and the HYPE they committed.
+    c.key("priority_places");
+    c.u64(xc.priority_places);
+    c.key("priority_fee_usd_1e6");
+    c.u64(xc.priority_fee_usd_1e6);
+    c.key("priority_refused");
+    c.u64(xc.priority_refused);
+    c.key("perps");
+    c.put(b"[");
+    let np = (xm.n_perps as usize).min(crate::SNAPSHOT_XMM_PERPS);
+    let mut i = 0usize;
+    while i < np {
+        let r = &xm.perps[i];
+        if i > 0 {
+            c.put(b",");
+        }
+        c.put(b"{\"hl_sym\":");
+        c.u64(u64::from(r.hl_sym));
+        c.key("lead_sym");
+        c.u64(u64::from(r.lead_sym));
+        c.key("pos_1e6");
+        c.i64(r.pos_1e6);
+        c.key("touch_bid_1e6");
+        c.i64(r.touch_bid_1e6);
+        c.key("touch_ask_1e6");
+        c.i64(r.touch_ask_1e6);
+        c.key("bid_px_1e6");
+        c.i64(r.bid_px_1e6);
+        c.key("ask_px_1e6");
+        c.i64(r.ask_px_1e6);
+        c.key("bid_state");
+        c.u64(u64::from(r.bid_state));
+        c.key("ask_state");
+        c.u64(u64::from(r.ask_state));
+        c.key("stale_flags");
+        c.u64(u64::from(r.stale_flags));
+        c.key("lead_age_ms");
+        c.age_ms(s.mono_ns, r.lead_rx_ns);
+        c.key("fol_age_ms");
+        c.age_ms(s.mono_ns, r.fol_rx_ns);
+        c.put(b"}");
+        i += 1;
+    }
+    c.put(b"]}");
+
+    // --- hcv (HC11: slot 7, Hypercall S1 — DARK, paper only) ---
+    //
+    // Flat, like `xmm`'s counters; `configured` is the artifact's
+    // presence (its hash — rendered here, the `vrp` precedent, so the
+    // pinned `boot` section is unchanged), so an unconfigured member
+    // reads all zeros.
+    let hc = &s.hcv.counters;
+    c.key("hcv");
+    c.put(b"{\"configured\":");
+    c.u64(u64::from(s.boot.hcv_hash != [0u8; 32]));
     c.key("hash");
-    c.hex(&ic.hash);
-    c.key("instruments");
-    c.u64(u64::from(ic.instruments));
-    let cnt = &ic.counters;
-    c.key("decisions");
-    c.u64(cnt.decisions);
-    c.key("signals");
-    c.u64(cnt.signals);
-    c.key("intents");
-    c.u64(cnt.intents);
-    c.key("exits");
-    c.u64(cnt.exits);
-    c.key("exit_on_stale");
-    c.u64(cnt.exit_on_stale);
-    c.key("skipped_spread");
-    c.u64(cnt.skipped_spread);
-    c.key("skipped_stale_open");
-    c.u64(cnt.skipped_stale_open);
-    c.key("skipped_stale_dec");
-    c.u64(cnt.skipped_stale_dec);
-    c.key("skipped_prev");
-    c.u64(cnt.skipped_prev);
-    c.key("late_bars");
-    c.u64(cnt.late_bars);
-    c.key("caps_rejected");
-    c.u64(cnt.caps_rejected);
-    c.key("rolls");
-    c.u64(cnt.rolls);
-    c.key("regime_blocked");
-    c.u64(cnt.regime_blocked);
-    c.key("regime_exits");
-    c.u64(cnt.regime_exits);
+    c.hex(&s.boot.hcv_hash);
+    c.key("judged");
+    c.u64(hc.judged);
+    c.key("sells");
+    c.u64(hc.sells);
+    c.key("buys");
+    c.u64(hc.buys);
+    c.key("option_fills");
+    c.u64(hc.option_fills);
+    c.key("hedges");
+    c.u64(hc.hedges);
+    c.key("hedge_fills");
+    c.u64(hc.hedge_fills);
+    c.key("unwind_slices");
+    c.u64(hc.unwind_slices);
+    c.key("settlements");
+    c.u64(hc.settlements);
+    c.key("settle_fallbacks");
+    c.u64(hc.settle_fallbacks);
+    c.key("skip_event");
+    c.u64(hc.skip_event);
+    c.key("skip_stale");
+    c.u64(hc.skip_stale);
+    c.key("skip_forecast");
+    c.u64(hc.skip_forecast);
+    c.key("skip_caps");
+    c.u64(hc.skip_caps);
+    c.key("skip_stopped");
+    c.u64(hc.skip_stopped);
+    c.key("ctx_refused");
+    c.u64(hc.ctx_refused);
+    c.key("calendars");
+    c.u64(hc.calendars);
+    c.key("har_updates");
+    c.u64(hc.har_updates);
+    c.key("restored");
+    c.u64(hc.restored);
+    c.key("positions");
+    c.i64(hc.positions);
+    c.key("vega_abs_usd_1e6");
+    c.i64(hc.vega_abs_usd_1e6);
+    c.key("pnl_usd_1e6");
+    c.i64(hc.pnl_usd_1e6);
+    c.key("day_pnl_usd_1e6");
+    c.i64(hc.day_pnl_usd_1e6);
+    c.key("orphans");
+    c.i64(hc.orphans);
+    c.key("book_stale");
+    c.i64(hc.book_stale);
+    c.key("marks_unknown");
+    c.i64(hc.marks_unknown);
     c.put(b"}");
 
     // --- exec (E6 c4) ---
@@ -319,6 +449,55 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.i64(ex.arm_pnl_anchor_usd_1e6);
     c.key("arm_session_pnl_usd_1e6");
     c.i64(ex.arm_session_pnl_usd_1e6);
+    // BX3: the instrument laws' two refusals and the retirements by
+    // `why`, spelled. Additive.
+    c.key("refused_short");
+    c.u64(ex.refused_short);
+    c.key("refused_unpriced");
+    c.u64(ex.refused_unpriced);
+    c.key("retired");
+    c.byte(b'{');
+    let mut i = 0usize;
+    while i < crate::RETIRED_WHY_WORDS.len() {
+        if i > 0 {
+            c.byte(b',');
+        }
+        c.quoted(crate::RETIRED_WHY_WORDS[i].as_bytes());
+        c.byte(b':');
+        c.u64(ex.retired[i]);
+        i += 1;
+    }
+    c.key("unknown");
+    c.u64(ex.retired[crate::RETIRED_WHY_UNKNOWN]);
+    c.byte(b'}');
+    // BX6: the mark law's two counters, and each venue arm that exists.
+    c.key("ledger_marks_refused");
+    c.u64(ex.ledger_marks_refused);
+    c.key("ledger_marks_expired");
+    c.u64(ex.ledger_marks_expired);
+    // XMM XH4f (D11): and slot 6's gateway arm, beside it; BX11: and the
+    // Binance arm's own words.
+    let bn = ex.arms_binance.present != 0;
+    let gw = ex.arms_hyperliquid_gw.present != 0;
+    let bngw = ex.arms_binance_gw.present != 0;
+    if bn || gw || bngw {
+        c.key("arms");
+        c.byte(b'{');
+        let mut first = true;
+        if bn {
+            member(&mut c, &mut first, b"binance");
+            arm_json(&mut c, &ex.arms_binance);
+        }
+        if bngw {
+            member(&mut c, &mut first, b"binance_gw");
+            binance_gw_json(&mut c, &ex.arms_binance_gw);
+        }
+        if gw {
+            member(&mut c, &mut first, b"hyperliquid_gw");
+            gateway_arm_json(&mut c, &ex.arms_hyperliquid_gw);
+        }
+        c.byte(b'}');
+    }
     c.key("halted");
     c.put(b"[");
     let mut i = 0usize;
@@ -511,6 +690,157 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.u64(cp.orders_io_errors);
     c.put(b"}");
 
+    // --- hyparb (HYPARB H6) ---
+    //
+    // Additive: `"v":1` stays. The side balance, the basis per pool and
+    // the hedge books per coin are read together because the disputed
+    // quantities are relationships between them (plan §10).
+    let hy = &s.hyparb;
+    let hc = &hy.counters;
+    c.key("hyparb");
+    c.put(b"{\"configured\":");
+    c.u64(u64::from(hy.n_pools > 0));
+    c.key("n_pools");
+    c.u64(u64::from(hy.n_pools));
+    c.key("n_coins");
+    c.u64(u64::from(hy.n_coins));
+    c.key("halted");
+    c.u64(hc.halted);
+    // The session's marked P&L (go-live 2026-09-24): a level, paper's
+    // evidence for gate G1 — the P&L stop is live-only (O-HL5).
+    c.key("pnl_session_usd_1e6");
+    c.i64(hc.pnl_session_usd_1e6);
+    // The counters sit flat in the object (a nested `counters` key would
+    // shadow the top-level section of that name).
+    c.key("pool_events");
+    c.u64(hc.pool_events);
+    c.key("pool_refused");
+    c.u64(hc.pool_refused);
+    c.key("maps_loaded");
+    c.u64(hc.maps_loaded);
+    c.key("maps_refused");
+    c.u64(hc.maps_refused);
+    c.key("evaluations");
+    c.u64(hc.evaluations);
+    c.key("arbs_submitted");
+    c.u64(hc.arbs_submitted);
+    c.key("arbs_buy");
+    c.u64(hc.arbs_buy);
+    c.key("arbs_sell");
+    c.u64(hc.arbs_sell);
+    c.key("skipped_below_min");
+    c.u64(hc.skipped_below_min);
+    c.key("skipped_not_live");
+    c.u64(hc.skipped_not_live);
+    c.key("skipped_no_hedge");
+    c.u64(hc.skipped_no_hedge);
+    c.key("skipped_inflight");
+    c.u64(hc.skipped_inflight);
+    c.key("skipped_cooldown");
+    c.u64(hc.skipped_cooldown);
+    c.key("skipped_halted");
+    c.u64(hc.skipped_halted);
+    c.key("size_capped");
+    c.u64(hc.size_capped);
+    c.key("amm_fills");
+    c.u64(hc.amm_fills);
+    c.key("hedges_submitted");
+    c.u64(hc.hedges_submitted);
+    c.key("hedges_perp");
+    c.u64(hc.hedges_perp);
+    c.key("hedges_spot");
+    c.u64(hc.hedges_spot);
+    c.key("hedge_fills");
+    c.u64(hc.hedge_fills);
+    c.key("hedges_missed");
+    c.u64(hc.hedges_missed);
+    c.key("flattens_submitted");
+    c.u64(hc.flattens_submitted);
+    c.key("inventory_breaches");
+    c.u64(hc.inventory_breaches);
+    c.key("orders_dropped");
+    c.u64(hc.orders_dropped);
+    c.key("gas_charged_usd_1e6");
+    c.i64(hc.gas_charged_usd_1e6);
+    c.key("pnl_predicted_usd_1e6");
+    c.i64(hc.pnl_predicted_usd_1e6);
+    c.key("amm_notional_usd_1e6");
+    c.i64(hc.amm_notional_usd_1e6);
+    c.key("funding_earned_usd_1e6");
+    c.i64(hc.funding_earned_usd_1e6);
+    c.key("pools");
+    c.put(b"[");
+    let np = (hy.n_pools as usize).min(crate::SNAPSHOT_HYPARB_POOLS);
+    let mut i = 0usize;
+    while i < np {
+        let r = &hy.pools[i];
+        if i > 0 {
+            c.put(b",");
+        }
+        c.put(b"{\"sym\":");
+        c.u64(u64::from(r.sym));
+        c.key("live");
+        c.u64(u64::from(r.live));
+        c.key("map_ok");
+        c.u64(u64::from(r.map_ok));
+        c.key("hedge_venue");
+        c.u64(u64::from(r.hedge_venue));
+        c.key("fee_pips");
+        c.u64(u64::from(r.fee_pips));
+        c.key("mid_1e6");
+        c.i64(r.mid_1e6);
+        c.key("basis_bps_1e6");
+        c.i64(r.basis_bps_1e6);
+        c.key("arbs");
+        c.u64(r.arbs);
+        c.key("pnl_predicted_usd_1e6");
+        c.i64(r.pnl_predicted_usd_1e6);
+        c.put(b"}");
+        i += 1;
+    }
+    c.put(b"]");
+    c.key("coins");
+    c.put(b"[");
+    let nc = (hy.n_coins as usize).min(crate::SNAPSHOT_HYPARB_COINS);
+    let mut i = 0usize;
+    while i < nc {
+        let r = &hy.coins[i];
+        if i > 0 {
+            c.put(b",");
+        }
+        c.put(b"{\"perp_sym\":");
+        c.u64(u64::from(r.perp_sym));
+        c.key("spot_sym");
+        c.u64(u64::from(r.spot_sym));
+        c.key("perp_depth_usd_1e6");
+        c.i64(r.perp_depth_usd_1e6);
+        c.key("spot_depth_usd_1e6");
+        c.i64(r.spot_depth_usd_1e6);
+        c.key("perp_cost_bps_1e6");
+        c.i64(r.perp_cost_bps_1e6);
+        c.key("spot_cost_bps_1e6");
+        c.i64(r.spot_cost_bps_1e6);
+        c.key("inventory_1e6");
+        c.i64(r.inventory_1e6);
+        c.key("perp_pos_1e6");
+        c.i64(r.perp_pos_1e6);
+        c.key("funding_1e9");
+        c.i64(r.funding_1e9);
+        c.put(b"}");
+        i += 1;
+    }
+    c.put(b"]}");
+
+    // --- har (HAR H3.5) ---
+    //
+    // Additive (`"v"` does not move). One row per long-tenor series: at the
+    // nine panel tenors the raw fold AND the fit (plan law L2 — neither
+    // hides the other), the pairs behind the fit, and the day census
+    // that says whether any of it is current (`day_age_s` > 26 h =
+    // "not recalibrating").
+    c.key("har");
+    har(&mut c, &s.har, s.wall_ns);
+
     // --- recent ---
     c.key("recent");
     c.put(b"{\"orders_total\":");
@@ -626,6 +956,162 @@ fn regime(c: &mut Cursor<'_>, r: &RegimeCounters, rel: &RegimeRelView, mono_ns: 
     c.put(b"}}");
 }
 
+/// The `har` object. `day_age_s` is WALL-derived — a UTC day is wall
+/// time — against the snapshot's own `wall_ns`: whole seconds since the
+/// newest closed day ended (its next midnight); `-1` = no closed day.
+fn har(c: &mut Cursor<'_>, h: &HarSnapshot, wall_ns: u64) {
+    let k = &h.counters;
+    c.put(b"{\"configured\":");
+    c.u64(u64::from(h.n));
+    c.key("hash");
+    c.hex(&h.hash);
+    c.key("dropped");
+    c.u64(u64::from(h.dropped));
+    // Flat, like `hyparb`'s: a nested `counters` key would shadow the
+    // top-level section of that name.
+    c.key("minutes_rolled");
+    c.u64(k.minutes_rolled);
+    c.key("closes");
+    c.u64(k.closes);
+    c.key("day_closes");
+    c.u64(k.day_closes);
+    c.key("held");
+    c.u64(k.held);
+    c.key("forced");
+    c.u64(k.forced);
+    c.key("day_close_ns_max");
+    c.u64(k.day_close_ns_max);
+    c.key("day_close_ns_last");
+    c.u64(k.day_close_ns_last);
+    c.key("epoch");
+    c.u64(k.epoch);
+    c.key("tenors_d");
+    c.put(b"[");
+    let mut t = 0usize;
+    while t < HAR_VIEW_TENORS {
+        if t > 0 {
+            c.put(b",");
+        }
+        c.u64(u64::from(HAR_VIEW_TENORS_D[t]));
+        t += 1;
+    }
+    c.put(b"]");
+    c.key("series");
+    c.put(b"[");
+    let n = (h.n as usize).min(HAR_VIEW_SERIES);
+    let wall_ms = wall_ns / 1_000_000;
+    let mut i = 0usize;
+    while i < n {
+        if i > 0 {
+            c.put(b",");
+        }
+        har_series(c, &h.series[i], wall_ms);
+        i += 1;
+    }
+    c.put(b"]}");
+}
+
+fn har_series(c: &mut Cursor<'_>, v: &HarSeriesView, wall_ms: u64) {
+    c.put(b"{\"name\":");
+    c.text(v.name());
+    c.key("feed");
+    c.u64(u64::from(v.feed));
+    c.key("warm");
+    c.u64(u64::from(v.warm));
+    c.key("days");
+    c.u64(u64::from(v.days));
+    c.key("empty_days");
+    c.u64(u64::from(v.empty_days));
+    c.key("gaps");
+    c.u64(v.gaps);
+    c.key("newest_day_ms");
+    c.u64(v.newest_day_ms);
+    c.key("day_age_s");
+    if v.newest_day_ms == 0 {
+        c.put(b"-1");
+    } else {
+        let closed_ms = v.newest_day_ms.saturating_add(86_400_000);
+        c.u64(wall_ms.saturating_sub(closed_ms) / 1_000);
+    }
+    c.key("last_min_ms");
+    c.u64(v.last_min_ms);
+    c.key("open_minutes");
+    c.u64(u64::from(v.open_minutes));
+    c.key("epoch");
+    c.u64(v.epoch);
+    c.key("raw_1e6");
+    i32_array(c, &v.raw_1e6);
+    c.key("fit_1e6");
+    i32_array(c, &v.fit_1e6);
+    c.key("pairs");
+    c.put(b"[");
+    let mut t = 0usize;
+    while t < HAR_VIEW_TENORS {
+        if t > 0 {
+            c.put(b",");
+        }
+        c.u64(u64::from(v.pairs[t]));
+        t += 1;
+    }
+    c.put(b"]");
+    c.key("fitted");
+    bits(c, v.fitted);
+    c.key("fit_beats_raw");
+    bits(c, v.fit_beats_raw);
+    c.key("weekday_1e6");
+    i32_array(c, &v.weekday_1e6);
+    c.key("weekday_n");
+    c.put(b"[");
+    let mut w = 0usize;
+    while w < HAR_VIEW_WEEKDAYS {
+        if w > 0 {
+            c.put(b",");
+        }
+        c.u64(u64::from(v.weekday_n[w]));
+        w += 1;
+    }
+    c.put(b"]}");
+}
+
+/// `[a,b,…]` of signed values.
+fn i32_array(c: &mut Cursor<'_>, a: &[i32]) {
+    c.put(b"[");
+    let mut i = 0usize;
+    while i < a.len() {
+        if i > 0 {
+            c.put(b",");
+        }
+        c.i64(i64::from(a[i]));
+        i += 1;
+    }
+    c.put(b"]");
+}
+
+/// A weight pool as `,"<key>":{"used":…,"max":…}` (the gateway's three:
+/// the futures', options' and, BX13, spot's).
+fn used_max(c: &mut Cursor<'_>, key: &str, used: u64, max: u64) {
+    c.key(key);
+    c.put(b"{\"used\":");
+    c.u64(used);
+    c.key("max");
+    c.u64(max);
+    c.byte(b'}');
+}
+
+/// A per-tenor bit mask as `[0|1, …]`, tenor order.
+fn bits(c: &mut Cursor<'_>, mask: u16) {
+    c.put(b"[");
+    let mut t = 0usize;
+    while t < HAR_VIEW_TENORS {
+        if t > 0 {
+            c.put(b",");
+        }
+        c.byte(b'0' + ((mask >> t) & 1) as u8);
+        t += 1;
+    }
+    c.put(b"]");
+}
+
 /// A regime word: its raw hex plus the seven dimension bytes (the
 /// page decodes names with the `core_types::regime` byte map).
 fn word(c: &mut Cursor<'_>, w: RegimeWord) {
@@ -704,6 +1190,257 @@ fn ingress(c: &mut Cursor<'_>, name: &[u8], g: &IngressSnapshot, mono_ns: u64) {
     c.key("feed_delay_ema_ms");
     c.u64(u64::from(g.feed_delay_ema_ms));
     c.put(b"}");
+}
+
+/// BX6: one venue arm's object in `exec.arms`.
+fn arm_json(c: &mut Cursor<'_>, a: &crate::ArmSnapshot) {
+    c.put(b"{\"submitted\":");
+    c.u64(a.submitted);
+    c.key("rejected");
+    c.u64(a.rejected);
+    c.key("ioc_missed");
+    c.u64(a.ioc_missed);
+    c.key("refused_local");
+    c.u64(a.refused_local);
+    c.key("refused_stale");
+    c.u64(a.refused_stale);
+    c.key("sent_unanswered");
+    c.u64(a.sent_unanswered);
+    c.key("fills_booked");
+    c.u64(a.fills_booked);
+    c.key("fills_unresolved");
+    c.u64(a.fills_unresolved);
+    c.key("fills_foreign");
+    c.u64(a.fills_foreign);
+    c.key("fills_dropped");
+    c.u64(a.fills_dropped);
+    c.key("fills_unowned");
+    c.u64(a.fills_unowned);
+    c.key("recon_ok");
+    c.u64(a.recon_ok);
+    c.key("recon_failed");
+    c.u64(a.recon_failed);
+    c.key("recon_drift_legs");
+    c.u64(a.recon_drift_legs);
+    c.key("recon_unseen_legs");
+    c.u64(a.recon_unseen_legs);
+    c.key("sweep_left");
+    c.u64(a.sweep_left);
+    c.key("sweep_stalled");
+    c.u64(a.sweep_stalled);
+    c.key("cancel_all_unqueued");
+    c.u64(a.cancel_all_unqueued);
+    c.key("ws_reconnects");
+    c.u64(a.ws_reconnects);
+    c.key("ws_connect_failures");
+    c.u64(a.ws_connect_failures);
+    c.key("pnl_anchor_usd_1e6");
+    c.i64(a.pnl_anchor_usd_1e6);
+    c.key("session_pnl_usd_1e6");
+    c.i64(a.session_pnl_usd_1e6);
+    c.put(b"}");
+}
+
+/// One member's key in an object whose members are optional: a comma
+/// before every one but the first.
+fn member(c: &mut Cursor<'_>, first: &mut bool, name: &[u8]) {
+    if !*first {
+        c.byte(b',');
+    }
+    *first = false;
+    c.quoted(name);
+    c.byte(b':');
+}
+
+/// BX11: the Binance arm's own words — the words spelled, a heartbeat not
+/// yet seen as `-1`, the refusals by reason as one object.
+fn binance_gw_json(c: &mut Cursor<'_>, b: &crate::BinanceGwSnapshot) {
+    c.put(b"{\"slot\":");
+    c.u64(u64::from(b.slot));
+    c.key("ready");
+    c.u64(u64::from(b.ready));
+    c.key("order_up");
+    c.u64(u64::from(b.order_up));
+    c.key("user_up");
+    c.u64(u64::from(b.user_up));
+    c.key("deadman_ok");
+    c.u64(u64::from(b.deadman_ok));
+    c.key("clock_ok");
+    c.u64(u64::from(b.clock_ok));
+    c.key("anchor_unsaved");
+    c.u64(u64::from(b.anchor_unsaved));
+    c.key("mode");
+    c.quoted(crate::bn_mode_word(b.account_mode).as_bytes());
+    c.key("demo");
+    c.u64(u64::from(b.demo));
+    c.key("congestion");
+    c.quoted(crate::congestion_word(b.congestion).as_bytes());
+    c.key("halt_reason");
+    c.u64(b.halt_reason);
+    c.key("sweep");
+    c.quoted(crate::sweep_word(b.sweep).as_bytes());
+    c.key("in_flight");
+    c.u64(b.in_flight);
+    c.key("in_doubt");
+    c.u64(b.in_doubt);
+    c.key("in_doubt_raised");
+    c.u64(b.in_doubt_raised);
+    c.key("jobs_dropped");
+    c.u64(b.jobs_dropped);
+    c.key("fills_deferred");
+    c.u64(b.fills_deferred);
+    c.key("journal_dropped");
+    c.u64(b.journal_dropped);
+    c.key("cancels_owed");
+    c.u64(b.cancels_owed);
+    c.key("quiet");
+    c.u64(b.quiet);
+    c.key("quiet_left_ms");
+    c.u64(b.quiet_left_ms);
+    c.key("dns_reresolved");
+    c.u64(b.dns_reresolved);
+    c.key("events_other");
+    c.u64(b.events_other);
+    c.key("budget_obs");
+    c.u64(b.budget_obs);
+    c.key("locks");
+    c.u64(b.locks);
+    c.key("scan_failed");
+    c.u64(b.scan_failed);
+    c.key("evt_unknown");
+    c.u64(b.evt_unknown);
+    c.key("cancels_refused");
+    c.u64(b.cancels_refused);
+    c.key("modifies_refused");
+    c.u64(b.modifies_refused);
+    c.key("sweeps_stranded");
+    c.u64(b.sweeps_stranded);
+    c.key("heartbeat_age_ms");
+    c.i64(i64::try_from(b.heartbeat_age_ms).unwrap_or(-1));
+    c.key("clock_offset_ms");
+    c.i64(b.clock_offset_ms);
+    used_max(c, "weight", b.weight_used, b.weight_max);
+    used_max(c, "opt_weight", b.opt_weight_used, b.opt_weight_max);
+    // BX13 (R2-4, R2-2, R3-1): spot's own pool, spot's day, held cycles.
+    used_max(c, "spot_weight", b.spot_weight_used, b.spot_weight_max);
+    c.key("spot_day");
+    c.put(b"{\"unfilled\":");
+    c.u64(b.spot_day_unfilled);
+    c.key("cap");
+    c.u64(b.spot_day_cap);
+    c.key("sell_cap");
+    c.u64(b.spot_sell_cap);
+    c.key("seeded");
+    c.u64(b.spot_day_seeded);
+    c.byte(b'}');
+    c.key("recon_held");
+    c.u64(b.recon_held);
+    c.key("orders_10s");
+    c.put(b"{\"used\":");
+    c.u64(b.orders_10s_used);
+    c.key("cap");
+    c.u64(b.orders_10s_cap);
+    c.byte(b'}');
+    c.key("orders_1m");
+    c.put(b"{\"used\":");
+    c.u64(b.orders_1m_used);
+    c.key("cap");
+    c.u64(b.orders_1m_cap);
+    c.byte(b'}');
+    c.key("margin_usdm_1e6");
+    c.i64(b.margin_usdm_1e6);
+    c.key("margin_coinm_1e6");
+    c.i64(b.margin_coinm_1e6);
+    c.key("margin_options_1e6");
+    c.i64(b.margin_options_1e6);
+    c.key("owned_rows");
+    c.u64(b.owned_rows);
+    c.key("post_rtt_p99_ns");
+    c.u64(b.post_rtt_p99_ns);
+    c.key("refused");
+    c.byte(b'{');
+    let mut i = 0;
+    while i < b.refused.len() {
+        if i > 0 {
+            c.byte(b',');
+        }
+        c.quoted(crate::BN_REFUSAL_WORDS[i].as_bytes());
+        c.byte(b':');
+        c.u64(u64::from(b.refused[i]));
+        i += 1;
+    }
+    c.byte(b'}');
+    c.byte(b'}');
+}
+
+/// XMM XH4f (D11): slot 6's gateway arm — its words spelled, a heartbeat
+/// not yet seen as `-1`.
+fn gateway_arm_json(c: &mut Cursor<'_>, g: &crate::GatewayArmSnapshot) {
+    c.put(b"{\"slot\":");
+    c.u64(u64::from(g.slot));
+    c.key("ready");
+    c.u64(u64::from(g.ready));
+    c.key("ws_up");
+    c.u64(u64::from(g.ws_up));
+    c.key("congestion");
+    c.quoted(crate::congestion_word(g.congestion).as_bytes());
+    c.key("health_blocked");
+    c.u64(g.health_blocked);
+    c.key("halt_reason");
+    c.u64(g.halt_reason);
+    c.key("open_orders");
+    c.u64(g.open_orders);
+    c.key("in_flight");
+    c.u64(g.in_flight);
+    c.key("heartbeat_age_ms");
+    c.i64(i64::try_from(g.heartbeat_age_ms).unwrap_or(-1));
+    c.key("rtt_worst_ns");
+    c.u64(g.rtt_worst_ns);
+    c.key("pushed");
+    c.u64(g.pushed);
+    c.key("rejects");
+    c.u64(g.rejects);
+    c.key("alo_rejects");
+    c.u64(g.alo_rejects);
+    c.key("refused_local");
+    c.u64(g.refused_local);
+    c.key("refused_budget");
+    c.u64(g.refused_budget);
+    c.key("refused_leverage");
+    c.u64(g.refused_leverage);
+    c.key("throttled");
+    c.u64(g.throttled);
+    c.key("fills");
+    c.u64(g.fills);
+    c.key("fills_crossed");
+    c.u64(g.fills_crossed);
+    c.key("fees_1e8");
+    c.i64(g.fees_1e8);
+    c.key("unknown_orders");
+    c.u64(g.unknown_orders);
+    c.key("day_unreadable");
+    c.u64(g.day_unreadable);
+    c.key("post_timeouts");
+    c.u64(g.post_timeouts);
+    c.key("reconnects");
+    c.u64(g.reconnects);
+    c.key("ttl_cancels");
+    c.u64(g.ttl_cancels);
+    c.key("budget_known");
+    c.u64(u64::from(g.budget_known));
+    c.key("budget_remaining");
+    c.i64(g.budget_remaining);
+    c.key("leverage_dark");
+    c.u64(u64::from(g.leverage_dark));
+    c.key("deadman");
+    c.put(b"{\"availability\":");
+    c.quoted(crate::deadman_availability_word(g.dm_availability).as_bytes());
+    c.key("deadline_ms");
+    c.u64(g.dm_deadline_ms);
+    c.byte(b'}');
+    c.key("shutdown_unconfirmed");
+    c.u64(g.shutdown_unconfirmed);
+    c.byte(b'}');
 }
 
 fn recent_orders<const N: usize>(c: &mut Cursor<'_>, r: &RecentRing<Order, N>, mono_ns: u64) {
@@ -915,6 +1652,17 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// Whole milliseconds from `stamp` to `now`; `-1` when `stamp == 0`
+    /// (never) — the maker's feeds go stale in hundreds of ms.
+    #[inline]
+    fn age_ms(&mut self, now: u64, stamp: u64) {
+        if stamp == 0 {
+            self.put(b"-1");
+        } else {
+            self.u64(now.saturating_sub(stamp) / 1_000_000);
+        }
+    }
+
     #[inline]
     fn finish(self) -> Result<usize, JsonOverflow> {
         if self.overflow {
@@ -973,11 +1721,179 @@ mod tests {
         let mut buf = vec![0u8; STATE_JSON_MAX];
         let n = encode_state_json(&s, &mut buf).unwrap();
         let body = core::str::from_utf8(&buf[..n]).unwrap();
-        assert!(body.starts_with("{\"v\":1,\"seq\":0,"), "{body}");
+        assert!(body.starts_with("{\"v\":2,\"seq\":0,"), "{body}");
         assert!(body.ends_with("\"fills\":[]}}"), "{body}");
-        assert!(body.contains("\"slots\":[{\"slot\":0,\"name\":\"latency-arb\""));
+        assert!(body.contains("\"slots\":[{\"slot\":0,\"name\":\"hyparb\""));
         assert!(body.contains("\"venue\":\"rpc\""));
+        // MX2: MEXC is appended after rpc — the array order is the
+        // `/state` contract, so it must render LAST.
+        let rpc = body.find("\"venue\":\"rpc\"").unwrap();
+        let mexc = body.find("\"venue\":\"mexc\"").expect("mexc ingress row");
+        assert!(rpc < mexc, "mexc must follow rpc (append, never reorder)");
+        let hev = body
+            .find("\"venue\":\"hyperevm\"")
+            .expect("hyperevm ingress row");
+        assert!(
+            mexc < hev,
+            "hyperevm must follow mexc (append, never reorder)"
+        );
+        let hc = body
+            .find("\"venue\":\"hypercall\"")
+            .expect("hypercall ingress row");
+        assert!(hev < hc, "hypercall must follow hyperevm (append, never reorder)");
         assert!(body.contains("\"heartbeat_age_s\":-1"));
+    }
+
+    /// BX3: the exec object carries the two instrument-law refusals and
+    /// every retirement `why` by word — `unknown` from its own bucket.
+    #[test]
+    fn the_exec_object_spells_the_retirements() {
+        let mut s = EngineSnapshot::empty();
+        s.exec.refused_short = 3;
+        s.exec.refused_unpriced = 4;
+        s.exec.retired = [10, 11, 12, 13, 14, 15, 0, 17];
+        let mut buf = vec![0u8; STATE_JSON_MAX];
+        let n = encode_state_json(&s, &mut buf).unwrap();
+        let body = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            body.contains(
+                "\"refused_short\":3,\"refused_unpriced\":4,\"retired\":{\"rejected\":10,\
+                 \"expired\":11,\"canceled_venue\":12,\"canceled_ttl\":13,\
+                 \"canceled_member\":14,\"filled\":15,\"unknown\":17},\
+                 \"ledger_marks_refused\":0,\"ledger_marks_expired\":0,\"halted\":["
+            ),
+            "{body}"
+        );
+        assert!(!body.contains("\"arms\""), "no Binance arm, no arms object");
+    }
+
+    /// BX6: a boot with a Binance arm publishes `exec.arms.binance`,
+    /// before `halted`; the mark law's counters ride beside the ledger's.
+    #[test]
+    fn the_exec_object_carries_the_binance_arm() {
+        let mut s = EngineSnapshot::empty();
+        s.exec.ledger_marks_refused = 2;
+        s.exec.ledger_marks_expired = 1;
+        s.exec.arms_binance.present = 1;
+        s.exec.arms_binance.submitted = 7;
+        s.exec.arms_binance.fills_booked = 5;
+        s.exec.arms_binance.pnl_anchor_usd_1e6 = 1_000_000_000;
+        s.exec.arms_binance.session_pnl_usd_1e6 = -2_500_000;
+        let mut buf = vec![0u8; STATE_JSON_MAX];
+        let n = encode_state_json(&s, &mut buf).unwrap();
+        let body = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            body.contains("\"ledger_marks_refused\":2,\"ledger_marks_expired\":1,\"arms\":{\"binance\":{\"submitted\":7,"),
+            "{body}"
+        );
+        assert!(body.contains("\"fills_booked\":5,"), "{body}");
+        assert!(
+            body.contains("\"pnl_anchor_usd_1e6\":1000000000,\"session_pnl_usd_1e6\":-2500000}},\"halted\":["),
+            "{body}"
+        );
+    }
+
+    /// XMM XH4f (D11): slot 6's gateway arm rides in `exec.arms` — alone,
+    /// or after the Binance arm — its words spelled and a heartbeat not yet
+    /// seen as `-1`.
+    #[test]
+    fn the_exec_object_carries_the_gateway_arm() {
+        let mut s = EngineSnapshot::empty();
+        let g = &mut s.exec.arms_hyperliquid_gw;
+        g.present = 1;
+        g.slot = 6;
+        g.ready = 1;
+        g.congestion = 2;
+        g.heartbeat_age_ms = u64::MAX;
+        g.budget_remaining = -4;
+        g.dm_availability = 1;
+        g.dm_deadline_ms = 1_790_000_000_000;
+        let mut buf = vec![0u8; STATE_JSON_MAX];
+        let n = encode_state_json(&s, &mut buf).unwrap();
+        let body = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            body.contains(
+                "\"arms\":{\"hyperliquid_gw\":{\"slot\":6,\"ready\":1,\"ws_up\":0,\
+                 \"congestion\":\"throttled\","
+            ),
+            "{body}"
+        );
+        assert!(body.contains("\"heartbeat_age_ms\":-1,"), "{body}");
+        assert!(body.contains("\"budget_remaining\":-4,"), "{body}");
+        assert!(
+            body.contains(
+                "\"deadman\":{\"availability\":\"eligible\",\"deadline_ms\":1790000000000},\
+                 \"shutdown_unconfirmed\":0}},\"halted\":["
+            ),
+            "{body}"
+        );
+        s.exec.arms_binance.present = 1;
+        let n = encode_state_json(&s, &mut buf).unwrap();
+        let body = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            body.contains("\"session_pnl_usd_1e6\":0},\"hyperliquid_gw\":{\"slot\":6,"),
+            "both arms: {body}"
+        );
+        assert_eq!(crate::congestion_word(9), "unknown");
+        assert_eq!(crate::deadman_availability_word(3), "exhausted");
+    }
+
+    /// BX11: the Binance arm's own words ride in `exec.arms.binance_gw` —
+    /// alone, or between `binance` and `hyperliquid_gw` (one comma each) —
+    /// its words spelled, a heartbeat not yet seen as `-1`, the refusals by
+    /// reason as one object in `Refusal` order. Break-and-watch: a comma
+    /// placed for two members only doubles or drops one here.
+    #[test]
+    fn the_exec_object_carries_the_binance_gateway_words() {
+        let mut s = EngineSnapshot::empty();
+        let b = &mut s.exec.arms_binance_gw;
+        b.present = 1;
+        b.slot = 2;
+        b.ready = 1;
+        b.order_up = 1;
+        b.account_mode = 1;
+        b.sweep = 2;
+        b.congestion = 1;
+        b.in_doubt = 3;
+        b.heartbeat_age_ms = u64::MAX;
+        b.clock_offset_ms = -12;
+        b.weight_used = 100;
+        b.weight_max = 1_200;
+        b.refused[0] = 4;
+        b.refused[19] = 9;
+        b.refused[20] = 7;
+        let mut buf = vec![0u8; STATE_JSON_MAX];
+        let n = encode_state_json(&s, &mut buf).unwrap();
+        let body = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            body.contains(
+                "\"arms\":{\"binance_gw\":{\"slot\":2,\"ready\":1,\"order_up\":1,\"user_up\":0,\
+                 \"deadman_ok\":0,\"clock_ok\":0,\"anchor_unsaved\":0,\"mode\":\"pm\",\"demo\":0,\
+                 \"congestion\":\"busy\",\"halt_reason\":0,\"sweep\":\"stranded\",\"in_flight\":0,\
+                 \"in_doubt\":3,"
+            ),
+            "{body}"
+        );
+        assert!(body.contains("\"heartbeat_age_ms\":-1,\"clock_offset_ms\":-12,\"weight\":{\"used\":100,\"max\":1200},\"opt_weight\":{\"used\":0,\"max\":0},"), "{body}");
+        // BX13: spot's pool, spot's day and the held cycles, after eapi's.
+        assert!(
+            body.contains("\"opt_weight\":{\"used\":0,\"max\":0},\"spot_weight\":{\"used\":0,\"max\":0},\"spot_day\":{\"unfilled\":0,\"cap\":0,\"sell_cap\":0,\"seeded\":0},\"recon_held\":0,\"orders_10s\":"),
+            "{body}"
+        );
+        assert!(
+            body.contains("\"refused\":{\"unbound\":4,\"not_live\":0,") && body.contains("\"deadman_down\":0,\"flags\":9,\"not_writable\":7}}},\"halted\":["),
+            "{body}"
+        );
+        // Between the other two: one comma each.
+        s.exec.arms_binance.present = 1;
+        s.exec.arms_hyperliquid_gw.present = 1;
+        let n = encode_state_json(&s, &mut buf).unwrap();
+        let body = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(body.contains("\"session_pnl_usd_1e6\":0},\"binance_gw\":{\"slot\":2,"), "{body}");
+        assert!(body.contains("\"not_writable\":7}},\"hyperliquid_gw\":{\"slot\":0,"), "{body}");
+        assert_eq!(crate::bn_mode_word(2), "pm_pro");
+        assert_eq!(crate::sweep_word(0), "clear");
+        assert_eq!(crate::sweep_word(7), "unknown");
     }
 
     #[test]

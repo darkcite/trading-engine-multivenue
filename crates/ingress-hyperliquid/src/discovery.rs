@@ -28,23 +28,29 @@
 //! checks `side < sideSpecs.len()` as captured from the wire instead
 //! of assuming binary outcomes.
 //!
-//! **Builder-dex asset ids are not derived in v1** ([`HlAssetInfo::asset_id`]
-//! is 0 for [`HlAssetKind::BuilderDex`]): the `idx` term needs the
-//! per-dex universe (`{"type":"meta","dex":"<name>"}`), which v1 does
-//! not fetch. A configured `dex:COIN` coin therefore validates only
-//! that the dex name exists — sufficient for Stage 1, because
-//! market-data subscriptions address markets by coin *string*, never
-//! by asset id. Asset ids matter to order placement (8j), which will
-//! fetch per-dex meta when builder-dex execution lands.
+//! **Builder-dex asset ids are derived since HC10** from the dex's
+//! position in `perpDexs` (`dex_idx`; the native dex is the leading
+//! `null`, slot 0 — `xyz` measured 1 on 2026-09-25) and the coin's
+//! position in that dex's own universe (`{"type":"meta","dex":"<name>"}`,
+//! [`HlDiscovery::ingest_dex_meta`]), with the dex meta's `szDecimals`.
+//! The boot fetches the meta of every builder dex a configured coin
+//! names; a coin its dex's meta does not list does not resolve. A dex
+//! whose meta was NOT ingested still validates by name only, with asset
+//! id 0 — market data addresses coins by string, never by id — and no
+//! order may be bound to it ([`HlAssetInfo::asset_id`] 0 is no asset).
 //!
 //! ## Allocation note (doctrine)
 //!
-//! This module runs **at boot only**, where allocation is allowed.
-//! Storage is four `Vec`s reserved once at [`HlDiscovery::new`] and
-//! capped at the `HL_DISCOVERY_*_CAP` limits (fail-fast beyond — a
-//! venue suddenly listing 10× assets is a contract change we want to
-//! see loudly). The table is dropped before the engine loop starts;
-//! nothing here is reachable from a hot path.
+//! This module runs **at boot**, where allocation is allowed, and on
+//! one cold path after it: the HL ingress thread's family rediscovery
+//! between sessions (the lane dark, at most once a minute while a
+//! family awaits its successor — `rediscover_hl_families`). Storage is
+//! six `Vec`s reserved once at [`HlDiscovery::new`] and capped at the
+//! `HL_DISCOVERY_*_CAP` limits (fail-fast beyond — a venue suddenly
+//! listing 10× assets is a contract change we want to see loudly; XMM
+//! XH5e-3 sized them for testnet's 2026-10-04 lists, ≈ 438 KiB reserved
+//! a table). Each table is dropped where it was built; nothing here is
+//! reachable from a hot path.
 //!
 //! ## Wire shapes (live-probed 2026-08-14)
 //!
@@ -83,13 +89,17 @@ use crate::HL_COIN_MAX;
 pub const HL_DISCOVERY_PERPS_CAP: usize = 2048;
 
 /// Hard cap on HIP-4 outcome rows (`outcomeMeta.outcomes`). Live
-/// 2026-08-14: 8 rows (protocol-run BTC dailies — permissionless
-/// deployment is testnet-only); headroom for mainnet opening up.
-pub const HL_DISCOVERY_OUTCOMES_CAP: usize = 512;
+/// 2026-08-14: 8 rows (protocol-run BTC dailies). 2026-10-04: 305 on
+/// mainnet (permissionless deployment opened up) and 633 on testnet —
+/// past the old 512, which refused the testnet boot and would refuse
+/// mainnet's as it grows (XMM XH5e-3). 4 096: over 6× testnet's count.
+pub const HL_DISCOVERY_OUTCOMES_CAP: usize = 4096;
 
 /// Hard cap on `perpDexs` entries (including the leading `null`
 /// native slot) and on stored dex names. Live 2026-08-14: 10 entries.
-pub const HL_DISCOVERY_DEXS_CAP: usize = 64;
+/// 2026-10-04: 11 on mainnet, 268 on testnet — past the old 64, which
+/// refused the testnet boot (XMM XH5e-3). 1 024: over 3× testnet's.
+pub const HL_DISCOVERY_DEXS_CAP: usize = 1024;
 
 /// Hard cap on spot universe rows (`spotMeta.universe`). Live
 /// 2026-08-14: 324 rows.
@@ -97,6 +107,36 @@ pub const HL_DISCOVERY_SPOT_CAP: usize = 4096;
 
 /// Dex-name storage width. Live names are short (`xyz`, `vntls`, …).
 const DEX_NAME_MAX: usize = 16;
+
+/// Hard cap on builder-dex universe rows over every ingested dex meta.
+pub const HL_DISCOVERY_BUILDER_CAP: usize = 2048;
+
+/// A HIP-3 builder-dex perp's asset id: `100_000 + dex_idx × 10_000 +
+/// index` (module docs). `None` off the scheme: the native dex (0), an
+/// index past the dex's 10 000-wide block, or an id into the HIP-4
+/// range. `exec_hyperliquid::asset` mirrors the law (a test there holds
+/// the two in agreement — the exec crate may not depend on this one).
+#[must_use]
+pub const fn builder_asset_id(dex_idx: u32, index: u32) -> Option<u32> {
+    if dex_idx == 0 || index >= 10_000 {
+        return None;
+    }
+    let id = 100_000u64 + dex_idx as u64 * 10_000 + index as u64;
+    if id >= 100_000_000 {
+        return None;
+    }
+    Some(id as u32)
+}
+
+/// The dex half of a `dex:COIN` coin (`None` for any other form).
+#[must_use]
+pub fn dex_of(coin: &[u8]) -> Option<&[u8]> {
+    let colon = memchr::memchr(b':', coin)?;
+    if colon == 0 || colon + 1 >= coin.len() {
+        return None;
+    }
+    Some(&coin[..colon])
+}
 
 /// Largest accepted `outcome` id: keeps the derived asset id
 /// `100_000_000 + 10*outcome + side` (side ≤ 9) inside `u32`.
@@ -128,8 +168,9 @@ pub enum HlAssetKind {
     Perp,
     /// Spot pair (`spotMeta.universe` row; `@{idx}` coin).
     Spot,
-    /// HIP-3 builder-dex perp (`dex:COIN` coin) — name-validated
-    /// only in v1; asset id underived (module docs).
+    /// HIP-3 builder-dex perp (`dex:COIN` coin) — its asset id and
+    /// `szDecimals` from the dex's own meta (HC10); asset id 0 when that
+    /// meta was not ingested (module docs).
     BuilderDex,
     /// HIP-4 outcome market (`#<enc>` coin).
     Outcome,
@@ -138,17 +179,17 @@ pub enum HlAssetKind {
 /// One resolved coin, from [`HlDiscovery::resolve`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HlAssetInfo {
-    /// Venue asset id per the module-docs scheme. **0 for
-    /// [`HlAssetKind::BuilderDex`]** — underivable without the
-    /// per-dex universe, which v1 does not fetch (module docs).
+    /// Venue asset id per the module-docs scheme. **0 for a
+    /// [`HlAssetKind::BuilderDex`] coin whose dex meta was not
+    /// ingested** (module docs) — no order may be bound to it.
     pub asset_id: u32,
     /// Asset class.
     pub kind: HlAssetKind,
-    /// `szDecimals` from `meta.universe` for native perps; **0 for
-    /// every other kind**: spot universe rows do not carry it (it
-    /// lives on the uncaptured `spotMeta.tokens`), builder-dex meta
-    /// is unfetched in v1, and outcome rows have no size decimals on
-    /// this wire shape.
+    /// `szDecimals` from `meta.universe` for native perps and from
+    /// the dex's meta for builder-dex perps (HC10); **0 for every other
+    /// kind**: spot universe rows do not carry it (it lives on the
+    /// uncaptured `spotMeta.tokens`) and outcome rows have no size
+    /// decimals on this wire shape.
     pub sz_decimals: u8,
 }
 
@@ -164,12 +205,16 @@ impl HlAssetInfo {
     pub fn max_price_decimals(&self) -> Option<u8> {
         match self.kind {
             HlAssetKind::Perp => Some(6u8.saturating_sub(self.sz_decimals)),
+            HlAssetKind::BuilderDex if self.asset_id != 0 => {
+                Some(6u8.saturating_sub(self.sz_decimals))
+            }
             _ => None,
         }
     }
 }
 
-/// Boot-only Hyperliquid asset table. See module docs.
+/// Hyperliquid asset table, built at boot and by the ingress thread's
+/// cold rediscovery. See module docs.
 ///
 /// Build once at boot: [`HlDiscovery::new`], then one ingest call per
 /// fetched `POST /info` body. Native-perp asset ids are **positions**
@@ -182,9 +227,16 @@ pub struct HlDiscovery {
     /// Spot universe `index` values seen. Resolve does a linear
     /// scan — boot only.
     spots: Vec<u32>,
-    /// Builder-dex names: (name bytes, valid len). Null slots are
-    /// counted by the ingest return value but not stored.
-    dexs: Vec<([u8; DEX_NAME_MAX], u8)>,
+    /// Builder-dex names: (name bytes, valid len, `dex_idx` = the
+    /// entry's position in `perpDexs`, null slots included). Null
+    /// slots are counted by the ingest return value but not stored.
+    dexs: Vec<([u8; DEX_NAME_MAX], u8, u16)>,
+    /// HC10: builder-dex perps from each ingested dex meta: (`dex_idx`,
+    /// the coin WITHOUT its `dex:` prefix, valid len, `szDecimals`,
+    /// position in that dex's universe).
+    builder: Vec<(u16, [u8; HL_COIN_MAX], u8, u8, u16)>,
+    /// HC10: the `dex_idx` of every dex whose meta was ingested.
+    dex_meta_seen: Vec<u16>,
     /// HIP-4 outcomes: (outcome id, side count from `sideSpecs`,
     /// parsed description). BIN15 O2 added the third member — the
     /// rolling families adopt their live instance from it at boot.
@@ -198,6 +250,8 @@ impl HlDiscovery {
             perps: Vec::with_capacity(HL_DISCOVERY_PERPS_CAP),
             spots: Vec::with_capacity(HL_DISCOVERY_SPOT_CAP),
             dexs: Vec::with_capacity(HL_DISCOVERY_DEXS_CAP),
+            builder: Vec::with_capacity(HL_DISCOVERY_BUILDER_CAP),
+            dex_meta_seen: Vec::with_capacity(HL_DISCOVERY_DEXS_CAP),
             outcomes: Vec::with_capacity(HL_DISCOVERY_OUTCOMES_CAP),
         }
     }
@@ -334,11 +388,13 @@ impl HlDiscovery {
                     if added as usize >= HL_DISCOVERY_DEXS_CAP {
                         return Err(HlDiscoveryErr::TooMany);
                     }
-                    let (row, end) = parse_dex_row(body, i)?;
+                    let ((name, len), end) = parse_dex_row(body, i)?;
                     if self.dexs.len() >= HL_DISCOVERY_DEXS_CAP {
                         return Err(HlDiscoveryErr::TooMany);
                     }
-                    self.dexs.push(row);
+                    // `added` counts null slots too: it IS the entry's
+                    // position — the asset-id scheme's `dex_idx`.
+                    self.dexs.push((name, len, added as u16));
                     added += 1;
                     i = skip_ws(body, end);
                     if i < body.len() && body[i] == b',' {
@@ -349,6 +405,91 @@ impl HlDiscovery {
             }
         }
         Ok(added)
+    }
+
+    /// HC10: parse `{"type":"meta","dex":"<dex>"}` — a builder dex's own
+    /// universe — into the table. `dex` must be a name
+    /// [`Self::ingest_perp_dexs`] stored. Each row's position is its
+    /// `index` in the asset-id scheme, so call once per dex per boot.
+    /// Row names may carry the `dex:` prefix (the venue's spelling) or
+    /// not; they are stored without it. Returns the rows added.
+    ///
+    /// # Errors
+    ///
+    /// [`HlDiscoveryErr::BadRow`] for a dex `perpDexs` did not list (or
+    /// a row off its contract), `Envelope`/`Truncated` for a body that
+    /// is not a meta, `TooMany` past [`HL_DISCOVERY_BUILDER_CAP`].
+    pub fn ingest_dex_meta(&mut self, dex: &[u8], body: &[u8]) -> Result<u32, HlDiscoveryErr> {
+        let dex_idx = self.dex_idx(dex).ok_or(HlDiscoveryErr::BadRow)?;
+        if self.dex_meta_seen.contains(&dex_idx) {
+            return Err(HlDiscoveryErr::BadRow);
+        }
+        let pos = find_field(body, b"\"universe\":").ok_or(HlDiscoveryErr::Envelope)?;
+        let mut i = skip_ws(body, pos);
+        if i >= body.len() || body[i] != b'[' {
+            return Err(HlDiscoveryErr::Envelope);
+        }
+        i += 1;
+        let mut added = 0u32;
+        loop {
+            i = skip_ws(body, i);
+            if i >= body.len() {
+                return Err(HlDiscoveryErr::Truncated);
+            }
+            match body[i] {
+                b']' => break,
+                b'{' => {
+                    let ((name, len, sz), end) = parse_meta_row(body, i)?;
+                    if self.builder.len() >= HL_DISCOVERY_BUILDER_CAP || added >= 10_000 {
+                        return Err(HlDiscoveryErr::TooMany);
+                    }
+                    let full = &name[..len as usize];
+                    let bare = if full.len() > dex.len() + 1
+                        && &full[..dex.len()] == dex
+                        && full[dex.len()] == b':'
+                    {
+                        &full[dex.len() + 1..]
+                    } else {
+                        full
+                    };
+                    let mut row = [0u8; HL_COIN_MAX];
+                    // COPY: ≤ 24 B coin name into its builder row, once per
+                    // row at boot — the row outlives the dex meta body
+                    // (as `parse_meta_row`'s own copy).
+                    row[..bare.len()].copy_from_slice(bare);
+                    self.builder.push((dex_idx, row, bare.len() as u8, sz, added as u16));
+                    added += 1;
+                    i = skip_ws(body, end);
+                    if i < body.len() && body[i] == b',' {
+                        i += 1;
+                    }
+                }
+                _ => return Err(HlDiscoveryErr::BadRow),
+            }
+        }
+        self.dex_meta_seen.push(dex_idx);
+        Ok(added)
+    }
+
+    /// Did `perpDexs` list the builder dex `dex`? (The boot fetches the
+    /// meta only of dexes the venue named — a configured name is never
+    /// rendered into a request unless the venue itself listed it.)
+    #[must_use]
+    pub fn has_dex(&self, dex: &[u8]) -> bool {
+        self.dex_idx(dex).is_some()
+    }
+
+    /// The `dex_idx` of a stored builder dex.
+    fn dex_idx(&self, dex: &[u8]) -> Option<u16> {
+        let mut k = 0;
+        while k < self.dexs.len() {
+            let (name, len, idx) = &self.dexs[k];
+            if *len as usize == dex.len() && &name[..*len as usize] == dex {
+                return Some(*idx);
+            }
+            k += 1;
+        }
+        None
     }
 
     /// Parse a `{"type":"outcomeMeta"}` body into the table. Returns
@@ -466,18 +607,28 @@ impl HlDiscovery {
                     if dex.is_empty() || rest.is_empty() {
                         return None;
                     }
+                    let dex_idx = self.dex_idx(dex)?;
+                    if !self.dex_meta_seen.contains(&dex_idx) {
+                        // Name-validated only (module docs).
+                        return Some(HlAssetInfo {
+                            asset_id: 0,
+                            kind: HlAssetKind::BuilderDex,
+                            sz_decimals: 0,
+                        });
+                    }
                     let mut k = 0;
-                    while k < self.dexs.len() {
-                        let (name, len) = &self.dexs[k];
-                        if *len as usize == dex.len() && &name[..*len as usize] == dex {
+                    while k < self.builder.len() {
+                        let (d, name, len, sz, index) = &self.builder[k];
+                        if *d == dex_idx && *len as usize == rest.len() && &name[..*len as usize] == rest {
                             return Some(HlAssetInfo {
-                                asset_id: 0,
+                                asset_id: builder_asset_id(u32::from(dex_idx), u32::from(*index))?,
                                 kind: HlAssetKind::BuilderDex,
-                                sz_decimals: 0,
+                                sz_decimals: *sz,
                             });
                         }
                         k += 1;
                     }
+                    // The dex's own universe does not list it.
                     None
                 } else {
                     let mut k = 0;
@@ -518,6 +669,12 @@ impl HlDiscovery {
     /// allocate by doctrine (module docs).
     #[must_use]
     pub fn outcome_specs(&self) -> Vec<HlOutcomeSpec> {
+        // COPY: cold — every known-grammar outcome spec (64 B) into the
+        // caller's own table, at most HL_DISCOVERY_OUTCOMES_CAP × 64 B =
+        // 256 KiB, once a boot and once a rediscovery (at most a minute
+        // apart, the lane dark). Rejected: handing the rows over by move
+        // (they sit beside their id and side count; a second layout for
+        // a cold path).
         let mut out = Vec::with_capacity(self.outcomes.len());
         for (_id, _sides, spec) in &self.outcomes {
             if spec.grammar != HlOutcomeGrammar::Unknown {
@@ -552,6 +709,15 @@ impl Default for HlDiscovery {
 
 /// Capacity of [`HlOutcomeSpec::underlying`].
 pub const HL_OUTCOME_UNDERLYING_MAX: usize = 15;
+
+/// **A-S7-47** — the widest deployer venue name an outcome spec keeps
+/// (`"venue":"out"`; testnet's widest of 95 is 5 B, 2026-10-06). A wider
+/// one is kept as a stranger's: it names no family's deployer.
+pub const HL_OUTCOME_VENUE_MAX: usize = 8;
+
+/// [`HlOutcomeSpec::venue_len`] of a row naming a venue that is empty or
+/// wider than [`HL_OUTCOME_VENUE_MAX`]: a stranger, never native.
+const VENUE_STRANGER: u8 = u8::MAX;
 
 /// Deployer grammar of a HIP-4 outcome `description`.
 ///
@@ -596,7 +762,12 @@ pub struct HlOutcomeSpec {
     pub underlying_len: u8,
     /// Underlying coin bytes (`perp:` / `underlying:`), left-aligned.
     pub underlying: [u8; HL_OUTCOME_UNDERLYING_MAX],
-    // 3 bytes of interior padding here — the `i64` below is 8-aligned.
+    /// A-S7-47: bytes of [`Self::venue`] in use — 0 when the row names no
+    /// deployer venue (HyperCore's own), `u8::MAX` when the venue is empty,
+    /// no string or does not fit (a stranger's). Set by [`Self::set_venue`].
+    pub venue_len: u8,
+    /// Explicit interior padding — the `i64` below is 8-aligned.
+    _pad0: [u8; 2],
     /// Strike/target ×1e6 (`threshold:` / `target:` / `targetPrice:`);
     /// 0 = absent.
     pub strike_1e6: i64,
@@ -609,11 +780,16 @@ pub struct HlOutcomeSpec {
     pub twap_s: u32,
     /// Recurrence period in seconds (`period:`); 0 = absent.
     pub period_s: u32,
+    /// A-S7-47: the deployer's venue (`"venue"`, the row's or the
+    /// `outcomeCreated` push's), left-aligned — the family's fourth
+    /// clause ([`crate::family::HlFamilyTable::match_spec`]).
+    pub venue: [u8; HL_OUTCOME_VENUE_MAX],
     /// Explicit tail padding.
-    _pad: [u8; 16],
+    _pad: [u8; 8],
 }
 
 const _: () = assert!(::core::mem::size_of::<HlOutcomeSpec>() == 64);
+const _: () = assert!(::core::mem::offset_of!(HlOutcomeSpec, venue) == 48);
 
 impl HlOutcomeSpec {
     /// The all-zero spec for `outcome` — what a description with
@@ -629,7 +805,10 @@ impl HlOutcomeSpec {
             expiry_ns: 0,
             twap_s: 0,
             period_s: 0,
-            _pad: [0; 16],
+            venue_len: 0,
+            _pad0: [0; 2],
+            venue: [0; HL_OUTCOME_VENUE_MAX],
+            _pad: [0; 8],
         }
     }
 
@@ -639,6 +818,56 @@ impl HlOutcomeSpec {
         let n = self.underlying_len as usize;
         debug_assert!(n <= HL_OUTCOME_UNDERLYING_MAX);
         &self.underlying[..n.min(HL_OUTCOME_UNDERLYING_MAX)]
+    }
+
+    /// **A-S7-47** — the deployer's venue bytes; empty for a row naming no
+    /// venue and for a stranger's that did not fit ([`Self::is_native`]
+    /// tells the two apart).
+    #[inline]
+    #[must_use]
+    pub fn venue_bytes(&self) -> &[u8] {
+        let n = self.venue_len as usize;
+        if n > HL_OUTCOME_VENUE_MAX {
+            &[]
+        } else {
+            &self.venue[..n]
+        }
+    }
+
+    /// **A-S7-47** — the row names no deployer venue: HyperCore's own.
+    #[inline]
+    #[must_use]
+    pub const fn is_native(&self) -> bool {
+        self.venue_len == 0
+    }
+
+    /// **A-S7-47** — keep the deployer's `venue` (`None`: the row or push
+    /// names none — HyperCore's own). One that is empty (a `venue` key whose
+    /// value is no string reads so) or wider than [`HL_OUTCOME_VENUE_MAX`]
+    /// is kept as a stranger's: it names no family's deployer and never
+    /// reads as native. In place, no allocation; the bytes past the name are
+    /// zero (the derived `Eq` reads all eight).
+    #[inline]
+    pub fn set_venue(&mut self, venue: Option<&[u8]>) {
+        self.venue = [0; HL_OUTCOME_VENUE_MAX];
+        let Some(v) = venue else {
+            self.venue_len = 0;
+            return;
+        };
+        if v.is_empty() || v.len() > HL_OUTCOME_VENUE_MAX {
+            self.venue_len = VENUE_STRANGER;
+            return;
+        }
+        // COPY: ≤ 8 B venue name into the spec's fixed field, once a row
+        // or a push — the fixed-size fields a spec keeps, as the
+        // underlying's; rejected: borrowing (the spec outlives the rx
+        // buffer).
+        let mut k = 0usize;
+        while k < v.len() {
+            self.venue[k] = v[k];
+            k += 1;
+        }
+        self.venue_len = v.len() as u8;
     }
 }
 
@@ -886,8 +1115,8 @@ fn scan_px_1e6(val: &[u8]) -> Option<i64> {
     Some(if neg { -units } else { units })
 }
 
-/// All-digit `u32` spanning the whole token. The 10-digit cap keeps
-/// [`scan_u64`]'s wrapping multiply out of range.
+/// All-digit `u32` spanning the whole token, at most 10 digits (the
+/// `u32` decimal width).
 fn scan_u32_exact(val: &[u8]) -> Option<u32> {
     if val.is_empty() || val.len() > 10 {
         return None;
@@ -961,6 +1190,11 @@ fn parse_meta_row(
                         if s.is_empty() || s.len() > HL_COIN_MAX {
                             return Err(HlDiscoveryErr::BadRow);
                         }
+                        // COPY: ≤ 24 B coin name (HL_COIN_MAX) into its discovery row, once per
+                        // coin row at boot — the row outlives the /info meta body it was scanned
+                        // from — rejected: rows borrowing the body (the meta body pinned for the
+                        // table's life and a lifetime threaded through the boot, to save ≤ 24 B a
+                        // row).
                         name[..s.len()].copy_from_slice(s);
                         name_len = s.len() as u8;
                         i = end;
@@ -1089,6 +1323,11 @@ fn parse_dex_row(
                         if s.is_empty() || s.len() > DEX_NAME_MAX {
                             return Err(HlDiscoveryErr::BadRow);
                         }
+                        // COPY: ≤ 16 B perp-dex name (DEX_NAME_MAX) into its discovery row, once
+                        // per dex row at boot — the row outlives the /info perpDexs body it was
+                        // scanned from — rejected: rows borrowing the body (the body pinned for the
+                        // table's life and a lifetime threaded through the boot, to save ≤ 16 B a
+                        // row).
                         name[..s.len()].copy_from_slice(s);
                         name_len = s.len() as u8;
                         i = end;
@@ -1110,6 +1349,10 @@ fn parse_dex_row(
 
 /// Parse one `outcomeMeta.outcomes` row starting at `pos` (must point
 /// at `{`). Returns `((outcome_id, n_sides), end)`.
+// COPY: `Result<((u32, u8, HlOutcomeSpec), usize), _>` ≥ 80 B by value,
+// once per row of the boot-time `outcomeMeta` discovery (cold; the row
+// is pushed into the discovery table next) — rejected: an out-param
+// into the table's next slot, bookkeeping a boot-once path does not earn.
 fn parse_outcome_row(
     body: &[u8],
     pos: usize,
@@ -1124,6 +1367,9 @@ fn parse_outcome_row(
     // body so it is subscribed at the first `Steady` instead of
     // waiting up to a whole period for the next lifecycle push.
     let mut desc: Option<(usize, usize)> = None;
+    // A-S7-47: the deployer's venue (`outcomeMeta.deployers[].venue`) —
+    // the family's fourth clause.
+    let mut venue: Option<(usize, usize)> = None;
 
     loop {
         i = skip_ws(body, i);
@@ -1163,11 +1409,15 @@ fn parse_outcome_row(
                         // Arbitrary text; the skipper is escape-aware
                         // via skip_string, and the span between the
                         // quotes is the grammar's input.
-                        let start = skip_ws(body, i);
-                        let end = skip_json_value(body, i).ok_or(HlDiscoveryErr::BadRow)?;
-                        if body.get(start) == Some(&b'"') && end > start + 1 {
-                            desc = Some((start + 1, end - 1));
-                        }
+                        let (span, end) = string_span(body, i)?;
+                        desc = span;
+                        i = end;
+                    }
+                    b"venue" => {
+                        // A value that is no string is a stranger's venue
+                        // (an empty span), never a native row.
+                        let (span, end) = string_span(body, i)?;
+                        venue = Some(span.unwrap_or((end, end)));
                         i = end;
                     }
                     _ => {
@@ -1181,11 +1431,22 @@ fn parse_outcome_row(
 
     let id = outcome.ok_or(HlDiscoveryErr::BadRow)?;
     let sides = n_sides.ok_or(HlDiscoveryErr::BadRow)?;
-    let spec = match desc {
+    let mut spec = match desc {
         Some((a, b)) if b <= body.len() => parse_outcome_spec(id, &body[a..b]),
         _ => HlOutcomeSpec::empty(id),
     };
+    spec.set_venue(venue.and_then(|(a, b)| body.get(a..b)));
     Ok(((id, sides, spec), i))
+}
+
+/// A string value's span between its quotes at `i` (`None` for a value of
+/// another kind), and where the value ends. Escape-aware via
+/// `skip_json_value`.
+fn string_span(body: &[u8], i: usize) -> Result<(Option<(usize, usize)>, usize), HlDiscoveryErr> {
+    let start = skip_ws(body, i);
+    let end = skip_json_value(body, i).ok_or(HlDiscoveryErr::BadRow)?;
+    let span = (body.get(start) == Some(&b'"') && end > start + 1).then_some((start + 1, end - 1));
+    Ok((span, end))
 }
 
 // ---------------------------------------------------------------
@@ -1251,9 +1512,9 @@ fn count_array_elems(body: &[u8], pos: usize) -> Result<(u32, usize), HlDiscover
 }
 
 /// Parse the all-digits suffix `coin[1..]` of an `@{idx}` / `#<enc>`
-/// coin into a `u32`. At most 10 digits (the `u32` decimal width, so
-/// the underlying u64 scan cannot wrap); the digits must run to the
-/// end of the coin. `None` on empty / junk / overflow.
+/// coin into a `u32`. At most 10 digits (the `u32` decimal width); the
+/// digits must run to the end of the coin. `None` on empty / junk /
+/// overflow.
 fn parse_coin_index(coin: &[u8]) -> Option<u32> {
     let (v, end) = scan_u64(coin, 1)?;
     if end != coin.len() || coin.len() - 1 > 10 {
@@ -1576,6 +1837,43 @@ mod tests {
         assert_eq!(d.resolve(b"nope:AAPL"), None);
     }
 
+    /// HC10: a dex's own meta gives its coins real asset ids and size
+    /// decimals — `100_000 + dex_idx × 10_000 + index` — with or without
+    /// the `dex:` prefix on the row names; a coin the dex does not list
+    /// does not resolve; a dex whose meta was not ingested stays
+    /// name-validated at asset 0.
+    #[test]
+    fn a_dex_meta_derives_builder_asset_ids_and_size_decimals() {
+        let mut d = HlDiscovery::new();
+        d.ingest_perp_dexs(PERP_DEXS).expect("dexs");
+        let xyz = br#"{"universe":[{"szDecimals":4,"name":"xyz:XYZ100","maxLeverage":20,"onlyIsolated":true},{"szDecimals":3,"name":"xyz:TSLA","maxLeverage":10},{"szDecimals":3,"name":"NVDA","maxLeverage":10}],"marginTables":[[1,{"description":"","marginTiers":[]}]],"collateralToken":0}"#;
+        assert_eq!(d.ingest_dex_meta(b"xyz", xyz), Ok(3));
+        let nvda = d.resolve(b"xyz:NVDA").expect("listed");
+        assert_eq!(nvda, HlAssetInfo { asset_id: 110_002, kind: HlAssetKind::BuilderDex, sz_decimals: 3 });
+        assert_eq!(nvda.max_price_decimals(), Some(3));
+        assert_eq!(d.resolve(b"xyz:XYZ100").unwrap().asset_id, 110_000);
+        assert_eq!(d.resolve(b"xyz:AAPL"), None, "the dex's universe does not list it");
+        // vntls (dex_idx 2): meta not ingested → name-validated, asset 0.
+        let v = d.resolve(b"vntls:UBER").expect("dex exists");
+        assert_eq!((v.asset_id, v.max_price_decimals()), (0, None));
+        // A dex perpDexs did not list, and a second ingest, refuse.
+        assert_eq!(d.ingest_dex_meta(b"nope", xyz), Err(HlDiscoveryErr::BadRow));
+        assert_eq!(d.ingest_dex_meta(b"xyz", xyz), Err(HlDiscoveryErr::BadRow));
+        assert_eq!(dex_of(b"xyz:NVDA"), Some(&b"xyz"[..]));
+        assert_eq!(dex_of(b"BTC"), None);
+        assert_eq!(dex_of(b":X"), None);
+    }
+
+    #[test]
+    fn the_builder_asset_id_scheme_is_bounded() {
+        assert_eq!(builder_asset_id(1, 0), Some(110_000));
+        assert_eq!(builder_asset_id(1, 9_999), Some(119_999));
+        assert_eq!(builder_asset_id(0, 5), None, "the native dex is not a builder dex");
+        assert_eq!(builder_asset_id(1, 10_000), None);
+        assert_eq!(builder_asset_id(9_990, 0), None, "never into the HIP-4 range");
+        assert_eq!(builder_asset_id(9_989, 9_999), Some(99_999_999));
+    }
+
     #[test]
     fn perp_dexs_rejects_envelope_violations() {
         let mut d = HlDiscovery::new();
@@ -1632,6 +1930,24 @@ mod tests {
         );
     }
 
+    /// XMM XH5e-3: the venue's live sizes of 2026-10-04 parse — testnet's
+    /// 268 `perpDexs` entries and 633 outcome rows (both past the old caps,
+    /// which refused the testnet boot).
+    #[test]
+    fn the_live_testnet_sizes_of_2026_10_04_parse() {
+        let mut d = HlDiscovery::new();
+        let dexs = synth_body(b"[", b"null", 268, b"]");
+        assert_eq!(d.ingest_perp_dexs(&dexs).expect("268 entries"), 268);
+        let mut d = HlDiscovery::new();
+        let outcomes = synth_body(
+            br#"{"outcomes":["#,
+            br#"{"outcome":1,"sideSpecs":[]}"#,
+            633,
+            br#"]}"#,
+        );
+        assert_eq!(d.ingest_outcome_meta(&outcomes).expect("633 rows"), 633);
+    }
+
     #[test]
     fn perp_dexs_enforces_dexs_cap_counting_null_slots() {
         let mut d = HlDiscovery::new();
@@ -1675,6 +1991,40 @@ mod tests {
         assert_eq!(d.resolve(b"#10812"), None);
         // Unknown outcome id 9999.
         assert_eq!(d.resolve(b"#99990"), None);
+    }
+
+    /// A-S7-47: a row's deployer venue is kept beside its economics — the
+    /// `out` venue's, none (HyperCore's own), or a stranger's that does not
+    /// fit (never native).
+    #[test]
+    fn outcome_rows_keep_their_deployer_s_venue() {
+        let mut d = HlDiscovery::new();
+        let body = br#"{"deployers":[],"outcomes":[
+          {"outcome":2649,"name":"template:binaryPrice","description":"perp:BTC|seconds:60|threshold:77177|time:20260912-0630","sideSpecs":[{"name":"Yes"},{"name":"No"}],"venue":"out"},
+          {"outcome":2650,"name":"Recurring","description":"class:priceBinary|underlying:BTC|expiry:20261007-0300|targetPrice:85620|period:1d","sideSpecs":[{"name":"Yes"},{"name":"No"}]},
+          {"outcome":2651,"name":"x","description":"perp:BTC|seconds:60|threshold:1|time:20260912-0630","sideSpecs":[{"name":"Yes"},{"name":"No"}],"venue":"averylongvenue"}]}"#;
+        assert_eq!(d.ingest_outcome_meta(body).unwrap(), 3);
+        let specs = d.outcome_specs();
+        assert_eq!(
+            (specs[0].venue_bytes(), specs[0].is_native()),
+            (&b"out"[..], false)
+        );
+        assert_eq!(
+            (specs[1].venue_bytes(), specs[1].is_native()),
+            (&b""[..], true)
+        );
+        assert_eq!(
+            (specs[2].venue_bytes(), specs[2].is_native()),
+            (&b""[..], false),
+            "a stranger's, kept as one"
+        );
+        let mut n = HlDiscovery::new();
+        let nulled = br#"{"outcomes":[{"outcome":2652,"description":"class:priceBinary|underlying:BTC|expiry:20261007-0300|targetPrice:85620|period:1d","sideSpecs":[{"name":"Yes"},{"name":"No"}],"venue":null}]}"#;
+        assert_eq!(n.ingest_outcome_meta(nulled).unwrap(), 1);
+        assert!(
+            !n.outcome_specs()[0].is_native(),
+            "a venue that is no string is a stranger's"
+        );
     }
 
     #[test]

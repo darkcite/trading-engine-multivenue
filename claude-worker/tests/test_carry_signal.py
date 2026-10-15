@@ -278,12 +278,15 @@ def test_regime_label_gates_cvfc_and_s1_entries_never_exits(tmp_path, monkeypatc
     put_rates(db, "bybit-linear:COTIUSDT", eight_hourly(1e-4, prints=9))
     fdir = features / "run-1"
     for sym, px in ((7003, 0.005), (7004, 0.005)):
-        (fdir / f"{sym}.json").write_text(json.dumps({"sym": sym, "last_bid_px": int(px * 1e6), "last_ask_px": int(px * 1e6) + 10}))
+        quote = {"sym": sym, "last_bid_px": int(px * 1e6), "last_ask_px": int(px * 1e6) + 10}
+        (fdir / f"{sym}.json").write_text(json.dumps(quote))
     m = json.loads(map_path.read_text())
     m["markets"]["binance-usdm:cotiusdt"] = 7003
     m["markets"]["bybit-linear:COTIUSDT"] = 7004
     map_path.write_text(json.dumps(m))
-    blocked = claude_worker.carry_signal.run_cycle(db, features, map_path, out, NOW, regime_words={"fast": bull, "slow": bear})
+    blocked = claude_worker.carry_signal.run_cycle(
+        db, features, map_path, out, NOW, regime_words={"fast": bull, "slow": bear}
+    )
     body = blocked.read_text()
     assert "regime: ENTRIES BLOCKED" in body
     assert "ENTRIES regime-blocked this cycle" in body and "ENTER ADA" not in body
@@ -291,13 +294,21 @@ def test_regime_label_gates_cvfc_and_s1_entries_never_exits(tmp_path, monkeypatc
     state = json.loads((out / "state.json").read_text())
     assert state["positions"] == [] and state.get("s1_positions", []) == []
     # Open regime: both lanes enter as before.
-    opened = claude_worker.carry_signal.run_cycle(db, features, map_path, out, NOW, regime_words={"fast": bear, "slow": bull})
+    opened = claude_worker.carry_signal.run_cycle(
+        db, features, map_path, out, NOW, regime_words={"fast": bear, "slow": bull}
+    )
     body = opened.read_text()
-    assert "regime: open" in body and "ENTER ADA short=hl long=dbt" in body and "ENTER short=bybit long=bn" in body
+    assert (
+        "regime: open" in body
+        and "ENTER ADA short=hl long=dbt" in body
+        and "ENTER short=bybit long=bn" in body
+    )
     # Past min-hold with the spread flipped, under a BLOCKING regime: exits.
     late = NOW + 100 * HOUR_MS
     put_rates(db, "hyperliquid:ADA", hourly(-6e-5, end=late))
     put_rates(db, "deribit:ADA_USDC-PERPETUAL", hourly(1e-5, end=late))
-    exited = claude_worker.carry_signal.run_cycle(db, features, map_path, out, late, regime_words={"fast": bear, "slow": bear})
+    exited = claude_worker.carry_signal.run_cycle(
+        db, features, map_path, out, late, regime_words={"fast": bear, "slow": bear}
+    )
     assert "EXIT ADA" in exited.read_text()
     assert json.loads((out / "state.json").read_text())["positions"] == []

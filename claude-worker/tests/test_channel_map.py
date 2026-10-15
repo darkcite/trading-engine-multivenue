@@ -9,7 +9,6 @@ only with the other in the same commit.
 Convention: full ``import x`` only.
 """
 
-import pathlib
 
 import claude_worker.channel_map
 import claude_worker.iv_digest
@@ -25,6 +24,8 @@ LAW: list[tuple[str, int]] = [
     ("123456789", P),  # bare PM token id
     ("binance:btcusdt", P),
     ("binance-usdm:btcusdt", P | F),
+    ("binance-coinm:btcusd_perp", P | F),
+    ("binance-coinm:btcusd_261225", P | F),
     ("okx:BTC-USDT-SWAP", P | F | D),
     ("okx:BTC-USDT", P | D),
     ("okx:BTC-USD-260925-100000-C", O),
@@ -36,6 +37,12 @@ LAW: list[tuple[str, int]] = [
     ("hyperliquid:#NVDA", P),
     ("bybit:BTCUSDT", P),
     ("bybit-linear:BTCUSDT", P | F),
+    ("mexc:BTCUSDT", P),
+    ("mexc-perp:BTC_USDT", P | F),
+    ("mexc-perp:XAU_USDT", P | F),
+    ("hypercall:BTC-20261002-100000-C", O | P),
+    ("hypercall:SP500-20260930-7742.5-P", O | P),
+    ("hypercall-idx:SP500", 0),
 ]
 
 

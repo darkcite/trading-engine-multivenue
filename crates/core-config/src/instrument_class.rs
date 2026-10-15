@@ -35,6 +35,9 @@ use core_types::InstrumentClass;
 /// * `binance:<sym>` → `Spot`; `binance-usdm:<sym>` → `Perp`, or
 ///   `Dated` when the venue symbol carries the delivery suffix
 ///   `_yymmdd` (`btcusdt_260327`); `binance-opt:<name>` → `Option`;
+///   `binance-coinm:<sym>` (BX2) → `Perp` for `…_perp`, `Dated` for
+///   `…_yymmdd`, anything else unknown — inverse is a discovery-row
+///   flag, never a class;
 /// * `okx:<instId>` — `…-SWAP` → `Perp`; `…-C` / `…-P` with a strike
 ///   segment → `Option`; a 6-digit date segment → `Dated`; the plain
 ///   `BASE-QUOTE` pair → `Spot`;
@@ -47,7 +50,17 @@ use core_types::InstrumentClass;
 ///   perp universe). `@<idx>` spot coins read as `Perp` — a KNOWN
 ///   mis-class, see [`hl_class`];
 /// * `bybit:<sym>` → `Spot`; `bybit-linear:<sym>` → `Dated` when the
-///   symbol carries `-DDMMMYY`, else `Perp`.
+///   symbol carries `-DDMMMYY`, else `Perp`;
+/// * `mexc:<SYM>` → `Spot` (tokenized xStocks such as `AAPLXUSDT` are
+///   ordinary spot rows — no new class, plan §4 D6); `mexc-perp:<SYM>`
+///   → `Perp` ALWAYS: MEXC lists no dated futures, and its TradFi /
+///   equity / FX / metal contracts are ordinary perps;
+/// * `hyperevm:<0x address>` → `Spot` (HYPARB H3b: an AMM pool trades
+///   token0 against token1 outright — a spot exchange with a curve);
+/// * `hypercall:<UND>-<YYYYMMDD>-<STRIKE>-<C|P>` → `Option` (HC1; strikes
+///   may be decimal, `BOT-20260925-2.5-C`), any other name `None`;
+///   `hypercall-idx:<UND>` → `Spot` — the venue's settlement index, a
+///   capture-only price series (nothing trades it).
 #[must_use]
 pub fn class_of_descriptor(descriptor: &str) -> Option<InstrumentClass> {
     if descriptor.is_empty() {
@@ -71,6 +84,7 @@ pub fn class_of_descriptor(descriptor: &str) -> Option<InstrumentClass> {
             InstrumentClass::Perp
         }),
         "binance-opt" => Some(InstrumentClass::Option),
+        "binance-coinm" => bn_coinm_class(name),
         "okx" => okx_class(name),
         "deribit" => deribit_class(name),
         "hyperliquid" => Some(hl_class(name)),
@@ -80,7 +94,43 @@ pub fn class_of_descriptor(descriptor: &str) -> Option<InstrumentClass> {
         } else {
             InstrumentClass::Perp
         }),
+        "mexc" => Some(InstrumentClass::Spot),
+        "mexc-perp" => Some(InstrumentClass::Perp),
+        "hyperevm" => Some(InstrumentClass::Spot),
+        "hypercall" => hypercall_class(name),
+        "hypercall-idx" => Some(InstrumentClass::Spot),
         _ => None,
+    }
+}
+
+/// Hypercall option symbols (HC1): `<UND>-<YYYYMMDD>-<STRIKE>-<C|P>` —
+/// `BTC-20261002-100000-C`, `SNDK-20260927-1948-P`, and decimal strikes
+/// such as `BOT-20260925-2.5-C`. The venue lists options only, but the
+/// shape is still checked: a malformed name is `None`, never a guess.
+fn hypercall_class(name: &str) -> Option<InstrumentClass> {
+    let mut segs = name.split('-');
+    let (Some(und), Some(date), Some(strike), Some(right), None) = (
+        segs.next(),
+        segs.next(),
+        segs.next(),
+        segs.next(),
+        segs.next(),
+    ) else {
+        return None;
+    };
+    let ok = !und.is_empty()
+        && is_digits(date, 8)
+        && is_decimal(strike)
+        && (right == "C" || right == "P");
+    ok.then_some(InstrumentClass::Option)
+}
+
+/// `123` or `2.5`: digits, at most one interior point.
+fn is_decimal(s: &str) -> bool {
+    let all_digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    match s.split_once('.') {
+        Some((int, frac)) => all_digits(int) && all_digits(frac),
+        None => all_digits(s),
     }
 }
 
@@ -110,6 +160,20 @@ fn has_bn_delivery_suffix(name: &str) -> bool {
     match name.rsplit_once('_') {
         Some((base, tail)) => !base.is_empty() && is_digits(tail, 6),
         None => false,
+    }
+}
+
+/// COIN-M stream symbols (`universe.rs` `coinm` / `coinm_dated`):
+/// `btcusd_perp` → `Perp`, `btcusd_261225` → `Dated`. The list
+/// validators require one of the two suffixes, so any other shape is a
+/// descriptor this law does not know.
+fn bn_coinm_class(name: &str) -> Option<InstrumentClass> {
+    match name.rsplit_once('_') {
+        Some((base, "perp")) if !base.is_empty() => Some(InstrumentClass::Perp),
+        Some((base, tail)) if !base.is_empty() && is_digits(tail, 6) => {
+            Some(InstrumentClass::Dated)
+        }
+        _ => None,
     }
 }
 
@@ -219,6 +283,8 @@ mod tests {
         assert_eq!(class_of_descriptor("binance-usdm:btcusdt"), Some(Perp));
         assert_eq!(class_of_descriptor("binance-usdm:btcusdt_260327"), Some(Dated));
         assert_eq!(class_of_descriptor("binance-opt:BTC-260912-76500-C"), Some(Opt));
+        assert_eq!(class_of_descriptor("binance-coinm:btcusd_perp"), Some(Perp));
+        assert_eq!(class_of_descriptor("binance-coinm:btcusd_261225"), Some(Dated));
         assert_eq!(class_of_descriptor("okx:BTC-USDT"), Some(Spot));
         assert_eq!(class_of_descriptor("okx:ETH-USDT-SWAP"), Some(Perp));
         assert_eq!(class_of_descriptor("okx:BTC-USDT-260926"), Some(Dated));
@@ -239,6 +305,23 @@ mod tests {
         assert_eq!(class_of_descriptor("bybit:BTCUSDT"), Some(Spot));
         assert_eq!(class_of_descriptor("bybit-linear:BTCUSDT"), Some(Perp));
         assert_eq!(class_of_descriptor("bybit-linear:BTCUSDT-26SEP25"), Some(Dated));
+        // MX2: the MEXC namespaces — equities and TradFi ride the
+        // ordinary Spot / Perp classes (D6).
+        assert_eq!(class_of_descriptor("mexc:BTCUSDT"), Some(Spot));
+        assert_eq!(class_of_descriptor("mexc:AAPLXUSDT"), Some(Spot));
+        assert_eq!(class_of_descriptor("mexc-perp:BTC_USDT"), Some(Perp));
+        assert_eq!(class_of_descriptor("mexc-perp:XAU_USDT"), Some(Perp));
+        assert_eq!(class_of_descriptor("mexc-perp:AAPLSTOCK_USDT"), Some(Perp));
+        // HYPARB H3b: a HyperEVM pool is spot.
+        assert_eq!(
+            class_of_descriptor("hyperevm:0x6c9a33e3b592c0d65b3ba59355d5be0d38259285"),
+            Some(Spot)
+        );
+        // HC1: Hypercall options (decimal strikes too) and its index.
+        assert_eq!(class_of_descriptor("hypercall:BTC-20261002-100000-C"), Some(Opt));
+        assert_eq!(class_of_descriptor("hypercall:SNDK-20260927-1948-P"), Some(Opt));
+        assert_eq!(class_of_descriptor("hypercall:BOT-20260925-2.5-C"), Some(Opt));
+        assert_eq!(class_of_descriptor("hypercall-idx:SP500"), Some(Spot));
         assert_eq!(
             class_of_descriptor(
                 "105554486916384658090975601083014063097607795931086109853984637938068004048895"
@@ -253,6 +336,24 @@ mod tests {
         assert_eq!(class_of_descriptor("run-1789187999444152000/sym-0x0200000a"), None);
         assert_eq!(class_of_descriptor("kraken:XBTUSD"), None);
         assert_eq!(class_of_descriptor("binance:"), None);
+        // BX2: a COIN-M name without one of its two suffixes.
+        assert_eq!(class_of_descriptor("binance-coinm:btcusd"), None);
+        assert_eq!(class_of_descriptor("binance-coinm:btcusd_2612"), None);
+        assert_eq!(class_of_descriptor("binance-coinm:_perp"), None);
+        assert_eq!(class_of_descriptor("binance-coinm:"), None);
+        assert_eq!(class_of_descriptor("mexc:"), None);
+        assert_eq!(class_of_descriptor("mexc-perp:"), None);
+        assert_eq!(class_of_descriptor("mexc-spot:BTCUSDT"), None);
+        assert_eq!(class_of_descriptor("hyperevm:"), None);
+        assert_eq!(class_of_descriptor("hypercall:"), None);
+        assert_eq!(class_of_descriptor("hypercall-idx:"), None);
+        assert_eq!(class_of_descriptor("hypercall:BTC-20261002-100000"), None);
+        assert_eq!(class_of_descriptor("hypercall:BTC-261002-100000-C"), None);
+        assert_eq!(class_of_descriptor("hypercall:BTC-20261002-1.2.3-P"), None);
+        assert_eq!(class_of_descriptor("hypercall:BTC-20261002-.5-P"), None);
+        assert_eq!(class_of_descriptor("hypercall:-20261002-100-C"), None);
+        assert_eq!(class_of_descriptor("hypercall:BTC-20261002-100-X"), None);
+        assert_eq!(class_of_descriptor("hypercall:BTC-20261002-100-C-1"), None);
         assert_eq!(class_of_descriptor("okx:BTC-USD-FOO-77000-C"), None);
         assert_eq!(class_of_descriptor("okx:BTC"), None);
         assert_eq!(class_of_descriptor("deribit:BTC-FS-26SEP26_PERP"), None);

@@ -31,6 +31,12 @@ use zeroize::Zeroize;
 
 pub mod bin15;
 pub mod exec;
+/// HAR H3: the long-tenor HAR series list (`har.toml`).
+pub mod har;
+/// HC11: `hcv.toml`, the slot-7 member's artifact.
+pub mod hcv;
+/// HYPARB H5: the slot-0 member's parameter artifact (`hyparb.toml`).
+pub mod hyparb;
 pub mod icdp;
 /// XSD-F: the descriptor law — an instrument's fee class from its §9.4
 /// descriptor (mirrored in `claude_worker.instrument_class`).
@@ -40,6 +46,8 @@ pub mod regime;
 pub mod universe;
 /// VRP V4: the VRP member's parameter artifact (`vrp.toml`) + seed rows.
 pub mod vrp;
+/// XMM XH1: the slot-6 member's parameter artifact (`xmm.toml`).
+pub mod xmm;
 pub mod xsd;
 
 // ---------------------------------------------------------------
@@ -97,18 +105,29 @@ pub struct Config {
     /// (`GET /fapi/v1/exchangeInfo`). Env: `BINANCE_FUT_REST_HOST`.
     /// Default: `fapi.binance.com`.
     pub binance_fut_rest_host: String,
+    /// Binance COIN-M futures WS host (BX2): `/ws/<sym>@bookTicker` and
+    /// `/market/ws/<sym>@markPrice` — the USDⓈ-M path law (K10,
+    /// measured 2026-09-26: dstream carries both streams on `/ws/`,
+    /// `/market/ws/` and `/public/ws/`). Env: `BINANCE_COINM_WS_HOST`.
+    /// Default: `dstream.binance.com`.
+    pub binance_coinm_ws_host: String,
+    /// Binance COIN-M REST host for BX2 boot discovery
+    /// (`GET /dapi/v1/exchangeInfo`). Env: `BINANCE_COINM_REST_HOST`.
+    /// Default: `dapi.binance.com`.
+    pub binance_coinm_rest_host: String,
     /// Binance European-options REST host (M2.4 eapi discovery:
     /// `GET /eapi/v1/exchangeInfo`, `GET /eapi/v1/index`). Env:
     /// `BINANCE_EAPI_REST_HOST`. Default: `eapi.binance.com`.
     pub binance_eapi_rest_host: String,
-    /// Binance European-options WS host (M2.4 combined stream at
-    /// `/eoptions/stream?streams=…` — the documented base on the live
-    /// nbstream ALB). TEMPORARILY UNREACHABLE from this network as of
-    /// 2026-08-22 (every candidate route 404/403s while eapi REST
-    /// serves fine — forensics in docs/m2-progress.md); the lane
-    /// retries harmlessly until an endpoint is confirmed, then this
-    /// override activates it without a code change. Env:
-    /// `BINANCE_EAPI_WS_HOST`. Default: `nbstream.binance.com`.
+    /// Binance European-options WS host: the options lane's combined
+    /// `/market/stream?streams=<uly>@optionMarkPrice/…` path (BX0-F2).
+    /// The 2025-12 options migration moved these streams onto fstream's
+    /// routed paths; the old nbstream `/eoptions/…` base answers HTTP
+    /// 404 — which was never this network, and which a host override
+    /// alone could not cure, since the path and stream names changed
+    /// too. Env: `BINANCE_EAPI_WS_HOST` (an `.env` still pinning
+    /// `nbstream.binance.com` keeps the lane dark — the boot's options
+    /// provenance line names the host). Default: `fstream.binance.com`.
     pub binance_eapi_ws_host: String,
     /// Alchemy RPC host.
     pub alchemy_host: String,
@@ -150,6 +169,38 @@ pub struct Config {
     /// (`GET /v5/market/instruments-info`). Env: `BYBIT_REST_HOST`.
     /// Default: `api.bybit.com`.
     pub bybit_rest_host: String,
+    /// MX2/MX5: MEXC spot public WS host (path `/ws`, protobuf
+    /// pushes). Env: `MEXC_WS_HOST`. Default: `wbs-api.mexc.com`.
+    pub mexc_ws_host: String,
+    /// MX2/MX5: MEXC futures public WS host (path `/edge`, JSON).
+    /// Env: `MEXC_FUT_WS_HOST`. Default: `contract.mexc.com`.
+    pub mexc_fut_ws_host: String,
+    /// MX2/MX5: MEXC spot REST host for boot discovery
+    /// (`GET /api/v3/exchangeInfo`). Env: `MEXC_REST_HOST`.
+    /// Default: `api.mexc.com`.
+    pub mexc_rest_host: String,
+    /// MX2/MX5: MEXC futures REST host for boot discovery + the funding
+    /// seed (`GET /api/v1/contract/detail`, `…/funding_rate/{sym}`).
+    /// Env: `MEXC_FUT_REST_HOST`. Default: `contract.mexc.com`. Four
+    /// hosts because MEXC splits spot and futures on both planes.
+    pub mexc_fut_rest_host: String,
+    /// HYPARB H3b: HyperEVM JSON-RPC WebSocket host (`newHeads`, pool
+    /// logs, the in-session snapshots and their archive probe). Env:
+    /// `HYPEREVM_WS_HOST`. Default: `rpc.purroofgroup.com` — the only
+    /// endpoint measured to answer historical `eth_call` honestly and to
+    /// upgrade a WebSocket (O-H15); the official one and hypurrscan
+    /// return LATEST state for a past block. The path is the boot flag
+    /// `--hyperevm-path`.
+    pub hyperevm_ws_host: String,
+    /// HC4: Hypercall public WS host (path `/ws`, JSON; data-only by
+    /// ruling O-HC1). Env: `HYPERCALL_WS_HOST`. Default:
+    /// `api.hypercall.xyz`.
+    pub hypercall_ws_host: String,
+    /// HC4: Hypercall REST host — boot discovery (`GET /markets`) and
+    /// the `/options-summary` poller. Env: `HYPERCALL_REST_HOST`.
+    /// Default: `api.hypercall.xyz` (one host serves both planes today;
+    /// two keys so either can move without a code change).
+    pub hypercall_rest_host: String,
     /// AI-command UDS path (Phase 8f §4.2). Env: `AI_INGRESS_SOCK`.
     /// Default: `~/multivenue/run/ai.sock` (tilde expanded at load,
     /// like `log_dir`). The companion secret `AI_INGRESS_HMAC_KEY` is
@@ -189,10 +240,14 @@ impl Config {
                 .unwrap_or_else(|| "api.binance.com".into()),
             binance_fut_rest_host: env_opt("BINANCE_FUT_REST_HOST")
                 .unwrap_or_else(|| "fapi.binance.com".into()),
+            binance_coinm_ws_host: env_opt("BINANCE_COINM_WS_HOST")
+                .unwrap_or_else(|| "dstream.binance.com".into()),
+            binance_coinm_rest_host: env_opt("BINANCE_COINM_REST_HOST")
+                .unwrap_or_else(|| "dapi.binance.com".into()),
             binance_eapi_rest_host: env_opt("BINANCE_EAPI_REST_HOST")
                 .unwrap_or_else(|| "eapi.binance.com".into()),
             binance_eapi_ws_host: env_opt("BINANCE_EAPI_WS_HOST")
-                .unwrap_or_else(|| "nbstream.binance.com".into()),
+                .unwrap_or_else(|| "fstream.binance.com".into()),
             alchemy_host: env_req("ALCHEMY_HOST")?,
             paper_mode: env_opt("MULTIVENUE_MODE").as_deref() == Some("paper"),
             metrics_bind: env_opt("METRICS_BIND").unwrap_or_else(|| "127.0.0.1:9191".into()),
@@ -210,6 +265,18 @@ impl Config {
                 .unwrap_or_else(|| "api.hyperliquid.xyz".into()),
             bybit_ws_host: env_opt("BYBIT_WS_HOST").unwrap_or_else(|| "stream.bybit.com".into()),
             bybit_rest_host: env_opt("BYBIT_REST_HOST").unwrap_or_else(|| "api.bybit.com".into()),
+            mexc_ws_host: env_opt("MEXC_WS_HOST").unwrap_or_else(|| "wbs-api.mexc.com".into()),
+            mexc_fut_ws_host: env_opt("MEXC_FUT_WS_HOST")
+                .unwrap_or_else(|| "contract.mexc.com".into()),
+            mexc_rest_host: env_opt("MEXC_REST_HOST").unwrap_or_else(|| "api.mexc.com".into()),
+            mexc_fut_rest_host: env_opt("MEXC_FUT_REST_HOST")
+                .unwrap_or_else(|| "contract.mexc.com".into()),
+            hyperevm_ws_host: env_opt("HYPEREVM_WS_HOST")
+                .unwrap_or_else(|| "rpc.purroofgroup.com".into()),
+            hypercall_ws_host: env_opt("HYPERCALL_WS_HOST")
+                .unwrap_or_else(|| "api.hypercall.xyz".into()),
+            hypercall_rest_host: env_opt("HYPERCALL_REST_HOST")
+                .unwrap_or_else(|| "api.hypercall.xyz".into()),
             ai_ingress_sock: expand_tilde(
                 &env_opt("AI_INGRESS_SOCK").unwrap_or_else(|| "~/multivenue/run/ai.sock".into()),
             )?,
@@ -276,21 +343,7 @@ impl Secrets {
     /// Load secrets from the (already-loaded) env. Call AFTER
     /// `Config::load`.
     pub fn load() -> Result<Self, ConfigError> {
-        let hex = env_req("POLYMARKET_EIP712_KEY")?;
-        // Strip optional "0x" prefix.
-        let hex_bytes = hex.trim_start_matches("0x").as_bytes();
-        if hex_bytes.len() != 64 {
-            return Err(ConfigError::Invalid("POLYMARKET_EIP712_KEY"));
-        }
-        let mut raw = [0u8; 32];
-        for i in 0..32 {
-            let hi = decode_hex_nibble(hex_bytes[i * 2])
-                .ok_or(ConfigError::Invalid("POLYMARKET_EIP712_KEY"))?;
-            let lo = decode_hex_nibble(hex_bytes[i * 2 + 1])
-                .ok_or(ConfigError::Invalid("POLYMARKET_EIP712_KEY"))?;
-            raw[i] = (hi << 4) | lo;
-        }
-        let key = SecretKeyBytes::new_locked(raw)?;
+        let key = SecretKeyBytes::from_hex_env("POLYMARKET_EIP712_KEY")?;
         let anthropic_api_key = env_req("ANTHROPIC_API_KEY")?;
         Ok(Self {
             key,
@@ -366,6 +419,39 @@ impl SecretKeyBytes {
         let mlocked = false;
 
         Ok(Self { inner: b, mlocked })
+    }
+
+    /// Read a 32-byte key from the environment variable `var` (64 hex
+    /// digits, optional `0x`) into an mlock'd page. The env string and
+    /// the stack copy are zeroized before return, on every path —
+    /// including a refusal. `Missing(var)` when unset, `Invalid(var)`
+    /// when not 32 bytes of hex; the VALUE is never in an error.
+    pub fn from_hex_env(var: &'static str) -> Result<Self, ConfigError> {
+        let mut s = env_req(var)?;
+        let mut raw = [0u8; 32];
+        let ok = {
+            let h = s.trim().trim_start_matches("0x").as_bytes();
+            let mut ok = h.len() == 64;
+            let mut i = 0;
+            while ok && i < 32 {
+                match (decode_hex_nibble(h[2 * i]), decode_hex_nibble(h[2 * i + 1])) {
+                    (Some(hi), Some(lo)) => raw[i] = (hi << 4) | lo,
+                    _ => ok = false,
+                }
+                i += 1;
+            }
+            ok
+        };
+        s.zeroize();
+        if !ok {
+            raw.zeroize();
+            return Err(ConfigError::Invalid(var));
+        }
+        // `raw` is `Copy`: `new_locked` zeroizes ITS copy; this one is
+        // zeroized here.
+        let key = Self::new_locked(raw);
+        raw.zeroize();
+        key
     }
 
     /// Read-only view of the 32 bytes. Callers must not copy them into
@@ -594,6 +680,48 @@ mod tests {
         }
     }
 
+    /// HYPARB H8: a key from the environment — with or without `0x`,
+    /// and named (never shown) when missing or malformed.
+    #[test]
+    fn a_hex_key_loads_from_the_environment_and_a_bad_one_is_named() {
+        let _env = env_guard();
+        const V: &str = "CORE_CONFIG_TEST_HEX_KEY";
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            std::env::remove_var(V);
+        }
+        assert!(matches!(
+            SecretKeyBytes::from_hex_env(V),
+            Err(ConfigError::Missing(V))
+        ));
+        let hex = "11".repeat(32);
+        for v in [hex.clone(), format!("0x{hex}"), format!(" 0x{hex}\n")] {
+            // SAFETY: as above.
+            unsafe {
+                std::env::set_var(V, &v);
+            }
+            let k = SecretKeyBytes::from_hex_env(V).expect("a good key");
+            assert_eq!(k.bytes(), &[0x11; 32]);
+        }
+        for bad in [
+            "11".repeat(31),
+            format!("{}zz", "11".repeat(31)),
+            "11".repeat(33),
+        ] {
+            // SAFETY: as above.
+            unsafe {
+                std::env::set_var(V, &bad);
+            }
+            let e = SecretKeyBytes::from_hex_env(V).err().expect("refused");
+            assert!(matches!(e, ConfigError::Invalid(V)), "{e:?}");
+            assert!(!e.to_string().contains(&bad), "the value is never echoed");
+        }
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var(V);
+        }
+    }
+
     #[test]
     fn phase_8e_host_fields_use_defaults_when_unset() {
         let _env = env_guard();
@@ -638,6 +766,82 @@ mod tests {
             std::env::remove_var("OKX_REST_HOST");
             std::env::remove_var("DERIBIT_WS_HOST");
             std::env::remove_var("HYPERLIQUID_API_HOST");
+        }
+    }
+
+    /// HC4: the two Hypercall hosts default to the one measured host
+    /// and each honours its own env override.
+    #[test]
+    fn hypercall_host_fields_default_and_override() {
+        let _env = env_guard();
+        set_required_env();
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            std::env::remove_var("HYPERCALL_WS_HOST");
+            std::env::remove_var("HYPERCALL_REST_HOST");
+        }
+        let cfg = Config::load(None).expect("required vars present");
+        assert_eq!(cfg.hypercall_ws_host, "api.hypercall.xyz");
+        assert_eq!(cfg.hypercall_rest_host, "api.hypercall.xyz");
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            std::env::set_var("HYPERCALL_WS_HOST", "ws.example");
+            std::env::set_var("HYPERCALL_REST_HOST", "rest.example");
+        }
+        let cfg = Config::load(None).expect("required vars present");
+        assert_eq!(cfg.hypercall_ws_host, "ws.example");
+        assert_eq!(cfg.hypercall_rest_host, "rest.example");
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            std::env::remove_var("HYPERCALL_WS_HOST");
+            std::env::remove_var("HYPERCALL_REST_HOST");
+        }
+    }
+
+    /// MX2/MX5: the four MEXC hosts default to the measured endpoints
+    /// and each honours its own env override.
+    #[test]
+    fn mexc_host_fields_default_and_override() {
+        let _env = env_guard();
+        set_required_env();
+        const KEYS: [&str; 4] = [
+            "MEXC_WS_HOST",
+            "MEXC_FUT_WS_HOST",
+            "MEXC_REST_HOST",
+            "MEXC_FUT_REST_HOST",
+        ];
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            for k in KEYS {
+                std::env::remove_var(k);
+            }
+        }
+        let cfg = Config::load(None).expect("required vars present");
+        assert_eq!(cfg.mexc_ws_host, "wbs-api.mexc.com");
+        assert_eq!(cfg.mexc_fut_ws_host, "contract.mexc.com");
+        assert_eq!(cfg.mexc_rest_host, "api.mexc.com");
+        assert_eq!(cfg.mexc_fut_rest_host, "contract.mexc.com");
+        assert_eq!(
+            cfg.hyperevm_ws_host, "rpc.purroofgroup.com",
+            "HYPARB H3b default"
+        );
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            std::env::set_var("MEXC_WS_HOST", "spot-ws.example");
+            std::env::set_var("MEXC_FUT_WS_HOST", "fut-ws.example");
+            std::env::set_var("MEXC_REST_HOST", "spot-rest.example");
+            std::env::set_var("MEXC_FUT_REST_HOST", "fut-rest.example");
+        }
+        let cfg = Config::load(None).expect("required vars present");
+        assert_eq!(cfg.mexc_ws_host, "spot-ws.example");
+        assert_eq!(cfg.mexc_fut_ws_host, "fut-ws.example");
+        assert_eq!(cfg.mexc_rest_host, "spot-rest.example");
+        assert_eq!(cfg.mexc_fut_rest_host, "fut-rest.example");
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            for k in KEYS {
+                std::env::remove_var(k);
+            }
         }
     }
 }

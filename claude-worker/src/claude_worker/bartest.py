@@ -68,10 +68,13 @@ DEFAULT_FEES: str = "~/multivenue/fees.toml"
 VENUE_OF_PREFIX: dict[str, str] = {
     "binance": "bn",
     "binance-usdm": "bn",
+    "binance-coinm": "bn",
     "bybit": "bybit",
     "bybit-linear": "bybit",
     "deribit": "deribit",
     "hyperliquid": "hl",
+    "mexc": "mexc",
+    "mexc-perp": "mexc",
     "okx": "okx",
     "polymarket": "pm",
 }

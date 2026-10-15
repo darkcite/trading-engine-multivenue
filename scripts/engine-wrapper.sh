@@ -130,15 +130,28 @@ fi
 # Operator ruling 2026-09-02: AI-pushed lanes only (ai-exec + vm,
 # mask 48) — Rust-coded strategies disabled at boot.
 #
-# ICDP I4 (2026-09-03): the operator opts the slot-6 intrabar member in
-# by writing `STRATEGY=ai+icdp` or `STRATEGY=ai+vrp` to
-# ~/multivenue/strategy.conf (KEY=VALUE,
-# sourced; absent ⇒ `ai`). Paper only — `icdp` never boots without
-# `--paper` (belt and braces: no live dispatcher exists, and the plan's
-# I4 law says the wrapper refuses it regardless). The artifact
-# (~/multivenue/icdp.toml) must resolve, or the engine refuses the boot
-# and KeepAlive relaunches — check the launchd log, then fix the file
-# or drop the mask back to `ai`.
+# ICDP I4 (2026-09-03): the operator opts a coded member in by writing
+# e.g. `STRATEGY=ai+vrp` to ~/multivenue/strategy.conf (KEY=VALUE,
+# sourced; absent ⇒ `ai`). A member's artifact must resolve, or the
+# engine refuses the boot and KeepAlive relaunches — check the launchd
+# log, then fix the file or drop the mask back to `ai`.
+#
+# XMM XH1 (2026-09-26): slot 6 is the xmm member (`xmm`, `ai+xmm`,
+# `ai+vrp+xsd+bin15+hyparb+xmm`); `icdp` and `ai+icdp` are GONE (the
+# engine refuses them too — the crate keeps only its offline backtest).
+# Its artifact is ~/multivenue/xmm.toml, and an absent one with the bit
+# REQUESTED refuses the boot (the F19 law). Since XH2 it quotes on the
+# paper queue law; XH3 runs it in paper (the runbook: docs/risk-policy.md,
+# XMM "XH3 amendment" — every descriptor must resolve or the WHOLE boot
+# refuses). A live slot 6 refuses the boot until XH4.
+#
+# HC11 (2026-09-26): slot 7 is the hcv member — Hypercall S1, DARK: paper
+# only and in no configured mask (O-HC18). Its names (`hcv`, `ai+hcv`,
+# `ai+vrp+xsd+bin15+hyparb+xmm+hcv`) are here so switching it on is ONE
+# strategy.conf line. Its artifact is ~/multivenue/hcv.toml (absent with
+# the bit REQUESTED refuses the boot — the F19 law); its hedges must be in
+# universe.toml [hyperliquid] coins and its options in [hypercall]. A live
+# slot 7 refuses the boot (exec_boot).
 STRATEGY="ai"
 if [ -f "$HOME/multivenue/strategy.conf" ]; then
   . "$HOME/multivenue/strategy.conf"
@@ -156,10 +169,21 @@ fi
 # operator comes to watch a member that was never there. `rule-tree` is
 # GONE from the set: slot 3 is bin15, and the name was never in this
 # allow-list.
+#
+# HYPARB H0 (2026-09-23): slot 0 is the hyparb member (`hyparb`,
+# `ai+hyparb`, `ai+vrp+xsd+bin15+hyparb`); `latency-arb` was never in
+# this list and is now gone from the engine too (O-H1). The names are
+# here so they CAN be set later — the member lands DARK (O-H8): nothing
+# edits strategy.conf until HZ and H8 are green. Since H5 the engine
+# boots slot 0 only with its artifact (~/multivenue/hyparb.toml) and the
+# pool ingress — see the HYPARB block at the end.
 case "$STRATEGY" in
-  ai|ai+icdp|icdp|ai+vrp|vrp|ai+xsd|ai+vrp+xsd|xsd) ;;
+  ai|ai+vrp|vrp|ai+xsd|ai+vrp+xsd|xsd) ;;
   bin15|ai+bin15|ai+vrp+bin15|ai+xsd+bin15|ai+vrp+xsd+bin15) ;;
-  *) echo "engine-wrapper: refusing STRATEGY=$STRATEGY (allowed: ai, ai+icdp, icdp, ai+vrp, vrp, ai+xsd, ai+vrp+xsd, xsd, bin15, ai+bin15, ai+vrp+bin15, ai+xsd+bin15, ai+vrp+xsd+bin15)" >&2; exit 78 ;;
+  hyparb|ai+hyparb|ai+vrp+xsd+bin15+hyparb) ;;
+  xmm|ai+xmm|ai+vrp+xsd+bin15+hyparb+xmm) ;;
+  hcv|ai+hcv|ai+vrp+xsd+bin15+hyparb+xmm+hcv) ;;
+  *) echo "engine-wrapper: refusing STRATEGY=$STRATEGY (allowed: ai, ai+vrp, vrp, ai+xsd, ai+vrp+xsd, xsd, bin15, ai+bin15, ai+vrp+bin15, ai+xsd+bin15, ai+vrp+xsd+bin15, hyparb, ai+hyparb, ai+vrp+xsd+bin15+hyparb, xmm, ai+xmm, ai+vrp+xsd+bin15+hyparb+xmm, hcv, ai+hcv, ai+vrp+xsd+bin15+hyparb+xmm+hcv)" >&2; exit 78 ;;
 esac
 
 # XSD-1 (2026-09-12, measured live): a launchd agent inherits macOS's
@@ -198,4 +222,194 @@ elif [ -n "${EXEC_TOML:-}${ARM_LIVE:-}" ]; then
   echo "engine-wrapper: refusing — EXEC_TOML and ARM_LIVE must BOTH be set to arm (got EXEC_TOML='${EXEC_TOML:-}' ARM_LIVE='${ARM_LIVE:-}')" >&2
   exit 78
 fi
-exec ./target/release/multivenue-engine run --paper --strategy "$STRATEGY" "${EXEC_ARGS[@]}"
+# HYPARB H5 (2026-09-23): slot 0. Its artifact is ~/multivenue/hyparb.toml
+# whenever STRATEGY carries hyparb (absent => the ENGINE refuses the boot,
+# the F19 law), and the member needs its pools: the HyperEVM pool ingress
+# starts with --hyperevm-path "$HYPEREVM_PATH" (default "/", the archive
+# endpoint's WebSocket path) whenever STRATEGY carries hyparb, or whenever
+# HYPEREVM_PATH is set (capture without the member). The EVM write path
+# (O-H5, TESTNET ONLY, chain 998) takes BOTH HYPARB_TOML=<an artifact with
+# mode = "testnet"> AND EVM_TESTNET=1 - one of the two alone REFUSES
+# (exit 78), the EXEC_TOML/ARM_LIVE shape; the engine's own interlock
+# (artifact mode <=> --evm-testnet) has the last word. HYPARB H8: the
+# O-H12 third switch EVM_HYBRID=1 (--evm-hybrid: mainnet pool reads,
+# testnet writes) is valid only on top of the pair - alone it REFUSES.
+# Per O-H8 nothing here edits strategy.conf.
+# HYPARB L5 (2026-09-24, O-HL1): LIVE mode — real swaps on HyperEVM
+# MAINNET and real hedges from slot 0's own Hyperliquid account — takes
+# HYPARB_TOML=<an artifact with mode = "live"> AND HYPARB_LIVE=1, on top
+# of EXEC_TOML/ARM_LIVE with ARM_LIVE naming slot 0 (the engine checks
+# the artifact's mode against exec.toml's slot 0 itself: three switches,
+# any one alone refuses). The wallet key HYPEREVM_MAINNET_KEY comes from
+# the repo .env sourced above. HYPARB_LIVE and EVM_TESTNET are exclusive.
+HYPARB_ARGS=()
+case "$STRATEGY" in
+  *hyparb*) HYPARB_ARGS=(--hyperevm-path "${HYPEREVM_PATH:-/}") ;;
+  *) if [ -n "${HYPEREVM_PATH:-}" ]; then HYPARB_ARGS=(--hyperevm-path "$HYPEREVM_PATH"); fi ;;
+esac
+if [ -n "${HYPARB_LIVE:-}" ] && [ -n "${EVM_TESTNET:-}${EVM_HYBRID:-}" ]; then
+  echo "engine-wrapper: refusing — HYPARB_LIVE is exclusive with EVM_TESTNET / EVM_HYBRID (the testnet shadow is paper's)" >&2
+  exit 78
+fi
+if [ -n "${HYPARB_TOML:-}" ] && [ -n "${EVM_TESTNET:-}" ]; then
+  if [ "$EVM_TESTNET" != "1" ]; then
+    echo "engine-wrapper: refusing — EVM_TESTNET must be 1 (got '$EVM_TESTNET')" >&2
+    exit 78
+  fi
+  if [ ! -f "$HYPARB_TOML" ]; then
+    echo "engine-wrapper: refusing — HYPARB_TOML=$HYPARB_TOML is not a file" >&2
+    exit 78
+  fi
+  case "$STRATEGY" in
+    *hyparb*) ;;
+    *) echo "engine-wrapper: refusing — EVM_TESTNET without hyparb in STRATEGY=$STRATEGY" >&2; exit 78 ;;
+  esac
+  # HYPARB go-live (2026-09-24): the shadow's wallet key. The engine reads
+  # HYPEREVM_TESTNET_KEY, else the E3 gate's HYPERLIQUID_TESTNET_AGENT_KEY,
+  # from its ENVIRONMENT; the repo .env sourced above carries neither on
+  # this host — the operator's testnet keys live in ~/multivenue/.env,
+  # which exec-smoke.sh and evm-testnet.sh read. Take exactly those two
+  # names from it: a subshell sources the file and only the named value
+  # leaves it (never printed; nothing else in that file reaches the
+  # engine). Neither found => refuse before the exec — the engine would
+  # refuse the same boot, less clearly.
+  if [ -z "${HYPEREVM_TESTNET_KEY:-}${HYPERLIQUID_TESTNET_AGENT_KEY:-}" ]; then
+    EVM_ENV_FILE="${MULTIVENUE_ENV_FILE:-$HOME/multivenue/.env}"
+    if [ -f "$EVM_ENV_FILE" ]; then
+      for _k in HYPEREVM_TESTNET_KEY HYPERLIQUID_TESTNET_AGENT_KEY; do
+        _v="$(set +u; . "$EVM_ENV_FILE" >/dev/null 2>&1; printf '%s' "${(P)_k:-}")"
+        if [ -n "$_v" ]; then
+          export "$_k=$_v"
+        fi
+      done
+      unset _k _v
+    fi
+  fi
+  if [ -z "${HYPEREVM_TESTNET_KEY:-}${HYPERLIQUID_TESTNET_AGENT_KEY:-}" ]; then
+    echo "engine-wrapper: refusing — EVM_TESTNET=1 but neither HYPEREVM_TESTNET_KEY nor HYPERLIQUID_TESTNET_AGENT_KEY is in the repo .env or ${MULTIVENUE_ENV_FILE:-$HOME/multivenue/.env}" >&2
+    exit 78
+  fi
+  HYPARB_ARGS+=(--hyparb "$HYPARB_TOML" --evm-testnet)
+  echo "engine-wrapper: hyparb EVM write path via $HYPARB_TOML — TESTNET (chain 998) only" >&2
+  if [ -n "${EVM_HYBRID:-}" ]; then
+    if [ "$EVM_HYBRID" != "1" ]; then
+      echo "engine-wrapper: refusing — EVM_HYBRID must be 1 (got '$EVM_HYBRID')" >&2
+      exit 78
+    fi
+    HYPARB_ARGS+=(--evm-hybrid)
+    echo "engine-wrapper: HYBRID — mainnet (999) pool reads, TESTNET (998) writes (O-H12)" >&2
+  fi
+elif [ -n "${HYPARB_TOML:-}" ] && [ -n "${HYPARB_LIVE:-}" ]; then
+  if [ "$HYPARB_LIVE" != "1" ]; then
+    echo "engine-wrapper: refusing — HYPARB_LIVE must be 1 (got '$HYPARB_LIVE')" >&2
+    exit 78
+  fi
+  if [ ! -f "$HYPARB_TOML" ]; then
+    echo "engine-wrapper: refusing — HYPARB_TOML=$HYPARB_TOML is not a file" >&2
+    exit 78
+  fi
+  case "$STRATEGY" in
+    *hyparb*) ;;
+    *) echo "engine-wrapper: refusing — HYPARB_LIVE without hyparb in STRATEGY=$STRATEGY" >&2; exit 78 ;;
+  esac
+  case ",${ARM_LIVE:-}," in
+    *,0,*) ;;
+    *) echo "engine-wrapper: refusing — HYPARB_LIVE needs EXEC_TOML and ARM_LIVE naming slot 0 (got ARM_LIVE='${ARM_LIVE:-}')" >&2; exit 78 ;;
+  esac
+  if [ -z "${HYPEREVM_MAINNET_KEY:-}" ]; then
+    echo "engine-wrapper: refusing — HYPARB_LIVE=1 but HYPEREVM_MAINNET_KEY is not in the repo .env" >&2
+    exit 78
+  fi
+  HYPARB_ARGS+=(--hyparb "$HYPARB_TOML")
+  echo "engine-wrapper: hyparb LIVE via $HYPARB_TOML — HyperEVM MAINNET + Hyperliquid MAINNET, REAL MONEY" >&2
+elif [ -n "${EVM_HYBRID:-}" ]; then
+  echo "engine-wrapper: refusing — EVM_HYBRID needs HYPARB_TOML and EVM_TESTNET=1" >&2
+  exit 78
+elif [ -n "${HYPARB_LIVE:-}" ]; then
+  echo "engine-wrapper: refusing — HYPARB_LIVE needs HYPARB_TOML (an artifact with mode = \"live\")" >&2
+  exit 78
+elif [ -n "${HYPARB_TOML:-}${EVM_TESTNET:-}" ]; then
+  echo "engine-wrapper: refusing — HYPARB_TOML needs EVM_TESTNET=1 (the testnet shadow) or HYPARB_LIVE=1 (live mode), and EVM_TESTNET needs HYPARB_TOML (got HYPARB_TOML='${HYPARB_TOML:-}' EVM_TESTNET='${EVM_TESTNET:-}')" >&2
+  exit 78
+fi
+# XMM XH1 (2026-09-26): slot 6's artifact. ~/multivenue/xmm.toml is the
+# default whenever STRATEGY carries xmm (absent => the ENGINE refuses the
+# boot, the F19 law); XMM_TOML=<path> in strategy.conf names another one.
+# It must be a file, and STRATEGY must carry xmm — a key for a member the
+# mask does not boot is a misconfiguration and REFUSES (exit 78), the
+# HYPARB_TOML shape. Paper only: nothing here can arm slot 6.
+XMM_ARGS=()
+if [ -n "${XMM_TOML:-}" ]; then
+  if [ ! -f "$XMM_TOML" ]; then
+    echo "engine-wrapper: refusing — XMM_TOML=$XMM_TOML is not a file" >&2
+    exit 78
+  fi
+  case "$STRATEGY" in
+    *xmm*) ;;
+    *) echo "engine-wrapper: refusing — XMM_TOML without xmm in STRATEGY=$STRATEGY" >&2; exit 78 ;;
+  esac
+  XMM_ARGS=(--xmm "$XMM_TOML")
+fi
+# HC11 (2026-09-26): slot 7's artifact and calendar, the XMM_TOML shape.
+# ~/multivenue/hcv.toml and the news lane's scheduled-events.json are the
+# defaults whenever STRATEGY carries hcv; HCV_TOML=<path> and
+# HCV_EVENTS=<path> in strategy.conf name others. Each must be a file,
+# and STRATEGY must carry hcv. Paper only: nothing here can arm slot 7.
+HCV_ARGS=()
+if [ -n "${HCV_TOML:-}${HCV_EVENTS:-}" ]; then
+  case "$STRATEGY" in
+    *hcv*) ;;
+    *) echo "engine-wrapper: refusing — HCV_TOML/HCV_EVENTS without hcv in STRATEGY=$STRATEGY" >&2; exit 78 ;;
+  esac
+fi
+if [ -n "${HCV_TOML:-}" ]; then
+  if [ ! -f "$HCV_TOML" ]; then
+    echo "engine-wrapper: refusing — HCV_TOML=$HCV_TOML is not a file" >&2
+    exit 78
+  fi
+  HCV_ARGS+=(--hcv "$HCV_TOML")
+fi
+if [ -n "${HCV_EVENTS:-}" ]; then
+  if [ ! -f "$HCV_EVENTS" ]; then
+    echo "engine-wrapper: refusing — HCV_EVENTS=$HCV_EVENTS is not a file" >&2
+    exit 78
+  fi
+  HCV_ARGS+=(--hcv-events "$HCV_EVENTS")
+fi
+# HK19 (2026-10-15): the §6.5 raw tap from strategy.conf. RAW_TAP=<labels>
+# (comma-separated, from pm bn okx rpc deribit hl bybit mexc hyperevm
+# hypercall; or `all` alone) writes the payloads those parsers REJECT to
+# `<venue>-raw.tap` in the run dir (docs/wire-format.md "Raw tap"), bounded
+# at RAW_TAP_BUDGET_MB per venue (the engine's default 64). RAW_TAP_MODE=all
+# records every payload — an audit window only: it grows at the feed's rate
+# until the budget stops it. A value the engine would refuse is refused here
+# (exit 78) rather than failing the boot after discovery.
+TAP_ARGS=()
+if [ -n "${RAW_TAP:-}" ]; then
+  case "$RAW_TAP" in
+    ,*|*,|*,,*) echo "engine-wrapper: refusing — RAW_TAP has an empty label (got '$RAW_TAP')" >&2; exit 78 ;;
+  esac
+  tap_seen=","
+  for tap_label in ${(s:,:)RAW_TAP}; do
+    case "$tap_label" in
+      pm|bn|okx|rpc|deribit|hl|bybit|mexc|hyperevm|hypercall) ;;
+      all) [ "$RAW_TAP" = "all" ] || { echo "engine-wrapper: refusing — RAW_TAP=all must stand alone (got '$RAW_TAP')" >&2; exit 78; } ;;
+      *) echo "engine-wrapper: refusing — RAW_TAP label '$tap_label' is not a venue (got '$RAW_TAP')" >&2; exit 78 ;;
+    esac
+    case "$tap_seen" in
+      *",$tap_label,"*) echo "engine-wrapper: refusing — RAW_TAP names '$tap_label' twice" >&2; exit 78 ;;
+    esac
+    tap_seen="$tap_seen$tap_label,"
+  done
+  case "${RAW_TAP_MODE:-rejects}" in
+    rejects|all) ;;
+    *) echo "engine-wrapper: refusing — RAW_TAP_MODE must be rejects or all (got '$RAW_TAP_MODE')" >&2; exit 78 ;;
+  esac
+  TAP_ARGS=(--raw-tap "$RAW_TAP" --raw-tap-mode "${RAW_TAP_MODE:-rejects}")
+  if [ -n "${RAW_TAP_BUDGET_MB:-}" ]; then
+    [[ "$RAW_TAP_BUDGET_MB" == <1-> ]] || { echo "engine-wrapper: refusing — RAW_TAP_BUDGET_MB must be a positive integer (got '$RAW_TAP_BUDGET_MB')" >&2; exit 78; }
+    TAP_ARGS+=(--raw-tap-budget-mb "$RAW_TAP_BUDGET_MB")
+  fi
+  echo "engine-wrapper: raw tap ${TAP_ARGS[*]}" >&2
+fi
+exec ./target/release/multivenue-engine run --paper --strategy "$STRATEGY" "${EXEC_ARGS[@]}" "${HYPARB_ARGS[@]}" "${XMM_ARGS[@]}" "${HCV_ARGS[@]}" "${TAP_ARGS[@]}"

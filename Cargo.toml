@@ -23,9 +23,16 @@ members = [
     "crates/ingress-bybit",
     "crates/ingress-deribit",
     "crates/ingress-hyperliquid",
+    "crates/ingress-mexc",
     "crates/ingress-okx",
     "crates/ingress-polymarket",
     "crates/ingress-rpc",
+    # HYPARB H3: HyperEVM pool events + in-session pool snapshots
+    "crates/ingress-hyperevm",
+    # HC3: Hypercall options — indicative quote-provider WS + REST summary
+    "crates/ingress-hypercall",
+    # HC7: the Hypercall settlement law (median-of-means), replicated
+    "crates/core-settle",
     # shared boot-only options-chain selection law (M2 close extraction)
     "crates/options-select",
     # VRP V1: option sym -> (expiry, strike, right, contract size) table
@@ -35,6 +42,9 @@ members = [
     # VRP X1: the ONE modelled fill law, shared by the offline harness
     # and the engine's paper dispatcher
     "crates/core-fill",
+    # HYPARB H1: bit-exact concentrated/constant-product AMM math and the
+    # single-block arb solve — the reusable CEX-DEX engine
+    "crates/core-amm",
 
     # --- book + strategies ---
     "crates/book-builder",
@@ -45,6 +55,12 @@ members = [
     "crates/strategy-ev",
     "crates/strategy-icdp",
     "crates/strategy-latency-arb",
+    # HYPARB H0: the slot-0 member (strategy-latency-arb is unlinked, not deleted — O-H1)
+    "crates/strategy-hyparb",
+    # XMM XH1: the slot-6 member (strategy-icdp is unlinked, not deleted — O-XH1)
+    "crates/strategy-xmm",
+    # HC11 (O-HC18): the slot-7 member, Hypercall S1 — DARK, paper only
+    "crates/strategy-hcv",
     "crates/strategy-bin15",
     "crates/strategy-rule-tree",
     "crates/strategy-set",
@@ -60,7 +76,21 @@ members = [
     "crates/clob-dispatcher",
     "crates/exec-router",
     "crates/exec-hyperliquid",
+    # XMM XH4a (O-XH13): the venue-agnostic order-gateway kit — used by
+    # the Hyperliquid gateway (XH4b), meant for MEXC (XM2); BX6 built its own
+    "crates/exec-gateway",
+    # HC9 (O-HC19): the Hypercall order arm — operator verbs only until
+    # slot 7's live-arming ruling (plan hc9-hc11 §1)
+    "crates/exec-hypercall",
     "crates/signer-eip712",
+    # HYPARB H7 (O-H7): chain-agnostic EIP-1559 render + sign
+    "crates/signer-evm",
+    # HYPARB H7c: the HyperEVM write path, testnet only (O-H5)
+    "crates/exec-hyperevm",
+    # BX4 (O-BX5): the Binance arm's Ed25519 request signatures, on ring
+    "crates/signer-ed25519",
+    # BX6: the Binance execution arm (engine half + gateway thread)
+    "crates/exec-binance",
 
     # --- engine + UI ---
     "crates/engine",
@@ -104,6 +134,15 @@ phf          = { version = "0.11", features = ["macros"] }
 # Explicit, minimal deps — not `ethers` or `alloy`.
 secp256k1   = { version = "0.29", features = ["recovery", "lowmemory"] }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
+
+# --- Ed25519 (signer-ed25519, BX4) ---
+# Ruling O-BX5: Ed25519 from `ring` -- already in the graph as rustls' crypto
+# provider (0.17.14, `Apache-2.0 AND ISC`), a direct dependency of
+# signer-ed25519 alone. No default features asked for — key expansion and
+# signing need neither `alloc` nor `std` — but rustls' own `ring` features
+# unify into the one build, so `ring/alloc` is on regardless: bench gate 86
+# (signing at 0 B/op) is the guarantee, not this flag.
+ring = { version = "0.17", default-features = false }
 
 # --- http/2 client (clob-dispatcher) ---
 # hyper + rustls only, no reqwest.
@@ -162,15 +201,20 @@ core-time    = { path = "crates/core-time" }
 core-types   = { path = "crates/core-types" }
 core-vol     = { path = "crates/core-vol" }
 core-fill    = { path = "crates/core-fill" }
+core-amm     = { path = "crates/core-amm" }
 
 ingress-ai         = { path = "crates/ingress-ai" }
 ingress-binance    = { path = "crates/ingress-binance" }
 ingress-deribit    = { path = "crates/ingress-deribit" }
 ingress-bybit      = { path = "crates/ingress-bybit" }
 ingress-hyperliquid = { path = "crates/ingress-hyperliquid" }
+ingress-mexc       = { path = "crates/ingress-mexc" }
 ingress-okx        = { path = "crates/ingress-okx" }
 ingress-polymarket = { path = "crates/ingress-polymarket" }
 ingress-rpc        = { path = "crates/ingress-rpc" }
+ingress-hyperevm   = { path = "crates/ingress-hyperevm" }
+ingress-hypercall  = { path = "crates/ingress-hypercall" }
+core-settle        = { path = "crates/core-settle" }
 options-select     = { path = "crates/options-select" }
 opt-registry       = { path = "crates/opt-registry" }
 
@@ -182,6 +226,9 @@ strategy-cross-arb    = { path = "crates/strategy-cross-arb" }
 strategy-ev           = { path = "crates/strategy-ev" }
 strategy-icdp         = { path = "crates/strategy-icdp" }
 strategy-latency-arb  = { path = "crates/strategy-latency-arb" }
+strategy-hyparb       = { path = "crates/strategy-hyparb" }
+strategy-xmm          = { path = "crates/strategy-xmm" }
+strategy-hcv          = { path = "crates/strategy-hcv" }
 strategy-bin15        = { path = "crates/strategy-bin15" }
 strategy-rule-tree    = { path = "crates/strategy-rule-tree" }
 strategy-set          = { path = "crates/strategy-set" }
@@ -196,7 +243,13 @@ pine-vm = { path = "crates/pine-vm" }
 clob-dispatcher = { path = "crates/clob-dispatcher" }
 exec-router     = { path = "crates/exec-router" }
 exec-hyperliquid = { path = "crates/exec-hyperliquid" }
+exec-gateway     = { path = "crates/exec-gateway" }
+exec-hypercall  = { path = "crates/exec-hypercall" }
 signer-eip712   = { path = "crates/signer-eip712" }
+signer-evm      = { path = "crates/signer-evm" }
+signer-ed25519  = { path = "crates/signer-ed25519" }
+exec-binance    = { path = "crates/exec-binance" }
+exec-hyperevm   = { path = "crates/exec-hyperevm" }
 
 engine          = { path = "crates/engine" }
 engine-snapshot = { path = "crates/engine-snapshot" }

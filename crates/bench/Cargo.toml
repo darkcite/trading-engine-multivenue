@@ -25,11 +25,19 @@ criterion            = { workspace = true }
 # round-trip real frames through the zero-alloc path.
 # core-crypto: gate 34 hashes ruleset fixture bytes (§4.2 rule 1).
 core-crypto          = { workspace = true }
+# BX12 gate 94: the gateway's seed (`SecretKeyBytes`) and the anchor id.
+core-config          = { workspace = true }
 ingress-ai           = { workspace = true }
 ingress-polymarket   = { workspace = true }
 ingress-binance      = { workspace = true }
 ingress-deribit      = { workspace = true }
 ingress-hyperliquid  = { workspace = true }
+# MX8: the MEXC spot-PB + futures-JSON parsers and run loop.
+ingress-mexc         = { workspace = true }
+# HC3 gates 78/79: the Hypercall parsers and run loop.
+ingress-hypercall    = { workspace = true }
+# HC7 gate 80: the settlement window and the median-of-means law.
+core-settle          = { workspace = true }
 ingress-okx          = { workspace = true }
 ingress-rpc          = { workspace = true }
 core-net             = { workspace = true }
@@ -50,8 +58,41 @@ strategy-cross-arb   = { workspace = true }
 # E1 gate 53: the execution router's hot path.
 exec-router          = { workspace = true }
 # E2 gate 54: the Hyperliquid encode+sign path.
-exec-hyperliquid     = { workspace = true }
+exec-hyperliquid     = { workspace = true, features = ["testvenue"] }
+# BX6 gates 92-93: the Binance arm, and the gateway's render and scan;
+# BX12 gate 94: the real gateway against the scripted venue (`testvenue`).
+exec-binance         = { workspace = true, features = ["testvenue"] }
 signer-eip712        = { workspace = true }
+# HC9 gate 84: the Hypercall arm's render + sign + answer scan.
+exec-hypercall       = { workspace = true }
+# HYPARB H1 gate 63: the AMM walk + arb solve.
+core-amm             = { workspace = true }
+# HYPARB H7 gate 64: the EVM sign + hash + hex render.
+signer-evm           = { workspace = true }
+# BX4 gate 86: the Ed25519 sign + base64 render.
+signer-ed25519       = { workspace = true }
+# HYPARB H3 gate 66: the HyperEVM ingress session after the handshake.
+ingress-hyperevm     = { workspace = true }
+# HYPARB H2 gate 67: the AMM fill law on the paper matcher.
+core-fill            = { workspace = true }
+# HYPARB H4 gate 68: the slot-0 member — decision, carry, hedge, timer.
+strategy-hyparb      = { workspace = true }
+# XMM XH4a gate 95: the order-gateway kit (duplex, in-flight table,
+# deadline queue, reconnect machine, wait policy, latency trackers).
+exec-gateway         = { workspace = true }
+# XMM XH1: the slot-6 member rides the set's trade / order-event / timer gate.
+strategy-xmm         = { workspace = true }
+# HC11 gate 85: the slot-7 member over the paper held-quote law.
+strategy-hcv         = { workspace = true }
+# HYPARB H7c gate 71: the EVM write path either side of the socket.
+# H9 gate 72: its `testnode` serves the HttpsPost cycle from a CHILD
+# process (a server thread here would allocate under the global count).
+exec-hyperevm        = { workspace = true, features = ["testnode"] }
+rustls               = { workspace = true }
+# BX5 gate 87b: the owner's poll a non-blocking HttpsConn runs on;
+# gate 87c: the certificate of its child-process WebSocket node.
+mio                  = { workspace = true }
+rcgen                = { workspace = true }
 strategy-rule-tree   = { workspace = true }
 strategy-set         = { workspace = true }
 strategy-vm          = { workspace = true }

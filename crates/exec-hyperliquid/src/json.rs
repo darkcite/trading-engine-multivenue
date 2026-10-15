@@ -125,11 +125,21 @@ pub(crate) fn bool_field(b: &[u8], key: &[u8]) -> Option<bool> {
     }
 }
 
+/// `"key":{…}` → the object's `(start, end)`, `end` just past its brace.
+pub(crate) fn object_field(b: &[u8], key: &[u8]) -> Option<(usize, usize)> {
+    let i = value_start(b, key)?;
+    if i >= b.len() || b[i] != b'{' {
+        return None;
+    }
+    Some((i, object_end(b, i)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const DOC: &[u8] = br#"{"a":"x\"y","n":"12.5","m":7,"t":true,"f":false,"arr":[{"k":1},{"k":2}]}"#;
+    const DOC: &[u8] =
+        br#"{"a":"x\"y","n":"12.5","m":7,"t":true,"f":false,"arr":[{"k":1},{"k":2}]}"#;
 
     #[test]
     fn every_reader_finds_its_field() {

@@ -46,7 +46,10 @@ pub struct ResolvedRegime {
 /// Map a `[labels.<member>]` name to its strategy-set slot.
 fn coded_member_slot(name: &str) -> Option<u8> {
     Some(match name {
-        "latency_arb" => strategy_set::SLOT_LATENCY_ARB,
+        // HYPARB H0 (2026-09-23): slot 0 is hyparb. `latency_arb` is
+        // GONE as a label name for the same reason `ev` is — a label
+        // evidenced for the old member must not gate the new one.
+        "hyparb" => strategy_set::SLOT_HYPARB,
         // VRP V7: slot 1 is the VRP member. `ev` is deliberately GONE:
         // a label evidenced for the EV member must not silently gate a
         // different strategy, so an old `regime.toml` carrying
@@ -62,7 +65,10 @@ fn coded_member_slot(name: &str) -> Option<u8> {
         // member that no longer sits there.
         "bin15" => strategy_set::SLOT_BIN15,
         "ai_exec" => strategy_set::SLOT_AI_EXEC,
-        "icdp" => strategy_set::SLOT_ICDP,
+        // XMM XH1 (2026-09-26): slot 6 is xmm; `icdp` is GONE as a label
+        // name for the same reason `ev` is. XH3: xmm carries its label
+        // (never consulted — the HORIZON law), so `require = 1` can boot it.
+        "xmm" => strategy_set::SLOT_XMM,
         _ => return None,
     })
 }
@@ -273,8 +279,11 @@ mod tests {
             set: RegimeLabelSet::ANY,
         });
         assert!(resolve_regime_file(&f, b"x", &resolver, false).is_err());
+        // XMM XH1: slot 6's old name labels nothing.
         f.labels[0].member = "icdp".to_owned();
+        assert!(resolve_regime_file(&f, b"x", &resolver, false).is_err());
+        f.labels[0].member = "ai_exec".to_owned();
         let r = resolve_regime_file(&f, b"x", &resolver, false).unwrap();
-        assert_eq!(r.labels[0].0, strategy_set::SLOT_ICDP);
+        assert_eq!(r.labels[0].0, strategy_set::SLOT_AI_EXEC);
     }
 }

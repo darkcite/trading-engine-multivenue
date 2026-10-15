@@ -1,0 +1,1997 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
+//! **Signed REST (plan §3.3; BX4 and BX5 carried).** Gateway thread.
+//!
+//! The futures × classic paths need REST for what their WS API does not
+//! carry: the listenKey, the dead-man (`countdownCancelAll`, BX-17), the
+//! sweep's fallback while the order session is down (`DELETE
+//! allOpenOrders`), the time, the open orders and the day's trades (recon,
+//! obligation 8), and the boot assertions (BX-19). USDⓈ-M's paths are
+//! fapi's, COIN-M's dapi's (BX7, C1), in Portfolio Margin each product's
+//! papi paths (BX7, C2), and spot's (BX8) the time, the open orders, the
+//! day's trades and the adoption's price (`/api/v3/…`): one template
+//! table, indexed alike ([`lane_specs`], [`ord_specs`]); a slot a host has
+//! no endpoint for is never started there.
+//!
+//! **Signing in place** (BX4 carried): the parameters are rendered
+//! contiguously into the connection's own template window
+//! ([`QueryWriter`]), the Ed25519 signature is computed over exactly those
+//! bytes and appended straight after as `&signature=<percent-encoded
+//! base64>` ([`sign_in_place`], one `split_at_mut`, no second buffer).
+//! The REST order route (BX7, C5: `order_transport = "rest"`, the Demo
+//! battery's fallback) renders the WS API's own parameters as a query
+//! ([`render_place`] and its siblings) on its own connection
+//! ([`ord_specs`]); every order verb — the place, the cancel, the modify —
+//! is body-form, as is the sweep's `DELETE allOpenOrders` (core-net's law
+//! for the order path: a query-form request stages its header tail behind
+//! the parameters on every send). HMAC (R22) signs the same bytes
+//! ([`QueryWriter::sign_with`]: `&signature=<hex>`).
+//!
+//! **Answers** are read in place, fail closed: [`scan_error`] (the
+//! venue's `{"code":…,"msg":…}`), [`scan_listen_key`],
+//! [`scan_server_time`], [`scan_countdown`], [`scan_orders`] (the open
+//! orders) and [`scan_trades`] (the day's trades); and, for the cli's Demo
+//! tools (BX7b), [`scan_touch`] and [`scan_mark`] (the book's touch and
+//! the mark — a price the tools order at).
+
+use core_net::{Method, Params, ReqSpec};
+
+use crate::config::{hex_lower, HmacSigner, Signer, HMAC_SIG_HEX};
+use crate::inst::{PRODUCT_COINM, PRODUCT_OPTIONS, PRODUCT_SPOT};
+use crate::json::{bool_of, dec_1e6, dec_1e9, i64_of, str_of, u64_of, Elems, Pairs};
+use crate::num::{render_fixed, render_u64, RENDER_MAX};
+use crate::userstream::{side_of, status_of, ScanErr, Span};
+use crate::wsapi::{render_parts, side_word, Part, Place, WsStatic};
+
+/// The form content type.
+pub const FORM: &str = "application/x-www-form-urlencoded";
+/// The API key header.
+pub const KEY_HEADER: &str = "X-MBX-APIKEY";
+
+/// `POST …/v1/listenKey`.
+pub const T_LISTEN_KEY_NEW: usize = 0;
+/// `PUT …/v1/listenKey` (keep-alive).
+pub const T_LISTEN_KEY_KEEP: usize = 1;
+/// `POST …/v1/countdownCancelAll` (signed).
+pub const T_COUNTDOWN: usize = 2;
+/// `GET …/v1/time`.
+pub const T_TIME: usize = 3;
+/// `GET …/v1/openOrders` (signed).
+pub const T_OPEN_ORDERS: usize = 4;
+/// `GET …/v1/userTrades` (signed).
+pub const T_USER_TRADES: usize = 5;
+/// `DELETE …/v1/allOpenOrders` (signed, body form — BX7): the sweep's
+/// fallback (B1).
+pub const T_CANCEL_ALL: usize = 6;
+/// `GET …/v1/positionSide/dual` (signed).
+pub const T_DUAL: usize = 7;
+/// `GET /fapi/v1/multiAssetsMargin` (signed). USDⓈ-M classic only: dapi
+/// and papi have no multi-assets toggle, and the slot is never started
+/// there.
+pub const T_MULTI_ASSETS: usize = 8;
+/// `GET …/account` (signed): started only in Portfolio Margin — the
+/// unified account, `/papi/v1/account` (BX7, C2: the ratio, the equity,
+/// the account status). Classic reads its account over the order route.
+pub const T_ACCOUNT: usize = 9;
+/// `GET /fapi/v1/symbolConfig?symbol=…` (signed; BX7, BX-19): an owned
+/// row's margin type and leverage, asserted at boot. USDⓈ-M only — COIN-M's
+/// account read carries both for every symbol, and Portfolio Margin is
+/// cross by construction — so the slot is never started elsewhere.
+pub const T_SYMBOL_CONFIG: usize = 10;
+/// `GET /api/v3/ticker/price?symbol=…` (public; BX8): a spot row's price,
+/// read once at boot for a balance the boot adopts (a balance carries
+/// none) — on options (BX9) `GET /eapi/v1/index?underlying=…`, an
+/// underlying's index for a held short's adoption. Spot and options only.
+pub const T_PRICE: usize = 11;
+/// `GET /eapi/v1/position` (signed; BX9): the options account's positions
+/// — the cycle's legs (its margin is the order route's `marginAccount`).
+/// Options only.
+pub const T_POSITION: usize = 12;
+/// `GET /eapi/v1/exerciseRecord` (signed; BX9): the expired options'
+/// settlements — read while an expired leg is settling (§3.10). Options only.
+pub const T_EXERCISE: usize = 13;
+/// A lane's jobs connection's templates.
+pub const LANE_TEMPLATES: usize = 14;
+
+/// papi's connectivity check: what a slot papi has no endpoint for names
+/// (the countdown — K13: no dead-man in PM — the time, multi-assets); it
+/// is never started.
+const PAPI_NONE: &str = "/papi/v1/ping";
+
+/// The jobs connection's paths by template, USDⓈ-M.
+const FAPI_PATHS: [&str; LANE_TEMPLATES] = [
+    "/fapi/v1/listenKey",
+    "/fapi/v1/listenKey",
+    "/fapi/v1/countdownCancelAll",
+    "/fapi/v1/time",
+    "/fapi/v1/openOrders",
+    "/fapi/v1/userTrades",
+    "/fapi/v1/allOpenOrders",
+    "/fapi/v1/positionSide/dual",
+    "/fapi/v1/multiAssetsMargin",
+    "/fapi/v3/account",
+    "/fapi/v1/symbolConfig",
+    "/fapi/v1/ping",
+    "/fapi/v1/ping",
+    "/fapi/v1/ping",
+];
+
+/// The jobs connection's paths by template, COIN-M. Its multi-assets and
+/// symbol-config slots name no dapi endpoint: never started, they would
+/// only ever be refused.
+const DAPI_PATHS: [&str; LANE_TEMPLATES] = [
+    "/dapi/v1/listenKey",
+    "/dapi/v1/listenKey",
+    "/dapi/v1/countdownCancelAll",
+    "/dapi/v1/time",
+    "/dapi/v1/openOrders",
+    "/dapi/v1/userTrades",
+    "/dapi/v1/allOpenOrders",
+    "/dapi/v1/positionSide/dual",
+    "/dapi/v1/multiAssetsMargin",
+    "/dapi/v1/account",
+    "/dapi/v1/symbolConfig",
+    "/dapi/v1/ping",
+    "/dapi/v1/ping",
+    "/dapi/v1/ping",
+];
+
+/// Portfolio Margin's paths by template, USDⓈ-M (papi `um/`).
+const PAPI_UM_PATHS: [&str; LANE_TEMPLATES] = [
+    "/papi/v1/listenKey",
+    "/papi/v1/listenKey",
+    PAPI_NONE,
+    PAPI_NONE,
+    "/papi/v1/um/openOrders",
+    "/papi/v1/um/userTrades",
+    "/papi/v1/um/allOpenOrders",
+    "/papi/v1/um/positionSide/dual",
+    PAPI_NONE,
+    "/papi/v1/account",
+    PAPI_NONE,
+    PAPI_NONE,
+    PAPI_NONE,
+    PAPI_NONE,
+];
+
+/// Portfolio Margin's paths by template, COIN-M (papi `cm/`).
+const PAPI_CM_PATHS: [&str; LANE_TEMPLATES] = [
+    "/papi/v1/listenKey",
+    "/papi/v1/listenKey",
+    PAPI_NONE,
+    PAPI_NONE,
+    "/papi/v1/cm/openOrders",
+    "/papi/v1/cm/userTrades",
+    "/papi/v1/cm/allOpenOrders",
+    "/papi/v1/cm/positionSide/dual",
+    PAPI_NONE,
+    "/papi/v1/account",
+    PAPI_NONE,
+    PAPI_NONE,
+    PAPI_NONE,
+    PAPI_NONE,
+];
+
+/// Spot's connectivity check: a slot spot has no endpoint for (the
+/// listenKey — gone since 2026-02-20; the dead-man and the cancel-all —
+/// spot is IoC-only, BX-17; the futures assertions); never started.
+const SPOT_NONE: &str = "/api/v3/ping";
+
+/// Spot's paths by template (BX8): the time, the open orders, the day's
+/// trades, a symbol's price. Its account is read on the order session.
+const SPOT_PATHS: [&str; LANE_TEMPLATES] = [
+    SPOT_NONE,
+    SPOT_NONE,
+    SPOT_NONE,
+    "/api/v3/time",
+    "/api/v3/openOrders",
+    "/api/v3/myTrades",
+    SPOT_NONE,
+    SPOT_NONE,
+    SPOT_NONE,
+    SPOT_NONE,
+    SPOT_NONE,
+    "/api/v3/ticker/price",
+    SPOT_NONE,
+    SPOT_NONE,
+];
+
+/// Options' connectivity check (BX9): what a slot eapi has no endpoint
+/// for, or the gateway never sends there (the countdown is a market
+/// maker's — `-6005`, K3; options are IoC-only: no cancel-all; the futures
+/// assertions); never started.
+const EAPI_NONE: &str = "/eapi/v1/ping";
+
+/// Options' paths by template (BX9): the listenKey, the time, the open
+/// orders, the day's trades, an underlying's index (the price slot: a held
+/// short's adoption), the positions, the exercise record. The margin is
+/// read on the order route (`marginAccount`).
+const EAPI_PATHS: [&str; LANE_TEMPLATES] = [
+    "/eapi/v1/listenKey",
+    "/eapi/v1/listenKey",
+    EAPI_NONE,
+    "/eapi/v1/time",
+    "/eapi/v1/openOrders",
+    "/eapi/v1/userTrades",
+    EAPI_NONE,
+    EAPI_NONE,
+    EAPI_NONE,
+    EAPI_NONE,
+    EAPI_NONE,
+    "/eapi/v1/index",
+    "/eapi/v1/position",
+    "/eapi/v1/exerciseRecord",
+];
+
+/// `GET /sapi/v1/account/apiRestrictions` (signed).
+pub const S_API_RESTRICTIONS: usize = 0;
+/// `GET /sapi/v1/portfolio/account` (signed).
+pub const S_PORTFOLIO: usize = 1;
+/// `GET /api/v3/time`: the clock in Portfolio Margin, whose papi has no
+/// time endpoint (Binance's one server time; BX7, C2).
+pub const S_TIME: usize = 2;
+/// `GET /sapi/v1/account/apiRestrictions` under the OPTIONS key (BX9, Q-1:
+/// options sign with their own HMAC key — its permissions are its own).
+pub const S_API_RESTRICTIONS_OPT: usize = 3;
+/// The sapi templates.
+pub const SAPI_TEMPLATES: usize = 4;
+
+/// **BX10 — Binance Stocks' order stream's path**, before the listenKey
+/// (`wss://<Hosts::eq_user>/equity/ws/<listenKey>@orderReport`; the probe's
+/// EQ7). Mainnet only: Binance Stocks has no Demo (K15, R21).
+pub const EQ_USER_PATH: &str = "/equity/ws/";
+/// Its path's suffix, after the listenKey.
+pub const EQ_USER_SUFFIX: &str = "@orderReport";
+
+/// BX10 — Binance Stocks' templates (`/sapi/v1/equity/`, on the SAPI host,
+/// the arm's key): `GET …/market/exchangeInfo` (the key's header,
+/// unsigned: MARKET_DATA).
+pub const EQ_INFO: usize = 0;
+/// `GET …/market/tokenized-assets` (MARKET_DATA).
+pub const EQ_TOKENIZED: usize = 1;
+/// `GET …/market/quote` (MARKET_DATA; ≤ 5 s stale, an empty body when none).
+pub const EQ_QUOTE: usize = 2;
+/// `GET /api/v3/time` (Binance's one server time), at the lanes' own
+/// [`T_TIME`] so a client's clock reads it there too.
+pub const EQ_TIME: usize = 3;
+const _: () = assert!(EQ_TIME == T_TIME);
+/// `GET …/order/open-orders` (signed).
+pub const EQ_OPEN: usize = 4;
+/// `GET …/order/history` (signed; a window and a page).
+pub const EQ_HISTORY: usize = 5;
+/// `GET …/trade/history` (signed; a window and a page): one row an execution.
+pub const EQ_TRADES: usize = 6;
+/// `GET …/order/detail` (signed; by `orderId` or `clientOrderId`).
+pub const EQ_DETAIL: usize = 7;
+/// `POST …/equity/listenKey` (signed): creates or renews the stream's key.
+pub const EQ_LISTEN_KEY: usize = 8;
+/// The templates that read (and the listenKey's): the read-only probe's.
+pub const EQ_READ_TEMPLATES: usize = 9;
+/// `POST …/order/place` (signed, body form).
+pub const EQ_PLACE: usize = 9;
+/// `POST …/order/cancel` (signed, body form): by the venue's `orderId`.
+pub const EQ_CANCEL: usize = 10;
+/// `POST …/order/cancel-all` (signed, body form).
+pub const EQ_CANCEL_ALL: usize = 11;
+/// Binance Stocks' templates.
+pub const EQ_TEMPLATES: usize = 12;
+
+/// Binance Stocks' paths, by template (`EQ_*` above).
+pub const EQ_PATHS: [&str; EQ_TEMPLATES] = [
+    "/sapi/v1/equity/market/exchangeInfo",
+    "/sapi/v1/equity/market/tokenized-assets",
+    "/sapi/v1/equity/market/quote",
+    "/api/v3/time",
+    "/sapi/v1/equity/order/open-orders",
+    "/sapi/v1/equity/order/history",
+    "/sapi/v1/equity/trade/history",
+    "/sapi/v1/equity/order/detail",
+    "/sapi/v1/equity/listenKey",
+    "/sapi/v1/equity/order/place",
+    "/sapi/v1/equity/order/cancel",
+    "/sapi/v1/equity/order/cancel-all",
+];
+
+/// **BX10 — Binance Stocks' templates** on the SAPI host, every one
+/// carrying the key header; the reads as queries, the listenKey and the
+/// order verbs as form bodies.
+#[must_use]
+pub fn equity_specs<'a>(key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; EQ_TEMPLATES] {
+    let q = |t: usize| ReqSpec {
+        method: Method::Get,
+        path: EQ_PATHS[t],
+        params: Params::Query,
+        headers: key,
+    };
+    let b = |t: usize| ReqSpec {
+        method: Method::Post,
+        path: EQ_PATHS[t],
+        params: Params::Body(FORM),
+        headers: key,
+    };
+    [
+        q(EQ_INFO),
+        q(EQ_TOKENIZED),
+        q(EQ_QUOTE),
+        q(EQ_TIME),
+        q(EQ_OPEN),
+        q(EQ_HISTORY),
+        q(EQ_TRADES),
+        q(EQ_DETAIL),
+        b(EQ_LISTEN_KEY),
+        b(EQ_PLACE),
+        b(EQ_CANCEL),
+        b(EQ_CANCEL_ALL),
+    ]
+}
+
+/// **`GET …/order/history` or `…/trade/history`** — the window
+/// `[start_ms, end_ms]` (both required), page `page` (1-based) of 100
+/// (the venue's most).
+pub fn render_eq_window(w: &mut QueryWriter<'_>, st: &WsStatic, start_ms: u64, end_ms: u64, page: u64, ts_ms: u64) {
+    render_eq_trades(w, st, b"", start_ms, end_ms, page, ts_ms);
+}
+
+/// **`GET …/trade/history`** of one ticker (`symbol`; empty: every ticker)
+/// over `[start_ms, end_ms]`, page `page` of [`EQ_PAGE`].
+#[allow(clippy::too_many_arguments)]
+pub fn render_eq_trades(w: &mut QueryWriter<'_>, st: &WsStatic, symbol: &[u8], start_ms: u64, end_ms: u64, page: u64, ts_ms: u64) {
+    if !symbol.is_empty() {
+        w.parts(&[Part::Lit(b"symbol="), Part::Lit(symbol), Part::Lit(b"&")]);
+    }
+    w.parts(&[
+        Part::Lit(b"startTime="),
+        Part::U64(start_ms),
+        Part::Lit(b"&endTime="),
+        Part::U64(end_ms),
+        Part::Lit(b"&current="),
+        Part::U64(page),
+        Part::Lit(b"&size="),
+        Part::U64(EQ_PAGE as u64),
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(ts_ms),
+    ]);
+}
+
+/// A history page's rows: the venue's most (`size` ≤ 100).
+pub const EQ_PAGE: usize = 100;
+
+/// **`POST …/order/place`** (BX10) — a LIMIT DAY order on the order's own
+/// terms (`o`: the ticker, the side, the price on the 0.01 grid, the
+/// quantity on the row's step, our 32-character id) and the D5 statics
+/// (`eq`: the trading session, the quote asset, `tokenize`). A BUY pays
+/// from the spot wallet (`walletType=MAIN`); a SELL names none — the venue
+/// settles it to the funding wallet whatever it says (its trade page).
+/// `timeInForce=DAY` always: a GTC order outlives any gateway TTL (BX-17's
+/// exception is DAY under the TTL).
+pub fn render_eq_place(w: &mut QueryWriter<'_>, st: &WsStatic, eq: &crate::equity::EqKnobs, o: &Place<'_>) {
+    let buy = o.side == core_types::Side::Bid as u8;
+    w.parts(&[
+        Part::Lit(b"symbol="),
+        Part::Lit(o.symbol),
+        Part::Lit(b"&side="),
+        Part::Lit(side_word(o.side)),
+        Part::Lit(b"&orderType=LIMIT&quoteAsset="),
+        Part::Lit(eq.quote.as_bytes()),
+        Part::Lit(b"&price="),
+        Part::Fixed(o.px_1e6, o.px_dec),
+        Part::Lit(b"&quantity="),
+        Part::Fixed(o.qty_1e6, o.qty_dec),
+        Part::Lit(b"&timeInForce=DAY&tradingSession="),
+        Part::Lit(eq.session.word()),
+        Part::Lit(if buy { b"&walletType=MAIN" } else { b"" }),
+        Part::Lit(b"&clientOrderId="),
+        o.cid,
+        Part::Lit(if eq.tokenize { b"&tokenize=true" } else { b"&tokenize=false" }),
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(o.ts_ms),
+    ]);
+}
+
+/// **`POST …/order/cancel` · `GET …/order/detail`** by the venue's order
+/// id (BX10: a UUID — the cancel takes nothing else).
+pub fn render_eq_by_id(w: &mut QueryWriter<'_>, st: &WsStatic, id: &[u8], ts_ms: u64) {
+    w.parts(&[
+        Part::Lit(b"orderId="),
+        Part::Lit(id),
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(ts_ms),
+    ]);
+}
+
+/// **`GET …/order/detail`** by our client id (BX10: the in-doubt query —
+/// the venue's own UUID is unknown until the place's answer names it).
+pub fn render_eq_detail_cid(w: &mut QueryWriter<'_>, st: &WsStatic, cid: Part<'_>, ts_ms: u64) {
+    w.parts(&[
+        Part::Lit(b"clientOrderId="),
+        cid,
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(ts_ms),
+    ]);
+}
+
+/// A lane's jobs connection's templates for `product` (`PRODUCT_COINM`:
+/// dapi; `PRODUCT_SPOT`: spot's, BX8; `PRODUCT_OPTIONS`: eapi's, BX9;
+/// otherwise fapi) — in Portfolio Margin (`pm`), the futures product's
+/// papi paths — every one carrying the key header.
+#[must_use]
+pub fn lane_specs<'a>(product: u8, pm: bool, key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; LANE_TEMPLATES] {
+    let p = match (pm, product) {
+        (_, PRODUCT_SPOT) => &SPOT_PATHS,
+        (_, PRODUCT_OPTIONS) => &EAPI_PATHS,
+        (false, PRODUCT_COINM) => &DAPI_PATHS,
+        (false, _) => &FAPI_PATHS,
+        (true, PRODUCT_COINM) => &PAPI_CM_PATHS,
+        (true, _) => &PAPI_UM_PATHS,
+    };
+    let q = |method, t: usize| ReqSpec {
+        method,
+        path: p[t],
+        params: Params::Query,
+        headers: key,
+    };
+    let b = |method, t: usize| ReqSpec {
+        method,
+        path: p[t],
+        params: Params::Body(FORM),
+        headers: key,
+    };
+    [
+        b(Method::Post, T_LISTEN_KEY_NEW),
+        b(Method::Put, T_LISTEN_KEY_KEEP),
+        b(Method::Post, T_COUNTDOWN),
+        q(Method::Get, T_TIME),
+        q(Method::Get, T_OPEN_ORDERS),
+        q(Method::Get, T_USER_TRADES),
+        b(Method::Delete, T_CANCEL_ALL),
+        q(Method::Get, T_DUAL),
+        q(Method::Get, T_MULTI_ASSETS),
+        q(Method::Get, T_ACCOUNT),
+        q(Method::Get, T_SYMBOL_CONFIG),
+        q(Method::Get, T_PRICE),
+        q(Method::Get, T_POSITION),
+        q(Method::Get, T_EXERCISE),
+    ]
+}
+
+/// The REST order route's templates (BX7, C5), on its own keep-alive
+/// connection — one request on the wire at a time.
+/// `POST …/v1/order` (signed, body form).
+pub const R_PLACE: usize = 0;
+/// `DELETE …/v1/order` (signed, body form — BX7): one order's cancel by its
+/// client id (or, a stray's, by the venue's id).
+pub const R_CANCEL: usize = 1;
+/// `PUT …/v1/order` (signed, body form): a modify.
+pub const R_MODIFY: usize = 2;
+/// `GET …/v1/order` (signed): the in-doubt query (BX-11).
+pub const R_STATUS: usize = 3;
+/// `GET /fapi/v3/account` · `GET /dapi/v1/account` (signed): recon and
+/// margin — the WS API's `v2/account.status` · `account.status`, the same
+/// shapes (fapi's v2 lists every symbol of the market and no `notional`:
+/// BX7 moved the route to v3, the WS API's own). In
+/// Portfolio Margin the product's positions: `GET /papi/v2/um/account` ·
+/// `GET /papi/v1/cm/account` (the margin is the unified account's,
+/// [`T_ACCOUNT`]).
+pub const R_ACCOUNT: usize = 4;
+/// The order route's templates.
+pub const ORD_TEMPLATES: usize = 5;
+
+/// The order route's templates for `product` (`PRODUCT_COINM`: dapi;
+/// `PRODUCT_OPTIONS`: eapi's — BX9: the place, the query and the margin
+/// account; no cancel or modify is built, those slots are never started;
+/// otherwise fapi; in Portfolio Margin, `pm`, the product's papi paths),
+/// every one carrying the key header.
+#[must_use]
+pub fn ord_specs<'a>(product: u8, pm: bool, key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; ORD_TEMPLATES] {
+    let (order, account) = match (pm, product) {
+        (_, PRODUCT_OPTIONS) => ("/eapi/v1/order", "/eapi/v1/marginAccount"),
+        (false, PRODUCT_COINM) => ("/dapi/v1/order", "/dapi/v1/account"),
+        (false, _) => ("/fapi/v1/order", "/fapi/v3/account"),
+        (true, PRODUCT_COINM) => ("/papi/v1/cm/order", "/papi/v1/cm/account"),
+        (true, _) => ("/papi/v1/um/order", "/papi/v2/um/account"),
+    };
+    // Options build no cancel and no modify (IoC-only, BX-17): their slots
+    // name eapi's connectivity check, never started.
+    let (cancel, modify) = if product == PRODUCT_OPTIONS { (EAPI_NONE, EAPI_NONE) } else { (order, order) };
+    let q = |method, path| ReqSpec {
+        method,
+        path,
+        params: Params::Query,
+        headers: key,
+    };
+    let b = |method, path| ReqSpec {
+        method,
+        path,
+        params: Params::Body(FORM),
+        headers: key,
+    };
+    [
+        b(Method::Post, order),
+        b(Method::Delete, cancel),
+        b(Method::Put, modify),
+        q(Method::Get, order),
+        q(Method::Get, account),
+    ]
+}
+
+/// BX11 — the account tool's mutations (`exec-smoke --binance-setup`),
+/// signed, body-form: `POST positionSide/dual` (`dualSidePosition`).
+/// The engine never sends one (BX-19: it asserts; the operator sets).
+pub const U_DUAL: usize = 0;
+/// `POST multiAssetsMargin` (`multiAssetsMargin`; USDⓈ-M only).
+pub const U_MULTI_ASSETS: usize = 1;
+/// `POST marginType` (`symbol`, `marginType`).
+pub const U_MARGIN_TYPE: usize = 2;
+/// `POST leverage` (`symbol`, `leverage`).
+pub const U_LEVERAGE: usize = 3;
+/// `POST stock/contract`: the TradFi Perps agreement (USDⓈ-M only; plan
+/// §1.6 item 5).
+pub const U_STOCK_CONTRACT: usize = 4;
+/// The setup templates.
+pub const SETUP_TEMPLATES: usize = 5;
+
+/// The account tool's templates for `product` (`PRODUCT_COINM`: dapi;
+/// otherwise fapi), every one carrying the key header. COIN-M names no
+/// multi-assets or agreement endpoint: those two slots are never started
+/// there (as [`lane_specs`]' unused ones).
+#[must_use]
+pub fn setup_specs<'a>(product: u8, key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; SETUP_TEMPLATES] {
+    let p: [&'a str; SETUP_TEMPLATES] = if product == PRODUCT_COINM {
+        [
+            "/dapi/v1/positionSide/dual",
+            "/dapi/v1/multiAssetsMargin",
+            "/dapi/v1/marginType",
+            "/dapi/v1/leverage",
+            "/dapi/v1/stock/contract",
+        ]
+    } else {
+        [
+            "/fapi/v1/positionSide/dual",
+            "/fapi/v1/multiAssetsMargin",
+            "/fapi/v1/marginType",
+            "/fapi/v1/leverage",
+            "/fapi/v1/stock/contract",
+        ]
+    };
+    let b = |t: usize| ReqSpec {
+        method: Method::Post,
+        path: p[t],
+        params: Params::Body(FORM),
+        headers: key,
+    };
+    [b(U_DUAL), b(U_MULTI_ASSETS), b(U_MARGIN_TYPE), b(U_LEVERAGE), b(U_STOCK_CONTRACT)]
+}
+
+/// **`POST /fapi/v1/order`** — the REST route's place (BX7, C5): the WS
+/// API's `order.place` parameters as a query, rendered in place.
+pub fn render_place(w: &mut QueryWriter<'_>, st: &WsStatic, o: &Place<'_>) {
+    let tif: &[u8] = if o.maker { b"GTX" } else { b"IOC" };
+    let ro: &[u8] = if o.reduce_only { b"&reduceOnly=true" } else { b"" };
+    w.parts(&[
+        Part::Lit(b"symbol="),
+        Part::Lit(o.symbol),
+        Part::Lit(b"&side="),
+        Part::Lit(side_word(o.side)),
+        Part::Lit(b"&type=LIMIT&timeInForce="),
+        Part::Lit(tif),
+        Part::Lit(ro),
+        Part::Lit(b"&quantity="),
+        Part::Fixed(o.qty_1e6, o.qty_dec),
+        Part::Lit(b"&price="),
+        Part::Fixed(o.px_1e6, o.px_dec),
+        Part::Lit(b"&newClientOrderId="),
+        o.cid,
+        Part::Lit(b"&newOrderRespType=ACK"),
+        // papi's COIN-M order takes no STP mode (an unread parameter is
+        // refused): its lane's static carries none.
+        Part::Lit(if st.stp.is_empty() { b"" } else { b"&selfTradePreventionMode=" }),
+        Part::Lit(st.stp),
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(o.ts_ms),
+    ]);
+}
+
+/// **`PUT /fapi/v1/order`** — a modify: price and quantity together; the
+/// venue keeps the order's client id, time in force and flags.
+pub fn render_modify(w: &mut QueryWriter<'_>, st: &WsStatic, o: &Place<'_>) {
+    w.parts(&[
+        Part::Lit(b"symbol="),
+        Part::Lit(o.symbol),
+        Part::Lit(b"&side="),
+        Part::Lit(side_word(o.side)),
+        Part::Lit(b"&origClientOrderId="),
+        o.cid,
+        Part::Lit(b"&quantity="),
+        Part::Fixed(o.qty_1e6, o.qty_dec),
+        Part::Lit(b"&price="),
+        Part::Fixed(o.px_1e6, o.px_dec),
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(o.ts_ms),
+    ]);
+}
+
+/// **`DELETE` / `GET /fapi/v1/order`** — one order by its client id: a
+/// cancel, or the in-doubt query.
+pub fn render_by_cid(w: &mut QueryWriter<'_>, st: &WsStatic, symbol: &[u8], cid: Part<'_>, ts_ms: u64) {
+    w.parts(&[
+        Part::Lit(b"symbol="),
+        Part::Lit(symbol),
+        Part::Lit(b"&origClientOrderId="),
+        cid,
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(ts_ms),
+    ]);
+}
+
+/// **`DELETE /fapi/v1/order`** by the venue's order id — a stray the
+/// REST route cancels (its client id lay in an answer since overwritten).
+pub fn render_by_order_id(w: &mut QueryWriter<'_>, st: &WsStatic, symbol: &[u8], order_id: u64, ts_ms: u64) {
+    w.parts(&[
+        Part::Lit(b"symbol="),
+        Part::Lit(symbol),
+        Part::Lit(b"&orderId="),
+        Part::U64(order_id),
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(ts_ms),
+    ]);
+}
+
+/// **`POST /eapi/v1/order`** — an options place (BX9): eapi names the id
+/// `clientOrderId` (not `newClientOrderId`), takes `LIMIT` only, and
+/// answers with `newOrderRespType=ACK`. Options are IoC-only (BX-17: the
+/// countdown is a market maker's), so a maker is never sent here — the arm
+/// refuses it first.
+pub fn render_opt_place(w: &mut QueryWriter<'_>, st: &WsStatic, o: &Place<'_>) {
+    debug_assert!(!o.maker, "options are IoC-only: the arm refuses a maker");
+    let ro: &[u8] = if o.reduce_only { b"&reduceOnly=true" } else { b"" };
+    w.parts(&[
+        Part::Lit(b"symbol="),
+        Part::Lit(o.symbol),
+        Part::Lit(b"&side="),
+        Part::Lit(side_word(o.side)),
+        Part::Lit(b"&type=LIMIT&timeInForce=IOC"),
+        Part::Lit(ro),
+        Part::Lit(b"&quantity="),
+        Part::Fixed(o.qty_1e6, o.qty_dec),
+        Part::Lit(b"&price="),
+        Part::Fixed(o.px_1e6, o.px_dec),
+        Part::Lit(b"&clientOrderId="),
+        o.cid,
+        Part::Lit(b"&newOrderRespType=ACK"),
+        Part::Lit(if st.stp.is_empty() { b"" } else { b"&selfTradePreventionMode=" }),
+        Part::Lit(st.stp),
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(o.ts_ms),
+    ]);
+}
+
+/// **`GET /eapi/v1/order`** — one options order by its client id (BX9: the
+/// in-doubt query, BX-11): eapi names it `clientOrderId`.
+pub fn render_opt_by_cid(w: &mut QueryWriter<'_>, st: &WsStatic, symbol: &[u8], cid: Part<'_>, ts_ms: u64) {
+    w.parts(&[
+        Part::Lit(b"symbol="),
+        Part::Lit(symbol),
+        Part::Lit(b"&clientOrderId="),
+        cid,
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(ts_ms),
+    ]);
+}
+
+/// **`GET /fapi/v3/account`** — recon and margin.
+pub fn render_account(w: &mut QueryWriter<'_>, st: &WsStatic, ts_ms: u64) {
+    w.parts(&[Part::Lit(b"recvWindow="), Part::U64(st.recv_window_ms), Part::Lit(b"&timestamp="), Part::U64(ts_ms)]);
+}
+
+/// The sapi connection's templates: the arm's key's, then the options
+/// key's permission read (BX9; `opt_key` is the arm's own where options sign
+/// with it, or none are armed — that slot is then never started).
+#[must_use]
+pub fn sapi_specs<'a>(key: &'a [(&'a str, &'a str)], opt_key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; SAPI_TEMPLATES] {
+    let q = |path, headers| ReqSpec {
+        method: Method::Get,
+        path,
+        params: Params::Query,
+        headers,
+    };
+    [
+        q("/sapi/v1/account/apiRestrictions", key),
+        q("/sapi/v1/portfolio/account", key),
+        q("/api/v3/time", key),
+        q("/sapi/v1/account/apiRestrictions", opt_key),
+    ]
+}
+
+/// A render that did not fit its window.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Overflow;
+
+/// **Parameters rendered in place** into a template window.
+pub struct QueryWriter<'a> {
+    buf: &'a mut [u8],
+    n: usize,
+    ok: bool,
+}
+
+impl<'a> QueryWriter<'a> {
+    /// Write from the start of `buf` (the template's window).
+    #[must_use]
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, n: 0, ok: true }
+    }
+
+    /// Append literal bytes.
+    #[inline]
+    pub fn put(&mut self, b: &[u8]) -> &mut Self {
+        if self.ok && self.n + b.len() <= self.buf.len() {
+            // COPY: a parameter name or value (≤ 64 B) into the request
+            // window — this IS the render (cold REST, once per request); the
+            // window is the one buffer the bytes are sent from.
+            self.buf[self.n..self.n + b.len()].copy_from_slice(b);
+            self.n += b.len();
+        } else {
+            self.ok = false;
+        }
+        self
+    }
+
+    /// Append an unsigned integer.
+    #[inline]
+    pub fn uint(&mut self, v: u64) -> &mut Self {
+        if self.ok && self.n + 20 <= self.buf.len() {
+            self.n += render_u64(v, &mut self.buf[self.n..]);
+        } else {
+            self.ok = false;
+        }
+        self
+    }
+
+    /// Append a ×1e6 value with `dec` decimals.
+    #[inline]
+    pub fn fixed(&mut self, v_1e6: i64, dec: u8) -> &mut Self {
+        if self.ok && self.n + RENDER_MAX <= self.buf.len() {
+            self.n += render_fixed(v_1e6, dec, &mut self.buf[self.n..]);
+        } else {
+            self.ok = false;
+        }
+        self
+    }
+
+    /// Append parts — a number's digits, our client id — rendered in
+    /// place (the WS API's renderer, BX7).
+    #[inline]
+    pub fn parts(&mut self, parts: &[Part<'_>]) -> &mut Self {
+        if self.ok {
+            match render_parts(parts, &mut self.buf[self.n..]) {
+                Ok(k) => self.n += k,
+                Err(_) => self.ok = false,
+            }
+        }
+        self
+    }
+
+    /// The rendered length, or `Overflow`.
+    pub fn rendered(&self) -> Result<usize, Overflow> {
+        if self.ok {
+            Ok(self.n)
+        } else {
+            Err(Overflow)
+        }
+    }
+
+    /// Sign what was rendered and append the signature (module docs).
+    /// Returns the request's total length.
+    pub fn sign(self, signer: &signer_ed25519::Ed25519Signer) -> Result<usize, Overflow> {
+        let n = self.rendered()?;
+        sign_in_place(signer, self.buf, n)
+    }
+
+    /// Sign with the arm's signer — Ed25519, or HMAC where the
+    /// configuration says so (BX7, R22).
+    pub fn sign_with(self, signer: &Signer) -> Result<usize, Overflow> {
+        match signer {
+            Signer::Ed25519(s) => self.sign(s),
+            Signer::Hmac(h) => h.sign_query(self),
+        }
+    }
+}
+
+/// **What signs a rendered query** (BX9, the risk review's R2): the arm's
+/// [`Signer`], or an HMAC key BORROWED where the configuration holds it —
+/// a cold boot read (the options held) signs with no copy of the secret: a
+/// throwaway copy's drop `munlock`s its whole page, which a live key's
+/// half may share (Linux locks do not stack).
+pub trait QuerySigner {
+    /// Sign `q`'s rendered bytes and append the signature; the request's
+    /// total length.
+    ///
+    /// # Errors
+    /// The request does not fit its window.
+    fn sign_query(&self, q: QueryWriter<'_>) -> Result<usize, Overflow>;
+}
+
+impl QuerySigner for Signer {
+    #[inline]
+    fn sign_query(&self, q: QueryWriter<'_>) -> Result<usize, Overflow> {
+        q.sign_with(self)
+    }
+}
+
+impl QuerySigner for HmacSigner {
+    #[inline]
+    fn sign_query(&self, q: QueryWriter<'_>) -> Result<usize, Overflow> {
+        let n = q.rendered()?;
+        sign_hmac_in_place(self, q.buf, n)
+    }
+}
+
+const SIG_KEY: &[u8] = b"&signature=";
+
+/// Sign `buf[..n]` and append `&signature=<pct-b64>` right after it.
+pub fn sign_in_place(signer: &signer_ed25519::Ed25519Signer, buf: &mut [u8], n: usize) -> Result<usize, Overflow> {
+    let need = n + SIG_KEY.len() + signer_ed25519::SIG_B64_PCT_MAX;
+    if n == 0 || need > buf.len() {
+        return Err(Overflow);
+    }
+    let (msg, rest) = buf.split_at_mut(n);
+    // COPY: the 11 B literal `&signature=` after the signed bytes — the
+    // render of the separator itself; nothing precedes it anywhere else.
+    rest[..SIG_KEY.len()].copy_from_slice(SIG_KEY);
+    let m = signer.sign_b64_pct(msg, &mut rest[SIG_KEY.len()..]);
+    Ok(n + SIG_KEY.len() + m)
+}
+
+/// HMAC (R22): sign `buf[..n]` and append `&signature=<64 hex>` right
+/// after it. The inner hash pads in place, in the 75 B the signature then
+/// takes (BX7: ≥ `SHA256_PAD_MAX`; no byte of the request is stashed).
+pub fn sign_hmac_in_place(h: &HmacSigner, buf: &mut [u8], n: usize) -> Result<usize, Overflow> {
+    const _: () = assert!(SIG_KEY.len() + HMAC_SIG_HEX >= core_crypto::SHA256_PAD_MAX);
+    let need = n + SIG_KEY.len() + HMAC_SIG_HEX;
+    if n == 0 || need > buf.len() {
+        return Err(Overflow);
+    }
+    let tag = h.tag_in_place(&mut buf[..need], n).ok_or(Overflow)?;
+    let rest = &mut buf[n..need];
+    // COPY: the 11 B literal `&signature=` after the signed bytes — the
+    // separator's render, as for Ed25519 (over the padding the tag left).
+    rest[..SIG_KEY.len()].copy_from_slice(SIG_KEY);
+    let Ok(sig) = <&mut [u8; HMAC_SIG_HEX]>::try_from(&mut rest[SIG_KEY.len()..]) else {
+        return Err(Overflow);
+    };
+    hex_lower(&tag, sig);
+    Ok(need)
+}
+
+// -------------------------------------------------------------------------
+// Answers
+// -------------------------------------------------------------------------
+
+#[inline(always)]
+fn malformed(_: ()) -> ScanErr {
+    ScanErr::Malformed
+}
+
+#[inline(always)]
+fn bad(_: ()) -> ScanErr {
+    ScanErr::BadField
+}
+
+/// The venue's refusal code in a `{"code":…,"msg":…}` body; 0 if the body
+/// is not one. BX7 (the one-reading law, as the WS API's `error` is read):
+/// the body is ONE object, whole and well-formed — bytes after it, a pair
+/// it cannot walk or `code` named twice is no code (0: "no code", which a
+/// refusal under 500 may not be).
+#[must_use]
+pub fn scan_error(body: &[u8]) -> i32 {
+    let whole = match core_parse::skip_json_value(body, 0) {
+        Some(end) => core_parse::skip_ws(body, end) == body.len(),
+        None => false,
+    };
+    if !whole {
+        return 0;
+    }
+    let Ok(mut w) = Pairs::new(body, 0) else {
+        return 0;
+    };
+    let (mut code, mut coded) = (0, false);
+    loop {
+        match w.next() {
+            Ok(Some((k, a, z))) if k == b"code" => {
+                if coded {
+                    return 0;
+                }
+                coded = true;
+                if let Ok(c) = i64_of(body, a, z) {
+                    code = c.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return code,
+            Err(()) => return 0,
+        }
+    }
+}
+
+/// The venue ms a 418 names in its message (`…IP banned until
+/// 1790000600000…`); 0 if it names none — the latest, if it names several
+/// (BX7: as the WS API's `retryAfter` copies are read). Advisory: it can
+/// only lengthen the gateway's quiet, never shorten it.
+#[must_use]
+pub fn scan_ban_until(body: &[u8]) -> u64 {
+    const AT: &[u8] = b"banned until ";
+    let mut latest = 0u64;
+    let mut i = 0;
+    while i + AT.len() <= body.len() {
+        if &body[i..i + AT.len()] == AT {
+            let mut j = i + AT.len();
+            let mut v = 0u64;
+            let mut n = 0;
+            while j < body.len() && body[j].is_ascii_digit() && n < 19 {
+                v = v * 10 + (body[j] - b'0') as u64;
+                j += 1;
+                n += 1;
+            }
+            latest = latest.max(v);
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    latest
+}
+
+/// `{"listenKey":"…"}` → the key.
+pub fn scan_listen_key(body: &[u8]) -> Result<Span, ScanErr> {
+    let mut w = Pairs::new(body, 0).map_err(malformed)?;
+    while let Some((k, a, z)) = w.next().map_err(malformed)? {
+        if k == b"listenKey" {
+            return Ok(Span::of(body, str_of(body, a, z).map_err(bad)?));
+        }
+    }
+    Err(ScanErr::Missing)
+}
+
+/// `{"serverTime":…}` → ms: one whole object naming it once (BX7b, the
+/// one-reading law — a second copy or bytes after the object refuse).
+pub fn scan_server_time(body: &[u8]) -> Result<u64, ScanErr> {
+    let mut w = Pairs::new(body, 0).map_err(malformed)?;
+    let mut t = None;
+    while let Some((k, a, z)) = w.next().map_err(malformed)? {
+        if k == b"serverTime" {
+            if t.is_some() {
+                return Err(ScanErr::Malformed);
+            }
+            t = Some(u64_of(body, a, z).map_err(bad)?);
+        }
+    }
+    if !ends_whole(body, w.end()) {
+        return Err(ScanErr::Malformed);
+    }
+    t.ok_or(ScanErr::Missing)
+}
+
+/// A walk that ended at `end` read the body whole: nothing but whitespace
+/// follows (one pass — the walk itself is the structure's check). It
+/// refuses what a whole-value pre-pass would, but one thing: the skipper's
+/// nesting cap (16) then applies to each value the walk passes, not to the
+/// body — nothing these readers read lies that deep.
+#[inline]
+pub(crate) fn ends_whole(body: &[u8], end: Option<usize>) -> bool {
+    end.is_some_and(|z| core_parse::skip_ws(body, z) == body.len())
+}
+
+/// `body` is one JSON value, whole: nothing but whitespace after it (the
+/// Demo tools' one-symbol reads, which must find the object before they
+/// walk it; the boot's boolean judges, BX9's parser review).
+pub(crate) fn whole(body: &[u8]) -> bool {
+    match core_parse::skip_json_value(body, 0) {
+        Some(end) => core_parse::skip_ws(body, end) == body.len(),
+        None => false,
+    }
+}
+
+/// Where a one-symbol read's object starts: the body itself, or the only
+/// element of an array (dapi answers one symbol's read as `[{…}]`) — the
+/// body whole either way.
+fn one_object(body: &[u8]) -> Result<usize, ScanErr> {
+    if !whole(body) {
+        return Err(ScanErr::Malformed);
+    }
+    let p = core_parse::skip_ws(body, 0);
+    match body.get(p) {
+        Some(b'{') => Ok(p),
+        Some(b'[') => {
+            let mut e = Elems::new(body, p).map_err(malformed)?;
+            let first = e.next().map_err(malformed)?;
+            let second = e.next().map_err(malformed)?;
+            match (first, second) {
+                // A lone element that is not an object is refused by the
+                // object's walk (`Pairs::new`).
+                (Some((at, _)), None) => Ok(at),
+                _ => Err(ScanErr::Malformed),
+            }
+        }
+        _ => Err(ScanErr::Malformed),
+    }
+}
+
+/// A one-symbol read's two decimal fields — each named once, the `symbol`
+/// named once and `symbol`'s.
+fn two_of(body: &[u8], symbol: &[u8], ka: &[u8], kb: &[u8]) -> Result<(i64, i64), ScanErr> {
+    let at = one_object(body)?;
+    let mut w = Pairs::new(body, at).map_err(malformed)?;
+    let (mut sym, mut a, mut b) = (None, None, None);
+    while let Some((k, v0, v1)) = w.next().map_err(malformed)? {
+        let slot = if k == b"symbol" {
+            if sym.is_some() {
+                return Err(ScanErr::Malformed);
+            }
+            sym = Some(str_of(body, v0, v1).map_err(bad)?);
+            continue;
+        } else if k == ka {
+            &mut a
+        } else if k == kb {
+            &mut b
+        } else {
+            continue;
+        };
+        if slot.is_some() {
+            return Err(ScanErr::Malformed);
+        }
+        *slot = Some(dec_1e6(body, v0, v1).map_err(bad)?);
+    }
+    match (sym, a, b) {
+        (Some(s), Some(a), Some(b)) if s == symbol => Ok((a, b)),
+        (Some(_), Some(_), Some(_)) => Err(ScanErr::BadField),
+        _ => Err(ScanErr::Missing),
+    }
+}
+
+/// **`GET …/ticker/bookTicker?symbol=`** (BX7b, the cli's Demo tools) → the
+/// touch `(bid, ask)` ×1e6 of `symbol`: one whole object (or dapi's
+/// one-element array of one), each key once, the symbol the one asked for,
+/// a two-sided book (`0 < bid < ask`).
+pub fn scan_touch(body: &[u8], symbol: &[u8]) -> Result<(i64, i64), ScanErr> {
+    let (bid, ask) = two_of(body, symbol, b"bidPrice", b"askPrice")?;
+    if bid <= 0 || ask <= bid {
+        return Err(ScanErr::BadField);
+    }
+    Ok((bid, ask))
+}
+
+/// **`GET …/premiumIndex?symbol=`** (BX7b, the cli's Demo tools) → `(mark,
+/// index)` ×1e6 of `symbol`, read as [`scan_touch`] reads; the mark
+/// positive, the index not negative.
+pub fn scan_mark(body: &[u8], symbol: &[u8]) -> Result<(i64, i64), ScanErr> {
+    let (mark, index) = two_of(body, symbol, b"markPrice", b"indexPrice")?;
+    if mark <= 0 || index < 0 {
+        return Err(ScanErr::BadField);
+    }
+    Ok((mark, index))
+}
+
+/// `{"symbol":"…","countdownTime":"…"}` — the dead-man is armed for that
+/// symbol (anything else is a refusal).
+pub fn scan_countdown(body: &[u8]) -> Result<Span, ScanErr> {
+    let mut w = Pairs::new(body, 0).map_err(malformed)?;
+    let (mut sym, mut ct) = (None, false);
+    while let Some((k, a, z)) = w.next().map_err(malformed)? {
+        match k {
+            b"symbol" => sym = Some(Span::of(body, str_of(body, a, z).map_err(bad)?)),
+            b"countdownTime" => {
+                u64_of(body, a, z).map_err(bad)?;
+                ct = true;
+            }
+            _ => {}
+        }
+    }
+    match (sym, ct) {
+        (Some(s), true) => Ok(s),
+        _ => Err(ScanErr::Missing),
+    }
+}
+
+/// One order from `openOrders`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct OrderRow {
+    /// `orderId`.
+    pub venue_oid: u64,
+    /// `origQty` ×1e6.
+    pub qty_1e6: i64,
+    /// `executedQty` ×1e6.
+    pub executed_1e6: i64,
+    /// `price` ×1e6.
+    pub px_1e6: i64,
+    /// `avgPrice` ×1e6.
+    pub avg_px_1e6: i64,
+    /// `cumQuote` ×1e6 (the filled notional).
+    pub cum_quote_1e6: i64,
+    /// `updateTime` ms.
+    pub update_ms: u64,
+    /// `symbol`.
+    pub symbol: Span,
+    /// `clientOrderId`.
+    pub cid: Span,
+    /// `Side` as its `u8`.
+    pub side: u8,
+    /// `S_*`.
+    pub status: u8,
+    _r: [u8; 6],
+}
+
+/// Why an array answer was refused.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ArrErr {
+    /// The body or an element did not scan.
+    Scan(ScanErr),
+    /// More elements than the buffer holds: refused, never truncated.
+    Truncated,
+}
+
+impl From<ScanErr> for ArrErr {
+    fn from(e: ScanErr) -> Self {
+        Self::Scan(e)
+    }
+}
+
+const O_SYM: u32 = 1 << 0;
+const O_CID: u32 = 1 << 1;
+const O_OID: u32 = 1 << 2;
+const O_SIDE: u32 = 1 << 3;
+const O_STATUS: u32 = 1 << 4;
+const O_QTY: u32 = 1 << 5;
+const O_EXEC: u32 = 1 << 6;
+const O_PX: u32 = 1 << 7;
+const O_AVG: u32 = 1 << 8;
+const O_QUOTE: u32 = 1 << 9;
+const O_UPDATE: u32 = 1 << 10;
+const O_NEED: u32 = O_SYM | O_CID | O_OID | O_SIDE | O_STATUS | O_QTY | O_EXEC | O_PX;
+
+/// An array of orders into `out`; the count. Fail closed: a missing field
+/// (`price` among them: a market order lists `"0"`), a key an order names
+/// twice (BX7b, the one-reading law), bytes after the array, or an element
+/// past `out` refuses the whole answer.
+pub fn scan_orders(body: &[u8], out: &mut [OrderRow]) -> Result<usize, ArrErr> {
+    let mut e = Elems::new(body, 0).map_err(malformed)?;
+    let mut n = 0;
+    while let Some((a, _)) = e.next().map_err(malformed)? {
+        if n == out.len() {
+            return Err(ArrErr::Truncated);
+        }
+        let r = &mut out[n];
+        *r = OrderRow::default();
+        let mut w = Pairs::new(body, a).map_err(malformed)?;
+        let mut have = 0u32;
+        while let Some((k, va, vz)) = w.next().map_err(malformed)? {
+            let bit = match k {
+                b"symbol" => {
+                    r.symbol = Span::of(body, str_of(body, va, vz).map_err(bad)?);
+                    O_SYM
+                }
+                b"clientOrderId" => {
+                    r.cid = Span::of(body, str_of(body, va, vz).map_err(bad)?);
+                    O_CID
+                }
+                b"orderId" => {
+                    r.venue_oid = u64_of(body, va, vz).map_err(bad)?;
+                    O_OID
+                }
+                b"side" => {
+                    r.side = side_of(str_of(body, va, vz).map_err(bad)?)?;
+                    O_SIDE
+                }
+                b"status" => {
+                    r.status = status_of(str_of(body, va, vz).map_err(bad)?);
+                    O_STATUS
+                }
+                // eapi names it `quantity` (BX9): one or the other, read once.
+                b"origQty" | b"quantity" => {
+                    r.qty_1e6 = dec_1e6(body, va, vz).map_err(bad)?;
+                    O_QTY
+                }
+                b"executedQty" => {
+                    r.executed_1e6 = dec_1e6(body, va, vz).map_err(bad)?;
+                    O_EXEC
+                }
+                b"price" => {
+                    r.px_1e6 = dec_1e6(body, va, vz).map_err(bad)?;
+                    O_PX
+                }
+                b"avgPrice" => {
+                    r.avg_px_1e6 = dec_1e6(body, va, vz).map_err(bad)?;
+                    O_AVG
+                }
+                b"cumQuote" => {
+                    r.cum_quote_1e6 = dec_1e6(body, va, vz).map_err(bad)?;
+                    O_QUOTE
+                }
+                b"updateTime" => {
+                    r.update_ms = u64_of(body, va, vz).map_err(bad)?;
+                    O_UPDATE
+                }
+                _ => 0,
+            };
+            // A key read twice: which copy would hold? Refused (BX7b).
+            if have & bit != 0 {
+                return Err(ArrErr::Scan(ScanErr::Malformed));
+            }
+            have |= bit;
+        }
+        if have & O_NEED != O_NEED {
+            return Err(ArrErr::Scan(ScanErr::Missing));
+        }
+        n += 1;
+    }
+    if !ends_whole(body, e.end()) {
+        return Err(ArrErr::Scan(ScanErr::Malformed));
+    }
+    Ok(n)
+}
+
+/// One trade from `userTrades`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TradeRow {
+    /// `orderId`.
+    pub venue_oid: u64,
+    /// `id` (the trade id).
+    pub trade_id: u64,
+    /// `price` ×1e6.
+    pub px_1e6: i64,
+    /// `qty` ×1e6.
+    pub qty_1e6: i64,
+    /// `time` ms.
+    pub time_ms: u64,
+    /// `commission` ×1e9 (BX8: a spot trade's, paid once when no report
+    /// carried it).
+    pub commission_1e9: i64,
+    /// `symbol`.
+    pub symbol: Span,
+    /// `Side` as its `u8`.
+    pub side: u8,
+    /// `maker`.
+    pub maker: u8,
+    /// `commissionAsset`'s span, packed (BX8: the row stays 64 B, copied
+    /// by value — [`Self::fee_asset`]).
+    fee_len: u16,
+    fee_at: u32,
+}
+
+// 64 B: the order's-trades read copies a row by value (BX8; CLAUDE.md's
+// ≤ 64 B POD law).
+const _: () = assert!(core::mem::size_of::<TradeRow>() == 64);
+
+impl TradeRow {
+    /// `commissionAsset` (empty when absent).
+    #[inline(always)]
+    #[must_use]
+    pub const fn fee_asset(&self) -> Span {
+        Span {
+            at: self.fee_at,
+            len: self.fee_len as u32,
+        }
+    }
+}
+
+const R_OID: u32 = 1 << 0;
+const R_ID: u32 = 1 << 1;
+const R_PX: u32 = 1 << 2;
+const R_QTY: u32 = 1 << 3;
+const R_TIME: u32 = 1 << 4;
+const R_SIDE: u32 = 1 << 5;
+const R_SYM: u32 = 1 << 6;
+const R_MAKER: u32 = 1 << 7;
+const R_FEE: u32 = 1 << 8;
+const R_FEE_ASSET: u32 = 1 << 9;
+const R_NEED: u32 = R_OID | R_ID | R_PX | R_QTY | R_TIME | R_SIDE | R_SYM;
+
+/// An array of trades into `out`; the count (fail closed, as
+/// [`scan_orders`]).
+pub fn scan_trades(body: &[u8], out: &mut [TradeRow]) -> Result<usize, ArrErr> {
+    let mut e = Elems::new(body, 0).map_err(malformed)?;
+    let mut n = 0;
+    while let Some((a, _)) = e.next().map_err(malformed)? {
+        if n == out.len() {
+            return Err(ArrErr::Truncated);
+        }
+        let r = &mut out[n];
+        *r = TradeRow::default();
+        let mut w = Pairs::new(body, a).map_err(malformed)?;
+        let mut have = 0u32;
+        while let Some((k, va, vz)) = w.next().map_err(malformed)? {
+            let bit = match k {
+                b"orderId" => {
+                    r.venue_oid = u64_of(body, va, vz).map_err(bad)?;
+                    R_OID
+                }
+                b"id" => {
+                    r.trade_id = u64_of(body, va, vz).map_err(bad)?;
+                    R_ID
+                }
+                // A trade of nothing, or at no price, is no trade (BX8, the
+                // parser review: a day would subtract it).
+                b"price" => {
+                    r.px_1e6 = dec_1e6(body, va, vz).map_err(bad)?;
+                    if r.px_1e6 <= 0 {
+                        return Err(ArrErr::Scan(ScanErr::BadField));
+                    }
+                    R_PX
+                }
+                // eapi names it `quantity` (BX9): one or the other, read once.
+                b"qty" | b"quantity" => {
+                    r.qty_1e6 = dec_1e6(body, va, vz).map_err(bad)?;
+                    if r.qty_1e6 <= 0 {
+                        return Err(ArrErr::Scan(ScanErr::BadField));
+                    }
+                    R_QTY
+                }
+                b"time" => {
+                    r.time_ms = u64_of(body, va, vz).map_err(bad)?;
+                    R_TIME
+                }
+                b"side" => {
+                    r.side = side_of(str_of(body, va, vz).map_err(bad)?)?;
+                    R_SIDE
+                }
+                // Spot's `myTrades` (BX8) names the buyer, not the side —
+                // one of the two, read once.
+                b"isBuyer" => {
+                    r.side = if bool_of(body, va, vz).map_err(bad)? { core_types::Side::Bid as u8 } else { core_types::Side::Ask as u8 };
+                    R_SIDE
+                }
+                b"symbol" => {
+                    r.symbol = Span::of(body, str_of(body, va, vz).map_err(bad)?);
+                    R_SYM
+                }
+                b"maker" | b"isMaker" => {
+                    r.maker = bool_of(body, va, vz).map_err(bad)? as u8;
+                    R_MAKER
+                }
+                b"commission" => {
+                    r.commission_1e9 = dec_1e9(body, va, vz).map_err(bad)?;
+                    R_FEE
+                }
+                b"commissionAsset" => {
+                    let s = Span::of(body, str_of(body, va, vz).map_err(bad)?);
+                    r.fee_at = s.at;
+                    r.fee_len = u16::try_from(s.len).map_err(|_| ArrErr::Scan(ScanErr::BadField))?;
+                    R_FEE_ASSET
+                }
+                _ => 0,
+            };
+            // A key read twice (BX8, as `scan_orders`' BX7b law): which
+            // copy would hold? Refused.
+            if have & bit != 0 {
+                return Err(ArrErr::Scan(ScanErr::Malformed));
+            }
+            have |= bit;
+        }
+        if have & R_NEED != R_NEED {
+            return Err(ArrErr::Scan(ScanErr::Missing));
+        }
+        // A commission and its asset come together (BX8, the parser
+        // review's P2-3): one without the other would read a defaulted
+        // figure — a fee of 0 marked paid on the trade-id ring.
+        if (have & R_FEE == 0) != (have & R_FEE_ASSET == 0) {
+            return Err(ArrErr::Scan(ScanErr::Missing));
+        }
+        n += 1;
+    }
+    if !ends_whole(body, e.end()) {
+        return Err(ArrErr::Scan(ScanErr::Malformed));
+    }
+    Ok(n)
+}
+
+/// **A spot symbol's price** (BX8: `GET /api/v3/ticker/price?symbol=…`,
+/// `{"symbol":…,"price":…}`) ×1e6 — the price a balance the boot adopts is
+/// valued at. Fail closed: one object read whole, its `symbol` `symbol`
+/// (another's price would value the balance wrongly) and its `price` each
+/// once, the price above zero.
+pub fn scan_ticker_price(body: &[u8], symbol: &[u8]) -> Result<i64, ScanErr> {
+    let mut w = Pairs::new(body, 0).map_err(malformed)?;
+    let (mut px, mut named) = (None, false);
+    while let Some((k, a, z)) = w.next().map_err(malformed)? {
+        match k {
+            b"price" => {
+                if px.is_some() {
+                    return Err(ScanErr::Malformed);
+                }
+                px = Some(dec_1e6(body, a, z).map_err(bad)?);
+            }
+            b"symbol" => {
+                if named {
+                    return Err(ScanErr::Malformed);
+                }
+                named = true;
+                if str_of(body, a, z).map_err(bad)? != symbol {
+                    return Err(ScanErr::BadField);
+                }
+            }
+            _ => {}
+        }
+    }
+    if !ends_whole(body, w.end()) {
+        return Err(ScanErr::Malformed);
+    }
+    match (px, named) {
+        (Some(p), true) if p > 0 => Ok(p),
+        (Some(_), true) => Err(ScanErr::BadField),
+        _ => Err(ScanErr::Missing),
+    }
+}
+
+/// **An option underlying's index** (BX9: `GET /eapi/v1/index?underlying=…`,
+/// `{"time":…,"indexPrice":…}`) ×1e6 — what a held short is adopted at
+/// (its initial margin's bound). Fail closed: one object read whole, its
+/// `indexPrice` named once and positive (the answer names no underlying:
+/// the request's is the job's own).
+pub fn scan_opt_index(body: &[u8]) -> Result<i64, ScanErr> {
+    let mut w = Pairs::new(body, 0).map_err(malformed)?;
+    let mut px = None;
+    while let Some((k, a, z)) = w.next().map_err(malformed)? {
+        if k == b"indexPrice" {
+            if px.is_some() {
+                return Err(ScanErr::Malformed);
+            }
+            px = Some(dec_1e6(body, a, z).map_err(bad)?);
+        }
+    }
+    if !ends_whole(body, w.end()) {
+        return Err(ScanErr::Malformed);
+    }
+    match px {
+        Some(p) if p > 0 => Ok(p),
+        Some(_) => Err(ScanErr::BadField),
+        None => Err(ScanErr::Missing),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// BX9: an underlying's index, read fail closed. Break-and-watch:
+    /// accepting a second `indexPrice` fails the third assertion.
+    #[test]
+    fn an_option_index_is_read_once_and_positive() {
+        assert_eq!(super::scan_opt_index(br#"{"time":1656647305000,"indexPrice":"105917.75"}"#), Ok(105_917_750_000));
+        assert_eq!(super::scan_opt_index(br#"{"time":1,"indexPrice":"0"}"#), Err(super::ScanErr::BadField));
+        assert_eq!(super::scan_opt_index(br#"{"indexPrice":"1","indexPrice":"2"}"#), Err(super::ScanErr::Malformed));
+        assert_eq!(super::scan_opt_index(br#"{"time":1}"#), Err(super::ScanErr::Missing));
+        assert_eq!(super::scan_opt_index(br#"{"indexPrice":"1"} {}"#), Err(super::ScanErr::Malformed));
+    }
+
+    #[test]
+    fn a_ban_names_its_end() {
+        let b = br#"{"code":-1003,"msg":"Way too much request weight used; IP banned until 1790000600000. Please use WebSocket Streams for live updates to avoid bans."}"#;
+        assert_eq!(super::scan_ban_until(b), 1_790_000_600_000);
+        assert_eq!(super::scan_ban_until(br#"{"code":-1003,"msg":"Too many requests."}"#), 0);
+        assert_eq!(super::scan_ban_until(b"banned until "), 0, "no digits: none");
+        assert_eq!(super::scan_ban_until(b"banned until 99999999999999999999999"), 9_999_999_999_999_999_999, "capped at 19 digits");
+        // BX7: the latest end named (never a shorter quiet than the venue's).
+        assert_eq!(super::scan_ban_until(b"IP banned until 1000. IP banned until 1790000600000."), 1_790_000_600_000);
+        assert_eq!(super::scan_ban_until(b"IP banned until 1790000600000. IP banned until 1000."), 1_790_000_600_000);
+    }
+
+    use super::*;
+
+    /// BX7 (F1): every order verb on the REST route — the place, the
+    /// cancel, the modify — and the sweep's cancel-all are body-form, on
+    /// every product and mode: core-net's law for the order path (a
+    /// query-form request stages its header tail on every send).
+    #[test]
+    fn the_order_verbs_are_body_form() {
+        let key = [(KEY_HEADER, "k")];
+        for (product, pm) in [(crate::inst::PRODUCT_USDM, false), (PRODUCT_COINM, false), (crate::inst::PRODUCT_USDM, true), (PRODUCT_COINM, true)] {
+            let o = ord_specs(product, pm, &key);
+            for t in [R_PLACE, R_CANCEL, R_MODIFY] {
+                assert!(matches!(o[t].params, Params::Body(FORM)), "template {t}");
+            }
+            assert!(matches!(o[R_STATUS].params, Params::Query), "a read stays a query");
+            assert!(matches!(lane_specs(product, pm, &key)[T_CANCEL_ALL].params, Params::Body(FORM)));
+        }
+    }
+
+    #[test]
+    fn each_product_has_its_own_paths_by_the_same_template() {
+        let key = [(KEY_HEADER, "k")];
+        let um = lane_specs(crate::inst::PRODUCT_USDM, false, &key);
+        let cm = lane_specs(PRODUCT_COINM, false, &key);
+        let mut t = 0;
+        while t < LANE_TEMPLATES {
+            assert!(um[t].path.starts_with("/fapi/v"), "{}", um[t].path);
+            assert!(cm[t].path.starts_with("/dapi/v1/"), "{}", cm[t].path);
+            if t != T_ACCOUNT {
+                assert_eq!(um[t].path[5..], cm[t].path[5..], "template {t} names one endpoint");
+            }
+            assert_eq!(um[t].method, cm[t].method);
+            t += 1;
+        }
+        let (um, cm) = (ord_specs(crate::inst::PRODUCT_USDM, false, &key), ord_specs(PRODUCT_COINM, false, &key));
+        assert_eq!((um[R_PLACE].path, um[R_ACCOUNT].path), ("/fapi/v1/order", "/fapi/v3/account"));
+        assert_eq!((cm[R_PLACE].path, cm[R_ACCOUNT].path), ("/dapi/v1/order", "/dapi/v1/account"));
+        // Portfolio Margin (BX7, C2): each product's papi paths; one
+        // listenKey and one unified account for both.
+        let (pu, pc) = (lane_specs(crate::inst::PRODUCT_USDM, true, &key), lane_specs(PRODUCT_COINM, true, &key));
+        assert_eq!((pu[T_OPEN_ORDERS].path, pc[T_OPEN_ORDERS].path), ("/papi/v1/um/openOrders", "/papi/v1/cm/openOrders"));
+        assert_eq!((pu[T_USER_TRADES].path, pc[T_DUAL].path), ("/papi/v1/um/userTrades", "/papi/v1/cm/positionSide/dual"));
+        assert_eq!((pu[T_LISTEN_KEY_NEW].path, pc[T_LISTEN_KEY_NEW].path), ("/papi/v1/listenKey", "/papi/v1/listenKey"));
+        assert_eq!((pu[T_ACCOUNT].path, pc[T_ACCOUNT].path), ("/papi/v1/account", "/papi/v1/account"));
+        // BX7 (BX-19): the margin type is USDⓈ-M's to ask; papi never.
+        let um = lane_specs(crate::inst::PRODUCT_USDM, false, &key);
+        assert_eq!((um[T_SYMBOL_CONFIG].path, um[T_SYMBOL_CONFIG].method), ("/fapi/v1/symbolConfig", Method::Get));
+        assert_eq!((pu[T_SYMBOL_CONFIG].path, pc[T_SYMBOL_CONFIG].path), (PAPI_NONE, PAPI_NONE));
+        let (pu, pc) = (ord_specs(crate::inst::PRODUCT_USDM, true, &key), ord_specs(PRODUCT_COINM, true, &key));
+        assert_eq!((pu[R_PLACE].path, pu[R_ACCOUNT].path), ("/papi/v1/um/order", "/papi/v2/um/account"));
+        assert_eq!((pc[R_PLACE].path, pc[R_ACCOUNT].path), ("/papi/v1/cm/order", "/papi/v1/cm/account"));
+        assert_eq!(sapi_specs(&key, &key)[S_TIME].path, "/api/v3/time");
+        // BX9: eapi's paths — the countdown, the cancel-all, the modify and
+        // the cancel never started (IoC-only; `-6005`); the margin on the
+        // route, the positions and the exercise record on the jobs.
+        let op = lane_specs(PRODUCT_OPTIONS, false, &key);
+        assert_eq!((op[T_LISTEN_KEY_NEW].path, op[T_TIME].path, op[T_OPEN_ORDERS].path), ("/eapi/v1/listenKey", "/eapi/v1/time", "/eapi/v1/openOrders"));
+        assert_eq!((op[T_USER_TRADES].path, op[T_POSITION].path, op[T_EXERCISE].path), ("/eapi/v1/userTrades", "/eapi/v1/position", "/eapi/v1/exerciseRecord"));
+        assert_eq!((op[T_COUNTDOWN].path, op[T_CANCEL_ALL].path), (EAPI_NONE, EAPI_NONE));
+        let oo = ord_specs(PRODUCT_OPTIONS, false, &key);
+        assert_eq!((oo[R_PLACE].path, oo[R_STATUS].path, oo[R_ACCOUNT].path), ("/eapi/v1/order", "/eapi/v1/order", "/eapi/v1/marginAccount"));
+        assert_eq!((oo[R_CANCEL].path, oo[R_MODIFY].path), (EAPI_NONE, EAPI_NONE));
+        assert_eq!(op[T_PRICE].path, "/eapi/v1/index", "an underlying's index (a held short's adoption)");
+        // The other products name their connectivity checks at the new slots.
+        let pl = lane_specs(crate::inst::PRODUCT_USDM, true, &key);
+        assert_eq!((um[T_POSITION].path, pl[T_EXERCISE].path), ("/fapi/v1/ping", PAPI_NONE));
+        let opt_key = [(KEY_HEADER, "opt")];
+        let sp = sapi_specs(&key, &opt_key);
+        assert_eq!((sp[S_API_RESTRICTIONS_OPT].path, sp[S_API_RESTRICTIONS_OPT].headers[0].1), ("/sapi/v1/account/apiRestrictions", "opt"));
+    }
+    use proptest::prelude::*;
+
+    #[test]
+    fn a_signed_query_is_rendered_then_signed_in_place() {
+        let signer = signer_ed25519::Ed25519Signer::from_seed(&[3u8; 32]).unwrap();
+        let mut win = [0u8; 512];
+        let mut w = QueryWriter::new(&mut win);
+        w.put(b"symbol=").put(b"BTCUSDT").put(b"&countdownTime=").uint(30_000).put(b"&recvWindow=").uint(1_000).put(b"&timestamp=").uint(1_790_000_000_000);
+        let n = w.rendered().unwrap();
+        let total = w.sign(&signer).unwrap();
+        let q = std::str::from_utf8(&win[..total]).unwrap();
+        let (msg, sig) = q.split_once("&signature=").unwrap();
+        assert_eq!(msg, "symbol=BTCUSDT&countdownTime=30000&recvWindow=1000&timestamp=1790000000000");
+        assert_eq!(msg.len(), n);
+        let mut want = [0u8; signer_ed25519::SIG_B64_PCT_MAX];
+        let m = signer.sign_b64_pct(msg.as_bytes(), &mut want);
+        assert_eq!(sig.as_bytes(), &want[..m]);
+        // Too small a window refuses, never truncates.
+        let mut tiny = [0u8; 40];
+        let mut w = QueryWriter::new(&mut tiny);
+        w.put(b"timestamp=").uint(1);
+        assert_eq!(w.sign(&signer), Err(Overflow));
+        let mut tiny = [0u8; 4];
+        let mut w = QueryWriter::new(&mut tiny);
+        w.put(b"timestamp=");
+        assert_eq!(w.rendered(), Err(Overflow));
+    }
+
+    /// BX9 (the risk review, round 3): eapi's words, pinned — the place
+    /// names its id `clientOrderId` (never `newClientOrderId`), and so does
+    /// the in-doubt status query (never futures' `origClientOrderId`: eapi
+    /// would answer it with an error that is not `-2013`, and the order
+    /// would stay in doubt). Break-and-watch: futures' word in either fails.
+    #[test]
+    fn the_equity_requests_carry_the_d5_keys_and_the_uuid() {
+        const PREFIX: crate::cid::CidPrefix = crate::cid::CidPrefix::new(0x6512_ab0f);
+        let st = WsStatic::new("EXPIRE_TAKER", 1_000);
+        let eq = crate::equity::EqKnobs::new(crate::equity::EqSession::Rth, false, "USDC").expect("the D5 keys");
+        let mut o = Place {
+            symbol: b"AAPL",
+            side: core_types::Side::Bid as u8,
+            maker: false,
+            reduce_only: false,
+            qty_1e6: 30_000,
+            qty_dec: 6,
+            px_1e6: 336_100_000,
+            px_dec: 2,
+            cid: Part::Cid(&PREFIX, 3, 0x0123_4567_89ab_cdef),
+            ts_ms: 1_790_000_000_000,
+        };
+        let text = |f: &dyn Fn(&mut QueryWriter<'_>)| {
+            let mut win = [0u8; 512];
+            let mut w = QueryWriter::new(&mut win);
+            f(&mut w);
+            let n = w.rendered().unwrap();
+            String::from_utf8(win[..n].to_vec()).unwrap()
+        };
+        assert_eq!(
+            text(&|w| render_eq_place(w, &st, &eq, &o)),
+            "symbol=AAPL&side=BUY&orderType=LIMIT&quoteAsset=USDC&price=336.10&quantity=0.030000&timeInForce=DAY&tradingSession=RTH&walletType=MAIN&clientOrderId=mv6512ab0f30123456789abcdef00000&tokenize=false&recvWindow=1000&timestamp=1790000000000"
+        );
+        // A SELL names no wallet (the venue settles it to the funding one);
+        // the other session words and tokenize render as asked.
+        o.side = core_types::Side::Ask as u8;
+        let eq2 = crate::equity::EqKnobs::new(crate::equity::EqSession::H24, true, "USDT").expect("the D5 keys");
+        let s = text(&|w| render_eq_place(w, &st, &eq2, &o));
+        assert!(s.starts_with("symbol=AAPL&side=SELL&orderType=LIMIT&quoteAsset=USDT&") && s.contains("&tradingSession=24H&clientOrderId=") && s.contains("&tokenize=true&"));
+        assert!(!s.contains("walletType"), "{s}");
+        let id = b"8b1f3a52-7c0e-4d55-9a8e-1f2b3c4d5e6f";
+        assert_eq!(text(&|w| render_eq_by_id(w, &st, id, 5)), "orderId=8b1f3a52-7c0e-4d55-9a8e-1f2b3c4d5e6f&recvWindow=1000&timestamp=5");
+        assert_eq!(
+            text(&|w| render_eq_detail_cid(w, &st, Part::Cid(&PREFIX, 3, 0x0123_4567_89ab_cdef), 5)),
+            "clientOrderId=mv6512ab0f30123456789abcdef00000&recvWindow=1000&timestamp=5"
+        );
+        // A page of the window, and a ticker's day: the page and its size
+        // named (the cycle judges both on the answer).
+        let w0 = text(&|w| render_eq_trades(w, &st, b"", 10, 20, 2, 5));
+        assert!(w0.starts_with("startTime=10&endTime=20&") && w0.contains("current=2") && w0.contains("size=100"), "{w0}");
+        let d = text(&|w| render_eq_trades(w, &st, b"AAPL", 10, 20, 1, 5));
+        assert!(d.starts_with("symbol=AAPL&startTime=10&"), "{d}");
+        assert_eq!(text(&|w| render_eq_window(w, &st, 10, 20, 2, 5)), w0, "the window is the trades' render with no ticker");
+        // EqKnobs refuses a quote it could not render.
+        for q in ["", "usdc", "TOOLONGQUOTE", "US-C"] {
+            assert!(crate::equity::EqKnobs::new(crate::equity::EqSession::Rth, false, q).is_none(), "{q}");
+        }
+        assert_eq!(crate::equity::EqSession::from_word("rth"), None, "the words as the venue spells them");
+    }
+
+    #[test]
+    fn the_options_place_and_status_query_name_eapis_client_id() {
+        const PREFIX: crate::cid::CidPrefix = crate::cid::CidPrefix::new(0x6512_ab0f);
+        let st = WsStatic::new("EXPIRE_TAKER", 1_000);
+        let o = Place {
+            symbol: b"BTC-261225-85000-C",
+            side: core_types::Side::Ask as u8,
+            maker: false,
+            reduce_only: true,
+            qty_1e6: 10_000,
+            qty_dec: 2,
+            px_1e6: 1_205_000_000,
+            px_dec: 0,
+            cid: Part::Cid(&PREFIX, 3, 0x0123_4567_89ab_cdef),
+            ts_ms: 1_790_000_000_000,
+        };
+        let text = |f: &dyn Fn(&mut QueryWriter<'_>)| {
+            let mut win = [0u8; 512];
+            let mut w = QueryWriter::new(&mut win);
+            f(&mut w);
+            let n = w.rendered().unwrap();
+            String::from_utf8(win[..n].to_vec()).unwrap()
+        };
+        assert_eq!(
+            text(&|w| render_opt_place(w, &st, &o)),
+            "symbol=BTC-261225-85000-C&side=SELL&type=LIMIT&timeInForce=IOC&reduceOnly=true&quantity=0.01&price=1205&clientOrderId=mv6512ab0f30123456789abcdef00000&newOrderRespType=ACK&selfTradePreventionMode=EXPIRE_TAKER&recvWindow=1000&timestamp=1790000000000"
+        );
+        assert_eq!(
+            text(&|w| render_opt_by_cid(w, &st, b"BTC-261225-85000-C", Part::Cid(&PREFIX, 3, 0x0123_4567_89ab_cdef), 5)),
+            "symbol=BTC-261225-85000-C&clientOrderId=mv6512ab0f30123456789abcdef00000&recvWindow=1000&timestamp=5"
+        );
+    }
+
+    /// BX7 (C5, R22): the REST route renders the WS API's parameters as a
+    /// query, and HMAC signs exactly those bytes. Break-and-watch: a modify
+    /// that renders the time in force, or HMAC over anything but the
+    /// rendered bytes, fails here.
+    #[test]
+    fn the_rest_order_route_renders_and_hmac_signs() {
+        const PREFIX: crate::cid::CidPrefix = crate::cid::CidPrefix::new(0x6512_ab0f);
+        let st = WsStatic::new("EXPIRE_MAKER", 1_000);
+        let o = Place {
+            symbol: b"BTCUSDT",
+            side: core_types::Side::Ask as u8,
+            maker: false,
+            reduce_only: true,
+            qty_1e6: 2_000,
+            qty_dec: 3,
+            px_1e6: 64_000_000_000,
+            px_dec: 1,
+            cid: Part::Cid(&PREFIX, 3, 0x0123_4567_89ab_cdef),
+            ts_ms: 1_790_000_000_000,
+        };
+        let text = |f: &dyn Fn(&mut QueryWriter<'_>)| {
+            let mut win = [0u8; 512];
+            let mut w = QueryWriter::new(&mut win);
+            f(&mut w);
+            let n = w.rendered().unwrap();
+            String::from_utf8(win[..n].to_vec()).unwrap()
+        };
+        assert_eq!(
+            text(&|w| render_place(w, &st, &o)),
+            "symbol=BTCUSDT&side=SELL&type=LIMIT&timeInForce=IOC&reduceOnly=true&quantity=0.002&price=64000.0&newClientOrderId=mv6512ab0f30123456789abcdef00000&newOrderRespType=ACK&selfTradePreventionMode=EXPIRE_MAKER&recvWindow=1000&timestamp=1790000000000"
+        );
+        assert_eq!(
+            text(&|w| render_modify(w, &st, &o)),
+            "symbol=BTCUSDT&side=SELL&origClientOrderId=mv6512ab0f30123456789abcdef00000&quantity=0.002&price=64000.0&recvWindow=1000&timestamp=1790000000000"
+        );
+        assert_eq!(
+            text(&|w| render_by_cid(w, &st, b"BTCUSDT", Part::Lit(b"CID"), 5)),
+            "symbol=BTCUSDT&origClientOrderId=CID&recvWindow=1000&timestamp=5"
+        );
+        assert_eq!(text(&|w| render_account(w, &st, 6)), "recvWindow=1000&timestamp=6");
+        assert_eq!(
+            text(&|w| render_by_order_id(w, &st, b"BTCUSDT", 7_001, 7)),
+            "symbol=BTCUSDT&orderId=7001&recvWindow=1000&timestamp=7"
+        );
+        // HMAC over exactly the rendered bytes.
+        let secret = *b"NhqPtmdSJYdKjVHjA7PZj4Mge3R5YNiP1e3UZjInClVN65XAbvqqM6A7H5fATj0j";
+        let h = Signer::Hmac(HmacSigner::from_secret(secret).unwrap());
+        let mut win = [0u8; 512];
+        let mut w = QueryWriter::new(&mut win);
+        render_by_cid(&mut w, &st, b"BTCUSDT", Part::Lit(b"CID"), 5);
+        let total = w.sign_with(&h).unwrap();
+        let q = std::str::from_utf8(&win[..total]).unwrap();
+        let (msg, sig) = q.split_once("&signature=").unwrap();
+        let want = core_crypto::hmac_sha256(&secret, msg.as_bytes());
+        let hex: String = want.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(sig, hex);
+        // BX7 (zero-copy N1): right at every length around the hash's block
+        // and padding bounds — the inner hash pads in the room the
+        // signature then takes — and nothing past the signature written.
+        let hk = HmacSigner::from_secret(secret).unwrap();
+        let mut n = 1;
+        while n <= 200 {
+            let mut win = [0xEEu8; 300];
+            let mut i = 0;
+            while i < n {
+                win[i] = b'a' + (i % 26) as u8;
+                i += 1;
+            }
+            assert_eq!(sign_hmac_in_place(&hk, &mut win[..n + 75], n), Ok(n + 75));
+            assert_eq!(&win[n..n + 11], b"&signature=");
+            let mut hex = [0u8; HMAC_SIG_HEX];
+            hex_lower(&core_crypto::hmac_sha256(&secret, &win[..n]), &mut hex);
+            assert_eq!(&win[n + 11..n + 75], &hex[..], "n {n}");
+            assert!(win[n + 75..].iter().all(|b| *b == 0xEE), "n {n}");
+            n += 1;
+        }
+        let mut room = [0u8; 80];
+        assert_eq!(sign_hmac_in_place(&hk, &mut room, 6), Err(Overflow), "75 B of room are needed");
+        // Too small a window refuses, never truncates.
+        let mut tiny = [0u8; 70];
+        let mut w = QueryWriter::new(&mut tiny);
+        w.put(b"timestamp=").uint(1);
+        assert_eq!(w.sign_with(&h), Err(Overflow));
+    }
+
+    #[test]
+    fn small_answers() {
+        assert_eq!(scan_error(br#"{"code":-1021,"msg":"Timestamp for this request is outside of the recvWindow."}"#), -1021);
+        assert_eq!(scan_error(br#"{"listenKey":"x"}"#), 0);
+        // BX7: a code named twice is no code (either order).
+        assert_eq!(scan_error(br#"{"code":-2019,"code":0,"msg":"x"}"#), 0);
+        assert_eq!(scan_error(br#"{"code":0,"code":-2019,"msg":"x"}"#), 0);
+        // ...and a body that is not one whole, well-formed object: no code
+        // (the parser review's round-3 R3-1; the WS API's reader refuses
+        // each of these alike).
+        for bad in [
+            &br#"{"code":-2019,"code":}"#[..],
+            br#"{"code":-2019,"code""#,
+            br#"{"code":-2019,"msg":"x"}{"code":-1003}"#,
+            br#"{"code":-2019,"msg":"x"} trailing"#,
+            br#"{"code":-2019,"msg":}"#,
+        ] {
+            assert_eq!(scan_error(bad), 0, "{}", String::from_utf8_lossy(bad));
+        }
+        assert_eq!(scan_error(b"{\"code\":-2019,\"msg\":\"x\"}\r\n"), -2019, "whitespace after it is not bytes");
+        assert_eq!(scan_error(b"<html>"), 0);
+        let lk = br#"{"listenKey":"pqia91ma19a5s61cv6a81va65sdf19v8a65a1a5s61cv6a81va65sdf19v8a65a1"}"#;
+        assert_eq!(scan_listen_key(lk).unwrap().get(lk).len(), 64);
+        assert_eq!(scan_server_time(br#"{"serverTime":1499827319559}"#), Ok(1_499_827_319_559));
+        // BX7b: one whole object, the key once.
+        assert_eq!(scan_server_time(br#"{"serverTime":1,"serverTime":2}"#), Err(ScanErr::Malformed));
+        assert_eq!(scan_server_time(br#"{"serverTime":1} {"serverTime":2}"#), Err(ScanErr::Malformed));
+        assert_eq!(scan_server_time(br#"{"serverTime":1}"#), Ok(1));
+        let cd = br#"{"symbol":"BTCUSDT","countdownTime":"30000"}"#;
+        assert_eq!(scan_countdown(cd).unwrap().get(cd), b"BTCUSDT");
+        assert_eq!(scan_countdown(br#"{"code":-1102}"#), Err(ScanErr::Missing));
+    }
+
+    const ORDERS: &[u8] = br#"[{"avgPrice":"0.00000","clientOrderId":"mvA","cumQuote":"0","executedQty":"0","orderId":1917641,"origQty":"0.40","origType":"LIMIT","price":"0","reduceOnly":false,"side":"BUY","positionSide":"BOTH","status":"NEW","stopPrice":"9300","closePosition":false,"symbol":"BTCUSDT","time":1579276756075,"timeInForce":"GTC","type":"LIMIT","updateTime":1579276756075},{"avgPrice":"65000.1","clientOrderId":"web_x","cumQuote":"650.001","executedQty":"0.01","orderId":2,"origQty":"0.01","price":"65000.1","side":"SELL","status":"FILLED","symbol":"ETHUSDT","updateTime":1}]"#;
+
+    #[test]
+    fn orders() {
+        let mut out = [OrderRow::default(); 4];
+        let n = scan_orders(ORDERS, &mut out).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!((out[0].venue_oid, out[0].qty_1e6, out[0].status), (1_917_641, 400_000, crate::userstream::S_NEW));
+        assert_eq!(out[0].cid.get(ORDERS), b"mvA");
+        assert_eq!((out[1].cum_quote_1e6, out[1].side), (650_001_000, core_types::Side::Ask as u8));
+        let mut one = [OrderRow::default(); 1];
+        assert_eq!(scan_orders(ORDERS, &mut one), Err(ArrErr::Truncated));
+        assert_eq!(scan_orders(b"[]", &mut one), Ok(0));
+        assert_eq!(scan_orders(br#"[{"symbol":"X"}]"#, &mut one), Err(ArrErr::Scan(ScanErr::Missing)));
+    }
+
+    /// BX7b (the parser review): an order naming a key twice, an order
+    /// without its price, bytes after the array — each refuses the answer.
+    #[test]
+    fn an_order_read_twice_or_short_or_trailed_is_refused() {
+        const ONE: &str = r#"{"clientOrderId":"mvA","executedQty":"0","orderId":1,"origQty":"0.40","price":"9","side":"BUY","status":"NEW","symbol":"BTCUSDT"}"#;
+        let mut out = [OrderRow::default(); 4];
+        assert_eq!(scan_orders(format!("[{ONE}]").as_bytes(), &mut out), Ok(1));
+        assert_eq!(scan_orders(format!("[{ONE}] ").as_bytes(), &mut out), Ok(1), "whitespace is not bytes");
+        for k in ["clientOrderId\":\"bxprobe", "price\":\"1", "origQty\":\"1", "symbol\":\"ETHUSDT", "orderId\":2,\"x"] {
+            let twice = ONE.replacen("{", &format!("{{\"{k}\","), 1);
+            let twice = twice.replace("\"x\",", "");
+            assert_eq!(
+                scan_orders(format!("[{twice}]").as_bytes(), &mut out),
+                Err(ArrErr::Scan(ScanErr::Malformed)),
+                "{twice}"
+            );
+        }
+        let no_price = ONE.replace(r#""price":"9","#, "");
+        assert_eq!(scan_orders(format!("[{no_price}]").as_bytes(), &mut out), Err(ArrErr::Scan(ScanErr::Missing)));
+        assert_eq!(scan_orders(format!("[{ONE}]]").as_bytes(), &mut out), Err(ArrErr::Scan(ScanErr::Malformed)));
+        assert_eq!(scan_orders(format!("[{ONE}][]").as_bytes(), &mut out), Err(ArrErr::Scan(ScanErr::Malformed)));
+    }
+
+    /// BX7b: the Demo tools' touch and mark — one whole object (or dapi's
+    /// one-element array), each key once, the symbol asked for.
+    #[test]
+    fn the_touch_and_the_mark_are_one_symbols_whole_answer() {
+        let t = br#"{"symbol":"BTCUSDT","bidPrice":"81759.10","bidQty":"459.1751","askPrice":"81766.10","askQty":"611.7072","time":1}"#;
+        assert_eq!(scan_touch(t, b"BTCUSDT"), Ok((81_759_100_000, 81_766_100_000)));
+        let a = br#"[{"symbol":"BNBUSD_PERP","pair":"BNBUSD","bidPrice":"730.760","askPrice":"731.020"}]"#;
+        assert_eq!(scan_touch(a, b"BNBUSD_PERP"), Ok((730_760_000, 731_020_000)));
+        assert_eq!(scan_touch(t, b"ETHUSDT"), Err(ScanErr::BadField), "another symbol's book");
+        assert_eq!(scan_touch(br#"{"symbol":"X","bidPrice":"2","askPrice":"1"}"#, b"X"), Err(ScanErr::BadField), "crossed");
+        for bad in [
+            &br#"{"symbol":"X","bidPrice":"1","askPrice":"2","bidPrice":"3"}"#[..],
+            br#"{"symbol":"X","symbol":"Y","bidPrice":"1","askPrice":"2"}"#,
+            br#"{"symbol":"X","bidPrice":"1","askPrice":"2"} x"#,
+            br#"[{"symbol":"X","bidPrice":"1","askPrice":"2"},{"symbol":"X","bidPrice":"1","askPrice":"2"}]"#,
+            br#"[{"symbol":"X","bidPrice":"1","askPrice":"2"}] ]"#,
+            br#"[1]"#,
+            br#"[]"#,
+        ] {
+            assert_eq!(scan_touch(bad, b"X"), Err(ScanErr::Malformed), "{}", String::from_utf8_lossy(bad));
+        }
+        assert_eq!(scan_touch(br#"{"symbol":"X","bidPrice":"1"}"#, b"X"), Err(ScanErr::Missing));
+        let m = br#"{"symbol":"BTCUSDT","markPrice":"81762.75753623","indexPrice":"81769.18456522","time":1}"#;
+        assert_eq!(scan_mark(m, b"BTCUSDT"), Ok((81_762_757_536, 81_769_184_565)));
+        assert_eq!(scan_mark(br#"{"symbol":"X","markPrice":"0","indexPrice":"1"}"#, b"X"), Err(ScanErr::BadField));
+    }
+
+    #[test]
+    fn trades() {
+        let body = br#"[{"buyer":false,"commission":"-0.07819010","commissionAsset":"USDT","id":698759,"maker":false,"orderId":25851813,"price":"7819.01","qty":"0.002","quoteQty":"15.63802","realizedPnl":"-0.91539999","side":"SELL","positionSide":"SHORT","symbol":"BTCUSDT","time":1569514978020}]"#;
+        let mut out = [TradeRow::default(); 2];
+        assert_eq!(scan_trades(body, &mut out), Ok(1));
+        assert_eq!((out[0].trade_id, out[0].venue_oid, out[0].px_1e6, out[0].qty_1e6), (698_759, 25_851_813, 7_819_010_000, 2_000));
+        assert_eq!(out[0].symbol.get(body), b"BTCUSDT");
+        // BX8: spot's `myTrades` names the buyer and the maker, not the side.
+        let spot = br#"[{"symbol":"BTCUSDT","id":28457,"orderId":100234,"orderListId":-1,"price":"65000.00000000","qty":"0.00100000","quoteQty":"65.00000000","commission":"0.00000100","commissionAsset":"BTC","time":1790000000100,"isBuyer":true,"isMaker":false,"isBestMatch":true}]"#;
+        assert_eq!(scan_trades(spot, &mut out), Ok(1));
+        assert_eq!((out[0].side, out[0].maker, out[0].qty_1e6, out[0].time_ms), (core_types::Side::Bid as u8, 0, 1_000, 1_790_000_000_100));
+        assert_eq!((out[0].commission_1e9, out[0].fee_asset().get(spot)), (1_000, &b"BTC"[..]), "0.00000100 BTC ×1e9");
+        for bad in [r#""qty":"0.00000000""#, r#""qty":"-0.00100000""#, r#""price":"0.00000000""#] {
+            let what = if bad.contains("qty") { r#""qty":"0.00100000""# } else { r#""price":"65000.00000000""# };
+            let b = String::from_utf8(spot.to_vec()).unwrap().replace(what, bad);
+            assert_eq!(scan_trades(b.as_bytes(), &mut out), Err(ArrErr::Scan(ScanErr::BadField)), "{bad}");
+        }
+        for (what, gone) in [("a commission without its asset", r#""commissionAsset":"BTC","#), ("an asset without its commission", r#""commission":"0.00000100","#)] {
+            let b = String::from_utf8(spot.to_vec()).unwrap().replace(gone, "");
+            assert_eq!(scan_trades(b.as_bytes(), &mut out), Err(ArrErr::Scan(ScanErr::Missing)), "{what}");
+        }
+        let sell = String::from_utf8(spot.to_vec()).unwrap().replace(r#""isBuyer":true"#, r#""isBuyer":false"#);
+        assert_eq!(scan_trades(sell.as_bytes(), &mut out), Ok(1));
+        assert_eq!(out[0].side, core_types::Side::Ask as u8);
+        // One reading (BX8, as `scan_orders`): a side named twice — either
+        // spelling — or any key twice is refused; so are bytes after the
+        // array.
+        for bad in [
+            String::from_utf8(spot.to_vec()).unwrap().replace(r#""isBuyer":true"#, r#""isBuyer":true,"side":"SELL""#),
+            String::from_utf8(spot.to_vec()).unwrap().replace(r#""id":28457"#, r#""id":28457,"id":1"#),
+            String::from_utf8(spot.to_vec()).unwrap().replace(r#""isMaker":false"#, r#""isMaker":false,"isMaker":true"#),
+            String::from_utf8(spot.to_vec()).unwrap() + "]",
+        ] {
+            assert!(scan_trades(bad.as_bytes(), &mut out).is_err(), "{bad}");
+        }
+    }
+
+    /// BX8: a spot symbol's price, one object read whole, above zero.
+    #[test]
+    fn a_ticker_price() {
+        let s = b"BTCUSDT";
+        assert_eq!(scan_ticker_price(br#"{"symbol":"BTCUSDT","price":"65000.01000000"}"#, s), Ok(65_000_010_000));
+        assert_eq!(scan_ticker_price(br#"{"symbol":"BTCUSDT","price":"0.00000000"}"#, s), Err(ScanErr::BadField));
+        assert_eq!(scan_ticker_price(br#"{"symbol":"BTCUSDT"}"#, s), Err(ScanErr::Missing));
+        assert_eq!(scan_ticker_price(br#"{"symbol":"ETHUSDT","price":"3000.00"}"#, s), Err(ScanErr::BadField), "another's price");
+        assert_eq!(scan_ticker_price(br#"{"price":"3000.00"}"#, s), Err(ScanErr::Missing), "no symbol");
+        assert_eq!(scan_ticker_price(br#"{"symbol":"BTCUSDT","symbol":"BTCUSDT","price":"1"}"#, s), Err(ScanErr::Malformed));
+        assert_eq!(scan_ticker_price(br#"{"symbol":"BTCUSDT","price":"1","price":"2"}"#, s), Err(ScanErr::Malformed));
+        assert_eq!(scan_ticker_price(br#"{"symbol":"BTCUSDT","price":"1"} x"#, s), Err(ScanErr::Malformed));
+        assert_eq!(scan_ticker_price(br#"[{"price":"1"}]"#, s), Err(ScanErr::Malformed));
+    }
+
+    /// BX8: spot's lane speaks `api/v3`; every slot it has no endpoint for
+    /// names the ping, and the futures name none for the price.
+    #[test]
+    fn the_lanes_templates_by_product() {
+        let key = [(KEY_HEADER, "k")];
+        let s = lane_specs(PRODUCT_SPOT, false, &key);
+        assert_eq!(
+            (s[T_TIME].path, s[T_OPEN_ORDERS].path, s[T_USER_TRADES].path, s[T_PRICE].path),
+            ("/api/v3/time", "/api/v3/openOrders", "/api/v3/myTrades", "/api/v3/ticker/price")
+        );
+        for t in [T_LISTEN_KEY_NEW, T_LISTEN_KEY_KEEP, T_COUNTDOWN, T_CANCEL_ALL, T_DUAL, T_MULTI_ASSETS, T_ACCOUNT, T_SYMBOL_CONFIG] {
+            assert_eq!(s[t].path, SPOT_NONE, "spot has no {t}");
+        }
+        assert_eq!(lane_specs(PRODUCT_SPOT, true, &key)[T_TIME].path, "/api/v3/time", "spot is never papi's");
+        assert_eq!(lane_specs(crate::inst::PRODUCT_USDM, false, &key)[T_PRICE].path, "/fapi/v1/ping");
+        assert_eq!(lane_specs(PRODUCT_COINM, false, &key)[T_PRICE].path, "/dapi/v1/ping");
+        assert_eq!(lane_specs(crate::inst::PRODUCT_USDM, true, &key)[T_PRICE].path, PAPI_NONE);
+    }
+
+    proptest! {
+        #[test]
+        fn never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let _ = scan_error(&bytes);
+            if let Ok(s) = scan_listen_key(&bytes) { let _ = s.get(&bytes); }
+            let _ = scan_server_time(&bytes);
+            let _ = scan_ticker_price(&bytes, b"BTCUSDT");
+            let _ = scan_countdown(&bytes);
+            let _ = scan_touch(&bytes, b"BTCUSDT");
+            let _ = scan_mark(&bytes, b"BTCUSDT");
+            let mut o = [OrderRow::default(); 8];
+            if let Ok(n) = scan_orders(&bytes, &mut o) {
+                for r in &o[..n] { let _ = (r.symbol.get(&bytes), r.cid.get(&bytes)); }
+            }
+            let mut t = [TradeRow::default(); 8];
+            let _ = scan_trades(&bytes, &mut t);
+            // BX9: the options index.
+            if let Ok(px) = scan_opt_index(&bytes) {
+                prop_assert!(px > 0);
+            }
+        }
+
+        /// BX9 (the parser review, round 2): an index answer reads back its
+        /// price, ×1e6; a byte after the object refuses it.
+        #[test]
+        fn an_option_index_round_trips(px in 1i64..1_000_000_000_000_000, t in 0u64..4_000_000_000_000) {
+            let body = std::format!(r#"{{"time":{t},"indexPrice":"{}.{:06}"}}"#, px / 1_000_000, px % 1_000_000);
+            prop_assert_eq!(scan_opt_index(body.as_bytes()), Ok(px));
+            let more = std::format!("{body}x");
+            prop_assert!(scan_opt_index(more.as_bytes()).is_err());
+        }
+
+        /// BX8 (the parser review's P2-6e): a spot `myTrades` row read back
+        /// whole — the buyer as the side, the maker, the commission ×1e9 and
+        /// its asset, the ids and figures.
+        #[test]
+        fn a_spot_trade_row_round_trips(id in 0u64..1_000_000_000_000_000_000, oid in any::<u32>(), px in 1i64..1_000_000_000, qty in 1i64..100_000_000_000, fee in 0i64..1_000_000_000, buyer in any::<bool>(), maker in any::<bool>()) {
+            let d8 = |v: i64, scale: i64| std::format!("{}.{:08}", v / scale, (v % scale) * (100_000_000 / scale));
+            let body = std::format!(
+                r#"[{{"symbol":"BTCUSDT","id":{id},"orderId":{oid},"orderListId":-1,"price":"{p}","qty":"{q}","quoteQty":"1.00000000","commission":"{n}","commissionAsset":"BNB","time":1790000000100,"isBuyer":{buyer},"isMaker":{maker},"isBestMatch":true}}]"#,
+                p = d8(px * 10_000, 1_000_000),
+                q = d8(qty, 1_000_000),
+                n = d8(fee, 100_000_000),
+            );
+            let mut out = [TradeRow::default(); 1];
+            prop_assert_eq!(scan_trades(body.as_bytes(), &mut out), Ok(1));
+            let r = out[0];
+            prop_assert_eq!((r.trade_id, r.venue_oid, r.px_1e6, r.qty_1e6), (id, u64::from(oid), px * 10_000, qty));
+            let side = if buyer { core_types::Side::Bid as u8 } else { core_types::Side::Ask as u8 };
+            prop_assert_eq!((r.side, r.maker, r.time_ms), (side, maker as u8, 1_790_000_000_100));
+            prop_assert_eq!((r.commission_1e9, r.fee_asset().get(body.as_bytes())), (fee * 10, &b"BNB"[..]));
+            prop_assert_eq!(r.symbol.get(body.as_bytes()), &b"BTCUSDT"[..]);
+        }
+    }
+}

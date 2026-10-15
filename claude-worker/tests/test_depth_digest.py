@@ -33,7 +33,7 @@ def write_depth(
 ) -> None:
     """One v2 kind-7 file. ``recs`` = (ts_ns, sym, venue, flags, bids,
     asks) with ≤5 (px_1e6, qty_1e6) levels per side, EMPTY-padded."""
-    header = claude_worker.pmlr._HEADER.pack(  # noqa: SLF001 — reader-defined layout, deliberately
+    header = claude_worker.pmlr._HEADER.pack(  # reader-defined layout, deliberately
         claude_worker.pmlr.MAGIC,
         2,
         claude_worker.pmlr.SLOT_KIND_DEPTH,
@@ -46,7 +46,7 @@ def write_depth(
             padded = list(side) + [(0, 0)] * (claude_worker.pmlr.DEPTH_K - len(side))
             for px, qty in padded:
                 levels.extend((px, qty))
-        slot = claude_worker.pmlr._DEPTH.pack(  # noqa: SLF001
+        slot = claude_worker.pmlr._DEPTH.pack(
             ts, sym, venue, claude_worker.pmlr.DEPTH_K, flags, *levels
         )
         blob.extend(slot + bytes(_DSLOT - len(slot)))
@@ -104,7 +104,7 @@ def test_depth_layout_pin_matches_wire_format_offsets(tmp_path):
     struct.pack_into("<B", slot, 14, 1)  # flags (STALE)
     struct.pack_into("<qq", slot, 16, 99_000_000, 3_000_000)  # bids[0]
     struct.pack_into("<qq", slot, 96, 101_000_000, 4_000_000)  # asks[0]
-    header = claude_worker.pmlr._HEADER.pack(  # noqa: SLF001
+    header = claude_worker.pmlr._HEADER.pack(  # reader-defined layout, deliberately
         claude_worker.pmlr.MAGIC, 2, claude_worker.pmlr.SLOT_KIND_DEPTH, EPOCH_NS
     )
     path = tmp_path / "okx-depth.pmlr"

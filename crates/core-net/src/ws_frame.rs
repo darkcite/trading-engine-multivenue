@@ -156,11 +156,15 @@ pub enum WsReadResult {
     Malformed,
 }
 
-/// Serialization error. Non-allocating: single-variant enum.
+/// Serialization error. Non-allocating.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WsWriteErr {
     /// Destination slice cannot fit header + payload.
     BufferTooSmall,
+    /// A header-first render ([`ws_write_text_frame_rendered`]) failed on
+    /// its writing pass, or wrote a different length there from the one
+    /// it counted.
+    RenderDiverged,
 }
 
 // ---------------------------------------------------------------
@@ -345,14 +349,77 @@ pub fn ws_write_text_frame(
     ws_write_frame(dst, WsOpcode::Text, payload, mask)
 }
 
-/// Binary counterpart of [`ws_write_text_frame`].
+/// **One payload part that renders itself straight into the frame**
+/// (BX6: the Binance order requests' numbers and client ids). Its length
+/// is known before it is written, so the header goes first and the part
+/// is written once, in place — never staged in a scratch and copied in.
+/// Monomorphized ([`ws_write_text_frame_with`] is generic), never `dyn`.
+pub trait WsPart {
+    /// The bytes [`WsPart::write_to`] writes.
+    fn part_len(&self) -> usize;
+    /// Write exactly [`WsPart::part_len`] bytes into `dst`, which is that
+    /// long, and return how many were written (the serialiser checks it in
+    /// debug: a short write would leave stale tx bytes on the wire).
+    fn write_to(&self, dst: &mut [u8]) -> usize;
+}
+
+impl WsPart for &[u8] {
+    #[inline(always)]
+    fn part_len(&self) -> usize {
+        self.len()
+    }
+
+    #[inline(always)]
+    fn write_to(&self, dst: &mut [u8]) -> usize {
+        // COPY: one payload part (≤ the frame's payload in all) into the
+        // final wire buffer — the serialiser's own write: WebSocket masks
+        // the payload on the wire and the caller's bytes are not ours to
+        // mutate — rejected: masking the caller's buffer in place (not
+        // ours) or staging the parts in a scratch first (a second copy).
+        dst.copy_from_slice(self);
+        self.len()
+    }
+}
+
+/// Serialize a single-fragment client text frame whose payload is the
+/// concatenation of `parts`, each RENDERING ITSELF straight into `dst`
+/// ([`WsPart`]): a number's digits or an id are written once, in the
+/// frame. Same contract as [`ws_write_text_frame`]: `FIN=1`, masked,
+/// zero-alloc.
 #[inline]
-pub fn ws_write_binary_frame(
+pub fn ws_write_text_frame_with<P: WsPart>(
     dst: &mut [u8],
-    payload: &[u8],
+    parts: &[P],
     mask: [u8; 4],
 ) -> Result<usize, WsWriteErr> {
-    ws_write_frame(dst, WsOpcode::Binary, payload, mask)
+    ws_write_frame_with(dst, WsOpcode::Text, parts, mask)
+}
+
+/// Serialize a single-fragment client text frame whose payload is the
+/// concatenation of `parts`, each written straight into `dst` — a
+/// caller never assembles the payload anywhere first (BX0: the Binance
+/// spot sentinel's SUBSCRIBE). Same contract as
+/// [`ws_write_text_frame`]: `FIN=1`, masked, zero-alloc.
+#[inline]
+pub fn ws_write_text_frame_parts(
+    dst: &mut [u8],
+    parts: &[&[u8]],
+    mask: [u8; 4],
+) -> Result<usize, WsWriteErr> {
+    ws_write_frame_parts(dst, WsOpcode::Text, parts, mask)
+}
+
+/// Binary counterpart of [`ws_write_text_frame_parts`]: the payload is
+/// the concatenation of `parts`, each written straight into `dst` (the
+/// RPC venues' fixed-shape JSON-RPC requests). `FIN=1`, masked,
+/// zero-alloc.
+#[inline]
+pub fn ws_write_binary_frame_parts(
+    dst: &mut [u8],
+    parts: &[&[u8]],
+    mask: [u8; 4],
+) -> Result<usize, WsWriteErr> {
+    ws_write_frame_parts(dst, WsOpcode::Binary, parts, mask)
 }
 
 /// Serialize a Pong control frame (in response to a Ping). Control
@@ -377,20 +444,78 @@ fn ws_write_frame(
     payload: &[u8],
     mask: [u8; 4],
 ) -> Result<usize, WsWriteErr> {
-    let plen = payload.len();
-    let hdr_len: usize = if plen <= 125 {
+    ws_write_frame_parts(dst, opcode, &[payload], mask)
+}
+
+/// The byte-parts serialiser: [`ws_write_frame_with`] over `&[u8]`.
+#[inline]
+fn ws_write_frame_parts(
+    dst: &mut [u8],
+    opcode: WsOpcode,
+    parts: &[&[u8]],
+    mask: [u8; 4],
+) -> Result<usize, WsWriteErr> {
+    ws_write_frame_with(dst, opcode, parts, mask)
+}
+
+/// The one frame serialiser: the payload is the concatenation of
+/// `parts`, each written straight into place ([`WsPart`]).
+#[inline]
+fn ws_write_frame_with<P: WsPart>(
+    dst: &mut [u8],
+    opcode: WsOpcode,
+    parts: &[P],
+    mask: [u8; 4],
+) -> Result<usize, WsWriteErr> {
+    let mut plen = 0usize;
+    let mut k = 0usize;
+    while k < parts.len() {
+        plen += parts[k].part_len();
+        k += 1;
+    }
+    let total = client_header_len(plen) + plen;
+    if dst.len() < total {
+        return Err(WsWriteErr::BufferTooSmall);
+    }
+    let cursor = write_client_header(dst, opcode, plen, mask);
+    debug_assert_eq!(cursor, client_header_len(plen), "header vs its length");
+
+    // Each part writes itself into place, then the payload is XOR-masked
+    // in place in one pass: `dst` is the caller's preallocated tx buffer
+    // and the final write must go out masked.
+    let mut at = cursor;
+    let mut k = 0usize;
+    while k < parts.len() {
+        let n = parts[k].part_len();
+        let wrote = parts[k].write_to(&mut dst[at..at + n]);
+        debug_assert!(wrote == n, "a part wrote other than its length");
+        at += n;
+        k += 1;
+    }
+    ws_unmask_in_place(&mut dst[cursor..cursor + plen], mask);
+
+    Ok(total)
+}
+
+/// Header length of a client frame carrying `plen` payload bytes: the
+/// shortest length form (RFC 6455 §5.2 requires it) plus the 4-byte mask
+/// key.
+#[inline]
+const fn client_header_len(plen: usize) -> usize {
+    if plen <= 125 {
         2 + 4
     } else if plen <= u16::MAX as usize {
         2 + 2 + 4
     } else {
         2 + 8 + 4
-    };
-
-    let total = hdr_len + plen;
-    if dst.len() < total {
-        return Err(WsWriteErr::BufferTooSmall);
     }
+}
 
+/// Write a client frame's header — FIN, `opcode`, MASK, the shortest
+/// length form for `plen`, the mask key — into `dst`, which holds at least
+/// [`client_header_len`]`(plen)` bytes. Returns the header's length.
+#[inline]
+fn write_client_header(dst: &mut [u8], opcode: WsOpcode, plen: usize, mask: [u8; 4]) -> usize {
     // Byte 0: FIN=1 | RSV=0 | opcode.
     dst[0] = 0x80 | (opcode as u8);
 
@@ -415,17 +540,188 @@ fn ws_write_frame(
     // 4-byte mask follows the length encoding.
     dst[cursor..cursor + 4].copy_from_slice(&mask);
     cursor += 4;
+    cursor
+}
 
-    // Copy payload, then XOR-mask it in place. We do copy-then-mask
-    // (rather than streaming through a scratch) because `dst` is the
-    // caller's preallocated tx buffer and we want the final write to
-    // go out masked. The copy is necessary — WebSocket masks the
-    // payload on the wire, and the caller's `payload` slice is not
-    // mutable.
-    dst[cursor..cursor + plen].copy_from_slice(payload);
-    ws_unmask_in_place(&mut dst[cursor..cursor + plen], mask);
+// ---------------------------------------------------------------
+// Header-first rendered frames
+// ---------------------------------------------------------------
 
+/// A client frame's payload, rendered straight into place
+/// ([`ws_write_text_frame_rendered`]). A render appends through
+/// [`put`](Self::put) and runs twice, identically: a counting pass, which
+/// writes nothing (the header needs the payload's length first), then the
+/// writing pass into the frame behind the header.
+#[derive(Debug)]
+pub struct WsPayload<'a> {
+    dst: &'a mut [u8],
+    len: usize,
+    counting: bool,
+}
+
+impl<'a> WsPayload<'a> {
+    /// A counting pass: [`put`](Self::put) only adds up lengths.
+    #[inline]
+    pub fn counting() -> Self {
+        Self {
+            dst: &mut [],
+            len: 0,
+            counting: true,
+        }
+    }
+
+    /// A writing pass into `dst` — the frame's payload span, or a test's
+    /// buffer.
+    #[inline]
+    pub fn writing(dst: &'a mut [u8]) -> Self {
+        Self {
+            dst,
+            len: 0,
+            counting: false,
+        }
+    }
+
+    /// Append `bytes` to the payload.
+    ///
+    /// # Errors
+    /// [`WsWriteErr::BufferTooSmall`] when a writing pass runs past its
+    /// destination.
+    #[inline]
+    pub fn put(&mut self, bytes: &[u8]) -> Result<(), WsWriteErr> {
+        let end = self.len + bytes.len();
+        if !self.counting {
+            let slot = self
+                .dst
+                .get_mut(self.len..end)
+                .ok_or(WsWriteErr::BufferTooSmall)?;
+            // COPY: the render itself — each literal fragment, symbol and
+            // id put once, straight into the frame's payload (≤ tx's free
+            // room, 16–24 KiB; at session start; Deribit's request id is
+            // put from its 20 B digit render) — the only write of those
+            // bytes into tx; the mask is then an in-place XOR — rejected:
+            // the scratch render and masked copy into tx it replaces.
+            slot.copy_from_slice(bytes);
+        }
+        self.len = end;
+        Ok(())
+    }
+
+    /// Bytes appended (or counted) so far.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether nothing has been appended yet.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Serialize a single-fragment client text frame whose payload `render`
+/// writes straight into `dst`, header first: a counting pass sizes the
+/// payload, the header goes down, the writing pass renders behind it, and
+/// the payload is masked in place — the batch subscribes, whose length is
+/// unknown until they are rendered, need no scratch and no second copy.
+/// `FIN=1`, masked, zero-alloc. Cold paths only: the render runs twice.
+///
+/// `render` must produce the same bytes on both passes — a pure function
+/// of what it captured (`Fn`: it cannot mutate a capture).
+///
+/// # Errors
+/// [`WsWriteErr::BufferTooSmall`] when `dst` cannot hold the frame, or the
+/// render's own error from its counting pass — both before a byte is
+/// written; [`WsWriteErr::RenderDiverged`] when the writing pass fails or
+/// writes a different length from the one it counted.
+#[inline]
+pub fn ws_write_text_frame_rendered<F>(
+    dst: &mut [u8],
+    mask: [u8; 4],
+    render: F,
+) -> Result<usize, WsWriteErr>
+where
+    F: Fn(&mut WsPayload<'_>) -> Result<(), WsWriteErr>,
+{
+    let mut count = WsPayload::counting();
+    render(&mut count)?;
+    let plen = count.len;
+    let hdr = client_header_len(plen);
+    let total = hdr + plen;
+    if dst.len() < total {
+        return Err(WsWriteErr::BufferTooSmall);
+    }
+    let at = write_client_header(dst, WsOpcode::Text, plen, mask);
+    debug_assert_eq!(at, hdr, "header vs its length");
+    // The writing pass gets exactly the counted span: running past it, or
+    // stopping short of it, is a render that diverged from its count.
+    let payload = &mut dst[hdr..total];
+    let mut written = WsPayload::writing(payload);
+    if render(&mut written).is_err() || written.len != plen {
+        debug_assert!(
+            false,
+            "a render's writing pass diverged from its count of {plen} B"
+        );
+        return Err(WsWriteErr::RenderDiverged);
+    }
+    ws_unmask_in_place(&mut dst[hdr..total], mask);
     Ok(total)
+}
+
+// ---------------------------------------------------------------
+// A frame around a payload rendered in place (XMM XH4a)
+// ---------------------------------------------------------------
+
+/// The most header a client frame needs, 14 B: the two fixed bytes, the
+/// 8-byte extended length and the 4-byte mask key. A payload rendered at
+/// `buf[WS_CLIENT_HDR_MAX..]` can always be framed where it lies.
+pub const WS_CLIENT_HDR_MAX: usize = 14;
+
+/// Frame a client payload that was rendered IN PLACE at
+/// `buf[room..room + plen]`: the header goes right-aligned into the `room`
+/// bytes reserved in front of it (the shortest length form, RFC 6455
+/// §5.2) and the payload is masked where it lies. Returns the frame's
+/// first byte: the frame is `buf[start..room + plen]`, ready for the
+/// socket.
+///
+/// `room = WS_CLIENT_HDR_MAX` fits every length. A writer that knows its
+/// payload's length form can reserve exactly that header — 8 B for
+/// 126 ..= 65 535 B, every signed order post — and then `start` is 0: no
+/// gap in front of the frame for an `IoBuf`-style window to skip.
+///
+/// The one-pass alternative to [`ws_write_text_frame_rendered`] for a
+/// writer that learns its payload's length only by rendering it (a signed
+/// order action, XMM XH4): no counting pass, no second render and no copy
+/// — each payload byte is written once, by the render; then the mask is an
+/// in-place XOR. The mask destroys the plaintext: a sender that must send
+/// the same payload unmasked (a REST fallback) XORs it back with the same
+/// key rather than render it again. `FIN=1`, masked, zero-alloc.
+///
+/// # Errors
+/// [`WsWriteErr::BufferTooSmall`] when `room` cannot hold this length's
+/// header or `buf` is shorter than `room + plen`; nothing is written.
+#[inline]
+pub fn ws_frame_in_place(
+    buf: &mut [u8],
+    room: usize,
+    opcode: WsOpcode,
+    plen: usize,
+    mask: [u8; 4],
+) -> Result<usize, WsWriteErr> {
+    debug_assert!(
+        !opcode.is_control() || plen <= 125,
+        "a control frame carries <= 125 bytes"
+    );
+    let hdr = client_header_len(plen);
+    let end = match plen.checked_add(room) {
+        Some(e) if e <= buf.len() && hdr <= room => e,
+        _ => return Err(WsWriteErr::BufferTooSmall),
+    };
+    let start = room - hdr;
+    let wrote = write_client_header(&mut buf[start..room], opcode, plen, mask);
+    debug_assert_eq!(wrote, hdr, "the header ends where the payload begins");
+    ws_unmask_in_place(&mut buf[room..end], mask);
+    Ok(start)
 }
 
 // ---------------------------------------------------------------
@@ -456,6 +752,214 @@ pub fn ws_mask_from_counter(counter: u64) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Header-first rendered frames ----
+
+    /// A render over `n` repeats of a 7-byte fragment, then a tail.
+    fn render_n(p: &mut WsPayload<'_>, n: usize) -> Result<(), WsWriteErr> {
+        let mut i = 0;
+        while i < n {
+            p.put(b"{\"a\":1}")?;
+            i += 1;
+        }
+        p.put(b"!")
+    }
+
+    #[test]
+    fn a_rendered_frame_is_byte_identical_to_the_parts_writer_in_every_length_form() {
+        // 7-bit (≤ 125), 16-bit and 64-bit length forms.
+        for n in [0usize, 17, 18, 1_000, 9_363, 9_400] {
+            let parts: Vec<&[u8]> = (0..n)
+                .map(|_| &b"{\"a\":1}"[..])
+                .chain(core::iter::once(&b"!"[..]))
+                .collect();
+            let mask = [0x11, 0x22, 0x33, 0x44];
+            let mut want = vec![0u8; 14 + 7 * n + 1];
+            let w = ws_write_text_frame_parts(&mut want, &parts, mask).unwrap();
+            let mut got = vec![0u8; 14 + 7 * n + 1];
+            let g = ws_write_text_frame_rendered(&mut got, mask, |p| render_n(p, n)).unwrap();
+            assert_eq!(&got[..g], &want[..w], "n = {n}");
+        }
+    }
+
+    #[test]
+    fn a_rendered_frame_that_does_not_fit_writes_nothing_and_fails() {
+        let mut dst = [0u8; 20];
+        assert_eq!(
+            ws_write_text_frame_rendered(&mut dst, [1, 2, 3, 4], |p| render_n(p, 3)),
+            Err(WsWriteErr::BufferTooSmall)
+        );
+        assert_eq!(dst, [0u8; 20], "the counting pass sized it first");
+    }
+
+    #[test]
+    fn a_rendered_frame_reads_back_at_every_length_boundary() {
+        // Each length form at its edges, read back by the frame reader and
+        // unmasked — a check independent of the header writer the parts
+        // frame shares.
+        let mask = [0xA5, 0x5A, 0x0F, 0xF0];
+        for (len, header_len) in [(0usize, 6u8), (125, 6), (126, 8), (65_535, 8), (65_536, 14)] {
+            let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut dst = vec![0u8; 14 + len];
+            let n = ws_write_text_frame_rendered(&mut dst, mask, |p| p.put(&body)).unwrap();
+            let WsReadResult::Frame { header, payload } = ws_read_frame(&dst[..n]) else {
+                panic!("len = {len}: not a frame");
+            };
+            assert!(header.fin && header.masked && header.opcode == WsOpcode::Text);
+            assert_eq!(
+                (header.header_len, header.payload_len),
+                (header_len, len as u64)
+            );
+            assert_eq!(payload.end, n, "len = {len}");
+            ws_unmask_in_place(&mut dst[payload.start..payload.end], header.mask);
+            assert_eq!(&dst[payload.start..payload.end], &body[..], "len = {len}");
+        }
+    }
+
+    // ---- Frames around a payload rendered in place (XMM XH4a) ----
+
+    #[test]
+    fn an_in_place_frame_is_byte_identical_to_the_payload_writer_in_every_length_form() {
+        let mask = [0x3C, 0xC3, 0x5A, 0xA5];
+        for len in [0usize, 1, 125, 126, 65_535, 65_536] {
+            let body: Vec<u8> = (0..len).map(|i| (i % 253) as u8).collect();
+            let mut want = vec![0u8; WS_CLIENT_HDR_MAX + len];
+            let w = ws_write_text_frame(&mut want, &body, mask).unwrap();
+            let mut buf = vec![0xEEu8; WS_CLIENT_HDR_MAX + len];
+            buf[WS_CLIENT_HDR_MAX..].copy_from_slice(&body);
+            let start =
+                ws_frame_in_place(&mut buf, WS_CLIENT_HDR_MAX, WsOpcode::Text, len, mask).unwrap();
+            assert_eq!(&buf[start..], &want[..w], "len = {len}");
+            assert!(
+                buf[..start].iter().all(|&b| b == 0xEE),
+                "nothing written before the frame"
+            );
+        }
+    }
+
+    #[test]
+    fn exactly_the_headers_room_frames_at_byte_zero_and_less_is_refused() {
+        let mask = [0x0F, 0xF0, 0x55, 0xAA];
+        let body: Vec<u8> = (0..3_000u32).map(|i| (i % 249) as u8).collect();
+        let mut want = vec![0u8; WS_CLIENT_HDR_MAX + body.len()];
+        let w = ws_write_text_frame(&mut want, &body, mask).unwrap();
+        // A signed post (126 ..= 65 535 B) needs 2 + 2 + 4 bytes of header.
+        let mut buf = vec![0u8; 8 + body.len()];
+        buf[8..].copy_from_slice(&body);
+        let start = ws_frame_in_place(&mut buf, 8, WsOpcode::Text, body.len(), mask).unwrap();
+        assert_eq!(start, 0, "no gap in front of the frame");
+        assert_eq!(&buf[..], &want[..w]);
+        // The same payload with room for the 7-bit form's header only.
+        let mut short = vec![3u8; 6 + body.len()];
+        assert_eq!(
+            ws_frame_in_place(&mut short, 6, WsOpcode::Text, body.len(), mask),
+            Err(WsWriteErr::BufferTooSmall)
+        );
+        assert!(short.iter().all(|&b| b == 3), "nothing written");
+    }
+
+    #[test]
+    fn an_in_place_binary_frame_reads_back_and_unmasks() {
+        let mask = [1, 2, 3, 4];
+        let body = b"{\"method\":\"post\",\"id\":7}";
+        let mut buf = vec![0u8; WS_CLIENT_HDR_MAX + body.len()];
+        buf[WS_CLIENT_HDR_MAX..].copy_from_slice(body);
+        let start = ws_frame_in_place(
+            &mut buf,
+            WS_CLIENT_HDR_MAX,
+            WsOpcode::Binary,
+            body.len(),
+            mask,
+        )
+        .unwrap();
+        assert_eq!(
+            start,
+            WS_CLIENT_HDR_MAX - 6,
+            "the 7-bit form: 2 + 4 header bytes"
+        );
+        let WsReadResult::Frame { header, payload } = ws_read_frame(&buf[start..]) else {
+            panic!("not a frame");
+        };
+        assert!(header.fin && header.masked && header.opcode == WsOpcode::Binary);
+        let at = start + payload.start;
+        ws_unmask_in_place(&mut buf[at..start + payload.end], header.mask);
+        assert_eq!(&buf[at..start + payload.end], &body[..]);
+    }
+
+    #[test]
+    fn an_in_place_frame_that_does_not_fit_writes_nothing_and_fails() {
+        let mut buf = [7u8; WS_CLIENT_HDR_MAX + 9];
+        assert_eq!(
+            ws_frame_in_place(
+                &mut buf,
+                WS_CLIENT_HDR_MAX,
+                WsOpcode::Text,
+                10,
+                [9, 9, 9, 9]
+            ),
+            Err(WsWriteErr::BufferTooSmall)
+        );
+        assert_eq!(buf, [7u8; WS_CLIENT_HDR_MAX + 9]);
+        assert_eq!(
+            ws_frame_in_place(
+                &mut buf,
+                WS_CLIENT_HDR_MAX,
+                WsOpcode::Text,
+                usize::MAX,
+                [9, 9, 9, 9]
+            ),
+            Err(WsWriteErr::BufferTooSmall),
+            "a length that overflows is refused, not wrapped"
+        );
+    }
+
+    #[test]
+    fn a_render_that_fails_its_counting_pass_writes_nothing() {
+        let mut dst = [0u8; 32];
+        let r = ws_write_text_frame_rendered(&mut dst, [1, 2, 3, 4], |_| {
+            Err(WsWriteErr::BufferTooSmall)
+        });
+        assert_eq!(r, Err(WsWriteErr::BufferTooSmall), "the render's own error");
+        assert_eq!(dst, [0u8; 32]);
+    }
+
+    /// A render asked for `first` repeats on its counting pass and
+    /// `second` on its writing pass.
+    fn diverging(first: usize, second: usize) -> Result<usize, WsWriteErr> {
+        let calls = core::cell::Cell::new(0);
+        let mut dst = [0u8; 64];
+        ws_write_text_frame_rendered(&mut dst, [1, 2, 3, 4], |p| {
+            calls.set(calls.get() + 1);
+            render_n(p, if calls.get() == 1 { first } else { second })
+        })
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "diverged from its count"))]
+    fn a_render_that_writes_more_than_it_counted_is_refused() {
+        assert_eq!(diverging(1, 2), Err(WsWriteErr::RenderDiverged));
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "diverged from its count"))]
+    fn a_render_that_writes_less_than_it_counted_is_refused() {
+        assert_eq!(diverging(2, 1), Err(WsWriteErr::RenderDiverged));
+    }
+
+    #[test]
+    fn a_payload_counts_without_writing_and_writes_within_bounds() {
+        let mut c = WsPayload::counting();
+        assert!(c.is_empty());
+        c.put(b"abc").unwrap();
+        c.put(b"de").unwrap();
+        assert_eq!(c.len(), 5);
+        let mut buf = [0u8; 4];
+        let mut w = WsPayload::writing(&mut buf);
+        w.put(b"abc").unwrap();
+        assert_eq!(w.put(b"de"), Err(WsWriteErr::BufferTooSmall));
+        assert_eq!(w.len(), 3, "a refused put appends nothing");
+        assert_eq!(&buf[..3], b"abc");
+    }
 
     // ---- Reader ----
 
@@ -611,6 +1115,88 @@ mod tests {
         }
     }
 
+    /// BX0: a frame written from parts is byte-identical to the frame
+    /// written from their concatenation, in every length class.
+    #[test]
+    fn parts_frame_matches_the_concatenated_frame() {
+        let mask = [0x11u8, 0x22, 0x33, 0x44];
+        for total in [0usize, 3, 125, 126, 1_000, 70_000] {
+            let whole: Vec<u8> = (0..total).map(|i| (i * 7 + 3) as u8).collect();
+            let (a, rest) = whole.split_at(total / 3);
+            let (b, c) = rest.split_at(rest.len() / 2);
+            let mut one = vec![0u8; total + 14];
+            let mut three = vec![0u8; total + 14];
+            let n1 = ws_write_text_frame(&mut one, &whole, mask).unwrap();
+            let n3 = ws_write_text_frame_parts(&mut three, &[a, b, c], mask).unwrap();
+            assert_eq!(n1, n3, "length class {total}");
+            assert_eq!(one[..n1], three[..n3], "length class {total}");
+        }
+        // Too small a destination is refused, never truncated.
+        let mut tiny = [0u8; 9];
+        assert_eq!(
+            ws_write_text_frame_parts(&mut tiny, &[b"abc", b"defg"], mask),
+            Err(WsWriteErr::BufferTooSmall)
+        );
+    }
+
+    /// A part that renders an integer's digits itself.
+    #[derive(Copy, Clone)]
+    enum TestPart<'a> {
+        Lit(&'a [u8]),
+        Num(u64),
+    }
+
+    impl WsPart for TestPart<'_> {
+        fn part_len(&self) -> usize {
+            match *self {
+                TestPart::Lit(b) => b.len(),
+                TestPart::Num(v) => v.checked_ilog10().map_or(1, |l| l as usize + 1),
+            }
+        }
+        fn write_to(&self, dst: &mut [u8]) -> usize {
+            match *self {
+                TestPart::Lit(b) => dst.copy_from_slice(b),
+                TestPart::Num(mut v) => {
+                    let mut i = dst.len();
+                    loop {
+                        i -= 1;
+                        dst[i] = b'0' + (v % 10) as u8;
+                        v /= 10;
+                        if v == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            dst.len()
+        }
+    }
+
+    /// BX6: a frame whose parts render themselves in place is byte-
+    /// identical to the frame of the rendered text, across the length
+    /// classes' edges (the header is written before any part, from the
+    /// parts' own lengths).
+    #[test]
+    fn self_rendering_parts_frame_like_their_text() {
+        let mask = [0x5au8, 0x01, 0xfe, 0x33];
+        for pad in [0usize, 100, 110, 115, 116, 117, 118, 119, 120, 1_000] {
+            let filler = vec![b'x'; pad];
+            let parts = [TestPart::Lit(b"{\"id\":"), TestPart::Num(pad as u64 * 977), TestPart::Lit(&filler), TestPart::Num(0)];
+            let text = format!("{{\"id\":{}{}0", pad * 977, "x".repeat(pad));
+            let mut a = vec![0u8; text.len() + 14];
+            let mut b = vec![0u8; text.len() + 14];
+            let na = ws_write_text_frame(&mut a, text.as_bytes(), mask).unwrap();
+            let nb = ws_write_text_frame_with(&mut b, &parts, mask).unwrap();
+            assert_eq!(a[..na], b[..nb], "pad {pad}");
+        }
+        let mut tiny = [0u8; 8];
+        assert_eq!(
+            ws_write_text_frame_with(&mut tiny, &[TestPart::Num(12_345)], mask),
+            Err(WsWriteErr::BufferTooSmall),
+            "refused whole, never truncated"
+        );
+    }
+
     #[test]
     fn write_errors_when_buffer_too_small() {
         let mut dst = [0u8; 3]; // header alone won't fit
@@ -626,7 +1212,7 @@ mod tests {
         // 126 triggers the 16-bit form.
         let payload = vec![0xAAu8; 126];
         let mut dst = vec![0u8; 4 + 4 + payload.len()];
-        let n = ws_write_binary_frame(&mut dst, &payload, [9, 9, 9, 9]).unwrap();
+        let n = ws_write_binary_frame_parts(&mut dst, &[&payload], [9, 9, 9, 9]).unwrap();
         assert_eq!(n, 2 + 2 + 4 + 126);
         // Re-parse.
         let r = ws_read_frame(&dst[..n]);

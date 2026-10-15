@@ -3,7 +3,8 @@
 
 //! **E6 commit 3 — the sticky halt.**
 //!
-//! Six triggers, one latch per slot, and no way out but an operator.
+//! Eight triggers (BX3 added the venue's two verdicts), one latch per
+//! slot, and no way out but an operator.
 //!
 //! ## What halts, and why each one (in `trigger_for`'s order)
 //!
@@ -16,6 +17,14 @@
 //! | reconciliation stale | `halt_on_recon_stale_ms` | the reconciler has not AGREED with the venue for this long — the safety net is dark |
 //! | user-event stream gap | `halt_on_ws_gap_ms` | LAW E-5 — the WS is the FILL, so a gap is trading blind |
 //!
+//! **BX3** — two venue VERDICTS are tested first, with no threshold: the
+//! venue restricted the account (`VenueLock`), or the arm judged its
+//! margin ratio at or past the slot's `halt_on_margin_ratio_1e6`
+//! (`MarginRisk`, O-BX18: the arm holds the number and reports only the
+//! flag). No arm sets either before BX6. The E7 session bound
+//! (`pnl-gain` / `pnl-loss`) is an operator's stopping rule on the same
+//! latch, not a fault detector.
+//!
 //! **The day cap is NOT here**, and the plan listed it. Reaching
 //! `cap_day_usd` is the clamp working, and it clears itself at
 //! 00:00Z; a sticky halt on it would stop the engine for good every
@@ -23,14 +32,24 @@
 //! five mean "something is wrong"; that one means "today is done".
 //! Operator ruling, 2026-09-19.
 //!
-//! ## Venue-wide sensors, per-slot thresholds
+//! ## Arm-wide sensors, per-slot thresholds
 //!
-//! Every trigger above is a property of the ARM — the socket, the
+//! Every trigger above is a property of an ARM — the socket, the
 //! budget, the reconciler — not of any one member. Each live slot
-//! compares that one signal against ITS OWN numbers, so a slot with a
+//! compares the signal of the arm(s) that trade it
+//! (`OrderDispatch::halt_signal_for`; a slot on two venues reads both,
+//! merged — BX3, O-BX17) against ITS OWN numbers, so a slot with a
 //! tighter threshold halts first and a slot on another venue is
-//! untouched. That is what "per-slot refusal, venue-wide cancel"
-//! means in code.
+//! untouched (O-BX8). That is what "per-slot refusal" means in code.
+//!
+//! **XMM XH5a (R-XH4-1) — and per-slot cancel.** A halt cancels only
+//! the halted slot's orders (`OrderDispatch::cancel_slot`): a sibling
+//! slot on the same arm keeps its quotes until its OWN numbers trip it.
+//! Before XH5a the cancel was venue-wide and pulled every live slot's
+//! quotes on any slot's halt. A condition of the whole arm (the budget
+//! floor, a venue lock, the gateway's halt word, margin risk) still
+//! reaches every slot the arm trades: each reads the arm's signal,
+//! latches, and cancels its own.
 //!
 //! ## Sticky
 //!
@@ -80,14 +99,31 @@ pub enum HaltReason {
     /// No reconciliation has AGREED with the venue for
     /// `halt_on_recon_stale_ms`.
     ReconStale = 7,
-    /// E7 session bound: the account's spot USDC reached the anchor
-    /// plus `halt_on_gain_usd_1e6` while flat. The operator's
-    /// stopping rule, not a fault — but sticky like every halt, so
-    /// "run until" means until.
+    /// E7 session bound: the account's equity at cost reached the
+    /// anchor plus `halt_on_gain_usd_1e6` (judged whether or not the
+    /// book is flat since S7-L1). The operator's stopping rule, not a
+    /// fault — but sticky like every halt, so "run until" means until.
     PnlGain = 8,
-    /// E7 session bound: the account's spot USDC fell to the anchor
-    /// minus `halt_on_loss_usd_1e6` while flat.
+    /// E7 session bound: the account's equity at cost fell to the
+    /// anchor minus `halt_on_loss_usd_1e6`.
     PnlLoss = 9,
+    /// **BX3** The venue imposed a restriction on the account (a 418
+    /// ban, reduce-only, a region lock, the options `REDUCE_ONLY` risk
+    /// level, a fired dead-man, a mode or permission change). Not
+    /// `BudgetFloor`, which means OUR governor hit its floor — naming a
+    /// venue restriction the same way would be the defect shape E6
+    /// recorded, a name describing a different property than it tests.
+    VenueLock = 10,
+    /// **BX3 (D6)** The arm judged a margin ratio at or past the slot's
+    /// `halt_on_margin_ratio_1e6`, or saw a `MARGIN_CALL`.
+    MarginRisk = 11,
+    /// XH4d, XH-7: post-only crosses reached `halt_on_alo_reject_pct`
+    /// of the arm's last ALO answers — the quotes are priced into a
+    /// book that is not there.
+    AloRejectRate = 12,
+    /// XH4d: the arm's order gateway halted (its halt word). No
+    /// threshold: it places for nobody and may have lost an event.
+    GatewayHalt = 13,
 }
 
 impl HaltReason {
@@ -105,6 +141,10 @@ impl HaltReason {
             HaltReason::ReconStale => "recon-stale",
             HaltReason::PnlGain => "pnl-gain",
             HaltReason::PnlLoss => "pnl-loss",
+            HaltReason::VenueLock => "venue-lock",
+            HaltReason::MarginRisk => "margin-risk",
+            HaltReason::AloRejectRate => "alo-reject-rate",
+            HaltReason::GatewayHalt => "gateway-halt",
         }
     }
 
@@ -128,6 +168,10 @@ impl HaltReason {
             "recon-stale" => HaltReason::ReconStale,
             "pnl-gain" => HaltReason::PnlGain,
             "pnl-loss" => HaltReason::PnlLoss,
+            "venue-lock" => HaltReason::VenueLock,
+            "margin-risk" => HaltReason::MarginRisk,
+            "alo-reject-rate" => HaltReason::AloRejectRate,
+            "gateway-halt" => HaltReason::GatewayHalt,
             _ => HaltReason::Operator,
         }
     }
@@ -256,6 +300,17 @@ pub fn parse_halt_file(text: &str) -> [HaltReason; EXEC_SLOTS] {
 /// cheapest and most specific comes first.
 #[must_use]
 pub fn trigger_for(sig: &HaltSignal, lim: &HaltLimits) -> HaltReason {
+    // BX3: the venue's own verdicts FIRST. Neither has a per-slot
+    // threshold here (the lock is the venue's decision; the margin
+    // threshold is the arm's, O-BX18), and both come before the reject
+    // streak because a locked account produces a streak of rejects as
+    // its symptom — the reason to read is the lock.
+    if sig.venue_lock != 0 {
+        return HaltReason::VenueLock;
+    }
+    if sig.margin_risk != 0 {
+        return HaltReason::MarginRisk;
+    }
     if lim.reject_streak > 0 && sig.reject_streak >= lim.reject_streak {
         return HaltReason::RejectStreak;
     }
@@ -268,6 +323,18 @@ pub fn trigger_for(sig: &HaltSignal, lim: &HaltLimits) -> HaltReason {
     // with no allowance left cannot place for anybody.
     if sig.budget_floor_breached != 0 {
         return HaltReason::BudgetFloor;
+    }
+    // XH4d: the arm's order gateway halted. No threshold either: it
+    // places for nobody, and an event it could not deliver may be lost —
+    // the arm no longer knows what rests, and the halt's sweep is the
+    // one thing a halted gateway still does.
+    if sig.gateway_halted != 0 {
+        return HaltReason::GatewayHalt;
+    }
+    // XH4d, XH-7: a post-only cross is information, never a reject —
+    // until it is most of what the quotes meet.
+    if lim.alo_reject_permille > 0 && sig.alo_reject_permille >= lim.alo_reject_permille {
+        return HaltReason::AloRejectRate;
     }
     if lim.recon_drift_usd_1e6 > 0 && sig.recon_drift_usd_1e6 >= lim.recon_drift_usd_1e6 {
         return HaltReason::ReconDrift;
@@ -294,11 +361,12 @@ pub fn trigger_for(sig: &HaltSignal, lim: &HaltLimits) -> HaltReason {
     }
     // E7 session bound — last, because it is the operator's stopping
     // rule and not a fault: when a fault and the bound coincide the
-    // fault is the thing to read. Judged only while FLAT (the arm
-    // reports `pnl_flat` = anchor set AND no outcome leg held), so a
-    // position's premium never reads as a loss and a payout not yet
-    // settled never reads as a gain.
-    if sig.pnl_flat != 0 {
+    // fault is the thing to read. Judged whenever the arm reports
+    // `pnl_judged` (anchored, and the account read since boot). The
+    // arm values held legs at cost, so a position's premium never
+    // reads as a loss and a payout not yet settled never reads as a
+    // gain — and a book that is never flat is still judged (S7-L1).
+    if sig.pnl_judged != 0 {
         if lim.pnl_gain_usd_1e6 > 0 && sig.pnl_delta_usd_1e6 >= lim.pnl_gain_usd_1e6 {
             return HaltReason::PnlGain;
         }
@@ -309,7 +377,7 @@ pub fn trigger_for(sig: &HaltSignal, lim: &HaltLimits) -> HaltReason {
     HaltReason::None
 }
 
-/// No cancel-all owed for this slot.
+/// No cancel owed for this slot.
 const CANCEL_NONE: u8 = 0;
 /// Latched, and the arm has not been asked yet.
 const CANCEL_WANTED: u8 = 1;
@@ -324,7 +392,7 @@ const CANCEL_RETRY: u8 = 3;
 pub enum CancelPhase {
     /// Nothing outstanding.
     None,
-    /// Ask the arm to cancel everything.
+    /// Ask the arm to cancel this slot's orders.
     Wanted,
     /// Already asked; poll for confirmation.
     Asked,
@@ -344,11 +412,12 @@ pub enum CancelPhase {
 pub struct HaltState {
     /// Index = `strategy_id`. Why each slot halted.
     reasons: [HaltReason; EXEC_SLOTS],
-    /// **Where this slot is in the cancel-all cycle.**
+    /// **Where this slot is in its cancel cycle** (per slot since XH5a:
+    /// each halted slot's cancel is its own request).
     ///
-    /// Index = `strategy_id`, one of [`CANCEL_NONE`],
-    /// [`CANCEL_WANTED`], [`CANCEL_ASKED`]. Three-valued because a
-    /// cancel-all on a real venue is a request and a confirmation
+    /// Index = `strategy_id`, one of [`CANCEL_NONE`], [`CANCEL_WANTED`],
+    /// [`CANCEL_ASKED`], [`CANCEL_RETRY`]. More than a `bool` because a
+    /// cancel on a real venue is a request and a confirmation
     /// separated by minutes, and the caller's job differs between
     /// them: `WANTED` means ask the arm, `ASKED` means poll it.
     ///
@@ -358,7 +427,7 @@ pub struct HaltState {
     pending_cancel: [u8; EXEC_SLOTS],
     /// Halt edges, total. One per slot that ever halted.
     pub halts: u64,
-    /// Cancel-all REQUESTS the arm would not accept.
+    /// Cancel REQUESTS the arm would not accept (per slot since XH5a).
     pub cancel_all_failures: u64,
     /// **Polls on which the arm reported it had given up** — a sweep
     /// abandoned, or a leg it could never queue — and the router
@@ -420,8 +489,7 @@ impl HaltState {
         self.reason(slot).is_halted()
     }
 
-    /// Is ANY slot halted? Decides whether the idle path has a
-    /// cancel-all to retry.
+    /// Is ANY slot halted?
     #[inline]
     #[must_use]
     pub fn any_halted(&self) -> bool {
@@ -451,8 +519,8 @@ impl HaltState {
     }
 
     /// **Latch a halt. Returns `true` on the EDGE** — the first time
-    /// this slot halts — so the caller fires cancel-all once per
-    /// incident rather than once per poll.
+    /// this slot halts — so the caller asks for the slot's cancel once
+    /// per incident rather than once per poll.
     ///
     /// Sticky: a slot already halted keeps its FIRST reason. The ones
     /// after it describe the same incident, and an operator wants to
@@ -470,75 +538,60 @@ impl HaltState {
         true
     }
 
-    /// The venue confirmed it holds nothing for us.
+    /// The venue confirmed it holds nothing of `slot`'s.
     #[inline]
-    pub fn cancel_cleared(&mut self) {
-        self.pending_cancel = [CANCEL_NONE; EXEC_SLOTS];
+    pub fn cancel_cleared(&mut self, slot: usize) {
+        if slot < EXEC_SLOTS {
+            self.pending_cancel[slot] = CANCEL_NONE;
+        }
     }
 
-    /// The request has gone to the arm; from here the caller polls
+    /// `slot`'s request has gone to the arm; from here the caller polls
     /// rather than asks.
     #[inline]
-    pub fn cancel_requested(&mut self) {
-        let mut i = 0usize;
-        while i < EXEC_SLOTS {
-            if self.pending_cancel[i] == CANCEL_WANTED || self.pending_cancel[i] == CANCEL_RETRY {
-                self.pending_cancel[i] = CANCEL_ASKED;
-            }
-            i += 1;
+    pub fn cancel_requested(&mut self, slot: usize) {
+        if slot < EXEC_SLOTS
+            && (self.pending_cancel[slot] == CANCEL_WANTED
+                || self.pending_cancel[slot] == CANCEL_RETRY)
+        {
+            self.pending_cancel[slot] = CANCEL_ASKED;
         }
     }
 
-    /// **What the caller owes the arm right now.**
-    ///
-    /// `Wanted` beats `Retry` beats `Asked`: a slot that halted while
-    /// another slot's sweep was already draining needs its own legs
-    /// requested, and a cancel-all is venue-wide, so one fresh
-    /// request covers both.
+    /// **What the caller owes the arm for `slot` right now** (XH5a:
+    /// each slot's cycle is its own). A slot that halts while another's
+    /// sweep is draining is `Wanted` on its own — its orders were not
+    /// in that request.
     #[inline]
     #[must_use]
-    pub fn cancel_phase(&self) -> CancelPhase {
-        let mut asked = false;
-        let mut retry = false;
-        let mut i = 0usize;
-        while i < EXEC_SLOTS {
-            match self.pending_cancel[i] {
-                CANCEL_WANTED => return CancelPhase::Wanted,
-                CANCEL_RETRY => retry = true,
-                CANCEL_ASKED => asked = true,
-                _ => {}
-            }
-            i += 1;
+    pub fn cancel_phase(&self, slot: usize) -> CancelPhase {
+        if slot >= EXEC_SLOTS {
+            return CancelPhase::None;
         }
-        if retry {
-            CancelPhase::Retry
-        } else if asked {
-            CancelPhase::Asked
-        } else {
-            CancelPhase::None
+        match self.pending_cancel[slot] {
+            CANCEL_WANTED => CancelPhase::Wanted,
+            CANCEL_ASKED => CancelPhase::Asked,
+            CANCEL_RETRY => CancelPhase::Retry,
+            _ => CancelPhase::None,
         }
     }
 
-    /// A `cancel_all` REQUEST did not land (refused outright, or only
-    /// partially queued). Every slot that was `ASKED` goes back to
-    /// `WANTED`, so the NEXT poll asks again rather than confirming.
+    /// `slot`'s REQUEST did not land (refused outright, or only
+    /// partially queued): `ASKED` goes back to `RETRY`, so the NEXT poll
+    /// asks again rather than confirming.
     ///
-    /// The first cut left them `ASKED` on the premise that the next
-    /// poll would read `Stranded` and re-ask — but the arm reported
-    /// `Clear` once the legs it DID queue drained, and the router then
-    /// zeroed every slot's resting count over quotes still live at the
-    /// venue: the commit-3 fail-open, back through the `QueueFull`
-    /// door (E7 review, 2026-09-19). A refused request is re-requested
-    /// by construction now, whatever the arm's state machine says.
+    /// The first cut left it `ASKED` on the premise that the next poll
+    /// would read `Stranded` and re-ask — but the arm reported `Clear`
+    /// once the legs it DID queue drained, and the router then zeroed
+    /// the resting count over quotes still live at the venue: the
+    /// commit-3 fail-open, back through the `QueueFull` door (E7
+    /// review, 2026-09-19). A refused request is re-requested by
+    /// construction, whatever the arm's state machine says.
     #[inline]
-    pub fn cancel_failed(&mut self) {
+    pub fn cancel_failed(&mut self, slot: usize) {
         self.cancel_all_failures = self.cancel_all_failures.saturating_add(1);
-        let mut i = 0usize;
-        while i < EXEC_SLOTS {
-            if self.pending_cancel[i] == CANCEL_ASKED {
-                self.pending_cancel[i] = CANCEL_RETRY;
-            }
-            i += 1;
+        if slot < EXEC_SLOTS && self.pending_cancel[slot] == CANCEL_ASKED {
+            self.pending_cancel[slot] = CANCEL_RETRY;
         }
     }
 
@@ -626,11 +679,12 @@ mod tests {
         assert_eq!(trigger_for(&s, &lim()), HaltReason::AssetRefusals);
     }
 
-    /// **E7 session bound.** Judged only while the arm reports FLAT;
-    /// the gain side at `>=`, the loss side at `<=`; a zero limit is
-    /// no bound; and a fault outranks the bound when both hold.
+    /// **E7 session bound.** Judged only while the arm reports it
+    /// judgeable (anchored and read since boot); the gain side at
+    /// `>=`, the loss side at `<=`; a zero limit is no bound; and a
+    /// fault outranks the bound when both hold.
     #[test]
-    fn the_session_bound_halts_only_when_flat_and_only_where_the_operator_wrote() {
+    fn the_session_bound_halts_only_when_judged_and_only_where_the_operator_wrote() {
         let bound = lim().with_pnl_bound(15_000_000, 5_000_000);
         let mut s = healthy().with_pnl(true, 14_999_999);
         assert_eq!(trigger_for(&s, &bound), HaltReason::None, "$14.999999 is not $15");
@@ -641,10 +695,10 @@ mod tests {
         s.pnl_delta_usd_1e6 = -5_000_000;
         assert_eq!(trigger_for(&s, &bound), HaltReason::PnlLoss);
 
-        // Not flat: the same delta is an open position's premium, not
-        // a loss, and no bound is judged.
-        s.pnl_flat = 0;
-        assert_eq!(trigger_for(&s, &bound), HaltReason::None, "an open leg has no P&L");
+        // Not judgeable (unanchored, or nothing read since boot): no
+        // bound is judged, at any delta.
+        s.pnl_judged = 0;
+        assert_eq!(trigger_for(&s, &bound), HaltReason::None, "not judged, not halted");
         s.pnl_delta_usd_1e6 = 40_000_000;
         assert_eq!(trigger_for(&s, &bound), HaltReason::None);
 
@@ -703,9 +757,10 @@ mod tests {
         assert_eq!(trigger_for(&s, &none), HaltReason::None);
     }
 
-    /// The budget floor is the ONE trigger with no per-slot threshold:
-    /// an address with no allowance left cannot place for anybody, so
-    /// a slot cannot opt out of it.
+    /// The budget floor and the gateway halt are the two triggers with
+    /// no per-slot threshold: an address with no allowance left, or a
+    /// gateway that stopped, cannot place for anybody, so a slot cannot
+    /// opt out of them.
     #[test]
     fn the_budget_floor_fires_even_with_every_threshold_unset() {
         let mut s = healthy();
@@ -713,6 +768,38 @@ mod tests {
         assert_eq!(
             trigger_for(&s, &HaltLimits::none()),
             HaltReason::BudgetFloor
+        );
+    }
+
+    #[test]
+    fn a_halted_gateway_halts_the_slot_with_every_threshold_unset() {
+        let s = healthy().with_gateway_halted(true);
+        assert_eq!(
+            trigger_for(&s, &HaltLimits::none()),
+            HaltReason::GatewayHalt
+        );
+        assert_eq!(
+            trigger_for(&healthy(), &HaltLimits::none()),
+            HaltReason::None
+        );
+    }
+
+    #[test]
+    fn the_alo_rate_halts_at_the_operator_s_permille_and_never_when_unset() {
+        let alo = lim().with_alo_reject_permille(500);
+        let s = healthy().with_alo_reject_permille(499);
+        assert_eq!(trigger_for(&s, &alo), HaltReason::None, "under the line");
+        let s = healthy().with_alo_reject_permille(500);
+        assert_eq!(trigger_for(&s, &alo), HaltReason::AloRejectRate);
+        let s = healthy().with_alo_reject_permille(1_000);
+        assert_eq!(trigger_for(&s, &lim()), HaltReason::None, "0 = off");
+        assert_eq!(
+            HaltReason::from_word(HaltReason::AloRejectRate.as_str()),
+            HaltReason::AloRejectRate
+        );
+        assert_eq!(
+            HaltReason::from_word(HaltReason::GatewayHalt.as_str()),
+            HaltReason::GatewayHalt
         );
     }
 
@@ -781,8 +868,47 @@ mod tests {
         assert!(!h.cancel_outstanding());
         h.latch(3, HaltReason::WsGap);
         assert!(h.cancel_outstanding(), "the venue still holds our orders");
-        h.cancel_cleared();
+        h.cancel_cleared(3);
         assert!(!h.cancel_outstanding());
+    }
+
+    /// XMM XH5a: each halted slot's cancel is its own cycle — asked,
+    /// failed, retried and cleared without touching another slot's.
+    #[test]
+    fn each_slot_s_cancel_runs_its_own_cycle() {
+        let mut h = HaltState::new();
+        h.latch(3, HaltReason::RejectStreak);
+        h.latch(6, HaltReason::WsGap);
+        assert_eq!(h.cancel_phase(3), CancelPhase::Wanted);
+        assert_eq!(h.cancel_phase(6), CancelPhase::Wanted);
+        assert_eq!(h.cancel_phase(0), CancelPhase::None, "never halted");
+        h.cancel_requested(3);
+        assert_eq!(h.cancel_phase(3), CancelPhase::Asked);
+        assert_eq!(h.cancel_phase(6), CancelPhase::Wanted, "6 not asked yet");
+        h.cancel_failed(3);
+        assert_eq!(h.cancel_phase(3), CancelPhase::Retry);
+        assert_eq!(h.cancel_all_failures, 1);
+        h.cancel_failed(6);
+        assert_eq!(
+            h.cancel_phase(6),
+            CancelPhase::Wanted,
+            "a failure only moves an ASKED slot"
+        );
+        h.cancel_requested(6);
+        h.cancel_cleared(6);
+        assert_eq!(h.cancel_phase(6), CancelPhase::None);
+        assert!(h.cancel_outstanding(), "3 still owes its cancel");
+        h.cancel_requested(3);
+        h.cancel_cleared(3);
+        assert!(!h.cancel_outstanding());
+        assert!(
+            h.is_halted(3) && h.is_halted(6),
+            "clearing a cancel un-halts nothing"
+        );
+        // Out of range: no slot, no phase, nothing moved.
+        h.cancel_requested(EXEC_SLOTS);
+        h.cancel_cleared(EXEC_SLOTS);
+        assert_eq!(h.cancel_phase(EXEC_SLOTS), CancelPhase::None);
     }
 
     #[test]
@@ -873,6 +999,13 @@ mod tests {
             HaltReason::WsGap,
             HaltReason::AssetRefusals,
             HaltReason::Operator,
+            HaltReason::ReconStale,
+            HaltReason::PnlGain,
+            HaltReason::PnlLoss,
+            HaltReason::VenueLock,
+            HaltReason::MarginRisk,
+            HaltReason::AloRejectRate,
+            HaltReason::GatewayHalt,
         ];
         let mut i = 0usize;
         while i < all.len() {
@@ -886,7 +1019,49 @@ mod tests {
                 j += 1;
             }
             assert!(!all[i].as_str().is_empty());
+            // Every word reads back as its reason (`none` excepted: it
+            // is never written to the file).
+            if all[i] != HaltReason::None {
+                assert_eq!(HaltReason::from_word(all[i].as_str()), all[i]);
+            }
             i += 1;
         }
+    }
+
+    /// BX3: the venue's verdicts halt with their own reason, and ahead
+    /// of the reject streak a lock produces as its symptom.
+    #[test]
+    fn a_venue_lock_or_margin_risk_halts_before_the_streak_it_causes() {
+        let lim = HaltLimits::new(5, 5_000_000, 30_000, 3, 300_000);
+        let base = HaltSignal::new(1_000_000, 0, 9, 0, false, true, 1_000_000);
+        assert_eq!(trigger_for(&base, &lim), HaltReason::RejectStreak);
+        assert_eq!(
+            trigger_for(&base.with_venue(true, false), &lim),
+            HaltReason::VenueLock
+        );
+        assert_eq!(
+            trigger_for(&base.with_venue(false, true), &lim),
+            HaltReason::MarginRisk
+        );
+        assert_eq!(
+            trigger_for(&base.with_venue(true, true), &lim),
+            HaltReason::VenueLock
+        );
+        let quiet = HaltSignal::new(1_000_000, 0, 0, 0, false, true, 1_000_000);
+        assert_eq!(trigger_for(&quiet, &lim), HaltReason::None);
+    }
+
+    /// BX3: both new words survive `exec.HALT`'s round trip.
+    #[test]
+    fn the_venue_verdicts_survive_the_halt_file() {
+        let mut reasons = [HaltReason::None; EXEC_SLOTS];
+        reasons[2] = HaltReason::VenueLock;
+        reasons[5] = HaltReason::MarginRisk;
+        let mut buf = [0u8; HALT_FILE_MAX];
+        let n = render_halt_file(&mut buf, &reasons);
+        let text = core::str::from_utf8(&buf[..n]).unwrap();
+        let back = parse_halt_file(text);
+        assert_eq!(back[2], HaltReason::VenueLock);
+        assert_eq!(back[5], HaltReason::MarginRisk);
     }
 }

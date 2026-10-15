@@ -24,6 +24,7 @@ import shutil
 import socket
 import tempfile
 import threading
+import time
 import types
 import typing
 
@@ -57,7 +58,11 @@ class FakeUdsServer:
         self.sock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._listener.bind(str(self.sock_path))
         self.sock_path.chmod(0o600)
-        self._listener.listen(1)
+        # HK8: a backlog of one refused a CLI invocation's connect while the
+        # previous one still waited to be accepted (the UDS-fixture "flakes"
+        # under load); the engine's own listener never sees back-to-back
+        # clients, so the fake must not be stricter than the code under test.
+        self._listener.listen(8)
         # Accept loop wakes regularly to observe the stop flag.
         self._listener.settimeout(0.05)
         self._thread = threading.Thread(target=self._run, name="fake-uds", daemon=True)
@@ -114,6 +119,19 @@ class FakeUdsServer:
             self.errors.append("hmac mismatch")
             return
         self.frames.append(cmd)
+
+    def wait_for_frames(self, count: int, timeout_s: float = 5.0) -> None:
+        """Block until ``count`` frames are recorded: the server reads on its
+        own thread, so a frame the client already sent can still be in
+        flight when the client returns (HK8)."""
+        deadline = time.monotonic() + timeout_s
+        while len(self.frames) < count:
+            if time.monotonic() > deadline:
+                raise AssertionError(
+                    f"fake server saw {len(self.frames)} frames, wanted {count};"
+                    f" errors={self.errors}"
+                )
+            time.sleep(0.01)
 
     def cmd_field(self, index: int, name: str) -> int:
         """Decode one field of recorded frame ``index`` (test sugar)."""

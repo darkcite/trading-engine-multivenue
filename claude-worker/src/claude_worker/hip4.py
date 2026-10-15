@@ -23,18 +23,36 @@ WHICH instance a slot meant at a time is the
 :func:`read_rolls` is how every offline consumer reads it; without it a
 captured slot sym is uninterpretable after the fact.
 
+**The settlement law** (BIN15 S1, LAW E-11 -- ``docs/risk-policy.md``
+"E8"). A HIP-4 binary settles on the TIME-weighted TWAP of the
+underlying's mark over ``[expiry - twap, expiry]``, ``>=`` the strike,
+under strict evidence. :func:`settle_reference_1e6` / :func:`payout_1e6`
+/ :func:`link_successors` / :func:`y_next_strike` are the PYTHON MIRROR
+of ``cli::backtest::binary``'s -- the first two pinned against it by the
+shared fixture ``tests/fixtures/bin15/settle-1.{input,expected}.tsv``,
+the last two by the worker's own tests; the accrual's
+``relabel`` lane (BIN15 S4) and every research reader label instances
+through them, so no reader restates the window.
+
 Offline only -- nothing here runs in the engine.
 """
 
+import bisect
 import dataclasses
+import itertools
 import pathlib
 import statistics
 import typing
 
+import claude_worker.bin15_ref
 import claude_worker.pmlr
 
 #: Ticks sampled when fitting the venue-wall offset (BIN15 O10).
 _OFFSET_SAMPLES: int = 4000
+
+#: The HARNESS's sample: the first N stamped Hyperliquid ticks
+#: (``cli::backtest::clock::VENUE_OFFSET_SAMPLES``, BIN15 S2).
+HARNESS_OFFSET_SAMPLES: int = 64
 
 #: Grammar of a parsed description -- mirrors ``HlOutcomeGrammar``.
 GRAMMAR_UNKNOWN: int = 0
@@ -266,20 +284,57 @@ def venue_wall_offset_ns(run_dir: pathlib.Path) -> int | None:
     f = run_dir / "hl-ticks.pmlr"
     if not f.is_file():
         return None
-    offs: list[int] = []
     try:
         with claude_worker.pmlr.Reader(f) as reader:
             if not reader.has_venue_time or len(reader) == 0:
                 return None
             n = len(reader)
             step = max(1, n // _OFFSET_SAMPLES)
-            for i in range(0, n, step):
-                tick = reader.tick(i)
-                if tick.venue_time_ms:
-                    offs.append(tick.venue_time_ms * 1_000_000 - tick.ts_ns)
+            return venue_offset_from_samples(
+                (t.venue_time_ms, t.ts_ns)
+                for t in (reader.tick(i) for i in range(0, n, step))
+            )
     except (claude_worker.pmlr.PmlrError, OSError, ValueError):
         return None
+
+
+def venue_offset_from_samples(pairs: typing.Iterable[tuple[int, int]]) -> int | None:
+    """``int(median(venue_time_ms·1e6 − ts_ns))`` over ``(venue_time_ms,
+    ts_ns)`` pairs, unstamped ones (``venue_time_ms == 0``) skipped;
+    ``None`` with none -- the law :func:`venue_wall_offset_ns` applies to
+    its 4 000-tick sample of a file."""
+    offs = [v * 1_000_000 - ts for v, ts in pairs if v]
     return int(statistics.median(offs)) if offs else None
+
+
+def venue_offset_first_n(
+    pairs: typing.Iterable[tuple[int, int]], n: int = HARNESS_OFFSET_SAMPLES
+) -> int | None:
+    """The HARNESS's law (``cli::backtest::clock::VenueOffsetFit``, BIN15
+    S2), mirrored exactly: the median of the FIRST ``n`` stamped pairs in
+    file order -- on an even count the mean of the two middle ones,
+    truncated toward zero as Rust's integer division does. Integer
+    throughout (a float median of 1.8e18-sized numbers is off by up to
+    ~100 ns)."""
+    offs: list[int] = []
+    for v, ts in pairs:
+        if not v:
+            continue
+        d = v * 1_000_000 - ts
+        # Rust drops a difference that leaves i64 rather than wrapping it.
+        if d < -(2**63) or d > 2**63 - 1:
+            continue
+        offs.append(d)
+        if len(offs) == n:
+            break
+    if not offs:
+        return None
+    offs.sort()
+    mid = len(offs) // 2
+    if len(offs) % 2 == 1:
+        return offs[mid]
+    s = offs[mid - 1] + offs[mid]
+    return s // 2 if s >= 0 else -((-s) // 2)
 
 
 def open_at_end(run_dir: pathlib.Path) -> list[Roll]:
@@ -370,3 +425,137 @@ def instance_at(rolls: typing.Iterable[Roll], sym: int, ts_ns: int) -> Roll | No
         if best is None or r.ts_ns > best.ts_ns:
             best = r
     return best
+
+
+# ---------------------------------------------------------------------------
+# The settlement law (BIN15 S1, LAW E-11) -- mirrored from cli::backtest::binary
+# ---------------------------------------------------------------------------
+
+#: ``cli::backtest::binary::SETTLE_MIN_MARKS`` -- marks INSIDE the window.
+SETTLE_MIN_MARKS: int = 3
+
+#: ``core_types::BINARY_SETTLE_MARK_GAP_MAX_NS`` -- the longest one mark may
+#: stand for the venue's series across the window (the whole piece counts).
+SETTLE_MARK_GAP_MAX_NS: int = 10_000_000_000
+
+#: ``cli::backtest::binary::SUCCESSOR_MAX_LAG_NS``.
+SUCCESSOR_MAX_LAG_NS: int = 120_000_000_000
+
+#: ``cli::backtest::binary::Y_NEXT_STRIKE_UNKNOWN``.
+Y_NEXT_STRIKE_UNKNOWN: int = -1
+
+#: A payout ×1e6: the leg won.
+PAYOUT_ITM_1E6: int = 1_000_000
+
+
+def settle_reference_1e6(
+    ts: typing.Sequence[int],
+    px: typing.Sequence[int],
+    expiry_ns: int,
+    twap_ns: int,
+) -> int | None:
+    """``cli::backtest::binary::settle_reference_1e6`` -- the settlement
+    price ×1e6, or ``None`` when the evidence is not there.
+
+    ``ts`` / ``px`` are the underlying's marks on the VENUE clock,
+    ascending in ``ts`` (a stable sort of the capture). The window is
+    ``[expiry - twap, expiry]``; each mark counts for as long as it was
+    the mark (:func:`claude_worker.bin15_ref.binary_twap_segment`, the
+    engine's own piece), the last one before the open carries into it and
+    the last one inside carries to the expiry. Strict evidence, as the
+    harness: a mark in force AT the open; no piece spanning the window
+    longer than :data:`SETTLE_MARK_GAP_MAX_NS` (the carry-in and the carry
+    to the expiry included); at least :data:`SETTLE_MIN_MARKS` marks
+    inside. One truncating divide at the end (Rust's ``i128 /``).
+    ``twap_ns == 0``: the last mark at or before the expiry.
+    """
+    close = expiry_ns
+    if twap_ns == 0:
+        end = bisect.bisect_right(ts, close)
+        return None if end == 0 else int(px[end - 1])
+    open_ns = max(close - twap_ns, 0)
+    first = bisect.bisect_right(ts, open_ns)
+    if first == 0:
+        return None
+    k = first - 1
+    since = int(ts[k])
+    cur = int(px[k])
+    k += 1
+    total = 0
+    inside = 1 if since == open_ns else 0
+    n = len(ts)
+    while k < n:
+        t = int(ts[k])
+        if t > close:
+            break
+        if t - since > SETTLE_MARK_GAP_MAX_NS:
+            return None
+        total += claude_worker.bin15_ref.binary_twap_segment(cur, since, t, open_ns, close)[0]
+        inside += 1
+        since = t
+        cur = int(px[k])
+        k += 1
+    if close - since > SETTLE_MARK_GAP_MAX_NS:
+        return None
+    total += claude_worker.bin15_ref.binary_twap_segment(cur, since, close, open_ns, close)[0]
+    if inside < SETTLE_MIN_MARKS:
+        return None
+    width = close - open_ns
+    q = abs(total) // width
+    return q if total >= 0 else -q
+
+
+def payout_1e6(reference_1e6: int, strike_1e6: int) -> int:
+    """``cli::backtest::binary::payout_1e6`` -- ``>=`` settles in the money."""
+    return PAYOUT_ITM_1E6 if reference_1e6 >= strike_1e6 else 0
+
+
+def y_next_strike(strike_1e6: int, next_strike_1e6: int) -> int:
+    """``BinaryInstance::y_next_strike`` -- the VENUE-published label: the
+    successor's strike is the venue's settlement price (rounded to the
+    strike grid). :data:`Y_NEXT_STRIKE_UNKNOWN` when there is no successor
+    or it rounded onto the strike (a tie is excluded, never guessed)."""
+    if next_strike_1e6 <= 0 or next_strike_1e6 == strike_1e6:
+        return Y_NEXT_STRIKE_UNKNOWN
+    return PAYOUT_ITM_1E6 if next_strike_1e6 > strike_1e6 else 0
+
+
+@dataclasses.dataclass(slots=True)
+class Instance:
+    """One created HIP-4 instance on the venue clock -- the fields
+    ``cli::backtest::binary::BinaryInstance`` carries, with the slot named
+    by its DESCRIPTOR (a sym means nothing across runs)."""
+
+    outcome: int
+    slot: str
+    strike_1e6: int
+    expiry_ns: int
+    twap_ns: int
+    created_ns: int
+    next_strike_1e6: int = 0
+
+    @property
+    def settle_open_ns(self) -> int:
+        return max(self.expiry_ns - self.twap_ns, 0)
+
+
+def link_successors(insts: typing.Sequence[Instance]) -> None:
+    """``cli::backtest::binary::link_successors``: set each instance's
+    ``next_strike_1e6`` from the next created instance of the SAME slot
+    with a later expiry, created between this one's window open and
+    :data:`SUCCESSOR_MAX_LAG_NS` after its expiry (anything else is a
+    capture gap). Order-independent: visited by ``(slot, created, expiry)``."""
+    order = sorted(
+        range(len(insts)), key=lambda k: (insts[k].slot, insts[k].created_ns, insts[k].expiry_ns)
+    )
+    for a, b in itertools.pairwise(order):
+        prev = insts[a]
+        nxt = insts[b]
+        if (
+            prev.slot == nxt.slot
+            and nxt.expiry_ns > prev.expiry_ns
+            and nxt.created_ns >= prev.settle_open_ns
+            and nxt.created_ns <= prev.expiry_ns + SUCCESSOR_MAX_LAG_NS
+            and nxt.strike_1e6 > 0
+        ):
+            prev.next_strike_1e6 = nxt.strike_1e6

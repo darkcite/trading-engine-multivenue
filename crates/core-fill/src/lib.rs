@@ -42,6 +42,12 @@
 //!   record's fill evidence is read: the bar has closed, and a fill now
 //!   would belong to the next one. `ttl_ns == 0` never expires.
 //!
+//! * **Post-only makers on a queue venue (XMM XH2)** — an order flagged
+//!   [`core_types::ORDER_FLAG_POST_ONLY`] on a venue where
+//!   [`queue_venue`] holds (Hyperliquid) — are judged by the queue law
+//!   instead of strict cross: module [`queue`] states it, and
+//!   [`judged_by_queue`] is the one selector both consumers call.
+//!
 //! ## Doctrine
 //!
 //! * **No allocation, no floats, no panics.** Every function here is a
@@ -49,10 +55,27 @@
 //! * **The activation table is a MEASUREMENT** ([`ACTIVATION_NS_DEFAULT`]),
 //!   not an assumption, and it is per deployment and per location.
 //! * This crate knows nothing about fees, marks, P&L or settlement.
-//!   Those are the harness's ledger and stay there.
+//!   Those are the harness's ledger and stay there. (The one exception
+//!   is the AMM pool fee, which is part of a swap's execution PRICE on
+//!   chain and so rides in the fill price — module [`amm`].)
+//! * **AMM swaps (HYPARB H2)** are judged against pool state rebuilt
+//!   from the pool-event tape, by [`AmmBook`] — module [`amm`] states
+//!   that law.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+
+pub mod amm;
+pub mod queue;
+/// HC11 (O-HC21): Hypercall's held-quote IoC law — the quote in force
+/// 2 s after submit decides.
+pub mod held;
+
+pub use amm::{amm_pool_index, AmmBook, AmmBookCounters, AmmObs, AmmVerdict, AMM_MAX_POOLS};
+pub use queue::{
+    QueueBook, QueueCounters, QueueEvent, QueueOrder, QueuePlace, QueueRefusal, QUEUE_AHEAD_UNKNOWN,
+    QUEUE_EVENT_FILL, QUEUE_MAX_ORDERS, QUEUE_MAX_SYMS, QUEUE_NEVER, QUEUE_OUT_CAP,
+};
 
 use core_types::{Side, Tick};
 
@@ -61,6 +84,32 @@ pub const ORDER_KIND_MAKER: u8 = 0;
 /// `Order.kind` of an immediate-or-cancel taker (I1; ICDP's, XSD's and
 /// the VRP member's primitive).
 pub const ORDER_KIND_IOC: u8 = 1;
+/// `Order.kind` of an AMM swap against a pool (HYPARB H2): judged once
+/// against pool state, never rests — the law is module [`amm`]'s.
+pub const ORDER_KIND_AMM_SWAP: u8 = 2;
+
+/// HK-R4: the Binance European options' ordinal block —
+/// `core_config::universe::BN_OPT_ORDINAL_BASE` + 1 up to
+/// `BN_DATED_ORDINAL_BASE` (the cli const-asserts the pair; this crate
+/// stays below `core-config`).
+pub const BN_OPTION_ORDINALS: core::ops::Range<u32> = 1_025..2_048;
+
+/// HK-R4: a symbol that is a signal and reference leg only, never an
+/// order this model executes — the Binance European options. They are in
+/// the AI boot universe as signal legs (the O-HC17 shape), and the v2
+/// grammar's descriptor table resolved them before that; their BBO ticks
+/// would otherwise fill a paper order the venue never saw. The paper
+/// matcher and the harness refuse an order on one as `unroutable`. Paper
+/// only: a LIVE Binance slot's option order goes to the arm and never
+/// meets this predicate — and no member arms one (ruling O-BX6).
+#[inline]
+#[must_use]
+pub const fn signal_only_sym(sym: core_types::SymbolId) -> bool {
+    let ord = core_types::symbol_ordinal(sym);
+    core_types::symbol_venue_byte(sym) == core_types::VenueId::Binance as u8
+        && ord >= BN_OPTION_ORDINALS.start
+        && ord < BN_OPTION_ORDINALS.end
+}
 
 /// Open orders one sym may hold at once.
 pub const MAX_OPEN_PER_SYM: usize = 8;
@@ -81,12 +130,25 @@ const MS: u64 = 1_000_000;
 /// deribit 108 + 208/2 → 220 ms · hl 272 + 124/2 → 340 ms ·
 /// bybit 29 + 44/2 → 60 ms. Polymarket's CLOB feed is UNMEASURED (the
 /// socket needs an asset id), so the §4.4 assumption of 200 ms stands
-/// there. Index 5 is `Ai`, a dead slot.
+/// there. Index 5 is `Ai`, a dead slot. Index 7 is MEXC, MEASURED
+/// 2026-09-23 07:24–07:34Z (MX9) on the same Mac / network: spot
+/// `aggre.bookTicker` 82 + 131/2 → 150 ms, futures `depth.full`
+/// 60 + 134/2 → 130 ms; one venue byte carries both classes, so the
+/// slower one binds (150). MEXC is data-only (O-MX1) — no fill model
+/// ever executes an order on it. Index 8 is HyperEVM (HYPARB, plan
+/// §6.3): **one block, not a network RTT** — a swap cannot land before
+/// the next block however fast the wire is (0.983 s measured, rounded
+/// up); modelling it as an RTT is the easiest way to invent edge.
+/// Index 9 is Hypercall, MEASURED 2026-09-25 21:05–21:15Z (HC0) on the
+/// same Mac / network: quote-stamp feed 64.3 + kept-alive RTT 113.7/2
+/// → 130 ms (the publish stamp alone gives 57.3 → 120). Hypercall is
+/// data-only (O-HC1) — no fill model executes an order on it until its
+/// own exec ruling.
 ///
 /// **RE-MEASURE ON EVERY DEPLOYMENT AND LOCATION.** One table, both
 /// consumers — the harness's `ModelParams::default()` reads it from
 /// here so a re-measurement cannot land in one and not the other.
-pub const ACTIVATION_NS_DEFAULT: [u64; 7] = [
+pub const ACTIVATION_NS_DEFAULT: [u64; core_types::VENUE_COUNT] = [
     200 * MS, // pm
     130 * MS, // bn
     130 * MS, // okx
@@ -94,7 +156,49 @@ pub const ACTIVATION_NS_DEFAULT: [u64; 7] = [
     340 * MS, // hl
     0,        // ai (dead)
     60 * MS,  // bybit
+    150 * MS, // mexc (spot binds; futures 130)
+    1_000 * MS, // hyperevm — ONE BLOCK (0.983 s measured, rounded up)
+    130 * MS,   // hypercall — quote-stamp feed 64 + RTT 114/2 (HC0)
 ];
+
+/// Venues whose post-only makers are judged by the queue law (module
+/// [`queue`]), per model venue byte. Only Hyperliquid: it is the one
+/// venue whose trade prints the engine and the harness replay, and a
+/// queue without prints can never fill. Every other venue keeps strict
+/// cross whatever the order's flags say (MEXC joins with its own prints,
+/// plan §7.2).
+pub const QUEUE_VENUE: [bool; core_types::VENUE_COUNT] = [
+    false, // pm
+    false, // bn
+    false, // okx
+    false, // deribit
+    true,  // hl
+    false, // ai (dead)
+    false, // bybit
+    false, // mexc (data-only)
+    false, // hyperevm (AMM law)
+    false, // hypercall (data-only)
+];
+
+/// Whether post-only makers on model venue byte `venue` are judged by
+/// the queue law. An unknown byte is not a queue venue.
+#[inline]
+#[must_use]
+pub const fn queue_venue(venue: u8) -> bool {
+    let v = venue as usize;
+    v < core_types::VENUE_COUNT && QUEUE_VENUE[v]
+}
+
+/// The one selector both consumers call: an order is judged by the queue
+/// law iff it is a maker ([`ORDER_KIND_MAKER`]) flagged
+/// [`core_types::ORDER_FLAG_POST_ONLY`] on a [`queue_venue`]. Anything
+/// else — every order any member placed before XH2 — keeps the law it
+/// had.
+#[inline]
+#[must_use]
+pub const fn judged_by_queue(venue: u8, kind: u8, flags: u8) -> bool {
+    kind == ORDER_KIND_MAKER && flags & core_types::ORDER_FLAG_POST_ONLY != 0 && queue_venue(venue)
+}
 
 /// The two sides of a book at one instant, ×1e6.
 #[repr(C)]
@@ -270,6 +374,21 @@ pub fn judge_maker(
 mod tests {
     use super::*;
     use core_types::{Price, Qty, SymbolId, VenueId};
+
+    /// HK-R4: exactly the Binance options block is signal-only — its
+    /// neighbours (usdm below, dated futures above), another venue's
+    /// option block and the legacy flat anchor are not.
+    #[test]
+    fn only_the_binance_option_block_is_signal_only() {
+        let bn = |o: u32| core_types::make_symbol_id(VenueId::Binance, o);
+        assert!(signal_only_sym(bn(1_025)));
+        assert!(signal_only_sym(bn(2_047)));
+        assert!(!signal_only_sym(bn(1_024)));
+        assert!(!signal_only_sym(bn(2_048)), "a dated future");
+        assert!(!signal_only_sym(bn(513)), "a usdm perp");
+        assert!(!signal_only_sym(core_types::make_symbol_id(VenueId::Deribit, 1_025)));
+        assert!(!signal_only_sym(7), "the legacy flat anchor");
+    }
 
     const SYM: SymbolId = 7;
 
@@ -491,8 +610,60 @@ mod tests {
         // can never drift apart.
         assert_eq!(
             ACTIVATION_NS_DEFAULT,
-            [200 * MS, 130 * MS, 130 * MS, 220 * MS, 340 * MS, 0, 60 * MS]
+            [
+                200 * MS,
+                130 * MS,
+                130 * MS,
+                220 * MS,
+                340 * MS,
+                0,
+                60 * MS,
+                150 * MS,
+                1_000 * MS,
+                130 * MS
+            ]
         );
-        assert_eq!(ACTIVATION_NS_DEFAULT[VenueId::Ai as usize], 0, "a dead slot");
+        assert_eq!(
+            ACTIVATION_NS_DEFAULT[VenueId::Ai as usize],
+            0,
+            "a dead slot"
+        );
+        // MX9: MEXC measured on the Mac 2026-09-23 — the slower class
+        // (spot 150) binds over futures (130).
+        assert_eq!(ACTIVATION_NS_DEFAULT[VenueId::Mexc as usize], 150 * MS);
+        // HYPARB: one block, never an RTT.
+        assert_eq!(
+            ACTIVATION_NS_DEFAULT[VenueId::HyperEvm as usize],
+            1_000 * MS
+        );
+        // HC0: Hypercall measured on the Mac 2026-09-25.
+        assert_eq!(ACTIVATION_NS_DEFAULT[VenueId::Hypercall as usize], 130 * MS);
+    }
+
+    #[test]
+    fn queue_venue_is_hyperliquid_only_and_unknown_bytes_are_not() {
+        assert!(queue_venue(VenueId::Hyperliquid as u8));
+        // Failure modes: every other venue, and a byte past the table.
+        let mut v = 0u8;
+        while (v as usize) < core_types::VENUE_COUNT {
+            assert_eq!(queue_venue(v), v == VenueId::Hyperliquid as u8, "venue byte {v}");
+            v += 1;
+        }
+        assert!(!queue_venue(core_types::VENUE_COUNT as u8));
+        assert!(!queue_venue(u8::MAX));
+    }
+
+    #[test]
+    fn judged_by_queue_needs_maker_post_only_and_a_queue_venue() {
+        let hl = VenueId::Hyperliquid as u8;
+        let po = core_types::ORDER_FLAG_POST_ONLY;
+        assert!(judged_by_queue(hl, ORDER_KIND_MAKER, po));
+        assert!(judged_by_queue(hl, ORDER_KIND_MAKER, po | core_types::ORDER_FLAG_REDUCE_ONLY));
+        // Failure modes: each of the three conditions alone flips it.
+        assert!(!judged_by_queue(hl, ORDER_KIND_MAKER, 0), "a plain maker keeps strict cross");
+        assert!(!judged_by_queue(hl, ORDER_KIND_MAKER, core_types::ORDER_FLAG_REDUCE_ONLY));
+        assert!(!judged_by_queue(hl, ORDER_KIND_IOC, po), "an IoC never rests");
+        assert!(!judged_by_queue(VenueId::Binance as u8, ORDER_KIND_MAKER, po));
+        assert!(!judged_by_queue(VenueId::HyperEvm as u8, ORDER_KIND_AMM_SWAP, po));
     }
 }

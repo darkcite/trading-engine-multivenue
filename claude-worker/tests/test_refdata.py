@@ -15,7 +15,6 @@ import claude_worker.fetchers
 import claude_worker.frames
 import claude_worker.refdata
 
-
 MS_1H = claude_worker.refdata.MS_1H
 NOW = 1_787_400_123_456  # mid-hour wall ms
 
@@ -34,6 +33,8 @@ def hosts() -> dict[str, str]:
         "deribit": "dbt.test",
         "hyperliquid": "hl.test",
         "bybit": "bybit.test",
+        "mexc": "mx.test",
+        "mexc-perp": "mxf.test",
     }
 
 
@@ -220,7 +221,7 @@ def test_cycle_bn_usdm_stores_vol_and_oi(tmp_path: pathlib.Path) -> None:
             ),
         }
     )
-    lines, report = report_sink()
+    _lines, report = report_sink()
     claude_worker.refdata.run_cycle(conn, lanes_bn_usdm(), http, NOW, 30, report)
     kinds = {(r[2], r[4]) for r in all_rows(conn)}
     assert kinds == {("vol24h_quote", 9e6), ("oi", 10659.5)}
@@ -237,7 +238,7 @@ def test_cycle_deribit_one_call_two_kinds(tmp_path: pathlib.Path) -> None:
             )
         }
     )
-    lines, report = report_sink()
+    _lines, report = report_sink()
     claude_worker.refdata.run_cycle(conn, lanes_deribit(), http, NOW, 30, report)
     kinds = {(r[2], r[4]) for r in all_rows(conn)}
     assert kinds == {("vol24h_quote", 219994260.0), ("oi", 686269060.0)}
@@ -314,7 +315,9 @@ def test_cycle_okx_vol_always_oi_derivatives_only(tmp_path: pathlib.Path) -> Non
             claude_worker.frames.VENUE_OKX, "okx:ETH-USDT-SWAP", "ETH-USDT-SWAP"
         ),
     ]
-    lanes = [claude_worker.candles.Lane("okx", claude_worker.frames.VENUE_OKX, targets, backward=True)]
+    lanes = [
+        claude_worker.candles.Lane("okx", claude_worker.frames.VENUE_OKX, targets, backward=True)
+    ]
     http, calls = http_map(
         {
             "https://okx.test/api/v5/market/ticker?instId=BTC-USDT": json.dumps(
@@ -395,7 +398,9 @@ def test_cycle_bybit_linear_one_call_vol_and_oi(tmp_path: pathlib.Path) -> None:
         claude_worker.frames.VENUE_BYBIT, "bybit-linear:BTCUSDT", "BTCUSDT"
     )
     lanes = [
-        claude_worker.candles.Lane("bybit", claude_worker.frames.VENUE_BYBIT, [spot_t], backward=False),
+        claude_worker.candles.Lane(
+            "bybit", claude_worker.frames.VENUE_BYBIT, [spot_t], backward=False
+        ),
         claude_worker.candles.Lane(
             "bybit-linear", claude_worker.frames.VENUE_BYBIT, [lin_t], backward=False
         ),
@@ -408,14 +413,12 @@ def test_cycle_bybit_linear_one_call_vol_and_oi(tmp_path: pathlib.Path) -> None:
             "https://bybit.test/v5/market/tickers?category=linear&symbol=BTCUSDT": json.dumps(
                 {
                     "retCode": 0,
-                    "result": {
-                        "list": [{"turnover24h": "222.5", "openInterest": "68744.761"}]
-                    },
+                    "result": {"list": [{"turnover24h": "222.5", "openInterest": "68744.761"}]},
                 }
             ),
         }
     )
-    lines, report = report_sink()
+    _lines, report = report_sink()
     claude_worker.refdata.run_cycle(conn, lanes, http, NOW, 30, report)
     assert len(calls) == 2
     rows = {(r[1], r[2], r[4]) for r in all_rows(conn)}
@@ -429,6 +432,72 @@ def test_cycle_bybit_linear_one_call_vol_and_oi(tmp_path: pathlib.Path) -> None:
     assert claude_worker.refdata.parse_bybit_ticker(err) is None
 
 
+#: MX7, measured live 2026-09-23 (trimmed): `GET contract.mexc.com/api/v1/
+#: contract/ticker?symbol=XAU_USDT` — BARE numbers, `data` an object.
+MEXC_PERP_TICKER = (
+    '{"success":true,"code":0,"data":{"contractId":1935,"symbol":"XAU_USDT",'
+    '"lastPrice":4332.05,"bid1":4332.05,"ask1":4332.08,"volume24":72391669,'
+    '"amount24":313985661.21342,"holdVol":82300176,"indexPrice":4329.61,'
+    '"fairPrice":4331.97,"fundingRate":0.000059,"timestamp":1790144201736}}'
+)
+#: `GET api.mexc.com/api/v3/ticker/24hr?symbol=BTCUSDT` (trimmed) — the
+#: Binance body, quoted decimals.
+MEXC_SPOT_TICKER = (
+    '{"symbol":"BTCUSDT","lastPrice":"86601.26","volume":"10102.14266626",'
+    '"quoteVolume":"870963232.08","openTime":1790144201042,"closeTime":1790144205082,'
+    '"count":null}'
+)
+
+
+def test_parse_mexc_ticker_live_shape_and_failures() -> None:
+    parse = claude_worker.refdata.parse_mexc_ticker
+    assert parse(MEXC_PERP_TICKER) == (313985661.21342, 82300176.0)
+    assert parse('{"success":false,"code":1001,"message":"Contract does not exist"}') is None
+    assert parse("junk") is None
+    assert parse('{"success":true,"code":0,"data":[]}') is None
+    # A quoted or boolean field is absent, never coerced.
+    assert parse('{"success":true,"code":0,"data":{"amount24":"1","holdVol":true}}') == (
+        None,
+        None,
+    )
+    # The spot 24 h ticker is the Binance body, read by the Binance parser.
+    assert claude_worker.refdata.parse_bn_ticker24h(MEXC_SPOT_TICKER) == 870963232.08
+
+
+def test_cycle_mexc_spot_vol_and_perp_vol_plus_oi(tmp_path: pathlib.Path) -> None:
+    # MX7: each class on its own host — spot stores vol only, the perp
+    # contract ticker stores vol + OI from one body.
+    conn = db(tmp_path)
+    mexc = claude_worker.frames.VENUE_MEXC
+    spot_t = claude_worker.candles.LaneTarget(mexc, "mexc:BTCUSDT", "BTCUSDT")
+    perp_t = claude_worker.candles.LaneTarget(mexc, "mexc-perp:XAU_USDT", "XAU_USDT")
+    lanes = [
+        claude_worker.candles.Lane("mexc", mexc, [spot_t], backward=False),
+        claude_worker.candles.Lane("mexc-perp", mexc, [perp_t], backward=False),
+    ]
+    http, calls = http_map(
+        {
+            "https://mx.test/api/v3/ticker/24hr?symbol=BTCUSDT": MEXC_SPOT_TICKER,
+            "https://mxf.test/api/v1/contract/ticker?symbol=XAU_USDT": MEXC_PERP_TICKER,
+        }
+    )
+    lines, report = report_sink()
+    claude_worker.refdata.run_cycle(conn, lanes, http, NOW, 30, report)
+    assert len(calls) == 2
+    rows = {(r[1], r[2], r[4]) for r in all_rows(conn)}
+    assert rows == {
+        ("mexc:BTCUSDT", "vol24h_quote", 870963232.08),
+        ("mexc-perp:XAU_USDT", "vol24h_quote", 313985661.21342),
+        ("mexc-perp:XAU_USDT", "oi", 82300176.0),
+    }
+    # A venue error envelope is a counted failure, not a crash.
+    http, _ = http_map({})
+    lines, report = report_sink()
+    claude_worker.refdata.run_cycle(conn, lanes, http, NOW, 30, report)
+    assert any("mexc: targets=1 rows=0 failed=1" in line for line in lines)
+    assert any("mexc-perp: targets=1 rows=0 failed=1" in line for line in lines)
+
+
 # ---- main shim -----------------------------------------------------------
 
 
@@ -438,3 +507,21 @@ def test_main_unusable_universe_exits_1(tmp_path: pathlib.Path) -> None:
         ["--universe", str(missing), "--db", str(tmp_path / "c.db"), "--now-ms", str(NOW)]
     )
     assert rc == 1
+
+
+def test_coinm_lane_is_reported_and_skipped(tmp_path: pathlib.Path) -> None:
+    """BX2: no v1 fetcher for dapi's 24 h body (module docs) — the lane is
+    reported and skipped: no request, no row, never a crash."""
+    conn = db(tmp_path)
+    target = claude_worker.candles.LaneTarget(
+        claude_worker.frames.VENUE_BINANCE, "binance-coinm:btcusd_perp", "BTCUSD_PERP"
+    )
+    lane = claude_worker.candles.Lane(
+        "binance-coinm", claude_worker.frames.VENUE_BINANCE, [target], backward=False
+    )
+    http, calls = http_map({})
+    lines: list[str] = []
+    claude_worker.refdata.run_cycle(conn, [lane], http, NOW, 30, lines.append)
+    assert calls == []
+    assert all_rows(conn) == []
+    assert lines == ["refdata: binance-coinm: targets=1 skipped (no v1 lane)"]

@@ -137,12 +137,26 @@ impl TlsTransport {
     /// Open a new TLS transport to `addr` for the given SNI `server_name`.
     /// `config` is a shared rustls configuration (typically from
     /// [`Self::default_client_config`]).
+    ///
+    /// Nagle is switched OFF here, on every socket this crate opens —
+    /// the one choke point every ingress, the exchange arm's
+    /// request/response client and its user-event WS go through
+    /// (BX0-F4, operator ruling O-BX12a). A pipelined order socket
+    /// with Nagle on holds each small write until the previous
+    /// segment is ACKed — one ~110 ms Tokyo RTT from here — and a
+    /// streaming reader loses nothing by sending its few bytes
+    /// (pongs, subscribes) at once.
+    ///
+    /// # Errors
+    /// The connect could not be started, the socket refused the
+    /// option, or rustls refused the configuration.
     pub fn connect(
         addr: SocketAddr,
         server_name: ServerName<'static>,
         config: Arc<ClientConfig>,
     ) -> io::Result<Self> {
         let sock = TcpStream::connect(addr)?;
+        sock.set_nodelay(true)?;
         let conn = ClientConnection::new(config, server_name).map_err(io::Error::other)?;
         Ok(Self {
             sock,
@@ -308,11 +322,11 @@ impl Transport for TlsTransport {
                 // exactly like the pre-fix fill path.
                 Ok(0) => return Ok(0),
                 Ok(_) => pulled = true,
+                // `Error::from(kind)` — never `Error::new(kind, "…")`,
+                // which boxes a String and a Custom (3 allocations on
+                // EVERY drain loop's last read; HYPARB H9 finding).
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "no plaintext yet",
-                    ));
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
                 }
                 // Backpressure guard (buffer-full signal): nothing
                 // read this call, but the deframer may still hold
@@ -338,10 +352,7 @@ impl Transport for TlsTransport {
             // TLS record is in flight — wait for more bytes rather
             // than spinning.
             if !pulled {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "no plaintext yet",
-                ));
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
             }
         }
     }
@@ -350,7 +361,8 @@ impl Transport for TlsTransport {
         // rustls plaintext writer; buffers internally until we call
         // write_tls() on the next pump.
         // COPY: plaintext → rustls sendable_tls, ≤ the caller's request
-        // (17 KiB for the exchange arm) — rustls encrypts out of its own
+        // (16 KiB + its head for the exchange arm, one write since XMM
+        // HD2) — rustls encrypts out of its own
         // buffer and exposes no borrowed-plaintext write API — rejected:
         // none available; this is the TLS boundary copy.
         let mut writer = self.conn.writer();
@@ -378,6 +390,32 @@ impl Transport for TlsTransport {
 // ---------------------------------------------------------------
 // TestTransport — integration tests + alloc-assertion harness
 // ---------------------------------------------------------------
+
+/// The 125 B control-frame maximum (RFC 6455 §5.5), patterned so an
+/// echo that reorders or drops a byte cannot pass.
+const PING_MAX: [u8; 125] = {
+    let mut a = [0u8; 125];
+    let mut i = 0;
+    while i < a.len() {
+        a[i] = (i as u8) ^ 0x5A;
+        i += 1;
+    }
+    a
+};
+
+/// One server Pong — FIN, unmasked (RFC 6455 §5.1) — carrying
+/// [`PING_MAX`]: 127 B on the wire.
+const PONG_MAX_FRAME: [u8; 2 + 125] = {
+    let mut a = [0u8; 2 + 125];
+    a[0] = 0x8A;
+    a[1] = 125;
+    let mut i = 0;
+    while i < 125 {
+        a[2 + i] = PING_MAX[i];
+        i += 1;
+    }
+    a
+};
 
 /// Simple in-process [`Transport`] backed by two preallocated byte
 /// buffers. Used by integration tests to feed scripted bytes into the
@@ -484,6 +522,60 @@ impl TestTransport {
         self.rx.append(src)
     }
 
+    /// The ping payloads every ingress run loop's echo test drives:
+    /// empty, a word, and the 125 B control-frame maximum.
+    pub const PING_ECHO_CASES: [&'static [u8]; 3] = [b"", b"PING", &PING_MAX];
+
+    /// Script one server Ping — FIN, unmasked (a server never masks,
+    /// RFC 6455 §5.1) — carrying `payload`, at most 125 B.
+    pub fn inject_server_ping(&mut self, payload: &[u8]) {
+        assert!(payload.len() <= 125, "a control payload is at most 125 B");
+        assert_eq!(self.rx.append(&[0x89, payload.len() as u8]), 2, "rx full");
+        assert_eq!(self.rx.append(payload), payload.len(), "rx full");
+    }
+
+    /// Script server Pongs — 127 B each — until at least `min_bytes` are
+    /// queued; returns the bytes queued. Every ingress drains a Pong as a
+    /// no-op, so this is the burst of non-tick frames the I-3 drain tests
+    /// ([`crate::drain`]) fill rx with.
+    pub fn inject_server_pongs(&mut self, min_bytes: usize) -> usize {
+        let mut queued = 0;
+        while queued < min_bytes {
+            assert_eq!(
+                self.rx.append(&PONG_MAX_FRAME),
+                PONG_MAX_FRAME.len(),
+                "rx full"
+            );
+            queued += PONG_MAX_FRAME.len();
+        }
+        queued
+    }
+
+    /// Drain the outbound bytes and assert they are exactly ONE client
+    /// Pong — FIN, masked (RFC 6455 §5.3) — echoing `payload` byte for
+    /// byte (§5.5.3).
+    pub fn expect_pong_echo(&mut self, payload: &[u8]) {
+        let mut out = [0u8; 2 + 4 + 125 + 1];
+        let n = self.tx.drain(&mut out);
+        assert_eq!(
+            n,
+            2 + 4 + payload.len(),
+            "exactly one masked pong, nothing else"
+        );
+        assert_eq!(out[0], 0x8A, "FIN + Pong");
+        assert_eq!(
+            usize::from(out[1]),
+            0x80 | payload.len(),
+            "masked, the ping's length"
+        );
+        let mask = [out[2], out[3], out[4], out[5]];
+        let mut i = 0;
+        while i < payload.len() {
+            assert_eq!(out[6 + i] ^ mask[i & 3], payload[i], "echo byte {i}");
+            i += 1;
+        }
+    }
+
     /// Drain plaintext bytes the transport produced via
     /// [`Transport::write`]. Used by tests to observe what the client
     /// would have sent on the wire.
@@ -581,9 +673,14 @@ pub struct PlainTcpTransport {
 impl PlainTcpTransport {
     /// Open a new plain TCP connection to `addr`. Non-blocking; the
     /// caller is expected to drive the connect-completion event via
-    /// mio.
+    /// mio. Nagle off, exactly as [`TlsTransport::connect`] (BX0-F4).
+    ///
+    /// # Errors
+    /// The connect could not be started, or the socket refused the
+    /// option.
     pub fn connect(addr: SocketAddr) -> io::Result<Self> {
         let sock = TcpStream::connect(addr)?;
+        sock.set_nodelay(true)?;
         Ok(Self {
             sock,
             tcp_connected: false,
@@ -752,5 +849,29 @@ mod tests {
     fn server_name_from_host_rejects_garbage() {
         let err = TlsTransport::server_name_from_host("not a valid host!").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// BX0-F4: Nagle is off on a socket the moment either transport
+    /// hands it back — while the non-blocking connect may still be in
+    /// flight, which is exactly the state every production caller
+    /// registers it with mio in. Break-and-watch: without the
+    /// `set_nodelay` line in each `connect`, both asserts read the
+    /// kernel default (`false`).
+    #[test]
+    fn every_connect_turns_nagle_off() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+
+        let plain = PlainTcpTransport::connect(addr).expect("plain connect");
+        assert!(plain.sock.nodelay().expect("getsockopt"), "plain TCP left Nagle on");
+
+        let tls = TlsTransport::connect(
+            addr,
+            TlsTransport::server_name_from_host("localhost").expect("name"),
+            TlsTransport::default_client_config(),
+        )
+        .expect("tls connect");
+        assert!(tls.sock.nodelay().expect("getsockopt"), "TLS transport left Nagle on");
+        drop(listener);
     }
 }

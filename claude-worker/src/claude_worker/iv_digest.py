@@ -122,7 +122,7 @@ CREATE TABLE IF NOT EXISTS iv_digest (
 # (tests pack fixture slots through `_OPT`).
 OptRec = claude_worker.pmlr.OptSummaryRec
 OptReader = claude_worker.pmlr.OptSummaryReader
-_OPT = claude_worker.pmlr._OPT_SUMMARY  # noqa: SLF001
+_OPT = claude_worker.pmlr._OPT_SUMMARY
 
 
 class Snapshot(typing.NamedTuple):

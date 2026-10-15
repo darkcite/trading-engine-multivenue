@@ -1,0 +1,69 @@
+[package]
+name         = "exec-binance"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "BX6/BX7: the Binance execution arm. The engine-thread half (BnArm: OrderDispatch — the alias-first row lookup, BX-5 quantization, the order governors, the BX-17/BX-18 refusals) and the gateway thread (every Binance socket: the WS API order sessions make-before-break, the user-data stream, signed REST), joined by the exec-gateway kit's duplex (two SPSC rings and the shared stats block); fills cross to the engine on fill lane 4."
+
+[dependencies]
+# `OrderDispatch`, `Retired`, `HaltSignal`, `LiveArmCounters` — the
+# engine-facing contract. No cycle: clob-dispatcher knows nothing of this.
+clob-dispatcher = { workspace = true }
+core-types      = { workspace = true }
+# ORDER_KIND_MAKER / ORDER_KIND_IOC.
+core-fill       = { workspace = true }
+# The boot discovery rows the instrument table is bound from (BX-4).
+ingress-binance = { workspace = true }
+# `SecretKeyBytes` (the seed, mlock'd for the process's life), the
+# `[exec.binance]` knobs and the universe's alias id.
+core-config     = { workspace = true }
+# The ONE Ed25519 signer (BX4): `session.logon` and every signed REST call.
+signer-ed25519  = { workspace = true }
+# The canonical in-place field finders and decimal scanners.
+core-parse      = { workspace = true }
+# CLOCK_MONOTONIC_RAW and the boot's wall anchor (BX-6).
+core-time       = { workspace = true }
+# Fill lane 4's producer (the engine's ring), and the rings' guards.
+core-ring       = { workspace = true }
+# BX7 (O-XH13): the gateway kit — the engine/gateway duplex and its stats
+# block (the halt and sweep words, the latencies), the in-flight table,
+# the deadline queue, make-before-break and the loop's wait policy.
+exec-gateway    = { workspace = true }
+# The journal's PMLR writer (cold thread) and the anchor's atomic write.
+core-io         = { workspace = true }
+# SHA-256: the anchor file's account tag; HMAC-SHA256's hash (BX7, R22).
+core-crypto     = { workspace = true }
+# Wiping the HMAC secret's staging copies and pads (BX7, R22).
+zeroize         = { workspace = true }
+# The non-blocking transports (BX5): `WsConn`, `HttpsConn`, `Backoff`.
+core-net        = { workspace = true }
+mio             = { workspace = true }
+rustls          = { workspace = true }
+# BX12 — TEST-ONLY (`testvenue`): the scripted venue's certificate, and
+# its OWN Ed25519 verifier (never the signer under test).
+rcgen           = { workspace = true, optional = true }
+ring            = { workspace = true, optional = true }
+
+[features]
+# TEST-ONLY (the O-BX20 shape): `BnConfig::with_port`, so a test can put
+# the real gateway in front of a scripted TLS venue on a loopback port.
+# The real hosts refuse any port but 443 even with it on. Only
+# dev-dependency edges enable it.
+loopback = []
+# BX12 — TEST-ONLY: the scripted rustls Binance (`testvenue`), shared by
+# this crate's end-to-end tests and allocation gate 94. Only
+# dev-dependency edges enable it: off in any build that compiles no tests
+# (the deploy's `cargo build --release -p cli`, runbook §7); a build that
+# compiles the tests links it in, inert — no production path calls it.
+testvenue = ["loopback", "dep:rcgen", "dep:ring"]
+
+[dev-dependencies]
+proptest = { workspace = true }
+# tests/bn_e2e_loopback.rs: the router the arm sits under in the engine.
+exec-router = { workspace = true }
+# The loopback transport shape and the scripted venue (`testvenue`) for
+# this crate's own integration tests.
+exec-binance = { path = ".", features = ["testvenue"] }

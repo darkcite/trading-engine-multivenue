@@ -86,10 +86,12 @@ DEFAULT_REPLAY_DIR: str = "~/multivenue/logs"
 #: candles/funding lane law).
 _FUNDING_VENUE_OF_PREFIX: dict[str, int] = {
     "binance-usdm": claude_worker.frames.VENUE_BINANCE,
+    "binance-coinm": claude_worker.frames.VENUE_BINANCE,
     "okx": claude_worker.frames.VENUE_OKX,
     "deribit": claude_worker.frames.VENUE_DERIBIT,
     "hyperliquid": claude_worker.frames.VENUE_HYPERLIQUID,
     "bybit-linear": claude_worker.frames.VENUE_BYBIT,
+    "mexc-perp": claude_worker.frames.VENUE_MEXC,
 }
 
 

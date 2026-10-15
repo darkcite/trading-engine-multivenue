@@ -11,9 +11,12 @@
 //!   impossible while in-flight count ≤ N).
 //! * [`SubTable`] — fixed-capacity `(SubId, kind)` rows mapping a
 //!   venue subscription id to what it streams.
-//! * [`queue_masked_binary_frame`] / [`queue_masked_text_frame`] —
-//!   the "serialize into tx IoBuf with a fresh mask" pattern every
-//!   client-side WS writer needs.
+//! * [`queue_masked_binary_frame`] / [`queue_masked_text_frame`] and
+//!   their `_parts` forms — the "serialize into tx IoBuf with a fresh
+//!   mask" pattern every client-side WS writer needs; a `_parts` payload
+//!   is masked into tx part by part, never assembled first — and
+//!   [`queue_masked_text_frame_rendered`], whose payload a render writes
+//!   straight into tx behind its header (the batch subscribes).
 //!
 //! Everything is preallocated, `Copy`-only rows, zero-alloc, no
 //! `dyn`: per-venue request kinds are monomorphized through the
@@ -27,7 +30,10 @@
 use std::io;
 
 use crate::iobuf::IoBuf;
-use crate::ws_frame::{ws_mask_from_counter, ws_write_binary_frame, ws_write_text_frame};
+use crate::ws_frame::{
+    ws_mask_from_counter, ws_write_binary_frame_parts, ws_write_text_frame_parts,
+    ws_write_text_frame_rendered, WsPayload, WsWriteErr,
+};
 
 // ---------------------------------------------------------------
 // Request kinds
@@ -122,6 +128,14 @@ impl<K: ReqKind, const N: usize> PendingTable<K, N> {
             kind,
         };
         Ok(())
+    }
+
+    /// Whether `id` can be recorded now: non-zero and its
+    /// `id & (N-1)` slot free. An allocator facing an endpoint that
+    /// answers out of order skips a busy slot's id instead of colliding.
+    #[inline]
+    pub fn is_free(&self, id: u64) -> bool {
+        id != 0 && !self.slots[(id as usize) & (N - 1)].is_used()
     }
 
     /// Take the request matching `id`, freeing its slot. `None` when
@@ -282,10 +296,22 @@ pub fn queue_masked_binary_frame(
     mask_counter: &mut u64,
     payload: &[u8],
 ) -> io::Result<()> {
+    queue_masked_binary_frame_parts(tx, mask_counter, &[payload])
+}
+
+/// [`queue_masked_binary_frame`] whose payload is the concatenation of
+/// `parts`, each masked straight into the tx window — a fixed-shape
+/// request is never assembled anywhere first (the RPC venues'
+/// `eth_blockNumber` poll and `newHeads` subscribe).
+#[inline]
+pub fn queue_masked_binary_frame_parts(
+    tx: &mut IoBuf,
+    mask_counter: &mut u64,
+    parts: &[&[u8]],
+) -> io::Result<()> {
     let mask = ws_mask_from_counter(*mask_counter);
     *mask_counter = mask_counter.wrapping_add(1);
-    let dst = tx.free_mut();
-    let n = ws_write_binary_frame(dst, payload, mask)
+    let n = ws_write_binary_frame_parts(tx.free_mut(), parts, mask)
         .map_err(|_| io::Error::other("ws binary frame: tx buffer too small"))?;
     tx.advance(n);
     Ok(())
@@ -299,11 +325,49 @@ pub fn queue_masked_text_frame(
     mask_counter: &mut u64,
     payload: &[u8],
 ) -> io::Result<()> {
+    queue_masked_text_frame_parts(tx, mask_counter, &[payload])
+}
+
+/// Text-frame counterpart of [`queue_masked_binary_frame_parts`]
+/// (Hyperliquid's subscriptions, Deribit's `public/test` answer).
+#[inline]
+pub fn queue_masked_text_frame_parts(
+    tx: &mut IoBuf,
+    mask_counter: &mut u64,
+    parts: &[&[u8]],
+) -> io::Result<()> {
     let mask = ws_mask_from_counter(*mask_counter);
     *mask_counter = mask_counter.wrapping_add(1);
-    let dst = tx.free_mut();
-    let n = ws_write_text_frame(dst, payload, mask)
+    let n = ws_write_text_frame_parts(tx.free_mut(), parts, mask)
         .map_err(|_| io::Error::other("ws text frame: tx buffer too small"))?;
+    tx.advance(n);
+    Ok(())
+}
+
+/// Text frame whose payload `render` writes straight into the tx window,
+/// header first ([`ws_write_text_frame_rendered`]) — the batch
+/// subscribes, whose length is unknown until rendered: no scratch, no
+/// second copy. `render` runs twice (count, then write) and must produce
+/// the same bytes both times. tx advances only over a whole frame.
+///
+/// # Errors
+/// tx too small, the render's own error, or a render whose two passes
+/// disagree.
+#[inline]
+pub fn queue_masked_text_frame_rendered<F>(
+    tx: &mut IoBuf,
+    mask_counter: &mut u64,
+    render: F,
+) -> io::Result<()>
+where
+    F: Fn(&mut WsPayload<'_>) -> Result<(), WsWriteErr>,
+{
+    let mask = ws_mask_from_counter(*mask_counter);
+    *mask_counter = mask_counter.wrapping_add(1);
+    let n = ws_write_text_frame_rendered(tx.free_mut(), mask, render).map_err(|e| match e {
+        WsWriteErr::BufferTooSmall => io::Error::other("ws text frame: tx buffer too small"),
+        WsWriteErr::RenderDiverged => io::Error::other("ws text frame: the render diverged"),
+    })?;
     tx.advance(n);
     Ok(())
 }
@@ -404,5 +468,74 @@ mod tests {
         let mut ctr = 0u64;
         let big = [0u8; 64];
         assert!(queue_masked_binary_frame(&mut tx, &mut ctr, &big).is_err());
+    }
+
+    #[test]
+    fn a_parts_frame_is_the_frame_of_their_concatenation() {
+        // The mask index runs across part boundaries: split or whole,
+        // the same bytes under the same mask counter give the same wire
+        // frame — binary and text, short and 16-bit length forms.
+        let long = [b'x'; 200];
+        let parts: [&[u8]; 3] = [b"{\"id\":", &long, b"}"];
+        let whole = parts.concat();
+        let (mut split, mut one) = (IoBuf::with_capacity(1024), IoBuf::with_capacity(1024));
+        let (mut cs, mut co) = (7u64, 7u64);
+        queue_masked_binary_frame_parts(&mut split, &mut cs, &parts).unwrap();
+        queue_masked_binary_frame(&mut one, &mut co, &whole).unwrap();
+        queue_masked_text_frame_parts(&mut split, &mut cs, &[b"{\"id\":", b"42}"]).unwrap();
+        queue_masked_text_frame(&mut one, &mut co, b"{\"id\":42}").unwrap();
+        assert_eq!(split.filled(), one.filled());
+        assert_eq!((cs, co), (9, 9));
+    }
+
+    #[test]
+    fn a_parts_frame_fails_on_tiny_tx() {
+        let mut tx = IoBuf::with_capacity(8);
+        let mut ctr = 0u64;
+        assert!(queue_masked_binary_frame_parts(&mut tx, &mut ctr, &[b"abc", b"defgh"]).is_err());
+        assert!(queue_masked_text_frame_parts(&mut tx, &mut ctr, &[b"abc", b"defgh"]).is_err());
+        assert!(tx.is_empty(), "a refused frame writes nothing");
+    }
+
+    #[test]
+    fn a_rendered_frame_is_the_frame_of_its_bytes() {
+        // Rendered or passed whole, the same bytes under the same mask
+        // counter give the same wire frame, and tx advances over it once.
+        let (mut rendered, mut whole) = (IoBuf::with_capacity(256), IoBuf::with_capacity(256));
+        let (mut cr, mut cw) = (7u64, 7u64);
+        queue_masked_text_frame_rendered(&mut rendered, &mut cr, |p| {
+            p.put(b"{\"op\":")?;
+            p.put(b"\"subscribe\"}")
+        })
+        .unwrap();
+        queue_masked_text_frame(&mut whole, &mut cw, b"{\"op\":\"subscribe\"}").unwrap();
+        assert_eq!(rendered.filled(), whole.filled());
+        assert_eq!((cr, cw), (8, 8));
+    }
+
+    #[test]
+    fn a_rendered_frame_that_does_not_fit_leaves_tx_empty() {
+        let mut tx = IoBuf::with_capacity(8);
+        let mut ctr = 0u64;
+        let r = queue_masked_text_frame_rendered(&mut tx, &mut ctr, |p| p.put(b"abcdefgh"));
+        assert!(r.is_err());
+        assert!(tx.is_empty(), "a refused frame writes nothing");
+    }
+
+    /// A render whose writing pass diverges from its count leaves tx where
+    /// it was: a release build fails the frame; a debug build panics first.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "diverged from its count"))]
+    fn a_diverging_render_never_advances_tx() {
+        let mut tx = IoBuf::with_capacity(64);
+        let mut ctr = 0u64;
+        let calls = core::cell::Cell::new(0);
+        let r = queue_masked_text_frame_rendered(&mut tx, &mut ctr, |p| {
+            calls.set(calls.get() + 1);
+            let bytes: &[u8] = if calls.get() == 1 { b"ab" } else { b"abc" };
+            p.put(bytes)
+        });
+        assert!(r.is_err());
+        assert!(tx.is_empty(), "tx never advances over a torn frame");
     }
 }

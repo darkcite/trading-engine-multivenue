@@ -111,7 +111,6 @@ def test_cex_sections_seed_descriptor_names(tmp_path: pathlib.Path) -> None:
     bn = claude_worker.frames.VENUE_BINANCE
     okx = claude_worker.frames.VENUE_OKX
     dbt = claude_worker.frames.VENUE_DERIBIT
-    hl = claude_worker.frames.VENUE_HYPERLIQUID
     universe = {
         42: PM,
         7: bn,
@@ -131,6 +130,48 @@ def test_cex_sections_seed_descriptor_names(tmp_path: pathlib.Path) -> None:
     assert props["okx:ETH-USDT-SWAP"] == (okx << 24) | 2
     assert props["deribit:BTC-PERPETUAL"] == (dbt << 24) | 1
     assert "hyperliquid:BTC" not in props
+
+
+def test_coinm_sections_seed_from_3072_and_3584(tmp_path: pathlib.Path) -> None:
+    """BX2: `[binance] coinm[j]` -> ordinal BN_COINM_ORDINAL_BASE + j + 1,
+    `coinm_dated[j]` -> BN_COINM_DATED_ORDINAL_BASE + j + 1, one
+    `binance-coinm:` namespace (mirrors core-config)."""
+    text = '[binance]\ncoinm = ["btcusd_perp", "ethusd_perp"]\ncoinm_dated = ["btcusd_261225"]\n'
+    p = _write(tmp_path, text)
+    bn = claude_worker.frames.VENUE_BINANCE
+    universe = {
+        (bn << 24) | 3073: bn,
+        (bn << 24) | 3074: bn,
+        (bn << 24) | 3585: bn,
+    }
+    props, _pairs, _lines = claude_worker.fetchers.universe_file_proposals(p, universe)
+    assert props == {
+        "binance-coinm:btcusd_perp": (bn << 24) | 3073,
+        "binance-coinm:ethusd_perp": (bn << 24) | 3074,
+        "binance-coinm:btcusd_261225": (bn << 24) | 3585,
+    }
+
+
+def test_mexc_sections_seed_spot_from_1_and_perp_from_512(tmp_path: pathlib.Path) -> None:
+    """MX7: `[mexc] spot[i]` -> venue 7 ordinal i+1, `perp[j]` -> ordinal
+    MEXC_PERP_ORDINAL_BASE + j + 1 (the Binance spot/usdm split)."""
+    text = '[mexc]\nspot = ["BTCUSDT", "AAPLXUSDT"]\nperp = ["BTC_USDT", "XAU_USDT"]\n'
+    p = _write(tmp_path, text)
+    mx = claude_worker.frames.VENUE_MEXC
+    assert claude_worker.fetchers.MEXC_PERP_ORDINAL_BASE == 512
+    universe = {(mx << 24) | 1: mx, (mx << 24) | 2: mx, (mx << 24) | 513: mx, (mx << 24) | 514: mx}
+    props, _pairs, _lines = claude_worker.fetchers.universe_file_proposals(p, universe)
+    assert props == {
+        "mexc:BTCUSDT": (mx << 24) | 1,
+        "mexc:AAPLXUSDT": (mx << 24) | 2,
+        "mexc-perp:BTC_USDT": (mx << 24) | 513,
+        "mexc-perp:XAU_USDT": (mx << 24) | 514,
+    }
+    # Observed-only: an ordinal the capture never saw is not proposed.
+    props, _pairs, _lines = claude_worker.fetchers.universe_file_proposals(
+        p, {(mx << 24) | 513: mx}
+    )
+    assert props == {"mexc-perp:BTC_USDT": (mx << 24) | 513}
 
 
 def test_refresh_appends_and_dedupes_pairs(tmp_path: pathlib.Path) -> None:

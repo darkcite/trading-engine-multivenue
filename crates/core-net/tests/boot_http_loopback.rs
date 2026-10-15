@@ -5,16 +5,17 @@
 //! TLS server with a self-signed cert (same rcgen harness as every
 //! ingress loopback). Covers, per the house happy+failure rule:
 //! Content-Length GET, chunked GET, POST body observed server-side,
-//! non-200 status, truncated body, over-budget body, and deadline
-//! timeout.
+//! POST to a boot-resolved address with no lookup (and its refused and
+//! silent-peer failures), non-200 status, truncated body, over-budget
+//! body, and deadline timeout.
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use core_net::boot_http::{https_get, https_post, BootHttpErr};
+use core_net::boot_http::{https_get, https_post, https_post_at, BootHttpErr};
 
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -27,8 +28,13 @@ struct LoopbackCert {
 }
 
 fn make_cert() -> LoopbackCert {
-    let cert =
-        generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen self-signed cert");
+    make_cert_for("localhost")
+}
+
+/// A self-signed cert naming `name` — the server identity the client
+/// verifies over SNI, whatever address it connected to.
+fn make_cert_for(name: &str) -> LoopbackCert {
+    let cert = generate_simple_self_signed(vec![name.to_string()]).expect("rcgen self-signed cert");
     let cert_der = cert.cert.der().clone();
     let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("private key DER");
     LoopbackCert { cert_der, key_der }
@@ -194,6 +200,106 @@ fn post_body_and_headers_reach_the_server() {
     assert!(find_subslice(&seen, b"Content-Type: application/json\r\n").is_some());
     assert!(find_subslice(&seen, b"Content-Length: 15\r\n").is_some());
     assert!(seen.ends_with(b"{\"type\":\"meta\"}"));
+}
+
+/// The post-boot form connects to the address it is handed and never
+/// looks `host` up — `host` only names the server for SNI and `Host:`.
+/// The name is under `.invalid` (RFC 6761: it never resolves), so a
+/// lookup would have failed with `Resolve` before any connect.
+#[test]
+fn post_at_a_boot_resolved_address_does_no_lookup() {
+    const NAME: &str = "boot-http.invalid";
+    let cert = make_cert_for(NAME);
+    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec();
+    let (port, srv) = one_shot_server(build_server_config(&cert), response, 0);
+    let mut out = Vec::new();
+    let range = https_post_at(
+        &build_client_config(&cert),
+        SocketAddr::from(([127, 0, 0, 1], port)),
+        NAME,
+        "/info",
+        UA,
+        b"application/json",
+        b"{\"type\":\"outcomeMeta\"}",
+        &mut out,
+        1 << 20,
+        TIMEOUT,
+    )
+    .expect("fetch ok");
+    assert_eq!(&out[range], b"ok");
+    let seen = srv.join().expect("server thread");
+    assert!(seen.starts_with(b"POST /info HTTP/1.1\r\nHost: boot-http.invalid\r\n"));
+    assert!(seen.ends_with(b"{\"type\":\"outcomeMeta\"}"));
+}
+
+/// Its failure side: an address nothing listens on is refused at the
+/// connect, and the kind is carried up.
+#[test]
+fn post_at_a_closed_port_is_refused() {
+    let cert = make_cert();
+    // Bound, then dropped at the end of the block: nothing listens there.
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("addr").port()
+    };
+    let mut out = Vec::new();
+    let err = https_post_at(
+        &build_client_config(&cert),
+        SocketAddr::from(([127, 0, 0, 1], port)),
+        "localhost",
+        "/info",
+        UA,
+        b"application/json",
+        b"{}",
+        &mut out,
+        1 << 20,
+        TIMEOUT,
+    )
+    .expect_err("must fail");
+    assert!(
+        matches!(
+            err,
+            BootHttpErr::Connect(std::io::ErrorKind::ConnectionRefused)
+        ),
+        "got {err:?}"
+    );
+}
+
+/// And a peer that accepts, then says nothing, is cut off by the
+/// deadline rather than by the peer: the call returns long before the
+/// server gives up on its own.
+#[test]
+fn post_at_a_silent_server_ends_at_the_deadline() {
+    let cert = make_cert();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let srv = thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        thread::sleep(Duration::from_millis(1500));
+        drop(sock);
+    });
+    let mut out = Vec::new();
+    let t0 = std::time::Instant::now();
+    let err = https_post_at(
+        &build_client_config(&cert),
+        SocketAddr::from(([127, 0, 0, 1], port)),
+        "localhost",
+        "/info",
+        UA,
+        b"application/json",
+        b"{}",
+        &mut out,
+        1 << 20,
+        Duration::from_millis(300),
+    )
+    .expect_err("must fail");
+    let took = t0.elapsed();
+    assert!(
+        matches!(err, BootHttpErr::Timeout | BootHttpErr::Io(_)),
+        "got {err:?}"
+    );
+    assert!(took < Duration::from_millis(1200), "took {took:?}");
+    srv.join().expect("server thread");
 }
 
 #[test]

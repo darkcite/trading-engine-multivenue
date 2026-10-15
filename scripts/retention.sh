@@ -84,15 +84,20 @@ for d in ${(f)candidates}; do
   epoch_ns="${name#run-}"
   case "$epoch_ns" in (*[!0-9]*|'') continue ;; esac
   age_days=$(( (now_s - epoch_ns / 1000000000) / 86400 ))
-  if [ "$age_days" -le "$PROTECT_DAYS" ]; then
-    echo "retention: $name is ${age_days}d old (<= protect ${PROTECT_DAYS}d) — stopping" >&2
+  # Whole days, floored: `-lt` protects exactly what the window says — a run
+  # younger than PROTECT_DAYS. `-le` (until HK12) protected a whole extra day:
+  # PROTECT_DAYS=1 kept every run under 48 h, not 24 h.
+  if [ "$age_days" -lt "$PROTECT_DAYS" ]; then
+    echo "retention: $name is ${age_days}d old (< protect ${PROTECT_DAYS}d) — stopping" >&2
     break # older→newer order: everything after is younger
   fi
   # An EMPTY run dir holds nothing to archive, and it must never stop the
   # sweep. The engine creates `run-<epoch_ns>` eagerly at boot, BEFORE the
   # venue discovery and every artifact law, so a boot that dies after that
   # point leaves a 0-file dir behind — and launchd's KeepAlive leaves one per
-  # attempt (nine on 2026-09-11, an OKX discovery BadRow). In s3 mode such a
+  # attempt (nine on 2026-09-11, an OKX discovery BadRow). Since HK6 a boot
+  # that fails before its manifests are written removes its empty dir; one
+  # that dies without unwinding (SIGKILL, abort) still leaves one. In s3 mode such a
   # dir can NEVER verify: stage A refuses a run with no files, so no index
   # object exists to find, and the `break` below would park the sweep on it
   # every night and free nothing. Stage A had the same pill and was fixed the

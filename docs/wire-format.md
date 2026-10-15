@@ -23,7 +23,10 @@ bottom of that file pins every struct at exactly 64 bytes.
 ### Venue identity (Phase 8, PMLR v2)
 
 `VenueId` (`#[repr(u8)]`, wire-stable, never renumbered):
-`Polymarket=0, Binance=1, Okx=2, Deribit=3, Hyperliquid=4, Ai=5`.
+`Polymarket=0, Binance=1, Okx=2, Deribit=3, Hyperliquid=4, Ai=5, Bybit=6, Mexc=7,
+HyperEvm=8` (Bybit WS9 2026-08-29, MEXC MX2 2026-09-23, HyperEVM HYPARB H0
+2026-09-23). Append-only; the first unassigned byte is 9;
+`core_types::VENUE_COUNT` (9) sizes every venue-indexed table.
 `255` is reserved (venue byte of `SYMBOL_ID_NONE`).
 
 `SymbolId` is venue-namespaced: bits 31..24 = venue byte, bits 23..0 =
@@ -41,7 +44,7 @@ files predate it (see `docs/migration.md`).
 | -----: | ----: | ------------- | ---------------- | -------------------------------------- |
 |      0 |     8 | ts_ns         | `u64` NsTs       | monotonic ns from `core-time::now_ns` — the ordering key everywhere; venue time never re-times a record |
 |      8 |     4 | sym           | `u32` SymbolId   | venue-namespaced; `SYMBOL_ID_NONE = u32::MAX` invalid |
-|     12 |     4 | venue_seq     | `u32`            | venue-provided sequence, monotonic     |
+|     12 |     4 | venue_seq     | `u32`            | venue-provided sequence, monotonic (`pm` since HK31, `hl` and `deribit` since HK32: the ingress's per-instrument arrival ordinal, and 0 = a tick older than the instrument's newest — "Capture files") |
 |     16 |     8 | bid_px        | `i64` Price      | fixed-point ×1e6                       |
 |     24 |     8 | bid_qty       | `i64` Qty        | fixed-point ×1e6                       |
 |     32 |     8 | ask_px        | `i64` Price      | fixed-point ×1e6                       |
@@ -64,10 +67,61 @@ a v2 file replays under the v2 law — never stale.
 |      0 |     8 | ts_ns    | `u64` NsTs     | monotonic ns                           |
 |      8 |     4 | sym      | `u32` SymbolId |                                        |
 |     12 |     1 | class    | `u8`           | `LatencyClass` (Hot=0, Warm=1, Slow=2) |
-|     13 |     1 | source   | `u8`           | `SignalSource` (Rss=1 retired, reserved) |
+|     13 |     1 | source   | `u8`           | `SignalSource` (Rss=1 retired, reserved; HyperEvm=5 — HYPARB) |
 |     14 |     2 | _pad0    | `[u8; 2]`      | explicit, zeroed                       |
 |     16 |    40 | payload  | `[u8; 40]`     | opaque; interpretation by source       |
 |     56 |     8 | _pad1    | `[u8; 8]`      | explicit, zeroed (v2+; garbage in v1)  |
+
+### `TradePrint` — 64 bytes (XMM XH1, 2026-09-26; the trade lane, never captured)
+
+One public trade print, carried from `ingress-hyperliquid` to the engine
+on the trade lane (`Ring<TradePrint, 16384>`, engine `on_trade`, drained
+after the tick lanes). The capture keeps recording prints as
+`ChannelEvent` rows (`ChannelId::Trade`, `v1` signed by side) — this slot
+is the ENGINE carrier, lossless against that row
+(`TradePrint::read_trade_event`), which is how `backtest --member xmm`
+rebuilds the lane. A full ring drops the print and counts it
+(`trade_ring_drops`); the capture row is written first either way.
+
+| offset | bytes | field         | type           | notes                                        |
+| -----: | ----: | ------------- | -------------- | -------------------------------------------- |
+|      0 |     8 | ts_ns         | `u64` NsTs     | ingress parse-complete, monotonic ns         |
+|      8 |     8 | venue_time_ms | `u64`          | venue trade time ms; 0 = unknown (data, not a clock) |
+|     16 |     8 | px_1e6        | `i64`          | trade price ×1e6                             |
+|     24 |     8 | qty_1e6       | `i64`          | size ×1e6, always > 0 (direction = `aggressor`) |
+|     32 |     8 | tid           | `u64`          | venue trade id; 0 = none; consumers dedupe on it |
+|     40 |     4 | sym           | `u32` SymbolId |                                              |
+|     44 |     1 | venue         | `u8` VenueId   |                                              |
+|     45 |     1 | aggressor     | `u8`           | 0 = BUY (lifted the ask, HL `B`), 1 = SELL (hit the bid, HL `A`) |
+|     46 |    18 | _pad          | `[u8; 18]`     | explicit, zeroed (one cache line, the ring-slot law) |
+
+### `OrderEvent` — 64 bytes (XMM XH1, 2026-09-26; the order-event lane; PMLR `slot_kind = 9` since XMM XH5d)
+
+One change in an order's venue-side state (`Ring<OrderEvent, 1024>`,
+engine `on_order_event`, drained after every fill source — the fill
+lanes and the dispatcher pump — so a fill waiting in the same iteration is
+booked before a member can act on an order event, LAW E6). Routed by
+`strategy_id` to the placing slot ALONE — the X1 fill law; an event whose
+slot is out of range or not enabled is counted
+(`StrategySet::order_events_unrouted`), never fanned out. XH1 adds the
+lane; the paper model (XH2) and the live gateway (XH4) are its producers.
+XMM XH5d captures every event the engine drains, every slot's, before the
+member sees it (`engine-events.pmlr`, `SlotKind::OrderEvent`); the
+Hyperliquid arm's RESTING carries the venue's time from the `open` row —
+repeated once, with it, when the post's answer (which carries none) came
+first (a member takes the repeat as a no-op).
+
+| offset | bytes | field         | type           | notes                                        |
+| -----: | ----: | ------------- | -------------- | -------------------------------------------- |
+|      0 |     8 | ts_ns         | `u64` NsTs     | observed, monotonic ns                       |
+|      8 |     8 | client_oid    | `u64`          | the order's client id (LAW E-9's durable name) |
+|     16 |     8 | venue_time_ms | `u64`          | venue time of the change; 0 = unknown (paper) |
+|     24 |     4 | sym           | `u32` SymbolId |                                              |
+|     28 |     1 | venue         | `u8` VenueId   |                                              |
+|     29 |     1 | strategy_id   | `u8`           | the placing slot; `0xFF` = not attributable (counted, never delivered) |
+|     30 |     1 | kind          | `u8`           | 1 RESTING (a post-only ACK) · 2 REJECTED · 3 CANCELED · 4 FILLED (terminal); 0 never produced |
+|     31 |     1 | reason        | `u8`           | 0 none · 1 cancel requested · 2 replaced · 3 expired · 4 bad ALO px · 5 self-trade · 6 margin · 7 open-interest cap · 8 scheduled cancel · 9 reduce-only · 10 tick or lot · 11 min notional · 255 other |
+|     32 |    32 | _pad          | `[u8; 32]`     | explicit, zeroed                             |
 
 ### `Fill` — 64 bytes (layout amended X1, pre-first-capture — see docs/migration.md)
 
@@ -84,11 +138,12 @@ the same situation `Order.strategy_id` was in at M4.1.
 |     12 |     1 | side        | `u8`           | `Side` (Bid=0, Ask=1)                            |
 |     13 |     1 | strategy_id | `u8`           | X1: emitting slot; `0xFF` = unattributed         |
 |     14 |     1 | origin      | `u8`           | X1: 0 = venue fill, 1 = MODELLED by the paper matcher |
-|     15 |     1 | flags       | `u8`           | E4: bit 0 = `FILL_FLAG_SETTLEMENT` (the VENUE closed the instance); was `_pad0`, explicit zeroed, so every capture written before E4 reads as no flags |
+|     15 |     1 | flags       | `u8`           | E4: bit 0 = `FILL_FLAG_SETTLEMENT` (the VENUE closed the instance); was `_pad0`, explicit zeroed, so every capture written before E4 reads as no flags. **BX7 (2026-10-08)**: bit 1 = `FILL_FLAG_ADOPTED` — the venue's position ADOPTED at a Binance boot as the owner slot's starting inventory: not a trade, no commission, no day turnover; an inverse leg's carries px 0 (its face carries the exposure). A reader folding fills into P&L or trade statistics must treat it as opening inventory (audit-pnl does; BX-14 excludes it). Wire-additive: bit 1 was always 0 |
 |     16 |     8 | px          | `i64` Price    | fixed-point ×1e6                                 |
 |     24 |     8 | qty         | `i64` Qty      | fixed-point ×1e6                                 |
 |     32 |     8 | order_id    | `u64`          | engine-assigned client oid                       |
-|     40 |    16 | _pad1       | `[u8; 16]`     | explicit, zeroed                                 |
+|     40 |     8 | tid         | `u64`          | XMM XH5d: the venue's trade id (Hyperliquid `tid`); 0 = none (paper) — was `_pad1`, explicit zeroed, so every capture written before reads as none |
+|     48 |     8 | _pad1       | `[u8; 8]`      | explicit, zeroed                                 |
 |     56 |     8 | _pad2       | `[u8; 8]`      | explicit, zeroed (v2+; garbage in v1)            |
 
 `origin` is load-bearing for any audit that will see both sources in one
@@ -109,14 +164,16 @@ reader-compat surface.
 |      8 |     4 | sym         | `u32` SymbolId | venue-namespaced                |
 |     12 |     1 | side        | `u8`           | `Side`                          |
 |     13 |     1 | kind        | `u8`           | 0=Limit, 1=IoC, 2=Market (rsv.) |
-|     14 |     2 | _pad0       | `[u8; 2]`      | explicit, zeroed                |
+|     14 |     1 | flags       | `u8`           | **XMM XH1 (2026-09-26)**: bit 0 = `ORDER_FLAG_REDUCE_ONLY` (the exec arm that honours it is XH4's; until then nothing sets it). **XMM XH2 (2026-09-26)**: bit 1 = `ORDER_FLAG_POST_ONLY` — the venue's post-only TIF (Hyperliquid `Alo`); on a queue venue (Hyperliquid) a maker carrying it is judged by the queue law (`core_fill::queue`) in the paper matcher and the harness. Only xmm sets it. Wire-additive: it was the first `_pad0` byte, explicit zeroed, so every Order persisted before XH1 reads as no flags |
+|     15 |     1 | _pad0       | `u8`           | explicit, zeroed                |
 |     16 |     8 | px          | `i64` Price    |                                 |
 |     24 |     8 | qty         | `i64` Qty      |                                 |
 |     32 |     8 | client_oid  | `u64`          | engine-assigned, monotonic      |
 |     40 |     1 | venue       | `u8` VenueId   | routing target (v2+; garbage in v1) |
-|     41 |     1 | strategy_id | `u8`           | M4.1: emitting strategy-set slot (0=latency-arb 1=vrp [VRP V7 2026-09-10 — was ev] 2=xsd [XSD-S/XSD-3 2026-09-12 — was cross-arb] 3=rule-tree 4=ai-exec 5=vm 6=icdp — ICDP I4, 2026-09-03: the intrabar member; its intents are `kind = 1` IoC with `ttl_ns` = the bar's remaining life), stamped by the set's `StampCtx`; `0xFF` = unattributed (bare boots). Per-ruleset attribution is NOT embedded — join vm orders (slot 5) against the ai-cmds `RulesetCommit` timeline |
+|     41 |     1 | strategy_id | `u8`           | M4.1: emitting strategy-set slot (0=latency-arb 1=vrp [VRP V7 2026-09-10 — was ev] 2=xsd [XSD-S/XSD-3 2026-09-12 — was cross-arb] 3=rule-tree 4=ai-exec 5=vm 6=icdp — ICDP I4, 2026-09-03: the intrabar member; its intents are `kind = 1` IoC with `ttl_ns` = the bar's remaining life). **Today's map: 0 hyparb · 1 vrp · 2 xsd · 3 bin15 · 4 ai-exec · 5 vm · 6 xmm (XMM XH1, 2026-09-26 — icdp unlinked; rows under 6 before that date are icdp's) · 7 free.** Stamped by the set's `StampCtx`; `0xFF` = unattributed (bare boots). Per-ruleset attribution is NOT embedded — join vm orders (slot 5) against the ai-cmds `RulesetCommit` timeline |
 |     42 |     1 | verb        | `u8`           | **E5 (2026-09-19)**: which LIFECYCLE verb this record is — 0=PLACE, 1=CANCEL, 2=MODIFY. Wire-additive: every Order persisted before E5 carries 0 here (the byte was explicit zeroed padding), and 0 is PLACE, which is what every one of them was. The verb rides the Order slot rather than a second file because a cancel is meaningless apart from the place it refers to, and two streams would let a replay apply it first — the same argument §7 of the exec plan gives for the `ExecCmd` union ring, and the field meanings are deliberately identical. A reader that does not know a verb byte MUST drop the record, never treat it as a place |
-|     43 |     5 | _pad1       | `[u8; 5]`      | explicit, zeroed                |
+|     43 |     1 | ab_arm      | `u8`           | XMM XH5d: the A/B arm the order was decided in — 0 none, 1 A, 2 B; was `_pad1`, explicit zeroed, so every capture written before reads as none |
+|     44 |     4 | alo_priority_1e8 | `u32`     | XMM XH5d: the ALO priority bid, p ×1e8 of resting notional (Hyperliquid's `{"p": N}` grouping); 0 none; a post-only place's alone; was `_pad1`, explicit zeroed (the last of it), so every capture written before reads as none |
 |     48 |     8 | ttl_ns      | `u64`          | I1 (2026-09-03): time-to-live relative to `ts_ns`; 0 = none. A MODEL field — the offline fill law (`backtest::fill`) cancels the order at the first record of its sym at/after `ts_ns + ttl_ns` (an IoC that meets no fresh tick before its emitting bar closes is a cancel); no engine cancel path reads it (Stage-3). Wire-additive: every Order persisted before I1 carries 0 here (the bytes were explicit zeroed padding) |
 |     56 |     8 | prev_client_oid | `u64`      | **E5 (2026-09-19)**: the resting order this record acts on, for `verb` 1 and 2; **0 for a place**, which acts on nothing. Wire-additive for the same reason as `verb`. Pairs with `client_oid`, which is the id the record's OWN order carries — so a MODIFY names both (the order it replaces and the replacement's fresh id, per ruling O-E5b), and a CANCEL carries `client_oid = 0` because it creates no order. A cancel record also carries `px`, `qty`, `side` and `kind` zero: a `CancelReq` asserts nothing about them, and a reader that found a price there would be reading a number nobody wrote |
 
@@ -168,7 +225,7 @@ per-venue event log (plan §6.5). BBO has no `ChannelId` — BBO flows as
 |      0 |     8 | ts_ns         | `u64` NsTs     | ingress parse-complete time             |
 |      8 |     4 | sym           | `u32` SymbolId | `SYMBOL_ID_NONE` for venue-global channels |
 |     12 |     1 | venue         | `u8` VenueId   |                                         |
-|     13 |     1 | channel       | `u8` ChannelId | 0=Trade (VT2, 2026-09-03: Binance SPOT prints now emitted by the aggTrade sentinel — `venue_seq`=aggregate id, `venue_time_ms`=`T`, `v0`=px ×1e6, `v1`=qty ×1e6 negated when `m:true` (aggressor sold), the cross-venue sign convention; capture only) 1=Book 2=Mark 3=Funding 4=Ticker 5=AssetCtx 6=AllMids 7=OutcomeMeta (clarified 2026-09-12, BIN15 O1 — no layout change: `v0`=the `HlOutcomeMetaFrame::kind` byte, `venue_time_ms`=the optional `time` (**0 on every live frame** — the venue's `outcomeMetaUpdates` shape carries no top-level `time`), `v1`=0. The frame's `enc` is now derived from the outcome id as `10 * id` (the Yes side) instead of from a `#<enc>` coin key, but `enc` is NOT a captured field: `sym` still resolves only through a `#<enc>` coin present in the boot coin table, and the live shape carries no coin key, so captured OutcomeMeta rows keep `sym`=`SYMBOL_ID_NONE` until the BIN15 O2 rolling-family pool maps an enc to a reserved slot sym. The per-instance economics — strike, expiry, TWAP window — live in the `description` string, which this event does not carry either; O2 puts them in their own event) 8=PriceChange 9=TradeGap 10=BookGap (appended 2026-08-15, G1 remediation — gap-monitor pairing events: TradeGap `v0`=expected seq `v1`=observed seq; BookGap `v0`=expected prev\_change\_id (`i64::MIN` = awaiting snapshot) `v1`=observed prev\_change\_id. Emitted 1:1 with every runtime `gaps_total` increment so §6.6's pairing letter is checkable offline) 11=SubDrop (appended 2026-08-29, WS2 — non-fatal subscribe drop on a reconnect session: `sym`=dropped instrument (`SYMBOL_ID_NONE` when the venue error names none), `venue_seq`=0, `venue_time_ms`=0, `v0`=venue numeric error code (0 = missing-from-echo), `v1`=venue-local channel discriminant (−1 = unknown / folded Deribit option row; Deribit static rows carry the CHANNEL\_ORDER index 0=quote 1=ticker 2=trades 3=book). Emitted 1:1 with every `sub_drops_total` increment — same §6.6 pairing contract as the gap events) 13=InstrumentRoll (appended 2026-09-12, BIN15 O2 — a ROLLING family's `SymbolId` slot changed which venue instrument it means. HIP-4 outcome markets are born and die on a schedule (the BTC 15-minute family creates its next instance at the previous one's expiry, 96 times a day), so a fixed sym cannot name one instrument for a whole capture, and `instrument-manifest.tsv` is two columns by law. This event IS the record of which instance a slot meant from when, and without it a captured slot sym is uninterpretable offline. `sym` = the family's **Yes** slot (the No leg is the next ordinal); `venue_time_ms` = 0 (the venue's lifecycle push carries no time); `v0` = strike ×1e6; `v1` = expiry ns; `venue_seq` PACKS the identity — bits 0..32 outcome id (`enc` = `10 × id`), 32..48 settlement TWAP seconds (`seconds:`, 0 = settle at `T`), 48..56 family index in the boot `rolling` list, 56..64 0 = created / 1 = settled. Two events per roll in the venue's own order: the outgoing instance's `settled` (the book empties, the slot keeps its binding) then the successor's `created` (the slot is rebound). Read offline with `claude_worker.hip4.read_rolls`) 12=VolIndex (appended 2026-08-29, WS6 — Deribit DVOL `deribit_volatility_index.{index}`: venue-GLOBAL series, `sym`=`SYMBOL_ID_NONE`, `venue_time_ms`=venue ts, `v0`=volatility POINTS ×1e9 (59.18 → 59\_180\_000\_000), `v1`=0-based ordinal of the index in the boot-configured `[deribit] options_underlyings` list — the boot log + universe file are the ordinal's resolution) |
+|     13 |     1 | channel       | `u8` ChannelId | 0=Trade (VT2, 2026-09-03: Binance SPOT prints now emitted by the aggTrade sentinel — `venue_seq`=aggregate id, `venue_time_ms`=`T`, `v0`=px ×1e6, `v1`=qty ×1e6 negated when `m:true` (aggressor sold), the cross-venue sign convention; capture only) 1=Book 2=Mark 3=Funding 4=Ticker 5=AssetCtx 6=AllMids 7=OutcomeMeta (clarified 2026-09-12, BIN15 O1 — no layout change: `v0`=the `HlOutcomeMetaFrame::kind` byte, `venue_time_ms`=the optional `time` (**0 on every live frame** — the venue's `outcomeMetaUpdates` shape carries no top-level `time`), `v1`=0. The frame's `enc` is now derived from the outcome id as `10 * id` (the Yes side) instead of from a `#<enc>` coin key, but `enc` is NOT a captured field: `sym` still resolves only through a `#<enc>` coin present in the boot coin table, and the live shape carries no coin key, so captured OutcomeMeta rows keep `sym`=`SYMBOL_ID_NONE` until the BIN15 O2 rolling-family pool maps an enc to a reserved slot sym. The per-instance economics — strike, expiry, TWAP window — live in the `description` string, which this event does not carry either; O2 puts them in their own event) 8=PriceChange 9=TradeGap 10=BookGap (appended 2026-08-15, G1 remediation — gap-monitor pairing events: TradeGap `v0`=expected seq `v1`=observed seq; BookGap `v0`=expected prev\_change\_id (`i64::MIN` = awaiting snapshot) `v1`=observed prev\_change\_id. Emitted 1:1 with every runtime `gaps_total` increment so §6.6's pairing letter is checkable offline) 11=SubDrop (appended 2026-08-29, WS2 — non-fatal subscribe drop on a reconnect session: `sym`=dropped instrument (`SYMBOL_ID_NONE` when the venue error names none), `venue_seq`=0, `venue_time_ms`=0, `v0`=venue numeric error code (0 = missing-from-echo), `v1`=venue-local channel discriminant (−1 = unknown / folded Deribit option row; Deribit static rows carry the CHANNEL\_ORDER index 0=quote 1=ticker 2=trades 3=book). Emitted 1:1 with every `sub_drops_total` increment — same §6.6 pairing contract as the gap events) 13=InstrumentRoll (appended 2026-09-12, BIN15 O2 — a ROLLING family's `SymbolId` slot changed which venue instrument it means. HIP-4 outcome markets are born and die on a schedule (the BTC 15-minute family creates its next instance at the previous one's expiry, 96 times a day), so a fixed sym cannot name one instrument for a whole capture, and `instrument-manifest.tsv` is two columns by law. This event IS the record of which instance a slot meant from when, and without it a captured slot sym is uninterpretable offline. `sym` = the family's **Yes** slot (the No leg is the next ordinal); `venue_time_ms` = 0 (the venue's lifecycle push carries no time); `v0` = strike ×1e6; `v1` = expiry ns; `venue_seq` PACKS the identity — bits 0..32 outcome id (`enc` = `10 × id`), 32..48 settlement TWAP seconds (`seconds:`, 0 = settle at `T`), 48..56 family index in the boot `rolling` list, 56..64 0 = created / 1 = settled. Two events per roll in the venue's own order: the outgoing instance's `settled` (the book empties, the slot keeps its binding) then the successor's `created` (the slot is rebound). One exception (2026-09-26): a reconnect that retires a settled or expired instance records no `settled` for it — its later push matches no slot — and the successor re-discovered over `/info` arrives as a lone `created`, stamped when adopted. Read offline with `claude_worker.hip4.read_rolls`) 12=VolIndex (appended 2026-08-29, WS6 — Deribit DVOL `deribit_volatility_index.{index}`: venue-GLOBAL series, `sym`=`SYMBOL_ID_NONE`, `venue_time_ms`=venue ts, `v0`=volatility POINTS ×1e9 (59.18 → 59\_180\_000\_000), `v1`=0-based ordinal of the index in the boot-configured `[deribit] options_underlyings` list — the boot log + universe file are the ordinal's resolution) 14=ProviderQuote (appended 2026-09-26, HC3 — Hypercall, plan `docs/research/hypercall/hypercall-integration-plan-2026-09-26.md` §3 HC3: ONE side of ONE market-maker's indicative quote, emitted for every `IndicativeMarketData` push with **≥ 2 providers** (the headline BBO is the tick; with one provider the tick IS that provider). Two events per provider in the venue's array order — bid, then ask. `sym` = the option instrument, `venue_time_ms` = the provider's own `updated_at`, `v0` = px ×1e6, `v1` = max size ×1e6 contracts (0 / 0 for a side the provider does not quote), `venue_seq` PACKS the identity — bits 0..8 the provider's index in the frame, bit 8 the side (0 bid / 1 ask), 16..24 the frame's `num_providers`, 32..64 the provider wallet's LOW 32 bits (its last 8 hex digits; a stable per-provider key, not an address). Capture always; the event lane only when the boot's lane mask names it. Why it exists: the venue's headline BBO can be CROSSED across providers (5.3 % of two-sided pushes on 2026-09-25, one stale provider) and only the per-provider rows let an offline reader attribute it) |
 |     14 |     2 | _pad0         | `[u8; 2]`      | explicit, zeroed                        |
 |     16 |     8 | venue_seq     | `u64`          | full-width venue seq; 0 where none. WS3 (2026-08-29) exception: HL AssetCtx rows (channel 5) carry `premium` ×1e9 BIT-CAST `i64`→`u64` here (the ctx has no venue seq; pre-WS3 rows are a constant 0 — the M4 hash128-in-px/qty packing precedent) |
 |     24 |     8 | venue_time_ms | `u64`          | venue timestamp ms; 0 where absent      |
@@ -183,14 +240,18 @@ push, appended by the owning ingress thread to its per-venue
 `<venue>-opt-summary.pmlr`. Capture-only through M5; **VM2 V2: the
 record now ALSO rides a per-venue options-summary SPSC lane into the
 engine** (`Ring<OptSummary, OPT_RING_SIZE = 4096>`,
-`engine::opt_lane_of`: OKX 0, Deribit 1, Binance-eapi 2 — the BN lane
-exists venue-dark so the `.env` heal activates it with no engine
-change) → `Strategy::on_opt_summary` → the vm feature engine's
+`engine::opt_lane_of`: OKX 0, Deribit 1, Binance 2 — the BN lane was
+dark from the venue's 2025-12 options migration until BX0-F2 moved it
+to fstream `/market`, 2026-09-23) → `Strategy::on_opt_summary` → the
+vm feature engine's
 mark/IV features. Capture stays FIRST at every emit site (§6.5
 capture-before-push law); full-ring pushes count
 `opt_ring_drops_total`. Offline consumers unchanged.
-Fed by Deribit option `ticker.{instr}.100ms` and OKX `opt-summary`
-(BN eapi joins at M2.4). Values are RAW VENUE UNITS fixed-point
+Fed by Deribit option `ticker.{instr}.100ms`, OKX `opt-summary` and
+(BX0-F2) Binance `<uly>@optionMarkPrice` — one record per SELECTED
+option per push, `underlying_px_1e9` = the element's `i` (the
+underlying's index, one value per push), flags = mark_px only (the
+stream carries no open interest). Values are RAW VENUE UNITS fixed-point
 (Deribit option mark px is coin-denominated); IV is a FRACTION ×1e9
 (Deribit's percent wire value normalized /100); greeks are
 Black-Scholes-style (Deribit `greeks.*`, OKX `*BS`) with SATURATING
@@ -208,7 +269,7 @@ M2.3 — both 0 with flags 0; its `fwdPx` fills `underlying_px_1e9`).
 |     14 |     2 | _pad0             | `[u8; 2]`      | explicit, zeroed                         |
 |     16 |     8 | mark_px_1e9       | `i64`          | raw venue units ×1e9; 0 if flag absent   |
 |     24 |     8 | mark_iv_1e9       | `i64`          | IV fraction ×1e9                         |
-|     32 |     8 | underlying_px_1e9 | `i64`          | Deribit `underlying_price`; OKX `fwdPx`  |
+|     32 |     8 | underlying_px_1e9 | `i64`          | Deribit `underlying_price`; OKX `fwdPx`; Binance `i` (index) |
 |     40 |     8 | open_interest_1e6 | `i64`          | raw venue units ×1e6; 0 if flag absent   |
 |     48 |     4 | delta_1e9         | `i32`          | BS delta ×1e9 (exact; \|δ\| ≤ 1)         |
 |     52 |     4 | gamma_1e9         | `i32`          | BS gamma ×1e9, saturating                |
@@ -225,8 +286,11 @@ per-venue depth ring (`Ring<DepthTopK, 4096>`, engine `on_depth`) AND
 into `<venue>-depth.pmlr`. **Hyperliquid (2026-09-19): HIP-4 outcome
 legs only** — the top-K of each `l2Book` snapshot (a full book the
 venue pushes on a ~5.3 s timer per coin; no ladder, no diffs) lands in
-`hl-depth.pmlr` under the same change gate; there is no HL depth ring
-and perps write nothing here (their touch stays `bbo`-sourced). **First non-64-byte PMLR kind: slot size
+`hl-depth.pmlr` under the same change gate; there is no HL depth ring.
+**XMM XH1 (2026-09-26): perps write here too** — the same top-5 of each
+perp `l2Book`, change-gated, as research capture for the queue-ahead
+study (their touch stays `bbo`-sourced). No lane carries it, so no replay
+merges it: `backtest` drops HL rows whose descriptor classes as a perp. **First non-64-byte PMLR kind: slot size
 is KIND-determined since WS10-B — kinds 0–6 stay 64 B, kind 7 is
 192 B (three cache lines; still a 64-multiple, so mmap'd access
 stays aligned).** On a venue seq-chain break the ladder clears and a
@@ -239,7 +303,7 @@ ascending; slots past the book's real depth are all-zero.
 | -----: | ----: | ----- | ------------------- | ------------------------------------ |
 |      0 |     8 | ts_ns | `u64` NsTs          | ingress apply-complete time          |
 |      8 |     4 | sym   | `u32` SymbolId      |                                      |
-|     12 |     1 | venue | `u8` VenueId        | Okx / Deribit in v1; Hyperliquid (outcome legs) since 2026-09-19 |
+|     12 |     1 | venue | `u8` VenueId        | Okx / Deribit in v1; Hyperliquid (outcome legs) since 2026-09-19, and perps since 2026-09-26 (XMM XH1) |
 |     13 |     1 | k     | `u8`                | always 5 (`DEPTH_K`)                 |
 |     14 |     1 | flags | `u8`                | bit0 = STALE (book resyncing)        |
 |     15 |     1 | _pad0 | `u8`                | explicit, zeroed                     |
@@ -485,12 +549,197 @@ venue sequence, so the §6.2 chain law does not apply to this venue).
 Bybit `Ticker` event rows carry `v0` = 0, `v1` = open interest ×1e6
 (venue base/contract units) — unlike Deribit's mark+OI pairing.
 
+HK31, appended 2026-10-15 — **`pm` `Tick.venue_seq` is the ingress's
+per-asset arrival ordinal; no layout change**
+(`crates/ingress-polymarket/src/lib.rs`, crate docs). CLOB frames carry
+no sequence number, only the quoted-ms `timestamp` (in full in
+`venue_time_ms` since VT2), and the venue sends several frames per
+asset inside one millisecond. The run loop numbers each asset's ticks
+1, 2, 3, … in arrival order (one connection: the venue's order) while
+their `timestamp` does not go back; a tick whose `timestamp` is OLDER
+than its asset's newest carries 0 (every `TopOfBook` drops it; each is
+counted on `engine_ingress_polymarket_seq_regressions_total`). The
+ordinal is dense per asset and per process — it restarts at 1 with each
+process (each `run-*`) and survives reconnects (a reconnect zeroes only
+the per-asset stamp the comparison uses). Captures from before HK31
+hold the low 32 bits of `timestamp` there (equal within a millisecond,
+wrapping every ~49.7 days). No reader keys on either today, but anyone
+replaying several `run-*` cuts through a `TopOfBook` must reset the
+books per run: a later run's ordinals start below the earlier run's,
+and below any pre-HK31 value.
+
+HK32, appended 2026-10-15 — **`hl` and `deribit` `Tick.venue_seq` are
+the ingress's per-instrument arrival ordinal too; no layout change**
+(`crates/ingress-hyperliquid/src/lib.rs`,
+`crates/ingress-deribit/src/lib.rs`, crate docs; the sequencer is
+`core_types::ArrivalSeq`, shared with `pm`). Hyperliquid `bbo` and the
+outcome-leg `l2Book` touch (BIN15 O8) and Deribit `quote` carry no
+sequence number, only a ms stamp (`time` / `timestamp`, in full in
+`venue_time_ms`); until HK32 `venue_seq` held its low 32 bits. Now each
+instrument's ticks are numbered exactly as `pm`'s above: 1, 2, 3, … in
+arrival order while the stamp does not go back, 0 for a tick older than
+the instrument's newest (counted on
+`engine_ingress_<venue>_seq_regressions_total`), dense per instrument
+and per process, surviving reconnects. One Hyperliquid outcome leg has
+ONE sequence across its two tick sources (one book, one block clock).
+Only `Tick` rows change: `hl-events` / `deribit-events` rows keep their
+venue ids (`tid`, `trade_seq`, `change_id`, the roll codec). The same
+per-run book reset applies when replaying cuts.
+
+MX2, appended 2026-09-23 — `mexc` (VenueId 7; spot + futures share
+one label; data-only, ruling O-MX1). The per-venue law
+(`crates/ingress-mexc/src/lib.rs`, `docs/mexc-ingress-plan.md` §4):
+
+- **Ticks are BBO CHANGES** (D11). MEXC republishes unchanged quotes
+  (spot `aggre.bookTicker@10ms` every 10 ms per symbol); a push whose
+  `(bid px, bid qty, ask px, ask qty)` equals the last one EMITTED for
+  its symbol writes no tick row (it still counts in `msgs_total`); the
+  first quote of every session is written, and so is an unchanged quote
+  whose stale verdict flipped or whose previous emission the ring
+  dropped. Tick source: spot
+  `aggre.bookTicker`, futures `depth.full` (limit 5) top level;
+  quantities in venue units ×1e6 — **futures in CONTRACTS** (×
+  `contractSize` for base units). `venue_time_ms`: spot `createTime`
+  else `sendTime`; futures `cts` else the envelope `ts`.
+- **`venue_seq`** (ruling Q-MX1): spot book `version`, spot trade =
+  the LEADING DIGITS of the `tradeId` string (0 when it has none or
+  the run overflows `u64`), futures book `version`, futures deal `i`.
+  `Tick.venue_seq` = the low 32 bits, `ChannelEvent.venue_seq` the
+  full `u64`. The §6.2 chain law does NOT apply — these are
+  sampled/snapshot streams that skip versions by design — so MEXC
+  emits no `TradeGap`/`BookGap` and `gaps_total` stays 0. A seq
+  strictly below the last-seen one of the same symbol × stream (book /
+  trade) increments `engine_ingress_mexc_seq_regressions_total` (a
+  counter, no event row).
+- `Trade` (0): `v0` = px ×1e6, `v1` = qty ×1e6 (spot base units,
+  futures contracts) NEGATED when the aggressor sold (spot
+  `tradeType == 2`, futures `T == 2`); `venue_time_ms` = the print's
+  own time, else the push's.
+- `Mark` (2), `Funding` (3), `Ticker` (4) — one futures `push.ticker`
+  frame, one row per field group present, `venue_time_ms` = its
+  `timestamp` else `ts`: `Mark` `v0` = `fairPrice` ×1e6, `v1` =
+  `indexPrice` ×1e6 (the Binance `@markPrice` shape); `Funding` `v0` =
+  rate ×1e9, `v1` = next-settle ms, seeded per perp at boot from REST
+  `funding_rate/{SYM}` (`nextSettleTime`) and advanced by THAT symbol's
+  `collectCycle` — 8 h or 4 h (ruling Q-MX3) — **0 when unseeded**;
+  `Ticker` `v0` = 0, `v1` = `holdVol` ×1e6 in contracts (the Bybit
+  shape).
+- `SubDrop` (11): `v0` = 1 (`SUB_DROP_REFUSED` — MEXC names no numeric
+  code: a param refused in the spot per-param echo, a futures
+  `rs.error` `"Contract [X] not exists"`, or a futures `rs.sub.*`
+  non-success) or the spot ack's non-zero `code` (a whole-request
+  refusal); `v1` = the venue-local channel — 0 spot bookTicker · 1 spot
+  deals · 2 futures depth.full · 3 futures deal · 4 futures ticker · −1
+  unknown (`rs.error` names no channel); `sym` = the refused instrument
+  when the echo or the `rs.error` names it, else `SYMBOL_ID_NONE`. Any
+  other `rs.error` (the 60 s heartbeat notice) is NOT a drop. A refused
+  symbol never blinds its socket: only a spot ack refusing EVERY pair,
+  or an `rs.sub.*` non-success, on a never-confirmed driver is fatal.
+
 Engine-side single-file sinks (`core_io::SlotCapture`) in the same
 run dir: `engine-fills.pmlr` (kind 2, Phase 8f — every fill
 dispatched to `Strategy::on_fill`, venue lanes + dispatcher pump),
 `engine-orders.pmlr` (kind 3, M4.1 — every order ACCEPTED by the
 dispatcher via `ctx.submit`; refusals are counters only), and
 `ai-cmds.pmlr` (kind 4, written by `ingress-ai`).
+
+BX0, appended 2026-09-23 — **Binance (`bn`) market data re-lit; no
+layout change.** Both lanes had gone dark venue-side without a single
+error: fstream answers the upgrade (101) on a route that no longer
+carries the stream and then sends nothing.
+
+- **USDⓈ-M `Mark` (2) / `Funding` (3) rows** (BX0-F1): the markPrice
+  slots dial fstream's ROUTED `/market/ws/<sym>@markPrice`. Binance
+  stopped serving `/market` streams on the legacy `/ws/` URLs on
+  2026-04-23 — before the WS5 lane existed (its 2026-08-29 "partial
+  venue fault" diagnosis was this routing) — so **no capture made
+  before the first post-BX0 boot holds a Binance Mark or Funding
+  row**; they appear from that boot on, additively (the bookTicker
+  `Tick` rows never stopped — `/ws/` still carries the `/public`
+  streams). The live frame gained `ap` and `st`
+  keys (skipped). A delivery contract writes `Mark` only: the WS5-era
+  wire sent `"r":""`, the live one sends `"r":"0.00000000","T":0`,
+  and `Funding` is written only for a parseable rate WITH a next
+  settlement (`T` > 0).
+- **Binance options** (BX0-F2): one combined slot,
+  `/market/stream?streams=<uly>@optionMarkPrice/…` on fstream (the
+  nbstream `/eoptions/` `@ticker`/`@index` routes answer 404 since the
+  2025-12 options migration — `bn-opt-summary.pmlr` is header-only
+  in every capture since then). Each push is ONE array holding the
+  underlying's whole listed chain (752 BTC options ≈ 246 KB, about
+  once a second); the lane keeps the boot-selected rows and skips the
+  rest by table lookup. Per selected row per push: one `OptSummary`
+  (above) and one `Tick` when a side is quoted (`bo`/`bq`, `ao`/`aq`;
+  `venue_seq` 0, no venue stamp — the stream carries neither per
+  row). Instrument names and syms resolve through
+  `options-manifest.tsv` / `instrument-manifest.tsv` as before.
+
+### The Binance execution journal — `binance-exec.pmlr` (BX6; refreshed at BX11, 2026-10-09; Binance Stocks at BX10, 2026-10-11)
+
+PMLR `slot_kind = 8` (`SlotKind::Exec`), one per run in the run directory,
+written by the arm's cold `bn-journal` thread from an SPSC ring (the
+engine's: 1 024 records; BX11 made the capacity the gateway's type
+parameter, so a test can run a two-record ring). A full ring drops the
+record and counts it (`GW_JOURNAL_DROPPED`, `/state`
+`exec.arms.binance_gw.journal_dropped`) — except the E7 anchor, which the
+gateway offers again until the ring takes it (S8). A 64 B header, then
+64 B `ExecRecord` slots (`core_types::ExecRecord`, `#[repr(C, align(64))]`):
+
+| offset | field | type | meaning |
+|---|---|---|---|
+| 0 | `ts_ns` | u64 | monotonic ns of the observation |
+| 8 | `wall_ms` | u64 | wall ms on the gateway's venue clock |
+| 16 | `client_oid` | u64 | the member's order id (0 if none) |
+| 24 | `venue_oid` | u64 | the venue's order id (0 if none); a Binance Stocks order's (BX10) is its UUID's key — `exec_binance::equity::eq_key`, FNV-1a over the case-folded 36 bytes, never 0 (the UUID is not a number) |
+| 32 | `a` | i64 | by kind |
+| 40 | `b` | i64 | by kind |
+| 48 | `c` | i64 | by kind |
+| 56 | `code` | i32 | by kind |
+| 60 | `row` | u16 | the arm's instrument row |
+| 62 | `kind` | u8 | below |
+| 63 | `slot` | u8 | the strategy slot |
+
+| kind | name | `a` | `b` | `c` | `code` |
+|---|---|---|---|---|---|
+| 1 | ACK | 0 | 0 | 0 | 0 (`venue_oid` set; on Binance Stocks the venue's receipt, `status:"S"`) |
+| 2 | REJECT | filled ×1e6 (0 when refused locally) | quantity ×1e6 (likewise) | 0 | the venue's code (negative), or the gateway's own: 9 001 table full · 9 002 duplicate id · 9 003 not ready · 9 004 render · 9 005 request ids full · 9 006 unknown order · 9 007 modify busy · 9 008 quiet · 9 009 deadline queue full · 9 014 swept unsent (BX7: a REST-route place or modify still held when a sweep began) · 9 018 Binance Stocks refused a place without a code (`status:"F"`), or its detail read `REJECTED` (BX10; moves the reject streak) · 9 019 an equity place with no TTL (BX10; refused before rendering); Binance Stocks' own codes are six-digit positives (`486…`) |
+| 3 | FILL | price ×1e6 | quantity ×1e6, signed by side | **0 since BX11** (the trade's commission is its FEE; BX6–BX7b journals carry the update's commission ×1e6 here when the update booked first, else 0) | bits: 1 maker · 2 LOST (never reached lane 4; nothing booked) · 4 UNSEEN (booked without its trade: from a status answer or a cumulative `z`, at the implied average — no commission or maker flag; exclude from fee and markout work) · 8 ADOPTED (BX7: the venue's position adopted at boot as the owner slot's inventory — no trade; BX-14 excludes it) |
+| 4 | ENDED | filled ×1e6 | quantity ×1e6 | 0 | the `RETIRED_*` reason |
+| 5 | RECON | drift USD ×1e6 | unseen legs | foreign orders | 1 if reconciled; 2 (`J_RECON_HELD`, BX13) a cycle held inconclusive |
+| 6 | MARGIN | ratio ×1e6 (the product's) | the session equity USD ×1e6 (USDⓈ-M's on a classic account, the unified account's in PM and PM Pro) | 1 on a margin call | the product (`PRODUCT_*`, BX7; 0 before) |
+| 7 | VENUE | 0 | 0 | 0 | the budget or lock code: the venue's (negative; or Binance Stocks' positive `486410`, the US-equity disclaimer unsigned, BX10), or 9 010 PM risk level · 9 011 PM account status · 9 012 account reconfigured (`ACCOUNT_CONFIG_UPDATE`) · 9 013 an owned row not cross-margined (BX7) |
+| 8 | SWEEP | orders left | cancels sent | 0 | 0 |
+| 9 | ANCHOR | the E7 session anchor, equity USD ×1e6 | 0 | 0 | 0 |
+| 10 | **FEE** (BX11) | the trade's price ×1e6 | its notional ×1e9 in the row's settlement asset (USDⓈ-M: price × quantity, the quote; COIN-M: contracts × face ÷ price, the coin) | the commission ×1e9 in its own asset (`n`; negative for a rebate) | bit 0 the maker · bits 1–2 the asset to the row (0 none named · 1 the row's settlement asset · 2 BNB · 3 another) · bits 4–6 whose order (0 the member's · 1 an earlier boot's · 2 settlement · 3 liquidation · 4 ADL) · bits 8–11 the product (`PRODUCT_*`) · bit 12 a dated row · bit 13 a TradFi row · bit 14 a Binance Stocks fee at the $0.35 per-order floor (BX10: the order's notional under $350 — no rate) (`exec_binance::journal::fee_fields` reads them back) |
+| 11 | **ACCEPTED** (BX10) | 0 | 0 | 0 | 0 — the broker accepted a Binance Stocks order (its `ACCEPTED`, after the venue's receipt, the ACK); `venue_oid` the UUID's key; once per order |
+
+A FILL's and a FEE's `client_oid` is the member's id, or 0 for a
+liquidation, ADL, settlement or older-epoch trade; a FEE's `venue_oid` is
+the venue's order id. **One FEE per trade** (BX11): only
+`ORDER_TRADE_UPDATE` carries a commission, and `TRADE_LITE` usually books
+the fill first (BX7b K2: 14 of 15 Demo IoCs), so the FEE comes from the
+first update that reports the trade, whichever report booked it — never
+twice for a replayed update. A trade the stream lost has no FEE (its fill
+is UNSEEN); a fee measurement (BX-14) reads FEE records alone: the rate is
+`c / b` where the asset is the row's settlement asset.
+
+**Binance Stocks (BX10)** has no per-trade commission: the order's detail
+carries a cumulative `fee` in USD. A FEE is journaled each time a detail
+raises it: `a` the order's average price ×1e6 (the row's last fill price
+when the detail names none), `b` the increase of the
+order's filled notional ×1e9 (USD), `c` the fee's increase ×1e9 (USD), the
+asset bits the row's settlement asset (USD); bit 14 while the order's
+notional is under $350 (the $0.35 minimum, no rate — `bn-fees` counts it
+apart). An equity FILL comes from the detail's executions (each once);
+the remainder its cumulative names past them is UNSEEN (bit 4), at the
+implied price.
+
+An ANCHOR record is also persisted by the writer to
+`binance-pnl-anchor.state` beside `exec.toml`: one line
+`<tag>\t<equity ×1e6>\t<unix s>\t<account mode>` (the mode since BX7: a
+line without one is a classic session's), the tag the first 8 bytes of
+SHA-256 of the API key in hex (never the key); retried every second until
+the store succeeds.
 
 ### Options manifest — `options-manifest.tsv` (M2 close)
 
@@ -504,7 +753,7 @@ shadow-P&L) resolve option syms through this file. UTF-8 text, one
 line per selected instrument,
 `<venue_label>\t<sym_u32_decimal>\t<instrument_name>\n`, where
 `venue_label` is the venue's capture-file prefix (`deribit`, `okx`,
-`bn`); no header line; present only when the boot selected ≥ 1
+`bn`, `hypercall` since HC4); no header line; present only when the boot selected ≥ 1
 option instrument (absence = options-less or pre-M2-close run).
 Readers parse strictly and skip-and-count malformed lines.
 
@@ -514,8 +763,8 @@ The options manifest generalized to EVERY allocated instrument:
 written once by the bin on EVERY boot (a boot always carries ≥ 1
 instrument), `<sym_u32_decimal>\t<descriptor>\n` per line, where
 `descriptor` is the FINAL §9.4 worker map-name string (PM token ids
-bare; `binance:` / `binance-usdm:` / `okx:` / `deribit:` /
-`hyperliquid:` for the static lanes — baked by
+bare; `binance:` / `binance-usdm:` / `binance-coinm:` / `okx:` /
+`deribit:` / `hyperliquid:` for the static lanes — baked by
 `core-config::universe` at allocation; options
 `deribit:`/`okx:`/`binance-opt:` + instrument name). Emission order =
 allocation order. This is the sym→descriptor resolution lane for
@@ -523,6 +772,18 @@ every offline venue+descriptor consumer (`audit-pnl`, the §9.8 IV
 digest, M5 naming); `options-manifest.tsv` is kept ONE release for
 pre-D3 readers and then retires. Absence = a pre-D3 run. Readers
 parse strictly and skip-and-count malformed lines.
+
+**COIN-M (BX2).** `[binance] coinm` / `coinm_dated` instruments are
+VenueId 1 (`bn` captures, the same files as spot and USDⓈ-M), ordinals
+from 3072 (perpetuals, `<coin>usd_perp`) and 3584 (delivery,
+`<coin>usd_<yymmdd>`), one `binance-coinm:` namespace — the class law
+reads the suffix (`_perp` → perp, six digits → dated). Each gets a
+bookTicker `Tick` and a capture-only `markPrice` lane exactly like
+USDⓈ-M (mark/index `Mark` events; `Funding` on perpetuals only). The
+contracts are INVERSE: `Tick` quantities and the worker's candle `v`
+are CONTRACTS (100 USD of face on BTC, 10 USD on the others), not
+coin; the frames carry `st: 2`. A consumer converting to coin or USD
+needs the contract face (dapi `exchangeInfo` `contractSize`).
 
 ### Raw tap — `<venue>-raw.tap`
 
@@ -544,6 +805,66 @@ parser rejected the payload. The file is budget-bounded at capture
 time; a torn final record (crash mid-write) is detected by readers and
 terminates iteration.
 
+### HyperEVM pool events (HYPARB H3b)
+
+Label `hyperevm` (VenueId 8), appended after `mexc`. The venue writes NO
+tick rows: everything it observes is a `Signal` (kind 1) in
+`hyperevm-signals.pmlr` with `source = SignalSource::HyperEvm` (5), `sym`
+= the pool (`make_symbol_id(HyperEvm, i+1)` for `[hyperevm] pools[i]`) or
+`SYMBOL_ID_NONE` for the chain-wide `HEAD` / `GAP`, and the 40-byte
+payload of `core_amm::payload` — ONE codec for the ring, the tape and the
+replay (its module doc is the byte-level contract). One swap is `SWAP`
+then `STATE`; a pool snapshot is `SNAPSHOT` (block, family, coverage,
+node count, fee in force, `tickSpacing`, token decimals — checked against
+`decimals()` on chain) · `nodes` × `TICK` · `STATE(snapshot)`, published
+before any later event, so a replay rebuilds the maps the live member
+walked. A capture is therefore self-describing: the harness prices and
+judges a pool from the tape alone (`core_fill::AmmBook`). Volume: one
+signal per event (≈ 2 per swap), never per block per pool.
+
+### Hypercall (HC3)
+
+Label `hypercall` (VenueId 9), appended after `hyperevm`. DATA-ONLY
+(ruling O-HC1: no keys, no exec arm, the paper matcher refuses the
+venue). One public WebSocket (`wss://api.hypercall.xyz/ws`) plus a REST
+poller thread; both write through the ingress thread's one
+`PmlrCapture` (the poller hands its rows over an SPSC ring), so every
+file keeps one writer. The per-venue law (`crates/ingress-hypercall`):
+
+- **Ticks are BBO CHANGES** of the `indicative_market_data` quote (the
+  MEXC D11 law): a push whose `(bid px, bid qty, ask px, ask qty)` and
+  stale verdict equal the last one EMITTED for the instrument writes no
+  tick row. Quotes are written as the venue published them — ONE-SIDED
+  (the missing side `0 / 0`) and CROSSED included; a push with neither
+  side writes nothing. Prices ×1e6 USD per contract, quantities ×1e6
+  CONTRACTS (1 contract = 1 unit of the underlying). `venue_time_ms` =
+  the quote's `timestamp` (the providers' quote stamp — the staleness
+  clock), NOT `published_at` (their difference is the
+  `quote_publish_lag_ms` gauge). `venue_seq` = 0: the feed has no
+  sequence, so the §6.2 chain law does not apply and `gaps_total`
+  stays 0. An instrument the venue announces `Expired`/`Deleted` stops
+  writing for the rest of the process.
+- `Trade` (0): `v0` = px ×1e6, `v1` = size ×1e6 contracts, negated when
+  the aggressor sold; `venue_time_ms` = the print's `timestamp`. Prints
+  on instruments outside the universe are counted, not written.
+- `Mark` (2): the venue's underlying INDEX, one row per configured
+  underlying per `IndexPriceUpdate` (≈ every 2 s) on its
+  `hypercall-idx:<U>` sym: `v0` = index ×1e6; `v1` and
+  `venue_time_ms` both carry the entry's own source time (ms).
+- `ProviderQuote` (14): see the `ChannelEvent` table.
+- `<venue>-opt-summary.pmlr` rows come from the REST poller
+  (`GET /options-summary?currency=<U>`, one underlying at a time,
+  staggered over `summary_every_s`, default 300 s, plus one full round
+  after a slow-consumer close): `mark_px_1e9` USD per contract (0 on an
+  unpriced row, which then carries no `MARK_PX` flag), `mark_iv_1e9` a
+  FRACTION (0.52 → 520 000 000 — Hypercall, unlike Deribit, does not
+  send percent), `underlying_px_1e9`, `open_interest_1e6` contracts and
+  the four greeks. `ts_ns` = the poll's receive instant.
+- Descriptors (`instrument-manifest.tsv` / `options-manifest.tsv`):
+  `hypercall:<instrument>` (e.g. `hypercall:BTC-20261002-100000-C`) and
+  `hypercall-idx:<U>` for the index syms; the options manifest's label
+  is `hypercall`.
+
 ## Replay log
 
 **TODO** — pinned here in Phase 1. Provisional shape:
@@ -558,7 +879,7 @@ Header:
 | -----: | ----: | ------------ | ---------------------------------------- |
 |      0 |     4 | magic        | `b"PMLR"`                                |
 |      4 |     2 | version      | `u16` — current = **3** (VT1); readers accept ≤ 3 |
-|      6 |     1 | slot_kind    | `u8` — 0=Tick, 1=Signal, 2=Fill, 3=Order, 4=AiCmd (8f §8.4), 5=ChannelEvent (8e), 6=OptSummary (M2.3), 7=DepthTopK (WS10-B) |
+|      6 |     1 | slot_kind    | `u8` — 0=Tick, 1=Signal, 2=Fill, 3=Order, 4=AiCmd (8f §8.4), 5=ChannelEvent (8e), 6=OptSummary (M2.3), 7=DepthTopK (WS10-B), 8=ExecRecord (BX6), 9=OrderEvent (XMM XH5d) |
 |      7 |     1 | _pad0        |                                          |
 |      8 |     8 | epoch_ns     | wall-clock ns at file open               |
 |     16 |    48 | _reserved    |                                          |

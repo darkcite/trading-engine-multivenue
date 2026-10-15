@@ -107,6 +107,13 @@ pub struct BootUniverse {
     /// logs the consequence. The dropped combos are also cleared
     /// from `allocated.deribit_combos`.
     pub deribit_combos_dropped: bool,
+    /// HC4: the `[hypercall]` capped-chain policy (config-file only —
+    /// no flag names the venue, so nothing overrides it; disabled in
+    /// legacy boots). The settlement indices are already allocated in
+    /// `allocated.hypercall_idx`.
+    pub hypercall_options: universe::OptionsPolicy,
+    /// HC4: `[hypercall] summary_every_s` (0 while the lane is off).
+    pub hypercall_summary_every_s: u32,
     /// True when a universe config file drove this resolution.
     pub from_config: bool,
 }
@@ -193,6 +200,8 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
                 deribit_options: universe::OptionsPolicy::default(),
                 deribit_options_dropped: false,
                 deribit_combos_dropped: false,
+                hypercall_options: universe::OptionsPolicy::default(),
+                hypercall_summary_every_s: 0,
                 from_config: false,
             }
         }
@@ -253,9 +262,10 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
             } else {
                 (u.okx_options.clone(), false)
             };
-            // M2.4: --binance-symbol replaces the whole [binance]
-            // section (spot/usdm handled above via the allocated
-            // universe) — the options policy drops with it.
+            // M2.4: --binance-symbol replaces the [binance] spot list
+            // (above, before allocation) and drops the options policy;
+            // the futures lists — usdm, usdm_dated and (BX2) coinm,
+            // coinm_dated — stay as configured.
             let bn_flag_active = f
                 .bn_symbol
                 .map(str::trim)
@@ -280,6 +290,8 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
                 deribit_options,
                 deribit_options_dropped,
                 deribit_combos_dropped,
+                hypercall_options: u.hypercall.clone(),
+                hypercall_summary_every_s: u.hypercall_summary_every_s,
                 allocated,
                 from_config: true,
             }
@@ -485,6 +497,36 @@ mod tests {
     }
 
     #[test]
+    fn config_hypercall_policy_carried_and_legacy_off() {
+        // HC4: config-file only; no flag touches it, the indices are
+        // allocated with the rest of the file.
+        let src = format!(
+            "{}[hypercall]\nunderlyings = [\"SP500\", \"BTC\"]\nexpiries = 3\nstrikes = 8\n",
+            cfg_src()
+        );
+        let f = UniverseFlags {
+            config_src: Some(&src),
+            okx_symbols: Some("BTC-USDT"),
+            ..UniverseFlags::default()
+        };
+        let b = resolve_boot_universe(&f).expect("config resolves");
+        assert!(b.hypercall_options.enabled());
+        assert_eq!(b.hypercall_options.underlyings, vec!["SP500", "BTC"]);
+        assert_eq!((b.hypercall_options.expiries, b.hypercall_options.strikes), (3, 8));
+        assert_eq!(b.hypercall_summary_every_s, universe::HC_SUMMARY_EVERY_S_DEFAULT);
+        assert_eq!(b.allocated.hypercall_idx.len(), 2);
+        assert_eq!(b.allocated.hypercall_idx[1].descriptor, "hypercall-idx:BTC");
+        let legacy = resolve_boot_universe(&UniverseFlags {
+            pm_asset_id: Some(T1),
+            ..UniverseFlags::default()
+        })
+        .expect("legacy resolves");
+        assert!(!legacy.hypercall_options.enabled());
+        assert_eq!(legacy.hypercall_summary_every_s, 0);
+        assert!(legacy.allocated.hypercall_idx.is_empty());
+    }
+
+    #[test]
     fn config_options_policy_carried_through() {
         let src = cfg_src_with_options();
         let f = UniverseFlags {
@@ -608,5 +650,32 @@ mod tests {
         let b2 = resolve_boot_universe(&f2).expect("resolves");
         assert!(!b2.bn_options.enabled());
         assert!(b2.bn_options_dropped);
+    }
+
+    // ---- BX2 COIN-M lists through the resolver ---------------------
+
+    #[test]
+    fn binance_symbol_flag_replaces_spot_and_keeps_the_futures_lists() {
+        let src = format!(
+            "[polymarket]\nmarkets = [\"{T1}\"]\n[binance]\nspot = [\"btcusdt\"]\n\
+             usdm = [\"btcusdt\"]\ncoinm = [\"btcusd_perp\"]\ncoinm_dated = [\"btcusd_261225\"]\n"
+        );
+        let f = UniverseFlags {
+            config_src: Some(&src),
+            ..UniverseFlags::default()
+        };
+        let b = resolve_boot_universe(&f).expect("resolves");
+        assert_eq!(b.allocated.bn_coinm[0].descriptor, "binance-coinm:btcusd_perp");
+        assert_eq!(b.allocated.bn_coinm_dated[0].name, "btcusd_261225");
+        let f2 = UniverseFlags {
+            config_src: Some(&src),
+            bn_symbol: Some("ethusdt"),
+            ..UniverseFlags::default()
+        };
+        let b2 = resolve_boot_universe(&f2).expect("resolves");
+        assert_eq!(b2.allocated.bn_spot[0].name, "ethusdt");
+        assert_eq!(b2.allocated.bn_usdm, b.allocated.bn_usdm);
+        assert_eq!(b2.allocated.bn_coinm, b.allocated.bn_coinm);
+        assert_eq!(b2.allocated.bn_coinm_dated, b.allocated.bn_coinm_dated);
     }
 }

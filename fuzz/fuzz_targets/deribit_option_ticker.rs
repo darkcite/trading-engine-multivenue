@@ -13,6 +13,12 @@
 
 use libfuzzer_sys::fuzz_target;
 
+#[path = "common/poison.rs"]
+mod poison;
+
 fuzz_target!(|data: &[u8]| {
-    let _ = ingress_deribit::parse_option_ticker(data);
+    let mut f: ingress_deribit::DeribitOptTickerFrame = poison::poisoned();
+    if !ingress_deribit::parse_option_ticker(data, &mut f) {
+        assert_eq!(f, poison::poisoned::<ingress_deribit::DeribitOptTickerFrame>(), "a failed parse wrote the frame");
+    }
 });

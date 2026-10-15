@@ -1,19 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! Hand-rolled SIGINT handler.
+//! Hand-rolled SIGINT / SIGTERM handler.
 //!
-//! Goal: when the user hits `Ctrl+C` (or `kill -INT $pid`), flip a
-//! single static [`AtomicBool`] that every ingress run-loop polls at
-//! the top of its mio cycle. No external crate (`signal-hook`,
-//! `ctrlc`, etc.) — those would either pull a runtime or queue
-//! callbacks on a helper thread we don't need.
+//! Goal: when the user hits `Ctrl+C` (or `kill -INT $pid`), or the
+//! restart lane sends `SIGTERM` (`scripts/daily-restart.sh`, launchd's
+//! `bootout`), flip a single static [`AtomicBool`] that every ingress
+//! run-loop polls at the top of its mio cycle. No external crate
+//! (`signal-hook`, `ctrlc`, etc.) — those would either pull a runtime
+//! or queue callbacks on a helper thread we don't need.
 //!
-//! The handler itself is **async-signal-safe**: it does exactly one
-//! atomic store. No allocation, no I/O, no locks.
+//! **S7-L1 — SIGTERM drains too.** Only SIGINT used to be caught, so
+//! the SIGTERM the restart lane sends five times a UTC day took the
+//! default action and killed the process where it stood: no member
+//! state flushed (the F18 drain law's `flush_member_state!` never ran on
+//! a scheduled restart), no `Engine::stop`, and — once a slot trades
+//! live — no cancel of the quotes resting on the venue. Both signals now
+//! take the same path.
 //!
-//! Two-stage shutdown: first SIGINT flips the flag; if the user hits
-//! it *again* while the engine is still running, we re-raise the
+//! The handler itself is **async-signal-safe**: one atomic swap and an
+//! `alarm(2)`. No allocation, no I/O, no locks.
+//!
+//! Two-stage shutdown: the first signal flips the flag and arms a
+//! [`DRAIN_DEADLINE_S`] alarm, whose default action kills a drain that
+//! hangs — so a restart can be delayed by the drain, never prevented by
+//! it. A second signal while the engine is still running re-raises the
 //! default handler so the process dies immediately. This avoids the
 //! "stuck on shutdown" papercut.
 
@@ -35,17 +46,33 @@ pub fn shutdown_requested() -> bool {
     SHUTDOWN.load(Ordering::Acquire)
 }
 
-/// Install the SIGINT handler. Idempotent — calling twice in the
-/// same process re-registers the same routine. The second SIGINT
-/// raises the default handler (SIG_DFL) so the process exits.
+/// **S7-L1** — seconds a drain may take after the first shutdown
+/// signal before `SIGALRM`'s default action ends the process anyway.
 ///
-/// Returns the previous handler config so tests can restore it.
+/// The drain flushes member state, stops the engine (the live arm's
+/// account-wide cancel runs there, itself bounded well inside this) and
+/// joins the ingress threads. Thirty seconds is far above a healthy
+/// drain and far below the capture catalog's 300 s gap tolerance; a
+/// drain that hangs costs the restart at most this, where the old
+/// SIGTERM path cost nothing and flushed nothing.
+pub const DRAIN_DEADLINE_S: u32 = 30;
+
+/// Install the shutdown handler for SIGINT and SIGTERM. Idempotent —
+/// calling twice in the same process re-registers the same routine. A
+/// second signal raises the default handler (SIG_DFL) so the process
+/// exits.
 pub fn install_sigint_handler() -> io::Result<()> {
     install_impl()
 }
 
 #[cfg(unix)]
 fn install_impl() -> io::Result<()> {
+    install_one(libc::SIGINT)?;
+    install_one(libc::SIGTERM)
+}
+
+#[cfg(unix)]
+fn install_one(sig: libc::c_int) -> io::Result<()> {
     // SAFETY: `sigaction` mutates a kernel-side table for the
     // current process. `sa` is fully populated below. We do not
     // borrow any non-static state from inside the handler.
@@ -56,7 +83,7 @@ fn install_impl() -> io::Result<()> {
         // than fail with EINTR — keeps the ingress threads simple.
         sa.sa_flags = libc::SA_RESTART;
         libc::sigemptyset(&mut sa.sa_mask);
-        let rc = libc::sigaction(libc::SIGINT, &sa as *const _, ::core::ptr::null_mut());
+        let rc = libc::sigaction(sig, &sa as *const _, ::core::ptr::null_mut());
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -76,12 +103,20 @@ fn install_impl() -> io::Result<()> {
 // fine because they're library-level (no syscalls, no `errno`
 // touches).
 #[cfg(unix)]
-extern "C" fn handle_sigint(_sig: libc::c_int) {
-    // First Ctrl+C: ask everything to stop politely.
+extern "C" fn handle_sigint(sig: libc::c_int) {
+    // First signal: ask everything to stop politely — against a
+    // deadline. `alarm` is on the async-signal-safe allowlist, and
+    // SIGALRM's default action terminates the process, so a drain
+    // that hangs is ended rather than left holding the restart.
     if !SHUTDOWN.swap(true, Ordering::Release) {
+        // SAFETY: `alarm` takes a plain integer and touches no state
+        // of ours; it is async-signal-safe per POSIX.
+        unsafe {
+            libc::alarm(DRAIN_DEADLINE_S);
+        }
         return;
     }
-    // Second Ctrl+C: revert SIGINT to SIG_DFL and re-raise so the
+    // Second signal: revert THAT signal to SIG_DFL and re-raise so the
     // process dies. This block is also async-signal-safe (sigaction
     // + raise are both on the allowlist).
 
@@ -91,8 +126,8 @@ extern "C" fn handle_sigint(_sig: libc::c_int) {
         let mut sa: libc::sigaction = ::core::mem::zeroed();
         sa.sa_sigaction = libc::SIG_DFL;
         libc::sigemptyset(&mut sa.sa_mask);
-        libc::sigaction(libc::SIGINT, &sa as *const _, ::core::ptr::null_mut());
-        libc::raise(libc::SIGINT);
+        libc::sigaction(sig, &sa as *const _, ::core::ptr::null_mut());
+        libc::raise(sig);
     }
 }
 

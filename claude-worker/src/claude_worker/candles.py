@@ -14,7 +14,7 @@ BINDING laws (docs/mvp-completion-plan.md §9, verbatim inheritance):
 - **§9.4 store**: SQLite WAL, ONE table, PK ``(venue, descriptor,
   tf, open_ts)``. ``descriptor`` is the venue instrument string in
   the worker map-name convention (``binance:btcusdt``,
-  ``binance-usdm:btcusdt``, ``okx:BTC-USDT``,
+  ``binance-usdm:btcusdt``, ``binance-coinm:btcusd_perp``, ``okx:BTC-USDT``,
   ``deribit:BTC-PERPETUAL``, ``hyperliquid:BTC``, a PM token id) —
   NEVER a bare SymbolId (ids reshuffle across boots). Columns
   ``o,h,l,c,v``, ``source`` ∈ ``rest|derived|capture``,
@@ -39,6 +39,15 @@ BINDING laws (docs/mvp-completion-plan.md §9, verbatim inheritance):
   Derived tfs follow their bases (no 1 m ⇒ no 5 m/15 m; 4 h still
   derives from 1 h). An unusable policy file is reported and IGNORED
   (best-effort law) — never a narrower fetch by accident.
+  Two more lane keys (HAR W1, 2026-09-26): ``extra = [...]`` — instruments
+  the universe does not name, fetched by that lane like its own (the
+  engine never subscribes them; ``[hyperliquid] extra = ["xyz:SP500"]``
+  is the descriptor ``hyperliquid:xyz:SP500``), a lane the universe lacks
+  included; and ``backfill_1m_h = N`` — that lane's 1 m backfill for an
+  EMPTY series, over ``CLAUDE_WORKER_CANDLES_BACKFILL_1M_H`` and the 48 h
+  default (§9.6). The HL lane is paced to HALF of HL's per-IP weight
+  minute (``CLAUDE_WORKER_CANDLES_HL_WEIGHT_PER_MIN``, 600): the engine on
+  the same host keeps the other half.
 - **§9.6 gap-fill**: per (descriptor, tf): ``SELECT max(open_ts)`` →
   request ONLY the missing window (re-requesting the stored max bar
   itself, which may have been OPEN at the last cycle) → paginate
@@ -62,6 +71,19 @@ BINDING laws (docs/mvp-completion-plan.md §9, verbatim inheritance):
   upserted ONLY when it connects to the stored frontier — a
   budget-truncated backward walk is discarded whole, otherwise
   ``max(open_ts)`` would leap over a permanent hole.
+- **No future bars (HK7, 2026-10-13)**: a real bar never opens after the
+  moment it is fetched. A fetched bar opening more than ``FUTURE_SKEW_MS``
+  after the fetch (the wall clock at the page, or the cycle's ``now``
+  where no clock is passed) is refused, never stored: such rows froze a
+  series' frontier until their date passed, and the placeholder minutes
+  behind a jumped frontier were never fetched again (MEXC's TradFi perps
+  answered flat bars ahead of time — 1 d rows to 2028). The MEXC request
+  ends at ``now`` (the Deribit and HL shape). ``--repair-future`` deletes
+  the rows already stored.
+- **The Hypercall index capture (HK7, H3 plan §5 W1)**: ``Mark`` prints
+  on ``hypercall-idx:<U>`` in ``hypercall-events.pmlr`` fold into 1 m
+  ``capture`` bars (venue 9), placed by the index's own time; idempotent
+  per (descriptor, minute) like the PM capture lane.
 
 Best-effort discipline throughout (fetchers pattern): transport
 failure / unusable body = counted + skipped, never a crash; the
@@ -70,6 +92,7 @@ calls in tests — HTTP rides injectable ``get_fn``/``post_fn``.
 """
 
 import argparse
+import collections
 import collections.abc
 import datetime
 import json
@@ -82,11 +105,13 @@ import tomllib
 import typing
 
 import httpx
+import numpy
 
 import claude_worker.cli
 import claude_worker.features
 import claude_worker.fetchers
 import claude_worker.frames
+import claude_worker.iv_digest
 import claude_worker.pmlr
 
 CANDLES_DB_ENV: str = "CLAUDE_WORKER_CANDLES_DB"
@@ -101,9 +126,28 @@ BN_REST_HOST_ENV: str = "BINANCE_REST_HOST"
 BN_REST_HOST_DEFAULT: str = "api.binance.com"
 BN_FUT_REST_HOST_ENV: str = "BINANCE_FUT_REST_HOST"
 BN_FUT_REST_HOST_DEFAULT: str = "fapi.binance.com"
+# BX2: COIN-M REST host (mirrors the engine's BINANCE_COINM_REST_HOST).
+BN_COINM_REST_HOST_ENV: str = "BINANCE_COINM_REST_HOST"
+BN_COINM_REST_HOST_DEFAULT: str = "dapi.binance.com"
+#: The two Binance futures kline endpoints, by lane. BX2 (measured live
+#: 2026-09-26): dapi's ``/dapi/v1/klines`` rows are fapi's shape; the
+#: volume column is CONTRACTS (100 USD on BTC, 10 USD on the others — the
+#: raw venue unit, the MEXC-perp precedent); ``startTime=0`` walks from
+#: the listing on both.
+_BN_FUT_KLINES: dict[str, str] = {
+    "binance-usdm": "/fapi/v1/klines",
+    "binance-coinm": "/dapi/v1/klines",
+}
 # WS9: Bybit REST host (mirrors the engine's BYBIT_REST_HOST).
 BYBIT_REST_HOST_ENV: str = "BYBIT_REST_HOST"
 BYBIT_REST_HOST_DEFAULT: str = "api.bybit.com"
+# MX7: MEXC splits spot and futures across TWO REST hosts (mirrors the
+# engine's MEXC_REST_HOST / MEXC_FUT_REST_HOST) — two budgets, see
+# `budget_key`.
+MEXC_REST_HOST_ENV: str = "MEXC_REST_HOST"
+MEXC_REST_HOST_DEFAULT: str = "api.mexc.com"
+MEXC_FUT_REST_HOST_ENV: str = "MEXC_FUT_REST_HOST"
+MEXC_FUT_REST_HOST_DEFAULT: str = "contract.mexc.com"
 
 MS_1M: int = 60_000
 MS_1H: int = 3_600_000
@@ -135,6 +179,17 @@ HL_1D_FLOOR_MS: int = 1_577_836_800_000  # 2020-01-01 (earliest observed: 2020-0
 SOURCE_REST: str = "rest"
 SOURCE_DERIVED: str = "derived"
 SOURCE_CAPTURE: str = "capture"
+
+#: HK7: how far after the moment of its fetch a bar may open — a venue
+#: clock a little ahead of ours — before it is refused as future-stamped.
+#: A real bar never opens after it is fetched; the defect this guards
+#: against stamped flat bars minutes to years ahead.
+FUTURE_SKEW_MS: int = MS_1M
+
+
+def _wall_ms() -> int:
+    """The wall clock, ms: when a page was fetched (HK7's bound)."""
+    return int(time.time() * 1000)
 
 _SCHEMA: str = """
 CREATE TABLE IF NOT EXISTS candles (
@@ -170,6 +225,8 @@ class UpsertStats(typing.NamedTuple):
     conflicts: int
     unchanged: int
     superseded_capture: int
+    #: HK7: bars opening more than one bar after ``now`` — never stored.
+    refused_future: int
 
 
 class LaneTarget(typing.NamedTuple):
@@ -189,18 +246,97 @@ class Lane(typing.NamedTuple):
     backward: bool
 
 
+class LaneForm(typing.NamedTuple):
+    """How a lane names its instruments: the venue, the descriptor
+    namespace (``<prefix>:<symbol as written>``), whether the request
+    form upper-cases the symbol (Binance), and the walk direction."""
+
+    venue: int
+    prefix: str
+    upper: bool
+    backward: bool
+
+
+#: Every candle lane, in lane order — the one table the universe's lanes
+#: and the policy's ``extra`` instruments are both built from. PM is
+#: deliberately absent (§9.7 capture lane, C5).
+LANE_FORMS: dict[str, LaneForm] = {
+    "binance": LaneForm(claude_worker.frames.VENUE_BINANCE, "binance", True, False),
+    # WS5: dated delivery futures ride the SAME fapi lane + descriptor
+    # namespace as the perps (klines/ticker endpoints serve both).
+    "binance-usdm": LaneForm(claude_worker.frames.VENUE_BINANCE, "binance-usdm", True, False),
+    # BX2: COIN-M perps and delivery futures — one dapi lane, one
+    # `binance-coinm:` namespace (its own REST host, so its own budget).
+    "binance-coinm": LaneForm(claude_worker.frames.VENUE_BINANCE, "binance-coinm", True, False),
+    "okx": LaneForm(claude_worker.frames.VENUE_OKX, "okx", False, True),
+    "deribit": LaneForm(claude_worker.frames.VENUE_DERIBIT, "deribit", False, False),
+    "hyperliquid": LaneForm(claude_worker.frames.VENUE_HYPERLIQUID, "hyperliquid", False, False),
+    # WS9: Bybit — one lane per category (the kline endpoint needs
+    # `category=`); symbols stay in the venue's UPPERCASE form.
+    "bybit": LaneForm(claude_worker.frames.VENUE_BYBIT, "bybit", False, False),
+    "bybit-linear": LaneForm(claude_worker.frames.VENUE_BYBIT, "bybit-linear", False, False),
+    # MX7: MEXC — one lane per class (different hosts AND endpoints);
+    # symbols stay in the venue's UPPERCASE form (`BTCUSDT` spot,
+    # `BTC_USDT` perp). xStocks / TradFi perps are ordinary rows.
+    "mexc": LaneForm(claude_worker.frames.VENUE_MEXC, "mexc", False, False),
+    "mexc-perp": LaneForm(claude_worker.frames.VENUE_MEXC, "mexc-perp", False, False),
+}
+
+
+def lane_target(lane_name: str, sym: str) -> LaneTarget:
+    """One instrument of lane ``lane_name`` (a ``LANE_FORMS`` key),
+    ``sym`` as written in universe.toml or the policy's ``extra``."""
+    form = LANE_FORMS[lane_name]
+    return LaneTarget(form.venue, f"{form.prefix}:{sym}", sym.upper() if form.upper else sym)
+
+
+def lane_of(lane_name: str, syms: collections.abc.Iterable[str]) -> Lane:
+    """Lane ``lane_name`` over ``syms`` (``LANE_FORMS`` key)."""
+    form = LANE_FORMS[lane_name]
+    return Lane(lane_name, form.venue, [lane_target(lane_name, s) for s in syms], form.backward)
+
+
+def with_extras(lanes: list[Lane], policy: TfPolicy) -> list[Lane]:
+    """The universe's lanes plus the policy's ``extra`` instruments
+    (HAR W1): appended to their lane after its own, one the universe
+    already names is not doubled, and a lane the universe lacks is
+    created (in ``LANE_FORMS`` order, after the universe's lanes).
+    The candles cycle alone reads them — never the engine."""
+    if not policy.extras:
+        return lanes
+    out: list[Lane] = []
+    seen: set[str] = set()
+    for lane in lanes:
+        seen.add(lane.name)
+        extra = policy.extras.get(lane.name, ())
+        have = {t.descriptor for t in lane.targets}
+        add = [t for t in (lane_target(lane.name, s) for s in extra) if t.descriptor not in have]
+        out.append(lane._replace(targets=lane.targets + add) if add else lane)
+    for name in LANE_FORMS:
+        if name in policy.extras and name not in seen:
+            out.append(lane_of(name, policy.extras[name]))
+    return out
+
+
 class TfPolicy(typing.NamedTuple):
     """Which §9.5 bases each lane / instrument fetches (module
     docstring, "Base-timeframe POLICY"). Keys of ``instruments`` are
     ``(lane name, venue symbol as written in universe.toml)``; values
-    are FETCHED_TFS keys in FETCHED_TFS order. Empty = the §9.5 law."""
+    are FETCHED_TFS keys in FETCHED_TFS order. ``extras``: per lane, the
+    instruments the universe does not name (venue-symbol form, file
+    order). ``backfill_1m_h``: per lane, the empty-series 1 m backfill
+    in hours. Empty = the §9.5 law."""
 
     lanes: dict[str, tuple[str, ...]]
     instruments: dict[tuple[str, str], tuple[str, ...]]
+    extras: dict[str, tuple[str, ...]]
+    backfill_1m_h: dict[str, int]
 
 
-DEFAULT_POLICY: TfPolicy = TfPolicy({}, {})
+DEFAULT_POLICY: TfPolicy = TfPolicy({}, {}, {}, {})
 ALL_TFS: tuple[str, ...] = tuple(FETCHED_TFS)
+#: ``backfill_1m_h`` bounds: an hour to a year of minutes.
+BACKFILL_1M_H_MAX: int = 8_760
 
 
 def _policy_tfs(raw: object) -> tuple[str, ...] | None:
@@ -214,6 +350,19 @@ def _policy_tfs(raw: object) -> tuple[str, ...] | None:
         return None
     chosen = {typing.cast(str, x) for x in items}
     return tuple(tf for tf in ALL_TFS if tf in chosen)
+
+
+def _policy_syms(raw: object) -> tuple[str, ...] | None:
+    """An ``extra`` value → its symbols in file order; ``None`` =
+    malformed (not a list, empty, a non-string or blank entry, or a
+    duplicate)."""
+    if not isinstance(raw, list):
+        return None
+    items = typing.cast(list[object], raw)
+    if not items or any(not isinstance(x, str) or not x.strip() or x != x.strip() for x in items):
+        return None
+    syms = tuple(typing.cast(str, x) for x in items)
+    return syms if len(set(syms)) == len(syms) else None
 
 
 def read_tf_policy(path: pathlib.Path) -> tuple[TfPolicy, str | None]:
@@ -234,15 +383,44 @@ def read_tf_policy(path: pathlib.Path) -> tuple[TfPolicy, str | None]:
         return DEFAULT_POLICY, f"not TOML ({e})"
     lanes: dict[str, tuple[str, ...]] = {}
     instruments: dict[tuple[str, str], tuple[str, ...]] = {}
+    extras: dict[str, tuple[str, ...]] = {}
+    backfill_1m_h: dict[str, int] = {}
     for lane_name, sec in obj.items():
         if not isinstance(sec, dict):
             return DEFAULT_POLICY, f"[{lane_name}] is not a table"
         section = typing.cast(dict[str, object], sec)
         for key, val in section.items():
-            if key == "tfs":
+            if key == "extra":
+                if lane_name not in LANE_FORMS:
+                    return (
+                        DEFAULT_POLICY,
+                        f"[{lane_name}] extra: not a candle lane {sorted(LANE_FORMS)}",
+                    )
+                syms = _policy_syms(val)
+                if syms is None:
+                    return (
+                        DEFAULT_POLICY,
+                        f"[{lane_name}] extra must be a non-empty list of distinct symbols",
+                    )
+                extras[lane_name] = syms
+            elif key == "backfill_1m_h":
+                if (
+                    isinstance(val, bool)
+                    or not isinstance(val, int)
+                    or not 1 <= val <= BACKFILL_1M_H_MAX
+                ):
+                    return (
+                        DEFAULT_POLICY,
+                        f"[{lane_name}] backfill_1m_h must be an integer 1..{BACKFILL_1M_H_MAX}",
+                    )
+                backfill_1m_h[lane_name] = val
+            elif key == "tfs":
                 tfs = _policy_tfs(val)
                 if tfs is None:
-                    return DEFAULT_POLICY, f"[{lane_name}] tfs must be a non-empty list of {list(ALL_TFS)}"
+                    return (
+                        DEFAULT_POLICY,
+                        f"[{lane_name}] tfs must be a non-empty list of {list(ALL_TFS)}",
+                    )
                 lanes[lane_name] = tfs
             elif key == "instruments":
                 if not isinstance(val, dict):
@@ -252,12 +430,13 @@ def read_tf_policy(path: pathlib.Path) -> tuple[TfPolicy, str | None]:
                     if tfs is None:
                         return (
                             DEFAULT_POLICY,
-                            f"[{lane_name}.instruments] {sym} must be a non-empty list of {list(ALL_TFS)}",
+                            f"[{lane_name}.instruments] {sym} must be a non-empty list of "
+                            f"{list(ALL_TFS)}",
                         )
                     instruments[(lane_name, sym)] = tfs
             else:
                 return DEFAULT_POLICY, f"[{lane_name}] unknown key `{key}`"
-    return TfPolicy(lanes, instruments), None
+    return TfPolicy(lanes, instruments, extras, backfill_1m_h), None
 
 
 def tfs_for(policy: TfPolicy, lane: Lane, target: LaneTarget) -> tuple[str, ...]:
@@ -311,16 +490,28 @@ def upsert_rest(
     tf_ms: int,
     bars: list[claude_worker.fetchers.Candle],
     now_ms: int,
+    fetched_ms: int | None = None,
 ) -> UpsertStats:
     """§9.6 upsert of one fetched page. Closed ``rest`` bars are
     immutable (disagreement → ``candle_conflicts``); the open bar
-    updates in place; ``capture`` rows are superseded by rest."""
+    updates in place; ``capture`` rows are superseded by rest.
+
+    HK7: a bar opening more than ``FUTURE_SKEW_MS`` after the page was
+    fetched (``fetched_ms``; ``now_ms`` when not given) is refused, never
+    stored — a real bar never opens after its fetch. MEXC's TradFi perps
+    answered such bars (1 d rows to 2028); one froze the lane's frontier
+    (``max_open_ts``) until its date passed."""
+    latest_open = (now_ms if fetched_ms is None else fetched_ms) + FUTURE_SKEW_MS
     inserted = 0
     updated_open = 0
     conflicts = 0
     unchanged = 0
     superseded = 0
+    refused_future = 0
     for bar in bars:
+        if bar.ts_ms > latest_open:
+            refused_future += 1
+            continue
         row = conn.execute(
             "SELECT o,h,l,c,v,source,fetched_ts FROM candles"
             " WHERE venue=? AND descriptor=? AND tf=? AND open_ts=?",
@@ -346,9 +537,13 @@ def upsert_rest(
             )
             inserted += 1
             continue
-        o, h, l, c, v, source, stored_fetched_ts = row
+        o, h, low, c, v, source, stored_fetched_ts = row
         same = (
-            o == bar.open and h == bar.high and l == bar.low and c == bar.close and v == bar.volume
+            o == bar.open
+            and h == bar.high
+            and low == bar.low
+            and c == bar.close
+            and v == bar.volume
         )
         if source == SOURCE_REST and same:
             unchanged += 1
@@ -403,7 +598,33 @@ def upsert_rest(
         else:
             updated_open += 1
     conn.commit()
-    return UpsertStats(inserted, updated_open, conflicts, unchanged, superseded)
+    return UpsertStats(inserted, updated_open, conflicts, unchanged, superseded, refused_future)
+
+
+def purge_future(conn: sqlite3.Connection, now_ms: int) -> list[tuple[int, str, str, int]]:
+    """HK7 (``--repair-future``): delete every candle row — any source,
+    any timeframe this module writes — that opens more than
+    ``FUTURE_SKEW_MS`` after ``now_ms`` (``upsert_rest``'s bound), so the
+    series' frontier falls back to its real newest bar and the next cycle
+    fetches it — and the placeholder bars behind it — again. Returns
+    ``(venue, descriptor, tf, rows)`` per purged series, sorted. A
+    timeframe outside ``FETCHED_TFS`` and ``DERIVED_TFS`` is left alone."""
+    tfs = sorted([*FETCHED_TFS, *(d[0] for d in DERIVED_TFS)])
+    bound = now_ms + FUTURE_SKEW_MS
+    out: list[tuple[int, str, str, int]] = []
+    for tf in tfs:
+        rows = conn.execute(
+            "SELECT venue, descriptor, count(*) FROM candles"
+            " WHERE tf=? AND open_ts > ? GROUP BY venue, descriptor",
+            (tf, bound),
+        ).fetchall()
+        if not rows:
+            continue
+        conn.execute("DELETE FROM candles WHERE tf=? AND open_ts > ?", (tf, bound))
+        out.extend((venue, descriptor, tf, n) for venue, descriptor, n in rows)
+    conn.commit()
+    out.sort()
+    return out
 
 
 # ---- universe → lanes ----------------------------------------------------
@@ -415,7 +636,7 @@ def read_universe_lanes(universe_path: pathlib.Path) -> list[Lane] | None:
     ``None`` on unusable file (best-effort law)."""
     try:
         obj = tomllib.loads(universe_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+    except OSError, UnicodeDecodeError, tomllib.TOMLDecodeError:
         return None
 
     def str_list(section: str, key: str) -> list[str]:
@@ -427,52 +648,24 @@ def read_universe_lanes(universe_path: pathlib.Path) -> list[Lane] | None:
             return []
         return [x for x in typing.cast(list[object], raw) if isinstance(x, str) and x]
 
-    frames = claude_worker.frames
     lanes: list[Lane] = []
-    spot = [
-        LaneTarget(frames.VENUE_BINANCE, f"binance:{s}", s.upper())
-        for s in str_list("binance", "spot")
-    ]
-    if spot:
-        lanes.append(Lane("binance", frames.VENUE_BINANCE, spot, backward=False))
-    # WS5: dated delivery futures ride the SAME fapi lane + descriptor
-    # namespace as the perps (klines/ticker endpoints serve both).
-    usdm = [
-        LaneTarget(frames.VENUE_BINANCE, f"binance-usdm:{s}", s.upper())
-        for s in str_list("binance", "usdm") + str_list("binance", "usdm_dated")
-    ]
-    if usdm:
-        lanes.append(Lane("binance-usdm", frames.VENUE_BINANCE, usdm, backward=False))
-    okx = [
-        LaneTarget(frames.VENUE_OKX, f"okx:{i}", i) for i in str_list("okx", "instruments")
-    ]
-    if okx:
-        lanes.append(Lane("okx", frames.VENUE_OKX, okx, backward=True))
-    deribit = [
-        LaneTarget(frames.VENUE_DERIBIT, f"deribit:{i}", i)
-        for i in str_list("deribit", "instruments")
-    ]
-    if deribit:
-        lanes.append(Lane("deribit", frames.VENUE_DERIBIT, deribit, backward=False))
-    hl = [
-        LaneTarget(frames.VENUE_HYPERLIQUID, f"hyperliquid:{c}", c)
-        for c in str_list("hyperliquid", "coins")
-    ]
-    if hl:
-        lanes.append(Lane("hyperliquid", frames.VENUE_HYPERLIQUID, hl, backward=False))
-    # WS9: Bybit — one lane per category (the kline endpoint needs
-    # `category=`); symbols stay in the venue's UPPERCASE form.
-    bybit_spot = [
-        LaneTarget(frames.VENUE_BYBIT, f"bybit:{s}", s) for s in str_list("bybit", "spot")
-    ]
-    if bybit_spot:
-        lanes.append(Lane("bybit", frames.VENUE_BYBIT, bybit_spot, backward=False))
-    bybit_linear = [
-        LaneTarget(frames.VENUE_BYBIT, f"bybit-linear:{s}", s)
-        for s in str_list("bybit", "linear")
-    ]
-    if bybit_linear:
-        lanes.append(Lane("bybit-linear", frames.VENUE_BYBIT, bybit_linear, backward=False))
+    # (lane, the universe.toml [section] key(s) it reads), in lane order.
+    sources: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+        ("binance", (("binance", "spot"),)),
+        ("binance-usdm", (("binance", "usdm"), ("binance", "usdm_dated"))),
+        ("binance-coinm", (("binance", "coinm"), ("binance", "coinm_dated"))),
+        ("okx", (("okx", "instruments"),)),
+        ("deribit", (("deribit", "instruments"),)),
+        ("hyperliquid", (("hyperliquid", "coins"),)),
+        ("bybit", (("bybit", "spot"),)),
+        ("bybit-linear", (("bybit", "linear"),)),
+        ("mexc", (("mexc", "spot"),)),
+        ("mexc-perp", (("mexc", "perp"),)),
+    )
+    for lane_name, keys in sources:
+        syms = [s for section, key in keys for s in str_list(section, key)]
+        if syms:
+            lanes.append(lane_of(lane_name, syms))
     return lanes
 
 
@@ -495,6 +688,25 @@ BYBIT_PAGE_BARS: int = 1000
 # clamp a pre-listing start to their earliest bar, the Deribit/HL
 # pattern).
 BYBIT_1D_FLOOR_MS: int = 1_514_764_800_000  # 2018-01-01
+# MX7: MEXC interval grammars — measured live 2026-09-23. Spot has NO
+# `1h` (`{"msg":"Invalid interval.","code":-1121}`); its hour is `60m`.
+MEXC_SPOT_INTERVAL: dict[str, str] = {"1m": "1m", "1h": "60m", "1d": "1d"}
+MEXC_PERP_INTERVAL: dict[str, str] = {"1m": "Min1", "1h": "Min60", "1d": "Day1"}
+# Spot answers at most 500 rows (`limit=1000` is clamped) over the window
+# [startTime, startTime + 500 bars); perp answers the NEWEST ≤ 2000 bars
+# of [start, end], so a 1000-bar window always comes back whole.
+MEXC_SPOT_PAGE_BARS: int = 500
+MEXC_PERP_PAGE_BARS: int = 1000
+# MX7: 1d is BOUNDED, not floored (the §9.5 cheapness carve-out, like
+# OKX): both endpoints answer an EMPTY page for a window that ends before
+# the listing (measured 2026-09-23 — `BTC_USDT` Day1 2017→2020 is empty
+# columns, `BTCUSDT` 1d from 2015 is `[]`), and an empty page ends the
+# forward walk. A pre-launch floor therefore backfills nothing for any
+# symbol listed more than one page after it (`AAPLXUSDT`: 2025-07). One
+# page back from now always contains the listing or covers the bound.
+MEXC_1D_BOUND_D: int = 500
+#: The contract kline's columns this lane reads (time in SECONDS).
+_MEXC_PERP_COLUMNS: tuple[str, ...] = ("time", "open", "high", "low", "close", "vol")
 
 
 def parse_binance_klines(raw: str) -> tuple[list[claude_worker.fetchers.Candle], int] | None:
@@ -594,6 +806,95 @@ def parse_bybit_kline(raw: str) -> tuple[list[claude_worker.fetchers.Candle], in
     return out, malformed
 
 
+def _mexc_perp_columns(raw: str) -> list[list[object]] | None:
+    """The contract kline's aligned columns (``_MEXC_PERP_COLUMNS``
+    order), or ``None`` for an error envelope / missing column / columns
+    of unequal length (they align by index — a mismatch leaves no row
+    identity)."""
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return None
+    body = typing.cast(dict[str, object], obj) if isinstance(obj, dict) else {}
+    data = body.get("data") if body.get("success") is True and body.get("code") == 0 else None
+    if not isinstance(data, dict):
+        return None
+    found = [typing.cast(dict[str, object], data).get(key) for key in _MEXC_PERP_COLUMNS]
+    if not all(isinstance(col, list) for col in found):
+        return None
+    cols = typing.cast(list[list[object]], found)
+    if any(len(col) != len(cols[0]) for col in cols):
+        return None
+    return cols
+
+
+def parse_mexc_kline(raw: str) -> tuple[list[claude_worker.fetchers.Candle], int] | None:
+    """MX7: strict parse of BOTH MEXC kline shapes (measured live
+    2026-09-23 on ``BTCUSDT`` / ``BTC_USDT``).
+
+    - spot ``/api/v3/klines`` answers a JSON ARRAY of rows ``[openMs,
+      "o", "h", "l", "c", "v", closeMs, "quoteVol"]`` — Binance's first
+      eight columns, so it rides ``parse_binance_klines`` unchanged;
+    - perp ``/api/v1/contract/kline/{sym}`` answers ``{"success": true,
+      "code": 0, "data": {"time": [s, …], "open": […], "close": […],
+      "high": […], "low": […], "vol": […], "amount": […], "realOpen":
+      …}}`` — COLUMNAR, times in SECONDS, bare numbers. ``vol`` is venue
+      CONTRACTS (raw venue units, the OKX-swap precedent); ``amount`` is
+      quote turnover and is not read.
+
+    ``None`` = unusable body (either venue's error envelope included);
+    a malformed perp CELL skips and counts its row — the index still
+    names its bar."""
+    if raw.lstrip().startswith("["):
+        return parse_binance_klines(raw)
+    cols = _mexc_perp_columns(raw)
+    if cols is None:
+        return None
+    out: list[claude_worker.fetchers.Candle] = []
+    malformed = 0
+    for i in range(len(cols[0])):
+        cells = [col[i] for col in cols]
+        if any(isinstance(c, bool) or not isinstance(c, (int, float)) for c in cells):
+            malformed += 1
+            continue
+        ts_s = cells[0]
+        if not isinstance(ts_s, int) or ts_s < 0:
+            malformed += 1
+            continue
+        o, h, low, c, v = (float(typing.cast(float, x)) for x in cells[1:])
+        out.append(
+            claude_worker.fetchers.Candle(
+                ts_ms=ts_s * 1000, open=o, high=h, low=low, close=c, volume=v
+            )
+        )
+    out.sort(key=lambda candle: candle.ts_ms)
+    return out, malformed
+
+
+def _mexc_url(host: str, lane_name: str, symbol: str, tf: str, span: tuple[int, int]) -> str:
+    """MX7: one forward page ``[start, min(start + page, now)]`` (``span =
+    (start, now)``) for either MEXC lane. Both endpoints need an explicit
+    END — without ``endTime`` spot ignores ``startTime`` and answers the
+    newest 500 bars. Both
+    accept an end in the future (measured 2026-09-23), but the TradFi
+    perps then answer flat placeholder bars ahead of time, so the end is
+    ``now`` (HK7; the Deribit and HL shape). Spot's end is exclusive and
+    ms; perp's is inclusive and SECONDS."""
+    start_ms, now_ms = span
+    tf_ms = FETCHED_TFS[tf]
+    if lane_name == "mexc":
+        end_ms = min(start_ms + MEXC_SPOT_PAGE_BARS * tf_ms, now_ms)
+        return (
+            f"https://{host}/api/v3/klines?symbol={symbol}&interval={MEXC_SPOT_INTERVAL[tf]}"
+            f"&startTime={start_ms}&endTime={end_ms}&limit={MEXC_SPOT_PAGE_BARS}"
+        )
+    end_ms = min(start_ms + MEXC_PERP_PAGE_BARS * tf_ms, now_ms)
+    return (
+        f"https://{host}/api/v1/contract/kline/{symbol}?interval={MEXC_PERP_INTERVAL[tf]}"
+        f"&start={start_ms // 1000}&end={end_ms // 1000}"
+    )
+
+
 def _bybit_url(host: str, category: str, symbol: str, tf: str, start_ms: int) -> str:
     return (
         f"https://{host}/v5/market/kline?category={category}&symbol={symbol}"
@@ -623,12 +924,71 @@ def _deribit_url(host: str, inst: str, tf: str, start_ms: int, end_ms: int) -> s
     )
 
 
+#: HL `/info` weights (HL's published IP rate limit: 1 200 weight a
+#: minute per IP, shared with the engine on the same host): a
+#: `candleSnapshot` weighs 20 plus 1 per 60 candles returned.
+HL_INFO_BASE_WEIGHT: int = 20
+HL_CANDLES_PER_WEIGHT: int = 60
+#: The heaviest page the lane asks for (`HL_PAGE_BARS` candles).
+HL_PAGE_WEIGHT_MAX: int = HL_INFO_BASE_WEIGHT + -(-HL_PAGE_BARS // HL_CANDLES_PER_WEIGHT)
+#: The lane's share of the IP's minute: HALF, the rest the engine's (its
+#: re-discovery reads, its boot, and a live slot's `/exchange`).
+HL_WEIGHT_PER_MIN_ENV: str = "CLAUDE_WORKER_CANDLES_HL_WEIGHT_PER_MIN"
+HL_WEIGHT_PER_MIN_DEFAULT: int = 600
+PACE_WINDOW_S: float = 60.0
+
+
+class WeightPacer:
+    """A rolling-minute weight budget for one host (HAR W1: the first
+    cycle of the ten `xyz` extras is ~90 pages — ~3 300 weight, near three
+    minutes of HL's per-IP limit, which the engine shares). ``acquire``
+    waits until the last minute's recorded weight leaves room for the
+    heaviest request; ``record`` books what a request actually weighed.
+    The clock and the sleep are injected (tests never sleep)."""
+
+    def __init__(
+        self,
+        per_min: int,
+        clock: collections.abc.Callable[[], float] = time.monotonic,
+        sleep: collections.abc.Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.per_min: int = per_min
+        self._clock = clock
+        self._sleep = sleep
+        self._booked: collections.deque[tuple[float, int]] = collections.deque()
+
+    def _spent(self, now: float) -> int:
+        while self._booked and self._booked[0][0] <= now - PACE_WINDOW_S:
+            self._booked.popleft()
+        return sum(w for _, w in self._booked)
+
+    def acquire(self, weight: int) -> float:
+        """Wait until ``weight`` more fits the rolling minute (an empty
+        minute always admits); returns the seconds waited."""
+        waited = 0.0
+        while True:
+            now = self._clock()
+            spent = self._spent(now)
+            if spent == 0 or spent + weight <= self.per_min:
+                return waited
+            pause = self._booked[0][0] + PACE_WINDOW_S - now
+            self._sleep(pause)
+            waited += pause
+
+    def record(self, weight: int) -> None:
+        """Book ``weight`` at now."""
+        self._booked.append((self._clock(), weight))
+
+
 class Http(typing.NamedTuple):
-    """Injectable transport pair (no live calls in tests)."""
+    """Injectable transport pair (no live calls in tests). ``hl_pace``
+    keeps the HL lane inside its share of the IP's minute (``None``: no
+    pacing — the tests' transports)."""
 
     get: collections.abc.Callable[[str], str | None]
     post: collections.abc.Callable[[str, str], str | None]
     hosts: dict[str, str]
+    hl_pace: WeightPacer | None = None
 
 
 def _fetch_forward_page(
@@ -638,14 +998,16 @@ def _fetch_forward_page(
     transport/parse failure (skip target this cycle)."""
     tf_ms = FETCHED_TFS[tf]
     if lane.name == "binance":
-        raw = http.get(_bn_url(http.hosts["binance"], "/api/v3/klines", target.instrument, tf, lo_ms))
+        raw = http.get(
+            _bn_url(http.hosts["binance"], "/api/v3/klines", target.instrument, tf, lo_ms)
+        )
         if raw is None:
             return None
         parsed = parse_binance_klines(raw)
         return None if parsed is None else parsed[0]
-    if lane.name == "binance-usdm":
+    if lane.name in _BN_FUT_KLINES:
         raw = http.get(
-            _bn_url(http.hosts["binance-usdm"], "/fapi/v1/klines", target.instrument, tf, lo_ms)
+            _bn_url(http.hosts[lane.name], _BN_FUT_KLINES[lane.name], target.instrument, tf, lo_ms)
         )
         if raw is None:
             return None
@@ -657,7 +1019,7 @@ def _fetch_forward_page(
         if raw is None:
             return None
         return claude_worker.fetchers.parse_deribit_chart(raw)
-    if lane.name == "bybit" or lane.name == "bybit-linear":
+    if lane.name in {"bybit", "bybit-linear"}:
         # WS9: forward-paged; the category rides the lane name.
         category = "spot" if lane.name == "bybit" else "linear"
         raw = http.get(_bybit_url(http.hosts["bybit"], category, target.instrument, tf, lo_ms))
@@ -665,6 +1027,15 @@ def _fetch_forward_page(
             return None
         parsed_bb = parse_bybit_kline(raw)
         return None if parsed_bb is None else parsed_bb[0]
+    if lane.name in ("mexc", "mexc-perp"):
+        # MX7: forward-paged; each class owns its host AND endpoint.
+        raw = http.get(
+            _mexc_url(http.hosts[lane.name], lane.name, target.instrument, tf, (lo_ms, now_ms))
+        )
+        if raw is None:
+            return None
+        parsed_mx = parse_mexc_kline(raw)
+        return None if parsed_mx is None else parsed_mx[0]
     if lane.name == "hyperliquid":
         end = min(now_ms, lo_ms + HL_PAGE_BARS * tf_ms)
         body = json.dumps(
@@ -679,10 +1050,14 @@ def _fetch_forward_page(
             },
             separators=(",", ":"),
         )
+        if http.hl_pace is not None:
+            http.hl_pace.acquire(HL_PAGE_WEIGHT_MAX)
         raw = http.post(f"https://{http.hosts['hyperliquid']}/info", body)
-        if raw is None:
-            return None
-        parsed_hl = claude_worker.fetchers.parse_hl_candles(raw)
+        parsed_hl = None if raw is None else claude_worker.fetchers.parse_hl_candles(raw)
+        if http.hl_pace is not None:
+            # A refused or unusable answer still spent the base weight.
+            items = 0 if parsed_hl is None else len(parsed_hl[0])
+            http.hl_pace.record(HL_INFO_BASE_WEIGHT + items // HL_CANDLES_PER_WEIGHT)
         return None if parsed_hl is None else parsed_hl[0]
     raise ValueError(f"not a forward lane: {lane.name}")
 
@@ -690,10 +1065,21 @@ def _fetch_forward_page(
 # ---- §9.6 gap-fill -------------------------------------------------------
 
 
-def backfill_start_ms(tf: str, now_ms: int, lane_name: str, env: collections.abc.Mapping[str, str]) -> int:
-    """Empty-store §9.6 backfill bound for one tf."""
+def backfill_start_ms(
+    tf: str,
+    now_ms: int,
+    lane_name: str,
+    env: collections.abc.Mapping[str, str],
+    hours_1m: int | None = None,
+) -> int:
+    """Empty-store §9.6 backfill bound for one tf. ``hours_1m`` is the
+    lane's ``backfill_1m_h`` (the policy file): it wins over the env
+    knob, which wins over the 48 h default."""
     if tf == "1m":
-        hours = int(env.get(BACKFILL_1M_H_ENV, "") or BACKFILL_1M_H_DEFAULT)
+        if hours_1m is not None:
+            hours = hours_1m
+        else:
+            hours = int(env.get(BACKFILL_1M_H_ENV, "") or BACKFILL_1M_H_DEFAULT)
         return now_ms - hours * MS_1H
     if tf == "1h":
         days = int(env.get(BACKFILL_1H_D_ENV, "") or BACKFILL_1H_D_DEFAULT)
@@ -706,6 +1092,8 @@ def backfill_start_ms(tf: str, now_ms: int, lane_name: str, env: collections.abc
         return HL_1D_FLOOR_MS
     if lane_name in ("bybit", "bybit-linear"):
         return BYBIT_1D_FLOOR_MS  # WS9: pre-launch floor (untested vs start=0)
+    if lane_name in ("mexc", "mexc-perp"):
+        return now_ms - MEXC_1D_BOUND_D * MS_1D  # MX7: bounded, see MEXC_1D_BOUND_D
     return 0  # Binance: startTime=0 = true listing lifetime (proven)
 
 
@@ -719,7 +1107,7 @@ class FillStats(typing.NamedTuple):
     failed: bool
 
 
-_ZERO_UPSERT = UpsertStats(0, 0, 0, 0, 0)
+_ZERO_UPSERT = UpsertStats(0, 0, 0, 0, 0, 0)
 
 
 def _merge(a: UpsertStats, b: UpsertStats) -> UpsertStats:
@@ -729,6 +1117,7 @@ def _merge(a: UpsertStats, b: UpsertStats) -> UpsertStats:
         a.conflicts + b.conflicts,
         a.unchanged + b.unchanged,
         a.superseded_capture + b.superseded_capture,
+        a.refused_future + b.refused_future,
     )
 
 
@@ -741,11 +1130,16 @@ def fill_forward(
     now_ms: int,
     budget: claude_worker.features.RestBudget,
     env: collections.abc.Mapping[str, str],
+    hours_1m: int | None = None,
+    clock: collections.abc.Callable[[], int] | None = None,
 ) -> FillStats:
-    """Forward §9.6 fill: page-by-page upsert, monotone frontier."""
+    """Forward §9.6 fill: page-by-page upsert, monotone frontier.
+    ``hours_1m``: the lane's ``backfill_1m_h`` (``backfill_start_ms``).
+    ``clock`` (HK7): read after each page to bound its bars' opens (the
+    cycle passes the wall clock; ``None`` = ``now_ms``)."""
     tf_ms = FETCHED_TFS[tf]
     last = max_open_ts(conn, target.venue, target.descriptor, tf)
-    lo = last if last is not None else backfill_start_ms(tf, now_ms, lane.name, env)
+    lo = last if last is not None else backfill_start_ms(tf, now_ms, lane.name, env, hours_1m)
     pages = 0
     bars = 0
     stats = _ZERO_UPSERT
@@ -759,7 +1153,11 @@ def fill_forward(
         if not page:
             break
         bars += len(page)
-        stats = _merge(stats, upsert_rest(conn, target.venue, target.descriptor, tf, tf_ms, page, now_ms))
+        fetched = None if clock is None else max(now_ms, clock())
+        stats = _merge(
+            stats,
+            upsert_rest(conn, target.venue, target.descriptor, tf, tf_ms, page, now_ms, fetched),
+        )
         new_lo = page[-1].ts_ms + tf_ms
         if new_lo <= lo:
             break  # progress guard: a stuck venue never loops us
@@ -777,13 +1175,15 @@ def fill_okx_backward(
     now_ms: int,
     budget: claude_worker.features.RestBudget,
     env: collections.abc.Mapping[str, str],
+    hours_1m: int | None = None,
 ) -> FillStats:
     """OKX §9.6 fill: BACKWARD walk (``history-candles`` + ``after``),
     buffered, upserted only when the walk CONNECTS to the stored
-    frontier (hole-avoidance law in the module docs)."""
+    frontier (hole-avoidance law in the module docs). ``hours_1m``: the
+    lane's ``backfill_1m_h``."""
     tf_ms = FETCHED_TFS[tf]
     last = max_open_ts(conn, target.venue, target.descriptor, tf)
-    bound = last if last is not None else backfill_start_ms(tf, now_ms, "okx", env)
+    bound = last if last is not None else backfill_start_ms(tf, now_ms, "okx", env, hours_1m)
     buffered: list[claude_worker.fetchers.Candle] = []
     after = now_ms + tf_ms  # strictly newer than any bar we want
     pages = 0
@@ -941,9 +1341,7 @@ def derive_pass(
             bucket.append((open_ts, o, h, low, c, v))
         flush()
         conn.commit()
-        report(
-            f"candles: derive {tf_out}: +{made} refreshed={refreshed} unchanged={unchanged}"
-        )
+        report(f"candles: derive {tf_out}: +{made} refreshed={refreshed} unchanged={unchanged}")
 
 
 class MinuteBar(typing.NamedTuple):
@@ -971,7 +1369,13 @@ def fold_capture_minutes(
     tick files only) → per (descriptor, minute) mid-price OHLC +
     tick-count. Wall mapping is the harness law:
     ``wall = epoch_ns + (ts − run_anchor)``. One-sided ticks (a zero
-    bid or ask) are skipped — a fabricated mid is worse than a gap."""
+    bid or ask) are skipped — a fabricated mid is worse than a gap.
+
+    HK7: ``lo`` rounds UP to a whole minute. An unaligned ``lo`` (the
+    hourly cycle's ``now - 26 h``) folded the window's first minute from
+    its tail alone, and ``upsert_capture`` then overwrote the complete
+    minute a day-old cycle had stored."""
+    lo_ms += -lo_ms % MS_1M
     out: dict[tuple[str, int], MinuteBar] = {}
     for run_dir in claude_worker.features.run_dirs(replay_root):
         try:
@@ -991,10 +1395,7 @@ def fold_capture_minutes(
                 continue
             try:
                 with claude_worker.pmlr.Reader(path) as reader:
-                    if (
-                        reader.slot_kind != claude_worker.pmlr.SLOT_KIND_TICK
-                        or len(reader) == 0
-                    ):
+                    if reader.slot_kind != claude_worker.pmlr.SLOT_KIND_TICK or len(reader) == 0:
                         continue
                     for tick in reader.ticks():
                         desc = sym_to_desc.get(tick.sym)
@@ -1017,8 +1418,86 @@ def fold_capture_minutes(
                                 mid,
                                 bar.n + 1,
                             )
-            except (claude_worker.pmlr.PmlrError, OSError, ValueError):
+            except claude_worker.pmlr.PmlrError, OSError, ValueError:
                 continue
+    return out
+
+
+#: HK7 (H3 plan §5 W1): the Hypercall lane's events file and the index's
+#: descriptor namespace (``hypercall-idx:<U>``, one ``Mark`` per print).
+HC_EVENTS_FILE: str = "hypercall-events.pmlr"
+HC_INDEX_PREFIX: str = "hypercall-idx:"
+
+
+def _print_time(row: tuple[int, int]) -> int:
+    """A ``(source ms, px)`` print's sort key: its time alone (stable)."""
+    return row[0]
+
+
+def fold_index_minutes(
+    replay_root: pathlib.Path, lo_ms: int, now_ms: int
+) -> dict[tuple[str, int], MinuteBar]:
+    """HK7 (H3 plan §5 W1): the Hypercall index into 1 m bars. Every
+    ``Mark`` on a ``hypercall-idx:<U>`` sym (named by the run's
+    ``instrument-manifest.tsv``) in ``hypercall-events.pmlr`` across the
+    runs overlapping ``[lo, now)`` → per (descriptor, minute) OHLC of the
+    index and its print count. A print is placed by the index's OWN time
+    (``venue_time_ms`` — the settlement's basis, ``hypercall_settle``),
+    never the arrival clock, and folded in that time's order whatever the
+    arrival order (arrival order breaks a tie). A print repeated with the
+    same time and price counts once; non-positive prints are skipped.
+    ``lo`` rounds up to a whole minute (``fold_capture_minutes``)."""
+    lo_ms += -lo_ms % MS_1M
+    prints: dict[str, list[tuple[int, int]]] = {}
+    for run_dir in claude_worker.features.run_dirs(replay_root):
+        try:
+            epoch_ns = int(run_dir.name[len("run-") :])
+        except ValueError:
+            continue
+        if epoch_ns // 1_000_000 + 36 * MS_1H < lo_ms:
+            continue
+        path = run_dir / HC_EVENTS_FILE
+        manifest = claude_worker.iv_digest.read_manifest(run_dir)
+        if manifest is None or not path.is_file():
+            continue
+        idx = {
+            sym: desc
+            for (_venue, sym), desc in manifest[0].items()
+            if desc.startswith(HC_INDEX_PREFIX)
+        }
+        if not idx:
+            continue
+        try:
+            ev = claude_worker.pmlr.channel_event_array(path)
+        except claude_worker.pmlr.PmlrError, OSError, ValueError:
+            continue
+        keep = (
+            (ev["channel"] == claude_worker.pmlr.CHANNEL_MARK)
+            & numpy.isin(ev["sym"], numpy.fromiter(idx, dtype=numpy.uint32, count=len(idx)))
+            & (ev["vt"] >= lo_ms)
+            & (ev["vt"] < now_ms)
+            & (ev["v0"] > 0)
+        )
+        marks = ev[keep]
+        for sym, vt, v0 in zip(
+            marks["sym"].tolist(), marks["vt"].tolist(), marks["v0"].tolist(), strict=True
+        ):
+            prints.setdefault(idx[sym], []).append((vt, v0))
+    out: dict[tuple[str, int], MinuteBar] = {}
+    for desc, rows in prints.items():
+        rows.sort(key=_print_time)
+        prev = (-1, -1)
+        for vt, v0 in rows:
+            if (vt, v0) == prev:
+                continue
+            prev = (vt, v0)
+            key = (desc, vt - vt % MS_1M)
+            px = v0 / 1_000_000
+            bar = out.get(key)
+            if bar is None:
+                out[key] = MinuteBar(px, px, px, px, 1)
+            else:
+                out[key] = MinuteBar(bar.o, max(bar.h, px), min(bar.low, px), px, bar.n + 1)
     return out
 
 
@@ -1048,7 +1527,18 @@ def upsert_capture(
                 "INSERT INTO candles"
                 " (venue,descriptor,tf,open_ts,o,h,l,c,v,n,source,fetched_ts)"
                 " VALUES (?,?,'1m',?,?,?,?,?,NULL,?,?,?)",
-                (venue, descriptor, minute, bar.o, bar.h, bar.low, bar.c, bar.n, SOURCE_CAPTURE, now_ms),
+                (
+                    venue,
+                    descriptor,
+                    minute,
+                    bar.o,
+                    bar.h,
+                    bar.low,
+                    bar.c,
+                    bar.n,
+                    SOURCE_CAPTURE,
+                    now_ms,
+                ),
             )
             inserted += 1
             continue
@@ -1130,9 +1620,9 @@ def capture_and_derive(
     report: collections.abc.Callable[[str], None],
     capture_backfill: bool = False,
 ) -> None:
-    """The C5 tail of one cycle: PM capture store lane → BN drift
-    check → §9.5 derive pass. Missing replay root / empty map =
-    reported skip, never an error (best-effort law)."""
+    """The C5 tail of one cycle: PM capture store lane → the Hypercall
+    index fold (HK7) → BN drift check → §9.5 derive pass. Missing replay
+    root / empty map = reported skip, never an error (best-effort law)."""
     if not replay_root.is_dir():
         report(f"candles: capture lane skipped — no replay root {replay_root}")
         derive_pass(conn, now_ms, report, now_ms - DERIVE_WINDOW_D * MS_1D)
@@ -1148,11 +1638,19 @@ def capture_and_derive(
             conn, claude_worker.frames.VENUE_POLYMARKET, pm_bars, now_ms
         )
         report(
-            f"candles: capture pm: minutes={len(pm_bars)} +{ins} refreshed={ref}"
-            f" rest_kept={kept}"
+            f"candles: capture pm: minutes={len(pm_bars)} +{ins} refreshed={ref} rest_kept={kept}"
         )
     else:
         report("candles: capture pm: no PM token names in the market map — skipped")
+    # HK7: the Hypercall index, named by each run's own manifest (the
+    # market map does not carry the index syms).
+    hc_lo = 0 if capture_backfill else now_ms - cap_h * MS_1H
+    hc_bars = fold_index_minutes(replay_root, hc_lo, now_ms)
+    ins, ref, kept = upsert_capture(conn, claude_worker.frames.VENUE_HYPERCALL, hc_bars, now_ms)
+    report(
+        f"candles: capture hypercall-idx: minutes={len(hc_bars)} +{ins} refreshed={ref}"
+        f" rest_kept={kept}"
+    )
     if bn_map:
         bn_bars = fold_capture_minutes(
             replay_root, bn_map, ("bn",), now_ms - drift_h * MS_1H, now_ms
@@ -1169,7 +1667,8 @@ def budget_key(lane_name: str) -> str:
     and that is the pool a budget models. The two bybit categories
     share ``api.bybit.com``; every other lane owns its host (binance
     spot ``api.`` vs usdm ``fapi.`` are DIFFERENT hosts with
-    independent limits — see run_cycle's VM2 V6 note)."""
+    independent limits — see run_cycle's VM2 V6 note — and so are
+    MEXC spot ``api.mexc.com`` vs perp ``contract.mexc.com``, MX7)."""
     return "bybit" if lane_name.startswith("bybit") else lane_name
 
 
@@ -1200,9 +1699,11 @@ def run_cycle(
     siblings (observed live 2026-08-22: okx ETH-USDT-SWAP's 29-page
     1m walk vs 27 remaining) — rotation lets every target lead a
     cycle eventually, so every backfill completes. ``policy`` narrows
-    the bases per lane / instrument (``tfs_for``); the default policy
-    is the §9.5 law and this function is then bit-identical to the
-    pre-policy lane."""
+    the bases per lane / instrument (``tfs_for``) and sets a lane's
+    empty-series 1 m backfill (``backfill_1m_h``); its ``extra``
+    instruments are already in ``lanes`` (``with_extras``). The default
+    policy is the §9.5 law and this function is then bit-identical to
+    the pre-policy lane."""
     demand: dict[str, int] = {}
     for lane in lanes:
         key = budget_key(lane.name)
@@ -1220,19 +1721,23 @@ def run_cycle(
         )
     for lane in lanes:
         budget = budgets[budget_key(lane.name)]
+        hours_1m = policy.backfill_1m_h.get(lane.name)
         rot = (now_ms // 3_600_000) % len(lane.targets) if lane.targets else 0
         rotated = lane.targets[rot:] + lane.targets[:rot]
         for target in rotated:
             for tf in tfs_for(policy, lane, target):
                 if lane.backward:
-                    st = fill_okx_backward(conn, http, target, tf, now_ms, budget, env)
+                    st = fill_okx_backward(conn, http, target, tf, now_ms, budget, env, hours_1m)
                 else:
-                    st = fill_forward(conn, http, lane, target, tf, now_ms, budget, env)
+                    st = fill_forward(
+                        conn, http, lane, target, tf, now_ms, budget, env, hours_1m, _wall_ms
+                    )
                 u = st.upsert
                 report(
                     f"candles: {target.descriptor} {tf}: pages={st.pages} bars={st.bars}"
                     f" +{u.inserted} open~{u.updated_open} conflicts={u.conflicts}"
                     f" unchanged={u.unchanged} capture->rest={u.superseded_capture}"
+                    f"{f' future-refused={u.refused_future}' if u.refused_future else ''}"
                     f"{' BUDGET' if st.budget_out else ''}{' FAILED' if st.failed else ''}"
                 )
 
@@ -1266,7 +1771,10 @@ def make_http(client: httpx.Client, env: collections.abc.Mapping[str, str]) -> H
     hosts = {
         "binance": env.get(BN_REST_HOST_ENV, "") or BN_REST_HOST_DEFAULT,
         "binance-usdm": env.get(BN_FUT_REST_HOST_ENV, "") or BN_FUT_REST_HOST_DEFAULT,
+        "binance-coinm": env.get(BN_COINM_REST_HOST_ENV, "") or BN_COINM_REST_HOST_DEFAULT,
         "bybit": env.get(BYBIT_REST_HOST_ENV, "") or BYBIT_REST_HOST_DEFAULT,
+        "mexc": env.get(MEXC_REST_HOST_ENV, "") or MEXC_REST_HOST_DEFAULT,
+        "mexc-perp": env.get(MEXC_FUT_REST_HOST_ENV, "") or MEXC_FUT_REST_HOST_DEFAULT,
         "okx": env.get(claude_worker.fetchers.OKX_REST_HOST_ENV, "")
         or claude_worker.fetchers.OKX_REST_HOST_DEFAULT,
         "deribit": env.get(claude_worker.fetchers.DERIBIT_REST_HOST_ENV, "")
@@ -1274,7 +1782,8 @@ def make_http(client: httpx.Client, env: collections.abc.Mapping[str, str]) -> H
         "hyperliquid": env.get(claude_worker.fetchers.HL_API_HOST_ENV, "")
         or claude_worker.fetchers.HL_API_HOST_DEFAULT,
     }
-    return Http(get=get, post=post, hosts=hosts)
+    per_min = int(env.get(HL_WEIGHT_PER_MIN_ENV, "") or HL_WEIGHT_PER_MIN_DEFAULT)
+    return Http(get=get, post=post, hosts=hosts, hl_pace=WeightPacer(per_min))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1292,8 +1801,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--capture-backfill",
         action="store_true",
-        help="one-shot: fold PM capture minutes over the WHOLE replay"
-        " root, not just the rolling window (operator-invoked)",
+        help="one-shot: fold PM capture minutes and the Hypercall index over the"
+        " WHOLE replay root, not just the rolling window (operator-invoked)",
+    )
+    parser.add_argument(
+        "--repair-future",
+        action="store_true",
+        help="one-shot (HK7): first delete every row opening more than a minute after"
+        " now, so frozen series fetch again; then the cycle (operator-invoked)",
     )
     args = parser.parse_args(argv)
     env = os.environ
@@ -1309,9 +1824,6 @@ def main(argv: list[str] | None = None) -> int:
     if lanes is None:
         print(f"candles: unusable universe file {universe}", file=sys.stderr)
         return 1
-    if not lanes:
-        print(f"candles: no candle-lane instruments in {universe}", file=sys.stderr)
-        return 0
     policy_path = pathlib.Path(
         args.policy or env.get(POLICY_ENV, "") or DEFAULT_POLICY_PATH
     ).expanduser()
@@ -1324,11 +1836,28 @@ def main(argv: list[str] | None = None) -> int:
     elif policy != DEFAULT_POLICY:
         print(
             f"candles: policy {policy_path}: lanes={len(policy.lanes)}"
-            f" instruments={len(policy.instruments)}",
+            f" instruments={len(policy.instruments)}"
+            f" extra={sum(len(v) for v in policy.extras.values())}"
+            f" backfill_1m_h={len(policy.backfill_1m_h)}",
             file=sys.stderr,
         )
+    lanes = with_extras(lanes, policy)
+    if not lanes:
+        print(f"candles: no candle-lane instruments in {universe}", file=sys.stderr)
+        return 0
     conn = open_db(db_path)
     try:
+        if args.repair_future:
+            purged = purge_future(conn, now_ms)
+            for venue, descriptor, tf, n in purged:
+                print(
+                    f"candles: repair-future: {descriptor} {tf}: -{n} (venue {venue})",
+                    file=sys.stderr,
+                )
+            print(
+                f"candles: repair-future: {sum(p[3] for p in purged)} rows in {len(purged)} series",
+                file=sys.stderr,
+            )
         with httpx.Client() as client:
             run_cycle(
                 conn,
@@ -1340,7 +1869,7 @@ def main(argv: list[str] | None = None) -> int:
                 lambda line: print(line, file=sys.stderr),
                 policy,
             )
-        # C5 tail: PM capture store + BN drift + §9.5 derive.
+        # C5 tail: PM capture store + the Hypercall index fold + BN drift + §9.5 derive.
         replay_root = pathlib.Path(
             env.get("CLAUDE_WORKER_REPLAY_DIR", "") or "~/multivenue/logs"
         ).expanduser()

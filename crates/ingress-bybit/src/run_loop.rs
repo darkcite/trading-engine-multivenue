@@ -33,10 +33,10 @@ use std::io;
 
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{
-    constant_time_eq, expected_accept, queue_masked_text_frame, read_server_handshake,
-    sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
-    ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf, Status, Transport, WsOpcode,
-    WsReadResult,
+    constant_time_eq, expected_accept, queue_masked_text_frame, queue_masked_text_frame_rendered,
+    read_server_handshake, sec_websocket_key_from_seed, write_client_handshake,
+    ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong, Drained,
+    HandshakeResult, IoBuf, RxFill, Status, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock, NsTs};
@@ -47,7 +47,8 @@ use core_types::{
 
 use crate::{
     classify, extract_topic_symbol, parse_orderbook1, parse_tickers, parse_trade_row,
-    write_subscribe, BybitChannel, BybitMsgKind, BybitSymbolTable, BYBIT_MAX_SYMBOLS, PING_PAYLOAD,
+    render_subscribe, BybitChannel, BybitMsgKind, BybitSymbolTable, BYBIT_MAX_SYMBOLS,
+    PING_PAYLOAD,
 };
 
 // ---------------------------------------------------------------
@@ -59,16 +60,27 @@ use crate::{
 /// multi-symbol burst with a large margin (boot-time allocation).
 pub const RX_BUF_SIZE: usize = 256 * 1024;
 
-/// Tx buffer: handshake + one batched subscribe (~30 B/topic × 192
-/// topics ≈ 5.8 KiB) + pings. 16 KiB keeps ≥2× margin.
+/// Tx buffer: handshake + one batched subscribe ([`SUB_PAYLOAD_MAX`])
+/// + pings. The worst case fits — const-asserted where the subscribe is queued (HK3).
 pub const TX_BUF_SIZE: usize = 16 * 1024;
+
+/// The handshake's allowance in the tx budget (the MEXC shape).
+const HANDSHAKE_TX_MAX: usize = 1024;
+
+/// The longest batched subscribe payload (`crate::render_subscribe`):
+/// the envelope, then three topics per symbol, each at the longest
+/// prefix (`orderbook.1.`) and the longest symbol with its quotes and
+/// comma — 7 516 B at [`BYBIT_MAX_SYMBOLS`] = 64 (HK3).
+pub const SUB_PAYLOAD_MAX: usize = br#"{"op":"subscribe","args":[]}"#.len()
+    + BYBIT_MAX_SYMBOLS
+        * 3
+        * (br#","""#.len()
+            + crate::BybitChannel::OrderbookL1.topic_prefix().len()
+            + crate::BYBIT_SYMBOL_MAX);
 
 /// Tick-ring capacity. Must equal `engine::TICK_RING_SIZE` — the cli
 /// const-asserts the equality when wiring lanes (8a §3.3 pattern).
 pub const DEFAULT_TICK_RING_CAP: usize = 16_384;
-
-/// Stack scratch for one rendered subscribe batch.
-const SUBSCRIBE_SCRATCH: usize = 8 * 1024;
 
 /// Max `publicTrade` rows seq-buffered per push (accounting only —
 /// Bybit trades carry no venue seq; see the crate docs).
@@ -178,6 +190,12 @@ impl Driver {
     pub fn new(nonce_seed: u64, symbols: BybitSymbolTable, want_tickers: bool) -> Self {
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
+        // COPY: the 2 056 B symbol table moves into the driver, and the
+        // 4 296 B driver returns by value — once per connection, at boot —
+        // the driver holds its table INLINE so every hot lookup walks
+        // contiguous rows with no pointer to chase — rejected: a `Box` (a
+        // heap hop on the hot lookup) and a two-phase in-place init behind
+        // `&mut` (for a boot-only cost).
         Self {
             state: State::Connecting,
             rx: IoBuf::with_capacity(RX_BUF_SIZE),
@@ -271,6 +289,10 @@ impl Driver {
 
 /// Pump the transport once and advance the state machine. Zero-alloc
 /// once the handshake has completed.
+///
+/// Returns `Ok(true)` when this step's read stopped on a full rx
+/// ([`RxFill::Full`]): input may still wait below it, so the caller
+/// drives again ([`core_net::drain`]).
 #[allow(clippy::too_many_arguments)]
 pub fn drive_one<T: Transport, C: Capture>(
     transport: &mut T,
@@ -282,9 +304,9 @@ pub fn drive_one<T: Transport, C: Capture>(
     event_mask: u16,
     status: &IngressStatus,
     capture: &mut C,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     flush_tx(transport, drv)?;
-    fill_rx(transport, drv)?;
+    let fill = core_net::fill_rx(transport, &mut drv.rx)?;
 
     match drv.state {
         State::Connecting => {}
@@ -304,8 +326,39 @@ pub fn drive_one<T: Transport, C: Capture>(
         State::Closed => {}
     }
 
+    // HK2: an EOF closes the session only now — the frames that arrived
+    // with the FIN were parsed above — and nothing is flushed to a peer
+    // that has closed.
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+        return Ok(false);
+    }
     flush_tx(transport, drv)?;
-    Ok(())
+    Ok(fill == RxFill::Full)
+}
+
+/// I-3 ([`core_net::drain`]): drive one connection until a step makes no
+/// progress — its read did not stop on a full rx, it published no tick,
+/// its state held — or [`core_net::DRAIN_STEP_CAP`] steps have run, so
+/// one connection's backlog cannot starve the others on this thread.
+#[allow(clippy::too_many_arguments)]
+fn drive_until_idle<T: Transport, C: Capture>(
+    transport: &mut T,
+    drv: &mut Driver,
+    host: &[u8],
+    path: &[u8],
+    producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
+    event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    event_mask: u16,
+    status: &IngressStatus,
+    capture: &mut C,
+) -> Drained {
+    core_net::drain_until_idle!(
+        step: drive_one(transport, drv, host, path, producer, event_tx, event_mask, status, capture),
+        published: producer.published(),
+        key: drv.state(),
+        closed: drv.state() == State::Closed,
+    )
 }
 
 /// Bump `Connecting → NeedsWsWrite` once the transport is TLS-ready.
@@ -343,24 +396,6 @@ fn flush_tx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()>
         drv.tx.clear();
     } else if written > 0 {
         drv.tx.consume(written);
-    }
-    Ok(())
-}
-
-fn fill_rx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> {
-    loop {
-        if drv.rx.free_mut().is_empty() {
-            break;
-        }
-        match transport.read(drv.rx.free_mut()) {
-            Ok(0) => {
-                drv.state = State::Closed;
-                break;
-            }
-            Ok(n) => drv.rx.advance(n),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
     }
     Ok(())
 }
@@ -416,10 +451,15 @@ fn queue_subscribe_all(drv: &mut Driver) -> io::Result<()> {
     if drv.symbols.is_empty() {
         return Err(io::Error::other("bybit: no symbols configured"));
     }
-    let mut scratch = [0u8; SUBSCRIBE_SCRATCH];
-    let len = write_subscribe(&mut scratch, &drv.symbols, drv.want_tickers)
-        .ok_or_else(|| io::Error::other("bybit: subscribe scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..len])?;
+    // HK3: the handshake, the worst batched subscribe and its frame header
+    // fit in tx together.
+    const {
+        assert!(HANDSHAKE_TX_MAX + SUB_PAYLOAD_MAX + core_net::WS_CLIENT_HDR_MAX <= TX_BUF_SIZE);
+    };
+    let (symbols, want_tickers) = (&drv.symbols, drv.want_tickers);
+    queue_masked_text_frame_rendered(&mut drv.tx, &mut drv.mask_counter, |p| {
+        render_subscribe(p, symbols, want_tickers)
+    })?;
     drv.subscribed = true;
     Ok(())
 }
@@ -445,17 +485,18 @@ enum Dispatch {
     Quiet,
     /// The whole-request subscribe ack.
     SubAck { success: bool },
-    /// `orderbook.1` push pre-parsed (BBO state applied in phase 2).
-    Book {
-        sym: u32,
-        sym_idx: u8,
-        frame: crate::BybitBookFrame,
-    },
+    /// `orderbook.1` push pre-parsed into the phase-1 frame (BBO state
+    /// applied in phase 2).
+    Book { sym: u32, sym_idx: u8 },
     /// `publicTrade` push scanned (+ events captured in phase 1).
     Trades { scan: TradeScan },
     /// LINEAR `tickers` push — events captured in phase 1.
     Tickers,
 }
+
+// The dispatch value crosses phase 1 → phase 2 by value: pinned
+// within the 64 B by-value bound (frames ride in phase-1 scratch).
+const _: () = assert!(core::mem::size_of::<Dispatch>() <= 64);
 
 fn drain_ws_frames<C: Capture>(
     drv: &mut Driver,
@@ -468,16 +509,8 @@ fn drain_ws_frames<C: Capture>(
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
         match read_result {
-            WsReadResult::Incomplete => {
-                // Oversize guard (fail-fast rather than livelock).
-                if drv.rx.free_mut().is_empty() && !drv.rx.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "ws frame exceeds rx buffer capacity",
-                    ));
-                }
-                return Ok(());
-            }
+            // Oversize guard (fail-fast rather than livelock).
+            WsReadResult::Incomplete => return core_net::incomplete_frame(&mut drv.rx),
             WsReadResult::Malformed => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -510,14 +543,14 @@ fn drain_ws_frames<C: Capture>(
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
                         drv.mask_counter = drv.mask_counter.wrapping_add(1);
-                        let start = payload.start;
-                        let end = payload.end;
-                        let plen = end - start;
-                        let mut scratch = [0u8; 125];
-                        debug_assert!(plen <= scratch.len());
-                        scratch[..plen].copy_from_slice(&drv.rx.filled()[start..end]);
-                        let dst = drv.tx.free_mut();
-                        if let Ok(n) = ws_write_pong(dst, &scratch[..plen], mask) {
+                        // The echo goes straight from rx into tx (disjoint
+                        // field borrows) — no scratch; `ws_read_frame`
+                        // already refused a control payload over 125 B.
+                        if let Ok(n) = ws_write_pong(
+                            drv.tx.free_mut(),
+                            &drv.rx.filled()[payload.start..payload.end],
+                            mask,
+                        ) {
                             drv.tx.advance(n);
                         }
                     }
@@ -562,25 +595,23 @@ fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeSc
         let next = memchr::memmem::find(&payload[row_start + MARKER.len()..], MARKER)
             .map(|o| row_start + MARKER.len() + o);
         let row_end = next.unwrap_or(payload.len());
-        match parse_trade_row(&payload[row_start..row_end]) {
-            Some(t) => {
-                scan.rows_parsed += 1;
-                let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
-                capture.event(&ChannelEvent::new(
-                    now_ns(),
-                    VenueId::Bybit,
-                    ChannelId::Trade,
-                    sym,
-                    0,
-                    t.ts_ns / 1_000_000,
-                    t.px_1e6,
-                    signed_qty,
-                ));
-            }
-            None => {
-                scan.rows_rejected += 1;
-                capture.parse_reject(now_ns(), &payload[row_start..row_end]);
-            }
+        let mut t = crate::BybitTradeFrame::ZERO;
+        if parse_trade_row(&payload[row_start..row_end], &mut t) {
+            scan.rows_parsed += 1;
+            let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
+            capture.event(&ChannelEvent::new(
+                now_ns(),
+                VenueId::Bybit,
+                ChannelId::Trade,
+                sym,
+                0,
+                t.ts_ns / 1_000_000,
+                t.px_1e6,
+                signed_qty,
+            ));
+        } else {
+            scan.rows_rejected += 1;
+            capture.parse_reject(now_ns(), &payload[row_start..row_end]);
         }
         at = row_end;
     }
@@ -597,6 +628,10 @@ fn handle_data_frame<C: Capture>(
     capture: &mut C,
 ) -> io::Result<()> {
     let reject_range = payload_range.clone();
+    // Phase 1's book frame, parsed in place: riding inside the dispatch
+    // value it would widen every dispatch past the 64 B bound and cross
+    // phase 1 → phase 2 by value. `Dispatch::Book` says it was written.
+    let mut frame = crate::BybitBookFrame::ZERO;
     // Phase 1: immutable borrows — classify, resolve, pre-parse into
     // a Copy dispatch; capture hooks needing parsed values fire here.
     let dispatch: Dispatch = {
@@ -611,13 +646,15 @@ fn handle_data_frame<C: Capture>(
                         .lookup(s)
                         .map(|sym| (sym, drv.symbols.index_of(sym)))
                 }) {
-                    Some((sym, Some(sym_idx))) => match parse_orderbook1(payload) {
-                        Some(frame) => Dispatch::Book {
-                            sym,
-                            sym_idx: sym_idx as u8,
-                            frame,
-                        },
-                        None => Dispatch::Nothing,
+                    Some((sym, Some(sym_idx))) => {
+                        if parse_orderbook1(payload, &mut frame) {
+                            Dispatch::Book {
+                                sym,
+                                sym_idx: sym_idx as u8,
+                            }
+                        } else {
+                            Dispatch::Nothing
+                        }
                     },
                     _ => Dispatch::Nothing,
                 }
@@ -636,8 +673,9 @@ fn handle_data_frame<C: Capture>(
                 match extract_topic_symbol(payload, BybitChannel::Tickers)
                     .and_then(|s| drv.symbols.lookup(s))
                 {
-                    Some(sym) => match parse_tickers(payload) {
-                        Some(f) => {
+                    Some(sym) => {
+                        let mut f = crate::BybitTickerFrame::ZERO;
+                        if parse_tickers(payload, &mut f) {
                             // §6.5 capture (crate-doc conventions):
                             // presence-gated per delta field group.
                             let ts_ms = f.ts_ns / 1_000_000;
@@ -669,7 +707,7 @@ fn handle_data_frame<C: Capture>(
                                 // (capture stays first — §6.5
                                 // capture-before-push law).
                                 if event_mask & core_types::event_lane_bit(ChannelId::Funding) != 0
-                                    && event_tx.try_push(ev).is_err()
+                                    && !event_tx.try_push_ref(&ev)
                                 {
                                     status.inc_event_ring_drops();
                                 }
@@ -687,8 +725,9 @@ fn handle_data_frame<C: Capture>(
                                 ));
                             }
                             Dispatch::Tickers
+                        } else {
+                            Dispatch::Nothing
                         }
-                        None => Dispatch::Nothing,
                     },
                     None => Dispatch::Nothing,
                 }
@@ -740,11 +779,7 @@ fn handle_data_frame<C: Capture>(
                 log_sub_drop_rate_limited(drv);
             }
         }
-        Dispatch::Book {
-            sym,
-            sym_idx,
-            frame,
-        } => {
+        Dispatch::Book { sym, sym_idx } => {
             status.add_msgs(1);
             status.add_ticks(1);
             // VT2: judge EVERY stamped push (the offset learns from
@@ -786,7 +821,7 @@ fn handle_data_frame<C: Capture>(
                 // §6.5: capture BEFORE the push (ring-dropped ticks
                 // still reach the replay log).
                 capture.tick(&tick);
-                if producer.try_push(tick).is_err() {
+                if !producer.try_push_ref(&tick) {
                     status.inc_ring_drops();
                 }
             }
@@ -825,6 +860,13 @@ fn log_sub_drop_rate_limited(drv: &mut Driver) {
     let mut ok = true;
     let put = |buf: &mut [u8; 128], n: &mut usize, ok: &mut bool, src: &[u8]| {
         if *n + src.len() <= buf.len() {
+            // COPY: one part of the WARN line into the 128 B stack line, rate-limited
+            // to one line per DROP_LOG_INTERVAL_NS (1 s) — the line must reach stderr in
+            // ONE write so it cannot interleave with the cli's tracing output —
+            // rejected: one write per part (interleaves), `write!` into the same buffer
+            // (the same bytes, through fmt), and one `writev` of the parts (a short
+            // writev splits the line and `write_all_vectored` is unstable; its retry
+            // loop costs more than assembling ≤ 128 B once a second).
             buf[*n..*n + src.len()].copy_from_slice(src);
             *n += src.len();
         } else {
@@ -878,13 +920,16 @@ fn fmt_u64(mut v: u64, scratch: &mut [u8; 20]) -> &[u8] {
 pub type StopFlag = AtomicBool;
 
 /// One connection slot for [`run_multi`] (spot or linear).
-pub struct BybitConn<T: Transport> {
+pub struct BybitConn<'a, T: Transport> {
     /// Live transport, `None` while disconnected.
     pub transport: Option<T>,
     /// Per-connection driver.
     pub drv: Driver,
-    host: Vec<u8>,
-    path: Vec<u8>,
+    /// Host bytes for the `Host:` header, borrowed from the boot's
+    /// endpoint list, which outlives the loop.
+    host: &'a [u8],
+    /// Request path, borrowed likewise.
+    path: &'a [u8],
     keepalive: core_net::Keepalive,
     backoff: core_net::Backoff,
     next_attempt_ns: NsTs,
@@ -892,22 +937,27 @@ pub struct BybitConn<T: Transport> {
     last_interest: Option<mio::Interest>,
 }
 
-impl<T: Transport> BybitConn<T> {
+impl<'a, T: Transport> BybitConn<'a, T> {
     /// New slot, initially disconnected (`next_attempt_ns` 0 = due
-    /// immediately). Boot-time allocation for host/path is sanctioned
-    /// (never touched on the hot path).
+    /// immediately). `host` and `path` are borrowed, not copied: the
+    /// boot keeps its endpoint list alive for as long as the loop runs.
     pub fn new(
         drv: Driver,
-        host: &[u8],
-        path: &[u8],
+        host: &'a [u8],
+        path: &'a [u8],
         keepalive: core_net::Keepalive,
         backoff: core_net::Backoff,
     ) -> Self {
+        // COPY: the Driver (4 296 B, its symbol table inline) moves into its
+        // slot here and, with the slot (5 488 B), into the boot's Vec — two
+        // moves per connection, once, at boot — rejected: a two-phase
+        // in-place init behind `&mut` (every constructor split, for a
+        // boot-only cost).
         Self {
             transport: None,
             drv,
-            host: host.to_vec(),
-            path: path.to_vec(),
+            host,
+            path,
             keepalive,
             backoff,
             next_attempt_ns: 0,
@@ -941,7 +991,7 @@ impl<T: Transport> BybitConn<T> {
 // loop (CLAUDE.md hot-path rules; `i` is also the mio Token identity).
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub fn run_multi<T: Transport, C: Capture>(
-    conns: &mut [BybitConn<T>],
+    conns: &mut [BybitConn<'_, T>],
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
@@ -952,6 +1002,8 @@ pub fn run_multi<T: Transport, C: Capture>(
     capture: &mut C,
     mut connect: impl FnMut(usize) -> Option<T>,
 ) -> RunResult {
+    // Set when a slot's drain hit the step cap: poll without sleeping.
+    let mut repoll_now = false;
     while !stop.load(core::sync::atomic::Ordering::Relaxed) {
         // 1. Reconnect pass — one dial per iteration, oldest-due first.
         let now = now_ns();
@@ -977,6 +1029,12 @@ pub fn run_multi<T: Transport, C: Capture>(
                         conns[i].drv.reset_for_reconnect(now);
                         conns[i].keepalive.reset();
                         conns[i].session_start_ns = now;
+                        // COPY: the new transport (1 080 B `TlsTransport`, rustls'
+                        // ClientConnection held inline) moves from `connect` into
+                        // its slot — once per reconnect, beside a TCP + TLS
+                        // handshake that costs orders of magnitude more —
+                        // rejected: a placement API on core-net's connect, for
+                        // one move per reconnect.
                         conns[i].transport = Some(t);
                     }
                 }
@@ -985,11 +1043,12 @@ pub fn run_multi<T: Transport, C: Capture>(
         }
 
         if poll
-            .poll(events, Some(std::time::Duration::from_millis(50)))
+            .poll(events, Some(core_net::poll_timeout(repoll_now)))
             .is_err()
         {
             return RunResult::Error;
         }
+        repoll_now = false;
 
         // 2. Readiness → per-slot pump.
         for ev in events.iter() {
@@ -1007,32 +1066,24 @@ pub fn run_multi<T: Transport, C: Capture>(
             }
         }
 
-        // 3. Drain every live slot (bounded no-progress loop).
+        // 3. Drain every live slot (I-3, core_net::drain), at most
+        //    DRAIN_STEP_CAP steps each; a capped slot is driven again next
+        //    iteration, after a poll that does not sleep.
         for i in 0..conns.len() {
             let c = &mut conns[i];
             let Some(t) = c.transport.as_mut() else {
                 continue;
             };
-            loop {
-                let n_before = producer.len();
-                let state_before = c.drv.state();
-                if drive_one(
-                    t, &mut c.drv, &c.host, &c.path, producer, event_tx, event_mask, status,
-                    capture,
-                )
-                .is_err()
-                {
-                    c.kill(now_ns(), status, false);
-                    break;
-                }
-                if c.drv.state() == State::Closed {
+            match drive_until_idle(
+                t, &mut c.drv, c.host, c.path, producer, event_tx, event_mask, status, capture,
+            ) {
+                Drained::Idle => {}
+                Drained::Capped => repoll_now = true,
+                Drained::Closed => {
                     let moved = c.drv.sub_count() > 0;
                     c.kill(now_ns(), status, moved);
-                    break;
                 }
-                if producer.len() == n_before && c.drv.state() == state_before {
-                    break;
-                }
+                Drained::Failed(_) => c.kill(now_ns(), status, false),
             }
         }
 
@@ -1173,7 +1224,7 @@ mod tests {
         producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
         status: &IngressStatus,
         capture: &mut C,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         let (mut etx, _erx) = event_ring_pair();
         super::drive_one(
             transport,
@@ -1218,6 +1269,31 @@ mod tests {
         }
         fn parse_reject(&mut self, _ts: u64, _p: &[u8]) {
             self.rejects += 1;
+        }
+    }
+
+    /// The WS Ping echo goes rx → tx with no scratch (the BX0 shape): an
+    /// empty, a 4 B and a 125 B (control-frame cap) ping each come back
+    /// as exactly one masked pong carrying the same bytes.
+    #[test]
+    fn a_ws_ping_is_echoed_straight_from_rx() {
+        for payload in TestTransport::PING_ECHO_CASES {
+            let mut t = TestTransport::with_capacity(4096);
+            let mut d = steady_driver(false);
+            let (mut prod, _cons) = ring_pair();
+            let status = IngressStatus::new();
+            t.inject_server_ping(payload);
+            drive_one(
+                &mut t,
+                &mut d,
+                b"host",
+                b"/",
+                &mut prod,
+                &status,
+                &mut NullCapture,
+            )
+            .unwrap();
+            t.expect_pong_echo(payload);
         }
     }
 
@@ -1291,6 +1367,107 @@ mod tests {
         assert!(memchr::memmem::find(&body, b"\"tickers.ETHUSDT\"").is_some());
     }
 
+    /// HK3: the worst batched subscribe — every row at the longest
+    /// symbol, tickers on — renders within [`SUB_PAYLOAD_MAX`], which the
+    /// tx sizing assert is built on.
+    #[test]
+    fn the_worst_batched_subscribe_fits_its_bound() {
+        let mut syms = BybitSymbolTable::new();
+        let mut i = 0u32;
+        while (i as usize) < BYBIT_MAX_SYMBOLS {
+            let mut name = [b'S'; crate::BYBIT_SYMBOL_MAX];
+            name[0] = b'A' + (i / 26) as u8;
+            name[1] = b'A' + (i % 26) as u8;
+            syms.insert(&name, (6 << 24) | (1 + i)).unwrap();
+            i += 1;
+        }
+        let mut tx = IoBuf::with_capacity(TX_BUF_SIZE);
+        let mut ctr = 0u64;
+        queue_masked_text_frame_rendered(&mut tx, &mut ctr, |p| {
+            render_subscribe(p, &syms, true)
+        })
+        .unwrap();
+        assert!(tx.len() <= SUB_PAYLOAD_MAX + core_net::WS_CLIENT_HDR_MAX);
+    }
+
+    /// HK2: a push that arrives in the same read as the venue's FIN is
+    /// published before the session closes. Before, the EOF set `Closed`
+    /// ahead of the state machine and the push was dropped.
+    #[test]
+    fn a_frame_that_arrives_with_the_fin_is_published_then_the_session_closes() {
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+        let snap = br#"{"topic":"orderbook.1.BTCUSDT","type":"snapshot","ts":1,"data":{"s":"BTCUSDT","b":[["50005.12","1.5"]],"a":[["50006.34","2.0"]],"u":100,"seq":1}}"#;
+        t.inject_incoming(&ws_text_frame(snap));
+        t.mark_closed();
+        let full = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture)
+            .unwrap();
+        assert!(!full);
+        assert_eq!(cons.try_pop_ref().map(|t| t.sym), Some(SYM_BTC), "published before the close");
+        assert_eq!(d.state(), State::Closed);
+    }
+
+    /// HK2: the oversize guard, now the shared `core_net::incomplete_frame`:
+    /// a frame larger than rx fails the session at once.
+    #[test]
+    fn a_frame_larger_than_rx_fails_the_session_instead_of_stalling() {
+        let mut t = TestTransport::with_capacity(RX_BUF_SIZE + 1024);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let huge = (RX_BUF_SIZE as u64 + 4096).to_be_bytes();
+        let mut frame = vec![0u8; RX_BUF_SIZE + 512];
+        frame[0] = 0x81;
+        frame[1] = 127;
+        frame[2..10].copy_from_slice(&huge);
+        t.inject_incoming(&frame);
+        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture)
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// I-3: a burst of non-tick frames past a full rx no longer strands
+    /// what follows it until the next readiness edge — one drain reads it
+    /// all, the tick behind it included; a backlog past `DRAIN_STEP_CAP`
+    /// full-rx steps ends `Capped` (`run_multi` re-polls at once and the
+    /// other slots get their turn) and the next drain finishes it.
+    #[test]
+    fn drive_until_idle_reads_past_a_full_rx_and_caps_a_backlog() {
+        let snap = br#"{"topic":"orderbook.1.BTCUSDT","type":"snapshot","ts":1,"data":{"s":"BTCUSDT","b":[["50005.12","1.5"]],"a":[["50006.34","2.0"]],"u":100,"seq":1}}"#;
+        for (fills, first) in [(2, Drained::Idle), (core_net::DRAIN_STEP_CAP as usize, Drained::Capped)] {
+            let mut t = TestTransport::with_capacity((fills + 1) * RX_BUF_SIZE);
+            let mut d = steady_driver(false);
+            let (mut prod, mut cons) = ring_pair();
+            let (mut etx, _erx) = event_ring_pair();
+            let status = IngressStatus::new();
+            t.inject_server_pongs(fills * RX_BUF_SIZE);
+            t.inject_incoming(&ws_text_frame(snap));
+            for expect in [first, Drained::Idle] {
+                assert_eq!(
+                    drive_until_idle(
+                        &mut t,
+                        &mut d,
+                        b"h",
+                        b"/",
+                        &mut prod,
+                        &mut etx,
+                        core_types::EVENT_LANE_FUNDING,
+                        &status,
+                        &mut NullCapture,
+                    ),
+                    expect
+                );
+                if expect == Drained::Capped {
+                    assert!(cons.try_pop_ref().is_none(), "the tick still waits below the cap");
+                }
+            }
+            assert_eq!(cons.try_pop_ref().expect("the tick behind the burst").sym, SYM_BTC);
+            assert_eq!(t.incoming_len(), 0, "every byte was read");
+        }
+    }
+
     #[test]
     fn book_snapshot_then_delta_emits_ticks_with_merged_state() {
         let mut t = TestTransport::with_capacity(16384);
@@ -1305,14 +1482,14 @@ mod tests {
         t.inject_incoming(&ws_text_frame(delta));
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
 
-        let t1 = cons.try_pop().expect("snapshot tick");
+        let t1 = *cons.try_pop_ref().expect("snapshot tick");
         assert_eq!(t1.sym, SYM_BTC);
         assert_eq!(t1.venue, VenueId::Bybit as u8);
         assert_eq!(t1.bid_px.raw(), 50_005_120_000);
         assert_eq!(t1.ask_px.raw(), 50_006_340_000);
         assert_eq!(t1.venue_seq, 100);
-        let t2 = cons
-            .try_pop()
+        let t2 = *cons
+            .try_pop_ref()
             .expect("delta tick — ask side carried forward");
         assert_eq!(t2.bid_px.raw(), 50_005_500_000);
         assert_eq!(
@@ -1343,7 +1520,9 @@ mod tests {
         );
         t.inject_incoming(&ws_text_frame(s.as_bytes()));
         drive_one(t, d, b"h", b"/", prod, status, &mut NullCapture).unwrap();
-        cons.try_pop().expect("two-sided snapshot must produce a tick")
+        *cons
+            .try_pop_ref()
+            .expect("two-sided snapshot must produce a tick")
     }
 
     #[test]
@@ -1416,7 +1595,7 @@ mod tests {
             &mut NullCapture,
         )
         .unwrap();
-        assert!(cons.try_pop().is_none(), "one-sided book is not a BBO");
+        assert!(cons.try_pop_ref().is_none(), "one-sided book is not a BBO");
         let ask = br#"{"topic":"orderbook.1.BTCUSDT","type":"delta","ts":2,"data":{"s":"BTCUSDT","b":[],"a":[["50006.00","1.0"]],"u":101,"seq":2}}"#;
         t.inject_incoming(&ws_text_frame(ask));
         drive_one(
@@ -1429,7 +1608,7 @@ mod tests {
             &mut NullCapture,
         )
         .unwrap();
-        assert!(cons.try_pop().is_some(), "both sides live now");
+        assert!(cons.try_pop_ref().is_some(), "both sides live now");
     }
 
     #[test]
@@ -1528,12 +1707,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(cap.events.len(), 3, "capture: Mark + Funding + OI");
-        let ev = erx.try_pop().expect("funding event on the lane");
+        let ev = *erx.try_pop_ref().expect("funding event on the lane");
         assert_eq!(ev.channel, ChannelId::Funding as u8);
         assert_eq!(ev.v0, -212_000, "rate ×1e9");
         assert_eq!(ev.v1, 1_673_280_000_000, "next funding ms");
         assert!(
-            erx.try_pop().is_none(),
+            erx.try_pop_ref().is_none(),
             "Mark/OI are NOT on the lane (mask gates per channel)"
         );
         assert_eq!(status.event_ring_drops_total(), 0);

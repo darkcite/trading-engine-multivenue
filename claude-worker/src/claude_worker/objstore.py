@@ -54,6 +54,8 @@ import http
 import pathlib
 import random
 import re
+import signal
+import threading
 import time
 import typing
 import urllib.parse
@@ -76,6 +78,15 @@ MAX_PARTS: typing.Final[int] = 10_000
 #: Streaming chunk size for uploads and downloads.
 CHUNK_SIZE: typing.Final[int] = 8 * 1024 * 1024
 
+#: Upload piece size under a rate cap. A capped FILE upload hands the socket at
+#: most this much at a time, so what sits queued ahead of the feeds' ACKs on
+#: the uplink is bounded by the cap, not by CHUNK_SIZE (HK11). An in-memory
+#: body (a manifest, the Complete XML) is paced as one piece: it is small.
+PACE_CHUNK: typing.Final[int] = 64 * 1024
+
+#: The cap's burst: bytes an idle bucket may send back to back.
+PACE_BURST: typing.Final[int] = 4 * PACE_CHUNK
+
 #: Headers that are never signed. ``content-length`` is excluded because httpx
 #: may normalise it; the others are transport-managed.
 UNSIGNED_HEADERS: typing.Final[frozenset[str]] = frozenset(
@@ -87,6 +98,13 @@ UNSIGNED_HEADERS: typing.Final[frozenset[str]] = frozenset(
 RETRY_STATUS: typing.Final[frozenset[int]] = frozenset({429, 500, 502, 503, 504})
 MAX_ATTEMPTS: typing.Final[int] = 6
 BACKOFF_CAP_S: typing.Final[float] = 32.0
+
+#: HK21: the timeout of a request with no payload and a small answer: the
+#: multipart initiate, its abort, the uploads listing. Short because the
+#: initiate runs with SIGTERM held, one attempt at a time: a stalled attempt
+#: delays a stop by its connect plus its read (2 x this), not by the 900 s a
+#: part is allowed.
+CONTROL_TIMEOUT_S: typing.Final[float] = 15.0
 
 
 class ObjStoreError(Exception):
@@ -148,6 +166,14 @@ class ObjectMeta(typing.NamedTuple):
     last_modified: str
 
 
+class Incomplete(typing.NamedTuple):
+    """A multipart upload begun and never completed or aborted (HK21)."""
+
+    key: str
+    upload_id: str
+    initiated: str  # ISO-8601, as the endpoint states it
+
+
 @dataclasses.dataclass(slots=True)
 class Budget:
     """A wall-clock budget shared across an upload.
@@ -162,6 +188,41 @@ class Budget:
 
     def spent(self) -> bool:
         return self.clock() >= self.deadline
+
+
+@dataclasses.dataclass(slots=True)
+class RateLimiter:
+    """A token bucket over upload bytes (HK11).
+
+    An uncapped upload saturated this Mac's uplink on 2026-10-14 and the
+    feeds' ACKs queued behind it: Deribit's delay EMA hit its 65 535 ms
+    ceiling and Binance went from 38 k to 1.14 M stale ticks. ``take`` sleeps
+    until ``n`` more bytes fit under ``rate_bps``; an idle bucket holds at
+    most ``burst`` bytes. The stamp advances by the time it asked to sleep,
+    so the pacing does not depend on how long the sleep really took.
+    """
+
+    rate_bps: float
+    burst: int
+    clock: collections.abc.Callable[[], float] = time.monotonic
+    sleep: collections.abc.Callable[[float], None] = time.sleep
+    _tokens: float = dataclasses.field(default=-1.0, init=False)
+    _stamp: float = dataclasses.field(default=0.0, init=False)
+
+    def take(self, n: int) -> None:
+        now = self.clock()
+        if self._tokens < 0.0:
+            self._tokens = float(self.burst)
+            self._stamp = now
+        elapsed = max(0.0, now - self._stamp)
+        self._tokens = min(float(self.burst), self._tokens + elapsed * self.rate_bps)
+        self._stamp = max(self._stamp, now)
+        self._tokens -= n
+        if self._tokens < 0.0:
+            wait = -self._tokens / self.rate_bps
+            self.sleep(wait)
+            self._stamp += wait
+            self._tokens = 0.0
 
 
 class SignedRequest(typing.NamedTuple):
@@ -188,7 +249,7 @@ def canonical_query(pairs: collections.abc.Sequence[tuple[str, str]]) -> str:
     return "&".join(name + "=" + value for name, value in encoded)
 
 
-def sign(  # noqa: PLR0913 — one parameter per SigV4 input, deliberately
+def sign(  # one parameter per SigV4 input, deliberately
     *,
     method: str,
     path: str,
@@ -206,9 +267,7 @@ def sign(  # noqa: PLR0913 — one parameter per SigV4 input, deliberately
     so a signing regression names its own stage instead of surfacing as a 403
     from a live endpoint.
     """
-    signed_names = sorted(
-        name.lower() for name in headers if name.lower() not in UNSIGNED_HEADERS
-    )
+    signed_names = sorted(name.lower() for name in headers if name.lower() not in UNSIGNED_HEADERS)
     lowered = {name.lower(): " ".join(str(value).split()) for name, value in headers.items()}
     canonical_headers = "".join(name + ":" + lowered[name] + "\n" for name in signed_names)
     signed_headers = ";".join(signed_names)
@@ -295,7 +354,7 @@ def _file_sha256_and_md5(path: pathlib.Path) -> tuple[str, str]:
 class ObjectStore:
     """The verbs this archive needs, and no others."""
 
-    def __init__(  # noqa: PLR0913 — one parameter per injected seam, deliberately
+    def __init__(  # one parameter per injected seam, deliberately
         self,
         endpoint: Endpoint,
         creds: Credentials,
@@ -305,21 +364,31 @@ class ObjectStore:
         clock: collections.abc.Callable[[], float] = time.time,
         sleep: collections.abc.Callable[[float], None] = time.sleep,
         rng: random.Random | None = None,
+        max_upload_bps: float = 0.0,
+        monotonic: collections.abc.Callable[[], float] = time.monotonic,
     ) -> None:
         self.endpoint = endpoint
         self._creds = creds
         self._http = http_client
         self._timeout_s = timeout_s
+        # HK21: set while a ``hold_term`` request's SIGTERM is still deferred.
+        self._term_held: _HeldTerm | None = None
         self._clock = clock
         self._sleep = sleep
         self._rng = rng if rng is not None else random.Random(0)
+        # 0 = uncapped. Every upload byte, retries included, passes the bucket.
+        self._limiter: RateLimiter | None = (
+            RateLimiter(max_upload_bps, PACE_BURST, clock=monotonic, sleep=sleep)
+            if max_upload_bps > 0.0
+            else None
+        )
 
     # -- request plumbing ---------------------------------------------------
 
     def _amz_date(self) -> str:
         return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(self._clock()))
 
-    def _build(  # noqa: PLR0913 — one parameter per request component, deliberately
+    def _build(  # one parameter per request component, deliberately
         self,
         method: str,
         key: str,
@@ -329,6 +398,7 @@ class ObjectStore:
         extra_headers: collections.abc.Mapping[str, str] | None,
         content: bytes | collections.abc.Iterable[bytes] | None,
         content_length: int | None,
+        timeout_s: float,
     ) -> httpx.Request:
         path = self.endpoint.path_for(key)
         qs = canonical_query(query)
@@ -363,7 +433,7 @@ class ObjectStore:
             # implement.
             wire["content-length"] = str(content_length)
         return self._http.build_request(
-            method, url, headers=wire, content=content, timeout=self._timeout_s
+            method, url, headers=wire, content=content, timeout=timeout_s
         )
 
     def _send(  # noqa: PLR0913 — one parameter per request component, deliberately
@@ -381,8 +451,15 @@ class ObjectStore:
         expect: collections.abc.Container[int] = (200, 204),
         allow: collections.abc.Container[int] = (),
         stream_response: bool = False,
+        timeout_s: float | None = None,
+        hold_term: bool = False,
     ) -> httpx.Response:
-        """One request with bounded retries. Re-signs on every attempt."""
+        """One request with bounded retries. Re-signs on every attempt.
+
+        ``hold_term`` (HK21) holds SIGTERM across each attempt alone: released
+        after a failed one, before its backoff; after a successful one it is
+        LEFT held, for the caller to release (`_release_held`) once what the
+        answer named is where its abort can reach it."""
         if key and not KEY_RE.match(key):
             raise ObjStoreError(f"key is not representable without escaping: {key!r}")
 
@@ -391,10 +468,18 @@ class ObjectStore:
             content: bytes | collections.abc.Iterable[bytes] | None = None
             length: int | None = None
             if body is not None:
+                if self._limiter is not None:
+                    self._limiter.take(len(body))
                 content = body
                 length = len(body)
             elif stream_path is not None:
-                content = _file_chunks(stream_path, stream_offset, stream_length)
+                if self._limiter is None:
+                    content = _file_chunks(stream_path, stream_offset, stream_length)
+                else:
+                    content = _paced_chunks(
+                        _file_chunks(stream_path, stream_offset, stream_length, PACE_CHUNK),
+                        self._limiter,
+                    )
                 length = stream_length
 
             request = self._build(
@@ -405,16 +490,23 @@ class ObjectStore:
                 extra_headers=extra_headers,
                 content=content,
                 content_length=length,
+                timeout_s=self._timeout_s if timeout_s is None else timeout_s,
             )
             try:
+                if hold_term:
+                    self._hold()
                 response = self._http.send(request, stream=stream_response)
             except httpx.TransportError as exc:
                 last = ObjStoreError(
                     f"{method} {key or '/'}: transport error ({type(exc).__name__})"
                 )
+            except BaseException:
+                self._release_held()
+                raise
             else:
                 if response.status_code in expect or response.status_code in allow:
-                    return response
+                    return response  # hold_term: still held, see the docstring
+                self._release_held()
                 payload = b"" if stream_response else response.content
                 if stream_response:
                     response.close()
@@ -427,18 +519,36 @@ class ObjectStore:
                 )
                 if response.status_code not in RETRY_STATUS:
                     raise last
+            self._release_held()
             if attempt + 1 < MAX_ATTEMPTS:
                 delay = min(BACKOFF_CAP_S, 2.0**attempt)
                 self._sleep(delay * (0.8 + 0.4 * self._rng.random()))
         raise last if last is not None else ObjStoreError(f"{method} {key or '/'}: no attempt made")
 
+    def _hold(self) -> None:
+        """Defer SIGTERM for one attempt (HK21). The deferral is kept BEFORE
+        it is installed, so every release path can find it, even one taken
+        by an exception between the two."""
+        held = _deferral()
+        if held is not None:
+            self._term_held = held
+            signal.signal(signal.SIGTERM, held.record)
+
+    def _release_held(self) -> None:
+        """Release what a ``hold_term`` request left held; a no-op when none
+        is. A SIGTERM held meanwhile raises out of this call. Idempotent: the
+        deferral is dropped only once released, so a release cut short is
+        finished by the next."""
+        held = self._term_held
+        if held is not None:
+            _release_term(held)
+            self._term_held = None
+
     # -- verbs --------------------------------------------------------------
 
     def head(self, key: str) -> ObjectMeta | None:
         """Metadata for ``key``; ``None`` when it does not exist."""
-        response = self._send(
-            "HEAD", key, expect=(200,), allow=(int(http.HTTPStatus.NOT_FOUND),)
-        )
+        response = self._send("HEAD", key, expect=(200,), allow=(int(http.HTTPStatus.NOT_FOUND),))
         if response.status_code == http.HTTPStatus.NOT_FOUND:
             return None
         return ObjectMeta(
@@ -448,9 +558,7 @@ class ObjectStore:
             last_modified=response.headers.get("last-modified", ""),
         )
 
-    def get(
-        self, key: str, dst: pathlib.Path, *, expect_size: int | None = None
-    ) -> ObjectMeta:
+    def get(self, key: str, dst: pathlib.Path, *, expect_size: int | None = None) -> ObjectMeta:
         """Stream ``key`` to ``dst``. Writes ``dst`` only on a complete read."""
         partial = dst.with_name(dst.name + ".part")
         partial.parent.mkdir(parents=True, exist_ok=True)
@@ -609,15 +717,36 @@ class ObjectStore:
         if parts_total > MAX_PARTS:
             raise ObjStoreError(f"{parts_total} parts exceeds the {MAX_PARTS} limit")
 
-        initiate = self._send("POST", key, query=[("uploads", "")], expect=(200,))
-        root = xml.etree.ElementTree.fromstring(initiate.content)
-        upload_id = _text(root, "{*}UploadId")
+        # HK21: the initiate runs with SIGTERM DEFERRED (recorded, then raised
+        # again), one attempt at a time. Acted on after the bucket made the
+        # upload but before its id is in hand, a SIGTERM's SystemExit would
+        # leave nothing to abort: an orphan. A failed attempt releases it
+        # before its backoff; the answering one keeps it until the id is in
+        # hand, released inside the try below, where the abort reaches it. An
+        # attempt whose answer was LOST made an upload no one can name:
+        # `abort-stale` clears those.
+        try:
+            initiate = self._send(
+                "POST",
+                key,
+                query=[("uploads", "")],
+                expect=(200,),
+                timeout_s=CONTROL_TIMEOUT_S,
+                hold_term=True,
+            )
+            root = xml.etree.ElementTree.fromstring(initiate.content)
+            upload_id = _text(root, "{*}UploadId")
+        except BaseException:
+            self._release_held()
+            raise
         if not upload_id:
+            self._release_held()
             raise ObjStoreError(f"POST {key}?uploads: no UploadId in the response")
 
         etags: builtins.list[str] = []
         md5s: builtins.list[bytes] = []
         try:
+            self._release_held()
             for number in range(1, parts_total + 1):
                 offset = (number - 1) * part_size
                 length = min(part_size, size - offset)
@@ -667,6 +796,36 @@ class ObjectStore:
             raise DigestMismatch(f"{key}: ETag {server_etag} != composite {composite}")
         return ObjectMeta(key=key, size=size, etag=server_etag or composite, last_modified="")
 
+    def list_multipart(self, prefix: str = "") -> collections.abc.Iterator[Incomplete]:
+        """Every incomplete multipart upload under ``prefix`` (HK21), following
+        the key and upload-id markers."""
+        key_marker = ""
+        id_marker = ""
+        while True:
+            query: builtins.list[tuple[str, str]] = [("uploads", "")]
+            if prefix:
+                query.append(("prefix", prefix))
+            if key_marker:
+                query.append(("key-marker", key_marker))
+            if id_marker:
+                query.append(("upload-id-marker", id_marker))
+            response = self._send(
+                "GET", "", query=query, expect=(200,), timeout_s=CONTROL_TIMEOUT_S
+            )
+            root = xml.etree.ElementTree.fromstring(response.content)
+            for node in root.findall("{*}Upload"):
+                yield Incomplete(
+                    key=_text(node, "{*}Key"),
+                    upload_id=_text(node, "{*}UploadId"),
+                    initiated=_text(node, "{*}Initiated"),
+                )
+            if _text(root, "{*}IsTruncated").lower() != "true":
+                return
+            key_marker = _text(root, "{*}NextKeyMarker")
+            id_marker = _text(root, "{*}NextUploadIdMarker")
+            if not key_marker:
+                return
+
     def abort_multipart(self, key: str, upload_id: str) -> None:
         """The ONLY DELETE-verb request this client can send (S-LAW 11).
 
@@ -680,6 +839,7 @@ class ObjectStore:
                 query=[("uploadId", upload_id)],
                 expect=(204, 200),
                 allow=(int(http.HTTPStatus.NOT_FOUND),),
+                timeout_s=CONTROL_TIMEOUT_S,
             )
         except ObjStoreError:
             return
@@ -710,9 +870,9 @@ def _response_chunks(response: httpx.Response) -> collections.abc.Iterator[bytes
 
 
 def _file_chunks(
-    path: pathlib.Path, offset: int, length: int
+    path: pathlib.Path, offset: int, length: int, chunk_size: int = CHUNK_SIZE
 ) -> collections.abc.Iterator[bytes]:
-    """Yield ``length`` bytes of ``path`` from ``offset`` in CHUNK_SIZE pieces.
+    """Yield ``length`` bytes of ``path`` from ``offset`` in ``chunk_size`` pieces.
 
     Copy ledger: one copy per chunk inside httpx/h11 (``h11.Connection.send``
     joins its data list into a fresh ``bytes``) plus the TLS record copy in
@@ -723,11 +883,68 @@ def _file_chunks(
     with path.open("rb") as handle:
         handle.seek(offset)
         while remaining > 0:
-            chunk = handle.read(min(CHUNK_SIZE, remaining))
+            chunk = handle.read(min(chunk_size, remaining))
             if not chunk:
                 return
             remaining -= len(chunk)
             yield chunk
+
+
+class _HeldTerm:
+    """The SIGTERM handler a hold replaced, and whether one arrived (HK21)."""
+
+    __slots__ = ("previous", "seen")
+
+    def __init__(self, previous: typing.Any) -> None:  # whatever getsignal gave
+        self.previous = previous
+        self.seen = False
+
+    def record(self, _signum: int, _frame: object) -> None:
+        self.seen = True
+
+
+def _deferral() -> _HeldTerm | None:
+    """A deferral of SIGTERM, not yet installed (HK21): while its ``record``
+    is the handler, a SIGTERM is recorded, not acted on, until
+    `_release_term`.
+
+    A deferral, not a mask: Python runs a handler on the main thread whichever
+    thread the OS hands the signal to, so it holds in a threaded process too,
+    where a per-thread mask did not (another thread took the signal; the
+    first HK21 cut). None — nothing deferred, `abort-stale` clears what an
+    orphaned initiate leaves — off the main thread (``signal.signal`` refuses
+    there) and when there is no Python handler to unwind through (None,
+    SIG_DFL, SIG_IGN: deferring those would only make the orphan certain)."""
+    if threading.current_thread() is not threading.main_thread():
+        return None
+    previous = signal.getsignal(signal.SIGTERM)
+    if not callable(previous):
+        return None
+    return _HeldTerm(previous)
+
+
+def _release_term(held: _HeldTerm) -> None:
+    """Put the replaced handler back (only if the deferral is still the
+    handler: idempotent) and raise a SIGTERM recorded meanwhile again, once,
+    so its handler's SystemExit comes out of this call."""
+    if signal.getsignal(signal.SIGTERM) == held.record:  # bound methods: ==
+        signal.signal(signal.SIGTERM, held.previous)
+    if held.seen:
+        held.seen = False
+        signal.raise_signal(signal.SIGTERM)
+
+
+def _paced_chunks(
+    chunks: collections.abc.Iterable[bytes], limiter: RateLimiter
+) -> collections.abc.Iterator[bytes]:
+    """Hand each piece to the socket only once the bucket admits it.
+
+    No copy: the pieces are the reads themselves (``_file_chunks`` at
+    PACE_CHUNK), passed through.
+    """
+    for chunk in chunks:
+        limiter.take(len(chunk))
+        yield chunk
 
 
 def _slice_digests(path: pathlib.Path, offset: int, length: int) -> tuple[str, str]:

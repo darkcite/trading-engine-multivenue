@@ -25,6 +25,19 @@ use std::path::{Path, PathBuf};
 use core_types::SymbolId;
 use tracing::{info, warn};
 
+// XH4i-3a: BIN15's grid (×1e6) and the gateway arm's `OutcomeRules` (×1e8)
+// are one rule set. The arm checks and never rounds, so a drift between the
+// two would refuse every leg order (`refused_rules`): held at compile time.
+const _: () = {
+    use exec_hyperliquid::rules::OutcomeRules as R;
+    assert!(strategy_bin15::GRID_TICK_1E6 * 100 == R::TICK_1E8);
+    assert!(strategy_bin15::GRID_LOT_1E6 * 100 == R::LOT_1E8);
+    assert!(strategy_bin15::GRID_PX_MIN_1E6 * 100 == R::PX_MIN_1E8);
+    assert!(strategy_bin15::GRID_PX_MAX_1E6 * 100 == R::PX_MAX_1E8);
+    // $1 both ways: px × qty / 1e6 at 1e6 there, px × sz at 1e8 × 1e8 here.
+    assert!(strategy_bin15::GRID_MIN_NOTIONAL_1E6 * 10_000_000_000 == R::MIN_NOTIONAL_1E16);
+};
+
 /// One underlying's boot seed.
 ///
 /// **A pair belongs to ONE tenor.** `x` is `ln har_tau` and `y` is `ln`
@@ -71,6 +84,8 @@ pub struct Bin15Boot {
     pub params: strategy_bin15::Bin15Params,
     /// The lookup tables, boxed once here and moved into the member.
     pub luts: Box<strategy_bin15::price::Bin15Luts>,
+    /// BIN15 H90: the late Φ table, when the artifact carries one.
+    pub late_lut: Option<Box<strategy_bin15::late::LateLut>>,
     /// sha256 of the artifact BYTES — the boot tell's identity.
     pub hash: [u8; 32],
     /// Per-underlying seeds, in `underlying` order.
@@ -275,10 +290,43 @@ pub fn load_bin15_boot(
     // BIN15 R0 (2026-09-19): absent = 0 = no floor, the old law bit for
     // bit; the parser has already bounded a present value to [0, 1e6).
     params.entry_min_px_1e6 = file.entry_min_px_1e6;
+    // BIN15 S5: absent = 1 and 0 = the pre-S5 law bit for bit (the
+    // first passing snapshot fires; no ceiling); the parser has bounded
+    // both.
+    params.entry_persist_polls = file.entry_persist_polls;
+    params.entry_elapsed_max_ns = file.entry_elapsed_max_ns;
+    // BIN15 S5b (ruling 2026-09-24): the control counterfactual is TODAY'S
+    // law — the stated default bound, whatever this artifact's own
+    // `e_entry_1e6` says. It prices nothing and emits nothing.
+    params.entry_control_e_1e6 = core_config::bin15::E_ENTRY_1E6_DEFAULT;
     params.maker_enabled = file.maker_enabled;
     params.null_arm = file.null_arm;
     params.hour_ln_off_1e9 = file.hour_ln_off_1e9;
     params.scale_1e9 = file.scale_1e9;
+    // BIN15 H90: absent keys = `late_enabled = 0` = the member as it was;
+    // the parser has bounded every value and refused "on" without a table.
+    params.late = strategy_bin15::late::LateParams {
+        enabled: file.late_enabled,
+        persist_polls: file.late_persist_polls,
+        _pad: [0; 6],
+        tau_min_ns: file.late_tau_min_ns,
+        tau_max_ns: file.late_tau_max_ns,
+        p_min_1e6: file.late_p_min_1e6,
+        e_1e6: file.late_e_1e6,
+        usd_1e6: file.late_usd_1e6,
+        sigma_k_1e3: file.late_sigma_k_1e3,
+    };
+    let late_lut = if file.late_phi_lut.len() == core_config::bin15::LATE_PHI_POINTS {
+        let mut l = Box::new(strategy_bin15::late::LateLut::flat());
+        let mut i = 0usize;
+        while i < core_config::bin15::LATE_PHI_POINTS {
+            l.phi[i] = file.late_phi_lut[i];
+            i += 1;
+        }
+        Some(l)
+    } else {
+        None
+    };
 
     let mut luts = Box::new(strategy_bin15::price::Bin15Luts::identity());
     let mut i = 0usize;
@@ -366,6 +414,7 @@ pub fn load_bin15_boot(
     Ok(Some(Bin15Boot {
         params,
         luts,
+        late_lut,
         hash,
         seeds,
         path,
@@ -386,40 +435,75 @@ pub fn render_boot_tell(boot: &Bin15Boot, dormant: usize) -> String {
     for b in &boot.hash {
         hex.push_str(&format!("{b:02x}"));
     }
-    // BIN15 O9: the ENTRY LAW is on the boot line, because "what size
-    // do we take, and on what" is the first question asked of this
-    // member and the artifact hash alone does not answer it.
-    // `entry_usd=0` means the edge law alone (pre-2026-09-13 shape).
-    let entry = if boot.params.entry_usd_1e6 > 0 {
-        // BIN15 P3 (F6): the BOUND is part of the entry law, so it is
-        // on the line beside the size. "$50 on every instance" and
-        // "$50 on every instance whose ask clears the model by 2 c"
-        // are different strategies.
-        // BIN15 R0 (2026-09-19): a FLOOR is part of the entry law too,
-        // so it is on the line whenever it is set; at 0 the line is
-        // exactly what it was before the key existed.
-        let floor = if boot.params.entry_min_px_1e6 > 0 {
-            format!("&ask>={}c", boot.params.entry_min_px_1e6 / 10_000)
-        } else {
-            String::new()
-        };
-        format!(
-            "every-15m@${}<=p_hat-{}c{floor}",
-            boot.params.entry_usd_1e6 / 1_000_000,
-            boot.params.e_entry_1e6 / 10_000
-        )
-    } else {
-        String::from("edge-only")
-    };
+    let entry = entry_law(&boot.params);
+    let late = late_law(&boot.params);
     format!(
         "bin15: artifact configured hash={hex} families={} dormant={dormant} \
-         seeds={seeded} daily_seeds={daily} entry={entry} \
+         seeds={seeded} daily_seeds={daily} entry={entry} late={late} \
          cap_instance=${} cap_day=${} mark_stale_ms={}{}",
         boot.resolved,
         boot.params.cap_instance_usd_1e6 / 1_000_000,
         boot.params.cap_day_usd_1e6 / 1_000_000,
         boot.params.mark_stale_ns / 1_000_000,
         day_cap_warning(&boot.params)
+    )
+}
+
+/// The ENTRY LAW as the boot line spells it (BIN15 O9), because "what
+/// size do we take, and on what" is the first question asked of this
+/// member and the artifact hash alone does not answer it. `edge-only` is
+/// the edge law alone (`entry_usd_1e6 = 0`, the pre-2026-09-13 shape).
+///
+/// Every term that changes WHICH instances are bought is on the line: the
+/// BOUND (P3 F6 — "$50 on every instance" and "$50 whose ask clears the
+/// model by 2 c" are different strategies), the FLOOR (R0) when set, and
+/// since BIN15 S5 the PERSISTENCE (`&persist<n>`, from 2 up) and the
+/// ELAPSED CEILING (`&el<=<s>s`) when set. A term at its off value is
+/// absent, so a pre-S5 artifact prints exactly the line it always did.
+#[must_use]
+pub fn entry_law(p: &strategy_bin15::Bin15Params) -> String {
+    use core::fmt::Write as _;
+    if p.entry_usd_1e6 <= 0 {
+        return String::from("edge-only");
+    }
+    let mut law = format!(
+        "every-15m@${}<=p_hat-{}c",
+        p.entry_usd_1e6 / 1_000_000,
+        p.e_entry_1e6 / 10_000
+    );
+    // Writing into a `String` cannot fail.
+    if p.entry_min_px_1e6 > 0 {
+        let _ = write!(law, "&ask>={}c", p.entry_min_px_1e6 / 10_000);
+    }
+    if p.entry_persist_polls > 1 {
+        let _ = write!(law, "&persist{}", p.entry_persist_polls);
+    }
+    if p.entry_elapsed_max_ns > 0 {
+        let _ = write!(law, "&el<={}s", p.entry_elapsed_max_ns / 1_000_000_000);
+    }
+    law
+}
+
+/// BIN15 H90: the LATE law as the boot line spells it — `off`, or the
+/// window, the belief floor, the margin, the persistence, the spend and
+/// the σ scale: `2-30s:p>=0.90:ask<=p-2c:persist2:$100:k1.550`.
+#[must_use]
+pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
+    let l = &p.late;
+    if l.enabled == 0 {
+        return String::from("off");
+    }
+    format!(
+        "{}-{}s:p>={}.{:02}:ask<=p-{}c:persist{}:${}:k{}.{:03}",
+        l.tau_min_ns / 1_000_000_000,
+        l.tau_max_ns / 1_000_000_000,
+        l.p_min_1e6 / 1_000_000,
+        (l.p_min_1e6 % 1_000_000) / 10_000,
+        l.e_1e6 / 10_000,
+        l.persist_polls,
+        l.usd_1e6 / 1_000_000,
+        l.sigma_k_1e3 / 1_000,
+        l.sigma_k_1e3 % 1_000
     )
 }
 
@@ -494,6 +578,38 @@ pub fn day_cap_warning(params: &strategy_bin15::Bin15Params) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// XH4i-3a (risk review r1): BIN15's grid test and the gateway arm's
+    /// `OutcomeRules::check` agree on every price around the grid — each
+    /// tick and between ticks, past both ends — and on sizes around the lot
+    /// and the $1 floor: no order BIN15 lets through is refused, and none
+    /// it holds back would pass.
+    #[test]
+    fn bin15_s_grid_test_and_the_outcome_rules_agree() {
+        let qtys = [
+            -1_000_000i64,
+            0,
+            500_000,
+            1_000_000,
+            1_500_000,
+            2_000_000,
+            3_000_000,
+            4_000_000,
+            10_000_000,
+            1_000_000_000,
+        ];
+        let mut px = -100i64;
+        while px <= 1_000_100 {
+            for q in qtys {
+                assert_eq!(
+                    strategy_bin15::Bin15Strategy::on_grid(px, q),
+                    exec_hyperliquid::rules::OutcomeRules::check(px * 100, q * 100).is_ok(),
+                    "px {px} qty {q}"
+                );
+            }
+            px += 50;
+        }
+    }
 
     #[test]
     fn the_family_key_grammar_accepts_two_forms_and_refuses_crossed_ones() {
@@ -651,6 +767,38 @@ mod tests {
         }
     }
 
+    /// BIN15 H90: the late law on the boot line — `off` when absent, else
+    /// every term that changes which instances it buys.
+    #[test]
+    fn the_boot_line_spells_the_late_law() {
+        let mut p = strategy_bin15::Bin15Params::default();
+        assert_eq!(late_law(&p), "off", "absent keys = the member as it was");
+        p.late.enabled = 1;
+        assert_eq!(late_law(&p), "2-30s:p>=0.90:ask<=p-2c:persist2:$100:k1.550");
+        p.late.tau_min_ns = 8_000_000_000;
+        p.late.p_min_1e6 = 925_000;
+        p.late.e_1e6 = 10_000;
+        assert_eq!(late_law(&p), "8-30s:p>=0.92:ask<=p-1c:persist2:$100:k1.550");
+    }
+
+    /// BIN15 S5: the entry law on the boot line — every term that changes
+    /// which instances are bought, and none at its off value, so a pre-S5
+    /// artifact prints the line it always did.
+    #[test]
+    fn the_boot_line_spells_the_whole_entry_law() {
+        let mut p = strategy_bin15::Bin15Params::default();
+        assert_eq!(entry_law(&p), "edge-only");
+        p.entry_usd_1e6 = 50_000_000;
+        assert_eq!(entry_law(&p), "every-15m@$50<=p_hat-2c", "the pre-S5 line, unchanged");
+        p.entry_min_px_1e6 = 700_000;
+        assert_eq!(entry_law(&p), "every-15m@$50<=p_hat-2c&ask>=70c");
+        p.entry_min_px_1e6 = 0;
+        p.e_entry_1e6 = 30_000;
+        p.entry_persist_polls = 3;
+        p.entry_elapsed_max_ns = 240_000_000_000;
+        assert_eq!(entry_law(&p), "every-15m@$50<=p_hat-3c&persist3&el<=240s");
+    }
+
     /// BIN15 P2 (F2): the entry law's arithmetic against the day cap,
     /// on the boot line where the operator will actually read it.
     #[test]
@@ -748,6 +896,29 @@ mod tests {
         assert_eq!(boot.seeds.len(), 4);
         assert!(boot.seeds.iter().all(Bin15Seed::is_empty));
         assert!(render_boot_tell(&boot, 3).contains("families=8 dormant=3 seeds=0 daily_seeds=0"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BIN15 S5b (ruling 2026-09-24): the control counterfactual is TODAY'S
+    /// law — the stated default bound — whatever the artifact's own
+    /// `e_entry_1e6` says, so no artifact moves its own control.
+    #[test]
+    fn the_control_bound_is_todays_law_whatever_the_artifact_says() {
+        let (dir, artifact) = scratch("control", &[]);
+        let moved = EXAMPLE.replacen("e_entry_1e6     = 20000", "e_entry_1e6     = 30000", 1);
+        assert_ne!(moved, EXAMPLE, "the example states its bound on one line");
+        std::fs::write(&artifact, moved).expect("artifact");
+        let boot = load_bin15_boot(
+            Some(&artifact),
+            Some(&dir),
+            &resolver,
+            &rolling(),
+            &rolling_syms(),
+        )
+        .expect("load")
+        .expect("configured");
+        assert_eq!(boot.params.e_entry_1e6, 30_000);
+        assert_eq!(boot.params.entry_control_e_1e6, core_config::bin15::E_ENTRY_1E6_DEFAULT);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

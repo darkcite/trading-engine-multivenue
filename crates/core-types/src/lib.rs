@@ -38,7 +38,16 @@ pub use regime::{
 /// Instrument fee class (XSD-F, statarb doc 08 §4): the second index of
 /// the harness fee table beside [`VenueId`].
 pub mod instrument_class;
+
+/// HC10: Hyperliquid's perp price and size law (five significant figures,
+/// `6 − szDecimals` decimals, the size step) — shared by the member that
+/// sizes a hedge and the arm that sends it.
+pub mod hl_px;
 pub use instrument_class::{InstrumentClass, ALL_CLASSES, INSTRUMENT_CLASSES};
+/// HK31/HK32: the per-instrument arrival sequencer — `Tick.venue_seq` on
+/// the top-of-book streams that carry no sequence number.
+pub mod arrival_seq;
+pub use arrival_seq::ArrivalSeq;
 
 // ---------------------------------------------------------------
 // Identifiers
@@ -67,6 +76,19 @@ pub enum VenueId {
     Ai = 5,
     /// WS9: Bybit v5 public WS (spot + linear perps).
     Bybit = 6,
+    /// MX2: MEXC — spot protobuf WS + futures JSON WS (data-only,
+    /// O-MX1: never tradeable, no exec arm).
+    Mexc = 7,
+    /// HYPARB (O-H11): HyperEVM — concentrated-liquidity pools, read over
+    /// JSON-RPC WS (`ingress-hyperevm`). Carries no ticks: pool events
+    /// travel as `Signal`s (`SignalSource::HyperEvm`). Its orders are
+    /// AMM swaps judged by `core-fill` (paper) and, behind the O-H5/O-H12
+    /// interlock, sent to TESTNET only.
+    HyperEvm = 8,
+    /// HC1 (O-HC1): Hypercall — cash-settled options on HL oracles
+    /// (`ingress-hypercall`, public `indicative_market_data` WS + REST
+    /// `/options-summary`). Data-only: no exec arm until its own ruling.
+    Hypercall = 9,
 }
 
 impl VenueId {
@@ -88,6 +110,9 @@ impl VenueId {
             4 => Some(Self::Hyperliquid),
             5 => Some(Self::Ai),
             6 => Some(Self::Bybit),
+            7 => Some(Self::Mexc),
+            8 => Some(Self::HyperEvm),
+            9 => Some(Self::Hypercall),
             _ => None,
         }
     }
@@ -108,13 +133,32 @@ impl VenueId {
             Self::Hyperliquid => 700,
             Self::Ai => 0,
             Self::Bybit => 500,
+            // MX9 (plan §4 D8 revised): the measured feed-delay p99
+            // rounded up, like every other venue — docs/venue-latency.md
+            // 2026-09-23: spot `aggre.bookTicker` 338 ms, futures
+            // `depth.full` 349 ms → 400. (The plan's provisional 1 500
+            // sized the threshold to the futures push CADENCE; the
+            // FeedClock judges feed DELAY, and a quiet book simply
+            // pushes nothing.) Override: `--stale-after-ms mexc:<ms>`.
+            Self::Mexc => 400,
+            // HZ part A (2026-09-23, the Mac): newHeads inter-arrival p99
+            // 2 281 ms — a pool state is not stale before the next block
+            // could have changed it; rounded up. Override:
+            // `--stale-after-ms hyperevm:<ms>`.
+            Self::HyperEvm => 2_500,
+            // HC0 (2026-09-25 21:05–21:15Z, the Mac; docs/venue-latency.md
+            // §3): the option quote tick carries the quote's own
+            // `timestamp` (plan D4), whose feed-delay p99 is 447.6 ms
+            // (n 10 159) — rounded up. (`published_at`, the wire leg
+            // alone, is 217.9.) Override: `--stale-after-ms hypercall:<ms>`.
+            Self::Hypercall => 500,
         }
     }
 
     /// VT2/VT4: the whole default threshold table indexed by the venue
     /// byte — the ONE table the engine flag parser and the harness
     /// `ModelParams` share.
-    pub const fn stale_after_ms_defaults() -> [u32; 7] {
+    pub const fn stale_after_ms_defaults() -> [u32; VENUE_COUNT] {
         [
             Self::Polymarket.default_stale_after_ms(),
             Self::Binance.default_stale_after_ms(),
@@ -123,9 +167,23 @@ impl VenueId {
             Self::Hyperliquid.default_stale_after_ms(),
             Self::Ai.default_stale_after_ms(),
             Self::Bybit.default_stale_after_ms(),
+            Self::Mexc.default_stale_after_ms(),
+            Self::HyperEvm.default_stale_after_ms(),
+            Self::Hypercall.default_stale_after_ms(),
         ]
     }
 }
+
+/// Number of [`VenueId`] values — the length of every table indexed by
+/// the venue byte (stale thresholds, the fill model's fee / Δ / activation
+/// columns, the matcher's activation table). HYPARB (O-H11) introduced it
+/// when HyperEVM took byte 8: the next venue is ONE edit here plus its
+/// arms, not a sweep of literal `8`s. HC1: Hypercall took byte 9.
+pub const VENUE_COUNT: usize = 10;
+const _: () = assert!(
+    VenueId::from_u8(VENUE_COUNT as u8 - 1).is_some()
+        && VenueId::from_u8(VENUE_COUNT as u8).is_none()
+);
 
 /// Dense u32 identifier for a trading symbol, namespaced by venue:
 /// bits 31..24 = [`VenueId`] byte, bits 23..0 = per-venue ordinal
@@ -302,14 +360,18 @@ pub const TICK_FLAG_VENUE_TIME_SENTINEL: u8 = 2;
 /// are zero in every v2 capture — "venue time unknown, never stale" —
 /// so v2 files keep replaying under the v2 law unchanged. Venue time
 /// is DATA, not a clock: `ts_ns` stays the ordering key everywhere.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(C, align(64))]
 pub struct Tick {
     /// When the ingress thread finished parsing the frame.
     pub ts_ns: NsTs,
     /// Resolved symbol ID (not a string).
     pub sym: SymbolId,
-    /// Sequence number emitted by the venue.
+    /// Sequence number emitted by the venue. Polymarket (`pm`, HK31),
+    /// Hyperliquid (`hl` `bbo` + outcome `l2Book` touch) and Deribit
+    /// (`quote`) (HK32) emit none: there it is the ingress's per-instrument
+    /// arrival ordinal ([`ArrivalSeq`] — 1, 2, 3, … per process; 0 = a
+    /// tick older than its instrument's newest).
     pub venue_seq: u32,
     /// Best bid price (fixed-point).
     pub bid_px: Price,
@@ -332,6 +394,23 @@ pub struct Tick {
     /// Venue timestamp of the quote in ms (venue clock); 0 = unknown
     /// (v2 captures, and venues whose stream carries no stamp).
     pub venue_time_ms: u64,
+}
+
+impl Tick {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        ts_ns: 0,
+        sym: 0,
+        venue_seq: 0,
+        bid_px: Price::from_raw(0),
+        bid_qty: Qty::from_raw(0),
+        ask_px: Price::from_raw(0),
+        ask_qty: Qty::from_raw(0),
+        venue: 0,
+        flags: 0,
+        _pad: [0; 6],
+        venue_time_ms: 0,
+    };
 }
 
 impl Tick {
@@ -467,6 +546,22 @@ pub const OPT_SUMMARY_FLAG_MARK_PX: u8 = 1;
 /// [`OptSummary::flags`] bit: the venue supplied `open_interest_1e6`.
 pub const OPT_SUMMARY_FLAG_OI: u8 = 2;
 
+/// **BX9 — an option's no-arbitrage band per contract** at the index
+/// `index` (all ×1e6; i128, never overflowing): at least the intrinsic
+/// value less 1 % of the index, at most the index (a call) or the strike
+/// (a put), each per underlying unit × `unit`. The ledger's mark sanity
+/// (Q-2), and the Binance gateway's check of the index it adopts a held
+/// short at against the venue's own mark (the risk review's R7). Warm on
+/// the ledger's path: once per options summary on the engine thread — 0 B
+/// (gates 92 and 111); the gateway's use is at boot, cold.
+#[must_use]
+pub fn option_mark_band(index: i64, strike: i64, unit: i64, call: bool) -> (i128, i128) {
+    let (i, k, u) = (i128::from(index), i128::from(strike), i128::from(unit));
+    let intrinsic = if call { i - k } else { k - i };
+    let intrinsic = if intrinsic > 0 { intrinsic } else { 0 };
+    ((intrinsic - i / 100) * u / 1_000_000, (if call { i } else { k }) * u / 1_000_000)
+}
+
 impl OptSummary {
     /// Construct in one shot; saturates the i32 greek conversions.
     #[allow(clippy::too_many_arguments)]
@@ -577,6 +672,9 @@ pub enum SignalSource {
     ClaudeWorker = 3,
     /// Internal heartbeat / liveness ticker.
     Heartbeat = 4,
+    /// HYPARB: HyperEVM pool events and snapshots (`ingress-hyperevm`);
+    /// the payload is `core_amm::payload`, `sym` the pool.
+    HyperEvm = 5,
 }
 
 /// A fill report coming back from the CLOB. Pushed onto the fill ring
@@ -610,7 +708,8 @@ pub struct Fill {
     /// apart is an audit of nothing, and Stage-3 will have both in one
     /// stream.
     pub origin: u8,
-    /// Bit flags about the fill itself — see [`FILL_FLAG_SETTLEMENT`].
+    /// Bit flags about the fill itself — see [`FILL_FLAG_SETTLEMENT`] and
+    /// [`FILL_FLAG_ADOPTED`].
     ///
     /// Deliberately NOT part of [`Self::origin`]. That byte answers
     /// one question ("did a venue report this, or did we model it?")
@@ -629,8 +728,14 @@ pub struct Fill {
     pub qty: Qty,
     /// Venue-assigned order ID (u64 for Polymarket CLOB).
     pub order_id: u64,
+    /// XMM XH5d: the venue's trade id, when it sends one (Hyperliquid's
+    /// `tid`) — the key a report matches its own fills against the
+    /// public prints by; `0` = none (paper, a venue without one).
+    /// Wire-additive: it was explicit zeroed padding, so every capture
+    /// written before reads as none.
+    pub tid: u64,
     /// Reserved.
-    _pad1: [u8; 16],
+    _pad1: [u8; 8],
     /// Explicit tail padding (see [`AsBytes`]). Always zero.
     _pad2: [u8; 8],
 }
@@ -656,9 +761,17 @@ impl Fill {
             px,
             qty,
             order_id,
-            _pad1: [0; 16],
+            tid: 0,
+            _pad1: [0; 8],
             _pad2: [0; 8],
         }
+    }
+
+    /// XMM XH5d: the same fill, with the venue's trade id.
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_tid(self, tid: u64) -> Self {
+        Self { tid, ..self }
     }
 
     /// X1: the same fill, attributed. Used by the paper dispatcher,
@@ -675,7 +788,8 @@ impl Fill {
         }
     }
 
-    /// The same fill, flagged — see [`FILL_FLAG_SETTLEMENT`].
+    /// The same fill, flagged — see [`FILL_FLAG_SETTLEMENT`] and
+    /// [`FILL_FLAG_ADOPTED`].
     ///
     /// Separate from [`Self::with_attribution`] because the two answer
     /// different questions and a caller that knows one rarely knows
@@ -692,6 +806,14 @@ impl Fill {
     #[must_use]
     pub const fn is_settlement(&self) -> bool {
         self.flags & FILL_FLAG_SETTLEMENT != 0
+    }
+
+    /// Is this the venue's position ADOPTED at boot as the slot's starting
+    /// inventory, rather than a trade (BX7)?
+    #[inline(always)]
+    #[must_use]
+    pub const fn is_adopted(&self) -> bool {
+        self.flags & FILL_FLAG_ADOPTED != 0
     }
 }
 
@@ -716,6 +838,19 @@ pub const FILL_ORIGIN_PAPER: u8 = 1;
 /// makes that counter mean two things. This flag is how a member tells
 /// them apart.
 pub const FILL_FLAG_SETTLEMENT: u8 = 1 << 0;
+
+/// [`Fill::flags`]: the venue's position ADOPTED at boot as the slot's
+/// starting inventory — no trade happened (BX7: the Binance arm, on a
+/// dedicated account, within the owner slot's instance cap).
+///
+/// A restart finds the account holding what the last run bought. The arm
+/// books it once, at its first reconciliation, as this fill — at the read's
+/// mark for a linear row; none for an inverse row, whose exposure is its
+/// face. The ledger books it into the position and nothing else: not the
+/// day's turnover (the venue's own day read already counts whatever was
+/// bought today) and no resting order. A member reads it as its inventory
+/// at boot, never as a trade it asked for.
+pub const FILL_FLAG_ADOPTED: u8 = 1 << 1;
 
 /// [`Order::client_oid`] bits 0..32: the **instance** the member
 /// believes it is trading.
@@ -797,8 +932,15 @@ pub struct Order {
     pub side: Side,
     /// Order-type tag (0=post-only limit; extend over time).
     pub kind: u8,
-    /// Reserved.
-    _pad0: [u8; 2],
+    /// **XMM XH1 — bit flags about the order itself**, see
+    /// [`ORDER_FLAG_REDUCE_ONLY`] and [`ORDER_FLAG_POST_ONLY`].
+    ///
+    /// Wire-additive: this byte was the first of two explicit zeroed
+    /// padding bytes, so every Order persisted before XH1 reads as "no
+    /// flags" — which is what every one of them was.
+    pub flags: u8,
+    /// Reserved. Always zero.
+    _pad0: u8,
     /// Limit price.
     pub px: Price,
     /// Quantity.
@@ -838,8 +980,18 @@ pub struct Order {
     /// is the id the record's own order carries (0 for a cancel,
     /// which creates no order).
     pub verb: u8,
-    /// Reserved.
-    _pad1: [u8; 5],
+    /// XMM XH5d: the A/B arm the order was decided in — `0` none, `1` A,
+    /// `2` B (the measurement's split; no execution path reads it).
+    /// Wire-additive: it was explicit zeroed padding, so every capture
+    /// written before reads as none.
+    pub ab_arm: u8,
+    /// XMM XH5d: the ALO priority the order bids for its queue place — p
+    /// ×1e8 of its resting notional, charged at placement from the
+    /// undelegated HYPE balance (Hyperliquid's `{"p": N}` grouping); `0`
+    /// none. A post-only place's alone: a modify carries no grouping.
+    /// Wire-additive: it was explicit zeroed padding (the last of it), so
+    /// every capture written before reads as none.
+    pub alo_priority_1e8: u32,
     /// Time-to-live relative to `ts_ns`; 0 = none (I1, 2026-09-03 —
     /// docs/wire-format.md). A MODEL field: the offline fill law
     /// cancels the order at the first record of its sym at/after
@@ -872,6 +1024,30 @@ pub const ORDER_VERB_MODIFY: u8 = 2;
 /// `Order.strategy_id` value meaning "no strategy attribution".
 pub const STRATEGY_ID_NONE: u8 = 0xFF;
 
+/// [`Order::flags`] bit 0 (XMM XH1): the order may only REDUCE the
+/// slot's position on its instrument — the venue's reduce-only flag.
+///
+/// It exists so an exit can be told from an entry by the order itself:
+/// `docs/risk-policy.md` records twice (`mode = "off"`, and the budget
+/// floor's modify rule) that `Order` carried no reduce-only bit, so the
+/// router could not exempt an exit from a cap. The execution arm that
+/// honours it is XH4's; until then nothing sets it and nothing reads it
+/// on the order path, and a zero byte means exactly what every Order
+/// before XH1 meant.
+pub const ORDER_FLAG_REDUCE_ONLY: u8 = 1 << 0;
+
+/// [`Order::flags`] bit 1 (XMM XH2): the order must only ever REST — the
+/// venue's post-only time in force (Hyperliquid `Alo`). An order that
+/// would cross when it arrives is rejected (`BAD_ALO_PX`), never filled
+/// as a taker.
+///
+/// It also selects the paper fill law: a post-only maker on a queue venue
+/// (`core_fill::queue_venue`, Hyperliquid) is judged by the queue law
+/// (`core_fill::queue`), everything else by the strict-cross law as
+/// before. No member placed an order with this bit before XH2, so none
+/// changes behaviour.
+pub const ORDER_FLAG_POST_ONLY: u8 = 1 << 1;
+
 impl Order {
     /// Construct an Order without naming the private padding fields.
     /// `strategy_id` starts [`STRATEGY_ID_NONE`]; the strategy-set's
@@ -892,14 +1068,16 @@ impl Order {
             sym,
             side,
             kind,
-            _pad0: [0; 2],
+            flags: 0,
+            _pad0: 0,
             px,
             qty,
             client_oid,
             venue: venue as u8,
             strategy_id: STRATEGY_ID_NONE,
             verb: ORDER_VERB_PLACE,
-            _pad1: [0; 5],
+            ab_arm: 0,
+            alo_priority_1e8: 0,
             ttl_ns: 0,
             prev_client_oid: 0,
         }
@@ -911,6 +1089,58 @@ impl Order {
     pub const fn with_ttl_ns(mut self, ttl_ns: u64) -> Self {
         self.ttl_ns = ttl_ns;
         self
+    }
+
+    /// The same order marked [`ORDER_FLAG_REDUCE_ONLY`] (XMM XH1).
+    /// Builder-style, like [`Self::with_ttl_ns`]; every other field is
+    /// untouched.
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_reduce_only(mut self) -> Self {
+        self.flags |= ORDER_FLAG_REDUCE_ONLY;
+        self
+    }
+
+    /// Did the member mark this order reduce-only?
+    #[inline(always)]
+    #[must_use]
+    pub const fn is_reduce_only(&self) -> bool {
+        self.flags & ORDER_FLAG_REDUCE_ONLY != 0
+    }
+
+    /// The same order marked [`ORDER_FLAG_POST_ONLY`] (XMM XH2).
+    /// Builder-style, like [`Self::with_reduce_only`]; every other field
+    /// is untouched.
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_post_only(mut self) -> Self {
+        self.flags |= ORDER_FLAG_POST_ONLY;
+        self
+    }
+
+    /// XMM XH5d: the same order, tagged with the A/B arm it was decided in
+    /// (`0` none, `1` A, `2` B).
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_ab_arm(mut self, arm: u8) -> Self {
+        self.ab_arm = arm;
+        self
+    }
+
+    /// XMM XH5d: the same order, bidding ALO priority — p ×1e8 of its
+    /// resting notional (`0` none).
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_alo_priority(mut self, p_1e8: u32) -> Self {
+        self.alo_priority_1e8 = p_1e8;
+        self
+    }
+
+    /// Did the member mark this order post-only?
+    #[inline(always)]
+    #[must_use]
+    pub const fn is_post_only(&self) -> bool {
+        self.flags & ORDER_FLAG_POST_ONLY != 0
     }
 }
 
@@ -1198,6 +1428,13 @@ unsafe impl AsBytes for Fill {}
 // SAFETY: Order has the same guarantees as Tick.
 unsafe impl AsBytes for Order {}
 
+// SAFETY: OrderEvent has the same guarantees as Tick — `#[repr(C,
+// align(64))]`, `Copy`, plain integers and an explicit `_pad` that sum to
+// exactly 64 bytes, every offset asserted beside its definition: no
+// compiler-inserted padding, every byte initialized. XMM XH5d: captured
+// (`engine-events.pmlr`).
+unsafe impl AsBytes for OrderEvent {}
+
 // SAFETY: ChannelEvent is `#[repr(C, align(64))]`, `#[derive(Copy)]`,
 // all fields plain integers + explicit `_pad` arrays summing to exactly
 // 64 bytes (checked by `channel_event_layout_is_fully_explicit`); no
@@ -1228,6 +1465,55 @@ unsafe impl AsBytes for DepthTopK {}
 
 const _: () = assert!(core::mem::size_of::<DepthTopK>() == 192);
 const _: () = assert!(core::mem::align_of::<DepthTopK>() == 64);
+
+/// **BX6 — one execution-journal record** (`binance-exec.pmlr`): an ACK, a
+/// refusal with its code, a fill with its commission, a cancel or expiry
+/// with its reason, a reconciliation verdict, a margin sample. The kind
+/// and the meaning of `a` / `b` / `c` belong to the arm that writes it
+/// (`exec_binance::journal`). 64 B, no heap, no destructor.
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecRecord {
+    /// Monotonic ns at the observation.
+    pub ts_ns: NsTs,
+    /// Wall ms (the venue's clock where the arm measured it).
+    pub wall_ms: u64,
+    /// The member's client id (0 if none).
+    pub client_oid: u64,
+    /// The venue's order id (0 if none).
+    pub venue_oid: u64,
+    /// Kind-specific.
+    pub a: i64,
+    /// Kind-specific.
+    pub b: i64,
+    /// Kind-specific.
+    pub c: i64,
+    /// The venue code (0 if none).
+    pub code: i32,
+    /// The arm's instrument row.
+    pub row: u16,
+    /// The arm's record kind.
+    pub kind: u8,
+    /// The strategy slot.
+    pub slot: u8,
+}
+
+const _: () = assert!(core::mem::size_of::<ExecRecord>() == 64);
+const _: () = assert!(core::mem::align_of::<ExecRecord>() == 64);
+// Every field is named and the named fields fill all 64 bytes, with no
+// gap between them.
+const _: () = assert!(core::mem::offset_of!(ExecRecord, c) == 48);
+const _: () = assert!(core::mem::offset_of!(ExecRecord, code) == 56);
+const _: () = assert!(core::mem::offset_of!(ExecRecord, row) == 60);
+const _: () = assert!(core::mem::offset_of!(ExecRecord, kind) == 62);
+const _: () = assert!(core::mem::offset_of!(ExecRecord, slot) == 63);
+
+// SAFETY: ExecRecord is `#[repr(C, align(64))]`, `#[derive(Copy)]`, all
+// fields plain integers whose sizes sum to exactly 64 bytes (the const
+// asserts above) in declaration order with no gap (each field's offset is
+// a multiple of its alignment) — no compiler-inserted padding, every byte
+// initialized.
+unsafe impl AsBytes for ExecRecord {}
 
 // ---------------------------------------------------------------
 // ChannelEvent — non-tick channel capture slot (Phase 8e, §6.5)
@@ -1320,6 +1606,23 @@ pub enum ChannelId {
     /// | 48..56 | family index in the boot `rolling` list |
     /// | 56..64 | 0 = created, 1 = settled |
     InstrumentRoll = 13,
+    /// HC3: ONE quote provider's side of a Hypercall indicative quote —
+    /// the per-provider detail behind the venue's `best_bid`/`best_ask`
+    /// (which can be CROSSED when providers disagree: measured
+    /// 2026-09-25, 5 % of two-sided pushes, every one a two-provider
+    /// frame). Emitted only for frames with ≥ 2 providers (a one-provider
+    /// frame's detail IS the tick). `sym` = the option; `venue_time_ms`
+    /// = the provider's `updated_at`; `v0` = price ×1e6 (USD per 1-unit
+    /// contract); `v1` = max size ×1e6 (contracts); `venue_seq` packs
+    /// the identity:
+    ///
+    /// | bits | field |
+    /// |---|---|
+    /// | 0..8 | provider index within the frame |
+    /// | 8 | side: 0 = bid, 1 = ask |
+    /// | 16..24 | `num_providers` of the frame |
+    /// | 32..64 | the provider wallet's LOW 32 bits (last 8 hex digits) |
+    ProviderQuote = 14,
 }
 
 impl ChannelId {
@@ -1341,6 +1644,7 @@ impl ChannelId {
             11 => Some(Self::SubDrop),
             12 => Some(Self::VolIndex),
             13 => Some(Self::InstrumentRoll),
+            14 => Some(Self::ProviderQuote),
             _ => None,
         }
     }
@@ -1363,6 +1667,7 @@ impl ChannelId {
             Self::SubDrop => "sub_drop",
             Self::VolIndex => "vol_index",
             Self::InstrumentRoll => "instrument_roll",
+            Self::ProviderQuote => "provider_quote",
         }
     }
 }
@@ -1390,8 +1695,11 @@ pub struct ChannelEvent {
     pub venue: u8,
     /// Channel tag ([`ChannelId`] as raw byte).
     pub channel: u8,
+    /// `EVENT_FLAG_*` (BX6). Zero on every event but a Binance mark for the
+    /// execution arm.
+    pub flags: u8,
     /// Reserved. Always zero.
-    _pad0: [u8; 2],
+    _pad0: u8,
     /// Venue-provided sequence (full width — OKX `seqId`, Deribit
     /// `change_id`/`trade_seq`); 0 where the channel carries none.
     pub venue_seq: u64,
@@ -1424,13 +1732,439 @@ impl ChannelEvent {
             sym,
             venue: venue as u8,
             channel: channel as u8,
-            _pad0: [0; 2],
+            flags: 0,
+            _pad0: 0,
             venue_seq,
             venue_time_ms,
             v0,
             v1,
             _pad1: [0; 16],
         }
+    }
+
+    /// The event with `flags` set.
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_flags(mut self, flags: u8) -> Self {
+        self.flags = flags;
+        self
+    }
+}
+
+/// **BX6 (O-BX29) — [`ChannelEvent::flags`]: for the execution side only.**
+/// The engine hands such an event to the dispatcher (the router and its
+/// ledger, the live arms) and NEVER to a member: a Binance mark prices the
+/// ledger's rows and bounds the arm's price band, and no member decides on
+/// it (O-BX6: no member trades Binance live).
+pub const EVENT_FLAG_EXEC_ONLY: u8 = 1 << 0;
+
+// ---------------------------------------------------------------
+// XMM XH1 — the trade lane and the order-event lane
+// ---------------------------------------------------------------
+
+/// Capacity of the trade-print SPSC lane (XMM XH1, plan §6). One ring,
+/// fed today by the Hyperliquid ingress; the MEXC maker plan reuses the
+/// lane. 16 384 × 64 B = 1 MiB — the tick lanes' geometry, because a
+/// sweep bursts prints harder than it moves quotes. Power of two, like
+/// every `core-ring` capacity.
+pub const TRADE_RING_SIZE: usize = 16_384;
+
+/// Capacity of the order-event SPSC lane (XMM XH1). Order events run at
+/// the ORDER rate — a place, a cancel, a reject — never per tick, so
+/// the fill lanes' 1 024 slots carry the same headroom.
+pub const ORDER_EVENT_RING_SIZE: usize = 1024;
+
+/// [`TradePrint::aggressor`]: the taker BOUGHT — the print lifted the
+/// ask (Hyperliquid side `"B"`). What it consumes is resting ASK size
+/// at its price.
+pub const TRADE_AGGRESSOR_BUY: u8 = 0;
+/// [`TradePrint::aggressor`]: the taker SOLD — the print hit the bid
+/// (Hyperliquid side `"A"`). What it consumes is resting BID size at
+/// its price.
+pub const TRADE_AGGRESSOR_SELL: u8 = 1;
+
+/// One public trade print (XMM XH1): the venue's tape, carried into the
+/// engine on its own lane so a maker can watch its queue being eaten.
+///
+/// The capture keeps recording prints as [`ChannelEvent`]s
+/// (`ChannelId::Trade`, `v1` signed by side) — this is the ENGINE-side
+/// carrier, never a capture slot, and it is lossless against that row:
+/// the offline harness rebuilds the same print from it
+/// ([`TradePrint::read_trade_event`]).
+///
+/// Content is 50 B; the slot is one cache line like every ring slot
+/// (`#[repr(C, align(64))]`, the house law), with the rest explicit
+/// zeroed padding.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C, align(64))]
+pub struct TradePrint {
+    /// When the ingress thread finished parsing the print — engine
+    /// monotonic ns, the ordering key, exactly as on [`Tick`].
+    pub ts_ns: NsTs,
+    /// Venue timestamp of the trade in ms (venue clock); 0 = unknown.
+    /// DATA, not a clock — `ts_ns` orders.
+    pub venue_time_ms: u64,
+    /// Trade price ×1e6.
+    pub px_1e6: i64,
+    /// Trade size ×1e6 in the venue's base units (Hyperliquid: coins).
+    /// Always positive — the direction is [`Self::aggressor`].
+    pub qty_1e6: i64,
+    /// The venue's trade id (Hyperliquid `tid`); 0 = none. Consumers
+    /// dedupe on it: a venue may re-send recent prints on a resubscribe.
+    pub tid: u64,
+    /// Venue-namespaced symbol.
+    pub sym: SymbolId,
+    /// Producing venue ([`VenueId`] as raw byte).
+    pub venue: u8,
+    /// [`TRADE_AGGRESSOR_BUY`] or [`TRADE_AGGRESSOR_SELL`].
+    pub aggressor: u8,
+    /// Explicit padding (the slot is one cache line). Always zero.
+    _pad: [u8; 18],
+}
+
+impl TradePrint {
+    /// Construct a print without naming the private padding.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new(
+        ts_ns: NsTs,
+        venue: VenueId,
+        sym: SymbolId,
+        tid: u64,
+        venue_time_ms: u64,
+        px_1e6: i64,
+        qty_1e6: i64,
+        aggressor: u8,
+    ) -> Self {
+        Self {
+            ts_ns,
+            venue_time_ms,
+            px_1e6,
+            qty_1e6,
+            tid,
+            sym,
+            venue: venue as u8,
+            aggressor,
+            _pad: [0; 18],
+        }
+    }
+
+    /// The zeroed print — size 0, so never a trade: the start value
+    /// an out-parameter reader ([`Self::read_trade_event`]) fills.
+    pub const ZERO: Self = Self {
+        ts_ns: 0,
+        venue_time_ms: 0,
+        px_1e6: 0,
+        qty_1e6: 0,
+        tid: 0,
+        sym: 0,
+        venue: 0,
+        aggressor: 0,
+        _pad: [0; 18],
+    };
+
+    /// Rebuild a print from its capture row, INTO `out`: a
+    /// [`ChannelId::Trade`] event (`venue_seq` = tid, `v0` = px ×1e6,
+    /// `v1` = size ×1e6 NEGATED for a sell print). `false`, with `out`
+    /// untouched, for any other channel, an unknown venue byte, or a
+    /// zero size — a row that says nothing traded is not a print.
+    ///
+    /// The `parse_trade` shape: the 64 B print is written once, into
+    /// the caller's storage, rather than returned by value inside an
+    /// `Option` (128 B on the stack).
+    #[inline]
+    #[must_use]
+    pub const fn read_trade_event(ev: &ChannelEvent, out: &mut Self) -> bool {
+        if ev.channel != ChannelId::Trade as u8 || ev.v1 == 0 || ev.v1 == i64::MIN {
+            return false;
+        }
+        let venue = match VenueId::from_u8(ev.venue) {
+            Some(v) => v,
+            None => return false,
+        };
+        let (qty_1e6, aggressor) = if ev.v1 < 0 {
+            (-ev.v1, TRADE_AGGRESSOR_SELL)
+        } else {
+            (ev.v1, TRADE_AGGRESSOR_BUY)
+        };
+        *out = Self::new(
+            ev.ts_ns,
+            venue,
+            ev.sym,
+            ev.venue_seq,
+            ev.venue_time_ms,
+            ev.v0,
+            qty_1e6,
+            aggressor,
+        );
+        true
+    }
+}
+
+/// [`OrderEvent::kind`] 0: no event — a zeroed slot. Never produced; a
+/// consumer that reads it is reading a slot nobody wrote.
+pub const ORDER_EVENT_NONE: u8 = 0;
+/// [`OrderEvent::kind`]: the order RESTS on the book — for a post-only
+/// order, the venue's ACK (LAW E-5: the answer to the place), or the
+/// paper model's activation.
+pub const ORDER_EVENT_RESTING: u8 = 1;
+/// [`OrderEvent::kind`]: the order was REFUSED and never rested;
+/// [`OrderEvent::reason`] says why (a crossing post-only order is
+/// `ORDER_EVENT_REASON_BAD_ALO_PX` — information, not a fault, law
+/// XH-7).
+pub const ORDER_EVENT_REJECTED: u8 = 2;
+/// [`OrderEvent::kind`]: the order LEFT the book without filling in
+/// full; [`OrderEvent::reason`] says who took it off.
+pub const ORDER_EVENT_CANCELED: u8 = 3;
+/// [`OrderEvent::kind`]: the order FILLED in full and is done. The fill
+/// itself rides the fill lane (LAW E-5: the stream is the FILL) — this
+/// is only the order's end of life.
+pub const ORDER_EVENT_FILLED: u8 = 4;
+
+/// [`OrderEvent::reason`]: none given (every `RESTING` and `FILLED`).
+pub const ORDER_EVENT_REASON_NONE: u8 = 0;
+/// [`OrderEvent::reason`]: our own cancel took effect.
+pub const ORDER_EVENT_REASON_CANCEL_REQUESTED: u8 = 1;
+/// [`OrderEvent::reason`]: a MODIFY retired this order (LAW E-7 — the
+/// replacement carries a fresh client id and its own events).
+pub const ORDER_EVENT_REASON_REPLACED: u8 = 2;
+/// [`OrderEvent::reason`]: the order's lifetime ran out (the engine TTL,
+/// or the venue's `expiresAfter`).
+pub const ORDER_EVENT_REASON_EXPIRED: u8 = 3;
+/// [`OrderEvent::reason`]: a post-only order would have crossed the
+/// touch (Hyperliquid `badAloPxRejected`).
+pub const ORDER_EVENT_REASON_BAD_ALO_PX: u8 = 4;
+/// [`OrderEvent::reason`]: self-trade prevention took the order.
+pub const ORDER_EVENT_REASON_SELF_TRADE: u8 = 5;
+/// [`OrderEvent::reason`]: margin — insufficient, or a margin cancel.
+pub const ORDER_EVENT_REASON_MARGIN: u8 = 6;
+/// [`OrderEvent::reason`]: the instrument is at its open-interest cap.
+pub const ORDER_EVENT_REASON_OPEN_INTEREST_CAP: u8 = 7;
+/// [`OrderEvent::reason`]: the venue's dead-man (`scheduleCancel`)
+/// fired.
+pub const ORDER_EVENT_REASON_SCHEDULED_CANCEL: u8 = 8;
+/// [`OrderEvent::reason`]: a reduce-only order would have increased the
+/// position.
+pub const ORDER_EVENT_REASON_REDUCE_ONLY: u8 = 9;
+/// [`OrderEvent::reason`]: the price or size is off the venue's grid.
+pub const ORDER_EVENT_REASON_TICK_OR_LOT: u8 = 10;
+/// [`OrderEvent::reason`]: below the venue's minimum notional.
+pub const ORDER_EVENT_REASON_MIN_NOTIONAL: u8 = 11;
+/// [`OrderEvent::reason`]: any other venue reason — the gateway counts
+/// the venue's own text.
+pub const ORDER_EVENT_REASON_OTHER: u8 = 255;
+
+/// One change in an order's venue-side state (XMM XH1): it rests, it
+/// was refused, it left the book, it is done.
+///
+/// The live gateway (XH4) turns Hyperliquid `orderUpdates` into these;
+/// the paper model (XH2) emits the same events, so a member's order
+/// state machine runs identically in both. Routed by
+/// [`Self::strategy_id`] to the slot that placed the order ALONE — the
+/// fill law (X1), never a fan-out.
+///
+/// Content is 32 B; the slot is one cache line like every ring slot,
+/// with the rest explicit zeroed padding.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C, align(64))]
+pub struct OrderEvent {
+    /// When the event was observed — engine monotonic ns (the paper
+    /// model's clock, or the gateway's receipt).
+    pub ts_ns: NsTs,
+    /// The client id of the order the event is about (LAW E-9's durable
+    /// name; the engine never learns a venue oid).
+    pub client_oid: u64,
+    /// Venue timestamp of the change in ms; 0 = unknown (paper, or a live
+    /// post's answer — XMM XH5d: the Hyperliquid arm then repeats the
+    /// RESTING once, with the `open` row's time).
+    pub venue_time_ms: u64,
+    /// The order's instrument.
+    pub sym: SymbolId,
+    /// The order's venue ([`VenueId`] as raw byte).
+    pub venue: u8,
+    /// The slot that placed the order ([`Order::strategy_id`]);
+    /// [`STRATEGY_ID_NONE`] = not ours to attribute — counted, never
+    /// delivered.
+    pub strategy_id: u8,
+    /// [`ORDER_EVENT_RESTING`] / [`ORDER_EVENT_REJECTED`] /
+    /// [`ORDER_EVENT_CANCELED`] / [`ORDER_EVENT_FILLED`].
+    pub kind: u8,
+    /// `ORDER_EVENT_REASON_*`.
+    pub reason: u8,
+    /// Explicit padding (the slot is one cache line). Always zero.
+    _pad: [u8; 32],
+}
+
+impl OrderEvent {
+    /// The zeroed event — kind `ORDER_EVENT_NONE`, attributed to no slot:
+    /// the scratch a consumer hands `try_next_order_event` to fill.
+    pub const ZERO: Self = Self {
+        ts_ns: 0,
+        client_oid: 0,
+        venue_time_ms: 0,
+        sym: SYMBOL_ID_NONE,
+        venue: 0,
+        strategy_id: STRATEGY_ID_NONE,
+        kind: ORDER_EVENT_NONE,
+        reason: ORDER_EVENT_REASON_NONE,
+        _pad: [0; 32],
+    };
+
+    /// Construct an event without naming the private padding.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new(
+        ts_ns: NsTs,
+        venue: VenueId,
+        sym: SymbolId,
+        client_oid: u64,
+        strategy_id: u8,
+        kind: u8,
+        reason: u8,
+        venue_time_ms: u64,
+    ) -> Self {
+        Self {
+            ts_ns,
+            client_oid,
+            venue_time_ms,
+            sym,
+            venue: venue as u8,
+            strategy_id,
+            kind,
+            reason,
+            _pad: [0; 32],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<TradePrint>() == 64);
+const _: () = assert!(core::mem::align_of::<TradePrint>() == 64);
+const _: () = assert!(core::mem::size_of::<OrderEvent>() == 64);
+const _: () = assert!(core::mem::align_of::<OrderEvent>() == 64);
+
+// Both layouts are pinned in `docs/wire-format.md` — every offset
+// asserted build-breaking, the AiCmd way, so the doc cannot drift.
+const _: () = {
+    assert!(::core::mem::offset_of!(TradePrint, ts_ns) == 0);
+    assert!(::core::mem::offset_of!(TradePrint, venue_time_ms) == 8);
+    assert!(::core::mem::offset_of!(TradePrint, px_1e6) == 16);
+    assert!(::core::mem::offset_of!(TradePrint, qty_1e6) == 24);
+    assert!(::core::mem::offset_of!(TradePrint, tid) == 32);
+    assert!(::core::mem::offset_of!(TradePrint, sym) == 40);
+    assert!(::core::mem::offset_of!(TradePrint, venue) == 44);
+    assert!(::core::mem::offset_of!(TradePrint, aggressor) == 45);
+    assert!(::core::mem::offset_of!(TradePrint, _pad) == 46);
+    assert!(::core::mem::offset_of!(OrderEvent, ts_ns) == 0);
+    assert!(::core::mem::offset_of!(OrderEvent, client_oid) == 8);
+    assert!(::core::mem::offset_of!(OrderEvent, venue_time_ms) == 16);
+    assert!(::core::mem::offset_of!(OrderEvent, sym) == 24);
+    assert!(::core::mem::offset_of!(OrderEvent, venue) == 28);
+    assert!(::core::mem::offset_of!(OrderEvent, strategy_id) == 29);
+    assert!(::core::mem::offset_of!(OrderEvent, kind) == 30);
+    assert!(::core::mem::offset_of!(OrderEvent, reason) == 31);
+    assert!(::core::mem::offset_of!(OrderEvent, _pad) == 32);
+    // XMM XH5d: the order's A/B arm and ALO priority and the fill's venue
+    // trade id, pinned with the doc's tables.
+    assert!(::core::mem::offset_of!(Order, verb) == 42);
+    assert!(::core::mem::offset_of!(Order, ab_arm) == 43);
+    assert!(::core::mem::offset_of!(Order, alo_priority_1e8) == 44);
+    // BX13 (the parser review's round 2): the fill's first 40 bytes are
+    // the PMLR fill record the worker reads (`pmlr._FILL`, `<QIBBBBqqQ`:
+    // the flags at byte 15).
+    assert!(::core::mem::offset_of!(Fill, ts_ns) == 0);
+    assert!(::core::mem::offset_of!(Fill, sym) == 8);
+    assert!(::core::mem::offset_of!(Fill, side) == 12);
+    assert!(::core::mem::offset_of!(Fill, strategy_id) == 13);
+    assert!(::core::mem::offset_of!(Fill, origin) == 14);
+    assert!(::core::mem::offset_of!(Fill, flags) == 15);
+    assert!(::core::mem::offset_of!(Fill, px) == 16);
+    assert!(::core::mem::offset_of!(Fill, qty) == 24);
+    assert!(::core::mem::offset_of!(Fill, order_id) == 32);
+    assert!(::core::mem::offset_of!(Fill, tid) == 40);
+    assert!(::core::mem::offset_of!(Fill, _pad1) == 48);
+    assert!(TRADE_RING_SIZE.is_power_of_two());
+    assert!(ORDER_EVENT_RING_SIZE.is_power_of_two());
+};
+
+// ---------------------------------------------------------------
+// ExecHealth — a live slot's execution health (XMM XH4f)
+// ---------------------------------------------------------------
+
+/// [`ExecHealth::blocked`]: the router latched a halt on the slot.
+pub const EXEC_BLOCKED_HALTED: u8 = 1;
+/// [`ExecHealth::blocked`]: the slot is `off` — every submit refused.
+pub const EXEC_BLOCKED_OFF: u8 = 1 << 1;
+/// [`ExecHealth::blocked`]: the router's ledger is not seeded yet — every
+/// live place refused until the arm's reconciler reports.
+pub const EXEC_BLOCKED_UNSEEDED: u8 = 1 << 2;
+/// [`ExecHealth::blocked`]: the slot's arm has not booted (its snapshot,
+/// sweep, sheet, orders, budget and leverage).
+pub const EXEC_BLOCKED_NOT_READY: u8 = 1 << 3;
+/// [`ExecHealth::blocked`]: the arm's request budget is at its floor or
+/// unread too long — growth refused.
+pub const EXEC_BLOCKED_BUDGET: u8 = 1 << 4;
+
+/// [`ExecHealth::congestion`]: the arm's rates have room.
+pub const EXEC_CONGESTION_NONE: u8 = 0;
+/// Busy: a rate window over 60 % of its share, most of the in-flight
+/// bound used, or the venue's answers slow.
+pub const EXEC_CONGESTION_BUSY: u8 = 1;
+/// Throttled: growth is refused unsent, cancels still go — or (XMM XH5c-3,
+/// the Hyperliquid gateway) no socket is Ready: every post goes by REST,
+/// nothing refused for it. The member holds either way.
+pub const EXEC_CONGESTION_THROTTLED: u8 = 2;
+/// The venue answered a rate-limit error in the last 10 s.
+pub const EXEC_CONGESTION_RATE_LIMITED: u8 = 3;
+
+/// **XMM XH4f (D7) — a live slot's execution health, as its member reads
+/// it** (`strategy_core::Ctx::exec_health`): the router's word and its
+/// arm's on whether a quote can be kept at the venue. 8 B POD. A paper
+/// slot, a replay, and every arm and ctx not taught it read
+/// [`ExecHealth::HEALTHY`] (the zeroed word, also `Default`) — so no
+/// paper member behaves differently.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecHealth {
+    /// `EXEC_BLOCKED_*` bits: any set, nothing the member places can rest.
+    pub blocked: u8,
+    /// `EXEC_CONGESTION_*`: how close the arm runs to the venue's rate
+    /// limits.
+    pub congestion: u8,
+    _pad: u16,
+    /// The worst post round trip in the arm's recent window, ms (0 = no
+    /// sample).
+    pub rtt_ms: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<ExecHealth>() == 8);
+
+impl ExecHealth {
+    /// Nothing blocked, no congestion, no round trip measured.
+    pub const HEALTHY: Self = Self::new(0, EXEC_CONGESTION_NONE, 0);
+
+    /// A health word, the padding zeroed.
+    #[inline(always)]
+    #[must_use]
+    pub const fn new(blocked: u8, congestion: u8, rtt_ms: u32) -> Self {
+        Self {
+            blocked,
+            congestion,
+            _pad: 0,
+            rtt_ms,
+        }
+    }
+
+    /// The worse of two words — a router's and its arm's, or two arms'.
+    #[inline(always)]
+    #[must_use]
+    pub fn worst(self, other: Self) -> Self {
+        Self::new(
+            self.blocked | other.blocked,
+            self.congestion.max(other.congestion),
+            self.rtt_ms.max(other.rtt_ms),
+        )
     }
 }
 
@@ -1545,6 +2279,56 @@ impl DepthTopK {
         [DepthLevel::EMPTY; DEPTH_K],
         [DepthLevel::EMPTY; DEPTH_K],
     );
+}
+
+/// One instrument's change-gated top-K state, double-buffered: one
+/// [`DepthTopK`] row holds the last snapshot emitted, the other takes
+/// the next snapshot IN PLACE, and a changed snapshot becomes the last
+/// one by [`Self::commit`] — an index flip, never a 192 B copy.
+///
+/// Rows are only ever written field by field or by a whole-row store
+/// of a [`DepthTopK::new`]-built value, so their padding stays zero.
+#[derive(Copy, Clone, Debug)]
+#[repr(C, align(64))]
+pub struct DepthPair {
+    rows: [DepthTopK; 2],
+    /// Which row holds the last snapshot (0 or 1).
+    last: u8,
+}
+
+impl DepthPair {
+    /// Both rows `init`; row 0 is the last snapshot.
+    // COPY: 192 B `init` in and the 448 B pair out, by value — boot-time
+    // construction only (a `vec![pair; n]` then clones it per slot) —
+    // rejected: an in-place initializer, for a once-per-process path.
+    #[inline]
+    pub const fn new(init: DepthTopK) -> Self {
+        Self {
+            rows: [init, init],
+            last: 0,
+        }
+    }
+
+    /// The row the next snapshot is written into.
+    #[inline(always)]
+    pub fn spare_mut(&mut self) -> &mut DepthTopK {
+        &mut self.rows[usize::from((self.last ^ 1) & 1)]
+    }
+
+    /// `(spare, last)` — the change gate's two sides.
+    #[inline(always)]
+    pub fn spare_and_last(&self) -> (&DepthTopK, &DepthTopK) {
+        (
+            &self.rows[usize::from((self.last ^ 1) & 1)],
+            &self.rows[usize::from(self.last & 1)],
+        )
+    }
+
+    /// The spare row becomes the last snapshot.
+    #[inline(always)]
+    pub fn commit(&mut self) {
+        self.last ^= 1;
+    }
 }
 
 // ---------------------------------------------------------------
@@ -1913,8 +2697,8 @@ impl AiCmd {
     /// offsets in the rx buffer, so a 64-alignment-free view is
     /// impossible; this is the **one documented copy** that materializes
     /// the slot onto the stack (a handful of vector moves). The
-    /// subsequent ring `try_push` copy is ownership transfer, identical
-    /// to every other ingress.
+    /// subsequent `try_push_ref` copy into the ring slot is the ring
+    /// publish, identical to every other ingress.
     #[inline(always)]
     pub fn read_le(bytes: &[u8; 64]) -> Self {
         // SAFETY: the source is a valid, initialized 64-byte buffer;
@@ -2262,7 +3046,7 @@ impl AiCmd {
 /// capture, never the market-data session (the impl owns its error
 /// policy and surfaces loss through counters).
 pub trait Capture {
-    /// One parsed BBO tick (called before the ring `try_push`, so
+    /// One parsed BBO tick (called before the ring `try_push_ref`, so
     /// ring-dropped ticks are still captured — the offline audit
     /// compares capture counts against `ring_drops_total`).
     #[inline(always)]
@@ -3104,15 +3888,22 @@ pub const fn funding_print_divisor(venue: VenueId) -> i64 {
 /// [`FeatId::ClockToFunding`] fallback when the venue's funding
 /// channel supplies no explicit next-funding time (OKX and Binance
 /// supply one; Bybit's per-symbol interval can differ from the 8 h
-/// default, so the venue-supplied time wins whenever present).
+/// default, so the venue-supplied time wins whenever present; MEXC's
+/// `collectCycle` is per symbol too — 8 h on BTC/SPY, 4 h on XAU/EUR,
+/// measured 2026-09-23 — and its Funding events carry the per-symbol
+/// v1 seeded from REST, so 8 h is the nominal fallback only).
 /// 0 = continuous funding (Deribit — no discrete print; the clock
 /// feature is ABSENT) or no funding at all (PM, AI).
 #[inline(always)]
 pub const fn funding_period_s(venue: VenueId) -> u32 {
     match venue {
-        VenueId::Binance | VenueId::Okx | VenueId::Bybit => 28_800,
+        VenueId::Binance | VenueId::Okx | VenueId::Bybit | VenueId::Mexc => 28_800,
         VenueId::Hyperliquid => 3_600,
-        VenueId::Polymarket | VenueId::Deribit | VenueId::Ai => 0,
+        VenueId::Polymarket
+        | VenueId::Deribit
+        | VenueId::Ai
+        | VenueId::HyperEvm
+        | VenueId::Hypercall => 0,
     }
 }
 
@@ -3333,6 +4124,73 @@ pub const fn roll_kind_strict(seq: u64) -> Option<bool> {
     }
 }
 
+/// BIN15 S1 (LAW E-11): the first instant of a HIP-4 instance's
+/// settlement window, epoch ns.
+///
+/// The venue's rules text for the rolling BTC 15-minute market reads
+/// "Settlement is according to the 60-second TWAP of BTC-USDC perp mark
+/// price ENDING at <expiry> UTC". The window is therefore
+/// `[expiry − twap, expiry]` — the minute BEFORE the expiry — and not
+/// `[expiry, expiry + twap]`, which is what the harness, the audit and
+/// the lane's restart law assumed until 2026-09-23 (vault doc 27 R0,
+/// confirmed on all 15 of the account's own venue settlements, plan 28
+/// S0). `twap_ns == 0` (the native daily families) is the degenerate
+/// window `[expiry, expiry]`: they settle on the last mark at `T`.
+#[inline(always)]
+#[must_use]
+pub const fn binary_settle_open_ns(expiry_ns: u64, twap_ns: u64) -> u64 {
+    expiry_ns.saturating_sub(twap_ns)
+}
+
+/// BIN15 S1 (LAW E-11): one piece of a HIP-4 settlement TWAP — the
+/// price `px_1e6` IN FORCE over `[from_ns, to_ns)`, clipped to the
+/// window `[open_ns, close_ns]` — as `(px × dt, dt)` in (×1e6 · ns, ns).
+///
+/// The one arithmetic every consumer of the law shares: the harness
+/// and the audit fold a captured mark series through it
+/// (`cli::backtest::binary::settle_reference_1e6`), and the member's
+/// running TWAP (BIN15 S3, `strategy_bin15`'s `fold_twap`) folds its live
+/// marks through the same piece to know how much of the average is
+/// already decided. A TWAP is
+/// TIME-weighted — each mark counts for as long as it was the mark —
+/// with the last mark carried forward, so a burst of prints in one
+/// second weighs one second and a quiet stretch keeps the price that
+/// was in force.
+///
+/// `i128` because `px × dt` is a mark ×1e6 (a $100k BTC is `1e11`)
+/// times up to a minute of ns (`6e10`): `6e21`, past `i64`.
+/// A piece that lies outside the window, or has no length, is `(0, 0)`.
+#[inline(always)]
+#[must_use]
+pub const fn binary_twap_segment(
+    px_1e6: i64,
+    from_ns: u64,
+    to_ns: u64,
+    open_ns: u64,
+    close_ns: u64,
+) -> (i128, u64) {
+    let lo = if from_ns > open_ns { from_ns } else { open_ns };
+    let hi = if to_ns < close_ns { to_ns } else { close_ns };
+    if hi <= lo {
+        return (0, 0);
+    }
+    let dt = hi - lo;
+    (px_1e6 as i128 * dt as i128, dt)
+}
+
+/// BIN15 S3 (LAW E-11): the longest one mark may stand for the venue's
+/// series across a settlement window, ns — the evidence bound every
+/// consumer of the law judges a window by.
+///
+/// Hyperliquid prints a mark every 1–3 s, so a longer hole between two
+/// marks we saw is a gap in OUR series — a restart, a stalled channel —
+/// and carrying the last mark across it would decide the minute on a
+/// number nobody saw. The harness refuses to settle such a window
+/// (`cli::backtest::binary::settle_reference_1e6`) and the member holds
+/// inside one (`strategy_bin15`'s `twap_gap`). Measured over the whole
+/// piece: the part carried in from before the open counts.
+pub const BINARY_SETTLE_MARK_GAP_MAX_NS: u64 = 10_000_000_000;
+
 /// HIP-4 exposure for one outcome: `|yes − no|`.
 ///
 /// Equal legs are riskless collateral — one pays $1 and the other $0
@@ -3354,6 +4212,36 @@ pub const fn net_exposure_1e8(yes_1e8: i64, no_1e8: i64) -> i64 {
 #[cfg(test)]
 mod roll_codec_tests {
     use super::*;
+
+    /// BIN15 S1: the window is the minute BEFORE the expiry.
+    #[test]
+    fn the_settlement_window_ends_at_the_expiry() {
+        assert_eq!(binary_settle_open_ns(1_000_000, 60), 999_940);
+        assert_eq!(binary_settle_open_ns(10, 0), 10, "a zero TWAP is the instant T");
+        assert_eq!(binary_settle_open_ns(5, 60), 0, "saturates, never wraps");
+    }
+
+    /// BIN15 S1: a price counts for exactly the part of its interval
+    /// that lies inside the window.
+    #[test]
+    fn a_twap_segment_is_clipped_to_the_window() {
+        // Entirely inside.
+        assert_eq!(binary_twap_segment(7, 10, 20, 0, 100), (70, 10));
+        // Straddles the open: only [open, to) counts.
+        assert_eq!(binary_twap_segment(7, 0, 20, 10, 100), (70, 10));
+        // Straddles the close: only [from, close] counts.
+        assert_eq!(binary_twap_segment(7, 90, 200, 0, 100), (70, 10));
+        // Covers the whole window.
+        assert_eq!(binary_twap_segment(3, 0, 1_000, 100, 200), (300, 100));
+        // Before, after, and empty.
+        assert_eq!(binary_twap_segment(7, 0, 10, 10, 100), (0, 0));
+        assert_eq!(binary_twap_segment(7, 100, 110, 10, 100), (0, 0));
+        assert_eq!(binary_twap_segment(7, 50, 50, 10, 100), (0, 0));
+        // A $100k mark over a full minute does not overflow.
+        let (s, dt) = binary_twap_segment(100_000_000_000, 0, 60_000_000_000, 0, 60_000_000_000);
+        assert_eq!(dt, 60_000_000_000);
+        assert_eq!(s, 6_000_000_000_000_000_000_000i128);
+    }
 
     #[test]
     fn the_codec_round_trips_every_field() {
@@ -3462,6 +4350,25 @@ mod roll_codec_tests {
 mod tests {
     use super::*;
 
+    /// XMM XH4f: the worse of two health words — every blocked bit, the
+    /// higher congestion, the slower round trip; healthy is the identity.
+    #[test]
+    fn the_worse_health_word_keeps_every_blocked_bit_and_the_worst_figures() {
+        let router = ExecHealth::new(EXEC_BLOCKED_HALTED, EXEC_CONGESTION_NONE, 0);
+        let arm = ExecHealth::new(EXEC_BLOCKED_BUDGET, EXEC_CONGESTION_THROTTLED, 1_700);
+        assert_eq!(
+            router.worst(arm),
+            ExecHealth::new(
+                EXEC_BLOCKED_HALTED | EXEC_BLOCKED_BUDGET,
+                EXEC_CONGESTION_THROTTLED,
+                1_700
+            )
+        );
+        assert_eq!(arm.worst(router), router.worst(arm));
+        assert_eq!(ExecHealth::HEALTHY.worst(arm), arm);
+        assert_eq!(ExecHealth::HEALTHY, ExecHealth::new(0, 0, 0));
+    }
+
     #[test]
     fn tick_size_is_one_cache_line() {
         assert_eq!(::core::mem::size_of::<Tick>(), 64);
@@ -3562,6 +4469,237 @@ mod tests {
         assert_eq!(::core::mem::align_of::<Order>(), 64);
     }
 
+    /// XMM XH1: the reduce-only bit took the first byte of the old
+    /// two-byte pad after `kind`. Every field around it keeps its
+    /// offset, so every Order ever captured still reads the same — and
+    /// reads as "no flags".
+    #[test]
+    fn order_flags_take_the_first_pad_byte_and_nothing_else_moves() {
+        assert_eq!(::core::mem::offset_of!(Order, kind), 13);
+        assert_eq!(::core::mem::offset_of!(Order, flags), 14);
+        assert_eq!(::core::mem::offset_of!(Order, px), 16);
+        assert_eq!(::core::mem::offset_of!(Order, client_oid), 32);
+        assert_eq!(::core::mem::offset_of!(Order, venue), 40);
+        assert_eq!(::core::mem::offset_of!(Order, ttl_ns), 48);
+        assert_eq!(::core::mem::offset_of!(Order, prev_client_oid), 56);
+    }
+
+    #[test]
+    fn order_reduce_only_is_opt_in_and_touches_nothing_else() {
+        let o = Order::new(
+            5,
+            VenueId::Hyperliquid,
+            make_symbol_id(VenueId::Hyperliquid, 3),
+            Side::Ask,
+            0,
+            Price::from_raw(101_000_000),
+            Qty::from_raw(150_000),
+            77,
+        );
+        // Failure mode first: a plain order is NOT reduce-only.
+        assert_eq!(o.flags, 0);
+        assert!(!o.is_reduce_only());
+        let r = o.with_reduce_only();
+        assert!(r.is_reduce_only());
+        assert_eq!(r.flags, ORDER_FLAG_REDUCE_ONLY);
+        // Idempotent, and every other field is untouched.
+        assert_eq!(r.with_reduce_only().flags, ORDER_FLAG_REDUCE_ONLY);
+        assert_eq!(
+            (r.ts_ns, r.sym, r.side, r.kind, r.px, r.qty, r.client_oid),
+            (o.ts_ns, o.sym, o.side, o.kind, o.px, o.qty, o.client_oid)
+        );
+        assert_eq!((r.venue, r.strategy_id, r.verb), (o.venue, o.strategy_id, o.verb));
+    }
+
+    #[test]
+    fn order_post_only_is_opt_in_and_independent_of_reduce_only() {
+        let o = Order::new(
+            5,
+            VenueId::Hyperliquid,
+            make_symbol_id(VenueId::Hyperliquid, 3),
+            Side::Bid,
+            0,
+            Price::from_raw(99_000_000),
+            Qty::from_raw(150_000),
+            78,
+        );
+        // Failure mode first: a plain order is NOT post-only, and the
+        // reduce-only bit does not imply it.
+        assert!(!o.is_post_only());
+        assert!(!o.with_reduce_only().is_post_only());
+        let p = o.with_post_only();
+        assert!(p.is_post_only());
+        assert!(!p.is_reduce_only());
+        assert_eq!(p.flags, ORDER_FLAG_POST_ONLY);
+        // Both bits compose, and the builder is idempotent.
+        let both = p.with_reduce_only().with_post_only();
+        assert_eq!(both.flags, ORDER_FLAG_POST_ONLY | ORDER_FLAG_REDUCE_ONLY);
+        assert!(both.is_post_only() && both.is_reduce_only());
+        assert_eq!(
+            (p.ts_ns, p.sym, p.side, p.kind, p.px, p.qty, p.client_oid, p.ttl_ns),
+            (o.ts_ns, o.sym, o.side, o.kind, o.px, o.qty, o.client_oid, o.ttl_ns)
+        );
+    }
+
+    #[test]
+    fn trade_print_and_order_event_are_one_cache_line() {
+        assert_eq!(::core::mem::size_of::<TradePrint>(), 64);
+        assert_eq!(::core::mem::align_of::<TradePrint>(), 64);
+        assert_eq!(::core::mem::size_of::<OrderEvent>(), 64);
+        assert_eq!(::core::mem::align_of::<OrderEvent>(), 64);
+        assert!(TRADE_RING_SIZE.is_power_of_two());
+        assert!(ORDER_EVENT_RING_SIZE.is_power_of_two());
+    }
+
+    #[test]
+    fn trade_print_new_sets_every_field() {
+        let sym = make_symbol_id(VenueId::Hyperliquid, 4);
+        let p = TradePrint::new(
+            9,
+            VenueId::Hyperliquid,
+            sym,
+            123_456,
+            1_790_000_000_000,
+            187_420_000,
+            2_500_000,
+            TRADE_AGGRESSOR_SELL,
+        );
+        assert_eq!(p.ts_ns, 9);
+        assert_eq!(p.venue, VenueId::Hyperliquid.to_u8());
+        assert_eq!(p.sym, sym);
+        assert_eq!(p.tid, 123_456);
+        assert_eq!(p.venue_time_ms, 1_790_000_000_000);
+        assert_eq!(p.px_1e6, 187_420_000);
+        assert_eq!(p.qty_1e6, 2_500_000);
+        assert_eq!(p.aggressor, TRADE_AGGRESSOR_SELL);
+        assert_ne!(TRADE_AGGRESSOR_BUY, TRADE_AGGRESSOR_SELL);
+    }
+
+    /// The capture row → print map is lossless in both directions of
+    /// the side convention (`v1` negative = a sell print).
+    #[test]
+    fn trade_print_rebuilds_from_its_capture_row() {
+        let sym = make_symbol_id(VenueId::Hyperliquid, 2);
+        let sell = ChannelEvent::new(
+            11,
+            VenueId::Hyperliquid,
+            ChannelId::Trade,
+            sym,
+            42,
+            1_790_000_000_123,
+            3_120_500_000,
+            -1_500_000,
+        );
+        let mut p = TradePrint::ZERO;
+        assert!(TradePrint::read_trade_event(&sell, &mut p), "a trade row is a print");
+        assert_eq!(
+            p,
+            TradePrint::new(
+                11,
+                VenueId::Hyperliquid,
+                sym,
+                42,
+                1_790_000_000_123,
+                3_120_500_000,
+                1_500_000,
+                TRADE_AGGRESSOR_SELL,
+            )
+        );
+        let buy = ChannelEvent::new(12, VenueId::Hyperliquid, ChannelId::Trade, sym, 43, 0, 7, 9);
+        let mut b = TradePrint::ZERO;
+        assert!(TradePrint::read_trade_event(&buy, &mut b), "a buy row is a print");
+        assert_eq!((b.qty_1e6, b.aggressor), (9, TRADE_AGGRESSOR_BUY));
+    }
+
+    #[test]
+    fn trade_print_refuses_rows_that_are_not_prints() {
+        let sym = make_symbol_id(VenueId::Hyperliquid, 2);
+        let mut out = TradePrint::ZERO;
+        // Another channel.
+        let book = ChannelEvent::new(1, VenueId::Hyperliquid, ChannelId::Book, sym, 0, 0, 5, 5);
+        assert!(!TradePrint::read_trade_event(&book, &mut out));
+        // A zero size says nothing traded.
+        let zero = ChannelEvent::new(1, VenueId::Hyperliquid, ChannelId::Trade, sym, 1, 0, 5, 0);
+        assert!(!TradePrint::read_trade_event(&zero, &mut out));
+        // `i64::MIN` has no positive magnitude — refused, never wrapped.
+        let min = ChannelEvent::new(1, VenueId::Hyperliquid, ChannelId::Trade, sym, 1, 0, 5, i64::MIN);
+        assert!(!TradePrint::read_trade_event(&min, &mut out));
+        // An unknown venue byte is a corrupt row.
+        let mut bad = ChannelEvent::new(1, VenueId::Hyperliquid, ChannelId::Trade, sym, 1, 0, 5, 1);
+        bad.venue = 250;
+        assert!(!TradePrint::read_trade_event(&bad, &mut out));
+        // A refusal writes nothing: the zeroed print is still zero.
+        assert_eq!(out, TradePrint::ZERO);
+        assert_eq!(out.qty_1e6, 0, "ZERO is no trade");
+    }
+
+    #[test]
+    fn order_event_new_sets_every_field() {
+        let sym = make_symbol_id(VenueId::Hyperliquid, 1);
+        let e = OrderEvent::new(
+            3,
+            VenueId::Hyperliquid,
+            sym,
+            0xABCD,
+            6,
+            ORDER_EVENT_REJECTED,
+            ORDER_EVENT_REASON_BAD_ALO_PX,
+            1_790_000_000_999,
+        );
+        assert_eq!(e.ts_ns, 3);
+        assert_eq!(e.venue, VenueId::Hyperliquid.to_u8());
+        assert_eq!(e.sym, sym);
+        assert_eq!(e.client_oid, 0xABCD);
+        assert_eq!(e.strategy_id, 6);
+        assert_eq!(e.kind, ORDER_EVENT_REJECTED);
+        assert_eq!(e.reason, ORDER_EVENT_REASON_BAD_ALO_PX);
+        assert_eq!(e.venue_time_ms, 1_790_000_000_999);
+    }
+
+    /// The kind and reason vocabularies are wire values: distinct,
+    /// append-only, and 0 is the "nothing written" value for both.
+    #[test]
+    fn order_event_vocabulary_is_distinct_and_zero_means_none() {
+        let kinds = [
+            ORDER_EVENT_NONE,
+            ORDER_EVENT_RESTING,
+            ORDER_EVENT_REJECTED,
+            ORDER_EVENT_CANCELED,
+            ORDER_EVENT_FILLED,
+        ];
+        let reasons = [
+            ORDER_EVENT_REASON_NONE,
+            ORDER_EVENT_REASON_CANCEL_REQUESTED,
+            ORDER_EVENT_REASON_REPLACED,
+            ORDER_EVENT_REASON_EXPIRED,
+            ORDER_EVENT_REASON_BAD_ALO_PX,
+            ORDER_EVENT_REASON_SELF_TRADE,
+            ORDER_EVENT_REASON_MARGIN,
+            ORDER_EVENT_REASON_OPEN_INTEREST_CAP,
+            ORDER_EVENT_REASON_SCHEDULED_CANCEL,
+            ORDER_EVENT_REASON_REDUCE_ONLY,
+            ORDER_EVENT_REASON_TICK_OR_LOT,
+            ORDER_EVENT_REASON_MIN_NOTIONAL,
+            ORDER_EVENT_REASON_OTHER,
+        ];
+        let mut i = 0usize;
+        while i < kinds.len() {
+            assert_eq!(kinds[i], i as u8, "kinds are dense from 0");
+            i += 1;
+        }
+        let mut i = 0usize;
+        while i < reasons.len() {
+            let mut j = i + 1;
+            while j < reasons.len() {
+                assert_ne!(reasons[i], reasons[j]);
+                j += 1;
+            }
+            i += 1;
+        }
+        assert_eq!(ORDER_EVENT_NONE, 0);
+        assert_eq!(ORDER_EVENT_REASON_NONE, 0);
+    }
+
     #[test]
     fn tick_mid_and_spread_are_correct() {
         let t = Tick::new(
@@ -3608,18 +4746,26 @@ mod tests {
             VenueId::Hyperliquid,
             VenueId::Ai,
             VenueId::Bybit,
+            VenueId::Mexc,
+            VenueId::HyperEvm,
+            VenueId::Hypercall,
         ];
+        assert_eq!(all.len(), VENUE_COUNT);
         let mut i = 0;
         while i < all.len() {
             assert_eq!(VenueId::from_u8(all[i].to_u8()), Some(all[i]));
             i += 1;
         }
+        assert_eq!(VenueId::Mexc.to_u8(), 7);
+        assert_eq!(VenueId::HyperEvm.to_u8(), 8);
+        assert_eq!(VenueId::Hypercall.to_u8(), 9);
     }
 
     #[test]
     fn venue_id_rejects_unknown_bytes() {
-        // 6 became Bybit at WS9 — the first unassigned byte is now 7.
-        assert_eq!(VenueId::from_u8(7), None);
+        // 6 became Bybit at WS9, 7 MEXC at MX2, 8 HyperEvm at HYPARB
+        // and 9 Hypercall at HC1 — the first unassigned byte is now 10.
+        assert_eq!(VenueId::from_u8(10), None);
         assert_eq!(VenueId::from_u8(254), None);
         // 255 is the venue byte of SYMBOL_ID_NONE — must never decode.
         assert_eq!(VenueId::from_u8(255), None);
@@ -3705,15 +4851,21 @@ mod tests {
         // compiler-inserted padding would break the AsBytes contract.
         // Tick: 8+4+4+8+8+8+8+1+1+6+8 = 64 (VT1: +flags, +venue_time_ms).
         // Signal: 8+4+1+1+2+40+8 = 64.
-        // Fill: 8+4+1+1+1+1+8+8+8+16+8 = 64 (X1: +strategy_id, +origin;
-        //       E4: +flags, which took the last explicit pad byte).
-        // Order: 8+4+1+1+2+8+8+8+1+1+1+5+8+8 = 64 (M4.1:
-        //        +strategy_id; E5: +verb, +prev_client_oid, both out
-        //        of the explicit padding).
+        // Fill: 8+4+1+1+1+1+8+8+8+8+8+8 = 64 (X1: +strategy_id, +origin;
+        //       E4: +flags, which took the last explicit pad byte; XMM
+        //       XH5d: +tid, out of `_pad1`).
+        // Order: 8+4+1+1+1+1+8+8+8+1+1+1+1+4+8+8 = 64 (M4.1:
+        //        +strategy_id; E5: +verb, +prev_client_oid; XMM XH1:
+        //        +flags; XMM XH5d: +ab_arm, +alo_priority_1e8 — all out of
+        //        the explicit padding, none left).
+        // TradePrint: 8+8+8+8+8+4+1+1+18 = 64 (XMM XH1).
+        // OrderEvent: 8+8+8+4+1+1+1+1+32 = 64 (XMM XH1).
         assert_eq!(::core::mem::size_of::<Tick>(), 64);
         assert_eq!(::core::mem::size_of::<Signal>(), 64);
         assert_eq!(::core::mem::size_of::<Fill>(), 64);
         assert_eq!(::core::mem::size_of::<Order>(), 64);
+        assert_eq!(::core::mem::size_of::<TradePrint>(), 64);
+        assert_eq!(::core::mem::size_of::<OrderEvent>(), 64);
     }
 
     #[test]
@@ -3822,11 +4974,19 @@ mod tests {
         assert_eq!(VenueId::Hyperliquid.default_stale_after_ms(), 700);
         assert_eq!(VenueId::Polymarket.default_stale_after_ms(), 1_000);
         assert_eq!(VenueId::Ai.default_stale_after_ms(), 0);
+        // MX9: the measured feed-delay p99 (338 / 349 ms) rounded up.
+        assert_eq!(VenueId::Mexc.default_stale_after_ms(), 400);
+        // HYPARB: HZ head inter-arrival p99 2 281 ms rounded up.
+        assert_eq!(VenueId::HyperEvm.default_stale_after_ms(), 2_500);
+        // HC0: the quote-stamp feed-delay p99 447.6 ms rounded up.
+        assert_eq!(VenueId::Hypercall.default_stale_after_ms(), 500);
     }
 
     #[test]
     fn stale_after_ms_defaults_is_indexed_by_the_venue_byte() {
         let table = VenueId::stale_after_ms_defaults();
+        assert_eq!(table.len(), VENUE_COUNT);
+        assert_eq!(table[VenueId::Mexc as usize], 400);
         let mut b = 0u8;
         while (b as usize) < table.len() {
             let venue = VenueId::from_u8(b).expect("every index is a venue");
@@ -3923,6 +5083,22 @@ mod channel_event_tests {
         assert_eq!(::core::mem::size_of::<DepthLevel>(), 16);
     }
 
+    /// The double buffer: the spare row is written in place, `commit`
+    /// makes it the last snapshot, and the next spare is the other row.
+    #[test]
+    fn depth_pair_flips_rows_instead_of_copying() {
+        let mut pair = DepthPair::new(DepthTopK::EMPTY);
+        pair.spare_mut().ts_ns = 7;
+        {
+            let (spare, last) = pair.spare_and_last();
+            assert_eq!((spare.ts_ns, last.ts_ns), (7, 0));
+        }
+        pair.commit();
+        let (spare, last) = pair.spare_and_last();
+        assert_eq!((spare.ts_ns, last.ts_ns), (0, 7), "the written row is now the last one");
+        assert!(::core::ptr::eq(spare, &pair.rows[0]) && ::core::ptr::eq(last, &pair.rows[1]));
+    }
+
     #[test]
     fn depth_top_k_new_and_empty_shape() {
         let mut bids = [DepthLevel::EMPTY; DEPTH_K];
@@ -4000,6 +5176,7 @@ mod channel_event_tests {
             ChannelId::SubDrop,
             ChannelId::VolIndex,
             ChannelId::InstrumentRoll,
+            ChannelId::ProviderQuote,
         ];
         let mut i = 0;
         while i < all.len() {
@@ -4008,7 +5185,10 @@ mod channel_event_tests {
             assert!(!c.as_str().is_empty());
             i += 1;
         }
-        assert_eq!(ChannelId::from_u8(14), None);
+        // HC3: 14 = ProviderQuote; the first unassigned byte is 15 (the
+        // last one a u16 event-lane mask can still express).
+        assert_eq!(ChannelId::ProviderQuote as u8, 14);
+        assert_eq!(ChannelId::from_u8(15), None);
         assert_eq!(ChannelId::from_u8(255), None);
     }
 
@@ -5395,6 +6575,9 @@ mod vm2_v1_tests {
         assert_eq!(funding_print_divisor(VenueId::Hyperliquid), 1);
         assert_eq!(funding_print_divisor(VenueId::Ai), 1);
         assert_eq!(funding_print_divisor(VenueId::Bybit), 1);
+        assert_eq!(funding_print_divisor(VenueId::Mexc), 1);
+        assert_eq!(funding_print_divisor(VenueId::HyperEvm), 1);
+        assert_eq!(funding_print_divisor(VenueId::Hypercall), 1);
     }
 
     #[test]
@@ -5402,11 +6585,18 @@ mod vm2_v1_tests {
         assert_eq!(funding_period_s(VenueId::Binance), 28_800);
         assert_eq!(funding_period_s(VenueId::Okx), 28_800);
         assert_eq!(funding_period_s(VenueId::Bybit), 28_800);
+        // MEXC: the NOMINAL fallback only — `collectCycle` is per symbol
+        // (8 h on BTC/SPY, 4 h on XAU/EUR, measured 2026-09-23) and the
+        // Funding events carry the seeded per-symbol v1.
+        assert_eq!(funding_period_s(VenueId::Mexc), 28_800);
         assert_eq!(funding_period_s(VenueId::Hyperliquid), 3_600);
         // Continuous funding / no funding: the clock feature is ABSENT.
         assert_eq!(funding_period_s(VenueId::Deribit), 0);
         assert_eq!(funding_period_s(VenueId::Polymarket), 0);
         assert_eq!(funding_period_s(VenueId::Ai), 0);
+        assert_eq!(funding_period_s(VenueId::HyperEvm), 0);
+        // HC1: options carry no funding.
+        assert_eq!(funding_period_s(VenueId::Hypercall), 0);
     }
 
     #[test]

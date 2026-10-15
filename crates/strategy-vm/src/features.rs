@@ -38,11 +38,12 @@
 //! law (and the worker's REST-fed `funding` table) count SETTLED
 //! prints. The state derives prints venue-faithfully:
 //!
-//! * **OKX / Bybit / Binance** (discrete 8 h prints, events carry
-//!   `v1` = next-funding-time ms): when a fresh event's `v1` ADVANCES
-//!   past the latched one, the closing period settled — record one
-//!   print at the OLD next-funding time with the last rate latched
-//!   before the advance.
+//! * **OKX / Bybit / Binance / MEXC** (discrete 8 h prints, events
+//!   carry `v1` = next-funding-time ms — MEXC's is seeded from the REST
+//!   `nextSettleTime` and advanced per `collectCycle`, plan §4 D4):
+//!   when a fresh event's `v1` ADVANCES past the latched one, the
+//!   closing period settled — record one print at the OLD
+//!   next-funding time with the last rate latched before the advance.
 //! * **Deribit** (continuous funding, hourly REST samples of
 //!   `interest_8h`): sample one print per venue-time HOUR from the
 //!   Funding event, preferring `v1` (= `funding_8h ×1e9`, emitted
@@ -424,7 +425,10 @@ impl FeatureState {
             None => return,
         };
         match (venue, ch) {
-            (VenueId::Okx | VenueId::Bybit | VenueId::Binance, ChannelId::Funding) => {
+            (
+                VenueId::Okx | VenueId::Bybit | VenueId::Binance | VenueId::Mexc,
+                ChannelId::Funding,
+            ) => {
                 let idx = match self.find_or_claim(e.sym) {
                     Some(i) => i,
                     None => return,
@@ -1278,6 +1282,37 @@ mod tests {
             f.read(FeatId::Apr24, sym, 0, now).unwrap(),
             125_000_000i64 * 365
         );
+    }
+
+    /// MX2: MEXC rides the discrete-8h advance law (plan §4 D4 — `v1`
+    /// = next settle ms, REST-seeded and advanced per `collectCycle`):
+    /// latch while `v1` holds, one settled print when it advances. A
+    /// perp-block sym, because MEXC funding is perp-only.
+    #[test]
+    fn mexc_advance_law_records_settled_print() {
+        let mut f = FeatureState::new_boxed();
+        let sym = make_symbol_id(VenueId::Mexc, 512 + 1);
+        let t_print = WALL0 + 8 * 3_600_000;
+        let ev = |mono: u64, wall: u64, rate: i64, next: u64| {
+            ChannelEvent::new(
+                mono,
+                VenueId::Mexc,
+                ChannelId::Funding,
+                sym,
+                0,
+                wall,
+                rate,
+                next as i64,
+            )
+        };
+        f.on_venue_event(&ev(MONO0, WALL0, 100_000, t_print), MONO0);
+        f.on_venue_event(&ev(MONO0 + 1, WALL0 + 1_000, 50_000, t_print), MONO0 + 1);
+        assert_eq!(f.funding_prints(sym), 0, "same period: still latched");
+        let after = mono_at(t_print + 1_000);
+        f.on_venue_event(&ev(after, t_print + 1_000, 70_000, t_print + 8 * 3_600_000), after);
+        assert_eq!(f.funding_prints(sym), 1, "the advance settles the old period");
+        let now = mono_at(t_print + 2_000);
+        assert_eq!(f.read(FeatId::Apr24, sym, 0, now).unwrap(), 50_000i64 * 365);
     }
 
     #[test]

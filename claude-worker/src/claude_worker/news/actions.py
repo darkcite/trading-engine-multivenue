@@ -528,7 +528,7 @@ class Emitter:
     construction), and `serve` may be between reconnects.
     """
 
-    def __init__(  # noqa: PLR0913 — composition root: every collaborator injected
+    def __init__(  # composition root: every collaborator injected
         self,
         *,
         state: claude_worker.state.State,
@@ -562,7 +562,7 @@ class Emitter:
                 count += 1
         return count
 
-    def _record(  # noqa: PLR0913 — one row of the actions table, field for field
+    def _record(  # one row of the actions table, field for field
         self,
         kind: str,
         mode: str,
@@ -762,7 +762,7 @@ class Emitter:
             )
         return outcome
 
-    def _declare(  # noqa: PLR0913, PLR0917 — the declaration's own send path
+    def _declare(  # the declaration's own send path
         self,
         frame: Frame,
         now_ts: int,
@@ -824,7 +824,7 @@ class Emitter:
         row_id = self._record(kind, RECORD_REFUSED, story_id=story_id, reason=reason, now_ts=now_ts)
         return Outcome(mode=RECORD_REFUSED, reason=reason, row_id=row_id)
 
-    def _dispatch(  # noqa: PLR0913, PLR0917 — the shared tail; the sender varies by kind
+    def _dispatch(  # the shared tail; the sender varies by kind
         self,
         kind: str,
         frame: Frame,

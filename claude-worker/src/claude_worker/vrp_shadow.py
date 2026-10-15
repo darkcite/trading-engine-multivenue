@@ -77,7 +77,9 @@ def engine_legs(run_dir: pathlib.Path, slot: int = SLOT_VRP) -> dict[int, Leg]:
     Only fills attributed to `slot` count. A fill carrying
     `STRATEGY_ID_NONE` is a venue fill fanned out to every member and
     belongs to none of them; before X1 every fill looked like that,
-    which is exactly why the attribution bytes exist.
+    which is exactly why the attribution bytes exist. BX13: an adopted
+    fill or a settlement moves the leg's position but is no fill of the
+    member's — the count is its trades.
     """
     path = run_dir / FILLS_FILE
     if not path.is_file():
@@ -88,7 +90,7 @@ def engine_legs(run_dir: pathlib.Path, slot: int = SLOT_VRP) -> dict[int, Leg]:
         for f in r.fills():
             if f.strategy_id != slot:
                 continue
-            fills[f.sym] += 1
+            fills[f.sym] += int(f.is_trade)
             signed = f.qty if f.side == 0 else -f.qty
             pos[f.sym] = pos.get(f.sym, 0) + signed
     return {sym: Leg(fills[sym], pos.get(sym, 0)) for sym in fills}

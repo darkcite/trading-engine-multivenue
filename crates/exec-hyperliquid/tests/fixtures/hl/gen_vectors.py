@@ -68,12 +68,10 @@ class _Cloid:
 
 
 def order_action(wires, grouping="na"):
-    # The SDK hardcodes `grouping = "na"`; the key is overwritten in
-    # place, which keeps its position (dict insertion order), so the
-    # msgpack key order stays the SDK's.
-    action = signing.order_wires_to_order_action(wires)
-    action["grouping"] = grouping
-    return action
+    # SDK 0.24.0 builds the action with its `grouping` — a string, or its
+    # `PriorityGrouping` {"p": int} (XMM XH5d) — keyed type, orders,
+    # grouping in that order (dict insertion order: the msgpack key order).
+    return signing.order_wires_to_order_action(wires, None, grouping)
 
 
 # HIP-4 asset ids: 100_000_000 + enc, enc = 10 * outcome_id + side.
@@ -134,6 +132,8 @@ case(
     True,
 )
 case("order_grouping_tpsl", order_action([wire(0, True, 0.5, 10.0, False, "Gtc")], "normalTpsl"), 15, True)
+# XMM XH5d: the ALO priority grouping, {"p": N} (1 bp of resting notional).
+case("order_alo_priority", order_action([wire(0, True, 0.5, 10.0, False, "Alo")], {"p": 10000}), 37, True)
 
 # --- vault + expiresAfter: the two tail bytes of the action hash ------
 case("order_vault", order_action([wire(0, True, 0.5, 10.0, False, "Gtc")]), 16, True, vault=VAULT)
@@ -182,6 +182,57 @@ case(
     },
     25,
     True,
+)
+
+# --- HIP-3 builder-dex perps (HC10): 100_000 + dex_idx*10_000 + index -
+# The shape of the `xyz` hedge leg (dex_idx 1 measured 2026-09-25); the
+# live index comes from the dex's own meta at boot. Prices obey the perp
+# law — five significant figures, 6 - szDecimals decimals (szDecimals 3).
+HIP3_XYZ_A = 100_000 + 1 * 10_000 + 2
+HIP3_XYZ_B = 100_000 + 1 * 10_000 + 9
+case("hip3_ioc_buy", order_action([wire(HIP3_XYZ_A, True, 187.12, 0.012, False, "Ioc", CLOID_B)]), 28, True)
+case("hip3_alo_sell_reduce", order_action([wire(HIP3_XYZ_B, False, 18.712, 1.5, True, "Alo")]), 29, True)
+
+# --- request weight (S7-L1): the address-budget top-up ----------------
+# The SDK has no helper for this action, so the dict IS the reference:
+# the documented key order (`type`, `weight`; `destination` is skipped
+# when unset), signed by the SDK's own L1 chain like every row above.
+case("reserve_weight", {"type": "reserveRequestWeight", "weight": 5000}, 26, True)
+case("reserve_weight_testnet", {"type": "reserveRequestWeight", "weight": 1}, 27, False)
+
+# --- XH4c: the perp arm's control actions -----------------------------
+# The SDK's own dict shapes (`Exchange.update_leverage`,
+# `Exchange.schedule_cancel` — `time` absent, not null, when clearing —
+# and `Exchange.noop`), signed by its L1 chain like every row above.
+case("update_leverage_cross", {"type": "updateLeverage", "asset": 1, "isCross": True, "leverage": 3}, 28, False)
+case("update_leverage_isolated", {"type": "updateLeverage", "asset": 0, "isCross": False, "leverage": 10}, 29, True)
+case("schedule_cancel_at", {"type": "scheduleCancel", "time": 1789000005000}, 30, False)
+case("schedule_cancel_clear", {"type": "scheduleCancel"}, 31, False)
+case("noop", {"type": "noop"}, 32, False)
+
+
+# --- XH4c: the gateway's 39-item actions and the split at 39 ----------
+# An action weighs 1 + n // 40 IP requests, so 39 items is the largest
+# weight-1 action; the XH4b coalescer puts a 40th into its own action.
+def mm_cloid(i):
+    """The E-9 cloid of slot 6, client id 1000 + i."""
+    return "0x4d5606" + "00" * 5 + format(1000 + i, "016x")
+
+
+MM_WIRES = [wire(1, i % 2 == 0, 2500.0 + i * 0.5, 0.01, False, "Alo", mm_cloid(i)) for i in range(40)]
+case("order_batch_39_alo", order_action(MM_WIRES[:39]), 33, False)
+case("order_split_tail", order_action(MM_WIRES[39:]), 34, False)
+case(
+    "batch_modify_39",
+    {"type": "batchModify", "modifies": [{"oid": mm_cloid(100 + i), "order": MM_WIRES[i]} for i in range(39)]},
+    35,
+    False,
+)
+case(
+    "cancel_by_cloid_39",
+    {"type": "cancelByCloid", "cancels": [{"asset": 1, "cloid": mm_cloid(i)} for i in range(39)]},
+    36,
+    False,
 )
 
 out = []

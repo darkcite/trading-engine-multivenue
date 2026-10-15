@@ -10,14 +10,16 @@
 //! * **[`PaperDispatcher`]** — never touches the network. Counts
 //!   submissions and exits. Default in `--paper` mode (which is the
 //!   only mode wired into the cli at this point).
-//! * **[`LiveDispatcher`]** — opens a [`core_net::TlsTransport`] to
-//!   the configured CLOB host, EIP-712-signs each order via
-//!   `signer_eip712`, serialises the order + signature into JSON in
-//!   a preallocated buffer, POSTs via the handwritten HTTP/1.1
-//!   codec in `core_net::http1`, and parses the response with a
-//!   zero-alloc scanner. Synchronous: the strategy's
-//!   `ctx.submit` blocks for one network round-trip. Acceptable
-//!   under the Phase 2 cooldown (250 ms per market).
+//! * **[`LiveDispatcher`]** — EIP-712-signs each order via
+//!   `signer_eip712`, serialises the order + signature into JSON
+//!   straight into the request window of a [`core_net::HttpsPost`] to
+//!   the configured CLOB host (HD3: core-net's one keep-alive HTTPS
+//!   engine), POSTs it, and parses the response with a zero-alloc
+//!   scanner. Synchronous — one network round trip per order — so it
+//!   runs on the [`QueuedDispatcher`] worker thread, never the engine
+//!   loop. It sends no Polymarket L2 authentication headers and signs
+//!   CLOB V1 orders, so the real CLOB is expected to refuse them
+//!   (`live.rs`).
 //!
 //! ## Why HTTP/1.1, not /2
 //!
@@ -47,7 +49,7 @@ pub use queued::{DispatcherWorker, QueuedDispatcher, ORDER_RING_CAP};
 pub use response::{parse_clob_response, ClobResponse, ResponseScanErr};
 
 use core_types::{
-    CancelReq, Fill, ModifyReq, NsTs, Order, OrderIdentity, Price, Qty, Side, Tick,
+    CancelReq, Fill, ModifyReq, NsTs, Order, OrderIdentity, Price, Qty, Side, SymbolId, Tick,
 };
 
 /// Dispatcher error modes.
@@ -79,10 +81,11 @@ pub enum DispatchError {
     /// reader of the tape.
     NoLiveRoute,
     /// E5: this dispatcher does not implement the verb that was
-    /// called. The default [`OrderDispatch::cancel`] and
-    /// [`OrderDispatch::modify`] bodies return it, so a dispatcher
-    /// that has not been taught to take an order back refuses loudly
-    /// rather than returning `Ok` and doing nothing.
+    /// called. A dispatcher that cannot take an order back returns it
+    /// from its [`OrderDispatch::cancel`] / [`OrderDispatch::modify`]
+    /// — both REQUIRED since BX3 (O-BX19), so that answer is always
+    /// written down, never inherited — and refuses loudly rather than
+    /// returning `Ok` and doing nothing.
     Unsupported,
     /// E5: no resting order carries that client id. Already filled,
     /// already expired, or already taken back — a RACE, not a
@@ -438,29 +441,61 @@ pub trait OrderDispatch {
     /// means it was already gone. The difference is the whole point
     /// of the method returning a `Result` at all.
     ///
-    /// Defaulted to [`DispatchError::Unsupported`] rather than
-    /// `Ok(())`: a dispatcher that cannot cancel must say so, because
-    /// a silent success here is a strategy believing a live quote was
-    /// pulled while the venue still holds it.
-    #[inline]
-    fn cancel(&mut self, _req: &CancelReq) -> Result<(), DispatchError> {
-        Err(DispatchError::Unsupported)
-    }
+    /// **Required — no default (BX3, O-BX19).** Until BX3 this was
+    /// defaulted to [`DispatchError::Unsupported`], and BX0-F3 was
+    /// exactly that default hiding a composed arm that never forwarded
+    /// the verb: every cancel reached nothing and said so only as a
+    /// refusal nobody expected. A dispatcher that cannot cancel now
+    /// writes `Err(Unsupported)` itself, and a composition that forgets
+    /// to forward does not compile.
+    fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError>;
 
     /// **E5, LAW E-7 — replace a resting order in place.**
     ///
     /// Price, size and client id may change; the five fields of
     /// [`core_types::OrderIdentity`] may not, and
     /// `req.order().ts_ns`/`ttl_ns` are ignored (the modified order
-    /// keeps the original's expiry). Defaulted like `cancel`, for the
+    /// keeps the original's expiry). Required like `cancel`, for the
     /// same reason.
-    #[inline]
-    fn modify(&mut self, _req: &ModifyReq) -> Result<(), DispatchError> {
-        Err(DispatchError::Unsupported)
-    }
+    fn modify(&mut self, req: &ModifyReq) -> Result<(), DispatchError>;
 
     /// Pop the next fill, if any.
     fn try_next_fill(&mut self) -> Option<Fill>;
+
+    /// **HYPARB L5, BX3 (F9) — an accepted order that ended without a
+    /// (further) fill**, as a [`Retired`]: a swap that reverted or was
+    /// never mined, the unfilled remainder of an IoC, a venue cancel.
+    /// The router retires its resting row, or `max_open_orders` would
+    /// count orders that no longer exist and stall the slot, and counts
+    /// the `why`. Defaulted to none: an arm whose orders end only by
+    /// fill or by the member's own cancel has nothing to say here.
+    #[inline]
+    fn try_next_retired(&mut self) -> Option<Retired> {
+        None
+    }
+
+    /// **BX6 (BX3 obligation 2) — does this arm confirm a cancel or a
+    /// modify LATER?** A queued arm's `cancel` / `modify` `Ok` means
+    /// "queued", not "done": the venue may still refuse it. For such an
+    /// arm the router neither releases a cancelled order's resting row on
+    /// `Ok` (it releases on the confirmed [`RETIRED_CANCELED_MEMBER`]) nor
+    /// renames a modified one (it renames on the arm's [`Renamed`]).
+    /// Asked per order, by its route: a composite answers for the arm the
+    /// order reaches. Defaulted to `false` — an arm whose `Ok` IS the
+    /// venue's answer (the Hyperliquid arm, the paper matcher).
+    #[inline]
+    fn verbs_confirm_later(&self, _sym: SymbolId, _venue: u8, _strategy_id: u8) -> bool {
+        false
+    }
+
+    /// **BX6 (BX3 obligation 2) — a modify the venue confirmed**, for an
+    /// arm that [`OrderDispatch::verbs_confirm_later`]: the router renames
+    /// and resizes the resting row now. Drained by the router like
+    /// retirements (at most 64 per idle poll). Defaulted to none.
+    #[inline]
+    fn try_next_renamed(&mut self) -> Option<Renamed> {
+        None
+    }
 
     /// Snapshot of dispatch counters.
     fn stats(&self) -> DispatchStats;
@@ -474,9 +509,51 @@ pub trait OrderDispatch {
     #[inline]
     fn observe_tick(&mut self, _tick: &Tick, _now_ns: NsTs) {}
 
+    /// HYPARB H2: show the dispatcher one pool-event signal (the HyperEVM
+    /// ingress's `Signal`: `sym` = the pool or `SYMBOL_ID_NONE`, the
+    /// 40-byte `core_amm::payload`), so a PAPER one can keep pool state
+    /// and judge its open AMM swaps on each new head.
+    ///
+    /// Defaulted to nothing for the same reason as [`Self::observe_tick`]:
+    /// a live dispatcher learns about fills from the chain, never from a
+    /// curve. Only [`PaperDispatcher`] overrides it.
+    #[inline]
+    fn observe_amm(&mut self, _sym: SymbolId, _payload: &[u8; 40], _now_ns: NsTs) {}
+
+    /// XMM XH2: show the dispatcher one trade print, so a PAPER one can
+    /// judge its post-only makers on a queue venue by the queue law
+    /// (`core_fill::queue`): prints consume the queue ahead, then fill.
+    ///
+    /// Defaulted to nothing for the reason [`Self::observe_tick`] is.
+    #[inline]
+    fn observe_trade(&mut self, _print: &core_types::TradePrint, _now_ns: NsTs) {}
+
+    /// XMM XH2: write the next order event (`RESTING`, `REJECTED`,
+    /// `CANCELED`, `FILLED`) about an order this dispatcher models into
+    /// `out` and say so — into the caller's storage rather than returned
+    /// inside an `Option` (128 B by value; `OrderEvent` has no niche), the
+    /// `TradePrint::read_trade_event` shape. The paper arm emits the
+    /// events the live gateway (XH4) will, so a member's order state
+    /// machine runs the same in both. Defaulted to none: an arm with no
+    /// order events has nothing to say.
+    #[inline]
+    fn try_next_order_event(&mut self, _out: &mut core_types::OrderEvent) -> bool {
+        false
+    }
+
+    /// XMM XH2: track the touch of `sym` for the queue law, so the first
+    /// post-only order placed on it meets a known book. Boot calls it
+    /// for every instrument a queue member may trade. Defaulted to
+    /// nothing: a live arm learns its queue from the venue.
+    #[inline]
+    fn track_queue_sym(&mut self, _sym: SymbolId) {}
+
     /// X1: what the paper matcher has done. All zeros for a dispatcher
     /// that does not model fills, which is how `/metrics` reads for a
     /// live boot.
+    // COPY: `MatcherCounters` (176 B, size-pinned) crosses the trait by
+    // value on the 5 s metrics cadence only — cold, and a reference
+    // would pin the matcher's borrow across the mirror.
     #[inline]
     fn matcher_counters(&self) -> MatcherCounters {
         MatcherCounters::default()
@@ -548,6 +625,32 @@ pub trait OrderDispatch {
     #[inline]
     fn on_venue_event(&mut self, _event: &core_types::ChannelEvent) {}
 
+    /// **BX3 — an options summary the engine drained** (mark, index,
+    /// greeks, from the options lanes).
+    ///
+    /// Defaulted to a no-op like [`Self::on_venue_event`]; the one
+    /// reader is the router's ledger, which prices its option rows —
+    /// the long's premium at risk and the short's venue IM — from the
+    /// mark and the index (plan §3.5). Called on the engine thread
+    /// BEFORE the strategy sees the same summary, for the same reason
+    /// as the venue event: a member handed a summary may submit in the
+    /// same call, and the ledger must already have priced it.
+    #[inline]
+    fn on_opt_summary(&mut self, _summary: &core_types::OptSummary) {}
+
+    /// **BX3 — the router's boot-fixed route aliases, handed down.**
+    ///
+    /// An arm that routes by venue (`exec_router::VenueSplit`) must route
+    /// by the SAME table the router allowed each order by — a table that
+    /// differed would send an order the router allowed as Binance to the
+    /// Hyperliquid arm, which refuses it (LAW E-4) into the asset-refusal
+    /// streak that halts Hyperliquid slots. So the router is the one
+    /// owner: it pushes its table down here at boot, and a composite
+    /// forwards it to each of its arms. Every other arm ignores it.
+    /// Boot-only.
+    #[inline]
+    fn set_route_aliases(&mut self, _aliases: RouteAliases) {}
+
     /// **E6 — a fill was BOOKED into the engine.**
     ///
     /// Defaulted to a no-op like every other hook here. The one
@@ -610,6 +713,20 @@ pub trait OrderDispatch {
         HaltSignal::default()
     }
 
+    /// **HYPARB L4 — the signal for ONE live slot.**
+    ///
+    /// The router polls this once per live slot and judges each slot
+    /// only against the arm that trades it: with two live arms behind
+    /// one router (`exec_router::SlotSplit`), slot 0's reconciler, its
+    /// stream and its P&L bound must never halt slot 3, nor the
+    /// reverse. An arm that serves every slot from one venue
+    /// relationship answers its one signal for all of them — the
+    /// default, and exactly the behaviour before L4.
+    #[inline]
+    fn halt_signal_for(&self, _slot: u8) -> HaltSignal {
+        self.halt_signal()
+    }
+
     /// **E6 commit 3 — REQUEST that every order come off the venue.**
     ///
     /// This is a request, not a confirmation. [`Self::cancel_all_state`]
@@ -656,6 +773,34 @@ pub trait OrderDispatch {
         CancelAllState::Clear
     }
 
+    /// **XMM XH5a (R-XH4-1) — REQUEST that ONE slot's orders come off
+    /// the venue.** The router's halt path asks this, never
+    /// [`Self::cancel_all`]: a halt cancels only the halted slot's
+    /// orders, so a sibling slot on the same arm keeps its quotes.
+    ///
+    /// The same request / confirmation split as `cancel_all`
+    /// ([`Self::cancel_slot_state`] confirms). Defaulted to the
+    /// venue-wide [`Self::cancel_all`]: an arm that cannot tell its slots
+    /// apart OVER-cancels — the behaviour before XH5a — and never leaves
+    /// a halted slot's order resting. Every arm a live engine composes
+    /// answers for its own slots.
+    ///
+    /// # Errors
+    /// Whatever stopped the arm accepting the request.
+    #[inline]
+    fn cancel_slot(&mut self, _slot: u8) -> Result<(), DispatchError> {
+        self.cancel_all()
+    }
+
+    /// **XMM XH5a — is the venue clear of ONE slot's orders?** Polled
+    /// after [`Self::cancel_slot`] until it answers
+    /// [`CancelAllState::Clear`]; three-valued for the reason
+    /// [`Self::cancel_all_state`] is, which it defaults to.
+    #[inline]
+    fn cancel_slot_state(&self, _slot: u8) -> CancelAllState {
+        self.cancel_all_state()
+    }
+
     /// E1: what the execution ROUTER did, when there is one.
     ///
     /// Defaulted to an unconfigured set — `configured == 0` — exactly
@@ -682,6 +827,309 @@ pub trait OrderDispatch {
     fn arm_counters(&self) -> LiveArmCounters {
         LiveArmCounters::default()
     }
+
+    /// **BX6 — one venue's live arm**, where a composition holds
+    /// several: `Some` from the arm that trades route venue `venue`, `None`
+    /// from everything else (the default). [`Self::arm_counters`] answers
+    /// the flat, first arm; this reaches the others (`/state`
+    /// `exec.arms.binance`). Cold: the 1 s publish.
+    // COPY: LiveArmCounters (272 B) in an Option by value — cold, once a
+    // second; composed by the arm on demand, so there is nothing to
+    // borrow — rejected: an out-param through every composite.
+    #[inline]
+    fn venue_arm_counters(&self, _venue: u8) -> Option<LiveArmCounters> {
+        None
+    }
+
+    /// **S7-L1 — the engine is stopping: take every resting order of
+    /// ours off the venue, NOW.**
+    ///
+    /// Called once, from `Engine::stop`, after the members' `on_stop`.
+    /// Blocking and bounded — unlike [`Self::cancel_all`], which queues
+    /// work for idle moments that at shutdown will not come. A restart
+    /// boots every member flat: a paper matcher's resting orders die
+    /// with its process, and a live quote left on the venue would fill
+    /// into a position no member of the next process knows it has.
+    ///
+    /// Defaulted to a no-op: a dispatcher that models rather than
+    /// trades has nothing resting anywhere but in its own memory.
+    #[inline]
+    fn on_shutdown(&mut self) {}
+
+    /// **S7-L1 — what the VENUE says `slot` bought today**:
+    /// `(UTC day number, filled BUY notional since that day's 00:00Z,
+    /// USD ×1e6)`, from the venue's own fill history, or `None` until
+    /// the arm has read it.
+    ///
+    /// The router adopts it into its day cap (never lowering it), which
+    /// is what makes `cap_day_usd_1e6` survive a restart: the router's
+    /// own count starts at zero on every boot, the venue's does not.
+    /// The day number is `wall_ms / 86 400 000` — the ledger's day
+    /// epoch. Defaulted to `None`: a paper matcher has no history
+    /// outside its own memory.
+    #[inline]
+    fn venue_day_bought(&self, _slot: usize) -> Option<(u64, i64)> {
+        None
+    }
+
+    /// **XMM XH4f (D7) — slot `slot`'s execution health** at `now_ns`
+    /// (engine clock): the router's word (halted, off, unseeded) and its
+    /// arm's (not booted, its budget, its congestion, its answers' round
+    /// trip). A member reads it through its ctx to pull or slow its
+    /// quotes. Defaulted healthy: the paper matcher, and every arm not
+    /// taught it. A few loads — read on a member's tick.
+    #[inline]
+    fn exec_health(&self, _slot: u8, _now_ns: NsTs) -> core_types::ExecHealth {
+        core_types::ExecHealth::HEALTHY
+    }
+
+    /// **XMM XH4f (D11) — the Hyperliquid gateway arm's numbers**, when
+    /// the composition holds one: `true` with `out` filled — by the arm,
+    /// and by the router with its words for the arm's slot — `false` from
+    /// everything else (the default; `out` untouched). `now_ns` is the
+    /// engine clock (the heartbeat's age, the slot's health). Cold: the 1 s
+    /// `/state` publish and the 5 s `/metrics` mirror; an out-param, so the
+    /// 1 016 B report never crosses by value.
+    #[inline]
+    fn gateway_arm_report(&self, _now_ns: NsTs, _out: &mut GatewayArmReport) -> bool {
+        false
+    }
+
+    /// **BX11 — the Binance arm's own numbers** (`/state`
+    /// `exec.arms.binance_gw`, `/metrics` `engine_exec_bn_*`), when the
+    /// composition holds one: `true` with `out` filled by the arm, `false`
+    /// from everything else (the default; `out` untouched). What
+    /// [`LiveArmCounters`] cannot say: the gateway's own tallies, the
+    /// refusals by reason, the stream and dead-man words, the governor's
+    /// headroom, the margin ratios, the clock offset and the round trips.
+    /// `now_ns` is the engine clock. Cold: the 1 s `/state` publish and the
+    /// 5 s `/metrics` mirror; an out-param, so the report never crosses by
+    /// value.
+    #[inline]
+    fn binance_arm_report(&self, _now_ns: NsTs, _out: &mut BinanceArmReport) -> bool {
+        false
+    }
+}
+
+/// **XMM XH4i-5 — an arm the composition may not hold.** `None` is an
+/// absent arm: it refuses every verb as the refusing stub does
+/// ([`DispatchError::NoLiveRoute`] — a verb reaching it is a routing bug),
+/// tells nothing, and answers every hook as the trait's defaults do; `Some`
+/// forwards every method. The engine composes slot 3's gateway arm so —
+/// `SlotSplit(3, <shape>, Option<HlGatewayArm>)`, whose slot names none
+/// (`exec_router::NO_SLOT`) when the arm is absent — so one loop type
+/// serves both and the shapes' sixteen compositions stay sixteen. One
+/// discriminant load a verb; no allocation, no `dyn`; the counters cross by
+/// value as the trait's do (cold, noted there).
+impl<D: OrderDispatch> OrderDispatch for Option<D> {
+    #[inline]
+    fn submit(&mut self, order: &Order) -> Result<(), DispatchError> {
+        match self {
+            Some(d) => d.submit(order),
+            None => Err(DispatchError::NoLiveRoute),
+        }
+    }
+
+    #[inline]
+    fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
+        match self {
+            Some(d) => d.cancel(req),
+            None => Err(DispatchError::NoLiveRoute),
+        }
+    }
+
+    #[inline]
+    fn modify(&mut self, req: &ModifyReq) -> Result<(), DispatchError> {
+        match self {
+            Some(d) => d.modify(req),
+            None => Err(DispatchError::NoLiveRoute),
+        }
+    }
+
+    #[inline]
+    fn try_next_fill(&mut self) -> Option<Fill> {
+        self.as_mut().and_then(D::try_next_fill)
+    }
+
+    #[inline]
+    fn try_next_retired(&mut self) -> Option<Retired> {
+        self.as_mut().and_then(D::try_next_retired)
+    }
+
+    #[inline]
+    fn verbs_confirm_later(&self, sym: SymbolId, venue: u8, strategy_id: u8) -> bool {
+        self.as_ref()
+            .is_some_and(|d| d.verbs_confirm_later(sym, venue, strategy_id))
+    }
+
+    #[inline]
+    fn try_next_renamed(&mut self) -> Option<Renamed> {
+        self.as_mut().and_then(D::try_next_renamed)
+    }
+
+    #[inline]
+    fn stats(&self) -> DispatchStats {
+        self.as_ref().map_or_else(DispatchStats::default, D::stats)
+    }
+
+    #[inline]
+    fn observe_tick(&mut self, tick: &Tick, now_ns: NsTs) {
+        if let Some(d) = self {
+            d.observe_tick(tick, now_ns);
+        }
+    }
+
+    #[inline]
+    fn observe_amm(&mut self, sym: SymbolId, payload: &[u8; 40], now_ns: NsTs) {
+        if let Some(d) = self {
+            d.observe_amm(sym, payload, now_ns);
+        }
+    }
+
+    #[inline]
+    fn observe_trade(&mut self, print: &core_types::TradePrint, now_ns: NsTs) {
+        if let Some(d) = self {
+            d.observe_trade(print, now_ns);
+        }
+    }
+
+    #[inline]
+    fn try_next_order_event(&mut self, out: &mut core_types::OrderEvent) -> bool {
+        self.as_mut().is_some_and(|d| d.try_next_order_event(out))
+    }
+
+    #[inline]
+    fn track_queue_sym(&mut self, sym: SymbolId) {
+        if let Some(d) = self {
+            d.track_queue_sym(sym);
+        }
+    }
+
+    #[inline]
+    fn matcher_counters(&self) -> MatcherCounters {
+        self.as_ref()
+            .map_or_else(MatcherCounters::default, D::matcher_counters)
+    }
+
+    #[inline]
+    fn open_paper_orders(&self) -> usize {
+        self.as_ref().map_or(0, D::open_paper_orders)
+    }
+
+    #[inline]
+    fn on_idle(&mut self) -> bool {
+        self.as_mut().is_some_and(D::on_idle)
+    }
+
+    #[inline]
+    fn on_venue_event(&mut self, event: &core_types::ChannelEvent) {
+        if let Some(d) = self {
+            d.on_venue_event(event);
+        }
+    }
+
+    #[inline]
+    fn on_opt_summary(&mut self, summary: &core_types::OptSummary) {
+        if let Some(d) = self {
+            d.on_opt_summary(summary);
+        }
+    }
+
+    #[inline]
+    fn set_route_aliases(&mut self, aliases: RouteAliases) {
+        if let Some(d) = self {
+            d.set_route_aliases(aliases);
+        }
+    }
+
+    #[inline]
+    fn on_fill_booked(&mut self, fill: &Fill) {
+        if let Some(d) = self {
+            d.on_fill_booked(fill);
+        }
+    }
+
+    #[inline]
+    fn halt_signal(&self) -> HaltSignal {
+        self.as_ref()
+            .map_or_else(HaltSignal::default, D::halt_signal)
+    }
+
+    #[inline]
+    fn halt_signal_for(&self, slot: u8) -> HaltSignal {
+        self.as_ref()
+            .map_or_else(HaltSignal::default, |d| d.halt_signal_for(slot))
+    }
+
+    #[inline]
+    fn cancel_all(&mut self) -> Result<(), DispatchError> {
+        self.as_mut().map_or(Ok(()), D::cancel_all)
+    }
+
+    #[inline]
+    fn cancel_all_state(&self) -> CancelAllState {
+        self.as_ref()
+            .map_or(CancelAllState::Clear, D::cancel_all_state)
+    }
+
+    #[inline]
+    fn cancel_slot(&mut self, slot: u8) -> Result<(), DispatchError> {
+        self.as_mut().map_or(Ok(()), |d| d.cancel_slot(slot))
+    }
+
+    #[inline]
+    fn cancel_slot_state(&self, slot: u8) -> CancelAllState {
+        self.as_ref()
+            .map_or(CancelAllState::Clear, |d| d.cancel_slot_state(slot))
+    }
+
+    #[inline]
+    fn exec_counters(&self) -> ExecCounters {
+        self.as_ref()
+            .map_or_else(ExecCounters::default, D::exec_counters)
+    }
+
+    #[inline]
+    fn arm_counters(&self) -> LiveArmCounters {
+        self.as_ref()
+            .map_or_else(LiveArmCounters::default, D::arm_counters)
+    }
+
+    #[inline]
+    fn venue_arm_counters(&self, venue: u8) -> Option<LiveArmCounters> {
+        self.as_ref().and_then(|d| d.venue_arm_counters(venue))
+    }
+
+    #[inline]
+    fn on_shutdown(&mut self) {
+        if let Some(d) = self {
+            d.on_shutdown();
+        }
+    }
+
+    #[inline]
+    fn venue_day_bought(&self, slot: usize) -> Option<(u64, i64)> {
+        self.as_ref().and_then(|d| d.venue_day_bought(slot))
+    }
+
+    #[inline]
+    fn exec_health(&self, slot: u8, now_ns: NsTs) -> core_types::ExecHealth {
+        self.as_ref().map_or(core_types::ExecHealth::HEALTHY, |d| {
+            d.exec_health(slot, now_ns)
+        })
+    }
+
+    #[inline]
+    fn gateway_arm_report(&self, now_ns: NsTs, out: &mut GatewayArmReport) -> bool {
+        self.as_ref()
+            .is_some_and(|d| d.gateway_arm_report(now_ns, out))
+    }
+
+    #[inline]
+    fn binance_arm_report(&self, now_ns: NsTs, out: &mut BinanceArmReport) -> bool {
+        self.as_ref()
+            .is_some_and(|d| d.binance_arm_report(now_ns, out))
+    }
 }
 
 /// **E7 — the live arm's operator numbers**, carried across the
@@ -701,11 +1149,13 @@ pub struct LiveArmCounters {
     /// Submits refused locally before any packet left.
     pub refused_local: u64,
     /// The LAW E-4 subset of `refused_local`: the order named an
-    /// instance the table has rolled past.
+    /// instance the table has rolled past (Binance, BX11: a row bound but
+    /// not live — rolled past, or never live, as inexact units are).
     pub refused_stale: u64,
     /// Actions that reached the wire and whose answer was never read.
     /// Non-zero = there may be an order at the venue no local book
-    /// has an id for; reconciliation is what finds it.
+    /// has an id for; reconciliation is what finds it. (Binance, BX11:
+    /// the orders put in doubt, a running total.)
     pub sent_unanswered: u64,
     /// Fills that reached fill lane 3.
     pub fills_booked: u64,
@@ -732,7 +1182,8 @@ pub struct LiveArmCounters {
     pub recon_unseen_legs: u64,
     /// LAW E-8 sweeps abandoned with orders possibly still resting.
     pub sweep_left: u64,
-    /// Sweeps that stopped shrinking and were force-terminated.
+    /// Sweeps that stopped shrinking and were force-terminated
+    /// (Binance, BX11: the sweeps that ended stranded).
     pub sweep_stalled: u64,
     /// Legs a cancel-all could not queue.
     pub cancel_all_unqueued: u64,
@@ -747,19 +1198,768 @@ pub struct LiveArmCounters {
     /// Symbols two slots both traded — a configuration error.
     pub owner_contested: u64,
     /// The address request budget's remaining headroom, per the
-    /// governor. Negative = past the venue's cliff.
+    /// governor. Negative = past the venue's cliff. (Binance, BX11: the
+    /// request weight's headroom against the arm's own share of the IP's
+    /// minute, `ARM_WEIGHT_MAX_PER_MIN`; negative = past that share.)
     pub budget_remaining: i64,
-    /// **E7 session bound** — the spot USDC (USD ×1e6) the session's
-    /// P&L is measured from: the balance at the first FLAT
-    /// reconciliation, persisted across restarts. `0` = not anchored
-    /// yet.
+    /// **E7 session bound** — the equity AT COST (spot USDC plus the
+    /// held legs' cost basis, USD ×1e6) the session's P&L is measured
+    /// from: the account at its first reconciliation, persisted across
+    /// restarts. `0` = not anchored yet.
     pub pnl_anchor_usd_1e6: i64,
-    /// **E7 session bound** — spot USDC minus the anchor at the last
-    /// reconciliation, USD ×1e6, signed. A LEVEL; `0` while not
-    /// anchored. The number `halt_on_gain_usd_1e6` /
-    /// `halt_on_loss_usd_1e6` are judged against while flat.
+    /// **E7 session bound** — the equity at cost minus the anchor at
+    /// the last reconciliation, USD ×1e6, signed. A LEVEL; `0` while
+    /// not anchored. The number `halt_on_gain_usd_1e6` /
+    /// `halt_on_loss_usd_1e6` are judged against — legs held or not
+    /// (S7-L1).
     pub session_pnl_usd_1e6: i64,
+    /// **S7-L1** — cancels the account-wide sweep (boot and shutdown)
+    /// had the venue confirm. A total.
+    pub sweep_all_cancelled: u64,
+    /// **S7-L1** — orders of ours the last account-wide sweep could
+    /// not confirm gone. A level; `u64::MAX` = the venue's open orders
+    /// could not be read, which is NOT clear.
+    pub sweep_all_left: u64,
+    /// **S7-L1** — request-weight top-ups the venue accepted.
+    pub topup_ok: u64,
+    /// **S7-L1** — request-weight top-up checks that failed.
+    pub topup_failed: u64,
+    /// **S7-L1** — day-spend reads (`userFillsByTime`) that parsed.
+    pub day_sync_ok: u64,
+    /// **S7-L1** — day-spend reads that did not. While the first read
+    /// of a boot keeps failing, a slot under restart safety stays
+    /// unseeded and refuses every live place.
+    pub day_sync_failed: u64,
 }
+
+// S7-L1: both counter blocks cross the `OrderDispatch` boundary BY
+// VALUE (`// COPY:` at `exec_router::RoutedDispatcher::exec_counters`),
+// and the byte bounds those comments state have drifted twice. Pinned.
+const _: () = assert!(core::mem::size_of::<LiveArmCounters>() == 272);
+// BX3: + `refused_short`, `refused_unpriced` and `retired[8]` (80 B).
+// BX6: + the two mark counters and the Binance arm's block (16 + 272 B;
+// `arm_bn_present` rides in padding).
+const _: () = assert!(core::mem::size_of::<ExecCounters>() == 936);
+const _: () = assert!(core::mem::offset_of!(ExecCounters, live_submits) == 16);
+
+/// **XMM XH4f (D11) — the Hyperliquid gateway arm's numbers** (slot 6's
+/// `exec_hyperliquid::arm::HlGatewayArm`), filled through
+/// [`OrderDispatch::gateway_arm_report`] for `/metrics`
+/// (`engine_exec_hlgw_*`) and `/state` (`exec.arms.hyperliquid_gw`): the
+/// arm's counters and the dead man's, the gateway's (its shared words and
+/// the ones it publishes at its heartbeat), the budget, the rates and the
+/// latencies, and the router's words for the arm's slot. Counters are
+/// totals since boot; the fields after [`Self::refused_foreign_row`] are
+/// levels. [`ExecCounters`] keeps its pinned 936 B.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct GatewayArmReport {
+    /// `1` when an arm filled the report.
+    pub present: u64,
+    /// The arm's slot.
+    pub slot: u64,
+    // --- counters: the arm ---
+    /// Places and modifies pushed.
+    pub pushed: u64,
+    /// Order events sent to the engine.
+    pub events: u64,
+    /// Submits and modifies refused before the ring (another slot, an
+    /// unbound symbol, a rule, a kind, a client id in use).
+    pub refused_local: u64,
+    /// Pushes the command ring refused (full).
+    pub ring_full: u64,
+    /// Fills sent to the engine.
+    pub fills: u64,
+    /// Fills of another slot (tape only).
+    pub fills_foreign: u64,
+    /// Fills on an asset the arm does not bind.
+    pub fills_unresolved: u64,
+    /// Fills that crossed (taker) — a post-only maker expects none.
+    pub fills_crossed: u64,
+    /// Answers about an order the arm does not hold.
+    pub stray: u64,
+    /// Post-only crosses the venue refused.
+    pub alo_rejects: u64,
+    /// Other venue refusals of places and modifies.
+    pub rejects: u64,
+    /// Orders in doubt settled by their cancel.
+    pub doubt_settled: u64,
+    /// Orders that ended unseen (the gone wait ran out).
+    pub closed_unseen: u64,
+    /// `FILLED` sent before its fills covered the order.
+    pub join_timeouts: u64,
+    /// Unknown orders of the slot a read found after boot.
+    pub unknown_orders: u64,
+    /// Reads answered (the sheet, the orders).
+    pub reads: u64,
+    /// Reads that failed.
+    pub reads_failed: u64,
+    /// Fills before the seeding sheet that did not fit its hold.
+    pub preseed_dropped: u64,
+    /// Fills after the engine stopped draining (the venue's sheet holds
+    /// them for the next boot).
+    pub shutdown_fills: u64,
+    /// Shutdowns that reached their bound with orders of ours possibly
+    /// resting — only the dead man's schedule, if the venue keeps one,
+    /// cancels them.
+    pub shutdown_unconfirmed: u64,
+    /// Shutdowns that reached their bound with the dead man's clear
+    /// unconfirmed (a trigger may be spent on an empty book).
+    pub shutdown_switch_held: u64,
+    /// Out-queue entries lost to a full queue (a bug).
+    pub dropped: u64,
+    /// Places and modifies refused at the budget floor, or while the
+    /// budget is stale.
+    pub refused_budget: u64,
+    /// Places and modifies the gateway refused unsent over its rate shares.
+    pub throttled: u64,
+    /// Budget reads answered.
+    pub limit_reads: u64,
+    /// Pages of the day's fills read.
+    pub day_pages: u64,
+    /// Days read spent because their start may be unread.
+    pub day_unreadable: u64,
+    /// Requests taken back from the budget (refused before they left).
+    pub refunded: u64,
+    /// Places and modifies refused on a perp whose leverage is dark.
+    pub refused_leverage: u64,
+    /// Spot sheets answered with their USDC row (XMM XH5b-2: an account
+    /// of the slot's own reads one with each perp sheet).
+    pub spot_reads: u64,
+    /// Spot reads that failed (XMM XH5b-2).
+    pub spot_failed: u64,
+    /// Top-ups seen on the venue: their price charged to the session's
+    /// spend (XMM XH5c-2).
+    pub topup_ok: u64,
+    /// Top-up stops: a purchase the venue refused or the next read did not
+    /// show, a state that could not be stored, an answer for no purchase in
+    /// flight (XMM XH5c-2).
+    pub topup_failed: u64,
+    /// Purchases that never left (refused unsent, a full ring, abandoned
+    /// before they left: a newer read out of the band, the slot's halt, the
+    /// shutdown): never bought, the day's charge returned (XMM XH5c-2).
+    pub topup_unsent: u64,
+    // --- counters: the dead man ---
+    /// Arms that left the host, probes included.
+    pub dm_arms: u64,
+    /// Clears that left the host.
+    pub dm_clears: u64,
+    /// Posts the venue accepted.
+    pub dm_accepted: u64,
+    /// Posts the venue refused.
+    pub dm_refused: u64,
+    /// Posts the venue's rate limit turned away.
+    pub dm_rate_limited: u64,
+    /// Posts answered in doubt.
+    pub dm_in_doubt: u64,
+    /// Posts that never left the host.
+    pub dm_unsent: u64,
+    /// Deadlines that passed unmoved (each a trigger).
+    pub dm_triggers: u64,
+    /// Verdicts of a kind a post never gets.
+    pub dm_stray: u64,
+    // --- counters: the gateway's shared words ---
+    /// Signed posts written.
+    pub actions_sent: u64,
+    /// Replies matched to their post.
+    pub replies: u64,
+    /// Replies for a post the table does not hold.
+    pub replies_unmatched: u64,
+    /// Posts whose reply never came inside its deadline.
+    pub post_timeouts: u64,
+    /// Posts sent over the REST fallback.
+    pub rest_fallback_posts: u64,
+    /// Connection swaps and re-dials.
+    pub reconnects: u64,
+    /// Events the gateway could not deliver (a full ring: the arm halts).
+    pub evt_ring_full: u64,
+    /// Cancels the gateway sent on its own (its sweeps' and its TTLs').
+    pub own_cancels: u64,
+    // --- counters: the gateway's own, published at its heartbeat ---
+    /// Fills the gateway emitted.
+    pub gw_fills: u64,
+    /// `userFills` frames that did not scan.
+    pub gw_fills_scan_failed: u64,
+    /// `orderUpdates` rows emitted.
+    pub gw_updates: u64,
+    /// `orderUpdates` rows with a status the gateway does not report.
+    pub gw_updates_ignored: u64,
+    /// `orderUpdates` frames that did not scan.
+    pub gw_updates_scan_failed: u64,
+    /// Post answers that could not be attributed.
+    pub gw_answers_unreadable: u64,
+    /// Answers that miscount their items or carry an impossible status.
+    pub gw_answers_mismatched: u64,
+    /// `{"channel":"error"}` frames.
+    pub gw_ws_errors: u64,
+    /// Commands refused before the socket.
+    pub gw_local_refusals: u64,
+    /// Posts that cannot grow, sent without a deadline (XG-3).
+    pub gw_cancels_untimed: u64,
+    /// Dials started.
+    pub gw_dials: u64,
+    /// Connections that went down.
+    pub gw_conn_drops: u64,
+    /// Sweep rounds run.
+    pub gw_sweep_rounds: u64,
+    /// Resting orders a sweep could not cancel (their coin unmapped).
+    pub gw_sweep_unmapped: u64,
+    /// Growing commands refused unsent at 80 % of a rate share.
+    pub gw_throttled: u64,
+    /// TTL cancels sent.
+    pub gw_ttl_cancels: u64,
+    /// Orders whose TTL the full table could not keep.
+    pub gw_ttl_full: u64,
+    // --- counters: the outcome mode (XMM XH4i-5: slot 3; 0 on a perps arm) ---
+    /// Created rolls bound, both legs.
+    pub outcome_rolls_bound: u64,
+    /// Settled rolls (they bind and unbind nothing).
+    pub outcome_rolls_settled: u64,
+    /// Rolls refused (a kind no packer writes, no outcome, ids that do not
+    /// fit, no room for both legs).
+    pub outcome_rolls_refused: u64,
+    /// Repeats of the live roll, left alone (A-S7-83).
+    pub outcome_rolls_repeated: u64,
+    /// Orders refused naming an instance that has rolled (LAW E-4).
+    pub outcome_refused_stale: u64,
+    /// Orders refused naming a leg no roll has bound.
+    pub outcome_refused_unbound: u64,
+    /// Orders refused by the outcome rules (one is a member's bug).
+    pub outcome_refused_rules: u64,
+    /// Our rows on a leg a roll retired, their cancels sent or kept (LAW
+    /// E-8).
+    pub outcome_e8_cancels: u64,
+    /// Settlements booked on a leg this slot owns.
+    pub outcome_settlements: u64,
+    /// Settlements on a leg no accepted order of ours owns (never booked).
+    pub outcome_settlements_unowned: u64,
+    /// Fills booked on a generation a roll retired.
+    pub outcome_fills_old_gen: u64,
+    /// Our fills naming another asset than their row's place (not booked).
+    pub outcome_fills_mismatched: u64,
+    /// Leg fills refused (a negative price, no whole engine unit).
+    pub outcome_fills_refused: u64,
+    /// Spot reads whose legs were compared with the ledger.
+    pub outcome_leg_reads: u64,
+    /// … in which a live leg's holding differed from the ledger.
+    pub outcome_leg_drift_reads: u64,
+    /// … in which the venue held a leg no live binding names.
+    pub outcome_leg_unseen_reads: u64,
+    /// First-snapshot rows that came before their leg's roll, kept for it.
+    pub outcome_snapshot_parked: u64,
+    // --- counters: the router, for the arm's slot ---
+    /// Orders the router refused over a perp slot's `cap_perp_usd_1e6`.
+    pub refused_cap_perp: u64,
+    /// Orders the router refused over a perp slot's `max_resting_usd_1e6`.
+    pub refused_max_resting: u64,
+    /// XMM XH5a: other slots' live orders the router refused on this
+    /// slot's owned rows.
+    pub refused_foreign_row: u64,
+    // --- gauges ---
+    /// `1` while the arm takes orders.
+    pub ready: u64,
+    /// Orders the arm tracks.
+    pub open_orders: u64,
+    /// Posts in flight.
+    pub in_flight: u64,
+    /// `1` while the WebSocket is up.
+    pub ws_up: u64,
+    /// The gateway's halt reason (`exec_gateway::stats::HALT_*`; 0 =
+    /// running).
+    pub halt_reason: u64,
+    /// Since the gateway's last heartbeat, ms (`u64::MAX` = none yet).
+    pub heartbeat_age_ms: u64,
+    /// The congestion word (`exec_gateway::stats::CONGESTION_*`).
+    pub congestion: u64,
+    /// The recent window's worst post round trip on a socket, ns (the REST
+    /// fallback's apart, XMM XH5c-3).
+    pub rtt_worst_ns: u64,
+    /// Post round trips on a socket since boot: p50, ns.
+    pub post_rtt_p50_ns: u64,
+    /// Post round trips on a socket since boot: p99, ns.
+    pub post_rtt_p99_ns: u64,
+    /// Post round trips on a socket since boot: the longest, ns.
+    pub post_rtt_max_ns: u64,
+    /// Posts sent by the REST fallback since boot — their own series, out
+    /// of the RTT word (XMM XH5c-3): p99, ns.
+    pub rest_rtt_p99_ns: u64,
+    /// Posts sent by the REST fallback since boot: the longest, ns.
+    pub rest_rtt_max_ns: u64,
+    /// Command push → its frame written, p99, ns.
+    pub push_to_write_p99_ns: u64,
+    /// Cancel written on a socket → its reply, p99, ns.
+    pub cancel_rtt_p99_ns: u64,
+    /// A fill's venue time → its local receipt, p99, ns.
+    pub fill_lag_p99_ns: u64,
+    /// `1` once the budget has been read.
+    pub budget_known: u64,
+    /// The address budget's headroom, requests (negative = past the
+    /// venue's cliff).
+    pub budget_remaining: i64,
+    /// The headroom cancels still have.
+    pub budget_cancel_remaining: i64,
+    /// The IP-weight window's sum (the last minute).
+    pub rate_ip_sum: u64,
+    /// The WebSocket-message window's sum (the last minute).
+    pub rate_ws_sum: u64,
+    /// Fees since boot, USD ×1e8 (signed; rebates negative).
+    pub fees_1e8: i64,
+    /// Perps whose leverage is dark (growth refused).
+    pub leverage_dark: u64,
+    /// The dead man's availability today: 0 unknown, 1 eligible,
+    /// 2 refused, 3 exhausted (parked until the next UTC day).
+    pub dm_availability: u64,
+    /// The deadline the venue may hold, venue ms (0 = none).
+    pub dm_deadline_ms: u64,
+    /// The dead man's triggers counted today.
+    pub dm_triggers_today: u64,
+    /// The slot's `EXEC_BLOCKED_*` bits — the router's word and the arm's.
+    pub health_blocked: u64,
+    /// The slot's positions without a fresh mark (XH2-C refuses growth).
+    pub unmarked_positions: u64,
+    /// The slot's resting notional, USD ×1e6.
+    pub resting_usd_1e6: i64,
+    /// `1` when the slot trades on an account of its own (XMM XH5b-2): its
+    /// worth is its P&L, judged against its anchor.
+    pub own_account: u64,
+    /// The session's P&L anchor, the account's worth USD ×1e6 (0 = none
+    /// yet).
+    pub pnl_anchor_usd_1e6: i64,
+    /// `1` once the anchor is durable — restored, or stored by its keeper:
+    /// the slot's first reconciliation waits for it.
+    pub anchor_kept: u64,
+    /// The account's worth, USD ×1e6: the perp sheet's value plus the spot
+    /// sheet's USDC (0 off an own account, or before both halves landed).
+    pub worth_usd_1e6: i64,
+    /// The session's P&L, USD ×1e6: the worth less the anchor, plus the
+    /// session's top-up spend (XMM XH5c-2, Q-XH5-2's add-back; 0 until
+    /// judged).
+    pub session_pnl_usd_1e6: i64,
+    /// The weight one top-up buys (`0`: off, stopped, or the buying ended —
+    /// the slot's halt, the shutdown) (XMM XH5c-2).
+    pub topup_weight: u64,
+    /// The weight bought — or possibly bought — on the UTC day counted
+    /// (`u64::MAX`: a state the boot could not read, the day spent).
+    pub topup_day_used: u64,
+    /// The session's top-up spend, USD ×1e6 — added back to its P&L,
+    /// bounded by the day's max instead.
+    pub topup_cost_usd_1e6: i64,
+}
+
+// XH4f: 94 words — pinned, as the other blocks crossing this boundary are.
+// XH5a: + `refused_foreign_row` (95). XMM XH5b-2: + the spot reads' two
+// counters and the own account's five levels (102). XMM XH5c-2: + the
+// top-ups' three counters and three levels (108). XMM XH5c-3: + the REST
+// round trips' p99 and maximum (110). XMM XH4i-5: + the outcome mode's
+// seventeen counters (127).
+const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 1_016);
+
+/// The Binance arm's local refusal reasons ([`BinanceArmReport::refused`]
+/// — `exec_binance::arm::Refusal`, pinned there).
+pub const BINANCE_REFUSALS: usize = 21;
+
+/// **BX11 — the Binance arm's own numbers**
+/// ([`OrderDispatch::binance_arm_report`]): its verbs, its gateway's
+/// tallies, its refusals by reason — counters, monotonic for the process —
+/// then its levels. Words are the arm's codes; `/state` spells them.
+/// Cold; filled in place.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BinanceArmReport {
+    /// `1` when filled.
+    pub present: u64,
+    /// The owner slot (BX-7: it owns every row).
+    pub slot: u64,
+    // ---- the arm's counters ----------------------------------------------
+    /// Orders the venue acknowledged.
+    pub acked: u64,
+    /// Cancels pushed to the gateway / the venue refused.
+    pub cancels_sent: u64,
+    /// See [`Self::cancels_sent`].
+    pub cancels_refused: u64,
+    /// Modifies pushed / refused / confirmed.
+    pub modifies_sent: u64,
+    /// See [`Self::modifies_sent`].
+    pub modifies_refused: u64,
+    /// See [`Self::modifies_sent`].
+    pub modified: u64,
+    /// Retirements and renames the arm's queues could not hold.
+    pub retired_dropped: u64,
+    /// See [`Self::retired_dropped`].
+    pub renamed_dropped: u64,
+    /// Budget observations (a 429 or 418: the quiet period) and venue
+    /// locks.
+    pub budget_obs: u64,
+    /// See [`Self::budget_obs`].
+    pub locks: u64,
+    /// Venue frames that did not scan (each a halt observation, BX-15).
+    pub scan_failed: u64,
+    /// Gateway events of a kind the arm does not know.
+    pub evt_unknown: u64,
+    /// Sweeps that ended STRANDED: orders possibly still resting.
+    pub sweeps_stranded: u64,
+    // ---- the gateway's tallies -------------------------------------------
+    /// Fills held back while the fill lane was full (then delivered).
+    pub fills_deferred: u64,
+    /// Jobs the gateway's queue could not take.
+    pub jobs_dropped: u64,
+    /// Orders put in doubt (their answer lost; resolved by query, BX-11).
+    pub in_doubt_raised: u64,
+    /// Journal records dropped on a full ring.
+    pub journal_dropped: u64,
+    /// Cancels the venue refused, owed and retried.
+    pub cancels_owed: u64,
+    /// Quiet periods (the venue's budget answer).
+    pub quiet: u64,
+    /// Hosts resolved again after failing dials.
+    pub dns_reresolved: u64,
+    /// User-stream events of a kind the arm does not act on (counted, never
+    /// booked: BX-15).
+    pub events_other: u64,
+    /// The arm's local refusals by reason (`exec_binance::arm::Refusal`).
+    pub refused: [u64; BINANCE_REFUSALS],
+    // ---- levels --------------------------------------------------------------
+    /// The arm admits orders now (the gateway ready and its status fresh).
+    pub ready: u64,
+    /// The order route is up / the user stream is up / the venue's
+    /// dead-man answers / the clock is measured (the last status's flags).
+    pub order_up: u64,
+    /// See [`Self::order_up`].
+    pub user_up: u64,
+    /// See [`Self::order_up`].
+    pub deadman_ok: u64,
+    /// See [`Self::order_up`].
+    pub clock_ok: u64,
+    /// The E7 anchor could not be stored (yet).
+    pub anchor_unsaved: u64,
+    /// Orders pushed and not yet terminal (resting makers included).
+    pub in_flight: u64,
+    /// Orders in doubt now.
+    pub in_doubt: u64,
+    /// The venue clock's offset, ms (venue − local).
+    pub clock_offset_ms: i64,
+    /// Since the gateway's last heartbeat, ms; `u64::MAX` = none yet.
+    pub heartbeat_age_ms: u64,
+    /// The gateway's congestion level, its halt word, the sweep's state
+    /// (`CancelAllState` as its `u8`).
+    pub congestion: u64,
+    /// See [`Self::congestion`].
+    pub halt_reason: u64,
+    /// See [`Self::congestion`].
+    pub sweep: u64,
+    /// The request weight spent in the last minute, and the arm's share of
+    /// the IP's minute (the governor's headroom is their difference).
+    pub weight_used: u64,
+    /// See [`Self::weight_used`].
+    pub weight_max: u64,
+    /// BX9: eapi's request weight spent in the last minute, and the
+    /// options lane's share of eapi's own minute (its pool, apart).
+    pub opt_weight_used: u64,
+    /// See [`Self::opt_weight_used`].
+    pub opt_weight_max: u64,
+    /// BX13 (R2-4): spot's request weight spent in the last minute, and the
+    /// spot lane's share of spot's own minute (its pool, apart).
+    pub spot_weight_used: u64,
+    /// See [`Self::spot_weight_used`].
+    pub spot_weight_max: u64,
+    /// BX13 (R2-2): spot's unfilled orders today as the arm mirrors them,
+    /// the BUYs' share and a SELL's ceiling, and `1` once the venue's own
+    /// count was read (no spot order before).
+    pub spot_day_unfilled: u64,
+    /// See [`Self::spot_day_unfilled`].
+    pub spot_day_cap: u64,
+    /// See [`Self::spot_day_unfilled`].
+    pub spot_sell_cap: u64,
+    /// See [`Self::spot_day_unfilled`].
+    pub spot_day_seeded: u64,
+    /// BX13 (R3-1): reconciliation cycles held inconclusive.
+    pub recon_held: u64,
+    /// The ORDERS pool's windows: placements in the last 10 s and minute,
+    /// and their caps.
+    pub orders_10s_used: u64,
+    /// See [`Self::orders_10s_used`].
+    pub orders_10s_cap: u64,
+    /// See [`Self::orders_10s_used`].
+    pub orders_1m_used: u64,
+    /// See [`Self::orders_10s_used`].
+    pub orders_1m_cap: u64,
+    /// What is left of the quiet period, ms (0: none).
+    pub quiet_left_ms: u64,
+    /// The margin ratio ×1e6, USDⓈ-M's and COIN-M's (maintenance over
+    /// equity; the unified account's on both in PM and PM Pro).
+    pub margin_usdm_1e6: i64,
+    /// See [`Self::margin_usdm_1e6`].
+    pub margin_coinm_1e6: i64,
+    /// BX9: the options account's (maintenance over adjusted equity).
+    pub margin_options_1e6: i64,
+    /// Rows on the owned list.
+    pub owned_rows: u64,
+    /// The account mode (`exec_binance::mode::AccountMode` as its `u8`)
+    /// and `1` on Demo (the battery; the engine trades mainnet only).
+    pub account_mode: u64,
+    /// See [`Self::account_mode`].
+    pub demo: u64,
+    /// The order route's round trip: p50, p99, the maximum; the cancel's
+    /// p99; a fill's venue-to-local lag p99; the REST round trip's p99; a
+    /// record's push to its write p99 — ns.
+    pub post_rtt_p50_ns: u64,
+    /// See [`Self::post_rtt_p50_ns`].
+    pub post_rtt_p99_ns: u64,
+    /// See [`Self::post_rtt_p50_ns`].
+    pub post_rtt_max_ns: u64,
+    /// See [`Self::post_rtt_p50_ns`].
+    pub cancel_rtt_p99_ns: u64,
+    /// See [`Self::post_rtt_p50_ns`].
+    pub fill_lag_p99_ns: u64,
+    /// See [`Self::post_rtt_p50_ns`].
+    pub rest_rtt_p99_ns: u64,
+    /// See [`Self::post_rtt_p50_ns`].
+    pub push_to_write_p99_ns: u64,
+}
+
+// BX11: 75 words — pinned, as the other blocks crossing this boundary are.
+// BX9: + the `not_writable` refusal, options' margin and eapi's weight (79).
+// BX13: + spot's weight, spot's day and the held cycles (86).
+const _: () = assert!(core::mem::size_of::<BinanceArmReport>() == 688);
+
+/// **BX3 (F9) — an accepted order that ended without a (further) fill**,
+/// as the arm tells the router ([`OrderDispatch::try_next_retired`]).
+/// 16 B, `Copy`, moved by value (under the 64 B bound).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Retired {
+    /// The member's client id of the order that ended.
+    pub client_oid: u64,
+    /// Its strategy slot.
+    pub slot: u8,
+    /// Why it ended: a `RETIRED_*` code.
+    pub why: u8,
+    /// Explicit padding.
+    _pad: [u8; 6],
+}
+
+impl Retired {
+    /// One retirement.
+    #[inline]
+    #[must_use]
+    pub const fn new(client_oid: u64, slot: u8, why: u8) -> Self {
+        Self {
+            client_oid,
+            slot,
+            why,
+            _pad: [0; 6],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<Retired>() == 16);
+
+/// **BX6 (BX3 obligation 2) — a modify the venue confirmed**, as a
+/// confirm-later arm tells the router ([`OrderDispatch::try_next_renamed`]):
+/// the resting row of `prev_client_oid` becomes `client_oid` at
+/// `qty_1e6`. 32 B, `Copy`, moved by value (under the 64 B bound).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Renamed {
+    /// The id the member replaced.
+    pub prev_client_oid: u64,
+    /// The id it replaced it with.
+    pub client_oid: u64,
+    /// The confirmed quantity ×1e6.
+    pub qty_1e6: i64,
+    /// The instrument (the engine's id).
+    pub sym: SymbolId,
+    /// The strategy slot.
+    pub slot: u8,
+    /// 1 for a buy.
+    pub buy: u8,
+    /// Explicit padding.
+    _pad: [u8; 2],
+}
+
+impl Renamed {
+    /// One confirmed modify.
+    #[inline]
+    #[must_use]
+    pub const fn new(prev_client_oid: u64, client_oid: u64, qty_1e6: i64, sym: SymbolId, slot: u8, buy: bool) -> Self {
+        Self {
+            prev_client_oid,
+            client_oid,
+            qty_1e6,
+            sym,
+            slot,
+            buy: buy as u8,
+            _pad: [0; 2],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<Renamed>() == 32);
+
+/// [`Retired::why`]: the venue refused the order after accepting it (a
+/// reverted swap, a post-acceptance reject).
+pub const RETIRED_REJECTED: u8 = 0;
+/// It expired: an IoC's unfilled remainder, a post-only that would have
+/// taken, a price-range expiry, a DAY order's end.
+pub const RETIRED_EXPIRED: u8 = 1;
+/// The venue cancelled it: self-trade prevention, a liquidation, a
+/// modify the venue turned into a cancel.
+pub const RETIRED_CANCELED_VENUE: u8 = 2;
+/// The gateway's own TTL cancelled it.
+pub const RETIRED_CANCELED_TTL: u8 = 3;
+/// The member's cancel, as the venue confirmed it.
+pub const RETIRED_CANCELED_MEMBER: u8 = 4;
+/// It filled completely.
+pub const RETIRED_FILLED: u8 = 5;
+/// Buckets the router counts retirements in: one per code above, and
+/// the last for a code no arm should send.
+pub const RETIRED_WHY_SLOTS: usize = 8;
+/// The bucket an undefined `why` is counted in.
+pub const RETIRED_WHY_UNKNOWN: usize = RETIRED_WHY_SLOTS - 1;
+
+/// **BX3 — a route alias**: an order on `sym` routes to `venue`, whatever
+/// venue byte its id carries. The one entry today is the M1 legacy
+/// anchor (`binance:btcusdt` is the flat id 7, whose byte reads 0 =
+/// Polymarket; plan §13.2 F10). 8 B; `venue == ROUTE_ALIAS_EMPTY`
+/// marks an unused entry.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RouteAlias {
+    /// The full id the alias matches (never a bare ordinal).
+    pub sym: SymbolId,
+    /// The venue byte it routes to.
+    pub venue: u8,
+    /// Explicit padding.
+    _pad: [u8; 3],
+}
+
+/// [`RouteAlias::venue`] of an unused entry.
+pub const ROUTE_ALIAS_EMPTY: u8 = 0xFF;
+/// Aliases one table holds.
+pub const ROUTE_ALIASES_MAX: usize = 4;
+
+/// Why [`RouteAliases::with`] refused an entry. Boot-only; fatal.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RouteAliasErr {
+    /// `SYMBOL_ID_NONE` is not an instrument.
+    NoneSym,
+    /// [`ROUTE_ALIAS_EMPTY`] is not a venue.
+    BadVenue,
+    /// That sym already has an alias.
+    Duplicate,
+    /// Every entry is taken.
+    Full,
+}
+
+/// **BX3 — the boot-fixed alias table** every router-side lookup of an
+/// order's route venue consults: the router's `venue_allowed` check and
+/// `exec_router::VenueSplit`'s arm choice. Built once at boot and copied
+/// by value into each (32 B). Never consulted by `ExecRoute`, the
+/// ledger, captures or the backtest model — the order bytes are
+/// untouched.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RouteAliases {
+    entries: [RouteAlias; ROUTE_ALIASES_MAX],
+}
+
+impl RouteAliases {
+    /// No alias: every order routes by its own venue byte.
+    pub const NONE: Self = Self {
+        entries: [RouteAlias {
+            sym: core_types::SYMBOL_ID_NONE,
+            venue: ROUTE_ALIAS_EMPTY,
+            _pad: [0; 3],
+        }; ROUTE_ALIASES_MAX],
+    };
+
+    /// Boot: the table with one more alias.
+    ///
+    /// # Errors
+    /// [`RouteAliasErr`] — a `NONE` sym, the empty venue, a sym already
+    /// aliased, or a full table.
+    pub const fn with(mut self, sym: SymbolId, venue: u8) -> Result<Self, RouteAliasErr> {
+        if sym == core_types::SYMBOL_ID_NONE {
+            return Err(RouteAliasErr::NoneSym);
+        }
+        if venue == ROUTE_ALIAS_EMPTY {
+            return Err(RouteAliasErr::BadVenue);
+        }
+        let mut i = 0usize;
+        while i < ROUTE_ALIASES_MAX {
+            if self.entries[i].venue != ROUTE_ALIAS_EMPTY && self.entries[i].sym == sym {
+                return Err(RouteAliasErr::Duplicate);
+            }
+            i += 1;
+        }
+        let mut i = 0usize;
+        while i < ROUTE_ALIASES_MAX {
+            if self.entries[i].venue == ROUTE_ALIAS_EMPTY {
+                self.entries[i] = RouteAlias {
+                    sym,
+                    venue,
+                    _pad: [0; 3],
+                };
+                return Ok(self);
+            }
+            i += 1;
+        }
+        Err(RouteAliasErr::Full)
+    }
+
+    /// **The venue an order on `sym` stamped `venue` routes to. Hot
+    /// path:** four full-id compares, unrolled, no branch the steady
+    /// state mispredicts; an empty entry never matches.
+    #[inline(always)]
+    #[must_use]
+    pub fn route_venue(&self, sym: SymbolId, venue: u8) -> u8 {
+        let e = &self.entries;
+        let mut v = venue;
+        if e[0].sym == sym && e[0].venue != ROUTE_ALIAS_EMPTY {
+            v = e[0].venue;
+        }
+        if e[1].sym == sym && e[1].venue != ROUTE_ALIAS_EMPTY {
+            v = e[1].venue;
+        }
+        if e[2].sym == sym && e[2].venue != ROUTE_ALIAS_EMPTY {
+            v = e[2].venue;
+        }
+        if e[3].sym == sym && e[3].venue != ROUTE_ALIAS_EMPTY {
+            v = e[3].venue;
+        }
+        v
+    }
+
+    /// Aliases in the table. Cold; boot tell.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        let mut n = 0usize;
+        let mut i = 0usize;
+        while i < ROUTE_ALIASES_MAX {
+            n += (self.entries[i].venue != ROUTE_ALIAS_EMPTY) as usize;
+            i += 1;
+        }
+        n
+    }
+
+    /// No alias at all.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for RouteAliases {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<RouteAlias>() == 8);
+const _: () = assert!(core::mem::size_of::<RouteAliases>() == 32);
+// Four unrolled compares in `route_venue`: the table cannot grow
+// without that body growing too.
+const _: () = assert!(ROUTE_ALIASES_MAX == 4);
 
 /// **What the venue has told us about a requested cancel-all.**
 ///
@@ -834,13 +2034,33 @@ pub struct HaltSignal {
     /// the arm know about the venue?") answered by the same poll.
     pub reconciled: u8,
     /// `1` when the E7 session bound may be judged: the arm has an
-    /// anchor (the spot USDC at its first flat reconciliation) AND the
-    /// account holds no outcome leg right now. `0` otherwise — an open
-    /// position's premium is not a loss, an unsettled win is not a
-    /// gain.
-    pub pnl_flat: u8,
-    /// Explicit padding.
-    _pad: [u8; 5],
+    /// anchor and has read the account since boot. Held legs no longer
+    /// withdraw it — the arm values them at COST, so an open
+    /// position's premium is not a loss and an unsettled win is not a
+    /// gain (S7-L1, gap B: a book that was never flat was never
+    /// judged). `0` otherwise.
+    pub pnl_judged: u8,
+    /// **BX3** `1` when the venue has imposed a restriction on this
+    /// arm's account: a 418 ban, a reduce-only or region lock, the
+    /// options `REDUCE_ONLY` risk level, a fired dead-man, an account
+    /// mode or permission change mid-session. The router halts on it
+    /// (`VenueLock`); no threshold, like the budget floor.
+    pub venue_lock: u8,
+    /// **BX3 (D6, O-BX18)** `1` when the arm judged a margin ratio at or
+    /// past the slot's `halt_on_margin_ratio_1e6`, or saw a
+    /// `MARGIN_CALL`. The arm holds the per-slot threshold and reports
+    /// the verdict; the router halts on it (`MarginRisk`).
+    pub margin_risk: u8,
+    /// XH4d: `1` when the arm's order gateway has halted (its halt
+    /// word): it places for nobody, and an event it could not deliver
+    /// may be lost, so the arm no longer knows what rests. Reported and
+    /// never thresholded — like the budget floor, no slot opts out.
+    pub gateway_halted: u8,
+    /// XH4d, XH-7: post-only crosses among the arm's last ALO answers,
+    /// permille (`0` until the window holds enough answers to mean
+    /// something). A cross is information, not a fault — it never
+    /// feeds `reject_streak` — until it is most of what the quotes meet.
+    pub alo_reject_permille: u16,
     /// Nanoseconds since the last reconciliation that AGREED. `0` =
     /// never (the seeding interlock already refuses that case). Once
     /// an arm has agreed with the venue, a reconciler that stops
@@ -850,14 +2070,15 @@ pub struct HaltSignal {
     /// silently disabled while the arm kept trading (E7 review,
     /// 2026-09-19). Compared against `halt_on_recon_stale_ms`.
     pub recon_age_ns: u64,
-    /// E7 session bound: the account's spot USDC minus the anchor,
-    /// USD ×1e6, as of the last reconciliation. Meaningful only while
-    /// [`Self::pnl_flat`] is set; `0` otherwise.
+    /// E7 session bound: the account's equity at cost (spot USDC plus
+    /// the held legs' cost basis) minus the anchor, USD ×1e6, as of
+    /// the last reconciliation. Meaningful only while
+    /// [`Self::pnl_judged`] is set; `0` otherwise.
     pub pnl_delta_usd_1e6: i64,
 }
 
 impl HaltSignal {
-    /// Build a signal with the session bound unobserved (`pnl_flat`
+    /// Build a signal with the session bound unobserved (`pnl_judged`
     /// 0). The arm is the only caller; see [`Self::with_pnl`].
     #[inline]
     #[must_use]
@@ -877,25 +2098,116 @@ impl HaltSignal {
             asset_refusal_streak,
             budget_floor_breached: budget_floor_breached as u8,
             reconciled: reconciled as u8,
-            pnl_flat: 0,
-            _pad: [0; 5],
+            pnl_judged: 0,
+            venue_lock: 0,
+            margin_risk: 0,
+            gateway_halted: 0,
+            alo_reject_permille: 0,
             recon_age_ns,
             pnl_delta_usd_1e6: 0,
         }
     }
 
-    /// E7: attach the session-bound reading — `flat` says the bound
-    /// may be judged, `delta` is spot USDC minus the anchor.
+    /// E7: attach the session-bound reading — `judged` says the bound
+    /// may be judged, `delta` is the equity at cost minus the anchor.
     #[inline]
     #[must_use]
-    pub const fn with_pnl(mut self, flat: bool, delta_usd_1e6: i64) -> Self {
-        self.pnl_flat = flat as u8;
+    pub const fn with_pnl(mut self, judged: bool, delta_usd_1e6: i64) -> Self {
+        self.pnl_judged = judged as u8;
         self.pnl_delta_usd_1e6 = delta_usd_1e6;
         self
+    }
+
+    /// XH4d: attach the arm's ALO window (XH-7), permille.
+    #[inline]
+    #[must_use]
+    pub const fn with_alo_reject_permille(mut self, permille: u16) -> Self {
+        self.alo_reject_permille = permille;
+        self
+    }
+
+    /// XH4d: attach whether the arm's order gateway has halted.
+    #[inline]
+    #[must_use]
+    pub const fn with_gateway_halted(mut self, halted: bool) -> Self {
+        self.gateway_halted = halted as u8;
+        self
+    }
+
+    /// BX3: attach the venue's verdicts — a restriction it imposed, and
+    /// the arm's margin judgement.
+    #[inline]
+    #[must_use]
+    pub const fn with_venue(mut self, venue_lock: bool, margin_risk: bool) -> Self {
+        self.venue_lock = venue_lock as u8;
+        self.margin_risk = margin_risk as u8;
+        self
+    }
+
+    /// **BX3 (O-BX17) — one slot's signal from two arms that both
+    /// trade it.** The worse of each observation: the MAX of the
+    /// streaks, the drift, the stream gap, the reconciliation age and the
+    /// ALO rate; the OR of the flags that trip a halt; the AND of the two
+    /// that permit trading (`reconciled`, `pnl_judged`) — a slot is
+    /// seeded, and its session bound judged, only when both arms can say
+    /// so; the SUM of the session P&L. Symmetric: `a.merged(b) ==
+    /// b.merged(a)`.
+    #[inline]
+    #[must_use]
+    pub const fn merged(self, o: Self) -> Self {
+        const fn max_u64(a: u64, b: u64) -> u64 {
+            if a > b {
+                a
+            } else {
+                b
+            }
+        }
+        const fn max_i64(a: i64, b: i64) -> i64 {
+            if a > b {
+                a
+            } else {
+                b
+            }
+        }
+        const fn max_u32(a: u32, b: u32) -> u32 {
+            if a > b {
+                a
+            } else {
+                b
+            }
+        }
+        const fn max_u16(a: u16, b: u16) -> u16 {
+            if a > b {
+                a
+            } else {
+                b
+            }
+        }
+        Self {
+            ws_gap_ns: max_u64(self.ws_gap_ns, o.ws_gap_ns),
+            recon_drift_usd_1e6: max_i64(self.recon_drift_usd_1e6, o.recon_drift_usd_1e6),
+            reject_streak: max_u32(self.reject_streak, o.reject_streak),
+            asset_refusal_streak: max_u32(self.asset_refusal_streak, o.asset_refusal_streak),
+            budget_floor_breached: ((self.budget_floor_breached | o.budget_floor_breached) != 0)
+                as u8,
+            reconciled: ((self.reconciled != 0) & (o.reconciled != 0)) as u8,
+            pnl_judged: ((self.pnl_judged != 0) & (o.pnl_judged != 0)) as u8,
+            venue_lock: ((self.venue_lock | o.venue_lock) != 0) as u8,
+            margin_risk: ((self.margin_risk | o.margin_risk) != 0) as u8,
+            gateway_halted: ((self.gateway_halted | o.gateway_halted) != 0) as u8,
+            alo_reject_permille: max_u16(self.alo_reject_permille, o.alo_reject_permille),
+            recon_age_ns: max_u64(self.recon_age_ns, o.recon_age_ns),
+            pnl_delta_usd_1e6: self.pnl_delta_usd_1e6.saturating_add(o.pnl_delta_usd_1e6),
+        }
     }
 }
 
 const _: () = assert!(core::mem::size_of::<HaltSignal>() == 48);
+const _: () = assert!(core::mem::offset_of!(HaltSignal, venue_lock) == 27);
+const _: () = assert!(core::mem::offset_of!(HaltSignal, margin_risk) == 28);
+const _: () = assert!(core::mem::offset_of!(HaltSignal, gateway_halted) == 29);
+const _: () = assert!(core::mem::offset_of!(HaltSignal, alo_reject_permille) == 30);
+const _: () = assert!(core::mem::offset_of!(HaltSignal, recon_age_ns) == 32);
 
 /// Strategy slots [`ExecCounters`] reports on. Mirrors
 /// `exec_router::EXEC_SLOTS`; the two are asserted equal in
@@ -919,6 +2231,9 @@ pub struct ExecCounters {
     pub configured: u8,
     /// Per-slot `ExecMode as u8`. Only meaningful when `configured`.
     pub modes: [u8; EXEC_COUNTER_SLOTS],
+    /// **BX6** — `1` when [`Self::arm_bn`] holds a Binance arm's numbers.
+    /// (Sits in what was padding: no offset after it moves.)
+    pub arm_bn_present: u8,
     /// Orders routed to the live arm.
     pub live_submits: u64,
     /// Orders routed to the paper matcher.
@@ -930,7 +2245,8 @@ pub struct ExecCounters {
     pub refused_no_route: u64,
     /// **E6: refused by the risk gate** — the SUM of every clamp's
     /// refusals (`max_order_usd`, `cap_instance_usd`, `cap_day_usd`,
-    /// `max_open_orders`, the seeding interlock, the halt latch).
+    /// `max_open_orders`, the seeding interlock, the halt latch and,
+    /// since BX3, the instrument laws' `short` and `unpriced`).
     /// Only the `max_order_usd` share still means "the member and the
     /// operator disagreed"; the rest mean the operator's ceiling was
     /// reached, which is the clamp working. An alert belongs on
@@ -950,6 +2266,14 @@ pub struct ExecCounters {
     /// boot and zero thereafter; a value that keeps climbing means
     /// the arm never reached the venue.
     pub refused_unseeded: u64,
+    /// **BX3 — refused by an instrument law**: a spot sell past the
+    /// holding, or a short on an option that is not writable. A subset
+    /// of `refused_risk`.
+    pub refused_short: u64,
+    /// **BX3 — refused as unpriceable on a Binance instrument row**: a
+    /// non-positive price, a Binance-routed order with no instrument
+    /// row, or a short option with no index. A subset of `refused_risk`.
+    pub refused_unpriced: u64,
     /// Halt edges — slots that went from running to halted.
     pub halts: u64,
     /// Cancel-all requests the arm would not accept.
@@ -992,8 +2316,20 @@ pub struct ExecCounters {
     pub ledger_resting_ambiguous: u64,
     /// Settle frames that matched no bound row.
     pub ledger_settles_unmatched: u64,
+    /// **BX3 (F9) — retirements drained, by `why`** (index = the
+    /// `RETIRED_*` code; [`RETIRED_WHY_UNKNOWN`] counts every undefined
+    /// code, and index 6 is never counted).
+    pub retired: [u64; RETIRED_WHY_SLOTS],
     /// The live arm's own numbers. Zeroed when there is no arm.
     pub arm: LiveArmCounters,
+    /// **BX6 (obligation 6)** — venue marks the ledger refused as
+    /// insane (a mark off its index by more than the law allows).
+    pub ledger_marks_refused: u64,
+    /// Rows whose mark went stale and stopped pricing.
+    pub ledger_marks_expired: u64,
+    /// **BX6** — the Binance arm's own numbers (`/state`
+    /// `exec.arms.binance`), valid when [`Self::arm_bn_present`].
+    pub arm_bn: LiveArmCounters,
 }
 
 /// X1 counters — what the matcher did, mirrored to `/metrics` as
@@ -1049,7 +2385,34 @@ pub struct MatcherCounters {
     /// still resting, and until it does the slot cannot name its own
     /// orders.
     pub ambiguous_order: u64,
+    /// HYPARB H2: AMM swaps that filled (also counted in `fills`).
+    pub amm_fills: u64,
+    /// HYPARB H2: AMM swaps judged and not filled, or dropped by a
+    /// chain-wide stream break — a swap never rests.
+    pub amm_canceled: u64,
+    /// HYPARB H2: AMM fills smaller than the order (the active range's
+    /// boundary or the price limit stopped the walk).
+    pub amm_partial: u64,
+    /// HYPARB H2: AMM swaps canceled because their pool was not
+    /// judgeable (never snapshotted, stale after a gap, edge-bound).
+    pub amm_not_live: u64,
+    /// XMM XH2: post-only orders the queue law took (also in `intake`).
+    pub queue_placed: u64,
+    /// XMM XH2: queue orders that landed and rest.
+    pub queue_rested: u64,
+    /// XMM XH2: queue orders rejected on landing for crossing
+    /// (`BAD_ALO_PX`) — information, not a fault (XH-7).
+    pub queue_rejected_alo: u64,
+    /// XMM XH2: queue orders cancelled — requested, replaced or expired.
+    pub queue_canceled: u64,
+    /// XMM XH2: queue fills (also in `fills`).
+    pub queue_fills: u64,
+    /// XMM XH2: order events dropped because the event ring was full
+    /// between two pumps. Must stay 0: the engine pumps every iteration.
+    pub order_events_overflow: u64,
 }
+
+const _: () = assert!(::core::mem::size_of::<MatcherCounters>() == 176);
 
 /// One order the paper matcher is holding.
 #[repr(C)]
@@ -1139,16 +2502,61 @@ pub struct PaperMatcher {
     open: [Pending; core_fill::MAX_OPEN_TOTAL],
     open_len: usize,
     /// Fills waiting for [`Self::try_next_fill`], FIFO.
-    out: [Fill; core_fill::MAX_OPEN_TOTAL],
+    out: [Fill; FILL_OUT],
     out_head: usize,
     out_len: usize,
-    /// Activation Δ by model venue byte (index 7 is unused padding so
-    /// a garbage byte cannot index out of bounds).
-    activation_ns: [u64; 8],
+    /// Activation Δ by model venue byte ([`core_fill::ACTIVATION_NS_DEFAULT`]
+    /// verbatim; a byte past its end is refused in [`Self::submit`]
+    /// before it can index anything).
+    activation_ns: [u64; core_types::VENUE_COUNT],
     seq: u64,
+    /// HYPARB H2: pool state for AMM swaps, rebuilt from the pool-event
+    /// signals ([`Self::observe_amm`]) — `core_fill::AmmBook`, the same
+    /// book the harness replays.
+    amm: core_fill::AmmBook,
+    /// XMM XH2: post-only makers on a queue venue, judged by the queue
+    /// law — `core_fill::QueueBook`, the same book the harness replays.
+    /// Its own table (32 orders, 8 symbols): the queue member cannot
+    /// crowd the strict-cross members' 64 slots, nor they its.
+    queue: core_fill::QueueBook,
+    /// HC11 (O-HC21): Hypercall IoCs, judged by the held-quote law —
+    /// the provider's quote in force 2 s after submit
+    /// (`core_fill::held`). Its own table: the strict-cross members'
+    /// 64 slots are not shared with it.
+    held: core_fill::held::HeldBook,
+    /// XMM XH2: order events waiting for [`Self::try_next_order_event`],
+    /// FIFO.
+    events: [core_types::OrderEvent; ORDER_EVENT_OUT],
+    ev_head: usize,
+    ev_len: usize,
     /// What the matcher did.
     pub counters: MatcherCounters,
 }
+
+/// XMM XH2: the paper matcher's order-event ring. One engine iteration
+/// drains many ticks and prints before it pumps, and one queue call can
+/// emit three events per queue order, so the ring holds several calls'
+/// worth; an overflow is counted (`order_events_overflow`), never
+/// silent.
+const ORDER_EVENT_OUT: usize = 256;
+
+/// The paper matcher's fill ring. X1 sized it at [`core_fill::MAX_OPEN_TOTAL`]
+/// ("one tick can produce at most that many fills"); XMM XH2's prints
+/// can partially fill a queue order once per print, and one iteration
+/// drains many prints before the pump, so it is four times that. The
+/// size changes nothing until the old ring would have overflowed.
+const FILL_OUT: usize = 4 * core_fill::MAX_OPEN_TOTAL;
+
+const EMPTY_ORDER_EVENT: core_types::OrderEvent = core_types::OrderEvent::new(
+    0,
+    core_types::VenueId::Hyperliquid,
+    core_types::SYMBOL_ID_NONE,
+    0,
+    core_types::STRATEGY_ID_NONE,
+    core_types::ORDER_EVENT_NONE,
+    core_types::ORDER_EVENT_REASON_NONE,
+    0,
+);
 
 impl Default for PaperMatcher {
     fn default() -> Self {
@@ -1165,11 +2573,17 @@ impl PaperMatcher {
         Self {
             open: [EMPTY_PENDING; core_fill::MAX_OPEN_TOTAL],
             open_len: 0,
-            out: [EMPTY_FILL; core_fill::MAX_OPEN_TOTAL],
+            out: [EMPTY_FILL; FILL_OUT],
             out_head: 0,
             out_len: 0,
-            activation_ns: [d[0], d[1], d[2], d[3], d[4], d[5], d[6], 0],
+            activation_ns: d,
             seq: 0,
+            amm: core_fill::AmmBook::new(),
+            queue: core_fill::QueueBook::new(),
+            held: core_fill::held::HeldBook::new(),
+            events: [EMPTY_ORDER_EVENT; ORDER_EVENT_OUT],
+            ev_head: 0,
+            ev_len: 0,
             counters: MatcherCounters {
                 intake: 0,
                 rejected_open_cap: 0,
@@ -1183,6 +2597,16 @@ impl PaperMatcher {
                 no_such_order: 0,
                 identity_mismatch: 0,
                 ambiguous_order: 0,
+                amm_fills: 0,
+                amm_canceled: 0,
+                amm_partial: 0,
+                amm_not_live: 0,
+                queue_placed: 0,
+                queue_rested: 0,
+                queue_rejected_alo: 0,
+                queue_canceled: 0,
+                queue_fills: 0,
+                order_events_overflow: 0,
             },
         }
     }
@@ -1206,13 +2630,69 @@ impl PaperMatcher {
         let venue = core_types::symbol_venue_byte(order.sym);
         let px = order.px.raw();
         let qty = order.qty.raw();
+        // MX2 / O-MX1: MEXC (venue byte 7) is data-only — its activation
+        // slot exists because the table is venue-byte indexed, but no
+        // order on it is ever modelled, exactly as the harness's
+        // `tradeable_venue_byte` refuses it. Before MX2 the byte sat past
+        // the table's end and was refused by the length check; this
+        // keeps that behaviour bit for bit.
+        //
+        // HC11 (O-HC21): a Hypercall (venue byte 9) IoC is judged by the
+        // held-quote law in its own table; anything else on Hypercall —
+        // a maker, which the venue cannot honour post-only — is
+        // unmodellable.
+        if venue == core_types::VenueId::Hypercall.to_u8() {
+            if order.kind == core_fill::ORDER_KIND_IOC && px > 0 && qty > 0 {
+                let o = core_fill::held::HeldOrder::new(
+                    now_ns.saturating_add(core_fill::held::HELD_DELAY_NS),
+                    order.sym,
+                    order.side,
+                    px,
+                    qty,
+                    order.client_oid,
+                    order.strategy_id,
+                    order.venue,
+                );
+                if self.held.submit(o) {
+                    self.counters.intake = self.counters.intake.wrapping_add(1);
+                } else if core_fill::held::held_index(order.sym).is_none() {
+                    self.counters.unroutable = self.counters.unroutable.wrapping_add(1);
+                } else {
+                    self.counters.rejected_open_cap =
+                        self.counters.rejected_open_cap.wrapping_add(1);
+                }
+            } else {
+                self.counters.unroutable = self.counters.unroutable.wrapping_add(1);
+            }
+            return;
+        }
+        //
+        // HYPARB H2: HyperEVM (venue byte 8) takes AMM swaps on a known
+        // pool slot and nothing else; every other venue takes makers and
+        // IoCs and never a swap.
+        let kind_ok = if venue == core_types::VenueId::HyperEvm.to_u8() {
+            order.kind == core_fill::ORDER_KIND_AMM_SWAP
+                && core_fill::amm_pool_index(order.sym).is_some()
+        } else {
+            order.kind == core_fill::ORDER_KIND_MAKER || order.kind == core_fill::ORDER_KIND_IOC
+        };
+        // HK-R4: a Binance option is a signal leg only (the harness
+        // refuses it the same way, `core_fill::signal_only_sym`).
         if venue as usize >= core_fill::ACTIVATION_NS_DEFAULT.len()
+            || venue == core_types::VenueId::Mexc.to_u8()
+            || core_fill::signal_only_sym(order.sym)
             || px <= 0
             || qty <= 0
-            || (order.kind != core_fill::ORDER_KIND_MAKER
-                && order.kind != core_fill::ORDER_KIND_IOC)
+            || !kind_ok
         {
             self.counters.unroutable = self.counters.unroutable.wrapping_add(1);
+            return;
+        }
+        // XMM XH2: a post-only maker on a queue venue is judged by the
+        // queue law, in its own table. No order before XH2 carried the
+        // flag, so every other path below is untouched.
+        if core_fill::judged_by_queue(venue, order.kind, order.flags) {
+            self.submit_queue(order, venue, now_ns);
             return;
         }
         let mut sym_count = 0usize;
@@ -1297,10 +2777,7 @@ impl PaperMatcher {
     pub fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
         let i = match self.find_resting(req.client_oid, req.strategy_id) {
             Resting::One(i) => i,
-            Resting::None => {
-                self.counters.no_such_order = self.counters.no_such_order.wrapping_add(1);
-                return Err(DispatchError::NoSuchOrder);
-            }
+            Resting::None => return self.cancel_queue(req),
             Resting::Many => {
                 self.counters.ambiguous_order = self.counters.ambiguous_order.wrapping_add(1);
                 return Err(DispatchError::AmbiguousOrder);
@@ -1356,10 +2833,7 @@ impl PaperMatcher {
     pub fn modify(&mut self, req: &ModifyReq, now_ns: NsTs) -> Result<(), DispatchError> {
         let i = match self.find_resting(req.prev_client_oid(), req.order().strategy_id) {
             Resting::One(i) => i,
-            Resting::None => {
-                self.counters.no_such_order = self.counters.no_such_order.wrapping_add(1);
-                return Err(DispatchError::NoSuchOrder);
-            }
+            Resting::None => return self.modify_queue(req, now_ns),
             Resting::Many => {
                 self.counters.ambiguous_order = self.counters.ambiguous_order.wrapping_add(1);
                 return Err(DispatchError::AmbiguousOrder);
@@ -1398,6 +2872,32 @@ impl PaperMatcher {
     /// fill pass in emit order over one shared displayed-size budget.
     pub fn observe_tick(&mut self, tick: &Tick, now_ns: NsTs) {
         let sym = tick.sym;
+        // HC11 (O-HC21): the held-quote law — every due Hypercall IoC is
+        // judged at the first record of ANY venue STAMPED at or after its
+        // due instant, against the quote held BEFORE this record is
+        // applied (so nothing after the instant leaks into the verdict);
+        // then a Hypercall quote becomes the one in force. The record's
+        // own stamp is the clock, not the drain instant: a quote stamped
+        // before the due instant but drained after it is still in force.
+        if self.held.pending_len() > 0 {
+            self.judge_held(tick.ts_ns, now_ns);
+        }
+        if core_types::symbol_venue_byte(sym) == core_types::VenueId::Hypercall.to_u8() {
+            self.held.on_quote(tick);
+        }
+        // XMM XH2: the queue law's book. Every record of the symbol lands
+        // what is due (a cancel or an expiry is never held back by a quiet
+        // or degraded feed); only fresh two-sided evidence teaches it the
+        // touch. One table lookup for any other venue.
+        if core_fill::queue_venue(core_types::symbol_venue_byte(sym)) {
+            let touch = if core_fill::is_fill_evidence(tick) {
+                core_fill::Touch::of(tick)
+            } else {
+                core_fill::Touch::default()
+            };
+            self.queue.on_book(sym, touch, now_ns);
+            self.drain_queue();
+        }
         let mut i = 0usize;
         while i < self.open_len {
             if self.open[i].ident.sym == sym
@@ -1464,39 +2964,401 @@ impl PaperMatcher {
         }
     }
 
+    /// HYPARB H2: apply one pool-event signal and, on a new HEAD, judge
+    /// every activated AMM swap in emit order against its pool
+    /// (`core_fill::amm` states the law). A chain-wide GAP cancels every
+    /// open swap: across a stream break a transaction's fate is unknown.
+    pub fn observe_amm(&mut self, sym: SymbolId, payload: &[u8; 40], now_ns: NsTs) {
+        match self.amm.observe(sym, payload) {
+            core_fill::AmmObs::Head { .. } => self.judge_amm_orders(now_ns),
+            core_fill::AmmObs::Gap => {
+                let mut i = 0usize;
+                while i < self.open_len {
+                    if self.open[i].ident.kind == core_fill::ORDER_KIND_AMM_SWAP {
+                        self.counters.amm_canceled = self.counters.amm_canceled.wrapping_add(1);
+                        self.remove_open(i);
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The HEAD pass: TTL first (a clock fact), then each activated swap
+    /// is judged ONCE and leaves the table either way.
+    fn judge_amm_orders(&mut self, now_ns: NsTs) {
+        let mut i = 0usize;
+        while i < self.open_len {
+            let o = self.open[i];
+            if o.ident.kind != core_fill::ORDER_KIND_AMM_SWAP {
+                i += 1;
+                continue;
+            }
+            if core_fill::expired_at(now_ns, o.expiry_ns) {
+                self.counters.ttl_expired = self.counters.ttl_expired.wrapping_add(1);
+                self.remove_open(i);
+                continue;
+            }
+            if now_ns < o.t_active_ns {
+                i += 1;
+                continue;
+            }
+            let v = match core_fill::amm_pool_index(o.ident.sym) {
+                Some(idx) => self.amm.judge(idx, o.ident.side, o.px_1e6, o.remaining_1e6),
+                // Unreachable: `submit` admits only pool slots.
+                None => core_fill::AmmVerdict::NOT_LIVE,
+            };
+            match v.verdict {
+                core_fill::Verdict::Fill { px_1e6, qty_1e6 } => {
+                    self.push_fill(&o, px_1e6, qty_1e6, now_ns);
+                    self.counters.amm_fills = self.counters.amm_fills.wrapping_add(1);
+                    if qty_1e6 < o.remaining_1e6 {
+                        self.counters.amm_partial = self.counters.amm_partial.wrapping_add(1);
+                    }
+                }
+                _ => {
+                    self.counters.amm_canceled = self.counters.amm_canceled.wrapping_add(1);
+                    if v.pool_not_live() {
+                        self.counters.amm_not_live = self.counters.amm_not_live.wrapping_add(1);
+                    }
+                }
+            }
+            self.remove_open(i);
+        }
+    }
+
+    /// HYPARB H2: the AMM book's own counters.
+    #[inline]
+    #[must_use]
+    pub const fn amm_book_counters(&self) -> core_fill::AmmBookCounters {
+        self.amm.counters
+    }
+
+    /// XMM XH2: track `sym`'s touch for the queue law (see
+    /// [`OrderDispatch::track_queue_sym`]). A ninth symbol is refused
+    /// and counted with the open-cap refusals: its orders will be too.
+    pub fn track_queue_sym(&mut self, sym: SymbolId) {
+        if self.queue.track(sym).is_err() {
+            self.counters.rejected_open_cap = self.counters.rejected_open_cap.wrapping_add(1);
+        }
+    }
+
+    /// XMM XH2: one trade print for the queue law — the prints of a
+    /// queue venue consume the queue ahead of our post-only makers and
+    /// fill them. One table lookup for any other venue.
+    pub fn observe_trade(&mut self, print: &core_types::TradePrint, now_ns: NsTs) {
+        if !core_fill::queue_venue(core_types::symbol_venue_byte(print.sym)) {
+            return;
+        }
+        let sell = print.aggressor == core_types::TRADE_AGGRESSOR_SELL;
+        self.queue.on_print(print.sym, print.px_1e6, print.qty_1e6, sell, now_ns);
+        self.drain_queue();
+    }
+
+    /// XMM XH2: write the next order event into `out`, FIFO; `false`
+    /// when there is none.
+    pub fn try_next_order_event(&mut self, out: &mut core_types::OrderEvent) -> bool {
+        if self.ev_len == 0 {
+            return false;
+        }
+        // COPY: one 64 B slot out of the ring into the caller's scratch —
+        // the event must outlive the slot, because the member is handed it
+        // through a ctx that holds `&mut` this dispatcher.
+        *out = self.events[self.ev_head];
+        self.ev_head = (self.ev_head + 1) % ORDER_EVENT_OUT;
+        self.ev_len -= 1;
+        true
+    }
+
+    /// XMM XH2: queue orders held (pending or resting).
+    #[inline]
+    #[must_use]
+    pub const fn queue_len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// The counters, with the queue law's own folded in.
+    #[must_use]
+    pub const fn counters_snapshot(&self) -> MatcherCounters {
+        let q = self.queue.counters;
+        let mut c = self.counters;
+        c.queue_placed = q.placed;
+        c.queue_rested = q.rested;
+        c.queue_rejected_alo = q.rejected_alo;
+        c.queue_canceled = q.canceled;
+        c.queue_fills = q.fills;
+        c
+    }
+
+    /// XMM XH2: take a post-only maker into the queue law. It lands at
+    /// the first record of its symbol at or after `now + Δ_venue`; its
+    /// TTL is a cancel scheduled at `emit + ttl`. A refusal (the table
+    /// or its symbols are full) is counted and ANSWERED — the member
+    /// waits on an event for every post-only order it sends.
+    fn submit_queue(&mut self, order: &Order, venue: u8, now_ns: NsTs) {
+        let expiry = core_fill::expiry_at(order.ts_ns, order.ttl_ns);
+        let p = core_fill::QueuePlace {
+            client_oid: order.client_oid,
+            sym: order.sym,
+            side: order.side,
+            slot: order.strategy_id,
+            px_1e6: order.px.raw(),
+            qty_1e6: order.qty.raw(),
+            ready_ns: now_ns.saturating_add(self.activation_ns[venue as usize]),
+            expiry_ns: if expiry == 0 { core_fill::QUEUE_NEVER } else { expiry },
+        };
+        match self.queue.place(&p) {
+            Ok(()) => self.counters.intake = self.counters.intake.wrapping_add(1),
+            Err(_) => {
+                self.counters.rejected_open_cap = self.counters.rejected_open_cap.wrapping_add(1);
+                self.push_event(
+                    now_ns,
+                    order.sym,
+                    order.client_oid,
+                    order.strategy_id,
+                    core_types::ORDER_EVENT_REJECTED,
+                    core_types::ORDER_EVENT_REASON_OTHER,
+                );
+            }
+        }
+    }
+
+    /// XMM XH2: a cancel that found nothing in the strict table. A queue
+    /// order of that slot and id gets a cancel that lands at the first
+    /// record at or after `ts + Δ_venue` — ahead of that block's prints —
+    /// and `Ok` says the cancel was SENT: the order may still fill before
+    /// it lands, and its `CANCELED` (or `FILLED`) event is the answer.
+    fn cancel_queue(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
+        let o = match self.queue.lookup(req.client_oid, req.strategy_id) {
+            Ok(o) => o,
+            Err(core_fill::QueueRefusal::Ambiguous) => return self.ambiguous(),
+            Err(_) => return self.no_such(),
+        };
+        if o.sym != req.sym || core_types::symbol_venue_byte(o.sym) != req.venue {
+            self.counters.identity_mismatch = self.counters.identity_mismatch.wrapping_add(1);
+            return Err(DispatchError::IdentityMismatch);
+        }
+        let venue = core_types::symbol_venue_byte(o.sym) as usize;
+        let at = req.ts_ns.saturating_add(self.activation_ns[venue]);
+        match self.queue.cancel(req.client_oid, req.strategy_id, at) {
+            Ok(()) => {
+                self.counters.cancels = self.counters.cancels.wrapping_add(1);
+                Ok(())
+            }
+            Err(_) => self.no_such(),
+        }
+    }
+
+    /// XMM XH2: a modify that found nothing in the strict table. On a
+    /// queue order it is the venue's modify: a cancel of the old order
+    /// and a new post-only order, both landing at `now + Δ_venue`, the
+    /// new one at the BACK of its queue and inheriting the old one's
+    /// expiry (E-7). Fail-closed: an old order no longer held is
+    /// `NoSuchOrder` and places nothing, and one that leaves the book
+    /// while the modify flies gets its replacement REJECTED on landing
+    /// (`core_fill::queue`). A full table is `QueueFull`, the old order
+    /// untouched.
+    fn modify_queue(&mut self, req: &ModifyReq, now_ns: NsTs) -> Result<(), DispatchError> {
+        let new = req.order();
+        let venue = core_types::symbol_venue_byte(new.sym);
+        let queued = core_fill::judged_by_queue(venue, new.kind, new.flags);
+        match self.queue.lookup(req.prev_client_oid(), new.strategy_id) {
+            Ok(o) => {
+                if !queued || o.sym != new.sym || o.side != new.side {
+                    self.counters.identity_mismatch = self.counters.identity_mismatch.wrapping_add(1);
+                    return Err(DispatchError::IdentityMismatch);
+                }
+            }
+            Err(core_fill::QueueRefusal::Ambiguous) => return self.ambiguous(),
+            // Fail-closed: the venue does not modify an order that is no
+            // longer on its book, so nothing is placed.
+            Err(_) => return self.no_such(),
+        }
+        let px = new.px.raw();
+        let qty = new.qty.raw();
+        if px <= 0 || qty <= 0 {
+            self.counters.unroutable = self.counters.unroutable.wrapping_add(1);
+            return Err(DispatchError::Unroutable);
+        }
+        let expiry = core_fill::expiry_at(new.ts_ns, new.ttl_ns);
+        let p = core_fill::QueuePlace {
+            client_oid: new.client_oid,
+            sym: new.sym,
+            side: new.side,
+            slot: new.strategy_id,
+            px_1e6: px,
+            qty_1e6: qty,
+            ready_ns: now_ns.saturating_add(self.activation_ns[venue as usize]),
+            expiry_ns: if expiry == 0 { core_fill::QUEUE_NEVER } else { expiry },
+        };
+        match self.queue.modify(req.prev_client_oid(), &p) {
+            Ok(()) => {
+                self.counters.modifies = self.counters.modifies.wrapping_add(1);
+                Ok(())
+            }
+            Err(_) => {
+                // The table is full: refused whole, and the old order is
+                // left exactly as it was — "a refused modify changes
+                // NOTHING" (E5). Said to the caller, not swallowed.
+                self.counters.rejected_open_cap = self.counters.rejected_open_cap.wrapping_add(1);
+                Err(DispatchError::QueueFull)
+            }
+        }
+    }
+
+    #[inline]
+    fn no_such(&mut self) -> Result<(), DispatchError> {
+        self.counters.no_such_order = self.counters.no_such_order.wrapping_add(1);
+        Err(DispatchError::NoSuchOrder)
+    }
+
+    #[inline]
+    fn ambiguous(&mut self) -> Result<(), DispatchError> {
+        self.counters.ambiguous_order = self.counters.ambiguous_order.wrapping_add(1);
+        Err(DispatchError::AmbiguousOrder)
+    }
+
+    /// Move the queue law's events out: a fill into the fill ring (the
+    /// engine pumps fills BEFORE order events, so a member sees a fill
+    /// before the `FILLED` it causes), everything else into the event
+    /// ring.
+    fn drain_queue(&mut self) {
+        while let Some(e) = self.queue.try_next_event() {
+            if e.kind == core_fill::QUEUE_EVENT_FILL {
+                self.push_fill_of(e.sym, e.side, e.client_oid, e.slot, e.px_1e6, e.qty_1e6, e.t_ns);
+            } else {
+                self.push_event(e.t_ns, e.sym, e.client_oid, e.slot, e.kind, e.reason);
+            }
+        }
+    }
+
+    #[inline]
+    fn push_event(
+        &mut self,
+        ts_ns: NsTs,
+        sym: SymbolId,
+        client_oid: u64,
+        strategy_id: u8,
+        kind: u8,
+        reason: u8,
+    ) {
+        if self.ev_len >= ORDER_EVENT_OUT {
+            debug_assert!(false, "paper matcher order-event ring overflowed");
+            self.counters.order_events_overflow = self.counters.order_events_overflow.wrapping_add(1);
+            return;
+        }
+        let venue = match core_types::VenueId::from_u8(core_types::symbol_venue_byte(sym)) {
+            Some(v) => v,
+            None => core_types::VenueId::Hyperliquid,
+        };
+        let slot = (self.ev_head + self.ev_len) % ORDER_EVENT_OUT;
+        self.events[slot] =
+            core_types::OrderEvent::new(ts_ns, venue, sym, client_oid, strategy_id, kind, reason, 0);
+        self.ev_len += 1;
+    }
+
     /// Pop the next modelled fill, FIFO.
     pub fn try_next_fill(&mut self) -> Option<Fill> {
         if self.out_len == 0 {
             return None;
         }
         let f = self.out[self.out_head];
-        self.out_head = (self.out_head + 1) % core_fill::MAX_OPEN_TOTAL;
+        self.out_head = (self.out_head + 1) % FILL_OUT;
         self.out_len -= 1;
         Some(f)
     }
 
     #[inline]
     fn push_fill(&mut self, o: &Pending, px_1e6: i64, qty_1e6: i64, now_ns: NsTs) {
-        if self.out_len >= core_fill::MAX_OPEN_TOTAL {
-            // The engine pumps every iteration and one tick can produce
-            // at most MAX_OPEN_TOTAL fills, so this is unreachable —
+        self.push_fill_of(
+            o.ident.sym,
+            o.ident.side,
+            o.client_oid,
+            o.ident.strategy_id,
+            px_1e6,
+            qty_1e6,
+            now_ns,
+        );
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn push_fill_of(
+        &mut self,
+        sym: SymbolId,
+        side: Side,
+        client_oid: u64,
+        strategy_id: u8,
+        px_1e6: i64,
+        qty_1e6: i64,
+        now_ns: NsTs,
+    ) {
+        if self.out_len >= FILL_OUT {
+            // The engine pumps every iteration, so this is unreachable —
             // which is exactly why it is counted rather than trusted.
             debug_assert!(false, "paper matcher out ring overflowed");
             self.counters.out_overflow = self.counters.out_overflow.wrapping_add(1);
             return;
         }
-        let slot = (self.out_head + self.out_len) % core_fill::MAX_OPEN_TOTAL;
+        let slot = (self.out_head + self.out_len) % FILL_OUT;
         self.out[slot] = Fill::new(
             now_ns,
-            o.ident.sym,
-            o.ident.side,
+            sym,
+            side,
             Price::from_raw(px_1e6),
             Qty::from_raw(qty_1e6),
-            o.client_oid,
+            client_oid,
         )
-        .with_attribution(o.ident.strategy_id, core_types::FILL_ORIGIN_PAPER);
+        .with_attribution(strategy_id, core_types::FILL_ORIGIN_PAPER);
         self.out_len += 1;
         self.counters.fills = self.counters.fills.wrapping_add(1);
+    }
+
+    /// HC11: judge the held-quote law's due IoCs (collected first: the
+    /// book and the fill ring are both `self`'s). A fill rides the fill
+    /// lane; a miss is an order event — `CANCELED`, reason `EXPIRED` — so
+    /// the member frees the instrument at the verdict instead of on a
+    /// timer.
+    fn judge_held(&mut self, stamp_ns: NsTs, now_ns: NsTs) {
+        let mut due = [(0u64, core_types::SYMBOL_ID_NONE, Side::Bid, 0u8, core_fill::Verdict::Cancel);
+            core_fill::held::HELD_PENDING];
+        let mut n = 0usize;
+        self.held.judge_due(stamp_ns, |o, v| {
+            if n < due.len() {
+                due[n] = (o.client_oid, o.sym, o.side, o.strategy_id, v);
+                n += 1;
+            }
+        });
+        let mut k = 0usize;
+        while k < n {
+            let (oid, sym, side, slot, v) = due[k];
+            match v {
+                core_fill::Verdict::Fill { px_1e6, qty_1e6 } => {
+                    self.push_fill_of(sym, side, oid, slot, px_1e6, qty_1e6, now_ns);
+                }
+                _ => {
+                    self.counters.ioc_canceled = self.counters.ioc_canceled.wrapping_add(1);
+                    self.push_event(
+                        now_ns,
+                        sym,
+                        oid,
+                        slot,
+                        core_types::ORDER_EVENT_CANCELED,
+                        core_types::ORDER_EVENT_REASON_EXPIRED,
+                    );
+                }
+            }
+            k += 1;
+        }
+    }
+
+    /// Hypercall IoCs pending under the held-quote law (tests, `/state`).
+    #[inline]
+    #[must_use]
+    pub const fn held_pending(&self) -> usize {
+        self.held.pending_len()
     }
 
     /// Remove open slot `i`, shifting the tail left so emit order — the
@@ -1517,8 +3379,14 @@ impl PaperMatcher {
 pub struct PaperDispatcher {
     stats: DispatchStats,
     /// X1: the matcher. Inline rather than boxed — the dispatcher is
-    /// itself boot-constructed once by the engine, and ~8 KiB of
-    /// fixed arrays inside it is the same memory either way.
+    /// itself boot-constructed once by the engine, and its fixed arrays
+    /// (≈ 60 KiB since XMM XH2: the strict table, the fill and
+    /// order-event rings, the AMM and queue books; ≈ 93 KiB since HC11's
+    /// held-quote book, 1 024 quotes) are the same memory
+    /// either way. It moves by value only at boot — handed on a few times
+    /// before the loop starts (the boot's `engine_loop_set_full` →
+    /// `run_engine_loop` → `Engine::new`, plus `RoutedDispatcher::new` on
+    /// an armed boot), never after.
     matcher: PaperMatcher,
 }
 
@@ -1533,14 +3401,15 @@ impl PaperDispatcher {
     #[inline]
     #[must_use]
     pub const fn matcher_counters(&self) -> MatcherCounters {
-        self.matcher.counters
+        self.matcher.counters_snapshot()
     }
 
-    /// X1: orders the matcher is currently holding.
+    /// X1: orders the matcher is currently holding (HC11: the held-quote
+    /// law's pending IoCs included).
     #[inline]
     #[must_use]
     pub const fn open_orders(&self) -> usize {
-        self.matcher.open_len()
+        self.matcher.open_len() + self.matcher.queue_len() + self.matcher.held_pending()
     }
 
     /// Construct empty.
@@ -1638,13 +3507,33 @@ impl OrderDispatch for PaperDispatcher {
     }
 
     #[inline]
+    fn observe_amm(&mut self, sym: SymbolId, payload: &[u8; 40], now_ns: NsTs) {
+        self.matcher.observe_amm(sym, payload, now_ns);
+    }
+
+    #[inline]
+    fn observe_trade(&mut self, print: &core_types::TradePrint, now_ns: NsTs) {
+        self.matcher.observe_trade(print, now_ns);
+    }
+
+    #[inline]
+    fn try_next_order_event(&mut self, out: &mut core_types::OrderEvent) -> bool {
+        self.matcher.try_next_order_event(out)
+    }
+
+    #[inline]
+    fn track_queue_sym(&mut self, sym: SymbolId) {
+        self.matcher.track_queue_sym(sym);
+    }
+
+    #[inline]
     fn matcher_counters(&self) -> MatcherCounters {
-        self.matcher.counters
+        self.matcher.counters_snapshot()
     }
 
     #[inline]
     fn open_paper_orders(&self) -> usize {
-        self.matcher.open_len()
+        self.matcher.open_len() + self.matcher.queue_len() + self.matcher.held_pending()
     }
 }
 
@@ -1823,6 +3712,172 @@ mod tests {
         assert_eq!(m.counters.unroutable, 3);
         assert_eq!(m.open_len(), 0);
         assert_eq!(m.counters.intake, 0);
+    }
+
+    /// MX2 / O-MX1: MEXC has an activation slot but is data-only — a
+    /// MEXC order is refused as `unroutable`, never modelled.
+    #[test]
+    fn a_mexc_order_is_unroutable_data_only() {
+        let mut m = PaperMatcher::new();
+        let sym = core_types::make_symbol_id(VenueId::Mexc, 1);
+        let o = Order::new(
+            1_000,
+            VenueId::Mexc,
+            sym,
+            Side::Bid,
+            core_fill::ORDER_KIND_IOC,
+            Price::from_raw(1_000_000),
+            Qty::from_raw(1_000_000),
+            1,
+        );
+        m.submit(&o, 1_000);
+        assert_eq!(m.counters.unroutable, 1);
+        assert_eq!(m.counters.intake, 0);
+        assert_eq!(m.open_len(), 0);
+    }
+
+    /// HK-R4: a Binance option (the eapi ordinal block) is a signal leg
+    /// only — an order on one is refused as `unroutable` and a crossing
+    /// tick fills nothing; a Binance perp beside it is still modelled.
+    #[test]
+    fn a_binance_option_order_is_unroutable_signal_only() {
+        let mut m = PaperMatcher::new();
+        let opt = core_types::make_symbol_id(VenueId::Binance, core_fill::BN_OPTION_ORDINALS.start);
+        let perp = core_types::make_symbol_id(VenueId::Binance, 513);
+        let order = |sym: SymbolId, cid: u64| {
+            Order::new(
+                1_000,
+                VenueId::Binance,
+                sym,
+                Side::Bid,
+                core_fill::ORDER_KIND_IOC,
+                Price::from_raw(1_000_000),
+                Qty::from_raw(1_000_000),
+                cid,
+            )
+        };
+        m.submit(&order(opt, 1), 1_000);
+        assert_eq!((m.counters.unroutable, m.counters.intake, m.open_len()), (1, 0, 0));
+        let mut crossing = mk_tick(990_000, 5_000_000, 1_000_000, 5_000_000);
+        crossing.sym = opt;
+        m.observe_tick(&crossing, AFTER_DELTA);
+        assert!(m.try_next_fill().is_none(), "a crossing tick fills nothing");
+        m.submit(&order(perp, 2), 1_000);
+        assert_eq!((m.counters.unroutable, m.counters.intake), (1, 1), "the perp is modelled");
+    }
+
+    /// HC11 (O-HC21): a Hypercall IoC is taken by the held-quote law (the
+    /// quote in force 2 s after submit decides); a Hypercall maker — the
+    /// venue has no post-only — and an index symbol are unroutable.
+    #[test]
+    fn a_hypercall_ioc_fills_at_the_quote_held_two_seconds_later() {
+        let mut m = PaperMatcher::new();
+        let opt = core_types::make_symbol_id(VenueId::Hypercall, 513);
+        let idx = core_types::make_symbol_id(VenueId::Hypercall, 3);
+        let tick = |bid: i64, ask: i64, ts: u64| {
+            Tick::new_stamped(
+                ts,
+                VenueId::Hypercall,
+                opt,
+                0,
+                Price::from_raw(bid),
+                Qty::from_raw(4_000_000),
+                Price::from_raw(ask),
+                Qty::from_raw(4_000_000),
+                0,
+                0,
+            )
+        };
+        let order = |kind, sym| {
+            let mut o = Order::new(
+                1_000,
+                VenueId::Hypercall,
+                sym,
+                Side::Bid,
+                kind,
+                Price::from_raw(1_050_000),
+                Qty::from_raw(1_000_000),
+                77,
+            );
+            o.strategy_id = 7;
+            o
+        };
+        m.observe_tick(&tick(900_000, 1_100_000, 500), 500);
+        m.submit(&order(core_fill::ORDER_KIND_MAKER, opt), 1_000);
+        m.submit(&order(core_fill::ORDER_KIND_IOC, idx), 1_000);
+        assert_eq!(m.counters.unroutable, 2);
+        m.submit(&order(core_fill::ORDER_KIND_IOC, opt), 1_000);
+        assert_eq!((m.counters.intake, m.held_pending()), (1, 1));
+        // The quote improves inside the 2 s; a record before the due
+        // instant judges nothing.
+        m.observe_tick(&tick(950_000, 1_040_000, 1_000_000_000), 1_000_000_000);
+        assert!(m.try_next_fill().is_none());
+        // Due at 1_000 + 2 s: the record at that instant is judged against
+        // the quote in force BEFORE it (1.04), not its own (1.20).
+        // A quote stamped just BEFORE the due instant but drained after it
+        // is still the one in force: nothing is judged on it…
+        m.observe_tick(&tick(960_000, 1_030_000, 2_000_000_999), 2_000_005_000);
+        assert!(m.try_next_fill().is_none());
+        m.observe_tick(&tick(1_150_000, 1_200_000, 2_000_001_000), 2_000_006_000);
+        let f = m.try_next_fill().expect("filled at the held ask");
+        // …and the verdict reads it (1.03), not the next record's (1.20).
+        assert_eq!((f.px.raw(), f.qty.raw(), f.order_id, f.strategy_id), (1_030_000, 1_000_000, 77, 7));
+        assert_eq!(f.origin, core_types::FILL_ORIGIN_PAPER);
+        assert_eq!(m.held_pending(), 0);
+        let mut ev = core_types::OrderEvent::ZERO;
+        assert!(!m.try_next_order_event(&mut ev), "a fill is no order event");
+        // Worse than the limit at the due instant: nothing — and the miss
+        // is told to the slot as an expiry.
+        m.submit(&order(core_fill::ORDER_KIND_IOC, opt), 3_000_000_000);
+        m.observe_tick(&tick(1_150_000, 1_200_000, 5_000_000_001), 5_000_000_001);
+        assert!(m.try_next_fill().is_none());
+        assert_eq!(m.counters.ioc_canceled, 1);
+        assert!(m.try_next_order_event(&mut ev));
+        assert_eq!(
+            (ev.kind, ev.reason, ev.client_oid, ev.strategy_id, ev.venue),
+            (
+                core_types::ORDER_EVENT_CANCELED,
+                core_types::ORDER_EVENT_REASON_EXPIRED,
+                77,
+                7,
+                VenueId::Hypercall.to_u8()
+            )
+        );
+    }
+
+    /// HC11: a Hypercall IoC waiting for its held-quote verdict is an open
+    /// paper order (the engine's shutdown drain and `/metrics` read it).
+    #[test]
+    fn a_held_ioc_counts_as_open_until_its_verdict() {
+        let mut d = PaperDispatcher::new();
+        let opt = core_types::make_symbol_id(VenueId::Hypercall, 513);
+        let mut o = Order::new(
+            1_000,
+            VenueId::Hypercall,
+            opt,
+            Side::Bid,
+            core_fill::ORDER_KIND_IOC,
+            Price::from_raw(1_000_000),
+            Qty::from_raw(1_000_000),
+            5,
+        );
+        o.strategy_id = 7;
+        OrderDispatch::submit(&mut d, &o).expect("the paper dispatcher takes it");
+        assert_eq!((OrderDispatch::open_paper_orders(&d), d.open_orders()), (1, 1));
+        let t = Tick::new_stamped(
+            2_000_001_000,
+            VenueId::Hypercall,
+            opt,
+            0,
+            Price::from_raw(0),
+            Qty::from_raw(0),
+            Price::from_raw(0),
+            Qty::from_raw(0),
+            0,
+            0,
+        );
+        OrderDispatch::observe_tick(&mut d, &t, 2_000_001_000);
+        assert_eq!(OrderDispatch::open_paper_orders(&d), 0, "judged: a miss, gone");
     }
 
     /// One tick's displayed size cannot fill two orders twice, and the
@@ -2164,31 +4219,87 @@ mod tests {
         assert_eq!(f.qty.raw(), 1_000_000, "still the old size");
     }
 
-    /// A dispatcher that has not been taught the verbs must SAY so.
-    /// `Ok(())` as a default would be a strategy believing a quote
-    /// was pulled that nothing ever pulled.
+    /// BX3: an alias reroutes exactly its own full id; an empty entry
+    /// never matches; the table refuses what it cannot hold.
     #[test]
-    fn the_default_lifecycle_verbs_refuse_rather_than_silently_succeed() {
-        struct Deaf;
-        impl OrderDispatch for Deaf {
-            fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
-                Ok(())
-            }
-            fn try_next_fill(&mut self) -> Option<Fill> {
-                None
-            }
-            fn stats(&self) -> DispatchStats {
-                DispatchStats::default()
-            }
-        }
-        let mut d = Deaf;
+    fn a_route_alias_reroutes_only_its_own_id() {
+        let t = RouteAliases::NONE.with(7, 1).unwrap();
+        assert_eq!(t.route_venue(7, 0), 1, "the anchor routes to its alias");
+        assert_eq!(t.route_venue(8, 0), 0, "a neighbour keeps its own byte");
+        assert_eq!(t.route_venue(core_types::SYMBOL_ID_NONE, 3), 3);
+        assert_eq!(
+            RouteAliases::NONE.route_venue(core_types::SYMBOL_ID_NONE, 3),
+            3
+        );
+        assert_eq!(t.len(), 1);
+        assert!(RouteAliases::NONE.is_empty());
+        assert_eq!(t.with(7, 4), Err(RouteAliasErr::Duplicate));
+        assert_eq!(
+            RouteAliases::NONE.with(core_types::SYMBOL_ID_NONE, 1),
+            Err(RouteAliasErr::NoneSym)
+        );
+        assert_eq!(
+            RouteAliases::NONE.with(9, ROUTE_ALIAS_EMPTY),
+            Err(RouteAliasErr::BadVenue)
+        );
+        let full = RouteAliases::NONE
+            .with(1, 1)
+            .and_then(|t| t.with(2, 1))
+            .and_then(|t| t.with(3, 1))
+            .and_then(|t| t.with(4, 1))
+            .unwrap();
+        assert_eq!(full.with(5, 1), Err(RouteAliasErr::Full));
+        assert_eq!(full.route_venue(4, 0), 1, "the last slot matches too");
+    }
+
+    /// BX3 (O-BX17): one slot's signal from two arms is the worse of
+    /// each observation, and the merge is symmetric and idempotent.
+    #[test]
+    fn a_merged_signal_is_the_worse_of_both_arms() {
+        let a = HaltSignal::new(5, 100, 3, 1, false, true, 7)
+            .with_pnl(true, -10)
+            .with_venue(false, true);
+        let b = HaltSignal::new(9, 50, 1, 4, true, false, 2)
+            .with_pnl(true, 4)
+            .with_venue(true, false);
+        let m = a.merged(b);
+        assert_eq!(m, b.merged(a), "symmetric");
+        assert_eq!(
+            (m.ws_gap_ns, m.recon_drift_usd_1e6, m.recon_age_ns),
+            (9, 100, 7)
+        );
+        assert_eq!((m.reject_streak, m.asset_refusal_streak), (3, 4));
+        assert_eq!(
+            (m.budget_floor_breached, m.venue_lock, m.margin_risk),
+            (1, 1, 1)
+        );
+        assert_eq!(m.reconciled, 0, "seeded only when both arms reconciled");
+        assert_eq!(m.pnl_judged, 1);
+        assert_eq!(m.pnl_delta_usd_1e6, -6);
+        let r = HaltSignal::new(1, 2, 0, 0, false, true, 3).with_pnl(true, 5);
+        let mut idem = r.merged(r);
+        idem.pnl_delta_usd_1e6 = r.pnl_delta_usd_1e6;
+        assert_eq!(idem, r, "idempotent but for the P&L sum");
+        assert_eq!(
+            HaltSignal::default().merged(HaltSignal::default()),
+            HaltSignal::default()
+        );
+    }
+
+    /// A dispatcher that cannot take an order back must SAY so. The
+    /// trait no longer supplies that answer (BX3, O-BX19): the queued
+    /// dispatcher's ring carries orders only, so its verbs refuse, and
+    /// they refuse in writing.
+    #[test]
+    fn a_queued_dispatcher_refuses_a_lifecycle_verb_rather_than_swallowing_it() {
+        let (mut q, _worker) = crate::QueuedDispatcher::new(PaperDispatcher::new());
         let o = maker(100_000_000, 1_000_000, 1, 0);
         assert_eq!(
-            d.cancel(&CancelReq::of(&o, 1_000)),
+            q.cancel(&CancelReq::of(&o, 1_000)),
             Err(DispatchError::Unsupported)
         );
         assert_eq!(
-            d.modify(&ModifyReq::new(1, o)),
+            q.modify(&ModifyReq::new(1, o)),
             Err(DispatchError::Unsupported)
         );
     }
@@ -2355,5 +4466,491 @@ mod tests {
         );
         b.side = Side::Ask;
         assert_ne!(OrderIdentity::of(&a), OrderIdentity::of(&b));
+    }
+
+    // ---------------- HYPARB H2: the AMM arm ----------------
+
+    mod amm {
+        use super::*;
+        use core_amm::payload::{
+            encode_gap, encode_head, encode_snapshot, encode_state, FAMILY_V3,
+        };
+        use core_amm::{price_1e18_from_sqrt, sqrt_at_tick};
+        use core_types::{make_symbol_id, SYMBOL_ID_NONE};
+
+        const POOL: SymbolId = make_symbol_id(VenueId::HyperEvm, 1);
+        const TICK: i32 = -230_543;
+        const L: u128 = 50_000_000_000_000_000_000;
+        const BLOCK_NS: u64 = 1_000_000_000;
+
+        fn swap(side: Side, px: i64, qty: i64, oid: u64) -> Order {
+            let mut o = Order::new(
+                1_000,
+                VenueId::HyperEvm,
+                POOL,
+                side,
+                core_fill::ORDER_KIND_AMM_SWAP,
+                Price::from_raw(px),
+                Qty::from_raw(qty),
+                oid,
+            );
+            o.strategy_id = 0;
+            o
+        }
+
+        fn live(m: &mut PaperMatcher) -> i64 {
+            let (lo, hi) = sqrt_at_tick(TICK);
+            let snap = encode_snapshot(7, FAMILY_V3, -240_000, -220_000, 0, 500, 10, 18, 6);
+            m.observe_amm(POOL, &snap.unwrap(), 0);
+            m.observe_amm(POOL, &encode_state(TICK, lo, hi, L, true).unwrap(), 0);
+            (price_1e18_from_sqrt(lo, hi, 18, 6) / 1_000_000_000_000) as i64
+        }
+
+        fn head(m: &mut PaperMatcher, block: u64, now: u64) {
+            m.observe_amm(SYMBOL_ID_NONE, &encode_head(block, 1, 1).unwrap(), now);
+        }
+
+        #[test]
+        fn a_swap_is_judged_once_at_the_first_head_after_one_block() {
+            let mut m = PaperMatcher::new();
+            let mid = live(&mut m);
+            m.submit(&swap(Side::Ask, mid * 99 / 100, 1_000_000, 9), 0);
+            assert_eq!(m.open_len(), 1);
+            head(&mut m, 8, BLOCK_NS - 1);
+            assert_eq!(m.open_len(), 1, "not before the block it could land in");
+            head(&mut m, 9, BLOCK_NS);
+            assert_eq!(m.open_len(), 0, "judged once, gone either way");
+            let f = m.try_next_fill().expect("a fill");
+            assert_eq!(f.sym, POOL);
+            assert_eq!(f.qty.raw(), 1_000_000);
+            assert!(f.px.raw() < mid, "the fee and the impact are in the price");
+            assert_eq!(f.strategy_id, 0);
+            assert_eq!(m.counters.amm_fills, 1);
+            assert_eq!(m.counters.fills, 1);
+        }
+
+        #[test]
+        fn a_swap_that_cannot_meet_its_limit_cancels_and_never_rests() {
+            let mut m = PaperMatcher::new();
+            let mid = live(&mut m);
+            m.submit(&swap(Side::Bid, mid, 1_000_000, 1), 0);
+            head(&mut m, 9, BLOCK_NS);
+            assert_eq!(m.open_len(), 0);
+            assert!(m.try_next_fill().is_none());
+            assert_eq!(m.counters.amm_canceled, 1);
+            assert_eq!(
+                m.counters.amm_not_live, 0,
+                "the price refused it, not the pool"
+            );
+        }
+
+        #[test]
+        fn a_pool_never_snapshotted_cancels_as_not_live() {
+            let mut m = PaperMatcher::new();
+            m.submit(&swap(Side::Ask, 1, 1_000_000, 1), 0);
+            head(&mut m, 9, BLOCK_NS);
+            assert_eq!(m.counters.amm_canceled, 1);
+            assert_eq!(m.counters.amm_not_live, 1);
+        }
+
+        #[test]
+        fn a_chain_gap_cancels_every_open_swap() {
+            let mut m = PaperMatcher::new();
+            let mid = live(&mut m);
+            m.submit(&swap(Side::Ask, mid / 2, 1_000_000, 1), 0);
+            m.submit(&swap(Side::Bid, mid * 2, 1_000_000, 2), 0);
+            m.observe_amm(SYMBOL_ID_NONE, &encode_gap(8).unwrap(), 10);
+            assert_eq!(m.open_len(), 0);
+            assert_eq!(m.counters.amm_canceled, 2);
+            assert!(m.try_next_fill().is_none());
+        }
+
+        #[test]
+        fn two_swaps_on_one_pool_see_each_others_impact_in_emit_order() {
+            let mut m = PaperMatcher::new();
+            let mid = live(&mut m);
+            m.submit(&swap(Side::Bid, mid * 101 / 100, 1_000_000, 1), 0);
+            m.submit(&swap(Side::Bid, mid * 101 / 100, 1_000_000, 2), 0);
+            head(&mut m, 9, BLOCK_NS);
+            let a = m.try_next_fill().unwrap();
+            let b = m.try_next_fill().unwrap();
+            assert_eq!((a.order_id, b.order_id), (1, 2));
+            assert!(
+                b.px.raw() > a.px.raw(),
+                "the second buy pays for the first's impact"
+            );
+        }
+
+        #[test]
+        fn the_ttl_cancels_a_swap_before_its_head() {
+            let mut m = PaperMatcher::new();
+            let mid = live(&mut m);
+            let mut o = swap(Side::Ask, mid / 2, 1_000_000, 1);
+            o.ttl_ns = 500_000_000;
+            m.submit(&o, 0);
+            head(&mut m, 9, BLOCK_NS);
+            assert_eq!(m.counters.ttl_expired, 1);
+            assert_eq!(m.counters.amm_fills, 0);
+        }
+
+        #[test]
+        fn hyperevm_takes_swaps_only_and_swaps_go_nowhere_else() {
+            let mut m = PaperMatcher::new();
+            let mut ioc = swap(Side::Ask, 1, 1, 1);
+            ioc.kind = core_fill::ORDER_KIND_IOC;
+            m.submit(&ioc, 0);
+            let mut off = swap(Side::Ask, 1, 1, 2);
+            off.sym = make_symbol_id(VenueId::HyperEvm, 200);
+            m.submit(&off, 0);
+            let mut elsewhere = mk_order(Side::Bid, core_fill::ORDER_KIND_AMM_SWAP, 1, 1, 3, 0);
+            elsewhere.kind = core_fill::ORDER_KIND_AMM_SWAP;
+            m.submit(&elsewhere, 0);
+            assert_eq!(m.open_len(), 0);
+            assert_eq!(m.counters.unroutable, 3);
+        }
+
+        #[test]
+        fn the_paper_dispatcher_forwards_pool_events_to_its_matcher() {
+            let mut d = PaperDispatcher::new();
+            let (lo, hi) = sqrt_at_tick(TICK);
+            let snap = encode_snapshot(7, FAMILY_V3, -240_000, -220_000, 0, 500, 10, 18, 6);
+            OrderDispatch::observe_amm(&mut d, POOL, &snap.unwrap(), 0);
+            OrderDispatch::observe_amm(
+                &mut d,
+                POOL,
+                &encode_state(TICK, lo, hi, L, true).unwrap(),
+                0,
+            );
+            assert_eq!(d.matcher.amm_book_counters().snapshots, 1);
+        }
+    }
+
+    // ---------------- XMM XH2: the queue law on the paper arm ----------------
+
+    const HL_PERP: SymbolId = 0x0400_0005;
+    /// Δ_hl is 340 ms.
+    const HL_DELTA: NsTs = 340_000_000;
+    const XMM_SLOT: u8 = 6;
+
+    fn hl_order(side: Side, px: i64, qty: i64, oid: u64, ts: NsTs) -> Order {
+        let mut o = Order::new(
+            ts,
+            VenueId::Hyperliquid,
+            HL_PERP,
+            side,
+            core_fill::ORDER_KIND_MAKER,
+            Price::from_raw(px),
+            Qty::from_raw(qty),
+            oid,
+        )
+        .with_post_only();
+        o.strategy_id = XMM_SLOT;
+        o
+    }
+
+    fn hl_tick(bid: i64, bid_q: i64, ask: i64, ask_q: i64) -> Tick {
+        Tick::new(
+            1_000,
+            VenueId::Hyperliquid,
+            HL_PERP,
+            0,
+            Price::from_raw(bid),
+            Qty::from_raw(bid_q),
+            Price::from_raw(ask),
+            Qty::from_raw(ask_q),
+        )
+    }
+
+    fn hl_print(px: i64, qty: i64, sell: bool) -> core_types::TradePrint {
+        core_types::TradePrint::new(
+            0,
+            VenueId::Hyperliquid,
+            HL_PERP,
+            7,
+            0,
+            px,
+            qty,
+            if sell { core_types::TRADE_AGGRESSOR_SELL } else { core_types::TRADE_AGGRESSOR_BUY },
+        )
+    }
+
+    /// A matcher tracking `HL_PERP` whose book is 100 (2 shown) / 101.
+    fn hl_matcher() -> PaperMatcher {
+        let mut m = PaperMatcher::new();
+        m.track_queue_sym(HL_PERP);
+        m.observe_tick(&hl_tick(100_000_000, 2_000_000, 101_000_000, 2_000_000), 0);
+        m
+    }
+
+    fn next_event(m: &mut PaperMatcher) -> Option<core_types::OrderEvent> {
+        let mut e = core_types::OrderEvent::ZERO;
+        if m.try_next_order_event(&mut e) {
+            Some(e)
+        } else {
+            None
+        }
+    }
+
+    fn next_event_of<D: OrderDispatch>(d: &mut D) -> Option<core_types::OrderEvent> {
+        let mut e = core_types::OrderEvent::ZERO;
+        if d.try_next_order_event(&mut e) {
+            Some(e)
+        } else {
+            None
+        }
+    }
+
+    fn event_kinds(m: &mut PaperMatcher) -> Vec<(u64, u8, u8)> {
+        let mut v = Vec::new();
+        while let Some(e) = next_event(m) {
+            assert_eq!((e.strategy_id, e.sym, e.venue), (XMM_SLOT, HL_PERP, VenueId::Hyperliquid as u8));
+            v.push((e.client_oid, e.kind, e.reason));
+        }
+        v
+    }
+
+    #[test]
+    fn a_post_only_hl_maker_joins_the_queue_and_fills_from_prints() {
+        let mut m = hl_matcher();
+        m.submit(&hl_order(Side::Bid, 100_000_000, 1_000_000, 9, 1_000), 1_000);
+        assert_eq!((m.open_len(), m.queue_len(), m.counters.intake), (0, 1, 1));
+        // Before Δ nothing lands; the first book at or after it does.
+        m.observe_tick(&hl_tick(100_000_000, 2_000_000, 101_000_000, 2_000_000), HL_DELTA);
+        assert!(event_kinds(&mut m).is_empty());
+        m.observe_tick(&hl_tick(100_000_000, 3_000_000, 101_000_000, 2_000_000), AFTER_DELTA + 60_000_000);
+        assert_eq!(event_kinds(&mut m), [(9, core_types::ORDER_EVENT_RESTING, 0)]);
+        // A seller takes 2.5: 2 ahead, then half of ours — at OUR price.
+        m.observe_trade(&hl_print(100_000_000, 2_500_000, true), 500_000_000);
+        let f = m.try_next_fill().expect("a queue fill");
+        assert_eq!((f.px.raw(), f.qty.raw(), f.order_id, f.strategy_id), (100_000_000, 500_000, 9, XMM_SLOT));
+        assert_eq!(f.ts_ns, 500_000_000);
+        assert!(event_kinds(&mut m).is_empty(), "a partial fill is no order event");
+        m.observe_trade(&hl_print(100_000_000, 9_000_000, true), 600_000_000);
+        assert_eq!(m.try_next_fill().map(|f| f.qty.raw()), Some(500_000));
+        assert_eq!(event_kinds(&mut m), [(9, core_types::ORDER_EVENT_FILLED, 0)]);
+        assert_eq!(m.queue_len(), 0);
+        let c = m.counters_snapshot();
+        assert_eq!((c.queue_placed, c.queue_rested, c.queue_fills, c.fills), (1, 1, 2, 2));
+    }
+
+    #[test]
+    fn a_plain_hl_maker_keeps_the_strict_cross_law() {
+        let mut m = hl_matcher();
+        let mut o = hl_order(Side::Bid, 100_000_000, 1_000_000, 9, 1_000);
+        o.flags = 0;
+        m.submit(&o, 1_000);
+        assert_eq!((m.open_len(), m.queue_len()), (1, 0));
+        m.observe_tick(&hl_tick(100_000_000, 3_000_000, 101_000_000, 2_000_000), AFTER_DELTA + 60_000_000);
+        m.observe_trade(&hl_print(99_000_000, 9_000_000, true), 500_000_000);
+        assert!(m.try_next_fill().is_none(), "prints are the queue law's evidence only");
+        assert!(next_event(&mut m).is_none());
+    }
+
+    #[test]
+    fn a_crossing_post_only_order_is_rejected_bad_alo_px_as_an_event() {
+        let mut m = hl_matcher();
+        m.submit(&hl_order(Side::Bid, 101_000_000, 1_000_000, 9, 1_000), 1_000);
+        m.observe_tick(&hl_tick(100_000_000, 3_000_000, 101_000_000, 2_000_000), AFTER_DELTA + 60_000_000);
+        assert_eq!(
+            event_kinds(&mut m),
+            [(9, core_types::ORDER_EVENT_REJECTED, core_types::ORDER_EVENT_REASON_BAD_ALO_PX)]
+        );
+        assert_eq!(m.counters_snapshot().queue_rejected_alo, 1);
+        assert_eq!(m.queue_len(), 0);
+    }
+
+    #[test]
+    fn a_queue_cancel_lands_after_delta_ahead_of_that_blocks_prints() {
+        let mut m = hl_matcher();
+        // Nothing shown at 100 when it lands, so nothing is ahead.
+        m.observe_tick(&hl_tick(100_000_000, 0, 101_000_000, 2_000_000), 500);
+        let o = hl_order(Side::Bid, 100_000_000, 1_000_000, 9, 1_000);
+        m.submit(&o, 1_000);
+        m.observe_tick(&hl_tick(100_000_000, 0, 101_000_000, 2_000_000), HL_DELTA + 1_000);
+        event_kinds(&mut m);
+        let at = 400_000_000;
+        assert_eq!(m.cancel(&CancelReq::of(&o, at)), Ok(()));
+        assert_eq!(m.counters.cancels, 1);
+        // Before the cancel lands the order still fills …
+        m.observe_trade(&hl_print(100_000_000, 400_000, true), at + HL_DELTA - 1);
+        assert_eq!(m.try_next_fill().map(|f| f.qty.raw()), Some(400_000));
+        // … and the print of the block it lands in does not.
+        m.observe_trade(&hl_print(100_000_000, 9_000_000, true), at + HL_DELTA);
+        assert!(m.try_next_fill().is_none());
+        assert_eq!(
+            event_kinds(&mut m),
+            [(9, core_types::ORDER_EVENT_CANCELED, core_types::ORDER_EVENT_REASON_CANCEL_REQUESTED)]
+        );
+    }
+
+    #[test]
+    fn a_stale_or_one_sided_tick_still_lands_a_queue_cancel() {
+        let mut m = hl_matcher();
+        m.observe_tick(&hl_tick(100_000_000, 0, 101_000_000, 2_000_000), 500);
+        let o = hl_order(Side::Bid, 100_000_000, 1_000_000, 9, 1_000);
+        m.submit(&o, 1_000);
+        m.observe_tick(&hl_tick(100_000_000, 0, 101_000_000, 2_000_000), HL_DELTA + 1_000);
+        event_kinds(&mut m);
+        m.cancel(&CancelReq::of(&o, 400_000_000)).expect("sent");
+        // A one-sided book lands it; it teaches the law no touch.
+        m.observe_tick(&hl_tick(0, 0, 101_000_000, 2_000_000), 400_000_000 + HL_DELTA);
+        assert_eq!(
+            event_kinds(&mut m),
+            [(9, core_types::ORDER_EVENT_CANCELED, core_types::ORDER_EVENT_REASON_CANCEL_REQUESTED)]
+        );
+    }
+
+    #[test]
+    fn a_queue_cancel_of_nothing_or_of_another_market_is_refused() {
+        let mut m = hl_matcher();
+        let o = hl_order(Side::Bid, 100_000_000, 1_000_000, 9, 1_000);
+        assert_eq!(m.cancel(&CancelReq::of(&o, 5)), Err(DispatchError::NoSuchOrder));
+        m.submit(&o, 1_000);
+        let mut other = o;
+        other.sym = 0x0400_0006;
+        assert_eq!(m.cancel(&CancelReq::of(&other, 5)), Err(DispatchError::IdentityMismatch));
+        m.submit(&hl_order(Side::Ask, 101_000_000, 1_000_000, 9, 1_000), 1_000);
+        assert_eq!(m.cancel(&CancelReq::of(&o, 5)), Err(DispatchError::AmbiguousOrder));
+        let c = m.counters_snapshot();
+        assert_eq!((c.no_such_order, c.identity_mismatch, c.ambiguous_order), (1, 1, 1));
+        assert_eq!(m.queue_len(), 2, "nothing was cancelled");
+    }
+
+    #[test]
+    fn a_queue_modify_replaces_and_a_lost_race_places_nothing() {
+        let mut m = hl_matcher();
+        let o = hl_order(Side::Bid, 100_000_000, 1_000_000, 9, 1_000);
+        m.submit(&o, 1_000);
+        m.observe_tick(&hl_tick(100_000_000, 2_000_000, 102_000_000, 2_000_000), HL_DELTA + 1_000);
+        event_kinds(&mut m);
+        let at = 400_000_000;
+        let new = hl_order(Side::Bid, 101_000_000, 1_000_000, 10, at);
+        assert_eq!(m.modify(&ModifyReq::new(9, new), at), Ok(()));
+        m.observe_tick(&hl_tick(100_000_000, 2_000_000, 102_000_000, 2_000_000), at + HL_DELTA);
+        assert_eq!(
+            event_kinds(&mut m),
+            [
+                (10, core_types::ORDER_EVENT_RESTING, 0),
+                (9, core_types::ORDER_EVENT_CANCELED, core_types::ORDER_EVENT_REASON_REPLACED),
+            ]
+        );
+        assert_eq!(m.counters.modifies, 1);
+        // Fail-closed: the old id is gone now, so a modify of it is
+        // refused and places nothing.
+        let again = hl_order(Side::Bid, 100_000_000, 1_000_000, 11, at + HL_DELTA);
+        assert_eq!(
+            m.modify(&ModifyReq::new(9, again), at + HL_DELTA),
+            Err(DispatchError::NoSuchOrder)
+        );
+        assert_eq!((m.queue_len(), m.counters.no_such_order), (1, 1));
+    }
+
+    #[test]
+    fn a_full_table_refuses_a_modify_and_leaves_the_old_order() {
+        let mut m = hl_matcher();
+        let mut oid = 1u64;
+        while m.queue_len() < core_fill::QUEUE_MAX_ORDERS {
+            m.submit(&hl_order(Side::Bid, 99_000_000, 1_000_000, oid, 1_000), 1_000);
+            oid += 1;
+        }
+        let new = hl_order(Side::Bid, 99_500_000, 1_000_000, 100, 5_000);
+        assert_eq!(m.modify(&ModifyReq::new(1, new), 5_000), Err(DispatchError::QueueFull));
+        let o = m.queue.get(1, XMM_SLOT).expect("the old order is untouched");
+        assert_eq!(o.cancel_ns, core_fill::QUEUE_NEVER);
+        assert!(next_event(&mut m).is_none(), "said to the caller, not as an event");
+    }
+
+    #[test]
+    fn a_queue_modify_that_changes_side_or_drops_the_flag_is_refused() {
+        let mut m = hl_matcher();
+        m.submit(&hl_order(Side::Bid, 100_000_000, 1_000_000, 9, 1_000), 1_000);
+        let flip = hl_order(Side::Ask, 102_000_000, 1_000_000, 10, 5);
+        assert_eq!(m.modify(&ModifyReq::new(9, flip), 5), Err(DispatchError::IdentityMismatch));
+        let mut plain = hl_order(Side::Bid, 99_000_000, 1_000_000, 10, 5);
+        plain.flags = 0;
+        assert_eq!(m.modify(&ModifyReq::new(9, plain), 5), Err(DispatchError::IdentityMismatch));
+        // A plain modify of nothing is the strict table's answer, as before XH2.
+        assert_eq!(m.modify(&ModifyReq::new(77, plain), 5), Err(DispatchError::NoSuchOrder));
+        assert_eq!(m.queue_len(), 1);
+    }
+
+    #[test]
+    fn prints_of_other_venues_and_untracked_books_do_nothing() {
+        let mut m = PaperMatcher::new();
+        let mut p = hl_print(100_000_000, 1_000_000, true);
+        p.sym = DERIBIT_PERP;
+        m.observe_trade(&p, 5);
+        m.observe_trade(&hl_print(100_000_000, 1_000_000, true), 5);
+        m.observe_tick(&hl_tick(100_000_000, 1, 101_000_000, 1), 5);
+        assert!(m.try_next_fill().is_none());
+        assert!(next_event(&mut m).is_none());
+        // Placing tracks the symbol itself, but the first arrival then
+        // meets no book: it rests unchecked.
+        m.submit(&hl_order(Side::Bid, 105_000_000, 1_000_000, 9, 1_000), 1_000);
+        m.observe_tick(&hl_tick(100_000_000, 1, 101_000_000, 1), AFTER_DELTA + 60_000_000);
+        assert_eq!(event_kinds(&mut m), [(9, core_types::ORDER_EVENT_RESTING, 0)]);
+    }
+
+    #[test]
+    fn a_full_queue_answers_with_a_rejected_event() {
+        let mut m = hl_matcher();
+        let mut oid = 1u64;
+        while m.queue_len() < core_fill::QUEUE_MAX_ORDERS {
+            m.submit(&hl_order(Side::Bid, 99_000_000, 1_000_000, oid, 1_000), 1_000);
+            oid += 1;
+        }
+        m.submit(&hl_order(Side::Bid, 99_000_000, 1_000_000, oid, 1_000), 1_000);
+        assert_eq!(
+            event_kinds(&mut m),
+            [(oid, core_types::ORDER_EVENT_REJECTED, core_types::ORDER_EVENT_REASON_OTHER)]
+        );
+        assert_eq!(m.counters.rejected_open_cap, 1);
+    }
+
+    #[test]
+    fn the_paper_dispatcher_forwards_the_queue_law() {
+        let mut d = PaperDispatcher::new();
+        d.track_queue_sym(HL_PERP);
+        d.observe_tick(&hl_tick(100_000_000, 0, 101_000_000, 2_000_000), 0);
+        d.submit(&hl_order(Side::Bid, 100_000_000, 1_000_000, 9, 1_000)).expect("paper submit");
+        assert_eq!(d.open_paper_orders(), 1);
+        assert_eq!(d.open_orders(), 1);
+        d.observe_tick(&hl_tick(100_000_000, 0, 101_000_000, 2_000_000), AFTER_DELTA + 60_000_000);
+        d.observe_trade(&hl_print(100_000_000, 1_000_000, true), 500_000_000);
+        assert_eq!(d.try_next_fill().map(|f| f.qty.raw()), Some(1_000_000));
+        assert_eq!(next_event_of(&mut d).map(|e| e.kind), Some(core_types::ORDER_EVENT_RESTING));
+        assert_eq!(next_event_of(&mut d).map(|e| e.kind), Some(core_types::ORDER_EVENT_FILLED));
+        assert!(next_event_of(&mut d).is_none());
+        assert_eq!(OrderDispatch::matcher_counters(&d).queue_fills, 1);
+        assert_eq!(d.matcher_counters().queue_placed, 1);
+    }
+
+    #[test]
+    fn the_trait_defaults_carry_no_queue_law() {
+        struct Deaf;
+        impl OrderDispatch for Deaf {
+            fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+                Ok(())
+            }
+            // BX3 (O-BX19): no default — a dispatcher that cannot cancel
+            // or modify says so itself.
+            fn cancel(&mut self, _r: &CancelReq) -> Result<(), DispatchError> {
+                Err(DispatchError::Unsupported)
+            }
+            fn modify(&mut self, _r: &ModifyReq) -> Result<(), DispatchError> {
+                Err(DispatchError::Unsupported)
+            }
+            fn try_next_fill(&mut self) -> Option<Fill> {
+                None
+            }
+            fn stats(&self) -> DispatchStats {
+                DispatchStats::default()
+            }
+        }
+        let mut d = Deaf;
+        d.track_queue_sym(HL_PERP);
+        d.observe_trade(&hl_print(100_000_000, 1_000_000, true), 5);
+        assert!(next_event_of(&mut d).is_none());
+        assert_eq!(d.matcher_counters(), MatcherCounters::default());
     }
 }

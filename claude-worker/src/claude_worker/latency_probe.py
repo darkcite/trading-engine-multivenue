@@ -8,15 +8,19 @@ and never in any engine path. It measures, from the host it runs on:
 * **feed delay** per venue stream: ``t_recv_local - venue_timestamp -
   clock_offset`` for every market-data message the venue stamps (Binance
   USDM bookTicker ``E``/``T``, Binance aggTrade ``E``/``T``, OKX ``ts``,
-  Bybit ``ts``/``cts``, Deribit ``timestamp``, Hyperliquid ``time``;
-  Binance SPOT bookTicker carries no timestamp and is recorded for
-  lead-lag only);
+  Bybit ``ts``/``cts``, Deribit ``timestamp``, Hyperliquid ``time``, MEXC
+  spot ``sendTime`` (inside a BINARY protobuf frame) and MEXC futures
+  ``ts``/``cts``, Hypercall ``published_at``/``timestamp``; Binance SPOT
+  bookTicker carries no timestamp and is recorded for lead-lag only);
 * **order-path RTT** proxy per venue: TCP connect, TLS handshake and the
   steady-state request round trip on a kept-alive HTTPS connection to the
   venue's REST edge (the same edge an order would take);
 * **clock offset** venue - host from the venue's time endpoint with the
   RTT/2 correction, so feed delays are venue-clock-relative and the host's
-  NTP error cancels.
+  NTP error cancels. A venue with no REST time endpoint (Hypercall) answers
+  an in-band ``ClockSync`` on the WS instead: the probe stamps its send
+  wall-clock ns into the nonce, and the midpoint rule gives the same
+  RTT/2-corrected offset.
 
 Every message is written to ``<out>/<venue>.ndjson`` (venue, stream, local
 wall + monotonic receive ns, venue timestamps, top of book / trade price)
@@ -38,6 +42,7 @@ Convention: full ``import x`` only. No ``from x import y``.
 
 import argparse
 import base64
+import http.client
 import json
 import os
 import pathlib
@@ -75,7 +80,33 @@ _SOCKET_TIMEOUT_S = 30.0
 _PERCENTILES = (0.5, 0.9, 0.99)
 _FRAME_HEAD_BYTES = 2
 _STATUS_LINE_MIN_PARTS = 2
-
+# Protocol Buffers wire types (MEXC spot, the first binary feed here).
+_PB_VARINT = 0
+_PB_I64 = 1
+_PB_LEN = 2
+_PB_I32 = 5
+_PB_VARINT_MAX_BYTES = 10
+_PB_I64_BYTES = 8
+_PB_I32_BYTES = 4
+# MEXC spot `PushDataV3ApiWrapper` / `PublicAggreBookTickerV3Api` field
+# numbers (docs/mexc-ingress-plan.md §1.1; re-measured live 2026-09-23).
+_MEXC_PB_SEND_TIME = 6
+_MEXC_PB_BOOK_TICKER = 315
+_MEXC_PB_BID = 1
+_MEXC_PB_ASK = 3
+_MEXC_PB_VERSION = 5
+# HC0: a keepalive text carrying this token is re-rendered per send with the
+# host's wall-clock ns (Hypercall's ``ClockSync`` nonce -> its offset sample).
+_NONCE_TOKEN = "%NONCE%"
+# HC0: the Hypercall probe universe — 4 underlyings x 5 instruments (plan §3
+# HC0), nearest the index on the nearest expiry outside the provider's
+# pre-expiry quoting blackout (plan §1.7: none quoted at T-38 min).
+_HC_REST_HOST = "api.hypercall.xyz"
+_HC_PROBE_UNDERLYINGS = ("BTC", "ETH", "SP500", "NVDA")
+_HC_PROBE_PER_UNDERLYING = 5
+_HC_BLACKOUT_MS = 2 * 3600 * 1000
+_HC_SYMBOL_FIELDS = 4
+_RAW_KIND_SCAN = 256
 
 
 def _mono_raw_ns() -> int:
@@ -86,7 +117,7 @@ def _mono_raw_ns() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Minimal RFC 6455 client (text frames; ping/pong; continuation)
+# Minimal RFC 6455 client (text + binary messages; ping/pong; continuation)
 # ---------------------------------------------------------------------------
 
 
@@ -139,7 +170,7 @@ def decode_frame(buf: bytes) -> tuple[int, bool, bytes, int] | None:
 
 
 class WsClient:
-    """One TLS WebSocket connection. ``recv_text`` answers pings itself."""
+    """One TLS WebSocket connection. ``recv_message`` answers pings itself."""
 
     def __init__(self, url: str, timeout_s: float = _SOCKET_TIMEOUT_S) -> None:
         u = urllib.parse.urlsplit(url)
@@ -150,6 +181,9 @@ class WsClient:
         self.sock: ssl.SSLSocket | None = None
         self.buf = b""
         self.fragments: list[bytes] = []
+        # The opcode of the message being reassembled (continuation
+        # frames carry 0; the FIRST frame says text or binary).
+        self.msg_opcode = _OP_TEXT
         self.connect_ms = 0.0
         self.tls_ms = 0.0
 
@@ -189,8 +223,10 @@ class WsClient:
         assert self.sock is not None
         self.sock.sendall(encode_frame(opcode, payload, os.urandom(4)))
 
-    def recv_text(self) -> str | None:
-        """Next complete text message, or None on close."""
+    def recv_message(self) -> str | bytes | None:
+        """Next complete message — ``str`` for a text message, the raw
+        ``bytes`` of a binary one (MEXC spot pushes Protocol Buffers, which
+        a UTF-8 decode would destroy) — or None on close."""
         assert self.sock is not None
         while True:
             frame = decode_frame(self.buf)
@@ -207,10 +243,14 @@ class WsClient:
             elif opcode == _OP_CLOSE:
                 return None
             elif opcode in (_OP_TEXT, _OP_BIN, _OP_CONT):
+                if opcode != _OP_CONT:
+                    self.msg_opcode = opcode
                 self.fragments.append(payload)
                 if fin:
                     msg = b"".join(self.fragments)
                     self.fragments = []
+                    if self.msg_opcode == _OP_BIN:
+                        return msg
                     return msg.decode("utf-8", errors="replace")
 
     def close(self) -> None:
@@ -312,6 +352,159 @@ def parse_hyperliquid(text: str) -> list[dict]:
     return [_rec("l2Book", _f(d.get("time")), bid=bid, ask=ask)]
 
 
+def _pb_varint(buf: bytes, pos: int) -> tuple[int, int]:
+    """One base-128 varint at ``pos`` -> (value, next pos). ValueError on
+    a truncated varint or one longer than protobuf's 10 bytes."""
+    value = 0
+    for i in range(_PB_VARINT_MAX_BYTES):
+        if pos + i >= len(buf):
+            raise ValueError("pb: truncated varint")
+        byte = buf[pos + i]
+        value |= (byte & 0x7F) << (7 * i)
+        if not byte & 0x80:  # no continuation bit: the last byte
+            return value, pos + i + 1
+    raise ValueError("pb: varint longer than 10 bytes")
+
+
+def pb_fields(buf: bytes) -> dict[int, int | bytes]:
+    """Order-agnostic forward walk of ONE protobuf message: field number
+    -> its last value (varint as ``int``, length-delimited as ``bytes``;
+    fixed 32/64-bit fields are skipped). proto3 permits any field order and
+    omits defaults, so nothing here is positional. ValueError on a
+    truncated field, field number 0, or a group (wire types 3/4)."""
+    out: dict[int, int | bytes] = {}
+    pos = 0
+    while pos < len(buf):
+        key, pos = _pb_varint(buf, pos)
+        field, wire = key >> 3, key & 0x7
+        if field == 0:
+            raise ValueError("pb: field number 0")
+        if wire == _PB_VARINT:
+            out[field], pos = _pb_varint(buf, pos)
+            continue
+        if wire == _PB_LEN:
+            size, pos = _pb_varint(buf, pos)
+            end = pos + size
+        elif wire == _PB_I64:
+            end = pos + _PB_I64_BYTES
+        elif wire == _PB_I32:
+            end = pos + _PB_I32_BYTES
+        else:
+            raise ValueError(f"pb: wire type {wire} refused")
+        if end > len(buf):
+            raise ValueError("pb: truncated field")
+        if wire == _PB_LEN:
+            out[field] = buf[pos:end]
+        pos = end
+    return out
+
+
+def _pb_ascii(value: int | bytes | None) -> str | None:
+    """A length-delimited field carrying an ASCII decimal (MEXC ships every
+    price as a string inside the protobuf)."""
+    return value.decode("ascii") if isinstance(value, bytes) else None
+
+
+def parse_mexc(msg: str | bytes) -> list[dict]:
+    """MEXC, both classes (MX7) — the probe's first BINARY parser.
+
+    Spot (``wbs-api.mexc.com/ws``) pushes protobuf in BINARY frames: the
+    ``PushDataV3ApiWrapper`` field 6 is ``sendTime`` (varint ms) and field
+    315 the aggregated bookTicker body, whose fields 1/3 are bid/ask as
+    ASCII decimals and 5 the book ``version``. Futures
+    (``contract.mexc.com/edge``) push JSON: ``push.depth.full`` carries the
+    envelope ``ts`` (send) and ``data.cts`` (the book's stamp) — the Bybit
+    ``ts``/``cts`` pair — with ``[price, volume, orderCount]`` rows. Both
+    shapes measured live 2026-09-23. Text frames that are neither (the spot
+    subscription ack, either pong, the futures ``rs.sub.*`` ack) yield
+    nothing."""
+    if isinstance(msg, bytes):
+        wrapper = pb_fields(msg)
+        body = wrapper.get(_MEXC_PB_BOOK_TICKER)
+        if not isinstance(body, bytes):
+            return []
+        send = wrapper.get(_MEXC_PB_SEND_TIME)
+        tick = pb_fields(body)
+        version = _pb_ascii(tick.get(_MEXC_PB_VERSION))
+        return [_rec("aggre.bookTicker", _f(send) if isinstance(send, int) else None,
+                     bid=_f(_pb_ascii(tick.get(_MEXC_PB_BID))),
+                     ask=_f(_pb_ascii(tick.get(_MEXC_PB_ASK))),
+                     seq=int(version) if version and version.isdigit() else None)]
+    m = json.loads(msg)
+    if not isinstance(m, dict) or m.get("channel") != "push.depth.full":
+        return []
+    d = m.get("data") or {}
+    bids = d.get("bids") or []
+    asks = d.get("asks") or []
+    return [_rec("depth.full", _f(m.get("ts")), _f(d.get("cts")),
+                 bid=_f(bids[0][0]) if bids else None, ask=_f(asks[0][0]) if asks else None,
+                 seq=d.get("version"))]
+
+
+# One decoded JSON object (the probe's records are plain dicts too).
+_JsonObj = dict[str, typing.Any]
+
+
+def _hc_quote(m: _JsonObj) -> _JsonObj:
+    return _rec("indicative", _f(m.get("published_at")), _f(m.get("timestamp")),
+                bid=_f(m.get("best_bid")), ask=_f(m.get("best_ask")),
+                sym=m.get("instrument"), providers=m.get("num_providers"))
+
+
+def _hc_index(m: _JsonObj) -> _JsonObj:
+    prices = m.get("prices") or []
+    stamps = [_f(e.get("timestamp")) for e in prices if isinstance(e, dict)]
+    newest = max((t for t in stamps if t is not None), default=None)
+    return _rec("index", newest, _f(m.get("timestamp")), n=len(prices))
+
+
+def _hc_trade(m: _JsonObj) -> _JsonObj:
+    return _rec("trade", _f(m.get("timestamp")), px=_f(m.get("price")),
+                sym=m.get("symbol"), side=m.get("side"))
+
+
+def _hc_listing(m: _JsonObj) -> _JsonObj:
+    return _rec("market_update", _f(m.get("timestamp")), sym=m.get("symbol"),
+                action=m.get("action"))
+
+
+def _hc_clock(m: _JsonObj) -> _JsonObj:
+    nonce = str(m.get("nonce", ""))
+    return _rec("clocksync", _f(m.get("server_at")),
+                sent_wall_ns=int(nonce) if nonce.isdigit() else None)
+
+
+_HC_RECORDS: dict[str, typing.Callable[[_JsonObj], _JsonObj]] = {
+    "IndicativeMarketData": _hc_quote,
+    "IndexPriceUpdate": _hc_index,
+    "Trade": _hc_trade,
+    "MarketUpdate": _hc_listing,
+    "ClockSynced": _hc_clock,
+}
+
+
+def parse_hypercall(msg: str | bytes) -> list[_JsonObj]:
+    """Hypercall public WS (HC0, ``wss://api.hypercall.xyz/ws``). Every
+    message is JSON with a ``"type"``; numbers are JSON strings.
+
+    ``IndicativeMarketData`` carries TWO stamps: ``published_at`` (the API
+    clock when the payload was published — the wire leg starts there) and
+    ``timestamp`` (the quote's own stamp, the provider's ``updated_at``), so
+    ``delay/T - delay`` is the server-side quote-to-publish lag.
+    ``IndexPriceUpdate`` stamps the OLDEST source observation in the frame
+    (``timestamp``) and each entry its own: ``ts`` is the newest entry,
+    ``ts2`` the frame's oldest. ``ClockSynced`` answers the probe's
+    ``ClockSync`` keepalive, whose nonce is the host's send wall-clock ns:
+    it is the venue's clock-offset sample (there is no REST time
+    endpoint). ``MarketUpdate`` (listing/expiry) is recorded for its
+    stamp. ``Subscribed`` / ``Error`` / anything else yields nothing."""
+    if isinstance(msg, bytes):
+        return []
+    m = json.loads(msg)
+    build = _HC_RECORDS.get(m.get("type", "")) if isinstance(m, dict) else None
+    return [build(m)] if build is not None else []
+
+
 # ---------------------------------------------------------------------------
 # Venue table (WS endpoints = the engine's; REST = the venue's public edge)
 # ---------------------------------------------------------------------------
@@ -323,12 +516,16 @@ class VenueSpec(typing.NamedTuple):
     subscribe: str | None
     keepalive: str | None
     keepalive_s: float
-    parse: typing.Callable[[str], list[dict]]
+    # A text message arrives as ``str``, a binary one as ``bytes`` (MEXC spot).
+    parse: typing.Callable[[str | bytes], list[dict]]
     rest_host: str
     rest_path: str
     rest_method: str
     rest_body: str | None
     time_ms_of: typing.Callable[[bytes], float | None]
+    # HC0: extra subscribe frames built at connect time (live symbol names —
+    # Hypercall's filter needs full instrument names, which roll daily).
+    subscribe_fn: typing.Callable[[], list[str]] | None = None
 
 
 def _t_binance(body: bytes) -> float | None:
@@ -353,8 +550,64 @@ def _t_deribit(body: bytes) -> float | None:
     return _f(json.loads(body).get("result"))
 
 
+def _t_mexc(body: bytes) -> float | None:
+    """MEXC futures ``/api/v1/contract/ping`` -> ``{"success": true, "code":
+    0, "data": <ms>}`` (the spot host's ``/api/v3/time`` is the Binance
+    body and rides ``_t_binance``)."""
+    return _f(json.loads(body).get("data"))
+
+
 def _t_none(_body: bytes) -> float | None:
     return None
+
+
+def hypercall_pick_symbols(rows: list[_JsonObj], now_ms: float,
+                           per_underlying: int = _HC_PROBE_PER_UNDERLYING) -> list[str]:
+    """From one ``/options-summary?currency=<U>`` result (the Deribit-shaped
+    ``result`` list): the nearest expiry outside the pre-expiry blackout,
+    then the ``per_underlying`` instruments whose strike is nearest the
+    index (``underlying_price``), calls and puts interleaved by distance.
+    Symbols are ``<UND>-<YYYYMMDD>-<STRIKE>-<C|P>``; strikes may be decimal."""
+    live = []
+    for r in rows:
+        name = str(r.get("instrument_name", ""))
+        parts = name.split("-")
+        expiry = _f(r.get("expiration_timestamp"))
+        und = _f(r.get("underlying_price"))
+        if len(parts) != _HC_SYMBOL_FIELDS or expiry is None or und is None:
+            continue
+        if expiry - now_ms <= _HC_BLACKOUT_MS:
+            continue
+        live.append((expiry, abs(float(parts[2]) - und), name))
+    if not live:
+        return []
+    nearest = min(e for e, _, _ in live)
+    chain = sorted((d, n) for e, d, n in live if e == nearest)
+    return [n for _, n in chain[:per_underlying]]
+
+
+def _hypercall_subscribe() -> list[str]:
+    """One ``Subscribe`` per channel (the frame takes ONE ``channel``):
+    ``index_prices`` and ``trades`` and ``market_updates`` unfiltered, and
+    ``indicative_market_data`` filtered to the live probe universe in ONE
+    frame (plan D3 — many frames tripped the ``message_limit`` close)."""
+    now_ms = time.time_ns() / NS_PER_MS
+    symbols: list[str] = []
+    for und in _HC_PROBE_UNDERLYINGS:
+        conn = http.client.HTTPSConnection(_HC_REST_HOST, timeout=_SOCKET_TIMEOUT_S)
+        try:
+            conn.request("GET", f"/options-summary?currency={und}",
+                         headers={"Accept": "application/json",
+                                  "User-Agent": "multivenue-latency-probe/1"})
+            body = conn.getresponse().read()
+        finally:
+            conn.close()
+        symbols += hypercall_pick_symbols(json.loads(body).get("result") or [], now_ms)
+    frames = [json.dumps({"type": "Subscribe", "channel": c})
+              for c in ("index_prices", "trades", "market_updates")]
+    frames.append(json.dumps({"type": "Subscribe", "channel": "indicative_market_data",
+                              "symbols": symbols}))
+    return frames
 
 
 VENUES: tuple[VenueSpec, ...] = (
@@ -389,8 +642,25 @@ VENUES: tuple[VenueSpec, ...] = (
                           "subscription": {"type": "l2Book", "coin": "BTC"}}),
               json.dumps({"method": "ping"}), 45.0, parse_hyperliquid,
               "api.hyperliquid.xyz", "/info", "POST", json.dumps({"type": "meta"}), _t_none),
+    # MX7: MEXC splits spot and futures across different hosts on BOTH
+    # planes, so each class is its own row (one WS + one REST edge each).
+    VenueSpec("mexc", "wss://wbs-api.mexc.com/ws",
+              json.dumps({"method": "SUBSCRIPTION",
+                          "params": ["spot@public.aggre.bookTicker.v3.api.pb@10ms@BTCUSDT"]}),
+              json.dumps({"method": "PING"}), 20.0, parse_mexc,
+              "api.mexc.com", "/api/v3/time", "GET", None, _t_binance),
+    VenueSpec("mexc-perp", "wss://contract.mexc.com/edge",
+              json.dumps({"method": "sub.depth.full",
+                          "param": {"symbol": "BTC_USDT", "limit": 5}}),
+              json.dumps({"method": "ping"}), 20.0, parse_mexc,
+              "contract.mexc.com", "/api/v1/contract/ping", "GET", None, _t_mexc),
     VenueSpec("polymarket", "", None, None, 0.0, parse_hyperliquid,
               "clob.polymarket.com", "/time", "GET", None, _t_none),
+    # HC0: no REST time endpoint — the offset rides the in-band ClockSync
+    # keepalive (5 s; the server's own Ping is answered by WsClient).
+    VenueSpec("hypercall", "wss://api.hypercall.xyz/ws", None,
+              json.dumps({"type": "ClockSync", "nonce": _NONCE_TOKEN}), 5.0, parse_hypercall,
+              _HC_REST_HOST, "/health", "GET", None, _t_none, _hypercall_subscribe),
 )
 
 
@@ -510,12 +780,34 @@ def rest_probe(spec: VenueSpec, samples: int = _DEFAULT_REST_SAMPLES) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def raw_kind(msg: str | bytes) -> str:
+    """The golden-frame bucket of a raw message: the first ``"type"``
+    value (Hypercall-style envelopes), else ``binary`` / ``other``."""
+    if isinstance(msg, bytes):
+        return "binary"
+    head = msg[:_RAW_KIND_SCAN]
+    at = head.find('"type"')
+    if at < 0:
+        return "other"
+    rest = head[at + len('"type"'):].lstrip(" :")
+    if not rest.startswith('"'):
+        return "other"
+    end = rest.find('"', 1)
+    return rest[1:end] if end > 0 else "other"
+
+
 class Collector(threading.Thread):
-    def __init__(self, spec: VenueSpec, out_dir: pathlib.Path, stop: threading.Event) -> None:
+    def __init__(self, spec: VenueSpec, out_dir: pathlib.Path, stop: threading.Event,
+                 raw_per_kind: int = 0) -> None:
         super().__init__(name=f"probe-{spec.name}", daemon=True)
         self.spec = spec
         self.stop = stop
         self.path = out_dir / f"{spec.name}.ndjson"
+        # HC0 golden frames: the first ``raw_per_kind`` raw text messages of
+        # every ``raw_kind`` bucket, verbatim (0 = off).
+        self.raw_path = out_dir / f"{spec.name}.raw.ndjson"
+        self.raw_per_kind = raw_per_kind
+        self.raw_counts: dict[str, int] = {}
         self.count = 0
         self.errors: list[str] = []
         self.connect_ms = 0.0
@@ -525,7 +817,7 @@ class Collector(threading.Thread):
         while not self.stop.is_set():
             try:
                 self._session()
-            except (OSError, ConnectionError, ValueError) as e:
+            except (OSError, ConnectionError, ValueError, http.client.HTTPException) as e:
                 self.errors.append(f"{time.time():.0f} {e!r}")
                 time.sleep(2.0)
 
@@ -536,18 +828,45 @@ class Collector(threading.Thread):
         self.tls_ms = ws.tls_ms
         if self.spec.subscribe:
             ws.send_text(self.spec.subscribe)
+        if self.spec.subscribe_fn is not None:
+            for frame in self.spec.subscribe_fn():
+                ws.send_text(frame)
         ws.sock.settimeout(5.0)  # type: ignore[union-attr]
         last_keepalive = time.monotonic()
+        raw = open(self.raw_path, "a", encoding="utf-8") if self.raw_per_kind else None
+        try:
+            self._pump(ws, last_keepalive, raw)
+        finally:
+            if raw is not None:
+                raw.close()
+        ws.close()
+
+    def _keepalive_text(self) -> str:
+        assert self.spec.keepalive is not None
+        return self.spec.keepalive.replace(_NONCE_TOKEN, str(time.time_ns()))
+
+    def _tap(self, raw: typing.TextIO, text: str | bytes, t_wall: int) -> None:
+        kind = raw_kind(text)
+        seen = self.raw_counts.get(kind, 0)
+        if seen >= self.raw_per_kind or isinstance(text, bytes):
+            return
+        self.raw_counts[kind] = seen + 1
+        raw.write(json.dumps({"kind": kind, "t_recv_wall_ns": t_wall, "msg": text},
+                             separators=(",", ":")) + "\n")
+
+    def _pump(self, ws: WsClient, last_keepalive: float, raw: typing.TextIO | None) -> None:
         with open(self.path, "a", encoding="ascii") as f:
             while not self.stop.is_set():
                 try:
-                    text = ws.recv_text()
+                    text = ws.recv_message()
                 except TimeoutError:
                     text = ""
                 if text is None:
                     break
                 t_wall = time.time_ns()
                 t_mono = _mono_raw_ns()
+                if text and raw is not None:
+                    self._tap(raw, text, t_wall)
                 if text:
                     for r in self.spec.parse(text):
                         r["venue"] = self.spec.name
@@ -557,9 +876,8 @@ class Collector(threading.Thread):
                         self.count += 1
                 now = time.monotonic()
                 if self.spec.keepalive and now - last_keepalive >= self.spec.keepalive_s:
-                    ws.send_text(self.spec.keepalive)
+                    ws.send_text(self._keepalive_text())
                     last_keepalive = now
-        ws.close()
 
 
 # ---------------------------------------------------------------------------
@@ -605,16 +923,40 @@ def feed_delay_stats(ndjson_path: pathlib.Path, offset_ms: float) -> dict[str, d
     return out
 
 
-def summarize(out_dir: pathlib.Path, rest_runs: list[dict], collectors: list[Collector]) -> dict:
+def ws_clock_offsets(ndjson_path: pathlib.Path) -> list[float]:
+    """venue - host (ms) from in-band ``clocksync`` records: the venue
+    stamped ``venue_ts_ms`` somewhere inside [send, recv], taken as the
+    midpoint (the REST probe's RTT/2 rule)."""
+    out: list[float] = []
+    if not ndjson_path.exists():
+        return out
+    with open(ndjson_path, "r", encoding="ascii") as f:
+        for line in f:
+            r = json.loads(line)
+            sent = r.get("sent_wall_ns")
+            if r.get("stream") != "clocksync" or sent is None or r.get("venue_ts_ms") is None:
+                continue
+            mid_ms = (sent + r["t_recv_wall_ns"]) / 2.0 / NS_PER_MS
+            out.append(r["venue_ts_ms"] - mid_ms)
+    return out
+
+
+def summarize(out_dir: pathlib.Path, rest_runs: list[dict], collectors: list[Collector],
+              venues: tuple[VenueSpec, ...] = VENUES) -> dict:
     by_venue: dict[str, list[dict]] = {}
     for r in rest_runs:
         by_venue.setdefault(r["venue"], []).append(r)
     summary: dict = {"generated_wall_ns": time.time_ns(), "host": socket.gethostname(),
                      "venues": {}}
-    for spec in VENUES:
+    for spec in venues:
         runs = by_venue.get(spec.name, [])
+        col = next((c for c in collectors if c.spec.name == spec.name), None)
         rtts = [x for r in runs for x in r["rtt_ms"]]
         offs = [x for r in runs for x in r["clock_offset_ms"]]
+        offset_source = "rest" if offs else None
+        if not offs and col is not None:
+            offs = ws_clock_offsets(col.path)
+            offset_source = "ws" if offs else None
         offset = statistics.median(offs) if offs else 0.0
         v: dict = {
             "rest_host": spec.rest_host,
@@ -625,14 +967,16 @@ def summarize(out_dir: pathlib.Path, rest_runs: list[dict], collectors: list[Col
             "clock_offset_ms": percentiles(offs),
             "clock_offset_used_ms": offset,
             "offset_known": bool(offs),
+            "offset_source": offset_source,
         }
-        col = next((c for c in collectors if c.spec.name == spec.name), None)
         if col is not None:
             v["ws_connect_ms"] = col.connect_ms
             v["ws_tls_ms"] = col.tls_ms
             v["ws_messages"] = col.count
             v["ws_errors"] = col.errors[-5:]
             v["streams"] = feed_delay_stats(col.path, offset)
+            if col.raw_per_kind:
+                v["raw_frames"] = dict(col.raw_counts)
         summary["venues"][spec.name] = v
     return summary
 
@@ -671,11 +1015,31 @@ def render(summary: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+def select_venues(names: str) -> tuple[VenueSpec, ...]:
+    """``--venues a,b`` -> those rows in table order; empty -> all. An
+    unknown name is an error, never a silent skip."""
+    wanted = [n.strip() for n in names.split(",") if n.strip()]
+    if not wanted:
+        return VENUES
+    known = {v.name for v in VENUES}
+    unknown = [n for n in wanted if n not in known]
+    if unknown:
+        raise ValueError(f"unknown venue(s): {', '.join(unknown)}")
+    return tuple(v for v in VENUES if v.name in wanted)
+
+
+class RunOpts(typing.NamedTuple):
+    """Which rows to probe, and the golden-frame tap (0 = off)."""
+    venues: tuple[VenueSpec, ...] = VENUES
+    raw_per_kind: int = 0
+
+
 def run(out_dir: pathlib.Path, minutes: float, rest_every_s: float, rest_samples: int,
-        venues: tuple[VenueSpec, ...] = VENUES) -> dict:
+        opts: RunOpts = RunOpts()) -> dict:
+    venues = opts.venues
     out_dir.mkdir(parents=True, exist_ok=True)
     stop = threading.Event()
-    collectors = [Collector(s, out_dir, stop) for s in venues if s.ws_url]
+    collectors = [Collector(s, out_dir, stop, opts.raw_per_kind) for s in venues if s.ws_url]
     for c in collectors:
         c.start()
     rest_runs: list[dict] = []
@@ -695,7 +1059,7 @@ def run(out_dir: pathlib.Path, minutes: float, rest_every_s: float, rest_samples
     stop.set()
     for c in collectors:
         c.join(timeout=10.0)
-    summary = summarize(out_dir, rest_runs, collectors)
+    summary = summarize(out_dir, rest_runs, collectors, venues)
     with open(out_dir / "summary.json", "w", encoding="ascii") as f:
         json.dump(summary, f, indent=1)
     return summary
@@ -708,9 +1072,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--minutes", type=float, default=_DEFAULT_MINUTES)
     p.add_argument("--rest-every-s", type=float, default=_DEFAULT_REST_EVERY_S)
     p.add_argument("--rest-samples", type=int, default=_DEFAULT_REST_SAMPLES)
+    p.add_argument("--venues", default="",
+                   help="comma list of venue rows to probe (default: every row)")
+    p.add_argument("--raw-per-kind", type=int, default=0,
+                   help="golden frames: keep the first N raw messages of every message "
+                        "type per venue in <venue>.raw.ndjson (0 = off)")
     a = p.parse_args(argv)
     summary = run(pathlib.Path(os.path.expanduser(a.out)), a.minutes, a.rest_every_s,
-                  a.rest_samples)
+                  a.rest_samples, RunOpts(select_venues(a.venues), a.raw_per_kind))
     print(render(summary))
     return 0
 

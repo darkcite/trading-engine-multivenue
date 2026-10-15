@@ -150,7 +150,7 @@ def regime_word_is_wire_declared(word: int) -> bool:
         if name == "source":
             continue
         b = (word >> (8 * byte_index)) & 0xFF
-        if b == 0 or b == REGIME_DIM_UNKNOWN_BIT:
+        if b in (0, REGIME_DIM_UNKNOWN_BIT):
             continue
         if b & (b - 1) or b.bit_length() > len(REGIME_VALUES[name]):
             return False
@@ -174,6 +174,11 @@ VENUE_HYPERLIQUID: int = 4
 VENUE_AI: int = 5
 # WS9: the sixth market-data venue.
 VENUE_BYBIT: int = 6
+# MX7: the seventh (docs/mexc-ingress-plan.md; data-only, O-MX1).
+VENUE_MEXC: int = 7
+# HC6: the tenth venue byte (Hypercall options; data-only, O-HC1) — the
+# research store keys `hypercall_history` rows by it.
+VENUE_HYPERCALL: int = 9
 FLAG_EXPIRE_ON_SILENCE: int = 1
 
 # len u16 + AiCmd head (50 B); the 16 pad bytes are zeroed separately.

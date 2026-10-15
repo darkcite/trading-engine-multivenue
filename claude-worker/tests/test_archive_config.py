@@ -176,6 +176,9 @@ def test_defaults_are_the_measured_values(tmp_path: pathlib.Path) -> None:
     assert cfg.cache_max_gib == 20
     assert cfg.cache_min_free_gib == 25
     assert cfg.skip_globs == ()
+    # HK11/HK20: the cap; at 20 the link (~5 MB/s) binds, and the client
+    # still writes 64 KiB at a time — an uncapped push stalled the feeds.
+    assert cfg.max_upload_mibps == 20.0
 
 
 def test_malformed_numeric_values_fall_back_to_defaults(tmp_path: pathlib.Path) -> None:
@@ -286,3 +289,13 @@ def test_disabled_config_still_answers_cache_questions(tmp_path: pathlib.Path) -
     assert not cfg.enabled
     assert cfg.cache_dir == tmp_path / "cache"
     assert cfg.cache_max_gib == 20
+
+
+def test_upload_cap_is_overridable_and_never_negative(tmp_path: pathlib.Path) -> None:
+    env = dict(FULL_ENV, MULTIVENUE_S3_MAX_UPLOAD_MIBPS="0.5")
+    cfg = claude_worker.archive_config.load(env=env, env_file=nowhere(tmp_path))
+    assert cfg.max_upload_mibps == 0.5
+    for raw in ("0", "-3"):
+        env = dict(FULL_ENV, MULTIVENUE_S3_MAX_UPLOAD_MIBPS=raw)
+        cfg = claude_worker.archive_config.load(env=env, env_file=nowhere(tmp_path))
+        assert cfg.max_upload_mibps == 0.0

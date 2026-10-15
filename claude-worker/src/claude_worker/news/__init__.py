@@ -59,6 +59,9 @@ DB_FILENAME: str = "news.db"
 #: File outputs under ``news_dir`` (spec §4.4). Named here so every writer
 #: and every reader agrees without repeating a literal.
 CALENDAR_FILE: str = "calendar.json"
+#: The scheduled-events feed (O-HC8, ``news.scheduled``): per-underlying
+#: dated events for the Hypercall S1 event law.
+SCHEDULED_EVENTS_FILE: str = "scheduled-events.json"
 SCORECARD_FILE: str = "scorecard.json"
 ALERT_FILE: str = "ALERT"
 UNIVERSE_PROPOSALS_FILE: str = "universe-proposals.toml"

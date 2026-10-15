@@ -52,7 +52,9 @@ def _proposal_json(rows: list[dict[str, object]] | None = None, thesis: str = "l
 
 def test_interval_default_and_override() -> None:
     assert claude_worker.strategist.interval_s(env={}) == 21_600
-    assert claude_worker.strategist.interval_s(env={"CLAUDE_WORKER_STRATEGIST_INTERVAL_S": "60"}) == 60
+    assert (
+        claude_worker.strategist.interval_s(env={"CLAUDE_WORKER_STRATEGIST_INTERVAL_S": "60"}) == 60
+    )
 
 
 @pytest.mark.parametrize("raw", ["abc", "1.5", "0", "-1"])
@@ -101,8 +103,15 @@ def test_static_block_teaches_the_live_caps_and_gates() -> None:
     both moved. A keyed serve reads this text as law, so pin it to the
     numbers `backtest.GateThresholds` actually enforces."""
     text = typing.cast(str, claude_worker.strategist.system_blocks()[0]["text"])
-    for needle in ("$10,000", "$20,000", "$100,000", "$7,500", ">= 50 OOS legs",
-                   ">= 10 round trips", ">= 1 OOS trading day"):
+    for needle in (
+        "$10,000",
+        "$20,000",
+        "$100,000",
+        "$7,500",
+        ">= 50 OOS legs",
+        ">= 10 round trips",
+        ">= 1 OOS trading day",
+    ):
         assert needle in text, f"static block is missing {needle!r}"
     for stale in ("$250", "$1000", ">= 2 OOS trading days", "<= $200"):
         assert stale not in text, f"static block still teaches the superseded {stale!r}"
@@ -118,9 +127,22 @@ def test_static_block_teaches_the_v2_grammar() -> None:
     can only author the legacy v1 sugar — no funding, options, depth,
     positions, groups, holds or confirms."""
     text = typing.cast(str, claude_worker.strategist.system_blocks()[0]["text"])
-    for needle in ('"instrument"', '"feature"', '"combine"', '"enter"', '"exit"',
-                   '"group"', '"min_hold_s"', '"confirm_pair"', "diff_bps",
-                   "apr24", "mark_iv", "depth_imb", "clock_utc_sod", "4320"):
+    for needle in (
+        '"instrument"',
+        '"feature"',
+        '"combine"',
+        '"enter"',
+        '"exit"',
+        '"group"',
+        '"min_hold_s"',
+        '"confirm_pair"',
+        "diff_bps",
+        "apr24",
+        "mark_iv",
+        "depth_imb",
+        "clock_utc_sod",
+        "4320",
+    ):
         assert needle in text, f"static block is missing {needle!r}"
     # Every FeatId token and every combine token is offered.
     for feature in claude_worker.strategist.FEATURES:
@@ -180,7 +202,13 @@ def test_revision_prompt_carries_gates_report_and_prior_rows() -> None:
     prompt = claude_worker.strategist.build_revision_prompt(
         "DIGEST-BODY", '{"rows":[]}', "pnl_positive=False -> FAIL", '{"gates":{}}'
     )
-    for needle in ("DIGEST-BODY", '{"rows":[]}', "pnl_positive=False -> FAIL", '{"gates":{}}', "FAILED"):
+    for needle in (
+        "DIGEST-BODY",
+        '{"rows":[]}',
+        "pnl_positive=False -> FAIL",
+        '{"gates":{}}',
+        "FAILED",
+    ):
         assert needle in prompt
 
 
@@ -199,7 +227,14 @@ def test_parse_proposal_good_two_rows() -> None:
     assert claude_worker.strategist.parse_proposal(_proposal_json(rows)) is None
     assert len(proposal.rows) == 2
     assert list(proposal.rows[0]) == [
-        "name", "family", "trigger", "sym", "side", "edge_bps", "horizon_ms", "max_risk_usd",
+        "name",
+        "family",
+        "trigger",
+        "sym",
+        "side",
+        "edge_bps",
+        "horizon_ms",
+        "max_risk_usd",
     ], "canonical key order"
     assert proposal.rows[1]["trigger"] == {"type": "cross_deviation", "ref": 7}
 
@@ -291,8 +326,18 @@ def test_parse_proposal_v2_row_round_trips() -> None:
     assert row["combine"] == "diff_bps"
     # Emission order is deterministic — artifact_bytes hashes these bytes.
     assert list(row) == [
-        "name", "family", "instrument", "ref", "feature", "combine",
-        "abs", "enter", "exit", "regimes", "horizon_ms", "max_risk_usd",
+        "name",
+        "family",
+        "instrument",
+        "ref",
+        "feature",
+        "combine",
+        "abs",
+        "enter",
+        "exit",
+        "regimes",
+        "horizon_ms",
+        "max_risk_usd",
     ]
 
 
@@ -322,8 +367,9 @@ def test_parse_proposal_v2_single_leg_and_rolling_window() -> None:
     # depth-imb-proof shape: no ref ⇒ no combine (lhs_only is inferred).
     single = _v2(name="imb", ref=None, combine=None, feature="depth_imb", enter=0.6)
     assert claude_worker.strategist.parse_proposal(_proposal_json([single])) is not None
-    rolling = _v2(name="roll", ref=None, combine=None, feature="roll_mean",
-                  window_min=60, enter=100.0)
+    rolling = _v2(
+        name="roll", ref=None, combine=None, feature="roll_mean", window_min=60, enter=100.0
+    )
     assert claude_worker.strategist.parse_proposal(_proposal_json([rolling])) is not None
 
 
@@ -353,8 +399,9 @@ def test_parse_proposal_v2_single_leg_and_rolling_window() -> None:
         _v2(**{"abs": 1}),  # int is not a bool
         _v2(confirm=1.0),  # confirm without confirm_feature
         _v2(confirm_feature="apr72"),  # confirm_feature without confirm
-        _v2(ref=None, combine=None, confirm_feature="mid", confirm=1.0,
-            confirm_pair=True),  # paired confirm needs a second leg
+        _v2(
+            ref=None, combine=None, confirm_feature="mid", confirm=1.0, confirm_pair=True
+        ),  # paired confirm needs a second leg
         _v2(exit=None, group=3),  # group without exit
         _v2(exit=None, min_hold_s=60),
         _v2(exit=None, max_hold_s=60),
@@ -365,7 +412,7 @@ def test_parse_proposal_v2_single_leg_and_rolling_window() -> None:
         _v2(max_risk_usd=10_000.01),
         _v2(max_risk_usd=0),
         _v2(horizon_ms=9),
-        _v2(instrument="okx:BTC–USDT"),  # noqa: RUF001 — the EN DASH is the point
+        _v2(instrument="okx:BTC–USDT"),  # the EN DASH is the point
         _v2(instrument=""),
         _v2(instrument="x" * 129),
         _v2(enter=float("inf")),
@@ -381,33 +428,70 @@ def test_parse_proposal_v2_row_malformed(row: dict[str, object]) -> None:
 def test_static_block_v3_teaches_the_regime_keys_and_variants() -> None:
     assert claude_worker.strategist.STRATEGIST_PROMPT_VERSION == "strategist-v5"
     text = typing.cast(str, claude_worker.strategist.system_blocks()[0]["text"])
-    for needle in ('"regimes"', '"regime_off"', '"rel"', "REGIME LAW", "GATE, never a signal",
-                   "exits", "NEVER gated", "VARIANTS", "DISJOINT", "--regime off",
-                   "trend:bull", '"soft"', '"hard"', "lagging|inline|leading",
-                   "WORKED EXAMPLE C"):
+    for needle in (
+        '"regimes"',
+        '"regime_off"',
+        '"rel"',
+        "REGIME LAW",
+        "GATE, never a signal",
+        "exits",
+        "NEVER gated",
+        "VARIANTS",
+        "DISJOINT",
+        "--regime off",
+        "trend:bull",
+        '"soft"',
+        '"hard"',
+        "lagging|inline|leading",
+        "WORKED EXAMPLE C",
+    ):
         assert needle in text, f"static block is missing {needle!r}"
-    for dim, values in claude_worker.strategist._REGIME_DIM_VALUES.items():  # noqa: SLF001
+    for dim, values in claude_worker.strategist._REGIME_DIM_VALUES.items():
         assert dim in text
         for v in values:
             assert v in text, f"static block never names {dim}:{v}"
     # The worked examples parse under the mirror (a prompt that teaches an
     # unparseable row would be a lie).
     for example in (
-        {"name": "xv-btc-okx-bn", "family": "crypto", "instrument": "okx:BTC-USDT",
-         "ref": "binance:btcusdt", "feature": "mid", "combine": "diff_bps", "abs": True,
-         "enter": 3.0, "regimes": ["vol:!high", "slow:shape:chop|mixed"],
-         "horizon_ms": 60000, "max_risk_usd": 3000.0},
-        {"name": "mom-eth-bull", "instrument": "okx:ETH-USDT-SWAP", "feature": "mid",
-         "ref": "binance-usdm:ethusdt", "ref_feature": "roll_mean", "ref_window_min": 30,
-         "combine": "diff_bps", "enter": 25.0, "exit": 5.0, "side": "bid",
-         "regimes": ["trend:bull", "shape:trend"], "rel": "leading|inline",
-         "horizon_ms": 300000, "max_risk_usd": 2000.0},
+        {
+            "name": "xv-btc-okx-bn",
+            "family": "crypto",
+            "instrument": "okx:BTC-USDT",
+            "ref": "binance:btcusdt",
+            "feature": "mid",
+            "combine": "diff_bps",
+            "abs": True,
+            "enter": 3.0,
+            "regimes": ["vol:!high", "slow:shape:chop|mixed"],
+            "horizon_ms": 60000,
+            "max_risk_usd": 3000.0,
+        },
+        {
+            "name": "mom-eth-bull",
+            "instrument": "okx:ETH-USDT-SWAP",
+            "feature": "mid",
+            "ref": "binance-usdm:ethusdt",
+            "ref_feature": "roll_mean",
+            "ref_window_min": 30,
+            "combine": "diff_bps",
+            "enter": 25.0,
+            "exit": 5.0,
+            "side": "bid",
+            "regimes": ["trend:bull", "shape:trend"],
+            "rel": "leading|inline",
+            "horizon_ms": 300000,
+            "max_risk_usd": 2000.0,
+        },
     ):
-        assert claude_worker.strategist.parse_proposal(_proposal_json([example])) is not None, example
+        assert claude_worker.strategist.parse_proposal(_proposal_json([example])) is not None, (
+            example
+        )
 
 
 def test_parse_proposal_v3_regime_keys_round_trip_in_canonical_order() -> None:
-    row = _v2(regimes=["trend:bull|neutral", "slow:vol:!high"], regime_off="hard", rel="lagging|inline")
+    row = _v2(
+        regimes=["trend:bull|neutral", "slow:vol:!high"], regime_off="hard", rel="lagging|inline"
+    )
     proposal = claude_worker.strategist.parse_proposal(_proposal_json([row]))
     assert proposal is not None
     out = proposal.rows[0]
@@ -415,8 +499,20 @@ def test_parse_proposal_v3_regime_keys_round_trip_in_canonical_order() -> None:
     assert out["regime_off"] == "hard"
     assert out["rel"] == "lagging|inline"
     assert list(out) == [
-        "name", "family", "instrument", "ref", "feature", "combine", "abs", "enter", "exit",
-        "regimes", "regime_off", "rel", "horizon_ms", "max_risk_usd",
+        "name",
+        "family",
+        "instrument",
+        "ref",
+        "feature",
+        "combine",
+        "abs",
+        "enter",
+        "exit",
+        "regimes",
+        "regime_off",
+        "rel",
+        "horizon_ms",
+        "max_risk_usd",
     ], "the regime keys sit before horizon_ms in the canonical emission"
     # RG8 (operator ruling 2026-09-05): an unlabelled row makes the
     # PROPOSAL malformed; the library's structural `parse_row` seam still
@@ -425,7 +521,10 @@ def test_parse_proposal_v3_regime_keys_round_trip_in_canonical_order() -> None:
     del bare["regimes"]
     assert claude_worker.strategist.parse_proposal(_proposal_json([bare])) is None
     assert claude_worker.strategist.parse_proposal(_proposal_json([_v2(), bare])) is None
-    assert claude_worker.strategist.parse_proposal(_proposal_json([bare]), require_labels=False) is not None
+    assert (
+        claude_worker.strategist.parse_proposal(_proposal_json([bare]), require_labels=False)
+        is not None
+    )
     assert claude_worker.strategist.parse_row(bare) is not None
     assert "regimes" not in typing.cast(dict, claude_worker.strategist.parse_row(bare))
     assert "REFUSED as malformed (RG8)" in claude_worker.strategist._STATIC_SYSTEM_TEXT
@@ -491,24 +590,58 @@ def test_parse_proposal_v2_mirrors_the_live_artifacts() -> None:
         # xv-v2 — committed live 2026-08-30
         _v2(),
         # cvfc-v2 — grouped per-coin funding carry with both holds
-        _v2(name="cvfc-sol-0", instrument="binance-usdm:solusdt",
-            ref="deribit:SOL_USDC-PERPETUAL", feature="apr24", combine="diff",
-            enter=0.20, exit=0.0, group=1, min_hold_s=345_600,
-            max_hold_s=1_728_000, max_risk_usd=4_950.0),
+        _v2(
+            name="cvfc-sol-0",
+            instrument="binance-usdm:solusdt",
+            ref="deribit:SOL_USDC-PERPETUAL",
+            feature="apr24",
+            combine="diff",
+            enter=0.20,
+            exit=0.0,
+            group=1,
+            min_hold_s=345_600,
+            max_hold_s=1_728_000,
+            max_risk_usd=4_950.0,
+        ),
         # basis-proof — spot↔perp bps with a funding confirm, no pair
-        _v2(name="basis-btc", instrument="binance-usdm:btcusdt",
-            ref="binance:btcusdt", feature="mid", combine="diff_bps",
-            enter=3.0, exit=0.5, confirm_feature="apr24", confirm=0.05,
-            confirm_abs=True, max_hold_s=86_400, max_risk_usd=9_900.0),
+        _v2(
+            name="basis-btc",
+            instrument="binance-usdm:btcusdt",
+            ref="binance:btcusdt",
+            feature="mid",
+            combine="diff_bps",
+            enter=3.0,
+            exit=0.5,
+            confirm_feature="apr24",
+            confirm=0.05,
+            confirm_abs=True,
+            max_hold_s=86_400,
+            max_risk_usd=9_900.0,
+        ),
         # iv-spread-proof — the OptSummary channel
-        _v2(name="iv-btc-atm", instrument="deribit:BTC-30AUG26-77500-C",
-            ref="okx:BTC-USD-260830-77500-C", feature="mark_iv",
-            combine="diff", enter=0.03, exit=0.005, max_hold_s=21_600,
-            max_risk_usd=2_000.0),
+        _v2(
+            name="iv-btc-atm",
+            instrument="deribit:BTC-30AUG26-77500-C",
+            ref="okx:BTC-USD-260830-77500-C",
+            feature="mark_iv",
+            combine="diff",
+            enter=0.03,
+            exit=0.005,
+            max_hold_s=21_600,
+            max_risk_usd=2_000.0,
+        ),
         # depth-imb-proof — single leg on the WS10-B depth channel
-        _v2(name="imb-btc-okx", instrument="okx:BTC-USDT", ref=None,
-            combine=None, feature="depth_imb", enter=0.6, exit=0.1,
-            max_hold_s=3_600, max_risk_usd=5_000.0),
+        _v2(
+            name="imb-btc-okx",
+            instrument="okx:BTC-USDT",
+            ref=None,
+            combine=None,
+            feature="depth_imb",
+            enter=0.6,
+            exit=0.1,
+            max_hold_s=3_600,
+            max_risk_usd=5_000.0,
+        ),
     ]
     proposal = claude_worker.strategist.parse_proposal(_proposal_json(live))
     assert proposal is not None, "a live-admitted artifact shape was refused"
@@ -593,7 +726,10 @@ def test_calls_today_counts_utc_day_only(tmp_path: pathlib.Path) -> None:
 
 def test_call_detail_fields() -> None:
     completion = claude_worker.llm.Completion(
-        text="x", input_tokens=1000, output_tokens=200, cache_read_input_tokens=900,
+        text="x",
+        input_tokens=1000,
+        output_tokens=200,
+        cache_read_input_tokens=900,
         cache_creation_input_tokens=0,
     )
     detail = json.loads(claude_worker.strategist.call_detail(completion, "proposal"))
@@ -619,9 +755,7 @@ def test_call_with_cache_miss_then_dedupe_hit(tmp_path: pathlib.Path) -> None:
     serve_handle = claude_worker.state.State(db)
     calls: list[tuple[list[dict[str, object]], str]] = []
 
-    def complete_fn(
-        system: list[dict[str, object]], prompt: str
-    ) -> claude_worker.llm.Completion:
+    def complete_fn(system: list[dict[str, object]], prompt: str) -> claude_worker.llm.Completion:
         calls.append((system, prompt))
         return claude_worker.llm.Completion("resp-1", 10, 5, 0, 0)
 
@@ -685,7 +819,9 @@ def _client(fake: _SystemFakeClient) -> anthropic.Anthropic:
 
 def test_complete_message_returns_usage_and_passes_system() -> None:
     usage = types.SimpleNamespace(
-        input_tokens=1200, output_tokens=340, cache_read_input_tokens=1100,
+        input_tokens=1200,
+        output_tokens=340,
+        cache_read_input_tokens=1100,
         cache_creation_input_tokens=0,
     )
     fake = _SystemFakeClient("out", usage)
@@ -714,10 +850,14 @@ def test_complete_message_omits_system_when_none_and_zeroes_absent_usage() -> No
 
 def test_complete_message_rejects_bool_usage_fields() -> None:
     usage = types.SimpleNamespace(
-        input_tokens=True, output_tokens=-5, cache_read_input_tokens=7,
+        input_tokens=True,
+        output_tokens=-5,
+        cache_read_input_tokens=7,
         cache_creation_input_tokens="x",
     )
-    completion = claude_worker.llm.complete_message(_client(_SystemFakeClient("t", usage)), "m", "p")
+    completion = claude_worker.llm.complete_message(
+        _client(_SystemFakeClient("t", usage)), "m", "p"
+    )
     assert completion == claude_worker.llm.Completion("t", 0, 0, 7, 0)
 
 
@@ -742,13 +882,24 @@ def test_stage_ruleset_attribution_written_and_preserved(tmp_path: pathlib.Path)
     # Pre-8h call shape: attribution stays NULL, row shape unchanged.
     st.stage_ruleset(full_hash, "rs.json", "rs.report.json", "session", 100)
     assert st.ruleset_row(full_hash) == (
-        full_hash, "rs.json", "rs.report.json", True, "session", 100, None,
+        full_hash,
+        "rs.json",
+        "rs.report.json",
+        True,
+        "session",
+        100,
+        None,
     )
     assert st.ruleset_attribution(full_hash) == (None, None)
     # §8.2: the auto path writes the pre-provisioned columns.
     st.stage_ruleset(
-        full_hash, "rs.json", "rs.report.json", "auto", 200,
-        model="claude-fable-5", thesis="fade the lag",
+        full_hash,
+        "rs.json",
+        "rs.report.json",
+        "auto",
+        200,
+        model="claude-fable-5",
+        thesis="fade the lag",
     )
     assert st.ruleset_attribution(full_hash) == ("claude-fable-5", "fade the lag")
     # A later restage WITHOUT attribution (e.g. §8.3 restage-prior via the
@@ -756,12 +907,16 @@ def test_stage_ruleset_attribution_written_and_preserved(tmp_path: pathlib.Path)
     st.stage_ruleset(full_hash, "rs.json", "rs.report.json", "session", 300)
     assert st.ruleset_attribution(full_hash) == ("claude-fable-5", "fade the lag")
     assert st.ruleset_row(full_hash) == (
-        full_hash, "rs.json", "rs.report.json", True, "session", 300, None,
+        full_hash,
+        "rs.json",
+        "rs.report.json",
+        True,
+        "session",
+        300,
+        None,
     ), "ruleset_row stays the pinned 7-tuple"
     # Explicit new values overwrite.
-    st.stage_ruleset(
-        full_hash, "rs.json", "rs.report.json", "auto", 400, model="m2", thesis="t2"
-    )
+    st.stage_ruleset(full_hash, "rs.json", "rs.report.json", "auto", 400, model="m2", thesis="t2")
     assert st.ruleset_attribution(full_hash) == ("m2", "t2")
     assert st.ruleset_attribution("cd" * 32) is None
     st.close()
@@ -772,14 +927,23 @@ def test_stage_ruleset_attribution_written_and_preserved(tmp_path: pathlib.Path)
 
 def test_static_block_v4_asks_for_the_regime_verdict() -> None:
     text = typing.cast(str, claude_worker.strategist.system_blocks()[0]["text"])
-    for needle in ('"regime": VERDICT', "REGIME VERDICT", '"measured"', "trend:bull,shape:trend",
-                   "OPTIONAL", "TTL", "the rows fit the regime"):
+    for needle in (
+        '"regime": VERDICT',
+        "REGIME VERDICT",
+        '"measured"',
+        "trend:bull,shape:trend",
+        "OPTIONAL",
+        "TTL",
+        "the rows fit the regime",
+    ):
         assert needle in text, f"static block is missing {needle!r}"
 
 
 def test_parse_proposal_accepts_the_optional_regime_verdict_and_refuses_bad_ones() -> None:
     base = {"thesis": "confirm", "rows": [_v2()]}
-    p = claude_worker.strategist.parse_proposal(json.dumps({**base, "regime": {"fast": "measured"}}))
+    p = claude_worker.strategist.parse_proposal(
+        json.dumps({**base, "regime": {"fast": "measured"}})
+    )
     assert p is not None and p.regime == {"fast": "measured"}
     p = claude_worker.strategist.parse_proposal(
         json.dumps({**base, "regime": {"fast": "trend:bull, shape:trend", "slow": "measured"}})
@@ -789,17 +953,19 @@ def test_parse_proposal_accepts_the_optional_regime_verdict_and_refuses_bad_ones
     p = claude_worker.strategist.parse_proposal(json.dumps(base))
     assert p is not None and p.regime is None
     for bad in (
-        {"fast": "sideways"},          # not a dimension:value
-        {"fast": "trend:sideways"},    # unknown value
-        {"fast": 7},                   # not a string
-        {},                            # empty map
-        {"medium": "measured"},        # unknown profile
+        {"fast": "sideways"},  # not a dimension:value
+        {"fast": "trend:sideways"},  # unknown value
+        {"fast": 7},  # not a string
+        {},  # empty map
+        {"medium": "measured"},  # unknown profile
         {"fast": "trend:bull|neutral"},  # a region, not a word
-        {"fast": "rel:lagging"},       # rel is per-symbol, never declared
-        "measured",                    # not a map
+        {"fast": "rel:lagging"},  # rel is per-symbol, never declared
+        "measured",  # not a map
         None,
     ):
-        assert claude_worker.strategist.parse_proposal(json.dumps({**base, "regime": bad})) is None, bad
+        assert (
+            claude_worker.strategist.parse_proposal(json.dumps({**base, "regime": bad})) is None
+        ), bad
     # Any other top-level key is still malformed.
     assert claude_worker.strategist.parse_proposal(json.dumps({**base, "verdict": {}})) is None
 

@@ -4,7 +4,7 @@ Tool-agnostic brief for any AI coding agent (Claude, Cursor, Codex, etc.) workin
 
 ## Project summary
 
-Pure-Rust, zero-allocation, zero-copy, single-writer, lock-free HFT engine executing an eight-slot strategy set across Binance, OKX, Deribit, Hyperliquid (incl. HIP-4 outcome markets), Bybit, Polymarket and Polygon RPC, with a per-slot paper/live execution lane (Hyperliquid arm; testnet first). v1 runs locally on macOS with free-tier external APIs only. Phase 7 migrates to a plain Linux box with no surrounding cloud services.
+Pure-Rust, zero-allocation, zero-copy, single-writer, lock-free HFT engine executing an eight-slot strategy set across Binance, OKX, Deribit, Hyperliquid (incl. HIP-4 outcome markets), Bybit, MEXC (market data only), Polymarket and Polygon RPC, with a per-slot paper/live execution lane (Hyperliquid arm; testnet first). v1 runs locally on macOS with free-tier external APIs only. Phase 7 migrates to a plain Linux box with no surrounding cloud services.
 
 ## Non-negotiable rules
 

@@ -49,10 +49,10 @@
 #
 # THE SLOT MAP (must match `strategy-set`)
 # ----------------------------------------
-#   0  latency-arb      4  ai-exec
+#   0  hyparb           4  ai-exec
 #   1  vrp              5  vm
-#   2  xsd              6  icdp
-#   3  bin15            7  (reserved)
+#   2  xsd              6  xmm (LIVE only on its gateway arm, XMM XH4f)
+#   3  bin15            7  hcv (DARK: a LIVE slot 7 refuses, O-HC18)
 #
 #
 # THE THREE GRAMMAR LAWS
@@ -150,7 +150,15 @@ name = "bin15"
 # own orders, so it is a parse error rather than a puzzle at runtime).
 #
 # Known spellings — the same ones universe.toml uses:
-#   polymarket  binance  okx  deribit  hyperliquid  ai  bybit
+#   polymarket  binance  okx  deribit  hyperliquid  ai  bybit  mexc
+#   hyperevm  hypercall
+#
+# `mexc` (byte 7) is reserved so an artifact can NAME the venue; MEXC is
+# DATA-ONLY (docs/mexc-ingress-plan.md, ruling O-MX1) — no execution arm,
+# so a live slot naming it refuses the boot like any venue without one.
+# `hypercall` (byte 9) is reserved the same way: DATA-ONLY by ruling O-HC1
+# (docs/research/hypercall/hypercall-integration-plan-2026-09-26.md); its
+# execution arm (HC9) waits for its own operator ruling.
 #
 # A LIVE SLOT NEVER FALLS BACK TO PAPER (law E-1). An order naming a
 # venue not listed here is refused and counted, never modelled — a
@@ -178,6 +186,12 @@ venues = ["hyperliquid"]
 # same position. The worst case with every quote working is
 # cap_instance_usd + max_open_orders × max_order_usd, not
 # cap_instance_usd. The three numbers multiply — set them together.
+# The money clamps never refuse an exit, and an exit never widens that
+# bound: on a Binance instrument (BX3) an order counts as an exit only if
+# it and every working order on its side together cannot cross zero (the
+# residuals are named in docs/risk-policy.md, "BX3"). On Binance an exit
+# still needs a free open-order place (O-BX25) — at a full count, cancel
+# or requote first.
 #
 # These caps are PER SLOT, not global. `max_open_orders = 64` here is
 # eight slots at 64 = 512 live orders across the table (that is what
@@ -217,8 +231,19 @@ cap_instance_usd_1e6 = 1000000000
 # per USDC of lifetime volume, and an exhausted address falls to ONE
 # request every 10 seconds. Stop placing when the remaining budget
 # drops below this, so a bad fill rate cannot brick the address.
-# Consumed by the budget governor in E4.
+# Consumed by the budget governor in E4. REQUIRED (non-zero) on a live
+# slot whose `venues` names hyperliquid (BX3); the Hyperliquid arm reads
+# it, and the top-up keys below, only from the live slots it trades.
 request_budget_floor = 2000
+
+# OPTIONAL (S7-L1): buy request weight before the floor is reached.
+# When the remaining budget comes within `request_topup_weight` of the
+# floor, the arm sends one `reserveRequestWeight` of that many requests,
+# paid from the account's PERPS balance at the venue's price (0.0005
+# USDC a request: 5000 = $2.50), at most `request_topup_day_max` per UTC
+# day. Both or neither; unset, the floor halts the slot as above.
+# request_topup_weight = 5000
+# request_topup_day_max = 30000
 
 # ---- the kill switches (E6) -----------------------------------------
 #
@@ -265,14 +290,17 @@ halt_on_recon_stale_ms = 300000
 # is "no bound on that side", and the five kill switches above stay
 # required whatever these say.
 #
-# Measured from the account's SPOT USDC as the reconciler reads it
-# every 60 s, against an ANCHOR: the balance at the first reconciliation
-# that found the account FLAT (no outcome leg held). The anchor is
-# written once to `exec-pnl-anchor.state` beside this file and restored
-# on every restart, so the session outlives the process (KeepAlive
-# relaunches it) — delete that file before a restart to start a new
-# session. The bound is judged ONLY while flat: an open leg's premium
-# is not a loss and its payout is not a gain until the venue settles.
+# Measured from the account's EQUITY AT COST as the reconciler reads it
+# every 60 s — spot USDC plus what the held outcome legs cost (the
+# venue's `entryNtl`) — against an ANCHOR: that equity at the session's
+# first reconciliation. The anchor is written once to
+# `exec-pnl-anchor.state` beside this file and restored on every
+# restart, so the session outlives the process (KeepAlive relaunches
+# it) — delete that file before a restart to start a new session.
+# Judged at every reconciliation, legs held or not (S7-L1): at cost, an
+# open leg's premium is not a loss and its payout is not a gain until
+# the venue settles or it is sold, and a book that is never flat is
+# still bounded.
 # `/state` shows `arm_pnl_anchor_usd_1e6` and `arm_session_pnl_usd_1e6`;
 # `/metrics` the same two as gauges.
 #
@@ -280,8 +308,259 @@ halt_on_recon_stale_ms = 300000
 # halt_on_gain_usd_1e6 = 15000000
 # halt_on_loss_usd_1e6 = 5000000
 
+# ---- the MARGIN HALT (BX3, Binance slots only) -------------------------
+#
+# A slot whose `venues` names binance must state it when live, and no
+# other slot may state it at all (the parser refuses both mistakes).
+# The margin ratio (maintenance margin over margin balance or adjusted
+# equity, x1e6) at or above which the Binance arm latches `margin-risk`:
+# a sticky halt like the five above (a cancel still passes; nothing is
+# flattened for you). The venue calls margin at 80 % — and any margin
+# call halts the slot on its own — and liquidates at 95 %, so the parser
+# refuses 800000 and up: a threshold there could never fire first.
+# 600000 = 60 % (the plan's D6 example).
+#
+# ENFORCED since BX6: the Binance arm reads the ratio at every
+# reconciliation and on the venue's MARGIN_CALL / ACCOUNT_UPDATE. To arm a
+# Binance slot: name the venue above (venues = ["binance"]), uncomment
+# this key, and uncomment the [exec.binance] block at the end of this file.
+# halt_on_margin_ratio_1e6 = 600000
+#
+# Two more keys for a Binance slot, with their defaults (BX6): how many
+# instruments it may hold working orders or a position on at once
+# (1..=49), and the shortest maker TTL a member may ask for (>= 5000 ms).
+# max_symbols = 20
+# min_maker_ttl_ms = 5000
+
 
 # Slot 1 — vrp. Explicit is better than default: writing it down means
 # a reader of this file knows the slot was considered, not forgotten.
 [exec.slot.1]
 mode = "paper"
+
+
+# Slot 0 — hyparb (HyperEVM AMM <-> Hyperliquid perp hedge, HYPARB §17).
+#
+# SHIPPED AS PAPER. Paper = the testnet shadow (hyparb.toml
+# `mode = "testnet"`); live = HyperEVM MAINNET swaps through the H9d
+# executor plus real HL perp hedges, BOTH from slot 0's OWN wallet X
+# (`HYPEREVM_MAINNET_KEY`), never the bin15 account.
+#
+# The flip is THREE switches that must agree, or the boot refuses:
+#   1. hyparb.toml   mode = "live"  (+ its [mainnet] executor)
+#   2. this section  mode = "live", venues EXACTLY both below
+#   3. --arm-live    names 0        (strategy.conf ARM_LIVE=0,3 + HYPARB_LIVE=1)
+#
+# Slot 0's state (X's HL budget, the HL anchor, the equity anchor
+# `hyparb-equity-anchor.state`) lives in `hyparb/` beside this file —
+# never slot 3's files. Delete the equity anchor to start a new session.
+#
+# The P&L bound is LIVE-ONLY and is COMBINED EQUITY: X's HL perp account
+# value + HL spot USDC + the executor's tokens at mids + X's HYPE gas,
+# judged only while flat (no swap in flight, 2 s quiet). Paper has none.
+#
+# Caps are USD x1e6 (every traded pool is USD-quoted — hyparb.toml's
+# live check refuses any other). Sized for the ~$115 wallet:
+[exec.slot.0]
+mode = "paper"
+# mode = "live"
+# name = "hyparb"
+# venues = ["hyperliquid", "hyperevm"]
+# max_order_usd_1e6 = 25000000
+# max_open_orders = 8
+# cap_day_usd_1e6 = 2000000000
+# cap_instance_usd_1e6 = 60000000
+# request_budget_floor = 2000
+# halt_on_reject_streak = 5
+# halt_on_recon_drift_usd_1e6 = 5000000
+# halt_on_ws_gap_ms = 30000
+# halt_on_asset_refusal_streak = 3
+# halt_on_recon_stale_ms = 120000
+# halt_on_gain_usd_1e6 = 50000000
+# halt_on_loss_usd_1e6 = 20000000
+
+
+# ---- [exec.slot.6] — xmm, the Hyperliquid post-only maker (XMM XH4f) ---
+#
+# Slot 6 is live ONLY on its own arm, the Hyperliquid WebSocket gateway
+# (`transport = "gateway"`; every other slot keeps the blocking arm until
+# XMM XH4h). The gateway trades the market data's network (LAW E-4:
+# HYPERLIQUID_WS_HOST) — MAINNET only behind its interlock (XMM XH5b-3:
+# this slot live, `--arm-live` naming 6, and its own mainnet account,
+# HYPERLIQUID_XMM_{AGENT_KEY,MASTER_ADDR}, on the mainnet host). A gateway slot
+# names hyperliquid alone and states its perp pair (deviation 19):
+# `cap_perp_usd_1e6`, the per-perp inventory with its working orders, and
+# `max_resting_usd_1e6`, the resting notional — both or neither;
+# `halt_on_alo_reject_pct`, its post-only rejection halt over the last 200
+# answers (XH-7); and an address floor of at least 320. On its OWN account
+# it may buy request weight (XMM XH5c-2: `request_topup_weight` /
+# `request_topup_day_max`, both or neither — the probe's 10000 a purchase,
+# $5, and 100000 a UTC day, $50; refused on the shared account, whose
+# requests are its blocking arm's to buy): its day's usage and its spend
+# are kept beside this file, one a network (`xmm-topup-testnet.state`,
+# `xmm-topup-mainnet.state`), and the session P&L adds the spend back
+# (Q-XH5-2: the day's max bounds it instead). A halt cancels the halted
+# slot's orders alone (XMM XH5a, R-XH4-1), so a live gateway slot 6 may
+# run beside the operator's arm's live slots (on either network, with
+# them), and beside slot 0 or a live Binance slot — arms that trade
+# mainnet only — on mainnet alone (XMM XH5b-3).
+#
+# Its account (XMM XH5b-2/-3): on mainnet always its OWN master and API
+# wallet (HYPERLIQUID_XMM_{AGENT_KEY,MASTER_ADDR}); on testnet its OWN
+# when HYPERLIQUID_XMM_TESTNET_{AGENT_KEY,MASTER_ADDR} are set in .env,
+# else the shared E3 testnet account. On its own account it reads every
+# 30 s, so `halt_on_recon_stale_ms` is at least 120000 (four read
+# periods), and it MUST state its session loss bound
+# (`halt_on_loss_usd_1e6`, the probe's -$50, O-XH5), judged on the
+# account's worth against an anchor kept beside this file, one a network
+# (`xmm-pnl-anchor-testnet.state`, `xmm-pnl-anchor-mainnet.state`; move
+# it aside to end a session); its API wallet must be its master's (the
+# boot asks the venue, `userRole`). On the shared account it reads every
+# 10 s (a floor of 20000) and states no session bound.
+# `cap_instance_usd_1e6` is the slot's gross over its perps. The numbers
+# are the maker plan's Appendix B (the XH3 bar sizes `cap_day`):
+[exec.slot.6]
+mode = "paper"
+# mode = "live"
+# name = "xmm"
+# venues = ["hyperliquid"]
+# transport = "gateway"
+# max_order_usd_1e6 = 20000000
+# max_open_orders = 16
+# cap_day_usd_1e6 = 5000000000
+# cap_instance_usd_1e6 = 400000000
+# cap_perp_usd_1e6 = 150000000
+# max_resting_usd_1e6 = 300000000
+# request_budget_floor = 2000
+# halt_on_reject_streak = 5
+# halt_on_recon_drift_usd_1e6 = 20000000
+# halt_on_ws_gap_ms = 5000
+# halt_on_asset_refusal_streak = 3
+# halt_on_recon_stale_ms = 180000
+# halt_on_alo_reject_pct = 20
+# halt_on_loss_usd_1e6 = 50000000
+# request_topup_weight = 10000
+# request_topup_day_max = 100000
+
+
+# ---- [exec.binance] — the Binance arm (BX6) -----------------------------
+#
+# REQUIRED when a live slot names binance (the parser refuses the boot
+# without it). This binary's gateway speaks USD-M and COIN-M futures
+# ("usdm", "coinm") x the classic, Portfolio Margin ("pm") and PM Pro
+# ("pm_pro") accounts, and spot ("spot", BX8) and options ("options",
+# BX9) x classic alone — makers on USD-M classic only, IoC-only
+# elsewhere. Spot or options beside pm / pm_pro refuse the boot (each
+# waits on a ruling); options beside "coinm" or "spot" refuse it too
+# (proven alone and beside "usdm" only); Binance Stocks ("equity", BX10)
+# refuse it, naming ruling S-3 (O-BX16, R17): the arm is built, but only
+# the operator's MAINNET battery (`exec-smoke --binance equity
+# --lifecycle`) drives it. At most ONE live slot may name binance — it owns every
+# bound instrument (BX-7). A session bound (halt_on_gain/loss_usd_1e6) is
+# judged on ONE USD equity: a classic arm trading "usdm", "options" or
+# both (BX9: USD-M's margin balance plus the options account's equity,
+# none until every part is read; COIN-M margins in each coin and the spot
+# wallet holds its own assets — a bounded classic arm with "coinm" or
+# "spot" refuses the boot), or pm / pm_pro (the unified account's). A
+# classic arm binds only USD-M contracts margined in USDT (the account's
+# single-asset totals count USDT's alone); a USDC-margined one refuses
+# the boot there — trade it under pm / pm_pro. Its anchor file is one
+# session's — this key's, this account mode's and its equity's basis
+# (BX9: USD-M's, the options key's, or both): a boot under another key
+# (toggling `signing` changes it), another mode, or with options armed or
+# dropped refuses until you delete the file, which ends the session.
+#
+# The key comes from .env: BINANCE_API_KEY and BINANCE_ED25519_SEED (the
+# names only — never a value in this file); `signing = "hmac"` reads
+# BINANCE_HMAC_API_KEY and BINANCE_HMAC_SECRET_KEY instead (REST only: it
+# needs `order_transport = "rest"`, which pm needs in any case). Before
+# any order the boot asserts one-way mode, single-asset margin (USD-M
+# classic), `account_mode`, a key that trades what is armed (futures;
+# spot) and cannot withdraw, and every owned row cross-margined at or
+# under `max_leverage` (1..=125, default 20; BX-19) — except the leverage
+# under pm, which papi's reads do not carry (not asserted there: a
+# residual); any miss refuses. Later, any leverage change on an owned row
+# locks the slot. A restart finding the account holding positions on
+# owned rows (a dedicated account, a slot naming binance alone) adopts
+# them as the owner slot's starting inventory if they fit its
+# `cap_instance_usd_1e6` — past it the boot refuses; on a slot naming
+# another venue too, any such position refuses the boot.
+#
+# Spot (BX8): the rows are universe.toml's `[binance] spot` list —
+# spot[0] (the M1 anchor) under SymbolId 7 whatever its name, routed to
+# Binance by its boot-fixed alias; the rest under Binance's own ids.
+# IoC-only: spot has no dead-man, so no maker rests and nothing is
+# cancelled or modified. Its user data rides a WS API session alone:
+# spot with order_transport = "rest" or signing = "hmac" refuses the
+# boot. One armed spot row per base asset, and no armed base another
+# row's quote — a row's position IS its base asset's balance, reconciled
+# at the venue's 8 decimals net of every commission charged in it; a
+# balance already held at boot is adopted as a position is (above). The
+# boot judges each spot row's permission groups against the account's
+# (the bStock check): a pair the account may not trade refuses it. No
+# session bound with spot (above).
+#
+# Options (BX9): European options on eapi, REST only. They sign with the
+# HMAC pair, BINANCE_HMAC_API_KEY and BINANCE_HMAC_SECRET_KEY, whatever
+# `signing` says (eapi refuses the Ed25519 key) — an options arm without
+# the pair refuses the boot; the pair's key must trade options and never
+# withdraw, and must be this account's. The rows are the paper-selected
+# chain (universe.toml's [binance] options_underlyings and its selection,
+# at most 64) plus every option the account holds outside it (at most 16
+# more, read once as the engine boots). IoC-only: the venue's countdown
+# is a market maker's, so no maker rests and nothing is cancelled — an
+# options order of ours resting at boot refuses it (cancel it in the
+# app). `options_write = 1` (default 0) lets the arm open shorts where the
+# venue's `nakedSell` allows (BTC, ETH); elsewhere, or with 0, a SELL with
+# no long is refused and any other SELL goes reduce-only, and a `-6057`
+# ends writing on that underlying for the boot. Held options are adopted
+# (a long at its mark, a short at its initial margin's upper bound); an
+# expired leg settles on the venue's exercise record. eapi's weight is
+# its own (the arm's 240 of the IP's 400 a minute): a `recon_every_ms`
+# whose cycle, kept in hand, leaves the boot's day read nothing refuses
+# the boot (20000 does; the default 60000 leaves 94 a minute, 98 beside
+# "usdm").
+#
+# `network` is "mainnet": market data and orders on one network (BX-16).
+# `account_scope` is "dedicated": this binary refuses "shared" (its
+# foreign-fill halt is not built). `recv_window_ms` is the stale-order
+# guard (1000; at most 5000, the venue's default). The dead-man
+# (O-BX13): `countdownCancelAll` with `countdown_ms` (at least twice the
+# heartbeat), re-armed every `heartbeat_ms` for each instrument with a
+# maker resting — and only while the order session can cancel: if the
+# engine or its order session goes quiet, the venue cancels the makers.
+# After a 429 or 418 the arm sends nothing for 60 s, or until the ban the
+# venue names ends (at most 3 days). `recon_every_ms` is at most half the
+# slot's `halt_on_recon_stale_ms`. The worst-case REST weight of the
+# dead-man on `max_symbols` instruments (10 per heartbeat each), a
+# reconciliation every `recon_every_ms` and the margin re-reads must stay
+# within the arm's 1 440 of the IP's 2 400 a minute, or the boot refuses
+# (the defaults weigh 1 309).
+# `orders_frac_1e6` / `qtr_frac_1e6`: the share of each venue order
+# window and quantitative-rule threshold the arm may use.
+#
+# The variants this binary boots, each one edit of the block below (BX11:
+# a test resolves every one): products = ["coinm"] or ["usdm", "coinm"];
+# products = ["spot"] or ["usdm", "spot"] (BX8: on the WS API with the
+# Ed25519 key, as below); products = ["options"] or ["usdm", "options"]
+# (BX9: the HMAC pair in .env; options_write = 1 to write);
+# order_transport = "rest"; signing = "hmac" with order_transport =
+# "rest"; account_mode = "pm" with order_transport = "rest";
+# account_mode = "pm_pro". Before arming, docs/binance-runbook.md.
+# [exec.binance]
+# network = "mainnet"
+# account_mode = "classic"
+# account_scope = "dedicated"
+# products = ["usdm"]
+# stp_mode = "EXPIRE_TAKER"
+# recv_window_ms = 1000
+# countdown_ms = 30000
+# heartbeat_ms = 10000
+# recon_every_ms = 60000
+# orders_frac_1e6 = 800000
+# qtr_frac_1e6 = 800000
+# spin = 1
+# order_transport = "ws"
+# signing = "ed25519"
+# max_leverage = 20
+# options_write = 0

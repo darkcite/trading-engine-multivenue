@@ -419,6 +419,15 @@ Operational laws:
   dependency since this lane; a plain `uv sync` drops the optional
   `kronos` group, so forecaster hosts re-run `uv sync --group kronos`.
 
+## Binance execution (BX)
+
+The Binance arm's keys, its Demo tools (`scripts/exec-smoke.sh
+--binance-probe`, `--binance … --lifecycle`, `--bn-drill gap`), the
+account tools (`--binance-setup`, `--binance-flatten`), the fee
+measurement (`multivenue-engine bn-fees`), its halts and its arming
+preconditions: `docs/binance-runbook.md`. No Binance slot arms a member
+before BX13 (O-BX6).
+
 ## Troubleshooting
 
 - **Build fails with "unknown target-feature"**: the Apple Silicon target
@@ -571,7 +580,8 @@ wall time; it resumes exactly where the last one stopped, because a run with no
 index object is invisible to every reader. **Run it through
 `scripts/archive-run.py`, never `python -m claude_worker.archive`**: every
 worker lane's overlap guard is `pgrep -f 'claude[-_]worke[r]'`, and the boot
-recommit gives up after five minutes of it, leaving `vm_rows_active 0`.
+recommit gives up after thirty minutes of it (five until 2026-09-27),
+leaving `vm_rows_active 0`.
 
 Verify one run round-trips before trusting the lane with deletion:
 
@@ -601,8 +611,13 @@ restart lane, add to `~/multivenue/retention.conf`:
 
 ```sh
 ARCHIVE_MODE="s3"
-S3_CYCLE_BUDGET_S=600
+S3_CYCLE_BUDGET_S=8400
 ```
+
+(8400, not 600, since HK18: a weekday's capture is 6.0–6.4 GB stored — ~20 min
+at this link's ~5 MB/s under the 20 MiB/s cap (HK20), ~1 h 45 min at 1 MiB/s.
+A budget spent mid-file aborts that file's multipart upload and the next cycle
+restarts it.)
 
 Retention then deletes a run **only** after `verify` exits 0 — index object
 present, manifest byte-identical to the index, every object `HEAD`ing with the

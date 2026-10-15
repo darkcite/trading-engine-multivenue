@@ -12,6 +12,7 @@ is not a pass, and it never waits.
 Convention: full ``import x`` only. No ``from x import y``.
 """
 
+import dataclasses
 import json
 import pathlib
 
@@ -21,7 +22,10 @@ import claude_worker.bin15_ledger
 import claude_worker.bin15_ref
 
 
-def _row(ts: int, outcome: int, p: int, y: int, tau: int = 900_000_000_000, fam: int = 0):
+def _row(ts: int, outcome: int, p: int, y: int, tau: int = 900_000_000_000, fam: int = 0,
+         venue: bool = True):
+    """A ledger row — on the VENUE's law by default (BIN15 S4): that is the
+    only label G6.1 scores, so the calibration tests are written on it."""
     return claude_worker.bin15_ledger.Row(
         ts_ns=ts,
         family=fam,
@@ -31,6 +35,7 @@ def _row(ts: int, outcome: int, p: int, y: int, tau: int = 900_000_000_000, fam:
         p_raw_1e6=p,
         arm=0,
         y=y,
+        venue=venue,
     )
 
 
@@ -47,9 +52,16 @@ def _instance_rows(outcome: int, p: int, y: int) -> list:
     ]
 
 
+#: A sidecar's run table as an S2 binary writes it for a venue-clocked run.
+_VENUE_RUNS: dict = {"ticks_skipped": 0, "runs": [{"epoch_ns": 1, "lanes": {}, "wall": "venue"}]}
+
+
 def _sidecar(tmp_path: pathlib.Path, name: str, rows: list[dict]) -> pathlib.Path:
     p = tmp_path / name
-    p.write_text(json.dumps({"detail_version": 7, "bin15_ledger": rows}), encoding="utf-8")
+    p.write_text(
+        json.dumps({"detail_version": 7, "stale": _VENUE_RUNS, "bin15_ledger": rows}),
+        encoding="utf-8",
+    )
     return p
 
 
@@ -265,10 +277,15 @@ def test_a_pre_p3_ledger_still_reads_and_says_it_does_not_know(tmp_path) -> None
     assert len(rows) == 2
     assert all(r.entered == claude_worker.bin15_ledger.ENTERED_UNKNOWN for r in rows)
     assert all(r.settled for r in rows)
-    # And the calibration still runs over them: the gate counts settled
-    # observations, never fills.
+    # BIN15 S4: an 8-column row predates the venue's law — its `y` is the
+    # engine's minute — so it reads, and G6.1 leaves it out until
+    # `bin15_accrue relabel` has put it on the venue's label.
+    assert not any(r.venue for r in rows)
     table = claude_worker.bin15_ledger.calibration(rows)
-    assert sum(t.rows for t in table) == 2
+    assert sum(t.rows for t in table) == 0
+    relabelled = [dataclasses.replace(r, venue=True) for r in rows]
+    table = claude_worker.bin15_ledger.calibration(relabelled)
+    assert sum(t.rows for t in table) == 2, "once relabelled, the gate counts observations"
 
 
 def test_entered_round_trips_through_the_sidecar_and_the_file(tmp_path) -> None:
@@ -382,3 +399,78 @@ def test_the_venue_mid_travels_on_the_row_and_round_trips(tmp_path) -> None:
     assert [r.mid_1e6 for r in back] == [615_000, -1]
     assert [r.entered for r in back] == [1, 1]
 
+
+
+# --- BIN15 S4: the venue's label, the engine's beside it -----------------
+
+
+def test_the_gate_scores_the_venues_label_outside_the_window_only(capsys) -> None:
+    """G6.1 is a calibration against what the VENUE paid (LAW E-11). An
+    engine-label row is not that, and a row priced inside the settlement
+    window (S3: horizon < W/3) is partly decided; both are counted and
+    left out, never scored."""
+    window = claude_worker.bin15_ledger.WINDOW_TAU_NS
+    rows = [
+        _row(100, 1, 900_000, 1_000_000),
+        _row(130, 1, 900_000, 1_000_000, venue=False),
+        _row(160, 1, 990_000, 1_000_000, tau=window - 1),
+        _row(190, 1, 900_000, 1_000_000, tau=window),
+    ]
+    table = claude_worker.bin15_ledger.calibration(rows)
+    assert [t.rows for t in table] == [1, 0, 1], "the engine row and the in-window row are out"
+    assert not claude_worker.bin15_ledger.scored(rows[1])
+    assert not claude_worker.bin15_ledger.scored(rows[2])
+
+
+def test_a_relabelled_row_round_trips_with_both_labels(tmp_path: pathlib.Path) -> None:
+    rows = [
+        dataclasses.replace(_row(100, 7, 600_000, 0), y_engine=1_000_000, y_next_strike=0),
+        _row(130, 8, 600_000, 1_000_000, venue=False),
+    ]
+    path = tmp_path / "ledger.tsv"
+    claude_worker.bin15_ledger.write_ledger(path, rows)
+    widths = [
+        len(line.split("\t"))
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+    ]
+    assert widths == [12, 10], "a venue row is 12 wide, an engine row stays 10"
+    back = claude_worker.bin15_ledger.read_ledger(path)
+    assert back == rows
+    assert (back[0].y, back[0].y_engine, back[0].y_next_strike) == (0, 1_000_000, 0)
+
+
+def test_a_venue_sidecar_yields_venue_rows_and_an_anchor_one_engine_rows() -> None:
+    row = {
+        "ts_ns": 1000, "family": 0, "outcome": 7, "tau_ns": 900_000_000_000,
+        "p_hat_1e6": 600_000, "p_raw_1e6": 580_000, "arm": 0, "y": 0, "y_next_strike": 0,
+    }
+    venue = claude_worker.bin15_ledger.rows_from_sidecar(
+        json.dumps({"stale": _VENUE_RUNS, "bin15_ledger": [row]})
+    )
+    assert venue[0].venue and venue[0].y_next_strike == 0
+    assert venue[0].y_engine == claude_worker.bin15_ledger.Y_UNKNOWN, "accrued on the venue law"
+    for runs in (
+        {"runs": [{"epoch_ns": 1, "lanes": {}}]},
+        {"runs": [{"epoch_ns": 1, "lanes": {}, "wall": "refused"}]},
+        {"runs": []},
+    ):
+        eng = claude_worker.bin15_ledger.rows_from_sidecar(
+            json.dumps({"stale": runs, "bin15_ledger": [row]})
+        )
+        assert not eng[0].venue, runs
+    # One sidecar, two clocks: refused rather than stored under one width.
+    mixed = {"runs": [{"epoch_ns": 1, "lanes": {}, "wall": "venue"}, {"epoch_ns": 2, "lanes": {}}]}
+    with pytest.raises(ValueError, match="mixes"):
+        claude_worker.bin15_ledger.rows_from_sidecar(
+            json.dumps({"stale": mixed, "bin15_ledger": [row]})
+        )
+
+
+def test_a_venue_row_replaces_an_engine_row_never_the_reverse() -> None:
+    engine = _row(100, 7, 600_000, 1_000_000, venue=False)
+    venue = _row(100, 7, 600_000, 0)
+    merged, added = claude_worker.bin15_ledger.merge([engine], [venue])
+    assert added == 0 and merged == [venue], "the law is corrected"
+    merged, added = claude_worker.bin15_ledger.merge([venue], [engine])
+    assert added == 0 and merged == [venue], "and never reverted"

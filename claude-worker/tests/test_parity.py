@@ -33,12 +33,12 @@ EXIT = claude_worker.parity.EXIT
 def write_orders(path, epoch_ns, recs):
     """(ts_ns, sym, side, px, qty, strategy_id) rows — the
     test_seeds.py fixture layout."""
-    header = claude_worker.pmlr._HEADER.pack(  # noqa: SLF001 — reader-defined layout, deliberately
+    header = claude_worker.pmlr._HEADER.pack(  # reader-defined layout, deliberately
         claude_worker.pmlr.MAGIC, 2, claude_worker.pmlr.SLOT_KIND_ORDER, epoch_ns
     )
     blob = bytearray(header + bytes(_HDR - len(header)))
     for i, (ts, sym, side, px, qty, sid) in enumerate(recs):
-        slot = claude_worker.pmlr._ORDER.pack(  # noqa: SLF001
+        slot = claude_worker.pmlr._ORDER.pack(
             ts, sym, side, 0, px, qty, i + 1, 1, sid
         )
         blob.extend(slot + bytes(_SLOT - len(slot)))

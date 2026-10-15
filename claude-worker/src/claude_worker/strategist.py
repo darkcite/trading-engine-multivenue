@@ -675,10 +675,17 @@ def build_digest(
     parts: list[str] = []
     used = 0
     map_lines = "\n".join(f"  {name} -> sym {markets[name]}" for name in sorted(markets))
-    used = _append_capped(parts, used, f"MARKET MAP (name -> SymbolId):\n{map_lines or '  (empty)'}\n", cap)
+    used = _append_capped(
+        parts, used, f"MARKET MAP (name -> SymbolId):\n{map_lines or '  (empty)'}\n", cap
+    )
     if universe is not None:
         syms = ", ".join(str(s) for s in sorted(set(universe)))
-        used = _append_capped(parts, used, f"\nOBSERVED CAPTURE UNIVERSE (legal sym/ref values): {syms or '(none)'}\n", cap)
+        used = _append_capped(
+            parts,
+            used,
+            f"\nOBSERVED CAPTURE UNIVERSE (legal sym/ref values): {syms or '(none)'}\n",
+            cap,
+        )
     if instruments is not None:
         used = _append_capped(
             parts,
@@ -700,7 +707,9 @@ def build_digest(
     if performance is not None:
         used = _append_capped(parts, used, f"\nACTIVE RULESET WALK-FORWARD:\n{performance}\n", cap)
     if positions is not None:
-        used = _append_capped(parts, used, f"\nPOSITIONS (paper netting, current run):\n{positions}\n", cap)
+        used = _append_capped(
+            parts, used, f"\nPOSITIONS (paper netting, current run):\n{positions}\n", cap
+        )
     if pnl is not None:
         used = _append_capped(
             parts, used, f"\nPER-STRATEGY SHADOW P&L (latest nightly report):\n{pnl}\n", cap
@@ -777,7 +786,7 @@ def gather_positions_payload(
         views = claude_worker.features.position_views(reconstructed, marks)
         pair_views = claude_worker.features.hip4_pair_views(views, list(hip4_pairs))
         total = claude_worker.features.total_exposure(views, pair_views)
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return None
     scale = 1_000_000.0
     to_usd = claude_worker.features.to_usd
@@ -859,26 +868,20 @@ def pnl_digest_text(reports_dir: pathlib.Path) -> str:
         return PNL_EMPTY_TEXT
     try:
         obj = json.loads(path.read_text())
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return f"  (report unreadable: {path.name})"
     if not isinstance(obj, dict):
         return f"  (report malformed: {path.name})"
     lines = [f"  report {path.name}  runs={obj.get('runs')}"]
     paper = obj.get("paper")
     if isinstance(paper, dict):
-        lines.append(
-            "  paper: "
-            + json.dumps(paper, sort_keys=True, separators=(",", ":"))
-        )
+        lines.append("  paper: " + json.dumps(paper, sort_keys=True, separators=(",", ":")))
     strategies = obj.get("strategies")
     if isinstance(strategies, list) and strategies:
         for row in strategies:
             if not isinstance(row, dict):
                 continue
-            lines.append(
-                "  strategy: "
-                + json.dumps(row, sort_keys=True, separators=(",", ":"))
-            )
+            lines.append("  strategy: " + json.dumps(row, sort_keys=True, separators=(",", ":")))
     else:
         lines.append("  (no per-strategy rows in the report)")
     return "\n".join(lines)
@@ -893,7 +896,9 @@ def build_user_prompt(digest: str) -> str:
     )
 
 
-def build_revision_prompt(digest: str, prior_rows_json: str, gate_summary: str, report_text: str) -> str:
+def build_revision_prompt(
+    digest: str, prior_rows_json: str, gate_summary: str, report_text: str
+) -> str:
     """Call-#2 (revision) user block: the §7.4 gate summary + worker
     report ride along with the prior candidate."""
     return (
@@ -1329,7 +1334,7 @@ def parse_proposal(raw: str, require_labels: bool = True) -> Proposal | None:
     structural so legacy artifacts still import as candidates)."""
     try:
         obj = json.loads(raw)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return None
     if not isinstance(obj, dict):
         return None

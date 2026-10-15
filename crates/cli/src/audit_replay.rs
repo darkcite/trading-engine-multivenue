@@ -36,8 +36,26 @@ use core_types::{AiCmd, AiCmdKind, ChannelEvent, ChannelId, Signal, Tick};
 use ingress_ai::AI_CMDS_FILE;
 
 /// Venue labels in capture-file order (`<label>-ticks.pmlr`, …).
-/// Mirrors the cli spawn labels exactly (`bybit` appended at WS9).
-const VENUE_LABELS: [&str; 7] = ["pm", "bn", "okx", "rpc", "deribit", "hl", "bybit"];
+/// Mirrors the cli spawn labels exactly (`bybit` appended at WS9,
+/// `mexc` at MX2 — MEXC carries `venue_seq` but no §6.2 chain law
+/// (Q-MX1): it emits no `TradeGap`/`BookGap`, so no derivation arm).
+/// HYPARB H3b: `hyperevm` appended — its tape is `hyperevm-signals.pmlr`
+/// (pool events); its tick file is header-only. HC1: `hypercall`
+/// appended — option quote ticks, index/trade/listing events; no
+/// `venue_seq` chain (the indicative feed carries none), so no
+/// derivation arm.
+const VENUE_LABELS: [&str; 10] = [
+    "pm",
+    "bn",
+    "okx",
+    "rpc",
+    "deribit",
+    "hl",
+    "bybit",
+    "mexc",
+    "hyperevm",
+    "hypercall",
+];
 
 /// Inter-arrival histogram bucket upper bounds (ns, exclusive). The
 /// last bucket is open-ended. Bounds chosen so every §6.2 cadence band
@@ -305,9 +323,11 @@ fn audit_ticks(venue: &str, r: &PmlrReader<Tick>, out: &mut VenueAudit) {
         let s = stat_for(&mut out.ticks, t.sym);
         s.note_ts(t.ts_ns);
         // Tick venue_seq is u32 and venue-specific; regression counting
-        // is informational (BN bookTicker gaps are legitimate; Deribit
-        // quote seq is a ms timestamp). Same-value repeats are legal
-        // everywhere.
+        // is informational (BN bookTicker gaps are legitimate; PM's is
+        // the ingress's per-asset arrival ordinal since HK31, HL's and
+        // Deribit quotes' since HK32 — 0 on an out-of-order tick, each
+        // counted here — and a ms timestamp's low 32 bits in older
+        // captures). Same-value repeats are legal everywhere.
         if let Some(last) = s.last_seq {
             if (t.venue_seq as u64) < last {
                 s.seq_regressions += 1;

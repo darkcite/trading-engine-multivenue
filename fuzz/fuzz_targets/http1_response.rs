@@ -2,19 +2,24 @@
 // Copyright 2026 Anton (darkcite)
 
 //! Fuzz target: arbitrary bytes → `core_net::http1::read_response` +
-//! `dechunk_in_place` + `write_get_request`.
+//! `dechunk_in_place` + `chunked_body` + `head_says_close` +
+//! `write_get_request`.
 //!
 //! Validates the HTTP/1.1 response scanner never panics, never reads
-//! past the end of `buf`, and yields offsets that are always in-bounds
-//! with `header_end <= body_start <= body_end <= data.len()` when a
-//! response is `Complete`. When the response advertises
+//! past the end of `buf`, and yields offsets ordered
+//! `header_end <= body_start <= body_end` when a response is `Complete`,
+//! the head in bounds, and the body in bounds for chunked and
+//! close-delimited framing — a Content-Length body's end is
+//! `body_start + n` whether or not it is all buffered (the parser's
+//! contract; HK4). When the response advertises
 //! `Transfer-Encoding: chunked`, we also feed the body region through
 //! the in-place dechunker and assert its outcome is one of the three
 //! documented variants without panicking or invalidating the buffer.
 //!
 //! Finally, we round-trip the request serializer (`write_get_request`)
 //! over the first few bytes of the input (split into host/path/UA) to
-//! stress the zero-alloc bounded writer path.
+//! stress the zero-alloc bounded writer path and its framing law
+//! (`HttpErr::BadHead`).
 
 #![no_main]
 
@@ -30,19 +35,26 @@ fuzz_target!(|data: &[u8]| {
             body_end,
             framing,
         } => {
-            // Every offset is in-bounds and correctly ordered.
+            // Every offset is correctly ordered, and the head is in bounds.
             assert!(header_end <= body_start);
             assert!(body_start <= body_end);
-            assert!(body_end <= data.len());
+            assert!(body_start <= data.len());
 
             match framing {
                 core_net::BodyFraming::ContentLength(n) => {
-                    // Body length agrees with the reported u64, clamped
-                    // to buffer-available bytes on the wire.
+                    // The parser's contract (`read_response` docs): a
+                    // Content-Length body's end is `body_start + n`
+                    // (saturating) whether or not it is all buffered — the
+                    // caller reads more while `body_end > buf.len()`. HK4:
+                    // the target asserted `body_end <= data.len()` for
+                    // every framing and aborted on any partly buffered
+                    // body (an `abc` short of `Content-Length: 10`).
                     let got = (body_end - body_start) as u64;
                     assert!(got <= n);
+                    assert_eq!(body_end, body_start.saturating_add(n as usize));
                 }
                 core_net::BodyFraming::Chunked => {
+                    assert!(body_end <= data.len());
                     // Dechunk a private copy so a malformed chunk
                     // framing can't corrupt the caller's buffer. We
                     // cap the copy at 4 KiB to keep the fuzzer fast
@@ -59,7 +71,9 @@ fuzz_target!(|data: &[u8]| {
                         core_net::DechunkResult::Malformed => {}
                     }
                 }
-                core_net::BodyFraming::CloseDelimited => {}
+                core_net::BodyFraming::CloseDelimited => {
+                    assert!(body_end <= data.len());
+                }
             }
         }
         core_net::HttpResult::Incomplete => {}
@@ -73,25 +87,61 @@ fuzz_target!(|data: &[u8]| {
     let mut scratch = [0u8; 4096];
     scratch[..cap].copy_from_slice(&data[..cap]);
     let _ = core_net::dechunk_in_place(&mut scratch[..cap]);
+    // HYPARB H9: the span locator agrees with the dechunker on every
+    // input — same verdict, same payload — and stays in bounds.
+    let mut a = [0u8; 4096];
+    a[..cap].copy_from_slice(&data[..cap]);
+    let mut b = [0u8; 4096];
+    b[..cap].copy_from_slice(&data[..cap]);
+    match (
+        core_net::dechunk_in_place(&mut a[..cap]),
+        core_net::chunked_body(&mut b[..cap]),
+    ) {
+        (
+            core_net::DechunkResult::Complete { length },
+            core_net::ChunkedBody::Span { start, len },
+        ) => {
+            assert_eq!(length, len);
+            assert!(start + len <= cap);
+            assert_eq!(&a[..length], &b[start..start + len]);
+        }
+        (core_net::DechunkResult::Incomplete, core_net::ChunkedBody::Incomplete)
+        | (core_net::DechunkResult::Malformed, core_net::ChunkedBody::Malformed) => {}
+        (x, y) => panic!("dechunk {x:?} vs span {y:?}"),
+    }
+    if let core_net::HttpResult::Complete { header_end, .. } = core_net::read_response(data) {
+        let _ = core_net::head_says_close(&data[..header_end]);
+    }
 
     // --- Request serializer -------------------------------------
     // Splits the input into (host, path, user-agent) as a cheap way
     // to exercise `write_get_request` with bounded, arbitrary byte
     // strings. The writer is bounded and must never overflow the
-    // 256-byte destination (or must return BufferTooSmall).
+    // 256-byte destination (or must return BufferTooSmall), and it
+    // keeps the framing law: BadHead exactly when a field would break
+    // the head — a target that is not visible-ASCII `/…`, an empty or
+    // non-visible host, a CR / LF / NUL in the user agent — decided
+    // before a byte is written.
     if data.len() >= 6 {
         let third = data.len() / 3;
         let host = &data[..third];
         let path = &data[third..2 * third];
         let ua = &data[2 * third..];
+        let well_formed = path.first() == Some(&b'/')
+            && path.iter().all(u8::is_ascii_graphic)
+            && !host.is_empty()
+            && host.iter().all(u8::is_ascii_graphic)
+            && !ua.iter().any(|&b| b == b'\r' || b == b'\n' || b == 0);
         let mut dst = [0u8; 256];
         match core_net::write_get_request(&mut dst, host, path, ua) {
             Ok(n) => {
                 // The writer returns the number of bytes written and
                 // those bytes are always within `dst`.
                 assert!(n <= dst.len());
+                assert!(well_formed);
             }
-            Err(core_net::HttpErr::BufferTooSmall) => {}
+            Err(core_net::HttpErr::BufferTooSmall) => assert!(well_formed),
+            Err(core_net::HttpErr::BadHead) => assert!(!well_formed),
         }
     }
 });

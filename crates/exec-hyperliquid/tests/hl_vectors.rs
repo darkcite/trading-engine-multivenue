@@ -25,9 +25,11 @@
 //! whose only purpose is to make (4) reproducible.
 
 use exec_hyperliquid::action::{
-    encode_batch_modify, encode_cancel, encode_cancel_by_cloid, encode_order, CancelByCloidWire,
-    CancelWire, ModifyWire, OrderWire, Tif, MAX_ACTION,
+    encode_batch_modify, encode_cancel, encode_cancel_by_cloid, encode_noop, encode_order,
+    encode_order_grouped, encode_reserve_weight, encode_schedule_cancel, encode_update_leverage,
+    CancelByCloidWire, CancelWire, Grouping, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
 };
+use exec_hyperliquid::cloid::encode as mm_cloid_of;
 use exec_hyperliquid::sign::{connection_id, Network, Vault};
 use signer_eip712::hyperliquid as hl;
 
@@ -43,6 +45,10 @@ const VAULT: [u8; 20] = [
 
 const HIP4_YES: u32 = 100_000_000 + 10 * 3253;
 const HIP4_NO: u32 = 100_000_000 + 10 * 3253 + 1;
+/// HC10: HIP-3 builder-dex perps on dex 1 (`xyz`), indices 2 and 9 —
+/// `100_000 + dex_idx × 10_000 + index`.
+const HIP3_XYZ_A: u32 = 100_000 + 10_000 + 2;
+const HIP3_XYZ_B: u32 = 100_000 + 10_000 + 9;
 
 fn cloid_a() -> [u8; 16] {
     let mut c = [0u8; 16];
@@ -51,9 +57,7 @@ fn cloid_a() -> [u8; 16] {
 }
 
 fn cloid_b() -> [u8; 16] {
-    [
-        0x4d, 0x56, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a,
-    ]
+    [0x4d, 0x56, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a]
 }
 
 /// One fixture row.
@@ -76,10 +80,9 @@ fn unhex(s: &str) -> Vec<u8> {
 }
 
 fn load() -> std::collections::HashMap<String, Row> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/hl/vectors.tsv");
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hl/vectors.tsv");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let mut out = std::collections::HashMap::new();
     for line in text.lines() {
         if line.starts_with('#') || line.is_empty() {
@@ -157,7 +160,12 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn order(name: &str, rows: &std::collections::HashMap<String, Row>, wires: &[OrderWire], grouping: &[u8]) {
+fn order(
+    name: &str,
+    rows: &std::collections::HashMap<String, Row>,
+    wires: &[OrderWire],
+    grouping: &[u8],
+) {
     let mut buf = [0u8; MAX_ACTION];
     let n = encode_order(&mut buf, wires, grouping).expect("encode");
     check(rows, name, &buf[..n]);
@@ -169,13 +177,39 @@ fn every_vector_reproduces_byte_for_byte() {
     let mut seen: Vec<&str> = Vec::new();
 
     // --- the three tifs, both sides, with and without cloid ---------
-    order("order_gtc_buy", &r, &[OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Gtc)], b"na");
+    order(
+        "order_gtc_buy",
+        &r,
+        &[OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Gtc)],
+        b"na",
+    );
     seen.push("order_gtc_buy");
-    order("order_ioc_buy", &r, &[OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Ioc)], b"na");
+    order(
+        "order_ioc_buy",
+        &r,
+        &[OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Ioc)],
+        b"na",
+    );
     seen.push("order_ioc_buy");
-    order("order_alo_buy", &r, &[OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Alo)], b"na");
+    order(
+        "order_alo_buy",
+        &r,
+        &[OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Alo)],
+        b"na",
+    );
     seen.push("order_alo_buy");
-    order("order_gtc_sell", &r, &[OrderWire::new(0, false, 50_000_000, 1_000_000_000, Tif::Gtc)], b"na");
+    order(
+        "order_gtc_sell",
+        &r,
+        &[OrderWire::new(
+            0,
+            false,
+            50_000_000,
+            1_000_000_000,
+            Tif::Gtc,
+        )],
+        b"na",
+    );
     seen.push("order_gtc_sell");
     order(
         "order_ioc_cloid",
@@ -203,24 +237,85 @@ fn every_vector_reproduces_byte_for_byte() {
     order(
         "hip4_yes_ioc",
         &r,
-        &[OrderWire::new(HIP4_YES, true, 45_670_000, 2_500_000_000, Tif::Ioc).with_cloid(cloid_b())],
+        &[
+            OrderWire::new(HIP4_YES, true, 45_670_000, 2_500_000_000, Tif::Ioc)
+                .with_cloid(cloid_b()),
+        ],
         b"na",
     );
     seen.push("hip4_yes_ioc");
-    order("hip4_no_alo", &r, &[OrderWire::new(HIP4_NO, false, 99_900_000, 100_000_000, Tif::Alo)], b"na");
+    order(
+        "hip4_no_alo",
+        &r,
+        &[OrderWire::new(
+            HIP4_NO,
+            false,
+            99_900_000,
+            100_000_000,
+            Tif::Alo,
+        )],
+        b"na",
+    );
     seen.push("hip4_no_alo");
-    order("hip4_min_px", &r, &[OrderWire::new(HIP4_YES, true, 100_000, 1_000_000_000, Tif::Ioc)], b"na");
+    order(
+        "hip4_min_px",
+        &r,
+        &[OrderWire::new(
+            HIP4_YES,
+            true,
+            100_000,
+            1_000_000_000,
+            Tif::Ioc,
+        )],
+        b"na",
+    );
     seen.push("hip4_min_px");
-    order("hip4_max_px", &r, &[OrderWire::new(HIP4_YES, true, 99_900_000, 1_000_000_000, Tif::Ioc)], b"na");
+    order(
+        "hip4_max_px",
+        &r,
+        &[OrderWire::new(
+            HIP4_YES,
+            true,
+            99_900_000,
+            1_000_000_000,
+            Tif::Ioc,
+        )],
+        b"na",
+    );
     seen.push("hip4_max_px");
     // 0.5000 must render "0.5" — the trailing-zero law, inside a signature.
     order(
         "hip4_trailing_zero_px",
         &r,
-        &[OrderWire::new(HIP4_YES, true, 50_000_000, 10_000_000_000, Tif::Gtc)],
+        &[OrderWire::new(
+            HIP4_YES,
+            true,
+            50_000_000,
+            10_000_000_000,
+            Tif::Gtc,
+        )],
         b"na",
     );
     seen.push("hip4_trailing_zero_px");
+
+    // --- HIP-3 builder-dex perps (HC10): the hedge leg's asset ids --
+    order(
+        "hip3_ioc_buy",
+        &r,
+        &[
+            OrderWire::new(HIP3_XYZ_A, true, 18_712_000_000, 1_200_000, Tif::Ioc)
+                .with_cloid(cloid_b()),
+        ],
+        b"na",
+    );
+    seen.push("hip3_ioc_buy");
+    order(
+        "hip3_alo_sell_reduce",
+        &r,
+        &[OrderWire::new(HIP3_XYZ_B, false, 1_871_200_000, 150_000_000, Tif::Alo).reduce_only()],
+        b"na",
+    );
+    seen.push("hip3_alo_sell_reduce");
 
     // --- batches ----------------------------------------------------
     order(
@@ -251,12 +346,26 @@ fn every_vector_reproduces_byte_for_byte() {
         b"normalTpsl",
     );
     seen.push("order_grouping_tpsl");
+    // XMM XH5d: the ALO priority grouping, `{"p": 10000}` (1 bp) — a map.
+    let mut buf = [0u8; MAX_ACTION];
+    let n = encode_order_grouped(
+        &mut buf,
+        &[OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Alo)],
+        Grouping::Priority(10_000),
+    )
+    .expect("encode");
+    check(&r, "order_alo_priority", &buf[..n]);
+    seen.push("order_alo_priority");
 
     // --- the two tail bytes of the action hash -----------------------
     for (name, vault, exp) in [
         ("order_vault", Vault::Address(VAULT), None),
         ("order_expires", Vault::None, Some(1_789_000_000_000u64)),
-        ("order_vault_expires", Vault::Address(VAULT), Some(1_789_000_000_000u64)),
+        (
+            "order_vault_expires",
+            Vault::Address(VAULT),
+            Some(1_789_000_000_000u64),
+        ),
     ] {
         let row = r.get(name).unwrap_or_else(|| panic!("no row {name}"));
         assert_eq!(row.vault, vault, "[{name}] fixture vault");
@@ -274,7 +383,14 @@ fn every_vector_reproduces_byte_for_byte() {
 
     // --- cancels -----------------------------------------------------
     let mut buf = [0u8; MAX_ACTION];
-    let n = encode_cancel(&mut buf, &[CancelWire { asset: 0, oid: 12_345 }]).unwrap();
+    let n = encode_cancel(
+        &mut buf,
+        &[CancelWire {
+            asset: 0,
+            oid: 12_345,
+        }],
+    )
+    .unwrap();
     check(&r, "cancel_single", &buf[..n]);
     seen.push("cancel_single");
 
@@ -283,7 +399,10 @@ fn every_vector_reproduces_byte_for_byte() {
         &[
             CancelWire { asset: 0, oid: 1 },
             CancelWire { asset: 1, oid: 2 },
-            CancelWire { asset: HIP4_YES, oid: 99_999_999 },
+            CancelWire {
+                asset: HIP4_YES,
+                oid: 99_999_999,
+            },
         ],
     )
     .unwrap();
@@ -296,7 +415,10 @@ fn every_vector_reproduces_byte_for_byte() {
 
     let n = encode_cancel_by_cloid(
         &mut buf,
-        &[CancelByCloidWire { asset: HIP4_YES, cloid: cloid_b() }],
+        &[CancelByCloidWire {
+            asset: HIP4_YES,
+            cloid: cloid_b(),
+        }],
     )
     .unwrap();
     check(&r, "cancel_by_cloid", &buf[..n]);
@@ -305,8 +427,14 @@ fn every_vector_reproduces_byte_for_byte() {
     let n = encode_cancel_by_cloid(
         &mut buf,
         &[
-            CancelByCloidWire { asset: 0, cloid: cloid_a() },
-            CancelByCloidWire { asset: HIP4_NO, cloid: cloid_b() },
+            CancelByCloidWire {
+                asset: 0,
+                cloid: cloid_a(),
+            },
+            CancelByCloidWire {
+                asset: HIP4_NO,
+                cloid: cloid_b(),
+            },
         ],
     )
     .unwrap();
@@ -350,10 +478,84 @@ fn every_vector_reproduces_byte_for_byte() {
     check(&r, "batch_modify_2", &buf[..n]);
     seen.push("batch_modify_2");
 
+    // --- request weight (S7-L1) ----------------------------------------
+    let n = encode_reserve_weight(&mut buf, 5_000).unwrap();
+    check(&r, "reserve_weight", &buf[..n]);
+    seen.push("reserve_weight");
+    let n = encode_reserve_weight(&mut buf, 1).unwrap();
+    check(&r, "reserve_weight_testnet", &buf[..n]);
+    seen.push("reserve_weight_testnet");
+
+    // --- XH4c: the perp arm's control actions ---------------------------
+    let n = encode_update_leverage(&mut buf, 1, true, 3).unwrap();
+    check(&r, "update_leverage_cross", &buf[..n]);
+    seen.push("update_leverage_cross");
+    let n = encode_update_leverage(&mut buf, 0, false, 10).unwrap();
+    check(&r, "update_leverage_isolated", &buf[..n]);
+    seen.push("update_leverage_isolated");
+    let n = encode_schedule_cancel(&mut buf, Some(1_789_000_005_000)).unwrap();
+    check(&r, "schedule_cancel_at", &buf[..n]);
+    seen.push("schedule_cancel_at");
+    let n = encode_schedule_cancel(&mut buf, None).unwrap();
+    check(&r, "schedule_cancel_clear", &buf[..n]);
+    seen.push("schedule_cancel_clear");
+    let n = encode_noop(&mut buf).unwrap();
+    check(&r, "noop", &buf[..n]);
+    seen.push("noop");
+
+    // --- XH4c: 39 items (one weight-1 action) and the split at 39 --------
+    let mm = |i: u64| mm_cloid_of(6, 1_000 + i);
+    let wires: Vec<OrderWire> = (0..40u64)
+        .map(|i| {
+            OrderWire::new(
+                1,
+                i % 2 == 0,
+                250_000_000_000 + i as i64 * 50_000_000,
+                1_000_000,
+                Tif::Alo,
+            )
+            .with_cloid(mm(i))
+        })
+        .collect();
+    assert_eq!(MAX_ORDERS, 39);
+    assert!(
+        encode_order(&mut buf, &wires, b"na").is_err(),
+        "40 items is two actions"
+    );
+    let n = encode_order(&mut buf, &wires[..39], b"na").unwrap();
+    check(&r, "order_batch_39_alo", &buf[..n]);
+    seen.push("order_batch_39_alo");
+    let n = encode_order(&mut buf, &wires[39..], b"na").unwrap();
+    check(&r, "order_split_tail", &buf[..n]);
+    seen.push("order_split_tail");
+    let modifies: Vec<ModifyWire> = (0..39u64)
+        .map(|i| ModifyWire {
+            order: wires[i as usize],
+            oid: 0,
+            oid_cloid: mm(100 + i),
+            oid_is_cloid: true,
+        })
+        .collect();
+    let n = encode_batch_modify(&mut buf, &modifies).unwrap();
+    check(&r, "batch_modify_39", &buf[..n]);
+    seen.push("batch_modify_39");
+    let cancels: Vec<CancelByCloidWire> = (0..39u64)
+        .map(|i| CancelByCloidWire {
+            asset: 1,
+            cloid: mm(i),
+        })
+        .collect();
+    let n = encode_cancel_by_cloid(&mut buf, &cancels).unwrap();
+    check(&r, "cancel_by_cloid_39", &buf[..n]);
+    seen.push("cancel_by_cloid_39");
+
     // Every fixture row must have been exercised: a row nobody checks
     // is a vector that proves nothing.
     let mut missing: Vec<&String> = r.keys().filter(|k| !seen.contains(&k.as_str())).collect();
     missing.sort();
-    assert!(missing.is_empty(), "fixture rows never checked: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "fixture rows never checked: {missing:?}"
+    );
     assert_eq!(seen.len(), r.len());
 }

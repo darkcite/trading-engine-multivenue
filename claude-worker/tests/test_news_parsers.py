@@ -53,6 +53,7 @@ _SHAPE: dict[str, str] = {
     "json-deribit-ann": "items",
     "json-bybit-ann": "items",
     "json-binance-cms": "items",
+    "json-mexc-ann": "items",
     "json-4chan-catalog": "items",
     "instruments-bn-usdm": "snapshot",
     "instruments-okx": "snapshot",
@@ -63,6 +64,7 @@ _SHAPE: dict[str, str] = {
     "status-bybit": "snapshot",
     "status-kraken": "snapshot",
     "ping-binance": "snapshot",
+    "ping-mexc": "snapshot",
     "calendar-fed": "snapshot",
     "series-bn-ls": "series",
     "series-bn-top-ls": "series",
@@ -475,6 +477,48 @@ def test_the_binance_ping_is_liveness_and_only_accepts_an_empty_body() -> None:
     assert parsed.snapshot is not None
     assert parsed.snapshot.count == 1
     assert _parse("ping-binance", '{"code": -1121}').is_empty()
+
+
+def test_the_mexc_ping_is_liveness_on_both_hosts_and_never_keeps_the_clock() -> None:
+    """MX7, both bodies measured live 2026-09-23: spot `/api/v3/ping` is
+    `{}`, futures `/api/v1/contract/ping` carries the server clock — which
+    must not reach the snapshot, or it would hash fresh every poll."""
+    spot = _parse("ping-mexc", "{}").snapshot
+    early = _parse("ping-mexc", '{"success":true,"code":0,"data":1790145267966}').snapshot
+    late = _parse("ping-mexc", '{"success":true,"code":0,"data":1790145327966}').snapshot
+    assert spot is not None and early is not None and late is not None
+    assert json.loads(early.body) == {"ok": 1}
+    assert spot.sha256 == early.sha256 == late.sha256
+    for envelope in ('{"success":false,"code":1001,"message":"x"}',
+                     '{"success":true,"code":500}',
+                     '{"msg":"Invalid symbol.","code":-1121}'):
+        assert _parse("ping-mexc", envelope).is_empty(), envelope
+
+
+def test_the_mexc_section_id_becomes_the_hint() -> None:
+    """MX7: MEXC's rows state their own section (read off the site's section
+    list, 2026-09-23); createdAt is ISO-8601 UTC, updateTime its fallback."""
+    rows = [
+        {"id": 1, "title": "Delisting of FOO USDT-M Perpetual Futures Pair",
+         "sectionId": 15425930840822, "createdAt": "2026-09-22T10:54:39Z"},
+        {"id": 2, "title": "MEXC Moves MUSEBOOK to Innovation Zone",
+         "sectionId": 15425930840821, "createdAt": "2026-09-23T03:56:43Z"},
+        {"id": 3, "title": "MEXC to Support Manta Network (MANTA) Network Upgrade",
+         "sectionId": 15425930840826, "updateTime": "2026-09-23T03:57:09Z"},
+        {"id": 4, "title": "MEXC Digest", "sectionId": 15425930840834, "createdAt": "bad"},
+        {"title": "no id: skipped", "sectionId": 15425930840822},
+    ]
+    items = _parse(
+        "json-mexc-ann", json.dumps({"data": {"results": rows}}), origin="www.mexc.co"
+    ).items
+    assert [i.hint for i in items] == ["delisting", "listing", "maintenance", "other"]
+    assert [i.guid for i in items] == ["1", "2", "3", "4"]
+    assert items[0].ts == 1_790_074_479
+    assert items[2].ts == 1_790_135_829  # updateTime when createdAt is absent
+    assert items[3].ts == 0
+    assert items[0].link == "https://www.mexc.co/announcements/1"
+    assert items[0].text == items[0].title
+    assert _parse("json-mexc-ann", '{"data":{"results":[]},"code":0}').is_empty()
 
 
 def test_an_all_clear_status_still_snapshots() -> None:

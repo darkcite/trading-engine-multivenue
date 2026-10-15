@@ -10,9 +10,18 @@
 # few lines), the way an `unsafe` block carries `// SAFETY:`.
 #
 # This script lists every byte-copy verb in the given crate directories
-# (default: the exec lane + core-net + each landed pine-* crate) that has
-# NO `COPY:` marker within the eight preceding lines, and compares the list against the committed
-# baseline `scripts/copy-audit-baseline.txt`. It is a RATCHET:
+# (default: the exec lane incl. the Binance signer (BX4) and arm (BX6),
+# core-net, core-ring, all nine ingress crates
+# (since the ZC pass of 2026-09-24) plus ingress-hypercall (born inside
+# the gate, HC3), the HYPARB lane's AMM math and member, XMM's member and,
+# since XH4a, the order-gateway kit `crates/exec-gateway`, and the threads
+# the engine hands work to — the EVM shadow, the HYPARB live arm and the
+# state writers (HAR H3.7; HC11b's generic `persist` thread and the
+# slot-7 settlement law it persists, `core-settle`), and each landed
+# pine-* crate of the PVM lane) that has NO `COPY:`
+# marker within the eight preceding lines,
+# and compares the list against the committed baseline
+# `scripts/copy-audit-baseline.txt`. It is a RATCHET:
 #
 #   * a hit that is in the baseline is legacy debt — printed in the
 #     summary count, never a failure;
@@ -23,16 +32,27 @@
 #     by that path; growing it is an operator decision, never the
 #     auditor's.
 #
-#   scripts/copy-audit.sh                       # exec lane + core-net + pine-*
-#   scripts/copy-audit.sh crates/ingress-okx    # any crate dir(s)
+#   scripts/copy-audit.sh                       # the default dirs (above)
+#   scripts/copy-audit.sh crates/ingress-okx    # any crate dir(s) or .rs file(s)
 #   scripts/copy-audit.sh --update-baseline     # rewrite the baseline
 #
 # Keys are `<file>:<line text with whitespace collapsed>`, not line
 # numbers, so an unrelated edit above a legacy copy does not churn the
-# baseline. Comment-only lines are skipped. Scanning stops at the first
-# `#[cfg(test)]` line of a file (test modules sit at the end by
-# convention here; a copy in a test is cold and not this gate's
-# business). Files under any `tests/` directory are skipped.
+# baseline. Comment-only lines are skipped. A `#[cfg(test)]` item is
+# skipped to its OWN end — a brace-less line's `;`, a braced one-liner,
+# or a block's closing brace at the attribute's indentation (rustfmt
+# layout) — and the scan resumes after it (a copy in a test is cold and
+# not this gate's business); test lines never count as a `COPY:` marker
+# for the live code below them. A construct the sweep cannot delimit
+# (`#[cfg(test)]` on a field, a variant, an arm, a multi-line
+# expression) or an item that never closes fails the sweep (exit 3)
+# rather than being guessed at; `scripts/copy-audit-selftest.sh` proves
+# all of this on fixtures, and `make copy-audit` runs it first. Until
+# BX0 (2026-09-23) the first such line ended the scan of its whole file,
+# so everything after a test-only method went unaudited: most of
+# exec-router's routed.rs, exec-hyperliquid's exchange.rs and
+# ingress-binance's run_loop.rs. Files under any `tests/` directory are
+# skipped.
 #
 # A whole module may opt out with a doctrine line in its first 60 lines:
 #     //! COPY-DOCTRINE: <why every copy in this module is cold>
@@ -57,7 +77,21 @@ if [ "${1:-}" = "--update-baseline" ]; then
 fi
 if [ "$#" -eq 0 ]; then
     set -- crates/exec-router crates/exec-hyperliquid crates/signer-eip712 \
-           crates/clob-dispatcher crates/core-net \
+           crates/signer-evm crates/signer-ed25519 crates/exec-binance crates/exec-hyperevm \
+           crates/clob-dispatcher crates/cli/src/bn_live.rs crates/cli/src/xmm_live.rs \
+           crates/cli/src/bin15_live.rs crates/strategy-bin15 \
+           crates/core-net \
+           crates/core-ring crates/ingress-binance crates/ingress-okx crates/ingress-deribit \
+           crates/ingress-hyperliquid crates/ingress-mexc crates/ingress-bybit \
+           crates/ingress-polymarket crates/ingress-rpc crates/ingress-hyperevm \
+           crates/ingress-hypercall crates/exec-hypercall \
+           crates/core-amm crates/strategy-hyparb crates/strategy-xmm crates/strategy-hcv \
+           crates/core-fill crates/engine \
+           crates/exec-gateway \
+           crates/cli/src/evm_shadow.rs \
+           crates/cli/src/hyparb_live.rs \
+           crates/cli/src/har_writer.rs \
+           crates/cli/src/persist.rs crates/core-settle \
            crates/pine-ir crates/pine-vm
 fi
 
@@ -73,18 +107,53 @@ trap 'rm -f "$tmp_hits" "$tmp_keys"' EXIT
 
 status=0
 for dir in "$@"; do
-    if [ ! -d "$dir" ]; then
-        printf 'copy-audit: no such directory: %s\n' "$dir" 1>&2
+    # A directory, or ONE file (a steady-state module inside a crate
+    # whose other modules are offline tools — `crates/cli`).
+    if [ ! -d "$dir" ] && [ ! -f "$dir" ]; then
+        printf 'copy-audit: no such directory or file: %s\n' "$dir" 1>&2
         status=2
         continue
     fi
     while IFS= read -r file; do
-        awk -v verbs="$verbs" -v file="$file" '
+        awk -v verbs="$verbs" -v file="$file" -v q="'" '
+            BEGIN { charlit = q "([^" q "\\\\]|\\\\.)" q }
             NR <= 60 && /COPY-DOCTRINE:/ { doctrine = 1 }
-            /^[[:space:]]*#\[cfg\(test\)\]/ { intest = 1 }
             {
                 line[NR] = $0
-                if (intest || doctrine) next
+                if (doctrine) next
+                # Code view for the item tests: char and string literals
+                # blanked, a trailing line comment and trailing blanks
+                # dropped.
+                code = $0
+                gsub(charlit, "_", code)
+                gsub(/"([^"\\]|\\.)*"/, "\"\"", code)
+                sub(/\/\/.*$/, "", code)
+                sub(/[[:space:]]+$/, "", code)
+                # Inside a `#[cfg(test)]` item nothing is scanned, and its
+                # lines are blanked so a COPY: marker in test code can
+                # never cover a live copy below the item.
+                if (mode == 1) {
+                    line[NR] = ""
+                    head_item(code)
+                    next
+                }
+                if (mode == 2) {
+                    line[NR] = ""
+                    if (code == pad "}" || code == pad "};" || code == pad "},") mode = 0
+                    next
+                }
+                if (code ~ /^[[:space:]]*#\[cfg\(test\)\]/) {
+                    line[NR] = ""
+                    match(code, /^[[:space:]]*/)
+                    pad = substr(code, 1, RLENGTH)
+                    rest = substr(code, RLENGTH + 1)
+                    sub(/^#\[cfg\(test\)\][[:space:]]*/, "", rest)
+                    mode = 1
+                    from = NR
+                    heads = 0
+                    head_item(rest)
+                    next
+                }
                 if ($0 ~ /^[[:space:]]*\/\//) next
                 if ($0 ~ verbs) {
                     covered = 0
@@ -97,6 +166,45 @@ for dir in "$@"; do
                         sub(/^ /, "", key); sub(/ $/, "", key)
                         printf "%s\t%d\t%s\n", file, NR, key
                     }
+                }
+            }
+            # One header line of a `#[cfg(test)]` item. The item must take
+            # a shape rustfmt gives an item or a statement: a brace-less
+            # line ending in `;`, a braced one-liner, or a block opened by
+            # a trailing `{` (after any signature lines) and closed by a
+            # `}` at the attribute own indentation. Anything else (a field,
+            # a variant, an arm, a multi-line expression) fails the sweep
+            # rather than being guessed at.
+            function head_item(c,    t, o, cl) {
+                t = c
+                sub(/^[[:space:]]+/, "", t)
+                if (t == "" || t ~ /^#\[/) return
+                heads++
+                o = gsub(/[{]/, "{", t)
+                cl = gsub(/[}]/, "}", t)
+                if (o == 0 && cl == 0) {
+                    if (t ~ /;$/) { mode = 0; return }
+                    if (heads > 40) unsupported()
+                    return
+                }
+                if (heads == 1 && o == cl && t ~ /[}][;,]?$/) { mode = 0; return }
+                if (o == cl + 1 && t ~ /[{]$/) { mode = 2; return }
+                unsupported()
+            }
+            function unsupported() {
+                printf "copy-audit: %s:%d: #[cfg(test)] on a construct this sweep cannot delimit — move it into the test module, or teach scripts/copy-audit.sh\n", file, from > "/dev/stderr"
+                bad = 1
+                mode = 0
+                exit 3
+            }
+            # An item still open at the end never closed where rustfmt puts
+            # its brace: the sweep of this file is not trustworthy — fail it
+            # loudly, never silently green.
+            END {
+                if (bad) exit 3
+                if (mode != 0) {
+                    printf "copy-audit: %s:%d: #[cfg(test)] item never closed at its indentation\n", file, from > "/dev/stderr"
+                    exit 3
                 }
             }
         ' "$file" || { printf 'copy-audit: awk failed on %s — the sweep is INVALID, not green\n' "$file" 1>&2; exit 3; }

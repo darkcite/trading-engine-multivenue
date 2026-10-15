@@ -128,7 +128,10 @@ dependencies = [
  "book-builder",
  "clob-dispatcher",
  "core-alloc",
+ "core-amm",
+ "core-config",
  "core-crypto",
+ "core-fill",
  "core-io",
  "core-latency",
  "core-metrics",
@@ -136,6 +139,7 @@ dependencies = [
  "core-parse",
  "core-regime",
  "core-ring",
+ "core-settle",
  "core-time",
  "core-types",
  "core-vol",
@@ -143,29 +147,44 @@ dependencies = [
  "dhat",
  "engine",
  "engine-snapshot",
+ "exec-binance",
+ "exec-gateway",
+ "exec-hypercall",
+ "exec-hyperevm",
  "exec-hyperliquid",
  "exec-router",
  "ingress-ai",
  "ingress-binance",
  "ingress-deribit",
+ "ingress-hypercall",
+ "ingress-hyperevm",
  "ingress-hyperliquid",
+ "ingress-mexc",
  "ingress-okx",
  "ingress-polymarket",
  "ingress-rpc",
+ "mio 0.8.11",
  "opt-registry",
+ "rcgen",
  "research-artifacts",
+ "rustls",
+ "signer-ed25519",
  "signer-eip712",
+ "signer-evm",
  "strategy-ai-exec",
  "strategy-bin15",
  "strategy-core",
  "strategy-cross-arb",
  "strategy-ev",
+ "strategy-hcv",
+ "strategy-hyparb",
  "strategy-icdp",
  "strategy-latency-arb",
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
  "strategy-vrp",
+ "strategy-xmm",
  "strategy-xsd",
 ]
 
@@ -194,7 +213,6 @@ checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 name = "book-builder"
 version = "0.1.0"
 dependencies = [
- "core-ring",
  "core-time",
  "core-types",
  "proptest",
@@ -317,6 +335,7 @@ dependencies = [
  "book-builder",
  "clap",
  "clob-dispatcher",
+ "core-amm",
  "core-config",
  "core-crypto",
  "core-fill",
@@ -331,13 +350,20 @@ dependencies = [
  "core-vol",
  "engine",
  "engine-snapshot",
+ "exec-binance",
+ "exec-gateway",
+ "exec-hypercall",
+ "exec-hyperevm",
  "exec-hyperliquid",
  "exec-router",
  "ingress-ai",
  "ingress-binance",
  "ingress-bybit",
  "ingress-deribit",
+ "ingress-hypercall",
+ "ingress-hyperevm",
  "ingress-hyperliquid",
+ "ingress-mexc",
  "ingress-okx",
  "ingress-polymarket",
  "ingress-rpc",
@@ -345,28 +371,34 @@ dependencies = [
  "mio 0.8.11",
  "opt-registry",
  "proptest",
+ "rcgen",
  "research-artifacts",
  "rustls",
  "rustls-pki-types",
+ "signer-eip712",
  "strategy-bin15",
  "strategy-core",
  "strategy-ev",
+ "strategy-hcv",
+ "strategy-hyparb",
  "strategy-icdp",
- "strategy-latency-arb",
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
  "strategy-vrp",
+ "strategy-xmm",
  "strategy-xsd",
  "tracing",
  "tracing-subscriber",
  "tui",
+ "zeroize",
 ]
 
 [[package]]
 name = "clob-dispatcher"
 version = "0.1.0"
 dependencies = [
+ "core-amm",
  "core-fill",
  "core-net",
  "core-parse",
@@ -374,7 +406,6 @@ dependencies = [
  "core-time",
  "core-types",
  "memchr",
- "mio 0.8.11",
  "proptest",
  "rcgen",
  "rustls",
@@ -407,6 +438,13 @@ name = "core-alloc"
 version = "0.1.0"
 
 [[package]]
+name = "core-amm"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "core-config"
 version = "0.1.0"
 dependencies = [
@@ -427,7 +465,9 @@ version = "0.1.0"
 name = "core-fill"
 version = "0.1.0"
 dependencies = [
+ "core-amm",
  "core-types",
+ "proptest",
 ]
 
 [[package]]
@@ -490,6 +530,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-settle"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "core-simd"
 version = "0.1.0"
 
@@ -509,6 +556,8 @@ name = "core-vol"
 version = "0.1.0"
 dependencies = [
  "core-regime",
+ "core-time",
+ "core-types",
 ]
 
 [[package]]
@@ -714,6 +763,79 @@ dependencies = [
 ]
 
 [[package]]
+name = "exec-binance"
+version = "0.1.0"
+dependencies = [
+ "clob-dispatcher",
+ "core-config",
+ "core-crypto",
+ "core-fill",
+ "core-io",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "exec-binance",
+ "exec-gateway",
+ "exec-router",
+ "ingress-binance",
+ "mio 0.8.11",
+ "proptest",
+ "rcgen",
+ "ring",
+ "rustls",
+ "signer-ed25519",
+ "zeroize",
+]
+
+[[package]]
+name = "exec-gateway"
+version = "0.1.0"
+dependencies = [
+ "core-latency",
+ "core-net",
+ "core-ring",
+ "proptest",
+]
+
+[[package]]
+name = "exec-hypercall"
+version = "0.1.0"
+dependencies = [
+ "clob-dispatcher",
+ "core-config",
+ "core-fill",
+ "core-net",
+ "core-parse",
+ "core-time",
+ "core-types",
+ "mio 0.8.11",
+ "rcgen",
+ "rustls",
+ "secp256k1",
+ "signer-eip712",
+ "zeroize",
+]
+
+[[package]]
+name = "exec-hyperevm"
+version = "0.1.0"
+dependencies = [
+ "core-config",
+ "core-net",
+ "core-parse",
+ "exec-hyperevm",
+ "ingress-hyperevm",
+ "ingress-rpc",
+ "proptest",
+ "rcgen",
+ "rustls",
+ "signer-eip712",
+ "signer-evm",
+]
+
+[[package]]
 name = "exec-hyperliquid"
 version = "0.1.0"
 dependencies = [
@@ -724,7 +846,10 @@ dependencies = [
  "core-net",
  "core-parse",
  "core-ring",
+ "core-time",
  "core-types",
+ "exec-gateway",
+ "exec-hyperliquid",
  "mio 0.8.11",
  "rcgen",
  "rustls",
@@ -951,7 +1076,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "ingress-hypercall"
+version = "0.1.0"
+dependencies = [
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "memchr",
+ "mio 0.8.11",
+ "options-select",
+ "proptest",
+ "rcgen",
+ "rustls",
+]
+
+[[package]]
+name = "ingress-hyperevm"
+version = "0.1.0"
+dependencies = [
+ "core-amm",
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "ingress-rpc",
+ "memchr",
+ "mio 0.8.11",
+ "proptest",
+]
+
+[[package]]
 name = "ingress-hyperliquid"
+version = "0.1.0"
+dependencies = [
+ "book-builder",
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "memchr",
+ "mio 0.8.11",
+ "proptest",
+ "rcgen",
+ "rustls",
+]
+
+[[package]]
+name = "ingress-mexc"
 version = "0.1.0"
 dependencies = [
  "core-metrics",
@@ -990,6 +1168,7 @@ dependencies = [
 name = "ingress-polymarket"
 version = "0.1.0"
 dependencies = [
+ "book-builder",
  "core-metrics",
  "core-net",
  "core-parse",
@@ -1796,6 +1975,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "signer-ed25519"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "libc",
+ "proptest",
+ "ring",
+]
+
+[[package]]
 name = "signer-eip712"
 version = "0.1.0"
 dependencies = [
@@ -1805,6 +1994,14 @@ dependencies = [
  "secp256k1",
  "tiny-keccak",
  "zeroize",
+]
+
+[[package]]
+name = "signer-evm"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "signer-eip712",
 ]
 
 [[package]]
@@ -1871,6 +2068,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "strategy-hcv"
+version = "0.1.0"
+dependencies = [
+ "core-fill",
+ "core-ring",
+ "core-settle",
+ "core-time",
+ "core-types",
+ "strategy-core",
+]
+
+[[package]]
+name = "strategy-hyparb"
+version = "0.1.0"
+dependencies = [
+ "core-amm",
+ "core-fill",
+ "core-time",
+ "core-types",
+ "strategy-core",
+]
+
+[[package]]
 name = "strategy-icdp"
 version = "0.1.0"
 dependencies = [
@@ -1909,15 +2129,18 @@ name = "strategy-set"
 version = "0.1.0"
 dependencies = [
  "core-regime",
+ "core-ring",
  "core-time",
  "core-types",
+ "core-vol",
  "strategy-ai-exec",
  "strategy-bin15",
  "strategy-core",
- "strategy-icdp",
- "strategy-latency-arb",
+ "strategy-hcv",
+ "strategy-hyparb",
  "strategy-vm",
  "strategy-vrp",
+ "strategy-xmm",
  "strategy-xsd",
 ]
 
@@ -1943,6 +2166,14 @@ dependencies = [
  "core-types",
  "core-vol",
  "opt-registry",
+ "strategy-core",
+]
+
+[[package]]
+name = "strategy-xmm"
+version = "0.1.0"
+dependencies = [
+ "core-types",
  "strategy-core",
 ]
 

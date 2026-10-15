@@ -19,13 +19,18 @@ Convention: full ``import x`` only. No ``from x import y``.
 import hashlib
 import hmac
 import json
+import os
 import pathlib
+import select
+import signal
+import threading
 import typing
 import urllib.parse
 
 import httpx
 import pytest
 
+import claude_worker.archive
 import claude_worker.objstore
 import tests.fake_s3
 
@@ -98,9 +103,7 @@ def test_canonical_query_encodes_and_sorts() -> None:
     query = claude_worker.objstore.canonical_query(
         [("prefix", "v1/runs/mbp-m4/"), ("continuation-token", "1/abc+def="), ("list-type", "2")]
     )
-    assert query == (
-        "continuation-token=1%2Fabc%2Bdef%3D&list-type=2&prefix=v1%2Fruns%2Fmbp-m4%2F"
-    )
+    assert query == ("continuation-token=1%2Fabc%2Bdef%3D&list-type=2&prefix=v1%2Fruns%2Fmbp-m4%2F")
 
 
 def test_canonical_query_space_is_percent_20_never_plus() -> None:
@@ -117,7 +120,12 @@ def test_valueless_subresource_is_name_equals() -> None:
 
 
 def make_store(
-    fake: tests.fake_s3.FakeS3, *, addressing: str = "virtual"
+    fake: tests.fake_s3.FakeS3,
+    *,
+    addressing: str = "virtual",
+    sleep: typing.Callable[[float], None] = lambda _s: None,
+    max_upload_bps: float = 0.0,
+    monotonic: typing.Callable[[], float] = lambda: 0.0,
 ) -> claude_worker.objstore.ObjectStore:
     endpoint = claude_worker.objstore.Endpoint(
         host="fsn1.your-objectstorage.com",
@@ -129,7 +137,13 @@ def make_store(
         access_key_id="AKIAEXAMPLEARCHIVE00", secret_access_key="archive-golden-secret"
     )
     return claude_worker.objstore.ObjectStore(
-        endpoint, creds, fake.client(), timeout_s=5.0, sleep=lambda _s: None
+        endpoint,
+        creds,
+        fake.client(),
+        timeout_s=5.0,
+        sleep=sleep,
+        max_upload_bps=max_upload_bps,
+        monotonic=monotonic,
     )
 
 
@@ -414,3 +428,333 @@ def test_secret_never_appears_in_repr_or_exception_text() -> None:
         store.head("v1/index/mbp-m4/run-1.json")
     assert secret not in str(caught.value)
     assert secret not in repr(caught.value)
+
+
+# -- HK11: the upload cap ----------------------------------------------------
+
+
+class _FakeTime:
+    """A clock that only moves when the limiter sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 100.0
+        self.slept: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def test_rate_limiter_paces_bytes_to_the_rate_after_the_burst() -> None:
+    fake = _FakeTime()
+    limiter = claude_worker.objstore.RateLimiter(1000.0, 500, clock=fake.clock, sleep=fake.sleep)
+    for _ in range(10):
+        limiter.take(250)
+    # 2 500 bytes at 1 000 B/s with a 500 B burst: the first two takes ride
+    # the burst, the other eight each wait a quarter second.
+    assert fake.slept == pytest.approx([0.25] * 8)
+
+
+def test_rate_limiter_does_not_rely_on_the_sleep_being_honoured() -> None:
+    fake = _FakeTime()
+    limiter = claude_worker.objstore.RateLimiter(
+        1000.0, 0, clock=fake.clock, sleep=fake.slept.append
+    )
+    for _ in range(4):
+        limiter.take(1000)
+    # The clock never moved, yet each take still owes exactly one second.
+    assert fake.slept == pytest.approx([1.0, 1.0, 1.0, 1.0])
+
+
+def test_rate_limiter_refills_while_idle_up_to_the_burst_only() -> None:
+    fake = _FakeTime()
+    limiter = claude_worker.objstore.RateLimiter(1000.0, 500, clock=fake.clock, sleep=fake.sleep)
+    limiter.take(500)
+    fake.now += 60.0  # a minute idle refills to the burst, not to 60 000 bytes
+    limiter.take(1500)
+    assert sum(fake.slept) == pytest.approx(1.0)
+
+
+def test_capped_upload_is_paced_in_small_pieces(tmp_path: pathlib.Path) -> None:
+    fake = _FakeTime()
+    fake_s3 = tests.fake_s3.FakeS3()
+    rate = 1024.0 * 1024.0
+    store = make_store(fake_s3, sleep=fake.sleep, max_upload_bps=rate, monotonic=fake.clock)
+    size = 3 * 1024 * 1024
+    src = tmp_path / "obj.bin"
+    src.write_bytes(b"c" * size)
+    store.put("v1/runs/mbp-m4/run-1/obj.bin", src)
+    assert fake_s3.objects["v1/runs/mbp-m4/run-1/obj.bin"] == src.read_bytes()
+    # Everything past the burst waits for the bucket, one PACE_CHUNK at a time.
+    piece = claude_worker.objstore.PACE_CHUNK / rate
+    pieces = (size - claude_worker.objstore.PACE_BURST) // claude_worker.objstore.PACE_CHUNK
+    assert fake.slept == pytest.approx([piece] * pieces)
+
+
+def test_uncapped_store_never_sleeps_on_upload(tmp_path: pathlib.Path) -> None:
+    slept: list[float] = []
+    fake_s3 = tests.fake_s3.FakeS3()
+    store = make_store(fake_s3, sleep=slept.append)
+    src = tmp_path / "obj.bin"
+    src.write_bytes(b"d" * (2 * 1024 * 1024))
+    store.put("v1/runs/mbp-m4/run-1/obj.bin", src)
+    assert slept == []
+
+
+def test_systemexit_mid_part_aborts_the_multipart_upload(tmp_path: pathlib.Path) -> None:
+    """A SIGTERM arrives as SystemExit (archive._terminate); the parts must go."""
+    fake = _FakeTime()
+    fake_s3 = tests.fake_s3.FakeS3()
+
+    def sleep_then_terminate(seconds: float) -> None:
+        fake.sleep(seconds)
+        if len(fake.slept) == 120:  # mid-way through the second part
+            raise SystemExit(143)
+
+    store = make_store(
+        fake_s3,
+        sleep=sleep_then_terminate,
+        max_upload_bps=1024.0 * 1024.0,
+        monotonic=fake.clock,
+    )
+    part = 5 * 1024 * 1024
+    src = tmp_path / "obj.bin"
+    src.write_bytes(b"e" * (part * 2 + 16))
+    with pytest.raises(SystemExit):
+        store.multipart_put("v1/runs/mbp-m4/run-1/obj.bin", src, part_size=part)
+    assert fake_s3.uploads == {}
+    assert any(m == "DELETE" and "uploadId" in q for m, _p, q in fake_s3.requests)
+    assert "v1/runs/mbp-m4/run-1/obj.bin" not in fake_s3.objects
+
+
+# -- HK21: incomplete uploads, and the initiate's SIGTERM window -------------
+
+
+def test_list_multipart_names_every_incomplete_upload() -> None:
+    fake_s3 = tests.fake_s3.FakeS3()
+    store = make_store(fake_s3)
+    fake_s3.initiated_at = "2026-09-05T10:15:05.328Z"
+    fake_s3.handle(httpx.Request("POST", f"https://{fake_s3.bucket}.h/v1/a.bin?uploads="))
+    fake_s3.handle(httpx.Request("POST", f"https://{fake_s3.bucket}.h/v2/b.bin?uploads="))
+    found = list(store.list_multipart())
+    assert [(u.key, u.initiated) for u in found] == [
+        ("v1/a.bin", "2026-09-05T10:15:05.328Z"),
+        ("v2/b.bin", "2026-09-05T10:15:05.328Z"),
+    ]
+    assert [u.key for u in store.list_multipart("v2/")] == ["v2/b.bin"]
+
+
+def test_list_multipart_follows_both_markers_across_pages() -> None:
+    """Two uploads of one key split across pages: the upload-id marker, not
+    the key marker alone, is what finds the second."""
+    fake_s3 = tests.fake_s3.FakeS3()
+    fake_s3.uploads_page = 1
+    store = make_store(fake_s3)
+    for key in ("v1/a.bin", "v1/a.bin", "v2/b.bin"):
+        fake_s3.handle(httpx.Request("POST", f"https://{fake_s3.bucket}.h/{key}?uploads="))
+    found = list(store.list_multipart())
+    assert [u.key for u in found] == ["v1/a.bin", "v1/a.bin", "v2/b.bin"]
+    assert len({u.upload_id for u in found}) == 3
+    assert fake_s3.count("GET") == 3
+
+
+_Handler = typing.Callable[[int, object], None]
+
+
+@pytest.fixture
+def sigterm_exits() -> typing.Iterator[_Handler]:
+    """SIGTERM raises SystemExit(143), as the archiver's `_terminate` does;
+    the handler before is restored afterwards, so a regression that left a
+    deferral installed cannot leak into later tests."""
+
+    def terminate(_signum: int, _frame: object) -> None:
+        raise SystemExit(143)
+
+    before = signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield terminate
+    finally:
+        try:
+            signal.signal(signal.SIGTERM, before)
+        except SystemExit:  # a late SIGTERM ran `terminate` inside the swap
+            signal.signal(signal.SIGTERM, before)
+
+
+def test_sigterm_during_the_initiate_is_held_until_the_abort_can_reach_it(
+    tmp_path: pathlib.Path, sigterm_exits: _Handler
+) -> None:
+    """Delivered during the initiate, SIGTERM used to unwind before the upload
+    id was known: an orphan. Held, it lands inside the abort's try."""
+    fake_s3 = tests.fake_s3.FakeS3()
+    fake_s3.on_initiate = lambda: os.kill(os.getpid(), signal.SIGTERM)
+    store = make_store(fake_s3)
+    part = 5 * 1024 * 1024
+    src = tmp_path / "obj.bin"
+    src.write_bytes(b"f" * (part * 2 + 16))
+    with pytest.raises(SystemExit):
+        store.multipart_put("v1/runs/mbp-m4/run-1/obj.bin", src, part_size=part)
+    assert fake_s3.uploads == {}, "the held SIGTERM must reach the abort"
+    assert any(m == "DELETE" and "uploadId" in q for m, _p, q in fake_s3.requests)
+    assert signal.getsignal(signal.SIGTERM) is sigterm_exits
+
+
+def test_the_hold_holds_when_another_thread_takes_the_signal(
+    tmp_path: pathlib.Path, sigterm_exits: _Handler
+) -> None:
+    """The first HK21 hold was a per-thread mask: in a threaded process the
+    OS hands SIGTERM to a thread that does not block it, and the handler still
+    ran on the main thread mid-initiate (an orphan; seen in the full suite,
+    where earlier tests leave threads). Sent to another thread on purpose,
+    and waited for on the wakeup fd (written once the signal is tripped), so
+    it is taken inside the initiate, never after."""
+    stop = threading.Event()
+    other = threading.Thread(target=stop.wait, daemon=True)
+    other.start()
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_w, False)
+    old_wake = signal.set_wakeup_fd(wake_w)
+    try:
+        assert other.ident is not None
+        ident = other.ident
+
+        def to_the_other_thread() -> None:
+            signal.pthread_kill(ident, signal.SIGTERM)
+            select.select([wake_r], [], [], 5.0)
+
+        fake_s3 = tests.fake_s3.FakeS3()
+        fake_s3.on_initiate = to_the_other_thread
+        store = make_store(fake_s3)
+        part = 5 * 1024 * 1024
+        src = tmp_path / "obj.bin"
+        src.write_bytes(b"f" * (part + 16))
+        with pytest.raises(SystemExit):
+            store.multipart_put("v1/runs/mbp-m4/run-1/obj.bin", src, part_size=part)
+    finally:
+        signal.set_wakeup_fd(old_wake)
+        os.close(wake_r)
+        os.close(wake_w)
+        stop.set()
+        other.join()
+    assert fake_s3.uploads == {}, "the deferred SIGTERM must reach the abort"
+    assert signal.getsignal(signal.SIGTERM) is sigterm_exits
+
+
+def test_the_archivers_one_shot_handler_exits_once_and_aborts(tmp_path: pathlib.Path) -> None:
+    """The real handler (`archive._terminate`, one-shot): two SIGTERMs during
+    the initiate give ONE SystemExit(143), the abort runs, and the handler is
+    left SIG_IGN, as `_terminate` leaves it."""
+    fake_s3 = tests.fake_s3.FakeS3()
+
+    def twice() -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    fake_s3.on_initiate = twice
+    store = make_store(fake_s3)
+    part = 5 * 1024 * 1024
+    src = tmp_path / "obj.bin"
+    src.write_bytes(b"f" * (part + 16))
+    before = signal.signal(signal.SIGTERM, claude_worker.archive._terminate)
+    try:
+        with pytest.raises(SystemExit) as exited:
+            store.multipart_put("v1/runs/mbp-m4/run-1/obj.bin", src, part_size=part)
+        after = signal.getsignal(signal.SIGTERM)
+    finally:
+        signal.signal(signal.SIGTERM, before)
+    assert exited.value.code == claude_worker.archive.EXIT_TERMINATED
+    assert fake_s3.uploads == {}
+    assert any(m == "DELETE" and "uploadId" in q for m, _p, q in fake_s3.requests)
+    assert after == signal.SIG_IGN
+
+
+def test_off_the_main_thread_nothing_is_deferred(sigterm_exits: _Handler) -> None:
+    """``signal.signal`` refuses off the main thread: no deferral there."""
+    got: list[object] = []
+    worker = threading.Thread(target=lambda: got.append(claude_worker.objstore._deferral()))
+    worker.start()
+    worker.join()
+    assert got == [None]
+    assert signal.getsignal(signal.SIGTERM) is sigterm_exits
+
+
+@pytest.mark.usefixtures("sigterm_exits")
+def test_no_python_handler_no_deferral() -> None:
+    """SIG_IGN / SIG_DFL have nothing to unwind through: deferring would only
+    make the orphan certain (SIG_DFL dies at the release instead)."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    assert claude_worker.objstore._deferral() is None
+
+
+def test_a_release_cut_short_is_finished_by_the_next(
+    monkeypatch: pytest.MonkeyPatch, sigterm_exits: _Handler
+) -> None:
+    """A KeyboardInterrupt inside the release's swap must not strand the
+    recorder (it would swallow every later SIGTERM): the deferral is dropped
+    only once released, so the next release finishes it."""
+    store = make_store(tests.fake_s3.FakeS3())
+    store._hold()
+    assert signal.getsignal(signal.SIGTERM) != sigterm_exits
+    real = signal.signal
+    cut: list[bool] = []
+
+    def interrupted_once(signum: int, handler: typing.Any) -> typing.Any:
+        if not cut:
+            cut.append(True)
+            raise KeyboardInterrupt
+        return real(signum, handler)
+
+    monkeypatch.setattr(signal, "signal", interrupted_once)
+    with pytest.raises(KeyboardInterrupt):
+        store._release_held()
+    monkeypatch.undo()
+    assert signal.getsignal(signal.SIGTERM) != sigterm_exits, "still the deferral"
+    store._release_held()
+    assert signal.getsignal(signal.SIGTERM) is sigterm_exits
+
+
+def test_a_failed_initiate_attempt_releases_sigterm_before_its_backoff(
+    tmp_path: pathlib.Path, sigterm_exits: _Handler
+) -> None:
+    """The hold is one attempt, not the retry loop (a stalled loop held a stop
+    for up to 6 x 900 s): a SIGTERM during an attempt that failed is delivered
+    before the backoff, and no second initiate is sent."""
+    fake_s3 = tests.fake_s3.FakeS3()
+    fake_s3.fail_initiates = 1
+    fake_s3.on_initiate = lambda: os.kill(os.getpid(), signal.SIGTERM)
+    slept: list[float] = []
+    store = make_store(fake_s3, sleep=slept.append)
+    part = 5 * 1024 * 1024
+    src = tmp_path / "obj.bin"
+    src.write_bytes(b"f" * (part + 16))
+    with pytest.raises(SystemExit):
+        store.multipart_put("v1/runs/mbp-m4/run-1/obj.bin", src, part_size=part)
+    assert slept == [], "released before the backoff"
+    assert fake_s3.count("POST") == 1
+    assert fake_s3.uploads == {}
+    assert signal.getsignal(signal.SIGTERM) is sigterm_exits
+
+
+def test_the_control_requests_run_on_the_short_timeout(tmp_path: pathlib.Path) -> None:
+    """The held initiate, its abort and the listing: CONTROL_TIMEOUT_S; a part
+    keeps the store's own."""
+    fake_s3 = tests.fake_s3.FakeS3()
+    fake_s3.fail_after_n_puts = 0
+    store = make_store(fake_s3)
+    part = 5 * 1024 * 1024
+    src = tmp_path / "obj.bin"
+    src.write_bytes(b"f" * (part + 16))
+    with pytest.raises(claude_worker.objstore.ObjStoreError):
+        store.multipart_put("v1/runs/mbp-m4/run-1/obj.bin", src, part_size=part)
+    list(store.list_multipart())
+    short = claude_worker.objstore.CONTROL_TIMEOUT_S
+    seen = {
+        (m, q.split("=")[0]): t
+        for (m, _p, q), t in zip(fake_s3.requests, fake_s3.timeouts, strict=True)
+    }
+    assert seen[("POST", "uploads")] == short
+    assert seen[("DELETE", "uploadId")] == short
+    assert seen[("GET", "uploads")] == short
+    assert seen[("PUT", "partNumber")] == 5.0

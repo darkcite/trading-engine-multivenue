@@ -32,7 +32,11 @@ cd "$REPO" || exit 78
 export PATH="$REPO/target/release:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 CONF="$HOME/multivenue/retention.conf"
-S3_CYCLE_BUDGET_S=600
+# HK18: a weekday's capture is 6.0-6.4 GB stored (2026-10-12..14): ~20 min at
+# the link's ~5 MB/s (the 20 MiB/s cap, HK20), ~1 h 45 min if the cap is set to
+# 1. 8400 s from 04:30 local (21:30Z on this Mac) ends by 23:50Z, before the
+# 00:10Z restart slot, so the budget is a ceiling even on a slow link.
+S3_CYCLE_BUDGET_S=8400
 ARCHIVE_MODE="compress"
 [ -f "$CONF" ] && . "$CONF"
 
@@ -78,12 +82,44 @@ fi
 #
 # Set S3_NICE_NETWORK=1 in retention.conf to put the background class back: the
 # upload then takes hours instead of minutes but is invisible to the feeds.
+#
+# HK11 (2026-10-14): neither holds any more, and the archiver caps itself.
+#   * The background class no longer throttles here: a push under
+#     `taskpolicy -b` ran at ~3.3 MB/s (nettop), not ~0.3 MiB/s.
+#   * Uncapped, the push filled the uplink and the feeds' ACKs queued behind
+#     it: Deribit's delay EMA reached its 65 535 ms ceiling, MEXC 52 s, and
+#     Binance's stale ticks went from 38 k to 1.14 M — not ~200 ms.
+#   So the archiver paces every upload byte itself (objstore's token bucket in
+#   64 KiB pieces, `MULTIVENUE_S3_MAX_UPLOAD_MIBPS`). HK11 set 1 MiB/s; HK20
+#   (2026-10-15, the operator's ruling) 20 MiB/s — above the link, measured
+#   with the delays near their no-upload band. A SIGTERM mid-push aborts the
+#   multipart upload in flight instead of leaving its parts.
 NET_PREFIX=""
 if [ "${S3_NICE_NETWORK:-0}" = "1" ]; then
   NET_PREFIX="taskpolicy -b"
 fi
 
-# shellcheck disable=SC2086  # NET_PREFIX is a deliberate word-split
-exec $NET_PREFIX nice -n 19 \
+# zsh never word-splits an unquoted parameter: ${=NET_PREFIX} is the split.
+# (HK21: the plain form ran "taskpolicy -b" as ONE word — not found, 127.)
+
+# HK21: first clear what an interrupted push left — incomplete multipart
+# uploads over a day old (the bucket has no AbortIncompleteMultipartUpload
+# rule). It can touch nothing a push completed; a failure here is not fatal.
+${=NET_PREFIX} nice -n 19 "$ALIAS/bin/python3" "$REPO/scripts/archive-run.py" abort-stale ||
+  echo "archive-cycle: abort-stale failed (non-fatal)" >&2
+
+# The sweep's time comes out of the cycle's budget ($SECONDS counts from this
+# script's start), so the 23:50Z bound above holds. None left is a spent
+# budget, exit 5 as the archiver's own: `--budget-s 0` would mean NO budget.
+BUDGET_S=$S3_CYCLE_BUDGET_S
+if (( S3_CYCLE_BUDGET_S > 0 )); then
+  BUDGET_S=$(( S3_CYCLE_BUDGET_S - SECONDS ))
+  if (( BUDGET_S <= 0 )); then
+    echo "archive-cycle: budget spent before the push" >&2
+    exit 5
+  fi
+fi
+
+exec ${=NET_PREFIX} nice -n 19 \
   "$ALIAS/bin/python3" "$REPO/scripts/archive-run.py" \
-  push-pending --budget-s "$S3_CYCLE_BUDGET_S"
+  push-pending --budget-s "$BUDGET_S"

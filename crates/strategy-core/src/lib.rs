@@ -32,9 +32,9 @@
 use core_time::NsTs;
 use core_types::regime::REL_UNKNOWN;
 use core_types::{
-    AiCmd, CancelReq, ChannelEvent, DepthTopK, Fill, OptSummary, Order, RegimeLabelSet,
-    RegimeWord, RuleTableV2, Signal, SymbolId, Tick, VenueId, REGIME_OFF_HARD, REGIME_OFF_SOFT,
-    REGIME_PROFILES, SYMBOL_ID_NONE,
+    AiCmd, CancelReq, ChannelEvent, DepthTopK, Fill, OptSummary, Order, OrderEvent,
+    RegimeLabelSet, RegimeWord, RuleTableV2, Signal, SymbolId, Tick, TradePrint, VenueId,
+    REGIME_OFF_HARD, REGIME_OFF_SOFT, REGIME_PROFILES, SYMBOL_ID_NONE,
 };
 
 /// Error type returned from `Strategy::on_start`. Startup errors are
@@ -156,6 +156,23 @@ pub trait Ctx {
     /// Current wall-clock nanoseconds — cheaper than hitting the clock
     /// again from inside a strategy callback.
     fn now_ns(&self) -> NsTs;
+
+    /// **XMM XH4f (D7) — the calling member's live-path health**: the
+    /// set's per-member wrapper (`strategy_set::StampCtx`) answers for
+    /// its slot through [`Self::exec_health_of`]. Defaulted healthy —
+    /// every paper, replay and test ctx — so no paper member behaves
+    /// differently.
+    #[inline]
+    fn exec_health(&self) -> core_types::ExecHealth {
+        core_types::ExecHealth::HEALTHY
+    }
+
+    /// The engine's half of [`Self::exec_health`]: slot `slot`'s health,
+    /// from the dispatcher at the callback's clock. Defaulted healthy.
+    #[inline]
+    fn exec_health_of(&self, _slot: u8) -> core_types::ExecHealth {
+        core_types::ExecHealth::HEALTHY
+    }
 }
 
 /// Optional dashboard-facing counters every strategy can expose.
@@ -325,6 +342,14 @@ pub trait StrategyCounters {
         0
     }
 
+    /// XMM XH2: order events that reached the strategy SET for a slot
+    /// that is not enabled or not built, or attributed to no slot —
+    /// counted, never fanned out (the X1 law).
+    #[inline]
+    fn order_events_unrouted(&self) -> u64 {
+        0
+    }
+
     /// VRP V8a: render that state. `false` = there is nothing to
     /// persist (no VRP member, or it is unconfigured), and the cli
     /// leaves the file alone.
@@ -335,6 +360,49 @@ pub trait StrategyCounters {
     fn render_vrp_state(&self, out: &mut String) -> bool {
         let _ = out;
         false
+    }
+
+    /// HAR H3.4: the long-tenor HAR series the strategy runs (`0`: none —
+    /// no `har.toml`, and nothing is ever written).
+    #[inline]
+    fn har_series(&self) -> usize {
+        0
+    }
+
+    /// HAR H3.4: series `i`'s state epoch — bumped at each of its UTC day
+    /// closes and at the boot restore. The cli rewrites that series'
+    /// `state-<NAME>.tsv` only when it moved (the
+    /// [`Self::vrp_state_epoch`] law, one file per series so a day close
+    /// writes one engine's rows, not twelve).
+    #[inline]
+    fn har_series_epoch(&self, i: usize) -> u64 {
+        let _ = i;
+        0
+    }
+
+    /// HAR H3.4: render series `i`'s state file into `out` (cleared
+    /// first): a comment header, then the rows `core_vol::parse_rows`
+    /// reads. `false` = no such series. Cold path.
+    #[inline]
+    fn render_har_series(&self, i: usize, out: &mut String) -> bool {
+        let _ = (i, out);
+        false
+    }
+
+    /// HAR H3.5: the long-tenor set's counters (`/state.har`, the
+    /// `engine_har_*` gauges); all zero with no `har.toml`.
+    #[inline]
+    fn har_counters(&self) -> HarCounters {
+        HarCounters::default()
+    }
+
+    /// HAR H3.5: copy the configured series' rows into `out` (`har.toml`
+    /// order, `min(series, out.len())` rows); returns the series
+    /// configured — `0` for a plain strategy. Never allocates.
+    #[inline]
+    fn har_series_view(&self, out: &mut [HarSeriesView]) -> u32 {
+        let _ = out;
+        0
     }
 
     /// XSD (slot 2, statarb doc 08): the cross-sectional member's
@@ -377,6 +445,79 @@ pub trait StrategyCounters {
     fn bin15_families_view(&self, out: &mut [Bin15FamilyView]) -> u32 {
         let _ = out;
         0
+    }
+
+    /// HYPARB H4: the slot-0 member's observables (`engine_hyparb_*`),
+    /// mirrored by the cli's generic 5 s block like [`Self::bin15_counters`].
+    #[inline]
+    fn hyparb_counters(&self) -> HyparbCounters {
+        HyparbCounters::default()
+    }
+
+    /// HYPARB H4: copy the per-pool view into `out` (a caller-owned
+    /// slice, `min(out.len())` rows), returning how many pools are
+    /// CONFIGURED. Cold path; never allocates.
+    #[inline]
+    fn hyparb_pools_view(&self, out: &mut [HyparbPoolView]) -> u32 {
+        let _ = out;
+        0
+    }
+
+    /// HYPARB H6: copy the per-coin view into `out` (`min(out.len())`
+    /// rows), returning how many coins are CONFIGURED. Cold path.
+    #[inline]
+    fn hyparb_coins_view(&self, out: &mut [HyparbCoinView]) -> u32 {
+        let _ = out;
+        0
+    }
+
+    /// XMM XH3: the slot-6 member's counters (`engine_xmm_*_total`,
+    /// `/state` `xmm`), written into `out` — the snapshot's own field on
+    /// the 1 s publish, so nothing is returned by value. Zeroes for every
+    /// strategy but the set carrying a configured xmm member.
+    #[inline]
+    fn xmm_counters(&self, out: &mut XmmCounters) {
+        *out = XmmCounters::default();
+    }
+
+    /// HC11: the slot-7 member's counters (`engine_hcv_*`, `/state`
+    /// `hcv`). Zeroes for every strategy but the set carrying a
+    /// configured hcv member.
+    #[inline]
+    fn hcv_counters(&self, out: &mut HcvCounters) {
+        *out = HcvCounters::default();
+    }
+
+    /// HC11b: render the slot-7 member's book into `out` (cleared first) —
+    /// the shutdown's forced write, once the state writer is joined (the
+    /// writer thread renders every other one). `false` = no configured hcv
+    /// member, and nothing is written. Cold path: it boxes its own snapshot.
+    #[inline]
+    fn render_hcv_state(&self, out: &mut String) -> bool {
+        let _ = out;
+        false
+    }
+
+    /// XMM XH3: copy the per-perp view into `out` (`min(out.len())`
+    /// rows), returning how many perps are CONFIGURED. Cold path (the
+    /// 1 s publish); never allocates.
+    #[inline]
+    fn xmm_perps_view(&self, out: &mut [XmmPerpView]) -> u32 {
+        let _ = out;
+        0
+    }
+
+    /// HYPARB H8/H9: the member's AMM decision log, BORROWED — a ring of
+    /// [`HYPARB_DECISION_LOG`] entries indexed by `seq %
+    /// HYPARB_DECISION_LOG` (an entry whose `seq` is not the one its slot
+    /// is read for was never written, or has been overwritten) — and the
+    /// newest `seq` (0 = none yet). The reader (the EVM shadow's tap, on
+    /// the engine thread) walks it in place and moves each new decision
+    /// straight into its own ring: no staging copy (H9). What the write
+    /// path shadows (O-H12). Never allocates.
+    #[inline]
+    fn hyparb_decision_log(&self) -> (&[HyparbDecision], u64) {
+        (&[], 0)
     }
 
     /// RG2: the regime detector's observables (`engine_regime_*`),
@@ -954,6 +1095,379 @@ pub struct XsdCounters {
     pub seed_dropped: u64,
 }
 
+/// HYPARB H4 counters (`engine_hyparb_*`), mirrored by the cli's generic
+/// 5 s block. Defined HERE for the reason [`IcdpCounters`] is. Every
+/// `skipped_*` is a REASON (the bin15 law): which gate held a pool is the
+/// observation, and "no hedge book" and "the day cap is full" call for
+/// opposite actions.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HyparbCounters {
+    /// Pool-event signals applied.
+    pub pool_events: u64,
+    /// Pool-event signals refused (undecodable, not a configured pool).
+    pub pool_refused: u64,
+    /// Tick maps loaded from a completed snapshot.
+    pub maps_loaded: u64,
+    /// Tick maps refused (a snapshot that does not load, a position the
+    /// map refuses) — the pool is stale until its next snapshot.
+    pub maps_refused: u64,
+    /// Pool evaluations run (the solve reached).
+    pub evaluations: u64,
+    /// Arb decisions: an AMM swap submitted.
+    pub arbs_submitted: u64,
+    /// Solves whose net edge was under `min_net_bps` (or not positive).
+    pub skipped_below_min: u64,
+    /// Held: the pool is not judgeable (never snapshotted, stale, edge).
+    pub skipped_not_live: u64,
+    /// Held: a hedge book is absent, stale or one-sided.
+    pub skipped_no_hedge: u64,
+    /// Held: the pool's previous swap is still in flight.
+    pub skipped_inflight: u64,
+    /// Held: the pool's cooldown.
+    pub skipped_cooldown: u64,
+    /// Held: the member is halted (inventory cap) or the day cap is full.
+    pub skipped_halted: u64,
+    /// Decisions whose size a cap cut (depth, order, pool, day).
+    pub size_capped: u64,
+    /// AMM-leg fills.
+    pub amm_fills: u64,
+    /// Hedge IoCs submitted after an AMM fill.
+    pub hedges_submitted: u64,
+    /// Hedge IoCs routed to the perp book.
+    pub hedges_perp: u64,
+    /// Hedge IoCs routed to the spot book.
+    pub hedges_spot: u64,
+    /// Hedge fills (any quantity).
+    pub hedge_fills: u64,
+    /// Hedge IoCs that reached their deadline unfilled — the latency
+    /// correction made visible (the book moved inside Δ).
+    pub hedges_missed: u64,
+    /// Inventory-flattening IoCs (the timer's TWAP of unhedged residue).
+    pub flattens_submitted: u64,
+    /// Times the unhedged-inventory cap was breached (the member halts).
+    pub inventory_breaches: u64,
+    /// Orders the context refused (ring full, unsupported, refused).
+    pub orders_dropped: u64,
+    /// Gas charged per ATTEMPT (every AMM swap submitted), USD × 1e6.
+    pub gas_charged_usd_1e6: i64,
+    /// Sum of the solver's predicted net P&L over submitted arbs, USD ×
+    /// 1e6 (after pool fee, hedge fees and gas) — the model's claim, for
+    /// the harness to hold it to.
+    pub pnl_predicted_usd_1e6: i64,
+    /// Sum of AMM-leg fill notional, USD × 1e6.
+    pub amm_notional_usd_1e6: i64,
+    /// HYPARB H6: arbs that BOUGHT token0 from the pool. With
+    /// [`Self::arbs_sell`] the side balance — a persistent skew in live
+    /// paper means basis control is off or wrong (plan §10 #2).
+    pub arbs_buy: u64,
+    /// HYPARB H6: arbs that SOLD token0 into the pool.
+    pub arbs_sell: u64,
+    /// HYPARB H6 LEVEL (not cumulative-monotonic): funding the perp
+    /// hedges have earned so far, USD × 1e6, signed (a short earns a
+    /// positive rate) — plan §10 #6.
+    pub funding_earned_usd_1e6: i64,
+    /// HYPARB H6 LEVEL: 1 while the inventory cap halts new arbs.
+    pub halted: u64,
+    /// HYPARB go-live LEVEL (2026-09-24): the member's own marked P&L
+    /// this session, USD × 1e6, signed — cash from every fill less the
+    /// hedge taker fees and the gas charged per attempt, plus funding,
+    /// plus the coins held valued at their mids. Held at its last value
+    /// while some held coin has no mark. A level, never a stop: the P&L
+    /// stop is LIVE-only (ruling O-HL5) — paper's evidence for gate G1.
+    pub pnl_session_usd_1e6: i64,
+}
+
+/// HYPARB H4: one pool's row (`/state`, the dashboard).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HyparbPoolView {
+    /// The pool's symbol.
+    pub sym: u32,
+    /// 1 when judgeable (snapshotted, not stale, not edge-bound).
+    pub live: u8,
+    /// 1 when the tick map is loaded and consistent.
+    pub map_ok: u8,
+    /// Last hedge venue chosen for token0 (0 perp, 1 spot, 255 none).
+    pub hedge_venue: u8,
+    _pad: u8,
+    /// Fee the member prices with, pips.
+    pub fee_pips: u32,
+    _pad2: u32,
+    /// Pool mid, token1 per token0 × 1e6 (0 = unknown).
+    pub mid_1e6: i64,
+    /// Basis EMA (pool vs hedge), bps × 1e6.
+    pub basis_bps_1e6: i64,
+    /// Arbs submitted on this pool.
+    pub arbs: u64,
+    /// HYPARB H6: the solver's predicted net P&L summed over this pool's
+    /// arbs, USD × 1e6 — where the edge concentrates (plan §10 #4).
+    pub pnl_predicted_usd_1e6: i64,
+}
+
+impl HyparbPoolView {
+    /// A row (the padding stays private and zero).
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        sym: u32,
+        live: u8,
+        map_ok: u8,
+        hedge_venue: u8,
+        fee_pips: u32,
+        mid_1e6: i64,
+        basis_bps_1e6: i64,
+        arbs: u64,
+        pnl_predicted_usd_1e6: i64,
+    ) -> Self {
+        Self {
+            sym,
+            live,
+            map_ok,
+            hedge_venue,
+            _pad: 0,
+            fee_pips,
+            _pad2: 0,
+            mid_1e6,
+            basis_bps_1e6,
+            arbs,
+            pnl_predicted_usd_1e6,
+        }
+    }
+}
+
+/// HYPARB H6: one hedge coin's row — the books the selector reads and
+/// what the member holds (plan §10 #1 and #6).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HyparbCoinView {
+    /// The perp's symbol (0 = none).
+    pub perp_sym: u32,
+    /// The spot pair's symbol (0 = none).
+    pub spot_sym: u32,
+    /// The perp's displayed touch, the thinner side, USD × 1e6.
+    pub perp_depth_usd_1e6: i64,
+    /// The spot pair's displayed touch, the thinner side, USD × 1e6.
+    pub spot_depth_usd_1e6: i64,
+    /// The selector's last total cost on the perp, bps × 1e6 (signed).
+    pub perp_cost_bps_1e6: i64,
+    /// The selector's last total cost on spot, bps × 1e6.
+    pub spot_cost_bps_1e6: i64,
+    /// Unhedged inventory, coin × 1e6, signed.
+    pub inventory_1e6: i64,
+    /// Net perp position the hedges built, coin × 1e6, signed.
+    pub perp_pos_1e6: i64,
+    /// The perp's hourly funding rate × 1e9.
+    pub funding_1e9: i64,
+}
+
+/// Decisions the HYPARB member remembers for
+/// [`StrategyCounters::hyparb_decision_log`].
+pub const HYPARB_DECISION_LOG: usize = 64;
+
+/// HYPARB H8: one AMM decision exactly as the member made it — the input
+/// the EVM write path shadows (O-H12: one testnet swap per paper
+/// decision, its G2 bid a fraction of THIS edge). Never persisted.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HyparbDecision {
+    /// Per-member sequence, from 1.
+    pub seq: u64,
+    /// Decision time, ns.
+    pub ts_ns: u64,
+    /// The solver's net P&L (after the pool fee, both hedge fees and
+    /// p50 gas), USD × 1e6 — the edge a gas bid is a fraction of.
+    pub edge_usd_1e6: i64,
+    /// The AMM leg's token0 notional, USD × 1e6.
+    pub notional_usd_1e6: i64,
+    /// The gas coin's USD mid at the decision (0 = no gas coin priced).
+    pub gas_px_usd_1e6: i64,
+    /// The pool's symbol.
+    pub pool_sym: u32,
+    /// 1 = bought token0 from the pool, 0 = sold it.
+    pub buy: u8,
+    /// Padding.
+    pub _pad: [u8; 3],
+}
+const _: () = assert!(core::mem::size_of::<HyparbDecision>() == 48);
+
+/// XMM (slot 6) counters — what the member did, cumulatively
+/// (`engine_xmm_*_total`, `/state` `xmm`, the harness lines). Defined
+/// HERE for the reason [`IcdpCounters`] is: the cli never names a
+/// member crate. POD.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct XmmCounters {
+    /// Post-only orders placed (fresh placements, not modifies).
+    pub placed: u64,
+    /// Requotes sent as a modify (E-7).
+    pub modifies: u64,
+    /// Cancels sent by the LEAD rule.
+    pub lead_cancels: u64,
+    /// Cancels sent to requote (the parity switch, a requote the gate
+    /// or the caps would not re-place, a modify the arm refused, or a
+    /// refused replacement's predecessor).
+    pub requote_cancels: u64,
+    /// Cancels sent by a safety pull (a stale leader or follower).
+    pub pull_cancels: u64,
+    /// Cancels the member sent itself at its order's TTL (LAW E-8's
+    /// member half; the venue's or the paper model's expiry normally
+    /// lands first).
+    pub expiry_cancels: u64,
+    /// Placements the gate held back.
+    pub gated: u64,
+    /// Placements held back because the leader's history overflowed the
+    /// gate window (fail-closed; must stay 0 at the ring's size).
+    pub gate_overflow: u64,
+    /// Placements a cap held back.
+    pub capped: u64,
+    /// Orders the venue rejected for crossing (`BAD_ALO_PX`) —
+    /// information, not a fault (XH-7).
+    pub rejected_alo: u64,
+    /// Orders rejected for any other reason.
+    pub rejected_other: u64,
+    /// Orders that ended cancelled (requested, replaced or expired).
+    pub canceled: u64,
+    /// Orders that ended filled.
+    pub filled: u64,
+    /// Fills received.
+    pub fills: u64,
+    /// Fills or events naming no order of ours (a race, or a bug when
+    /// large).
+    pub unmatched: u64,
+    /// Submits, cancels or modifies the ctx refused.
+    pub ctx_refused: u64,
+    /// Sides released after waiting 10 s on a final event (a
+    /// best-effort cancel goes out for what they held). Must stay 0.
+    pub stuck: u64,
+    /// XH4f (D8): cancels sent because the live path was blocked (a
+    /// halt, the slot off, the ledger unseeded, the arm not booted, its
+    /// request budget).
+    pub blocked_cancels: u64,
+    /// XH4f (D8): cancels sent because the venue's answers were slower
+    /// than `rtt_pull_ms`.
+    pub rtt_cancels: u64,
+    /// XH4f (D8): cancels sent because the arm was throttled or
+    /// rate-limited.
+    pub congestion_cancels: u64,
+    /// XH4f (D8): follower updates the health word held (nothing placed
+    /// or requoted).
+    pub health_held: u64,
+    /// XH4f (D8): requotes a busy arm deferred (its floor ×4).
+    pub busy_deferred: u64,
+    /// XMM XH5d (`ab_mode` 2): fresh places that bid ALO priority.
+    pub priority_places: u64,
+    /// XMM XH5d: the HYPE those bids committed, USD ×1e6 (rounded up per
+    /// place — the arm's own reckoning); the boot's cap bounds it.
+    pub priority_fee_usd_1e6: u64,
+    /// XMM XH5d: priority places the venue refused for no reason it names
+    /// (`ORDER_EVENT_REASON_OTHER`) — three in a row end the priority for
+    /// the boot.
+    pub priority_refused: u64,
+}
+const _: () = assert!(core::mem::size_of::<XmmCounters>() == 25 * 8);
+
+/// HC11: the slot-7 HCV member's counters and gauges (`engine_hcv_*`,
+/// `/state` `hcv`), written by the member crate. POD.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HcvCounters {
+    /// Instruments judged (a fresh quote inside the policy).
+    pub judged: u64,
+    /// Option sells sent.
+    pub sells: u64,
+    /// Option buys sent.
+    pub buys: u64,
+    /// Option fills received.
+    pub option_fills: u64,
+    /// Hedge IoCs sent.
+    pub hedges: u64,
+    /// Hedge fills received.
+    pub hedge_fills: u64,
+    /// Final-window unwind slices worked.
+    pub unwind_slices: u64,
+    /// Expiries booked at the replicated settlement.
+    pub settlements: u64,
+    /// …of which the window was too thin and the last oracle price stood.
+    pub settle_fallbacks: u64,
+    /// Skipped: an event inside the option's life, or no current calendar.
+    pub skip_event: u64,
+    /// Skipped: a stale provider quote, oracle or hedge touch.
+    pub skip_stale: u64,
+    /// Skipped: no HAR forecast for the tenor.
+    pub skip_forecast: u64,
+    /// Skipped: a cap (vega, premium, tail) left no size.
+    pub skip_caps: u64,
+    /// Skipped: the kill switch or the day's stop.
+    pub skip_stopped: u64,
+    /// Submits the ctx refused.
+    pub ctx_refused: u64,
+    /// Calendars taken from the reader.
+    pub calendars: u64,
+    /// HAR views taken from the set.
+    pub har_updates: u64,
+    /// HC11b: held options the boot restored from the state file.
+    pub restored: u64,
+    /// Gauge: options held (non-zero positions).
+    pub positions: i64,
+    /// Gauge: Σ |net vega| over underlyings, USD per vol point ×1e6.
+    pub vega_abs_usd_1e6: i64,
+    /// Gauge: the book's marked P&L — its cash plus every position at its
+    /// mark — since the book began (HC11b: it persists across restarts),
+    /// USD ×1e6.
+    pub pnl_usd_1e6: i64,
+    /// Gauge: the day's marked P&L, USD ×1e6.
+    pub day_pnl_usd_1e6: i64,
+    /// HC11b gauge: options held outside this boot's chain — carried by
+    /// their terms (hedged and marked at σ̂, settled at expiry), never
+    /// traded.
+    pub orphans: i64,
+    /// HC11b gauge: 1 while the book's file is behind the book — the writer
+    /// has not taken a moved book for 30 s — and new risk is stopped.
+    pub book_stale: i64,
+    /// HC11b gauge: underlyings the book holds (an option or a hedge) with
+    /// no oracle yet this process — while it is non-zero the book's mark is
+    /// unknown and new risk is stopped.
+    pub marks_unknown: i64,
+}
+const _: () = assert!(core::mem::size_of::<HcvCounters>() == 25 * 8);
+
+/// XMM XH3: one quoted perp's row, read at one instant — the follower's
+/// touch, our two quotes on it, what the member holds and how old each
+/// feed is (the `/state` `xmm.perps` array).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct XmmPerpView {
+    /// Signed position from the member's own fills, base × 1e6.
+    pub pos_1e6: i64,
+    /// The follower's (Hyperliquid) bid, × 1e6 (0 = no fresh book yet).
+    pub touch_bid_1e6: i64,
+    /// The follower's ask, × 1e6 (0 = no fresh book yet).
+    pub touch_ask_1e6: i64,
+    /// Our bid's price, × 1e6 (0 = no bid).
+    pub bid_px_1e6: i64,
+    /// Our ask's price, × 1e6 (0 = no ask).
+    pub ask_px_1e6: i64,
+    /// Engine-monotonic ns of the leader's last fresh update (0 = none).
+    pub lead_rx_ns: u64,
+    /// Engine-monotonic ns of the follower's last update (0 = none).
+    pub fol_rx_ns: u64,
+    /// The Hyperliquid perp.
+    pub hl_sym: u32,
+    /// Its Binance USDⓈ-M leader.
+    pub lead_sym: u32,
+    /// Our bid: 0 none, 1 sent, 2 resting, 3 cancelling.
+    pub bid_state: u8,
+    /// Our ask, as `bid_state`.
+    pub ask_state: u8,
+    /// Bit 0: the follower's last update was flagged stale; bit 1: the
+    /// leader's.
+    pub stale_flags: u8,
+    /// Padding.
+    pub _pad: [u8; 5],
+}
+const _: () = assert!(core::mem::size_of::<XmmPerpView>() == 72);
+
 /// BIN15 counters (`engine_bin15_*`), mirrored by the cli's generic 5 s
 /// block. Defined HERE for the reason [`IcdpCounters`] is.
 ///
@@ -1000,13 +1514,18 @@ pub struct Bin15Counters {
     pub skipped_tau: u64,
     /// Re-prices held: inside `tail_refuse_ns`.
     pub skipped_tail: u64,
-    /// Re-prices held: the underlying mark or a touch is stale.
+    /// Re-prices held: no underlying mark, a cold forecast or a price
+    /// the pricer refused — and (BIN15 S3) inside a settlement window
+    /// whose running average has a hole (`twap_gap`: an open the
+    /// instance never saw a mark in force at, or a mark piece longer
+    /// than `core_types::BINARY_SETTLE_MARK_GAP_MAX_NS`).
     pub skipped_stale: u64,
     /// BIN15 P0 (F4): re-prices held because the underlying mark is
     /// OLDER than `mark_stale_ns`. Distinct from `skipped_stale`: that
-    /// one means no mark at all, this one means a mark the tape has
-    /// left behind, which is the failure that prices four families off
-    /// a frozen number while their books track reality.
+    /// one means an input that does not exist (no mark, no forecast, no
+    /// whole average), this one means a mark the tape has left behind,
+    /// which is the failure that prices four families off a frozen
+    /// number while their books track reality.
     pub skipped_mark_stale: u64,
     /// Re-prices held: the binary book is one-sided or empty.
     pub skipped_book: u64,
@@ -1036,6 +1555,19 @@ pub struct Bin15Counters {
     /// means the bound is not binding and the arm is a market order
     /// wearing a price limit.
     pub skipped_entry_price: u64,
+    /// BIN15 S5: coverage entries NOT taken YET because the price test
+    /// has not held on `entry_persist_polls` consecutive distinct book
+    /// snapshots. Counted per reprice, like `skipped_entry_price`; zero
+    /// for ever under `entry_persist_polls = 1` (the pre-S5 law).
+    pub skipped_entry_persist: u64,
+    /// BIN15 S5: instances whose coverage entry the elapsed ceiling
+    /// CLOSED — past `entry_elapsed_max_ns` with no run of passing
+    /// snapshots under way (none began by then, or the one that did was
+    /// broken after it). Counted ONCE per instance, not per reprice, so it
+    /// reads as instances; zero for ever with no ceiling. A closed
+    /// instance is silent after, so `skipped_entry_price` stops counting
+    /// its refusals too.
+    pub skipped_entry_elapsed: u64,
     /// Configured families with no live instance (a level, not a total).
     pub families_dormant: u64,
     /// Fills matched to one of this member's pendings.
@@ -1105,6 +1637,27 @@ pub struct Bin15Counters {
     /// longer exists — and they move no member position, because the
     /// roll's own `clear_instance` is what flattens the family.
     pub settlement_fills: u64,
+    /// BIN15 H90: re-prices inside the late window that ran the late
+    /// pricer (the grid advanced and a price was attempted).
+    pub late_reprices: u64,
+    /// BIN15 H90: late entries SUBMITTED (one per instance at most).
+    pub late_submitted: u64,
+    /// BIN15 H90: late entries that filled (any quantity).
+    pub late_filled: u64,
+    /// BIN15 H90: late re-prices the late pricer HELD (no σ, no nowcast, a
+    /// stale mark or observed second, a shape refusal).
+    pub late_skipped_stale: u64,
+    /// BIN15 H90: late re-prices whose favoured leg had no usable ask.
+    pub late_skipped_book: u64,
+    /// BIN15 H90: late re-prices whose test failed (belief under `p_min`,
+    /// or the ask not `e` under it).
+    pub late_skipped_price: u64,
+    /// BIN15 H90: late re-prices whose test held but not yet on
+    /// `persist_polls` consecutive snapshots.
+    pub late_skipped_persist: u64,
+    /// BIN15 H90: late entries refused for size — the caps or the resting
+    /// size left under one contract.
+    pub late_skipped_cap: u64,
 }
 
 /// Families one BIN15 view carries. Mirrors
@@ -1128,9 +1681,11 @@ pub const BIN15_VIEW_FAMILIES: usize = 8;
 pub struct Bin15FamilyView {
     /// The venue's own id for the live instance; `0` = dormant.
     pub live_outcome: u32,
-    /// Whole seconds of pricing horizon at the last reprice (time to
-    /// expiry plus a third of the settlement TWAP window). `0` when
-    /// the family has never priced.
+    /// Whole seconds of pricing horizon at the last reprice, rounded UP
+    /// — the variance-time left in the venue's settlement TWAP
+    /// (`strategy_bin15::price::pricing_horizon_ns`, BIN15 S3: `τ − 2W/3`
+    /// with the window ahead, `τ³/(3W²)` inside it, sub-second for the
+    /// last ~22 s). `0` when the family has never priced.
     pub tau_s: u32,
     /// Last fair value ×1e6.
     pub p_hat_1e6: i64,
@@ -1173,6 +1728,167 @@ pub struct XsdPositionView {
     pub entry_hour: i64,
     /// Boundary hour of the last add (`entry_hour` when none).
     pub last_add_hour: i64,
+}
+
+// ---------------------------------------------------------------
+// HAR H3.5 — the long-tenor set's `/state.har` rows and counters
+// ---------------------------------------------------------------
+
+/// Series `/state.har` carries — `core_vol::LONG_SET_MAX` (a const assert
+/// in `strategy-set` pins the two together).
+pub const HAR_VIEW_SERIES: usize = 12;
+/// A series name's bytes — `core_vol::LONG_SET_NAME_MAX`.
+pub const HAR_VIEW_NAME_MAX: usize = 12;
+/// The dashboard's tenors (the H3 plan's §7 panel), whole days, in
+/// `/state` order.
+pub const HAR_VIEW_TENORS_D: [u32; 9] = [1, 2, 3, 5, 7, 14, 21, 30, 40];
+/// Tenors per series row.
+pub const HAR_VIEW_TENORS: usize = HAR_VIEW_TENORS_D.len();
+/// Weekdays of the profile, Monday first — `core_vol::WEEKDAYS`.
+pub const HAR_VIEW_WEEKDAYS: usize = 7;
+
+/// HAR H3.5: the long-tenor set's own counters (`core_vol::LongSetCounters`,
+/// field for field) — defined here so the cli mirrors them without naming
+/// `core-vol` (the regime-counters precedent). POD.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HarCounters {
+    /// Minute boundaries the clock rolled.
+    pub minutes_rolled: u64,
+    /// Minute closes delivered to the engines.
+    pub closes: u64,
+    /// Closes that crossed a UTC day (the close law ran).
+    pub day_closes: u64,
+    /// First new-day minutes held for a later poll (the stagger).
+    pub held: u64,
+    /// Held minutes forced out by a newer minute of their series.
+    pub forced: u64,
+    /// The costliest day close, ns (the engine's close law alone).
+    pub day_close_ns_max: u64,
+    /// The newest day close's cost, ns.
+    pub day_close_ns_last: u64,
+    /// Bumped at every day close and at the boot restore.
+    pub epoch: u64,
+}
+
+/// HAR H3.5: one long-tenor series as `/state.har` and the dashboard read
+/// it. POD, 176 B.
+///
+/// The forecasts, the pairs, the profile and the day census move only at
+/// the series' own UTC day close (or the boot restore), so the set builds
+/// this row there and the 1 s publish copies it; `last_min_ms`,
+/// `open_minutes` and `gaps` are read live at the publish.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HarSeriesView {
+    /// The newest folded minute's open, ms since the epoch (0 = none).
+    pub last_min_ms: u64,
+    /// The newest CLOSED day's UTC midnight, ms since the epoch (0 = none).
+    pub newest_day_ms: u64,
+    /// Non-contiguous minutes folded (one splice per restart is normal).
+    pub gaps: u64,
+    /// The series' state epoch when this row was built.
+    pub epoch: u64,
+    /// The feed's symbol.
+    pub feed: SymbolId,
+    /// Minutes folded into the open day.
+    pub open_minutes: u32,
+    /// σ annualised ×1e6 at each [`HAR_VIEW_TENORS_D`] tenor: the raw
+    /// fold (`0` = none — cold, or before the first close).
+    pub raw_1e6: [i32; HAR_VIEW_TENORS],
+    /// σ annualised ×1e6: the rolling fit applied to the fold (`0` =
+    /// unfitted — fewer than 60 pairs).
+    pub fit_1e6: [i32; HAR_VIEW_TENORS],
+    /// The weekday profile ×1e6, Monday first: the mean `Σ r²` of that
+    /// weekday's observed days over the mean observed day (`1e6` = an
+    /// average day; `0` = no observed day of it).
+    pub weekday_1e6: [i32; HAR_VIEW_WEEKDAYS],
+    /// Observed days behind each weekday's mean (saturating at 255).
+    pub weekday_n: [u8; HAR_VIEW_WEEKDAYS],
+    /// Pairs held at each tenor (the ring holds 128).
+    pub pairs: [u8; HAR_VIEW_TENORS],
+    /// The `har.toml` name, `name_len` bytes live.
+    pub name: [u8; HAR_VIEW_NAME_MAX],
+    /// Live bytes of `name`.
+    pub name_len: u8,
+    /// 1 when the fold forecasts: the newest 30 closed days are resident
+    /// and every one was observed.
+    pub warm: u8,
+    /// Closed days resident (≤ 64).
+    pub days: u8,
+    /// Resident days with no minute at all (holes — the empty-day law).
+    pub empty_days: u8,
+    /// Bit `k`: tenor `k` has a fit.
+    pub fitted: u16,
+    /// Bit `k`: tenor `k`'s QLIKE over a FULL window says the fit beats
+    /// the raw fold.
+    pub fit_beats_raw: u16,
+}
+
+impl HarSeriesView {
+    /// The live name bytes.
+    #[inline]
+    #[must_use]
+    pub fn name(&self) -> &[u8] {
+        &self.name[..(self.name_len as usize).min(HAR_VIEW_NAME_MAX)]
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<HarSeriesView>() == 176);
+const _: () = assert!(core::mem::size_of::<HarCounters>() == 64);
+const _: () = assert!(HAR_VIEW_TENORS <= 16, "fitted / fit_beats_raw are u16 masks");
+
+/// A UTC day, ms — `core_vol::DAY_MS` (a const assert in `strategy-set`
+/// pins the two together).
+pub const HAR_DAY_MS: u64 = 86_400_000;
+
+/// HAR H3.7: the `engine_har_*` gauges, as one law the cli mirrors and the
+/// alloc gate measures. POD.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HarGauges {
+    /// `engine_har_series_configured`.
+    pub configured: i64,
+    /// `engine_har_series_warm`: series whose fold forecasts.
+    pub warm: i64,
+    /// `engine_har_day_age_max_s`: seconds since the stalest series'
+    /// newest closed day ENDED (`-1` = no series has closed a day).
+    pub day_age_max_s: i64,
+    /// `engine_har_day_close_ns_max`: the costliest day close since boot.
+    pub day_close_ns_max: i64,
+}
+
+/// HAR H3.7: the gauges from the set's rows — `configured` series, the
+/// first `min(configured, rows.len())` rows read — and its counters, at
+/// `wall_ms`. Never allocates.
+#[must_use]
+pub fn har_gauges(
+    rows: &[HarSeriesView],
+    configured: u32,
+    counters: &HarCounters,
+    wall_ms: u64,
+) -> HarGauges {
+    let m = (configured as usize).min(rows.len());
+    let mut warm = 0i64;
+    let mut age_max: i64 = -1;
+    let mut i = 0usize;
+    while i < m {
+        let r = &rows[i];
+        warm += i64::from(r.warm);
+        if r.newest_day_ms != 0 {
+            let closed_ms = r.newest_day_ms.saturating_add(HAR_DAY_MS);
+            let age = (wall_ms.saturating_sub(closed_ms) / 1_000).min(i64::MAX as u64) as i64;
+            if age > age_max {
+                age_max = age;
+            }
+        }
+        i += 1;
+    }
+    HarGauges {
+        configured: i64::from(configured),
+        warm,
+        day_age_max_s: age_max,
+        day_close_ns_max: counters.day_close_ns_max.min(i64::MAX as u64) as i64,
+    }
 }
 
 // ---------------------------------------------------------------
@@ -1486,6 +2202,31 @@ pub trait Strategy: StrategyCounters {
         let _ = (opt, ctx);
     }
 
+    /// Called once per [`TradePrint`] popped from the trade lane (XMM
+    /// XH1): the venue's public tape — fed today by the Hyperliquid
+    /// ingress. A maker reads its queue being consumed from it.
+    ///
+    /// Defaulted to a no-op so every existing strategy compiles and
+    /// behaves unchanged; `strategy-set` forwards it to enabled members
+    /// like `on_tick`. Monomorphized — no `dyn`.
+    #[inline]
+    fn on_trade<C: Ctx>(&mut self, trade: &TradePrint, ctx: &mut C) {
+        let _ = (trade, ctx);
+    }
+
+    /// Called once per [`OrderEvent`] about an order this member placed
+    /// (XMM XH1): it rests, it was refused, it left the book, it is
+    /// done. The paper model and the live gateway emit the same events,
+    /// so a member's order state machine runs identically in both.
+    ///
+    /// Defaulted to a no-op so every existing strategy compiles and
+    /// behaves unchanged. `strategy-set` routes each event to the slot
+    /// named by its `strategy_id` ALONE — the fill law, never a fan-out.
+    #[inline]
+    fn on_order_event<C: Ctx>(&mut self, event: &OrderEvent, ctx: &mut C) {
+        let _ = (event, ctx);
+    }
+
     /// Periodic timer. `now_ns` is the current timestamp; the engine
     /// calls this at roughly the interval returned by `timer_period_ns`.
     fn on_timer<C: Ctx>(&mut self, now_ns: NsTs, ctx: &mut C);
@@ -1744,6 +2485,63 @@ mod tests {
     }
 
     #[test]
+    fn on_trade_defaults_to_noop() {
+        // XMM XH1 default: a delivered print touches neither strategy
+        // state nor the Ctx — every member that exists today is
+        // unchanged by the new lane.
+        let mut ctx = NoopCtx {
+            submitted: 0,
+            now: 0,
+        };
+        let mut s = NoopStrat {
+            started: false,
+            ticks: 0,
+        };
+        s.on_start(&mut ctx).unwrap();
+        let p = TradePrint::new(
+            1,
+            core_types::VenueId::Hyperliquid,
+            7,
+            9,
+            1_790_000_000_000,
+            187_000_000,
+            1_000_000,
+            core_types::TRADE_AGGRESSOR_BUY,
+        );
+        s.on_trade(&p, &mut ctx);
+        assert_eq!(s.ticks, 0, "default hook must not touch strategy state");
+        assert_eq!(ctx.submitted, 0, "default hook must not submit");
+    }
+
+    #[test]
+    fn on_order_event_defaults_to_noop() {
+        // XMM XH1 default: even a terminal event about an order the
+        // strategy never placed is inert through the default hook.
+        let mut ctx = NoopCtx {
+            submitted: 0,
+            now: 0,
+        };
+        let mut s = NoopStrat {
+            started: false,
+            ticks: 0,
+        };
+        s.on_start(&mut ctx).unwrap();
+        let e = OrderEvent::new(
+            1,
+            core_types::VenueId::Hyperliquid,
+            7,
+            42,
+            6,
+            core_types::ORDER_EVENT_REJECTED,
+            core_types::ORDER_EVENT_REASON_BAD_ALO_PX,
+            0,
+        );
+        s.on_order_event(&e, &mut ctx);
+        assert_eq!(s.ticks, 0, "default hook must not touch strategy state");
+        assert_eq!(ctx.submitted, 0, "default hook must not submit");
+    }
+
+    #[test]
     fn on_opt_summary_defaults_to_noop() {
         // VM2 V2 default: a delivered options record touches neither
         // strategy state nor the Ctx.
@@ -1815,6 +2613,27 @@ mod tests {
         let mut out = [XsdPositionView::default(); 2];
         assert_eq!(s.xsd_positions_view(&mut out), 0);
         assert_eq!(out, [XsdPositionView::default(); 2]);
+        // XMM (slot 6): zero counters, and the view buffer untouched.
+        let mut c = XmmCounters {
+            placed: 9,
+            ..XmmCounters::default()
+        };
+        s.xmm_counters(&mut c);
+        assert_eq!(c, XmmCounters::default());
+        let mut rows = [XmmPerpView::default(); 2];
+        assert_eq!(s.xmm_perps_view(&mut rows), 0);
+        assert_eq!(rows, [XmmPerpView::default(); 2]);
+        // HC11b (slot 7): zero counters, and no book to write — the buffer
+        // is left untouched.
+        let mut h = HcvCounters {
+            restored: 3,
+            ..HcvCounters::default()
+        };
+        s.hcv_counters(&mut h);
+        assert_eq!(h, HcvCounters::default());
+        let mut text = String::from("kept");
+        assert!(!s.render_hcv_state(&mut text));
+        assert_eq!(text, "kept");
     }
 
     #[test]
@@ -1921,5 +2740,36 @@ mod tests {
         gate.record_emit(0, 42);
         assert_eq!(gate.last_emit_ns(0), 42);
         assert_eq!(gate.last_emit_ns(99), 0, "OOB returns 0");
+    }
+
+    /// HAR H3.7: the gauge law — warm series counted, the STALEST newest
+    /// closed day's age (a day ends at the next midnight), `-1` before any
+    /// close, rows past `configured` ignored, the counter saturated.
+    #[test]
+    fn har_gauges_read_the_stalest_day_and_only_the_configured_rows() {
+        let day = HAR_DAY_MS;
+        let mut rows = [HarSeriesView::default(); 3];
+        rows[0].warm = 1;
+        rows[0].newest_day_ms = 10 * day;
+        rows[1].newest_day_ms = 8 * day;
+        rows[2].warm = 1;
+        rows[2].newest_day_ms = day; // past `configured`: never read
+        let c = HarCounters {
+            day_close_ns_max: u64::MAX,
+            ..HarCounters::default()
+        };
+        let now = 11 * day + 5_000;
+        let g = har_gauges(&rows, 2, &c, now);
+        assert_eq!((g.configured, g.warm), (2, 1));
+        assert_eq!(g.day_age_max_s, (2 * day + 5_000) as i64 / 1_000, "series 1: day 8 ended at day 9");
+        assert_eq!(g.day_close_ns_max, i64::MAX, "saturated, never negative");
+
+        // Nothing closed yet: the age is -1; a clock behind the close is 0.
+        let fresh = [HarSeriesView::default(); 2];
+        assert_eq!(har_gauges(&fresh, 2, &HarCounters::default(), now).day_age_max_s, -1);
+        assert_eq!(har_gauges(&rows, 1, &c, 0).day_age_max_s, 0);
+        // More series configured than rows handed: only the rows count.
+        assert_eq!(har_gauges(&rows[..1], 12, &c, now).configured, 12);
+        assert_eq!(har_gauges(&rows[..1], 12, &c, now).warm, 1);
     }
 }

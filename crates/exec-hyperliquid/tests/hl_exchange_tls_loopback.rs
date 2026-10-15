@@ -18,6 +18,12 @@
 //! | malformed body | a non-JSON 200 body refuses, never accepts |
 //! | mid-body disconnect | a truncated body is `Disconnected`, not a short read treated as complete |
 //! | slow loris | a server that stalls is bounded by `REQ_DEADLINE`, not hung forever |
+//! | idle close | the venue closed the kept-alive connection while idle: the next order dials fresh and SUCCEEDS — it is never written into the dead socket and reported "left the host" |
+//! | `Connection: close` | an announced close retires the connection with the answer; the next order does not reuse it |
+//! | request head (HD2) | the head, byte for byte: `HttpsPost`'s template — Host, Content-Type, Connection, then the length |
+//! | bare FIN (HD2) | an answer its `Content-Length` proves whole survives a FIN without `close_notify` right behind it |
+//! | chunked (HD2) | a `Transfer-Encoding: chunked` answer is decoded in place and scanned |
+//! | interim, `204` (HD2) | `100`/`103` heads before the answer are skipped and a `204` ends at its blank line — promptly, the connection kept |
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener};
@@ -27,7 +33,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use exec_hyperliquid::action::{encode_order, OrderWire, Tif, MAX_ACTION};
-use exec_hyperliquid::http::{HlHttp, HttpErr, REQ_DEADLINE};
+use exec_hyperliquid::http::{HlHttp, HttpErr, PostErr, REQ_DEADLINE};
 use exec_hyperliquid::response::{scan, HlResponse};
 use exec_hyperliquid::sign::{sign_action, Network, Vault};
 use rcgen::generate_simple_self_signed;
@@ -44,6 +50,13 @@ enum Script {
     TruncateThenClose(&'static [u8]),
     /// Send nothing at all and hold the socket open.
     Stall,
+    /// HD2: a full reply, then a bare TCP FIN — no `close_notify` — in
+    /// the same breath.
+    ReplyThenBareFin(&'static [u8]),
+    /// HD2: the reply `Transfer-Encoding: chunked`, in three chunks.
+    Chunked(&'static [u8]),
+    /// HD2: these bytes as they are — interim answers, a `204`.
+    Raw(&'static [u8]),
 }
 
 struct Cert {
@@ -85,43 +98,8 @@ fn boot(script: Script) -> (u16, Arc<ClientConfig>, Arc<AtomicBool>) {
         };
         let mut conn = ServerConnection::new(server_cfg).expect("conn");
         let mut stream = Stream::new(&mut conn, &mut sock);
-
-        // Read headers.
-        let mut buf = [0u8; 32 * 1024];
-        let mut total = 0usize;
-        let header_end = loop {
-            let Ok(n) = stream.read(&mut buf[total..]) else {
-                return;
-            };
-            if n == 0 {
-                return;
-            }
-            total += n;
-            if let Some(i) = (0..total.saturating_sub(3)).find(|&i| &buf[i..i + 4] == b"\r\n\r\n") {
-                break i + 4;
-            }
-            if total == buf.len() {
-                return;
-            }
-        };
-        // Drain the declared body.
-        let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-        let clen: usize = head
-            .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-            .and_then(|l| l.split(':').nth(1))
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
-        let mut remaining = clen.saturating_sub(total - header_end);
-        while remaining > 0 {
-            let need = remaining.min(buf.len());
-            let Ok(n) = stream.read(&mut buf[..need]) else {
-                return;
-            };
-            if n == 0 {
-                break;
-            }
-            remaining -= n;
+        if !read_one_request(&mut stream) {
+            return;
         }
 
         match script {
@@ -149,6 +127,48 @@ fn boot(script: Script) -> (u16, Arc<ClientConfig>, Arc<AtomicBool>) {
                 let _ = sock.shutdown(Shutdown::Both);
                 return;
             }
+            Script::ReplyThenBareFin(body) => {
+                // The answer's records, then the FIN, in two syscalls
+                // back to back: most often one client wake reads both,
+                // and rustls ends the read after the answer with
+                // `UnexpectedEof`. (When the answer lands first the test
+                // passes without that path; core-net's
+                // `https_conn_loopback::an_answer_proven_whole_survives_a_close_without_close_notify`
+                // is the deterministic proof.)
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                    body.len()
+                );
+                let mut records = Vec::new();
+                let _ = stream.conn.writer().write_all(head.as_bytes());
+                let _ = stream.conn.writer().write_all(body);
+                while stream.conn.wants_write() {
+                    if stream.conn.write_tls(&mut records).is_err() {
+                        break;
+                    }
+                }
+                let _ = stream.sock.write_all(&records);
+                let _ = stream.sock.shutdown(Shutdown::Write);
+                thread::sleep(Duration::from_millis(300));
+                return;
+            }
+            Script::Chunked(body) => {
+                let mut out = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                    Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"
+                    .to_vec();
+                for part in body.chunks(body.len().div_ceil(3)) {
+                    out.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+                    out.extend_from_slice(part);
+                    out.extend_from_slice(b"\r\n");
+                }
+                out.extend_from_slice(b"0\r\n\r\n");
+                let _ = stream.write_all(&out);
+                let _ = stream.flush();
+            }
+            Script::Raw(bytes) => {
+                let _ = stream.write_all(bytes);
+                let _ = stream.flush();
+            }
             Script::Stall => {
                 // Never answer. Hold the socket past the deadline.
                 let deadline = Instant::now() + REQ_DEADLINE + Duration::from_secs(3);
@@ -170,6 +190,108 @@ fn boot(script: Script) -> (u16, Arc<ClientConfig>, Arc<AtomicBool>) {
     (port, client_cfg, done)
 }
 
+/// Read one request — the head and its declared body — off `stream`.
+/// `false` at EOF or on a read error.
+fn read_one_request<S: Read>(stream: &mut S) -> bool {
+    read_request_head(stream).is_some()
+}
+
+/// [`read_one_request`], handing back the head's bytes (the blank line
+/// included).
+fn read_request_head<S: Read>(stream: &mut S) -> Option<Vec<u8>> {
+    let mut buf = [0u8; 32 * 1024];
+    let mut total = 0usize;
+    let header_end = loop {
+        let Ok(n) = stream.read(&mut buf[total..]) else {
+            return None;
+        };
+        if n == 0 {
+            return None;
+        }
+        total += n;
+        if let Some(i) = (0..total.saturating_sub(3)).find(|&i| &buf[i..i + 4] == b"\r\n\r\n") {
+            break i + 4;
+        }
+        if total == buf.len() {
+            return None;
+        }
+    };
+    let head_bytes = buf[..header_end].to_vec();
+    let head = String::from_utf8_lossy(&head_bytes).to_string();
+    let clen: usize = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+        .and_then(|l| l.split(':').nth(1))
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let mut remaining = clen.saturating_sub(total - header_end);
+    while remaining > 0 {
+        let need = remaining.min(buf.len());
+        let Ok(n) = stream.read(&mut buf[..need]) else {
+            return None;
+        };
+        if n == 0 {
+            return None;
+        }
+        remaining -= n;
+    }
+    Some(head_bytes)
+}
+
+/// A venue that answers ONE request per connection and then closes it:
+/// after `close_delay` (the idle close — the client has already read the
+/// answer when the FIN arrives), announcing it with `Connection: close`
+/// when `announce`. Serves any number of connections; counts them.
+fn boot_closing(
+    announce: bool,
+    close_delay: Duration,
+) -> (u16, Arc<ClientConfig>, Arc<std::sync::atomic::AtomicUsize>) {
+    let cert = make_cert();
+    let server_cfg = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert_der.clone()], cert.key_der.clone_key())
+            .expect("server cfg"),
+    );
+    let mut roots = RootCertStore::empty();
+    roots.add(cert.cert_der.clone()).expect("anchor");
+    let client_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accepts_srv = accepts.clone();
+    thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let Ok(mut sock) = incoming else { return };
+            accepts_srv.fetch_add(1, Ordering::AcqRel);
+            let mut conn = ServerConnection::new(server_cfg.clone()).expect("conn");
+            {
+                let mut stream = Stream::new(&mut conn, &mut sock);
+                if !read_one_request(&mut stream) {
+                    continue;
+                }
+                let h = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                    OK_RESTING.len(),
+                    if announce { "close" } else { "keep-alive" }
+                );
+                let _ = stream.write_all(h.as_bytes());
+                let _ = stream.write_all(OK_RESTING);
+                let _ = stream.flush();
+            }
+            thread::sleep(close_delay);
+            conn.send_close_notify();
+            let _ = conn.write_tls(&mut sock);
+            let _ = sock.shutdown(Shutdown::Both);
+        }
+    });
+    (port, client_cfg, accepts)
+}
+
 const TEST_KEY: [u8; 32] = [0x2b; 32];
 
 /// Build a real, really-signed request body — the same path a live
@@ -179,7 +301,13 @@ fn signed_body(out: &mut Vec<u8>) {
     let mut action = [0u8; MAX_ACTION];
     let n = encode_order(
         &mut action,
-        &[OrderWire::new(100_032_530, true, 45_670_000, 2_500_000_000, Tif::Ioc)],
+        &[OrderWire::new(
+            100_032_530,
+            true,
+            45_670_000,
+            2_500_000_000,
+            Tif::Ioc,
+        )],
         b"na",
     )
     .expect("encode");
@@ -198,7 +326,9 @@ fn signed_body(out: &mut Vec<u8>) {
     // r/s/v. (E4 gives this its own encoder; the loopback only needs
     // well-formed bytes of the right size.)
     out.clear();
-    out.extend_from_slice(br#"{"action":{"type":"order"},"nonce":1789000000000,"signature":{"r":"0x"#);
+    out.extend_from_slice(
+        br#"{"action":{"type":"order"},"nonce":1789000000000,"signature":{"r":"0x"#,
+    );
     for b in &sig[..32] {
         out.extend_from_slice(format!("{b:02x}").as_bytes());
     }
@@ -213,6 +343,55 @@ fn client(port: u16, cfg: Arc<ClientConfig>) -> HlHttp {
     HlHttp::new("localhost", port, cfg).expect("construct")
 }
 
+/// One order through the client — the production call, in one place:
+/// the body goes into the client's `/exchange` window, then out.
+fn post(c: &mut HlHttp, body: &[u8]) -> Result<(u16, std::ops::Range<usize>), PostErr> {
+    c.body_mut()[..body.len()].copy_from_slice(body);
+    c.post(body.len())
+}
+
+/// HD2: a server that answers one request and hands its head back.
+fn boot_capture() -> (u16, Arc<ClientConfig>, std::sync::mpsc::Receiver<Vec<u8>>) {
+    let cert = make_cert();
+    let server_cfg = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert_der.clone()], cert.key_der.clone_key())
+            .expect("server cfg"),
+    );
+    let mut roots = RootCertStore::empty();
+    roots.add(cert.cert_der.clone()).expect("anchor");
+    let client_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else {
+            return;
+        };
+        let mut conn = ServerConnection::new(server_cfg).expect("conn");
+        let mut stream = Stream::new(&mut conn, &mut sock);
+        let Some(head) = read_request_head(&mut stream) else {
+            return;
+        };
+        let _ = tx.send(head);
+        let h = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+            OK_RESTING.len()
+        );
+        let _ = stream.write_all(h.as_bytes());
+        let _ = stream.write_all(OK_RESTING);
+        let _ = stream.flush();
+        thread::sleep(Duration::from_millis(200));
+        let _ = sock.shutdown(Shutdown::Both);
+    });
+    (port, client_cfg, rx)
+}
+
 const OK_RESTING: &[u8] =
     br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":424242}}]}}}"#;
 const ERR_ENVELOPE: &[u8] = br#"{"status":"err","response":"Unable to recover signer."}"#;
@@ -225,7 +404,7 @@ fn ack_round_trips_and_scans_as_accepted() {
     let mut body = Vec::new();
     signed_body(&mut body);
 
-    let (status, range) = c.post(&body).expect("round trip");
+    let (status, range) = post(&mut c, &body).expect("round trip");
     assert_eq!(status, 200);
     let scanned = scan(&c.resp()[range]).expect("scan");
     let HlResponse::Ok(o) = scanned else {
@@ -246,7 +425,7 @@ fn a_rejection_at_http_200_is_a_refusal_not_an_acceptance() {
     let mut body = Vec::new();
     signed_body(&mut body);
 
-    let (status, range) = c.post(&body).expect("round trip");
+    let (status, range) = post(&mut c, &body).expect("round trip");
     assert_eq!(status, 200, "the venue really does answer 200 here");
     // A `Span` indexes the slice that was SCANNED, not the whole
     // response buffer — so resolve it against the same body slice.
@@ -268,7 +447,7 @@ fn a_malformed_body_refuses_rather_than_accepting() {
     let mut body = Vec::new();
     signed_body(&mut body);
 
-    let (status, range) = c.post(&body).expect("round trip");
+    let (status, range) = post(&mut c, &body).expect("round trip");
     assert_eq!(status, 200);
     assert!(
         scan(&c.resp()[range]).is_err(),
@@ -287,7 +466,7 @@ fn a_mid_body_disconnect_is_an_error_not_a_short_read() {
     let mut body = Vec::new();
     signed_body(&mut body);
 
-    let e = match c.post(&body) {
+    let e = match post(&mut c, &body) {
         Err(e) => e,
         Ok((s, r)) => panic!("a truncated body must not succeed: {s} {r:?}"),
     };
@@ -318,7 +497,7 @@ fn a_stalled_server_is_bounded_by_the_deadline() {
     signed_body(&mut body);
 
     let t0 = Instant::now();
-    let e = match c.post(&body) {
+    let e = match post(&mut c, &body) {
         Err(e) => e,
         Ok(_) => panic!("a silent server must not look like a reply"),
     };
@@ -367,41 +546,10 @@ fn the_connection_is_reused_across_requests() {
         accepts_srv.fetch_add(1, Ordering::Release);
         let mut conn = ServerConnection::new(server_cfg).expect("conn");
         let mut stream = Stream::new(&mut conn, &mut sock);
-        let mut buf = [0u8; 32 * 1024];
         // Answer two requests on the same connection.
         for _ in 0..2 {
-            let mut total = 0usize;
-            let header_end = loop {
-                let Ok(n) = stream.read(&mut buf[total..]) else {
-                    return;
-                };
-                if n == 0 {
-                    return;
-                }
-                total += n;
-                if let Some(i) =
-                    (0..total.saturating_sub(3)).find(|&i| &buf[i..i + 4] == b"\r\n\r\n")
-                {
-                    break i + 4;
-                }
-            };
-            let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-            let clen: usize = head
-                .lines()
-                .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-                .and_then(|l| l.split(':').nth(1))
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0);
-            let mut remaining = clen.saturating_sub(total - header_end);
-            while remaining > 0 {
-                let need = remaining.min(buf.len());
-                let Ok(n) = stream.read(&mut buf[..need]) else {
-                    return;
-                };
-                if n == 0 {
-                    break;
-                }
-                remaining -= n;
+            if !read_one_request(&mut stream) {
+                return;
             }
             let h = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
@@ -420,7 +568,7 @@ fn the_connection_is_reused_across_requests() {
     signed_body(&mut body);
 
     for i in 0..2 {
-        let (status, range) = c.post(&body).unwrap_or_else(|e| panic!("request {i}: {e}"));
+        let (status, range) = post(&mut c, &body).unwrap_or_else(|e| panic!("request {i}: {e}"));
         assert_eq!(status, 200);
         let HlResponse::Ok(o) = scan(&c.resp()[range]).expect("scan") else {
             panic!("request {i}")
@@ -432,4 +580,158 @@ fn the_connection_is_reused_across_requests() {
         1,
         "two orders must share ONE TLS session"
     );
+    assert_eq!(c.dials(), 1);
+}
+
+/// The venue closed the kept-alive connection while we were idle. The
+/// next order must dial fresh and SUCCEED — before the fix it was
+/// written into the dead socket, read EOF, and came back `Disconnected`
+/// with `left_host == true`: an order lost to reconciliation that never
+/// reached the venue (operator ask, 2026-09-24).
+#[test]
+fn an_idle_close_is_noticed_before_the_next_order_is_written() {
+    let (port, cfg, accepts) = boot_closing(false, Duration::from_millis(50));
+    let mut c = client(port, cfg);
+    let mut body = Vec::new();
+    signed_body(&mut body);
+    let mut i = 0;
+    while i < 3 {
+        // Idle long enough for the venue's close to land.
+        thread::sleep(Duration::from_millis(250));
+        let (status, range) = post(&mut c, &body)
+            .unwrap_or_else(|e| panic!("order {i}: {e} — a closed keep-alive was reused"));
+        assert_eq!(status, 200);
+        let HlResponse::Ok(o) = scan(&c.resp()[range]).expect("scan") else {
+            panic!("order {i}")
+        };
+        assert_eq!(o.oid, 424_242);
+        i += 1;
+    }
+    assert_eq!(
+        accepts.load(Ordering::Acquire),
+        3,
+        "one connection per answer"
+    );
+    assert_eq!(c.dials(), 3, "the dial counter shows the venue's closes");
+}
+
+/// HD2: the request head, byte for byte — `HttpsPost`'s template
+/// (Host, Content-Type, Connection, then the length). Before HD2 the
+/// length came before `Connection`. (That head and body leave in one
+/// write is gate 101's evidence, not this test's.)
+#[test]
+fn the_request_head_is_pinned_byte_for_byte() {
+    let (port, cfg, heads) = boot_capture();
+    let mut c = client(port, cfg);
+    let mut body = Vec::new();
+    signed_body(&mut body);
+    let (status, _) = post(&mut c, &body).expect("round trip");
+    assert_eq!(status, 200);
+    let head = heads
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the server saw a request");
+    assert_eq!(
+        String::from_utf8_lossy(&head),
+        format!(
+            "POST /exchange HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+             Connection: keep-alive\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+    );
+}
+
+/// HD2: an answer its `Content-Length` proves whole, followed at once by
+/// a bare TCP FIN. TLS authenticated every byte of it, so it is
+/// delivered. Before HD2 the read after it (`UnexpectedEof`) threw it
+/// away: `Disconnected` with `left_host`, a false `sent_unanswered` on an
+/// order the venue had answered.
+#[test]
+fn a_whole_answer_survives_a_close_without_close_notify() {
+    let (port, cfg, done) = boot(Script::ReplyThenBareFin(OK_RESTING));
+    let mut c = client(port, cfg);
+    let mut body = Vec::new();
+    signed_body(&mut body);
+    let (status, range) = post(&mut c, &body).expect("the answer was lost to the bare FIN");
+    assert_eq!(status, 200);
+    let HlResponse::Ok(o) = scan(&c.resp()[range]).expect("scan") else {
+        panic!("expected Ok")
+    };
+    assert_eq!(o.oid, 424_242);
+    done.store(true, Ordering::Release);
+}
+
+/// HD2: a `Transfer-Encoding: chunked` answer is decoded in place and
+/// scanned. Before HD2 it was `BadHttp` with `left_host`: an in-doubt
+/// order on an answer the venue gave.
+#[test]
+fn a_chunked_answer_is_decoded_and_scanned() {
+    let (port, cfg, done) = boot(Script::Chunked(OK_RESTING));
+    let mut c = client(port, cfg);
+    let mut body = Vec::new();
+    signed_body(&mut body);
+    let (status, range) = post(&mut c, &body).expect("a chunked answer is an answer");
+    assert_eq!(status, 200);
+    let HlResponse::Ok(o) = scan(&c.resp()[range]).expect("scan") else {
+        panic!("expected Ok")
+    };
+    assert!(o.accepted());
+    assert_eq!(o.oid, 424_242);
+    assert!(c.is_connected(), "chunked framing keeps the connection");
+    done.store(true, Ordering::Release);
+}
+
+/// HD2: interim `100`/`103` answers before the answer are skipped, and a
+/// `204` ends at its blank line — promptly, the connection kept. Before
+/// HD2 both read as close-delimited and waited out the deadline:
+/// `Timeout` with `left_host`, an in-doubt order the venue had answered.
+#[test]
+fn interim_answers_and_a_204_end_at_their_heads() {
+    let mut body = Vec::new();
+    signed_body(&mut body);
+    let interim = format!(
+        "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\n\
+         HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        OK_RESTING.len(),
+        String::from_utf8_lossy(OK_RESTING)
+    );
+    let (port, cfg, done) = boot(Script::Raw(Vec::leak(interim.into_bytes())));
+    let mut c = client(port, cfg);
+    let (status, range) = post(&mut c, &body).expect("an answer behind interim heads");
+    assert_eq!(status, 200);
+    let HlResponse::Ok(o) = scan(&c.resp()[range]).expect("scan") else {
+        panic!("expected Ok")
+    };
+    assert_eq!(o.oid, 424_242);
+    assert!(c.is_connected(), "interim heads keep the connection");
+    done.store(true, Ordering::Release);
+
+    let (port, cfg, done) = boot(Script::Raw(b"HTTP/1.1 204 No Content\r\n\r\n"));
+    let mut c = client(port, cfg);
+    let t0 = Instant::now();
+    let (status, range) = post(&mut c, &body).expect("a 204 is an answer");
+    assert_eq!((status, range.len()), (204, 0));
+    assert!(t0.elapsed() < REQ_DEADLINE, "a 204 ends at its blank line");
+    assert!(c.is_connected(), "a 204 keeps the connection");
+    done.store(true, Ordering::Release);
+}
+
+/// `Connection: close` on an answer retires the connection WITH the
+/// answer (kept intact) — the next order, sent at once, before the venue
+/// has actually closed, must not reuse it.
+#[test]
+fn an_announced_close_retires_the_connection_with_the_answer() {
+    let (port, cfg, accepts) = boot_closing(true, Duration::from_millis(300));
+    let mut c = client(port, cfg);
+    let mut body = Vec::new();
+    signed_body(&mut body);
+    let (status, range) = post(&mut c, &body).expect("first");
+    assert_eq!(status, 200);
+    assert!(!c.is_connected(), "`Connection: close` retires it at once");
+    let HlResponse::Ok(o) = scan(&c.resp()[range]).expect("the answer survives") else {
+        panic!("first")
+    };
+    assert_eq!(o.oid, 424_242);
+    let (status, _) = post(&mut c, &body).expect("second, immediately");
+    assert_eq!(status, 200);
+    assert_eq!(accepts.load(Ordering::Acquire), 2);
 }

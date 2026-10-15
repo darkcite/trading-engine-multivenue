@@ -115,10 +115,7 @@ impl WireNum {
             }
         }
 
-        Self {
-            buf,
-            len: n as u8,
-        }
+        Self { buf, len: n as u8 }
     }
 
     /// The rendered bytes.

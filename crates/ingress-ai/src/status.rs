@@ -38,7 +38,7 @@ pub struct AiIngressStatus {
     seq_gap_total: AtomicU64,
     /// Sequence regressions (frame discarded, connection kept).
     seq_regress_total: AtomicU64,
-    /// Ring `try_push` failures — commands dropped because the engine
+    /// Ring `try_push_ref` failures — commands dropped because the engine
     /// was not draining fast enough.
     ring_drops_total: AtomicU64,
     /// Commands dropped TTL-expired at the engine drain site.
@@ -63,7 +63,7 @@ pub struct AiIngressStatus {
     /// (`engine_ai_ruleset_rejected_total`).
     ruleset_rejected_total: AtomicU64,
     /// Ruleset side-path (8g item 4): Stages that passed the §4.2
-    /// validator but were REJECTED at the table-ring `try_push` —
+    /// validator but were REJECTED at the table-ring `try_push_ref` —
     /// 2 undrained stages, §5 push-full. Every such event also
     /// increments `ruleset_rejected_total`; this counter isolates the
     /// cause (`engine_ai_table_push_fail_total`, §9 — /metrics

@@ -1,0 +1,630 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
+//! HYPARB L4 — two live arms behind one router.
+//!
+//! [`RoutedDispatcher`](crate::RoutedDispatcher) holds ONE live arm.
+//! Two slots can be live at once on different money: slot 3 (BIN15, the
+//! operator's Hyperliquid account) and slot 0 (HYPARB, its own wallet on
+//! HyperEVM and Hyperliquid, ruling O-HL3). [`SlotSplit`] is that one arm:
+//! it sends every verb of slot `slot` to `b` and every other slot's to
+//! `a`, by the `strategy_id` byte the router already routed on.
+//!
+//! ## What is per slot, and what is shared
+//!
+//! * **Per slot:** submit, cancel and modify; the halt signal
+//!   ([`OrderDispatch::halt_signal_for`]), so slot 0's reconciler,
+//!   stream and P&L bound never halt slot 3, nor the reverse. The
+//!   router seeds each slot from its own arm's signal.
+//! * **Shared:** fills and retirements (a's, then b's), idle work, venue events and
+//!   ticks (each arm ignores what is not its own), and `cancel_all`.
+//!   The router's cancel-all is venue-wide by design: a halt takes
+//!   every live order off, the healthy slot re-quotes. Both arms are
+//!   asked, and the state is the least settled of the two.
+//! * **Slot-agnostic readers** (`halt_signal`, `arm_counters`) answer
+//!   `a`'s — the surface that existed before L4.
+//!
+//! Zero-sized glue: one byte compare per verb, no allocation, no `dyn`.
+
+use clob_dispatcher::{
+    CancelAllState, DispatchError, DispatchStats, HaltSignal, LiveArmCounters, OrderDispatch,
+    Retired,
+};
+use core_types::{CancelReq, ChannelEvent, Fill, ModifyReq, NsTs, Order, SymbolId, Tick};
+
+/// **XMM XH4i-5 — the slot a split names when it names none**: every verb
+/// goes to `a`. The engine composes slot 3's gateway arm innermost —
+/// `SlotSplit(3, <shape>, Option<arm>)` — and with the arm absent its slot
+/// is this one. Neither a slot (`0..EXEC_SLOTS`) nor
+/// [`core_types::STRATEGY_ID_NONE`] (an unstamped order is the shape's).
+/// The Hyperliquid gateway's `SWEEP_SLOT` is 0xFE too: its own sweep
+/// posts' slot on its wire — another namespace, never a router slot.
+pub const NO_SLOT: u8 = 0xFE;
+const _: () = assert!(
+    NO_SLOT as usize >= crate::route::EXEC_SLOTS && NO_SLOT != core_types::STRATEGY_ID_NONE
+);
+
+/// Slot `slot`'s verbs go to `b`; every other slot's to `a`.
+pub struct SlotSplit<A: OrderDispatch, B: OrderDispatch> {
+    slot: u8,
+    a: A,
+    b: B,
+}
+
+impl<A: OrderDispatch, B: OrderDispatch> SlotSplit<A, B> {
+    /// `b` trades slot `slot`; `a` every other live slot.
+    #[inline]
+    #[must_use]
+    pub const fn new(slot: u8, a: A, b: B) -> Self {
+        Self { slot, a, b }
+    }
+
+    /// The slot `b` trades.
+    #[inline]
+    #[must_use]
+    pub const fn slot(&self) -> u8 {
+        self.slot
+    }
+
+    /// The arm every other slot trades through.
+    #[inline]
+    #[must_use]
+    pub const fn a(&self) -> &A {
+        &self.a
+    }
+
+    /// The arm slot [`Self::slot`] trades through.
+    #[inline]
+    #[must_use]
+    pub const fn b(&self) -> &B {
+        &self.b
+    }
+
+    #[cfg(test)]
+    pub(crate) fn a_mut(&mut self) -> &mut A {
+        &mut self.a
+    }
+
+    #[cfg(test)]
+    pub(crate) fn b_mut(&mut self) -> &mut B {
+        &mut self.b
+    }
+}
+
+/// The least settled of two confirmations: a sweep still draining
+/// waits; an arm that gave up is asked again; clear only when both are.
+#[inline]
+pub(crate) const fn least_settled(a: CancelAllState, b: CancelAllState) -> CancelAllState {
+    match (a, b) {
+        (CancelAllState::Working, _) | (_, CancelAllState::Working) => CancelAllState::Working,
+        (CancelAllState::Stranded, _) | (_, CancelAllState::Stranded) => CancelAllState::Stranded,
+        _ => CancelAllState::Clear,
+    }
+}
+
+impl<A: OrderDispatch, B: OrderDispatch> OrderDispatch for SlotSplit<A, B> {
+    #[inline]
+    fn submit(&mut self, order: &Order) -> Result<(), DispatchError> {
+        if order.strategy_id == self.slot {
+            self.b.submit(order)
+        } else {
+            self.a.submit(order)
+        }
+    }
+
+    #[inline]
+    fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
+        if req.strategy_id == self.slot {
+            self.b.cancel(req)
+        } else {
+            self.a.cancel(req)
+        }
+    }
+
+    #[inline]
+    fn modify(&mut self, req: &ModifyReq) -> Result<(), DispatchError> {
+        if req.order().strategy_id == self.slot {
+            self.b.modify(req)
+        } else {
+            self.a.modify(req)
+        }
+    }
+
+    #[inline]
+    fn try_next_fill(&mut self) -> Option<Fill> {
+        match self.a.try_next_fill() {
+            Some(f) => Some(f),
+            None => self.b.try_next_fill(),
+        }
+    }
+
+    #[inline]
+    fn try_next_retired(&mut self) -> Option<Retired> {
+        match self.a.try_next_retired() {
+            Some(r) => Some(r),
+            None => self.b.try_next_retired(),
+        }
+    }
+
+    /// BX6 (obligation 2): the arm the order routes to answers — by the
+    /// slot, exactly as `cancel` and `modify` route.
+    #[inline]
+    fn verbs_confirm_later(&self, sym: SymbolId, venue: u8, strategy_id: u8) -> bool {
+        if strategy_id == self.slot {
+            self.b.verbs_confirm_later(sym, venue, strategy_id)
+        } else {
+            self.a.verbs_confirm_later(sym, venue, strategy_id)
+        }
+    }
+
+    fn try_next_renamed(&mut self) -> Option<clob_dispatcher::Renamed> {
+        match self.a.try_next_renamed() {
+            Some(r) => Some(r),
+            None => self.b.try_next_renamed(),
+        }
+    }
+
+    fn stats(&self) -> DispatchStats {
+        self.a.stats().merged(self.b.stats())
+    }
+
+    #[inline]
+    fn observe_tick(&mut self, tick: &Tick, now_ns: NsTs) {
+        self.a.observe_tick(tick, now_ns);
+        self.b.observe_tick(tick, now_ns);
+    }
+
+    #[inline]
+    fn observe_amm(&mut self, sym: SymbolId, payload: &[u8; 40], now_ns: NsTs) {
+        self.a.observe_amm(sym, payload, now_ns);
+        self.b.observe_amm(sym, payload, now_ns);
+    }
+
+    /// XMM XH2: both arms see every print, like every tick.
+    #[inline]
+    fn observe_trade(&mut self, print: &core_types::TradePrint, now_ns: NsTs) {
+        self.a.observe_trade(print, now_ns);
+        self.b.observe_trade(print, now_ns);
+    }
+
+    /// XMM XH2: arm A's order events first, then B's — the fill order.
+    /// Forwarded now so the XH4 gateway's events cannot vanish into a
+    /// defaulted `false` behind this wrapper.
+    #[inline]
+    fn try_next_order_event(&mut self, out: &mut core_types::OrderEvent) -> bool {
+        self.a.try_next_order_event(out) || self.b.try_next_order_event(out)
+    }
+
+    /// XMM XH2: both arms learn the queue law's instruments.
+    #[inline]
+    fn track_queue_sym(&mut self, sym: SymbolId) {
+        self.a.track_queue_sym(sym);
+        self.b.track_queue_sym(sym);
+    }
+
+    /// Both arms, unconditionally — neither may starve the other.
+    #[inline]
+    fn on_idle(&mut self) -> bool {
+        let a = self.a.on_idle();
+        let b = self.b.on_idle();
+        a | b
+    }
+
+    #[inline]
+    fn on_venue_event(&mut self, event: &ChannelEvent) {
+        self.a.on_venue_event(event);
+        self.b.on_venue_event(event);
+    }
+
+    #[inline]
+    fn on_fill_booked(&mut self, fill: &Fill) {
+        self.a.on_fill_booked(fill);
+        self.b.on_fill_booked(fill);
+    }
+
+    #[inline]
+    fn on_opt_summary(&mut self, summary: &core_types::OptSummary) {
+        self.a.on_opt_summary(summary);
+        self.b.on_opt_summary(summary);
+    }
+
+    /// BX3: the router's alias table, to both arms.
+    fn set_route_aliases(&mut self, aliases: clob_dispatcher::RouteAliases) {
+        self.a.set_route_aliases(aliases);
+        self.b.set_route_aliases(aliases);
+    }
+
+    #[inline]
+    fn halt_signal(&self) -> HaltSignal {
+        self.a.halt_signal()
+    }
+
+    #[inline]
+    fn halt_signal_for(&self, slot: u8) -> HaltSignal {
+        if slot == self.slot {
+            self.b.halt_signal()
+        } else {
+            self.a.halt_signal_for(slot)
+        }
+    }
+
+    /// Both arms are asked, whatever the first answered.
+    fn cancel_all(&mut self) -> Result<(), DispatchError> {
+        let a = self.a.cancel_all();
+        let b = self.b.cancel_all();
+        a.and(b)
+    }
+
+    fn cancel_all_state(&self) -> CancelAllState {
+        least_settled(self.a.cancel_all_state(), self.b.cancel_all_state())
+    }
+
+    /// **XMM XH5a** — a slot's halt reaches the arm that trades it, and
+    /// only that arm (as `halt_signal_for` reads it).
+    fn cancel_slot(&mut self, slot: u8) -> Result<(), DispatchError> {
+        if slot == self.slot {
+            self.b.cancel_slot(slot)
+        } else {
+            self.a.cancel_slot(slot)
+        }
+    }
+
+    fn cancel_slot_state(&self, slot: u8) -> CancelAllState {
+        if slot == self.slot {
+            self.b.cancel_slot_state(slot)
+        } else {
+            self.a.cancel_slot_state(slot)
+        }
+    }
+
+    fn arm_counters(&self) -> LiveArmCounters {
+        self.a.arm_counters()
+    }
+
+    /// BX6: whichever arm trades `venue` (`a` asked first).
+    fn venue_arm_counters(&self, venue: u8) -> Option<LiveArmCounters> {
+        match self.a.venue_arm_counters(venue) {
+            Some(c) => Some(c),
+            None => self.b.venue_arm_counters(venue),
+        }
+    }
+
+    /// Both arms take their own orders off the venue on the way out.
+    fn on_shutdown(&mut self) {
+        self.a.on_shutdown();
+        self.b.on_shutdown();
+    }
+
+    /// Each slot's day, from the arm that trades it.
+    #[inline]
+    fn venue_day_bought(&self, slot: usize) -> Option<(u64, i64)> {
+        if slot == self.slot as usize {
+            self.b.venue_day_bought(slot)
+        } else {
+            self.a.venue_day_bought(slot)
+        }
+    }
+
+    /// XMM XH4f: each slot's health, from the arm that trades it.
+    #[inline]
+    fn exec_health(&self, slot: u8, now_ns: NsTs) -> core_types::ExecHealth {
+        if slot == self.slot {
+            self.b.exec_health(slot, now_ns)
+        } else {
+            self.a.exec_health(slot, now_ns)
+        }
+    }
+
+    /// XMM XH4f (D11): the gateway arm's report, from whichever arm holds
+    /// one — the split slot's first.
+    fn gateway_arm_report(
+        &self,
+        now_ns: NsTs,
+        out: &mut clob_dispatcher::GatewayArmReport,
+    ) -> bool {
+        self.b.gateway_arm_report(now_ns, out) || self.a.gateway_arm_report(now_ns, out)
+    }
+
+    /// BX11: the Binance arm's report, from whichever arm holds one — the
+    /// split slot's first.
+    fn binance_arm_report(
+        &self,
+        now_ns: NsTs,
+        out: &mut clob_dispatcher::BinanceArmReport,
+    ) -> bool {
+        self.b.binance_arm_report(now_ns, out) || self.a.binance_arm_report(now_ns, out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_types::{Price, Qty, Side, VenueId};
+
+    /// An arm that records what reached it and answers what the test
+    /// sets.
+    #[derive(Default)]
+    struct Arm {
+        seen: Vec<u64>,
+        cancelled: Vec<u64>,
+        fills: Vec<Fill>,
+        retired: Vec<Retired>,
+        day: Option<(u64, i64)>,
+        shutdowns: u32,
+        sig: HaltSignal,
+        cancel_all_calls: u32,
+        cancel_all_err: bool,
+        state: u8,
+        health: core_types::ExecHealth,
+        /// A gateway arm's `pushed` (0 = no gateway arm).
+        gw: u64,
+        /// A Binance arm's `acked` (0 = no Binance arm).
+        bn: u64,
+    }
+
+    impl OrderDispatch for Arm {
+        fn submit(&mut self, o: &Order) -> Result<(), DispatchError> {
+            self.seen.push(o.client_oid);
+            Ok(())
+        }
+        fn cancel(&mut self, r: &CancelReq) -> Result<(), DispatchError> {
+            self.cancelled.push(r.client_oid);
+            Ok(())
+        }
+        fn modify(&mut self, r: &ModifyReq) -> Result<(), DispatchError> {
+            self.seen.push(r.order().client_oid);
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            self.fills.pop()
+        }
+        fn try_next_retired(&mut self) -> Option<Retired> {
+            self.retired.pop()
+        }
+        fn on_shutdown(&mut self) {
+            self.shutdowns += 1;
+        }
+        fn venue_day_bought(&self, _slot: usize) -> Option<(u64, i64)> {
+            self.day
+        }
+        fn exec_health(&self, _slot: u8, _now_ns: NsTs) -> core_types::ExecHealth {
+            self.health
+        }
+        fn gateway_arm_report(
+            &self,
+            _now_ns: NsTs,
+            out: &mut clob_dispatcher::GatewayArmReport,
+        ) -> bool {
+            if self.gw == 0 {
+                return false;
+            }
+            out.present = 1;
+            out.pushed = self.gw;
+            true
+        }
+        fn binance_arm_report(
+            &self,
+            _now_ns: NsTs,
+            out: &mut clob_dispatcher::BinanceArmReport,
+        ) -> bool {
+            if self.bn == 0 {
+                return false;
+            }
+            out.present = 1;
+            out.acked = self.bn;
+            true
+        }
+        fn stats(&self) -> DispatchStats {
+            DispatchStats::default()
+        }
+        fn halt_signal(&self) -> HaltSignal {
+            self.sig
+        }
+        fn cancel_all(&mut self) -> Result<(), DispatchError> {
+            self.cancel_all_calls += 1;
+            if self.cancel_all_err {
+                Err(DispatchError::Disconnected)
+            } else {
+                Ok(())
+            }
+        }
+        fn cancel_all_state(&self) -> CancelAllState {
+            match self.state {
+                1 => CancelAllState::Working,
+                2 => CancelAllState::Stranded,
+                _ => CancelAllState::Clear,
+            }
+        }
+    }
+
+    fn order(slot: u8, oid: u64) -> Order {
+        let mut o = Order::new(
+            1,
+            VenueId::Hyperliquid,
+            1,
+            Side::Bid,
+            1,
+            Price::from_raw(1),
+            Qty::from_raw(1),
+            oid,
+        );
+        o.strategy_id = slot;
+        o
+    }
+
+    fn split() -> SlotSplit<Arm, Arm> {
+        SlotSplit::new(0, Arm::default(), Arm::default())
+    }
+
+    #[test]
+    fn each_slots_verbs_reach_its_own_arm_only() {
+        let mut s = split();
+        s.submit(&order(0, 10)).unwrap();
+        s.submit(&order(3, 30)).unwrap();
+        s.cancel(&CancelReq::of(&order(0, 11), 1)).unwrap();
+        s.cancel(&CancelReq::of(&order(3, 31), 1)).unwrap();
+        s.modify(&ModifyReq::new(30, order(3, 32))).unwrap();
+        assert_eq!(s.b().seen, [10]);
+        assert_eq!(s.b().cancelled, [11]);
+        assert_eq!(s.a().seen, [30, 32]);
+        assert_eq!(s.a().cancelled, [31]);
+        assert_eq!(s.slot(), 0);
+    }
+
+    #[test]
+    fn each_slot_reads_its_own_arms_signal() {
+        let mut s = split();
+        s.a_mut().sig = HaltSignal::new(0, 0, 7, 0, false, true, 0);
+        s.b_mut().sig = HaltSignal::new(0, 0, 1, 0, false, false, 0).with_pnl(true, -9);
+        assert_eq!(s.halt_signal_for(3).reject_streak, 7);
+        assert_eq!(s.halt_signal_for(0).reject_streak, 1);
+        assert_eq!(s.halt_signal_for(0).pnl_delta_usd_1e6, -9);
+        assert_eq!(s.halt_signal().reject_streak, 7, "slot-agnostic = a");
+    }
+
+    /// XMM XH4f: slot 6's health is its own arm's, never another slot's.
+    #[test]
+    fn each_slot_reads_its_own_arm_s_health() {
+        use core_types::{ExecHealth, EXEC_BLOCKED_NOT_READY, EXEC_CONGESTION_BUSY};
+        let mut s = split();
+        s.a_mut().health = ExecHealth::new(0, EXEC_CONGESTION_BUSY, 50);
+        s.b_mut().health = ExecHealth::new(EXEC_BLOCKED_NOT_READY, 0, 0);
+        assert_eq!(
+            s.exec_health(3, 1),
+            ExecHealth::new(0, EXEC_CONGESTION_BUSY, 50)
+        );
+        assert_eq!(
+            s.exec_health(0, 1),
+            ExecHealth::new(EXEC_BLOCKED_NOT_READY, 0, 0)
+        );
+    }
+
+    /// XMM XH4f (D11): the gateway arm's report from whichever arm holds
+    /// one — the split slot's first.
+    #[test]
+    fn the_gateway_arm_s_report_comes_from_the_arm_that_holds_one() {
+        let mut s = split();
+        let mut r = clob_dispatcher::GatewayArmReport::default();
+        assert!(!s.gateway_arm_report(1, &mut r), "neither arm holds one");
+        s.a_mut().gw = 3;
+        assert!(s.gateway_arm_report(1, &mut r));
+        assert_eq!(r.pushed, 3);
+        s.b_mut().gw = 6;
+        assert!(s.gateway_arm_report(1, &mut r));
+        assert_eq!(r.pushed, 6, "the split slot's arm first");
+    }
+
+    /// BX11: the Binance arm's report from whichever arm holds one — the
+    /// split slot's first.
+    #[test]
+    fn the_binance_arm_s_report_comes_from_the_arm_that_holds_one() {
+        let mut s = split();
+        let mut r = clob_dispatcher::BinanceArmReport::default();
+        assert!(!s.binance_arm_report(1, &mut r), "neither arm holds one");
+        s.a_mut().bn = 3;
+        assert!(s.binance_arm_report(1, &mut r));
+        assert_eq!(r.acked, 3);
+        s.b_mut().bn = 6;
+        assert!(s.binance_arm_report(1, &mut r));
+        assert_eq!(r.acked, 6, "the split slot's arm first");
+    }
+
+    #[test]
+    fn fills_come_from_both_arms_a_first() {
+        let mut s = split();
+        let f = |oid| Fill::new(1, 1, Side::Bid, Price::from_raw(1), Qty::from_raw(1), oid);
+        s.a_mut().fills.push(f(1));
+        s.b_mut().fills.push(f(2));
+        assert_eq!(s.try_next_fill().map(|x| x.order_id), Some(1));
+        assert_eq!(s.try_next_fill().map(|x| x.order_id), Some(2));
+        assert!(s.try_next_fill().is_none());
+    }
+
+    #[test]
+    fn retirements_come_from_both_arms() {
+        let mut s = split();
+        let expired = clob_dispatcher::RETIRED_EXPIRED;
+        let rejected = clob_dispatcher::RETIRED_REJECTED;
+        s.a_mut().retired.push(Retired::new(5, 3, expired));
+        s.b_mut().retired.push(Retired::new(6, 0, rejected));
+        assert_eq!(s.try_next_retired(), Some(Retired::new(5, 3, expired)));
+        assert_eq!(s.try_next_retired(), Some(Retired::new(6, 0, rejected)));
+        assert_eq!(s.try_next_retired(), None);
+    }
+
+    #[test]
+    fn shutdown_reaches_both_arms_and_each_slot_reads_its_own_day() {
+        let mut s = split();
+        s.a_mut().day = Some((20_000, 7));
+        s.b_mut().day = Some((20_000, 9));
+        assert_eq!(s.venue_day_bought(3), Some((20_000, 7)));
+        assert_eq!(s.venue_day_bought(0), Some((20_000, 9)));
+        s.on_shutdown();
+        assert_eq!((s.a().shutdowns, s.b().shutdowns), (1, 1));
+    }
+
+    #[test]
+    fn cancel_all_asks_both_and_confirms_only_when_both_are_clear() {
+        let mut s = split();
+        s.a_mut().cancel_all_err = true;
+        assert!(s.cancel_all().is_err());
+        assert_eq!((s.a().cancel_all_calls, s.b().cancel_all_calls), (1, 1));
+        assert_eq!(s.cancel_all_state(), CancelAllState::Clear);
+        s.b_mut().state = 2;
+        assert_eq!(s.cancel_all_state(), CancelAllState::Stranded);
+        s.a_mut().state = 1;
+        assert_eq!(s.cancel_all_state(), CancelAllState::Working, "wait first");
+    }
+
+    /// XMM XH5a: a slot's cancel asks its own arm alone, and its
+    /// confirmation is that arm's.
+    #[test]
+    fn a_slot_s_cancel_asks_its_own_arm_alone() {
+        let mut s = split();
+        s.cancel_slot(0).unwrap();
+        assert_eq!((s.a().cancel_all_calls, s.b().cancel_all_calls), (0, 1));
+        s.a_mut().cancel_all_err = true;
+        assert!(s.cancel_slot(3).is_err());
+        assert_eq!((s.a().cancel_all_calls, s.b().cancel_all_calls), (1, 1));
+        s.a_mut().state = 2;
+        assert_eq!(s.cancel_slot_state(3), CancelAllState::Stranded);
+        assert_eq!(
+            s.cancel_slot_state(0),
+            CancelAllState::Clear,
+            "b's own word"
+        );
+        s.b_mut().state = 1;
+        assert_eq!(s.cancel_slot_state(0), CancelAllState::Working);
+    }
+
+    /// XMM XH5b-3: slot 6 outermost beside a nested shape — the engine's
+    /// `SlotSplit(6, SlotSplit(0, <the rest>, slot 0's arm), slot 6's arm)`:
+    /// each slot's verbs reach its own arm, and a slot's sweep asks its own
+    /// arm alone, through every nesting.
+    #[test]
+    fn slot_six_outermost_routes_through_a_nested_shape() {
+        let mut s = SlotSplit::new(6, split(), Arm::default());
+        s.submit(&order(0, 10)).unwrap();
+        s.submit(&order(3, 30)).unwrap();
+        s.submit(&order(6, 60)).unwrap();
+        s.cancel(&CancelReq::of(&order(6, 61), 1)).unwrap();
+        s.modify(&ModifyReq::new(60, order(6, 62))).unwrap();
+        assert_eq!(s.b().seen, [60, 62]);
+        assert_eq!(s.b().cancelled, [61]);
+        assert_eq!(s.a().b().seen, [10]);
+        assert_eq!(s.a().a().seen, [30]);
+        s.cancel_slot(6).unwrap();
+        let calls = |s: &SlotSplit<SlotSplit<Arm, Arm>, Arm>| {
+            (
+                s.a().a().cancel_all_calls,
+                s.a().b().cancel_all_calls,
+                s.b().cancel_all_calls,
+            )
+        };
+        assert_eq!(calls(&s), (0, 0, 1));
+        s.cancel_slot(0).unwrap();
+        assert_eq!(calls(&s), (0, 1, 1));
+        s.cancel_slot(3).unwrap();
+        assert_eq!(calls(&s), (1, 1, 1));
+    }
+}

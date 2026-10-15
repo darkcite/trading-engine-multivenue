@@ -75,7 +75,7 @@ def _entry(ts_ms: int, engine: dict | None, fast: int, slow: int) -> dict:
     return e
 
 
-def _samples(  # noqa: PLR0913, PLR0917 — one knob per sample shape, deliberately
+def _samples(  # one knob per sample shape, deliberately
     start_ms: int,
     n: int,
     pid: int = 100,
@@ -286,7 +286,8 @@ def test_run_soak_pools_windows_and_never_waits(tmp_path, capsys) -> None:
     assert claude_worker.regime.parse_since_ms(str(since)) == since
     assert claude_worker.regime.main(["soak", "--since", since_iso, *common]) == 3
     assert "INSUFFICIENT (windows 4, counted 4" in capsys.readouterr().out
-    assert claude_worker.regime.main(["soak", "--since", str(base), "--min-windows", "8", *common]) == 0
+    soak = ["soak", "--since", str(base), "--min-windows", "8", *common]
+    assert claude_worker.regime.main(soak) == 0
     # Without --pool the windows come from the runs themselves (no cut
     # needed): an empty replay root has none ⇒ INSUFFICIENT.
     empty = tmp_path / "logs"

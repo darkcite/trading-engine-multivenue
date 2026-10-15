@@ -9,7 +9,8 @@
 //!
 //! It runs on the dispatcher worker thread and nowhere else. That is
 //! not a style choice — the fill lane needs exactly ONE writer, and
-//! the worker already owns the HTTP socket, the nonce and the budget.
+//! the worker already owns the HTTP socket and the budget, and draws the
+//! nonce (its agent's one stream since XH4h S3).
 //! A second thread for the user-event stream would need a lock around
 //! all of it, on the path that books fills.
 //!
@@ -43,19 +44,21 @@ use std::time::{Duration, Instant};
 use clob_dispatcher::{DispatchError, DispatchStats, OrderDispatch};
 use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
 use core_ring::Producer;
-use core_types::{ChannelEvent, ChannelId, Fill, NsTs, Order, Side, Tick, VenueId};
+use core_types::{CancelReq, ChannelEvent, Fill, ModifyReq, NsTs, Order, Side, Tick};
 
 use crate::action::{encode_order, OrderWire, Tif, MAX_ACTION};
-use crate::asset::AssetTable;
+use crate::asset::{AssetTable, RollOf};
 use crate::budget::{self, AddressBudget};
 use crate::cloid::encode as encode_cloid;
 use crate::config::HlConfig;
-use crate::http::{HlHttp, MAX_REQ_BODY};
-use crate::nonce::Nonce;
+use crate::http::HlHttp;
+use crate::nonce::{NonceSource, SharedNonce};
 use crate::request::{envelope_close, envelope_open, order_json};
 use crate::response::{scan, HlOk, HlResponse};
 use crate::sign::{sign_action, Network, Vault};
-use crate::userws::{scan_user_fills, to_fill, to_fill_as, Routed, TidRing, UserFill, SNAPSHOT_RING};
+use crate::userws::{
+    scan_user_fills, to_fill, to_fill_as, Routed, TidRing, UserFill, SNAPSHOT_RING,
+};
 use crate::userws_conn::UserWs;
 
 /// Engine 1e6 → venue 1e8.
@@ -107,6 +110,28 @@ const WS_BACKOFF: [Duration; 4] = [
     Duration::from_secs(15),
     Duration::from_secs(60),
 ];
+
+/// **S7-L1** — passes the account-wide sweep makes: ask the venue,
+/// cancel what is ours, ask again. Three is two retries for an order
+/// that survived its cancel (a fill racing it, a venue blip).
+const SWEEP_ALL_ROUNDS: u32 = 3;
+
+/// **S7-L1** — the account-wide sweep starts no request after this
+/// long. The drain it runs in has its own, longer deadline
+/// (`cli::sigint::DRAIN_DEADLINE_S`); this keeps the sweep inside it
+/// with room for the rest of the drain.
+const SWEEP_ALL_DEADLINE: Duration = Duration::from_secs(12);
+
+/// **S7-L1** — the request-weight top-up is checked at most this
+/// often, whatever the check found or did.
+const TOPUP_EVERY: Duration = Duration::from_secs(60);
+
+/// **S7-L1** — the first wait after a failed day-spend read; each
+/// further failure doubles it, up to [`DAY_RETRY_MAX`].
+const DAY_RETRY_MIN: Duration = Duration::from_secs(60);
+
+/// **S7-L1** — the longest wait between failed day-spend reads.
+const DAY_RETRY_MAX: Duration = Duration::from_secs(900);
 
 /// Counters an operator reads on `/metrics`.
 #[repr(C, align(64))]
@@ -317,6 +342,24 @@ pub struct HlExecCounters {
     /// first flat balance, which is the thing the file exists to
     /// prevent. Appended, like `sweep_deferred`, for the same reason.
     pub anchor_persist_failed: u64,
+    /// **S7-L1** — cancels the account-wide sweep (boot and shutdown,
+    /// [`HlExchange::cancel_ours_everywhere`]) had the venue confirm.
+    /// A total across both sweeps.
+    pub sweep_all_cancelled: u64,
+    /// **S7-L1** — orders of ours the LAST account-wide sweep could
+    /// not confirm gone. A level, not a total; `u64::MAX` = the venue's
+    /// open orders could not be read at all, which is NOT clear.
+    pub sweep_all_left: u64,
+    /// **S7-L1** — `userFillsByTime` day-spend reads that parsed.
+    pub day_sync_ok: u64,
+    /// **S7-L1** — day-spend reads that did not (transport, parse, or
+    /// a page the venue may have cut short).
+    pub day_sync_failed: u64,
+    /// **S7-L1** — `reserveRequestWeight` top-ups the venue accepted.
+    pub topup_ok: u64,
+    /// **S7-L1** — top-up checks that failed: the venue's budget could
+    /// not be read, or the purchase was not accepted.
+    pub topup_failed: u64,
 }
 
 /// Which budget rule an action answers to.
@@ -356,8 +399,9 @@ enum Spend {
     Cancel,
 }
 
-/// A leg whose instance has ENDED and whose resting orders have not
-/// been taken off the book yet (LAW E-8).
+/// A leg whose resting orders have not been taken off the book yet: its
+/// instance has ENDED (LAW E-8), or a halted slot's cancel asked for it
+/// (XMM XH5a).
 ///
 /// The coin bytes are CARRIED rather than derived from the asset id:
 /// a name derived from an id is the same class of guess LAW E-4
@@ -377,7 +421,13 @@ struct PendingSweep {
     /// The runaway guard. See [`SWEEP_MAX_DEFERS`].
     defers: u16,
     coin: [u8; crate::asset::COIN_MAX],
-    _pad2: [u8; 8],
+    /// **XMM XH5a — whose orders the sweep takes**: a mask over the
+    /// cloid's slot byte (LAW E-9), which `recon::ours_on_leg` reads.
+    /// [`crate::recon::ALL_SLOTS`] for a roll (a retired leg is nobody's
+    /// to keep), `1 << slot` for a halted slot's cancel. A second
+    /// request for a leg already pending ORs its slots in.
+    slots: u8,
+    _pad2: [u8; 7],
 }
 
 impl PendingSweep {
@@ -387,9 +437,15 @@ impl PendingSweep {
         coin_len: 0,
         defers: 0,
         coin: [0; crate::asset::COIN_MAX],
-        _pad2: [0; 8],
+        slots: 0,
+        _pad2: [0; 7],
     };
 }
+
+// XMM XH5a: `slots` took a byte of the padding — the entry stays 36 B, a
+// by-value copy within the ≤ 64 B allowance (`sweep_one_pending`'s
+// snapshot, `drop_sweep`'s swap).
+const _: () = assert!(core::mem::size_of::<PendingSweep>() == 36);
 
 /// How many ended legs can await a sweep at once.
 ///
@@ -398,7 +454,12 @@ impl PendingSweep {
 /// the member explains. Overflow is counted as `sweep_left` rather
 /// than silently dropped: a leg nobody swept and nobody counted is the
 /// stranded quote LAW E-8 exists to prevent.
-const MAX_PENDING_SWEEPS: usize = 16;
+///
+/// XMM XH5a: a halt's request queues every live leg at once, and a leg the
+/// table cannot hold is re-asked from the start of the walk — the same
+/// leading legs — so the table must hold every leg the market-data feed
+/// can bind: `cli` pins `2 × HL_MAX_FAMILIES` against it at compile time.
+pub const MAX_PENDING_SWEEPS: usize = 16;
 
 /// Attempts a pending sweep gets before it is given up on and counted.
 ///
@@ -534,11 +595,17 @@ const fn classify_sweep(failed: u32, deferred: u32, truncated: bool) -> SweepOut
 
 /// The live Hyperliquid dispatcher.
 pub struct HlExchange<const FILL_N: usize> {
+    /// The venue's REST client. Its `/exchange` window
+    /// ([`HlHttp::body_mut`]) is where every request body is built IN
+    /// PLACE: envelope head, then the action JSON rendered straight into
+    /// it, then the signature tail — one buffer, one write per byte, no
+    /// staging copy, sent as one TLS record while it is ≤ 16 KiB (XMM
+    /// HD2).
     http: HlHttp,
     ws: UserWs,
     sk: secp256k1::SecretKey,
     network: Network,
-    nonce: Nonce,
+    nonce: NonceSource,
     budget: AddressBudget,
     /// Where `budget` came from at boot — for the boot tell.
     budget_source: BudgetSource,
@@ -548,16 +615,22 @@ pub struct HlExchange<const FILL_N: usize> {
     counters: HlExecCounters,
     budget_path: PathBuf,
     last_persist: Instant,
-    /// **E7 session bound** — the account's spot USDC (×1e6) at the
-    /// first FLAT reconciliation of the session, restored from
-    /// `pnl_path` at boot or set by [`Self::note_account`]. `0` =
-    /// not anchored yet. Never moved once set: a session's bound is
-    /// judged from where it started (see [`crate::anchor`]).
+    /// **E7 session bound** — the account's equity AT COST (spot USDC
+    /// plus the held legs' `entryNtl`, ×1e6) at the first
+    /// reconciliation of the session, restored from `pnl_path` at boot
+    /// or set by [`Self::note_account`]. `0` = not anchored yet. Never
+    /// moved once set: a session's bound is judged from where it
+    /// started (see [`crate::anchor`]). On a flat account it is the
+    /// spot USDC — what the first cut anchored on, so a file it wrote
+    /// reads the same.
     pnl_anchor_1e6: i64,
     /// Spot USDC (×1e6) at the last reconciliation that parsed.
     usdc_1e6: i64,
-    /// Outcome legs the venue held at that reconciliation. Non-zero
-    /// means the bound is not judged — an open position has no P&L.
+    /// What the legs held at that reconciliation cost (Σ `entryNtl`,
+    /// ×1e6) — the other half of the equity the bound is judged on.
+    held_cost_1e6: i64,
+    /// Outcome legs the venue held at that reconciliation. For the
+    /// operator; the bound is judged whether or not one is held.
     legs_held: u32,
     /// Explicit padding after the one `u32` in this run of fields.
     _pad_legs: u32,
@@ -627,6 +700,15 @@ pub struct HlExchange<const FILL_N: usize> {
     /// so the router zeroed every slot's resting count over quotes
     /// still live at the venue (E7 review, 2026-09-19).
     cancel_all_unqueued_mark: u64,
+    /// **XMM XH5a — per slot, the legs a sweep carrying the slot gave
+    /// up on or could not queue**: `sweep_left` and
+    /// `cancel_all_unqueued` split by slot, which the venue-wide
+    /// counters cannot say. Index = slot.
+    slot_left: [u64; core_config::exec::EXEC_SLOTS],
+    /// `slot_left[s]` as it stood when slot `s`'s cancel was last
+    /// REQUESTED: `cancel_slot_state`'s `Stranded`, per slot, as
+    /// `cancel_all_mark` is the venue-wide one's.
+    slot_mark: [u64; core_config::exec::EXEC_SLOTS],
     /// When a reconciliation last COMPLETED a comparison the arm was
     /// willing to stand behind. `None` = never. `last_recon` stamps
     /// the attempt; this stamps the success, and the gap between them
@@ -647,14 +729,52 @@ pub struct HlExchange<const FILL_N: usize> {
     /// cut zeroed 4 KiB of it per action, and re-declared it inside
     /// the sweep loop.
     mp: Box<[u8]>,
-    /// The request body, built IN PLACE: envelope head, then the
-    /// action JSON rendered straight into it, then the signature
-    /// tail. One buffer, one write per byte, no staging copy.
-    req: Box<[u8]>,
     /// Scratch for one frame's fills. **Boxed and sized for the
     /// venue's SNAPSHOT**, not for a steady-state frame — see
     /// [`HlExchange::pump_user_events`].
     scratch: Box<[UserFill]>,
+    /// **S7-L1** — scratch for the account-wide sweep's selection:
+    /// `(asset, oid)` of every order of ours the venue reports resting.
+    /// A boot buffer, sized like `open`.
+    wires: Box<[crate::action::CancelWire]>,
+    /// **S7-L1** — the operator arm's restart safety is on
+    /// ([`HlExchange::enable_restart_safety`]): the day-spend read (gap
+    /// A) and a clean read of the account's resting orders (gap C) both
+    /// gate the seeding verdict. Off for an arm that never turns it on,
+    /// which keeps exactly its old behaviour.
+    restart_safety: bool,
+    /// **S7-L1 (gap C)** — a read of the whole account's resting orders
+    /// has found nothing of ours since boot. Until then, with restart
+    /// safety on, the seeding verdict waits and each reconciliation
+    /// retries one sweep round.
+    orphans_clear: bool,
+    /// **S7-L1 (gap A)** — what each slot BOUGHT on the venue since
+    /// 00:00Z of `day_epoch`, USD ×1e6 ([`crate::dayspend`]).
+    day_bought_1e6: [i64; core_config::exec::EXEC_SLOTS],
+    /// `wall_ms / DAY_MS` of the day `day_bought_1e6` is for; `0` =
+    /// not read since boot. The seeding verdict waits for it.
+    day_epoch: u64,
+    /// Earliest instant a failed day-spend read may be tried again.
+    day_retry_at: Instant,
+    /// The wait after the next failed read: [`DAY_RETRY_MIN`] doubling
+    /// to [`DAY_RETRY_MAX`], back to the minimum on a success.
+    day_backoff: Duration,
+    /// **S7-L1 (gap E)** — the request-weight top-up
+    /// ([`budget::TopupGovernor`], XMM XH5c: shared with the gateway arm):
+    /// the weight per top-up (`0` = off), the day's max, the UTC day and the
+    /// weight SENT on it — persisted in `exec-topup.state`, so a restart
+    /// does not hand the day its ceiling again — and what this SESSION's
+    /// top-ups cost, subtracted from the session P&L because the perps
+    /// balance it is paid from is not in the equity the reconciler reads
+    /// (persisted with the anchor it belongs to).
+    topup: budget::TopupGovernor,
+    /// When the current anchor was set (unix s), `0` = none: what ties
+    /// the top-up spend in the state file to THIS session.
+    anchor_set_s: u64,
+    /// Earliest instant the next top-up check may run.
+    topup_next_at: Instant,
+    /// Where `exec-topup.state` lives — beside the budget file.
+    topup_path: PathBuf,
 }
 
 impl<const FILL_N: usize> HlExchange<FILL_N> {
@@ -671,9 +791,9 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         floor: u64,
     ) -> Result<Self, crate::config::ConfigErr> {
         let sk = cfg.secret_key()?;
-        let http = HlHttp::new(&cfg.host, 443, tls.clone())
+        let http = HlHttp::new(&cfg.host, cfg.port(), tls.clone())
             .map_err(|_| crate::config::ConfigErr::BadHex("HYPERLIQUID host"))?;
-        let ws = UserWs::new(&cfg.host, 443, tls, &cfg.master_addr)
+        let ws = UserWs::new(&cfg.host, cfg.port(), tls, &cfg.master_addr)
             .map_err(|_| crate::config::ConfigErr::BadHex("HYPERLIQUID host"))?;
         let budget = budget::load(&budget_path, cfg.master_addr, floor);
         let budget_source = if budget == AddressBudget::cold(cfg.master_addr, floor) {
@@ -688,14 +808,24 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default()
             .join(crate::anchor::DEFAULT_STATE_PATH);
-        let pnl_anchor_1e6 =
-            crate::anchor::load(&pnl_path, cfg.master_addr).map_or(0, |a| a.usdc_1e6);
+        let anchor = crate::anchor::load(&pnl_path, cfg.master_addr);
+        let pnl_anchor_1e6 = anchor.map_or(0, |a| a.usdc_1e6);
+        let anchor_set_s = anchor.map_or(0, |a| a.set_unix_s);
+        // S7-L1 (gap E): the top-up's day ceiling and the session's
+        // top-up spend survive a restart, beside the anchor.
+        let topup_path = pnl_path.with_file_name(budget::TOPUP_STATE_PATH);
+        let (topup_day, topup_used, topup_cost_1e6) = budget::restore_topup(
+            &topup_path,
+            cfg.master_addr,
+            crate::dayspend::utc_day(),
+            anchor_set_s,
+        );
         Ok(Self {
             http,
             ws,
             sk,
             network: cfg.network,
-            nonce: Nonce::new(),
+            nonce: NonceSource::own(),
             budget,
             budget_source,
             seen: TidRing::new(),
@@ -706,6 +836,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             last_persist: Instant::now(),
             pnl_anchor_1e6,
             usdc_1e6: 0,
+            held_cost_1e6: 0,
             legs_held: 0,
             _pad_legs: 0,
             pnl_path,
@@ -723,6 +854,8 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             sweeps_n: 0,
             cancel_all_mark: 0,
             cancel_all_unqueued_mark: 0,
+            slot_left: [0; core_config::exec::EXEC_SLOTS],
+            slot_mark: [0; core_config::exec::EXEC_SLOTS],
             last_recon_ok: None,
             open: vec![crate::recon::OpenOrder::default(); crate::recon::MAX_OPEN_ORDERS]
                 .into_boxed_slice(),
@@ -730,8 +863,37 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             bal: vec![crate::recon::SpotBalance::default(); crate::recon::MAX_SPOT_BALANCES]
                 .into_boxed_slice(),
             mp: vec![0u8; MAX_ACTION].into_boxed_slice(),
-            req: vec![0u8; MAX_REQ_BODY].into_boxed_slice(),
+            wires: vec![
+                crate::action::CancelWire { asset: 0, oid: 0 };
+                crate::recon::MAX_OPEN_ORDERS
+            ]
+            .into_boxed_slice(),
+            restart_safety: false,
+            orphans_clear: false,
+            day_bought_1e6: [0; core_config::exec::EXEC_SLOTS],
+            day_epoch: 0,
+            day_retry_at: Instant::now(),
+            day_backoff: DAY_RETRY_MIN,
+            topup: budget::TopupGovernor::restored(topup_day, topup_used, topup_cost_1e6),
+            anchor_set_s,
+            topup_next_at: Instant::now(),
+            topup_path,
         })
+    }
+
+    /// **XMM XH4h S3.** Sign with nonces from `stream`, the agent
+    /// address's one stream in this process, so this arm never draws a
+    /// nonce another signer of the same agent drew (the gateway's thread,
+    /// another arm). Boot: right after [`HlExchange::new`], before the
+    /// first signed action (the boot sweep is one).
+    pub fn share_nonce(&mut self, stream: Arc<SharedNonce>) {
+        self.nonce.share(stream);
+    }
+
+    /// Whether this arm draws its nonces from a shared stream (S3).
+    #[must_use]
+    pub const fn nonce_shared(&self) -> bool {
+        self.nonce.is_shared()
     }
 
     /// The asset table. **Bound by a roll event, never derived**
@@ -765,25 +927,31 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     }
 
     /// **E7 session bound** — the anchor the bound is judged from,
-    /// USD ×1e6; `0` until the first flat reconciliation sets it
-    /// (or the file restored it). For the boot tell and `/state`.
+    /// USD ×1e6; `0` until the first reconciliation sets it (or the
+    /// file restored it). For the boot tell and `/state`.
     #[inline]
     #[must_use]
     pub const fn pnl_anchor_usd_1e6(&self) -> i64 {
         self.pnl_anchor_1e6
     }
 
-    /// **E7 session bound** — spot USDC minus the anchor as of the
-    /// last reconciliation, USD ×1e6; `0` while not anchored or
-    /// while nothing has been reconciled since boot. A LEVEL, signed:
-    /// what `/state` shows and what the router halts on when flat.
+    /// **E7 session bound** — the equity at cost (spot USDC plus the
+    /// held legs' `entryNtl`) minus the anchor, minus what this
+    /// session's request-weight top-ups cost (S7-L1: paid from the
+    /// perps balance, which that equity does not read), as of the last
+    /// reconciliation, USD ×1e6; `0` while not anchored or while
+    /// nothing has been reconciled since boot. A LEVEL, signed: what
+    /// `/state` shows and what the router halts on.
     #[inline]
     #[must_use]
     pub const fn session_pnl_usd_1e6(&self) -> i64 {
         if self.pnl_anchor_1e6 == 0 || self.usdc_1e6 == 0 {
             0
         } else {
-            self.usdc_1e6 - self.pnl_anchor_1e6
+            self.usdc_1e6
+                .saturating_add(self.held_cost_1e6)
+                .saturating_sub(self.pnl_anchor_1e6)
+                .saturating_sub(self.topup.cost_1e6())
         }
     }
 
@@ -795,21 +963,23 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     }
 
     /// **E7 session bound** — record one reconciliation's account
-    /// reading and, on the FIRST flat one, set the session anchor.
-    /// Split from [`Self::reconcile`] so it can be tested without a
-    /// venue.
+    /// reading and, on the first one, set the session anchor to the
+    /// equity at cost. Split from [`Self::reconcile`] so it can be
+    /// tested without a venue.
     ///
     /// Returns `true` when this call SET the anchor — the caller
     /// persists it. The anchor is never moved afterwards, and never
-    /// set while a leg is held (the balance then is not the account's
-    /// worth) or at zero USDC (nothing to bound).
-    fn note_account(&mut self, usdc_1e6: i64, legs_held: u32) -> bool {
-        self.usdc_1e6 = usdc_1e6;
-        self.legs_held = legs_held;
-        if self.pnl_anchor_1e6 != 0 || legs_held != 0 || usdc_1e6 <= 0 {
+    /// set at zero USDC (nothing to bound). A held leg no longer
+    /// defers it: at cost, the sheet is the account's worth whatever
+    /// it holds (see [`crate::recon::account_view`]).
+    fn note_account(&mut self, v: crate::recon::AccountView) -> bool {
+        self.usdc_1e6 = v.usdc_1e6;
+        self.held_cost_1e6 = v.held_cost_1e6;
+        self.legs_held = v.legs;
+        if self.pnl_anchor_1e6 != 0 || v.usdc_1e6 <= 0 {
             return false;
         }
-        self.pnl_anchor_1e6 = usdc_1e6;
+        self.pnl_anchor_1e6 = v.equity_at_cost_1e6();
         true
     }
 
@@ -851,21 +1021,389 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// the budget `new` loaded stands — the file, else cold — and the
     /// returned source says which.
     pub fn seed_budget_from_venue(&mut self) -> BudgetSource {
-        let mut req = [0u8; budget::MAX_RATE_REQ];
-        if let Ok(n) = budget::rate_limit_request(&mut req, &self.master_addr) {
-            if let Ok((_status, range)) = self.http.post_to(crate::http::INFO_PATH, &req[..n]) {
-                if let Some((used, vlm_1e6)) = budget::scan_rate_limit(&self.http.resp()[range]) {
-                    self.budget = AddressBudget::from_venue(
-                        self.master_addr,
-                        self.budget.floor(),
-                        used,
-                        vlm_1e6,
-                    );
-                    self.budget_source = BudgetSource::Venue;
-                }
-            }
+        if self.read_venue_budget() {
+            self.budget_source = BudgetSource::Venue;
         }
         self.budget_source
+    }
+
+    /// One `/info userRateLimit` read into `self.budget`; `false` — the
+    /// budget untouched — when the venue did not answer or answered
+    /// half. The boot seed and the top-up's re-read share it.
+    fn read_venue_budget(&mut self) -> bool {
+        let Ok(n) = budget::rate_limit_request(self.http.info_mut(), &self.master_addr) else {
+            return false;
+        };
+        let Ok((_status, range)) = self.http.post_info(n) else {
+            return false;
+        };
+        let Some((used, vlm_1e6, surplus)) = budget::scan_rate_limit(&self.http.resp()[range])
+        else {
+            return false;
+        };
+        self.budget = AddressBudget::from_venue(
+            self.master_addr,
+            self.budget.floor(),
+            used,
+            vlm_1e6,
+            surplus,
+        );
+        true
+    }
+
+    /// **S7-L1** — turn on the operator arm's restart safety: the
+    /// seeding verdict waits for the day-spend read (gap A) and for a
+    /// read of the whole account that finds no order of ours resting
+    /// (gap C). The boot calls it for the arm that trades the operator's
+    /// slots, before [`Self::cancel_ours_everywhere`]; an arm that never
+    /// calls it keeps exactly its old behaviour.
+    pub fn enable_restart_safety(&mut self) {
+        self.restart_safety = true;
+    }
+
+    /// **S7-L1 (gap E)** — arm the request-weight top-up: when the
+    /// headroom comes within `weight` of the floor, buy `weight`
+    /// requests, at most `day_max` per UTC day. `weight == 0` leaves it
+    /// off. Boot only, from `exec.toml` (`request_topup_weight`,
+    /// `request_topup_day_max`); the day's usage and the session's
+    /// spend were restored by [`Self::new`].
+    pub fn set_topup(&mut self, weight: u64, day_max: u64) {
+        self.topup = self.topup.armed(weight, day_max);
+    }
+
+    /// **S7-L1 (gap C) — take every resting order of OURS off the
+    /// venue, on every leg, now.** Blocking and bounded. The boot calls
+    /// it before the arm is announced, and `on_shutdown` as the engine
+    /// stops; with restart safety on, each reconciliation retries one
+    /// round until a read finds nothing of ours.
+    ///
+    /// Why both ends: a restart boots every member FLAT — the paper
+    /// arm's resting orders die with its process, and the venue's must
+    /// too, or a quote the old process left fills into a position no
+    /// member of the new one knows it has. The shutdown sweep is the
+    /// normal path; the boot sweep is the one that still holds after a
+    /// crash, a `kill -9` or a drain that ran out of time.
+    ///
+    /// Unlike the LAW E-8 sweep ([`Self::cancel_all`]) it asks about
+    /// the WHOLE account, not per bound leg — the orders it exists for
+    /// sit on instances this process never bound — and it queues no
+    /// work for idle moments that, at shutdown, will not come. At most
+    /// [`SWEEP_ALL_ROUNDS`] passes of ask → cancel each (single-item
+    /// actions, the sweep's own shape), stopping at the first read that
+    /// finds nothing of ours, and no request starts after
+    /// [`SWEEP_ALL_DEADLINE`].
+    ///
+    /// Returns `(cancelled, left)`. `left == u32::MAX` means the
+    /// venue's open orders could not be read: NOT confirmed clear.
+    pub fn cancel_ours_everywhere(&mut self) -> (u32, u32) {
+        self.sweep_ours_everywhere(SWEEP_ALL_ROUNDS, usize::MAX)
+    }
+
+    /// The account-wide sweep: at most `rounds` cancel passes of at
+    /// most `per_round` cancels each; a read that finds nothing of ours
+    /// sets `orphans_clear`. The boot and shutdown sweeps are unbounded
+    /// per round (the deadline bounds them); the reconciliation's retry
+    /// takes [`SWEEP_CANCELS_PER_IDLE`], as the LAW E-8 sweep does, and
+    /// continues at the next reconciliation.
+    ///
+    /// **Neutral to the streaks.** A cancel of an order that filled or
+    /// expired between the read and the cancel comes back "never
+    /// placed, already canceled, or filled", which `judge` counts into
+    /// the reject streak — five of them in a boot sweep racing an
+    /// instance's expiry would latch a sticky `reject-streak` halt over
+    /// orders that were simply gone. The streaks are the venue refusing
+    /// to TRADE; the sweep puts them back as it found them.
+    fn sweep_ours_everywhere(&mut self, rounds: u32, per_round: usize) -> (u32, u32) {
+        let deadline = Instant::now() + SWEEP_ALL_DEADLINE;
+        let streaks = (self.reject_streak, self.asset_refusal_streak);
+        let mut cancelled = 0u32;
+        let mut round = 0u32;
+        let mut left_known = u32::MAX;
+        let left = loop {
+            // No request starts after the deadline — not even the
+            // re-read; the last read's count stands, unconfirmed.
+            if round > 0 && Instant::now() >= deadline {
+                break left_known;
+            }
+            let Some((k, unmapped)) = self.read_ours_everywhere() else {
+                break u32::MAX;
+            };
+            if k == 0 {
+                // Nothing of ours this crate can cancel: clear, but for
+                // any order of ours on a coin that is not an outcome
+                // leg, which is reported rather than forgotten.
+                self.orphans_clear = true;
+                break unmapped;
+            }
+            left_known = u32::try_from(k)
+                .unwrap_or(u32::MAX)
+                .saturating_add(unmapped);
+            if round >= rounds {
+                break left_known;
+            }
+            round += 1;
+            let mut j = 0usize;
+            while j < k && j < per_round && Instant::now() < deadline {
+                let c = self.wires[j];
+                j += 1;
+                if self.cancel_by_oid(c.asset, c.oid) {
+                    cancelled = cancelled.saturating_add(1);
+                }
+            }
+        };
+        self.reject_streak = streaks.0;
+        self.asset_refusal_streak = streaks.1;
+        self.counters.sweep_all_cancelled = self
+            .counters
+            .sweep_all_cancelled
+            .wrapping_add(u64::from(cancelled));
+        self.counters.sweep_all_left = if left == u32::MAX {
+            u64::MAX
+        } else {
+            u64::from(left)
+        };
+        (cancelled, left)
+    }
+
+    /// One `frontendOpenOrders` read, selected to the orders of ours on
+    /// any outcome leg ([`crate::recon::ours_everywhere`]) in
+    /// `self.wires`: `(selected, unmapped)`. `None` when the answer
+    /// could not be had or read — never "nothing resting".
+    fn read_ours_everywhere(&mut self) -> Option<(usize, u32)> {
+        let n = crate::recon::open_orders_request(self.http.info_mut(), &self.master_addr).ok()?;
+        let (_status, range) = self.http.post_info(n).ok()?;
+        let body = &self.http.resp()[range];
+        let rows = crate::recon::scan_open_orders(body, &mut self.open).ok()?;
+        Some(crate::recon::ours_everywhere(
+            &self.open[..rows],
+            body,
+            &mut self.wires,
+        ))
+    }
+
+    /// One single-item cancel by venue oid — the LAW E-8 sweep's shape,
+    /// shared with the account-wide sweep. `true` only when the venue
+    /// confirmed it (`judge` under [`Spend::Cancel`]); an encode failure
+    /// is counted.
+    fn cancel_by_oid(&mut self, asset: u32, oid: u64) -> bool {
+        let c = [crate::action::CancelWire { asset, oid }];
+        let (Ok(mp_n), Ok(head)) = (
+            crate::action::encode_cancel(&mut self.mp, &c),
+            envelope_open(self.http.body_mut()),
+        ) else {
+            self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+            return false;
+        };
+        let Ok(aj_n) = crate::request::cancel_json(&mut self.http.body_mut()[head..], &c) else {
+            self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+            return false;
+        };
+        self.send_action(mp_n, head + aj_n, 1, Spend::Cancel)
+            .is_ok()
+    }
+
+    /// **S7-L1 (gap A)** — read what each slot BOUGHT on the venue since
+    /// today's 00:00Z ([`crate::dayspend`]), once per UTC day: at the
+    /// first reconciliation of a boot and at the first after each
+    /// midnight. Restart safety only. A failed read is counted and tried
+    /// again after a backoff ([`DAY_RETRY_MIN`] doubling to
+    /// [`DAY_RETRY_MAX`]); the figure it would have replaced stands.
+    fn sync_day_spend(&mut self) {
+        if !self.restart_safety {
+            return;
+        }
+        let today = crate::nonce::now_ms() / crate::dayspend::DAY_MS;
+        if today == self.day_epoch {
+            return;
+        }
+        let now = Instant::now();
+        if now < self.day_retry_at {
+            return;
+        }
+        let start_ms = today * crate::dayspend::DAY_MS;
+        let mut bought = [0i64; core_config::exec::EXEC_SLOTS];
+        let info = self.http.info_mut();
+        let read = match crate::dayspend::fills_since_request(info, &self.master_addr, start_ms) {
+            Ok(n) => match self.http.post_info(n) {
+                Ok((_status, range)) => crate::dayspend::scan_day_bought(
+                    &self.http.resp()[range],
+                    start_ms,
+                    &mut bought,
+                )
+                .is_ok(),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+        if read {
+            // COPY: [i64; EXEC_SLOTS] (64 B) of day spend, stack → arm,
+            // once per UTC day — `scan_day_bought` zeroes its target on
+            // every failure and a failed read must leave the standing
+            // figure — rejected: scanning straight into `day_bought_1e6`.
+            self.day_bought_1e6 = bought;
+            self.day_epoch = today;
+            self.day_backoff = DAY_RETRY_MIN;
+            self.counters.day_sync_ok = self.counters.day_sync_ok.wrapping_add(1);
+        } else {
+            self.counters.day_sync_failed = self.counters.day_sync_failed.wrapping_add(1);
+            self.day_retry_at = now + self.day_backoff;
+            self.day_backoff = self.day_backoff.saturating_mul(2).min(DAY_RETRY_MAX);
+        }
+    }
+
+    /// **S7-L1 (gap E) — buy request weight before the floor, not at
+    /// it.**
+    ///
+    /// The address allowance is 10 000 requests plus one per USDC of
+    /// lifetime volume, and a member requoting every instance spends it
+    /// in about half a day, after which the floor halts the slot. The
+    /// venue sells more (`reserveRequestWeight`, paid from the PERPS
+    /// balance): when the headroom is within one top-up of the floor,
+    /// buy one, at most the day's max weight per UTC day. Weight `0`
+    /// is off, and the floor halts as it always did.
+    ///
+    /// Guarded six ways, each against a way a spender runs away:
+    /// - **the venue's headroom, not the model's**: `userRateLimit` is
+    ///   re-read before every purchase, so a top-up that went through
+    ///   with an answer this arm could not read shows up as headroom
+    ///   and is not bought twice;
+    /// - **seen on the venue, or no more**: right after a purchase the
+    ///   venue's figures must show it; if they do not, top-ups stop for
+    ///   the process — the guard that holds whatever the venue's
+    ///   netting turns out to be;
+    /// - **one check per [`TOPUP_EVERY`]**, whatever it found or did;
+    /// - **charged when bought or possibly bought** (accepted, or sent
+    ///   with no readable answer — a clear refusal buys nothing): the
+    ///   day's usage and the session's cost are on disk before the
+    ///   next step, and a failed write stops top-ups for the process;
+    /// - **only on a budget the venue stated** at boot, never the cold
+    ///   or file fallback;
+    /// - **not at or under the floor**: the router has halted the slot
+    ///   there (sticky), and headroom bought would un-halt nothing.
+    ///
+    /// A refused or stopped top-up is counted (`topup_failed`), never
+    /// put in the reject streak — it is not the venue refusing to TRADE.
+    /// If top-ups keep failing, the floor halts the slot, which is what
+    /// the floor is for.
+    fn top_up_budget(&mut self) {
+        let weight = self.topup.weight();
+        if weight == 0 || self.budget_source != BudgetSource::Venue {
+            return;
+        }
+        let now = Instant::now();
+        if now < self.topup_next_at {
+            return;
+        }
+        if self
+            .topup
+            .above_band(self.budget.remaining(), self.budget.floor())
+        {
+            return;
+        }
+        self.topup_next_at = now + TOPUP_EVERY;
+        if !self.read_venue_budget() {
+            self.counters.topup_failed = self.counters.topup_failed.wrapping_add(1);
+            return;
+        }
+        let today = crate::dayspend::utc_day();
+        if !self
+            .topup
+            .wants(self.budget.remaining(), self.budget.floor(), today)
+        {
+            return;
+        }
+        let before = self.budget.remaining();
+        let outcome = self.reserve_weight(weight);
+        if !matches!(outcome, Reserve::Accepted | Reserve::Unknown) {
+            // Never sent, or the venue said no: nothing was bought.
+            self.counters.topup_failed = self.counters.topup_failed.wrapping_add(1);
+            return;
+        }
+        // Bought, or it may have been: the day and the session are
+        // charged now, and the charge is on disk before anything else.
+        self.topup.charge_day();
+        if self.pnl_anchor_1e6 != 0 {
+            self.topup.charge_cost();
+        }
+        let st = self.topup.state(self.anchor_set_s);
+        if budget::store_topup(&self.topup_path, &self.master_addr, st).is_err() {
+            // The next boot would restore an older day: no more
+            // purchases from this process.
+            self.stop_topups();
+            return;
+        }
+        // **Seen on the venue, or no more.** The purchase must show as
+        // headroom in the venue's own figures (less the one request it
+        // cost). If it does not — the venue did not credit it, or
+        // credits it where this arm cannot read it — the next purchase
+        // could be a second one for the same need: stop for this process
+        // and let the floor decide.
+        if !self.read_venue_budget() {
+            if outcome == Reserve::Accepted {
+                // The venue said yes in so many words; the model carries
+                // the credit it cannot re-read.
+                self.budget.on_reserved(weight);
+            }
+            self.stop_topups();
+            return;
+        }
+        if self.topup.confirms(before, self.budget.remaining()) {
+            self.counters.topup_ok = self.counters.topup_ok.wrapping_add(1);
+        } else {
+            self.stop_topups();
+        }
+    }
+
+    /// No more request-weight top-ups from this process — nor, for the
+    /// rest of the UTC day, from the next: the day is written as spent,
+    /// so a restart does not re-arm what this one stopped. Counted as a
+    /// failure; the floor decides from here.
+    fn stop_topups(&mut self) {
+        self.topup.stop();
+        let st = self.topup.state(self.anchor_set_s);
+        let _ = budget::store_topup(&self.topup_path, &self.master_addr, st);
+        self.counters.topup_failed = self.counters.topup_failed.wrapping_add(1);
+    }
+
+    /// One signed `reserveRequestWeight`, and what it came to.
+    fn reserve_weight(&mut self, weight: u64) -> Reserve {
+        let Ok(mp_n) = crate::action::encode_reserve_weight(&mut self.mp, weight) else {
+            self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+            return Reserve::NotSent;
+        };
+        let Ok(head) = self.open_action() else {
+            return Reserve::NotSent;
+        };
+        let Ok(aj_n) =
+            crate::request::reserve_weight_json(&mut self.http.body_mut()[head..], weight)
+        else {
+            self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+            return Reserve::NotSent;
+        };
+        let Ok(n) = self.seal(mp_n, head + aj_n) else {
+            return Reserve::NotSent;
+        };
+        let posted = self.post_counted(n, 1);
+        let left_host = Self::counts_against_address(&posted);
+        let Ok((_status, range)) = posted else {
+            return if left_host {
+                Reserve::Unknown
+            } else {
+                Reserve::NotSent
+            };
+        };
+        match scan(&self.http.resp()[range]) {
+            Ok(HlResponse::Ok(ok))
+                if ok.accepted() && !ok.any_resting && !ok.any_filled && !ok.any_success =>
+            {
+                Reserve::Accepted
+            }
+            // Only an explicit `status: err` is a refusal. An ok envelope
+            // of another shape may be this action's success in a form not
+            // yet measured: charged, and checked on the venue like one.
+            Ok(HlResponse::Err { .. }) => Reserve::Refused,
+            Ok(HlResponse::Ok(_)) | Err(_) => Reserve::Unknown,
+        }
     }
 
     /// Map the engine's order kind onto the venue's TIF.
@@ -936,9 +1474,9 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// that no gate touched the fill path at all, which made "0 B/op"
     /// a statement about other code. Publishing it adds no capability:
     /// every ingredient (`scan_user_fills`, `to_fill`, `TidRing`,
-    /// `AddressBudget::on_venue_fill`, `Producer::try_push`) was
+    /// `AddressBudget::on_venue_fill`, `Producer::try_push_ref`) was
     /// already public, and every `HlExchange` field is private, so
-    /// this is a NARROWING wrapper over `try_push` — it adds the
+    /// this is a NARROWING wrapper over `try_push_ref` — it adds the
     /// channel test, the strict parse, the tid dedupe, the cloid
     /// containment and the zero-quantity refusal.
     #[allow(clippy::too_many_arguments)]
@@ -975,8 +1513,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                 // and never confused with a frame from another
                 // channel — silently discarding a reconnect snapshot
                 // is the failure this counter exists for.
-                counters.fills_scan_failed =
-                    counters.fills_scan_failed.wrapping_add(1);
+                counters.fills_scan_failed = counters.fills_scan_failed.wrapping_add(1);
                 return 0;
             }
         };
@@ -1039,8 +1576,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             // must not credit the successor's ledger, which `bind` just
             // zeroed and whose venue balance will never contain it.
             let Some((sym, current)) = assets.sym_of_coin_gen(f.coin.of(payload)) else {
-                counters.fills_unresolved =
-                    counters.fills_unresolved.wrapping_add(1);
+                counters.fills_unresolved = counters.fills_unresolved.wrapping_add(1);
                 continue;
             };
             // A SETTLEMENT has no cloid — the venue placed the order,
@@ -1052,15 +1588,17 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             // a submit that was merely attempted. A leg nothing has
             // traded still books nothing.
             //
-            // COPY (both `try_push` below): one `Fill` POD (≤ 128 B)
-            // by value into lane 3's ring slot — the ring publish IS
-            // the ownership transfer to the engine thread (§7); the
-            // frame's bytes in `rx` are compacted away after the pump.
+            // COPY: one 64 B `Fill`, the stack value → lane 3's ring slot
+            // (`try_push_ref`, the only copy), per fill — the ring publish
+            // IS the handoff to the engine thread (§7); the frame's bytes
+            // in `rx` are compacted away after the pump — rejected: building
+            // it in a claimed slot (core-ring keeps one publish path; a warm
+            // 64 B copy does not buy a second, full-ring-aware one).
             if f.is_settlement && f.cloid.is_none() {
                 match assets.owner_of_sym(sym) {
                     Some(slot) => match to_fill_as(f, sym, ts, slot) {
                         Ok(fill) => {
-                            if fills.try_push(fill).is_err() {
+                            if !fills.try_push_ref(&fill) {
                                 counters.fills_dropped = counters.fills_dropped.wrapping_add(1);
                             } else {
                                 counters.fills_booked = counters.fills_booked.wrapping_add(1);
@@ -1085,15 +1623,15 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             }
             match to_fill(f, sym, ts) {
                 Ok(Routed::Slot(fill)) => {
-                    if fills.try_push(fill).is_err() {
+                    // COPY: the same 64 B `Fill` publish as the settlement
+                    // arm's above (same bound, reason and rejection).
+                    if !fills.try_push_ref(&fill) {
                         // A dropped fill is a position the engine does
                         // not know it has. Reconciliation catches it;
                         // this counter explains it afterwards.
-                        counters.fills_dropped =
-                            counters.fills_dropped.wrapping_add(1);
+                        counters.fills_dropped = counters.fills_dropped.wrapping_add(1);
                     } else {
-                        counters.fills_booked =
-                            counters.fills_booked.wrapping_add(1);
+                        counters.fills_booked = counters.fills_booked.wrapping_add(1);
                         // The RECONCILER's own side of the comparison,
                         // fed only from fills that actually entered the
                         // lane — a dropped or refused fill is not a
@@ -1110,15 +1648,13 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                     // member. (Plan §6.1 also wants it written to the
                     // tape; that writer does not exist here and is
                     // recorded as open in docs/risk-policy.md.)
-                    counters.fills_foreign =
-                        counters.fills_foreign.wrapping_add(1);
+                    counters.fills_foreign = counters.fills_foreign.wrapping_add(1);
                 }
                 Err(_) => {
                     // A REFUSAL (zero or negative quantity), not a
                     // loss. Kept off `fills_dropped` so that alarm
                     // keeps meaning "a position we do not know about".
-                    counters.fills_refused =
-                        counters.fills_refused.wrapping_add(1);
+                    counters.fills_refused = counters.fills_refused.wrapping_add(1);
                 }
             }
         }
@@ -1215,31 +1751,34 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// so this must consume it before the next submit — both live on
     /// one thread and this one runs between order batches, so they are
     /// serialised by construction.
-    fn reconcile(&mut self) {
+    ///
+    /// Returns whether it RAN this call (past its cadence gate), for
+    /// `on_idle`'s one-blocking-step rule.
+    fn reconcile(&mut self) -> bool {
         if self.last_recon.elapsed() < RECON_EVERY {
-            return;
+            return false;
         }
         self.last_recon = Instant::now();
 
-        let mut req = [0u8; crate::recon::MAX_STATE_REQ];
-        let Ok(n) = crate::recon::spot_state_request(&mut req, &self.master_addr) else {
+        let Ok(n) = crate::recon::spot_state_request(self.http.info_mut(), &self.master_addr)
+        else {
             self.counters.recon_failed = self.counters.recon_failed.wrapping_add(1);
-            return;
+            return true;
         };
-        let Ok((_status, range)) = self.http.post_to(crate::http::INFO_PATH, &req[..n]) else {
+        let Ok((_status, range)) = self.http.post_info(n) else {
             self.counters.recon_failed = self.counters.recon_failed.wrapping_add(1);
-            return;
+            return true;
         };
         let body = &self.http.resp()[range];
         let Ok(rows) = crate::recon::scan_spot_state(body, &mut self.bal) else {
             self.counters.recon_failed = self.counters.recon_failed.wrapping_add(1);
-            return;
+            return true;
         };
         self.counters.recon_ok = self.counters.recon_ok.wrapping_add(1);
         // E7 session bound: the same sheet, read for the account's
         // worth (recorded below, once `body`'s borrow of the response
         // buffer has ended).
-        let (usdc_1e6, legs_held) = crate::recon::account_view(&self.bal[..rows], body);
+        let view = crate::recon::account_view(&self.bal[..rows], body);
         let (legs, worst) = Self::compare(&self.assets, &self.bal[..rows], body);
         let unseen = crate::recon::unreconciled_venue_legs(&self.assets, &self.bal[..rows], body);
         self.counters.recon_drift_legs = legs;
@@ -1248,12 +1787,16 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         // E7 session bound: the anchor is written ONCE per session,
         // from here — the idle path, on the 60 s cadence — never from
         // a tick.
-        if self.note_account(usdc_1e6, legs_held) {
+        if self.note_account(view) {
             let a = crate::anchor::PnlAnchor {
                 address: self.master_addr,
-                usdc_1e6,
+                usdc_1e6: self.pnl_anchor_1e6,
                 set_unix_s: crate::nonce::now_ms() / 1000,
             };
+            // S7-L1: a new session's top-up spend starts at zero, tied
+            // to THIS anchor in `exec-topup.state`.
+            self.anchor_set_s = a.set_unix_s;
+            self.topup.new_session();
             if crate::anchor::store(&self.pnl_path, a).is_err() {
                 // The in-memory anchor stands for this process; the
                 // next boot re-anchors. Counted so it is not silent.
@@ -1279,10 +1822,26 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         // that no bound leg matched; a flat account seeds at once, an
         // account still holding a retired instance waits for its
         // settlement. (E7 review, 2026-09-19.)
-        if legs == 0 && unseen == 0 {
+        //
+        // **S7-L1, with restart safety on: and only once the day's
+        // spend has been read from the venue (gap A) and a read of the
+        // whole account has found no order of ours resting (gap C).**
+        // The router adopts the day's spend into its day cap on the
+        // same poll that seeds it, so a restart never starts that cap
+        // at zero under a day the venue says was already spent; and an
+        // orphan a previous process left — the boot sweep could not
+        // confirm it gone — is retried here, one round a
+        // reconciliation, before anything trades beside it.
+        self.sync_day_spend();
+        if self.restart_safety && !self.orphans_clear {
+            let _ = self.sweep_ours_everywhere(1, SWEEP_CANCELS_PER_IDLE);
+        }
+        let safe = !self.restart_safety || (self.day_epoch != 0 && self.orphans_clear);
+        if legs == 0 && unseen == 0 && safe {
             self.reconciled = true;
             self.last_recon_ok = Some(Instant::now());
         }
+        true
     }
 
     /// The comparison itself, split out of the I/O.
@@ -1328,9 +1887,9 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// that runs on the engine thread and must not allocate.
     ///
     /// The msgpack is `self.mp[..mp_n]`; the action JSON already sits
-    /// in `self.req[..action_end]` behind the envelope head
-    /// ([`Self::open_action`]). Returns the finished body length in
-    /// `self.req`.
+    /// in the `/exchange` window's `[..action_end]` behind the envelope
+    /// head ([`Self::open_action`]). Returns the finished body length in
+    /// that window.
     ///
     /// # Errors
     /// `SignerRejected` if the key refuses — or if the wall clock reads
@@ -1344,23 +1903,30 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             return Err(DispatchError::SignerRejected);
         }
         let nonce = self.nonce.next(ms);
-        let sig = sign_action(&self.sk, &self.mp[..mp_n], nonce, Vault::None, None, self.network)
-            .map_err(|_| {
-                self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
-                DispatchError::SignerRejected
-            })?;
-        envelope_close(&mut self.req, action_end, nonce, &sig, None, None).map_err(|_| {
+        let sig = sign_action(
+            &self.sk,
+            &self.mp[..mp_n],
+            nonce,
+            Vault::None,
+            None,
+            self.network,
+        )
+        .map_err(|_| {
+            self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+            DispatchError::SignerRejected
+        })?;
+        envelope_close(self.http.body_mut(), action_end, nonce, &sig, None, None).map_err(|_| {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             DispatchError::EncodeOverflow
         })
     }
 
-    /// Write the envelope head into `self.req` and return the offset
+    /// Write the envelope head into the `/exchange` window and return the offset
     /// the caller renders the action JSON at. See
     /// [`crate::request::envelope_open`].
     #[inline(always)]
     fn open_action(&mut self) -> Result<usize, DispatchError> {
-        envelope_open(&mut self.req).map_err(|_| {
+        envelope_open(self.http.body_mut()).map_err(|_| {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             DispatchError::EncodeOverflow
         })
@@ -1387,7 +1953,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         n: usize,
         items: u32,
     ) -> Result<(u16, core::ops::Range<usize>), crate::http::PostErr> {
-        let posted = self.http.post(&self.req[..n]);
+        let posted = self.http.post(n);
         self.count_post(&posted, items);
         posted
     }
@@ -1468,8 +2034,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                 // may have placed an order nothing in this process
                 // knows the id of, which is what E6's reconciliation
                 // is for.
-                self.counters.sent_unanswered =
-                    self.counters.sent_unanswered.wrapping_add(1);
+                self.counters.sent_unanswered = self.counters.sent_unanswered.wrapping_add(1);
             }
             DispatchError::Disconnected
         })?;
@@ -1529,33 +2094,64 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         }
     }
 
-    /// Queue a leg whose instance has ended (LAW E-8). Idempotent per
-    /// asset: a second roll before the first was swept must not add a
+    /// Queue a sweep of `slots`' orders on a leg — LAW E-8: a leg whose
+    /// instance has ended, every slot's; XMM XH5a: a halted slot's live
+    /// leg. Idempotent per asset: a second request before the first was
+    /// swept ORs its slots into the pending entry rather than adding a
     /// second entry racing the first.
-    fn queue_sweep(&mut self, asset: u32, coin: [u8; crate::asset::COIN_MAX], coin_len: u8) {
-        let mut i = 0usize;
-        while i < self.sweeps_n {
-            if self.sweeps[i].asset == asset {
-                return;
-            }
-            i += 1;
+    fn queue_sweep(
+        &mut self,
+        asset: u32,
+        coin: [u8; crate::asset::COIN_MAX],
+        coin_len: u8,
+        slots: u8,
+    ) {
+        if self.merge_sweep(asset, slots) {
+            return;
         }
         if self.sweeps_n >= MAX_PENDING_SWEEPS {
             // COUNTED, never silently dropped. A leg nobody swept and
             // nobody counted is the stranded quote this law exists to
             // prevent.
             self.counters.sweep_left = self.counters.sweep_left.wrapping_add(1);
+            self.strand(slots, 1);
             return;
         }
+        self.push_sweep(asset, coin, coin_len, slots);
+    }
+
+    /// Append a sweep entry: the caller has seen that the asset is not
+    /// pending (`merge_sweep`) and that the table has room.
+    fn push_sweep(
+        &mut self,
+        asset: u32,
+        coin: [u8; crate::asset::COIN_MAX],
+        coin_len: u8,
+        slots: u8,
+    ) {
+        debug_assert!(self.sweeps_n < MAX_PENDING_SWEEPS);
         self.sweeps[self.sweeps_n] = PendingSweep {
             asset,
             tries: SWEEP_TRIES,
             coin_len,
             defers: 0,
             coin,
-            _pad2: [0; 8],
+            slots,
+            _pad2: [0; 7],
         };
         self.sweeps_n += 1;
+    }
+
+    /// **XMM XH5a** — `k` legs carrying the slots in `mask` were given up
+    /// on or could not be queued: each such slot's confirmation reads
+    /// `Stranded` until its next request re-marks it.
+    fn strand(&mut self, mask: u8, k: u64) {
+        let mut s = 0usize;
+        while s < core_config::exec::EXEC_SLOTS {
+            // Branchless: a slot outside the mask adds nothing.
+            self.slot_left[s] = self.slot_left[s].wrapping_add(k * u64::from((mask >> s) & 1));
+            s += 1;
+        }
     }
 
     /// Drop entry `i`, keeping the queue contiguous.
@@ -1591,13 +2187,13 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         self.counters.sweeps_run = self.counters.sweeps_run.wrapping_add(1);
 
         // ---- ask the venue what is resting --------------------------
-        let mut req = [0u8; crate::recon::MAX_OPEN_ORDERS_REQ];
-        let Ok(n) = crate::recon::open_orders_request(&mut req, &self.master_addr) else {
+        let Ok(n) = crate::recon::open_orders_request(self.http.info_mut(), &self.master_addr)
+        else {
             self.counters.sweep_failed = self.counters.sweep_failed.wrapping_add(1);
             self.spend_try(0);
             return;
         };
-        let Ok((_status, range)) = self.http.post_to(crate::http::INFO_PATH, &req[..n]) else {
+        let Ok((_status, range)) = self.http.post_info(n) else {
             self.counters.sweep_failed = self.counters.sweep_failed.wrapping_add(1);
             self.spend_try(0);
             return;
@@ -1612,7 +2208,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             return;
         };
 
-        // ---- which of them are ours, on THIS leg --------------------
+        // ---- which of them are ours, on THIS leg, of its slots -------
         // Collected first: the cancel below borrows `self` mutably,
         // and the rows borrow the response buffer. `oids` is a boot
         // buffer, not 2 KiB of stack zeroed every 2 ms while a sweep
@@ -1621,6 +2217,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             &self.open[..rows],
             body,
             &e.coin[..e.coin_len as usize],
+            e.slots,
             &mut self.oids,
         );
         if k == 0 {
@@ -1657,21 +2254,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         while j < budget {
             let oid = self.oids[j];
             j += 1;
-            let c = [crate::action::CancelWire { asset: e.asset, oid }];
-            let (Ok(mp_n), Ok(head)) = (
-                crate::action::encode_cancel(&mut self.mp, &c),
-                envelope_open(&mut self.req),
-            ) else {
-                self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
-                failed += 1;
-                continue;
-            };
-            let Ok(aj_n) = crate::request::cancel_json(&mut self.req[head..], &c) else {
-                self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
-                failed += 1;
-                continue;
-            };
-            if self.send_action(mp_n, head + aj_n, 1, Spend::Cancel).is_ok() {
+            if self.cancel_by_oid(e.asset, oid) {
                 self.counters.sweep_cancelled = self.counters.sweep_cancelled.wrapping_add(1);
             } else {
                 failed += 1;
@@ -1690,8 +2273,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                     // shrinking. Stop deferring and start spending
                     // retries, so the entry terminates whether or not
                     // the venue's view reflects our own cancels.
-                    self.counters.sweep_stalled =
-                        self.counters.sweep_stalled.wrapping_add(1);
+                    self.counters.sweep_stalled = self.counters.sweep_stalled.wrapping_add(1);
                     self.sweeps[0].defers = 0;
                     self.spend_try(0);
                 } else {
@@ -1704,13 +2286,17 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         }
     }
 
-    /// Is a sweep already pending for this asset? `queue_sweep` is
-    /// idempotent per asset, so a leg already queued is already
-    /// covered and must not read as a failure to queue.
-    fn sweep_pending_for(&self, asset: u32) -> bool {
+    /// Is a sweep already pending for this asset? Then it takes `slots`
+    /// too (XMM XH5a: OR'd in — its next pass selects the union), and
+    /// the leg is covered: it must not read as a failure to queue, nor
+    /// gain a second entry racing the first.
+    fn merge_sweep(&mut self, asset: u32, slots: u8) -> bool {
+        // One bounds check for the walk, not one per entry.
+        let live = &mut self.sweeps[..self.sweeps_n];
         let mut i = 0usize;
-        while i < self.sweeps_n {
-            if self.sweeps[i].asset == asset {
+        while i < live.len() {
+            if live[i].asset == asset {
+                live[i].slots |= slots;
                 return true;
             }
             i += 1;
@@ -1718,14 +2304,74 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         false
     }
 
+    /// **Queue a sweep of `slots`' orders on every live leg** — the body
+    /// of `cancel_all` (every slot) and `cancel_slot` (one, XMM XH5a).
+    ///
+    /// # Errors
+    /// [`DispatchError::QueueFull`] when the pending-sweep table could
+    /// not hold every live leg: the legs left out are counted once
+    /// (`cancel_all_unqueued`) and stranded for `slots`, so each one's
+    /// confirmation says so and the router asks again.
+    fn request_sweeps(&mut self, slots: u8) -> Result<(), DispatchError> {
+        // Collected first: `merge_sweep` and `push_sweep` borrow `self`
+        // mutably and `for_each_live` borrows it immutably.
+        let mut syms = [0u32; crate::asset::ASSET_SLOTS];
+        let mut n = 0usize;
+        self.assets.for_each_live(|sym, _coin, _booked| {
+            if n < syms.len() {
+                syms[n] = sym;
+                n += 1;
+            }
+        });
+
+        let mut queued = 0usize;
+        let mut i = 0usize;
+        while i < n {
+            let sym = syms[i];
+            i += 1;
+            let Some((asset, coin, coin_len)) = self.assets.bound(sym) else {
+                continue;
+            };
+            // A leg already pending is already covered — for `slots`
+            // too, from its next pass.
+            if self.merge_sweep(asset, slots) {
+                queued += 1;
+                continue;
+            }
+            // **Checked BEFORE queueing, not after.** `queue_sweep`
+            // answers a full table by bumping `sweep_left`, which is
+            // the roll path's honest accounting for a stranded leg —
+            // but this path is retried from every idle moment, so
+            // going through it would add ~500 phantom strandings a
+            // second to the one counter LAW E-8 arms an operator on.
+            // Unqueued legs are counted once per run below instead.
+            if self.sweeps_n >= MAX_PENDING_SWEEPS {
+                continue;
+            }
+            self.push_sweep(asset, coin, coin_len, slots);
+            queued += 1;
+        }
+
+        if queued == n {
+            return Ok(());
+        }
+        let left = (n - queued) as u64;
+        let c = &mut self.counters;
+        c.cancel_all_unqueued = c.cancel_all_unqueued.wrapping_add(left);
+        self.strand(slots, left);
+        Err(DispatchError::QueueFull)
+    }
+
     /// Burn one retry on a pending sweep, counting it as `sweep_left`
-    /// and dropping it when they are spent.
+    /// (and stranded for each of its slots, XMM XH5a) and dropping it
+    /// when they are spent.
     fn spend_try(&mut self, i: usize) {
         if self.sweeps[i].tries > 1 {
             self.sweeps[i].tries -= 1;
             return;
         }
         self.counters.sweep_left = self.counters.sweep_left.wrapping_add(1);
+        self.strand(self.sweeps[i].slots, 1);
         self.drop_sweep(i);
     }
 
@@ -1755,8 +2401,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                     // E6 commit 3: CONSECUTIVE. One is a race with a
                     // roll; a streak is a member quoting an instance
                     // that no longer exists.
-                    self.asset_refusal_streak =
-                        self.asset_refusal_streak.saturating_add(1);
+                    self.asset_refusal_streak = self.asset_refusal_streak.saturating_add(1);
                 }
                 self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
                 self.counters.cancels_refused = self.counters.cancels_refused.wrapping_add(1);
@@ -1768,13 +2413,14 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         }];
         let (Ok(mp_n), Ok(head)) = (
             crate::action::encode_cancel_by_cloid(&mut self.mp, &c),
-            envelope_open(&mut self.req),
+            envelope_open(self.http.body_mut()),
         ) else {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             self.counters.cancels_refused = self.counters.cancels_refused.wrapping_add(1);
             return Err(DispatchError::EncodeOverflow);
         };
-        let Ok(aj_n) = crate::request::cancel_by_cloid_json(&mut self.req[head..], &c) else {
+        let Ok(aj_n) = crate::request::cancel_by_cloid_json(&mut self.http.body_mut()[head..], &c)
+        else {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             self.counters.cancels_refused = self.counters.cancels_refused.wrapping_add(1);
             return Err(DispatchError::EncodeOverflow);
@@ -1791,10 +2437,10 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         }
     }
 
-    /// The ENCODE half of [`Self::modify`]: asset lookup, the scale
+    /// The ENCODE half of [`Self::modify_by_cloid`]: asset lookup, the scale
     /// guards, the cloid builder, the wire structs, msgpack into
     /// `self.mp` and the action JSON in place behind the envelope head
-    /// in `self.req`. Returns `(mp_n, action_end)` for
+    /// in the `/exchange` window. Returns `(mp_n, action_end)` for
     /// [`Self::seal`] / `send_action`. Touches no socket and spends no
     /// budget.
     ///
@@ -1803,7 +2449,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// buffers, without a venue — and without a staging copy of them.
     ///
     /// # Errors
-    /// As [`Self::modify`]'s local refusals. Every one is counted here
+    /// As [`Self::modify_by_cloid`]'s local refusals. Every one is counted here
     /// (`refused_local` / `modifies_refused` / `encode_failures`), so
     /// the caller adds nothing on `Err`.
     pub fn stage_modify(
@@ -1820,8 +2466,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                     // E6 commit 3: CONSECUTIVE. One is a race with a
                     // roll; a streak is a member quoting an instance
                     // that no longer exists.
-                    self.asset_refusal_streak =
-                        self.asset_refusal_streak.saturating_add(1);
+                    self.asset_refusal_streak = self.asset_refusal_streak.saturating_add(1);
                 }
                 self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
                 self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
@@ -1858,13 +2503,14 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         }];
         let (Ok(mp_n), Ok(head)) = (
             crate::action::encode_batch_modify(&mut self.mp, &m),
-            envelope_open(&mut self.req),
+            envelope_open(self.http.body_mut()),
         ) else {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
             return Err(DispatchError::EncodeOverflow);
         };
-        let Ok(aj_n) = crate::request::batch_modify_json(&mut self.req[head..], &m) else {
+        let Ok(aj_n) = crate::request::batch_modify_json(&mut self.http.body_mut()[head..], &m)
+        else {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
             return Err(DispatchError::EncodeOverflow);
@@ -1885,10 +2531,20 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// venue does not have to accept a modify that changes the id, and
     /// nothing in this repo could say that it did until it was asked.
     ///
+    /// Named `_by_cloid`, like its cancel sibling, so that no inherent
+    /// method shares a name with an [`OrderDispatch`] one: with both
+    /// called `modify`, the inherent method shadowed the trait's at
+    /// every call site that could see it, which is how the trait's own
+    /// `modify` went unimplemented without anything noticing (BX0-F3).
+    ///
     /// # Errors
     /// As [`Self::cancel_by_cloid`], plus a price or size that will not
     /// scale and an order kind with no TIF.
-    pub fn modify(&mut self, prev_client_oid: u64, order: &Order) -> Result<(), DispatchError> {
+    pub fn modify_by_cloid(
+        &mut self,
+        prev_client_oid: u64,
+        order: &Order,
+    ) -> Result<(), DispatchError> {
         let (mp_n, action_end) = self.stage_modify(prev_client_oid, order)?;
         // A modify can MOVE exposure, so it answers to the submit rule
         // rather than the exit one — LAW E-7 makes it the requote path,
@@ -1900,8 +2556,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                 // acceptance rule `submit` uses, because a requote is a
                 // submit that kept its place in the queue.
                 if self.assets.note_owner(order.sym, order.strategy_id) {
-                    self.counters.owner_contested =
-                        self.counters.owner_contested.wrapping_add(1);
+                    self.counters.owner_contested = self.counters.owner_contested.wrapping_add(1);
                 }
                 Ok(())
             }
@@ -1952,8 +2607,7 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
                     // E6 commit 3: CONSECUTIVE. One is a race with a
                     // roll; a streak is a member quoting an instance
                     // that no longer exists.
-                    self.asset_refusal_streak =
-                        self.asset_refusal_streak.saturating_add(1);
+                    self.asset_refusal_streak = self.asset_refusal_streak.saturating_add(1);
                 }
                 self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
                 DispatchError::NoLiveRoute
@@ -1984,25 +2638,31 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
             return Err(DispatchError::NoLiveRoute);
         };
         let wire = OrderWire::new(asset, order.side == Side::Bid, px, sz, tif)
-        // 3. LAW E-9 — the slot travels in the cloid, so the fill can
-        //    be routed without a table when it comes back.
-        .with_cloid(encode_cloid(order.strategy_id, order.client_oid));
+            // 3. LAW E-9 — the slot travels in the cloid, so the fill can
+            //    be routed without a table when it comes back.
+            .with_cloid(encode_cloid(order.strategy_id, order.client_oid));
 
         // Every local failure from here on bumps a counter. Without
         // that they are invisible: `stats()` reports nothing for this
         // arm, so an encode that silently refused every order would
         // look exactly like an engine that emitted none.
         let enc = |r: Result<usize, crate::msgpack::MsgPackErr>,
-                       c: &mut HlExecCounters|
+                   c: &mut HlExecCounters|
          -> Result<usize, DispatchError> {
             r.map_err(|_| {
                 c.encode_failures = c.encode_failures.wrapping_add(1);
                 DispatchError::EncodeOverflow
             })
         };
-        let mp_n = enc(encode_order(&mut self.mp, &[wire], b"na"), &mut self.counters)?;
+        let mp_n = enc(
+            encode_order(&mut self.mp, &[wire], b"na"),
+            &mut self.counters,
+        )?;
         let head = self.open_action()?;
-        let aj_n = enc(order_json(&mut self.req[head..], &[wire], b"na"), &mut self.counters)?;
+        let aj_n = enc(
+            order_json(&mut self.http.body_mut()[head..], &[wire], b"na"),
+            &mut self.counters,
+        )?;
 
         // The nonce is taken LAST among the things that can fail, so a
         // local refusal cannot burn one. (HL only requires strictly
@@ -2022,6 +2682,33 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
         }
         Ok(())
     }
+
+    /// **E5 — the router's cancel reaches the venue (BX0-F3).**
+    ///
+    /// `RoutedDispatcher` drives every live verb through this trait,
+    /// and until BX0 this impl overrode `submit` alone: a live cancel
+    /// fell through to the trait default, `Unsupported`, and never
+    /// left the host — invisible while bin15 ran with its maker off.
+    /// The three fields that name the order are forwarded unchanged:
+    /// its market, its slot (LAW E-9 carries it in the cloid) and its
+    /// client id. Spent as an exit, so the budget floor never blocks
+    /// it.
+    #[inline]
+    fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
+        self.cancel_by_cloid(req.sym, req.strategy_id, req.client_oid)
+    }
+
+    /// **E5, LAW E-7 — the router's requote reaches the venue
+    /// (BX0-F3).** Same defect as `cancel`, same repair: the resting
+    /// order is named by the client id it was sent with, and the
+    /// replacement goes as the router stamped it. Spent as a submit —
+    /// a requote can move exposure, and the router has already put it
+    /// through the risk gate as a `Replace`.
+    #[inline]
+    fn modify(&mut self, req: &ModifyReq) -> Result<(), DispatchError> {
+        self.modify_by_cloid(req.prev_client_oid(), req.order())
+    }
+
     /// **Always `None`, deliberately.**
     ///
     /// Fills reach the engine through fill lane 3, written by
@@ -2044,11 +2731,11 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
     /// reason.
     fn arm_counters(&self) -> clob_dispatcher::LiveArmCounters {
         let c = &self.counters;
-        // COPY: 216 B POD (26 × u64 + i64) composed here and returned by
-        // value — cold (1 Hz /state, 0.2 Hz /metrics); it is BUILT from
-        // two sources (`counters`, `budget`) so there is nothing to
-        // borrow — rejected: an out-param, for one struct read twice a
-        // second.
+        // COPY: 272 B POD (31 × u64 + 3 × i64) composed here and
+        // returned by value — cold (1 Hz /state, 0.2 Hz /metrics); it is
+        // BUILT from two sources (`counters`, `budget`) so there is
+        // nothing to borrow — rejected: an out-param, for one struct read
+        // twice a second.
         clob_dispatcher::LiveArmCounters {
             submitted: c.submitted,
             rejected: c.rejected,
@@ -2078,6 +2765,12 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
             budget_remaining: self.budget.remaining(),
             pnl_anchor_usd_1e6: self.pnl_anchor_1e6,
             session_pnl_usd_1e6: self.session_pnl_usd_1e6(),
+            sweep_all_cancelled: c.sweep_all_cancelled,
+            sweep_all_left: c.sweep_all_left,
+            topup_ok: c.topup_ok,
+            topup_failed: c.topup_failed,
+            day_sync_ok: c.day_sync_ok,
+            day_sync_failed: c.day_sync_failed,
         }
     }
 
@@ -2103,125 +2796,38 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
     /// overwrites in place and carries the old name forward. Dropping
     /// the binding here would throw away a real fill to tidy a table.
     fn on_venue_event(&mut self, event: &ChannelEvent) {
-        if event.channel != ChannelId::InstrumentRoll as u8 {
-            return;
-        }
-        if event.venue != VenueId::Hyperliquid as u8 {
-            return;
-        }
-        let Some((outcome, settled)) = unpack_roll(event.venue_seq) else {
-            // A kind byte no packer of ours writes. Neither created nor
-            // settled — refused, never guessed (core_types::roll_kind_strict).
+        let (sym_yes, outcome) = match crate::asset::roll_of(event) {
+            RollOf::NotARoll => return,
+            RollOf::Refused => {
+                self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
+                return;
+            }
+            RollOf::Settled => {
+                self.counters.rolls_settled = self.counters.rolls_settled.wrapping_add(1);
+                return;
+            }
+            RollOf::Created { sym_yes, outcome } => (sym_yes, outcome),
+        };
+        // Both legs or neither (`AssetTable::bind_roll`, XH4i-3a — the
+        // gateway arm's outcome mode binds the same way).
+        let Some(retired) = self.assets.bind_roll(sym_yes, outcome) else {
             self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
             return;
         };
-        if settled {
-            self.counters.rolls_settled = self.counters.rolls_settled.wrapping_add(1);
-            return;
-        }
-        // A created roll with no outcome names nothing. Refuse rather
-        // than bind slot 0 of somebody's market.
-        if outcome == 0 {
-            self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
-            return;
-        }
-        // BOTH LEGS OR NEITHER. Everything that can fail is computed
-        // and checked before the first mutation, because a table left
-        // holding the Yes leg and not the No would book one side of a
-        // position and count the other as a stranger's fill — while
-        // `rolls_refused` said nothing had been bound.
-        //
-        // The YES leg is what the wire carries; NO is the next ordinal
-        // (the boot ordinal law, not an inference of this crate's).
-        // `sym + 1` is the NO leg — but `sym` comes off the wire, and
-        // this crate has twice refused an unchecked add on exactly
-        // this kind of value. Release sets `overflow-checks = false`,
-        // the ordinal field is 24 bits, and `SYMBOL_ID_NONE` is
-        // `u32::MAX`, so an unchecked `+ 1` could carry out of the
-        // ordinal into the VENUE byte and bind a leg in another
-        // venue's namespace. Refused at runtime in every profile, the
-        // same ruling `AssetTable::asset_id` got.
-        let ord = core_types::symbol_ordinal(event.sym);
-        if event.sym == core_types::SYMBOL_ID_NONE || ord >= core_types::SYMBOL_ORDINAL_MASK {
-            self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
-            return;
-        }
-        let syms = [event.sym, event.sym + 1];
-        let mut coins = [[0u8; crate::asset::COIN_MAX]; 2];
-        let mut lens = [0usize; 2];
-        let mut assets = [0u32; 2];
-        for side in 0usize..2 {
-            let Some(a) = AssetTable::asset_id(outcome, side as u8) else {
-                self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
-                return;
-            };
-            let Some(n) = AssetTable::outcome_coin(outcome, side as u8, &mut coins[side]) else {
-                self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
-                return;
-            };
-            assets[side] = a;
-            lens[side] = n;
-        }
-        if !self.assets.would_fit(&syms) {
-            self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
-            return;
-        }
-
-        // LAW E-8 — what this roll RETIRES, recorded before the bind
-        // overwrites the slot. Queued rather than swept here: a sweep
-        // is one info round trip plus a cancel per resting order, and
-        // `on_venue_event` runs INLINE ON THE ENGINE THREAD. Blocking
-        // it at roll time is blocking it at the exact moment the
-        // member wants to quote the successor. The idle path is where
-        // a blocking HTTPS round trip belongs — the same reasoning
-        // `reconcile` already carries — and it gives the operator's
-        // "retry on the next idle" ruling for free.
-        // A range loop: it indexes BOTH `syms` and `assets`, so there
-        // is no `- 1` for an off-by-one to hide in. (`syms.iter()`
-        // would borrow `syms` across the `&mut self` call — the same
-        // reason the rollback loop below carries its allow.)
-        for side in 0..syms.len() {
-            if let Some((asset, coin, coin_len)) = self.assets.bound(syms[side]) {
-                // A REPEAT of the roll that is already live retires
-                // nothing. The venue re-sends `outcomeCreated` on a
-                // reconnect snapshot and a replayed ring entry carries
-                // it too — and without this the sweep would enumerate
-                // the account and cancel every one of our quotes on a
-                // LIVE leg, at the moment the member is quoting it.
-                if asset != assets[side] {
-                    self.queue_sweep(asset, coin, coin_len);
-                }
+        // LAW E-8 — what this roll RETIRED, queued rather than swept here:
+        // a sweep is one info round trip plus a cancel per resting order,
+        // and `on_venue_event` runs INLINE ON THE ENGINE THREAD. Blocking
+        // it at roll time is blocking it at the exact moment the member
+        // wants to quote the successor. The idle path is where a blocking
+        // HTTPS round trip belongs — the same reasoning `reconcile`
+        // already carries — and it gives the operator's "retry on the next
+        // idle" ruling for free.
+        let mut side = 0usize;
+        while side < retired.len() {
+            if let Some((asset, coin, coin_len)) = retired[side] {
+                self.queue_sweep(asset, coin, coin_len, crate::recon::ALL_SLOTS);
             }
-        }
-
-        // From here nothing can fail: both names are non-empty and
-        // within COIN_MAX by construction, and the slots are known to
-        // be available. A failure here would be a bug in `bind`, and
-        // `debug_assert!` is how this file says so.
-        for side in 0usize..2 {
-            let r = self.assets.bind(
-                syms[side],
-                assets[side],
-                u64::from(outcome),
-                &coins[side][..lens[side]],
-            );
-            debug_assert!(r.is_ok(), "a prechecked bind failed: {r:?}");
-            if r.is_err() {
-                // Unreachable by construction, and `debug_assert!` is a
-                // no-op in the profile that trades — so this is the
-                // RELEASE behaviour on a `bind` bug. Roll the first leg
-                // back rather than return a half-bound family while
-                // the counter says nothing was bound.
-                // Index loop, per the doctrine — and clippy's
-                // `iter().take(side)` would borrow `syms` across the
-                // `&mut self.assets` call anyway.
-                #[allow(clippy::needless_range_loop)]
-                for done in 0usize..side {
-                    self.assets.unbind(syms[done]);
-                }
-                self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
-                return;
-            }
+            side += 1;
         }
         self.counters.rolls_bound = self.counters.rolls_bound.wrapping_add(1);
     }
@@ -2237,8 +2843,9 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
             // infinite gap. An arm that has never connected is not an
             // arm that has gone quiet, and reporting u64::MAX here
             // would halt every boot before its first connect.
-            self.last_ws_ok
-                .map_or(0, |t| t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64),
+            self.last_ws_ok.map_or(0, |t| {
+                t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+            }),
             // The reconciler measures a CONTRACT QUANTITY; the
             // threshold is money. Converted here, once, through the
             // function `recon` owns — the two numbers share a name
@@ -2254,15 +2861,17 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
             // once, a reconciler that stops agreeing (or stops
             // answering) is measured here and halts at
             // `halt_on_recon_stale_ms`.
-            self.last_recon_ok
-                .map_or(0, |t| t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64),
+            self.last_recon_ok.map_or(0, |t| {
+                t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+            }),
         )
-        // E7 session bound: judged only while anchored AND flat, and
+        // E7 session bound: judged whenever anchored, legs held or
+        // not (they are valued at cost — `recon::account_view`), and
         // only from a balance this process has actually read — a
         // restored anchor with no reconciliation yet reports "not
-        // flat" rather than a $-anchor delta.
+        // judged" rather than a $-anchor delta.
         .with_pnl(
-            self.pnl_anchor_1e6 != 0 && self.usdc_1e6 != 0 && self.legs_held == 0,
+            self.pnl_anchor_1e6 != 0 && self.usdc_1e6 != 0,
             self.session_pnl_usd_1e6(),
         )
     }
@@ -2300,54 +2909,7 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
         // abandoned after it is the whole point.
         self.cancel_all_mark = self.counters.sweep_left;
         self.cancel_all_unqueued_mark = self.counters.cancel_all_unqueued;
-
-        // Collected first: `queue_sweep` borrows `self` mutably and
-        // `for_each_live` borrows it immutably.
-        let mut syms = [0u32; crate::asset::ASSET_SLOTS];
-        let mut n = 0usize;
-        self.assets.for_each_live(|sym, _coin, _booked| {
-            if n < syms.len() {
-                syms[n] = sym;
-                n += 1;
-            }
-        });
-
-        let mut queued = 0usize;
-        let mut i = 0usize;
-        while i < n {
-            let sym = syms[i];
-            i += 1;
-            let Some((asset, coin, coin_len)) = self.assets.bound(sym) else {
-                continue;
-            };
-            // A leg already pending is already covered.
-            if self.sweep_pending_for(asset) {
-                queued += 1;
-                continue;
-            }
-            // **Checked BEFORE queueing, not after.** `queue_sweep`
-            // answers a full table by bumping `sweep_left`, which is
-            // the roll path's honest accounting for a stranded leg —
-            // but this path is retried from every idle moment, so
-            // going through it would add ~500 phantom strandings a
-            // second to the one counter LAW E-8 arms an operator on.
-            // Unqueued legs are counted once per run below instead.
-            if self.sweeps_n >= MAX_PENDING_SWEEPS {
-                continue;
-            }
-            self.queue_sweep(asset, coin, coin_len);
-            queued += 1;
-        }
-
-        if queued == n {
-            Ok(())
-        } else {
-            self.counters.cancel_all_unqueued = self
-                .counters
-                .cancel_all_unqueued
-                .wrapping_add((n - queued) as u64);
-            Err(DispatchError::QueueFull)
-        }
+        self.request_sweeps(crate::recon::ALL_SLOTS)
     }
 
     /// **LAW E-8's confirmation.** See
@@ -2375,6 +2937,51 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
         clob_dispatcher::CancelAllState::Clear
     }
 
+    /// **XMM XH5a (R-XH4-1) — a halt cancels the halted slot's orders
+    /// alone.** One account serves several slots here (BIN15's, the
+    /// operator's), so the request is a sweep of every live leg that
+    /// selects only cloids whose slot byte (LAW E-9) is `slot`'s: a
+    /// sibling slot's quotes stay. Counted in `cancel_all_runs`.
+    ///
+    /// # Errors
+    /// [`DispatchError::QueueFull`], as `cancel_all`'s.
+    fn cancel_slot(&mut self, slot: u8) -> Result<(), DispatchError> {
+        let s = usize::from(slot);
+        if s >= core_config::exec::EXEC_SLOTS {
+            // Not a slot the router names: the venue-wide verb —
+            // over-cancel, never under.
+            return self.cancel_all();
+        }
+        self.counters.cancel_all_runs = self.counters.cancel_all_runs.wrapping_add(1);
+        // Relative to THIS request, as `cancel_all_mark` is.
+        self.slot_mark[s] = self.slot_left[s];
+        self.request_sweeps(1u8 << slot)
+    }
+
+    /// `slot`'s confirmation, as `cancel_all_state` is the venue-wide
+    /// one: `Working` while a pending sweep carries the slot, `Stranded`
+    /// when one carrying it was given up on or could not be queued since
+    /// the slot's request, `Clear` otherwise.
+    fn cancel_slot_state(&self, slot: u8) -> clob_dispatcher::CancelAllState {
+        let s = usize::from(slot);
+        if s >= core_config::exec::EXEC_SLOTS {
+            return self.cancel_all_state();
+        }
+        let bit = 1u8 << slot;
+        let live = &self.sweeps[..self.sweeps_n];
+        let mut i = 0usize;
+        while i < live.len() {
+            if live[i].slots & bit != 0 {
+                return clob_dispatcher::CancelAllState::Working;
+            }
+            i += 1;
+        }
+        if self.slot_left[s] != self.slot_mark[s] {
+            return clob_dispatcher::CancelAllState::Stranded;
+        }
+        clob_dispatcher::CancelAllState::Clear
+    }
+
     fn on_idle(&mut self) -> bool {
         let worked = self.pump_user_events();
         self.persist_budget();
@@ -2383,36 +2990,46 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
         // useful ordering is to try the fix before measuring the
         // damage.
         self.sweep_one_pending();
-        self.reconcile();
+        // S7-L1: the reconciliation and the top-up are both blocking
+        // round trips; at most one of them per idle call.
+        if !self.reconcile() {
+            self.top_up_budget();
+        }
         worked
+    }
+
+    /// **S7-L1** — the engine is stopping: every resting order of ours
+    /// comes off the venue ([`HlExchange::cancel_ours_everywhere`];
+    /// its counters carry the result to the drain's log line), and the
+    /// budget is written one last time — the sweep's cancels count
+    /// against the address like any other action.
+    fn on_shutdown(&mut self) {
+        let _ = self.cancel_ours_everywhere();
+        let _ = budget::store(&self.budget_path, &self.budget);
+    }
+
+    /// **S7-L1 (gap A)** — see [`crate::dayspend`].
+    fn venue_day_bought(&self, slot: usize) -> Option<(u64, i64)> {
+        if self.day_epoch == 0 {
+            return None;
+        }
+        self.day_bought_1e6.get(slot).map(|&v| (self.day_epoch, v))
     }
 }
 
-/// The `InstrumentRoll` `venue_seq` layout, bits 0..32 and 56.
-///
-/// E6: no longer duplicated. §6.1 forbids this crate depending on the
-/// market-data crate, which is why the unpack was restated here — but
-/// the codec now lives in `core_types`, which this crate already
-/// depends on, so the restatement is gone and this is the projection
-/// onto the two fields the asset binding needs.
-///
-/// Bits 0..32 are the **outcome id**, NOT `enc`. `AssetTable::asset_id`
-/// and `outcome_coin` do the `× 10 + side` themselves, so feeding them
-/// `enc` would be a silent tenfold error naming a real other market.
-///
-/// `settled` is the STRICT reading (`core_types::roll_kind_strict`):
-/// `None` for a kind byte no packer of ours writes, which the caller
-/// refuses. The low-bit mask this used before read `0x03` as settled
-/// while `strategy_bin15` read it as created — one frame, two answers
-/// (E7 review, 2026-09-19); all three live readers share the strict
-/// one now.
-#[inline]
-const fn unpack_roll(seq: u64) -> Option<(u32, bool)> {
-    let (outcome, _twap_s, _family, _masked) = core_types::unpack_roll_seq(seq);
-    match core_types::roll_kind_strict(seq) {
-        Some(settled) => Some((outcome, settled)),
-        None => None,
-    }
+/// **S7-L1 (gap E)** — what one signed `reserveRequestWeight` came to.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum Reserve {
+    /// Never left the host (encode, sign or connect failed): nothing
+    /// was spent.
+    NotSent,
+    /// The venue's `{"status":"ok","response":{"type":"default"}}`.
+    Accepted,
+    /// A readable refusal: the venue said no, and nothing was bought.
+    Refused,
+    /// It left the host and no readable answer came back: it may have
+    /// gone through, so it is charged as if it had.
+    Unknown,
 }
 
 /// Wall clock, nanoseconds. Read ONCE PER PUMP, never per fill.
@@ -2428,7 +3045,7 @@ mod tests {
     use super::*;
     use crate::config::{Scope, HOST_TESTNET};
     use core_ring::Ring;
-    use core_types::{Price, Qty, VenueId};
+    use core_types::{ChannelId, Price, Qty, VenueId};
 
     const KEY: [u8; 32] = [0x21; 32];
     const ADDR: [u8; 20] = [0x22; 20];
@@ -2548,9 +3165,8 @@ mod tests {
     fn a_snapshot_sized_frame_does_not_vanish() {
         let mut x = exchange();
         // 400 fills in one frame — far past any steady-state size.
-        let mut body = String::from(
-            r#"{"channel":"userFills","data":{"isSnapshot":true,"fills":["#,
-        );
+        let mut body =
+            String::from(r#"{"channel":"userFills","data":{"isSnapshot":true,"fills":["#);
         for i in 0..400u64 {
             if i > 0 {
                 body.push(',');
@@ -2571,7 +3187,11 @@ mod tests {
             0,
             "a snapshot-sized frame was discarded as unscannable"
         );
-        assert_eq!(x.counters().fills_unresolved, 400, "every row accounted for");
+        assert_eq!(
+            x.counters().fills_unresolved,
+            400,
+            "every row accounted for"
+        );
     }
 
     /// A venue timestamp that will not convert must NOT be clamped.
@@ -2671,7 +3291,10 @@ mod tests {
         // A LIVE fill does accrue.
         let live = br#"{"channel":"userFills","data":{"isSnapshot":false,"fills":[{"coin":"BTC","px":"1000","sz":"1000","side":"B","time":1,"oid":2,"tid":2}]}}"#;
         x.route_fills(live);
-        assert!(x.budget_remaining() > before, "a live fill must earn budget");
+        assert!(
+            x.budget_remaining() > before,
+            "a live fill must earn budget"
+        );
     }
 
     /// The engine's scale is 1e6; the venue's is 1e8.
@@ -2702,7 +3325,7 @@ mod tests {
 
         // Asked, and a leg queued.
         x.cancel_all_mark = x.counters.sweep_left;
-        x.queue_sweep(7, [0u8; crate::asset::COIN_MAX], 0);
+        x.queue_sweep(7, [0u8; crate::asset::COIN_MAX], 0, crate::recon::ALL_SLOTS);
         assert_eq!(
             x.cancel_all_state(),
             CancelAllState::Working,
@@ -2717,7 +3340,7 @@ mod tests {
         // Now the other ending: queued again, and abandoned with its
         // retries spent.
         x.cancel_all_mark = x.counters.sweep_left;
-        x.queue_sweep(7, [0u8; crate::asset::COIN_MAX], 0);
+        x.queue_sweep(7, [0u8; crate::asset::COIN_MAX], 0, crate::recon::ALL_SLOTS);
         x.sweeps[0].tries = 1;
         x.spend_try(0);
         assert_eq!(x.sweeps_n, 0, "the table is empty either way");
@@ -2744,7 +3367,7 @@ mod tests {
         // Fill the pending table with legs the cancel-all did not put
         // there.
         for a in 0..MAX_PENDING_SWEEPS as u32 {
-            x.queue_sweep(a, [0u8; crate::asset::COIN_MAX], 0);
+            x.queue_sweep(a, [0u8; crate::asset::COIN_MAX], 0, crate::recon::ALL_SLOTS);
         }
         assert_eq!(x.sweeps_n, MAX_PENDING_SWEEPS);
         let before = x.counters.sweep_left;
@@ -2753,10 +3376,7 @@ mod tests {
         for _ in 0..100 {
             let _ = x.cancel_all();
         }
-        assert_eq!(
-            x.counters.sweep_left, before,
-            "a retry is not a stranding"
-        );
+        assert_eq!(x.counters.sweep_left, before, "a retry is not a stranding");
     }
 
     /// Counters exist so an operator can tell a refusal from a
@@ -2779,12 +3399,12 @@ mod tests {
         // what this assertion is for.
         assert_eq!(
             core::mem::size_of::<HlExecCounters>(),
-            320,
-            "HlExecCounters changed size — 39 eight-byte slots (312 B: 38 \
-             u64/i64 + the u32 pair) rounded up to five 64-byte lines, \
-             with room for ONE more before it grows to six. Earlier \
-             messages under-counted (35, then 40 u64), which is why adding \
-             one looked like it would cross a line and did not."
+            384,
+            "HlExecCounters changed size — 45 eight-byte slots (360 B: 44 \
+             u64/i64 + the u32 pair) rounded up to six 64-byte lines, with \
+             room for three more before it grows to seven. S7-L1 added six \
+             (the account-wide sweep, the day-spend read, the top-up) and \
+             took it from five lines to six, on purpose."
         );
     }
 
@@ -2820,6 +3440,108 @@ mod tests {
         // the venue's own rows without deriving a name from an id.
         assert!(x.sweeps[0].coin_len > 1, "a real name, not an empty one");
         assert_eq!(x.sweeps[0].coin[0], b'#', "the FILL namespace, not `+`");
+        // XMM XH5a: a retired leg is every slot's to sweep.
+        assert!(x.sweeps[..2]
+            .iter()
+            .all(|e| e.slots == crate::recon::ALL_SLOTS));
+    }
+
+    /// **XMM XH5a — a halted slot's sweep is its own.** One account
+    /// serves several slots, so `cancel_slot` queues a sweep of the
+    /// slot's orders alone on every live leg; a second slot's request
+    /// ORs into the same entries; each slot's confirmation follows only
+    /// the entries carrying it.
+    #[test]
+    fn a_halted_slot_s_sweep_carries_that_slot_alone() {
+        use clob_dispatcher::CancelAllState;
+        let mut x = exchange_at("127.0.0.1");
+        x.on_venue_event(&roll(3253, 0, false, 4096));
+        assert_eq!(x.sweeps_n, 0);
+        assert_eq!(
+            x.cancel_slot_state(3),
+            CancelAllState::Clear,
+            "nothing asked"
+        );
+
+        x.cancel_slot(3).expect("queued");
+        assert_eq!(x.sweeps_n, 2, "one entry per live leg");
+        assert!(
+            x.sweeps[..2].iter().all(|e| e.slots == 1 << 3),
+            "slot 3's orders alone"
+        );
+        assert_eq!(x.cancel_slot_state(3), CancelAllState::Working);
+        assert_eq!(
+            x.cancel_slot_state(7),
+            CancelAllState::Clear,
+            "7 was not asked for"
+        );
+
+        // Slot 7 halts while 3's sweep drains: OR'd in, no second entry.
+        x.cancel_slot(7).expect("merged");
+        assert_eq!(x.sweeps_n, 2);
+        assert!(x.sweeps[..2].iter().all(|e| e.slots == (1 << 3) | (1 << 7)));
+        assert_eq!(x.cancel_slot_state(7), CancelAllState::Working);
+        assert_eq!(x.counters.cancel_all_runs, 2, "one request per slot");
+
+        // Both legs read clean (`k == 0`): both slots clear.
+        x.drop_sweep(0);
+        x.drop_sweep(0);
+        assert_eq!(x.cancel_slot_state(3), CancelAllState::Clear);
+        assert_eq!(x.cancel_slot_state(7), CancelAllState::Clear);
+        assert_eq!(x.counters.sweep_left, 0);
+    }
+
+    /// XMM XH5a: a sweep given up on strands the slots it carried, and
+    /// only those; a request the full table could not queue strands its
+    /// own slot, once, without a phantom `sweep_left`.
+    #[test]
+    fn a_given_up_sweep_strands_only_the_slots_it_carried() {
+        use clob_dispatcher::CancelAllState;
+        let mut x = exchange_at("127.0.0.1");
+        x.on_venue_event(&roll(3253, 0, false, 4096));
+        x.cancel_slot(3).expect("queued");
+        // Both legs given up on, their retries spent.
+        x.sweeps[0].tries = 1;
+        x.spend_try(0);
+        x.sweeps[0].tries = 1;
+        x.spend_try(0);
+        assert_eq!(x.sweeps_n, 0, "the table is empty either way");
+        assert_eq!(
+            x.cancel_slot_state(3),
+            CancelAllState::Stranded,
+            "an empty table over orders never cancelled is NOT clear"
+        );
+        assert_eq!(
+            x.cancel_slot_state(7),
+            CancelAllState::Clear,
+            "7's were never in it"
+        );
+
+        // A full table of slot 4's legs: slot 5's request queues nothing.
+        let left = x.counters.sweep_left;
+        let mut a = 100u32;
+        while x.sweeps_n < MAX_PENDING_SWEEPS {
+            x.queue_sweep(a, [0u8; crate::asset::COIN_MAX], 0, 1 << 4);
+            a += 1;
+        }
+        assert_eq!(x.cancel_slot(5), Err(DispatchError::QueueFull));
+        assert_eq!(x.cancel_slot_state(5), CancelAllState::Stranded);
+        assert_eq!(x.cancel_slot_state(4), CancelAllState::Working);
+        assert_eq!(
+            x.counters.cancel_all_unqueued, 2,
+            "both live legs, counted once"
+        );
+        assert_eq!(x.counters.sweep_left, left, "a retry is not a stranding");
+
+        // Slot 3 asks again once the table drains: judged afresh.
+        while x.sweeps_n > 0 {
+            x.drop_sweep(0);
+        }
+        x.cancel_slot(3).expect("queued again");
+        assert_eq!(x.cancel_slot_state(3), CancelAllState::Working);
+        x.drop_sweep(0);
+        x.drop_sweep(0);
+        assert_eq!(x.cancel_slot_state(3), CancelAllState::Clear);
     }
 
     // ---------- E5: the budget counts what left the host ----------
@@ -2852,18 +3574,20 @@ mod tests {
             "THE case this exists for: the venue has it, we do not know what it did"
         );
 
-        let before: R = Err(crate::http::PostErr::before_send(
-            crate::http::HttpErr::Dns,
-        ));
+        let before: R = Err(crate::http::PostErr {
+            err: crate::http::HttpErr::Dns,
+            left_host: false,
+        });
         assert!(
             !HlExchange::<64>::counts_against_address(&before),
             "a request that never reached a socket is not an action"
         );
         // And the two are NOT distinguishable by the error variant,
         // which is why the flag exists: `Disconnected` is both.
-        let d_before: R = Err(crate::http::PostErr::before_send(
-            crate::http::HttpErr::Disconnected,
-        ));
+        let d_before: R = Err(crate::http::PostErr {
+            err: crate::http::HttpErr::Disconnected,
+            left_host: false,
+        });
         let d_after: R = Err(crate::http::PostErr {
             err: crate::http::HttpErr::Disconnected,
             left_host: true,
@@ -2883,9 +3607,10 @@ mod tests {
         let before = x.budget.spent();
 
         x.count_post(
-            &Err(crate::http::PostErr::before_send(
-                crate::http::HttpErr::Dns,
-            )),
+            &Err(crate::http::PostErr {
+                err: crate::http::HttpErr::Dns,
+                left_host: false,
+            }),
             1,
         );
         assert_eq!(x.budget.spent(), before, "nothing left, nothing spent");
@@ -2912,7 +3637,11 @@ mod tests {
         x.count_post(&Ok((200, 0..1)), 3);
         assert_eq!(x.budget.spent(), before + 5, "three orders, three requests");
         x.count_post(&Ok((200, 0..1)), 0);
-        assert_eq!(x.budget.spent(), before + 6, "never less than the request itself");
+        assert_eq!(
+            x.budget.spent(),
+            before + 6,
+            "never less than the request itself"
+        );
     }
 
     /// The other half, end to end through `send_action`: a submit
@@ -2953,16 +3682,18 @@ mod tests {
         assert!(x.budget_remaining() <= 0, "and cold still refuses");
     }
 
-    /// **E7 session bound — the anchor is set ONCE, at the first FLAT
-    /// reading, and the signal is judged only from there.** A boot
-    /// with no anchor file starts unanchored; a reading with a leg
-    /// held does not anchor (the balance then is not the account's
-    /// worth); the first flat reading does, and persists; later
-    /// readings move the delta and never the anchor; a leg held
-    /// later withdraws the bound from judgement without losing the
-    /// anchor; and a second `new` on the same directory restores it.
+    /// **E7 session bound — the anchor is set ONCE, at the first
+    /// reading, as the equity AT COST, and the signal is judged from
+    /// there whether or not a leg is held.** A boot with no anchor
+    /// file starts unanchored; zero USDC does not anchor; the first
+    /// reading does — legs at cost included — and persists; buying a
+    /// leg moves nothing (USDC down, cost up by the same premium); a
+    /// settlement or a sale moves the delta; later readings never
+    /// move the anchor; and a second `new` on the same directory
+    /// restores it.
     #[test]
-    fn the_session_anchor_is_the_first_flat_balance_and_survives_a_restart() {
+    fn the_session_anchor_is_the_first_equity_at_cost_and_survives_a_restart() {
+        use crate::recon::AccountView;
         let dir = std::env::temp_dir().join(format!("mv-hlx-anchor-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let budget_path = dir.join(budget::DEFAULT_STATE_PATH);
@@ -2979,38 +3710,60 @@ mod tests {
         };
         let mut x = build();
         assert_eq!(x.pnl_anchor_usd_1e6(), 0, "no file, no anchor");
-        assert_eq!(x.pnl_state_path(), dir.join(crate::anchor::DEFAULT_STATE_PATH));
+        assert_eq!(
+            x.pnl_state_path(),
+            dir.join(crate::anchor::DEFAULT_STATE_PATH)
+        );
         let sig = x.halt_signal();
-        assert_eq!((sig.pnl_flat, sig.pnl_delta_usd_1e6), (0, 0), "unanchored: not judged");
-
-        // A leg held: the balance is not the account's worth.
-        assert!(!x.note_account(7_800_000, 1));
-        assert_eq!(x.pnl_anchor_usd_1e6(), 0);
-        assert_eq!(x.halt_signal().pnl_flat, 0);
+        assert_eq!(
+            (sig.pnl_judged, sig.pnl_delta_usd_1e6),
+            (0, 0),
+            "unanchored: not judged"
+        );
 
         // Zero USDC: nothing to bound.
-        assert!(!x.note_account(0, 0));
+        assert!(!x.note_account(AccountView::new(0, 0, 0)));
         assert_eq!(x.pnl_anchor_usd_1e6(), 0);
+        assert_eq!(x.halt_signal().pnl_judged, 0);
 
-        // The first FLAT reading anchors.
-        assert!(x.note_account(8_630_000, 0), "the first flat balance is the anchor");
-        assert_eq!(x.pnl_anchor_usd_1e6(), 8_630_000);
+        // The first reading anchors — a held leg at cost included.
+        assert!(
+            x.note_account(AccountView::new(7_270_000, 1_360_000, 1)),
+            "the anchor"
+        );
+        assert_eq!(
+            x.pnl_anchor_usd_1e6(),
+            8_630_000,
+            "USDC plus the leg at cost"
+        );
         assert_eq!(x.session_pnl_usd_1e6(), 0);
         let sig = x.halt_signal();
-        assert_eq!((sig.pnl_flat, sig.pnl_delta_usd_1e6), (1, 0));
+        assert_eq!(
+            (sig.pnl_judged, sig.pnl_delta_usd_1e6),
+            (1, 0),
+            "judged while holding"
+        );
 
-        // Later flat readings move the delta, never the anchor.
-        assert!(!x.note_account(23_630_000, 0));
-        assert_eq!(x.pnl_anchor_usd_1e6(), 8_630_000);
+        // Buying another leg moves nothing: USDC down, cost up.
+        assert!(!x.note_account(AccountView::new(5_270_000, 3_360_000, 2)));
+        assert_eq!(x.session_pnl_usd_1e6(), 0, "a premium paid is not a loss");
+
+        // Both legs settle: one pays 2 × $1, one pays nothing.
+        assert!(!x.note_account(AccountView::new(7_270_000, 0, 0)));
+        assert_eq!(x.pnl_anchor_usd_1e6(), 8_630_000, "never moved");
+        assert_eq!(x.session_pnl_usd_1e6(), -1_360_000);
+        assert_eq!(x.halt_signal().pnl_delta_usd_1e6, -1_360_000);
+
+        // Later readings move the delta, never the anchor.
+        assert!(!x.note_account(AccountView::new(23_630_000, 0, 0)));
         assert_eq!(x.session_pnl_usd_1e6(), 15_000_000);
-        assert_eq!(x.halt_signal().pnl_delta_usd_1e6, 15_000_000);
-        assert!(!x.note_account(3_630_000, 0));
-        assert_eq!(x.session_pnl_usd_1e6(), -5_000_000);
-
-        // A leg held later: the delta is reported but not judged.
-        assert!(!x.note_account(1_630_000, 2));
+        assert!(!x.note_account(AccountView::new(1_630_000, 2_000_000, 2)));
         let sig = x.halt_signal();
-        assert_eq!(sig.pnl_flat, 0, "an open leg withdraws the bound from judgement");
+        assert_eq!(
+            (sig.pnl_judged, sig.pnl_delta_usd_1e6),
+            (1, -5_000_000),
+            "judged, held"
+        );
         assert_eq!(x.pnl_anchor_usd_1e6(), 8_630_000, "and keeps the anchor");
 
         // `reconcile` is what persists (it needs a venue); the module
@@ -3022,10 +3775,14 @@ mod tests {
         };
         crate::anchor::store(x.pnl_state_path(), a).expect("persists");
         let y = build();
-        assert_eq!(y.pnl_anchor_usd_1e6(), 8_630_000, "a restart restores the anchor");
+        assert_eq!(
+            y.pnl_anchor_usd_1e6(),
+            8_630_000,
+            "a restart restores the anchor"
+        );
         let sig = y.halt_signal();
         assert_eq!(
-            (sig.pnl_flat, sig.pnl_delta_usd_1e6),
+            (sig.pnl_judged, sig.pnl_delta_usd_1e6),
             (0, 0),
             "restored but nothing reconciled yet: not judged, no $-anchor delta"
         );
@@ -3049,10 +3806,16 @@ mod tests {
             ..HlOk::default()
         };
         let r = x.judge(Spend::Submit, Ok(HlResponse::Ok(miss)));
-        assert!(matches!(r, Err(DispatchError::Http(200))), "nothing traded: {r:?}");
+        assert!(
+            matches!(r, Err(DispatchError::Http(200))),
+            "nothing traded: {r:?}"
+        );
         assert_eq!(x.counters.ioc_missed, 1);
         assert_eq!(x.counters.rejected, 0, "a miss is not a refusal");
-        assert_eq!(x.reject_streak, 2, "and it neither bumps nor resets the streak");
+        assert_eq!(
+            x.reject_streak, 2,
+            "and it neither bumps nor resets the streak"
+        );
 
         // The same wording on a CANCEL is not a miss — there is no
         // such thing as a cancel that found no counterparty.
@@ -3080,7 +3843,9 @@ mod tests {
             oid: 42,
             ..HlOk::default()
         };
-        let ok = x.judge(Spend::Submit, Ok(HlResponse::Ok(filled))).expect("filled");
+        let ok = x
+            .judge(Spend::Submit, Ok(HlResponse::Ok(filled)))
+            .expect("filled");
         assert_eq!(ok.oid, 42);
         assert_eq!(x.reject_streak, 0);
 
@@ -3091,17 +3856,19 @@ mod tests {
         assert_eq!(x.reject_streak, 1);
     }
 
-    /// **A REPEAT of the live roll retires nothing.** The venue
-    /// re-sends `outcomeCreated` on a reconnect snapshot and a replayed
-    /// ring entry carries it too. Without the guard the queued asset is
-    /// the very one the bind re-establishes as live, and the next idle
-    /// would enumerate the account and cancel every one of our quotes
-    /// on a LIVE leg — at the moment the member is quoting it.
+    /// **A REPEAT of the live roll retires nothing.** A replayed ring
+    /// entry carries one (the venue itself pushes `outcomeCreated` once
+    /// and replays none on a reconnect — probed 2026-09-26). Without
+    /// the guard the queued asset is the very one the bind
+    /// re-establishes as live, and the next idle would enumerate the
+    /// account and cancel every one of our quotes on a LIVE leg — at
+    /// the moment the member is quoting it.
     #[test]
     fn a_repeated_roll_never_queues_a_sweep_of_the_live_leg() {
         let mut x = exchange();
         x.on_venue_event(&roll(3253, 0, false, 4096));
         assert_eq!(x.sweeps_n, 0);
+        x.assets.book_qty(4096, 3_000_000);
 
         // The SAME outcome again, twice.
         x.on_venue_event(&roll(3253, 0, false, 4096));
@@ -3110,6 +3877,10 @@ mod tests {
             x.sweeps_n, 0,
             "the leg the bind re-establishes as live is not retired"
         );
+        // A-S7-81 on the blocking arm: the repeats rebind nothing, so the
+        // leg's ledger survives them; they still count as binds here.
+        assert_eq!(x.assets.booked_qty(4096), Some(3_000_000));
+        assert_eq!(x.counters.rolls_bound, 3);
 
         // A genuinely NEW outcome still retires the old one.
         x.on_venue_event(&roll(3254, 0, false, 4096));
@@ -3172,15 +3943,18 @@ mod tests {
     fn the_sweep_queue_dedupes_and_counts_its_own_overflow() {
         let mut x = exchange();
         let coin = *b"#1234560000000000000";
-        x.queue_sweep(77, coin, 7);
-        x.queue_sweep(77, coin, 7);
+        x.queue_sweep(77, coin, 7, crate::recon::ALL_SLOTS);
+        x.queue_sweep(77, coin, 7, crate::recon::ALL_SLOTS);
         assert_eq!(x.sweeps_n, 1, "a second roll before the first swept");
 
         for a in 100..100 + MAX_PENDING_SWEEPS as u32 {
-            x.queue_sweep(a, coin, 7);
+            x.queue_sweep(a, coin, 7, crate::recon::ALL_SLOTS);
         }
         assert_eq!(x.sweeps_n, MAX_PENDING_SWEEPS);
-        assert!(x.counters.sweep_left > 0, "overflow is COUNTED, not dropped");
+        assert!(
+            x.counters.sweep_left > 0,
+            "overflow is COUNTED, not dropped"
+        );
     }
 
     /// "Retry on the next idle" without a bound is a leg that burns the
@@ -3189,7 +3963,7 @@ mod tests {
     #[test]
     fn a_sweep_that_keeps_failing_is_given_up_on_and_counted() {
         let mut x = exchange();
-        x.queue_sweep(77, *b"#1234560000000000000", 7);
+        x.queue_sweep(77, *b"#1234560000000000000", 7, crate::recon::ALL_SLOTS);
         assert_eq!(x.sweeps_n, 1);
 
         for _ in 0..u32::from(SWEEP_TRIES) - 1 {
@@ -3230,14 +4004,14 @@ mod tests {
     fn a_hand_built_roll_seq_unpacks_the_way_the_ingress_packs_it() {
         // The ingress's own pinned vector: pack_roll_seq(2649, 60, 0, false).
         let seq = 2649u64 | (60u64 << 32);
-        assert_eq!(unpack_roll(seq), Some((2649, false)));
+        assert_eq!(crate::asset::unpack_roll(seq), Some((2649, false)));
         // The settled bit is bit 56, and the family byte must not leak
         // into the outcome id.
         let seq = 19_418u64 | (60u64 << 32) | (7u64 << 48) | (1u64 << 56);
-        assert_eq!(unpack_roll(seq), Some((19_418, true)));
+        assert_eq!(crate::asset::unpack_roll(seq), Some((19_418, true)));
         // Bits 0..32 are the OUTCOME ID, not `enc`. Confusing them is a
         // silent tenfold error naming a real other market.
-        let Some((o, _)) = unpack_roll(u64::from(u32::MAX)) else {
+        let Some((o, _)) = crate::asset::unpack_roll(u64::from(u32::MAX)) else {
             panic!("a CREATED frame with a full outcome id must unpack");
         };
         assert_eq!(o, u32::MAX);
@@ -3245,7 +4019,11 @@ mod tests {
         // either kind — `0x03` used to mask to "settled" here while
         // `strategy_bin15` read it as "created" (E7 review).
         let seq = 2649u64 | (60u64 << 32) | (3u64 << 56);
-        assert_eq!(unpack_roll(seq), None, "an unknown roll kind binds nothing");
+        assert_eq!(
+            crate::asset::unpack_roll(seq),
+            None,
+            "an unknown roll kind binds nothing"
+        );
     }
 
     /// LAW E-4's writer. One roll binds BOTH legs, and the No leg is
@@ -3262,7 +4040,11 @@ mod tests {
 
         // The venue's OWN names, in the FILL namespace.
         assert_eq!(x.assets().sym_of_coin(b"#194180"), Some(4096), "Yes");
-        assert_eq!(x.assets().sym_of_coin(b"#194181"), Some(4097), "No is the next ordinal");
+        assert_eq!(
+            x.assets().sym_of_coin(b"#194181"),
+            Some(4097),
+            "No is the next ordinal"
+        );
 
         // And the asset ids the venue will accept.
         assert_eq!(x.assets().lookup(4096, 19_418), Ok(100_194_180));
@@ -3292,7 +4074,8 @@ mod tests {
         assert_eq!(x.counters().submitted, 0);
         assert!(
             matches!(
-                x.assets().lookup(4096, core_types::instance_of(o.client_oid)),
+                x.assets()
+                    .lookup(4096, core_types::instance_of(o.client_oid)),
                 Err(crate::asset::AssetError::StaleInstance { .. })
             ),
             "the refusal must be STALE, not merely unbound"
@@ -3312,7 +4095,11 @@ mod tests {
         // settlement is.
         const SETTLE: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194180","px":"1.0","sz":"2.0","side":"A","time":1757942400000,"oid":88,"tid":5001,"dir":"Settlement","fee":"0.0"}]}}"##;
         assert_eq!(x.route_fills(SETTLE), 0);
-        assert_eq!(x.counters().fills_unowned, 1, "no member has traded this leg");
+        assert_eq!(
+            x.counters().fills_unowned,
+            1,
+            "no member has traded this leg"
+        );
         assert_eq!(x.counters().fills_booked, 0);
         assert_eq!(x.counters().fills_settlement, 1, "still SEEN");
 
@@ -3335,7 +4122,11 @@ mod tests {
         assert_eq!(x.route_fills(SETTLE2), 1, "the settlement must now BOOK");
         assert_eq!(x.counters().fills_booked, 1);
         assert_eq!(x.counters().fills_unowned, 1, "unchanged");
-        assert_eq!(x.counters().fills_foreign, 0, "it must NOT go to the tape arm");
+        assert_eq!(
+            x.counters().fills_foreign,
+            0,
+            "it must NOT go to the tape arm"
+        );
     }
 
     /// The narrowness IS the safety. A cloid-less row that is not a
@@ -3420,7 +4211,11 @@ mod tests {
         let mut bal = [crate::recon::SpotBalance::default(); 8];
         let n = crate::recon::scan_spot_state(SHEET, &mut bal).expect("scans");
         assert_eq!(bal[1].hold_1e8, 100_000_000, "the fixture must HAVE a hold");
-        assert_eq!(bal[1].free_1e8(), 100_000_000, "which free would report as 1");
+        assert_eq!(
+            bal[1].free_1e8(),
+            100_000_000,
+            "which free would report as 1"
+        );
 
         let (legs, worst) = HlExchange::<64>::compare(x.assets(), &bal[..n], SHEET);
         assert_eq!(
@@ -3443,7 +4238,11 @@ mod tests {
         x.on_venue_event(&roll(19_418, 0, false, 4096));
         // The quarter rolls. `#194180` is now the PREVIOUS name.
         x.on_venue_event(&roll(19_419, 0, false, 4096));
-        assert_eq!(x.assets().booked_qty(4096), Some(0), "a new instance starts flat");
+        assert_eq!(
+            x.assets().booked_qty(4096),
+            Some(0),
+            "a new instance starts flat"
+        );
 
         // A fill for the leg that just ended, arriving late.
         const LATE: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194180","px":"0.68","sz":"2.0","side":"B","time":1757942400000,"oid":1,"tid":1,"cloid":"0x4d560300000000000000000000000001"}]}}"##;
@@ -3473,10 +4272,18 @@ mod tests {
     fn a_drift_must_survive_a_reconciliation_interval_before_it_can_halt() {
         let mut x = exchange();
         x.note_drift(2_000_000);
-        assert_eq!(x.counters().recon_drift_max_qty_1e6, 0, "one sighting is not drift");
+        assert_eq!(
+            x.counters().recon_drift_max_qty_1e6,
+            0,
+            "one sighting is not drift"
+        );
         assert_eq!(x.halt_signal().recon_drift_usd_1e6, 0, "and halts nothing");
         x.note_drift(0);
-        assert_eq!(x.counters().recon_drift_max_qty_1e6, 0, "cleared: it was the race");
+        assert_eq!(
+            x.counters().recon_drift_max_qty_1e6,
+            0,
+            "cleared: it was the race"
+        );
 
         x.note_drift(3_000_000);
         x.note_drift(2_000_000);
@@ -3485,10 +4292,18 @@ mod tests {
             2_000_000,
             "two consecutive sightings confirm the smaller"
         );
-        assert_eq!(x.halt_signal().recon_drift_usd_1e6, 2_000_000, "and the halt reads it");
+        assert_eq!(
+            x.halt_signal().recon_drift_usd_1e6,
+            2_000_000,
+            "and the halt reads it"
+        );
         x.note_drift(0);
         x.note_drift(5_000_000);
-        assert_eq!(x.counters().recon_drift_max_qty_1e6, 2_000_000, "a high-water mark never clears");
+        assert_eq!(
+            x.counters().recon_drift_max_qty_1e6,
+            2_000_000,
+            "a high-water mark never clears"
+        );
         x.note_drift(5_000_000);
         assert_eq!(x.counters().recon_drift_max_qty_1e6, 5_000_000);
     }
@@ -3503,7 +4318,8 @@ mod tests {
         assert_eq!(x.route_fills(BUY), 1);
 
         // A sheet with no outcome legs at all.
-        const EMPTY: &[u8] = br#"{"balances":[{"coin":"USDC","token":0,"total":"997.64","hold":"0.0"}]}"#;
+        const EMPTY: &[u8] =
+            br#"{"balances":[{"coin":"USDC","token":0,"total":"997.64","hold":"0.0"}]}"#;
         let mut bal = [crate::recon::SpotBalance::default(); 8];
         let n = crate::recon::scan_spot_state(EMPTY, &mut bal).expect("scans");
         let (legs, worst) = HlExchange::<64>::compare(x.assets(), &bal[..n], EMPTY);
@@ -3666,9 +4482,8 @@ mod tests {
     fn a_full_selection_finishes_within_the_retries_it_has() {
         // A 256-order leg: exactly one buffer, truncated on the first
         // call and shrinking from there.
-        let (idles, tries, stalls) =
-            run_sweep_to_completion(crate::recon::MAX_OPEN_ORDERS, true)
-                .expect("a 256-order sweep must not be abandoned");
+        let (idles, tries, stalls) = run_sweep_to_completion(crate::recon::MAX_OPEN_ORDERS, true)
+            .expect("a 256-order sweep must not be abandoned");
         assert_eq!(idles, 32, "256 orders at 8 a call");
         assert_eq!(tries, SWEEP_TRIES, "deferral spent no retries");
         assert_eq!(stalls, 0);
@@ -3760,7 +4575,10 @@ mod tests {
         assert_eq!(x.assets().owner_of_sym(4096), Some(3));
 
         // A second member trades the same leg.
-        assert!(x.assets_mut().note_owner(4096, 5), "must report the contest");
+        assert!(
+            x.assets_mut().note_owner(4096, 5),
+            "must report the contest"
+        );
         assert_eq!(
             x.assets().owner_of_sym(4096),
             None,
@@ -3836,8 +4654,16 @@ mod tests {
 
         assert_eq!(x.counters().rolls_refused, 1);
         assert_eq!(x.counters().rolls_bound, 0);
-        assert_eq!(x.assets().len(), before, "a refused roll must bind NEITHER leg");
-        assert_eq!(x.assets().sym_of_coin(b"#194180"), None, "not even the Yes leg");
+        assert_eq!(
+            x.assets().len(),
+            before,
+            "a refused roll must bind NEITHER leg"
+        );
+        assert_eq!(
+            x.assets().sym_of_coin(b"#194180"),
+            None,
+            "not even the Yes leg"
+        );
     }
 
     /// `sym + 1` on a wire-derived symbol. `SYMBOL_ID_NONE` is
@@ -3862,10 +4688,8 @@ mod tests {
 
         // One below the top still binds — the guard refuses the wrap,
         // not the range.
-        let ok = core_types::make_symbol_id(
-            VenueId::Hyperliquid,
-            core_types::SYMBOL_ORDINAL_MASK - 1,
-        );
+        let ok =
+            core_types::make_symbol_id(VenueId::Hyperliquid, core_types::SYMBOL_ORDINAL_MASK - 1);
         x.on_venue_event(&roll(19_418, 0, false, ok));
         assert_eq!(x.counters().rolls_bound, 1);
     }
@@ -3921,5 +4745,130 @@ mod tests {
         // Replaying the same tid books nothing more (LAW E-5).
         assert_eq!(x.route_fills(frame), 0, "a replayed tid double-booked");
         assert_eq!(x.counters().fills_booked, 1);
+    }
+
+    /// The LAW E-9 cloid of `(slot, client_oid)` as the action JSON
+    /// renders it: magic `MV`, the slot byte, five reserved zeros,
+    /// then the big-endian client id.
+    fn cloid_json(slot: u8, client_oid: u64) -> String {
+        format!("\"0x4d56{slot:02x}0000000000{client_oid:016x}\"")
+    }
+
+    /// **BX0-F3 — the trait's lifecycle verbs reach this arm.** The
+    /// router drives every live verb through `OrderDispatch`; until
+    /// BX0 this impl overrode `submit` only, so a live cancel or
+    /// modify fell to the trait default, `Unsupported`, and never
+    /// reached the venue. An unbound symbol makes the arm answer with
+    /// its OWN refusal (LAW E-4) before anything is signed or sent, so
+    /// no venue is needed. Break-and-watch: delete either override and
+    /// its assert reads `Unsupported` with the arm's counters untouched.
+    #[test]
+    fn the_trait_cancel_and_modify_reach_the_cloid_verbs() {
+        let mut x = exchange_at("127.0.0.1");
+        let resting = order(42, ORDER_KIND_MAKER);
+        assert_eq!(
+            OrderDispatch::cancel(&mut x, &CancelReq::of(&resting, 2)),
+            Err(DispatchError::NoLiveRoute),
+            "the trait cancel never reached cancel_by_cloid"
+        );
+        assert_eq!(x.counters().cancels_refused, 1);
+
+        let mut repl = order(42, ORDER_KIND_MAKER);
+        repl.client_oid = (1 << 32) | 7;
+        assert_eq!(
+            OrderDispatch::modify(&mut x, &ModifyReq::new(resting.client_oid, repl)),
+            Err(DispatchError::NoLiveRoute),
+            "the trait modify never reached modify_by_cloid"
+        );
+        assert_eq!(x.counters().modifies_refused, 1);
+        assert_eq!(
+            x.counters().refused_local,
+            2,
+            "one LAW E-4 refusal per verb"
+        );
+        assert_eq!(x.counters().cancels_sent + x.counters().modifies_sent, 0);
+    }
+
+    /// **BX0-F3 — the trait modify forwards the two ids the right way
+    /// round.** A transposed pair would compile, address the
+    /// REPLACEMENT's id as the resting order and fail at the venue as
+    /// "no such order" — or worse, replace some other quote. With the
+    /// leg bound and the cold budget at its floor, the requote encodes
+    /// in full and stops at the submit barrier (never a socket — the
+    /// bench gate 60 posture), leaving the rendered action in the
+    /// `/exchange` window:
+    /// the resting order must be the `oid` and the replacement the
+    /// order's own `c`.
+    #[test]
+    fn the_trait_modify_names_the_resting_order_and_carries_the_replacement() {
+        let mut x = exchange_at("127.0.0.1");
+        x.assets_mut().bind(42, 3, 7, b"#42").expect("bind");
+        let prev: u64 = (1 << 32) | 7;
+        let mut repl = order(42, ORDER_KIND_MAKER);
+        repl.client_oid = (2 << 32) | 7;
+        assert_eq!(
+            OrderDispatch::modify(&mut x, &ModifyReq::new(prev, repl)),
+            Err(DispatchError::SlotDisabled),
+            "a cold budget refuses a requote at the submit barrier"
+        );
+        assert_eq!(x.counters().modifies_refused, 1);
+        assert_eq!(
+            x.counters().encode_failures,
+            0,
+            "the encode half ran to the end"
+        );
+        let body = String::from_utf8_lossy(x.http.body_mut());
+        let resting = format!("\"oid\":{}", cloid_json(3, prev));
+        let replacement = format!("\"c\":{}", cloid_json(3, repl.client_oid));
+        assert!(
+            body.contains(&resting),
+            "resting order not addressed by its cloid"
+        );
+        assert!(
+            body.contains(&replacement),
+            "replacement does not carry its own cloid"
+        );
+        // The stamping `ModifyReq::new` does (verb, prev id) must not
+        // reach the wire: the action is byte-for-byte the one an
+        // unstamped replacement encodes.
+        let (_mp, end) = x.stage_modify(prev, &repl).expect("unstamped encode");
+        let unstamped = x.http.body_mut()[..end].to_vec();
+        let _ = OrderDispatch::modify(&mut x, &ModifyReq::new(prev, repl));
+        assert_eq!(
+            &x.http.body_mut()[..end],
+            &unstamped[..],
+            "the stamp leaked into the action"
+        );
+    }
+
+    /// **BX0-F3 — the trait cancel forwards the three fields that name
+    /// the order.** A bound leg takes the cancel through the encode to
+    /// the socket (a cancel is an exit: no budget bars it); nothing
+    /// listens on loopback:443, so the send fails — but the action it
+    /// rendered names this order's asset and cloid, not a neighbour's.
+    #[test]
+    fn the_trait_cancel_names_the_asset_and_the_cloid_it_was_given() {
+        let mut x = exchange_at("127.0.0.1");
+        x.assets_mut().bind(42, 3, 7, b"#42").expect("bind");
+        let resting = order(42, ORDER_KIND_MAKER);
+        let r = OrderDispatch::cancel(&mut x, &CancelReq::of(&resting, 2));
+        assert!(
+            !matches!(
+                r,
+                Err(DispatchError::Unsupported
+                    | DispatchError::SlotDisabled
+                    | DispatchError::NoLiveRoute)
+            ),
+            "the cancel stopped before the socket: {r:?}"
+        );
+        let body = String::from_utf8_lossy(x.http.body_mut());
+        let named = format!(
+            "\"asset\":3,\"cloid\":{}",
+            cloid_json(3, resting.client_oid)
+        );
+        assert!(
+            body.contains(&named),
+            "the cancel did not name this order: {named}"
+        );
     }
 }

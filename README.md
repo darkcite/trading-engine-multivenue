@@ -6,8 +6,8 @@
 
 Pure-Rust, zero-allocation, zero-copy, single-writer, lock-free HFT engine
 that executes systematic strategies across a multivenue universe — Binance
-spot/USDM, OKX, Deribit, Hyperliquid, Bybit, Polymarket's CLOB and Polygon
-RPC, plus a boot-selected options ladder.
+spot/USDM, OKX, Deribit, Hyperliquid, Bybit, MEXC (data-only), Polymarket's
+CLOB and Polygon RPC, plus a boot-selected options ladder.
 
 Strategies are composed at boot from a slot set (AI-executed intents, the
 ruleset VM, the intrabar candle member) and are free to trade any subset of
@@ -33,6 +33,7 @@ through an HMAC'd UDS command plane. It is never in the hot path.
 | Real execution E1–E6 (per-slot routing, HL signer + arm, risk gate, kill switches) | **LANDED, reviewed + re-tested in E7 (2026-09-19)** |
 | E7 — the ramp | **TESTNET first** (operator-gated R0); mainnet is a later ruling |
 | Stage 3 — AI-promoted members live | **GATED** on the Stage-3 entry gate (waived for BIN15 only) |
+| MEXC — the seventh market-data venue (MX0–MX9, `docs/mexc-ingress-plan.md`) | **LANDED 2026-09-23, data-only** — captured once `[mexc]` is in the boot universe |
 
 Gates at HEAD: **2585** nextest · **62/62** alloc assertions at 0 B/op ·
 clippy clean · `make copy-audit` new=0 · **1153** worker pytest.
@@ -111,7 +112,7 @@ symbols through the manifest, never a bare `SymbolId` across runs.
 Tick v3 carries `venue_time_ms` + `flags`; every ingress judges each tick
 against the venue's own fastest message (`core_time::FeedClock`) and
 flags it STALE past the per-venue `stale_after_ms` (pm 1000 / bn 1000 /
-okx 400 / deribit 600 / hl 700 / bybit 500; `run --stale-after-ms
+okx 400 / deribit 600 / hl 700 / bybit 500 / mexc 400; `run --stale-after-ms
 <venue>:<ms>` overrides, `:0` = measure only). A stale tick is captured
 but never a signal (`Mid/Bid/Ask` ABSENT in the VM), never a fill and
 never a mark. `backtest` and `audit-pnl` RE-JUDGE v3 captures from the
@@ -124,20 +125,37 @@ a v2 root is an upper bound.** Metrics:
 Engine-side delay per venue: `docs/venue-latency.md` §5. Capture windows
 for research are ≤ 2 h by law (VT plan §6.1).
 
-**Slot 6 — `strategy-icdp` (ICDP I1–I7, 2026-09-03; paper only).** The
+**Slot 6 — `strategy-xmm` (XMM XH1–XH3, 2026-09-26; paper only).** The
+Binance-led post-only market maker on Hyperliquid perps (plan
+`xmm-hl-maker-plan-2026-09-26.md`, rulings O-XH1…O-XH15). Parameters come
+from `~/multivenue/xmm.toml` (`--xmm <path>`; `xmm.toml.example` is the
+probe); a requested xmm bit with no artifact refuses the boot. Since XH2
+the member runs the LEAD θ policy (post-only at the touch, the LEAD
+cancel, the 500 ms gate, hard caps, stale-feed pulls), judged on paper by
+the queue law (`core_fill::queue`: queue ahead, prints, post-only
+rejects) in both the engine's paper matcher and `backtest --member xmm`;
+`multivenue-engine xmm-parity` replays one window on the XMM simulator's
+clock for the parity gate. Since XH3 it reports on `/state` (the `xmm`
+block: counters and one row per perp) and `/metrics`
+(`engine_xmm_*_total`, `engine_xmm_perps`, `engine_xmm_p{k}_pos_1e6`),
+`audit-pnl` fills its orders from the prints, and `[labels.xmm]` carries a
+regime label it never consults. A live slot 6 refuses the boot until XH4.
+
+**`strategy-icdp` (ICDP I1–I7, 2026-09-03) — unlinked at XMM XH1.** Its
+crate, tests and `backtest --member icdp --icdp <path>` stay; no engine
+path composes it and `--strategy ai+icdp` refuses the boot. The
 intrabar candle-direction member: a UTC bar grid (`core_time::BarClock`),
 L1 features from every tick, an offline-fitted linear composite, IoC
 taker intents (`Order.kind = 1`, `ttl_ns` = the bar's remaining life) —
 entry at `open + δ`, exit at the roll, one position per instrument per
 bar. Parameters come from `~/multivenue/icdp.toml` (`--icdp <path>`), a
 generated integer artifact (sha256 logged at boot); descriptors must
-resolve against the boot universe or the boot refuses. Enable with
-`--strategy ai+icdp` (the launchd wrapper reads `STRATEGY=ai+icdp` from
-`~/multivenue/strategy.conf`; default `ai`). The offline fill model
+resolve against the boot universe or the boot refuses. It was enabled
+with `--strategy ai+icdp` until XH1 (that name now refuses the boot). The
+offline fill model
 scores its intents under the I1 IoC law and prints the fee ladder.
-Metrics: `engine_icdp_{decisions,signals,intents,exits,exit_on_stale,
-skipped_spread,skipped_stale_open,skipped_stale_dec,skipped_prev,late_bars,
-caps_rejected,rolls}_total`.
+Its `engine_icdp_*_total` metrics and `/state` block were retired at XMM
+XH3.
 
 ## Venue latency calibration — REQUIRED per deployment and per location
 

@@ -75,14 +75,24 @@ def caps_of_descriptor(desc: str) -> int:
         if name.endswith("-SWAP"):
             return CAP_PRICE | CAP_FUNDING | CAP_DEPTH
         return CAP_PRICE | CAP_DEPTH
-    if venue == "binance-usdm":
+    if venue in ("binance-usdm", "binance-coinm"):
+        # BX2: COIN-M's markPrice lane carries funding on the perps; its
+        # dated rows take the permissive grant, as usdm's do.
         return CAP_PRICE | CAP_FUNDING
-    if venue == "bybit-linear":
+    if venue in ("bybit-linear", "mexc-perp"):
+        # MX7: every `[mexc] perp` row is a perpetual; `mexc` spot takes
+        # the CAP_PRICE default below (the bybit-spot shape).
         return CAP_PRICE | CAP_FUNDING
     if venue == "hyperliquid":
         if name.startswith("#"):
             return CAP_PRICE
         return CAP_PRICE | CAP_FUNDING
+    if venue == "hypercall":
+        # HC4: every `hypercall:` name is an option (BBO tick + REST
+        # summary); the settlement index carries neither.
+        return CAP_OPT | CAP_PRICE if is_opt else 0
+    if venue == "hypercall-idx":
+        return 0
     return CAP_PRICE
 
 

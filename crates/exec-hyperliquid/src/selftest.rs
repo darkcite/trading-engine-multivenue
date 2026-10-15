@@ -4,7 +4,7 @@
 //! The binary certifying its own signing chain, offline, before it
 //! talks to anyone.
 //!
-//! COPY-DOCTRINE: a boot self-test over 25 embedded vectors, run once
+//! COPY-DOCTRINE: a boot self-test over the `VECTOR_ROWS` (39) embedded vectors, run once
 //! before the arm exists and never again; every copy in it is cold.
 //! `scripts/copy-audit.sh` skips this module on that line.
 //!
@@ -19,7 +19,7 @@
 //! sent was rejected with a valid signature over a digest the venue
 //! never computed. The network probe cannot see that, by construction.
 //!
-//! What can see it is the 25 known-answer vectors the official
+//! What can see it is the 39 known-answer vectors the official
 //! `hyperliquid-python-sdk` generated. They already guard CI through
 //! `tests/hl_vectors.rs` — but `cargo nextest` is not what runs before
 //! a restart. **So the vectors are embedded in the binary** and checked
@@ -29,18 +29,24 @@
 //!
 //! ## Two checks, and they cover different halves
 //!
-//! 1. **The chain, over all 25 rows.** For every vector, recompute the
+//! 1. **The chain, over all 39 rows.** For every vector, recompute the
 //!    connection id, the `Agent` EIP-712 digest and the 65-byte
 //!    signature from the SDK's *recorded* msgpack. This covers keccak,
 //!    the domain separator, the nonce/vault/expiry framing and
 //!    secp256k1 — but takes the action bytes as given, so it cannot
 //!    catch a key-order change.
-//! 2. **The encoders, over all four action types.** Rebuild the
+//! 2. **The encoders, over all eight action types and the priority
+//!    grouping.** Rebuild the
 //!    msgpack from inputs written out below and compare it to the
 //!    recorded bytes. This is the half that catches LAW E-3, and it is
 //!    why one case per action type is the minimum: `order`, `cancel`,
-//!    `cancelByCloid` and `batchModify` (whose payload nests an
-//!    `OrderWire`, so it covers the order key order a second time).
+//!    `cancelByCloid`, `batchModify` (whose payload nests an
+//!    `OrderWire`, so it covers the order key order a second time),
+//!    `reserveRequestWeight` (S7-L1, the request-budget top-up) and the
+//!    perp arm's control actions (XH4c): `updateLeverage`,
+//!    `scheduleCancel` in both shapes (`time` set, and absent to clear)
+//!    and `noop` — and (XMM XH5d) an order under the ALO priority
+//!    grouping, `{"p": N}`, the one grouping that is a map.
 //!
 //! The inputs below are a second statement of what `gen_vectors.py`
 //! fed the SDK. They cannot drift silently: if they ever stop matching
@@ -74,12 +80,15 @@ const TEST_KEY: [u8; 32] = [
 /// sends, not a round number that would hide an arithmetic bug.
 const HIP4_YES: u32 = 100_000_000 + 10 * 3253;
 
-/// The fixture's row count, EXACTLY. The header says "all 25", so the
-/// gate asserts 25 — a `>= 20` (the first cut) let five rows vanish
+/// The fixture's row count, EXACTLY. The header says "all 39", so the
+/// gate asserts 39 — a `>= 20` (the first cut) let five rows vanish
 /// with both gates still green, which is a claim the code did not
 /// test. Regenerating the fixture with more vectors moves this number
-/// on purpose.
-pub const VECTOR_ROWS: u32 = 25;
+/// on purpose (S7-L1 moved it from 25 for the two request-weight rows;
+/// XH4c by nine for the five control rows and the four 39-item rows;
+/// HC10 by two for the HIP-3 builder-perp rows; XMM XH5d by one for the
+/// ALO priority grouping).
+pub const VECTOR_ROWS: u32 = 39;
 
 /// Why the binary failed to certify itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +112,10 @@ impl core::fmt::Display for SelfTestErr {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             SelfTestErr::Fixture(w) => {
-                write!(f, "hl self-test: the embedded SDK vectors are unusable ({w})")
+                write!(
+                    f,
+                    "hl self-test: the embedded SDK vectors are unusable ({w})"
+                )
             }
             SelfTestErr::Chain { name, stage } => write!(
                 f,
@@ -206,7 +218,9 @@ pub fn run() -> Result<SelfTestReport, SelfTestErr> {
     }
 
     if rows != VECTOR_ROWS {
-        return Err(SelfTestErr::Fixture("the fixture does not hold exactly the 25 vectors"));
+        return Err(SelfTestErr::Fixture(
+            "the fixture does not hold exactly the 39 vectors",
+        ));
     }
 
     let encoders = check_encoders()?;
@@ -228,8 +242,14 @@ fn check_encoders() -> Result<u32, SelfTestErr> {
     .map_err(|_| SelfTestErr::Encode("order"))?;
     want("order_gtc_buy", &buf[..n], "order")?;
 
-    let n = encode_cancel(&mut buf, &[CancelWire { asset: 0, oid: 12_345 }])
-        .map_err(|_| SelfTestErr::Encode("cancel"))?;
+    let n = encode_cancel(
+        &mut buf,
+        &[CancelWire {
+            asset: 0,
+            oid: 12_345,
+        }],
+    )
+    .map_err(|_| SelfTestErr::Encode("cancel"))?;
     want("cancel_single", &buf[..n], "cancel")?;
 
     let n = encode_cancel_by_cloid(
@@ -255,13 +275,43 @@ fn check_encoders() -> Result<u32, SelfTestErr> {
     .map_err(|_| SelfTestErr::Encode("batchModify"))?;
     want("batch_modify_1", &buf[..n], "batchModify")?;
 
-    Ok(4)
+    // S7-L1: the request-budget top-up — the one action the arm signs
+    // that is neither an order nor a cancel.
+    let n = crate::action::encode_reserve_weight(&mut buf, 5_000)
+        .map_err(|_| SelfTestErr::Encode("reserveRequestWeight"))?;
+    want("reserve_weight", &buf[..n], "reserveRequestWeight")?;
+
+    // XH4c: the perp arm's control actions — three more key sequences,
+    // and scheduleCancel's second shape (no `time` key: a clear).
+    let n = crate::action::encode_update_leverage(&mut buf, 1, true, 3)
+        .map_err(|_| SelfTestErr::Encode("updateLeverage"))?;
+    want("update_leverage_cross", &buf[..n], "updateLeverage")?;
+
+    let n = crate::action::encode_schedule_cancel(&mut buf, Some(1_789_000_005_000))
+        .map_err(|_| SelfTestErr::Encode("scheduleCancel"))?;
+    want("schedule_cancel_at", &buf[..n], "scheduleCancel")?;
+    let n = crate::action::encode_schedule_cancel(&mut buf, None)
+        .map_err(|_| SelfTestErr::Encode("scheduleCancel"))?;
+    want("schedule_cancel_clear", &buf[..n], "scheduleCancel")?;
+
+    let n = crate::action::encode_noop(&mut buf).map_err(|_| SelfTestErr::Encode("noop"))?;
+    want("noop", &buf[..n], "noop")?;
+
+    // XMM XH5d: the order under the ALO priority grouping — the one
+    // grouping that is a map, not a string.
+    let n = crate::action::encode_order_grouped(
+        &mut buf,
+        &[OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Alo)],
+        crate::action::Grouping::Priority(10_000),
+    )
+    .map_err(|_| SelfTestErr::Encode("order (priority)"))?;
+    want("order_alo_priority", &buf[..n], "order (priority)")?;
+
+    Ok(9)
 }
 
 /// The cloid `gen_vectors.py` used for the cloid-bearing cases.
-const CLOID_B: [u8; 16] = [
-    0x4d, 0x56, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a,
-];
+const CLOID_B: [u8; 16] = [0x4d, 0x56, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a];
 
 /// Compare `got` against the named row's recorded msgpack.
 fn want(row: &str, got: &[u8], label: &'static str) -> Result<(), SelfTestErr> {
@@ -330,7 +380,10 @@ mod tests {
     fn this_binary_certifies_itself() {
         let r = run().expect("the embedded vectors must reproduce");
         assert_eq!(r.rows, VECTOR_ROWS, "{r:?}");
-        assert_eq!(r.encoders, 4, "one case per action type, no fewer");
+        assert_eq!(
+            r.encoders, 9,
+            "one case per action type and the priority grouping, no fewer"
+        );
     }
 
     /// The self-test is only worth running if it can FAIL. Feed the

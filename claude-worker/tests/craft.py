@@ -18,7 +18,7 @@ _SLOT = claude_worker.pmlr.SLOT_SIZE
 _HDR = claude_worker.pmlr.HEADER_SIZE
 
 
-def write_ticks(  # noqa: PLR0913 — one parameter per header/slot field, deliberately
+def write_ticks(  # one parameter per header/slot field, deliberately
     path: pathlib.Path,
     ts_list: list[int],
     epoch_ns: int,
@@ -31,12 +31,12 @@ def write_ticks(  # noqa: PLR0913 — one parameter per header/slot field, delib
     (flags, venue_time_ms) are packed as 0 — byte-identical to a v2
     writer's zeroed tail pad; ``version`` only stamps the header (RG4's
     window pool refuses stale-blind v2 runs, so its tests write 3)."""
-    header = claude_worker.pmlr._HEADER.pack(  # noqa: SLF001 — reader-defined layout, deliberately
+    header = claude_worker.pmlr._HEADER.pack(  # reader-defined layout, deliberately
         claude_worker.pmlr.MAGIC, version, claude_worker.pmlr.SLOT_KIND_TICK, epoch_ns
     )
     blob = bytearray(header + bytes(_HDR - len(header)))
     for i, ts in enumerate(ts_list):
-        slot = claude_worker.pmlr._TICK.pack(  # noqa: SLF001
+        slot = claude_worker.pmlr._TICK.pack(
             ts, sym, i + 1, 400_000, 1_000_000, 420_000, 1_000_000, venue, 0, 0
         )
         blob.extend(slot + bytes(_SLOT - len(slot)))
@@ -67,12 +67,12 @@ def write_ticks_px(
     """M3-C5 builder: one v2 tick file with EXPLICIT per-slot prices —
     ``rows`` = (ts_ns, sym, bid_px, ask_px, venue), fixed-point 1e6
     (the capture-derived candle tests need controlled mids)."""
-    header = claude_worker.pmlr._HEADER.pack(  # noqa: SLF001 — reader-defined layout, deliberately
+    header = claude_worker.pmlr._HEADER.pack(  # reader-defined layout, deliberately
         claude_worker.pmlr.MAGIC, 2, claude_worker.pmlr.SLOT_KIND_TICK, epoch_ns
     )
     blob = bytearray(header + bytes(_HDR - len(header)))
     for i, (ts, sym, bid_px, ask_px, venue) in enumerate(rows):
-        slot = claude_worker.pmlr._TICK.pack(  # noqa: SLF001
+        slot = claude_worker.pmlr._TICK.pack(
             ts, sym, i + 1, bid_px, 1_000_000, ask_px, 1_000_000, venue, 0, 0
         )
         blob.extend(slot + bytes(_SLOT - len(slot)))
@@ -139,3 +139,62 @@ def seed_committed_ruleset(
     )
     state.mark_ruleset_committed(full_hash, ts=committed_ts)
     return full_hash, ruleset_path, report_path
+
+
+def _write_slots(
+    path: pathlib.Path, kind: int, slots: list[bytes], epoch_ns: int, version: int = 3
+) -> None:
+    header = claude_worker.pmlr._HEADER.pack(  # reader-defined layout, deliberately
+        claude_worker.pmlr.MAGIC, version, kind, epoch_ns
+    )
+    blob = bytearray(header + bytes(_HDR - len(header)))
+    for slot in slots:
+        blob.extend(slot + bytes(_SLOT - len(slot)))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(blob))
+
+
+def write_fills(
+    path: pathlib.Path,
+    rows: list[tuple[int, int, int, int, int, int, int, int, int]],
+    epoch_ns: int,
+) -> None:
+    """HYPARB G1 builder: one kind-2 fill file — ``rows`` = (ts_ns, sym,
+    side, strategy_id, origin, flags, px, qty, order_id), the reader's own
+    layout."""
+    _write_slots(
+        path,
+        claude_worker.pmlr.SLOT_KIND_FILL,
+        [claude_worker.pmlr._FILL.pack(*r) for r in rows],
+        epoch_ns,
+    )
+
+
+def write_orders(
+    path: pathlib.Path,
+    rows: list[tuple[int, int, int, int, int, int, int, int, int]],
+    epoch_ns: int,
+) -> None:
+    """HYPARB G1 builder: one kind-3 order file — ``rows`` = (ts_ns, sym,
+    side, kind, px, qty, client_oid, venue, strategy_id)."""
+    _write_slots(
+        path,
+        claude_worker.pmlr.SLOT_KIND_ORDER,
+        [claude_worker.pmlr._ORDER.pack(*r) for r in rows],
+        epoch_ns,
+    )
+
+
+def write_events(
+    path: pathlib.Path,
+    rows: list[tuple[int, int, int, int, int, int, int, int]],
+    epoch_ns: int,
+) -> None:
+    """HYPARB G1 builder: one kind-5 ChannelEvent file — ``rows`` =
+    (ts_ns, sym, venue, channel, venue_seq, venue_time_ms, v0, v1)."""
+    _write_slots(
+        path,
+        claude_worker.pmlr.SLOT_KIND_CHANNEL_EVENT,
+        [claude_worker.pmlr._CHANNEL_EVENT.pack(*r) for r in rows],
+        epoch_ns,
+    )

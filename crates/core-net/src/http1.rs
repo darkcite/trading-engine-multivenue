@@ -4,9 +4,20 @@
 //! # HTTP/1.1 minimal codec
 //!
 //! Zero-alloc, pure-byte-scanner HTTP/1.1 client codec used by the
-//! boot-time REST discovery path (`boot_http`) and the CLOB
-//! dispatcher. No cookies, no compression (the request hard-codes
+//! boot-time REST discovery path (`boot_http`), the CLOB dispatcher and
+//! the keep-alive clients ([`crate::HttpsPost`], [`crate::HttpsReq`]).
+//! No cookies, no compression (the request hard-codes
 //! `Accept-Encoding: identity`), no automatic redirect chasing.
+//!
+//! ## Requests (HC2)
+//!
+//! ONE writer, [`write_request_head`], renders every request head: any
+//! [`Method`], an origin-form target (path + optional query), and the
+//! caller's extra headers (Hypercall's signed `X-Hypercall-*` pair).
+//! [`request_head_len`] sizes the head first, so a keep-alive client can
+//! render it flush against a body already in place — one contiguous
+//! slice, one write. [`write_get_request`] / [`write_post_request`] are
+//! thin wrappers over it and emit the bytes they always did.
 //!
 //! ## Why hand-roll?
 //!
@@ -23,6 +34,10 @@
 //! * `Transfer-Encoding: chunked` — dechunked in-place into a caller-owned
 //!   scratch slice via [`dechunk_in_place`].
 //! * Connection-close framing (treated as `Content-Length: remaining`).
+//! * A `204` has no body whatever its headers say, and interim `1xx`
+//!   answers before the final one are skipped (RFC 9112 §6.3, RFC 9110
+//!   §15.2; XMM HD2). A `101` is malformed: nothing here asks to switch
+//!   protocols.
 //!
 //! ## Non-goals (deferred to Phase 1d)
 //!
@@ -36,11 +51,17 @@
 // Errors + result types
 // ---------------------------------------------------------------
 
-/// Reason a response scan rejected a buffer.
+/// Reason a request could not be rendered.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HttpErr {
     /// Caller's output buffer is too small to fit the request.
     BufferTooSmall,
+    /// HC2: a head field would break the request's framing — a CR, LF or
+    /// NUL in any field (header injection), a target that is not
+    /// visible-ASCII origin-form (`/…`), an empty or non-visible host, or
+    /// a header name that is empty or carries `:` / whitespace. Refused,
+    /// never rewritten.
+    BadHead,
 }
 
 /// Outcome of a single call to [`read_response`].
@@ -52,8 +73,9 @@ pub enum HttpResult {
     Complete {
         /// HTTP status code (e.g. 200, 404).
         status: u16,
-        /// Exclusive end of the response header region (first byte of
-        /// body, if any).
+        /// Exclusive end of the final response head (first byte of body,
+        /// if any). Interim `1xx` heads before it were skipped and lie
+        /// inside `buf[..header_end]`.
         header_end: usize,
         /// Inclusive start of the (possibly-empty) body region.
         body_start: usize,
@@ -84,6 +106,223 @@ pub enum BodyFraming {
 // Request serialization
 // ---------------------------------------------------------------
 
+/// Request method (HC2) — the request line's first token.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Method {
+    /// `GET` — no body; no `Content-Length` unless a body is given.
+    Get = 0,
+    /// `POST`.
+    Post = 1,
+    /// `PUT` (Hypercall: replace an order).
+    Put = 2,
+    /// `DELETE` — may carry a body (Hypercall cancels with one).
+    Delete = 3,
+}
+
+impl Method {
+    /// The request-line token.
+    #[inline(always)]
+    #[must_use]
+    pub const fn token(self) -> &'static [u8] {
+        match self {
+            Self::Get => b"GET",
+            Self::Post => b"POST",
+            Self::Put => b"PUT",
+            Self::Delete => b"DELETE",
+        }
+    }
+}
+
+/// One extra request header, `(name, value)`, sent verbatim after the
+/// fixed ones.
+pub type Header<'a> = (&'a [u8], &'a [u8]);
+
+/// Everything in a request head but the body bytes (HC2).
+///
+/// Rendered as:
+///
+/// ```text
+/// {METHOD} {target} HTTP/1.1
+/// Host: {host}
+/// User-Agent: {user_agent}
+/// Accept: */*
+/// Accept-Encoding: identity
+/// Content-Type: {content_type}      (only when Some)
+/// Content-Length: {body_len}        (every method but a bodiless GET)
+/// {name}: {value}                   (each `extra` header, in order)
+/// Connection: keep-alive | close
+/// ```
+#[derive(Copy, Clone, Debug)]
+pub struct ReqHead<'a> {
+    /// Request method.
+    pub method: Method,
+    /// `Host` header value.
+    pub host: &'a [u8],
+    /// Origin-form request target: `/path` plus an optional `?query`.
+    pub target: &'a [u8],
+    /// `User-Agent` header value.
+    pub user_agent: &'a [u8],
+    /// `Content-Type` header value, when the request carries one.
+    pub content_type: Option<&'a [u8]>,
+    /// Extra headers, after the fixed set.
+    pub extra: &'a [Header<'a>],
+    /// `Connection: keep-alive` (true) or `close`.
+    pub keep_alive: bool,
+}
+
+const H_HOST: &[u8] = b" HTTP/1.1\r\nHost: ";
+const H_UA: &[u8] = b"\r\nUser-Agent: ";
+const H_ACCEPT: &[u8] = b"\r\nAccept: */*\r\nAccept-Encoding: identity\r\n";
+const H_CT: &[u8] = b"Content-Type: ";
+const H_CL: &[u8] = b"Content-Length: ";
+const H_SEP: &[u8] = b": ";
+const CRLF: &[u8] = b"\r\n";
+const H_KEEP: &[u8] = b"Connection: keep-alive\r\n\r\n";
+const H_CLOSE: &[u8] = b"Connection: close\r\n\r\n";
+
+/// The `Connection` line and the blank line that ends the head.
+#[inline]
+const fn connection_line(keep_alive: bool) -> &'static [u8] {
+    if keep_alive {
+        H_KEEP
+    } else {
+        H_CLOSE
+    }
+}
+
+/// A field value that cannot break the head's framing: no CR, LF, NUL.
+#[inline]
+fn field_ok(v: &[u8]) -> bool {
+    memchr::memchr3(b'\r', b'\n', 0, v).is_none()
+}
+
+/// A header name: a non-empty run of visible ASCII without `:`.
+#[inline]
+fn name_ok(n: &[u8]) -> bool {
+    !n.is_empty() && n.iter().all(|&b| b.is_ascii_graphic() && b != b':')
+}
+
+impl ReqHead<'_> {
+    /// `Content-Length` goes on every method that may carry a body (POST,
+    /// PUT, DELETE) and on any request with a non-empty body; a bodiless
+    /// GET sends none.
+    #[inline]
+    const fn sends_length(&self, body_len: usize) -> bool {
+        !matches!(self.method, Method::Get) || body_len > 0
+    }
+
+    /// The framing law ([`HttpErr::BadHead`]).
+    fn validate(&self) -> Result<(), HttpErr> {
+        // Request target and host: visible ASCII only (RFC 9112 §3.2 /
+        // §3.2.2) — a space would end the target, a CR/LF would end the
+        // line.
+        let visible = |v: &[u8]| v.iter().all(u8::is_ascii_graphic);
+        let mut ok = self.target.first() == Some(&b'/')
+            && visible(self.target)
+            && !self.host.is_empty()
+            && visible(self.host)
+            && field_ok(self.user_agent)
+            && self.content_type.is_none_or(field_ok);
+        let mut i = 0usize;
+        while ok && i < self.extra.len() {
+            ok = name_ok(self.extra[i].0) && field_ok(self.extra[i].1);
+            i += 1;
+        }
+        if ok {
+            Ok(())
+        } else {
+            Err(HttpErr::BadHead)
+        }
+    }
+}
+
+/// Byte length of the head [`write_request_head`] renders for `head`
+/// and a `body_len`-byte body — validated, so a head that sizes is a
+/// head that renders.
+pub fn request_head_len(head: &ReqHead<'_>, body_len: usize) -> Result<usize, HttpErr> {
+    head.validate()?;
+    let mut n = head.method.token().len() + 1 + head.target.len() + H_HOST.len() + head.host.len();
+    n += H_UA.len() + head.user_agent.len() + H_ACCEPT.len();
+    if let Some(ct) = head.content_type {
+        n += H_CT.len() + ct.len() + CRLF.len();
+    }
+    if head.sends_length(body_len) {
+        n += H_CL.len() + dec_digits(body_len as u64) + CRLF.len();
+    }
+    let mut i = 0usize;
+    while i < head.extra.len() {
+        n += head.extra[i].0.len() + H_SEP.len() + head.extra[i].1.len() + CRLF.len();
+        i += 1;
+    }
+    n += connection_line(head.keep_alive).len();
+    Ok(n)
+}
+
+/// Render the head of a request with a `body_len`-byte body into `dst`
+/// (the body itself is the caller's: a keep-alive client renders it in
+/// place, then this head flush against it). Returns bytes written. Zero-
+/// alloc; [`HttpErr::BufferTooSmall`] if `dst` can't fit it,
+/// [`HttpErr::BadHead`] on a field that would break the framing.
+pub fn write_request_head(
+    dst: &mut [u8],
+    head: &ReqHead<'_>,
+    body_len: usize,
+) -> Result<usize, HttpErr> {
+    head.validate()?;
+    let mut cursor = 0usize;
+    push(dst, &mut cursor, head.method.token())?;
+    push(dst, &mut cursor, b" ")?;
+    push(dst, &mut cursor, head.target)?;
+    push(dst, &mut cursor, H_HOST)?;
+    push(dst, &mut cursor, head.host)?;
+    push(dst, &mut cursor, H_UA)?;
+    push(dst, &mut cursor, head.user_agent)?;
+    push(dst, &mut cursor, H_ACCEPT)?;
+    if let Some(ct) = head.content_type {
+        push(dst, &mut cursor, H_CT)?;
+        push(dst, &mut cursor, ct)?;
+        push(dst, &mut cursor, CRLF)?;
+    }
+    if head.sends_length(body_len) {
+        push(dst, &mut cursor, H_CL)?;
+        // u64 → ASCII into a stack scratch; 20 digits max.
+        let mut len_buf = [0u8; 20];
+        let digits = fmt_u64_ascii(body_len as u64, &mut len_buf);
+        push(dst, &mut cursor, digits)?;
+        push(dst, &mut cursor, CRLF)?;
+    }
+    let mut i = 0usize;
+    while i < head.extra.len() {
+        push(dst, &mut cursor, head.extra[i].0)?;
+        push(dst, &mut cursor, H_SEP)?;
+        push(dst, &mut cursor, head.extra[i].1)?;
+        push(dst, &mut cursor, CRLF)?;
+        i += 1;
+    }
+    push(dst, &mut cursor, connection_line(head.keep_alive))?;
+    Ok(cursor)
+}
+
+/// Render a whole request — head, then `body` — into `dst`. Returns
+/// bytes written. Zero-alloc.
+pub fn write_request(dst: &mut [u8], head: &ReqHead<'_>, body: &[u8]) -> Result<usize, HttpErr> {
+    let mut cursor = write_request_head(dst, head, body.len())?;
+    push(dst, &mut cursor, body)?;
+    Ok(cursor)
+}
+
+/// Decimal digits of `v` (≥ 1).
+#[inline]
+const fn dec_digits(mut v: u64) -> usize {
+    let mut d = 1;
+    while v >= 10 {
+        v /= 10;
+        d += 1;
+    }
+    d
+}
+
 /// Write a `GET {path} HTTP/1.1\r\n…` request into `dst`. Zero-alloc.
 ///
 /// Emits a fixed header set:
@@ -98,8 +337,9 @@ pub enum BodyFraming {
 /// ```
 ///
 /// Returns the number of bytes written. Fails with
-/// [`HttpErr::BufferTooSmall`] if `dst` can't fit the request — never
-/// allocates.
+/// [`HttpErr::BufferTooSmall`] if `dst` can't fit the request, and with
+/// [`HttpErr::BadHead`] on a field that would break the head (the
+/// framing law of [`write_request_head`]) — never allocates.
 #[inline]
 pub fn write_get_request(
     dst: &mut [u8],
@@ -107,25 +347,16 @@ pub fn write_get_request(
     path: &[u8],
     user_agent: &[u8],
 ) -> Result<usize, HttpErr> {
-    let mut cursor = 0usize;
-
-    push(dst, &mut cursor, b"GET ")?;
-    push(dst, &mut cursor, path)?;
-    push(dst, &mut cursor, b" HTTP/1.1\r\n")?;
-
-    push(dst, &mut cursor, b"Host: ")?;
-    push(dst, &mut cursor, host)?;
-    push(dst, &mut cursor, b"\r\n")?;
-
-    push(dst, &mut cursor, b"User-Agent: ")?;
-    push(dst, &mut cursor, user_agent)?;
-    push(dst, &mut cursor, b"\r\n")?;
-
-    push(dst, &mut cursor, b"Accept: */*\r\n")?;
-    push(dst, &mut cursor, b"Accept-Encoding: identity\r\n")?;
-    push(dst, &mut cursor, b"Connection: close\r\n\r\n")?;
-
-    Ok(cursor)
+    let head = ReqHead {
+        method: Method::Get,
+        host,
+        target: path,
+        user_agent,
+        content_type: None,
+        extra: &[],
+        keep_alive: false,
+    };
+    write_request(dst, &head, &[])
 }
 
 /// Write a `POST {path} HTTP/1.1\r\n…` request into `dst`, including the
@@ -147,8 +378,9 @@ pub fn write_get_request(
 /// followed by the body bytes. Needed for venue REST endpoints that are
 /// POST-only (Hyperliquid `/info` — plan §8.1). Returns the total number
 /// of bytes written (headers + body). Fails with
-/// [`HttpErr::BufferTooSmall`] if `dst` can't fit the request — never
-/// allocates.
+/// [`HttpErr::BufferTooSmall`] if `dst` can't fit the request, and with
+/// [`HttpErr::BadHead`] on a field that would break the head (the
+/// framing law of [`write_request_head`]) — never allocates.
 #[inline]
 pub fn write_post_request(
     dst: &mut [u8],
@@ -158,39 +390,16 @@ pub fn write_post_request(
     content_type: &[u8],
     body: &[u8],
 ) -> Result<usize, HttpErr> {
-    let mut cursor = 0usize;
-
-    push(dst, &mut cursor, b"POST ")?;
-    push(dst, &mut cursor, path)?;
-    push(dst, &mut cursor, b" HTTP/1.1\r\n")?;
-
-    push(dst, &mut cursor, b"Host: ")?;
-    push(dst, &mut cursor, host)?;
-    push(dst, &mut cursor, b"\r\n")?;
-
-    push(dst, &mut cursor, b"User-Agent: ")?;
-    push(dst, &mut cursor, user_agent)?;
-    push(dst, &mut cursor, b"\r\n")?;
-
-    push(dst, &mut cursor, b"Accept: */*\r\n")?;
-    push(dst, &mut cursor, b"Accept-Encoding: identity\r\n")?;
-
-    push(dst, &mut cursor, b"Content-Type: ")?;
-    push(dst, &mut cursor, content_type)?;
-    push(dst, &mut cursor, b"\r\n")?;
-
-    push(dst, &mut cursor, b"Content-Length: ")?;
-    // u64 → ASCII into a stack scratch; 20 digits max.
-    let mut len_buf = [0u8; 20];
-    let len_ascii = fmt_u64_ascii(body.len() as u64, &mut len_buf);
-    push(dst, &mut cursor, len_ascii)?;
-    push(dst, &mut cursor, b"\r\n")?;
-
-    push(dst, &mut cursor, b"Connection: close\r\n\r\n")?;
-
-    push(dst, &mut cursor, body)?;
-
-    Ok(cursor)
+    let head = ReqHead {
+        method: Method::Post,
+        host,
+        target: path,
+        user_agent,
+        content_type: Some(content_type),
+        extra: &[],
+        keep_alive: false,
+    };
+    write_request(dst, &head, body)
 }
 
 /// Render `v` as decimal ASCII into the tail of `scratch`, returning the
@@ -217,6 +426,12 @@ fn push(dst: &mut [u8], cursor: &mut usize, src: &[u8]) -> Result<(), HttpErr> {
     if end > dst.len() {
         return Err(HttpErr::BufferTooSmall);
     }
+    // COPY: one request part into the final request buffer, ≤ `dst` — a
+    // head constant, the host, the path, a header value, or (`write_request`)
+    // a boot-time POST's whole body — the render into the wire buffer —
+    // rejected: rendering that body behind a `request_head_len`-sized head
+    // (the `https_req` shape) for the boot path: cold, once per boot request
+    // (HK4: the marker HD1 left owed).
     dst[*cursor..end].copy_from_slice(src);
     *cursor = end;
     Ok(())
@@ -235,54 +450,150 @@ fn push(dst: &mut [u8], cursor: &mut usize, src: &[u8]) -> Result<(), HttpErr> {
 /// according to the declared framing. For [`BodyFraming::ContentLength`]
 /// callers check that `body_end <= buf.len()` to know whether the body
 /// is fully buffered; if it isn't they read more and call again.
+///
+/// **No-body statuses (XMM HD2).** Interim `1xx` answers before the
+/// final one are skipped: a client must parse them even unasked (RFC
+/// 9110 §15.2), they carry no body, and the final answer follows on the
+/// same connection — so `status` and the offsets are the final answer's,
+/// and `Incomplete` lasts until its head is in. A `101` is `Malformed`:
+/// no request through this parser asks to switch protocols. A `204` has
+/// no body whatever its headers say (RFC 9112 §6.3): `ContentLength(0)`.
+/// Before HD2 both read as close-delimited, and a keep-alive client
+/// waited for a close that never came.
 pub fn read_response(buf: &[u8]) -> HttpResult {
-    // Find end of headers.
-    let header_end = match find_header_end(buf) {
-        Some(n) => n,
-        None => return HttpResult::Incomplete,
-    };
+    // Where the head being judged starts: past any interim answers.
+    let mut at = 0usize;
+    loop {
+        // Find end of headers.
+        let header_end = match find_header_end(&buf[at..]) {
+            Some(n) => at + n,
+            None => return HttpResult::Incomplete,
+        };
 
-    // Parse status line.
-    let status_end = match memchr::memmem::find(&buf[..header_end], b"\r\n") {
-        Some(n) => n,
-        None => return HttpResult::Malformed,
-    };
-    let status_line = &buf[..status_end];
-    let status = match parse_status_line(status_line) {
-        Some(s) => s,
-        None => return HttpResult::Malformed,
-    };
+        // Parse status line.
+        let status_end = match memchr::memmem::find(&buf[at..header_end], b"\r\n") {
+            Some(n) => at + n,
+            None => return HttpResult::Malformed,
+        };
+        let status = match parse_status_line(&buf[at..status_end]) {
+            Some(s) => s,
+            None => return HttpResult::Malformed,
+        };
 
-    // Treat 3xx as malformed (redirect chasing is deferred).
-    if (300..400).contains(&status) {
-        return HttpResult::Malformed;
+        // An interim answer: skip it — the final one follows.
+        if (100..200).contains(&status) {
+            if status == 101 {
+                return HttpResult::Malformed;
+            }
+            at = header_end;
+            continue;
+        }
+
+        // Treat 3xx as malformed (redirect chasing is deferred).
+        if (300..400).contains(&status) {
+            return HttpResult::Malformed;
+        }
+
+        let headers = &buf[status_end + 2..header_end - 2];
+
+        // A 204 has no body whatever its headers say. Else Content-Length
+        // takes precedence; else Transfer-Encoding: chunked; else
+        // close-delimited.
+        let framing = if status == 204 {
+            BodyFraming::ContentLength(0)
+        } else if let Some(len) = find_content_length(headers) {
+            BodyFraming::ContentLength(len)
+        } else if find_chunked(headers) {
+            BodyFraming::Chunked
+        } else {
+            BodyFraming::CloseDelimited
+        };
+
+        let body_start = header_end;
+        let body_end = match framing {
+            BodyFraming::ContentLength(len) => body_start.saturating_add(len as usize),
+            BodyFraming::Chunked | BodyFraming::CloseDelimited => buf.len(),
+        };
+
+        return HttpResult::Complete {
+            status,
+            header_end,
+            body_start,
+            body_end,
+            framing,
+        };
     }
+}
 
-    let headers = &buf[status_end + 2..header_end - 2];
+/// Whether a response head (`buf[..header_end]` of a
+/// [`HttpResult::Complete`]) ends its connection: a `Connection: close`
+/// token, or an HTTP/1.0 status line without `Connection: keep-alive`.
+/// A keep-alive client retires the connection after such an answer
+/// instead of writing its next request into a socket the server is
+/// closing (HYPARB H9). Since HD2 the region may hold the interim `1xx`
+/// heads [`read_response`] skipped before the final one: each head is
+/// judged on its own, and ANY that says close retires the connection
+/// (read as one head, an interim head's empty line ended the field scan
+/// before the final head's `Connection` was reached).
+#[must_use]
+pub fn head_says_close(head: &[u8]) -> bool {
+    // Interim heads come first, so the region holds one exactly when its
+    // first status is 1xx (`HTTP/1.x 1…`): an answer without pays nothing.
+    if head.get(9) != Some(&b'1') {
+        return one_head_says_close(head);
+    }
+    let mut rest = head;
+    // Every head but the last ends in an empty line with more after it.
+    while let Some(i) = memchr::memmem::find(rest, b"\r\n\r\n") {
+        if i + 4 >= rest.len() {
+            break;
+        }
+        if one_head_says_close(&rest[..i + 4]) {
+            return true;
+        }
+        rest = &rest[i + 4..];
+    }
+    one_head_says_close(rest)
+}
 
-    // Content-Length takes precedence; else Transfer-Encoding: chunked;
-    // else close-delimited.
-    let framing = if let Some(len) = find_content_length(headers) {
-        BodyFraming::ContentLength(len)
-    } else if find_chunked(headers) {
-        BodyFraming::Chunked
+/// [`head_says_close`] for ONE head.
+fn one_head_says_close(head: &[u8]) -> bool {
+    let Some(status_end) = memchr::memmem::find(head, b"\r\n") else {
+        return true;
+    };
+    let headers = if head.len() >= status_end + 4 {
+        &head[status_end + 2..head.len() - 2]
     } else {
-        BodyFraming::CloseDelimited
+        &head[..0]
     };
-
-    let body_start = header_end;
-    let body_end = match framing {
-        BodyFraming::ContentLength(len) => body_start.saturating_add(len as usize),
-        BodyFraming::Chunked | BodyFraming::CloseDelimited => buf.len(),
-    };
-
-    HttpResult::Complete {
-        status,
-        header_end,
-        body_start,
-        body_end,
-        framing,
+    let http10 = head.starts_with(b"HTTP/1.0 ");
+    match find_header_value(headers, b"connection") {
+        Some(v) => {
+            if has_token(v, b"close") {
+                true
+            } else {
+                http10 && !has_token(v, b"keep-alive")
+            }
+        }
+        None => http10,
     }
+}
+
+/// A case-insensitive token in a comma-separated header value.
+fn has_token(value: &[u8], token: &[u8]) -> bool {
+    let bytes = trim_ascii(value);
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i <= bytes.len() {
+        if i == bytes.len() || bytes[i] == b',' {
+            if eq_ignore_ascii_case(trim_ascii(&bytes[start..i]), token) {
+                return true;
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Find the end of the header region. Returns the offset *after* the
@@ -327,25 +638,7 @@ fn find_content_length(headers: &[u8]) -> Option<u64> {
 /// case-insensitive `chunked`). Returns `true` on match.
 fn find_chunked(headers: &[u8]) -> bool {
     match find_header_value(headers, b"transfer-encoding") {
-        Some(v) => {
-            let trimmed = trim_ascii(v);
-            // Value may be a comma-separated list; check each token.
-            let mut start = 0usize;
-            let mut i = 0usize;
-            let bytes = trimmed;
-            while i <= bytes.len() {
-                let at_boundary = i == bytes.len() || bytes[i] == b',';
-                if at_boundary {
-                    let token = trim_ascii(&bytes[start..i]);
-                    if eq_ignore_ascii_case(token, b"chunked") {
-                        return true;
-                    }
-                    start = i + 1;
-                }
-                i += 1;
-            }
-            false
-        }
+        Some(v) => has_token(v, b"chunked"),
         None => false,
     }
 }
@@ -440,15 +733,91 @@ pub enum DechunkResult {
 /// In-place decode of `Transfer-Encoding: chunked`. Writes the decoded
 /// body over the top of `buf` (so `buf[..length]` is the payload). Zero
 /// alloc.
+///
+/// **`buf` is untouched unless the result is `Complete`** (HYPARB H8):
+/// the framing is walked once read-only and decoded only when it is
+/// whole, so a caller that is still filling its buffer can call this on
+/// every read and retry on `Incomplete` — the first cut shifted chunks
+/// left before discovering the tail was missing, which is harmless to a
+/// read-to-EOF caller and corrupting to an incremental one.
 pub fn dechunk_in_place(buf: &mut [u8]) -> DechunkResult {
+    match walk_chunks(buf, false, 0).res {
+        DechunkResult::Complete { .. } => walk_chunks(buf, true, 0).res,
+        other => other,
+    }
+}
+
+/// Where [`chunked_body`] left a chunked body's payload.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ChunkedBody {
+    /// The decoded payload is `buf[start..start + len]`.
+    Span {
+        /// Offset of the payload's first byte within `buf`.
+        start: usize,
+        /// Payload length.
+        len: usize,
+    },
+    /// Not enough bytes yet; `buf` is untouched — read more and retry.
+    Incomplete,
+    /// Malformed chunk framing.
+    Malformed,
+}
+
+/// [`dechunk_in_place`] without the moves that are not needed (HYPARB
+/// H9, the zero-copy review): the payload is assembled where its FIRST
+/// data chunk already lies — a one-chunk body (what a JSON-RPC endpoint
+/// sends for a small answer) moves no byte at all, and a multi-chunk
+/// body moves only chunks 2.. left over the framing, onto the end of
+/// chunk 1. `buf` is untouched unless the result is a `Span`, so an
+/// incremental reader retries on `Incomplete`.
+pub fn chunked_body(buf: &mut [u8]) -> ChunkedBody {
+    let w = walk_chunks(buf, false, 0);
+    match w.res {
+        DechunkResult::Complete { length } if w.chunks <= 1 => ChunkedBody::Span {
+            start: w.first,
+            len: length,
+        },
+        DechunkResult::Complete { .. } => match walk_chunks(buf, true, w.first).res {
+            DechunkResult::Complete { length } => ChunkedBody::Span {
+                start: w.first,
+                len: length,
+            },
+            DechunkResult::Incomplete => ChunkedBody::Incomplete,
+            DechunkResult::Malformed => ChunkedBody::Malformed,
+        },
+        DechunkResult::Incomplete => ChunkedBody::Incomplete,
+        DechunkResult::Malformed => ChunkedBody::Malformed,
+    }
+}
+
+/// One pass of [`walk_chunks`]: the verdict, the first data chunk's
+/// offset and the number of non-empty data chunks.
+struct Walk {
+    res: DechunkResult,
+    first: usize,
+    chunks: u32,
+}
+
+#[inline(always)]
+const fn done(res: DechunkResult, first: usize, chunks: u32) -> Walk {
+    Walk { res, first, chunks }
+}
+
+/// The chunk walker behind [`dechunk_in_place`] and [`chunked_body`]:
+/// validates the framing and, with `copy`, shifts each chunk body left
+/// over the framing, assembling the payload from `write0` (at most the
+/// first chunk's own offset). `length` is the payload's length.
+fn walk_chunks(buf: &mut [u8], copy: bool, write0: usize) -> Walk {
     let mut read: usize = 0;
-    let mut write: usize = 0;
+    let mut write: usize = write0;
+    let mut first: usize = 0;
+    let mut chunks: u32 = 0;
     loop {
         // Find \r\n after the chunk-size hex digits.
         let remain = &buf[read..];
         let crlf = match memchr::memmem::find(remain, b"\r\n") {
             Some(n) => n,
-            None => return DechunkResult::Incomplete,
+            None => return done(DechunkResult::Incomplete, first, chunks),
         };
         // Parse size as hex (allow chunk extensions after ';').
         let size_bytes = match memchr::memchr(b';', &remain[..crlf]) {
@@ -457,30 +826,54 @@ pub fn dechunk_in_place(buf: &mut [u8]) -> DechunkResult {
         };
         let size = match parse_hex_u64(size_bytes) {
             Some(n) => n as usize,
-            None => return DechunkResult::Malformed,
+            None => return done(DechunkResult::Malformed, first, chunks),
         };
         let chunk_data = read + crlf + 2;
         if size == 0 {
             // Terminator: expect one more \r\n.
             let need = chunk_data + 2;
             if buf.len() < need {
-                return DechunkResult::Incomplete;
+                return done(DechunkResult::Incomplete, first, chunks);
             }
             if &buf[chunk_data..chunk_data + 2] != b"\r\n" {
-                return DechunkResult::Malformed;
+                return done(DechunkResult::Malformed, first, chunks);
             }
-            return DechunkResult::Complete { length: write };
+            return done(
+                DechunkResult::Complete {
+                    length: write - write0,
+                },
+                first,
+                chunks,
+            );
         }
-        let chunk_end = chunk_data + size;
+        // A size no buffer can hold is MALFORMED, never wrapped (fuzz,
+        // HYPARB H9: `fffffffffffffffe` wrapped `chunk_end` below
+        // `chunk_data`, the framing check then read the size line's own
+        // CRLF and passed, and the copy pass panicked on an inverted
+        // range — a process abort in release, from any chunked answer).
+        let Some(chunk_end) = chunk_data.checked_add(size) else {
+            return done(DechunkResult::Malformed, first, chunks);
+        };
         // +2 for the trailing CRLF after the chunk body.
-        if buf.len() < chunk_end + 2 {
-            return DechunkResult::Incomplete;
+        let Some(chunk_tail) = chunk_end.checked_add(2) else {
+            return done(DechunkResult::Malformed, first, chunks);
+        };
+        if buf.len() < chunk_tail {
+            return done(DechunkResult::Incomplete, first, chunks);
         }
         if &buf[chunk_end..chunk_end + 2] != b"\r\n" {
-            return DechunkResult::Malformed;
+            return done(DechunkResult::Malformed, first, chunks);
         }
-        // Copy chunk body left, skipping headers.
-        if chunk_data != write {
+        if chunks == 0 {
+            first = chunk_data;
+        }
+        chunks += 1;
+        // COPY: each chunk body after the payload's start (≤ the caller's
+        // response buffer), shifted left over its framing ONCE — the
+        // payload must be contiguous for the byte scanners — rejected: a
+        // segmented scan over chunk spans (every scanner would need a
+        // split-token path). `chunked_body` never moves chunk 1.
+        if copy && chunk_data != write {
             buf.copy_within(chunk_data..chunk_end, write);
         }
         write += size;
@@ -615,6 +1008,29 @@ mod tests {
         }
     }
 
+    /// HK4: the contract the `http1_response` fuzz target now holds — a
+    /// Content-Length body only partly buffered still reports its whole end
+    /// (`body_start + n`, past the buffer); the caller reads more while
+    /// `body_end > buf.len()`.
+    #[test]
+    fn read_response_partly_buffered_content_length_reports_its_whole_end() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc";
+        match read_response(raw) {
+            HttpResult::Complete {
+                body_start,
+                body_end,
+                framing,
+                ..
+            } => {
+                assert_eq!(framing, BodyFraming::ContentLength(10));
+                assert_eq!(body_start, raw.len() - 3);
+                assert_eq!(body_end, body_start + 10);
+                assert!(body_end > raw.len(), "the caller must read more");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
     #[test]
     fn read_response_chunked_flag_detected() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
@@ -640,6 +1056,93 @@ mod tests {
         }
     }
 
+    /// HD2: a 204 ends at its blank line, whatever its headers say — a
+    /// keep-alive client never waits for a body it cannot have.
+    #[test]
+    fn read_response_a_204_has_no_body() {
+        for raw in [
+            &b"HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n"[..],
+            &b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+            &b"HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n"[..],
+        ] {
+            match read_response(raw) {
+                HttpResult::Complete {
+                    status,
+                    header_end,
+                    body_start,
+                    body_end,
+                    framing,
+                } => {
+                    assert_eq!(status, 204);
+                    assert_eq!(framing, BodyFraming::ContentLength(0));
+                    assert_eq!((body_start, body_end), (header_end, header_end));
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    /// HD2: interim (1xx) answers before the final one are skipped — the
+    /// status, framing and body are the final answer's — and any head
+    /// that says close ends the connection. Only interim heads so far is
+    /// `Incomplete`; a `101` is `Malformed`.
+    #[test]
+    fn read_response_skips_interim_answers() {
+        let raw = b"HTTP/1.1 100 Continue\r\n\r\n\
+                    HTTP/1.1 103 Early Hints\r\nLink: </a>; rel=preload\r\n\r\n\
+                    HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok";
+        match read_response(raw) {
+            HttpResult::Complete {
+                status,
+                header_end,
+                body_start,
+                body_end,
+                framing,
+            } => {
+                assert_eq!(status, 200);
+                assert_eq!(framing, BodyFraming::ContentLength(2));
+                assert_eq!(body_start, header_end);
+                assert_eq!(&raw[body_start..body_end], b"ok");
+                assert!(
+                    head_says_close(&raw[..header_end]),
+                    "the final head says close"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let kept = b"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n\
+                     HTTP/1.1 204 No Content\r\n\r\n";
+        match read_response(kept) {
+            HttpResult::Complete {
+                status: 204,
+                header_end,
+                ..
+            } => assert!(!head_says_close(&kept[..header_end]), "kept alive"),
+            other => panic!("unexpected {other:?}"),
+        }
+        // An interim head that says close retires the connection too.
+        let interim_close = b"HTTP/1.1 103 Early Hints\r\nConnection: close\r\n\r\n\
+                              HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        match read_response(interim_close) {
+            HttpResult::Complete {
+                status: 200,
+                header_end,
+                ..
+            } => assert!(head_says_close(&interim_close[..header_end]), "any head"),
+            other => panic!("unexpected {other:?}"),
+        }
+        // Only interim heads so far: the final answer is still to come.
+        assert_eq!(
+            read_response(b"HTTP/1.1 100 Continue\r\n\r\n"),
+            HttpResult::Incomplete
+        );
+        let partial = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n";
+        assert_eq!(read_response(partial), HttpResult::Incomplete);
+        // Nothing through this parser asks to switch protocols.
+        let upgrade = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+        assert_eq!(read_response(upgrade), HttpResult::Malformed);
+    }
+
     #[test]
     fn read_response_rejects_malformed_status_line() {
         let r = read_response(b"HTTP/2.0 200 OK\r\n\r\n");
@@ -650,6 +1153,20 @@ mod tests {
     fn read_response_rejects_3xx_redirect() {
         let r = read_response(b"HTTP/1.1 301 Moved\r\nLocation: /x\r\n\r\n");
         assert_eq!(r, HttpResult::Malformed);
+    }
+
+    #[test]
+    fn dechunk_in_place_leaves_an_incomplete_buffer_untouched() {
+        let raw = b"5\r\nhello\r\n6\r\n world\r\n0\r\n";
+        let mut buf = raw.to_vec();
+        assert_eq!(dechunk_in_place(&mut buf), DechunkResult::Incomplete);
+        assert_eq!(&buf[..], &raw[..], "no chunk was shifted");
+        buf.extend_from_slice(b"\r\n");
+        assert_eq!(
+            dechunk_in_place(&mut buf),
+            DechunkResult::Complete { length: 11 }
+        );
+        assert_eq!(&buf[..11], b"hello world");
     }
 
     #[test]
@@ -699,6 +1216,100 @@ mod tests {
         assert_eq!(
             dechunk_in_place(&mut buf[..raw.len()]),
             DechunkResult::Malformed
+        );
+    }
+
+    #[test]
+    fn chunked_body_returns_a_single_chunk_where_it_lies() {
+        let raw = b"5\r\nhello\r\n0\r\n\r\n";
+        let mut buf = raw.to_vec();
+        assert_eq!(
+            chunked_body(&mut buf),
+            ChunkedBody::Span { start: 3, len: 5 }
+        );
+        assert_eq!(&buf[..], &raw[..], "no byte moved");
+        assert_eq!(&buf[3..8], b"hello");
+    }
+
+    #[test]
+    fn chunked_body_moves_only_the_chunks_after_the_first() {
+        let mut buf = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec();
+        assert_eq!(
+            chunked_body(&mut buf),
+            ChunkedBody::Span { start: 3, len: 11 }
+        );
+        assert_eq!(
+            &buf[3..14],
+            b"hello world",
+            "chunk 1 stayed; chunk 2 joined it"
+        );
+    }
+
+    /// Fuzz, HYPARB H9: a chunk size near `usize::MAX` used to wrap the
+    /// chunk's end below its start and abort the process in the copy
+    /// pass. Now it is malformed, whatever the bytes after it.
+    #[test]
+    fn a_chunk_size_that_wraps_is_malformed_not_an_abort() {
+        let mut i = 0;
+        while i < 3 {
+            let size = ["fffffffffffffffe", "ffffffffffffffff", "fffffffffffffff0"][i];
+            let raw = format!("{size}\r\nabc\r\n0\r\n\r\n");
+            let mut a = raw.as_bytes().to_vec();
+            assert_eq!(dechunk_in_place(&mut a), DechunkResult::Malformed, "{size}");
+            let mut b = raw.as_bytes().to_vec();
+            assert_eq!(chunked_body(&mut b), ChunkedBody::Malformed, "{size}");
+            assert_eq!(&b[..], raw.as_bytes(), "untouched");
+            // …and as a SECOND chunk, after a good one.
+            let raw2 = format!("3\r\nabc\r\n{size}\r\nxyz\r\n0\r\n\r\n");
+            let mut c = raw2.as_bytes().to_vec();
+            assert_eq!(chunked_body(&mut c), ChunkedBody::Malformed, "{size}");
+            i += 1;
+        }
+        // A size that fits usize but not the buffer is only incomplete.
+        let mut d = b"ffffff\r\nabc".to_vec();
+        assert_eq!(dechunk_in_place(&mut d), DechunkResult::Incomplete);
+    }
+
+    #[test]
+    fn chunked_body_failure_modes_leave_the_buffer_untouched() {
+        let raw = b"5\r\nhello\r\n6\r\n world\r\n0\r\n";
+        let mut buf = raw.to_vec();
+        assert_eq!(chunked_body(&mut buf), ChunkedBody::Incomplete);
+        assert_eq!(&buf[..], &raw[..]);
+        let mut bad = b"zz\r\nhello\r\n0\r\n\r\n".to_vec();
+        assert_eq!(chunked_body(&mut bad), ChunkedBody::Malformed);
+        let mut empty = b"0\r\n\r\n".to_vec();
+        assert_eq!(
+            chunked_body(&mut empty),
+            ChunkedBody::Span { start: 0, len: 0 }
+        );
+    }
+
+    #[test]
+    fn head_says_close_reads_the_connection_token() {
+        let head = |s: &str| s.as_bytes().to_vec();
+        assert!(!head_says_close(&head(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"
+        )));
+        assert!(!head_says_close(&head(
+            "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n"
+        )));
+        assert!(head_says_close(&head(
+            "HTTP/1.1 200 OK\r\nconnection: Close\r\n\r\n"
+        )));
+        assert!(head_says_close(&head(
+            "HTTP/1.1 200 OK\r\nConnection: upgrade, close\r\n\r\n"
+        )));
+        assert!(
+            head_says_close(&head("HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n")),
+            "1.0 closes by default"
+        );
+        assert!(!head_says_close(&head(
+            "HTTP/1.0 200 OK\r\nConnection: keep-alive\r\n\r\n"
+        )));
+        assert!(
+            head_says_close(b"garbage"),
+            "an unreadable head is not reused"
         );
     }
 
@@ -761,6 +1372,41 @@ mod proptests {
             }
         }
 
+        /// `chunked_body` names exactly the payload `dechunk_in_place`
+        /// produces, for any split of any payload into chunks.
+        #[test]
+        fn chunked_body_agrees_with_dechunk_in_place(
+            payload in proptest::collection::vec(any::<u8>(), 0..512),
+            cuts in proptest::collection::vec(1usize..64, 0..8),
+        ) {
+            let mut wire = Vec::new();
+            let mut at = 0usize;
+            let mut k = 0usize;
+            while at < payload.len() {
+                let n = if k < cuts.len() { cuts[k].min(payload.len() - at) } else { payload.len() - at };
+                wire.extend_from_slice(format!("{n:x}\r\n").as_bytes());
+                wire.extend_from_slice(&payload[at..at + n]);
+                wire.extend_from_slice(b"\r\n");
+                at += n;
+                k += 1;
+            }
+            wire.extend_from_slice(b"0\r\n\r\n");
+            let mut a = wire.clone();
+            let mut b = wire;
+            let len = match dechunk_in_place(&mut a) {
+                DechunkResult::Complete { length } => length,
+                other => return Err(TestCaseError::fail(format!("{other:?}"))),
+            };
+            match chunked_body(&mut b) {
+                ChunkedBody::Span { start, len: l } => {
+                    prop_assert_eq!(l, len);
+                    prop_assert_eq!(&b[start..start + l], &a[..len]);
+                    prop_assert_eq!(&a[..len], &payload[..]);
+                }
+                other => return Err(TestCaseError::fail(format!("{other:?}"))),
+            }
+        }
+
         /// `write_get_request` is panic-free across host/path
         /// shapes and either succeeds writing ≤ buf.len() bytes
         /// or returns `BufferTooSmall`.
@@ -776,6 +1422,7 @@ mod proptests {
             match res {
                 Ok(n) => prop_assert!(n <= buf.len()),
                 Err(HttpErr::BufferTooSmall) => {}
+                Err(HttpErr::BadHead) => prop_assert!(false, "well-formed fields are never BadHead"),
             }
         }
 
@@ -809,6 +1456,62 @@ mod proptests {
                     prop_assert!(buf[..header_len].ends_with(b"\r\n\r\n"));
                 }
                 Err(HttpErr::BufferTooSmall) => {}
+                Err(HttpErr::BadHead) => prop_assert!(false, "well-formed fields are never BadHead"),
+            }
+        }
+
+        /// HC2: for ANY field bytes the generic head writer never
+        /// panics; the head it sizes is the head it renders; a head that
+        /// renders ends in exactly one blank line and carries exactly
+        /// `2 + extra` header-terminating CRLFs past the request line —
+        /// no field can smuggle a line in; and a CR / LF / NUL anywhere
+        /// is `BadHead`.
+        #[test]
+        fn write_request_head_is_sized_bounded_and_injection_proof(
+            method in 0u8..4,
+            target in proptest::collection::vec(any::<u8>(), 0..96),
+            host in proptest::collection::vec(any::<u8>(), 0..48),
+            names in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..16), 0..3),
+            value in proptest::collection::vec(any::<u8>(), 0..48),
+            body_len in 0usize..100_000,
+            keep_alive in any::<bool>(),
+            buf_size in 0usize..1024,
+        ) {
+            let method = [Method::Get, Method::Post, Method::Put, Method::Delete][method as usize];
+            let extra: Vec<Header<'_>> = names.iter().map(|n| (&n[..], &value[..])).collect();
+            let head = ReqHead {
+                method,
+                host: &host,
+                target: &target,
+                user_agent: b"t/1",
+                content_type: Some(b"application/json"),
+                extra: &extra,
+                keep_alive,
+            };
+            let mut buf = vec![0u8; buf_size];
+            let sized = request_head_len(&head, body_len);
+            let res = write_request_head(&mut buf, &head, body_len);
+            let dirty = |v: &[u8]| v.iter().any(|&b| b == b'\r' || b == b'\n' || b == 0);
+            let injected = dirty(&target) || dirty(&host) || dirty(&value)
+                || names.iter().any(|n| dirty(n));
+            match (sized, res) {
+                (Ok(len), Ok(n)) => {
+                    prop_assert!(!injected);
+                    prop_assert_eq!(len, n);
+                    let h = &buf[..n];
+                    prop_assert!(h.ends_with(b"\r\n\r\n"));
+                    let crlfs = memchr::memmem::find_iter(h, b"\r\n").count();
+                    // request line + Host + UA + Accept + A-E + C-T
+                    // [+ C-L] + extras + Connection + the blank line.
+                    let has_cl = !matches!(method, Method::Get) || body_len > 0;
+                    prop_assert_eq!(crlfs, 7 + usize::from(has_cl) + extra.len() + 1);
+                }
+                (Ok(len), Err(HttpErr::BufferTooSmall)) => prop_assert!(len > buf.len()),
+                (Err(HttpErr::BadHead), Err(HttpErr::BadHead)) => {}
+                (a, b) => prop_assert!(false, "sized {a:?} vs rendered {b:?}"),
+            }
+            if injected {
+                prop_assert_eq!(request_head_len(&head, body_len), Err(HttpErr::BadHead));
             }
         }
     }

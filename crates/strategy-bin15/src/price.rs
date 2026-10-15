@@ -9,6 +9,14 @@
 //! the two expensive transcendentals (`exp`, `ln`) are NOT here — they
 //! run once per minute per underlying inside `core-vol` and arrive as
 //! `sig2_min_1e18`.
+//!
+//! **BIN15 S3 — the venue's settlement, priced.** The venue settles on
+//! the TWAP of the underlying's mark over `[T − W, T]` (LAW E-11,
+//! `docs/risk-policy.md` "E8"). [`pricing_horizon_ns`] is the variance-time
+//! of that average seen from `τ = T − t`, and [`fair_value_twap`] prices
+//! the binary from anywhere in its life: [`fair_value`] at that horizon
+//! while the window lies ahead, and the RUNNING-TWAP law inside it, where
+//! part of the average is already decided (ruling O-2).
 
 use core_regime::math::{floor_div, isqrt_i128};
 
@@ -203,16 +211,24 @@ pub struct Fair {
     /// 1e6 is indistinguishable between the two, and telling them
     /// apart previously needed an offline replay of the run.
     pub den_1e9: i64,
+    /// BIN15 S3: the pricing horizon this price was computed at, ns —
+    /// `tau_ns` for [`fair_value`], [`pricing_horizon_ns`] for
+    /// [`fair_value_twap`]. It picked the recalibration phase, and the
+    /// member records it rather than re-deriving it (`last_tau_ns`, the
+    /// ledger's `tau_ns`).
+    pub horizon_ns: u64,
 }
 
-/// Price one binary.
+/// Price one binary at a pricing horizon.
 ///
 /// * `mark_1e6` — the UNDERLYING's mark, ×1e6.
 /// * `strike_1e6` — the instance's threshold, ×1e6.
-/// * `tau_ns` — the pricing horizon: time to expiry plus a third of the
-///   settlement TWAP window, because a TWAP-settled binary is not
-///   decided at `T` but averaged over `[T, T + twap]`, and the mean of
-///   a Brownian average over that window has a third of its variance.
+/// * `tau_ns` — the pricing horizon, the variance-time the settlement is
+///   still exposed to: [`pricing_horizon_ns`] for a TWAP-settled family
+///   (BIN15 S3 — `τ − 2W/3` while the window lies ahead), the time to
+///   expiry for one that settles at `T`. [`fair_value_twap`] is the
+///   member's entry point; this is the law it reduces to outside the
+///   window, and what the parity fixture pins.
 /// * `sig2_min_1e18` — per-minute variance of log-price, `σ_min² ×1e18`,
 ///   from `core-vol`'s once-a-minute `sigma_hat_1e9`.
 ///
@@ -242,6 +258,13 @@ pub fn fair_value(
     }
     let d_1e6 = floor_div(x_1e9 as i128 * 1_000_000, den_1e9 as i128) as i64;
     let d_1e6 = d_1e6.clamp(-D_CLAMP_1E6, D_CLAMP_1E6);
+    Some(fair_of_d(luts, d_1e6, den_1e9, tau_ns))
+}
+
+/// `d` → Φ → recalibration at `horizon_ns`'s phase: the tail every
+/// pricing law shares.
+#[inline(always)]
+fn fair_of_d(luts: &Bin15Luts, d_1e6: i64, den_1e9: i64, horizon_ns: u64) -> Fair {
     // Φ is tabulated on the non-negative half only; the other half is
     // its reflection, which is exact rather than an approximation.
     let p_raw_1e6 = if d_1e6 >= 0 {
@@ -249,13 +272,146 @@ pub fn fair_value(
     } else {
         1_000_000 - luts.phi_1e6(-d_1e6)
     };
-    let p_hat_1e6 = luts.recal_1e6(phase_of(tau_ns), p_raw_1e6);
-    Some(Fair {
+    let p_hat_1e6 = luts.recal_1e6(phase_of(horizon_ns), p_raw_1e6);
+    Fair {
         p_hat_1e6: p_hat_1e6.clamp(0, 1_000_000),
         p_raw_1e6,
         d_1e6,
         den_1e9,
-    })
+        horizon_ns,
+    }
+}
+
+/// BIN15 S3: the pricing horizon of a TWAP-settled binary, ns — the
+/// variance-time its settlement is still exposed to, `to_expiry_ns`
+/// before the expiry.
+///
+/// The venue settles on the mean mark over `[T − W, T]`. For a Brownian
+/// log-price with variance σ² per unit time, the variance of that mean
+/// seen from `t` (τ = T − t):
+///
+/// * τ ≥ W — the window lies wholly ahead: the mean is the price at
+///   `T − W` plus the average of W more of the path, so
+///   `Var = σ²(τ − W) + σ²·W/3 = σ²·(τ − 2W/3)`.
+/// * τ < W — inside the window: only the part of the average still ahead
+///   is uncertain, `(1/W)·∫_t^T`, so `Var = σ²·τ³/(3W²)`; the part
+///   already behind shifts the MEAN, which [`fair_value_twap`] carries.
+/// * W = 0 — a family that settles AT `T`: τ itself.
+///
+/// Continuous at τ = W (both W/3). Integer and exact to the nanosecond
+/// the division floors to: `⌊2W/3⌋` is formed without `2W` (no overflow
+/// for any `u64`), and the cube as `⌊⌊τ²/W⌋·τ / 3W⌋` in `u128` (no
+/// intermediate past `τ²`, since τ < W). Until S3 the member priced
+/// `τ + W/3` — a window AFTER the expiry — 60 s too long.
+#[inline]
+#[must_use]
+pub const fn pricing_horizon_ns(to_expiry_ns: u64, twap_ns: u64) -> u64 {
+    if twap_ns == 0 {
+        return to_expiry_ns;
+    }
+    if to_expiry_ns >= twap_ns {
+        let two_thirds = (twap_ns / 3) * 2 + ((twap_ns % 3) * 2) / 3;
+        return to_expiry_ns - two_thirds;
+    }
+    let t = to_expiry_ns as u128;
+    let w = twap_ns as u128;
+    ((t * t / w) * t / (3 * w)) as u64
+}
+
+/// BIN15 S3: the running-TWAP moneyness ×1e9 — the excess of the
+/// settlement average over the strike, in units of the current mark,
+/// when `a_known_px_ns` of the window is already behind.
+///
+/// `X = A_known + τ·S − W·K` (mark ×1e6 · ns) is how far the average's
+/// integral would clear `W·K` if the mark stayed where it is;
+/// `m = X / (S·W)`. At the window's open (A = 0, τ = W) this is
+/// `(S − K)/S` — the log-moneyness to first order — so the two sides of
+/// [`fair_value_twap`] meet. `None` on a non-positive price or window, on
+/// arithmetic that would overflow `i128` (a nonsense `A`), or when
+/// `|m|` leaves [`U_CLAMP_1E9`] (the same band [`log_moneyness_1e9`]
+/// refuses outside — ABSENT DATA HOLDS).
+#[inline]
+#[must_use]
+pub fn twap_moneyness_1e9(
+    a_known_px_ns: i128,
+    mark_1e6: i64,
+    strike_1e6: i64,
+    to_expiry_ns: u64,
+    twap_ns: u64,
+) -> Option<i64> {
+    if mark_1e6 <= 0 || strike_1e6 <= 0 || twap_ns == 0 {
+        return None;
+    }
+    let s = mark_1e6 as i128;
+    let w = twap_ns as i128;
+    let x = a_known_px_ns
+        .checked_add((to_expiry_ns as i128).checked_mul(s)?)?
+        .checked_sub(w.checked_mul(strike_1e6 as i128)?)?;
+    let m = floor_div(x.checked_mul(1_000_000_000)?, s.checked_mul(w)?);
+    if !(-U_CLAMP_1E9..=U_CLAMP_1E9).contains(&m) {
+        return None;
+    }
+    i64::try_from(m).ok()
+}
+
+/// BIN15 S3 (ruling O-2): price one binary on the venue's own settlement
+/// — the TWAP of the underlying's mark over `[T − W, T]` — from anywhere
+/// in its life.
+///
+/// * The window lies ahead (`to_expiry_ns ≥ twap_ns`, or `twap_ns == 0`):
+///   [`fair_value`] at [`pricing_horizon_ns`] (`τ − 2W/3`).
+/// * Inside the window: `a_known_px_ns = ∫_{T−W}^{t} S du` (mark ×1e6 ·
+///   ns, the member's running sum, last mark carried forward) has decided
+///   part of the average. ITM ⇔ `A + ∫_t^T S du ≥ W·K`; with
+///   `∫_t^T S du ≈ τ·S + S·σ·∫_0^τ B_s ds` (variance `S²σ²τ³/3`) the
+///   standardised distance is `d = X / (S·σ·√(τ³/3))`, computed as the
+///   moneyness [`twap_moneyness_1e9`] over `σ_min·√(horizon)` with the
+///   horizon `τ³/(3W²)` — the same variance stated per unit of the
+///   average. As τ → 0 the horizon → 0 and `d` → the clamp on the side of
+///   `m` (`>=` settles ITM): the known part IS the answer.
+///
+/// Outside the window `None` exactly where [`fair_value`] refuses. Inside
+/// it `None` on a cold forecast (σ² ≤ 0) or where [`twap_moneyness_1e9`]
+/// refuses; a variance that floors to zero is NOT a refusal there —
+/// nothing is left uncertain, and `d` is the clamp on `m`'s side.
+#[inline]
+#[must_use]
+pub fn fair_value_twap(
+    luts: &Bin15Luts,
+    mark_1e6: i64,
+    strike_1e6: i64,
+    to_expiry_ns: u64,
+    twap_ns: u64,
+    a_known_px_ns: i128,
+    sig2_min_1e18: i128,
+) -> Option<Fair> {
+    if twap_ns == 0 || to_expiry_ns >= twap_ns {
+        return fair_value(
+            luts,
+            mark_1e6,
+            strike_1e6,
+            pricing_horizon_ns(to_expiry_ns, twap_ns),
+            sig2_min_1e18,
+        );
+    }
+    if sig2_min_1e18 <= 0 {
+        return None;
+    }
+    let m_1e9 = twap_moneyness_1e9(a_known_px_ns, mark_1e6, strike_1e6, to_expiry_ns, twap_ns)?;
+    let horizon = pricing_horizon_ns(to_expiry_ns, twap_ns);
+    let var_1e18 = sig2_min_1e18.saturating_mul(horizon as i128) / 60_000_000_000;
+    let den_1e9 = isqrt_i128(var_1e18);
+    let d_1e6 = if den_1e9 <= 0 {
+        if m_1e9 >= 0 {
+            D_CLAMP_1E6
+        } else {
+            -D_CLAMP_1E6
+        }
+    } else {
+        (floor_div(m_1e9 as i128 * 1_000_000, den_1e9 as i128) as i64)
+            .clamp(-D_CLAMP_1E6, D_CLAMP_1E6)
+    };
+    Some(fair_of_d(luts, d_1e6, den_1e9, horizon))
 }
 
 /// Round `px_1e6` DOWN to the venue's 1e-4 grid.
@@ -464,6 +620,97 @@ mod tests {
         assert_eq!(ceil_grid_1e6(-50, 100) % 100, 0);
         assert!(floor_grid_1e6(-50, 100) <= -50);
         assert!(ceil_grid_1e6(-50, 100) >= -50);
+    }
+
+    /// BIN15 S3: the horizon of a TWAP ENDING at `T`.
+    #[test]
+    fn the_pricing_horizon_is_the_variance_time_of_a_twap_ending_at_expiry() {
+        const S: u64 = 1_000_000_000;
+        const W: u64 = 60 * S;
+        // The window ahead: τ − 2W/3 = τ − 40 s at W = 60 s.
+        assert_eq!(pricing_horizon_ns(900 * S, W), 860 * S);
+        assert_eq!(pricing_horizon_ns(120 * S, W), 80 * S);
+        assert_eq!(pricing_horizon_ns(W, W), 20 * S, "W/3 at the open");
+        // Inside: the cubic τ³/(3W²) — 30 s left ⇒ 30³/(3·60²) = 2.5 s.
+        assert_eq!(pricing_horizon_ns(30 * S, W), 2_500_000_000);
+        // Continuous at the open to within the floor of the division.
+        let just_inside = pricing_horizon_ns(W - 1, W);
+        assert!((20 * S).abs_diff(just_inside) < 2, "{just_inside}");
+        // Nothing left, nothing uncertain.
+        assert_eq!(pricing_horizon_ns(0, W), 0);
+        // A family settling AT `T` keeps τ.
+        assert_eq!(pricing_horizon_ns(123_456, 0), 123_456);
+        // No overflow at the extremes the wire allows (u16 seconds).
+        let w_max = 65_535 * S;
+        assert_eq!(pricing_horizon_ns(u64::MAX, w_max), u64::MAX - (2 * w_max) / 3);
+        assert!(pricing_horizon_ns(w_max - 1, w_max) <= w_max / 3);
+    }
+
+    /// BIN15 S3: at τ = 120 s the old horizon (τ + W/3 = 140 s) and the
+    /// venue's (τ − 2W/3 = 80 s) differ by √(140/80) in `d` — the factor
+    /// the late-life belief was too timid by. Asserted by formula.
+    #[test]
+    fn the_horizon_moves_d_by_the_ratio_of_the_two_variance_times() {
+        let l = normal_luts();
+        let sig2 = 1_000_000_000_000i128;
+        let k = 79_000_000_000i64;
+        let mark = k + 100_000_000; // ~12.7 bps above
+        let old = fair_value(&l, mark, k, 140_000_000_000, sig2).expect("old");
+        let new = fair_value_twap(&l, mark, k, 120_000_000_000, 60_000_000_000, 0, sig2)
+            .expect("new");
+        let want = old.d_1e6 as f64 * (140.0f64 / 80.0).sqrt();
+        assert!(
+            (new.d_1e6 as f64 - want).abs() <= 2.0,
+            "d {} vs {} × √(140/80) = {want}",
+            new.d_1e6,
+            old.d_1e6
+        );
+        assert!(new.p_raw_1e6 > old.p_raw_1e6, "the same lead is surer, later");
+        assert_eq!(old.horizon_ns, 140_000_000_000, "fair_value keeps the τ it was given");
+        assert_eq!(new.horizon_ns, 80_000_000_000, "and the TWAP law reports its horizon");
+    }
+
+    /// BIN15 S3 (O-2): inside the window the part of the average already
+    /// behind decides — a TWAP known well above the strike wins even when
+    /// the mark has just dipped under it, and vice versa.
+    #[test]
+    fn inside_the_window_the_known_average_moves_the_price() {
+        let l = normal_luts();
+        let sig2 = 1_000_000_000_000i128;
+        let k = 79_000_000_000i64;
+        const S: u64 = 1_000_000_000;
+        let w = 60 * S;
+        let tau = 20 * S;
+        // 40 s behind at +0.5 % over the strike; the mark now 0.1 % under.
+        let above = (k + k / 200) as i128 * (40 * S) as i128;
+        let mark = k - k / 1_000;
+        let f = fair_value_twap(&l, mark, k, tau, w, above, sig2).expect("f");
+        assert!(f.p_hat_1e6 > 990_000, "the known part wins: {}", f.p_hat_1e6);
+        // The mirror: 40 s behind at −0.5 %, the mark 0.1 % over.
+        let below = (k - k / 200) as i128 * (40 * S) as i128;
+        let g = fair_value_twap(&l, k + k / 1_000, k, tau, w, below, sig2).expect("g");
+        assert!(g.p_hat_1e6 < 10_000, "the known part loses: {}", g.p_hat_1e6);
+        // At the open (nothing behind) the two branches meet: the
+        // running-TWAP moneyness is the log-moneyness to first order.
+        let at_open_in = fair_value_twap(&l, mark, k, w - 1, w, 0, sig2).expect("in");
+        let at_open_out = fair_value_twap(&l, mark, k, w, w, 0, sig2).expect("out");
+        assert!(
+            at_open_in.d_1e6.abs_diff(at_open_out.d_1e6) < 2_000,
+            "continuous at τ = W: {} vs {}",
+            at_open_in.d_1e6,
+            at_open_out.d_1e6
+        );
+        // Nothing left: the known average IS the settlement.
+        let known_above = (k + 1) as i128 * w as i128;
+        let done = fair_value_twap(&l, k - 1_000, k, 0, w, known_above, sig2).expect("done");
+        assert_eq!(done.d_1e6, D_CLAMP_1E6);
+        let known_at = k as i128 * w as i128;
+        let tie = fair_value_twap(&l, k, k, 0, w, known_at, sig2).expect("tie");
+        assert_eq!(tie.d_1e6, D_CLAMP_1E6, "`>=` settles ITM");
+        // Absent data still holds.
+        assert_eq!(fair_value_twap(&l, mark, k, tau, w, above, 0), None);
+        assert_eq!(fair_value_twap(&l, 0, k, tau, w, above, sig2), None);
+        assert_eq!(fair_value_twap(&l, mark, k, tau, w, i128::MAX, sig2), None, "overflow");
     }
 
     #[test]

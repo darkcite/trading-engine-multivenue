@@ -42,8 +42,10 @@ const BN: SymbolId = 0x0100_0001;
 const DB: SymbolId = 0x0300_0001;
 /// venue byte 4 (hl, Δ 340 ms)
 const HL: SymbolId = 0x0400_0002;
-/// venue byte 7 — past the end of the activation table, so every
-/// order on it is `unroutable`. Pins the refusal path too.
+/// venue byte 7 — past the end of the activation table when the
+/// constant was derived; since MX2 it is MEXC, data-only (O-MX1), and
+/// the matcher still refuses every order on it as `unroutable`. Pins
+/// the refusal path too.
 const BAD: SymbolId = 0x0700_0001;
 
 const KIND_MAKER: u8 = 0;

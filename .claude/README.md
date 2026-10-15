@@ -20,7 +20,7 @@ Do not add `from x import y` to Python files. Ruff
 (`isort.force-single-line`) plus a pytest test
 (`tests/test_imports_are_full.py`) enforce this.
 
-## Review agents (all pinned to Opus 5 — operator ruling 2026-09-19)
+## Review agents (the three verdict agents pinned to Opus 5.5 — `claude-opus-5-5`, operator ruling O-8 2026-09-23; Opus 5 since 2026-09-19)
 
 - `alloc-auditor` — zero-ALLOCATION gate (`make alloc-assert`).
 - `zero-copy-auditor` — zero-COPY gate (`make copy-audit`,
@@ -29,7 +29,7 @@ Do not add `from x import y` to Python files. Ruff
   carries a `// COPY:` line (what · bound · why · alternative rejected),
   the way `unsafe` carries `// SAFETY:`.
 - `risk-reviewer` — LAWS E-1..E-9 and `docs/risk-policy.md`.
-- `parser-property-tester` — proptest + fuzz for byte scanners.
+- `parser-property-tester` — proptest + fuzz for byte scanners (Sonnet).
 
 Run the two auditors after any change to a socket, parser, encoder,
 signer or ring path; run the risk reviewer before any exec-lane merge.

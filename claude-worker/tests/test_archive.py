@@ -13,13 +13,17 @@ Every test runs against `tests/fake_s3.py` over httpx.MockTransport. No socket.
 Convention: full ``import x`` only. No ``from x import y``.
 """
 
+import datetime
 import json
 import pathlib
 import random
+import signal
+import sqlite3
 import struct
 import subprocess
 import typing
 
+import httpx
 import pytest
 
 import claude_worker.archive
@@ -43,9 +47,7 @@ ENV: typing.Final[dict[str, str]] = {
 }
 
 
-def make_pmlr(
-    path: pathlib.Path, *, kind: int, slots: int, start_ns: int = EPOCH_NS
-) -> None:
+def make_pmlr(path: pathlib.Path, *, kind: int, slots: int, start_ns: int = EPOCH_NS) -> None:
     """A structurally valid PMLR v3 file. `slots=0` is header-only (64 B)."""
     body = bytearray(HEADER.pack(b"PMLR", 3, kind, start_ns))
     body.extend(b"\x00" * (64 - len(body)))
@@ -153,9 +155,7 @@ def test_windows_2h_complete_matches_window_root(tmp_path: pathlib.Path) -> None
 
     archiver.push_run(run, with_catalog=False)
     manifest = json.loads(fake.objects[cfg.manifest_key(run.name)])
-    assert manifest["windows_2h_complete"] == len(
-        claude_worker.window_root.complete_windows(run)
-    )
+    assert manifest["windows_2h_complete"] == len(claude_worker.window_root.complete_windows(run))
     assert manifest["windows_2h_complete"] == 2
     assert manifest["pmlr_version"] == 3
     assert manifest["span_ns"] == list(claude_worker.window_root.run_span(run) or ())
@@ -414,6 +414,45 @@ def test_push_run_still_refuses_an_empty_run(tmp_path: pathlib.Path) -> None:
     assert fake.count("PUT") == 0
 
 
+def test_push_pending_archives_a_run_with_a_truncated_file_and_keeps_going(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The second poison pill (the 2026-09-22 cycle). A boot that died between
+    creating `okx-events.pmlr` and writing its header left a 0-byte file;
+    `build_manifest` asked `window_root.run_span` for the span, the header read
+    raised, and the whole sweep aborted — stranding every run behind it and, one
+    stage later, retention (which deletes only what `verify` confirms). A
+    truncated file is data like any other: the run is archived byte-for-byte
+    and the sweep walks on."""
+    cfg = make_cfg(tmp_path)
+    fake = tests.fake_s3.FakeS3()
+    archiver = make_archiver(cfg, fake)
+    logs = tmp_path / "logs"
+    torn = make_run(logs, f"run-{EPOCH_NS}")
+    (torn / "okx-events.pmlr").write_bytes(b"")  # the header never landed
+    (torn / "deribit-events.pmlr").write_bytes(b"PMLR")  # torn inside the header
+    behind = f"run-{EPOCH_NS + 10**12}"
+    make_run(logs, behind)
+    make_run(logs, f"run-{EPOCH_NS + 2 * 10**12}")  # newest, never swept
+
+    results = archiver.push_pending(logs)
+
+    assert [r.run for r in results] == [torn.name, behind]
+    assert not results[0].skipped and results[0].files == 11
+    # Both runs are complete in the bucket — the torn one AND the one behind it.
+    assert cfg.index_key(torn.name) in fake.objects
+    assert cfg.index_key(behind) in fake.objects
+    manifest = json.loads(fake.objects[cfg.manifest_key(torn.name)])
+    assert manifest["span_ns"] == list(claude_worker.window_root.run_span(torn) or ())
+    assert manifest["span_ns"], "the readable files still give the run its span"
+    zero = next(f for f in manifest["files"] if f["name"] == "okx-events.pmlr")
+    assert zero["size_bytes"] == 0 and zero["pmlr_version"] is None
+    # Byte-faithful: the pulled run IS the local run, torn files included.
+    pulled = archiver.pull(torn.name, tmp_path / "pulled")
+    assert (pulled / "okx-events.pmlr").read_bytes() == b""
+    assert (pulled / "deribit-events.pmlr").read_bytes() == b"PMLR"
+
+
 def test_free_space_floor_refuses_and_touches_nothing(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -507,6 +546,38 @@ def test_catalog_absent_is_null_not_a_failure(
     assert manifest["catalog_error"] == "absent"
 
 
+#: The `venue_totals` block exactly as `capture_catalog.rs` renders it: an
+#: ARRAY in `VENUE_LABELS` order (bybit and mexc included, MX9).
+CATALOG_VENUE_TOTALS: typing.Final[dict[str, object]] = {
+    "catalog_version": 1,
+    "venue_totals": [
+        {"venue": "pm", "runs_present": 1, "ticks": 10, "bytes": 640},
+        {"venue": "bn", "runs_present": 1, "ticks": 0, "bytes": 64},
+        {"venue": "rpc", "runs_present": 0, "ticks": 0, "bytes": 0},
+        {"venue": "bybit", "runs_present": 1, "ticks": 7, "bytes": 512},
+        {"venue": "mexc", "runs_present": 1, "ticks": 3, "bytes": 256},
+    ],
+}
+
+
+def test_catalog_venues_reads_the_engines_array_and_counts_bybit_and_mexc() -> None:
+    venues = claude_worker.archive.catalog_venues(CATALOG_VENUE_TOTALS)
+    assert venues == ("bybit", "mexc", "pm")  # a venue with 0 ticks is absent
+    manifest = {
+        "run": f"run-{EPOCH_NS}",
+        "epoch_ns": EPOCH_NS,
+        "host_id": "h",
+        "totals": {"size_bytes": 1, "stored_bytes": 1},
+        "catalog": CATALOG_VENUE_TOTALS,
+    }
+    assert claude_worker.archive._list_row(manifest)["venues"] == ["bybit", "mexc", "pm"]
+    # No catalog (binary absent), a label-keyed object, junk rows: nothing.
+    assert claude_worker.archive.catalog_venues(None) == ()
+    assert claude_worker.archive.catalog_venues({"venue_totals": {"pm": {"ticks": 1}}}) == ()
+    junk = {"venue_totals": [1, {"venue": "", "ticks": 5}, {"venue": "okx", "ticks": True}]}
+    assert claude_worker.archive.catalog_venues(junk) == ()
+
+
 def test_disabled_gating_lanes_exit_3_and_do_zero_http(tmp_path: pathlib.Path) -> None:
     cfg = claude_worker.archive_config.load(env={}, env_file=tmp_path / "absent.env")
     assert not cfg.enabled
@@ -522,6 +593,61 @@ def test_pull_partial_dir_is_invisible_to_every_discovery_law(
     partial = tmp_path / f"run-{EPOCH_NS}.partial"
     partial.mkdir()
     assert claude_worker.features.run_dirs(tmp_path) == []
+
+
+def test_pull_files_fetches_only_the_named_files_and_verifies_each(
+    tmp_path: pathlib.Path,
+) -> None:
+    """HYPARB G1: two small logs of a multi-GB run — the index law, the digest
+    check, and a partial pull that is never a complete run."""
+    cfg = make_cfg(tmp_path)
+    fake = tests.fake_s3.FakeS3()
+    archiver = make_archiver(cfg, fake)
+    logs = tmp_path / "logs"
+    run = make_run(logs, f"run-{EPOCH_NS}")
+    make_run(logs, f"run-{EPOCH_NS + 10**12}")
+    archiver.push_run(run, with_catalog=False)
+
+    names = ["pm-ticks.pmlr", "instrument-manifest.tsv", "absent.pmlr"]
+    pulled, manifest = archiver.pull_files(run.name, names, tmp_path / "g1")
+    assert sorted(p.name for p in pulled.iterdir()) == ["instrument-manifest.tsv", "pm-ticks.pmlr"]
+    for p in pulled.iterdir():
+        assert p.read_bytes() == (run / p.name).read_bytes()
+    assert manifest["run"] == run.name and manifest["span_ns"]
+    assert sorted(p.name for p in (tmp_path / "g1").iterdir()) == [run.name], "no marker"
+
+    tampered = dict(
+        manifest,
+        files=[
+            dict(f, sha256="0" * 64) if f["name"] == "pm-ticks.pmlr" else f
+            for f in manifest["files"]
+        ],
+    )
+    raw = claude_worker.archive.manifest_bytes(tampered)
+    fake.objects[cfg.manifest_key(run.name)] = raw
+    fake.objects[cfg.index_key(run.name)] = raw
+    with pytest.raises(claude_worker.archive.ArchiveError, match="sha256"):
+        archiver.pull_files(run.name, ["pm-ticks.pmlr"], tmp_path / "g2")
+    assert not any((tmp_path / "g2").iterdir()), "a failed pull leaves nothing"
+    del fake.objects[cfg.index_key(run.name)]
+    with pytest.raises(claude_worker.archive.ArchiveError, match="not complete"):
+        archiver.pull_files(run.name, ["pm-ticks.pmlr"], tmp_path / "g3")
+
+
+def test_run_ids_lists_complete_runs_from_the_index_alone(tmp_path: pathlib.Path) -> None:
+    cfg = make_cfg(tmp_path)
+    fake = tests.fake_s3.FakeS3()
+    archiver = make_archiver(cfg, fake)
+    logs = tmp_path / "logs"
+    for offset in (0, 10**12, 2 * 10**12):
+        make_run(logs, f"run-{EPOCH_NS + offset}")
+    archiver.push_pending(logs)
+    fake.requests.clear()
+    cached = sorted(cfg.cache_dir.rglob("*")) if cfg.cache_dir.exists() else []
+    assert archiver.run_ids() == [f"run-{EPOCH_NS}", f"run-{EPOCH_NS + 10**12}"]
+    assert archiver.run_ids(EPOCH_NS + 10**12) == [f"run-{EPOCH_NS + 10**12}"]
+    assert all("list-type=2" in q for _, _, q in fake.requests), "no manifest is fetched"
+    assert (sorted(cfg.cache_dir.rglob("*")) if cfg.cache_dir.exists() else []) == cached
 
 
 def test_list_runs_returns_one_row_per_complete_run(tmp_path: pathlib.Path) -> None:
@@ -557,9 +683,7 @@ def test_tarball_round_trip_extracts_the_original_run(tmp_path: pathlib.Path) ->
 
     # exactly the shape retention.sh writes: tar -czf <out> -C <root> <name>
     tarball = tmp_path / f"{run.name}.tar.gz"
-    subprocess.run(
-        ["tar", "-czf", str(tarball), "-C", str(logs), run.name], check=True
-    )
+    subprocess.run(["tar", "-czf", str(tarball), "-C", str(logs), run.name], check=True)
     result = archiver.push_tarball(tarball)
     assert result.files == 1
     assert cfg.tarballs_prefix() + run.name + ".tar.gz" in fake.objects
@@ -625,8 +749,7 @@ def test_key_order_property_lexicographic_equals_numeric(tmp_path: pathlib.Path)
     cfg = make_cfg(tmp_path)
     rng = random.Random(20260905)
     epochs = [
-        rng.randrange(1_500_000_000_000_000_000, 9_999_999_999_999_999_999)
-        for _ in range(10_000)
+        rng.randrange(1_500_000_000_000_000_000, 9_999_999_999_999_999_999) for _ in range(10_000)
     ]
     keys = [cfg.index_key(f"run-{e}") for e in epochs]
     assert sorted(keys) == [cfg.index_key(f"run-{e}") for e in sorted(epochs)]
@@ -636,3 +759,150 @@ def test_run_id_accepts_a_path_or_an_id() -> None:
     assert claude_worker.archive._run_id("run-123") == "run-123"
     assert claude_worker.archive._run_id("/a/b/run-123") == "run-123"
     assert claude_worker.archive._run_id("/a/b/run-123/") == "run-123"
+
+
+def test_sigterm_handler_unwinds_with_the_terminated_code() -> None:
+    """HK11: SIGTERM raises SystemExit so multipart_put's abort still runs,
+    and a second SIGTERM during that abort is ignored (one-shot)."""
+    before = signal.getsignal(signal.SIGTERM)
+    try:
+        with pytest.raises(SystemExit) as caught:
+            claude_worker.archive._terminate(signal.SIGTERM, None)
+        assert caught.value.code == claude_worker.archive.EXIT_TERMINATED == 143
+        assert signal.getsignal(signal.SIGTERM) is signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGTERM, before)
+
+
+def test_main_installs_the_handler_and_restores_the_previous_one(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = signal.getsignal(signal.SIGTERM)
+    seen: list[object] = []
+
+    def dispatch(*_args: object, **_kwargs: object) -> int:
+        seen.append(signal.getsignal(signal.SIGTERM))
+        return claude_worker.archive.EXIT_OK
+
+    monkeypatch.setenv("MULTIVENUE_S3_ENV_FILE", str(tmp_path / "absent.env"))
+    monkeypatch.setattr(claude_worker.archive, "build", lambda _cfg: object())
+    monkeypatch.setattr(claude_worker.archive, "_dispatch", dispatch)
+    assert claude_worker.archive.main(["list"]) == claude_worker.archive.EXIT_OK
+    assert seen == [claude_worker.archive._terminate]
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_budget_spent_mid_object_exits_resumable(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HK11: a budget spent inside a multipart is EXIT_BUDGET, not a failure."""
+
+    def spent(*_args: object, **_kwargs: object) -> int:
+        raise claude_worker.objstore.BudgetSpent("k: budget spent after part 1/2")
+
+    monkeypatch.setenv("MULTIVENUE_S3_ENV_FILE", str(tmp_path / "absent.env"))
+    monkeypatch.setattr(claude_worker.archive, "build", lambda _cfg: object())
+    monkeypatch.setattr(claude_worker.archive, "_dispatch", spent)
+    assert claude_worker.archive.main(["list"]) == claude_worker.archive.EXIT_BUDGET
+
+
+def test_features_keys_keep_the_run_directory(tmp_path: pathlib.Path) -> None:
+    """HK12: two runs' same-named feature files get two keys, not one."""
+    root = tmp_path / "worker" / "features"
+    for run in ("run-1", "run-2"):
+        (root / run).mkdir(parents=True)
+        (root / run / "16777842.json").write_text(run, encoding="utf-8")
+    pairs = claude_worker.archive._derived_paths("features", "", 3, home=tmp_path)
+    assert [name for _p, name in pairs] == ["run-1/16777842.json", "run-2/16777842.json"]
+
+
+def test_push_derived_keys_by_the_name_given(tmp_path: pathlib.Path) -> None:
+    fake = tests.fake_s3.FakeS3()
+    cfg = make_cfg(tmp_path)
+    archiver = make_archiver(cfg, fake)
+    src = tmp_path / "16777842.json"
+    src.write_text("{}", encoding="utf-8")
+    archiver.push_derived("features", src, "run-1/16777842.json")
+    archiver.push_derived("features", src, "run-2/16777842.json")
+    prefix = cfg.derived_prefix("features")
+    assert prefix + "run-1/16777842.json" in fake.objects
+    assert prefix + "run-2/16777842.json" in fake.objects
+
+
+def test_candles_snapshot_is_staged_compressed_and_the_raw_one_removed(
+    tmp_path: pathlib.Path,
+) -> None:
+    """HK11: the candles push stages a `.zst` and never leaves the raw copy."""
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    with sqlite3.connect(worker / "candles.db") as conn:
+        conn.execute("CREATE TABLE bars (ts INTEGER, px INTEGER)")
+        conn.executemany("INSERT INTO bars VALUES (?, ?)", [(i, i * 2) for i in range(1000)])
+    pairs = claude_worker.archive._derived_paths("candles", "", 3, home=tmp_path)
+    assert len(pairs) == 1
+    staged, name = pairs[0]
+    assert name.endswith(".db.zst") and staged.is_file()
+    staging = tmp_path / "s3-cache" / "staging"
+    assert sorted(p.name for p in staging.iterdir()) == [name]
+
+
+def test_abort_stale_aborts_only_uploads_over_the_age(tmp_path: pathlib.Path) -> None:
+    """HK21: an orphan from 2026-09-05 goes; a push in flight stays."""
+    fake = tests.fake_s3.FakeS3()
+    cfg = make_cfg(tmp_path)
+    archiver = make_archiver(cfg, fake)
+    fake.initiated_at = "2026-09-05T11:50:25.707Z"
+    fake.handle(httpx.Request("POST", f"https://{fake.bucket}.h/v1/old.zst?uploads="))
+    fake.initiated_at = "2026-10-15T08:30:00.000Z"
+    fake.handle(httpx.Request("POST", f"https://{fake.bucket}.h/v1/live.zst?uploads="))
+    now = datetime.datetime(2026, 10, 15, 9, 0, tzinfo=datetime.UTC)
+    assert claude_worker.archive.abort_stale(archiver.store, 24.0, now=now) == (1, 1, 0)
+    assert [u.key for u in fake.uploads.values()] == ["v1/live.zst"]
+
+
+def test_abort_stale_never_judges_a_start_it_cannot_read(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A naive or unreadable `Initiated` is left alone and counted apart (a
+    provider format change must not pass for "nothing stale"); each abort is
+    logged with its start."""
+    fake = tests.fake_s3.FakeS3()
+    archiver = make_archiver(make_cfg(tmp_path), fake)
+    for key, started in (
+        ("v1/naive.zst", "2026-09-05T11:50:25"),
+        ("v1/garbled.zst", "Sat, 05 Sep 2026 11:50:25 GMT"),
+        ("v1/old.zst", "2026-09-05T11:50:25.707Z"),
+    ):
+        fake.initiated_at = started
+        fake.handle(httpx.Request("POST", f"https://{fake.bucket}.h/{key}?uploads="))
+    now = datetime.datetime(2026, 10, 15, 9, 0, tzinfo=datetime.UTC)
+    assert claude_worker.archive.abort_stale(archiver.store, 24.0, now=now) == (1, 0, 2)
+    assert sorted(u.key for u in fake.uploads.values()) == ["v1/garbled.zst", "v1/naive.zst"]
+    assert (
+        "archive: aborted v1/old.zst initiated=2026-09-05T11:50:25.707Z" in capsys.readouterr().err
+    )
+
+
+def test_explicit_path_under_the_root_keeps_its_path(tmp_path: pathlib.Path) -> None:
+    """HK21: `--path` under the kind's root is keyed like the default run."""
+    run = tmp_path / "worker" / "features" / "run-1"
+    run.mkdir(parents=True)
+    inside = run / "16777842.json"
+    inside.write_text("{}", encoding="utf-8")
+    outside = tmp_path / "elsewhere.json"
+    outside.write_text("{}", encoding="utf-8")
+    pairs = claude_worker.archive._derived_paths("features", str(inside), 3, home=tmp_path)
+    assert [name for _p, name in pairs] == ["run-1/16777842.json"]
+    pairs = claude_worker.archive._derived_paths("features", str(outside), 3, home=tmp_path)
+    assert [name for _p, name in pairs] == ["elsewhere.json"]
+    # A symlink keys by its own name, as the default run's `rglob` keys it.
+    link = run / "linked.json"
+    link.symlink_to(outside)
+    pairs = claude_worker.archive._derived_paths("features", str(link), 3, home=tmp_path)
+    assert [name for _p, name in pairs] == ["run-1/linked.json"]
+    default = claude_worker.archive._derived_paths("features", "", 3, home=tmp_path)
+    assert "run-1/linked.json" in [name for _p, name in default]
+    outer = tmp_path / "outer.json"
+    outer.symlink_to(inside)
+    pairs = claude_worker.archive._derived_paths("features", str(outer), 3, home=tmp_path)
+    assert [name for _p, name in pairs] == ["outer.json"]

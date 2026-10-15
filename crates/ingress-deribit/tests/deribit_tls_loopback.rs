@@ -337,11 +337,12 @@ fn deribit_tls_loopback_yields_tick_and_answers_test_request() {
     assert_eq!(status.ring_drops_total(), 0);
     assert_eq!(status.gaps_total(), 0);
     assert_eq!(status.resubscribes_total(), 0);
-    let tick = cons.try_pop().expect("tick must be on the ring");
+    let tick = *cons.try_pop_ref().expect("tick must be on the ring");
     assert_eq!(tick.venue, VenueId::Deribit as u8);
     assert_eq!(tick.sym, SYM_BTC);
-    // No seq on quotes: venue ms timestamp truncated to u32 (8c).
-    assert_eq!(tick.venue_seq, 1_550_658_624_149u64 as u32);
+    // HK32: no seq on quotes — the instrument's arrival ordinal.
+    assert_eq!(tick.venue_seq, 1);
+    assert_eq!(tick.venue_time_ms, 1_550_658_624_149);
     // Prices ×1e6 — 3914.97 → 3_914_970_000; 3996.61 → 3_996_610_000.
     assert_eq!(tick.bid_px.raw(), 3_914_970_000);
     assert_eq!(tick.ask_px.raw(), 3_996_610_000);

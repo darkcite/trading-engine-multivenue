@@ -22,6 +22,8 @@ memchr       = { workspace = true }
 mio          = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
-rcgen    = { workspace = true }
-rustls   = { workspace = true }
+# HK32: the sequencer tests apply its ticks to `TopOfBook`.
+book-builder = { workspace = true }
+proptest     = { workspace = true }
+rcgen        = { workspace = true }
+rustls       = { workspace = true }

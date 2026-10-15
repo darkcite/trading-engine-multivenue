@@ -36,12 +36,14 @@ import argparse
 import collections.abc
 import compression.zstd
 import dataclasses
+import datetime
 import fnmatch
 import hashlib
 import json
 import os
 import pathlib
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -95,6 +97,27 @@ EXIT_REFUSED: typing.Final[int] = 2  # newest run without --force, or guard hit
 EXIT_DISABLED: typing.Final[int] = 3  # subsystem off on a GATING lane
 EXIT_NO_SPACE: typing.Final[int] = 4  # free-space floor would be breached
 EXIT_BUDGET: typing.Final[int] = 5  # budget spent mid-run — resumable
+EXIT_TERMINATED: typing.Final[int] = 143  # SIGTERM; any multipart in flight is aborted
+
+#: HK21: an incomplete upload older than this is an orphan, not a push in
+#: flight (a night's cycle is bounded by its 8400 s budget).
+STALE_UPLOAD_H: typing.Final[float] = 24.0
+
+#: HK21: each derived kind's root under ~/multivenue (the key's base).
+_DERIVED_ROOTS: typing.Final[dict[str, str]] = {
+    "features": "worker/features",
+    "reports": "worker/reports",
+}
+
+MIB: typing.Final[int] = 1024 * 1024
+
+
+class StaleSweep(typing.NamedTuple):
+    """What `abort_stale` did (HK21)."""
+
+    aborted: int
+    kept: int  # younger than the age: a push may still be in flight
+    unparsed: int  # an ``Initiated`` that is not an aware time: never judged
 
 
 class ArchiveError(Exception):
@@ -288,7 +311,7 @@ def free_gib(path: pathlib.Path) -> float:
 def _read_progress(path: pathlib.Path) -> dict[str, typing.Any]:
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return {}
     return loaded if isinstance(loaded, dict) else {}
 
@@ -329,12 +352,42 @@ def capture_catalog(run_dir: pathlib.Path) -> tuple[typing.Any, str]:
         return None, "unparseable stdout"
 
 
+def catalog_venues(catalog: object) -> tuple[str, ...]:
+    """The venue labels a capture catalog saw ticks from, sorted.
+
+    ``venue_totals`` is what ``capture_catalog.rs`` actually emits: an ARRAY
+    of ``{"venue": <label>, "runs_present", "ticks", "bytes"}`` in the fixed
+    ``VENUE_LABELS`` order — every venue, bybit and mexc included. (The
+    readers used to expect a label-keyed object, which the engine never
+    wrote, so every manifest listed NO venues.) The per-day ``venue_ticks``
+    array is not read: an engine older than the MX9 fix made it 6 wide and
+    silently dropped bybit, and archived manifests keep that shape forever.
+    """
+    if not isinstance(catalog, dict):
+        return ()
+    totals = typing.cast(dict[str, object], catalog).get("venue_totals")
+    if not isinstance(totals, list):
+        return ()
+    out: set[str] = set()
+    for row in typing.cast(list[object], totals):
+        if not isinstance(row, dict):
+            continue
+        entry = typing.cast(dict[str, object], row)
+        label = entry.get("venue")
+        ticks = entry.get("ticks")
+        if isinstance(ticks, bool) or not isinstance(ticks, int):
+            continue
+        if isinstance(label, str) and label and ticks > 0:
+            out.add(label)
+    return tuple(sorted(out))
+
+
 # --------------------------------------------------------------------------
 # manifest
 # --------------------------------------------------------------------------
 
 
-def build_manifest(  # noqa: PLR0913 — one parameter per manifest input, deliberately
+def build_manifest(  # one parameter per manifest input, deliberately
     cfg: claude_worker.archive_config.ArchiveConfig,
     run_dir: pathlib.Path,
     files: list[dict[str, typing.Any]],
@@ -367,8 +420,9 @@ def build_manifest(  # noqa: PLR0913 — one parameter per manifest input, delib
         "windows_2h_complete": len(complete),
         "catalog": catalog,
         "catalog_note": (
-            "venue_totals is authoritative for per-venue ticks; the per-day "
-            "venue_ticks array omits bybit (capture_catalog.rs)"
+            "venue_totals is authoritative for per-venue ticks; a per-day "
+            "venue_ticks array from an engine older than the MX9 "
+            "capture_catalog.rs fix is 6 wide and omits bybit"
         ),
     }
     if catalog_error:
@@ -443,7 +497,7 @@ class Archiver:
 
     # -- push ------------------------------------------------------------
 
-    def push_run(  # noqa: PLR0912, PLR0915 — the commit order is one flat sequence
+    def push_run(  # the commit order is one flat sequence
         self,
         run_dir: pathlib.Path,
         *,
@@ -510,9 +564,7 @@ class Archiver:
 
             sha256_hex, _md5, size = _digests(path)
             staged = staging / (path.name + ".zst")
-            stored_sha, stored_md5, stored_size = compress_to(
-                path, staged, self.cfg.zstd_level
-            )
+            stored_sha, stored_md5, stored_size = compress_to(path, staged, self.cfg.zstd_level)
             try:
                 head = self.store.head(key)
                 if head is not None and head.size != stored_size:
@@ -558,9 +610,7 @@ class Archiver:
                     f"{run_id}: budget spent after {done}/{len(files)} files", EXIT_BUDGET
                 )
 
-        catalog, catalog_error = (
-            capture_catalog(run_dir) if with_catalog else (None, "skipped")
-        )
+        catalog, catalog_error = capture_catalog(run_dir) if with_catalog else (None, "skipped")
         ordered = [records[p.name] for p in files]
         manifest = build_manifest(
             self.cfg,
@@ -621,9 +671,7 @@ class Archiver:
             # still stops the sweep (S-LAW 5, resume tomorrow); having nothing
             # to upload is not a failure.
             if not eligible_files(run_dir, self.cfg.skip_globs):
-                result = PushResult(
-                    run_dir.name, 0, 0, 0, 0, 0.0, skipped=True, reason="empty"
-                )
+                result = PushResult(run_dir.name, 0, 0, 0, 0, 0.0, skipped=True, reason="empty")
             else:
                 result = self.push_run(run_dir, budget=budget, dry_run=dry_run)
             out.append(result)
@@ -646,8 +694,9 @@ class Archiver:
             if entry.get("etag") and head.etag and head.etag != entry["etag"]:
                 raise ArchiveError(f"{entry['key']}: ETag mismatch", EXIT_FAILED)
 
-    def verify(self, run_id: str, *, deep: bool = False) -> dict[str, typing.Any]:
-        """The question retention.sh asks before it deletes anything."""
+    def _complete_manifest(self, run_id: str) -> dict[str, typing.Any]:
+        """The run's manifest — only when its index object exists and holds the
+        SAME bytes (S-LAW 5: the index is the completeness bit)."""
         index = self.store.head(self.cfg.index_key(run_id))
         if index is None:
             raise ArchiveError(f"{run_id}: no index object — not complete", EXIT_FAILED)
@@ -655,7 +704,11 @@ class Archiver:
         manifest_raw = self.store.get_bytes(self.cfg.manifest_key(run_id))
         if index_bytes != manifest_raw:
             raise ArchiveError(f"{run_id}: index and manifest bytes differ", EXIT_FAILED)
-        manifest = json.loads(manifest_raw)
+        return typing.cast(dict[str, typing.Any], json.loads(manifest_raw))
+
+    def verify(self, run_id: str, *, deep: bool = False) -> dict[str, typing.Any]:
+        """The question retention.sh asks before it deletes anything."""
+        manifest = self._complete_manifest(run_id)
         self._verify_manifest(manifest)
         if deep:
             self._verify_deep(manifest)
@@ -692,6 +745,21 @@ class Archiver:
                 cached.write_bytes(raw)
             out.append(json.loads(raw))
         return out
+
+    def run_ids(self, since_ns: int | None = None) -> list[str]:
+        """Complete runs (their INDEX object exists, S-LAW 5) from ``since_ns``,
+        oldest first — from the index listing alone: unlike :meth:`list_runs`
+        no manifest is fetched or cached (HYPARB G1 lists ~100 to pull two
+        files of each)."""
+        prefix = self.cfg.index_prefix()
+        start = f"{prefix}run-{since_ns - 1}" if since_ns else None
+        out: list[str] = []
+        for meta in self.store.list(prefix, start_after=start):
+            run_id = meta.key.rsplit("/", 1)[-1].removesuffix(".json")
+            digits = run_id[len("run-") :]
+            if run_id.startswith("run-") and digits.isdigit() and int(digits) >= (since_ns or 0):
+                out.append(run_id)
+        return sorted(out, key=lambda r: int(r[len("run-") :]))
 
     # -- S7: legacy tarballs and derived stores --------------------------
 
@@ -815,25 +883,29 @@ class Archiver:
         )
         return final
 
-    def push_derived(self, kind: str, path: pathlib.Path) -> PushResult:
+    def push_derived(self, kind: str, path: pathlib.Path, name: str = "") -> PushResult:
         """A derived store (candles db, a report, a features day).
 
         Derived data is reproducible in principle and precious in practice —
         it is what the gates were computed against. Same index-last law.
+        ``name`` is the key under the kind's prefix — the path relative to
+        the store's root (HK11: features repeat basenames across runs, so a
+        basename key let one run's file stand for another's).
         """
         started = self._clock()
-        key = f"{self.cfg.derived_prefix(kind)}{path.name}"
+        name = name or path.name
+        key = f"{self.cfg.derived_prefix(kind)}{name}"
         sha256_hex, md5_hex, size = _digests(path)
         head = self.store.head(key)
         if head is not None and head.size == size:
-            return PushResult(path.name, 0, 0, 0, 0, self._clock() - started, skipped=True)
+            return PushResult(name, 0, 0, 0, 0, self._clock() - started, skipped=True)
         if size >= self.cfg.part_size:
             self.store.multipart_put(key, path, part_size=self.cfg.part_size)
             parts = (size + self.cfg.part_size - 1) // self.cfg.part_size
         else:
             self.store.put(key, path, sha256_hex=sha256_hex, md5_hex=md5_hex)
             parts = 1
-        return PushResult(path.name, 1, size, size, parts, self._clock() - started)
+        return PushResult(name, 1, size, size, parts, self._clock() - started)
 
     def pull(self, run_id: str, into: pathlib.Path) -> pathlib.Path:
         """Materialise a run. Verifies every file's ORIGINAL sha256.
@@ -850,14 +922,7 @@ class Archiver:
         staging = partial / ".staged"
         staging.mkdir(exist_ok=True)
         for entry in manifest["files"]:
-            stored = staging / (entry["name"] + ".zst")
-            self.store.get(entry["key"], stored, expect_size=int(entry["stored_bytes"]))
-            digest = decompress_to(stored, partial / entry["name"])
-            stored.unlink(missing_ok=True)
-            if digest != entry["sha256"]:
-                raise ArchiveError(
-                    f"{entry['name']}: sha256 mismatch after decompression", EXIT_FAILED
-                )
+            self._pull_entry(entry, partial, staging)
         shutil.rmtree(staging, ignore_errors=True)
         final = into / run_id
         shutil.rmtree(final, ignore_errors=True)
@@ -868,6 +933,57 @@ class Archiver:
             encoding="utf-8",
         )
         return final
+
+    def _pull_entry(
+        self, entry: dict[str, typing.Any], dst: pathlib.Path, staging: pathlib.Path
+    ) -> None:
+        """One manifest file into ``dst``, its ORIGINAL sha256 verified."""
+        stored = staging / (entry["name"] + ".zst")
+        self.store.get(entry["key"], stored, expect_size=int(entry["stored_bytes"]))
+        digest = decompress_to(stored, dst / entry["name"])
+        stored.unlink(missing_ok=True)
+        if digest != entry["sha256"]:
+            raise ArchiveError(f"{entry['name']}: sha256 mismatch after decompression", EXIT_FAILED)
+
+    def pull_files(
+        self, run_id: str, names: collections.abc.Iterable[str], into: pathlib.Path
+    ) -> tuple[pathlib.Path, dict[str, typing.Any]]:
+        """Materialise only ``names`` of a run; returns ``(dir, manifest)``.
+
+        HYPARB G1: a session's tally reads two small logs and a TSV of a run that
+        is gigabytes whole, so this fetches those keys and nothing else. The
+        completeness law is :meth:`pull`'s (the index object exists and holds the
+        manifest's bytes), but only the fetched files are touched — each by its
+        manifest key, each ORIGINAL sha256 verified after decompression exactly as
+        :meth:`pull` does. A name the manifest does not list is simply absent.
+
+        The result is a PARTIAL run, so it carries no ``.complete`` marker and is
+        refused anywhere inside the archive cache, whose discovery would serve it
+        as a whole one; it is assembled under the same ``.partial`` name, so an
+        interrupted pull is invisible.
+        """
+        if into.resolve().is_relative_to(self.cfg.cache_dir.resolve()):
+            raise ArchiveError(
+                f"{run_id}: a partial pull never lands in the archive cache", EXIT_REFUSED
+            )
+        manifest = self._complete_manifest(run_id)
+        wanted = set(names)
+        partial = into / f"{run_id}.partial"
+        shutil.rmtree(partial, ignore_errors=True)
+        staging = partial / ".staged"
+        staging.mkdir(parents=True, exist_ok=True)
+        try:
+            for entry in manifest["files"]:
+                if entry["name"] in wanted:
+                    self._pull_entry(entry, partial, staging)
+            shutil.rmtree(staging, ignore_errors=True)
+            final = into / run_id
+            shutil.rmtree(final, ignore_errors=True)
+            os.replace(partial, final)
+        except BaseException:
+            shutil.rmtree(partial, ignore_errors=True)
+            raise
+        return final, manifest
 
 
 # --------------------------------------------------------------------------
@@ -887,6 +1003,7 @@ def build(
         cfg.creds,
         client if client is not None else httpx.Client(),
         timeout_s=cfg.timeout_s,
+        max_upload_bps=cfg.max_upload_mibps * MIB,
     )
     return Archiver(cfg, store)
 
@@ -916,14 +1033,14 @@ def gc_cache(cfg: claude_worker.archive_config.ArchiveConfig, max_gib: float) ->
         removed["partial"] += 1
     runs = sorted(
         (p for p in cache.glob("run-*") if p.is_dir()),
-        key=lambda p: (cache / f".{p.name}.complete").stat().st_mtime
-        if (cache / f".{p.name}.complete").exists()
-        else 0.0,
+        key=lambda p: (
+            (cache / f".{p.name}.complete").stat().st_mtime
+            if (cache / f".{p.name}.complete").exists()
+            else 0.0
+        ),
     )
     limit = max_gib * GIB
-    total = sum(
-        sum(f.stat().st_size for f in run.rglob("*") if f.is_file()) for run in runs
-    )
+    total = sum(sum(f.stat().st_size for f in run.rglob("*") if f.is_file()) for run in runs)
     for run in runs:
         if total <= limit:
             break
@@ -973,6 +1090,14 @@ def main(argv: collections.abc.Sequence[str] | None = None) -> int:
 
     sub.add_parser("status")
 
+    # HK21: the bucket has no AbortIncompleteMultipartUpload rule; these are
+    # the client's own way to see and clear what an interrupted push left.
+    uploads = sub.add_parser("uploads")
+    uploads.add_argument("--prefix", default="")
+    stale = sub.add_parser("abort-stale")
+    stale.add_argument("--older-than-h", type=float, default=STALE_UPLOAD_H)
+    stale.add_argument("--prefix", default="")
+
     tarball = sub.add_parser("push-tarball")
     tarball.add_argument("path", nargs="?", default="")
     tarball.add_argument("--all", action="store_true")
@@ -994,18 +1119,39 @@ def main(argv: collections.abc.Sequence[str] | None = None) -> int:
         print(cfg.tell(), file=sys.stderr)
         return EXIT_OK
 
+    # SIGTERM (launchd's unload, an operator's kill) must not leave a multipart
+    # upload's parts in the bucket: the default action ends the process before
+    # `multipart_put`'s abort runs, which is how 2026-10-14's orphan happened.
+    # Raised as SystemExit, it unwinds through that abort instead (HK11).
+    previous = signal.signal(signal.SIGTERM, _terminate)
     try:
         archiver = build(cfg)
         return _dispatch(args, cfg, archiver)
     except ArchiveError as exc:
         print(str(exc), file=sys.stderr)
         return exc.code
+    except claude_worker.objstore.BudgetSpent as exc:
+        # Mid-object, the multipart aborted: resumable, like a budget spent
+        # between files — not a failure (HK11; it read as 1 until then).
+        print(f"archive: {exc}", file=sys.stderr)
+        return EXIT_BUDGET
     except claude_worker.objstore.ObjStoreError as exc:
         print(f"archive: {exc}", file=sys.stderr)
         return EXIT_FAILED
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
-def _dispatch(  # noqa: PLR0911, PLR0912 — one branch per verb, deliberately flat
+def _terminate(_signum: int, _frame: object) -> None:
+    """The SIGTERM handler: unwind, so every ``finally`` and abort runs.
+
+    One-shot: a second SIGTERM while the abort itself is in flight is
+    ignored rather than cutting the abort short."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise SystemExit(EXIT_TERMINATED)
+
+
+def _dispatch(  # one branch per verb, deliberately flat
     args: argparse.Namespace,
     cfg: claude_worker.archive_config.ArchiveConfig,
     archiver: Archiver,
@@ -1063,6 +1209,22 @@ def _dispatch(  # noqa: PLR0911, PLR0912 — one branch per verb, deliberately f
         runs = archiver.list_runs()
         print(f"{cfg.tell()} runs_remote={len(runs)}", file=sys.stderr)
         return EXIT_OK
+    if args.verb == "uploads":
+        found = list(archiver.store.list_multipart(args.prefix))
+        for up in found:
+            print(f"archive: incomplete {up.key} initiated={up.initiated}", file=sys.stderr)
+        print(f"archive: incomplete uploads={len(found)}", file=sys.stderr)
+        return EXIT_OK
+    if args.verb == "abort-stale":
+        sweep = abort_stale(archiver.store, args.older_than_h, args.prefix)
+        print(
+            f"archive: abort-stale aborted={sweep.aborted} kept={sweep.kept}"
+            f" unparsed={sweep.unparsed}",
+            file=sys.stderr,
+        )
+        # A start that no longer parses would stop every cleanup in silence:
+        # fail, so the cycle's log says so (non-fatal there).
+        return EXIT_FAILED if sweep.unparsed else EXIT_OK
     if args.verb == "push-tarball":
         budget = _budget(args.budget_s)
         paths = (
@@ -1078,21 +1240,71 @@ def _dispatch(  # noqa: PLR0911, PLR0912 — one branch per verb, deliberately f
         return EXIT_OK
     if args.verb == "push-derived":
         budget = _budget(args.budget_s)
-        for path in _derived_paths(args.kind, args.path):
-            if budget is not None and budget.spent():
-                print("archive: budget spent between files", file=sys.stderr)
-                return EXIT_BUDGET
-            print(archiver.push_derived(args.kind, path).tell(), file=sys.stderr)
+        for path, name in _derived_paths(args.kind, args.path, cfg.zstd_level):
+            try:
+                if budget is not None and budget.spent():
+                    print("archive: budget spent between files", file=sys.stderr)
+                    return EXIT_BUDGET
+                print(archiver.push_derived(args.kind, path, name).tell(), file=sys.stderr)
+            finally:
+                if args.kind == "candles" and not args.path:
+                    # The staged snapshot: in the bucket, or to be taken again
+                    # (a snapshot is never resumed). Never left in staging/.
+                    path.unlink(missing_ok=True)
         return EXIT_OK
     return EXIT_OK
 
 
-def _derived_paths(kind: str, explicit: str) -> list[pathlib.Path]:
+def abort_stale(
+    store: claude_worker.objstore.ObjectStore,
+    older_than_h: float,
+    prefix: str = "",
+    now: datetime.datetime | None = None,
+) -> StaleSweep:
+    """Abort every incomplete multipart upload initiated over ``older_than_h``
+    hours ago (HK21), logging each. A push in flight is younger, and an abort
+    can touch nothing but parts that never completed (S-LAW 11). An upload
+    whose start is not an aware time is left alone and counted apart."""
+    now = now if now is not None else datetime.datetime.now(datetime.UTC)
+    cutoff = now - datetime.timedelta(hours=older_than_h)
+    aborted = kept = unparsed = 0
+    for up in list(store.list_multipart(prefix)):
+        try:
+            started = datetime.datetime.fromisoformat(up.initiated)
+        except ValueError:
+            unparsed += 1
+            continue
+        if started.tzinfo is None:
+            unparsed += 1
+            continue
+        if started > cutoff:
+            kept += 1
+            continue
+        store.abort_multipart(up.key, up.upload_id)
+        print(f"archive: aborted {up.key} initiated={up.initiated}", file=sys.stderr)
+        aborted += 1
+    return StaleSweep(aborted, kept, unparsed)
+
+
+def _derived_paths(
+    kind: str, explicit: str, zstd_level: int, home: pathlib.Path | None = None
+) -> list[tuple[pathlib.Path, str]]:
+    """(file, key name) pairs; the name is relative to the kind's root (HK11),
+    an explicit ``--path`` under that root too (HK21)."""
+    home = home if home is not None else pathlib.Path.home() / "multivenue"
     if explicit:
-        return [pathlib.Path(explicit).expanduser()]
-    home = pathlib.Path.home() / "multivenue"
+        # The parent resolved, never the file: a symlink keys by its own name,
+        # as the default run's `rglob` keys it.
+        given = pathlib.Path(explicit).expanduser()
+        path = given.parent.resolve() / given.name
+        base = _DERIVED_ROOTS.get(kind)
+        root = (home / base).resolve() if base is not None else None
+        if root is not None and path.is_relative_to(root):
+            return [(path, path.relative_to(root).as_posix())]
+        return [(path, path.name)]
     if kind == "reports":
-        return sorted((home / "worker" / "reports").glob("pnl-*.json"))
+        reports = home / _DERIVED_ROOTS["reports"]
+        return [(p, p.name) for p in sorted(reports.glob("pnl-*.json"))]
     if kind == "candles":
         # A live sqlite file is not a file you copy. `.backup` is the only
         # snapshot that is guaranteed internally consistent.
@@ -1102,18 +1314,30 @@ def _derived_paths(kind: str, explicit: str) -> list[pathlib.Path]:
         stamp = time.strftime("%Y%m%d", time.gmtime())
         snapshot = home / "s3-cache" / "staging" / f"candles-{stamp}.db"
         snapshot.parent.mkdir(parents=True, exist_ok=True)
-        done = subprocess.run(
-            ["sqlite3", str(source), f".backup '{snapshot}'"], capture_output=True, check=False
-        )
-        if done.returncode != 0 or not snapshot.is_file():
-            raise ArchiveError("candles: sqlite3 .backup failed", EXIT_FAILED)
-        return [snapshot]
-    return sorted(p for p in (home / "worker" / "features").rglob("*") if p.is_file())
+        # HK11: stored compressed (4.40 GB -> 816 MiB on 2026-10-14). The raw
+        # snapshot never outlives this call — it is the size of the db — and
+        # a failed or killed compress leaves no partial `.zst` behind.
+        staged = snapshot.with_name(snapshot.name + ".zst")
+        try:
+            done = subprocess.run(
+                ["sqlite3", str(source), f".backup '{snapshot}'"],
+                capture_output=True,
+                check=False,
+            )
+            if done.returncode != 0 or not snapshot.is_file():
+                raise ArchiveError("candles: sqlite3 .backup failed", EXIT_FAILED)
+            compress_to(snapshot, staged, zstd_level)
+        except BaseException:
+            staged.unlink(missing_ok=True)
+            raise
+        finally:
+            snapshot.unlink(missing_ok=True)
+        return [(staged, staged.name)]
+    root = home / _DERIVED_ROOTS["features"]
+    return [(p, p.relative_to(root).as_posix()) for p in sorted(root.rglob("*")) if p.is_file()]
 
 
-def _gc_limit(
-    args: argparse.Namespace, cfg: claude_worker.archive_config.ArchiveConfig
-) -> float:
+def _gc_limit(args: argparse.Namespace, cfg: claude_worker.archive_config.ArchiveConfig) -> float:
     """A NEGATIVE --max-gib means "use the configured cap"; 0 means "empty it"."""
     return cfg.cache_max_gib if args.max_gib < 0 else args.max_gib
 
@@ -1125,11 +1349,6 @@ def _run_id(raw: str) -> str:
 
 
 def _list_row(manifest: dict[str, typing.Any]) -> dict[str, typing.Any]:
-    catalog = manifest.get("catalog") or {}
-    venues: list[str] = []
-    totals = catalog.get("venue_totals") if isinstance(catalog, dict) else None
-    if isinstance(totals, dict):
-        venues = sorted(k for k, v in totals.items() if isinstance(v, dict) and v.get("ticks"))
     return {
         "run": manifest["run"],
         "epoch_ns": manifest["epoch_ns"],
@@ -1140,7 +1359,7 @@ def _list_row(manifest: dict[str, typing.Any]) -> dict[str, typing.Any]:
         "stored_bytes": manifest["totals"]["stored_bytes"],
         "pmlr_version": manifest.get("pmlr_version"),
         "windows_2h_complete": manifest.get("windows_2h_complete"),
-        "venues": venues,
+        "venues": list(catalog_venues(manifest.get("catalog"))),
         "local_path": None,
         "uploaded_at_ns": manifest.get("uploaded_at_ns"),
     }

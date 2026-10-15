@@ -50,6 +50,7 @@ def _error(code: str, message: str = "") -> bytes:
 @dataclasses.dataclass(slots=True)
 class _Upload:
     key: str
+    initiated: str = ""
     parts: dict[int, bytes] = dataclasses.field(default_factory=dict)
 
 
@@ -62,6 +63,7 @@ class FakeS3:
         self.uploads: dict[str, _Upload] = {}
         self.versioning = versioning
         self.requests: list[tuple[str, str, str]] = []  # (method, path, query)
+        self.timeouts: list[float | None] = []  # each request's read timeout
         self.put_keys: list[str] = []
         # fault hooks
         self.fail_after_n_puts: int | None = None
@@ -70,6 +72,14 @@ class FakeS3:
         self.corrupt_etag: set[str] = set()
         self.reject_digest: set[str] = set()
         self._upload_seq = 0
+        # HK21: what ListMultipartUploads reports as an upload's start, and a
+        # hook run when an upload is initiated (before the answer returns).
+        self.initiated_at = "2026-10-15T00:00:00.000Z"
+        self.on_initiate: typing.Callable[[], None] | None = None
+        # initiates answered 503 (after the hook, making no upload), and the
+        # uploads listing's page size.
+        self.fail_initiates = 0
+        self.uploads_page = 1000
 
     # -- helpers ---------------------------------------------------------
 
@@ -92,12 +102,13 @@ class FakeS3:
 
     # -- the handler -----------------------------------------------------
 
-    def handle(  # noqa: PLR0911, PLR0912 — one branch per S3 verb, deliberately flat
+    def handle(  # one branch per S3 verb, deliberately flat
         self, request: httpx.Request
     ) -> httpx.Response:
         key = self.key_of(request)
         raw_query = request.url.query.decode("ascii")
         self.requests.append((request.method, request.url.path, raw_query))
+        self.timeouts.append(request.extensions.get("timeout", {}).get("read"))
         query = dict(urllib.parse.parse_qsl(raw_query, keep_blank_values=True))
 
         forced = self.status_once.pop(request.method, 0)
@@ -116,6 +127,8 @@ class FakeS3:
             return httpx.Response(200, content=_xml(body))
         if request.method == "GET" and query.get("list-type") == "2":
             return self._list(query)
+        if request.method == "GET" and "uploads" in query and not key:
+            return self._list_uploads(query)
         if request.method == "POST" and "uploads" in query:
             return self._initiate(key)
         if request.method == "PUT" and "uploadId" in query:
@@ -221,7 +234,7 @@ class FakeS3:
             contents.append(
                 "<Contents>"
                 f"<Key>{key}</Key><Size>{len(body)}</Size>"
-                f'<ETag>&quot;{self._etag(key, body)}&quot;</ETag>'
+                f"<ETag>&quot;{self._etag(key, body)}&quot;</ETag>"
                 "<LastModified>2026-09-05T12:00:00.000Z</LastModified>"
                 "</Contents>"
             )
@@ -245,9 +258,16 @@ class FakeS3:
         )
 
     def _initiate(self, key: str) -> httpx.Response:
+        failing = self.fail_initiates > 0
+        self.fail_initiates -= int(failing)
         self._upload_seq += 1
         upload_id = f"2~upload-{self._upload_seq}"
-        self.uploads[upload_id] = _Upload(key=key)
+        if not failing:
+            self.uploads[upload_id] = _Upload(key=key, initiated=self.initiated_at)
+        if self.on_initiate is not None:
+            self.on_initiate()
+        if failing:
+            return httpx.Response(503, content=_error("SlowDown"))
         return httpx.Response(
             200,
             content=_xml(
@@ -256,6 +276,43 @@ class FakeS3:
                 "</InitiateMultipartUploadResult>"
             ),
         )
+
+    def _list_uploads(self, query: dict[str, str]) -> httpx.Response:
+        """By key, then upload id; S3's markers: with ``key-marker`` alone,
+        keys after it; with ``upload-id-marker`` too, that key's later ids."""
+        prefix = query.get("prefix", "")
+        key_marker = query.get("key-marker", "")
+        id_marker = query.get("upload-id-marker", "")
+
+        def after(key: str, upload_id: str) -> bool:
+            if not key_marker or key > key_marker:
+                return True
+            return bool(id_marker) and key == key_marker and upload_id > id_marker
+
+        found = sorted(
+            (up.key, upload_id, up.initiated)
+            for upload_id, up in self.uploads.items()
+            if up.key.startswith(prefix) and after(up.key, upload_id)
+        )
+        page = found[: self.uploads_page]
+        truncated = len(found) > len(page)
+        rows = "".join(
+            f"<Upload><Key>{key}</Key><UploadId>{upload_id}</UploadId>"
+            f"<Initiated>{initiated}</Initiated></Upload>"
+            for key, upload_id, initiated in page
+        )
+        markers = (
+            f"<NextKeyMarker>{page[-1][0]}</NextKeyMarker>"
+            f"<NextUploadIdMarker>{page[-1][1]}</NextUploadIdMarker>"
+            if truncated
+            else ""
+        )
+        body = (
+            f'<ListMultipartUploadsResult xmlns="{NS}">'
+            f"<IsTruncated>{str(truncated).lower()}</IsTruncated>"
+            f"{markers}{rows}</ListMultipartUploadsResult>"
+        )
+        return httpx.Response(200, content=_xml(body))
 
     def _upload_part(self, key: str, query: dict[str, str], body: bytes) -> httpx.Response:
         upload = self.uploads.get(query.get("uploadId", ""))

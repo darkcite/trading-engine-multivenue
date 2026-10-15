@@ -20,6 +20,7 @@ frozen-surface amendment with this ruling cited in the pin tests).
 | ---------------------------- | --------- | ------------------------------------ |
 | max open orders per symbol   | 8         | `cli::backtest::fill` (paper model)  |
 | max total open orders        | 64        | `cli::backtest::fill` (paper model)  |
+| xmm queue orders (XMM XH2)   | 32 total, 8 symbols | `core_fill::queue` — a SEPARATE table for post-only makers on Hyperliquid, in the paper matcher and the harness; no per-symbol cap of its own (the member holds ≤ 4 per perp: two sides, each with a modify in flight). Combined paper capacity is 96 |
 | max net notional per symbol  | $20 000   | rule 7 + gates (RiskGate at 8i)      |
 | max net notional total       | $100 000  | rule 7 + gates (2× book gross)       |
 | max single-order notional    | $10 000   | rule 7 + VM clamp + gates            |
@@ -109,7 +110,8 @@ laws, enforced in `crates/core-regime` (the detector), `crates/strategy-set`
 - **Entries only.** A closed gate blocks ENTRIES; it never blocks an
   exit and never flips a table. `off = soft` lets the position drain by
   its own exit law; `off = hard` flattens on the flip
-  (`engine_vm_regime_hard_exits_total`, `engine_icdp_regime_exits_total`).
+  (`engine_vm_regime_hard_exits_total`; icdp's `engine_icdp_regime_exits_total`
+  was retired with its member at XMM XH3).
 - **Fail closed.** UNKNOWN words (warm-up, a declaration that expired,
   a venue-dark FUND dimension) close every LABELLED row/member; an
   unlabelled row is bit-identical to pre-RG0 behaviour.
@@ -142,14 +144,25 @@ open, stop ingesting rules) on any of the following:
 5. `core-alloc::CountingAllocator` reports any allocation in a tick-loop
    iteration. (debug builds only; release aborts via `panic = "abort"`.)
 6. A `debug_assert!` fails in a strategy's `on_tick`/`on_signal`/`on_fill`.
-7. **(E6, NOT YET ENFORCED)** `halt_on_reject_streak` consecutive venue
-   rejections on a live slot ⇒ sticky per-slot halt.
-8. **(E6, NOT YET ENFORCED)** reconciliation drift between our position and
-   the venue's above `halt_on_recon_drift_usd_1e6` ⇒ sticky per-slot halt.
+7. **(E6)** `halt_on_reject_streak` consecutive venue rejections on a live
+   slot (`RejectStreak`) ⇒ sticky per-slot halt.
+8. **(E6)** reconciliation drift between our position and the venue's above
+   `halt_on_recon_drift_usd_1e6` (`ReconDrift`) ⇒ sticky per-slot halt.
+9. **(BX3, enforced since BX6)** the venue restricted a Binance account
+   (`VenueLock`) ⇒ sticky halt of every slot whose venues name binance.
+10. **(BX3, enforced since BX6)** a Binance account's margin ratio reached a
+    slot's own `halt_on_margin_ratio_1e6` (`MarginRisk`) ⇒ sticky halt of
+    that slot; a `MARGIN_CALL` ⇒ of every slot whose venues name binance.
 
-Triggers 7 and 8 are PARSED from `exec.toml` today (E1) and enforced by
-nothing. E6 adds the enforcement, cancel-all-on-halt and the
-operator-restart requirement; until then neither number is a control.
+Triggers 7–10 are enforced by `exec_router::halt` (`trigger_for`): 7 and 8
+since E6, with the halted slot's cancel (per slot since XH5a) and
+`exec.HALT`, which only the operator clears; 9 and 10 since BX6 built the
+Binance arm that reports them (armable, though no member arms it, O-BX6) —
+"E6" and "BX3" below. `HaltReason` also names the budget floor, the
+user-WS gap, the asset-refusal streak, the operator (`exec.HALT`),
+recon-STALE, the E7 session bound (P&L gain / loss) and the ALO reject rate;
+the full table is the `exec_router::halt` module docs. (Until 2026-10-13 this list still read
+"NOT YET ENFORCED" and "DARK until BX6"; HK10 brought it current.)
 
 Halt is **sticky**: it requires a manual engine restart. No "auto-resume"
 logic is permitted — a halted engine means a human investigates.
@@ -365,8 +378,10 @@ funding requirement.
 ### `off` is a STOP, and it stops exits too
 
 `mode = "off"` refuses EVERY order from the slot, entries and **exits**
-alike: `Order` carries no reduce-only bit today, so the dispatcher cannot
-tell them apart. It also does not cancel orders already resting.
+alike: the dispatcher cannot tell them apart. (`Order.flags` bit 0,
+`ORDER_FLAG_REDUCE_ONLY`, exists since XMM XH1 — but nothing sets or
+honours it before XH4; see "XMM — slot 6" below.) It also does not
+cancel orders already resting.
 
 This is a deliberate, documented **exception** to the standing law above
 that a cap never blocks an exit. `off` is not a cap — it is an operator
@@ -387,7 +402,10 @@ two. `--live` now `conflicts_with = "exec"`, so the two can never be
 combined, but the asymmetry is recorded here deliberately rather than
 left implicit: what keeps the legacy path unreachable in the managed
 fleet is `scripts/engine-wrapper.sh`'s strategy allow-list and its
-hard-coded `--paper`, not the flag's own design.
+hard-coded `--paper`, not the flag's own design. Since HD3 the path posts
+through `core_net::HttpsPost`. Polymarket is expected to refuse its orders
+(its documented `POST /order` contract, not tested against the venue —
+HD3, below); the wrapper remains the control.
 
 ## Signing-key handling
 
@@ -400,9 +418,14 @@ hard-coded `--paper`, not the flag's own design.
   `.env` only". The managed fleet has sourced `~/multivenue/.env` since
   the launchd lane existed, so the old wording described a setup that
   had not been true for some time.)*
-- Boot-time: the key is `mlock`'d into its own page (see
-  `crates/core-config::SecretKeyBytes`).
-- Drop: the key page is zeroized and `munlock`'d.
+- Boot-time: the key is `mlock`'d (see
+  `crates/core-config::SecretKeyBytes`): a 32 B heap box, so the lock
+  covers the heap page the box sits on, which it may SHARE with other
+  allocations, another key included — not a page of its own (corrected
+  2026-09-26 by the BX4 review; the BX4 bullet below).
+- Drop: the key's 32 B are zeroized and `munlock`'d — which, where locks
+  do not stack (Linux), unlocks that whole page for anything else locked
+  on it.
 - Debug: the `Secrets` struct has a custom `Debug` impl that redacts the
   key. Any code that formats or logs the key without redaction fails the
   `risk-reviewer` subagent check.
@@ -412,6 +435,41 @@ hard-coded `--paper`, not the flag's own design.
   zeroize-on-drop — rather than a second implementation. Two
   implementations of a key's memory handling is one more than can be
   audited, and E4 puts a MAINNET key in that struct.
+- **HYPARB (H8) adds the HyperEVM testnet wallets** — the same
+  `SecretKeyBytes`, read through `from_hex_env`; see "HYPARB — slot 0"
+  below for which variable and why it may be the E3 testnet key.
+- **BX4 adds the Binance Ed25519 key** (`crates/signer-ed25519`, ruling
+  O-BX5: `ring`). The seed arrives through the same
+  `SecretKeyBytes::from_hex_env` (`BINANCE_ED25519_SEED`). `ring` expands
+  it ONCE, at boot, into its keypair form (96 B: the secret scalar, the
+  nonce prefix, the public key), and that expansion lives in a page of its
+  own — page-aligned and page-sized, so no `munlock` of a neighbour can
+  unlock it (`mlock` does not stack) — `mlock`'d, and overwritten with
+  volatile zero writes on drop before `munlock` and free; `ring`'s type
+  zeroizes nothing itself. The NAMED temporary the expansion is returned
+  into is wiped too; `ring`'s own stack frames (its SHA-512 buffers the
+  seed there), a return slot the compiler does not elide and a register
+  spill are not — the same stated limit as the environment block below.
+  `Debug` prints `<redacted>`; an error carries an errno or a vector
+  index, never a key byte. `signer_ed25519::self_test()` runs RFC 8032's
+  known answers through the signer itself — both renders compared with
+  literals from outside the crate — and refuses on one corrupted byte or
+  an empty table (LAW BX-3). **BX6's boot must call it before building
+  the real signer and refuse the boot on `Err`, never warn** — no boot
+  calls it yet. **This is a second locked-memory implementation beside
+  `SecretKeyBytes`** — one more than the paragraph above allows — because
+  the 96 B expansion does not fit the 32 B type. Whether the page type
+  moves into `core-config` and `SecretKeyBytes` adopts it is an open
+  operator question (BX4, 2026-09-26). The hazard it would close is
+  reachable today, outside this lane: `cli::evm_live::check_wallet_env`
+  (`crates/cli/src/evm_live.rs:416-427`) builds a temporary
+  `SecretKeyBytes` of slot 3's agent key and drops it while HYPARB's
+  mainnet boot holds `HYPEREVM_MAINNET_KEY` live
+  (`crates/cli/src/hyparb_live.rs:1480-1483`); on Linux that drop can
+  unlock the live key's page. macOS counts user wirings per map entry
+  (XNU), so the Mac fleet is likely unaffected — not verified. Until the
+  question is ruled, BX6 keeps the seed's `SecretKeyBytes` alive for the
+  life of the process. Nothing builds a signer from the environment yet.
 - The intermediate hex `String` the environment hands us is zeroized
   after parsing. Without that, the key sits in freed heap for the life
   of the process.
@@ -508,11 +566,13 @@ above, plus the fact that the account is a separate testnet account.
 The gate has two halves and they cover different things.
 
 - **Offline** (`exec-smoke.sh --offline`, no network, no credentials):
-  the binary reproduces all 25 known-answer vectors the official
+  the binary reproduces all 39 known-answer vectors the official
   `hyperliquid-python-sdk` generated, and rebuilds one action per TYPE
-  from inputs — `order`, `cancel`, `cancelByCloid`, `batchModify` —
-  demanding the SDK's exact msgpack. **This is the half that covers LAW
-  E-3 for orders.**
+  from inputs — `order`, `cancel`, `cancelByCloid`, `batchModify`,
+  `reserveRequestWeight` (S7-L1) and the XH4c control actions
+  `updateLeverage`, `scheduleCancel`, `noop`, plus XMM XH5d's order under
+  the ALO priority grouping `{"p": N}` — demanding the SDK's exact
+  msgpack. **This is the half that covers LAW E-3 for orders.**
 - **Venue** (two signed POSTs): the venue verifies a good signature and
   rejects a corrupted one.
 
@@ -1283,15 +1343,17 @@ Arm B reprices ~333 times per instance, so a modify routed to
 which is the address-budget exhaustion the governor exists to prevent.
 **One case this gets wrong, deliberately**: a modify that REDUCES
 exposure — smaller size, or a price further from the market — is
-arguably an exit and is refused at the floor anyway. `Order` carries no
-reduce-only bit, which is the same limitation already recorded for
-`mode = "off"`, so treating every modify as a submit is the fail-closed
-choice with an existing precedent. **When the reduce-only bit lands
-with E6, this is one of the sites to revisit.**
+arguably an exit and is refused at the floor anyway. No reduce-only bit
+is honoured — the same limitation already recorded for `mode = "off"`
+(the bit itself exists since XMM XH1, unread until XH4) — so treating
+every modify as a submit is the fail-closed choice with an existing
+precedent. **When the reduce-only bit is honoured (XH4), this is one of
+the sites to revisit.**
 
-**A repeated roll retires nothing.** The venue re-sends
-`outcomeCreated` on a reconnect snapshot and a replayed ring entry
-carries it too, so the handler compares the bound asset against the one
+**A repeated roll retires nothing.** A replayed ring entry carries one
+(the venue itself pushes `outcomeCreated` once and replays none on a
+reconnect — corrected 2026-09-26, probed; "The Hyperliquid reconnect
+loop" below), so the handler compares the bound asset against the one
 it is about to bind. Without that the queued asset is the very one the
 bind re-establishes as live, and the next idle would enumerate the
 account and cancel every quote on a LIVE leg — at the moment the member
@@ -2327,6 +2389,36 @@ stronger property than its condition tests. So it is recorded inside
 the HTTP cycle at the moment the write is attempted, and returned in a
 struct every one of the fifteen call sites must destructure.
 
+#### The live arm's stale keep-alive (H9c, operator ask, 2026-09-24)
+
+Found by the HYPARB H9 review on `core_net::HttpsPost`, which copied
+`HlHttp`'s shape. The venue closes an idle keep-alive connection on its
+own schedule (and may announce `Connection: close`). `HlHttp` reused
+such a connection: the next ORDER's bytes went into a socket the peer
+had already closed, the local write succeeded, the read found EOF, and
+the order came back `Disconnected` with `left_host == true` — counted
+`sent_unanswered`, charged to the address budget, left to
+reconciliation, although no byte of it reached the venue. An entry lost
+exactly when the book was worth entering.
+
+Now an answer that announces `Connection: close` (or arrives with the
+FIN) retires the connection WITH the answer (the answer is kept), and a
+one-byte non-blocking read before each reuse retires a connection the
+venue closed while idle; the order dials fresh with `left_host ==
+false`. Cost: one `read(2)` per order on a healthy connection, a TLS
+handshake (50–150 ms) only when the venue had closed it — which the
+order would otherwise have lost. `HlHttp::dials()` counts handshakes.
+Pinned by `hl_exchange_tls_loopback::an_idle_close_is_noticed_before_the_next_order_is_written`
+and `…::an_announced_close_retires_the_connection_with_the_answer`
+(both RED with the fix disabled). It reaches the armed engine only
+through a merge to `main`, a release build and an
+`exec-smoke`-gated restart.
+
+**Since HD2 (2026-10-05)** the probe and the retirement are the shared
+engine's (`core_net::HttpsConn`), not a copy in `HlHttp`; the same two
+tests pin them. The bare-FIN case BX5 recorded as overstated here now
+holds: a whole answer before a bare FIN is kept ("HD2", below).
+
 #### A torn write COUNTS
 
 `left_host` is set before the write is attempted rather than after it
@@ -2355,8 +2447,9 @@ four cache lines to five to carry it.
 
 #### The alloc gate: `hl_exchange_requote_path_is_zero_alloc`
 
-Gate 60 drives `HlExchange::modify` — the arm's own verb, not the raw
-encoders — with the budget floor at `u64::MAX`, so `send_action`
+Gate 60 drives the arm's own requote verb (`HlExchange::modify_by_cloid`,
+since BX0-F3 through the `OrderDispatch::modify` the router calls), not
+the raw encoders — with the budget floor at `u64::MAX`, so `send_action`
 refuses at its barrier before any network work and only the encode
 half runs. `seal` (the nonce/signature/envelope half of `send_action`,
 split out for this) is driven beside it. Between them that is every
@@ -2425,6 +2518,1132 @@ the durable handle and an oid captured at placement is not.
 Run under the standing engine's own laws: `cargo build --release -p
 cli` first (G0), the launchd instance booted out for the window and
 bootstrapped back after, nothing left resting.
+
+### BX0-F3 — the router's cancel and modify reach the arm (2026-09-23)
+
+**The defect.** `HlExchange` implemented both lifecycle verbs as
+INHERENT methods — `cancel_by_cloid` and `modify(prev, &Order)` — but
+its `impl OrderDispatch` overrode `submit` alone. `RoutedDispatcher` is
+generic over its live arm (`L: OrderDispatch`), and generic code can
+call only trait methods, so every live slot's cancel and modify that
+reached the router got the trait default, `Err(Unsupported)`, and never
+left the host. Phase F's §7.1 measurement (above) drove the inherent
+verbs from `exec-smoke`, not through the router, so it could not see
+this: E5's "the engine learns two verbs" was true of the arm and of the
+router separately, never of the pair. It stayed invisible because
+bin15 has run with `maker_enabled = 0` — IoC entries only, nothing to
+requote or pull. Had the maker gone live, a member could neither
+requote nor take back its own quote; only the E6 halt's sweep could.
+
+**The repair.** The inherent `modify` is renamed `modify_by_cloid`, so
+no inherent method shares a name with a trait method (the shadowing
+that hid the gap). The trait's `cancel` / `modify` delegate to
+`cancel_by_cloid(req.sym, req.strategy_id, req.client_oid)` /
+`modify_by_cloid(req.prev_client_oid(), req.order())`. Spend classes
+unchanged: a cancel is an exit that no budget floor bars, a modify a
+submit (the router has already risk-checked it as a `Replace`).
+
+**The proof.** `exchange::tests::the_trait_cancel_and_modify_reach_the_cloid_verbs`
+(the arm's own LAW E-4 refusal comes back through the trait and its
+counters move) and
+`…::the_trait_modify_names_the_resting_order_and_carries_the_replacement`
+(the rendered action addresses the resting order by its cloid as `oid`
+and carries the replacement's as `c` — a transposed pair fails it).
+Break-and-watch: without the overrides both read `Unsupported`. Gate 60
+now drives the TRAIT modify, the path the router calls, at 0 B/op. The
+router→ledger half (`Ok` → `on_cancel` / `on_modify`) was already pinned
+with a spy arm. The operator accepted this split (2026-09-23) in place of
+the planned composed test — `RoutedDispatcher<Paper, HlExchange>` against
+a loopback venue — which moves to BX3.
+
+**Not re-measured on a venue.** The wire — cancel-by-cloid, and a
+`batchModify` addressing the resting order by cloid — is Phase F's,
+unchanged; BX0 changed only which caller reaches it. The bar before
+bin15's maker is switched on live: `exec-smoke --requote` plus a
+router-driven cancel/modify on testnet (plan §5 BX0 F3) — and, since a
+happy-path run exercises none of them, a ruling or a test on each of
+these paths, which the router could not reach before BX0 and now can
+(risk-reviewer, 2026-09-23; UNVERIFIED until then):
+
+1. **An uncertain modify.** The router renames the ledger row on `Ok`
+   and keeps the old one on `Err`; a modify whose reply timed out or
+   could not be read, but which the venue applied, leaves the
+   replacement unbooked and the caps under-counting. It needs the
+   E-5 "sent, unanswered" treatment: resolved by a readback, booked
+   conservatively meanwhile.
+2. **A modify the venue turns into a cancel** (a post-only replacement
+   that would cross): the old row stays in the ledger for an order that
+   no longer rests, and its later cancel returns `Err`.
+3. **A modify across an instance roll** (`instance_of(prev)` ≠
+   `instance_of(order.client_oid)`) is not refused by `stage_modify`,
+   which looks up the replacement's instance only.
+4. **Ledger edges:** a late partial fill of the old id after
+   `on_modify`; `on_modify` for an old id the ledger does not hold; a
+   modify that flips side (the HIP-4 ledger has no shorts).
+5. **A refused requote** (risk gate or budget floor) leaves the old
+   quote resting at the old price — the member must pull it.
+6. **Two members quoting one leg from one address** (`note_owner`
+   counts the contest and nothing more): self-trade prevention by the
+   venue would cancel without a fill, which a fill-fed ledger never
+   sees.
+
+### BX0 — `ingress-binance` joins the zero-copy gate (2026-09-23)
+
+On the operator's word (plan O-BX12d): every pre-existing zero-copy
+finding in `ingress-binance` fixed, and the crate put in
+`make copy-audit`'s scope.
+
+**The gate had a blind spot.** `scripts/copy-audit.sh` stopped reading a
+file at its first `#[cfg(test)]` line, on the convention that test
+modules sit at the end. Three files break the convention with a
+test-only METHOD mid-file, so everything after it went unaudited:
+`exec-router/src/routed.rs` from line 358 (≈ 920 lines of non-test
+code), `exec-hyperliquid/src/exchange.rs` from line 898 (≈ 1 570) and
+`ingress-binance/src/run_loop.rs` from line 436 (≈ 1 010). The sweep now
+skips a `#[cfg(test)]` ITEM to its own end and resumes: a brace-less
+line's `;`, a braced one-liner, or a block's closing brace at the
+attribute's indentation. It refuses to guess: `#[cfg(test)]` on a field,
+a variant, an arm or a multi-line expression, or an item that never
+closes, fails the sweep (exit 3). A `COPY:` marker inside a test item no
+longer covers the live copy below it. `scripts/copy-audit-selftest.sh`
+proves all of that on fixtures (14 live copies found and none inside a
+test item; 6 undelimitable constructs refused), and `make copy-audit`
+runs it first. A probe copy injected at the end of each formerly blind
+region was flagged in all three files. The exec lane's formerly blind
+code is clean: no new hit.
+
+**What the pass removed** (copies gone, not commented):
+
+* `parse_book_ticker` / `parse_mark_price` returned a 64 B `align(64)`
+  frame inside an `Option` — 128 B by value, on every bookTicker and
+  markPrice push. Both now fill the caller's frame in place
+  (`&mut Frame` → `bool`) and write it only once every field has
+  parsed: a failed parse leaves it untouched (a unit test, and both
+  fuzz targets assert it on every input). `parse_trade` keeps its
+  `Option` — under 64 B, asserted at compile time.
+* The spot sentinel's SUBSCRIBE was re-assembled through a stack
+  scratch on every (re)connect. Its stream symbol is now read from the
+  slot's own endpoint path, and the request's four parts go straight
+  into the masked frame through the new
+  `core_net::ws_write_text_frame_parts` (core-net's one frame
+  serialiser now writes a payload from parts; the single-payload
+  writers call it with one). Nothing is composed or stored: the
+  Driver's 32 B sentinel stream buffer is gone.
+* The Ping echo went rx → stack scratch → tx; it goes rx → tx.
+* `MultiConn` copied its host and path into two `Vec`s per connection;
+  it borrows them from the boot's endpoint list.
+* `parse_filters` copied each `filterType` into a 32 B buffer to
+  compare it; it compares the borrowed span, so an over-long
+  `filterType` no longer rejects its row (tested).
+* The discovery rows (`BnSymbolRow`; `EapiOptionRow`, 72 B) crossed a
+  return by value together with their end offset; they are parsed in
+  place into their table slot.
+* `options-select` sizes its output once (`with_capacity`), so a
+  selected row is copied in exactly once, never again by a growing Vec.
+
+**What the pass commented** (designed copies, each with its `// COPY:`):
+the ≤ 32 B symbol and ≤ 16 B underlying copied into each discovery row
+at boot (the row outlives the REST body it was scanned from, and the
+fetch buffer is reused by the next request); the options selection
+law's by-value rows (72 B, ≤ 64, once at boot — references into the
+table would change the three-venue law for ≤ 4.6 KB); the ≈ 2.9 KB
+Driver moving into its slot 2–4 times per connection at boot (every
+slot's `StreamLane` is sized for the 2 568 B options table it carries
+inline); the transport moving into its slot once per reconnect; and the
+test views that return a frame's `Option` by value.
+
+**The auditor on the pass** (`zero-copy-auditor`, Opus): PASS — no hot
+copy left in `ingress-binance`; RX = 4 copies against the target of 3
+on every Binance lane, the extra one in core-net (below). Its cold
+findings were all acted on. The first sentinel fix carried a `// COPY:`
+whose reason was false ("the driver cannot borrow the boot strings" —
+the symbol is in the slot's own path), so that copy was removed rather
+than re-worded; the Driver, transport and test-view moves got honest
+markers; the options table's marker now states its real size and its
+second move. Its review of the first version of the new skip logic
+found shapes that would still have swallowed live code silently (a
+braced `use`, an empty-bodied method, a field or a variant, a struct
+literal, a multi-line array); the reader above delimits or refuses
+each, and the self-test pins them.
+
+**Escalated, not changed:** core-net's RX path keeps a fourth copy —
+rustls' plaintext into the caller's rx buffer — and its `// COPY:`
+rejection ("rustls has no in-place plaintext borrow") is out of date for
+the `unbuffered` API of rustls 0.23 (the pinned 0.23.38). The auditor
+also flagged that the buffered API may stage each received record's
+plaintext through a heap `Vec` — an allocation per record that the
+alloc gate cannot see, because it drives a test transport. UNVERIFIED:
+it needs an allocation count over a real TLS loopback before anyone
+moves the engine's TLS reader.
+
+**Measured since the HYPARB merge (2026-09-23).** HYPARB H9's bench
+gate 72 is that count: `HttpsPost` against a rustls loopback node, in a
+child process, allocates EXACTLY 2 per request — one per record sealed,
+one per application-data record decrypted (rustls 0.23's buffered API)
+— once `TlsTransport::read`'s `WouldBlock` stopped allocating (3 more
+per drain loop until then). Record: "HYPARB — slot 0" → "What H9 fixed
+on the write path". The move to the unbuffered API stays the
+operator's transport decision.
+
+Gate after the pass: `hits=32 baselined=32 new=0 paid=0` over the exec
+lane, `core-net` and `ingress-binance`. The baseline shrank by one (the
+old single-payload copy in `ws_frame.rs`, now the marked parts write)
+and did not grow.
+
+### BX0 — the other ingress crates parse in place too (2026-09-23)
+
+On the operator's word ("the okx, deribit, hyperliquid and mexc parsers
+return frames by value too — fix it as far as you've found it"): the
+pattern the BX0 pass removed from `ingress-binance` was measured across
+every other ingress crate and removed there as well — `ingress-okx`,
+`-deribit`, `-hyperliquid`, `-mexc`, `-bybit`, `-polymarket` and `-rpc`.
+
+**What the pass removed** (copies gone, not commented):
+
+* **30 parsers** returned a 64 B `align(64)` frame inside an `Option` —
+  128 B by value (192 B for `DeribitTickerFrame`, 256 B for HL's
+  `DepthTopK`) on every push they parse. Each now fills the caller's
+  frame in place (`&mut Frame` → `bool`, `#[must_use]`) and writes it
+  once, only after every field has parsed, so a failed parse leaves it
+  untouched. The one exception is `parse_l2book_depth`, whose level
+  carrier fills as the walk goes and is never read on `false` (its
+  header obeys the rule).
+* **Frames inside the dispatch value.** The two-phase run loops carried
+  the parsed `Tick` / frame / head inside `Dispatch` from phase 1 to
+  phase 2 — every dispatch value ≥ 128 B (a 64 B `align(64)` payload
+  plus its tag), and mexc's crossed two function returns by value. The frame now lives in a phase-1 scratch the arm
+  writes in place; the variant only says it was written. Each run
+  loop's `Dispatch` is const-asserted ≤ 64 B (HL's 64 B roll spec is
+  parked in the driver to fit).
+* **OKX's 144 B `TradeScan`** staged sixteen seq ids for phase 2. The
+  seq monitor is a driver field disjoint from the rx borrow, so the walk
+  chain-checks the same first 16 rows as it reads them; the scan is
+  12 B.
+* **The top-K change gate** kept the last snapshot by copying the new
+  one over it (192 B per changed push, OKX / Deribit / HL). The new
+  `core_types::DepthPair` holds two rows: the snapshot is written in
+  place into the spare one and becomes the last by an index flip.
+  `DepthLadder::snapshot_into` / `top_k_into` replace the 192 B / 80 B
+  by-value `snapshot` / `top_k`.
+* **HL walked an outcome leg's `l2Book` twice** (header, then depth):
+  `parse_l2book_depth` now yields the header from the same walk.
+
+**What the pass commented** (designed copies, each with its `// COPY:`):
+the 192 B `DepthTopK` pushed into the depth ring (OKX, Deribit) —
+core-ring has only a by-value `try_push`; the boot-time discovery rows
+(Deribit, MEXC ×2, HL, Polymarket ×2, OKX; 80–264 B, once per row);
+`DepthPair::new` at boot; the HL test recorder; and one marker per test
+view (the views are now one `#[cfg(test)] mod views` per file). Two
+by-value returns at the bound are pinned by compile-time asserts:
+`Option<MexcSpotFrame>` (64 B only through `MexcChannel`'s niche) and
+Deribit's 56 B `TradeScan`.
+
+**The fuzz contract is checked against non-zero bytes.** Starting a
+target from `ZERO` could not tell "untouched" from "zeroed on the way
+out". Thirteen targets now start from a `0xA5`-filled frame
+(`fuzz/fuzz_targets/common/poison.rs`; `poisoned::<T>()` is bounded on
+the `unsafe trait AnyBits`, implemented only for the 28 frames checked
+field by field as integer-only `repr(C)`). `parse_price_change_row` and
+`parse_l2book_depth` are now fuzzed and alloc-gated; `hl_l2book` —
+broken since `HlStaleness::arm` took the coin table — compiles again
+and runs a header-vs-depth differential.
+
+**The auditor on the pass** (`zero-copy-auditor`): PASS — no hot hidden
+copy left on these lanes; RX = 4 against the target of 3, the extra one
+core-net's rustls copy (above). Its findings were acted on: the poison
+helper's first soundness argument (a niche check) was not a proof, so
+the proof moved into the `AnyBits` contract and the niche check stayed
+as a tripwire; three more cold discovery returns got markers; two
+at-bound returns got size pins; stale docs were corrected.
+
+**Open, not in this pass:**
+
+1. **core-ring moves by value.** `try_push(T)` and `try_pop() ->
+   Option<T>` — every consumer pops a 128 B `Option<Tick>` per tick and
+   a 256 B `Option<DepthTopK>` per snapshot. An in-slot claim/commit
+   push and a `pop_into(&mut T) -> bool` is its own change, across
+   every consumer. *Closed by ZC pass A, below (in-place pop, no claim).*
+2. **These seven crates are not in `make copy-audit`.** A sweep with
+   the script's own reader finds 51 unmarked copy verbs, all older than
+   this pass. The hot one is the WS Ping echo through a 125 B stack
+   scratch in OKX, Deribit, HL, Bybit, RPC and Polymarket (BX0 removed
+   it from Binance; MEXC marks it); the rest are cold (subscribe,
+   resync and log renders, boot symbol copies, Bybit's boot `to_vec`).
+   Whether they join the gate is the operator's call. *Closed by ZC pass
+   B, below.*
+
+Gates after the pass: clippy clean; nextest 2743 passed (3 skipped; one
+earlier run hit the known parallel-load flake
+`hl_userws_loopback::a_frame_larger_than_the_buffer_is_refused_not_grown`,
+green alone and on the rerun); alloc 64/64 at 0 B/op; `make copy-audit`
+new=0; license-check OK; fourteen fuzz targets 60 s each, no crash
+(1.1 M–31 M runs); live smokes 60 s — MEXC 31 002 messages, Binance
+59 819 — both with 0 parse errors and 0 reconnects.
+
+### ZC pass B — the seven ingress crates join the zero-copy gate (2026-09-24)
+
+On the operator's word (the zero-copy next-pass plan; its open questions
+ruled 2026-09-24 — every plan default, plus: delete
+`drain_and_count_loop`, drop `book-builder`'s unused `core-ring`
+dependency, commit each green checkpoint): item 2 of "Open, not in this
+pass" above is closed. `ingress-okx`, `-deribit`, `-hyperliquid`,
+`-mexc`, `-bybit`, `-polymarket` and `-rpc` — and `core-ring` — are in
+`make copy-audit`'s default scope, which now covers the exec lane,
+core-net, core-ring, all nine ingress crates and the HYPARB crates.
+
+**Before:** the script's own reader over the seven crates found 51
+unmarked copy lines (47 unique keys). MEXC had none, because its two
+copies carried markers — and both markers stated a false premise.
+
+**What the pass removed** (copies gone, not commented):
+
+* **The WS Ping echo** (hot: every venue ping) went rx → 125 B stack
+  scratch → tx in OKX, Deribit, HL, Bybit, RPC and Polymarket; MEXC's
+  marker on the same copy said echoing from rx "would alias rx and tx
+  borrows". It would not: rx and tx are disjoint driver fields. All
+  seven echo rx → tx, as Binance has since BX0 — and so does
+  `exec-hyperliquid`'s user-WS (the FILLS socket), whose marker made the
+  same false claim (found by the auditor). Every crate now tests a 0 B,
+  4 B and 125 B ping through core-net's shared test support
+  (`TestTransport::PING_ECHO_CASES`, `inject_server_ping`,
+  `expect_pong_echo`); the user-WS loopback answers all three.
+* **Deribit's DVOL index name** was copied into the frame's 16 B array
+  on every push. The frame carries its span instead
+  (`index_name_off`, `index_name_len`; still 64 B, integer-only) and the
+  run loop compares the name where it lies in rx
+  (`DeribitVolIndexFrame::index_name(payload)`); the fuzz target asserts
+  the span on every input that parses.
+* **Fixed-shape requests are masked into tx from their parts** —
+  core-net `ws_write_binary_frame_parts`,
+  `queue_masked_binary_frame_parts` and `queue_masked_text_frame_parts`
+  (the single-payload queue functions are one-line wrappers; the old
+  `ws_write_binary_frame` is gone). This retired: RPC's 2 s
+  `eth_blockNumber` poll and its `newHeads` subscribe (a 96 B scratch
+  each, the id's digits copied twice) — and `ingress-hyperevm`'s
+  identical two requests, which had reused RPC's writers; Deribit's
+  `public/test` (the answer to every heartbeat), its book resync and its
+  `set_heartbeat`; OKX's books resync; and every HL (un)subscribe (a
+  160 B scratch per frame, on every session and every 15-minute outcome
+  roll). A parts array wider than 64 B is filled in the caller's slot
+  (`&mut [&[u8]; 5]`), never returned by value.
+* **False borrow premises.** HL copied each coin out of its table before
+  queueing a frame (the roll's unsubscribe, the ack retry, the subscribe
+  sweep), and Deribit each instrument (the resync, the confirmed-sub
+  registration). The queue helpers now take the tx fields rather than
+  the driver, so every name is read in place. Bybit and MEXC copied
+  host and path into two `Vec`s per connection; they borrow them from
+  the boot's endpoint list (MEXC's marker said the conn "must own them"
+  — it is built on the ingress thread, from that list).
+* **HL's roll** rendered each new coin into a stack buffer, copied it
+  into its table row, then rendered it again to subscribe. It renders
+  straight into the row (`HlCoinTable::rebind_outcome`) and subscribes
+  from the row.
+* **Polymarket** built its 10 240 B id table beside the driver and moved
+  it in; it fills the driver's own table.
+
+**What the pass commented** (every remaining copy verb, 24 markers over
+29 lines, plus the hidden moves the auditor flagged): boot discovery and
+symbol-table rows (16–80 B; a row outlives the REST body it was scanned
+from, and the table owns fixed rows for the hot lookup); boot driver
+tables (OKX families ≤ 384 B, Deribit DVOL ≤ 128 B, Polymarket ids ≤
+10 240 B); the variable-length batch subscribe renders (OKX ≤ 12 KiB,
+Deribit ≤ 16 KiB, Bybit ≤ 8 KiB, Polymarket ≤ 11 KiB — the frame length
+is unknown until the render ends; a header-first render is the
+operator's later pass, Q7 — done 2026-09-26, "Batch subscribes render
+straight into tx", below); the rate-limited WARN lines (≤ 224 B, one a
+second — one `writev` rejected: a short writev splits the line);
+Deribit's ≤ 64 B memmem needle per subscribe result; the RPC signal
+payload's 8 B word encodes. On the auditor's flag (ruling Q12): the
+1 080 B `TlsTransport` moving into its slot once per reconnect (Bybit,
+MEXC — Binance's marker), and the boot moves at MEASURED sizes — the
+OKX (7 696 B), Deribit (9 520 B), Bybit (4 296 B; slot 5 488 B), MEXC
+(1 792 B; slot 3 008 B) and Polymarket (10 536 B) drivers with the
+tables they take by value.
+
+**The auditor on the pass** (`zero-copy-auditor`, Opus 5.5): PASS —
+RX = 4 against the target of 3 on every lane (the extra one core-net's
+escalated rustls copy, above), TX = 2 plus the serialiser's single
+write. Every cold finding and every flagged hidden move was acted on
+(above); its borderline notes — MEXC futures' per-(symbol, channel)
+subscribe render and the other remaining render markers as candidates
+for Q7's pass — stay open (closed 2026-09-26 by the header-first renders,
+below; HyperEVM's request bodies stay copied, re-marked).
+
+Gate after the pass: `hits=31 baselined=31 new=0 paid=0` over 21 dirs —
+the baseline byte-identical (sha256 `caf8a05e…`), the seven crates and
+core-ring at zero hits.
+
+Gates after the pass: clippy clean; nextest 3119 passed (5 skipped);
+alloc 72/72 at 0 B/op (fresh `Compiling bench`); license-check OK;
+fuzz from a poisoned start — `deribit_vol_index` 300 s (52.9 M runs),
+`rpc_subscribe_envelope` 120 s (13.8 M) and `deribit_jsonrpc_frame`,
+`hl_ws_frame`, `okx_frame`, `bybit_ws_frame`, `polymarket_clob_frame`,
+`rpc_response`, `mexc_ws_frame` 60 s each, no crash; Miri was not needed
+(no unsafe changed). Live smokes 60 s, the engine untouched — MEXC
+31 008 messages, Binance 65 120, both 0 parse errors, 0 reconnects, 0
+ring drops. (The first smoke runs timed out at the boot REST call: the
+Mac's LuLu firewall blocks a freshly built binary's outbound connections
+until the operator allows it — a smoke `Timeout` there is LuLu, not the
+code.) The release engine binary was not rebuilt.
+
+### ZC pass A — core-ring lends its slots (2026-09-24)
+
+On the operator's word (the same plan and rulings as pass B: the RAII
+guard over a peek/advance pair, 128 B index padding, split exactly once,
+Miri plus a torn-read stress rather than loom, the slot stride decided on
+the numbers below): item 1 of "Open, not in this pass" above is closed.
+**No ring element crosses a function boundary by value.**
+
+**The API.** `Producer::try_push_ref(&T) -> bool` copies ONE element from
+the caller's value into its slot and publishes it — the ring-slot publish,
+the law's designed copy, marked `// COPY:` in core-ring; `false` = full,
+nothing written (`#[must_use]`). `Consumer::try_pop_ref() ->
+Option<Popped<'_, T, N>>` lends the oldest slot in place: the guard derefs
+to the slot itself, and dropping it releases the slot (a Release store of
+`tail`). A held guard keeps its slot occupied and its consumer borrowed; a
+`mem::forget`ten one consumes nothing. The by-value `try_push(T)` /
+`try_pop() -> Option<T>` are deleted, with their `compiler_fence`s and
+`impl Drop for Ring`: `Ring::new` and every handle method are bounded on
+`T: Copy`, so a ring never runs a destructor.
+
+**What left the data path (D1).** Every consumer copied an `Option<T>` out
+of its slot per element — 128 B per tick, event, option record and AI
+command, 256 B per depth snapshot; OKX and Deribit pushed their 192 B
+`DepthTopK` by value; `ingress-ai` pushed the 32 832 B ruleset table by
+value and the engine popped it into a 32 896 B `Option` on its own stack
+before `on_ruleset_table`. Now every lane is one copy into the slot and a
+read in place; the table's documented copies are the two left (scratch →
+slot, slot → the vm member's staged buffer — now marked `// COPY:` in
+`strategy-vm`). What still leaves a slot by value is ≤ 64 B and outlives
+it by design: the engine's store into the `/state` recent-fills ring, the
+HYPARB live arm's fills (the dispatcher trait hands the pump an owned
+`Fill`), retired oids and swap request, and the EVM shadow's pending
+decision (both of the last feed a `&mut self` send).
+
+**Hardening (D2–D5).**
+
+* **D2 — whole-buffer retags.** The old push and pop reached a slot
+  through a reference over the WHOLE buffer while the other thread used
+  another slot. Miri on the pre-pass ring reports that as a data race
+  under Stacked Borrows and under Tree Borrows. Every slot is now its own
+  `UnsafeCell`, reached through a raw element pointer; `Ring` is
+  `#[repr(C)]` (head | tail | buf | split).
+* **D3 — two producers from safe code.** `split()` worked on any `Arc`
+  clone. It now succeeds exactly once (an `AtomicBool` swap; a second call
+  panics — boot-time, an abort in release). It caught one latent double
+  split, in the test `cli::paper::rings_allocate_and_split`.
+* **D4 — false sharing on the M4.** `head` and `tail` sat 64 B apart,
+  one 128 B line on the M4 Pro (`hw.cachelinesize: 128`), contended on
+  every push and pop. Each now owns a 128 B granule; `offset_of!` pins
+  0 / 128 and `buf` at 256. The ring is built in place in its `Arc`
+  (`Arc::new_uninit`) — no stack temporary, no Box → Arc copy of a 1 MiB
+  tick ring.
+* **D5 — housekeeping.** The redundant `compiler_fence`s are gone (the
+  Release store and the Acquire load order the slot access for compiler
+  and CPU alike); the `Sync` SAFETY comment is true again; `proptest`
+  drives a model test; `book-builder`'s unused `core-ring` dependency is
+  dropped (Q13); the engine's "16 KiB" table reads 32 KiB.
+
+**Proof.** Unit tests (FIFO, full at exactly N, wrap-around, a held guard
+keeps its slot, a forgotten guard consumes nothing, the lent address lies
+inside the ring's allocation, a guard pushed into a second ring, a second
+split panics, the layout); two-thread hand-offs on the weakly ordered M4
+(16 384 values through 8 slots; 200 000 192 B payloads whose 24 words must
+agree — never torn); a proptest model against `VecDeque` (push, pop,
+hold-a-guard-and-push, forget). Miri: clean under Stacked Borrows and under
+Tree Borrows (14 tests; the proptest ignored), and under
+`-Zmiri-many-seeds=0..16` for the two-thread tests.
+
+**Callers.** Every production site moved — 48, and the 6 in
+`drain_and_count_loop` went with it. The engine reads all nine lanes in
+place (tick, RPC signal, pool, fill, event, depth, options, ruleset table,
+AI); `touch_sym_bucket` and `dispatch_signal` became associated fns over
+the fields they touch, because a guard borrows one lane of the engine for
+its arm. The effect order inside each arm is unchanged, and the engine's
+exactly-once tests (`ticks_dispatched` across budgeted iterations) pass
+unchanged. The queued dispatcher's worker submits each order from its
+slot. `drain_and_count_loop`, which had no caller but its own test, is
+deleted with its counters (Q8). About 250 test and bench call sites moved
+with it; a test that needs an owned value copies it out
+(`*c.try_pop_ref().expect(..)`, `.as_deref().copied()`).
+
+**Bench** (the Apple M4 Pro, criterion medians, the live engine running
+beside it; both APIs measured side by side before the deletion):
+
+| bench | in place | by value (deleted) |
+|---|---|---|
+| push + pop, `Tick` | 2.53 ns | 5.68 ns |
+| push + pop, 192 B `DepthTopK` | 4.35 ns | 6.21 ns |
+| two threads, stream — the engine's pattern | ~53 ns | ~58–61 ns |
+| two threads, ping-pong round trip | ~179–186 ns | ~149–154 ns |
+
+After the deletion: 2.51 ns, 4.30 ns, 49.7 ns and 168.8 ns. The queued
+dispatcher's `dispatcher/queued_submit` went from 1.65 ns (commit
+`0990e4f`, same host, same session) to 0.51 ns — with no worker draining,
+that bench mostly times the full-ring refusal, where the by-value push
+handed the 64 B order back in its `Err`.
+
+Q10 — **no slot-stride change.** Reading in place does not lose to copying
+out on the streaming path, adjacent 64 B slots sharing a 128 B line
+included. The round trip is ~20 % slower in place: the echo thread holds
+its guard across the onward push, so the source ring's `tail` store lands
+after the push and the other side waits on that line. Producer-cached
+`tail` / consumer-cached `head` (Rigtorp) take the cross-core index read
+off the push and pop paths of both shapes; that is its own pass, with
+these benches as its baseline. *Done: "core-ring caches the other side's
+index", below.* `crates/bench/baselines/hot_path.json`'s
+`ring/push_pop_tick` is now `ring/push_ref_pop_ref_tick` at the M4 median.
+
+`make bench-check` cannot compare on this Mac: `check_regression.py`'s
+`float | None` annotation needs Python ≥ 3.10 (the system Python is
+3.9.6), and criterion files `bench_function("ring/push_ref_pop_ref_tick")`
+under `target/criterion/ring_push_ref_pop_ref_tick/`, not the
+`ring/push_ref_pop_ref_tick/` path the script reads — so every sample
+reads "missing" and the check passes vacuously. The comparison was made by
+hand: the ring bench −0.8 % against its new baseline; the benches this pass
+does not touch (`book/apply_n8_middle` 2.01 ns, the latency-arb callback
+2.37 ns) read the same as at `0990e4f` on this host (1.96 ns, 2.33 ns) —
+their distance from the sandbox baseline is the host, not a regression.
+The script's repair is left to the operator. *Repaired, and that distance
+measured: it is D10's stale-drop count, not the host — "`make
+bench-check` compares", below.*
+
+**The auditor on the pass** (`zero-copy-auditor`, Opus 5.5): PASS — RX = 4
+against the target of 3 (the extra one core-net's escalated rustls copy),
+TX = 2; the consumer side of every lane now costs no copy. Every copy out
+of a guard is ≤ 64 B and forced; no production code moves a `DepthTopK`
+or a ruleset table by value; no soundness finding in core-ring (ordering,
+slot exclusion, `Send`/`Sync`, the split, `Arc::new_uninit`). Its findings
+were acted on: the lane-3 fill marker (it said ≤ 128 B; a `Fill` is 64 B)
+is in the canonical form and covers both pushes; the engine's `tick()` doc
+names the recent-fills copy it had denied; the EVM shadow takes its next
+decision out of the slot in one move, not two; core-ring's marker says
+≤ 64 B and gives the claim's real rejection; SAFETY (2) no longer assumes
+the loaded `tail` is current; stale ruleset docs ("16 KiB", "parked until
+item 7") and a dangling `receive_table` link are fixed; the vm member's
+copy #2 carries its `// COPY:` line.
+
+Gates after the pass: clippy clean; nextest 3125 passed (5 skipped); alloc 73/73 at
+0 B/op (fresh `Compiling bench`; −1 by-value ring gate, +2 in-place
+ring gates, one of them the 192 B depth lane); `make copy-audit`
+`hits=31 baselined=31 new=0 paid=0`, the baseline byte-identical
+(sha256 `caf8a05e…`); license-check OK; `cargo +nightly fuzz build` OK (no
+parser changed). Live smokes 60 s, the engine untouched, every element
+through the in-place rings: MEXC 31 176 messages (1 594 ticks, funding on
+the event lane), Binance 27 334 (28 159 ticks — four USDⓈ-M books, spot,
+16 options; markPrice and funding events; 59 summaries per option on the
+opt lane), both 0 parse errors, 0 reconnects and 0 drops on every ring.
+They ran on 2026-09-25, after the commit: LuLu had blocked the rebuilt
+smoke binaries until the operator allowed them (both first timed out at
+the boot REST call while curl from the same Mac reached both venues). The
+release engine binary was not rebuilt.
+
+### core-ring caches the other side's index (2026-09-25)
+
+On the operator's word (2026-09-25: implement the cached-index ring "to
+win back the slower two-thread round trip") — the follow-up ZC pass A
+named.
+
+**What changed.** Each handle keeps its OWN index in a plain field — it is
+that index's only writer, so it publishes the shared atomic (Release) and
+never reads it back — and a CACHE of the OTHER side's index, refreshed
+(Acquire) only when the cache shows the ring full (producer) or empty
+(consumer) and stored only when the refresh finds news. Per element,
+neither side touches the other side's index line: a burst of `k` costs the
+consumer one `head` load, and the producer refreshes `tail` once per
+`N − L` pushes at occupancy `L`. The API is unchanged;
+`Producer::published()` is new — the producer's own publish count, a field
+read. A guard still carries its position; dropping it advances the private
+`tail` and publishes it.
+
+**Which variant.** An interleaved A/B on the M4 — every variant on the
+same two OS threads, alternating round by round (21 rounds), so thread
+placement and background load hit them alike — in ns per operation
+(median; the round trip across two such runs):
+
+| variant | round trip | saturated stream | same-core push+pop |
+|---|---|---|---|
+| uncached (pass A) | 170–175 | 50 | 2.14 |
+| each side re-loads its own index from the ring (Rigtorp's C++) | 114–126 | 2.7 | 2.76 |
+| the producer's own index private | 107 | 4.1 | 2.81 |
+| **both own indices private (chosen)** | **99–108** | 3.9–4.3 | 2.68 |
+
+The round trip is the engine's regime — one tick in flight, the consumer
+waiting — and there the private own index is what wins: re-loading it from
+its shared line, which the other side's refreshes read, cost 6–27 % per
+round trip. The saturated stream (a producer flat out against a consumer
+that reads every field twice) is bistable in the private variants (2.5–5 ns,
+as the ring runs full or in lockstep) — orders of magnitude above any
+feed's rate either way. 256 B index granules changed nothing measurable.
+
+Criterion, same session, three runs each, before → after: round trip
+170–177 → 103–111 ns; stream 50 → 9.2–9.4 ns; same-core push+pop, `Tick`
+2.52 → 2.99–3.06 ns and `DepthTopK` 4.31–4.37 → 4.86–4.91 ns. The same-core
+cost is the price of the private state — about 0.5 ns per push+pop against
+about 35 ns saved per cross-core hop — and `hot_path.json`'s
+`ring/push_ref_pop_ref_tick` is re-baselined to 2.99 ns with that note.
+`dispatcher/queued_submit` (mostly the full-ring refusal) reads 0.57 ns.
+
+**The ingress drain loops.** The ten I-3 loops (Binance ×2, Bybit, Deribit,
+HyperEVM, Hyperliquid, MEXC, OKX, Polymarket, RPC) judged progress by
+`producer.len()` before and after each drive step: two loads of the
+engine's `tail` per iteration — the cross-core read the caches remove —
+and a count every concurrent engine pop also moves, so a pop during a
+tick-less step read as progress and a push cancelled by a pop read as
+none. Their own comment defines progress as "we produced a tick OR moved
+the driver's state machine forward"; they now compare
+`producer.published()`, which is exactly that, at the cost of a field
+read. HyperEVM's three `len() < CAP` room checks (snapshot emission, boot
+and resync cadence) keep `len()`, an upper bound: a true answer guarantees
+the push lands.
+
+What this does NOT fix (pre-existing; the reviewer's notes, left to the
+operator): progress counts ticks only, so a drive step that stops on a
+FULL rx (not on WouldBlock) and publishes no tick — non-tick frames, or
+ticks dropped on a full ring — leaves its unread bytes for the next
+readiness edge or the poll timeout (the old `len()` check re-drove such a
+step only when an engine pop happened to land inside it); and the
+multi-connection loops (Binance, Bybit, MEXC) have no per-connection step
+cap. Both want their own change — consumed rx bytes and the other rings'
+publishes counted as progress; a step cap with a zero-timeout re-poll.
+*Fixed, with a read that stopped on a full rx as the progress signal: "The
+I-3 drain loops read past a full rx", below.*
+
+**Proof.** 21 core-ring tests. New: a stale tail cache refreshes when the
+ring looks full (a refused push keeps it); a stale head cache refreshes
+when it looks empty (one refresh serves a burst); `published` counts
+publishes only; the private indices match the published ones (a forgotten
+guard advancing neither); each handle carries its index and one cache;
+every index wraps through `usize::MAX`. The proptest model now starts up
+to 64 below the wrap, checks both `len`s and `published`, and after every
+operation asserts the private indices equal the published ones and each
+cache lags its side. Miri: Stacked and Tree Borrows clean,
+`-Zmiri-many-seeds=0..16` clean on the two-thread tests.
+
+**The review** (a subagent acting as `zero-copy-auditor`, concurrency
+focus): PASS — no memory-ordering, aliasing or zero-copy finding; the
+core-ring `// COPY:` marker stands. Its wording findings were acted on: the
+SAFETY comments no longer claim a refresh before the first lap and state
+the wrapping distances; the docs no longer promise one `tail` load per `N`
+pushes when the consumer lags; the `len`s document their bounds; the tests
+pin the caches, the lag invariants and the wrap. Its two ingress notes are
+the paragraph above.
+
+Gates: clippy clean; nextest 3131 passed (5 skipped); alloc 73/73 at 0 B/op
+(fresh `Compiling bench`); `make copy-audit` `hits=31 baselined=31 new=0
+paid=0`, the baseline byte-identical; license-check OK; `cargo +nightly fuzz
+build` OK; live smokes 60 s, the engine untouched — MEXC 31 245 messages
+(1 719 ticks), Binance 44 785 (45 610 ticks), 0 parse errors, 0 reconnects,
+0 drops on every ring. The release engine binary was not rebuilt.
+
+### `make bench-check` compares (2026-09-25)
+
+On the operator's word (2026-09-25: "finish what's left of our
+refactoring" — the bench-check item of the three).
+
+**What was wrong.** `check_regression.py` could not run on this Mac, and
+could not have compared anything if it had: its `float | None` annotation
+needs Python ≥ 3.10 (the Mac's is 3.9.6); it looked for results under
+`target/criterion/<group>/<name>/`, where criterion 0.5 files
+`bench_function("ring/push_ref_pop_ref_tick")` under
+`ring_push_ref_pop_ref_tick/`; its `_ns`-suffix rule turned `clock/now_ns`
+into `clock/now`; and a sample with no result printed a WARNING, then "OK".
+The baseline beside it was a 2026-05-19 Linux sandbox run.
+
+**What it does now.** It finds each result by the id criterion records in
+the result's own `new/benchmark.json` (`full_id`), never by path, and the
+baseline's keys are those ids exactly (`signer/sign_order_full_ns` is now
+`signer/sign_order_full`; the suffix rule is gone). A baselined sample with
+no result fails the check, and so, under `--since`, does a result written
+before the run began — one left from an earlier run, or from a bench since
+deleted, cannot stand in for this run's; `make bench-check` passes its
+start time. Samples faster than the baseline by more than the tolerance are
+listed (re-baseline, or a slide back to the old number passes unseen), and
+benches that ran without a baseline are named. Exit 0 pass, 1 regression
+or missing result, 2 unusable baseline. Python ≥ 3.9, full imports only.
+
+**The baseline, on the M4.** Each value the median of three `make
+bench-check` runs at `5f2140f`, with the launchd engine running as it
+always is; a fourth run against it: all 11 within 1.3 %. The single-thread
+`ring/push_ref_pop_ref_depth` joins the gate. The two-thread ring benches
+stay out: macOS places their threads, and between sessions they moved
+103–122 ns (round trip) and 9–11 ns (stream) with no code change.
+
+**A correction.** ZC pass A (above) read `book/apply_n8_middle` (2.01 ns)
+and the latency-arb callback (2.37 ns) against the sandbox's 0.94 /
+1.66 ns and called the distance the host. It is not: the initial commit's
+code (`02db7a6`), benched on this M4 in the same hour, reads 1.07 /
+1.69 ns. The rise is phase 8a's D10 (`503606f`): a stale apply now counts
+itself (`stale_drops += 1`, a read-modify-write per call) where it used to
+return, and both benches repeat one tick, so every apply after the first
+is stale. That is the policy — D10 never drops silently — not a regression
+to undo; it does mean both benches time the stale path, not an apply (a
+bench of the applied path would be a new id).
+
+Gates: `make bench-check` passes; against the old baseline it fails, as it
+should (book +114 %, latency-arb +43 %, the `_ns` key missing). The
+script's error paths — no baseline, a non-positive value, no tolerance, a
+missing sample, a regression, no criterion directory — exit as documented.
+This work built no engine binary.
+
+### The I-3 drain loops read past a full rx (2026-09-25)
+
+On the operator's word (2026-09-25: "finish what's left of our
+refactoring" — the I-3 item of the three).
+
+**What was wrong** (the cached-ring pass's open notes, above). A drive step
+reads until rx is full or the transport says `WouldBlock`. The ten loops
+drove again only when a step published a tick or moved its state, so a
+step that stopped on a *full* rx and published nothing — a run of pongs,
+acks, heartbeats, events or options summaries, or ticks a full ring
+dropped — left the rest in the kernel or in rustls, and an edge-triggered
+poller never announces bytes that already arrived: they waited for the
+next packet or the 50 ms poll timeout. And the three multi-connection loops
+(Binance, Bybit, MEXC) drained each slot without a bound, so one slot's
+backlog held every other slot, the keepalives, the capture flush and the
+stop flag.
+
+**What changed.** `core_net::drain` holds what the loops share.
+`fill_rx` — the read half of every `drive_one`, one copy where there were
+nine — reports `RxFill::Full` when a read took bytes and stopped on a full
+rx; a read that finds rx already full took nothing and reports `Drained`,
+since driving again cannot shrink a frame larger than rx. `drive_one`
+returns that as a bool, and each crate's new `drive_until_idle` — one
+body, the `core_net::drain_until_idle!` macro (each crate's `drive_one`
+takes its own lanes, and a closure is off the table on this path) —
+drives again while a step filled rx, published, or moved its state
+(HyperEVM: or its phase), for at most `DRAIN_STEP_CAP` = 8 steps. A capped
+drain ends `Drained::Capped` and the next poll does not sleep
+(`poll_timeout`); every live connection is driven every iteration anyway,
+so the capped one resumes once the others have had their turn. Eight steps bound one turn at
+eight rx buffers: 0.5 MiB (Binance spot, Polymarket, RPC) to 32 MiB (OKX,
+Deribit). The kill and reconnect paths are unchanged; OKX and Deribit still
+record the failing step's io-kind (`Drained::Failed(kind)`). Binance dropped
+its private copy of `IoBuf` for core-net's — the same type — and its
+sentinel SUBSCRIBE now goes through `queue_masked_text_frame_parts`.
+
+Why "filled rx" rather than "read any bytes": a step that read to
+`WouldBlock` has taken everything that had arrived, and anything newer
+arrives with its own readiness edge, so counting every read would buy one
+wasted drive — one read syscall — per wake. The publish criterion stays:
+HyperEVM's snapshot phases emit as the engine frees ring room, and a step
+that published costs one more read, as before.
+
+**Proof.** core-net: `fill_rx` drained at `WouldBlock`; `Full` with input
+left below; an exact fill reports `Full` and the next read decides; rx
+already full is not progress; EOF keeps the bytes before it. The macro,
+over a scripted connection: a full read, a publish and a state change
+each count as progress; a step without any ends the drain at once; a
+drain that keeps progressing stops at exactly `DRAIN_STEP_CAP` steps and
+the next one resumes; a close or a failure ends it at the step that saw
+it. All nine crates: two rx buffers of Pongs with a tick behind them (a
+signal on RPC, a swap on HyperEVM) are delivered by one drain — on the old
+criterion the test fails (checked by mutation on Polymarket) — and eight
+end `Capped` with the tick still below; the next drain delivers it. And
+Polymarket's `run`, fed a backlog one rx past the cap that no readiness
+edge will announce, delivers its tick well inside one `POLL_IDLE`; with
+`Capped` not wired to the zero-timeout poll it takes 50.7 ms and the test
+fails (checked by mutation).
+
+**The review** (a read-only subagent): PASS WITH NOTES, all correctness
+areas clean — no path stalls input or spins, `repoll_now` is set and reset
+right in all ten loops, no slot is starved or forgotten, the close and
+error paths are unchanged. Acted on: the `run`-level re-poll test, the
+macro in place of nine copies of the loop, three doc comments. Left open,
+pre-existing, each its own change: Binance (its 2 MiB options slot
+included), OKX, Polymarket, RPC and HyperEVM stall on a frame larger than
+rx until the idle timeout (Bybit, Deribit, Hyperliquid and MEXC fail fast
+on one); every `drive_one` marks `Closed` on EOF before parsing the
+complete frames that arrived with it (**both closed by HK2, 2026-10-13** —
+the EOF one for an EOF the read itself meets; see "HK2" at the end); the multi-connection re-poll is
+tested through the drain, not end to end (a `TestTransport` slot cannot
+finish a handshake inside `run_multi`); and the exec lane's user-WS fill
+(`exec-hyperliquid` `userws_conn`) reads only on a readiness event, the
+same gap outside this change.
+
+Gates: clippy clean; nextest 3150 passed (5 skipped); alloc 73/73 at 0 B/op
+(fresh `Compiling bench`); `make copy-audit` `hits=31 baselined=31 new=0
+paid=0`; license-check OK; `cargo +nightly fuzz build` OK; live smokes
+60 s, the engine untouched — MEXC 31 195 messages (1 575 ticks), Binance
+92 037 (92 876 ticks), 0 parse errors, 0 reconnects, 0 drops on every ring.
+This work built no engine binary.
+
+**Hypercall joins (2026-09-26, the commit after its merge).**
+`ingress-hypercall` was built beside this change with its own drain:
+progress was a consumed frame or a state change, 64 steps, then the
+50 ms poll. That read past a run of republications that publish
+nothing, but a capped backlog still waited for the poll timeout, and
+the crate kept its own copy of the read loop. It now drains by
+`core_net::drain` like the others: `fill_rx`; `drive_one` returns the
+full-rx bool; `drive_until_idle` over `drain_until_idle!` (published =
+its tick producer, key = its state); `DRAIN_STEP_CAP` = 8 steps of its
+1 MiB rx; `poll_timeout` after a capped drain. Proof: two rx buffers of
+Pongs with a quote behind them are delivered by one drain; eight end
+`Capped` with the quote still below, and the next drain delivers it;
+with the full-rx signal cut, the test fails (checked by mutation). As
+for MEXC, the `run`-level re-poll is wired and tested through the
+drain, not end to end. Not changed: its reconnect is internal (one
+`HcConn`), like MEXC's `run_multi`, and a confirmed subscription resets
+its backoff; the 30 s healthy-session law (`7235201`) binds the seven
+outer spawn loops. Gates: nextest 3424 (6 skipped); alloc 86/86;
+clippy clean; copy-audit new=0; license OK; worker pytest unchanged.
+Live smoke, the engine untouched (2026-09-26 12:00Z, ruling O-HC13: the
+operator allowed the freshly built test binary in LuLu, which had held its
+11:36Z boot `GET /markets` — curl fetched the same 4.3 MB in 1.7 s): `GET
+/markets` 4.34 MB in 1.8 s, 32 instruments; 90 s — 2 342 messages, 1 494
+ticks, 0 parse errors, 0 reconnects, 0 ring drops, 0 opt-ring drops, one
+subscribe, no venue close, 880 provider sides, the poller 6 ok / 0 err /
+48 rows, clock-sync RTT 98 ms.
+
+**The internal reconnects join the healthy-session law (2026-09-26,
+ruling O-HC16).** The law — reset the backoff only after a session that
+moved market data AND lived `HEALTHY_SESSION_MIN_NS` (30 s), or one that
+ended in a venue-quiet trip — lived in `cli/src/paper.rs` for the seven
+outer spawn loops; Hypercall's `HcConn` and MEXC's `run_multi` slots
+reconnect internally and reset on any confirmed subscription, so a
+session that confirmed and then died young — the 2026-09-26 HL shape —
+reset them every time. The law moved to core-net unchanged
+(`core_net::{HEALTHY_SESSION_MIN_NS, should_reset_backoff}`, its test with
+it; the seven loops call it from there) and both crates reset through it:
+Hypercall with the venue's `ticks_total` recorded at session start (one
+connection, so the venue's count is the session's); MEXC per slot, with
+`Driver::session_ticks` — the ticks THIS connection published, cleared by
+`reset_for_reconnect` — because the venue's status is shared by every slot
+on the thread. The keepalive's `Reconnect` (inbound silence) is the quiet
+trip; every other end (a transport error, the venue's close, the
+establishment budget, a failed ping) is not. Proof, per crate: a session
+that moved data and died young escalates; one that lived 30 s moving data
+resets; the quiet trip resets; pairs confirmed without data escalate;
+MEXC: another slot's data does not reset this one.
+
+### Batch subscribes render straight into tx (2026-09-26)
+
+On the operator's word (2026-09-25: "finish what's left of our
+refactoring" — the in-place subscribe renders of plan Q7, the last of the
+three).
+
+**What was wrong.** A client frame's header carries its payload length in
+a 7-, 16- or 64-bit form (RFC 6455 §5.2), and a batch subscribe's length
+is unknown until it has been rendered. So OKX, Deribit, Bybit, Polymarket
+and MEXC rendered theirs into a stack scratch (OKX 12 KiB, Deribit
+16 KiB, Bybit 8 KiB, Polymarket 11 KiB, MEXC spot ~2.3 KiB and one
+~80 B futures frame per (symbol, channel)), and `queue_masked_text_frame`
+then copied it into tx behind the header and masked it: every subscribe
+byte written twice, and up to 16 KiB of stack per call. ZC pass B marked
+those copies (OKX K3, Deribit K8, Bybit K16, Polymarket K20/K21, MEXC's
+`push_bytes`) and left the header-first render to this pass.
+
+**What changed.** core-net's `ws_write_text_frame_rendered` (on tx:
+`queue_masked_text_frame_rendered`) takes a render in place of the
+payload. The render appends through a `WsPayload` and runs twice: a
+counting pass that writes nothing and sizes the payload, then — the
+header written at its minimal width — a writing pass into exactly the
+counted span of tx; the payload is then masked in place. A render must be
+a pure function of what it captured, and its `Fn` bound keeps it from
+mutating a capture: a writing pass that fails, runs past its count or
+stops short of it is `RenderDiverged` — a `debug_assert!` in debug builds;
+in release the error fails the session, which reconnects, and tx never
+advances over the torn frame. The venues' writers became renders — OKX
+`render_subscribe_batch`, Deribit `render_subscribe_all`, Bybit
+`render_subscribe`, Polymarket `render_market_subscribe` (its id-list
+check split out as `market_subscribe_ids_valid`, run first), MEXC
+`render_spot_subscribe` and `render_fut_subscribe` — and the scratches
+and their markers are gone. The one copy left — each literal fragment,
+symbol and id put once, straight into the frame — is marked once, in
+`WsPayload::put`. The parts writer builds its header from the same two
+helpers (`client_header_len`, `write_client_header`). A subscribe is now
+bounded by tx's free room rather than by a scratch; every venue's tx was
+already sized for its largest batch, since the copied frame had to fit
+there too (OKX's doc now counts its 160 args: ≤ 11.2 KiB in 16 KiB).
+Cold paths only: every render runs twice, at session start.
+
+HyperEVM's request bodies — the logs subscribe and every snapshot
+`eth_call` — still render into the driver's 8 KiB scratch and are copied
+into tx behind the header. Their marker said a header-first render needed
+a core-net API that did not exist; it is re-worded: the API exists (a
+binary twin is one opcode away), but it would trade that copy for a
+second run of every render on the warm read path, and `write_eth_call`'s
+calldata writer is a one-shot `FnOnce` into the request's tail, so every
+ABI encoder would need a counting mode.
+
+**Proof.** core-net: a rendered frame is byte-identical to the parts
+writer's in all three length forms, and reads back through
+`ws_read_frame` and unmasks to its payload at every length boundary (0,
+125, 126, 65 535 and 65 536 B) — a check independent of the header writer
+the two share, which both writers now also check against its length; one
+that does not fit fails `BufferTooSmall`, and a render that fails its
+counting pass returns its own error, both without writing a byte; a render
+that writes more, or less, on its writing pass than it counted is refused;
+`WsPayload` counts without writing and refuses a put past its span. On tx:
+a rendered frame is the plain frame of its bytes under the same mask
+counter, and a refused or diverging render leaves tx empty. The zero-alloc
+round trip (alloc gate) runs the rendered writer beside the plain one. The
+venues' exact-bytes tests run unchanged through a `WsPayload::writing`
+helper, and the run-loop tests that unmask the subscribe off the wire —
+all five venues, and MEXC's TLS loopback — see the same frames. A const
+assert pins that MEXC's `from_slot` names exactly `channels_per_symbol`
+slots per class (both subscribe loops walk `from_slot`; the ack
+bookkeeping counts the other).
+
+**The review** (a read-only subagent): PASS WITH NOTES — byte identity
+holds for all six renders, each render captures only shared references
+and `Copy` values, the header forms and the mask are right, and every call
+site borrows disjoint fields. Acted on: the `Fn` bound, the queue-level
+and boundary tests, the counting-pass test, the header check, the alloc
+gate, MEXC's const assert, Polymarket's render and id check made
+`pub(crate)` (the check guards the render) with its duplicated tests
+folded, Deribit's `push_bytes` moved beside the WARN lines that are its
+only callers, and the stale docs (the scratch wording in OKX, Deribit,
+Bybit and Hyperliquid — Hyperliquid's since pass B — OKX's `write_op` and
+its tx sizing, the `put` marker's bound). Left open:
+Deribit's subscribe-result check (`found_mask`) builds its needle apart
+from `render_channel_name`, and OKX, Deribit, Bybit and Polymarket size
+tx for their worst batch in docs, not in a const assert as MEXC does
+(**both closed by HK3, 2026-10-13** — see "HK3" at the end).
+
+Gates: clippy clean; nextest 3158 passed (5 skipped); alloc 73/73 at 0 B/op
+(fresh `Compiling bench`); core-net's tests in release (the torn-frame
+path) pass; `make copy-audit` `hits=31 baselined=31 new=0 paid=0`, the
+baseline byte-identical (sha256 `caf8a05e…`); license-check OK; `cargo
++nightly fuzz build` OK; live smokes 60 s, the engine untouched — MEXC
+30 814 messages (1 216 ticks; one spot `SUBSCRIPTION` for 5 symbols and
+21 futures frames, every channel confirmed: 0 sub-drops), Binance 34 118
+(34 943 ticks), 0 parse errors, 0 reconnects, 0 drops on every ring.
+`make bench-check` was not judged: the hot_path binary links none of the
+changed crates (`nm`: no core-net or ingress symbols), and at a load of
+12–31 (RustRover's background checks at ~550 % CPU, another session's
+build and tests beside the engine) two benches it does link read slow
+(latency-arb `on_tick` +61 %, `sign_order_full` +23 %) — to re-run on a
+quiet Mac. This work built no engine binary.
+
+### The Hyperliquid reconnect loop — dead HIP-4 instances (2026-09-26)
+
+On the operator's word (2026-09-26: "investigate why hyperliquid lane is
+reconnecting constantly", then "implement the fix and restart now").
+
+**What was wrong.** From 01:45:11Z the lane logged `hyperliquid: run-loop
+returned res=Disconnected` every ~1.24 s — 15 190 times by 07:13Z, 43 139
+since 09-19 — in episodes that began at a reconnect and ended only at a
+process restart. The venue answers a subscribe to a settled or unknown
+coin by dropping the whole socket: a bare FIN, no `error` frame, no Close
+(probed from the Mac: `l2Book` on the BTC 15-minute instance that expired
+at 00:15Z, or on `NOTACOIN`, EOF within 0.25 s; the engine's own 70
+subscriptions ran 20 s and 786 frames on the live instances, and died at
+1.2 s after 56 acks with the BTC family on its settled one). The engine
+re-subscribed exactly that: `perform_roll` keeps a settled instance bound
+until the next `outcomeCreated`, and `reset_for_reconnect` re-subscribed
+every binding. The successor could not arrive — each session died before
+`outcomeMetaUpdates`, subscribed last, was acknowledged, and that channel
+replays nothing (below) — so only boot discovery rebound. The backoff
+never grew: `should_reset_backoff` reset on any tick, and the perp
+snapshots arrived in a session's first 0.2 s. What started it: an
+instance expired, the venue settled it and listed its successor late, and
+the expired coin's silence — the staleness monitor let go of a coin only
+at `outcomeSettled` — tripped the whole session 10 s after the expiry
+(logged at 12:35:11 and 18:30:11Z on 09-25 and at 01:45:11Z; two other
+episodes began at a `res=Error`). During a loop the lane carried
+connect-time snapshots only, every BIN15 family was dark, and it opened
+~48 connections a minute against the venue's 30 per IP.
+
+**What changed.** A dead instance is never subscribed again.
+`perform_roll` flags a family whose instance settles (`HlFamily::settled`);
+`instance_dead` holds for a bound instance that settled or passed its WALL
+expiry; and `reset_for_reconnect` now ends by retiring every dead family
+(`HlFamilyTable::retire`: both coin rows unbound through the new
+`HlCoinTable::unbind`, the family dormant and `awaiting`), so the next
+subscribe sweep and the ack masks skip it; it returns the count, which
+the caller logs. On a live session a settled instance stays bound and
+subscribed as before — the venue keeps a subscription it already holds.
+Successors are re-discovered between sessions: while a family awaits
+one, the HL thread re-reads `/info {"type":"outcomeMeta"}` before the
+socket opens, at most once a minute — the boot's own request and parser
+(`boot_discovery::fetch_hl_outcome_specs`), sent with core-net's new
+`boot_http::https_post_at` to the address the engine resolved at boot
+(like the WS host's), so no DNS lookup runs on that thread and every
+socket step is armed with what remains of a 3 s deadline — and
+`Driver::rebind_dormant` binds every family naming no instance, the
+boot's dormant ones included, by the boot's rule (`best_live_spec`: the
+earliest-expiring instance still live), announcing each adoption as
+`perform_roll` announces a roll (`emit_roll_event`, now the one writer
+for the roll, the boot announcement and the re-discovery). A failed fetch
+leaves the family waiting for the venue's next `outcomeCreated`.
+Staleness stops judging an instance at its expiry: `session_health`
+unwatches the rows of every expired instance — right after `arm`, and
+again at each expiry (`next_expiry_ns`, one compare per iteration;
+`perform_roll` puts the successor on the schedule) — and its ack check is
+masked, since a roll can ack rows the sweep did not expect. The backoff
+resets only after a session that moved market data AND lived 30 s
+(`HEALTHY_SESSION_MIN_NS`), or a venue-quiet trip, in the seven venue
+loops that share `should_reset_backoff` (in core-net since O-HC16, which
+extended it to the Hypercall and MEXC internal reconnects — "Hypercall
+joins" above): a silent-drop loop of any cause
+now climbs to the 8 s cap (≤ 7.5 connects a minute). And every end names
+itself on the T1(a) status triple: the run loop's error exits record site
+and io-kind (`session_err`), a peer Close `peer-close` with its code
+(1005 when it carried none), a bare EOF `peer-eof`, a missed ack deadline
+`subscribe-missing` with the count missing, a venue error frame
+`venue-error`; `run-loop returned` prints them with `lived_ms`, `acks`
+and `acks_expected`. core-metrics gains `ERR_SITE_PEER_EOF` (10) and
+`ERR_SITE_PEER_CLOSE` (11). A retired instance's later `outcomeSettled`
+matches no family, so the capture carries no `settled` for it, and its
+re-discovered successor arrives as a lone `created`
+(`docs/wire-format.md`).
+
+**Proof.** ingress-hyperliquid (162 tests): a reconnect never
+re-subscribes an expired instance (12 subscribes on the wire, none for
+`#2649`); a settled instance stays bound on its own session and is
+retired at the reconnect; staleness stops judging an instance at its
+expiry, and a mid-session roll puts the successor on the schedule;
+`rebind_dormant` adopts the live successor and announces it, or leaves
+the announcement to the boot's when that has not gone out; a boot binding
+dead before the first connect is announced exactly once; a retired family
+is off the wire and `bind` revives it; the end of a session is named on
+the status slot (Close 1008; a Close with no code → 1005; a bare EOF →
+`peer-eof`; the ack deadline → `subscribe-missing`, 9 missing). cli:
+`backoff_resets_only_on_a_healthy_session_or_quiet_trip`. core-net: a
+POST to a boot-resolved address does no lookup — the server name is under
+`.invalid` (RFC 6761), so a lookup fails `Resolve` before any connect
+(checked by mutation) — a closed port is refused (`Connect(ConnectionRefused)`),
+and a peer that accepts and stays silent is cut off by the deadline
+(300 ms), not by the peer (1.5 s). And the venue fact the fix rests on,
+probed at the 08:15Z and 08:30Z rolls: `outcomeMetaUpdates` pushes a roll
+once, live, and replays nothing to a later subscriber. A socket
+subscribed from 08:28:30Z got `outcomeSettled` for 5791 and 5790 at
+08:30:04Z and one `outcomeCreated` push for their successors 5792/5793 at
+08:30:06.6Z; sockets subscribed 14 s and 74 s after that push — and at
+08:15:30 and 08:16:30Z, after the 08:15Z roll — got the ack and nothing
+else, while `/info outcomeMeta` listed the successors by 08:16:10 and
+08:31:00Z. (A probe socket must ping: the venue closes one 60 s after the
+client's last message.) Five comments said the venue re-sends
+`outcomeCreated` on a reconnect — the run loop's roll dispatch, the TLS
+loopback test, `exec-router`'s ledger (twice), `exec-hyperliquid`'s
+exchange (twice) — as did "LAW E-8 — the roll takes its own quotes back"
+above; each now says what was measured, and the guards they explain stay:
+a replayed ring entry still carries a repeat, and an instance adopted from
+an `/info` snapshot can see its own push arrive after the session
+subscribed.
+
+**The review** (read-only subagents, two passes). The fix: PASS WITH
+NOTES — the loop is closed, and each new test fails without its part of
+the fix. Acted on: the post-boot use of `boot_http`, whose doc said boot
+only — throttled to one fetch a minute, run before the socket opens, on a
+3 s deadline, and documented; the one expiry-schedule write that matters
+(`perform_roll`'s) got its test, and the four dead ones went;
+`rebind_dormant` picks families by `live.outcome == 0`, not the `dormant`
+flag, which would re-announce a live instance once the second-strike bug
+below is fixed — and BIN15 would zero a position the ledger keeps; the
+masked ack check; one WALL clock for every judgement; the roll records
+mirrored to disk before the connect; the race documented; the family log
+shared with boot; the first-connect test; stale docs and `debug_assert!`s.
+The replay contradiction it found went to the probe above. The second
+pass, over what followed — the boot-resolved `/info` address and the
+comment corrections: PASS WITH NOTES — boot's own fetches behave exactly
+as before (the deadline starts before the lookup, `RequestTooLarge`
+before any I/O, the same errors), and nothing on the HL thread can reach
+DNS. Acted on: the failure tests for `https_post_at`, the E-8 paragraph,
+the deadline wording (each socket step is armed, not the call as one),
+the module title and error docs, `WssEndpoint`'s doc narrowed to the HL
+thread, the guard's remaining trigger, the wire-format note, and a
+duplicated `#[allow]` on `run`. Left open: `roll_health`'s retry sets
+`ack_deadline_ns = u64::MAX`, so its second strike (dormant) is
+unreachable — pre-existing, its own change (**closed by HK1, 2026-10-13**:
+the second strike stops the asking and never marks the family dormant —
+see "HK1" at the end); a successor listed between
+the `/info` snapshot and the new session's `outcomeMetaUpdates` ack is
+missed until the family's next instance (at most one 15-minute instance;
+a daily's successor is listed a day ahead); the `/info` host is resolved
+whenever HL is configured, families or not — boot discovery already
+posts to it then, so nothing new can fail; and the venue now acks
+`l2Book` with `"fast":false` (≈ one push per coin every 4–5 s against
+`bbo` at ~1/s in the probes) — unverified, not this change.
+
+**Operations.** The operator's restart at 07:18Z (the sanctioned 0010
+revive) rebound the live instances and ended the loop; the lane then ran
+clean through the 07:30–08:30Z rolls. At 08:32Z a venue-side incident —
+the probes' control socket dropped at 08:32:21Z, a fresh upgrade answered
+502, `/info` timed out — tripped the lane (`res=Stale` at 08:32:01Z) into
+26 more session ends in 102 s — the first 12 about 1.2 s apart, the rest
+5–7 s — until the 08:33Z daily restart stopped it. Under the new rule
+those 1.2 s gaps climb to the 8 s cap, and the new line says how each
+session ended; the old one could not tell this outage from the loop. That restart's boot
+discovery failed on the same outage (`spotMeta` Timeout, exit 1), and
+launchd's relaunch booted clean at 08:36:24Z (the 15-minute families on
+5792/5793, the dailies on 5755–5758; `vm_rows_active` 2). Deployed on the
+operator's word: `7235201` built and restarted through the 0010 revive at
+09:03Z (the old engine drained, exit 0); the new one booted at 09:05:11Z,
+and at the 09:15Z roll it settled 5796/5797 and adopted 5799/5800 in
+session — no reconnect, no ack timeout, no staleness trip. The lane counts
+~1 parse reject a second, before and after that roll; the parse path and
+the subscription set are unchanged by this work — they are BIN15 O8's
+one-sided outcome `bbo` drops (next section).
+
+Gates: clippy clean; nextest 3169 passed (5 skipped); alloc
+73/73 at 0 B/op (fresh `Compiling bench`); `make copy-audit` `hits=31
+baselined=31 new=0 paid=0`, the baseline byte-identical (sha256
+`caf8a05e…`); license-check OK; `cargo +nightly fuzz build` OK. No live
+smoke exists for this lane, and what one would need to show — a reconnect
+across an expiry — is what the unit tests script. This work built no
+engine binary.
+
+### The one-sided outcome `bbo` is not a parse error (2026-09-26)
+
+On the operator's word (2026-09-26: "Fix it (own counter)", after the
+probe below).
+
+**What was wrong.** After the deploy above the lane counted 1–1.5 parse
+errors a second. A read-only probe carried the engine's exact 70
+subscriptions for 60 s (3 504 frames) and sorted every frame by the
+parser's rules: the only reject class was `bbo` pushes on HIP-4 outcome
+legs with the ask `null` — 1.57/s, against the engine's 1.45/s over the
+same window; trades, asset contexts, books and unknown channels, none.
+BIN15 O8 drops those pushes by policy (the leg's two-sided touch comes
+from its `l2Book`), but it dropped them through `Dispatch::Nothing`, the
+rejection path: each one counted in `parse_errors_total` and was tapped as
+a reject. No data was lost; the counter stopped meaning anything for this
+lane, and a real parse failure would have hidden in it.
+
+**What changed.** The drop has its own dispatch
+(`Dispatch::OutcomeBboOneSided`): it counts as a message — not a tick, so
+neither the last-tick age nor the backoff reset ever feeds on a dropped
+frame — and in `HlRollStatus::outcome_bbo_one_sided`, published as
+`engine_ingress_hyperliquid_outcome_bbo_one_sided_total`;
+`parse_errors_total` and the reject tap are left to real rejections. The
+drop condition is unchanged: a two-sided outcome `bbo` is still a tick, a
+perp's is untouched, and a `bbo` with both sides `null` is still a parse
+failure. Docs: `HlRollStatus` (the slot `IngressStatus` could not take is
+192 B, three lines), the driver's `roll_status` and `verified`,
+`set_families`, and `session_health` (the masked ack check, both halves).
+
+**Proof.** `a_one_sided_outcome_bbo_is_dropped_and_l2book_carries_the_touch`
+now pins the count: the one-sided push leaves the ring empty, adds one to
+the new counter and to `msgs_total`, and no tick, parse error or reject
+tap (it is still tapped raw, like every frame); a both-`null` push is one
+parse error and one reject tap with the count untouched; the two-sided
+push is a tick and the count stays 1. Routed back through `Nothing`, the
+test fails (checked by mutation).
+
+**The review** (a read-only subagent): PASS WITH NOTES — the change is
+correct; `msgs_total` feeds only the metric mirror and `/state`, while the
+health tells read `ticks_total` and the venue clock, so counting the drop
+there masks nothing (MEXC's dropped quotes and HL's `RollUnmatched` count
+the same way). Acted on: the stale records, a `docs/migration.md` entry,
+the tick and both-`null` assertions, the doc nits, and the name — `one
+sided`, O8's own word, not `ask_null`, so a widened condition would not
+need a rename. Left open: the parse count is not zero after this — each
+mid-session roll's six unsubscribe echoes still land in `Nothing`
+(`parse_sub_response` takes only `"subscribe"`, though `lib.rs` calls the
+echo deliberately ignored), and so do frames in flight for the retired
+coins; the same class, its own change. (**The echoes: closed by HK1,
+2026-10-13** — see "HK1" at the end. The in-flight frames for retired
+coins still count.) Only a `null` ask is guarded, which
+is what the venue does (2026-09-12: 194 of 194 outcome ticks had a zero
+ask, none a zero bid).
+
+Gates: clippy clean; nextest 3169 passed (5 skipped); alloc 73/73 at
+0 B/op (fresh `Compiling bench`); `make copy-audit` `hits=31 baselined=31
+new=0 paid=0`, the baseline byte-identical (sha256 `caf8a05e…`);
+license-check OK; `cargo +nightly fuzz build` OK. This work built no
+engine binary.
 
 ## E6 — the risk gate and the kill switches
 
@@ -2695,6 +3914,11 @@ Those are different quantities, deliberately:
   how much was committed, and selling a position back does not
   un-commit it. A ledger that netted sells off would let a member
   round-trip an unbounded notional under a fixed cap.
+  **BX3:** that is the family rows' rule. On a Binance instrument row
+  (a signed law: linear, inverse, a short option) a sell can OPEN a
+  position, so the day cap counts the part of any order — buy or sell —
+  that increases the position's magnitude, at the law's price; a
+  reducing order adds nothing. See "BX3" below.
 * `cap_instance_usd` — NET EXPOSURE, `|yes − no|` per outcome, summed
   across outcomes. Money actually at stake rather than money spent.
 
@@ -2886,6 +4110,14 @@ fill, which cannot happen, and it would strangle the maker. bin15's
 own ledger reserves notional at submit and self-limits in the healthy
 case; this gate's job is the unhealthy one, and there it bounds
 exposure at that product.
+
+**BX3 — exits never widen the bound.** On a Binance instrument row an
+order is an exit only if it and every working order of the slot on the
+same instrument and side cannot cross zero, and an exit PLACE still
+counts against `max_open_orders` (O-BX25). N working exits of a whole
+position are one exit; the rest meet every clamp. So the worst case
+above holds on Binance rows too, except for the residuals "BX3" below
+names (the two anomalous table states, and its BX6 obligations 1–3).
 
 Two related shapes, both by design and both worth an operator
 knowing:
@@ -3428,6 +4660,17 @@ once the answer is no, the size of the next order is beside the point.
 `trigger_for` evaluates them in that order and returns the FIRST one
 that fires.
 
+**BX3 (2026-09-26)** adds two venue VERDICTS, evaluated before all of
+the above and with no threshold of their own:
+
+| trigger | fires when | threshold key |
+|---|---|---|
+| `VenueLock` (10) | the venue restricted the account | *(none — the arm's flag)* |
+| `MarginRisk` (11) | margin ratio ≥ the slot's number, or any `MARGIN_CALL` | `halt_on_margin_ratio_1e6` (the arm judges it, O-BX18) |
+
+Only a Binance arm sets either, so neither can fire before BX6; a slot
+reads them only when its venues name binance (O-BX8). See "BX3" below.
+
 **The order only breaks ties inside one poll.** `on_idle` runs every
 2 ms and the latch is sticky, so whichever condition crosses its
 threshold first *in time* is the one recorded, whatever the order
@@ -3674,7 +4917,11 @@ never fires.
 `request_budget_floor` joins them. It is not a threshold the router
 compares against — the arm owns it and reports a flag — but at `0` the
 budget trigger fires only at TOTAL exhaustion, which is a kill switch
-that waits until the address is already bricked.
+that waits until the address is already bricked. **BX3:** it is
+Hyperliquid's address budget, so it is required only on a live slot
+whose venues name hyperliquid — every slot that can be live today — and
+the arm reads it only from the live slots it trades (the HIGHEST of
+them, O-BX27).
 
 This broke ten existing fixture tests, which is the correct outcome: a
 fixture that armed a live slot without a kill switch was describing a
@@ -4124,7 +5371,9 @@ And the exit-75 flake above.
    done zero-copy; a copy that cannot be avoided carries a comment.
    Enforced by a new `zero-copy-auditor` agent, the same way
    `alloc-auditor` / `risk-reviewer` are enforced — and **all three
-   review agents run on Opus 5** (`model: claude-opus-5`).
+   review agents run on Opus 5** (`model: claude-opus-5`). *Amended
+   2026-09-23 (ruling O-8): all three now pin `model: claude-opus-5-5`
+   (Opus 5.5); `parser-property-tester` stays on Sonnet.*
 
 ### What the review was
 
@@ -4143,7 +5392,7 @@ none was a false positive.
 
 | # | where | the hole | the fix |
 |---|---|---|---|
-| 1 | `http.rs` read_response | a chunked or close-delimited `/exchange` answer was returned as soon as ANY bytes arrived — a truncated `{"status":"ok","response":{"type":"order","data":{"statu` reached the scanner | `Chunked ⇒ Err(BadHttp)`; `CloseDelimited` only once `peer_closed`; `ContentLength` waits for `body_end` |
+| 1 | `http.rs` read_response | a chunked or close-delimited `/exchange` answer was returned as soon as ANY bytes arrived — a truncated `{"status":"ok","response":{"type":"order","data":{"statu` reached the scanner | `Chunked ⇒ Err(BadHttp)`; `CloseDelimited` only once `peer_closed`; `ContentLength` waits for `body_end` (since HD2 the shared engine's: a chunked answer is decoded once its terminating chunk is in, never handed on partial; a close-delimited one needs a clean close) |
 | 2 | `response.rs` scan | the no-`"statuses"` branch ACCEPTED on the mere absence of the token (fail-open, against the module's own doctrine) | accepted only when `"type":"default"` is present, else `Malformed`; fuzz invariant strengthened (`hl_exchange_response.rs` now requires `statuses` or `type:default` on any accept) |
 | 3 | `exchange.rs` send_action | the live submit accepted on `ok.accepted()` alone — no resting/filled outcome required, `oid == 0` bound the slot to a leg the sweep could not see; the stricter predicate lived only in the operator probe | acceptance is `Spend`-aware: Submit ⇒ `any_resting ‖ any_filled`, Cancel ⇒ `any_success`; anything else takes the reject-streak branch |
 | 4 | `http.rs` post | polled 50 ms BEFORE flushing rustls, so every request waited a slice before its ciphertext left the host | `Transport::flush()` (new trait method; `TlsTransport` drains `write_tls` to `WouldBlock`) + `reregister` before `read_response`; `write_segments` `Ok(0)`/`WouldBlock` ⇒ `Overflow`, no sleep |
@@ -4169,9 +5418,9 @@ Smaller items closed in the same pass: `libc` literal dep in
 repo's existing convention (cli, core-config, core-io, core-time all do
 it; there is no workspace `libc`); `gen_vectors.py` now drives the SDK's
 own `order_request_to_order_wire` / `order_wires_to_order_action` and
-records the SDK version; `selftest` pins the vector count (25);
+records the SDK version; `selftest` pins the vector count (25; 27 since S7-L1);
 `MAX_ORDERS` enforced in all four batch encoders; `BudgetGauge` removed;
-`cancel_by_cloid` / `modify` render into the boot-owned `mp` / `req`
+`cancel_by_cloid` / `modify_by_cloid` render into the boot-owned `mp` / `req`
 buffers (no 16 KiB stack arrays on the engine thread); `POLL_SLICE`
 removed from the steady-state pump (it parked the single-writer thread
 50 ms out of every 52); `Order.verb` doc corrected (`paper.rs` said the
@@ -4227,6 +5476,9 @@ EIP-712 assembly, the PM dispatcher, `core-net`), listed in
 unmarked copy fails, a paid entry is dropped with `--update-baseline`,
 and only the operator grows it. Gate at the close: `hits=33 baselined=33
 new=0 paid=0` on the exec lane + core-net.
+Since BX0 the gate also covers `ingress-binance`, and a `#[cfg(test)]`
+ITEM no longer ends the scan of its file ("BX0 — `ingress-binance` joins
+the zero-copy gate", above).
 
 ### The auditor's own verdict on the pass
 
@@ -4419,7 +5671,10 @@ the same sticky halt machine as every kill switch — reasons
 written, refused submits until an operator restart. A gain halt is a
 halt: "run until" means until.
 
-**What is measured, and from where.** The account's SPOT USDC as the
+**What is measured, and from where** (superseded 2026-09-24 by S7-L1,
+gap B: the equity AT COST, anchored at the session's first
+reconciliation, flat or not — see "The live arm, restart-proof"). The
+account's SPOT USDC as the
 reconciler already reads it (`spotClearinghouseState`, every 60 s on the
 idle path), against an ANCHOR: the balance at the first reconciliation
 of the session that found the account FLAT — no outcome leg with a
@@ -4432,7 +5687,9 @@ boot would be a bound on nothing. An operator starts a new session by
 deleting the file before a restart — the manual step every sticky halt
 already requires, not an auto-resume.
 
-**Judged only while flat.** An outcome leg is worth anything from 0 to
+**Judged only while flat** (superseded 2026-09-24 by S7-L1, gap B: the
+bound is judged at cost at every reconciliation, and the field below
+is `HaltSignal::pnl_judged`). An outcome leg is worth anything from 0 to
 1 USDC until the venue settles it, so an account holding one has no
 P&L to read: the premium it paid is not a loss, the payout it may get
 is not a gain. `HaltSignal::pnl_flat` (anchored AND no leg held AND a
@@ -4488,4 +5745,10595 @@ having both.
   "deliberately not here") are unchanged.
 * `.claude/settings.json` still names `claude-opus-4-6` as the SESSION
   model; only the three review agents were pinned to `claude-opus-5`
-  (the ruling was about the agents). Operator's call.
+  (the ruling was about the agents) — since ruling O-8 (2026-09-23)
+  to `claude-opus-5-5`. Operator's call.
+
+## E8 — the BIN15 settlement law (S1, 2026-09-24)
+
+### LAW E-11 — a binary settles on the window the venue's rules text names
+
+> **A HIP-4 binary settles on the window the venue's rules text names —
+> today the 60-second TWAP of the underlying's perp MARK ENDING at the
+> expiry, `TWAP[T − 60 s, T] ≥ strike`. The harness and the audit settle
+> through ONE implementation of that window, and the member (from BIN15
+> S3) folds its live marks through the same window, piece arithmetic and
+> evidence bound; none restates them.**
+
+The outcome.xyz rules text for the rolling BTC 15-minute market:
+*"Settlement is according to the 60-second TWAP of BTC-USDC perp mark
+price ENDING at <expiry> UTC."* Until 2026-09-24 the harness
+(`cli::backtest::binary::settle_value`), the audit (which reaches the
+same function) and the lane's restart law read the minute AFTER the
+expiry — wrong on ~8 % of instances. The corrected law was confirmed on
+the account's OWN venue settlements before any code moved: all 15
+`userFills` rows with `dir = "Settlement"` of the 2026-09-19 mainnet
+session agree with `TWAP[T − 60, T]`; the old window agreed with 14.
+
+What shares the law (E-10 is reserved for the doc-24 bankroll law):
+
+* `core_types::binary_settle_open_ns` / `binary_twap_segment` — the
+  window and the TIME-weighted piece (the mark in force counts for as
+  long as it was the mark, the last one carried forward, `dt` clipped at
+  the window's edges, `i128`) — in the one crate every consumer already
+  depends on.
+* `cli::backtest::binary::settle_reference_1e6` / `settle_value` — the
+  harness (`backtest`, `--member`) and `audit-pnl` both settle through
+  it; `>=` settles in the money. **The evidence is strict**: a mark in
+  force at the window's open, no piece longer than
+  `SETTLE_MARK_GAP_MAX_NS` (10 s — the venue marks every 1–3 s, so a
+  longer hole is a capture gap) anywhere across the window including
+  the carry to the expiry, and at least `SETTLE_MIN_MARKS` (3) marks
+  inside it. Anything less is UNSETTLED — counted, never guessed, never
+  averaged over part of the minute.
+* `claude_worker.hip4` — the worker's mirror of the same law
+  (`settle_reference_1e6` and `payout_1e6`, pinned to the harness by the
+  shared fixture `settle-1`; `link_successors`, by its own tests); the
+  accrual stores are
+  relabelled through it (`bin15_accrue relabel`, BIN15 S4) and every
+  offline reader labels an instance with it rather than restating the
+  window.
+* The value is knowable AT the expiry, so the harness settles a slot at
+  the expiry and the successor trades from `T`; an order still resting
+  on the slot is cancelled at that instant (the venue clears the book at
+  `T`) and counted in `settled_sym_orders_canceled`.
+* **The live member prices this window (BIN15 S3).** Its horizon is the
+  variance-time of `TWAP[T − W, T]` (`price::pricing_horizon_ns`), and
+  inside the window it folds its own marks through
+  `binary_twap_segment` into the running average and prices on it
+  (below). Until S3 the member priced a window AFTER the expiry
+  (`τ + twap/3`); a harness number from a binary before S3 scores a
+  member that priced the old window.
+
+**The venue-published cross-check.** The venue prints each settlement
+price as the SUCCESSOR's strike (rounded to the strike grid, ~9.5 s after
+the expiry), so `next_strike > strike` is the venue's own label. Both
+harness surfaces carry it (`BinaryInstance::next_strike_1e6`) and print
+`settle_disagree_next_strike` beside `next_strike_checked` (ties
+excluded). **A non-zero disagreement is a finding** — a mark tape that
+misses the venue's marks, a clock error, or a law change — and is never
+absorbed into the P&L silently. The sidecar carries the venue label per
+row (`y_next_strike`, `-1` unknown or a tie) beside `y`.
+
+**The settlement-sensitive minute is the one BEFORE each quarter-hour.**
+The engine is down 75–90 s across a restart, and an instance whose
+settlement minute is missing from the tape is unsettleable offline
+(counted, and lost to the accrual). So no restart window may cover
+`[T − 60 s, T]` of a live instance: manual restarts avoid hh:14–15,
+hh:29–30, hh:44–45 and hh:59–00 (ruling O-6), and the routine 00:10 /
+08:30 / 16:05Z slots are clear. (The ingress re-announces every bound
+family at its first Steady, so the member binds the live instance as
+soon as the boot completes.)
+
+### The harness clock is the venue's (S2, 2026-09-24)
+
+LAW E-11 is only as good as the clock the window is read on. The
+harness used to pin a run's first record to its directory's epoch — the
+boot's instant, 10–25 s before the first tick — so every replayed
+instant ran 23–42 s early and `[T − 60 s, T]` was a different minute.
+`backtest::clock::RunClock` maps a v3 run with a Hyperliquid lane onto
+the VENUE's clock (the median of the first 64 `venue_time_ms − ts`), one
+function for `backtest`, `--member` and `audit-pnl`; runs without venue
+stamps keep the old law bit for bit, and a fit that would put a run's
+first record before its directory's epoch (a stale-dominated fit) is
+refused back to the old law, loudly. The stderr names the clock of
+every venue-clock or refused run; silence means the anchor law. Replay
+ORDER (the virtual clock) is untouched, and
+no fill law moved with it: `requote_ttl_ns` and the IoC activation
+reference are the doc-11 law, not a clock (plan 28, refusal 5).
+
+### The member prices the venue's window (S3, 2026-09-24)
+
+The pricer's horizon is the variance the settlement is still exposed
+to, and E-11 fixes which average that is. For a Brownian log-price seen
+from `τ = T − t`:
+
+* **the window ahead** (`τ ≥ W`): `σ²·(τ − 2W/3)` — the price at `T − W`
+  plus the average of `W` more of the path. The horizon was `τ + W/3`
+  (a window after `T`), 60 s too long at `W = 60 s`, so a lead's `d`
+  was too small by `√((τ + 20 s)/(τ − 40 s))` — ×1.32 at `τ = 120 s`;
+* **inside it** (`τ < W`): part of the average is DECIDED. The member
+  keeps `twap_sum = ∫_{T−W}^{t} mark du` per family (last mark carried
+  forward, the harness's own arithmetic) and prices the excess
+  `X = A_known + τ·S − W·K` against `S·σ·√(τ³/3)`
+  (`price::fair_value_twap`, ruling O-2); as `τ → 0` the known average
+  IS the answer and `d` goes to the clamp on its side (`>=` is ITM);
+* **`W = 0`** (a family that settles AT `T`): `τ` itself.
+
+**Absent data holds inside the window too.** The running average is
+judged by the harness's evidence rule: an instance whose window opened
+before it saw a mark in force (a boot or a late bind inside the minute),
+or whose mark series has a piece longer than
+`core_types::BINARY_SETTLE_MARK_GAP_MAX_NS` (10 s, the constant the
+harness settles by) across the window, sets `twap_gap` and HOLDS
+(`skipped_stale`) for the rest of that instance — it never prices on
+half an average. The harness's third rule (at least `SETTLE_MIN_MARKS`
+inside the window) decides whether a settled LABEL exists, not what the
+average is, so the member does not mirror it. The member's marks are
+stamped on receipt, not by the venue: its window sits one feed latency
+(milliseconds) late against the venue's, which a 60 s average does not
+see.
+
+**The τ floors are clock statements.** `tau_min_take_ns` /
+`tau_min_quote_ns` are judged on the TIME TO EXPIRY, not on the horizon:
+"no take in the last minute" is a clock statement, and judging it on a
+variance-time that moves with the settlement law would have closed the
+take arm 40 s early. The ledger's `tau_ns` is the horizon the price was
+computed at (the member's own `last_tau_ns`), so a row priced inside
+the window reads `tau_ns < W/3` — the horizon is monotone in the time
+left and is `W/3` at the open — and needs no flag of its own.
+
+### The coverage entry's persistence and elapsed ceiling (S5, 2026-09-24)
+
+* **The price test can be required to HOLD before the entry pays.**
+  `entry_persist_polls = n` fires the coverage entry only once its ask
+  has passed (the floor, and `ask ≤ belief − e_entry`) at n consecutive
+  POLLS of the preferred leg, on one side. Above 1, a poll is the
+  reprice a new book snapshot of that leg triggers on its arrival — doc
+  27 R2's poll instant exactly (S5b) — and a snapshot is one write of the
+  leg's touch: the `l2Book` push, ~5.3 s apart while the venue publishes
+  the outcome `bbo` one-sided (O8). A poll extends the run, starts one on
+  a flipped side, or breaks it when the test fails; the reprices between
+  polls (marks, the other leg's ticks) never move the run and may fire
+  only a run already complete (a retry after a refused emit). A snapshot
+  whose arrival never reaches the gate (a stale or one-sided book, a take
+  in flight) is not a poll. Under `n = 1` every reprice is judged — the
+  pre-S5 law.
+* **The elapsed ceiling.** `entry_elapsed_max_ns` makes a run BEGIN
+  within that long of the instance's start (expiry − 900 s; doc 27 R2's
+  "the first of them"). Past it a run already under way may still fire;
+  a poll that would begin a run or break one — or, between polls, any
+  reprice with no run under way — closes the instance for good, counted
+  ONCE (`skipped_entry_elapsed`), not per reprice.
+* **Refusals burn nothing, as before.** `covered` is set only after a
+  submitted emit, so a cap, grid or ring refusal on a completed run
+  retries while the run lasts; past the ceiling, a break closes it.
+* Both keys absent is the pre-S5 law bit for bit. The gate
+  (`Bin15Strategy::entry_gate`) allocates nothing; gate 52 runs it with a
+  persistence count, a price refusal, a ceiling and one close under the
+  guard.
+* **The counterfactual is logged, never traded (ruling O-4).** Each
+  instance records when its price test — the artifact's own floor and
+  `e_entry` — first held and the ask then (`FamilyState::entry_first_ok_*`):
+  the pre-S5 law's entry attempt on it (a cap, grid or ring refusal there
+  would have moved its real entry later). The harness writes it beside each entry (`first_fire_*`) and,
+  for the instances the persistence law declined, in
+  `bin15_first_fires`, with the entry law the member ran under;
+  `bin15_accrue` keeps it in `first_fires.tsv` and reports it on the SAME
+  instances beside the new, one block per law — what the persistence law
+  and the ceiling alone changed; doc 27 §5's "over today's law" bar is
+  scored against the control (S5b, below). No order is ever sized or
+  sent from it.
+* These are research keys. The shipped example and the fitter carry the
+  old law; a persistence setting is a hand edit of the live artifact,
+  measured in paper first (plan 28 S7).
+
+### The entry's control and the fill bar (S5b, 2026-09-24)
+
+* **Today's law is recorded beside the artifact's.** A second
+  counterfactual, the CONTROL, records the first reprice on which
+  today's law would have bought the instance: the artifact's floor, the
+  compiled default bound (`core_config::bin15::E_ENTRY_1E6_DEFAULT`, set
+  by the cli as `Bin15Params::entry_control_e_1e6` — not an artifact key),
+  persist 1, no ceiling (`FamilyState::entry_ctl_ok_*`). Same reprice
+  stream, same record; it gates nothing and emits nothing. Once an
+  artifact moves `e_entry`, the artifact's own first fire is no longer
+  today's law, and doc 27 §5's "≥ +5 pts over today's law on the same
+  instances" is scored against the control: the harness writes it as
+  `ctl_fire_*` beside each entry and `ctl_*` in `bin15_first_fires`, and
+  `bin15_accrue report` pairs the member's entries with both.
+* **Fills gate the first live step, not the paper CONFIRM (ruling
+  2026-09-24).** The harness models every fill, so doc 27 §5's "IoC
+  fills on ≥ 50 % of signals" cannot be measured in paper. A paper
+  CONFIRM is judged on the other five bars; the fill bar, and the kill
+  on fills < 50 %, are judged on the first live step's own fills. The
+  report says so under every counterfactual block ("not measurable in
+  the paper model"), so a CONFIRM read off it cannot forget it.
+
+### The live arm, restart-proof (S7-L1, 2026-09-24)
+
+The risk review of the live-sized package (2026-09-24) found five gaps
+between the paper engine and a live one. Each is closed in code for the
+arm that trades the operator's Hyperliquid slots — the boot turns on
+`HlExchange::enable_restart_safety` there. Slot 0's own hedge account
+(HYPARB) is not covered by A or C.
+
+- **(A) The day cap restarted at zero on every boot.** Five scheduled
+  drains a UTC day each handed a slot its whole `cap_day_usd_1e6` again.
+  The arm reads the day's spend from the venue's own fill history
+  (`userFillsByTime` since 00:00Z, our BUYS per slot) once per UTC day,
+  retrying a failed read after one minute, doubling to fifteen, and
+  reports `reconciled` only after a boot's first read succeeds; the
+  router adopts the figure into its day cap — never lowering its own
+  count — before the slot's first live place. A page the venue may have
+  cut short (2 000 fills) is refused, never summed: a day that busy
+  stays unseeded until 00:00Z, with
+  `engine_exec_hl_day_sync_failed_total` climbing and every live place
+  counted in `refused_unseeded`. The router's day ledger only rolls
+  forward.
+- **(B) The session bound was judged only while flat**, and a book that
+  is never flat — overlapping 15-minute instances, the daily families —
+  was never judged. It is judged at every reconciliation on the equity
+  AT COST: spot USDC plus the held legs' `entryNtl`, each leg's basis
+  clamped to what the holding can ever pay (1 USDC a contract), minus
+  the session's request-weight spend (E). Buying a leg moves nothing; a
+  settlement or a sale moves it. How the venue lowers `entryNtl` on a
+  PARTIAL sale is not yet measured; the clamp bounds the error, and the
+  first live partial sale's balance row is to be checked. **The
+  overshoot:** an open leg's
+  unrealised loss is not in the figure, so the halt fires at the stated
+  loss PLUS the cost of whatever legs are still open and losing at that
+  moment — at most the day's premium (`cap_day_usd_1e6`) and the daily
+  legs still held from the day before. Deposits, withdrawals and
+  transfers between spot and perps move the figure: never fund
+  mid-session. An anchor written flat reads the same as before.
+- **(C) Nothing took resting quotes off the venue at shutdown**, and
+  SIGTERM — what the restart lane sends — killed the process with no
+  drain at all. SIGTERM now drains like SIGINT, under a 30 s deadline;
+  `Engine::stop` calls `OrderDispatch::on_shutdown`, and the Hyperliquid
+  arm cancels every resting order whose cloid is ours, on any outcome
+  leg. The asset id is read off the venue's `#<enc>`: a cancel names an
+  oid the venue itself reported resting, so a wrong id is a refused
+  cancel and never another market — LAW E-4 refuses DERIVED ids for
+  orders, not for this. The same sweep runs at boot, before the arm is
+  announced, for the crash, the `kill -9` and the drain that ran out of
+  time; until a read of the account finds nothing of ours resting, the
+  slot stays unseeded and each reconciliation retries one sweep round.
+  The sweeps leave the reject streaks as they found them: an order that
+  filled or expired under its cancel is not the venue refusing to
+  trade. A restart clears resting ORDERS; held legs stay (below).
+- **(D) `max_order_usd_1e6` refused position-reducing sells.** A sell no
+  larger than the slot's holding on that leg is exempt from
+  `max_order_usd_1e6` and `max_open_orders`: a cap that can trap a
+  member in a position is not a risk control. `cap_instance` still
+  judges it — selling one leg of an outcome whose other leg is also
+  held raises the net exposure — and `cap_day` never counted sells.
+  (BX3: this is the family rows' exemption. On a Binance instrument row
+  an exit is judged net of the slot's working orders and still needs a
+  free open-order place — "BX3" below.)
+- **(E) The address request budget ran out in about half a day under
+  full parity**, after which the floor halts the slot.
+  `request_topup_weight` / `request_topup_day_max` (both or neither;
+  weight 1 000–100 000, ceiling ≤ 1 000 000) buy weight with
+  `reserveRequestWeight`, paid from the PERPS balance at 0.0005 USDC a
+  request, when the headroom comes within one top-up of the floor.
+  Guarded six ways: the venue's headroom is re-read before every
+  purchase; right after one, the venue's own figures must show it, or
+  top-ups stop for the process (this holds whatever the venue's netting
+  of reserved weight turns out to be — the success answer and the
+  netting are documented, not yet measured, and the first live
+  purchase's rise in `arm_budget_remaining` is to be checked); one check
+  a minute, whatever it found; a purchase is charged to the day ceiling
+  and the session when accepted or sent without a readable answer (a
+  clear refusal buys nothing), persisted in `exec-topup.state` before
+  the next step (an unreadable file reads as the day's ceiling spent,
+  and a failed write stops top-ups); only on a budget the venue stated
+  at boot; never at or under the floor, where the router has already
+  halted the slot. A refused purchase is counted
+  (`engine_exec_hl_topup_failed_total`), never put in the reject streak;
+  if purchases keep failing, the floor halts the slot. The spend is
+  subtracted from the session bound's figure (B). The perps balance is
+  refilled only by a deposit — the engine never moves money.
+
+**Not changed — positions across a restart.** The member boots flat,
+live as in paper, and does not learn a position the previous process
+held. The venue still holds it: the router's ledger re-learns legs the
+new process binds from the `userFills` snapshot replay, the reconciler
+compares them, and a held leg of an instance the new process has not
+bound keeps the slot unseeded until it settles. After a restart
+mid-instance the member may enter that instance again up to its own
+per-instance cap; the bounds on the combined position are the router's
+`cap_instance_usd_1e6` (net contracts × $1) and the venue-synced
+`cap_day_usd_1e6` on premium.
+
+**Tells.** ARMED gains `topup_weight`, `topup_day_max`, `boot_swept`,
+`boot_sweep_left`; HALTS gains `topup=<weight>/<day_max>`; the drain
+logs `exec: shutdown sweep of resting orders done` (`cancelled_total`,
+`left`); `/metrics` gains `engine_exec_hl_sweep_all_cancelled_total`,
+`engine_exec_hl_topup_ok_total`, `engine_exec_hl_topup_failed_total`,
+`engine_exec_hl_day_sync_ok_total` and
+`engine_exec_hl_day_sync_failed_total`.
+
+### S7-L1 — slot 3 LIVE on Hyperliquid mainnet at the $100 frame (operator rulings 2026-09-24)
+
+Slot 3 armed again after R0, at full paper parity. Nothing arms until
+the operator runs `scripts/bin15-flip.sh live`; `bin15-flip.sh paper`
+disarms. The numbers below are that script's `LIVE_SIZING` and
+`slot3_section`. This entry supersedes ruling O-E4 ("caps stay exactly
+paper's") for slot 3.
+
+**The operator's rulings (2026-09-24):** doc 27 R4's $100 frame; FULL
+paper parity — the entry, Arm A and Arm B on every family, chosen after
+the request-budget warning; no price floor. Running `bin15-flip.sh
+live` is the operator's sign-off for every number in this entry, the
+$10 per instance and the router's caps included.
+
+**Caps and halts.**
+- `bin15.toml`: four lines differ from the paper artifact, nothing else
+  — entry $2 (R4: stake = max($2, ¼·f·B), f = 0 until 300 venue
+  entries), per instance $10 (the entry plus up to $8 of Arm A/B), per
+  UTC day $50 (R4: 50 % of B = $100), clip 4 contracts. The entry law
+  and both arms are paper's byte for byte, so paper and venue evidence
+  stay one law. The flip refuses a paper artifact with a price floor or
+  any other sizing key.
+- `[exec.slot.3]`: `max_order` $10 (it bounds buys; a sell within the
+  holding is exempt, gap D); `max_open_orders` 24 (up to 10 quotes — one
+  15-minute and four daily families — plus accepted IoCs the router
+  counts until their leg rolls); `cap_day` $50, venue-synced (gap A);
+  `cap_instance` 200 contracts (net contracts × $1, a backstop against
+  runaway accumulation: two days of daily legs at ~0.50); request floor
+  2 000 with top-ups of 5 000 ($2.50) up to 30 000 ($15) a UTC day
+  (gap E); the R0 halts — reject streak 5, drift $2, WS gap 30 s, asset
+  refusals 3, recon stale 300 s. The router's caps sit above B (200
+  contracts, 24 × $10): the 200-contract cap can bind on a very cheap
+  leg that paper buys, the one place live may refuse what paper does.
+- Session bound: loss −$54 on equity at cost (gap B) — B = $100 falling
+  to R4's no-edge 5th percentile, $46, a figure from R4's entry-only,
+  paced frame: under unpaced full parity it is a stop, not a statistical
+  bound. The at-cost figure lets the halt overshoot by the open legs'
+  loss — at most the day's $50 of premium plus daily legs carried from
+  the day before — so the funded balance is the real limit. No gain
+  halt: a measurement step does not stop on success.
+- **Every `live` starts a new session:** the flip archives the anchor,
+  and −$54 is measured from the equity at cost at the session's first
+  reconciliation. An engine halt of slot 3 (`pnl-loss` or any other
+  reason than `operator`) stays in `exec.HALT` through `paper`, and
+  `live` refuses until the operator has read it and archived it by
+  hand. After a `pnl-loss` stop, re-arming means re-funding to B or a
+  new ruling.
+
+**Widening versus R0 (2026-09-19):** `cap_day` $8 → $50; `max_order`,
+`max_open_orders` and the router's instance cap widen; the gain halt
+goes (+$15 → none) and the loss halt loosens (−$5 → −$54); the 0.70
+price floor goes; Arm A, Arm B and the daily families trade live for
+the first time.
+
+**Precondition 1 (the prior phase's P&L):** R0 — 6 VENUE entries on
+2026-09-19, −$5.105, stopped by its own −$5 session bound; no cap was
+the bottleneck. The paper record since is in the vault (the
+`bin15_accrue` report). The vault checklist's paper CONFIRM (≥ 200
+settled entries over ≥ 10 days, about 2026-10-04 at the earliest) is the
+recommended bar; arming before it is the operator's call at flip time.
+
+**Precondition 2 (the engine):** the five gaps the 2026-09-24 review
+found are closed in commit `5b9fb3f` ("The live arm, restart-proof",
+above). Still to check by hand on the first live day: the first partial
+sale's `entryNtl`, the first top-up's rise in `arm_budget_remaining`,
+and each daily family's settlement text against LAW E-11.
+
+**The flip** refuses `live` unless this entry is in the COMMITTED file,
+slot 3 is not running live, `exec.HALT` does not name slot 3, no gated
+restart is owed, and `exec-smoke` passes on the binary launchd boots
+(checked unchanged before the switch). It restarts only at :04–:10, :19–:25, :34–:40 or
+:49–:55 UTC, outside 00:05–00:59Z and the scheduled drains, then checks
+the boot tells. `paper` halts slot 3 first, requires the venue to show
+none of slot 3's orders resting before and after the restart, and
+leaves held legs to settle unmanaged. `--switch-only` arms or disarms
+at the NEXT restart, which may be an unattended scheduled drain.
+
+**Money:** the master account (R0's) holds the bankroll on SPOT, about
+$100 USDC, and the top-up budget on PERPS, at least one day's ceiling
+($15; about $7 a day at paper's pace). Fund before `live`, never during
+a session. The API agent holds nothing; its approval expires
+2026-10-19.
+
+**Precondition 3 (sign-off):** the rulings above set the frame; arming
+is the operator's own act, `scripts/bin15-flip.sh live`, logged with
+its time in `~/multivenue/logs/bin15-flip.log`.
+
+## HYPARB — slot 0: paper-first, TESTNET-only EVM writes (H0–H9, 2026-09-23)
+
+Slot 0 is `hyparb`, the HyperEVM AMM ↔ Hyperliquid Core arb
+(`crates/strategy-hyparb`). It trades **PAPER**; the mask flip that puts
+it in `strategy.conf` is an operator action after H9 (O-H8). Its only
+real submission path is the HyperEVM **TESTNET** shadow (chain 998).
+Build record: `docs/hyparb-build-plan.md` §16.
+
+### Slot 0 live — three switches, its own wallet (L5, 2026-09-24; supersedes H9's "never armed")
+
+H9 held slot 0 out of `--arm-live` because its AMM leg had no live arm:
+arming it would have sent real hedges against paper swaps. L2–L5 built
+that arm (`docs/hyparb-build-plan.md` §17.5), so the refusal became an
+interlock:
+
+* **Three switches, any one alone refuses:** `hyparb.toml mode =
+  "live"`; `exec.toml [exec.slot.0] mode = "live"` on EXACTLY
+  `["hyperliquid", "hyperevm"]` (one-legged is refused; `hyperevm` on
+  any other slot is refused); `--arm-live` naming 0.
+  `MainnetAuthority::armed_engine` opens the mainnet EVM arm only when
+  all three agree. `scripts/hyparb-flip.sh live|paper` sets them after
+  a preflight that sends nothing.
+* **Its own money (O-HL3):** wallet X swaps, pays gas, owns the executor
+  and hedges on its own Hyperliquid account. Slot 0's state files live
+  in `hyparb/` beside `exec.toml`; slot 3's are never touched.
+* **The five kill switches apply as on slot 3**, from slot 0's arm
+  alone (`halt_signal_for(0)`), never halting slot 3 nor the reverse.
+  The reject streak counts swaps refused, unsent or unconfirmed; a
+  REVERT (below `minOut`) is a miss, counted and never a streak — the
+  E7-F2 law for an IoC that did not cross. Drift covers the executor's
+  tokens and X's perp sizes.
+* **A swap the executor cannot fund is refused before it is sent**
+  (never a chain revert that pays gas to say so).
+* **The session bound (O-HL5, LIVE-only):** +$50 / −$20 on combined
+  equity (X's perp value + spot USDC + the executor's tokens at mids +
+  X's HYPE), judged only while flat, anchored at the first flat reading
+  and persisted. Gas lowers the equity, so the loss bound caps gas too.
+* **Only this process's fills book.** A `userFills` snapshot row older
+  than the arm's boot is dropped: a perp coin stays bound across
+  restarts, so the replayed history would otherwise be booked again.
+* **Resting rows retire** when the arm says an accepted order ended
+  without a fill (`OrderDispatch::try_next_retired`): a reverted swap,
+  a hedge IoC 5 s after acceptance.
+
+### The member's caps (`hyparb.toml`, paper)
+
+| cap | key | shipped value |
+|---|---|---|
+| one arb | `max_order_usd_1e6` | $100 |
+| one pool (a `[[pool]]` may set its own) | `cap_instance_usd_1e6` | $100 |
+| one UTC day of AMM notional | `cap_day_usd_1e6` | $2,000 |
+| unhedged inventory, all coins | `inventory_cap_usd_1e6` | $300 |
+
+The inventory cap is an **entry gate**: a breach halts NEW arbs; hedges
+and the flattening timer keep running (they are how the exposure comes
+down), and the halt lifts only under half the cap. H9 closed a hole in
+it: a coin whose hedge books had gone unusable was valued at **$0**, so
+a dead book could lift the halt with the exposure still on. Now a coin
+is valued at its last usable mid; inventory in a coin that never had a
+mid cannot be valued at all, and unvalued inventory both SETS the halt
+and never lifts it — an exposure of unknown size is under no cap.
+
+### The EVM write path's interlock
+
+1. **Compiled:** `exec_hyperevm::EVM_ARM_CHAIN_IDS = [998]`,
+   compile-time asserted — configuration arms testnet only. Since L1
+   (O-HL1) `Network::Mainnet` exists, but `EvmArm::new` refuses it and
+   `EvmArm::new_mainnet` demands a `MainnetAuthority`; nothing in the
+   ENGINE holds one (next section).
+2. **Signed:** every transaction is EIP-155 — the shadow's transactions
+   carry chain id 998 in the signed payload, so no signature the engine makes
+   is valid on 999 (the node answers "invalid chain ID"; the arm HALTS
+   on that refusal).
+3. **At the wire, at boot:** the write endpoint's `eth_chainId` must be
+   998 (the arm halts otherwise), and `check_chains(read, write,
+   --evm-hybrid)` allows same-chain, or exactly 999 reads → 998 writes
+   with the O-H12 switch — never the inverse.
+4. **Switches:** `mode = "testnet"` in `hyparb.toml` AND `--evm-testnet`
+   (+ `--evm-hybrid` for mainnet reads); either alone refuses.
+5. **Per-process halt:** a node that answers a different hash than the
+   one signed, a receipt from another sender or to another target, or a
+   node refusing the chain HALTS the arm for the life of the process —
+   nothing more is sent; only a restart re-arms it.
+
+**Refuse vs dark (H9).** A misconfiguration or a VERIFIED interlock
+failure refuses the boot: a wrong chain, a 999 read without the switch,
+a missing or malformed key or URL, an executor wallet 0 does not own or
+an executor address with no contract. An endpoint that cannot be used
+right now — DNS, transport, a non-200, the public endpoint's `-32005`
+throttle (a JSON-RPC error inside an HTTP 200, so it is classified by
+its message: `ArmErr::RateLimited`), an unreadable answer to a routine
+read — or an unfunded wallet 0 leaves the shadow **DARK**: logged at
+ERROR, `engine_hyparb_evm_dark = 1`, nothing sent, the paper member
+running. Dark bypasses no interlock: an interlock that could not be
+verified is still not passed, because nothing is sent. (A mistyped HOST
+is a DNS failure and therefore dark — it looks like an outage from
+here; the ERROR line names it.)
+
+### Mainnet writes: the operator's verbs only (L1, ruling O-HL1, 2026-09-24)
+
+Live mode (plan §17) will swap on HyperEVM MAINNET. Until L5 lands its
+three switches, the only code that can sign for chain 999 is the
+operator's `evm-live` verbs (`cli::evm_live`, `scripts/evm-live.sh`):
+`deploy`, `wrap`, `swap`, `sweep` — run by hand, never by the engine.
+
+* **The authority.** `exec_hyperevm::MainnetAuthority` is the one proof
+  a mainnet arm accepts. Its only door is `operator_verb(--confirm)`:
+  without `--confirm` the verb refuses before a key is read or a socket
+  opened. `status` only reads (its own connection, no arm, no key).
+* **The wallet (O-HL3).** One key, `HYPEREVM_MAINNET_KEY` (repo `.env`):
+  its address X owns the executor, pays gas and — from L2 — IS slot 0's
+  Hyperliquid account (`HYPERLIQUID_HYPARB_MASTER_ADDR` must equal X
+  when set). X is never slot 3's: a key equal to `HYPERLIQUID_AGENT_KEY`
+  or an X equal to `HYPERLIQUID_MASTER_ADDR` refuses.
+* **The bytes (O-HL2).** `deploy` sends only creation code whose sha256
+  is the pinned H9d hash, then requires the deployed runtime to equal
+  the committed one byte for byte, `owner` slots holding X, and
+  `owner()` = X. `status` repeats the check.
+* **The wire.** The endpoint's `eth_chainId` must be 999 (the arm halts
+  otherwise); `swap` trades only the artifact's `[[pool]]`s, needs an
+  explicit `--min-out-raw > 0`, and refuses a size the executor does
+  not hold; every send is refused unless X can pay its whole gas limit
+  at the fee cap.
+* **What bounds a verb's loss:** the balances the operator funded (the
+  live plan's ≈ $110 minimum) — the verbs have no cap of their own; the
+  P&L bound is live mode's (L3).
+
+### The shadow is a submission path OUTSIDE the risk gate
+
+The E6 risk gate sits in `RoutedDispatcher`, on `Order`s. The shadow
+does not go through it: the `evm-shadow` thread sends testnet swaps
+straight from the member's decision log. Its bounds are therefore its
+own, and they are these:
+
+* **Testnet only** (the interlock above) — no swap it sends can move
+  mainnet value.
+* **One swap in flight**, from **wallet 0 only**: the executor accepts
+  its immutable owner alone (`NotOwner`), boot reads `owner()` and
+  refuses an executor wallet 0 does not own. While a swap is in flight
+  a burst of decisions collapses to its newest (`superseded`, counted).
+  Wallets 1..7 carry the battery's nonce and ordering probes (0-value
+  self-transfers), never a swap.
+* **Fixed size:** every swap is `[testnet] amount_raw` exact input,
+  whatever the decision's notional.
+* **Gas:** G2 — a quarter of the decision's net edge over the swap's gas
+  limit, never above `gas_p99_usd_1e6` — so a shadow swap never bids
+  more than the artifact's p99 gas.
+* **Nonces:** one transaction in flight per wallet, `Ready` only when
+  `latest == pending`; a refusal that proves the nonce was not taken
+  returns it, anything else quarantines the wallet until a settled sync.
+
+A MAINNET write path would need an executor allow-list or one executor
+per wallet (a contract change under its own review) and a place inside
+the risk gate — neither exists, and the chain allow-list keeps it so.
+
+### The executor answers three callback names (H9d, 2026-09-24)
+
+Found live by the H8 battery: its first swap reverted on chain because
+the testnet pool is Hyperswap V3, whose pools call
+`hyperswapV3SwapCallback` — a name the executor did not have (mainnet
+Hyperswap runs the same pool code). The contract now answers it; it
+routes to the same `_pay` as `uniswapV3SwapCallback` and
+`algebraSwapCallback`, which pays only the pool the current call is
+swapping and only inside that swap (transient storage), so a third name
+adds no trust. An executor deployed before H9d must be redeployed
+(`evm-testnet deploy`, then `[testnet] executor`); boot's `owner()` check
+does not tell the two apart, the first swap's revert does. The cost of
+the miss was gas only — `BelowMinOut` and a callback revert both move no
+inventory.
+
+### Signing keys
+
+`HYPEREVM_TESTNET_KEY`, else — by the 2026-09-23 operator ruling ("reuse
+the one we used for HL") — `HYPERLIQUID_TESTNET_AGENT_KEY`, which makes
+this lane a NEW reader of the E3 gate's testnet key; never the mainnet
+agent key (pinned by a test). Read through
+`core_config::SecretKeyBytes::from_hex_env` (the one env-hex-key reader:
+mlock'd page, the env string zeroized, errors name the variable, never
+the value). Wallets 1..7 are derived from it, each in its own mlock'd
+page. The engine never opens `.env`; `scripts/evm-testnet.sh` sources it
+exactly as `exec-smoke.sh` does.
+
+### What H9 fixed on the write path (review, 2026-09-23)
+
+* **R4 (critical)** — the shadow picked wallets round-robin; the
+  executor accepts its owner (wallet 0) only, so every swap from wallets
+  1.. would have reverted and burnt gas. Fixed as above.
+* **R3** — every boot failure refused the engine; transport, throttle
+  and funding failures now leave the shadow dark (the second review
+  caught the throttle: it arrives as an HTTP 200 and first scanned as
+  "unreadable" — a refusal).
+* **A false "may have left the host"** — a kept-alive connection the
+  server had since closed took the next request's bytes into a dead
+  socket, and the arm booked a `MaybeSent` (a wallet lost to the receipt
+  timeout). `HttpsPost` now retires a connection the answer closes or
+  announces closing, and probes one before reusing it.
+* **Allocations on every TLS ingress thread** — `TlsTransport::read`
+  built its `WouldBlock` with `io::Error::new(kind, "…")`: three heap
+  allocations at the end of EVERY drain loop, on every TLS socket in the
+  engine, since 2026-08-14. Now `io::Error::from(kind)`. Found by a
+  measurement the alloc gates could not make (they drive
+  `TestTransport`); bench gate 72 now pins the HTTPS cycle.
+* **A chunked answer could abort the engine** (found by the H9 fuzz
+  run, `http1_response`; present since the initial commit): a chunk
+  size near `usize::MAX` wrapped the chunk's end below its start, the
+  framing check read the size line's own CRLF and passed, and the copy
+  pass panicked on the inverted range — `panic = "abort"` in release,
+  so one malformed chunked answer ended the process. Reachable from
+  `boot_http` (every venue's boot REST) and `HttpsPost`. The walk now
+  uses checked arithmetic: such a size is `Malformed`.
+* **The shadow's steady state left the opt-out.** `evm_testnet.rs`
+  carries a file-level `COPY-DOCTRINE:` header, which the copy audit
+  honours for the whole file — and the engine thread's `drain` lived
+  there. The tap and the worker are now `crates/cli/src/evm_shadow.rs`
+  (no opt-out, in the audit's default sweep), and `drain` walks the
+  member's decision log in place instead of staging 64 × 48 B per
+  report.
+* **Residue, recorded not fixed:** rustls 0.23's buffered API allocates
+  one `Vec` per TLS record sealed and one per application-data record
+  decrypted — on every TLS socket, the E-lane's `HlHttp` included (until
+  HD2 it wrote head and body as two records: two allocations where one
+  would do — one since HD2, gate 101; its stale-keep-alive shape WAS
+  fixed — H9c, "The live arm's stale
+  keep-alive"). Gate 72 pins it at exactly 2 per `HttpsPost` request. Removing it
+  is rustls' unbuffered API (`UnbufferedClientConnection`) — a core-net
+  transport decision for the operator, not a HYPARB-lane change.
+
+### BX5: `HttpsPost` became the blocking form of `HttpsConn` (2026-09-26)
+
+`core_net::HttpsPost`, HYPARB's JSON-RPC write arm and `/info` client,
+now runs the protocol of the new non-blocking `core_net::HttpsConn`,
+which is the Binance lane's REST client. The wire bytes are unchanged
+(pinned byte for byte), and so are the API and the `left_host` points
+(set before the write). Gate 72 still measures exactly 2 allocations per
+post.
+
+**One behaviour changed: the incomplete TLS close.** When a peer ends a
+connection with a bare TCP FIN and no `close_notify`, rustls returns
+`UnexpectedEof` on the read after the buffered answer. Before BX5 that
+read error discarded the answer and returned `Disconnected, left_host:
+true`. For the write arm that was a false `MaybeSent`: a 30 s receipt
+timeout, a wallet quarantine and, for a receipt, a lost answer. Now:
+
+* **An answer its own framing proves whole is delivered**, and the
+  connection retires. "Whole" means `Content-Length` was reached or the
+  terminating chunk was seen. RFC 9112 §9.8 says so, and TLS
+  authenticates every record, so a FIN can only cut bytes off the end;
+  it cannot change them. The arm's scanners and its mapping are
+  unchanged: answers that were thrown away reach the branches they
+  would have reached on a clean close.
+* **A close-delimited answer (no length of its own) counts only after a
+  close that a read CONFIRMED clean.**
+  * After an `Ok(0)`, one more read asks rustls, whose reader answers
+    `Ok(0)` only after `close_notify` and `UnexpectedEof` otherwise.
+  * A bare FIN ends as `Disconnected, left_host: true`.
+  * A close-delimited answer that our own buffer cut ends as `Overflow`.
+  * `TlsTransport::read`'s pull-through, which BX5 did not change,
+    returns `Ok(0)` at TCP EOF without making that distinction. That
+    happens every time an answer is larger than rustls' 16 KiB
+    plaintext wave. The confirming read closes the gap for `HttpsConn`.
+    The other `TlsTransport` users, the WS ingress streams, reconnect
+    on either result, and their frames are self-delimiting.
+* **Pinned by** `https_conn_loopback::`:
+  * `an_answer_proven_whole_survives_a_close_without_close_notify`
+  * `a_chunked_answer_proven_whole_survives_a_close_without_close_notify`
+  * `a_close_delimited_answer_needs_a_clean_close`
+  * `a_large_close_delimited_answer_needs_a_clean_close_too`
+  * `a_close_delimited_answer_cut_by_our_own_buffer_overflows`
+
+  The first and the fourth fail when their fix is disabled.
+* **`HlHttp` is unchanged.** It is the E-lane's slot-3 `/exchange` arm.
+  It still maps a bare-FIN `UnexpectedEof` to `Disconnected`: a false
+  `sent_unanswered`, which errs on the conservative side. "The live
+  arm's stale keep-alive (H9c)" above ("or arrives with the FIN … the
+  answer is kept") overstates it for that case. The E-lane decides;
+  BX5 changes nothing there. **Superseded by HD2** (2026-10-05, ruling
+  R2): `HlHttp` now runs on `HttpsConn`, and a whole answer before a
+  bare FIN is delivered.
+* **It reaches the armed engine only** through a merge to `main`, a
+  release build and an `exec-smoke`-gated restart.
+
+**Order-state rules for the Binance gateway (BX6)**, recorded now
+because the transport makes them:
+* **`WsConn` has no `left_host`.** A WS API request is maybe-sent from
+  the moment `flush` is called. Frames that were queued but never
+  flushed when the session died were not sent (`connect` drops them).
+* **`HttpsConn::window_mut` is empty while a dial is pending**, so a
+  render cannot rewrite a request that has not been sent. `Busy`
+  means nothing was written.
+* **DNS is never resolved on the gateway thread.** `reresolve` is
+  crate-private; addresses come in through `set_addr`.
+* **No transport enforces a cap.** Every order enters through
+  `RoutedDispatcher`'s risk gate.
+
+### HD1: `HttpsReq` moved onto `HttpsConn` — one keep-alive engine (2026-10-05)
+
+`core_net::HttpsReq` is the Hypercall REST client: the paper fleet's
+`hypercall-poller` (`/options-summary`), the exec-hypercall arm (dark) and
+its operator verbs. It now runs on `HttpsPost`'s crate-private **raw**
+form over `HttpsConn`, the engine BX5 reviewed: one window, the whole
+request rendered into it by `HttpsReq`. The older blocking copy of the
+engine (`core_net::https_keepalive`, HC2's `KeepAlive`) is deleted, so the
+`left_host` law is implemented once. The API is source-compatible
+(`host()` now returns the interned `&'static str`); the error kinds, the
+`left_host` points (set before the write) and the wire bytes are
+unchanged. Gate 77b still measures exactly 2 allocations per request.
+
+**The two behaviours BX5 changed for `HttpsPost` now hold for `HttpsReq`:**
+
+* **An answer its own framing proves whole survives a bare FIN** (a TCP
+  FIN with no `close_notify`): `Content-Length` reached, or the
+  terminating chunk seen. Before HD1 the read after the answer
+  (`UnexpectedEof`) discarded it and returned `Disconnected, left_host:
+  true` — for the arm, a false in-doubt on an order the venue had already
+  answered; for the poller, a lost summary.
+  `https_req_tls_loopback::a_whole_answer_survives_a_close_without_close_notify`
+  failed 11 runs of 11 on the old engine and passes on the new one.
+* **A close-delimited answer counts only after a close a read confirmed
+  clean.** After a bare FIN it ends as `Disconnected, left_host: true`;
+  cut by our own buffer, as `Overflow`. Before HD1 two unconfirmed
+  closes also delimited it: the pull-through's `Ok(0)` (a bare FIN met
+  past rustls' 16 KiB wave), and a close the pump saw while our full
+  buffer had cut the body, which was handed on truncated. Hypercall's
+  measured REST answers (`/markets`, `/options-summary`, `/health`) carry
+  `Content-Length` (venue-latency.md §3); the arm's order paths are
+  unmeasured.
+
+**Recorded, not fixed (pre-existing, every engine):** `http1::read_response`
+frames a `204` (or `1xx`) without `Content-Length` as close-delimited. On
+a kept-alive connection such an answer waits out the 5 s deadline and
+ends `Timeout, left_host: true` — before HD1 as after; since HD1 a bare
+FIN right behind it ends `Disconnected`. RFC 9112 §6.3 gives those
+statuses no body (`ContentLength(0)`). The parser is shared with the HL
+order path, whose changes are the E-lane's to rule on, so the fix waits
+for HD2 (`HlHttp` onto `HttpsConn`). **Fixed in HD2** (below): a `204`
+ends at its head, and interim `1xx` answers are skipped.
+
+**A new boot refusal:** `head_cap + body_cap` above `MAX_BODY_CAP`
+(9 999 999 B) is `BadEndpoint`, because the head and the body now share
+one window. Every caller is far below it (512 + 0 and 1 024 + 2 048).
+
+**It reaches the paper fleet only** through a merge to `main`, a release
+build and a restart. Then the poller's
+`engine_ingress_hypercall_rest_polls_ok_total` / `_polls_err_total` are
+the check.
+
+### HD3: `LiveDispatcher` moved onto `HttpsPost` (2026-10-05)
+
+`clob_dispatcher::LiveDispatcher` is the legacy `--live` Polymarket CLOB
+path ("The legacy `--live` flag is outside the interlock", above). It now
+posts through `core_net::HttpsPost`, the engine HD1 put `HttpsReq` on,
+instead of a transport of its own — Anton's ruling R3: migrate, not
+retire. Its API and error variants are unchanged. It runs on the
+`QueuedDispatcher` worker thread, never the engine loop (one order may
+block up to 5 s). What changed:
+
+* **A connection the CLOB closed while idle is no longer written to.**
+  The reuse probe retires it and the order dials fresh. Before HD3 the
+  order went into the dead connection and failed `Disconnected`. An
+  answer with `Connection: close` (or HTTP/1.0) now retires the
+  connection too; before, the next order was written into it.
+* **A chunked answer is decoded.** Before HD3 its raw chunk lines reached
+  the scanner (`JsonMalformed`). A close-delimited answer needs a clean
+  close.
+* **The request is flushed at once.** Before, on a reused connection it
+  sat in rustls until the next poll wake, up to 50 ms (HlHttp's E7
+  finding).
+* **One 5 s budget per order** (dial, write and read together) where
+  each phase had 5 s of its own, up to 15 s. Every failure closes the
+  connection; before, a failed write or poll could leave it open.
+* **One TLS record per order:** head and body go out as one slice. The
+  head's header order is `HttpsPost`'s (Host, Content-Type, Connection,
+  Content-Length).
+* **Some rejections change category in `DispatchStats`; of these shifts,
+  none moves to `accepted`.** A chunked or close-delimited non-2xx answer
+  used to be `Http(status)` as soon as its head arrived; now the whole
+  answer is framed first. One over 8 KiB (a CDN error page, say) is now
+  `Disconnected` (`Overflow`); one ended by a bare FIN, `Disconnected`;
+  one with malformed chunks, `JsonMalformed`. A `204` or `1xx` without a
+  length waits out the 5 s deadline (HD1's recorded parser issue), where
+  it returned at once — until HD2, which ends both at their head. A
+  `Content-Length` answer over 8 KiB fails at once instead of at the
+  deadline.
+* A non-2xx answer still closes the connection, so a venue that refuses
+  every order costs a full TLS handshake per order. If the path is ever
+  made real, a well-framed `4xx` should keep the connection.
+* DNS is re-resolved, blocking the worker thread, after every third
+  failed dial in a row.
+
+Pinned by `live_dispatcher_loopback::`
+`an_order_after_an_idle_close_goes_out_on_a_fresh_connection` and
+`a_chunked_answer_is_decoded_and_the_connection_kept` — both failed on
+the old transport, 3 runs of 3 — beside the three original tests,
+unchanged. The copy-audit baseline goes 31 → 28: the old transport's two
+copies are gone, and the token-id fallback's copy now carries its note.
+
+**Not expected to place a real order** (from Polymarket's documentation,
+read 2026-10-05; not tested against the venue). Its `POST /order`
+reference requires the L2 authentication headers (`POLY_API_KEY`,
+`POLY_ADDRESS`, `POLY_SIGNATURE`, `POLY_PASSPHRASE`, `POLY_TIMESTAMP`),
+none of which this dispatcher sends, and describes `owner` as the "UUID
+of the API key owner", where this dispatcher puts the maker address. Its
+CLOB V2 migration page says V1-signed orders "are no longer supported on
+production" since 2026-04-28, and this signer is V1 (domain version
+`"1"`, the `taker` / `nonce` / `feeRateBps` struct). What keeps the path
+out of the managed fleet is unchanged: the wrapper's allow-list and its
+hard-coded `--paper`.
+
+### HD2: `HlHttp` moved onto `HttpsPost` — the HL order path (2026-10-05)
+
+`exec_hyperliquid::http::HlHttp` is the E-lane's REST arm: every
+`/exchange` order and `/info` read of the operator's HL arm (slot 3,
+BIN15's mainnet orders), the HYPARB hedge, the XMM gateway's REST
+fallback, `exec-smoke` and the lifecycle probe. It now posts through
+`core_net::HttpsPost` with two templates, `POST /exchange` and
+`POST /info`, over `HttpsConn` — the engine HD1 and HD3 put the other
+clients on — instead of a transport of its own. Anton's ruling R2
+accepted the behaviour changes below. `HttpErr` and
+`PostErr { err, left_host }` keep their shapes: core-net's kinds map
+onto them one to one, except `BadEndpoint` → `BadServerName` and `Busy`
+/ `BadRequest` (unreachable from this client) → `Disconnected`; and
+`left_host` — the engine's, set before the write — passes through
+untouched. An order is rendered into the client's `/exchange` window
+(`body_mut()`) and posted by its length (`post(n)`); `/info` reads
+render into a window of their own (crate-private `info_mut()` /
+`post_info(n)`), so a read never disturbs an order's bytes. The other
+API changes are in migration.md.
+
+**What changed on the order path:**
+
+* **A whole answer survives a bare FIN.** When `Content-Length` was
+  reached or the terminating chunk seen, a TCP FIN without
+  `close_notify` right behind the answer no longer discards it: it is
+  delivered and the connection retires. Before HD2 the read after it
+  (`UnexpectedEof`) threw it away — `Disconnected, left_host: true`, a
+  false `sent_unanswered` on an order the venue had answered, charged to
+  the address budget and left to reconciliation. BX5's "`HlHttp` is
+  unchanged" bullet and H9c's overstatement for that case are settled.
+* **A chunked answer is decoded in place.** Before HD2 it was `BadHttp,
+  left_host: true` — the same false in-doubt.
+* **A close-delimited answer counts only after a close a read confirmed
+  clean** (BX5's rule): after a bare FIN it ends `Disconnected,
+  left_host: true`; cut by our own 1 MiB buffer, `Overflow`.
+* **Statuses with no body end at their head** — HD1's recorded parser
+  issue, fixed in the shared `http1::read_response`. A `204` is
+  `ContentLength(0)` whatever its headers say; interim `1xx` answers
+  before the final one are skipped (RFC 9110 §15.2); a `101` is
+  `Malformed` (no request through this parser asks to switch
+  protocols). `http1::head_says_close` judges every head of such a
+  region, and any that says close retires the connection — read as one
+  head, an interim head's empty line ended the field scan before the
+  final head's `Connection: close`; an answer with no interim head is
+  judged as before, at no extra cost. Before HD2 a `204` or a `1xx` read
+  as close-delimited and, on a kept-alive connection, waited out the
+  5 s deadline: `Timeout, left_host: true`. The fix reaches every user
+  of the parser: `boot_http` and every `HttpsConn` client (the Binance
+  REST arm, the HyperEVM write arm, `HttpsReq`'s Hypercall clients, the
+  Polymarket path). **A `204` on `/exchange`** (Hyperliquid sends none)
+  now reaches the answer scanner with an empty body and is judged as
+  any unreadable answer is — `JsonMalformed`, counted as a rejection,
+  the address budget charged, reconciliation left to settle it — where
+  it timed out as `sent_unanswered` before; the gateway reads it as in
+  doubt (`EV_UNANSWERED`).
+* **One TLS record per order, one allocation fewer** — while head and
+  body fit rustls' 16 KiB record; every real order is far below (a
+  39-item batch renders to ≈ 7 KiB). The head and the body go out as ONE
+  slice in ONE write; before HD2 they were two writes, two sealed
+  records — by the one-record-per-write rule H9 measured, 3 allocations
+  per post where gate 101 now pins 2.
+* **The head's header order is `HttpsPost`'s:** Host, Content-Type,
+  Connection, Content-Length. Before HD2, Content-Length came before
+  Connection. `HttpsPost` already sends this order to Hyperliquid's
+  `/info` as HYPARB's client (BX5).
+* **Unchanged in substance:** one 5 s budget per cycle (dial, write and
+  read together); the reuse probe and the `Connection: close`
+  retirement (H9c), now the engine's code rather than a copy; DNS
+  re-resolved, blocking, after every third failed dial in a row, as
+  `HlHttp` did. The calling thread still blocks for a cycle, up to 5 s:
+  on the `--exec` path that is the ENGINE thread for the blocking arm —
+  slot 3's submits and idle work, and HYPARB's Hyperliquid hedges
+  (`crates/engine/src/lib.rs`: "It BLOCKS, and that is the accepted
+  cost"; XH4i moves BIN15 onto the gateway) — and the gateway's own
+  thread on its REST fallback.
+* **The gateway's REST fallback renders the envelope straight into the
+  `/exchange` window** when a post is sealed with no socket Ready — no
+  WebSocket head it would never be sent with, and no copy. Only a
+  re-send — a post whose socket died under the write, whose signed
+  bytes exist only in the TX buffer and must go out unchanged — copies
+  its envelope (≤ 16 KiB; the TX buffer is const-asserted to fit the
+  window) into the window: the cut's one new `// COPY:`, on the coldest
+  path. Before HD2 the old client sent the envelope from the TX buffer
+  as it lay, in two records. (Since HK4 the re-send is tested end to end —
+  the REST body is the WebSocket post's payload, byte for byte — and the
+  REST path is alloc gate 114.)
+* **Copies the old client made are gone:** the per-post head render (the
+  head is now rendered once at boot and moved by a marked `copy_within`
+  only when the body's digit count changes), and the boot-time copy of
+  its host name, whose owned TLS server name was also cloned — a
+  `String` allocation — on every dial (core-net interns the host once per
+  process, marked; a dial now copies a pointer).
+* **A host refused on its syntax** (empty, over 253 B, not visible
+  ASCII) is `BadServerName` at construction, before DNS, where it used
+  to be `Dns`.
+
+**Evidence:**
+
+* Red first, against the old client and the old parser:
+  `hl_exchange_tls_loopback::`
+  `a_whole_answer_survives_a_close_without_close_notify`
+  (`Disconnected, left_host: true`),
+  `a_chunked_answer_is_decoded_and_scanned` (`BadHttp, left_host:
+  true`), `the_request_head_is_pinned_byte_for_byte` (the old header
+  order) and `interim_answers_and_a_204_end_at_their_heads` (`Timeout,
+  left_host: true` after 5 s) each failed 3 runs of 3;
+  `http1::tests::read_response_a_204_has_no_body` and
+  `read_response_skips_interim_answers` failed. All pass on the new
+  code. The bare-FIN loopback is a race the FIN usually wins; BX5's
+  `https_conn_loopback::an_answer_proven_whole_survives_a_close_without_close_notify`
+  is the deterministic proof of the engine path.
+* `https_post::tests::two_templates_each_render_their_own_request` pins
+  both templates byte for byte, and a template that does not exist is
+  refused before anything dials; `http::tests::each_api_has_its_own_window`
+  pins `HlHttp`'s template indices to their paths and its windows apart.
+* **Gate 101 (new):** `HlHttp`'s keep-alive cycle at exactly 2
+  allocations per post — rustls' sealed record out and decrypted record
+  in — with the head moving on every post, against gate 72's
+  child-process node. Gate 87 now also judges an answer behind two
+  interim heads (one of them saying close): 0 B.
+* `hl_gateway_loopback::with_no_socket_left_a_post_goes_rest_as_the_envelope_alone`
+  pins the REST body the gateway now renders in the window.
+* **Gates on the final tree (09:05–09:11Z):** clippy 0; nextest 4 213
+  passed (9 skipped); `make alloc-assert` 110 passed (3 ignored) — gate
+  101 exactly 2 per post, gate 87 0 B with the interim answer;
+  copy-audit hits 28, baselined 28, new 0, paid 0; license OK (663
+  files); release OK; replay 7× IDENTICAL; rustfmt clean on the touched
+  hunks. Reviews: risk APPROVE (round 3); allocation and zero-copy
+  APPROVE WITH NITS (round 2) — the zero-copy round 1 asked for the
+  gateway's REST render at seal time, now in.
+* **The E3 testnet battery** on the final release binary (09:11–09:17Z):
+  `exec-smoke` phases A and B PASS (the venue verified the signature and
+  refused a corrupted one); `--lifecycle` on the BTC perp (post-only
+  0.0002 at 77 575, modified to 76 575) placed, modified to a new oid,
+  cancelled by cloid and verified gone; `--requote` PASS (a modify by
+  cloid with a fresh cloid moved the order); `--sweep` PASS;
+  `--hl-perp --lifecycle` (BTC, ETH, SOL; 20 cycles, 3 IoC pairs) exit 0,
+  the bar met — 20/20 cycles, 20 refused crossing modifies, 20
+  `BadAloPx` places, 20 TTLs, 4/4 sweeps, 6/6 clean reconciliations, 8
+  fills (fees $0.042), nothing left on the account; post RTT p50 579 ms,
+  p99 1.21 s. `--recon` exits 24 on E3 — with byte-identical JSON on
+  `main`'s pre-HD2 binary: the account holds an outcome leg whose fills
+  aged out of the `userFills` window (`venue_legs_unreconciled` 1, 3 legs
+  drifting, worst 0.72 contracts) — the account's state, not this cut;
+  the equal JSON shows the `/info` reads parse identically on both.
+
+**It reaches the armed engine only** through a merge to `main`, a
+release build and an `exec-smoke`-gated restart — Anton's word.
+
+## BX — the Binance execution laws (BX-1 … BX-20)
+
+The plan's §4 laws (`docs/binance-exec-plan.md`), carried here by BX11 and
+restated **as built** on branch `binance` through BX8 (2026-10-10, after
+BX12; options since BX9; Binance Stocks since BX10, 2026-10-11). The arm
+is ARMABLE for USDⓈ-M and COIN-M under classic, PM and PM Pro, for spot
+(bStocks included) under classic, IoC-only, and for options under
+classic, IoC-only (BX9); **no member arms (O-BX6)** before BX13. Binance
+Stocks (BX10) is built and battery-tested but the ENGINE refuses it
+(ruling S-3; O-BX16, R17): only the operator's mainnet battery drives it.
+Each law gives its text, where it is enforced, what proves it and what
+stays open; "**As built**" marks where the build departs from the plan's
+wording. The phase entries after the laws (BX3, BX6, BX7, BX7b, BX11,
+BX12, BX8, BX9, BX10) are the history: where an entry and a law
+disagree, the law is the current statement. The operator's procedures
+are `docs/binance-runbook.md`.
+
+### The laws, as built
+
+#### BX-1 (E-1) — never paper
+
+* **Law.** A live Binance slot never falls back to paper. An order the
+  arm cannot route is refused and counted.
+* **Enforced.** `exec-router` `RoutedDispatcher::submit` (its cancel and
+  modify alike): a live slot's order off its venue is `NoLiveRoute` and
+  never reaches the paper matcher. `BnArm::admit`: an unbound, not-live
+  or not-owned row is `NoLiveRoute`; every local refusal is counted by
+  reason (20 reasons). An arm that does not boot ends the engine (exit 1).
+* **Tested.** `routed.rs`
+  `a_live_slot_on_a_wrong_venue_is_refused_and_never_falls_back_to_paper`,
+  `a_live_slots_cancel_on_a_wrong_venue_never_reaches_the_paper_matcher`;
+  `arm.rs` `the_refusals_are_counted_by_reason`; gate 92.
+* **Open.** Nothing. BX6's "`/state` omits the refusals by reason" is
+  closed by BX11 (`exec.arms.binance_gw.refused`,
+  `engine_exec_bn_refused_<word>_total`).
+
+#### BX-2 (E-5) — the response is the ACK, the stream is the FILL
+
+* **Law.** Orders ask for `ACK`: no order response books a fill.
+  `TRADE_LITE` and `ORDER_TRADE_UPDATE` are deduplicated on (row,
+  `tradeId`).
+* **As built — three more fill sources, none a response:** an
+  `order.status` answer for an order in doubt (`J_FILL_UNSEEN`), an
+  update's cumulative `z` past the trades seen, and the boot's adoption
+  of the venue's positions (`FILL_FLAG_ADOPTED`). "BX6" (fills, doubts and
+  cancels) and "BX7" (adoption) carry their rules.
+* **As built — spot (BX8):** the stream is the order session's own
+  subscription. Only its 200 naming a `subscriptionId` makes a session
+  live (`wsapi::scan_subscribed`), and `eventStreamTerminated` drops the
+  session. During make-before-break both sessions are subscribed: a trade
+  reported on both is booked once (the trade-id ring).
+* **Enforced.** `wsapi::queue_place` and `rest::render_place` send
+  `newOrderRespType=ACK`; `place_answered` books nothing;
+  `oot::TidRing::see` (256 trade ids) books a trade once and, since BX11,
+  owes its commission once (`J_FEE`, BX-14).
+* **Tested.** e2e `the_arm_trades_end_to_end_against_a_scripted_venue`
+  (the lite, the update and a replay book one fill),
+  `a_trades_commission_is_journaled_once_whichever_report_booked_it`;
+  `oot.rs` `tid_ring_books_once_and_owes_the_fee_once`; gate 93; fuzz
+  `bn_user_event`, `bn_wsapi_frame`. BX8: e2e
+  `the_spot_lane_trades_iocs_and_its_fills_reach_lane_4` (spot's place
+  asks `ACK`; each trade one fill),
+  `both_spot_sessions_subscribed_book_each_trade_once`,
+  `a_subscription_answered_without_its_id_is_never_live`,
+  `the_subscription_ending_drops_the_session`; gates 108 and 109; fuzz
+  `bn_spot_event`.
+* **As built — Stocks (BX10):** a fourth fill source, and the only one on
+  Stocks: the order's detail (`order/detail`). The stream's `orderReport`
+  names no execution and no client id: it is the TRIGGER only — a report
+  that ends the order or names more filled than booked asks the detail,
+  and so does a listing that shows more filled than booked (a report the
+  stream lost). The place's answer is a receipt (`J_ACK`, the order's
+  UUID); the broker's `ACCEPTED` is journaled once (`J_ACCEPTED`, kind 11)
+  — a report's `ACCEPTED` that came before the answer named the order is
+  kept by its key and journaled once it does. Each execution books once —
+  its `executionId` on the trade-id ring, exact (`equity::exec_key`) —
+  never past the cumulative `filledQty`; a cumulative past the executions
+  listed books at the implied price (`J_FILL_UNSEEN`), except the cut the
+  venue's nine decimals make to six (never booked). Tested: e2e
+  `the_equity_lane_places_fills_and_reconciles`,
+  `the_stream_before_the_answer_waits_for_the_answers_id`,
+  `an_acceptance_ahead_of_its_answer_is_journaled_once_named`,
+  `a_fill_the_stream_lost_is_booked_once_the_stream_reopens`,
+  `a_lost_fill_on_a_working_order_is_booked_from_the_listing`,
+  `the_cut_past_the_sixth_decimal_is_never_drift`; `equity.rs`
+  `an_order_report_is_the_trigger`,
+  `a_detail_reads_its_executions_and_its_cumulative_figures`; gates 112
+  and 113; fuzz `bn_equity`.
+* **Open.** The dedup horizon, 256 trade ids ("BX6"). A mainnet fill seen
+  on the stream is BX13's to prove; Demo's is met ("BX7b"). Stocks'
+  report, detail and execution shapes are the docs' and the connector's
+  until the operator's battery places an order ("BX10", residuals).
+
+#### BX-3 (E-3) — signatures proved by known answers
+
+* **Law.** Signature payloads are proved by known-answer vectors, in
+  `tests/` and in the boot's self-test, never taken on trust from prose.
+* **Enforced.** `BnGateway::new` runs `selftest::run()` and the key's own
+  check — `signer_ed25519::self_test` (RFC 8032 §7.1) or the HMAC check
+  on the docs' worked example; a failure is `BootErr::SelfTest`. The
+  loopback venue verifies every signature it is sent.
+* **Tested.** signer-ed25519 `the_rfc8032_known_answers_pass`,
+  `one_corrupted_byte_anywhere_refuses`, `the_boot_self_test_passes`,
+  `the_ws_api_docs_payload_signs_as_openssl_signs_it`; `selftest.rs`
+  `every_vector_holds`; `config.rs`
+  `hmac_signs_binances_documented_example`; every e2e test (`sig_bad ==
+  0`); gates 86 and 104. Demo verified every rendered payload ("BX7b").
+* **As built — Stocks (BX10):** `/sapi/v1/equity/*` is signed as SAPI is —
+  Ed25519 or HMAC over the query rendered in place (gate 113 signs with
+  Ed25519). The read-only mainnet probe proved HMAC there (S-1); Ed25519
+  on mainnet waits for the operator's battery. Tested: e2e
+  `the_equity_lane_places_fills_and_reconciles` (Ed25519),
+  `an_hmac_key_signs_the_equity_lane`; `rest.rs`
+  `the_equity_requests_carry_the_d5_keys_and_the_uuid`.
+* **Open — short of the law:** the official connectors' own vectors,
+  deferred by BX4 to BX6's renderer, never landed (the payload vectors in
+  `selftest.rs` were computed with Python `cryptography`); the HMAC
+  example runs as a unit test and at boot, not in `tests/`. No RSA (no
+  product needs it). (**HK5, 2026-10-13:** the docs' two HMAC vectors are
+  in `tests/` on the arm's signing path; Binance's API documentation
+  gives no checkable Ed25519 vector — see "HK5" at the end.)
+
+#### BX-4 (E-4) — bound at boot, never named at runtime
+
+* **Law.** An instrument is live-tradable only if the boot's discovery
+  bound it; it is never derived from a name at runtime.
+* **Enforced.** `bn_live::bind_table` binds each owned instrument from its
+  discovery row (a missing row refuses the boot); `InstTable::bind` makes
+  a row live only if it is TRADING, has an exact tick and step and is
+  owned (≤ 256 rows); `row_of` gives `ROW_NONE` to anything else. A
+  stream fill on an unbound symbol is counted (`GW_FILLS_UNOWNED`), never
+  booked; the router refuses an unbound Binance id.
+* **As built — stricter:** liveness is fixed at boot and can only be
+  withdrawn (`-4411` retires a TradFi row). **BX8:** a spot row binds only
+  naming its base and quote assets (`BindErr::BadAsset`) and quoted in
+  USDT (`bind_table`); spot[0] binds under the M1 anchor's id 7, routed by
+  the alias. **BX9:** an option row binds by `InstTable::bind_option` —
+  IoC-only (`INST_NO_DEADMAN`), writable as the boot judged (BX-18), its
+  underlying indexed; a row with no unit, no expiry or a strike finer
+  than 1e-6 is refused (`BindErr::BadOption`). The chain bound is the
+  paper-selected one plus every option the account holds outside it (the
+  R3 ruling): one signed `GET /eapi/v1/position` right after the boot's
+  discovery, before any table is built from the chain, joins each under
+  the next id (`bn_live::held_outside_chain`; on a shared account — not
+  armable today — only an owned underlying's, every owned underlying
+  configured), so
+  one id is bound, priced and named in the manifests; a held option of
+  ours no listed row names, or more than 16 outside the chain, refuses
+  the boot by name or by count.
+* **Tested.** `inst.rs`
+  `inexact_units_and_settling_rows_stay_bound_but_not_live`,
+  `binding_refusals`; `bn_live.rs`
+  `the_table_binds_every_usdm_instrument_from_its_own_row`; e2e
+  `a_row_the_arm_cannot_trade_is_never_adopted`. BX8: `inst.rs`
+  `a_spot_row_binds_with_its_assets_and_groups`,
+  `the_alias_is_matched_by_the_full_id_first`; `bn_live.rs`
+  `spot_binds_quoted_in_usdt_and_the_anchor_under_its_alias`. BX9:
+  `inst.rs` `an_option_binds_ioc_only_writable_as_judged`,
+  `option_binding_refusals`; `bn_live.rs`
+  `options_held_outside_the_chain_join_it_and_bind`.
+* **As built — Stocks (BX10):** an equity row binds from its ticker's
+  `exchangeInfo` row (`InstTable::bind_equity`: the cent tick, the step,
+  the minimum notional and the venue's sides — `tradability` — fixed at
+  boot); the engine's `bind_table` binds none (S-3): only the battery
+  binds one. Tested: `inst.rs`
+  `an_equity_row_binds_on_the_cent_and_its_step`; `equity.rs`
+  `a_tickers_rules_read_from_exchange_info`; proptest
+  `a_tickers_rules_round_trip`.
+* **Open.** A row the venue closes in session is learnt only from its
+  refusals (BX-5's streak), never from a re-read. BX9: the held read is
+  one read at boot — an option bought between it and the arm's boot is
+  unbound: on a dedicated account the boot completes with the slot
+  unreconciled (it refuses every order; `unseen_legs` in the boot's
+  reconciliation tells) until the option is closed in the app or a
+  restart joins it; one bought after Ready leaves the cycles unreconciled
+  until the slot halts `ReconStale` (orders pass until then). An expired
+  option still held while its settlement is
+  pending, if the venue no longer lists it, refuses the boot by name
+  until the venue settles it. Before a shared scope is ever armable (the
+  risk review's round 3): on a shared account a held option no listed row
+  names is skipped even when its underlying is owned — neither bound nor
+  counted unseen; it must refuse by name there too.
+
+#### BX-5 (numeric) — quantized locally
+
+* **Law.** Integer quantization against the bound tick and step: a BUY's
+  price floors, a SELL's ceils, a quantity floors. A local violation is
+  refused and never sent; a venue filter reject feeds the streak.
+* **Enforced.** `BnArm::quantize` on submit and modify (`num::floor_to`,
+  `ceil_to`); the price, the minimum quantity and notional, the maximum
+  quantity and the PERCENT_PRICE band are refused before the ring and
+  counted. A venue reject is `CodeClass::Reject` and moves the reject
+  streak.
+* **As built:** the band binds only with a mark under 10 s old
+  (`MARK_FRESH_NS`); without one the order goes and the venue judges it.
+  A filter reject is not singled out as a defect: it is a reject like any
+  other, and any ACK resets the streak ("BX6").
+* **Tested.** `num.rs` `quantize_is_the_side_safe_rounding`,
+  `floor_and_ceil_bracket`; `arm.rs` `a_healthy_arm_quantizes_and_pushes`,
+  `the_refusals_are_counted_by_reason` (nothing refused reaches the
+  ring), `the_band_binds_only_with_a_fresh_mark`; gate 92. BX8: `inst.rs`
+  `a_spot_row_binds_with_its_assets_and_groups` (spot's BTCUSDT grid:
+  tick 0.01, step 0.00001, a 5 USDT minimum notional); e2e
+  `the_spot_lane_trades_iocs_and_its_fills_reach_lane_4` (the place on
+  the row's step and tick); gate 109 (spot's place rendered).
+* **As built — Stocks (BX10):** the price on the cent (a BUY floors, a
+  SELL ceils), the quantity on the row's step at the arm's six decimals
+  (the venue's step is 1e-9), the $5 minimum notional refused locally;
+  there is no `minQty` (S-1). Tested: `inst.rs`
+  `an_equity_row_binds_on_the_cent_and_its_step`; `bn_equity_battery.rs`
+  `prices_and_quantities_are_cut_the_venues_way`; gate 92.
+* **Open.** The risk gate judges the order before quantization: a SELL
+  may price one tick above what it judged ("BX6").
+
+#### BX-6 (clock)
+
+* **Law.** A timestamp is local wall time plus the measured offset;
+  `-1021` / `-5028` resync the clock and count toward the streak.
+* **Enforced.** `clock::VenueClock::venue_ms` (the offset of the round's
+  minimum round trip); nothing is signed before the clock is measured;
+  `-1021` / `-5028` invalidate the clock and start a round.
+* **As built — the window is configured, not measured:** `recvWindow` is
+  `[exec.binance] recv_window_ms` (1..=5 000, default 1 000); the plan's
+  "never 5 000 ms" is not enforced (the bound is inclusive; the Demo
+  tools use 5 000). The clock codes move the streak only on a place's
+  reject. On a spot-only arm (BX8) the clock is the spot lane's:
+  `/api/v3/time`.
+* **Tested.** `clock.rs` `the_minimum_rtt_sample_wins_the_round`; `gov.rs`
+  `codes_classify`; core-config `the_binance_section_is_required_and_bounded`
+  (5 001 refused); the loopback venue checks every timestamp (`bad_ts ==
+  0`); e2e `a_1021_resyncs_the_clock_and_its_place_is_never_resent` (BX12:
+  the clock's round of four reads, the place refused, counted and never
+  re-sent, the next one trading),
+  `the_spot_lane_trades_iocs_and_its_fills_reach_lane_4` (BX8: a
+  spot-only boot's round, four `/api/v3/time` reads).
+* **BX13:** `-5028` driven end to end:
+  `a_5028_resyncs_the_clock_and_its_place_is_never_resent` (the clock's
+  round of four reads; the place refused, counted, never re-sent; the
+  next trades — break-and-watched: `-5028` an ordinary refusal leaves the
+  clock unread).
+
+#### BX-7 (ownership)
+
+* **Law.** One live slot owns what it trades for the life of a boot;
+  venue-originated fills (liquidation, ADL, delivery, assignment) go to
+  the owner.
+* **As built — coarser:** at most one live Binance slot, owning every
+  bound row of every armed product ("BX6", departure e). Orphan fills go
+  to the owner too. An option's settlement (BX9) is the owner's: the
+  exercise record that agrees with the booked leg books one settlement
+  fill (`FILL_FLAG_SETTLEMENT`) to the owner slot. Spot has no
+  venue-originated fill (BX8): an id spelling a liquidation's, an ADL's or
+  a settlement's on a spot event is someone else's order — foreign
+  (BX-8).
+* **Enforced.** `exec_boot::check_binance` refuses a second live Binance
+  slot; `BnArm::admit` refuses another slot's order (`NotOwner`);
+  `on_order_event` books orphan, liquidation (`autoclose-`), ADL
+  (`adl_autoclose`) and settlement (`settlement_autoclose-`) fills to the
+  owner slot, a settlement flagged `FILL_FLAG_SETTLEMENT`; any other
+  foreign fill is counted (`GW_FILLS_FOREIGN`), never booked.
+* **Tested.** exec_boot
+  `a_live_binance_slot_resolves_with_its_section_and_nothing_else_does`;
+  `cid.rs` `ours_orphans_and_the_venues_own`; fuzz `bn_cid`; e2e
+  `venue_originated_fills_go_to_the_owner_and_a_strangers_to_no_one`
+  (BX12: the orphan's — its id naming another slot — a liquidation's,
+  reported `CALCULATED`, an ADL's and a settlement's fills to the owner
+  slot, the settlement alone flagged; a stranger's counted, booked to no
+  one), `a_foreign_or_liquidation_named_spot_fill_is_booked_to_no_one`
+  (BX8: on spot, the same names booked to no one).
+* **Open.** The worker folds adopted fills and settlements as trades — an
+  arming precondition ("BX7").
+
+#### BX-8 (the account's scope)
+
+* **Law.** On a dedicated account anything the engine did not place is a
+  reconciliation fact; on a shared one the artifact's owned list is the
+  engine's universe, and foreign activity on an owned instrument is a
+  drift halt.
+* **As built — dedicated only:** `exec_boot::check_binance` refuses
+  `account_scope = "shared"` (O-BX2a's foreign-fill halt is not built). On
+  the dedicated account a foreign order is counted and reported each
+  cycle (`EVT_RECON`, `J_RECON`), never cancelled, and does not block
+  `reconciled`; a foreign fill reads as position drift (the drift halt,
+  required on a live slot). An unbound venue position is an unseen leg:
+  the slot stays unreconciled until it is flattened. **Spot (BX8):** the
+  reconciled figure is each armed base asset's balance (the balance law,
+  "BX8"): anything the arm did not book — a foreign fill, a deposit, a
+  withdrawal, a convert, an airdrop, a dust conversion of an armed base
+  asset — is drift (an unseen leg on a row explained at 0); the quote and
+  the unarmed assets are never compared.
+* **Enforced.** `gateway::orders_answered` (foreign orders);
+  `recon::Verdict::reconciled` / `drift_reported`; `judge_positions` (the
+  owned legs); `on_order_event` (`GW_FILLS_FOREIGN`).
+* **Tested.** `recon.rs` `foreign_orders_halt_only_a_shared_account`,
+  `a_boot_with_an_unbooked_venue_leg_is_not_reconciled`; `inst.rs`
+  `a_shared_account_row_not_owned_is_not_live`; `bn_live.rs`
+  `a_shared_account_owns_only_its_list`; e2e
+  `the_arm_trades_end_to_end_against_a_scripted_venue` (a stranger's
+  order rests, counted every cycle),
+  `venue_originated_fills_go_to_the_owner_and_a_strangers_to_no_one`
+  (BX12: a stranger's fill counted, booked to no one). BX8: e2e
+  `a_foreign_or_liquidation_named_spot_fill_is_booked_to_no_one` (four
+  foreign spot trades counted, none booked; the BTC they moved reads as
+  drift), `the_spot_sweep_confirms_clear_with_nothing_to_cancel` (a
+  stranger's resting spot order reported every cycle).
+* **As built — Stocks (BX10):** dedicated only, reconciled from executions
+  (S-2): each ticker's net over the session's window (`trade/history`)
+  against what the gateway booked since its boot — a foreign execution on
+  a bound ticker is drift (an unseen leg where the arm booked nothing), on
+  a ticker no row binds an unseen leg. Holdings are never read. Another's
+  open order before Ready refuses the boot by name (`BootErr::EqStray`:
+  any ticker on the dedicated account, `ROW_NONE` when unbound); after
+  Ready it is foreign (counted, never cancelled). Tested: e2e
+  `an_execution_the_arm_never_booked_drifts_and_an_unbound_one_is_unseen`,
+  `a_stray_at_boot_refuses_it_by_name`,
+  `a_stray_on_an_unbound_ticker_refuses_the_boot`.
+* **Open.** The shared scope (O-BX2a); the drift halt a foreign fill
+  raises, end to end (BX8 drives the drift on spot, not the halt). Stocks
+  (BX10): net only — a foreign BUY and SELL of one size inside the window
+  cancel out — and holdings unread (a deposit, a transfer or a corporate
+  action is invisible).
+
+#### BX-9 (E-9) — the client order id
+
+* **Law.** The cid encodes the epoch, the slot and `client_oid`;
+  foreign-epoch `mv` orders are orphans, swept before `reconciled`.
+* **As built:** 32 characters — `mv`, the epoch (8), the slot (1), the
+  oid (16), `00000` (D7, plan §13.4); the epoch is the low 32 bits of the
+  boot's unix seconds. Orphans are swept every cycle, not only at boot;
+  their fills book to the owner.
+* **Enforced.** `cid::render` / `classify`; `gateway::orders_answered`
+  counts and cancels each orphan (by id on the WS API, by venue id on the
+  REST route, else the symbol's cancel-all); the boot stays in `Recon`
+  until orphans and ghosts are both 0. **On spot (BX8)** no cancel is
+  built: an order of ours listed on a bound spot row before Ready refuses
+  the boot (`BootErr::SpotStray(row)`; the operator cancels it in the
+  app); after Ready it is counted, never cancelled, the slot
+  unreconciled.
+* **Tested.** `cid.rs` `the_layout_is_the_plans`,
+  `ours_orphans_and_the_venues_own`, `a_malformed_mv_id_is_foreign`,
+  `render_classify_round_trips`, `classify_never_panics`; fuzz `bn_cid`;
+  e2e `the_arm_trades_end_to_end_against_a_scripted_venue`; gate 93. BX8:
+  e2e `a_spot_order_of_ours_resting_at_boot_refuses_the_boot` (an orphan
+  and a ghost, each refusing the boot at the listing, never cancelled).
+* **As built — Stocks (BX10):** the place carries our 32-character id; the
+  venue's own id is a UUID, held whole per order (`EqOrderId`) and keyed
+  in the table by its FNV-1a (`equity::eq_key`, case-folded). The listing
+  and the stream name no client id: ours are told by UUID, so a previous
+  boot's order is a stray (it refuses the boot by name, BX-8), never an
+  orphan swept. A cancel goes by the UUID only; the in-doubt detail by our
+  id while no UUID is held; a duplicate id (`486449`) is in doubt, never
+  re-sent. Tested: e2e `a_member_cancel_goes_by_the_uuid`,
+  `a_lost_place_answer_is_resolved_by_our_id_and_never_resent`,
+  `a_duplicate_id_is_in_doubt_and_never_resent`; `equity.rs`
+  `an_order_id_is_a_uuid_held_whole`; fuzz `bn_equity` (the UUID's shape).
+* **Open.** (a) Past the dedup horizon a late event can reach a reused id
+  before its ACK; the next listing heals it ("BX6"). (b) **Found in BX11:**
+  an orphan on a row this boot did not bind is counted but never
+  cancelled (the gateway cancels by row), so the boot cannot leave
+  `Recon` and ends `BootErr::Timeout` — fail closed. The venue's dead-man
+  clears a maker within its countdown; anything else the operator cancels
+  (the runbook, "A boot that never reconciles"). The same holds on spot
+  for a spot symbol the boot did not bind (BX8: `SpotStray` names a bound
+  row only).
+
+#### BX-10 (E-7, adapted) — one request per requote
+
+* **Law.** A requote is the venue's one-request verb (UM/CM modify, PM
+  `PUT`, spot amend); where none exists (options, Binance Stocks), cancel
+  plus new is the documented exception, counted against the order budget.
+* **As built:** USDⓈ-M classic is the only product that modifies — the
+  only maker product (BX-17); COIN-M, PM and PM Pro are IoC-only and
+  their `PUT` templates go unused. Spot (BX8) is IoC-only: no requote
+  verb (amend, cancelReplace) is built for it. Options (BX9) are
+  IoC-only too: no cancel and so no cancel plus new — the exception is
+  unused. Stocks (BX10) have no modify either: an equity row refuses
+  modify (`Refusal::Verb`), and no cancel plus new is built — no member
+  requotes there (S-3). The venue keeps the order's first client
+  id; the rename is the engine's own.
+* **Enforced.** `BnArm::modify` (one command, counted in the order
+  windows); `BnGateway::on_modify` sends one `order.modify` (WS API) or
+  one `PUT` (REST); an IoC-only row refuses cancel and modify
+  (`Refusal::Verb`).
+* **Tested.** `arm.rs` `cancel_and_modify_are_queued_and_confirmed_later`,
+  `a_modify_passes_the_submits_gate`,
+  `an_ioc_only_product_builds_no_cancel_verb`; `wsapi.rs`
+  `cancel_modify_status_account_render`; `rest.rs`
+  `the_order_verbs_are_body_form`; e2e
+  `the_arm_survives_a_lost_stream_a_5xx_and_a_dead_order_session`,
+  `the_rest_route_trades_with_an_hmac_key`; gates 92, 93 and 104.
+* **Open.** A modify's `Ok` means queued; a size-raising modify
+  under-counts the working quantity until it is confirmed ("BX6").
+
+#### BX-11 (in-doubt)
+
+* **Law.** A lost ACK is never resent; the order is resolved by query and
+  stays booked until then.
+* **Enforced.** An order goes in doubt (kept in the open-order table) on
+  a lost request, a place or modify answered unreadably, a `-2011` on its
+  cancel, a stream reopen or a re-logon, or a listing that does not show
+  it; one status query per in-doubt order a second; `-2013` is final only
+  after `recvWindow` + 5 s. No path re-sends a place.
+* **As built — wider:** more causes than a lost ACK put an order in
+  doubt; a cancel whose answer was lost is owed and re-sent until
+  resolved. Since BX11 the doubts are counted (`in_doubt_raised`, and the
+  live level `in_doubt`, in `/state` and `/metrics`). **BX8:** a status or
+  an event naming `REJECTED` (`S_REJECTED`, on every lane) ends the order
+  — retired `RETIRED_REJECTED`, `J_REJECT`, nothing booked, no code —
+  never asked about again. Spot's `order.status` carries no `avgPrice`:
+  the average is `cummulativeQuoteQty / executedQty` (a negative quote is
+  unavailable). A spot lane up again after a gap with no session runs the
+  reconciliation at once: its user data rode the lost session.
+  **BX9:** options are REST-only (eapi has no WS API): an options order
+  goes in doubt by the causes above that a REST lane has (a lost or
+  unreadable place answer, the lane's session lost, a listing that does
+  not show it) and is asked by `GET /eapi/v1/order` by `clientOrderId`;
+  `-2013` is final only after `recvWindow` + 5 s, as futures'. No options
+  cancel is built (BX-17), so no `-2011` doubt arises there.
+* **Tested.** e2e
+  `the_arm_survives_a_lost_stream_a_5xx_and_a_dead_order_session`,
+  `the_arm_survives_an_early_cancel_a_lost_partial_and_a_half_open_session`,
+  `an_unreadable_429_or_418_on_the_rest_route_is_still_the_budget_or_the_lock`,
+  `a_lost_place_answer_is_never_resent` (BX12, the WS API route: one
+  `order.place`, the doubt resolved by `order.status` after the request's
+  deadline);
+  `gateway.rs` `a_lost_trade_is_priced_at_the_implied_average`. BX8: e2e
+  `a_lost_spot_place_answer_is_never_resent` (the next subscribed
+  session's `order.status`: booked once at the implied average; one
+  `order.place` seen), `an_in_doubt_spot_order_the_venue_rejected_is_ended`;
+  `wsapi.rs` `spot_user_events_are_told_from_answers` (the average from
+  the quote). BX9: `rest.rs`
+  `each_product_has_its_own_paths_by_the_same_template` (the options
+  status route), `the_options_place_and_status_query_name_eapis_client_id`
+  (eapi's `clientOrderId` on the place and the in-doubt query, pinned).
+* **As built — Stocks (BX10):** an equity order goes in doubt on a lost or
+  unreadable place answer (an answer under 500 naming no code a scanner
+  reads included — also a scan failure), one not echoing our id, `486449`,
+  a cancel answered `F`, `486219`, unreadably or naming another UUID, and
+  the stream's reopen; one `order/detail` a second (by the UUID, or by our
+  id while none is held). `486218` ends it only past `recvWindow` + 5 s
+  and only while no UUID is held — with one held it is a scan failure
+  (BX-15). A cancel's `S` is a receipt: the cancel is owed again 5 s on
+  (`EQ_CANCEL_CHECK_NS`), and the third `S` for an order still working is
+  a scan failure (`EQ_CANCEL_TAKES_MAX`). Tested: e2e
+  `a_lost_place_answer_is_resolved_by_our_id_and_never_resent`,
+  `a_place_answered_by_a_page_no_scanner_reads_is_in_doubt`,
+  `a_lost_cancel_answer_is_resolved_by_the_detail`,
+  `not_found_ends_only_an_order_never_receipted`,
+  `a_cancel_taken_but_never_carried_out_goes_again`,
+  `a_cancel_taken_again_and_again_is_a_scan_failure`,
+  `a_duplicate_id_is_in_doubt_and_never_resent`.
+* **BX13:** the REST order route's unknown outcome on a place driven end
+  to end — `a_rest_place_answered_503_1007_is_in_doubt_and_never_resent`
+  (the venue applies the place and answers 503 `-1007`: in doubt, `GET
+  /fapi/v1/order` resolves it, it cancels, one place sent;
+  break-and-watched: the unknown outcome read as a refusal retires the
+  resting order). The 503 alone makes it unknown, whatever its code.
+* **Open.** The daily stream reopen doubts every
+  order (up to 256 status queries, "BX6"). BX9: the options in-doubt
+  query is not driven end to end (gate 110's list of what no socket
+  pins), and eapi's `-2013` for an unknown order is the docs' and the
+  scripted venue's — Demo confirms it before arming (BX13, with the
+  expiry run). BX10: when `486218` is final and what a cancel's `S` means
+  are the docs' until the operator's battery (Stocks has no Demo).
+
+#### BX-12 (governed budgets)
+
+* **Law.** Every venue budget is governed fail-closed; a 429, 418,
+  `-4400` or `-4401` is a halt observation, never a retry.
+* **Enforced.** `gov::classify`: 429, `-1003` and `-1015` are the budget;
+  a 418 (whatever its code) and `-4400`…`-4402` the lock. The gateway goes
+  quiet (≥ 60 s, or to the venue's named end, ≤ 3 days) and the slot halts
+  `BudgetFloor` or `VenueLock`, sticky; a 418 or 429 whose body reads as
+  nothing still counts. The order windows (the 10 s and 1 min caps,
+  `MAX_NUM_ORDERS`, breadth) refuse locally; the steady request weight is
+  judged at boot (`check_binance`, `arm_weight_per_min` ≤ 1 440). **Spot
+  (BX8):** `gov::SpotOrders` — 100 / 10 s sliding and the UTC day's
+  unfilled-order count against 200 000, each at `orders_frac` (+1 a
+  place, −1 an order retired with `EVT_F_HAD_FILL`, never below 0, reset
+  at 00:00Z, the day rolled forward only — an end stamped on an earlier
+  day takes nothing off: AL2-2); a spot row is judged on it instead of
+  the futures' pool, and the UM quantitative rules and the breadth are the
+  futures' alone. **Options (BX9):** `gov::OptionOrders` — 30 / 10 s and
+  100 / min (mainnet's `rateLimits`; Demo's looser 300 / 6 000 are not
+  used), each at `orders_frac`; an option row is judged on it, not the
+  futures' pool. eapi's REQUEST_WEIGHT is its own pool (400 / min an IP;
+  the arm's share `OPT_ARM_WEIGHT_MAX_PER_MIN`, 240): the lane's steady
+  weight (`gov::opt_weight_per_min` — a cycle at its worst, 53; the
+  margin re-reads; the clock on an options-only arm) is judged at boot
+  apart from the futures': `exec_boot` refuses a `recon_every_ms` whose
+  cycle kept in hand leaves the boot's day read nothing
+  (`gov::opt_day_row_ns`). The futures' `arm_weight_per_min` check is
+  skipped for options alone only; a spot-only arm keeps its one phantom
+  futures lane (`lanes.max(1)`), as before BX9. At run time the day read
+  (`userTrades`, weight 5 a row) waits while eapi's window cannot take a
+  whole cycle more (`opt_day_room`), and the boot's timeout grows with
+  the rows at that pace (`bn_live::boot_timeout_ns`). eapi's answers are
+  classified as futures' (`gov::classify`); `-6057` is `WriteFatal`
+  (BX-18), every other options code an ordinary refusal.
+* **As built:** at run time the request-weight window refuses nothing;
+  only an early reconciliation waits past 80 % ("BX7": what the model
+  counts never waits). A refused cancel is owed and re-sent after the
+  quiet; a refused place retires `REJECTED` and is never retried. Spot's
+  request weight (BX8) is the venue's separate spot pool; BX13 (R2-4)
+  meters it in a window of its own (`spot_weight`: 3 600 of the IP's
+  6 000 a minute) at spot's weights (`gov::spot_request_weight`: every
+  class at or above the docs' spot weight); past 80 % it throttles an
+  early cycle as the futures' pool does — the early cycle after a spot
+  session's recovery and the prompt cycle after an order's-trades read
+  — and an unread day's `myTrades` waits for room for itself and a whole
+  cycle (`gov::day_read_room`, shared with options' Q-5 pacing). The
+  boot's model still counts none of spot's (the cadence, ≥ 10 s, is a
+  tenth of the pool). **Spot's day count** (R2-2; BX13): the venue's own
+  count and limit (`account.rateLimits.orders`, weight 40) are read at
+  each venue UTC day's first cycle, beside the spot lane's account read;
+  until the arm has them no spot order is admitted (`NotReady`); a read
+  never lowers the mirror (ours in flight, a fill the venue took off
+  first); a refused read is asked again at the next cycle, a malformed
+  one is a scan failure (BX-15: the slot halts on unbounded drift until a
+  restart, futures included — `SCAN_SPOT_DAY` names the site). BUYs stop
+  at the share (160 000 at
+  80 %); a SELL goes on into a reserve — half of what the limit leaves,
+  at most a twentieth of it (to 170 000) — the rest the operator's, by
+  hand. `/state` `spot_day` (the count, both caps, read or not). **Options (BX9):** a place on an expired row spends the
+  options pool before the gateway refuses it (`CODE_EXPIRED`; R12).
+* **Tested.** `gov.rs` `codes_classify`,
+  `a_window_refuses_at_its_share_and_slides`,
+  `the_futures_pool_needs_both_windows`,
+  `the_steady_weight_is_judged_at_boot`; `rest.rs` `a_ban_names_its_end`;
+  e2e `a_429_makes_the_gateway_quiet_then_the_halts_sweep_clears` (BX11:
+  the halt's reason, `BudgetFloor`, asserted),
+  `a_418_keeps_the_gateway_quiet_until_the_ban_it_names`,
+  `the_boot_is_refused_by_a_lock_or_a_budget_answer`,
+  `a_dial_completing_inside_a_quiet_period_sends_nothing`. BX8: `gov.rs`
+  `the_spot_pool_mirrors_the_unfilled_count` (midnight's yesterday-stamped
+  end included, AL2-2); `arm.rs`
+  `a_spot_row_is_ioc_only_on_its_own_pool` (80 IoCs at 80 % of 100, the
+  futures' pool untouched, an order that filled off the day's count);
+  gate 92 (spot's pool spent). BX9: `gov.rs`
+  `the_options_pool_needs_both_windows`, `the_options_weight_is_judged_apart`,
+  `codes_classify` (`-6055`, `-6059`, `-6005` ordinary; `-6057`
+  `WriteFatal`); `bn_live.rs` `the_boot_timeout_outlasts_the_options_day_read`
+  (the gateway's pacing simulated for 1 to 128 rows); `exec_boot.rs`
+  `a_live_binance_slot_resolves_with_its_section_and_nothing_else_does`
+  (a 10 s options cycle refused "on eapi"); gate 92 (options' pool takes
+  its window's 30).
+* **As built — Stocks (BX10):** equity's own ORDERS pool, 200 a minute at
+  `orders_frac` (`gov::EquityOrders`); its REST reads are SAPI's own IP
+  pool (12 000 a minute), never the futures' window — unmetered, as
+  spot's. The venue's code-less refusal (`F`, `CODE_EQ_REFUSED` 9 018)
+  moves the reject streak as a coded one does; `486410` (the disclaimer
+  unsigned) is one `VenueLock`; `486207` and `486426`–`486428` retire the
+  row. Every product: `-1006` is now unknown (in doubt), `-26004`
+  row-fatal. Tested: `gov.rs` `the_equity_pool_is_two_hundred_a_minute`,
+  `codes_classify`; e2e `the_venues_refusals_move_the_reject_streak`,
+  `the_unsigned_disclaimer_refuses_and_locks_once`; gate 92.
+* **Tested (BX13).** `gov.rs`
+  `the_spot_day_is_seeded_from_the_venue_and_a_sell_keeps_a_reserve`,
+  `the_spot_weight_is_spots_own`, `a_day_read_waits_for_a_whole_cycles_room`;
+  `wsapi.rs` `the_spot_days_count_is_its_one_day_entry`; `arm.rs`
+  `a_spot_row_is_ioc_only_on_its_own_pool` (`NotReady` before the read),
+  `a_spot_sell_keeps_its_reserve_past_the_days_share`; e2e
+  `spots_day_is_the_venues_count_and_its_weight_its_own_pool`,
+  `no_spot_order_goes_before_the_venues_day_is_read` — each
+  break-and-watched ("BX13").
+* **Open.** A 418 on the WS upgrade is a transport failure (a redial at
+  its backoff, ≤ 30 s; "BX6"). The 429 drill is loopback-only: a
+  deliberate breach on Demo risks an IP ban that the running engine's
+  market data shares (BX11's departure from the plan's "on Demo"). Spot's
+  weights are the docs' (the window can only refuse earlier); the day
+  read's pacing is proven by its arithmetic, not on a socket; the day
+  count's DAY entry is the docs' shape until Demo or mainnet answers it
+  (BX13's Demo evidence).
+
+#### BX-13 (TTL)
+
+* **Law.** The gateway enforces a maker's TTL (Binance has no short GTD);
+  on USDⓈ-M a maker's TTL is at least 5 s.
+* **Enforced.** core-config refuses `min_maker_ttl_ms` under 5 000
+  (`BN_MIN_MAKER_TTL_MS`); the arm refuses a shorter TTL (`Refusal::Ttl`)
+  and stamps the deadline; the gateway arms the order's timer (a full
+  timer wheel refuses the order) and sends the TTL cancel at the deadline
+  (`RETIRED_CANCELED_TTL`).
+* **As built:** a maker with TTL 0 has no gateway deadline — the venue's
+  dead-man alone covers it ("BX6"); a modify does not extend the TTL;
+  during a quiet period the TTL cancel is owed, not sent.
+* **Tested.** core-config `the_breadth_and_ttl_knobs_are_bounded_binance_keys`;
+  `arm.rs` `the_refusals_are_counted_by_reason`; e2e
+  `the_arm_trades_end_to_end_against_a_scripted_venue`; gate 93; the Demo
+  battery's TTL phase ("BX7b").
+* **As built — Stocks (BX10):** every equity order carries the gateway's
+  TTL — mandatory, not a maker's option (`ArmKnobs::equity_ttl_ns`: 0
+  refuses every equity order, `Refusal::Ttl`; a place with no deadline is
+  refused before a byte is rendered, `CODE_EQ_TTL` 9 019). A TTL that
+  falls before the UUID is known is owed until an answer names it. The
+  battery's TTL: 5 000 … 300 000 ms. Tested: `arm.rs`
+  `an_equity_row_rests_under_the_ttl_long_only`; e2e
+  `the_ttl_cancels_a_resting_day_order_and_the_close_expires_one`,
+  `the_ttl_before_the_uuid_is_owed_until_the_answer_names_it`; gate 112
+  (its TTL rounds).
+* **Open.** The timer wheel's capacity ("BX7").
+
+#### BX-14 (fees measured)
+
+* **Law.** The commission measured from the stream sets `fees.toml`'s
+  Binance rows once each class has N commission-bearing trades — counted
+  in trades, never days. BNB burn is off.
+* **As built (BX11):** every trade's commission is journaled once
+  (`J_FEE`, kind 10), whichever report booked its fill;
+  `multivenue-engine bn-fees <run-dir>…` measures per class (product ×
+  perpetual, dated or TradFi × maker or taker) with N = 30 and **prints**
+  the rows a measured class supports — `[fees.bn]`'s `perp` and `dated`,
+  whole bps rounded up (the file's L3), a rebate as 0 (the grammar is
+  unsigned); it **never writes `fees.toml`** — the operator does. Excluded
+  and counted apart: the venue's own trades (settlements, liquidations,
+  ADL), a commission in another asset than the row's settlement asset
+  (BNB, or any other) or naming none, a trade of no notional. A foreign
+  trade carries no `J_FEE`, nor does a futures fill booked without its
+  trade (a spot one's commission is read from its order's trades: BX8).
+  COIN-M's and TradFi's classes are measured and shown and make no row
+  (COIN-M shares the `bn` rows; the file has no TradFi class). A journal
+  named twice is read once.
+* **As built — spot (BX8):** one `J_FEE` a spot trade, in the asset
+  charged — BNB (the burn), the base on a BUY, the quote on a SELL —
+  classified by `journal::fee_asset` (to a spot row the base is another
+  asset, the quote its settlement asset). A fill booked without its
+  report (an `order.status` answer, an update's `z`) has its commissions
+  read from `/api/v3/myTrades?orderId=` and journaled then, by the venue's
+  order id, in at most three tries (paused 1 s, then 2 s). Each
+  commission charged in an armed base asset is also paid out of that
+  row's explained balance (the balance law, "BX8").
+* **Enforced.** `gateway::book_event` (the trade's first sight owes the
+  fee); `journal::fee_code` / `fee_asset`; `cli::bn_fees`;
+  `gateway::order_trades_answered` (BX8).
+* **Tested.** `journal.rs` `a_commissions_asset_is_judged_against_its_row`,
+  `a_fees_notional_and_class`; `oot.rs`
+  `tid_ring_books_once_and_owes_the_fee_once`; `bn_fees.rs`
+  `the_classes_and_the_exclusions`,
+  `a_rebate_rounds_up_and_no_notional_has_no_rate`,
+  `a_journal_file_is_read_and_another_kind_refused`; e2e
+  `a_trades_commission_is_journaled_once_whichever_report_booked_it`;
+  gate 93; fuzz `bn_user_event`. BX8: e2e
+  `the_spot_lane_trades_iocs_and_its_fills_reach_lane_4` (BTC on the
+  buys, USDT on the sell),
+  `a_bnb_commission_on_another_row_is_paid_from_bnb`,
+  `a_spot_fill_booked_without_its_report_pays_its_commission`,
+  `a_fill_whose_report_lost_its_trades_pays_their_commissions_from_the_order_trades`,
+  `a_failed_order_trades_read_is_asked_again_and_pays_once`,
+  `a_failed_order_trades_read_leaves_the_commission_as_drift`; gates 108
+  and 109; fuzz `bn_spot_event`.
+* **As built — Stocks (BX10):** the fee is the detail's cumulative `fee`
+  (USD), journaled by its increase (`J_FEE`); while the order's notional
+  is under $350 it is the $0.35 minimum, flagged `FEE_FLAG_EQ_FLOOR` (bit
+  14) — `bn-fees` counts it apart (`eq_floor`), never as a rate. Tested:
+  `journal.rs` `a_commissions_asset_is_judged_against_its_row`;
+  `bn_fees.rs` `an_equity_fee_at_the_floor_is_no_rate`; e2e
+  `the_equity_lane_places_fills_and_reconciles`.
+* **Open.** BNB burn is neither asserted at boot nor set by the setup
+  tool: a commission paid in BNB is detected and excluded (burn off is an
+  arming precondition, the runbook). Stocks' $0.35 per-order minimum is
+  flagged, not a rate (BX10). Spot's burn (BX8) is the operator's
+  setting, kept fixed while armed (the runbook's §10); a spot commission
+  in BNB measures nothing, as on futures; Q3 (a burn option in the
+  account tools) is open.
+
+#### BX-15 (scan failure)
+
+* **Law.** A frame the arm cannot scan is a halt observation, never a
+  skip.
+* **Enforced.** Every frame that fails its scanner — the user stream, PM
+  Pro's risk stream, the WS API, the REST route's answers, the account
+  and listing reads — reaches `BnGateway::scan_failed`; an output the
+  rings could not take is lost (`EVT_F_LOST`); either sets the arm's
+  sticky `scan_failed`, which reports unbounded drift: the slot halts
+  `ReconDrift` (the drift halt is required on a live slot).
+* **As built:** wider than the plan's "user-data frame" (every reader),
+  and the halt reads `recon-drift`, not a reason of its own. **BX11:** an
+  event of a kind the arm does not act on (`STRATEGY_UPDATE`,
+  `GRID_UPDATE`, a kind newer than this build) scans and is counted
+  (`events_other` in `/state`, `engine_exec_bn_events_other_total`), never
+  booked — the gateway's catch-all used to drop it uncounted. **BX8:**
+  `scan_spot_event` reads spot's `executionReport` whole — its 20 keys
+  once — and refuses what is no shape of the venue's (a `TRADE` with
+  `t: -1`, a commission with `N: null`, `C` on anything but a cancel,
+  `CALCULATED` or `AMENDMENT`, `t` below −1, an escaped or second event
+  name); an event frame on a futures session, an order's-trades answer
+  that does not scan and a spot account read short of a required key are
+  scan failures. Every WS API frame is now read as one object, whole
+  (`scan_answer`, every lane), and `scan_trades` reads each key once and
+  the page whole (every lane; "BX8", "Beyond spot"). Round 2, every
+  product: a trade of nothing or at no price is refused
+  (`ORDER_TRADE_UPDATE`, `TRADE_LITE`; P2-1), so is a trade row naming
+  one of `commission` and `commissionAsset` (P2-3) and an account answer
+  with no `result` (P2-4); on spot, `N: ""` (P2-2) and a balance `asset`
+  with a backslash (P2-4).
+* **Tested.** `arm.rs` `the_signal_carries_every_observation`;
+  `userstream.rs` `a_known_event_missing_a_field_is_refused_never_skipped`;
+  e2e `the_margin_and_scan_failure_halts_end_to_end`,
+  `a_classic_stream_event_naming_fs_is_a_scan_failure`,
+  `a_portfolio_margin_event_naming_no_product_is_a_scan_failure`,
+  `an_event_of_no_kind_the_arm_acts_on_is_counted_and_halts_nothing`;
+  proptest `bx7_scanners_never_panic_on_arbitrary_bytes`,
+  `an_order_event_naming_a_read_key_twice_is_refused`; fuzz
+  `bn_user_event`, `bn_wsapi_frame`, `bn_rest_body`, `bn_rest_answer`,
+  `bn_account`; gate 92. BX8: `userstream.rs`
+  `spot_execution_reports_read_as_order_updates`,
+  `spot_events_fail_closed`, proptests `spot_reports_never_panic`,
+  `a_spot_report_round_trips`; `wsapi.rs`
+  `spot_user_events_are_told_from_answers`; `recon.rs`
+  `a_spot_account_read_fails_closed`, proptest
+  `a_spot_account_round_trips`; `rest.rs` `trades`, `a_ticker_price`,
+  proptest `a_spot_trade_row_round_trips`; `userstream.rs`
+  `a_trade_at_no_price_is_refused`; ingress-binance
+  `a_rows_assets_are_read_once_and_never_cut`; fuzz `bn_spot_event`,
+  `bn_user_event` (an accepted trade is of something at a price),
+  `bn_rest_body` (trade rows, the pair rule, the ticker); gate 109.
+* **As built — Stocks (BX10):** every equity answer is read whole by
+  `exec_binance::equity` — each key once (a nested execution's too), no
+  figure negative (refused on its sign: `-0` and a negative below the
+  scale too), no ticker empty, no execution id twice, a page within its
+  `total` and its `size`, `filledQty` named, a filled word (`FILLED`,
+  `PARTIALLY_FILLED`) never with nothing filled, a fill never without its
+  `trades` key, a report's values judged once it is an `orderReport`. Scan
+  failures too: a detail filled past its order's quantity, `FILLED` short
+  of it, or naming another UUID or side; a page not the one asked for, or
+  a window's `total` that moves; `486218` for an order the venue's receipt
+  named; an answer under 500 naming no code; a cancel taken a third time
+  with the order still working. Tested: `equity.rs`
+  `every_refusal_is_its_own_case`,
+  `the_round_two_refusals_are_each_their_own_case`; proptests
+  `a_key_read_twice_is_refused`,
+  `the_equity_scanners_never_panic_on_arbitrary_bytes`; e2e
+  `the_cycle_reads_every_page_and_refuses_one_it_did_not_ask_for`,
+  `not_found_ends_only_an_order_never_receipted`,
+  `a_detail_past_or_short_of_its_order_is_a_scan_failure`,
+  `a_place_answered_by_a_page_no_scanner_reads_is_in_doubt`,
+  `a_cancel_taken_again_and_again_is_a_scan_failure`; fuzz `bn_equity`.
+* **Open.** The scan failure holds until a restart; a mid-session switch
+  to hedge mode reads as a scan failure, not `VenueLock` ("BX7").
+  `scan_trades` accepts `"commissionAsset":""` beside a commission (every
+  product); the gateway refuses it on the order's own trades it reads
+  (BX8: `order_trades_answered`, `Missing`).
+
+#### BX-16 (one network)
+
+* **Law.** The arm's hosts and the market data's are one network; Demo
+  is the standalone tools' alone.
+* **Enforced.** `config::network_of` and `BnConfig::checked` refuse a
+  host off the scope's network; `BnConfig::assert_market_data` (in
+  `bn_live::boot_binance_arm`) refuses market-data hosts of another
+  network; `[exec.binance] network` accepts `mainnet` only; the Demo
+  tools' hosts pass `bn_demo::demo_host` only. **BX8:** the host table is
+  nine — spot's WS API (`ws-api.binance.com`; Demo
+  `demo-ws-api.binance.com`) beside the eight; spot's REST is SAPI's host
+  — and with spot armed the engine adds the spot market data's hosts
+  (`BINANCE_WS_HOST`, `BINANCE_REST_HOST`) to `assert_market_data`'s
+  list.
+* **As built:** Demo (one network with the futures testnet) serves the
+  probe, the battery and its drill, and BX11's account tools by default.
+  The account tools also reach mainnet — outside the engine, by the
+  operator's hand: they read freely and change the account only with
+  `--confirm` (the sealed `MainnetVerb`).
+* **Tested.** `config.rs` `networks`, `hosts_must_be_on_the_scopes_network`,
+  `market_data_must_share_the_network`; core-config
+  `the_binance_section_is_required_and_bounded`; `bn_demo.rs`
+  `only_demo_hosts_pass` (BX8: the Demo scope's nine hosts, spot's WS API
+  among them); `bn_ops.rs`
+  `mainnet_changes_need_the_operators_word`, `bn_demo.rs`
+  `a_mainnet_host_sends_no_change_without_the_word` (on a mainnet host a
+  change leaves only signed with the word); e2e
+  `a_demo_boot_reads_no_sapi_and_a_live_one_refuses_without_it`.
+* **As built — Stocks (BX10):** the order stream's `nbstream.binance.com`
+  joins the host table (`Hosts::eq_user`; `DNS_HOSTS` 11); Stocks' REST is
+  SAPI's host. Stocks has no Demo (R21): an equity row on Demo refuses the
+  boot, never dialled. The read-only probe and the battery are mainnet, by
+  the operator's hand (the battery sends only with
+  `--bn-confirm-mainnet`). Tested: `config.rs`
+  `hosts_must_be_on_the_scopes_network`; e2e
+  `equity_needs_its_keys_mainnet_and_a_classic_account`.
+* **Open.** The `loopback` feature links into `--all-targets` builds,
+  inert in the engine ("BX6").
+
+#### BX-17 (no resting order without a dead-man)
+
+* **Law.** A maker is accepted only on a product and mode whose venue
+  countdown is armed and working; spot is IoC-only; Binance Stocks (no
+  IoC exists) is the one exception, DAY orders under a mandatory gateway
+  TTL.
+* **As built:** USDⓈ-M classic is the only maker product
+  (`mode::maker_ok`). COIN-M, PM and PM Pro are IoC-only — PM Pro waits on
+  K14, and COIN-M's countdown answered on Demo (K16) but no ruling has
+  made it a maker product. Spot (BX8) is IoC-only — it has no dead-man
+  (K8): no maker, cancel, modify, amend or cancel-all is built for it, a
+  reduce-only order is refused (`Flags`), and a halt's sweep has nothing
+  to cancel there. **Stocks (BX10)** are the one exception: no IoC
+  exists, so an equity order is LIMIT DAY under the gateway's mandatory
+  TTL (BX-13); the row is flagged `INST_NO_DEADMAN` (no maker, no modify)
+  but its cancel is built. **Options (BX9)** are IoC-only:
+  the venue's countdown is a market maker's (`-6005` for any other
+  account), so no dead-man is ours — no maker, cancel, batch, amend, MMP
+  or countdown is built; `bind_option` flags every row `INST_NO_DEADMAN`;
+  a halt's sweep has nothing to cancel there, and an options order of
+  ours resting at boot refuses the boot by name (`OptStray`), never
+  cancelled — the operator cancels it in the app.
+* **Enforced.** `bind_table` flags every other row `INST_NO_DEADMAN`;
+  `BnArm::admit` refuses a maker there (`NoDeadman`) and anywhere while
+  the gateway's pulse lacks `EVT_F_DEADMAN_OK` (`DeadmanDown`), a modify
+  alike. The gateway raises the flag only while every lane is ready and
+  each row with a maker of ours resting has its countdown answered within
+  two heartbeats (or its first maker is younger than that: its countdown
+  left in the same pass).
+* **Tested.** `mode.rs` `the_maker_list_is_um_classic_only`; `arm.rs`
+  `a_maker_needs_a_working_dead_man`; `bn_live.rs`
+  `coinm_binds_ioc_only_and_inverse_at_its_face`; e2e
+  `a_dead_gateway_halts_ws_gap_and_the_venues_countdown_cancels_the_makers`
+  (BX11: the loopback venue's countdown fires),
+  `a_renewal_queued_before_the_session_died_is_not_sent`; on Demo the
+  battery's `--bn-drill gap` (BX11). BX8: `mode.rs`
+  `the_classic_futures_are_built` (no spot maker); `arm.rs`
+  `a_spot_row_is_ioc_only_on_its_own_pool`; `inst.rs`
+  `a_spot_row_binds_with_its_assets_and_groups`; e2e
+  `the_spot_sweep_confirms_clear_with_nothing_to_cancel`; gate 92 (a spot
+  maker refused). BX9: `mode.rs` `the_classic_futures_are_built` (no
+  options maker, `-6005`); `inst.rs`
+  `an_option_binds_ioc_only_writable_as_judged`; e2e
+  `the_options_lane_trades_long_and_short_iocs`,
+  `an_options_order_of_ours_resting_at_boot_refuses_it`.
+* **Open.** A row's first maker can rest up to two heartbeats before its
+  own countdown answers; a half-open session leaves makers resting about
+  45 s ("BX6").
+
+#### BX-18 (short options) — built (BX9)
+
+* **Law.** Shorts only where the contract's `nakedSell` is true (BTC,
+  ETH) and only in Long & Short Sell mode; exposure is the venue's IM
+  formula; `-6057` is a per-underlying fatal refusal; the options
+  stream's `RISK_LEVEL_CHANGE → REDUCE_ONLY` is `VenueLock`.
+* **As built (BX9, Q-6):** `INST_WRITABLE` = `nakedSell` ∧
+  `options_write` ∧ not TradFi, the ledger's row carrying the table's own
+  writability. Two guards: the ledger refuses an opening short on a row
+  not writable (`InstRefusal::Short`); the arm's `writing_law` refuses a
+  SELL there with no long of the owner's (`NotWritable`) and sends any
+  other SELL there reduce-only. `-6057` → `CodeClass::WriteFatal` →
+  `unwrite_underlying` (every row of the underlying, for the boot; its
+  longs still trade). A held short on a non-writable row refuses the boot
+  (`OptionShort`); one on a writable row is adopted at its IM's upper
+  bound against an index the venue's mark agrees with. The Long & Short
+  mode is the venue's: its `-6057` is the assertion.
+* **Tested.** ledger `a_non_writable_option_cannot_be_shorted`,
+  `option_im_follows_the_venue_formula`,
+  `a_stale_option_opens_nothing_and_an_exit_still_passes`,
+  `an_option_mark_outside_its_band_is_refused`; inst
+  `an_option_binds_ioc_only_writable_as_judged`, `option_binding_refusals`;
+  e2e `a_row_the_arm_may_not_write_sells_reduce_only_and_6057_unwrites`,
+  `a_held_short_is_adopted_at_its_im_bound_or_refuses_the_boot`; gate 92;
+  eapi `live_rows_keep_rules_status_and_naked_sell`.
+
+#### BX-19 (account mode)
+
+* **Law.** The account mode and scope are asserted at boot and watched in
+  session; a mismatch refuses the boot; a mid-session mode or permission
+  change is `VenueLock`.
+* **Enforced at boot.** Any judge's refusal refuses the boot
+  (`BootErr::Assert`): `judge_key` (the key trades what is armed —
+  futures, and spot since BX8 — and never withdraws), `judge_mode` (the
+  account mode `exec.toml` names), `judge_one_way`, `judge_single_asset`
+  (USDⓈ-M classic), `judge_symbol_config` (each owned row CROSSED at a
+  leverage within `max_leverage`), COIN-M's from its account read; spot's
+  from its first account read (BX8: each live armed row's permission
+  groups, `judge_permission` — the bStock check — and `canTrade`:
+  `SymbolNotPermitted`, `CannotTrade`). **Options (BX9):** the options
+  key's permissions are read apart (`RestrictionsOpt`, signed by the
+  options HMAC key) and judged by `judge_key` (`enableVanillaOptions`,
+  never withdrawals); the options account's `marginAccount` reading
+  `reduceOnly` or not `canTrade` refuses the boot (`ReduceOnly`,
+  `CannotTrade`); options beside PM, PM Pro, COIN-M or spot refuse the
+  boot (`exec_boot`).
+* **Enforced in session.** An owned row's position not cross (9013), an
+  owned row's leverage changed or the multi-assets mode turned on (9012),
+  PM's risk level or account status (9010, 9011), a spot row's
+  permission groups no longer the account's or `canTrade` false (9015,
+  `CODE_PERMISSION`, raised once a process; BX8) — each `VenueLock`.
+  Options (BX9): `marginAccount` reading `reduceOnly` or not `canTrade`
+  after Ready, or the options stream's `RISK_LEVEL_CHANGE` to
+  `REDUCE_ONLY` (9016, `CODE_OPT_ACCOUNT`, raised once) — `VenueLock`.
+* **As built — short of the law:** the mode and the key's permissions are
+  read at boot only (spot's account permissions and `canTrade` at every
+  account read: BX8). A mid-session account-mode change goes unseen (PM's
+  account read ignores `accountType`); a revoked permission's `-2015` is a
+  plain reject, so it halts the slot `RejectStreak` or `ReconStale`, never
+  `VenueLock`. The scope is taken on trust (only `dedicated` boots). Since
+  BX11, `exec-smoke --binance-setup` sets what the boot asserts; the
+  engine never does.
+* **Tested.** `mode.rs` `the_judges_fail_closed`,
+  `the_symbol_config_judge_wants_cross_under_the_cap`; `userstream.rs`
+  `account_config_updates`; e2e
+  `the_boot_asserts_cross_margin_and_the_leverage_cap`,
+  `an_owned_row_isolated_mid_session_is_a_lock`,
+  `a_coinm_read_listing_a_row_twice_fails_and_one_unlisted_locks`,
+  `the_boot_is_refused_by_a_lock_or_a_budget_answer`; fuzz `bn_mode`.
+  BX8: `mode.rs` `the_permission_judge` (several sets, and a flat or
+  mixed list — P2-5 — refused; `TRD_GRP_4` never matching `TRD_GRP_004`),
+  `the_judges_fail_closed` (the key per armed product); e2e
+  `a_spot_row_whose_groups_the_account_lacks_refuses_the_boot`,
+  `a_spot_permission_lost_mid_session_locks_the_venue`; gate 109; the
+  battery's 66 (`the_permission_refusal_has_its_own_exit_code`). BX9:
+  `mode.rs` `the_judges_fail_closed` (the options key: no
+  `enableVanillaOptions`, withdrawals, a byte after the answer);
+  `userstream.rs` `eapis_status_words_read_as_theirs`; e2e
+  `the_options_account_refuses_the_boot_or_locks_once`,
+  `options_need_an_hmac_key_and_a_classic_account`; `exec_boot.rs`
+  `a_live_binance_slot_resolves_with_its_section_and_nothing_else_does`
+  (beside PM Pro), `a_session_bound_needs_a_usd_equity` (beside COIN-M or
+  spot); fuzz `bn_mode` (the options key, the answer whole).
+* **As built — Stocks (BX10):** an equity row needs the D5 keys
+  (`GwKnobs::equity`), a classic account and mainnet — else
+  `BootErr::Product`; with `tokenize` on, an armed spot row's base must
+  not be the ticker's bStock, and a bStock left unnamed beside an armed
+  spot row refuses the boot (`EqToken`: the check cannot be made). No
+  Stocks permission is asserted (`apiRestrictions` names none): a key that
+  cannot trade Stocks is refused at the first place. The disclaimer is
+  judged at the first place (`486410`, one `VenueLock`), never read.
+  Tested: e2e `equity_needs_its_keys_mainnet_and_a_classic_account`,
+  `an_unnamed_bstock_beside_spot_refuses_the_boot`,
+  `the_unsigned_disclaimer_refuses_and_locks_once`.
+* **Open.** The `-2015` and account-mode gaps above. PM's leverage is not
+  asserted ("BX7"); a mid-session hedge-mode switch reads as a scan
+  failure (BX-15); a Demo key's permissions are never asserted ("BX7b");
+  the TradFi agreement cannot be read — `-4411` retires the row. D-1
+  (BX8): on the live venue a bStock's set names `SPOT`, so any account
+  holding it passes; the refusal is proven on the scripted venue and by
+  unit tests, and Demo shows the real verdict ("BX8"). BX9 (R8): nothing
+  proves the options HMAC key and the arm's key are one account's (eapi
+  names no UID) — the operator uses one account's pair; the anchor's
+  basis names the options key's tag (E7).
+
+#### BX-20 (margin)
+
+* **Law.** The arm computes every product's margin ratio; at or above
+  `halt_on_margin_ratio_1e6`, or on any margin call, it raises
+  `MarginRisk`. A cancel still passes and nothing flattens (O-BX9): the
+  operator flattens by tool.
+* **Enforced.** `margin::um_ratio_1e6` (USDⓈ-M: maintenance over margin
+  balance), `cm_asset_ratio_1e6` (COIN-M: the riskiest asset's), and the
+  unified account's one ratio (PM, PM Pro: `accountMaintMargin /
+  accountEquity`, the reciprocal of `uniMMR`); sampled at each
+  reconciliation, on `ACCOUNT_UPDATE` (re-read at least 5 s apart) and on
+  a margin call (the stream's `MARGIN_CALL`; on PM and PM Pro the
+  `riskLevelChange` `MARGIN_CALL` and the unified account's status
+  `MARGIN_CALL` or `SUPPLY_MARGIN`);
+  `MarginBook::at_risk` raises `MarginRisk`, sticky. The threshold is
+  required on a live Binance slot, ≤ 799 999. The router's halt refuses
+  submit and modify and passes cancel.
+* **BX11 — the tool:** `exec-smoke --binance-flatten <um|cm>` closes with
+  reduce-only IoCs through the touch, inside the row's band, three tries a
+  position; it refuses while an order of the arm's rests unless
+  `--bn-cancel-first`; its verdict is a fresh read of the positions; it
+  never clears the halt (the engine's next boot finds the account flat).
+  Demo by default; mainnet only with `--confirm`. Classic accounts only:
+  on PM and PM Pro, close in the app.
+* **As built — options (BX9):** the options account's ratio is
+  `maintMargin / adjustedEquity` (its USDT entry), sampled at each cycle's
+  `marginAccount`, on `ACCOUNT_UPDATE` and on `RISK_LEVEL_CHANGE`;
+  `reduceOnly` or `canTrade = false` refuses the boot, a lock after it.
+  The options equity joins E7's session equity (Q-4). The flatten tool is
+  the futures'; an option is closed in the app or by the arm's
+  reduce-only IoCs.
+* **As built — spot (BX8):** a spot wallet is not margined: the spot lane
+  has no ratio and gives the session bound (E7) no USD equity, so a
+  session-bounded slot arming spot is refused (`exec_boot::check_binance`
+  on the products, `bn_live` on the rows bound). The flatten tool is the
+  futures'; a spot holding is sold in the app (the runbook's §3.2).
+* **Tested.** `margin.rs` `a_slot_reads_its_own_threshold_and_products`;
+  exec-router `a_margin_risk_halts_cancels_and_refuses`,
+  `a_binance_verdict_reaches_only_the_slots_that_trade_binance`;
+  core-config
+  `the_margin_halt_is_a_bounded_binance_key_required_on_a_live_binance_slot`;
+  e2e `the_margin_and_scan_failure_halts_end_to_end`; `bn_ops.rs`
+  `a_close_crosses_the_touch_inside_the_band`, `a_close_is_whole_steps`;
+  on Demo the battery's `--bn-drill flatten` (BX11); e2e
+  `a_stream_margin_call_halts_the_slot_and_rereads_the_account` (BX12: the
+  call halts `MarginRisk` with a healthy ratio; the account re-read at
+  once, before the halt's confirming cycle reads it); exec_boot
+  `a_session_bound_needs_a_usd_equity` (BX8: a bound refuses spot beside
+  USDⓈ-M; unbounded, it boots). BX9: e2e
+  `the_options_margin_ratio_halts_the_slot` (the options ratio past the
+  threshold halts `MarginRisk`),
+  `the_options_account_refuses_the_boot_or_locks_once`;
+  `recon.rs` `the_options_account_reads_its_usdt_figures`.
+* **As built — Stocks (BX10):** a cash holding, not margined: no ratio,
+  long-only (a SELL past the booked holding is `NotWritable`); the engine
+  never arms it (S-3). The battery sells its own holding; what it leaves
+  is sold in the app (its exit 58).
+* **BX13:** the margin call driven end to end on COIN-M's dstream
+  (`MARGIN_CALL`), Portfolio Margin's `/pm/ws/` and PM Pro's risk stream
+  (`riskLevelChange` `MARGIN_CALL`) —
+  `a_margin_call_halts_the_slot_on_coin_m_pm_and_pm_pro`: `MarginRisk`
+  with a healthy ratio, a `J_MARGIN` marked a call, the lane's account
+  (PM, PM Pro: the unified account) the first request after the call,
+  the halt's sweep confirmed clear; break-and-watched (the call's flag,
+  the immediate re-read on each path).
+* **Open.** The unified account's own `MARGIN_CALL` / `SUPPLY_MARGIN`
+  status (read at a cycle, not a stream event) is not driven. Options'
+  ratio is driven past the threshold end to end (BX9); their
+  `RISK_LEVEL_CHANGE` `MARGIN_CALL` is read but no test drives it. Stocks
+  have no ratio (BX10).
+
+### BX3 — router, ledger, lanes (2026-09-26) — DARK until BX6
+
+Built on branch `binance` (plan §5 BX3; rulings O-BX17…O-BX27 and D8).
+**No live slot can name Binance yet:** `LIVE_ARM_VENUES` is unchanged
+(hyperliquid, hyperevm), and a live slot naming binance refuses the
+boot and names BX6. Every rule below binds the day an arm exists; it
+reaches the engine only through a merge to `main`, a release build and
+a restart.
+
+**A Hyperliquid-only boot is unchanged** (with today's one live
+Hyperliquid slot). With no instrument row bound the ledger's instrument
+probe returns before any work; the alias matches only the anchor, whose
+orders were and remain `NoLiveRoute` on every live slot; the Hyperliquid
+arm never raises the new flags; its boot tell is byte-identical
+(pinned). Two things differ only in shapes that do not run today: with
+two or more live Hyperliquid slots the address floor is now the highest
+of theirs (O-BX27, a tightening), and HYPARB's retirements drain at most
+64 a poll (more than it can produce).
+
+#### New kill switches: `VenueLock` (10) and `MarginRisk` (11)
+
+* Venue verdicts, no threshold, tested FIRST by `trigger_for`.
+  `VenueLock`: the venue restricted the account (for example
+  `RISK_LEVEL_CHANGE → REDUCE_ONLY`, O-BX10a). `MarginRisk`: the arm
+  judged the account's margin ratio at or past the slot's
+  `halt_on_margin_ratio_1e6`, or a `MARGIN_CALL` arrived (BX-20).
+  Sticky like every halt; a cancel still passes; nothing is flattened
+  (O-BX9).
+* Words `venue-lock` and `margin-risk` in `exec.HALT` and `/state`. An
+  older binary reads either word as `operator`: still halted.
+* No arm sets either before BX6; the Hyperliquid arm never does.
+* **Per-slot coverage (O-BX8, O-BX17).** A slot reads the signal of the
+  arm(s) that trade it, fixed at construction from its venue mask, so a
+  Binance verdict never reaches a Hyperliquid-only slot. A slot on both
+  venues reads the merge — the worse of each observation: the MAX of
+  the streaks, drift, stream gap and reconciliation age; the OR of the
+  flags that halt; the AND of `reconciled` and `pnl_judged`; the SUM of
+  the session P&L. Such a slot is seeded, and its session bound judged,
+  only when BOTH arms say so, and one venue's gain offsets the other's
+  loss in the bound.
+* A halt's cancel-all reaches every live arm (O-BX8); its confirmation
+  is the least settled of theirs (Working > Stranded > Clear).
+
+#### `halt_on_margin_ratio_1e6` — declared, NOT yet enforced
+
+* Allowed only on a slot whose `venues` names binance; required non-zero
+  on a live one; at most 799 999 (O-BX26: just under the venue's 80 %
+  margin call, which halts the slot on its own from BX6, BX-20; the venue
+  liquidates at 95 %). The plan's example is 600 000.
+* Parsed and validated now; printed in the boot tell's HALTS line of a
+  Binance slot; in `exec.toml.example` (commented) and the template
+  test.
+* **Not enforced until BX6:** the per-slot side table (O-BX18) and its
+  reader, the Binance arm, do not exist yet. A live Binance slot cannot
+  boot before then.
+
+#### `request_budget_floor` is Hyperliquid's
+
+* Required non-zero only on a live slot whose venues name hyperliquid
+  (amends E6 commit 4 above). Every slot that can be live today names
+  it, so nothing widens today.
+* The Hyperliquid arm's address numbers come only from the live slots
+  it trades — every live slot but slot 0 whose route names hyperliquid:
+  the HIGHEST floor (O-BX27; the code took the lowest, which made no
+  difference with one live slot), the LOWEST top-up weight and day
+  ceiling (S7-L1). A slot on another venue has no say, and the boot
+  tell prints the address numbers only on a slot naming hyperliquid.
+
+#### How an order on a Binance instrument row is judged
+
+Every Binance instrument the boot binds (BX6, from discovery; none is
+bound today) is a ledger row with a law — SPOT, LINEAR, INVERSE,
+OPTION — and every slot's signed position on it. An order is
+judged by its row's law, **all at one price**: the row is priced alike
+on both sides of every comparison, so a price move can never make a
+reducing order read as an increase.
+
+* **Exposure.** SPOT and LINEAR `|pos| × P`; INVERSE `|pos| × face`;
+  OPTION long `|pos| × mark` (the premium is per contract, D8); OPTION
+  short `|pos| × IM`, with IM per contract
+  `max(10 %·I, 15 %·I − OTM)·unit + mark` — Binance's short-selling
+  formula (D8). A short with no index yet is priced at the strike.
+* **The one price P.** A spot or linear row being traded: a buy at its
+  own price; a SELL at the higher of its limit and the row's reference,
+  the mark else the last fill (O-BX24 — a marketable sell fills at or
+  above its limit, so its limit alone understates what a short-opening
+  sell adds). An option row at its mark and index; the order's price
+  drives only clamp 1's premium, the turnover and — before the first
+  mark — the mark's stand-in (for a sell, again the higher of limit and
+  last fill). Other rows at their own prices: the mark, else the last
+  fill (O-BX22).
+* **Clamp 1 (`max_order`)** in the law's units: the notional (spot,
+  linear), the face (inverse), the premium of an option buy, the IM a
+  sell adds when it opens or grows a short (O-BX21).
+* **Clamp 3 (`cap_instance`)** compares the slot's exposure across every
+  venue — the family rows plus the instrument rows — before and after.
+* **Clamp 4 (`cap_day`)** adds the part of any order, buy or sell, that
+  increases the position's magnitude, at the law's price (the family
+  rows still count buys only). A settlement zeroes the row and adds no
+  turnover.
+* **Refusals.** `Short`: a spot sell past the holding net of the slot's
+  working sells, or a short on an option row not bound writable (from
+  the contract's `nakedSell`; the account's Long & Short mode is the
+  venue's own check, BX-18).
+  `Unpriced`: a non-positive limit (spot, linear, option), a short
+  option with no index yet, or a Binance-routed order on an instrument
+  no row was bound for (F8, closed at the router). Hyperliquid orders
+  never reach these; their arm refuses a non-positive price itself.
+* **Exits (risk review; O-BX25).** An order is an EXIT only if it
+  opposes the position and, with every working order of the slot on the
+  same instrument and side, cannot cross zero — N working exits of the
+  whole position are one exit. An order that opposes the position is
+  judged from the position those working orders would leave (its worst
+  case); a modify is judged beside every OTHER working order. An exit
+  is never refused by the money clamps (1, 3, 4), but a new exit PLACE
+  still needs a free open-order place (clamp 2): the resting table is
+  shared by every slot. A member at its count cancels or requotes (a
+  modify is exempt, E-7). **The stated worst case,
+  `cap_instance + max_open_orders × max_order`, holds on Binance rows —
+  an exit never widens it — except for the residuals named here: the two
+  anomalous states below and BX6 obligations 1–3.** The family rows keep
+  S7-L1's (D).
+* Two anomalous states loosen the exit test, and both are counted where
+  an operator reads them. `resting_ambiguous` (two rows under one key; a
+  modify's exclusion drops both): by one order. `resting_full`: every
+  order placed while the shared table is full goes untracked, so its
+  quantity is missing from the working sum — bounded by the slot's
+  `max_open_orders`, because the count still rises.
+
+#### Retirement (F9)
+
+* An arm reports an accepted order that ended without a (further) fill
+  as a `Retired` record: rejected, expired, canceled by the venue, by
+  TTL or by the member, filled; any other code counts as unknown. The
+  router drains at most 64 per idle poll, releases each order's resting
+  row and counts it by `why` (`/state` `exec.retired`;
+  `engine_exec_retired_total`).
+* Release is idempotent: an absent row is a no-op. A retirement drained
+  before the order's last fill moves no money ledger — exposure and
+  turnover come from fills alone — but the resting count AND the exit
+  test's working quantity are early by that order (BX6 obligation 1).
+* The Binance arm must retire an order only on a venue-confirmed
+  terminal state (a BX6 requirement). HYPARB's arm, today, retires a
+  hedge IoC after a fixed delay and a swap that was refused, unsent or
+  unconfirmed; on the family path only the open-order count reads the
+  row, so nothing else moves.
+
+#### The route alias
+
+The M1 legacy anchor (`binance:btcusdt`, flat id 7, whose venue byte
+reads Polymarket) routes to Binance by a boot-fixed alias, matched by
+the full id. Only the router's venue check and the venue split read it
+— never `ExecRoute`, the ledger, captures or the backtest model. The
+router owns the one table and hands it down to the split, so the venue
+an order was allowed by and the arm it reaches cannot disagree — while
+every composite forwards the hand-down hook (BX6 obligation 4). Today
+every anchor order from a live slot is still `NoLiveRoute`.
+
+#### Also recorded
+
+* **O-BX19:** `OrderDispatch::cancel` and `modify` are required — a
+  forgotten override no longer compiles (the shape of BX0-F3). The
+  composition test drives the real Hyperliquid arm through
+  `RoutedDispatcher<Paper, SlotSplit<VenueSplit<HlExchange, …>, …>>`
+  against a scripted TLS venue.
+* **O-BX20:** exec-hyperliquid's test-only `loopback` feature
+  (`HlConfig::with_port`) refuses any port but 443 on the real hosts.
+  A build without test targets never enables it; `--all-targets`,
+  `--tests` and clippy `--all-targets` do (resolver 2 unifies the
+  dev-dependency's feature), so a `cargo test --release -p cli` would
+  relink `target/release/multivenue-engine` with it compiled in — inert,
+  since nothing outside tests calls it — and G0 already requires a fresh
+  release build before any live boot.
+
+#### BX6 obligations (recorded now)
+
+1. **A retirement can arrive before its fill.** The engine runs members
+   before it drains the fill lanes, so a retirement drained in the same
+   iteration frees the resting row a tick early. BX6 pushes fills
+   first and retires one idle later — or the router stops releasing on
+   `FILLED`, which the fill releases anyway (a lost fill then leaves the
+   row counted: fail closed).
+2. **A queued arm's cancel or modify `Ok` means "queued".** The router
+   releases or renames the row on `Ok`, before the venue confirms; a
+   venue-refused cancel would leave a working order uncounted. BX6
+   applies them on confirmation (`CANCELED_MEMBER`), or records the
+   one-order residual here.
+3. **`Clear` on an IoC-only product** must also mean nothing of ours is
+   in flight (plan §3.8's confirmed no-op); otherwise `clear_resting`
+   drops in-flight IoC exits from the working count.
+4. **The defaulted `set_route_aliases` hook** has BX0-F3's shape: a
+   future composite that forgets to forward keeps an empty table (the
+   failure is loud — Hyperliquid refuses the order and counts asset
+   refusals). BX6 asserts at boot that the split's table equals the
+   router's, and builds the split from the router's own route — its
+   per-slot coverage comes from the route it is built with.
+5. **A two-venue slot whose second arm never judges P&L** has no
+   session bound: BX6 refuses that boot.
+6. **The Binance Mark producer**, with staleness and sanity checks on
+   mark and index, before BX7/BX9. Until then spot and linear rows are
+   priced at their last fill and inverse rows at their face; option rows
+   already take mark and index from the live options lane, unchecked.
+7. **Bind the armed set from discovery** (more than 256 rows refuses the
+   boot); Binance fills carry the engine id; the boot checks that no
+   non-Binance instrument carries the alias id.
+8. **Day-spend adoption for Binance slots** (the S7-L1 gap A analogue):
+   the Binance arm reports the day's turnover through
+   `venue_day_bought` (merged per O-BX17 for a two-venue slot) and
+   reports `reconciled` only after that read — for the signed laws,
+   "bought" is the increasing part on either side. Without it every
+   restart hands a Binance slot a fresh `cap_day`.
+9. **Arming precondition.** Binance joins `LIVE_ARM_VENUES` only in the
+   phase that also lands the O-BX18 side table and its reader, the
+   `VenueLock` and `MarginRisk` producers, and obligations 1–4 and 8 —
+   otherwise the boot tell would print a `margin_ratio_1e6` that nothing
+   enforces.
+
+### BX6 — the Binance arm (2026-09-26) — ARMABLE, and no member arms (O-BX6)
+
+Built on branch `binance` (plan §5 BX6; rulings O-BX28…O-BX30). It
+reaches the engine only through a merge to `main`, a release build and a
+restart. **Scope:** USDⓈ-M × classic, a dedicated account, one owner
+slot; every other product, mode and scope refuses the boot naming its
+phase (BX7–BX10; "shared" is refused outright).
+
+#### Arming
+
+* **Obligation 9's precondition is met:** Binance is in
+  `LIVE_ARM_VENUES` (`crates/cli/src/exec_boot.rs`), in the same commit
+  as the O-BX18 side table and its reader, the `VenueLock` and
+  `MarginRisk` producers and obligations 1–4 and 8.
+* **O-BX6 still forbids arming any member.** Nothing in the code stops a
+  live slot whose member is a real strategy: the operator and the
+  wrapper enforce it. Do not arm before BX13 has proved a live fill on
+  the user stream, with the conditions below met.
+* **The arming recipe** (a battery or, one day, a member): `exec.toml`
+  `[exec.slot.N] mode = "live"` naming `binance`, with its caps and
+  halts (`halt_on_margin_ratio_1e6` required, ≤ 799 999, O-BX26), plus
+  `max_symbols` and `min_maker_ttl_ms`; the `[exec.binance]` section;
+  the key pair `BINANCE_API_KEY` / `BINANCE_ED25519_SEED` in `.env`
+  (names only in any file; the seed is locked in memory and released
+  only after the gateway thread ends); `--arm-live` naming the slot. The
+  boot then runs the vectors, the BX-19 assertions, the orphan sweep,
+  the first reconciliation and the day read, and prints
+  `binance: LIVE ARM ARMED — …` (or `UNRECONCILED: n unbound
+  position(s)`). Any miss refuses the boot.
+* The restart exec gate stays Hyperliquid's. Binance has its boot
+  vectors and the BX-19 assertions instead.
+* **Kill switches 10 (`VenueLock`) and 11 (`MarginRisk`) go from DARK to
+  LIVE** for a Binance slot.
+
+#### Obligations 1–9, as built, with their residuals
+
+1. Fills leave on lane 4 before the event that retires their order,
+   through ONE ordered held queue when a ring is full (2 048 entries);
+   the arm releases a retirement one idle later. **Residual:** a lane-4
+   backlog deeper than the engine's per-pass drain. A fill neither the
+   lane nor the held queue can take is LOST: nothing is booked, the
+   journal writes `J_FILL | J_FILL_LOST`, and the sticky `EVT_F_LOST`
+   makes the arm report unbounded drift (a `ReconDrift` halt).
+2. **A cancel or modify `Ok` means queued.** The member's cancel
+   releases the row on `CANCELED_MEMBER`; a rename lands on the modify's
+   answer, the stream's `AMENDMENT`, or a status showing the new terms;
+   the old terms are final only after `recvWindow` + 5 s. Until then the
+   ledger holds the old id and quantity, so a size-raising modify
+   under-counts working quantity. Venue refusals of cancels and modifies
+   are counted, never reported to the member. A cancel is OWED, never
+   dropped: one the session cannot take, whose answer was lost, or that
+   the venue refused is retried from the TTL wheel; a `-2011` parks it
+   (below).
+3. **`Clear`** = the venue's own open-order listing names none of ours
+   AND the gateway's table is empty AND nothing of ours is in flight. A
+   stranded sweep is reported `Stranded` even with orders in flight; the
+   router asks again.
+4. `finish_bn_boot` asserts the split's alias table equals the router's;
+   the split is built from the router's own route.
+5. A two-arm slot whose second arm judges no P&L refuses the boot. It
+   never fires today.
+6. **Binance marks reach the arm only through the dispatcher (O-BX29)**
+   and never a member. The ledger refuses a mark more than 10 % off its
+   index and expires one older than 30 s (then the last fill). A wrong
+   mark and a wrong index together pass the sanity law; the fallback can
+   understate another row's exposure after a move; the arm's band check
+   reads the mark unchecked.
+7. The armed set is bound from discovery (more than 256 rows refuses);
+   fills carry the engine id; no other instrument carries the alias id.
+8. The day's spend (`userTrades` from 00:00 UTC, the increasing part) is
+   read at boot, and `reconciled` waits for it. **Residual:** a full
+   trades page is refused, never summed, so the slot stays unseeded
+   until the next UTC day; an unread row retries once per cycle.
+9. Above.
+
+#### Every live trigger and its source
+
+* **`VenueLock`** — `-4400`…`-4402` and ANY HTTP 418, whatever its code
+  (a 418 is an IP ban; the worker's traffic on the shared IP can cause
+  it). Sticky: the slot stays halted after the ban ends. A lock or a
+  budget code during the boot refuses the boot (the first error is kept).
+* **`MarginRisk`** — `totalMaintMargin / totalMarginBalance` (UM),
+  sampled at every reconciliation and on every `ACCOUNT_UPDATE` (an
+  account-only re-read, at least 5 s apart) and `MARGIN_CALL` (re-read at
+  once). `MARGIN_CALL` is itself a sticky observation and reaches every
+  Binance slot.
+* **`BudgetFloor`** — 429, `-1003`, `-1015`: a sticky halt.
+* **Quiet (BX-12).** After a budget or lock answer the gateway sends
+  NOTHING — no order, cancel, heartbeat (the dead-man then cancels the
+  makers), REST call, dial or logon — for `max(60 s, the end the venue
+  names)`, at most 3 days: a WS error's `retryAfter`, a 418's "banned
+  until". Measured on the venue clock (the host's if never measured). A
+  boot refused this way does not hand the ban's end to the next boot:
+  how often the engine relaunches during a ban is the restart lane's
+  decision. A 418 on the WS upgrade itself is a transport failure: the
+  gateway redials at its backoff (at most 30 s).
+* **`ReconDrift`** — two cycles in drift. A frame the arm cannot read,
+  or a lost output, reads as drift `i64::MAX` (BX-15).
+* **`ReconStale`** and **`WsGap`** — the gap is the longer socket
+  outage. A half-open USER stream is blind for up to the 240 s idle law.
+  A half-open ORDER session is found within one heartbeat of silence
+  plus 5 s (below).
+* **The reject streak** moves only on the venue's negative codes of
+  class Reject, Clock or Unknown, and on `-4411` (RowFatal, which also
+  retires the row); an ACK or a retirement resets it.
+* **The session bound (E7)** — `totalMarginBalance`, anchored at the
+  session's first reconciled equity and persisted beside `exec.toml` in
+  `binance-pnl-anchor.state`, keyed by an 8-byte SHA-256 tag of the API
+  key. Deposits and transfers move it; rotating the key starts a new
+  session (**BX7: it refuses the boot until the file is deleted**,
+  below); deleting the file ends one. The anchor is offered to the
+  journal ring until it takes it, and the writer retries a failed store
+  every second; until it lands the pulse raises `EVT_F_ANCHOR_UNSAVED`
+  (`BnArm::anchor_unsaved`), and a process ending with it unsaved logs
+  an ERROR. **No member may arm while it is raised.**
+
+#### Departures (decisions a–i and the review rounds')
+
+* (a) The scope above.
+* (b) Obligation 1 by ordering; the router still releases on `FILLED`.
+* (c) **No position adoption across a restart.** A venue position the
+  gateway did not book is an unseen leg: the boot logs an ERROR and
+  tells `UNRECONCILED`, and the slot stays unseeded until someone
+  flattens it by hand — there is no flatten tool before BX11 (BX11:
+  `exec-smoke --binance-flatten`). A lost
+  fill on a leg booked flat reads as unseen and halts only via
+  `ReconStale`. **Superseded by BX7** (adoption within the cap, below).
+* (d) The 23 h rotation is break-before-make at a quiet moment. The user
+  stream is not rotated: the venue's 24 h cut is a daily reopen, a
+  `doubt_all` and a burst of status queries (at most 256 in flight).
+* (e) At most one live Binance slot; it owns every bound row.
+* (f) Shutdown: the arm waits 3 s, the gateway serves up to 8 s for the
+  engine drain's sweep (makers only, never a flatten), then the
+  countdown is the backstop.
+* (g) Marks dispatcher-only (O-BX29).
+* (h) `min_maker_ttl_ms` ≥ 5 000; a maker's TTL 0 means no deadline, as
+  on paper.
+* (i) Obligation 5 as a boot refusal.
+* **Shared scope refused.** On a shared account a foreign fill on an
+  owned instrument would only be counted (O-BX2a wants a halt), and the
+  sweep's REST fallback cancels every order on a symbol.
+* **No REQUEST_WEIGHT governor at run time** (§3.9, BX-12; **closed by
+  BX7**: the kit's `RateWindow`, below). The boot
+  refuses a configuration whose worst steady weight exceeds the arm's
+  1 440 of the IP's 2 400 a minute (`gov::arm_weight_per_min`: the
+  dead-man 10 per maker row per heartbeat, a reconciliation of 45 every
+  `recon_every_ms`, an account re-read of 5 every 5 s, the clock). The
+  defaults weigh 1 309; at 20 symbols `heartbeat_ms` must be about 9 s
+  or more. **Not covered:** member cancels, modifies and status queries
+  (1 each); the status burst after a stream reopen or a re-logon (up to
+  256); sweep listings (40 each) and REST cancel-alls; the recon a
+  stream reopen starts; the day read; the `MARGIN_CALL` re-read.
+* **The quiet period** is 60 s or the venue's named end (above).
+
+#### The dead-man as built (O-BX13)
+
+* `countdownCancelAll` (`countdown_ms`, at least twice `heartbeat_ms`)
+  is renewed every `heartbeat_ms` for each row with a maker of OURS
+  resting — and ONLY while the order session can cancel (logged on, the
+  socket open, the clock measured, not quiet). A renewal queued while it
+  could is dropped at start once it cannot. Weight: 10 per row per
+  heartbeat — 1 200 a minute at 20 rows and 10 s.
+* **Proven before any maker:** until one countdown has answered, a probe
+  (`countdownTime=0`, which sets no timer) goes to a row with no maker of
+  ours; a refused row (`-4411`) hands over to the next.
+* **`DEADMAN_OK`** (the arm's gate for a maker) = the session can cancel
+  AND the endpoint is proven AND every maker row was answered within two
+  heartbeats (or its first maker is younger than two heartbeats). A
+  maker is refused `Disconnected` (retryable) while it is down; a row
+  flagged no-dead-man refuses `Unsupported`.
+* **The first-maker window.** A row's first maker rests with no venue
+  timer until that row's countdown answers — up to 2 × `heartbeat_ms`
+  while `DEADMAN_OK` holds (the REST queue is one request at a time,
+  with a 5 s timeout). BX-17 is enforced at admission.
+* **A half-open order session** (a NAT, Wi-Fi or VPN change: no FIN, no
+  RST) is found by its silence: while a maker rests, a session silent
+  for one heartbeat is asked for the margin (an account-only read, at
+  most every 5 s), and ANY WS API request unanswered for 5 s drops the
+  session — every request in flight goes in doubt, and on the new logon
+  every open order is queried. At most one renewal goes out over the
+  dead path; makers then rest at most `countdown_ms` more (about 45 s at
+  the defaults). A venue slower than 5 s makes the session reconnect
+  and may let the dead-man cancel makers: it costs availability, and
+  fails safe.
+* **The sweep** (a halt, a cancel-all, the shutdown): WS cancels for
+  every maker; REST `DELETE allOpenOrders` for each row with a maker of
+  ours while the session is down, from the second round on, and from
+  the first when the last sweep stranded — it cancels EVERY order of the
+  account on that symbol (dedicated only). The confirmation reads the
+  venue's listing (the REST listing alone while the session is down);
+  its reads back off after stranded sweeps (up to 32 s). Makers swept
+  over REST retire `CANCELED_VENUE`, and so do member or TTL cancels
+  still owed when it landed.
+
+#### Fills, doubts and cancels (the second fill source and its rules)
+
+* **In doubt (BX-11).** A place whose answer never came (a timeout, a
+  dead socket), a 5xx or `-1007`, a 200 that does not name the order,
+  every open order on a user-stream reopen or an order-session re-logon,
+  and every working order a listing should have named: resolved by
+  `order.status`, never resent.
+* **Fills booked without their trade** — from a status answer, or from
+  an `ORDER_TRADE_UPDATE`'s cumulative `z` past what was booked (trades
+  the stream lost while down, S1): priced at the implied average
+  `(z × ap − booked quote) / missing` when within 10 % of `ap`, else
+  `ap`, else the trade's or the order's price; stamped on the gateway's
+  clock (a lost fill near 00:00 UTC lands on the booking day);
+  commission 0; journaled `J_FILL_UNSEEN`. **BX-14 must exclude them.**
+  After one, that order's `TRADE_LITE`s wait for their updates (they
+  carry no `z`). Dedup horizons: 256 trade ids, 256 ended orders.
+* **Fill time (B3):** the venue's `T` when within a day behind to a
+  minute ahead of the gateway's venue clock, else that clock — never the
+  monotonic clock.
+* **`-2011`** on a cancel parks it (`OWE_UNKNOWN`) and puts the order in
+  doubt: the cancel goes again once the venue shows the order working —
+  a status, a stream update, the ACK, or the next listing. No
+  `EVT_CANCEL_FAILED` is emitted for it.
+* **The client-id law (S7) — an arming precondition:** client ids are
+  unique per slot per boot. A reuse within the last 256 ended orders is
+  refused (a REJECT with `CODE_DUPLICATE`); every request carries the
+  table slot's generation, so a late answer never reaches the slot's
+  next order; a stream event naming another venue order id is not
+  applied. Past that horizon a late event can reach a reused id before
+  its ACK; the next listing heals it.
+
+#### Other residuals
+
+* K19 (fapi REST accepting Ed25519: the boot refuses if not) and K20
+  (`/ws/<listenKey>` unverified live; F1 shows streams can fail
+  silently).
+* The risk gate judges the order before quantization: a SELL can be
+  priced up to one tick above what was judged.
+* The `loopback` feature (`BnConfig::loopback`) has O-BX20's shape: only
+  test targets enable it, and a build with `--all-targets` links it in,
+  inert.
+* DNS is resolved once per boot (BX7, with make-before-break);
+  `ACCOUNT_CONFIG_UPDATE` is ignored and margin type and leverage are
+  never asserted (§3.12's assertion is BX7's; isolated-margin
+  liquidation is invisible to the ratio; a mid-session switch to hedge
+  mode surfaces as a scan failure, `ReconDrift` at MAX, not
+  `VenueLock`). **Closed by BX7** (below), except the hedge-mode switch,
+  which still surfaces as a scan failure.
+* Gate 94, the live-socket allocation gate, is due before BX13.
+* `/state` omits jobs dropped, doubts raised, fills deferred, journal
+  drops, refusals by reason, budget and lock counts and the anchor flag
+  (the arm's counters carry them): BX11. **Closed by BX11**
+  (`exec.arms.binance_gw`).
+* No test yet for a Binance fill rolling the ledger's day (B3 is tested
+  at the stamp), `go_quiet` with a named end, the probe's
+  `countdownTime=0`, or a lock at boot, a restart with a position, the
+  margin and scan-failure halts end to end. **Closed by BX7** (each has
+  its test now).
+
+#### Still gated
+
+BX13 proving a live fill on the user stream before any member arms;
+K2, K5, K11/R20; BX7 (adoption, make-before-break, COIN-M, PM, PM Pro —
+built by BX7, below; its venue proof is BX7b's); BX11 (the flatten tool,
+observability); the Stage-3 member gate.
+
+#### The reviews
+
+| round | reviewer | verdict | disposition |
+|---|---|---|---|
+| 1 | zero-copy | FAIL: order digits and client ids staged then copied; a 128 B `Out` by value | `core_net::WsPart`: every part written in place; fills and events pushed by reference |
+| 1 | alloc | PASS with borderlines | all acted on: the anchor store moved to the writer thread; cross-multiplied compares; masked indexes over boxed fixed arrays; gate 92 through the router |
+| 1 | parser | one bug: `dec_1e6` wrapped on a 20-digit integer part | capped at 18 digits; fuzz `bn_account`, `bn_mode`; a tautology fixed |
+| 1 | risk | BLOCK: B1 the dead-man renewed while the arm could not cancel; B2 lost stream events never resolved, double booking; B3 fills on the monotonic clock; B4 no back-off after a 429 | all fixed, each with a test that fails without it; 17 should-fix items fixed or recorded above |
+| 2 | zero-copy | PASS; the logon's markers; six nits | all acted on |
+| 2 | risk | APPROVE WITH CONDITIONS: S1 lost fills, S2 half-open session, S3 `-2011`, S4 stalled sweep, S5 weight, S6 ban length, S7 id reuse, S8 anchor drop; N1–N9 | all fixed (N8, N9 recorded) |
+| 3 | risk (verification) | APPROVE WITH CONDITIONS: F1 the ACK did not send a parked cancel; F2 a failed anchor store was silent; five nits | all fixed, F1 and F2 each with a test that fails without it |
+
+### BX7 — futures on the shared gateway kit (2026-10-08) — ARMABLE, and no member arms (O-BX6)
+
+Built on branch `binance` (plan §5 BX7; the operator's rulings of
+2026-10-08: offline-first; the gateway onto `exec-gateway` first; one
+commit; adopt within caps; require CROSSED; fail-closed across lanes;
+"commit BX7 now, battery later"). It reaches the engine only through a
+merge to `main`, a release build and a restart. **Scope:** USDⓈ-M and
+COIN-M futures × the classic, Portfolio Margin (`pm`) and PM Pro
+(`pm_pro`) accounts; a dedicated account; one owner slot. Makers on
+USDⓈ-M classic only — the one dead-man of ours that is proven (BX-17).
+COIN-M (O-BX3a), Portfolio Margin (K13) and PM Pro (K14) are IoC-only.
+Spot, options and Binance Stocks still refuse the boot naming their phase
+(BX8–BX10); "shared" is still refused. **Nothing of BX7 is proven on a
+venue:** the Demo battery and the K-probes are their own phase (BX7b),
+and PM and PM Pro have no Demo at all.
+
+#### Arming — what changes from BX6
+
+* **A new arming precondition — adopted fills.** Every member trading a
+  Binance slot reads `FILL_FLAG_ADOPTED` (core-types, `Fill::is_adopted`)
+  as opening inventory, never a trade, before it arms (BX13). BX-14's
+  trade statistics exclude `J_FILL_ADOPTED`, as they exclude
+  `J_FILL_UNSEEN`. **The worker cannot see the bit:** its PMLR reader
+  (`claude_worker/pmlr.py`, `_FILL` = `<QIBBBxqqQ`) skips byte 15 as
+  padding, so any worker verb that folds fills (`positions`, …) counts an
+  adopted fill — and a settlement — as a trade. Reading the flag there is
+  an arming precondition for any worker surface that folds Binance fills.
+  **Built in BX13:** `_FILL` = `<QIBBBBqqQ`, `FillRec.flags` and
+  `is_trade`; the position fold, the dashboard's counts and
+  `vrp_shadow`'s leg count adopted fills and settlements apart ("BX13").
+* **A new arming precondition — body-form DELETEs.** The REST route's
+  cancel and the sweep's emergency `DELETE allOpenOrders` now carry their
+  parameters in the body, as every order verb does. This is proven on
+  loopback only. If the venue, or anything between it and us, ignored a
+  DELETE's body, every one would be refused (`-1102`): the sweep's REST
+  fallback would strand, and only the dead-man would clear makers. BX7b
+  proves both on Demo before anything arms. (Met on Demo, both products,
+  2026-10-09: risk-policy "BX7b".)
+* **The recipe is BX6's, plus** `account_mode`, `products`,
+  `order_transport` (`ws` | `rest`; `pm` needs `rest`), `signing`
+  (`ed25519` | `hmac`; `hmac` needs `rest` and reads
+  `BINANCE_HMAC_API_KEY` / `BINANCE_HMAC_SECRET_KEY`, names only) and
+  `max_leverage`. The tell names each product's order kinds, the account
+  mode, the order route, the key type and the leverage cap — marked
+  NOT asserted under `pm`.
+* The O-BX18 side table covers COIN-M: the margin ratio is per product.
+
+#### The kit (O-XH13)
+
+* The duplex is 1 024 commands / 4 096 events. XG-2 back-pressure: no
+  command is taken while events are held, or while the event ring has
+  under 256 free.
+* The sweep is the stats word: a cancel-all never waits on ring room
+  (XG-1).
+* The halt word: `HALT_OUTPUT_LOST` when an event or a fill finds
+  neither its ring nor the held queue; `HALT_TIMER_FULL`.
+* `Pending<_, 256>` for the WS API ids. One `TimerQueue<2 048>` holds
+  the TTLs, the owed cancels and every request's 5 s deadline.
+* `Mbb` make-before-break serves the 23 h rotation and the venue's
+  `serverShutdown`. A request unanswered for 5 s is still a cold drop:
+  that session cannot cancel (B1).
+* `Idle` parks at most 100 µs and never past a deadline (`spin`).
+* **The run-time weight governor closes BX6's residual.** `RateWindow`
+  sums every request's REQUEST_WEIGHT; the congestion word is published.
+  Past 80 % of the arm's 1 440/min share, the one read the boot's weight
+  model does not count waits: a reconciliation asked for before its
+  cadence (a stream's reopen), unless it confirms a sweep. What the model
+  counts never waits — the cycle at its cadence (so the margin, the bound
+  and the staleness keep their samples), the paced margin re-read and the
+  half-open probe it carries, every cancel, countdown and order: a
+  configuration the boot accepted (up to 100 % of the share) must run.
+  Under papi's 6 000/min pool the share stays the classic one
+  (conservative).
+
+#### Lanes, and fail-closed across them (the operator's ruling)
+
+* One gateway thread, one lane per armed futures product, USDⓈ-M first.
+  The lanes share the open-order table, the held queue and lane 4, the
+  journal, the signer, the clock, the weight window and the ORDERS
+  governor.
+* ORDER_UP and DEADMAN_OK hold only while every lane is up, and the gap
+  is the longest lane's: one lane's outage stops every admission. A
+  reconciliation cycle reads every lane and judges every leg once; a
+  lane that cannot read fails the cycle.
+* **COIN-M** follows the inverse law: contracts × face / price, and an
+  inverse leg is valued at its face. The margin ratio is per product
+  (`EVT_MARGIN.product`): the riskiest asset's. No countdown is ever sent
+  on dapi.
+
+#### Portfolio Margin and PM Pro
+
+* **PM** is papi REST only (the route is forced), with one stream for the
+  account (`/pm/ws/`; each event routed by its `fs`) and the clock on
+  SAPI's `/api/v3/time`.
+* **PM Pro** keeps the classic routes and streams; its unified account is
+  read on SAPI. The `/pm-classic/ws/` risk stream rides the USDⓈ-M lane's
+  key and is risk guidance only: its outage gates nothing, because the
+  status is read every cycle. With only COIN-M armed under PM Pro there
+  is no risk stream.
+* **The unified account is the cycle's last step** (`ReconStep::Unified`).
+  No verdict is given without a 200 that scans. Any other answer fails
+  the cycle (`GW_RECON_FAILED`), so `halt_on_recon_stale_ms` halts the
+  slot. A boot needs one good read: in PM it times out in its first
+  reconciliation; in PM Pro the mode probe is the same read and refuses
+  it first.
+* The ratio is `accountMaintMargin / accountEquity`, on every product.
+  * `accountStatus` MARGIN_CALL or SUPPLY_MARGIN is a margin call.
+  * REDUCE_ONLY, ACTIVE_LIQUIDATION, FORCE_LIQUIDATION, BANKRUPTED or an
+    unknown word is a `VenueLock` (9 011, `CODE_PM_ACCOUNT`).
+  * `riskLevelChange`: NORMAL changes nothing; MARGIN_CALL is a margin
+    call, priced from the event, with the account re-read; any other
+    level is a `VenueLock` (9 010, `CODE_PM_RISK`), and is not quiet.
+* On a classic stream, an event naming `fs` is a scan failure (unbounded
+  drift), never read as PM's; on PM's stream, an order, account or
+  configuration event naming none is one too, never read as the first
+  lane's.
+
+#### Margin type and leverage (BX-19; the operator's ruling "Require CROSSED")
+
+* **At boot:**
+  * USDⓈ-M (classic, PM Pro): `GET /fapi/v1/symbolConfig` per owned row
+    must show CROSSED at most `max_leverage`.
+  * COIN-M (classic, PM Pro): the first account read must list every
+    owned row, cross, with leverage at least 1 and at most the cap.
+  * The refusals are `AssertErr::Isolated`, `Leverage` and `Unlisted`.
+  * **Residual:** under Portfolio Margin nothing asserts the leverage
+    (papi's reads do not carry it; `positionRisk` would). The margin is
+    cross by construction.
+* **Mid-session**, each of these is a `VenueLock` (the arm halts the
+  owner slot):
+  * **9 013 `CODE_MARGIN_TYPE`:** an `ACCOUNT_UPDATE` position on an owned
+    row that is not cross (a classic stream's position without `mt`
+    counts as not cross), or a COIN-M read showing an owned row
+    isolated.
+  * **9 012 `CODE_CONFIG`:** ANY leverage change on an owned row
+    (`ACCOUNT_CONFIG_UPDATE` — stricter than the cap); multi-assets turned
+    on (USDⓈ-M classic); a COIN-M read above the cap, or no longer listing
+    an owned perpetual (a dated contract may leave at delivery).
+  * **9 010 / 9 011:** PM's risk level and account status (above).
+* **9 014 `CODE_SWEPT` is not a lock:** it is a local REJECT (below).
+
+#### Adoption (the operator's ruling "Adopt within caps"; replaces BX6's departure (c))
+
+* **When it happens.** At the boot's first full reconciliation, on a
+  DEDICATED account whose owner slot names Binance alone, the boot adopts
+  the venue's positions as the owner slot's starting inventory. It takes
+  only positions on owned, LIVE rows that the boot has not booked.
+* **The cap.** Their exposure in all must fit the slot's
+  `cap_instance_usd_1e6`: a linear leg at the read's mark, an inverse one
+  at its face. The boot is refused (`BootErr::Inventory`), with nothing
+  booked, when:
+  * the exposure is past the cap;
+  * a linear leg has no price;
+  * the legs need more room than the held queue has (two records a row,
+    and the cycle's own two).
+* **What adopts nothing.** A shared account and a row the arm cannot
+  trade (not live) adopt nothing: the leg stays unseen, and the slot
+  unreconciled until it is flattened by hand. A slot naming another venue
+  has a cap of 0, so a position on an owned, live row refuses the boot
+  (`BootErr::Inventory`). A leg already booked is not adopted again: any
+  difference is drift.
+* **The booking.** Each row is one fill flagged `FILL_FLAG_ADOPTED`,
+  journalled `J_FILL | J_FILL_ADOPTED`. The ledger moves the position
+  only: no day turnover, no resting order consumed.
+* **The seeding order.** The day report, which seeds the slot, waits
+  until lane 4 is drained, so the router holds the inventory before it
+  seeds. A refused boot adopts and journals nothing.
+* **Audit.** audit-pnl's paper view reads an adopted fill as opening
+  inventory; one without a price (an inverse leg) opens at the symbol's
+  mark.
+
+#### The session bound (E7), by account mode
+
+* **One USD equity.** On a classic account it is USDⓈ-M's
+  `totalMarginBalance`; in PM and PM Pro, the unified account's
+  `accountEquity`.
+* **COIN-M has none:** it margins in each coin. So a bounded classic arm
+  that trades COIN-M — alone or beside USDⓈ-M — refuses the boot.
+  `check_binance` refuses it on the armed products, and `bn_live` on
+  the rows bound.
+* **A classic account's totals count USDT's alone** (single-asset mode,
+  BX-19): `totalMarginBalance` and `totalMaintMargin` — the session
+  equity and the margin ratio — never see a USDⓈ-M contract margined in
+  USDC. So a classic arm binds only USDⓈ-M rows whose discovery names
+  `marginAsset` USDT; any other, or one naming none, refuses the boot.
+  PM and PM Pro read the unified account and bind them.
+* **The anchor file is one session's.** Its line names the account mode
+  beside the key's tag. A boot under another key, or in another mode,
+  refuses until the operator deletes the file, which ends the session:
+  the anchor is never inherited and never silently replaced. An
+  unreadable file refuses too.
+  * `signing = "hmac"` signs with another key, so toggling it ends the
+    session the same way.
+  * A line written before BX7 is a classic session's.
+
+#### The REST order route and HMAC
+
+* **The route.** `order_transport = "rest"` sends one request at a time
+  on its own keep-alive connection. Every order verb is body-form
+  (`POST`/`PUT`/`DELETE`), and the answers are read as the WS API's, by
+  one judge.
+* **Up and down.** The route is up while its last request was answered. A
+  lost request puts its order in doubt and takes the route down.
+* **A 418 or a 429 it cannot read** (a CDN's page, a code named twice) is
+  still the lock or the budget: the quiet, `VenueLock` / `BudgetFloor`,
+  the order in doubt — as the jobs judge it (`classify(0, http)`).
+* **A sweep first retires what the route still holds unsent.** Places
+  are refused and modifies aborted (`CODE_SWEPT` 9 014, positive, so the
+  reject streak does not move); cancels and reads keep their order.
+* **HMAC** works only by `signing = "hmac"`, on the REST route.
+  Elsewhere it is `BootErr::Signing`, because `session.logon` takes
+  Ed25519 only.
+  * The secret is two mlock'd halves.
+  * The key pads live on the stack and are wiped after each signature.
+  * The inner hash pads inside the request's own window, so no byte is
+    copied out.
+  * The boot self-test signs Binance's documented example along the same
+    path and builds no locked copy of its own (dropping one would
+    `munlock` the live key's page).
+
+#### Scanners fail closed
+
+* **One reading of a key.** Every reader BX7 added or changed refuses a
+  key it reads that one object names twice, so no other reader of the
+  frame can pick another copy. That covers:
+  * the user stream: the top level, `o`, `TRADE_LITE`'s order keys,
+    `a.P`, a position's `s`/`mt`, `ac` and `ai`;
+  * every account read and the mode judges;
+  * a WS API answer (an event's name too) and its `result`;
+  * the refusal code, read from ONE whole, well-formed object (bytes
+    after it, or a pair it cannot walk, is no code).
+
+  An answer naming a `result` AND an `error` is refused. Of several ban
+  ends a 418 names, the latest stands.
+* A REST 200's body is one JSON object, whole: bytes after it are
+  refused.
+* Any WS API answer except a 200 must carry a code. A code-less 204
+  would retire an order the venue may hold.
+* Numerals are read whole (at most 18 digits, `json::i64_of`). K17's
+  code is never read through `core_parse::scan_i64` (escalated, below).
+
+#### DNS
+
+* A host whose connections fail to establish 3 times in a row is
+  resolved again, and again after every 3 more. The resolution runs on a
+  cold thread (`bn-dns`), never `getaddrinfo` on the gateway thread. The
+  answer goes to every connection on the host, for its next dial. The
+  thread is serving before the boot goes on.
+
+#### Residuals (new)
+
+* **Unproven on a venue.** Everything above runs on loopback only. BX7b
+  covers:
+  * the Demo battery (`exec-smoke --binance {um,cm}`);
+  * K11 (the Demo WS API with the Ed25519 key), K19 (Ed25519 on Demo
+    REST), K20, K16 (the dapi countdown), K5, the account mode;
+  * the body-form DELETEs (an arming precondition, above).
+
+  PM and PM Pro have no Demo: proving them needs such accounts and the
+  operator's arming.
+* **TradFi:** there is no endpoint to query the agreement. The first
+  order on an unsigned row is refused `-4411` (RowFatal: that row stops,
+  the others trade). Signing is `exec-smoke --binance-setup
+  --bn-sign-tradfi`'s job (BX11).
+* A COIN-M fill's commission is in the margin asset (journal only).
+* A fill booked without its trade on an inverse row is priced by the
+  linear form; the exact form is harmonic. The error is tiny, on a rare
+  path.
+* The anchor's journal-ring retry (S8) has no test: a journal-capacity
+  knob is BX11's. **Closed by BX11** (the knob, and
+  `an_anchor_the_journal_refused_is_flagged_and_offered_until_it_lands`).
+* PM's leverage is not asserted (above), and PM Pro with COIN-M alone has
+  no risk stream (guidance only).
+* **Escalated outside the lane:** `core_parse::scan_i64` negates without
+  an overflow check. ingress-rpc, exec-hyperevm (`rpc.rs`),
+  ingress-deribit, ingress-okx and ingress-mexc still call it.
+
+#### BX6 residuals this closes
+
+* The run-time REQUEST_WEIGHT governor.
+* DNS resolved once per boot.
+* `ACCOUNT_CONFIG_UPDATE` ignored, and margin type and leverage never
+  asserted.
+* Departure (c): no adoption.
+* No make-before-break.
+* The open tests: a lock at boot, a restart with a position, the margin
+  and scan-failure halts end to end, `go_quiet` with a named end, the
+  probe's `countdownTime=0`, a fill rolling the ledger's day.
+
+#### Still gated
+
+* BX7b: the Demo battery, the K-probes, the body-form DELETEs (done on
+  Demo, 2026-10-09: "BX7b").
+* BX13: a live fill on the user stream; members read adopted fills.
+* K2, K5.
+* BX11: the flatten tool, observability, gate 94.
+* BX8–BX10.
+* The Stage-3 member gate.
+
+#### The reviews
+
+| round | reviewer | verdict | disposition |
+|---|---|---|---|
+| 1 | risk | BLOCK: R1 COIN-M's leverage and margin type passed when absent, and fell silent once ready; R2 PM's unified account judged after the verdict, its failures silent; R3 a session bound on classic COIN-M could never fire; 7 SHOULD-FIX, 5 NIT | all fixed, each with a test that fails without it |
+| 1 | zero-copy | FAIL: the REST cancel's query copied into the window; the SHA-256 block staged on the stack; 5 cold copies | body-form DELETEs; full blocks hashed in place; the cold ones removed or marked |
+| 1 | alloc | PASS; gate gaps (the DNS tick, COIN-M's fields, `ACCOUNT_CONFIG_UPDATE`), a quadratic walk, boot temporaries | gate 107; gates 93 and 105 widened; one pass (`NotCross`); `boxed_array` |
+| 1 | parser | FAIL: a walk disagreeing with the scan (a key named twice); a panic in `judge_mode`; fail-open saturation and missing fields | the one-reading law; codes read whole; counts exact; fields required |
+| 2 | risk | BLOCK: N1 a bounded classic arm with COIN-M judged USDⓈ-M's equity alone; N2 the anchor blind to the account mode; N3–N9 docs and nits | refused; the anchor names the mode and refuses another key or mode; all fixed |
+| 2 | zero-copy | FAIL: N1 the HMAC tail stashed in the hash's block; N2 the key copied into a block; N3 the host table; C3 a shrink | in-window padding (`finalize_in_place`); the key XORed into the pads; one table by value; the lanes reserved exactly |
+| 2 | alloc | PASS; the adoption room counted one record a row (two) | two a row |
+| 2 | parser | FAIL: NEW-1 a REST 200 read past its object; NEW-2 three readers outside the one-reading law; NEW-3 a model | whole objects; the law in every order reader and the refusal code; the model fixed |
+| 3 | risk | NEEDS-DOCS: N1–N9 fixed; 1 the throttle starved the cadence the boot accepted; 2 an unreadable 418/429 on the REST route skipped the quiet; 3 classic totals blind to USDC-margined rows; 4 the adoption text; 5–7 nits | the model's reads never throttled; the quiet and the halt; non-USDT rows refused on classic; the text fixed; all nits acted on — each with a test |
+| 3 | zero-copy | PASS; four cold nits (an unbounded anchor read, a table moved into an iterator, two markers) and the streaming hash's unmarked block | all acted on |
+| 3 | alloc | PASS; borderlines (the cycle's two events beside the adoption room; a bounds-checked zero-fill) | both acted on |
+| 3 | parser | PASS; R3-1 the refusal code read off a malformed or trailing body; three nits | whole objects for the code; an event's name once; `result` with `error` refused; the latest ban end |
+
+### BX7b — the Demo battery and the K-probes (2026-10-09) — Demo orders only; no member arms (O-BX6)
+
+Built on branch `binance` (the operator's rulings of 2026-10-08: the battery
+is its own phase; Demo orders are allowed, mainnet orders are not). Two
+operator tools over one crate-private Demo client (`cli::bn_demo`):
+`exec-smoke --binance-probe` (`cli::bn_probe`) and `exec-smoke --binance
+<um|cm|um,cm> --lifecycle` (`cli::bn_battery`). They are reached only through
+`exec-smoke`; the engine loop, `bn_live` and the engine's boot never call
+them. **This phase also changes the Live arm in two places:** the Demo
+scope's boot law (below; Live is unaffected), and three scanners that now
+refuse more (see "The scanners' Live reach").
+
+#### The Demo law (the gateway)
+
+* `Scope::Demo` boots classic only. `AccountMode::Pm` and `PmPro` are
+  refused at construction (`AssertErr::Mode`), before any request.
+* A Demo boot skips the two SAPI reads, `apiRestrictions` and
+  `portfolio/account`: Demo serves no SAPI (404, measured, P3).
+  **Residual:** a Demo key's permissions are never asserted.
+* It cannot reach Live. The scope is fixed at construction; every host is
+  checked against the scope's network (BX-16); `bn_live` builds Live only;
+  `network` accepts mainnet only. The loopback test
+  (`a_demo_boot_reads_no_sapi_and_a_live_one_refuses_without_it`) was
+  break-and-watched: a Live boot on the same venue still refuses
+  (`AssertErr::Unreadable`), with no listenKey.
+
+#### The probe is not an order path
+
+* It sends raw signed REST orders outside the risk gate, bounded by
+  construction:
+  * post-only BUYs 4 % (USDⓈ-M) or 5 % (COIN-M) behind a touch read inside
+    the row's PERCENT_PRICE band around the mark; the TradFi IoC under the
+    bid; at the row's minimum size, and never over 200 USD of notional
+    (`PROBE_MAX_USD_1E6`, checked in the one `place()`);
+  * every id `bxprobe…`, which `cid::classify` reads as foreign: never the
+    arm's own, never an orphan a boot would sweep.
+* Its account effects:
+  * **P5** sets a 30 s countdown and clears it, on each product, only where
+    nothing but the probe's own rests. The clear is always sent. A clear
+    the venue refuses after a set it accepted, or one in doubt, is a
+    failure: a 30 s cancel-all may be armed.
+  * **P6**'s cancel-all runs only when its two orders are both listed and
+    nothing else rests on the symbol, read just before it.
+  * **The end** cancels every `bxprobe` order still listed, then compares
+    the positions on BTCUSDT, TSLAUSDT and BNBUSD_PERP with the start's.
+* Its verdicts: **59** a probe failed (a body-form DELETE refused, a control
+  not refused with `-1022`, a probe that could not run); **58** something
+  is left, or the end could not read the account.
+* A signal stops places, countdowns, socket opens, price reads and every
+  wait; the end still runs and re-reads each symbol once. **The end's reads
+  are outside the drain alarm:** what the alarm cuts leaves at most
+  `bxprobe` orders, which the battery's account check refuses as foreign.
+
+#### The battery's departures from `bn_live`
+
+* **The arm, the router and the gateway are the engine's; the composition
+  is not.** No split layers (`SlotSplit`, `VenueSplit`), no alias check, no
+  journal writer thread (the journal ring is drained in-process: every
+  answer the gateway journals is the battery's evidence), no shutdown grace,
+  no thread pinning.
+* **No `exec.toml`.** Slot 2. The router's clamps: 600 USD an order, 2 000
+  USD of exposure, 100 000 USD a day, 16 orders working; a 60 % margin
+  halt. The kill switches are `exec.toml.example`'s: 5 refusals in a row,
+  5 USD of drift, a 30 s order-route gap, 3 asset refusals in a row, 300 s
+  without an agreeing reconciliation. The arm's shortest maker TTL is 5 s
+  (BX6 (h)); the TTL phase runs 5–20 s.
+* **No anchor file and no session bound.** A halt is latched in memory only
+  (no `exec.HALT`).
+* **Growth** (`may_grow`: every place and modify) stops at a signal, a halt,
+  the arm's halt word, any drift in the latest reconciliation, or a full
+  record (the tap at 50 000 frames or 64 MiB; 65 536 journal records;
+  16 384 fills). **A reduce-only close** (`may_reduce`) stops only at a
+  signal or a halt: reduce-only never adds exposure.
+* **Pricing.** A row the venue lists without a PERCENT_PRICE band prices
+  nothing; neither does a touch outside the band around the mark.
+* **The tap** is a second, read-only socket on the account's one listenKey;
+  its POST extends the key.
+
+#### The account check and the flat read
+
+* **Before the boot**, per product: one-way; single-asset (USDⓈ-M); the
+  symbol CROSSED at a leverage of at most 20 (USDⓈ-M: `symbolConfig`;
+  COIN-M: its account row, which must be listed); flat everywhere; and no
+  order but ids `cid::classify` reads as Ours or Orphan (the boot sweeps
+  orphans). Anything else is **50**.
+* **The account read is the gateway's own:** the answer through
+  `scan_rest_answer` (one object, whole), the gateway's scanner on its
+  `result`. A symbol listed twice, a symbol carrying an escape, or (COIN-M)
+  a symbol not listed refuses the read. The probe's P3 and its end use the
+  same reader.
+* **The flat read**, per lane: no order of this run's epoch on the
+  product's account, and the lane's symbol flat. Both requests are signed on
+  the main thread (the locked-page signer is not `Sync`) under an 11 s
+  `recvWindow`, then sent from one thread per lane, the lanes in parallel,
+  before K2. **58** means left, or unreadable: read the account by hand.
+
+#### The signal path, bounded
+
+* **The end after a signal** fits the 30 s drain alarm, asserted at compile
+  time: the request in flight (5 s), the arm's shutdown spin (3 s), the
+  gateway's share (5 s), its stop (1 s), the tap's join (1 s) and the flat
+  reads (2 × 5 s) = 25 s. **A boot the signal lands on:** 20 s
+  (`BOOT_TIMEOUT`) + 5 s; nothing is placed before it.
+* **After a signal:** no growth and no price read; a cancel goes once,
+  unretried; K2 and the tap's lines are skipped; threads still running are
+  left to the process's exit.
+* **Outside the bound:** core-net's blocking DNS lookup after a third failed
+  dial; the probe's end (above). A second signal kills at once; the USDⓈ-M
+  dead-man then cancels the makers within 30 s.
+
+#### The bar
+
+The plan's, judged absolutely (`bar_short`) whatever the run asked for.
+USDⓈ-M: 10 maker cycles, a post-only refusal, a TTL cancel, 6 fills, 3
+agreeing reconciliations and a halt's sweep. COIN-M: the maker refused, 4
+fills and 2 agreeing reconciliations. A clean run short of it exits with
+the short phase's code (52–57), never 0.
+
+#### The scanners' Live reach
+
+This phase changes what the engine's arm refuses:
+
+* `json::Pairs::next` refuses a key carrying `\`, in every scanner. Keys are
+  compared raw, so an escaped key would read as another key and slip past
+  the one-reading law. Binance names no key with one.
+* `rest::scan_orders` reads each of its 11 keys once, requires `price`, and
+  reads the body whole (the tail checked after its own walk). The gateway's
+  reconciliation reads every listing with it.
+* `rest::scan_server_time` reads one whole object naming the key once
+  (gate 93 now reads it).
+
+**What a refusal does in the engine:** a refused listing is a scan failure
+(BX-15). The sticky unbounded drift halts the slot until a restart: loud,
+never silent. Demo's fapi and dapi listings pass (the battery's agreeing
+reconciliations, below); papi's stay unproven until BX13. New and cold:
+`rest::scan_touch` and `rest::scan_mark` (the tools' only), and `json` is
+`pub`; `bn_demo` is `pub(crate)`.
+
+#### The evidence (Demo, 2026-10-09, the final binary)
+
+Every run below is the final binary's (`exec-smoke` from the worktree's
+release build; the wrapper exported the Demo keys; nothing printed a key,
+a signature, a listenKey or a WS API answer). The round-1 runs, on an
+earlier binary, are superseded. Reports in the vault
+(`docs/research/bx/bx7b/`, git-excluded).
+
+| run | what | result |
+|---|---|---|
+| p2 | the probe, P0–P9 | exit 0: every probe ran, the arming-precondition probes passed, nothing left |
+| b11 | USDⓈ-M, WS API, Ed25519 | exit 0, the bar met: 10 cycles, a post-only refusal (`-5022`), a TTL cancel at 5 s, 6 fills, 6 agreeing reconciliations, the halt's sweep; flat |
+| b12 | COIN-M (BNBUSD_PERP), WS API | exit 0: the maker refused locally (`NoDeadman`), 6 fills, 6 agreeing reconciliations; flat |
+| b13 | USDⓈ-M, the REST route, Ed25519 | exit 0, the bar met (as b11) |
+| b14 | USDⓈ-M, the REST route, HMAC | exit 0, the bar met (as b11) |
+| b15 | USDⓈ-M and COIN-M on one gateway | exit 0, both bars met: 10 cycles, 6 + 8 fills, 6 + 6 reconciliations |
+| b16 | USDⓈ-M, the session replaced every 40 s, 20 cycles | exit 0, the bar met; 2 make-before-break replacements, no connect failure |
+
+Every battery run: 0 reconciliations failed, 0 journal records or fills
+dropped or lost, no tap frame dropped, the shutdown sweep done
+(`Exiting`), the flat read empty. Boots took 2.5–3.8 s.
+
+**K2 on Demo** (the tap, 15 USDⓈ-M IoCs over b11 and b13–b16; evidence
+across two sockets, not proof): `TRADE_LITE` and the `ORDER_TRADE_UPDATE`
+trade reached the tap within 2 µs of each other (one read) in 10;
+`TRADE_LITE` led by 1.6–4.2 ms in 4, and by 17 ms once. Their `E` was
+equal, or within 1 ms, in 14 (23 ms once). The WS API's ACK was journaled
+for 6 of 15, each 45 µs to 245 ms before the tap's `TRADE_LITE`; for the
+other 9 the stream ended the IoC first, and an answer for an order already
+ended is applied to nothing (the BX7b battery's end-driven legs).
+
+#### The K-items, answered on Demo
+
+Measured by p2 (2026-10-09 04:26Z), the gateway's own requests:
+
+* **K19:** Ed25519 is accepted on demo-fapi and demo-dapi REST, and so is
+  HMAC (R22's fallback).
+* **K11:** `session.logon` with the Demo Ed25519 key is accepted on
+  `testnet.binancefuture.com` `/ws-fapi/v1` and `/ws-dapi/v1` (R20 does not
+  bind on Demo).
+* **K20:** USDⓈ-M's user stream delivers the order's events on `/ws/<key>`,
+  on `/private/ws?listenKey=<key>` and with `&events=ORDER_TRADE_UPDATE`
+  alike: `events=` is not required. COIN-M's `/ws/<key>` delivers them too.
+* **K16:** `POST /dapi/v1/countdownCancelAll` is accepted on Demo (set
+  30 000 and cleared, each echoing the symbol). Mainnet stays unverified,
+  so COIN-M stays IoC-only (O-BX3a) until the operator rules.
+* **K5:** `apiTradingStatus` answers `{"indicators":{},"updateTime":…}`:
+  nothing is triggered, so the `GCR`/`ICR` name stays unanswered.
+* **K17:** Demo serves no SAPI (404 on `apiRestrictions` and
+  `portfolio/account`): the account mode is unreadable there, hence the
+  Demo law.
+* **K4:** a TradFi IoC on TSLAUSDT is refused `-4411` ("Please sign
+  TradFi-Perps agreement contract fapi.") on an unsigned account.
+* **BX-19 on the Demo account:** one-way, single-asset, BTCUSDT CROSSED at
+  20.
+
+#### The arming preconditions
+
+* **The body-form DELETEs are met on Demo, on both products:** the cancel
+  by id answered 200 `CANCELED`; the same DELETE with one signature
+  character changed answered `-1022`; the cancel-all answered 200 "done",
+  with nothing of the probe's left.
+* **"A live fill seen on the user stream":** Demo's form is met (every
+  battery fill booked from the user stream on lane 4, each leg proven by an
+  agreeing reconciliation). The mainnet form stays BX13's.
+
+#### Demo's differences from mainnet
+
+* BTCUSDT's filters: step 0.0001 against 0.001, minimum notional 50 USD
+  against 100.
+* COIN-M runs on BNBUSD_PERP: Demo's coin wallet holds BNB and no BTC, so a
+  BTCUSD_PERP order is refused `-2019`.
+* Demo serves no SAPI, and its `apiTradingStatus` lists no indicator.
+
+#### Residuals
+
+* A Demo key's permissions are never asserted.
+* The probe's end, and core-net's DNS lookup after a third failed dial, are
+  outside the drain bound.
+* K5's indicator name (`GCR` or `ICR`) stays unanswered: Demo lists none.
+* PM, PM Pro and papi stay unproven: no Demo.
+* TradFi answers `-4411` until the agreement is signed (as BX7 recorded).
+
+#### The reviews
+
+| round | reviewer | verdict | disposition |
+|---|---|---|---|
+| 1 | risk | BLOCK: R1-1 the end's drain bound was false (the arm's 3 s spin uncounted; waits deaf to the signal); R1-2 the kill switches unset; R1-3 a foreign-id test looser than the gateway's; R1-4 P6 could pass vacuously; R1-5 the bar judged against the spec; R1-6 the probe deaf to a signal mid-step; R1-7 P5's clear; R1-8 the notional ceilings; R1-9 three gaps | all fixed; the bound asserted at compile time |
+| 1 | zero-copy | FAIL: ZC-1 the doctrine line past copy-audit's 60-line window; 4 NITs | fixed; the markers bounded; `bn_demo` `pub(crate)` |
+| 1 | alloc | PASS; 3 notes | the composition doc corrected |
+| 1 | parser | FAIL: the flat read failed open on a symbol listed twice; COIN-M's BX-19 silent when unlisted; bodies read past their object; 7 SHOULD/NIT | one account reader; touch and mark in `exec-binance`; `scan_orders`' one-reading law; caps; checked arithmetic |
+| 2 | risk | NEEDS-DOCS: the scanners' Live reach; 5 NITs | this entry; an 11 s `recvWindow`; the flat read before K2; one re-read; 58's text; a cancel after a signal |
+| 2 | zero-copy | PASS; 2 NITs, 2 notes | the markers; the fill booked from its slot; one pass |
+| 2 | alloc | PASS; 2 SHOULD (low), 1 NIT | the key read once; one pass; gate 93 reads the clock's answer |
+| 2 | parser | PASS; 5 NITs | escaped row symbols; no band; no quantity; the fuzz symbol; G1 |
+| 3 | risk | NEEDS-DOCS: the code approved | this entry; the gates; the Demo evidence on the final binary |
+| 3 | zero-copy | PASS | — |
+| 3 | alloc | PASS | — |
+| 3 | parser | PASS (a depth note) | noted at `ends_whole` |
+
+### BX11 — kill switches, observability, the operator tools, the laws (2026-10-09) — no member arms (O-BX6)
+
+Built on branch `binance` (plan §5 BX11; the BX11 build plan of
+2026-10-09). Nothing here arms a member or places a mainnet order: Demo
+orders only (the operator's ruling of 2026-10-08), and the session never
+runs an account tool on mainnet. It reaches the engine only through a
+merge to `main`, a release build and a restart — the operator's word.
+The laws are restated as built above ("BX — the Binance execution
+laws"); the operator's procedures are `docs/binance-runbook.md`.
+
+#### What changes on the live arm
+
+* **The commission — a defect fixed (BX-14).** A fill booked off
+  `TRADE_LITE` (the first report in 14 of 15 Demo IoCs, K2) journaled a
+  commission of 0, and the `ORDER_TRADE_UPDATE` that carries `n` was then
+  deduplicated away: no fee could ever be measured. Every trade now
+  journals one **`J_FEE`** (kind 10) from the first update that reports
+  it, whichever report booked the fill (`TidRing::see` owes the fee once):
+  the price, the notional (×1e9, in the row's settlement asset) and the
+  commission (×1e9, in its own asset `N`), and in `code` the maker bit,
+  the commission asset judged against the row, whose order it was, the
+  product, dated and TradFi.
+  `J_FILL.c` is 0 now: the commission lives in `J_FEE` alone. The update's
+  `N` is read once per frame (gate 93 reads it).
+* **Events of no kind the arm acts on are counted (BX-15).** The
+  gateway's catch-all dropped them uncounted, though the scanner's doc
+  said "counted": `GW_EVENTS_OTHER`, `events_other`.
+* **The anchor's retry (S8).** An anchor note the journal ring refused is
+  flagged and offered again on every pulse until it lands; the flag
+  (`anchor_unsaved`) is published. The ring's capacity is a type
+  parameter (`JournalTx<const N>`, `BnGateway<…, J_N>`); the engine keeps
+  1 024.
+* **The published words that misread (`LiveArmCounters`, `/state`
+  `exec.arms.binance`):** `sent_unanswered` is now the orders put in
+  doubt (it was every order in flight), `refused_stale` a row bound but
+  not live (it also counted unbound ones), `sweep_stalled` the stranded
+  sweeps and `budget_remaining` the request weight's headroom (both read
+  0 for Binance before).
+
+#### Observability
+
+* **`BinanceArmReport`** (600 B, pinned; `OrderDispatch::binance_arm_report`,
+  forwarded by `Option`, `RoutedDispatcher`, `SlotSplit` and
+  `VenueSplit`): the arm's verbs, the gateway's tallies, the
+  refusals by reason, the levels (ready, the routes, the dead-man, the
+  clock, the anchor, in flight, in doubt, the congestion, the halt, the
+  sweep, the windows, the margins), the latencies — one histogram walk a
+  report, round robin (each about 1 µs; never seven at once on the engine
+  thread). Filled cold, once a second, 0 B/op (gate 92, in the engine's
+  own `SlotSplit` shape, its trackers holding samples).
+* **`/state` `exec.arms.binance_gw`** (`BinanceGwSnapshot`, 344 B;
+  `EngineSnapshot` 31 808 B of 32 768), **`/metrics` `engine_exec_bn_*`**
+  (41 counters, the refusals by reason among them, and 31 gauges), and the
+  TUI's **`bn_chip`** (the arm's state; orders working and in doubt,
+  refusals, the halt, the anchor — alerts only when non-zero).
+
+#### The operator tools (O-BX9, plan §3.12)
+
+Reached only through `exec-smoke`; the engine loop, `bn_live` and the
+engine's boot never call them. **Classic accounts only** (`fapi`,
+`dapi`): on PM and PM Pro the operator sets and closes in the app. A
+change with no answer — none, or the venue's own "unknown" as the
+gateway's classifier reads it (a 5xx, `-1007`) — has an unknown outcome:
+the tool reads the account and judges what holds; nothing is resent
+blind.
+
+* **`exec-smoke --binance-setup <um|cm>`** (`cli::bn_ops::setup`): reads
+  what the boot asserts (BX-19), then changes only what differs — the
+  one-way position mode, the single-asset mode (USDⓈ-M), each
+  `--bn-symbol` CROSSED at a leverage within `--bn-leverage-cap` — and,
+  with `--bn-sign-tradfi`, the TradFi agreement. Every change's answer is
+  printed; a refusal fails the tool (61); the settings are read and
+  judged again at the end. `--bn-reassert` sends every change even where
+  the read says it holds (each change's own "no need to change" answer
+  counts as held: `-4059`, `-4171`, `-4046`): how each change is proven
+  on Demo. COIN-M in hedge mode reads its symbols only once one-way holds:
+  their changes are decided then (a dry run says so). A TradFi agreement
+  with no answer fails the tool (nothing reads it back).
+* **`exec-smoke --binance-flatten <um|cm>`** (`cli::bn_ops::flatten`):
+  refuses a `--bn-symbol` the venue does not list (1), and while an order
+  of the arm's rests (62) unless `--bn-cancel-first`, which cancels them
+  by id first (on COIN-M the arm rests none, so the guard cannot see a
+  running engine: it warns); reads the positions again after the cancels;
+  then per non-zero position (or `--bn-symbol`'s) a reduce-only IoC of
+  the position (whole steps, at most LOT_SIZE's maximum), through the
+  touch, inside the row's band, the position read again, up to three
+  tries, the distance doubling from `--bn-close-bps`; a close refused for
+  having nothing to reduce (`-2022`) is judged by that read. A position
+  that cannot be priced or closed is reported and the others still close.
+  Its verdict is a fresh read of the product's positions (or the named
+  one's): 63 if one stays open. `--bn-cancel-first` cancels the arm's
+  orders on every symbol of the product. It never clears a halt.
+* **Demo by default.** `--bn-network mainnet` reads the live account with
+  the engine's own key; it changes it only with `--confirm`, which mints
+  the sealed `MainnetVerb` (the `exec_hyperevm::MainnetAuthority`
+  precedent). Without it the tool reads, prints every change, cancel and
+  close it would send (each close's first try priced at the touch; one
+  it cannot price as `would_skip`) and sends none (64). The client enforces it too: on a mainnet host a request
+  that changes anything (a template not a GET) leaves only signed through
+  `Rest::sign_change` with the word — whatever path rendered it
+  (`a_mainnet_host_sends_no_change_without_the_word`). A tool's flags are
+  its own: each tool names every other `exec-smoke` flag as a conflict
+  (`BN_TOOL_CONFLICTS`; clap waives a `requires` whose target conflicts
+  with a flag present, so a battery flag beside a tool once parsed and
+  was ignored — `--bn-um-symbol ETHUSDT` beside a flatten closed every
+  position), pinned by `each_tool_conflicts_with_every_flag_not_its_own`;
+  and a tool's own flag needs its tool, beside any mode
+  (`a_battery_flag_beside_a_tool_is_refused`).
+* **`multivenue-engine bn-fees <run-dir>…`** (`cli::bn_fees`, BX-14):
+  read-only; per class the trades, the notional, the commission, the rate
+  (its sign its own) and whether N (30) is reached; the `perp` and `dated`
+  rows the measurement supports, rounded up, a rebate as 0; it never
+  writes `fees.toml`.
+* **Exit codes** 60–64 (`bn_ops`), 65 the gap drill once the gateway is
+  dead (`bn_demo`; a failure before the kill is the cycle's, 52), each
+  named by `scripts/exec-smoke.sh`, which also warns before a mainnet run
+  and names the account (Demo or live) in its pass and abnormal-end
+  lines.
+
+#### The drills
+
+| drill | where | proof |
+|---|---|---|
+| The gateway dies under resting makers | loopback | `a_dead_gateway_halts_ws_gap_and_the_venues_countdown_cancels_the_makers`: `WsGap` at the slot's `ws_gap_ms`; the loopback venue's countdown fires and cancels the makers |
+| The same | **Demo** | the battery's `--bn-drill gap`: two makers rest under the dead-man; the gateway thread stops without its sweep; the venue lists neither within the countdown + 10 s, each one's status reads CANCELED (the read retried to the deadline), and no sooner than the countdown less two heartbeats (65 if not — a maker filled, cancelled too soon or not at all; a failure before the kill is 52; after a signal nothing more is read, the makers cancelled by id) |
+| The operator's flatten on a real position | **Demo** | the battery's `--bn-drill flatten` (`--binance um` or `cm`): one IoC opens a position, reconciled; the gateway stops; `bn_ops::flatten` closes it with its own reduce-only IoC and reads flat (if not: its code, 60–63; before the stop, 57, 56 or 52) |
+| Once a drill stopped the gateway | **Demo** | unless a signal came, the end runs the operator's flatten on each lane's symbol (the arm's orders cancelled by id first), then reads the account flat (58 if not) |
+| Reconciliation withheld | loopback | `a_withheld_reconciliation_halts_a_classic_arm_stale`: `ReconStale` |
+| A 429 | loopback only | `BudgetFloor`, the reason asserted (the departure: a breach on Demo risks an IP ban the running engine's market data shares) |
+| A margin ratio, a scan failure | loopback | `the_margin_and_scan_failure_halts_end_to_end`: `MarginRisk`, `ReconDrift`, the reasons asserted |
+
+#### The evidence (Demo, 2026-10-09 21:26–21:31Z, the final binary)
+
+Every run below is the final binary's (`exec-smoke` from the worktree's
+release build; the wrapper exported the Demo keys). Nothing printed a key,
+a signature or a listenKey; the tools print the venue's REST answers,
+which carry none. The runs of 20:25Z, on the binary of the round-1
+fixes, are superseded; they answered the same.
+
+| run | what | result |
+|---|---|---|
+| probe | `--binance-probe`, P0–P9 | exit 0: every probe ran, nothing left |
+| battery | `--binance um,cm --lifecycle`: both products on one gateway, the WS API, Ed25519 | exit 0, both bars met: 10 cycles, 6 + 13 fills, 6 + 6 agreeing reconciliations, the halt's sweep; **19 fills journaled and 19 `J_FEE` records, one per trade** (BX-14's defect fixed on the venue); flat |
+| setup | `--binance-setup um --bn-symbol BTCUSDT` | exit 0: one-way, single-asset and BTCUSDT CROSSED at 20 read and judged held; nothing sent |
+| setup, reasserted | the same with `--bn-reassert` | exit 0: `-4059` (one-way), `-4171` (single-asset) and `-4046` (margin type) each counted as held; the leverage answered 200 at 20; read back held |
+| the TradFi agreement | `--bn-sign-tradfi` | exit 0: 200 `SUCCESS` (signed on the first Demo run; the venue answers the same again) |
+| COIN-M setup, reasserted | `--binance-setup cm --bn-symbol BNBUSD_PERP --bn-reassert` | exit 0: `-4059` and `-4046` held; the leverage answered 200 at 20; read back held |
+| flatten, flat | `--binance-flatten um` | exit 0: no position, nothing sent |
+| flatten, a typo | `--binance-flatten um --bn-symbol BTCUSDTX` | exit 1: the venue lists no such symbol; nothing sent |
+| the flatten drill, USDⓈ-M | `--binance um --lifecycle --bn-drill flatten` | exit 0: one IoC opened 0.0008 BTCUSDT long (reconciled); the gateway stopped; the flatten closed it with one reduce-only IoC on its first try and read flat; the end's flatten found nothing; 1 fill and 1 fee journaled |
+| the flatten drill, COIN-M | the same with `--binance cm` | exit 0: 6 BNBUSD_PERP contracts long (3 fills, 3 fees journaled), closed on the first try; the guard's COIN-M warning printed |
+| the gap drill | `--binance um --lifecycle --bn-drill gap` | exit 0: the venue's dead-man cancelled both makers 30.918 s after the kill, each one's status CANCELED with nothing executed; the end's flatten found nothing; flat |
+
+Every battery and drill run: 0 reconciliations failed, 0 journal records
+or fills dropped or lost, no tap frame dropped, the flat read empty.
+
+#### Residuals
+
+* Found while carrying the laws (each recorded at its law): the official
+  connectors' vectors never landed (BX-3); `recvWindow` is configured, not
+  measured, and 5 000 is accepted (BX-6); an orphan on a row the boot did
+  not bind holds the boot in `Recon` until it times out (BX-9); a revoked
+  key's `-2015` halts as a reject streak or a stale reconciliation, never
+  `VenueLock`, and a mid-session account-mode change goes unseen (BX-19);
+  BNB burn is neither asserted nor set (BX-14).
+* Tests still missing (at their laws): a `-1021` through the resync, a
+  lost place answer never resent, a foreign fill, a venue-originated
+  fill's owner, a stream `MARGIN_CALL` end to end — each added by BX12 (the
+  lost answer on the WS API route; the margin call on the classic USDⓈ-M
+  stream: risk-policy "BX12").
+* The account tools' mainnet path is proven by the client's guard (a
+  change to a mainnet host leaves only signed with the word), by the
+  dry run's ordering (read, print, return 64 before any change) and by its
+  Demo twin; its first mainnet use is the operator's.
+* The tools are classic-only; PM and PM Pro accounts are set and closed in
+  the app.
+* `bn-fees` is proven on synthetic journals only: no run journals `J_FEE`
+  until a member arms (BX13), so no rate is measured yet.
+
+#### BX6 and BX7 residuals this closes
+
+* "`/state` omits jobs dropped, doubts raised, fills deferred, journal
+  drops, refusals by reason, budget and lock counts and the anchor flag"
+  ("BX6"): `exec.arms.binance_gw`.
+* "The anchor's journal-ring retry (S8) has no test" ("BX7"):
+  `an_anchor_the_journal_refused_is_flagged_and_offered_until_it_lands`.
+* "There is no flatten tool before BX11", and "Signing [the TradFi
+  agreement] is `exec-smoke --binance setup`'s job" ("BX6", "BX7"): the
+  account tools.
+
+#### Still gated
+
+* **O-BX6:** no member arms before BX13.
+* BX12's gates (gate 94, the TLS loopback set), then BX13's ramp; BX8–BX10's
+  products.
+
+#### The reviews
+
+| round | reviewer | verdict | disposition |
+|---|---|---|---|
+| 1 | risk | NEEDS-DOCS: R1-1 the flatten judged a stale read; R1-2 a named symbol the venue does not list; R1-3 COIN-M hedge mode's rows made up; R1-4 a dry run that printed no order; R1-5 only the tool kept a change off mainnet; R1-6 classic-only unsaid; R1-7, R1-8 the gap drill's 65 before the kill, and unlisted read as cancelled; R1-9 an unknown outcome; R1-10 a "no need" code held for any change; R1-11 the symbol unvalidated; R1-12 docs | all fixed: a fresh read decides; exit 1 before anything; `Settings.unread`; `would_cancel` and `would_close`; the client's guard (`a_mainnet_host_sends_no_change_without_the_word`, break-and-watched); 52 before the kill, the statuses read; `Sent::{Unsent, Lost}`; `Change::already` per change; `is_symbol` |
+| 1 | zero-copy | PASS; 7 notes | the counters one literal; the markers' sizes; the doctrine wording; the chip written in place |
+| 1 | alloc | PASS; 5 notes | gate 93 counts `UE_OTHER` and drives S8 on `JournalTx<2>`; gate 43's three arms; gate 92 in the engine's `SlotSplit` shape, its trackers holding samples; one histogram walk a report |
+| 1 | parser | FAIL: P-1 the combined form did not re-base the commission's asset (BLOCK); P-2 a battery flag beside a tool parsed and was ignored (BLOCK); P-3…P-10 | both BLOCKs fixed and break-and-watched (`the_combined_form_rebases_its_spans`; `BN_TOOL_CONFLICTS`, `each_tool_conflicts_with_every_flag_not_its_own`); `bn-fees`' rows, the rate's sign, a journal read once; the settlement asset matched whole; the inverse notional checked; `TRADE_LITE`'s commission zeroed; the close in whole steps |
+| 2 | risk | NEEDS-DOCS: R2-1…R2-10 — the flatten drill's exit; the end after a drill; the venue's own "unknown" and `-2022`; one position's failure stopped the rest; the kill flag set late; the guard bypassable by rendering again; the gap drill's status reads; the asked leverage unjudged | the end's flatten after a drill; CANCELED only, and no sooner than the countdown less a heartbeat; `gov::classify`; `close_position` per position; `kill_gateway` sets the flag at once; `WordGuard`; the reads retried to the deadline; `judge` the asked leverage |
+| 2 | zero-copy and alloc | PASS; 3 notes | the latency cells; `bn_chip`'s `String` kept (every TUI chip's idiom, on the TUI thread) |
+| 2 | parser | PASS; 5 notes | the tools' own flags `requires = "binance_tool"` (break-and-watched); the close at most LOT_SIZE's maximum |
+| 3 | risk and parser | NEEDS-DOCS: the code approved; R3-1 the dry run silent on a position it cannot price; R3-2 the gap drill's floor one heartbeat short of a covered dead-man; R3-3 reads after a signal; R3-4 five doc lines | `would_skip`; two heartbeats; nothing read after a signal (the makers cancelled by id), the flatten drill not started; this entry, the runbook and the wrapper's text |
+
+### BX12 — the gates: gate 94 on a real TLS socket (loopback), the laws' open tests, fuzz (2026-10-09) — no member arms (O-BX6)
+
+Built on branch `binance` (plan §5 BX12; the BX12 build plan of
+2026-10-09). Loopback only: no venue order, no account tool run. Nothing on
+the live path changes — BX12 adds gates, tests and a test-only module — and
+it reaches the engine only through a merge to `main`, a release build and a
+restart: the operator's word.
+
+#### Gate 94 — the arming precondition, met on this tree (re-run on the tree armed, runbook §8)
+
+* **What it pins** (`crates/bench/tests/alloc_assertions.rs`:
+  `binance_gateway_round_trip_allocates_only_rustls_record_buffers`, 94;
+  `binance_rest_route_round_trip_allocates_only_rustls_record_buffers`,
+  94b): the REAL `BnGateway`, booted as the engine boots it and stepped
+  against the scripted venue in a child process over rustls, the engine end
+  driven raw (the arm is gate 92's). A round — a post-only maker and a
+  crossing IoC (bought, then sold, round by round) in one burst, then the
+  maker's cancel — allocates exactly the TLS records rustls seals and
+  opens: **11** on the WS API route (two sealed, nine opened), **12** on
+  the REST order route with HMAC (three requests sealed and answered, six
+  stream frames). Measured alone, on gate 94: the gateway's own TTL
+  cancel, **6**, no REST job answered; the halt's sweep with the
+  reconciliation cycle that confirms it, **7**, one REST job answered (the
+  cycle alone: four records). Everything else on the path — the burst,
+  the desk, the deadline queue, the render (the WS API's frames ride the
+  session's logon, no signature an order; 94b signs each request with
+  HMAC), the frames, the scans, the trade-id ring, `J_FEE`, the journal,
+  lane 4, the events, the 100 ms pulse — is 0 B. The counts are the same
+  in the cloud (debug, Linux) and on the Mac (release, `make
+  alloc-assert`). A break-and-watch (an 8-byte `Vec` in `on_place`)
+  failed the rounds at 13 and the TTL at 7.
+* **What it does not pin:** a WAN's records (an inbound burst over rustls'
+  4 KiB receive window costs more, as gate 87b says; the largest here is
+  about 2.3 KB); a redial's handshake; the clock's round (a 60 s constant,
+  the gate's run stays clear of it, asserted) and the dead-man's renewal
+  (its heartbeat set past the run) — REST jobs the rounds' window asserts
+  absent; the REST route's TTL cancel and sweep (94b runs the rounds
+  only); COIN-M's lane and Portfolio Margin on a socket (their renders and
+  scans are gates 105 and 106).
+* **The plan's seven named alloc gates** are these numbers:
+  `bn_arm_submit` 92; `bn_gateway_render_flush` 93 and 94;
+  `bn_wsapi_response_scan` 93, 104, 105; `bn_user_event_to_fill` 93, 105,
+  106 and 94 (`book_fill`, lane 4, `J_FEE`); `bn_recon_compare` 93, 105,
+  106 and 94's sweep; `bn_margin_ratio` 92, 105, 106; `bn_rest_render_sign`
+  86, 93, 104 and 94b.
+
+#### One scripted venue
+
+`exec_binance::testvenue` (feature `testvenue` = `loopback`, `rcgen`,
+`ring`; only dev-dependency edges enable it: it is off in any build that
+compiles no tests — the deploy's `cargo build --release -p cli` — and a
+build that compiles the tests links it in, inert: no production path calls
+it) is the venue the end-to-end tests ran against, moved
+out of `tests/bn_e2e_loopback.rs` — not copied — so gate 94 runs the same
+one. It exports its certificate (`cert_der`) for a client in another
+process and gains two knobs, `refuse_place` and `lose_place_answer`
+(the WS API's; on the REST order route a lost answer reads as a 503
+`-1007`).
+
+#### The TLS loopback set
+
+The plan's four names (`bn_wsapi_tls_loopback`, `bn_userstream_loopback`,
+`bn_rest_loopback`, `bn_gateway_e2e_loopback`) are one file,
+`crates/exec-binance/tests/bn_e2e_loopback.rs`: 39 tests of the real gateway
+over rustls against one venue serving the WS API, the user streams and
+REST.
+
+#### The laws' open tests, closed
+
+| law | e2e test | what it proves |
+|---|---|---|
+| BX-6 | `a_1021_resyncs_the_clock_and_its_place_is_never_resent` | a `-1021` starts the clock's round (four reads); the place is refused, counted and never re-sent; the next place trades |
+| BX-7 | `venue_originated_fills_go_to_the_owner_and_a_strangers_to_no_one` | the orphan's (its id naming another slot), a liquidation's (`CALCULATED`), an ADL's and a settlement's fills go to the owner slot, the settlement alone flagged (it closes the position); a stranger's trade is counted and booked to no one |
+| BX-11 | `a_lost_place_answer_is_never_resent` | on the WS API route, a place the venue applies and never answers: the request's deadline drops the session, `order.status` resolves the doubt, the venue saw one `order.place` |
+| BX-20 | `a_stream_margin_call_halts_the_slot_and_rereads_the_account` | the classic USDⓈ-M stream's `MARGIN_CALL` halts `MarginRisk` with a healthy ratio, the lane's account is re-read at once (two reads before the confirming listing: the call's, the cycle's), the halt's sweep confirms clear |
+
+Each was break-and-watched — seven breaks, each failing its test: the
+`-1021`'s clock round dropped; a stream trade's settlement flag dropped;
+`CALCULATED` no longer a trade; an orphan booked to the slot its id names;
+the in-doubt status query dropped; the margin call's flag dropped; the
+call's immediate re-read dropped.
+
+#### Fuzz and licences
+
+`bn_user_event` also judges every order update's commission asset (`N`,
+the raw span) with `journal::fee_asset` against five rows — BTCUSDT,
+BTCUSDC, a dated BTCUSDT, BTCUSD_PERP and BNBUSD_PERP — by an independent
+oracle (the USDC branch, and the settlement asset before BNB).
+
+The 13 Binance targets, 300 s each on the Mac, no crash: `bn_rest_answer`
+33.5 M, `bn_rest_body` 24.1 M, `bn_wsapi_frame` 34.0 M, `bn_cid` 37.5 M,
+`bn_mode` 25.4 M, `bn_account` 28.0 M, `binance_exchange_info` 11.1 M
+(COIN-M's discovery among it), `binance_eapi` 10.4 M,
+`binance_eapi_mark_array` 17.1 M (the plan's `bn_eapi_mark_array`),
+`binance_mark_price` 193.6 M and `binance_book_ticker` 165.6 M (dstream's
+frames too), `binance_agg_trade` 38.4 M runs; `bn_user_event` 29.7 M on the
+five-row oracle (26.8 M on its first, three-row form).
+
+Licences: `cargo deny check licenses` passes, and `cargo about generate`
+writes notices identical to the tracked `THIRD-PARTY-NOTICES.md` (written
+to `target/`, compared, not committed); `make license-check` OK.
+
+#### Residuals
+
+* Gate 94 pins the loopback's record count. The live path's — a WAN's
+  record sizes, a redial's handshake — is BX13's to observe.
+* COIN-M's lane and Portfolio Margin have no live-socket gate of their own.
+* CLAUDE.md's gate line reads 117/117: 119/119 (+1 ignored helper) needs
+  the operator's word.
+
+#### Still gated
+
+* **O-BX6:** no member arms before BX13, whose other preconditions stand
+  (runbook §8): a live fill seen on the user stream, the members reading
+  adopted fills as inventory, the worker's PMLR reader of the fill flags;
+  and gate 94, 94b and the loopback set passing on the tree that is
+  armed.
+
+#### The reviews
+
+| round | reviewer | verdict | disposition |
+|---|---|---|---|
+| 1 | risk | NEEDS-DOCS: R1-1 the margin call's re-read unproven (the sweep's cycle and the half-open probe read the account too); R1-2 the runbook's "met" (history; a live socket; USDⓈ-M only); R1-3 a member precondition missing from §8; R1-4 the orphan's id named the owner's slot; R1-5 BX-8's foreign-fill line; R1-6…R1-9 the gate's wording, "every `cargo build`", BX-6's `-5028`, the knob on REST | the BX-20 test reworked (no maker; two account reads before the confirming listing; break-and-watched); §8 rewritten (on the tree you arm) with the members' bullet; the orphan names slot 5 (break-and-watched); BX-8 narrowed; the wording fixed |
+| 1 | alloc | NEEDS-DOCS: AL-1 the timers' wording (the pulse; the 60 s clock a constant); AL-2 the TTL and sweep windows asserted less than the rounds'; AL-3…AL-8 the signature's wording, 94b's stall, the windows' scope, an IoC that never sold, a notional, the plan | the clock asserted clear before each window; each window's counts asserted; the IoC alternates sides; the wording fixed; the plan's log records the departures |
+| 1 | zero-copy | PASS; ZC-1 the copy-audit header's doctrine classes lag the practice (a feature-gated test fixture) | the operator's call; unchanged |
+| 1 | parser | NEEDS-DOCS: P-1 no `CALCULATED` frame anywhere (a liquidation's type); P-2 as R1-1; P-3 the knob on REST; P-4 the oracle's rows and header | the liquidation sent `CALCULATED` (break-and-watched); the knob documented; five rows; the header |
+| 2 | risk | NEEDS-DOCS: R2-1 COIN-M's and PM's margin calls not driven; R2-2 the REST route's unknown place outcome; R2-3 the Mac's counts unproven on this tree; R2-4, R2-5 wording | BX-20's and BX-11's Open lines; the Mac's release run on the final tree; the wording |
+| 2 | alloc | NEEDS-DOCS: AL2-1 `EVT_POSITION` exercised, not counted; AL2-2 the side order; AL2-3 the re-open counter's reach; AL2-5 the sweep's retirement | counted and asserted every round; the wording |
+| 2 | parser | PASS; P2-1 run the oracle before the batch; P2-2 the plan's target names | run on the Mac (29.7 M); the plan's record maps the names |
+
+### BX8 — spot, including bStocks, IoC-only (2026-10-10) — Demo orders only; no member arms (O-BX6)
+
+Built on branch `binance` (plan §5 BX8; the BX8 build plan of 2026-10-10,
+the project doc `claude/bx8-build-plan-2026-10-10.md`). The code was built
+and its tests run in the cloud while the operator's laptop was off; the
+Mac's gates, the Demo exit runs and the one `BX8:` commit came after.
+Nothing here arms a member or places a mainnet order: Demo orders only
+(the operator's ruling of 2026-10-08). It reaches the engine only through
+a merge to `main`, a release build and a restart — the operator's word.
+**Scope:** spot × classic, IoC-only, on a dedicated account, one owner
+slot; a bStock (TSLABUSDT and its kind) is a spot row the permission check
+judges. The laws are restated as built above ("BX — the Binance execution
+laws"); their Tested and Open lines carry this entry.
+
+#### What is built and how it reaches the engine
+
+* **The gateway** (`crates/exec-binance`) gains spot's lane, its scanners,
+  its reconciliation and its ORDERS governor; the arm admits a spot row
+  IoC-only, on spot's own pool.
+* **The boot** (`cli::bn_live`) binds `[exec.binance] products` naming
+  `spot` — alone, or beside `usdm` and `coinm` — from the universe's
+  `[binance] spot` list and the boot discovery's spot rows (`paper.rs`,
+  `bn_spot_rows`): spot[0], the M1 anchor, under its flat id 7 whatever
+  its name, routed to Binance by the route alias (`binance:btcusdt`); the
+  rest under Binance's own ids; each with a ledger row of `LAW_SPOT`. With
+  spot armed, the spot market data's hosts (`BINANCE_WS_HOST`,
+  `BINANCE_REST_HOST`) join BX-16's check.
+* **The Demo tools**, reached only through `exec-smoke`: the battery's
+  `--binance spot --lifecycle` (`cli::bn_battery`) and the probe's
+  `--binance-probe spot` (`cli::bn_probe`, K1's Demo half). The battery
+  now composes the router over `VenueSplit<NullLiveDispatcher, BnArm>`
+  (the engine's Binance shape without its slot splits) and routes by the
+  engine's own alias table (`exec_boot::route_aliases`), so a spot order
+  on the anchor's id 7 reaches the arm only through the alias. Its slot's
+  instance cap is 2 000 USD plus `--bn-adopt-usd`: the engine's law is
+  adoption within the slot's instance cap, and a spot BUY is judged on the
+  whole holding, the adopted balance included.
+* **The spot lane is built only when a slot arms spot**; a row-less arm
+  keeps USDⓈ-M's, as before. What changes for the futures lanes and the
+  engine's discovery is "Beyond spot", below.
+
+#### The spot lane
+
+* `LANES` = 3 and `LANE_ORDER` = `[USDM, COINM, SPOT]`: a lane per product
+  the wire table binds, spot last. A spot-only arm builds no futures lane,
+  so lane 0, the clock's, is spot's: the clock reads `/api/v3/time`.
+* **One WS API order pair** (make-before-break, as the futures') on
+  `ws-api.binance.com` `/ws-api/v3` (Demo: `demo-ws-api.binance.com`).
+  Each session sends `session.logon` (Ed25519), then
+  `userDataStream.subscribe` on the same socket. Only the subscription's
+  200 naming a `subscriptionId` makes the session live
+  (`wsapi::scan_subscribed`): a refused logon or subscription, or a bare
+  200, drops it (`ws_failed`, the redial machine). On spot "order up"
+  means "user data up".
+* **The user data rides the order socket.** Each event comes framed
+  `{"subscriptionId":N,"event":{…}}`: `scan_answer` tells it from an
+  answer (`WsAnswer::user`, the `event` span) and the gateway reads the
+  event in place (`userstream::scan_spot_event`). There is no listenKey
+  (the venue removed spot's on 2026-02-20): the lane holds no stream
+  (`has_us` false). `eventStreamTerminated` ends the subscription: the
+  session is dropped, and a new one logs on and subscribes before it is
+  live. A lane live again after a gap with no session puts its orders in
+  doubt (BX-11) and runs the reconciliation at once: Binance replays
+  nothing the lost session would have carried.
+* **REST.** Spot's host is `sapi`'s (`api.binance.com`; Demo
+  `demo-api.binance.com`). Its jobs: `/api/v3/time`; `/api/v3/openOrders`
+  (signed, no symbol: the listing); `/api/v3/myTrades` (signed: the day
+  since 00:00Z, and by `orderId` an order's trades,
+  `JobKind::OrderTrades`); `/api/v3/ticker/price` (public: the adoption's
+  price, `JobKind::Price`). Every other template slot names
+  `/api/v3/ping` and is never started.
+* **The account** is read on the order session: `account.status` with
+  `omitZeroBalances` (a Demo account lists hundreds of assets).
+* **The boot.** The futures assertions (one-way, single-asset, the symbol
+  configuration) skip the spot lane. The key's (SAPI; not on Demo) asks
+  `enableSpotAndMarginTrading` when spot is armed and `enableFutures` only
+  when a futures lane is. A spot-only Demo arm has no assertion to ask
+  and moves on at once; with no listenKey to ask, the sockets open.
+* **Events.** An `executionReport` reads into the futures' `UserEvent`
+  (`UE_ORDER`), so `on_order_event`, `book_event`, `book_fill` and `J_FEE`
+  run unchanged. Any other event — `outboundAccountPosition`,
+  `balanceUpdate`, … — is counted (`GW_EVENTS_OTHER`), never booked: the
+  cycle reads the balances.
+
+#### IoC-only (BX-17)
+
+* The place is `order.place` `LIMIT` + `IOC`, `newOrderRespType=ACK`, the
+  STP `[exec.binance] stp_mode` names, never `reduceOnly`.
+* The arm refuses what spot cannot carry. A maker is `NoDeadman`: spot
+  rows are bound `INST_NO_DEADMAN` (spot has no dead-man, K8). A
+  reduce-only order is `Flags`: the venue has none, and a spot sell is
+  bounded by the holding (the router's law). Cancel and modify are `Verb`,
+  as on every IoC-only row.
+* **Not built** (no dead code): amend, cancelReplace, `order.cancel`,
+  `openOrders.cancelAll`. They arrive with a spot dead-man or a ruling
+  allowing spot makers. A halt's sweep cancels makers only: on spot it has
+  nothing to send, and the venue's listing confirms it clear.
+* **A stray refuses the boot.** An order of ours listed open on a bound
+  spot row before Ready — another epoch's (an orphan) or this epoch's
+  unknown to the boot (a ghost) — refuses the boot
+  `BootErr::SpotStray(row)`: no spot cancel exists, so the operator
+  cancels it in the app. After Ready a spot stray is counted, never
+  cancelled, and the slot stays unreconciled (fail closed). One on a spot
+  symbol this boot did not bind is counted, not named: the boot holds in
+  `Recon` to its timeout, as on futures (BX-9 (b)). A stranger's resting
+  order is foreign: reported every cycle, never cancelled.
+
+#### Products and refusals
+
+Spot is classic-only, rides the WS API with an Ed25519 key, and owns its
+assets. Each refusal comes before any order:
+
+| refusal | when | where |
+|---|---|---|
+| "a ruling (spot beside Portfolio Margin or PM Pro)"; `BootErr::Product(PRODUCT_SPOT)` | spot under `pm` or `pm_pro`: unproven (no PM Demo exists) and outside the unified account's equity | `mode::built` in `exec_boot::check_binance`; the gateway |
+| by name; `BootErr::SpotRoute` | spot on `order_transport = "rest"` or with `signing = "hmac"`: spot's user data exists only on a WS API session, whose logon takes Ed25519 alone (HMAC on the WS API route is refused `Signing` first, R22) | `check_binance`; the gateway |
+| by name | a spot row not quoted in USDT: every cap, the adoption and the drift halt are USD, which a spot row's figures are only when it is quoted in USDT (the risk review's BLOCK) | `bn_live::bind_table` |
+| `BootErr::SpotAsset(row)` | a base asset armed twice, a base another armed row's quote, or past 64 spot rows (`SPOT_ASSETS_MAX`): the reconciled asset must be the row's | the gateway |
+| `BindErr::BadAsset` | a spot row whose discovery names no base or quote asset (or one past 16 bytes, kept as unknown, never cut) | `InstTable::bind` |
+| by name | a session bound (E7) on an arm with spot: the spot wallet has no USD equity the bound reads (COIN-M's precedent) | `check_binance` on the products; `bn_live` on the rows bound |
+| `BootErr::Assert(NoTradePermission)` | the key does not trade spot (`enableSpotAndMarginTrading`; Live only) | `mode::judge_key` |
+| `BootErr::Assert(SymbolNotPermitted)` or `(CannotTrade)` | the permission check, or `canTrade: false`, before Ready (below) | the first account read |
+| `BootErr::SpotStray(row)` | an order of ours resting on a bound spot row (above) | the boot's listing |
+| `BootErr::Inventory` | a held balance past the adoption cap, or one it cannot price (below) | the boot's first full cycle |
+
+No margin and no equity come from the spot lane (E7, BX-20).
+
+#### Permissions (BX-19, the bStock check)
+
+* **The judge** (`mode::judge_permission`): a row's `permissionSets` (the
+  discovery's digest, `BnPermissions`) against the account's
+  `permissions` (`account.status`). The venue's rule: a set is met when
+  the account holds ONE of its members — a name (`SPOT`, `MARGIN`, …) or a
+  `TRD_GRP_n` — and several sets must each be met. The judge passes a row
+  with one set whose known name or group the account holds. It refuses
+  as undecidable a row with several sets (the digest is their union; the
+  venue ANDs them), a row naming a name outside any inner set — a flat or
+  mixed list, no spot shape (`BN_PERM_FLAT`, the parser review's P2-5;
+  the futures' flat lists carry the bit, never judged) — and a member
+  that only an unknown name, or a group of 512 or more (past the bitset),
+  could match.
+* **When.** At every account read, for every live armed spot row, beside
+  `canTrade`. Before Ready a refusal refuses the boot:
+  `BootErr::Assert(AssertErr::SymbolNotPermitted)` or `CannotTrade`.
+  After it, a `VenueLock` (`CODE_PERMISSION`, 9 015) raised once a
+  process: the arm halts the owner slot. `exec-smoke --binance spot`
+  exits **66** on `SymbolNotPermitted`.
+* **Names as the venue spells them** (the parser review): `TRD_GRP_` and
+  three digits, zero-padded, or more without a leading zero — the venue
+  compares names as strings, so `TRD_GRP_4` is no group (pinned in
+  `mode.rs` `the_permission_judge`). A row's `permissionSets` is read
+  once.
+* **On the live venue** (the build plan's reading of `exchangeInfo`) a
+  bStock's one set names `SPOT` among some 200 entries, so an account
+  holding `SPOT` passes: D-1, below.
+
+#### The balance law (exact at the venue's precision)
+
+* A spot row's position IS its base asset's balance, and a BUY's
+  commission is charged in that asset at 8 decimals — where ×1e6 keeps
+  nothing of a small trade's. So each spot row keeps the balance its
+  bookings explain, ×1e8 (`RowGw::spot_1e8`): the adopted balance, ± each
+  fill (×100: quantities lie on the step), − each commission charged in
+  that asset — a BUY's base-asset fee, and BNB's (the burn) out of BNB's
+  row when BNB is an armed base (`fee_row`, found by the commission's
+  asset name). A SELL's commission, in the quote, moves no armed balance.
+* **The comparison.** `account.status`'s `free + locked` ×1e8 of the armed
+  base assets alone (`recon::scan_spot_account`: an unarmed asset's
+  figures are never converted, so a huge one never fails the read)
+  against the explained balance, each floored to ×1e6 (`div_euclid(100)`):
+  a base-asset fee is never false drift. Every other asset (the quote,
+  BNB unless armed) is the operator's, never compared. An answer with no
+  `result` (a zero-length span) is no account, and a balance whose
+  `asset` carries a backslash is refused (the parser review's P2-4).
+* **The asset is the row's:** one armed row per base asset, and no armed
+  base another armed row's quote (`BootErr::SpotAsset`), so one balance
+  is never set against two rows' bookings.
+* **G1 — a fill booked without its report owes its commission.** An
+  `order.status` answer for an order in doubt, or an update's cumulative
+  `z` past the trades seen, books a fill no report's `n` paid. The gateway
+  reads the order's trades (`/api/v3/myTrades?orderId=`,
+  `JobKind::OrderTrades`), journals each commission not yet paid (`J_FEE`,
+  by the venue's order id: the member's may have ended) — deduped on the
+  trade-id ring, so a report arriving late pays nothing again — and pays
+  it out of the explained balance. The answer must name the order's whole
+  executed quantity (`Job::qty_1e6`: the status's `executedQty`, or the
+  update's `z`); one naming less — none, or a short page: the venue's
+  trade list lagging its match — pays what it names and is asked again
+  (the risk review's R2-3). A failed or short read is asked again after
+  a pause, 1 s and then 2 s (`Job::not_before_ns`: the tries ×
+  `ORDER_TRADES_BACKOFF_NS`; `start_jobs` moves a paused job from the
+  queue's front to its back, so the jobs behind it go first), at most 3
+  times in all (`ORDER_TRADES_TRIES`): a lagging list gets about 3 s.
+  Then it is counted (`GW_JOBS_DROPPED`) and the commission left unpaid:
+  drift (fail closed). While any order's-trades read is queued, paused
+  or in flight, **every spot leg is held** (`Leg::held`): the
+  commission's asset is the read's to say — the base, or BNB's row when
+  the burn pays in BNB with BNBUSDT armed. A held leg is not judged, its
+  last `differed` kept — derived from the job queue each cycle
+  (`hold_owed_legs`), never a counter a lost job could leave set — and
+  the cycle is inconclusive (`Verdict::held_legs`): never drift, never
+  reconciled, since a held leg may hide a real difference beside the
+  commission it waits for (R2-1). When the read leaves the queue for good
+  (paid, given up, or a scan failure), `order_trades_done` asks for the
+  next cycle at once (`recon_next_ns = now`), not a cadence later.
+  An answer that does not scan is a scan failure (BX-15), and so is a
+  trade of the order asked about naming an empty `commissionAsset`
+  (`Missing`).
+* **G2 — boot dust.** A balance under one millionth reads 0 at ×1e6 —
+  never adopted, never compared — so the explained balance starts at it,
+  to its last decimal (the boot's first full cycle): a later fill never
+  brings it into view as drift.
+* **What reads as drift:** a deposit, withdrawal, convert, airdrop or
+  dust conversion of an armed base asset — anything the arm did not book.
+  From the second cycle that sees it the leg counts: past the slot's
+  `halt_on_recon_drift_usd_1e6` it halts `recon-drift`; under it the slot
+  is unreconciled, and `recon-stale` halts it once no cycle has agreed
+  for `halt_on_recon_stale_ms`. Onto a row whose explained balance is 0
+  it is an unseen leg, not drift: the slot unreconciled, then
+  `recon-stale` (R2-5). The runbook's §10.
+* **R-1 (residual).** The router's ledger books the gross traded quantity
+  (`LAW_SPOT`); the venue's balance is net of the base-asset commissions,
+  so the ledger's holding runs ahead of it by them. The gateway's leg is
+  the exact one. A member's SELL of the ledger's whole holding is refused
+  `-2010` by the venue: a reject, the streak moves.
+
+#### Adoption (risk-policy "BX7", on spot)
+
+* A base balance held on an owned, live spot row is adopted at the boot's
+  first full cycle as a position is: one fill, `FILL_FLAG_ADOPTED`
+  (`J_FILL | J_FILL_ADOPTED`), the row's explained balance the venue's own
+  to its last decimal.
+* A balance carries no price. That cycle asks `/api/v3/ticker/price` for
+  each balance it will adopt — one public read a row, queued ahead of the
+  listing so it lands before the verdict — and values the balance there.
+  The answer must name the row's symbol: another symbol's price, or none
+  (an error), leaves the leg unpriced and the boot refused
+  `BootErr::Inventory(i64::MAX)`.
+* Past the cap (`GwKnobs::adopt_cap_usd_1e6`: the owner slot's
+  `cap_instance_usd_1e6` on a slot naming Binance alone, else 0) the boot
+  is refused `BootErr::Inventory(usd)`, nothing adopted. The battery's cap
+  is `--bn-adopt-usd` (default 250 000 USD: a Demo spot account is seeded
+  with balances).
+
+#### Spot's governed budgets (BX-12)
+
+* **`gov::SpotOrders`** (the arm, on the engine thread): the venue's spot
+  ORDERS pool, per account — a 10 s sliding window of 100 ×
+  `orders_frac`, and the UTC day's unfilled-order count against 200 000 ×
+  `orders_frac`: +1 a place, −1 an order retired with `EVT_F_HAD_FILL`
+  (one that filled: the venue takes it off at its first fill), never below
+  0, reset at 00:00Z (the arm's wall anchor). The day rolls forward only,
+  and an end takes one off only if it is stamped in today's UTC day: an
+  end stamped before 00:00Z, drained after the new day's first place, no
+  longer resets today's count (the alloc review's AL2-2, a fail-open
+  fixed). The window takes no fill off, so it can only refuse earlier. A
+  spot row is judged on it instead of the futures' pool; a refusal is
+  `Orders`.
+* **What the mirror does not know** (the risk review's R2-2; carried, the
+  code before BX13). (a) The day's count starts at 0 at every boot: the
+  venue's own count of the day is not read, so after a restart the venue
+  may refuse first, with `-1015` — the budget: the whole gateway goes
+  quiet, the futures with it (no heartbeat: the venue's dead-man cancels
+  the futures' makers), and the slot halts `BudgetFloor`, sticky. Fail
+  closed, but costly. An order placed before 00:00Z that fills after it
+  is off by one, either way. (b) At its share (160 000 at 80 %) every spot
+  order is refused until 00:00Z, sells included: the exit is by hand, in
+  the app; the count is not in `/state`. An IoC member at 80 orders a
+  10 s window, mostly unfilled, reaches it in about 6 h. **Built in
+  BX13:** the count read from the venue (`account.rateLimits.orders`)
+  before the first spot order and at each venue day; a SELL's reserve
+  past the share; `/state` `spot_day` (BX-12, "BX13").
+* The UM quantitative rules and the breadth (`max_symbols`) stay the
+  futures': a spot order counts toward neither.
+* **The request weight.** Spot's is the venue's separate spot pool (6 000
+  a minute per IP): counted neither in the boot's model nor in the
+  run-time window (`BnGateway::weigh` skips the spot lane) — a departure
+  from the build plan's default 5. What bounds it is the cadence: a cycle
+  (`account.status` 20, `openOrders` 80) every `recon_every_ms` — at least
+  10 s, so 600 a minute, a tenth of the pool; under 2 % at the default
+  60 s — besides the boot's reads, the clock's on a spot-only arm, and at
+  most three order's-trades reads per fill booked without its report. The
+  bound leaves out (the risk review's R2-4; carried): (i) the early cycle
+  after every spot session's recovery — never throttled on a spot-only
+  arm, where `weigh` counts nothing; (ii) R2-1's prompt cycle when an
+  order's-trades read leaves the queue, one per fill booked without its
+  report; (iii) an unread day's retry every cycle — `myTrades` at weight
+  20 a row, and a row with 1 000 trades or more today never reads (one
+  page). At `recon_every_ms` = 10 000, past about 45 unread rows the arm
+  alone passes the 6 000 a minute: a 429, and `BudgetFloor`. **Built in
+  BX13:** spot metered in a window of its own; the early and prompt
+  cycles throttled past 80 % of it; an unread day's retry paced to its
+  room (BX-12, "BX13"). A 429 or `-1003` on spot is the budget: the
+  gateway goes quiet and the slot halts `BudgetFloor`.
+
+#### The other laws on spot
+
+* **BX-2.** The stream is the subscription on the order session: only its
+  200 naming an id makes a session live, and its end drops the session.
+  Both make-before-break sessions are subscribed and both carry every
+  event: each trade is booked once, its commission journaled and paid
+  once (the trade-id ring; an order's end reported twice finds it ended —
+  the ended ring).
+* **BX-11.** An order in doubt is resolved by `order.status` (spot's
+  answer has no `avgPrice`: the average is `cummulativeQuoteQty /
+  executedQty`, a negative quote unavailable); a lost place answer is
+  never re-sent. `REJECTED` (`S_REJECTED`) now ends an order — from an
+  event or an in-doubt status: retired `RETIRED_REJECTED`, `J_REJECT`,
+  nothing booked, no code (the streak does not move); an end not taken
+  would be asked about every second, for ever.
+* **BX-7 and BX-8.** Spot has no liquidation, ADL or settlement: a client
+  id spelling one (`autoclose-…`, `adl_autoclose`,
+  `settlement_autoclose-…`) on a spot event is someone else's order —
+  foreign, counted (`GW_FILLS_FOREIGN`), booked to no one. What it moved
+  of an armed base asset is the reconciliation's: drift.
+* **BX-14.** `J_FEE` once per spot trade, in the asset charged — BNB (the
+  burn), the base on a BUY, the quote on a SELL — classified against the
+  row by `journal::fee_asset` (to a spot row the base is
+  `FEE_ASSET_OTHER`, the quote `FEE_ASSET_SETTLE`). A fill booked without
+  its report has its commission from the order's trades (G1).
+* **BX-15.** `scan_spot_event` reads the venue's shape whole: an
+  `executionReport` names all 20 of its keys once (`e E s c S x X i l L z
+  t q p n N T m Z C`), and is refused when a `TRADE` has `t: -1`, a trade
+  has `l` or `L` not above zero (the parser review's P2-1, on every
+  product), `N` is `null` beside a commission or empty (P2-2), `C` (the
+  original client id) is non-empty on anything but a cancel, `x` is the
+  futures' `CALCULATED` or `AMENDMENT`, `t` is below −1, or the event's
+  name is escaped or named twice. `ap` is not read on spot (the average is
+  `Z / z`). `t: -1` with no trade reads as 0, `N: null` with no commission
+  as no asset, and a cancel's `C` replaces `c`. A `TRADE` with `t: 0` is
+  accepted — a symbol's first trade id is 0 — and deduped like any other
+  (the trade-id ring's empty entries name no row; pinned in
+  `spot_events_fail_closed`). An event frame on a futures session is a
+  scan failure, as is a spot account read with no `result`, short of
+  `canTrade`, `permissions` or `balances`, or naming an armed asset twice.
+* **BX-16.** Spot's hosts — `ws-api.binance.com` and `api.binance.com`;
+  on Demo `demo-ws-api.binance.com` and `demo-api.binance.com` — are on
+  the scope's network (the host table is nine), and the spot market
+  data's join `BnConfig::assert_market_data` when spot is armed.
+* **BX-5.** Spot's grid is quantized locally (BTCUSDT: tick 0.01, step
+  0.00001, a 5 USDT minimum notional).
+* **BX-20.** Spot has no margin and no ratio, and gives the session bound
+  no equity: a session-bounded slot arming spot is refused.
+
+#### Beyond spot
+
+What BX8 changes for the futures lanes and the engine's discovery:
+
+* `wsapi::scan_answer` reads every WS API frame as ONE object, whole
+  (the parser review): bytes after it are refused — a scan failure
+  (BX-15), on every lane. An `event` that is not an object is refused; a
+  frame naming `subscriptionId` is a spot user frame, a scan failure on a
+  futures session.
+* An order event on every product (`ORDER_TRADE_UPDATE`'s `TRADE` or
+  `CALCULATED` naming both `l` and `L`, and `TRADE_LITE`) is refused when
+  its last quantity or price is not above zero (the parser review's
+  P2-1): no stream books a fill at price 0 — a scan failure (BX-15).
+* `rest::scan_trades` — the futures' `userTrades` day too — reads each
+  key once, needs `price` and `qty` above 0, refuses a row naming exactly
+  one of `commission` and `commissionAsset` (`Missing`, P2-3), and reads
+  the page whole. A page it refuses leaves the row's day unread, asked
+  again each cycle (S7-L1).
+* `scan_um_account`, `scan_cm_account` and `scan_positions` (as spot's)
+  refuse a zero-length `result` (P2-4): an answer without one never reads
+  its own keys as the account.
+* `status_of` reads `REJECTED` as `S_REJECTED` on every lane: an order the
+  venue names REJECTED ends there too.
+* The boot discovery (`ingress-binance`): `baseAsset`, `quoteAsset` and
+  `permissionSets` are each read once a row — a second copy refuses the
+  row and so its page ("bn: discovery parse failed"), as a second
+  lifecycle does — and `TRD_GRP_n` is read in the venue's spelling; a
+  name outside any inner set marks the digest `BN_PERM_FLAT` (the
+  futures' flat lists carry it, never judged). `BnSymbolRow` is 248 B
+  (208 before); the 8 192-row reservation stays under 2 MiB (asserted).
+* `judge_key` asks `enableFutures` only when a futures lane is armed.
+
+Binance sends one object a frame, names each of these keys once, a
+commission with its asset, and a trade of something at a price: what
+changes is what a malformed frame or page does.
+
+#### Gates
+
+* **Gate 108** (`crates/bench/tests/alloc_assertions.rs`:
+  `binance_spot_lane_round_trip_allocates_only_rustls_record_buffers`):
+  the REAL `BnGateway`, spot-only (BTCUSDT under the alias), stepped
+  against the scripted venue's spot routes in gate 94's child process over
+  rustls (`GATE94_SPOT=1`: every commission paid in BNB, so the BTC a
+  round buys is sold back whole), the engine end driven raw. A round — an
+  IoC BUY of 0.002 and, once it ended, an IoC SELL of it, each filled
+  whole — allocates exactly rustls' records: **4** (`G108_ROUND`: each
+  IoC's place sealed, its ACK and the subscription's three events for it —
+  NEW, the TRADE, the balances — opened as one record), over 300 rounds.
+  Measured alone: the partial, an IoC half filled and EXPIRED, **2**
+  (`G108_PARTIAL`); the venue writing a frame a write, **10** a round
+  (`G108_FRAMES_ROUND`: one record sealed and four opened an IoC); the
+  halt's sweep, whose confirmation is a whole cycle — spot's
+  `account.status` on the order session and the REST listing — **4**
+  (`G108_RECON`), one REST job. Each window's tallies are asserted: one
+  balances' event (`GW_EVENTS_OTHER`) and one fill (`GW_FILLS_BOOKED`) an
+  IoC; the cycle's `GW_RECON_OK` by one, no drift or unseen leg; foreign,
+  unowned, deferred, unresolved and lost fills, dropped jobs, doubts and
+  journal records 0; no REST job and no session opened again in an IoC
+  window. Everything else on the path — the scans, the trade-id ring,
+  `J_FEE`, lane 4, the explained balance — is 0 B. A break-and-watch (an
+  8-byte `Vec` in `spot_event`, and one in `spot_account_answered`)
+  failed the rounds at 3 000, the partial at 6, a frame a write at 4 800
+  and the cycle at 5.
+* **What 108 does not pin:** the boot (the logon, the subscription, the
+  day, `ticker/price`); the order's-trades read (its scan is 109's); a
+  base-asset commission (109 classifies it); the in-doubt `order.status`,
+  the rotation and the subscription's end; bursts over rustls' 4 KiB
+  receive window.
+* **Gate 109** (`binance_spot_lane_render_and_scan_steady_state`): spot's
+  renders and scans at 0 B/op, in-process — `order.place`,
+  `order.status`, `userDataStream.subscribe` and `account.status`
+  rendered; `scan_subscribed`; the ACK and an `order.status` answer; the
+  user frames told from answers and each event read in place (an
+  `executionReport` NEW; a TRADE with its commission in BNB, in the base
+  and in the quote, each classified and seen once by the trade-id ring;
+  an EXPIRED; `outboundAccountPosition`; `eventStreamTerminated`); the
+  account read with the permission judge and the leg; `openOrders`;
+  `myTrades` as the day's buys and as the order's-trades answer;
+  `ticker/price`.
+* **Gate 92** extended: a spot row beside the futures rows, in the
+  engine's `SlotSplit` shape — IoC BUYs every fourth turn on spot's own
+  pool, ended FILLED or EXPIRED, and a spot maker now and then. Pinned
+  there: 0 B; exactly 100 spot IoCs accepted in the 10 s window, at least
+  one refused, no spot maker accepted. Exercised, not asserted there (no
+  accessor): the refusals' reason, the futures' pool left alone and the
+  unfilled count's decrement — `a_spot_row_is_ioc_only_on_its_own_pool`
+  and `the_spot_pool_mirrors_the_unfilled_count` pin those (the alloc
+  review's AL2-1). A break-and-watch failed it at 970.
+* **The count:** alloc, a run in the cloud (debug, `--test-threads=1`):
+  121 passed at 0 B/op, 4 ignored (the helpers); CLAUDE.md's gate line
+  (119 → 121) needs the operator's word. The Mac (release):
+  `make alloc-assert` 121 passed, 4 ignored — gates 92, 108 and 109 at their pins in release too. With it, on the tree synced to the worktree: `make lint` clean; nextest 4 453 passed, 10 skipped; copy-audit `hits=28 baselined=28 new=0`; the SPDX line on every changed source; `cargo deny check licenses` passing and `cargo about`'s notices identical to the tracked file (`make license-check` not run: its recipe's text carries a word the CMDLINE law keeps out of any argv — its two checks run apart).
+* **The cloud's runs.** On the current tree: the workspace's clippy
+  clean (`--all-targets`, `--features exec-binance/testvenue`,
+  `-D warnings`); e2e 64/64; alloc as above; exec-binance's unit tests
+  147. Run after the last scanner change and not repeated since:
+  ingress-binance's unit tests 101, cli's 472 and the engine binary's
+  10, and copy-audit (hits=28 baselined=28 new=0). Nothing those tests
+  cover has changed since, and the later code (the order's-trades
+  pause, the hold's scope) adds no copy verb; the fuzz runs (below)
+  likewise predate it, their scanners unchanged.
+
+#### Tests
+
+`crates/exec-binance/tests/bn_e2e_loopback.rs` holds 64 tests, 25 of them
+spot's (the scripted venue, `exec_binance::testvenue`, gains the
+`/ws-api/v3` sessions carrying the user data and `/api/v3`):
+
+| test | what it proves |
+|---|---|
+| `the_spot_lane_trades_iocs_and_its_fills_reach_lane_4` | a spot-only arm boots on `api/v3` and `/ws-api/v3` alone (the clock on `/api/v3/time`; no futures assertion, listenKey or stream): it logs on, subscribes, then reads; IoCs — a full fill in two trades, a partial and its expiry, one unfilled — each trade one lane-4 fill under the anchor's id 7 at its own price; the place `LIMIT`, `IOC`, `ACK`, no `reduceOnly`, on the row's step and tick; a SELL of the ledger's gross holding refused `-2010` (R-1); the cycles reconcile, the BTC commissions paid out of the explained balance; one `J_FEE` a trade (BTC on the buys, USDT on the sell) |
+| `a_spot_row_whose_groups_the_account_lacks_refuses_the_boot` | TSLABUSDT's one set (TRD_GRP_004, TRD_GRP_261) against an account holding `SPOT` alone: `SymbolNotPermitted` at the first account read, nothing placed; holding TRD_GRP_261 too, it boots; `canTrade: false` is `CannotTrade`; a key without spot trading `NoTradePermission`, before any session |
+| `a_spot_permission_lost_mid_session_locks_the_venue` | the group lost once Ready: `EVT_LOCK` with `CODE_PERMISSION`, the slot's venue lock, raised once |
+| `a_lost_spot_place_answer_is_never_resent` | an IoC filled in two trades whose answer and reports are lost: the deadline drops the session; the next session, subscribed, resolves it by `order.status` — booked once (`J_FILL_UNSEEN`) at `cummulativeQuoteQty / executedQty`, retired FILLED; the venue saw one `order.place` |
+| `a_spot_balance_held_at_boot_is_adopted_at_the_ticker_price` | 0.5 BTC at the ticker's 65 000: adopted as one adopted fill within a 40 000 USD cap; refused `Inventory` past a 30 000 USD cap; refused `Inventory(i64::MAX)` with no price (the venue's 400) |
+| `the_spot_sweep_confirms_clear_with_nothing_to_cancel` | a halt's sweep sends no cancel and the listing confirms it clear; a stranger's resting order is reported foreign every cycle |
+| `both_spot_sessions_subscribed_book_each_trade_once` | a rotation's two subscribed sessions both carry an IoC's reports: one lane-4 fill, one `J_FEE`, the commission paid once; the cycles reconcile |
+| `a_foreign_or_liquidation_named_spot_fill_is_booked_to_no_one` | `autoclose-…`, `adl_autoclose`, `settlement_autoclose-…` and a stranger's (`web_…`) spot trades: counted `GW_FILLS_FOREIGN`, none on lane 4; the BTC they moved reads as drift |
+| `the_subscription_ending_drops_the_session` | `eventStreamTerminated`: the session dropped; a new one logs on and subscribes; trading resumes on it |
+| `a_bnb_commission_on_another_row_is_paid_from_bnb` | BTCUSDT and BNBUSDT armed, the commissions burnt in BNB: a BTCUSDT trade's 0.0005 BNB paid once out of BNBUSDT's explained balance; both legs reconcile |
+| `a_spot_fill_booked_without_its_report_pays_its_commission` | G1: a fill booked from `order.status` — its BTC commission read once from `myTrades?orderId=`, journaled by the venue's order id and paid; the reports delivered late pay nothing again |
+| `a_fill_whose_report_lost_its_trades_pays_their_commissions_from_the_order_trades` | G1 on the S1 path: the second trade's `z` books the lost first (`J_FILL_UNSEEN`); the order's trades pay the lost one's commission once |
+| `sub_millionth_dust_at_boot_never_reads_as_drift` | G2: 0.00000077 BTC at boot seeds the explained balance; after a buy of 0.00123 the two agree on the millionth (1 229) |
+| `a_failed_order_trades_read_leaves_the_commission_as_drift` | every order's-trades read answering 500: asked 3 times — the second at least 1 s after the first, the third at least 2 s after it — and none after the third, counted `GW_JOBS_DROPPED`; no commission journaled or paid; the leg drifts, the slot unreconciled |
+| `a_failed_order_trades_read_is_asked_again_and_pays_once` | one 500, then the read — at least 1 s later — pays the commission once; nothing counted dropped |
+| `a_cycle_while_the_order_trades_read_is_pending_holds_the_leg` | the read answered 1.5 s late, the cadence 5 s: the cycle landing meanwhile holds the leg — inconclusive, neither reconciled nor drift (R2-1); the read pays once and its end asks for the next cycle at once (`order_trades_done`), reconciled well inside the cadence; no verdict journaled reads drift |
+| `a_cycle_while_a_bnb_paid_commission_is_read_holds_bnbs_leg_too` | BTCUSDT and BNBUSDT armed, 1 BNB adopted at boot, the burn at 0.0005 BNB a trade: a BTCUSDT fill booked from `order.status`, its read answered 1.5 s late; the cycle while it is pending holds both legs — inconclusive, no drift on either row — and the next reconciles both; one `J_FEE`, in BNB, paid from BNB's explained balance; the commission is no position |
+| `an_order_trades_page_short_of_its_fill_is_read_again` | R2-3: a read by `orderId` naming less than the order executed — none, or one of its two trades — pays what it names (once) and is asked again at least 1 s later; the next names it all; each commission paid once, nothing dropped, the cycles reconcile — from a report's `z` (S1) and from a status's `executedQty` |
+| `a_spot_row_on_the_rest_route_or_with_an_hmac_key_is_refused` | the REST route, with the Ed25519 key or an HMAC one, is `SpotRoute`; an HMAC key on the WS API `Signing`; both before any request |
+| `a_spot_base_armed_twice_or_quoted_by_another_row_is_refused` | BTCUSDT beside BTCUSDC, and beside BNBBTC: `SpotAsset(row)` at the gateway's construction |
+| `spot_beside_portfolio_margin_or_pm_pro_is_refused` | `Product(PRODUCT_SPOT)` under `pm` and `pm_pro`, before any request |
+| `a_spot_order_of_ours_resting_at_boot_refuses_the_boot` | an orphan, and a ghost, listed on spot: `SpotStray(row)` at that listing, never cancelled |
+| `an_in_doubt_spot_order_the_venue_rejected_is_ended` | `order.status` answering REJECTED: retired REJECTED, nothing booked, no streak, never asked about again |
+| `a_subscription_answered_without_its_id_is_never_live` | a 200 naming no `subscriptionId`: the session dropped (a connect failure) and the next one carries the boot; every one so, the boot times out in `Connect`, nothing read or placed |
+| `a_ticker_answer_naming_another_symbol_prices_nothing` | an ETHUSDT answer to BTCUSDT's read: the leg unpriced, `Inventory(i64::MAX)` |
+
+The round-1 follow-up added nine of them: the route, the asset, spot
+beside PM, the stray, the in-doubt REJECTED, the subscription without its
+id, the order's-trades retry, the ticker's symbol, and the held leg (an
+end-to-end review's finding: a status-booked fill read as drift for one
+cycle). **Break-and-watch:** each new law was broken once and its test
+failed; each test's doc names its break. Round 2 added eight breaks, each
+failing its own test: P2-1 (the spot reader, and the futures and lite
+arm), P2-2, P2-3, P2-4 (twice), P2-5 and AL2-2. The risk review's R2-1
+and R2-3 were broken too, each failing its e2e test (a held cycle
+counted reconciled, or no prompt cycle after the read; a short page
+taken whole); then the hold narrowed back to the order's row (the BNB
+test fails: BNB's leg in drift, 0.30 USD) and the retry's pause set to
+0 (the three pause assertions fail: gaps of 2 ms).
+
+**Unit tests:** `gov.rs` `the_spot_pool_mirrors_the_unfilled_count`;
+`arm.rs` `a_spot_row_is_ioc_only_on_its_own_pool`; `mode.rs`
+`the_permission_judge`, `the_classic_futures_are_built`,
+`the_judges_fail_closed`; `userstream.rs`
+`spot_execution_reports_read_as_order_updates`, `spot_events_fail_closed`,
+`a_trade_at_no_price_is_refused` (every product, P2-1), proptests
+`spot_reports_never_panic` and `a_spot_report_round_trips`; `wsapi.rs`
+`spot_user_events_are_told_from_answers`,
+`cancel_modify_status_account_render`, proptest `never_panics`
+(`scan_subscribed` on any result); `recon.rs`
+`a_spot_account_reads_its_armed_assets_exactly`,
+`a_spot_account_read_fails_closed`, `a_spot_day_is_its_buys`,
+`a_held_leg_waits_for_its_commission`, proptest
+`a_spot_account_round_trips`; `rest.rs` `trades`, `a_ticker_price`,
+`the_lanes_templates_by_product`, proptest `a_spot_trade_row_round_trips`;
+`json.rs` `eight_decimals_at_1e8`; `inst.rs`
+`a_spot_row_binds_with_its_assets_and_groups`; ingress-binance
+`a_rows_assets_are_read_once_and_never_cut`,
+`a_spot_row_keeps_notional_side_band_order_cap_and_groups`,
+`two_permission_sets_mark_the_digest_inexact` (the flat list); `bn_live.rs`
+`spot_binds_quoted_in_usdt_and_the_anchor_under_its_alias`;
+`exec_boot.rs` `the_templates_binance_recipe_boots_every_built_product_and_mode`,
+`a_live_binance_slot_resolves_with_its_section_and_nothing_else_does`,
+`a_session_bound_needs_a_usd_equity`; the Demo tools' (`bn_demo.rs`,
+`bn_probe.rs`, `bn_battery.rs`, and the engine binary's
+`spots_flags_parse_where_they_belong`).
+
+**Fuzz** `bn_spot_event` (new): arbitrary bytes into `scan_answer` and,
+for a spot user frame it accepts, `scan_spot_event` on its event; the
+bytes as an event object too; and as a spot `account.status` result (BTC
+and BNB armed). Each scan is judged by an independent oracle — its own
+walk of the JSON and its own readers of the venue's values: all 20 keys
+named exactly once; the refusals both ways (where every value is
+well-formed, an event or an account the oracle reads as valid must be
+accepted, a huge unarmed figure included); the exact figures; the
+account's exact sums ×1e8. Round 2's oracle adds a trade of nothing or at
+no price, `N: ""`, a zero-length `result`, an asset with a backslash and
+the permissions digest. In the cloud (coverage-guided, no crash):
+`bn_spot_event` 15.0 M runs on the round-1 oracle and 9.7 M on round 2's;
+`bn_user_event` 25.6 M (an accepted trade is of something at a price);
+`bn_rest_body` 12.9 M (trade rows' spans and figures, the commission's
+pair rule, the ticker's price). On the Mac: the 14 Binance targets, 300 s each (the nightly sanitizer build), no crash: `bn_spot_event` 23.8 M runs, `bn_user_event` 25.1 M, `bn_rest_body` 21.2 M, `bn_rest_answer` 25.9 M, `bn_wsapi_frame` 27.8 M, `bn_account` 23.6 M, `bn_mode` 20.9 M (judging the key per product set — `judge_key`'s new flags had left it uncompiled, the fuzz crate being outside the workspace build; fixed on the Mac), `bn_cid` 35.0 M, `binance_exchange_info` 9.2 M, `binance_eapi` 9.8 M, `binance_eapi_mark_array` 22.3 M, `binance_mark_price` 43.6 M, `binance_book_ticker` 132.0 M, `binance_agg_trade` 37.0 M.
+
+#### The Demo exit
+
+The plan's exit — IoC fills reach lane 4; `binance:btcusdt` routes
+through the alias; the permission check on the Demo account's real
+permissions (D-1) — and K1's Demo half (`--binance-probe spot`):
+met on Demo on 2026-10-10, from the worktree's release binary of this tree. `--binance-probe spot`: `session.logon` accepted with the Demo Ed25519 key and `userDataStream.subscribe` accepted (subscription 0) on demo-ws-api — the futures Demo key reaches spot Demo. `--binance spot --lifecycle` (BTCUSDT bound under the alias, sym 7): 10 cycles, 20 IoC fills on lane 4, every order routed by the alias, each BUY's commission charged in BTC and journaled (20 fees), 10 reconciliations agreeing at drift 0 (11 cycles reconciled, none failed), no reconnect, the halt's sweep a no-op — PASS. A bStock, `--bn-spot-symbol TSLABUSDT`: its 206 permission groups judged `Ok` on the Demo account, which holds `SPOT` (D-1: the venue's own rule), then 33 fills (IoCs filled in parts) with 33 commissions journaled and 10 reconciliations at drift 0 — PASS. The three lanes together (`--binance um,cm,spot --lifecycle`): 6 USDⓈ-M, 10 COIN-M and 20 spot fills, 26 reconciliations agreeing, none failed, the boot adopting the 0.0000927 BTC the first run left (7 USD at the ticker) — PASS. The refusal of a missing group stays the scripted venue's (`a_spot_row_whose_groups_the_account_lacks_refuses_the_boot`).
+
+#### Departures (from plan §5 BX8 and the build plan)
+
+| departure | from | as built, and why |
+|---|---|---|
+| D-1 | plan §5 BX8's exit: "the bStock permission check refuses a missing group", on Demo | the venue's rule passes any account holding `SPOT`, which every bStock set seen live names: the refusal is proven on the scripted venue (a set naming groups only) and by unit tests; on Demo the check runs on the account's real permissions and shows its verdict |
+| D-2 | plan §5 BX8 and §3.10: `openOrders.status` | REST `GET /api/v3/openOrders`, the futures lanes' path: it reads while the order session is down |
+| the weight | the build plan's default 5: spot's REST weight in the one window | counted nowhere: spot's request weight is the venue's separate pool; the cadence bounds it (BX-12, above) |
+| a stray | the build plan: the boot holds in `Recon` | `BootErr::SpotStray(row)` at the listing (the risk review: never a cycle a second to the timeout) |
+| the day | the build plan: `day_increasing_1e6` | `day_buys_1e6`, the buys at their prices: the venue's balance is net of the base-asset commissions, so a replay from it would read part of a buy as covering a short — an undercount the day's cap must never have |
+| the refusal | the build plan: `BootErr::Permission` | `BootErr::Assert(SymbolNotPermitted)` or `(CannotTrade)`: the BX-19 judges' one refusal |
+| E7 on spot | plan §3.10: realized P&L plus inventory at mid | not built: a session bound refuses a spot arm (the build plan's default 2) |
+| the quote law | — | added by the risk review: spot rows quoted in USDT only |
+
+#### Residuals
+
+* `GW_JOBS_DROPPED` counts both a full job queue and an exhausted
+  order's-trades read: carried — the second wants a tally of its own.
+* The hold's reach (G1): every spot leg is held while any order's-trades
+  read is owed — about 3 s and the round trips for a read that fails or
+  lags to its last try, and several reports lost in a burst stack those
+  windows. A real difference on another row is masked that long, and the
+  staleness clock runs: accepted by design, worth knowing if
+  `halt_on_recon_stale_ms` is set tight. Before a lost-report order's
+  status resolves, no read is owed and nothing is held: BNB's leg (the
+  burn on, BNBUSDT armed) differs by the commission, unexplained until
+  then — as the order's own row does by its fill — and counts as drift
+  from the second cycle that sees it.
+* A deposit, withdrawal, convert, airdrop or dust conversion of an armed
+  base asset is drift (an unseen leg on a row whose explained balance is
+  0): one is moved only with the arm stopped (the runbook's §10).
+* R-1: the ledger's gross holding (above).
+* The quote asset's balance is never read: a BUY the USDT cannot pay is
+  the venue's `-2010`, a reject. Plan §3.10's "observed for insufficient
+  balance" is not built.
+* Spot's request weight (R2-4, above) and spot's day count (R2-2, above):
+  built in BX13 ("BX13", BX-12).
+* `rest::scan_trades` accepts `"commissionAsset":""` beside a commission
+  (every product). The gateway refuses it on the order's own trades it
+  reads (`order_trades_answered`: a scan failure, `Missing`); the day's
+  read never uses the commission.
+* The USDT-only quote law is the default: an allowlist (another
+  USD-pegged quote) would need a ruling.
+* No spot flatten tool: a spot position is sold in the app (the runbook's
+  §3.2).
+* Q2 (spot beside PM or PM Pro) and Q3 (a BNB-burn option in the account
+  tools, `/sapi/v1/bnbBurn`) are the operator's.
+* O-BX22's tick mid (the router prices a slot's other spot holdings at
+  their last fill; "revisited at BX8") is not revisited: no router or
+  ledger file changed. No spot Mark reaches the ledger (only a futures
+  `markPrice` stream emits one; `exec-router` `routed.rs`
+  `on_venue_event`), so `cap_instance` prices the other spot rows at
+  their last fill and an adopted row at the boot's ticker: a ruling, or
+  a spot price feed, is a precondition of arming spot (the runbook's §8).
+* The Demo exit proves the lane against Demo's matching, not mainnet's:
+  the live path's first spot fills are BX13's to observe.
+
+#### Still gated
+
+* **O-BX6:** no member arms before BX13. Spot adds to the runbook's §8:
+  the Demo exit seen on the binary armed (`--binance-probe spot`,
+  `--binance spot --lifecycle`); gate 108 passing on the tree armed; the
+  operator's spot rules (the runbook's §10); R2-2's and R2-4's code
+  (above); O-BX22 ruled, or a spot price feed.
+
+#### The reviews
+
+| round | reviewer | verdict | disposition |
+|---|---|---|---|
+| 1 | risk | BLOCK: the quote law — a spot row not quoted in USDT (every cap, the adoption and the drift halt are USD); with it G1 a status-booked fill's commission unpaid; G2 boot dust; the day undercounted; a stray holding the boot to its timeout; the order's-trades retry unbounded; REJECTED never ending an order; a subscription answered without its id taken as live; the ticker's symbol unread; every balance converted, armed or not | each fixed, each with a test that fails without it: USDT-quoted rows only (`bn_live::bind_table`); the order's trades (`JobKind::OrderTrades`); the dust seeded; `day_buys_1e6`; `SpotStray`; three tries (`ORDER_TRADES_TRIES`); `S_REJECTED`; `scan_subscribed`; the symbol matched; the armed assets alone converted |
+| 1 | parser | findings: the venue's shape read whole; a frame one object, whole; `permissionSets` read once; an escaped event name; the `TRD_GRP` names | fixed: the 20 keys once and the shape's refusals (`spot_events_fail_closed`); `ends_whole` in `scan_answer`; `permissionSets`, `baseAsset` and `quoteAsset` once a row; an escaped name refused; `TRD_GRP_n` in the venue's spelling |
+| 1 | alloc | findings: gate 108 lacked a reconciliation window, a frame-a-write window and their tallies; gate 92 lacked spot; `TradeRow` | added: `G108_RECON`, `G108_FRAMES_ROUND` and each window's tallies; gate 92's spot row; `TradeRow` packed to 64 B |
+| 1 | zero-copy | findings: the `// COPY:` lines for the asset names and the spot facts | present: `inst.rs`, the gateway, discovery and `paper.rs`; plan §6's copies table |
+| 2 | parser | NEEDS-FIX: P2-1 (MEDIUM) a trade at no price booked from any stream, every product; P2-2 spot's `N: ""`; P2-3 a trade row naming one of `commission` and `commissionAsset`; P2-4 an answer with no `result` read as the account, a balance `asset` with a backslash; P2-5 a flat or mixed `permissionSets`; P2-6 tests (the `TRD_GRP` spelling, `scan_subscribed` fuzzed, a spot trade row's round trip, `t: 0`); P2-7 `UserEvent::trade_id`'s doc | all fixed, each break-and-watched: `l` and `L` above zero in `order_fields` and `TRADE_LITE` (`a_trade_at_no_price_is_refused`); `N: ""` refused; the pair rule (`Missing`); `recon::no_result` in the four account scans, the backslash refused; `BN_PERM_FLAT`, refused by `judge_permission`; the tests pinned; the doc |
+| 2 | alloc | NEEDS-DOCS: AL2-1 gate 92's doc claimed what it does not assert; AL2-2 a real fail-open — an end stamped before 00:00Z, drained after the new day's first place, reset today's unfilled count; AL2-3…AL2-5 wording (`TradeRow`'s 64 B, `weigh`'s doc, lib.rs's map) | gate 92's doc says what it pins, and the arm test asserts the futures' pool untouched; `SpotOrders::roll` forward only and `filled` off today's ends alone (`the_spot_pool_mirrors_the_unfilled_count`; the count's boot and share are the risk review's R2-2); the wording |
+| 2 | zero-copy | FAIL: ZC2-1 the quote law's boot message rendered the asset with `from_utf8_lossy` (copy-audit new=1); ZC2-2 BX8's three arrays inline in the gateway, copied by its move into its thread (a move unmarked since BX6) | `escape_ascii()` (copy-audit hits=28 baselined=28 new=0); `spot_assets`, `spot_rows` and `spot_bal_1e8` boxed where they live (`exec_gateway::boxed_array`), the `// COPY:` line updated — of BX8's state only `acct_perm` (72 B) moves inline |
+| 2 | risk | BLOCK: R2-1 a held leg's cycle counted reconciled (MEDIUM); R2-2 the unfilled count's boot and share (MEDIUM: docs now, code before BX13); R2-3 a lagging order's-trades answer taken whole (LOW); R2-4 spot's weight bound short of three reads (LOW, docs); R2-5 behaviour stated wrongly (LOW, docs) | R2-1 and R2-3 fixed in code, each with an e2e test and a break-and-watch: `Verdict::held_legs` (a held cycle inconclusive) and `order_trades_done` (the next cycle at once); `Job::qty_1e6` (the read names the order's whole executed quantity, else asked again); R2-2 and R2-4 documented and carried (BX-12, "Spot's governed budgets", the runbook's §8 and §10); R2-5 fixed: the quote law's message names universe.toml's `[binance] spot`, and the runbook (an unseen leg, Earn, Auto-Invest and Convert off, O-BX22) |
+| 3 | risk | APPROVE; R3-1 (NIT) a held, inconclusive cycle looks in `/state` and the journal like any other unreconciled one (`Verdict::held_legs` reaches neither `EVT_RECON`, `J_RECON` nor a `GW_RECON_*` tally) | carried; built in BX13: `GW_RECON_HELD` (`/state` `recon_held`, `/metrics`, the TUI chip), `J_RECON_HELD` on the record, the runbook's §5 |
+
+### BX9 — options, long and short BTC/ETH, IoC-only (2026-10-11) — Demo orders only; no member arms (O-BX6)
+
+Built on branch `binance` (plan §5 BX9; the BX9 build plan of 2026-10-10
+and the operator's rulings Q-1 … Q-6 of 2026-10-11 01:55Z and R3 of
+04:00Z, the project doc `claude/bx9-build-plan-2026-10-10.md`). The code
+was built and its tests run in the cloud; the Mac's gates, the Demo exit
+runs and the one `BX9:` commit came after. Nothing here arms a member or
+places a mainnet order: Demo orders only. It reaches the engine only
+through a merge to `main`, a release build and a restart — the operator's
+word. **Scope:** European options on eapi × classic, IoC-only, on a
+dedicated account (the engine refuses a `shared` scope, as before; the
+gateway's shared paths are tested, not armable), one owner slot; BTC and
+ETH writable where the venue's `nakedSell` and `options_write` both say
+so. The laws are
+restated as built above ("BX — the Binance execution laws"); their Tested
+and Open lines carry this entry.
+
+#### The rulings (2026-10-11)
+
+| ruling | what it fixed |
+|---|---|
+| Q-1 HMAC key for options | eapi refuses the Ed25519 key (`-2015`, the key before any signature — K-probe OP2b). The options lane alone signs with the scope's HMAC pair (`BINANCE_HMAC_*`; Demo `BINANCE_DEMO_HMAC_*`), `.env` only; futures and spot keep Ed25519. An options arm without the pair refuses the boot. |
+| Q-2 30 s stale + bounds | The ledger: an option summary older than `MARK_STALE_NS` (30 s) refuses OPENING orders (`Unpriced`; exits pass); a mark outside its no-arbitrage band is refused and counted, the row keeping its last price. |
+| Q-3 scripted venue now, Demo later | Settlement is proven on the scripted venue; the Demo expiry run (the exercise record's real shape across 08:00Z) is a BX13 arming precondition. |
+| Q-4 read the options equity | E7's session equity = USDⓈ-M's margin balance + the options account's `equity`; a session-bounded slot arming options is allowed. |
+| Q-5 whole chain (≤ 64) | The arm binds the paper-selected chain plus every option the account holds at boot; the day read is paced in eapi's own weight window; the boot's timeout grows with the rows. |
+| Q-6 reduce-only + unwrite | On a non-writable row a SELL with no long is refused `NotWritable`; any other SELL there leaves `reduceOnly=true`; `-6057` clears writing on every row of that underlying. |
+| R3 price the held | An option the account holds outside the chain joins it at the engine's boot — before any table is built from the chain — so the options lane prices it and the arm binds it under the same id. |
+
+#### What is built and how it reaches the engine
+
+* **The gateway** (`crates/exec-binance`) gains the options lane:
+  `LANES` = 4, `LANE_ORDER` = `[USDM, COINM, SPOT, OPTIONS]`. REST-only
+  (eapi has no WS API): every verb on eapi REST over the lane's REST
+  route, HMAC-signed with the options key's header; the user stream on
+  `/private/ws/<listenKey>` (mainnet `fstream.binance.com`, Demo
+  `fstream.binancefuture.com`; Demo REST `testnet.binancefuture.com`).
+  `POST /eapi/v1/order` LIMIT + IoC (`clientOrderId`, ACK, the STP mode,
+  `reduceOnly`); `GET /eapi/v1/order` resolves an order in doubt (BX-11).
+  The cycle: `marginAccount` (the route) → `position` → `openOrders`
+  (jobs); the day: `userTrades` a row at a time (weight 5, the symbol
+  required), paced in eapi's window; settlement: `exerciseRecord`;
+  adoption's index: `/eapi/v1/index`.
+* **The arm** admits an option row IoC-only on options' own ORDERS pool
+  (30 / 10 s, 100 / min at `orders_frac`), applies the writing law
+  (Q-6), unwrites an underlying on `-6057`; the UM quantitative rules and
+  the breadth stay futures'.
+* **The ledger** (`exec-router`) keeps `LAW_OPTION` rows: Q-2's staleness
+  (`INST_STALE`, set at bind and by the sweep, cleared by a sane summary)
+  and sanity (`option_mark_sane`, over `core_types::option_mark_band`).
+* **The boot** (`cli::bn_live`) binds `[exec.binance] products` naming
+  `options` — alone or beside `usdm` (Q-4) — from the paper-selected
+  chain (`paper.rs`: `bn_option_rows`, `bn_option_universe`); the engine
+  (`multivenue-engine.rs`) resolves the exec artifact BEFORE the boot
+  discovery and, with a live options arm, reads the options held
+  (`bn_live::options_held_outside`: one signed `GET /eapi/v1/position`)
+  right after it — those outside the chain join it under the next ids
+  (`BN_OPT_ORDINAL_BASE` + the chain's length + k + 1) before the
+  manifests, the descriptor table and the options lane's mark table
+  (`EAPI_TABLE_MAX` = 64 + `EAPI_HELD_MAX` 16) are built. On a shared
+  account (not armable today) only the options of an owned underlying
+  join, and every owned underlying must be configured (the risk review's
+  R2-4). The arm's
+  config (`bn_live::arm_config`) is built once, before the discovery,
+  and serves both the held read and the arm's boot — the options HMAC
+  key borrowed, never duplicated (R2). `exec_boot` judges eapi's weight
+  (a cycle in hand must leave the day read some of the lane's 240 a
+  minute) and refuses options beside PM, PM Pro, COIN-M or spot (R2-5:
+  options are proven alone and beside USDⓈ-M only).
+* **The Demo tools**, reached only through `exec-smoke`: the battery's
+  `--binance options --lifecycle` (`cli::bn_battery`, options alone) and
+  the probe's `--binance-probe options` (`cli::bn_probe`, the K-probes).
+
+#### The writing law (BX-18, Q-6)
+
+* `INST_WRITABLE` = the underlying's `nakedSell` ∧ `options_write` ∧ not
+  TradFi (the table never makes a TradFi row writable). The ledger's row
+  carries the table's own writability (`InstrumentSpec` flags), so the
+  ledger's `Short` refusal of an opening short on a non-writable row is
+  the first guard; the arm's `writing_law` is the second: on a
+  non-writable row a SELL with no long of the owner's (`pos_1e6` ≤ 0,
+  the gateway's booked position by `EVT_POSITION`) is `NotWritable`,
+  before the pool; any other SELL there leaves reduce-only (the venue
+  refuses a short, `-2022`).
+* `-6057` → `CodeClass::WriteFatal` → `unwrite_underlying`: every row of
+  that underlying loses writing for the boot; its longs still trade.
+  No other options code is classified (the risk review's R10: `-6055` /
+  `-6059` are unsourced — ordinary refusals; a closed account is read
+  where it is documented: `marginAccount`'s `reduceOnly` / `canTrade`, the
+  stream's `RISK_LEVEL_CHANGE`).
+
+#### Margin and the account (BX-19, BX-20)
+
+* The ratio is `maintMargin / adjustedEquity` (the USDT entry) into
+  `MarginBook`'s options product. `reduceOnly = true` or `canTrade =
+  false` refuses the boot before Ready (`AssertErr::ReduceOnly`,
+  `CannotTrade`), a `VenueLock` after it (once, `CODE_OPT_ACCOUNT`);
+  `RISK_LEVEL_CHANGE REDUCE_ONLY` is a lock; `ACCOUNT_UPDATE` asks a
+  paced margin re-read. The options key's permissions are judged at boot
+  (`judge_key`: `enableVanillaOptions`, never withdrawals).
+
+#### Settlement (expiry)
+
+* A BOOKED leg past its expiry is **settling**: not judged, the cycle
+  still conclusive (`Leg::settling`), while `exerciseRecord` is read each
+  cycle from the earliest settling expiry. A record of a booked row books
+  ONE settlement fill (`FILL_FLAG_SETTLEMENT`: the ledger zeroes the row,
+  no turnover) at the intrinsic value per contract that flattens it, its
+  fee journaled (`TRADE_BY_SETTLEMENT`) — only when the record AGREES
+  with the leg (`recon::settlement_agrees`, the risk review's R4): its
+  signed quantity the whole booked position, the cash's sign the side's
+  (a short's never positive — the docs' example), and the cash per
+  contract the intrinsic value its own `exercisePrice` gives within the
+  fee per contract (at most a tenth of the intrinsic), a thousandth of
+  the intrinsic and 0.001 USDT. A record that disagrees books nothing and
+  is a scan failure (the slot's drift halt); the leg stays settling until
+  `EXPIRY_HOLD_MAX_MS` (2 h), then is judged — drift, fail closed. The
+  venue holding an expired row with nothing booked is judged at once (R9).
+  An exercise page naming one symbol twice is a scan failure, nothing
+  booked.
+* A place on an expired row is refused locally (`CODE_EXPIRED`).
+
+#### Adoption
+
+* A position read's mark of 0 is accepted (a negative one refused); a
+  leg's price is taken only from a non-zero notional.
+* Held options are adopted (a dedicated account, within the cap): a long
+  at its mark (a mark of 0 is a price — worth nothing), a short at its
+  initial margin's upper bound per contract (the mark + 15 % of the index
+  × the unit, `OPT_SHORT_IM_MAX_1E6`; the index read once at boot). The
+  index is checked against the venue's own mark of the row: a mark
+  outside the no-arbitrage band at that index prices nothing — refused
+  unpriced (`Inventory(i64::MAX)`, the risk review's R7: an index read
+  low would understate the bound; a call's band bounds it weakly — see
+  the residuals). A held short on a non-writable row
+  refuses the boot (`OptionShort`); an order of ours resting at boot
+  refuses it by name (`OptStray`), never cancelled.
+
+#### E7 (Q-4) and the anchor
+
+* The session equity sums the parts armed — USDⓈ-M's margin balance and
+  the options account's `equity` — and is 0 until EVERY part is read; the
+  anchor reaches the arm only beside an equity read whole
+  (`equity_known`; the risk review's R5: a restart's persisted anchor
+  beside one part read as a loss of the other — proven by a test that
+  failed before the fix). PM and PM Pro: the unified account's.
+* The anchor file records the equity's **basis** beside the key's tag and
+  the mode (the risk review's R1, a blocker): `um`, `opt-<the options
+  key's tag>` or `um+opt-<tag>` (classic), `unified` (PM, PM Pro). Arming
+  options into a USDⓈ-M session, dropping them, or another options key
+  refuses the boot ("delete it to end that session"); a line written
+  before BX9 reads as its mode's basis alone.
+
+#### Governed budgets (BX-12)
+
+* eapi's REQUEST_WEIGHT is its own pool (400 / min an IP; the lane's
+  share 240): `W_OPT_RECON` 53 (a cycle at its worst: `marginAccount` 3,
+  `position` 5, `openOrders` 40, `exerciseRecord` 5), the margin re-reads,
+  the clock when eapi is the only lane — `opt_weight_per_min`. The day
+  read waits while the window cannot take a whole cycle more
+  (`opt_day_room`); `exec_boot` refuses a cycle that leaves the day
+  nothing (`opt_day_row_ns`: a 20 s cycle does; the default 60 s leaves
+  94 a minute alone — a row each 3.19 s — and 98 beside USDⓈ-M, where
+  the clock is fapi's); the boot's timeout is
+  `bn_live::boot_timeout_ns` — 30 s, and with options one window more and
+  every bound option row at that worst pace (R6; a simulation of the
+  gateway's pacing pins it for 1 to 128 rows).
+* The futures' steady-weight check (`arm_weight_per_min`, BX-12) is
+  skipped for options alone only — eapi's weight is judged apart; a
+  spot-only arm keeps its phantom futures lane (`lanes.max(1)`), as
+  before BX9. The options ORDERS pool is mainnet's 30 / 10 s and 100 /
+  min (Demo's looser 300 / 6 000 are not used).
+
+#### Gates
+
+* **Alloc 123** (+ 4 ignored helpers; was 121): gate 110 — the options
+  lane over a real rustls loopback (the scripted venue in a child): an
+  IoC BUY and SELL a round, each one route request and its answer and
+  the stream's NEW and TRADE, `G110_ROUND` rustls records; a
+  reconciliation cycle with the PUT HELD LONG through it (the alloc
+  review), `G110_RECON`. Gate 111 — options' renders, scans and judges
+  at 0 B, with the stale-row branch every 64th turn (the sweep past the
+  stale age, both probes `Unpriced`) and the exercise record's
+  agreement. Gate 92 — the arm on the engine thread now with a writable
+  call and a non-writable put held long: `-6057` unwrites the call
+  (every later call SELL with no long `NotWritable`), every put SELL
+  leaves reduce-only, options' pool takes its window's 30; 0 B. Not
+  pinned on a socket (gate 110's list): the boot; the paced margin
+  re-read; the exercise records and a settlement fill; an unfilled IoC's
+  `EXPIRED` and `RISK_LEVEL_CHANGE`; a place on an expired row; an
+  in-doubt query.
+* **Copy:** every new copy marked or zero-copy (the held options' symbols
+  borrowed from the read's body; `WireTable`'s underlyings boxed).
+* **Fuzz:** a new target `bn_option_rest` (the options scanners, the
+  settlement price against an exact i128 reference, the record's
+  agreement); `bn_user_event` reads options' rows and
+  `RISK_LEVEL_CHANGE`; `bn_mode` judges the options key.
+* **Fuzz (Mac):** the 15 Binance targets × 300 s, no crash; the three
+  whose oracles changed again on the final tree — `bn_option_rest` 25.7
+  M, `bn_user_event` 28.9 M, `bn_mode` 16.0 M runs.
+* **The Mac's gates on the final tree:** lint clean; nextest 4 491
+  passed, 10 skipped; alloc (release) 123 passed, 4 ignored; copy-audit
+  new=0; SPDX on the commit's paths; the licences unchanged.
+
+#### The Demo exit
+
+On this tree's release binary (md5 `598a63e6…`), 2026-10-11, Demo orders
+only. Demo's eapi host, `testnet.binancefuture.com` (a CloudFront edge),
+flapped from the Mac from 05:25Z — answering, then timing out — as it did
+on 2026-10-10; the runs were retried through it.
+
+* `--binance-probe options` (05:39:57Z): PASS — eapi served from
+  `testnet.binancefuture.com` (646 rows; `demo-fapi` 403s `/eapi/*`); the
+  Ed25519 key refused (`-2015`, the key before any signature), the HMAC
+  key accepted (`marginAccount`); a 32-character `mv…` id accepted on a
+  BUY and a SELL IoC; the user stream on
+  `fstream.binancefuture.com/private/ws/`; `countdownCancelAll` `-6005`;
+  nothing left.
+* `--binance options --lifecycle` (05:46Z): PASS — `BTC-261012-88000-C`
+  (writable), the boot 1.7 s, nothing adopted, no unseen leg; 5 LONG and
+  5 SHORT IoCs answered, each ended unfilled by the venue (Demo's options
+  books held no two-sided row: the IoCs went at the band's far edge);
+  3 agreeing reconciliations (4 cycles reconciled, none failed); the
+  sweep a no-op; the flat read clean.
+* `--binance options --lifecycle --bn-rest --bn-hmac` (the arm's key the
+  HMAC pair too): not reached on this binary — 16 tries from 05:46Z to
+  06:00Z each timed out at the edge before the boot (exit 50, a request
+  that did not complete). It passed at 04:14Z on an earlier tree; the
+  runbook's §7 runs it again on the binary deployed.
+* Before these, the flapping edge failed tries with 50 and 51 (a request
+  or the boot timed out) and one 58 whose end could not read the account;
+  the next run's account check and flat read found it clean. None was a
+  defect of the arm. The same battery and the REST + HMAC variant passed
+  at 04:12Z and 04:14Z on an earlier tree of this phase (before the
+  battery's stricter mark read).
+* The plan's exit beyond these — a fill long and short, the IM against
+  the venue's `initialMargin`, the expiry — is BX13's (Q-3; the
+  residuals).
+
+#### Departures (from plan §5 BX9 and the build plan)
+
+| departure | from | as built, and why |
+|---|---|---|
+| settling | the build plan: a leg past expiry is held | `Leg::settling` — only a BOOKED leg (R9), and the cycle stays conclusive; judged after 2 h |
+| the held | Q-5: bind every held option | R3: they join the chain at the engine's boot and are priced; the exec artifact is resolved before the discovery |
+| the boot's timeout | the build plan: ~90 s | derived from the rows and eapi's pace (R6) |
+| `-6055` / `-6059` | the build plan: a lock | ordinary refusals (R10: unsourced) |
+| the anchor | E7's file: key and mode | and the equity's basis (R1) |
+| the record | the build plan: the record books the settlement | only a record that agrees (R4) |
+| the index | the build plan: read once | and checked against the venue's mark (R7) |
+| the battery | plan §5: long and short IoCs, a reconciliation | options alone; two LONG and two SHORT IoCs answered and two agreeing reconciliations — fills reported, not required (a Demo options book is often empty) |
+| gate 110 | the build plan: the settlement on the socket | the scans and the price at 0 B in gate 111; the socket's list above |
+
+#### Residuals
+
+* **R8 — one account, two keys.** Nothing proves the options HMAC key and
+  the arm's key are the same account's (eapi names no UID): the operator
+  uses one account's pair. The anchor's basis names the options key's tag.
+* **R12.** A place on an expired row is refused by the gateway
+  (`CODE_EXPIRED`) after the arm's options pool counted it.
+* **R13 — `/state`.** It shows options' margin ratio and eapi's weight;
+  not the settling legs, the exercise reads or the held options joined
+  (the boot's log and the manifests name those).
+* **The record's shape is Demo's to confirm** (Q-3, BX13): which field
+  is the settlement price, the `amount`'s sign for a short (if the venue
+  sends it unsigned, `settlement_agrees` refuses every short's record — a
+  scan failure, then drift: fail closed, loud), a mark of 0 on a live
+  row, eapi's `-2013` for an unknown order, the options equity on
+  mainnet.
+* **The held read** is one read at boot: an option bought between it and
+  the arm's boot is an unbound leg — on a dedicated account the boot
+  completes with the slot unreconciled (it refuses every order;
+  `unseen_legs` in the boot's reconciliation tells) until it is closed in
+  the app or a restart joins it; one bought after Ready leaves the cycles
+  unreconciled and the slot halts `ReconStale` at
+  `halt_on_recon_stale_ms` (orders pass until then). On a shared account
+  (not armable today) it would read as another owner's — and a held
+  option no listed row names is skipped there even when its underlying is
+  owned (the risk review's round 3): it must refuse by name before a
+  shared scope is armable. More than 16 held outside the chain refuses
+  the boot by count.
+* **An expired option still held** while its settlement is pending, if
+  the venue no longer lists it, refuses the boot by name (no listed row
+  names it) until the venue settles it.
+* **The index check's call side (R7).** The band's lower edge (the
+  intrinsic) catches an index read low on a put; on a call a low index
+  only lowers the lower edge, and the upper edge (index × unit) refuses
+  it only below the mark — an out-of-the-money call's small mark admits
+  an index read far low, understating a held short call's IM bound. The
+  index is the venue's own `/eapi/v1/index`, read once at boot.
+* **BX13 arming preconditions** (beside Q-3's expiry run): a Demo options
+  FILL, long and short, booked and reconciled — the Demo runs filled
+  nothing (Demo's options books held no two-sided row); the record's
+  shape and the other points below.
+* **A stale row's exposure** keeps its last values (Q-2); the E7 bound
+  reads the options account's equity, mark-to-market, whatever the
+  ledger's.
+* No cancel, batch, amend, maker, MMP or countdown (the countdown is a
+  market maker's, `-6005`); options beside PM, PM Pro, COIN-M or spot
+  refuse the boot.
+
+#### The reviews
+
+| round | reviewer | verdict | disposition |
+|---|---|---|---|
+| 1 | risk | REQUEST-CHANGES: R1 (BLOCKER) the E7 anchor named no equity basis; R2 a throwaway duplicate of the HMAC secret; R3 a held option outside the chain bound but unpriced; R4 a settlement booked from any record; R5 an unread equity read as a loss; R6 the 90 s boot timeout against 64 rows; R7 the adoption index unchecked; R8 the two keys' account; R9 settling with nothing booked; R10 `-6055` / `-6059` as a lock, unsourced; R11 `EXERCISE_PAGE`'s doc; R12 an expired row's place spending the pool; R13 `/state` and the manifests; R14 tests | R1, R2, R4–R7, R9–R11, R14 fixed in code, each new law break-and-watched (above); R3 ruled "Price it" by the operator and built; R8, R12, R13 residuals |
+| 1 | parser | findings: a mark of 0; `json_bool` reading a prefix; `status_of` shared; bytes after the options account object; the settlement price and agreement unfuzzed | a mark of 0 accepted (a negative refused), a leg priced only from a non-zero notional; `json_bool` whole (`rest::whole`); documented; refused; `bn_option_rest` |
+| 1 | alloc | findings: gate 92 without options; gate 110 without a held leg through the window; gate 111 without the stale branch or the agreement | gate 92's options rows (`-6057`, `NotWritable`, reduce-only, the pool's 30); the put held long through `G110_RECON`; the stale branch every 64th turn and `settlement_agrees` in the cycle |
+| 1 | zero-copy | findings: a name `String` at bind; the held options' `String`s; `paper.rs`'s COPY lines; `WireTable`'s underlyings inline | removed; borrowed spans, the join's copy marked; completed; boxed |
+| 2 | alloc | PASS | — |
+| 2 | zero-copy | findings: COPY lines whose stated bounds the held options' widening outgrew; the anchor's basis built through a temporary | the bounds restated (the mark table's 3 208 B, the paper Driver's ≈ 3.5 KB); the basis written in place (`// COPY:`, ≤ 96 B); copy-audit new=0 |
+| 2 | parser | findings: the fuzz oracles trusted what the scanners returned; the account read not proven whole within its span; the agreement not driven at its boundary | each accepted element re-read apart from the scanner (its side's sign, its notional at its mark); a byte after the account, or a span one short, refuses it; the agreement's law restated and driven near its edge; the index answer whole |
+| 2 | risk | REQUEST-CHANGES: the laws' sections without options (BX-4, BX-11, BX-12, BX-17, BX-19) and the futures' weight check's change unrecorded; the held read's residual worded wrongly; R7's call side unstated; R2-4 a shared account's held options of other owners; R2-5 options beside COIN-M or spot untested; a Demo fill as a BX13 precondition; NITs | R2-4: only an owned underlying's held options join, each owned underlying configured; R2-5: refused in `exec_boot` (tested); the futures' weight check restored (`lanes.max(1)`), skipped for options alone only; the laws' options lines; this entry's wording (the held read, R7's call side, the BX13 preconditions, gate 92's `NotWritable`) |
+| 3 | risk | APPROVE; MINOR: BX-11 cited a futures render test for the options in-doubt query; the template test lacked the options variants `exec.toml.example` lists; BX-20's Open line contradicted its own options line, and no test drove the options ratio; R2-4's filter skips an owned, unlisted held option on a shared account (latent: shared is not armable); NITs: the runbook on an option bought while the engine runs, the boot's unseen-legs message, the weight check's new edges untested | `the_options_place_and_status_query_name_eapis_client_id` (break-and-watched: futures' `origClientOrderId` fails it), cited in BX-11; five options cases in `the_templates_binance_recipe_boots_every_built_product_and_mode` (two refusing); BX-20 corrected and `the_options_margin_ratio_halts_the_slot` (break-and-watched: the options product out of the slot's margin mask times it out); the shared gap stated in BX-4 and the residuals — a precondition before a shared scope is armable; the runbook's §6 and §11 and the boot's message; a heavy spot-alone (refused) and options-alone (boots) case (break-and-watched: no skip, or a skip for any lane-less arm, fails it) |
+| 3 | parser | PASS; F1 (MINOR) a byte after the exercise page refused by no test; F2 (NIT) the proptest's sign drawn wrong 7 in 8, its edge never sampled | F1: the unit test's refusals and the fuzz oracle (break-and-watched: dropping `ends_whole` in `scan_exercise` fails it); F2: the side's sign 7 in 8, a quarter of the cases one contract within 3 µUSDT of the tolerance's edge — `<=` read as `<`, the 0.001 USDT floor dropped, the fee cap dropped and the sign law dropped each fail it |
+| 3 | zero-copy | PASS; cold: the universe copy's rejected alternative circular and its growth unstated; the chain's vectors grown by push past 64 | the `// COPY:` line restated — counted first, sized once; the alternative (the discovery's own vector out, filtered at the lookup) named and why rejected; the chain's vectors sized `EAPI_TABLE_MAX` at once |
+| 3 | alloc | PASS (debug: 123 passed, 4 ignored; release on the Mac); notes: the duplicate check's n², its absence from gate 110's list, `option_mark_band`'s doc | the check stops at its second sight; named in gate 110's unpinned list; the doc: warm on the ledger's path, cold in the gateway |
+
+### BX10 — the Binance Stocks arm, battery-only (2026-10-11) — no member arms (O-BX6, O-BX16); the engine refuses it (S-3)
+
+Built on branch `binance` (plan §5 BX10; the BX10 build plan of
+2026-10-11, the project doc `claude/bx10-build-plan-2026-10-11.md`, and
+the operator's rulings S-1 … S-3 of 06:15Z). The code was built and its
+tests run in the cloud; the Mac's gates and the one `BX10:` commit came
+after. **Binance Stocks has no Demo and no testnet (R21): every order is
+real money.** The session placed none: the arm is proven on the scripted
+venue alone, the shapes the read-only mainnet probe could pin are pinned
+(S-1, plan doc §1a), and the mainnet battery is built for the operator to
+run. **Scope:** `/sapi/v1/equity/*` × classic, LIMIT DAY under a
+mandatory gateway TTL, long-only, on a dedicated account, one owner slot.
+The laws are restated as built above ("BX — the Binance execution
+laws"); their BX10 bullets carry this entry.
+
+#### The rulings (2026-10-11)
+
+| ruling | what it fixed |
+|---|---|
+| S-1 the scripted venue + a read-only probe | No Demo exists: the arm is built and proven against `exec_binance::testvenue`'s `/sapi/v1/equity/*` and its order stream; the read-only keyed probe on mainnet (`exec-smoke --binance-probe equity [--bn-stream-confirm]`, EQ0–EQ7, PASS 06:48Z) pinned the hosts, the rules' shape (no `minQty`; `minNotional` $5; a 1e-9 step), the history pages' envelope, `486218` for an unknown order, HMAC on `/sapi/v1/equity/*` and the listenKey and stream address. |
+| S-2 reconciliation from executions | No positions endpoint: a cycle compares the venue's executions since the session's window opened (`trade/history`, paged) with what the gateway booked since its boot, ticker by ticker, and judges the open orders (ours by UUID, strays). Holdings are never read (a residual). |
+| S-3 battery-only | The ENGINE keeps refusing `equity` (now naming S-3, O-BX16 and R17: no member trades it and no equity market data exists); the arm is exercised only by the operator's battery, `exec-smoke --binance equity --lifecycle`, which carries the D5 keys as flags. |
+| (the session's calls, the plan doc §2) | LIMIT only (a MARKET BUY needs `notional`, which the arm's quantity law cannot bound); DAY only (a GTC order outlives any TTL); a mandatory gateway TTL on every equity order (BX-17's one exception); `walletType=MAIN` on a BUY (a SELL settles to the funding wallet by the venue's rule); the fills booked from `order/detail`'s executions, the stream the trigger only; the fee from the detail's cumulative `fee`, journaled with the $0.35 floor's flag (BX-14). |
+
+#### What is built, and how it is kept from the engine
+
+* **The gateway** (`crates/exec-binance`) gains the equity lane:
+  `LANES` = 5, `LANE_ORDER` = `[USDM, COINM, SPOT, OPTIONS, EQUITY]`.
+  REST-only on SAPI (`api.binance.com`): the place, the cancel and the
+  in-doubt detail on the lane's REST route; the detail after a report,
+  the listenKey (a signed `POST /sapi/v1/equity/listenKey`, its renewal
+  the same `POST`), the open orders, the pages of executions and a
+  ticker's day as jobs; the order stream on
+  `nbstream.binance.com/equity/ws/<listenKey>@orderReport` (the key a
+  36-character UUID; `DNS_HOSTS` 11). The scanners are
+  `exec_binance::equity` (each answer read whole; numbers from their
+  text, never through `f64`).
+* **The arm** admits an equity row LIMIT DAY under its TTL
+  (`ArmKnobs::equity_ttl_ns`, stamped on every equity order; 0 refuses
+  every one, `Refusal::Ttl`), long-only (a SELL with no booked holding is
+  `NotWritable`), on the venue's sides (`tradability`, bound at boot: a
+  closed side is `NotLive`), on equity's own ORDERS pool (200 a minute at
+  `orders_frac`); no reduce-only, no maker, no modify. The cancel passes
+  despite the row's `INST_NO_DEADMAN` (an equity order rests).
+* **The ledger** binds an equity row `LAW_SPOT` (long-only, a cash
+  holding; priced at its last fill or its limit — no equity market data,
+  R17).
+* **The engine refuses it, three ways:** `exec_boot::check_binance`
+  refuses `products` naming `equity` (S-3, O-BX16, R17); `bn_live` builds
+  the gateway with no D5 keys (`GwKnobs::equity: None`, an equity row
+  then refuses the boot — `BootErr::Product`) and the arm with no TTL
+  (`equity_ttl_ns: 0` — every equity order `Refusal::Ttl`); and
+  `bind_table` binds no equity row.
+* **The operator's tools**, reached only through `exec-smoke`: the
+  read-only probe (`--binance-probe equity`, S-1) and the battery
+  (`--binance equity --lifecycle`, `cli::bn_equity_battery`, below).
+
+#### An equity order's life
+
+* **The place** (`POST …/order/place`): `symbol`, `side`, `orderType=LIMIT`,
+  `quoteAsset`, `price` (the cent), `quantity` (the row's step),
+  `timeInForce=DAY`, `tradingSession`, `walletType=MAIN` on a BUY, our
+  32-character id, `tokenize`. A place with no deadline is refused before
+  a byte is rendered (`CODE_EQ_TTL` 9 019). Its answer is a RECEIPT
+  (`status:"S"`, the order's UUID, our id echoed — `J_ACK`); `"F"` is the
+  venue's refusal (`CODE_EQ_REFUSED` 9 018, which moves the reject streak
+  as a coded refusal does — the risk review's item 4); an answer that does
+  not echo our id or name a UUID is no answer we know (in doubt). The UUID
+  is held whole per order (`EqOrderId`, 36 bytes); the table's
+  `venue_oid` is its FNV-1a key (`eq_key`, case-folded, never 0), a key
+  match confirmed against the whole id, either case.
+* **The broker's `ACCEPTED`** is journaled once an order (`J_ACCEPTED`,
+  kind 11), from a report or a detail.
+* **The stream** (`orderReport`: JSON numbers, lowercase words, `EQ_` +
+  the ticker; no client id, no execution id) is the TRIGGER: a report
+  that ends the order or names more filled than booked asks the order's
+  detail (once at a time). A report that arrives before the place's
+  answer names no order we hold: the UUID-less orders in flight are
+  marked, and each asks its detail when its answer names it (a lost or
+  unread answer puts it in doubt instead); such a report's `ACCEPTED` is
+  kept by its UUID's key (the last 8) and journaled once an answer names
+  the order — an order can end before any detail reads it `ACCEPTED`
+  (round 2: gate 112 under load).
+* **The detail** (`order/detail` by the UUID, or by our id while none is
+  held) books the executions — oldest first, each once (its
+  `executionId` keyed on the trade-id ring, exact: `exec_key`), never
+  past the cumulative `filledQty`; a cumulative past the executions
+  listed books at the implied price (`J_FILL_UNSEEN`) — except the cut the
+  venue's nine decimals make to six on each execution (up to a millionth
+  an execution past the first, never booked: the history's rows are cut
+  the same way — the risk review's S3). A detail filled past the order's
+  own quantity, `FILLED` short of it, of another UUID, or of another side
+  is a scan failure (BX-15; the round-2 B1: an end must never leave the
+  venue's holding unbooked); so is a detail that does not name
+  `filledQty`, names a filled word (`FILLED`, `PARTIALLY_FILLED`) with
+  nothing filled, or a fill with no `trades` key (`null` is no execution:
+  the cumulative books at the implied price). The fee: the detail's cumulative `fee` (USD), journaled by its
+  increase (`J_FEE`; `FEE_FLAG_EQ_FLOOR`, bit 14, while the order's
+  notional is under $350 — the $0.35 minimum, no rate).
+* **The ends:** `FILLED`; `CANCELED` (ours, `CANCELED_MEMBER` /
+  `CANCELED_TTL`, when the venue took a cancel of ours; else
+  `CANCELED_VENUE`); `EXPIRED` (a DAY order at its session's close);
+  `REJECTED` (`CODE_EQ_REFUSED`). Only a detail ends an order.
+* **The TTL and the cancel:** at the TTL's deadline the gateway cancels
+  the order by its UUID (`POST …/order/cancel`; owed until a UUID is
+  known — the cancel goes once the place's answer, or the detail, names
+  it). The cancel's `S` is a receipt too (the risk review's S1): the
+  cancel is owed again 5 s on (`EQ_CANCEL_CHECK_NS`) and goes again if
+  the order is still working then — its end disarms that; the third `S`
+  for one order still working is a scan failure (`EQ_CANCEL_TAKES_MAX`,
+  round 2's m5: never an endless retry); a halt's sweep leaves a taken
+  cancel to that re-check (a slow broker's receipts are no failure to
+  count). A cancel answered `F`, `486219`,
+  unreadably, or naming another UUID leaves the order in doubt with the
+  cancel owed.
+* **In doubt** (BX-11): one detail query a second; `486218` ("no such
+  order") ends an order only past `recvWindow` + 5 s and only while no
+  UUID is held — for an order the venue's receipt named it is a scan
+  failure (the risk review's item 3). `486449` (a duplicate id) is in
+  doubt, never re-sent. An answer under 500 naming no code a scanner
+  reads (a CDN's page, a code named twice, a 2xx we do not know) is a
+  scan failure — a place in doubt, a cancel owed as an unread one (the
+  order in doubt, the cancel re-sent once its detail shows it working,
+  never at once into a page that keeps answering; round 2's m1, round
+  3's MINOR). No path re-sends a place.
+
+#### Reconciliation (S-2)
+
+* **The window** opens at the boot's first cycle and never moves. A
+  cycle reads the session's executions page by page (`trade/history`,
+  100 a page, `current=<n>`): **the page law** (the risk review's item 2)
+  — each page must be the one asked for at the size asked for (a venue
+  that ignores the page parameter would hand page 1 twice: a scan
+  failure), the window's `total` fixed by the first page (another
+  `total` later fails the cycle), the rows summing exactly to it, at most
+  `EQ_PAGES_MAX` (20) pages — else the cycle fails, no verdict. Each
+  ticker's net (a BUY adds, a SELL takes) is its leg's venue figure,
+  against what the gateway booked since its boot; a ticker no row binds
+  is an unseen leg. A leg is HELD (the cycle inconclusive) while an order
+  of ours on its row is in doubt or its detail is being read.
+* **The open orders** (no client id): ours by UUID; one of ours listed
+  with more filled than booked asks its detail (a fill the stream lost,
+  the risk review's S4); nothing is judged while an order of ours has no
+  UUID yet. Another's order is a stray: before Ready it refuses the boot
+  by name (`EqStray`: on a bound ticker, or — on a dedicated account — on
+  any, `ROW_NONE`; the operator cancels it in the app), after it foreign
+  (counted, never cancelled).
+* **The sweep** (a halt's, the shutdown's) cancels every equity order of
+  ours by its UUID each round; from the second round (or after a sweep
+  stranded), on a dedicated account and while an equity order of ours is
+  open, the account's `cancel-all` too; the confirmation is a cycle.
+
+#### The battery (`exec-smoke --binance equity --lifecycle`; MAINNET, the operator's)
+
+* **Flags:** the D5 keys `--bn-eq-session` (RTH / EXTENDED / 24H),
+  `--bn-eq-tokenize` (0 / 1), `--bn-eq-quote` — required, no default;
+  `--bn-eq-symbol` (AAPL), `--bn-eq-ttl-ms` (5 000 … 300 000; 60 000),
+  `--bn-usd` (6 … 25 for Stocks), `--bn-rest-bps` (50 … 900),
+  `--bn-cross-bps` (1 … 300); `--bn-confirm-mainnet`, the operator's word
+  (the sealed `MainnetVerb`) — without it the battery reads (the clock,
+  the ticker's rules, its quote, the open orders: none may rest) and
+  prints its plan, and sends nothing (exit 64). The key is `.env`'s live
+  Ed25519 pair, else its live HMAC pair; it must trade Stocks.
+* **The router's clamps** on its slot: one order $50, the holding $50,
+  the day $200, two orders working; the halts `exec.toml.example`'s (5
+  rejects, $5 of drift, 30 s of a silent route, 3 local refusals, 300 s
+  unreconciled).
+* **The run:** a BUY at `--bn-rest-bps` under the bid — `ACCEPTED`, then
+  cancelled by its member (`CANCELED_MEMBER`); a marketable BUY at
+  `--bn-cross-bps` over the ask at `--bn-usd` (at least the minimum
+  notional) — filled, or ended by its TTL; the SELL of the holding the
+  ledger booked (floored to the step) through a fresh bid; three
+  reconciliations in a row after the SELL that agree (a cycle read before
+  the SELL was booked can land after it, and a leg's first differing
+  cycle still reads reconciled — the risk review's S2 and round-2 m2).
+  The end, always: the holding not sold offered once more; the shutdown
+  sweep; the open orders read empty, and the ticker's executions since
+  the run began (`trade/history`) netting to what the run booked (round
+  2's B1: else the difference may be held, unreported) — else 58.
+* **Exits:** 0 the bar met; 50 the account (a resting order — `EqStray`
+  — or a ticker not tradable both ways or not at all; also a place
+  refused not tradable later in the run); 51 the boot; 52 the rest phase
+  (never `ACCEPTED` — the session may be closed — or not cancelled by its
+  member), or a place refused with a code the tool does not map; 56 no
+  three agreeing cycles; 57 a fill missing; 58 something left (an order
+  rests WITHOUT its TTL until its session closes — cancel it, and sell a
+  holding, in the app) or the executions disagree with the booking; 64
+  no word; 66 `486410` — the disclaimer unsigned (signed in the app,
+  never by the tool; nothing placed). `scripts/exec-smoke.sh`
+  prints a MAINNET banner before the run and the MAINNET reading of each
+  code.
+* **Preconditions:** a dedicated account (no manual Stocks order during
+  the run — a halt's `cancel-all` takes the account's every equity
+  order); `--bn-eq-tokenize 1` lands the fill as a bStock — never one an
+  armed engine's spot row holds; one Ctrl-C (a second kills at once). Cost
+  at the minimum: two fees at the $0.35 floor and the spread twice.
+
+#### Gates
+
+* **Alloc 125** (+ 4 ignored helpers; was 123): gate 112 — the equity
+  lane over a real rustls loopback (the scripted venue in a child): a BUY
+  and its SELL a round, `G112_ROUND` = 12 rustls records (each order's
+  place and answer, the stream's `accepted` and `filled`, its detail);
+  TTL rounds — a resting order the gateway's TTL cancels by its UUID,
+  `G112_TTL` = 8; the halt's sweep with an order resting — its cancel by
+  the UUID, then the confirmation cycle over one page — `G112_RECON` = 9,
+  measured BEFORE the rounds (a cycle reads every execution since the
+  boot: a page over rustls' 4 KiB read buffer grows and shrinks it in
+  arrival-dependent steps — rustls' allocations, not pinnable to an exact
+  count; a full page's scan is gate 113's). Gate 113 — the renders (the
+  place, the cancel and detail by UUID, the in-doubt detail by our id, a
+  page of the window or a ticker's day), Ed25519-signed in place, and the
+  scans (the receipt, the reports, the detail, the cancel, the listing, a
+  FULL 100-row page) at 0 B. Gate 92 — the arm with AAPL (both sides) and
+  SPY (SELL-only): 200 equity orders on equity's pool, each under the
+  TTL and cancelled by its member, every seventh from the third refused
+  by the venue with a six-digit code (29, asserted, each a reject the arm
+  counts), SPY's BUYs `NotLive`; 0 B. Not pinned on a socket (each
+  allocation-free by inspection, built of what the gates pin): the boot;
+  the listenKey's renewal; a non-empty listing's found row (scanned in
+  gate 113); the multi-page cycle's hand-off; the implied-price
+  remainder; the route's in-doubt detail; the account's `cancel-all`;
+  the gateway's refusals (a place answered `F`, coded, unreadable or
+  `486218`; a cancel answered `F`, unreadably or naming another UUID);
+  a cancel's re-check firing on an order still working; the
+  `CANCELED_VENUE`, `EXPIRED` and `REJECTED` ends; a stray or foreign
+  listing row; the over-fill, page and total guards; an early report's
+  kept `ACCEPTED`; bursts over rustls' 4 KiB window.
+* **Copy:** the UUID copied once an order into its slot, only from an
+  answer of ours (marked); one execution (≤ 64 B) off the read's array,
+  only once it books (marked); the asked ticker and its rules' row (80 B,
+  moved by value) at boot (marked, cold); copy-audit new=0.
+* **Fuzz:** `bn_equity` (new) — every equity scanner against oracles: an
+  accepted answer whole, executions whole and summing ≤ `filledQty`, no
+  id named twice, no figure negative, a page within its `total` and its
+  `size`, the rules for a ticker the input names, `json_num_1e6` against
+  an independent textual oracle (agreeing on 5 M cross-checked inputs),
+  the UUID shape against a byte-wise model.
+* **Proptests:** `tests/bn_equity_proptest.rs` (11) — round trips of every
+  scanner, the one-reading law (nested keys included), arbitrary bytes.
+
+#### Departures (from plan §5 BX10 and the build plan)
+
+| departure | from | as built, and why |
+|---|---|---|
+| no 1 s poll | the plan: the stream, or a 1 s poll while it is down | the stream's reopen puts every order in doubt (one detail a second each) and the listing books a lost fill: the poll adds nothing |
+| reconciliation | the plan: open orders + positions (K15) | executions (S-2): no positions endpoint exists |
+| the session | the plan: per order, from the artifact | the D5 flag, one for the run (no member, S-3) |
+| the disclaimer assertion | the plan: asserted | judged at the first place (`486410`: one `VenueLock`; the battery's exit 66): no endpoint reads it |
+| the engine | the plan: a full arm | built in full, battery-only (S-3) |
+| gate 112's cycle | the gates' habit: after the rounds | before them, on one page (above) |
+
+#### Residuals
+
+* **The live shapes are the docs' and the connector's** until the
+  operator's battery places an order (BX13): the `orderReport` payload,
+  the detail's executions, the history rows (and how they name their
+  ticker), the place and cancel answers, the page parameter's name
+  (`current`), what `S` means on a cancel, when `486218` is final, Ed25519
+  on `/sapi/v1/equity/*` (HMAC is proven), the 9-decimal executions.
+* **The window never moves:** past `EQ_PAGES_MAX` × 100 (2 000)
+  executions since the boot every cycle fails (fail closed: the slot
+  halts `recon-stale`); a restart opens a new window.
+* **Net only:** a foreign BUY and SELL of one size inside the window
+  cancel out (BX-8); holdings are never read — a deposit, a transfer or a
+  corporate action is invisible.
+* **A side the venue closes** counts as a local refusal (`NotLive`)
+  toward the asset-refusal halt.
+* **No Stocks permission is asserted at boot** (`apiRestrictions` names
+  none): a key that cannot trade Stocks is refused at the first place.
+* **`maxNumOrders` is not enforced locally**; the venue refuses past it.
+* **`eq_find` scans the open-order table** (1 024 slots) per report and
+  per listed row, and the one-reading check on a listing (`named_twice`)
+  is quadratic in its rows (a 1 024-row listing ~1–2 ms on the gateway
+  thread): allocation-free, a latency cost on a broker path whose answers
+  take ~100 ms.
+* **A lost place answer, then `486218` by our id** past the window,
+  ends the order `REJECTED`. Had the venue placed it after all (its
+  lookup by our id not finding it), it rests with no TTL: the listing
+  counts it foreign (on a dedicated account that does not block
+  `reconciled`), and the sweep's `cancel-all` runs only while an order
+  of ours is open — the battery's end read catches it (58). A place
+  answered `F` is final, as the venue's refusal.
+* **Below a millionth:** a positive execution under a millionth of a
+  share (legal at the venue's 1e-9 step) is refused — a scan failure,
+  the slot's halt; so is a `PARTIALLY_FILLED` (or `FILLED`) with less
+  than a millionth filled. The arm's own quantities are on the 1e-6 grid: only a partial
+  could be so small (fail closed).
+* **The cut, twice more:** a working order whose executions carry the
+  nine-to-six cut asks its detail every cycle (its listing's `filledQty`
+  past the booked by the residue); and when the executions list lags the
+  cumulative, the implied-price remainder books the cut too — a
+  permanent sub-cent difference to the history (fail closed: the leg's
+  drift).
+* **A `CANCELED` or `EXPIRED` detail naming `filledQty` `null`** after
+  a partial fill the arm never booked books nothing more: the cycle's
+  drift and the battery's end read (58) catch it (keeping the stream's
+  highest `fq` would need room `EqSlot` does not have).
+* **Escaped strings are compared raw** (keys with escapes are refused):
+  an escaped `orderReport` event name is counted as another event — its
+  trigger lost (the listing and the reopen catch up); an escaped
+  execution id reads as another id (booking stays capped by the
+  cumulative `filledQty`).
+* **The fee grammar** (`fees.toml`) cannot express the per-order minimum:
+  `bn-fees` counts a floored fee apart (`eq_floor`), never as a rate.
+* `-1006` is now `Unknown` on every product (a tightening: an unknown
+  outcome is in doubt everywhere); `-26004` is row-fatal everywhere
+  (only SAPI's Stocks names it).
+* **CLAUDE.md's gate line** (121; 125 at this phase's merge) is the
+  operator's word.
+
+#### The reviews
+
+| round | reviewer | verdict | disposition |
+|---|---|---|---|
+| 1 | risk | BLOCK: (1) `exec-smoke.sh` read the MAINNET battery as Demo; (2) the page law could sum page 1 twice; (3) `486218` could end a receipted order; (4) the venue's code-less refusal never moved the streak; S1 a cancel's `S` taken as done; S2 the battery's bar on a first differing cycle; S3 the 9-decimal cut as drift; S4 a fill the stream lost on a working order; S5 no over-fill guard; S6 a comment against the code; S7 `EqStray` narrower than its doc; S8 `-1006` / `-26004` everywhere; S9 an unnamed bStock beside spot; S10 the word a plain bool; S11 tests; NITs | all four fixed in code with e2e tests, each break-and-watched (`the_cycle_reads_every_page_and_refuses_one_it_did_not_ask_for`, `not_found_ends_only_an_order_never_receipted`, `the_venues_refusals_move_the_reject_streak`, the wrapper's MAINNET texts); S1, S3, S4, S5, S7, S9 fixed in code (`a_cancel_taken_but_never_carried_out_goes_again`, `the_cut_past_the_sixth_decimal_is_never_drift`, each break-and-watched); S2 two agreeing cycles in a row; S6 the comment; S8 documented; S10 `MainnetVerb`; S11 `the_ttl_before_the_uuid_is_owed_until_the_answer_names_it` and the above; the NITs residuals |
+| 1 | alloc | PASS (125 debug); findings: gate 112 without the TTL path; gate 92's equity branches; a few renders and paths unpinned; the UUID copied on every detail; the slot copied for two fields; `EqSlot` unasserted; bounds checks; `eq_find`'s scan | gate 112's TTL rounds and the sweep's cancel by UUID; gate 92's cancels and a six-digit refusal; gate 113's day render; the UUID copied only while none is held; two fields read; `EqSlot` ≤ 64 B asserted; `eq_find` a residual |
+| 1 | zero-copy | FINDINGS (copy-audit new=0): the UUID's copy on every detail; the slot's copy; the marker's wording; the rules' ticker copied per row | fixed as the alloc review's; the marker restated; only the asked ticker copied |
+| 1 | parser | FINDINGS: the rules' fuzz path never ran; ~15 refusals untested; `inside()` could not fail; `page`/`size` dropped; negatives clamped or passed; `orderReport` judged other events' values; ids named twice; a UUID's case; the shared walker's brackets; `filledQty`/`trades` null refused | the fuzz input's first byte the ticker's length (and AAPL, A), with oracles, and a rules round-trip property; a test per refusal (17 mutations killed); `inside()` on the span's own bounds; `page` and `size` returned and judged; negatives refused; the report's values judged once it is an `orderReport` (nulls allowed but `fq`); ids twice refused (an order's UUID case-folded, an execution's exact); `null` / absent read as none; the walker's brackets a residual (core-parse, shared) |
+| 2 | risk | BLOCK: B1 (new) a `FILLED` detail with no `filledQty` booked nothing and ended FILLED — the venue's holding unreported; MINOR m1 an unreadable 4xx ended a place REJECTED (code 0), m2 the two-cycle bar raced a cycle read before the SELL, m3 S4, S5, S7, S9 untested, m4 a lost answer then `486218` leaves an order resting untracked, m5 cancel receipts retried without bound, m6 the wrapper's header and PASS order, m7 the runbook's exit table; NITs | B1: `filledQty` required, a filled word with nothing filled refused, a fill with no `trades` key refused, a `FILLED` detail short of the order a scan failure, and the battery's end reads the ticker's executions against the booking (58) — each break-and-watched (`a_detail_past_or_short_of_its_order_is_a_scan_failure`; unit cases in `a_detail_reads_its_executions_and_its_cumulative_figures`); m1 a scan failure and the request lost (`a_place_answered_by_a_page_no_scanner_reads_is_in_doubt`); m2 three agreeing cycles; m3 `a_lost_fill_on_a_working_order_is_booked_from_the_listing`, `a_stray_on_an_unbound_ticker_refuses_the_boot`, `an_unnamed_bstock_beside_spot_refuses_the_boot` and the S5 case above, each break-and-watched; m4 a residual; m5 `EQ_CANCEL_TAKES_MAX` (`a_cancel_taken_again_and_again_is_a_scan_failure`); m6, m7 and the NITs fixed (the stray's message names the ticker, not a count) |
+| 2 | alloc | PASS; L1 gate 112's stale comments, L2 its "not pinned" list short, L3 round 1's bounds checks without a disposition; I1 `named_twice` quadratic, I2 gate 92's six-digit branch unasserted, I3 `EqSlot` at exactly 64 B, I4 the report's key slots unasserted | L1, L2 fixed; L3 accepted — `gateway.rs` uses checked indexing throughout, none can fire under the table invariants; I1 a residual; I2 asserted (29); I3 noted (the new `takes` sits in its padding); I4 a const assert |
+| 2 | zero-copy | PASS; cold notes: the rules' row (80 B) moved by value under a marker naming the ticker; each execution copied before the room and seen checks; the §6 listenKey row (64 B vs 96); `bn_probe`'s doctrine header (Demo only); the UUID copied before the echo check | the marker names the row; the execution copied only once it books; the row ≤ 96 B; the header names the MAINNET probe; the UUID copied only for an answer that is ours |
+| 2 | parser | FINDINGS: F1 `-0` and negatives below the scale read 0 in the never-negative helpers (MEDIUM); F2 refusals no test pinned (two fail open); F3 `E` / `U` `null` refused against the doc; F4 a filled word with nothing filled accepted; F5 an execution under a millionth refused; INFO: leading zeros, escaped values compared raw, the walker's brackets confined, no seed corpus, `cancel-all`'s answer unread | F1 refused on the sign (`signed`), with unit and fuzz oracles; F2 `the_round_two_refusals_are_each_their_own_case` (eight mutations killed); F3 `null` reads 0; F4 refused (B1); F5, escapes a residual; empty tickers refused; the fuzz run seeded from the unit tests' bodies |
+| 3 | risk | APPROVE; MINOR: a cancel answered by an unreadable 4xx re-sent every 10 ms (the shared lost-request path); NITs: `venue_net` trusted the venue's symbol filter and its window, read the holding before a last drain; a `CANCELED` detail with `filledQty` `null` after an unbooked partial; the plan's test count; the runbook's stray wording | the cancel owed as an unread one (paced through the doubt); `venue_net` refuses another ticker's row, a moving `total`, an empty page short of it, and drains the rings first; the null case a residual; the docs fixed |
+| 3 | alloc | PASS; info: the gate's "not pinned" list one item short; the key-slot assert on its highest bit only; the sweep's re-sent cancels could reach the take bound in ~2 s | the item added; the assert over every key bit; a halt's sweep leaves a taken cancel to its re-check (`the_sweep_leaves_a_taken_cancel_to_its_recheck`, break-and-watched) |
+| 3 | zero-copy | PASS (copy-audit emulation: 0 unmarked); nits: "of ours" untrue for the place's receipt; a rejected alternative without its reason; the Copy bullet without the cold row | the receipt's UUID copied only for an answer echoing our id; the reason given; the bullet completed |
+| 3 | parser | PASS; info: no `-0` case for the listing's fill or the report's `FN`; F5 widened by the filled-word refusal | both cases added; F5's residual names it |
+
+### BX13 — the ramp's code half: the R0 battery on mainnet, R2-2, R2-4, R3-1, the worker's fill flags, the loopback gaps (2026-10-11) — no member arms (O-BX6); the mainnet session is the operator's
+
+Built on branch `binance` (plan §5 BX13; the build plan
+`claude/bx13-build-plan-2026-10-11.md`; the operator's rulings R-1…R-3 of
+10:45Z and his instruction: "proceed with BX items, we will do the
+mainnet testing when all done"). The code was built and its tests run in
+the cloud; the Mac's gates, the Demo evidence and the one `BX13:` commit
+came after. **The session placed no mainnet order** (Demo orders only):
+everything here is what the operator's one mainnet session needs.
+
+#### The rulings (2026-10-11)
+
+| ruling | what it fixed |
+|---|---|
+| R-1 the products | R0 on mainnet runs USDⓈ-M (makers and IoCs, the gap drill), COIN-M, spot and options — each at its minimum size — beside the Stocks battery (BX10) |
+| R-2 options' bar | 4 round trips (2 LONG, 2 SHORT) and ≥ 5 fills, not the plan's 20 IoC round trips (each crosses options' wide spread on a minimum contract) |
+| R-3 the account | classic: K13 and K14 (the PM and PM Pro read-only probes) carried, not run |
+
+#### What is built
+
+* **The R0 ramp battery** (`cli::bn_battery`, `exec-smoke --binance
+  um,cm,spot | options --lifecycle --bn-mainnet [--bn-confirm-mainnet]`):
+  the Demo battery's composition (router → venue split → `BnArm` → the
+  gateway's thread → lane 4) on MAINNET with the engine's key (Scope
+  `Live`, every one of the twelve hosts checked mainnet's where the
+  battery dials, BX-16). Its clients are the account tools' (`Rest::ops`,
+  `Public::ops`, `discover_ops`, `discover_spot` on the configuration's
+  network), which read freely and send a change only signed with the
+  sealed `MainnetVerb` (BX11's `WordGuard`): without the word the run
+  reads the account and prints one `plan` line per product, and returns
+  64 having sent nothing; with it, the word is held for the run — the
+  tap's listenKey (`Rest::plain_change`, new), the gap drill's cancels by
+  id and the end's flatten (`Reach::Mainnet`, confirmed) are its only REST
+  changes; every order is the gateway's. R0's counts are fixed (`Counts`:
+  20 maker cycles and 3 round trips on USDⓈ-M, 20 on COIN-M, 20 on spot,
+  4 on options); the CLI refuses `--bn-cycles` and `--bn-fill-pairs`
+  beside the reach, `--bn-confirm-mainnet` without it, and the spec the
+  flatten drill on mainnet (no R0 bar). The router's day cap is
+  mainnet's (20 000 USD); the adoption is 0 on mainnet unless
+  `--bn-adopt-usd` names it (a held spot base then refuses the boot,
+  naming the flag); the plan line prints both and the instance cap.
+  **The R0 bar** (`r0_bars`, one `phase:"r0"` line each, met or short —
+  the run is the record): per product its count, ≥ 5 fills, the Demo
+  bar's proofs (post-only refusal, TTL, halt's sweep, COIN-M's maker
+  refused, the alias), a `J_MARGIN` per futures product and options; for
+  the run, first the journal whole (no record dropped by the gateway's
+  ring or the battery's caps — every other run bar reads it), ≥ 3
+  consecutive clean reconciliations (`clean_streak`: reconciled, no
+  drift, no unseen leg, no foreign order; a held cycle ends a run — the
+  gateway's verdict covers every lane), the trades journaled, none booked
+  without its trade report (`J_FILL_UNSEEN`: the streams lost a trade —
+  short; and the fee bars hold only then), exactly one `J_FEE` a trade
+  (`is_trade`: a `J_FILL` not unseen, adopted or lost) order by order
+  (`fee_gaps`: one order's missing fee and another's doubled one never
+  cancel), none with its asset unjudged (`FEE_ASSET_NONE`; BNB
+  reported), no scan failure, no fill lost. The dead-man's bar is the
+  gap drill's own run (its `r0` line). The wrapper prints a MAINNET
+  banner and a LIVE text for every exit.
+* **R2-2 — spot's day** (BX-12): the venue's own count and limit read
+  (`account.rateLimits.orders`, `REQ_RATE_LIMITS`, `wsapi::scan_day_orders`
+  — the one ORDERS / DAY / 1 entry; every entry its five keys, each
+  once, numbers whole) beside the spot lane's account read at each venue
+  UTC day's first cycle, carried to the arm (`EVT_SPOT_DAY`, `c` the
+  venue day the read was asked on — a read straddling 00:00Z seeds the
+  day it asked about, and the next day's first cycle asks again; a day
+  more than one from the arm's own seeds nothing) and seeded into
+  `SpotOrders` (never lowered; a stale day's taken for nothing); no spot
+  order before it
+  (`NotReady`); a refused read asked again at the next cycle, a malformed
+  one a scan failure (`SCAN_SPOT_DAY`) — which halts the slot on
+  unbounded drift until a restart, futures included (fail closed: a day
+  count the arm cannot read is no count); the scanner refuses a limit of
+  0, an escaped type or interval (read raw it could hide a second DAY
+  entry) and an entry short of a key (a reader that defaults a missing
+  `intervalNum` would see a second DAY entry); a SELL's reserve past the
+  BUYs' share (`gov::spot_caps`, at most `limit / 20`).
+* **R2-4 — spot's weight** (BX-12): `spot_weight`, its own one-minute
+  window at spot's weights (`gov::spot_request_weight`), its share 3 600
+  of the IP's 6 000; in `throttled()` and the congestion word — the
+  throttle defers the one early cycle, which reads every lane, so spot's
+  pool past 80 % delays USDⓈ-M's early cycle too (as eapi's has since
+  BX9), by at most the cadence; the day read paced by
+  `gov::day_read_room` (options' Q-5 rule, now shared).
+* **The gateway's last tallies** (the risk review's rounds 2 and 3): the
+  gateway pulses once more as it exits, after its held events, so a fill
+  lost, a record dropped or the shutdown sweep's confirming cycle counted
+  after the last beat reaches the arm; the battery drains every event the
+  gateway left (the ring's 4 096) before it reads them — the R0 record's
+  run bars and `/state` read the tallies as they end (before: the arm's
+  agreeing cycles one short of the journal's, every run).
+* **R3-1 — the held cycle:** `GW_RECON_HELD` (tally 20; `GW_TALLIES` 21),
+  `J_RECON_HELD` on the record (`code` 2), `/state` `recon_held`,
+  `/metrics` `engine_exec_bn_recon_held_total`, the TUI chip's alert, the
+  runbook's §5.
+* **`/state`, `/metrics`:** `spot_weight`, `spot_day` (`unfilled`, `cap`,
+  `sell_cap`, `seeded`), `recon_held` — `BinanceArmReport` 688 B,
+  `BinanceGwSnapshot` 424 B, `EngineSnapshot` 31 872 B (896 B left).
+* **The worker's fill flags** (the "BX7" arming precondition):
+  `pmlr._FILL` = `<QIBBBBqqQ` (byte 15, `FillRec.flags`,
+  `FILL_FLAG_SETTLEMENT`, `FILL_FLAG_ADOPTED`, `is_trade`); the position
+  fold counts `fills` (trades), `adopted` and `settlements` apart (both
+  still move the position: inventory opened, a position ended);
+  `features.count_fills`; the dashboard's `trades`, `fills_adopted`,
+  `fills_settlement`; `vrp_shadow`'s leg count is its trades. The engine's
+  journal bit `J_FILL_UNSEEN` has no PMLR twin (a `Fill` carries none).
+  `core_types`' const asserts pin the record's 40 bytes (`Fill`'s offsets
+  0–32, the flags at 15).
+* **The loopback gaps:** `-5028` (BX-6), the REST route's 503 `-1007`
+  (BX-11), the margin call on COIN-M, PM and PM Pro (BX-20) — each an e2e
+  test, break-and-watched.
+* **The runbook's §13:** the R0 session — the command lines, the
+  checklist, the order of runs, every exit on a LIVE account, the R0
+  record's template.
+
+#### Departures (from plan §5 BX13 and the build plan)
+
+| departure | from | as built, and why |
+|---|---|---|
+| `--bn-mainnet` | the build plan: `--bn-network mainnet` | `--bn-network` is the account tools' own flag; the parser review's P2-2 keeps a tool's flags off the battery |
+| options' bar | plan §5: ≥ 20 IoC round trips | R-2: 4 round trips, ≥ 5 fills |
+| the streak | plan §5: per product | the gateway's verdict is one over every lane: one streak for the run |
+| the SELL's reserve | the build plan: "a SELL may use the reserve" | the reserve is past the BUYs' share (half of what the limit leaves, at most a twentieth of it), the rest of the limit the operator's |
+| the day's retry | R2-4: metered, or once a minute | metered, and paced to the window's room (options' rule) |
+| gates 108/109 | the build plan: "re-pinned" | 108's pins unchanged (the day's read rides the boot's first cycle, outside every window — now asserted: one `EVT_SPOT_DAY`, before the windows and in the run; named in its "NOT pinned" list); 109 extended (the render and the scan, 0 B); 92 feeds the day (its spot IoCs were `NotReady` without it) — 150 000 at the boot, 160 000 in the window, the caps asserted each read's |
+
+#### Residuals
+
+* **Mainnet is the operator's:** every mainnet shape the R0 run meets is
+  the docs' and Demo's until it runs — `account.rateLimits.orders`'s DAY
+  entry on spot (Demo answers it: the Demo evidence), the live fills'
+  and fees' records, options' expiry and records, COIN-M's countdown
+  (K16) — the R0 record and the runbook's §13 say what to read.
+* The R0 battery is a cold operator tool (COPY-DOCTRINE); no alloc gate
+  pins it. Its unit tests pin the counts, the bars, the word and the
+  records' reading; its run is not exercised on a socket here (Demo runs
+  the same code path with Demo's configuration).
+* Spot's weights are the docs'; the day read's pacing is proven by its
+  arithmetic, not on a socket.
+* **Spot's 10 s ORDERS window stays the docs' 100** (`gov::SpotOrders`'
+  `w10s`): the day read's answer also carries the account's own 10 s
+  entry (the docs' example names 50). Seeding the window from it is an
+  arming precondition for a spot member (a `-1015` quiets the whole
+  gateway, futures included), not R0's: the battery's spot IoCs go a
+  round trip a cycle, far under either.
+* The unified account's own `MARGIN_CALL` status (a cycle's read, not an
+  event) is not driven.
+* **A day read the arm refuses** (asked more than a day from the arm's
+  own — a broken clock) leaves spot `NotReady` until the next venue day's
+  read: visible as `/state` `spot_day.seeded` 0 and `NotReady` refusals,
+  not counted apart.
+* **The fee bar keys an order by its placement id**: a modified order's
+  fill (booked under its current id while in the table) and its fee
+  (under the placement id once ended) are read as one order through the
+  battery's own renames; an order modified by anything but the battery
+  (none on a dedicated account) would read short — exit 57, fail closed.
+
+#### The evidence (the final tree)
+
+* **Gates (Mac, 14:19–14:23Z):** `make lint` clean; nextest 4 572 passed
+  (10 skipped); `make alloc-assert` (release) 125 passed, 4 ignored;
+  copy-audit hits=28 baselined=28 new=0; SPDX on every changed source;
+  `cargo deny check licenses` OK and the notices identical. The worker:
+  `make py-test` 1 654 passed and 1 failed (`test_news_lanes`, the
+  baseline's own), `make py-lint` the baseline's 836.
+* **Demo (the worktree's release binary, 14:27–14:40Z):** spot PASS (20
+  fills: the day read answered and seeded on Demo); USDⓈ-M + COIN-M on
+  `--bn-rest` PASS (10 maker cycles with their modifies, 6 + 6 fills, a
+  clean streak of 17); USDⓈ-M on the WS API PASS (10 cycles, 6 fills);
+  the gap drill PASS (the dead-man fired after 30.4 s); options PASS (5 +
+  5 IoCs answered, none filled: Demo's books). Every END line's R0 run
+  values clean — records dropped, fills unseen, `fees_short`,
+  `fees_extra`, fees unjudged, scan failures, fills lost all 0. The WS,
+  drill and options runs first timed out on `testnet.binancefuture.com`
+  (its CloudFront edge flapping from the Mac) and passed once it
+  answered.
+* **Fuzz (Mac, 14:41–15:01Z):** the 16 Binance targets × 300 s, no
+  crash — `bn_wsapi_frame` 23.4 M (each input also judged as a documented
+  answer's entries), `bn_spot_event` 24.0 M, `bn_user_event` 28.0 M,
+  `bn_rest_answer` 29.1 M, `bn_account` 26.6 M, `bn_option_rest` 22.3 M,
+  `bn_rest_body` 21.4 M, `bn_equity` 16.1 M, `bn_mode` 16.2 M, `bn_cid`
+  33.9 M; the market-data six 9.4 M–201.0 M.
+
+#### The reviews
+
+| round | reviewer | verdict | disposition |
+|---|---|---|---|
+| 1 | risk | REQUEST-CHANGES: MAJOR the fee bar blind to fills booked without their trade report (futures: met when a trade's fee is missing; spot: a good run short); MINOR the journal's completeness unjudged, a malformed day answer halting the slot undocumented, mainnet inheriting Demo's 250 000 USD adoption; NITs the wire format's `J_RECON`, "bit 2", the wrapper's flatten without `--bn-cancel-first`, the flatten drill on mainnet, a read straddling 00:00Z, the reserve's cap in a table, the throttle across lanes | the bar "fills booked without their trade report" ≤ 0 before the fee bars and "records dropped" ≤ 0 first (each break-and-watched: the bar blind fails `the_r0_bar_is_r0s_whatever_the_spec_asked`); the consequence documented (`SCAN_SPOT_DAY`; runbook §5, §10); mainnet's adoption 0 unless named, the plan line printing it and the instance cap; the docs and the wrapper fixed; the flatten drill refused on mainnet (tested); `EVT_SPOT_DAY.c` the asked venue day (break-and-watched: unset, the e2e never seeds) |
+| 1 | alloc | FINDINGS: HIGH gate 92 red (its spot IoCs `NotReady`: no `EVT_SPOT_DAY` given); MEDIUM the render and the scan pinned nowhere; MEDIUM gate 108 not proving the day read outside its windows; LOW a stale COPY bound; NIT gate 43's fixture | gate 92 feeds the day before and inside the window and asserts it seeded with its caps; gate 109 renders `queue_rate_limits` and reads `scan_day_orders` every cadence (asserted); gate 108 counts `EVT_SPOT_DAY` (one, before the windows, none after) and `GW_RECON_HELD` in its zero list; the bound fixed; the fixture's new words at their widest. No hot path allocates. |
+| 1 | zero-copy | FINDINGS (copy-audit new=0): two stale COPY sizes in paper.rs (the id block, the totals), the battery's and the Demo client's headers claiming Demo only, `plain_change` repeating `plain`'s copy | the sizes fixed (332 B, 344 B); the headers name the R0 reach; one `put_params` for both renders (one copy site, one marker) |
+| 1 | parser | FINDINGS: MEDIUM the fee bar (as risk's MAJOR); LOW a named limit of 0 read as unnamed, an escaped DAY read raw (fail-open), three mutants the unit test let live, the proptest not calling the scanner, the fuzz oracle near-vacuous; INFO the journal readings right, the PMLR layout right, `J_RECON_HELD`'s readers right; NITs the streak on a held cycle, the error text | a limit of 0 and an escaped word refused; the unit test's new cases kill the three mutants (and the two fixes', each break-and-watched); the proptest reads every result with it; the fuzz target judges it against an independent reference (`expect_day`, over the oracles' walk moved to `common/jsonref.rs`, shared with `bn_spot_event`) both ways where the answer is plain — break-and-watched (two DAY entries accepted fails it); a held cycle ends a streak (tested, documented); the message names a held cycle |
+| 2 | risk | APPROVE: MINOR the new 503 test flaky under load (1 of 3 full runs); NITs the fee bars on run totals (one order's missing fee and another's doubled one cancel), R0's run bars judged first on mainnet, `plain_change`'s word and the host loop untested, the run bars reading tallies up to a beat stale, the first seed taking any day, spot's 10 s window the docs' 100, the wrapper's flatten text | the flake's cause — the stream's `NEW` read in the 503's turn resolves the doubt before the status is asked — removed by holding the stream (break-and-watched); `fee_gaps`, per order (tested; END `fees_short`, `fees_extra`); the runbook §13 checklist reads the Demo runs' END lines; `WordGuard::may_change` (tested) and one host list, `Hosts::all` through `hosts_on` (tested); the exit's pulse (`the_gateways_last_tallies_reach_the_arm`, break-and-watched: 7 of 8 without it, every run); a day within one of the arm's own (`a_day_far_from_the_arms_own_seeds_nothing`, break-and-watched); the 10 s window carried (residuals); the text fixed |
+| 2 | alloc | CLEAN: LOW the day read's gateway glue in no window; NITs gate 92's caps vacuous at 200 000, a second walk over each string, two stale docs, the fuzz extraction's leftovers. Gate count 125 | named in gate 108's "NOT pinned" list (its post, weight and emit are the cycle's, pinned there; render and scan gate 109's); gate 92 reads 150 000 at the boot and 160 000 in the window (rounds 2–3), each asserted; the docs fixed; the leftovers removed; the second walk kept (once a day) |
+| 2 | zero-copy | CLEAN (copy-audit new=0): LOW the fuzz imports, the twelve-host list three times; NITs the word's check twice, the weight JSON three times, stale Demo wording, `put_params`' marker naming no rejected alternative | one list (`Hosts::all`, public), one check (`may_change`), one writer (`used_max`); the wording and the marker fixed |
+| 2 | parser | FINDINGS: LOW a limit past `u32` cut to 0 (a mutant lived), four more mutants, the proptest never reaching the scanner, an entry short of `intervalNum` skipped (could hide a second DAY entry); INFO the fuzz oracle sound, no seed; NITs the leftovers, the 0-limit docs, no Rust pin of the PMLR fill's layout, equity beside `--bn-mainnet` refused at run time only | 4 294 967 297; the four inputs (eight mutants killed by the unit test); a structured proptest against a model; every entry its five keys (fail closed); the fuzz target judges each input also framed as a documented answer's entries; the docs; `core_types`' offset asserts; `equity_reach_refused`, tested |
+| 3 | risk | APPROVE: NITs the exit's pulse unread past one turn's 64 events, a modified order's fill and fee under two ids (a clean run would read 57), the checklist's margins literal for spot and the drills, a refused seed silent, the stream branch of the 503 untested | the battery drains the whole ring at the end, the gateway's held events go before its pulse; the battery's renames read an order under its placement id (tested); the checklist qualified; the refused seed documented (`spot_day.seeded`); the branch tested (`…_beside_its_streams_new_…`, break-and-watched) |
+| 3 | alloc + zero-copy | CLEAN (alloc 125, copy-audit new=0): NITs gate 92's in-window read unproven, the exit pulse's order | the in-window read's own limit asserted; held events first |
+| 3 | parser | FINDINGS: LOW the proptest's kills resting on an untracked regression file (fresh seeds: 51–94 % of runs); NIT `never_panics` no longer calling the scanner | its own block at 2 048 cases, the regression file removed; the call restored |
+
+## XMM — slot 6: the Hyperliquid maker, DARK at XH1 (2026-09-26)
+
+Slot 6 is `xmm` (`crates/strategy-xmm`, plan
+`docs/research/xmm/xmm-hl-maker-plan-2026-09-26.md`, rulings
+O-XH1…O-XH15). `strategy-icdp` is UNLINKED from the set (its crate and
+`backtest --member icdp` stay); `icdp` / `ai+icdp` refuse the boot.
+
+**XH1 widens nothing and arms nothing.**
+
+* **The member places nothing.** Configured from `~/multivenue/xmm.toml`
+  (a requested bit with no artifact refuses the boot — the F19 law), it
+  implements no order path: every callback is a no-op and its timer is
+  off. No `strategy.conf` names it.
+* **A live slot 6 refuses the boot** (`cli::exec_boot::XMM_SLOT`), even
+  correctly named and agreed by `--arm-live`, until XH4 gives xmm its own
+  Hyperliquid master account and gateway (O-XH3, O-XH7). Armed on today's
+  arm it would share slot 3's account, where a slot-6 halt's venue-wide
+  cancel would pull bin15's quotes. Lifting this refusal is XH4's own
+  entry here (the "no phase may arm without its own entry" rule above).
+* **`Order.flags` bit 0 = `ORDER_FLAG_REDUCE_ONLY`** (byte 14, former
+  padding — every older `Order` reads 0). **Nothing honours it before
+  XH4:** not `risk_check`, not `mode = "off"`, not the budget floor, not
+  the Hyperliquid order (sent reduce-only = false), and it is not part of
+  `OrderIdentity`. No member may rely on it for an exit until XH4's entry
+  here says otherwise.
+* **The member's caps (`xmm.toml`, the XH5 probe values, O-XH5):** clip
+  $15, per perp $150, gross $400, resting $300. Parse-time ceilings bound
+  them at the largest configuration the plan names — clip $10 000, per
+  perp $5 000 000, gross $20 000 000, resting $1 000 000; the clip's
+  ceiling also refuses a probe clip written at ×1e9. Raising a ceiling is
+  a scale step (XH7): a code change with its entry here. The caps' boot
+  cross-check against `exec.toml` slot 6 (E6: a mismatch refuses) lands
+  with the slot's arm (XH4).
+* **Two new engine lanes, no new submission path.** Trade prints
+  (`on_trade`) and order events (`on_order_event`) reach members with
+  the same `EngineCtx` as ticks, so anything a member submits from them
+  passes the same router and `risk_check`. Order events route to the
+  placing slot ALONE (the X1 fill law); an unattributed or disabled slot
+  is counted, never fanned out. They drain AFTER every fill source, so a
+  fill waiting in the same iteration is booked (E6) before a member can
+  act on an order event. No producer exists before XH2 (paper) / XH4
+  (live).
+* **Per-slot timers.** Each member's `on_timer` runs on its own period.
+  Every existing member has a 1 s period or an empty `on_timer`, so each
+  fires exactly as before (bin15's LAW E-8 sweep and day roll, hyparb's
+  timer pass). **Re-review at XH3**: once xmm has a period under 1 s, the
+  1 s members run every 1 s to 1 s + p.
+* **Regime:** slot 6 takes no label yet; with `[labels] require = 1` an
+  enabled xmm refuses the boot (fail-closed). `[labels.icdp]` refuses at
+  the grammar.
+
+### XH2 amendment (2026-09-26): the policy and the queue law — PAPER only
+
+* **The member now quotes** (`maker_enabled = 1`): post-only orders at the
+  Hyperliquid touch, sized `clip ÷ px` down to the venue lot (never under
+  $10); a requote is a modify (E-7); the LEAD rule and the 500 ms gate
+  pull or hold the side about to be picked off. Every order carries the
+  TTL `lifetime_ms` (E-8, ≤ 30 s). **Still no `strategy.conf` names it,
+  and a live slot 6 still refuses the boot** — XH2 arms nothing; XH3
+  enables it on paper.
+* **Hard caps in the member** (rule 6), on PROJECTED exposure — the E6
+  rule "the clamp projects": every order the member has out (sent,
+  resting, cancelling, and a modify's predecessor, counted at the
+  replacement's size) is counted as if it filled. A side whose
+  worst-case exposure would pass `inv_cap_usd_1e6`, the gross past
+  `gross_inv_cap_usd_1e6` or the resting notional past
+  `resting_cap_usd_1e6` is not quoted; an order that does not raise its
+  perp's worst case always is. A requote's replacement is checked with
+  its predecessor still counted (both can fill in the race).
+* **Safety pulls (XH-2), the member's half:** a leader silent for
+  `lead_stale_ms` or a follower for `follower_stale_ms`, or either one's
+  last update flagged stale by its ingress, cancels both sides and places
+  nothing — on the next update, and on a 100 ms timer when the feeds
+  themselves are silent. A stale-flagged leader tick refreshes nothing
+  (no reference price, no LEAD trigger, no gate history). The halt,
+  ACK-RTT and congestion pulls are the XH4 arm's.
+* **The gate fails closed on lost history:** a burst of leader updates
+  that overwrites the gate's ring (8 192 samples per perp, ≈ 16 k
+  updates/s over the 500 ms window) closes the gate for that decision
+  and is counted (`gate_overflow`, must stay 0); history never received
+  (the first half-second) leaves it open, as the simulator does.
+* **LAW E-8, the member's half:** the member cancels its own order at
+  its TTL (`expiry_cancels`), whoever else expires it; the paper model
+  expires it at the same instant. **XH4 precondition:** Hyperliquid has
+  no per-order TTL — its limit TIFs are `Alo`, `Ioc` and `Gtc` (no GTD);
+  `expiresAfter` only rejects an ACTION processed after that instant and
+  never ends a resting order; `scheduleCancel` is an account-wide
+  cancel-all dead-man's switch (≥ 5 s ahead, ≤ 10 triggers per UTC day).
+  On this venue the TTL is therefore an engine-sent cancel: the XH4
+  gateway sends it itself at each order's expiry, whatever the member
+  does, and `scheduleCancel` is at most a coarse account-level backstop,
+  never the TTL.
+* **A lost order event cannot wedge a side:** a side waiting on its
+  order's final event for 10 s (or resting 10 s past its TTL) is released,
+  a best-effort cancel goes out for what it held (the order and a
+  modify's predecessor), and it is counted (`stuck`, must stay 0). In
+  paper a long Hyperliquid outage can trip it without an event being
+  lost — read `stuck` next to the feed's health.
+* **Departures from E5 for queue orders** (the paper matcher and the
+  harness, post-only makers on Hyperliquid only):
+  * `Ok` from a cancel means the cancel was SENT: it lands at the first
+    record at or after `CancelReq.ts_ns + Δ_hl`, ahead of that block's
+    prints — the order can still fill until then, and its `CANCELED` (or
+    `FILLED`) event is the answer. So `CancelReq.ts_ns` sets when a
+    queue cancel lands; stamp it from `ctx.now_ns()`.
+  * A modify of an order no longer held is `NoSuchOrder` and places
+    nothing (fail-closed; whether the venue ever places the replacement
+    is not measured). A replacement whose predecessor filled or was
+    cancelled while the modify flew is REJECTED on landing
+    (`stale_modify`) — one quote decision cannot fill twice. A modify
+    against a full table is `QueueFull`, the old order untouched ("a
+    refused modify changes NOTHING"). The replacement inherits the old
+    order's expiry (E-7).
+  * A refused replacement hands the side back to its predecessor, which
+    the member then cancels; the side is free only on the predecessor's
+    final event. A modify the arm refuses is followed by a cancel, never
+    retried on every update.
+* **The paper model is the queue law** for post-only makers on
+  Hyperliquid (`core_fill::queue`): an order that would cross on arrival
+  is REJECTED (`BAD_ALO_PX` — information, not a fault, XH-7); a resting
+  one fills only from prints, after the displayed size ahead of it. Every
+  other member's order keeps the strict-cross law, unchanged.
+* **Per-slot timers, re-reviewed:** with xmm enabled the set's timer runs
+  every 100 ms; each member's own `timer_due` gate still fires it on its
+  own period (a 1 s member now fires every 1.0–1.1 s).
+
+**Open before XH3 enables xmm** (both closed by the XH3 amendment below):
+* `audit-pnl` does not replay trade prints, so a slot-6 queue order can
+  never fill there — its shadow P&L would read flat until it does.
+* The member's counters reach `/metrics` — at least `stuck`,
+  `gate_overflow`, `unmatched` and `ctx_refused`, each of which must
+  stay 0; until then they print only in the harness lines.
+
+**Open for XH4:** a position with no follower mark yet counts $0 in the
+projected gross (`exposure()` prices at the follower mid, 0 until the
+first fresh Hyperliquid book). Unreachable in paper — every fill needs a
+quote and every quote a touch — but reachable once XH4 seeds positions
+from the venue at boot: XH4 refuses every growing order while any perp
+holds a position without a mark.
+
+Gates (XH2, 2026-09-26): alloc 79/79 at 0 B/op (+1 ignored helper),
+incl. gates 74 (queue law), 75/75b/75c (the member, its fail-safe
+branches included), 76 (the paper dispatcher's queue path) and the
+engine gate driving the paper order-event pump.
+
+### XH3 amendment (2026-09-26): the member on the live paper engine
+
+* **Observability (the XH2 open items, closed).** `/metrics` carries the
+  member's 17 counters (`engine_xmm_*_total` — `stuck`, `gate_overflow`,
+  `unmatched` and `ctx_refused` must stay 0; the pulls by reason are
+  `lead_cancels`, `requote_cancels`, `pull_cancels`, `expiry_cancels`;
+  a modify or cancel of an order the venue already ended is a race, not
+  a refusal, and is not counted in `ctx_refused`),
+  `engine_xmm_perps` and the first four perps' positions. `/state`
+  (schema 2) carries them plus one row per perp: the touch, our two
+  quotes and their states, the position, each feed's age. `audit-pnl`
+  replays the queue venue's prints — only for a run with a post-only
+  maker in it, and only inside its ticks, so every other run reports
+  exactly as before — and slot 6's shadow P&L is the queue law's, not
+  flat. Caveats: a regime-bucketed audit replay can hold a queue order
+  whose cancel landed in another bucket (its own TTL, ≤ 30 s, ends it
+  there); an audit engine is born at its first intent, so that first
+  queue order meets no known book (conservative: an unknown queue).
+* **Regime: carried, never consulted.** `[labels.xmm]` is accepted so
+  `[labels] require = 1` can boot the member enabled; the label never
+  gates it (the HORIZON law, bin15's precedent — a quote that lives
+  seconds and is scored on a 5 s markout is not a cell of a 4–8 h
+  lane). Its off switches are the XH-2 pulls, the caps and (XH4) the
+  arm's halts.
+* **Enabling is paper only** (`STRATEGY=…+xmm` in `strategy.conf` and
+  `~/multivenue/xmm.toml` — the probe: $15 clip, ±$150 per perp, $400
+  gross, $300 resting, θ 0.5 bp). A live slot 6 still refuses the boot
+  (XH4). The set's timer runs every 100 ms with xmm enabled; each
+  member's own period still gates it (1 s members fire every 1.0–1.1 s).
+  **The runbook, in this order:**
+  1. The build: merge, then the release build the wrapper execs
+     (`cargo build --release -p cli`; check the binary's mtime). An
+     older binary or wrapper refuses `+xmm`.
+  2. Pre-flight — every descriptor must resolve, or `xmm_boot` refuses
+     the WHOLE boot (and an unattended daily restart would then take
+     every member down in a KeepAlive loop): `hyperliquid:{BTC,ETH,SOL,
+     XRP}` and `binance-usdm:{btc,eth,sol,xrp}usdt` in `universe.toml`;
+     `backtest --member xmm --xmm ~/multivenue/xmm.toml` on the current
+     run's ≤ 2 h window resolves them with the boot's own code.
+  3. Place `xmm.toml`, then edit `strategy.conf` LAST, outside the quiet
+     windows; restart supervised rather than waiting for 00:10/08:30/
+     16:05Z.
+  4. Restart `com.multivenue.dashboard` with the engine: it reads its page
+     once at start, and the page before XH3 stops rendering its later
+     panels on `/state` v2 (the page since XH3 reads v1 and v2).
+     After the boot: the tell `xmm: artifact configured … phase=XH3(paper)`;
+     `/state` `xmm.configured = 1`, `boot.xmm_coins = BTC,ETH,SOL,XRP`;
+     `engine_xmm_perps 4`; `engine_xmm_placed_total` and
+     `engine_paper_matcher_queue_rested_total` rising; `stuck`,
+     `gate_overflow`, `unmatched`, `ctx_refused` at 0; every other
+     member back (`vm_rows_active ≥ 1`, as after any restart).
+  5. Rollback: `STRATEGY` back to the previous name, restart.
+  6. Arming later (`EXEC_TOML`/`ARM_LIVE`): `exec.toml` must leave slot 6
+     absent or `paper` — `off` refuses every xmm order, `live` refuses
+     the boot. Under `[labels] require = 1` both `[labels.xmm]` and
+     `[labels.bin15]` are then needed.
+* **The XH3 bar (plan §9)** — measured on the live paper engine, never
+  on hours: ≥ 2,000 paper fills over ≥ 6 windows; `stuck`,
+  `gate_overflow`, `unmatched` and `ctx_refused` all 0; requote rate
+  ≤ 1.25 × the XH0(c) model; pulls reported by reason; the paper 5 s
+  markout inside the XMM CUR back-of-queue CI per perp; clean through
+  the 00:10, 08:30 and 16:05Z restarts. In paper a `stuck` needs ≥ 10 s
+  with no Hyperliquid record at all — of ANY symbol, since a block is the
+  venue's (below): each one is read against the ingress health, and one
+  no outage explains fails the bar. XH4's testnet battery does not wait
+  on the bar (operator, 2026-09-26: "through XH4 on testnet"); XH5's
+  mainnet probe does.
+* **The queue law's block is the venue's (XH3).** Hyperliquid processes a
+  cancel in the next block whether or not that perp's book changes, so
+  off the parity switch any record of the venue (any symbol, tracked or
+  not) lands what is due on every tracked perp of that venue, against
+  its last known book: a quiet book never holds a pull or a TTL cancel
+  back (before, a perp quiet for 12 s — the 2 s follower pull, then the
+  10 s watchdog — read as `stuck` with no outage anywhere). The paper
+  matcher, `backtest --member xmm` and `audit-pnl` follow; the parity
+  verb keeps the simulator's per-symbol clock, so the XH2 parity result
+  stands.
+
+### Operator-confirmed deviations from plan v2 (Anton, 2026-09-26)
+
+Nine departures the build made from `xmm-hl-maker-plan-2026-09-26.md`
+v2, each logged when it was made, all confirmed by the operator at the
+end of session 2:
+
+1. Perp depth is captured top-5 (the existing `DepthTopK`), not top 20.
+2. Ring slots are 64 B (one cache line, the house law), not the plan's
+   40/32 B.
+3. The order-event lane drains after EVERY fill source (E6), not only
+   after the tick lanes.
+4. xmm has its own 32-order queue table in the paper matcher; the strict
+   members keep the shared 64-slot table.
+5. The parity gate runs on its own verb (`xmm-parity`), not `backtest
+   --member xmm`.
+6. 15 parity windows (2026-09-25), not 13; the sign rule applied as
+   ≥ 14/15.
+7. Hyperliquid has no per-order TTL: the XH4 gateway sends each order's
+   TTL cancel itself (`expiresAfter` only rejects a late action;
+   `scheduleCancel` is an account-wide cancel-all, ≤ 10 triggers a day).
+8. `[labels.xmm]` is carried and never consulted (the HORIZON law);
+   xmm's off switches are the XH-2 pulls, the caps and the XH4 arm's
+   halts.
+9. XH4's testnet battery starts before the XH3 bar is met; XH5's mainnet
+   probe waits for the bar.
+
+Proposed, for the operator to confirm:
+
+10. (with XH4h) The Hyperliquid arm's transport becomes a per-arm boot
+    choice that defaults to today's blocking path, so merging XH4 changes
+    nothing live until the operator flips it.
+11. (XH4a) No command-ring doorbell (the plan's XH4b row: "mio poll: WS
+    socket + command ring doorbell"): the gateway busy-polls while work
+    flows and then requests poller timeouts of at most 100 µs, so the
+    engine's push never makes a syscall; the wait this adds is measured
+    (`push_to_write`), and `park_ns = 0` removes it on a pinned core.
+12. (XH4c) The dead-man switch is driven from the ARM, not the gateway
+    (plan §8.11: "the gateway arms it"): a gateway that re-armed on its own
+    would keep a stalled engine's schedule alive (its TTL cancels would
+    still fire; the switch would not). `DeadMan` is thread-agnostic, so
+    XH4f wires whichever driver is confirmed.
+13. (XH4c) The switch's horizon defaults to 20 s, not the plan's 15 s: at
+    15 s one lost push fires it (one of the day's 10 triggers, and a
+    cancel-all); 15 s stays the configurable floor, 30 s (E-8) the ceiling.
+14. (XH4c) Four pieces of the XH4c row are composed at XH4f, where the arm
+    exists: the perp asset binding (`HlDiscovery`), `updateLeverage` at
+    boot, the reduce-only mapping and the requote `expiresAfter`
+    configuration. XH4c delivers their parts (the rules, the actions, the
+    per-command expiry).
+15. (XH4d) The reconciler reads over the WebSocket post channel
+    (`{"type":"info"}`), not blocking REST `/info`: neither the engine nor
+    the gateway thread ever waits on a read, and the reads ride the
+    socket the orders do. A read never falls back to REST.
+16. (XH4d) Two halt reasons the plan does not name: `AloRejectRate`
+    (XH-7's threshold, `halt_on_alo_reject_pct`) and `GatewayHalt` (the
+    gateway's halt word — no threshold, like the budget floor).
+    `HaltLimits` grows 48 → 56 B and `ExecRoute` 640 → 704 B (the halt
+    table's lines, never read per submit).
+17. (XH4d) An order in doubt whose settling cancel finds nothing is
+    `REJECTED(EXPIRED)` (it can no longer land); one whose cancel succeeds
+    is `RESTING` then `CANCELED(OTHER)` — `CANCELED(CANCEL_REQUESTED)` when
+    the member had asked. A resting order the venue calls "not found", or
+    a read stops listing, is read again at once and waits `gone_ms` for
+    the stream to say how it ended (and for that read, if it is still in
+    flight or asked: its listing revives the order), then is
+    `CANCELED(OTHER)`.
+18. (XH4d) The arm's stream gap is 0 until a gateway socket was first up
+    (the router's documented "no observation") and then the time since
+    one was last up with a fresh gateway heartbeat (the `ws_up` gauge and
+    a 100 ms stamp) — not the time since the last event, which a quiet
+    account would read as a gap.
+19. (XH4e) The per-perp inventory cap is its own key,
+    `cap_perp_usd_1e6`, not Appendix B's `cap_instance_usd_1e6 = 150 per
+    perp`: after BX3, `cap_instance` on an instrument row is the slot's
+    projected GROSS exposure. Slot 6 therefore carries `cap_instance`
+    $400 (O-XH5's gross), `cap_perp_usd_1e6` $150 (O-XH5's per perp) and
+    `max_resting_usd_1e6` $300 (O-XH5's resting).
+
+### XH4a amendment (2026-09-26): the order-gateway kit — nothing wired, nothing armed
+
+`crates/exec-gateway` (O-XH13) holds the venue-agnostic half of the
+asynchronous gateway XH4 builds for every Hyperliquid strategy (O-XH7),
+reused by MEXC (XM2) and Binance (BX6): the engine ⇄ gateway duplex (one
+bounded SPSC ring each way, each end two disjoint handles), the shared
+stats block with its halt word and latency trackers, the in-flight post
+table, the deadline queue, the make-before-break reconnect machine and
+the gateway's wait policy. **No engine path uses it yet**; a live slot 6
+still refuses the boot, and nothing here changes live behaviour.
+
+**The laws it fixes for every gateway built on it (XG-1 … XG-5):**
+
+* **XG-1 — the engine's push is a ring write.** No syscall (deviation
+  11), no allocation, never blocking. A full command ring REFUSES the
+  command (counted): the caller fails a growing order closed; a refused
+  cancel stays the caller's to retry and its order keeps counting as
+  exposure. The halt and cancel-all path must never depend on ring room
+  (XH4b: an engine-written cancel-all word beside the ring).
+* **XG-2 — a lost event halts the arm.** Commands and events are 64 B
+  slots and the event ring holds at least four command rings
+  (const-asserted); the gateway stops popping commands while the event
+  ring lacks room for its in-flight worst case (XH4b). A full event ring
+  is still a bug: the drop is counted and the halt word set, then a
+  `debug_assert!` fails (tested in both builds). **The halt word is
+  advisory until it has readers:** the gateway enforces it itself from
+  XH4b, the engine reads it (and `/metrics` shows it) from XH4f.
+* **XG-3 — deadlines.** A GROWING command (place, modify) the gateway
+  cannot time out — its deadline queue full — is not sent. A cancel (TTL,
+  sticky, sweep) always goes out; its missing timeout is counted and
+  reconciliation is the backstop. The queue is sized so that a full queue
+  is a sizing bug, which halts the arm.
+* **XG-4 — make-before-break.** A replaced connection drains — no new
+  post; its in-flight replies still land — and is retired when empty or
+  when its drain budget runs out; a dial that never comes up is given up
+  after its budget. The reconnect backoff resets only after a session
+  that stayed up the healthy span (30 s, the ingress law of `7235201`)
+  and moved data (a matched reply or a pong).
+* **XG-5 — one halt registry.** Every halt reason of every gateway lives
+  in `exec_gateway::stats` (the kit owns 1–15, a venue gateway numbers
+  its own from 16); the first reason wins.
+
+core-net gains `ws_frame_in_place`: a client frame around a payload
+rendered in place behind reserved room — `WS_CLIENT_HDR_MAX` (14 B) fits
+every length; 8 B is exact for 126 ..= 65 535 B, every signed post, and
+leaves no gap before the frame — the signed order post's frame with no
+copy (the XH4b TX path). The mask destroys the plaintext: a REST
+fallback of the same post XORs it back, never renders it twice.
+
+**Open for XH4b** (the gateway that uses the kit): a post whose reply
+never comes (its deadline passes), comes malformed, or is stranded on a
+connection that died or was retired is E-5 "sent, unanswered" — never
+REJECTED (plan §5's "malformed reply → REJECTED" is superseded): its
+orders keep counting as exposure until `orderUpdates` or reconciliation
+resolves them, and it is never re-signed. A REST re-send of the same
+signed bytes (the WebSocket down) whose nonce the venue refuses means
+the WebSocket original may have landed: in doubt, never a reject.
+
+Gates (XH4a, 2026-09-26): alloc 87/87 in release (gate 95: the kit
+under load and on every refusal path, 0 B/op); clippy clean; copy-audit
+hits 31 = baseline, new 0 (`crates/exec-gateway` joins the default dirs,
+no hit); nextest 3452/3454 — the two reds are known isolation-disproven
+flakes, green alone (`hl_userws_loopback`'s oversized-frame test, and
+HC7's gate 80 in the debug profile under full-suite load); the existing
+members' replays byte-identical against main's binary.
+
+The laws XH-1…XH-7 (plan §10) are recorded here as their XH4 sub-phases
+land (the XH2/XH3 amendments carry the member's halves of XH-2, XH-4 and
+XH-6).
+
+### XH4b amendment (2026-09-26): the Hyperliquid order gateway — built, loopback-tested, nothing wired, nothing armed
+
+`exec_hyperliquid::gateway::HlGateway`: one thread per HL arm, the only
+place an HL order meets a socket. **No engine path uses it yet** (XH4f
+wires slot 6); the blocking arm (`exchange.rs`) is untouched; a live slot
+6 still refuses the boot. Shared changes: `action::MAX_ORDERS` 16 → 39
+and `MAX_ACTION` 4 096 → 8 192 (the blocking arm sends one-item actions;
+its budget accounting is unchanged); `UserFill` gains `crossed`
+(additive); `UserWs` renders its subscribe through the shared
+`request::subscribe_json`, framed in place (byte-identical).
+
+**What it does:**
+- 64 B `HlCmd` and `ExecEvent` (layouts const-asserted) on the kit's
+  duplex (1 024 / 4 096). The engine's half is one ring write per command
+  and one ring read per event (gate 96a, 0 B/op).
+- **Admission (refused unsent, `EV_REJECTED`):** a slot outside the
+  gateway's configured mask (two arms may share an account, never a cloid
+  namespace); a kind or time-in-force it does not carry — ALO and IoC
+  places, ALO modifies and cancels only (XH-3: a Gtc place or a taker
+  modify is refused); growth while the halt word is set (`HALTED`;
+  cancels still go, and the word is re-checked when a batch is posted);
+  growth before the process's first `userFills` snapshot was absorbed
+  (`NOT_READY` — no fill of ours can be taken for history).
+- **Coalescing (XH-3):** four classes, never mixed, ≤ 39 items per action
+  (one IP request); batches post in the order they opened; a full batch
+  posts every open batch; a cancel or modify whose target is still in an
+  open batch posts every open batch first. **On one socket nothing
+  overtakes the order it names; across sockets (a swap, the REST
+  fallback) and after an unanswered post there is no such guarantee** —
+  XH4d's sticky intent covers cancels AND modifies (a not-found answer
+  about an unresolved target does not mean the order is gone).
+- **One post:** msgpack encoded once and signed on the gateway thread
+  (one nonce stream per arm); the JSON rendered once behind the WebSocket
+  post head and framed in place — or, with no socket Ready, the envelope
+  alone straight into the REST client's window (XMM HD2); a re-send's
+  REST body is the envelope copied out of the post. `expiresAfter` = the
+  smallest non-zero per-command
+  offset (XH4c configures it).
+- **Streams:** `userFills` → FILL + FILL_META (fee signed, crossed),
+  tid-deduped across sockets and reconnects (E-5); `orderUpdates` →
+  RESTING / CANCELED / FILLED / REJECTED with the status's reason,
+  deduped. **The first `userFills` snapshot is history:** its tids are
+  admitted, nothing is emitted, and `EV_SNAPSHOT` (rows, the latest
+  fill's venue time) tells the arm to read its boot reconciliation after
+  it. **A stream gap is an event:** a frame that does not scan, a socket
+  that comes up after a spell with none live, or one that replaces a
+  socket that had gone silent (`orderUpdates` has no snapshot) is
+  `EV_GAP` — the arm re-checks its open orders (XH4d).
+- Make-before-break (XG-4) on two sockets; ping at 30 s of silence,
+  replace at 45 s, dead at 60 s — and **a post that times out on the
+  active socket with nothing read since it was written replaces that
+  socket at once** (a second one while the replacement is still dialing
+  closes the silent socket, so posts go by REST instead of into it);
+  DNS re-resolve after 3 failed dials, only while no socket is live.
+
+**E-5, implemented (the "Open for XH4b" paragraph above):**
+
+| outcome | event |
+|---|---|
+| a status per item, each one its item's kind can have | `resting`/`filled`/`success` → ACK; `error` → REJECTED with the venue's reason |
+| `status: err` (the exchange refused the action) | REJECTED, every item — unless the post is a re-send |
+| deadline passed (5 s); an answer that does not scan, miscounts its items or answers an item with a status its kind cannot have; a post stranded on a socket that died or was retired (an answer read whole before the socket's close is delivered first, since HK2) | UNANSWERED |
+| a WebSocket `"type":"error"` answer (the venue's API layer, not the exchange) | UNANSWERED, the message's reason carried |
+| REST: 2xx → as above; 429 on a first send → REJECTED (rate limit); any other status, or a 429 on a re-send → UNANSWERED; a failure before the request left the host → REJECTED (transport), unless a re-send | |
+| a WebSocket write that died → the SAME signed bytes re-sent by REST (the mask XORs back, never re-signed); **only a per-item answer settles a re-send — any refusal of it is UNANSWERED** | |
+
+**Rules it fixes (XH4b):**
+- XG-2: the gateway stops popping commands while 97 posts are in flight
+  or the event ring lacks room for every in-flight item's answer, one
+  batch per class and 512 for the streams; an emit into a full ring waits
+  ≤ 50 ms for the engine before the kit counts the drop and halts.
+- XG-3: a post's deadline is armed before its write; a growing post that
+  cannot be timed is refused unsent and halts the arm (`HALT_TIMER_FULL`);
+  a cancel goes anyway (counted).
+- The halt word gets its first reader (the gateway); the engine reads it
+  from XH4f.
+- **The engine-written cancel-all word moves to XH4d, with the sweep:** a
+  cancel-all needs the venue's open-order list and the gateway keeps no
+  order state. Until then a halted arm's cancels need command-ring room
+  and wait behind the in-flight and event-room limits.
+- The REST fallback blocks the gateway thread up to its 5 s deadline
+  (never the engine thread).
+
+**Obligations handed on:** XH4d — XH-7's counter counts reply items only
+(a post-only cross also arrives as a `badAloPxRejected` row); cancel slot-6
+orders before quoting; halt if `EV_SNAPSHOT` never arrives; a fill with
+`venue_ms` at or before the boot `clearinghouseState` read is already in
+it; `SLOT_FOREIGN` fills go to the tape only (never broadcast to every
+member); the sticky intent above. XH4f — the TTL cancel; shutdown order
+(drain the ring, cancel, mark in-flight posts unanswered, join); **on
+testnet slot 6 shares the agent key with slots 0/3 (Anton's ruling), so
+the two arms must draw nonces from ONE stream** (two millisecond streams
+on one signer collide); the 100-in-flight WebSocket bound is per IP and
+shared once more arms run gateways. For Anton: whether known
+pre-execution wordings of a WebSocket `"type":"error"` answer may be
+REJECTED instead of UNANSWERED — to be decided on what XH4g's testnet
+battery shows.
+
+**Tests:** unit tests per module (the E-5 table above row by row, the
+first-snapshot and gap rules, layouts, the reason map); the loopback
+(`tests/hl_gateway_loopback.rs`, 10 scripts against `testvenue`, the
+test-only scripted rustls Hyperliquid): coalescing and item mapping, both
+streams and their dedupe, the snapshot gate and admission refusals, the
+39 split and class separation, cancel ordering, silence → UNANSWERED, a
+dropped socket → stranded UNANSWERED + redial + gap, the REST fallback
+(the envelope alone), make-before-break with an answer landing on the
+draining socket, the halt, malformed / miscounted / API-error / refused
+answers.
+
+**Gates (XH4b, 2026-09-26):** alloc 89/89 in release — gate 96a (the
+engine half: 10 000 command/event round trips, 0 B/op) and gate 96b (the
+whole gateway turn over a real rustls loopback, the venue in a child
+process: two ALO places, a modify and a cancel a round → three posts,
+their answers, an `orderUpdates` row and a `userFills` row — exactly 8
+allocations a round, rustls' record buffers (3 sealed, 5 opened), so 0 B
+of the gateway's own); clippy `-D warnings` clean; nextest 3492/3492;
+copy-audit hits 31 = baseline, new 0; license-check OK; the existing
+members' replays (bin15, vrp, xsd, hyparb, icdp, vm, xmm) byte-identical
+against main's binary. Reviews: zero-copy and alloc APPROVE WITH NITS,
+risk REJECT (r1: a refused REST re-send read as REJECTED; the first
+snapshot could absorb our own fills; a silent socket kept taking posts
+for 45 s) → fixed (r2) → all three APPROVE WITH NITS → nits applied (r3).
+
+### XH4c amendment (2026-09-26): the perp pieces — local rules, three control actions, the dead-man switch — nothing wired, nothing armed
+
+Offline pieces the arm composes at XH4f. **No engine path changes**; the
+blocking arm is untouched; a live slot 6 still refuses the boot.
+
+**LAW XH-4, the local rules (`exec_hyperliquid::rules::PerpRules`) —
+never a venue reject.** Perps: an integer price is always valid;
+otherwise at most 5 significant figures AND at most `6 − szDecimals`
+decimals — in 1e8 one tick per price level, `10^(8 − d)` with
+`d = min(6 − szDecimals, 4 − ⌊log10 px⌋)` clamped at 0; a size is a
+multiple of the lot `10^−szDecimals`; notional ≥ $10. `round_px` rounds
+away from the touch (a bid down, an ask up) and its result always passes
+`check` (tested over every `szDecimals` 0–6 against a geometric sweep of
+prices, and across a power of ten); `round_sz_down` never rounds a size
+up. The arm refuses or rounds BEFORE it pushes (XH4f). The binding (asset
+index and `szDecimals` per coin) is `ingress_hyperliquid::discovery::
+HlDiscovery` over `/info meta` at boot — the hyparb pattern; no second
+parser.
+
+**Three actions** (encoders and their JSON twins, key order per the
+SDK): `updateLeverage` (`type asset isCross leverage` — O-XH6, at boot),
+`scheduleCancel` (`type` [`time`] — the key ABSENT, not null, to
+clear), `noop` (`type`). **`noop` cannot do the plan's job** (invalidate
+an in-flight post's nonce): the gateway signs every post with a fresh
+nonce, and cancelling one needs a `noop` signed with THAT nonce — not
+built; the action exists, the optimisation does not.
+
+**The gateway's fifth class, control:**
+- A control command posts ALONE, after every batch opened before it;
+  nothing admitted after it goes before it. One dispatch renders both its
+  msgpack and its JSON, so the signed and the sent bytes cannot name
+  different actions; a kind with no action is refused locally, never
+  sent as a `noop`. It carries the command's own `expiresAfter` (the dead
+  man's posts do).
+- Its only acceptance is `{"type":"default"}` (`HlOk::is_default`);
+  `"status":"err"` → REJECTED (UNANSWERED on a re-send, E-5); an
+  item-shaped answer does not fit a post with no items → UNANSWERED
+  (malformed, counted as mismatched); unreadable → UNANSWERED. Its events
+  carry command bits 0 — the arm correlates by client id (the id is not
+  sent).
+- **Growth is a place, a modify or a leverage change — a reduce-only
+  place included** (XH1: no member relies on the bit for an exit):
+  refused unsent while halted and before the first snapshot.
+  `scheduleCancel` and `noop` never grow: they go while halted — a
+  dead-man clear or push must never wait on the halt it backs up — and
+  under XG-3 they go untimed like a cancel (counted with the cancels).
+- XG-2 keeps one open batch per class in reserve: with five classes the
+  gateway stops popping commands at 96 posts in flight (was 97) and keeps
+  5 × 39 event slots for the open batches' answers.
+
+**The venue half of LAW XH-1 — the dead-man switch
+(`exec_hyperliquid::deadman::DeadMan`).** Pure state, no I/O, no
+allocation (gate 97); 256 B, cache-laid.
+- While slot 6 may have orders resting and the account is known to hold
+  no other slot's orders (`want`), a cancel-all is kept scheduled 20 s
+  ahead and pushed every 5 s. When the pushes stop — a dead process, a
+  lost venue, or (driven from the arm, proposed deviation 12) a stalled
+  engine thread — the venue cancels every open order of the account at
+  the deadline.
+- **Boot:** the first post is a clear, whatever `want` says, and nothing
+  is armed before the venue has answered it (`settled()`). A refused boot
+  clear takes the longest schedule any process sets (30 s from now) as
+  held and retries until it passes (counted as a trigger).
+- **Eligibility is probed, never assumed** (plan §8.11): the first arm of
+  a UTC day whose eligibility is unknown is the probe. No single refused
+  arm — probe or push — is read as ineligibility (an expired or late post
+  is refused too): the arms back off an answer the first time (a push
+  still lands before the held deadline: no trigger spent), a minute the
+  second, and the third refusal in a row parks the switch until 00:00 UTC
+  — an ineligible account costs three probes a day, and one a restart
+  that finds it unknown. A clear still goes at once. **A refusal that is
+  not about the action is never counted:** a post that never left the
+  host (the gateway's own refusal, a REST send that failed before the
+  request left, a full ring) is retried after 5 s; the venue's rate limit
+  backs every post off a minute.
+- **Ordering (E-5):** one post in flight; every post expires 5 s (the
+  answer bound, the gateway's post timeout) after it is signed. A post is
+  signed before its verdict, and the gateway reports a post in doubt at
+  its timeout OR EARLY (a socket that died under it, the API layer's
+  error, a REST failure after the request left), so after a verdict in
+  doubt the switch posts nothing for an answer + the 2 s skew allowance:
+  its next post is then the last one the venue can apply, and that
+  answer settles what is held. Until then an in-doubt arm's deadline is
+  kept as possibly held — and cleared if the switch is no longer wanted.
+  After a timeout the next push goes 12 s after the lost one was due, so
+  the 20 s horizon survives one lost push.
+- **Triggers are counted by the clock, conservatively** (a deadline
+  possibly held that passes unmoved counts as one); at the cap (the
+  venue's 10 a day, configurable lower) the switch parks until 00:00 UTC;
+  a schedule the venue accepted after the cap is cleared.
+- A flapping `want` costs at most one arm per push period (a fresh arm
+  waits a period after the last post); a clear goes at once.
+- **Timing, validated at construction:** 15 s ≤ horizon ≤ 30 s — the
+  floor is a period + an answer + the venue's 5 s lead (the plan's value,
+  at which one lost push fires the switch), the ceiling E-8's 30 s quote
+  life; the default 20 s survives one lost push (proposed deviation 13);
+  `expiresAfter` ≤ 65 535 ms; skew ≤ 5 s; back-off ≥ an answer.
+- **What it is not:** a substitute for the sweep (XH4d) or for the
+  gateway-sent TTL cancel (XH4f). **O-XH4 stands:** until the account is
+  eligible, slot 6 quotes without it, on the engine TTL, the caps and the
+  boot sweep; the testnet account has traded little, so a refusal there
+  is the expected outcome and is recorded, not a fault.
+
+**Vectors:** `vectors.tsv` regenerated from `hyperliquid-python-sdk`
+0.24.0 in a throwaway venv under `target/`: the 27 existing rows came
+back byte-identical; 9 new — `updateLeverage` cross and isolated,
+`scheduleCancel` set and cleared, `noop`, a 39-item ALO `order` (one IP
+request), the 40th item alone (the split), a 39-item `batchModify` by
+cloid and a 39-item `cancelByCloid`; `encode_order` refuses 40 items. The
+release binary's self-test (the pre-restart gate): 36 rows, 8 action
+types rebuilt from inputs (was 27 and 5).
+
+**Obligations handed on:**
+- **XH4d:** the open-orders read at boot and after every `EV_GAP` — the
+  dead man's `want` depends on it (below).
+- **XH4e:** every control post is one ADDRESS request and is never
+  exempted as a cancel (whether `scheduleCancel` draws on the cancel
+  allowance is unmeasured — plan §11 Q2 — so assume not). At a 5 s period
+  the switch alone posts ≈ 17 280 a quoting day: the governor parks it
+  before the budget floor (the budget is a cliff, not a rate — exhausted
+  means one request per 10 s). A stale `expiresAfter` rejection costs 5×.
+- **XH4f:**
+  - The boot order: the first snapshot; the dead man settled;
+    `updateLeverage` per perp (O-XH6: cross margin, 3×) — **a perp quotes
+    only after ITS leverage ACK; a refused or in-doubt change keeps that
+    perp dark** — then quoting.
+  - The binding composed from `HlDiscovery` (asset index; `szDecimals` →
+    `PerpRules`; `CoinMap`); `expiresAfter` on requotes from the arm's
+    configuration; `ORDER_FLAG_REDUCE_ONLY` → `CMD_FLAG_REDUCE_ONLY`.
+  - The dead man: its driver (deviation 12); `answer_ms` asserted equal
+    to the gateway's post timeout at boot; a client-id range reserved for
+    control commands (the switch's, leverage's and noop's); `want` = slot
+    6 may have orders resting AND the account is known to hold no other
+    slot's orders — always so on an account of slot 6's own; on the
+    shared testnet account only after the boot open-orders read and again
+    after each `EV_GAP`'s re-check, other slots' in-flight orders counted
+    (`orderUpdates` has no snapshot and cannot say it alone); at
+    shutdown, after the sweep, it is driven with `want` false until
+    `quiescent()` (nothing out, nothing the venue may still hold); its
+    `skew_ms` from the measured venue clock offset, the boot refused above
+    it; it is driven with the clock the gateway signs `expiresAfter` with
+    (`nonce::now_ms`), or their difference is added to `skew_ms`; its
+    counters on `/metrics`.
+  - Alloc: gate 96b gains one `scheduleCancel` a round once control
+    posts are wired (posts 3 → 4 a round, rustls' records 8 → 10
+    expected); the 256 B `DeadMan` is moved once into the arm's boot state
+    (marked `// COPY:`).
+  - **Reduce-only:** only the wire bit is handed on. The five places XH1
+    lists that ignore it still do, and XH1's "no member may rely on it for
+    an exit" stands; a reduce-only place is growth.
+- **XH4g:** whether the venue exempts a reduce-only close from the $10
+  minimum (if it does, `check` must not block that exit);
+  `scheduleCancel`'s refusal wordings (eligibility, the trigger cap, the
+  lead, an expired action).
+- **For Anton:** (a) under O-XH4, may slot 6 keep quoting on MAINNET when
+  the switch is SPENT (10 triggers) or parked after three arms refused in
+  a row (probes or pushes), or must it pull? (b) may a reduce-only exit
+  pass a halt (today it is growth and refused)?
+
+**Tests:** `rules` (every rule, happy and refused; the sweep); `deadman`
+(12 scripts: timing validation, the boot clear and its refusal, probe and
+push cadence, three refused probes parking until the 00:00 UTC re-probe,
+refused pushes (an answer's back-off spends no trigger, a minute's does,
+the third in a row parks, a clear still goes), never-left and rate-limit
+retries, clear
+at once and a flapping `want`, the wait after early and timeout verdicts
+in doubt, triggers and the cap, acceptance after the cap, foreign events,
+`quiescent`); the control class (classes, growth, command bits, the
+one dispatch, the answer table); the loopback's `control` script ([ALO]
+[leverage] [ALO] [scheduleCancel] [noop] → five posts in that order, the
+default ACK, the venue's refusal, the command's `expiresAfter`) and the
+extended `halted` script (a place and a leverage change refused; a cancel
+and a dead-man clear posted); gate 58 now encodes, renders and wraps the
+three control actions; gate 97 holds the dead man and the rules at
+0 B/op.
+
+**Gates (XH4c, 2026-09-26):** clippy `-D warnings` clean; nextest
+3515/3515; alloc 90/90 in release — gate 58 now also encodes, renders and
+wraps the three control actions, and gate 97 (new) holds `DeadMan` and
+`PerpRules` at 0 B/op over a scripted 55 h; copy-audit hits 31 =
+baseline, new 0; license-check OK; the release binary builds; the
+existing members' replays (bin15, vrp, xsd, hyparb, icdp, vm, xmm)
+byte-identical against main's binary; rustfmt clean on the new files and
+the touched hunks. Reviews: zero-copy and alloc PASS WITH NITS (r1) →
+PASS (r2); risk REJECT (r1: a failure that never left the host parked the
+switch for the day; a later clear settled an in-doubt arm) → REJECT (r2:
+an early in-doubt verdict could still let a late arm land after a clear;
+the first refused push parked the day) → APPROVE WITH NITS (r3) → nits
+applied → APPROVE (r4).
+
+### XH4d amendment (2026-09-26): order state, reconciliation, sweeps — the arm built, nothing wired, nothing armed
+
+`exec_hyperliquid::arm::HlGatewayArm`: the engine's half of a gateway arm,
+an `OrderDispatch` that never touches a socket. **No engine path uses it
+yet** (XH4f wires slot 6); the blocking arm is untouched; a live slot 6
+still refuses the boot. Shared changes: `HaltSignal` gains
+`gateway_halted` (byte 29) and `alo_reject_permille` (30, a `u16`) — the
+rest of its padding after BX3's `venue_lock` and `margin_risk` (48 B
+kept, offsets const-asserted); `HaltLimits` gains `alo_reject_permille`
+(0 = off; 56 B, `ExecRoute` 704 B, both const-asserted); `HaltReason`
+gains `AloRejectRate` (12, `alo-reject-rate`) and `GatewayHalt` (13,
+`gateway-halt`), after BX3's `VenueLock` (10) and `MarginRisk` (11); `PerpPosition` gains `value_1e8` (`positionValue`); the
+gateway stats block gains two rarely-written blocks — the engine's sweep
+request, and the gateway's `ws_up` gauge, heartbeat and sweep state — so
+neither thread's per-command counters share a line with a word the other
+reads every pass (66 688 B).
+
+**The gateway's reads (a sixth class, READ):** `frontendOpenOrders` and
+`clearinghouseState` as `{"method":"post","request":{"type":"info",…}}`,
+posted alone, WebSocket only — with no socket a read is refused
+`TRANSPORT` unsent (never REST); one whose deadline cannot be armed is
+refused unsent. The answer's `data` is scanned in place into
+`EV_OPEN_ORDER` rows (slot and client id from the cloid, `SLOT_FOREIGN`
+when not ours; `aux` = the read's id) or `EV_POSITION` rows (signed size;
+`aux` = |value| at the venue's mark), then one `EV_READ_DONE` (rows; for
+the sheet the account value and its time), or `EV_READ_FAILED` when it
+does not scan; a read answered as an action is in doubt (`MALFORMED`).
+Reads never grow (they go while halted) and feed no order latency. XG-2:
+six classes — the gateway stops popping at 95 posts in flight (was 96)
+and keeps a full read's 257 events in reserve; the arm keeps ONE read in
+flight (the reserve's premise).
+
+**The cancel-all word (XG-1, never behind ring room):** the engine bumps
+`GatewayStats::request_sweep`; the gateway's sweep reads the account's
+open orders (its own read, which emits nothing; refused or unreadable, it
+fails the round), cancels by cloid every order whose cloid slot is in the
+gateway's mask — never another slot's, never a stranger's (an unmapped
+coin is counted; XH4i-1: on an outcome map a `#<enc>` leg is named and
+cancelled, below) — within XG-2's room (the rest go next round), settles
+1 s, reads again: none of ours → `SWEEP_CLEAR`; 8 rounds without that →
+`SWEEP_STRANDED`; a newer request restarts it. The state is published
+state-then-sequence. The sweep's cancels are answered to the arm like its
+own.
+
+**The arm — the paper vocabulary, live** (what xmm expects of any arm):
+- A place or modify rounds away from the touch and sizes down (LAW XH-4,
+  `PerpRules`), maps reduce-only to the wire bit, carries the
+  configured `expiresAfter` (> 0 by construction); a maker order must be
+  post-only (ALO), an IoC is IoC; another slot's order, cancel or modify,
+  an unbound symbol (the asset-refusal streak), a client id in use, or a
+  rule the venue would break is refused before the ring. 128 tracked.
+- `RESTING` once; a modify is the new `RESTING` then the old
+  `CANCELED(REPLACED)` (a replacement that lands by its end — a fill, a
+  `filled` row, a cancel — adds that end third; the out-queues keep room
+  for three); a refused modify is the new `REJECTED` — and if the stream
+  ended the original meanwhile (a venue that drops the original of a
+  refused modify), the old one's `CANCELED` follows, otherwise it rests on
+  and the member cancels it. Every end but a fill is a retirement. Fills
+  go out on the arm's own fill queue (lane 3 has one producer, the
+  operator arm): `order_id` = client id, attributed to the slot, origin
+  VENUE, 1e8 → 1e6; `FILLED` only once the fills cover the order (or the
+  join window passes — counted).
+- **Sticky cancel intent:** once asked, a cancel is the arm's to deliver
+  (a full ring or a refusal keeps it and re-sends it; the verb returns
+  `Ok`). "Not found" about an unanswered place is not an end: the cancel
+  is re-sent when the place lands. "Not found" about a resting order, or
+  a read that stops listing one, reads the orders again at once (a
+  listing brings it back) and waits `gone_ms` for the stream — and, when
+  an orders read issued since it was thought gone is in flight or asked
+  at the end of that wait, for that read: its listing revives the order,
+  its silence ends it — then `CANCELED(OTHER)` (counted). A cancel asked of
+  such an order (the member's or the cancel-all word's) still goes, and
+  every path that keeps a cancel (a full ring, a refusal, no answer)
+  leaves its gone wait running; a listing that brings it back re-sends a
+  cancel asked or kept that is not in flight.
+- **In doubt (E-5):** a place or modify the gateway could not settle
+  waits its `expiresAfter` and a skew from the verdict, then a cancel by
+  cloid settles it (deviation 17). A cancel asked meanwhile goes at once;
+  a "not found" before the doubt ends keeps it for the doubt's end.
+- **XH-7:** every ALO answer enters a 200-answer window; the post-only
+  crosses in it are reported in permille once it holds 50 (the reply item
+  is counted, never the `badAloPxRejected` row; a cross never feeds
+  `reject_streak`, and an acceptance resets both streaks).
+
+**Reconciliation, through the reads:** boot = the first snapshot → the
+sweep (asked again while Stranded) → the sheet → the orders → quoting
+(and the dead man's boot clear answered). Then the sheet and the orders
+every `recon_ms`, the orders at once after `EV_GAP` (an orders read in
+flight went before the gap: another follows it) or a "gone" inference —
+such a re-read goes before a periodic sheet unless the sheet is a whole
+period overdue (no storm of re-reads starves the drift and the P&L); a
+read that fails is asked again after a skew; one with no
+verdict past its post timeout and 5 s is abandoned. **A seeding sheet
+with a position in a bound perp holds the arm** — never ready, never
+reconciled — because the member boots flat and the router's ledger would
+be seeded over a position it never saw (XH5 rules: flatten at shutdown,
+or refuse such a boot). Positions are seeded from the first sheet (fills
+stamped at or before its time are in it; earlier-arrived later fills are
+booked on top). Drift = the worst |booked − venue| at the venue's mark
+(the last fill's price when the venue holds none; saturating), noted
+only when two sheets in a row disagree, kept as a high-water mark. **An
+order carrying the slot's byte the arm does not know is cancelled and,
+after boot, pins the drift unbounded — `ReconDrift` halts the slot until
+the operator clears it.** A listing is a race — ignored — only for an
+order the venue said ended in the last 30 s, or one the arm closed
+unseen when the read went before that close; a read issued after an
+unseen close that still lists the order found a live one. On the slot's
+own account a position in an unbound perp leaves the arm unreconciled; on
+a shared account it is another slot's. `reconciled` = booted, not held,
+the last sheet agreeing, the last orders read holding nothing unknown;
+its age runs from the last agreement, and an agreement needs both reads
+within two periods (a read that stops coming, starved or failing, shows
+as `ReconStale`).
+
+**The session's P&L (E7):** the anchor is the account value at the
+session's first sheet, restored at boot from the owner's state file per
+master (`ArmCfg::anchor_1e6`, XH4f reads it with `crate::anchor`), or
+taken at this boot's first sheet and offered to the owner to keep
+(`fresh_anchor_1e6`, on the slot's own account only, written off the
+engine thread to a state file of slot 6's own — never `crate::anchor`'s
+default path, BIN15's, whose one line a shared testnet master would
+overwrite; the `hyparb-equity-anchor.state` precedent) — a bound
+re-anchored per boot is a bound on nothing; the operator ends a session
+by deleting the file. Judged on the slot's own account only (a shared account's
+value is every slot's), from the first sheet of the boot on.
+
+**Cancel-all and shutdown:** `cancel_all` asks the sweep AND sends a
+cancel for every order the arm holds (one still in flight is cancelled
+when it lands); `cancel_all_state` is `Clear` only when the venue read
+clear AND no order the arm holds can still be on the book or land.
+**Shutdown keeps the dead man wanted** until that `Clear` (after boot, a
+cancel-all not read clear holds the switch like an order does, past the
+30 s hold) — the reads go on meanwhile — then drives it cleared until
+`quiescent()`; a Stranded sweep
+is asked again; at the bound (`shutdown_ms`, ≤ 30 s) a shutdown the
+venue never confirmed returns as it is, counted (`shutdown_unconfirmed`):
+the switch still armed — the venue cancels at its deadline — **only if
+the venue keeps a schedule for the account** (a bound reached with the
+sweep read clear but the switch's clear unanswered is counted apart,
+`shutdown_switch_held`: nothing of ours rests, but the switch may still
+fire on an empty book, a trigger spent): a parked switch (O-XH4: a
+fresh master not yet eligible, or the day's triggers spent — XH4c's For
+Anton (a)) or a shared account without exclusivity has none, and then
+nothing cancels what may rest until the next boot's sweep, which needs
+the socket. XH4f logs and alerts on the counter with the switch's
+availability and deadline. Fills that arrive after the engine stopped
+draining are counted (the venue's sheet holds them for the next boot).
+The arm's windows are bounded at boot (post timeout, read period, join
+and gone ≤ 60 s; shutdown ≤ 30 s).
+
+**What reaches the router (`HaltSignal`):** the stream gap (deviation
+18: 0 until a gateway socket was first up; then the time since one was
+last up WITH a gateway heartbeat under 2 s — the gateway stamps it every
+100 ms, so a dead gateway thread cannot hide behind a gauge frozen at
+1), the drift, both streaks, `reconciled` and its age, the P&L, the ALO
+rate, and `gateway_halted` from the gateway's halt word (an event can be
+lost — `HALT_EVENT_RING_FULL` means one was — the word cannot).
+`trigger_for` halts on `GatewayHalt` with no threshold, and on
+`AloRejectRate` at `alo_reject_permille` (0 = off until XH4f's key).
+**`budget_floor_breached` is always 0 from this arm until XH4e wires the
+budget governor** — XH4e must, before any live slot 6.
+
+**The dead man, driven by the arm (deviation 12):** wanted while the arm
+is booted, the account is the slot's own or read to hold no other slot's
+orders — a stream gap or another slot's resting row ends that until an
+orders read issued since says so again — and the arm holds an order or
+held one in the last 30 s (a requote gap must not cost a clear and a
+re-arm), or a cancel-all is not read clear. Another
+slot's order still in flight cannot be seen until it rests (the stream
+has no snapshot); the switch fires only when slot 6's own pushes stop,
+i.e. the whole engine stalled.
+
+**Obligations handed on:**
+- **XH4e:** the budget floor flag (above); **the day's spend**
+  (`venue_day_bought`) read from the venue before the router may seed
+  from this arm — until then `cap_day_usd_1e6` restarts at a full
+  allowance each boot (S7-L1 gap A), so XH4f must not route a live slot
+  through it before XH4e; the reads' IP weight (the venue weighs
+  `clearinghouseState` 2 and most other info requests 20 on REST; its
+  weighting of WebSocket-posted info is unmeasured — assume the REST
+  weights: ≈ 22 per 5 s at the default `recon_ms`), and the extra orders
+  reads a "gone" inference asks for; the sweep's cancels are address
+  requests.
+- **XH4f:** compose `ArmCfg` (the bound perps and their rules from
+  `HlDiscovery`; `expires_after_ms` = the requote expiry;
+  `post_timeout_ms` = the gateway's = the dead man's `answer_ms`;
+  `skew_ms` from the measured offset; `recon_ms`, `join_ms`, `gone_ms`,
+  `shutdown_ms`; `own_account`; `anchor_1e6` restored per master, and
+  `fresh_anchor_1e6` stored off the engine thread); map
+  `halt_on_alo_reject_pct` × 10 into `HaltLimits`; route slot 6's verbs,
+  fills, order events, retirements, idle, halt signal, cancel-all and
+  shutdown to the arm; its counters and the dead man's on `/metrics`;
+  carry XH2's open item — refuse growth while a perp holds a position
+  without a mark; pin the S7-L1 contract (the router seeds from an arm
+  that reports `reconciled` only once the day's spend is read) with a
+  guard or a boot test until XH4e implements `venue_day_bought`; keep the
+  fresh anchor in a state file of slot 6's own; log and alert on
+  `shutdown_unconfirmed` with the dead man's availability and deadline.
+- **XH4g (testnet):** whether a refused modify drops the original (the
+  arm handles both); whether a modified order's original gets an
+  `orderUpdates` `canceled` row; the gone and join windows against real
+  stream lag; whether a read can lag an acknowledged order (the re-read
+  and the unseen-close rule assume it can). **A bound perp must be slot
+  6's alone on the shared testnet account** (slots 0 and 3 trade on it):
+  pick perps they never touch, or the drift halts the slot by design; the
+  account must be flat in them at boot.
+- **XH4h:** a gateway sweeps every slot in its mask — arms that share a
+  gateway share its sweeps (each arm its own gateway, or a per-request
+  mask).
+- **For Anton:** (a) an unknown slot-6 order halts the slot until the
+  operator clears it — confirm (the alternative, cancel-and-continue,
+  trusts a book that just proved wrong); (b) the session P&L bound is not
+  judged on a shared account — confirm for testnet (mainnet slot 6 has
+  its own master); (c) a boot with a slot-6 position is held until XH5's
+  rule; (d) a shutdown that reaches its bound unconfirmed relies on the
+  dead man's schedule, which a parked switch or a shared account without
+  exclusivity does not have — confirm that XH4f's alert is the answer
+  (the process cannot outwait launchd's own stop).
+- **Debt noted (not XH4d's):** `request::Json::u64` renders a number's
+  digits through a 20-byte stack buffer before `put` (the read's post id
+  inherits it); `put`'s doc says no staging — a separate ticket.
+  `OrderDispatch::stats` returns its 96 B by value on every arm (a
+  `stats_into` ticket), and `RoutedDispatcher::new` takes the 704 B
+  `ExecRoute` by value at boot (E6) — cold, unmarked, a ticket.
+
+**Tests:** the arm (39): rounding and the fill-before-`FILLED` join; the
+join window; modify → `RESTING` + `CANCELED(REPLACED)`; a replacement
+that lands by a fill (three events in order); a refused modify
+(`REJECTED` alone, the cross counted, the predecessor cancellable); the
+venue's end of an original held for its modify's answer (both ways); a
+cancel that overtook its place; doubt settled both ways; a cancel asked
+in doubt; a read that stops listing a resting order (read again, then
+closed); "not found" read again and revived; a slow confirming read (a
+listing revives, silence ends); a cancel of an order thought gone, and
+an unanswered one (the gone wait kept); an order closed unseen and
+listed again (cancelled, drift pinned); an unknown order (cancelled,
+drift pinned, the account marked shared); a gap and another slot's
+resting row ending exclusivity; a gap during an orders read (another
+read, and only it restores exclusivity); a storm of re-reads never
+starving the sheet; an agreement needing a fresh sheet and a fresh
+orders read; drift on the
+second disagreeing sheet only; fills before the seeding sheet; a boot held by a bound
+position; the anchor restored and offered (and none offered on a shared
+account); the ALO permille; the sweep word; cancel-all `Clear` only once
+no held order can land; a cancel-all not read clear holding the switch
+past the hold; shutdown — swept then cleared, never confirmed (left
+armed, counted), a clear sweep whose switch clear goes unanswered
+(counted apart), Stranded (asked again); the signal (a stale heartbeat,
+the gateway halt, the P&L); a shared account; a failed read asked again;
+refusals before the ring; the stream beating the answer; bad
+configurations (the bounds included). The loopback (+4): reads (rows,
+ends, an unreadable answer), a read with no socket, the sweep (ours
+only, read until clear), Stranded after 8 rounds. The router (+2):
+`GatewayHalt` with every threshold unset, `AloRejectRate` at the
+operator's permille and never when unset, both words round-tripped. Gate
+96b now also posts and scans both reads every round (rustls' residue
+pinned at 12 a round) and measures one sweep round alone (4: its read
+and the cancel of ours, sealed and opened); gate 98 holds the arm at
+0 B/op over every path above, each run in the measured window (the
+stream's row before the answer every other time, another slot's resting
+row every 89 commands).
+
+**Gates (XH4d, 2026-09-26):** clippy `-D warnings` clean; nextest
+3562/3562; alloc 91/91 in release — gate 96b now also posts and scans
+both reads every round (rustls' residue measured at exactly 12 a round,
+was 8) and measures one sweep round alone (exactly 4), and gate 98 (new)
+holds the arm at 0 B/op over 40 000 rounds, each of its eleven paths run
+again inside the window (and in every repeated run); copy-audit hits 31 =
+baseline, new 0; license-check OK; the release binary builds; the
+existing members' replays (bin15, vrp, xsd, hyparb, icdp, vm, xmm)
+byte-identical against main's binary; rustfmt clean on the new file and
+the touched hunks. One known flake, pre-existing and not XH4d's:
+`hl_userws_loopback::a_frame_larger_than_the_buffer_is_refused_not_grown`
+("connect: BadFrame", failing intermittently since main's base; its
+`userws_conn` is untouched). Reviews: zero-copy APPROVE WITH NITS (r1,
+r2) → APPROVE (r3); alloc REJECT (r1: gate 98 never ran a successful
+modify; no gate over the reads and the sweep) → APPROVE WITH NITS (r2,
+r3) → nits applied (the size pin kept exact: the toolchain is pinned);
+risk REJECT (r1: shutdown cleared the dead man before the sweep and quit
+on Stranded; cancel-all Clear on the first empty read; the router seeded
+over an unseen position; the P&L anchor reset each boot; an inferred
+close ignored a later listing) → APPROVE WITH NITS (r2: a slow confirming
+read discarded; an unanswered cancel reset a gone wait; a gap mid-read;
+the switch's 30 s hold at shutdown; a silent bound) → nits applied, and
+the ones they raised (the shutdown counters, the re-read's priority, a
+starved sheet, a stale orders read) → APPROVE (r3). Found and fixed on
+the way: a cancel to an order thought gone wiped its gone wait (the row
+stranded, cancel-all never Clear).
+
+**Merged with main (2026-09-26, `4a087f5`: BX1–BX6, HC8–HC11b, HAR):**
+`HaltReason` 10/11 are BX3's `VenueLock`/`MarginRisk`, so XH4d's two are
+12/13 (the trigger order: the venue's verdicts, the streaks, the budget
+floor, the gateway halt, the ALO rate, drift, staleness, the gap, the
+session bound); `HaltSignal` holds BX3's two flags at bytes 27/28 and
+XH4d's at 29/30 (48 B, no padding left), and BX3's two-arm
+`HaltSignal::merged` ORs `gateway_halted` and keeps the larger ALO rate;
+XMM's allocation gates are renumbered after main's (HC8/HC9/HC11 hold
+83–85, BX 86–93, 94 is BX's): 83 → 95, 84a/84b → 96a/96b, 85 → 97,
+86 → 98; the HL signing fixture holds 38 vectors (XH4c's nine rows and
+HC10's two HIP-3 rows); `exec-hyperliquid`'s `testvenue` and BX3's
+`loopback` features share one `[features]` table. The arm meets BX3's
+`try_next_retired`, which now carries the router's `why`: a post-only
+cross or an order in doubt that never landed is `RETIRED_EXPIRED`, any
+other refusal `RETIRED_REJECTED`, the member's cancel or its modify
+`RETIRED_CANCELED_MEMBER`, every other end `RETIRED_CANCELED_VENUE`; and
+`/state` names XH4d's halts (`engine_snapshot::HALT_REASON_WORDS` gains
+`alo-reject-rate` and `gateway-halt`, pinned by `cli` as before — until
+this merge XH4d's two reasons would have read `unknown` there).
+**Handed to XH4f from BX3/BX6:** the gateway arm is a queued arm — its
+`cancel`/`modify` `Ok` means queued — so it must answer
+`verbs_confirm_later` `true` for slot 6 and follow the contract
+`exec-binance`'s arm follows: the router releases a cancelled row on the
+confirmed `RETIRED_CANCELED_MEMBER` and renames a modified one on the
+arm's `Renamed` (a modify's landing then emits `Renamed`, not the
+original's retirement), fills reach the router before the retirement
+that ends their order (BX3 obligation 1: the retirement one idle poll
+later), and a filled order retires as `RETIRED_FILLED` where the router
+expects it; `/metrics` shows the arm's `closed_unseen` beside the
+retirement counts (an order the arm closed unseen retires as a venue
+cancel — its real end is not known). **For Anton:** BX6 built its gateway machinery inside
+`exec-binance` rather than on the `exec-gateway` kit (the pending table,
+the deadline queue, the duplex): two order-gateway cores now — converge
+them before MEXC (XM2) builds a third.
+
+### XH4e amendment (2026-09-26): the perp ledger and the budget governor — nothing wired, nothing armed
+
+The E6 ledger learned perps from BX3/BX6 (instrument rows, `LAW_LINEAR`:
+signed positions per slot, marks with the sanity and 30 s staleness laws,
+the one-price probe, the exit rule over the working orders, and the clip,
+gross and day clamps); XH4e adds what a maker slot needs on top of it,
+and the gateway arm's half of the budget governor (maker plan §8.7–8.8).
+Slots 0–5 and 7 are judged exactly as before; nothing is wired (XH4f).
+
+**Router — perp slots (`PerpLimits`, per slot, 0 = unset; `ExecRoute`
+704 → 832 B).** A slot that sets `cap_perp_usd_1e6` and
+`max_resting_usd_1e6` is a perp slot — both or neither:
+`ExecRoute::set_perp_limits` refuses a pair that sets one without the
+other, or a negative one (`PerpLimitsPartial`) — and on it:
+- an order on an id with no instrument row, or on a row that is not
+  linear, is refused `Unpriced` — a perp order never falls to the HIP-4
+  family clamps;
+- **XH2-C, no mark, no growth:** while any linear row holds a position of
+  the slot that no mark prices (none yet, or older than the ledger's 30 s
+  `MARK_STALE_NS`), every order that is not an exit is refused `Unpriced`.
+  The ledger keeps the count exact per slot — one bit per row and slot,
+  set and cleared wherever a position or a mark changes (a fill, a mark,
+  an expiry, a settlement);
+- **per-perp inventory, working orders included:** |the position + every
+  order working on the order's side (less the one a modify replaces) +
+  the order|, at the cap's one price — the higher of the order's limit
+  and the row's reference (the mark, else the last fill), either side:
+  the held position is worth at least its mark whatever a bid below it
+  says — over `cap_perp_usd_1e6` and larger than the same without the
+  order → `CapPerp`;
+- **resting notional:** Σ remaining × limit over the slot's working
+  orders; a place or modify that takes it over `max_resting_usd_1e6` and
+  raises it → `MaxResting`.
+
+Exits pass both money clamps (O-BX25) and count in the resting sum. The
+order of the clamps: the law, the open-order count, the exit, XH2-C, the
+clip, the per-perp inventory, the resting notional, the gross
+(`cap_instance`), the day. A perp slot's order is probed in ONE pass over
+the resting table (`Ledger::probe_perp`: the exit test's working orders,
+the inventory's and the replaced order's resting term together;
+`InstProbe` 40 → 64 B, one line, still returned by value). The ledger
+keeps each resting row's price in arrays beside the 24 B rows (whose
+full-table scans are unchanged) and the per-slot sum exactly (a property
+test against a recompute); a queued arm's modify counts at the larger of
+its two sizes and the higher of its two prices in the resting sum (which
+only a perp slot reads) and, on a perp slot, in the working orders its
+exit test and inventory add — until its `Renamed`, then at what it asked
+(a refused one keeps them until the row goes); every other slot's exit
+test counts the remaining quantity exactly as BX3 ruled (a pinned test);
+an order the table could not hold keeps its notional for good, as it
+keeps its count (fail closed). The refusals count in
+`RouteCounters.refused_cap_perp` /
+`refused_max_resting` (and in `refused_risk`); XH2-C's count in
+`refused_unpriced` — `RouteCounters` is full at 256 B and growing it is
+the decision its layout test pins — so XH4f publishes slot 6's
+`unmarked_positions` as a gauge: the alertable signal of a dead mark feed.
+
+**The ledger after a refused modify — closed by XH4f's queued-arm
+contract.** While this arm answers `verbs_confirm_later` false, the
+router renames a resting row at a modify's `Ok`; a modify the gateway or
+the venue refuses after that closes the replacement, and the router's
+`on_cancel` of it drops the predecessor — still resting at the venue,
+released by the arm — from the open-order count, the resting sum and the
+working orders until the member's cancel lands: one clip per side in
+transition, more often under throttling. XH4d's merge note already hands
+XH4f the contract that closes it (the arm answers `verbs_confirm_later`
+true, a modify's landing emits `Renamed`, a refusal leaves the
+predecessor's row as it was); the asked size held above is what lets that
+contract count a queued size increase, and XH4f releases a refused queued
+modify's hold when its replacement's retirement arrives (the replacement's
+cloid kept beside the hold) — until then the hold stays until the row's
+next modify or its end, the conservative way. Nothing is wired before it.
+
+**Gateway — the rates.** Every post charges a one-minute window of the
+venue's IP weight — an action 1 + ⌊n/40⌋, `clearinghouseState` 2, the
+other reads 20 (the venue's REST weights: its weighting of WebSocket-posted
+info is unmeasured), `userFillsByTime` 1 more per 20 rows — and every
+WebSocket frame (posts, pings, pongs, subscribes) a window of its
+messages, against the gateway's shares (`IP_WEIGHT_SHARE` 400 of the
+venue's 1 200 a minute per IP, which the blocking arm and the ingress
+share; `WS_MSG_SHARE` 1 000 of 2 000). At 80 % of either share, growth
+(a place, a modify, a leverage change — a reduce-only place included, as
+XH1 rules for the halt and the snapshot gate: no member relies on the bit
+for an exit) is refused unsent, `REASON_THROTTLED` — it never left, so it
+is no reject, feeds no streak and is taken back from the address budget;
+cancels, control actions, reads and pings still go. The congestion word
+(`GatewayStats::congestion`, published with the gateway's heartbeat: at
+most ten stores a second on the line the engine polls): 0; 1 busy (60 %
+of a share, 60 posts in flight, or a post-RTT moving average of 1 s); 2
+throttled; 3 a venue rate-limit answer in the last 10 s. The arm reports
+it (`congestion()`). A sweep round's cancels reach the engine as one add.
+
+**The arithmetic, for XH4f.** At XH4d's read defaults the orders read
+(20) and the sheet (2) every 5 s are 264 IP weight a minute, and the
+budget read at a 60 s period 20 more: 71 % of the 400 share. The word
+then reads busy for good, and the throttle line (320) leaves ≈ 36 a
+minute for every action, the switch's 12 re-arms and each gone re-read —
+below a maker's requote rate — while a boot's day pages (≤ 120 each)
+throttle growth outright, XH4f's `updateLeverage` included. XH4f
+therefore sizes `recon_ms` (the orders read may run slower than the
+sheet) and the shares together — or XH4g measures the WebSocket info
+weights first — and retries a leverage change refused `THROTTLED`.
+
+**Arm — the address budget.** Read from the venue (`userRateLimit`, a
+WebSocket-posted read) after the boot's orders read and every `limit_ms`
+(≤ 10 min); between reads the arm counts one address request per item it
+pushes — a place, a modify, a cancel, a control post (never exempted as a
+cancel: whether `scheduleCancel` draws on the cancel allowance is
+unmeasured) — and per cancel of the gateway's own sweeps (its stats
+word), and takes one back for each of its own — a place, a modify, a
+cancel, the switch's post — the gateway refused unsent (a read is no
+address request; no other control post is the arm's). Every count errs
+high but one: the requests unanswered when a read goes (places and
+modifies sent or in doubt, cancels sent, the switch's post) and every one
+pushed while it is in flight are added on top of its answer (some may
+count twice) — the exception, untracked by rows, is the cancels still in
+flight as a read goes of a sweep round (at most one round: inside the
+floor's headroom, which holds two cancels per order the arm can hold) and
+of the unknown orders an orders read found (one each; after boot any
+unknown order also halts the slot, its drift pinned), under-counted until
+the next read states them — and no fill is credited between reads — the
+last read may already count a fill that arrives after it; the next read
+states the volume (≈ 4 requests a minute at the probe's rate). The arm is
+not ready before the first answer; **growth is refused** (`SlotDisabled`,
+counted `refused_budget`; no halt) **once no read has answered for three
+`limit_ms`**, until one does. **At or below `budget_floor`** (at least
+`MIN_BUDGET_FLOOR` = 2 × 128 + 64 = 320 — every order the arm can hold
+cancelled twice over and 64 re-arms — or the boot refuses the arm,
+`ArmErr::Budget`): places and modifies are refused (`SlotDisabled`, the
+blocking arm's answer), `budget_floor_breached` is 1 — the router's
+`BudgetFloor` halt: cancel-all, sticky — and **the dead man stays armed
+while the arm holds an order or the cancel-all is not read clear** (the
+floor is the headroom for exactly that cleanup; LAW XH-1), then parks at
+once, the requote hold skipped (its re-arms alone cost ≈ 17 280 requests
+a quoting day). A shutdown at the floor keeps the switch armed until the
+venue reads clear, as every shutdown does. Cancels are never refused; the
+venue's separate cancel allowance, min(cap + 100 000, 2 × cap), is
+modelled (`AddressBudget::cancel_remaining`) and reported. **The shared
+address:** on the testnet account slots 0 and 3 spend from the same
+address unseen by this arm between reads — the next read states it (the
+staleness bound only fires when reads stop answering); on mainnet slot 6
+trades from its own master (O-XH5).
+**Deferred, for Anton:** top-ups (`reserveRequestWeight`, the blocking
+arm's S7-L1 path) on the gateway arm — the probe earns ≈ 1 request per $1
+traded; XH5 decides. A stale `expiresAfter` rejection's 5× charge is not
+modelled (the venue's wording is unmeasured; the next read corrects the
+count).
+
+**Arm — the day's spend (S7-L1 gap A; the XH4d amendment's XH4e
+obligation).** Read once, after the first budget answer:
+`userFillsByTime` from 00:00Z, page after page — each from the last one's
+latest row, inclusive (a row on the boundary counts twice, the
+conservative way), a read period later and never while the gateway's
+rates read throttled, and every page ending at the time the first page
+went (`endTime`, taken again each time the first page is asked: later
+fills are the live ledger's, and on a shared account other slots' new
+fills cannot keep the read moving) — until a page adds nothing past its
+start (a short page is not taken as the end: the venue's 2 000-row page
+is documented, not measured) — and the rows whose cloid carries the slot
+summed as |px × sz|: an upper bound on the day's increasing turnover (the
+venue's `startPosition` is account-wide on the shared testnet account).
+**The day reads spent** (fail closed, every sum saturating; counted
+`day_unreadable`) once the rows read **plus every fill the account took
+after `endTime`** reach 10 000 — the venue serves only an account's
+10 000 most recent fills, counted to the moment it answers, so fills
+after `endTime` (other slots' on a shared account) push the day's first
+rows toward the edge unseen by the pages (risk r3): the arm counts each
+one the user stream brings, any slot's or a stranger's (one with no time
+counts too), and judges the sum at every page, the page that adds nothing
+included (it answers a read period after the last page with rows: the
+fills that raced that page are in by then) — or once a stream gap that
+may have lost fills (not an `orderUpdates` frame) falls while the read
+holds its `endTime` (a page answered, or the first in flight: before
+that, the first page asked again takes a new `endTime` and what the gap
+lost comes back as rows), or the read needs more than 20 pages, meets a
+full page that cannot move past its start, or a page whose rows ran
+backward in time (the scan counts them in place: a venue answering the
+newest rows first would leave a gap the next page's start skips, so such
+a page fails closed instead of open; the order is unmeasured — XH4g
+measures it before any live slot 6). What the count cannot see: a fill
+stamped after `endTime` that reached the arm — or was lost to a gap —
+before the first page was asked (the host's clock behind the venue's:
+milliseconds of fills), or one the stream brings more than a read period
+late — the boundary rows, at least one a page and counted twice, err the
+other way. A failed budget or day read is
+asked again a read period later (each is 20 IP weight or more; a read
+that keeps failing retries for ever and `reconciled` waits — fail
+closed). `reconciled` waits for the day, so the router — which adopts the
+arm's `venue_day_bought` before it seeds — never restarts the slot's day
+cap at a full allowance. XH4f's S7-L1 pin becomes a test of that. **A
+full page's size:** ≈ 0.8 MB of real-length rows (a loopback test: 2 000
+rows with a cloid, a hash and a builder fee, in one frame, fit the post
+connection's 1 MiB receive buffer and sum in place, the connection kept);
+a page past 1 MiB would drop the post connection (`BadFrame`, its posts
+in doubt) — XH4g measures a real page and, if one nears the bound, pages
+by a narrower `endTime`. **Its rustls cost:** a full page is ≈ 50 TLS
+records and a burst past rustls' 4 KiB receive window (it grows and
+shrinks: more allocations than a short read's — gate 96b pins 4 for two
+short reads), up to ≈ 250 records for the read's 10 000-row bound, once a
+boot and before `reconciled` — off the trading path; it joins the rustls
+record-layer residue (TL4/TL5b), and XH4g counts one real page. **For
+Anton:** Appendix B calls slot 6's `cap_day_usd_1e6` ($5 000) a reporting
+bound, but the router ENFORCES it (clamp 4, the increasing part of every
+fill); at the paper rate (≈ 17 fills an hour of ≈ $15) a busy day reaches
+it, a restart sooner (the venue's figure counts both sides). XH4f sets it
+from the XH3 bar's fill rate, or the router gets a report-only mode.
+
+**Fill stamps.** A venue fill's `ts_ns` is the venue's time × 1e6 (wall),
+as the blocking arm stamps one; XH4d stamped the gateway's monotonic
+clock, which the ledger's day epoch would have read as wall time.
+
+**Obligations handed on:**
+- **XH4f:** slot 6's `PerpLimits` from two new `exec.toml` keys (the
+  grammar, `exec.toml.example`, the boot tell and the pinned test;
+  deviation 19) — the boot refuses a live slot 6 unless BOTH are > 0 (the
+  router refuses a partial pair too); bind slot 6's perps as `LAW_LINEAR`
+  instrument rows — disjoint from slot 0's hedge perps, since the router
+  judges every slot's order on a bound id by its law; feed Hyperliquid
+  marks (`activeAssetCtx`: `markPx`, and `oraclePx` as the index) through
+  BX6's `Mark` channel **stamped on the monotonic clock**
+  (`core_time::now_ns()`, as BX6's lane stamps them: `expire_marks` reads
+  a monotonic now, so a wall-stamped mark would never go stale and XH2-C's
+  expiry half would be silently off) — without marks XH2-C refuses every
+  growing order once slot 6 holds a position; the queued-arm contract
+  (XH4d's merge note; it closes the refused-modify gap above) and the
+  release of a refused queued modify's hold when its replacement's
+  retirement arrives (the replacement's cloid kept beside the hold);
+  `ArmCfg.budget_floor` from `request_budget_floor` (≥ `MIN_BUDGET_FLOOR`)
+  and `limit_ms`; the gateway's shares and `recon_ms`, sized together (the
+  arithmetic above; `recon_ms` at least 1 s — the day read's last page
+  waits one read period for the stream to bring the fills that raced the
+  page before it); leverage changes sent through the arm (charged to
+  its budget) or charged by their sender, a `THROTTLED` one retried; the
+  member's congestion pull and its requote cap; `/metrics` for
+  `refused_cap_perp`, `refused_max_resting`, slot 6's
+  `unmarked_positions` (a gauge), the budget (`budget()`,
+  `cancel_remaining`), `throttled`, `refunded`, `limit_reads`,
+  `day_pages`, `day_unreadable`, the resting sum (`resting_usd_1e6`), the
+  rate windows (`RateWindow::sum`) and the gateway's `throttled` — each of
+  these public items has no production caller until then (the checklist
+  the allocation review asked for); an allocation gate driving slot 6
+  through the router — XH2-C refusing, a mark arriving, `CapPerp` and
+  `MaxResting` refusing, a queued modify's asked hold (the perp half of
+  the probe is 0 B by inspection and runs only once `PerpLimits` is set).
+- **XH4g (testnet):** the shares against the host's real Hyperliquid
+  traffic; the WebSocket info weights; the stale-expiry rejection's
+  wording; `userFillsByTime`'s page size, which end of a range over 2 000
+  rows a page is cut at (the next page starts at a page's latest row, so
+  the oldest end is assumed: a cut at the newest, in time order, would
+  skip rows unseen), its bytes against `MAX_WS_BUF`, its order within a
+  page, its `endTime` and the venue's 10 000-fill retention, counted to the
+  moment it answers (the day read's spent rule rests on both).
+
+**Reviews:** r1 — zero-copy APPROVE WITH NITS, allocation APPROVE WITH
+NITS, risk REJECT (MAJOR: the dead man parked at the budget floor while
+orders rested — an engine stall or a Stranded sweep in the halt's window
+left them with no venue switch) → the fixes above, every MINOR and NIT
+applied or answered here (not done: a reduce-only exemption from the
+throttle, XH1; a separate XH2-C counter, `RouteCounters` full; the
+pre-existing `Json::u64` scratch, its own ticket in the XH4d amendment);
+r2 — zero-copy, allocation and risk APPROVE WITH NITS (risk's on the
+condition that the queued-size hold's reach be stated) → the hold kept
+off every non-perp slot's exit test (pinned), the day read's `endTime`
+and its time-order check, the refund kept to the arm's own posts, the
+floor's flat-and-Working and shutdown cases pinned, one `never_left`
+rule for the arm and the dead man, the `HlGateway` bound, the probe by
+reference, the docs (not done: carrying a sweep round's in-flight
+cancels into a read — above; proving the park branch in gate 98's window
+— boolean, gate 97 covers the clear); r3 — zero-copy APPROVE, allocation
+and risk APPROVE WITH NITS (risk's on the condition that its N1 land: a
+shared account's fills after `endTime` could push the day's first rows out
+of the venue's 10 000 unseen, the more so for a first page retried with
+its old `endTime`) → every fill after `endTime` counted with the rows and
+judged at every page, a stream gap during the read spending the day,
+`endTime` taken again at each ask of the first page (all pinned); the
+unknown orders' cancels in the under-count; the page's cut end on XH4g's
+list; the hold's release on XH4f's; `never_left` pinned (a truth-table
+test, THROTTLED in the dead man's retry test); `DAY_MS`, the page size
+and the digit writer shared with `dayspend` (the dead man's `DAY_MS`
+too); the docs; r4 — zero-copy APPROVE, allocation and risk APPROVE WITH
+NITS, no condition (N1 closed as built) → the gap's spend kept to a read
+holding its `endTime` and to gaps that may lose fills, a fill with no
+time counted, the post-gap page's test made to fail without its guard,
+`never_left` swept over all 256 reason bytes, the `userFillsByTime` head
+shared with `dayspend`, `recon_ms` ≥ 1 s on XH4f's list, the docs; r5 —
+zero-copy APPROVE, allocation and risk APPROVE WITH NITS (risk: pin the
+first page in flight before merge, no further round) → the gap's spend
+pinned wherever the read holds its `endTime` (the first page in flight
+on a `userFills` frame that did not scan, between pages on a reconnect,
+a later page in flight on a gap of no stated kind), the residual's twin
+stated (a fill lost to a gap before the first page was asked), the docs.
+
+### XH4f amendment (2026-09-27): slot 6 wired to its gateway arm — TESTNET only, the fleet stays paper
+
+XH4f wires slot 6 (the xmm maker) to the Hyperliquid WebSocket gateway
+arm XH4b–XH4e built (maker plan §8, XH4 plan row XH4f). A live gateway
+slot 6 boots only against TESTNET, with the E3 testnet agent, and only
+as the only live slot of its engine (XH4g's battery composes the same arm
+and gateway in-process instead — see the XH4g amendment): the launchd engine
+stays paper, slots 0–5 and 7 are judged and routed exactly as before, and
+every default (a paper slot, the blocking arm, a member that reads no
+health) leaves paper runs and the seven members' replays byte-identical.
+
+**The artifact (D1, D3, D4; deviation 19).** A per-slot `transport =
+"blocking" | "gateway"` (default `blocking`: today's path unless flipped,
+deviation 10). `gateway` is accepted on slot 6 only (XH4h widens it) and
+only with `venues = ["hyperliquid"]`; a LIVE gateway slot needs both perp
+keys > 0 (`cap_perp_usd_1e6`, `max_resting_usd_1e6` — the router's
+`PerpLimits`), `halt_on_alo_reject_pct` in 1..=100 (× 10 into the ALO
+halt's permille), `request_budget_floor` ≥ 320 (`MIN_BUDGET_FLOOR`,
+const-asserted against the grammar's mirror) and no top-up keys (none
+before XH5). The boot tell names the transport and the three keys on a
+gateway slot only. `exec_boot` refuses a live slot 6 on the blocking
+arm (XH1's refusal, narrowed), and a live gateway slot 6 **runs alone**:
+- beside any other live slot — **A-XH4f-1**: until XH4h shares one nonce
+  per agent address (S3, deferred there) the gateway is the process's
+  only Hyperliquid signer (two nonce streams on one agent collide, and
+  the venue refuses the loser — possibly a cancel); and **D2**: the
+  router's halt cancel-all is global, so a testnet halt of slot 6 would
+  pull any other live slot's quotes (a mainnet Binance slot's included),
+  and theirs slot 6's;
+- with a session bound (`halt_on_gain/loss_usd_1e6`): the gateway arm
+  judges no P&L on the shared testnet account, so the bound could never
+  fire (XH5 gives slot 6 its own account).
+
+The boot also refuses: no xmm member in `--strategy`; the member's caps
+outside the slot's clamps (clip ≤ `max_order`, per-perp inventory ≤
+`cap_perp`, resting ≤ `max_resting`, gross ≤ `cap_instance`); a
+`halt_on_recon_stale_ms` below two read periods; an exchange config that
+is not the testnet venue (`HlConfig::is_testnet`: the host and the
+network) or a market-data host that is not testnet (LAW E-4; D3 — mainnet
+needs slot 6's own master, O-XH5, and comes with XH5). Credentials:
+`HlConfig::from_env(Scope::Testnet)` (Anton's ruling: the E3 testnet
+agent, shared with slots 0 and 3), `own_account = false`.
+
+**The composition (`cli::xmm_live`).** One `/info meta` on the exchange
+host, parsed in place in the boot client's buffer → `HlDiscovery` → each
+member perp's asset id, its `PerpRules` (the member's lot checked against
+the venue's `szDecimals`), the `CoinMap` and a `LAW_LINEAR` instrument
+row. The arm and its gateway are paired (the post timeout = the dead
+man's `answer_ms`, every bound asset in the coin map, the dead man's skew
+= the arm's, asserted); the gateway runs on the pinned thread `hl-gw-xmm`
+(core 12). The engine composes `SlotSplit(6, NullLive, arm)` — slot 6 on
+its arm, outermost; every other combination with a gateway fails closed
+(the Binance + slot 6 shape comes back when D2 is ruled) — binds the rows
+through the BX6 path, turns the mark lane on (the router prices slot 6's
+perps off Hyperliquid marks, XH2-C — so a gateway-live engine's members
+also see HL marks they did not before; paper and replays are unchanged),
+and releases the gateway's stop after the engine loop returned (the arm's
+`on_shutdown` pumps the gateway inside the engine's drain) or on a boot
+abort — once the process-wide shutdown is seen, the gateway turns 18 s
+more at most (above the arm's 10 s shutdown bound, under the 20 s join
+grace; const-asserted).
+
+**The timing knobs** — constants in `cli::xmm_live` until XH4g measures
+them: the sheet and orders reads every **10 s** (`recon_ms`, twice XH4d's
+5 s — the XH4e amendment's arithmetic, const-asserted at the composition
+as the periodic reads under 40 % of the IP share: at 10 s the two reads
+weigh 132 IP weight a minute and the budget read, every 60 s, 20 more —
+38 % of the 400 share, so the congestion word reads busy only once
+actions, the dead man's re-arms among them, pass 88 a minute and growth
+throttles past 168; at 5 s the reads alone were 71 %, busy for good); the
+budget every 60 s; the shutdown bound 10 s; the join 1 s and the gone
+wait 3 s (XH4d's tested values); the skew 2 s (the dead man's, asserted);
+leverage 3× cross (O-XH6); `expires_after_ms` = the member's
+`lifetime_ms` (≤ 30 s, the xmm.toml grammar's bound, E-8).
+
+**The queued-arm contract (closes XH4e's refused-modify gap).** The arm
+answers `verbs_confirm_later` for its slot: a cancel's or a modify's `Ok`
+means queued. A modify that lands emits `Renamed(prev, new, qty, …)` — the
+router renames the row and the asked size becomes its size — and never
+the predecessor's retirement; a fill that ends an order retires it
+`FILLED`. Retirements are released a poll behind their orders' fills and
+only once the engine has taken every fill queued (the engine books a fill
+before its row is released) — the fills the arm has taken: a `canceled`
+row closes its order at once, so a partial fill whose `userFills` frame
+comes after that row (another channel, the same block) is booked after
+the release — the resting sum drops before the position rises, by each
+such order's unbooked part, for the moment between the two frames (r2:
+stated, not joined). The router drains **renames before
+retirements** — a replacement that ended by the poll its landing arrived
+in (a cancel, a fill, a TTL answered with the landing) finds its row under
+its new id; drained the other way, its retirement found no row and the
+rename revived one the venue no longer held (a phantom in the open-order
+count and the resting sum; r1 MAJOR) — and takes no retirement in a poll
+whose renames reached the drain's cap. `Ledger::on_retired` releases the
+row, or drops a live row's asked hold when the retirement is its asked
+replacement's — for every queued arm, BX6's refused modifies included. A
+refused modify leaves the predecessor's row as it was.
+
+**Leverage (D10, O-XH6).** Once the seeding sheet has read every bound
+perp flat, and before `ready()`, the arm sets each one's leverage (3×,
+cross) through its own budget — never before: on the shared account a
+bound perp may hold another slot's position, the boot holds then, and a
+held boot sends none (r1). A perp quotes only after ITS acknowledgement;
+a refusal that never left the host (throttled, a full ring) is retried a
+read period later; a venue refusal or an unanswered post leaves that perp
+**dark** — every place and modify on it refused locally
+(`refused_leverage`; a dark perp never quoted, so slot 6 holds nothing on
+it), cancels pass.
+
+**Execution health and the member's pulls (D7, D8).**
+`core_types::ExecHealth` (8 B: blocked bits, the congestion word, the
+recent window's worst post round trip in ms) through a defaulted
+`OrderDispatch::exec_health(slot, now)` and `Ctx::exec_health()`: a paper
+slot is healthy, an `off` slot blocked, a live slot the router's word (a
+latched halt, an unseeded ledger) merged with its arm's (not ready, the
+budget refusing growth, congestion, the RTT). The gateway keeps the RTT
+window (64 samples ≤ 30 s old; the worst is the p99 of so few) and
+publishes it with its heartbeat. The member, after its staleness checks:
+blocked → cancel both sides and hold; RTT over `rtt_pull_ms` → pull;
+congestion throttled or worse → pull; busy → the requote floor × 4. LEAD
+cancels are untouched (XH-5). Five new member counters (22).
+
+**TTL at the gateway (D9 — survives an engine stall).** The arm stamps a
+place's TTL (≤ 30 s) into the command; the gateway tracks it at admission
+(128 dense 24 B rows; a full table counts `ttl_full` and the member's own
+expiry cancel remains), a modify's replacement inherits the original's
+deadline and the original's row goes when it lands. A cancel that
+succeeded — the arm's own or the TTL's — the order's end row, or a
+refused place or modify drops a row; the arm's own cancel no longer drops
+it at admission, so a cancel that fails leaves the TTL to cancel the
+order. **A not-found drops nothing** (r2): about an order still in flight
+— a place or a modify in doubt, landing over another socket or the REST
+fallback after the cancel — it does not mean gone (XH4d's sticky intent),
+so the row stays for the order's end row. Its order seen resting once that
+cancel was answered (a late landing) has the cancel go again at the next
+beat; seen while the cancel is out, the answer decides — a not-found sends
+it again, a success ends it, and nothing goes meanwhile (r3). At the
+heartbeat (one pass over the table) an
+expired row is sent an UNTIMED `cancelByCloid` (XG-3: a cancel always
+goes), charged to the address budget with the sweeps' cancels; its
+acknowledgement reads `EXPIRED` and the arm retires the order
+`RETIRED_CANCELED_TTL` (an end row that arrives before the acknowledgement
+reads `EXPIRED` too — the row remembers that its TTL cancel went, whatever
+went again since (r3); one after it, the venue's own reason). A TTL cancel
+refused unsent goes again at the next beat; one the venue refused (the
+order not gone) goes again 1 s later, three venue refusals at most —
+account-level ones included, so a refusal the venue repeats every time
+stays bounded (r1, r4); one left in doubt (a dropped socket, a lost
+answer), one that never
+left this host (a REST dial that failed) and one the venue's rate limit
+turned away go again 1 s later too and never use up a try — a transport
+outage does not end the TTL (r2, r3).
+**Residual (r2):** past three refusals, or after a not-found, the row
+waits, sent, for the order's end row or a late landing (seen during its
+last refused try or after it — r4), and is dropped
+60 s past its last deadline (a retry moves the deadline); nothing at the
+gateway cancels that order again on its own. While the engine runs the
+arm acts on each TTL answer as its own cancel's (a refusal: its cancel
+again; a not-found: its sticky intent); in an engine stall only the dead
+man cancels — armed while the account is the slot's own or a read finds no
+other slot's orders on it, the shared E3 account included (its cancel is
+account-wide; XH4g's obligations). **Known:** a TTL cancel answered in
+doubt also reaches the arm as its own cancel's doubt — the arm sends a
+cancel of its own (one more); the order's end reads `EXPIRED` unless that
+cancel of the arm's is acknowledged before the order's end row arrives. Only
+a plain `canceled` end becomes `EXPIRED`: a venue-specific one (margin,
+self-trade, reduce-only, the open-interest cap, the dead man's schedule)
+keeps its reason (r4).
+
+**The rate windows move with the clock.** XH4e's windows advanced only
+when something was spent, so after a burst the throttle and the congestion
+word could hold on a stale sum until the next spend; the gateway now
+advances both at its heartbeat (≤ 100 ms stale).
+
+**Metrics and the shutdown alert (D11).** The arm's numbers cross in a
+pinned 752 B `GatewayArmReport` through a defaulted
+`OrderDispatch::gateway_arm_report(now, out)` (an out-param; `ExecCounters`
+keeps its 936 B), ONE a second (the engine loop takes it for `/state` and
+the 5 s `/metrics` mirror reads the latest): the arm's counters and the
+dead man's, the gateway's shared words and — a new 256 B granule of
+`GatewayStats` the gateway writes at its heartbeat, by name (`pw::*`) —
+its own counters and its rate windows' sums, the budget and cancel
+headroom, the latencies (post RTT p50/p99/max, push to write, cancel RTT,
+fill lag), and the router's words for the slot (`refused_cap_perp`,
+`refused_max_resting`, `unmarked_positions`, the resting notional, the
+merged health). `/metrics`: the `engine_exec_hlgw_*` family (65 counters,
+28 gauges), registered only when slot 6 is live on the gateway (with BX6's
+per-`why` retirements and mark counters); `core_metrics` grows to 640
+counters and 512 gauges (147 520 B, built on the booting thread's stack;
+the worst case — every slot live, both arms — measures 518 and 407).
+`/state`: `exec.arms.hyperliquid_gw`. **The shutdown tell**
+(`xmm-gateway-shutdown.tell`, beside the exec artifact) is written at
+boot and removed only by a confirmed shutdown: a shutdown that reaches its
+bound with orders of ours possibly resting rewrites it with the dead
+man's availability and deadline and an ERROR line; a kill during the
+drain, a crash or an abort leaves it as it was written at boot (r1). A
+tell that cannot be written at boot stops the boot before the members
+start, while nothing can have been sent (r2). The
+next boot reads it back as `engine_exec_hlgw_last_shutdown_unconfirmed`
+and an ERROR line — XH4d's For Anton (d): the process cannot outwait
+launchd's own stop, so the alert is the answer.
+
+**The engine must drain the arm.** The arm stops taking the gateway's
+events while its out-queues (order events, fills, renames, retirements)
+lack room — the engine's per-loop drain is what keeps it moving (gate 99
+found it).
+
+**Gates.** 75d (the member's pulls and the busy requote, 0 B); 96b (a TTL
+window: exactly the rustls record buffers); 99 (slot 6 through the router
+as the engine composes it — the leverage set at boot, place, modify landed
+or refused (the resting sum checked after each: the rename, or the hold's
+drop), fills booked, `CapPerp` and `MaxResting` refusing, the health read,
+the operator's report over trackers holding samples, cancel and
+retirement, a stale mark twice: XH2-C refusing until a fresh one — 0 B);
+the composition loopback test (slot 6 outermost over an in-process gateway
+end: S7-L1 end to end — unseeded, its health saying so and a place
+refused, until the day's read seeds it — a rename, not an add; a
+replacement ending with its landing in one pump; the queued contract).
+
+**Not done here:** S3's shared nonce (XH4h; A-XH4f-1 until then); the
+hedge-coin overlap rule (XH4h — dead while slot 6 runs alone); the P&L
+anchor file and the session bound (XH5: on a shared account the account
+value is not slot 6's P&L); top-ups (XH5).
+
+**Obligations handed on:**
+- **XH4g (testnet; done in-process by `exec-smoke --hl-perp --lifecycle`,
+  the XH4g amendment — an engine instance with a live slot needs the
+  operator's two switches, so the engine-instance checks below stay on
+  his list):**
+  no other signer of the E3 agent while the battery runs — the exec smoke,
+  the arm smoke, another engine (A-XH4f-1 is enforced in-process only) —
+  and `scheduleCancel` is account-wide (the dead man cancels every order
+  on the shared account); the shares and `recon_ms` against the host's
+  real traffic and the venue's weighting of WebSocket-posted reads; the
+  RTT distribution (`rtt_pull_ms`); the skew; the leverage answers'
+  wording; a refused modify's behaviour; the gone and join windows; the
+  day read's page facts (XH4e's list); every `engine_exec_hlgw_*` number
+  read once against the venue; the `HYPERLIQUID_TESTNET_MASTER_ADDR`
+  import in the battery's wrapper; the bound perps flat and slot 6's alone
+  on the shared account.
+- **XH4h:** one nonce stream per agent address (S3) and then lifting
+  A-XH4f-1; the hedge-coin overlap rule; BIN15/HYPARB onto the gateway (a
+  gateway sweeps every slot in its mask).
+
+**For Anton:** (a) D2 — the router's halt cancel-all is GLOBAL; until you
+rule it (keep it, or a per-slot sweep), a live gateway slot 6 runs alone;
+(b) A-XH4f-1 as above; (c) a gateway-live engine's members see
+Hyperliquid marks on the event lane — confirm, or rule an exec-only mark
+bit; (d) `cap_day` is enforced, not report-only (the XH3 bar sizes it).
+
+**Reviews:** r1 — zero-copy APPROVE WITH NITS, allocation APPROVE WITH
+NITS, risk REJECT (MAJOR: renames drained after retirements left a
+phantom row when a replacement ended in the poll of its landing) → the
+drain order and its cap rule (pinned in the router, the composition test);
+the leverage after a flat seeding sheet; the TTL's retries and its cancel
+dropping a row only on success; the tell from boot; a gateway slot alone
+and with no session bound; S7-L1 pinned end to end; retirements behind
+queued fills; `is_testnet`; the TTL table's clamped loops and one-pass
+scan; gate 99 with the leverage, sampled trackers and the rename/hold
+checks; gate 96b's TTL at 50 ms; the published words by name; one report
+a second; the registry's real sizes pinned; the docs. r2 — all three
+APPROVE WITH NITS → a not-found drops no TTL row and a late landing fires
+the TTL cancel again (pinned in the loopback test); a doubt never uses up
+a TTL try; the residual stated; a tell that cannot be written aborts the
+boot; the fill after a `canceled` row stated; the report filled only
+when read; gate 99 counts its landed renames; the notes (the tell read's
+copy, `info_once`'s, `pw`'s count pinned, the slot-6 example's two
+refusals, `xmm_live`'s doc). r3 — zero-copy APPROVE, allocation and risk
+APPROVE WITH NITS → the TTL row keeps FIRED/OUT/SEEN bits in its spare
+byte: an `open` row while the TTL cancel is out waits for its answer (no
+second cancel; pinned in the loopback test with a late answer), the end
+reads `EXPIRED` whatever went again since; a refusal that never left the
+host or met the rate limit uses up no try; a place left in doubt whose
+TTL cancel found nothing, landing late, is cancelled again (pinned); the
+dead man's reach and the partial-fill window restated. r4 — allocation and
+risk APPROVE WITH NITS (zero-copy's r3 APPROVE stands: r4 and r5 move no
+bytes) → a landing seen during the last refused try sends the TTL cancel
+once more; only a plain `canceled` end reads `EXPIRED`; the counting rule
+stated as coded (every venue refusal but the rate limit) and pinned over
+the 256 reason bytes; the Known note's order of the arm's acknowledgement.
+r5 (risk confirmation) — APPROVE WITH NITS, every r4 item closed, no
+further round asked → an end row while the TTL cancel is out pinned in the
+loopback test (a plain `canceled` reads `EXPIRED`, the dead man's
+`scheduledCancel` keeps its reason); the TTL table's docs say "plain
+`canceled`".
+
+### XH4g amendment (2026-10-03): the testnet battery — slot 6's gateway arm against Hyperliquid TESTNET
+
+`exec-smoke --hl-perp --lifecycle` (`cli::xmm_battery`) composes slot 6's
+arm and its gateway in-process with the engine's own composition pieces —
+`xmm_live::{bind_perps, arm_cfg, spawn_gateway}`, factored out of
+`boot_xmm_arm`: one composition, two owners — and drives the arm through
+its `OrderDispatch` surface as the engine loop does (the fills, the order
+events, the renames, the retirements, the idle), signing as the E3 agent.
+Where it differs from the engine's boot: `expiresAfter` 10 s, the minimum
+budget floor (320), no pinning, no router, no mark lane. **No engine, no
+arming switch (D1):** a live slot in an engine instance needs the
+operator's two switches, so the XH4f amendment's engine-instance checks
+(every `engine_exec_hlgw_*` number read against the venue; the member
+quoting on testnet) stay on his list, or XH5's probe.
+
+**No router — what stands in for it.** The battery is an order-submission
+path around the router's risk gate, on TESTNET only (exec-smoke phases C
+and D are the precedent): `CapPerp`, `MaxResting`, `ReconDrift`,
+`AloRejectRate`, `BudgetFloor` and the gateway halt are not on it. Instead:
+the stated notional bounds every order; every quote but the TTL phase's
+and the stall's carries the gateway's 30 s TTL; growth — every place,
+modify and top-up, behind one gate — stops at the first drift, unknown
+order of slot 6 or gateway halt word (exit 36), read before every order
+and once more after the end's reconciliation, and a drift high water at
+the end fails the run too (a reduce-only close still goes out under a
+drift or an unknown order — it only shrinks; the gateway's halt word
+refuses every place, a close included: the run then exits 38); the
+account must hold no order of slot 6 at the start (another slot-6 signer,
+or a run that did not end — `--sweep-first` lets the arm's boot cancel a
+run's leftovers on the run's perps; one on another coin holds the boot,
+and the flat read then finds it: exit 38); a tap row not of slot 6
+(another signer, or another slot's order filling) or a tap that missed
+rows (it never connected, or its stream broke) fails the run (exit 30);
+the end cancels everything resting first, then closes every position the
+fills booked, and reads the account flat with nothing of slot 6 resting,
+or exits 38 — the loudest (the next boot would be held). A SIGINT/SIGTERM
+stops growth at once (only cancels after it) and fails the run (exit 32
+unless something failed first); its end is short — the cancel-all and the
+flat read: the worst case from the signal (a read in flight, a 2 s wait,
+the arm's 10 s shutdown) is asserted at compile time inside the gateway
+thread's 18 s grace, and with a 2 s join and the flat read's two reads
+inside the 30 s drain alarm; no closes, no reconciliation: a position open at the signal
+is left, exit 38. The wrapper waits for the binary through a Ctrl-C and
+warns of possible leftovers on any other abnormal exit.
+
+**What keeps it a test.** TESTNET only (the binary refuses any other
+configuration; `run` any network but testnet's and any host but testnet's
+or the loopback's), after the A/B signature probe. Every quote is
+post-only: it cannot TAKE (a cross is refused), but a resting quote can be
+filled passively — quotes are at most 2 × `--usd` and live at most 30 s
+while the process runs (the gateway's TTL; the stall's quote has none —
+the dead man or the end's cancel-all takes it), and a passive fill is
+closed at the end like the IoCs' (one racing the end's cancel-all is
+closed too; one inside the shutdown is caught by the flat read: 38). Prices come from
+the venue's `allMids` at stated distances (D5), a fresh mid before every
+IoC; an IoC is bounded by `--usd` (≤ $80 stated, ≤ $100 at its own limit
+price — a buy fills at or under its limit; a sell can fill above it, so
+its size, not its notional, is what is bounded) and closed reduce-only by
+exactly what the fills booked (a partial fill under $10 is topped up
+first through the same class — the arm refuses < $10 locally, LAW XH-4 —
+never on the last try). A perp the account holds, or one with no mid on
+the venue, is dropped at the account check. Exit codes 30–39, pinned. The
+run leaves each bound perp's leverage at 3× cross on the shared account.
+
+**The bar — MET** on the committed code: the record run b5 (2026-10-03
+09:43–09:48Z, the round-3 code; only the stop path's join wait and texts
+changed after it), `bar_met` true, drift high water 0, gateway halt reason
+0, no tap gap, exit 0. Before it, b4 (08:47Z, round-2 code) met it too,
+and b2 (07:50Z) and b3 (07:57Z) before review round 2 with the cycle's
+cancel leg pre-empted — the crossing modify had already dropped the
+original — so their cancels were the TTLs' and the sweeps'. b5: 20/20
+lifecycle cycles (an ALO place, a price modify, a size-only modify — each
+renamed, its original `CANCELED(REPLACED)` — and a cancel through the verb,
+`CANCELED(CANCEL_REQUESTED)` and `RETIRED_CANCELED_MEMBER`); on a fresh
+quote each cycle, a modify that would cross, refused `BAD_ALO_PX` (20/20);
+20 crossing places `BAD_ALO_PX`; 20 gateway TTLs `EXPIRED` with
+`RETIRED_CANCELED_TTL`; 4 sweeps read clear; 3 IoC round trips (6 fills,
+venue fees $0.043; b4: 8 fills); 6 clean reconciliations (a sheet AND an orders read
+answered at least a post timeout after each leg's acknowledgement — so
+issued after it — agreeing with the book, drift 0); nothing left; and the
+loopback end-to-end tests.
+
+**Measured (the XH4d/XH4e/XH4f obligations):**
+- **A refused modify DROPS the original** (80/80 over b2–b5): the venue
+  cancels the order a crossing `batchModify` named, with a plain
+  `canceled` row — the arm reports it `CANCELED(CANCEL_REQUESTED)` (the
+  vocabulary's "when the venue already ended it, its `CANCELED` follows").
+- The status words the venue sent: `open`, `canceled`, `filled` and
+  `badAloPxRejected` (one for every refused crossing place AND modify) —
+  all in `orderupd::status_of`'s table.
+- A landed modify's original gets an `orderUpdates` `canceled` row
+  (160/160) and the replacement a new oid.
+- No read lagged an acknowledged order (0/80; REST `/info` reads answered
+  111–520 ms after the acknowledgement (b2–b5) — not the arm's WebSocket-posted
+  reads). The first sheet answered at least a post timeout (5 s) after a
+  fill agreed every time (24/24) — it says nothing of a sheet issued in the
+  first 5 s.
+- Stream rows against the arm's events (timed at the battery's drain,
+  which pauses during its own blocking `/info` reads): `open` and
+  `canceled` p50 ≤ 1 ms, p90 ≤ 64 ms, max 665 ms (a row can also come
+  first: −204 ms); fills within 4 ms (b2–b5) — the join (1 s) and gone
+  (3 s) windows hold.
+- Receipt wall time minus the venue's stamp (the clock offset plus the
+  one-way delay): min 165–230, p50 201–262, p90 ≤ 373, max 1 129 ms —
+  under the 2 s `SKEW_MS`.
+- **The RTT word** (what the member pulls on, XH4f D8), tracked every turn
+  in b4: max 1 438 ms, 34 s after the arm was ready, with one
+  REST-fallback post counted by then (the count is sampled once a second;
+  that it was the boot's post, outside the 30 s window by then — so the
+  max a WebSocket post's — is inferred), never at or above 1 500 ms; b5:
+  max 1 150 ms, never at or above 1 500 ms. b2's slowest post took
+  1 445 ms (under the pull); **b3's took 1 809 ms**: there the word stood
+  above `rtt_pull_ms` 1 500 (xmm.toml) for up to 30 s — **a member would
+  have pulled**. Post RTT p50 524–545 ms (b2–b5), p99 0.91–1.2 s; cancel
+  RTT p99 1.16–1.5 s; push to write p99 ≈ 160 µs; fill lag p99 ≤ 356 ms.
+- The gateway's IP window peaked at 318 (b4) and **320 (b5) — the
+  throttle** — of its 400 share under the battery's load (a cycle every
+  ≈ 7.4 s, sweeps, the 10 s reads): in b5 the congestion word read
+  `THROTTLED` at its peak; no place was refused (the battery waits the word
+  out before each cycle and IoC). The battery's own REST reads and the tap
+  are not in that window. WebSocket messages ≤ 86 of 1 000.
+- `userFillsByTime`: rows oldest first; ≈ 362 B a row (a 2 000-row page ≈
+  0.72 MB, under `MAX_WS_BUF`).
+- Leverage 3× cross acknowledged (`{"type":"default"}`) on BTC, ETH and
+  SOL; none dark.
+- `scheduleCancel` refused every arm (4–6 a run; the dead man parked).
+  Its wording is not captured — "not eligible" is the dead man's design
+  reading of repeated refusals, not a measured text. `dm_triggers` 1 is the
+  refused boot clear modelled as a held schedule (`deadman.rs`), not a
+  firing: no `scheduledCancel` row appeared. The stall could not run.
+- No other signer: no tap row that was not slot 6's (b2–b5; no tap gap
+  — none of the runs logged a tap line), and no other order on the
+  account before each run.
+- Margin: b1 (07:45Z) stopped at the then-rule "perp value ≥ $50" — the E3
+  account reads perp value $0, spot USDC $883; m1 (07:47Z, exec-smoke
+  phase C on the BTC perp) rested an ALO with that; the IoCs then filled:
+  the venue margins the perps from spot USDC there. The rule became perp
+  value + free spot USDC ≥ $50.
+- Listing: XRP is not a testnet perp (no mid; dropped); BTC = 3, ETH = 4,
+  SOL = 0.
+
+**Not measured (on Anton's list):**
+- **Maker fills:** every fill was an IoC's (no second address, D2). A
+  resting ALO filled by the venue — a fill with no post answer, `crossed`
+  false, a partial maker fill, the `FILLED` join on a resting order — is
+  slot 6's main mainnet path and was never exercised on a venue.
+- `userFillsByTime` (XH4e's list): the page size, which end of a range
+  over 2 000 rows is cut (the day read assumes the oldest), `endTime`'s
+  semantics, the 10 000-fill retention, a real full page's bytes and its
+  rustls cost — the E3 account's whole history was 59 rows at b5.
+- The stale-`expiresAfter` wording; the reduce-only $10 exemption (the arm
+  refuses < $10 locally by design); `scheduleCancel`'s refusal wordings,
+  its trigger cap and its firing (the account is not eligible); the
+  venue's weighting of WebSocket-posted reads; the TTL's not-found and
+  late-landing paths on the venue (racy to provoke); every
+  `engine_exec_hlgw_*` number against the venue (an engine instance).
+- The battery's top-up path ran only against the loopback venue (a
+  partial fill under $10, then the close).
+
+**Obligations handed on — XH5:**
+- **Spot margin and the P&L anchor:** on the E3 account the venue margins
+  the perps from spot USDC and `marginSummary.accountValue` reads $0 — the
+  arm's P&L (`accountValue` − the anchor) may not move with a loss, so a
+  session bound there might never fire. XH5 confirms its master's margin
+  mode, or judges P&L on perp value + spot USDC.
+- **The RTT word and the boot's REST post:** the member pulls on the worst post RTT of the last 30 s. A boot's first
+  post (the dead man's clear) can go before the WebSocket is up — by REST,
+  over a fresh dial (one each run) — and any slow post (b3's 1 809 ms)
+  holds a member at `rtt_pull_ms` 1 500 off for up to 30 s. XH5 sizes
+  `rtt_pull_ms` on mainnet's measured RTT and decides whether REST-fallback
+  samples belong in the pull window.
+- **The IP share at a member's cadence:** the gateway's IP window
+  reached its throttle (320 of the 400 share, b5) under the battery's
+  load — a cycle every ≈ 7.4 s and the arm's 10 s reads. XH5 sizes the member's
+  quoting cadence and `recon_ms` against the share (or the share against
+  the address budget) before its probe.
+- **A refused requote costs the side:** the venue drops the original, so
+  the side is dark until the venue's `canceled` row arrives (measured
+  ≤ 665 ms); if the answer comes first, the member's blind cancel draws a
+  not-found (an orders read and up to the 3 s gone wait); ≈ 3 address
+  requests (modify, cancel, re-place) against 1 for a landed modify; the
+  original retires `RETIRED_CANCELED_MEMBER` though the venue ended it.
+
+**Code:** the arm gains `recon_view()` (a cold getter over state it
+keeps — no new state); `testvenue` serves `POST /info` (`REST_INFO`); the
+battery is a cold operator module (`//! COPY-DOCTRINE:`), never reached by
+the engine loop; the loopback test covers the whole run against a scripted
+exchange over TLS, a partial fill topped up, and a refused close ending in
+exit 38.
+
+**Reviews:** r1 — allocation APPROVE WITH NITS, zero-copy APPROVE WITH
+NITS, risk REJECT (NEEDS-DOCS: the RTT statement, the cancel leg pre-empted
+in every cycle, the not-measured list) → the RTT word tracked every turn;
+the cancel through the verb, the crossing modify on a fresh quote (b4);
+the lists above and the XH5 hand-on; growth stopped at a drift, an
+unknown slot-6 order or the gateway halt; slot 6's orders at the start
+refuse the run; a foreign tap row or a failed tap fail it; SIGINT/SIGTERM
+end it through the end; a fresh mid before every IoC; no top-up on the
+last try; passive fills closed at the end; the binding written into the
+configuration in place (no 1.5 KiB return, no table copy) and the
+gateway's COPY note at its copy site; the loopback venue drops a refused
+modify's original, with a partial-fill and a refused-close test. r2 —
+allocation APPROVE, zero-copy APPROVE WITH NITS (the blank perp row a
+const), risk REJECT on two narrow findings: a signal did not stop growth
+(a round trip's open, a close's top-up and a sweep's quotes still went
+out) and the halt read missed the last turn and the end → r3: every
+place, modify and top-up behind one gate (no stop, no halt); the halt read
+after the loops, in the stall and at the end; the end cancels first, then
+closes; under a signal no close, no reconciliation, no pages; the wrapper
+waits through a Ctrl-C; `--sweep-first`; a tap gap fails the run;
+`drift_hw_1e6` and the gateway's halt reason in the report; `arm_cfg` a
+`const fn`; `bind_perps`' refusals pinned by a test. r3 — risk APPROVE
+WITH NITS, all fixed and confirmed (one more stop check in a close; a
+stopped run fails; the worst case after a signal asserted inside the
+grace and the alarm, the gateway's join short under a stop; the end's
+halt read after its reconciliation and a drift high water at the end
+fails the run; `--sweep-first`'s scope; five texts), zero-copy APPROVE,
+allocation APPROVE. The record run b5 ran on that code, before its last
+change (the gateway's join shortened under a stop, and texts).
+
+### XH4h-1 amendment (2026-10-03): one nonce stream per agent address (S3) — A-XH4f-1 lifted
+
+The venue keeps its nonce window per SIGNER: a nonce must be unique, inside
+(T − 2 days, T + 1 day), and above the smallest of the 100 highest it holds
+for that signer. One process may hold several signers of one agent address —
+the E3 testnet agent signs for slots 0, 3 and 6, and an operator may point
+two arms at one agent. Two counters on one agent draw the same millisecond,
+and the venue refuses the loser (possibly a cancel). Since XH4h every
+Hyperliquid signer of the engine draws from its agent's ONE stream:
+
+- `exec_hyperliquid::nonce::SharedNonce` — `max(now_ms, last + 1)` by one
+  compare-and-swap on its own 128 B granule (`Relaxed`: the
+  read-modify-writes of one atomic are totally ordered, and the stream
+  publishes no other memory). No lock, no allocation (alloc gate
+  `hl_shared_nonce_draws_are_zero_alloc`; gates 60 and 96 now run the arm
+  and the gateway on a shared stream, as the engine boots them).
+- `NonceSource` — a signer's own `Nonce` (a process's lone signer) or its
+  agent's stream: one predictable branch per signed action (an enum, not
+  the plan's generic: no type parameter through the arms and the loop
+  shapes for a nanosecond beside a signature's tens of microseconds).
+  `share` is boot-only — before the signer's first signed action, asserted
+  in debug builds; in release it still raises the stream past anything the
+  signer drew, so it never steps back.
+- `NonceStreams` — the boot's registry, one stream per agent address
+  (`HlConfig.agent_addr`, derived from the same key the signer signs with;
+  at most four). The engine's boot hands it to every Hyperliquid signer
+  right after the signer is built: HYPARB's X arm, the operator's arm
+  (before its boot sweep), slot 6's gateway (before its thread starts). The
+  boot tells the count (`agents`, `signers`).
+- **Within ONE process only.** Two processes signing as one agent (E3 on
+  testnet, X on mainnet) still collide: the XH4g battery, exec-smoke, the
+  arm smoke and an engine never run at once on one agent — the XH4f
+  obligation stands.
+- The venue's window of 100 is shared by every signer of the agent: a post
+  overtaken by 100 later draws is refused for its nonce — never a fill,
+  never a duplicate (the gateway's in-flight bound is 100 too; it matters
+  only once D2 lets two signers of one agent run live together).
+- Superseded: "one nonce stream per arm" (the XH4b text above) — the
+  stream is per agent address.
+
+**A-XH4f-1 is lifted** (plan default H2, taken in the session; it was item
+(b) on XH4f's list for Anton). `check_gateway_alone` still refuses a live
+gateway slot 6 beside another live slot — now for D2 alone (the router's
+halt cancel-all is global; the operator's to rule) — and a session bound on
+it (XH5). No live shape changes: today every engine shape that boots has one
+signer per agent.
+
+**Tests:** the stream's counter law (a backwards clock, a raise); four
+threads × 50 000 draws, unique and increasing per thread; two signers joined
+to one stream interleave uniquely; a signer that drew cannot join late
+(debug); one stream per agent address, and the registry's capacity; the
+gateway-alone refusal citing D2 alone; the alloc gate. **Deviations from the
+plan:** no testvenue duplicate-nonce test (the testvenue checks no nonces;
+the threads test and the debug assertion pin the law) and no offline
+contention micro-bench (the signers' posts are milliseconds apart).
+
+**Reviews:** round 1 — risk APPROVE WITH NITS, zero-copy and allocation
+APPROVE WITH NITS; round 2 — risk, zero-copy and allocation APPROVE. The
+nits, all taken: the cross-process sentence corrected, the 128 B granule
+and its size assert, gates 60 and 96 on a shared stream, `NonceSource` not
+`Clone`, the share-before-sign assertion, the stale texts. Answered, not
+changed: deriving the registry key from the signer's own key (the address
+already comes from that key in `HlConfig`; deriving again would put the
+secret on the stack).
+
+### XH4h-2 amendment (2026-10-03): the hedge-coin overlap rule
+
+Slot 6's gateway-bound perps become `LAW_LINEAR` ledger rows (XH4f), and the
+router judges every LIVE slot's order on a bound id by that row — one engine
+id, one row. On one master another slot's trades in a bound perp would also
+read as slot 6's drift (and halt it), and slot 6's leverage set would move
+the other slot's position. XH4e's obligations asked for slot 6's rows to be
+disjoint from slot 0's hedge perps; since XH4h the engine's boot enforces
+it, before any arm boots:
+
+- when slot 6 is live on the gateway, no perp it binds may be another LIVE
+  member's Hyperliquid perp — HYPARB's hedge perps (slot 0), VRP's hedge
+  (slot 1, a free descriptor) and HCV's hedge perps (slot 7) — **whatever
+  the master**: the row judges every live slot's orders on its id, so a
+  second master does not make the overlap safe;
+- a PAPER member is no claim: the risk clamp runs on the live arm only
+  (`RoutedDispatcher::submit`), the ledger books venue fills only, and a
+  paper order never reaches the venue — so the rule is dead while D2 keeps
+  a live gateway slot 6 alone, as planned;
+- the refusal names the coin, the engine id, the member and its slot, and
+  the two ways out (perps no other live member trades, or that member
+  paper); `cli::xmm_live::check_perp_overlap`, pinned by a test.
+
+**Not covered by a boot check** (for the D2 ruling): ai-exec (slot 4) and
+vm (slot 5) choose their symbols at runtime. Once D2 lets them run live
+beside slot 6, the complete rule is a router refusal of any live order from
+another slot on a gateway-bound row. BIN15 trades outcome legs; XSD trades
+no Hyperliquid perp by how its table is written (Binance USDⓈ-M names) —
+nothing enforces it, which the router refusal would. The ledger's own refusal of a
+duplicate row stays. **Deviations from the plan:** a perp shared across
+masters is refused, not allowed (one row per id judges every live slot);
+no cross-slot test of the ledger's duplicate-row refusal (the boot rule
+fires first).
+
+**Reviews:** risk round 1 REJECT (the rule bit on paper members, on a false
+premise — fixed: live members only; VRP added; the runtime-symbol gap and
+the deviations recorded); risk round 2 APPROVE.
+
+### XH4h-3 amendment (2026-10-03): slot 0's hedge arm per transport — the gateway on testnet, in the rehearsal
+
+The plan's cut 3 (transport plumbing, one gateway per arm in the engine) is
+re-scoped: the engine's slot 0 is mainnet-only (`MainnetAuthority`), the
+gateway is testnet-only until XH5, and D2 keeps a live gateway slot alone —
+so a second gateway arm in an engine could not boot, and its composition
+would be dead code. What lands instead:
+
+- **`HedgeArm`** (`cli::hyparb_live`): slot 0's Hyperliquid hedge arm as a
+  type parameter of `HyparbLive` — static dispatch, nothing per order. Two
+  implementations: `BlockingHedge` (X's `HlExchange` and its fill ring —
+  the engine's, unchanged: the same verbs, the same 5 s local retirement of
+  a hedge IoC, no order events, no renames, no shutdown reaching it, as
+  before) and `HlGatewayArm` (its own retirements by the queued contract,
+  its order events and renames drained so its out-queues never stall its
+  pump, its shutdown).
+- `HyparbLive`'s `reconciled` now also needs the hedge arm to take orders
+  (the gateway arm's boot; the blocking arm at once), and its halt signal
+  carries the gateway's halt word; `verbs_confirm_later` follows the arm.
+- **`boot_hyparb_live_gateway`** — the same boot (keys, EVM arm, pools, the
+  coins resolved against `meta`, the anchor, the worker) with an
+  `HlGatewayArm` on slot 0 and its own unpinned `hl-gw-hyparb` thread, its
+  nonce from the agent's stream (S3). TESTNET only; native perps only (a
+  builder-dex perp on the gateway is refused — not built); the shared E3
+  account is not X's (`own_account` false), and X's leverage is left as it
+  is (`leverage` 0).
+- **The rehearsal** `evm-live arm-smoke --gateway` (testnet) runs the same
+  five steps over the gateway arm, drains the arm's queues as the engine
+  does, and — on every path after the boot, an early stop included — ends
+  with the arm's shutdown and the gateway thread's release (a boot that
+  fails after the gateway thread started leaves it to the process's exit).
+  Like every E3 signer it never runs beside another process on that agent:
+  its dead man's `scheduleCancel` is account-wide.
+- **An IoC miss is no reject streak on the gateway arm** (E7-F2, as the
+  blocking arm's `response.rs`): "could not immediately match" ends the
+  order `REJECTED` with `REASON_IOC_MISS`, retired, and moves neither
+  `rejects` nor `reject_streak` — HYPARB's touch-priced hedges miss
+  routinely, and five in a row would latch the sticky halt. Slot 6's IoCs
+  gain the same (pinned: `an_ioc_miss_is_no_reject_streak`).
+- The engine: `transport = "gateway"` stays slot 6's alone; the refusal on
+  any other slot names the rehearsal (slot 0) and XH4i (slot 3).
+
+**H5 (adopt the venue's positions at boot) is not built**: until Anton
+confirms it, the gateway arm holds its boot over a position in a bound perp
+(fail closed).
+
+**The testnet record (XH4h-4, 2026-10-03, the committed code).**
+`evm-live arm-smoke --network testnet --coin ETH --gateway` (11:35:55Z):
+**PASS** — seeded once X's account was read AND the gateway arm was ready
+(equity $1 882.39, drift $0, recon age 1.96 s); the unfundable swap
+refused locally; an executor swap on chain 998 filled from its receipt; the
+ETH hedge round trip through the gateway — an IoC buy of 0.0042 at 2 680.7
+and an IoC sell of 0.0042 at 2 680.6 — filled from `userFills`; both IoCs
+retired by the gateway arm; settled flat, drift $0, reject streak 0; the
+gateway stopped at the end. The blocking transport, the same smoke
+(11:36:44Z, the regression): **PASS** (its session filter dropped 8 earlier
+sessions' snapshot fills, as designed).
+
+**Reviews:** risk round 1 APPROVE WITH NITS (the IoC miss counted as a
+reject on the gateway arm; the rehearsal's early stops skipping the
+gateway's end; three texts — all fixed above), round 2 APPROVE; zero-copy
+APPROVE WITH NITS (two boot-time `COPY:` notes, added), allocation
+APPROVE.
+
+### XH5a amendment (2026-10-03): D2 ruled — a halt cancels the halted slot's orders alone (R-XH4-1)
+
+Anton's ruling R-XH4-1 (2026-10-03): the router's halt cancel becomes a
+per-slot sweep — a halt cancels only the halted slot's orders. Built as
+XH5a, the first code cut of XH5's prep (R-XH4-11). What changed:
+
+- **The dispatch surface.** `OrderDispatch` gains `cancel_slot(slot)` (the
+  request) and `cancel_slot_state(slot)` (the confirmation, three-valued as
+  `cancel_all_state`). Their defaults are the venue-wide verbs: an arm that
+  cannot tell its slots apart OVER-cancels (the pre-XH5a behaviour) and
+  never leaves a halted slot's order resting. Every arm a live engine
+  composes answers per slot:
+  - `SlotSplit` routes the slot to the arm that serves it; `VenueSplit` asks
+    both arms (a slot may trade both venues), the least settled answer wins;
+  - `HlExchange`, the operator's blocking arm (BIN15's account, several
+    slots): a pending sweep carries a slot mask in a padding byte;
+    `recon::ours_on_leg` selects only cloids whose slot byte (LAW E-9) is in
+    the mask; a halt queues `1 << slot` on every live leg, OR'd into an entry
+    already pending; the roll path (LAW E-8) carries every slot. The
+    confirmation is per slot: `Working` while an entry carrying the slot is
+    pending, `Stranded` when one carrying it was given up on or could not be
+    queued since the slot's request (a per-slot counter and mark), `Clear`
+    otherwise. `cancel_all_runs`, `cancel_all_unqueued` and `sweep_left`
+    count the per-slot requests as they count the venue-wide ones;
+  - `HlGatewayArm` (one slot per arm; its sweep takes only its slots'
+    cloids, XG-1), the Binance arm (one owner slot, BX-7) and `HyparbLive`
+    (slot 0's own wallet): their slot → the whole cancel; any other slot →
+    nothing to cancel, `Clear`.
+- **The router.** Each halted slot's cancel cycle runs on its own — at most
+  one request per slot per poll, a failed request retried for that slot, a
+  `Stranded` re-asked for that slot — and a slot's `Clear` releases that
+  slot's resting rows, count and notional alone (`Ledger::clear_resting_slot`).
+  The latch, `exec.HALT`, `--halt-slot` and the live-only filter are
+  unchanged. `HlExchange`'s boot and shutdown sweeps
+  (`cancel_ours_everywhere`) and the gateway's shutdown are unchanged; the
+  venue-wide `cancel_all` is now what the single-slot arms answer for their
+  own slot.
+- **The behaviour that changes.** Two live slots on one arm with different
+  thresholds (say a WS gap of 5 s on one and 30 s on the other): the first
+  halts and pulls its own quotes; the other's stay until its own threshold
+  trips. Before XH5a the venue-wide cancel pulled both. That is the ruling's
+  intent; an operator who wants both pulled together sets the same
+  thresholds, or halts both. **A condition of the whole arm still reaches
+  every slot on it:** the budget floor, a venue lock, the gateway's halt word
+  and margin risk come from the arm's signal, which every slot it trades
+  reads — each latches and cancels its own. BIN15's halt path changes with
+  this (R-XH4-1 says so): a BIN15 halt cancels BIN15's orders, not another
+  operator-arm slot's; its flip checks are re-read in XH5e.
+- **The foreign-row refusal** (the runtime gap XH4h-2 recorded: ai-exec and
+  vm choose their symbols at runtime). An instrument row slot 6's boot binds
+  carries an owner byte; the router refuses a live order of any other slot
+  on an owned row — `RiskRefusal::ForeignRow`, counted
+  (`refused_foreign_row`, published as
+  `engine_exec_hlgw_refused_foreign_row_total`) — before any ledger
+  arithmetic. The XH4h-2 boot rule stays. `RouteCounters` grew to five lines
+  for it, on purpose.
+- **The boot.** `check_gateway_alone` is now `check_gateway_slot`: D2's
+  refusal is gone, so a live gateway slot 6 runs beside the live slots of the
+  operator's blocking arm — on TESTNET with them (LAW E-4 puts both arms on
+  the market data's network): XH5e's engine-instance check. Slot 6 beside
+  slot 0 or a live Binance slot stays refused until XH5b: their arms trade
+  mainnet only (`MainnetAuthority`, BX-16), and one engine never mixes a
+  testnet rehearsal with mainnet orders. The session-bound refusal stays
+  until XH5b. The engine composes `SlotSplit(6, operator arm, gateway arm)`;
+  every other shape with slot 6 stays an abort.
+- **Under-cancel is what this cut must rule out:** a halted slot's order
+  left resting. The mask is the halted slot's bit; every pass re-reads the
+  venue's open orders; a pass that finds none of the carried slots' orders
+  on a leg drops the entry, as does one whose cancels the venue all
+  confirmed (`SweepOutcome::Done`, unchanged); an entry given up on, or a
+  leg the table could not hold, strands the slot and the router asks again.
+  A per-slot clear never touches another slot's rows. A request queues
+  every live leg at once, and a leg the table cannot hold is re-asked from
+  the start of the walk, so `cli` pins at compile time that the table holds
+  every leg the feed can bind (`2 × HL_MAX_FAMILIES ≤ MAX_PENDING_SWEEPS`).
+- **The single-slot arms' premise.** `HlGatewayArm` answers `Clear` for any
+  slot but its own because one gateway serves one slot today; XH4i, which
+  lets a gateway serve several, must carry the slot into its sweep request
+  and replace that answer. `HyparbLive` now refuses another slot's order
+  (`Unroutable`), the premise of its own `Clear`. `VenueSplit` asks both arms
+  for a slot whatever its route — a Binance-only slot's halt also queues
+  `HlExchange` sweeps, which find nothing of its: the safe direction, at
+  the old verb's cost.
+
+**The shared testnet account (the shape XH5a makes bootable).** Slot 6's
+gateway signs as the E3 testnet agent, on the account slots 0 and 3 test
+on. With slot 3 (or 4, 5) live on the operator's arm on that account,
+nothing under-cancels, but:
+(a) slot 6's dead man goes off once another slot's order is seen on the
+account (`deadman_wanted` arms the account-wide `scheduleCancel` only on
+an account of its own or while slot 6's orders are the account's only
+ones), so for that while its quotes outlive a process death — until a boot
+that runs slot 6's gateway sweeps them (the operator arm's boot sweep takes
+`#` coins only);
+(b) two budget governors count one address: the operator arm's (seeded at
+boot, re-read in top-ups) never sees the gateway's spend, so its
+`BudgetFloor` halt can fire late;
+(c) the venue's window of 100 nonces is shared by two live signers — the
+case XH4h-1 left for this ruling;
+(d) slot 6's perp fills land in the operator arm's `fills_unresolved`;
+(e) a session bound on slot 3 would be judged on the shared account.
+XH5e's engine-instance check therefore runs the operator's arm on a testnet
+master AND agent of its own (`HYPERLIQUID_*` ≠ the E3 agent's: the nonce
+window of (c) is per signer), or records (a)–(e) as accepted for that run.
+XH5b's own account ends all five for slot 6.
+
+**Residual, for Anton: the arm-wide reject streak.** A cancel the venue
+answers "never placed, already cancelled or filled" counts into the arm's
+reject streak, which every slot on the arm reads: a halted slot's member
+cancelling orders its sweep already took could trip a sibling at
+`halt_on_reject_streak`. Fail-safe (the sibling halts and cancels its own),
+and left as it is: making that answer neutral, as E7-F2 did for an IoC miss,
+would change BIN15's mainnet streak.
+
+**XH5e obligations from this cut:** BIN15's flip checks re-read under the
+per-slot halt (R-XH4-1) — `scripts/bin15-flip.sh` counts every order on a
+`#` coin as slot 3's, which a sibling slot's HIP-4 orders on the operator's
+account would break; the shared-account choice above.
+
+**Superseded:** O-BX8's fan-out (a halt's cancel "fans out to every live
+arm", BX3 and `docs/binance-exec-plan.md`) — it now carries only the halted
+slot's orders, on every arm that slot trades; E6 commit 3's "venue-wide
+cancel on the edge" and "two slots in one poll share one request, because
+cancel-all is venue-wide"; XH1's note that a slot-6 halt's venue-wide cancel
+would pull bin15's quotes; XH4f's D2 refusal (`check_gateway_alone`);
+XH4h-1's "only once D2 lets two signers of one agent run live together" (the
+shape above); XH4h-2's "dead while D2 keeps a live gateway slot 6 alone" and
+its runtime gap (closed by the foreign-row refusal).
+
+**Deviations from the plan:** only the shape that can boot is composed —
+slot 6 beside the operator's arm; the shapes with slot 0 or a Binance slot
+wait for XH5b, since they cannot boot while the gateway is testnet-only. The
+plan's composition loopback with both real arms is covered by a loopback
+through the real `HlExchange` (slot 3's halt cancels slot 3's oid alone,
+`exec_composition_loopback`), the spy-arm router tests and gate 100; the
+run with both real arms is XH5e's engine-instance check. `RouteCounters`
+grew to 320 B.
+
+**Tests:** the router (a halt asks only the halted slot; two slots in one
+poll run two cycles; a slot's failed request and its stranded sweep re-ask
+that slot alone; a slot's `Clear` releases its rows only; an owned row
+refuses another live slot's order, passes its cancel and the owner's order,
+never judges a paper slot); the ledger (the per-slot clear; an owned row
+refuses every other slot; an owner past the slots refused at the bind);
+`SlotSplit` and `VenueSplit` routing; `HlExchange` (a halted slot's sweep
+carries its slot alone, a second slot ORs in, per-slot
+`Working`/`Stranded`/`Clear`, the roll still every slot's); `ours_on_leg`'s
+slot filter; the real-arm loopback (slot 3's halt: the venue's read lists
+slots 3 and 4, one cancel leaves the host, for slot 3's oid; slot 3's row
+released on the confirmation, slot 4's kept); `bind_perps` owns slot 6's
+rows; the boot (slot 6 beside slot 3 resolves, the operator arm's numbers
+are slot 3's; beside Binance or slot 0 refused; the session bound refused);
+slot 0's halt reaches slot 0's arm alone; alloc gate 100 (0 B: the router's
+per-slot cycle through `Retry`, `Stranded` and the `Clear` that releases a
+real row; `HlExchange`'s per-slot request over more legs than its table,
+`strand` included; the sweep's selection), gate 99 binding slot 6's row as
+the engine does.
+
+**Gates (the committed tree):** clippy 0; nextest 4 119/4 119; alloc 108
+(+3 ignored) at 0 B, gate 100 new, compiled fresh; copy new=0; license OK;
+release OK; replay 7× IDENTICAL; rustfmt clean on every touched hunk.
+
+**Reviews:** round 1 — risk, allocation and zero-copy APPROVE WITH NITS (no
+under-cancel path; the texts above — superseded rulings, deviations, the
+shared account, the residual, the single-slot premise; the router-level
+foreign-row test, the real-arm loopback, gate 100's widening, the size pin,
+the owner's validation, stale texts — all taken); round 2 — zero-copy
+APPROVE, risk and allocation APPROVE WITH NITS (the feed-to-table pin, two
+wordings, a comment, the alloc gate's freshness — taken); round 3 — risk,
+allocation and zero-copy APPROVE. Answered, not changed: the three
+single-slot overrides stay explicit; `VenueSplit` asks both arms;
+`sweep_one_pending`'s 36 B snapshot stays (pinned); the reject-streak
+residual above.
+
+### XH5b-1 amendment (2026-10-03): the account's worth — perp value plus spot USDC
+
+The first half of XH5b (plan §3.2 item 3; the cut is split in two,
+session-5 assumption A-S5-15).
+
+- **What changes.** On an account of slot 6's own (`own_account`), the
+  gateway arm reads the spot sheet right after each perp sheet:
+  `spotClearinghouseState`, a new gateway read (`CMD_READ_SPOT`, IP weight
+  2) answered by one `EV_READ_DONE` that carries the USDC `total` and
+  whether the sheet lists USDC at all, scanned in place into a fixed
+  256-row table (8 KiB, pinned). **The account's worth is the perp sheet's
+  `accountValue` plus that USDC.** Spot USDC margins the perps (XH4g
+  measured `accountValue` at $0 on E3), so USDC moving between the two
+  halves moves neither the worth nor the session P&L.
+- **Fail-closed rules.**
+  - A spot sheet that lists no USDC row is a failed read, never a $0 half
+    (`account_view`'s rule: nothing to anchor) — no anchor, no judgement,
+    the agreement ages. An own account must therefore list USDC on its
+    spot sheet; a zero balance listed is a legitimate $0 half.
+  - The anchor, when none was restored, is the first COMPLETE worth — never
+    half of one — and a positive one: a $0 worth (an unfunded account)
+    anchors nothing, the blocking arm's E7 rule, and the slot's first
+    reconciliation waits for an anchor.
+  - The P&L is judged, and the slot reconciled, only once the spot half has
+    landed. A restored anchor is never judged against the perp half alone,
+    which would read the whole spot balance as a loss; and the router
+    refuses the slot's live places until its first reconciliation, so the
+    slot never quotes before its worth is known. Unjudged, the signal's P&L
+    reads 0.
+  - The agreement (`ReconStale`'s clock) needs the spot half fresh within
+    two read periods, as it needs the sheet and the orders: a spot read that
+    keeps failing halts the slot as a stale reconciliation.
+  - One spot read per perp sheet, ahead of the other reads. A failed one —
+    a failure, an end of another kind, no answer, no USDC row — waits for
+    the next perp sheet: it never storms, whatever the skew, and delays a
+    pending re-read by one answer at most.
+- **The shared account judges nothing new:** no spot read and no bound, as
+  before; and no anchor is taken there any more (it was never judged nor
+  offered for keeping).
+- **Residuals.**
+  - *Two reads, not one.* The halves are read one answer apart, not
+    atomically. USDC that moves between them inside that gap — a class
+    transfer, or, on a spot-margined account, a reducing fill's realised
+    P&L, its fee or a funding payment settling to spot — misreads the worth
+    by its amount for one reconciliation: as a loss (the bound may halt —
+    fail-closed), or as a gain that hides a loss of that size for one
+    reconciliation. The settlements are small against the bound (a $15
+    clip); XH5e's runbooks forbid transfers while slot 6 is live.
+  - *A stale spot half.* While spot reads fail, the P&L stays judged on the
+    last spot half — blind to realised losses that settle to spot since —
+    until `ReconStale` halts the slot: up to two read periods plus
+    `halt_on_recon_stale_ms`. XH5b-2 sizes `halt_on_recon_stale_ms` with
+    this window in mind.
+  - *Other spot tokens* are outside the worth (USDC only): the probe's HYPE
+    for the ALO priority fee (XH5d) is spent outside the bound, which XH5d
+    bounds by its own cap.
+  - Top-ups (`reserveRequestWeight`, XH5c) are paid from the perp balance
+    and read as a real spend; Q-XH5-2's add-back is XH5c's.
+- **For XH5e — the pre-arm check.** The sum assumes no dollar is in both
+  halves: measured flat on E3, whose spot USDC margins the perps, but
+  margin in use could sit in both (`accountValue` counts margin; the spot
+  `total` counts `hold`), and a flat check cannot see it. The runbook
+  therefore opens a small position on the own account, reads both sheets,
+  and requires the worth ≈ the USDC funded − fees + the position's
+  unrealised P&L, logging `marginSummary.totalMarginUsed` against the spot
+  USDC `hold`: a residual of half the margin in use or more aborts the
+  arming. The account is funded in full before its first boot, and no
+  deposit or withdrawal is made while a session's anchor stands: the first
+  positive worth anchors, so funding in steps would anchor at the first step
+  and read the rest as gain (a new session starts by deleting XH5b-2's
+  anchor file).
+- **Not in this cut (XH5b-2):** the XMM scopes and their refusals,
+  `own_account` on them, the anchor file, the mainnet guard behind the
+  interlock, and the session-bound refusal kept only on the shared account.
+  The composition still runs slot 6 on the shared E3 account
+  (`cli::xmm_live::OWN_ACCOUNT` false), so no spot read is issued yet.
+  `read_weight_per_min` takes the spot read as a flag (2 a period), and
+  `xmm_live`'s 40 % pin reads it from `OWN_ACCOUNT`: at `RECON_MS` 10 s the
+  spot read would take the reads to 164 a minute, past 40 % of the share
+  (160), so XH5b-2 cannot turn the own account on without XH5c's 30 s (68).
+  XH5b-2 also owes: an own-account floor for `halt_on_recon_stale_ms` of
+  four read periods, since a failed spot read waits a whole period (the
+  boot's floor of two would halt on two failed spot reads in a row);
+  `spot_reads` and the refused spot reads on `/metrics` (moving the
+  `GatewayArmReport` pin and `HLGW_COUNTERS`); and, once the scope sets
+  `own_account` at boot, a boot-time check of `read_weight_per_min` against
+  the share (the const pin then covers the default only).
+
+**Tests:** the gateway — the spot read's one end on the venue's own
+testnet body ($999 over fourteen rows, USDC listed), a sheet with no USDC
+saying so, one that does not scan failing with its own code; the read
+weights by kind; the steady weight with and without the spot read; the
+read kinds ending at the spot sheet. The arm — the worth sums the halves
+and moves with both; the spot read goes before the orders and the anchor
+waits for it; a restored anchor is not judged on half a worth; a $0 worth
+anchors nothing until the account is funded; a sheet without USDC is a
+failed read (no anchor); a failed spot read — an end of
+another kind, a timeout — waits for the next perp sheet, at skew 0 too;
+the first reconciliation waits for the spot half (the sheet, the orders,
+the budget and the day read: nothing reconciled, no agreement, nothing
+judged); the spot half goes ahead of a pending re-read; an agreement needs
+a fresh spot half; a shared account reads no spot sheet. Alloc gate 98
+(spot reads every sheet — every sixth failing, every seventh listing no
+USDC — the arm's answered spot reads and the refused ones each a path the
+window must run) and gate 96b (the real gateway's spot read beside the
+budget and day reads: its pin moves 4 → 6, three records sealed and three
+opened, rustls' alone — the XH4e entry's "4 for two short reads" is
+superseded).
+
+**Gates (the committed tree):** clippy 0; nextest 4 129/4 129; alloc 108
+(+3 ignored) at 0 B, compiled fresh; copy new=0; license OK; release OK;
+replay 7× IDENTICAL; rustfmt clean on every touched hunk.
+
+**Reviews:** round 1 — zero-copy and allocation APPROVE WITH NITS (stale
+size and weight notes, the request render's COPY note, gate 98's paths
+counted on the arm's side, gate 96b's comment, the 40 % pin's flag — all
+taken), risk REQUEST CHANGES (a sheet without USDC anchored and judged as
+$0, the XH5e check blind to margin counted twice, the latch untested, the
+residuals, a retry with no floor — all taken; other spot tokens documented
+outside the worth); round 2 — zero-copy APPROVE, allocation and risk
+APPROVE WITH NITS (the zero-worth anchor and the check's tolerance —
+taken; `/metrics`, the own-account stale floor and a boot-time weight
+check — XH5b-2's, above); round 3 — allocation and zero-copy APPROVE, risk
+APPROVE WITH NITS (funding in full before the first boot — taken).
+
+### XH5b-2 amendment (2026-10-03): slot 6's own testnet account — its scopes, its refusals, its anchor kept off the engine thread
+
+The second part of XH5b (plan §3.2; session-5 assumption A-S5-21).
+XH5b-3 puts mainnet behind its interlock; nothing here reaches mainnet.
+
+- **The account.** Slot 6 trades on its OWN testnet master and API wallet
+  when `HYPERLIQUID_XMM_TESTNET_{AGENT_KEY,MASTER_ADDR}` are set — both are
+  then required (`exec_hyperliquid::config::Scope::XmmTestnet`; its host
+  and source are the smoke's `HYPERLIQUID_TESTNET_*`, defaulting to
+  testnet); otherwise on the shared E3 account as before (`Scope::Testnet`,
+  `own_account = false`). `Scope::Xmm` (mainnet:
+  `HYPERLIQUID_XMM_{AGENT_KEY,MASTER_ADDR}` on the live arm's
+  `HYPERLIQUID_EXCHANGE_HOST` / `HYPERLIQUID_SOURCE`, every variable
+  required, as `Scope::Live`) is declared; XH5b-3 composes it. No two
+  scopes read the same key or master variable (pinned).
+- **The refusals (O-XH3)**, on its own account:
+  - *Nothing shared.* Neither slot 6's master nor its API wallet may be an
+    address another arm signs or trades as: E3's testnet master and agent
+    (`HYPERLIQUID_TESTNET_*`), slot 3's (`HYPERLIQUID_MASTER_ADDR`,
+    `HYPERLIQUID_AGENT_KEY`), HYPARB's (`HYPERLIQUID_HYPARB_MASTER_ADDR`,
+    and the wallets `HYPEREVM_MAINNET_KEY` / `HYPEREVM_TESTNET_KEY` sign as
+    — X signs as itself). Masters and signers are compared crosswise (an
+    API wallet that is another arm's master refuses too). A set variable
+    that does not parse (a value that is not Unicode included), or holds no
+    valid key, refuses and is named: the check cannot vouch for it
+    (`xmm_live::check_own_account` and `identities_with`, pure, under an
+    env wrapper).
+  - *The venue binds the API wallet to slot 6's master.* An order lands on
+    the account of the master that approved the API wallet, while the
+    arm's reads and its fill stream follow the configured master: a wallet
+    approved by another master would trade that account unseen (its orders
+    read gone, its fills never booked, the worth unmoved, the bound blind).
+    One boot read of `userRole` for the API wallet (its request rendered
+    straight into the boot client's body window,
+    `hyparb_live::info_rendered`) must answer `agent` for slot 6's master —
+    or `user` when the wallet is the master itself, signing as itself; any
+    other answer refuses
+    (`xmm_live::check_agent_binding`, pure; `recon::scan_user_role`).
+  - *Keys.* Another arm's key is read only to derive its address, in the
+    one form the policy lets a signing key have
+    (`core_config::SecretKeyBytes`: mlock'd, its hex and bytes erased), and
+    dropped at once (`config::agent_addr_from_env`); the presence check
+    erases the copy the standard library hands over
+    (`config::env_is_set`). `HlConfig::from_env` now holds its parsed key in
+    a wrapper that erases it on every return.
+- **The rules by account** (`xmm_live::check_account_rules`, at slot 6's
+  boot):
+  - the read period: 30 s on its own account (`OWN_RECON_MS`: the perp
+    sheet, its spot half and the orders — 68 IP weight a minute with the
+    budget read), 10 s on the shared one (`RECON_MS`: 152; HYPARB's
+    gateway hedge keeps it); both pinned under 40 % of the gateway's share
+    (160) and checked again at the boot;
+  - `halt_on_recon_stale_ms` ≥ four read periods on its own account
+    (120 s: a failed spot read waits a whole period for the next sheet,
+    XH5b-1, so two in a row must not halt the slot), two on the shared one
+    (20 s);
+  - the session bound: refused on the shared account (moved here from
+    `exec_boot::check_gateway_slot`, which cannot know the account) and
+    REQUIRED on its own (`halt_on_loss_usd_1e6` > 0 — O-XH5: the probe's
+    −$50), where it is judged on the account's worth (XH5b-1).
+- **The anchor, kept (E7: the bound outlives the process).** One file a
+  network beside the exec artifact — `xmm-pnl-anchor-testnet.state` here
+  (one master address can exist on both networks, and one network's worth
+  is never the other's anchor) — in E7's format (`<master>\t<usd
+  ×1e6>\t<unix s>`; the number is the account's worth).
+  - At the boot it is read strictly (`anchor::load_own`, at most 128 B into
+    a stack buffer): no file is a session's first boot; this master's line
+    is restored (the arm's `anchor_1e6`, durable from the start, and no
+    keeper is wired); ANYTHING ELSE — another master's line, a malformed,
+    overlong or empty line, a file that cannot be read — refuses the boot.
+    A re-anchored bound is a bound on nothing, and only the operator ends a
+    session, by moving the file aside.
+  - With no anchor restored, the fresh one (the first complete, positive
+    worth, XH5b-1) is handed by the arm through an `AnchorSlot` (one atomic
+    word in a granule of its own: the anchor to keep, then its negation
+    once kept) to an `AnchorKeeper` on the gateway's thread
+    (`xmm_live::run_gateway`: one load a pass until it acts), which stores
+    it once (temp file, fsync, rename) and writes back "kept".
+  - **The arm reports itself reconciled only once it reads the anchor
+    durable**, so the router's first-reconciliation latch holds every quote
+    until then. **A store that fails halts the gateway**
+    (`gateway::HALT_ANCHOR_UNKEPT` = 16, the HL gateway's first venue halt
+    reason): the router halts the slot on the gateway's word, and the slot
+    stays unreconciled. An arm with no keeper never reads a fresh anchor
+    kept — the safe direction.
+- **`/metrics`** (`engine_exec_hlgw_*`; `GatewayArmReport` 760 → 816 B,
+  the counters 66 → 68, the levels 27 → 32): `spot_reads_total` and
+  `spot_failed_total`; `own_account`, `pnl_anchor_usd_1e6`, `anchor_kept`,
+  `worth_usd_1e6` and `session_pnl_usd_1e6` — what XH5e's checklists read.
+  `/state` is unchanged.
+- **The boot tell** names the account (its own — with the master, the API
+  wallet and the loss bound — or the shared one) and the anchor (`anchor
+  RESTORED`, with its value and its file, or "the first complete worth
+  anchors, kept in …").
+- **Residuals.**
+  - *No directory fsync after the store's rename* (`core_io::write_atomic`,
+    as E7's anchor): a power loss right after a session's first store may
+    lose the file's name — a process crash cannot — and the next boot then
+    finds no file and anchors anew. XH5e's runbooks check that every boot
+    of a session after its first tells `anchor RESTORED`.
+  - *Longer windows on an own account.* A stale spot half (XH5b-1's
+    residual) stays judged for up to two read periods (60 s) plus
+    `halt_on_recon_stale_ms` (≥ 120 s; the probe's artifact states 180 s)
+    before `ReconStale` halts; a drift must survive two sheets 30 s apart
+    (≈ 60 s, against ≈ 20 s on the shared account). The $15 clip and the
+    caps bound what either window can hide.
+  - *Key copies beyond our reach:* deriving an address copies the key into
+    the signer library's secret type, which does not erase itself (as every
+    boot's `HlConfig::new` already does); the process `environ` itself
+    cannot be erased.
+  - *The shared account still runs* when the XMM testnet variables are
+    unset, with the XH5a amendment's effects (a)–(e); the boot tell says
+    which account.
+- **For XH5e:** the engine-instance testnet check runs slot 6 on its own
+  testnet account (both variables set), which ends (a)–(e) for slot 6; its
+  `exec.toml` states `halt_on_recon_stale_ms` ≥ 120 000 and a loss bound;
+  every boot after a session's first must tell `anchor RESTORED`; the
+  runbook ends each session by moving the anchor file aside.
+- **Superseded:** XH4f's "states no session bound" for the gateway slot
+  (`exec.toml.example`), `check_gateway_slot`'s session-bound refusal
+  (moved), XH5b-1's `cli::xmm_live::OWN_ACCOUNT` (gone: the boot decides
+  the account), `HlGatewayArm::fresh_anchor_1e6` (the keeper replaces the
+  owner's getter), and the boot's stale floor of two `RECON_MS` for every
+  account.
+
+**Tests:** the scopes (each reads its own key and master; the testnet ones
+alone default; the interlock names the scope's variable); the boot helpers
+(a master, a key's address, a set variable that does not parse — a value
+that is not Unicode included — or holds no key, named; presence); the
+own-account check (a shared master, a shared signer, crosswise both ways,
+nothing configured), its variable lists and the identities over fake
+readers (every set master and key; a variable a reader refuses fails the
+boot, named — no test touches a real key's variable); the agent binding
+(an API wallet of the master, the master itself, another master's wallet,
+another master, an unknown address) and the `userRole` request and
+answers (an agent and its master, a master, the rest); the rules by
+account (the floors at four and two periods, the bound refused on the
+shared account and required on an own one, the read weights 68 and 152),
+the template's slot-6 recipe under both; the anchor file's place, one a
+network; the strict read (no file, this master's line, another master's,
+a malformed, an empty and an overlong file); the keeper (nothing before
+the hand-over, one store, kept only for the value handed over, once a
+session; a store that fails halts the gateway and keeps nothing); the arm
+(a fresh anchor handed over and the first reconciliation waiting for it —
+and for good once the gateway halts; a kept anchor reconciles on the next
+pass; no keeper, never reconciled; a restored anchor durable with nothing
+to keep; the report's new fields; `spot_failed` on every failed spot
+read); the boot (a session bound resolves at `exec_boot`); `/metrics`
+(every new row its own value); alloc gate 98 (a real keeper stores the
+boot's anchor just before the window, whose first pass reads it kept; in
+every round of the window that keeper's pass and one nothing is handed
+to; `spot_failed` one of the window's paths).
+
+**Gates (the committed tree):** clippy 0; nextest 4 147/4 147; alloc 108
+(+3 ignored) at 0 B, compiled fresh; copy new=0; license OK; release OK;
+replay 7× IDENTICAL; rustfmt clean on every touched hunk.
+
+**Reviews:** round 1 — zero-copy and allocation APPROVE WITH NITS (stale
+size and count notes, another arm's key read as a bare array, a keeper
+wired beside a restored anchor, gate 98 blind to the keeper's pass — all
+taken), risk REQUEST CHANGES (this section had swallowed the next one's
+heading; an API wallet another master approved would trade an account
+slot 6 does not read — the `userRole` binding; the keys' form, one anchor
+file a network, the test gaps — all taken); round 2 — all three APPROVE
+(the `userRole` request staged before its copy — rendered in place; a set
+key that is not Unicode read as unset — refused; a test reading the real
+environment — fake readers; wording — all taken); round 3 — all three
+APPROVE (a COPY note claiming constants only — reworded); round 4
+(comments only) — zero-copy APPROVE (the function's doc — taken).
+
+### XH5b-3 amendment (2026-10-03): slot 6 on mainnet behind its interlock — the network is the market data's
+
+The third part of XH5b (plan §3.2 item 4; session-5 assumption A-S5-21).
+Nothing is armed: the path exists; the first mainnet run is the operator's,
+by XH5e's checklist.
+
+- **The network is the market data's (LAW E-4)** — the venue's own hosts
+  alone (`xmm_live::md_network`: `HYPERLIQUID_WS_HOST`, a `:port` aside,
+  exactly `api.hyperliquid.xyz` or `api.hyperliquid-testnet.xyz`; any other
+  host, a relay, refuses slot 6's boot — its network cannot be vouched
+  for). On mainnet slot 6 trades its OWN master and API wallet
+  (`scope_for`) — `Scope::Xmm`, `HYPERLIQUID_XMM_{AGENT_KEY,MASTER_ADDR}` on
+  the live arm's `HYPERLIQUID_EXCHANGE_HOST` / `HYPERLIQUID_SOURCE`, every
+  variable required, never defaulted — always: there is no shared mainnet
+  account. On testnet, XH5b-2's: its own account when its testnet
+  variables are set, else the shared E3 one.
+- **The interlock** (Q-XH5-3's default — no third switch). Slot 6 boots
+  only when it is live in the exec artifact AND named by `--arm-live`
+  (`exec_boot::resolve`'s two switches, LAW E-1) — the same switches on
+  both networks: what makes a run MAINNET is the market data (the venue's
+  mainnet host) and slot 6's own mainnet variables. Then
+  `xmm_live::check_network` (pure): the exchange host's network must be
+  the market data's (E-4), the host the venue's own for that network (no
+  local double), and the scope that network's — mainnet `Scope::Xmm`
+  alone, testnet a testnet scope. Anything else refuses the boot, naming
+  what does not hold.
+- **On mainnet, every XH5b-2 rule of an own account holds:** nothing shared
+  with E3's, slot 3's or HYPARB's masters and signers; the venue's
+  `userRole` binding of the API wallet to the master; reads every 30 s; a
+  stale floor of 120 s; the session bound REQUIRED (the probe's −$50,
+  O-XH5), judged on the account's worth against the anchor kept in
+  `xmm-pnl-anchor-mainnet.state` — its own file.
+- **Beside the mainnet-only arms** (`ExecBoot::check_gateway_network`,
+  replacing `check_gateway_slot`): slot 6 runs beside slot 0 (its
+  `MainnetAuthority`) or a live Binance slot (BX-16) only when the market
+  data is the venue's mainnet host; otherwise the boot refuses, naming that
+  arm's slot — one engine never mixes a testnet rehearsal with mainnet
+  orders. Alone, or
+  beside the operator's arm (XH5a), either network. `resolve` reads no
+  host, so the engine asks right after it, before any arm boots; slot 6's
+  boot asks again.
+- **The compositions** (`multivenue-engine`): the other arms' eight shapes
+  each enter the loop through one macro (`shape!`), alone or with slot 6
+  outermost — `SlotSplit(6, <shape>, xmm)` — sixteen compositions, no
+  `dyn`; under slot 6 the Binance arm's aliases are read one `a()` deeper;
+  the "beside a mainnet-only arm" abort is gone. A halt cancels the halted
+  slot's orders alone through every nesting (`SlotSplit::cancel_slot`,
+  XH5a).
+- **The tell and the loop's line name the network:** "the Hyperliquid
+  gateway, MAINNET", "slot 6 on its OWN MAINNET account …", and "slot 6 LIVE
+  on the Hyperliquid gateway (MAINNET) beside <the arms> — real MAINNET
+  orders will be submitted".
+- **Residuals.**
+  - *The mainnet switch is slot 6's mainnet variables.* Under Q-XH5-3's
+    default the artifact's switch and `--arm-live 6` are the same on both
+    networks, and `HYPERLIQUID_WS_HOST` defaults to the mainnet host when
+    unset: a testnet rehearsal's artifact and command line arm MAINNET
+    wherever the market data is mainnet and
+    `HYPERLIQUID_XMM_{AGENT_KEY,MASTER_ADDR}` are set. XH5e keeps those two
+    variables out of `.env` outside an armed mainnet session; a third,
+    network-naming switch (Q-XH5-3's alternative) stays the operator's call.
+  - *Likely no dead-man switch (O-XH4, restated for mainnet):* a fresh XMM
+    master is unlikely to be eligible for `scheduleCancel`, so slot 6 would
+    quote with no venue-side dead-man. The engine-sent TTL cancel (LAW E-8,
+    XH4f) works only while the gateway lives — `expiresAfter` never ends a
+    resting order — so between a crash or a network loss and the next
+    boot's sweep the quotes rest, bounded by the caps ($300 resting, ±$150
+    a perp); XH4f's alert names it (the maker plan's accepted risk, §8.11).
+    XH5e reads `dm_availability` before the first quote.
+  - *Until XH5c, no top-ups* (the gateway slot states no top-up keys): on
+    mainnet the address budget is what the account's traded volume funds;
+    at the arm's floor the slot halts, quoting nothing more — the safe
+    direction, and a short probe.
+- **For XH5e:** the mainnet arming checklist states each switch (slot 6 live
+  in the artifact, `--arm-live 6`, the XMM mainnet variables — set for the
+  armed session alone — and both hosts the venue's mainnet ones), reads
+  `dm_availability`, the boot tell's `MAINNET` and anchor lines, and checks
+  `/metrics` before the first quote; the testnet runbook runs the same boot
+  on testnet first.
+- **Superseded:** `exec_boot::check_gateway_slot` (its refusal is
+  `ExecBoot::check_gateway_network`'s, now by network); `boot_xmm_arm`'s
+  testnet-only refusal; the engine's "slot 6's gateway beside a mainnet-only
+  arm" abort; `xmm_live::account_name(own)` (now by scope).
+
+**Tests:** the market data's network (the venue's two hosts, with a port;
+relays, a look-alike and a bad port refused) and the scope (the network ×
+the account); the gate's matrix (testnet on the testnet host with either
+testnet scope; a double and a mainnet scope refused; mainnet on its own
+account and host; the shared and the testnet scopes and a double refused;
+both E-4 mismatches refused); `check_gateway_network` (testnet beside
+Binance and beside slot 0 refused, naming them; mainnet beside both; alone
+and beside the operator's arm, both networks); the tell (its own MAINNET
+account with no anchor and with one
+restored; the shared TESTNET account); the nested composition
+(`SlotSplit(6, SlotSplit(0, a, b), c)`: each slot's verbs reach its own
+arm, each slot's sweep asks its own arm alone); the engine compiles all
+sixteen compositions.
+
+**Gates (the committed tree):** clippy 0; nextest 4 151/4 151; alloc 108
+(+3 ignored) at 0 B, compiled fresh; copy new=0; license OK; release OK;
+replay 7× IDENTICAL; rustfmt clean on every touched hunk. (Round 2's run
+failed the debug `ws_frame_roundtrip_is_zero_alloc` once — the counting
+allocator is process-global and caught the test harness's own thread; the
+release gate passed; the committed tree's run is clean.)
+
+**Reviews:** round 1 — allocation and zero-copy APPROVE WITH NITS (an
+`armed` input that restated the boot's precondition; the shapes' moves
+un-noted — taken), risk REQUEST CHANGES (the market data's network read
+from its host's spelling: a relay serving testnet data would pass for
+mainnet beside the venue's mainnet exchange host — now the venue's own
+hosts alone; the mainnet switch and the dead-man residual stated —
+taken); round 2 — allocation and zero-copy APPROVE, risk APPROVE WITH
+NITS (the dead-man residual named a protection `expiresAfter` does not
+give — reworded).
+
+### XH5c-1 amendment (2026-10-03): one top-up governor, and the gateway's weight purchase
+
+The first part of XH5c (plan §3.3 item 1; session-6 assumption A-S6-16:
+XH5c in three commits — the governor and the command; the gateway arm's
+top-ups; the RTT word and the cadence). Nothing new is sent: no arm
+pushes the command before XH5c-2.
+
+- **One governor** (`exec_hyperliquid::budget::TopupGovernor`, 40 B,
+  `Copy`, never allocates): S7-L1's top-up policy moved out of `HlExchange`
+  — the weight per top-up (`0` = off), the day's max, the UTC day and the
+  weight bought on it, the session's spend — with the band rule
+  `topup_fits` and `TOPUP_PRICE_1E6`, unchanged. `above_band` (the cheap
+  check before a venue read), `wants` (the day roll, then the band rule),
+  `take` (decide and charge the day in one step — for an arm whose
+  purchase answers later), `charge_day`, `charge_cost`, `confirms` (seen on
+  the venue: half the weight), `stop` (weight 0, the day spent),
+  `new_session`, `state` (the state line). The blocking arm's
+  `top_up_budget` / `stop_topups` call it in the order they always ran:
+  its policy, its six guards and its state file are unchanged — but one:
+- **The day rolls forward only** (review r1): a clock stepped back across
+  00:00Z (an NTP step, a hand-set clock) no longer re-opens a day already
+  spent — `wants` rolls on a LATER day alone, and `restore_topup` keeps a
+  stored day one later than today with its usage; a day stored further
+  ahead (a clock that once ran ahead) reads as today spent, healed the next
+  day — never top-ups off until the clock catches up. Both arms.
+- **`CMD_RESERVE` (12)** on the gateway: a control action
+  (`HlCmd::reserve`, `arg` the weight), encoded by `encode_reserve_weight`
+  — the SDK vector's encoder — and its JSON twin `reserve_weight_json` in
+  one dispatch (`encode_control`; `ControlWire`'s `leverage` becomes
+  `arg`). It GROWS: the halt, an unready gateway and the throttle refuse
+  it — a halted, unready or throttled slot buys nothing. Its answer is a
+  control answer (ACK, REJECTED or UNANSWERED).
+- **For XH5c-2** (the gateway arm's top-ups): decide with `take` (the day
+  charged before the purchase leaves) and have the state stored off the
+  engine thread before the command is pushed; route the purchase's answer
+  by its own client-id range (never `stray`); refund the address request
+  when the purchase is refused before it leaves (halted, not ready,
+  throttled), and never read such a refusal as bought nor charge its cost;
+  the weight narrowed to the command's `u32` by refusal, never truncation;
+  the state file per network; the command built in place and pushed by
+  reference (the ring slot its one copy); the arm's size pin (1 664 B) and
+  its notes, and the report's (816 B) with its trait doc, size check and
+  `/metrics` notes, moved together; the whole round trip under the alloc
+  gates (the arm's step in gate 98, the control post in gate 96b).
+
+**Tests:** the band (moved with it); the governor (off, the band, the
+day's max, the day roll — forward only — the charges, `take` deciding
+once for a day with room for one, the state line, the confirm's bar, the
+stop, `above_band`); the restore (a later stored day kept with its usage);
+`CMD_RESERVE` is a control and no read, carries its weight, grows and
+carries no order verb; its JSON twin and its msgpack (the vector's
+encoder's bytes); a kind past the last is refused.
+
+**Gates (the committed tree):** clippy 0; nextest 4 152/4 152 (the known
+`a_frame_larger_than_the_buffer_is_refused_not_grown` flake passed on its
+one re-run); alloc 108 (+3 ignored) at 0 B, compiled fresh; copy new=0;
+license OK; release OK; replay 7× IDENTICAL; rustfmt clean on every touched
+hunk.
+
+**Reviews:** round 1 — zero-copy APPROVE, risk and allocation APPROVE WITH
+NITS (a clock stepping back re-opened a spent day — the forward roll; the
+decide/charge split for an arm whose purchase answers later — `take`;
+three double blank lines; the band's check in two files — `above_band`);
+round 2 — allocation and zero-copy APPROVE, risk APPROVE WITH NITS (a day
+stored far ahead kept top-ups off until the clock caught up — read as
+today spent; XH5c-2's list completed); round 3 — risk and zero-copy
+APPROVE.
+
+### XH5c-2 amendment (2026-10-03): the gateway arm's top-ups — decided at a budget read, stored before they leave
+
+The second part of XH5c (plan §3.3 item 1; A-S6-16), built to the XH5c-1
+amendment's "For XH5c-2" list. Nothing is armed: slot 6 buys requests only
+on its own account, when its `exec.toml` slot states the top-up keys, in a
+run the operator arms (XH5e's checklist; the probe's 10 000 a purchase, $5,
+and 100 000 a UTC day, $50 — O-XH9).
+
+- **Decided at a budget read, stored before it leaves.** At a budget read
+  (`limit_done`, the venue's figure applied) with no purchase in flight —
+  on the slot's own account, its session anchor durable, top-ups armed —
+  `TopupGovernor::take` decides one inside the band `(floor, floor +
+  weight]` and the day's max, and charges the day in the same step. The
+  governor's state (the UTC day, the weight bought on it, the session's
+  spend) goes to a `TopupKeeper` on the gateway's thread through a
+  `TopupSlot` (one 128 B granule; one hand-over at a time: the arm writes
+  only once the last one is stored, the keeper reads only after the
+  version that publishes it), which stores it in the slot's own file —
+  `xmm-topup-{testnet,mainnet}.state` beside the exec artifact, never the
+  blocking arm's `exec-topup.state`; the blocking arm's line — tied to the
+  session's anchor (`set_unix_s`: the restored one's, or the fresh one's,
+  handed over by its keeper in the pass it was stored). Only once the arm
+  reads that hand-over kept does the purchase leave: `HlCmd::reserve` built
+  in place in the arm's scratch command (the dead man's, one at a time on
+  the engine thread) and pushed by reference — the ring slot its one copy —
+  one address request. A restart never forgets a purchase that may have
+  left: the day's max holds across processes (`restore_topup` at boot,
+  read into one line's room: no file, a fresh day; an unreadable, overlong
+  or foreign one, today spent). A newer read that leaves a decision still
+  waiting for its keeper out of the band abandons it before it leaves.
+- **The answer, by its own range.** `TOPUP_OID_BASE = (1<<63)|(1<<60)`,
+  the purchases' count in the low 60 bits — bit 63 set, bit 62 clear: the
+  never-left rule refunds its request — routed ahead of `stray` and matched
+  exactly to the purchase in flight.
+  - *Refused before it left* (halted, not ready, throttled — or a full
+    ring at the push): never bought, its price never charged, its request
+    refunded, and the day's charge returned in memory
+    (`TopupGovernor::refund_day`): a throttled minute never spends the
+    day's max on nothing. Decided again at a later read — its state then
+    the one stored, which the keeper marks kept with no write.
+  - *Accepted, or in doubt (unanswered; its request carried as one
+    unanswered until it is seen):* judged at the next budget read ISSUED
+    after the answer — by the read's own number, never a clock — on the
+    headroom apart from what traded volume earned
+    (`AddressBudget::remaining_unearned`: a minute's volume is never read
+    as a purchase): half its weight must show (`confirms`). Not seen: the
+    top-ups stop. Seen: its price (the weight × 0.0005 USDC) is charged to
+    the session's spend once a perp sheet issued after the answer, with its
+    spot half, has landed too — the worth then carries the price; for one
+    answered in doubt, a sheet issued after the read that showed it (it may
+    have landed after a sheet issued since its answer) — and the state is
+    handed over again (no wait; owed and retried a pass at a time while the
+    keeper still stores another).
+  - *Refused by the venue:* they stop. *An answer in the range for no
+    purchase in flight* (the arm's own count gone wrong): they stop.
+  - A stop is `TopupGovernor::stop` after a forward roll to today — none
+    more from this process, and the day it happens on read as spent once
+    its state is stored — counted (`topup_failed`) and handed over.
+- **A halted slot buys nothing more:** the router's sweep of the slot
+  (`cancel_slot`, asked of a halted slot alone, XH5a) and the shutdown end
+  the buying (`topup_end`) — no decision at a read answered after it; a
+  purchase decided and not sent never leaves (abandoned: the day's charge
+  returned). The accounting goes on: a purchase that left is still carried,
+  judged and charged, its spend or a stop handed over — a hand-over owed
+  goes again each shutdown pass, the shutdown waiting for its keeper within
+  its bound, and the gateway's thread gives the top-up keeper one last pass
+  once released. The report's weight reads 0 once the buying ended. The
+  gateway's own halt refuses the purchase unsent as before.
+- **A state its keeper cannot store is never bought:** the slot is marked
+  failed (once; the gateway's thread logs it) and the arm stops. No
+  gateway halt: not buying is the safe direction, and the floor halts the
+  slot when the budget runs dry.
+- **Q-XH5-2's add-back:** the session P&L is the worth less the anchor
+  PLUS the session's spend — the purchases seen on the venue AND inside the
+  worth alone (one not seen, or seen before a sheet carries it, reads as a
+  loss: the safe direction) — so the −$50 bound is the trading's and the
+  day's max is the purchases'. No purchase before the anchor is durable: a
+  price paid before it would be inside it. The spend restored at boot is
+  added back whether or not the artifact still arms top-ups. One purchase
+  is priced at most a quarter of the loss bound (`check_account_rules`):
+  until it is inside the worth its price reads as a loss, and one must
+  never end a session alone.
+- **The weight narrowed by refusal:** `HlGatewayArm::set_topup` refuses a
+  weight past the purchase command's `u32` (`ArmErr::Topup`), an account
+  not the slot's own, and top-ups armed with no keeper; the push converts
+  by `u32::try_from` and stops on a failure — never a truncation. Slot 6's
+  boot builds the keeper only when the artifact arms top-ups (a weight
+  above 0): off, the governor alone carries the restored spend's add-back,
+  and nothing is stored (the temp-path rule does not apply).
+- **0 B after boot, on both threads, on the success path.** The arm's step
+  is gate 98's, with a REAL keeper storing inside its window: the keeper
+  writes its line in place (`TopupState::write_line`, its master rendered
+  by `config::hex20_into` into the line itself — `hex20` renders into its
+  String's own buffer with it, no copy) through
+  `core_io::write_atomic_at`, its temp name taken at boot
+  (`core_io::tmp_path`, one allocation; `write_atomic` calls it — one
+  durable write); a temp path of 256 B or more refuses the boot (std builds
+  a C path on the stack under 384 B). The blocking arm's store writes the
+  same line in place. The control post is gate 96b's: exactly rustls' two
+  records. A failed store formats its error once, and is the last.
+- **`exec.toml`:** `request_topup_weight` / `request_topup_day_max` are
+  legal on a gateway slot under the general rules (both or neither;
+  1 000–100 000 a purchase; at most 1 000 000 a day, and at least one
+  purchase) — XH4f's "the gateway arm buys none before XH5" refusal goes.
+  Slot 6's boot refuses them on the shared account (`check_account_rules`:
+  that account's requests are its blocking arm's to buy — one governor a
+  master's day).
+- **`/metrics`:** `engine_exec_hlgw_topup_{ok,failed,unsent}_total` and
+  `engine_exec_hlgw_topup_{weight,day_used,cost_usd_1e6}` (counters 68 →
+  71, levels 32 → 35; a day read as spent shows −1; `unsent` counts the
+  purchases that never left — refused unsent, a full ring, or abandoned: a
+  newer read out of the band, the halt, the shutdown); `GatewayArmReport`
+  816 → 864 B (108 words); `session_pnl_usd_1e6` carries the add-back. The
+  arm 1 664 → 1 792 B; the anchor keeper 64 → 72 B (its stamp); the top-up
+  keeper 120 B. The boot tell names the top-ups — the weight and the day's
+  max, both priced, the day's usage restored (or read as spent), the file
+  — or "no top-ups", and a restored spend.
+- **One definition each:** the UTC day (`dayspend::utc_day`, both arms'
+  top-ups), the state line, the temp name, the master's hex.
+- **Residuals.**
+  - *A store on the gateway's thread:* the temp write, the fsync
+    (`F_FULLFSYNC` on macOS) and the rename run between two gateway turns —
+    the sockets wait that long, a few ms, at most twice a purchase (the
+    pre-charge, then the spend or the stop; a decision again after a
+    refusal is kept with no write): ten purchases a day at the probe's
+    values.
+  - *The file can lag a step:* a spend or a stop the keeper cannot take at
+    once is owed and retried each pass — the shutdown waits for it within
+    its bound — but a crash, or a keeper still busy at the shutdown's bound
+    (no counter marks that one), loses it: a restart then reads the last
+    pre-charge (the day's usage with every purchase decided — the safe way)
+    with the spend short (a loss on the bound — the safe way) and no stop
+    (top-ups resume within the day's max).
+  - *No `expiresAfter` on the purchase* (the SDK vector carries none; the
+    venue's handling of one on `reserveRequestWeight` is unproven): a
+    purchase in doubt may land after the read that judged it — the top-ups
+    stop and its price is never added back (the safe way) — or after
+    00:00Z, counted on the day it was decided (the venue's next day may
+    hold one weight over the max).
+  - *A rename not yet durable:* `write_atomic` syncs the file, not its
+    directory (E4's helper, every state file's); a power loss right after a
+    store can bring back the last line — one purchase forgotten, one weight
+    over the day's max at most.
+  - *Seen on the venue, the price waits for the worth:* the price reads as
+    a loss from the first sheet that carries it until both the budget read
+    and a sheet issued after the answer (after that read, for one in doubt)
+    land (≤ a read period or two) — the boot's quarter-of-the-bound rule
+    keeps that from ending a session.
+- **For XH5c-3:** the RTT word without REST samples (their own histogram),
+  `rtt_pull_ms` 2 000 for the probe, the IP share kept at 400, and the
+  harness's `lead_stale_ms` 300-vs-500 re-check.
+
+**Tests:** the arm — a purchase decided inside the band (nothing above it),
+handed over and sent only once stored (one `reserveRequestWeight`, its
+range, its weight, one request), seen at the next read and inside the worth
+(the spend, the add-back, the report), seen before a sheet carries it (no
+add-back until one does), refused unsent (refunded, the day returned,
+decided again), not seen and refused by the venue (stopped, the stop handed
+over as the day spent, nothing more decided), in doubt (carried, judged by
+the next read, its request kept, charged only once a sheet issued after the
+read that showed it lands), a read issued before the answer (judges
+nothing; the purchase carried), a newer read out of the band (abandoned
+before it left), a keeper that failed (nothing sent), a keeper still
+storing (the spend owed, handed over later — during the shutdown too, which
+waits for its keeper), an answer for no purchase (stopped, never `stray`),
+a stop on a later day (that day spent), a halted slot (a decision
+abandoned, the day returned, nothing decided after; a purchase that left
+still judged and charged, its spend handed over, the weight reported 0),
+the day's max, the arming (the shared account, a weight past `u32` and
+top-ups armed with no keeper refused; off with none accepted; nothing
+before the anchor is kept), the shutdown (nothing decided, nothing sent);
+the keeper — the hand-over stored under its anchor and restored, one at a
+time, the state already stored kept with no write, a failed store keeping
+nothing more, a temp path too long refused; the line written in place = the
+state line (the widest figures), the blocking arm's store in place; the
+restore read into one line's room (an overlong file spent); the forward
+roll; `refund_day`; the headroom apart from volume; `hex20_into` (in place,
+the bytes `hex20` returns); `core_io::write_atomic_at` and `tmp_path`; the
+anchor keeper's stamp; the shared account refused, the quarter-of-the-bound
+rule and the file a network (`xmm_live`); the tell (armed, spent, none, a
+restored spend); the artifact's top-up keys on a gateway slot; `/metrics`'
+rows.
+
+**Gates (the committed tree):** clippy 0; nextest 4 182/4 182; alloc 108
+(+3 ignored) at 0 B, compiled fresh — gate 98's window ran ≈ 90 000 rounds
+with purchases seen, one refused unsent and a decision kept with no write;
+copy-audit 31, new=0; license OK (661); release OK; replay 7× IDENTICAL;
+rustfmt clean on every touched hunk. Round 3's run had one debug-nextest
+alloc flake in a test this cut does not touch
+(`icdp_on_tick_decision_and_roll_are_zero_alloc`, the process-global
+counter): the release gate passed, and eight debug re-runs passed.
+
+**Reviews:** four rounds, risk APPROVE.
+- *Round 1:* zero-copy REQUEST CHANGES — the keeper's store built its line
+  as a `String` (`from_utf8_lossy(..).into_owned()` on the gateway's
+  thread): now written in place; allocation and risk APPROVE WITH NITS — a
+  temp path of 256 B or more (std's rename would allocate: refused at
+  boot), a refused purchase re-stored each minute (the keeper skips an
+  unchanged state), the add-back on a budget read rather than a worth that
+  carries the price (the worth gate), a halted slot still buying (the halt
+  ends the buying), volume read as a purchase (`remaining_unearned`), the
+  in-doubt carry, a stale decision sent (abandoned), the restored spend
+  with top-ups off (kept), a stop that could be lost (owed and retried).
+- *Round 2:* all three APPROVE WITH NITS — an in-doubt purchase's price
+  added back before a worth carried it (the read that shows it moves the
+  mark), the halt stopping the accounting too (`topup_off`: only the buying
+  ends), the shutdown never retrying an owed hand-over, the keeper built
+  with top-ups off (only when armed), `hex20_into`'s panic path and
+  `hex20`'s copy (typed; no copy), stale notes.
+- *Round 3:* zero-copy APPROVE; risk and allocation APPROVE WITH NITS — an
+  owed hand-over lost when the shutdown ends first (it now waits, within
+  its bound), the report's weight after the buying ended (0).
+- *Round 4:* risk and zero-copy APPROVE; allocation APPROVE WITH NITS (this
+  paragraph's wrapping — taken).
+- *Declined, as residuals above:* `expiresAfter` on the purchase; a
+  parent-directory fsync in the shared `write_atomic`; a counter for a
+  hand-over still owed at the shutdown's bound (optional); a heap-free
+  restore compare (boot only; the three restores compare one way).
+
+### XH5c-3 amendment (2026-10-03): the RTT word without REST samples; the cadence re-checked
+
+The third part of XH5c (plan §3.3 items 2 and 3; A-S6-16). Nothing is armed.
+
+- **A REST post's round trip is its own series.** The gateway's `finish`
+  records a post that went by the REST fallback (`rec.conn == CONN_REST`:
+  the boot's dead-man clear before the socket is up, a fallback with no
+  socket Ready) in `GatewayStats::rest_rtt` alone — a fresh dial and a
+  synchronous exchange are not the socket's path. Before, they fed the RTT
+  word: XH4g's boot clear (1 809 ms in run b3) held it over 1 500 ms for up
+  to 30 s. Socket posts feed `post_rtt` / `cancel_rtt`, the congestion
+  average and the RTT window as before; a socket post that times out still
+  holds the word high (its ~5 s sample).
+- **No socket Ready reads throttled.** With REST out of the word, a
+  WebSocket outage no longer reaches the member through it — so the
+  congestion word reads `THROTTLED` while no connection is Ready to carry a
+  post (one test, `ready_conn`, shared with `send`): the member holds
+  (`WHY_CONGESTION`) while every post would go by REST; the pull's cancels,
+  the dead man and the control posts still go by REST (the word is
+  advisory; `admit` judges the rate throttle itself). At boot the word
+  reads throttled until the first socket is Ready — the arm is not ready
+  then anyway; the arm's day pages, which wait out throttled, wait for a
+  socket (a read needs one anyway). The HYPARB member does not read the
+  word.
+- **`rtt_pull_ms`** is a threshold — the member pulls while the published
+  worst exceeds it. The probe's artifact (XH5e) carries 2 000 (testnet p99
+  0.91–1.2 s, max 1.8 s); `xmm.toml.example` and the paper artifact keep
+  1 500. After the probe's first 2 000 mainnet posts it is re-sized to
+  max(1 500, ⌈1.5 × p99⌉) — an `xmm.toml` edit, a new config hash.
+- **The IP share stays 400** (`IP_WEIGHT_SHARE`). XH5e's runbook measures
+  the host's other Hyperliquid REST weight over an hour before any change
+  (an `exec.toml` key bounded by 1 200 less that).
+- **The cadence re-check** — the harness (`backtest --member xmm`) at
+  `lead_stale_ms` 300 and 500 on W17 (a weekday peak), W10 (a weekday
+  average) and W29 (a Saturday), ≤ 2 h windows, nice 15 — lives in the
+  vault (`docs/research/xmm/xh5c3-stale-2026-10-03/`: research never enters
+  git). The rulings it informs: the probe's artifact (XH5e) takes
+  `lead_stale_ms` 500; the paper engine stays at 300 until Anton rules;
+  Q-XH5-4 stands — the $50 cap binds and the floor halts the slot (the
+  safe direction).
+- **Residual — a socket loss is a pull.** A loss of the socket that spans a
+  heartbeat (a venue close, a pong timeout, a silent socket closed while its
+  replacement dials) now pulls the member's quotes and re-places them once
+  a socket is Ready: a cancel and a place per resting quote, and the queue
+  position — the intended direction, small against a quoting day's
+  requests.
+- **`/metrics`:** `engine_exec_hlgw_rest_rtt_{p99,max}_ns` (levels
+  35 → 37); `GatewayArmReport` 864 → 880 B (110 words); `rtt_worst_ns` and
+  the post series are the socket's. The stats block 66 944 → 83 456 B (one
+  more `Lat`, built once per arm at boot on the booting thread's stack, as
+  before).
+
+**Tests:** the router — a REST post's round trip in its own series alone
+(not `post_rtt`, the window or the average), the same post on a socket in
+all three; the gateway over the loopback venue — the REST post's round trip
+in its series, and the congestion word throttled with no socket Ready; the
+arm's report — the REST series apart from the post series; `/metrics`'
+rows; gate 95 records the REST series every turn, and the report gate's
+trackers hold REST samples too.
+
+**Gates (the committed tree):** clippy 0; nextest 4 183/4 183; alloc 108
+(+3 ignored) at 0 B, compiled fresh — gate 95 records the REST series
+every turn, gate 99's report walks it; copy-audit 31, new=0; license OK
+(661); release OK; replay 7× IDENTICAL; rustfmt clean on every touched
+hunk.
+
+**Reviews:** two rounds. Round 1 — zero-copy APPROVE; risk APPROVE WITH
+NITS (A-S7-16, no socket Ready reads throttled, judged sound: it blocks
+nothing that must go and does not flap in a make-before-break swap; NITs:
+THROTTLED's docs, the battery's congestion peak at every boot, the socket
+loss residual); allocation REQUEST CHANGES — the harness's numbers in this
+tracked file (research never enters git): moved to the vault, the rulings
+kept; NITs: "on a socket" wording, gate 95. Round 2 — risk, allocation and
+zero-copy APPROVE. Declined (optional): the battery's peak can still read
+one stale throttled report in the heartbeat after a socket comes up (the
+battery's evidence alone).
+
+### XH5d-1 amendment (2026-10-04): the measurement's record — every order event captured, the venue's time on a RESTING, the venue's trade id on a fill
+
+The first part of XH5d (plan §3.4 item 1; A-S7-21: XH5d in parts — the
+record; the A/B arms; the report, which lives in the vault). Nothing is
+armed, and no order path changes.
+
+- **`engine-events.pmlr`** (`SlotKind::OrderEvent` = 9, 64 B slots, in the
+  run's capture directory beside `engine-fills.pmlr` and
+  `engine-orders.pmlr`): every `OrderEvent` the engine drains — the
+  dispatcher's pump and the lane, every slot's — is staged BEFORE the
+  member sees it, as the fills are. The record is the event itself (kind,
+  reason, client oid, symbol, venue, slot, the venue's time): `OrderEvent`
+  gains `AsBytes` — its layout was already fully explicit, every offset
+  asserted. The bin opens it at boot (an open failure is fatal: capture is
+  the product); it flushes on the fills' 5 s cadence and drains at stop;
+  `engine_events_capture_{io_errors,records}` on `/metrics`. Synchronous on
+  the engine thread like the other two (a 64 KiB staging buffer; a full one
+  writes inline).
+- **The venue's time on a RESTING.** Hyperliquid's post answer carries no
+  time; the `orderUpdates` `open` row carries `statusTimestamp`. The arm's
+  RESTING carries the row's time when the row lands the order; when the
+  answer came first — the usual order — its RESTING went without a time,
+  and the row repeats it once, with the time (`RB_STAMPED`: once an order).
+  A member takes the repeat as a no-op (XMM's RESTING moves PENDING →
+  RESTING alone); the router passes events through. The measurement's ACK
+  time is an order's first RESTING with a venue time. A repeat is an event
+  wherever events are counted — the arm's `events`, the engine's
+  `order_events_dispatched`, the set's `order_events_unrouted` (a disabled
+  slot), XMM's `unmatched` (a repeat after the member's watchdog released
+  the side) — so on `/metrics` events outnumber orders by up to one a
+  post-only order: the repeat, not an anomaly. The testnet battery's
+  `open_row_lag_ms` samples an order's first RESTING alone.
+- **The venue's trade id on a fill.** `Fill.tid` (offset 40, out of
+  `_pad1`: wire-additive — every capture written before reads as none)
+  carries Hyperliquid's `tid` on the gateway arm's fills, 0 elsewhere: the
+  report's key for excluding our own prints from the public volume.
+- **Wire format:** `docs/wire-format.md` — `OrderEvent` captured, `Fill`'s
+  `tid`, the header's slot kinds 8 and 9.
+- **Copies:** one 64 B slot into the staging buffer an event (the
+  existing `SlotCapture::append`, as for fills and orders); at boot the
+  capture's handle moves by value through its builders once (noted, with
+  its two siblings').
+
+**Tests:** the slot kind (9, 64 B); the engine — both drains staged before
+the member, read back as written (the venue's time with it); the arm — a
+RESTING repeated once with the `open` row's time after the answer, the
+`open` row first carrying it in the only RESTING, a fill's trade id; the
+engine tick gate measures the capture inside its window (every drained
+event staged exactly once, 0 B); gate 98 runs both stamped paths in its
+window — an `open` row before the answer (its RESTING stamped) and one
+after it (the repeat).
+
+**Gates:** clippy 0; nextest 4 185/4 185; alloc 108 (+3 ignored) at 0 B;
+copy-audit 31, new 0; license OK (662); release OK; replay 7× IDENTICAL;
+rustfmt clean on touched hunks.
+
+**Reviews:** risk APPROVE (round 2), allocation APPROVE (round 2),
+zero-copy APPROVE (round 3).
+
+### XH5d-2 amendment (2026-10-04): the A/B arms — θ, and the size-only modify
+
+The second part of XH5d (plan §3.4 item 2; A-S7-21). Nothing is armed, and
+`ab_mode` 0 — the example's and the paper artifact's — quotes exactly as
+before: no arm, the artifact's θ, no size-only modify.
+
+- **The block.** An A/B block is 600 000 ms of the follower's venue time
+  (the last fresh bbo's `time`): the arm is (venue ms ÷ 600 000) mod 2 —
+  even A, odd B; before the first venue time, A. Both arms see the same
+  market mix; the arm is a function of time alone, stated in the boot tell
+  (`ab_arms=`).
+- **`ab_mode` 1 — θ.** Arm B decides with half the artifact's θ (A-S7-23:
+  no new key — the probe's 0.5 bps gives 0.25): a second multiplier pair
+  from `configure`. The gate uses the block's pair at placement; a quote
+  remembers the arm its price was decided in, and its LEAD cancel uses that
+  arm's pair — a quote decided in A keeps A's rule into a B block.
+- **`ab_mode` 3 — the size-only modify.** A quote decided in arm B and
+  resting at the touch is modified one lot down, then — once that rests —
+  one lot back, and no more: the same modify path (a fresh oid each, the
+  TTL inherited, LAW E-7), paced as a requote (no sooner than
+  `requote_min` after the quote's last change; four floors under a busy
+  arm) and counted in `orders_emitted`. A size the venue would refuse
+  (under a lot, or under its $10 minimum), one the member's caps would not
+  take — either step: a modify sets the replacement's whole size, whatever
+  of the original filled — or a refused modify ends the step. A requote to
+  a new price is a new decision (its arm now) and ends a half-done step.
+  Off under the parity switch (`sim_parity` 1, whose requotes are cancels
+  and fresh orders).
+- **`ab_mode` 2** is tagged with its arms and quotes as 0 until XH5d-3.
+- **The record.** `Order.ab_arm` (byte 43, out of `_pad1`: wire-additive —
+  every capture written before reads as none): 0 none, 1 A, 2 B, in
+  `engine-orders.pmlr`. No execution path reads it.
+- **Risk.** The arms change only which θ decides and, in arm B under
+  `ab_mode` 3, at most two extra modifies a placement — every one through
+  the member's caps and pacing, the router's caps, the request budget and
+  the halt, as a requote; the ledger, the caps and the halt are untouched.
+  Arm B's half θ cancels on smaller leader moves: more LEAD cancels (and
+  requests) in B blocks — what the A/B measures.
+- **Copies:** none new (`with_ab_arm` is a const by-value builder on the
+  order built in place, as `with_post_only`).
+
+**Tests:** the block (the follower's venue time; none yet: A) and arm B's
+half θ (its multipliers the square roots of A's); arm B's LEAD cancel at a
+−0.3 bps leader move (between θ/2 and θ) while arm A's quote rests; arm B's
+size-only modify — down, back, once, each a floor after the last change —
+and none in arm A or under the parity switch; the boot tell's `ab_arms`;
+gate 75e — both arms, alternating every cycle, under `ab_mode` 1 (arm B's
+half-θ pull) and 3 (arm B's size-only modifies, a requote ending a step, a
+refused modify), at 0 B.
+
+**Gates:** clippy 0; nextest 4 189/4 189; alloc 109 (+3 ignored; gate 75e
+new) at 0 B; copy-audit 31, new 0; license OK (662); release OK; replay
+7× IDENTICAL; rustfmt clean on touched hunks.
+
+**Reviews:** risk APPROVE (round 2), allocation APPROVE (round 2),
+zero-copy APPROVE (round 2).
+
+### XH5d-3a amendment (2026-10-04): the ALO priority on the wire — the order's bid, the `{"p": N}` grouping, the gateway batching by it
+
+The third part of XH5d, its first half (plan §3.4 item 2, `ab_mode` 2;
+A-S7-29: XH5d-3 in two — the wire, then the member's rule and its cap).
+Nothing is armed, and nothing bids a priority yet: no member sets one
+until XH5d-3b, which bounds the spend.
+
+- **The field.** `Order.alo_priority_1e8` (u32 at byte 44, the last of
+  `_pad1`: wire-additive — every capture written before reads as none):
+  p ×1e8 of the order's resting notional, 0 none.
+- **The arm.** An ALO place carries it in `HlCmd.arg`; a modify never
+  does (Hyperliquid's `batchModify` carries no grouping, A-S7-27), nor an
+  IoC. An order bidding more than 1 % (`HlCmd::PRIORITY_MAX_1E8`, the
+  xmm.toml parser's bound) is refused unsent.
+- **The arm's cap.** The HYPE a priority commits is bounded at the arm:
+  `set_priority_cap` (boot-only) arms a session cap, USD ×1e6; with none
+  armed — the default — a place bidding a priority is refused unsent
+  (`refused_local`). Each place's fee — p ×1e8 of its rounded resting
+  notional, rounded up — is tallied when it is sent, and a place past the
+  cap is refused unsent. XH5d-3b arms it for slot 6 under `ab_mode` 2.
+- **The gateway.** An action carries one grouping: the open ALO batch
+  keeps its priority, and a place bidding another — or none — posts every
+  open batch first, as a full batch does (the open order kept). The
+  batch's action is signed and rendered with `"grouping": {"p": N}` — a
+  one-key map in the msgpack, an object in the JSON — or `"na"` when it
+  bids none.
+- **The bytes** are pinned by a known-answer vector from
+  hyperliquid-python-sdk 0.24.0's `PriorityGrouping` (`order_alo_priority`,
+  p 10 000): the fixture holds 39 vectors, and the boot self-test rebuilds
+  the priority order too (nine encodings). `gen_vectors.py` builds every
+  order action through the SDK's own `grouping` parameter; the 38 earlier
+  rows regenerate byte-identical. The XH5e testnet step proves the venue
+  takes the grouping.
+- **What it costs.** The venue charges p ×1e8 of the resting notional at
+  placement from the undelegated HYPE of the master's staking balance (the
+  venue's "delegatable balance"; spot HYPE does not pay — XH5e-4) — each
+  place in a priority batch on its own notional — outside the worth (USDC
+  only) and outside every cap the router keeps; the arm's cap is its bound.
+  The engine reads no HYPE balance. Short of it, the venue refuses the
+  place with an order error the arm classes OTHER — never an ALO reject,
+  so XH-7's rate does not rise; it counts in the reject streak (five in a
+  row halt the slot). XH5e-4 records the testnet answer and corrects this
+  bullet's earlier guess.
+- **Copies:** none new (the grouping is written in place by the existing
+  msgpack and JSON writers; the arm writes `arg` in place).
+
+**Tests:** the priority grouping's msgpack (a one-key map; the named form
+unchanged) and JSON (an object); the vector; the self-test (39 rows, nine
+encodings); the arm — an ALO place bids its priority, a modify none, over
+1 % refused unsent; unarmed, a priority place refused unsent; armed, the
+places within the cap sent and the one past it refused, a place bidding
+none unaffected; gate 98 — every third order bids priority, the arm armed
+(the fee tallied in the window); the gateway loopback — places batched by
+priority (two at one p, one at none, one at another: three posts, each its
+grouping); gate 96's ALO places bid priority (the grouping sealed in
+place, at rustls' count).
+
+**Gates:** clippy 0; nextest 4 193/4 193 (round 2; round 3's run: one
+debug-run alloc flake in untouched option-analytics, re-run ×8 clean);
+alloc 109 (+3 ignored) at 0 B; copy-audit 31, new 0; license OK (662);
+release OK; replay 7× IDENTICAL; rustfmt clean on touched hunks.
+
+**Reviews:** risk APPROVE (round 2, confirmed round 3), allocation APPROVE
+(round 3), zero-copy APPROVE (round 3).
+
+### XH5d-3b amendment (2026-10-04): the ALO priority arm — arm B's fresh places at a level just formed bid it, under the boot's cap
+
+The third part of XH5d, its second half (plan §3.4 item 2, `ab_mode` 2;
+A-S7-29). Nothing is armed; `ab_mode` 0 — the example's and the paper
+artifact's — and modes 1 and 3 bid no priority.
+
+- **The rule.** Under `ab_mode` 2 a fresh place whose price was decided in
+  arm B (the XH5d-2 block) bids the artifact's `alo_priority_1e8` when the
+  follower's touch on its side formed — improved to a new level in front —
+  within the last 400 ms (local receipt; the venue sorts ALO orders by
+  priority on that timescale). A retreat lands on a queue already there;
+  the book's first sight, and the first fresh tick after a stale one or
+  after a silence the member calls the follower stale (the level's time
+  unknown), form none. A requote is a modify and bids none (A-S7-27); arm
+  A bids none.
+- **The cap.** The member tallies each bid's fee — p ×1e8 of the place's
+  notional, rounded up, the arm's own reckoning on the same price and size
+  — and bids none once the next would pass $25 a boot
+  (`XMM_PRIORITY_MAX_USD_1E6`, half the probe's funded HYPE — staked and
+  left undelegated, XH5e-4). Slot 6's arm
+  is armed (XH5d-3a's `set_priority_cap`) only under `ab_mode` 2 with a
+  priority to bid, at the member's cap and $1 of room
+  (`XMM_PRIORITY_ARM_ROOM_USD_1E6`): the member stops first, and the arm
+  refuses unsent past its own. Every other configuration arms none — a
+  place bidding a priority would be refused unsent. The cap is per boot:
+  the funded HYPE is the ceiling across restarts.
+- **The latch.** A priority the venue will not take (short of undelegated
+  HYPE in the staking balance) lands as a refusal the arm cannot name
+  (`ORDER_EVENT_REASON_OTHER` — an item's error, a whole action refused, a
+  stream's unnamed rejection); on testnet it is the order error
+  `Insufficient delegatable balance for priority order` (XH5e-4). Three
+  priority places in a row refused end the priority for the boot
+  (`priority_refused` counts them); a priority place that rests resets the
+  run. The member keeps quoting; arm B's places bid none after it. The
+  latch has tripped when `priority_places` stops growing while arm B
+  quotes.
+- **The bound.** `alo_priority_1e8` must be at most 1 % (1 000 000) —
+  `XmmParams::validate` now refuses more, as the parser and the arm do.
+- **On `/metrics` and `/state`:** `engine_xmm_priority_places_total`,
+  `engine_xmm_priority_fee_usd_1e6_total`,
+  `engine_xmm_priority_refused_total` (`XmmCounters` 22 → 25 × 8 B); the
+  boot tell states the rule and the cap (`ab_arms=`; `off` when
+  `alo_priority_1e8` is 0).
+- **The record:** the order carries what it bid (`alo_priority_1e8`, in
+  `engine-orders.pmlr`), so the report sees the priority places apart.
+- **Layout:** `Inst` gains the two sides' formed times on their own line
+  (192 → 256 B a perp); `Quote.prio`, one byte of `Quote`'s padding (64 B
+  kept).
+- **Copies:** none new (`with_alo_priority`, a const by-value builder on
+  the order built in place, as `with_ab_arm`).
+
+**Tests:** the rule (the first sight, a retreat and the tick after a stale
+one form nothing, an improved touch forms its side; arm B within 400 ms
+bids and tallies, beyond it, arm A, another mode and the spent cap bid
+none); the latch (three refusals in a row end it, a resting priority place
+resets the run); the fee as the arm reckons it; `validate` refuses over
+1 %; the arm's cap armed for `ab_mode` 2 with a priority alone; the boot
+tell; the counters on `/metrics` and `/state` (the worst-case `/state` with
+every counter at its widest); gate 75e — under `ab_mode` 2 arm B's bids at
+a level formed that cycle bid 1 % until the cap (exactly 166 places at
+0.15 and 99.995), then the cap refuses them; the asks and arm A never; 0 B.
+
+**Gates:** clippy 0; nextest 4 197/4 197; alloc 109 (+3 ignored) at 0 B;
+copy-audit 31, new 0; license OK (662); release OK; replay 7× IDENTICAL;
+rustfmt clean on touched hunks.
+
+**Reviews:** risk APPROVE (round 3), allocation APPROVE (round 3),
+zero-copy APPROVE (round 2, confirmed round 3).
+
+### XH5e-1 amendment (2026-10-04): slot 6's preflight, and the probe's artifacts as files
+
+The first part of XH5e (plan §3.5; A-S7-37). Nothing is armed and no file in
+`~/multivenue` changes; the flip that installs these files
+(`scripts/xmm-flip.sh`) is XH5e-2.
+
+- **One boot, two stopping points.** `xmm_live::plan_xmm_arm` is slot 6's
+  boot up to its first network read: the artifact's slot, the member and its
+  shape as the arm binds it (1..=16 perps, `lifetime_ms` within the arm's
+  `expiresAfter`), the caps, the market data's network (LAW E-4), the
+  account and its rules, the credentials, their network and identity, the
+  anchor and the top-ups restored from their files, and the tell's head.
+  `boot_xmm_arm` runs it, then reads the venue (`userRole` on its own
+  account, then `meta`). The anchor's and the top-ups' files are now read
+  before `userRole` — reads only, so a bad anchor refuses before any
+  request. The tell is unchanged.
+- **The preflight sends nothing.** `multivenue-engine xmm-preflight --exec
+  … --arm-live … --xmm … --strategy …` resolves the artifact with the arming
+  list (slot 6 live on the gateway, or it refuses), loads the member's
+  artifact on an offline universe (the coin table; the boot resolves the
+  same names against its own), runs the plan and prints the boot's tells,
+  then PASS naming what it did not check: the venue's perp universe, the API
+  wallet's binding, the account's positions, orders and balances, the perps
+  in the boot universe, their overlap with a live slot 0 or 1. It opens no
+  socket and writes nothing. Its inputs must be the boot's: the anchor and
+  the top-up state are read beside `--exec`, so a work copy sits in the
+  installed `exec.toml`'s directory; the identities are those its
+  environment states, so it runs from the repo in the wrapper's environment.
+  A PASS the boot then refuses costs a refused boot, never an order.
+- **The probe's artifacts are files** at the repository's root, changed only
+  under review: `xmm-probe.toml`, the example's member (the paper engine's)
+  with `lead_stale_ms` 500 and `rtt_pull_ms` 2000 (XH5c-3) and `ab_mode` 0
+  for the first run (Q-XH5-5 is open; mode 2 waits for the testnet proof of
+  the priority grouping); and `exec-slot6-probe.toml`, the template's slot-6
+  recipe live (top-ups 10 000 / 100 000, the −$50 bound, reads stale after
+  180 s). Tests pin both to their templates.
+- **`bin15+xmm`** joins the bootable names (mask 72): the testnet
+  engine-instance check's set. The wrapper's allow-list does not carry it.
+- **Copies:** the plan's move out of its `Result` at boot, noted; the key
+  moves as its box, never its bytes. None on a hot path; nothing runs after
+  boot, so no alloc gate is new.
+
+**Tests:** the probe passes on mainnet market data on an account of its own
+(the report: slot 6 live on the gateway with its clamps, the probe's member,
+the MAINNET head with its bound, a new session and its top-ups, PASS); the
+boot's refusals are the preflight's, word for word — `--arm-live` not naming
+6, a relay's market data, testnet data on the shared account, an absent
+member; the anchor beside the artifact restores this master's session and
+refuses another's; the probe's member differs from the example's in its two
+values alone; the probe's section is the template's recipe; the offline
+universe; the preflight's `--strategy` boots xmm; `bin15+xmm`'s mask.
+
+**Gates:** clippy 0; nextest 4 204/4 204 (a debug-run alloc flake, 6
+allocations / 1 012 B in `binance_book_ticker_is_zero_alloc`, re-run ×8
+clean — the release gate is the authority); alloc 109 (+3 ignored) at 0 B;
+copy-audit 31, new 0; license OK; release OK; replay 7× IDENTICAL; rustfmt
+clean on touched hunks.
+
+**Reviews:** risk APPROVE (round 2), allocation APPROVE (round 2),
+zero-copy APPROVE (round 2); their two round-2 wording NITs applied
+(comments only).
+
+### XH5e-2 amendment (2026-10-04): the flip and the runbooks — how the probe is armed, and by whom
+
+The second part of XH5e (plan §3.5, R-XH4-8; A-S7-37). It arms nothing:
+only Anton arms the probe, by the checklist.
+
+- **The flip** (`scripts/xmm-flip.sh status|live|paper`) is the only way
+  the probe's artifacts reach `~/multivenue`.
+  - **What it touches.** It edits `strategy.conf` (`XMM_TOML`, `EXEC_TOML`,
+    `ARM_LIVE`) and `exec.toml`'s `[exec.slot.6]` alone, each after a `.bak`.
+    It installs the probe's member as `~/multivenue/xmm-probe.toml`. It
+    restarts nothing.
+  - **When `live` refuses.** `live` refuses unless all of these hold:
+    - slot 6 is a clean paper state, and the running engine does not route it
+      live;
+    - `STRATEGY` boots xmm;
+    - `exec.HALT` halts slot 6 for no reason but the operator's (archived, then
+      dropped);
+    - it is outside the quiet windows;
+    - no scheduled drain is near, no gated restart is owed, and the wrapper is
+      not mid-boot;
+    - the checkout is the one the engine's launchd job runs, and its binary was
+      built after its HEAD with the preflight in it;
+    - the preflight passes on the work copies. These are written beside the
+      installed files and run in the environment the wrapper builds under
+      launchd: the terminal's exports dropped, the repo `.env` and the
+      wrapper's testnet names sourced as the wrapper sources them, tracing off.
+      A sandbox's stand-ins (`MULTIVENUE_DIR`, the plist, the env file) are
+      honoured only under an explicit sandbox switch and refused otherwise.
+
+    Nothing is installed unless it passes.
+  - **`paper`.** `paper` halts slot 6 first (the halt read back as the engine
+    parses it), unless the file says paper and the engine answers without
+    routing it live. It then restores paper.
+  - **Restarting.** A restart is SIGTERM (`pkill -TERM -f 'multivenue-engine
+    run'`, launchd's KeepAlive relaunching), never `launchctl kickstart -k`,
+    which is SIGKILL and skips the gateway's shutdown sweep.
+- **The testnet engine-instance runbook** (`docs/xmm-testnet-runbook.md`)
+  runs before the first mainnet arming. It runs a second engine on the binary
+  the probe will run: slot 6 on the gateway beside slot 3 on E3, under a
+  home, port, credentials and minimal universe of its own. Every path is
+  under that home, every Hyperliquid host is testnet's, E3's pair stands in
+  for the operator arm's names, and every exported credential but E3's and
+  slot 6's testnet keys is dropped; no credential file is copied. It checks:
+  - the boot's tells and numbers against the venue;
+  - the per-slot halt, both ways;
+  - the session restored across a restart (`anchor RESTORED`);
+  - the top-ups.
+
+  Its priority proof — the grouping accepted, and the venue's answer with no
+  undelegated HYPE in the staking balance recorded — comes before any
+  `ab_mode` 2 on mainnet (done 2026-10-04: XH5e-4).
+- **The arming checklist** (`docs/xmm-mainnet-arming.md`) is the only way to
+  arm.
+  - **Before the flip** it checks:
+    - the account at the venue: funded in full before the first boot, flat,
+      and the API wallet approved and bound;
+    - XH5b-1's margin check: a small position opened by hand, and the worth
+      against funded − fees + its unrealised P&L. A residual of half the
+      margin in use or more aborts.
+  - **No transfers** are made while a session's anchor stands.
+  - **After the restart**, it reads:
+    - the boot tell's `MAINNET` and anchor lines;
+    - `dm_availability` — under O-XH4 since XH5e-5: `unknown` or `refused`
+      expected below $1 000 000 traded, quoting on; halt on `exhausted`, or on
+      anything but `eligible` once the master qualifies;
+    - `/metrics` against the venue.
+  - **The `.env` switch.** `HYPERLIQUID_XMM_*` sit in `.env` only during an
+    armed session (Q-XH5-3: with no third switch they are the mainnet
+    switch).
+  - **Ending a session.** A session ends with the anchor's file moved aside.
+  - **A tripped priority latch** reads as `engine_xmm_priority_places_total`
+    frozen, `engine_xmm_priority_refused_total` at 3 or more, and
+    `engine_xmm_priority_fee_usd_1e6_total` short of the cap.
+- **Two recorded limits.**
+  - `dm_availability` is read within the first read period after the boot,
+    so the member's first quotes may precede it — a deviation from XH5b-3's
+    "before the first quote" (A-S7-43).
+  - The five daily drains restart the engine. If slot 6 holds a position at a
+    drain, the boot holds its arm until flat (H5), and its stale reads then
+    halt it: each drain needs a hand flatten, or the session ends before it.
+- **XH5a's obligation is closed.** BIN15's flip checks hold under the
+  per-slot halt. `bin15-flip.sh paper` halts slot 3 through `exec.HALT`,
+  which now cancels slot 3's orders alone. Its venue check counts slot 3's
+  cloids and the `#` outcome coins, and slot 6 trades perps on a master of
+  its own.
+
+**Tests:** the flip in a sandbox (copies of the operator's `strategy.conf`,
+`exec.toml` and `xmm.toml`; no real `.env`; throwaway credentials):
+- `status`;
+- `live` refused when:
+  - the binary is older than HEAD;
+  - the checkout is not the one the launchd job runs;
+  - the preflight refuses (terminal exports do not reach it);
+  - a halt has another reason.
+
+  Nothing changed in any of these cases.
+- `live` passing and installing;
+- `paper` halting a live slot and restoring paper, and halting nothing on a
+  paper state;
+- `live` again dropping the operator's halt line, leaving one section and one
+  provenance line in `exec.toml`, with modes preserved.
+
+**Gates:** clippy 0; nextest 4 204/4 204; alloc 109 (+3 ignored) — no code in
+this cut; copy-audit 31, new 0; license OK; release OK; replay 7× IDENTICAL;
+rustfmt clean. Rounds 2–4 changed the script and the documents alone.
+
+**Reviews:** risk APPROVE (round 4), allocation APPROVE (round 4),
+zero-copy APPROVE (round 3, confirmed round 4). Round 1 found the testnet
+instance on mainnet credentials and the paper engine's files, the whole
+operator directory copied (with a credential file), a SIGKILL restart and
+XH5b-1's pre-arm checks missing — all fixed above.
+
+### XH5e-3 amendment (2026-10-04): Hyperliquid discovery sized for the venue's lists as they are
+
+Found by the testnet engine-instance run (XH5e-2's runbook): the
+instance's boot refused at Hyperliquid discovery. Testnet's `perpDexs` and
+`outcomeMeta` lists had outgrown the parser's caps. The same growth on
+mainnet would have refused the paper engine's own boot.
+
+- **The caps.** `HL_DISCOVERY_DEXS_CAP` rises from 64 to 1 024, and
+  `HL_DISCOVERY_OUTCOMES_CAP` from 512 to 4 096. Both stay fail-closed: past
+  a cap the boot refuses, and a rediscovery leaves its family waiting. A
+  truncated table could drop a family's live instance without a word.
+- **No downstream change.** The dex index (a `u16`) and the builder asset
+  ids (below the HIP-4 base) hold at the new caps. Nothing else is sized by
+  these constants.
+- **Allocation.** Each table reserves about 438 KiB, built at boot and by
+  the ingress thread's family rediscovery. That rediscovery runs between
+  sessions, at most once a minute, with the lane dark: a cold path, and no
+  alloc gate's. The module's note now names it. `outcome_specs()` carries a
+  `// COPY:` note: at most 256 KiB, cold.
+- **Deferred, for Anton.**
+  - A warning when a list passes half its cap (A-S7-46).
+  - BIN15's family binding: it matches an outcome by its description's
+    shape and window, not by its deployer, so a look-alike deployed by a
+    third party could be adopted. This predates this cut, and must be fixed
+    before any live re-arm of slot 3 (A-S7-47).
+
+**Tests:** testnet's live lists of 2026-10-04 parse (268 dexes, 633
+outcomes). The existing cap tests (cap + 1 refused) scale with the
+constants.
+
+**Gates:** clippy 0; nextest 4 205/4 205; alloc 109 (+3 ignored) at 0 B;
+copy-audit 31, new 0; license OK; release OK; replay 7× IDENTICAL; rustfmt
+clean on touched hunks.
+
+**Reviews:** risk, allocation and zero-copy APPROVE (round 2; round 1's
+findings were notes and comments, all applied or deferred above).
+
+### XH5e-4 amendment (2026-10-04): the ALO priority's funding and the venue's answer — the testnet runbook's §7
+
+Docs only: no code, test or script changes. Recorded from the testnet
+engine-instance runs of 2026-10-04 (slot 6 on the shared E3 account, main's
+`79abb8c` binary, `ab_mode` 2 at 1 bp) and three probe orders signed by the
+official SDK (hyperliquid-python-sdk 0.24.0, a throwaway venv).
+
+- **What pays.** The priority fee comes from the master's **staking**
+  balance, undelegated — the venue's "delegatable balance". Spot HYPE does
+  not pay: with 0.9993 HYPE in spot and none staked, every priority place
+  was refused. "Undelegated HYPE" in XH5d-3a and XH5d-3b, the testnet
+  runbook and the arming checklist means this balance. HYPE reaches it by
+  the staking page's spot-to-staking transfer, with no validator chosen;
+  moving it back to spot takes 7 days, so fund it for the probe's life.
+- **Without it,** the venue's answer, word for word: the order's status is
+  the error `Insufficient delegatable balance for priority order` (the
+  action itself answers `ok`); the same order without the grouping rests.
+  The arm classes it `ORDER_EVENT_REASON_OTHER`: it counts in
+  `rejected_other` and in the arm's reject streak (an accepted place resets
+  the streak; five in a row halt the slot), never as an ALO reject, so
+  XH-7's rate does not rise. The member's latch ended the priority after
+  three refusals and held: through the next arm-B block `priority_places`
+  stayed at 3 while the member placed 615 more orders. XH5d-3a's guess (an
+  ALO refusal) is corrected there.
+- **With it** (1 HYPE staked, undelegated): 11 priority places over two
+  arm-B blocks, none refused, each resting. The charge is taken at
+  placement, on the resting notional, converted at HYPE's spot mark price:
+  the staking balance fell 0.00045 HYPE against the member's tally of
+  $0.0162 (≈ $35.6 a HYPE; the spot mid was $35.4), and a probe order
+  cancelled at once was charged too.
+- **What it settles.** The testnet runbook's §9.5 holds. `ab_mode` 2 on
+  mainnet still waits for its ruling (Q-XH5-5) and for HYPE staked on the
+  probe's master; the first run stays at `ab_mode` 0.
+- **Also seen** (a shared account only): the operator arm's shutdown sweep
+  logged `left=6`. It read the venue before the gateway's own shutdown
+  cancels of slot 6's orders landed; the gateway confirmed its sweep, and
+  the venue showed none open seconds later (A-S7-55, a follow-up on the
+  shutdown's order).
+
+**Gates:** unchanged — docs only, and no test reads these files.
+
+### XH5e-5 amendment (2026-10-04): the arming checklist's dead-man check follows O-XH4
+
+Anton's ruling (2026-10-04): §C12 follows O-XH4, "so the probe keeps
+quoting without the dead man's switch until the account qualifies". Docs
+only: no code, test or script changes.
+
+- **Why.** XH5e-2's §C12 halted unless `dm_availability` read `eligible`.
+  The venue refuses `scheduleCancel` until the address has traded
+  $1 000 000 (its words, kept in `tests/hl_gateway_loopback.rs`'s fixture:
+  "Cannot set scheduled cancel time until enough volume traded. Required:
+  $1000000."), and the probe's master is a fresh one (§A3), so the check
+  would have halted every boot. O-XH4 (the maker plan §8.11) rules the other way:
+  until the account is eligible, slot 6 quotes on the engine TTL (≤ 30 s,
+  LAW E-8), the boot sweep and the caps, and the gateway arms the switch by
+  itself once a probe is accepted.
+- **The check now** (§C12) reads the availability with the master's
+  lifetime volume (`portfolio`, `allTime` `vlm`). Below $1 000 000,
+  `unknown` or `refused` is expected and the probe keeps quoting; at or
+  above it, anything but `eligible` halts; `exhausted` (ten deadlines the
+  venue may have held passed unmoved today) halts at any volume. §D15 reads
+  it at every check, §E18 stops on the halting readings, the known-limits
+  note names the accepted risk, and the testnet runbook's §3 and §9 expect the same.
+- **The accepted risk,** unchanged from O-XH4: between a crash or a network
+  loss and the next boot's sweep, slot 6's quotes rest on the venue — at
+  most $300 resting and ±$150 a perp. A crash relaunches through launchd,
+  and the boot sweeps.
+- **No code change:** the gateway already probes, parks and arms this way
+  (XH4c's `deadman.rs`). Every boot starts at `unknown` and parks the switch
+  after three refused arms in a row, until the next boot or UTC day: three
+  refused probes at every boot and every UTC day, not XH4c's "three probes
+  a day, and one a restart". A refused boot clear takes the longest schedule
+  as held, so a master below $1 000 000 adds one counted trigger a boot;
+  the count restarts with the process, so restarts never add up to
+  `exhausted`.
+
+**Gates:** unchanged — docs only, and no test reads these files.
+
+### XH4i-1 amendment (2026-10-05): the gateway names outcome legs by their own coins — nothing wired, nothing armed
+
+Anton's word (2026-10-05): "Please do it" — XH4i, BIN15 (slot 3) off the
+blocking arm on the engine thread and onto a WebSocket order gateway of
+its own — with rulings Q1–Q4 (`claude/xmm-hl-xh4i-build-plan-2026-10-05.md`
+§0). This first cut teaches the gateway to name the legs it will see.
+Nothing builds such a gateway yet (XH4i-5 composes slot 3's), and slot 3
+stays on the blocking arm until Anton flips its transport.
+
+- **What changed.** `CoinMap::with_outcomes()` builds a coin map that,
+  besides the perps bound by name, resolves a HIP-4 leg's `#<enc>` to
+  `ASSET_BASE + enc`, read off the venue's own coin name
+  (`asset::asset_of_fill_coin`, S7-L1's helper: `#` and canonical digits
+  only, an id that fits `u32`). The gateway reads every coin through its
+  map — fills, `orderUpdates`, open-order rows, perp positions, the
+  sweep's hits — in place off the frame. On an outcome map a `#` name is
+  refused at `insert` (boot refuses): a leg is named by its coin alone.
+- **The spelling is measured, not assumed:** `#<enc>` in `userFills`
+  (2026-09-15, the asset table's namespace note) and in `orderUpdates` and
+  `frontendOpenOrders` (testnet, 2026-09-19, `#154150`: the watch log and
+  phase G's sweep in the vault's `outcome/data/testnet-exec-2026-09-19/`).
+- **LAW E-4 holds.** The id read off a coin reaches the venue one way
+  only: a sweep's `cancelByCloid`, by S7-L1's rule ("The live arm,
+  restart-proof", (C)): a cancel names an order the venue just listed as
+  ours, so a wrong id is a refused cancel, never another market. Inbound,
+  it identifies the leg of an event the venue reported. Places, modifies
+  and leverage changes take the arm's ids — the perps' `/info meta`
+  binding today; for slot 3, the roll binding (XH4i-3).
+- **Ownership is unchanged.** The sweep cancels only orders whose cloid
+  decodes as ours (LAW E-9) on this gateway's slots — a decision the coin
+  never enters; another slot's order and a stranger's on the same leg are
+  never cancelled (the loopback pins both).
+- **Slot 6 and HYPARB are byte-identical.** Every production map is built
+  `CoinMap::new()` (`xmm_live.rs`, `hyparb_live.rs`), which never takes the
+  outcome branch; gate 96b runs that map, unchanged (gate 99 drives the
+  arm's half and builds none).
+- **The sentinel edge.** `#4194967295` reads as `u32::MAX` — the value of
+  `ASSET_UNKNOWN` itself: an id no roll can bind, so the row is unmapped
+  and never cancelled (pinned on purpose). The ids just below it (enc
+  4 194 967 290 … 294) exceed any outcome id a roll can bind; at worst a
+  cancel the venue refuses.
+- **What XH4i-3 must hold before the arm trusts an event's asset** (the
+  risk review's notes, carried into the plan): a row's asset is set only
+  from the E-4 binding — never from a landed, adopted or snapshot row's
+  event, nor from settlement attribution; `ASSET_UNKNOWN` is ruled out
+  before `asset::kind_of`, which reads `u32::MAX` as an outcome id; and on
+  an outcome map the arm's `unlisted_order` cancels an unknown `#<enc>`
+  order of its own slot, which it skipped before — S7-L1 allows it, and
+  XH4i-3/-5 test it.
+
+**Gates (g2, 2026-10-05):** clippy clean; nextest 4 217/4 217 (+4 on
+`3ea326c`: the map's unit test, the two loopbacks below, gate 102 under
+nextest); alloc 111 (+1: **gate 102**, an outcome map's lookups at 0 B/op —
+a perp name, two legs, the refused spellings); copy-audit 28 baselined,
+0 new; license 663; release builds; replay 7× IDENTICAL; fmt clean. **Red
+first:** before the fix the three outcome tests failed — `ASSET_UNKNOWN`
+for `ASSET_BASE + 1941`, and the sweep STRANDED after 8 rounds with 8
+unmapped — while their perps-only halves passed.
+
+**Tests:** gateway.rs `an_outcome_map_names_legs_by_their_own_coins`;
+`hl_gateway_loopback.rs` `an_outcome_order_of_ours_is_swept_when_the_map_names_outcome_legs`
+(an outcome map: [read] [cancel ours alone, `{"asset":100001941,…}`]
+[read] → `SWEEP_CLEAR`, another slot's and a stranger's untouched; a
+perps-only map: no cancel, unmapped) and
+`outcome_legs_name_their_asset_in_every_stream_on_an_outcome_map`; bench
+gate 102. Reviews: risk, allocation and zero-copy APPROVE WITH NITS (round
+1); round 2 took the nits.
+
+### XH4i-2 amendment (2026-10-05): the spot read reports the outcome legs the account holds — nothing wired, nothing armed
+
+XH4i-4 judges slot 3's session bound at equity AT COST and reconciles its
+legs on the gateway as the blocking arm does (S7-L1 gap B;
+`recon::compare_booked`, `unreconciled_venue_legs`, `account_view`). This
+cut gives it the sheet's legs. Nothing consumes them yet, nothing builds an
+outcome map in production, and slot 3 stays on the blocking arm.
+
+- **What the spot read emits on an outcome map** (`CoinMap::with_outcomes`,
+  XH4i-1): before its end, one `EV_BALANCE` per `+<enc>` row with a
+  non-zero `total` — `asset` from `asset::asset_of_balance_coin` (`+` and
+  canonical digits, an id that fits `u32`), else `ASSET_UNKNOWN`; `sz_1e8`
+  = the holding (`total`); `px_1e8` = the venue's `entryNtl`, raw; slot and
+  `client_oid` the read's. The end's `oid` counts the rows and its `asset`
+  is `SPOT_LEGS_READ` (`ASSET_BASE`, the mark of a sheet read for legs).
+  The USDC figures of the end are unchanged.
+- **On a perps-only map nothing changes:** no row, `oid` 0, `asset` 0 —
+  slot 6 and HYPARB byte-identical (gate 96b's perps variant at its pins).
+  An outcome arm REFUSES an unmarked spot end (XH4i-4): a gateway that
+  never named legs could not have reported them, so its silence is not
+  "no legs held" — the hazard the E6 interlock exists for.
+- **Selection is recon's own:** a `+` row with a non-zero total, the test
+  `account_view` and `unreconciled_venue_legs` apply; a settled husk reads
+  as a missing row does in `compare_booked` (venue 0). `hold` is not
+  carried: every consumer reads `total`.
+- **Unparsable names are reported, never dropped:** `ASSET_UNKNOWN` matches
+  no bound leg, so an outcome arm counts it unseen and holds `reconciled`
+  back — the reading `same_leg`'s byte comparison gives the blocking arm.
+- **One valuation:** `recon::leg_cost_1e6(total, entryNtl)` — `entryNtl`
+  clamped to the holding ($1 a contract) and never below zero — is what
+  `account_view` now sums, and what an outcome arm sums over these rows
+  (every held row, `ASSET_UNKNOWN` included, as `account_view` counts it).
+  The events carry raw values; the clamp is the valuation's.
+- **Identification only.** A `+<enc>` id names a held leg; nothing is placed,
+  modified or cancelled with it (LAW E-4). S7-L1's cancel exception covers
+  the `#<enc>` names alone.
+- **XG-2.** At most one row per sheet row: 256 rows and the end fit the
+  read reserve (257, const-asserted); a sheet over 256 rows fails the scan
+  before any row goes out — never a partial read.
+- **What XH4i-4 must hold** (the risk review's): a row counts only for its
+  slot, its read (`client_oid`) and READ_SPOT; the rows are dropped when a
+  read is issued or fails; the read commits only when the rows taken equal
+  the end's `oid`, the end is marked, and it lists USDC; every held row is
+  compared (its leg bound) or counted unseen, and `ASSET_UNKNOWN` never
+  matches an empty slot; compare takes the first row of a leg, `total` at
+  ×1e6, as `compare_booked`; drift is confirmed over two reads; every sum
+  saturates.
+- **Gate 96b, outcome variant** (`hl_gateway_outcome_round_trip_allocates_only_rustls_record_buffers`):
+  the same turn and pins on an outcome map, the venue's orders, fills and
+  day's fills on `#1941` and its spot sheet holding `+1941` beside a husk
+  (`+1942`) and an unparsable `+0195`: five events a round name the leg,
+  the spot read emits two rows (the leg; `ASSET_UNKNOWN`) and a marked end
+  that counts 2, and the sweep's cancel names the leg — at rustls' exact
+  residue (A-S7-69 closed here, not in XH4i-5). Its counters are now one
+  per kind byte (`[u64; 256]`), so a new kind can never fold into another.
+
+**Gates (g1, 2026-10-05, on r2):** clippy clean; nextest 4 221 run (+4: the
+spot-read, balance-coin and leg-cost unit tests, gate 96b's outcome variant
+under nextest), 4 220 passed — the one failure `deribit_parsers_are_zero_alloc`
+under nextest's debug build (6 allocations), a test this cut does not touch
+— the same run's alloc gate passed it (release, 112/112) and it passed 10×
+re-run alone; its six allocations are an open investigation (A-S7-71), not
+closed as a flake; alloc 112 (+1: gate 96b's outcome variant; both
+variants at their exact pins); copy-audit 28 baselined, 0 new; license 663;
+release builds; replay 7× IDENTICAL; fmt clean. **Red first:** before the
+emission, round 1's `on_an_outcome_map_the_spot_read_reports_the_held_legs`
+failed — `(1, 0)` for `(3, 2)` — while its perps-only half passed.
+
+**Tests:** gateway.rs `on_an_outcome_map_the_spot_read_reports_the_held_legs`
+(raw negatives, a missing basis, no USDC, a full sheet of 256 legs);
+asset.rs `a_balance_coin_names_its_leg_by_the_same_rule`; recon.rs
+`a_leg_at_cost_is_its_basis_clamped_to_what_it_can_pay`; bench gate 96b's
+outcome variant.
+
+### XH4i-3a amendment (2026-10-05): the gateway arm's outcome mode — rows, rules, rolls and verbs; nothing wired, nothing armed
+
+The gateway arm learns BIN15's legs. Nothing builds an outcome arm in
+production yet (XH4i-5 composes slot 3's), and slot 3 stays on the
+blocking arm until Anton flips its transport. **An outcome arm must not be
+composed before XH4i-3b and XH4i-4:** today a fill on a leg is dropped as
+`fills_unresolved` (`perp_of_asset` finds no perp), and the account's worth
+is still the perp formula. Fills on legs, settlements and the snapshot rule
+are XH4i-3b.
+
+- **One roll reader, one binder (A-S7-77).** The `InstrumentRoll` reading
+  (`asset::roll_of`: a strict kind byte; a settled roll binds nothing; no
+  outcome is refused) and the both-legs binder (`AssetTable::bind_roll`:
+  ids, names and room checked before the first mutation; the NO leg's
+  ordinal guarded against a carry into the venue byte; a repeat of the live
+  roll retires nothing) moved out of `HlExchange::on_venue_event` into
+  `asset.rs`. The blocking arm calls them, and its roll tests hold its
+  behaviour, with one unreachable exception: a `bind` failure after the
+  precheck used to queue its E-8 sweeps and now queues none, since nothing
+  was rebound.
+- **`ArmCfg::outcomes`** stands alone: no perp and no leverage beside it
+  (`ArmErr::Outcomes`). A perps arm still needs a perp, and it reads no
+  roll. The mode's state — the 32-leg `AssetTable` and its counters,
+  ≈ 2.4 KiB — is the one allocation it adds, boxed once at boot; the arm
+  stays 1 792 B inline.
+- **LAW E-4 on the gateway.** A place or a modify takes its asset from the
+  roll's binding for the instance its client id names — the id's low 32
+  bits (`core_types::instance_of`), which BIN15 writes through its shared
+  `OID_INSTANCE_MASK`. **Only BIN15 may be composed on an outcome arm:**
+  another member's ids would name instances it never meant. A stale
+  instance is refused (`NoLiveRoute`, as the blocking arm answers) and is
+  the one refusal the streak counts (A-S7-74). A leg no roll bound is
+  refused uncounted. A modify must stay on its predecessor's leg.
+- **`OutcomeRules` checks and never rounds:** tick 1e-4, whole contracts,
+  a price in [0.001, 0.999], $1 of notional. These are the venue's
+  measured rules, as BIN15's grid states them; the member keeps to the grid,
+  so a refusal here is a bug and is counted. The cli holds BIN15's `GRID_*`
+  equal to these at compile time, and a sweep of every price around the
+  grid pins `Bin15Strategy::on_grid` and `OutcomeRules::check` to one
+  answer.
+- **The queue law is untouched.** A MAKER rests as ALO whatever its flags,
+  because BIN15 sends none (pinned on BIN15's Arm B orders). The replay
+  judges an order by the queue only when the post-only flag is set
+  (`core_fill::judged_by_queue`), so the live mapping never needs it
+  (pinned). An IoC is an IoC. A leg takes no reduce-only and bids no ALO
+  priority.
+- **No TTL on a leg (A-S7-73).** On the blocking arm BIN15's orders rested
+  until they were replaced or cancelled, and they still do. `expiresAfter`
+  rides on every place and modify, as on slot 6.
+- **A cancel names the asset its row's place named (A-S7-75)**, with no new
+  lookup. The order lives on that asset, so the cancel can only name our
+  own order. The blocking arm refuses the cancel of a rolled order and
+  leaves it to its E-8 sweep; this is the safer of the two.
+- **LAW E-8 on the gateway (A-S7-76).** A roll that retires a leg cancels
+  every row of ours on it the venue may hold — sent, resting, in doubt or
+  thought gone, YES or NO — except one already filling or one whose cancel
+  is out; a full ring keeps the cancel as intent. Every such row, the one
+  whose cancel is out included, is marked `RB_RETIRED` (A-S7-78): when the
+  venue answers "not found" about an order that still rests, the read that
+  lists it brings the row back and sends the cancel again, as for a
+  member's own. The roll also reads the orders at once. Three qualifiers:
+  - Anything else of the slot's left on the old leg is listed and
+    `unlisted_order` cancels it under the venue's own name (S7-L1) **only
+    once slot 3's gateway is built `with_outcomes` (XH4i-5)**. Before that
+    the row reads `ASSET_UNKNOWN` and is counted, not cancelled.
+  - After boot, an order the arm does not hold also pins the drift, so the
+    router halts the slot.
+  - The sweep is slot-masked; the blocking arm's sweep names `ALL_SLOTS`.
+    One arm is one slot, and only slot 3 trades legs.
+- **The owner** of a leg (what a settlement is attributed by, XH4i-3b) is
+  learned from our own accepted orders, never from a roll or a fill, as on
+  the blocking arm. One arm is one slot and its table is its own, so no leg
+  can be contested: `debug_assert!`, not the blocking arm's
+  `owner_contested` count (A-S7-79).
+- **Rows** carry the asset and symbol their command named. On slot 6
+  these are the same `cfg.perps[p]` values its reads took before, so slot 6
+  is byte-identical.
+- **BIN15's client ids can fall in the arm's internal ranges.** Its null
+  arm sets bit 63, and a sequence with bit 13 set sets bit 62, so for
+  example `READ_OID_BASE | outcome`. An order's answers carry a command kind
+  and internal posts carry none, so the order is routed as an order
+  (pinned).
+- **Allocation (A-S7-80).** The outcome mode's per-order and roll paths
+  allocate nothing by construction (reviewed). Its 0 B/op gate comes with
+  its fills in XH4i-3b, and covers the roll binder both arms now share.
+  Gate 98 runs the perps mode.
+- **What XH4i-3b must hold** (the risk review's): an outcome fill resolves
+  by its row first — the asset and symbol `track` stored — cross-checked
+  against the event's asset; the previous generation (`sym_of_asset_gen`)
+  only when a previous name is held, and `book_qty` on the current
+  generation only; `ASSET_UNKNOWN` is ruled out before `kind_of`, and
+  `perp_of_asset` is never asked in the outcome mode. A settlement is the
+  foreign slot's `REASON_SETTLEMENT` with no client id: booked
+  (`FILL_FLAG_SETTLEMENT`, the venue's `order_id`, the slot stamped) only
+  when `owner_of_sym` is this slot, otherwise counted unowned; the perps arm
+  is unchanged. The snapshot rule (A-S7-72): the gateway emits the first
+  snapshot's rows only on outcome maps, flagged, their tids admitted; the
+  arm books them once, on bound legs; XH4i-4 never seeds the ledger from the
+  sheet. A late fill that crosses a roll books against its row's retired
+  leg.
+
+**Gates (s8-3a-g4, 2026-10-05, on r2):** clippy clean; nextest 4 232 run
+(+11 over XH4i-2: nine arm.rs outcome tests, the rules test, the cli grid
+sweep), 4 232 passed — the userws loopback flake (A-S7-34) failed once on
+g3 and passed on its re-run; alloc 112; copy-audit 28 baselined, 0 new;
+license 663; release builds; replay 7× IDENTICAL (BIN15 included); fmt
+clean. **Red first:** against the scaffolding
+(`s8/c3a-red.sh` red4), the roll, maker, refusal, E-8, modify and id-range
+tests failed while the stand-alone, rules and blocking-arm roll tests
+passed; round 2's `an_e8_cancel_answered_not_found_goes_again_when_a_read_lists_the_order`
+failed — "the owed cancel goes again" — before `RB_RETIRED` (`s8/c3a2-red.sh`
+red1).
+
+**Tests:** arm.rs `the_outcome_mode_stands_alone`,
+`a_created_roll_binds_both_legs_and_nothing_else_does`,
+`an_outcome_maker_with_no_flags_rests_as_alo_on_its_bound_leg`,
+`outcome_orders_refuse_a_rolled_or_unbound_instance_and_an_off_grid_price`,
+`a_roll_cancels_our_rows_on_the_leg_it_retires_and_reads_the_orders`,
+`an_e8_cancel_answered_not_found_goes_again_when_a_read_lists_the_order`,
+`an_e8_sweep_cancels_every_row_on_the_retired_legs_and_nothing_else`,
+`an_outcome_modify_stays_on_its_leg_and_never_crosses_a_roll`,
+`an_order_whose_id_falls_in_the_arm_s_own_ranges_is_still_an_order`;
+rules.rs `an_outcome_leg_is_checked_never_rounded`; cli
+`bin15_s_grid_test_and_the_outcome_rules_agree` and `bin15_boot`'s
+compile-time agreement; strategy-bin15's no-flag pin in
+`arm_b_quotes_the_bid_and_asks_only_against_inventory`; the blocking arm's
+roll tests (exchange.rs) unchanged.
+
+### XH4i-3b-1 amendment (2026-10-05): the outcome mode's fills and settlements — nothing wired, nothing armed
+
+The gateway arm's outcome mode books fills on BIN15's legs by the blocking
+arm's rules (`route_frame`), read off the gateway's events (their tids
+admitted there). An outcome arm still must not be composed: XH4i-3b-2 (the
+first snapshot's rows; the outcome mode's 0 B/op gate) and XH4i-4 (the
+account's worth) come first.
+
+- **Ours resolves by its row** — the leg and the asset its place named —
+  and must name that asset: a fill for our cloid on another asset is
+  counted (`fills_mismatched`, and `fills_unresolved`), never booked or
+  joined. One whose row is gone resolves by its asset
+  (`AssetTable::sym_of_asset_gen`): the live generation, or the one a roll
+  just retired. `ASSET_UNKNOWN` (a map built without `with_outcomes`) names
+  no leg, so such an arm fails closed, counted; `perp_of_asset` and
+  `kind_of` are never asked in the outcome mode.
+- **One generation back, by asset.** `AssetSlot` keeps the asset a roll
+  retired (`prev_asset`, in the slot's former padding: still 64 B), read
+  only where a roll moved the slot (`prev_coin_len != 0`; asset 0 is a real
+  perp). The current generation answers first, and two answers are none —
+  `sym_of_coin_gen`'s rules.
+- **The ledger** (`book_qty`, ×1e6) is credited only by a fill on the live
+  generation that the member was handed — after the push, as the blocking
+  arm (a dropped fill is not a position; the drift shows it). A fill on a
+  retired generation still reaches the member on its leg — under the
+  member's client id, or a settlement's venue order id — and is counted
+  (`fills_old_gen`).
+- **A settlement** is the venue's row: no cloid, so the gateway names no
+  slot (`SLOT_FOREIGN`), `REASON_SETTLEMENT`, client id 0. It is booked only
+  when the leg's owner — learned from our own accepted orders, surviving a
+  roll — is this slot: flagged `FILL_FLAG_SETTLEMENT`, under the venue's
+  order id, the slot stamped; on the live generation it debits the ledger
+  like a sale. Otherwise it is counted (`settlements_unowned`), never
+  guessed. A cloid-less row that is no settlement stays another's
+  (`fills_foreign`). The gateway names a row with no cloid and a
+  stranger's alike (`owner()`), so this test cannot tell them apart where
+  the blocking arm reads `cloid.is_none()` — moot, since the venue's
+  settlement rows carry no cloid. The perps arm is unchanged: every row of
+  another slot, a settlement included, is `fills_foreign`.
+- **Refused, as the blocking arm's `to_fill` refuses:** a negative price,
+  or a size under one engine unit (`fills_refused`). A price of 0 — a losing
+  leg's settlement — is booked.
+- **Fees** stay the slot's `EV_FILL_META` sum; a settlement's meta carries
+  no slot and is not summed.
+- **Not yet (XH4i-3b-2).** The gateway absorbs the process's first
+  snapshot, so fills on legs made before the boot are not booked. A-S7-72's
+  rule — that snapshot's rows emitted on outcome maps only, flagged, their
+  tids admitted; the arm books them once, on bound legs; XH4i-4 never seeds
+  the ledger from the sheet — lands there, with the outcome mode's 0 B/op
+  gate (A-S7-80), which is not deferred again: a gate-98 outcome variant
+  driving every branch of `on_leg_fill` (ours live, ours after a roll, ours
+  with its row gone, a mismatch, `ASSET_UNKNOWN`, a refusal, an owned and an
+  unowned settlement, a foreign row), the verbs and the shared roll binder.
+- **Found, not changed — and a precondition (A-S7-81).** A repeat of the
+  live roll rebinds both legs in place: it zeroes their ledgers and
+  overwrites the previous generation (`prev_coin`, now `prev_asset`) with
+  the live names — on the blocking arm today too. The venue sends
+  `outcomeCreated` once (probed 2026-09-26), but a replayed engine ring
+  entry could repeat it. This cut leans on that memory: after a real roll,
+  `prev_asset` is the only way from the retired asset to its leg, so a
+  repeat before the old instance settles drops its settlement — and any
+  late fill of ours whose row is gone — as `fills_unresolved`, and the
+  member keeps a position that has settled; the zeroed ledger reads as
+  drift until the next roll (a halt, or `reconciled` false: safe, but
+  disruptive). Fills whose row is still held are unaffected. The fix —
+  `bind_roll` leaves a repeated leg untouched — changes the blocking arm,
+  so it waits for Anton's word (raised 2026-10-05); if he declines, the
+  gateway arm guards repeats on its own. **It is a hard precondition for
+  XH4i-5, the C7 flip and any live re-arm of BIN15.**
+
+**Gates (s8-3b-g2, 2026-10-05, on r2):** clippy clean; nextest 4 238 run
+(+6 over XH4i-3a's 4 232: five arm.rs fill tests and the asset.rs
+generation test), 4 238 passed; alloc 112; copy-audit 28 baselined, 0 new;
+license 663; release builds; replay 7× IDENTICAL (BIN15 included); fmt
+clean. **Red first:** against stubs (no
+`sym_of_asset_gen`, no outcome fill path), the four arm.rs fill tests and
+the asset.rs generation test failed — "the fill", "the late fill", "the
+settlement", `fills_mismatched` 0 for 1, `None` for `Some((4096, true))` —
+while the round-1/2 outcome tests passed (`s8/c3b-red.sh` red1).
+
+**Tests:** arm.rs
+`an_outcome_fill_books_on_its_row_s_leg_and_credits_the_live_ledger`,
+`a_fill_on_a_retired_generation_reaches_its_leg_but_not_the_successor_s_ledger`,
+`a_settlement_books_only_for_the_slot_whose_order_the_venue_accepted`,
+`outcome_fills_that_name_no_leg_or_another_leg_are_never_booked`,
+`a_refused_leg_fill_books_nothing_and_a_live_settlement_debits_the_ledger`;
+asset.rs `a_leg_is_found_by_its_asset_in_either_generation`.
+
+### XH4i-3b-2a amendment (2026-10-05): the outcome mode's 0 B/op gate (gate 103) — nothing wired, nothing armed
+
+The gate the allocation review asked for in XH4i-3a and bound in XH4i-3b-1
+(A-S7-80) lands first in XH4i-3b-2, as its conditions require. No
+production code changes; the arm's module doc names the gate.
+
+- **Gate 103** (`hl_gateway_outcome_arm_is_zero_alloc`): an outcome arm on
+  slot 3 (no perp, no leverage, the slot's own account) booted through the
+  duplex by a scripted venue that answers every command at once, then
+  40 000 rounds under the counting allocator. Each round:
+  - a roll: the next instance binds both legs and the last one's retire,
+    through the binder both arms share — the E-8 cancel of the MAKER still
+    resting there, and the orders read at once;
+  - a fill on the retired generation for that MAKER (its row held: no row
+    closes unseen in the gate, `gone_ms` 60 s) and one for the last round's
+    IoC on its NO leg (its row gone: one roll back by asset);
+  - a MAKER on YES and an IoC on NO with BIN15's client ids and no flag,
+    answered resting (the owner noted; the scripted venue rests the IoC so
+    it can be cancelled);
+  - one refusal of each kind: a stale instance, an unbound leg, an
+    off-grid price;
+  - a modify of the MAKER and a cancel of the IoC;
+  - every other branch of `on_leg_fill`: ours on the live generation, a
+    mismatched asset, `ASSET_UNKNOWN`, a refused fill, an owned settlement
+    (a sale of the holding), an unowned one (a family no order of ours
+    trades), another slot's row.
+
+  Fifteen paths — the outcome counters, the arm's fill counters, and the
+  modifies and cancels done — must each run at least 99 % of their scripted
+  count inside the window. Exact counts are not asserted: at this pace the
+  arm's own gates refuse an occasional round's verbs (about 10 rounds in
+  40 000, measured; not yet attributed — the risk review reads it as the
+  stale-budget refusal, intended throttling that never halts). The budget
+  read answers $1M traded, so the budget never nears its floor.
+- **Still XH4i-3b-2b:** the first-snapshot rule (A-S7-72). Gate 103 then
+  drives the snapshot's rows too. When XH4i-4 refuses an unmarked spot end,
+  the gate's `READ_SPOT` answer must carry `SPOT_LEGS_READ` (it would fail
+  loudly at boot otherwise).
+
+**Gates (s8-3b2a-g3, 2026-10-05, on r2):** clippy clean; nextest 4 239 run
+(+1: gate 103 under nextest), 4 239 passed; alloc 113 (+1: gate 103);
+copy-audit 28 baselined, 0 new; license 663; release builds; replay 7×
+IDENTICAL; fmt clean. Gate 103 alone (release, serial) passed in run3; the
+exact-count attempt (run2) fell short by about 10 rounds in 40 000, hence
+the 99 % floor.
+
+**Tests:** bench gate 103.
+
+### XH4i-3b-2b … XH4i-7 amendment (2026-10-06): BIN15 (slot 3) can run on its own gateway arm — composed, refused where unsafe; the default stays blocking, nothing armed
+
+Session 9 lands the rest of XH4i's code in one commit (Anton: implement
+everything, then one gates run and one combined review). Slot 3 can now be
+put on the WebSocket gateway arm's outcome mode by its artifact
+(`transport = "gateway"`) and `--arm-live 3`. Until Anton flips it
+(R-XH4-7), slot 3 stays on the blocking arm, and nothing here runs.
+
+- **A-S7-83 — a repeat of the live roll is left alone** (gateway arm only):
+  - both legs already bound to the ids the roll names → no rebind, counted
+    `rolls_repeated`;
+  - a rebind would zero the legs' ledgers (a drift halt) and overwrite the
+    generation the last roll retired;
+  - the shared binder's own fix (A-S7-81, Q5) stays Anton's decision; the
+    blocking arm keeps the bug until he rules.
+- **XH4i-3b-2b — the first snapshot's legs:**
+  - on an outcome map only, the process's first `userFills` snapshot emits
+    the legs' rows of the last 25 h, flagged `EVF_SNAPSHOT`, with no fee;
+  - only freshly admitted tids are emitted; at most a quarter of the event
+    ring, and the rest is counted (`snapshot_kept`; the arm's drift then
+    halts the slot);
+  - slot 6's perps maps are unchanged;
+  - the arm books each row once, on a bound leg;
+  - a row whose leg no roll has bound yet is **parked** (256 at most;
+    `snapshot_parked`) and booked when the roll binds — the snapshot can
+    beat the ingress's boot roll (risk review r1).
+- **XH4i-4 — S7-L1 parity:**
+  - the spot read's leg rows are compared with the ledger; a drift needs
+    two reads; a held leg no live binding names is unseen;
+  - an unmarked or miscounted end is a failed read;
+  - worth = USDC + perps + the legs at cost;
+  - agreement (`reconciled`) needs the legs to agree and a fresh spot read;
+  - the ledger is never seeded from the sheet (A-S7-72).
+- **XH4i-5 — composition, boot and refusals:**
+  - `impl OrderDispatch for Option<D>`: `None` refuses every verb
+    (`NoLiveRoute`) and answers every hook as the defaults do;
+  - every shape is composed `SlotSplit(3, <shape>, Option<arm>)` innermost.
+    With no gateway arm, its slot is `exec_router::NO_SLOT` (0xFE: no slot,
+    and not `STRATEGY_ID_NONE`). The sixteen compositions stay sixteen;
+  - core-config no longer demands the perp pair on a live gateway slot; the
+    boot judges it by the slot's role: slot 6 must state it, and slot 3 must
+    not (a perp slot's every order must be on a linear row);
+  - `exec_boot` refuses slot 3 on its gateway:
+    - beside slot 6 on its gateway (**A-S7-85**: one gateway arm an engine
+      until the report is per slot and the two gateways split the rate
+      shares — the follow-up);
+    - beside any live slot of the operator's blocking arm (**A-S7-89**: one
+      master, one arm — this replaces slot masks on the blocking arm's
+      sweeps and fills);
+  - testnet market data beside a mainnet-only arm is refused for slot 3 as
+    for slot 6 (risk review r1);
+  - the boot (`cli::bin15_live`):
+    - the operator's account (`HYPERLIQUID_*`), the market data's network
+      and the venue's own host (LAW E-4);
+    - `own_account`; leverage 0; `outcomes`; `CoinMap::with_outcomes`;
+    - reads every 30 s; the stale floor at least 300 s (**A-S7-91**: a held
+      leg of the retired instance reads unseen until it settles);
+    - `expiresAfter` 5 s (**A-S7-86**);
+    - the session anchor in `bin15-pnl-anchor-<network>.state` (**A-S7-84**:
+      a new session at the flip — the blocking arm's anchor measures
+      another worth);
+    - top-ups on the blocking arm's `exec-topup.state` day (one governor a
+      master's day), their cost added back (Q3);
+    - thread `hl-gw-bin15` on core 12;
+  - the gateway report carries the outcome mode's seventeen counters, on
+    `/metrics` (`engine_exec_hlgw_outcome_*`), not `/state` (**A-S7-87**);
+  - the shutdown tell is `bin15-gateway-shutdown.tell`.
+- **XH4i-6 — BIN15 learns its order events** (Q1):
+  - a late `REJECTED` of a reprice restores the quote as it stood;
+  - a refused fresh quote frees its side and re-quotes at the next price;
+  - a refused coverage IoC is written off, so the entry retries;
+  - a `CANCELED` of a pending quote frees its side (no phantom restore).
+    The undo arrays have cache lines of their own;
+  - **the arm** (risk review r1, MAJOR): a replacement the member cancelled
+    before the venue refused the modify → its original, resting on, is
+    cancelled too, never left untracked;
+  - replays are neutral: no order event reaches BIN15 off a gateway arm,
+    and BIN15 never sets `ORDER_FLAG_POST_ONLY`.
+- **XH4i-7 — the code half of the flip:**
+  - **A-S7-47 fixed (A-S7-88):** a family adopts by its deployer. The `out`
+    family takes rows with `venue == "out"` alone, and a native family takes
+    rows naming no venue. The venue's registry maps one name to one
+    deployer (2026-10-06: `0x0c46…819e` mainnet, `0x295b…d33f` testnet). A
+    venue that is no string, empty or too wide is a stranger's;
+  - two instances expiring together are adopted by no family — at boot and
+    rediscovery (dormant), and on a push (counted unmatched);
+  - `scripts/bin15-flip.sh live --gateway` writes the gateway section and
+    checks the binary carries XH4i-5 and that `ARM_LIVE` holds slots 0 and
+    3 alone. It archives both anchors on every flip.
+- **Not built here:**
+  - per-slot reports;
+  - the rate-share split;
+  - a loopback with slots 3 and 6 together (A-S7-85);
+  - E3's `+154150` leg sale and the testnet outcome battery (operational
+    steps).
+- **Preconditions for Anton's flip:** Q5 (A-S7-81) and the battery.
+
+**Reviews (one combined round, frozen `review-xh4i-s9-r1`):**
+- **Risk: REQUEST CHANGES** — one MAJOR (the stranded original) and MINORs:
+  the snapshot's race, the push tie, a non-string venue, slot 3's network
+  rule, the stale floor, the flip's preflight, a phantom restore, the test
+  gaps. All fixed.
+- **Allocation: APPROVE WITH NITS** — the undo arrays' alignment, gate
+  coverage (gate 103's legs, repeats and report; the bin15 gate's refusal
+  and cancel), `LegRead` resets, a reference scan. All fixed.
+- **Zero-copy: APPROVE WITH NITS** — stale COPY notes, the counters' copy
+  (now borrowed), the leg saves noted, the audit's directories (+
+  `bin15_live.rs`, `strategy-bin15`). All fixed.
+
+**Gates:** s9-g2 (2026-10-06, 04:04Z): clippy clean; nextest 4 252 run, 4 252 passed
+(9 skipped; +13 since `d6078ce`); alloc 113 (gates 103, 99 and the bin15 gate
+extended); copy-audit 28 baselined, 0 new (its directories + `bin15_live.rs`,
+`strategy-bin15`); license 663 (`bin15_live.rs` counts from the commit);
+release builds; replay 7× IDENTICAL; fmt clean. The run before the review's
+fixes (s9-g1) was green too (nextest 4 250).
+
+**Tests:**
+- exec-hyperliquid:
+  - the repeat roll;
+  - the outcome leg reconciliation, including the miscounted end;
+  - first-snapshot rows waiting for their roll;
+  - the refused reprice whose replacement was cancelled;
+  - an unknown order of the slot on a leg;
+  - the first snapshot handed to the arm (gateway).
+- cli:
+  - `slot_three_runs_on_a_gateway_arm_of_its_own_alone`;
+  - the perp-pair rules;
+  - the composition test (a roll through router and split; an absent arm).
+- core-config: the perp pair left to the boot.
+- strategy-bin15: the late refusals and the cancel.
+- ingress-hyperliquid:
+  - the venue kept, stranger and null;
+  - the deployer clause and the tie;
+  - the push venue, borrowed.
+- bench: gates 103 (+ legs, repeats, report), 99 (the engine's composition)
+  and the bin15 gate (+ refusal and cancel).
+
+### XH4i-8 amendment (2026-10-08): the outcome battery — slot 3's gateway arm on testnet HIP-4 (an operator tool; nothing armed)
+
+- **Anton's ask (2026-10-08):** "sell E3's leftover +154150 leg on testnet,
+  then run the outcome test battery on testnet HIP-4." The leg was sold
+  first (09:34:43Z, `exec-smoke --fill`: 25 at 0.39583); E3 holds no leg.
+- **`exec-smoke --hl-outcome --lifecycle --outcome <id> [--outcome-usd N]`**
+  (`cli::outcome_battery`): slot 3's arm in its outcome mode and its
+  gateway, built as `bin15_live` builds them but on E3's TESTNET account
+  (`own_account = false`), driven as the engine drives it. Testnet only:
+  the host and the network are checked, and the exec-smoke binary reads
+  `HYPERLIQUID_TESTNET_*` alone. No arming switch: the wrapper is the only
+  way in.
+- **A-S7-92 — a stated outcome:** testnet has no recurring `out` family (its
+  `out` outcomes are dated and past), so the operator states the outcome and
+  the battery feeds the roll the ingress publishes (family 0's YES symbol,
+  `pack_roll_seq`). LAW E-4 holds: the legs bind from a roll alone, and no
+  id is derived. Prices come from the outcome's own book, read before each
+  step (A-S7-94).
+- **What stands in for the router:**
+  - every bid is sized at its own price to the stated notional (2 ..= 25
+    USD) and refused locally above it plus a contract; a sale is sized by
+    what this run holds and only shrinks it, so no bound refuses it;
+  - growth stops at the first halt word — a drift, an unknown order of the
+    slot, the gateway's halt, the budget floor, an asset-refusal streak
+    (`xmm_battery::Drive::halt_word`, shared with the perps battery, whose
+    halt gains the budget floor and the asset-refusal streak here; not the
+    reject streak, which the batteries provoke on purpose);
+  - the start refuses a held HIP-4 leg, a perp position or an order of slot
+    3 (A-S7-93), and USDC under four times the stated notional ($20 at
+    least);
+  - a take goes out only when the bid can buy it back whole, three steps
+    deeper, within the venue's $1 minimum; a sale never steps under the
+    price that keeps it;
+  - the end cancels everything, sells what this run holds — the smaller of
+    the venue's `+<enc>` total and this run's own fills, after the boot's
+    first agreement only — shuts the arm down (its sweep, the dead man's
+    clear) and reads the account: any HIP-4 leg or slot-3 order left exits
+    48, the loudest.
+- **This run's rows only:** fills, positions and spellings count slot 3's
+  cloids whose client-id sequence the run issued (above its start, at most
+  its last) — never the first snapshot's rows or a co-signer's.
+- **A-S7-96:** the arm books its slot's first-snapshot rows of the last day
+  and an hour on the legs a roll binds (BIN15's instances live a day at most).
+  On an older outcome a leg bought before that window and sold inside it books
+  a short the venue does not hold, and the legs never agree: the battery runs
+  on an outcome the account has not traded in the window (15415 was sold
+  09:34Z, so the run uses 21406).
+- **The dead man:** E3 has traded under the venue's $1 000 000, so
+  `scheduleCancel` is refused there (O-XH4, A-S7-57): the battery reports
+  `dm_refused` and the availability word, and does not fail on them.
+- **The run:**
+  - the verbs on YES — a rest, a reprice, a crossing modify (refused
+    `BAD_ALO_PX`; the original's fate recorded), a cancel, a crossing place
+    (refused);
+  - a quote on the NO leg, cancelled;
+  - IoCs — a miss, a take and its sale — each reconciled on two spot reads
+    of the legs after it;
+  - the cancel-all word;
+  - measured: the legs' `#<enc>` spellings on the open orders read and on the
+    tap's `orderUpdates` and `userFills`, and the arm's outcome counters.
+  - Exit codes 40–48 (A-S7-95).
+- **Shared, not copied:** `xmm_battery`'s `/info` reader (slot-generic now,
+  with `spot` and `budget_left`), its tap and its driver (`Drive::new`).
+
+**Reviews (one combined round, frozen `review-xh4i8-r1`; a re-verification on
+`review-xh4i8-r2`):**
+- **Risk: REQUEST CHANGES**, then fixed:
+  - MAJOR: the crossing modify and place were sized at the lowest resting
+    price (on a wide book, many times the stated notional) — each order is
+    now sized at its own price and every bid bounded;
+  - MAJOR: a take the bid could not buy back within the venue's $1 minimum
+    (a stranded leg, exit 48 on every later run) — the take now goes out only
+    when it is sellable, and a sale never steps under the minimum's price;
+  - the re-verification's MAJOR: the bound refused sales — a sale only
+    shrinks, so it is exempt;
+  - MINORs: sales sized by the venue and this run's fills, after the first
+    agreement only; every `+` leg counted at the end; the miss judged
+    (`IOC_MISS`); this run's rows only (a sequence the run issued); the
+    cancel verb on a fresh quote; the halt word widened; USDC scaled; the
+    flags' conflicts; the leftover message.
+- **Allocation and zero-copy (one reviewer, a cold change): APPROVE WITH
+  NITS**, then fixed: a book in range or an error (never an empty book read
+  off a bad answer); the duplicated helpers moved onto `Drive`; the tap
+  labelled, `finish` returning its gap; `spot_rows` pinned by a test; the
+  budget's arithmetic saturating; the doctrine line naming what allocates.
+- Deferred (A-S7-100): an end-to-end E-4 submit test from the cli (the arm
+  refuses submits until its gateway readies it; exec-hyperliquid's own test
+  covers the lookup) and a loopback `run()`.
+
+**Gates:** s10-g3 (2026-10-08, 10:43Z): clippy clean; nextest 4 261 passed (9
+skipped); alloc 113; copy-audit 28 baselined, 0 new; license 664 (+1, the new
+module); release builds; replay 7× IDENTICAL against main's release binary on
+the 10-07 20:16Z hour (A-S7-98: the 10-04 root rotated out); fmt clean.
+
+**Testnet (10:43:39–10:44:46Z, this tree's release binary, outcome 21406,
+$5): PASS, the bar met.**
+- Verbs 3/0, `BAD_ALO_PX` 2/0 (the refused modify's original ended
+  CANCELED / `CANCEL_REQUESTED` within 3 s), NO leg 1/0, IoCs 3/0 (the miss
+  REJECTED / `IOC_MISS`), sweep 1/0, clean reconciliations 2/0, fills 2.
+- This run's rows name the legs `#<enc>`: openOrders yes; `orderUpdates`
+  YES 13, NO 4; `userFills` YES 2; another coin 0.
+- The arm: one roll, 7 leg reads, none drifting or unseen, no settlement, no
+  unresolved fill, the shutdown confirmed; the dead man refused (5) on E3, as
+  O-XH4 expects; fees $0.0065.
+- Nothing left on E3. Its address budget read 2 637 requests left (the
+  start needs 2 000).
+
+## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
+
+`crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall
+options (`HcExchange`). It is **not armed by the engine**:
+`exec_boot` refuses any live slot naming `hypercall`, and its refusal
+names what slot 7's live-arming ruling must settle first:
+
+1. **An options row in the E6 ledger.** Its exposure clamp values HIP-4
+   binaries (Σ|yes−no|, $1 a contract). An option SELL is an unbound leg
+   that adds nothing, so a short option would pass `cap_instance` unseen.
+2. **An HL account whose perps are reconciled, for slot 7's hedges.**
+   The operator arm reconciles `spotClearinghouseState`, not perps.
+   HYPARB's answer was its own wallet plus a `clearinghouseState` recon
+   (O-HL3).
+3. **The two-venue composition.** `VenueSplit`, the venue-keyed twin of
+   `SlotSplit`, exists since the Binance lane's BX3 (Hyperliquid +
+   Binance; merged 2026-09-26); a Hypercall boot branch over it lands
+   with that ruling.
+
+What drives the arm today is the operator's `hypercall-live` verbs
+(`scripts/hypercall-live.sh`, zsh). There is no testnet, so every live
+proof is a mainnet micro-step:
+
+| verb | effect |
+|---|---|
+| `status` | read-only |
+| `simulate` | `POST /risk/simulate/orders`, never mutates |
+| `recon` | read-only |
+| `dust --symbol S [--price P --size Q] --confirm` | places one `book_only` GTC bid, 0.000001 @ $0.0005 by default; cancels it by client id; reconciles. PASS needs all of: the place accepted; the cancel answered CANCELED with nothing filled; no fill on the socket; and a reconcile afterwards that agrees on every leg, finds nothing of ours open, and leaves the symbol's position unchanged. It refuses to send while orders of ours are already open. When a place's fate is unknown (a 5xx, a 429, an unreadable answer, or no answer) it takes the order back by client id and reconciles. |
+| `cancel-all --confirm` | cancels every order of ours that the venue lists |
+
+- **Writes need `--confirm`**, else exit 2. This is the HYPARB L1 precedent: a session builds the verbs and runs only the reads, and **an order on mainnet is the operator's to send**.
+- **Keys:** the verbs read `HYPERCALL_WALLET` (the owner, an address only) and `HYPERCALL_AGENT_KEY` (the signer, `SecretKeyBytes`, mlock'd) from the environment. The script sources the repo `.env`, or `HYPERCALL_ENV_FILE`. The binary never opens it.
+- **Signer:** `owner_signs` says whether the owner's own key or an approved agent signs.
+
+The arm's laws, which bind the verbs now and the engine later:
+
+* **E-1.** A failure is a refusal, counted, and never a modelled fill.
+* **E-3 / D7.** Every write body (`POST /order`, `PUT /order`, `DELETE /order_cloid`) is rendered IN PLACE into the `HttpsReq` body window. The EIP-712 struct hash is taken over that body's own spans (HC8). Price and size are rendered once, as 6 dp with trailing zeros trimmed.
+* **Fail closed.** An acceptance requires all of:
+  * HTTP 200;
+  * a body that is one well-formed object;
+  * a UNIQUE top-level `status` in {ACKED, OPEN, PARTIALLY_FILLED, FILLED};
+  * a top-level integer `order_id`.
+
+  A `REJECTED` at 200 is a refusal and keeps its reason. `CANCELED` with nothing filled is an IoC miss: not a reject streak, the E7-F2 lesson. A 401/403 is `SignerRejected`. The fuzz target is `hypercall_response`.
+* **IoC only.** The engine's maker (kind 0) is POST-ONLY and the venue has no post-only time in force (`gtc | ioc | fok`), so `submit` refuses it — a `gtc` would cross, and paper and live would disagree. The verbs' resting order is `place_resting` (`gtc` + `book_only`, priced where nothing can cross).
+* **A refused cancel is not a gone order.** Only an explicit "not found" releases the row; any other refusal (a used nonce, a 4xx, a 5xx, an unreadable answer) keeps the order WORKING, and `cancel_all_state` reads Working until the venue confirms. A `success:true` whose order is still working is not a cancel.
+* **E-5.** The HTTP answer is the ACK. The private socket's `Fill` is the FILL. The socket is separate from the data lane (D1), unsigned `Authenticate` of the OWNER wallet, then `fills` + `order_updates`, both confirmed (`Subscribed`) before the socket counts as up; an `Error` on it forces a reconnect. Liveness is a pump that read without error (the venue pings every 20 s). Fills are deduped by `fill_id`, attributed to the slot and to the member's `client_oid` through the ACK table, and handed out by `try_next_fill` from the arm's own queue (the HyparbLive precedent, so no engine fill lane).
+* **E-9.** `client_id` is 32 hex characters: `HC`, version, slot, `client_oid`, and an FNV check. An id not of that shape is not ours, and the sweep leaves it alone.
+* **Reconcile.** `GET /portfolio`, `/orders?status=open` and `/fills` run once a minute on the idle path. The first adopts the venue's positions; each later one compares them and reports drift and unseen legs in `HaltSignal`. Every read refuses an unreadable body; none reads an empty book.
+* **The rate governor.** It enforces the Default tier as a SLIDING 60 s window on the monotonic clock, assuming one venue replica:
+  * places stop at 90 % of 60 orders and 600 requests;
+  * cancels are exits and pass up to 120 cancels and 600 requests, even during a 429 back-off (5 s; `Retry-After` is not read — `HttpsReq` returns no headers).
+* **Nonces.** The wall clock in ms — `max(now_ms, last + 1)` — below 2^53 (the SDK's JS `Number`), never on a zero clock. MEASURED: the venue bounds the nonce by its own command clock in ms; the first dust smoke, signed with `ms × 1000`, was refused "nonce … is outside time bounds for signer … (command_ts=<ms>)" with its signature accepted (fix `84fc32b`).
+
+- **Gates:** unit and TLS-loopback tests, fuzz `hypercall_response` and `hypercall_userws`, alloc gate 84 (render + sign + scans at 0 B/op), and `make copy-audit` over the crate.
+- **Deferred:** MMP, because SDK 0.1.0 has no `SetMmpConfig` field order. RFQ, because S1 routes `best_execution`.
+- **Mainnet proof, 2026-09-26 (operator, after the nonce fix):** `dust --symbol BTC-20260927-83000-P --confirm` PASS — an agent (`0x97f4…19ee`) signing for the owner wallet (`0x4479…5644`, $5 USDC), the `book_only` bid accepted (order 31965), cancelled by client id (`CANCELED`, nothing filled), 3 order updates on the private socket, the reconcile agreed before and after, 0 fills, 0 orphans. The owner and the signer are separate: the arm authenticates the socket and reads the portfolio as the OWNER, and signs as the agent the owner approved in the venue's app.
+
+## HYPERCALL — slot 7, the S1 member (HC11, rulings O-HC18..O-HC23, 2026-09-26): DARK, paper only
+
+`crates/strategy-hcv` (`HcvStrategy`) is slot 7 of the set. Its names are
+`hcv`, `ai+hcv` and `ai+vrp+xsd+bin15+hyparb+xmm+hcv`; `all` (`BUILT_MASK`
+= 255) composes it too, inert without its artifact.
+
+**DARK (O-HC18).** Paper only and in no configured mask: `strategy.conf` is
+untouched. `exec_boot` refuses a live slot 7 whatever venues it names, and
+the engine never arms the Hypercall order arm. Arming it is its own ruling,
+which must settle: an options row in the E6 ledger; a reconciled HL perp
+account for its hedges; a Hypercall boot branch over `VenueSplit` (the
+type is BX3's); hedge-fill attribution by client id
+(paper matches the member's `client_oid`); and the R1 gate — the harness
+mirror (`backtest --member hcv`) is its prerequisite and is not built.
+
+**Boot.** Only with `~/multivenue/hcv.toml` (or `--hcv`); requested but
+absent refuses (the F19 law). Every traded underlying's hedge must resolve
+in the boot universe — `hyperliquid:xyz:<U>` for the eight equities, BTC and
+ETH native (O-HC20: `[hyperliquid] coins` gains the eight at go-live) — with
+the `szDecimals` the venue stated at this boot's discovery, or the boot
+refuses. The options are the boot's own Hypercall chain; an untraded
+underlying's (BABA, BOT) are counted in the tell. The wall anchor is taken
+right before the loop.
+
+**The decision (O-HC23, every knob in `hcv.toml`).** Per option whose quote
+or underlying moved, inside the policy — |ln K/S| ≤ 5 %, tenor 1–40 d, a
+live uncrossed provider quote, a fresh oracle and a live HL touch, a
+forecast, and the **event law**: an event of the underlying in (t, T] — or a
+calendar that is missing, older than 2 h, or does not vouch for (t, T] — is
+no trade:
+
+- `g_sell = σ_bid − σ̂(τ)`, `g_buy = σ̂(τ) − σ_ask` (Black–Scholes, r = 0,
+  the implied vol by bracketed Newton);
+- at `g ≥ θ` (5 vol points) ONE IoC at the quote — a sale at the bid, a
+  purchase at the ask — and **one IoC in flight per underlying** until its
+  verdict (its fill, the paper law's expiry event, or 5 s): every cap below
+  reads the book that verdict moves, and its new risk counts in the gross
+  premium meanwhile.
+
+**σ̂ (O-HC22).** The HAR set's rows, handed to slot 7 by the set whenever a
+row moves (law L4 lifted for slot 7 alone): the fit where fitted, the raw
+fold otherwise; a cold series forecasts nothing. Interpolated in total
+variance across the 1–40 d tenors, flat beyond them.
+
+**Sizing and the caps.** The displayed size and the clip ($5 of premium);
+then the gross-premium cap ($50 — the premium at stake is each position's
+ENTRY BASIS, plus the in-flight IoC's new risk at its limit), the
+per-underlying |net vega| cap ($20 a vol point) and the one-day 10σ stress:
+the size halves until the stress loss fits the tail cap ($20) or the trade
+lowers it. A **reduce** passes the premium cap (a reduce lowers the basis at
+stake) and never flips through zero, but NOT the vega and stress laws: net
+vega is not the position — selling one leg of a vega-neutral pair raises
+it — so a reduce may leave |net vega| and the stress no worse than the cap
+or than now, and is halved until it does.
+
+**Stops.** The day's marked P&L at or below −$20 stops new risk; `kill = 1`
+stops it at boot; per underlying, a stale or crossed provider quote, a stale
+oracle or a stale touch stops it (the dead-man); a mark not yet known (below)
+and a book whose file has fallen behind (below) stop it too. **Hedging continues under
+every stop, and so do reduces** (a buy-back of a short is closing risk).
+
+**The calendar fails closed.** A row naming an underlying outside `[hypercall]
+underlyings` (a misspelt "SPX" for "SP500") refuses the whole calendar — the
+last good one stays until it is older than 2 h, and then nothing trades.
+
+**Liveness, not age.** A tick is a BBO CHANGE (both ingresses' tick law): a
+quote the venue keeps re-pushing unchanged emits nothing. So a provider
+quote stands while the Hypercall FEED is alive (any instrument's tick within
+`quote_stale_ms`), and a hedge touch while the HL feed is (`oracle_stale_ms`);
+a quote or touch the ingress marked STALE is none; the oracle is judged by
+its own prints' age. Known gap, for R1 to measure: the Hypercall ingress
+emits nothing for a push with neither side, so a quote withdrawn on both
+sides at once stands in the member — and in the held-quote law — until its
+next change.
+
+**The hedge.** Never before a fill (the VRP F7 lesson). Per underlying the
+net delta — options at their mid IV (else σ̂), plus the perp — is kept
+inside **±0.10 per contract held**: O-HC23's "±0.10 delta" read per contract,
+so the band means the same on a $100 and a $100 000 underlying (read in raw
+underlying units it would never hedge BTC or ETH at these sizes — the
+reading awaits the operator's word). An IoC crosses the touch by 10 bps,
+rounded by the HL price law and the lot, never below $10 notional; its ttl
+is the member's own release (5 s), so the paper law expires a released hedge
+before its successor can fill beside it. A held option that cannot be
+priced (no live two-sided quote, no σ̂) leaves the delta unknown: the hedge
+is held, not traded on part of it. Over the final 30 minutes the options'
+delta decays in one-minute slices and every slice re-hedges, so the hedge's
+average exit tracks the settlement's average; a slice under $10 carries into
+the next; at T the option leaves the delta and the band, and the last
+slice's residual closes there.
+
+**Settlement (paper, in the member).** A `core_settle::SettleWindow` per
+held expiry, sampled on the 1 s sample-and-hold grid from T − 30 min − 5 s
+to T; at T + 60 s each position is booked at intrinsic on the median of
+means (`settle_order`, the HC7 gate's pick). A window under 90 % coverage —
+or none — counts in `settle_fallbacks` (no window: the last oracle).
+
+**Paper fills (O-HC21) — `core_fill::held`.** A Hypercall IoC is judged at
+submit + 2 s against the provider quote in force then (sample-and-hold: the
+due record's own quote is applied after), up to its displayed size. A stale
+quote is no quote; a miss is an order event (`CANCELED`, `EXPIRED`) back to
+the slot; a Hypercall maker is unmodellable. Only slot 7 emits Hypercall
+orders.
+
+**Money.** Premiums are USD per 1-unit contract; τ counts 365.25-day years
+(the HAR set's annualiser). The marked P&L is cash + options at their mid
+IV (else σ̂) + perps at the oracle — an expired position not yet booked at
+its intrinsic on the fixed settlement (else the oracle), never at a stale
+premium — since the book began (it persists, below); the day's is that less
+its value at the first timer of the UTC day that had a known mark. The mark
+is UNKNOWN while an underlying the book holds (an option or its hedge) has
+no oracle yet — after a boot, until its first Hyperliquid Mark: the day does
+not roll, the P&L gauges keep their last value, and new risk stops (the
+HC11b review found a restored hedge marked at a zero price lifting a
+tripped stop).
+
+**The book persists (HC11b, `strategy_hcv::state`).** The engine restarts at
+00:10, 08:33 and 16:05Z and a position lives for days, so the book outlives
+the process in `hcv-state.tsv` (`--hcv-state`; else beside an explicit
+`--hcv`, else `~/multivenue/hcv-state.tsv` — the F22 law: a smoke boot never
+reads or rewrites the standing engine's book):
+
+- **What is kept:** every held option **by contract** — underlying,
+  expiry, strike, right; never by symbol, since the chain's ordinals are
+  re-allocated every boot — with its entry basis and last traded price; each
+  underlying's hedge position; the cash; the UTC day and its opening mark
+  (the day's stop carries across a restart); every live settlement window —
+  its 1 s grid run-length encoded, or its price once fixed.
+- **What is not:** IoCs in flight (the X1 law — the paper matcher's table
+  dies with the process; armed live, a fill that lands across a restart is
+  the reconcile's to carry — the live-arming ruling's), quotes, touches, the
+  oracle, σ̂, the calendar and the counters.
+- **Written off the engine thread (the H3.7 law).** A fill, a booking, a
+  window opened, fixed or freed, a window's sample in a new minute and the
+  UTC day move the member's state epoch; at its timer, while it moved, the
+  member copies the book into a `core_ring::Mailbox` and the
+  `hcv-state-writer` thread (`cli::persist`, shared with the HAR series)
+  renders and fsyncs it. A slot the writer still holds (a write in flight or
+  failing — retried every 5 s, one warning a minute) is offered again at the
+  next timer: the file never goes backwards. At shutdown the writer is joined
+  and the live book is written once more, unconditionally. **A book that
+  cannot persist must not grow:** the boot writes the book once itself and
+  refuses if it cannot, a writer that does not spawn refuses the boot, and a
+  moved book the writer has not taken for 30 s stops new risk
+  (`book_stale` = 1) until it takes one again — hedging and reduces go on.
+- **Restored at boot, fail closed.** After `configure`, before the first
+  event. A row the member cannot place — an underlying `hcv.toml` does not
+  trade, a malformed or extra field, an implausible value (any ×1e6
+  magnitude past 1e15, an expiry past 2100), an unknown tag, a duplicate, a
+  window's grid short of its points, more than eight windows — refuses the
+  boot (the VRP / XSD law), and the member is left unchanged. One exception:
+  a hedge residual under the venue's minimum (`hedge_min_usd`, judged at the
+  oracle the row was written with — the last one known, carried from the
+  restored book until the process's first Mark, so a restart never erases
+  it) on an underlying `hcv.toml` no longer trades — one the member could
+  never close — is dropped and counted in the tell. A file that exists but cannot be read (a directory it may not
+  search, bytes that are not UTF-8) refuses too: only a MISSING file is a
+  first boot.
+- **Orphans.** A held contract this boot's chain no longer lists (the capped
+  chain is ±4 strikes around the index, so a move can drop a held strike) is
+  carried by its terms — hedged and marked at σ̂ (no quote reaches it) or,
+  without σ̂, at the implied vol of its expiry's nearest quoted strike (the
+  same fallback serves any held option with neither), sampled and settled at
+  expiry — and never traded, until a later boot's chain lists it again. At
+  most 64; more refuses the boot.
+- **A restart inside the final window** keeps the grid it had and holds
+  NOTHING across the outage (sample-and-hold holds what was seen, never across
+  a gap): the dark instants are missing, not filled, so a long outage shows
+  as a thin window (`settle_fallbacks`). A position that expired while the
+  engine was down is booked at the first timer — on its window if one was
+  kept, else on the first oracle, counted.
+
+**Observability.** `/state` `hcv` (configured, the artifact hash, 18
+counters, 7 gauges — `restored`: positions the boot read back; `orphans`:
+positions carried outside the chain; `book_stale`: 1 while the file is
+behind the book; `marks_unknown`: held underlyings still waiting for their
+first oracle this process — while it is non-zero the mark is unknown and new
+risk stops) and `slots[7]` named `hcv`; `engine_hcv_*` (18 counters, 7
+gauges); the boot tells `hcv: artifact configured … state=<path>` and `hcv:
+book restored positions= orphans= expired= hedges= hedges_dropped= windows=
+cash_usd_1e6=` (a warning each for orphans, for positions that expired while
+down and for dropped residuals). The calendar is read by the `hcv-events`
+thread on each change of `scheduled-events.json` and handed over a
+`core_ring::Mailbox`; the book leaves by another — the engine thread never
+opens either file.
+
+**Known gaps — each blocks switching slot 7 on (or is R1's to measure):**
+
+1. The final-window delta is the European delta scaled by the fraction of
+   the average still to come, not an average-price (Asian) delta on the
+   running mean's effective strike: R1 measures how well the TWAP tracks.
+2. No cost term: HL taker fees and funding are not booked, and Hypercall's
+   fee is `0:0` UNVERIFIED (O-HC7) — R1 carries both.
+3. A hedge residual under $10 cannot be closed (the venue minimum), and a
+   stale oracle held in a settlement window counts as coverage.
+4. An orphan is marked and hedged at σ̂ (else its expiry's nearest quote),
+   not at a market it can no longer see, and cannot be reduced; a position
+   that expired while the engine was down is booked on the first oracle
+   rather than the venue's posted price.
+
+- **Gates:** `strategy-hcv`'s 50 tests (the laws above, the independent
+  review's eight regressions, HC11b's eight — the round trip by contract
+  under a renumbered chain, the orphan hedged and settled but never traded,
+  a position expired while down, a restart inside the final window, a fixed
+  window, the epoch law, the mailbox hand-off and its retry, the refusals —
+  and its review's five: the unknown mark, the orphan's neighbour vol, the
+  dropped residual, the stale book, the kept mark),
+  `core-settle`'s window restore, the set's slot-7 tests, `cli`'s path law
+  and the writer-to-restore round trip, alloc gate 85 (the member over the
+  held-quote law, 2 400 engine steps with fills, hedges, a TWAP, a
+  settlement and every book hand-off, 0 B/op), `make copy-audit` over the
+  crate, `core-settle` and the writer thread.
+- **Review (2026-09-26, independent, Opus 5.5):** it found the caps blind to
+  the IoC in flight, reduces bypassing the vega and stress laws, stale-premium
+  marking of expired positions, a venue-blind option index, a residual hedge
+  after T, the day stop blocking buy-backs, paper hedge IoCs that never
+  expired, hedging on a partial delta, and a calendar that failed open on a
+  misspelt name — all fixed above; the per-session book it named is closed
+  by HC11b (the book persists, above).
+- **Review of HC11b (2026-09-26, independent, Opus 5.5, 19 min, each defect
+  reproduced by a probe):** MAJOR — right after a restore the day's opening
+  mark and its stop were judged with a hedge at a zero oracle (a tripped
+  stop lifted, and a sale went out). MINOR — an orphan without σ̂ froze its
+  underlying's hedge; a dust hedge on an underlying no longer traded refused
+  the boot; no plausibility bounds (`i64::MIN` sizes overflowed `abs`); a
+  book the writer could not write kept trading; a stat error read as a
+  first boot; two doc overclaims. All fixed above, each with a regression.
+  Its re-verification confirmed all six and found one regression — the
+  boot's own write erased every hedge's mark before the first oracle —
+  fixed: the last known mark is carried until the feed brings one.
+
+## BIN15 H90 — the late-window entry (PAPER) and its live dust test (rulings O-H90-1..10, 2026-10-13)
+
+**Evidence:** vault doc 32 (pre-registered, out-of-sample PASS for τ ∈ [2, 30) s;
+independent rebuild exact). **Plan:** vault doc 33. **Nothing here arms a slot.**
+
+- **The law (strategy-bin15 `late.rs`, `late_reprice`).** For a 15 m family whose
+  time to expiry is inside [`late_tau_min_ns`, `late_tau_max_ns`) (2–30 s), at
+  every reprice — a mark, either leg's snapshot:
+  - **The price (P1b).** A 1-s grid of the mark (fresh < 5 s) and of the HL perp
+    BBO mid (fresh < 3 s), kept per underlying. σ is the RMS of the 1-s mark
+    returns over 900 s, and the price holds below 300 valid returns. The nowcast
+    is the perp mid × the 60-s median of mark/perp. The venue's settlement
+    average (LAW E-11) has a known part, the observed seconds, and an unknown
+    part with `Var = (k·σ·m)²(a·n² + n(n−1)(2n−1)/6)/3600`, k = 1.55. Then
+    `p_yes = Φ(z)` from `late_phi_lut`, an artifact table that reaches 1.0, so
+    near-certain instances are priced as such.
+  - **The entry.** The favourite side, when `p ≥ late_p_min_1e6` (0.90) and its
+    ask ≤ p − `late_e_1e6` (2 c) on `late_persist_polls` (2) consecutive
+    snapshots of that leg. One IoC at that ask, sized at the whole resting ask
+    up to `late_usd_1e6` ($100) and the caps. One entry per instance; a gateway
+    refusal re-arms it.
+  - **Integer only, zero allocation.** Alloc gate 52b covers three families, 90
+    instances, fills and refusals at 0 B. Parity with the worker's mirror is
+    held at tolerance 0 (parity-3).
+- **The bypass, and why.** The late entry is NOT held by `tail_refuse_ns`
+  (10 s) or `tau_min_take_ns`; its own floor is `late_tau_min_ns`.
+  - The S-law's tail hold exists because the production pricer's error near
+    expiry exceeds any edge.
+  - The late pricer is a different law: it prices the settlement average with
+    most of it already observed. Doc 32 measured its hit rate exactly in that
+    window, out of sample.
+  - Every other bound still binds: caps, the grid, one pending take, no short,
+    and fills that move positions.
+- **Counterfactuals (logged, never traded).**
+  - `late_ff_*`: P1b's first pass, with persistence 1.
+  - `late_ctl_*`: the production p̂'s first pass under the same test, where it
+    priced.
+- **Paper only (O-H90-1).** Absent keys mean `late_enabled = 0`, which is
+  today's member bit for bit.
+  - `late_enabled = 1` requires `late_phi_lut`.
+  - Every stated value is bounded.
+  - An absent stake is clamped to the artifact's own per-instance cap.
+  - Today's early coverage entry keeps running on paper as the control
+    (O-H90-2).
+- **Paper bars (pre-registered, doc 33 §3).**
+  - KILL: EV/$ ≤ 0 after 100 settled late entries.
+  - PASS: ≥ 200 settled late entries with hit ≥ 95 %, EV/$ > 0 and day-t ≥ 2.
+  - Always reported: the ≥ 0.97 and < 0.97 ask subsets, per family and per τ
+    band.
+  - A PASS arms nothing. Live is a separate ruling, after the dust test.
+- **The dust test (`multivenue-engine hl-outcome-probe`,
+  `scripts/bin15-late-dust.sh`, O-H90-3), run by the operator before the
+  mainnet agent's approval expires (2026-10-19).**
+  - **What it does.** On the live `out:BTC:15m` instance, at each offset
+    (default 25 / 15 / 8 / 3 s): read both legs' `l2Book`, then buy the
+    favourite at its ask, ⌈$1 / ask⌉ whole contracts, IoC, `expiresAfter` 2 s.
+    Each offset writes one JSON line (the touches and their ages, the answer,
+    the round trip). After expiry it reads back the account's fills and the
+    settlement rows.
+  - **Hard caps.** $10 total notional per invocation (a constant, counted on
+    every order that left the process) and `--max-orders` ≤ 8.
+  - **Network guards.** Mainnet sends need `--confirm`. `--dry-run` signs
+    nothing. `--network testnet` rehearses on the smoke's account.
+  - **Account checks.** The account must have no open order, free spot USDC
+    for every planned order, budget headroom, and the agent listed in
+    `extraAgents` and valid for an hour more.
+  - **Its own client ids.** Probe orders carry `H90D` client ids, which
+    `cloid::decode` reads as `Foreign`, so no slot books a probe fill.
+  - **Unexpected answers.** An IoC that rests is cancelled by client id and
+    fails the run. An answer in doubt stops it.
+  - **Script guards.** The script refuses while `strategy.conf` arms slot 3
+    (two signers as one agent) and while another probe runs.
+  - **The instance it trades.** It is the one the engine's own boot binding
+    adopts (`best_live_spec` over a fresh `outcomeMeta`), read seconds before
+    the first order and checked to expire after every offset.
+  - **What its answer moves.** `late_tau_min_ns` (for example to 8 s), before
+    any live ruling.
+- **Still gated:** arming the late law live, which needs its own ruling
+  after the dust test and the paper bars, and the L6 install on paper (a
+  safe-minute restart, O-H90-10). The harness blocks (`bin15_late_entries`,
+  `bin15_late_fires`, `bin15_late_law`) and the stores
+  (`claude_worker.bin15_late`) landed with L3.
+
+## HK — the housekeeping lane (2026-10-13)
+
+Section A of the 2026-10-13 survey, one `HK:` commit per cut on `main`
+(rulings HK-R1..R4: never pushed; the session builds and tests, the deploy is
+the operator's). Plan: project doc `claude/hk-housekeeping-plan-2026-10-13.md`.
+**Nothing here arms a slot or changes a cap, a halt or an order path** unless
+its entry says so.
+
+### HK1 — the HL roll's two counters (`ingress-hyperliquid`)
+
+- **The second strike is reachable.** `roll_health` re-queues a roll's hot
+  subscribes once when they go unacknowledged past `sub_ack_budget_ns`. The
+  retry used to store `ack_deadline_ns = u64::MAX` as its "retried" mark, and
+  the overdue test `now > ack_deadline_ns` can never pass against it. So a
+  family whose retry also went unanswered waited forever with its acks
+  pending (the "Left open" items above). Now `HlFamily::ack_retried` (from the
+  row's tail padding; the 112 B size assert holds) marks the retry, which runs
+  under a fresh, whole budget. The flag is cleared wherever the deadline is:
+  the roll's bind, the last ack, the reconnect reset, `retire`, and the
+  strike.
+- **The second strike stops the asking and nothing else.** The row keeps its
+  bound instance and is **not** marked `dormant`, because dormant means "no
+  live instance". The 2026-09-26 review above records why the flag must not
+  be set on a bound row: `rebind_dormant` selects by `live.outcome == 0`, the
+  `families_dormant` gauge and the family log would lie, and nothing but a
+  bind clears the flag. The bound coins' data stays the staleness monitor's to
+  judge, as every bound coin's is: no ticks ⇒ `Stale` ⇒ reconnect, whose sweep
+  re-subscribes under the session-fatal mask. A strike with data flowing
+  means acks unconfirmed on a live feed — nothing to act on until the next
+  roll. Counted in `engine_ingress_hyperliquid_family_ack_timeouts_total`
+  (twice for such a family).
+- **An unsubscribe echo is an answer.** The six
+  `subscriptionResponse` echoes of a roll's `unsubscribe`s were counted as
+  parse errors and tapped as rejects. They are now `Dispatch::UnsubAck`:
+  one message, plus the new gauge
+  `engine_ingress_hyperliquid_unsub_acks_total`, and no reject tap. A
+  `subscriptionResponse` that names no known channel is still a rejection.
+- **Unchanged and recorded (review):** if the first acks were only late, the
+  retry re-subscribes coins the venue already holds. Its "Already
+  subscribed" answer is an `error` frame, which is fatal, so the session
+  reconnects. That is pre-existing behaviour, not widened by HK1.
+- **Tests (red on the old code, green now):**
+  `a_roll_whose_retry_also_times_out_stops_asking` and
+  `a_rolls_unsubscribe_echoes_are_counted_not_rejected`. The `lib.rs` echo
+  test covers `is_unsub_response`. Alloc gate `hl_run_loop_steady_state_is_zero_alloc`
+  carries three unsubscribe echoes inside its measured window (0 B/op). Fuzz
+  `hl_ws_frame` calls `is_unsub_response`.
+- **Reviews:**
+  - risk: NEEDS-DOCS (these records), and the dormant-on-a-bound-row hazard,
+    which led to the design above;
+  - alloc: PASS;
+  - zero-copy: PASS (no new copy; one more ≤ 130 B scan per echo, a cold class).
+- **Gates:**
+  - clippy clean;
+  - nextest 4 603 passed (10 skipped);
+  - alloc 126/126 at 0 B/op (a fresh `Compiling bench`);
+  - copy-audit hits 28, new 0;
+  - license-check OK;
+  - fuzz `hl_ws_frame` 60 s clean (2.05 M runs).
+
+### HK2 — the drain's two gaps (`core-net`, the ten ingress crates, `exec-hyperliquid` `gwconn`)
+
+**This entry changes an order path:** a post's answer that is read whole
+before its socket's close is now ACK or REJECT, where it used to be
+stranded UNANSWERED (`REASON_TRANSPORT`). No cap, halt or refusal changes.
+
+- **One oversize guard.** `core_net::incomplete_frame` is called on every
+  `WsReadResult::Incomplete` by all ten ingress drains. If rx is full after
+  the compaction `free_mut` performs, the partial frame can never complete,
+  and the session fails with `InvalidData` (`Error::from(kind)`, which
+  allocates nothing).
+  - HL, Bybit, MEXC, Deribit and Hypercall lose their private copies.
+  - Binance, OKX, Polymarket, RPC and HyperEVM used to return `Ok` and stall
+    until the idle timeout; they now fail fast too (the I-3 "Left open"
+    item above).
+  - Margins: Binance frames < 1 KiB against 64 KiB (the eapi slot 2 MiB
+    against a ~246 KB chain); OKX ≈ 600 KiB `opt-summary` against 4 MiB;
+    RPC `newHeads` < 2 KiB; HyperEVM ≈ 1 KiB pushes against 256 KiB.
+    **Polymarket's book frames are unmeasured against 64 KiB.** A frame
+    past it was already a dead session (the re-snapshot stalled again), so
+    fail-fast turns it into a logged reconnect. Measuring the largest PM
+    frame from a capture is a follow-up.
+- **A read-detected EOF closes after the parse.** Every ingress `drive_one`
+  set `State::Closed` on `RxFill::Eof` before its state machine ran, which
+  dropped the frames that arrived in the same read as the FIN. Now the state
+  machine runs first, and then the EOF closes the session. On EOF the final
+  `flush_tx` is skipped: nothing goes to a closed peer, and the reconnect
+  redoes pongs, subscribes and reads. A Close frame that arrives with the
+  FIN is now parsed, so HL records `peer-close` with its code where it said
+  `peer-eof`.
+- **`gwconn` reads to the close.** When the TLS pump met the peer's close,
+  `on_event` returned `Closed` while decrypted plaintext sat unread in
+  rustls, and every post's answer in it was lost. Now:
+  - `on_event` notes `peer_closed`;
+  - `service` reads the buffered bytes. A FIN without `close_notify` (rustls'
+    `UnexpectedEof`) is an end, not a fault: every byte before it is
+    authentic (the BX5 reading);
+  - `service` hands their frames on, then reports `Closed`;
+  - on that closing path no pong is written and the socket never turns
+    Ready.
+  - Safe by construction:
+    - post ids are gateway-wide and monotonic;
+    - fills dedupe on the `tids` ring, so a fill delivered before the close
+      is not re-booked from the reconnect's snapshot;
+    - `conn_down` strands only what is still out, after `service` returns;
+    - an answer is a whole length-prefixed frame inside authenticated
+      records, so E-5 holds.
+- **Residuals (recorded, not changed):**
+  - For TLS ingress the pump usually meets the FIN first: `drive_tls` reads
+    the socket to EOF on each readiness event and
+    `note_transport_ready(Closed)` closes before `drive_one` runs. So the
+    ingress half covers the FINs met in `read`'s pull-through (after a
+    16 KiB rustls wave). The loss is market data, re-snapshotted on
+    reconnect.
+  - `userws_conn` (the blocking arm's `userFills` stream) still stops at
+    the pump's `Closed`. The venue re-sends a `userFills` snapshot on
+    resubscribe, and fills dedupe by `tid`.
+- **Tests (red on the old code, checked on Binance and on `gwconn`):**
+  - every ingress crate's
+    `a_frame_that_arrives_with_the_fin_is_published_then_the_session_closes`;
+  - `a_frame_larger_than_rx_fails_the_session_instead_of_stalling` for the
+    five stalling crates, Bybit and Hypercall;
+  - core-net's two guard tests;
+  - the gateway loopback
+    `an_answer_that_arrives_with_the_fin_is_delivered_before_the_close`
+    (the test venue's `Answer::ActionThenDrop`).
+- **Reviews:**
+  - risk: NEEDS-DOCS (these records). Its nits were acted on: no pong on
+    the closing path, and no Ready on a closed socket.
+  - alloc: PASS. Its nit was acted on: `Error::from(kind)`.
+  - zero-copy: PASS. No new copy site; the guard's compaction is the copy
+    the next `fill_rx` paid before, one step earlier.
+- **Gates:** clippy clean; nextest 4 623 passed (10 skipped); alloc 126/126
+  at 0 B/op (a fresh `Compiling bench`); copy-audit hits 28, new 0;
+  license-check OK; `cargo +nightly fuzz build` OK.
+
+### HK3 — D3's leftovers: one channel-name spelling, the tx sizing asserted (`ingress-{deribit,okx,bybit,polymarket}`)
+
+Ingress code only: no order path, cap or halt changes, and no wire byte
+changes.
+
+- **One spelling of a Deribit channel name.** The subscribe request
+  (`render_channel_name`) and the subscribe-result check (`found_mask`)
+  both read `channel_name_parts`. The parts are laid into the caller's
+  slot, never returned by value (the ZC pass B rule).
+  - `CHANNEL_NAME_MAX` (47 B) is computed from the channel prefixes and
+    suffixes and `DERIBIT_INSTR_MAX`, and is const-asserted against the
+    64 B needle scratch.
+  - The needle bytes are unchanged, and the `// COPY:` marker moved with
+    the copy.
+  - `DERIBIT_DVOL_NAME_MAX` (16) names the one DVOL width read by the
+    table, the boot check, the push parser and the sizing.
+- **The tx sizing is asserted, not argued.** Each crate gets a
+  `SUB_PAYLOAD_MAX`, built from its render's literal lengths and its
+  table's maxima:
+
+  | crate | bound | tx |
+  |---|---|---|
+  | OKX | 12 028 B at 160 args | 16 KiB |
+  | Deribit | 9 664 B at 192 channels + 8 DVOL | 24 KiB |
+  | Bybit | 7 516 B at 192 topics | 16 KiB |
+  | Polymarket | 10 657 B at 128 ids | 16 KiB |
+
+  - A `const { assert!(…) }` at the subscribe's queue site, the MEXC shape,
+    checks the handshake allowance (1 KiB) + the bound + the 14 B frame
+    header against tx.
+  - Each crate has a worst-case render test (the real output fits the
+    bound). Deribit's also feeds its own rendered request, unmasked, to
+    `found_mask` and gets `expected_mask` back.
+- **Deviation from the plan, recorded:**
+  - The plan named MEXC's `≤ TX_BUF_SIZE / 2`. Half of a 16 KiB tx cannot
+    hold the worst case on OKX (13 066 B), Polymarket (11 695 B) or Bybit
+    (8 554 B), so those three assert `≤ TX_BUF_SIZE` — what their docs
+    claimed.
+  - Deribit asserts the handshake + 2 × the bound + the header ≤ 24 KiB,
+    its doc's "≥ 2× margin".
+  - Growing tx was not taken: no frame needs it.
+- **Residual:** the channel maxima are taken over hand-listed variants
+  (`OKX_CHANNEL_NAME_MAX`, `CHANNEL_NAME_MAX`, Bybit's `OrderbookL1`). A new
+  longer channel would fall outside the bound, and only Bybit's test
+  renders every channel.
+- **Review:** one combined pass (risk NEEDS-DOCS, done; alloc PASS;
+  zero-copy PASS). Acted on: the parts array filled in place, the named
+  DVOL width, and the Deribit test reading the real render.
+- **Gates:**
+  - clippy clean;
+  - nextest 4 627 passed (10 skipped);
+  - alloc 126/126 at 0 B/op;
+  - copy-audit hits 28, new 0;
+  - license-check OK;
+  - fuzz `deribit_vol_index` 60 s clean (12.2 M runs).
+
+### HK4 — the HD lane's follow-ups (`core-net`, `exec-hyperliquid`, `fuzz/`, the alloc suite)
+
+Tests, a marker, a fuzz target and a gate. No shipped behaviour changes.
+
+- **`http1::push` carries its `// COPY:` marker.** The marker states the
+  copy's real extent: request-head parts, and the whole body of a boot-time
+  POST through `write_request`. The copy-audit baseline drops the entry
+  (27 baselined, 0 new). The ratchet only shrinks.
+- **The `http1_response` fuzz target holds the parser's contract.** It
+  used to assert `body_end <= data.len()` for every framing, which aborted
+  on any Content-Length body only partly buffered.
+  - `read_response` reports such a body's end as
+    `body_start.saturating_add(n)`, and the target now asserts exactly
+    that.
+  - In-bounds stays the rule for chunked and close-delimited bodies.
+  - A unit test pins the contract: `fuzz/corpus` is git-ignored, so no seed
+    can.
+- **The gateway's re-send branch is tested.** The test seam
+  `kill_ws_after_next_send` / `die_after_next_send` exists only under
+  `testvenue`, a dev-dependency feature everywhere. Under resolver 2 it
+  never reaches `cargo build --release -p cli`. The G0 rebuild covers a
+  release test run.
+  - The seam lets the next write on the active socket leave, then reports
+    the socket dead.
+  - The gateway unmasks, copies the envelope into the REST window and
+    re-sends. The venue's REST body is the WebSocket post's payload, byte
+    for byte (never re-signed), and the REST answer ACKs it
+    (`a_post_whose_socket_dies_under_the_write_is_re_sent_by_rest_unchanged`).
+- **Alloc gate 114: the gateway's REST path allocates only rustls' record
+  buffers.**
+  - Setup: gate 96b's harness (now `gate96_boot`, shared). The gateway goes
+    live, the venue starts refusing upgrades (a `refuse_ws` file), and the
+    seam kills the socket. Every post then goes REST.
+  - The pin: exactly 2 allocations per REST post (one record sealed, one
+    opened — the gate-101 pin).
+  - Judged windows: only those that open with no connection dialing
+    (`HlGateway::dialing`, a cold accessor) and see no dial start. A
+    refused redial's TLS session is cold, and never counted.
+- **Review:** one combined pass. Risk: NEEDS-DOCS (these records). Alloc
+  and zero-copy: PASS. Acted on:
+  - the gate's window judged on `dialing` (a dial that fails synchronously
+    no longer jams it);
+  - the seam cleared by `close`;
+  - the marker's wording;
+  - the unit test.
+- **Found while gating: the listed `hl_userws_loopback` "parallel-load
+  flake" was a race in the test.** It failed 1 run in 5 even alone. The
+  server floods the oversize frame right behind its 101, so the client's
+  refusal (`BadFrame`) can surface from `connect` as well as from a later
+  `pump`, and the test accepted only the second. It now accepts either:
+  10/10 alone, green in the full run. The client's law is unchanged.
+- **Gates:**
+  - clippy clean;
+  - nextest 4 630 passed (10 skipped);
+  - alloc 127/127 at 0 B/op, gate 114 new (a fresh `Compiling bench` in the
+    run that built it);
+  - copy-audit hits 27, baselined 27, new 0;
+  - license-check OK;
+  - fuzz `http1_response` 60 s clean (2.39 M runs; it used to abort on
+    trivial input).
+
+### HK5 — the missing tests: BX-3's vectors and LAW E-4 from the cli (`exec-binance`, `cli`)
+
+Two test files. No shipped code changes.
+
+- **BX-3: the venue's own vectors, in `tests/`**
+  (`crates/exec-binance/tests/official_vectors.rs`).
+  - Binance's API documentation publishes, for `POST /api/v3/order`, one
+    HMAC secret with two signed requests: the ASCII `LTCBTC` order
+    (`c8db5682…6b71`) and the same order with a non-ASCII symbol
+    percent-encoded before signing (`e1353ec6…3ef3`).
+  - Both are pinned byte for byte on the arm's own signing path,
+    `rest::sign_hmac_in_place`: the signature is appended in the request's
+    window and the request bytes are untouched.
+  - The boot self-tests (`config::hmac_self_test`, `selftest::run`) now
+    also run from outside the crate.
+  - Before this the docs' vector was checked only by the boot self-test;
+    `hmac_signs_binances_documented_example` signs a request of its own.
+- **Ed25519 has no public Binance vector.**
+  - The documentation's Ed25519 example publishes the API key, the payload
+    and the signature, but not the private key that signed it. Its public
+    key is not published either, so the signature cannot be checked.
+  - The signer's authority stays RFC 8032 §7.1, pinned in `signer-ed25519`.
+    `selftest`'s payload vectors stay the renders' authority.
+  - BX-3's vectors item is therefore closed for HMAC and **not closable**
+    for Ed25519 from Binance's API documentation. The official connectors'
+    own test suites were not searched for an Ed25519 key pair; that is the
+    one place left to look.
+- **A-S7-100, its cli half: LAW E-4 end to end through the router**
+  (`exec_composition_loopback`
+  `slot_three_s_outcome_arm_refuses_an_unbound_leg_through_the_router`).
+  - Setup: slot 3's gateway arm in outcome mode (`outcomes`, no perps)
+    behind `SlotSplit(3, …)` in the `RoutedDispatcher`, booted through the
+    router's idle. The boot includes the outcome map's spot sheet, whose
+    end carries `SPOT_LEGS_READ`.
+  - Before any roll, a submit on the family's YES leg is refused
+    (`NoLiveRoute`) and nothing leaves the arm. The arm's
+    `refused_unbound` counts it, so the refusal is the binding's, not the
+    router's.
+  - The roll, an `InstrumentRoll` through the router's `on_venue_event`,
+    binds both legs. The same order then leaves as a place on
+    `ASSET_BASE + 10 × outcome` (YES), and a NO-leg order on `… + 1`.
+  - The boot's scripted venue answers only the reads it expects; any other
+    command panics the test.
+  - The next roll retires the instance. An order naming it is refused as
+    stale (`refused_stale`) and feeds the arm's E-4 streak (1; the unbound
+    refusal does not). The successor's order leaves on the successor's
+    asset. After the router's next idle, nothing has halted (the streak's
+    limit is 3).
+- **A-S7-100's second half moves to Section B (A-HK-6).** That half is a
+  loopback `run()` of the outcome battery, and it needs
+  `cli::outcome_battery`, which is only on the unmerged `xmm` branch.
+- **Review:** one combined pass. Risk: NEEDS-CHANGES (test-only), acted on:
+  - the "nothing halts" check now follows an idle (the router latches a
+    halt only there) and pins the E-4 streak directly;
+  - the NO leg is tested;
+  - the boot loop panics on an unexpected command instead of answering it
+    as a read.
+
+  Alloc and zero-copy: PASS. Docs: the Ed25519 statement narrowed to
+  Binance's API documentation.
+- **Gates:**
+  - clippy clean;
+  - nextest 4 633 passed (10 skipped), on HK5's tree alone — HK6's edits
+    landed after that run had compiled;
+  - copy-audit hits 27, new 0 (`tests/` is outside its reading);
+  - license-check OK.
+  - Alloc was not re-run: the cut adds tests only, and no library code
+    the alloc suite links changed.
+
+### HK6 — a failed boot leaves no empty capture directory (`cli`)
+
+- **The defect.**
+  - `new_capture_run_dir` creates `run-<epoch_ns>` before boot discovery,
+    so a boot that died there left the directory empty.
+  - Under launchd's relaunch that is one directory per failed boot: 40 of
+    the 55 in `~/multivenue/logs` between 10-11 and 10-13 came from the
+    Bybit edge loop.
+- **The fix: `cli::RunDirGuard`.**
+  - `run` creates the guard right after the directory and `commit`s it
+    once the fills, orders and events captures are open, before the
+    engine loop. About thirty member-boot refusals run after the commit;
+    by then the directory holds the manifest and those captures, so it
+    would be kept anyway.
+  - Every failing boot returns an `ExitCode` from `run`, so the
+    uncommitted guard drops and calls `std::fs::remove_dir`.
+  - `remove_dir` refuses a directory holding anything. The guard therefore
+    removes an EMPTY directory only and never deletes capture.
+  - What it removes: the directory of a boot that failed before the
+    instrument manifest was written. That covers boot discovery (the
+    Bybit loop's case) and the `--halt-slot`, exec and Binance-arm
+    refusals.
+  - What it keeps: a boot that failed after the manifest was written (the
+    DNS, endpoint, gateway-network and observability refusals, and
+    later) keeps its directory with the manifest, as before.
+  - It deletes no data, so S-DOCTRINE is unaffected (A-HK-4).
+  - `#[must_use]`: a guard dropped at once would remove the directory.
+- **Not covered:**
+  - a boot that dies by `panic = "abort"`;
+  - a boot killed by `SIGKILL` (SIGINT and SIGTERM are handled, and the
+    boot runs on to a `return`);
+  - a boot whose `join_reverse` hangs until the join watchdog's
+    `process::exit`.
+
+  None of these unwinds, so their empty directory stays, as before.
+- **Tests (`paper.rs`):**
+  - `an_uncommitted_guard_removes_its_empty_run_dir`;
+  - `an_uncommitted_guard_keeps_a_run_dir_that_holds_capture`;
+  - `a_committed_guard_keeps_its_run_dir`.
+- **The empty directories already on disk are the operator's to remove.**
+  `migration.md` "HK6" has the listing command; the session deletes
+  nothing there.
+- **Review:** one combined pass. Risk, alloc and zero-copy: PASS. All 49
+  exits between the guard and the commit are `return ExitCode`. Every
+  capture opens on the main thread, so no thread races the removal. Docs:
+  NEEDS-DOCS, acted on:
+  - the manifests' reach stated (above);
+  - `migration.md`'s tooling line corrected;
+  - `retention.sh`'s comment updated;
+  - `warn` for an unexpected removal error;
+  - `#[must_use]`;
+  - "SIGKILL", not "a signal".
+- **Gates:**
+  - clippy clean;
+  - nextest 4 636 passed (10 skipped; `amm_walk_and_arb_solve_are_zero_alloc`
+    flagged leaky by nextest, which is not a failure), then cli 612 passed
+    after the review's edits;
+  - alloc 127/127 (the bench crate links no `cli` code, so its build was
+    unchanged);
+  - copy-audit new 0 (neither file is in its reading);
+  - license-check OK.
+
+### HK7a — candles.db: no future bars; the Hypercall index as 1 m capture (`claude-worker`)
+
+Worker only; no engine code. The worker runs from the working tree, so
+the hourly candles cycle ran the first draft of this cut before its
+commit. That run surfaced the false refusals described below.
+
+- **No bar opens after its fetch.**
+  - The MEXC TradFi perps answered flat placeholder bars ahead of time
+    when asked for the future: 1 m bars hours ahead, 1 h bars weeks
+    ahead, 1 d bars to 2028.
+  - Stored, they froze each series' gap-fill frontier until their date
+    passed. The placeholder minutes behind a jumped frontier were never
+    fetched again (the H3 plan §1.6's flat 1 m days).
+  - Now the MEXC request ends at `now`, as Deribit's and HL's do.
+  - `upsert_rest` refuses any bar opening more than `FUTURE_SKEW_MS` (one
+    minute) after the wall clock at its page (`fill_forward`'s `clock`;
+    the cycle passes the wall clock).
+  - The first draft bounded by "the cycle's `now` + one bar". Live, that
+    refused the real open 1 m bar of every lane fetched minutes into the
+    cycle. The review then showed that "+ one bar" also admits tomorrow's
+    1 d placeholder.
+- **`--repair-future`** (module flag, operator-invoked; not a frozen
+  verb) purges the stored future rows, then runs the cycle. Running it is
+  the operator's: it deletes rows from the live store.
+- **Capture windows start on a whole minute.** Both capture folds, the PM
+  ticks and the new index, used to fold the hourly window's first minute
+  from its tail and store it over the whole minute. That was a
+  pre-existing defect of the PM lane.
+- **The Hypercall index fold (H3 plan §5 W1).**
+  - Input: the `Mark` prints on `hypercall-idx:<U>` (named by each run's
+    manifest) from `hypercall-events.pmlr`, mapped as one numpy array
+    (`pmlr.channel_event_array`).
+  - Placement: each print by its own source time. A tie keeps arrival
+    order, and a repeated print counts once.
+  - Output: 1 m `capture` bars, venue 9, written by `upsert_capture` (rest
+    supersedes; idempotent per minute).
+  - Live: 18 648 minutes on the first cycle (12 underlyings × ~26 h).
+- **Review:** one pass, NEEDS-CHANGES, all acted on:
+  - the bound, from "+ one bar" to the fetch;
+  - MEXC's request end;
+  - minute alignment, in both folds;
+  - tie order and repeats;
+  - tests for the array reader and `main --repair-future`;
+  - the migration entry's numbers and steps.
+- **Gates:** worker pytest 1 722 passed, 3 skipped (the time-bombed
+  funnel test is fixed under HK8); ruff reports nothing new on the added
+  lines.
+
+### HK8a — `make py-lint` green (`claude-worker`)
+
+Lint only, plus one test clock. 861 ruff findings → 0, and the worker is
+not reformatted:
+
+- **Config (`pyproject.toml`).**
+  - `PLR0402` is ignored. Its fix is a `from` import, which this codebase
+    forbids.
+  - σ × − – are allowed confusables: they are the worker's notation.
+  - The pylint size rules get a ceiling at today's worst function that
+    carries no annotation (10 args, 10 positional, 36 branches, 21
+    returns, 90 statements). The larger functions keep their own `# noqa`
+    with its reason.
+  - `allow-magic-value-types` adds `int`: field counts and fixed-point
+    scales are the house style, and tests already ignored PLR2004. This
+    loosening goes beyond A-HK-5, so it is recorded as A-HK-7 for the
+    operator to overrule.
+- **Mechanics.**
+  - Every over-long statement was wrapped by `ruff format --range` on
+    that statement alone. Strings, comments and the compound headers the
+    formatter leaves alone were wrapped by hand.
+  - One URL keeps `# noqa: E501`.
+  - The `# noqa` directives the new config makes unused were removed, and
+    their reasons kept as plain comments.
+- **Real fixes.**
+  - 19 ambiguous `l` names renamed.
+  - A duplicate `isqrt_i128` in `bin15_ref.py` removed. The kept one is
+    identical: the same body, and `I64_MAX` = `_I64_MAX`.
+  - Imports inside test functions moved to the top.
+  - Unused locals, unpacked names and imports removed; `ClassVar` on a
+    fake's class attribute.
+  - Comparisons merged into `in`; `int(round(…))` → `round(…)`; list
+    concatenation → unpacking; `itertools.pairwise`.
+- **The time bomb.** `test_report_prints_the_funnel` runs on a pinned
+  clock, an hour after its fixture feed's newest item. On the wall clock,
+  the report's 24 h window lost the fixture a day after it was written.
+- **Proof of no behaviour change.**
+  - `ast.unparse(HEAD)` against `ast.unparse(working)` for every changed
+    file: 36 are AST-identical.
+  - The rest differ only by the fixes above, each read in that semantic
+    diff.
+  - The frozen `backtest.py` and `cli.py` differ only in comments.
+- **Review:** one pass, PASS. Acted on: `max-positional-args` back to 10
+  (two functions regained `PLR0917` in their noqa), the ceiling's wording,
+  and the int allowance recorded as an assumption.
+- **Gates:** `make py-lint` all checks passed; worker pytest 1 722
+  passed, 3 skipped.
+
+### HK8b — the worker's UDS-fixture "flakes" (`claude-worker` tests)
+
+Test-only. Two races in the fixture and its tests, not a parallel-load
+property of the code under test.
+
+- **The listener's backlog.**
+  - `FakeUdsServer` listened with a backlog of one. A CLI invocation's
+    `connect` could be refused while the previous invocation's connection
+    still waited to be accepted.
+  - That is the shape of `test_commit_ruleset_happy_by_hash_then_by_file`
+    (stage, then commit, back to back).
+  - The backlog is 8 now. The fake must not be stricter than the engine,
+    which never meets back-to-back clients.
+- **Frames read on the server's own thread.**
+  - The `test_recommit` family asserted the frame count the moment the
+    client returned, while the fake still read on its own thread.
+  - `FakeUdsServer.wait_for_frames(count)` waits first. The test that
+    asserts the absence of a commit frame waits, then gives a 50 ms grace.
+  - The three copies of `_wait_for_frames` (`test_cli`, `test_commander`,
+    `test_daemon`) are now that one method.
+- **Gates:** worker pytest 1 722 passed, 3 skipped; `make py-lint` all
+  checks passed. The race cannot be forced from here, so the fix rests on
+  the mechanism, not a reproduction.
+
+### HK7b — Binance options: signal legs only (`core-fill`, `clob-dispatcher`, `cli`)
+
+Ruling HK-R4: the Binance options join the AI boot universe as signal and
+reference legs, and orders on them stay unroutable (the O-HC17 shape).
+
+- **The gap this closes.**
+  - The v2 grammar resolves descriptors through `DescriptorTable`, which
+    has carried `binance-opt:` (caps `CAP_OPT | CAP_PRICE`) since M2.4.
+  - So a v2 row could already name a Binance option as its order
+    instrument.
+  - The paper matcher modelled that order against the option's BBO ticks
+    (ingress-binance emits a `Tick` per quoted option): a fill the venue
+    never saw.
+- **The law, once, for both consumers.**
+  - `core_fill::signal_only_sym`: the Binance venue byte and the eapi
+    ordinal block. `BN_OPTION_ORDINALS` is restated below core-config and
+    const-asserted equal in `cli::paper`.
+  - `PaperMatcher::submit` and the harness's `FillEngine::intake` both
+    count such an order `unroutable` before any other state change.
+  - `modify` cannot bypass it: identity includes the sym.
+- **Paper only.** A LIVE Binance slot's option order goes to its arm and
+  never meets the predicate. No member arms one (O-BX6).
+- **The universe.** `build_ai_universe` takes the Hypercall and Binance
+  options as one `option_syms` slice. The chain plus the held options
+  stay inside the block (≤ 64 + 16 ordinals).
+- **Tests:**
+  - the block's edges (core-fill);
+  - an option order unroutable, with a crossing tick that fills nothing,
+    beside a perp that is modelled (matcher);
+  - the same in the harness at zero Δ;
+  - the universe's order and dedupe.
+- **Review:** one combined pass. Risk, alloc and zero-copy PASS: no
+  current member trades Binance options in paper, and no live path
+  reaches the matcher. Docs NEEDS-DOCS, acted on:
+  - these records and the migration entry;
+  - the core-fill doc and ai-strategy-pipeline (the live arm is not
+    operator-verbs-only, O-BX6);
+  - research-universe's stale "venue-dark" lines (BX0 made them live);
+  - the Hypercall wording.
+
+  Tests: the crossing tick added; the harness at zero Δ.
+- **Gates (before the review's test edits):**
+  - clippy clean;
+  - nextest 4 639 passed (10 skipped), with HK8c's test groups;
+  - alloc 127/127 at 0 B/op (a fresh `Compiling bench`);
+  - copy-audit hits 27, new 0;
+  - license-check OK.
+
+### HK8c — nextest test groups (`.config/nextest.toml`)
+
+- The workspace had no nextest configuration. It now has one, with one
+  group, `load-sensitive` (`max-threads = 1`): the six debug-profile
+  allocation tests and `scrape_hammer_all_succeed_without_conn_errors`.
+  These were the standing "isolation-disproven flakes".
+  - Each test already runs in its own process; what they share is the
+    machine.
+  - The allocation tests count through the process-global
+    `CountingAllocator`, where lazy runtime initialisation and scheduler
+    timing can land inside the measured window under load.
+  - The hammer opens many loopback connections at once.
+- `cargo nextest show-config test-groups` lists exactly the seven.
+- `hl_userws_loopback`'s entry is gone: HK4 found a race in that test and
+  fixed it.
+- The file's own rule: a test is added only with the reason it is
+  load-sensitive, never to hide a test that fails alone.
+
+### HK9 — three hot-path benches baselined (`crates/bench/baselines/hot_path.json`)
+
+- `vol/long_day_close_warm` (37 460 ns), `vol/long_state_copy_warm`
+  (2 490 ns) and `signer/hypercall_place_order` (19 950 ns) are now gated.
+  Before, they were measured and not baselined.
+- Method (D2's): each value is the median of three `make bench-check` runs
+  on the M4, with the engine running (load 9.4–11.3, under the 12 that
+  would have forced a re-run).
+- The eleven older samples were left as they are. All three runs passed
+  them within 15 %, and none moved on purpose (`book/apply_n8_middle`
+  −11.7 % and `strategy/latency_arb_on_tick_no_fire` −8.6 % are faster).
+- `bin15/late_fair_in_window` and `bin15/late_grid_mark_and_perp_1s` (BIN15
+  H90's) stay unbaselined for that lane. The second spread 1.6–2.3 ns
+  across runs.
+- **Gate:** `make bench-check` "OK: all 14 samples within 15 % of the
+  baseline".
+
+### HK10 — the docs, and the lane's close
+
+- **`CLAUDE.md`'s CURRENT STATE** is cut to current facts: 356 lines → 172.
+  - The merge and go-live paragraphs moved verbatim to
+    `docs/arch/claude-md-state-log-2026-10-13.md` (README indexed). The
+    lane records stay here and in `migration.md`, so every citation still
+    resolves.
+  - Stale lines fixed:
+    - the heading's date;
+    - the engine's binary and mask;
+    - the slot-3 bullet's dangling "R0's record:";
+    - the gate line, restated from this lane's final gates;
+    - `make py-lint` no longer RED;
+    - the flake list (root-caused or grouped);
+    - the open operator items (the disk, `--repair-future`, Bybit's edge).
+  - New current-state lines: the Binance arm (BX0–BX13, dark) and slot 6
+    (XMM; the `xmm` branch unmerged).
+- **This file's kill-switch list:** triggers 7–10 lose "NOT YET ENFORCED"
+  and "DARK until BX6". `exec_router::halt::trigger_for` enforces all four,
+  with the halted slot's cancel (per slot since XH5a) and `exec.HALT`. The
+  list now names the module docs for the other `HaltReason`s (budget
+  floor, user-WS gap, asset-refusal streak, operator, recon-STALE, the E7
+  session bound, ALO reject rate).
+- **The lane, closed — Section A of the 2026-10-13 survey.**
+
+  | cut | commit |
+  |---|---|
+  | HK1 | `1af7e45` |
+  | HK2 | `da535cd` |
+  | HK3 | `9eedffb` |
+  | HK4 | `1286ed4` |
+  | HK5 | `38e777a` |
+  | HK6 | `f195c7b` |
+  | HK7a | `6324819` |
+  | HK7b | `74c9ac6` |
+  | HK8a | `4b6306e` |
+  | HK8b | `4829d6e` |
+  | HK8c | `2f842e6` |
+  | HK9 | `c3e38dc` |
+  | HK10 | this commit |
+
+  - Nothing pushed. No engine binary was built (HK-R3).
+  - The operator's steps:
+    - the release build and the restart (HK1, HK2, HK6, HK7b reach the
+      engine only through it);
+    - `--repair-future` once;
+    - before the restart, a check of the committed ruleset for
+      `binance-opt:` order legs (migration.md "HK7b").
+  - Moved to Section B: A-S7-100's loopback `run()` (it needs the `xmm`
+    branch). Recorded, not closable from public material: a Binance
+    Ed25519 vector (HK5).
+- **Review:** one pass, NEEDS-CHANGES, all acted on:
+  - `LIVE_ARM_VENUES` includes Binance (since BX6);
+  - five live smokes, not three or four;
+  - the halt list's cancel is per slot (XH5a) and `exec.HALT` survives a
+    restart;
+  - the release build and restart added as an open item;
+  - the current facts the first cut dropped restored, one line each:
+    - unverified fees;
+    - HYPARB's verbs, executor and stop;
+    - where the keys live;
+    - HC11c's third defect;
+    - the HL venue law;
+    - H90's scoring;
+    - the doctest note;
+    - bench-check's staleness;
+    - the rustls pin;
+  - the directory guide names `exec-binance`.
+- **Final gates (`c3e38dc`):**
+  - clippy clean;
+  - nextest 4 639 passed (10 skipped);
+  - alloc 127/127 (at `74c9ac6`; nothing it links changed since);
+  - copy-audit 27 / new 0;
+  - license-check OK;
+  - `make bench-check` 14 OK;
+  - worker pytest 1 722 passed, 3 skipped;
+  - `make py-lint` all checks passed.
+
+## HK, part 2 — Section B and the 2026-10-14 findings
+
+The operator's ask of 2026-10-14 ("do these"), one `HK:` commit per cut on
+`main` (HK-R5: nothing pushed). Rulings HK-R5..R10 and the plan: project doc
+`claude/hk-sectionb-plan-2026-10-14.md`; the plan numbers the cuts one higher
+(its HK12, the features key, landed in HK11, so its HK13–HK18 are HK12–HK17
+here). The session also runs the deploy this time (HK-R8): the release build
+and SIGTERM restart HK1–HK10's got at 04:21Z. **Nothing here arms a slot
+or changes a cap or a halt.** HK13 changes what the outcome binder does on a
+repeated roll (both arms; nothing armed today).
+
+### HK11 — the S3 archiver: a measured upload cap (`claude-worker` objstore, archive)
+
+- **The finding.** The first `candles.db` push (4.4 GB, uncompressed,
+  uncapped) filled this Mac's uplink, and the feeds' ACKs queued behind it.
+  Deribit's `feed_delay_ema_ms` reached its 65 535 ms ceiling, MEXC 52 s and
+  Hypercall 11 s. Binance's stale ticks went from 38 k to 1.14 M. Delays
+  were back to 30–100 ms within a minute of each push ending.
+  - `taskpolicy -b` did not throttle the push: ~3.3 MB/s by `nettop`, where
+    `archive-cycle.sh` recorded ~0.3 MiB/s in September.
+- **The measurement** (HK-R6). The run closed at 08:33Z was pushed at three
+  caps, 300 s each, with every venue's delay EMA sampled every 15 s:
+
+  | phase | samples | > 500 ms | worst |
+  |---|---|---|---|
+  | no upload | 12 | 0 | 186 ms (Bybit) |
+  | 0.5 MiB/s | 22 | 9 | two all-venue spikes (~1.1–1.3 s), not network-bound at this rate |
+  | 1 MiB/s | 20 | 1 | 748 ms (Hypercall, one sample) |
+  | 2 MiB/s | 20 | 6 | 2 842 ms (Deribit) and two all-venue spikes |
+
+  1 MiB/s is the default: its medians stayed in the no-upload band.
+- **What changed.**
+  - `objstore.RateLimiter`: a token bucket over every upload byte. File
+    streams go in 64 KiB pieces (`PACE_CHUNK`, burst 256 KiB); in-memory
+    bodies (manifests, the Complete XML) take one piece. Retries pass it
+    too. `MULTIVENUE_S3_MAX_UPLOAD_MIBPS` (default 1; 0 = uncapped).
+    Downloads are not capped.
+  - `archive.main` traps SIGTERM: SystemExit(143), one-shot, so
+    `multipart_put`'s abort runs (a killed push left an incomplete upload
+    this morning). The previous handler is restored.
+  - A `BudgetSpent` inside a multipart exits 5 (resumable), not 1.
+  - `push-derived` keys by the path under the store's root. Features repeat
+    basenames across run dirs (1 694 files), so the basename key let one
+    run's file stand for another's. The candles snapshot is zstd'd
+    (4.40 GB → 816 MiB), and neither it nor the staged `.zst` outlives the
+    push, on any exit (a budget spent before the upload included).
+  - `archive-cycle.sh`'s budget fallback 600 → 3600 s, and
+    `local-setup.md` likewise. **Corrected by HK18:** a weekday's capture
+    is 6.0–6.4 GB stored, not ~2.2 GB, so 3600 s was short — 8400 s now.
+- **Not closed:** a SIGTERM during the initiate POST still orphans an upload
+  (its id is not known yet). The backstop is the bucket's
+  `AbortIncompleteMultipartUpload` rule, the operator's item.
+- **The bucket, 2026-10-14:** the three incomplete uploads aborted (this
+  morning's and the two of 2026-09-05); 304 runs complete;
+  `candles-20261014.db.zst` pushed; the features (1 694 files) pushing under
+  their run paths at the lane's close.
+- **Review:** one pass, NEEDS CHANGES, all acted on: the nightly budget,
+  the staged candles leak on failure, the body-pacing comment, a clock seam
+  for the limiter's tests, the handler assertions, the one-shot handler.
+- **Gates:** worker pytest (the archiver's, the config's, the store's,
+  candles, pmlr) 237 passed; ruff clean.
+
+### HK12 — retention's window, the session model, `_wtest`
+
+- `retention.sh` protects a run whose floored age is `< PROTECT_DAYS`
+  (was `<=`). With `PROTECT_DAYS=1` it kept every run under 48 h, not the
+  24 h `retention.conf.example` states. Deletion is still gated on S3
+  `verify` (S-LAW 3).
+- `.claude/settings.json`: `claude-opus-4-6` → `claude-opus-5-5` (O-8).
+- `_wtest`: an empty write-test file committed by a sandbox on 2026-08-14.
+
+### HK13 — A-S7-81: the shared binder leaves a repeat of the live roll alone (`exec-hyperliquid`)
+
+- **Ruling:** HK-R10 (2026-10-14), Q5 of the XH4i plan.
+- **The bug.** A roll naming the ids both legs are already bound to rebound
+  them in place: the legs' ledgers zeroed (a drift the reconciler halts
+  on) and the retired generation overwritten (a settlement of the old
+  instance then named no leg). The gateway arm guarded itself (A-S7-83);
+  the blocking arm did not.
+- **The fix.** `AssetTable::repeats_live_roll` (moved from `arm.rs`; one
+  copy). `bind_roll` asks it before rendering a name and returns
+  `Some([None, None])` with the table untouched. Both arms bind through it.
+  - The gateway arm keeps asking first, to count `rolls_repeated`.
+  - The blocking arm still counts a repeat as `rolls_bound`
+    (`engine_exec_hl_rolls_bound_total`). Nothing gates or halts on it.
+  - LAW E-8 is unchanged: a repeat retired nothing before and retires
+    nothing now.
+- **Limits:** one leg matching is still a full rebind (rolls bind pairs, so
+  it is unreachable); a stale replay of an OLDER roll is still a genuine
+  roll (ingress never re-announces a family that holds an instance).
+- **Discharged:** A-S7-81 as a precondition of XH4i-5, the C7 flip and any
+  live re-arm of BIN15. The XH4i-3b-2b note "the blocking arm keeps the bug
+  until he rules" is superseded.
+- **Tests:** `a_repeated_roll_keeps_the_ledgers_and_the_retired_generation`
+  (the binder); the blocking arm's
+  `a_repeated_roll_never_queues_a_sweep_of_the_live_leg` now pins the
+  ledger and the counter.
+- **Reviews:** risk APPROVE WITH NITS; alloc/zero-copy APPROVE WITH NITS
+  (the check moved above the name rendering, `#[must_use]`, the docs). No
+  allocation, no copy, nothing per tick.
+
+### HK14 — A-S7-101: the counting allocator does not count libtest's runner (`core-alloc`, `.config/nextest.toml`)
+
+- **Root cause.** `CountingAllocator` counts process-wide. libtest runs each
+  test on a thread it spawns (under nextest too), and right after the spawn
+  its MAIN thread allocates six times: the `running_tests` insert (140 B),
+  the timeout queue (608 B), its `Thread` handle (56 B), the mpmc
+  `Context` (48 B), the waker's mutex (64 B) and selectors (96 B) =
+  1 012 B. Under load the test thread opened its window first. Proved with a
+  probe allocator's backtraces (9 red in 7 200, every allocation on the main
+  thread). A-S7-14 (5 / 872 B) and A-S7-40 were tails of the same sequence.
+- **The fix.** The main thread is not counted on Apple (`pthread_main_np`)
+  and Linux (`gettid == getpid`), cached in a `const`, drop-free
+  thread-local; elsewhere no thread-local is read and every thread counts
+  (it can flake red, never pass wrongly). On Apple and Linux,
+  `AllocGuard::new` panics on the main thread. Every other thread counts as before, including the threads
+  the code under test spawns. No threshold moved.
+- `core-alloc` is linked only into `bench`'s `alloc_assertions`.
+- The six alloc tests leave nextest's `load-sensitive` group; the scrape
+  hammer stays.
+- **Evidence:** under 24 CPU hogs, 8 red in 14 400 before and 0 in 14 400
+  after; nextest `--stress-count` 0 red in 6 000. Break-and-watch: one
+  `Vec::with_capacity(8)` inside the window fails the gate.
+- **Reviews:** risk and alloc APPROVE WITH NITS (the cfg on the non-native
+  path, the cold classification, the doc example).
+
+### HK15 — A-S7-100's second half: the outcome battery on loopback (`cli` tests)
+
+- `outcome_battery_loopback.rs` drives `cli::outcome_battery::run` against
+  `exec_hyperliquid::testvenue` on 127.0.0.1 (real rustls), the way
+  `xmm_battery_loopback` drives the perps battery. The scripted venue lists
+  outcome 21406 (`#214060` / `#214061`) with fixed books; rests, refuses,
+  fills, modifies and cancels as the venue does; and pushes every reply to
+  the gateway and the battery's tap.
+- **The happy path:** the account, the boot (`rolls_bound` 1), the verbs on
+  YES, the NO leg, the IoCs and their reconciliations, the sweep, the end
+  read clear; exit 0 and the bar met. The happy path also asserts nothing
+  unserved was posted (no `updateLeverage` from an outcome arm).
+- **A failure path:** an account holding a YES leg at the start ends with
+  exit 40 and sends no order.
+- **Not on loopback:** a non-empty first snapshot (A-S7-96, exit 41), the
+  dead man's refusal below $1M traded, the signal stop, sales that do not
+  fill first time, the leftover exit 48.
+- Green 2/2; `--stress-count 10` 20/20; clippy clean.
+
+### HK16 — H90's leftovers (`crates/bench`, `claude-worker`)
+
+- `bin15/late_fair_in_window` (340 ns) and `bin15/late_grid_mark_and_perp_1s`
+  (1.6 ns) baselined: the median of five runs with bench-check's settings,
+  engine running (load 9.6), 335.2–342.9 ns and 1.597–1.621 ns. HK9's
+  1.6–2.3 ns spread did not recur. `make bench-check`: 16 OK (load 11.3).
+- `bin15_tape.EV_DT` is `pmlr.CHANNEL_EVENT_DT`; its private copy of the
+  events reader is gone for `pmlr.channel_event_array`.
+
+### HK17 — the docs, the operator files, and the lane's close
+
+- **Operator files (no commit):**
+  - `~/multivenue/strategy.conf` exports `BYBIT_REST_HOST=api.bytick.com`
+    (backup `strategy.conf.bak-20261014T102233Z-hk`): boot discovery looped
+    on `api.bybit.com` from this Mac.
+  - The ten empty run dirs of 2026-10-12 (nine at 00:11–00:23Z, one at
+    20:15Z) removed with `rmdir`.
+  - The finished lanes' 108 `tools_*` one-shots moved to `docs/research/<lane>/tools/`
+    (HK-R7; list in `docs/research/tools-moved-2026-10-14.txt`); 86 stay
+    (BIN15, XMM, `pmlr_symfilter`, `all_trades_csv`).
+- **Watched: Polymarket's parse errors.** After the 08:33Z restart, 58 in
+  32 min with 0 reconnects: a steady ~0.1 % of messages, not a FIN path.
+  What they are needs `--raw-tap pm` (rejects only), which the wrapper does
+  not pass today.
+- **The lane's commits:**
+
+  | cut | commit |
+  |---|---|
+  | HK11 | `1edacf4` |
+  | HK12 | `38ad1fd` |
+  | HK13 | `b8b4f1c` |
+  | HK14 | `9c390fa` |
+  | HK15 | `c24557d` |
+  | HK16 | `c24f7c1` |
+  | HK17 | this commit |
+
+  - Nothing pushed (HK-R5). The deploy follows this commit (HK-R8).
+- **Final gates (`c24f7c1`):**
+  - clippy clean;
+  - nextest 4 652 passed, 10 skipped (one nextest `LEAK`, a pass);
+  - alloc 127/127;
+  - copy-audit 27 / new 0;
+  - license-check OK (689 files);
+  - `make bench-check` 16 OK;
+  - worker pytest (HK11's suites) 237 passed; ruff clean on every touched file.
+
+### HK18 — the nightly upload budget, sized from a measured day (2026-10-15)
+
+- **The finding.** The first nightly cycle under the 1 MiB/s cap (2026-10-14,
+  04:30 local = 21:30Z) spent its 3600 s on three runs (0.48, 1.83 and
+  0.97 GB stored, each at ~0.9 MiB/s) and stopped inside a fourth's
+  `bn-ticks` (exit 5, resumable). HK11 had sized the budget from ~2.2 GB a
+  day; the bucket's own manifests say a weekday is 6.0–6.4 GB stored
+  (2026-10-12: 5.95 GB over 23.6 h; 10-13: 6.38 over 23.9 h; 10-14: 6.35 per
+  24 h), the weekend 3.2–3.9. 3600 s at the cap moves ~3.5 GB: the backlog
+  would have grown every weekday.
+- **The change.** `S3_CYCLE_BUDGET_S` 8400 in `archive-cycle.sh`'s fallback,
+  `retention.conf.example`, `local-setup.md` and the live
+  `~/multivenue/retention.conf` (backup `retention.conf.bak-20261015T083615Z-hk18`).
+  8400 s moves ~8.8 GB, a weekday plus a night's backlog, and ends by
+  23:50Z — before the 00:10Z restart slot, which also runs retention.
+- **Backlog, 2026-10-15:** pushed by hand at the cap the same morning, so
+  the first 8400 s night starts level.
+- The rate stays 1 MiB/s: 2 MiB/s failed HK11's measurement.
+- Also corrected: CLAUDE.md's restart slots (00:10/08:33/16:05/20:15/21:15Z;
+  the 20:15/21:15 pair is BST3.5's equity-dailies refresh), and HK11's
+  ~2.2 GB / ~35 min in its record, its migration entry and the config
+  comment.
+
+### HK19 — the raw tap from `strategy.conf` (`scripts/engine-wrapper.sh`), 2026-10-15
+
+- **Why.** Polymarket's parser rejects ~0.17 % of messages (420 in 243 658
+  over 08:34–10:46Z on 2026-10-14, one reconnect) and nothing says which. The
+  engine's §6.5 raw tap (`--raw-tap`, docs/wire-format.md "Raw tap") records
+  exactly the rejected payloads, but the wrapper had no way to pass it.
+- **What.** `RAW_TAP=<labels>` in `~/multivenue/strategy.conf` (comma-
+  separated from `pm bn okx rpc deribit hl bybit mexc hyperevm hypercall`, or
+  `all` alone), `RAW_TAP_MODE` (`rejects`, the default, or `all`) and
+  `RAW_TAP_BUDGET_MB` (positive; the engine's default is 64) become
+  `--raw-tap …`. A value the engine would refuse — an unknown or repeated
+  label, an empty one, `all` with others, a bad mode or budget — is refused
+  by the wrapper (exit 78) before discovery, the other keys' shape. Tested
+  on eleven cases through the wrapper's own block.
+- **Bounded.** Rejects only, ≤ 64 MiB per venue per run; `<venue>-raw.tap` sits
+  in the run dir, so the archiver carries it (a non-PMLR file: its manifest
+  row has null PMLR facts) and retention removes it with its run.
+- **Not changed:** no hot-path code; the tap's own cost is the existing
+  `parse_reject` path (a bounded write on a reject).
+- **Switched on:** `RAW_TAP=pm` in the live `strategy.conf` (backup
+  `strategy.conf.bak-20261015T083817Z-hk19`), live from the 16:05Z restart.
+
+### HK20 — the upload cap raised to 20 MiB/s (operator's ruling, 2026-10-15)
+
+- **Ruling:** the operator raised the cap to 20 MiB/s.
+- **Measured before the change** (the backlog push of 2026-10-15, 08:42–08:49Z,
+  every venue's delay EMA sampled every ~15 s):
+
+  | phase | samples | > 500 ms | worst | throughput |
+  |---|---|---|---|---|
+  | no upload | 6 | 0 | 241 ms (Bybit) | — |
+  | 20 MiB/s, 240 s | 18 | 1 | 551 ms (Polymarket) | ~5 MB/s, the link's own |
+  | no upload after | 5 | 0 | 111 ms | — |
+
+  At 20 the link, not the cap, sets the rate, and the delays stayed at
+  HK11's 1 MiB/s level (one sample in eighteen over 500 ms). The 2026-10-14
+  stall (Deribit 65 535 ms) did not recur: that push wrote 8 MiB at a time
+  uncapped, through a link that hour measured worse (HK11's 2 MiB/s phase
+  already reached 2.8 s). Which of the two caused it is not separated.
+- **What changed:** `MULTIVENUE_S3_MAX_UPLOAD_MIBPS` default 1 → 20
+  (`archive_config.py`, `s3.env.example`). 20, not 0: a capped upload still
+  hands the socket 64 KiB at a time; 0 streams 8 MiB chunks. A weekday's
+  capture (6.0–6.4 GB stored) now takes ~20 min; the 8400 s budget stays as
+  a ceiling (HK18).
+- **Also proven live the same morning:** SIGTERM to a running push (the
+  08:36Z backlog push) exited 143 and left no incomplete upload (HK11's
+  handler).
+- **Watch:** the 00:30Z check-in of 2026-10-16 reads the first night at 20.
+  If the delays misbehave on the link's bad hours, lower the cap in
+  `s3.env` (no code change).
+
+### HK21 — the archiver clears orphaned uploads; a SIGTERM during the initiate no longer orphans one (`claude-worker` objstore, archive; `scripts/archive-cycle.sh`; the archive plist), 2026-10-15
+
+- **Why.** The bucket has no `AbortIncompleteMultipartUpload` rule, and
+  HK11 left one window: a SIGTERM after the bucket made an upload but before
+  its id was in hand unwound with nothing to abort. Orphans were cleared by
+  a scratch script (`target/hk/s3_abort_orphans.py`).
+- **Verbs.** `archive-run.py uploads [--prefix]` lists incomplete multipart
+  uploads (`list_multipart`, following both markers). `abort-stale
+  [--older-than-h 24] [--prefix]` aborts those begun over a day ago — a push
+  in flight is younger, a night's cycle being ≤ 8400 s — and logs each
+  (`archive: aborted <key> initiated=<t>`). A start it cannot read (naive or
+  unparsable `Initiated`) is never judged: counted as `unparsed=`, exit 1, so
+  a provider format change cannot pass for "nothing stale". An abort is the
+  client's one DELETE verb and touches only parts that never completed
+  (S-LAW 11).
+- **The cycle.** `archive-cycle.sh` runs `abort-stale` before the push,
+  non-fatal. Its time comes out of `S3_CYCLE_BUDGET_S`: the push gets what is
+  left, and none left exits 5 (`--budget-s 0` would mean unbounded).
+  `${=NET_PREFIX}`: zsh never word-splits the plain form, so
+  `S3_NICE_NETWORK=1` would have run "taskpolicy -b" as one word, exit 127
+  (pre-existing; unset live, never hit).
+- **The SIGTERM hold.** `multipart_put` holds SIGTERM (blocked, not ignored)
+  across each initiate ATTEMPT: a failed attempt releases it before its
+  backoff; the answering one keeps it until the upload id is inside the
+  abort's try, where the held signal lands. The initiate, the abort and the
+  listing run on `CONTROL_TIMEOUT_S` = 15 s, so a stalled attempt delays a
+  stop by its connect plus its read, ≤ ~30 s. The first version held across
+  the whole retry loop — up to 6 × 900 s, past launchd's 20 s before SIGKILL;
+  the review caught it. `pthread_sigmask` runs a pending handler before it
+  returns, so `_hold_term` unblocks again if the handler raises out of the
+  blocking call itself. It holds on the main thread of a single-threaded
+  process (the archiver). An attempt whose answer was LOST made an upload no
+  one can name: `abort-stale` clears it the next night. **Superseded the
+  same day by HK27:** a mask is per thread, and with any other thread in the
+  process the OS handed SIGTERM to that thread (the full worker suite showed
+  it); the hold is now a deferral of the handler.
+- **launchd.** `ExitTimeOut` 60 in `launchd/com.multivenue.archive.plist`
+  (the engine's; the default is 20 s). The installed agent was re-rendered
+  and re-bootstrapped alone (backup `com.multivenue.archive.plist.bak-…-hk21`
+  in `~/Library/LaunchAgents`); `launchctl print` says `exit timeout = 60`.
+  Not through `install-launchd.sh`, which restarts the engine.
+- **`push-derived --path`.** A path under the kind's root is keyed by the
+  path relative to it, as the default run keys it; only the parent is
+  resolved, so a symlink keys by its own name.
+- **Tests.** The listing across pages (two uploads of one key, split by the
+  upload-id marker); the age sweep; unreadable starts; the held SIGTERM
+  reaching the abort; a failed attempt releasing before its backoff (no
+  sleep, one POST); the handler raising inside the blocking call; the control
+  timeouts; `--path` keys with symlinks both ways. A fixture restores the
+  mask and the handler (SIGTERM ignored meanwhile), so a regression cannot
+  leave SIGTERM blocked for later tests or kill the runner. Break-and-watch:
+  the two new SIGTERM tests fail on the whole-loop hold and on the unguarded
+  block. Worker suites (archive, config, agent, objstore, retention) 185
+  passed; ruff clean. (The mask's tests went with the mask in HK27.)
+- **Live.** `uploads`: 0 incomplete; `abort-stale`: aborted 0, kept 0,
+  unparsed 0. It runs nightly from 2026-10-15 21:30Z.
+
+### HK22 — one `l2Book` reader for the outcome battery and the H90 probe (`cli`), 2026-10-15
+
+- **Why.** Flagged when `xmm` merged: the H90 dust-test probe
+  (`hl_outcome_probe`) and the outcome battery each read Hyperliquid's REST
+  `l2Book` answer with a parser of their own.
+- **What.** `outcome_battery::book_of`, on the engine's own
+  `ingress_hyperliquid::parse_l2book_header`, is the one reader: `null` is no
+  book; anything not a book stated in range (price in (0, $1], size in
+  (0, 1e8 contracts], checked at 1e6 scale before the ×100) is an error,
+  never priced off. The probe's `touch_of` maps its `Top`; `null` keeps
+  "l2Book #<enc>: unreadable". The battery's hand scanner is gone.
+- **Narrowings, all fail-safe.** The probe refuses an out-of-range book and a
+  side whose best level is `null` or priced under 1e-6, which it read empty
+  (it skips that sample); the battery requires `time` and well-formed levels.
+  Under 0.01 a price past six decimals reads truncated, as the engine reads
+  it: `floor_tick` is unchanged; `ceil_tick` of such an ask can land a tick
+  low and a percentage step (`sale_px`, `under`) floor a tick deeper —
+  neither reachable on a book held to the 1e-4 grid. The probe buys only at
+  asks ≥ 0.50, which read exactly.
+- **Reviews.** risk / alloc / zero-copy: SHIP. Allocation only on error
+  paths; the battery parses in place from the response buffer.
+- **Tests.** The reader's bounds and exact error text; its 1e-6 edges
+  (truncation not rounding, sub-1e-6 and `null` levels refused, a 96-byte
+  cut through a multi-byte character lossy, never a panic); the probe's
+  touch equal to the battery's top and the old mapping. cli nextest 627
+  passed; clippy clean.
+- **Left.** core-parse's `scan_u64` uses `wrapping_mul`: a 20-digit whole
+  part wraps (`"18446744073709551616.5"` reads 0.5). Pre-existing, the
+  engine's hot path: its own reviewed cut. `hyparb_rehearsal`'s depth
+  reader, and the probe's `dec_1e8` / `mid_of` (copies of `xmm_battery`'s).
+  (All closed the same day: HK24, HK25.)
+
+### HK23 — the nextest `LEAK`: a nextest race, no test at fault, 2026-10-15
+
+- **Seen.** `ingress-hypercall`
+  `discovery::tests::a_series_inside_the_blackout_is_never_selected` marked
+  LEAK at 0.212 s under a full run: its usual 6–13 ms plus nextest's 200 ms
+  leak timeout. It parses an `include_bytes!` fixture and spawns nothing.
+- **Cause.** cargo-nextest 0.9.143 on macOS: std makes a pipe with `pipe()`
+  and only then marks it close-on-exec (macOS has no `pipe2`), and nextest
+  spawns tests from several threads, so a test spawned in that gap inherits
+  a sibling's capture pipe and holds it open past the sibling's exit.
+  Fixed upstream in 0.9.145 (2026-09-16).
+- **Evidence.** 14 full runs: 5 LEAKs on 5 different tests in 4 crates, none
+  of which spawns. A probe crate (64 no-op tests, one process in eight
+  sleeping 1 s, 8 960 runs each): 0.9.143 started 89 tests holding a
+  sibling's pipe and reported 11 LEAKs; 0.9.148 0 and 0. Full workspace,
+  alternating: 0.9.143 one LEAK in three runs, 0.9.148 none in three.
+- **What changed.** `.config/nextest.toml` recommends 0.9.145 (a warning on
+  older, never a failure). No test, timeout or `leak-timeout` touched.
+- **Operator.** Upgrade cargo-nextest to ≥ 0.9.145. **Done 2026-10-15
+  10:30Z** (the operator's word): `brew upgrade cargo-nextest` 0.9.143 →
+  0.9.148 (a Homebrew install; the old keg kept). Full runs since: no LEAK.
+
+## HK, part 3 — the rest of the housekeeping (2026-10-15)
+
+**Ask (Anton):** "ask me all questions you need to clarify and then proceed
+until all the housekeeping will be done". **Plan:** project doc
+`claude/hk-sectionc-plan-2026-10-15.md`. **Rulings:** nextest upgraded
+(HK-R11); core-parse's overflow fixed and deployed (HK-R12); both duplicates
+removed (HK-R13); one format-only commit for the HK lane's drifted files
+(HK-R14); push `main` at the end (HK-R15); `pvm-pine-engine` left (HK-R16);
+the Polymarket rejects fixed only if their cause is clear (HK-R17); the
+Makefile comment fixed (HK-R18); of the strategy rulings only "build the
+HYPARB G1 tally" (HK-R19); S3 versioning, the lifecycle rule and key rotation
+stay the operator's (HK-R20); the lost `-dotnet/PLAN.md` is let go (HK-R21).
+
+### HK24 — core-parse refuses an integer past u64 instead of wrapping it (`core-parse`, `ingress-mexc`, `ingress-ai`), 2026-10-15
+
+- **Defect.** `scan_u64` accumulated with `wrapping_mul`/`wrapping_add`: a
+  digit run past `u64::MAX` wrapped silently, so
+  `scan_price_1e6("18446744073709551616.5")` read 0.5 — and an AI ruleset
+  whose `max_risk_usd` was that literal was ACCEPTED at $0.50. `scan_i64`'s
+  `-(mag as i64)` panicked in debug at i64::MIN.
+- **Fix.** A run of ≤ 19 digits keeps the old loop (it cannot overflow); a
+  longer one is re-read with checked arithmetic in a `#[cold]
+  #[inline(never)]` function, taken through `buf.get(..)` (no slice panic left
+  in the code): `None` past `u64::MAX`. `scan_i64` is exact at both ends
+  (`checked_sub_unsigned` / `try_from`). ingress-mexc's own `scan_u64_checked`
+  — it existed only because core-parse wrapped — is gone (5 sites); ingress-ai
+  maps a `None` where a digit is guaranteed to its `Number` reject.
+- **Audit** (every caller, ~70 sites, `target/hk/cp/audit.md`): no field read
+  through these scanners can exceed u64/i64 on the wire — timestamps are ms/s,
+  sequence numbers < 1e14, ids within u64; Polymarket's 77-digit asset ids are
+  compared as raw bytes, EVM values are hex-decoded elsewhere. Every changed
+  outcome fails closed (exec-hyperliquid `nRequestsUsed` past u64 now falls
+  back to the cold budget instead of granting a wrapped one).
+- **Cost.** `scan_u64` +2–7 % (one compare), `scan_i64` +0.2 ns (scratch
+  micro-bench, M4); `make bench-check` unchanged (no gated bench calls these).
+  Fuzz 60 s each, clean: `core_parse_price`, `ruleset_json`, `mexc_ws_frame`,
+  `mexc_instruments`, `deribit_book`, `okx_book_seq`, `hl_ws_frame`.
+- **Tests.** u64::MAX and one past; 25 digits; leading zeros; i64 bounds; the
+  three price scales with a 20-digit whole part; two proptests against
+  `str::parse` (their shrunk seeds kept in `proptest-regressions`); the $0.50
+  ruleset; MEXC readers' overflow. Each fails on the old code. Reviews: risk /
+  alloc / zero-copy: SHIP, findings applied.
+
+### HK25 — the rehearsal reads `l2Book` with the engine's parser; one `dec_1e8` (`cli`), 2026-10-15
+
+- `hyparb_rehearsal` drops its hand-written scanner (and its `Vec` book) for
+  `ingress_hyperliquid::parse_l2book_depth` (`DepthTopK`, no heap). Prices and
+  sizes stay ×1e6, exact for a perp. Five levels a side (`DEPTH_K`) instead of
+  up to 20: `through` prices at the level holding 2× the leg, else the fifth —
+  never past a quoted level, less aggressive than the old 20th-level fallback.
+  `"time"` is required; a `null`, zero or negative level in the top five
+  rejects the answer. A failed book read on a hedge leg now spends one of its
+  3 tries instead of stopping with the bought leg open.
+- The H90 probe uses `xmm_battery`'s `dec_1e8` / `mid_of`; the shared
+  `dec_1e8` is signed (the probe's fee parsing needs it) and `mid_of` refuses
+  a mid not above zero, so `xmm_battery` still fails closed.
+- Reviews: risk / alloc / zero-copy: SHIP, findings applied. Left by design:
+  the close leg's size includes any position the account already held (a large
+  one may take all 3 tries and end FAIL, loud).
+
+### HK26 — the HYPARB G1 tally (`claude_worker.hyparb_g1`), 2026-10-15
+
+- **Why.** G1 had nothing counting it: `pnl_report --hyparb-ladder` is a
+  re-simulation that had never run (and every rung was refused: the harness
+  rejects a `mode = "testnet"` artifact); `/state`'s session P&L dies with
+  each restart; the nightly report's slot-0 row is audit-pnl's re-model of the
+  LOGGED orders, which has no AMM judge, so it is the hedges alone — never G1.
+- **What.** Each CLOSED run dir's slot-0 paper fills and orders are folded
+  under the member's own law (strategy-hyparb `pnl_session_usd_1e6`: pool fee
+  in the fill, taker fees, gas p50 per attempt, funding, marks perp-then-spot)
+  into `~/multivenue/worker/hyparb/g1-sessions.tsv` — idempotent, the live run
+  never stored, error rows never summed and retried, marks from the run's tape
+  else `candles.db` (staleness-bounded, labelled), each row with the
+  artifact's hash and mtime. The 2-block condition replays lean ≤ 2 h units
+  (only `hl-*`/`hyperevm-*`) at r3 and at `--latency-ns-venue
+  hyperevm:2000000000` into `g1-replay.tsv`; it must cover every day of
+  condition 1 with ≥ 200 judged fills, else INCOMPLETE. Replays boot a scratch
+  copy of the artifact as `mode = "paper"` (the member is identical), which
+  also un-breaks `--hyparb-ladder`. `backtest`'s counters line prints
+  `pnl_session_usd=`.
+- **Nightly.** `daily-restart.sh`'s 0020 slot runs `accrue` (120 s a rung, 300
+  s for the replay — a live worker process holds off the boot recommit).
+- **Checked live.** The fold of the running session equals `/state` (attempts,
+  fills, gas, notional exact; P&L within µ$); candle-marked vs tape-marked
+  folds of the same runs differ by $0.0025 in total.
+- **Result (2026-09-25 → 10-15, 114 sessions): G1 NOT PASSED.** 833 judged AMM
+  fills (≥ 200 met), Σ pnl_session **−$59.46** = cash −$42.87 (taker fees
+  $44.37 inside) + inventory −$1.06 + funding −$0.25 − gas $15.28; before fees
+  and gas ≈ +$0.19. 2 of 21 days positive. Condition 2: INCOMPLETE (not
+  replayed). The sample caveat stands: `cap_day` $2k of SUBMITTED notional
+  restarts with each session, so a session samples its first ~20 arbs.
+- Review: one pass (NEEDS CHANGES: condition-2 coverage, the artifact per
+  session, the slot's time bound, heal/refold, funding/marks gaps, helper
+  reuse), all applied.
+
+### HK27 — the initiate's SIGTERM hold is a deferral, not a per-thread mask (`claude-worker` objstore), 2026-10-15
+
+- **Defect (HK21's).** `pthread_sigmask` blocks a signal on ONE thread. With
+  any other thread in the process the OS hands SIGTERM to a thread that does
+  not block it, and Python still runs the handler on the main thread
+  mid-initiate — the orphan HK21 meant to close. The archiver is
+  single-threaded; the full worker suite (earlier tests leave threads) failed
+  the HK21 test this way. Shown deterministically with `pthread_kill` to
+  another thread: the mask orphaned 200/200.
+- **Fix.** The hold swaps in a recording handler; the release puts the old one
+  back and, if a SIGTERM came meanwhile, raises it again
+  (`signal.raise_signal`), so its SystemExit comes out where the abort reaches
+  it. Python runs handlers on the main thread whichever thread the OS picked,
+  so it holds with threads. The deferral is kept before it is installed and
+  dropped only once released (a release cut short by a KeyboardInterrupt is
+  finished by the next — no recorder is stranded to swallow later SIGTERMs);
+  no deferral off the main thread or without a Python handler (None, SIG_DFL,
+  SIG_IGN). The `pthread_sigmask` race handling went with the mask.
+- **Tests.** SIGTERM sent to another thread during the initiate reaches the
+  abort (synced on the wakeup fd); the archiver's real one-shot `_terminate`
+  with two SIGTERMs: one exit 143, the abort, SIG_IGN after; a release cut
+  short is finished by the next. Full worker suite 1 786 passed. Review: SHIP,
+  findings applied.
+
+### Deploy (HK-R12), 2026-10-15
+
+- `cargo build --release -p cli` at `4098f7b` (1 m 42 s), `exec-smoke.sh
+  --offline` PASS, `pkill -TERM` 12:46:39Z (after the 12:45 settlement
+  minute).
+- Booted: `git_sha 4098f7bf864c`, halted 0, `engine_vm_rows_active 2`, the
+  nine feeds flowing (Polymarket, Binance, OKX, Deribit, Hyperliquid, Bybit,
+  MEXC, HyperEVM, Hypercall; `rpc` is unconfigured, as before), feed delays
+  43–129 ms; the wrapper passed `--raw-tap pm --raw-tap-mode all
+  --raw-tap-budget-mb 512` (the largest-frame window).
+- Gates at `4098f7b`: clippy clean; nextest 4 662 passed (10 skipped), no LEAK
+  under nextest 0.9.148; alloc 127/127; copy-audit 27 / new 0; license OK;
+  worker suite 1 786 passed (3 skipped).
+
+### HK28 — format only (the HK lane's drifted files), 2026-10-15
+
+- rustfmt (per file, never `cargo fmt --all`) on `exec-hyperliquid` (26
+  files), `cli` `hl_outcome_probe.rs` and `backtest/member.rs`; `ruff format`
+  on `archive.py`, `objstore.py`, `hyparb_ladder.py`, `archive_config.py` and
+  their tests and `fake_s3.py`. No behaviour change (whitespace, wrapping, import order); all gates rerun green. The
+  running binary (`4098f7b`) is semantically this tree.
+- **Left (a ruling):** the rest of the workspace drifts too — ~208 more Rust
+  files (`cargo fmt --all -- --check -l`: 236 in all) and ~106 worker files
+  (ruff's line-length 100 against code wrapped narrower). Formatting all of it
+  is `cargo fmt --all` in effect, which the house rule bans; it stays as is
+  unless the operator rules otherwise.
+
+### HK30 — Polymarket's post-trade `book` re-snapshots parse (`ingress-polymarket`), 2026-10-15
+
+- **Cause.** Every Polymarket parse error (~0.2 % of messages; 46 in the first
+  hour of the all-frames tap) was one shape: after subscribe the venue
+  re-sends a book as a SINGLE object with ", " separators (`{"price":"0.01",
+  "size":"…"}, {…}`), bids/asks before hash/timestamp, no `tick_size`.
+  `scan_best_level` matched compact bytes (`","size":"`, `{` right after `,`),
+  so every re-snapshot was rejected; only the subscribe-time array form
+  parsed.
+- **Fix.** The level walk skips JSON whitespace after `[`, between `",` and
+  `"size":"`, after each `}` and `,` (core-parse `skip_ws`), returns at `]`,
+  and now rejects leading/trailing/doubled/missing commas (the old walker
+  accepted `[,{…}]`, `[{…},]`, `},,{`, `}{`).
+- **What it buys.** A quiet parse-error counter and the touch sizes in the
+  capture. Each re-snapshot is post-trade: the same `timestamp` and best
+  bid/ask as the `price_change` just before it (122/122) — no fresher touch.
+- **Evidence.** 46/46 rejects parse and match a Python json decode; 17 279
+  accepted events/rows identical before/after; 126/126 book events in both
+  forms match an independent max-bid/min-ask. Fuzz ~5–6 M runs clean; the
+  compact path's A/B unchanged; copy-audit new 0. Reviews: SHIP.
+- **Deployed** at `ddc1d6a`, `pkill -TERM` 13:46:38Z: Polymarket parse errors
+  0 since (0 rejects in the 13:46Z, 16:05Z and 16:31Z taps).
+
+### HK31 — Polymarket `venue_seq` is a per-asset arrival ordinal (`ingress-polymarket`), 2026-10-15
+
+- **Defect** (found in HK30's review). `Tick.venue_seq` was the low 32 bits of
+  the frame's ms timestamp and book-builder's `TopOfBook::apply` drops
+  `venue_seq <= last` as Stale, so every update sharing its asset's previous
+  millisecond was dropped — 8–10 % of `price_change` rows, 172 touch changes
+  an hour, every post-trade re-snapshot — and at the low-32 wrap (next
+  2026-11-21 21:25:29.728Z) every pm tick would have been Stale until a
+  restart.
+- **Fix.** A per-asset `{ last_ms, seq }` in the PM driver (a fixed array by
+  SymbolMap row, owned by the ingress thread): a frame at or after the asset's
+  newest ms takes the next ordinal (arrival order on the one connection = the
+  venue's order); an older frame gets 0 — dropped by every book, counted on
+  `engine_ingress_polymarket_seq_regressions_total`. A reconnect zeroes
+  `last_ms` (a poisoned clock clears) and keeps `seq` (monotone per process).
+  Parsers emit 0; the run loop stamps after a successful parse.
+- **Evidence.** Only `TopOfBook::apply` interprets pm `venue_seq`; nothing
+  reads it as a time; one PM connection; 0 timestamp decreases in 164 372
+  rows. An hour's tap through the real `drive_one` into `TopOfBook`: new law
+  164 666 applied, 0 stale, 0 gaps, 0 older applied; old law 13 372 stale, the
+  touch lagging in 170 episodes (3.57 s, worst 430 ms); 184 touch prices
+  recovered. Reviews: SHIP.
+
+### HK32 — Hyperliquid `bbo` / outcome `l2Book` touch and Deribit `quote`: the shared arrival ordinal (`core-types`, `ingress-hyperliquid`, `ingress-deribit`), 2026-10-15
+
+- **Ruling.** The operator chose to fix HL and Deribit the same way (both used
+  `venue_seq = ms as u32`; same collapse, same 2026-11-21 wrap for all three
+  venues).
+- **What.** `core_types::ArrivalSeq` (HK31's sequencer, shared; PM moved onto
+  it). HL: one sequencer per coin row for `bbo` AND the outcome-leg `l2Book`
+  touch — one book needs one sequence. The two are different views: within a
+  block the l2Book touch is never looser than the bbo, and the venue sends it
+  second (115/115 on outcome legs, 4 798/4 800 on perps), so it wins the
+  block; the rare reversed order lets the looser bbo win, accepted. A roll
+  rebinds the row under the same SymbolId and keeps the ordinal. Deribit: one
+  per symbol index. `IngressStatus::note_arrival_seq` counts a 0 on
+  `seq_regressions_total` (cold path).
+- **Measured** (one closed hour, captured ticks rebuilt to wire frames through
+  the real `drive_one`): HL 368 687 applied, 0 stale — old law 116 stale (the
+  block's l2Book touch right behind its bbo), 84 touch prices lost, 137 s of
+  lag on the outcome legs (perps had no same-ms pairs: the change there is the
+  wrap). Deribit 821 405 applied, 115 older quotes dropped and counted
+  (backlogs after multi-second host stalls) — old law 80 more stale, 3 touch
+  prices.
+- **Baselines for `seq_regressions_total`:** pm ~0/h, hl ~0/h (an HL re-send
+  carries the last-change stamp, so an occasional count is not a stuck clock),
+  deribit ~115/h.
+- Reviews: SHIP (both), findings applied; fuzz `hl_ws_frame` /
+  `deribit_jsonrpc_frame` clean; bench-check 16/16; copy-audit new 0.
+
+### Deploys of HK30–HK32, 2026-10-15
+
+| at | binary | how | checked |
+|---|---|---|---|
+| 13:46:38Z | `ddc1d6a` (HK30) | release build, `exec-smoke --offline` PASS, `pkill -TERM` after the 13:45 settlement minute | 9 feeds, halted 0, `vm_rows_active 2`, PM parse errors 0 |
+| 16:05Z | `ddc1d6a` | the daily-restart slot | — |
+| 16:31:36Z | `9f5bc8c` (HK31+HK32) | release build, `exec-smoke --offline` PASS, `pkill -TERM` after the 16:30 settlement minute | 9 feeds, halted 0, `vm_rows_active 2`, PM parse errors 0, `seq_regressions_total` 0/0/0 |
+
+Gates at `9f5bc8c`: clippy clean; nextest 4 693 passed (10 skipped); alloc
+127/127; copy-audit 27 / new 0; license OK.
+
+### Polymarket's largest frame (the all-frames window, 2026-10-15 12:46–~18:30Z)
+
+- `--raw-tap pm --raw-tap-mode all --raw-tap-budget-mb 512` over four runs
+  (12:46Z, 13:46Z — its tap filled the 512 MiB budget after 1.85 h —, 16:05Z,
+  16:31Z): **982 584 frames in 3.53 h; max 10 152 B; p99 623 B, p99.9 2 394 B,
+  p99.99 3 180 B; none over 16 KiB.**
+- Against `RX_BUF_SIZE` = 64 KiB (`ingress-polymarket/src/run_loop.rs:60`),
+  where a larger frame is refused by the HK2 oversize guard (test at
+  `run_loop.rs` ~1296): the largest frame uses 15.5 % of the buffer, a 6.5×
+  margin. The theoretical worst case is a full 0.001-tick ladder (~74 KB),
+  which these markets (0.01 ticks, ≤ 99 levels a side, ~7 KB) do not reach.
+- The tap is back to rejects-only from the next boot: `strategy.conf` keeps
+  `RAW_TAP=pm` (backup `strategy.conf.bak-…-hk-tapoff`); the wrapper block
+  yields `--raw-tap pm --raw-tap-mode rejects`.
+
+### Open after HK30–HK32 (rulings)
+
+- **BIN15 O8, which source is the outcome touch.** Across blocks the
+  outcome-leg touch alternates between the tighter `l2Book` view and the
+  looser `bbo` view; BIN15 reads ticks raw, last-arrival-wins (under both
+  laws). Which source is the truth when both sides are quoted is a BIN15
+  ruling.
+- **Other u32 truncations.** Binance bookTicker `u`, Bybit `update_id` and
+  MEXC `version` are also cut to u32 in `Tick.venue_seq`. No live `TopOfBook`
+  reads those venues today; a later HK.
+- **Hyperliquid `parse_errors_total`** reads 8 in the first ~20 min after the
+  16:31Z boot (137 782 messages). HK32 did not touch HL's dispatch; whether
+  this is the old rate is unknown (no counter history). `RAW_TAP=pm,hl`
+  (rejects only) at a boot would name them.
+

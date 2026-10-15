@@ -35,10 +35,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use strategy_set::{StrategySet, BIT_VM};
 
-// The lane arrays below are written out for the lane geometry (six
-// tick lanes since WS9 added Bybit); break the build loudly if that
-// drifts.
-const _: () = assert!(NUM_TICK_LANES == 6 && NUM_FILL_LANES == 4);
+// The lane arrays below are written out for the lane geometry (eight
+// tick lanes and four opt lanes since HC1 added Hypercall, after MX2's
+// MEXC and WS9's Bybit; five fill lanes since BX3 gave Binance lane 4);
+// break the build loudly if that drifts.
+const _: () = assert!(NUM_TICK_LANES == 8 && engine::NUM_OPT_LANES == 4 && NUM_FILL_LANES == 5);
 
 /// Raw Polymarket SymbolId (venue byte 0) — the boot-universe shape
 /// `build_ai_universe` produces for `--polymarket-sym-id`.
@@ -144,6 +145,8 @@ fn harness(tag: &str) -> Harness {
     let (_t3p, t3) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t4p, t4) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t5p, t5) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    let (_t6p, t6) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    let (_t7p, t7) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     // WS10-A: venue-event lanes ride in every engine (producers
     // dropped — the lanes read empty; this harness exercises the
     // ruleset plumbing, not funding).
@@ -159,6 +162,10 @@ fn harness(tag: &str) -> Harness {
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     let (_e5p, e5) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e6p, e6) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e7p, e7) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     // WS10-B: depth lanes ride in every engine (producers dropped).
     let (_d0p, d0) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
     let (_d1p, d1) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
@@ -166,22 +173,24 @@ fn harness(tag: &str) -> Harness {
     let (_o0p, o0) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
     let (_o1p, o1) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
     let (_o2p, o2) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
+    let (_o3p, o3) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
     let (_sp, sc) = Ring::<core_types::Signal, SIGNAL_RING_SIZE>::new().split();
     let (_f0p, f0) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f1p, f1) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f2p, f2) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f3p, f3) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
+    let (_f4p, f4) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (ai_prod, ai_cons) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
 
     let mut eng = Engine::new(
         StrategySet::new(BIT_VM),
         PaperDispatcher::new(),
-        [t0, t1, t2, t3, t4, t5],
-        [e0, e1, e2, e3, e4, e5],
+        [t0, t1, t2, t3, t4, t5, t6, t7],
+        [e0, e1, e2, e3, e4, e5, e6, e7],
         [d0, d1],
-        [o0, o1, o2],
+        [o0, o1, o2, o3],
         sc,
-        [f0, f1, f2, f3],
+        [f0, f1, f2, f3, f4],
         ai_cons,
         Arc::clone(&status),
         table_cons,
@@ -203,7 +212,7 @@ fn harness(tag: &str) -> Harness {
 /// Stage cmd precedes the table in real time (§4.4/§6).
 fn stage(h: &mut Harness, seq: u32, hash128: [u8; 16]) {
     let cmd = ruleset_cmd(AiCmdKind::RulesetStage, seq, hash128);
-    h.ai_prod.try_push(cmd).expect("stage cmd push");
+    assert!(h.ai_prod.try_push_ref(&cmd), "stage cmd push");
     h.side.on_cmd(&cmd);
 }
 
@@ -223,9 +232,11 @@ fn staged_table_commits_and_fires_through_engine_loop() {
     // Same batch: the Commit is already in the AI ring before the
     // engine runs at all. Pop-precedes-AI-drain makes this flip in
     // ONE iteration.
-    h.ai_prod
-        .try_push(ruleset_cmd(AiCmdKind::RulesetCommit, 2, hash_a))
-        .expect("commit cmd push");
+    assert!(
+        h.ai_prod
+            .try_push_ref(&ruleset_cmd(AiCmdKind::RulesetCommit, 2, hash_a)),
+        "commit cmd push"
+    );
     h.eng.tick(16);
 
     assert_eq!(h.eng.ai_dispatched, 2, "Stage + Commit dispatched");
@@ -238,9 +249,10 @@ fn staged_table_commits_and_fires_through_engine_loop() {
     assert_eq!(vm.staged_hash128(), None, "flip consumes the staged buffer");
 
     // Committed row fires: bid row, best ask 0.49 ≤ level 0.5.
-    h.pm_prod
-        .try_push(pm_tick(1, 480_000, 490_000))
-        .expect("tick push");
+    assert!(
+        h.pm_prod.try_push_ref(&pm_tick(1, 480_000, 490_000)),
+        "tick push"
+    );
     h.eng.tick(16);
     let vm = h.eng.strategy().vm();
     assert_eq!(vm.fires, 1, "committed row fired through the engine loop");
@@ -258,9 +270,11 @@ fn staged_table_commits_and_fires_through_engine_loop() {
 #[test]
 fn commit_without_staged_table_drops_through_engine_loop() {
     let mut h = harness("nostage");
-    h.ai_prod
-        .try_push(ruleset_cmd(AiCmdKind::RulesetCommit, 1, [0x5A; 16]))
-        .expect("commit cmd push");
+    assert!(
+        h.ai_prod
+            .try_push_ref(&ruleset_cmd(AiCmdKind::RulesetCommit, 1, [0x5A; 16])),
+        "commit cmd push"
+    );
     h.eng.tick(16);
 
     let vm = h.eng.strategy().vm();
@@ -268,9 +282,10 @@ fn commit_without_staged_table_drops_through_engine_loop() {
     assert_eq!(vm.commits_applied, 0);
     assert_eq!(vm.rows_active(), 0, "still inert (§7.3)");
 
-    h.pm_prod
-        .try_push(pm_tick(1, 480_000, 490_000))
-        .expect("tick push");
+    assert!(
+        h.pm_prod.try_push_ref(&pm_tick(1, 480_000, 490_000)),
+        "tick push"
+    );
     h.eng.tick(16);
     assert_eq!(h.eng.strategy().vm().fires, 0);
     assert_eq!(h.eng.dispatcher().stats().accepted, 0);
@@ -292,18 +307,22 @@ fn mismatched_commit_drops_and_staged_survives_through_engine_loop() {
         "pop staged"
     );
 
-    h.ai_prod
-        .try_push(ruleset_cmd(AiCmdKind::RulesetCommit, 2, [0x5A; 16]))
-        .expect("commit cmd push");
+    assert!(
+        h.ai_prod
+            .try_push_ref(&ruleset_cmd(AiCmdKind::RulesetCommit, 2, [0x5A; 16])),
+        "commit cmd push"
+    );
     h.eng.tick(16);
     let vm = h.eng.strategy().vm();
     assert_eq!(vm.commits_dropped, 1, "mismatch drops the Commit");
     assert_eq!(vm.commits_applied, 0);
     assert_eq!(vm.staged_hash128(), Some(hash_a), "staged survives");
 
-    h.ai_prod
-        .try_push(ruleset_cmd(AiCmdKind::RulesetCommit, 3, hash_a))
-        .expect("commit cmd push");
+    assert!(
+        h.ai_prod
+            .try_push_ref(&ruleset_cmd(AiCmdKind::RulesetCommit, 3, hash_a)),
+        "commit cmd push"
+    );
     h.eng.tick(16);
     let vm = h.eng.strategy().vm();
     assert_eq!(vm.commits_applied, 1, "correct Commit still lands");
@@ -339,12 +358,16 @@ fn restage_supersedes_and_newest_table_runs_through_engine_loop() {
         "engine-side supersede mirror"
     );
 
-    h.ai_prod
-        .try_push(ruleset_cmd(AiCmdKind::RulesetCommit, 3, hash_a))
-        .expect("commit cmd push");
-    h.ai_prod
-        .try_push(ruleset_cmd(AiCmdKind::RulesetCommit, 4, hash_b))
-        .expect("commit cmd push");
+    assert!(
+        h.ai_prod
+            .try_push_ref(&ruleset_cmd(AiCmdKind::RulesetCommit, 3, hash_a)),
+        "commit cmd push"
+    );
+    assert!(
+        h.ai_prod
+            .try_push_ref(&ruleset_cmd(AiCmdKind::RulesetCommit, 4, hash_b)),
+        "commit cmd push"
+    );
     h.eng.tick(16);
     let vm = h.eng.strategy().vm();
     assert_eq!(vm.commits_dropped, 1, "superseded hash must not commit");
@@ -354,16 +377,18 @@ fn restage_supersedes_and_newest_table_runs_through_engine_loop() {
 
     // Ask 0.45: at/below A's level (0.5) but ABOVE B's (0.4) — if A
     // were live this would fire; B stays quiet.
-    h.pm_prod
-        .try_push(pm_tick(1, 440_000, 450_000))
-        .expect("tick push");
+    assert!(
+        h.pm_prod.try_push_ref(&pm_tick(1, 440_000, 450_000)),
+        "tick push"
+    );
     h.eng.tick(16);
     assert_eq!(h.eng.strategy().vm().fires, 0, "A's threshold must be gone");
 
     // Ask 0.39 ≤ 0.4: B fires.
-    h.pm_prod
-        .try_push(pm_tick(2, 380_000, 390_000))
-        .expect("tick push");
+    assert!(
+        h.pm_prod.try_push_ref(&pm_tick(2, 380_000, 390_000)),
+        "tick push"
+    );
     h.eng.tick(16);
     let vm = h.eng.strategy().vm();
     assert_eq!(vm.fires, 1, "B's committed row fires");

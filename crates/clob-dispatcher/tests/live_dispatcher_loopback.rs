@@ -6,11 +6,13 @@
 //!
 //! Scripts a Polymarket-shaped POST → success-envelope reply,
 //! drives `LiveDispatcher::submit_inline` against the real socket,
-//! and asserts the dispatcher counters increment correctly.
+//! and asserts the dispatcher counters increment correctly. HD3 adds a
+//! keep-alive server: an order after an idle close goes out on a fresh
+//! connection, and a chunked answer is decoded.
 
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -198,4 +200,157 @@ fn live_dispatcher_returns_http_status_for_non_2xx() {
         Err(DispatchError::Http(401)) => {}
         other => panic!("expected Http(401), got {other:?}"),
     }
+}
+
+/// How the keep-alive server of the HD3 tests answers.
+#[derive(Clone, Copy, Default)]
+struct Script {
+    /// Answer `Transfer-Encoding: chunked`, the body cut inside its
+    /// `"orderID"` field.
+    chunked: bool,
+    /// After each answer, hold the connection this long, then close it
+    /// (`close_notify` and a FIN) while the client is idle (0 = never).
+    idle_close_ms: u64,
+}
+
+const ENVELOPE: &[u8] = br#"{"orderID":"0xabc123","success":true}"#;
+
+/// A keep-alive server on `127.0.0.1` that answers every request with
+/// the success envelope: its port, a client config that trusts it, the
+/// connections it accepted and the idle closes it made.
+fn serve(script: Script) -> (u16, Arc<ClientConfig>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let cert = make_cert();
+    let server_cfg = build_server_config(&cert);
+    let client_cfg = build_client_config(&cert);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    let conns = Arc::new(AtomicUsize::new(0));
+    let closes = Arc::new(AtomicUsize::new(0));
+    let (counted, closed) = (conns.clone(), closes.clone());
+    thread::spawn(move || {
+        for sock in listener.incoming() {
+            let Ok(sock) = sock else { continue };
+            counted.fetch_add(1, Ordering::SeqCst);
+            let (cfg, closed) = (server_cfg.clone(), closed.clone());
+            thread::spawn(move || answer_each(sock, cfg, script, &closed));
+        }
+    });
+    (port, client_cfg, conns, closes)
+}
+
+/// Serve one connection: every request gets the envelope, kept alive —
+/// or the connection is closed `idle_close_ms` after each answer, and
+/// the close counted in `closed`.
+fn answer_each(mut sock: TcpStream, cfg: Arc<ServerConfig>, script: Script, closed: &AtomicUsize) {
+    sock.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    let mut conn = ServerConnection::new(cfg).expect("server conn");
+    let mut tls = Stream::new(&mut conn, &mut sock);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        // One whole request: the head, then its Content-Length body.
+        let whole = loop {
+            if let Some(he) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..he]).to_ascii_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if buf.len() >= he + 4 + len {
+                    break he + 4 + len;
+                }
+            }
+            match tls.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        };
+        buf.drain(..whole);
+        let mut wire = Vec::new();
+        if script.chunked {
+            wire.extend_from_slice(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                  Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+            );
+            // `{"ord` | `erID":"0xabc` | `123","success":true}`: read as
+            // raw bytes, a chunk line sits inside the field the scanner
+            // looks for.
+            let (a, rest) = ENVELOPE.split_at(5);
+            let (b, c) = rest.split_at(12);
+            for part in [a, b, c] {
+                wire.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+                wire.extend_from_slice(part);
+                wire.extend_from_slice(b"\r\n");
+            }
+            wire.extend_from_slice(b"0\r\n\r\n");
+        } else {
+            wire.extend_from_slice(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                    ENVELOPE.len()
+                )
+                .as_bytes(),
+            );
+            wire.extend_from_slice(ENVELOPE);
+        }
+        if tls.write_all(&wire).is_err() || tls.flush().is_err() {
+            return;
+        }
+        if script.idle_close_ms != 0 {
+            thread::sleep(Duration::from_millis(script.idle_close_ms));
+            tls.conn.send_close_notify();
+            let _ = tls.conn.write_tls(tls.sock);
+            let _ = tls.sock.shutdown(Shutdown::Both);
+            closed.fetch_add(1, Ordering::SeqCst);
+            return;
+        }
+    }
+}
+
+#[test]
+fn an_order_after_an_idle_close_goes_out_on_a_fresh_connection() {
+    // HD3: the server closes the kept-alive connection while the
+    // dispatcher is idle. The next order must dial fresh; before HD3 it
+    // was written into the dead connection (no reuse probe) and failed.
+    let (port, client_cfg, conns, closes) = serve(Script {
+        idle_close_ms: 50,
+        ..Script::default()
+    });
+    let mut disp = LiveDispatcher::connect("localhost", "/order", port, canned_key(), client_cfg)
+        .expect("LiveDispatcher::connect");
+    disp.submit_inline(&canned_order())
+        .expect("the first order");
+    // Wait for the server's idle close (bounded), then give its
+    // `close_notify` and FIN a moment to land.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while closes.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the server never closed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    thread::sleep(Duration::from_millis(50));
+    disp.submit_inline(&canned_order())
+        .expect("the second order, on a fresh connection");
+    assert_eq!(disp.stats().accepted, 2);
+    assert_eq!(conns.load(Ordering::SeqCst), 2, "one connection per order");
+}
+
+#[test]
+fn a_chunked_answer_is_decoded_and_the_connection_kept() {
+    // HD3: a `Transfer-Encoding: chunked` success envelope. Before HD3
+    // the raw chunk lines reached the scanner (`JsonMalformed`); now the
+    // body is decoded in place and the connection serves the next order.
+    let (port, client_cfg, conns, _) = serve(Script {
+        chunked: true,
+        ..Script::default()
+    });
+    let mut disp = LiveDispatcher::connect("localhost", "/order", port, canned_key(), client_cfg)
+        .expect("LiveDispatcher::connect");
+    disp.submit_inline(&canned_order())
+        .expect("a chunked success envelope is an accepted order");
+    disp.submit_inline(&canned_order())
+        .expect("the next order on the same connection");
+    assert_eq!(disp.stats().accepted, 2);
+    assert_eq!(conns.load(Ordering::SeqCst), 1, "chunked framing keeps it");
 }

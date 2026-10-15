@@ -1,20 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! # boot_http — boot-only blocking HTTPS/1.1 client
+//! # boot_http — blocking HTTPS/1.1 client for boot-time fetches
 //!
 //! Drives the [`crate::http1`] codec over a **blocking** `TcpStream` +
 //! rustls session for the Phase-8e venue REST discovery calls (plan
-//! §6.1) and any other one-shot boot fetch.
+//! §6.1) and any other one-shot boot fetch — plus the one cold
+//! post-boot caller named below.
 //!
 //! ## Doctrine note — this module ALLOCATES
 //!
 //! REST discovery runs at boot, where allocation is explicitly allowed
 //! (fixed-cap tables are built *from* these bodies; the bodies
 //! themselves live in a caller-owned `Vec` that is dropped before the
-//! engine starts). Nothing in this module may be called after boot —
-//! it takes no part in any hot path, uses blocking sockets, and is
-//! deliberately not wired to `mio`.
+//! engine starts). Nothing in this module may be called on a hot path —
+//! it uses blocking sockets and is deliberately not wired to `mio`.
+//! The ONE caller after boot is cold by construction: the Hyperliquid
+//! ingress thread re-reading `/info outcomeMeta` BETWEEN sessions,
+//! when a reconnect retired a rolling family (2026-09-26), throttled
+//! to one fetch a minute on a short deadline
+//! (`cli::paper::rediscover_hl_families`). It uses [`https_post_at`]
+//! with an address resolved at boot, so no DNS lookup — the one
+//! blocking step no socket timeout arms — ever runs after boot.
 //!
 //! ## Zero-copy note
 //!
@@ -24,7 +31,7 @@
 //! for chunked bodies, both inherent to TCP + HTTP/1.1 framing.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -41,8 +48,9 @@ pub const MAX_REQUEST_BYTES: usize = 4096;
 /// Read chunk size for the response loop.
 const READ_CHUNK: usize = 32 * 1024;
 
-/// Errors from a boot fetch. All fatal to the caller (fail-fast at
-/// boot); carried up for a precise log line.
+/// Errors from a fetch, carried up for a precise log line. Every one
+/// is fatal at boot (fail-fast); the post-boot re-read logs it and
+/// asks again later.
 #[derive(Debug)]
 pub enum BootHttpErr {
     /// Hostname failed to resolve / produced no addresses.
@@ -102,7 +110,15 @@ pub fn https_get(
     let mut req = [0u8; MAX_REQUEST_BYTES];
     let n = http1::write_get_request(&mut req, host.as_bytes(), path.as_bytes(), user_agent)
         .map_err(|_| BootHttpErr::RequestTooLarge)?;
-    exchange(tls, host, port, &req[..n], out, max_body, timeout)
+    exchange(
+        tls,
+        host,
+        Target::Resolve(port),
+        &req[..n],
+        out,
+        max_body,
+        timeout,
+    )
 }
 
 /// Blocking HTTPS `POST {path}` against `host:port` (Hyperliquid
@@ -113,11 +129,81 @@ pub fn https_get(
 /// * `max_body` bounds `out` growth — a discovery endpoint suddenly
 ///   serving gigabytes must not OOM the boot.
 /// * `timeout` is the overall deadline for connect + TLS + request +
-///   full response.
+///   full response, re-armed before each socket step. The DNS lookup
+///   before the connect is a blocking call no socket timeout arms —
+///   after boot, use [`https_post_at`].
 pub fn https_post(
     tls: &Arc<ClientConfig>,
     host: &str,
     port: u16,
+    path: &str,
+    user_agent: &[u8],
+    content_type: &[u8],
+    body: &[u8],
+    out: &mut Vec<u8>,
+    max_body: usize,
+    timeout: Duration,
+) -> Result<Range<usize>, BootHttpErr> {
+    post(
+        tls,
+        host,
+        Target::Resolve(port),
+        path,
+        user_agent,
+        content_type,
+        body,
+        out,
+        max_body,
+        timeout,
+    )
+}
+
+/// [`https_post`] to `addr`, which the caller resolved at boot: no DNS
+/// lookup, so every blocking step of the call — connect, each write,
+/// each read — is armed with what remains of `timeout`. `host` still
+/// names the server for SNI and the `Host:` header. The form for the
+/// one caller after boot (module doc): a blocking lookup on an ingress
+/// thread is what the WS endpoints' resolve-once rule exists to prevent.
+pub fn https_post_at(
+    tls: &Arc<ClientConfig>,
+    addr: SocketAddr,
+    host: &str,
+    path: &str,
+    user_agent: &[u8],
+    content_type: &[u8],
+    body: &[u8],
+    out: &mut Vec<u8>,
+    max_body: usize,
+    timeout: Duration,
+) -> Result<Range<usize>, BootHttpErr> {
+    post(
+        tls,
+        host,
+        Target::Addr(addr),
+        path,
+        user_agent,
+        content_type,
+        body,
+        out,
+        max_body,
+        timeout,
+    )
+}
+
+/// Where [`exchange`] connects.
+#[derive(Clone, Copy)]
+enum Target {
+    /// Look `host` up at call time (boot), on this port.
+    Resolve(u16),
+    /// An address the caller resolved at boot — no lookup.
+    Addr(SocketAddr),
+}
+
+/// Render the POST and run it — the one body behind both POST forms.
+fn post(
+    tls: &Arc<ClientConfig>,
+    host: &str,
+    target: Target,
     path: &str,
     user_agent: &[u8],
     content_type: &[u8],
@@ -136,14 +222,14 @@ pub fn https_post(
         body,
     )
     .map_err(|_| BootHttpErr::RequestTooLarge)?;
-    exchange(tls, host, port, &req[..n], out, max_body, timeout)
+    exchange(tls, host, target, &req[..n], out, max_body, timeout)
 }
 
 /// Connect, send `request`, read the full response, frame the body.
 fn exchange(
     tls: &Arc<ClientConfig>,
     host: &str,
-    port: u16,
+    target: Target,
     request: &[u8],
     out: &mut Vec<u8>,
     max_body: usize,
@@ -152,22 +238,15 @@ fn exchange(
     let deadline = Instant::now() + timeout;
     out.clear();
 
-    // Resolve + connect (first address that answers).
-    let addrs = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
-        .map_err(|_| BootHttpErr::Resolve)?;
-    let mut sock: Option<TcpStream> = None;
-    let mut last_kind = std::io::ErrorKind::NotConnected;
-    for addr in addrs {
-        let remain = remaining(deadline)?;
-        match TcpStream::connect_timeout(&addr, remain) {
-            Ok(s) => {
-                sock = Some(s);
-                break;
-            }
-            Err(e) => last_kind = e.kind(),
+    // Connect — resolving `host` first unless the caller already did.
+    let mut sock = match target {
+        Target::Resolve(port) => {
+            let addrs = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+                .map_err(|_| BootHttpErr::Resolve)?;
+            connect_first(addrs, deadline)?
         }
-    }
-    let mut sock = sock.ok_or(BootHttpErr::Connect(last_kind))?;
+        Target::Addr(addr) => connect_first(core::iter::once(addr), deadline)?,
+    };
     sock.set_nodelay(true)
         .map_err(|e| BootHttpErr::Io(e.kind()))?;
 
@@ -256,6 +335,24 @@ fn exchange(
     }
 }
 
+/// A TCP connect to the first of `addrs` that answers before
+/// `deadline`: `Timeout` once the deadline passes between addresses,
+/// and when none answers, the last connect error's kind.
+fn connect_first<A: Iterator<Item = SocketAddr>>(
+    addrs: A,
+    deadline: Instant,
+) -> Result<TcpStream, BootHttpErr> {
+    let mut last_kind = std::io::ErrorKind::NotConnected;
+    for addr in addrs {
+        let remain = remaining(deadline)?;
+        match TcpStream::connect_timeout(&addr, remain) {
+            Ok(s) => return Ok(s),
+            Err(e) => last_kind = e.kind(),
+        }
+    }
+    Err(BootHttpErr::Connect(last_kind))
+}
+
 /// Remaining time before `deadline`, or `Timeout`.
 #[inline]
 fn remaining(deadline: Instant) -> Result<Duration, BootHttpErr> {
@@ -286,8 +383,9 @@ fn map_io(e: std::io::Error, deadline: Instant) -> BootHttpErr {
     if timed_out && Instant::now() >= deadline {
         BootHttpErr::Timeout
     } else if timed_out {
-        // Spurious wake below the deadline — surface as I/O; callers
-        // treat every variant as fatal at boot anyway.
+        // Spurious wake below the deadline — surface as I/O; boot
+        // treats every variant as fatal, the post-boot re-read as a
+        // miss to ask again.
         BootHttpErr::Io(e.kind())
     } else {
         BootHttpErr::Io(e.kind())

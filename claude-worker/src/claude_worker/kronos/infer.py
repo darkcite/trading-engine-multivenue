@@ -133,7 +133,7 @@ class Forecaster:
     and would otherwise land inside a live decision), and freezes the
     GC's view of everything allocated so far."""
 
-    def __init__(  # noqa: PLR0913 - the shape bounds ARE the constructor's contract (§14.2)
+    def __init__(  # the shape bounds ARE the constructor's contract (§14.2)
         self,
         name: str,
         device: str,
@@ -285,7 +285,7 @@ class Forecaster:
 
     # ---- the call --------------------------------------------------------
 
-    def forecast(  # noqa: PLR0913 - the pinned §14.2 signature
+    def forecast(  # the pinned §14.2 signature
         self,
         ohlcv: numpy.ndarray,
         x_stamp: numpy.ndarray,

@@ -184,6 +184,18 @@ def test_the_venue_comes_from_the_source_when_the_title_is_silent() -> None:
     assert assets == ()
 
 
+def test_a_mexc_source_and_a_mexc_title_both_resolve_to_mexc() -> None:
+    """Q-MX7: MEXC joined the news lane, so its own feed keys on `mexc`
+    (not `other`) and a press title naming it does too."""
+    venues, _ = _resolve(
+        "Delisting of ASTEROIDUSDT Perpetual Futures Pair [Sep 25, 2026, 13:00 (UTC)]",
+        venue="mexc",
+    )
+    assert venues == ("mexc",)
+    venues, _ = _resolve("MEXC halts deposits after an exploit")
+    assert venues == ("mexc",)
+
+
 def test_a_venue_named_in_the_title_is_found_too() -> None:
     venues, _ = _resolve("Binance halts withdrawals after outage")
     assert venues == ("binance",)

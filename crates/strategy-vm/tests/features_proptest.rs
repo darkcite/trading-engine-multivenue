@@ -148,17 +148,22 @@ proptest! {
     /// Random funding prints: APRs match
     /// `claude_worker.carry_signal.apr_from_prints` transcribed —
     /// Σ(in-window)/divisor / days × 365, deribit ÷8, empty window
-    /// ABSENT.
+    /// ABSENT. The 8 h venues (Bybit, MEXC since MX2) share one law.
     #[test]
     fn funding_apr_matches_carry_signal_law(
-        deribit in prop::bool::ANY,
+        pick in 0u8..3,
         prints in proptest::collection::vec(
             // (hours back 0..96, rate ×1e9)
             (0i64..96, -500_000_000i64..500_000_000),
             0..80,
         ),
     ) {
-        let venue = if deribit { VenueId::Deribit } else { VenueId::Bybit };
+        let venue = match pick {
+            0 => VenueId::Deribit,
+            1 => VenueId::Bybit,
+            _ => VenueId::Mexc,
+        };
+        let deribit = venue == VenueId::Deribit;
         let sym = core_types::make_symbol_id(venue, 5);
         let mut f = FeatureState::new_boxed();
         teach_wall(&mut f);
@@ -171,8 +176,8 @@ proptest! {
         for (h, r) in &prints {
             by_hour.entry(*h).or_insert(*r);
         }
-        // Half-period dedup tolerance: bybit period 8 h ⇒ keep hours
-        // ≥ 4 apart; deribit (period 0 ⇒ 30 min tol) keeps hourly.
+        // Half-period dedup tolerance: bybit/mexc period 8 h ⇒ keep
+        // hours ≥ 4 apart; deribit (period 0 ⇒ 30 min tol) keeps hourly.
         let mut kept: Vec<(i64, i64)> = Vec::new();
         for (h, r) in &by_hour {
             let tol_h = if deribit { 1 } else { 4 };

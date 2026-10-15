@@ -93,7 +93,8 @@ Every offline consumer joins by **descriptor string** (`okx:BTC-USDT`, `binance-
 `deribit:BTC-30AUG26-77500-C`, a bare PM token id) and resolves through the run's own manifest.
 Skipping this is what produced a phantom $248.8M per-symbol bound in V7.
 
-Venue labels, in venue-byte order: `pm bn okx rpc deribit hl bybit`.
+Venue labels, in capture-file order: `pm bn okx rpc deribit hl bybit mexc` (`mexc` = VenueId 7,
+data-only, appended 2026-09-23).
 
 ---
 
@@ -110,7 +111,7 @@ namespace).
 | module | table |
 |---|---|
 | `claude_worker.candles` | `candles`, `candle_conflicts` |
-| `claude_worker.funding` | `funding` (per-print rates, 5 venues) |
+| `claude_worker.funding` | `funding` (per-print rates, 6 venues — `mexc-perp` since 2026-09-23) |
 | `claude_worker.iv_digest` | `iv_digest` (1m/1h IV from kind-6 slots) |
 | `claude_worker.depth_digest` | `depth_digest` (hourly imbalance-OHLC, spread bps, near notional) |
 | `claude_worker.refdata` | `refdata` (24 h quote volume, open interest) |
@@ -262,8 +263,9 @@ and parses schema-1 JSON off stdout. **The harness conforms to the worker, never
    - **Strict-cross maker.** A resting BID at `P` fills only when `ask_px < P` — strictly through,
      never a touch. Fill price is always `P`. Displayed opposite size is a **shared budget** across all
      our resting orders on that sym, consumed FIFO. Zero RNG.
-   - **Activation latency** `t_emit + Δ`: PM 200 ms, BN/OKX/Deribit/Bybit 100 ms, **HL 600 ms**. An
-     order can never fill on its own emitting tick.
+   - **Activation latency** `t_emit + Δ`, the MEASURED per-venue table (`docs/venue-latency.md` §3):
+     PM 200, BN 130, OKX 130, Deribit 220, **HL 340**, Bybit 60, MEXC 150 ms. An order can never
+     fill on its own emitting tick; an order on MEXC (venue byte 7, data-only) is unroutable.
    - **Open-order caps** 8 per sym, 64 total; beyond-cap emits are counted and dropped.
    - **D-7 options mark-fill:** option syms have no book, so they fill in full at
      `mark ± max(0.5% of mark, 1 tick)` with **taker** fees — and any report that used it must print
@@ -351,7 +353,7 @@ which is why live evidence reads *stage seq 48 / commit seq 50* — heartbeat 47
 
 `len == 80` → HMAC (constant-time) → `validate_shape()` → seq policy → **`ts_ns` rewritten to engine
 monotonic** → **append to `ai-cmds.pmlr` *before* the ring push**, so even a ring-dropped command stays
-auditable → `try_push` → Stage/Commit additionally routed to the side-path seam. Failures at steps 1–2
+auditable → `try_push_ref` → Stage/Commit additionally routed to the side-path seam. Failures at steps 1–2
 drop the connection; step 3 discards the frame and keeps the connection.
 
 ### 6.5 Side path — the second validation
@@ -366,8 +368,29 @@ features/bind budget, and descriptor resolution.
 truth that writes `instrument-manifest.tsv`. Unresolvable ⇒ `Descriptor` refuse. This is exactly why
 the post-boot re-commit (§8) is what makes options tradeable across ordinal reshuffles.
 
-On success the table is stamped `epoch = self.epoch + 1` and pushed by value (copy #1, 32,832 B) onto
-a 2-slot ring. A successful Stage sets `committed = None` — **a new Stage supersedes an old Commit.**
+On success the table is stamped `epoch = self.epoch + 1` and copied once, scratch → slot, onto a
+2-slot ring (copy #1, 32,832 B; `try_push_ref` — no by-value temporary since ZC pass A). A successful Stage sets `committed = None` — **a new Stage supersedes an old Commit.**
+
+**The boot universe** rule 6 checks symbols against is `cli::build_ai_universe`: the PM and BN pair
+syms, the OKX / Deribit / Hyperliquid discovery tables and — since 2026-09-23 (ruling Q-MX6) — every
+MEXC instrument the boot allocated, spot and perp; Bybit stays out by its WS9 precedent. Since
+2026-09-26 (ruling O-HC17) it also holds every Hypercall option the boot selected
+(`hypercall:<U>-<YYYYMMDD>-<K>-<C|P>`, caps `CAP_OPT | CAP_PRICE`, HC4); the `hypercall-idx:<U>`
+index syms stay out — capture-only `Mark`s, caps 0, nothing could read them. Since HK7b (ruled
+HK-R4, 2026-10-13) it also holds every Binance option the boot selected (`binance-opt:<SYMBOL>`,
+caps `CAP_OPT | CAP_PRICE`, M2.4). MEXC and the Binance options enter as signal or reference legs
+only: an order on one is `unroutable` in the paper matcher and the harness (venue byte 7; for the
+options `core_fill::signal_only_sym`, the eapi ordinal block — paper only: a live Binance slot's
+option order goes to its arm, and no member arms one, O-BX6). On Hypercall the paper matcher judges
+an IoC by the held-quote law since HC11 (slot 7 is the only IoC emitter; an AI door's maker on venue
+9 is unroutable) and the harness refuses venue byte 9. (The v2 grammar resolves
+descriptors through the `DescriptorTable`, which already carried Hypercall since HC4 and the Binance
+options since M2.4 — so before HK-R4 a v2 row could name a Binance option as its instrument and the
+paper matcher modelled the order; the snapshot is the v1 arm's sym universe.) Rule 10
+reads the per-descriptor channel caps, mirrored Rust↔Python (`caps_of_descriptor`): `mexc:<SYM>`
+(spot, xStocks included) → `CAP_PRICE`; `mexc-perp:<SYM>` (every MEXC perp, TradFi included) →
+`CAP_PRICE | CAP_FUNDING`. MEXC has no depth or options lane, so no depth or option feature validates
+on it.
 
 ### 6.6 Engine side — staged, then the flip
 
@@ -375,7 +398,8 @@ Inside one `Engine::tick()`, the table lane is drained **immediately before** th
 Stage and Commit arriving in the same batch always land in the right order:
 
 ```
-table lane:  try_pop → StrategySet::on_ruleset_table → vm.receive_table_v2   (copy #2)
+table lane:  try_pop_ref (read in the slot) → StrategySet::on_ruleset_table
+             → vm.receive_table_v2   (copy #2, slot → staged buffer)
              ⇒ tables[(active&1)^1] = table;  staged_valid = true
              ⇒ NOT mask-gated
 
@@ -416,7 +440,7 @@ to enabled members in slot order:
 | 3 | 8 | `rule-tree` |
 | 4 | 16 | `ai-exec` — the s4 Intent lane |
 | 5 | 32 | `vm` — the ruleset VM |
-| 6 | 64 | `icdp` — the intrabar candle-direction member (ICDP I3, 2026-09-03; configured only when `~/multivenue/icdp.toml` resolves) |
+| 6 | 64 | `xmm` — the HL post-only maker (XMM XH1, 2026-09-26 — was `icdp`, the intrabar candle-direction member, now unlinked; configured only when `~/multivenue/xmm.toml` resolves; DARK at XH1) |
 
 `--strategy all` requests 127, but slots 1/2/3 need `vrp.toml` / `xsd.toml`+`xsd-table.tsv` / `--rules-path`,
 which the launchd wrapper does not pass. **Since the operator ruling of 2026-09-02 the wrapper boots
@@ -530,7 +554,7 @@ Proven live 2026-08-30: 1,669 frames, 52 funding descriptors, `cmds_total` 1674,
 | `parity` | `python -m claude_worker.parity --window-h 48` | `engine-orders.pmlr` only | s4-vs-s5 verdict (§10) |
 | `audit-replay` | `multivenue-engine audit-replay --dir run-<ns>` | the whole run dir | cadence/integrity verdicts + the full AI-command chain |
 | `/metrics` | `127.0.0.1:9191/metrics` | live counters | `engine_vm_*`, `engine_ai_ruleset_*`, `engine_ingress_ai_*`, `engine_regime_*` |
-| `/state` | `127.0.0.1:9191/state` (RG6) | the 1 s engine snapshot | JSON `v: 1` — boot / regime words + per-row gate bytes / slots / vm rows / icdp / ai / ingress / recent orders + fills |
+| `/state` | `127.0.0.1:9191/state` (RG6) | the 1 s engine snapshot | JSON `v: 2` — boot / regime words + per-row gate bytes / slots / vm rows / xmm (was icdp until v2) / ai / ingress / recent orders + fills |
 | dashboard | `http://127.0.0.1:9292/` (`python -m claude_worker.dashboard`) | `/state` + `/metrics` proxied, `state.db`, reports, regime history, configs | the read-only operator page (no controls) |
 | `regime soak` | `python -m claude_worker.regime soak` (RG7) | the regime history + the runs' complete ≤ 2 h windows + the nightly reports | the pooled soak verdict (`~/multivenue/worker/regime/soak-<utc>.json`) |
 

@@ -1,0 +1,57 @@
+# xmm.toml — the slot-6 XMM member's artifact (Hyperliquid maker, plan
+# Appendix A). Integer-only, ONE [xmm] section, EVERY key required:
+# an unknown, missing or duplicate key refuses the boot, and so does any
+# bound: θ's and the clip's catch a scale slip (the $15 clip written at
+# ×1e9 reads $15 000 and refuses). Copy to ~/multivenue/xmm.toml (or point
+# the engine at it with --xmm / the wrapper's XMM_TOML).
+#
+# The values below are the XH5 probe (rulings O-XH5, O-XH10): $15 clips,
+# ±$150 per perp, $400 gross, $300 resting; SOL, XRP, BTC and ETH.
+
+[xmm]
+# Master switch (the ablation pattern): 0 = the member runs and quotes nothing.
+maker_enabled = 1
+
+# The perps to quote. `quote_<coin> = 1` quotes the Hyperliquid perp
+# `hyperliquid:<COIN>`, led by the Binance USDⓈ-M perp
+# `binance-usdm:<coin>usdt` — BOTH must be in ~/multivenue/universe.toml
+# ([hyperliquid] coins, [binance] usdm) or the boot refuses.
+quote_btc = 1
+quote_eth = 1
+quote_sol = 1
+quote_xrp = 1
+quote_ada = 0
+quote_ltc = 0
+quote_doge = 0
+
+# θ, bps ×1e6: pull a quote when the leader has moved θ against it since
+# it was placed (0.5 bps; the XH5 A/B runs 0.25).
+theta_bps_1e6 = 500000
+# The gate's window for the "unreflected" leader move, ms.
+gate_window_ms = 500
+# Quote lifetime cap, ms (LAW E-8: at most 30 000).
+lifetime_ms = 30000
+
+# Sizes and caps, USD ×1e6 (inventory at mark). Ceilings — policy, raised
+# only by a code change with its risk-policy entry (XH7): clip $10 000,
+# per perp $5 000 000, gross $20 000 000, resting $1 000 000.
+clip_usd_1e6 = 15000000
+inv_cap_usd_1e6 = 150000000
+gross_inv_cap_usd_1e6 = 400000000
+resting_cap_usd_1e6 = 300000000
+
+# Safety pulls (law XH-2), ms.
+lead_stale_ms = 300
+follower_stale_ms = 2000
+rtt_pull_ms = 1500
+
+# Minimum quote life before a price requote, ms (budget control).
+# PLACEHOLDER until XH0(c) measures the request cadence.
+requote_min_ms = 250
+
+# Inventory skew κ ×1e6 — refused unless 0 until XH7.
+skew_kappa_1e6 = 0
+# ALO priority rate, p / 1e8 of resting notional (0 = none; 1 bp = 10000).
+alo_priority_1e8 = 0
+# A/B selector: 0 off, 1 θ, 2 ALO priority, 3 size-only modify.
+ab_mode = 0

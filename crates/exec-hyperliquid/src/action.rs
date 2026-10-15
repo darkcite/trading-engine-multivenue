@@ -13,12 +13,16 @@
 //!
 //! | action | keys, in order |
 //! |---|---|
-//! | order | `type`, `orders`, `grouping` |
+//! | order | `type`, `orders`, `grouping` (a string; XMM XH5d's ALO priority a map, `p`) |
 //! | order wire | `a`, `b`, `p`, `s`, `r`, `t`, then `c` only if present |
 //! | order type | `limit` → `tif` |
 //! | cancel | `type`, `cancels`; item `a`, `o` |
 //! | cancelByCloid | `type`, `cancels`; item `asset`, `cloid` |
 //! | batchModify | `type`, `modifies`; item `oid`, `order` |
+//! | reserveRequestWeight | `type`, `weight` |
+//! | updateLeverage | `type`, `asset`, `isCross`, `leverage` |
+//! | scheduleCancel | `type`, then `time` only if set (absent clears) |
+//! | noop | `type` |
 //!
 //! Note `cancel` keys its asset `a` while `cancelByCloid` keys the same
 //! field `asset`. That is not a typo here — it is the SDK's own
@@ -30,18 +34,20 @@
 use crate::msgpack::{MsgPackErr, Writer};
 use crate::wire::WireNum;
 
-/// Largest action this crate will encode. A batch of
-/// [`MAX_ORDERS`] wires with cloids is far below this.
-pub const MAX_ACTION: usize = 4096;
+/// Largest action this crate will encode. A batch of [`MAX_ORDERS`]
+/// modifies, each naming its resting cloid and carrying a new one
+/// (~150 B of msgpack apiece), is ≈ 5.9 KiB.
+pub const MAX_ACTION: usize = 8192;
 
-/// Most orders in one batched action. The venue counts a batch of `n`
-/// as ONE IP request but `n` ADDRESS requests (§2.2), so batching
-/// helps the IP limit and not the address budget — there is no reason
-/// to make this large. ENFORCED by every batch encoder (`Overflow`
-/// past it); the first cut declared it and read it nowhere, so the
-/// only bound on a batch was the 4 KiB buffer while the budget
-/// governor charged one request per POST.
-pub const MAX_ORDERS: usize = 16;
+/// Most orders in one batched action: 39 (Anton's ruling, XH4 plan
+/// §4.2). The venue weighs an action `1 + ⌊n / 40⌋` IP requests and
+/// counts `n` ADDRESS requests (§2.2), so 39 is the largest batch that
+/// still costs ONE IP request — the XH4b gateway's coalescer splits
+/// there; the address budget is unchanged by batching. ENFORCED by
+/// every batch encoder (`Overflow` past it); the first cut declared it
+/// and read it nowhere, so the only bound on a batch was the buffer
+/// while the budget governor charged one request per POST.
+pub const MAX_ORDERS: usize = 39;
 
 /// Time-in-force. The mapping to `Order.kind` is fixed and exhaustive:
 /// IoC for takes and coverage entries, Alo for maker quotes.
@@ -182,16 +188,41 @@ fn write_order_wire(w: &mut Writer<'_>, o: &OrderWire) -> Result<(), MsgPackErr>
     Ok(())
 }
 
+/// An `order` action's `grouping`, inside the signature: a named one —
+/// `b"na"` for everything this lane sends but the ALO priority — or XMM
+/// XH5d's ALO priority, `{"p": N}` (N: p ×1e8 of resting notional;
+/// hyperliquid-python-sdk 0.24.0's `PriorityGrouping`). An action carries
+/// one: the gateway batches places by it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Grouping<'a> {
+    /// A string grouping (`"na"`, `"normalTpsl"`, …).
+    Named(&'a [u8]),
+    /// `{"p": N}`: a one-key map (msgpack), an object (JSON).
+    Priority(u32),
+}
+
 /// `{"type":"order","orders":[…],"grouping":"…"}`
 ///
-/// `grouping` is `b"na"` for everything this lane sends; it is a
-/// parameter because it is inside the signature and a default that
-/// silently differed from the caller's intent would be unfindable.
+/// `grouping` is `b"na"` for everything this lane sends but the ALO
+/// priority ([`encode_order_grouped`]); it is a parameter because it is
+/// inside the signature and a default that silently differed from the
+/// caller's intent would be unfindable.
 #[inline]
 pub fn encode_order(
     dst: &mut [u8],
     orders: &[OrderWire],
     grouping: &[u8],
+) -> Result<usize, MsgPackErr> {
+    encode_order_grouped(dst, orders, Grouping::Named(grouping))
+}
+
+/// [`encode_order`] under any [`Grouping`]: XMM XH5d's ALO priority as
+/// `"grouping": {"p": N}`.
+#[inline]
+pub fn encode_order_grouped(
+    dst: &mut [u8],
+    orders: &[OrderWire],
+    grouping: Grouping<'_>,
 ) -> Result<usize, MsgPackErr> {
     if orders.len() > MAX_ORDERS {
         return Err(MsgPackErr::Overflow);
@@ -206,7 +237,14 @@ pub fn encode_order(
         write_order_wire(&mut w, o)?;
     }
     w.str_bytes(b"grouping")?;
-    w.str_bytes(grouping)?;
+    match grouping {
+        Grouping::Named(g) => w.str_bytes(g)?,
+        Grouping::Priority(p) => {
+            w.map_header(1)?;
+            w.str_bytes(b"p")?;
+            w.uint(u64::from(p))?;
+        }
+    }
     Ok(w.len())
 }
 
@@ -331,6 +369,73 @@ pub fn encode_batch_modify(dst: &mut [u8], modifies: &[ModifyWire]) -> Result<us
     Ok(w.len())
 }
 
+/// `{"type":"reserveRequestWeight","weight":…}` — **S7-L1**: buy
+/// `weight` more address requests, paid from the PERPS balance at the
+/// venue's price per request. `destination` is omitted, which the
+/// venue documents as skipped in the hash when unset: the weight is
+/// this address's own.
+#[inline]
+pub fn encode_reserve_weight(dst: &mut [u8], weight: u64) -> Result<usize, MsgPackErr> {
+    let mut w = Writer::new(dst);
+    w.map_header(2)?;
+    w.str_bytes(b"type")?;
+    w.str_bytes(b"reserveRequestWeight")?;
+    w.str_bytes(b"weight")?;
+    w.uint(weight)?;
+    Ok(w.len())
+}
+
+/// `{"type":"updateLeverage","asset":…,"isCross":…,"leverage":…}` — the
+/// perp arm sets its leverage at boot (O-XH6). Key order per the SDK's
+/// `Exchange.update_leverage`.
+#[inline]
+pub fn encode_update_leverage(
+    dst: &mut [u8],
+    asset: u32,
+    is_cross: bool,
+    leverage: u32,
+) -> Result<usize, MsgPackErr> {
+    let mut w = Writer::new(dst);
+    w.map_header(4)?;
+    w.str_bytes(b"type")?;
+    w.str_bytes(b"updateLeverage")?;
+    w.str_bytes(b"asset")?;
+    w.uint(u64::from(asset))?;
+    w.str_bytes(b"isCross")?;
+    w.bool(is_cross)?;
+    w.str_bytes(b"leverage")?;
+    w.uint(u64::from(leverage))?;
+    Ok(w.len())
+}
+
+/// `{"type":"scheduleCancel"[,"time":…]}` — the venue's dead-man switch:
+/// at `time_ms` every open order of the ACCOUNT is cancelled; `None`
+/// clears it. Account-wide, so on an account shared between slots it is
+/// armed only while no other slot has orders (XH4 ruling). The `time`
+/// key is absent, not null, when clearing — as the SDK writes it.
+#[inline]
+pub fn encode_schedule_cancel(dst: &mut [u8], time_ms: Option<u64>) -> Result<usize, MsgPackErr> {
+    let mut w = Writer::new(dst);
+    w.map_header(if time_ms.is_some() { 2 } else { 1 })?;
+    w.str_bytes(b"type")?;
+    w.str_bytes(b"scheduleCancel")?;
+    if let Some(t) = time_ms {
+        w.str_bytes(b"time")?;
+        w.uint(t)?;
+    }
+    Ok(w.len())
+}
+
+/// `{"type":"noop"}` — spends a nonce and does nothing.
+#[inline]
+pub fn encode_noop(dst: &mut [u8]) -> Result<usize, MsgPackErr> {
+    let mut w = Writer::new(dst);
+    w.map_header(1)?;
+    w.str_bytes(b"type")?;
+    w.str_bytes(b"noop")?;
+    Ok(w.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,9 +460,7 @@ mod tests {
             "0x00000000000000000000000000000001"
         );
         // The engine-origin prefix from LAW E-9: 0x4d56 = "MV".
-        let raw = [
-            0x4d, 0x56, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a,
-        ];
+        let raw = [0x4d, 0x56, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a];
         render_cloid(&raw, &mut out);
         assert_eq!(
             core::str::from_utf8(&out).unwrap(),
@@ -372,7 +475,10 @@ mod tests {
         let over = [o; MAX_ORDERS + 1];
         let mut dst = [0u8; MAX_ACTION];
         assert!(encode_order(&mut dst, &ok, b"na").is_ok());
-        assert_eq!(encode_order(&mut dst, &over, b"na"), Err(MsgPackErr::Overflow));
+        assert_eq!(
+            encode_order(&mut dst, &over, b"na"),
+            Err(MsgPackErr::Overflow)
+        );
         let c = [CancelWire { asset: 1, oid: 2 }; MAX_ORDERS + 1];
         assert_eq!(encode_cancel(&mut dst, &c), Err(MsgPackErr::Overflow));
     }
@@ -425,5 +531,30 @@ mod tests {
         assert_eq!(Tif::Gtc.as_bytes(), b"Gtc");
         assert_eq!(Tif::Ioc.as_bytes(), b"Ioc");
         assert_eq!(Tif::Alo.as_bytes(), b"Alo");
+    }
+
+    /// XMM XH5d: `{"p": N}` is a one-key map after the `grouping` key (the
+    /// SDK's msgpack of `PriorityGrouping`; the vector pins the rest), and
+    /// a named grouping encodes as `encode_order` does.
+    #[test]
+    fn the_priority_grouping_is_a_one_key_map() {
+        let o = OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Alo);
+        let mut a = [0u8; MAX_ACTION];
+        let mut b = [0u8; MAX_ACTION];
+        let n1 = encode_order(&mut a, &[o], b"na").unwrap();
+        let n2 = encode_order_grouped(&mut b, &[o], Grouping::Named(b"na")).unwrap();
+        assert_eq!(&a[..n1], &b[..n2]);
+        let n3 = encode_order_grouped(&mut b, &[o], Grouping::Priority(10_000)).unwrap();
+        // "grouping" (0xa8 and 8 B), then fixmap 1, "p", uint16 10 000.
+        let tail = [
+            0xa8, b'g', b'r', b'o', b'u', b'p', b'i', b'n', b'g', 0x81, 0xa1, b'p', 0xcd, 0x27,
+            0x10,
+        ];
+        assert!(b[..n3].ends_with(&tail));
+        assert_eq!(
+            n3,
+            n1 - 3 + 6,
+            "\"na\" (3 B) out, {{\"p\": 10 000}} (6 B) in"
+        );
     }
 }

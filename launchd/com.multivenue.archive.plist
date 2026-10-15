@@ -46,5 +46,11 @@
        Network QoS belongs to ONE lever, S3_NICE_NETWORK in retention.conf.
        Nice 19 stays: CPU politeness is free and does not touch the socket. -->
   <key>Nice</key><integer>19</integer>
+
+  <!-- HK21: a stop first waits out the multipart initiate in flight (SIGTERM
+       held for that one attempt: at most its connect plus its read, 2 x
+       objstore.CONTROL_TIMEOUT_S), then sends the abort. launchd's default
+       is 20 s before SIGKILL; 60 matches the engine's. -->
+  <key>ExitTimeOut</key><integer>60</integer>
 </dict>
 </plist>

@@ -91,7 +91,7 @@ const KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
 };
 /// `{"method":"ping"}` — the venue's application-level ping, answered
 /// with `{"channel":"pong"}`. Same bytes as the ingress crate's.
-const PING_PAYLOAD: &[u8] = b"{\"method\":\"ping\"}";
+pub(crate) const PING_PAYLOAD: &[u8] = b"{\"method\":\"ping\"}";
 
 /// Why the user-event socket failed.
 #[repr(u8)]
@@ -451,19 +451,12 @@ impl UserWs {
                 }
                 WsOpcode::Ping => {
                     let mask = self.next_mask();
-                    let payload_len = p1 - p0;
-                    if payload_len > 125 {
+                    if p1 - p0 > 125 {
                         return Err(WsErr::BadFrame);
                     }
-                    // COPY: a Ping payload, ≤ 125 B (RFC 6455), copied
-                    // out before writing — the pong borrows `tx`
-                    // mutably while the payload borrows `rx`, both
-                    // fields of one struct — rejected: splitting rx/tx
-                    // into separate owners buys 125 B at the cost of
-                    // the pump's single-borrow shape.
-                    let mut echo = [0u8; 125];
-                    echo[..payload_len].copy_from_slice(&self.rx[p0..p1]);
-                    let n = ws_write_pong(&mut self.tx, &echo[..payload_len], mask)
+                    // The echo goes straight from rx into tx — two
+                    // disjoint fields, so no scratch.
+                    let n = ws_write_pong(&mut self.tx, &self.rx[p0..p1], mask)
                         .map_err(|_| WsErr::BadFrame)?;
                     write_all_t(t, &self.tx[..n], deadline)?;
                 }
@@ -506,31 +499,22 @@ impl UserWs {
     }
 
     fn send_subscribe(&mut self, channel: &[u8], deadline: Instant) -> Result<(), WsErr> {
-        let mut body = [0u8; 256];
-        let mut n = 0usize;
-        let mut put = |b: &[u8], n: &mut usize| -> Result<(), WsErr> {
-            if *n + b.len() > body.len() {
-                return Err(WsErr::BadFrame);
-            }
-            // COPY: subscribe-frame literals + the 42 B master hex,
-            // ≤ 256 B, twice per connect — building the JSON body from
-            // fixed parts IS its construction, and the masked frame
-            // writer needs it contiguous; cold, once per socket.
-            body[*n..*n + b.len()].copy_from_slice(b);
-            *n += b.len();
-            Ok(())
-        };
-        put(br#"{"method":"subscribe","subscription":{"type":""#, &mut n)?;
-        put(channel, &mut n)?;
-        put(br#"","user":""#, &mut n)?;
-        put(self.master_hex.as_bytes(), &mut n)?;
-        put(br#""}}"#, &mut n)?;
-
+        // ONE renderer for the subscription body, shared with the
+        // gateway's connections (`request::subscribe_json`), rendered
+        // behind the frame-header room and framed in place — no staging
+        // copy.
+        let room = core_net::WS_CLIENT_HDR_MAX;
+        let n = crate::request::subscribe_json(
+            &mut self.tx[room..],
+            channel,
+            self.master_hex.as_bytes(),
+        )
+        .map_err(|_| WsErr::BadFrame)?;
         let mask = self.next_mask();
-        let frame_len = core_net::ws_write_text_frame(&mut self.tx, &body[..n], mask)
+        let start = core_net::ws_frame_in_place(&mut self.tx, room, WsOpcode::Text, n, mask)
             .map_err(|_| WsErr::BadFrame)?;
         let t = self.transport.as_mut().ok_or(WsErr::Disconnected)?;
-        write_all_t(t, &self.tx[..frame_len], deadline)?;
+        write_all_t(t, &self.tx[start..room + n], deadline)?;
         Ok(())
     }
 
@@ -634,9 +618,7 @@ fn write_all_t<T: Transport>(t: &mut T, buf: &[u8], deadline: Instant) -> Result
         match t.write(&buf[off..]) {
             Ok(0) => return Err(WsErr::Disconnected),
             Ok(n) => off += n,
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                return Err(WsErr::Disconnected)
-            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Err(WsErr::Disconnected),
             Err(_) => return Err(WsErr::Disconnected),
         }
     }
@@ -691,5 +673,4 @@ mod tests {
             assert!(m.len() > 15, "{m}");
         }
     }
-
 }

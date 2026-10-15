@@ -14,6 +14,18 @@ cargo-fuzz = true
 
 [dependencies]
 exec-hyperliquid = { path = "../crates/exec-hyperliquid" }
+# bn_cid / bn_wsapi_frame / bn_user_event / bn_rest_body / bn_account /
+# bn_mode: the BX6 arm's scanners and boot assertions; BX7 widens
+# bn_user_event (every product's and mode's events, the not-cross walk's
+# agreement law, raw ⇔ combined), bn_account (COIN-M and Portfolio Margin's
+# positions) and bn_mode (a row's margin type and leverage, PM's key and
+# unified account), and adds bn_rest_answer (the REST order route's answer).
+# BX8 adds bn_spot_event (spot's user-data frame, its event and the spot
+# account read, each judged by an oracle of the target's own). BX9 adds
+# bn_option_rest (the options account, positions, exercise records, index
+# and route answer; the settlement price) and widens bn_user_event (an
+# option's commission asset; RISK_LEVEL_CHANGE ⇔ riskLevelChange).
+exec-binance     = { path = "../crates/exec-binance" }
 # cargo-fuzz runtime.
 libfuzzer-sys = "0.4"
 
@@ -26,6 +38,7 @@ core-crypto        = { path = "../crates/core-crypto" }
 ingress-polymarket = { path = "../crates/ingress-polymarket" }
 ingress-binance    = { path = "../crates/ingress-binance" }
 ingress-bybit      = { path = "../crates/ingress-bybit" }
+ingress-mexc       = { path = "../crates/ingress-mexc" }
 ingress-rpc        = { path = "../crates/ingress-rpc" }
 ingress-okx        = { path = "../crates/ingress-okx" }
 book-builder    = { path = "../crates/book-builder" }
@@ -37,6 +50,21 @@ signer-eip712      = { path = "../crates/signer-eip712" }
 clob-dispatcher    = { path = "../crates/clob-dispatcher" }
 # universe_toml: the M1 boot-universe config parser (core-config).
 core-config        = { path = "../crates/core-config" }
+# evm_rlp: the HYPARB H7 EIP-1559 renderer.
+signer-evm         = { path = "../crates/signer-evm" }
+# amm_tick_walk / amm_map_payload: the HYPARB H1 AMM walk + arb solve, the
+# O-H19 tick-map maintenance and the pool-event payload codec.
+core-amm           = { path = "../crates/core-amm" }
+# hyperevm_decode: the HYPARB H3 log/envelope decoders + pool snapshot machine.
+ingress-hyperevm   = { path = "../crates/ingress-hyperevm" }
+# amm_book: the HYPARB H2 AMM fill law (pool book + judge).
+core-fill          = { path = "../crates/core-fill" }
+# hypercall_{ws_frame,markets,summary}: the HC3/HC4 Hypercall parsers.
+ingress-hypercall  = { path = "../crates/ingress-hypercall" }
+# evm_exec_response: the HYPARB H7c write-path response scanners.
+exec-hyperevm      = { path = "../crates/exec-hyperevm" }
+# hypercall_{response,userws}: the HC9 order arm's answer and event scanners.
+exec-hypercall     = { path = "../crates/exec-hypercall" }
 
 [[bin]]
 name   = "ai_cmd_frame"
@@ -242,6 +270,13 @@ doc    = false
 bench  = false
 
 [[bin]]
+name   = "binance_eapi_mark_array"
+path   = "fuzz_targets/binance_eapi_mark_array.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
 name   = "hl_info"
 path   = "fuzz_targets/hl_info.rs"
 test   = false
@@ -314,6 +349,188 @@ bench  = false
 [[bin]]
 name   = "hl_user_events"
 path   = "fuzz_targets/hl_user_events.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "pb_scan"
+path   = "fuzz_targets/pb_scan.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "mexc_ws_frame"
+path   = "fuzz_targets/mexc_ws_frame.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "mexc_instruments"
+path   = "fuzz_targets/mexc_instruments.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "amm_tick_walk"
+path   = "fuzz_targets/amm_tick_walk.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "amm_map_payload"
+path   = "fuzz_targets/amm_map_payload.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hyperevm_decode"
+path   = "fuzz_targets/hyperevm_decode.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "evm_rlp"
+path   = "fuzz_targets/evm_rlp.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "amm_book"
+path   = "fuzz_targets/amm_book.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "evm_exec_response"
+path   = "fuzz_targets/evm_exec_response.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "https_answer"
+path   = "fuzz_targets/https_answer.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "ws_framer"
+path   = "fuzz_targets/ws_framer.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_cid"
+path   = "fuzz_targets/bn_cid.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_wsapi_frame"
+path   = "fuzz_targets/bn_wsapi_frame.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_user_event"
+path   = "fuzz_targets/bn_user_event.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_rest_body"
+path   = "fuzz_targets/bn_rest_body.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_account"
+path   = "fuzz_targets/bn_account.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_mode"
+path   = "fuzz_targets/bn_mode.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_rest_answer"
+path   = "fuzz_targets/bn_rest_answer.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_spot_event"
+path   = "fuzz_targets/bn_spot_event.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_option_rest"
+path   = "fuzz_targets/bn_option_rest.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_equity"
+path   = "fuzz_targets/bn_equity.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hypercall_ws_frame"
+path   = "fuzz_targets/hypercall_ws_frame.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hypercall_markets"
+path   = "fuzz_targets/hypercall_markets.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hypercall_summary"
+path   = "fuzz_targets/hypercall_summary.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hypercall_response"
+path   = "fuzz_targets/hypercall_response.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hypercall_userws"
+path   = "fuzz_targets/hypercall_userws.rs"
 test   = false
 doc    = false
 bench  = false

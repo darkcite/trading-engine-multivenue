@@ -1,0 +1,18 @@
+[package]
+name         = "signer-evm"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "HYPARB H7 (O-H7): chain-agnostic EIP-1559 transactions. Signing digest and transaction hash are hashed in place over stack encodings and the borrowed calldata; the signed envelope is rendered as hex straight into the JSON-RPC body. secp256k1 + keccak via signer-eip712 (unmodified)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+signer-eip712 = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

@@ -53,7 +53,7 @@ use crate::action::{
     encode_cancel_by_cloid, encode_order, CancelByCloidWire, ModifyWire, OrderWire, Tif, MAX_ACTION,
 };
 use crate::config::HlConfig;
-use crate::http::{HlHttp, MAX_REQ_BODY};
+use crate::http::HlHttp;
 use crate::request::{batch_modify_json, cancel_by_cloid_json, envelope, order_json};
 use crate::response::{scan, HlOk, HlResponse};
 use crate::sign::{sign_action, Vault};
@@ -111,7 +111,7 @@ pub fn run(
     if !cfg.is_testnet() {
         return Err(SmokeErr::NotTestnet(cfg.host.clone()));
     }
-    let mut http = HlHttp::new(&cfg.host, 443, tls).map_err(SmokeErr::Http)?;
+    let mut http = HlHttp::new(&cfg.host, cfg.port(), tls).map_err(SmokeErr::Http)?;
     run_on(cfg, &mut http, spec)
 }
 
@@ -160,7 +160,16 @@ pub fn run_on(
     let mut aj = [0u8; MAX_ACTION];
     let mp_n = encode_order(&mut mp, &[order], b"na").map_err(|_| SmokeErr::Encode)?;
     let aj_n = order_json(&mut aj, &[order], b"na").map_err(|_| SmokeErr::Encode)?;
-    let ok = post(http, &sk, cfg, &mut nonces, &mp[..mp_n], &aj[..aj_n], "place", ItemErrors::AreFailures)?;
+    let ok = post(
+        http,
+        &sk,
+        cfg,
+        &mut nonces,
+        &mp[..mp_n],
+        &aj[..aj_n],
+        "place",
+        ItemErrors::AreFailures,
+    )?;
 
     if ok.any_filled {
         // A post-only order should be unable to trade. If one did, the
@@ -193,7 +202,16 @@ pub fn run_on(
     // issued a NEW oid, and a client that tracked only the old one
     // would be unable to cancel what it placed. LAW E-9 puts the slot
     // in the cloid precisely so the client id is the durable handle.
-    let ok = match cancel(http, &sk, cfg, &mut nonces, spec.asset, cloid, "cancel", ItemErrors::AreFailures) {
+    let ok = match cancel(
+        http,
+        &sk,
+        cfg,
+        &mut nonces,
+        spec.asset,
+        cloid,
+        "cancel",
+        ItemErrors::AreFailures,
+    ) {
         Ok(ok) => ok,
         Err(e) => return Err(cleanup(http, &sk, cfg, &mut nonces, spec.asset, cloid, e)),
     };
@@ -209,7 +227,16 @@ pub fn run_on(
     // Cancelling the same cloid again must be REFUSED. A second `ok`
     // here would mean the venue accepts cancels for orders it does not
     // have, and the first `ok` would have proved nothing.
-    let ok = cancel(http, &sk, cfg, &mut nonces, spec.asset, cloid, "verify", ItemErrors::AreData)?;
+    let ok = cancel(
+        http,
+        &sk,
+        cfg,
+        &mut nonces,
+        spec.asset,
+        cloid,
+        "verify",
+        ItemErrors::AreData,
+    )?;
     let verified_gone = ok.errors > 0;
 
     Ok(LifecycleReport {
@@ -259,9 +286,8 @@ pub fn preview(spec: LifecycleSpec) -> Result<Preview, SmokeErr> {
     let cloid = [0u8; 16];
     let order = OrderWire::new(spec.asset, spec.is_buy, spec.px_1e8, spec.sz_1e8, Tif::Alo)
         .with_cloid(cloid);
-    let replacement =
-        OrderWire::new(spec.asset, spec.is_buy, spec.px2_1e8, spec.sz_1e8, Tif::Alo)
-            .with_cloid(cloid);
+    let replacement = OrderWire::new(spec.asset, spec.is_buy, spec.px2_1e8, spec.sz_1e8, Tif::Alo)
+        .with_cloid(cloid);
 
     let mut buf = [0u8; MAX_ACTION];
     let n = order_json(&mut buf, &[order], b"na").map_err(|_| SmokeErr::Encode)?;
@@ -310,9 +336,8 @@ fn modify(
     cloid: [u8; 16],
     oid: u64,
 ) -> Result<u64, SmokeErr> {
-    let replacement =
-        OrderWire::new(spec.asset, spec.is_buy, spec.px2_1e8, spec.sz_1e8, Tif::Alo)
-            .with_cloid(cloid);
+    let replacement = OrderWire::new(spec.asset, spec.is_buy, spec.px2_1e8, spec.sz_1e8, Tif::Alo)
+        .with_cloid(cloid);
     let m = [ModifyWire {
         order: replacement,
         oid,
@@ -323,7 +348,16 @@ fn modify(
     let mut aj = [0u8; MAX_ACTION];
     let mp_n = crate::action::encode_batch_modify(&mut mp, &m).map_err(|_| SmokeErr::Encode)?;
     let aj_n = batch_modify_json(&mut aj, &m).map_err(|_| SmokeErr::Encode)?;
-    let ok = post(http, sk, cfg, nonces, &mp[..mp_n], &aj[..aj_n], "modify", ItemErrors::AreFailures)?;
+    let ok = post(
+        http,
+        sk,
+        cfg,
+        nonces,
+        &mp[..mp_n],
+        &aj[..aj_n],
+        "modify",
+        ItemErrors::AreFailures,
+    )?;
     if ok.any_filled {
         return Err(SmokeErr::Lifecycle {
             stage: "modify",
@@ -358,7 +392,16 @@ fn cancel(
     let mut aj = [0u8; MAX_ACTION];
     let mp_n = encode_cancel_by_cloid(&mut mp, &c).map_err(|_| SmokeErr::Encode)?;
     let aj_n = cancel_by_cloid_json(&mut aj, &c).map_err(|_| SmokeErr::Encode)?;
-    post(http, sk, cfg, nonces, &mp[..mp_n], &aj[..aj_n], stage, items)
+    post(
+        http,
+        sk,
+        cfg,
+        nonces,
+        &mp[..mp_n],
+        &aj[..aj_n],
+        stage,
+        items,
+    )
 }
 
 /// Best-effort removal of a resting order after a failure, folding the
@@ -372,7 +415,16 @@ fn cleanup(
     cloid: [u8; 16],
     original: SmokeErr,
 ) -> SmokeErr {
-    match cancel(http, sk, cfg, nonces, asset, cloid, "cleanup", ItemErrors::AreData) {
+    match cancel(
+        http,
+        sk,
+        cfg,
+        nonces,
+        asset,
+        cloid,
+        "cleanup",
+        ItemErrors::AreData,
+    ) {
         Ok(ok) if ok.errors == 0 => original,
         _ => SmokeErr::Lifecycle {
             stage: "cleanup",
@@ -423,10 +475,9 @@ fn post(
     let nonce = nonces.next(crate::nonce::now_ms());
     let sig = sign_action(sk, action_mp, nonce, Vault::None, None, cfg.network)
         .map_err(|_| SmokeErr::Sign)?;
-    let mut body = [0u8; MAX_REQ_BODY];
-    let n = envelope(&mut body, action_json, nonce, &sig, None, None)
+    let n = envelope(http.body_mut(), action_json, nonce, &sig, None, None)
         .map_err(|_| SmokeErr::Encode)?;
-    let (_status, range) = http.post(&body[..n]).map_err(|e| SmokeErr::Http(e.err))?;
+    let (_status, range) = http.post(n).map_err(|e| SmokeErr::Http(e.err))?;
     let resp = http.resp();
     let slice = &resp[range];
     match scan(slice).map_err(|_| SmokeErr::Unreadable)? {
@@ -772,7 +823,7 @@ pub fn run_fill(
     if !cfg.is_testnet() {
         return Err(SmokeErr::NotTestnet(cfg.host.clone()));
     }
-    let mut http = HlHttp::new(&cfg.host, 443, tls).map_err(SmokeErr::Http)?;
+    let mut http = HlHttp::new(&cfg.host, cfg.port(), tls).map_err(SmokeErr::Http)?;
     run_fill_on(cfg, &mut http, spec)
 }
 
@@ -782,11 +833,7 @@ pub fn run_fill(
 ///
 /// # Errors
 /// As [`run_fill`].
-pub fn run_fill_on(
-    cfg: &HlConfig,
-    http: &mut HlHttp,
-    spec: FillSpec,
-) -> Result<FillRun, SmokeErr> {
+pub fn run_fill_on(cfg: &HlConfig, http: &mut HlHttp, spec: FillSpec) -> Result<FillRun, SmokeErr> {
     if !cfg.is_testnet() {
         return Err(SmokeErr::NotTestnet(cfg.host.clone()));
     }
@@ -854,7 +901,16 @@ pub fn run_fill_on(
         // will likely refuse the next nineteen for the same reason,
         // and nineteen more refusals is nineteen more nonces spent to
         // learn nothing. The report says what happened up to here.
-        let ok = match post(http, &sk, cfg, &mut nonces, &mp[..mp_n], &aj[..aj_n], "fill", ItemErrors::AreFailures) {
+        let ok = match post(
+            http,
+            &sk,
+            cfg,
+            &mut nonces,
+            &mp[..mp_n],
+            &aj[..aj_n],
+            "fill",
+            ItemErrors::AreFailures,
+        ) {
             Ok(ok) => ok,
             Err(e) => {
                 // The ONE site that knows which refusals are answers.
@@ -1108,8 +1164,8 @@ pub fn run_requote_on(
     };
 
     // ---- place ------------------------------------------------------
-    let order = OrderWire::new(spec.asset, spec.is_buy, spec.px_1e8, spec.sz_1e8, Tif::Alo)
-        .with_cloid(old);
+    let order =
+        OrderWire::new(spec.asset, spec.is_buy, spec.px_1e8, spec.sz_1e8, Tif::Alo).with_cloid(old);
     let mut mp = [0u8; MAX_ACTION];
     let mut aj = [0u8; MAX_ACTION];
     let mp_n = encode_order(&mut mp, &[order], b"na").map_err(|_| SmokeErr::Encode)?;
@@ -1275,7 +1331,16 @@ fn modify_to_cloid(
     let mut aj = [0u8; MAX_ACTION];
     let mp_n = crate::action::encode_batch_modify(&mut mp, &m).map_err(|_| SmokeErr::Encode)?;
     let aj_n = batch_modify_json(&mut aj, &m).map_err(|_| SmokeErr::Encode)?;
-    let ok = post(http, sk, cfg, nonces, &mp[..mp_n], &aj[..aj_n], "modify", ItemErrors::AreFailures)?;
+    let ok = post(
+        http,
+        sk,
+        cfg,
+        nonces,
+        &mp[..mp_n],
+        &aj[..aj_n],
+        "modify",
+        ItemErrors::AreFailures,
+    )?;
     if ok.any_filled {
         return Err(SmokeErr::Lifecycle {
             stage: "modify",
@@ -1309,7 +1374,7 @@ pub fn run_requote(
     if !cfg.is_testnet() {
         return Err(SmokeErr::NotTestnet(cfg.host.clone()));
     }
-    let mut http = HlHttp::new(&cfg.host, 443, tls).map_err(SmokeErr::Http)?;
+    let mut http = HlHttp::new(&cfg.host, cfg.port(), tls).map_err(SmokeErr::Http)?;
     run_requote_on(cfg, &mut http, spec)
 }
 
@@ -1527,10 +1592,12 @@ pub fn run_sweep_on(
             }
             if rep.listed {
                 let mut oids = [0u64; crate::recon::MAX_OPEN_ORDERS];
+                // The roll path's mask: every slot's (LAW E-8).
                 let picked = crate::recon::ours_on_leg(
                     &rows[..n],
                     body,
                     &rep.coin[..rep.coin_len as usize],
+                    crate::recon::ALL_SLOTS,
                     &mut oids,
                 );
                 rep.selected = oids[..picked].contains(&rep.placed_oid);
@@ -1615,12 +1682,9 @@ fn enumerate(
     cfg: &HlConfig,
     rows: &mut [crate::recon::OpenOrder],
 ) -> Result<(usize, core::ops::Range<usize>), SmokeErr> {
-    let mut req = [0u8; crate::recon::MAX_OPEN_ORDERS_REQ];
-    let n = crate::recon::open_orders_request(&mut req, &cfg.master_addr)
+    let n = crate::recon::open_orders_request(http.info_mut(), &cfg.master_addr)
         .map_err(|_| SmokeErr::Encode)?;
-    let (_status, range) = http
-        .post_to(crate::http::INFO_PATH, &req[..n])
-        .map_err(|e| SmokeErr::Http(e.err))?;
+    let (_status, range) = http.post_info(n).map_err(|e| SmokeErr::Http(e.err))?;
     // Fail-closed: an unreadable answer is NOT "nothing is resting".
     let k = crate::recon::scan_open_orders(&http.resp()[range.clone()], rows)
         .map_err(|_| SmokeErr::Unreadable)?;
@@ -1639,7 +1703,16 @@ fn sweep_cleanup(
     cloid: [u8; 16],
     rep: &mut SweepReport,
 ) {
-    match cancel(http, sk, cfg, nonces, asset, cloid, "cleanup", ItemErrors::AreData) {
+    match cancel(
+        http,
+        sk,
+        cfg,
+        nonces,
+        asset,
+        cloid,
+        "cleanup",
+        ItemErrors::AreData,
+    ) {
         // `errors > 0` here means the venue had nothing under that id,
         // which is the answer we want. Unlike phase F's
         // `new_cancel_succeeded` this is a CLEANUP rather than an
@@ -1670,7 +1743,7 @@ pub fn run_sweep(
     if !cfg.is_testnet() {
         return Err(SmokeErr::NotTestnet(cfg.host.clone()));
     }
-    let mut http = HlHttp::new(&cfg.host, 443, tls).map_err(SmokeErr::Http)?;
+    let mut http = HlHttp::new(&cfg.host, cfg.port(), tls).map_err(SmokeErr::Http)?;
     run_sweep_on(cfg, &mut http, spec)
 }
 
@@ -1906,12 +1979,11 @@ pub fn run_recon(
     }
     let stage = "recon";
 
-    let mut ws = crate::UserWs::new(&cfg.host, 443, Arc::clone(&tls), &cfg.master_addr).map_err(
-        |e| SmokeErr::Lifecycle {
+    let mut ws = crate::UserWs::new(&cfg.host, cfg.port(), Arc::clone(&tls), &cfg.master_addr)
+        .map_err(|e| SmokeErr::Lifecycle {
             stage,
             msg: format!("user-event socket: {e:?}"),
-        },
-    )?;
+        })?;
     ws.connect().map_err(|e| SmokeErr::Lifecycle {
         stage,
         msg: format!("subscribe: {e:?}"),
@@ -1989,13 +2061,10 @@ pub fn run_recon(
         });
     }
 
-    let mut http = HlHttp::new(&cfg.host, 443, tls).map_err(SmokeErr::Http)?;
-    let mut req = [0u8; crate::recon::MAX_STATE_REQ];
-    let n = crate::recon::spot_state_request(&mut req, &cfg.master_addr)
+    let mut http = HlHttp::new(&cfg.host, cfg.port(), tls).map_err(SmokeErr::Http)?;
+    let n = crate::recon::spot_state_request(http.info_mut(), &cfg.master_addr)
         .map_err(|_| SmokeErr::Encode)?;
-    let (_status, range) = http
-        .post_to(crate::http::INFO_PATH, &req[..n])
-        .map_err(|e| SmokeErr::Http(e.err))?;
+    let (_status, range) = http.post_info(n).map_err(|e| SmokeErr::Http(e.err))?;
     let body = &http.resp()[range];
     let mut bal = vec![crate::recon::SpotBalance::default(); crate::recon::MAX_SPOT_BALANCES];
     let rows = crate::recon::scan_spot_state(body, &mut bal).map_err(|_| SmokeErr::Unreadable)?;
@@ -2086,9 +2155,9 @@ mod recon_tests {
         let mut set = row(leg, None, 400_000_000, false); // sells 4 back
         set.is_settlement = true;
         let fills = [
-            set,                                    // newest: the settlement
-            row(leg, ours(2), 200_000_000, true),   // +2
-            row(leg, ours(1), 200_000_000, true),   // +2
+            set,                                  // newest: the settlement
+            row(leg, ours(2), 200_000_000, true), // +2
+            row(leg, ours(1), 200_000_000, true), // +2
         ];
 
         let mut a = AssetTable::new();
@@ -2158,7 +2227,10 @@ mod recon_tests {
     /// disagrees with a venue while looking right.
     #[test]
     fn a_sell_books_negative_and_the_scale_is_1e6() {
-        assert_eq!(signed_1e6(&row(span(0, 7), None, 200_000_000, true)), 2_000_000);
+        assert_eq!(
+            signed_1e6(&row(span(0, 7), None, 200_000_000, true)),
+            2_000_000
+        );
         assert_eq!(
             signed_1e6(&row(span(0, 7), None, 200_000_000, false)),
             -2_000_000,
@@ -2184,7 +2256,7 @@ mod recon_tests {
     /// address, and an account whose only rows are somebody's payout.
     #[test]
     fn a_verdict_over_zero_legs_is_never_an_agreement() {
-        use super::{ReconReport, LedgerStats};
+        use super::{LedgerStats, ReconReport};
 
         let verdict = |ledger: LedgerStats| {
             ReconReport {
@@ -2232,7 +2304,10 @@ mod recon_tests {
         let mut a = AssetTable::new();
         let st = build_ledger(&[row(span(0, 7), ours(1), 200_000_000, true)], BODY, &mut a);
         assert_eq!(st.legs, 1);
-        assert!(verdict(st), "a leg that agreed must still read as agreement");
+        assert!(
+            verdict(st),
+            "a leg that agreed must still read as agreement"
+        );
     }
 
     /// A settlement is classified BEFORE its cloid is looked at, which
@@ -2436,7 +2511,10 @@ mod fill_tests {
         match check_fill_spec(s) {
             Err(SmokeErr::Lifecycle { stage, msg }) => {
                 assert_eq!(stage, "fill-spec");
-                assert!(msg.contains("ceiling"), "the message must say what it refused: {msg}");
+                assert!(
+                    msg.contains("ceiling"),
+                    "the message must say what it refused: {msg}"
+                );
             }
             other => panic!("a 1,360 USDC order was not refused: {other:?}"),
         }
@@ -2444,7 +2522,10 @@ mod fill_tests {
         let mut s = spec();
         s.sz_1e8 = i64::MAX;
         s.px_1e8 = i64::MAX;
-        assert!(check_fill_spec(s).is_err(), "i64::MAX squared must not wrap past the ceiling");
+        assert!(
+            check_fill_spec(s).is_err(),
+            "i64::MAX squared must not wrap past the ceiling"
+        );
     }
 
     #[test]
@@ -2469,8 +2550,15 @@ mod fill_tests {
         assert_eq!(p.px, "0.68");
         assert_eq!(p.sz, "2");
         assert_eq!(p.cloid, "0x4d560300000000000000000000000001");
-        assert!(p.place.contains("\"Ioc\""), "phase D is an IoC: {}", p.place);
-        assert!(!p.place.contains("Alo"), "a post-only preview would be the wrong rehearsal");
+        assert!(
+            p.place.contains("\"Ioc\""),
+            "phase D is an IoC: {}",
+            p.place
+        );
+        assert!(
+            !p.place.contains("Alo"),
+            "a post-only preview would be the wrong rehearsal"
+        );
     }
 
     /// The preview renders the REAL magic, so the echo it tells the
@@ -2491,7 +2579,6 @@ mod fill_tests {
             crate::cloid::Owner::Foreign
         ));
     }
-
 }
 
 #[cfg(test)]
@@ -2530,13 +2617,28 @@ mod tests {
         let c = HlConfig::new(Scope::Testnet, crate::config::HOST_TESTNET, 'b', KEY, ADDR)
             .expect("cfg");
         for bad in [
-            LifecycleSpec { sz_1e8: 0, ..spec() },
-            LifecycleSpec { sz_1e8: -1, ..spec() },
-            LifecycleSpec { px_1e8: 0, ..spec() },
-            LifecycleSpec { px2_1e8: -5, ..spec() },
+            LifecycleSpec {
+                sz_1e8: 0,
+                ..spec()
+            },
+            LifecycleSpec {
+                sz_1e8: -1,
+                ..spec()
+            },
+            LifecycleSpec {
+                px_1e8: 0,
+                ..spec()
+            },
+            LifecycleSpec {
+                px2_1e8: -5,
+                ..spec()
+            },
         ] {
             let e = run(&c, tls.clone(), bad).expect_err("must refuse");
-            assert!(matches!(e, SmokeErr::Lifecycle { stage: "spec", .. }), "{e:?}");
+            assert!(
+                matches!(e, SmokeErr::Lifecycle { stage: "spec", .. }),
+                "{e:?}"
+            );
         }
     }
 
@@ -2579,8 +2681,14 @@ mod tests {
     #[test]
     fn the_preview_refuses_what_the_run_refuses() {
         for bad in [
-            LifecycleSpec { sz_1e8: 0, ..spec() },
-            LifecycleSpec { px_1e8: -1, ..spec() },
+            LifecycleSpec {
+                sz_1e8: 0,
+                ..spec()
+            },
+            LifecycleSpec {
+                px_1e8: -1,
+                ..spec()
+            },
         ] {
             assert!(matches!(
                 preview(bad),
@@ -2598,9 +2706,21 @@ mod tests {
             verified_gone: true,
         };
         assert!(base.passed());
-        assert!(!LifecycleReport { verified_gone: false, ..base }.passed());
-        assert!(!LifecycleReport { cancelled: false, ..base }.passed());
-        assert!(!LifecycleReport { placed_oid: 0, ..base }.passed());
+        assert!(!LifecycleReport {
+            verified_gone: false,
+            ..base
+        }
+        .passed());
+        assert!(!LifecycleReport {
+            cancelled: false,
+            ..base
+        }
+        .passed());
+        assert!(!LifecycleReport {
+            placed_oid: 0,
+            ..base
+        }
+        .passed());
     }
 
     /// Two runs must not collide on the account.

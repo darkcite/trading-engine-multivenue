@@ -84,6 +84,7 @@ VENUE_NAMES: tuple[str, ...] = (
     "deribit",
     "hyperliquid",
     "bybit",
+    "mexc",
     "polymarket",
     "coinbase",
     "kraken",

@@ -22,6 +22,23 @@
 //! chunked / close-delimited framing). Consumers today: the boot-time
 //! REST discovery path ([`boot_http`], 8e) and the CLOB dispatcher's
 //! POST path (its original consumer, the RSS poller, was retired in 8f).
+//!
+//! HC2 generalises the request side — any [`http1::Method`], any target,
+//! extra headers ([`http1::write_request_head`]) — and adds
+//! [`HttpsReq`], a keep-alive client for one host and any request.
+//!
+//! BX5 adds [`HttpsConn`] — one non-blocking keep-alive HTTPS connection
+//! whose requests are boot-rendered templates, driven by its owner's poll
+//! (the Binance arm's REST); [`HttpsPost`] is now its blocking form — and
+//! [`WsConn`] / [`WsFramer`], the non-blocking WebSocket session.
+//!
+//! HD1 moves [`HttpsReq`] onto `HttpsPost`'s raw form, so `HttpsConn` is
+//! the crate's one keep-alive HTTPS engine. The older blocking copy HC2
+//! had moved out of the pre-BX5 `HttpsPost` (`https_keepalive`) is gone.
+//! HD2 gives [`HttpsPost`] several templates on one connection
+//! ([`HttpsPost::with_specs`]) and makes it the Hyperliquid exchange
+//! arm's transport; [`http1::read_response`] skips interim `1xx`
+//! answers, and a `204` ends at its blank line.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -35,37 +52,57 @@
 
 pub mod backoff;
 pub mod boot_http;
+pub mod drain;
 pub mod error;
 pub mod http1;
+pub mod https_conn;
+pub mod https_post;
+pub mod https_req;
 pub mod iobuf;
 pub mod keepalive;
 pub mod subs;
 pub mod transport;
+pub mod ws_conn;
 pub mod ws_frame;
 pub mod ws_handshake;
 
-pub use backoff::{Backoff, BACKOFF_BASE_NS, BACKOFF_CAP_NS};
+pub use backoff::{
+    should_reset_backoff, Backoff, BACKOFF_BASE_NS, BACKOFF_CAP_NS, HEALTHY_SESSION_MIN_NS,
+};
+pub use drain::{
+    fill_rx, incomplete_frame, poll_timeout, Drained, RxFill, DRAIN_STEP_CAP, POLL_IDLE,
+};
 pub use error::{NetworkErr, NetworkErrKind, NetworkSource};
 pub use iobuf::IoBuf;
 pub use keepalive::{
     establishment_expired, Keepalive, KeepaliveAction, KeepaliveCfg, ESTABLISH_BUDGET_NS,
 };
 pub use subs::{
-    queue_masked_binary_frame, queue_masked_text_frame, PendingErr, PendingReq, PendingTable,
-    ReqKind, SubErr, SubId, SubTable,
+    queue_masked_binary_frame, queue_masked_binary_frame_parts, queue_masked_text_frame,
+    queue_masked_text_frame_parts, queue_masked_text_frame_rendered, PendingErr, PendingReq,
+    PendingTable, ReqKind, SubErr, SubId, SubTable,
 };
 
 pub use http1::{
-    dechunk_in_place, read_response, write_get_request, BodyFraming, DechunkResult, HttpErr,
-    HttpResult,
+    chunked_body, dechunk_in_place, head_says_close, read_response, request_head_len,
+    write_get_request, write_request, write_request_head, BodyFraming, ChunkedBody, DechunkResult,
+    Header, HttpErr, HttpResult, Method, ReqHead,
 };
+pub use https_conn::{
+    ConnCfg, HttpsConn, Params, PostErr, PostErrKind, Progress, ReqSpec, ReqWire, MAX_BODY_CAP,
+};
+pub use https_post::{parse_https_url, HttpsPost};
+pub use https_req::{HttpsReq, REQ_USER_AGENT};
 pub use transport::{
     PlainTcpTransport, Status, TestBuffer, TestTransport, TlsTransport, Transport,
 };
+pub use ws_conn::{WsCfg, WsConn, WsErr, WsFramer, WsNext, WsProgress};
 pub use ws_frame::{
-    ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_binary_frame, ws_write_ping,
-    ws_write_pong, ws_write_text_frame, PayloadSpan, WsFrameHeader, WsOpcode, WsReadResult,
-    WsWriteErr,
+    ws_frame_in_place, ws_mask_from_counter, ws_read_frame, ws_unmask_in_place,
+    ws_write_binary_frame_parts, ws_write_ping, ws_write_pong, ws_write_text_frame,
+    ws_write_text_frame_parts, ws_write_text_frame_rendered, ws_write_text_frame_with,
+    PayloadSpan, WsFrameHeader, WsOpcode, WsPart, WsPayload, WsReadResult, WsWriteErr,
+    WS_CLIENT_HDR_MAX,
 };
 pub use ws_handshake::{
     constant_time_eq, expected_accept, read_server_handshake, sec_websocket_key_from_seed,

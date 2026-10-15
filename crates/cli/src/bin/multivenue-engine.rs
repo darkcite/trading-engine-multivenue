@@ -12,7 +12,7 @@
 //!   OKX when `--okx-symbols` is set, Deribit when
 //!   `--deribit-symbols` is set, Hyperliquid when `--hl-coins` is
 //!   set, Polygon RPC), boot the
-//!   real `Engine` with the latency-arb strategy + paper dispatcher,
+//!   real `Engine` with the composed strategy set + paper dispatcher,
 //!   drain consumers on the main thread until SIGINT.
 //! * `print-config` — load `.env` + env and print the resolved
 //!   (non-secret) config.
@@ -29,11 +29,11 @@ use std::sync::atomic::AtomicBool;
 
 use clap::Parser;
 use cli::{
-    boot_info, engine_loop_ev_full, engine_loop_full, engine_loop_rule_tree_full,
-    engine_loop_set_full, install_sigint_handler, join_reverse,
-    spawn_binance, spawn_deribit, spawn_hyperliquid, spawn_okx, spawn_polymarket, spawn_rpc,
-    state_writer, Consumers, EngineConfig, EngineLoopResult, LatencyDump, LiveDispatcher,
-    Observability, Rings, StrategyPair, WssEndpoint, SHUTDOWN,
+    boot_info, engine_loop_ev_full, engine_loop_rule_tree_full, engine_loop_set_full,
+    install_sigint_handler, join_reverse, spawn_binance, spawn_deribit, spawn_hyperliquid,
+    spawn_okx, spawn_polymarket, spawn_rpc, state_writer, Consumers, EngineConfig,
+    EngineLoopResult, LatencyDump, LiveDispatcher, Observability, Rings, StrategyPair, WssEndpoint,
+    SHUTDOWN,
 };
 use core_config::{Config, Secrets};
 use core_net::TlsTransport;
@@ -42,22 +42,87 @@ use tracing_subscriber::EnvFilter;
 
 /// BIN15 O5 (2026-09-12): the composed-set names this binary will boot.
 ///
-/// This list MUST mirror `strategy_set::mask_for_name`, minus
-/// `latency-arb`, which has its own paper arm above and no set arm.
-/// It lives here as a named const rather than as match literals so the
+/// This list MUST mirror `strategy_set::mask_for_name` exactly (HYPARB
+/// H0 retired the one exemption: `latency-arb` and its standalone arm
+/// left with the member, O-H1). It lives here as a named const rather than as match literals so the
 /// `strategy_name_pin` tests below can read it: the arm and the mask
 /// table DID drift once. The five bin15 names reached `mask_for_name`
 /// and the wrapper allow-list but never the match arm, so
 /// `--strategy ai+vrp+xsd+bin15` refused the boot at 2026-09-12T20:04:42Z
 /// and the whole set — ai-exec, vm, vrp, xsd and bin15 — went dark
 /// behind a live capture that looked healthy.
+/// BX11 (the parser review's P-2): every `exec-smoke` flag that is not the
+/// account tools' own. clap waives a `requires` whose target conflicts with
+/// an argument present — every battery flag `requires = "binance"`, and the
+/// tools conflict with `--binance` — so a battery flag beside a tool parsed
+/// and was ignored (`--bn-um-symbol ETHUSDT` beside a flatten closed every
+/// position). Each tool names all of these as conflicts instead; a test
+/// keeps the list whole for the flags to come.
+const BN_TOOL_CONFLICTS: [&str; 57] = [
+    "asset",
+    "offline",
+    "lifecycle",
+    "px",
+    "px2",
+    "sz",
+    "sell",
+    "hl_perp",
+    "coins",
+    "cycles",
+    "fill_pairs",
+    "usd",
+    "rest_bps",
+    "cross_bps",
+    "ttl_ms",
+    "sweep_every",
+    "stall",
+    "sweep_first",
+    "hl_outcome",
+    "outcome",
+    "outcome_usd",
+    "dry_run",
+    "fill",
+    "fill_px",
+    "fill_sz",
+    "fill_slot",
+    "fill_cloid",
+    "fill_repeat",
+    "sweep",
+    "requote",
+    "recon",
+    "recon_secs",
+    "watch",
+    "binance_probe",
+    "binance",
+    "bn_rest",
+    "bn_hmac",
+    "bn_um_symbol",
+    "bn_cm_symbol",
+    "bn_cycles",
+    "bn_fill_pairs",
+    "bn_usd",
+    "bn_rest_bps",
+    "bn_cross_bps",
+    "bn_ttl_ms",
+    "bn_rotate_s",
+    "bn_drill",
+    "bn_spot_symbol",
+    "bn_adopt_usd",
+    "bn_stream_confirm",
+    "bn_eq_symbol",
+    "bn_eq_session",
+    "bn_eq_tokenize",
+    "bn_eq_quote",
+    "bn_eq_ttl_ms",
+    "bn_confirm_mainnet",
+    "bn_mainnet",
+];
+
 const STRATEGY_SET_NAMES: &[&str] = &[
     "all",
     "ai",
     "ai-exec",
     "vm",
-    "icdp",
-    "ai+icdp",
     "vrp",
     "ai+vrp",
     "xsd",
@@ -68,6 +133,27 @@ const STRATEGY_SET_NAMES: &[&str] = &[
     "ai+vrp+bin15",
     "ai+xsd+bin15",
     "ai+vrp+xsd+bin15",
+    // HYPARB H0: slot 0. Resolves, but refuses the boot as "no
+    // requested member is configured" until H5 lands its artifact
+    // (lands DARK — O-H8).
+    "hyparb",
+    "ai+hyparb",
+    "ai+vrp+xsd+bin15+hyparb",
+    // XMM XH1 (O-XH1): slot 6. Resolves, but refuses the boot as "no
+    // requested member is configured" without `~/multivenue/xmm.toml`
+    // (or `--xmm`); `icdp` and `ai+icdp` are gone with the unlink.
+    "xmm",
+    "ai+xmm",
+    "ai+vrp+xsd+bin15+hyparb+xmm",
+    // XMM XH5e: the testnet engine-instance check's set (slot 3 beside slot
+    // 6, nothing else); the wrapper's allow-list keeps it off launchd.
+    "bin15+xmm",
+    // HC11 (O-HC18): slot 7, DARK. Resolves, but refuses the boot as "no
+    // requested member is configured" without `~/multivenue/hcv.toml`
+    // (or `--hcv`); in no configured mask until the operator names it.
+    "hcv",
+    "ai+hcv",
+    "ai+vrp+xsd+bin15+hyparb+xmm+hcv",
 ];
 
 /// Top-level CLI.
@@ -100,6 +186,12 @@ enum Cmd {
     /// stderr; exit 0 only when a trustworthy report was printed.
     /// H1 slice: hold-model accounting — the §4 fill model lands in H2.
     Backtest(BacktestArgs),
+    /// XMM XH2 parity gate (plan §7.3): replay ONE window of one capture
+    /// run through the xmm member on the queue law, on the XMM
+    /// simulator's venue clock and S1 latencies, and write one TSV row
+    /// per (perp, side) beside the simulator's for the comparison.
+    /// Research only; the frozen `backtest` argv is untouched.
+    XmmParity(XmmParityArgs),
     /// Offline M3 capture catalog (mvp-plan §4-M3): walks a replay
     /// root (or one `run-<epoch_ns>` dir) and reports per-run wall
     /// spans, per-venue tick coverage, UTC-day continuity (gap map,
@@ -114,6 +206,13 @@ enum Cmd {
     /// per-strategy / per-ruleset-hash modeled P&L beside the paper
     /// view. JSON on stdout, human summary on stderr.
     AuditPnl(AuditPnlArgs),
+    /// BX11 (BX-14): the Binance commission measured from the arm's
+    /// journals (`binance-exec.pmlr` in each run directory, or in every
+    /// `run-*` under a root) — per class (product × perpetual/dated/TradFi ×
+    /// maker/taker) the trades, the rate, whether it reached N; the
+    /// `fees.toml` rows it supports, rounded up. Read-only: it never writes
+    /// `fees.toml`. JSON lines on stdout.
+    BnFees(BnFeesArgs),
     /// E3 execution gate: sign a probe action against Hyperliquid
     /// TESTNET and assert the venue verifies it — then assert it
     /// REJECTS a deliberately corrupted one.
@@ -126,6 +225,265 @@ enum Cmd {
     /// TESTNET ONLY, by construction. There is no flag that points
     /// this at production.
     ExecSmoke(ExecSmokeArgs),
+    /// HYPARB H8: the HyperEVM write path's operator verbs, TESTNET
+    /// (chain 998) ONLY by construction — `status`, `fund` (derived
+    /// wallets from wallet 0), `deploy` (the O-H18 executor), `mint` (a
+    /// testnet token's public faucet, to the executor), `battery`
+    /// (DONE(H8): a swap lands and reconciles; three wallets without a
+    /// nonce collision; an underbid observed losing). Reads the wallet
+    /// key from the environment and never opens `.env` —
+    /// `scripts/evm-testnet.sh` sources it. Report on stdout.
+    EvmTestnet(EvmTestnetArgs),
+    /// HYPARB L1 (ruling O-HL1): the HyperEVM MAINNET operator verbs —
+    /// `status` (read-only), `deploy` (the H9d executor, bytes checked
+    /// on chain), `wrap` (HYPE → WHYPE → the executor), `swap` (one
+    /// executor swap on an artifact pool), `sweep` (executor → the
+    /// wallet). Every mainnet WRITE needs `--confirm`; `--network
+    /// testnet` runs the same verb on chain 998 against `[testnet]`.
+    /// Reads keys from the environment and never opens `.env` —
+    /// `scripts/evm-live.sh` sources it. Report on stdout.
+    EvmLive(EvmLiveArgs),
+    /// HC9 (ruling O-HC19): the Hypercall order arm's MAINNET operator
+    /// verbs — `status`, `simulate` (`POST /risk/simulate/orders`, never
+    /// mutates), `recon` (read-only), `dust` (one `book_only` bid of
+    /// `--size` at `--price` on `--symbol`, its cancel by client id and
+    /// a reconcile) and `cancel-all` (every order of ours the venue
+    /// lists). There is no testnet: the two writes need `--confirm`.
+    /// Reads `HYPERCALL_WALLET` / `HYPERCALL_AGENT_KEY` from the
+    /// environment and never opens `.env` — `scripts/hypercall-live.sh`
+    /// sources it. Report on stdout.
+    HypercallLive(HypercallLiveArgs),
+    /// XMM XH5e: slot 6's PREFLIGHT — its boot's checks on the exact
+    /// `exec.toml`, `--arm-live` and `xmm.toml` a flip installs, up to the
+    /// boot's first network read: it opens no socket and sends nothing.
+    /// Loads `.env` as `run` does; run it in the wrapper's environment (from
+    /// the repo, with the wrapper's exports — `scripts/xmm-flip.sh` does):
+    /// the identities it checks are those its environment states. Exit 0
+    /// PASS (the report on stdout), 1 refused (the reason on stderr).
+    XmmPreflight(XmmPreflightArgs),
+    /// BIN15 H90 L4 (ruling O-H90-3): the late window's LIVE dust test on
+    /// the `out:BTC:15m` instance — at each `--offsets` second before its
+    /// expiry, buy the favourite leg at its ask, ⌈$1 / ask⌉ whole contracts,
+    /// IoC (`expiresAfter` 2 s); then the account's fills and the
+    /// settlement read back. $10 total per invocation (a constant). Mainnet
+    /// sends need `--confirm`; `--dry-run` signs nothing; `--network
+    /// testnet` rehearses on the smoke's account. Reads keys from the
+    /// environment and never opens `.env` — `scripts/bin15-late-dust.sh`
+    /// sources it. JSON lines on stdout.
+    HlOutcomeProbe(HlOutcomeProbeArgs),
+}
+
+/// `hl-outcome-probe --network`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ProbeNet {
+    /// Slot 3's account (`HYPERLIQUID_*`, `Scope::Live`).
+    Mainnet,
+    /// The smoke's account (`HYPERLIQUID_TESTNET_*`, `Scope::Testnet`).
+    Testnet,
+}
+
+#[derive(Debug, Parser)]
+struct HlOutcomeProbeArgs {
+    /// Which account and venue.
+    #[arg(long, value_enum, default_value = "mainnet")]
+    network: ProbeNet,
+    /// Seconds before expiry, a comma list, each 1 ..= 60.
+    #[arg(long, default_value = "25,15,8,3")]
+    offsets: String,
+    /// At most this many orders (1 ..= 8); the $10 total cap binds as well.
+    #[arg(long, default_value_t = 4)]
+    max_orders: u32,
+    /// Consecutive instances to probe (1 ..= 3).
+    #[arg(long, default_value_t = 1)]
+    instances: u32,
+    /// Read the account, the instance and the books; sign and send nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Required for a MAINNET run that sends.
+    #[arg(long)]
+    confirm: bool,
+}
+
+/// `hypercall-live` verbs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum HcVerb {
+    /// Who signs for which wallet; the private socket; balance, orders.
+    Status,
+    /// The venue's margin check of the dust leg (never mutates).
+    Simulate,
+    /// One reconciliation.
+    Recon,
+    /// The mainnet dust smoke (a WRITE: `--confirm`).
+    Dust,
+    /// Cancel every order of ours (a WRITE: `--confirm`).
+    CancelAll,
+}
+
+#[derive(Debug, Parser)]
+struct XmmPreflightArgs {
+    /// Path to a .env file; defaults to `./.env` via dotenvy (as `run`).
+    #[arg(long)]
+    env_file: Option<PathBuf>,
+    /// The `exec.toml` the boot will read.
+    #[arg(long)]
+    exec: PathBuf,
+    /// The slots the boot will arm (`--arm-live`); they must arm slot 6.
+    #[arg(long)]
+    arm_live: String,
+    /// The member's artifact (`--xmm`); `~/multivenue/xmm.toml` if absent.
+    #[arg(long)]
+    xmm: Option<PathBuf>,
+    /// The `--strategy` the boot will run: a bootable set holding xmm.
+    #[arg(long)]
+    strategy: String,
+}
+
+#[derive(Debug, Parser)]
+struct HypercallLiveArgs {
+    /// The verb.
+    #[arg(value_enum)]
+    verb: HcVerb,
+    /// The instrument, the venue's own spelling
+    /// (`<UND>-<YYYYMMDD>-<STRIKE>-<C|P>`); `simulate` and `dust` need it.
+    #[arg(long)]
+    symbol: Option<String>,
+    /// `dust` / `simulate`: the bid, USD per contract.
+    #[arg(long, default_value = "0.0005")]
+    price: String,
+    /// `dust` / `simulate`: contracts.
+    #[arg(long, default_value = "0.000001")]
+    size: String,
+    /// Required by every write: this is mainnet.
+    #[arg(long, default_value_t = false)]
+    confirm: bool,
+}
+
+/// `evm-live` verbs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum LiveVerb {
+    /// Chain, wallet X, and the executor's code, owner and balances.
+    Status,
+    /// Deploy the H9d executor from X.
+    Deploy,
+    /// Wrap `--amount-wei` HYPE into WHYPE and hand it to the executor.
+    Wrap,
+    /// One executor swap: `--pool`, `--zero-for-one`, `--amount-raw`,
+    /// `--min-out-raw`.
+    Swap,
+    /// The executor returns `--amount-raw` of `--token` to X.
+    Sweep,
+    /// HYPARB L5: slot 0's live arm end to end — boot, reconcile, a
+    /// refused unfundable swap, one AMM swap, one `--coin` hedge round
+    /// trip, retirements, the settled equity. `--network testnet` is
+    /// the rehearsal; mainnet trades a few dollars and needs `--confirm`.
+    ArmSmoke,
+}
+
+/// `evm-live --network`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum LiveNetArg {
+    /// Chain 999 — real money.
+    Mainnet,
+    /// Chain 998 — the dry run.
+    Testnet,
+}
+
+#[derive(Debug, Parser)]
+struct EvmLiveArgs {
+    /// The verb.
+    #[arg(value_enum)]
+    verb: LiveVerb,
+    /// The chain. MAINNET unless stated.
+    #[arg(long, value_enum, default_value = "mainnet")]
+    network: LiveNetArg,
+    /// The artifact whose `[mainnet]` / `[testnet]` block to use
+    /// (default `~/multivenue/hyparb.toml`).
+    #[arg(long)]
+    hyparb: Option<PathBuf>,
+    /// Required by every mainnet write: this send spends real money.
+    #[arg(long, default_value_t = false)]
+    confirm: bool,
+    /// `wrap`: HYPE to wrap and hand to the executor, wei.
+    #[arg(long)]
+    amount_wei: Option<u128>,
+    /// `swap`: exact input; `sweep`: the amount returned. Raw units.
+    #[arg(long)]
+    amount_raw: Option<u128>,
+    /// `swap`: the least output accepted, raw units (> 0).
+    #[arg(long)]
+    min_out_raw: Option<u128>,
+    /// `swap`: the pool (one of the artifact's `[[pool]]`s).
+    #[arg(long)]
+    pool: Option<String>,
+    /// `swap`: token0 in (true) or token1 in (false).
+    #[arg(long)]
+    zero_for_one: Option<bool>,
+    /// `sweep`: the token; `status`: extra executor balances (repeatable).
+    #[arg(long)]
+    token: Vec<String>,
+    /// `arm-smoke`: the hedge coin (one of the artifact's `[[coin]]`s).
+    #[arg(long, default_value = "HYPE")]
+    coin: String,
+    /// `arm-smoke`: the PREFLIGHT — boot, reconcile and the refused
+    /// unfundable swap only; nothing is sent to either venue.
+    #[arg(long, default_value_t = false)]
+    no_trade: bool,
+    /// `arm-smoke` (XMM XH4h-3): X's hedges through the Hyperliquid
+    /// WebSocket gateway instead of the blocking arm — TESTNET only.
+    #[arg(long, default_value_t = false)]
+    gateway: bool,
+    /// `arm-smoke`: also check this exec.toml arms slot 0 with
+    /// `--arm-live` (the engine's own interlock, run without the engine).
+    #[arg(long)]
+    exec: Option<PathBuf>,
+    /// `arm-smoke --exec`: the slots the engine would be armed with.
+    #[arg(long)]
+    arm_live: Option<String>,
+}
+
+/// `evm-testnet` verbs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum EvmVerb {
+    /// Chain check; every wallet's address, nonces and balance.
+    Status,
+    /// Top every derived wallet up to `--amount-wei` from wallet 0.
+    Fund,
+    /// Deploy the executor from wallet 0 (its owner).
+    Deploy,
+    /// `--token`'s public `mint(executor, --amount-raw)`.
+    Mint,
+    /// The DONE(H8) battery.
+    Battery,
+    /// The engine's shadow (boot, hybrid chain checks, ring, thread) end
+    /// to end on synthetic decisions — without stopping the live engine.
+    ShadowSmoke,
+}
+
+#[derive(Debug, Parser)]
+struct EvmTestnetArgs {
+    /// The verb.
+    #[arg(value_enum)]
+    verb: EvmVerb,
+    /// The artifact whose `[testnet]` block to use (default
+    /// `~/multivenue/hyparb.toml`).
+    #[arg(long)]
+    hyparb: Option<PathBuf>,
+    /// `fund`: each derived wallet's target balance, wei.
+    #[arg(long)]
+    amount_wei: Option<u128>,
+    /// `mint`: the testnet token (0x + 40 hex).
+    #[arg(long)]
+    token: Option<String>,
+    /// `mint`: raw units to mint to the executor.
+    #[arg(long)]
+    amount_raw: Option<u128>,
+    /// `shadow-smoke`: synthetic decisions to shadow.
+    #[arg(long, default_value_t = 3)]
+    decisions: u64,
+    /// `shadow-smoke`: the READ endpoint (the pool ingress's) — default
+    /// `https://$HYPEREVM_WS_HOST/`, else the O-H15 archive endpoint.
+    #[arg(long)]
+    read_url: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -182,6 +540,96 @@ struct ExecSmokeArgs {
     /// safely BELOW the market); for `--fill` it crosses the bid.
     #[arg(long, default_value_t = false)]
     sell: bool,
+
+    /// **XMM XH4g — the testnet battery.** With `--lifecycle`: slot 6's
+    /// Hyperliquid gateway arm and its gateway, composed in-process as the
+    /// engine composes them, driven through ALO places, modifies (a price,
+    /// a size, a crossing one), cancels, `BadAloPx`, gateway TTLs, sweeps,
+    /// IoC round trips and reconciliations on the PERPS of `--coins` —
+    /// after phases A and B, on the testnet host only. Prices come from
+    /// the venue's mids at `--rest-bps` / `--cross-bps`; each order's
+    /// notional is `--usd` (≤ $80). Exit codes 30–39 (`xmm_battery`).
+    #[arg(
+        long,
+        default_value_t = false,
+        requires = "lifecycle",
+        conflicts_with_all = ["dry_run", "offline", "watch", "recon", "fill", "requote", "sweep"]
+    )]
+    hl_perp: bool,
+
+    /// XH4g: the perps (comma-separated venue names).
+    #[arg(long, default_value = "BTC,ETH,SOL,XRP", requires = "hl_perp")]
+    coins: String,
+
+    /// XH4g: lifecycle cycles (the bar: 20).
+    #[arg(long, default_value_t = 20, requires = "hl_perp")]
+    cycles: u32,
+
+    /// XH4g: IoC round trips (an open and its reduce-only close).
+    #[arg(long, default_value_t = 3, requires = "hl_perp")]
+    fill_pairs: u32,
+
+    /// XH4g: each order's notional, USD (12 ..= 80).
+    #[arg(long, default_value_t = 15, requires = "hl_perp")]
+    usd: i64,
+
+    /// XH4g: a resting quote's distance behind the mid, bps.
+    #[arg(long, default_value_t = 500, requires = "hl_perp")]
+    rest_bps: i64,
+
+    /// XH4g: a crossing order's distance through the mid, bps.
+    #[arg(long, default_value_t = 300, requires = "hl_perp")]
+    cross_bps: i64,
+
+    /// XH4g: the TTL phase's lifetime, ms.
+    #[arg(long, default_value_t = 2_000, requires = "hl_perp")]
+    ttl_ms: u64,
+
+    /// XH4g: a sweep every this many cycles.
+    #[arg(long, default_value_t = 5, requires = "hl_perp")]
+    sweep_every: u32,
+
+    /// XH4g: stall past the dead man's deadline once (spends one of the
+    /// venue's ten daily `scheduleCancel` triggers).
+    #[arg(long, default_value_t = false, requires = "hl_perp")]
+    stall: bool,
+
+    /// XH4g: slot-6 orders resting at the start are a run that did not
+    /// end — let the arm's boot cancel them, on the run's perps only (one on
+    /// another coin holds the boot, and the flat read then finds it: exit
+    /// 38). Without this they refuse the run: they could be another slot-6
+    /// signer's.
+    #[arg(long, default_value_t = false, requires = "hl_perp")]
+    sweep_first: bool,
+
+    /// **XMM XH4i-8 — the outcome battery.** With `--lifecycle`: slot 3's
+    /// Hyperliquid gateway arm in its outcome mode and its gateway, composed
+    /// in-process as the engine composes them, rolled onto `--outcome` and
+    /// driven through an ALO place, a reprice, `BadAloPx` refusals, a quote
+    /// on the NO leg, IoCs (a miss, a take and its sale), reconciliations of
+    /// the legs and the cancel-all word on its HIP-4 legs — after phases A
+    /// and B, on the testnet host only. Prices come from the outcome's book;
+    /// each order's notional is `--outcome-usd` (≤ $25). Exit codes 40–48
+    /// (`outcome_battery`).
+    #[arg(
+        long,
+        default_value_t = false,
+        requires_all = ["lifecycle", "outcome"],
+        conflicts_with_all = [
+            "dry_run", "hl_perp", "binance", "offline", "watch", "recon", "fill", "requote",
+            "sweep"
+        ]
+    )]
+    hl_outcome: bool,
+
+    /// XH4i-8: the outcome the battery rolls onto — its id, NOT `enc` (the
+    /// YES leg is `#<id × 10>`). The operator states it (LAW E-4).
+    #[arg(long, requires = "hl_outcome")]
+    outcome: Option<u32>,
+
+    /// XH4i-8: each order's notional, USD (2 ..= 25).
+    #[arg(long, default_value_t = 5, requires = "hl_outcome")]
+    outcome_usd: i64,
 
     /// Show exactly what phase C WOULD send, and send nothing.
     ///
@@ -345,6 +793,303 @@ struct ExecSmokeArgs {
     /// invocation would silently place nothing.
     #[arg(long, conflicts_with_all = ["lifecycle", "fill"])]
     watch: Option<u64>,
+
+    /// **BX7b — the K-probes on Binance DEMO** (`cli::bn_probe`): K19,
+    /// K11, K20, K16, K5, the account mode, the body-form DELETEs and K4,
+    /// asked with the Demo keys (`BINANCE_DEMO_*`, exported by the wrapper)
+    /// and the gateway's own requests. Demo only: no flag points it at
+    /// mainnet. Its orders are post-only far behind the touch, or IoCs that
+    /// cannot fill, each cancelled by the probe. Exit 58: something of the
+    /// probe's is left on the Demo account; 59: a precondition probe failed
+    /// or a probe could not run. BX8: `--binance-probe spot` probes spot
+    /// instead (K1's Demo half): Demo's spot WS API, `session.logon` then
+    /// `userDataStream.subscribe` on the one socket — the logon's result
+    /// keys (never a value) and the subscription's id printed — then the
+    /// socket closes; it places nothing (0, or 59). BX9: `--binance-probe
+    /// options` probes eapi on Demo (K3, K18, K19): which host serves it,
+    /// an Ed25519-signed read, the listenKey and the `/private` stream, one
+    /// IoC BUY under the book and one IoC SELL over it with the arm's own
+    /// 32-character id (neither can fill), the countdown (`-6005`), and the
+    /// reconciliation's read shapes (0, 58 or 59). BX10 (the operator's
+    /// ruling S-1): `--binance-probe equity` READS the live Binance Stocks
+    /// account on MAINNET with the engine's own key — Stocks has no Demo —
+    /// and places nothing: its client holds no order, cancel or disclaimer
+    /// template; the account's rows are reported by their shapes, never
+    /// their values; with `--bn-stream-confirm` also the listenKey and a
+    /// minute of the order stream (0, or 59).
+    #[arg(
+        long,
+        value_name = "futures|spot|options|equity",
+        num_args = 0..=1,
+        default_missing_value = "futures",
+        value_parser = ["futures", "spot", "options", "equity"],
+        conflicts_with_all = ["offline", "lifecycle", "fill", "sweep", "requote", "recon", "watch", "dry_run"]
+    )]
+    binance_probe: Option<String>,
+
+    /// **BX7b — the Binance DEMO battery** (`cli::bn_battery`), with
+    /// `--lifecycle`: the engine's own composition (router → venue split →
+    /// `BnArm` → `BnGateway`) on the named products — `um`, `cm`, `spot`,
+    /// comma-separated — on Demo's hosts with the Demo keys: maker cycles
+    /// (place, two modifies, cancel), a post-only refusal and a TTL on
+    /// USDⓈ-M; IoC round trips on each futures product, each leg proven by
+    /// a reconciliation that agrees; BX8: spot's IoC cycles (a BUY across
+    /// the ask, a SELL of it less the base-asset fee across the bid) on the
+    /// M1 anchor's id 7 routed by its alias, each cycle proven by a
+    /// reconciliation (spot rides the WS API: no `--bn-rest`); a halt's
+    /// sweep last; the end reads the account flat. Demo — BX13: on MAINNET
+    /// with `--bn-mainnet` (the R0 ramp). Exit codes
+    /// 50–58; 66: the permission check refused the boot (a spot row's group
+    /// the account lacks — the bStock check's verdict; nothing placed); 0
+    /// only when the plan's bar is met. BX10: `equity`, alone — the Binance
+    /// Stocks battery (`cli::bn_equity_battery`, ruling S-3), on MAINNET
+    /// (Stocks has no Demo: REAL MONEY), the operator's to run: the D5 keys
+    /// (`--bn-eq-session`, `--bn-eq-tokenize`, `--bn-eq-quote`) and
+    /// `--bn-confirm-mainnet`, without which it reads, prints its plan and
+    /// sends nothing (exit 64).
+    #[arg(
+        long,
+        value_name = "um,cm,spot|equity",
+        requires = "lifecycle",
+        conflicts_with_all = ["hl_perp", "binance_probe", "offline", "fill", "sweep", "requote", "recon", "watch", "dry_run"]
+    )]
+    binance: Option<String>,
+
+    /// BX7b: the REST order route (`order_transport = "rest"`) instead of
+    /// the WS API.
+    #[arg(long, default_value_t = false, requires = "binance")]
+    bn_rest: bool,
+
+    /// BX7b: the HMAC key (`BINANCE_DEMO_HMAC_*`) — REST only (R22).
+    #[arg(long, default_value_t = false, requires = "bn_rest")]
+    bn_hmac: bool,
+
+    /// BX7b: the USDⓈ-M symbol.
+    #[arg(long, default_value = "BTCUSDT", requires = "binance")]
+    bn_um_symbol: String,
+
+    /// BX7b: the COIN-M symbol (Demo's coin wallet holds BNB, not BTC).
+    #[arg(long, default_value = "BNBUSD_PERP", requires = "binance")]
+    bn_cm_symbol: String,
+
+    /// BX8: the spot symbol (`--binance spot`): the battery's one spot
+    /// symbol is the universe's first, the M1 anchor — bound under its flat
+    /// id 7 whatever its name, as the universe binds its first spot symbol,
+    /// and routed to Binance by its alias. A bStock (e.g. TSLABUSDT) puts
+    /// the permission check to the account: exit 66 when the account lacks
+    /// the row's group.
+    #[arg(long, default_value = "BTCUSDT", requires = "binance")]
+    bn_spot_symbol: String,
+
+    /// BX8: the most venue inventory the boot adopts, USD (at the ticker):
+    /// a Demo spot account is seeded with balances (e.g. 1 BTC) and the
+    /// boot adopts the held base balance as the slot's starting inventory
+    /// (the slot's instance cap carries it too). 0..=10000000 (default
+    /// 250000 on Demo); 0 adopts nothing — a held base balance then refuses
+    /// the boot (exit 51, naming this flag). BX13: on MAINNET
+    /// (`--bn-mainnet`) the default is 0 — the live account's balance is
+    /// adopted only as far as the operator names it.
+    #[arg(long, requires = "binance")]
+    bn_adopt_usd: Option<i64>,
+
+    /// BX7b: maker cycles on USDⓈ-M (the bar: 10 — fewer runs short of it
+    /// and exits non-zero). BX8: spot's IoC cycles too (a BUY and its SELL
+    /// each; spot's bar: 4 fills, 2 agreeing reconciliations).
+    #[arg(long, default_value_t = 10, requires = "binance")]
+    bn_cycles: u32,
+
+    /// BX7b: IoC round trips per futures product, an open and its
+    /// reduce-only close (the bar: 3 on USDⓈ-M, 2 on COIN-M).
+    #[arg(long, default_value_t = 3, requires = "binance")]
+    bn_fill_pairs: u32,
+
+    /// BX7b: each order's requested notional, USD (at most 200; a row's
+    /// minimum can raise it — the router's 600 USD clamp bounds the order).
+    #[arg(long, default_value_t = 60, requires = "binance")]
+    bn_usd: i64,
+
+    /// BX7b: a resting quote's distance behind the touch, bps (50..=450).
+    #[arg(long, default_value_t = 300, requires = "binance")]
+    bn_rest_bps: i64,
+
+    /// BX7b: an IoC's distance through the touch, bps.
+    #[arg(long, default_value_t = 50, requires = "binance")]
+    bn_cross_bps: i64,
+
+    /// BX7b: the TTL phase's lifetime, ms (5000..=20000: the arm's
+    /// shortest maker TTL is 5 s).
+    #[arg(long, default_value_t = 5_000, requires = "binance")]
+    bn_ttl_ms: u64,
+
+    /// BX7b: replace the order session make-before-break after this many
+    /// seconds (the WS API); 0 = the production 23 h.
+    #[arg(long, default_value_t = 0, requires = "binance")]
+    bn_rotate_s: u64,
+
+    /// BX11: a drill instead of the battery's phases — `gap`: two makers
+    /// rest under the dead-man, the gateway dies without its sweep, and the
+    /// venue's countdown must cancel them within 40 s (exit 65 if not; the
+    /// end then cancels them by id and reads the account flat); `flatten`:
+    /// one IoC opens a position, the gateway stops, and the operator's
+    /// flatten must close it (its exit code, 60–63, if not).
+    #[arg(long, value_name = "gap|flatten", requires = "binance")]
+    bn_drill: Option<String>,
+
+    /// **BX11 — the Binance account setup** (`cli::bn_ops::setup`): read
+    /// the settings the engine asserts at boot (BX-19), then change only
+    /// what differs — the one-way position mode, the single-asset mode
+    /// (USDⓈ-M), each `--bn-symbol` CROSSED within the leverage cap — and,
+    /// with `--bn-sign-tradfi`, the TradFi agreement. Demo unless
+    /// `--bn-network mainnet`, whose changes need `--confirm`. Exit codes
+    /// 60–64.
+    #[arg(
+        long,
+        value_name = "um|cm",
+        group = "binance_tool",
+        conflicts_with_all = BN_TOOL_CONFLICTS
+    )]
+    binance_setup: Option<String>,
+
+    /// **BX11 — the Binance flatten** (`cli::bn_ops::flatten`, O-BX9):
+    /// close every position (or `--bn-symbol`'s) with reduce-only IoCs
+    /// through the touch, up to three tries each; refused while an order of
+    /// the arm's rests unless `--bn-cancel-first`. Never clears a halt.
+    /// Demo unless `--bn-network mainnet`, whose orders need `--confirm`.
+    #[arg(
+        long,
+        value_name = "um|cm",
+        group = "binance_tool",
+        conflicts_with_all = BN_TOOL_CONFLICTS
+    )]
+    binance_flatten: Option<String>,
+
+    /// BX11: where the account tools reach — `demo` (the default) or
+    /// `mainnet` (the engine's own key; read freely, changed only with
+    /// `--confirm`).
+    #[arg(long, default_value = "demo", value_parser = ["demo", "mainnet"], requires = "binance_tool")]
+    bn_network: String,
+
+    /// BX11: the operator's word for a MAINNET change (`--bn-network
+    /// mainnet`): without it the tool reads, prints what it would send,
+    /// and sends nothing (exit 64).
+    #[arg(long, default_value_t = false, requires = "binance_tool")]
+    confirm: bool,
+
+    /// BX10 (ruling S-3): `--binance equity`'s ticker — Binance Stocks on
+    /// MAINNET (real money: no Demo exists).
+    #[arg(long, default_value = "AAPL", requires = "binance")]
+    bn_eq_symbol: String,
+
+    /// BX10: `tradingSession` (D5 — required with `--binance equity`, no
+    /// default): RTH, EXTENDED or 24H.
+    #[arg(long, value_parser = ["RTH", "EXTENDED", "24H"], requires = "binance")]
+    bn_eq_session: Option<String>,
+
+    /// BX10: `tokenize` (D5 — required, no default): 1 settles the fill as
+    /// the tokenized bStock, 0 as the equity in the broker's custody.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=1), requires = "binance")]
+    bn_eq_tokenize: Option<u8>,
+
+    /// BX10: `quoteAsset` (D5 — required, no default), e.g. USDC.
+    #[arg(long, requires = "binance")]
+    bn_eq_quote: Option<String>,
+
+    /// BX10: the arm's TTL on every equity order, ms (5000..=300000): the
+    /// gateway cancels a DAY order still resting at it (BX-17's one
+    /// exception).
+    #[arg(long, default_value_t = 60_000, requires = "binance")]
+    bn_eq_ttl_ms: u64,
+
+    /// BX10: the operator's word for the Binance Stocks battery's orders on
+    /// MAINNET — real money. Without it `--binance equity` reads, prints
+    /// its plan and sends nothing (exit 64). BX13: the word for the R0
+    /// ramp too (`--bn-mainnet`).
+    #[arg(long = "bn-confirm-mainnet", default_value_t = false, requires = "binance")]
+    bn_confirm_mainnet: bool,
+
+    /// **BX13 — the R0 ramp on MAINNET** (`cli::bn_battery`, `--binance
+    /// um,cm,spot | options --lifecycle --bn-mainnet`): the battery on the
+    /// LIVE account with the engine's own key (`BINANCE_*`) — REAL MONEY,
+    /// the operator's to run. R0's counts are fixed (no `--bn-cycles`, no
+    /// `--bn-fill-pairs`); every R0 bar is one `phase:"r0"` line. Without
+    /// `--bn-confirm-mainnet` it reads the account, prints its plan and
+    /// sends nothing (exit 64).
+    #[arg(long, default_value_t = false, requires = "binance", conflicts_with_all = ["bn_cycles", "bn_fill_pairs"])]
+    bn_mainnet: bool,
+
+    /// BX10 (the operator's ruling S-1): the operator's word for the
+    /// Binance Stocks probe's one POST on MAINNET — the listenKey, which
+    /// changes nothing tradable — and a minute of the order stream. Without
+    /// it `--binance-probe equity` reads alone.
+    #[arg(long = "bn-stream-confirm", default_value_t = false, requires = "binance_probe")]
+    bn_stream_confirm: bool,
+
+    /// BX11: a symbol (repeatable): the setup's to set, the flatten's one
+    /// to close.
+    #[arg(long = "bn-symbol", value_name = "SYMBOL", requires = "binance_tool")]
+    bn_symbol: Vec<String>,
+
+    /// BX11 (setup): the leverage to set on each symbol (at most the cap);
+    /// none: a leverage within the cap is left as it is.
+    #[arg(long, requires = "binance_setup", requires = "binance_tool", conflicts_with = "binance_flatten")]
+    bn_leverage: Option<u8>,
+
+    /// BX11 (setup): the leverage cap (`exec.toml` `max_leverage`).
+    #[arg(
+        long,
+        default_value_t = cli::bn_ops::DEFAULT_LEVERAGE_CAP,
+        requires = "binance_setup",
+        requires = "binance_tool",
+        conflicts_with = "binance_flatten"
+    )]
+    bn_leverage_cap: u8,
+
+    /// BX11 (setup): sign the TradFi Perps agreement (USDⓈ-M).
+    #[arg(long, default_value_t = false, requires = "binance_setup", requires = "binance_tool", conflicts_with = "binance_flatten")]
+    bn_sign_tradfi: bool,
+
+    /// BX11 (setup): send every change even where the read says it holds
+    /// (the venue's "no need to change" answers count as held).
+    #[arg(long, default_value_t = false, requires = "binance_setup", requires = "binance_tool", conflicts_with = "binance_flatten")]
+    bn_reassert: bool,
+
+    /// BX11 (flatten): cancel the arm's resting orders by id first.
+    #[arg(long, default_value_t = false, requires = "binance_flatten", requires = "binance_tool", conflicts_with = "binance_setup")]
+    bn_cancel_first: bool,
+
+    /// BX11 (flatten): the first try's distance through the touch, bps
+    /// (doubling each try, at most 300; inside the row's band).
+    #[arg(long, default_value_t = 20, requires = "binance_flatten", requires = "binance_tool", conflicts_with = "binance_setup")]
+    bn_close_bps: i64,
+
+    /// BX11: the account tools sign with the HMAC key (`BINANCE_*HMAC*`).
+    #[arg(long, default_value_t = false, requires = "binance_tool")]
+    bn_ops_hmac: bool,
+}
+
+/// `bn-fees` (BX11, BX-14).
+#[derive(Debug, Parser)]
+struct BnFeesArgs {
+    /// Run directories (`run-<ns>`), or roots holding them.
+    #[arg(required = true)]
+    dirs: Vec<PathBuf>,
+    /// BX-14's N: commission-bearing trades per class before its row is
+    /// measured.
+    #[arg(long, default_value_t = cli::bn_fees::FEE_N)]
+    n: u64,
+}
+
+fn bn_fees(args: &BnFeesArgs) -> ExitCode {
+    match cli::bn_fees::run(&args.dirs, args.n) {
+        Ok(m) => {
+            info!(journal_records = m.records, fees = m.fees, classes = m.classes.len(), "bn-fees: measured (fees.toml untouched)");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!("bn-fees: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -421,6 +1166,35 @@ struct AuditPnlArgs {
 }
 
 #[derive(Debug, Parser)]
+struct XmmParityArgs {
+    /// The `run-<epoch_ns>` directory holding the window.
+    #[arg(long)]
+    replay_dir: PathBuf,
+    /// The parity artifact (`xmm.toml` shape, production pulls off).
+    #[arg(long)]
+    xmm: PathBuf,
+    /// Window start, venue-clock ns (the simulator's `utc_lo_ns`).
+    #[arg(long)]
+    lo_ns: u64,
+    /// Window end, venue-clock ns (`utc_hi_ns`).
+    #[arg(long)]
+    hi_ns: u64,
+    /// The window's label (`W01`, …), echoed into the rows.
+    #[arg(long)]
+    win: String,
+    /// Output TSV path.
+    #[arg(long)]
+    out: PathBuf,
+    /// Seconds of both feeds watched before the window (the gate's
+    /// history).
+    #[arg(long, default_value_t = 60)]
+    preroll_s: u64,
+    /// The simulator's tail: no decision in the window's last seconds.
+    #[arg(long, default_value_t = 90)]
+    tail_s: u64,
+}
+
+#[derive(Debug, Parser)]
 struct BacktestArgs {
     /// Candidate ruleset JSON artifact (8g §4.1 grammar). Required
     /// unless `--member` names a coded member (Tier 3).
@@ -428,7 +1202,8 @@ struct BacktestArgs {
     ruleset: Option<PathBuf>,
     /// Tier 3 (statarb doc 08 §6.2): drive a CODED member through the
     /// harness instead of the ruleset VM — `icdp` (with `--icdp <toml>`;
-    /// default `~/multivenue/icdp.toml`), `xsd`, `vrp`, `bin15`.
+    /// default `~/multivenue/icdp.toml` — unlinked from the set at XMM
+    /// XH1, still driven here), `xsd`, `vrp`, `bin15`, `hyparb`, `xmm`.
     /// Additive: the frozen worker argv never passes it.
     #[arg(long)]
     member: Option<String>,
@@ -459,6 +1234,21 @@ struct BacktestArgs {
     /// `~/multivenue` to fold the live cut in deliberately.
     #[arg(long, requires = "member")]
     bin15_seed_dir: Option<PathBuf>,
+    /// `--member hyparb`: the parameter artifact (`hyparb.toml`; default
+    /// `~/multivenue/hyparb.toml`).
+    #[arg(long, requires = "member")]
+    hyparb: Option<PathBuf>,
+    /// `--member xmm`: the parameter artifact (`xmm.toml`; default
+    /// `~/multivenue/xmm.toml`); descriptors resolve against the
+    /// capture's newest manifest.
+    #[arg(long, requires = "member")]
+    xmm: Option<PathBuf>,
+    /// `--member hyparb`: the `universe.toml` whose `[hyperevm] pools`
+    /// names the pools (default `~/multivenue/universe.toml` — the list
+    /// is append-only, so the live file names every pool an older
+    /// capture carries).
+    #[arg(long, requires = "member")]
+    hyparb_universe: Option<PathBuf>,
     /// Capture source: a single `run-<epoch_ns>` directory or a log
     /// root (`MULTIVENUE_LOG_DIR`) containing `run-*` children.
     #[arg(long)]
@@ -676,6 +1466,12 @@ struct RunArgs {
     /// thread is not started.
     #[arg(long)]
     polygon_path: Option<String>,
+    /// HYPARB H3b: HyperEVM JSON-RPC WebSocket path on
+    /// `HYPEREVM_WS_HOST` (e.g. `/`). Absent ⇒ the pool-event ingress is
+    /// not started; present with an empty `[hyperevm] pools` ⇒ warned and
+    /// not started.
+    #[arg(long)]
+    hyperevm_path: Option<String>,
     /// Bind `127.0.0.1:9191` and expose `/metrics` (Prometheus text),
     /// `/healthz` and `/state` (RG6: the 1 s engine snapshot as
     /// JSON — boot identity, regime words, slots, vm rows, recent
@@ -686,8 +1482,9 @@ struct RunArgs {
     /// `/state` serves. Implies `--metrics`.
     #[arg(long, default_value_t = false)]
     tui: bool,
-    /// Strategy selector. `latency-arb` (default) uses Binance →
-    /// Polymarket cross-venue arbitrage. `ev` uses Strategy A:
+    /// Strategy selector. `ai` (default since HYPARB H0 retired the
+    /// standalone `latency-arb` arm) composes ai-exec + vm through the
+    /// set path. `ev` uses Strategy A:
     /// model-vs-market mispricing against claude-worker artifacts.
     /// `ai-exec` (Phase 8f item 8) runs the AI-driven fair-value/
     /// intent strategy alone via the set path (no boot symbol
@@ -699,7 +1496,7 @@ struct RunArgs {
     /// composed StrategySet: every built member whose config flags
     /// are present (ai-exec and vm need none and are always
     /// included), AI-toggleable at runtime; paper-only until 8i.
-    #[arg(long, default_value = "latency-arb")]
+    #[arg(long, default_value = "ai")]
     strategy: String,
     /// Path to claude-worker NDJSON tag artifacts. Required when
     /// `--strategy ev`.
@@ -726,13 +1523,53 @@ struct RunArgs {
     /// boot must be — and the member holds until its HAR window warms.
     #[arg(long)]
     bin15_seed_dir: Option<PathBuf>,
-    /// ICDP I5: the slot-6 parameter artifact (`~/multivenue/icdp.toml`
-    /// by default). Read only when the requested mask carries the icdp
-    /// bit (`--strategy icdp` / `ai+icdp` / `all`); an absent or
-    /// unresolvable artifact refuses the boot with the bit set — never
-    /// a silent no-op.
+    /// HYPARB H5: the slot-0 parameter artifact
+    /// (`~/multivenue/hyparb.toml` by default). Read only when the
+    /// requested mask carries slot 0 (`--strategy hyparb` / `ai+hyparb`
+    /// / … / `all`); absent or unresolvable with the bit set REFUSES the
+    /// boot — never a silent no-op. The member also needs its pools:
+    /// `--hyperevm-path` and a non-empty `[hyperevm] pools`.
     #[arg(long)]
-    icdp: Option<PathBuf>,
+    hyparb: Option<PathBuf>,
+    /// HYPARB O-H5: the second switch of the EVM write path, TESTNET
+    /// ONLY (chain 998; the crate refuses 999 regardless). Must agree
+    /// with the artifact's `mode = "testnet"` — both or neither.
+    #[arg(long, default_value_t = false)]
+    evm_testnet: bool,
+    /// HYPARB O-H12: the third switch — the pool ingress may read chain
+    /// 999 (mainnet signal) while the write path writes chain 998. Only
+    /// with `--evm-testnet`; never the inverse. Shouted in the ARMED tell.
+    #[arg(long, default_value_t = false, requires = "evm_testnet")]
+    evm_hybrid: bool,
+    /// XMM XH1: the slot-6 parameter artifact (`~/multivenue/xmm.toml`
+    /// by default). Read only when the requested mask carries the xmm
+    /// bit (`--strategy xmm` / `ai+xmm` / … / `all`); an absent or
+    /// unresolvable artifact refuses the boot with the bit set — never
+    /// a silent no-op (the icdp/F19 law). `--icdp` left with the unlink
+    /// (O-XH1): `backtest --member icdp` keeps its own `--icdp`.
+    #[arg(long)]
+    xmm: Option<PathBuf>,
+    /// HC11: the slot-7 parameter artifact (`~/multivenue/hcv.toml` by
+    /// default; `hcv.toml.example`). Read only when the requested mask
+    /// carries the hcv bit (`--strategy hcv` / `ai+hcv` / … / `all`); an
+    /// absent or unresolvable artifact refuses the boot with the bit set
+    /// (the icdp/F19 law). Paper only: a live slot 7 refuses (O-HC18).
+    #[arg(long)]
+    hcv: Option<PathBuf>,
+    /// HC11: the calendar slot 7's event law reads — the news lane's
+    /// `scheduled-events.json` (`~/multivenue/worker/news/…` by default;
+    /// name it when the worker runs with `CLAUDE_WORKER_NEWS_DIR`). Read
+    /// only when the requested mask carries the hcv bit.
+    #[arg(long)]
+    hcv_events: Option<PathBuf>,
+    /// HC11b: slot 7's book — the engine's OWN persisted positions (by
+    /// contract), hedges, cash, day mark and open settlement windows.
+    /// Default: `hcv-state.tsv` beside an explicit `--hcv`, else
+    /// `~/multivenue/hcv-state.tsv` (the F22 law: a smoke boot never reads or
+    /// rewrites the standing engine's book). A file the member cannot read
+    /// exactly refuses the boot.
+    #[arg(long)]
+    hcv_state: Option<PathBuf>,
     /// RG2: the regime detector's parameter artifact
     /// (`~/multivenue/regime.toml` by default; `docs/regime-and-dashboard-plan.md`
     /// §4.6). Set boots only. An ABSENT default file boots the detector
@@ -747,6 +1584,20 @@ struct RunArgs {
     /// absent = warm live (boot tell `regime: seed absent`).
     #[arg(long)]
     regime_seed: Option<PathBuf>,
+    /// HAR H3.4: the long-tenor HAR series list (`~/multivenue/har.toml`
+    /// by default). Set boots only; no member reads the forecasts. An
+    /// ABSENT default file boots without the service (the pre-H3 engine,
+    /// bit for bit); a file that does not parse turns the service OFF with
+    /// a named error and never refuses the boot; a series whose feed the
+    /// boot universe does not carry is dropped. Only an explicit
+    /// `--har <path>` that cannot be read refuses the boot.
+    #[arg(long)]
+    har: Option<PathBuf>,
+    /// HAR H3.4: where the per-series seeds (`seed-<NAME>.tsv`, cut hourly
+    /// by `candles-cycle.sh`) and the engine's own state (`state-<NAME>.tsv`)
+    /// live. Default `~/multivenue/har`.
+    #[arg(long)]
+    har_dir: Option<PathBuf>,
     /// VRP V5: the worker-written boot seed
     /// (`~/multivenue/vrp-seed.tsv` by default) — the settled `(x, y)`
     /// pairs the VRP member's forecast is fitted from. Absent is LEGAL
@@ -855,6 +1706,10 @@ fn main() -> ExitCode {
             init_tracing_stderr();
             backtest(args)
         }
+        Cmd::XmmParity(args) => {
+            init_tracing_stderr();
+            xmm_parity(args)
+        }
         Cmd::CaptureCatalog(args) => {
             // stderr tracing for the same reason as the backtest arm:
             // stdout carries the catalog JSON and nothing else.
@@ -866,13 +1721,502 @@ fn main() -> ExitCode {
             init_tracing_stderr();
             audit_pnl(args)
         }
+        Cmd::BnFees(args) => {
+            // JSON lines only on stdout.
+            init_tracing_stderr();
+            bn_fees(&args)
+        }
         Cmd::ExecSmoke(args) => {
             // Same law again: one line of JSON on stdout for CI, the
             // human report on stderr.
             init_tracing_stderr();
             exec_smoke(args)
         }
+        Cmd::EvmTestnet(args) => {
+            init_tracing_stderr();
+            evm_testnet(args)
+        }
+        Cmd::EvmLive(args) => {
+            init_tracing_stderr();
+            evm_live(args)
+        }
+        Cmd::HypercallLive(args) => {
+            init_tracing_stderr();
+            hypercall_live(args)
+        }
+        Cmd::XmmPreflight(args) => {
+            init_tracing_stderr();
+            xmm_preflight(args)
+        }
+        Cmd::HlOutcomeProbe(args) => {
+            // JSON lines only on stdout.
+            init_tracing_stderr();
+            hl_outcome_probe(&args)
+        }
     }
+}
+
+/// BIN15 H90 L4: `hl-outcome-probe` — the statement checked, `--confirm`
+/// enforced for a mainnet send, then `cli::hl_outcome_probe::run`.
+fn hl_outcome_probe(args: &HlOutcomeProbeArgs) -> ExitCode {
+    use cli::hl_outcome_probe::{run, ProbeSpec, EXIT_REFUSED};
+    let scope = match args.network {
+        ProbeNet::Mainnet => exec_hyperliquid::Scope::Live,
+        ProbeNet::Testnet => exec_hyperliquid::Scope::Testnet,
+    };
+    let cfg = match exec_hyperliquid::HlConfig::from_env(scope) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hl-outcome-probe: the {scope:?} configuration: {e:?}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    let offsets_s = match ProbeSpec::parse_offsets(&args.offsets) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("hl-outcome-probe: {e}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    let mut spec = ProbeSpec {
+        offsets_s,
+        max_orders: args.max_orders,
+        instances: args.instances,
+        dry_run: args.dry_run,
+    };
+    if let Err(e) = spec.validate() {
+        eprintln!("hl-outcome-probe: {e}");
+        return ExitCode::from(EXIT_REFUSED);
+    }
+    if !cfg.is_testnet() && !spec.dry_run && !args.confirm {
+        eprintln!(
+            "hl-outcome-probe: a MAINNET send ({}) needs --confirm (or --dry-run to read only)",
+            cfg.host
+        );
+        return ExitCode::from(EXIT_REFUSED);
+    }
+    ExitCode::from(run(&cfg, TlsTransport::default_client_config(), &spec))
+}
+
+/// XMM XH5e: a `--strategy` the boot accepts (`STRATEGY_SET_NAMES`) whose
+/// mask boots the xmm member — the boot's own test (`xmm_wanted`).
+fn holds_xmm(strategy: &str) -> bool {
+    STRATEGY_SET_NAMES.contains(&strategy)
+        && strategy_set::mask_for_name(strategy).is_some_and(cli::xmm_boot::xmm_wanted)
+}
+
+/// XMM XH5e: `xmm-preflight` — slot 6's boot checks, nothing sent: the
+/// environment as `run` loads it (`.env` under the process's own), a
+/// `--strategy` the boot accepts with xmm in it, then
+/// `cli::xmm_preflight::preflight`.
+fn xmm_preflight(args: XmmPreflightArgs) -> ExitCode {
+    let cfg = match Config::load(args.env_file.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("xmm-preflight: REFUSED — the config does not load: {e:?}");
+            return ExitCode::from(1);
+        }
+    };
+    if !holds_xmm(&args.strategy) {
+        eprintln!(
+            "xmm-preflight: REFUSED — --strategy {} is not a bootable set holding xmm",
+            args.strategy
+        );
+        return ExitCode::from(1);
+    }
+    match cli::xmm_preflight::preflight(
+        &args.exec,
+        &args.arm_live,
+        args.xmm.as_deref(),
+        &cfg.hyperliquid_ws_host,
+    ) {
+        Ok(report) => {
+            print!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("xmm-preflight: REFUSED — {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// HC9: the `hypercall-live` verbs (`exec_hypercall::smoke`). Exit 0
+/// PASS, 1 FAIL, 2 refused (no `--confirm`, or a configuration that
+/// does not build).
+fn hypercall_live(args: HypercallLiveArgs) -> ExitCode {
+    use exec_hypercall::smoke;
+    let cfg = match exec_hypercall::HcExecConfig::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hypercall-live: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    println!(
+        "hypercall-live: wallet {} · signer {} ({}) · host {}",
+        exec_hypercall::config::hex20(cfg.wallet()),
+        exec_hypercall::config::hex20(cfg.signer()),
+        if cfg.owner_signs() {
+            "the owner's own key"
+        } else {
+            "an agent — the owner must have approved it"
+        },
+        cfg.rest_host()
+    );
+    let (Some(px), Some(qty)) = (
+        exec_hypercall::num::scan_1e6_exact(args.price.as_bytes()),
+        exec_hypercall::num::scan_1e6_exact(args.size.as_bytes()),
+    ) else {
+        eprintln!("hypercall-live: --price and --size are plain decimals");
+        return ExitCode::from(2);
+    };
+    let mut table = exec_hypercall::HcInstruments::new();
+    if let Some(sym) = args.symbol.as_deref() {
+        let id = core_types::make_symbol_id(
+            core_types::VenueId::Hypercall,
+            core_config::universe::OPT_ORDINAL_BASE + 1,
+        );
+        if let Err(e) = table.insert(id, sym.as_bytes()) {
+            eprintln!("hypercall-live: --symbol {sym:?} refused: {e:?}");
+            return ExitCode::from(2);
+        }
+    } else if matches!(args.verb, HcVerb::Simulate | HcVerb::Dust) {
+        eprintln!("hypercall-live: this verb needs --symbol");
+        return ExitCode::from(2);
+    }
+    let mut arm = match exec_hypercall::HcExchange::new(
+        &cfg,
+        TlsTransport::default_client_config(),
+        table,
+        exec_hypercall::HC_SLOT,
+        443,
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("hypercall-live: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut out = std::io::stdout();
+    let v = match args.verb {
+        HcVerb::Status => smoke::status(&mut arm, &mut out),
+        HcVerb::Simulate => smoke::simulate(&mut arm, px, qty, &mut out),
+        HcVerb::Recon => smoke::recon(&mut arm, &mut out),
+        HcVerb::Dust => smoke::dust(&mut arm, px, qty, args.confirm, &mut out),
+        HcVerb::CancelAll => smoke::cancel_all(&mut arm, args.confirm, &mut out),
+    };
+    println!("hypercall-live: counters {:?}", arm.counters());
+    ExitCode::from(v.code())
+}
+
+/// HYPARB L1: the `evm-live` verbs. Exit 0 only when the verb did what
+/// it says (`status`: every check held; `swap`: mined without a revert).
+fn evm_live(args: EvmLiveArgs) -> ExitCode {
+    use cli::evm_live as el;
+    let net = match args.network {
+        LiveNetArg::Mainnet => el::LiveNet::Mainnet,
+        LiveNetArg::Testnet => el::LiveNet::Testnet,
+    };
+    let write = args.verb != LiveVerb::Status;
+    // O-HL1: a mainnet write's authority is the operator's --confirm.
+    let auth = if write && net == el::LiveNet::Mainnet {
+        match exec_hyperevm::MainnetAuthority::operator_verb(args.confirm) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                eprintln!("evm-live: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
+    let path = match args.hyparb.clone() {
+        Some(p) => p,
+        None => match core_config::hyparb::default_hyparb_path() {
+            Ok(p) => PathBuf::from(p),
+            Err(e) => {
+                eprintln!("evm-live: {e}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let (file, target) = match core_config::hyparb::load(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|(f, _)| el::Target::from_file(&f, net).map(|t| (f, t)))
+    {
+        Ok(ft) => ft,
+        Err(e) => {
+            eprintln!("evm-live: {}: {e}", path.display());
+            return ExitCode::from(2);
+        }
+    };
+    let mut tokens = Vec::with_capacity(args.token.len());
+    let mut i = 0usize;
+    while i < args.token.len() {
+        match cli::evm_testnet::parse_addr(&args.token[i]) {
+            Ok(a) => tokens.push(a),
+            Err(e) => {
+                eprintln!("evm-live: --token {e}");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    let tls = TlsTransport::default_client_config();
+    let a = auth.as_ref();
+    let out = match args.verb {
+        LiveVerb::Status => el::verb_status(&target, &tokens, tls),
+        LiveVerb::Deploy => el::verb_deploy(&target, a, tls).map(|r| (r, true)),
+        LiveVerb::Wrap => match args.amount_wei {
+            Some(w) => el::verb_wrap(&target, a, w, tls).map(|r| (r, true)),
+            None => Err("wrap needs --amount-wei".to_owned()),
+        },
+        LiveVerb::Swap => match (
+            args.pool.as_deref().map(cli::evm_testnet::parse_addr),
+            args.zero_for_one,
+            args.amount_raw,
+            args.min_out_raw,
+        ) {
+            (Some(Ok(pool)), Some(z), Some(amt), Some(min)) => {
+                el::verb_swap(&target, a, pool, z, amt, min, tls)
+            }
+            (Some(Err(e)), ..) => Err(format!("--pool {e}")),
+            _ => Err(
+                "swap needs --pool, --zero-for-one, --amount-raw and --min-out-raw".to_owned(),
+            ),
+        },
+        LiveVerb::Sweep => match (tokens.as_slice(), args.amount_raw) {
+            ([tok], Some(amt)) => el::verb_sweep(&target, a, *tok, amt, tls).map(|r| (r, true)),
+            _ => Err("sweep needs exactly one --token and --amount-raw".to_owned()),
+        },
+        LiveVerb::ArmSmoke => {
+            let interlock = match args.exec.as_deref() {
+                None => Ok(String::new()),
+                Some(x) => match cli::exec_boot::resolve(Some(x), args.arm_live.as_deref()) {
+                    Ok(Some(eb)) if eb.hyparb_live() => Ok(format!(
+                        "interlock: {} + --arm-live {} arms slot 0 — OK\n",
+                        x.display(),
+                        args.arm_live.as_deref().unwrap_or("")
+                    )),
+                    Ok(_) => Err(format!(
+                        "{} with --arm-live {:?} does not arm slot 0",
+                        x.display(),
+                        args.arm_live
+                    )),
+                    Err(e) => Err(format!("{}: {e}", x.display())),
+                },
+            };
+            let pool = args.pool.as_deref().map(cli::evm_testnet::parse_addr).transpose();
+            match (interlock, pool) {
+                (Err(e), _) => Err(e),
+                (_, Err(e)) => Err(format!("--pool {e}")),
+                (Ok(head), Ok(p)) => cli::hyparb_rehearsal::verb_arm_smoke(
+                    &target,
+                    &file,
+                    a,
+                    &args.coin,
+                    p,
+                    args.no_trade,
+                    args.gateway,
+                    tls,
+                )
+                .map(|(r, ok)| (head + &r, ok)),
+            }
+        }
+    };
+    match out {
+        Ok((report, ok)) => {
+            print!("{report}");
+            if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        Err(e) => {
+            eprintln!("evm-live: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// HYPARB H8: the `evm-testnet` verbs. Exit 0 only when the verb did
+/// what it says (the battery: only when DONE(H8) held).
+fn evm_testnet(args: EvmTestnetArgs) -> ExitCode {
+    use cli::evm_testnet as et;
+    let path = match args.hyparb.clone() {
+        Some(p) => p,
+        None => match core_config::hyparb::default_hyparb_path() {
+            Ok(p) => PathBuf::from(p),
+            Err(e) => {
+                eprintln!("evm-testnet: {e}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let file = match core_config::hyparb::load(&path) {
+        Ok((f, _)) => f,
+        Err(e) => {
+            eprintln!("evm-testnet: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(t) = file.testnet.as_ref() else {
+        eprintln!("evm-testnet: {} has no [testnet] block", path.display());
+        return ExitCode::from(2);
+    };
+    let tls = TlsTransport::default_client_config();
+    let out = match args.verb {
+        EvmVerb::Status => et::verb_status(t, tls).map(|r| (r, true)),
+        EvmVerb::Fund => match args.amount_wei {
+            Some(a) => et::verb_fund(t, a, tls).map(|r| (r, true)),
+            None => Err("fund needs --amount-wei".to_owned()),
+        },
+        EvmVerb::Deploy => et::verb_deploy(t, tls).map(|r| (r, true)),
+        EvmVerb::Mint => match (args.token.as_deref(), args.amount_raw) {
+            (Some(tok), Some(a)) => et::verb_mint(t, tok, a, tls).map(|r| (r, true)),
+            _ => Err("mint needs --token and --amount-raw".to_owned()),
+        },
+        EvmVerb::Battery => et::verb_battery(t, tls),
+        EvmVerb::ShadowSmoke => {
+            let read_url = args.read_url.clone().unwrap_or_else(|| {
+                let host = std::env::var("HYPEREVM_WS_HOST")
+                    .unwrap_or_else(|_| "rpc.purroofgroup.com".to_owned());
+                format!("https://{host}/")
+            });
+            et::verb_shadow_smoke(t, file.gas_p99_usd_1e6, &read_url, args.decisions, tls)
+        }
+    };
+    match out {
+        Ok((report, ok)) => {
+            print!("{report}");
+            if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        Err(e) => {
+            eprintln!("evm-testnet: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// BX13: Stocks is mainnet by nature — the reach flag is the R0 battery's;
+/// beside equity it would be read as nothing: refused, with why.
+fn equity_reach_refused(args: &ExecSmokeArgs) -> Option<&'static str> {
+    args.bn_mainnet.then_some(
+        "exec-smoke --binance equity: --bn-mainnet is the R0 battery's (um, cm, spot, options); the Stocks battery is MAINNET by nature",
+    )
+}
+
+/// BX7b: the Binance Demo battery (`exec-smoke --binance … --lifecycle`);
+/// BX10: `--binance equity`, the Binance Stocks battery on MAINNET.
+fn exec_binance_battery(products: &str, args: &ExecSmokeArgs) -> ExitCode {
+    if products.trim() == "equity" {
+        if let Some(why) = equity_reach_refused(args) {
+            error!("{why}");
+            return ExitCode::from(1);
+        }
+        let spec = cli::bn_equity_battery::EquitySpec {
+            symbol: args.bn_eq_symbol.to_ascii_uppercase(),
+            session: args.bn_eq_session.clone().unwrap_or_default(),
+            tokenize: args.bn_eq_tokenize,
+            quote: args.bn_eq_quote.clone().unwrap_or_default(),
+            ttl_ms: args.bn_eq_ttl_ms,
+            usd: args.bn_usd,
+            rest_bps: args.bn_rest_bps,
+            cross_bps: args.bn_cross_bps,
+            confirm: args.bn_confirm_mainnet,
+        };
+        info!(?spec, "exec-smoke: BX10 — the Binance Stocks battery (MAINNET)");
+        // SIGINT/SIGTERM end it through its end — the sweep and the read.
+        if let Err(e) = cli::sigint::install_sigint_handler() {
+            error!("exec-smoke --binance equity: the signal handler: {e}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::from(cli::bn_equity_battery::run(&spec, TlsTransport::default_client_config()));
+    }
+    let (um, cm, spot, options) = match cli::bn_battery::parse_products(products) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("exec-smoke --binance: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let spec = cli::bn_battery::BatterySpec {
+        um,
+        cm,
+        spot,
+        options,
+        rest: args.bn_rest,
+        hmac: args.bn_hmac,
+        um_symbol: args.bn_um_symbol.clone(),
+        cm_symbol: args.bn_cm_symbol.clone(),
+        spot_symbol: args.bn_spot_symbol.clone(),
+        adopt_usd: args.bn_adopt_usd.unwrap_or(if args.bn_mainnet { 0 } else { cli::bn_battery::DEFAULT_ADOPT_USD }),
+        cycles: args.bn_cycles,
+        fill_pairs: args.bn_fill_pairs,
+        usd: args.bn_usd,
+        rest_bps: args.bn_rest_bps,
+        cross_bps: args.bn_cross_bps,
+        ttl_ms: args.bn_ttl_ms,
+        rotate_s: args.bn_rotate_s,
+        drill: match args.bn_drill.as_deref() {
+            None => None,
+            Some("gap") => Some(cli::bn_battery::Drill::Gap),
+            Some("flatten") => Some(cli::bn_battery::Drill::Flatten),
+            Some(other) => {
+                error!("exec-smoke --bn-drill: `{other}` is not a drill (gap, flatten)");
+                return ExitCode::from(1);
+            }
+        },
+        mainnet: args.bn_mainnet,
+        confirm: args.bn_confirm_mainnet,
+    };
+    if spec.mainnet {
+        info!(?spec, "exec-smoke: BX13 — the R0 ramp battery (MAINNET)");
+    } else {
+        info!(?spec, "exec-smoke: BX7b — the Binance Demo battery");
+    }
+    // SIGINT/SIGTERM end the battery through its end — the cancel-all, the
+    // closes and the flat read — never mid-run with orders left.
+    if let Err(e) = cli::sigint::install_sigint_handler() {
+        error!("exec-smoke --binance: the signal handler: {e}");
+        return ExitCode::from(1);
+    }
+    ExitCode::from(cli::bn_battery::run(&spec, TlsTransport::default_client_config()))
+}
+
+/// BX11: the Binance account tools (`--binance-setup`, `--binance-flatten`).
+fn exec_binance_ops(product: &str, args: &ExecSmokeArgs) -> ExitCode {
+    let product = match product {
+        "um" => exec_binance::inst::PRODUCT_USDM,
+        "cm" => exec_binance::inst::PRODUCT_COINM,
+        other => {
+            error!("exec-smoke: `{other}` is not a product (um, cm)");
+            return ExitCode::from(1);
+        }
+    };
+    let spec = cli::bn_ops::OpsSpec {
+        reach: if args.bn_network == "mainnet" { cli::bn_ops::Reach::Mainnet } else { cli::bn_ops::Reach::Demo },
+        confirm: args.confirm,
+        hmac: args.bn_ops_hmac,
+        product,
+        symbols: args.bn_symbol.clone(),
+        leverage: args.bn_leverage,
+        cap: args.bn_leverage_cap,
+        sign_tradfi: args.bn_sign_tradfi,
+        reassert: args.bn_reassert,
+        cancel_first: args.bn_cancel_first,
+        close_bps: args.bn_close_bps,
+    };
+    info!(?spec, "exec-smoke: BX11 — the Binance account tool");
+    let tls = TlsTransport::default_client_config();
+    let code = if args.binance_setup.is_some() { cli::bn_ops::setup(&spec, tls) } else { cli::bn_ops::flatten(&spec, tls) };
+    ExitCode::from(code)
 }
 
 /// E3 arm: the TESTNET-ONLY signature gate.
@@ -887,6 +2231,31 @@ fn main() -> ExitCode {
 /// file would be one refactor away from logging it.
 fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
     use exec_hyperliquid::{HlConfig, Scope};
+
+    // BX7b: the Binance Demo tools read their own variables and need none
+    // of Hyperliquid's phases; BX11: nor do the account tools.
+    if let Some(product) = args.binance_setup.as_deref().or(args.binance_flatten.as_deref()) {
+        return exec_binance_ops(product, &args);
+    }
+    if let Some(which) = args.binance_probe.as_deref() {
+        // A SIGINT/SIGTERM stops the probes and still runs their end (the
+        // probe's orders cancelled, the account read; spot's places none).
+        if let Err(e) = cli::sigint::install_sigint_handler() {
+            error!("exec-smoke --binance-probe: the signal handler: {e}");
+            return ExitCode::from(1);
+        }
+        let tls = TlsTransport::default_client_config();
+        let code = match which {
+            "spot" => cli::bn_probe::run_spot(tls),
+            "options" => cli::bn_probe::run_options(tls),
+            "equity" => cli::bn_probe::run_equity(tls, args.bn_stream_confirm),
+            _ => cli::bn_probe::run(tls),
+        };
+        return ExitCode::from(code);
+    }
+    if let Some(products) = args.binance.as_deref() {
+        return exec_binance_battery(products, &args);
+    }
 
     // The offline half needs nothing: not a key, not a host, not a
     // socket. Do it before anything can fail for a reason that has
@@ -916,7 +2285,11 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
     // Validate phase C's arguments BEFORE any network work. An
     // operator who forgot --px should learn that now, not after two
     // venue round-trips have already run.
-    if args.lifecycle && (args.px.is_none() || args.px2.is_none() || args.sz.is_none()) {
+    if args.lifecycle
+        && !args.hl_perp
+        && !args.hl_outcome
+        && (args.px.is_none() || args.px2.is_none() || args.sz.is_none())
+    {
         error!("exec-smoke: --lifecycle needs --px, --px2 and --sz (all 1e8-scaled)");
         eprintln!(
             "exec-smoke: e.g. --lifecycle --asset 100032530 --px 1000000 --px2 2000000 --sz 1000000000\n\
@@ -1060,6 +2433,12 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
                 "exec-smoke: PASSED — the venue verified this binary's signature and rejected a \
                  corrupted one"
             );
+            if args.lifecycle && args.hl_perp {
+                return exec_hl_perp(&cfg, &args);
+            }
+            if args.lifecycle && args.hl_outcome {
+                return exec_hl_outcome(&cfg, &args);
+            }
             if args.lifecycle {
                 return exec_lifecycle(&cfg, &args);
             }
@@ -1205,7 +2584,7 @@ fn exec_watch(scope: exec_hyperliquid::Scope, secs: u64) -> ExitCode {
         }
     };
     let tls = TlsTransport::default_client_config();
-    let mut ws = match UserWs::new(&cfg.host, 443, tls, &cfg.master_addr) {
+    let mut ws = match UserWs::new(&cfg.host, cfg.port(), tls, &cfg.master_addr) {
         Ok(w) => w,
         Err(e) => {
             error!("{e}");
@@ -1667,6 +3046,124 @@ fn exec_requote(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitC
     }
 }
 
+/// XMM XH4g: the testnet battery on slot 6's gateway arm
+/// (`cli::xmm_battery`). Runs only after phases A and B, like phase C,
+/// and only against the testnet host.
+fn exec_hl_perp(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {
+    if !cfg.is_testnet() {
+        error!("exec-smoke --hl-perp: the battery runs on TESTNET only");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+    let spec = cli::xmm_battery::BatterySpec {
+        coins: args
+            .coins
+            .split(',')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect(),
+        cycles: args.cycles,
+        fill_pairs: args.fill_pairs,
+        usd: args.usd,
+        rest_bps: args.rest_bps,
+        cross_bps: args.cross_bps,
+        ttl_ms: args.ttl_ms,
+        sweep_every: args.sweep_every,
+        recon_ms: cli::xmm_live::RECON_MS,
+        stall: args.stall,
+        sweep_first: args.sweep_first,
+    };
+    if let Err(e) = spec.validate() {
+        error!("exec-smoke --hl-perp: {e}");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+    let sk = match cfg.secret_key() {
+        Ok(k) => k,
+        Err(e) => {
+            error!("exec-smoke --hl-perp: {e}");
+            return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+        }
+    };
+    let gcfg = exec_hyperliquid::GatewayCfg::production(
+        cfg.host.clone(),
+        TlsTransport::default_client_config(),
+        cfg.network,
+        cfg.master_addr,
+        cli::exec_boot::XMM_SLOT as u8,
+    );
+    info!(
+        host = %cfg.host,
+        coins = %args.coins,
+        cycles = args.cycles,
+        fill_pairs = args.fill_pairs,
+        usd = args.usd,
+        stall = args.stall,
+        "exec-smoke: XH4g — the testnet battery on slot 6's gateway arm"
+    );
+    // SIGINT/SIGTERM end the battery through its end — the cancel-all and
+    // the flat read — never mid-run with quotes left resting.
+    if let Err(e) = cli::sigint::install_sigint_handler() {
+        error!("exec-smoke --hl-perp: the signal handler: {e}");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+    let report = cli::xmm_battery::run(&spec, gcfg, sk);
+    cli::xmm_battery::log_report(&report);
+    println!("{}", report.to_json());
+    ExitCode::from(report.exit)
+}
+
+/// XMM XH4i-8: the outcome battery on slot 3's gateway arm
+/// (`cli::outcome_battery`). Runs only after phases A and B, like phase C,
+/// and only against the testnet host.
+fn exec_hl_outcome(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {
+    if !cfg.is_testnet() {
+        error!("exec-smoke --hl-outcome: the battery runs on TESTNET only");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+    let Some(outcome) = args.outcome else {
+        error!("exec-smoke --hl-outcome needs --outcome <id> (the outcome id, not enc)");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    };
+    let spec = cli::outcome_battery::OutcomeSpec {
+        outcome,
+        usd: args.outcome_usd,
+        recon_ms: cli::xmm_live::RECON_MS,
+    };
+    if let Err(e) = spec.validate() {
+        error!("exec-smoke --hl-outcome: {e}");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+    let sk = match cfg.secret_key() {
+        Ok(k) => k,
+        Err(e) => {
+            error!("exec-smoke --hl-outcome: {e}");
+            return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+        }
+    };
+    let gcfg = exec_hyperliquid::GatewayCfg::production(
+        cfg.host.clone(),
+        TlsTransport::default_client_config(),
+        cfg.network,
+        cfg.master_addr,
+        cli::exec_boot::BIN15_SLOT as u8,
+    );
+    info!(
+        host = %cfg.host,
+        outcome,
+        usd = args.outcome_usd,
+        "exec-smoke: XH4i-8 — the outcome battery on slot 3's gateway arm"
+    );
+    // SIGINT/SIGTERM end the battery through its end — the cancel-all and
+    // the account read — never mid-run with quotes left resting.
+    if let Err(e) = cli::sigint::install_sigint_handler() {
+        error!("exec-smoke --hl-outcome: the signal handler: {e}");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+    let report = cli::outcome_battery::run(&spec, gcfg, sk);
+    cli::outcome_battery::log_report(&report);
+    println!("{}", report.to_json());
+    ExitCode::from(report.exit)
+}
+
 fn exec_lifecycle(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {
     // Checked at entry, before any network work; this is the
     // unwrap-free restatement of that.
@@ -1736,6 +3233,44 @@ fn audit_pnl(args: AuditPnlArgs) -> ExitCode {
     }
 }
 
+/// XMM XH2 parity arm: one JSON line on stdout (the replay's own tally
+/// and the member's, its must-stay-0 counters included), the rows in
+/// `--out`; any failure prints its reason to stderr and exits nonzero.
+fn xmm_parity(args: XmmParityArgs) -> ExitCode {
+    let spec = cli::backtest::xmm_parity::ParitySpec {
+        run_dir: args.replay_dir,
+        xmm: args.xmm,
+        lo_ns: args.lo_ns,
+        hi_ns: args.hi_ns,
+        win: args.win,
+        out: args.out,
+        preroll_ns: args.preroll_s.saturating_mul(1_000_000_000),
+        tail_ns: args.tail_s.saturating_mul(1_000_000_000),
+        lat: cli::backtest::xmm_parity::ParityLatency::S1,
+    };
+    match cli::backtest::xmm_parity::run(&spec) {
+        Ok(s) => {
+            let m = s.member;
+            println!(
+                "{{\"win\":\"{}\",\"records\":{},\"no_venue_time\":{},\"placed\":{},\"fills\":{},\"rows\":{},\
+                 \"member\":{{\"placed\":{},\"modifies\":{},\"lead_cancels\":{},\"requote_cancels\":{},\
+                 \"pull_cancels\":{},\"expiry_cancels\":{},\"gated\":{},\"gate_overflow\":{},\"capped\":{},\
+                 \"rejected_alo\":{},\"rejected_other\":{},\"canceled\":{},\"filled\":{},\"fills\":{},\
+                 \"unmatched\":{},\"ctx_refused\":{},\"stuck\":{}}}}}",
+                spec.win, s.records, s.no_venue_time, s.placed, s.fills, s.rows,
+                m.placed, m.modifies, m.lead_cancels, m.requote_cancels, m.pull_cancels, m.expiry_cancels,
+                m.gated, m.gate_overflow, m.capped, m.rejected_alo, m.rejected_other, m.canceled, m.filled,
+                m.fills, m.unmatched, m.ctx_refused, m.stuck
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("xmm-parity: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 /// M3 catalog arm: JSON on stdout + summary on stderr, exit 0 iff a
 /// report was produced (an empty root IS a report); any failure
 /// prints its reason to stderr only and exits nonzero.
@@ -1768,7 +3303,9 @@ fn backtest(args: BacktestArgs) -> ExitCode {
         None => None,
         Some(name) => {
             let Some(kind) = cli::backtest::member::MemberKind::parse(name) else {
-                eprintln!("backtest: unknown --member {name:?} (known: icdp, xsd, vrp, bin15)");
+                eprintln!(
+                    "backtest: unknown --member {name:?} (known: icdp, xsd, vrp, bin15, hyparb, xmm)"
+                );
                 return ExitCode::from(1);
             };
             let params = match kind {
@@ -1812,6 +3349,26 @@ fn backtest(args: BacktestArgs) -> ExitCode {
                         }
                     },
                 },
+                cli::backtest::member::MemberKind::Hyparb => match args.hyparb.clone() {
+                    Some(p) => p,
+                    None => match core_config::hyparb::default_hyparb_path() {
+                        Ok(p) => PathBuf::from(p),
+                        Err(e) => {
+                            eprintln!("backtest: --member hyparb needs --hyparb <toml>: {e}");
+                            return ExitCode::from(1);
+                        }
+                    },
+                },
+                cli::backtest::member::MemberKind::Xmm => match args.xmm.clone() {
+                    Some(p) => p,
+                    None => match core_config::xmm::default_xmm_path() {
+                        Ok(p) => PathBuf::from(p),
+                        Err(e) => {
+                            eprintln!("backtest: --member xmm needs --xmm <toml>: {e}");
+                            return ExitCode::from(1);
+                        }
+                    },
+                },
             };
             Some(cli::backtest::member::MemberSpec {
                 kind,
@@ -1820,6 +3377,7 @@ fn backtest(args: BacktestArgs) -> ExitCode {
                 seed: args.xsd_seed.clone(),
                 vrp_seed: args.vrp_seed.clone(),
                 bin15_seed_dir: args.bin15_seed_dir.clone(),
+                hyparb_universe: args.hyparb_universe.clone(),
             })
         }
     };
@@ -1907,6 +3465,152 @@ fn print_config(args: ConfigArgs) -> ExitCode {
 /// Boot a [`LiveDispatcher`] from the loaded config + secrets.
 /// Returns a static error message on any boot-time failure so the
 /// caller can surface a clean `EngineLoopResult::Failed`.
+/// **E7 — the operator's Hyperliquid arm**, for every live slot on
+/// Hyperliquid except slot 0 (which hedges from its own account). Fed by
+/// fill lane 3; configured from the `HYPERLIQUID_*` variables.
+fn boot_operator_hl_arm(
+    eb: &cli::exec_boot::ExecBoot,
+    md_ws_host: &str,
+    f3p: core_ring::Producer<core_types::Fill, { engine::FILL_RING_SIZE }>,
+    nonces: &mut exec_hyperliquid::NonceStreams,
+) -> Result<exec_hyperliquid::HlExchange<{ engine::FILL_RING_SIZE }>, String> {
+    let hl_cfg = exec_hyperliquid::HlConfig::from_env(exec_hyperliquid::Scope::Live).map_err(|e| {
+        format!("slot(s) LIVE on hyperliquid but the arm cannot be configured: {e}")
+    })?;
+    // **LAW E-4's precondition.** The asset ids the arm binds come from
+    // the MARKET-DATA ingress's roll events; the orders go to the
+    // EXCHANGE host. A testnet id is a mainnet stranger's market and vice
+    // versa, so both hosts must be on the same network or the boot
+    // refuses.
+    let md_testnet = md_ws_host.contains("testnet");
+    let ex_testnet = hl_cfg.network == exec_hyperliquid::Network::Testnet;
+    if md_testnet != ex_testnet {
+        return Err(format!(
+            "HYPERLIQUID_WS_HOST ({md_ws_host}) and HYPERLIQUID_EXCHANGE_HOST ({}) are on \
+             different networks — the roll events that bind asset ids would name another \
+             network's markets (LAW E-4). Point both at testnet or both at mainnet.",
+            hl_cfg.host
+        ));
+    }
+    // The address's numbers, from the live slots THIS arm trades
+    // (`ExecBoot::hl_address_numbers`: the highest floor, O-BX27; the
+    // lowest top-up weight and day ceiling, S7-L1).
+    let (floor, topup_weight, topup_day_max) = eb.hl_address_numbers();
+    let budget_path = eb
+        .path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default()
+        .join(exec_hyperliquid::budget::DEFAULT_STATE_PATH);
+    let mut arm = exec_hyperliquid::HlExchange::new(
+        &hl_cfg,
+        TlsTransport::default_client_config(),
+        f3p,
+        budget_path.clone(),
+        floor,
+    )
+    .map_err(|e| e.to_string())?;
+    // XMM XH4h S3: the agent's one nonce stream in this process, before the
+    // first signed action (the boot sweep below).
+    arm.share_nonce(nonces.stream(&hl_cfg.agent_addr).ok_or_else(|| {
+        String::from("the operator's arm: more agent addresses than the nonce streams hold")
+    })?);
+    // E7-F1: the address budget is the venue's number, read once here;
+    // the cold assumption halted the first mainnet boot before its first
+    // order (2026-09-19).
+    arm.seed_budget_from_venue();
+    // S7-L1 (gap E): the request-weight top-up is a property of the
+    // ADDRESS, like the floor (numbers above).
+    arm.set_topup(topup_weight, topup_day_max);
+    // S7-L1 (gaps A, C): this arm's seeding waits for the venue's day
+    // spend and for a read of the account that finds nothing of ours
+    // resting.
+    arm.enable_restart_safety();
+    // S7-L1 (gap C): this process starts every member flat, so every
+    // order of ours still resting at the venue is a previous process's
+    // orphan — a crash, a `kill -9`, a drain that ran out of time. Taken
+    // off before anything trades.
+    let (boot_swept, boot_sweep_left) = arm.cancel_ours_everywhere();
+    if boot_sweep_left != 0 {
+        warn!(
+            left = boot_sweep_left,
+            "exec: the boot sweep could not confirm every resting order of ours cancelled \
+             (u32::MAX = the venue's open orders could not be read) — while any cancellable \
+             one may rest, the live slots stay unseeded and each reconciliation retries the \
+             sweep"
+        );
+    }
+    info!(
+        host = %hl_cfg.host,
+        network = if ex_testnet { "testnet" } else { "MAINNET" },
+        agent = %exec_hyperliquid::config::hex20(&hl_cfg.agent_addr),
+        master = %exec_hyperliquid::config::hex20(&hl_cfg.master_addr),
+        budget_floor = floor,
+        budget_source = ?arm.budget_source(),
+        budget_remaining = arm.budget_remaining(),
+        budget_state = %budget_path.display(),
+        topup_weight,
+        topup_day_max,
+        boot_swept,
+        boot_sweep_left,
+        // E7 session bound: 0 = not anchored yet — the first
+        // reconciliation sets it (equity at cost, S7-L1) and writes the
+        // file; a restart restores it.
+        pnl_anchor_usd_1e6 = arm.pnl_anchor_usd_1e6(),
+        pnl_anchor_state = %arm.pnl_state_path().display(),
+        "exec: hyperliquid arm ARMED"
+    );
+    Ok(arm)
+}
+
+/// **HYPARB L5 — slot 0's live arm** from the booted artifact, the
+/// exec interlock and the universe. The engine's `MainnetAuthority` door
+/// opens only on all three switches.
+fn boot_hyparb_live_arm(
+    eb: &cli::exec_boot::ExecBoot,
+    hb: Option<&cli::hyparb_boot::HyparbBoot>,
+    universe: &core_config::universe::AllocatedUniverse,
+    nonces: &mut exec_hyperliquid::NonceStreams,
+) -> Result<
+    cli::hyparb_live::LiveBoot<cli::hyparb_live::BlockingHedge<{ engine::FILL_RING_SIZE }>>,
+    String,
+> {
+    let hb = hb.ok_or("slot 0 is armed live but no hyparb artifact is booted")?;
+    let authority = exec_hyperevm::MainnetAuthority::armed_engine(
+        hb.mode == core_config::hyparb::HyparbMode::Live,
+        eb.hyparb_live(),
+    )
+    .map_err(|e| e.to_string())?;
+    let m = hb
+        .mainnet
+        .as_ref()
+        .ok_or("hyparb.toml has no [mainnet] block")?;
+    let executor = cli::evm_testnet::parse_addr(
+        m.executor
+            .as_deref()
+            .ok_or("hyparb.toml [mainnet] `executor` is not set")?,
+    )?;
+    let (pools, coins) =
+        cli::hyparb_live::pools_and_coins(hb, &universe.hyperevm, &universe.hyperevm_pools)?;
+    let floor = eb
+        .slots
+        .get(cli::exec_boot::HYPEREVM_SLOT)
+        .and_then(|s| u64::try_from(s.request_budget_floor).ok())
+        .unwrap_or(0);
+    let spec = cli::hyparb_live::LiveSpec {
+        net: cli::evm_live::LiveNet::Mainnet,
+        authority: Some(&authority),
+        evm_endpoint: &m.endpoint,
+        executor,
+        pools,
+        coins,
+        gas_coin: hb.params.gas_coin,
+        state_dir: cli::hyparb_live::state_dir(&eb.path),
+        budget_floor: floor,
+    };
+    cli::hyparb_live::boot_hyparb_live(&spec, TlsTransport::default_client_config(), nonces)
+}
+
 /// **E6 commit 3/4 — the halt machine, wired.** Shared by both
 /// `--exec` arms (the real Hyperliquid arm and the refusing stub), so
 /// the halt file, the boot read-back and `--halt-slot` behave the same
@@ -1915,11 +3619,17 @@ fn print_config(args: ConfigArgs) -> ExitCode {
 /// `set_halt_path` before any halt can fire: the writer is a no-op
 /// without it, and a halt that leaves no file is cleared by the 00:10Z
 /// restart and resumes trading into whatever tripped it, unattended.
+///
+/// **BX3** — the route aliases are set here too, before the first order
+/// can exist, so every boot shape routes the Binance anchor the same way
+/// (`cli::exec_boot::route_aliases`).
 fn wire_exec_halts<L: clob_dispatcher::OrderDispatch>(
     exec_dispatcher: &mut exec_router::RoutedDispatcher<clob_dispatcher::PaperDispatcher, L>,
     eb: &cli::exec_boot::ExecBoot,
     halt_mask: u8,
+    aliases: clob_dispatcher::RouteAliases,
 ) {
+    exec_dispatcher.set_route_aliases(aliases);
     exec_dispatcher.set_halt_path(cli::exec_boot::halt_file_path(&eb.path));
     // **E6 commit 4 — read back what the last run halted.** Before
     // anything else touches the table: a slot the last run stopped
@@ -1983,6 +3693,69 @@ fn wire_exec_halts<L: clob_dispatcher::OrderDispatch>(
             );
         }
     }
+}
+
+/// **BX6 — a Binance shape's last boot steps**, after `wire_exec_halts`:
+/// the ledger binds every instrument the arm bound, under the same engine
+/// ids (obligation 7), and the venue split routes by the router's own
+/// alias table (obligation 4: `split_aliases` is what the split holds).
+fn finish_bn_boot<L: clob_dispatcher::OrderDispatch>(
+    d: &mut exec_router::RoutedDispatcher<clob_dispatcher::PaperDispatcher, L>,
+    split_aliases: clob_dispatcher::RouteAliases,
+    specs: &[exec_router::InstrumentSpec],
+) -> Result<(), String> {
+    if split_aliases != *d.route_aliases() {
+        return Err(String::from(
+            "the venue split's alias table is not the router's (obligation 4) — an order could \
+             be allowed for one venue and reach another arm",
+        ));
+    }
+    bind_ledger_rows(d, specs, "Binance instrument")?;
+    info!(
+        instruments = specs.len(),
+        "exec: binance instruments bound in the ledger"
+    );
+    Ok(())
+}
+
+/// **XMM XH5b-3** — the loop's line for a shape with slot 6 outermost: the
+/// gateway's network and the arms beside it.
+fn xmm_line(net: exec_hyperliquid::Network, beside: &str) -> String {
+    let n = cli::xmm_live::network_name(net);
+    format!(
+        "running strategy-set with slot 6 LIVE on the Hyperliquid gateway ({n}) beside {beside} \
+         — real {n} orders will be submitted"
+    )
+}
+
+/// **XMM XH4f — slot 6's last boot step**, after `wire_exec_halts`: the
+/// ledger binds the gateway arm's perps as `LAW_LINEAR` rows under the
+/// member's engine ids — the rows the router's perp clamps price (XH2-C,
+/// `CapPerp`, `MaxResting`).
+fn finish_xmm_boot<L: clob_dispatcher::OrderDispatch>(
+    d: &mut exec_router::RoutedDispatcher<clob_dispatcher::PaperDispatcher, L>,
+    specs: &[exec_router::InstrumentSpec],
+) -> Result<(), String> {
+    bind_ledger_rows(d, specs, "xmm perp")?;
+    info!(
+        instruments = specs.len(),
+        "exec: xmm perps bound in the ledger"
+    );
+    Ok(())
+}
+
+/// Bind an arm's instrument rows in the ledger, every one or the boot
+/// stops (BX6 obligation 7; XMM XH4f).
+fn bind_ledger_rows<L: clob_dispatcher::OrderDispatch>(
+    d: &mut exec_router::RoutedDispatcher<clob_dispatcher::PaperDispatcher, L>,
+    specs: &[exec_router::InstrumentSpec],
+    what: &str,
+) -> Result<(), String> {
+    for spec in specs {
+        d.bind_instrument(spec)
+            .map_err(|e| format!("the ledger refused {what} {}: {e:?}", spec.sym))?;
+    }
+    Ok(())
 }
 
 fn boot_live_dispatcher(
@@ -2120,6 +3893,8 @@ fn run(args: RunArgs) -> ExitCode {
         bn_spot = boot.allocated.bn_spot.len(),
         bn_usdm = boot.allocated.bn_usdm.len(),
         bn_dated = boot.allocated.bn_dated.len(),
+        bn_coinm = boot.allocated.bn_coinm.len(),
+        bn_coinm_dated = boot.allocated.bn_coinm_dated.len(),
         pairs = boot.allocated.pairs.len(),
         "universe resolved"
     );
@@ -2163,6 +3938,9 @@ fn run(args: RunArgs) -> ExitCode {
         }
     };
     info!(dir = %run_dir.display(), "capture: run directory");
+    // HK6: a boot that fails before the engine loop removes the directory
+    // again if it is still empty (`remove_dir`, never `remove_dir_all`).
+    let mut run_dir_guard = cli::RunDirGuard::new(&run_dir);
 
     // -- Phase-8e boot REST discovery (plan §6.1) --
     // Runs BEFORE any ingress thread spawns: validates every
@@ -2190,8 +3968,26 @@ fn run(args: RunArgs) -> ExitCode {
         .iter()
         .map(|i| i.name.clone())
         .collect();
-    let bn_discovery_arg: Option<(&[String], &[String], &[String])> = if boot.from_config {
-        Some((&bn_spot_names, &bn_usdm_names, &bn_dated_names))
+    let bn_coinm_names: Vec<String> = boot
+        .allocated
+        .bn_coinm
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+    let bn_coinm_dated_names: Vec<String> = boot
+        .allocated
+        .bn_coinm_dated
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+    let bn_discovery_arg = if boot.from_config {
+        Some(cli::boot_discovery::BnLists {
+            spot: &bn_spot_names,
+            usdm: &bn_usdm_names,
+            dated: &bn_dated_names,
+            coinm: &bn_coinm_names,
+            coinm_dated: &bn_coinm_dated_names,
+        })
     } else {
         None
     };
@@ -2237,6 +4033,87 @@ fn run(args: RunArgs) -> ExitCode {
         } else {
             None
         };
+    // MX6: the MEXC audit + funding seeds run whenever `[mexc]` is
+    // configured (config-file only, like Bybit).
+    let mexc_spot_names: Vec<String> = boot
+        .allocated
+        .mexc_spot
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+    let mexc_perp_names: Vec<String> = boot
+        .allocated
+        .mexc_perp
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+    let mexc_discovery_arg: Option<(&[String], &[String])> =
+        if !mexc_spot_names.is_empty() || !mexc_perp_names.is_empty() {
+            Some((&mexc_spot_names, &mexc_perp_names))
+        } else {
+            None
+        };
+    // E1: the execution route table. Resolved HERE — before the boot
+    // discovery, the metric registry, before any socket opens — for two
+    // reasons. (1) The registry is boot-only-insertion, and whether
+    // the `engine_exec_*` family exists at all depends on this
+    // artifact: no `--exec` registers NOTHING, which is what keeps
+    // `/metrics` byte-identical to a pre-E1 binary. (2) A disagreement
+    // between the two arming switches, or a live slot with no compiled
+    // arm, should abort before the engine has done anything at all,
+    // not after it is already streaming six venues.
+    // E6: parsed HERE, beside the artifact, for the same reason — a
+    // malformed kill switch must abort the boot, not be discovered at
+    // the moment someone reaches for it.
+    let halt_mask = match args
+        .halt_slot
+        .as_deref()
+        .map_or(Ok(0u8), cli::exec_boot::parse_halt_slots)
+    {
+        Ok(m) => m,
+        Err(reason) => {
+            error!(reason, "exec: --halt-slot refused — boot aborted");
+            return ExitCode::from(1);
+        }
+    };
+    // Said out loud rather than refused. An operator reaching for the
+    // kill switch on a boot that has no route table has asked for
+    // something that is already true — every slot is paper and
+    // nothing can reach a venue — and refusing to start would be
+    // punishing them for asking for MORE safety. Staying silent would
+    // be worse: it would let them believe a switch fired that did not.
+    if halt_mask != 0 && args.exec.is_none() {
+        warn!(
+            halted = %cli::exec_boot::render_slot_mask(halt_mask),
+            "--halt-slot named slots but there is no --exec artifact: \
+             every slot is already paper and no order can reach a venue, \
+             so this flag halted nothing"
+        );
+    }
+    let exec_boot = match cli::exec_boot::resolve(args.exec.as_deref(), args.arm_live.as_deref()) {
+        Ok(e) => e,
+        Err(reason) => {
+            error!(reason, "exec: artifact refused — boot aborted");
+            return ExitCode::from(1);
+        }
+    };
+    // (BX9: before the discovery too — a live Binance arm's options held
+    // outside the chain join it right after the discovery, before any
+    // table is built from the chain: the R3 ruling.)
+    // BX9 (the zero-copy review's ZC2-6): a live Binance arm's
+    // configuration — its keys — built ONCE, here: lent to the held read
+    // below, then owned by the arm's boot. A second build would stage the
+    // secrets again, and its drop `munlock` their pages.
+    let mut bn_arm_cfg = match exec_boot.as_ref().and_then(|b| b.binance_slot().and(b.binance.as_ref())) {
+        Some(b) => match cli::bn_live::arm_config(b) {
+            Ok(c) => Some(c),
+            Err(reason) => {
+                error!(reason, "binance: the arm cannot be configured — boot aborted");
+                return ExitCode::from(1);
+            }
+        },
+        None => None,
+    };
     let discovery = match cli::boot_discovery::run_all(
         &cfg,
         &tls_config,
@@ -2248,6 +4125,8 @@ fn run(args: RunArgs) -> ExitCode {
         bn_discovery_arg,
         &boot.bn_options,
         bybit_discovery_arg,
+        mexc_discovery_arg,
+        &boot.hypercall_options,
         &pm_ids,
     ) {
         Ok(o) => o,
@@ -2267,6 +4146,39 @@ fn run(args: RunArgs) -> ExitCode {
             "discovery: configured symbol(s) missing from venue universe — continuing in paper mode"
         );
     }
+    // BX9 (Q-5; the R3 ruling 2026-10-11): the options a live Binance
+    // arm's account holds OUTSIDE the paper-selected chain join it here —
+    // before the manifests, the descriptor table and the options lane's
+    // mark table are built from the chain — so the lane prices them and
+    // the arm binds them under the same ids. One signed read
+    // (`GET /eapi/v1/position`, the options HMAC key); none without a live
+    // options arm.
+    let mut discovery = discovery;
+    if let (Some(eb), Some(bn_cfg)) = (exec_boot.as_ref(), bn_arm_cfg.as_ref()) {
+        let selected = discovery.bn_options.len();
+        let universe = std::mem::take(&mut discovery.bn_option_universe);
+        match cli::bn_live::options_held_outside(
+            eb,
+            bn_cfg,
+            &mut discovery.bn_options,
+            &mut discovery.bn_option_rows,
+            &universe,
+            std::sync::Arc::clone(&tls_config),
+        ) {
+            Ok(n) => {
+                for (symbol, sym) in &discovery.bn_options[selected..] {
+                    info!(symbol = %symbol, sym, "binance: an option held outside the chain joins it (Q-5)");
+                }
+                info!(joined = n, chain = discovery.bn_options.len(), "binance: the options chain with the options held");
+            }
+            Err(reason) => {
+                error!(reason, "binance: the options held could not be read — boot aborted");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    // The universe's one use is the join above: dropped here, every boot.
+    drop(std::mem::take(&mut discovery.bn_option_universe));
 
     // -- M2-close: options manifest (per-run sym → instrument-name
     // sidecar; docs/wire-format.md "Capture files"). Options ordinals
@@ -2279,6 +4191,7 @@ fn run(args: RunArgs) -> ExitCode {
         &discovery.deribit_options,
         &discovery.okx_options,
         &discovery.bn_options,
+        &discovery.hypercall_options,
     );
     if !options_manifest.is_empty() {
         let manifest_path = run_dir.join(cli::options_manifest::OPTIONS_MANIFEST_FILE);
@@ -2290,7 +4203,8 @@ fn run(args: RunArgs) -> ExitCode {
             path = %manifest_path.display(),
             rows = discovery.deribit_options.len()
                 + discovery.okx_options.len()
-                + discovery.bn_options.len(),
+                + discovery.bn_options.len()
+                + discovery.hypercall_options.len(),
             "capture: options manifest written"
         );
     }
@@ -2302,6 +4216,7 @@ fn run(args: RunArgs) -> ExitCode {
         &discovery.deribit_options,
         &discovery.okx_options,
         &discovery.bn_options,
+        &discovery.hypercall_options,
     );
     {
         let manifest_path = run_dir.join(cli::options_manifest::INSTRUMENT_MANIFEST_FILE);
@@ -2482,7 +4397,25 @@ fn run(args: RunArgs) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            Some((coins, families, hl_ep))
+            // The `/info` endpoint a reconnect re-discovers retired
+            // families' successors on (2026-09-26 reconnect-loop fix) —
+            // resolved here, once, like the WS host: the ingress thread
+            // never runs a DNS lookup.
+            let (api_host, api_port) = match cli::split_host_port(&cfg.hyperliquid_api_host, 443) {
+                Ok(v) => v,
+                Err(reason) => {
+                    error!(reason, host = %cfg.hyperliquid_api_host, "bad hyperliquid_api_host");
+                    return ExitCode::from(1);
+                }
+            };
+            let hl_info_ep = match WssEndpoint::resolve(api_host, api_port, "/info") {
+                Ok(e) => e,
+                Err(e) => {
+                    error!(error = ?e, "hyperliquid /info DNS failed");
+                    return ExitCode::from(1);
+                }
+            };
+            Some((coins, families, hl_ep, hl_info_ep))
         }
         _ => None,
     };
@@ -2493,7 +4426,7 @@ fn run(args: RunArgs) -> ExitCode {
     // spawn calls below). Sorted strict-ascending, deduped; feeds
     // `spawn_ai` → `RulesetSidePath` (§4.2 rule-6 membership checks).
     // M1: spawn-aligned — every PM token + every Binance instrument
-    // (spot + USDS-M) this boot wires.
+    // (spot + USDS-M, BX2: + COIN-M) this boot wires.
     let pm_syms: Vec<core_types::SymbolId> =
         boot.allocated.pm_tokens.iter().map(|t| t.sym).collect();
     let bn_syms: Vec<core_types::SymbolId> = boot
@@ -2502,14 +4435,38 @@ fn run(args: RunArgs) -> ExitCode {
         .iter()
         .chain(boot.allocated.bn_usdm.iter())
         .chain(boot.allocated.bn_dated.iter())
+        .chain(boot.allocated.bn_coinm.iter())
+        .chain(boot.allocated.bn_coinm_dated.iter())
         .map(|i| i.sym)
+        .collect();
+    // MX6 (ruling Q-MX6): every MEXC instrument this boot allocates
+    // is addressable by AI rulesets (spot + perp).
+    let mexc_syms: Vec<core_types::SymbolId> = boot
+        .allocated
+        .mexc_spot
+        .iter()
+        .chain(boot.allocated.mexc_perp.iter())
+        .map(|i| i.sym)
+        .collect();
+    // O-HC17: every Hypercall option the boot selected is addressable by
+    // AI rulesets (signal / reference legs); the `hypercall-idx:<U>`
+    // index syms stay out (caps 0). HK-R4: every Binance option the boot
+    // selected too — signal legs only, an order on one unroutable
+    // (`core_fill::signal_only_sym`).
+    let option_syms: Vec<core_types::SymbolId> = discovery
+        .hypercall_options
+        .iter()
+        .map(|o| o.1)
+        .chain(discovery.bn_options.iter().map(|o| o.1))
         .collect();
     let ai_universe = cli::build_ai_universe(
         &pm_syms,
         &bn_syms,
         okx_boot.as_ref().map(|(t, _)| t),
         deribit_boot.as_ref().map(|(t, _)| t),
-        hl_boot.as_ref().map(|(t, _f, _e)| t),
+        hl_boot.as_ref().map(|(t, _f, _e, _i)| t),
+        &mexc_syms,
+        &option_syms,
     );
     // VM2 V4 (D-6): the live descriptor→(sym, caps) table for the v2
     // grammar's stage-time resolution — same allocation truth as the
@@ -2520,6 +4477,7 @@ fn run(args: RunArgs) -> ExitCode {
             &discovery.deribit_options,
             &discovery.okx_options,
             &discovery.bn_options,
+            &discovery.hypercall_options,
             boot.okx_depth,
             boot.deribit_depth,
         ),
@@ -2550,6 +4508,11 @@ fn run(args: RunArgs) -> ExitCode {
     // WS9: lane 5 = Bybit (VenueId 6 — lane≠venue past Ai, see
     // engine::tick_lane_of).
     let (bybit_prod, bybit_lane_cons) = rings.tick[5].clone().split();
+    // MX2: lane 6 = MEXC (VenueId 7, engine::tick_lane_of).
+    let (mexc_prod, mexc_lane_cons) = rings.tick[6].clone().split();
+    // HC1: lane 7 = Hypercall (VenueId 9 — HyperEvm, 8, has no tick
+    // lane; engine::tick_lane_of).
+    let (hypercall_prod, hypercall_lane_cons) = rings.tick[7].clone().split();
     // WS10-A: venue-event lanes, tick-lane indexing. Producers ride
     // into the four funding-capable venue spawns; PM (0) and the
     // spare lane 4 producer for HL are dropped — HL carries premium
@@ -2559,6 +4522,8 @@ fn run(args: RunArgs) -> ExitCode {
     let (okx_event_prod, okx_event_cons) = rings.event[2].clone().split();
     let (deribit_event_prod, deribit_event_cons) = rings.event[3].clone().split();
     let (bybit_event_prod, bybit_event_cons) = rings.event[5].clone().split();
+    let (mexc_event_prod, mexc_event_cons) = rings.event[6].clone().split();
+    let (hypercall_event_prod, hypercall_event_cons) = rings.event[7].clone().split();
     let (_pm_event_prod, pm_event_cons) = rings.event[0].clone().split();
     // VM2 V2: HL gained its event lane — funding rides AssetCtx.
     let (hl_event_prod, hl_event_cons) = rings.event[4].clone().split();
@@ -2569,6 +4534,8 @@ fn run(args: RunArgs) -> ExitCode {
         deribit_event_cons,
         hl_event_cons,
         bybit_event_cons,
+        mexc_event_cons,
+        hypercall_event_cons,
     ];
     // WS10-B: depth lanes (engine::depth_lane_of order — okx 0,
     // deribit 1). Producers ride into the two depth-capable spawns.
@@ -2576,23 +4543,38 @@ fn run(args: RunArgs) -> ExitCode {
     let (deribit_depth_prod, deribit_depth_cons) = rings.depth[1].clone().split();
     let depth_lane_cons = [okx_depth_cons, deribit_depth_cons];
     // VM2 V2: options-summary lanes (engine::opt_lane_of order —
-    // okx 0, deribit 1, binance 2). Producers ride into the three
-    // options-capable spawns.
+    // okx 0, deribit 1, binance 2, hypercall 3 — HC1). Producers ride
+    // into the options-capable spawns.
     let (okx_opt_prod, okx_opt_cons) = rings.opt[0].clone().split();
     let (deribit_opt_prod, deribit_opt_cons) = rings.opt[1].clone().split();
     let (bn_opt_prod, bn_opt_cons) = rings.opt[2].clone().split();
-    let opt_lane_cons = [okx_opt_cons, deribit_opt_cons, bn_opt_cons];
+    let (hypercall_opt_prod, hypercall_opt_cons) = rings.opt[3].clone().split();
+    let opt_lane_cons = [
+        okx_opt_cons,
+        deribit_opt_cons,
+        bn_opt_cons,
+        hypercall_opt_cons,
+    ];
     let (rpc_prod, rpc_cons) = rings.rpc_signal.clone().split();
+    let (hyperevm_prod, hyperevm_cons) = rings.hyperevm_signal.clone().split();
+    // XMM XH1: the trade lane — Hyperliquid prints, pushed by the HL
+    // ingress thread after their capture. Dropped with the HL producers
+    // when no coin is subscribed (the unspawned-venue shape, §3.3).
+    let (trade_prod, trade_cons) = rings.trade.clone().split();
     // E7: lane 3 (`engine::fill_lane_of(Hyperliquid)`) finally has a
     // producer — the live arm's user-event pump. Until E7 every lane's
     // producer was dropped here, so the E6 exposure ledger and the
     // `on_fill_booked` ordering were reachable only from tests.
-    let (mut hl_fill_prod, fill_lane_cons) = {
+    let (mut hl_fill_prod, mut bn_fill_prod, fill_lane_cons) = {
         let (_f0p, f0) = rings.fill[0].clone().split();
         let (_f1p, f1) = rings.fill[1].clone().split();
         let (_f2p, f2) = rings.fill[2].clone().split();
         let (f3p, f3) = rings.fill[3].clone().split();
-        (Some(f3p), [f0, f1, f2, f3])
+        // BX3/BX6: lane 4 is the Binance gateway's (plan §3.1). Its
+        // producer goes to the gateway when a Binance slot is armed, and
+        // is dropped (the engine reads the lane empty) otherwise.
+        let (f4p, f4) = rings.fill[4].clone().split();
+        (Some(f3p), Some(f4p), [f0, f1, f2, f3, f4])
     };
     // AI command lane (Phase 8f). The producer half feeds the
     // `ingress-ai` thread (spawned below, gated on
@@ -2604,10 +4586,11 @@ fn run(args: RunArgs) -> ExitCode {
     // Ruleset-table handoff ring (Phase 8g §6, item 7): the producer
     // half rides with the AI lane into `spawn_ai`; the consumer half
     // rides in `Consumers` to the engine, which pops it immediately
-    // before the AI-cmd drain each iteration and hands slots to the
-    // strategy's `on_ruleset_table` hook (→ the set's vm member —
-    // documented copy #2). Key-unset boots drop the producer and the
-    // lane reads empty forever (§3.3 unspawned shape).
+    // before the AI-cmd drain each iteration and lends each slot in
+    // place to the strategy's `on_ruleset_table` hook (→ the set's vm
+    // member, whose copy into its staged buffer is documented copy #2).
+    // Key-unset boots drop the producer and the lane reads empty
+    // forever (§3.3 unspawned shape).
     let (ruleset_table_prod, ruleset_table_cons) = rings.ruleset_tables.clone().split();
 
     // -- Per-ingress status slots (D7) --
@@ -2619,52 +4602,18 @@ fn run(args: RunArgs) -> ExitCode {
     // — Part B.4's two §6.5 capture gauges are set from inside each
     // spawn wrapper thread itself, so the registry + gauge ids must
     // already exist at spawn time.
-    // E1: the execution route table. Resolved HERE — before the
-    // metric registry is built, before any socket opens — for two
-    // reasons. (1) The registry is boot-only-insertion, and whether
-    // the `engine_exec_*` family exists at all depends on this
-    // artifact: no `--exec` registers NOTHING, which is what keeps
-    // `/metrics` byte-identical to a pre-E1 binary. (2) A disagreement
-    // between the two arming switches, or a live slot with no compiled
-    // arm, should abort before the engine has done anything at all,
-    // not after it is already streaming six venues.
-    // E6: parsed HERE, beside the artifact, for the same reason — a
-    // malformed kill switch must abort the boot, not be discovered at
-    // the moment someone reaches for it.
-    let halt_mask = match args
-        .halt_slot
-        .as_deref()
-        .map_or(Ok(0u8), cli::exec_boot::parse_halt_slots)
-    {
-        Ok(m) => m,
-        Err(reason) => {
-            error!(reason, "exec: --halt-slot refused — boot aborted");
-            join_reverse(handles);
-            return ExitCode::from(1);
-        }
-    };
-    // Said out loud rather than refused. An operator reaching for the
-    // kill switch on a boot that has no route table has asked for
-    // something that is already true — every slot is paper and
-    // nothing can reach a venue — and refusing to start would be
-    // punishing them for asking for MORE safety. Staying silent would
-    // be worse: it would let them believe a switch fired that did not.
-    if halt_mask != 0 && args.exec.is_none() {
-        warn!(
-            halted = %cli::exec_boot::render_slot_mask(halt_mask),
-            "--halt-slot named slots but there is no --exec artifact: \
-             every slot is already paper and no order can reach a venue, \
-             so this flag halted nothing"
-        );
-    }
-    let exec_boot = match cli::exec_boot::resolve(args.exec.as_deref(), args.arm_live.as_deref()) {
-        Ok(e) => e,
-        Err(reason) => {
+    // XMM XH5b-3: slot 6's gateway beside a mainnet-only arm (slot 0, a live
+    // Binance slot) on mainnet alone — its network is the market data's (LAW
+    // E-4), which the artifact does not state: asked before any arm boots.
+    if let Some(b) = &exec_boot {
+        let md_mainnet = cli::xmm_live::md_network(&cfg.hyperliquid_ws_host)
+            == Some(exec_hyperliquid::Network::Mainnet);
+        if let Err(reason) = b.check_gateway_network(md_mainnet) {
             error!(reason, "exec: artifact refused — boot aborted");
             join_reverse(handles);
             return ExitCode::from(1);
         }
-    };
+    }
     let exec_modes = exec_boot.as_ref().map(|b| {
         let mut m = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];
         for (slot, dst) in m.iter_mut().enumerate() {
@@ -2674,8 +4623,16 @@ fn run(args: RunArgs) -> ExitCode {
                 .unwrap_or(exec_router::ExecMode::Paper)
                 .as_u8();
         }
-        m
+        cli::ExecObs {
+            modes: m,
+            binance: b.binance_slot().is_some(),
+            gateway: b.gateway_live().is_some() || b.bin15_gateway_live(),
+        }
     });
+    // BX6: a live slot names binance — its arm reads the marks (O-BX29).
+    let bn_armed = exec_boot
+        .as_ref()
+        .is_some_and(|b| b.binance_slot().is_some());
     let enable_metrics = args.metrics || args.tui;
     let obs = match Observability::build(enable_metrics, exec_modes) {
         // RG6: the `/state` boot identity (pid, anchor, binary link
@@ -2707,10 +4664,21 @@ fn run(args: RunArgs) -> ExitCode {
         .latency_dump_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("{}/latency", cfg.log_dir)));
-    let obs = obs.with_latency_dump(LatencyDump::from_secs(
+    let mut obs = obs.with_latency_dump(LatencyDump::from_secs(
         latency_dump_dir.clone(),
         args.latency_dump_secs,
     ));
+    // XMM XH4f (D11): the gateway arm's tell — slot 6's when slot 6 is live
+    // on its gateway, slot 3's when slot 3 is (XMM XH4i-5; never both).
+    obs.xmm_gateway_tell = exec_boot.as_ref().and_then(|b| {
+        if b.gateway_live().is_some() {
+            Some(cli::xmm_live::shutdown_tell_path(&b.path))
+        } else if b.bin15_gateway_live() {
+            Some(cli::bin15_live::shutdown_tell_path(&b.path))
+        } else {
+            None
+        }
+    });
     if args.latency_dump_secs > 0 {
         info!(
             secs = args.latency_dump_secs,
@@ -2734,6 +4702,10 @@ fn run(args: RunArgs) -> ExitCode {
             .set(discovery.bn.map(|c| c.configured).unwrap_or(0) as i64);
         reg.gauge(ids.coverage_bybit)
             .set(discovery.bybit.map(|c| c.configured).unwrap_or(0) as i64);
+        reg.gauge(ids.coverage_mexc)
+            .set(discovery.mexc.map(|c| c.configured).unwrap_or(0) as i64);
+        reg.gauge(ids.coverage_hypercall)
+            .set(discovery.hypercall.map(|c| c.configured).unwrap_or(0) as i64);
         // M2.1/M2.2/M2.4: capped options chain sizes this boot
         // (0 = lane off).
         reg.gauge(ids.deribit_options_selected)
@@ -2742,6 +4714,8 @@ fn run(args: RunArgs) -> ExitCode {
             .set(discovery.okx_options.len() as i64);
         reg.gauge(ids.binance_options_selected)
             .set(discovery.bn_options.len() as i64);
+        reg.gauge(ids.hypercall_options_selected)
+            .set(discovery.hypercall_options.len() as i64);
     }
 
     // Per-venue (registry, gauge-ids) pair for the §6.5 capture
@@ -2807,13 +4781,16 @@ fn run(args: RunArgs) -> ExitCode {
     // own ordinal block); every USDS-M instrument (perp + dated) also
     // gets a `@markPrice` slot — the capture-only mark/index/funding
     // lane (dated frames carry no funding; the parser's has_funding
-    // gate handles it).
+    // gate handles it). BX2: COIN-M perps and delivery futures take
+    // the same two slots each on the COIN-M host (dstream).
     let bn_usdm_all = boot.allocated.bn_usdm.len() + boot.allocated.bn_dated.len();
-    let bn_total = boot.allocated.bn_spot.len() + bn_usdm_all;
+    let bn_coinm_all = boot.allocated.bn_coinm.len() + boot.allocated.bn_coinm_dated.len();
+    let bn_fut_all = bn_usdm_all + bn_coinm_all;
+    let bn_total = boot.allocated.bn_spot.len() + bn_fut_all;
     let bn_eapi_on = !discovery.bn_options.is_empty();
-    let bn_handle = if bn_total > 1 || bn_usdm_all > 0 || bn_eapi_on {
+    let bn_handle = if bn_total > 1 || bn_fut_all > 0 || bn_eapi_on {
         let mut specs: Vec<cli::BinanceConnSpec> =
-            Vec::with_capacity(bn_total + bn_usdm_all + usize::from(bn_eapi_on));
+            Vec::with_capacity(bn_total + bn_fut_all + usize::from(bn_eapi_on));
         for inst in &boot.allocated.bn_spot {
             specs.push(cli::BinanceConnSpec {
                 host: cfg.binance_ws_host.clone(),
@@ -2832,80 +4809,68 @@ fn run(args: RunArgs) -> ExitCode {
             .iter()
             .chain(boot.allocated.bn_dated.iter())
         {
-            specs.push(cli::BinanceConnSpec {
-                host: cfg.binance_fut_ws_host.clone(),
-                path: format!("/ws/{}@bookTicker", inst.name),
-                sym: inst.sym,
-                eapi: None,
-                mark_price: false,
-                // USDS-M bookTicker stamps itself (T/E) — no sentinel.
-                spot_sentinel: false,
-            });
-            specs.push(cli::BinanceConnSpec {
-                host: cfg.binance_fut_ws_host.clone(),
-                path: format!("/ws/{}@markPrice", inst.name),
-                sym: inst.sym,
-                eapi: None,
-                mark_price: true,
-                spot_sentinel: false,
-            });
+            // BX0-F1: bookTicker on the legacy `/ws/` path (still
+            // delivering), markPrice on the routed `/market/ws/` path —
+            // one builder shared with the live smoke.
+            let [book, mark] = cli::bn_usdm_specs(&cfg.binance_fut_ws_host, &inst.name, inst.sym);
+            specs.push(book);
+            specs.push(mark);
+        }
+        for inst in boot
+            .allocated
+            .bn_coinm
+            .iter()
+            .chain(boot.allocated.bn_coinm_dated.iter())
+        {
+            let [book, mark] =
+                cli::bn_coinm_specs(&cfg.binance_coinm_ws_host, &inst.name, inst.sym);
+            specs.push(book);
+            specs.push(mark);
         }
         if bn_eapi_on {
-            // M2.4: one combined-stream slot carries every selected
-            // option ticker + one index stream per underlying (all
-            // stream names lowercased; no subscribe frames — the
-            // house direct-URL pattern).
+            // M2.4 / BX0-F2: ONE combined slot, one
+            // `<uly>@optionMarkPrice` stream per underlying on
+            // fstream's routed `/market` path; each push is the whole
+            // chain of that underlying and the table keeps the
+            // selected rows (no subscribe frames — the house
+            // direct-URL pattern).
             let mut table = ingress_binance::eapi::EapiSymbolTable::new();
-            let mut streams = String::new();
-            for (symbol, sym, uly_idx) in &discovery.bn_options {
-                if let Err(e) = table.insert(symbol.as_bytes(), *sym, *uly_idx) {
-                    error!(?e, symbol = %symbol, "binance: eapi table build failed");
+            for (symbol, sym) in &discovery.bn_options {
+                if let Err(e) = table.insert(symbol.as_bytes(), *sym) {
+                    error!(?e, symbol = %symbol, "binance: options table build failed");
                     join_reverse(handles);
                     return ExitCode::from(1);
                 }
-                if !streams.is_empty() {
-                    streams.push('/');
-                }
-                streams.push_str(&symbol.to_ascii_lowercase());
-                streams.push_str("@ticker");
             }
-            for uly in &boot.bn_options.underlyings {
-                streams.push('/');
-                streams.push_str(&uly.to_ascii_lowercase());
-                streams.push_str("@index");
-            }
+            let path = cli::bn_options_path(&boot.bn_options.underlyings);
+            // Loud endpoint provenance — the options WS base has
+            // churned (nbstream `/eoptions` retired, fstream `/market`
+            // since the 2025-12 migration); a host pinned in `.env`
+            // shows here, and so does its 404.
+            info!(
+                host = %cfg.binance_eapi_ws_host,
+                path = %path,
+                underlyings = boot.bn_options.underlyings.len(),
+                selected = discovery.bn_options.len(),
+                "binance: options mark-array slot (override via BINANCE_EAPI_WS_HOST)"
+            );
             specs.push(cli::BinanceConnSpec {
                 host: cfg.binance_eapi_ws_host.clone(),
-                // The documented eapi combined base (legacy docs +
-                // the live nbstream ALB). TEMPORARILY UNREACHABLE
-                // from this network as of 2026-08-22 (404/403 on
-                // every candidate route while eapi REST serves —
-                // forensics in docs/m2-progress.md); the slot retries
-                // harmlessly and BINANCE_EAPI_WS_HOST is the
-                // override once an endpoint is confirmed.
-                path: format!("/eoptions/stream?streams={streams}"),
+                path,
                 sym: 0,
-                eapi: Some((table, boot.bn_options.underlyings.clone())),
+                eapi: Some(table),
                 mark_price: false,
                 spot_sentinel: false,
             });
-        }
-        if bn_eapi_on {
-            // Loud endpoint provenance — the options WS base has
-            // churned (nbstream/fstream/vstream history) and can be
-            // geo-gated; the operator override is the escape hatch.
-            info!(
-                host = %cfg.binance_eapi_ws_host,
-                streams = discovery.bn_options.len() + boot.bn_options.underlyings.len(),
-                "binance: eapi options combined-stream slot (override via BINANCE_EAPI_WS_HOST)"
-            );
         }
         info!(
             conns = specs.len(),
             spot = boot.allocated.bn_spot.len(),
             usdm = boot.allocated.bn_usdm.len(),
             dated = boot.allocated.bn_dated.len(),
-            mark_price = bn_usdm_all,
+            coinm = boot.allocated.bn_coinm.len(),
+            coinm_dated = boot.allocated.bn_coinm_dated.len(),
+            mark_price = bn_fut_all,
             eapi_options = discovery.bn_options.len(),
             stale_after_ms = stale_after_ms[core_types::VenueId::Binance as usize],
             "binance: M1 multi-connection lane"
@@ -2923,6 +4888,14 @@ fn run(args: RunArgs) -> ExitCode {
             epoch_ns,
             raw_tap_cfg.bn,
             capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_bn)),
+            // BX6 (O-BX29): the marks ride the lane — flagged for the
+            // dispatcher alone — only when a Binance arm will read them.
+            if bn_armed {
+                core_types::EVENT_LANE_FUNDING
+                    | core_types::event_lane_bit(core_types::ChannelId::Mark)
+            } else {
+                core_types::EVENT_LANE_FUNDING
+            },
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -3069,7 +5042,7 @@ fn run(args: RunArgs) -> ExitCode {
 
     // Hyperliquid rides core 7 per the §9 core map.
     let hl_wall_anchor = core_time::WallAnchor::now();
-    if let Some((mut hl_coins, mut hl_families, hl_ep)) = hl_boot {
+    if let Some((mut hl_coins, mut hl_families, hl_ep, hl_info_ep)) = hl_boot {
         // BIN15 O2: adopt each family's LIVE instance out of the
         // discovery body, so the first `Steady` subscribes it instead
         // of waiting up to a whole period for the venue's next
@@ -3090,35 +5063,7 @@ fn run(args: RunArgs) -> ExitCode {
                 candidates = discovery.hl_outcome_specs.len(),
                 "hyperliquid: rolling families bound"
             );
-            for f in 0..hl_families.len() {
-                let Some(row) = hl_families.get(f) else {
-                    continue;
-                };
-                let underlying = core::str::from_utf8(row.underlying_bytes()).unwrap_or("?");
-                if row.dormant {
-                    info!(
-                        family = f,
-                        underlying,
-                        period_s = row.period_s,
-                        sym_yes = row.sym[0],
-                        sym_no = row.sym[1],
-                        "hyperliquid: family dormant (no live instance)"
-                    );
-                } else {
-                    info!(
-                        family = f,
-                        underlying,
-                        period_s = row.period_s,
-                        sym_yes = row.sym[0],
-                        sym_no = row.sym[1],
-                        live = row.live.outcome,
-                        strike_1e6 = row.live.strike_1e6,
-                        expiry_ns = row.live.expiry_ns,
-                        twap_s = row.live.twap_s,
-                        "hyperliquid: family live"
-                    );
-                }
-            }
+            cli::log_hl_families(&hl_families);
         }
         info!(
             coins = hl_coins.len(),
@@ -3128,14 +5073,23 @@ fn run(args: RunArgs) -> ExitCode {
         );
         let hl_handle = match spawn_hyperliquid(
             hl_ep,
+            hl_info_ep,
             tls_config.clone(),
             hl_coins,
             hl_families,
             statuses.hl_roll.clone(),
             hl_wall_anchor,
+            // HC11: slot 7 reads each underlying's oracle off the MARK;
+            // XMM XH4f: the router prices slot 6's perps off it (XH2-C).
+            strategy_set::mask_for_name(&args.strategy)
+                .is_some_and(|m| m & strategy_set::BIT_HCV != 0)
+                || exec_boot
+                    .as_ref()
+                    .is_some_and(|b| b.gateway_live().is_some()),
             stale_after_ms[core_types::VenueId::Hyperliquid as usize],
             hl_prod,
             hl_event_prod,
+            trade_prod,
             statuses.hyperliquid.clone(),
             7,
             &run_dir,
@@ -3157,6 +5111,7 @@ fn run(args: RunArgs) -> ExitCode {
         // empty ring (the unspawned-venue shape, §3.3).
         drop(hl_prod);
         drop(hl_event_prod);
+        drop(trade_prod);
     }
 
     // WS9: Bybit — spot + linear connection slots on ONE thread
@@ -3229,6 +5184,167 @@ fn run(args: RunArgs) -> ExitCode {
         drop(bybit_event_prod);
     }
 
+    // MX6: MEXC — spot (protobuf, `/ws`) + futures (JSON, `/edge`)
+    // connection slots on ONE thread (core 9, the §9 core-map
+    // extension past Bybit's 8). Config-file only. Each class is
+    // chunked to its MEASURED per-socket cap (plan §4 D1: spot 30 subs
+    // = 15 symbols × 2 channels, futures 13 symbols × 3 channels);
+    // futures conns carry the boot REST funding seeds (Q-MX3).
+    if !boot.allocated.mexc_spot.is_empty() || !boot.allocated.mexc_perp.is_empty() {
+        let mut specs: Vec<cli::MexcConnSpec> = Vec::new();
+        for (class, insts, host) in [
+            (
+                ingress_mexc::MexcClass::Spot,
+                &boot.allocated.mexc_spot,
+                &cfg.mexc_ws_host,
+            ),
+            (
+                ingress_mexc::MexcClass::Futures,
+                &boot.allocated.mexc_perp,
+                &cfg.mexc_fut_ws_host,
+            ),
+        ] {
+            let Ok(path) = std::str::from_utf8(class.ws_path()) else {
+                error!(class = class.label(), "mexc: non-utf8 ws path");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            };
+            for chunk in insts.chunks(class.symbols_per_conn()) {
+                let mut table = ingress_mexc::MexcSymbolTable::new();
+                let mut funding_seeds = Vec::new();
+                for inst in chunk {
+                    if let Err(e) = table.insert(inst.name.as_bytes(), inst.sym) {
+                        error!(?e, symbol = %inst.name, class = class.label(), "mexc: table build failed");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
+                    if class == ingress_mexc::MexcClass::Futures {
+                        match discovery.mexc_funding.iter().find(|(n, _)| *n == inst.name) {
+                            Some((_, seed)) => funding_seeds.push((
+                                inst.sym,
+                                seed.next_settle_ms,
+                                seed.collect_cycle_h,
+                            )),
+                            // Missing from the venue (discovery already
+                            // flagged it): no seed, Funding v1 stays 0.
+                            None => warn!(symbol = %inst.name, "mexc: no funding seed — Funding v1 = 0"),
+                        }
+                    }
+                }
+                specs.push(cli::MexcConnSpec {
+                    class,
+                    host: host.clone(),
+                    path: path.to_string(),
+                    table,
+                    funding_seeds,
+                });
+            }
+        }
+        info!(
+            spot = boot.allocated.mexc_spot.len(),
+            perp = boot.allocated.mexc_perp.len(),
+            conns = specs.len(),
+            seeds = discovery.mexc_funding.len(),
+            stale_after_ms = stale_after_ms[core_types::VenueId::Mexc as usize],
+            "mexc: starting ingress thread"
+        );
+        let mexc_handle = match cli::spawn_mexc(
+            specs,
+            tls_config.clone(),
+            stale_after_ms[core_types::VenueId::Mexc as usize],
+            mexc_prod,
+            mexc_event_prod,
+            statuses.mexc.clone(),
+            9,
+            &run_dir,
+            epoch_ns,
+            raw_tap_cfg.mexc,
+            capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_mexc)),
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                error!(error = ?e, "mexc: capture open failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        };
+        handles.push(mexc_handle);
+    } else {
+        // Drop the producer sides so the lanes stay permanently-
+        // empty rings (the unspawned-venue shape, §3.3) — a boot with
+        // no `[mexc]` section is the pre-MEXC boot, bit for bit.
+        drop(mexc_prod);
+        drop(mexc_event_prod);
+    }
+
+    // -- Hypercall (HC5; data-only, ruling O-HC1): ONE public socket on
+    // its own thread (core 11, past HyperEVM's 10) + the REST poller
+    // thread, whenever `[hypercall]` selected a chain at boot. The
+    // universe is the HC4 discovery outcome; the index syms are the
+    // config file's. --
+    if !discovery.hypercall_options.is_empty() {
+        let mut symbols = ingress_hypercall::HcSymbolTable::new();
+        for (name, sym, ..) in &discovery.hypercall_options {
+            if let Err(e) = symbols.insert(name.as_bytes(), *sym) {
+                error!(?e, instrument = %name, "hypercall: table build failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        }
+        let mut underlyings = ingress_hypercall::HcUnderlyings::new();
+        for inst in &boot.allocated.hypercall_idx {
+            if let Err(e) = underlyings.insert(inst.name.as_bytes(), inst.sym) {
+                error!(?e, underlying = %inst.name, "hypercall: index table build failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        }
+        let stale = stale_after_ms[core_types::VenueId::Hypercall as usize];
+        info!(
+            instruments = discovery.hypercall_options.len(),
+            underlyings = boot.allocated.hypercall_idx.len(),
+            summary_every_s = boot.hypercall_summary_every_s,
+            stale_after_ms = stale,
+            "hypercall: starting ingress + poller threads"
+        );
+        let spec = cli::HypercallSpec {
+            ws_host: cfg.hypercall_ws_host.clone(),
+            rest_host: cfg.hypercall_rest_host.clone(),
+            symbols,
+            underlyings,
+            summary_underlyings: boot.hypercall_options.underlyings.clone(),
+            summary_every_s: boot.hypercall_summary_every_s,
+            stale_after_ms: stale,
+        };
+        match cli::spawn_hypercall(
+            spec,
+            tls_config.clone(),
+            hypercall_prod,
+            hypercall_event_prod,
+            hypercall_opt_prod,
+            statuses.hypercall.clone(),
+            statuses.hc.clone(),
+            11,
+            &run_dir,
+            epoch_ns,
+            raw_tap_cfg.hypercall,
+            capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_hypercall)),
+        ) {
+            Ok(hs) => handles.extend(hs),
+            Err(e) => {
+                error!(error = ?e, "hypercall: capture open failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        // The unspawned-venue shape (§3.3): permanently-empty rings, so a
+        // boot without `[hypercall]` is the pre-HC5 boot, bit for bit.
+        drop(hypercall_prod);
+        drop(hypercall_event_prod);
+        drop(hypercall_opt_prod);
+    }
+
     if let Some(polygon_path) = args.polygon_path {
         match WssEndpoint::resolve(&cfg.alchemy_host, 443, &polygon_path) {
             Ok(rpc_ep) => {
@@ -3257,6 +5373,68 @@ fn run(args: RunArgs) -> ExitCode {
         }
     } else {
         warn!("--polygon-path not provided; RPC ingress thread not started");
+    }
+
+    // -- HYPARB H3b: the HyperEVM pool-event ingress --
+    // Both switches or nothing: the path flag AND a `[hyperevm] pools`
+    // list. Anything else drops the producer, so the engine's pool lane
+    // is a permanently-empty ring (the unspawned-venue shape, §3.3).
+    // HYPARB H5: whether the operator CONFIGURED the ingress — slot 0
+    // refuses a boot without it (a member that can never see a pool);
+    // a runtime failure (DNS, a dishonest archive) only darkens the
+    // member (O-H15), it never refuses the boot.
+    let hyperevm_configured = args.hyperevm_path.is_some() && !boot.allocated.hyperevm.is_empty();
+    match (
+        args.hyperevm_path.as_deref(),
+        boot.allocated.hyperevm.is_empty(),
+    ) {
+        (Some(path), false) => {
+            let table = match cli::hyperevm_pool_table(&boot.allocated) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(error = ?e, "hyperevm: pool table refused");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+            };
+            match WssEndpoint::resolve(&cfg.hyperevm_ws_host, 443, path) {
+                Ok(ep) => {
+                    info!(
+                        host = %cfg.hyperevm_ws_host,
+                        pools = boot.allocated.hyperevm.len(),
+                        "hyperevm: starting pool-event ingress"
+                    );
+                    match cli::spawn_hyperevm(
+                        ep,
+                        tls_config.clone(),
+                        hyperevm_prod,
+                        statuses.hyperevm.clone(),
+                        10,
+                        &run_dir,
+                        epoch_ns,
+                        raw_tap_cfg.hyperevm,
+                        capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_hyperevm)),
+                        table,
+                        ingress_hyperevm::run_loop::DEFAULT_SNAPSHOT_RADIUS,
+                    ) {
+                        Ok(h) => handles.push(h),
+                        Err(e) => {
+                            error!(error = ?e, "hyperevm: capture open failed");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = ?e, "HyperEVM DNS failed; skipping the pool-event ingress");
+                }
+            }
+        }
+        (Some(_), true) => {
+            warn!("--hyperevm-path given but [hyperevm] pools is empty; pool ingress not started");
+            drop(hyperevm_prod);
+        }
+        (None, _) => drop(hyperevm_prod),
     }
 
     // -- AI-command ingress (Phase 8f; opt-in via AI_INGRESS_HMAC_KEY
@@ -3337,8 +5515,19 @@ fn run(args: RunArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // XMM XH5d: the order-event capture beside them — the same stance.
+    let obs = match cli::open_events_capture(&run_dir, epoch_ns) {
+        Ok(cap) => obs.with_events_capture(cap),
+        Err(e) => {
+            error!(error = ?e, dir = %run_dir.display(), "events capture open failed");
+            join_reverse(handles);
+            return ExitCode::from(1);
+        }
+    };
 
     // -- Main thread: real engine loop until SIGINT --
+    // HK6: the captures are open — the run directory stays from here on.
+    run_dir_guard.commit();
     let cons = Consumers {
         tick_lanes: [
             pm_lane_cons,
@@ -3347,11 +5536,15 @@ fn run(args: RunArgs) -> ExitCode {
             deribit_lane_cons,
             hl_lane_cons,
             bybit_lane_cons,
+            mexc_lane_cons,
+            hypercall_lane_cons,
         ],
         event_lanes: event_lane_cons,
         depth_lanes: depth_lane_cons,
         opt_lanes: opt_lane_cons,
         rpc_signal: rpc_cons,
+        hyperevm_signal: hyperevm_cons,
+        trades: trade_cons,
         fill_lanes: fill_lane_cons,
         ai_cmds: ai_lane_cons,
         ai_status,
@@ -3438,7 +5631,7 @@ fn run(args: RunArgs) -> ExitCode {
 
     // `--exec` is honoured ONLY by the composed strategy-set arm — it
     // is the only arm that builds a `RoutedDispatcher`. Accepting the
-    // flag for `latency-arb` / `rule-tree` / `ev` and then routing
+    // flag for `rule-tree` / `ev` and then routing
     // nothing would be the worst kind of silent no-op: the operator
     // passed an arming artifact and the engine ignored it.
     if args.exec.is_some() && !STRATEGY_SET_NAMES.contains(&args.strategy.as_str()) {
@@ -3451,24 +5644,15 @@ fn run(args: RunArgs) -> ExitCode {
         return ExitCode::from(1);
     }
     let strategy_choice = args.strategy.as_str();
+    // XMM XH4f: slot 6's gateway thread's owner — set when its arm boots,
+    // released after the loop (or on a boot abort past that point).
+    let mut xmm_stop: Option<cli::xmm_live::GatewayStop> = None;
+    // XMM XH4i-5: slot 3's gateway thread's owner, alike.
+    let mut bin15_stop: Option<cli::xmm_live::GatewayStop> = None;
     let result = match (strategy_choice, args.live) {
-        ("latency-arb", true) => match boot_queued_live(&cfg, tls_config.clone()) {
-            Ok((queued, worker_handle)) => {
-                info!("running latency-arb LIVE — orders queued to dispatcher thread");
-                obs_handles.push(worker_handle);
-                engine_loop_full(cons, engine_cfg, queued, obs)
-            }
-            Err(reason) => EngineLoopResult::Failed(reason),
-        },
-        ("latency-arb", false) => {
-            info!("running latency-arb PAPER — no orders will be submitted");
-            engine_loop_full(
-                cons,
-                engine_cfg,
-                clob_dispatcher::PaperDispatcher::new(),
-                obs,
-            )
-        }
+        // HYPARB H0 (O-H1): `latency-arb` has no arm any more — slot 0
+        // is the hyparb set member and the old name falls through to
+        // the "unknown --strategy" refusal below, on purpose.
         // XSD-S (2026-09-12): `cross-arb` has no arm any more — slot 2 is
         // vacant until `strategy-xsd` lands (XSD-3) and the name falls
         // through to the "unknown --strategy" refusal below, on purpose.
@@ -3529,10 +5713,10 @@ fn run(args: RunArgs) -> ExitCode {
         (name, _live) if STRATEGY_SET_NAMES.contains(&name) => {
             // Phase 8f item 7: the composed StrategySet. `all` means
             // "every built member the given flags can boot" —
-            // latency-arb from the mandatory pair flags, bin15 only
+            // hyparb only when `hyparb.toml` resolves (H5), bin15 only
             // when its artifact resolves, vrp only when
-            // `vrp.toml` resolves (VRP V7: slot 1), icdp only when its
-            // artifact resolves (slot 2 is vacant — XSD-S),
+            // `vrp.toml` resolves (VRP V7: slot 1), xmm only when its
+            // artifact resolves (slot 6 — XMM XH1),
             // ai-exec and vm unconditionally (neither has boot
             // config; items 8 / 8g-6) (members without config boot
             // inert; see engine_loop_set_full docs). `ai-exec` (item
@@ -3544,15 +5728,18 @@ fn run(args: RunArgs) -> ExitCode {
             // live arm.
             let requested =
                 strategy_set::mask_for_name(name).expect("matched names are valid mask names");
-            // ICDP I5: resolve the artifact against the SAME
+            // XMM XH1: slot 6's artifact, resolved against the SAME
             // descriptor table the ruleset validator uses (D-6 truth).
             // Only when the bit is requested — `--strategy ai` never
             // touches the file.
-            let icdp_params = if requested & strategy_set::BIT_ICDP != 0 {
-                match load_icdp_params(args.icdp.as_deref(), &ai_descriptors) {
-                    Ok(p) => Some(p),
+            let xmm_boot = if cli::xmm_boot::xmm_wanted(requested) {
+                match cli::xmm_boot::load_xmm_boot(
+                    args.xmm.as_deref(),
+                    &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                ) {
+                    Ok(b) => b,
                     Err(reason) => {
-                        error!(reason, "icdp: artifact refused — boot aborted");
+                        error!(reason, "xmm: artifact refused — boot aborted");
                         join_reverse(handles);
                         return ExitCode::from(1);
                     }
@@ -3560,6 +5747,56 @@ fn run(args: RunArgs) -> ExitCode {
             } else {
                 None
             };
+            // F19 / the icdp law: requested-but-absent REFUSES. Booting
+            // `ai+xmm` silently as `ai` is how an operator comes to watch
+            // a member that was never there.
+            if cli::xmm_boot::xmm_wanted(requested) && xmm_boot.is_none() {
+                error!(
+                    "xmm: requested by --strategy but the artifact is absent \
+                     (~/multivenue/xmm.toml or --xmm) — boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+            // HC11: slot 7's artifact — its hedges resolved against the
+            // SAME descriptor table (D-6 truth), their szDecimals from this
+            // boot's Hyperliquid discovery, its options this boot's
+            // Hypercall chain. Only when the bit is requested.
+            let hcv_boot = if cli::hcv_boot::hcv_wanted(requested) {
+                match cli::hcv_boot::load_hcv_boot(
+                    args.hcv.as_deref(),
+                    args.hcv_events.as_deref(),
+                    args.hcv_state.as_deref(),
+                    &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                    &|coin: &str| {
+                        discovery
+                            .hl_sz_decimals
+                            .iter()
+                            .find(|(c, _)| c == coin)
+                            .map(|(_, sz)| *sz)
+                    },
+                    &discovery.hypercall_options,
+                    &boot.hypercall_options.underlyings,
+                ) {
+                    Ok(b) => b,
+                    Err(reason) => {
+                        error!(reason, "hcv: artifact refused — boot aborted");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                None
+            };
+            // The same law for slot 7.
+            if cli::hcv_boot::hcv_wanted(requested) && hcv_boot.is_none() {
+                error!(
+                    "hcv: requested by --strategy but the artifact is absent \
+                     (~/multivenue/hcv.toml or --hcv) — boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
             // RG2: the regime detector's artifact + seed, resolved
             // against the same descriptor table (D-6 truth). An absent
             // DEFAULT file is legal (unconfigured); an explicit path
@@ -3572,6 +5809,23 @@ fn run(args: RunArgs) -> ExitCode {
                 Ok(rb) => rb,
                 Err(reason) => {
                     error!(reason, "regime: artifact refused — boot aborted");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+            };
+            // HAR H3.4: the long-tenor HAR series, their feeds resolved
+            // against the same descriptor table (D-6 truth), each engine's
+            // seed and state read and merged. Only an EXPLICIT `--har`
+            // that cannot be read refuses the boot; every other problem
+            // turns the service (or one series) off with a named error.
+            let har_boot = match cli::har_boot::load_har_boot(
+                args.har.as_deref(),
+                args.har_dir.as_deref(),
+                &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+            ) {
+                Ok(hb) => hb,
+                Err(reason) => {
+                    error!(reason, "har: the explicit --har file is unreadable — boot aborted");
                     join_reverse(handles);
                     return ExitCode::from(1);
                 }
@@ -3722,11 +5976,141 @@ fn run(args: RunArgs) -> ExitCode {
                 join_reverse(handles);
                 return ExitCode::from(1);
             }
+            // HYPARB H5: slot 0's artifact. Coins resolve against the
+            // same descriptor table; pools against the universe's
+            // `[hyperevm]` list (the universe allocates their symbols).
+            let hyparb_boot = if cli::hyparb_boot::hyparb_wanted(requested) {
+                match cli::hyparb_boot::load_hyparb_boot(
+                    args.hyparb.as_deref(),
+                    &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                    &boot.allocated.hyperevm,
+                    args.evm_testnet,
+                ) {
+                    Ok(b) => b,
+                    Err(reason) => {
+                        error!(reason, "hyparb: artifact refused — boot aborted");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                if args.evm_testnet {
+                    error!("--evm-testnet without slot 0 in --strategy — boot aborted");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+                None
+            };
+            // F19 / the icdp law: requested-but-absent REFUSES.
+            if cli::hyparb_boot::hyparb_wanted(requested) && hyparb_boot.is_none() {
+                error!(
+                    "hyparb: requested by --strategy but the artifact is absent \
+                     (~/multivenue/hyparb.toml or --hyparb) — boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+            if hyparb_boot.is_some() && !hyperevm_configured {
+                error!(
+                    "hyparb: the member needs the HyperEVM pool ingress — \
+                     --hyperevm-path and a non-empty universe.toml `[hyperevm] pools` \
+                     — boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+            // HYPARB L5 (O-HL1): live mode's three switches — the
+            // artifact's `mode = "live"`, and the exec interlock's slot 0
+            // (`exec.toml [exec.slot.0] mode = "live"` + `--arm-live 0`,
+            // which `exec_boot::resolve` already made agree) — agree, or
+            // no boot. Either side alone is a refusal, never a downgrade.
+            let hyparb_live_mode = hyparb_boot
+                .as_ref()
+                .is_some_and(|b| b.mode == core_config::hyparb::HyparbMode::Live);
+            let slot0_armed = exec_boot
+                .as_ref()
+                .is_some_and(cli::exec_boot::ExecBoot::hyparb_live);
+            if hyparb_live_mode != slot0_armed {
+                error!(
+                    artifact_live = hyparb_live_mode,
+                    exec_slot0_live = slot0_armed,
+                    "hyparb: LIVE mode needs all three switches — hyparb.toml `mode = \"live\"`, \
+                     exec.toml [exec.slot.0] `mode = \"live\"` and --arm-live 0 — and they \
+                     disagree; boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
             // RG6: the `/state` `boot` section's regime identity.
             let mut obs = obs;
             if let Some(rb) = regime_boot.as_ref() {
                 obs.boot.regime_hash = rb.hash;
                 obs.boot.regime_configured = 1;
+            }
+            // HYPARB H8: the EVM write path, TESTNET ONLY (O-H5) — the
+            // shadow of each paper AMM decision (O-H12). The chain checks
+            // need the wire, so they run here. H9 R3: a misconfiguration
+            // or a VERIFIED interlock failure refuses the boot; an
+            // endpoint that cannot be reached (transport, rate limit) or
+            // an unfunded wallet 0 leaves the shadow DARK — nothing is
+            // sent, so an interlock that could not be verified is still
+            // not passed, and the paper member (the P&L source) runs.
+            match hyparb_boot
+                .as_ref()
+                .filter(|b| b.mode == core_config::hyparb::HyparbMode::Testnet)
+            {
+                Some(hb) => {
+                    let Some(t) = hb.testnet.as_ref() else {
+                        error!("hyparb: testnet mode without [testnet] — boot aborted");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    };
+                    let read_url = format!(
+                        "https://{}{}",
+                        cfg.hyperevm_ws_host,
+                        args.hyperevm_path.as_deref().unwrap_or("/")
+                    );
+                    let booted = cli::evm_testnet::wallet_keys_from_env(t.wallets)
+                        .map_err(cli::evm_testnet::ShadowBootErr::Refuse)
+                        .and_then(|k| {
+                            cli::evm_testnet::boot_shadow(
+                                t,
+                                &k.keys,
+                                k.source,
+                                hb.params.gas_p99_usd_1e6,
+                                &read_url,
+                                args.evm_hybrid,
+                                tls_config.clone(),
+                            )
+                        });
+                    match booted {
+                        Ok(b) => {
+                            warn!("{}", b.tell);
+                            obs.hyparb_shadow = Some(b.tap);
+                            handles.push(b.handle);
+                        }
+                        Err(cli::evm_testnet::ShadowBootErr::Dark(reason)) => {
+                            obs.hyparb_shadow_dark = true;
+                            error!(
+                                reason,
+                                "hyparb: the EVM write path is DARK — no testnet shadow swap \
+                                 will be sent this run; the paper member runs (fix the reason \
+                                 and restart to arm it)"
+                            );
+                        }
+                        Err(cli::evm_testnet::ShadowBootErr::Refuse(reason)) => {
+                            error!(reason, "hyparb: the EVM write path refused — boot aborted");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }
+                    }
+                }
+                None if args.evm_hybrid => {
+                    error!("--evm-hybrid without a testnet hyparb artifact — boot aborted");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+                None => {}
             }
             match exec_boot {
                 // NO `--exec`: the pre-E1 path, untouched. Same
@@ -3735,15 +6119,17 @@ fn run(args: RunArgs) -> ExitCode {
                     info!("running strategy-set PAPER — no orders will be submitted");
                     engine_loop_set_full(
                         cons,
-                        engine_cfg,
                         clob_dispatcher::PaperDispatcher::new(),
                         obs,
                         requested,
                         vrp_boot.as_ref(),
                         xsd_boot.as_ref(),
                         bin15_boot.as_ref(),
-                        icdp_params.as_ref(),
+                        xmm_boot.as_ref(),
+                        hcv_boot.as_ref(),
                         regime_boot.as_ref(),
+                        hyparb_boot.as_ref(),
+                        har_boot.as_ref(),
                     )
                 }
                 // WITH `--exec`: the same loop over the compositing
@@ -3759,177 +6145,511 @@ fn run(args: RunArgs) -> ExitCode {
                 // rather than by care.
                 Some(eb) => {
                     cli::exec_boot::log_boot_tell(&eb);
-                    // **E7 — the live arm.** A route table with
-                    // Hyperliquid live gets a real `HlExchange` behind
-                    // the router, fed by fill lane 3's producer and
-                    // configured from the `HYPERLIQUID_*` variables the
-                    // wrapper sourced from `.env`. Anything else keeps
-                    // the refusing stub, so LAW E-1 stays true by
-                    // construction on a boot that armed nothing.
-                    //
-                    // The two dispatcher types cannot share one binding
-                    // (the loop is monomorphised over `D`), so the halt
-                    // wiring below is a generic helper and the loop is
-                    // entered from two arms.
-                    if eb.route.venue_live(core_types::VenueId::Hyperliquid.to_u8()) {
-                        let hl_cfg = match exec_hyperliquid::HlConfig::from_env(
-                            exec_hyperliquid::Scope::Live,
-                        ) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                error!(
-                                    error = %e,
-                                    "exec: slot(s) LIVE on hyperliquid but the arm cannot be \
-                                     configured — boot aborted"
-                                );
-                                join_reverse(handles);
-                                return ExitCode::from(1);
-                            }
-                        };
-                        // **LAW E-4's precondition.** The asset ids the
-                        // arm binds come from the MARKET-DATA ingress's
-                        // roll events; the orders go to the EXCHANGE
-                        // host. A testnet id is a mainnet stranger's
-                        // market and vice versa, so both hosts must be
-                        // on the same network or the boot refuses.
-                        let md_testnet = cfg.hyperliquid_ws_host.contains("testnet");
-                        let ex_testnet = hl_cfg.network == exec_hyperliquid::Network::Testnet;
-                        if md_testnet != ex_testnet {
-                            error!(
-                                market_data = %cfg.hyperliquid_ws_host,
-                                exchange = %hl_cfg.host,
-                                "exec: HYPERLIQUID_WS_HOST and HYPERLIQUID_EXCHANGE_HOST are on \
-                                 different networks — the roll events that bind asset ids \
-                                 would name another network's markets (LAW E-4). Point both \
-                                 at testnet or both at mainnet. Boot aborted."
-                            );
+                    // **BX3 — the route alias** (plan §3.2 item 4): Binance
+                    // spot[0]'s flat legacy id routes to Binance. Built
+                    // before any arm boots, so a refusal opens no socket.
+                    let bn_anchor = boot.allocated.bn_spot.first().map(|i| i.sym);
+                    let aliases = match cli::exec_boot::route_aliases(bn_anchor) {
+                        Ok(a) => a,
+                        Err(reason) => {
+                            error!(%reason, "exec: route alias refused — boot aborted");
                             join_reverse(handles);
                             return ExitCode::from(1);
                         }
-                        // The tightest floor across the live HL slots:
-                        // the budget is a property of the ADDRESS.
-                        let floor = eb
-                            .slots
+                    };
+                    if let Some(sym) = bn_anchor.filter(|_| !aliases.is_empty()) {
+                        info!(
+                            sym,
+                            "exec: route alias — the Binance spot anchor routes to binance"
+                        );
+                    }
+                    // **HYPARB L5 — slot 0's own live arm** (O-HL1/O-HL3):
+                    // real swaps on HyperEVM mainnet and real hedges from
+                    // the slot's own Hyperliquid account, authorised only
+                    // by all three switches (checked above, and again by
+                    // `MainnetAuthority::armed_engine`).
+                    // **XMM XH4h S3 — one nonce stream per agent address**:
+                    // every Hyperliquid signer below asks for its agent's
+                    // stream before its first signed action.
+                    let mut nonces = exec_hyperliquid::NonceStreams::new();
+                    // **XMM XH4h-2 — the hedge-coin overlap rule**, before
+                    // any arm boots: no perp slot 6's gateway binds may be
+                    // another LIVE member's perp (a paper member is no
+                    // claim; since XH5a a live one can sit beside slot 6).
+                    if let (Some(_), Some(xb)) = (eb.gateway_live(), xmm_boot.as_ref()) {
+                        let live = |slot: u8| eb.live_mask & (1u8 << slot) != 0;
+                        let n = usize::from(xb.params.n_perps).min(xb.coins.len());
+                        let bound: Vec<(&str, core_types::SymbolId)> = xb.coins[..n]
                             .iter()
-                            .filter(|s| s.is_live() && s.request_budget_floor > 0)
-                            .map(|s| s.request_budget_floor)
-                            .min()
-                            .and_then(|f| u64::try_from(f).ok())
-                            .unwrap_or(0);
-                        let budget_path = eb
-                            .path
-                            .parent()
-                            .map(std::path::Path::to_path_buf)
-                            .unwrap_or_default()
-                            .join(exec_hyperliquid::budget::DEFAULT_STATE_PATH);
+                            .zip(xb.params.perps[..n].iter())
+                            .map(|(c, p)| (*c, p.hl_sym))
+                            .collect();
+                        let hyparb_perps: Vec<core_types::SymbolId> = hyparb_boot
+                            .as_ref()
+                            .filter(|_| live(strategy_set::SLOT_HYPARB))
+                            .map(|b| {
+                                b.params.coins[..b.params.n_coins]
+                                    .iter()
+                                    .map(|c| c.perp_sym)
+                                    .filter(|s| *s != core_types::SYMBOL_ID_NONE)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let hcv_perps: Vec<core_types::SymbolId> = hcv_boot
+                            .as_ref()
+                            .filter(|_| live(strategy_set::SLOT_HCV))
+                            .map(|b| b.params.und.iter().map(|u| u.hedge_sym).collect())
+                            .unwrap_or_default();
+                        let vrp_hedge: Vec<core_types::SymbolId> = vrp_boot
+                            .as_ref()
+                            .filter(|_| live(strategy_set::SLOT_VRP))
+                            .map(|b| vec![b.hedge_sym])
+                            .unwrap_or_default();
+                        if let Err(reason) = cli::xmm_live::check_perp_overlap(
+                            &bound,
+                            &[
+                                (strategy_set::SLOT_HYPARB, "hyparb", &hyparb_perps),
+                                (strategy_set::SLOT_VRP, "vrp", &vrp_hedge),
+                                (strategy_set::SLOT_HCV, "hcv", &hcv_perps),
+                            ],
+                        ) {
+                            error!(%reason, "xmm: the hedge-coin overlap rule refused the boot");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }
+                    }
+                    let hyparb_live = if eb.hyparb_live() {
+                        match boot_hyparb_live_arm(
+                            &eb,
+                            hyparb_boot.as_ref(),
+                            &boot.allocated,
+                            &mut nonces,
+                        ) {
+                            Ok(b) => {
+                                warn!("{}", b.tell);
+                                obs.hyparb_live_status = Some(b.arm.shared().clone());
+                                handles.push(b.handle);
+                                Some(b.arm)
+                            }
+                            Err(reason) => {
+                                error!(reason, "hyparb: the LIVE arm refused — boot aborted");
+                                join_reverse(handles);
+                                return ExitCode::from(1);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    // **E7 — the operator's Hyperliquid arm**, for every
+                    // live slot on Hyperliquid other than slot 0, fed by
+                    // fill lane 3's producer and configured from the
+                    // `HYPERLIQUID_*` variables the wrapper sourced.
+                    let hl_arm = if eb.hl_arm_needed() {
                         let Some(f3p) = hl_fill_prod.take() else {
                             error!("exec: fill lane 3 producer already taken — boot aborted");
                             join_reverse(handles);
                             return ExitCode::from(1);
                         };
-                        let mut arm = match exec_hyperliquid::HlExchange::new(
-                            &hl_cfg,
-                            TlsTransport::default_client_config(),
-                            f3p,
-                            budget_path.clone(),
-                            floor,
-                        ) {
-                            Ok(a) => a,
-                            Err(e) => {
-                                error!(error = %e, "exec: hyperliquid arm refused — boot aborted");
+                        match boot_operator_hl_arm(&eb, &cfg.hyperliquid_ws_host, f3p, &mut nonces)
+                        {
+                            Ok(a) => Some(a),
+                            Err(reason) => {
+                                error!(reason, "exec: hyperliquid arm refused — boot aborted");
                                 join_reverse(handles);
                                 return ExitCode::from(1);
                             }
-                        };
-                        // E7-F1: the address budget is the venue's
-                        // number, read once here; the cold assumption
-                        // halted the first mainnet boot before its
-                        // first order (2026-09-19).
-                        arm.seed_budget_from_venue();
-                        info!(
-                            host = %hl_cfg.host,
-                            network = if ex_testnet { "testnet" } else { "MAINNET" },
-                            agent = %exec_hyperliquid::config::hex20(&hl_cfg.agent_addr),
-                            master = %exec_hyperliquid::config::hex20(&hl_cfg.master_addr),
-                            budget_floor = floor,
-                            budget_source = ?arm.budget_source(),
-                            budget_remaining = arm.budget_remaining(),
-                            budget_state = %budget_path.display(),
-                            // E7 session bound: 0 = not anchored yet —
-                            // the first FLAT reconciliation sets it and
-                            // writes the file; a restart restores it.
-                            pnl_anchor_usd_1e6 = arm.pnl_anchor_usd_1e6(),
-                            pnl_anchor_state = %arm.pnl_state_path().display(),
-                            "exec: hyperliquid arm ARMED"
-                        );
-                        let mut exec_dispatcher = exec_router::RoutedDispatcher::new(
-                            eb.route,
-                            clob_dispatcher::PaperDispatcher::new(),
-                            arm,
-                            core_time::WallAnchor::now(),
-                        );
-                        wire_exec_halts(&mut exec_dispatcher, &eb, halt_mask);
-                        info!(
-                            live = %cli::exec_boot::render_slot_mask(eb.live_mask),
-                            network = if ex_testnet { "testnet" } else { "MAINNET" },
-                            "running strategy-set with LIVE slots — real orders will be submitted"
-                        );
-                        engine_loop_set_full(
-                            cons,
-                            engine_cfg,
-                            exec_dispatcher,
-                            obs,
-                            requested,
-                            vrp_boot.as_ref(),
-                            xsd_boot.as_ref(),
-                            bin15_boot.as_ref(),
-                            icdp_params.as_ref(),
-                            regime_boot.as_ref(),
-                        )
+                        }
                     } else {
-                        // Nothing armed: the refusing stub, so a live
-                        // slot on a venue with no arm cannot exist here
-                        // (already refused by `exec_boot::resolve`).
-                        let mut exec_dispatcher = exec_router::RoutedDispatcher::new(
-                            eb.route,
-                            clob_dispatcher::PaperDispatcher::new(),
-                            exec_router::NullLiveDispatcher::new(),
-                            core_time::WallAnchor::now(),
-                        );
-                        wire_exec_halts(&mut exec_dispatcher, &eb, halt_mask);
-                        info!(
-                            "running strategy-set PAPER (exec artifact present, nothing armed) \
-                             — no orders will be submitted"
-                        );
-                        // E6: `WallAnchor::now()` above is the anchor
-                        // the venue-fill ledger's 00:00Z day epoch
-                        // needs. Taken HERE, at boot, because an
-                        // `Order`'s `ts_ns` is `CLOCK_MONOTONIC_RAW` and
-                        // the day cap is a wall-clock fact;
-                        // `strategy_bin15` anchors its own day cap the
-                        // same way.
-                        //
-                        // The ledger is deliberately left UNSEEDED: it
-                        // has not been reconciled against the venue, so
-                        // every live PLACE is refused until the arm's
-                        // reconciler reports success, which E6 commit 3
-                        // reads from `halt_signal().reconciled` on the
-                        // idle path. An `--exec` boot with a live slot
-                        // therefore trades nothing until it has seen
-                        // the venue, rather than clamping against a
-                        // position it has never seen. (Both arms.)
-                        engine_loop_set_full(
-                            cons,
-                            engine_cfg,
-                            exec_dispatcher,
-                            obs,
-                            requested,
-                            vrp_boot.as_ref(),
-                            xsd_boot.as_ref(),
+                        None
+                    };
+                    // **BX6 — the Binance arm** (obligations 4, 7, 9): the one
+                    // live slot naming binance, fed by fill lane 4, its
+                    // instruments bound from the boot discovery's rows, its
+                    // gateway BOOTED (the BX-19 assertions held, the orphans
+                    // swept, the day read) before any member can order.
+                    let bn_arm = if eb.binance_slot().is_some() {
+                        let Some(f4p) = bn_fill_prod.take() else {
+                            error!("exec: fill lane 4 producer already taken — boot aborted");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        };
+                        let alias = bn_anchor
+                            .filter(|_| !aliases.is_empty())
+                            .unwrap_or(core_types::SYMBOL_ID_NONE);
+                        if let Err(reason) =
+                            cli::exec_boot::check_alias_unique(alias, &boot.allocated)
+                        {
+                            error!(%reason, "exec: binance arm refused — boot aborted");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }
+                        let usdm: Vec<core_config::universe::Instrument> = boot
+                            .allocated
+                            .bn_usdm
+                            .iter()
+                            .chain(boot.allocated.bn_dated.iter())
+                            .cloned()
+                            .collect();
+                        // BX7: COIN-M, when `products` arms it — its
+                        // market data on the arm's network too (BX-16).
+                        let coinm: Vec<core_config::universe::Instrument> = boot
+                            .allocated
+                            .bn_coinm
+                            .iter()
+                            .chain(boot.allocated.bn_coinm_dated.iter())
+                            .cloned()
+                            .collect();
+                        let armed = |w: &str| {
+                            eb.binance.as_ref().is_some_and(|b| b.products.iter().any(|p| p == w))
+                        };
+                        let mut md_hosts = vec![
+                            cfg.binance_fut_ws_host.as_str(),
+                            cfg.binance_fut_rest_host.as_str(),
+                        ];
+                        if armed("coinm") {
+                            md_hosts.push(cfg.binance_coinm_ws_host.as_str());
+                            md_hosts.push(cfg.binance_coinm_rest_host.as_str());
+                        }
+                        // BX8: spot's books and its discovery on the arm's
+                        // network too (BX-16).
+                        if armed("spot") {
+                            md_hosts.push(cfg.binance_ws_host.as_str());
+                            md_hosts.push(cfg.binance_rest_host.as_str());
+                        }
+                        // BX9: the options' marks and their discovery too.
+                        if armed("options") {
+                            md_hosts.push(cfg.binance_eapi_ws_host.as_str());
+                            md_hosts.push(cfg.binance_eapi_rest_host.as_str());
+                        }
+                        let spec = cli::bn_live::BnSpec {
+                            eb: &eb,
+                            rows: &discovery.bn_fapi_rows,
+                            usdm: &usdm,
+                            cm_rows: &discovery.bn_dapi_rows,
+                            coinm: &coinm,
+                            spot_rows: &discovery.bn_spot_rows,
+                            spot: &boot.allocated.bn_spot,
+                            opt_chain: &discovery.bn_options,
+                            opt_rows: &discovery.bn_option_rows,
+                            alias,
+                            md_hosts: &md_hosts,
+                            run_dir: &run_dir,
+                        };
+                        let Some(bn_cfg) = bn_arm_cfg.take() else {
+                            error!("exec: binance arm: its configuration was not built — boot aborted");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        };
+                        match cli::bn_live::boot_binance_arm(
+                            &spec,
+                            bn_cfg,
+                            TlsTransport::default_client_config(),
+                            f4p,
+                        ) {
+                            Ok(b) => {
+                                warn!("{}", b.tell);
+                                handles.push(b.handle);
+                                Some((b.arm, b.specs))
+                            }
+                            Err(reason) => {
+                                error!(%reason, "exec: binance arm refused — boot aborted");
+                                join_reverse(handles);
+                                return ExitCode::from(1);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    // **XMM XH4f — slot 6's own arm, the Hyperliquid
+                    // gateway** (on the market data's network, XH5b-3):
+                    // the member's perps bound from the exchange host's
+                    // meta, their leverage set before it takes orders, its
+                    // thread released only after the loop (the arm's
+                    // shutdown pumps it in the drain). Beside the
+                    // operator's arm on either network (XH5a), beside
+                    // slot 0 or a Binance slot on mainnet alone (asked
+                    // right after `resolve`, XH5b-3); it draws from its
+                    // agent's nonce stream (XH4h S3). Booted last: no
+                    // refusal after it but the shapes' own.
+                    // **XMM XH4i-5 — slot 3's own arm, the Hyperliquid
+                    // gateway in its outcome mode**, when the artifact puts
+                    // slot 3 there (`transport = "gateway"`; the default is
+                    // the blocking arm): BIN15's legs off the engine thread,
+                    // on the operator's account (`exec_boot` refused it
+                    // beside the blocking arm and beside slot 6's gateway).
+                    // Its thread is released after the loop, as slot 6's.
+                    let bin15_gw = if eb.bin15_gateway_live() {
+                        match cli::bin15_live::boot_bin15_arm(
+                            &eb,
                             bin15_boot.as_ref(),
-                            icdp_params.as_ref(),
-                            regime_boot.as_ref(),
-                        )
+                            &cfg.hyperliquid_ws_host,
+                            TlsTransport::default_client_config(),
+                            &mut nonces,
+                        ) {
+                            Ok(b) => {
+                                warn!("{}", b.tell);
+                                bin15_stop = Some(b.stop);
+                                handles.push(b.handle);
+                                Some(b.arm)
+                            }
+                            Err(reason) => {
+                                error!(%reason, "bin15: slot 3's gateway arm refused — boot aborted");
+                                join_reverse(handles);
+                                return ExitCode::from(1);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    // The innermost split's slot: 3 with its arm; none
+                    // (`NO_SLOT`) without — every verb to the shape's arms.
+                    let bin15_slot = if bin15_gw.is_some() {
+                        cli::exec_boot::BIN15_SLOT as u8
+                    } else {
+                        exec_router::NO_SLOT
+                    };
+                    let xmm_arm = if eb.gateway_live().is_some() {
+                        let spec = cli::xmm_live::XmmSpec {
+                            eb: &eb,
+                            xmm: xmm_boot.as_ref(),
+                            md_ws_host: &cfg.hyperliquid_ws_host,
+                        };
+                        match cli::xmm_live::boot_xmm_arm(
+                            &spec,
+                            TlsTransport::default_client_config(),
+                            &mut nonces,
+                        ) {
+                            Ok(b) => {
+                                warn!("{}", b.tell);
+                                xmm_stop = Some(b.stop);
+                                handles.push(b.handle);
+                                Some((b.arm, b.specs, b.network))
+                            }
+                            Err(reason) => {
+                                error!(%reason, "xmm: slot 6's gateway arm refused — boot aborted");
+                                if let Some(s) = &bin15_stop {
+                                    s.release();
+                                }
+                                join_reverse(handles);
+                                return ExitCode::from(1);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if nonces.signers() != 0 {
+                        info!(
+                            agents = nonces.agents(),
+                            signers = nonces.signers(),
+                            "exec: Hyperliquid nonce streams — one per agent address (XMM XH4h \
+                             S3): every signer of one agent draws from one stream"
+                        );
+                    }
+                    // The dispatcher types cannot share one binding (the
+                    // loop is monomorphised over `D`), so each shape enters
+                    // the loop from its own arm — enumerated, eight (O-BX30),
+                    // each alone or with slot 6 outermost (`SlotSplit`: XH4f,
+                    // XH5a; XH5b-3's `shape!`, sixteen compositions); the
+                    // halt wiring is one generic helper. Nothing armed
+                    // keeps the refusing stub, so LAW E-1 stays true by
+                    // construction. A Binance shape splits by route venue
+                    // (`VenueSplit`), built from the router's own route.
+                    let anchor = core_time::WallAnchor::now();
+                    let paper = clob_dispatcher::PaperDispatcher::new();
+                    let live_line = cli::exec_boot::render_slot_mask(eb.live_mask);
+                    let bn_venue = core_types::VenueId::Binance as u8;
+                    macro_rules! enter_loop {
+                        ($d:expr, $what:expr) => {{
+                            info!(live = %live_line, "{}", $what);
+                            engine_loop_set_full(
+                                cons,
+                                $d,
+                                obs,
+                                requested,
+                                vrp_boot.as_ref(),
+                                xsd_boot.as_ref(),
+                                bin15_boot.as_ref(),
+                                xmm_boot.as_ref(),
+                                hcv_boot.as_ref(),
+                                regime_boot.as_ref(),
+                                hyparb_boot.as_ref(),
+                                har_boot.as_ref(),
+                            )
+                        }};
+                    }
+                    // A refusal past the arms' boot: slot 3's or slot 6's
+                    // gateway (if any; never both) is released first, so the
+                    // join never waits out its grace.
+                    macro_rules! abort_boot {
+                        ($($log:tt)*) => {{
+                            error!($($log)*);
+                            if let Some(s) = &xmm_stop {
+                                s.release();
+                            }
+                            if let Some(s) = &bin15_stop {
+                                s.release();
+                            }
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }};
+                    }
+                    macro_rules! finish_bn {
+                        ($d:expr, $split_aliases:expr, $specs:expr) => {
+                            if let Err(reason) = finish_bn_boot(&mut $d, $split_aliases, &$specs) {
+                                abort_boot!(%reason, "exec: binance arm refused — boot aborted");
+                            }
+                        };
+                    }
+                    macro_rules! finish_xmm {
+                        ($d:expr, $specs:expr) => {
+                            if let Err(reason) = finish_xmm_boot(&mut $d, &$specs) {
+                                abort_boot!(%reason, "xmm: slot 6's gateway arm refused — boot aborted");
+                            }
+                        };
+                    }
+                    // XMM XH5b-3: every shape enters the loop through
+                    // `shape!` — alone, or with slot 6 outermost when its
+                    // gateway arm booted (`SlotSplit(6, <shape>, xmm)`):
+                    // one macro over the shapes, sixteen compositions, no
+                    // `dyn`. `bn(<specs>, <hops>)` names a shape's Binance
+                    // symbols and the path from the shape to its
+                    // `VenueSplit`, whose aliases the Binance arm finishes
+                    // with; slot 6's split adds one `a()`, slot 3's one more
+                    // (XMM XH4i-5: innermost, `SlotSplit(3, <shape>,
+                    // Option<arm>)` — no slot, `NO_SLOT`, when its gateway
+                    // arm is absent — so the compositions stay sixteen). A halt cancels
+                    // the halted slot's orders alone (XH5a,
+                    // `OrderDispatch::cancel_slot`), through every nesting.
+                    macro_rules! shape {
+                        (
+                            $inner:expr,
+                            $what:expr,
+                            $beside:expr
+                            $(, bn($specs:expr $(, $hop:ident)*))?
+                        ) => {
+                            // COPY: boot, once — the shape's arms move by
+                            // value into their splits and the router (KiB;
+                            // the gateway arms' 1 792 B noted at their
+                            // boots). Rejected: boxing (every verb would
+                            // chase a pointer).
+                            match xmm_arm {
+                                None => {
+                                    let inner =
+                                        exec_router::SlotSplit::new(bin15_slot, $inner, bin15_gw);
+                                    let mut d = exec_router::RoutedDispatcher::new(
+                                        eb.route, paper, inner, anchor,
+                                    );
+                                    wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                                    $(
+                                        let split_aliases = *d.live().a()$(.$hop())*.aliases();
+                                        finish_bn!(d, split_aliases, $specs);
+                                    )?
+                                    enter_loop!(d, $what)
+                                }
+                                Some((xmm, xspecs, net)) => {
+                                    let split = exec_router::SlotSplit::new(
+                                        cli::exec_boot::XMM_SLOT as u8,
+                                        exec_router::SlotSplit::new(bin15_slot, $inner, bin15_gw),
+                                        xmm,
+                                    );
+                                    let mut d = exec_router::RoutedDispatcher::new(
+                                        eb.route, paper, split, anchor,
+                                    );
+                                    wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                                    $(
+                                        let split_aliases = *d.live().a().a()$(.$hop())*.aliases();
+                                        finish_bn!(d, split_aliases, $specs);
+                                    )?
+                                    finish_xmm!(d, xspecs);
+                                    enter_loop!(d, xmm_line(net, $beside))
+                                }
+                            }
+                        };
+                    }
+                    const REAL: &str = "running strategy-set with LIVE slots — real orders will be \
+                                        submitted";
+                    match (hl_arm, bn_arm, hyparb_live) {
+                        (Some(arm), None, None) => shape!(arm, REAL, "the operator's arm"),
+                        (Some(arm), None, Some(live)) => shape!(
+                            exec_router::SlotSplit::new(cli::hyparb_live::SLOT, arm, live),
+                            "running strategy-set with LIVE slots on TWO arms (slot 0 on its own \
+                             wallet) — real orders will be submitted",
+                            "the operator's arm and slot 0's wallet"
+                        ),
+                        (None, None, Some(live)) => shape!(
+                            exec_router::SlotSplit::new(
+                                cli::hyparb_live::SLOT,
+                                exec_router::NullLiveDispatcher::new(),
+                                live,
+                            ),
+                            "running strategy-set with slot 0 LIVE on its own wallet — real \
+                             orders will be submitted",
+                            "slot 0's wallet"
+                        ),
+                        (None, None, None) => {
+                            // Nothing armed (but slot 6, if it booted): the
+                            // refusing stub, so a live slot on a venue with
+                            // no arm cannot exist here (already refused by
+                            // `exec_boot::resolve`).
+                            //
+                            // E6: `WallAnchor::now()` above is the anchor
+                            // the venue-fill ledger's 00:00Z day epoch
+                            // needs — an `Order`'s `ts_ns` is monotonic and
+                            // the day cap is a wall-clock fact. The ledger
+                            // is left UNSEEDED: every live PLACE is refused
+                            // until the arm's reconciler reports success.
+                            shape!(
+                                exec_router::NullLiveDispatcher::new(),
+                                "running strategy-set PAPER (exec artifact present, nothing \
+                                 armed) — no orders will be submitted",
+                                "no other arm"
+                            )
+                        }
+                        (None, Some((bn, specs)), None) => shape!(
+                            exec_router::VenueSplit::new(
+                                bn_venue,
+                                exec_router::NullLiveDispatcher::new(),
+                                bn,
+                                &eb.route,
+                            ),
+                            REAL,
+                            "the Binance arm",
+                            bn(specs)
+                        ),
+                        (Some(arm), Some((bn, specs)), None) => shape!(
+                            exec_router::VenueSplit::new(bn_venue, arm, bn, &eb.route),
+                            "running strategy-set with LIVE slots on TWO venue arms \
+                             (hyperliquid, binance) — real orders will be submitted",
+                            "the operator's arm and the Binance arm",
+                            bn(specs)
+                        ),
+                        (None, Some((bn, specs)), Some(live)) => shape!(
+                            exec_router::SlotSplit::new(
+                                cli::hyparb_live::SLOT,
+                                exec_router::VenueSplit::new(
+                                    bn_venue,
+                                    exec_router::NullLiveDispatcher::new(),
+                                    bn,
+                                    &eb.route,
+                                ),
+                                live,
+                            ),
+                            "running strategy-set with LIVE slots on TWO arms (binance; slot 0 \
+                             on its own wallet) — real orders will be submitted",
+                            "the Binance arm and slot 0's wallet",
+                            bn(specs, a)
+                        ),
+                        (Some(arm), Some((bn, specs)), Some(live)) => shape!(
+                            exec_router::SlotSplit::new(
+                                cli::hyparb_live::SLOT,
+                                exec_router::VenueSplit::new(bn_venue, arm, bn, &eb.route),
+                                live,
+                            ),
+                            "running strategy-set with LIVE slots on THREE arms (hyperliquid, \
+                             binance; slot 0 on its own wallet) — real orders will be submitted",
+                            "the operator's arm, the Binance arm and slot 0's wallet",
+                            bn(specs, a)
+                        ),
                     }
                 }
             }
@@ -3952,6 +6672,15 @@ fn run(args: RunArgs) -> ExitCode {
     };
 
     // -- Reverse-order join (ingress threads first, then obs) --
+    // XMM XH4f: the loop returned, so slot 6's arm is done with its
+    // gateway (its shutdown ran in the drain): release the thread. XMM
+    // XH4i-5: slot 3's, alike.
+    if let Some(s) = &xmm_stop {
+        s.release();
+    }
+    if let Some(s) = &bin15_stop {
+        s.release();
+    }
     join_reverse(handles);
     for h in obs_handles.into_iter().rev() {
         let name = h.thread().name().unwrap_or("<obs>").to_string();
@@ -3963,53 +6692,6 @@ fn run(args: RunArgs) -> ExitCode {
     exit_code
 }
 
-/// ICDP I5: read `icdp.toml`, resolve every descriptor against the boot
-/// universe, build the POD artifact the strategy consumes, hash the
-/// exact bytes (logged + stamped by the strategy). Boot-only.
-fn load_icdp_params(
-    path: Option<&std::path::Path>,
-    descriptors: &ingress_ai::DescriptorTable,
-) -> Result<strategy_icdp::IcdpParams, String> {
-    let owned;
-    let path: &std::path::Path = match path {
-        Some(p) => p,
-        None => {
-            owned = core_config::icdp::default_icdp_path().map_err(|e| e.to_string())?;
-            std::path::Path::new(&owned)
-        }
-    };
-    let (file, bytes) = core_config::icdp::load(path).map_err(|e| e.to_string())?;
-    let mut params = strategy_icdp::IcdpParams::EMPTY;
-    params.tf_ns = file.tf_ms.saturating_mul(1_000_000);
-    params.delta_ns = file.delta_ms.saturating_mul(1_000_000);
-    params.n = file.instruments.len();
-    params.hash = core_crypto::sha256(&bytes);
-    for (i, inst) in file.instruments.iter().enumerate() {
-        let (sym, _caps) = descriptors
-            .resolve(inst.descriptor.as_bytes())
-            .ok_or_else(|| format!("icdp: `{}` is not in the boot universe", inst.descriptor))?;
-        params.syms[i] = strategy_icdp::IcdpSymParams {
-            sym,
-            mu: inst.mu,
-            inv_sd: inst.inv_sd,
-            w: inst.w,
-            b: inst.b,
-            thr: inst.thr,
-            notional_1e6: inst.notional_usd_1e6,
-            spread_cap_1e9: inst.spread_cap_1e9,
-            entry_slip_1e9: inst.entry_slip_1e9,
-            exit_slip_1e9: inst.exit_slip_1e9,
-        };
-        info!(
-            descriptor = %inst.descriptor,
-            sym,
-            notional_usd_1e6 = inst.notional_usd_1e6,
-            thr_1e9 = inst.thr,
-            "icdp: instrument resolved"
-        );
-    }
-    Ok(params)
-}
 #[cfg(test)]
 mod strategy_name_pin {
     //! BIN15 O5: the regression pin for the arm/mask drift recorded on
@@ -4017,10 +6699,6 @@ mod strategy_name_pin {
     //! binary will not boot is a silent dark-engine bug — the wrapper
     //! passes the name, the process starts, capture runs, and only the
     //! mask gauge says the strategies never composed.
-
-    /// The one deliberate asymmetry: `latency-arb` is a mask name but
-    /// has its own `("latency-arb", false)` paper arm, never a set arm.
-    const EXEMPT: &[&str] = &["latency-arb"];
 
     /// Every bootable name must be a name the mask table can resolve —
     /// the arm body `expect`s exactly this.
@@ -4033,25 +6711,130 @@ mod strategy_name_pin {
                 strategy_set::mask_for_name(name).is_some(),
                 "{name} is bootable but mask_for_name does not know it"
             );
+            i += 1;
+        }
+    }
+
+    /// XMM XH5e: the preflight's `--strategy` is a bootable set holding the
+    /// xmm member — the engine-instance check's `bin15+xmm` among them.
+    #[test]
+    fn the_preflight_takes_a_bootable_set_holding_xmm() {
+        for ok in [
+            "xmm",
+            "ai+xmm",
+            "bin15+xmm",
+            "ai+vrp+xsd+bin15+hyparb+xmm+hcv",
+            "all",
+        ] {
+            assert!(super::holds_xmm(ok), "{ok}");
+        }
+        for no in [
+            "bin15",
+            "ai",
+            "ai+vrp+xsd+bin15+hyparb",
+            "xmm+bin15",
+            "xmmx",
+            "",
+        ] {
+            assert!(!super::holds_xmm(no), "{no}");
+        }
+    }
+
+    /// Every name the mask table accepts must be bootable. This is the
+    /// direction that failed on 2026-09-12. (HYPARB H0 retired the one
+    /// exemption, `latency-arb`, with its standalone arm — O-H1.)
+    #[test]
+    fn every_mask_name_is_bootable() {
+        let mut i = 0;
+        while i < strategy_set::MASK_TABLE.len() {
+            let (name, _mask) = strategy_set::MASK_TABLE[i];
             assert!(
-                !EXEMPT.contains(&name),
-                "{name} is exempt and must not also be bootable"
+                super::STRATEGY_SET_NAMES.contains(&name),
+                "mask_for_name accepts {name} but the boot arm refuses it"
             );
             i += 1;
         }
     }
 
-    /// Every name the mask table accepts must be bootable or exempt.
-    /// This is the direction that failed on 2026-09-12.
+    /// HYPARB H0 (O-H1): `latency-arb` is gone as a name — neither the
+    /// mask table nor the boot arm knows it, so the old wrapper line
+    /// refuses the boot instead of composing a different member — and
+    /// the three slot-0 names resolve to bit 0.
     #[test]
-    fn every_mask_name_is_bootable_or_exempt() {
+    fn latency_arb_is_refused_and_the_hyparb_names_resolve() {
+        assert_eq!(strategy_set::mask_for_name("latency-arb"), None);
+        assert!(!super::STRATEGY_SET_NAMES.contains(&"latency-arb"));
+        let want = [
+            ("hyparb", strategy_set::BIT_HYPARB),
+            (
+                "ai+hyparb",
+                strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_HYPARB,
+            ),
+            (
+                "ai+vrp+xsd+bin15+hyparb",
+                strategy_set::BIT_AI_EXEC
+                    | strategy_set::BIT_VM
+                    | strategy_set::BIT_VRP
+                    | strategy_set::BIT_XSD
+                    | strategy_set::BIT_BIN15
+                    | strategy_set::BIT_HYPARB,
+            ),
+        ];
         let mut i = 0;
-        while i < strategy_set::MASK_TABLE.len() {
-            let (name, _mask) = strategy_set::MASK_TABLE[i];
-            assert!(
-                super::STRATEGY_SET_NAMES.contains(&name) || EXEMPT.contains(&name),
-                "mask_for_name accepts {name} but the boot arm refuses it"
-            );
+        while i < want.len() {
+            let (name, mask) = want[i];
+            assert!(super::STRATEGY_SET_NAMES.contains(&name), "{name}");
+            assert_eq!(strategy_set::mask_for_name(name), Some(mask), "{name}");
+            i += 1;
+        }
+    }
+
+    /// XMM XH1 (O-XH1): `icdp` and `ai+icdp` are gone as names — the
+    /// old wrapper line refuses the boot instead of composing a different
+    /// member — and the three slot-6 names resolve to bit 6.
+    #[test]
+    fn icdp_is_refused_and_the_xmm_names_resolve() {
+        assert_eq!(strategy_set::mask_for_name("icdp"), None);
+        assert_eq!(strategy_set::mask_for_name("ai+icdp"), None);
+        assert!(!super::STRATEGY_SET_NAMES.contains(&"icdp"));
+        assert!(!super::STRATEGY_SET_NAMES.contains(&"ai+icdp"));
+        let want = [
+            ("xmm", strategy_set::BIT_XMM),
+            (
+                "ai+xmm",
+                strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_XMM,
+            ),
+            (
+                "ai+vrp+xsd+bin15+hyparb+xmm",
+                strategy_set::BUILT_MASK & !strategy_set::BIT_HCV,
+            ),
+        ];
+        let mut i = 0;
+        while i < want.len() {
+            let (name, mask) = want[i];
+            assert!(super::STRATEGY_SET_NAMES.contains(&name), "{name}");
+            assert_eq!(strategy_set::mask_for_name(name), Some(mask), "{name}");
+            i += 1;
+        }
+    }
+
+    /// HC11 (O-HC18): the three slot-7 names resolve to bit 7, and the
+    /// widest one composes every slot.
+    #[test]
+    fn the_hcv_names_resolve() {
+        let want = [
+            ("hcv", strategy_set::BIT_HCV),
+            (
+                "ai+hcv",
+                strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_HCV,
+            ),
+            ("ai+vrp+xsd+bin15+hyparb+xmm+hcv", strategy_set::BUILT_MASK),
+        ];
+        let mut i = 0;
+        while i < want.len() {
+            let (name, mask) = want[i];
+            assert!(super::STRATEGY_SET_NAMES.contains(&name), "{name}");
+            assert_eq!(strategy_set::mask_for_name(name), Some(mask), "{name}");
             i += 1;
         }
     }
@@ -4098,6 +6881,195 @@ mod strategy_name_pin {
             );
             assert_eq!(strategy_set::mask_for_name(name), Some(mask), "{name}");
             i += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod exec_smoke_args {
+    //! BX11 (the parser review's P-2): the account tools take their own
+    //! flags and no other (`BN_TOOL_CONFLICTS`).
+    use clap::{CommandFactory, Parser};
+
+    /// The account tools' own flags.
+    const TOOLS: [&str; 12] = [
+        "binance_setup",
+        "binance_flatten",
+        "bn_network",
+        "confirm",
+        "bn_symbol",
+        "bn_leverage",
+        "bn_leverage_cap",
+        "bn_sign_tradfi",
+        "bn_reassert",
+        "bn_cancel_first",
+        "bn_close_bps",
+        "bn_ops_hmac",
+    ];
+
+    /// Every `exec-smoke` flag that is not a tool's own conflicts with both
+    /// tools — a flag added later without joining the list fails here.
+    #[test]
+    fn each_tool_conflicts_with_every_flag_not_its_own() {
+        let cli = super::Cli::command();
+        let smoke = cli.find_subcommand("exec-smoke").expect("exec-smoke");
+        for tool in ["binance_setup", "binance_flatten"] {
+            let t = smoke.get_arguments().find(|a| a.get_id() == tool).expect("the tool's flag");
+            let conflicts = smoke.get_arg_conflicts_with(t);
+            for a in smoke.get_arguments() {
+                let id = a.get_id().as_str();
+                if TOOLS.contains(&id) || id == "help" {
+                    continue;
+                }
+                assert!(conflicts.iter().any(|c| c.get_id() == id), "`{id}` parses beside `{tool}`");
+            }
+        }
+    }
+
+    /// The reviewer's case and its kin are refused; the tools' own flags
+    /// still parse.
+    #[test]
+    fn a_battery_flag_beside_a_tool_is_refused() {
+        let refused: [&[&str]; 6] = [
+            &["--binance-flatten", "um", "--bn-um-symbol", "ETHUSDT"],
+            &["--binance-flatten", "um", "--bn-network", "mainnet", "--confirm", "--bn-um-symbol", "ETHUSDT"],
+            &["--binance-setup", "um", "--bn-rest"],
+            &["--binance-setup", "cm", "--bn-cm-symbol", "BTCUSD_PERP"],
+            &["--binance-flatten", "um", "--bn-drill", "gap"],
+            &["--binance-flatten", "um", "--px", "1"],
+        ];
+        for args in refused {
+            let mut argv = vec!["multivenue-engine", "exec-smoke"];
+            argv.extend_from_slice(args);
+            assert!(super::Cli::try_parse_from(&argv).is_err(), "{argv:?} parsed");
+        }
+        // The parser review's P2-2: a tool's flag beside another mode, and
+        // no tool, is refused too (clap waives a `requires` of a flag that
+        // conflicts with one present; a group's, never).
+        let modes: [&[&str]; 4] = [&["--lifecycle"], &["--offline"], &["--binance", "um", "--lifecycle"], &["--binance-probe"]];
+        let owns: [&[&str]; 10] = [
+            &["--bn-leverage", "5"],
+            &["--bn-leverage-cap", "10"],
+            &["--bn-sign-tradfi"],
+            &["--bn-reassert"],
+            &["--bn-cancel-first"],
+            &["--bn-close-bps", "50"],
+            &["--bn-network", "mainnet"],
+            &["--confirm"],
+            &["--bn-symbol", "BTCUSDT"],
+            &["--bn-ops-hmac"],
+        ];
+        for mode in modes {
+            for own in owns {
+                let mut argv = vec!["multivenue-engine", "exec-smoke"];
+                argv.extend_from_slice(mode);
+                argv.extend_from_slice(own);
+                assert!(super::Cli::try_parse_from(&argv).is_err(), "{argv:?} parsed");
+            }
+        }
+        let ok: [&[&str]; 2] = [
+            &["--binance-flatten", "um", "--bn-symbol", "BTCUSDT", "--bn-network", "mainnet", "--confirm", "--bn-cancel-first"],
+            &["--binance-setup", "cm", "--bn-symbol", "BTCUSD_PERP", "--bn-leverage", "5", "--bn-reassert"],
+        ];
+        for args in ok {
+            let mut argv = vec!["multivenue-engine", "exec-smoke"];
+            argv.extend_from_slice(args);
+            assert!(super::Cli::try_parse_from(&argv).is_ok(), "{argv:?} refused");
+        }
+    }
+
+    /// `exec-smoke <args>`'s parse.
+    fn smoke(args: &[&str]) -> Result<super::ExecSmokeArgs, clap::Error> {
+        let mut argv = vec!["multivenue-engine", "exec-smoke"];
+        argv.extend_from_slice(args);
+        super::Cli::try_parse_from(&argv).map(|c| match c.cmd {
+            super::Cmd::ExecSmoke(a) => a,
+            _ => panic!("not exec-smoke"),
+        })
+    }
+
+    /// BX8: the probe's word is `futures` — alone, the K-probes as before —
+    /// or `spot`, nothing else; the battery's spot flags need `--binance`
+    /// (alone, each is refused) and default to BTCUSDT and the Demo
+    /// adoption cap; the product list's words are the battery's to judge.
+    #[test]
+    fn spots_flags_parse_where_they_belong() {
+        assert_eq!(smoke(&["--binance-probe"]).unwrap().binance_probe.as_deref(), Some("futures"));
+        assert_eq!(smoke(&["--binance-probe", "spot"]).unwrap().binance_probe.as_deref(), Some("spot"));
+        assert_eq!(smoke(&["--binance-probe", "options"]).unwrap().binance_probe.as_deref(), Some("options"));
+        assert_eq!(smoke(&["--binance-probe", "equity"]).unwrap().binance_probe.as_deref(), Some("equity"), "BX10 (S-1)");
+        assert!(smoke(&["--binance-probe", "equity", "--bn-stream-confirm"]).unwrap().bn_stream_confirm);
+        assert!(smoke(&["--bn-stream-confirm"]).is_err(), "the probe's word, with the probe only");
+        assert!(smoke(&["--binance-probe", "equity", "--confirm"]).is_err(), "the account tools' word is theirs");
+        assert_eq!(smoke(&["--binance-probe=futures"]).unwrap().binance_probe.as_deref(), Some("futures"));
+        assert_eq!(smoke(&["--offline"]).unwrap().binance_probe, None);
+        assert!(smoke(&["--binance-probe", "coinm"]).is_err(), "an unknown probe word");
+        assert!(smoke(&["--binance-probe", "spot", "--lifecycle"]).is_err());
+        let a = smoke(&["--binance", "um,spot", "--lifecycle"]).unwrap();
+        assert_eq!((a.binance.as_deref(), a.bn_spot_symbol.as_str(), a.bn_adopt_usd), (Some("um,spot"), "BTCUSDT", None), "Demo's default at the spec");
+        let a = smoke(&["--binance", "spot", "--lifecycle", "--bn-spot-symbol", "TSLABUSDT", "--bn-adopt-usd", "0"]).unwrap();
+        assert_eq!((a.bn_spot_symbol.as_str(), a.bn_adopt_usd), ("TSLABUSDT", Some(0)));
+        for orphan in [&["--bn-spot-symbol", "BTCUSDT"][..], &["--bn-adopt-usd", "5"][..]] {
+            assert!(smoke(orphan).is_err(), "{orphan:?} parsed without --binance");
+        }
+        assert_eq!(cli::bn_battery::parse_products("um,spot"), Ok((true, false, true, false)));
+        assert_eq!(cli::bn_battery::parse_products("options"), Ok((false, false, false, true)), "BX9: the options battery");
+        let a = smoke(&["--binance", "options", "--lifecycle"]).unwrap();
+        assert_eq!(a.binance.as_deref(), Some("options"));
+    }
+
+    /// BX10 (S-3): the Binance Stocks battery's flags parse with
+    /// `--binance` only; the D5 keys have no default; the session and
+    /// tokenize take their words alone; equity runs alone.
+    #[test]
+    fn the_equity_batterys_flags_parse_where_they_belong() {
+        let a = smoke(&[
+            "--binance", "equity", "--lifecycle", "--bn-eq-session", "RTH", "--bn-eq-tokenize", "0", "--bn-eq-quote", "USDC", "--bn-usd", "6",
+            "--bn-confirm-mainnet",
+        ])
+        .unwrap();
+        assert_eq!(
+            (a.binance.as_deref(), a.bn_eq_symbol.as_str(), a.bn_eq_session.as_deref(), a.bn_eq_tokenize, a.bn_eq_quote.as_deref(), a.bn_eq_ttl_ms),
+            (Some("equity"), "AAPL", Some("RTH"), Some(0), Some("USDC"), 60_000)
+        );
+        assert!(a.bn_confirm_mainnet);
+        let a = smoke(&["--binance", "equity", "--lifecycle"]).unwrap();
+        assert_eq!((a.bn_eq_session, a.bn_eq_tokenize, a.bn_eq_quote, a.bn_confirm_mainnet), (None, None, None, false), "no D5 default; no word");
+        assert!(smoke(&["--binance", "equity", "--lifecycle", "--bn-eq-tokenize", "2"]).is_err());
+        assert!(smoke(&["--binance", "equity", "--lifecycle", "--bn-eq-session", "rth"]).is_err());
+        for orphan in [&["--bn-confirm-mainnet"][..], &["--bn-eq-session", "RTH"][..], &["--bn-eq-quote", "USDC"][..]] {
+            assert!(smoke(orphan).is_err(), "{orphan:?} parsed without --binance");
+        }
+        assert!(cli::bn_battery::parse_products("um,equity").is_err(), "equity runs alone");
+    }
+
+    /// BX13: the R0 ramp's reach parses with `--binance` only, takes the
+    /// battery's word, and refuses the counts R0 fixes (a count passed
+    /// beside the reach would be read as nothing); the account tools'
+    /// reach and word stay theirs.
+    #[test]
+    fn the_r0_reach_parses_where_it_belongs() {
+        let a = smoke(&["--binance", "um,cm,spot", "--lifecycle", "--bn-mainnet", "--bn-confirm-mainnet"]).unwrap();
+        assert!(a.bn_mainnet && a.bn_confirm_mainnet);
+        let a = smoke(&["--binance", "options", "--lifecycle", "--bn-mainnet"]).unwrap();
+        assert!(a.bn_mainnet && !a.bn_confirm_mainnet, "the plan only: no word");
+        let a = smoke(&["--binance", "um", "--lifecycle", "--bn-mainnet", "--bn-drill", "gap", "--bn-confirm-mainnet"]).unwrap();
+        assert_eq!(a.bn_drill.as_deref(), Some("gap"), "the dead-man's R0 bar is the gap drill's run");
+        assert!(!smoke(&["--binance", "um", "--lifecycle"]).unwrap().bn_mainnet, "Demo by default");
+        // The parser review's round 2: beside equity (mainnet by nature)
+        // the reach is refused before anything runs.
+        let eq = smoke(&["--binance", "equity", "--lifecycle", "--bn-mainnet"]).unwrap();
+        assert!(super::equity_reach_refused(&eq).is_some(), "the R0 reach beside the Stocks battery");
+        assert!(super::equity_reach_refused(&smoke(&["--binance", "equity", "--lifecycle"]).unwrap()).is_none());
+        for refused in [
+            &["--bn-mainnet"][..],
+            &["--binance", "um", "--lifecycle", "--bn-mainnet", "--bn-cycles", "20"][..],
+            &["--binance", "cm", "--lifecycle", "--bn-mainnet", "--bn-fill-pairs", "20"][..],
+            &["--binance", "um", "--lifecycle", "--bn-network", "mainnet"][..],
+            &["--binance", "um", "--lifecycle", "--bn-mainnet", "--confirm"][..],
+            &["--binance-flatten", "um", "--bn-mainnet"][..],
+        ] {
+            assert!(smoke(refused).is_err(), "{refused:?} parsed");
         }
     }
 }

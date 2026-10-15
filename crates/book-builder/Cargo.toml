@@ -12,7 +12,6 @@ description  = "Consumes Polymarket book deltas + trades, maintains a fixed-dept
 path = "src/lib.rs"
 
 [dependencies]
-core-ring  = { workspace = true }
 core-time  = { workspace = true }
 core-types = { workspace = true }
 

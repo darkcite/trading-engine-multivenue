@@ -129,7 +129,7 @@ def logs_dir(env: typing.Mapping[str, str] | None = None) -> pathlib.Path:
 # ---- words + neighbourhood ----
 
 
-def effective_words(  # noqa: PLR0913 — one parameter per source, deliberately
+def effective_words(  # one parameter per source, deliberately
     directory: pathlib.Path,
     now_ms: int,
     *,
@@ -147,7 +147,12 @@ def effective_words(  # noqa: PLR0913 — one parameter per source, deliberately
     words, source = claude_worker.regime.current_words(directory, now_ms, url)
     if source != "unknown":
         return words, source
-    if regime_toml is not None and candles_db is not None and regime_toml.is_file() and candles_db.is_file():
+    if (
+        regime_toml is not None
+        and candles_db is not None
+        and regime_toml.is_file()
+        and candles_db.is_file()
+    ):
         m = claude_worker.regime.measure(regime_toml, candles_db, now_ms)
         return claude_worker.regime.measured_words(m), "measured"
     return words, source
@@ -176,7 +181,10 @@ def neighbourhood(words: dict[str, int]) -> list[dict[str, int]]:
 
 
 def words_hex(words: dict[str, int]) -> dict[str, str]:
-    return {n: f"{words.get(n, claude_worker.regime.UNKNOWN_WORD):016x}" for n in claude_worker.regime.PROFILE_NAMES}
+    return {
+        n: f"{words.get(n, claude_worker.regime.UNKNOWN_WORD):016x}"
+        for n in claude_worker.regime.PROFILE_NAMES
+    }
 
 
 # ---- rule-8 identity + regions (validator mirror, conservative) ----
@@ -194,10 +202,10 @@ def _rel_nibbles(terms: typing.Iterable[str]) -> tuple[int, int]:
     for t in terms:
         parts = t.split(":")
         profile = 0
-        if len(parts) == 3:  # noqa: PLR2004 — profile:dim:values
+        if len(parts) == 3:  # profile:dim:values
             profile = 1 if parts[0] == "slow" else 0
             parts = parts[1:]
-        if len(parts) != 2 or parts[0] != "rel":  # noqa: PLR2004 — dim:values
+        if len(parts) != 2 or parts[0] != "rel":  # dim:values
             continue
         values = parts[1]
         if values == "*":
@@ -246,7 +254,9 @@ def _labels_intersect(a: int, b: int) -> bool:
 def regions_intersect(a: Region, b: Region) -> bool:
     rel_f = a.rel_fast == 0 or b.rel_fast == 0 or (a.rel_fast & b.rel_fast) != 0
     rel_s = a.rel_slow == 0 or b.rel_slow == 0 or (a.rel_slow & b.rel_slow) != 0
-    return _labels_intersect(a.fast, b.fast) and _labels_intersect(a.slow, b.slow) and rel_f and rel_s
+    return (
+        _labels_intersect(a.fast, b.fast) and _labels_intersect(a.slow, b.slow) and rel_f and rel_s
+    )
 
 
 def rows_conflict(a: typing.Mapping[str, object], b: typing.Mapping[str, object]) -> bool:
@@ -333,7 +343,7 @@ def _fast_hex(words: dict[str, int]) -> str:
     return f"{words.get('fast', claude_worker.regime.UNKNOWN_WORD):016x}"
 
 
-def select_members(  # noqa: PLR0913 — one parameter per selection knob, deliberately
+def select_members(  # one parameter per selection knob, deliberately
     state: claude_worker.state.State,
     directory: pathlib.Path,
     words: dict[str, int],
@@ -380,14 +390,22 @@ def select_members(  # noqa: PLR0913 — one parameter per selection knob, delib
         elif fit_from_evidence and _evidence_fit(evidence, nb_fast, min_windows):
             fit = "evidence"
         else:
-            skipped.append((row.name, f"no fit for {claude_worker.regime.describe(words.get('fast', 0))} (labels {claude_worker.library.describe_labels(member.labels)})"))
+            skipped.append(
+                (
+                    row.name,
+                    f"no fit for {claude_worker.regime.describe(words.get('fast', 0))} (labels "
+                    f"{claude_worker.library.describe_labels(member.labels)})",
+                )
+            )
             continue
         selected.append(Selected(member, fit, summary))
     selected.sort(key=lambda s: (-s.evidence.net_usd_tier, -s.evidence.windows, s.member.name))
     return selected, skipped
 
 
-def admit(selected: list[Selected]) -> tuple[list[Selected], list[dict[str, object]], list[tuple[str, str]]]:
+def admit(
+    selected: list[Selected],
+) -> tuple[list[Selected], list[dict[str, object]], list[tuple[str, str]]]:
     """Step 2: admit members in order while rule 5 (names), rule 8
     (identity ∩ region) and rule 7 (caps) hold for the growing table."""
     admitted: list[Selected] = []
@@ -403,7 +421,10 @@ def admit(selected: list[Selected]) -> tuple[list[Selected], list[dict[str, obje
                 break
             for prior in rows:
                 if rows_conflict(prior, row):
-                    reason = f"row {name!r} duplicates {prior.get('name')!r} on an intersecting region (rule 8)"
+                    reason = (
+                        f"row {name!r} duplicates {prior.get('name')!r} on an intersecting region "
+                        "(rule 8)"
+                    )
                     break
             if reason is not None:
                 break
@@ -418,7 +439,7 @@ def admit(selected: list[Selected]) -> tuple[list[Selected], list[dict[str, obje
     return admitted, rows, skipped
 
 
-def compose(  # noqa: PLR0913 — one parameter per selection knob, deliberately
+def compose(  # one parameter per selection knob, deliberately
     state: claude_worker.state.State,
     directory: pathlib.Path,
     words: dict[str, int],
@@ -441,7 +462,11 @@ def compose(  # noqa: PLR0913 — one parameter per selection knob, deliberately
     )
     admitted, rows, more = admit(selected)
     if not admitted:
-        raise ComposeError("no member fits — " + "; ".join(f"{n}: {r}" for n, r in skipped + more) if skipped + more else "no member fits (empty library?)")
+        raise ComposeError(
+            "no member fits — " + "; ".join(f"{n}: {r}" for n, r in skipped + more)
+            if skipped + more
+            else "no member fits (empty library?)"
+        )
     data = claude_worker.strategist.artifact_bytes(rows)
     full_hash = claude_worker.library.member_id_of(rows)
     return Composition(
@@ -472,7 +497,10 @@ def thesis_of(composition: Composition) -> str:
     parts = [f"{s.member.name}({s.member.member_id[:12]},{s.fit})" for s in composition.members]
     fast = claude_worker.regime.describe(composition.words.get("fast", 0))
     slow = claude_worker.regime.describe(composition.words.get("slow", 0))
-    return f"composed ({composition.words_source}) fast=[{fast}] slow=[{slow}] members: " + ", ".join(parts)
+    return (
+        f"composed ({composition.words_source}) fast=[{fast}] slow=[{slow}] members: "
+        + ", ".join(parts)
+    )
 
 
 # ---- gate ----
@@ -481,7 +509,9 @@ def thesis_of(composition: Composition) -> str:
 class WallBudget:
     """The 2 h ceiling every gate run is charged to (fail, never wait)."""
 
-    def __init__(self, budget_s: float = WALL_BUDGET_S, clock: typing.Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self, budget_s: float = WALL_BUDGET_S, clock: typing.Callable[[], float] = time.monotonic
+    ) -> None:
         self._clock = clock
         self._start = clock()
         self.budget_s = budget_s
@@ -492,7 +522,9 @@ class WallBudget:
     def check(self, step: str) -> None:
         elapsed = self.elapsed()
         if elapsed >= self.budget_s:
-            raise BudgetExceeded(f"{step}: wall budget {self.budget_s:.0f} s exhausted after {elapsed:.0f} s")
+            raise BudgetExceeded(
+                f"{step}: wall budget {self.budget_s:.0f} s exhausted after {elapsed:.0f} s"
+            )
 
 
 class GateVerdict(typing.NamedTuple):
@@ -530,13 +562,13 @@ def _report_regime_block(report_path: pathlib.Path) -> dict[str, object] | None:
     report or an unreadable file)."""
     try:
         obj = json.loads(report_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return None
     block = obj.get("regime") if isinstance(obj, dict) else None
     return block if isinstance(block, dict) and block.get("labelled") else None
 
 
-def gate(  # noqa: PLR0913, PLR0917 — one parameter per gate input, deliberately
+def gate(  # noqa: PLR0913 — one parameter per gate input, deliberately
     state: claude_worker.state.State,
     composition: Composition,
     composition_path: pathlib.Path,
@@ -576,11 +608,15 @@ def gate(  # noqa: PLR0913, PLR0917 — one parameter per gate input, deliberate
                 if w.name in have:
                     continue
                 wall.check(f"evidence {s.member.name} {w.name}")
-                ev = claude_worker.library.run_evidence(state, s.member, w, work_dir, fees=fees, run_fn=run_fn, ts=ts)
+                ev = claude_worker.library.run_evidence(
+                    state, s.member, w, work_dir, fees=fees, run_fn=run_fn, ts=ts
+                )
                 evidence_runs += 1
                 report(
-                    f"{_TELL} evidence: {s.member.name} {w.name} fills={ev.n_fills} tier={ev.net_usd_tier:+.2f}"
-                    f" zero={ev.net_usd_0:+.2f} judged={ev.judged} word={ev.regime_word_mode or '-'}"
+                    f"{_TELL} evidence: {s.member.name} {w.name} fills={ev.n_fills} "
+                    f"tier={ev.net_usd_tier:+.2f}"
+                    f" zero={ev.net_usd_0:+.2f} judged={ev.judged} "
+                    f"word={ev.regime_word_mode or '-'}"
                 )
         # the pooled frozen gate — the report a stage binds on
         wall.check("pooled gate")
@@ -588,13 +624,18 @@ def gate(  # noqa: PLR0913, PLR0917 — one parameter per gate input, deliberate
         pooled = outcome.gates
         pooled_net = outcome.harness.oos_net_pnl_usd
         report_path = outcome.report_path
+        h = outcome.harness
+        legs = h.oos_legs if h.oos_legs >= 0 else h.oos_trades
         report(
-            f"{_TELL} pooled: net={pooled_net:+.2f} legs={outcome.harness.oos_legs if outcome.harness.oos_legs >= 0 else outcome.harness.oos_trades}"
+            f"{_TELL} pooled: net={pooled_net:+.2f} legs={legs}"
             f" rt={outcome.harness.oos_round_trips} days={outcome.harness.oos_trading_days}"
-            f" dd={outcome.harness.oos_max_drawdown_usd:.2f} -> {'PASS' if pooled.all_passed else 'FAIL'}"
+            f" dd={outcome.harness.oos_max_drawdown_usd:.2f} -> "
+            f"{'PASS' if pooled.all_passed else 'FAIL'}"
         )
         if not pooled.all_passed:
-            reasons.append("pooled gates: " + ", ".join(k for k, v in pooled._asdict().items() if not v))
+            reasons.append(
+                "pooled gates: " + ", ".join(k for k, v in pooled._asdict().items() if not v)
+            )
         # the on/off delta: the labels must not be worse than their absence.
         # RG8: for a LABELLED table the frozen run above already replayed
         # `--regime off` (the earned-label gate) and recorded it in the
@@ -605,7 +646,9 @@ def gate(  # noqa: PLR0913, PLR0917 — one parameter per gate input, deliberate
         if regime_block is not None and regime_block.get("net_off") is not None:
             off_net = float(typing.cast(float, regime_block["net_off"]))
         else:
-            off = claude_worker.backtest.run_harness_extra(composition_path, pool_dir, extra_flags=_regime_off_flags(), run_fn=run_fn)
+            off = claude_worker.backtest.run_harness_extra(
+                composition_path, pool_dir, extra_flags=_regime_off_flags(), run_fn=run_fn
+            )
             off_net = off.harness.oos_net_pnl_usd
         report(f"{_TELL} regime off: net={off_net:+.2f} delta(on-off)={pooled_net - off_net:+.2f}")
         if pooled_net - off_net < 0:
@@ -614,8 +657,12 @@ def gate(  # noqa: PLR0913, PLR0917 — one parameter per gate input, deliberate
         if lowo:
             for k, held_out in enumerate(windows):
                 wall.check(f"lowo {held_out.name}")
-                root = claude_worker.window_root.symlink_root(work_dir / f"lowo-{k}", [w for w in windows if w is not held_out])
-                res = claude_worker.backtest.run_harness_extra(composition_path, root, run_fn=run_fn)
+                root = claude_worker.window_root.symlink_root(
+                    work_dir / f"lowo-{k}", [w for w in windows if w is not held_out]
+                )
+                res = claude_worker.backtest.run_harness_extra(
+                    composition_path, root, run_fn=run_fn
+                )
                 lowo_nets.append((held_out.name, res.harness.oos_net_pnl_usd))
                 report(f"{_TELL} lowo -{held_out.name}: net={res.harness.oos_net_pnl_usd:+.2f}")
             bad = [w for w, n in lowo_nets if n <= 0]
@@ -623,10 +670,25 @@ def gate(  # noqa: PLR0913, PLR0917 — one parameter per gate input, deliberate
                 reasons.append("lowo: OOS net <= 0 without " + ", ".join(bad))
     except BudgetExceeded as exc:
         reasons.append(str(exc))
-    except (claude_worker.backtest.BacktestError, claude_worker.library.LibraryError, OSError) as exc:
+    except (
+        claude_worker.backtest.BacktestError,
+        claude_worker.library.LibraryError,
+        OSError,
+    ) as exc:
         reasons.append(f"harness: {exc}")
     passed = not reasons
-    return GateVerdict(passed, reasons, pooled, pooled_net, off_net, lowo_nets, evidence_runs, names, wall.elapsed(), report_path)
+    return GateVerdict(
+        passed,
+        reasons,
+        pooled,
+        pooled_net,
+        off_net,
+        lowo_nets,
+        evidence_runs,
+        names,
+        wall.elapsed(),
+        report_path,
+    )
 
 
 # ---- promote ----
@@ -645,13 +707,13 @@ def metrics_table_epoch(url: str, timeout_s: float = 2.0) -> int | None:
     try:
         with urllib.request.urlopen(url, timeout=timeout_s) as resp:  # loopback only
             text = resp.read().decode("utf-8", errors="replace")
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return None
     for line in text.splitlines():
         if line.startswith("engine_vm_table_epoch "):
             try:
                 return int(line.split()[1])
-            except (IndexError, ValueError):
+            except IndexError, ValueError:
                 return None
     return None
 
@@ -673,18 +735,31 @@ def promote(  # noqa: PLR0913 — one parameter per promotion input, deliberatel
     """Step 5: FREEZE pin -> refuse; hash == active -> no-op; else install
     → stage → commit through the frozen pair, then watch ``table_epoch``."""
     if freeze_file.is_file():
-        return PromoteResult(False, f"promotion refused: {freeze_file} pin is set (soak)", None, None, None, None)
+        return PromoteResult(
+            False, f"promotion refused: {freeze_file} pin is set (soak)", None, None, None, None
+        )
     active = claude_worker.library.active_hash(state)
     if active == composition.full_hash:
-        return PromoteResult(False, f"already active: {composition.hash128}", None, None, None, None)
-    if claude_worker.library.active_canonical_hash(state, cfg.ai_ruleset_dir) == composition.full_hash:
+        return PromoteResult(
+            False, f"already active: {composition.hash128}", None, None, None, None
+        )
+    if (
+        claude_worker.library.active_canonical_hash(state, cfg.ai_ruleset_dir)
+        == composition.full_hash
+    ):
         return PromoteResult(
             False,
-            f"already active: the live table {(active or '')[:_HASH128_HEX]} carries these very rows"
+            f"already active: the live table {(active or '')[:_HASH128_HEX]} carries these very "
+            "rows"
             f" (non-canonical bytes) — no flip for {composition.hash128}",
-            None, None, None, None,
+            None,
+            None,
+            None,
+            None,
         )
-    installed = claude_worker.strategist.install_candidate(cfg.ai_ruleset_dir, composition_path, composition.hash128)
+    installed = claude_worker.strategist.install_candidate(
+        cfg.ai_ruleset_dir, composition_path, composition.hash128
+    )
     installed_report = claude_worker.backtest.report_path_for(installed)
     installed_report.write_bytes(report_path.read_bytes())
     url = claude_worker.regime.metrics_url() if metrics_url is None else metrics_url
@@ -693,14 +768,25 @@ def promote(  # noqa: PLR0913 — one parameter per promotion input, deliberatel
     client.connect()
     try:
         client.send_heartbeat()
-        staged_seq, full_hash = claude_worker.backtest.stage_ruleset(state, client, installed, installed_report, "session")
-        state.stage_ruleset(full_hash, str(installed), str(installed_report), "session", thesis=thesis_of(composition))
+        staged_seq, full_hash = claude_worker.backtest.stage_ruleset(
+            state, client, installed, installed_report, "session"
+        )
+        state.stage_ruleset(
+            full_hash,
+            str(installed),
+            str(installed_report),
+            "session",
+            thesis=thesis_of(composition),
+        )
         state.composition_mark(full_hash, "staged_ts")
         committed_seq = claude_worker.backtest.commit_ruleset(state, client, full_hash)
         state.composition_mark(full_hash, "committed_ts")
     finally:
         client.close()
-    report(f"{_TELL} promote: installed {installed.name}, staged seq={staged_seq}, committed seq={committed_seq}")
+    report(
+        f"{_TELL} promote: installed {installed.name}, staged seq={staged_seq}, committed "
+        f"seq={committed_seq}"
+    )
     epoch_after = epoch_before
     if epoch_before is not None:
         deadline = clock() + wait_s
@@ -714,7 +800,10 @@ def promote(  # noqa: PLR0913 — one parameter per promotion input, deliberatel
     elif epoch_after is not None and epoch_after > epoch_before:
         tell = f"promoted: table_epoch {epoch_before} -> {epoch_after}"
     else:
-        tell = f"frames sent but table_epoch stayed {epoch_before} within {wait_s:.0f} s — check the engine log (validator refusal?)"
+        tell = (
+            f"frames sent but table_epoch stayed {epoch_before} within {wait_s:.0f} s — check the "
+            "engine log (validator refusal?)"
+        )
     return PromoteResult(True, tell, staged_seq, committed_seq, epoch_before, epoch_after)
 
 
@@ -724,16 +813,19 @@ def promote(  # noqa: PLR0913 — one parameter per promotion input, deliberatel
 def render(composition: Composition) -> str:
     u = cap_usage(composition.rows)
     lines = [
-        f"{_TELL}: words ({composition.words_source}) fast=[{claude_worker.regime.describe(composition.words.get('fast', 0))}]"
+        f"{_TELL}: words ({composition.words_source}) "
+        f"fast=[{claude_worker.regime.describe(composition.words.get('fast', 0))}]"
         f" slow=[{claude_worker.regime.describe(composition.words.get('slow', 0))}]",
-        f"{_TELL}: table {composition.hash128} rows={u.rows} table=${u.table_usd:,.0f} max_symbol=${u.max_symbol_usd:,.0f}"
+        f"{_TELL}: table {composition.hash128} rows={u.rows} table=${u.table_usd:,.0f} "
+        f"max_symbol=${u.max_symbol_usd:,.0f}"
         f" members={len(composition.members)}",
     ]
     for s in composition.members:
         lines.append(
             f"  + {s.member.name} {s.member.member_id[:12]} fit={s.fit} rows={len(s.member.rows)}"
             f" labels={claude_worker.library.describe_labels(s.member.labels)}"
-            f" evidence={s.evidence.windows}w/{s.evidence.judged}j tier={s.evidence.net_usd_tier:+.2f}"
+            f" evidence={s.evidence.windows}w/{s.evidence.judged}j "
+            f"tier={s.evidence.net_usd_tier:+.2f}"
         )
     for name, reason in composition.skipped:
         lines.append(f"  - {name}: {reason}")
@@ -743,12 +835,27 @@ def render(composition: Composition) -> str:
 # ---- CLI ----
 
 
-def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — one dispatcher, one linear pipeline
+def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915 — one dispatcher, one linear pipeline
     parser = argparse.ArgumentParser(prog="claude_worker.compose")
-    parser.add_argument("--db", default=None, help=f"state.db (default ${claude_worker.library.DB_ENV})")
-    parser.add_argument("--library-dir", default=None, help=f"library dir (default ${claude_worker.library.LIBRARY_DIR_ENV})")
-    parser.add_argument("--regime-dir", default=None, help="worker regime state dir (declared.json)")
-    parser.add_argument("--regime", default=None, help='words: current | "<fast-decl>[;<slow-decl>]" (default: engine -> declaration -> measured)')
+    parser.add_argument(
+        "--db", default=None, help=f"state.db (default ${claude_worker.library.DB_ENV})"
+    )
+    parser.add_argument(
+        "--library-dir",
+        default=None,
+        help=f"library dir (default ${claude_worker.library.LIBRARY_DIR_ENV})",
+    )
+    parser.add_argument(
+        "--regime-dir", default=None, help="worker regime state dir (declared.json)"
+    )
+    parser.add_argument(
+        "--regime",
+        default=None,
+        help=(
+            'words: current | "<fast-decl>[;<slow-decl>]" (default: engine -> declaration -> '
+            'measured)'
+        ),
+    )
     parser.add_argument("--regime-toml", default=claude_worker.regime.REGIME_PATH_DEFAULT)
     parser.add_argument("--candles-db", default=None, help="candles.db for the measured fallback")
     parser.add_argument("--include-candidates", action="store_true")
@@ -759,23 +866,57 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911, PLR0912, PLR09
         help="admit unlabelled (ANY) members too — RG8 excludes them by default",
     )
     parser.add_argument("--min-windows", type=int, default=MIN_WINDOWS)
-    parser.add_argument("--dry-run", action="store_true", help="select + emit only (no harness run)")
-    parser.add_argument("--promote", action="store_true", help="on PASS: install -> stage -> commit (hash change only)")
-    parser.add_argument("--no-lowo", action="store_true", help="skip leave-one-window-out (evidence + pooled + off only)")
-    parser.add_argument("--pool", default=None, help="window pool dir (default <worker dir>/windows)")
-    parser.add_argument("--pool-size", type=int, default=claude_worker.window_root.POOL_SIZE_DEFAULT)
-    parser.add_argument("--no-refresh", action="store_true", help="use the pool as it is (no cut/prune)")
-    parser.add_argument("--logs", default=None, help=f"capture runs root (default ${LOGS_DIR_ENV} or {DEFAULT_LOGS_DIR})")
-    parser.add_argument("--fees", default=claude_worker.pnl_report.FEES_PATH_DEFAULT, help="fees.toml for evidence rows (or 'none')")
-    parser.add_argument("--budget-s", type=float, default=WALL_BUDGET_S, help="wall budget for the gate (<= 7200)")
-    parser.add_argument("--freeze", action="store_true", help="set the FREEZE pin (promotion refused until --unfreeze)")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="select + emit only (no harness run)"
+    )
+    parser.add_argument(
+        "--promote",
+        action="store_true",
+        help="on PASS: install -> stage -> commit (hash change only)",
+    )
+    parser.add_argument(
+        "--no-lowo",
+        action="store_true",
+        help="skip leave-one-window-out (evidence + pooled + off only)",
+    )
+    parser.add_argument(
+        "--pool", default=None, help="window pool dir (default <worker dir>/windows)"
+    )
+    parser.add_argument(
+        "--pool-size", type=int, default=claude_worker.window_root.POOL_SIZE_DEFAULT
+    )
+    parser.add_argument(
+        "--no-refresh", action="store_true", help="use the pool as it is (no cut/prune)"
+    )
+    parser.add_argument(
+        "--logs",
+        default=None,
+        help=f"capture runs root (default ${LOGS_DIR_ENV} or {DEFAULT_LOGS_DIR})",
+    )
+    parser.add_argument(
+        "--fees",
+        default=claude_worker.pnl_report.FEES_PATH_DEFAULT,
+        help="fees.toml for evidence rows (or 'none')",
+    )
+    parser.add_argument(
+        "--budget-s", type=float, default=WALL_BUDGET_S, help="wall budget for the gate (<= 7200)"
+    )
+    parser.add_argument(
+        "--freeze",
+        action="store_true",
+        help="set the FREEZE pin (promotion refused until --unfreeze)",
+    )
     parser.add_argument("--unfreeze", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--now-ms", type=int, default=None, help="tests only")
     args = parser.parse_args(argv)
 
     db = pathlib.Path(args.db).expanduser() if args.db else claude_worker.library.db_path()
-    lib_dir = pathlib.Path(args.library_dir).expanduser() if args.library_dir else claude_worker.library.library_dir()
+    lib_dir = (
+        pathlib.Path(args.library_dir).expanduser()
+        if args.library_dir
+        else claude_worker.library.library_dir()
+    )
     comp_dir = compositions_dir_for(db)
     freeze_file = comp_dir / FREEZE_FILE
     if args.freeze or args.unfreeze:
@@ -788,20 +929,33 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911, PLR0912, PLR09
             print(f"{_TELL}: FREEZE pin cleared")
         return 0
     if args.budget_s > WALL_BUDGET_S or args.budget_s <= 0:
-        print(f"{_TELL}: --budget-s must be in (0, {WALL_BUDGET_S:.0f}] (the 2 h law)", file=sys.stderr)
+        print(
+            f"{_TELL}: --budget-s must be in (0, {WALL_BUDGET_S:.0f}] (the 2 h law)",
+            file=sys.stderr,
+        )
         return 2
 
     now_ms = args.now_ms if args.now_ms is not None else int(time.time() * 1000)
-    regime_dir = pathlib.Path(args.regime_dir).expanduser() if args.regime_dir else claude_worker.regime.regime_dir()
+    regime_dir = (
+        pathlib.Path(args.regime_dir).expanduser()
+        if args.regime_dir
+        else claude_worker.regime.regime_dir()
+    )
     regime_toml = pathlib.Path(args.regime_toml).expanduser()
     candles_db = (
-        pathlib.Path(args.candles_db).expanduser() if args.candles_db else claude_worker.regime.regime_inputs()[1]
+        pathlib.Path(args.candles_db).expanduser()
+        if args.candles_db
+        else claude_worker.regime.regime_inputs()[1]
     )
     state = claude_worker.state.State(db)
     try:
         try:
             words, source = effective_words(
-                regime_dir, now_ms, regime_toml=regime_toml, candles_db=candles_db, query=args.regime
+                regime_dir,
+                now_ms,
+                regime_toml=regime_toml,
+                candles_db=candles_db,
+                query=args.regime,
             )
             composition = compose(
                 state,
@@ -818,8 +972,12 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911, PLR0912, PLR09
             return 2
         path = write_composition(comp_dir, composition)
         state.composition_insert(
-            composition.full_hash, composition.hash128, [s.member.member_id for s in composition.members],
-            words_hex(composition.words), str(path), None,
+            composition.full_hash,
+            composition.hash128,
+            [s.member.member_id for s in composition.members],
+            words_hex(composition.words),
+            str(path),
+            None,
         )
         out: dict[str, object] = {
             "hash": composition.full_hash,
@@ -828,7 +986,12 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911, PLR0912, PLR09
             "words": words_hex(composition.words),
             "words_source": composition.words_source,
             "members": [
-                {"member_id": s.member.member_id, "name": s.member.name, "fit": s.fit, "rows": len(s.member.rows)}
+                {
+                    "member_id": s.member.member_id,
+                    "name": s.member.name,
+                    "fit": s.fit,
+                    "rows": len(s.member.rows),
+                }
                 for s in composition.members
             ],
             "skipped": [{"name": n, "reason": r} for n, r in composition.skipped],
@@ -842,7 +1005,11 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911, PLR0912, PLR09
                 print(json.dumps(out, sort_keys=True))
             return 0
 
-        pool_dir = pathlib.Path(args.pool).expanduser() if args.pool else claude_worker.window_root.pool_dir_for(db)
+        pool_dir = (
+            pathlib.Path(args.pool).expanduser()
+            if args.pool
+            else claude_worker.window_root.pool_dir_for(db)
+        )
         seed = claude_worker.regime.regime_inputs()
         seed_pair = seed if seed[0].is_file() and seed[1].is_file() else None
         if args.no_refresh:
@@ -856,8 +1023,15 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911, PLR0912, PLR09
                 report=None if args.json else print,
             )
         if seed_pair is None and not args.json:
-            print(f"{_TELL}: NO regime seed pair (regime.toml/candles.db) — windows warm live; labelled rows may fail closed")
-        fees = [] if args.fees == "none" else claude_worker.library.fee_flags(pathlib.Path(args.fees).expanduser())
+            print(
+                f"{_TELL}: NO regime seed pair (regime.toml/candles.db) — windows warm live; "
+                "labelled rows may fail closed"
+            )
+        fees = (
+            []
+            if args.fees == "none"
+            else claude_worker.library.fee_flags(pathlib.Path(args.fees).expanduser())
+        )
         verdict = gate(
             state,
             composition,
@@ -872,13 +1046,20 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911, PLR0912, PLR09
             min_windows=args.min_windows,
         )
         state.composition_insert(
-            composition.full_hash, composition.hash128, [s.member.member_id for s in composition.members],
-            words_hex(composition.words), str(path), verdict.as_dict(),
+            composition.full_hash,
+            composition.hash128,
+            [s.member.member_id for s in composition.members],
+            words_hex(composition.words),
+            str(path),
+            verdict.as_dict(),
         )
         out["gate"] = verdict.as_dict()
         if not args.json:
-            print(f"{_TELL}: gate {'PASS' if verdict.passed else 'FAIL'} ({verdict.wall_s:.0f} s, {len(verdict.windows)} windows)"
-                  + ("" if verdict.passed else " — " + "; ".join(verdict.reasons)))
+            print(
+                f"{_TELL}: gate {'PASS' if verdict.passed else 'FAIL'} ({verdict.wall_s:.0f} s, "
+                f"{len(verdict.windows)} windows)"
+                + ("" if verdict.passed else " — " + "; ".join(verdict.reasons))
+            )
         if not verdict.passed:
             if args.json:
                 print(json.dumps(out, sort_keys=True))
@@ -889,8 +1070,15 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911, PLR0912, PLR09
                 return 2
             cfg = claude_worker.config.load_base_from_env()
             try:
-                result = promote(state, cfg, composition, path, verdict.report_path, freeze_file=freeze_file,
-                                 report=(lambda _s: None) if args.json else print)
+                result = promote(
+                    state,
+                    cfg,
+                    composition,
+                    path,
+                    verdict.report_path,
+                    freeze_file=freeze_file,
+                    report=(lambda _s: None) if args.json else print,
+                )
             except (claude_worker.uds.UdsError, claude_worker.backtest.GateRefused) as exc:
                 print(f"{_TELL}: promote failed: {exc}", file=sys.stderr)
                 return 4

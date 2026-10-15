@@ -56,6 +56,37 @@ if [ -f "$HOME/multivenue/vrp.toml" ]; then
     --out "$HOME/multivenue/vrp-seed.tsv" ||
     echo "candles-cycle: vrp_seed failed (non-fatal; next hour retries)" >&2
 fi
+# HAR H3.6 (rulings 2026-09-26): the long-tenor HAR's hourly lane, guarded
+# on the artifact like vrp_seed (F27) -- no har.toml, no HAR, no noise.
+# One serialized window, three steps, each non-fatal:
+#  1. har_backfill: every har.toml source -- the feed AND each fallback --
+#     gap-filled to the last closed minute (the ruling "keep fallbacks
+#     live"; one page a source in the hourly case, one for a source that
+#     stopped printing). The page budget bounds a catch-up after downtime and
+#     the per-source share keeps one lagging source from starving the rest;
+#     a walk they stop keeps what it stored and resumes next hour.
+#  2. har_seed seed-out: every series' seed-<NAME>.tsv, atomically -- the
+#     boot's history wherever the engine's own state-<NAME>.tsv is absent
+#     or behind (the engine merges both at boot, core_vol::merge_rows).
+#  3. har_seed compare --json-out: each feed against its fallbacks over the
+#     last 14 days -> har/drift.json, the dashboard's live amber rule.
+if [ -f "$HOME/multivenue/har.toml" ]; then
+  uv run python -m claude_worker.har_backfill \
+    --har-toml "$HOME/multivenue/har.toml" \
+    --db "$HOME/multivenue/worker/candles.db" \
+    --max-pages 400 --max-pages-per-source 48 ||
+    echo "candles-cycle: har_backfill failed or stopped short (non-fatal; next hour resumes)" >&2
+  uv run python -m claude_worker.har_seed seed-out \
+    --har-toml "$HOME/multivenue/har.toml" \
+    --db "$HOME/multivenue/worker/candles.db" \
+    --out-dir "$HOME/multivenue/har" ||
+    echo "candles-cycle: har_seed seed-out failed (non-fatal; next hour retries)" >&2
+  uv run python -m claude_worker.har_seed compare \
+    --har-toml "$HOME/multivenue/har.toml" \
+    --db "$HOME/multivenue/worker/candles.db" \
+    --days 14 --json-out "$HOME/multivenue/har/drift.json" >/dev/null ||
+    echo "candles-cycle: har_seed compare failed (non-fatal; next hour retries)" >&2
+fi
 # D3: the IV digest rides the same serialized window.
 uv run python -m claude_worker.iv_digest ||
   echo "candles-cycle: iv_digest failed (non-fatal; next hour retries)" >&2
@@ -71,3 +102,16 @@ uv run python -m claude_worker.depth_digest ||
 # newest page per instrument, best-effort.
 uv run python -m claude_worker.funding ||
   echo "candles-cycle: funding failed (non-fatal; next hour retries)" >&2
+# HC6 go-live (ruling O-HC2; scheduled 2026-09-26, O-HC29): the Hypercall
+# research-store puller rides beside the funding lane — public REST only:
+# the venue's trades by its own cursor, the options summaries of
+# `[hypercall] underlyings`, and the settlement payouts of the wallets in
+# CLAUDE_WORKER_HC_WALLETS (.env; the lane skips while it is unset — the
+# wallets stay out of git by the research law). Guarded on the section,
+# like the lanes above on their artifacts: no Hypercall, no noise.
+if grep -q '^\[hypercall\]' "$HOME/multivenue/universe.toml" 2>/dev/null; then
+  uv run python -m claude_worker.hypercall_history \
+    --universe "$HOME/multivenue/universe.toml" \
+    --db "$HOME/multivenue/worker/candles.db" ||
+    echo "candles-cycle: hypercall_history failed (non-fatal; next hour retries)" >&2
+fi

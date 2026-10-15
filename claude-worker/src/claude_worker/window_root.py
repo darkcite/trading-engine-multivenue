@@ -15,9 +15,11 @@ as runs of their own:
 * the 64-byte header is copied with ``epoch_ns`` advanced by the
   window's offset from the run's first tick, and the window directory is
   named ``run-<advanced epoch>`` — the harness's directory/epoch check
-  holds and its wall rebase (``wall = epoch + (ts - ts_first)``) lands
-  on the true wall clock, so consecutive windows are disjoint runs on
-  its virtual timeline;
+  holds and consecutive windows are disjoint runs on its virtual
+  timeline. (Its WALL clock is the venue's since BIN15 S2 when the cut
+  carries Hyperliquid venue stamps — ``cli::backtest::clock`` — and the
+  old ``wall = epoch + (ts - ts_first)`` otherwise; the cut's epoch
+  names the directory and seeds a window, it no longer clocks one.)
 * the manifests are copied;
 * RG3: ``ai-cmds.pmlr`` is cut by ``ts_ns`` like every file (the
   events-file lesson — an uncut file drags out-of-window rows into the
@@ -49,8 +51,8 @@ import sys
 import time
 import typing
 
-import claude_worker.iv_digest
 import claude_worker.hip4
+import claude_worker.iv_digest
 import claude_worker.regime
 import claude_worker.seeds
 import claude_worker.vrp_seed
@@ -131,11 +133,23 @@ def first_last_ts(path: pathlib.Path) -> tuple[int, int] | None:
 
 def run_span(run_dir: pathlib.Path) -> tuple[int, int] | None:
     """(min first ts over TICK files, max last ts over every file) — the
-    harness's anchor law for the first; None when the run has no tick."""
+    harness's anchor law for the first; None when the run has no tick.
+
+    A file whose header cannot be read holds no slot, so it is SKIPPED — the
+    law ``run_pmlr_version`` already applies. A boot that dies between creating
+    a capture file and writing its 64 bytes leaves 0 B behind, and raising here
+    let that one file stop every SWEEP that asks a run for its span: the
+    archive push (the 2026-09-22 cycle aborted on a 0-byte ``okx-events.pmlr``
+    and stranded every run behind it — and so retention), the window pools and
+    the pnl-report windowing. Cutting stays strict (``_cut_file``): a cut is
+    replayed by the harness, and a file it cannot read is an error there."""
     first = None
     last = None
     for p in sorted(run_dir.glob("*.pmlr")):
-        fl = first_last_ts(p)
+        try:
+            fl = first_last_ts(p)
+        except WindowError:
+            continue
         if fl is None:
             continue
         if p.name.endswith("-ticks.pmlr"):
@@ -189,7 +203,9 @@ def _ts_at_bytes(slot_bytes: bytes) -> int:
     return struct.unpack_from("<Q", slot_bytes, 0)[0]
 
 
-def _cut_file(src: pathlib.Path, dst: pathlib.Path, lo_ts: int, hi_ts: int, epoch_ns: int) -> tuple[int, int]:
+def _cut_file(
+    src: pathlib.Path, dst: pathlib.Path, lo_ts: int, hi_ts: int, epoch_ns: int
+) -> tuple[int, int]:
     """Copy the slots with ``lo_ts <= ts < hi_ts``; header epoch rewritten.
     An ``ai-cmds.pmlr`` additionally carries the pre-window ``SetRegime``
     declarations still in force at ``lo_ts`` (module docs)."""
@@ -278,7 +294,10 @@ def cut_run(
         a, b = (hi_ts, hi_ts) if p.name in empty else (lo_ts, hi_ts)
         total, kept = _cut_file(p, out_dir / p.name, a, b, new_epoch)
         if report is not None:
-            report(f"window-root: {run_dir.name} {p.name} {total} -> {kept} ({from_s:.0f}..{to_s:.0f} s)")
+            report(
+                f"window-root: {run_dir.name} {p.name} {total} -> {kept} ({from_s:.0f}..{to_s:.0f} "
+                "s)"
+            )
     if seed is not None and seed[0].is_file() and seed[1].is_file():
         n_desc, n_rows = claude_worker.regime.seed_out(
             seed[0],
@@ -288,7 +307,9 @@ def cut_run(
             now_ms=new_epoch // 1_000_000,
         )
         if report is not None:
-            report(f"window-root: {run_dir.name} {SEED_FILE} {n_rows} rows for {n_desc} descriptors")
+            report(
+                f"window-root: {run_dir.name} {SEED_FILE} {n_rows} rows for {n_desc} descriptors"
+            )
     if seed is not None and seed[1].is_file():
         n_desc, n_rows = funding_seed_out(out_dir, seed[1], new_epoch // 1_000_000)
         if report is not None:
@@ -421,7 +442,9 @@ def carry_head(
     return cut
 
 
-def complete_windows(run_dir: pathlib.Path, window_s: float = WINDOW_MAX_S) -> list[tuple[float, float]]:
+def complete_windows(
+    run_dir: pathlib.Path, window_s: float = WINDOW_MAX_S
+) -> list[tuple[float, float]]:
     """The FULL ``window_s`` slices a run holds (``windows_of`` minus the
     partial tail) — the only windows a pool may cut."""
     span = run_span(run_dir)
@@ -481,7 +504,7 @@ def pool_windows(pool_dir: pathlib.Path) -> list[pathlib.Path]:
     return sorted((p for p in pool_dir.glob("run-*") if p.is_dir()), key=lambda p: p.name)
 
 
-def pool_ensure(  # noqa: PLR0913 — one parameter per pool knob, deliberately
+def pool_ensure(  # one parameter per pool knob, deliberately
     logs_dir: pathlib.Path,
     pool_dir: pathlib.Path,
     k: int,
@@ -658,7 +681,7 @@ def _run_covering(logs_dir: pathlib.Path, wall_ns: int) -> tuple[pathlib.Path, i
     return best
 
 
-def campaign_cut(  # noqa: PLR0913 - one parameter per cut input, deliberately
+def campaign_cut(  # one parameter per cut input, deliberately
     logs_dir: pathlib.Path,
     pool_dir: pathlib.Path,
     day_ms: int,

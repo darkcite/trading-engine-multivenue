@@ -157,6 +157,13 @@ def test_frame_geometry_constants() -> None:
     )
 
 
+def test_venue_bytes_mirror_core_types_venue_id() -> None:
+    """The wire-stable `VenueId` bytes (core-types); MEXC is 7 (MX2/MX7)."""
+    f = claude_worker.frames
+    assert (f.VENUE_POLYMARKET, f.VENUE_BINANCE, f.VENUE_OKX, f.VENUE_DERIBIT) == (0, 1, 2, 3)
+    assert (f.VENUE_HYPERLIQUID, f.VENUE_AI, f.VENUE_BYBIT, f.VENUE_MEXC) == (4, 5, 6, 7)
+
+
 # ---- RG0: regime word helpers (core-types regime.rs mirror) ----
 
 
@@ -165,7 +172,7 @@ def test_regime_word_matches_the_golden_set_regime_vector() -> None:
     # normal/neutral with an EMPTY source byte; its qty is the same word
     # stamped MEASURED. Both are pinned by the shared golden bytes.
     _key, vectors = load_golden()
-    fast = [v for v in vectors if v.name == "set_regime_fast"][0]
+    fast = next(v for v in vectors if v.name == "set_regime_fast")
     word = claude_worker.frames.regime_word(
         trend="bull",
         shape="trend",
@@ -180,7 +187,7 @@ def test_regime_word_matches_the_golden_set_regime_vector() -> None:
     assert fast.param_id == claude_worker.frames.REGIME_PROFILE_FAST
     assert claude_worker.frames.regime_word_is_wire_declared(fast.px)
     assert not claude_worker.frames.regime_word_is_wire_declared(fast.qty)
-    slow = [v for v in vectors if v.name == "set_regime_slow_eos"][0]
+    slow = next(v for v in vectors if v.name == "set_regime_slow_eos")
     assert slow.px == claude_worker.frames.regime_word(trend="bull")
     assert slow.param_id == claude_worker.frames.REGIME_PROFILE_SLOW
     assert slow.flags == claude_worker.frames.FLAG_EXPIRE_ON_SILENCE

@@ -97,7 +97,10 @@ fn drain_client_frames(
         if consumed + total > len {
             return (consumed, frames);
         }
-        assert!(header.masked, "client frames MUST be masked (RFC 6455 §5.1)");
+        assert!(
+            header.masked,
+            "client frames MUST be masked (RFC 6455 §5.1)"
+        );
         let start = consumed + span.start;
         let end = consumed + span.end;
         ws_unmask_in_place(&mut buf[start..end], header.mask);
@@ -202,7 +205,10 @@ fn boot(script: Script) -> (u16, Arc<ClientConfig>, mpsc::Receiver<ClientFrame>)
             }
         };
         let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-        assert!(head.starts_with("GET /ws HTTP/1.1\r\n"), "request line: {head:?}");
+        assert!(
+            head.starts_with("GET /ws HTTP/1.1\r\n"),
+            "request line: {head:?}"
+        );
         let key_line = head
             .lines()
             .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:"))
@@ -250,7 +256,10 @@ fn boot(script: Script) -> (u16, Arc<ClientConfig>, mpsc::Receiver<ClientFrame>)
                 // 101 AND the first frame in the SAME write — the shape
                 // the venue produces when it packs the snapshot into
                 // the upgrade's segment.
-                resp.extend_from_slice(&server_frame(0x1, br#"{"channel":"subscriptionResponse","n":1}"#));
+                resp.extend_from_slice(&server_frame(
+                    0x1,
+                    br#"{"channel":"subscriptionResponse","n":1}"#,
+                ));
                 let _ = stream.write_all(&resp);
                 let _ = stream.flush();
                 // The two subscribes; the client sends them right after
@@ -267,15 +276,18 @@ fn boot(script: Script) -> (u16, Arc<ClientConfig>, mpsc::Receiver<ClientFrame>)
                 thread::sleep(Duration::from_millis(30));
                 let _ = stream.write_all(&f2[cut..]);
                 let _ = stream.flush();
-                // Two messages in ONE write, then a Ping with a payload,
-                // in the same write too.
+                // Two messages in ONE write, then three Pings — empty, a
+                // word, and the 125 B control-frame cap — in the same write
+                // too.
                 let mut two = server_frame(0x1, br#"{"channel":"orderUpdates","data":[]}"#);
                 two.extend_from_slice(&server_frame(0x1, br#"{"channel":"pong"}"#));
-                two.extend_from_slice(&server_frame(0x9, b"hl-ping-7"));
+                for p in core_net::TestTransport::PING_ECHO_CASES {
+                    two.extend_from_slice(&server_frame(0x9, p));
+                }
                 let _ = stream.write_all(&two);
                 let _ = stream.flush();
-                // The pong the client owes us.
-                read_client_frames(&mut stream, &mut buf, &mut len, 1, &tx);
+                // The three pongs the client owes us.
+                read_client_frames(&mut stream, &mut buf, &mut len, 3, &tx);
                 // And a Close.
                 let _ = stream.write_all(&server_frame(0x8, &[0x03, 0xE8]));
                 let _ = stream.flush();
@@ -316,7 +328,12 @@ fn client(port: u16, cfg: Arc<ClientConfig>) -> UserWs {
 }
 
 /// Pump until `want` payloads were delivered or `for_` elapsed.
-fn pump_until(ws: &mut UserWs, want: usize, for_: Duration, sink: &mut Vec<Vec<u8>>) -> Result<(), WsErr> {
+fn pump_until(
+    ws: &mut UserWs,
+    want: usize,
+    for_: Duration,
+    sink: &mut Vec<Vec<u8>>,
+) -> Result<(), WsErr> {
     let until = Instant::now() + for_;
     while sink.len() < want && Instant::now() < until {
         ws.pump(Duration::from_millis(5), |p| sink.push(p.to_vec()))?;
@@ -334,8 +351,12 @@ fn the_stream_script_round_trips_every_frame_shape() {
 
     // The server saw two masked, well-formed subscribes naming the
     // master, in order.
-    let s1 = from_server.recv_timeout(Duration::from_secs(5)).expect("subscribe 1");
-    let s2 = from_server.recv_timeout(Duration::from_secs(5)).expect("subscribe 2");
+    let s1 = from_server
+        .recv_timeout(Duration::from_secs(5))
+        .expect("subscribe 1");
+    let s2 = from_server
+        .recv_timeout(Duration::from_secs(5))
+        .expect("subscribe 2");
     for (s, ch) in [(&s1, "userFills"), (&s2, "orderUpdates")] {
         assert_eq!(s.opcode, WsOpcode::Text);
         let text = std::str::from_utf8(&s.payload).expect("utf8");
@@ -353,7 +374,10 @@ fn the_stream_script_round_trips_every_frame_shape() {
     let mut got: Vec<Vec<u8>> = Vec::new();
     pump_until(&mut ws, 4, Duration::from_secs(5), &mut got).expect("pump");
     assert_eq!(got.len(), 4, "delivered: {got:?}");
-    assert_eq!(got[0], br#"{"channel":"subscriptionResponse","n":1}"#.to_vec());
+    assert_eq!(
+        got[0],
+        br#"{"channel":"subscriptionResponse","n":1}"#.to_vec()
+    );
     assert_eq!(
         got[1],
         br#"{"channel":"userFills","data":{"isSnapshot":false,"user":"0x","fills":[]}}"#.to_vec()
@@ -361,15 +385,29 @@ fn the_stream_script_round_trips_every_frame_shape() {
     assert_eq!(got[2], br#"{"channel":"orderUpdates","data":[]}"#.to_vec());
     assert_eq!(got[3], br#"{"channel":"pong"}"#.to_vec());
 
-    // The Ping that rode in with them was answered with its payload.
-    let pong = from_server.recv_timeout(Duration::from_secs(5)).expect("pong");
-    assert_eq!(pong.opcode, WsOpcode::Pong);
-    assert_eq!(pong.payload, b"hl-ping-7".to_vec());
+    // The Pings that rode in with them were answered, in order, each
+    // with its own payload.
+    for want in core_net::TestTransport::PING_ECHO_CASES {
+        let pong = from_server
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pong");
+        assert_eq!(pong.opcode, WsOpcode::Pong);
+        assert_eq!(
+            pong.payload,
+            want.to_vec(),
+            "the echo of a {} B ping",
+            want.len()
+        );
+    }
 
     // The Close is a disconnect, and the socket is gone.
     let mut rest: Vec<Vec<u8>> = Vec::new();
     let r = pump_until(&mut ws, 1, Duration::from_secs(5), &mut rest);
-    assert_eq!(r, Err(WsErr::Disconnected), "a Close must surface as Disconnected");
+    assert_eq!(
+        r,
+        Err(WsErr::Disconnected),
+        "a Close must surface as Disconnected"
+    );
     assert!(rest.is_empty(), "nothing after the Close: {rest:?}");
     assert!(!ws.is_connected());
 }
@@ -384,8 +422,12 @@ fn a_silent_server_draws_a_ping_then_a_reconnect() {
         idle_timeout_ns: 400_000_000,
     });
     ws.connect().expect("connect");
-    let _s1 = from_server.recv_timeout(Duration::from_secs(5)).expect("subscribe 1");
-    let _s2 = from_server.recv_timeout(Duration::from_secs(5)).expect("subscribe 2");
+    let _s1 = from_server
+        .recv_timeout(Duration::from_secs(5))
+        .expect("subscribe 1");
+    let _s2 = from_server
+        .recv_timeout(Duration::from_secs(5))
+        .expect("subscribe 2");
 
     // Pump through the interval: nothing arrives, the ping goes out.
     let t0 = Instant::now();
@@ -404,16 +446,25 @@ fn a_silent_server_draws_a_ping_then_a_reconnect() {
         thread::sleep(Duration::from_millis(5));
     }
     let elapsed = t0.elapsed();
-    assert_eq!(outcome, Err(WsErr::Disconnected), "an unanswered ping is a dead session");
+    assert_eq!(
+        outcome,
+        Err(WsErr::Disconnected),
+        "an unanswered ping is a dead session"
+    );
     assert!(!ws.is_connected());
     assert!(
         elapsed >= Duration::from_millis(390) && elapsed < Duration::from_millis(1500),
         "the idle timeout, not the 3 s budget, ended it: {elapsed:?} after {pumps} pumps"
     );
-    let ping = from_server.recv_timeout(Duration::from_secs(2)).expect("the keepalive ping");
+    let ping = from_server
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the keepalive ping");
     assert_eq!(ping.opcode, WsOpcode::Text);
     assert_eq!(ping.payload, b"{\"method\":\"ping\"}".to_vec());
-    assert!(sink.is_empty(), "a silent server delivers nothing: {sink:?}");
+    assert!(
+        sink.is_empty(),
+        "a silent server delivers nothing: {sink:?}"
+    );
     // And exactly ONE ping: the interval anchors on the ping itself,
     // so a second one would need another 120 ms of silence, which the
     // 400 ms idle cut-off leaves room for — twice at most.
@@ -431,19 +482,27 @@ fn a_refused_upgrade_is_an_upgrade_error_not_a_hang() {
     let t0 = Instant::now();
     let r = ws.connect();
     assert_eq!(r, Err(WsErr::Upgrade));
-    assert!(t0.elapsed() < Duration::from_secs(5), "bounded: {:?}", t0.elapsed());
+    assert!(
+        t0.elapsed() < Duration::from_secs(5),
+        "bounded: {:?}",
+        t0.elapsed()
+    );
     assert!(!ws.is_connected());
 }
 
+/// The server floods the oversize frame right behind its 101, so the
+/// refusal can surface from `connect` (whose read after the upgrade meets
+/// the full buffer) as well as from a later `pump` — either is the law.
+/// HK4: the test took only the second, and failed ~1 run in 5 even alone
+/// (the listed "parallel-load flake" — it was this race).
 #[test]
 fn a_frame_larger_than_the_buffer_is_refused_not_grown() {
     let (port, cfg, _rx) = boot(Script::Oversize);
     let mut ws = client(port, cfg);
-    ws.connect().expect("connect");
     let delivered = AtomicUsize::new(0);
     let until = Instant::now() + Duration::from_secs(10);
-    let mut outcome = Ok(0usize);
-    while Instant::now() < until {
+    let mut outcome = ws.connect().map(|()| 0usize);
+    while outcome.is_ok() && Instant::now() < until {
         match ws.pump(Duration::from_millis(5), |_| {
             delivered.fetch_add(1, Ordering::Relaxed);
         }) {
@@ -455,6 +514,10 @@ fn a_frame_larger_than_the_buffer_is_refused_not_grown() {
         }
     }
     assert_eq!(outcome, Err(WsErr::BadFrame), "the buffer is the bound");
-    assert_eq!(delivered.load(Ordering::Relaxed), 0, "nothing of it may be delivered");
+    assert_eq!(
+        delivered.load(Ordering::Relaxed),
+        0,
+        "nothing of it may be delivered"
+    );
     assert!(!ws.is_connected());
 }

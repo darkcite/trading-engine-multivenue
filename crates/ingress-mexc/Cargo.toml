@@ -1,0 +1,29 @@
+[package]
+name         = "ingress-mexc"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "MEXC public WebSocket ingress (MX3/MX4): spot protobuf aggre.bookTicker/deals + futures JSON depth.full/deal/ticker (mark-funding-OI) on one thread; boot REST discovery. PB + byte-scanner parsers, zero-alloc steady state. Data-only (O-MX1)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-types   = { workspace = true }
+core-parse   = { workspace = true }
+core-net     = { workspace = true }
+core-ring    = { workspace = true }
+core-metrics = { workspace = true }
+core-time    = { workspace = true }
+memchr       = { workspace = true }
+mio          = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+# TLS-loopback integration test (tests/mexc_tls_loopback.rs) — the
+# binance/okx pattern; test-only, never linked into release.
+rcgen    = { workspace = true }
+rustls   = { workspace = true }

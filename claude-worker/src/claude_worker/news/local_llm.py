@@ -575,7 +575,7 @@ def _spent_today(
     return total
 
 
-def run_local_tiers(  # noqa: PLR0913 — composition root: every collaborator named
+def run_local_tiers(  # composition root: every collaborator named
     *,
     state: "claude_worker.state.State",
     store: "claude_worker.news.store.Store",
@@ -661,7 +661,7 @@ def _model_matches(
     return False
 
 
-def _watcher(  # noqa: PLR0913, PLR0917 — composition root: every collaborator named
+def _watcher(  # composition root: every collaborator named
     state: "claude_worker.state.State",
     store: "claude_worker.news.store.Store",
     registry: "claude_worker.news.sources.Registry",
@@ -697,7 +697,7 @@ def _ceilings_for(policy: "claude_worker.news.actions.NewsPolicy") -> dict[str, 
     return out
 
 
-def _local_triage(  # noqa: PLR0913, PLR0917 — one pass, every collaborator it needs
+def _local_triage(  # one pass, every collaborator it needs
     state: "claude_worker.state.State",
     store: "claude_worker.news.store.Store",
     registry: "claude_worker.news.sources.Registry",
@@ -723,7 +723,7 @@ def _local_triage(  # noqa: PLR0913, PLR0917 — one pass, every collaborator it
     return len(ids)
 
 
-def _local_label(  # noqa: PLR0913, PLR0917 — one pass, every collaborator it needs
+def _local_label(  # one pass, every collaborator it needs
     state: "claude_worker.state.State",
     store: "claude_worker.news.store.Store",
     registry: "claude_worker.news.sources.Registry",

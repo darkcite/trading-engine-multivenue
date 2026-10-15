@@ -20,8 +20,9 @@
 //!
 //! ## Capacity
 //!
-//! `MAX_COUNTERS = 512` / `MAX_GAUGES = 384` (Phase 8a headroom for
-//! five venues' loss-accounting counters and per-bucket gauges).
+//! `MAX_COUNTERS = 640` / `MAX_GAUGES = 512` (Phase 8a headroom for
+//! five venues' loss-accounting counters and per-bucket gauges, raised
+//! at E7 and again at XMM XH4f).
 //! Still fixed arrays, still lock-free; raising further is a const
 //! change + recompile.
 
@@ -41,8 +42,9 @@ pub mod server;
 
 pub use ingress_status::{
     err_site_name, io_kind_code, io_kind_name, IngressState, IngressStatus, SessionErrSnapshot,
-    ERR_SITE_DRIVE, ERR_SITE_ESTABLISH, ERR_SITE_KEEPALIVE, ERR_SITE_POLL, ERR_SITE_PUMP,
-    ERR_SITE_REGISTER, ERR_SITE_REREGISTER, ERR_SITE_SUBSCRIBE_MISSING, ERR_SITE_VENUE_ERROR,
+    ERR_SITE_DRIVE, ERR_SITE_ESTABLISH, ERR_SITE_KEEPALIVE, ERR_SITE_PEER_CLOSE, ERR_SITE_PEER_EOF,
+    ERR_SITE_POLL, ERR_SITE_PUMP, ERR_SITE_REGISTER, ERR_SITE_REREGISTER,
+    ERR_SITE_SUBSCRIBE_MISSING, ERR_SITE_VENUE_ERROR,
 };
 pub use registry::{
     Counter, CounterId, EncodeErr, Gauge, GaugeId, MetricsRegistry, RegErr, MAX_COUNTERS,

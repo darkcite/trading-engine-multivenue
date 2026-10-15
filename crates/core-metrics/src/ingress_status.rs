@@ -13,7 +13,7 @@
 //! Replaces the Phase-2 fiction `up = engine.iterations > 0` with the
 //! real per-thread connection state, and carries the §6.4
 //! loss-accounting counters (D4: `ring_drops` is incremented on every
-//! failed `try_push`).
+//! failed `try_push_ref`).
 
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
@@ -53,6 +53,15 @@ pub const ERR_SITE_SUBSCRIBE_MISSING: u8 = 8;
 /// outage 2026-08-27 §5.3 — covers Connecting/AwaitingUpgrade
 /// wedges AND zero-sub `Steady` sessions kept alive by pongs).
 pub const ERR_SITE_ESTABLISH: u8 = 9;
+/// Session-END site (not a local error): the peer ended the stream
+/// with no WebSocket Close first — a bare FIN or TLS close. It is
+/// Hyperliquid's entire answer to a subscribe for a settled or unknown
+/// coin (probed 2026-09-26), which `res=Disconnected` alone hid for
+/// hours.
+pub const ERR_SITE_PEER_EOF: u8 = 10;
+/// Session-END site: the peer sent a WebSocket Close (`venue_code` =
+/// its status code; 1005 when the frame carried none).
+pub const ERR_SITE_PEER_CLOSE: u8 = 11;
 
 /// Human name for a session-error site code (0 = "none").
 #[inline]
@@ -68,6 +77,8 @@ pub const fn err_site_name(site: u8) -> &'static str {
         ERR_SITE_VENUE_ERROR => "venue-error",
         ERR_SITE_SUBSCRIBE_MISSING => "subscribe-missing",
         ERR_SITE_ESTABLISH => "establish-timeout",
+        ERR_SITE_PEER_EOF => "peer-eof",
+        ERR_SITE_PEER_CLOSE => "peer-close",
         _ => "unknown",
     }
 }
@@ -169,10 +180,11 @@ impl IngressState {
 
 /// Cache-aligned, single-writer status slot for one ingress thread.
 ///
-/// Layout note: state + activity + 8 counters + the T1(a) diag
-/// triple = 79 bytes → the slot spans two cache lines. That is
-/// fine: there is exactly one writer and readers poll at human
-/// cadence, so cross-line traffic is nil.
+/// Layout note: state + activity + the counters + the T1(a) diag
+/// triple = 136 bytes → the slot spans three cache lines (192 B with
+/// the alignment tail; MX3 `seq_regressions_total` crossed the second
+/// line). That is fine: there is exactly one writer and readers poll
+/// at human cadence, so cross-line traffic is nil.
 #[repr(C, align(64))]
 pub struct IngressStatus {
     /// [`IngressState`] as raw byte.
@@ -187,11 +199,23 @@ pub struct IngressStatus {
     parse_errors_total: AtomicU64,
     /// Venue sequence-chain breaks observed (§6.2 policy per venue).
     gaps_total: AtomicU64,
+    /// MX3 (ruling Q-MX1): venue seq REGRESSIONS on sampled/snapshot
+    /// streams where the §6.2 chain law does not apply (MEXC) — a
+    /// value strictly below the last-seen one for the same symbol ×
+    /// stream. Never folded into `gaps_total` (a skipped version is
+    /// normal there; only a step BACK is news). HK31/HK32: Polymarket,
+    /// Hyperliquid and Deribit count a top-of-book tick whose stamp is
+    /// older than its instrument's newest (the `core_types::ArrivalSeq`
+    /// 0, dropped by every book; [`Self::note_arrival_seq`]). Baselines
+    /// (2026-10-15 hour): HL ~0/h, Deribit ~115/h (the backlog after a
+    /// host stall); an HL re-send carries the last-change stamp, so an
+    /// occasional HL count is not a stuck clock.
+    seq_regressions_total: AtomicU64,
     /// Channel resubscribes triggered by integrity monitors.
     resubscribes_total: AtomicU64,
     /// Transport reconnects.
     reconnects_total: AtomicU64,
-    /// Ring `try_push` failures — events dropped because the engine
+    /// Ring `try_push_ref` failures — events dropped because the engine
     /// was not draining fast enough (D4).
     ring_drops_total: AtomicU64,
     /// Market-data rows (ticks/trades/books/summaries) parsed — the
@@ -215,6 +239,9 @@ pub struct IngressStatus {
     /// VM2 V2: options-summary lane pushes refused by a full ring.
     /// Same separation rationale as the two above.
     opt_ring_drops_total: AtomicU64,
+    /// XMM XH1: trade-lane pushes refused by a full ring (the print is
+    /// still captured). Same separation rationale as the three above.
+    trade_ring_drops_total: AtomicU64,
     /// T1(a) diag: `ERR_SITE_*` of the first fatal error this
     /// session (0 = none). First-error-wins; cleared by the venue
     /// loop via [`Self::take_last_err`] (same thread as the writer).
@@ -231,8 +258,7 @@ pub struct IngressStatus {
     last_err_venue_code: AtomicU32,
     /// VT2: ticks the ingress judged STALE against the venue's
     /// `stale_after_ms` (`TICK_FLAG_STALE` set; captured, never a
-    /// signal). A subset of `ticks_total`. Fills the slot's last
-    /// 8 bytes exactly (128 B).
+    /// signal). A subset of `ticks_total`.
     stale_ticks_total: AtomicU64,
 }
 
@@ -246,6 +272,7 @@ impl IngressStatus {
             bytes_total: AtomicU64::new(0),
             parse_errors_total: AtomicU64::new(0),
             gaps_total: AtomicU64::new(0),
+            seq_regressions_total: AtomicU64::new(0),
             resubscribes_total: AtomicU64::new(0),
             reconnects_total: AtomicU64::new(0),
             ring_drops_total: AtomicU64::new(0),
@@ -254,6 +281,7 @@ impl IngressStatus {
             event_ring_drops_total: AtomicU64::new(0),
             depth_ring_drops_total: AtomicU64::new(0),
             opt_ring_drops_total: AtomicU64::new(0),
+            trade_ring_drops_total: AtomicU64::new(0),
             last_err_site: AtomicU8::new(0),
             last_err_io_kind: AtomicU8::new(0),
             feed_delay_ema_ms: AtomicU16::new(0),
@@ -298,6 +326,29 @@ impl IngressStatus {
     #[inline(always)]
     pub fn inc_gaps(&self) {
         self.gaps_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one venue seq regression (MX3 — see
+    /// `seq_regressions_total` field docs). Cold: a regression is news,
+    /// never the steady state, so every caller's hot path keeps only the
+    /// predicted branch (HK32 — it was Polymarket's private
+    /// `count_older_frame`).
+    #[cold]
+    #[inline(never)]
+    pub fn inc_seq_regressions(&self) {
+        self.seq_regressions_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// HK32: judge one top-of-book tick's `venue_seq` as stamped by
+    /// `core_types::ArrivalSeq` (Polymarket, Hyperliquid, Deribit): 0 is
+    /// a tick older than its instrument's newest, dropped by every book,
+    /// and counted. One predicted compare inline; the count stays cold
+    /// ([`Self::inc_seq_regressions`]).
+    #[inline(always)]
+    pub fn note_arrival_seq(&self, venue_seq: u32) {
+        if venue_seq == 0 {
+            self.inc_seq_regressions();
+        }
     }
 
     /// Count one integrity-driven resubscribe.
@@ -350,6 +401,12 @@ impl IngressStatus {
     #[inline(always)]
     pub fn inc_opt_ring_drops(&self) {
         self.opt_ring_drops_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one trade-lane push refused by a full ring (XMM XH1).
+    #[inline(always)]
+    pub fn inc_trade_ring_drops(&self) {
+        self.trade_ring_drops_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count one tick the ingress judged stale (VT2).
@@ -426,6 +483,12 @@ impl IngressStatus {
         self.gaps_total.load(Ordering::Relaxed)
     }
 
+    /// Total venue seq regressions (MX3).
+    #[inline]
+    pub fn seq_regressions_total(&self) -> u64 {
+        self.seq_regressions_total.load(Ordering::Relaxed)
+    }
+
     /// Total resubscribes.
     #[inline]
     pub fn resubscribes_total(&self) -> u64 {
@@ -473,6 +536,12 @@ impl IngressStatus {
     #[inline(always)]
     pub fn opt_ring_drops_total(&self) -> u64 {
         self.opt_ring_drops_total.load(Ordering::Relaxed)
+    }
+
+    /// Total trade-lane pushes refused by a full ring (XMM XH1).
+    #[inline]
+    pub fn trade_ring_drops_total(&self) -> u64 {
+        self.trade_ring_drops_total.load(Ordering::Relaxed)
     }
 
     /// Total ticks judged stale by the ingress (VT2).
@@ -552,6 +621,7 @@ mod tests {
         s.add_bytes(1024);
         s.inc_parse_errors();
         s.inc_gaps();
+        s.inc_seq_regressions();
         s.inc_resubscribes();
         s.inc_reconnects();
         s.inc_ring_drops();
@@ -561,6 +631,7 @@ mod tests {
         assert_eq!(s.bytes_total(), 1024);
         assert_eq!(s.parse_errors_total(), 1);
         assert_eq!(s.gaps_total(), 1);
+        assert_eq!(s.seq_regressions_total(), 1);
         assert_eq!(s.resubscribes_total(), 1);
         assert_eq!(s.reconnects_total(), 1);
         assert_eq!(s.ring_drops_total(), 2);
@@ -570,11 +641,12 @@ mod tests {
     #[test]
     fn slot_is_cache_aligned() {
         assert_eq!(::core::mem::align_of::<IngressStatus>(), 64);
-        // 1(+7 pad) + 8 + 12×8 + (1+1+2+4) + 8 = 128 B — exactly two
-        // cache lines with ZERO slack left (VT2 spent the last 8 B on
-        // stale_ticks and the diag triple's pad on the delay gauge);
-        // the next counter must reuse a field or grow to 192.
-        assert_eq!(::core::mem::size_of::<IngressStatus>(), 128);
+        // 1(+7 pad) + 8 + 14×8 + (1+1+2+4) + 8 = 144 B → 192 B with
+        // the alignment tail: three cache lines (MX3's
+        // seq_regressions_total crossed the second; XMM XH1's
+        // trade_ring_drops_total took 8 of the slack — 48 B remain for
+        // the next counters before 256).
+        assert_eq!(::core::mem::size_of::<IngressStatus>(), 192);
     }
 
     #[test]
@@ -650,6 +722,21 @@ mod tests {
     }
 
     #[test]
+    fn trade_ring_drops_counter_accumulates_independently() {
+        // XMM XH1: a refused print advances trade_ring_drops ONLY —
+        // never ring_drops (tick loss) or the other lanes' counters.
+        let s = IngressStatus::new();
+        assert_eq!(s.trade_ring_drops_total(), 0);
+        s.inc_trade_ring_drops();
+        s.inc_trade_ring_drops();
+        assert_eq!(s.trade_ring_drops_total(), 2);
+        assert_eq!(s.ring_drops_total(), 0);
+        assert_eq!(s.event_ring_drops_total(), 0);
+        assert_eq!(s.depth_ring_drops_total(), 0);
+        assert_eq!(s.opt_ring_drops_total(), 0);
+    }
+
+    #[test]
     fn depth_ring_drops_counter_accumulates_independently() {
         // WS10-B: same separation law for the depth lane.
         let s = IngressStatus::new();
@@ -657,6 +744,21 @@ mod tests {
         assert_eq!(s.depth_ring_drops_total(), 1);
         assert_eq!(s.event_ring_drops_total(), 0);
         assert_eq!(s.ring_drops_total(), 0);
+    }
+
+    #[test]
+    fn seq_regressions_counter_accumulates_independently() {
+        // MX3: a regression advances seq_regressions ONLY — never the
+        // §6.2 gaps (a sampled stream skipping versions is not a gap)
+        // nor parse_errors (the frame parsed fine).
+        let s = IngressStatus::new();
+        assert_eq!(s.seq_regressions_total(), 0);
+        s.inc_seq_regressions();
+        s.inc_seq_regressions();
+        assert_eq!(s.seq_regressions_total(), 2);
+        assert_eq!(s.gaps_total(), 0);
+        assert_eq!(s.parse_errors_total(), 0);
+        assert_eq!(s.msgs_total(), 0);
     }
 
     #[test]
@@ -682,6 +784,8 @@ mod tests {
             "subscribe-missing"
         );
         assert_eq!(err_site_name(ERR_SITE_ESTABLISH), "establish-timeout");
+        assert_eq!(err_site_name(ERR_SITE_PEER_EOF), "peer-eof");
+        assert_eq!(err_site_name(ERR_SITE_PEER_CLOSE), "peer-close");
         assert_eq!(err_site_name(200), "unknown");
         assert_eq!(io_kind_name(0), "none");
         assert_eq!(

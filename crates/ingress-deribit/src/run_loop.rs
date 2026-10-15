@@ -93,32 +93,35 @@
 //! livelocking (fail-fast doctrine).
 //!
 //! Everything after the handshake is zero-alloc: parsers slice the rx
-//! buffer in place; requests render into stack scratch; the only copy
-//! is the 64-byte `Tick` moved into the ring.
+//! buffer in place; requests go straight into tx (the batch subscribe
+//! rendered header first, the rest from parts); the ring copies
+//! are the 64-byte `Tick` and, per changed book top-K, the 192-byte
+//! `DepthTopK` (one copy each into the slot — marked at the push).
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::io;
 
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{
-    constant_time_eq, expected_accept, queue_masked_text_frame, read_server_handshake,
-    sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
-    ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf, Keepalive, KeepaliveAction,
-    PendingTable, ReqKind, Status, SubErr, SubTable, Transport, WsOpcode, WsReadResult,
+    constant_time_eq, expected_accept, queue_masked_text_frame_parts,
+    queue_masked_text_frame_rendered, read_server_handshake, sec_websocket_key_from_seed,
+    write_client_handshake, ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong,
+    Drained, HandshakeResult, IoBuf, Keepalive, KeepaliveAction, PendingTable, ReqKind, RxFill,
+    Status, SubErr, SubTable, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock};
 use core_types::{
-    Capture, ChannelEvent, ChannelId, DepthTopK, OptSummary, Price, Qty, Tick, VenueId,
+    Capture, ChannelEvent, ChannelId, DepthPair, DepthTopK, OptSummary, Price, Qty, Tick, VenueId,
     DEPTH_RING_SIZE, EVENT_RING_SIZE, OPT_RING_SIZE, SYMBOL_ID_NONE, TICK_FLAG_STALE,
 };
 
 use crate::{
-    classify, extract_instrument, parse_book_header, parse_option_ticker, parse_quote,
-    parse_ticker, parse_trade, parse_vol_index, row_wants_channel, sub_id_of, write_book_op,
-    write_set_heartbeat, write_subscribe_all, write_test, ChainOutcome, DeribitChannel,
-    DeribitMsgKind, DeribitSymbolTable, DeribitTradeSeq, DvolName, TradeSeqOutcome,
-    DERIBIT_DVOL_MAX, DERIBIT_MAX_SYMBOLS, HEARTBEAT_INTERVAL_SECS,
+    book_op_parts, classify, extract_instrument, parse_book_header, parse_option_ticker,
+    parse_quote, parse_ticker, parse_trade, parse_vol_index, render_subscribe_all,
+    row_wants_channel, set_heartbeat_parts, sub_id_of, test_request_parts, ChainOutcome,
+    DeribitBookOp, DeribitChannel, DeribitMsgKind, DeribitSymbolTable, DeribitTradeSeq, DvolName,
+    TradeSeqOutcome, DERIBIT_DVOL_MAX, DERIBIT_MAX_SYMBOLS, HEARTBEAT_INTERVAL_SECS,
 };
 
 // ---------------------------------------------------------------
@@ -132,10 +135,24 @@ use crate::{
 pub const RX_BUF_SIZE: usize = 4 * 1024 * 1024;
 
 /// Tx buffer: handshake + set_heartbeat + one batched subscribe
-/// (≤ ~48 B/channel × [`MAX_CHANNELS`] = 192 ≈ 9.2 KiB with a full
-/// M2.3 options block) + resync pairs + test replies. 24 KiB keeps
-/// ≥2× margin (boot-time allocation).
+/// ([`SUB_PAYLOAD_MAX`]) + resync pairs + test replies, with ≥ 2× margin
+/// on the subscribe — const-asserted where it is queued (HK3). Boot-time
+/// allocation.
 pub const TX_BUF_SIZE: usize = 24 * 1024;
+
+/// The handshake's allowance in the tx budget (the MEXC shape).
+const HANDSHAKE_TX_MAX: usize = 1024;
+
+/// The longest batched subscribe payload (`crate::render_subscribe_all`):
+/// the request head with a 20-digit id, every channel at
+/// [`crate::CHANNEL_NAME_MAX`] plus its comma, every DVOL index at its
+/// longest, the close — 9 664 B at [`MAX_CHANNELS`] = 192 (HK3).
+pub const SUB_PAYLOAD_MAX: usize = br#"{"jsonrpc":"2.0","id":"#.len()
+    + 20
+    + br#","method":"public/subscribe","params":{"channels":[]}}"#.len()
+    + MAX_CHANNELS * (crate::CHANNEL_NAME_MAX + 1)
+    + crate::DERIBIT_DVOL_MAX
+        * (br#","deribit_volatility_index.""#.len() + crate::DERIBIT_DVOL_NAME_MAX);
 
 /// Tick-ring capacity. Must equal `engine::TICK_RING_SIZE` — the cli
 /// const-asserts the equality when wiring lanes (8a §3.3 pattern).
@@ -166,13 +183,10 @@ pub const MAX_CHANNELS: usize =
 /// Subscription-table capacity (≥ [`MAX_CHANNELS`]).
 pub const SUB_CAP: usize = MAX_CHANNELS;
 
-/// Stack scratch for one rendered subscribe batch (≤ ~48 B/channel ×
-/// 192 channels ≈ 9.2 KiB; ~1.7× margin).
-const SUBSCRIBE_SCRATCH: usize = 16 * 1024;
-
-/// Stack scratch for one rendered channel name
-/// (`"` + prefix ≤ 7 + instrument ≤ 32 + `.100ms` + `"` = 47 max).
+/// Stack scratch for one rendered channel name ([`crate::CHANNEL_NAME_MAX`]
+/// = 47 B, asserted).
 const CHANNEL_NAME_SCRATCH: usize = 64;
+const _: () = assert!(crate::CHANNEL_NAME_MAX <= CHANNEL_NAME_SCRATCH);
 
 /// Minimum interval between emitted gap log lines (operator-terminal
 /// budget; increments beyond it are counted into `suppressed=` on the
@@ -317,8 +331,9 @@ pub struct Driver {
     /// empty when depth is off). Boot-allocated; steady state only
     /// indexes.
     ladders: Vec<book_builder::ladder::DepthLadder>,
-    /// WS10-B: last EMITTED top-K per instrument — the change gate.
-    last_depth: Vec<DepthTopK>,
+    /// WS10-B: the change gate per instrument — the last EMITTED top-K
+    /// and the row the next snapshot is written into, in place.
+    depth: Vec<DepthPair>,
     /// WS6: configured DVOL index names (`n_dvol` valid). Boot-set,
     /// connection-independent; ordinal = position here (the capture
     /// event's `v1` identity).
@@ -369,6 +384,12 @@ pub struct Driver {
     /// threshold = venue default or `--stale-after-ms deribit:<ms>` via
     /// [`Self::set_stale_after_ms`].
     feed_clock: FeedClock,
+    /// HK32: each instrument's `quote` arrival sequencer — the
+    /// `Tick.venue_seq` law (crate docs) — indexed by symbol-table row like
+    /// `book_chains`. Its ordinal is process-lifetime, so it never falls
+    /// under a book; its clock is per connection
+    /// ([`Self::reset_for_reconnect`]).
+    quote_seq: [core_types::ArrivalSeq; DERIBIT_MAX_SYMBOLS],
     /// `!Sync` marker — see struct doc.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
 }
@@ -394,12 +415,14 @@ impl Driver {
     ) -> Self {
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
-        let mut dvol: [DvolName; DERIBIT_DVOL_MAX] = [(0, [0; 16]); DERIBIT_DVOL_MAX];
+        let mut dvol: [DvolName; DERIBIT_DVOL_MAX] =
+            [(0, [0; crate::DERIBIT_DVOL_NAME_MAX]); DERIBIT_DVOL_MAX];
         let mut n_dvol = 0usize;
         let mut i = 0;
         while i < dvol_names.len() {
             let name = dvol_names[i];
-            if name.is_empty() || name.len() > 16 || n_dvol >= DERIBIT_DVOL_MAX {
+            if name.is_empty() || name.len() > crate::DERIBIT_DVOL_NAME_MAX || n_dvol >= DERIBIT_DVOL_MAX
+            {
                 debug_assert!(
                     false,
                     "dvol entry dropped (len/cap) — config layer caps this"
@@ -408,6 +431,12 @@ impl Driver {
                 continue;
             }
             dvol[n_dvol].0 = name.len() as u8;
+            // COPY: ≤ 16 B DVOL index name into the driver's index table,
+            // ≤ DERIBIT_DVOL_MAX (8) rows = ≤ 128 B, once at boot — the driver matches
+            // every DVOL push against them and re-subscribes them every session, long
+            // after the boot's config slices are gone — rejected: a lifetime on `Driver`
+            // (threaded through the run loop, the spawn wrapper and every test) for
+            // ≤ 128 B.
             dvol[n_dvol].1[..name.len()].copy_from_slice(name);
             n_dvol += 1;
             i += 1;
@@ -415,14 +444,20 @@ impl Driver {
         // WS10-B: per-instrument ladders + last-emitted snapshots,
         // boot-allocated once (empty when depth is off).
         let n_syms = symbols.len();
-        let (ladders, last_depth) = if depth_enabled {
+        let (ladders, depth) = if depth_enabled {
             (
                 vec![book_builder::ladder::DepthLadder::new(); n_syms],
-                vec![DepthTopK::EMPTY; n_syms],
+                vec![DepthPair::new(DepthTopK::EMPTY); n_syms],
             )
         } else {
             (Vec::new(), Vec::new())
         };
+        // COPY: the 3 224 B symbol table and the ≤ 136 B DVOL table above move
+        // into the driver, and the 10 800 B driver returns by value — once per
+        // connection, at boot — the driver holds its tables INLINE so every
+        // hot lookup walks contiguous rows with no pointer to chase —
+        // rejected: a `Box` per table (a heap hop on the hot lookup) and a
+        // two-phase in-place init behind `&mut` (for a boot-only cost).
         Self {
             state: State::Connecting,
             rx: IoBuf::with_capacity(RX_BUF_SIZE),
@@ -434,7 +469,7 @@ impl Driver {
             symbols,
             depth_enabled,
             ladders,
-            last_depth,
+            depth,
             dvol,
             n_dvol,
             subs: SubTable::new(),
@@ -451,6 +486,7 @@ impl Driver {
             drop_log_last_ns: 0,
             drop_log_suppressed: 0,
             feed_clock: FeedClock::new(VenueId::Deribit.default_stale_after_ms()),
+            quote_seq: [core_types::ArrivalSeq::ZERO; DERIBIT_MAX_SYMBOLS],
             _not_sync: ::core::marker::PhantomData,
         }
     }
@@ -538,6 +574,11 @@ impl Driver {
         self.session_started = false;
         // VT2: a new connection is a new offset; the threshold stays.
         self.feed_clock.reset();
+        // HK32: every instrument's ordinal stays (monotone — no book sees
+        // it fall); its clock is zeroed, so a reconnect clears a clock a
+        // far-future stamp poisoned. rx is cleared and the old socket gone:
+        // no quote of the old connection can follow.
+        core_types::ArrivalSeq::reset_clocks(&mut self.quote_seq);
     }
 }
 
@@ -552,6 +593,10 @@ impl Driver {
 ///   and bumps `IngressStatus::ring_drops`.
 /// * `status`: per-ingress observability slot; this thread is its
 ///   single writer.
+///
+/// Returns `Ok(true)` when this step's read stopped on a full rx
+/// ([`RxFill::Full`]): input may still wait below it, so the caller
+/// drives again ([`core_net::drain`]).
 #[allow(clippy::too_many_arguments)]
 pub fn drive_one<T: Transport, C: Capture>(
     transport: &mut T,
@@ -565,9 +610,9 @@ pub fn drive_one<T: Transport, C: Capture>(
     opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
     status: &IngressStatus,
     capture: &mut C,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     flush_tx(transport, drv)?;
-    fill_rx(transport, drv)?;
+    let fill = core_net::fill_rx(transport, &mut drv.rx)?;
 
     match drv.state {
         State::Connecting => {}
@@ -589,8 +634,43 @@ pub fn drive_one<T: Transport, C: Capture>(
         State::Closed => {}
     }
 
+    // HK2: an EOF closes the session only now — the frames that arrived
+    // with the FIN were parsed above — and nothing is flushed to a peer
+    // that has closed.
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+        return Ok(false);
+    }
     flush_tx(transport, drv)?;
-    Ok(())
+    Ok(fill == RxFill::Full)
+}
+
+/// I-3 ([`core_net::drain`]): drive the connection until a step makes no
+/// progress — its read did not stop on a full rx, it published no tick,
+/// its state held — or [`core_net::DRAIN_STEP_CAP`] steps have run.
+#[allow(clippy::too_many_arguments)]
+fn drive_until_idle<T: Transport, C: Capture>(
+    transport: &mut T,
+    drv: &mut Driver,
+    host: &[u8],
+    path: &[u8],
+    producer: &mut Producer<Tick, TICK_RING_CAP>,
+    event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    event_mask: u16,
+    depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
+    opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
+    status: &IngressStatus,
+    capture: &mut C,
+) -> Drained {
+    core_net::drain_until_idle!(
+        step: drive_one(
+            transport, drv, host, path, producer, event_tx, event_mask, depth_tx, opt_tx, status,
+            capture,
+        ),
+        published: producer.published(),
+        key: drv.state(),
+        closed: drv.state() == State::Closed,
+    )
 }
 
 /// Bump `Connecting → NeedsWsWrite` once the transport is TLS-ready.
@@ -628,24 +708,6 @@ fn flush_tx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()>
         drv.tx.clear();
     } else if written > 0 {
         drv.tx.consume(written);
-    }
-    Ok(())
-}
-
-fn fill_rx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> {
-    loop {
-        if drv.rx.free_mut().is_empty() {
-            break;
-        }
-        match transport.read(drv.rx.free_mut()) {
-            Ok(0) => {
-                drv.state = State::Closed;
-                break;
-            }
-            Ok(n) => drv.rx.advance(n),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
     }
     Ok(())
 }
@@ -699,9 +761,14 @@ fn advance_ws_upgrade(drv: &mut Driver, status: &IngressStatus) -> io::Result<()
 
 /// Record a freshly-queued JSON-RPC request. Slot collision means
 /// more than [`PENDING_CAP`] unanswered requests — a protocol bug or
-/// a dead venue; fail-fast either way.
-fn record_pending(drv: &mut Driver, id: u64, kind: DeribitReqKind) -> io::Result<()> {
-    match drv.pending.record(id, kind, now_ns()) {
+/// a dead venue; fail-fast either way. Takes the table, not the
+/// driver, so a caller may hold a symbol row borrowed meanwhile.
+fn record_pending(
+    pending: &mut PendingTable<DeribitReqKind, PENDING_CAP>,
+    id: u64,
+    kind: DeribitReqKind,
+) -> io::Result<()> {
+    match pending.record(id, kind, now_ns()) {
         Ok(()) => Ok(()),
         Err(_e) => {
             debug_assert!(false, "deribit pending table rejected id {id}: {_e:?}");
@@ -724,39 +791,47 @@ fn queue_session_start(drv: &mut Driver) -> io::Result<()> {
     // 1. Heartbeat first — the venue polices the connection from the
     //    moment this is acked (test_request every 15 s).
     let hb_id = drv.alloc_req_id();
-    let mut scratch = [0u8; 128];
-    let n = write_set_heartbeat(&mut scratch, hb_id, HEARTBEAT_INTERVAL_SECS)
-        .ok_or_else(|| io::Error::other("deribit: set_heartbeat scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
-    record_pending(drv, hb_id, DeribitReqKind::SetHeartbeat)?;
+    let (mut id_digits, mut secs_digits) = ([0u8; 20], [0u8; 20]);
+    let mut parts: [&[u8]; 5] = [b""; 5];
+    set_heartbeat_parts(
+        hb_id,
+        HEARTBEAT_INTERVAL_SECS,
+        &mut id_digits,
+        &mut secs_digits,
+        &mut parts,
+    );
+    queue_masked_text_frame_parts(&mut drv.tx, &mut drv.mask_counter, &parts)?;
+    record_pending(&mut drv.pending, hb_id, DeribitReqKind::SetHeartbeat)?;
 
     // 2. One batched subscribe for every (channel × instrument)
     //    (+ WS6 DVOL indices).
+    //    Header first, rendered straight into tx: no scratch.
+    // HK3: the handshake, the worst batched subscribe twice over and a
+    // frame header fit in tx.
+    const {
+        assert!(
+            HANDSHAKE_TX_MAX + 2 * SUB_PAYLOAD_MAX + core_net::WS_CLIENT_HDR_MAX <= TX_BUF_SIZE
+        );
+    };
     let sub_id = drv.alloc_req_id();
-    let mut scratch = [0u8; SUBSCRIBE_SCRATCH];
-    let n = write_subscribe_all(
-        &mut scratch,
-        sub_id,
-        &drv.symbols,
-        drv.depth_enabled,
-        &drv.dvol[..drv.n_dvol],
-    )
-    .ok_or_else(|| io::Error::other("deribit: subscribe scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
-    record_pending(drv, sub_id, DeribitReqKind::SubscribeAll)?;
+    let (symbols, depth_enabled, dvol) = (&drv.symbols, drv.depth_enabled, &drv.dvol[..drv.n_dvol]);
+    queue_masked_text_frame_rendered(&mut drv.tx, &mut drv.mask_counter, |p| {
+        render_subscribe_all(p, sub_id, symbols, depth_enabled, dvol)
+    })?;
+    record_pending(&mut drv.pending, sub_id, DeribitReqKind::SubscribeAll)?;
     drv.subscribe_req_id = sub_id;
     drv.session_started = true;
     Ok(())
 }
 
-/// Queue one `public/test` (test_request answer / proactive probe).
+/// Queue one `public/test` (test_request answer / proactive probe),
+/// its parts masked straight into tx.
 fn queue_test(drv: &mut Driver) -> io::Result<()> {
     let id = drv.alloc_req_id();
-    let mut scratch = [0u8; 96];
-    let n = write_test(&mut scratch, id)
-        .ok_or_else(|| io::Error::other("deribit: test scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
-    record_pending(drv, id, DeribitReqKind::Test)
+    let mut digits = [0u8; 20];
+    let parts = test_request_parts(id, &mut digits);
+    queue_masked_text_frame_parts(&mut drv.tx, &mut drv.mask_counter, &parts)?;
+    record_pending(&mut drv.pending, id, DeribitReqKind::Test)
 }
 
 /// Queue an unsubscribe+subscribe pair for one `book.{instr}.100ms` —
@@ -765,27 +840,34 @@ fn queue_book_resync(drv: &mut Driver, sym_idx: usize) -> io::Result<()> {
     // Ids allocated before the symbol-row borrow (alloc needs &mut).
     let unsub_id = drv.alloc_req_id();
     let sub_id = drv.alloc_req_id();
-    let Some((instr_ref, _sym)) = drv.symbols.get(sym_idx) else {
+    // The instrument is read in place for the whole function: the
+    // frames go through `tx`/`mask_counter` and the ids into `pending`,
+    // every one a field disjoint from `symbols`.
+    let Some((instr, _sym)) = drv.symbols.get(sym_idx) else {
         debug_assert!(false, "resync for unknown symbol row {sym_idx}");
         return Ok(());
     };
-    // Copy the instrument out of the table row (≤32 B stack) so the
-    // immutable borrow ends before the tx queueing below.
-    let mut instr_buf = [0u8; crate::DERIBIT_INSTR_MAX];
-    let instr_len = instr_ref.len();
-    instr_buf[..instr_len].copy_from_slice(instr_ref);
-    let instr = &instr_buf[..instr_len];
+    let (tx, mc) = (&mut drv.tx, &mut drv.mask_counter);
+    queue_book_op(tx, mc, DeribitBookOp::Unsubscribe, unsub_id, instr)?;
+    record_pending(&mut drv.pending, unsub_id, DeribitReqKind::BookUnsub)?;
+    let (tx, mc) = (&mut drv.tx, &mut drv.mask_counter);
+    queue_book_op(tx, mc, DeribitBookOp::Subscribe, sub_id, instr)?;
+    record_pending(&mut drv.pending, sub_id, DeribitReqKind::BookSub)
+}
 
-    let mut scratch = [0u8; 256];
-    let n = write_book_op(&mut scratch, unsub_id, b"public/unsubscribe", instr)
-        .ok_or_else(|| io::Error::other("deribit: resync scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
-    record_pending(drv, unsub_id, DeribitReqKind::BookUnsub)?;
-    let n = write_book_op(&mut scratch, sub_id, b"public/subscribe", instr)
-        .ok_or_else(|| io::Error::other("deribit: resync scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
-    record_pending(drv, sub_id, DeribitReqKind::BookSub)?;
-    Ok(())
+/// Queue one book (un)subscribe, its parts masked straight into `tx`.
+#[inline]
+fn queue_book_op(
+    tx: &mut IoBuf,
+    mask_counter: &mut u64,
+    op: DeribitBookOp,
+    id: u64,
+    instrument: &[u8],
+) -> io::Result<()> {
+    let mut digits = [0u8; 20];
+    let mut parts: [&[u8]; 5] = [b""; 5];
+    book_op_parts(op, id, instrument, &mut digits, &mut parts);
+    queue_masked_text_frame_parts(tx, mask_counter, &parts)
 }
 
 // ---------------------------------------------------------------
@@ -870,21 +952,22 @@ fn found_mask(payload: &[u8], symbols: &DeribitSymbolTable, depth_enabled: bool)
                 continue;
             }
             wanted += 1;
-            let ch = CHANNEL_ORDER[c];
+            // HK3: the subscribe render's own spelling, never a second one.
+            let mut parts: [&[u8]; 5] = [b""; 5];
+            crate::channel_name_parts(CHANNEL_ORDER[c], instr, &mut parts);
             let mut name = [0u8; CHANNEL_NAME_SCRATCH];
             let mut n = 0usize;
-            name[n] = b'"';
-            n += 1;
-            let p = ch.wire_prefix();
-            name[n..n + p.len()].copy_from_slice(p);
-            n += p.len();
-            name[n..n + instr.len()].copy_from_slice(instr);
-            n += instr.len();
-            let s = ch.wire_suffix();
-            name[n..n + s.len()].copy_from_slice(s);
-            n += s.len();
-            name[n] = b'"';
-            n += 1;
+            let mut k = 0usize;
+            while k < parts.len() {
+                let part = parts[k];
+                // COPY: the quoted channel name (≤ CHANNEL_NAME_MAX = 47 B) as one memmem
+                // needle, once per wanted channel per subscribe RESULT (once per session) —
+                // memmem needs a contiguous needle — rejected: find-then-verify per hit of
+                // the bare instrument (more work per hit).
+                name[n..n + part.len()].copy_from_slice(part);
+                n += part.len();
+                k += 1;
+            }
             if memchr::memmem::find(payload, &name[..n]).is_some() {
                 if is_tail_row(symbols, i) {
                     found_in_row += 1;
@@ -939,6 +1022,24 @@ struct TradeScan {
     intra_last_observed: i64,
 }
 
+// [`scan_trades`] returns a scan by value: pinned within the 64 B bound.
+const _: () = assert!(core::mem::size_of::<TradeScan>() <= 64);
+
+impl TradeScan {
+    /// Nothing walked yet.
+    const EMPTY: Self = Self {
+        rows_parsed: 0,
+        rows_rejected: 0,
+        n_seq: 0,
+        first_seq: 0,
+        last_seq: 0,
+        first_ts_ms: 0,
+        intra_breaks: 0,
+        intra_last_expected: 0,
+        intra_last_observed: 0,
+    };
+}
+
 /// Phase-1 dispatch outcome — everything pre-parsed while the rx
 /// borrow is live, applied after it ends (template pattern).
 #[derive(Copy, Clone)]
@@ -968,20 +1069,17 @@ enum Dispatch {
         vol_1e9: i64,
         ordinal: i64,
     },
-    /// `quote` push became a Tick.
-    Quote { tick: Tick },
+    /// `quote` push became the phase-1 tick.
+    Quote,
     /// `ticker` push validated (slow lane; captured as a §6.5 event).
     Ticker,
     /// M2.3: an OPTION row's ticker parsed → `OptSummary` captured in
     /// phase 1 (capture-only; nothing reaches the engine ring).
     OptSummary,
-    /// `trades` push scanned (`sym` rides along for phase-2 gap
-    /// events — resolving it again would re-borrow `drv.symbols`).
-    Trades {
-        sym: u32,
-        sym_idx: u8,
-        scan: TradeScan,
-    },
+    /// `trades` push scanned into the phase-1 scan (`sym` rides along
+    /// for phase-2 gap events — resolving it again would re-borrow
+    /// `drv.symbols`).
+    Trades { sym: u32, sym_idx: u8 },
     /// `book` push — chain applied AND (WS10-B) ladder walked in
     /// phase 1 (payload in scope there; the `BookGap` pairing event
     /// moved with the apply). Phase 2 counts, rate-limit-logs and
@@ -994,6 +1092,10 @@ enum Dispatch {
         prev: i64,
     },
 }
+
+// The dispatch value crosses phase 1 → phase 2 by value: pinned
+// within the 64 B by-value bound (frames ride in phase-1 scratch).
+const _: () = assert!(core::mem::size_of::<Dispatch>() <= 64);
 
 fn drain_ws_frames<C: Capture>(
     drv: &mut Driver,
@@ -1008,18 +1110,10 @@ fn drain_ws_frames<C: Capture>(
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
         match read_result {
-            WsReadResult::Incomplete => {
-                // Oversize guard: a frame that cannot fit the rx
-                // buffer never completes — fail the session instead
-                // of livelocking (module doc).
-                if drv.rx.free_mut().is_empty() && !drv.rx.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "ws frame exceeds rx buffer capacity",
-                    ));
-                }
-                return Ok(());
-            }
+            // Oversize guard: a frame that cannot fit the rx buffer never
+            // completes — fail the session instead of livelocking (module
+            // doc; the shared guard since HK2).
+            WsReadResult::Incomplete => return core_net::incomplete_frame(&mut drv.rx),
             WsReadResult::Malformed => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1054,14 +1148,14 @@ fn drain_ws_frames<C: Capture>(
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
                         drv.mask_counter = drv.mask_counter.wrapping_add(1);
-                        let start = payload.start;
-                        let end = payload.end;
-                        let plen = end - start;
-                        let mut scratch = [0u8; 125];
-                        debug_assert!(plen <= scratch.len());
-                        scratch[..plen].copy_from_slice(&drv.rx.filled()[start..end]);
-                        let dst = drv.tx.free_mut();
-                        if let Ok(n) = ws_write_pong(dst, &scratch[..plen], mask) {
+                        // The echo goes straight from rx into tx (disjoint
+                        // field borrows) — no scratch; `ws_read_frame`
+                        // already refused a control payload over 125 B.
+                        if let Ok(n) = ws_write_pong(
+                            drv.tx.free_mut(),
+                            &drv.rx.filled()[payload.start..payload.end],
+                            mask,
+                        ) {
                             drv.tx.advance(n);
                         }
                     }
@@ -1099,17 +1193,7 @@ fn drain_ws_frames<C: Capture>(
 /// `v1` = amount ×1e6 negated for sell-side prints (Deribit amounts
 /// are USD notionals for perps/futures).
 fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeScan {
-    let mut scan = TradeScan {
-        rows_parsed: 0,
-        rows_rejected: 0,
-        n_seq: 0,
-        first_seq: 0,
-        last_seq: 0,
-        first_ts_ms: 0,
-        intra_breaks: 0,
-        intra_last_expected: 0,
-        intra_last_observed: 0,
-    };
+    let mut scan = TradeScan::EMPTY;
     // Rows are the OBJECTS of the `"data":[...]` array, sliced by JSON
     // object extent. The 8c implementation sliced at `"trade_seq":`
     // markers instead and broke live on 2026-08-15: Deribit's starbase
@@ -1154,53 +1238,51 @@ fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeSc
             }
         };
         i = row_end;
-        match parse_trade(&payload[row_start..row_end], sym) {
-            Some(t) => {
-                scan.rows_parsed += 1;
-                if scan.n_seq == 0 {
-                    scan.first_seq = t.trade_seq;
-                    scan.first_ts_ms = t.ts_ns / 1_000_000;
-                } else if t.trade_seq != scan.last_seq.wrapping_add(1) {
-                    // Within-frame discontinuity. §6.6 pairing: the
-                    // increment this row will cause in phase 2 gets
-                    // its ChannelEvent HERE, where expected/observed
-                    // are both at hand (v0 = expected, v1 = observed).
-                    scan.intra_breaks += 1;
-                    scan.intra_last_expected = scan.last_seq.wrapping_add(1);
-                    scan.intra_last_observed = t.trade_seq;
-                    capture.event(&ChannelEvent::new(
-                        now_ns(),
-                        VenueId::Deribit,
-                        ChannelId::TradeGap,
-                        sym,
-                        t.trade_seq as u64,
-                        t.ts_ns / 1_000_000,
-                        scan.last_seq.wrapping_add(1),
-                        t.trade_seq,
-                    ));
-                }
-                scan.last_seq = t.trade_seq;
-                scan.n_seq += 1;
-                // §6.5 capture: v0 = px ×1e6, v1 = amount ×1e6 (USD
-                // notional), negated when `direction` is sell.
-                let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
+        let mut t = crate::DeribitTradeFrame::ZERO;
+        if parse_trade(&payload[row_start..row_end], sym, &mut t) {
+            scan.rows_parsed += 1;
+            if scan.n_seq == 0 {
+                scan.first_seq = t.trade_seq;
+                scan.first_ts_ms = t.ts_ns / 1_000_000;
+            } else if t.trade_seq != scan.last_seq.wrapping_add(1) {
+                // Within-frame discontinuity. §6.6 pairing: the
+                // increment this row will cause in phase 2 gets
+                // its ChannelEvent HERE, where expected/observed
+                // are both at hand (v0 = expected, v1 = observed).
+                scan.intra_breaks += 1;
+                scan.intra_last_expected = scan.last_seq.wrapping_add(1);
+                scan.intra_last_observed = t.trade_seq;
                 capture.event(&ChannelEvent::new(
                     now_ns(),
                     VenueId::Deribit,
-                    ChannelId::Trade,
+                    ChannelId::TradeGap,
                     sym,
                     t.trade_seq as u64,
                     t.ts_ns / 1_000_000,
-                    t.px_1e6,
-                    signed_qty,
+                    scan.last_seq.wrapping_add(1),
+                    t.trade_seq,
                 ));
             }
-            None => {
-                scan.rows_rejected += 1;
-                // Tap the exact rejected row slice — the §6.5 raw-tap
-                // differential audit consumes these.
-                capture.parse_reject(now_ns(), &payload[row_start..row_end]);
-            }
+            scan.last_seq = t.trade_seq;
+            scan.n_seq += 1;
+            // §6.5 capture: v0 = px ×1e6, v1 = amount ×1e6 (USD
+            // notional), negated when `direction` is sell.
+            let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
+            capture.event(&ChannelEvent::new(
+                now_ns(),
+                VenueId::Deribit,
+                ChannelId::Trade,
+                sym,
+                t.trade_seq as u64,
+                t.ts_ns / 1_000_000,
+                t.px_1e6,
+                signed_qty,
+            ));
+        } else {
+            scan.rows_rejected += 1;
+            // Tap the exact rejected row slice — the §6.5 raw-tap
+            // differential audit consumes these.
+            capture.parse_reject(now_ns(), &payload[row_start..row_end]);
         }
     }
     scan
@@ -1220,6 +1302,12 @@ fn handle_data_frame<C: Capture>(
 ) -> io::Result<()> {
     // Retained for the phase-2 reject re-borrow (Range is not Copy).
     let reject_range = payload_range.clone();
+    // Phase 1's tick and trades scan, built in place: riding inside the
+    // dispatch value they would widen every dispatch past the 64 B bound
+    // and cross phase 1 → phase 2 by value. `Dispatch::Quote` /
+    // `Dispatch::Trades` say which one was written.
+    let mut tick = Tick::ZERO;
+    let mut trades = TradeScan::EMPTY;
     // Phase 1: immutable borrow of rx (+ symbols) — classify, resolve
     // the instrument, pre-parse into a Copy dispatch value. Capture
     // hooks that need parsed values fire here (events); the raw tap
@@ -1234,9 +1322,13 @@ fn handle_data_frame<C: Capture>(
             DeribitMsgKind::RpcError { id, code } => Dispatch::VenueError { id, code },
             // WS6: DVOL — venue-global; identity = ordinal into the
             // boot-configured index list (never the symbol table).
-            DeribitMsgKind::VolIndexPush => match parse_vol_index(payload) {
-                Some(f) => {
-                    let name = &f.index_name[..f.index_name_len as usize];
+            DeribitMsgKind::VolIndexPush => {
+                let mut f = crate::DeribitVolIndexFrame::ZERO;
+                if parse_vol_index(payload, &mut f) {
+                    // The name is compared where it lies in rx: the
+                    // parser returned its span, never a copy (a frame
+                    // parsed from this payload always has one).
+                    let name = f.index_name(payload).unwrap_or_default();
                     let mut ordinal: i64 = -1;
                     let mut d = 0;
                     while d < drv.n_dvol {
@@ -1258,8 +1350,9 @@ fn handle_data_frame<C: Capture>(
                             ordinal,
                         }
                     }
+                } else {
+                    Dispatch::Nothing
                 }
-                None => Dispatch::Nothing,
             },
             DeribitMsgKind::RpcResult(id) => {
                 if id == drv.subscribe_req_id {
@@ -1282,31 +1375,33 @@ fn handle_data_frame<C: Capture>(
                         // §6.5: no ChannelEvent for quotes — BBO flows
                         // as `Tick` into the per-venue tick log (see
                         // the `ChannelId` doc in core-types).
-                        DeribitChannel::Quote => match parse_quote(payload, sym) {
-                            Some(f) => {
+                        DeribitChannel::Quote => {
+                            let mut f = crate::DeribitQuoteFrame::ZERO;
+                            if parse_quote(payload, sym, &mut f) {
                                 // VT2: one parse-complete stamp serves
                                 // the tick AND the staleness judgement;
                                 // `timestamp` is the venue quote time.
                                 let now = now_ns();
                                 let judged = drv.feed_clock.judge(f.ts_ms, now);
-                                Dispatch::Quote {
-                                    tick: Tick::new_stamped(
-                                        now,
-                                        VenueId::Deribit,
-                                        sym,
-                                        // No seq on quotes: venue ms
-                                        // timestamp, truncated (crate doc).
-                                        f.ts_ms as u32,
-                                        Price::from_raw(f.bid_px_1e6),
-                                        Qty::from_raw(f.bid_qty_1e6),
-                                        Price::from_raw(f.ask_px_1e6),
-                                        Qty::from_raw(f.ask_qty_1e6),
-                                        f.ts_ms,
-                                        (judged.stale as u8) * TICK_FLAG_STALE,
-                                    ),
-                                }
+                                tick = Tick::new_stamped(
+                                    now,
+                                    VenueId::Deribit,
+                                    sym,
+                                    // HK32: no seq on quotes — the
+                                    // instrument's arrival ordinal
+                                    // (crate doc).
+                                    drv.quote_seq[sym_idx].next(f.ts_ms),
+                                    Price::from_raw(f.bid_px_1e6),
+                                    Qty::from_raw(f.bid_qty_1e6),
+                                    Price::from_raw(f.ask_px_1e6),
+                                    Qty::from_raw(f.ask_qty_1e6),
+                                    f.ts_ms,
+                                    (judged.stale as u8) * TICK_FLAG_STALE,
+                                );
+                                Dispatch::Quote
+                            } else {
+                                Dispatch::Nothing
                             }
-                            None => Dispatch::Nothing,
                         },
                         // M2.3: OPTION rows' ticker carries the
                         // mark/IV/greeks/OI surface → OptSummary
@@ -1314,37 +1409,38 @@ fn handle_data_frame<C: Capture>(
                         // futures parser would reject it (no
                         // current_funding on option tickers).
                         DeribitChannel::Ticker if drv.symbols.is_option_row(sym_idx) => {
-                            match parse_option_ticker(payload) {
-                                Some(f) => {
-                                    let o = OptSummary::new(
-                                        now_ns(),
-                                        VenueId::Deribit,
-                                        sym,
-                                        core_types::OPT_SUMMARY_FLAG_MARK_PX
-                                            | core_types::OPT_SUMMARY_FLAG_OI,
-                                        f.mark_px_1e9,
-                                        f.mark_iv_1e9,
-                                        f.underlying_px_1e9,
-                                        f.open_interest_1e6,
-                                        f.delta_1e9,
-                                        f.gamma_1e9,
-                                        f.vega_1e6,
-                                        f.theta_1e6,
-                                    );
-                                    capture.opt_summary(&o);
-                                    // VM2 V2: onto the opt lane
-                                    // (capture stays first — §6.5
-                                    // capture-before-push law).
-                                    if opt_tx.try_push(o).is_err() {
-                                        status.inc_opt_ring_drops();
-                                    }
-                                    Dispatch::OptSummary
+                            let mut f = crate::DeribitOptTickerFrame::ZERO;
+                            if parse_option_ticker(payload, &mut f) {
+                                let o = OptSummary::new(
+                                    now_ns(),
+                                    VenueId::Deribit,
+                                    sym,
+                                    core_types::OPT_SUMMARY_FLAG_MARK_PX
+                                        | core_types::OPT_SUMMARY_FLAG_OI,
+                                    f.mark_px_1e9,
+                                    f.mark_iv_1e9,
+                                    f.underlying_px_1e9,
+                                    f.open_interest_1e6,
+                                    f.delta_1e9,
+                                    f.gamma_1e9,
+                                    f.vega_1e6,
+                                    f.theta_1e6,
+                                );
+                                capture.opt_summary(&o);
+                                // VM2 V2: onto the opt lane
+                                // (capture stays first — §6.5
+                                // capture-before-push law).
+                                if !opt_tx.try_push_ref(&o) {
+                                    status.inc_opt_ring_drops();
                                 }
-                                None => Dispatch::Nothing,
+                                Dispatch::OptSummary
+                            } else {
+                                Dispatch::Nothing
                             }
                         }
-                        DeribitChannel::Ticker => match parse_ticker(payload, sym) {
-                            Some(tk) => {
+                        DeribitChannel::Ticker => {
+                            let mut tk = crate::DeribitTickerFrame::ZERO;
+                            if parse_ticker(payload, sym, &mut tk) {
                                 // §6.5 capture: v0 = mark px ×1e6
                                 // (`mark_px_1e6`), v1 = open interest
                                 // ×1e6 as stored in the parsed POD
@@ -1393,22 +1489,26 @@ fn handle_data_frame<C: Capture>(
                                     // §6.5 capture-before-push law).
                                     if event_mask & core_types::event_lane_bit(ChannelId::Funding)
                                         != 0
-                                        && event_tx.try_push(ev).is_err()
+                                        && !event_tx.try_push_ref(&ev)
                                     {
                                         status.inc_event_ring_drops();
                                     }
                                 }
                                 Dispatch::Ticker
+                            } else {
+                                Dispatch::Nothing
                             }
-                            None => Dispatch::Nothing,
                         },
-                        DeribitChannel::Trades => Dispatch::Trades {
-                            sym,
-                            sym_idx: sym_idx as u8,
-                            scan: scan_trades(payload, sym, capture),
+                        DeribitChannel::Trades => {
+                            trades = scan_trades(payload, sym, capture);
+                            Dispatch::Trades {
+                                sym,
+                                sym_idx: sym_idx as u8,
+                            }
                         },
-                        DeribitChannel::Book => match parse_book_header(payload, sym) {
-                            Some(b) => {
+                        DeribitChannel::Book => {
+                            let mut b = crate::DeribitBookFrame::ZERO;
+                            if parse_book_header(payload, sym, &mut b) {
                                 // §6.5 capture: venue_seq = change_id,
                                 // v0 = prev_change_id (−1 on snapshots
                                 // — the crate's convention for the
@@ -1461,7 +1561,7 @@ fn handle_data_frame<C: Capture>(
                                 if !drv.ladders.is_empty() {
                                     deribit_depth_step(
                                         &mut drv.ladders[sym_idx],
-                                        &mut drv.last_depth[sym_idx],
+                                        &mut drv.depth[sym_idx],
                                         payload,
                                         sym,
                                         gapped,
@@ -1478,8 +1578,9 @@ fn handle_data_frame<C: Capture>(
                                     expected_prev,
                                     prev: b.prev_change_id,
                                 }
+                            } else {
+                                Dispatch::Nothing
                             }
-                            None => Dispatch::Nothing,
                         },
                     },
                     // Data for an instrument we never configured —
@@ -1634,7 +1735,7 @@ fn handle_data_frame<C: Capture>(
             status.add_msgs(1);
             status.add_ticks(1);
         }
-        Dispatch::Quote { tick } => {
+        Dispatch::Quote => {
             status.add_msgs(1);
             status.add_ticks(1);
             // VT2: stale quotes are captured and pushed like any other
@@ -1643,13 +1744,17 @@ fn handle_data_frame<C: Capture>(
             if tick.is_stale() {
                 status.inc_stale_ticks();
             }
+            // HK32: older than its instrument's newest (`venue_seq` 0,
+            // dropped by every book) — counted; ~100 an hour in the
+            // backlog after a host stall, a steady count is a stuck clock.
+            status.note_arrival_seq(tick.venue_seq);
             status.set_feed_delay_ema_ms(drv.feed_clock.delay_ema_ms());
             // §6.5 capture BEFORE the push — a ring-dropped tick must
             // still reach the replay log (the audit pairs capture
             // counts with ring_drops_total).
             capture.tick(&tick);
             // D4: a full ring is data loss — count it, never block.
-            if producer.try_push(tick).is_err() {
+            if !producer.try_push_ref(&tick) {
                 status.inc_ring_drops();
             }
         }
@@ -1661,7 +1766,8 @@ fn handle_data_frame<C: Capture>(
             status.add_msgs(1);
             status.add_ticks(1);
         }
-        Dispatch::Trades { sym, sym_idx, scan } => {
+        Dispatch::Trades { sym, sym_idx } => {
+            let scan = &trades;
             status.add_msgs(scan.rows_parsed as u64);
             status.add_ticks(scan.rows_parsed as u64);
             let mut r = 0;
@@ -1741,11 +1847,13 @@ fn handle_data_frame<C: Capture>(
 /// change-gated emission (capture first, then the depth-lane push;
 /// full-ring pushes count `depth_ring_drops`). On a chain gap the
 /// ladder clears and a `DEPTH_FLAG_STALE` snapshot ALWAYS emits so a
-/// strategy never trades a known-broken book.
+/// strategy never trades a known-broken book. Snapshots are written in
+/// place into `pair`'s spare row; an emitted one becomes the last by
+/// [`DepthPair::commit`], never by a copy.
 #[allow(clippy::too_many_arguments)]
 fn deribit_depth_step<C: Capture>(
     ladder: &mut book_builder::ladder::DepthLadder,
-    last: &mut DepthTopK,
+    pair: &mut DepthPair,
     payload: &[u8],
     sym: u32,
     gapped: bool,
@@ -1756,17 +1864,17 @@ fn deribit_depth_step<C: Capture>(
 ) {
     if gapped {
         ladder.clear();
-        let stale = ladder.snapshot(
-            now_ns(),
-            VenueId::Deribit,
-            sym,
-            core_types::DEPTH_FLAG_STALE,
-        );
-        capture.depth(&stale);
-        if depth_tx.try_push(stale).is_err() {
+        let stale = pair.spare_mut();
+        ladder.snapshot_into(now_ns(), VenueId::Deribit, sym, core_types::DEPTH_FLAG_STALE, stale);
+        capture.depth(stale);
+        // COPY: one 192 B `DepthTopK`, `pair`'s row → the depth ring's
+        // slot (`try_push_ref`, the only copy), per emitted snapshot — the
+        // ring is what hands it to the strategy thread — rejected: building
+        // it in the slot (the pair keeps its own row to gate the next one).
+        if !depth_tx.try_push_ref(stale) {
             status.inc_depth_ring_drops();
         }
-        *last = stale;
+        pair.commit();
         return;
     }
     if is_snapshot {
@@ -1774,13 +1882,19 @@ fn deribit_depth_step<C: Capture>(
     }
     match crate::walk_book_levels(payload, ladder) {
         Some(_) => {
-            let snap = ladder.snapshot(now_ns(), VenueId::Deribit, sym, 0);
-            if !book_builder::ladder::levels_equal(&snap, last) {
-                capture.depth(&snap);
-                if depth_tx.try_push(snap).is_err() {
+            ladder.snapshot_into(now_ns(), VenueId::Deribit, sym, 0, pair.spare_mut());
+            let (snap, last) = pair.spare_and_last();
+            if !book_builder::ladder::levels_equal(snap, last) {
+                capture.depth(snap);
+                // COPY: one 192 B `DepthTopK`, `pair`'s row → the depth
+                // ring's slot (`try_push_ref`, the only copy), per CHANGED
+                // snapshot — the ring hands it to the strategy thread —
+                // rejected: building it in the slot (the pair keeps its own
+                // row to gate the next one).
+                if !depth_tx.try_push_ref(snap) {
                     status.inc_depth_ring_drops();
                 }
-                *last = snap;
+                pair.commit();
             }
         }
         None => {
@@ -1826,15 +1940,14 @@ fn log_gap_rate_limited(
     let mut digits = [0u8; 20];
     let mut n = 0usize;
     let mut ok = true;
-    let put =
-        |buf: &mut [u8; 224], n: &mut usize, ok: &mut bool, src: &[u8]| match crate::push_bytes(
-            &mut buf[..],
-            *n,
-            src,
-        ) {
-            Some(e) => *n = e,
-            None => *ok = false,
-        };
+    let put = |buf: &mut [u8; 224], n: &mut usize, ok: &mut bool, src: &[u8]| match push_bytes(
+        &mut buf[..],
+        *n,
+        src,
+    ) {
+        Some(e) => *n = e,
+        None => *ok = false,
+    };
     put(
         &mut buf,
         &mut n,
@@ -1877,6 +1990,20 @@ fn log_gap_rate_limited(
         let mut err = std::io::stderr().lock();
         let _ = std::io::Write::write_all(&mut err, &buf[..n]);
     }
+}
+
+/// Append `src` at `at` in a WARN line's stack buffer; `None` when it
+/// does not fit.
+#[inline]
+fn push_bytes(dst: &mut [u8], at: usize, src: &[u8]) -> Option<usize> {
+    let end = at.checked_add(src.len())?;
+    // COPY: WARN-line text into the caller's stack line (≤ 224 B gap, ≤ 160 B
+    // sub-drop, ≤ 1 per GAP_LOG_INTERVAL_NS, 1 s) — a WARN line must reach
+    // stderr in ONE write — rejected: one write per part (interleaves) and one
+    // `writev` (a short writev splits the line; `write_all_vectored` is
+    // unstable).
+    dst.get_mut(at..end)?.copy_from_slice(src);
+    Some(end)
 }
 
 /// Render `v` as `0x`-prefixed lowercase hex (SymbolId display form —
@@ -1922,18 +2049,12 @@ fn fmt_i64(v: i64, scratch: &mut [u8; 20]) -> &[u8] {
 fn register_confirmed_subs(drv: &mut Driver, found: u128) {
     let mut i = 0;
     while i < drv.symbols.len() {
-        // Instrument bytes copied to end the immutable table borrow
-        // before the mutable subs borrow (two-phase pattern).
-        let mut instr_buf = [0u8; crate::DERIBIT_INSTR_MAX];
-        let instr_len = {
-            let Some((instr, _sym)) = drv.symbols.get(i) else {
-                debug_assert!(false, "row {i} < len() must exist");
-                break;
-            };
-            instr_buf[..instr.len()].copy_from_slice(instr);
-            instr.len()
+        // The instrument is read in place: `subs` is a field disjoint
+        // from `symbols`.
+        let Some((instr, _sym)) = drv.symbols.get(i) else {
+            debug_assert!(false, "row {i} < len() must exist");
+            break;
         };
-        let instr = &instr_buf[..instr_len];
         let mut c = 0;
         while c < CHANNELS_PER_INSTR {
             if !row_wants_channel(&drv.symbols, i, c, drv.depth_enabled) {
@@ -2048,15 +2169,14 @@ fn log_sub_drop_rate_limited(drv: &mut Driver, sym: u32, code: i64, ch: i64) {
     let mut digits = [0u8; 20];
     let mut n = 0usize;
     let mut ok = true;
-    let put =
-        |buf: &mut [u8; 160], n: &mut usize, ok: &mut bool, src: &[u8]| match crate::push_bytes(
-            &mut buf[..],
-            *n,
-            src,
-        ) {
-            Some(e) => *n = e,
-            None => *ok = false,
-        };
+    let put = |buf: &mut [u8; 160], n: &mut usize, ok: &mut bool, src: &[u8]| match push_bytes(
+        &mut buf[..],
+        *n,
+        src,
+    ) {
+        Some(e) => *n = e,
+        None => *ok = false,
+    };
     put(
         &mut buf,
         &mut n,
@@ -2142,9 +2262,10 @@ pub fn run<T: Transport, C: Capture>(
         return RunResult::Error;
     }
     let mut last_interest = transport.interest();
+    let mut repoll_now = false;
 
     while !stop.load(Ordering::Relaxed) {
-        if let Err(e) = poll.poll(events, Some(std::time::Duration::from_millis(50))) {
+        if let Err(e) = poll.poll(events, Some(core_net::poll_timeout(repoll_now))) {
             status.note_session_err(
                 core_metrics::ERR_SITE_POLL,
                 core_metrics::io_kind_code(e.kind()),
@@ -2169,25 +2290,18 @@ pub fn run<T: Transport, C: Capture>(
             note_transport_ready(drv, transport_status);
         }
 
-        // Tight inner drain (see ingress-polymarket for rationale).
-        loop {
-            let n_before = producer.len();
-            let state_before = drv.state();
-            if let Err(e) = drive_one(
-                transport, drv, host, path, producer, event_tx, event_mask, depth_tx, opt_tx,
-                status, capture,
-            ) {
-                status.note_session_err(
-                    core_metrics::ERR_SITE_DRIVE,
-                    core_metrics::io_kind_code(e.kind()),
-                );
+        // I-3 (core_net::drain): drive until a step leaves nothing
+        // behind; re-poll at once if the step cap cut a backlog short.
+        match drive_until_idle(
+            transport, drv, host, path, producer, event_tx, event_mask, depth_tx, opt_tx, status,
+            capture,
+        ) {
+            Drained::Idle => repoll_now = false,
+            Drained::Capped => repoll_now = true,
+            Drained::Closed => return RunResult::Disconnected,
+            Drained::Failed(kind) => {
+                status.note_session_err(core_metrics::ERR_SITE_DRIVE, core_metrics::io_kind_code(kind));
                 return RunResult::Error;
-            }
-            if drv.state() == State::Closed {
-                return RunResult::Disconnected;
-            }
-            if producer.len() == n_before && drv.state() == state_before {
-                break;
             }
         }
 
@@ -2265,6 +2379,7 @@ pub fn run<T: Transport, C: Capture>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use book_builder::{ApplyOutcome, TopOfBook};
     use core_net::{
         expected_accept as expected_accept_pub, sec_websocket_key_from_seed as sec_key_pub,
         KeepaliveCfg, TestTransport,
@@ -2394,7 +2509,7 @@ mod tests {
         producer: &mut Producer<Tick, TICK_RING_CAP>,
         status: &IngressStatus,
         capture: &mut C,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         let (mut etx, _erx) = event_ring_pair();
         let (mut dtx, _drx) = depth_ring_pair();
         let (mut otx, _orx) = opt_ring_pair();
@@ -2456,6 +2571,31 @@ mod tests {
         let mut frame = vec![0u8; body.len() + 8];
         let n = wrap_text_frame(body, &mut frame);
         t.inject_incoming(&frame[..n]);
+    }
+
+    /// The WS Ping echo goes rx → tx with no scratch (the BX0 shape): an
+    /// empty, a 4 B and a 125 B (control-frame cap) ping each come back
+    /// as exactly one masked pong carrying the same bytes.
+    #[test]
+    fn a_ws_ping_is_echoed_straight_from_rx() {
+        for payload in TestTransport::PING_ECHO_CASES {
+            let mut t = TestTransport::with_capacity(4096);
+            let mut d = steady_driver(false);
+            let (mut prod, _cons) = ring_pair();
+            let status = IngressStatus::new();
+            t.inject_server_ping(payload);
+            drive_one(
+                &mut t,
+                &mut d,
+                b"host",
+                b"/",
+                &mut prod,
+                &status,
+                &mut NullCapture,
+            )
+            .unwrap();
+            t.expect_pong_echo(payload);
+        }
     }
 
     #[test]
@@ -2543,7 +2683,7 @@ mod tests {
     fn subscribe_result_confirms_all_channels() {
         let mut t = TestTransport::with_capacity(16384);
         let mut d = steady_driver(false);
-        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        record_pending(&mut d.pending, 2, DeribitReqKind::SubscribeAll).unwrap();
         let status = IngressStatus::new();
         let (mut prod, _cons) = ring_pair();
 
@@ -2583,7 +2723,7 @@ mod tests {
         }
         let mut t = TestTransport::with_capacity(16384);
         let mut d = steady_driver(false);
-        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        record_pending(&mut d.pending, 2, DeribitReqKind::SubscribeAll).unwrap();
         let status = IngressStatus::new();
         let (mut prod, _cons) = ring_pair();
 
@@ -2624,7 +2764,7 @@ mod tests {
         let mut t = TestTransport::with_capacity(16384);
         let mut d = steady_driver(false);
         d.subs_ever_confirmed = true; // a boot session verified fully
-        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        record_pending(&mut d.pending, 2, DeribitReqKind::SubscribeAll).unwrap();
         let status = IngressStatus::new();
         let (mut prod, mut cons) = ring_pair();
         let mut cap = EventRecCap::default();
@@ -2673,7 +2813,7 @@ mod tests {
         let quote = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC-PERPETUAL","data":{"timestamp":1550658624149,"instrument_name":"BTC-PERPETUAL","best_bid_price":3914.97,"best_bid_amount":40,"best_ask_price":3996.61,"best_ask_amount":50}}}"#;
         inject_text(&mut t, quote);
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
-        let tick = cons.try_pop().expect("echoed channel keeps flowing");
+        let tick = *cons.try_pop_ref().expect("echoed channel keeps flowing");
         assert_eq!(tick.sym, SYM_BTC);
     }
 
@@ -2692,7 +2832,7 @@ mod tests {
         d.next_req_id = 3;
         d.subscribe_req_id = 2;
         d.subs_ever_confirmed = true;
-        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        record_pending(&mut d.pending, 2, DeribitReqKind::SubscribeAll).unwrap();
         let status = IngressStatus::new();
         let (mut prod, _cons) = ring_pair();
         let mut cap = EventRecCap::default();
@@ -2725,7 +2865,7 @@ mod tests {
         let mut t = TestTransport::with_capacity(16384);
         let mut d = steady_driver(false);
         assert!(!d.subs_ever_confirmed);
-        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        record_pending(&mut d.pending, 2, DeribitReqKind::SubscribeAll).unwrap();
         let status = IngressStatus::new();
         let (mut prod, _cons) = ring_pair();
 
@@ -2873,11 +3013,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status.ticks_total(), 1, "quote push is a tick");
-        let _ = cons.try_pop().expect("tick must be pushed");
+        let _ = cons.try_pop_ref().expect("tick must be pushed");
     }
 
     #[test]
-    fn quote_push_emits_tick_with_venue_byte_and_ms_seq() {
+    fn quote_push_emits_tick_with_venue_byte_and_ordinal_seq() {
         let mut t = TestTransport::with_capacity(8192);
         let mut d = steady_driver(false);
         let status = IngressStatus::new();
@@ -2899,19 +3039,293 @@ mod tests {
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.ring_drops_total(), 0);
 
-        let tick = cons.try_pop().expect("tick must be pushed");
+        let tick = *cons.try_pop_ref().expect("tick must be pushed");
         assert_eq!(tick.sym, SYM_BTC);
         assert_eq!(tick.venue, VenueId::Deribit as u8);
-        // venue_seq = venue ms timestamp truncated to u32 (crate doc).
-        assert_eq!(tick.venue_seq, 1_550_658_624_149u64 as u32);
+        // HK32: venue_seq = the instrument's arrival ordinal (crate doc).
+        assert_eq!(tick.venue_seq, 1);
         assert_eq!(tick.bid_px.raw(), 3_914_970_000);
         assert_eq!(tick.ask_px.raw(), 3_996_610_000);
         assert_eq!(tick.bid_qty.raw(), 40_000_000);
         assert_eq!(tick.ask_qty.raw(), 50_000_000);
         assert!(tick.ts_ns > 0);
-        // VT2: the venue stamp rides the slot in full (venue_seq keeps
-        // its truncated-u32 law).
+        // VT2: the venue stamp rides the slot in full.
         assert_eq!(tick.venue_time_ms, 1_550_658_624_149);
+    }
+
+    /// HK32 rig: a steady driver over the test symbols (`BTC-PERPETUAL`,
+    /// `ETH-PERPETUAL`); `feed` drives one payload and returns its ticks
+    /// in ring order.
+    struct SeqRig {
+        t: TestTransport,
+        d: Driver,
+        prod: Producer<Tick, TICK_RING_CAP>,
+        cons: core_ring::Consumer<Tick, TICK_RING_CAP>,
+        status: IngressStatus,
+    }
+
+    impl SeqRig {
+        fn new() -> Self {
+            let (prod, cons) = ring_pair();
+            Self {
+                t: TestTransport::with_capacity(16 * 1024),
+                d: steady_driver(false),
+                prod,
+                cons,
+                status: IngressStatus::new(),
+            }
+        }
+
+        fn feed(&mut self, payload: &str) -> Vec<Tick> {
+            inject_text(&mut self.t, payload.as_bytes());
+            drive_one(
+                &mut self.t,
+                &mut self.d,
+                b"h",
+                b"/",
+                &mut self.prod,
+                &self.status,
+                &mut NullCapture,
+            )
+            .unwrap();
+            let mut out = Vec::new();
+            while let Some(t) = self.cons.try_pop_ref() {
+                out.push(*t);
+            }
+            out
+        }
+
+        /// A reconnect, then the steady shape `steady_driver` builds.
+        fn reconnect(&mut self) {
+            self.d.reset_for_reconnect(9);
+            self.d.set_state(State::Steady);
+            self.d.session_started = true;
+            self.d.next_req_id = 3;
+            self.d.subscribe_req_id = 2;
+        }
+    }
+
+    /// A live-shape `quote` push for `instr` stamped `ms`: `bid` × 40 /
+    /// `ask` × 50.
+    fn quote_frame(instr: &str, ms: u64, bid: &str, ask: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"subscription","params":{{"channel":"quote.{instr}","data":{{"timestamp":{ms},"instrument_name":"{instr}","best_bid_price":{bid},"best_bid_amount":40.0,"best_ask_price":{ask},"best_ask_amount":50.0}}}}}}"#
+        )
+    }
+
+    /// A live stamp (the 2026-10-15 hour).
+    const T0: u64 = 1_792_071_174_266;
+
+    /// HK32: two quotes for one instrument in one millisecond (67 in the
+    /// 2026-10-15 hour) are two updates — both apply and the second's
+    /// touch is the book's. Old law: one seq, the second `Stale`.
+    #[test]
+    fn same_ms_quotes_both_apply_and_the_second_is_the_touch() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        let a = r.feed(&quote_frame("BTC-PERPETUAL", T0, "80384.5", "80389.0"));
+        let b = r.feed(&quote_frame("BTC-PERPETUAL", T0, "80385.0", "80388.5"));
+        assert_eq!(book.apply(&a[0]), ApplyOutcome::Applied);
+        assert_eq!(
+            book.apply(&b[0]),
+            ApplyOutcome::Applied,
+            "same ms, later arrival"
+        );
+        assert_eq!(
+            (book.bid_px.raw(), book.ask_px.raw()),
+            (80_385_000_000, 80_388_500_000)
+        );
+        assert_eq!(book.stale_drops(), 0);
+    }
+
+    /// HK32: a quote OLDER than its instrument's newest (115 in the
+    /// 2026-10-15 hour, all in the backlog after a host stall) carries 0 —
+    /// `Stale` at every book, one that missed the newest quote included —
+    /// takes no ordinal and is counted; the quote back at the newest stamp
+    /// applies (old law: `Stale`, its seq equal to the newest's). Old law
+    /// also: a book that missed the newest applied the older touch, and
+    /// nothing was counted.
+    #[test]
+    fn an_older_quote_is_stale_at_every_book_counted_and_the_ordinal_holds() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        // Never sees the newest quote (a ring drop, a late slot claim).
+        let mut missed = TopOfBook::empty(SYM_BTC);
+        let newest = r.feed(&quote_frame("BTC-PERPETUAL", T0, "80384.5", "80389.0"));
+        let older = r.feed(&quote_frame(
+            "BTC-PERPETUAL",
+            T0 - 220,
+            "80384.5",
+            "80390.0",
+        ));
+        let back = r.feed(&quote_frame("BTC-PERPETUAL", T0, "80385.0", "80389.0"));
+        assert_eq!(book.apply(&newest[0]), ApplyOutcome::Applied);
+        assert_eq!(book.apply(&older[0]), ApplyOutcome::Stale);
+        assert_eq!(missed.apply(&older[0]), ApplyOutcome::Stale);
+        assert!(!missed.has_quotes());
+        assert_eq!(
+            book.apply(&back[0]),
+            ApplyOutcome::Applied,
+            "back at the newest stamp"
+        );
+        assert_eq!(book.bid_px.raw(), 80_385_000_000);
+        assert_eq!(book.gaps(), 0, "the older quote took no ordinal");
+        assert_eq!(r.status.seq_regressions_total(), 1);
+    }
+
+    /// HK32: each instrument counts from 1 on its own. Old law: every
+    /// quote carried its stamp's low 32 bits.
+    #[test]
+    fn interleaved_instruments_keep_independent_ordinals_from_1() {
+        let mut r = SeqRig::new();
+        let mut seqs = Vec::new();
+        for (instr, ms) in [
+            ("BTC-PERPETUAL", T0),
+            ("ETH-PERPETUAL", T0),
+            ("BTC-PERPETUAL", T0),
+            ("ETH-PERPETUAL", T0 + 1),
+            ("BTC-PERPETUAL", T0 + 1),
+        ] {
+            let t = r.feed(&quote_frame(instr, ms, "100.0", "101.0"));
+            seqs.extend(t.iter().map(|t| (t.sym, t.venue_seq)));
+        }
+        const SYM_ETH: u32 = (3 << 24) | 2;
+        assert_eq!(
+            seqs,
+            [
+                (SYM_BTC, 1),
+                (SYM_ETH, 1),
+                (SYM_BTC, 2),
+                (SYM_ETH, 2),
+                (SYM_BTC, 3)
+            ]
+        );
+    }
+
+    /// HK32: a reconnect keeps the ordinal — the subscribe-time quote of the
+    /// new connection in the same ms as the last one of the old applies (3
+    /// after 1, 2) and the stream goes on from it, dense. Old law: that
+    /// quote was `Stale`.
+    #[test]
+    fn the_ordinal_stays_monotone_across_a_reconnect() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        let mut ticks = r.feed(&quote_frame("BTC-PERPETUAL", T0, "80384.5", "80389.0"));
+        ticks.extend(r.feed(&quote_frame("BTC-PERPETUAL", T0, "80385.0", "80389.0")));
+        r.reconnect();
+        ticks.extend(r.feed(&quote_frame("BTC-PERPETUAL", T0, "80385.5", "80389.0")));
+        ticks.extend(r.feed(&quote_frame("BTC-PERPETUAL", T0 + 1, "80385.5", "80388.0")));
+        for t in &ticks {
+            assert_eq!(book.apply(t), ApplyOutcome::Applied);
+        }
+        let seqs: Vec<u32> = ticks.iter().map(|t| t.venue_seq).collect();
+        assert_eq!(seqs, [1, 2, 3, 4]);
+        assert_eq!(book.ask_px.raw(), 80_388_000_000);
+        assert_eq!(book.gaps(), 0, "dense: no tick lost");
+    }
+
+    /// HK32: one far-future stamp poisons its instrument's clock — later
+    /// normal quotes are older, take 0, are `Stale` and COUNTED (the stuck
+    /// instrument shows); the other instrument's clock is its own; a
+    /// reconnect clears the clock and keeps the ordinal. Old law: nothing
+    /// counted, and no reconnect could clear it.
+    #[test]
+    fn a_far_future_stamp_is_counted_until_a_reconnect_clears_it() {
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        let mut ticks = r.feed(&quote_frame("BTC-PERPETUAL", T0, "80384.5", "80389.0"));
+        ticks.extend(r.feed(&quote_frame(
+            "BTC-PERPETUAL",
+            T0 + 86_400_000,
+            "80384.5",
+            "80389.0",
+        )));
+        for ms in [T0 + 1, T0 + 2] {
+            ticks.extend(r.feed(&quote_frame("BTC-PERPETUAL", ms, "80385.0", "80389.0")));
+        }
+        assert_eq!(r.status.seq_regressions_total(), 2);
+        let eth = r.feed(&quote_frame("ETH-PERPETUAL", T0 + 3, "2340.0", "2341.0"));
+        assert_eq!(eth[0].venue_seq, 1);
+        assert_eq!(r.status.seq_regressions_total(), 2);
+        r.reconnect();
+        ticks.extend(r.feed(&quote_frame("BTC-PERPETUAL", T0 + 4, "80386.0", "80389.0")));
+        let seqs: Vec<u32> = ticks.iter().map(|t| t.venue_seq).collect();
+        assert_eq!(seqs, [1, 2, 0, 0, 3]);
+        let outcomes: Vec<ApplyOutcome> = ticks.iter().map(|t| book.apply(t)).collect();
+        assert_eq!(
+            outcomes,
+            [
+                ApplyOutcome::Applied,
+                ApplyOutcome::Applied,
+                ApplyOutcome::Stale,
+                ApplyOutcome::Stale,
+                ApplyOutcome::Applied
+            ]
+        );
+        assert_eq!(book.bid_px.raw(), 80_386_000_000);
+        assert_eq!(r.status.seq_regressions_total(), 2);
+    }
+
+    /// HK32: no wrap — across the low-32-bit ms boundary (next at
+    /// 2026-11-21 21:25:29.728Z) the stream keeps applying. Old law: the
+    /// seq fell from `u32::MAX` to 0 and every later quote was `Stale`
+    /// until a restart.
+    #[test]
+    fn the_low_32_bit_ms_boundary_does_not_wrap_the_ordinal() {
+        const WRAP: u64 = 418 << 32; // 1 795 296 329 728 ms
+        let mut r = SeqRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        let mut seqs = Vec::new();
+        for ms in [WRAP - 1, WRAP, WRAP + 1] {
+            let t = r.feed(&quote_frame("BTC-PERPETUAL", ms, "80384.5", "80389.0"));
+            assert_eq!(book.apply(&t[0]), ApplyOutcome::Applied, "{ms}");
+            seqs.push(t[0].venue_seq);
+        }
+        assert_eq!(seqs, [1, 2, 3]);
+    }
+
+    /// I-3: a burst of non-tick frames past a full rx no longer strands
+    /// what follows it until the next readiness edge — one drain reads it
+    /// all, the tick behind it included; a backlog past `DRAIN_STEP_CAP`
+    /// full-rx steps ends `Capped` (the loop re-polls at once) and the
+    /// next drain finishes it.
+    #[test]
+    fn drive_until_idle_reads_past_a_full_rx_and_caps_a_backlog() {
+        let quote = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC-PERPETUAL","data":{"timestamp":1550658624149,"instrument_name":"BTC-PERPETUAL","best_bid_price":3914.97,"best_bid_amount":40.0,"best_ask_price":3996.61,"best_ask_amount":50.0}}}"#;
+        for (fills, first) in [(2, Drained::Idle), (core_net::DRAIN_STEP_CAP as usize, Drained::Capped)] {
+            let mut t = TestTransport::with_capacity((fills + 1) * RX_BUF_SIZE);
+            let mut d = steady_driver(false);
+            let (mut prod, mut cons) = ring_pair();
+            let (mut etx, _erx) = event_ring_pair();
+            let (mut dtx, _drx) = depth_ring_pair();
+            let (mut otx, _orx) = opt_ring_pair();
+            let status = IngressStatus::new();
+            t.inject_server_pongs(fills * RX_BUF_SIZE);
+            inject_text(&mut t, quote);
+            for expect in [first, Drained::Idle] {
+                assert_eq!(
+                    drive_until_idle(
+                        &mut t,
+                        &mut d,
+                        b"h",
+                        b"/",
+                        &mut prod,
+                        &mut etx,
+                        core_types::EVENT_LANE_FUNDING,
+                        &mut dtx,
+                        &mut otx,
+                        &status,
+                        &mut NullCapture,
+                    ),
+                    expect
+                );
+                if expect == Drained::Capped {
+                    assert!(cons.try_pop_ref().is_none(), "the tick still waits below the cap");
+                }
+            }
+            assert_eq!(cons.try_pop_ref().expect("the tick behind the burst").sym, SYM_BTC);
+            assert_eq!(t.incoming_len(), 0, "every byte was read");
+        }
     }
 
     /// VT2 helper: one two-sided `quote.BTC-PERPETUAL` push stamped
@@ -2929,7 +3343,7 @@ mod tests {
         );
         inject_text(t, s.as_bytes());
         drive_one(t, d, b"h", b"/", prod, status, &mut NullCapture).unwrap();
-        cons.try_pop().expect("quote must produce a tick")
+        *cons.try_pop_ref().expect("quote must produce a tick")
     }
 
     #[test]
@@ -3005,7 +3419,7 @@ mod tests {
         .unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
-        assert!(cons.try_pop().is_none());
+        assert!(cons.try_pop_ref().is_none());
     }
 
     #[test]
@@ -3049,7 +3463,7 @@ mod tests {
         let mut t = TestTransport::with_capacity(8192);
         let mut d = steady_driver(false);
         d.subs_ever_confirmed = true;
-        record_pending(&mut d, 9, DeribitReqKind::BookSub).unwrap();
+        record_pending(&mut d.pending, 9, DeribitReqKind::BookSub).unwrap();
         let status = IngressStatus::new();
         let (mut prod, _cons) = ring_pair();
         let mut cap = EventRecCap::default();
@@ -3120,7 +3534,7 @@ mod tests {
         let mut t = TestTransport::with_capacity(16384);
         let mut d = steady_driver(false);
         d.set_establish_budget_ns(1);
-        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        record_pending(&mut d.pending, 2, DeribitReqKind::SubscribeAll).unwrap();
         let status = IngressStatus::new();
         let (mut prod, _cons) = ring_pair();
         let stop = StopFlag::new(false);
@@ -3178,7 +3592,7 @@ mod tests {
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.parse_errors_total(), 0);
         assert!(
-            cons.try_pop().is_none(),
+            cons.try_pop_ref().is_none(),
             "tickers do not enter the Tick lane"
         );
     }
@@ -3276,7 +3690,7 @@ mod tests {
         d.session_started = true;
         d.next_req_id = 3;
         d.subscribe_req_id = 2;
-        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        record_pending(&mut d.pending, 2, DeribitReqKind::SubscribeAll).unwrap();
         let status = IngressStatus::new();
         let (mut prod, mut cons) = ring_pair();
 
@@ -3311,7 +3725,7 @@ mod tests {
             &mut NullCapture,
         )
         .unwrap();
-        let tick = cons.try_pop().expect("spot BBO rings");
+        let tick = *cons.try_pop_ref().expect("spot BBO rings");
         assert_eq!(tick.sym, (3 << 24) | 2);
     }
 
@@ -3330,7 +3744,7 @@ mod tests {
         d.session_started = true;
         d.next_req_id = 3;
         d.subscribe_req_id = 2;
-        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        record_pending(&mut d.pending, 2, DeribitReqKind::SubscribeAll).unwrap();
         let status = IngressStatus::new();
         let (mut prod, mut cons) = ring_pair();
 
@@ -3360,7 +3774,7 @@ mod tests {
             &mut NullCapture,
         )
         .unwrap();
-        let tick = cons.try_pop().expect("combo BBO rings");
+        let tick = *cons.try_pop_ref().expect("combo BBO rings");
         assert_eq!(tick.sym, (3 << 24) | 1025);
     }
 
@@ -3764,12 +4178,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(cap.events, 2, "capture: Ticker + Funding");
-        let ev = erx.try_pop().expect("funding event on the lane");
+        let ev = *erx.try_pop_ref().expect("funding event on the lane");
         assert_eq!(ev.channel, core_types::ChannelId::Funding as u8);
         assert_eq!(ev.v0, 420_000, "0.00042 ×1e9");
         assert_eq!(ev.v1, 0, "no funding_8h in this frame ⇒ v1 = 0 (VM2 V2)");
         assert!(
-            erx.try_pop().is_none(),
+            erx.try_pop_ref().is_none(),
             "Ticker event is NOT on the lane (mask gates per channel)"
         );
         assert_eq!(status.event_ring_drops_total(), 0);
@@ -3817,19 +4231,16 @@ mod tests {
         );
         assert_eq!(status.parse_errors_total(), 2);
         // Tick still captured when the ring is full: fill it, resend.
-        while prod
-            .try_push(Tick::new(
-                1,
-                VenueId::Deribit,
-                SYM_BTC,
-                1,
-                Price::from_raw(1),
-                Qty::from_raw(1),
-                Price::from_raw(2),
-                Qty::from_raw(1),
-            ))
-            .is_ok()
-        {}
+        while prod.try_push_ref(&Tick::new(
+            1,
+            VenueId::Deribit,
+            SYM_BTC,
+            1,
+            Price::from_raw(1),
+            Qty::from_raw(1),
+            Price::from_raw(2),
+            Qty::from_raw(1),
+        )) {}
         inject_text(&mut t, quote);
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
         assert_eq!(cap.ticks, 2, "ring-dropped tick still captured");
@@ -3857,6 +4268,74 @@ mod tests {
         .unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
+    }
+
+    /// HK3: the worst batched subscribe — every static and option row at
+    /// the longest instrument, depth on, every DVOL index at its longest —
+    /// renders within [`SUB_PAYLOAD_MAX`], which the tx sizing assert is
+    /// built on. And `found_mask` reads the render's own spelling: the
+    /// subscribe result that echoes every rendered name confirms every row.
+    #[test]
+    fn the_worst_batched_subscribe_fits_its_bound_and_confirms_itself() {
+        let mut syms = DeribitSymbolTable::new();
+        let mut i = 0u32;
+        while (i as usize) < crate::DERIBIT_STATIC_MAX {
+            // A dash makes it a future (four channels), not spot (two).
+            let mut name = [b'F'; crate::DERIBIT_INSTR_MAX];
+            name[0] = b'A' + (i as u8);
+            name[1] = b'-';
+            syms.insert(&name, (3 << 24) | (1 + i)).unwrap();
+            i += 1;
+        }
+        let mut j = 0u32;
+        while (j as usize) < crate::DERIBIT_OPT_MAX {
+            let mut name = [b'O'; crate::DERIBIT_INSTR_MAX];
+            name[0] = b'A' + (j / 26) as u8;
+            name[1] = b'A' + (j % 26) as u8;
+            syms.insert_option(&name, (3 << 24) | (512 + j)).unwrap();
+            j += 1;
+        }
+        let dvol = [(16u8, [b'v'; 16]); crate::DERIBIT_DVOL_MAX];
+        let mut tx = IoBuf::with_capacity(TX_BUF_SIZE);
+        let mut ctr = 0u64;
+        queue_masked_text_frame_rendered(&mut tx, &mut ctr, |p| {
+            render_subscribe_all(p, u64::MAX, &syms, true, &dvol)
+        })
+        .unwrap();
+        assert!(tx.len() <= SUB_PAYLOAD_MAX + core_net::WS_CLIENT_HDR_MAX);
+
+        // The render read back by the result check: the request itself,
+        // unmasked, names every channel it subscribed, so it confirms
+        // every row (statics: four bits each; options: one folded bit each).
+        let WsReadResult::Frame { header, payload } = ws_read_frame(tx.filled()) else {
+            panic!("one whole frame in tx");
+        };
+        let mut request = tx.filled()[payload.start..payload.end].to_vec();
+        if header.masked {
+            ws_unmask_in_place(&mut request, header.mask);
+        }
+        let m = found_mask(&request, &syms, true);
+        assert_eq!(m, expected_mask(&syms, true));
+        assert_eq!(m.count_ones() as usize, 4 * crate::DERIBIT_STATIC_MAX + crate::DERIBIT_OPT_MAX);
+    }
+
+    /// HK2: a push that arrives in the same read as the venue's FIN is
+    /// published before the session closes. Before, the EOF set `Closed`
+    /// ahead of the state machine and the push was dropped.
+    #[test]
+    fn a_frame_that_arrives_with_the_fin_is_published_then_the_session_closes() {
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+        let quote = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC-PERPETUAL","data":{"timestamp":1550658624149,"instrument_name":"BTC-PERPETUAL","best_bid_price":3914.97,"best_bid_amount":40,"best_ask_price":3996.61,"best_ask_amount":50}}}"#;
+        inject_text(&mut t, quote);
+        t.mark_closed();
+        let full = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture)
+            .unwrap();
+        assert!(!full);
+        assert_eq!(cons.try_pop_ref().map(|t| t.sym), Some(SYM_BTC), "published before the close");
+        assert_eq!(d.state(), State::Closed);
     }
 
     #[test]
@@ -3891,7 +4370,7 @@ mod tests {
     #[test]
     fn reset_for_reconnect_clears_connection_state() {
         let mut d = steady_driver(true);
-        record_pending(&mut d, 9, DeribitReqKind::Test).unwrap();
+        record_pending(&mut d.pending, 9, DeribitReqKind::Test).unwrap();
         d.subs
             .insert(
                 sub_id_of(DeribitChannel::Quote, b"BTC-PERPETUAL"),

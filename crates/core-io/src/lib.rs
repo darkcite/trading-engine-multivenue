@@ -38,7 +38,7 @@ pub use pmlr::{
 };
 pub use pmlr_reader::{PmlrReadErr, PmlrReader};
 pub use slot_capture::SlotCapture;
-pub use state_file::write_atomic;
+pub use state_file::{tmp_path, write_atomic, write_atomic_at};
 
 use std::fs::File;
 use std::io::{self, Write};

@@ -19,7 +19,7 @@
 //! per selected option instrument —
 //! `<venue_label>\t<sym_u32_decimal>\t<instrument_name>\n` — where
 //! `venue_label` is the venue's capture-file prefix (`deribit`, `okx`,
-//! `bn`). No header line. The file exists only when the boot selected
+//! `bn`, `hypercall` since HC4). No header line. The file exists only when the boot selected
 //! ≥ 1 option instrument; absence = an options-less (or pre-M2-close)
 //! run. Readers parse strictly and skip-and-count malformed lines
 //! (worker labeling.py discipline).
@@ -37,7 +37,8 @@ pub const OPTIONS_MANIFEST_FILE: &str = "options-manifest.tsv";
 /// EVERY allocated instrument on every venue, `<sym_u32>\t<descriptor>`
 /// per line (descriptors are the §9.4 worker map-name convention,
 /// baked engine-side: PM token ids bare; `binance:` / `binance-usdm:` /
-/// `okx:` / `deribit:` / `hyperliquid:` from the allocation lane;
+/// `binance-coinm:` (BX2) / `okx:` / `deribit:` / `hyperliquid:` from
+/// the allocation lane;
 /// options `deribit:`/`okx:`/`binance-opt:` + instrument name). Written
 /// on EVERY boot (a boot always has ≥ 1 instrument — venue-blind boots
 /// refuse). [`OPTIONS_MANIFEST_FILE`] stays for one release for
@@ -50,7 +51,8 @@ pub const INSTRUMENT_MANIFEST_FILE: &str = "instrument-manifest.tsv";
 pub fn render(
     deribit: &[crate::paper::DiscoveredOption],
     okx: &[(String, SymbolId)],
-    bn: &[(String, SymbolId, u8)],
+    bn: &[(String, SymbolId)],
+    hypercall: &[crate::paper::DiscoveredOption],
 ) -> String {
     let mut out = String::new();
     for (name, sym, ..) in deribit {
@@ -59,8 +61,11 @@ pub fn render(
     for (name, sym) in okx {
         push_row(&mut out, "okx", *sym, name);
     }
-    for (name, sym, _uly_idx) in bn {
+    for (name, sym) in bn {
         push_row(&mut out, "bn", *sym, name);
+    }
+    for (name, sym, ..) in hypercall {
+        push_row(&mut out, "hypercall", *sym, name);
     }
     out
 }
@@ -73,7 +78,8 @@ pub fn render_instruments(
     allocated: &AllocatedUniverse,
     deribit_opts: &[crate::paper::DiscoveredOption],
     okx_opts: &[(String, SymbolId)],
-    bn_opts: &[(String, SymbolId, u8)],
+    bn_opts: &[(String, SymbolId)],
+    hypercall_opts: &[crate::paper::DiscoveredOption],
 ) -> String {
     let mut out = String::new();
     for t in &allocated.pm_tokens {
@@ -90,6 +96,14 @@ pub fn render_instruments(
     // missing from the manifest until the first offline consumer
     // (carry_signal) needed a Bybit descriptor.
     for i in &allocated.bn_dated {
+        push_desc_row(&mut out, i.sym, &i.descriptor);
+    }
+    // BX2: the COIN-M blocks (empty without `coinm` / `coinm_dated`, so
+    // a pre-BX2 boot's manifest is byte-identical).
+    for i in &allocated.bn_coinm {
+        push_desc_row(&mut out, i.sym, &i.descriptor);
+    }
+    for i in &allocated.bn_coinm_dated {
         push_desc_row(&mut out, i.sym, &i.descriptor);
     }
     for i in &allocated.okx {
@@ -110,6 +124,19 @@ pub fn render_instruments(
     for i in &allocated.bybit_linear {
         push_desc_row(&mut out, i.sym, &i.descriptor);
     }
+    // MX2: the seventh venue's two blocks (empty without `[mexc]`, so
+    // a pre-MX2 boot's manifest is byte-identical).
+    for i in &allocated.mexc_spot {
+        push_desc_row(&mut out, i.sym, &i.descriptor);
+    }
+    for i in &allocated.mexc_perp {
+        push_desc_row(&mut out, i.sym, &i.descriptor);
+    }
+    // HC4: the Hypercall settlement indices (empty without
+    // `[hypercall]`, so a pre-HC4 boot's manifest is byte-identical).
+    for i in &allocated.hypercall_idx {
+        push_desc_row(&mut out, i.sym, &i.descriptor);
+    }
     for (name, sym, ..) in deribit_opts {
         let desc = format!("deribit:{name}");
         push_desc_row(&mut out, *sym, &desc);
@@ -118,8 +145,12 @@ pub fn render_instruments(
         let desc = format!("okx:{name}");
         push_desc_row(&mut out, *sym, &desc);
     }
-    for (name, sym, _uly_idx) in bn_opts {
+    for (name, sym) in bn_opts {
         let desc = format!("binance-opt:{name}");
+        push_desc_row(&mut out, *sym, &desc);
+    }
+    for (name, sym, ..) in hypercall_opts {
+        let desc = format!("hypercall:{name}");
         push_desc_row(&mut out, *sym, &desc);
     }
     out
@@ -137,7 +168,8 @@ pub fn build_descriptor_entries(
     allocated: &AllocatedUniverse,
     deribit_opts: &[crate::paper::DiscoveredOption],
     okx_opts: &[(String, SymbolId)],
-    bn_opts: &[(String, SymbolId, u8)],
+    bn_opts: &[(String, SymbolId)],
+    hypercall_opts: &[crate::paper::DiscoveredOption],
     okx_depth: bool,
     deribit_depth: bool,
 ) -> Vec<(String, SymbolId, u8)> {
@@ -160,12 +192,17 @@ pub fn build_descriptor_entries(
         .iter()
         .chain(allocated.bn_usdm.iter())
         .chain(allocated.bn_dated.iter())
+        .chain(allocated.bn_coinm.iter())
+        .chain(allocated.bn_coinm_dated.iter())
         .chain(allocated.okx.iter())
         .chain(allocated.deribit.iter())
         .chain(allocated.deribit_combos.iter())
         .chain(allocated.hl.iter())
         .chain(allocated.bybit_spot.iter())
         .chain(allocated.bybit_linear.iter())
+        .chain(allocated.mexc_spot.iter())
+        .chain(allocated.mexc_perp.iter())
+        .chain(allocated.hypercall_idx.iter())
     {
         push(i.descriptor.clone(), i.sym);
     }
@@ -175,8 +212,11 @@ pub fn build_descriptor_entries(
     for (name, sym) in okx_opts {
         push(format!("okx:{name}"), *sym);
     }
-    for (name, sym, _uly_idx) in bn_opts {
+    for (name, sym) in bn_opts {
         push(format!("binance-opt:{name}"), *sym);
+    }
+    for (name, sym, ..) in hypercall_opts {
+        push(format!("hypercall:{name}"), *sym);
     }
     out
 }
@@ -225,21 +265,29 @@ mod tests {
             ),
         ];
         let okx = vec![("BTC-USD-260327-100000-C".to_string(), 0x0200_0201u32)];
-        let bn = vec![("BTC-260327-100000-C".to_string(), 0x0100_0401u32, 0u8)];
-        let body = render(&deribit, &okx, &bn);
+        let bn = vec![("BTC-260327-100000-C".to_string(), 0x0100_0401u32)];
+        let hc = vec![(
+            "SP500-20260930-7742.5-P".to_string(),
+            0x0900_0201u32,
+            7_742_500_000_000i64,
+            1_790_798_400_000i64,
+            opt_registry::RIGHT_PUT,
+        )];
+        let body = render(&deribit, &okx, &bn, &hc);
         let want = format!(
             "deribit\t{}\tBTC-27MAR26-100000-C\n\
              deribit\t{}\tBTC-27MAR26-100000-P\n\
              okx\t{}\tBTC-USD-260327-100000-C\n\
-             bn\t{}\tBTC-260327-100000-C\n",
-            0x0300_0201u32, 0x0300_0202u32, 0x0200_0201u32, 0x0100_0401u32
+             bn\t{}\tBTC-260327-100000-C\n\
+             hypercall\t{}\tSP500-20260930-7742.5-P\n",
+            0x0300_0201u32, 0x0300_0202u32, 0x0200_0201u32, 0x0100_0401u32, 0x0900_0201u32
         );
         assert_eq!(body, want);
     }
 
     #[test]
     fn empty_outcome_renders_empty() {
-        assert!(render(&[], &[], &[]).is_empty());
+        assert!(render(&[], &[], &[], &[]).is_empty());
     }
 
     #[test]
@@ -268,6 +316,18 @@ mod tests {
             name: "btcusdt_260925".to_string(),
             descriptor: "binance-usdm:btcusdt_260925".to_string(),
         });
+        // BX2: both COIN-M blocks (perps from 3072, delivery from 3584),
+        // one namespace.
+        alloc.bn_coinm.push(core_config::universe::Instrument {
+            sym: 0x0100_0C01,
+            name: "btcusd_perp".to_string(),
+            descriptor: "binance-coinm:btcusd_perp".to_string(),
+        });
+        alloc.bn_coinm_dated.push(core_config::universe::Instrument {
+            sym: 0x0100_0E01,
+            name: "btcusd_261225".to_string(),
+            descriptor: "binance-coinm:btcusd_261225".to_string(),
+        });
         alloc.deribit_combos.push(core_config::universe::Instrument {
             sym: 0x0300_0101,
             name: "BTC-FS-27MAR26_PERP".to_string(),
@@ -283,6 +343,17 @@ mod tests {
             name: "ADAUSDT".to_string(),
             descriptor: "bybit-linear:ADAUSDT".to_string(),
         });
+        // MX2: both MEXC blocks, spot from ordinal 1, perp from 512.
+        alloc.mexc_spot.push(core_config::universe::Instrument {
+            sym: 0x0700_0001,
+            name: "AAPLXUSDT".to_string(),
+            descriptor: "mexc:AAPLXUSDT".to_string(),
+        });
+        alloc.mexc_perp.push(core_config::universe::Instrument {
+            sym: 0x0700_0201,
+            name: "XAU_USDT".to_string(),
+            descriptor: "mexc-perp:XAU_USDT".to_string(),
+        });
         let deribit_opts = vec![(
             "BTC-27MAR26-100000-C".to_string(),
             0x0300_0201u32,
@@ -290,27 +361,86 @@ mod tests {
             1_774_598_400_000i64,
             opt_registry::RIGHT_CALL,
         )];
-        let bn_opts = vec![("BTC-260327-100000-C".to_string(), 0x0100_0401u32, 0u8)];
-        let body = render_instruments(&alloc, &deribit_opts, &[], &bn_opts);
+        // HC4: the Hypercall index block (a static lane) and its
+        // discovered options (the last block).
+        alloc.hypercall_idx.push(core_config::universe::Instrument {
+            sym: 0x0900_0001,
+            name: "SP500".to_string(),
+            descriptor: "hypercall-idx:SP500".to_string(),
+        });
+        let hc_opts = vec![(
+            "SP500-20260930-7742.5-P".to_string(),
+            0x0900_0201u32,
+            7_742_500_000_000i64,
+            1_790_798_400_000i64,
+            opt_registry::RIGHT_PUT,
+        )];
+        let bn_opts = vec![("BTC-260327-100000-C".to_string(), 0x0100_0401u32)];
+        let body = render_instruments(&alloc, &deribit_opts, &[], &bn_opts, &hc_opts);
         let want = format!(
             "42\t2875608808\n\
              {}\tbinance:btcusdt\n\
              {}\tbinance-usdm:btcusdt_260925\n\
+             {}\tbinance-coinm:btcusd_perp\n\
+             {}\tbinance-coinm:btcusd_261225\n\
              {}\tderibit:BTC-PERPETUAL\n\
              {}\tderibit:BTC-FS-27MAR26_PERP\n\
              {}\tbybit:BTCUSDT\n\
              {}\tbybit-linear:ADAUSDT\n\
+             {}\tmexc:AAPLXUSDT\n\
+             {}\tmexc-perp:XAU_USDT\n\
+             {}\thypercall-idx:SP500\n\
              {}\tderibit:BTC-27MAR26-100000-C\n\
-             {}\tbinance-opt:BTC-260327-100000-C\n",
+             {}\tbinance-opt:BTC-260327-100000-C\n\
+             {}\thypercall:SP500-20260930-7742.5-P\n",
             0x0100_0007u32,
             0x0100_0301u32,
+            0x0100_0C01u32,
+            0x0100_0E01u32,
             0x0300_0001u32,
             0x0300_0101u32,
             0x0600_0001u32,
             0x0600_0201u32,
+            0x0700_0001u32,
+            0x0700_0201u32,
+            0x0900_0001u32,
             0x0300_0201u32,
-            0x0100_0401u32
+            0x0100_0401u32,
+            0x0900_0201u32
         );
         assert_eq!(body, want);
+        // The live resolver iterates the same blocks, and the perp
+        // block carries FUNDING (the string law, MX2).
+        let entries = build_descriptor_entries(&alloc, &deribit_opts, &[], &bn_opts, &hc_opts, false, false);
+        let mx = entries
+            .iter()
+            .find(|(d, ..)| d == "mexc-perp:XAU_USDT")
+            .expect("mexc perp entry");
+        assert_eq!(mx.1, 0x0700_0201);
+        assert_eq!(mx.2, ingress_ai::CAP_PRICE | ingress_ai::CAP_FUNDING);
+        assert!(entries.iter().any(|(d, s, c)| d == "mexc:AAPLXUSDT"
+            && *s == 0x0700_0001
+            && *c == ingress_ai::CAP_PRICE));
+        // BX2: both COIN-M blocks resolve, with the futures grant.
+        for (desc, sym) in [
+            ("binance-coinm:btcusd_perp", 0x0100_0C01u32),
+            ("binance-coinm:btcusd_261225", 0x0100_0E01u32),
+        ] {
+            assert!(
+                entries.iter().any(|(d, s, c)| d == desc
+                    && *s == sym
+                    && *c == ingress_ai::CAP_PRICE | ingress_ai::CAP_FUNDING),
+                "{desc}"
+            );
+        }
+        // HC4: the same membership as the manifest — the option reads
+        // its BBO and summary, the index nothing.
+        assert!(entries.iter().any(|(d, s, c)| d == "hypercall:SP500-20260930-7742.5-P"
+            && *s == 0x0900_0201
+            && *c == ingress_ai::CAP_OPT | ingress_ai::CAP_PRICE));
+        assert!(entries
+            .iter()
+            .any(|(d, s, c)| d == "hypercall-idx:SP500" && *s == 0x0900_0001 && *c == 0));
+        assert_eq!(entries.len(), body.lines().count(), "the resolver and the manifest agree");
     }
 }

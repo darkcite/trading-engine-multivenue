@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 
 use core_io::{PmlrWriter, SlotKind};
 use core_types::{
-    AiCmd, AiCmdKind, Fill, Order, Price, Qty, Side, Tick, VenueId, AI_SIDE_NONE, SYMBOL_ID_NONE,
+    AiCmd, AiCmdKind, Fill, Order, Price, Qty, Side, Tick, VenueId, AI_SIDE_NONE, FILL_FLAG_ADOPTED,
+    SYMBOL_ID_NONE,
 };
 
 use cli::audit_pnl::{run, AuditPnlConfig};
@@ -188,7 +189,7 @@ fn golden_modeled_fill_attribution_and_markout() {
     // (`claude_worker.pnl_report`) now REFUSES a row without it, and
     // this string is the only thing connecting the two.
     assert!(json.contains(
-        "\"strategy_id\":0,\"label\":\"latency-arb\",\"origin\":1,\"orders\":1,\"fills\":1,\"trades\":1"
+        "\"strategy_id\":0,\"label\":\"hyparb\",\"origin\":1,\"orders\":1,\"fills\":1,\"trades\":1"
     ));
     assert!(
         !json.contains("\"origin\":0"),
@@ -330,7 +331,9 @@ fn stale_tick_neither_fills_nor_marks_in_audit_pnl_and_is_reported() {
     );
     let (json, lines) = run_report(&root);
     assert!(
-        json.contains("\"strategy_id\":0,\"label\":\"latency-arb\",\"origin\":1,\"orders\":1,\"fills\":0,"),
+        json.contains(
+            "\"strategy_id\":0,\"label\":\"hyparb\",\"origin\":1,\"orders\":1,\"fills\":0,"
+        ),
         "json: {json}"
     );
     assert!(
@@ -529,6 +532,60 @@ fn paper_fills_fold_into_cash_plus_markout() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// BX7 (the risk review's R6): a Binance restart adopts the position the
+/// last run left — opening inventory, not a second buy. Run 1 bought 10 @
+/// 0.50; run 2's boot adopts the same 10 at its mark (0.55): the paper view
+/// holds 10, marked 0.60 ⇒ net +1 (cash −5, mark-out 6), one fill traded.
+/// Break-and-watch: folded as a trade it holds 20 and nets +1.5.
+#[test]
+fn an_adopted_fill_is_opening_inventory_not_a_second_buy() {
+    let root = tmp_root("adopted");
+    let d1 = run_dir(&root, EPOCH_1);
+    manifest(&d1, &[(42, "PMTOK")]);
+    write_ticks(&d1, "pm", EPOCH_1, &[pm_tick(1_000, 42, 400_000, 1_000_000, 420_000, 1_000_000)]);
+    write_fills(&d1, EPOCH_1, &[Fill::new(5_000, 42, Side::Bid, Price::from_raw(500_000), Qty::from_raw(10_000_000), 77)]);
+    let d2 = run_dir(&root, EPOCH_2);
+    manifest(&d2, &[(42, "PMTOK")]);
+    write_ticks(&d2, "pm", EPOCH_2, &[pm_tick(1_000, 42, 590_000, 1_000_000, 610_000, 1_000_000)]);
+    write_fills(
+        &d2,
+        EPOCH_2,
+        &[Fill::new(2_000, 42, Side::Bid, Price::from_raw(550_000), Qty::from_raw(10_000_000), 0).with_flags(FILL_FLAG_ADOPTED)],
+    );
+    let (json, lines) = run_report(&root);
+    assert!(json.contains("\"paper\":{\"fills\":1,\"net_usd\":\"1.0\"}"), "json: {json}");
+    assert!(lines.iter().any(|l| l.contains("paper view: fills=1 adopted=1 ")), "{lines:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// BX7 (the risk review's N7): an adopted fill without a price (an
+/// inverse leg's: its face carries none) opens at its symbol's last mark —
+/// or, before any, at its next — never at 0, which read the exit's whole
+/// flow as paper P&L. 42 adopts 10 after a 0.41 mark; 43 adopts 10 before
+/// its first mark (0.30): both open where they are marked ⇒ net 0.
+/// Break-and-watch: opened at 0, the paper view nets +7.1.
+#[test]
+fn an_unpriced_adopted_fill_opens_at_the_mark() {
+    let root = tmp_root("adopted-unpriced");
+    let d = run_dir(&root, EPOCH_1);
+    manifest(&d, &[(42, "PMTOK"), (43, "PMTWO")]);
+    write_ticks(
+        &d,
+        "pm",
+        EPOCH_1,
+        &[
+            pm_tick(1_000, 42, 400_000, 1_000_000, 420_000, 1_000_000),
+            pm_tick(3_000_000_000, 43, 290_000, 1_000_000, 310_000, 1_000_000),
+        ],
+    );
+    let adopted = |sym: u32| Fill::new(2_000, sym, Side::Bid, Price::from_raw(0), Qty::from_raw(10_000_000), 0).with_flags(FILL_FLAG_ADOPTED);
+    write_fills(&d, EPOCH_1, &[adopted(42), adopted(43)]);
+    let (json, lines) = run_report(&root);
+    assert!(json.contains("\"paper\":{\"fills\":0,\"net_usd\":\"0.0\"}"), "json: {json}");
+    assert!(lines.iter().any(|l| l.contains("paper view: fills=0 adopted=2 ") && l.contains("; 0 adopted leg(s) never marked")), "{lines:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn rerun_is_byte_identical() {
     let root = tmp_root("determinism");
@@ -718,7 +775,8 @@ const BIN_OUTCOME: u32 = 2650;
 /// A strike far below the mark: the Yes leg settles at 1.0.
 const BIN_STRIKE_1E6: i64 = 70_000_000_000;
 const BIN_MARK_1E6: i64 = 79_000_000_000;
-/// The instance expires 40 s into the run and TWAPs over 10 s.
+/// The instance expires 40 s into the run and TWAPs over the 10 s
+/// BEFORE that (BIN15 S1).
 const BIN_EXPIRY_OFF: u64 = 40_000_000_000;
 const BIN_TWAP_S: u16 = 10;
 
@@ -811,18 +869,24 @@ fn a_binary_held_through_expiry_settles_at_the_payout_not_the_last_book() {
     let root = tmp_root("bin15-settle");
     let dir = run_dir(&root, EPOCH_1);
     bin_manifest(&dir, true);
-    // The roll binds the instance at the run's start; the marks after
-    // the expiry are the settlement TWAP (>= SETTLE_MIN_MARKS of them).
+    // The roll binds the instance at the run's start; the marks in the
+    // TWAP window ENDING at the expiry (BIN15 S1, LAW E-11:
+    // `[expiry − twap, expiry]`) are the settlement evidence
+    // (>= SETTLE_MIN_MARKS of them). The one after the expiry must not
+    // be read.
     write_events(
         &dir,
         EPOCH_1,
         &[
             bin_roll(1_000, HL_YES, false),
             bin_mark(2_000, HL_BTC, BIN_MARK_1E6),
+            // In force at the window's open (the evidence must cover it).
+            bin_mark(BIN_EXPIRY_OFF - 10_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 7_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 4_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 1_000_000_000, HL_BTC, BIN_MARK_1E6),
             bin_mark(BIN_EXPIRY_OFF, HL_BTC, BIN_MARK_1E6),
-            bin_mark(BIN_EXPIRY_OFF + 3_000_000_000, HL_BTC, BIN_MARK_1E6),
-            bin_mark(BIN_EXPIRY_OFF + 7_000_000_000, HL_BTC, BIN_MARK_1E6),
-            bin_mark(BIN_EXPIRY_OFF + 10_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF + 3_000_000_000, HL_BTC, 1_000_000),
         ],
     );
     // The Yes book: an ask at 0.40 that the order crosses, then a LAST
@@ -870,6 +934,84 @@ fn a_binary_held_through_expiry_settles_at_the_payout_not_the_last_book() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// BIN15 S2: the same instance on a v3 root whose run directory was
+/// named 23 s before its first tick (as a boot names it) and whose HL
+/// ticks carry the venue's own clock. On the old anchor law every wall
+/// instant would sit 23 s early and the minute before the expiry would
+/// hold none of the settlement marks; on the venue clock the audit
+/// settles it exactly as the identity fixture above does — and says
+/// which clock it used.
+#[test]
+fn a_v3_root_settles_on_the_venue_clock_in_the_audit_too() {
+    const EARLY: u64 = 23_000_000_000;
+    let root = tmp_root("bin15-venue-clock");
+    let epoch = EPOCH_1 - EARLY;
+    let dir = run_dir(&root, epoch);
+    bin_manifest(&dir, true);
+    write_events(
+        &dir,
+        epoch,
+        &[
+            bin_roll(1_000, HL_YES, false),
+            bin_mark(2_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 10_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 7_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 4_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 1_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF, HL_BTC, BIN_MARK_1E6),
+        ],
+    );
+    // The venue's clock: the first tick (ts 1 000) IS `EPOCH_1`.
+    let stamp = |t: Tick| -> Tick {
+        Tick::new_stamped(
+            t.ts_ns,
+            VenueId::Hyperliquid,
+            t.sym,
+            t.venue_seq,
+            t.bid_px,
+            t.bid_qty,
+            t.ask_px,
+            t.ask_qty,
+            (EPOCH_1 + t.ts_ns - 1_000) / 1_000_000,
+            0,
+        )
+    };
+    write_ticks(
+        &dir,
+        "hl",
+        epoch,
+        &[
+            stamp(hl_tick(1_000, HL_YES, 390_000, 410_000)),
+            stamp(hl_tick(2_000 + HL_DELTA + 10, HL_YES, 380_000, 390_000)),
+            stamp(hl_tick(BIN_EXPIRY_OFF + 12_000_000_000, HL_YES, 200_000, 220_000)),
+        ],
+    );
+    write_orders(
+        &dir,
+        epoch,
+        &[hl_order(2_000, HL_YES, Side::Bid, 400_000, 100_000_000, 11)],
+    );
+    let (json, lines) = run_report(&root);
+    let tell = lines
+        .iter()
+        .find(|l| l.contains("wall=venue"))
+        .unwrap_or_else(|| panic!("no clock tell: {lines:#?}"));
+    // The stamps are whole milliseconds, so the fitted offset is off the
+    // exact 23 s by under a millisecond.
+    assert!(
+        tell.contains("(the anchor law ran 22.999 s early)")
+            || tell.contains("(the anchor law ran 23.000 s early)"),
+        "{tell}"
+    );
+    let sched = lines
+        .iter()
+        .find(|l| l.contains("bin15 settlement table"))
+        .unwrap_or_else(|| panic!("no schedule line: {lines:#?}"));
+    assert!(sched.contains("1 of 1 instance(s) settleable"), "{sched}");
+    assert!(json.contains("\"net_usd\":\"60.0\""), "json: {json}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn a_roll_whose_underlying_is_not_in_the_manifest_is_counted_not_guessed() {
     // Without the underlying's own row there is no mark series to
@@ -884,9 +1026,9 @@ fn a_roll_whose_underlying_is_not_in_the_manifest_is_counted_not_guessed() {
         &[
             bin_roll(1_000, HL_YES, false),
             bin_mark(2_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 9_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 5_000_000_000, HL_BTC, BIN_MARK_1E6),
             bin_mark(BIN_EXPIRY_OFF, HL_BTC, BIN_MARK_1E6),
-            bin_mark(BIN_EXPIRY_OFF + 5_000_000_000, HL_BTC, BIN_MARK_1E6),
-            bin_mark(BIN_EXPIRY_OFF + 10_000_000_000, HL_BTC, BIN_MARK_1E6),
         ],
     );
     write_ticks(
@@ -956,4 +1098,140 @@ fn a_root_with_no_hip4_instrument_says_nothing_and_changes_nothing() {
     // Byte for byte the golden above.
     assert!(json.contains("\"net_usd\":\"1.0\""), "json: {json}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A sell print on Hyperliquid (`v1` negative = the seller aggressed).
+fn hl_sell_print(ts: u64, sym: u32, tid: u64, px_1e6: i64, qty_1e6: i64) -> core_types::ChannelEvent {
+    core_types::ChannelEvent::new(
+        ts,
+        VenueId::Hyperliquid,
+        core_types::ChannelId::Trade,
+        sym,
+        tid,
+        0,
+        px_1e6,
+        -qty_1e6,
+    )
+}
+
+/// XMM XH3: a post-only maker on Hyperliquid (slot 6) fills in the audit
+/// from the prints AFTER the displayed queue ahead of it — before XH3
+/// audit-pnl read no prints, so such an order could never fill and slot
+/// 6's shadow P&L read flat. The queue line fires only for a run with a
+/// post-only maker in it.
+#[test]
+fn a_post_only_maker_fills_from_prints_after_the_displayed_queue() {
+    let root = tmp_root("xmm-queue");
+    let dir = run_dir(&root, EPOCH_1);
+    manifest(&dir, &[(HL_BTC, "hyperliquid:BTC")]);
+    let land = 2_000 + HL_DELTA + 10;
+    // 100.00 / 100.01 with 100 displayed on each side; a later book for
+    // the mark-out.
+    write_ticks(
+        &dir,
+        "hl",
+        EPOCH_1,
+        &[
+            hl_tick(1_000, HL_BTC, 100_000_000, 100_010_000),
+            hl_tick(land, HL_BTC, 100_000_000, 100_010_000),
+            hl_tick(land + 5_000_000_000, HL_BTC, 100_000_000, 100_010_000),
+        ],
+    );
+    // One post-only bid joining the touch: 100 ahead of it.
+    let mut o = hl_order(2_000, HL_BTC, Side::Bid, 100_000_000, 1_000_000, 21).with_post_only();
+    o.strategy_id = 6;
+    write_orders(&dir, EPOCH_1, &[o]);
+    // 60 traded at our price: the queue ahead shrinks to 40, nothing for
+    // us. Then 41: the last 40 ahead, and 1 — all of ours.
+    write_events(
+        &dir,
+        EPOCH_1,
+        &[
+            hl_sell_print(land + 1_000_000, HL_BTC, 1, 100_000_000, 60_000_000),
+            hl_sell_print(land + 2_000_000, HL_BTC, 2, 100_000_000, 41_000_000),
+        ],
+    );
+    let (json, lines) = run_report(&root);
+    let q = lines
+        .iter()
+        .find(|l| l.contains("queue-orders="))
+        .unwrap_or_else(|| panic!("no queue line: {lines:#?}"));
+    assert!(q.contains("queue-orders=1 queue-prints=2"), "{q}");
+    assert!(
+        json.contains("\"strategy_id\":6,\"label\":\"xmm\",\"origin\":1,\"orders\":1,\"fills\":1"),
+        "json: {json}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+
+    // The same run with prints that never clear the queue ahead: no fill.
+    let root = tmp_root("xmm-queue-short");
+    let dir = run_dir(&root, EPOCH_1);
+    manifest(&dir, &[(HL_BTC, "hyperliquid:BTC")]);
+    write_ticks(
+        &dir,
+        "hl",
+        EPOCH_1,
+        &[
+            hl_tick(1_000, HL_BTC, 100_000_000, 100_010_000),
+            hl_tick(land, HL_BTC, 100_000_000, 100_010_000),
+            hl_tick(land + 5_000_000_000, HL_BTC, 100_000_000, 100_010_000),
+        ],
+    );
+    write_orders(&dir, EPOCH_1, &[o]);
+    write_events(
+        &dir,
+        EPOCH_1,
+        &[hl_sell_print(land + 1_000_000, HL_BTC, 1, 100_000_000, 99_000_000)],
+    );
+    let (json, _) = run_report(&root);
+    assert!(
+        json.contains("\"strategy_id\":6,\"label\":\"xmm\",\"origin\":1,\"orders\":1,\"fills\":0"),
+        "json: {json}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// XMM XH3: prints load ONLY for a run with a post-only maker, and only
+/// inside its ticks — a run without one (here slot 3's plain order and a
+/// print 5 s after the last tick) reports byte-for-byte as it did.
+#[test]
+fn prints_change_nothing_for_a_run_without_a_post_only_maker() {
+    let report = |with_print: bool| {
+        let root = tmp_root(if with_print { "xmm-noq-print" } else { "xmm-noq-bare" });
+        let dir = run_dir(&root, EPOCH_1);
+        manifest(&dir, &[(HL_BTC, "hyperliquid:BTC")]);
+        write_ticks(
+            &dir,
+            "hl",
+            EPOCH_1,
+            &[
+                hl_tick(1_000, HL_BTC, 100_000_000, 100_010_000),
+                hl_tick(2_000 + HL_DELTA + 10, HL_BTC, 99_990_000, 100_000_000),
+                hl_tick(3_000_000_000, HL_BTC, 100_000_000, 100_010_000),
+            ],
+        );
+        write_orders(
+            &dir,
+            EPOCH_1,
+            &[hl_order(2_000, HL_BTC, Side::Bid, 100_000_000, 1_000_000, 31)],
+        );
+        if with_print {
+            write_events(
+                &dir,
+                EPOCH_1,
+                &[
+                    hl_sell_print(1_500, HL_BTC, 1, 100_000_000, 5_000_000),
+                    hl_sell_print(8_000_000_000, HL_BTC, 2, 100_000_000, 5_000_000),
+                ],
+            );
+        }
+        let (json, lines) = run_report(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        (json, lines)
+    };
+    let (bare, bare_lines) = report(false);
+    let (with, with_lines) = report(true);
+    assert_eq!(bare, with, "the JSON (window, days, rows) must not move");
+    assert_eq!(bare_lines, with_lines, "nor the stderr surface");
+    assert!(!with_lines.iter().any(|l| l.contains("queue-orders=")));
 }

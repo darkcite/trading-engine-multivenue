@@ -17,7 +17,8 @@ Its **status, edge thesis and roadmap are historical**: §3, §4, §7–§8 and
 §15 describe the April-2026 Polymarket-centric v1 (RSS, rule-tree, the
 latency-arb primary edge) which was built, measured and then displaced. The
 engine is now a multivenue slot set (Binance, OKX, Deribit, Hyperliquid incl.
-HIP-4, Bybit, Polymarket, Polygon RPC) with an eight-slot strategy set and a
+HIP-4, Bybit, MEXC (data-only), Polymarket, Polygon RPC) with an eight-slot
+strategy set and a
 per-slot live-execution lane. **The current picture is:** `CLAUDE.md`
 (state + laws), `docs/risk-policy.md` (execution laws and record), and the
 three sheets `docs/phase-8-architecture-v2.svg`, `docs/engine-memory-cpu.svg`,
@@ -310,15 +311,15 @@ impl<S: Strategy> Engine<S> {
     pub fn run(&mut self) -> ! {
         self.strategy.on_start(&mut self.ctx());
         loop {
-            while let Some(t) = self.tick_ring.try_pop() {
+            while let Some(t) = self.tick_ring.try_pop_ref() {
                 self.books.apply(&t);
                 let book = self.books.get(t.market_id);
                 self.strategy.on_tick(&t, book, &mut self.ctx());
             }
-            while let Some(s) = self.sig_ring.try_pop() {
+            while let Some(s) = self.sig_ring.try_pop_ref() {
                 self.strategy.on_signal(&s, &mut self.ctx());
             }
-            while let Some(f) = self.fill_ring.try_pop() {
+            while let Some(f) = self.fill_ring.try_pop_ref() {
                 self.risk.apply_fill(&f);
                 self.strategy.on_fill(&f, &mut self.ctx());
             }
@@ -395,7 +396,7 @@ The signing key bytes live in a single `mlock`'d page and are zeroized on drop. 
 
 ### 7.3 Signer implementation
 - `secp256k1` (libsecp256k1-sys) for signing. Hand-rolled EIP-712 typed-data hash, no `ethers`/`alloy` full stacks.
-- Nonce manager: single-threaded monotonic `u64` per API key.
+- Nonce manager: a monotonic `u64` per signer; one stream per agent address shared by a process's signers of that agent (XMM XH4h S3, a lock-free compare-and-swap).
 - Zeroization via the `zeroize` crate; `mlock` on the key page.
 
 ### 7.4 CLOB REST dispatcher

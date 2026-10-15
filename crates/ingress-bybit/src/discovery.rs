@@ -211,6 +211,11 @@ fn parse_row(body: &[u8], pos: usize) -> Result<(BybitInstrumentRow, usize), Byb
                         if s.is_empty() || s.len() > BYBIT_DISCOVERY_SYMBOL_MAX {
                             return Err(BybitDiscoveryErr::BadRow);
                         }
+                        // COPY: ≤ 24 B symbol (BYBIT_DISCOVERY_SYMBOL_MAX) into its discovery row,
+                        // once per instrument row at boot — the row outlives the REST body it was
+                        // scanned from — rejected: rows borrowing the body (the instruments body
+                        // pinned for the table's life and a lifetime threaded through the boot, to
+                        // save ≤ 24 B a row).
                         symbol[..s.len()].copy_from_slice(s);
                         symbol_len = s.len() as u8;
                         i = end;

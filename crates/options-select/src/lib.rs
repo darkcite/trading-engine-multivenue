@@ -55,7 +55,11 @@ pub fn select_capped_chain<R: ChainRow, F: Fn(&R) -> bool>(
     expiries_e: u32,
     strikes_k: u32,
 ) -> Vec<R> {
-    let mut out: Vec<R> = Vec::new();
+    // Sized once for the law's own bound (≤ E × K × 2 rows, never more
+    // than the page holds): each selected row is copied in exactly once,
+    // never again by a growing Vec.
+    let mut out: Vec<R> =
+        Vec::with_capacity(rows.len().min(expiries_e as usize * strikes_k as usize * 2));
     if expiries_e == 0 || strikes_k == 0 {
         return out;
     }
