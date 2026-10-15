@@ -376,4 +376,40 @@ if [ -n "${HCV_EVENTS:-}" ]; then
   fi
   HCV_ARGS+=(--hcv-events "$HCV_EVENTS")
 fi
-exec ./target/release/multivenue-engine run --paper --strategy "$STRATEGY" "${EXEC_ARGS[@]}" "${HYPARB_ARGS[@]}" "${XMM_ARGS[@]}" "${HCV_ARGS[@]}"
+# HK19 (2026-10-15): the §6.5 raw tap from strategy.conf. RAW_TAP=<labels>
+# (comma-separated, from pm bn okx rpc deribit hl bybit mexc hyperevm
+# hypercall; or `all` alone) writes the payloads those parsers REJECT to
+# `<venue>-raw.tap` in the run dir (docs/wire-format.md "Raw tap"), bounded
+# at RAW_TAP_BUDGET_MB per venue (the engine's default 64). RAW_TAP_MODE=all
+# records every payload — an audit window only: it grows at the feed's rate
+# until the budget stops it. A value the engine would refuse is refused here
+# (exit 78) rather than failing the boot after discovery.
+TAP_ARGS=()
+if [ -n "${RAW_TAP:-}" ]; then
+  case "$RAW_TAP" in
+    ,*|*,|*,,*) echo "engine-wrapper: refusing — RAW_TAP has an empty label (got '$RAW_TAP')" >&2; exit 78 ;;
+  esac
+  tap_seen=","
+  for tap_label in ${(s:,:)RAW_TAP}; do
+    case "$tap_label" in
+      pm|bn|okx|rpc|deribit|hl|bybit|mexc|hyperevm|hypercall) ;;
+      all) [ "$RAW_TAP" = "all" ] || { echo "engine-wrapper: refusing — RAW_TAP=all must stand alone (got '$RAW_TAP')" >&2; exit 78; } ;;
+      *) echo "engine-wrapper: refusing — RAW_TAP label '$tap_label' is not a venue (got '$RAW_TAP')" >&2; exit 78 ;;
+    esac
+    case "$tap_seen" in
+      *",$tap_label,"*) echo "engine-wrapper: refusing — RAW_TAP names '$tap_label' twice" >&2; exit 78 ;;
+    esac
+    tap_seen="$tap_seen$tap_label,"
+  done
+  case "${RAW_TAP_MODE:-rejects}" in
+    rejects|all) ;;
+    *) echo "engine-wrapper: refusing — RAW_TAP_MODE must be rejects or all (got '$RAW_TAP_MODE')" >&2; exit 78 ;;
+  esac
+  TAP_ARGS=(--raw-tap "$RAW_TAP" --raw-tap-mode "${RAW_TAP_MODE:-rejects}")
+  if [ -n "${RAW_TAP_BUDGET_MB:-}" ]; then
+    [[ "$RAW_TAP_BUDGET_MB" == <1-> ]] || { echo "engine-wrapper: refusing — RAW_TAP_BUDGET_MB must be a positive integer (got '$RAW_TAP_BUDGET_MB')" >&2; exit 78; }
+    TAP_ARGS+=(--raw-tap-budget-mb "$RAW_TAP_BUDGET_MB")
+  fi
+  echo "engine-wrapper: raw tap ${TAP_ARGS[*]}" >&2
+fi
+exec ./target/release/multivenue-engine run --paper --strategy "$STRATEGY" "${EXEC_ARGS[@]}" "${HYPARB_ARGS[@]}" "${XMM_ARGS[@]}" "${HCV_ARGS[@]}" "${TAP_ARGS[@]}"

@@ -15914,3 +15914,25 @@ repeated roll (both arms; nothing armed today).
   the 20:15/21:15 pair is BST3.5's equity-dailies refresh), and HK11's
   ~2.2 GB / ~35 min in its record, its migration entry and the config
   comment.
+
+### HK19 — the raw tap from `strategy.conf` (`scripts/engine-wrapper.sh`), 2026-10-15
+
+- **Why.** Polymarket's parser rejects ~0.17 % of messages (420 in 243 658
+  over 08:34–10:46Z on 2026-10-14, one reconnect) and nothing says which. The
+  engine's §6.5 raw tap (`--raw-tap`, docs/wire-format.md "Raw tap") records
+  exactly the rejected payloads, but the wrapper had no way to pass it.
+- **What.** `RAW_TAP=<labels>` in `~/multivenue/strategy.conf` (comma-
+  separated from `pm bn okx rpc deribit hl bybit mexc hyperevm hypercall`, or
+  `all` alone), `RAW_TAP_MODE` (`rejects`, the default, or `all`) and
+  `RAW_TAP_BUDGET_MB` (positive; the engine's default is 64) become
+  `--raw-tap …`. A value the engine would refuse — an unknown or repeated
+  label, an empty one, `all` with others, a bad mode or budget — is refused
+  by the wrapper (exit 78) before discovery, the other keys' shape. Tested
+  on eleven cases through the wrapper's own block.
+- **Bounded.** Rejects only, ≤ 64 MiB per venue per run; `<venue>-raw.tap` sits
+  in the run dir, so the archiver carries it (a non-PMLR file: its manifest
+  row has null PMLR facts) and retention removes it with its run.
+- **Not changed:** no hot-path code; the tap's own cost is the existing
+  `parse_reject` path (a bounded write on a reject).
+- **Switched on:** `RAW_TAP=pm` in the live `strategy.conf` (backup
+  `strategy.conf.bak-20261015T083817Z-hk19`), live from the 16:05Z restart.

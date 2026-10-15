@@ -6,6 +6,21 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-15 — `strategy.conf` keys `RAW_TAP`, `RAW_TAP_MODE`, `RAW_TAP_BUDGET_MB` (HK19)
+
+**What changed**
+- `scripts/engine-wrapper.sh` passes `--raw-tap`, `--raw-tap-mode` and
+  `--raw-tap-budget-mb` from these keys; absent keys pass nothing (as before).
+  A bad value refuses the boot (exit 78).
+
+**Impact**
+- With `RAW_TAP` set, each run dir gains `<venue>-raw.tap`
+  (docs/wire-format.md "Raw tap"), archived with the run.
+
+**Migration steps**
+1. None to keep the old behaviour. To name a venue's parser rejects: add
+   `RAW_TAP=<venue>` to `strategy.conf`; it applies at the next restart.
+
 ## 2026-10-15 — S3 archiver: the nightly budget 3600 → 8400 s (HK18)
 
 **What changed**

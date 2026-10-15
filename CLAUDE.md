@@ -237,9 +237,10 @@ The lane records stay where they always were: `docs/risk-policy.md` and
     set; once set, that lifecycle rule is the only backstop for an upload
     orphaned by a SIGTERM during its initiate POST (HK11). The `s3.env`
     credential pair was once pasted in chat: rotate it.
-  - **Polymarket parse errors** trickle at ~0.1 % of messages with no
-    reconnects (58 in 32 min after a restart). Naming them needs
-    `--raw-tap pm`, which the wrapper does not pass.
+  - **Polymarket parse errors** trickle at ~0.17 % of messages with no
+    reconnects (420 in 243 658 over 08:34–10:46Z on 2026-10-14). Since HK19
+    `strategy.conf`'s `RAW_TAP=pm` makes the wrapper pass `--raw-tap pm`
+    (rejects only, ≤ 64 MiB): each run dir's `pm-raw.tap` holds them.
   - **Memory:** a whole-root `audit-pnl` / `backtest` OOMs above ~27 GB; use
     bounded ≤ 2 h window roots.
   - **Regime:** `regime.toml [labels] require = 1` is NOT flipped live.
