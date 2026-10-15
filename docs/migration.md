@@ -6,6 +6,44 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-15 — HYPARB G1 tally: `claude_worker.hyparb_g1`, nightly; `backtest` counters `pnl_session_usd=` (HK26)
+
+**What changed**
+- New worker module `claude_worker.hyparb_g1` (`accrue`, `backfill --since
+  [--replay] [--refold]`, `status`, `fold`) and its ledgers
+  `~/multivenue/worker/hyparb/g1-sessions.tsv` and `g1-replay.tsv`.
+- `scripts/daily-restart.sh`'s 0020 slot runs `hyparb_g1 accrue` when
+  `~/multivenue/hyparb.toml` exists (non-fatal; 120 s a rung, 300 s replay).
+- `backtest --member hyparb`'s counters line adds `pnl_session_usd=`.
+- `hyparb_ladder` replays boot a scratch copy of the artifact as
+  `mode = "paper"`, so `pnl_report --hyparb-ladder` runs again on the live
+  testnet artifact.
+- `Archiver.pull_files` / `run_ids`; `pmlr.TICK_DT` / `tick_array`.
+
+**Impact**
+- Additive. The ledgers live outside the repo. Replay rows from a binary
+  without `pnl_session_usd=` are a labelled proxy that cannot pass.
+
+**Migration steps**
+1. None. History was backfilled on 2026-10-15 (114 sessions). To replay
+   archived days for condition 2: `hyparb_g1 backfill --since 2026-09-25
+   --replay` (S3 pulls of the hl-*/hyperevm-* files, ~60 MB a run).
+
+## 2026-10-15 — core-parse: an integer past u64 is refused, not wrapped (HK24)
+
+**What changed**
+- `core_parse::scan_u64` returns `None` for a digit run past `u64::MAX`
+  (was: wrapped); `scan_i64` is exact at i64::MIN/MAX; so do the price
+  scanners on a 20+-digit whole part.
+
+**Impact**
+- No wire field read through them exceeds u64/i64 (audited). A frame or an
+  AI ruleset carrying such a number is now refused instead of read as a
+  wrapped value (a `max_risk_usd` of 18446744073709551616.5 read $0.50).
+
+**Migration steps**
+1. None.
+
 ## 2026-10-15 — S3 archiver: `uploads` / `abort-stale`; the cycle sweeps orphans; `--path` keys (HK21)
 
 **What changed**

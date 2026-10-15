@@ -15998,7 +15998,10 @@ repeated roll (both arms; nothing armed today).
   returns, so `_hold_term` unblocks again if the handler raises out of the
   blocking call itself. It holds on the main thread of a single-threaded
   process (the archiver). An attempt whose answer was LOST made an upload no
-  one can name: `abort-stale` clears it the next night.
+  one can name: `abort-stale` clears it the next night. **Superseded the
+  same day by HK27:** a mask is per thread, and with any other thread in the
+  process the OS handed SIGTERM to that thread (the full worker suite showed
+  it); the hold is now a deferral of the handler.
 - **launchd.** `ExitTimeOut` 60 in `launchd/com.multivenue.archive.plist`
   (the engine's; the default is 20 s). The installed agent was re-rendered
   and re-bootstrapped alone (backup `com.multivenue.archive.plist.bak-…-hk21`
@@ -16016,7 +16019,7 @@ repeated roll (both arms; nothing armed today).
   leave SIGTERM blocked for later tests or kill the runner. Break-and-watch:
   the two new SIGTERM tests fail on the whole-loop hold and on the unguarded
   block. Worker suites (archive, config, agent, objstore, retention) 185
-  passed; ruff clean.
+  passed; ruff clean. (The mask's tests went with the mask in HK27.)
 - **Live.** `uploads`: 0 incomplete; `abort-stale`: aborted 0, kept 0,
   unparsed 0. It runs nightly from 2026-10-15 21:30Z.
 
@@ -16050,6 +16053,7 @@ repeated roll (both arms; nothing armed today).
   part wraps (`"18446744073709551616.5"` reads 0.5). Pre-existing, the
   engine's hot path: its own reviewed cut. `hyparb_rehearsal`'s depth
   reader, and the probe's `dec_1e8` / `mid_of` (copies of `xmm_battery`'s).
+  (All closed the same day: HK24, HK25.)
 
 ### HK23 — the nextest `LEAK`: a nextest race, no test at fault, 2026-10-15
 
@@ -16069,5 +16073,152 @@ repeated roll (both arms; nothing armed today).
   alternating: 0.9.143 one LEAK in three runs, 0.9.148 none in three.
 - **What changed.** `.config/nextest.toml` recommends 0.9.145 (a warning on
   older, never a failure). No test, timeout or `leak-timeout` touched.
-- **Operator.** Upgrade cargo-nextest to ≥ 0.9.145; a checked 0.9.148
-  binary is at `target/hk/leak/nextest-0.9.148/cargo-nextest`.
+- **Operator.** Upgrade cargo-nextest to ≥ 0.9.145. **Done 2026-10-15
+  10:30Z** (the operator's word): `brew upgrade cargo-nextest` 0.9.143 →
+  0.9.148 (a Homebrew install; the old keg kept). Full runs since: no LEAK.
+
+## HK, part 3 — the rest of the housekeeping (2026-10-15)
+
+**Ask (Anton):** "ask me all questions you need to clarify and then proceed
+until all the housekeeping will be done". **Plan:** project doc
+`claude/hk-sectionc-plan-2026-10-15.md`. **Rulings:** nextest upgraded
+(HK-R11); core-parse's overflow fixed and deployed (HK-R12); both duplicates
+removed (HK-R13); one format-only commit for the HK lane's drifted files
+(HK-R14); push `main` at the end (HK-R15); `pvm-pine-engine` left (HK-R16);
+the Polymarket rejects fixed only if their cause is clear (HK-R17); the
+Makefile comment fixed (HK-R18); of the strategy rulings only "build the
+HYPARB G1 tally" (HK-R19); S3 versioning, the lifecycle rule and key rotation
+stay the operator's (HK-R20); the lost `-dotnet/PLAN.md` is let go (HK-R21).
+
+### HK24 — core-parse refuses an integer past u64 instead of wrapping it (`core-parse`, `ingress-mexc`, `ingress-ai`), 2026-10-15
+
+- **Defect.** `scan_u64` accumulated with `wrapping_mul`/`wrapping_add`: a
+  digit run past `u64::MAX` wrapped silently, so
+  `scan_price_1e6("18446744073709551616.5")` read 0.5 — and an AI ruleset
+  whose `max_risk_usd` was that literal was ACCEPTED at $0.50. `scan_i64`'s
+  `-(mag as i64)` panicked in debug at i64::MIN.
+- **Fix.** A run of ≤ 19 digits keeps the old loop (it cannot overflow); a
+  longer one is re-read with checked arithmetic in a `#[cold]
+  #[inline(never)]` function, taken through `buf.get(..)` (no slice panic left
+  in the code): `None` past `u64::MAX`. `scan_i64` is exact at both ends
+  (`checked_sub_unsigned` / `try_from`). ingress-mexc's own `scan_u64_checked`
+  — it existed only because core-parse wrapped — is gone (5 sites); ingress-ai
+  maps a `None` where a digit is guaranteed to its `Number` reject.
+- **Audit** (every caller, ~70 sites, `target/hk/cp/audit.md`): no field read
+  through these scanners can exceed u64/i64 on the wire — timestamps are ms/s,
+  sequence numbers < 1e14, ids within u64; Polymarket's 77-digit asset ids are
+  compared as raw bytes, EVM values are hex-decoded elsewhere. Every changed
+  outcome fails closed (exec-hyperliquid `nRequestsUsed` past u64 now falls
+  back to the cold budget instead of granting a wrapped one).
+- **Cost.** `scan_u64` +2–7 % (one compare), `scan_i64` +0.2 ns (scratch
+  micro-bench, M4); `make bench-check` unchanged (no gated bench calls these).
+  Fuzz 60 s each, clean: `core_parse_price`, `ruleset_json`, `mexc_ws_frame`,
+  `mexc_instruments`, `deribit_book`, `okx_book_seq`, `hl_ws_frame`.
+- **Tests.** u64::MAX and one past; 25 digits; leading zeros; i64 bounds; the
+  three price scales with a 20-digit whole part; two proptests against
+  `str::parse` (their shrunk seeds kept in `proptest-regressions`); the $0.50
+  ruleset; MEXC readers' overflow. Each fails on the old code. Reviews: risk /
+  alloc / zero-copy: SHIP, findings applied.
+
+### HK25 — the rehearsal reads `l2Book` with the engine's parser; one `dec_1e8` (`cli`), 2026-10-15
+
+- `hyparb_rehearsal` drops its hand-written scanner (and its `Vec` book) for
+  `ingress_hyperliquid::parse_l2book_depth` (`DepthTopK`, no heap). Prices and
+  sizes stay ×1e6, exact for a perp. Five levels a side (`DEPTH_K`) instead of
+  up to 20: `through` prices at the level holding 2× the leg, else the fifth —
+  never past a quoted level, less aggressive than the old 20th-level fallback.
+  `"time"` is required; a `null`, zero or negative level in the top five
+  rejects the answer. A failed book read on a hedge leg now spends one of its
+  3 tries instead of stopping with the bought leg open.
+- The H90 probe uses `xmm_battery`'s `dec_1e8` / `mid_of`; the shared
+  `dec_1e8` is signed (the probe's fee parsing needs it) and `mid_of` refuses
+  a mid not above zero, so `xmm_battery` still fails closed.
+- Reviews: risk / alloc / zero-copy: SHIP, findings applied. Left by design:
+  the close leg's size includes any position the account already held (a large
+  one may take all 3 tries and end FAIL, loud).
+
+### HK26 — the HYPARB G1 tally (`claude_worker.hyparb_g1`), 2026-10-15
+
+- **Why.** G1 had nothing counting it: `pnl_report --hyparb-ladder` is a
+  re-simulation that had never run (and every rung was refused: the harness
+  rejects a `mode = "testnet"` artifact); `/state`'s session P&L dies with
+  each restart; the nightly report's slot-0 row is audit-pnl's re-model of the
+  LOGGED orders, which has no AMM judge, so it is the hedges alone — never G1.
+- **What.** Each CLOSED run dir's slot-0 paper fills and orders are folded
+  under the member's own law (strategy-hyparb `pnl_session_usd_1e6`: pool fee
+  in the fill, taker fees, gas p50 per attempt, funding, marks perp-then-spot)
+  into `~/multivenue/worker/hyparb/g1-sessions.tsv` — idempotent, the live run
+  never stored, error rows never summed and retried, marks from the run's tape
+  else `candles.db` (staleness-bounded, labelled), each row with the
+  artifact's hash and mtime. The 2-block condition replays lean ≤ 2 h units
+  (only `hl-*`/`hyperevm-*`) at r3 and at `--latency-ns-venue
+  hyperevm:2000000000` into `g1-replay.tsv`; it must cover every day of
+  condition 1 with ≥ 200 judged fills, else INCOMPLETE. Replays boot a scratch
+  copy of the artifact as `mode = "paper"` (the member is identical), which
+  also un-breaks `--hyparb-ladder`. `backtest`'s counters line prints
+  `pnl_session_usd=`.
+- **Nightly.** `daily-restart.sh`'s 0020 slot runs `accrue` (120 s a rung, 300
+  s for the replay — a live worker process holds off the boot recommit).
+- **Checked live.** The fold of the running session equals `/state` (attempts,
+  fills, gas, notional exact; P&L within µ$); candle-marked vs tape-marked
+  folds of the same runs differ by $0.0025 in total.
+- **Result (2026-09-25 → 10-15, 114 sessions): G1 NOT PASSED.** 833 judged AMM
+  fills (≥ 200 met), Σ pnl_session **−$59.46** = cash −$42.87 (taker fees
+  $44.37 inside) + inventory −$1.06 + funding −$0.25 − gas $15.28; before fees
+  and gas ≈ +$0.19. 2 of 21 days positive. Condition 2: INCOMPLETE (not
+  replayed). The sample caveat stands: `cap_day` $2k of SUBMITTED notional
+  restarts with each session, so a session samples its first ~20 arbs.
+- Review: one pass (NEEDS CHANGES: condition-2 coverage, the artifact per
+  session, the slot's time bound, heal/refold, funding/marks gaps, helper
+  reuse), all applied.
+
+### HK27 — the initiate's SIGTERM hold is a deferral, not a per-thread mask (`claude-worker` objstore), 2026-10-15
+
+- **Defect (HK21's).** `pthread_sigmask` blocks a signal on ONE thread. With
+  any other thread in the process the OS hands SIGTERM to a thread that does
+  not block it, and Python still runs the handler on the main thread
+  mid-initiate — the orphan HK21 meant to close. The archiver is
+  single-threaded; the full worker suite (earlier tests leave threads) failed
+  the HK21 test this way. Shown deterministically with `pthread_kill` to
+  another thread: the mask orphaned 200/200.
+- **Fix.** The hold swaps in a recording handler; the release puts the old one
+  back and, if a SIGTERM came meanwhile, raises it again
+  (`signal.raise_signal`), so its SystemExit comes out where the abort reaches
+  it. Python runs handlers on the main thread whichever thread the OS picked,
+  so it holds with threads. The deferral is kept before it is installed and
+  dropped only once released (a release cut short by a KeyboardInterrupt is
+  finished by the next — no recorder is stranded to swallow later SIGTERMs);
+  no deferral off the main thread or without a Python handler (None, SIG_DFL,
+  SIG_IGN). The `pthread_sigmask` race handling went with the mask.
+- **Tests.** SIGTERM sent to another thread during the initiate reaches the
+  abort (synced on the wakeup fd); the archiver's real one-shot `_terminate`
+  with two SIGTERMs: one exit 143, the abort, SIG_IGN after; a release cut
+  short is finished by the next. Full worker suite 1 786 passed. Review: SHIP,
+  findings applied.
+
+### Deploy (HK-R12), 2026-10-15
+
+- `cargo build --release -p cli` at `4098f7b` (1 m 42 s), `exec-smoke.sh
+  --offline` PASS, `pkill -TERM` 12:46:39Z (after the 12:45 settlement
+  minute).
+- Booted: `git_sha 4098f7bf864c`, halted 0, `engine_vm_rows_active 2`, the
+  nine feeds flowing (Polymarket, Binance, OKX, Deribit, Hyperliquid, Bybit,
+  MEXC, HyperEVM, Hypercall; `rpc` is unconfigured, as before), feed delays
+  43–129 ms; the wrapper passed `--raw-tap pm --raw-tap-mode all
+  --raw-tap-budget-mb 512` (the largest-frame window).
+- Gates at `4098f7b`: clippy clean; nextest 4 662 passed (10 skipped), no LEAK
+  under nextest 0.9.148; alloc 127/127; copy-audit 27 / new 0; license OK;
+  worker suite 1 786 passed (3 skipped).
+
+### HK28 — format only (the HK lane's drifted files), 2026-10-15
+
+- rustfmt (per file, never `cargo fmt --all`) on `exec-hyperliquid` (26
+  files), `cli` `hl_outcome_probe.rs` and `backtest/member.rs`; `ruff format`
+  on `archive.py`, `objstore.py`, `hyparb_ladder.py`, `archive_config.py` and
+  their tests and `fake_s3.py`. No behaviour change (whitespace, wrapping, import order); all gates rerun green. The
+  running binary (`4098f7b`) is semantically this tree.
+- **Left (a ruling):** the rest of the workspace drifts too — ~208 more Rust
+  files (`cargo fmt --all -- --check -l`: 236 in all) and ~106 worker files
+  (ruff's line-length 100 against code wrapped narrower). Formatting all of it
+  is `cargo fmt --all` in effect, which the house rule bans; it stays as is
+  unless the operator rules otherwise.

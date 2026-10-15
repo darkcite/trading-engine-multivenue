@@ -131,6 +131,13 @@ The lane records stay where they always were: `docs/risk-policy.md` and
     998 only, compile-time).
   - LIVE only through three switches (`scripts/hyparb-flip.sh`), on slot 0's
     own wallet. Real money only after paper's gate G1.
+  - G1 is tallied by `claude_worker.hyparb_g1` (HK26): each closed session
+    folded under the member's own P&L law into
+    `~/multivenue/worker/hyparb/g1-sessions.tsv` nightly (0020 slot), the
+    2-block replay into `g1-replay.tsv`; `hyparb_g1 status` gives the
+    verdict. 2026-10-15: NOT PASSED — 833 judged AMM fills, Σ −$59.46 over
+    114 sessions (fees and gas exceed the edge). The nightly report's
+    slot-0 row is hedge-only (audit-pnl has no AMM judge): not G1.
   - HZ part B is not green from this Mac, so paper AMM fills are an upper
     bound on latency.
   - The operator's verbs: `scripts/evm-testnet.sh` (zsh — never `sh`) and
@@ -201,23 +208,24 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   candles.db as 1 m capture bars, a candidate primary per `har_seed compare`.
 - **The HK housekeeping lane (risk-policy "HK", "HK, part 2").** HK1–HK10
   (2026-10-13) closed Section A of that day's survey; HK11–HK17 (2026-10-14)
-  Section B and the day's findings; HK18–HK23 (2026-10-15) the follow-ups.
+  Section B and the day's findings; HK18–HK23 (2026-10-15) the follow-ups;
+  HK24–HK28 ("HK, part 3", 2026-10-15) the rest of the housekeeping.
 - **The S3 archive (HK11, HK18, HK20).** Uploads are paced in 64 KiB pieces
   under `MULTIVENUE_S3_MAX_UPLOAD_MIBPS`, 20 MiB/s since HK20 (the link's
   ~5 MB/s binds; the feed delays stayed near their no-upload band). An
   uncapped push (8 MiB writes) stalled the feeds on 2026-10-14. A weekday's
   capture (6.0–6.4 GB stored) takes ~20 min; the nightly budget, 8400 s, is
-  a ceiling. A SIGTERM aborts the upload in flight, and is held across each
-  multipart initiate attempt so the abort can name it (HK21). The nightly
+  a ceiling. A SIGTERM aborts the upload in flight, and is deferred across
+  each multipart initiate attempt so the abort can name it (HK21, HK27). The nightly
   cycle first runs `abort-stale` (incomplete uploads over 24 h; `uploads`
   lists them). `push-derived` keys keep their path under the store's root,
   `--path` too, and candles go up zstd'd.
-- **Gates at HEAD (the HK lane's close, 2026-10-14):**
+- **Gates at HEAD (HK, part 3, 2026-10-15):**
   - clippy clean.
-  - nextest 4 652 passed (10 skipped: the five `#[ignore]`d live smokes,
-    four alloc child helpers and a fixture regenerator). A random `LEAK` at
-    ~0.2 s under nextest < 0.9.145 on macOS is nextest's pipe race, not the
-    test (HK23). Only the scrape hammer runs alone (`.config/nextest.toml`):
+  - nextest 4 662 passed (10 skipped: the five `#[ignore]`d live smokes,
+    four alloc child helpers and a fixture regenerator), under nextest
+    0.9.148. A random `LEAK` at ~0.2 s under nextest < 0.9.145 on macOS is
+    nextest's pipe race, not the test (HK23). Only the scrape hammer runs alone (`.config/nextest.toml`):
     the alloc tests' reds under load were libtest's runner thread, no longer
     counted (A-S7-101, HK14). nextest runs no doctests: core-ring's
     `Mailbox` `compile_fail` doctest needs `cargo test --doc -p core-ring`.
@@ -227,9 +235,8 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   - `make license-check` OK.
   - `make bench-check` OK: 16 samples within 15 % on the M4 (HK9, HK16); a
     missing or stale result fails.
-  - worker pytest 1 722 passed, 3 skipped (the three need the release
-    binary on PATH) at HK10; HK11's suites (archive, config, store, candles,
-    pmlr) 237 passed.
+  - worker pytest 1 786 passed, 3 skipped (the three need the release
+    binary on PATH), HK27.
   - `make py-lint` all checks passed (HK8a). `make lint` means clippy.
   - fuzz: each HK cut's touched targets 60 s, clean (risk-policy "HK1",
     "HK2", "HK4"). The longer runs are in each lane's record.
@@ -242,7 +249,9 @@ The lane records stay where they always were: `docs/risk-policy.md` and
     set; the nightly `abort-stale` (HK21) now clears what a lost initiate
     answer orphans, so the rule is a second backstop, not the only one. The
     `s3.env` credential pair was once pasted in chat: rotate it.
-  - **nextest:** upgrade to ≥ 0.9.145 (0.9.143 installed; HK23).
+  - **Format drift:** ~208 Rust files and ~106 worker files outside the HK
+    lane's are not rustfmt/ruff-format clean (HK28); formatting them all is
+    `cargo fmt --all` in effect — the operator's call.
   - **Polymarket parse errors** trickle at ~0.17 % of messages with no
     reconnects (420 in 243 658 over 08:34–10:46Z on 2026-10-14). Since HK19
     `strategy.conf`'s `RAW_TAP=pm` makes the wrapper pass `--raw-tap pm`

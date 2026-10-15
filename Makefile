@@ -53,8 +53,10 @@ check:
 alloc-assert:
 	# --test-threads=1 is REQUIRED: the CountingAllocator uses process-
 	# global atomic counters, so parallel test threads pollute each
-	# other's AllocGuard delta. Serial execution gives us per-test
-	# isolation without turning the allocator into a TLS-tracked beast.
+	# other's AllocGuard delta. Since HK14 (A-S7-101) one thread-local
+	# flag keeps the main thread -- libtest's runner -- out of the count;
+	# the counters themselves stay global, so serial execution is still
+	# what isolates one test from another.
 	cargo test -p bench --test alloc_assertions --release -- --nocapture --test-threads=1
 
 copy-audit:
