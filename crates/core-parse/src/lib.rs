@@ -38,9 +38,22 @@ pub use pb::{
 // Integer parsing
 // ---------------------------------------------------------------
 
+/// The longest digit run that cannot overflow `u64`
+/// (`10^19 - 1 < u64::MAX < 10^20 - 1`).
+const U64_SAFE_DIGITS: usize = 19;
+
 /// Parse an ASCII-digit unsigned integer starting at `pos`. Returns
 /// `(value, new_pos)` on success, or `None` if there is no leading
-/// digit at `pos`.
+/// digit at `pos` or the digit run's value exceeds `u64::MAX`.
+///
+/// Exact: a run past `u64::MAX` is refused, never wrapped — a wrapped
+/// value is any number in `0..2^64`, a plausible id or quantity made
+/// from garbage. Leading zeros are not magnitude (`"000…042"` is 42).
+///
+/// A run of at most 19 digits cannot overflow, so the loop accumulates
+/// without a per-digit check; only a longer run (no field read through
+/// this scanner has one) is re-read with checked arithmetic, in a cold
+/// function kept out of line.
 ///
 /// Does not allocate. Does not panic. Never touches bytes outside the
 /// slice bounds.
@@ -48,37 +61,53 @@ pub use pb::{
 pub fn scan_u64(buf: &[u8], pos: Pos) -> Option<(u64, Pos)> {
     let mut i = pos;
     let mut v: u64 = 0;
-    let mut any = false;
     while i < buf.len() {
         let b = buf[i];
         if !b.is_ascii_digit() {
             break;
         }
-        v = v.wrapping_mul(10).wrapping_add((b - b'0') as u64);
+        // Wraps only in a run longer than U64_SAFE_DIGITS, whose `v`
+        // is discarded below.
+        v = v.wrapping_mul(10).wrapping_add(u64::from(b - b'0'));
         i += 1;
-        any = true;
     }
-    if any {
-        Some((v, i))
-    } else {
-        None
+    let digits = i - pos;
+    if digits == 0 {
+        return None;
     }
+    if digits > U64_SAFE_DIGITS {
+        return buf.get(pos..i).and_then(digits_u64_checked).map(|v| (v, i));
+    }
+    Some((v, i))
+}
+
+/// [`scan_u64`]'s exact path for a run longer than [`U64_SAFE_DIGITS`]:
+/// the value of an all-ASCII-digit slice, `None` past `u64::MAX`.
+#[cold]
+#[inline(never)]
+fn digits_u64_checked(digits: &[u8]) -> Option<u64> {
+    debug_assert!(digits.iter().all(u8::is_ascii_digit));
+    digits.iter().try_fold(0u64, |v, &b| {
+        v.checked_mul(10)?.checked_add(u64::from(b - b'0'))
+    })
 }
 
 /// Parse an ASCII-digit signed integer (optional leading `-`). Returns
-/// `(value, new_pos)` on success.
+/// `(value, new_pos)` on success, or `None` if no digit follows the
+/// optional sign or the value lies outside `i64`.
+///
+/// Exact at both ends: `"-9223372036854775808"` is `i64::MIN`;
+/// `"9223372036854775808"` and `"-9223372036854775809"` are refused,
+/// never wrapped.
 #[inline]
 pub fn scan_i64(buf: &[u8], pos: Pos) -> Option<(i64, Pos)> {
-    if pos >= buf.len() {
-        return None;
-    }
-    let (negative, start) = if buf[pos] == b'-' {
-        (true, pos + 1)
+    let negative = *buf.get(pos)? == b'-';
+    let (mag, next) = scan_u64(buf, pos + usize::from(negative))?;
+    let signed = if negative {
+        0i64.checked_sub_unsigned(mag)?
     } else {
-        (false, pos)
+        i64::try_from(mag).ok()?
     };
-    let (mag, next) = scan_u64(buf, start)?;
-    let signed = if negative { -(mag as i64) } else { mag as i64 };
     Some((signed, next))
 }
 
@@ -87,7 +116,9 @@ pub fn scan_i64(buf: &[u8], pos: Pos) -> Option<(i64, Pos)> {
 // ---------------------------------------------------------------
 
 /// Parse a decimal number like `"0.518000"` and return it scaled by
-/// `1e6` as `i64`. Returns `None` on malformed input.
+/// `1e6` as `i64`. Returns `None` on malformed input, or when the
+/// scaled value does not fit `i64` — a whole part past `u64::MAX`
+/// included, which [`scan_u64`] refuses rather than wraps.
 ///
 /// This is the canonical price-parsing primitive used by every ingress
 /// adapter. It keeps everything in integer arithmetic, so there is no
@@ -616,6 +647,8 @@ mod tests {
     fn scan_u64_returns_none_on_non_digit() {
         let b = b"abc";
         assert_eq!(scan_u64(b, 0), None);
+        assert_eq!(scan_u64(b"", 0), None);
+        assert_eq!(scan_u64(b"7", 5), None);
     }
 
     #[test]
@@ -628,6 +661,75 @@ mod tests {
     fn scan_i64_handles_negative() {
         let b = b"-42end";
         assert_eq!(scan_i64(b, 0), Some((-42, 3)));
+    }
+
+    /// 2^64 - 1 is the last value; one past it is refused, where the
+    /// wrapping accumulator returned 0.
+    #[test]
+    fn scan_u64_accepts_u64_max_and_refuses_one_past() {
+        assert_eq!(scan_u64(b"18446744073709551615,", 0), Some((u64::MAX, 20)));
+        assert_eq!(scan_u64(b"18446744073709551616,", 0), None);
+        assert_eq!(scan_u64(b"99999999999999999999", 0), None);
+        // The 19-digit fast path's ceiling still reads exactly.
+        assert_eq!(
+            scan_u64(b"9999999999999999999}", 0),
+            Some((9_999_999_999_999_999_999, 19))
+        );
+    }
+
+    #[test]
+    fn scan_u64_refuses_a_25_digit_run() {
+        assert_eq!(scan_u64(b"1234567890123456789012345,", 0), None);
+        assert_eq!(scan_u64(b"abc1234567890123456789012345", 3), None);
+        // Width is not magnitude: 25 digits with leading zeros fit.
+        assert_eq!(scan_u64(b"0000000000000000000000042,", 0), Some((42, 25)));
+    }
+
+    #[test]
+    fn scan_i64_is_exact_at_both_ends() {
+        assert_eq!(scan_i64(b"9223372036854775807,", 0), Some((i64::MAX, 19)));
+        assert_eq!(scan_i64(b"-9223372036854775808,", 0), Some((i64::MIN, 20)));
+        assert_eq!(scan_i64(b"9223372036854775808", 0), None);
+        assert_eq!(scan_i64(b"-9223372036854775809", 0), None);
+        assert_eq!(scan_i64(b"-18446744073709551616", 0), None);
+        assert_eq!(scan_i64(b"-0", 0), Some((0, 2)));
+        assert_eq!(scan_i64(b"-x", 0), None);
+        assert_eq!(scan_i64(b"-", 0), None);
+        assert_eq!(scan_i64(b"", 0), None);
+        assert_eq!(scan_i64(b"7", 5), None);
+    }
+
+    /// The whole part used to wrap before the scanners' checked combine
+    /// saw it: 2^64 + 0.5 read as 0.5.
+    #[test]
+    fn price_scanners_refuse_a_20_digit_whole_part() {
+        for s in [
+            &b"18446744073709551616.5"[..],
+            b"-18446744073709551616.5",
+            b"10000000000000000000.5",
+            b"1234567890123456789012345.000001",
+        ] {
+            assert_eq!(scan_price_1e6(s, 0), None);
+            assert_eq!(scan_price_1e8(s, 0), None);
+            assert_eq!(scan_price_1e9(s, 0), None);
+        }
+        // In range, unchanged: the largest value each scale holds, and
+        // one count past it.
+        assert_eq!(
+            scan_price_1e6(b"9223372036854.775807", 0),
+            Some((i64::MAX, 20))
+        );
+        assert_eq!(
+            scan_price_1e8(b"92233720368.54775807", 0),
+            Some((i64::MAX, 20))
+        );
+        assert_eq!(
+            scan_price_1e9(b"9223372036.854775807", 0),
+            Some((i64::MAX, 20))
+        );
+        assert_eq!(scan_price_1e6(b"9223372036854.775808", 0), None);
+        assert_eq!(scan_price_1e8(b"92233720368.54775808", 0), None);
+        assert_eq!(scan_price_1e9(b"9223372036.854775808", 0), None);
     }
 
     #[test]
@@ -729,12 +831,28 @@ mod proptests {
 
     proptest! {
         #[test]
-        fn scan_u64_roundtrips(v in 0u64..1_000_000_000u64) {
+        fn scan_u64_roundtrips(v in any::<u64>()) {
             let mut buf = [0u8; 32];
             let s = format_u64(&mut buf, v);
             let (out, end) = scan_u64(s, 0).expect("parse");
             prop_assert_eq!(out, v);
             prop_assert_eq!(end, s.len());
+        }
+
+        /// Oracle: on any run of 1-25 digits `scan_u64` agrees with
+        /// `str::parse::<u64>` — the value when it fits, `None` when it
+        /// does not, never a wrapped value.
+        #[test]
+        fn scan_u64_matches_std_parse(s in "[0-9]{1,25}") {
+            let want = s.parse::<u64>().ok().map(|v| (v, s.len()));
+            prop_assert_eq!(scan_u64(s.as_bytes(), 0), want);
+        }
+
+        /// The same oracle for `scan_i64`, sign included.
+        #[test]
+        fn scan_i64_matches_std_parse(s in "-?[0-9]{1,25}") {
+            let want = s.parse::<i64>().ok().map(|v| (v, s.len()));
+            prop_assert_eq!(scan_i64(s.as_bytes(), 0), want);
         }
 
         #[test]

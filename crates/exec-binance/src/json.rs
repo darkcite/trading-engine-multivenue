@@ -221,10 +221,8 @@ fn num_bytes(b: &[u8], v0: usize, v1: usize) -> Result<&[u8], ()> {
 
 /// A decimal (quoted or bare, optional `-`, ≤ 6 decimals kept) ×1e6. The
 /// whole value must be the number: a trailing byte is a refusal. The
-/// integer part has at most 18 digits — the integer scanner wraps past 19
-/// without a signal, and a wrapped numeral can read as any small value
-/// (a plausible quantity made from nonsense) — so a longer one is refused,
-/// never defaulted; the scale's own overflow is refused by the scanner.
+/// integer part has at most 18 digits — a longer one is refused, never
+/// defaulted; the scale's own overflow is refused by the scanner.
 #[inline]
 pub fn dec_1e6(b: &[u8], v0: usize, v1: usize) -> Result<i64, ()> {
     dec_scaled::<6>(b, v0, v1)
@@ -270,8 +268,7 @@ fn dec_scaled<const DIGITS: u8>(b: &[u8], v0: usize, v1: usize) -> Result<i64, (
     Ok(v)
 }
 
-/// An unsigned integer (quoted or bare), at most 19 digits (so it cannot
-/// wrap).
+/// An unsigned integer (quoted or bare), at most 19 digits.
 #[inline]
 pub fn u64_of(b: &[u8], v0: usize, v1: usize) -> Result<u64, ()> {
     let n = num_bytes(b, v0, v1)?;

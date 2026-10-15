@@ -47,9 +47,7 @@
 //! beyond). The tables drop before the engine loop starts; nothing here
 //! is reachable from a hot path.
 
-use core_parse::{scan_number_sci_1e9, skip_json_value, skip_string, skip_ws};
-
-use crate::scan_u64_checked;
+use core_parse::{scan_number_sci_1e9, scan_u64, skip_json_value, skip_string, skip_ws};
 
 /// Spot REST host (the cli's `MEXC_REST_HOST` overrides it).
 pub const SPOT_REST_HOST: &str = "api.mexc.com";
@@ -197,10 +195,10 @@ fn read_decimal_1e9(body: &[u8], pos: usize) -> Option<(i64, usize)> {
 /// (a fraction or exponent is not an integer).
 fn read_u64(body: &[u8], pos: usize) -> Option<(u64, usize)> {
     if body.get(pos) == Some(&b'"') {
-        let (v, e) = scan_u64_checked(body, pos + 1)?;
+        let (v, e) = scan_u64(body, pos + 1)?;
         return if body.get(e) == Some(&b'"') { Some((v, e + 1)) } else { None };
     }
-    let (v, e) = scan_u64_checked(body, pos)?;
+    let (v, e) = scan_u64(body, pos)?;
     if matches!(body.get(e), Some(b'.' | b'e' | b'E')) {
         return None;
     }
@@ -927,6 +925,7 @@ mod tests {
         assert_eq!(read_u64(b"\"12\"", 0), Some((12, 4)));
         assert_eq!(read_u64(b"1.5", 0), None);
         assert_eq!(read_u64(b"\"1", 0), None);
+        assert_eq!(read_u64(b"18446744073709551616,", 0), None);
         assert_eq!(read_decimal_1e9(b"\"0.0005\"", 0), Some((500_000, 8)));
         assert_eq!(read_decimal_1e9(b"\"0.0005x\"", 0), None);
         assert_eq!(read_decimal_1e9(b"1e-3,", 0), Some((1_000_000, 4)));

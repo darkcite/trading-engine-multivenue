@@ -567,33 +567,6 @@ impl Default for MexcSymbolTable {
 }
 
 // ---------------------------------------------------------------
-// Shared byte helpers
-// ---------------------------------------------------------------
-
-/// Checked ASCII-digit run at `pos` → `(value, end)`. `None` when no
-/// digit is present or the run overflows `u64` (never wraps — unlike
-/// `core_parse::scan_u64`, whose wrap would turn a garbage id into a
-/// plausible one).
-#[inline]
-pub(crate) fn scan_u64_checked(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
-    let mut i = pos;
-    let mut v: u64 = 0;
-    while i < buf.len() {
-        let b = buf[i];
-        if !b.is_ascii_digit() {
-            break;
-        }
-        v = v.checked_mul(10)?.checked_add((b - b'0') as u64)?;
-        i += 1;
-    }
-    if i == pos {
-        None
-    } else {
-        Some((v, i))
-    }
-}
-
-// ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
 
@@ -703,15 +676,6 @@ mod tests {
             k += 1;
         }
         assert_eq!(full.insert(b"OVER", 999), Err(SymbolTableErr::Full));
-    }
-
-    #[test]
-    fn checked_digit_scan_never_wraps() {
-        assert_eq!(scan_u64_checked(b"123x", 0), Some((123, 3)));
-        assert_eq!(scan_u64_checked(b"x", 0), None);
-        assert_eq!(scan_u64_checked(b"", 0), None);
-        assert_eq!(scan_u64_checked(b"18446744073709551615", 0), Some((u64::MAX, 20)));
-        assert_eq!(scan_u64_checked(b"18446744073709551616", 0), None, "overflow");
     }
 }
 

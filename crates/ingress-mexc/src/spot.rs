@@ -41,14 +41,11 @@
 
 use core_net::{WsPayload, WsWriteErr};
 use core_parse::{
-    find_field, scan_i64, scan_pb_field, scan_price_1e6, skip_string, skip_ws, PB_WT_LEN,
+    find_field, scan_i64, scan_pb_field, scan_price_1e6, scan_u64, skip_string, skip_ws, PB_WT_LEN,
     PB_WT_VARINT,
 };
 
-use crate::{
-    scan_u64_checked, MexcChannel, MexcClass, MexcDeal, MexcSymbolTable, DEAL_SIDE_BUY,
-    DEAL_SIDE_SELL,
-};
+use crate::{MexcChannel, MexcClass, MexcDeal, MexcSymbolTable, DEAL_SIDE_BUY, DEAL_SIDE_SELL};
 
 // Wrapper field numbers (`PushDataV3ApiWrapper`; f1 `channel` is
 // deliberately not latched).
@@ -253,7 +250,7 @@ fn span_decimal_1e6(span: &[u8]) -> Option<i64> {
 /// A PB string payload that must be ALL ASCII digits (checked).
 #[inline]
 fn span_u64(span: &[u8]) -> Option<u64> {
-    let (v, end) = scan_u64_checked(span, 0)?;
+    let (v, end) = scan_u64(span, 0)?;
     if end == span.len() {
         Some(v)
     } else {
@@ -267,7 +264,7 @@ fn span_u64(span: &[u8]) -> Option<u64> {
 /// the run overflows `u64` (unrepresentable = absent, never wrapped).
 #[inline]
 pub fn trade_id_seq(id: &[u8]) -> u64 {
-    match scan_u64_checked(id, 0) {
+    match scan_u64(id, 0) {
         Some((v, _)) => v,
         None => 0,
     }

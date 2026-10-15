@@ -318,14 +318,13 @@ proptest! {
 //
 // Every numeric reader in `json.rs` refuses a field with an unreasonable
 // digit count rather than guess at it (`u64_of` caps at 19 digits,
-// `i64_of` and `dec_1e6` at 18), so `core_parse::scan_u64`'s wrapping
-// accumulator, which has no overflow signal of its own, never wraps for a
-// value that gets past the cap.
+// `i64_of` and `dec_1e6` at 18). The cap predates `core_parse::scan_u64`
+// refusing a run past u64 (it used to wrap); the two now refuse together.
 
 /// A 20-digit `executedQty` equal to 2^64 wrapped to exactly 0 and was
 /// accepted, where an oversized `id`/`orderId` is refused. `dec_1e6` now
 /// caps the integer part at 18 digits (fixed in BX6; break-and-watch:
-/// without the cap this fails).
+/// without the cap this failed — core_parse now refuses it too).
 #[test]
 fn dec_1e6_refuses_a_wraparound_digit_count() {
     let frame = br#"{"id":1,"status":200,"result":{"orderId":1,"clientOrderId":"x","executedQty":"18446744073709551616","avgPrice":"0","origQty":"0","price":"0"}}"#;

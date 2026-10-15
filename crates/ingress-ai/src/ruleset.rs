@@ -681,13 +681,13 @@ fn scan_u32_field(cur: &mut Cur<'_>) -> Result<u32, RulesetReject> {
     if !c.is_ascii_digit() {
         return Err(RulesetReject::Grammar);
     }
+    // A digit is at `cur.i` (checked above), so `None` is a literal
+    // past u64 — oversized, the same Number reject as the cap below.
     let (v, end) = match scan_u64(cur.b, cur.i) {
         Some(x) => x,
-        None => return Err(RulesetReject::Grammar),
+        None => return Err(RulesetReject::Number),
     };
-    // `scan_u64` wraps on overflow — cap the literal at 10 digits
-    // (u32::MAX is 10) so a wrapped value can never sneak back into
-    // range.
+    // Cap the literal at 10 digits (u32::MAX is 10).
     if end - cur.i > 10 {
         return Err(RulesetReject::Number);
     }
@@ -2565,6 +2565,21 @@ mod tests {
         assert_eq!(
             check(mk("80", "1500", "-1.0", None).as_bytes()),
             Err(RulesetReject::Number)
+        );
+        // Oversized literals: past u32, and past u64 (refused by the
+        // scanner, never wrapped back into range).
+        assert_eq!(
+            check(mk("80", "4294967296", "50.0", None).as_bytes()),
+            Err(RulesetReject::Number)
+        );
+        assert_eq!(
+            check(mk("80", "1234567890123456789012345", "50.0", None).as_bytes()),
+            Err(RulesetReject::Number)
+        );
+        // A money whole part past u64 is malformed, not a wrapped $0.50.
+        assert_eq!(
+            check(mk("80", "1500", "18446744073709551616.5", None).as_bytes()),
+            Err(RulesetReject::Grammar)
         );
         // Boundary values pass (control).
         assert_eq!(check(mk("10000", "10", "50.0", None).as_bytes()), Ok(()));

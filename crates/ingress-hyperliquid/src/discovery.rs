@@ -1115,8 +1115,8 @@ fn scan_px_1e6(val: &[u8]) -> Option<i64> {
     Some(if neg { -units } else { units })
 }
 
-/// All-digit `u32` spanning the whole token. The 10-digit cap keeps
-/// [`scan_u64`]'s wrapping multiply out of range.
+/// All-digit `u32` spanning the whole token, at most 10 digits (the
+/// `u32` decimal width).
 fn scan_u32_exact(val: &[u8]) -> Option<u32> {
     if val.is_empty() || val.len() > 10 {
         return None;
@@ -1512,9 +1512,9 @@ fn count_array_elems(body: &[u8], pos: usize) -> Result<(u32, usize), HlDiscover
 }
 
 /// Parse the all-digits suffix `coin[1..]` of an `@{idx}` / `#<enc>`
-/// coin into a `u32`. At most 10 digits (the `u32` decimal width, so
-/// the underlying u64 scan cannot wrap); the digits must run to the
-/// end of the coin. `None` on empty / junk / overflow.
+/// coin into a `u32`. At most 10 digits (the `u32` decimal width); the
+/// digits must run to the end of the coin. `None` on empty / junk /
+/// overflow.
 fn parse_coin_index(coin: &[u8]) -> Option<u32> {
     let (v, end) = scan_u64(coin, 1)?;
     if end != coin.len() || coin.len() - 1 > 10 {

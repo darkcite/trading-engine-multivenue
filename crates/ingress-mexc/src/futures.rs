@@ -25,10 +25,10 @@
 
 use core_net::{WsPayload, WsWriteErr};
 use core_parse::{
-    find_field, scan_number_sci_1e6, scan_number_sci_1e9, skip_json_value, skip_ws,
+    find_field, scan_number_sci_1e6, scan_number_sci_1e9, scan_u64, skip_json_value, skip_ws,
 };
 
-use crate::{scan_u64_checked, MexcChannel, MexcDeal, DEAL_SIDE_BUY, DEAL_SIDE_SELL};
+use crate::{MexcChannel, MexcDeal, DEAL_SIDE_BUY, DEAL_SIDE_SELL};
 
 // ---------------------------------------------------------------
 // Number readers (bare — the wire — or quoted, tolerated)
@@ -72,7 +72,7 @@ fn json_u64(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
     let p = skip_ws(buf, pos);
     let quoted = buf.get(p) == Some(&b'"');
     let start = if quoted { p + 1 } else { p };
-    let (v, e) = scan_u64_checked(buf, start)?;
+    let (v, e) = scan_u64(buf, start)?;
     if quoted {
         if buf.get(e) != Some(&b'"') {
             return None;
@@ -882,6 +882,7 @@ mod tests {
         assert_eq!(json_u64(b"4.2", 0), None);
         assert_eq!(json_u64(b"4e2", 0), None);
         assert_eq!(json_u64(b"-4", 0), None);
+        assert_eq!(json_u64(b"18446744073709551616,", 0), None);
         assert_eq!(json_num_1e9(b"\"0.5\"", 0), Some((500_000_000, 5)));
         assert_eq!(json_num_1e9(b"\"0.5", 0), None);
         assert_eq!(json_num_1e6(b"80489,", 0), Some((80_489_000_000, 5)));
