@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// PIN: pin:01-v5-paren-wrap
+// OURS: accept
+// TV: pending
+//@version=6
+indicator("p05")
+x = math.max(1,
+    2)
+plot(x)

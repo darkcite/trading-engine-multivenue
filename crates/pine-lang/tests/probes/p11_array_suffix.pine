@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// PIN: pin:01-array-suffix-type
+// OURS: accept
+// TV: pending
+//@version=6
+indicator("p11")
+float[] a = array.new<float>(3, 0.0)
+plot(array.size(a))

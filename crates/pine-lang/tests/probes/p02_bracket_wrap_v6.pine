@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// PIN: pin:01-bracket-wrap
+// OURS: accept
+// TV: pending
+//@version=6
+indicator("p02")
+f() => [1,
+    2]
+[a, b] = f()
+plot(a + b)

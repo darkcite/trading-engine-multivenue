@@ -1,0 +1,18 @@
+[package]
+name         = "pine-lang"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Pine Script v5 + v6 front end: version gate, lexer, layout machine and parser into an arena AST (impl-01)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+pine-ir = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// RULE: R3
+// OURS: reject 1008
+// TV: pending
+//@version=6
+indicator("p13")
+x = close +
+    open
+plot(x)

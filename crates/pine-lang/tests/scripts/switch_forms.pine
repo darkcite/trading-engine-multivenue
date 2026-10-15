@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+x = 2
+r = switch x
+    1 => "a"
+    2 =>
+        switch
+            x > 1 => "b"
+            => "c"
+    => "d"
+switch x
+    3 => label.new(bar_index, high, r)

@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=5
+strategy("v5 dialect", overlay = true)
+fast = ta.sma(close, 10)
+slow = ta.sma(close, 30)
+if ta.crossover(fast, slow)
+    strategy.entry("L", strategy.long)
+else if ta.crossunder(fast, slow)
+    strategy.close("L")
+f(x,
+  y) => x + y
+z = f(1,
+  2)

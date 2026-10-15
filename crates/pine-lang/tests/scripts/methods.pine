@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+type Counter
+    int n = 0
+method bump(Counter c, int by = 1) =>
+    c.n += by
+    c
+method value(Counter c) => c.n
+cnt = Counter.new()
+cnt.bump(2).bump()
+v = cnt.value()

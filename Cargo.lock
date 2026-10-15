@@ -1484,6 +1484,14 @@ name = "pine-ir"
 version = "0.1.0"
 
 [[package]]
+name = "pine-lang"
+version = "0.1.0"
+dependencies = [
+ "pine-ir",
+ "proptest",
+]
+
+[[package]]
 name = "pine-spec"
 version = "0.1.0"
 dependencies = [

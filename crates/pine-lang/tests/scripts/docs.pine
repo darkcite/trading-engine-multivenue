@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//@description doc runs and annotations
+//@strategy_alert_message hello
+indicator("docs")
+//@function twice
+//@param x the value
+//@returns 2x
+twice(x) => 2 * x
+
+//@variable a counter
+var int n = 0
+//@type holder
+type H
+    //@field v the value
+    int v = 1
+n += 1
