@@ -14,6 +14,15 @@
 //!
 //! ## Slot map (wire-stable — `AiCmd::strategy_id`)
 //!
+//! One declarative table, `member_table!` (S16-1), lists the members in
+//! slot order: slot, mask bit, field and type, `--strategy` name and
+//! `regime.toml [labels.<member>]` key. The `SLOT_*`/`BIT_*` constants,
+//! [`BUILT_MASK`], [`MEMBERS`], the [`StrategySet`] member fields and
+//! every per-member fan-out, route and sum below are generated from its
+//! rows by `member_gen!`: the same monomorphic call per member, in row
+//! (= slot) order, that the hand-written sites made — no `dyn`, no
+//! allocation, no extra branch.
+//!
 //! | slot | member | status |
 //! |---|---|---|
 //! | 0 | `strategy-hyparb` | built (HYPARB H0, 2026-09-23 — **was `strategy-latency-arb`**, unlinked the same day; lands DARK — O-H8) |
@@ -33,6 +42,54 @@
 //! Slot 6 changed hands on 2026-09-26 the same way: `strategy-icdp`
 //! stays in the workspace (and `backtest --member icdp` still drives
 //! it); nothing in the set links it.
+//!
+//! ### Slot history
+//!
+//! A slot NUMBER is wire-stable — `Order.strategy_id` n and
+//! `AiCmd::strategy_id` n still mean "slot n" when the slot changes
+//! hands — so a capture taken before a swap carries the earlier member's
+//! rows under that slot. `docs/migration.md` records every boundary.
+//!
+//! * **Slot 0** ([`SLOT_HYPARB`]; HYPARB O-H2, 2026-09-23) — **was
+//!   `strategy-latency-arb`**, unlinked by O-H1: the crate stays in the
+//!   workspace, nothing links it. A capture taken before H0 carries
+//!   latency-arb rows under slot 0.
+//! * **Slot 1** ([`SLOT_VRP`]; [`SLOT_EV`] / [`BIT_EV`] are its
+//!   pre-2026-09-10 names) — **the swap boundary.** Slot 1 was
+//!   `strategy-ev` until 2026-09-10 (VRP V7), so a capture taken before
+//!   that date carries EV rows under this slot and one taken after
+//!   carries VRP rows.
+//! * **Slot 2** ([`SLOT_XSD`]: the cross-sectional dislocation member,
+//!   the statarb lane's coded member) — **the second swap boundary.**
+//!   Slot 2 was `strategy-cross-arb` until 2026-09-12 (XSD-S; operator
+//!   ruling R3 = reuse slot 2), so a capture taken before that date
+//!   carries cross-arb rows under this slot, one taken after XSD-3
+//!   carries XSD rows, and between the two the slot emits nothing.
+//! * **Slot 3** ([`SLOT_BIN15`]) changed hands on 2026-09-12 (BIN15
+//!   O4b): it was `strategy-rule-tree`, which is now UNLINKED — the crate
+//!   remains a workspace member and still builds and tests, but nothing
+//!   depends on it and no mask name reaches it. A capture taken before
+//!   that date carries rule-tree rows under this slot and one taken after
+//!   carries bin15 rows. Pinned in `core-types` as
+//!   [`core_types::STRATEGY_SLOT_BIN15`], because `SetBinarySpec` shape
+//!   enforcement depends on it.
+//! * **Slot 4** ([`SLOT_AI_EXEC`]) — wire value pinned in `core-types`
+//!   ([`core_types::STRATEGY_SLOT_AI_EXEC`]): `OrderIntent` shape
+//!   enforcement depends on it.
+//! * **Slot 5** ([`SLOT_VM`]) — wire value pinned in `core-types`
+//!   ([`core_types::STRATEGY_SLOT_VM`]): `RulesetStage`/`RulesetCommit`
+//!   shape enforcement depends on it.
+//! * **Slot 6** ([`SLOT_XMM`]; XMM XH1, ruling O-XH1) — **the third swap
+//!   boundary.** Slot 6 was `strategy-icdp` (ICDP I4, 2026-09-03) until
+//!   2026-09-26; icdp is UNLINKED — the crate stays in the workspace and
+//!   `backtest --member icdp` still drives it, but nothing in the set
+//!   links it and no mask name reaches it. A capture taken before XH1
+//!   carries icdp rows under this slot and one taken after carries xmm
+//!   rows.
+//! * **Slot 7** ([`SLOT_HCV`]; HC11, ruling O-HC18) — the Hypercall S1
+//!   options member: DARK, paper only (`exec.toml` refuses a live slot 7
+//!   until its own arming ruling). Slot 7 was reserved until HC11, so the
+//!   number carries no earlier member's rows.
 //!
 //! ## Timers are per slot (XMM XH1)
 //!
@@ -112,9 +169,7 @@ use core_vol::{LongForecast, LongSetCounters, LongStateSnap, LongVolSet, DAY_NS}
 use core_types::{
     AiCmd, AiCmdKind, ChannelEvent, ChannelId, Fill, Order, OrderEvent, RegimeLabelSet,
     RegimeWord, RuleTableV2, Signal, Tick, TradePrint, REGIME_OFF_HARD, REGIME_PROFILES,
-    STRATEGY_SLOT_AI_EXEC, STRATEGY_SLOT_VM,
 };
-use strategy_ai_exec::AiExec;
 use strategy_core::{
     Ctx, HarCounters, HarSeriesView, RegimeCounters, RegimeGate, RegimeRelView, SlotCounters,
     Strategy, StrategyCounters, StrategyError, SubmitErr, VmRowView, HAR_VIEW_NAME_MAX,
@@ -134,103 +189,246 @@ const _: () = assert!(HAR_VIEW_TENORS_D[HAR_VIEW_TENORS - 1] as usize <= core_vo
 const _: () = assert!(
     core::mem::size_of::<HarCounters>() == core::mem::size_of::<LongSetCounters>()
 );
-use strategy_bin15::Bin15Strategy;
-use strategy_hyparb::HyparbStrategy;
-use strategy_vm::VmStrategy;
-use strategy_hcv::HcvStrategy;
-use strategy_vrp::VrpStrategy;
-use strategy_xmm::XmmStrategy;
-use strategy_xsd::XsdStrategy;
 
 // ---------------------------------------------------------------
-// Slot / mask constants
+// The member table (S16-1)
 // ---------------------------------------------------------------
 
-/// Slot index of the hyparb member (HYPARB O-H2, 2026-09-23 — **was
-/// `strategy-latency-arb`**, unlinked by O-H1: the crate stays in the
-/// workspace, nothing links it). The number is wire-stable: a capture
-/// taken before H0 carries latency-arb rows under slot 0.
-pub const SLOT_HYPARB: u8 = 0;
-/// Slot index of the VRP member.
-///
-/// **The swap boundary.** Slot 1 was `strategy-ev` until 2026-09-10
-/// (VRP V7). The NUMBER is wire-stable — `Order.strategy_id` 1 and
-/// `AiCmd::strategy_id` 1 still mean "slot 1" — so a capture taken
-/// before that date carries EV rows under this slot and one taken after
-/// carries VRP rows. `docs/migration.md` records the boundary.
-pub const SLOT_VRP: u8 = 1;
+/// One row of the member table as data ([`MEMBERS`]): a member's slot,
+/// bit, `--strategy` name and `regime.toml` label key, without its type.
+/// For boot-only readers; the hot path never reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Member {
+    /// The member's slot: `Order::strategy_id` / `AiCmd::strategy_id`.
+    pub slot: u8,
+    /// The member's enable-mask bit, `1 << slot`.
+    pub bit: u8,
+    /// The member's own `--strategy` name: the [`MASK_TABLE`] name that
+    /// composes its bit alone.
+    pub name: &'static str,
+    /// The `regime.toml [labels.<key>]` section the cli resolves for this
+    /// member; `None` where the cli resolves none (vm's rows gate
+    /// themselves, RG3; hcv has no section).
+    pub regime_key: Option<&'static str>,
+}
+
+/// The generator behind `member_table!`. Each `@arm` turns the table's
+/// rows (which `member_table!` appends after the `;`) into one site's
+/// code: one monomorphic call per member, in row order — the code that
+/// site carried by hand before S16-1, so no `dyn`, no allocation and no
+/// branch the hand-written fan-out did not have. `$s` and `$c` are the
+/// caller's `self` and ctx, passed in because macro hygiene keeps the
+/// body from naming them. Call it only through `member_table!`.
+macro_rules! member_gen {
+    // The SLOT_*/BIT_* constants, `BUILT_MASK` and `MEMBERS`, and the
+    // table's laws checked at compile time.
+    (@consts ;
+        $(($sn:ident = $sv:expr, $bn:ident, $f:ident: $ty:ty, $nm:literal, $rk:expr)),* $(,)?
+    ) => {
+        $(
+            #[doc = concat!(
+                "Slot index of the `", $nm, "` member (wire-stable; the module ",
+                "docs' slot map carries its history)."
+            )]
+            pub const $sn: u8 = $sv;
+        )*
+        $(
+            #[doc = concat!("Enable-mask bit of the `", $nm, "` member: `1 << ", stringify!($sn), "`.")]
+            pub const $bn: u8 = 1 << $sn;
+        )*
+        /// Every built member's bit: the OR of the member table's rows
+        /// (slots 0–7, all of them since HC11).
+        pub const BUILT_MASK: u8 = $($bn)|*;
+        /// The member table's rows in slot order: every member's slot,
+        /// bit, `--strategy` name and `regime.toml` label key. Boot-only
+        /// readers; nothing on the hot path reads it.
+        pub const MEMBERS: &[Member] = &[
+            $(Member { slot: $sn, bit: $bn, name: $nm, regime_key: $rk }),*
+        ];
+        // The table's laws: fan-out order = row order = slot order
+        // (strictly increasing), every slot inside the wire's range, and
+        // every bit its own slot's.
+        const _: () = {
+            let mut i = 0;
+            while i < MEMBERS.len() {
+                assert!(MEMBERS[i].slot < core_types::MAX_STRATEGY_SLOTS, "slot past the wire");
+                assert!(MEMBERS[i].bit == 1 << MEMBERS[i].slot, "a bit not its slot's");
+                assert!(i == 0 || MEMBERS[i - 1].slot < MEMBERS[i].slot, "rows out of order");
+                i += 1;
+            }
+        };
+    };
+    // The struct: the members' fields first, in row order, then the
+    // set's own fields as written at the call site.
+    (@struct $(#[$m:meta])* $v:vis struct $name:ident {
+        $($(#[$fm:meta])* $fv:ident: $ft:ty),* $(,)?
+    } ;
+        $(($sn:ident = $sv:expr, $bn:ident, $f:ident: $ty:ty, $nm:literal, $rk:expr)),* $(,)?
+    ) => {
+        $(#[$m])*
+        $v struct $name {
+            $($f: $ty,)*
+            $($(#[$fm])* $fv: $ft,)*
+        }
+    };
+    // `Self { .. }`: every member default-constructed, then the set's own
+    // fields as written at the call site.
+    (@new { $($fv:ident: $fe:expr),* $(,)? } ;
+        $(($sn:ident = $sv:expr, $bn:ident, $f:ident: $ty:ty, $nm:literal, $rk:expr)),* $(,)?
+    ) => {
+        Self {
+            $($f: <$ty>::new(),)*
+            $($fv: $fe,)*
+        }
+    };
+    // `on_start` to the INITIALLY-enabled members only; the first refusal
+    // is the boot's (`?`).
+    (@start $s:ident, $c:ident ;
+        $(($sn:ident = $sv:expr, $bn:ident, $f:ident: $ty:ty, $nm:literal, $rk:expr)),* $(,)?
+    ) => {
+        $(
+            if $s.initial & $bn != 0 {
+                $s.$f.on_start(&mut StampCtx::new(&mut *$c, $sn))?;
+            }
+        )*
+    };
+    // A one-argument callback to every ENABLED member, slot-stamped.
+    (@gated $s:ident, $c:ident, $m:ident($a:ident) ;
+        $(($sn:ident = $sv:expr, $bn:ident, $f:ident: $ty:ty, $nm:literal, $rk:expr)),* $(,)?
+    ) => {
+        $(
+            if $s.enabled & $bn != 0 {
+                $s.$f.$m($a, &mut StampCtx::new(&mut *$c, $sn));
+            }
+        )*
+    };
+    // `on_timer` to every enabled member whose own period has elapsed
+    // since its own last call (XMM XH1's per-slot clocks).
+    (@timer $s:ident, $c:ident, $now:ident ;
+        $(($sn:ident = $sv:expr, $bn:ident, $f:ident: $ty:ty, $nm:literal, $rk:expr)),* $(,)?
+    ) => {
+        $(
+            if $s.enabled & $bn != 0
+                && Self::timer_due(
+                    &mut $s.timer_last_ns[$sn as usize],
+                    $s.$f.timer_period_ns(),
+                    $now,
+                )
+            {
+                $s.$f.on_timer($now, &mut StampCtx::new(&mut *$c, $sn));
+            }
+        )*
+    };
+    // A ctx-only callback to EVERY member, enabled or not.
+    (@each $s:ident, $c:ident, $m:ident ;
+        $(($sn:ident = $sv:expr, $bn:ident, $f:ident: $ty:ty, $nm:literal, $rk:expr)),* $(,)?
+    ) => {
+        $($s.$f.$m(&mut StampCtx::new(&mut *$c, $sn));)*
+    };
+    // A one-argument callback to slot `$k`'s member ALONE; `$default`
+    // for a slot with no member.
+    (@route $s:ident, $c:ident, $k:ident, $m:ident($a:ident), $default:expr ;
+        $(($sn:ident = $sv:expr, $bn:ident, $f:ident: $ty:ty, $nm:literal, $rk:expr)),* $(,)?
+    ) => {
+        match $k {
+            $($sn => $s.$f.$m($a, &mut StampCtx::new(&mut *$c, $sn)),)*
+            _ => $default,
+        }
+    };
+    // Relabel slot `$k`'s member: `false` for a slot with no member, and
+    // from a member that keeps the trait default (it stores no label).
+    (@relabel $s:ident, $k:ident, $set:ident ;
+        $(($sn:ident = $sv:expr, $bn:ident, $f:ident: $ty:ty, $nm:literal, $rk:expr)),* $(,)?
+    ) => {
+        match $k {
+            $($sn => $s.$f.set_regime_label($set),)*
+            _ => false,
+        }
+    };
+    // Every member's label, pulled into its slot.
+    (@labels $s:ident ;
+        $(($sn:ident = $sv:expr, $bn:ident, $f:ident: $ty:ty, $nm:literal, $rk:expr)),* $(,)?
+    ) => {
+        $($s.regime_labels[$sn as usize] = $s.$f.regime_label();)*
+    };
+    // Slot `$k`'s bit; `$default` for a slot with no member.
+    (@bit_of $k:ident, $default:expr ;
+        $(($sn:ident = $sv:expr, $bn:ident, $f:ident: $ty:ty, $nm:literal, $rk:expr)),* $(,)?
+    ) => {
+        match $k {
+            $($sn => $bn,)*
+            _ => $default,
+        }
+    };
+    // Slot `$k`'s member's (emitted, dropped); `$default` for a slot with
+    // no member.
+    (@slot_orders $s:ident, $k:ident, $default:expr ;
+        $(($sn:ident = $sv:expr, $bn:ident, $f:ident: $ty:ty, $nm:literal, $rk:expr)),* $(,)?
+    ) => {
+        match $k {
+            $($sn => ($s.$f.orders_emitted(), $s.$f.orders_dropped()),)*
+            _ => $default,
+        }
+    };
+    // One `u64` counter summed over every member.
+    (@sum $s:ident, $m:ident ;
+        $(($sn:ident = $sv:expr, $bn:ident, $f:ident: $ty:ty, $nm:literal, $rk:expr)),* $(,)?
+    ) => {{
+        let mut n = 0u64;
+        $(n += $s.$f.$m();)*
+        n
+    }};
+    // `$min` lowered to every member's timer period.
+    (@min_period $s:ident, $min:ident ;
+        $(($sn:ident = $sv:expr, $bn:ident, $f:ident: $ty:ty, $nm:literal, $rk:expr)),* $(,)?
+    ) => {
+        $(
+            let v = $s.$f.timer_period_ns();
+            if v < $min {
+                $min = v;
+            }
+        )*
+    };
+}
+
+/// THE member table (S16-1, ruling S16-R3): every member of the set, one
+/// row each, in slot order —
+/// `(SLOT const = slot, BIT const, field: type, --strategy name, labels key)`.
+/// Every per-member site in this crate is a `member_table!(@arm ..)` that
+/// hands these rows to `member_gen!`. A new member is one row here, plus
+/// its [`MASK_TABLE`] names and its `*_mut` accessor.
+macro_rules! member_table {
+    ($($arm:tt)*) => {
+        member_gen! {
+            $($arm)* ;
+            (SLOT_HYPARB = 0, BIT_HYPARB,
+                hyparb: strategy_hyparb::HyparbStrategy, "hyparb", Some("hyparb")),
+            (SLOT_VRP = 1, BIT_VRP,
+                vrp: strategy_vrp::VrpStrategy, "vrp", Some("vrp")),
+            (SLOT_XSD = 2, BIT_XSD,
+                xsd: strategy_xsd::XsdStrategy, "xsd", Some("xsd")),
+            (SLOT_BIN15 = core_types::STRATEGY_SLOT_BIN15, BIT_BIN15,
+                bin15: strategy_bin15::Bin15Strategy, "bin15", Some("bin15")),
+            (SLOT_AI_EXEC = core_types::STRATEGY_SLOT_AI_EXEC, BIT_AI_EXEC,
+                ai_exec: strategy_ai_exec::AiExec<SET_AI_EXEC_SLOTS>, "ai-exec", Some("ai_exec")),
+            (SLOT_VM = core_types::STRATEGY_SLOT_VM, BIT_VM,
+                vm: strategy_vm::VmStrategy, "vm", None),
+            (SLOT_XMM = 6, BIT_XMM,
+                xmm: strategy_xmm::XmmStrategy, "xmm", Some("xmm")),
+            (SLOT_HCV = 7, BIT_HCV,
+                hcv: strategy_hcv::HcvStrategy, "hcv", None),
+        }
+    };
+}
+
+// The SLOT_*/BIT_* constants, `BUILT_MASK` and `MEMBERS`, from the table.
+member_table! { @consts }
+
 /// Slot 1 under its pre-2026-09-10 name, for readers of pre-boundary
 /// captures and configs. Identical value.
 pub const SLOT_EV: u8 = SLOT_VRP;
-/// Slot index of the xsd member (cross-sectional dislocation; the
-/// statarb lane's coded member).
-///
-/// **The second swap boundary.** Slot 2 was `strategy-cross-arb` until
-/// 2026-09-12 (XSD-S; operator ruling R3 = reuse slot 2). The NUMBER is
-/// wire-stable — `Order.strategy_id` 2 and `AiCmd::strategy_id` 2 still
-/// mean "slot 2" — so a capture taken before that date carries
-/// cross-arb rows under this slot, one taken after XSD-3 carries XSD
-/// rows, and between the two the slot emits nothing. `docs/migration.md`
-/// records the boundary.
-pub const SLOT_XSD: u8 = 2;
-/// Slot index of the bin15 member.
-///
-/// Slot 3 changed hands on 2026-09-12 (BIN15 O4b): it was
-/// `strategy-rule-tree`, which is now UNLINKED — the crate remains a
-/// workspace member and still builds and tests, but nothing depends on
-/// it and no mask name reaches it. The NUMBER is wire-stable
-/// — `Order.strategy_id` 3 and `AiCmd::strategy_id` 3 still mean
-/// "slot 3" — so a capture taken before that date carries rule-tree
-/// rows under this slot and one taken after carries bin15 rows.
-/// `docs/migration.md` records the boundary. Pinned in `core-types` as
-/// [`core_types::STRATEGY_SLOT_BIN15`], because `SetBinarySpec` shape
-/// enforcement depends on it.
-pub const SLOT_BIN15: u8 = core_types::STRATEGY_SLOT_BIN15;
-/// Slot index of the ai-exec member (wire value pinned in
-/// `core-types` — `OrderIntent` shape enforcement depends on it).
-pub const SLOT_AI_EXEC: u8 = STRATEGY_SLOT_AI_EXEC;
-/// Slot index of the vm member (wire value pinned in `core-types` —
-/// `RulesetStage`/`RulesetCommit` shape enforcement depends on it).
-pub const SLOT_VM: u8 = STRATEGY_SLOT_VM;
-/// Slot index of the xmm member (XMM XH1, ruling O-XH1).
-///
-/// **The third swap boundary.** Slot 6 was `strategy-icdp` (ICDP I4,
-/// 2026-09-03) until 2026-09-26; icdp is UNLINKED — the crate stays in
-/// the workspace and `backtest --member icdp` still drives it, but
-/// nothing in the set links it and no mask name reaches it. The NUMBER
-/// is wire-stable — `Order.strategy_id` 6 and `AiCmd::strategy_id` 6
-/// still mean "slot 6" — so a capture taken before XH1 carries icdp
-/// rows under this slot and one taken after carries xmm rows.
-/// `docs/migration.md` records the boundary.
-pub const SLOT_XMM: u8 = 6;
-/// Slot index of the hcv member (HC11, ruling O-HC18): the Hypercall S1
-/// options member — DARK, paper only (`exec.toml` refuses a live slot 7
-/// until its own arming ruling). Slot 7 was reserved until HC11, so the
-/// number carries no earlier member's rows.
-pub const SLOT_HCV: u8 = 7;
-
-/// Enable-mask bit for the hyparb member (slot 0 — see [`SLOT_HYPARB`]).
-pub const BIT_HYPARB: u8 = 1 << SLOT_HYPARB;
-/// Enable-mask bit for the VRP member (slot 1 — see [`SLOT_VRP`]).
-pub const BIT_VRP: u8 = 1 << SLOT_VRP;
 /// Slot 1's bit under its pre-2026-09-10 name. Identical value.
 pub const BIT_EV: u8 = BIT_VRP;
-/// Enable-mask bit for the xsd member (slot 2 — see [`SLOT_XSD`]).
-pub const BIT_XSD: u8 = 1 << SLOT_XSD;
-/// Enable-mask bit for the bin15 member (slot 3 — see [`SLOT_BIN15`]).
-pub const BIT_BIN15: u8 = 1 << SLOT_BIN15;
-/// Enable-mask bit for the ai-exec member (item 8).
-pub const BIT_AI_EXEC: u8 = 1 << SLOT_AI_EXEC;
-/// Enable-mask bit for the vm member (8g item 6).
-pub const BIT_VM: u8 = 1 << SLOT_VM;
-/// Enable-mask bit for the xmm member (slot 6 — see [`SLOT_XMM`]).
-pub const BIT_XMM: u8 = 1 << SLOT_XMM;
-/// Enable-mask bit for the hcv member (slot 7 — see [`SLOT_HCV`]).
-pub const BIT_HCV: u8 = 1 << SLOT_HCV;
-
-/// Every built member's bit (slots 0–7: all of them since HC11).
-pub const BUILT_MASK: u8 =
-    BIT_HYPARB | BIT_VRP | BIT_XSD | BIT_BIN15 | BIT_AI_EXEC | BIT_VM | BIT_XMM | BIT_HCV;
 
 /// Ai-exec capacity inside the set (design §7 sketch `AiExec<64>` —
 /// sizes the fair table, book table and cooldown gate alike).
@@ -343,76 +541,73 @@ pub fn mask_for_name(name: &str) -> Option<u8> {
 // StrategySet
 // ---------------------------------------------------------------
 
-/// Statically-composed strategy set. See the module docs for slot
-/// map, routing and boot semantics.
-pub struct StrategySet {
-    hyparb: HyparbStrategy,
-    vrp: VrpStrategy,
-    xsd: XsdStrategy,
-    bin15: Bin15Strategy,
-    ai_exec: AiExec<SET_AI_EXEC_SLOTS>,
-    vm: VmStrategy,
-    xmm: XmmStrategy,
-    hcv: HcvStrategy,
-    /// Runtime enable mask (bits per the slot map). Every bit is a
-    /// built slot since HC11.
-    enabled: u8,
-    /// Initial mask as passed to [`Self::new`] — `on_start` validates
-    /// exactly these members.
-    initial: u8,
-    /// Sticky halt flag (set-local until 8i). Once set, enables are
-    /// refused until the process restarts.
-    halted: bool,
-    /// Refused `EnableStrategy` commands (halted or reserved/unknown
-    /// slot). Mirrored to `engine_ai_enable_refused_total`.
-    enable_refused: u64,
-    /// X1: fills stamped for a slot that is not enabled, or not built.
-    /// Mirrored to `engine_set_fills_unrouted_total`.
-    fills_unrouted: u64,
-    /// XMM XH1: order events for a slot that is not enabled, not built,
-    /// or not attributed — counted, never delivered.
-    order_events_unrouted: u64,
-    /// XMM XH1: when each slot's `on_timer` last ran (per-slot gating —
-    /// module docs).
-    timer_last_ns: [NsTs; 8],
-    /// XMM XH1: when the regime detector's timer last ran.
-    regime_timer_last_ns: NsTs,
-    /// RG2: the regime detector (boot-boxed; inert until
-    /// [`Self::configure_regime`] — every word UNKNOWN, every gate open
-    /// for the unconstrained members that exist today).
-    regime: Box<RegimeState>,
-    /// RG2: per-slot label sets, pulled from the members at configure
-    /// time (or overridden from `regime.toml [labels.*]`).
-    regime_labels: [RegimeLabelSet; 8],
-    /// RG2: per-slot current gate.
-    regime_gates: [RegimeGate; 8],
-    /// RG2: `SetRegime` commands applied.
-    regime_declared_total: u64,
-    /// RG2: gate edges fanned out (`on_regime` calls).
-    regime_gate_changes: u64,
-    /// HAR H3.3: the long-tenor HAR series (boot-boxed; inert until the
-    /// cli configures it from `har.toml` — one branch per tick and per
-    /// poll, so a boot without the file is the pre-H3 set, bit for bit).
-    /// Beside the regime detector, in the same seat and on the same 1 s
-    /// period (its own clock); no member reads it (plan law L4).
-    har: Box<LongVolSet>,
-    /// HAR H3.5: each series' `/state.har` row as of its newest day close
-    /// or the restore — rebuilt in `on_timer` only when that series'
-    /// epoch moved (the forecasts do not move between day closes), so
-    /// the 1 s publish copies rows instead of re-reading 9 tenors × 12
-    /// engines. Boot-boxed.
-    har_view: Box<[HarSeriesView; HAR_VIEW_SERIES]>,
-    /// The epoch each cached row was built at (`u64::MAX`: never).
-    har_view_epoch: [u64; HAR_VIEW_SERIES],
-    /// When the long-tenor set's timer last ran: its own clock on the
-    /// regime's 1 s period (XMM XH1's per-slot timers).
-    har_timer_last_ns: NsTs,
-    /// HAR H3.7: one mailbox per series to the cli's state-writer thread
-    /// (`har.toml` order). Empty = no writer: the cli writes the state on
-    /// the engine thread instead (the pre-H3.7 path). Boot-only.
-    har_out: Vec<MailboxTx<LongStateSnap>>,
-    /// HAR H3.7: the epoch each series' state was last handed to the writer.
-    har_offered: [u64; HAR_VIEW_SERIES],
+// The struct: one field per member table row (generated, in slot order),
+// then the set's own state.
+member_table! {
+    @struct
+    /// Statically-composed strategy set. See the module docs for slot
+    /// map, routing and boot semantics.
+    pub struct StrategySet {
+        /// Runtime enable mask (bits per the slot map). Every bit is a
+        /// built slot since HC11.
+        enabled: u8,
+        /// Initial mask as passed to [`Self::new`] — `on_start` validates
+        /// exactly these members.
+        initial: u8,
+        /// Sticky halt flag (set-local until 8i). Once set, enables are
+        /// refused until the process restarts.
+        halted: bool,
+        /// Refused `EnableStrategy` commands (halted or reserved/unknown
+        /// slot). Mirrored to `engine_ai_enable_refused_total`.
+        enable_refused: u64,
+        /// X1: fills stamped for a slot that is not enabled, or not built.
+        /// Mirrored to `engine_set_fills_unrouted_total`.
+        fills_unrouted: u64,
+        /// XMM XH1: order events for a slot that is not enabled, not built,
+        /// or not attributed — counted, never delivered.
+        order_events_unrouted: u64,
+        /// XMM XH1: when each slot's `on_timer` last ran (per-slot gating —
+        /// module docs).
+        timer_last_ns: [NsTs; 8],
+        /// XMM XH1: when the regime detector's timer last ran.
+        regime_timer_last_ns: NsTs,
+        /// RG2: the regime detector (boot-boxed; inert until
+        /// [`Self::configure_regime`] — every word UNKNOWN, every gate open
+        /// for the unconstrained members that exist today).
+        regime: Box<RegimeState>,
+        /// RG2: per-slot label sets, pulled from the members at configure
+        /// time (or overridden from `regime.toml [labels.*]`).
+        regime_labels: [RegimeLabelSet; 8],
+        /// RG2: per-slot current gate.
+        regime_gates: [RegimeGate; 8],
+        /// RG2: `SetRegime` commands applied.
+        regime_declared_total: u64,
+        /// RG2: gate edges fanned out (`on_regime` calls).
+        regime_gate_changes: u64,
+        /// HAR H3.3: the long-tenor HAR series (boot-boxed; inert until the
+        /// cli configures it from `har.toml` — one branch per tick and per
+        /// poll, so a boot without the file is the pre-H3 set, bit for bit).
+        /// Beside the regime detector, in the same seat and on the same 1 s
+        /// period (its own clock); no member reads it (plan law L4).
+        har: Box<LongVolSet>,
+        /// HAR H3.5: each series' `/state.har` row as of its newest day close
+        /// or the restore — rebuilt in `on_timer` only when that series'
+        /// epoch moved (the forecasts do not move between day closes), so
+        /// the 1 s publish copies rows instead of re-reading 9 tenors × 12
+        /// engines. Boot-boxed.
+        har_view: Box<[HarSeriesView; HAR_VIEW_SERIES]>,
+        /// The epoch each cached row was built at (`u64::MAX`: never).
+        har_view_epoch: [u64; HAR_VIEW_SERIES],
+        /// When the long-tenor set's timer last ran: its own clock on the
+        /// regime's 1 s period (XMM XH1's per-slot timers).
+        har_timer_last_ns: NsTs,
+        /// HAR H3.7: one mailbox per series to the cli's state-writer thread
+        /// (`har.toml` order). Empty = no writer: the cli writes the state on
+        /// the engine thread instead (the pre-H3.7 path). Boot-only.
+        har_out: Vec<MailboxTx<LongStateSnap>>,
+        /// HAR H3.7: the epoch each series' state was last handed to the writer.
+        har_offered: [u64; HAR_VIEW_SERIES],
+    }
 }
 
 /// RG2: the set's timer cadence once a detector is configured — the
@@ -430,15 +625,7 @@ impl StrategySet {
     /// at boot. Boot-only.
     pub fn new(initial_mask: u8) -> Self {
         let m = initial_mask & BUILT_MASK;
-        Self {
-            hyparb: HyparbStrategy::new(),
-            vrp: VrpStrategy::new(),
-            xsd: XsdStrategy::new(),
-            bin15: Bin15Strategy::new(),
-            ai_exec: AiExec::new(),
-            vm: VmStrategy::new(),
-            xmm: XmmStrategy::new(),
-            hcv: HcvStrategy::new(),
+        member_table!(@new {
             enabled: m,
             initial: m,
             halted: false,
@@ -458,7 +645,7 @@ impl StrategySet {
             har_timer_last_ns: 0,
             har_out: Vec::new(),
             har_offered: [0; HAR_VIEW_SERIES],
-        }
+        })
     }
 
     // ---- HAR H3.3: the long-tenor HAR series --------------------------
@@ -576,16 +763,9 @@ impl StrategySet {
     /// `regime.toml [labels.<member>]`. `false` when the slot is not a
     /// coded member or the member cannot be relabelled.
     pub fn set_regime_label(&mut self, slot: u8, set: RegimeLabelSet) -> bool {
-        let ok = match slot {
-            SLOT_HYPARB => self.hyparb.set_regime_label(set),
-            SLOT_VRP => self.vrp.set_regime_label(set),
-            SLOT_XSD => self.xsd.set_regime_label(set),
-            SLOT_BIN15 => self.bin15.set_regime_label(set),
-            SLOT_AI_EXEC => self.ai_exec.set_regime_label(set),
-            SLOT_XMM => self.xmm.set_regime_label(set),
-            SLOT_HCV => self.hcv.set_regime_label(set),
-            _ => false,
-        };
+        // vm (its rows gate themselves, RG3), hyparb and hcv keep the
+        // trait default: no stored label, refused.
+        let ok = member_table!(@relabel self, slot, set);
         if ok {
             self.regime_labels[slot as usize] = set;
         }
@@ -619,14 +799,8 @@ impl StrategySet {
     }
 
     fn pull_regime_labels(&mut self) {
-        self.regime_labels[SLOT_HYPARB as usize] = self.hyparb.regime_label();
-        self.regime_labels[SLOT_VRP as usize] = self.vrp.regime_label();
-        self.regime_labels[SLOT_XSD as usize] = self.xsd.regime_label();
-        self.regime_labels[SLOT_BIN15 as usize] = self.bin15.regime_label();
-        self.regime_labels[SLOT_AI_EXEC as usize] = self.ai_exec.regime_label();
-        self.regime_labels[SLOT_VM as usize] = RegimeLabelSet::ANY; // rows gate themselves (RG3)
-        self.regime_labels[SLOT_XMM as usize] = self.xmm.regime_label();
-        self.regime_labels[SLOT_HCV as usize] = self.hcv.regime_label();
+        // vm's is the trait default, ANY: its rows gate themselves (RG3).
+        member_table! { @labels self }
     }
 
     /// The gate verdict for `slot` on the current effective words.
@@ -688,33 +862,7 @@ impl StrategySet {
     }
 
     fn deliver_gate<C: Ctx>(&mut self, slot: u8, gate: RegimeGate, ctx: &mut C) {
-        match slot {
-            SLOT_HYPARB => self
-                .hyparb
-                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB)),
-            SLOT_VRP => self
-                .vrp
-                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_VRP)),
-            SLOT_XSD => self
-                .xsd
-                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_XSD)),
-            SLOT_BIN15 => self
-                .bin15
-                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_BIN15)),
-            SLOT_AI_EXEC => self
-                .ai_exec
-                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC)),
-            SLOT_VM => self
-                .vm
-                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_VM)),
-            SLOT_XMM => self
-                .xmm
-                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_XMM)),
-            SLOT_HCV => self
-                .hcv
-                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_HCV)),
-            _ => {}
-        }
+        member_table!(@route self, ctx, slot, on_regime(gate), {})
     }
 
     /// Current enable mask.
@@ -738,40 +886,19 @@ impl StrategySet {
 
     /// Configure the hyparb member (boot-only).
     #[inline]
-    pub fn hyparb_mut(&mut self) -> &mut HyparbStrategy {
+    pub fn hyparb_mut(&mut self) -> &mut strategy_hyparb::HyparbStrategy {
         &mut self.hyparb
     }
 
     /// X1: deliver an attributed fill to exactly one enabled slot.
     #[inline(always)]
     fn route_fill_to_slot<C: Ctx>(&mut self, slot: u8, fill: &Fill, ctx: &mut C) {
-        match slot {
-            SLOT_HYPARB => self
-                .hyparb
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB)),
-            SLOT_VRP => self
-                .vrp
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VRP)),
-            SLOT_XSD => self
-                .xsd
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_XSD)),
-            SLOT_BIN15 => self
-                .bin15
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_BIN15)),
-            SLOT_AI_EXEC => self
-                .ai_exec
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC)),
-            SLOT_VM => self.vm.on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VM)),
-            SLOT_XMM => self
-                .xmm
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_XMM)),
-            SLOT_HCV => self
-                .hcv
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_HCV)),
-            // No slot past 7 exists. A fill stamped with one is a bug
-            // upstream, not a member to deliver to.
-            _ => self.fills_unrouted = self.fills_unrouted.wrapping_add(1),
-        }
+        // No slot past 7 exists. A fill stamped with one is a bug
+        // upstream, not a member to deliver to.
+        member_table!(
+            @route self, ctx, slot, on_fill(fill),
+            self.fills_unrouted = self.fills_unrouted.wrapping_add(1)
+        )
     }
 
     /// X1: fills that reached the set stamped for a slot that is not
@@ -787,35 +914,12 @@ impl StrategySet {
     /// the [`Self::route_fill_to_slot`] law.
     #[inline(always)]
     fn route_order_event_to_slot<C: Ctx>(&mut self, slot: u8, event: &OrderEvent, ctx: &mut C) {
-        match slot {
-            SLOT_HYPARB => self
-                .hyparb
-                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB)),
-            SLOT_VRP => self
-                .vrp
-                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_VRP)),
-            SLOT_XSD => self
-                .xsd
-                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_XSD)),
-            SLOT_BIN15 => self
-                .bin15
-                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_BIN15)),
-            SLOT_AI_EXEC => self
-                .ai_exec
-                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC)),
-            SLOT_VM => self
-                .vm
-                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_VM)),
-            SLOT_XMM => self
-                .xmm
-                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_XMM)),
-            SLOT_HCV => self
-                .hcv
-                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_HCV)),
-            // No slot past 7 exists — the caller's mask check keeps it
-            // out, and this arm counts it if that ever changes.
-            _ => self.order_events_unrouted = self.order_events_unrouted.wrapping_add(1),
-        }
+        // No slot past 7 exists — the caller's mask check keeps it
+        // out, and this arm counts it if that ever changes.
+        member_table!(
+            @route self, ctx, slot, on_order_event(event),
+            self.order_events_unrouted = self.order_events_unrouted.wrapping_add(1)
+        )
     }
 
     /// XMM XH1: order events that reached the set for a slot that is not
@@ -842,44 +946,44 @@ impl StrategySet {
 
     /// Configure the VRP member (boot-only).
     #[inline]
-    pub fn vrp_mut(&mut self) -> &mut VrpStrategy {
+    pub fn vrp_mut(&mut self) -> &mut strategy_vrp::VrpStrategy {
         &mut self.vrp
     }
 
     /// The VRP member (cli: the boot tell's artifact hash).
     #[inline]
-    pub fn vrp(&self) -> &VrpStrategy {
+    pub fn vrp(&self) -> &strategy_vrp::VrpStrategy {
         &self.vrp
     }
 
     /// Configure the xsd member (boot-only).
     #[inline]
-    pub fn xsd_mut(&mut self) -> &mut XsdStrategy {
+    pub fn xsd_mut(&mut self) -> &mut strategy_xsd::XsdStrategy {
         &mut self.xsd
     }
 
     /// The xsd member (cli: boot tells).
     #[inline]
-    pub fn xsd(&self) -> &XsdStrategy {
+    pub fn xsd(&self) -> &strategy_xsd::XsdStrategy {
         &self.xsd
     }
 
     /// Configure the bin15 member (boot-only).
     #[inline]
-    pub fn bin15_mut(&mut self) -> &mut Bin15Strategy {
+    pub fn bin15_mut(&mut self) -> &mut strategy_bin15::Bin15Strategy {
         &mut self.bin15
     }
 
     /// Configure the ai-exec member (boot-only).
     #[inline]
-    pub fn ai_exec_mut(&mut self) -> &mut AiExec<SET_AI_EXEC_SLOTS> {
+    pub fn ai_exec_mut(&mut self) -> &mut strategy_ai_exec::AiExec<SET_AI_EXEC_SLOTS> {
         &mut self.ai_exec
     }
 
     /// Read the vm member (§9 gauges read rows_active/epoch/hash
     /// through this in item 8; tests observe counters).
     #[inline]
-    pub fn vm(&self) -> &VmStrategy {
+    pub fn vm(&self) -> &strategy_vm::VmStrategy {
         &self.vm
     }
 
@@ -888,27 +992,27 @@ impl StrategySet {
     /// copy-#2 seam; there is no boot config (§7.3: booting inert is
     /// normal).
     #[inline]
-    pub fn vm_mut(&mut self) -> &mut VmStrategy {
+    pub fn vm_mut(&mut self) -> &mut strategy_vm::VmStrategy {
         &mut self.vm
     }
 
     /// Configure the xmm member (boot-only: `configure` with the
     /// resolved artifact).
     #[inline]
-    pub fn xmm_mut(&mut self) -> &mut XmmStrategy {
+    pub fn xmm_mut(&mut self) -> &mut strategy_xmm::XmmStrategy {
         &mut self.xmm
     }
 
     /// Configure the hcv member (boot-only: `configure` with the resolved
     /// artifact, `install_events` with the calendar's mailbox).
     #[inline]
-    pub fn hcv_mut(&mut self) -> &mut HcvStrategy {
+    pub fn hcv_mut(&mut self) -> &mut strategy_hcv::HcvStrategy {
         &mut self.hcv
     }
 
     /// The hcv member (cli: boot tells).
     #[inline]
-    pub fn hcv(&self) -> &HcvStrategy {
+    pub fn hcv(&self) -> &strategy_hcv::HcvStrategy {
         &self.hcv
     }
 
@@ -919,21 +1023,11 @@ impl StrategySet {
             self.enable_refused = self.enable_refused.wrapping_add(1);
             return;
         }
-        let bit = match slot {
-            SLOT_HYPARB => BIT_HYPARB,
-            SLOT_VRP => BIT_VRP,
-            SLOT_XSD => BIT_XSD,
-            SLOT_BIN15 => BIT_BIN15,
-            SLOT_AI_EXEC => BIT_AI_EXEC,
-            SLOT_VM => BIT_VM,
-            SLOT_XMM => BIT_XMM,
-            SLOT_HCV => BIT_HCV,
-            // No slot past 7: no member behind it — refuse and count.
-            _ => {
-                self.enable_refused = self.enable_refused.wrapping_add(1);
-                return;
-            }
-        };
+        // No slot past 7: no member behind it — refuse and count.
+        let bit = member_table!(@bit_of slot, {
+            self.enable_refused = self.enable_refused.wrapping_add(1);
+            return;
+        });
         self.enabled |= bit;
     }
 
@@ -961,25 +1055,11 @@ impl StrategySet {
 impl StrategyCounters for StrategySet {
     #[inline]
     fn orders_emitted(&self) -> u64 {
-        self.hyparb.orders_emitted()
-            + self.vrp.orders_emitted()
-            + self.xsd.orders_emitted()
-            + self.bin15.orders_emitted()
-            + self.ai_exec.orders_emitted()
-            + self.vm.orders_emitted()
-            + self.xmm.orders_emitted()
-            + self.hcv.orders_emitted()
+        member_table!(@sum self, orders_emitted)
     }
     #[inline]
     fn orders_dropped(&self) -> u64 {
-        self.hyparb.orders_dropped()
-            + self.vrp.orders_dropped()
-            + self.xsd.orders_dropped()
-            + self.bin15.orders_dropped()
-            + self.ai_exec.orders_dropped()
-            + self.vm.orders_dropped()
-            + self.xmm.orders_dropped()
-            + self.hcv.orders_dropped()
+        member_table!(@sum self, orders_dropped)
     }
     #[inline]
     fn strategy_kind(&self) -> &'static str {
@@ -1234,17 +1314,8 @@ impl StrategyCounters for StrategySet {
     /// Per-slot orders + the slot's label shape (the gate itself rides
     /// `regime_counters().gates`).
     fn slot_counters(&self, slot: u8) -> SlotCounters {
-        let (emitted, dropped) = match slot {
-            SLOT_HYPARB => (self.hyparb.orders_emitted(), self.hyparb.orders_dropped()),
-            SLOT_VRP => (self.vrp.orders_emitted(), self.vrp.orders_dropped()),
-            SLOT_XSD => (self.xsd.orders_emitted(), self.xsd.orders_dropped()),
-            SLOT_BIN15 => (self.bin15.orders_emitted(), self.bin15.orders_dropped()),
-            SLOT_AI_EXEC => (self.ai_exec.orders_emitted(), self.ai_exec.orders_dropped()),
-            SLOT_VM => (self.vm.orders_emitted(), self.vm.orders_dropped()),
-            SLOT_XMM => (self.xmm.orders_emitted(), self.xmm.orders_dropped()),
-            SLOT_HCV => (self.hcv.orders_emitted(), self.hcv.orders_dropped()),
-            _ => return SlotCounters::default(),
-        };
+        let (emitted, dropped) =
+            member_table!(@slot_orders self, slot, return SlotCounters::default());
         let label = self.regime_labels[slot as usize];
         SlotCounters::new(emitted, dropped, label.n, label.off)
     }
@@ -1336,35 +1407,7 @@ impl Strategy for StrategySet {
     /// Every member callback in this impl goes through [`StampCtx`]
     /// (M4.1 M-c) so any submit carries its member's slot.
     fn on_start<C: Ctx>(&mut self, ctx: &mut C) -> Result<(), StrategyError> {
-        if self.initial & BIT_HYPARB != 0 {
-            self.hyparb
-                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_HYPARB))?;
-        }
-        if self.initial & BIT_VRP != 0 {
-            self.vrp.on_start(&mut StampCtx::new(&mut *ctx, SLOT_VRP))?;
-        }
-        if self.initial & BIT_XSD != 0 {
-            self.xsd.on_start(&mut StampCtx::new(&mut *ctx, SLOT_XSD))?;
-        }
-        if self.initial & BIT_BIN15 != 0 {
-            self.bin15
-                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_BIN15))?;
-        }
-        if self.initial & BIT_AI_EXEC != 0 {
-            self.ai_exec
-                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC))?;
-        }
-        if self.initial & BIT_VM != 0 {
-            self.vm.on_start(&mut StampCtx::new(&mut *ctx, SLOT_VM))?;
-        }
-        if self.initial & BIT_XMM != 0 {
-            self.xmm
-                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_XMM))?;
-        }
-        if self.initial & BIT_HCV != 0 {
-            self.hcv
-                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_HCV))?;
-        }
+        member_table! { @start self, ctx }
         Ok(())
     }
 
@@ -1375,74 +1418,12 @@ impl Strategy for StrategySet {
         self.regime.on_tick(tick);
         // HAR H3.3: so does the long-tenor set (one branch while inert).
         self.har.on_tick(tick);
-        if self.enabled & BIT_HYPARB != 0 {
-            self.hyparb
-                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
-        }
-        if self.enabled & BIT_VRP != 0 {
-            self.vrp
-                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
-        }
-        if self.enabled & BIT_XSD != 0 {
-            self.xsd
-                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
-        }
-        if self.enabled & BIT_BIN15 != 0 {
-            self.bin15
-                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
-        }
-        if self.enabled & BIT_AI_EXEC != 0 {
-            self.ai_exec
-                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
-        }
-        if self.enabled & BIT_VM != 0 {
-            self.vm
-                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_VM));
-        }
-        if self.enabled & BIT_XMM != 0 {
-            self.xmm
-                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
-        }
-        if self.enabled & BIT_HCV != 0 {
-            self.hcv
-                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
-        }
+        member_table! { @gated self, ctx, on_tick(tick) }
     }
 
     #[inline(always)]
     fn on_signal<C: Ctx>(&mut self, signal: &Signal, ctx: &mut C) {
-        if self.enabled & BIT_HYPARB != 0 {
-            self.hyparb
-                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
-        }
-        if self.enabled & BIT_VRP != 0 {
-            self.vrp
-                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
-        }
-        if self.enabled & BIT_XSD != 0 {
-            self.xsd
-                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
-        }
-        if self.enabled & BIT_BIN15 != 0 {
-            self.bin15
-                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
-        }
-        if self.enabled & BIT_AI_EXEC != 0 {
-            self.ai_exec
-                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
-        }
-        if self.enabled & BIT_VM != 0 {
-            self.vm
-                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_VM));
-        }
-        if self.enabled & BIT_XMM != 0 {
-            self.xmm
-                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
-        }
-        if self.enabled & BIT_HCV != 0 {
-            self.hcv
-                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
-        }
+        member_table! { @gated self, ctx, on_signal(signal) }
     }
 
     /// WS10-A: venue events fan out to enabled members exactly like
@@ -1460,114 +1441,21 @@ impl Strategy for StrategySet {
         {
             self.regime.on_funding(event.v0, event.venue_time_ms);
         }
-        if self.enabled & BIT_HYPARB != 0 {
-            self.hyparb
-                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
-        }
-        if self.enabled & BIT_VRP != 0 {
-            self.vrp
-                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
-        }
-        if self.enabled & BIT_XSD != 0 {
-            self.xsd
-                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
-        }
-        if self.enabled & BIT_BIN15 != 0 {
-            self.bin15
-                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
-        }
-        if self.enabled & BIT_AI_EXEC != 0 {
-            self.ai_exec
-                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
-        }
-        if self.enabled & BIT_VM != 0 {
-            self.vm
-                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_VM));
-        }
-        if self.enabled & BIT_XMM != 0 {
-            self.xmm
-                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
-        }
-        if self.enabled & BIT_HCV != 0 {
-            self.hcv
-                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
-        }
+        member_table! { @gated self, ctx, on_venue_event(event) }
     }
 
     /// WS10-B: depth snapshots fan out to enabled members exactly
     /// like ticks/events — same mask gate, same slot stamping.
     #[inline(always)]
     fn on_depth<C: Ctx>(&mut self, depth: &core_types::DepthTopK, ctx: &mut C) {
-        if self.enabled & BIT_HYPARB != 0 {
-            self.hyparb
-                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
-        }
-        if self.enabled & BIT_VRP != 0 {
-            self.vrp
-                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
-        }
-        if self.enabled & BIT_XSD != 0 {
-            self.xsd
-                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
-        }
-        if self.enabled & BIT_BIN15 != 0 {
-            self.bin15
-                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
-        }
-        if self.enabled & BIT_AI_EXEC != 0 {
-            self.ai_exec
-                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
-        }
-        if self.enabled & BIT_VM != 0 {
-            self.vm
-                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_VM));
-        }
-        if self.enabled & BIT_XMM != 0 {
-            self.xmm
-                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
-        }
-        if self.enabled & BIT_HCV != 0 {
-            self.hcv
-                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
-        }
+        member_table! { @gated self, ctx, on_depth(depth) }
     }
 
     /// VM2 V2: options records fan out to enabled members exactly
     /// like depth — same mask gate, same slot stamping.
     #[inline(always)]
     fn on_opt_summary<C: Ctx>(&mut self, opt: &core_types::OptSummary, ctx: &mut C) {
-        if self.enabled & BIT_HYPARB != 0 {
-            self.hyparb
-                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
-        }
-        if self.enabled & BIT_VRP != 0 {
-            self.vrp
-                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
-        }
-        if self.enabled & BIT_XSD != 0 {
-            self.xsd
-                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
-        }
-        if self.enabled & BIT_BIN15 != 0 {
-            self.bin15
-                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
-        }
-        if self.enabled & BIT_AI_EXEC != 0 {
-            self.ai_exec
-                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
-        }
-        if self.enabled & BIT_VM != 0 {
-            self.vm
-                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_VM));
-        }
-        if self.enabled & BIT_XMM != 0 {
-            self.xmm
-                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
-        }
-        if self.enabled & BIT_HCV != 0 {
-            self.hcv
-                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
-        }
+        member_table! { @gated self, ctx, on_opt_summary(opt) }
     }
 
     /// XMM XH1: trade prints fan out to enabled members exactly like
@@ -1575,38 +1463,7 @@ impl Strategy for StrategySet {
     /// xmm inherits the default no-op.
     #[inline(always)]
     fn on_trade<C: Ctx>(&mut self, trade: &TradePrint, ctx: &mut C) {
-        if self.enabled & BIT_HYPARB != 0 {
-            self.hyparb
-                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
-        }
-        if self.enabled & BIT_VRP != 0 {
-            self.vrp
-                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
-        }
-        if self.enabled & BIT_XSD != 0 {
-            self.xsd
-                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
-        }
-        if self.enabled & BIT_BIN15 != 0 {
-            self.bin15
-                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
-        }
-        if self.enabled & BIT_AI_EXEC != 0 {
-            self.ai_exec
-                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
-        }
-        if self.enabled & BIT_VM != 0 {
-            self.vm
-                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_VM));
-        }
-        if self.enabled & BIT_XMM != 0 {
-            self.xmm
-                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
-        }
-        if self.enabled & BIT_HCV != 0 {
-            self.hcv
-                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
-        }
+        member_table! { @gated self, ctx, on_trade(trade) }
     }
 
     /// XMM XH1: an order event goes to the slot that placed the order
@@ -1653,38 +1510,7 @@ impl Strategy for StrategySet {
             self.route_fill_to_slot(slot, fill, ctx);
             return;
         }
-        if self.enabled & BIT_HYPARB != 0 {
-            self.hyparb
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
-        }
-        if self.enabled & BIT_VRP != 0 {
-            self.vrp
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
-        }
-        if self.enabled & BIT_XSD != 0 {
-            self.xsd
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
-        }
-        if self.enabled & BIT_BIN15 != 0 {
-            self.bin15
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
-        }
-        if self.enabled & BIT_AI_EXEC != 0 {
-            self.ai_exec
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
-        }
-        if self.enabled & BIT_VM != 0 {
-            self.vm
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VM));
-        }
-        if self.enabled & BIT_XMM != 0 {
-            self.xmm
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
-        }
-        if self.enabled & BIT_HCV != 0 {
-            self.hcv
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
-        }
+        member_table! { @gated self, ctx, on_fill(fill) }
     }
 
     /// Set-level routing per §7 (module docs), then fan-out.
@@ -1735,41 +1561,13 @@ impl Strategy for StrategySet {
             // shape checks), and every remaining kind fans out.
             _ => {}
         }
-        if self.enabled & BIT_HYPARB != 0 {
-            self.hyparb
-                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
-        }
-        if self.enabled & BIT_VRP != 0 {
-            self.vrp.on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
-        }
-        if self.enabled & BIT_XSD != 0 {
-            self.xsd.on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
-        }
-        if self.enabled & BIT_BIN15 != 0 {
-            self.bin15
-                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
-        }
-        if self.enabled & BIT_AI_EXEC != 0 {
-            self.ai_exec
-                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
-        }
-        if self.enabled & BIT_VM != 0 {
-            self.vm.on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_VM));
-        }
-        if self.enabled & BIT_XMM != 0 {
-            self.xmm
-                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
-        }
-        if self.enabled & BIT_HCV != 0 {
-            self.hcv
-                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
-        }
+        member_table! { @gated self, ctx, on_ai(cmd) }
     }
 
     /// 8g §6 item 7: the engine's pre-AI-drain table pop lands here —
     /// the ring slot itself, lent in place — forwarded to the slot-5
-    /// vm member ([`VmStrategy::receive_table_v2`] — documented copy
-    /// #2, slot → its staged buffer).
+    /// vm member ([`strategy_vm::VmStrategy::receive_table_v2`] —
+    /// documented copy #2, slot → its staged buffer).
     /// Deliberately NOT mask-gated: staging is control plane and a
     /// staged table is inert until an in-stream `RulesetCommit`,
     /// which IS mask-gated through [`Strategy::on_ai`] — so an
@@ -1827,86 +1625,7 @@ impl Strategy for StrategySet {
             self.refresh_har_view();
             self.offer_har_state();
         }
-        if self.enabled & BIT_HYPARB != 0
-            && Self::timer_due(
-                &mut self.timer_last_ns[SLOT_HYPARB as usize],
-                self.hyparb.timer_period_ns(),
-                now_ns,
-            )
-        {
-            self.hyparb
-                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
-        }
-        if self.enabled & BIT_VRP != 0
-            && Self::timer_due(
-                &mut self.timer_last_ns[SLOT_VRP as usize],
-                self.vrp.timer_period_ns(),
-                now_ns,
-            )
-        {
-            self.vrp
-                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
-        }
-        if self.enabled & BIT_XSD != 0
-            && Self::timer_due(
-                &mut self.timer_last_ns[SLOT_XSD as usize],
-                self.xsd.timer_period_ns(),
-                now_ns,
-            )
-        {
-            self.xsd
-                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
-        }
-        if self.enabled & BIT_BIN15 != 0
-            && Self::timer_due(
-                &mut self.timer_last_ns[SLOT_BIN15 as usize],
-                self.bin15.timer_period_ns(),
-                now_ns,
-            )
-        {
-            self.bin15
-                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
-        }
-        if self.enabled & BIT_AI_EXEC != 0
-            && Self::timer_due(
-                &mut self.timer_last_ns[SLOT_AI_EXEC as usize],
-                self.ai_exec.timer_period_ns(),
-                now_ns,
-            )
-        {
-            self.ai_exec
-                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
-        }
-        if self.enabled & BIT_VM != 0
-            && Self::timer_due(
-                &mut self.timer_last_ns[SLOT_VM as usize],
-                self.vm.timer_period_ns(),
-                now_ns,
-            )
-        {
-            self.vm
-                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_VM));
-        }
-        if self.enabled & BIT_XMM != 0
-            && Self::timer_due(
-                &mut self.timer_last_ns[SLOT_XMM as usize],
-                self.xmm.timer_period_ns(),
-                now_ns,
-            )
-        {
-            self.xmm
-                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
-        }
-        if self.enabled & BIT_HCV != 0
-            && Self::timer_due(
-                &mut self.timer_last_ns[SLOT_HCV as usize],
-                self.hcv.timer_period_ns(),
-                now_ns,
-            )
-        {
-            self.hcv
-                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
-        }
+        member_table! { @timer self, ctx, now_ns }
     }
 
     /// Minimum over the BUILT members (mask-independent so the
@@ -1920,38 +1639,7 @@ impl Strategy for StrategySet {
         } else {
             u64::MAX
         };
-        let v = self.hyparb.timer_period_ns();
-        if v < min {
-            min = v;
-        }
-        let v = self.vrp.timer_period_ns();
-        if v < min {
-            min = v;
-        }
-        let v = self.xsd.timer_period_ns();
-        if v < min {
-            min = v;
-        }
-        let v = self.bin15.timer_period_ns();
-        if v < min {
-            min = v;
-        }
-        let v = self.ai_exec.timer_period_ns();
-        if v < min {
-            min = v;
-        }
-        let v = self.vm.timer_period_ns();
-        if v < min {
-            min = v;
-        }
-        let v = self.xmm.timer_period_ns();
-        if v < min {
-            min = v;
-        }
-        let v = self.hcv.timer_period_ns();
-        if v < min {
-            min = v;
-        }
+        member_table! { @min_period self, min }
         min
     }
 
@@ -1960,19 +1648,9 @@ impl Strategy for StrategySet {
         // the shutdown state write.
         self.har.drain_held();
         // Stop is unconditional — even disabled members get the
-        // teardown callback (they may hold capture-worthy state some
-        // day; today all six are no-ops).
-        self.hyparb
-            .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
-        self.vrp.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_VRP));
-        self.xsd.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_XSD));
-        self.bin15
-            .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_BIN15));
-        self.ai_exec
-            .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
-        self.vm.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_VM));
-        self.xmm.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_XMM));
-        self.hcv.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_HCV));
+        // teardown callback (each member's `on_stop` says what it
+        // tears down).
+        member_table! { @each self, ctx, on_stop }
     }
 }
 
@@ -2048,8 +1726,8 @@ fn har_row(set: &LongVolSet, i: usize) -> HarSeriesView {
 mod tests {
     use super::*;
     use core_types::{
-        make_symbol_id, Order, Price, Qty, SymbolId, VenueId, AI_SIDE_NONE, STRATEGY_SLOT_NONE,
-        SYMBOL_ID_NONE,
+        make_symbol_id, Order, Price, Qty, SymbolId, VenueId, AI_SIDE_NONE, STRATEGY_SLOT_AI_EXEC,
+        STRATEGY_SLOT_NONE, STRATEGY_SLOT_VM, SYMBOL_ID_NONE,
     };
     use strategy_core::SubmitErr;
 
@@ -3254,6 +2932,25 @@ mod tests {
                 REL_UNKNOWN
             ));
         }
+
+        /// S16-1: the member table hands `regime_label` /
+        /// `set_regime_label` to the vm member as to any member. vm keeps
+        /// the trait defaults, so slot 5 answers exactly what the
+        /// hand-written set answered (ANY; a relabel refused) and its rows
+        /// go on gating themselves (RG3).
+        #[test]
+        fn vm_keeps_the_trait_label_defaults() {
+            let mut vm = strategy_vm::VmStrategy::new();
+            assert_eq!(vm.regime_label(), RegimeLabelSet::ANY);
+            assert!(!vm.set_regime_label(bull_label(REGIME_OFF_SOFT)));
+            assert_eq!(vm.regime_label(), RegimeLabelSet::ANY, "nothing stored");
+            let mut s = StrategySet::new(BIT_VM);
+            assert!(!s.set_regime_label(SLOT_VM, bull_label(REGIME_OFF_SOFT)));
+            s.configure_regime(&params(), WallAnchor::new(T0, WALL0), T0)
+                .unwrap();
+            assert_eq!(s.regime_label_of(SLOT_VM), RegimeLabelSet::ANY, "pulled at configure");
+            assert!(s.regime_gate(SLOT_VM).open, "slot 5's own gate never closes");
+        }
     }
 
     /// BIN15 O5: `MASK_TABLE` is the only name list, so it must not
@@ -3295,6 +2992,44 @@ mod tests {
             assert_eq!(mask & !BUILT_MASK, 0, "{name} composes an unbuilt slot");
             i += 1;
         }
+    }
+
+    /// S16-1: the member table is the slot map. Its rows are the wire's
+    /// slot numbers in order, each member's `--strategy` name composes its
+    /// own bit alone, `BUILT_MASK` is the rows' OR, and the label keys are
+    /// the `regime.toml [labels.<member>]` sections the cli resolves
+    /// (`regime_boot::coded_member_slot`): vm and hcv carry none.
+    #[test]
+    fn the_member_table_is_the_slot_map() {
+        let slots: Vec<u8> = MEMBERS.iter().map(|m| m.slot).collect();
+        assert_eq!(slots, [0, 1, 2, 3, 4, 5, 6, 7], "wire-stable");
+        assert_eq!(
+            [SLOT_HYPARB, SLOT_VRP, SLOT_XSD, SLOT_BIN15, SLOT_AI_EXEC, SLOT_VM, SLOT_XMM, SLOT_HCV],
+            [0, 1, 2, 3, 4, 5, 6, 7]
+        );
+        let mut or = 0u8;
+        for m in MEMBERS {
+            assert_eq!(m.bit, 1 << m.slot, "{}", m.name);
+            assert_eq!(mask_for_name(m.name), Some(m.bit), "{}", m.name);
+            or |= m.bit;
+        }
+        assert_eq!(or, BUILT_MASK);
+        let names: Vec<&str> = MEMBERS.iter().map(|m| m.name).collect();
+        assert_eq!(names, ["hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "hcv"]);
+        let keys: Vec<Option<&str>> = MEMBERS.iter().map(|m| m.regime_key).collect();
+        assert_eq!(
+            keys,
+            [
+                Some("hyparb"),
+                Some("vrp"),
+                Some("xsd"),
+                Some("bin15"),
+                Some("ai_exec"),
+                None,
+                Some("xmm"),
+                None
+            ]
+        );
     }
 
     // ---- HC11 ---------------------------------------------------------
