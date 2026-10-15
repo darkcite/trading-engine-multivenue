@@ -679,8 +679,16 @@ pub(crate) fn spot_rows(b: &[u8]) -> Result<(i64, Vec<(String, i64)>), String> {
     Ok((usdc, legs))
 }
 
-/// A decimal string (`"60123.5"`) as ×1e8.
+/// A decimal string (`"60123.5"`, `"-0.0012"`) as ×1e8, truncated past
+/// eight places. Signed: a fill's `fee` is negative on a maker rebate
+/// (`crate::hl_outcome_probe`'s `userFills`); a mid is not, and [`mid_of`]
+/// refuses one that is not above zero.
+#[must_use]
 pub(crate) fn dec_1e8(s: &[u8]) -> Option<i64> {
+    let (neg, s) = match s.first() {
+        Some(b'-') => (true, &s[1..]),
+        _ => (false, s),
+    };
     let mut int: i64 = 0;
     let mut frac: i64 = 0;
     let mut scale: i64 = E8;
@@ -706,16 +714,20 @@ pub(crate) fn dec_1e8(s: &[u8]) -> Option<i64> {
     if !any {
         return None;
     }
-    int.checked_mul(E8)?.checked_add(frac)
+    let v = int.checked_mul(E8)?.checked_add(frac)?;
+    Some(if neg { -v } else { v })
 }
 
-/// `"<coin>":"<decimal>"` out of an `allMids` answer, ×1e8.
-fn mid_of(body: &[u8], coin: &str) -> Option<i64> {
+/// `"<coin>":"<decimal>"` out of an `allMids` answer, ×1e8. `None` when
+/// the coin is absent, its value not a decimal, or not above zero (`"0"`,
+/// `"-1"`): a mid is never signed or zero, and such a read fails closed.
+#[must_use]
+pub(crate) fn mid_of(body: &[u8], coin: &str) -> Option<i64> {
     let key = format!("\"{coin}\":\"");
     let k = key.as_bytes();
     let at = find(body, k)? + k.len();
     let end = body[at..].iter().position(|&c| c == b'"')? + at;
-    dec_1e8(&body[at..end])
+    dec_1e8(&body[at..end]).filter(|&m| m > 0)
 }
 
 /// Wall time, ms (the venue's clock: `expiresAfter`, the dead man's
@@ -2615,6 +2627,19 @@ mod tests {
         );
         assert_eq!(dec_1e8(b""), None);
         assert_eq!(dec_1e8(b"1.2.3"), None);
+        assert_eq!(dec_1e8(b"-0.0012"), Some(-120_000), "signed: a rebate");
+        assert_eq!(dec_1e8(b"-"), None);
+        assert_eq!(dec_1e8(b"--1"), None);
+    }
+
+    #[test]
+    fn a_mid_not_above_zero_reads_none() {
+        for m in ["-1", "0", "-0", "0.0", "-0.00000001"] {
+            let b = format!(r#"{{"BTC":"{m}","ETH":"3000"}}"#);
+            assert_eq!(mid_of(b.as_bytes(), "BTC"), None, "{m}");
+            assert_eq!(mid_of(b.as_bytes(), "ETH"), Some(300_000_000_000));
+        }
+        assert_eq!(mid_of(br#"{"BTC":"0.00000001"}"#, "BTC"), Some(1));
     }
 
     /// The spot sheet's legs (XMM XH4i-8, risk review): USDC free, a held

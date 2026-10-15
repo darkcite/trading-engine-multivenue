@@ -76,6 +76,7 @@ use ingress_hyperliquid::HlCoinTable;
 use rustls::ClientConfig;
 
 use crate::outcome_battery::book_of;
+use crate::xmm_battery::{dec_1e8, mid_of};
 
 const E8: i64 = 100_000_000;
 
@@ -368,52 +369,6 @@ pub fn probe_cloid(run_s: u32, seq: u32) -> [u8; 16] {
     c[4..8].copy_from_slice(&run_s.to_be_bytes());
     c[12..16].copy_from_slice(&seq.to_be_bytes());
     c
-}
-
-/// A decimal string (`"0.9712"`) as ×1e8.
-#[must_use]
-pub fn dec_1e8(s: &[u8]) -> Option<i64> {
-    let (neg, s) = match s.first() {
-        Some(b'-') => (true, &s[1..]),
-        _ => (false, s),
-    };
-    let mut int: i64 = 0;
-    let mut frac: i64 = 0;
-    let mut scale: i64 = E8;
-    let mut dot = false;
-    let mut any = false;
-    for &c in s {
-        match c {
-            b'0'..=b'9' if !dot => {
-                int = int.checked_mul(10)?.checked_add(i64::from(c - b'0'))?;
-                any = true;
-            }
-            b'0'..=b'9' => {
-                if scale > 1 {
-                    scale /= 10;
-                    frac += i64::from(c - b'0') * scale;
-                }
-                any = true;
-            }
-            b'.' if !dot => dot = true,
-            _ => return None,
-        }
-    }
-    if !any {
-        return None;
-    }
-    let v = int.checked_mul(E8)?.checked_add(frac)?;
-    Some(if neg { -v } else { v })
-}
-
-/// `"<coin>":"<decimal>"` out of an `allMids` answer, x1e8.
-#[must_use]
-pub fn mid_of(body: &[u8], coin: &str) -> Option<i64> {
-    let key = format!("\"{coin}\":\"");
-    let k = key.as_bytes();
-    let at = body.windows(k.len()).position(|w| w == k)? + k.len();
-    let end = body[at..].iter().position(|&c| c == b'"')? + at;
-    dec_1e8(&body[at..end])
 }
 
 /// ×1e8 as a plain decimal (`97120000` → `"0.9712"`).

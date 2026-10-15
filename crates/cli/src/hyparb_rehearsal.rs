@@ -35,9 +35,12 @@ use std::time::Duration;
 
 use clob_dispatcher::{DispatchError, OrderDispatch};
 use core_config::hyparb::HyparbFile;
-use core_types::{Fill, Order, Price, Qty, Side, SymbolId, Tick, VenueId};
+use core_types::{
+    DepthLevel, DepthTopK, Fill, Order, Price, Qty, Side, SymbolId, Tick, VenueId, DEPTH_K,
+};
 use exec_hyperevm::calldata::{DECIMALS_SELECTOR, TOKEN0_SELECTOR, TOKEN1_SELECTOR};
 use exec_hyperevm::MainnetAuthority;
+use ingress_hyperliquid::{parse_l2book_depth, HlL2BookFrame};
 use rustls::ClientConfig;
 
 use crate::evm_live::{LiveNet, Probe, Target};
@@ -60,75 +63,55 @@ const SWAP_USD_1E6: i64 = 5_000_000;
 /// Mainnet swap slack against the coin's mid, bps.
 const SWAP_SLACK_BPS: i64 = 100;
 
-/// A decimal string (`"45.123"`) as × 1e6, truncated past six places.
-fn dec_1e6(s: &[u8]) -> Option<i64> {
-    let (mut int, mut frac, mut scale, mut dot) = (0i64, 0i64, 1_000_000i64, false);
-    if s.is_empty() {
-        return None;
-    }
-    let mut i = 0usize;
-    while i < s.len() {
-        let c = s[i];
-        i += 1;
-        match c {
-            b'.' if !dot => dot = true,
-            b'0'..=b'9' if !dot => int = int.checked_mul(10)?.checked_add(i64::from(c - b'0'))?,
-            b'0'..=b'9' => {
-                if scale > 1 {
-                    scale /= 10;
-                    frac += i64::from(c - b'0') * scale;
-                }
-            }
-            _ => return None,
-        }
-    }
-    int.checked_mul(1_000_000)?.checked_add(frac)
+/// `coin`'s perp book: the top [`DEPTH_K`] levels of each side, best
+/// first, (px, sz) × 1e6 — and how many of each side's slots it fills.
+struct Book {
+    top: DepthTopK,
+    /// Bid, ask levels held: at most [`DEPTH_K`] each.
+    n: [usize; 2],
 }
 
-/// The string value after the first `"key":"` at or past `from`, and
-/// where it ends.
-fn str_after(b: &[u8], from: usize, key: &[u8]) -> Option<(usize, usize)> {
-    let mut pat = Vec::with_capacity(key.len() + 5);
-    pat.extend_from_slice(b"\"");
-    pat.extend_from_slice(key);
-    pat.extend_from_slice(b"\":\"");
-    let at = b
-        .get(from..)?
-        .windows(pat.len())
-        .position(|w| w == pat.as_slice())?
-        + from
-        + pat.len();
-    let end = b.get(at..)?.iter().position(|&c| c == b'"')? + at;
-    Some((at, end))
-}
-
-/// The levels of one side of an `l2Book` answer, (px, sz) × 1e6, best
-/// first.
-fn levels(seg: &[u8]) -> Result<Vec<(i64, i64)>, String> {
-    let mut out = Vec::new();
-    let mut at = 0usize;
-    while let Some((ps, pe)) = str_after(seg, at, b"px") {
-        let (ss, se) = str_after(seg, pe, b"sz").ok_or("l2Book: a level without sz")?;
-        match (dec_1e6(&seg[ps..pe]), dec_1e6(&seg[ss..se])) {
-            (Some(p), Some(z)) if p > 0 && z > 0 => out.push((p, z)),
-            _ => return Err("l2Book: unreadable level".to_owned()),
-        }
-        at = se;
+impl Book {
+    fn bids(&self) -> &[DepthLevel] {
+        self.top.bids.get(..self.n[0]).unwrap_or(&[])
     }
-    Ok(out)
+
+    fn asks(&self) -> &[DepthLevel] {
+        self.top.asks.get(..self.n[1]).unwrap_or(&[])
+    }
 }
 
-/// `coin`'s perp book: (bids, asks), best first.
-type Book = (Vec<(i64, i64)>, Vec<(i64, i64)>);
-
+/// A REST `l2Book` answer, read on the engine's own parser
+/// (`parse_l2book_depth`, the ingress's for every push). Fail closed:
+/// `null` (no such coin), an answer without its `levels` or its `time`,
+/// and a level at any depth that does not scan (`{"px":"…","sz":"…",…}`
+/// with decimal values, or `null`) are each an error, never a book. Only
+/// the top [`DEPTH_K`] (5) levels a side are value-checked: one of them
+/// not priced and sized above zero (`null` among them) is an error too.
+/// Past the fifth a level must only scan — `null`, a zero or a negative
+/// there passes. Prices and sizes read × 1e6, truncated past six places —
+/// exact on a perp, whose price and size decimals stop at six.
+///
+/// Depth: the engine lifts those five levels a side, not all of the
+/// venue's (up to 20). The touch is the first of them; [`through`] prices
+/// a hedge leg (≈ $11, [`HEDGE_USD_1E6`]) at the level holding twice its
+/// size, which the top five of a perp book hold — and where they do not,
+/// it prices at the fifth: a level the venue quotes, the IoC fills what it
+/// reaches, and the leg retries on a fresh book.
 fn book_of(b: &[u8]) -> Result<Book, String> {
-    let find = |from: usize, pat: &[u8]| -> Option<usize> {
-        Some(b.get(from..)?.windows(pat.len()).position(|w| w == pat)? + from)
-    };
-    let start = find(0, b"\"levels\":[[").ok_or("l2Book: no levels")? + 11;
-    let split = find(start, b"],[").ok_or("l2Book: no bid/ask split")?;
-    let end = find(split + 3, b"]]").ok_or("l2Book: unterminated levels")?;
-    Ok((levels(&b[start..split])?, levels(&b[split + 3..end])?))
+    let mut top = DepthTopK::EMPTY;
+    let mut h = HlL2BookFrame::ZERO;
+    if !parse_l2book_depth(b, 0, 0, &mut top, &mut h) {
+        return Err("l2Book: not a book".to_owned());
+    }
+    let n = [h.n_bids, h.n_asks].map(|k| usize::from(k).min(DEPTH_K));
+    let bk = Book { top, n };
+    let readable = |l: &DepthLevel| l.px_1e6 > 0 && l.qty_1e6 > 0;
+    if bk.bids().iter().chain(bk.asks()).all(readable) {
+        Ok(bk)
+    } else {
+        Err("l2Book: unreadable level".to_owned())
+    }
 }
 
 fn book(host: &str, coin: &str, tls: Arc<ClientConfig>) -> Result<Book, String> {
@@ -138,8 +121,10 @@ fn book(host: &str, coin: &str, tls: Arc<ClientConfig>) -> Result<Book, String> 
 
 /// The best bid and ask, (px, sz) × 1e6 each.
 fn touch_of(bk: &Book, coin: &str) -> Result<[(i64, i64); 2], String> {
-    match (bk.0.first(), bk.1.first()) {
-        (Some(&b), Some(&a)) if b.0 < a.0 => Ok([b, a]),
+    match (bk.bids().first(), bk.asks().first()) {
+        (Some(b), Some(a)) if b.px_1e6 < a.px_1e6 => {
+            Ok([(b.px_1e6, b.qty_1e6), (a.px_1e6, a.qty_1e6)])
+        }
         (None, _) => Err(format!("{coin}: the book has no bids")),
         (_, None) => Err(format!("{coin}: the book has no asks")),
         _ => Err(format!("{coin}: a crossed touch")),
@@ -151,19 +136,20 @@ fn touch(host: &str, coin: &str, tls: Arc<ClientConfig>) -> Result<[(i64, i64); 
 }
 
 /// A venue price that crosses `qty` with room to spare: the level where
-/// the side's depth first reaches twice `qty` (else its last level). A
-/// level's own price is valid on the venue by construction.
-fn through(side: &[(i64, i64)], qty: i64) -> Option<i64> {
+/// the side's depth first reaches twice `qty` (else its last level read —
+/// the fifth at most, [`book_of`]). A level's own price is valid on the
+/// venue by construction.
+fn through(side: &[DepthLevel], qty: i64) -> Option<i64> {
     let mut depth = 0i64;
     let mut i = 0usize;
     while i < side.len() {
-        depth = depth.saturating_add(side[i].1);
+        depth = depth.saturating_add(side[i].qty_1e6);
         if depth >= qty.saturating_mul(2) {
-            return Some(side[i].0);
+            return Some(side[i].px_1e6);
         }
         i += 1;
     }
-    side.last().map(|l| l.0)
+    side.last().map(|l| l.px_1e6)
 }
 
 /// `coin`'s perp size step, × 1e6, from the venue's `meta`.
@@ -621,7 +607,9 @@ fn steps<H: HedgeArm>(
     //    plus whatever X held before (the rehearsal ends flat). Priced
     //    THROUGH the book (a level with twice the size), not at the touch
     //    as the member does; an IoC miss on a moving book is retried
-    //    (three tries a leg, a fresh book each).
+    //    (three tries a leg, a fresh book each). A book read that fails
+    //    spends a try and is reported — it never ends the smoke with the
+    //    bought leg open before the close leg has had its tries.
     let bk = or_report!(book(host, coin, tls.clone()));
     let t = or_report!(touch_of(&bk, coin));
     arm.observe_tick(&tick_of(t, core_time::now_ns()), core_time::now_ns());
@@ -651,11 +639,17 @@ fn steps<H: HedgeArm>(
         let mut tries = 0u32;
         while tries < 3 && done < want {
             tries += 1;
-            let b = or_report!(book(host, coin, tls.clone()));
+            let b = match book(host, coin, tls.clone()) {
+                Ok(b) => b,
+                Err(e) => {
+                    out.push_str(&format!("4.{}.{tries} {coin}: no book: {e}\n", leg + 1));
+                    continue;
+                }
+            };
             let (s, p) = if leg == 0 {
-                (Side::Bid, through(&b.1, want - done))
+                (Side::Bid, through(b.asks(), want - done))
             } else {
-                (Side::Ask, through(&b.0, want - done))
+                (Side::Ask, through(b.bids(), want - done))
             };
             let Some(p) = p else {
                 out.push_str(&format!("4.{} {coin}: an empty side\n", leg + 1));
@@ -752,41 +746,132 @@ fn steps<H: HedgeArm>(
 mod tests {
     use super::*;
 
-    #[test]
-    fn decimals_read_as_fixed_point() {
-        assert_eq!(dec_1e6(b"45.123"), Some(45_123_000));
-        assert_eq!(dec_1e6(b"0.0000019"), Some(1));
-        assert_eq!(dec_1e6(b"12"), Some(12_000_000));
-        assert_eq!(dec_1e6(b""), None);
-        assert_eq!(dec_1e6(b"1.2.3"), None);
-        assert_eq!(dec_1e6(b"-1"), None);
+    /// A side as (px, sz) pairs, × 1e6.
+    fn pairs(side: &[DepthLevel]) -> Vec<(i64, i64)> {
+        side.iter().map(|l| (l.px_1e6, l.qty_1e6)).collect()
     }
 
     #[test]
     fn a_book_reads_its_levels_and_prices_through_them() {
-        let b = br#"{"coin":"ETH","levels":[[{"px":"44.9","sz":"3.5","n":2},{"px":"44.8","sz":"1","n":1}],[{"px":"45.1","sz":"1.25","n":1},{"px":"45.2","sz":"9","n":3}]]}"#;
+        let b = br#"{"coin":"ETH","time":1,"levels":[[{"px":"44.9","sz":"3.5","n":2},{"px":"44.8","sz":"1","n":1}],[{"px":"45.1","sz":"1.25","n":1},{"px":"45.2","sz":"9","n":3}]]}"#;
         let bk = book_of(b).unwrap();
-        assert_eq!(bk.0, [(44_900_000, 3_500_000), (44_800_000, 1_000_000)]);
-        assert_eq!(bk.1, [(45_100_000, 1_250_000), (45_200_000, 9_000_000)]);
-        assert_eq!(touch_of(&bk, "ETH").unwrap(), [bk.0[0], bk.1[0]]);
-        // 0.5 needs 1.0 of depth: the touch holds it; 1.0 needs 2.0.
-        assert_eq!(through(&bk.1, 500_000), Some(45_100_000));
-        assert_eq!(through(&bk.1, 1_000_000), Some(45_200_000));
         assert_eq!(
-            through(&bk.1, 50_000_000),
+            pairs(bk.bids()),
+            [(44_900_000, 3_500_000), (44_800_000, 1_000_000)]
+        );
+        assert_eq!(
+            pairs(bk.asks()),
+            [(45_100_000, 1_250_000), (45_200_000, 9_000_000)]
+        );
+        assert_eq!(
+            touch_of(&bk, "ETH").unwrap(),
+            [pairs(bk.bids())[0], pairs(bk.asks())[0]]
+        );
+        // 0.5 needs 1.0 of depth: the touch holds it; 1.0 needs 2.0.
+        assert_eq!(through(bk.asks(), 500_000), Some(45_100_000));
+        assert_eq!(through(bk.asks(), 1_000_000), Some(45_200_000));
+        assert_eq!(
+            through(bk.asks(), 50_000_000),
             Some(45_200_000),
             "the last level"
         );
         // An empty side is said, not misread from the other side.
-        let one = br#"{"coin":"HYPE","levels":[[{"px":"44.996","sz":"0.94","n":1}],[]]}"#;
+        let one = br#"{"coin":"HYPE","time":1,"levels":[[{"px":"44.996","sz":"0.94","n":1}],[]]}"#;
         let bk = book_of(one).unwrap();
-        assert_eq!((bk.0.len(), bk.1.len()), (1, 0));
+        assert_eq!((bk.bids().len(), bk.asks().len()), (1, 0));
         assert!(touch_of(&bk, "HYPE").unwrap_err().contains("no asks"));
-        assert!(through(&bk.1, 1).is_none());
-        let none = br#"{"coin":"X","levels":[[],[{"px":"1","sz":"1","n":1}]]}"#;
+        assert!(through(bk.asks(), 1).is_none());
+        let none = br#"{"coin":"X","time":1,"levels":[[],[{"px":"1","sz":"1","n":1}]]}"#;
         assert!(touch_of(&book_of(none).unwrap(), "X")
             .unwrap_err()
             .contains("no bids"));
         assert!(book_of(b"{}").is_err());
+    }
+
+    /// The reader pinned on a perp answer shaped as the venue's REST `info`
+    /// states one — `coin`, `time`, then `levels` best-first with `px`,
+    /// `sz`, `n` in that order — seven levels a side: it keeps the top five
+    /// ([`DEPTH_K`]), the touch is the first, and a size the five cannot
+    /// hold twice is priced at the fifth.
+    #[test]
+    fn a_real_shaped_answer_reads_its_top_five() {
+        let b = br#"{"coin":"ETH","time":1791451999803,"levels":[[{"px":"4101.2","sz":"12.5843","n":3},{"px":"4101.1","sz":"0.0049","n":1},{"px":"4101.0","sz":"7.31","n":2},{"px":"4100.9","sz":"1.2","n":1},{"px":"4100.8","sz":"25.0","n":4},{"px":"4100.7","sz":"3.0","n":1},{"px":"4100.6","sz":"99.0","n":7}],[{"px":"4101.3","sz":"0.5","n":1},{"px":"4101.4","sz":"2.4402","n":2},{"px":"4101.5","sz":"0.01","n":1},{"px":"4101.6","sz":"6.0","n":3},{"px":"4101.7","sz":"1.0","n":1},{"px":"4101.8","sz":"40.0","n":5},{"px":"4101.9","sz":"0.3","n":1}]]}"#;
+        let bk = book_of(b).unwrap();
+        assert_eq!(
+            pairs(bk.bids()),
+            [
+                (4_101_200_000, 12_584_300),
+                (4_101_100_000, 4_900),
+                (4_101_000_000, 7_310_000),
+                (4_100_900_000, 1_200_000),
+                (4_100_800_000, 25_000_000),
+            ]
+        );
+        assert_eq!(
+            pairs(bk.asks()),
+            [
+                (4_101_300_000, 500_000),
+                (4_101_400_000, 2_440_200),
+                (4_101_500_000, 10_000),
+                (4_101_600_000, 6_000_000),
+                (4_101_700_000, 1_000_000),
+            ]
+        );
+        assert_eq!(
+            touch_of(&bk, "ETH").unwrap(),
+            [(4_101_200_000, 12_584_300), (4_101_300_000, 500_000)]
+        );
+        // The asks' depth: 0.5, 2.9402, 2.9502, 8.9502, 9.9502 (five read).
+        assert_eq!(through(bk.asks(), 1_000_000), Some(4_101_400_000));
+        assert_eq!(through(bk.asks(), 4_000_000), Some(4_101_600_000));
+        assert_eq!(
+            through(bk.asks(), 5_000_000),
+            Some(4_101_700_000),
+            "past the five read: the fifth, not the sixth that holds it"
+        );
+        // The bids' depth reaches 20.0 at the fourth (21.0992).
+        assert_eq!(through(bk.bids(), 10_000_000), Some(4_100_900_000));
+    }
+
+    /// The reader's scale and its refusals: × 1e6, truncated past six
+    /// places; `null`, an answer without `levels` or `time`, and a level
+    /// that is not a positive decimal — at the touch, or misshapen at any
+    /// depth — are each an error, never a book.
+    #[test]
+    fn the_reader_reads_fixed_point_and_fails_closed() {
+        let with_bids = |bids: &str| {
+            format!(
+                r#"{{"coin":"X","time":1,"levels":[[{bids}],[{{"px":"46","sz":"12","n":1}}]]}}"#
+            )
+        };
+        let bk =
+            book_of(with_bids(r#"{"px":"45.123","sz":"0.0000019","n":1}"#).as_bytes()).unwrap();
+        assert_eq!(pairs(bk.bids()), [(45_123_000, 1)], "past six places: cut");
+        assert_eq!(pairs(bk.asks()), [(46_000_000, 12_000_000)]);
+        for bad in [
+            r#"{"px":"","sz":"1","n":1}"#,
+            r#"{"px":"1.2.3","sz":"1","n":1}"#,
+            r#"{"px":"1e-5","sz":"1","n":1}"#,
+            r#"{"px":"-1","sz":"1","n":1}"#,
+            r#"{"px":"1","sz":"-1","n":1}"#,
+            r#"{"px":"0","sz":"1","n":1}"#,
+            "null",
+            // The touch good, the second level not: every level read is
+            // value-checked, not the touch alone.
+            r#"{"px":"5","sz":"1","n":1},null"#,
+            r#"{"px":"5","sz":"1","n":1},{"px":"4","sz":"0","n":1}"#,
+            // Six good levels, a seventh misshapen: every level is walked.
+            r#"{"px":"5","sz":"1","n":1},{"px":"4","sz":"1","n":1},{"px":"3","sz":"1","n":1},{"px":"2","sz":"1","n":1},{"px":"1.5","sz":"1","n":1},{"px":"1","sz":"1","n":1},{"px":"0.5","sz":"x","n":1}"#,
+        ] {
+            assert!(book_of(with_bids(bad).as_bytes()).is_err(), "{bad}");
+        }
+        for bad in [
+            &b"null"[..],
+            &b"{}"[..],
+            &br#"{"coin":"X","levels":[[],[]]}"#[..],
+            &br#"{"coin":"X","time":1}"#[..],
+        ] {
+            assert!(book_of(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+        }
     }
 }
