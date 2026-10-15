@@ -1167,6 +1167,7 @@ dependencies = [
 name = "ingress-polymarket"
 version = "0.1.0"
 dependencies = [
+ "book-builder",
  "core-metrics",
  "core-net",
  "core-parse",

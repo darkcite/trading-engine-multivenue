@@ -42,7 +42,10 @@ pub enum ApplyOutcome {
     /// Applied; sequence advanced contiguously (or first update).
     Applied = 0,
     /// Applied, but `venue_seq` jumped by more than one — the venue
-    /// skipped sequence numbers upstream of us.
+    /// skipped sequence numbers upstream of us. (Polymarket's seq is the
+    /// ingress's dense per-asset ordinal since HK31: a gap there is a
+    /// tick this book never received — a ring drop, or a consumer that
+    /// skips some PM ticks.)
     AppliedGap = 1,
     /// Dropped: `venue_seq` is not newer than the last applied.
     /// Out-of-order delivery or duplicate.

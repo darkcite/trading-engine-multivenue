@@ -324,8 +324,9 @@ fn audit_ticks(venue: &str, r: &PmlrReader<Tick>, out: &mut VenueAudit) {
         s.note_ts(t.ts_ns);
         // Tick venue_seq is u32 and venue-specific; regression counting
         // is informational (BN bookTicker gaps are legitimate; Deribit
-        // quote seq is a ms timestamp). Same-value repeats are legal
-        // everywhere.
+        // quote seq is a ms timestamp; PM's is the ingress's per-asset
+        // arrival ordinal since HK31, 0 on an out-of-order frame).
+        // Same-value repeats are legal everywhere.
         if let Some(last) = s.last_seq {
             if (t.venue_seq as u64) < last {
                 s.seq_regressions += 1;

@@ -203,7 +203,9 @@ pub struct IngressStatus {
     /// streams where the §6.2 chain law does not apply (MEXC) — a
     /// value strictly below the last-seen one for the same symbol ×
     /// stream. Never folded into `gaps_total` (a skipped version is
-    /// normal there; only a step BACK is news).
+    /// normal there; only a step BACK is news). HK31: Polymarket counts
+    /// a frame whose stamp is older than its asset's newest (the
+    /// sequencer's 0, dropped by every book).
     seq_regressions_total: AtomicU64,
     /// Channel resubscribes triggered by integrity monitors.
     resubscribes_total: AtomicU64,

@@ -13,6 +13,29 @@
 //!
 //! Real network plumbing (mio event loop, TLS, handshake, ping/pong)
 //! lands in Phase 0 finish + Phase 1.
+//!
+//! ## `Tick.venue_seq` — the per-asset arrival ordinal (HK31, 2026-10-15)
+//!
+//! CLOB frames carry no sequence number, only the quoted-ms
+//! `timestamp`, and the venue sends several frames per asset inside one
+//! millisecond (8.0 % of the rows on the 2026-10-15 tap). The parsers
+//! leave `venue_seq` 0; the run loop's per-asset sequencer (`AssetSeq`)
+//! stamps it: a frame whose `timestamp` is not older than its asset's
+//! newest takes the next ordinal — 1, 2, 3, … in arrival order, which on
+//! the one TCP stream is the venue's order — and an OLDER one takes 0,
+//! which every `book_builder::TopOfBook` drops as `Stale` and the run loop
+//! counts on `seq_regressions_total`. The ordinal is dense and monotone for
+//! the life of the process (reconnects included — a reconnect zeroes only
+//! the per-asset clock); a `u32` per asset lasts ~76 days even at the
+//! measured one-asset peak of 655 ticks/s.
+//!
+//! Until HK31 it was the low 32 bits of the ms `timestamp`: every frame
+//! after the first in a millisecond was `Stale` (172 touch changes in the
+//! tap's hour lagged until the next millisecond; every post-trade `book`
+//! re-snapshot was dropped), and the low 32 bits wrap every ~49.7 days
+//! (next 2026-11-21 21:25:29Z), after which every tick would have been
+//! `Stale` until a restart. The full stamp rides `Tick.venue_time_ms`
+//! (VT2) under both laws.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -51,7 +74,7 @@ use core_types::{NsTs, Price, Qty, SymbolId, Tick};
 /// That array is the subscribe-time snapshot; the post-trade `book`
 /// re-snapshots sent while subscribed arrive as one plain,
 /// `", "`-separated object per asset (live 2026-10-15) — same event,
-/// same walk; [`parse_book_update`] says what they add (little).
+/// same walk; [`parse_book_update`] says what they add (the touch sizes).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FrameKind {
     /// `book` — full snapshot per asset (levels sorted worst→best).
@@ -97,22 +120,14 @@ pub fn classify(buf: &[u8]) -> FrameKind {
 // ---------------------------------------------------------------
 
 /// Extract the frame's `"timestamp"` (quoted ms) in full — the VT2
-/// venue time that rides `Tick.venue_time_ms`; its low 32 bits are the
-/// `Tick.venue_seq` (wraps ~49.7 days — the documented venue_seq
-/// policy on this venue since Phase 1, see [`venue_seq_of`]).
+/// venue time that rides `Tick.venue_time_ms`, and the clock the run
+/// loop's per-asset sequencer orders frames by (HK31, crate docs).
 #[inline]
 pub fn scan_venue_time_ms(buf: &[u8]) -> Option<u64> {
     let p = find_field(buf, b"\"timestamp\":")?;
     let p = skip_byte(buf, p, b'"');
     let (v, _end) = scan_u64(buf, p)?;
     Some(v)
-}
-
-/// The venue_seq law for this venue: the low 32 bits of the frame's
-/// millisecond `timestamp`.
-#[inline(always)]
-pub const fn venue_seq_of(venue_time_ms: u64) -> u32 {
-    (venue_time_ms & 0xFFFF_FFFF) as u32
 }
 
 /// Parse one `book` event into a `Tick`.
@@ -143,12 +158,17 @@ pub const fn venue_seq_of(venue_time_ms: u64) -> u32 {
 /// Both forms are the full snapshot and parse identically: the touch
 /// and the `timestamp` (`hash`, `tick_size`, `last_trade_price` are
 /// unused). The re-snapshot is post-trade: it carries the same
-/// `timestamp` — so the same `venue_seq` — and the same best bid/ask
-/// as the `price_change` sent for that asset just before it (122 of
-/// 122 on the 2026-10-15 tap, 0–69 ms behind it). A book ordered by
-/// `venue_seq` (`book_builder::TopOfBook::apply`) drops it as `Stale`.
-/// Parsing it buys a quiet parse-error counter and the touch sizes in
-/// the capture — not a fresher touch.
+/// `timestamp`, `hash` and best bid/ask as the `price_change` sent for
+/// that asset just before it (122 of 122 on the 2026-10-15 tap, 0–69 ms
+/// behind it; 288 of 288 over the closed hour). Since HK31 the run
+/// loop's arrival ordinal applies it — the ms-derived `venue_seq` made
+/// `book_builder::TopOfBook::apply` drop it as `Stale` — and it brings
+/// the book the touch SIZES a `price_change` row leaves 0: not a
+/// fresher touch price.
+///
+/// `venue_seq` and `flags` are left 0 for the run loop's sequencer and
+/// judge (HK31, VT2): it stamps `venue_seq` with the asset's arrival
+/// ordinal.
 ///
 /// Levels are objects sorted **worst→best**: top-of-book is the
 /// **last** element of each side. The caller slices one event out of
@@ -175,12 +195,13 @@ fn parse_book_update_fill(buf: &[u8], sym: SymbolId, ts_ns: NsTs, out: &mut Tick
         return None;
     }
     // VT2: the stamp rides the slot; the run loop judges staleness
-    // (the parser has no per-connection estimator) and sets `flags`.
+    // (the parser has no per-connection estimator) and sets `flags`,
+    // and its per-asset sequencer sets `venue_seq` (HK31).
     *out = Tick::new_stamped(
         ts_ns,
         core_types::VenueId::Polymarket,
         sym,
-        venue_seq_of(venue_time_ms),
+        0,
         Price::from_raw(bid_px),
         Qty::from_raw(bid_qty),
         Price::from_raw(ask_px),
@@ -246,8 +267,8 @@ fn scan_best_level(buf: &[u8], marker: &[u8]) -> Option<(i64, i64)> {
 ///
 /// `venue_time_ms` is the enclosing event's `timestamp` (rows carry
 /// none) — the caller extracts it once per frame via
-/// [`scan_venue_time_ms`]; `venue_seq` derives from it
-/// ([`venue_seq_of`]). `flags` are left 0 for the run loop's judge.
+/// [`scan_venue_time_ms`]. `venue_seq` and `flags` are left 0 for the
+/// run loop's sequencer and judge.
 ///
 /// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
 /// the call by value, past the 64 B bound. `out` is written once, only
@@ -307,7 +328,8 @@ fn parse_price_change_row_fill(
         ts_ns,
         core_types::VenueId::Polymarket,
         sym,
-        venue_seq_of(venue_time_ms),
+        // HK31: the run loop's sequencer sets `venue_seq`.
+        0,
         Price::from_raw(bid_px),
         Qty::from_raw(bid_qty),
         Price::from_raw(ask_px),
@@ -525,8 +547,8 @@ mod tests {
         assert_eq!(t.bid_qty.raw(), 100_000_000);
         assert_eq!(t.ask_px.raw(), 520_000);
         assert_eq!(t.ask_qty.raw(), 50_000_000);
-        // venue_seq = low 32 bits of "1713000000000".
-        assert_eq!(t.venue_seq, (1_713_000_000_000u64 & 0xFFFF_FFFF) as u32);
+        // HK31: the run loop's sequencer sets venue_seq, not the parser.
+        assert_eq!(t.venue_seq, 0);
         // VT2: the full stamp rides the slot; the parser never judges.
         assert_eq!(t.venue_time_ms, 1_713_000_000_000);
         assert_eq!(t.flags, 0);
@@ -561,7 +583,7 @@ mod tests {
         assert_eq!(t.ask_px.raw(), 190_000);
         assert_eq!(t.ask_qty.raw(), 1_861_190_000);
         assert_eq!(t.venue_time_ms, 1_792_068_514_889);
-        assert_eq!(t.venue_seq, venue_seq_of(1_792_068_514_889));
+        assert_eq!(t.venue_seq, 0);
         assert_eq!(t.flags, 0);
     }
 
@@ -612,12 +634,10 @@ mod tests {
     fn parse_price_change_row_uses_row_touch() {
         let venue_time_ms = scan_venue_time_ms(SAMPLE_PC).unwrap();
         assert_eq!(venue_time_ms, 1_713_000_000_123);
-        let seq = venue_seq_of(venue_time_ms);
-        assert_eq!(seq, (1_713_000_000_123u64 & 0xFFFF_FFFF) as u32);
         let t = parse_price_change_row_view(SAMPLE_PC, 3, 99, venue_time_ms).unwrap();
         assert_eq!(t.sym, 3);
         assert_eq!(t.ts_ns, 99);
-        assert_eq!(t.venue_seq, seq);
+        assert_eq!(t.venue_seq, 0, "the run loop's sequencer sets it");
         assert_eq!(t.venue_time_ms, venue_time_ms);
         assert_eq!(t.flags, 0);
         assert_eq!(t.bid_px.raw(), 518_000);
@@ -647,7 +667,6 @@ mod tests {
         assert_eq!(scan_venue_time_ms(b"{\"bids\":[]}"), None);
         assert_eq!(scan_venue_time_ms(br#"{"timestamp":"soon"}"#), None);
         assert_eq!(scan_venue_time_ms(br#"{"timestamp":"1713000000123"}"#), Some(1_713_000_000_123));
-        assert_eq!(venue_seq_of(0x1_0000_0007), 7);
     }
 }
 
@@ -658,9 +677,8 @@ mod tests {
 
 #[cfg(test)]
 mod proptests {
-    use super::*;
-    use proptest::prelude::*;
     use super::views::*;
+    use proptest::prelude::*;
 
     proptest! {
         #[test]
@@ -685,9 +703,10 @@ mod proptests {
             prop_assert_eq!(t.bid_qty.raw(), bq as i64);
             prop_assert_eq!(t.ask_px.raw(), ap as i64);
             prop_assert_eq!(t.ask_qty.raw(), aq as i64);
-            // VT2: the stamp rides in full, venue_seq is its low 32 bits
+            // VT2: the stamp rides in full; HK31: venue_seq is the run
+            // loop's, 0 out of the parser
             prop_assert_eq!(t.venue_time_ms, ts);
-            prop_assert_eq!(t.venue_seq, venue_seq_of(ts));
+            prop_assert_eq!(t.venue_seq, 0);
             prop_assert_eq!(t.flags, 0);
         }
     }

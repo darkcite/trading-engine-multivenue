@@ -44,7 +44,7 @@ files predate it (see `docs/migration.md`).
 | -----: | ----: | ------------- | ---------------- | -------------------------------------- |
 |      0 |     8 | ts_ns         | `u64` NsTs       | monotonic ns from `core-time::now_ns` — the ordering key everywhere; venue time never re-times a record |
 |      8 |     4 | sym           | `u32` SymbolId   | venue-namespaced; `SYMBOL_ID_NONE = u32::MAX` invalid |
-|     12 |     4 | venue_seq     | `u32`            | venue-provided sequence, monotonic     |
+|     12 |     4 | venue_seq     | `u32`            | venue-provided sequence, monotonic (`pm`: the ingress's per-asset arrival ordinal since HK31 — "Capture files") |
 |     16 |     8 | bid_px        | `i64` Price      | fixed-point ×1e6                       |
 |     24 |     8 | bid_qty       | `i64` Qty        | fixed-point ×1e6                       |
 |     32 |     8 | ask_px        | `i64` Price      | fixed-point ×1e6                       |
@@ -548,6 +548,25 @@ spot + usdm; Bybit trades carry `venue_seq` 0 — UUID trade ids, no
 venue sequence, so the §6.2 chain law does not apply to this venue).
 Bybit `Ticker` event rows carry `v0` = 0, `v1` = open interest ×1e6
 (venue base/contract units) — unlike Deribit's mark+OI pairing.
+
+HK31, appended 2026-10-15 — **`pm` `Tick.venue_seq` is the ingress's
+per-asset arrival ordinal; no layout change**
+(`crates/ingress-polymarket/src/lib.rs`, crate docs). CLOB frames carry
+no sequence number, only the quoted-ms `timestamp` (in full in
+`venue_time_ms` since VT2), and the venue sends several frames per
+asset inside one millisecond. The run loop numbers each asset's ticks
+1, 2, 3, … in arrival order (one connection: the venue's order) while
+their `timestamp` does not go back; a tick whose `timestamp` is OLDER
+than its asset's newest carries 0 (every `TopOfBook` drops it; each is
+counted on `engine_ingress_polymarket_seq_regressions_total`). The
+ordinal is dense per asset and per process — it restarts at 1 with each
+process (each `run-*`) and survives reconnects (a reconnect zeroes only
+the per-asset stamp the comparison uses). Captures from before HK31
+hold the low 32 bits of `timestamp` there (equal within a millisecond,
+wrapping every ~49.7 days). No reader keys on either today, but anyone
+replaying several `run-*` cuts through a `TopOfBook` must reset the
+books per run: a later run's ordinals start below the earlier run's,
+and below any pre-HK31 value.
 
 MX2, appended 2026-09-23 — `mexc` (VenueId 7; spot + futures share
 one label; data-only, ruling O-MX1). The per-venue law

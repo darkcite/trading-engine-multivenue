@@ -363,7 +363,9 @@ pub struct Tick {
     pub ts_ns: NsTs,
     /// Resolved symbol ID (not a string).
     pub sym: SymbolId,
-    /// Sequence number emitted by the venue.
+    /// Sequence number emitted by the venue. Polymarket (`pm`) emits none:
+    /// there it is the ingress's per-asset arrival ordinal (HK31 — 1, 2,
+    /// 3, … per process; 0 = a frame older than its asset's newest).
     pub venue_seq: u32,
     /// Best bid price (fixed-point).
     pub bid_px: Price,
