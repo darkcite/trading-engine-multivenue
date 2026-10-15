@@ -69,8 +69,10 @@ members = [
     "crates/strategy-xsd",
 
     # --- pine execution (PVM lane) ---
+    "crates/pine-broker",
     "crates/pine-ir",
     "crates/pine-lang",
+    "crates/pine-sema",
     "crates/pine-spec",
     "crates/pine-std",
     "crates/pine-vm",
@@ -240,8 +242,10 @@ strategy-vrp          = { path = "crates/strategy-vrp" }
 strategy-xsd          = { path = "crates/strategy-xsd" }
 
 # --- pine execution (PVM lane) ---
+pine-broker = { path = "crates/pine-broker" }
 pine-ir = { path = "crates/pine-ir" }
 pine-lang = { path = "crates/pine-lang" }
+pine-sema = { path = "crates/pine-sema" }
 pine-spec = { path = "crates/pine-spec" }
 pine-std = { path = "crates/pine-std" }
 pine-vm = { path = "crates/pine-vm" }

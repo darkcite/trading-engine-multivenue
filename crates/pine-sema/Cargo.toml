@@ -1,0 +1,19 @@
+[package]
+name = "pine-sema"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+description = "PVM compiler middle and back end: resolve, infer, monomorphise, lay out, emit. The one edge from pine_lang::Ast to pine_ir::PineProgram. Load time only."
+
+[dependencies]            # contract §2, exactly (row 17: no pine-vm edge, no cycle)
+pine-ir   = { workspace = true }
+pine-lang = { workspace = true }
+pine-spec = { workspace = true }
+pine-std  = { workspace = true }   # load-time services only (contract §3.8.4)
+
+[dev-dependencies]
+proptest = { workspace = true }
+pine-vm  = { workspace = true, features = ["testkit"] }   # verify, VmInstance, Tb — tests only
