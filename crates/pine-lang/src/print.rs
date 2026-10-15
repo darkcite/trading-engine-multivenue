@@ -371,6 +371,51 @@ impl Printer<'_> {
         self.expr(id, level, out)
     }
 
+    /// A chain of prefix operators under ONE pair of parentheses — `(- -x)` prints as `(--x)`, not
+    /// `(-((-(x))))`: every printed parenthesis is a level of the reparse's recursion, so a
+    /// parenthesis per operator would make the canonical form deeper than its source (a chain the
+    /// source parsed within `MAX_DEPTH` would reparse as 2026, breaking I9).
+    fn unary_chain<W: Write>(&self, id: NodeId, level: u32, out: &mut W) -> Result {
+        let mut cur = id;
+        while let Node::Unary { op, operand } = self.ast.node(cur) {
+            out.write_str(op.text())?;
+            if matches!(op, crate::ast::UnOp::Not) {
+                out.write_char(' ')?;
+            }
+            cur = operand;
+        }
+        self.expr(cur, level, out)
+    }
+
+    /// `cond ? then : otherwise` without its own parentheses; a conditional in the `then` branch,
+    /// and (right-associative, pin:01-ternary-assoc) in the `otherwise` branch, is printed flat
+    /// for the same depth reason as `unary_chain`: both readings are unambiguous.
+    fn ternary_body<W: Write>(&self, id: NodeId, level: u32, out: &mut W) -> Result {
+        let Node::Ternary {
+            cond,
+            then,
+            otherwise,
+        } = self.ast.node(id)
+        else {
+            return Err(core::fmt::Error);
+        };
+        self.expr(cond, level, out)?;
+        out.write_str(" ? ")?;
+        if self.ast.kind(then) == NodeKind::Ternary {
+            self.ternary_body(then, level, out)?;
+        } else {
+            self.expr(then, level, out)?;
+        }
+        out.write_str(" : ")?;
+        if crate::policy::POLICY.ternary_right_assoc
+            && self.ast.kind(otherwise) == NodeKind::Ternary
+        {
+            self.ternary_body(otherwise, level, out)
+        } else {
+            self.expr(otherwise, level, out)
+        }
+    }
+
     /// An expression (or a structure on the right of `=`/`:=`, whose blocks sit at `level + 1`).
     fn expr<W: Write>(&self, id: NodeId, level: u32, out: &mut W) -> Result {
         match self.ast.node(id) {
@@ -433,18 +478,9 @@ impl Printer<'_> {
                 self.expr(offset, level, out)?;
                 out.write_char(']')
             }
-            Node::Unary { op, operand } => {
+            Node::Unary { .. } => {
                 out.write_char('(')?;
-                out.write_str(op.text())?;
-                out.write_char(if matches!(op, crate::ast::UnOp::Not) {
-                    ' '
-                } else {
-                    '('
-                })?;
-                self.expr(operand, level, out)?;
-                if !matches!(op, crate::ast::UnOp::Not) {
-                    out.write_char(')')?;
-                }
+                self.unary_chain(id, level, out)?;
                 out.write_char(')')
             }
             Node::Binary { op, lhs, rhs } => {
@@ -456,17 +492,9 @@ impl Printer<'_> {
                 self.expr(rhs, level, out)?;
                 out.write_char(')')
             }
-            Node::Ternary {
-                cond,
-                then,
-                otherwise,
-            } => {
+            Node::Ternary { .. } => {
                 out.write_char('(')?;
-                self.expr(cond, level, out)?;
-                out.write_str(" ? ")?;
-                self.expr(then, level, out)?;
-                out.write_str(" : ")?;
-                self.expr(otherwise, level, out)?;
+                self.ternary_body(id, level, out)?;
                 out.write_char(')')
             }
             Node::Tuple { items } => self.list('[', items, ']', level, out),

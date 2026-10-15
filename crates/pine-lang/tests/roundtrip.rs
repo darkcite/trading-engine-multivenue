@@ -65,9 +65,9 @@ fn printing_is_idempotent() {
 fn canonical_forms() {
     let cases = [
         ("a + b * c", "(a + (b * c))"),
-        ("-a[1]", "(-(a[1]))"),
+        ("-a[1]", "(-a[1])"),
         ("not a == b", "((not a) == b)"),
-        ("a ? b : c ? d : e", "(a ? b : (c ? d : e))"),
+        ("a ? b : c ? d : e", "(a ? b : c ? d : e)"),
         ("(1).abs()", "(1).abs()"),
         ("x = 1.", "x = 1.0"),
         ("c = #ff0000a0", "c = #FF0000A0"),
@@ -175,7 +175,15 @@ impl Gen {
             };
         }
         let d = d - 1;
-        match self.rng.below(8) {
+        match self.rng.below(9) {
+            // Operator runs (the pine_lex_parse fuzz finding): up to 150 prefix operators.
+            7 => {
+                let run = self
+                    .rng
+                    .pick(&["-", "+", "not ", "- "])
+                    .repeat(1 + self.rng.below(150) as usize);
+                format!("({} - {run}{})", self.expr(d), self.rng.pick(&NAMES))
+            }
             0 => format!(
                 "({} {} {})",
                 self.expr(d),
@@ -372,4 +380,87 @@ fn prop_parse_print_parse_identical() {
         missing.is_empty(),
         "the generator never produced {missing:?}"
     );
+}
+
+/// Parse → print → parse → `structurally_eq`, for a source the parser accepts.
+fn assert_round_trips(src: &str) {
+    let mut s1 = SymTable::new();
+    let Ok(a) = parse(src, FileId::ROOT, &mut s1) else {
+        return;
+    };
+    let mut text = String::new();
+    print(&a, &s1, &mut text).expect("print");
+    let mut s2 = SymTable::new();
+    let b = parse(&text, FileId::ROOT, &mut s2).unwrap_or_else(|d| {
+        let codes: Vec<u16> = d.iter().map(|x| x.code.0).collect();
+        panic!("accepted source's canonical print refused {codes:?}:\n{text}")
+    });
+    assert!(structurally_eq(&a, &s1, &b, &s2), "{text}");
+}
+
+/// The pine_lex_parse fuzz finding: operands joined by long runs of `-` (binary minus followed
+/// by a chain of unary minuses) — the printer gave every unary its own parentheses, so the
+/// canonical form needed ~3 recursion levels per operator and reparsed as 2026.
+#[test]
+fn minus_runs_round_trip() {
+    let runs: [&[usize]; 5] = [
+        &[1, 150, 30, 20, 18],
+        &[100],
+        &[220],
+        &[1, 1, 1, 1, 1],
+        &[60, 60, 60],
+    ];
+    let ops = ["e", "P", "P", "e", "P", "P"];
+    for v in [5, 6] {
+        for r in runs {
+            let mut body = String::from(ops[0]);
+            for (k, n) in r.iter().enumerate() {
+                body.push_str(&"-".repeat(*n));
+                body.push_str(ops[(k + 1) % ops.len()]);
+            }
+            let src = format!("//@version={v}\n{body}");
+            let mut syms = SymTable::new();
+            assert!(parse(&src, FileId::ROOT, &mut syms).is_ok(), "{src}");
+            assert_round_trips(&src);
+        }
+    }
+    for unit in ["+", "not ", "- ", "-+"] {
+        assert_round_trips(&format!("//@version=6\nx = a - {}b\n", unit.repeat(120)));
+    }
+}
+
+/// Every accepted program round-trips right up to the depth limit, for each chain shape.
+#[test]
+fn deep_accepted_programs_round_trip() {
+    let run = || {
+        let mut n = 100usize;
+        while n <= 520 {
+            assert_round_trips(&format!("//@version=6\nx = {}a\n", "-".repeat(n)));
+            assert_round_trips(&format!("//@version=6\nx = {}a\n", "not ".repeat(n)));
+            assert_round_trips(&format!("//@version=6\nx = {}c\n", "a ? b : ".repeat(n)));
+            assert_round_trips(&format!(
+                "//@version=6\nx = {}b{}\n",
+                "a ? ".repeat(n),
+                " : c".repeat(n)
+            ));
+            assert_round_trips(&format!("//@version=6\nx = {}a\n", "a - ".repeat(n)));
+            assert_round_trips(&format!("//@version=6\nx = {}a\n", "a - -".repeat(n)));
+            assert_round_trips(&format!(
+                "//@version=6\nx = {}a{}\n",
+                "(".repeat(n),
+                ")".repeat(n)
+            ));
+            assert_round_trips(&format!(
+                "//@version=6\nx = {}a{}\n",
+                "a - (".repeat(n),
+                ")".repeat(n)
+            ));
+            n += 7;
+        }
+    };
+    let h = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(run)
+        .expect("spawn");
+    h.join().expect("no overflow, no panic");
 }

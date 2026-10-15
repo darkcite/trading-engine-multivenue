@@ -337,10 +337,10 @@ fn several_expression_statements_and_doc_runs() {
 fn fully_parenthesised_prints() {
     let cases = [
         ("not a == b", "((not a) == b)"),
-        ("-a[1]", "(-(a[1]))"),
+        ("-a[1]", "(-a[1])"),
         ("a.b[1]", "a.b[1]"),
         ("(a[1]).b", "a[1].b"),
-        ("a ? b : c ? d : e", "(a ? b : (c ? d : e))"),
+        ("a ? b : c ? d : e", "(a ? b : c ? d : e)"),
         ("a and b or c", "((a and b) or c)"),
         ("a - b - c", "((a - b) - c)"),
         ("a < b < c", "((a < b) < c)"),
