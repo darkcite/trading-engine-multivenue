@@ -19,7 +19,9 @@ Convention: full ``import x`` only. No ``from x import y``.
 import hashlib
 import hmac
 import json
+import os
 import pathlib
+import signal
 import typing
 import urllib.parse
 
@@ -527,3 +529,144 @@ def test_systemexit_mid_part_aborts_the_multipart_upload(tmp_path: pathlib.Path)
     assert fake_s3.uploads == {}
     assert any(m == "DELETE" and "uploadId" in q for m, _p, q in fake_s3.requests)
     assert "v1/runs/mbp-m4/run-1/obj.bin" not in fake_s3.objects
+
+
+# -- HK21: incomplete uploads, and the initiate's SIGTERM window -------------
+
+
+def test_list_multipart_names_every_incomplete_upload() -> None:
+    fake_s3 = tests.fake_s3.FakeS3()
+    store = make_store(fake_s3)
+    fake_s3.initiated_at = "2026-09-05T10:15:05.328Z"
+    fake_s3.handle(httpx.Request("POST", f"https://{fake_s3.bucket}.h/v1/a.bin?uploads="))
+    fake_s3.handle(httpx.Request("POST", f"https://{fake_s3.bucket}.h/v2/b.bin?uploads="))
+    found = list(store.list_multipart())
+    assert [(u.key, u.initiated) for u in found] == [
+        ("v1/a.bin", "2026-09-05T10:15:05.328Z"),
+        ("v2/b.bin", "2026-09-05T10:15:05.328Z"),
+    ]
+    assert [u.key for u in store.list_multipart("v2/")] == ["v2/b.bin"]
+
+
+def test_list_multipart_follows_both_markers_across_pages() -> None:
+    """Two uploads of one key split across pages: the upload-id marker, not
+    the key marker alone, is what finds the second."""
+    fake_s3 = tests.fake_s3.FakeS3()
+    fake_s3.uploads_page = 1
+    store = make_store(fake_s3)
+    for key in ("v1/a.bin", "v1/a.bin", "v2/b.bin"):
+        fake_s3.handle(httpx.Request("POST", f"https://{fake_s3.bucket}.h/{key}?uploads="))
+    found = list(store.list_multipart())
+    assert [u.key for u in found] == ["v1/a.bin", "v1/a.bin", "v2/b.bin"]
+    assert len({u.upload_id for u in found}) == 3
+    assert fake_s3.count("GET") == 3
+
+
+@pytest.fixture
+def sigterm_exits() -> typing.Iterator[None]:
+    """SIGTERM raises SystemExit(143), as `archive-run.py`'s handler does.
+    Afterwards the mask AND the handler are restored — SIGTERM ignored while
+    the mask is, so a regression that left it blocked and pending can neither
+    leak into later tests nor kill the runner."""
+
+    def terminate(_signum: int, _frame: object) -> None:
+        raise SystemExit(143)
+
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+    before = signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        signal.signal(signal.SIGTERM, before)
+
+
+def _sigterm_blocked() -> bool:
+    return signal.SIGTERM in signal.pthread_sigmask(signal.SIG_BLOCK, ())
+
+
+@pytest.mark.usefixtures("sigterm_exits")
+def test_sigterm_during_the_initiate_is_held_until_the_abort_can_reach_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Delivered during the initiate, SIGTERM used to unwind before the upload
+    id was known: an orphan. Held, it lands inside the abort's try."""
+    fake_s3 = tests.fake_s3.FakeS3()
+    fake_s3.on_initiate = lambda: os.kill(os.getpid(), signal.SIGTERM)
+    store = make_store(fake_s3)
+    part = 5 * 1024 * 1024
+    src = tmp_path / "obj.bin"
+    src.write_bytes(b"f" * (part * 2 + 16))
+    with pytest.raises(SystemExit):
+        store.multipart_put("v1/runs/mbp-m4/run-1/obj.bin", src, part_size=part)
+    assert fake_s3.uploads == {}, "the held SIGTERM must reach the abort"
+    assert any(m == "DELETE" and "uploadId" in q for m, _p, q in fake_s3.requests)
+    assert not _sigterm_blocked()
+
+
+@pytest.mark.usefixtures("sigterm_exits")
+def test_a_failed_initiate_attempt_releases_sigterm_before_its_backoff(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The hold is one attempt, not the retry loop (a stalled loop held a stop
+    for up to 6 x 900 s): a SIGTERM during an attempt that failed is delivered
+    before the backoff, and no second initiate is sent."""
+    fake_s3 = tests.fake_s3.FakeS3()
+    fake_s3.fail_initiates = 1
+    fake_s3.on_initiate = lambda: os.kill(os.getpid(), signal.SIGTERM)
+    slept: list[float] = []
+    store = make_store(fake_s3, sleep=slept.append)
+    part = 5 * 1024 * 1024
+    src = tmp_path / "obj.bin"
+    src.write_bytes(b"f" * (part + 16))
+    with pytest.raises(SystemExit):
+        store.multipart_put("v1/runs/mbp-m4/run-1/obj.bin", src, part_size=part)
+    assert slept == [], "released before the backoff"
+    assert fake_s3.count("POST") == 1
+    assert fake_s3.uploads == {}
+    assert not _sigterm_blocked()
+
+
+@pytest.mark.usefixtures("sigterm_exits")
+def test_a_sigterm_inside_the_blocking_call_leaves_it_unblocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`pthread_sigmask` runs a pending handler before it returns, so the exit
+    can come out of the very call that blocked SIGTERM."""
+    real = signal.pthread_sigmask
+
+    def handler_runs_inside(how: int, mask: typing.Iterable[int]) -> set[int]:
+        previous = real(how, mask)
+        if how == signal.SIG_BLOCK and signal.SIGTERM in set(mask):
+            raise SystemExit(143)
+        return previous
+
+    monkeypatch.setattr(signal, "pthread_sigmask", handler_runs_inside)
+    with pytest.raises(SystemExit):
+        claude_worker.objstore._hold_term()
+    monkeypatch.undo()
+    assert not _sigterm_blocked()
+
+
+def test_the_control_requests_run_on_the_short_timeout(tmp_path: pathlib.Path) -> None:
+    """The held initiate, its abort and the listing: CONTROL_TIMEOUT_S; a part
+    keeps the store's own."""
+    fake_s3 = tests.fake_s3.FakeS3()
+    fake_s3.fail_after_n_puts = 0
+    store = make_store(fake_s3)
+    part = 5 * 1024 * 1024
+    src = tmp_path / "obj.bin"
+    src.write_bytes(b"f" * (part + 16))
+    with pytest.raises(claude_worker.objstore.ObjStoreError):
+        store.multipart_put("v1/runs/mbp-m4/run-1/obj.bin", src, part_size=part)
+    list(store.list_multipart())
+    short = claude_worker.objstore.CONTROL_TIMEOUT_S
+    seen = {
+        (m, q.split("=")[0]): t
+        for (m, _p, q), t in zip(fake_s3.requests, fake_s3.timeouts, strict=True)
+    }
+    assert seen[("POST", "uploads")] == short
+    assert seen[("DELETE", "uploadId")] == short
+    assert seen[("GET", "uploads")] == short
+    assert seen[("PUT", "partNumber")] == 5.0

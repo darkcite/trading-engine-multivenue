@@ -13,6 +13,7 @@ Every test runs against `tests/fake_s3.py` over httpx.MockTransport. No socket.
 Convention: full ``import x`` only. No ``from x import y``.
 """
 
+import datetime
 import json
 import pathlib
 import random
@@ -22,6 +23,7 @@ import struct
 import subprocess
 import typing
 
+import httpx
 import pytest
 
 import claude_worker.archive
@@ -794,3 +796,65 @@ def test_candles_snapshot_is_staged_compressed_and_the_raw_one_removed(
     assert name.endswith(".db.zst") and staged.is_file()
     staging = tmp_path / "s3-cache" / "staging"
     assert sorted(p.name for p in staging.iterdir()) == [name]
+
+
+def test_abort_stale_aborts_only_uploads_over_the_age(tmp_path: pathlib.Path) -> None:
+    """HK21: an orphan from 2026-09-05 goes; a push in flight stays."""
+    fake = tests.fake_s3.FakeS3()
+    cfg = make_cfg(tmp_path)
+    archiver = make_archiver(cfg, fake)
+    fake.initiated_at = "2026-09-05T11:50:25.707Z"
+    fake.handle(httpx.Request("POST", f"https://{fake.bucket}.h/v1/old.zst?uploads="))
+    fake.initiated_at = "2026-10-15T08:30:00.000Z"
+    fake.handle(httpx.Request("POST", f"https://{fake.bucket}.h/v1/live.zst?uploads="))
+    now = datetime.datetime(2026, 10, 15, 9, 0, tzinfo=datetime.UTC)
+    assert claude_worker.archive.abort_stale(archiver.store, 24.0, now=now) == (1, 1, 0)
+    assert [u.key for u in fake.uploads.values()] == ["v1/live.zst"]
+
+
+def test_abort_stale_never_judges_a_start_it_cannot_read(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A naive or unreadable `Initiated` is left alone and counted apart (a
+    provider format change must not pass for "nothing stale"); each abort is
+    logged with its start."""
+    fake = tests.fake_s3.FakeS3()
+    archiver = make_archiver(make_cfg(tmp_path), fake)
+    for key, started in (
+        ("v1/naive.zst", "2026-09-05T11:50:25"),
+        ("v1/garbled.zst", "Sat, 05 Sep 2026 11:50:25 GMT"),
+        ("v1/old.zst", "2026-09-05T11:50:25.707Z"),
+    ):
+        fake.initiated_at = started
+        fake.handle(httpx.Request("POST", f"https://{fake.bucket}.h/{key}?uploads="))
+    now = datetime.datetime(2026, 10, 15, 9, 0, tzinfo=datetime.UTC)
+    assert claude_worker.archive.abort_stale(archiver.store, 24.0, now=now) == (1, 0, 2)
+    assert sorted(u.key for u in fake.uploads.values()) == ["v1/garbled.zst", "v1/naive.zst"]
+    assert (
+        "archive: aborted v1/old.zst initiated=2026-09-05T11:50:25.707Z" in capsys.readouterr().err
+    )
+
+
+def test_explicit_path_under_the_root_keeps_its_path(tmp_path: pathlib.Path) -> None:
+    """HK21: `--path` under the kind's root is keyed like the default run."""
+    run = tmp_path / "worker" / "features" / "run-1"
+    run.mkdir(parents=True)
+    inside = run / "16777842.json"
+    inside.write_text("{}", encoding="utf-8")
+    outside = tmp_path / "elsewhere.json"
+    outside.write_text("{}", encoding="utf-8")
+    pairs = claude_worker.archive._derived_paths("features", str(inside), 3, home=tmp_path)
+    assert [name for _p, name in pairs] == ["run-1/16777842.json"]
+    pairs = claude_worker.archive._derived_paths("features", str(outside), 3, home=tmp_path)
+    assert [name for _p, name in pairs] == ["elsewhere.json"]
+    # A symlink keys by its own name, as the default run's `rglob` keys it.
+    link = run / "linked.json"
+    link.symlink_to(outside)
+    pairs = claude_worker.archive._derived_paths("features", str(link), 3, home=tmp_path)
+    assert [name for _p, name in pairs] == ["run-1/linked.json"]
+    default = claude_worker.archive._derived_paths("features", "", 3, home=tmp_path)
+    assert "run-1/linked.json" in [name for _p, name in default]
+    outer = tmp_path / "outer.json"
+    outer.symlink_to(inside)
+    pairs = claude_worker.archive._derived_paths("features", str(outer), 3, home=tmp_path)
+    assert [name for _p, name in pairs] == ["outer.json"]

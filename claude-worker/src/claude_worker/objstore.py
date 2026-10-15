@@ -54,6 +54,7 @@ import http
 import pathlib
 import random
 import re
+import signal
 import time
 import typing
 import urllib.parse
@@ -96,6 +97,13 @@ UNSIGNED_HEADERS: typing.Final[frozenset[str]] = frozenset(
 RETRY_STATUS: typing.Final[frozenset[int]] = frozenset({429, 500, 502, 503, 504})
 MAX_ATTEMPTS: typing.Final[int] = 6
 BACKOFF_CAP_S: typing.Final[float] = 32.0
+
+#: HK21: the timeout of a request with no payload and a small answer: the
+#: multipart initiate, its abort, the uploads listing. Short because the
+#: initiate runs with SIGTERM held, one attempt at a time: a stalled attempt
+#: delays a stop by its connect plus its read (2 x this), not by the 900 s a
+#: part is allowed.
+CONTROL_TIMEOUT_S: typing.Final[float] = 15.0
 
 
 class ObjStoreError(Exception):
@@ -155,6 +163,14 @@ class ObjectMeta(typing.NamedTuple):
     size: int
     etag: str
     last_modified: str
+
+
+class Incomplete(typing.NamedTuple):
+    """A multipart upload begun and never completed or aborted (HK21)."""
+
+    key: str
+    upload_id: str
+    initiated: str  # ISO-8601, as the endpoint states it
 
 
 @dataclasses.dataclass(slots=True)
@@ -356,6 +372,8 @@ class ObjectStore:
         self._creds = creds
         self._http = http_client
         self._timeout_s = timeout_s
+        # HK21: True while a ``hold_term`` request's SIGTERM is still held.
+        self._term_held = False
         self._clock = clock
         self._sleep = sleep
         self._rng = rng if rng is not None else random.Random(0)
@@ -381,6 +399,7 @@ class ObjectStore:
         extra_headers: collections.abc.Mapping[str, str] | None,
         content: bytes | collections.abc.Iterable[bytes] | None,
         content_length: int | None,
+        timeout_s: float,
     ) -> httpx.Request:
         path = self.endpoint.path_for(key)
         qs = canonical_query(query)
@@ -415,7 +434,7 @@ class ObjectStore:
             # implement.
             wire["content-length"] = str(content_length)
         return self._http.build_request(
-            method, url, headers=wire, content=content, timeout=self._timeout_s
+            method, url, headers=wire, content=content, timeout=timeout_s
         )
 
     def _send(  # noqa: PLR0913 — one parameter per request component, deliberately
@@ -433,8 +452,15 @@ class ObjectStore:
         expect: collections.abc.Container[int] = (200, 204),
         allow: collections.abc.Container[int] = (),
         stream_response: bool = False,
+        timeout_s: float | None = None,
+        hold_term: bool = False,
     ) -> httpx.Response:
-        """One request with bounded retries. Re-signs on every attempt."""
+        """One request with bounded retries. Re-signs on every attempt.
+
+        ``hold_term`` (HK21) holds SIGTERM across each attempt alone: released
+        after a failed one, before its backoff; after a successful one it is
+        LEFT held, for the caller to release (`_release_held`) once what the
+        answer named is where its abort can reach it."""
         if key and not KEY_RE.match(key):
             raise ObjStoreError(f"key is not representable without escaping: {key!r}")
 
@@ -465,16 +491,23 @@ class ObjectStore:
                 extra_headers=extra_headers,
                 content=content,
                 content_length=length,
+                timeout_s=self._timeout_s if timeout_s is None else timeout_s,
             )
+            if hold_term:
+                self._term_held = _hold_term()
             try:
                 response = self._http.send(request, stream=stream_response)
             except httpx.TransportError as exc:
                 last = ObjStoreError(
                     f"{method} {key or '/'}: transport error ({type(exc).__name__})"
                 )
+            except BaseException:
+                self._release_held()
+                raise
             else:
                 if response.status_code in expect or response.status_code in allow:
-                    return response
+                    return response  # hold_term: still held, see the docstring
+                self._release_held()
                 payload = b"" if stream_response else response.content
                 if stream_response:
                     response.close()
@@ -487,10 +520,17 @@ class ObjectStore:
                 )
                 if response.status_code not in RETRY_STATUS:
                     raise last
+            self._release_held()
             if attempt + 1 < MAX_ATTEMPTS:
                 delay = min(BACKOFF_CAP_S, 2.0**attempt)
                 self._sleep(delay * (0.8 + 0.4 * self._rng.random()))
         raise last if last is not None else ObjStoreError(f"{method} {key or '/'}: no attempt made")
+
+    def _release_held(self) -> None:
+        """Release what a ``hold_term`` request left held; a no-op when none
+        is. A SIGTERM held meanwhile raises out of this call."""
+        held, self._term_held = self._term_held, False
+        _release_term(held)
 
     # -- verbs --------------------------------------------------------------
 
@@ -669,15 +709,35 @@ class ObjectStore:
         if parts_total > MAX_PARTS:
             raise ObjStoreError(f"{parts_total} parts exceeds the {MAX_PARTS} limit")
 
-        initiate = self._send("POST", key, query=[("uploads", "")], expect=(200,))
-        root = xml.etree.ElementTree.fromstring(initiate.content)
-        upload_id = _text(root, "{*}UploadId")
+        # HK21: the initiate runs with SIGTERM HELD (blocked, not ignored),
+        # one attempt at a time. Delivered after the bucket made the upload but
+        # before its id is in hand, a SIGTERM's SystemExit would leave nothing
+        # to abort: an orphan. A failed attempt releases it before its backoff;
+        # the answering one keeps it until the id is in hand, released inside
+        # the try below, where the abort reaches it. An attempt whose answer
+        # was LOST made an upload no one can name: `abort-stale` clears those.
+        try:
+            initiate = self._send(
+                "POST",
+                key,
+                query=[("uploads", "")],
+                expect=(200,),
+                timeout_s=CONTROL_TIMEOUT_S,
+                hold_term=True,
+            )
+            root = xml.etree.ElementTree.fromstring(initiate.content)
+            upload_id = _text(root, "{*}UploadId")
+        except BaseException:
+            self._release_held()
+            raise
         if not upload_id:
+            self._release_held()
             raise ObjStoreError(f"POST {key}?uploads: no UploadId in the response")
 
         etags: builtins.list[str] = []
         md5s: builtins.list[bytes] = []
         try:
+            self._release_held()
             for number in range(1, parts_total + 1):
                 offset = (number - 1) * part_size
                 length = min(part_size, size - offset)
@@ -727,6 +787,36 @@ class ObjectStore:
             raise DigestMismatch(f"{key}: ETag {server_etag} != composite {composite}")
         return ObjectMeta(key=key, size=size, etag=server_etag or composite, last_modified="")
 
+    def list_multipart(self, prefix: str = "") -> collections.abc.Iterator[Incomplete]:
+        """Every incomplete multipart upload under ``prefix`` (HK21), following
+        the key and upload-id markers."""
+        key_marker = ""
+        id_marker = ""
+        while True:
+            query: builtins.list[tuple[str, str]] = [("uploads", "")]
+            if prefix:
+                query.append(("prefix", prefix))
+            if key_marker:
+                query.append(("key-marker", key_marker))
+            if id_marker:
+                query.append(("upload-id-marker", id_marker))
+            response = self._send(
+                "GET", "", query=query, expect=(200,), timeout_s=CONTROL_TIMEOUT_S
+            )
+            root = xml.etree.ElementTree.fromstring(response.content)
+            for node in root.findall("{*}Upload"):
+                yield Incomplete(
+                    key=_text(node, "{*}Key"),
+                    upload_id=_text(node, "{*}UploadId"),
+                    initiated=_text(node, "{*}Initiated"),
+                )
+            if _text(root, "{*}IsTruncated").lower() != "true":
+                return
+            key_marker = _text(root, "{*}NextKeyMarker")
+            id_marker = _text(root, "{*}NextUploadIdMarker")
+            if not key_marker:
+                return
+
     def abort_multipart(self, key: str, upload_id: str) -> None:
         """The ONLY DELETE-verb request this client can send (S-LAW 11).
 
@@ -740,6 +830,7 @@ class ObjectStore:
                 query=[("uploadId", upload_id)],
                 expect=(204, 200),
                 allow=(int(http.HTTPStatus.NOT_FOUND),),
+                timeout_s=CONTROL_TIMEOUT_S,
             )
         except ObjStoreError:
             return
@@ -788,6 +879,37 @@ def _file_chunks(
                 return
             remaining -= len(chunk)
             yield chunk
+
+
+def _hold_term() -> bool:
+    """Block SIGTERM; True when this call blocked it (HK21).
+
+    Holds only on the main thread of a single-threaded process (the
+    archiver's case): Python runs handlers on the main thread, and in a
+    threaded process another thread would take the signal. Where the
+    platform has no per-thread mask nothing is held, and `abort-stale` is
+    what clears an upload orphaned during its initiate.
+
+    ``pthread_sigmask`` runs a pending handler before it returns, so its
+    SystemExit can come out of the very call that blocked SIGTERM: that exit
+    unblocks first, so none leaves SIGTERM blocked."""
+    if not hasattr(signal, "pthread_sigmask"):
+        return False
+    if signal.SIGTERM in signal.pthread_sigmask(signal.SIG_BLOCK, ()):
+        return False
+    try:
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+        raise
+    return True
+
+
+def _release_term(held: bool) -> None:
+    """Unblock what `_hold_term` blocked. A SIGTERM held meanwhile is
+    delivered inside this call: its handler's SystemExit comes out of here."""
+    if held:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
 
 
 def _paced_chunks(

@@ -99,7 +99,27 @@ if [ "${S3_NICE_NETWORK:-0}" = "1" ]; then
   NET_PREFIX="taskpolicy -b"
 fi
 
-# shellcheck disable=SC2086  # NET_PREFIX is a deliberate word-split
-exec $NET_PREFIX nice -n 19 \
+# zsh never word-splits an unquoted parameter: ${=NET_PREFIX} is the split.
+# (HK21: the plain form ran "taskpolicy -b" as ONE word — not found, 127.)
+
+# HK21: first clear what an interrupted push left — incomplete multipart
+# uploads over a day old (the bucket has no AbortIncompleteMultipartUpload
+# rule). It can touch nothing a push completed; a failure here is not fatal.
+${=NET_PREFIX} nice -n 19 "$ALIAS/bin/python3" "$REPO/scripts/archive-run.py" abort-stale ||
+  echo "archive-cycle: abort-stale failed (non-fatal)" >&2
+
+# The sweep's time comes out of the cycle's budget ($SECONDS counts from this
+# script's start), so the 23:50Z bound above holds. None left is a spent
+# budget, exit 5 as the archiver's own: `--budget-s 0` would mean NO budget.
+BUDGET_S=$S3_CYCLE_BUDGET_S
+if (( S3_CYCLE_BUDGET_S > 0 )); then
+  BUDGET_S=$(( S3_CYCLE_BUDGET_S - SECONDS ))
+  if (( BUDGET_S <= 0 )); then
+    echo "archive-cycle: budget spent before the push" >&2
+    exit 5
+  fi
+fi
+
+exec ${=NET_PREFIX} nice -n 19 \
   "$ALIAS/bin/python3" "$REPO/scripts/archive-run.py" \
-  push-pending --budget-s "$S3_CYCLE_BUDGET_S"
+  push-pending --budget-s "$BUDGET_S"

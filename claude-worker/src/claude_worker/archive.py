@@ -36,6 +36,7 @@ import argparse
 import collections.abc
 import compression.zstd
 import dataclasses
+import datetime
 import fnmatch
 import hashlib
 import json
@@ -98,7 +99,25 @@ EXIT_NO_SPACE: typing.Final[int] = 4  # free-space floor would be breached
 EXIT_BUDGET: typing.Final[int] = 5  # budget spent mid-run — resumable
 EXIT_TERMINATED: typing.Final[int] = 143  # SIGTERM; any multipart in flight is aborted
 
+#: HK21: an incomplete upload older than this is an orphan, not a push in
+#: flight (a night's cycle is bounded by its 8400 s budget).
+STALE_UPLOAD_H: typing.Final[float] = 24.0
+
+#: HK21: each derived kind's root under ~/multivenue (the key's base).
+_DERIVED_ROOTS: typing.Final[dict[str, str]] = {
+    "features": "worker/features",
+    "reports": "worker/reports",
+}
+
 MIB: typing.Final[int] = 1024 * 1024
+
+
+class StaleSweep(typing.NamedTuple):
+    """What `abort_stale` did (HK21)."""
+
+    aborted: int
+    kept: int  # younger than the age: a push may still be in flight
+    unparsed: int  # an ``Initiated`` that is not an aware time: never judged
 
 
 class ArchiveError(Exception):
@@ -1013,6 +1032,14 @@ def main(argv: collections.abc.Sequence[str] | None = None) -> int:
 
     sub.add_parser("status")
 
+    # HK21: the bucket has no AbortIncompleteMultipartUpload rule; these are
+    # the client's own way to see and clear what an interrupted push left.
+    uploads = sub.add_parser("uploads")
+    uploads.add_argument("--prefix", default="")
+    stale = sub.add_parser("abort-stale")
+    stale.add_argument("--older-than-h", type=float, default=STALE_UPLOAD_H)
+    stale.add_argument("--prefix", default="")
+
     tarball = sub.add_parser("push-tarball")
     tarball.add_argument("path", nargs="?", default="")
     tarball.add_argument("--all", action="store_true")
@@ -1124,6 +1151,22 @@ def _dispatch(  # one branch per verb, deliberately flat
         runs = archiver.list_runs()
         print(f"{cfg.tell()} runs_remote={len(runs)}", file=sys.stderr)
         return EXIT_OK
+    if args.verb == "uploads":
+        found = list(archiver.store.list_multipart(args.prefix))
+        for up in found:
+            print(f"archive: incomplete {up.key} initiated={up.initiated}", file=sys.stderr)
+        print(f"archive: incomplete uploads={len(found)}", file=sys.stderr)
+        return EXIT_OK
+    if args.verb == "abort-stale":
+        sweep = abort_stale(archiver.store, args.older_than_h, args.prefix)
+        print(
+            f"archive: abort-stale aborted={sweep.aborted} kept={sweep.kept}"
+            f" unparsed={sweep.unparsed}",
+            file=sys.stderr,
+        )
+        # A start that no longer parses would stop every cleanup in silence:
+        # fail, so the cycle's log says so (non-fatal there).
+        return EXIT_FAILED if sweep.unparsed else EXIT_OK
     if args.verb == "push-tarball":
         budget = _budget(args.budget_s)
         paths = (
@@ -1154,16 +1197,56 @@ def _dispatch(  # one branch per verb, deliberately flat
     return EXIT_OK
 
 
+def abort_stale(
+    store: claude_worker.objstore.ObjectStore,
+    older_than_h: float,
+    prefix: str = "",
+    now: datetime.datetime | None = None,
+) -> StaleSweep:
+    """Abort every incomplete multipart upload initiated over ``older_than_h``
+    hours ago (HK21), logging each. A push in flight is younger, and an abort
+    can touch nothing but parts that never completed (S-LAW 11). An upload
+    whose start is not an aware time is left alone and counted apart."""
+    now = now if now is not None else datetime.datetime.now(datetime.UTC)
+    cutoff = now - datetime.timedelta(hours=older_than_h)
+    aborted = kept = unparsed = 0
+    for up in list(store.list_multipart(prefix)):
+        try:
+            started = datetime.datetime.fromisoformat(up.initiated)
+        except ValueError:
+            unparsed += 1
+            continue
+        if started.tzinfo is None:
+            unparsed += 1
+            continue
+        if started > cutoff:
+            kept += 1
+            continue
+        store.abort_multipart(up.key, up.upload_id)
+        print(f"archive: aborted {up.key} initiated={up.initiated}", file=sys.stderr)
+        aborted += 1
+    return StaleSweep(aborted, kept, unparsed)
+
+
 def _derived_paths(
     kind: str, explicit: str, zstd_level: int, home: pathlib.Path | None = None
 ) -> list[tuple[pathlib.Path, str]]:
-    """(file, key name) pairs; the name is relative to the kind's root (HK11)."""
-    if explicit:
-        path = pathlib.Path(explicit).expanduser()
-        return [(path, path.name)]
+    """(file, key name) pairs; the name is relative to the kind's root (HK11),
+    an explicit ``--path`` under that root too (HK21)."""
     home = home if home is not None else pathlib.Path.home() / "multivenue"
+    if explicit:
+        # The parent resolved, never the file: a symlink keys by its own name,
+        # as the default run's `rglob` keys it.
+        given = pathlib.Path(explicit).expanduser()
+        path = given.parent.resolve() / given.name
+        base = _DERIVED_ROOTS.get(kind)
+        root = (home / base).resolve() if base is not None else None
+        if root is not None and path.is_relative_to(root):
+            return [(path, path.relative_to(root).as_posix())]
+        return [(path, path.name)]
     if kind == "reports":
-        return [(p, p.name) for p in sorted((home / "worker" / "reports").glob("pnl-*.json"))]
+        reports = home / _DERIVED_ROOTS["reports"]
+        return [(p, p.name) for p in sorted(reports.glob("pnl-*.json"))]
     if kind == "candles":
         # A live sqlite file is not a file you copy. `.backup` is the only
         # snapshot that is guaranteed internally consistent.
@@ -1192,7 +1275,7 @@ def _derived_paths(
         finally:
             snapshot.unlink(missing_ok=True)
         return [(staged, staged.name)]
-    root = home / "worker" / "features"
+    root = home / _DERIVED_ROOTS["features"]
     return [(p, p.relative_to(root).as_posix()) for p in sorted(root.rglob("*")) if p.is_file()]
 
 
