@@ -1,27 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicU64, Ordering};
-
+use core_alloc::{AllocGuard, CountingAllocator};
 use pine_ir::*;
 use pine_vm::*;
 use pine_vm::testkit::stub::*;
 use pine_vm::testkit::*;
 
-struct Counting;
-static ALLOCS: AtomicU64 = AtomicU64::new(0);
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.alloc(l) }
-    }
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        unsafe { System.dealloc(p, l) }
-    }
-}
+// The workspace's counting allocator: it does not count libtest's runner
+// (the main thread), whose bookkeeping right after spawning a test thread
+// would otherwise land inside the window under CPU load (HK14, A-S7-101).
 #[global_allocator]
-static G: Counting = Counting;
+static G: CountingAllocator = CountingAllocator::new();
 
 #[test]
 fn new_step_bar_and_step_tick_allocate_nothing() {
@@ -52,7 +42,7 @@ fn new_step_bar_and_step_tick_allocate_nothing() {
     let bars: Vec<Bar> = (0..200).map(|i| bar(i, 1.0 + i as f64, barflag::CONFIRMED)).collect();
     let tick = bar(0, 3.0, barflag::REALTIME);
     let mut ctx = Ctx { now: 0 };
-    let before = ALLOCS.load(Ordering::Relaxed);
+    let guard = AllocGuard::new();
     let mut vm = VmInstance::new(v, ar.slice());
     let mut k = 0;
     while k < bars.len() {
@@ -65,5 +55,6 @@ fn new_step_bar_and_step_tick_allocate_nothing() {
         k += 1;
     }
     vm.reset();
-    assert_eq!(ALLOCS.load(Ordering::Relaxed) - before, 0, "new/step_bar/step_tick/reset allocated");
+    let (allocs, bytes, _) = guard.delta();
+    assert_eq!(allocs, 0, "new/step_bar/step_tick/reset allocated {allocs} times / {bytes} B");
 }

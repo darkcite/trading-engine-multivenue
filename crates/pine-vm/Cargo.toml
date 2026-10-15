@@ -23,3 +23,7 @@ pine-ir = { workspace = true }
 [dev-dependencies]
 # Integration tests need the testkit feature of this very crate.
 pine-vm = { path = ".", features = ["testkit"] }
+# tests/alloc.rs counts with the workspace's allocator (HK14: the test
+# runner's thread is not counted). Test-only; the contract's crate graph
+# (00-INDEX v4 section 2) is about [dependencies] and stays pine-ir only.
+core-alloc = { workspace = true }
