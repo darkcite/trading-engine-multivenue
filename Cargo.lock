@@ -1502,6 +1502,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pine-std"
+version = "0.1.0"
+dependencies = [
+ "core-time",
+ "pine-ir",
+ "pine-spec",
+ "pine-vm",
+ "proptest",
+]
+
+[[package]]
 name = "pine-vm"
 version = "0.1.0"
 dependencies = [

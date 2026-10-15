@@ -72,6 +72,7 @@ members = [
     "crates/pine-ir",
     "crates/pine-lang",
     "crates/pine-spec",
+    "crates/pine-std",
     "crates/pine-vm",
 
     # --- execution ---
@@ -242,6 +243,7 @@ strategy-xsd          = { path = "crates/strategy-xsd" }
 pine-ir = { path = "crates/pine-ir" }
 pine-lang = { path = "crates/pine-lang" }
 pine-spec = { path = "crates/pine-spec" }
+pine-std = { path = "crates/pine-std" }
 pine-vm = { path = "crates/pine-vm" }
 
 clob-dispatcher = { path = "crates/clob-dispatcher" }
