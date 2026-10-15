@@ -517,6 +517,45 @@ fn bench_bin15_late(c: &mut Criterion) {
     });
 }
 
+// -----------------------------------------------------------------
+// 13. S16 — the strategy set's own dispatch: one tick through all
+//     eight mask-gated members and through none, one attributed fill
+//     routed to its slot alone (slot 7, the route's last arm), and one
+//     timer poll over every member's own period. Every member is
+//     default-constructed and unconfigured, so each returns at its
+//     first check: the numbers are the set's mask tests, slot stamps
+//     and routing, not a member's work. Baselined on the hand-written
+//     fan-out before S16-1 generated it from the member table
+//     (hot_path.json), so the table is held to it.
+// -----------------------------------------------------------------
+
+fn bench_strategy_set(c: &mut Criterion) {
+    use core_types::{Fill, FILL_ORIGIN_PAPER};
+    use strategy_set::{StrategySet, BUILT_MASK, REGIME_TIMER_NS, SLOT_HCV};
+    let t = sample_tick();
+    let mut ctx = NullCtx { now: 1 };
+    let mut all = Box::new(StrategySet::new(BUILT_MASK));
+    let mut none = Box::new(StrategySet::new(0));
+    c.bench_function("strategy_set/on_tick_all", |b| {
+        b.iter(|| all.on_tick(black_box(&t), &mut ctx));
+    });
+    c.bench_function("strategy_set/on_tick_none", |b| {
+        b.iter(|| none.on_tick(black_box(&t), &mut ctx));
+    });
+    let fill = Fill::new(1, t.sym, Side::Bid, t.bid_px, t.bid_qty, 1)
+        .with_attribution(SLOT_HCV, FILL_ORIGIN_PAPER);
+    c.bench_function("strategy_set/on_fill_routed", |b| {
+        b.iter(|| all.on_fill(black_box(&fill), &mut ctx));
+    });
+    let mut now = 0u64;
+    c.bench_function("strategy_set/on_timer_all", |b| {
+        b.iter(|| {
+            now += REGIME_TIMER_NS;
+            all.on_timer(black_box(now), &mut ctx);
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_clock,
@@ -531,5 +570,6 @@ criterion_group!(
     bench_signer_hypercall_place_order,
     bench_long_vol_day_close,
     bench_bin15_late,
+    bench_strategy_set,
 );
 criterion_main!(benches);

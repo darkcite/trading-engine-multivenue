@@ -6,7 +6,8 @@
     "Not gated: ring/spsc_rtt_tick and ring/spsc_stream_tick, two threads that macOS places as it likes (103-122 ns and 9-11 ns across sessions); docs/risk-policy.md records them.",
     "Re-baseline when a change moves a number on purpose: three `make bench-check` runs, each value their median, and the reason recorded here and in docs/risk-policy.md.",
     "HK9 (2026-10-13, at 2f842e6): vol/long_day_close_warm, vol/long_state_copy_warm and signer/hypercall_place_order baselined, each the median of three `make bench-check` runs with the engine running (load 9.4-11.3); the eleven above were left as they are (all within 15 %, none moved on purpose). bin15/late_fair_in_window and bin15/late_grid_mark_and_perp_1s (BIN15 H90) stay unbaselined for that lane: the second spread 1.6-2.3 ns across runs.",
-    "HK16 (2026-10-14, at c24557d): bin15/late_fair_in_window and bin15/late_grid_mark_and_perp_1s baselined, each the median of five runs with bench-check's settings (warm-up 1 s, 2 s, 50 samples) with the engine running (load 9.6): 335.2-342.9 ns and 1.597-1.621 ns, so neither moved more than 1.5 % across the five. HK9's 1.6-2.3 ns spread did not recur."
+    "HK16 (2026-10-14, at c24557d): bin15/late_fair_in_window and bin15/late_grid_mark_and_perp_1s baselined, each the median of five runs with bench-check's settings (warm-up 1 s, 2 s, 50 samples) with the engine running (load 9.6): 335.2-342.9 ns and 1.597-1.621 ns, so neither moved more than 1.5 % across the five. HK9's 1.6-2.3 ns spread did not recur.",
+    "S16-1 (2026-10-16, at 0432bfa): strategy_set/on_tick_all, on_tick_none, on_fill_routed and on_timer_all baselined on the hand-written fan-out, BEFORE S16-1 generated it from the member table, so the table is held to the code it replaced. Each value is the median of three runs with bench-check's settings (warm-up 1 s, 2 s, 50 samples) with the engine running (load 8-10): 4.626-4.631, 2.2548-2.2554, 1.7541-1.7543 and 2.2555-2.5056 ns (on_timer_all: 2.256 twice, 2.506 once)."
   ],
   "_source": "docs/risk-policy.md, \"make bench-check compares (2026-09-25)\"",
   "tolerance_pct": 15,
@@ -26,6 +27,10 @@
     "vol/long_day_close_warm": 37460,
     "vol/long_state_copy_warm": 2490,
     "bin15/late_fair_in_window": 340,
-    "bin15/late_grid_mark_and_perp_1s": 1.6
+    "bin15/late_grid_mark_and_perp_1s": 1.6,
+    "strategy_set/on_tick_all": 4.63,
+    "strategy_set/on_tick_none": 2.26,
+    "strategy_set/on_fill_routed": 1.75,
+    "strategy_set/on_timer_all": 2.26
   }
 }
