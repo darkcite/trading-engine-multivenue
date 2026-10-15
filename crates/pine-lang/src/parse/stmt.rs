@@ -188,6 +188,17 @@ impl Parser<'_, '_> {
                 let header_end = matches!(after, TokKind::Newline | TokKind::Eof);
                 match t.kw {
                     SoftKw::Import if next == TokKind::Seg => return self.import_decl(),
+                    // `import` + a word on a wrapped line: on one line the lexer reads it as an
+                    // import path (§4.4), so accepting it here would make the statement's meaning
+                    // depend on a line break — and its canonical print would not reparse (I9).
+                    SoftKw::Import if next == TokKind::Ident => {
+                        let at = self.tspan(self.peek_at(1));
+                        return self.recover(
+                            code::EXPECTED,
+                            at,
+                            "an `import` path must be on the same line as `import`",
+                        );
+                    }
                     SoftKw::Export if next == TokKind::Ident => return self.export_decl(),
                     SoftKw::Type if next == TokKind::Ident && header_end => {
                         return self.type_decl(t.lo, 0)

@@ -464,3 +464,32 @@ fn deep_accepted_programs_round_trip() {
         .expect("spawn");
     h.join().expect("no overflow, no panic");
 }
+
+/// The second pine_lex_parse fuzz finding, minimised: `import` with its operand on a wrapped
+/// line. The parser accepted it (a typed declaration of type `import`, a field of type
+/// `import`), but on one line the lexer reads `import K` as an import path, so the canonical
+/// print reparsed as 2012 / 2004. It is now refused in the wrapped spelling too.
+#[test]
+fn import_word_on_a_wrapped_line_is_refused() {
+    let codes = |body: &str| -> Vec<u16> {
+        let mut syms = SymTable::new();
+        parse(&format!("//@version=6\n{body}"), FileId::ROOT, &mut syms)
+            .err()
+            .unwrap_or_default()
+            .iter()
+            .map(|d| d.code.0)
+            .collect()
+    };
+    assert_eq!(codes("import\n K = 1.5\n"), vec![2000]);
+    assert_eq!(codes("type T\n    import\n      x\n"), vec![2004]);
+    // Still identifiers wherever no path reading applies (L6), and still round-tripping.
+    for body in [
+        "import = 1\nimport := 2\n",
+        "import\n",
+        "x = import + 1\n",
+        "f(import) => import\n",
+    ] {
+        assert!(codes(body).is_empty(), "{body:?}");
+        assert_round_trips(&format!("//@version=6\n{body}"));
+    }
+}

@@ -206,3 +206,92 @@ proptest! {
         check_total(&format!("{pragma}{}", lines.concat()));
     }
 }
+
+/// A splitmix64 stream for the seeded mutations.
+fn splitmix(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Fixtures mutated the way the fuzzer reaches the second finding: each mutant applies one to
+/// three seeded line edits — a line cut short, a line duplicated elsewhere, two lines swapped, a
+/// line re-indented by 1/2/4 spaces, a CRLF terminator, a line re-wrapped (its first word maybe
+/// swapped for a soft keyword) — and is sometimes truncated at a random byte. Few edits keep most mutants acceptable, so the round-trip property (`check_total`) is
+/// exercised on accepted programs, not just on refusals.
+#[test]
+fn shuffled_and_truncated_fixtures_round_trip() {
+    let all = fixtures();
+    let mut state = 0x00F1_2F12_5EED_0002u64;
+    let mut accepted = 0usize;
+    for src in &all {
+        let base: Vec<String> = src.lines().map(str::to_string).collect();
+        for _ in 0..400 {
+            let mut lines = base.clone();
+            let edits = 1 + splitmix(&mut state) % 3;
+            for _ in 0..edits {
+                let n = lines.len() as u64;
+                let i = (splitmix(&mut state) % n) as usize;
+                let j = (splitmix(&mut state) % n) as usize;
+                match splitmix(&mut state) % 6 {
+                    // Re-wrap: split the line at its first space and indent the rest by two
+                    // (an R3 continuation), sometimes after swapping its first word for a soft
+                    // keyword — the layout-dependent lexing class of the second fuzz finding.
+                    5 => {
+                        if splitmix(&mut state) % 2 == 0 {
+                            let kw = [
+                                "import", "type", "enum", "method", "export", "once", "series",
+                            ][(splitmix(&mut state) % 7) as usize];
+                            let rest = lines[i]
+                                .trim_start()
+                                .find(' ')
+                                .map_or(String::new(), |k| lines[i].trim_start()[k..].to_string());
+                            lines[i] = format!("{kw}{rest}");
+                        }
+                        if let Some(k) = lines[i].find(' ') {
+                            let tail = lines[i][k + 1..].to_string();
+                            lines[i].truncate(k);
+                            lines.insert(i + 1, format!("  {tail}"));
+                        }
+                    }
+                    0 => {
+                        let mut end = (splitmix(&mut state) % (lines[i].len() as u64 + 1)) as usize;
+                        while !lines[i].is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        lines[i].truncate(end);
+                    }
+                    1 => {
+                        let l = lines[i].clone();
+                        lines.insert(j, l);
+                    }
+                    2 => lines.swap(i, j),
+                    3 => {
+                        let pad = [" ", "  ", "    "][(splitmix(&mut state) % 3) as usize];
+                        lines[i].insert_str(0, pad);
+                    }
+                    _ => lines[i].push('\r'),
+                }
+            }
+            let out = lines.join("\n");
+            let mut syms = SymTable::new();
+            if parse(&out, FileId::ROOT, &mut syms).is_ok() {
+                accepted += 1;
+            }
+            check_total(&out);
+            if splitmix(&mut state) % 4 == 0 {
+                let mut cut = (splitmix(&mut state) % (out.len() as u64 + 1)) as usize;
+                while !out.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                check_total(&out[..cut]);
+            }
+        }
+    }
+    assert!(
+        accepted > all.len() * 40,
+        "only {accepted} mutants were accepted"
+    );
+}

@@ -186,8 +186,12 @@ impl Parser<'_, '_> {
             }
             _ => {}
         }
+        // A field line `import x` is an import path to the lexer (§4.4); the wrapped spelling
+        // `import` + `x` on a continuation line is refused the same way (I9).
+        let import_word =
+            self.peek().kw == SoftKw::Import && self.peek_at(1).kind == TokKind::Ident;
         let typed = match self.type_end(0) {
-            Some(k) => self.peek_at(k).kind == TokKind::Ident,
+            Some(k) => self.peek_at(k).kind == TokKind::Ident && !import_word,
             None => false,
         };
         if !typed {
