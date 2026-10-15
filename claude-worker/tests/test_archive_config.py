@@ -176,8 +176,9 @@ def test_defaults_are_the_measured_values(tmp_path: pathlib.Path) -> None:
     assert cfg.cache_max_gib == 20
     assert cfg.cache_min_free_gib == 25
     assert cfg.skip_globs == ()
-    # HK11: the measured cap; an uncapped push stalls the feeds.
-    assert cfg.max_upload_mibps == 1.0
+    # HK11/HK20: the cap; at 20 the link (~5 MB/s) binds, and the client
+    # still writes 64 KiB at a time — an uncapped push stalled the feeds.
+    assert cfg.max_upload_mibps == 20.0
 
 
 def test_malformed_numeric_values_fall_back_to_defaults(tmp_path: pathlib.Path) -> None:

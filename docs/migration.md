@@ -6,6 +6,20 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-15 — S3 archiver: the upload cap's default 1 → 20 MiB/s (HK20)
+
+**What changed**
+- `MULTIVENUE_S3_MAX_UPLOAD_MIBPS` defaults to 20 (was 1, HK11).
+
+**Impact**
+- Uploads run at the link's own rate (~5 MB/s here), still written in
+  64 KiB pieces; a weekday's capture takes ~20 min instead of ~1 h 45 min.
+- Measured 2026-10-15: feed delays stayed near their no-upload band
+  (risk-policy "HK20").
+
+**Migration steps**
+1. None. An `s3.env` that sets the knob keeps its own value.
+
 ## 2026-10-15 — `strategy.conf` keys `RAW_TAP`, `RAW_TAP_MODE`, `RAW_TAP_BUDGET_MB` (HK19)
 
 **What changed**

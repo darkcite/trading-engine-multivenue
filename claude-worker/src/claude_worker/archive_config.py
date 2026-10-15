@@ -92,11 +92,15 @@ DEFAULTS: typing.Final[dict[str, str]] = {
     # (Deribit's to its 65 535 ms ceiling). Measured the same day on a real
     # run, feed-delay EMAs sampled every 15 s: at 1 MiB/s they stayed in the
     # no-upload band (medians 8-118 ms, one sample over 500 ms in twenty);
-    # at 2 MiB/s six samples went over 500 ms (Deribit 2.8 s). A weekday's
-    # capture (6.0-6.4 GB stored since 2026-10-12) takes ~1 h 45 min at
-    # 1 MiB/s, inside the nightly budget (8400 s, HK18). docs/risk-policy.md
-    # "HK11", "HK18".
-    "MULTIVENUE_S3_MAX_UPLOAD_MIBPS": "1",
+    # at 2 MiB/s six samples went over 500 ms (Deribit 2.8 s). HK20
+    # (2026-10-15, the operator's 20): measured again with the paced client
+    # at 20 MiB/s, the link's own ~5 MB/s is the limit and the delays stayed
+    # at 1 MiB/s's level (one sample in eighteen over 500 ms, worst 551 ms).
+    # 2026-10-14's stall did not recur: the uncapped push's 8 MiB writes, or
+    # that hour's link. A capped upload still hands the socket 64 KiB at a
+    # time; 0 (uncapped) does not. A weekday (6.0-6.4 GB stored) takes ~20 min.
+    # docs/risk-policy.md "HK11", "HK18", "HK20".
+    "MULTIVENUE_S3_MAX_UPLOAD_MIBPS": "20",
     "MULTIVENUE_S3_SKIP_GLOBS": "",
 }
 

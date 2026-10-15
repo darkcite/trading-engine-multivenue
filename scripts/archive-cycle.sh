@@ -32,9 +32,10 @@ cd "$REPO" || exit 78
 export PATH="$REPO/target/release:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 CONF="$HOME/multivenue/retention.conf"
-# HK18: a weekday's capture is 6.0-6.4 GB stored (2026-10-12..14), ~1 h 45 min
-# at the 1 MiB/s cap. 8400 s from 04:30 local (21:30Z on this Mac) ends by
-# 23:50Z, before the 00:10Z restart slot, with room for a night's backlog.
+# HK18: a weekday's capture is 6.0-6.4 GB stored (2026-10-12..14): ~20 min at
+# the link's ~5 MB/s (the 20 MiB/s cap, HK20), ~1 h 45 min if the cap is set to
+# 1. 8400 s from 04:30 local (21:30Z on this Mac) ends by 23:50Z, before the
+# 00:10Z restart slot, so the budget is a ceiling even on a slow link.
 S3_CYCLE_BUDGET_S=8400
 ARCHIVE_MODE="compress"
 [ -f "$CONF" ] && . "$CONF"
@@ -88,10 +89,11 @@ fi
 #   * Uncapped, the push filled the uplink and the feeds' ACKs queued behind
 #     it: Deribit's delay EMA reached its 65 535 ms ceiling, MEXC 52 s, and
 #     Binance's stale ticks went from 38 k to 1.14 M — not ~200 ms.
-#   So the archiver paces every upload byte itself (objstore's token bucket,
-#   `MULTIVENUE_S3_MAX_UPLOAD_MIBPS`, default 1 MiB/s: the measured rate at
-#   which the delays stay in their no-upload band). A SIGTERM mid-push now
-#   aborts the multipart upload in flight instead of leaving its parts.
+#   So the archiver paces every upload byte itself (objstore's token bucket in
+#   64 KiB pieces, `MULTIVENUE_S3_MAX_UPLOAD_MIBPS`). HK11 set 1 MiB/s; HK20
+#   (2026-10-15, the operator's ruling) 20 MiB/s — above the link, measured
+#   with the delays near their no-upload band. A SIGTERM mid-push aborts the
+#   multipart upload in flight instead of leaving its parts.
 NET_PREFIX=""
 if [ "${S3_NICE_NETWORK:-0}" = "1" ]; then
   NET_PREFIX="taskpolicy -b"

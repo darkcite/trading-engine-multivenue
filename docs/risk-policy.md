@@ -15936,3 +15936,32 @@ repeated roll (both arms; nothing armed today).
   `parse_reject` path (a bounded write on a reject).
 - **Switched on:** `RAW_TAP=pm` in the live `strategy.conf` (backup
   `strategy.conf.bak-20261015T083817Z-hk19`), live from the 16:05Z restart.
+
+### HK20 — the upload cap raised to 20 MiB/s (operator's ruling, 2026-10-15)
+
+- **Ruling:** the operator raised the cap to 20 MiB/s.
+- **Measured before the change** (the backlog push of 2026-10-15, 08:42–08:49Z,
+  every venue's delay EMA sampled every ~15 s):
+
+  | phase | samples | > 500 ms | worst | throughput |
+  |---|---|---|---|---|
+  | no upload | 6 | 0 | 241 ms (Bybit) | — |
+  | 20 MiB/s, 240 s | 18 | 1 | 551 ms (Polymarket) | ~5 MB/s, the link's own |
+  | no upload after | 5 | 0 | 111 ms | — |
+
+  At 20 the link, not the cap, sets the rate, and the delays stayed at
+  HK11's 1 MiB/s level (one sample in eighteen over 500 ms). The 2026-10-14
+  stall (Deribit 65 535 ms) did not recur: that push wrote 8 MiB at a time
+  uncapped, through a link that hour measured worse (HK11's 2 MiB/s phase
+  already reached 2.8 s). Which of the two caused it is not separated.
+- **What changed:** `MULTIVENUE_S3_MAX_UPLOAD_MIBPS` default 1 → 20
+  (`archive_config.py`, `s3.env.example`). 20, not 0: a capped upload still
+  hands the socket 64 KiB at a time; 0 streams 8 MiB chunks. A weekday's
+  capture (6.0–6.4 GB stored) now takes ~20 min; the 8400 s budget stays as
+  a ceiling (HK18).
+- **Also proven live the same morning:** SIGTERM to a running push (the
+  08:36Z backlog push) exited 143 and left no incomplete upload (HK11's
+  handler).
+- **Watch:** the 00:30Z check-in of 2026-10-16 reads the first night at 20.
+  If the delays misbehave on the link's bad hours, lower the cap in
+  `s3.env` (no code change).
