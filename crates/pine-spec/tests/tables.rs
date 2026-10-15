@@ -10,9 +10,9 @@ mod json;
 use json::{Node, Val};
 use pine_ir::{Dialect, Qual, Ty};
 use pine_spec::{
-    entry_of, kind, lookup, lookup_parts, params, pf, rets, sx, tv, Abi, DefaultKind, Overload,
-    Scope, SigTy, StateShape, StateSpec, ValueSrc, WarmKind, BF_LOWERING, DELTAS, ENTRIES, NAMES,
-    NAMESPACES, OVERLOADS, OVERLOAD_COUNT, PARAMS, RETS, SWITCHES, VALUES,
+    derived, entry_of, kind, lookup, lookup_parts, params, pf, rets, sx, tv, Abi, DefaultKind,
+    Overload, Scope, SigTy, StateShape, StateSpec, ValueSrc, WarmKind, BF_LOWERING, DELTAS,
+    ENTRIES, NAMES, NAMESPACES, OVERLOADS, OVERLOAD_COUNT, PARAMS, RETS, SWITCHES, VALUES,
 };
 
 #[test]
@@ -192,7 +192,7 @@ fn version_masks_consistent() {
     }
 }
 
-fn default_matches(p: &pine_spec::Param) -> bool {
+fn default_matches(ov: &Overload, p: &pine_spec::Param) -> bool {
     let t = p.sig.ty.ty;
     let var = tv::whole(p.sig.tv) != 0;
     match p.default.kind {
@@ -209,6 +209,23 @@ fn default_matches(p: &pine_spec::Param) -> bool {
             !var && t == Ty::String && off + len <= NAMES.len()
         }
         DefaultKind::Value => (p.default.bits as usize) < VALUES.len(),
+        DefaultKind::Derived => {
+            let c = derived::code(p.default.bits);
+            let opts = p.flags & pf::OPTIONS != 0;
+            if (c == derived::NO_OPTIONS) != opts || !(1..=8).contains(&c) {
+                return false;
+            }
+            if c != derived::PARAM {
+                return derived::param(p.default.bits) == 0;
+            }
+            // A4.1: another row of the same overload, same type (qualifier aside).
+            let ps = params(ov);
+            let i = derived::param(p.default.bits) as usize;
+            i < ps.len() && !core::ptr::eq(&ps[i], p) && {
+                let (a, b) = (ps[i].sig, p.sig);
+                (a.ty.ty, a.ty.a, a.ty.b, a.tv) == (b.ty.ty, b.ty.a, b.ty.b, b.tv)
+            }
+        }
     }
 }
 
@@ -221,15 +238,52 @@ fn params_wellformed_in_each_dialect() {
             }
             let vis: Vec<_> = params(ov).iter().filter(|p| p.versions.has(d)).collect();
             let mut plain = false;
+            let mut optional_seen = false;
             for (i, p) in vis.iter().enumerate() {
                 let n = p.name.as_str();
+                // A4.4b (R22): no required parameter after an optional one, synthetics aside.
+                if p.flags & pf::SYNTHETIC == 0 {
+                    if p.flags & pf::OPTIONAL != 0 {
+                        optional_seen = true;
+                    } else {
+                        assert!(!optional_seen, "{n}: required after optional");
+                    }
+                }
+                // A4.4a (R21): no `na` default on a v6 bool (W13).
+                if d == Dialect::V6 && p.default.kind == DefaultKind::Na {
+                    assert!(
+                        p.sig.tv != 0 || p.sig.ty.ty != Ty::Bool,
+                        "{n}: na bool default in v6"
+                    );
+                }
                 assert!(vis[..i].iter().all(|q| q.name.as_str() != n), "{n} twice");
                 if p.flags & pf::VARIADIC != 0 {
                     assert_eq!(i + 1, vis.len(), "{n}: variadic not last");
                 }
                 let opt = p.flags & pf::OPTIONAL != 0;
                 assert_eq!(opt, p.default.kind != DefaultKind::None, "{n}");
-                assert!(default_matches(p), "{n}");
+                assert!(default_matches(ov, p), "{n}");
+                if p.flags & pf::OPTIONS != 0 {
+                    // A4.3 / A4.4d: a const element type, or a type variable bound to enums
+                    // only; only on input.*.
+                    assert_eq!(
+                        entry_of(ov).ns.as_str(),
+                        "input",
+                        "{n}: options outside input.*"
+                    );
+                    assert_eq!(p.sig.ty.qual, Qual::Const, "{n}");
+                    let scalar = p.sig.tv == 0
+                        && matches!(
+                            p.sig.ty.ty,
+                            Ty::Int | Ty::Float | Ty::Bool | Ty::Color | Ty::String
+                        );
+                    let w = tv::whole(p.sig.tv);
+                    let enum_var = p.sig.ty.ty == Ty::Void
+                        && w != 0
+                        && p.sig.tv == w
+                        && ov.tv_kinds[w as usize - 1] == kind::ENUM;
+                    assert!(scalar || enum_var, "{n}: options of a non-element type");
+                }
                 let synth = p.flags & pf::SYNTHETIC != 0;
                 assert_eq!(synth, n.starts_with("__"), "{n}");
                 if synth {
@@ -254,7 +308,7 @@ fn decodes(s: &SigTy, ov: &Overload) -> bool {
     let ok_vars = declared(w) && declared(a) && declared(b) && not_coll(a) && not_coll(b);
     let shape = match s.ty.ty {
         Ty::Void => (w != 0 || (a == 0 && b == 0)) && s.ty.a == 0 && s.ty.b == 0,
-        Ty::Int | Ty::Float | Ty::Bool | Ty::Color | Ty::String => {
+        Ty::Int | Ty::Float | Ty::Bool | Ty::Color | Ty::String | Ty::Plot | Ty::Hline => {
             w == 0 && a == 0 && b == 0 && s.ty.a == 0 && s.ty.b == 0
         }
         Ty::Array | Ty::Matrix => w == 0 && b == 0 && (a != 0) == (s.ty.a == 0) && s.ty.b == 0,
@@ -578,5 +632,33 @@ fn synthetic_families_lead_with_their_parameters() {
             lookup_parts(ns, name).is_some(),
             "{ns}.{name} missing while {ns:?} is authored"
         );
+    }
+}
+
+#[test]
+fn overloads_unambiguous() {
+    // A4.4c (R23): one entry's overloads differ positionally (synthetics dropped) per dialect.
+    for e in ENTRIES.iter() {
+        let ovs = e.overloads();
+        for d in [Dialect::V5, Dialect::V6] {
+            let sigs: Vec<Vec<SigTy>> = ovs
+                .iter()
+                .filter(|o| o.versions.has(d))
+                .map(|o| {
+                    params(o)
+                        .iter()
+                        .filter(|p| p.versions.has(d) && p.flags & pf::SYNTHETIC == 0)
+                        .map(|p| p.sig)
+                        .collect()
+                })
+                .collect();
+            for (j, s) in sigs.iter().enumerate() {
+                assert!(
+                    !sigs[..j].contains(s),
+                    "{} ambiguous in {d:?}",
+                    e.full.as_str()
+                );
+            }
+        }
     }
 }

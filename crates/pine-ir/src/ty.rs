@@ -31,6 +31,12 @@ pub enum Ty {
     Udt = 9,
     /// An enum (v6) — i64 lane, the member ordinal.
     Enum = 10,
+    /// A `plot` handle (what `plot()` returns, `fill()` takes) — i64 lane, the plot ordinal
+    /// (amendment A4.2).
+    Plot = 11,
+    /// An `hline` handle (what `hline()` returns, `fill()` takes) — i64 lane, the hline ordinal
+    /// (amendment A4.2).
+    Hline = 12,
 }
 
 impl Ty {
@@ -50,6 +56,8 @@ impl Ty {
             8 => Some(Self::Matrix),
             9 => Some(Self::Udt),
             10 => Some(Self::Enum),
+            11 => Some(Self::Plot),
+            12 => Some(Self::Hline),
             _ => None,
         }
     }
@@ -115,28 +123,52 @@ impl TypeQ {
     #[inline]
     #[must_use]
     pub const fn scalar(ty: Ty, qual: Qual) -> Self {
-        Self { ty, qual, a: 0, b: 0, _pad: 0 }
+        Self {
+            ty,
+            qual,
+            a: 0,
+            b: 0,
+            _pad: 0,
+        }
     }
 
     /// `array<elem>`; `elem` is an [`elem`]-encoded element.
     #[inline]
     #[must_use]
     pub const fn array(elem: u16, qual: Qual) -> Self {
-        Self { ty: Ty::Array, qual, a: elem, b: 0, _pad: 0 }
+        Self {
+            ty: Ty::Array,
+            qual,
+            a: elem,
+            b: 0,
+            _pad: 0,
+        }
     }
 
     /// `map<key, value>`; both [`elem`]-encoded.
     #[inline]
     #[must_use]
     pub const fn map(key: u16, value: u16, qual: Qual) -> Self {
-        Self { ty: Ty::Map, qual, a: key, b: value, _pad: 0 }
+        Self {
+            ty: Ty::Map,
+            qual,
+            a: key,
+            b: value,
+            _pad: 0,
+        }
     }
 
     /// The same type with a different qualifier.
     #[inline]
     #[must_use]
     pub const fn with_qual(self, qual: Qual) -> Self {
-        Self { ty: self.ty, qual, a: self.a, b: self.b, _pad: 0 }
+        Self {
+            ty: self.ty,
+            qual,
+            a: self.a,
+            b: self.b,
+            _pad: 0,
+        }
     }
 }
 

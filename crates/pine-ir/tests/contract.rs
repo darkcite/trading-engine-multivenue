@@ -42,7 +42,11 @@ fn canonical_symbol_keys_are_recognised() {
         b"polymarket:1234567890",
         b"hyperliquid:kpepe",
     ] {
-        assert!(is_canonical_symbol_key(ok), "{:?}", core::str::from_utf8(ok));
+        assert!(
+            is_canonical_symbol_key(ok),
+            "{:?}",
+            core::str::from_utf8(ok)
+        );
     }
     for bad in [
         &b""[..],
@@ -57,7 +61,11 @@ fn canonical_symbol_keys_are_recognised() {
         b"1binance:btcusdt",
         b"binance:-btc",
     ] {
-        assert!(!is_canonical_symbol_key(bad), "{:?}", core::str::from_utf8(bad));
+        assert!(
+            !is_canonical_symbol_key(bad),
+            "{:?}",
+            core::str::from_utf8(bad)
+        );
     }
     let long = [b'a'; SYMBOL_KEY_MAX_LEN + 1];
     assert!(!is_canonical_symbol_key(&long));
@@ -140,9 +148,15 @@ fn strref_round_trips_every_region() {
     let k = StrRef::konst(12, 5);
     assert_eq!((k.region(), k.off(), k.len()), (str_region::CONST, 12, 5));
     let s = StrRef::scratch(StrRef::MAX_OFF, u32::MAX);
-    assert_eq!((s.region(), s.off(), s.len()), (str_region::SCRATCH, StrRef::MAX_OFF, u32::MAX));
+    assert_eq!(
+        (s.region(), s.off(), s.len()),
+        (str_region::SCRATCH, StrRef::MAX_OFF, u32::MAX)
+    );
     let p = StrRef::persist(4096, 0);
-    assert_eq!((p.region(), p.off(), p.len()), (str_region::PERSIST, 4096, 0));
+    assert_eq!(
+        (p.region(), p.off(), p.len()),
+        (str_region::PERSIST, 4096, 0)
+    );
     assert!(p.is_empty());
     assert!(k.is_valid_encoding() && s.is_valid_encoding() && p.is_valid_encoding());
     assert!(!StrRef(NA_I64 as u64).is_valid_encoding());
@@ -156,7 +170,11 @@ fn collref_round_trips_and_never_decodes_na() {
     assert!(r.is_valid_encoding());
     assert!(!CollRef(NA_I64 as u64).is_valid_encoding());
     assert!(!CollRef(0).is_valid_encoding(), "gen 0 is never live");
-    assert_eq!(CollRef::next_gen(CollRef::GEN_MASK), 1, "31-bit wrap skips 0");
+    assert_eq!(
+        CollRef::next_gen(CollRef::GEN_MASK),
+        1,
+        "31-bit wrap skips 0"
+    );
     assert_eq!(CollRef::next_gen(1), 2);
 }
 
@@ -164,8 +182,15 @@ fn collref_round_trips_and_never_decodes_na() {
 fn colour_packing_is_bgr_plus_transparency() {
     let c = color::pack(0x12, 0x34, 0x56, 80);
     assert_eq!(c, 0x5012_3456);
-    assert_eq!((color::r(c), color::g(c), color::b(c), color::t(c)), (0x12, 0x34, 0x56, 80));
-    assert_eq!(color::t(color::pack(0, 0, 0, 250)), 100, "transparency clamps to 100");
+    assert_eq!(
+        (color::r(c), color::g(c), color::b(c), color::t(c)),
+        (0x12, 0x34, 0x56, 80)
+    );
+    assert_eq!(
+        color::t(color::pack(0, 0, 0, 250)),
+        100,
+        "transparency clamps to 100"
+    );
 }
 
 #[test]
@@ -174,11 +199,27 @@ fn elem_encoding_separates_scalars_enums_and_udts() {
     assert_eq!(elem::as_scalar(elem::enumeration(3)), None);
     assert_eq!(elem::as_scalar(elem::udt(3)), None);
     assert_ne!(elem::enumeration(3), elem::udt(3));
-    let t = TypeQ::map(elem::scalar(Ty::String), elem::scalar(Ty::Int), Qual::Series);
+    let t = TypeQ::map(
+        elem::scalar(Ty::String),
+        elem::scalar(Ty::Int),
+        Qual::Series,
+    );
     assert_eq!(t.ty, Ty::Map);
     assert_eq!(elem::as_scalar(t.a), Some(Ty::String));
     assert_eq!(elem::as_scalar(t.b), Some(Ty::Int));
     assert!(Qual::Const < Qual::Input && Qual::Input < Qual::Simple && Qual::Simple < Qual::Series);
+}
+
+#[test]
+fn plot_and_hline_handles_are_frozen() {
+    // Amendment A4.2: two i64-lane handle types after `Enum`; 13.. stay unassigned.
+    assert_eq!((Ty::Plot as u8, Ty::Hline as u8), (11, 12));
+    assert_eq!(Ty::from_u8(11), Some(Ty::Plot));
+    assert_eq!(Ty::from_u8(12), Some(Ty::Hline));
+    assert_eq!(Ty::from_u8(13), None);
+    assert_eq!(Ty::Plot.lane(), Some(Lane::I64));
+    assert_eq!(Ty::Hline.lane(), Some(Lane::I64));
+    assert_eq!(elem::as_scalar(elem::scalar(Ty::Hline)), Some(Ty::Hline));
 }
 
 // ---------------------------------------------------------------- diagnostics
@@ -213,14 +254,23 @@ fn opcode_table_defines_exactly_the_v4_set() {
     // 4 control + 16 f64 + 16 i64 + 12 compare + 8 na + 2 history
     // + 7 flow + 1 builtin + 5 object + 1 string.
     assert_eq!(n, 72);
-    for retired in [0x3Cu8, 0x3D, 0x52, 0x53, 0x54, 0x85, 0x98, 0x9A, 0x9F, 0xA0, 0xA1, 0xB0, 0xC0, 0xC6] {
+    for retired in [
+        0x3Cu8, 0x3D, 0x52, 0x53, 0x54, 0x85, 0x98, 0x9A, 0x9F, 0xA0, 0xA1, 0xB0, 0xC0, 0xC6,
+    ] {
         assert!(!pine_ir::op::defined(retired), "{retired:#04x} is retired");
     }
-    assert_eq!(Insn::new(pine_ir::op::JMP, 0, 0x0001, 0x0002, 0).target(), 0x0001_0002);
+    assert_eq!(
+        Insn::new(pine_ir::op::JMP, 0, 0x0001, 0x0002, 0).target(),
+        0x0001_0002
+    );
     assert_eq!(argwin::slot(argwin::i64(513)), 513);
     assert!(argwin::is_i64(argwin::i64(0)));
     assert!(!argwin::is_i64(argwin::f64(0x7FFF)));
-    assert_eq!(argwin::f64(0x8001), 1, "an f64 entry can never carry the lane bit");
+    assert_eq!(
+        argwin::f64(0x8001),
+        1,
+        "an f64 entry can never carry the lane bit"
+    );
     assert_eq!(abi::RESERVED_F, 5);
     assert_eq!(abi::RESERVED_I, 10);
 }
@@ -263,7 +313,10 @@ fn money_renders_like_the_fill_ledger() {
     assert_eq!(scale::e12_to_1e6_ceil(3_000_000), 3);
     assert_eq!(scale::e12_to_1e6_floor(i128::MAX), i64::MAX);
     assert_eq!(scale::e12_to_1e6_ceil(i128::MIN), i64::MIN);
-    assert_eq!(scale::notional_1e12(100_000_000_000, 2_500_000), 250_000_000_000_000_000);
+    assert_eq!(
+        scale::notional_1e12(100_000_000_000, 2_500_000),
+        250_000_000_000_000_000
+    );
     assert_eq!(scale::usd_1e6_to_1e12(2_000_000), 2_000_000_000_000);
     assert_eq!(scale::ms_from_ns(-1), -1, "floor, not truncation");
     assert_eq!(scale::ms_from_ns(1_999_999), 1);

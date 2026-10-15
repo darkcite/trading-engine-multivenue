@@ -22,9 +22,9 @@ mod model;
 pub use bf_lowering::BF_LOWERING;
 pub use lookup::{is_namespace, lookup, lookup_parts};
 pub use model::{
-    coverage, entry_of, kind, overload, param_index, params, pf, rets, sx, tv, Abi, Coverage,
-    DefaultKind, DefaultVal, Delta, DeltaMech, Entry, Fold, NaPolicy, Overload, Param, RetQual,
-    Scope, SigTy, SpecStr, StateShape, StateSpec, SwMech, Switch, Tier, Value, ValueSrc,
+    coverage, derived, entry_of, kind, overload, param_index, params, pf, rets, sx, tv, Abi,
+    Coverage, DefaultKind, DefaultVal, Delta, DeltaMech, Entry, Fold, NaPolicy, Overload, Param,
+    RetQual, Scope, SigTy, SpecStr, StateShape, StateSpec, SwMech, Switch, Tier, Value, ValueSrc,
     VersionMask, WarmKind, Warmup,
 };
 

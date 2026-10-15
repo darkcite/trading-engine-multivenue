@@ -159,12 +159,13 @@ pub mod kind {
     /// Any collection — whole-value positions only (R6).
     pub const COLL: u8 = 1 << 7;
 
-    /// The kind bit of a concrete type (0 for `Void`).
+    /// The kind bit of a concrete type (0 for `Void` and for the `plot` / `hline` handles, which
+    /// no type variable binds).
     #[inline]
     #[must_use]
     pub const fn of(ty: Ty) -> u8 {
         match ty {
-            Ty::Void => 0,
+            Ty::Void | Ty::Plot | Ty::Hline => 0,
             Ty::Int => INT,
             Ty::Float => FLOAT,
             Ty::Bool => BOOL,
@@ -206,6 +207,10 @@ pub mod pf {
     /// A synthetic parameter (impl-04 §3.4): a leading, required `const int` named `__…` that sema
     /// fills with a compile-time constant; never bound to a user argument (§3.8, R5).
     pub const SYNTHETIC: u8 = 1 << 5;
+    /// An `options` parameter (amendment A4.3): its type is the element type at `const`, and
+    /// the argument is a bracketed tuple of `const` values of that type (`options=[1, 2, 3]`).
+    /// Only on `input.*` overloads; its default is [`crate::derived::NO_OPTIONS`] (R5, R9, R18).
+    pub const OPTIONS: u8 = 1 << 6;
 }
 
 /// Discriminant of a [`DefaultVal`].
@@ -228,6 +233,45 @@ pub enum DefaultKind {
     Value = 6,
     /// The literal `na`.
     Na = 7,
+    /// A default the reference states as a rule, not a literal (amendment A4.1); `bits` = a
+    /// [`derived`] code in the low byte and, for [`derived::PARAM`], the referenced parameter's
+    /// index among the overload's parameter rows in bits 8..16. Sema resolves it.
+    Derived = 8,
+}
+
+/// [`DefaultKind::Derived`] codes (amendment A4.1). JSON `{"k": "derived", "src": "<code>"}`.
+pub mod derived {
+    /// `decl_format`: the `format` set on `indicator()` / `strategy()`.
+    pub const DECL_FORMAT: u8 = 1;
+    /// `decl_precision`: the `precision` set there.
+    pub const DECL_PRECISION: u8 = 2;
+    /// `param:<name>`: the value of another parameter of the same overload (`shorttitle` ←
+    /// `title`); its row index is in bits 8..16 of `DefaultVal::bits`.
+    pub const PARAM: u8 = 3;
+    /// `sym_precision`: inherited from the chart symbol's mintick.
+    pub const SYM_PRECISION: u8 = 4;
+    /// `chart_bar_count`: the number of chart bars.
+    pub const CHART_BAR_COUNT: u8 = 5;
+    /// `timeframe_change`: as if `timeframe.change()` were passed (`ta.vwap`'s anchor).
+    pub const TIMEFRAME_CHANGE: u8 = 6;
+    /// `source_length`: the length of parameter 0 (`str.substring`'s `end_pos`).
+    pub const SOURCE_LENGTH: u8 = 7;
+    /// `no_options`: an `options` parameter left out — no restriction.
+    pub const NO_OPTIONS: u8 = 8;
+
+    /// The code of a [`super::DefaultKind::Derived`] payload.
+    #[inline]
+    #[must_use]
+    pub const fn code(bits: u64) -> u8 {
+        bits as u8
+    }
+
+    /// The parameter row index of a [`PARAM`] payload.
+    #[inline]
+    #[must_use]
+    pub const fn param(bits: u64) -> u8 {
+        (bits >> 8) as u8
+    }
 }
 
 /// A parameter default: a Pine-level literal, never fixed point.

@@ -4,11 +4,34 @@
 //! COPY-DOCTRINE: build script — runs once in cargo's build step and is linked into no binary;
 //! every copy here is cold.
 //!
-//! Rules R1–R20 over the lowered model (impl-00 §4.6). Rules whose input only exists in the
-//! JSON (R2, R6, R8, R9, R13, R20 and the resolution halves of R3, R7, R17) are refused during
-//! lowering (`build/schema.rs`) with the same `R<nn>` prefix; this pass checks the rest.
+//! Rules R1–R23 over the lowered model (impl-00 §4.6, amendment A4). Rules whose input only
+//! exists in the JSON (R2, R6, R8, R9, R13, R20 and the resolution halves of R3, R7, R17) are
+//! refused during lowering (`build/schema.rs`) with the same `R<nn>` prefix; this pass checks
+//! the rest.
+//!
+//! Amendment A4.4 (lead rulings 2026-10-15) adds:
+//! - **R21** default/type: a `value` default names a row whose type equals the parameter's
+//!   (qualifier aside; never on a type variable); `na` only where the type admits it in every
+//!   dialect of the row (W13: no `bool` `na` in v6); a `derived` default's code yields the
+//!   parameter's type (`decl_format` string; `decl_precision`, `sym_precision`,
+//!   `chart_bar_count`, `source_length` int; `timeframe_change` bool). Literal kinds against
+//!   the type stay R9 (lowering).
+//! - **R22** order: in each dialect, no required parameter after an optional one (synthetic
+//!   leading parameters are outside the comparison, §3.8).
+//! - **R23** ambiguity: no two overloads of one entry share a dialect in which their positional
+//!   parameter lists (synthetics dropped; type, element codes, type variables and qualifier)
+//!   are identical.
+//! - **A4.4d**: an `options` parameter (R5) may also be a whole-value type variable whose only
+//!   kind is `enum` (`input.enum`).
 
-use crate::schema::{fail, DefVal, Model, SpecErr, BF_LOWERING, SX_NAMES};
+use crate::schema::{
+    fail, DefVal, MOverload, MParam, Model, SpecErr, BF_LOWERING, DERIVED_NO_OPTIONS, PF_OPTIONS,
+    SX_NAMES,
+};
+use pine_ir::Ty;
+
+/// `kind::ENUM`.
+const KIND_ENUM: u8 = 1 << 5;
 
 const PF_OPTIONAL: u8 = 1 << 0;
 const PF_VARIADIC: u8 = 1 << 1;
@@ -36,6 +59,7 @@ pub fn check(m: &Model) -> Result<(), SpecErr> {
     ascii(m)?;
     entries(m)?;
     overloads(m)?;
+    ambiguity(m)?;
     values(m)?;
     switches(m)?;
     deltas(m)
@@ -216,6 +240,60 @@ fn overloads(m: &Model) -> Result<(), SpecErr> {
                 }
             }
         }
+        // A4.3: `options` parameters (R5 shape, R18 namespace, R9 default).
+        let ns = &m.entries[o.entry as usize].ns;
+        for p in ps {
+            let opts = p.flags & PF_OPTIONS != 0;
+            let no_opts = p.default == DefVal::Derived(DERIVED_NO_OPTIONS, 0);
+            if opts {
+                let scalar = matches!(
+                    p.sig.ty.ty,
+                    pine_ir::Ty::Int
+                        | pine_ir::Ty::Float
+                        | pine_ir::Ty::Bool
+                        | pine_ir::Ty::Color
+                        | pine_ir::Ty::String
+                );
+                // A4.4d: or a whole-value type variable bound to enums only (`input.enum`).
+                let w = p.sig.tv & 3;
+                let enum_var = p.sig.ty.ty == Ty::Void
+                    && p.sig.tv == w
+                    && w != 0
+                    && o.tv_kinds[w as usize - 1] == KIND_ENUM;
+                let elem = (p.sig.tv == 0 && scalar) || enum_var;
+                if p.sig.ty.qual != pine_ir::Qual::Const || !elem {
+                    return fail(
+                        p.off,
+                        5,
+                        format!(
+                            "{}: options \"{}\" is not a const element type",
+                            o.sym, p.name
+                        ),
+                    );
+                }
+                if ns != "input" {
+                    return fail(
+                        p.off,
+                        18,
+                        format!("{}: options parameter outside input.*", o.sym),
+                    );
+                }
+                if !no_opts {
+                    return fail(p.off, 9, format!("{}: options \"{}\" default is not derived no_options (a tuple-literal default has no A4 encoding)", o.sym, p.name));
+                }
+            } else if no_opts {
+                return fail(
+                    p.off,
+                    9,
+                    format!(
+                        "{}: no_options default on a non-options parameter \"{}\"",
+                        o.sym, p.name
+                    ),
+                );
+            }
+        }
+        default_types(m, o, ps)?;
+        order(o, ps)?;
         // R7.
         let stateful = o.bf & bf("stateful") != 0;
         let coll = o.bf & bf("collection") != 0;
@@ -265,7 +343,6 @@ fn overloads(m: &Model) -> Result<(), SpecErr> {
         if o.plot.is_some() && o.bf & bf("capture") == 0 {
             return fail(o.off, 18, format!("{}: plot kind without capture", o.sym));
         }
-        let ns = &m.entries[o.entry as usize].ns;
         if o.bf & bf("intent") != 0 && ns != "strategy" && !ns.starts_with("strategy.") {
             return fail(
                 o.off,
@@ -397,6 +474,103 @@ fn deltas(m: &Model) -> Result<(), SpecErr> {
                     16,
                     format!("delta \"{}\": subject \"{s}\" names no entry", d.id),
                 );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// R21: a default has its parameter's type.
+fn default_types(m: &Model, o: &MOverload, ps: &[MParam]) -> Result<(), SpecErr> {
+    for p in ps {
+        let t = p.sig.ty;
+        let var = p.sig.tv != 0;
+        let bad = match p.default {
+            DefVal::Value(i) => {
+                let v = m.values[i as usize].ty;
+                var || (v.ty, v.a, v.b) != (t.ty, t.a, t.b)
+            }
+            DefVal::Na => !var && t.ty == Ty::Bool && p.versions & 2 != 0,
+            DefVal::Derived(c, _) => {
+                let want = match c {
+                    1 => Some(Ty::String),
+                    2 | 4 | 5 | 7 => Some(Ty::Int),
+                    6 => Some(Ty::Bool),
+                    _ => None, // `param:` is R9's (same type); `no_options` is the options rule's
+                };
+                want.is_some_and(|w| var || t.ty != w)
+            }
+            _ => false,
+        };
+        if bad {
+            return fail(
+                p.off,
+                21,
+                format!("{}: default of \"{}\" is not of its type", o.sym, p.name),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// R22: in each dialect, no required parameter after an optional one (synthetics excluded).
+fn order(o: &MOverload, ps: &[MParam]) -> Result<(), SpecErr> {
+    for d in [1u8, 2u8] {
+        if o.versions & d == 0 {
+            continue;
+        }
+        let mut optional_seen = false;
+        for p in ps
+            .iter()
+            .filter(|p| p.versions & d != 0 && p.flags & PF_SYNTHETIC == 0)
+        {
+            if p.flags & PF_OPTIONAL != 0 {
+                optional_seen = true;
+            } else if optional_seen {
+                return fail(
+                    p.off,
+                    22,
+                    format!(
+                        "{}: required \"{}\" after an optional parameter",
+                        o.sym, p.name
+                    ),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The positional signature of `o` in dialect `d`: synthetics dropped.
+fn positional(m: &Model, o: &MOverload, d: u8) -> Vec<(pine_ir::TypeQ, u8)> {
+    m.params[o.p_lo as usize..o.p_hi as usize]
+        .iter()
+        .filter(|p| p.versions & d != 0 && p.flags & PF_SYNTHETIC == 0)
+        .map(|p| (p.sig.ty, p.sig.tv))
+        .collect()
+}
+
+/// R23: no two overloads of one entry with identical positional lists in a shared dialect.
+fn ambiguity(m: &Model) -> Result<(), SpecErr> {
+    for e in &m.entries {
+        let ovs = &m.overloads[e.ov_lo as usize..e.ov_hi as usize];
+        for (j, b) in ovs.iter().enumerate() {
+            for a in &ovs[..j] {
+                for d in [1u8, 2u8] {
+                    if a.versions & b.versions & d != 0
+                        && positional(m, a, d) == positional(m, b, d)
+                    {
+                        let v = if d == 1 { 5 } else { 6 };
+                        return fail(
+                            b.off,
+                            23,
+                            format!(
+                                "{} and {} have one positional signature in v{v}",
+                                a.sym, b.sym
+                            ),
+                        );
+                    }
+                }
             }
         }
     }

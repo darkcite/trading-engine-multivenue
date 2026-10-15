@@ -62,6 +62,23 @@ pub const PF_NAMES: [&str; 6] = [
     "tuple_ok",
     "synthetic",
 ];
+/// `pf::OPTIONS` (amendment A4.3): set by the parameter key `"options": true`.
+pub const PF_OPTIONS: u8 = 1 << 6;
+/// `derived` codes 1..=8 by name (`src/model.rs` `derived`); code 3 is spelled `param:<name>`.
+pub const DERIVED_NAMES: [&str; 8] = [
+    "decl_format",
+    "decl_precision",
+    "param:",
+    "sym_precision",
+    "chart_bar_count",
+    "timeframe_change",
+    "source_length",
+    "no_options",
+];
+/// `derived::PARAM`.
+pub const DERIVED_PARAM: u8 = 3;
+/// `derived::NO_OPTIONS`.
+pub const DERIVED_NO_OPTIONS: u8 = 8;
 /// `kind` names in bit order (`src/model.rs` `kind`).
 pub const KIND_NAMES: [&str; 8] = [
     "int", "float", "bool", "color", "string", "enum", "udt", "coll",
@@ -150,6 +167,9 @@ pub enum DefVal {
     Value(u16),
     /// `na`.
     Na,
+    /// A derived default (amendment A4.1): `(code, parameter row index)`; the index is
+    /// meaningful for `param:` only.
+    Derived(u8, u8),
 }
 
 /// One parameter row.
@@ -586,6 +606,8 @@ fn scalar(s: &str) -> Option<Ty> {
         "bool" => Ty::Bool,
         "color" => Ty::Color,
         "string" => Ty::String,
+        "plot" => Ty::Plot,
+        "hline" => Ty::Hline,
         _ => return None,
     })
 }
@@ -1136,8 +1158,9 @@ fn lower_overload(
     if pn.len() > 255 {
         return fail(o.off, 13, "more than 255 parameters on one overload");
     }
+    let mut pending: Vec<(usize, String, u32)> = Vec::new();
     for p in pn {
-        let po = Obj::of(p, "param", &PARAM_KEYS, &["versions"])?;
+        let po = Obj::of(p, "param", &PARAM_KEYS, &["versions", "options"])?;
         let name = po.str("name")?;
         if !is_ident(name) {
             return fail(
@@ -1152,8 +1175,18 @@ fn lower_overload(
         };
         let q = qual(po.get("qual"), "qual")?;
         let s = sig(po.get("ty"), q, &tvk)?;
-        let flags = bits(po.get("flags"), "flags", &PF_NAMES)?;
-        let default = lower_default(po.get("default"), s, pv, fulls, val_ranges, &m.values)?;
+        let mut flags = bits(po.get("flags"), "flags", &PF_NAMES)?;
+        if let Some(on) = po.opt("options") {
+            match on.v {
+                Val::Bool(true) => flags |= PF_OPTIONS,
+                _ => return fail(on.off, 2, "\"options\": expected true"),
+            }
+        }
+        let dn = po.get("default");
+        let default = lower_default(dn, s, pv, fulls, val_ranges, &m.values)?;
+        if let Some(target) = derived_param(dn)? {
+            pending.push((m.params.len(), target, dn.off));
+        }
         m.params.push(MParam {
             off: po.off,
             name: name.to_string(),
@@ -1164,6 +1197,7 @@ fn lower_overload(
         });
     }
     let p_hi = m.params.len();
+    resolve_derived(&mut m.params[p_lo..p_hi], p_lo, &pending)?;
 
     // Results.
     let rq = pick(o.get("ret_qual"), "ret_qual", &RQ)?;
@@ -1261,6 +1295,25 @@ fn lower_default(
     if kind == "na" {
         Obj::of(n, "default", &["k"], &[])?;
         return Ok(DefVal::Na);
+    }
+    if kind == "derived" {
+        let o = Obj::of(n, "default", &["k", "src"], &[])?;
+        let src = o.str("src")?;
+        let code = if src.starts_with("param:") {
+            DERIVED_PARAM
+        } else {
+            match DERIVED_NAMES.iter().position(|d| *d == src) {
+                Some(i) => i as u8 + 1,
+                None => {
+                    return fail(
+                        o.get("src").off,
+                        9,
+                        format!("unknown derived default \"{src}\""),
+                    )
+                }
+            }
+        };
+        return Ok(DefVal::Derived(code, 0));
     }
     let o = Obj::of(n, "default", &["k", "v"], &[])?;
     let v = o.get("v");
@@ -1478,4 +1531,55 @@ fn lower_warm(n: &Node<'_>, params: &[MParam]) -> Result<MWarm, SpecErr> {
         }
         _ => fail(n.off, 2, format!("warmup kind \"{k}\" unknown")),
     }
+}
+
+/// The parameter a `{"k": "derived", "src": "param:<name>"}` default names, if it is one.
+fn derived_param(n: &Node<'_>) -> Result<Option<String>, SpecErr> {
+    let f = match &n.v {
+        Val::Obj(f) => f,
+        _ => return Ok(None),
+    };
+    let src = f.iter().find(|(k, _)| k == "src").map(|(_, v)| v);
+    match src {
+        Some(v) => Ok(as_str(v, "src")?.strip_prefix("param:").map(str::to_string)),
+        None => Ok(None),
+    }
+}
+
+/// Resolve `param:<name>` defaults against the overload's rows `ps` (which start at absolute
+/// row `p_lo`): another row of that name, visible in every dialect of the referring row, of the
+/// same type (qualifier aside) — R9.
+fn resolve_derived(
+    ps: &mut [MParam],
+    p_lo: usize,
+    pending: &[(usize, String, u32)],
+) -> Result<(), SpecErr> {
+    for (abs, name, off) in pending {
+        let me = abs - p_lo;
+        let hit = ps.iter().enumerate().position(|(i, q)| {
+            i != me && q.name == *name && q.versions & ps[me].versions == ps[me].versions
+        });
+        let i = match hit {
+            Some(i) => i,
+            None => {
+                return fail(
+                    *off,
+                    9,
+                    format!("derived param:{name} names no parameter row"),
+                )
+            }
+        };
+        let (a, b) = (ps[i].sig, ps[me].sig);
+        if a.ty.ty != b.ty.ty || a.ty.a != b.ty.a || a.ty.b != b.ty.b || a.tv != b.tv {
+            return fail(
+                *off,
+                9,
+                format!("derived param:{name} has an incompatible type"),
+            );
+        }
+        if let DefVal::Derived(c, _) = ps[me].default {
+            ps[me].default = DefVal::Derived(c, i as u8);
+        }
+    }
+    Ok(())
 }

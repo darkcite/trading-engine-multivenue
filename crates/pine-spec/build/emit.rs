@@ -136,6 +136,7 @@ pub fn spec(m: &Model, mph: &Mph, sha: &[u8; 32]) -> String {
                     DefVal::Str(s) => ("Str", packed(nm.span(s))),
                     DefVal::Value(v) => ("Value", *v as u64),
                     DefVal::Na => ("Na", 0),
+                    DefVal::Derived(c, i) => ("Derived", *c as u64 | (*i as u64) << 8),
                 };
                 let _ = writeln!(
                     prm,
