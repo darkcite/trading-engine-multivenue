@@ -413,6 +413,42 @@ def channel_event_array(path: pathlib.Path) -> numpy.ndarray:
     return numpy.memmap(path, dtype=CHANNEL_EVENT_DT, mode="r", offset=HEADER_SIZE, shape=(n,))
 
 
+#: HYPARB G1: the Tick slot as a numpy dtype (``_TICK``, field for field:
+#: ``seq`` = ``venue_seq``, ``bq``/``aq`` the touch quantities, ``vt`` =
+#: ``venue_time_ms``) — a multi-hour tick file scanned as one memory map.
+#: ``flags`` is meaningful only when the file ``has_venue_time`` (v3+).
+TICK_DT: numpy.dtype = numpy.dtype(
+    [
+        ("ts", "<u8"),
+        ("sym", "<u4"),
+        ("seq", "<u4"),
+        ("bid", "<i8"),
+        ("bq", "<i8"),
+        ("ask", "<i8"),
+        ("aq", "<i8"),
+        ("venue", "u1"),
+        ("flags", "u1"),
+        ("pad", "V6"),
+        ("vt", "<u8"),
+    ]
+)
+assert TICK_DT.itemsize == SLOT_SIZE
+
+
+def tick_array(path: pathlib.Path) -> numpy.ndarray:
+    """HYPARB G1: the file's whole Tick slots as a read-only memory map
+    (``TICK_DT``), after the house reader has checked the header — a trailing
+    partial slot is left out, as [`Reader.torn`] says. Raises [`PmlrError`]
+    for any other slot kind."""
+    with Reader(path) as reader:
+        if reader.slot_kind != SLOT_KIND_TICK:
+            raise PmlrError(f"{path}: slot kind {reader.slot_kind}, not a Tick file")
+        n = len(reader)
+    if n == 0:
+        return numpy.zeros(0, dtype=TICK_DT)
+    return numpy.memmap(path, dtype=TICK_DT, mode="r", offset=HEADER_SIZE, shape=(n,))
+
+
 # ---------------------------------------------------------------------------
 # WS11 (D5 fold-in): the kind-6 OptSummary decode + the run anchor —
 # both previously private to iv_digest.py (and the anchor duplicated

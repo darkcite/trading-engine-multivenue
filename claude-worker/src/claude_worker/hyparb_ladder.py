@@ -54,6 +54,17 @@ _COUNTERS_PREFIX = "member: hyparb pool_events="
 _INT_FIELDS = ("arbs", "side_buy", "side_sell", "size_capped", "hedges_perp", "hedges_spot",
                "hedges_missed", "amm_judged_fills", "amm_canceled")
 _USD_FIELDS = ("gas_usd", "pnl_predicted_usd", "funding_earned_usd")
+#: Dollar fields a binary may not print (HYPARB G1 added the member's own
+#: session level). ABSENT stays absent — in a rung's row and in the merge —
+#: never a 0 that reads as a level the replay measured.
+_OPTIONAL_USD_FIELDS = ("pnl_session_usd",)
+
+#: Every rung replays the PAPER member (HYPARB G1, 2026-10-15). The
+#: harness boots without ``--evm-testnet``, and a ``mode = "testnet"``
+#: artifact refuses there (O-H5: both switches or neither) — so the live
+#: artifact never replayed at all. The testnet shadow is an exec battery,
+#: never a P&L term: the member a replay drives is the same either way.
+REPLAY_MODE: dict[str, str] = {"mode": '"paper"'}
 
 
 class LadderError(Exception):
@@ -75,6 +86,12 @@ def rung_artifact(text: str, overrides: dict[str, str]) -> str:
     return out
 
 
+def replay_artifact(text: str, overrides: dict[str, str]) -> str:
+    """A rung's artifact as the harness can boot it: ``overrides`` plus
+    :data:`REPLAY_MODE`."""
+    return rung_artifact(text, {**REPLAY_MODE, **overrides})
+
+
 def _parse_counters(stderr: str) -> dict[str, object]:
     for line in stderr.splitlines():
         if line.startswith(_COUNTERS_PREFIX):
@@ -85,6 +102,9 @@ def _parse_counters(stderr: str) -> dict[str, object]:
                 row[k] = int(fields.get(k, "0"))
             for k in _USD_FIELDS:
                 row[k] = float(fields.get(k, "0"))
+            for k in _OPTIONAL_USD_FIELDS:
+                if k in fields:
+                    row[k] = float(fields[k])
             return row
     raise ValueError("no `member: hyparb` counters line on stderr")
 
@@ -94,10 +114,12 @@ def run_rung(
     artifact: pathlib.Path,
     fee_flags: list[str],
     run_fn: RunFn,
+    extra_argv: typing.Sequence[str] = (),
 ) -> dict[str, object]:
     """One replay of ``unit_dir`` with ``artifact``: OOS net after gas,
     trades and the member's counters. Raises on a failed or unreadable
-    replay (the caller records the rung as failed)."""
+    replay (the caller records the rung as failed). ``extra_argv`` rides
+    after the fee flags (HYPARB G1: the judge's HyperEVM latency)."""
     argv = [
         claude_worker.backtest.ENGINE_BINARY,
         "backtest",
@@ -110,6 +132,7 @@ def run_rung(
         "--split",
         "0/100",
         *fee_flags,
+        *extra_argv,
     ]
     code, out, err = run_fn(argv)
     if code != 0:
@@ -139,7 +162,7 @@ def run_ladder(
     for name, overrides in RUNGS:
         path = scratch / f"hyparb-{name}.toml"
         try:
-            path.write_text(rung_artifact(artifact_text, overrides), encoding="utf-8")
+            path.write_text(replay_artifact(artifact_text, overrides), encoding="utf-8")
             row = run_rung(unit_dir, path, fee_flags, run_fn)
         except (LadderError, ValueError, OSError) as exc:
             rows.append({"rung": name, "error": str(exc)})
@@ -151,7 +174,9 @@ def run_ladder(
 def merge_ladder(per_unit: list[list[dict[str, object]]]) -> list[dict[str, object]]:
     """Sum each rung across the day's units (dollars rendered to 1e-6,
     as the audit merge does). A rung that failed in any unit is marked
-    — a partial sum would read as a smaller number, not a missing one."""
+    — a partial sum would read as a smaller number, not a missing one. An
+    optional field is summed only when every summed unit printed it, else
+    it is left out."""
     merged: list[dict[str, object]] = []
     for name, _ in RUNGS:
         acc: dict[str, object] = {"rung": name, "units": 0, "failed_units": 0,
@@ -160,6 +185,7 @@ def merge_ladder(per_unit: list[list[dict[str, object]]]) -> list[dict[str, obje
             acc[k] = 0
         for k in _USD_FIELDS:
             acc[k] = 0.0
+        optional = dict.fromkeys(_OPTIONAL_USD_FIELDS, 0.0)
         for rows in per_unit:
             row = next((r for r in rows if r.get("rung") == name), None)
             if row is None or "error" in row:
@@ -172,8 +198,15 @@ def merge_ladder(per_unit: list[list[dict[str, object]]]) -> list[dict[str, obje
                 acc[k] = int(acc[k]) + int(row[k])
             for k in _USD_FIELDS:
                 acc[k] = float(acc[k]) + float(row[k])
+            for k in list(optional):
+                if k in row:
+                    optional[k] += float(row[k])
+                else:
+                    del optional[k]
         for k in ("oos_net_usd", *_USD_FIELDS):
             acc[k] = f"{float(acc[k]):.6f}"
+        if int(acc["units"]) > 0:
+            acc.update({k: f"{v:.6f}" for k, v in optional.items()})
         merged.append(acc)
     return merged
 

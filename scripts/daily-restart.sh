@@ -494,6 +494,24 @@ if slot_ready 0020; then
         uv run python -m claude_worker.bin15_accrue accrue --bin15 "$b15" >&2 ||
           echo "daily-restart: bin15 accrual failed (non-fatal; tomorrow retries)" >&2
       fi
+      # HYPARB G1 (operator 2026-10-15): the gate's tally. Fold the closed
+      # day's slot-0 sessions under the member's own P&L law into
+      # ~/multivenue/worker/hyparb/g1-sessions.tsv (each run dir is one
+      # session; /state's level dies with it), then replay the day's lean
+      # <= 2 h windows at r3 and at the judge's 2-block delta into
+      # g1-replay.tsv. Here for the same reason as the bin15 accrual: the
+      # run dirs are still local. The replay is cheap enough to ride the
+      # slot -- one lean 2 h unit measured 0.4 s to cut and 0.4 s per rung
+      # (2026-10-15) -- and BOUNDED, because a live worker process holds
+      # off the engine's boot recommit: 120 s a rung, 300 s for the whole
+      # replay; units past the budget stay pending (no row) for the next
+      # night or a manual `backfill --replay`. Idempotent and non-fatal like
+      # the two above.
+      if [ -f "$HOME/multivenue/hyparb.toml" ]; then
+        echo "daily-restart: 0020 hyparb G1 accrual (closed UTC day)" >&2
+        uv run python -m claude_worker.hyparb_g1 accrue >&2 ||
+          echo "daily-restart: hyparb G1 accrual failed (non-fatal; tomorrow retries)" >&2
+      fi
     )
   fi
 fi

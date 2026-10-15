@@ -700,8 +700,9 @@ class Archiver:
             if entry.get("etag") and head.etag and head.etag != entry["etag"]:
                 raise ArchiveError(f"{entry['key']}: ETag mismatch", EXIT_FAILED)
 
-    def verify(self, run_id: str, *, deep: bool = False) -> dict[str, typing.Any]:
-        """The question retention.sh asks before it deletes anything."""
+    def _complete_manifest(self, run_id: str) -> dict[str, typing.Any]:
+        """The run's manifest — only when its index object exists and holds the
+        SAME bytes (S-LAW 5: the index is the completeness bit)."""
         index = self.store.head(self.cfg.index_key(run_id))
         if index is None:
             raise ArchiveError(f"{run_id}: no index object — not complete", EXIT_FAILED)
@@ -709,7 +710,11 @@ class Archiver:
         manifest_raw = self.store.get_bytes(self.cfg.manifest_key(run_id))
         if index_bytes != manifest_raw:
             raise ArchiveError(f"{run_id}: index and manifest bytes differ", EXIT_FAILED)
-        manifest = json.loads(manifest_raw)
+        return typing.cast(dict[str, typing.Any], json.loads(manifest_raw))
+
+    def verify(self, run_id: str, *, deep: bool = False) -> dict[str, typing.Any]:
+        """The question retention.sh asks before it deletes anything."""
+        manifest = self._complete_manifest(run_id)
         self._verify_manifest(manifest)
         if deep:
             self._verify_deep(manifest)
@@ -746,6 +751,21 @@ class Archiver:
                 cached.write_bytes(raw)
             out.append(json.loads(raw))
         return out
+
+    def run_ids(self, since_ns: int | None = None) -> list[str]:
+        """Complete runs (their INDEX object exists, S-LAW 5) from ``since_ns``,
+        oldest first — from the index listing alone: unlike :meth:`list_runs`
+        no manifest is fetched or cached (HYPARB G1 lists ~100 to pull two
+        files of each)."""
+        prefix = self.cfg.index_prefix()
+        start = f"{prefix}run-{since_ns - 1}" if since_ns else None
+        out: list[str] = []
+        for meta in self.store.list(prefix, start_after=start):
+            run_id = meta.key.rsplit("/", 1)[-1].removesuffix(".json")
+            digits = run_id[len("run-") :]
+            if run_id.startswith("run-") and digits.isdigit() and int(digits) >= (since_ns or 0):
+                out.append(run_id)
+        return sorted(out, key=lambda r: int(r[len("run-") :]))
 
     # -- S7: legacy tarballs and derived stores --------------------------
 
@@ -908,14 +928,7 @@ class Archiver:
         staging = partial / ".staged"
         staging.mkdir(exist_ok=True)
         for entry in manifest["files"]:
-            stored = staging / (entry["name"] + ".zst")
-            self.store.get(entry["key"], stored, expect_size=int(entry["stored_bytes"]))
-            digest = decompress_to(stored, partial / entry["name"])
-            stored.unlink(missing_ok=True)
-            if digest != entry["sha256"]:
-                raise ArchiveError(
-                    f"{entry['name']}: sha256 mismatch after decompression", EXIT_FAILED
-                )
+            self._pull_entry(entry, partial, staging)
         shutil.rmtree(staging, ignore_errors=True)
         final = into / run_id
         shutil.rmtree(final, ignore_errors=True)
@@ -926,6 +939,57 @@ class Archiver:
             encoding="utf-8",
         )
         return final
+
+    def _pull_entry(
+        self, entry: dict[str, typing.Any], dst: pathlib.Path, staging: pathlib.Path
+    ) -> None:
+        """One manifest file into ``dst``, its ORIGINAL sha256 verified."""
+        stored = staging / (entry["name"] + ".zst")
+        self.store.get(entry["key"], stored, expect_size=int(entry["stored_bytes"]))
+        digest = decompress_to(stored, dst / entry["name"])
+        stored.unlink(missing_ok=True)
+        if digest != entry["sha256"]:
+            raise ArchiveError(f"{entry['name']}: sha256 mismatch after decompression", EXIT_FAILED)
+
+    def pull_files(
+        self, run_id: str, names: collections.abc.Iterable[str], into: pathlib.Path
+    ) -> tuple[pathlib.Path, dict[str, typing.Any]]:
+        """Materialise only ``names`` of a run; returns ``(dir, manifest)``.
+
+        HYPARB G1: a session's tally reads two small logs and a TSV of a run that
+        is gigabytes whole, so this fetches those keys and nothing else. The
+        completeness law is :meth:`pull`'s (the index object exists and holds the
+        manifest's bytes), but only the fetched files are touched — each by its
+        manifest key, each ORIGINAL sha256 verified after decompression exactly as
+        :meth:`pull` does. A name the manifest does not list is simply absent.
+
+        The result is a PARTIAL run, so it carries no ``.complete`` marker and is
+        refused anywhere inside the archive cache, whose discovery would serve it
+        as a whole one; it is assembled under the same ``.partial`` name, so an
+        interrupted pull is invisible.
+        """
+        if into.resolve().is_relative_to(self.cfg.cache_dir.resolve()):
+            raise ArchiveError(
+                f"{run_id}: a partial pull never lands in the archive cache", EXIT_REFUSED
+            )
+        manifest = self._complete_manifest(run_id)
+        wanted = set(names)
+        partial = into / f"{run_id}.partial"
+        shutil.rmtree(partial, ignore_errors=True)
+        staging = partial / ".staged"
+        staging.mkdir(parents=True, exist_ok=True)
+        try:
+            for entry in manifest["files"]:
+                if entry["name"] in wanted:
+                    self._pull_entry(entry, partial, staging)
+            shutil.rmtree(staging, ignore_errors=True)
+            final = into / run_id
+            shutil.rmtree(final, ignore_errors=True)
+            os.replace(partial, final)
+        except BaseException:
+            shutil.rmtree(partial, ignore_errors=True)
+            raise
+        return final, manifest
 
 
 # --------------------------------------------------------------------------

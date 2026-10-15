@@ -14,6 +14,7 @@ Convention: full ``import x`` only. No ``from x import y``.
 import datetime
 import json
 import pathlib
+import re
 
 import pytest
 
@@ -85,6 +86,39 @@ def test_run_ladder_replays_every_rung_and_parses_net_and_counters(tmp_path):
     assert [r["rung"] for r in rows] == ["r0", "r1", "r2", "r3"]
     assert [r["oos_net_usd"] for r in rows] == [5.0, 2.0, 1.0, 0.5]
     assert rows[3]["arbs"] == 1 and rows[3]["side_buy"] == 1 and rows[3]["gas_usd"] == 0.0098
+
+
+def test_every_rung_replays_the_paper_member(tmp_path):
+    # HYPARB G1: the harness boots without --evm-testnet, so the live
+    # artifact's `mode = "testnet"` refused every rung (O-H5).
+    text = EXAMPLE.replace('mode = "paper"', 'mode = "testnet"', 1)
+    seen: list[str] = []
+
+    def fn(argv):
+        seen.append(pathlib.Path(argv[argv.index("--hyparb") + 1]).read_text(encoding="utf-8"))
+        return ladder_fn(argv)
+
+    rows = claude_worker.hyparb_ladder.run_ladder(tmp_path / "u", text, tmp_path / "s", [], fn)
+    assert all("error" not in r for r in rows), rows
+    assert len(seen) == 4
+    assert all(re.search(r'^mode = "paper"$', t, re.MULTILINE) for t in seen)
+    assert not any(re.search(r'^mode = "testnet"$', t, re.MULTILINE) for t in seen)
+
+
+def test_an_optional_field_a_binary_does_not_print_stays_absent(tmp_path):
+    # HYPARB G1 (N2/N3): `pnl_session_usd` is newer than some binaries — absent
+    # is absent in the row and the merge, never a 0.000000 that reads as a level.
+    def with_pnl(argv):
+        code, out, err = ladder_fn(argv)
+        return code, out, err.replace(" orders_emitted=", " pnl_session_usd=0.25 orders_emitted=")
+
+    run = claude_worker.hyparb_ladder.run_ladder
+    old = run(tmp_path / "u1", EXAMPLE, tmp_path / "s1", [], ladder_fn)
+    new = run(tmp_path / "u2", EXAMPLE, tmp_path / "s2", [], with_pnl)
+    assert "pnl_session_usd" not in old[3] and new[3]["pnl_session_usd"] == 0.25
+    merge = claude_worker.hyparb_ladder.merge_ladder
+    assert all("pnl_session_usd" not in r for r in merge([old, new]))
+    assert [r["pnl_session_usd"] for r in merge([new, new])] == ["0.500000"] * 4
 
 
 def test_a_failed_rung_is_marked_and_not_summed_as_a_smaller_number(tmp_path):

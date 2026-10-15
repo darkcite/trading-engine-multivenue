@@ -203,6 +203,13 @@ fn the_member_arbs_the_pool_tape_hedges_on_the_perp_and_pays_gas() {
         field(line, "gas_usd"),
         "all OOS: {line}"
     );
+    // HYPARB G1: the member's own session level (cash + marks + funding −
+    // gas) rides the counters line — the gate's measure at any judge Δ.
+    // One attempt's gas is inside it, so it is never a member's idle 0.0.
+    let pnl: f64 = field(line, "pnl_session_usd")
+        .parse()
+        .unwrap_or_else(|_| panic!("pnl_session_usd in {line}"));
+    assert!(pnl.abs() > 0.0, "{line}");
     let head = out
         .summary
         .lines()

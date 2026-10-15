@@ -139,3 +139,62 @@ def seed_committed_ruleset(
     )
     state.mark_ruleset_committed(full_hash, ts=committed_ts)
     return full_hash, ruleset_path, report_path
+
+
+def _write_slots(
+    path: pathlib.Path, kind: int, slots: list[bytes], epoch_ns: int, version: int = 3
+) -> None:
+    header = claude_worker.pmlr._HEADER.pack(  # reader-defined layout, deliberately
+        claude_worker.pmlr.MAGIC, version, kind, epoch_ns
+    )
+    blob = bytearray(header + bytes(_HDR - len(header)))
+    for slot in slots:
+        blob.extend(slot + bytes(_SLOT - len(slot)))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(blob))
+
+
+def write_fills(
+    path: pathlib.Path,
+    rows: list[tuple[int, int, int, int, int, int, int, int, int]],
+    epoch_ns: int,
+) -> None:
+    """HYPARB G1 builder: one kind-2 fill file — ``rows`` = (ts_ns, sym,
+    side, strategy_id, origin, flags, px, qty, order_id), the reader's own
+    layout."""
+    _write_slots(
+        path,
+        claude_worker.pmlr.SLOT_KIND_FILL,
+        [claude_worker.pmlr._FILL.pack(*r) for r in rows],
+        epoch_ns,
+    )
+
+
+def write_orders(
+    path: pathlib.Path,
+    rows: list[tuple[int, int, int, int, int, int, int, int, int]],
+    epoch_ns: int,
+) -> None:
+    """HYPARB G1 builder: one kind-3 order file — ``rows`` = (ts_ns, sym,
+    side, kind, px, qty, client_oid, venue, strategy_id)."""
+    _write_slots(
+        path,
+        claude_worker.pmlr.SLOT_KIND_ORDER,
+        [claude_worker.pmlr._ORDER.pack(*r) for r in rows],
+        epoch_ns,
+    )
+
+
+def write_events(
+    path: pathlib.Path,
+    rows: list[tuple[int, int, int, int, int, int, int, int]],
+    epoch_ns: int,
+) -> None:
+    """HYPARB G1 builder: one kind-5 ChannelEvent file — ``rows`` =
+    (ts_ns, sym, venue, channel, venue_seq, venue_time_ms, v0, v1)."""
+    _write_slots(
+        path,
+        claude_worker.pmlr.SLOT_KIND_CHANNEL_EVENT,
+        [claude_worker.pmlr._CHANNEL_EVENT.pack(*r) for r in rows],
+        epoch_ns,
+    )

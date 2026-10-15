@@ -1902,8 +1902,8 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                      hedges={} hedges_perp={} hedges_spot={} hedge_fills={} hedges_missed={} \
                      flattens={} inventory_breaches={} amm_judged_fills={} amm_canceled={} \
                      amm_partial={} amm_not_live={} gas_usd={} gas_oos_usd={} \
-                     pnl_predicted_usd={} funding_earned_usd={} orders_emitted={} \
-                     regime=not-replayed(v1)",
+                     pnl_predicted_usd={} funding_earned_usd={} pnl_session_usd={} \
+                     orders_emitted={} regime=not-replayed(v1)",
                 c.pool_events,
                 c.pool_refused,
                 c.maps_loaded,
@@ -1935,6 +1935,9 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                 super::fmt_usd_1e6(gas_oos_usd_1e6),
                 super::fmt_usd_1e6(c.pnl_predicted_usd_1e6),
                 super::fmt_usd_1e6(c.funding_earned_usd_1e6),
+                // HYPARB G1: the member's own session level (cash + marks
+                // + funding − gas), the gate's measure at any judge Δ.
+                super::fmt_usd_1e6(c.pnl_session_usd_1e6),
                 out.orders_emitted,
             );
             (hash_hex, line, out, counters)

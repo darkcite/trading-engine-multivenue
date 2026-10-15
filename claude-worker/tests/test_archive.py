@@ -599,6 +599,61 @@ def test_pull_partial_dir_is_invisible_to_every_discovery_law(
     assert claude_worker.features.run_dirs(tmp_path) == []
 
 
+def test_pull_files_fetches_only_the_named_files_and_verifies_each(
+    tmp_path: pathlib.Path,
+) -> None:
+    """HYPARB G1: two small logs of a multi-GB run — the index law, the digest
+    check, and a partial pull that is never a complete run."""
+    cfg = make_cfg(tmp_path)
+    fake = tests.fake_s3.FakeS3()
+    archiver = make_archiver(cfg, fake)
+    logs = tmp_path / "logs"
+    run = make_run(logs, f"run-{EPOCH_NS}")
+    make_run(logs, f"run-{EPOCH_NS + 10**12}")
+    archiver.push_run(run, with_catalog=False)
+
+    names = ["pm-ticks.pmlr", "instrument-manifest.tsv", "absent.pmlr"]
+    pulled, manifest = archiver.pull_files(run.name, names, tmp_path / "g1")
+    assert sorted(p.name for p in pulled.iterdir()) == ["instrument-manifest.tsv", "pm-ticks.pmlr"]
+    for p in pulled.iterdir():
+        assert p.read_bytes() == (run / p.name).read_bytes()
+    assert manifest["run"] == run.name and manifest["span_ns"]
+    assert sorted(p.name for p in (tmp_path / "g1").iterdir()) == [run.name], "no marker"
+
+    tampered = dict(
+        manifest,
+        files=[
+            dict(f, sha256="0" * 64) if f["name"] == "pm-ticks.pmlr" else f
+            for f in manifest["files"]
+        ],
+    )
+    raw = claude_worker.archive.manifest_bytes(tampered)
+    fake.objects[cfg.manifest_key(run.name)] = raw
+    fake.objects[cfg.index_key(run.name)] = raw
+    with pytest.raises(claude_worker.archive.ArchiveError, match="sha256"):
+        archiver.pull_files(run.name, ["pm-ticks.pmlr"], tmp_path / "g2")
+    assert not any((tmp_path / "g2").iterdir()), "a failed pull leaves nothing"
+    del fake.objects[cfg.index_key(run.name)]
+    with pytest.raises(claude_worker.archive.ArchiveError, match="not complete"):
+        archiver.pull_files(run.name, ["pm-ticks.pmlr"], tmp_path / "g3")
+
+
+def test_run_ids_lists_complete_runs_from_the_index_alone(tmp_path: pathlib.Path) -> None:
+    cfg = make_cfg(tmp_path)
+    fake = tests.fake_s3.FakeS3()
+    archiver = make_archiver(cfg, fake)
+    logs = tmp_path / "logs"
+    for offset in (0, 10**12, 2 * 10**12):
+        make_run(logs, f"run-{EPOCH_NS + offset}")
+    archiver.push_pending(logs)
+    fake.requests.clear()
+    cached = sorted(cfg.cache_dir.rglob("*")) if cfg.cache_dir.exists() else []
+    assert archiver.run_ids() == [f"run-{EPOCH_NS}", f"run-{EPOCH_NS + 10**12}"]
+    assert archiver.run_ids(EPOCH_NS + 10**12) == [f"run-{EPOCH_NS + 10**12}"]
+    assert all("list-type=2" in q for _, _, q in fake.requests), "no manifest is fetched"
+    assert (sorted(cfg.cache_dir.rglob("*")) if cfg.cache_dir.exists() else []) == cached
+
+
 def test_list_runs_returns_one_row_per_complete_run(tmp_path: pathlib.Path) -> None:
     cfg = make_cfg(tmp_path)
     fake = tests.fake_s3.FakeS3()
