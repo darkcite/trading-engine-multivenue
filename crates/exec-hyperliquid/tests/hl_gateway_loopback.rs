@@ -1501,8 +1501,15 @@ fn the_sweep_cancels_this_gateway_s_slots_only_and_reads_until_none_rest() {
     v.policy(move |s| {
         if s.body.contains("frontendOpenOrders") {
             reads += 1;
-            // Another slot's order and a stranger's never leave.
-            let mut rows = vec![open_row(300, Some((3, 9))), open_row(301, None)];
+            // Another slot's order and a stranger's never leave — S16-4:
+            // nor a router slot 8..16's, slot 14 (`14 & 7 == 6`) among them.
+            let mut rows = vec![
+                open_row(300, Some((3, 9))),
+                open_row(301, None),
+                open_row(302, Some((11, 9))),
+                open_row(303, Some((14, 9))),
+                open_row(304, Some((15, 9))),
+            ];
             if reads == 1 {
                 rows.push(open_row(101, Some((SLOT, 7))));
             }
@@ -1530,6 +1537,12 @@ fn the_sweep_cancels_this_gateway_s_slots_only_and_reads_until_none_rest() {
         posts[1].body
     );
     assert!(posts[2].body.contains("frontendOpenOrders"));
+    for other in [3u8, 11, 14, 15] {
+        assert!(
+            posts.iter().all(|p| !p.body.contains(&cloid_hex(other, 9))),
+            "slot {other}'s order was cancelled"
+        );
+    }
     let ack = evs
         .iter()
         .find(|e| e.kind == EV_ACK)

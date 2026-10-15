@@ -159,22 +159,6 @@ pub const HCV_SLOT: usize = strategy_set::SLOT_HCV as usize;
 const _: () = assert!(core_config::exec::EXEC_SLOTS == EXEC_SLOTS);
 const _: () = assert!(clob_dispatcher::EXEC_COUNTER_SLOTS == EXEC_SLOTS);
 
-/// **S16-3** — no BUILT slot is past what the venue arms carry today: the
-/// Hyperliquid arm's masks hold [`exec_hyperliquid::cloid::HL_SLOTS`] slots
-/// (its `cancel_slot` past them is the venue-wide cancel, and
-/// `VenueSplit::cancel_slot` sends every slot's cancel to both arms), and
-/// a Binance id names a slot up to [`exec_binance::cid::CID_SLOT_MAX`].
-// S16-4 removes this: a member at slot ≥ 8 needs the HL and Binance arms widened first (else its halt is an HL cancel_all).
-const _: () = assert!(
-    strategy_set::BUILT_MASK >> exec_hyperliquid::cloid::HL_SLOTS == 0,
-    "a built slot is past the Hyperliquid arm's HL_SLOTS"
-);
-// S16-4 removes this: a member at slot ≥ 8 needs the HL and Binance arms widened first (else its halt is an HL cancel_all).
-const _: () = assert!(
-    strategy_set::BUILT_MASK >> (exec_binance::cid::CID_SLOT_MAX + 1) == 0,
-    "a built slot is past the Binance arm's CID_SLOT_MAX"
-);
-
 /// XMM XH5a — the operator arm's sweep table holds every live leg the feed
 /// can bind (two per family): a halt's per-slot request queues them all at
 /// once, and one the table could not hold would be re-asked behind the

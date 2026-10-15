@@ -1095,6 +1095,31 @@ mod tests {
         }
     }
 
+    /// S16-4 (risk review): a cloid naming router slot 11 (or 15) routes
+    /// to that slot — never to `11 & 7 == 3`, BIN15's — carrying the
+    /// member's id, exactly as a slot-3 cloid routes to slot 3.
+    #[test]
+    fn a_slot_11_or_15_cloid_routes_to_that_slot_never_slot_3() {
+        const CLIENT_OID: u64 = 0xDEAD_BEEF;
+        for slot in [3u8, 11, 15] {
+            let f = UserFill {
+                tid: 1,
+                oid: 77_216_390,
+                cloid: Some(encode_cloid(slot, CLIENT_OID)),
+                px_1e8: 47_000_000,
+                sz_1e8: 2_500_000_000,
+                ..UserFill::default()
+            };
+            match to_fill(&f, 7, 1).expect("converts") {
+                Routed::Slot(fill) => {
+                    assert_eq!(fill.strategy_id, slot, "slot {slot}");
+                    assert_eq!(fill.order_id, CLIENT_OID, "slot {slot}");
+                }
+                Routed::TapeOnly(_) => panic!("slot {slot}'s cloid must route to its slot"),
+            }
+        }
+    }
+
     #[test]
     fn a_user_fill_stays_the_size_it_was() {
         assert_eq!(

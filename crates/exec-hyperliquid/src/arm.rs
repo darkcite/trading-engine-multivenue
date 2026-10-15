@@ -452,7 +452,7 @@ pub struct ArmCfg {
 /// Why an arm cannot be built.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ArmErr {
-    /// A slot outside the engine's eight.
+    /// A slot outside the router's `EXEC_SLOTS` (sixteen).
     Slot,
     /// No perps (on a perps arm), more than [`ARM_PERPS`], or one bound
     /// twice.
@@ -1090,7 +1090,8 @@ impl HlGatewayArm {
     /// # Errors
     /// [`ArmErr`].
     pub fn new(cfg: &ArmCfg, end: HlEngineEnd) -> Result<Self, ArmErr> {
-        if cfg.slot >= 8 {
+        // S16-4: every router slot; the gateway's `SlotMask` names each.
+        if usize::from(cfg.slot) >= core_config::exec::EXEC_SLOTS {
             return Err(ArmErr::Slot);
         }
         if cfg.outcomes {
@@ -6250,6 +6251,62 @@ mod tests {
         assert!(!arm.exclusive);
     }
 
+    /// S16-4 (risk review): on this slot-6 arm (the fixtures' slot; BIN15's
+    /// slot 3 is the same law), a router slot 8..16 is another slot's
+    /// exactly as slot 5 is — slot 14 is never read as `14 & 7 == 6`, nor
+    /// 11 as BIN15's 3. Its fill is counted foreign and books nothing; its
+    /// resting row and its listed open order end the account's
+    /// exclusivity and are never cancelled as the slot's own. The slot's
+    /// own fill still books to it.
+    #[test]
+    fn a_slot_8_to_15_event_is_another_slot_s_as_slot_5_s_is() {
+        for other in [5u8, 11, 14, 15] {
+            // A fill: counted, never booked.
+            let (mut arm, mut v, t) = booted();
+            v.send(ExecEvent {
+                slot: other,
+                ..fill(55, true, 100 * E8, E8 / 2, 10)
+            });
+            let _ = arm.idle(t);
+            assert!(arm.try_next_fill().is_none(), "slot {other}");
+            let c = arm.counters();
+            assert_eq!((c.fills, c.fills_foreign), (0, 1), "slot {other}");
+            v.send(ExecEvent {
+                slot: SLOT,
+                ..fill(56, true, 100 * E8, E8 / 2, 11)
+            });
+            let _ = arm.idle(t);
+            let f = arm.try_next_fill().expect("the slot's own fill books");
+            assert_eq!((f.strategy_id, f.order_id), (SLOT, 56), "slot {other}");
+            assert_eq!(arm.counters().fills_foreign, 1, "slot {other}");
+
+            // A resting row: the account is shared.
+            let (mut arm, mut v, t) = booted();
+            assert!(arm.exclusive);
+            v.send(ExecEvent {
+                slot: other,
+                ..row(EV_RESTING, 5, 0)
+            });
+            let _ = arm.idle(t);
+            assert!(!arm.exclusive, "slot {other}");
+
+            // A listed open order: shared, never the slot's unknown order.
+            let (mut arm, mut v, t) = booted();
+            let _ = arm.idle(t + 5 * S);
+            let st = v.take(CMD_READ_STATE).expect("the sheet");
+            v.send(read_end(&st, 1_000 * E8, 2));
+            let _ = arm.idle(t + 5 * S);
+            spot(&mut arm, &mut v, t + 5 * S, 0);
+            let od = v.take(CMD_READ_ORDERS).expect("the orders");
+            v.send(open_order(&od, other, 999));
+            v.send(read_end(&od, 0, 0));
+            let _ = arm.idle(t + 5 * S);
+            assert!(v.take(CMD_CANCEL).is_none(), "slot {other}");
+            assert_eq!(arm.counters().unknown_orders, 0, "slot {other}");
+            assert!(!arm.exclusive, "slot {other}: the account is shared");
+        }
+    }
+
     #[test]
     fn drift_is_noted_only_when_two_sheets_disagree() {
         let (mut arm, mut v, t) = booted();
@@ -6944,12 +7001,21 @@ mod tests {
 
     #[test]
     fn a_bad_configuration_is_refused() {
-        let mut c = cfg();
-        c.slot = 8;
-        assert_eq!(
-            HlGatewayArm::new(&c, hl_duplex().0).err(),
-            Some(ArmErr::Slot)
-        );
+        // S16-4: slots 8..16 are router slots; 16 and past are not.
+        for slot in [16u8, 0x80, 0xFE, 0xFF] {
+            let mut c = cfg();
+            c.slot = slot;
+            assert_eq!(
+                HlGatewayArm::new(&c, hl_duplex().0).err(),
+                Some(ArmErr::Slot),
+                "slot {slot}"
+            );
+        }
+        for slot in [8u8, 11, 15] {
+            let mut c = cfg();
+            c.slot = slot;
+            assert!(HlGatewayArm::new(&c, hl_duplex().0).is_ok(), "slot {slot}");
+        }
         let mut c = cfg();
         c.n_perps = 2;
         assert_eq!(
