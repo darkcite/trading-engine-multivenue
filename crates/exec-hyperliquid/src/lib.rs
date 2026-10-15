@@ -138,11 +138,14 @@ pub use action::{
 pub use asset::{AssetError, AssetTable, ASSET_SLOTS};
 pub use budget::{AddressBudget, BudgetErr, INITIAL_BUFFER};
 pub use cloid::{decode as decode_cloid, encode as encode_cloid, Owner, MAGIC as CLOID_MAGIC};
+pub use cmd::HlCmd;
 pub use config::{
     ConfigErr, HlConfig, Scope, ENV_AGENT_KEY, ENV_HOST, ENV_MASTER_ADDR, ENV_SOURCE,
     ENV_T_AGENT_KEY, ENV_T_HOST, ENV_T_MASTER_ADDR, ENV_T_SOURCE, HOST_MAINNET, HOST_TESTNET,
 };
+pub use event::ExecEvent;
 pub use exchange::{HlExchange, HlExecCounters};
+pub use gateway::{hl_duplex, CoinMap, GatewayCfg, HlGateway};
 pub use http::{HlHttp, HttpErr, EXCHANGE_PATH, MAX_REQ_BODY, MAX_RESP_BUF};
 pub use lifecycle::{LifecycleReport, LifecycleSpec};
 pub use msgpack::{MsgPackErr, Writer};
@@ -161,9 +164,6 @@ pub use smoke::{
     SmokeErr, SmokeReport, EXIT_CORRUPT_ACCEPTED, EXIT_FAILED, EXIT_LIFECYCLE, EXIT_NOT_VERIFIED,
     EXIT_PASS, EXIT_SELFTEST, EXIT_UNREACHABLE,
 };
-pub use userws_conn::{UserWs, WsErr, MAX_WS_BUF};
 pub use userws::{owner_of, scan_user_fills, to_fill, ConvertErr, TidRing, UserFill};
+pub use userws_conn::{UserWs, WsErr, MAX_WS_BUF};
 pub use wire::{WireNum, WIRE_SCALE};
-pub use cmd::HlCmd;
-pub use event::ExecEvent;
-pub use gateway::{hl_duplex, CoinMap, GatewayCfg, HlGateway};

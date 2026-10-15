@@ -112,7 +112,10 @@ impl core::fmt::Display for SelfTestErr {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             SelfTestErr::Fixture(w) => {
-                write!(f, "hl self-test: the embedded SDK vectors are unusable ({w})")
+                write!(
+                    f,
+                    "hl self-test: the embedded SDK vectors are unusable ({w})"
+                )
             }
             SelfTestErr::Chain { name, stage } => write!(
                 f,
@@ -239,8 +242,14 @@ fn check_encoders() -> Result<u32, SelfTestErr> {
     .map_err(|_| SelfTestErr::Encode("order"))?;
     want("order_gtc_buy", &buf[..n], "order")?;
 
-    let n = encode_cancel(&mut buf, &[CancelWire { asset: 0, oid: 12_345 }])
-        .map_err(|_| SelfTestErr::Encode("cancel"))?;
+    let n = encode_cancel(
+        &mut buf,
+        &[CancelWire {
+            asset: 0,
+            oid: 12_345,
+        }],
+    )
+    .map_err(|_| SelfTestErr::Encode("cancel"))?;
     want("cancel_single", &buf[..n], "cancel")?;
 
     let n = encode_cancel_by_cloid(
@@ -302,9 +311,7 @@ fn check_encoders() -> Result<u32, SelfTestErr> {
 }
 
 /// The cloid `gen_vectors.py` used for the cloid-bearing cases.
-const CLOID_B: [u8; 16] = [
-    0x4d, 0x56, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a,
-];
+const CLOID_B: [u8; 16] = [0x4d, 0x56, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a];
 
 /// Compare `got` against the named row's recorded msgpack.
 fn want(row: &str, got: &[u8], label: &'static str) -> Result<(), SelfTestErr> {

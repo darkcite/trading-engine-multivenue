@@ -360,7 +360,9 @@ pub fn envelope(
     expires_after: Option<u64>,
 ) -> Result<usize, MsgPackErr> {
     let head = envelope_open(dst)?;
-    let end = head.checked_add(action_json.len()).ok_or(MsgPackErr::Overflow)?;
+    let end = head
+        .checked_add(action_json.len())
+        .ok_or(MsgPackErr::Overflow)?;
     if end > dst.len() {
         return Err(MsgPackErr::Overflow);
     }
@@ -417,7 +419,11 @@ pub fn ws_post_close(dst: &mut [u8], end: usize) -> Result<usize, MsgPackErr> {
 /// — a user-channel subscription; `user_hex` is the `0x…` MASTER
 /// address. ONE renderer for the blocking `UserWs` and the gateway's
 /// connections.
-pub fn subscribe_json(dst: &mut [u8], channel: &[u8], user_hex: &[u8]) -> Result<usize, MsgPackErr> {
+pub fn subscribe_json(
+    dst: &mut [u8],
+    channel: &[u8],
+    user_hex: &[u8],
+) -> Result<usize, MsgPackErr> {
     let mut j = Json::new(dst);
     j.put(b"{\"method\":\"subscribe\",\"subscription\":{\"type\":\"")?;
     j.put(channel)?;
@@ -446,7 +452,11 @@ mod ws_post_tests {
         let env = envelope_close(&mut dst[p..], head + body.len(), 7, &sig, None, None).unwrap();
         let mut rest = [0u8; 512];
         let n = envelope(&mut rest, body, 7, &sig, None, None).unwrap();
-        assert_eq!(&dst[p..p + env], &rest[..n], "the REST body is the post's sub-slice");
+        assert_eq!(
+            &dst[p..p + env],
+            &rest[..n],
+            "the REST body is the post's sub-slice"
+        );
         let total = ws_post_close(&mut dst, p + env).unwrap();
         assert_eq!(total, p + env + 2);
         assert!(dst[..total].ends_with(b"}}}"));
@@ -487,15 +497,19 @@ mod tests {
 
     #[test]
     fn a_cloid_renders_as_the_venues_raw_form() {
-        let cloid = [
-            0x4d, 0x56, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a,
-        ];
+        let cloid = [0x4d, 0x56, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a];
         let o = OrderWire::new(0, false, 50_000_000, 100_000_000, Tif::Alo)
             .with_cloid(cloid)
             .reduce_only();
         let j = s(|d| order_json(d, &[o], b"na"));
-        assert!(j.contains(r#""c":"0x4d56030000000000000000000000002a""#), "{j}");
-        assert!(j.contains(r#""b":false"#) && j.contains(r#""r":true"#), "{j}");
+        assert!(
+            j.contains(r#""c":"0x4d56030000000000000000000000002a""#),
+            "{j}"
+        );
+        assert!(
+            j.contains(r#""b":false"#) && j.contains(r#""r":true"#),
+            "{j}"
+        );
         assert!(j.contains(r#""tif":"Alo""#), "{j}");
     }
 
@@ -506,15 +520,15 @@ mod tests {
     #[test]
     fn the_price_and_size_strings_are_identical_in_both_encodings() {
         let cases: [(i64, i64); 9] = [
-            (50_000_000, 1_000_000_000),   // 0.5   / 10
-            (45_670_000, 2_500_000_000),   // 0.4567/ 25
-            (100_000, 1_000_000_000),      // 0.001 / 10
-            (99_900_000, 100_000_000),     // 0.999 / 1
-            (50_000_000, 10_000_000_000),  // 0.5   / 100  (trailing zeros)
-            (1, 1),                        // the smallest representable
-            (50_000_001, 333_000_000),     // a real 8th digit
-            (25_000_000, 300_000_000),     // 0.25  / 3
-            (60_100_000, 500_000_000),     // 0.601 / 5
+            (50_000_000, 1_000_000_000),  // 0.5   / 10
+            (45_670_000, 2_500_000_000),  // 0.4567/ 25
+            (100_000, 1_000_000_000),     // 0.001 / 10
+            (99_900_000, 100_000_000),    // 0.999 / 1
+            (50_000_000, 10_000_000_000), // 0.5   / 100  (trailing zeros)
+            (1, 1),                       // the smallest representable
+            (50_000_001, 333_000_000),    // a real 8th digit
+            (25_000_000, 300_000_000),    // 0.25  / 3
+            (60_100_000, 500_000_000),    // 0.601 / 5
         ];
         for (px, sz) in cases {
             let o = OrderWire::new(7, true, px, sz, Tif::Gtc);
@@ -539,13 +553,22 @@ mod tests {
     #[test]
     fn cancels_and_modifies_render() {
         assert_eq!(
-            s(|d| cancel_json(d, &[CancelWire { asset: 0, oid: 12_345 }])),
+            s(|d| cancel_json(
+                d,
+                &[CancelWire {
+                    asset: 0,
+                    oid: 12_345
+                }]
+            )),
             r#"{"type":"cancel","cancels":[{"a":0,"o":12345}]}"#
         );
         assert_eq!(
             s(|d| cancel_by_cloid_json(
                 d,
-                &[CancelByCloidWire { asset: 5, cloid: [0u8; 16] }]
+                &[CancelByCloidWire {
+                    asset: 5,
+                    cloid: [0u8; 16]
+                }]
             )),
             r#"{"type":"cancelByCloid","cancels":[{"asset":5,"cloid":"0x00000000000000000000000000000000"}]}"#
         );
@@ -556,7 +579,10 @@ mod tests {
             oid_is_cloid: false,
         };
         let j = s(|d| batch_modify_json(d, &[m]));
-        assert!(j.starts_with(r#"{"type":"batchModify","modifies":[{"oid":99,"order":{"#), "{j}");
+        assert!(
+            j.starts_with(r#"{"type":"batchModify","modifies":[{"oid":99,"order":{"#),
+            "{j}"
+        );
     }
 
     #[test]
@@ -567,7 +593,10 @@ mod tests {
         sig[64] = 28;
         let action = br#"{"type":"cancel","cancels":[]}"#;
         let j = s(|d| envelope(d, action, 1_789_000_000_000, &sig, None, None));
-        assert!(j.starts_with(r#"{"action":{"type":"cancel","cancels":[]},"nonce":1789000000000,"#), "{j}");
+        assert!(
+            j.starts_with(r#"{"action":{"type":"cancel","cancels":[]},"nonce":1789000000000,"#),
+            "{j}"
+        );
         assert!(j.contains(r#""r":"0xab00"#), "{j}");
         assert!(j.contains(r#""s":"0xcd00"#), "{j}");
         assert!(j.ends_with(r#""v":28}}"#), "{j}");
@@ -594,7 +623,10 @@ mod tests {
     fn an_oversized_body_is_refused_not_truncated() {
         let mut tiny = [0u8; 8];
         let o = OrderWire::new(0, true, 50_000_000, 100_000_000, Tif::Gtc);
-        assert_eq!(order_json(&mut tiny, &[o], b"na"), Err(MsgPackErr::Overflow));
+        assert_eq!(
+            order_json(&mut tiny, &[o], b"na"),
+            Err(MsgPackErr::Overflow)
+        );
         assert_eq!(
             envelope(&mut tiny, b"{}", 1, &[0u8; 65], None, None),
             Err(MsgPackErr::Overflow)

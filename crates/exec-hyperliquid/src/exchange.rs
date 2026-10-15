@@ -56,7 +56,9 @@ use crate::nonce::{NonceSource, SharedNonce};
 use crate::request::{envelope_close, envelope_open, order_json};
 use crate::response::{scan, HlOk, HlResponse};
 use crate::sign::{sign_action, Network, Vault};
-use crate::userws::{scan_user_fills, to_fill, to_fill_as, Routed, TidRing, UserFill, SNAPSHOT_RING};
+use crate::userws::{
+    scan_user_fills, to_fill, to_fill_as, Routed, TidRing, UserFill, SNAPSHOT_RING,
+};
 use crate::userws_conn::UserWs;
 
 /// Engine 1e6 → venue 1e8.
@@ -1039,8 +1041,13 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         else {
             return false;
         };
-        self.budget =
-            AddressBudget::from_venue(self.master_addr, self.budget.floor(), used, vlm_1e6, surplus);
+        self.budget = AddressBudget::from_venue(
+            self.master_addr,
+            self.budget.floor(),
+            used,
+            vlm_1e6,
+            surplus,
+        );
         true
     }
 
@@ -1128,7 +1135,9 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                 self.orphans_clear = true;
                 break unmapped;
             }
-            left_known = u32::try_from(k).unwrap_or(u32::MAX).saturating_add(unmapped);
+            left_known = u32::try_from(k)
+                .unwrap_or(u32::MAX)
+                .saturating_add(unmapped);
             if round >= rounds {
                 break left_known;
             }
@@ -1144,8 +1153,10 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         };
         self.reject_streak = streaks.0;
         self.asset_refusal_streak = streaks.1;
-        self.counters.sweep_all_cancelled =
-            self.counters.sweep_all_cancelled.wrapping_add(u64::from(cancelled));
+        self.counters.sweep_all_cancelled = self
+            .counters
+            .sweep_all_cancelled
+            .wrapping_add(u64::from(cancelled));
         self.counters.sweep_all_left = if left == u32::MAX {
             u64::MAX
         } else {
@@ -1187,7 +1198,8 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             return false;
         };
-        self.send_action(mp_n, head + aj_n, 1, Spend::Cancel).is_ok()
+        self.send_action(mp_n, head + aj_n, 1, Spend::Cancel)
+            .is_ok()
     }
 
     /// **S7-L1 (gap A)** — read what each slot BOUGHT on the venue since
@@ -1213,10 +1225,12 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         let info = self.http.info_mut();
         let read = match crate::dayspend::fills_since_request(info, &self.master_addr, start_ms) {
             Ok(n) => match self.http.post_info(n) {
-                Ok((_status, range)) => {
-                    crate::dayspend::scan_day_bought(&self.http.resp()[range], start_ms, &mut bought)
-                        .is_ok()
-                }
+                Ok((_status, range)) => crate::dayspend::scan_day_bought(
+                    &self.http.resp()[range],
+                    start_ms,
+                    &mut bought,
+                )
+                .is_ok(),
                 Err(_) => false,
             },
             Err(_) => false,
@@ -1499,8 +1513,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                 // and never confused with a frame from another
                 // channel — silently discarding a reconnect snapshot
                 // is the failure this counter exists for.
-                counters.fills_scan_failed =
-                    counters.fills_scan_failed.wrapping_add(1);
+                counters.fills_scan_failed = counters.fills_scan_failed.wrapping_add(1);
                 return 0;
             }
         };
@@ -1563,8 +1576,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             // must not credit the successor's ledger, which `bind` just
             // zeroed and whose venue balance will never contain it.
             let Some((sym, current)) = assets.sym_of_coin_gen(f.coin.of(payload)) else {
-                counters.fills_unresolved =
-                    counters.fills_unresolved.wrapping_add(1);
+                counters.fills_unresolved = counters.fills_unresolved.wrapping_add(1);
                 continue;
             };
             // A SETTLEMENT has no cloid — the venue placed the order,
@@ -1617,11 +1629,9 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                         // A dropped fill is a position the engine does
                         // not know it has. Reconciliation catches it;
                         // this counter explains it afterwards.
-                        counters.fills_dropped =
-                            counters.fills_dropped.wrapping_add(1);
+                        counters.fills_dropped = counters.fills_dropped.wrapping_add(1);
                     } else {
-                        counters.fills_booked =
-                            counters.fills_booked.wrapping_add(1);
+                        counters.fills_booked = counters.fills_booked.wrapping_add(1);
                         // The RECONCILER's own side of the comparison,
                         // fed only from fills that actually entered the
                         // lane — a dropped or refused fill is not a
@@ -1638,15 +1648,13 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                     // member. (Plan §6.1 also wants it written to the
                     // tape; that writer does not exist here and is
                     // recorded as open in docs/risk-policy.md.)
-                    counters.fills_foreign =
-                        counters.fills_foreign.wrapping_add(1);
+                    counters.fills_foreign = counters.fills_foreign.wrapping_add(1);
                 }
                 Err(_) => {
                     // A REFUSAL (zero or negative quantity), not a
                     // loss. Kept off `fills_dropped` so that alarm
                     // keeps meaning "a position we do not know about".
-                    counters.fills_refused =
-                        counters.fills_refused.wrapping_add(1);
+                    counters.fills_refused = counters.fills_refused.wrapping_add(1);
                 }
             }
         }
@@ -2026,8 +2034,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                 // may have placed an order nothing in this process
                 // knows the id of, which is what E6's reconciliation
                 // is for.
-                self.counters.sent_unanswered =
-                    self.counters.sent_unanswered.wrapping_add(1);
+                self.counters.sent_unanswered = self.counters.sent_unanswered.wrapping_add(1);
             }
             DispatchError::Disconnected
         })?;
@@ -2266,8 +2273,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                     // shrinking. Stop deferring and start spending
                     // retries, so the entry terminates whether or not
                     // the venue's view reflects our own cancels.
-                    self.counters.sweep_stalled =
-                        self.counters.sweep_stalled.wrapping_add(1);
+                    self.counters.sweep_stalled = self.counters.sweep_stalled.wrapping_add(1);
                     self.sweeps[0].defers = 0;
                     self.spend_try(0);
                 } else {
@@ -2395,8 +2401,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                     // E6 commit 3: CONSECUTIVE. One is a race with a
                     // roll; a streak is a member quoting an instance
                     // that no longer exists.
-                    self.asset_refusal_streak =
-                        self.asset_refusal_streak.saturating_add(1);
+                    self.asset_refusal_streak = self.asset_refusal_streak.saturating_add(1);
                 }
                 self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
                 self.counters.cancels_refused = self.counters.cancels_refused.wrapping_add(1);
@@ -2461,8 +2466,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                     // E6 commit 3: CONSECUTIVE. One is a race with a
                     // roll; a streak is a member quoting an instance
                     // that no longer exists.
-                    self.asset_refusal_streak =
-                        self.asset_refusal_streak.saturating_add(1);
+                    self.asset_refusal_streak = self.asset_refusal_streak.saturating_add(1);
                 }
                 self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
                 self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
@@ -2552,8 +2556,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                 // acceptance rule `submit` uses, because a requote is a
                 // submit that kept its place in the queue.
                 if self.assets.note_owner(order.sym, order.strategy_id) {
-                    self.counters.owner_contested =
-                        self.counters.owner_contested.wrapping_add(1);
+                    self.counters.owner_contested = self.counters.owner_contested.wrapping_add(1);
                 }
                 Ok(())
             }
@@ -2604,8 +2607,7 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
                     // E6 commit 3: CONSECUTIVE. One is a race with a
                     // roll; a streak is a member quoting an instance
                     // that no longer exists.
-                    self.asset_refusal_streak =
-                        self.asset_refusal_streak.saturating_add(1);
+                    self.asset_refusal_streak = self.asset_refusal_streak.saturating_add(1);
                 }
                 self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
                 DispatchError::NoLiveRoute
@@ -2636,16 +2638,16 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
             return Err(DispatchError::NoLiveRoute);
         };
         let wire = OrderWire::new(asset, order.side == Side::Bid, px, sz, tif)
-        // 3. LAW E-9 — the slot travels in the cloid, so the fill can
-        //    be routed without a table when it comes back.
-        .with_cloid(encode_cloid(order.strategy_id, order.client_oid));
+            // 3. LAW E-9 — the slot travels in the cloid, so the fill can
+            //    be routed without a table when it comes back.
+            .with_cloid(encode_cloid(order.strategy_id, order.client_oid));
 
         // Every local failure from here on bumps a counter. Without
         // that they are invisible: `stats()` reports nothing for this
         // arm, so an encode that silently refused every order would
         // look exactly like an engine that emitted none.
         let enc = |r: Result<usize, crate::msgpack::MsgPackErr>,
-                       c: &mut HlExecCounters|
+                   c: &mut HlExecCounters|
          -> Result<usize, DispatchError> {
             r.map_err(|_| {
                 c.encode_failures = c.encode_failures.wrapping_add(1);
@@ -2841,8 +2843,9 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
             // infinite gap. An arm that has never connected is not an
             // arm that has gone quiet, and reporting u64::MAX here
             // would halt every boot before its first connect.
-            self.last_ws_ok
-                .map_or(0, |t| t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64),
+            self.last_ws_ok.map_or(0, |t| {
+                t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+            }),
             // The reconciler measures a CONTRACT QUANTITY; the
             // threshold is money. Converted here, once, through the
             // function `recon` owns — the two numbers share a name
@@ -2858,8 +2861,9 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
             // once, a reconciler that stops agreeing (or stops
             // answering) is measured here and halts at
             // `halt_on_recon_stale_ms`.
-            self.last_recon_ok
-                .map_or(0, |t| t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64),
+            self.last_recon_ok.map_or(0, |t| {
+                t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+            }),
         )
         // E7 session bound: judged whenever anchored, legs held or
         // not (they are valued at cost — `recon::account_view`), and
@@ -3161,9 +3165,8 @@ mod tests {
     fn a_snapshot_sized_frame_does_not_vanish() {
         let mut x = exchange();
         // 400 fills in one frame — far past any steady-state size.
-        let mut body = String::from(
-            r#"{"channel":"userFills","data":{"isSnapshot":true,"fills":["#,
-        );
+        let mut body =
+            String::from(r#"{"channel":"userFills","data":{"isSnapshot":true,"fills":["#);
         for i in 0..400u64 {
             if i > 0 {
                 body.push(',');
@@ -3184,7 +3187,11 @@ mod tests {
             0,
             "a snapshot-sized frame was discarded as unscannable"
         );
-        assert_eq!(x.counters().fills_unresolved, 400, "every row accounted for");
+        assert_eq!(
+            x.counters().fills_unresolved,
+            400,
+            "every row accounted for"
+        );
     }
 
     /// A venue timestamp that will not convert must NOT be clamped.
@@ -3284,7 +3291,10 @@ mod tests {
         // A LIVE fill does accrue.
         let live = br#"{"channel":"userFills","data":{"isSnapshot":false,"fills":[{"coin":"BTC","px":"1000","sz":"1000","side":"B","time":1,"oid":2,"tid":2}]}}"#;
         x.route_fills(live);
-        assert!(x.budget_remaining() > before, "a live fill must earn budget");
+        assert!(
+            x.budget_remaining() > before,
+            "a live fill must earn budget"
+        );
     }
 
     /// The engine's scale is 1e6; the venue's is 1e8.
@@ -3366,10 +3376,7 @@ mod tests {
         for _ in 0..100 {
             let _ = x.cancel_all();
         }
-        assert_eq!(
-            x.counters.sweep_left, before,
-            "a retry is not a stranding"
-        );
+        assert_eq!(x.counters.sweep_left, before, "a retry is not a stranding");
     }
 
     /// Counters exist so an operator can tell a refusal from a
@@ -3630,7 +3637,11 @@ mod tests {
         x.count_post(&Ok((200, 0..1)), 3);
         assert_eq!(x.budget.spent(), before + 5, "three orders, three requests");
         x.count_post(&Ok((200, 0..1)), 0);
-        assert_eq!(x.budget.spent(), before + 6, "never less than the request itself");
+        assert_eq!(
+            x.budget.spent(),
+            before + 6,
+            "never less than the request itself"
+        );
     }
 
     /// The other half, end to end through `send_action`: a submit
@@ -3699,9 +3710,16 @@ mod tests {
         };
         let mut x = build();
         assert_eq!(x.pnl_anchor_usd_1e6(), 0, "no file, no anchor");
-        assert_eq!(x.pnl_state_path(), dir.join(crate::anchor::DEFAULT_STATE_PATH));
+        assert_eq!(
+            x.pnl_state_path(),
+            dir.join(crate::anchor::DEFAULT_STATE_PATH)
+        );
         let sig = x.halt_signal();
-        assert_eq!((sig.pnl_judged, sig.pnl_delta_usd_1e6), (0, 0), "unanchored: not judged");
+        assert_eq!(
+            (sig.pnl_judged, sig.pnl_delta_usd_1e6),
+            (0, 0),
+            "unanchored: not judged"
+        );
 
         // Zero USDC: nothing to bound.
         assert!(!x.note_account(AccountView::new(0, 0, 0)));
@@ -3709,11 +3727,22 @@ mod tests {
         assert_eq!(x.halt_signal().pnl_judged, 0);
 
         // The first reading anchors — a held leg at cost included.
-        assert!(x.note_account(AccountView::new(7_270_000, 1_360_000, 1)), "the anchor");
-        assert_eq!(x.pnl_anchor_usd_1e6(), 8_630_000, "USDC plus the leg at cost");
+        assert!(
+            x.note_account(AccountView::new(7_270_000, 1_360_000, 1)),
+            "the anchor"
+        );
+        assert_eq!(
+            x.pnl_anchor_usd_1e6(),
+            8_630_000,
+            "USDC plus the leg at cost"
+        );
         assert_eq!(x.session_pnl_usd_1e6(), 0);
         let sig = x.halt_signal();
-        assert_eq!((sig.pnl_judged, sig.pnl_delta_usd_1e6), (1, 0), "judged while holding");
+        assert_eq!(
+            (sig.pnl_judged, sig.pnl_delta_usd_1e6),
+            (1, 0),
+            "judged while holding"
+        );
 
         // Buying another leg moves nothing: USDC down, cost up.
         assert!(!x.note_account(AccountView::new(5_270_000, 3_360_000, 2)));
@@ -3730,7 +3759,11 @@ mod tests {
         assert_eq!(x.session_pnl_usd_1e6(), 15_000_000);
         assert!(!x.note_account(AccountView::new(1_630_000, 2_000_000, 2)));
         let sig = x.halt_signal();
-        assert_eq!((sig.pnl_judged, sig.pnl_delta_usd_1e6), (1, -5_000_000), "judged, held");
+        assert_eq!(
+            (sig.pnl_judged, sig.pnl_delta_usd_1e6),
+            (1, -5_000_000),
+            "judged, held"
+        );
         assert_eq!(x.pnl_anchor_usd_1e6(), 8_630_000, "and keeps the anchor");
 
         // `reconcile` is what persists (it needs a venue); the module
@@ -3742,7 +3775,11 @@ mod tests {
         };
         crate::anchor::store(x.pnl_state_path(), a).expect("persists");
         let y = build();
-        assert_eq!(y.pnl_anchor_usd_1e6(), 8_630_000, "a restart restores the anchor");
+        assert_eq!(
+            y.pnl_anchor_usd_1e6(),
+            8_630_000,
+            "a restart restores the anchor"
+        );
         let sig = y.halt_signal();
         assert_eq!(
             (sig.pnl_judged, sig.pnl_delta_usd_1e6),
@@ -3769,10 +3806,16 @@ mod tests {
             ..HlOk::default()
         };
         let r = x.judge(Spend::Submit, Ok(HlResponse::Ok(miss)));
-        assert!(matches!(r, Err(DispatchError::Http(200))), "nothing traded: {r:?}");
+        assert!(
+            matches!(r, Err(DispatchError::Http(200))),
+            "nothing traded: {r:?}"
+        );
         assert_eq!(x.counters.ioc_missed, 1);
         assert_eq!(x.counters.rejected, 0, "a miss is not a refusal");
-        assert_eq!(x.reject_streak, 2, "and it neither bumps nor resets the streak");
+        assert_eq!(
+            x.reject_streak, 2,
+            "and it neither bumps nor resets the streak"
+        );
 
         // The same wording on a CANCEL is not a miss — there is no
         // such thing as a cancel that found no counterparty.
@@ -3800,7 +3843,9 @@ mod tests {
             oid: 42,
             ..HlOk::default()
         };
-        let ok = x.judge(Spend::Submit, Ok(HlResponse::Ok(filled))).expect("filled");
+        let ok = x
+            .judge(Spend::Submit, Ok(HlResponse::Ok(filled)))
+            .expect("filled");
         assert_eq!(ok.oid, 42);
         assert_eq!(x.reject_streak, 0);
 
@@ -3906,7 +3951,10 @@ mod tests {
             x.queue_sweep(a, coin, 7, crate::recon::ALL_SLOTS);
         }
         assert_eq!(x.sweeps_n, MAX_PENDING_SWEEPS);
-        assert!(x.counters.sweep_left > 0, "overflow is COUNTED, not dropped");
+        assert!(
+            x.counters.sweep_left > 0,
+            "overflow is COUNTED, not dropped"
+        );
     }
 
     /// "Retry on the next idle" without a bound is a leg that burns the
@@ -3992,7 +4040,11 @@ mod tests {
 
         // The venue's OWN names, in the FILL namespace.
         assert_eq!(x.assets().sym_of_coin(b"#194180"), Some(4096), "Yes");
-        assert_eq!(x.assets().sym_of_coin(b"#194181"), Some(4097), "No is the next ordinal");
+        assert_eq!(
+            x.assets().sym_of_coin(b"#194181"),
+            Some(4097),
+            "No is the next ordinal"
+        );
 
         // And the asset ids the venue will accept.
         assert_eq!(x.assets().lookup(4096, 19_418), Ok(100_194_180));
@@ -4022,7 +4074,8 @@ mod tests {
         assert_eq!(x.counters().submitted, 0);
         assert!(
             matches!(
-                x.assets().lookup(4096, core_types::instance_of(o.client_oid)),
+                x.assets()
+                    .lookup(4096, core_types::instance_of(o.client_oid)),
                 Err(crate::asset::AssetError::StaleInstance { .. })
             ),
             "the refusal must be STALE, not merely unbound"
@@ -4042,7 +4095,11 @@ mod tests {
         // settlement is.
         const SETTLE: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194180","px":"1.0","sz":"2.0","side":"A","time":1757942400000,"oid":88,"tid":5001,"dir":"Settlement","fee":"0.0"}]}}"##;
         assert_eq!(x.route_fills(SETTLE), 0);
-        assert_eq!(x.counters().fills_unowned, 1, "no member has traded this leg");
+        assert_eq!(
+            x.counters().fills_unowned,
+            1,
+            "no member has traded this leg"
+        );
         assert_eq!(x.counters().fills_booked, 0);
         assert_eq!(x.counters().fills_settlement, 1, "still SEEN");
 
@@ -4065,7 +4122,11 @@ mod tests {
         assert_eq!(x.route_fills(SETTLE2), 1, "the settlement must now BOOK");
         assert_eq!(x.counters().fills_booked, 1);
         assert_eq!(x.counters().fills_unowned, 1, "unchanged");
-        assert_eq!(x.counters().fills_foreign, 0, "it must NOT go to the tape arm");
+        assert_eq!(
+            x.counters().fills_foreign,
+            0,
+            "it must NOT go to the tape arm"
+        );
     }
 
     /// The narrowness IS the safety. A cloid-less row that is not a
@@ -4150,7 +4211,11 @@ mod tests {
         let mut bal = [crate::recon::SpotBalance::default(); 8];
         let n = crate::recon::scan_spot_state(SHEET, &mut bal).expect("scans");
         assert_eq!(bal[1].hold_1e8, 100_000_000, "the fixture must HAVE a hold");
-        assert_eq!(bal[1].free_1e8(), 100_000_000, "which free would report as 1");
+        assert_eq!(
+            bal[1].free_1e8(),
+            100_000_000,
+            "which free would report as 1"
+        );
 
         let (legs, worst) = HlExchange::<64>::compare(x.assets(), &bal[..n], SHEET);
         assert_eq!(
@@ -4173,7 +4238,11 @@ mod tests {
         x.on_venue_event(&roll(19_418, 0, false, 4096));
         // The quarter rolls. `#194180` is now the PREVIOUS name.
         x.on_venue_event(&roll(19_419, 0, false, 4096));
-        assert_eq!(x.assets().booked_qty(4096), Some(0), "a new instance starts flat");
+        assert_eq!(
+            x.assets().booked_qty(4096),
+            Some(0),
+            "a new instance starts flat"
+        );
 
         // A fill for the leg that just ended, arriving late.
         const LATE: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194180","px":"0.68","sz":"2.0","side":"B","time":1757942400000,"oid":1,"tid":1,"cloid":"0x4d560300000000000000000000000001"}]}}"##;
@@ -4203,10 +4272,18 @@ mod tests {
     fn a_drift_must_survive_a_reconciliation_interval_before_it_can_halt() {
         let mut x = exchange();
         x.note_drift(2_000_000);
-        assert_eq!(x.counters().recon_drift_max_qty_1e6, 0, "one sighting is not drift");
+        assert_eq!(
+            x.counters().recon_drift_max_qty_1e6,
+            0,
+            "one sighting is not drift"
+        );
         assert_eq!(x.halt_signal().recon_drift_usd_1e6, 0, "and halts nothing");
         x.note_drift(0);
-        assert_eq!(x.counters().recon_drift_max_qty_1e6, 0, "cleared: it was the race");
+        assert_eq!(
+            x.counters().recon_drift_max_qty_1e6,
+            0,
+            "cleared: it was the race"
+        );
 
         x.note_drift(3_000_000);
         x.note_drift(2_000_000);
@@ -4215,10 +4292,18 @@ mod tests {
             2_000_000,
             "two consecutive sightings confirm the smaller"
         );
-        assert_eq!(x.halt_signal().recon_drift_usd_1e6, 2_000_000, "and the halt reads it");
+        assert_eq!(
+            x.halt_signal().recon_drift_usd_1e6,
+            2_000_000,
+            "and the halt reads it"
+        );
         x.note_drift(0);
         x.note_drift(5_000_000);
-        assert_eq!(x.counters().recon_drift_max_qty_1e6, 2_000_000, "a high-water mark never clears");
+        assert_eq!(
+            x.counters().recon_drift_max_qty_1e6,
+            2_000_000,
+            "a high-water mark never clears"
+        );
         x.note_drift(5_000_000);
         assert_eq!(x.counters().recon_drift_max_qty_1e6, 5_000_000);
     }
@@ -4233,7 +4318,8 @@ mod tests {
         assert_eq!(x.route_fills(BUY), 1);
 
         // A sheet with no outcome legs at all.
-        const EMPTY: &[u8] = br#"{"balances":[{"coin":"USDC","token":0,"total":"997.64","hold":"0.0"}]}"#;
+        const EMPTY: &[u8] =
+            br#"{"balances":[{"coin":"USDC","token":0,"total":"997.64","hold":"0.0"}]}"#;
         let mut bal = [crate::recon::SpotBalance::default(); 8];
         let n = crate::recon::scan_spot_state(EMPTY, &mut bal).expect("scans");
         let (legs, worst) = HlExchange::<64>::compare(x.assets(), &bal[..n], EMPTY);
@@ -4396,9 +4482,8 @@ mod tests {
     fn a_full_selection_finishes_within_the_retries_it_has() {
         // A 256-order leg: exactly one buffer, truncated on the first
         // call and shrinking from there.
-        let (idles, tries, stalls) =
-            run_sweep_to_completion(crate::recon::MAX_OPEN_ORDERS, true)
-                .expect("a 256-order sweep must not be abandoned");
+        let (idles, tries, stalls) = run_sweep_to_completion(crate::recon::MAX_OPEN_ORDERS, true)
+            .expect("a 256-order sweep must not be abandoned");
         assert_eq!(idles, 32, "256 orders at 8 a call");
         assert_eq!(tries, SWEEP_TRIES, "deferral spent no retries");
         assert_eq!(stalls, 0);
@@ -4490,7 +4575,10 @@ mod tests {
         assert_eq!(x.assets().owner_of_sym(4096), Some(3));
 
         // A second member trades the same leg.
-        assert!(x.assets_mut().note_owner(4096, 5), "must report the contest");
+        assert!(
+            x.assets_mut().note_owner(4096, 5),
+            "must report the contest"
+        );
         assert_eq!(
             x.assets().owner_of_sym(4096),
             None,
@@ -4566,8 +4654,16 @@ mod tests {
 
         assert_eq!(x.counters().rolls_refused, 1);
         assert_eq!(x.counters().rolls_bound, 0);
-        assert_eq!(x.assets().len(), before, "a refused roll must bind NEITHER leg");
-        assert_eq!(x.assets().sym_of_coin(b"#194180"), None, "not even the Yes leg");
+        assert_eq!(
+            x.assets().len(),
+            before,
+            "a refused roll must bind NEITHER leg"
+        );
+        assert_eq!(
+            x.assets().sym_of_coin(b"#194180"),
+            None,
+            "not even the Yes leg"
+        );
     }
 
     /// `sym + 1` on a wire-derived symbol. `SYMBOL_ID_NONE` is
@@ -4592,10 +4688,8 @@ mod tests {
 
         // One below the top still binds — the guard refuses the wrap,
         // not the range.
-        let ok = core_types::make_symbol_id(
-            VenueId::Hyperliquid,
-            core_types::SYMBOL_ORDINAL_MASK - 1,
-        );
+        let ok =
+            core_types::make_symbol_id(VenueId::Hyperliquid, core_types::SYMBOL_ORDINAL_MASK - 1);
         x.on_venue_event(&roll(19_418, 0, false, ok));
         assert_eq!(x.counters().rolls_bound, 1);
     }
@@ -4687,7 +4781,11 @@ mod tests {
             "the trait modify never reached modify_by_cloid"
         );
         assert_eq!(x.counters().modifies_refused, 1);
-        assert_eq!(x.counters().refused_local, 2, "one LAW E-4 refusal per verb");
+        assert_eq!(
+            x.counters().refused_local,
+            2,
+            "one LAW E-4 refusal per verb"
+        );
         assert_eq!(x.counters().cancels_sent + x.counters().modifies_sent, 0);
     }
 
@@ -4722,8 +4820,14 @@ mod tests {
         let body = String::from_utf8_lossy(x.http.body_mut());
         let resting = format!("\"oid\":{}", cloid_json(3, prev));
         let replacement = format!("\"c\":{}", cloid_json(3, repl.client_oid));
-        assert!(body.contains(&resting), "resting order not addressed by its cloid");
-        assert!(body.contains(&replacement), "replacement does not carry its own cloid");
+        assert!(
+            body.contains(&resting),
+            "resting order not addressed by its cloid"
+        );
+        assert!(
+            body.contains(&replacement),
+            "replacement does not carry its own cloid"
+        );
         // The stamping `ModifyReq::new` does (verb, prev id) must not
         // reach the wire: the action is byte-for-byte the one an
         // unstamped replacement encodes.
@@ -4749,11 +4853,22 @@ mod tests {
         let resting = order(42, ORDER_KIND_MAKER);
         let r = OrderDispatch::cancel(&mut x, &CancelReq::of(&resting, 2));
         assert!(
-            !matches!(r, Err(DispatchError::Unsupported | DispatchError::SlotDisabled | DispatchError::NoLiveRoute)),
+            !matches!(
+                r,
+                Err(DispatchError::Unsupported
+                    | DispatchError::SlotDisabled
+                    | DispatchError::NoLiveRoute)
+            ),
             "the cancel stopped before the socket: {r:?}"
         );
         let body = String::from_utf8_lossy(x.http.body_mut());
-        let named = format!("\"asset\":3,\"cloid\":{}", cloid_json(3, resting.client_oid));
-        assert!(body.contains(&named), "the cancel did not name this order: {named}");
+        let named = format!(
+            "\"asset\":3,\"cloid\":{}",
+            cloid_json(3, resting.client_oid)
+        );
+        assert!(
+            body.contains(&named),
+            "the cancel did not name this order: {named}"
+        );
     }
 }

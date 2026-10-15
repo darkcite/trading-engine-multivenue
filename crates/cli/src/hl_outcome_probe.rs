@@ -170,7 +170,10 @@ impl ProbeSpec {
     /// The first term out of its bounds.
     pub fn validate(&mut self) -> Result<(), String> {
         if self.offsets_s.is_empty() || self.offsets_s.len() > MAX_OFFSETS {
-            return Err(format!("{} offsets; 1 ..= {MAX_OFFSETS}", self.offsets_s.len()));
+            return Err(format!(
+                "{} offsets; 1 ..= {MAX_OFFSETS}",
+                self.offsets_s.len()
+            ));
         }
         self.offsets_s.sort_unstable_by(|a, b| b.cmp(a));
         let mut i = 0usize;
@@ -185,10 +188,16 @@ impl ProbeSpec {
             i += 1;
         }
         if self.max_orders == 0 || self.max_orders > MAX_ORDERS {
-            return Err(format!("max_orders {} outside 1 ..= {MAX_ORDERS}", self.max_orders));
+            return Err(format!(
+                "max_orders {} outside 1 ..= {MAX_ORDERS}",
+                self.max_orders
+            ));
         }
         if self.instances == 0 || self.instances > MAX_INSTANCES {
-            return Err(format!("instances {} outside 1 ..= {MAX_INSTANCES}", self.instances));
+            return Err(format!(
+                "instances {} outside 1 ..= {MAX_INSTANCES}",
+                self.instances
+            ));
         }
         Ok(())
     }
@@ -439,7 +448,9 @@ fn num_field(obj: &[u8], key: &[u8]) -> Option<u64> {
 pub fn agent_valid_until(body: &[u8], agent_hex: &str) -> Option<u64> {
     let lower = body.to_ascii_lowercase();
     let needle = agent_hex.to_ascii_lowercase();
-    let at = lower.windows(needle.len()).position(|w| w == needle.as_bytes())?;
+    let at = lower
+        .windows(needle.len())
+        .position(|w| w == needle.as_bytes())?;
     num_field(enclosing(&lower, at)?, b"\"validuntil\":")
 }
 
@@ -521,8 +532,15 @@ struct Venue {
 
 impl Venue {
     fn new(cfg: &HlConfig, tls: Arc<ClientConfig>) -> Result<Self, String> {
-        let info = HttpsPost::new(&cfg.host, cfg.port(), "/info", tls.clone(), INFO_REQ, INFO_RESP)
-            .map_err(|e| format!("{}/info: {e}", cfg.host))?;
+        let info = HttpsPost::new(
+            &cfg.host,
+            cfg.port(),
+            "/info",
+            tls.clone(),
+            INFO_REQ,
+            INFO_RESP,
+        )
+        .map_err(|e| format!("{}/info: {e}", cfg.host))?;
         let exchange = HlHttp::new(&cfg.host, cfg.port(), tls)
             .map_err(|e| format!("{}/exchange: {e:?}", cfg.host))?;
         Ok(Self {
@@ -539,7 +557,10 @@ impl Venue {
             return Err(String::from("/info: request too large"));
         }
         b[..body.len()].copy_from_slice(body);
-        let (status, r) = self.info.post(body.len()).map_err(|e| format!("/info: {e}"))?;
+        let (status, r) = self
+            .info
+            .post(body.len())
+            .map_err(|e| format!("/info: {e}"))?;
         if status != 200 {
             return Err(format!("/info: http status {status}"));
         }
@@ -585,7 +606,8 @@ impl Venue {
     fn instance(&mut self, now_ms: u64) -> Result<HlOutcomeSpec, String> {
         let b = self.read(br#"{"type":"outcomeMeta"}"#)?;
         let mut d = HlDiscovery::new();
-        d.ingest_outcome_meta(&b).map_err(|e| format!("outcomeMeta: {e:?}"))?;
+        d.ingest_outcome_meta(&b)
+            .map_err(|e| format!("outcomeMeta: {e:?}"))?;
         let specs = d.outcome_specs();
         let mut coins = Box::new(HlCoinTable::new());
         let fams = crate::paper::build_hl_families(&[FAMILY.to_owned()], &mut coins)?;
@@ -686,7 +708,9 @@ fn send_ioc(
                 avg_1e8: items[0].avg_px_1e8,
             },
             ITEM_RESTING => Answer::Resting { oid: items[0].oid },
-            ITEM_ERROR => Answer::Error(String::from_utf8_lossy(items[0].msg.of(&body)).to_string()),
+            ITEM_ERROR => {
+                Answer::Error(String::from_utf8_lossy(items[0].msg.of(&body)).to_string())
+            }
             k => Answer::InDoubt(format!("an item of kind {k} to an order")),
         },
         Ok(ItemsReply::Items(n)) => Answer::InDoubt(format!("{n} items for one order")),
@@ -710,19 +734,23 @@ fn cancel(
     asset: u32,
     cloid_b: [u8; 16],
 ) -> bool {
-    let c = [CancelByCloidWire { asset, cloid: cloid_b }];
+    let c = [CancelByCloidWire {
+        asset,
+        cloid: cloid_b,
+    }];
     let mut mp = [0u8; MAX_ACTION];
     let mut aj = [0u8; MAX_ACTION];
-    let (Ok(mn), Ok(an)) = (encode_cancel_by_cloid(&mut mp, &c), cancel_by_cloid_json(&mut aj, &c))
-    else {
+    let (Ok(mn), Ok(an)) = (
+        encode_cancel_by_cloid(&mut mp, &c),
+        cancel_by_cloid_json(&mut aj, &c),
+    ) else {
         return false;
     };
     let Ok((body, _)) = post_action(v, sk, network, nonces, &mp[..mn], &aj[..an]) else {
         return false;
     };
     let mut items = [ItemStatus::default(); 1];
-    matches!(scan_items(&body, &mut items), Ok(ItemsReply::Items(1)))
-        && items[0].kind != ITEM_ERROR
+    matches!(scan_items(&body, &mut items), Ok(ItemsReply::Items(1))) && items[0].kind != ITEM_ERROR
 }
 
 /// The account's statement before anything is signed.
@@ -850,7 +878,8 @@ pub fn run(cfg: &HlConfig, tls: Arc<ClientConfig>, spec: &ProbeSpec) -> u8 {
         fmt_1e8(acct.usdc_1e8),
         acct.budget_left,
         acct.open_orders,
-        acct.agent_valid_until_ms.map_or_else(|| String::from("null"), |t| t.to_string())
+        acct.agent_valid_until_ms
+            .map_or_else(|| String::from("null"), |t| t.to_string())
     );
     if let Some(why) = refuse_account(&acct, start_ms, spec.max_orders) {
         if spec.dry_run {
@@ -895,7 +924,10 @@ pub fn run(cfg: &HlConfig, tls: Arc<ClientConfig>, spec: &ProbeSpec) -> u8 {
             }
         };
         let Some(inst) = inst else {
-            eprintln!("hl-outcome-probe: no instance came round in {} s", MAX_WAIT_MS / 1_000);
+            eprintln!(
+                "hl-outcome-probe: no instance came round in {} s",
+                MAX_WAIT_MS / 1_000
+            );
             break;
         };
         let expiry_ms = inst.expiry_ns / 1_000_000;
@@ -917,7 +949,9 @@ pub fn run(cfg: &HlConfig, tls: Arc<ClientConfig>, spec: &ProbeSpec) -> u8 {
             }
             sleep_until_ms(target);
             let t_read = now_ms();
-            let books = v.book(enc_yes).and_then(|y| v.book(enc_yes + 1).map(|n| (y, n)));
+            let books = v
+                .book(enc_yes)
+                .and_then(|y| v.book(enc_yes + 1).map(|n| (y, n)));
             let t_books = now_ms();
             let (yes, no) = match books {
                 Ok(b) => b,
@@ -949,13 +983,18 @@ pub fn run(cfg: &HlConfig, tls: Arc<ClientConfig>, spec: &ProbeSpec) -> u8 {
                 fmt_1e8(mid),
                 by_price.map_or("null", |y| if y { "\"yes\"" } else { "\"no\"" })
             );
-            let (is_yes, px, sz) = match plan(yes, no, by_price, t.spent_1e8, t.sent, spec.max_orders) {
-                Plan::Skip(why) => {
-                    println!(r#"{line},"kind":"skip","why":"{why}"}}"#);
-                    continue;
-                }
-                Plan::Buy { yes, px_1e8, sz_1e8 } => (yes, px_1e8, sz_1e8),
-            };
+            let (is_yes, px, sz) =
+                match plan(yes, no, by_price, t.spent_1e8, t.sent, spec.max_orders) {
+                    Plan::Skip(why) => {
+                        println!(r#"{line},"kind":"skip","why":"{why}"}}"#);
+                        continue;
+                    }
+                    Plan::Buy {
+                        yes,
+                        px_1e8,
+                        sz_1e8,
+                    } => (yes, px_1e8, sz_1e8),
+                };
             let enc = enc_yes + u64::from(!is_yes);
             let asset = u32::try_from(u64::from(ASSET_BASE) + enc).unwrap_or(0);
             let notional = px * (sz / E8);
@@ -968,7 +1007,8 @@ pub fn run(cfg: &HlConfig, tls: Arc<ClientConfig>, spec: &ProbeSpec) -> u8 {
                 fmt_1e8(notional)
             );
             let Some(sk) = sk.as_ref() else {
-                let order = OrderWire::new(asset, true, px, sz, Tif::Ioc).with_cloid(probe_cloid(run_s, t.sent));
+                let order = OrderWire::new(asset, true, px, sz, Tif::Ioc)
+                    .with_cloid(probe_cloid(run_s, t.sent));
                 let mut aj = [0u8; MAX_ACTION];
                 let action = order_json(&mut aj, &[order], b"na")
                     .map(|n| String::from_utf8_lossy(&aj[..n]).to_string())
@@ -997,7 +1037,11 @@ pub fn run(cfg: &HlConfig, tls: Arc<ClientConfig>, spec: &ProbeSpec) -> u8 {
                 expiry_ms.saturating_sub(t_ans)
             );
             match &ans {
-                Answer::Filled { oid, sz_1e8, avg_1e8 } => {
+                Answer::Filled {
+                    oid,
+                    sz_1e8,
+                    avg_1e8,
+                } => {
                     t.filled += 1;
                     sent_oids.push(*oid);
                     let _ = write!(
@@ -1030,7 +1074,10 @@ pub fn run(cfg: &HlConfig, tls: Arc<ClientConfig>, spec: &ProbeSpec) -> u8 {
             }
             println!("{line}}}");
             if stop {
-                eprintln!("hl-outcome-probe: STOPPING — {} — check the account by hand", ans.kind());
+                eprintln!(
+                    "hl-outcome-probe: STOPPING — {} — check the account by hand",
+                    ans.kind()
+                );
                 break;
             }
         }
@@ -1164,7 +1211,11 @@ mod tests {
             dry_run: false,
         };
         s.validate().expect("valid");
-        assert_eq!(s.offsets_s, vec![25, 15, 8, 3], "descending: the earliest offset first");
+        assert_eq!(
+            s.offsets_s,
+            vec![25, 15, 8, 3],
+            "descending: the earliest offset first"
+        );
         assert!(ProbeSpec::parse_offsets("25,x").is_err());
         let bad: [(&str, u32, u32, &str); 6] = [
             ("", 4, 1, "0 offsets"),
@@ -1194,7 +1245,14 @@ mod tests {
         assert_eq!(contracts_for(E8), 1);
         assert_eq!(contracts_for(0), 0);
         // The favourite is the leg with the higher mid; No here.
-        let p = plan(touch(2_000_000, 3_000_000, 50), touch(97_000_000, 98_000_000, 50), None, 0, 0, 4);
+        let p = plan(
+            touch(2_000_000, 3_000_000, 50),
+            touch(97_000_000, 98_000_000, 50),
+            None,
+            0,
+            0,
+            4,
+        );
         assert_eq!(
             p,
             Plan::Buy {
@@ -1214,12 +1272,21 @@ mod tests {
     fn the_plan_refuses_what_the_test_must_not_send() {
         let yes = touch(96_000_000, 97_000_000, 50);
         let no = touch(3_000_000, 4_000_000, 50);
-        assert!(matches!(plan(yes, no, None, 0, 0, 4), Plan::Buy { yes: true, .. }));
+        assert!(matches!(
+            plan(yes, no, None, 0, 0, 4),
+            Plan::Buy { yes: true, .. }
+        ));
         let cases: [(Touch, Touch, i64, u32, &str); 7] = [
             (yes, no, 0, 4, "order count"),
             (yes, yes, 0, 0, "no favourite"),
             (touch(96_000_000, 0, 50), no, 0, 0, "no ask"),
-            (touch(40_000_000, 45_000_000, 50), touch(30_000_000, 35_000_000, 50), 0, 0, "under 0.50"),
+            (
+                touch(40_000_000, 45_000_000, 50),
+                touch(30_000_000, 35_000_000, 50),
+                0,
+                0,
+                "under 0.50",
+            ),
             (touch(99_900_000, 100_000_000, 50), no, 0, 0, "1.0"),
             (touch(96_000_000, 97_000_000, 1), no, 0, 0, "under a dollar"),
             (yes, no, 9 * E8, 0, "$10 total cap"),
@@ -1242,13 +1309,16 @@ mod tests {
         let no = touch(3_000_000, 4_000_000, 50);
         let mut spent = 0i64;
         let mut placed = 0u32;
-        while let Plan::Buy { px_1e8, sz_1e8, .. } = plan(yes, no, None, spent, placed, MAX_ORDERS) {
+        while let Plan::Buy { px_1e8, sz_1e8, .. } = plan(yes, no, None, spent, placed, MAX_ORDERS)
+        {
             spent += px_1e8 * (sz_1e8 / E8);
             placed += 1;
         }
         assert_eq!(placed, 5, "five orders of $1.94 fit under $10");
         assert!(spent <= MAX_TOTAL_1E8);
-        assert!(matches!(plan(yes, no, None, spent, placed, MAX_ORDERS), Plan::Skip(w) if w.contains("cap")));
+        assert!(
+            matches!(plan(yes, no, None, spent, placed, MAX_ORDERS), Plan::Skip(w) if w.contains("cap"))
+        );
     }
 
     #[test]
@@ -1257,7 +1327,10 @@ mod tests {
         assert_eq!(&c[..4], b"H90D");
         assert!(probe_cloid_is_foreign(&c), "a slot would book it otherwise");
         assert_ne!(probe_cloid(1, 0), probe_cloid(1, 1));
-        assert!(!probe_cloid_is_foreign(&cloid::encode(3, 7)), "the engine's own are not foreign");
+        assert!(
+            !probe_cloid_is_foreign(&cloid::encode(3, 7)),
+            "the engine's own are not foreign"
+        );
     }
 
     #[test]
@@ -1281,12 +1354,21 @@ mod tests {
             agent_valid_until(agents, "0xabc0000000000000000000000000000000000001"),
             Some(1_792_368_000_000)
         );
-        assert_eq!(agent_valid_until(agents, "0x1110000000000000000000000000000000000001"), None);
+        assert_eq!(
+            agent_valid_until(agents, "0x1110000000000000000000000000000000000001"),
+            None
+        );
         let fills = br##"[{"coin":"#123450","px":"0.97","sz":"2.0","side":"B","time":1792000000123,"startPosition":"0.0","dir":"Buy","closedPnl":"0.0","hash":"0x1","oid":4242,"crossed":true,"fee":"0.0003","tid":9,"cloid":"0x48393044000000000000000000000000","feeToken":"USDC"},{"coin":"BTC","px":"1","sz":"1","time":1,"dir":"Open Long","oid":1,"fee":"0"},{"coin":"#123450","px":"1.0","sz":"2.0","time":1792000060000,"dir":"Settlement","oid":77,"fee":"0.0"}]"##;
         let rows = fill_rows(fills, &[String::from("#123450"), String::from("#123451")]);
         assert_eq!(rows.len(), 2, "the perp row is not the probe's");
         assert_eq!(
-            (rows[0].oid, rows[0].px_1e8, rows[0].sz_1e8, rows[0].fee_1e8, rows[0].time_ms),
+            (
+                rows[0].oid,
+                rows[0].px_1e8,
+                rows[0].sz_1e8,
+                rows[0].fee_1e8,
+                rows[0].time_ms
+            ),
             (4242, 97_000_000, 2 * E8, 30_000, 1_792_000_000_123)
         );
         assert_eq!(rows[0].dir, "Buy");
@@ -1303,14 +1385,58 @@ mod tests {
             agent_valid_until_ms: Some(now + 86_400_000),
         };
         assert_eq!(refuse_account(&ok, now, 4), None);
-        assert_eq!((usdc_needed_1e8(1), usdc_needed_1e8(4), usdc_needed_1e8(8)), (2 * E8, 8 * E8, 10 * E8));
-        assert!(refuse_account(&Account { usdc_1e8: 3 * E8, ..ok }, now, 1).is_none(), "$3 runs one order");
+        assert_eq!(
+            (usdc_needed_1e8(1), usdc_needed_1e8(4), usdc_needed_1e8(8)),
+            (2 * E8, 8 * E8, 10 * E8)
+        );
+        assert!(
+            refuse_account(
+                &Account {
+                    usdc_1e8: 3 * E8,
+                    ..ok
+                },
+                now,
+                1
+            )
+            .is_none(),
+            "$3 runs one order"
+        );
         let cases: [(Account, &str); 5] = [
-            (Account { open_orders: 1, ..ok }, "open order"),
-            (Account { usdc_1e8: 7 * E8, ..ok }, "lower --max-orders"),
-            (Account { budget_left: 10, ..ok }, "budget"),
-            (Account { agent_valid_until_ms: None, ..ok }, "not in the master's extraAgents"),
-            (Account { agent_valid_until_ms: Some(now + 60_000), ..ok }, "renew"),
+            (
+                Account {
+                    open_orders: 1,
+                    ..ok
+                },
+                "open order",
+            ),
+            (
+                Account {
+                    usdc_1e8: 7 * E8,
+                    ..ok
+                },
+                "lower --max-orders",
+            ),
+            (
+                Account {
+                    budget_left: 10,
+                    ..ok
+                },
+                "budget",
+            ),
+            (
+                Account {
+                    agent_valid_until_ms: None,
+                    ..ok
+                },
+                "not in the master's extraAgents",
+            ),
+            (
+                Account {
+                    agent_valid_until_ms: Some(now + 60_000),
+                    ..ok
+                },
+                "renew",
+            ),
         ];
         for (a, want) in cases {
             let why = refuse_account(&a, now, 4).expect(want);
@@ -1331,26 +1457,49 @@ mod tests {
         // Mainnet 2026-10-13 11:44:45Z: one wide quote mirrored on both legs.
         let wide = touch(210_000, 99_790_000, 477);
         let strike = 8_349_500_000_000i64; // $83 495
-        assert_eq!(side_by_price(strike + strike / 1_000, strike), Some(true), "10 bps above");
-        assert_eq!(side_by_price(strike - strike / 1_000, strike), Some(false), "10 bps below");
-        assert_eq!(side_by_price(strike + strike / 2_000, strike), None, "5 bps: too close");
+        assert_eq!(
+            side_by_price(strike + strike / 1_000, strike),
+            Some(true),
+            "10 bps above"
+        );
+        assert_eq!(
+            side_by_price(strike - strike / 1_000, strike),
+            Some(false),
+            "10 bps below"
+        );
+        assert_eq!(
+            side_by_price(strike + strike / 2_000, strike),
+            None,
+            "5 bps: too close"
+        );
         assert_eq!(side_by_price(0, strike), None, "no mid, no side");
         assert!(matches!(plan(wide, wide, None, 0, 0, 4), Plan::Skip(w) if w.contains("level")));
         assert_eq!(
             plan(wide, wide, Some(false), 0, 0, 4),
-            Plan::Buy { yes: false, px_1e8: 99_790_000, sz_1e8: 2 * E8 }
+            Plan::Buy {
+                yes: false,
+                px_1e8: 99_790_000,
+                sz_1e8: 2 * E8
+            }
         );
         // A book that leans 0.10 or more decides by itself, whatever the price says.
         let yes = touch(96_000_000, 97_000_000, 50);
         let no = touch(3_000_000, 4_000_000, 50);
-        assert!(matches!(plan(yes, no, Some(false), 0, 0, 4), Plan::Buy { yes: true, .. }));
+        assert!(matches!(
+            plan(yes, no, Some(false), 0, 0, 4),
+            Plan::Buy { yes: true, .. }
+        ));
         // Mainnet 12:00:00Z: the favourite (No, by price) asked 0.99909 -- 5
         // significant figures, a price the venue's own book carries.
         let yes_late = touch(91_000, 99_280_000, 2_778);
         let no_late = touch(720_000, 99_909_000, 1_099);
         assert_eq!(
             plan(yes_late, no_late, Some(false), 0, 0, 4),
-            Plan::Buy { yes: false, px_1e8: 99_909_000, sz_1e8: 2 * E8 }
+            Plan::Buy {
+                yes: false,
+                px_1e8: 99_909_000,
+                sz_1e8: 2 * E8
+            }
         );
         for (px, ok) in [
             (99_909_000, true),

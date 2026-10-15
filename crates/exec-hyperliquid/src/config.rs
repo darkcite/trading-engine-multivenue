@@ -226,7 +226,9 @@ impl core::fmt::Display for ConfigErr {
                  is {len} characters long (not echoed — a secret pasted into the wrong variable \
                  must not reach a log)"
             ),
-            ConfigErr::BadHex(v) => write!(f, "hl config: {v} is not valid hex of the right length"),
+            ConfigErr::BadHex(v) => {
+                write!(f, "hl config: {v} is not valid hex of the right length")
+            }
             ConfigErr::Locking(e) => write!(
                 f,
                 "hl config: the agent key could not be mlock'd into its own page (errno {e}). \
@@ -257,7 +259,11 @@ impl core::fmt::Display for ConfigErr {
                 "hl config: host {host} is the {} network but {var}={source} signs for the \
                  {} network. Every order would be rejected — or worse, signed for one network and \
                  sent to the other. Set {var}={expected}.",
-                if *expected == 'a' { "MAINNET" } else { "TESTNET" },
+                if *expected == 'a' {
+                    "MAINNET"
+                } else {
+                    "TESTNET"
+                },
                 if *source == 'a' { "mainnet" } else { "testnet" },
             ),
         }
@@ -333,10 +339,11 @@ impl HlConfig {
             signer_eip712::address_from_private_key(&agent_key).map_err(|_| ConfigErr::BadKey)?;
         // Moves the bytes into an mlock'd page AND zeroizes the copy
         // the caller handed us, so `agent_key` is dead on return.
-        let agent_key = core_config::SecretKeyBytes::new_locked(agent_key).map_err(|e| match e {
-            core_config::ConfigError::Mlock(errno) => ConfigErr::Locking(errno),
-            _ => ConfigErr::BadKey,
-        })?;
+        let agent_key =
+            core_config::SecretKeyBytes::new_locked(agent_key).map_err(|e| match e {
+                core_config::ConfigError::Mlock(errno) => ConfigErr::Locking(errno),
+                _ => ConfigErr::BadKey,
+            })?;
         Ok(Self {
             // COPY: ≤ 64 B host name into the config, ONCE at boot —
             // the env var's storage is not ours to borrow for the
@@ -497,7 +504,10 @@ fn hex_nibble(c: u8) -> Option<u8> {
 
 fn parse_hex_n<const N: usize>(s: &str) -> Option<[u8; N]> {
     let s = s.trim();
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     if s.len() != N * 2 {
         return None;
     }

@@ -227,7 +227,10 @@ mod tests {
         assert_eq!(out[2], 0, "and a stale value is never carried in");
 
         let mut empty = [5i64; EXEC_SLOTS];
-        assert_eq!(scan_day_bought(b" [ ] ", 0, &mut empty).expect("an empty day"), 0);
+        assert_eq!(
+            scan_day_bought(b" [ ] ", 0, &mut empty).expect("an empty day"),
+            0
+        );
         assert_eq!(empty, [0; EXEC_SLOTS]);
     }
 
@@ -248,7 +251,10 @@ mod tests {
             ),
         ] {
             let mut out = [0i64; EXEC_SLOTS];
-            assert!(scan_day_bought(bad.as_bytes(), 0, &mut out).is_err(), "{bad}");
+            assert!(
+                scan_day_bought(bad.as_bytes(), 0, &mut out).is_err(),
+                "{bad}"
+            );
             assert_eq!(out, [0; EXEC_SLOTS], "{bad}");
         }
     }

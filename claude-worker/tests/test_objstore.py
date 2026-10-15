@@ -103,9 +103,7 @@ def test_canonical_query_encodes_and_sorts() -> None:
     query = claude_worker.objstore.canonical_query(
         [("prefix", "v1/runs/mbp-m4/"), ("continuation-token", "1/abc+def="), ("list-type", "2")]
     )
-    assert query == (
-        "continuation-token=1%2Fabc%2Bdef%3D&list-type=2&prefix=v1%2Fruns%2Fmbp-m4%2F"
-    )
+    assert query == ("continuation-token=1%2Fabc%2Bdef%3D&list-type=2&prefix=v1%2Fruns%2Fmbp-m4%2F")
 
 
 def test_canonical_query_space_is_percent_20_never_plus() -> None:
@@ -484,9 +482,7 @@ def test_capped_upload_is_paced_in_small_pieces(tmp_path: pathlib.Path) -> None:
     fake = _FakeTime()
     fake_s3 = tests.fake_s3.FakeS3()
     rate = 1024.0 * 1024.0
-    store = make_store(
-        fake_s3, sleep=fake.sleep, max_upload_bps=rate, monotonic=fake.clock
-    )
+    store = make_store(fake_s3, sleep=fake.sleep, max_upload_bps=rate, monotonic=fake.clock)
     size = 3 * 1024 * 1024
     src = tmp_path / "obj.bin"
     src.write_bytes(b"c" * size)

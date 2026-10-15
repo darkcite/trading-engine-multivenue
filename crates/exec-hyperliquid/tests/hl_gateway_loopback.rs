@@ -945,13 +945,22 @@ fn an_answer_that_arrives_with_the_fin_is_delivered_before_the_close() {
     let mut evs = Vec::new();
     live(&mut gw, &mut eng, &mut evs);
     assert!(eng.cmd.push(&alo(1)));
-    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, _| !v.posts().is_empty()));
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, _| !v
+        .posts()
+        .is_empty()));
     // The answer and the FIN both land before the gateway reads again.
     std::thread::sleep(Duration::from_millis(300));
-    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| count(e, EV_ACK)
-        + count(e, EV_UNANSWERED)
-        >= 1));
-    assert_eq!(count(&evs, EV_ACK), 1, "the answer behind the FIN is delivered");
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| count(
+        e, EV_ACK
+    ) + count(
+        e,
+        EV_UNANSWERED
+    ) >= 1));
+    assert_eq!(
+        count(&evs, EV_ACK),
+        1,
+        "the answer behind the FIN is delivered"
+    );
     assert_eq!(count(&evs, EV_UNANSWERED), 0);
     assert!(
         drive(&mut gw, &mut eng, &mut evs, 15, |g, e| g.ws_live()
@@ -974,21 +983,32 @@ fn a_post_whose_socket_dies_under_the_write_is_re_sent_by_rest_unchanged() {
     let ws_posts_before = v.posts().len();
     gw.kill_ws_after_next_send();
     assert!(eng.cmd.push(&alo(1)));
-    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| count(e, EV_ACK)
-        + count(e, EV_UNANSWERED)
-        >= 1));
-    assert_eq!(count(&evs, EV_ACK), 1, "the REST re-send's answer ACKs the post");
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| count(
+        e, EV_ACK
+    ) + count(
+        e,
+        EV_UNANSWERED
+    ) >= 1));
+    assert_eq!(
+        count(&evs, EV_ACK),
+        1,
+        "the REST re-send's answer ACKs the post"
+    );
     assert_eq!(count(&evs, EV_UNANSWERED), 0);
     // The WebSocket copy reaches the venue too (it left before the "death").
     let t0 = Instant::now();
     let posts = loop {
         let p = v.posts();
-        if p.iter().any(|s| s.conn == 0 && s.body.contains(r#""method":"post""#))
+        if p.iter()
+            .any(|s| s.conn == 0 && s.body.contains(r#""method":"post""#))
             && p.len() > ws_posts_before
         {
             break p;
         }
-        assert!(t0.elapsed() < Duration::from_secs(2), "the WebSocket post never arrived");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "the WebSocket post never arrived"
+        );
         std::thread::sleep(Duration::from_millis(10));
     };
     let rest: Vec<_> = posts.iter().filter(|s| s.conn == usize::MAX).collect();

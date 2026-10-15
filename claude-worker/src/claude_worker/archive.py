@@ -311,7 +311,7 @@ def free_gib(path: pathlib.Path) -> float:
 def _read_progress(path: pathlib.Path) -> dict[str, typing.Any]:
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return {}
     return loaded if isinstance(loaded, dict) else {}
 
@@ -564,9 +564,7 @@ class Archiver:
 
             sha256_hex, _md5, size = _digests(path)
             staged = staging / (path.name + ".zst")
-            stored_sha, stored_md5, stored_size = compress_to(
-                path, staged, self.cfg.zstd_level
-            )
+            stored_sha, stored_md5, stored_size = compress_to(path, staged, self.cfg.zstd_level)
             try:
                 head = self.store.head(key)
                 if head is not None and head.size != stored_size:
@@ -612,9 +610,7 @@ class Archiver:
                     f"{run_id}: budget spent after {done}/{len(files)} files", EXIT_BUDGET
                 )
 
-        catalog, catalog_error = (
-            capture_catalog(run_dir) if with_catalog else (None, "skipped")
-        )
+        catalog, catalog_error = capture_catalog(run_dir) if with_catalog else (None, "skipped")
         ordered = [records[p.name] for p in files]
         manifest = build_manifest(
             self.cfg,
@@ -675,9 +671,7 @@ class Archiver:
             # still stops the sweep (S-LAW 5, resume tomorrow); having nothing
             # to upload is not a failure.
             if not eligible_files(run_dir, self.cfg.skip_globs):
-                result = PushResult(
-                    run_dir.name, 0, 0, 0, 0, 0.0, skipped=True, reason="empty"
-                )
+                result = PushResult(run_dir.name, 0, 0, 0, 0, 0.0, skipped=True, reason="empty")
             else:
                 result = self.push_run(run_dir, budget=budget, dry_run=dry_run)
             out.append(result)
@@ -1039,14 +1033,14 @@ def gc_cache(cfg: claude_worker.archive_config.ArchiveConfig, max_gib: float) ->
         removed["partial"] += 1
     runs = sorted(
         (p for p in cache.glob("run-*") if p.is_dir()),
-        key=lambda p: (cache / f".{p.name}.complete").stat().st_mtime
-        if (cache / f".{p.name}.complete").exists()
-        else 0.0,
+        key=lambda p: (
+            (cache / f".{p.name}.complete").stat().st_mtime
+            if (cache / f".{p.name}.complete").exists()
+            else 0.0
+        ),
     )
     limit = max_gib * GIB
-    total = sum(
-        sum(f.stat().st_size for f in run.rglob("*") if f.is_file()) for run in runs
-    )
+    total = sum(sum(f.stat().st_size for f in run.rglob("*") if f.is_file()) for run in runs)
     for run in runs:
         if total <= limit:
             break
@@ -1343,9 +1337,7 @@ def _derived_paths(
     return [(p, p.relative_to(root).as_posix()) for p in sorted(root.rglob("*")) if p.is_file()]
 
 
-def _gc_limit(
-    args: argparse.Namespace, cfg: claude_worker.archive_config.ArchiveConfig
-) -> float:
+def _gc_limit(args: argparse.Namespace, cfg: claude_worker.archive_config.ArchiveConfig) -> float:
     """A NEGATIVE --max-gib means "use the configured cap"; 0 means "empty it"."""
     return cfg.cache_max_gib if args.max_gib < 0 else args.max_gib
 

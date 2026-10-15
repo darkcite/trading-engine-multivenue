@@ -267,9 +267,7 @@ def sign(  # one parameter per SigV4 input, deliberately
     so a signing regression names its own stage instead of surfacing as a 403
     from a live endpoint.
     """
-    signed_names = sorted(
-        name.lower() for name in headers if name.lower() not in UNSIGNED_HEADERS
-    )
+    signed_names = sorted(name.lower() for name in headers if name.lower() not in UNSIGNED_HEADERS)
     lowered = {name.lower(): " ".join(str(value).split()) for name, value in headers.items()}
     canonical_headers = "".join(name + ":" + lowered[name] + "\n" for name in signed_names)
     signed_headers = ";".join(signed_names)
@@ -550,9 +548,7 @@ class ObjectStore:
 
     def head(self, key: str) -> ObjectMeta | None:
         """Metadata for ``key``; ``None`` when it does not exist."""
-        response = self._send(
-            "HEAD", key, expect=(200,), allow=(int(http.HTTPStatus.NOT_FOUND),)
-        )
+        response = self._send("HEAD", key, expect=(200,), allow=(int(http.HTTPStatus.NOT_FOUND),))
         if response.status_code == http.HTTPStatus.NOT_FOUND:
             return None
         return ObjectMeta(
@@ -562,9 +558,7 @@ class ObjectStore:
             last_modified=response.headers.get("last-modified", ""),
         )
 
-    def get(
-        self, key: str, dst: pathlib.Path, *, expect_size: int | None = None
-    ) -> ObjectMeta:
+    def get(self, key: str, dst: pathlib.Path, *, expect_size: int | None = None) -> ObjectMeta:
         """Stream ``key`` to ``dst``. Writes ``dst`` only on a complete read."""
         partial = dst.with_name(dst.name + ".part")
         partial.parent.mkdir(parents=True, exist_ok=True)

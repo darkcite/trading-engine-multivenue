@@ -138,7 +138,8 @@ pub(crate) fn object_field(b: &[u8], key: &[u8]) -> Option<(usize, usize)> {
 mod tests {
     use super::*;
 
-    const DOC: &[u8] = br#"{"a":"x\"y","n":"12.5","m":7,"t":true,"f":false,"arr":[{"k":1},{"k":2}]}"#;
+    const DOC: &[u8] =
+        br#"{"a":"x\"y","n":"12.5","m":7,"t":true,"f":false,"arr":[{"k":1},{"k":2}]}"#;
 
     #[test]
     fn every_reader_finds_its_field() {

@@ -312,7 +312,11 @@ mod tests {
         assert_eq!(n.next(5_000), 5_000);
         assert_eq!(n.next(1_000), 5_001, "clock stepped back; nonce did not");
         assert_eq!(n.next(1), 5_002);
-        assert_eq!(n.next(5_003), 5_003, "and it recovers when the clock passes");
+        assert_eq!(
+            n.next(5_003),
+            5_003,
+            "and it recovers when the clock passes"
+        );
     }
 
     #[test]

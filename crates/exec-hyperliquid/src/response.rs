@@ -184,10 +184,7 @@ impl HlOk {
     #[inline]
     #[must_use]
     pub fn missed(&self) -> bool {
-        self.errors > 0
-            && self.ioc_misses == self.errors
-            && !self.any_resting
-            && !self.any_filled
+        self.errors > 0 && self.ioc_misses == self.errors && !self.any_resting && !self.any_filled
     }
 }
 
@@ -371,7 +368,8 @@ pub fn scan(body: &[u8]) -> Result<HlResponse, ScanErr> {
                 } else if word == b"error" {
                     out.statuses = out.statuses.saturating_add(1);
                     out.errors = out.errors.saturating_add(1);
-                    if let Some((v, _)) = after_colon(body, next).and_then(|p| read_string(body, p)) {
+                    if let Some((v, _)) = after_colon(body, next).and_then(|p| read_string(body, p))
+                    {
                         if v.of(body).starts_with(IOC_MISS_PREFIX) {
                             out.ioc_misses = out.ioc_misses.saturating_add(1);
                         }
@@ -581,7 +579,8 @@ mod item_tests {
         assert_eq!(scan_items(body, &mut out), Ok(ItemsReply::Items(2)));
         assert_eq!(out[0].kind, ITEM_SUCCESS);
         assert_eq!((out[1].kind, out[1].reason), (ITEM_ERROR, REASON_NOT_FOUND));
-        let err = br#"{"status":"err","response":"Too many cumulative requests sent (1301 > 1200)"}"#;
+        let err =
+            br#"{"status":"err","response":"Too many cumulative requests sent (1301 > 1200)"}"#;
         let Ok(ItemsReply::Refused { reason, msg }) = scan_items(err, &mut out) else {
             panic!("not a refusal");
         };
@@ -605,7 +604,11 @@ mod item_tests {
         ];
         let mut i = 0usize;
         while i < cases.len() {
-            assert_eq!(scan_items(cases[i], &mut out), Err(ScanErr::Malformed), "case {i}");
+            assert_eq!(
+                scan_items(cases[i], &mut out),
+                Err(ScanErr::Malformed),
+                "case {i}"
+            );
             i += 1;
         }
     }

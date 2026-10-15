@@ -250,9 +250,7 @@ impl AddressBudget {
     /// because every caller happened to send one-element batches.
     #[inline(always)]
     pub fn on_action_sent(&mut self, items: u32) {
-        self.spent_requests = self
-            .spent_requests
-            .saturating_add(u64::from(items.max(1)));
+        self.spent_requests = self.spent_requests.saturating_add(u64::from(items.max(1)));
     }
 
     /// **XH4e — `items` requests counted by [`Self::on_action_sent`] never
@@ -903,10 +901,19 @@ mod tests {
         // volume (the docs' own example: 10 000 + 2 854 574).
         let docs = br#"{"cumVlm":"2854574.593578","nRequestsUsed":2890,"nRequestsCap":2864574,"nRequestsSurplus":7}"#;
         assert_eq!(scan_rate_limit(docs).map(|t| t.2), Some(7));
-        let carried = br#"{"cumVlm":"0.0","nRequestsUsed":0,"nRequestsCap":15000,"nRequestsSurplus":5000}"#;
-        assert_eq!(scan_rate_limit(carried).map(|t| t.2), Some(0), "a cap that carries it");
+        let carried =
+            br#"{"cumVlm":"0.0","nRequestsUsed":0,"nRequestsCap":15000,"nRequestsSurplus":5000}"#;
+        assert_eq!(
+            scan_rate_limit(carried).map(|t| t.2),
+            Some(0),
+            "a cap that carries it"
+        );
         let uncapped = br#"{"cumVlm":"0.0","nRequestsUsed":0,"nRequestsSurplus":5000}"#;
-        assert_eq!(scan_rate_limit(uncapped).map(|t| t.2), Some(0), "unprovable");
+        assert_eq!(
+            scan_rate_limit(uncapped).map(|t| t.2),
+            Some(0),
+            "unprovable"
+        );
 
         // Half an answer is no answer.
         assert!(scan_rate_limit(br#"{"nRequestsUsed":5}"#).is_none());
@@ -933,13 +940,15 @@ mod tests {
     #[test]
     fn reserved_weight_is_headroom_in_both_of_the_venues_regimes() {
         // 10 000 cap, 3 000 used, 5 000 reserved: surplus 2 000.
-        let over = br#"{"cumVlm":"0.0","nRequestsUsed":0,"nRequestsCap":10000,"nRequestsSurplus":2000}"#;
+        let over =
+            br#"{"cumVlm":"0.0","nRequestsUsed":0,"nRequestsCap":10000,"nRequestsSurplus":2000}"#;
         let (used, vlm, surplus) = scan_rate_limit(over).expect("shape");
         let b = AddressBudget::from_venue(ADDR, 2000, used, vlm, surplus);
         assert_eq!(b.remaining(), 10_000 - 3_000 + 5_000);
 
         // 10 000 cap, 9 000 used, 5 000 reserved: used nets to 4 000.
-        let under = br#"{"cumVlm":"0.0","nRequestsUsed":4000,"nRequestsCap":10000,"nRequestsSurplus":0}"#;
+        let under =
+            br#"{"cumVlm":"0.0","nRequestsUsed":4000,"nRequestsCap":10000,"nRequestsSurplus":0}"#;
         let (used, vlm, surplus) = scan_rate_limit(under).expect("shape");
         let mut b = AddressBudget::from_venue(ADDR, 2000, used, vlm, surplus);
         assert_eq!(b.remaining(), 10_000 - 9_000 + 5_000);
@@ -971,13 +980,21 @@ mod tests {
         );
         assert_eq!(TopupState::from_line(&line, ADDR), Some(s));
         assert_eq!(TopupState::from_line(&line, OTHER), None);
-        assert_eq!(TopupState::from_line("0xab\t1\t2\t3\t-4", ADDR), None, "negative");
+        assert_eq!(
+            TopupState::from_line("0xab\t1\t2\t3\t-4", ADDR),
+            None,
+            "negative"
+        );
 
         let dir = std::env::temp_dir().join(format!("mv-topup-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(TOPUP_STATE_PATH);
         let _ = std::fs::remove_file(&path);
-        assert_eq!(restore_topup(&path, ADDR, 20_720, 1_790_200_000), (20_720, 0, 0), "fresh");
+        assert_eq!(
+            restore_topup(&path, ADDR, 20_720, 1_790_200_000),
+            (20_720, 0, 0),
+            "fresh"
+        );
 
         store_topup(&path, &ADDR, s).expect("stores");
         assert_eq!(
@@ -1145,7 +1162,7 @@ mod tests {
         for bad in [
             "",
             "\t\t",
-            "0xabab\t1\t2",              // wrong-length address
+            "0xabab\t1\t2", // wrong-length address
             &format!("{}\tx\t2", crate::config::hex20(&ADDR)),
             &format!("{}\t1", crate::config::hex20(&ADDR)),
             &format!("{}\t1\t2\t3", crate::config::hex20(&ADDR)),

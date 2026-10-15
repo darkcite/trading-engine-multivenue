@@ -794,7 +794,11 @@ impl AssetTable {
             // SAFETY: as above.
             let s = unsafe { self.slots.get_unchecked(i) };
             if s.live {
-                f(s.sym, &s.coin[..usize::from(s.coin_len)], self.booked_1e6[i]);
+                f(
+                    s.sym,
+                    &s.coin[..usize::from(s.coin_len)],
+                    self.booked_1e6[i],
+                );
             }
             i += 1;
         }
@@ -1111,8 +1115,14 @@ mod tests {
     #[test]
     fn the_formula_matches_the_venues() {
         // outcome 3253, YES side 0 / NO side 1 — the ids in the vectors.
-        assert_eq!(AssetTable::asset_id(3253, 0).expect("in range"), 100_032_530);
-        assert_eq!(AssetTable::asset_id(3253, 1).expect("in range"), 100_032_531);
+        assert_eq!(
+            AssetTable::asset_id(3253, 0).expect("in range"),
+            100_032_530
+        );
+        assert_eq!(
+            AssetTable::asset_id(3253, 1).expect("in range"),
+            100_032_531
+        );
         assert_eq!(AssetTable::asset_id(0, 0).expect("in range"), 100_000_000);
     }
 
@@ -1124,9 +1134,17 @@ mod tests {
         assert_eq!(asset_of_fill_coin(b"#32530"), AssetTable::asset_id(3253, 0));
         assert_eq!(asset_of_fill_coin(b"#194180"), Some(ASSET_BASE + 194_180));
         assert_eq!(asset_of_fill_coin(b"#0"), Some(ASSET_BASE));
-        assert_eq!(asset_of_fill_coin(b"#4194967295"), Some(u32::MAX), "the last id");
+        assert_eq!(
+            asset_of_fill_coin(b"#4194967295"),
+            Some(u32::MAX),
+            "the last id"
+        );
         assert_eq!(asset_of_fill_coin(b"#4194967296"), None, "past u32");
-        assert_eq!(asset_of_fill_coin(b"#99999999999"), None, "past u32 in the digits");
+        assert_eq!(
+            asset_of_fill_coin(b"#99999999999"),
+            None,
+            "past u32 in the digits"
+        );
         assert_eq!(asset_of_fill_coin(b"+194180"), None, "a balance name");
         assert_eq!(asset_of_fill_coin(b"#0194180"), None, "a leading zero");
         assert_eq!(asset_of_fill_coin(b"#-1"), None);
@@ -1174,7 +1192,13 @@ mod tests {
     #[test]
     fn a_stale_instance_is_refused_even_though_the_symbol_is_bound() {
         let mut t = AssetTable::new();
-        t.bind(42, AssetTable::asset_id(3253, 0).expect("in range"), 1_000, b"#32530").unwrap();
+        t.bind(
+            42,
+            AssetTable::asset_id(3253, 0).expect("in range"),
+            1_000,
+            b"#32530",
+        )
+        .unwrap();
         assert_eq!(t.lookup(42, 1_000), Ok(100_032_530));
         // The quarter rolled. The caller still believes in the old one.
         assert_eq!(
@@ -1190,9 +1214,21 @@ mod tests {
     #[test]
     fn a_roll_rebinds_in_place() {
         let mut t = AssetTable::new();
-        t.bind(42, AssetTable::asset_id(3253, 0).expect("in range"), 1_000, b"#32530").unwrap();
+        t.bind(
+            42,
+            AssetTable::asset_id(3253, 0).expect("in range"),
+            1_000,
+            b"#32530",
+        )
+        .unwrap();
         assert_eq!(t.len(), 1);
-        t.bind(42, AssetTable::asset_id(3254, 0).expect("in range"), 1_001, b"#32540").unwrap();
+        t.bind(
+            42,
+            AssetTable::asset_id(3254, 0).expect("in range"),
+            1_001,
+            b"#32540",
+        )
+        .unwrap();
         assert_eq!(t.len(), 1, "a roll must not consume a second slot");
         assert_eq!(t.lookup(42, 1_001), Ok(100_032_540));
         assert!(t.lookup(42, 1_000).is_err(), "the old instance is gone");
@@ -1281,7 +1317,10 @@ mod tests {
         let mut out = [0u8; COIN_MAX];
         let n = AssetTable::outcome_coin(3253, 0, &mut out).expect("in range");
         assert_eq!(&out[..n], b"#32530", "the FILL namespace");
-        assert_eq!(AssetTable::asset_id(3253, 0).expect("in range"), ASSET_BASE + 32_530);
+        assert_eq!(
+            AssetTable::asset_id(3253, 0).expect("in range"),
+            ASSET_BASE + 32_530
+        );
         let n = AssetTable::outcome_coin(0, 0, &mut out).expect("in range");
         assert_eq!(&out[..n], b"#0");
         // The BALANCE namespace is the same enc behind a different
@@ -1311,7 +1350,11 @@ mod tests {
             AssetTable::asset_id(OUTCOME_ID_MAX, 9).is_some(),
             "the bound itself must still be usable"
         );
-        assert_eq!(AssetTable::outcome_coin(1, 10, &mut out), None, "side is one digit");
+        assert_eq!(
+            AssetTable::outcome_coin(1, 10, &mut out),
+            None,
+            "side is one digit"
+        );
 
         // Agreement with ingest's own bound (discovery.rs:103), which
         // this crate deliberately does not import.
@@ -1343,10 +1386,20 @@ mod tests {
     #[test]
     fn a_fill_from_the_instance_that_just_rolled_still_resolves() {
         let mut t = AssetTable::new();
-        t.bind(42, AssetTable::asset_id(3253, 0).expect("in range"), 1_000, b"#32530")
-            .unwrap();
-        t.bind(42, AssetTable::asset_id(3254, 0).expect("in range"), 1_001, b"#32540")
-            .unwrap();
+        t.bind(
+            42,
+            AssetTable::asset_id(3253, 0).expect("in range"),
+            1_000,
+            b"#32530",
+        )
+        .unwrap();
+        t.bind(
+            42,
+            AssetTable::asset_id(3254, 0).expect("in range"),
+            1_001,
+            b"#32540",
+        )
+        .unwrap();
         assert_eq!(t.sym_of_coin(b"#32540"), Some(42), "the live leg");
         assert_eq!(
             t.sym_of_coin(b"#32530"),
@@ -1359,8 +1412,13 @@ mod tests {
             "the forward direction must NOT have grown a memory"
         );
         // Two generations back is gone.
-        t.bind(42, AssetTable::asset_id(3255, 0).expect("in range"), 1_002, b"#32550")
-            .unwrap();
+        t.bind(
+            42,
+            AssetTable::asset_id(3255, 0).expect("in range"),
+            1_002,
+            b"#32550",
+        )
+        .unwrap();
         assert_eq!(t.sym_of_coin(b"#32530"), None, "only ONE generation");
     }
 

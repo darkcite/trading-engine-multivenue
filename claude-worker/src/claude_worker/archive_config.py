@@ -171,7 +171,7 @@ def read_env_file(path: pathlib.Path) -> dict[str, str]:
     out: dict[str, str] = {}
     try:
         text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+    except OSError, UnicodeDecodeError:
         # An unreadable credential file means "disabled", never a crash — and
         # never an error message that could echo a line of the file.
         return out
@@ -247,9 +247,7 @@ def load(
     """
     source: collections.abc.Mapping[str, str] = os.environ if env is None else env
     if env_file is None:
-        env_file = pathlib.Path(
-            source.get(ENV_FILE_KEY, "") or DEFAULT_ENV_FILE
-        ).expanduser()
+        env_file = pathlib.Path(source.get(ENV_FILE_KEY, "") or DEFAULT_ENV_FILE).expanduser()
 
     merged: dict[str, str] = read_env_file(env_file)
     for key, value in source.items():

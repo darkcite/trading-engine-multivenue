@@ -109,7 +109,11 @@ impl PnlAnchor {
         if !addr_s.eq_ignore_ascii_case(&crate::config::hex20(&address)) {
             return None;
         }
-        Some(Self { address, usdc_1e6, set_unix_s })
+        Some(Self {
+            address,
+            usdc_1e6,
+            set_unix_s,
+        })
     }
 }
 
@@ -357,15 +361,27 @@ mod tests {
     /// for.
     #[test]
     fn the_anchor_round_trips_for_its_own_address_only() {
-        let a = PnlAnchor { address: ADDR, usdc_1e6: 8_630_000, set_unix_s: 1_789_600_000 };
+        let a = PnlAnchor {
+            address: ADDR,
+            usdc_1e6: 8_630_000,
+            set_unix_s: 1_789_600_000,
+        };
         let line = a.to_line();
         assert_eq!(
             line,
             "0xabababababababababababababababababababab\t8630000\t1789600000\n"
         );
         assert_eq!(PnlAnchor::from_line(&line, ADDR), Some(a));
-        assert_eq!(PnlAnchor::from_line(&line.to_uppercase(), ADDR), Some(a), "hex case-blind");
-        assert_eq!(PnlAnchor::from_line(&line, OTHER), None, "another account's anchor");
+        assert_eq!(
+            PnlAnchor::from_line(&line.to_uppercase(), ADDR),
+            Some(a),
+            "hex case-blind"
+        );
+        assert_eq!(
+            PnlAnchor::from_line(&line, OTHER),
+            None,
+            "another account's anchor"
+        );
     }
 
     /// Every malformed shape is "not anchored", never a panic and
@@ -394,7 +410,11 @@ mod tests {
         let dir = scratch("io");
         let p = dir.join(DEFAULT_STATE_PATH);
         assert_eq!(load(&p, ADDR), None);
-        let a = PnlAnchor { address: ADDR, usdc_1e6: 9_800_000, set_unix_s: 7 };
+        let a = PnlAnchor {
+            address: ADDR,
+            usdc_1e6: 9_800_000,
+            set_unix_s: 7,
+        };
         store(&p, a).expect("stores");
         assert_eq!(load(&p, ADDR), Some(a));
         assert_eq!(load(&p, OTHER), None);

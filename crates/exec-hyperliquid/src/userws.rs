@@ -314,16 +314,21 @@ pub fn to_fill_as(
         return Err(ConvertErr::ZeroQuantity);
     }
     let side = if f.is_buy { Side::Bid } else { Side::Ask };
-    Ok(
-        Fill::new(now_ns, sym, side, Price::from_raw(px), Qty::from_raw(qty), f.oid)
-            .with_attribution(strategy_id, FILL_ORIGIN_VENUE)
-            // FLAGGED, so the member can tell a payout from a trade.
-            // Its `order_id` is the venue's and will match no pending
-            // leg of the member's — without this the member counts it
-            // "a fill the engine did not order", which is true of a
-            // stranger's trade and NOT of our own position resolving.
-            .with_flags(core_types::FILL_FLAG_SETTLEMENT),
+    Ok(Fill::new(
+        now_ns,
+        sym,
+        side,
+        Price::from_raw(px),
+        Qty::from_raw(qty),
+        f.oid,
     )
+    .with_attribution(strategy_id, FILL_ORIGIN_VENUE)
+    // FLAGGED, so the member can tell a payout from a trade.
+    // Its `order_id` is the venue's and will match no pending
+    // leg of the member's — without this the member counts it
+    // "a fill the engine did not order", which is true of a
+    // stranger's trade and NOT of our own position resolving.
+    .with_flags(core_types::FILL_FLAG_SETTLEMENT))
 }
 
 /// Is this fill one of ours, and whose?
@@ -345,10 +350,7 @@ pub fn owner_of(f: &UserFill) -> Owner {
 /// it carries more fills than `out` can take. Neither degrades to
 /// "no fills" — see [`crate::recon`] for why an unreadable body must
 /// never read as an empty one.
-pub fn scan_user_fills(
-    body: &[u8],
-    out: &mut [UserFill],
-) -> Result<(usize, bool), ScanErr> {
+pub fn scan_user_fills(body: &[u8], out: &mut [UserFill]) -> Result<(usize, bool), ScanErr> {
     // The channel must be the one we think it is. A frame from
     // `orderUpdates` has a different shape and would otherwise be
     // half-parsed into fills that never happened.
@@ -464,8 +466,7 @@ fn fill_row(body: &[u8], i: usize, end: usize, out: &mut UserFill) -> Result<(),
     // `dir` is descriptive on the wire ("Buy", "Sell",
     // "Settlement", "Open Long", ...), so an unknown value is NOT
     // a refusal — only the settlement case is load-bearing here.
-    let is_settlement = string_field(obj, b"\"dir\"")
-        .is_some_and(|d| d.of(obj) == b"Settlement");
+    let is_settlement = string_field(obj, b"\"dir\"").is_some_and(|d| d.of(obj) == b"Settlement");
     let crossed = bool_field(obj, b"\"crossed\"").unwrap_or(false);
     *out = UserFill {
         tid,
@@ -549,7 +550,12 @@ impl<const N: usize> TidRing<N> {
     /// An empty ring.
     #[must_use]
     pub const fn new() -> Self {
-        const { assert!(N.is_power_of_two(), "TidRing capacity must be a power of two") };
+        const {
+            assert!(
+                N.is_power_of_two(),
+                "TidRing capacity must be a power of two"
+            )
+        };
         const { assert!(N >= 2, "TidRing needs at least two rows") };
         Self {
             tids: [0u64; N],
@@ -738,7 +744,10 @@ mod tests {
         assert_eq!(out[0].oid, 77_216_390);
         assert_eq!(out[0].px_1e8, 47_000_000);
         assert_eq!(out[0].sz_1e8, 2_500_000_000);
-        assert_eq!(out[0].fee_1e8, 1_230_000, "the fee is MEASURED, not assumed");
+        assert_eq!(
+            out[0].fee_1e8, 1_230_000,
+            "the fee is MEASURED, not assumed"
+        );
         assert!(out[0].is_buy);
         assert_eq!(out[0].coin.of(&f), b"#32530");
 
@@ -802,7 +811,10 @@ mod tests {
         // genuinely zero one. Both would book a trade that reports as
         // having happened and moved nothing.
         for sz in [99i64, 0, 1] {
-            let z = UserFill { sz_1e8: sz, ..out[0] };
+            let z = UserFill {
+                sz_1e8: sz,
+                ..out[0]
+            };
             assert_eq!(
                 to_fill(&z, 7, 1).unwrap_err(),
                 ConvertErr::ZeroQuantity,
@@ -810,7 +822,10 @@ mod tests {
             );
         }
         // One engine tick of size is the smallest thing that IS a fill.
-        let ok = UserFill { sz_1e8: 100, ..out[0] };
+        let ok = UserFill {
+            sz_1e8: 100,
+            ..out[0]
+        };
         assert_eq!(to_fill(&ok, 7, 1).unwrap().fill().qty.raw(), 1);
 
         // A NEGATIVE size would sail past the zero check and arrive as
@@ -898,9 +913,7 @@ mod tests {
     fn a_wrong_channel_is_distinguishable_from_a_failed_scan() {
         let f = frame_with(&ours_hex(), false);
         assert!(is_user_fills(&f));
-        assert!(!is_user_fills(
-            br#"{"channel":"orderUpdates","data":[]}"#
-        ));
+        assert!(!is_user_fills(br#"{"channel":"orderUpdates","data":[]}"#));
         assert!(!is_user_fills(b"{}"));
         assert!(!is_user_fills(b""));
         // THE CASE THAT MATTERS: a userFills frame too big for the
@@ -1104,7 +1117,11 @@ mod tests {
         assert_eq!(n, 3, "all three real rows");
         assert!(!snap);
 
-        assert_eq!(out[0].coin.of(REAL), b"#118441", "the FILL namespace is '#'");
+        assert_eq!(
+            out[0].coin.of(REAL),
+            b"#118441",
+            "the FILL namespace is '#'"
+        );
         assert_eq!(out[0].px_1e8, 88_000_000);
         assert_eq!(out[0].sz_1e8, 1_200_000_000);
         assert_eq!(out[0].tid, 229_944_652_074_215);

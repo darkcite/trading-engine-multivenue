@@ -324,7 +324,10 @@ fn an_ioc_that_rested_is_reported_not_swallowed() {
     let r = run_fill_on(&cfg(), &mut http, fill_spec())
         .expect("the venue answered ok")
         .report;
-    assert!(r.any_resting, "the caller must be able to SEE that it rested");
+    assert!(
+        r.any_resting,
+        "the caller must be able to SEE that it rested"
+    );
     assert_eq!(r.filled, 0);
     assert_ne!(r.oid, 0, "and must know which order to cancel");
 }
@@ -475,7 +478,11 @@ fn the_whole_round_trip_passes_and_takes_exactly_four_requests() {
         "the second cancel must be REFUSED — that is what proves the first one worked"
     );
     assert!(r.passed());
-    assert_eq!(served.load(Ordering::SeqCst), 4, "place, modify, cancel, verify");
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        4,
+        "place, modify, cancel, verify"
+    );
 }
 
 /// The step that makes the other three mean something. If the venue
@@ -569,7 +576,6 @@ fn every_request_carries_a_distinct_nonce() {
     assert!(r.passed());
 }
 
-
 // ---- Phase F: the requote -------------------------------------------
 
 /// **The shape the whole probe rests on.** A requote passes only when
@@ -629,7 +635,10 @@ fn a_modify_that_created_nothing_is_not_a_requote_either() {
     let mut http = client(port, tls);
     let r = run_requote_on(&cfg(), &mut http, spec()).expect("the venue answered");
 
-    assert!(r.old_cancel_refused, "and this alone would have read as a pass");
+    assert!(
+        r.old_cancel_refused,
+        "and this alone would have read as a pass"
+    );
     assert!(!r.new_cancel_succeeded);
     assert!(!r.passed());
 }
@@ -645,7 +654,13 @@ fn a_requote_that_fills_sweeps_both_ids_rather_than_only_the_old_one() {
     let r = run_requote_on(&cfg(), &mut http, spec()).expect("a stop is not an Err");
 
     assert!(
-        matches!(r.stopped, Some(SmokeErr::Lifecycle { stage: "modify", .. })),
+        matches!(
+            r.stopped,
+            Some(SmokeErr::Lifecycle {
+                stage: "modify",
+                ..
+            })
+        ),
         "{:?}",
         r.stopped
     );
@@ -653,7 +668,11 @@ fn a_requote_that_fills_sweeps_both_ids_rather_than_only_the_old_one() {
     // THE POINT: which id survives a failed modify is exactly what is
     // unknown — the answer may have been lost after the venue acted —
     // so both are swept. The old shape cancelled only the old one.
-    assert_eq!(served.load(Ordering::SeqCst), 4, "place, modify, and BOTH cancels");
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        4,
+        "place, modify, and BOTH cancels"
+    );
     assert!(!r.has_unswept(), "both cancels were answered");
 }
 
@@ -675,7 +694,11 @@ fn a_cancel_that_never_answers_is_reported_with_the_id_to_go_and_find() {
     assert!(r.unswept_new, "the new id's cancel never came back");
     assert!(r.has_unswept());
     assert!(!r.passed(), "an unswept id is not a pass");
-    assert!(matches!(r.stopped, Some(SmokeErr::Http(_))), "{:?}", r.stopped);
+    assert!(
+        matches!(r.stopped, Some(SmokeErr::Http(_))),
+        "{:?}",
+        r.stopped
+    );
     // And the id is IN the report, which is the whole recovery path.
     assert_eq!(r.new_cloid.len(), 16);
     assert_ne!(r.new_cloid, r.old_cloid, "two distinct ids, both named");
@@ -699,10 +722,16 @@ fn both_ids_go_unswept_when_the_socket_dies_before_either_cancel() {
     let r = run_requote_on(&cfg(), &mut http, spec()).expect("a stop is not an Err");
 
     assert!(r.unswept_old, "the old id's cancel never came back");
-    assert!(r.unswept_new, "and the new one was still ATTEMPTED, then did not either");
+    assert!(
+        r.unswept_new,
+        "and the new one was still ATTEMPTED, then did not either"
+    );
     assert!(r.has_unswept());
     assert!(!r.passed());
-    assert!(!r.old_cancel_refused, "no answer is not evidence the old id is gone");
+    assert!(
+        !r.old_cancel_refused,
+        "no answer is not evidence the old id is gone"
+    );
     assert!(!r.new_cancel_succeeded);
     // Both ids are named, which is the entire recovery path.
     assert_ne!(r.old_cloid, r.new_cloid);
@@ -749,7 +778,6 @@ fn a_requote_refuses_mainnet() {
     assert!(matches!(e, SmokeErr::NotTestnet(_)), "{e:?}");
     assert_eq!(served.load(Ordering::SeqCst), 0);
 }
-
 
 // ---- Phase G: the roll sweep ----------------------------------------
 

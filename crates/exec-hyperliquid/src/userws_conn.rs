@@ -504,8 +504,12 @@ impl UserWs {
         // behind the frame-header room and framed in place — no staging
         // copy.
         let room = core_net::WS_CLIENT_HDR_MAX;
-        let n = crate::request::subscribe_json(&mut self.tx[room..], channel, self.master_hex.as_bytes())
-            .map_err(|_| WsErr::BadFrame)?;
+        let n = crate::request::subscribe_json(
+            &mut self.tx[room..],
+            channel,
+            self.master_hex.as_bytes(),
+        )
+        .map_err(|_| WsErr::BadFrame)?;
         let mask = self.next_mask();
         let start = core_net::ws_frame_in_place(&mut self.tx, room, WsOpcode::Text, n, mask)
             .map_err(|_| WsErr::BadFrame)?;
@@ -614,9 +618,7 @@ fn write_all_t<T: Transport>(t: &mut T, buf: &[u8], deadline: Instant) -> Result
         match t.write(&buf[off..]) {
             Ok(0) => return Err(WsErr::Disconnected),
             Ok(n) => off += n,
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                return Err(WsErr::Disconnected)
-            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Err(WsErr::Disconnected),
             Err(_) => return Err(WsErr::Disconnected),
         }
     }
@@ -671,5 +673,4 @@ mod tests {
             assert!(m.len() > 15, "{m}");
         }
     }
-
 }

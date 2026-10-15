@@ -769,7 +769,10 @@ pub fn ours_everywhere(
         if n >= out.len() {
             return (n, unmapped);
         }
-        out[n] = crate::action::CancelWire { asset, oid: row.oid };
+        out[n] = crate::action::CancelWire {
+            asset,
+            oid: row.oid,
+        };
         n += 1;
     }
     (n, unmapped)
@@ -809,7 +812,11 @@ pub const MAX_STATE_REQ: usize = 96;
 /// # Errors
 /// The buffer is shorter than [`MAX_STATE_REQ`].
 pub fn spot_state_request(out: &mut [u8], master: &[u8; 20]) -> Result<usize, ScanErr> {
-    user_info_request(out, br#"{"type":"spotClearinghouseState","user":"0x"#, master)
+    user_info_request(
+        out,
+        br#"{"type":"spotClearinghouseState","user":"0x"#,
+        master,
+    )
 }
 
 /// HYPARB L3: render `{"type":"clearinghouseState","user":"0x<40 hex>"}`
@@ -903,8 +910,7 @@ pub fn scan_perp_state(body: &[u8], out: &mut [PerpPosition]) -> Result<(i64, us
         return Err(ScanErr::Malformed);
     }
     let ms_end = object_end(body, i).ok_or(ScanErr::Malformed)?;
-    let value =
-        decimal_field(&body[i..ms_end], b"\"accountValue\"").ok_or(ScanErr::Malformed)?;
+    let value = decimal_field(&body[i..ms_end], b"\"accountValue\"").ok_or(ScanErr::Malformed)?;
 
     let pos = find_field(body, b"\"assetPositions\"").ok_or(ScanErr::Malformed)?;
     let mut i = skip_ws(body, pos);
@@ -1018,9 +1024,15 @@ mod tests {
         let mut one = [PerpPosition::default(); 1];
         assert!(scan_perp_state(body, &mut one).is_err());
         let s = core::str::from_utf8(body).unwrap();
-        assert!(scan_perp_state(s.replacen("\"szi\":\"-0.5\",", "", 1).as_bytes(), &mut out).is_err());
+        assert!(
+            scan_perp_state(s.replacen("\"szi\":\"-0.5\",", "", 1).as_bytes(), &mut out).is_err()
+        );
         assert!(scan_perp_state(&body[..body.len() - 30], &mut out).is_err());
-        assert!(scan_perp_state(s.replacen("\"marginSummary\"", "\"x\"", 1).as_bytes(), &mut out).is_err());
+        assert!(scan_perp_state(
+            s.replacen("\"marginSummary\"", "\"x\"", 1).as_bytes(),
+            &mut out
+        )
+        .is_err());
         let mut buf = [0u8; MAX_STATE_REQ];
         let n = perp_state_request(&mut buf, &[0xAB; 20]).expect("fits");
         assert_eq!(
@@ -1036,8 +1048,14 @@ mod tests {
     fn the_two_namespaces_match_on_the_enc_and_nothing_else() {
         assert!(same_leg(b"+32530", b"#32530"));
         assert!(!same_leg(b"+32530", b"#32531"), "different leg");
-        assert!(!same_leg(b"+032530", b"#32530"), "a leading zero is a different name");
-        assert!(!same_leg(b"#32530", b"#32530"), "a fill name is not a balance name");
+        assert!(
+            !same_leg(b"+032530", b"#32530"),
+            "a leading zero is a different name"
+        );
+        assert!(
+            !same_leg(b"#32530", b"#32530"),
+            "a fill name is not a balance name"
+        );
         assert!(!same_leg(b"+32530", b"+32530"), "and vice versa");
         assert!(!same_leg(b"USDC", b"#32530"));
         assert!(!same_leg(b"+", b"#"), "an empty enc matches nothing");
@@ -1087,9 +1105,9 @@ mod tests {
             b"{}",
             b"not json at all",
             br#"{"balances":}"#,
-            br#"{"balances":[{"coin":"USDC"}]}"#,          // no total
-            br#"{"balances":[{"total":"1.0"}]}"#,          // no coin
-            br#"{"balances":[{"coin":"USDC","total":"1"#,  // truncated
+            br#"{"balances":[{"coin":"USDC"}]}"#, // no total
+            br#"{"balances":[{"total":"1.0"}]}"#, // no coin
+            br#"{"balances":[{"coin":"USDC","total":"1"#, // truncated
             br#"{"balances":[{"coin":"USDC","total":"1.0"},"#, // no close
         ] {
             assert!(
@@ -1099,10 +1117,7 @@ mod tests {
             );
         }
         // An explicitly EMPTY sheet is legitimate and is not an error.
-        assert_eq!(
-            scan_spot_state(br#"{"balances":[]}"#, &mut out),
-            Ok(0)
-        );
+        assert_eq!(scan_spot_state(br#"{"balances":[]}"#, &mut out), Ok(0));
     }
 
     /// A position the caller never saw is a position that reconciles
@@ -1203,7 +1218,8 @@ mod tests {
 
         // USDC is not a position this arm's ledger ever claimed to
         // track, so it is skipped rather than counted forever.
-        let only_quote = br#"{"balances":[{"coin":"USDC","token":0,"total":"968.0","hold":"0.0"}]}"#;
+        let only_quote =
+            br#"{"balances":[{"coin":"USDC","token":0,"total":"968.0","hold":"0.0"}]}"#;
         let mut b2 = [SpotBalance::default(); MAX_SPOT_BALANCES];
         let n2 = scan_spot_state(only_quote, &mut b2).expect("scans");
         let empty = crate::asset::AssetTable::new();
@@ -1251,8 +1267,15 @@ mod tests {
         let n = scan_spot_state(body, &mut bal).expect("scans");
         assert_eq!(bal[1].entry_ntl_1e8, 136_000_000);
         let v = account_view(&bal[..n], body);
-        assert_eq!((v.usdc_1e6, v.legs, v.held_cost_1e6), (997_640_000, 1, 1_360_000));
-        assert_eq!(v.equity_at_cost_1e6(), 999_000_000, "USDC plus the legs at cost");
+        assert_eq!(
+            (v.usdc_1e6, v.legs, v.held_cost_1e6),
+            (997_640_000, 1, 1_360_000)
+        );
+        assert_eq!(
+            v.equity_at_cost_1e6(),
+            999_000_000,
+            "USDC plus the legs at cost"
+        );
 
         let flat = br#"{"balances":[
             {"coin":"USDC","token":0,"total":"8.63","hold":"0.0"},
@@ -1260,14 +1283,21 @@ mod tests {
         ]}"#;
         let n2 = scan_spot_state(flat, &mut bal).expect("scans");
         let v2 = account_view(&bal[..n2], flat);
-        assert_eq!((v2.usdc_1e6, v2.legs, v2.held_cost_1e6), (8_630_000, 0, 0), "a husk");
+        assert_eq!(
+            (v2.usdc_1e6, v2.legs, v2.held_cost_1e6),
+            (8_630_000, 0, 0),
+            "a husk"
+        );
         assert_eq!(v2.equity_at_cost_1e6(), 8_630_000);
 
         let no_quote = br#"{"balances":[{"coin":"+195720","token":3,"total":"1.0","hold":"0.0"}]}"#;
         let n3 = scan_spot_state(no_quote, &mut bal).expect("scans");
         let v3 = account_view(&bal[..n3], no_quote);
         assert_eq!((v3.usdc_1e6, v3.legs), (0, 1), "no USDC row reads zero");
-        assert_eq!(v3.held_cost_1e6, 0, "a row without entryNtl has no cost basis");
+        assert_eq!(
+            v3.held_cost_1e6, 0,
+            "a row without entryNtl has no cost basis"
+        );
 
         // A basis above what the holding can pay (2 contracts pay at
         // most $2) is clamped to it; a negative one to zero.
@@ -1333,13 +1363,27 @@ mod tests {
         assert_eq!(n, 5);
         let mut out = [crate::action::CancelWire { asset: 0, oid: 0 }; 8];
         let (k, unmapped) = ours_everywhere(&rows[..n], body, &mut out);
-        assert_eq!((k, unmapped), (2, 1), "two outcome legs of ours; the BTC one counted");
-        assert_eq!((out[0].asset, out[0].oid), (crate::asset::ASSET_BASE + 194_180, 101));
-        assert_eq!((out[1].asset, out[1].oid), (crate::asset::ASSET_BASE + 195_721, 102));
+        assert_eq!(
+            (k, unmapped),
+            (2, 1),
+            "two outcome legs of ours; the BTC one counted"
+        );
+        assert_eq!(
+            (out[0].asset, out[0].oid),
+            (crate::asset::ASSET_BASE + 194_180, 101)
+        );
+        assert_eq!(
+            (out[1].asset, out[1].oid),
+            (crate::asset::ASSET_BASE + 195_721, 102)
+        );
 
         let mut one = [crate::action::CancelWire { asset: 0, oid: 0 }; 1];
         let (k1, _) = ours_everywhere(&rows[..n], body, &mut one);
-        assert_eq!(k1, one.len(), "a full buffer reports its length: maybe more");
+        assert_eq!(
+            k1,
+            one.len(),
+            "a full buffer reports its length: maybe more"
+        );
     }
 
     /// An account with nothing resting answers `[]`. That is a real
@@ -1585,7 +1629,10 @@ mod tests {
     fn a_drift_is_never_valued_below_what_it_could_settle_for() {
         let qty_1e6 = 40_000_000i64; // 40 contracts
         let ceiling = drift_qty_to_usd_1e6(qty_1e6);
-        assert_eq!(ceiling, 40_000_000, "40 contracts settle for at most 40 USDC");
+        assert_eq!(
+            ceiling, 40_000_000,
+            "40 contracts settle for at most 40 USDC"
+        );
 
         let mut px_1e6 = 0i64;
         while px_1e6 <= 1_000_000 {

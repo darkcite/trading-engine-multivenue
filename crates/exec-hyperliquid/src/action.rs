@@ -460,9 +460,7 @@ mod tests {
             "0x00000000000000000000000000000001"
         );
         // The engine-origin prefix from LAW E-9: 0x4d56 = "MV".
-        let raw = [
-            0x4d, 0x56, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a,
-        ];
+        let raw = [0x4d, 0x56, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a];
         render_cloid(&raw, &mut out);
         assert_eq!(
             core::str::from_utf8(&out).unwrap(),
@@ -477,7 +475,10 @@ mod tests {
         let over = [o; MAX_ORDERS + 1];
         let mut dst = [0u8; MAX_ACTION];
         assert!(encode_order(&mut dst, &ok, b"na").is_ok());
-        assert_eq!(encode_order(&mut dst, &over, b"na"), Err(MsgPackErr::Overflow));
+        assert_eq!(
+            encode_order(&mut dst, &over, b"na"),
+            Err(MsgPackErr::Overflow)
+        );
         let c = [CancelWire { asset: 1, oid: 2 }; MAX_ORDERS + 1];
         assert_eq!(encode_cancel(&mut dst, &c), Err(MsgPackErr::Overflow));
     }

@@ -262,13 +262,25 @@ impl SmokeReport {
         s.push_str("\",\"agent\":\"");
         json_escape(&mut s, &self.agent);
         s.push_str("\",\"signature_verified\":");
-        s.push_str(if self.signature_verified { "true" } else { "false" });
+        s.push_str(if self.signature_verified {
+            "true"
+        } else {
+            "false"
+        });
         s.push_str(",\"agent_registered\":");
-        s.push_str(if self.agent_registered { "true" } else { "false" });
+        s.push_str(if self.agent_registered {
+            "true"
+        } else {
+            "false"
+        });
         s.push_str(",\"selftest_rows\":");
         push_u32(&mut s, self.selftest_rows);
         s.push_str(",\"corruption_rejected\":");
-        s.push_str(if self.corruption_rejected { "true" } else { "false" });
+        s.push_str(if self.corruption_rejected {
+            "true"
+        } else {
+            "false"
+        });
         s.push_str(",\"corruption_message\":\"");
         json_escape(&mut s, &self.corruption_message);
         s.push_str("\",\"passed\":");
@@ -326,7 +338,11 @@ const NONEXISTENT_OID: u64 = 1;
 /// `asset` is the venue asset id the probe cancel names; it need not
 /// exist for the probe to be meaningful, because the cancel is
 /// expected to fail on the ORDER, not on the signature.
-pub fn run(cfg: &HlConfig, tls: Arc<rustls::ClientConfig>, asset: u32) -> Result<SmokeReport, SmokeErr> {
+pub fn run(
+    cfg: &HlConfig,
+    tls: Arc<rustls::ClientConfig>,
+    asset: u32,
+) -> Result<SmokeReport, SmokeErr> {
     // THE GUARD. Nothing below can run against mainnet.
     if !cfg.is_testnet() {
         return Err(SmokeErr::NotTestnet(cfg.host.clone()));
@@ -569,14 +585,16 @@ mod tests {
         let tls = core_net::TlsTransport::default_client_config();
 
         // Mainnet host + mainnet source: a valid config, refused here.
-        let m = HlConfig::new(Scope::Live, HOST_MAINNET, 'a', KEY, ADDR).expect("valid mainnet cfg");
+        let m =
+            HlConfig::new(Scope::Live, HOST_MAINNET, 'a', KEY, ADDR).expect("valid mainnet cfg");
         let e = run(&m, tls.clone(), 0).expect_err("mainnet must be refused");
         assert!(matches!(e, SmokeErr::NotTestnet(_)), "{e:?}");
         assert!(e.to_string().contains("TESTNET ONLY"), "{e}");
 
         // A local double is not the testnet venue either — the smoke
         // asserts against the real one or not at all.
-        let l = HlConfig::new(Scope::Testnet, "localhost", 'b', KEY, ADDR).expect("valid local cfg");
+        let l =
+            HlConfig::new(Scope::Testnet, "localhost", 'b', KEY, ADDR).expect("valid local cfg");
         assert!(matches!(
             run(&l, tls, 0).expect_err("a double is not testnet"),
             SmokeErr::NotTestnet(_)
@@ -627,7 +645,9 @@ mod tests {
     #[test]
     fn the_failure_messages_say_what_to_do() {
         let a = SmokeErr::SignatureNotVerified("Unable to recover signer.".to_owned());
-        assert!(a.to_string().contains("must not be allowed to sign a mainnet order"));
+        assert!(a
+            .to_string()
+            .contains("must not be allowed to sign a mainnet order"));
         let b = SmokeErr::CorruptSignatureAccepted;
         assert!(b.to_string().contains("meaningless"));
     }

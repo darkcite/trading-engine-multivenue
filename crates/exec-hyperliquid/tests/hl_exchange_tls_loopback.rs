@@ -301,7 +301,13 @@ fn signed_body(out: &mut Vec<u8>) {
     let mut action = [0u8; MAX_ACTION];
     let n = encode_order(
         &mut action,
-        &[OrderWire::new(100_032_530, true, 45_670_000, 2_500_000_000, Tif::Ioc)],
+        &[OrderWire::new(
+            100_032_530,
+            true,
+            45_670_000,
+            2_500_000_000,
+            Tif::Ioc,
+        )],
         b"na",
     )
     .expect("encode");
@@ -320,7 +326,9 @@ fn signed_body(out: &mut Vec<u8>) {
     // r/s/v. (E4 gives this its own encoder; the loopback only needs
     // well-formed bytes of the right size.)
     out.clear();
-    out.extend_from_slice(br#"{"action":{"type":"order"},"nonce":1789000000000,"signature":{"r":"0x"#);
+    out.extend_from_slice(
+        br#"{"action":{"type":"order"},"nonce":1789000000000,"signature":{"r":"0x"#,
+    );
     for b in &sig[..32] {
         out.extend_from_slice(format!("{b:02x}").as_bytes());
     }

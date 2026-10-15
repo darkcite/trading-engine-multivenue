@@ -51,8 +51,17 @@ RUNGS: tuple[tuple[str, dict[str, str]], ...] = (
 _COUNTERS_PREFIX = "member: hyparb pool_events="
 
 #: Integer / dollar fields the ladder keeps from the counters line.
-_INT_FIELDS = ("arbs", "side_buy", "side_sell", "size_capped", "hedges_perp", "hedges_spot",
-               "hedges_missed", "amm_judged_fills", "amm_canceled")
+_INT_FIELDS = (
+    "arbs",
+    "side_buy",
+    "side_sell",
+    "size_capped",
+    "hedges_perp",
+    "hedges_spot",
+    "hedges_missed",
+    "amm_judged_fills",
+    "amm_canceled",
+)
 _USD_FIELDS = ("gas_usd", "pnl_predicted_usd", "funding_earned_usd")
 #: Dollar fields a binary may not print (HYPARB G1 added the member's own
 #: session level). ABSENT stays absent — in a rung's row and in the merge —
@@ -179,8 +188,13 @@ def merge_ladder(per_unit: list[list[dict[str, object]]]) -> list[dict[str, obje
     it is left out."""
     merged: list[dict[str, object]] = []
     for name, _ in RUNGS:
-        acc: dict[str, object] = {"rung": name, "units": 0, "failed_units": 0,
-                                  "oos_net_usd": 0.0, "trades": 0}
+        acc: dict[str, object] = {
+            "rung": name,
+            "units": 0,
+            "failed_units": 0,
+            "oos_net_usd": 0.0,
+            "trades": 0,
+        }
         for k in _INT_FIELDS:
             acc[k] = 0
         for k in _USD_FIELDS:

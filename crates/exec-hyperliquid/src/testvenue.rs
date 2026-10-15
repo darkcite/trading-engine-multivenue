@@ -312,7 +312,10 @@ fn serve(mut sock: TcpStream, cfg: Arc<ServerConfig>, sh: &Shared) {
         sh.posts.lock().unwrap().push(seen.clone());
         let answer = (sh.policy.lock().unwrap())(&seen);
         let body = match answer {
-            Answer::Action(p) | Answer::Later(_, p) | Answer::Info(p) | Answer::ActionThenDrop(p) => p,
+            Answer::Action(p)
+            | Answer::Later(_, p)
+            | Answer::Info(p)
+            | Answer::ActionThenDrop(p) => p,
             Answer::Error(m) => format!(r#"{{"status":"err","response":"{m}"}}"#),
             Answer::Silent | Answer::Drop => return,
         };

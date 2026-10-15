@@ -224,13 +224,19 @@ mod tests {
             vec![0xcf, 0, 0, 0, 1, 0, 0, 0, 0]
         );
         // The HIP-4 asset id range: 100_000_000 + enc lands in u32.
-        assert_eq!(enc(|w| w.uint(100_032_530)), vec![0xce, 0x05, 0xf6, 0x60, 0x12]);
+        assert_eq!(
+            enc(|w| w.uint(100_032_530)),
+            vec![0xce, 0x05, 0xf6, 0x60, 0x12]
+        );
     }
 
     #[test]
     fn strings_match_the_observed_sdk_bytes() {
         // Straight out of the committed vectors: "type" and "order".
-        assert_eq!(enc(|w| w.str_bytes(b"type")), vec![0xa4, b't', b'y', b'p', b'e']);
+        assert_eq!(
+            enc(|w| w.str_bytes(b"type")),
+            vec![0xa4, b't', b'y', b'p', b'e']
+        );
         assert_eq!(
             enc(|w| w.str_bytes(b"order")),
             vec![0xa5, b'o', b'r', b'd', b'e', b'r']
@@ -267,7 +273,10 @@ mod tests {
     fn overflow_is_refused_not_truncated() {
         let mut buf = [0u8; 4];
         let mut w = Writer::new(&mut buf);
-        assert!(w.str_bytes(b"type").is_err(), "5 bytes into a 4-byte buffer");
+        assert!(
+            w.str_bytes(b"type").is_err(),
+            "5 bytes into a 4-byte buffer"
+        );
 
         let mut buf = [0u8; 2];
         let mut w = Writer::new(&mut buf);

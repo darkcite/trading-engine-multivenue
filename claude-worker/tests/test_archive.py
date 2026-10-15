@@ -47,9 +47,7 @@ ENV: typing.Final[dict[str, str]] = {
 }
 
 
-def make_pmlr(
-    path: pathlib.Path, *, kind: int, slots: int, start_ns: int = EPOCH_NS
-) -> None:
+def make_pmlr(path: pathlib.Path, *, kind: int, slots: int, start_ns: int = EPOCH_NS) -> None:
     """A structurally valid PMLR v3 file. `slots=0` is header-only (64 B)."""
     body = bytearray(HEADER.pack(b"PMLR", 3, kind, start_ns))
     body.extend(b"\x00" * (64 - len(body)))
@@ -157,9 +155,7 @@ def test_windows_2h_complete_matches_window_root(tmp_path: pathlib.Path) -> None
 
     archiver.push_run(run, with_catalog=False)
     manifest = json.loads(fake.objects[cfg.manifest_key(run.name)])
-    assert manifest["windows_2h_complete"] == len(
-        claude_worker.window_root.complete_windows(run)
-    )
+    assert manifest["windows_2h_complete"] == len(claude_worker.window_root.complete_windows(run))
     assert manifest["windows_2h_complete"] == 2
     assert manifest["pmlr_version"] == 3
     assert manifest["span_ns"] == list(claude_worker.window_root.run_span(run) or ())
@@ -687,9 +683,7 @@ def test_tarball_round_trip_extracts_the_original_run(tmp_path: pathlib.Path) ->
 
     # exactly the shape retention.sh writes: tar -czf <out> -C <root> <name>
     tarball = tmp_path / f"{run.name}.tar.gz"
-    subprocess.run(
-        ["tar", "-czf", str(tarball), "-C", str(logs), run.name], check=True
-    )
+    subprocess.run(["tar", "-czf", str(tarball), "-C", str(logs), run.name], check=True)
     result = archiver.push_tarball(tarball)
     assert result.files == 1
     assert cfg.tarballs_prefix() + run.name + ".tar.gz" in fake.objects
@@ -755,8 +749,7 @@ def test_key_order_property_lexicographic_equals_numeric(tmp_path: pathlib.Path)
     cfg = make_cfg(tmp_path)
     rng = random.Random(20260905)
     epochs = [
-        rng.randrange(1_500_000_000_000_000_000, 9_999_999_999_999_999_999)
-        for _ in range(10_000)
+        rng.randrange(1_500_000_000_000_000_000, 9_999_999_999_999_999_999) for _ in range(10_000)
     ]
     keys = [cfg.index_key(f"run-{e}") for e in epochs]
     assert sorted(keys) == [cfg.index_key(f"run-{e}") for e in sorted(epochs)]

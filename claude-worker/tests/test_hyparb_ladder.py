@@ -219,7 +219,11 @@ def test_an_unreadable_artifact_skips_the_ladder_loudly(tmp_path):
 
     lines: list[str] = []
     rc = claude_worker.pnl_report.run_day(
-        logs, tmp_path / "reports", day, lines.append, run_fn=fn,
+        logs,
+        tmp_path / "reports",
+        day,
+        lines.append,
+        run_fn=fn,
         hyparb_artifact=tmp_path / "absent.toml",
     )
     assert rc == 0

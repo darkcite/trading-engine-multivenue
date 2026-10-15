@@ -234,7 +234,7 @@ class FakeS3:
             contents.append(
                 "<Contents>"
                 f"<Key>{key}</Key><Size>{len(body)}</Size>"
-                f'<ETag>&quot;{self._etag(key, body)}&quot;</ETag>'
+                f"<ETag>&quot;{self._etag(key, body)}&quot;</ETag>"
                 "<LastModified>2026-09-05T12:00:00.000Z</LastModified>"
                 "</Contents>"
             )
