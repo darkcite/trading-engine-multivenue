@@ -62,11 +62,17 @@ fn price_scanner_is_zero_alloc() {
 #[test]
 fn book_parser_is_zero_alloc() {
     let buf: &[u8] = br#"[{"market":"0x60c2","asset_id":"0xabc","timestamp":"1713000000000","hash":"deadbeef","bids":[{"price":"0.517","size":"200.0"},{"price":"0.518","size":"100.0"}],"asks":[{"price":"0.521","size":"150.0"},{"price":"0.520","size":"50.0"}],"event_type":"book"}]"#;
+    // The single-object, `", "`-separated re-snapshot (live 2026-10-15;
+    // a copy of ingress-polymarket's `LIVE_BOOK_SPACED` test fixture).
+    let spaced: &[u8] = br#"{"market":"0x99b5ab8514be117c2a544cfc01186da0157453f1db21ae635c11d6a6afef22ee", "asset_id":"88378104575386233188962226569320382272592669666454108287035040791872565531906", "bids":[{"price":"0.01", "size":"14741.19"}, {"price":"0.16", "size":"190"}, {"price":"0.17", "size":"10"}], "asks":[{"price":"0.99", "size":"107748.47"}, {"price":"0.2", "size":"5465"}, {"price":"0.19", "size":"1861.19"}], "hash":"b383d532df1450e8b0a702c5c42fef0aff0b461b", "timestamp":"1792068514889", "event_type":"book"}"#;
     let row: &[u8] = br#"{"asset_id":"0xabc","price":"0.518","size":"642.77","side":"BUY","hash":"d0c1","best_bid":"0.518","best_ask":"0.520"}"#;
     let g = AllocGuard::new();
     for _ in 0..1_000u32 {
         let mut t = core_types::Tick::ZERO;
         assert!(ingress_polymarket::parse_book_update(buf, 1, 0, &mut t));
+        std::hint::black_box(t);
+        let mut t = core_types::Tick::ZERO;
+        assert!(ingress_polymarket::parse_book_update(spaced, 1, 0, &mut t));
         std::hint::black_box(t);
         let mut t = core_types::Tick::ZERO;
         assert!(ingress_polymarket::parse_price_change_row(row, 1, 0, 1_713_000_000_123, &mut t));

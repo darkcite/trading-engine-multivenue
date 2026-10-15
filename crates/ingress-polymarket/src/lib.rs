@@ -33,7 +33,7 @@ pub use run_loop::{
 };
 
 use core_net::{WsPayload, WsWriteErr};
-use core_parse::{find_field, scan_price_1e6, scan_u64, skip_byte};
+use core_parse::{find_field, scan_price_1e6, scan_u64, skip_byte, skip_ws};
 use core_types::{NsTs, Price, Qty, SymbolId, Tick};
 
 // ---------------------------------------------------------------
@@ -48,6 +48,10 @@ use core_types::{NsTs, Price, Qty, SymbolId, Tick};
 /// per asset in the market) while `price_change` events arrive as
 /// plain objects. Classification is `memmem`-based, so the wrapper
 /// is irrelevant here; the run loop walks multi-event frames.
+/// That array is the subscribe-time snapshot; the post-trade `book`
+/// re-snapshots sent while subscribed arrive as one plain,
+/// `", "`-separated object per asset (live 2026-10-15) — same event,
+/// same walk; [`parse_book_update`] says what they add (little).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FrameKind {
     /// `book` — full snapshot per asset (levels sorted worst→best).
@@ -127,6 +131,25 @@ pub const fn venue_seq_of(venue_time_ms: u64) -> u32 {
 ///   "event_type":"book"}]
 /// ```
 ///
+/// Re-sent while subscribed (live 2026-10-15), the same snapshot is one
+/// plain object, `", "`-separated, `bids`/`asks` before `hash`/
+/// `timestamp`, without `tick_size`/`last_trade_price`:
+///
+/// ```text
+/// {"market":"0x..", "asset_id":"8837..", "bids":[{"price":"0.01", "size":"14741.19"}, ...],
+///  "asks":[...], "hash":"..", "timestamp":"17..", "event_type":"book"}
+/// ```
+///
+/// Both forms are the full snapshot and parse identically: the touch
+/// and the `timestamp` (`hash`, `tick_size`, `last_trade_price` are
+/// unused). The re-snapshot is post-trade: it carries the same
+/// `timestamp` — so the same `venue_seq` — and the same best bid/ask
+/// as the `price_change` sent for that asset just before it (122 of
+/// 122 on the 2026-10-15 tap, 0–69 ms behind it). A book ordered by
+/// `venue_seq` (`book_builder::TopOfBook::apply`) drops it as `Stale`.
+/// Parsing it buys a quiet parse-error counter and the touch sizes in
+/// the capture — not a fresher touch.
+///
 /// Levels are objects sorted **worst→best**: top-of-book is the
 /// **last** element of each side. The caller slices one event out of
 /// the array wrapper (see the run loop's event walk).
@@ -173,31 +196,39 @@ fn parse_book_update_fill(buf: &[u8], sym: SymbolId, ts_ns: NsTs, out: &mut Tick
 /// pair as `(px_1e6, sz_1e6)`. An empty side yields `(0, 0)`.
 /// Level count on this venue is bounded by the price grid (≤ 999
 /// levels at the 0.001 tick), so the strict walk stays cheap.
+///
+/// JSON whitespace is skipped after the `[`, after every `,` (between
+/// levels and between `price` and `size`) and after each level's `}`:
+/// the single-object re-snapshot is `", "`-separated (every one was
+/// rejected before 2026-10-15). Keys stay colon-compact (`"price":"`),
+/// as everywhere on this wire. On compact input each skip is one
+/// failed compare.
 #[inline]
 fn scan_best_level(buf: &[u8], marker: &[u8]) -> Option<(i64, i64)> {
-    let mut at = memchr::memmem::find(buf, marker)? + marker.len();
-    let mut best: (i64, i64) = (0, 0);
+    let mut at = skip_ws(buf, memchr::memmem::find(buf, marker)? + marker.len());
+    if *buf.get(at)? == b']' {
+        return Some((0, 0));
+    }
     loop {
+        // {"price":"X","size":"Y"} / {"price":"X", "size":"Y"}
+        if buf.get(at..at + 10)? != b"{\"price\":\"" {
+            return None;
+        }
+        let (px, px_end) = scan_price_1e6(buf, at + 10)?;
+        if buf.get(px_end..px_end + 2)? != b"\"," {
+            return None;
+        }
+        let sz_at = skip_ws(buf, px_end + 2);
+        if buf.get(sz_at..sz_at + 8)? != b"\"size\":\"" {
+            return None;
+        }
+        let (sz, sz_end) = scan_price_1e6(buf, sz_at + 8)?;
+        let rel = memchr::memchr(b'}', buf.get(sz_end..)?)?;
+        at = skip_ws(buf, sz_end + rel + 1);
         match *buf.get(at)? {
-            b']' => return Some(best),
-            b'{' | b',' => {
-                if *buf.get(at)? == b',' {
-                    at += 1;
-                    continue;
-                }
-                // {"price":"X","size":"Y"}
-                if buf.get(at..at + 10)? != b"{\"price\":\"" {
-                    return None;
-                }
-                let (px, px_end) = scan_price_1e6(buf, at + 10)?;
-                if buf.get(px_end..px_end + 10)? != b"\",\"size\":\"" {
-                    return None;
-                }
-                let (sz, sz_end) = scan_price_1e6(buf, px_end + 10)?;
-                let rel = memchr::memchr(b'}', buf.get(sz_end..)?)?;
-                best = (px, sz);
-                at = sz_end + rel + 1;
-            }
+            b',' => at = skip_ws(buf, at + 1),
+            // The last level is the best one.
+            b']' => return Some((px, sz)),
             _ => return None,
         }
     }
@@ -401,6 +432,15 @@ mod tests {
     /// Live wire shape (2026-08-14): array-wrapped event, object
     /// levels, both sides sorted **worst→best**.
     const SAMPLE_BOOK: &[u8] = br#"[{"market":"0x60c2","asset_id":"1054263738","timestamp":"1713000000000","hash":"deadbeef","bids":[{"price":"0.517","size":"200.0"},{"price":"0.518","size":"100.0"}],"asks":[{"price":"0.521","size":"150.0"},{"price":"0.520","size":"50.0"}],"event_type":"book"}]"#;
+    /// Live wire 2026-10-15 (raw tap `pm-raw.tap`, a parse reject before
+    /// the fix): the single-object `book` re-snapshot — `", "`
+    /// separators, `bids`/`asks` before `hash`/`timestamp`, no
+    /// `tick_size`. Level arrays trimmed to first + last two; spacing
+    /// and key order exact.
+    const LIVE_BOOK_SPACED: &[u8] = br#"{"market":"0x99b5ab8514be117c2a544cfc01186da0157453f1db21ae635c11d6a6afef22ee", "asset_id":"88378104575386233188962226569320382272592669666454108287035040791872565531906", "bids":[{"price":"0.01", "size":"14741.19"}, {"price":"0.16", "size":"190"}, {"price":"0.17", "size":"10"}], "asks":[{"price":"0.99", "size":"107748.47"}, {"price":"0.2", "size":"5465"}, {"price":"0.19", "size":"1861.19"}], "hash":"b383d532df1450e8b0a702c5c42fef0aff0b461b", "timestamp":"1792068514889", "event_type":"book"}"#;
+    /// The same snapshot in the subscribe-time array form (compact,
+    /// key order and extra fields of the live array frame).
+    const LIVE_BOOK_COMPACT: &[u8] = br#"[{"market":"0x99b5ab8514be117c2a544cfc01186da0157453f1db21ae635c11d6a6afef22ee","asset_id":"88378104575386233188962226569320382272592669666454108287035040791872565531906","timestamp":"1792068514889","hash":"b383d532df1450e8b0a702c5c42fef0aff0b461b","bids":[{"price":"0.01","size":"14741.19"},{"price":"0.16","size":"190"},{"price":"0.17","size":"10"}],"asks":[{"price":"0.99","size":"107748.47"},{"price":"0.2","size":"5465"},{"price":"0.19","size":"1861.19"}],"tick_size":"0.01","event_type":"book","last_trade_price":"0.180"}]"#;
     const SAMPLE_PC: &[u8] = br#"{"market":"0x60c2","price_changes":[{"asset_id":"1054263738","price":"0.518","size":"642.77","side":"BUY","hash":"d0c1","best_bid":"0.518","best_ask":"0.520"}],"timestamp":"1713000000123","event_type":"price_change"}"#;
 
     #[test]
@@ -505,6 +545,62 @@ mod tests {
         // Both sides empty carries no information.
         let both = br#"{"timestamp":"1","bids":[],"asks":[]}"#;
         assert!(parse_book_update_view(both, 1, 0).is_none());
+    }
+
+    /// Every live single-object re-snapshot was a parse reject before
+    /// 2026-10-15 (the strict walk wanted `","size":"` and `},{`).
+    #[test]
+    fn parse_book_update_accepts_live_spaced_single_object_snapshot() {
+        assert_eq!(classify(LIVE_BOOK_SPACED), FrameKind::BookUpdate);
+        let t = parse_book_update_view(LIVE_BOOK_SPACED, 7, 42).unwrap();
+        assert_eq!(t.sym, 7);
+        assert_eq!(t.ts_ns, 42);
+        // Worst→best: the LAST level of each side is the touch.
+        assert_eq!(t.bid_px.raw(), 170_000);
+        assert_eq!(t.bid_qty.raw(), 10_000_000);
+        assert_eq!(t.ask_px.raw(), 190_000);
+        assert_eq!(t.ask_qty.raw(), 1_861_190_000);
+        assert_eq!(t.venue_time_ms, 1_792_068_514_889);
+        assert_eq!(t.venue_seq, venue_seq_of(1_792_068_514_889));
+        assert_eq!(t.flags, 0);
+    }
+
+    /// Both snapshot forms land identically — same touch, same stamp.
+    #[test]
+    fn spaced_and_compact_snapshots_parse_to_the_same_tick() {
+        let spaced = parse_book_update_view(LIVE_BOOK_SPACED, 3, 9).unwrap();
+        let compact = parse_book_update_view(LIVE_BOOK_COMPACT, 3, 9).unwrap();
+        assert_eq!(spaced, compact);
+    }
+
+    #[test]
+    fn scan_best_level_skips_json_whitespace() {
+        // JSON whitespace after `[`, `,` and `}` — newlines and tabs too.
+        let ws = b"{\"timestamp\":\"1\",\"bids\":[ \n{\"price\":\"0.1\",\t\"size\":\"1\"} ,\r\n {\"price\":\"0.2\", \"size\":\"2\"} ],\"asks\":[ ]}";
+        let t = parse_book_update_view(ws, 1, 0).unwrap();
+        assert_eq!(t.bid_px.raw(), 200_000);
+        assert_eq!(t.bid_qty.raw(), 2_000_000);
+        assert_eq!(t.ask_px.raw(), 0);
+    }
+
+    #[test]
+    fn scan_best_level_rejects_malformed_separators() {
+        // Leading, trailing or doubled commas and a missing comma now
+        // reject — the pre-2026-10-15 walker accepted all four compact
+        // forms — with or without whitespace between the levels.
+        for bids in [
+            r#"[,{"price":"0.1","size":"1"}]"#,
+            r#"[{"price":"0.1","size":"1"},]"#,
+            r#"[{"price":"0.1","size":"1"},,{"price":"0.2","size":"2"}]"#,
+            r#"[{"price":"0.1","size":"1"}{"price":"0.2","size":"2"}]"#,
+            r#"[{"price":"0.1","size":"1"}, ,{"price":"0.2","size":"2"}]"#,
+            r#"[{"price":"0.1","size":"1"} {"price":"0.2","size":"2"}]"#,
+        ] {
+            let frame = format!(
+                r#"{{"timestamp":"1","asks":[{{"price":"0.5","size":"1"}}],"bids":{bids}}}"#
+            );
+            assert!(parse_book_update_view(frame.as_bytes(), 1, 0).is_none(), "{bids}");
+        }
     }
 
     #[test]

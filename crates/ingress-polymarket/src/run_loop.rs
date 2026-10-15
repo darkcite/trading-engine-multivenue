@@ -694,7 +694,9 @@ fn judge_and_push_tick<C: Capture>(
 /// 2026-08-14; see [`crate::FrameKind`]).
 ///
 /// * `book` frames are **array-wrapped**, one event per asset in the
-///   market — events are walked at `{"market":"` boundaries; events
+///   market (the subscribe-time snapshot), or one plain object (the
+///   post-trade re-snapshots, live 2026-10-15) — either way
+///   events are walked at `{"market":"` boundaries; events
 ///   for sibling assets we never configured are skipped silently
 ///   (the venue groups by market, not by subscribed token — they
 ///   are not parse failures, and §6.5 deliberately does not tap them
@@ -1768,6 +1770,35 @@ mod tests {
         fn maybe_flush(&mut self, _now_ns: u64) {
             self.flushes += 1;
         }
+    }
+
+    /// Live wire 2026-10-15: the single-object, `", "`-separated `book`
+    /// re-snapshot (every one tapped as a reject before the fix) ticks
+    /// like the array-wrapped snapshot — one tick, no reject.
+    #[test]
+    fn single_object_spaced_book_ticks_without_reject() {
+        let mut t = TestTransport::with_capacity(16 * 1024);
+        let mut d = build_driver_with_seed(7);
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let map = SymbolMap::from_pairs(std::iter::once((b"0xABC".to_vec(), 42u32)));
+        let status = IngressStatus::new();
+        let mut cap = CountingCapture::default();
+        let spaced = br#"{"market":"0x1", "asset_id":"0xABC", "bids":[{"price":"0.17", "size":"10"}, {"price":"0.18", "size":"5.5"}], "asks":[{"price":"0.2", "size":"7"}, {"price":"0.19", "size":"3"}], "hash":"h", "timestamp":"1792068514889", "event_type":"book"}"#;
+        inject_unmasked_text(&mut t, spaced);
+        drive_one(
+            &mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut cap,
+        )
+        .unwrap();
+        assert_eq!(cap.rejects, 0);
+        assert_eq!(status.parse_errors_total(), 0);
+        let tick = *cons.try_pop_ref().expect("the spaced book must tick");
+        assert_eq!(tick.sym, 42);
+        assert_eq!((tick.bid_px.raw(), tick.bid_qty.raw()), (180_000, 5_500_000));
+        assert_eq!((tick.ask_px.raw(), tick.ask_qty.raw()), (190_000, 3_000_000));
+        assert_eq!(tick.venue_time_ms, 1_792_068_514_889);
+        assert!(cons.try_pop_ref().is_none(), "exactly one event");
     }
 
     #[test]
