@@ -33,10 +33,15 @@
 //! | 5 | `strategy-vm` | built (8g item 6) |
 //! | 6 | `strategy-xmm` | built (XMM XH1, 2026-09-26 — **was `strategy-icdp`**, unlinked the same day, O-XH1; lands DARK until XH3) — configured only when `~/multivenue/xmm.toml` resolves |
 //! | 7 | `strategy-hcv` | built (HC11, 2026-09-26 — Hypercall S1; lands DARK, paper only, in no configured mask, O-HC18) — configured only when `~/multivenue/hcv.toml` resolves |
+//! | 8–15 | — | **reserved** (S16-2, ruling S16-R5): no member; an `EnableStrategy` is refused and counted |
 //!
-//! Every slot is built since HC11: an `EnableStrategy` for a slot past 7
-//! is refused (counted), and slot 7 was never assigned before, so no
-//! capture carries rows of another member under it. Slot 2 changed hands on 2026-09-12:
+//! Slots 0–7 are all built since HC11 (slot 7 was never assigned before,
+//! so no capture carries rows of another member under it). Slots 8–15 are
+//! reserved (S16-2, ruling S16-R5): every mask is a
+//! [`core_types::SlotMask`] and every per-slot array is
+//! [`core_types::MAX_STRATEGY_SLOTS`] long, but no member stands there, so
+//! [`BUILT_MASK`] stays `0x00FF` and an `EnableStrategy` for 8–15 — like
+//! one past 15 — is refused (counted). Slot 2 changed hands on 2026-09-12:
 //! `strategy-cross-arb` was unlinked (the crate stays in the workspace
 //! — the `strategy-ev` precedent) and `strategy-xsd` took the number.
 //! Slot 6 changed hands on 2026-09-26 the same way: `strategy-icdp`
@@ -168,7 +173,8 @@ use core_ring::MailboxTx;
 use core_vol::{LongForecast, LongSetCounters, LongStateSnap, LongVolSet, DAY_NS};
 use core_types::{
     AiCmd, AiCmdKind, ChannelEvent, ChannelId, Fill, Order, OrderEvent, RegimeLabelSet,
-    RegimeWord, RuleTableV2, Signal, Tick, TradePrint, REGIME_OFF_HARD, REGIME_PROFILES,
+    RegimeWord, RuleTableV2, Signal, SlotMask, Tick, TradePrint, MAX_STRATEGY_SLOTS,
+    REGIME_OFF_HARD, REGIME_PROFILES,
 };
 use strategy_core::{
     Ctx, HarCounters, HarSeriesView, RegimeCounters, RegimeGate, RegimeRelView, SlotCounters,
@@ -190,6 +196,11 @@ const _: () = assert!(
     core::mem::size_of::<HarCounters>() == core::mem::size_of::<LongSetCounters>()
 );
 
+/// S16-2: the per-slot arrays' length — every slot a [`SlotMask`] can
+/// name, member or not (8–15 reserved: their entries keep their boot
+/// values and their gates read open).
+const SLOTS: usize = MAX_STRATEGY_SLOTS as usize;
+
 // ---------------------------------------------------------------
 // The member table (S16-1)
 // ---------------------------------------------------------------
@@ -202,7 +213,7 @@ pub struct Member {
     /// The member's slot: `Order::strategy_id` / `AiCmd::strategy_id`.
     pub slot: u8,
     /// The member's enable-mask bit, `1 << slot`.
-    pub bit: u8,
+    pub bit: SlotMask,
     /// The member's own `--strategy` name: the [`parse_strategy`] segment
     /// that composes its bit alone.
     pub name: &'static str,
@@ -234,11 +245,12 @@ macro_rules! member_gen {
         )*
         $(
             #[doc = concat!("Enable-mask bit of the `", $nm, "` member: `1 << ", stringify!($sn), "`.")]
-            pub const $bn: u8 = 1 << $sn;
+            pub const $bn: SlotMask = 1 << $sn;
         )*
         /// Every built member's bit: the OR of the member table's rows
-        /// (slots 0–7, all of them since HC11).
-        pub const BUILT_MASK: u8 = $($bn)|*;
+        /// (slots 0–7, all of them since HC11; 8–15 are reserved, S16-R5,
+        /// so this is `0x00FF`).
+        pub const BUILT_MASK: SlotMask = $($bn)|*;
         /// The member table's rows in slot order: every member's slot,
         /// bit, `--strategy` name and `regime.toml` label key. Boot-only
         /// readers; nothing on the hot path reads it.
@@ -251,7 +263,7 @@ macro_rules! member_gen {
         const _: () = {
             let mut i = 0;
             while i < MEMBERS.len() {
-                assert!(MEMBERS[i].slot < core_types::MAX_STRATEGY_SLOTS, "slot past the wire");
+                assert!(MEMBERS[i].slot < MAX_STRATEGY_SLOTS, "slot past the mask");
                 assert!(MEMBERS[i].bit == 1 << MEMBERS[i].slot, "a bit not its slot's");
                 assert!(i == 0 || MEMBERS[i - 1].slot < MEMBERS[i].slot, "rows out of order");
                 i += 1;
@@ -428,7 +440,7 @@ member_table! { @consts }
 /// captures and configs. Identical value.
 pub const SLOT_EV: u8 = SLOT_VRP;
 /// Slot 1's bit under its pre-2026-09-10 name. Identical value.
-pub const BIT_EV: u8 = BIT_VRP;
+pub const BIT_EV: SlotMask = BIT_VRP;
 
 /// Ai-exec capacity inside the set (design §7 sketch `AiExec<64>` —
 /// sizes the fair table, book table and cooldown gate alike).
@@ -442,7 +454,7 @@ pub const SET_AI_EXEC_SLOTS: usize = 64;
 /// executes only what the AI command plane pushes: ai-exec intents and VM
 /// rulesets). The one [`parse_strategy`] segment that names more than one
 /// member.
-pub const AI_MASK: u8 = BIT_AI_EXEC | BIT_VM;
+pub const AI_MASK: SlotMask = BIT_AI_EXEC | BIT_VM;
 
 /// Why [`parse_strategy`] refused a `--strategy` value. Its `Display`
 /// names the fault, then the valid names.
@@ -494,14 +506,14 @@ impl core::fmt::Display for StrategyParseErr<'_> {
 /// wrapper's `case` — and they drifted: `--strategy ai+vrp+xsd+bin15`
 /// refused the boot with every member dark behind a capture that still
 /// looked healthy. Every reader now calls this. Boot-only.
-pub fn parse_strategy(s: &str) -> Result<u8, StrategyParseErr<'_>> {
+pub fn parse_strategy(s: &str) -> Result<SlotMask, StrategyParseErr<'_>> {
     if s.is_empty() {
         return Err(StrategyParseErr::Empty);
     }
     if s == "all" {
         return Ok(BUILT_MASK);
     }
-    let mut mask = 0;
+    let mut mask: SlotMask = 0;
     for seg in s.split('+') {
         mask |= match seg {
             "" => return Err(StrategyParseErr::EmptySegment),
@@ -520,7 +532,7 @@ pub fn parse_strategy(s: &str) -> Result<u8, StrategyParseErr<'_>> {
 /// spelling of a [`parse_strategy`] result (`ai+vrp` → `vrp+ai-exec+vm`).
 /// A bit with no member shows nothing; mask 0 is the empty string.
 #[derive(Clone, Copy, Debug)]
-pub struct MaskNames(pub u8);
+pub struct MaskNames(pub SlotMask);
 
 impl core::fmt::Display for MaskNames {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -546,12 +558,12 @@ member_table! {
     /// Statically-composed strategy set. See the module docs for slot
     /// map, routing and boot semantics.
     pub struct StrategySet {
-        /// Runtime enable mask (bits per the slot map). Every bit is a
-        /// built slot since HC11.
-        enabled: u8,
+        /// Runtime enable mask (bits per the slot map). Only
+        /// [`BUILT_MASK`] bits are ever set: 8–15 are reserved (S16-R5).
+        enabled: SlotMask,
         /// Initial mask as passed to [`Self::new`] — `on_start` validates
         /// exactly these members.
-        initial: u8,
+        initial: SlotMask,
         /// Sticky halt flag (set-local until 8i). Once set, enables are
         /// refused until the process restarts.
         halted: bool,
@@ -566,7 +578,7 @@ member_table! {
         order_events_unrouted: u64,
         /// XMM XH1: when each slot's `on_timer` last ran (per-slot gating —
         /// module docs).
-        timer_last_ns: [NsTs; 8],
+        timer_last_ns: [NsTs; SLOTS],
         /// XMM XH1: when the regime detector's timer last ran.
         regime_timer_last_ns: NsTs,
         /// RG2: the regime detector (boot-boxed; inert until
@@ -575,9 +587,9 @@ member_table! {
         regime: Box<RegimeState>,
         /// RG2: per-slot label sets, pulled from the members at configure
         /// time (or overridden from `regime.toml [labels.*]`).
-        regime_labels: [RegimeLabelSet; 8],
+        regime_labels: [RegimeLabelSet; SLOTS],
         /// RG2: per-slot current gate.
-        regime_gates: [RegimeGate; 8],
+        regime_gates: [RegimeGate; SLOTS],
         /// RG2: `SetRegime` commands applied.
         regime_declared_total: u64,
         /// RG2: gate edges fanned out (`on_regime` calls).
@@ -616,12 +628,12 @@ pub const REGIME_TIMER_NS: u64 = 1_000_000_000;
 
 impl StrategySet {
     /// Build the set with all members default-constructed and the
-    /// given initial enable mask. Reserved/unknown bits in
-    /// `initial_mask` are silently cleared to `BUILT_MASK` — the wire
-    /// cannot express them and the cli builds masks via
+    /// given initial enable mask. Reserved bits (8–15, S16-R5) in
+    /// `initial_mask` are silently cleared to `BUILT_MASK` — no member
+    /// stands behind them and the cli builds masks via
     /// [`parse_strategy`], so anything else is caller error contained
     /// at boot. Boot-only.
-    pub fn new(initial_mask: u8) -> Self {
+    pub fn new(initial_mask: SlotMask) -> Self {
         let m = initial_mask & BUILT_MASK;
         member_table!(@new {
             enabled: m,
@@ -630,11 +642,11 @@ impl StrategySet {
             enable_refused: 0,
             fills_unrouted: 0,
             order_events_unrouted: 0,
-            timer_last_ns: [0; 8],
+            timer_last_ns: [0; SLOTS],
             regime_timer_last_ns: 0,
             regime: RegimeState::new_boxed(),
-            regime_labels: [RegimeLabelSet::ANY; 8],
-            regime_gates: [RegimeGate::OPEN_UNKNOWN; 8],
+            regime_labels: [RegimeLabelSet::ANY; SLOTS],
+            regime_gates: [RegimeGate::OPEN_UNKNOWN; SLOTS],
             regime_declared_total: 0,
             regime_gate_changes: 0,
             har: Box::new(LongVolSet::new()),
@@ -779,7 +791,7 @@ impl StrategySet {
     /// The current gate of `slot` (open for unconstrained members).
     #[inline]
     pub fn regime_gate(&self, slot: u8) -> RegimeGate {
-        if slot < 8 {
+        if slot < MAX_STRATEGY_SLOTS {
             self.regime_gates[slot as usize]
         } else {
             RegimeGate::OPEN_UNKNOWN
@@ -789,7 +801,7 @@ impl StrategySet {
     /// The label set of `slot`.
     #[inline]
     pub fn regime_label_of(&self, slot: u8) -> RegimeLabelSet {
-        if slot < 8 {
+        if slot < MAX_STRATEGY_SLOTS {
             self.regime_labels[slot as usize]
         } else {
             RegimeLabelSet::ANY
@@ -820,7 +832,7 @@ impl StrategySet {
     /// Re-judge every slot without member callbacks (boot / seed).
     fn judge_gates_silently(&mut self) {
         let mut slot = 0usize;
-        while slot < 8 {
+        while slot < SLOTS {
             self.regime_gates[slot] = self.judge_slot(slot);
             slot += 1;
         }
@@ -846,11 +858,11 @@ impl StrategySet {
     /// themselves from the pushed view (RG3).
     fn refresh_gates<C: Ctx>(&mut self, ctx: &mut C) {
         let mut slot = 0usize;
-        while slot < 8 {
+        while slot < SLOTS {
             let next = self.judge_slot(slot);
             let prev = self.regime_gates[slot];
             self.regime_gates[slot] = next;
-            if next.open != prev.open && self.enabled & (1u8 << slot) != 0 {
+            if next.open != prev.open && self.enabled & ((1 as SlotMask) << slot) != 0 {
                 self.regime_gate_changes = self.regime_gate_changes.wrapping_add(1);
                 self.deliver_gate(slot as u8, next, ctx);
             }
@@ -865,7 +877,7 @@ impl StrategySet {
 
     /// Current enable mask.
     #[inline]
-    pub fn enabled_mask(&self) -> u8 {
+    pub fn enabled_mask(&self) -> SlotMask {
         self.enabled
     }
 
@@ -891,8 +903,9 @@ impl StrategySet {
     /// X1: deliver an attributed fill to exactly one enabled slot.
     #[inline(always)]
     fn route_fill_to_slot<C: Ctx>(&mut self, slot: u8, fill: &Fill, ctx: &mut C) {
-        // No slot past 7 exists. A fill stamped with one is a bug
-        // upstream, not a member to deliver to.
+        // Slots 8–15 have no member (S16-R5) and no slot past 15 exists:
+        // a fill stamped with one is a bug upstream, not a member to
+        // deliver to.
         member_table!(
             @route self, ctx, slot, on_fill(fill),
             self.fills_unrouted = self.fills_unrouted.wrapping_add(1)
@@ -912,8 +925,8 @@ impl StrategySet {
     /// the [`Self::route_fill_to_slot`] law.
     #[inline(always)]
     fn route_order_event_to_slot<C: Ctx>(&mut self, slot: u8, event: &OrderEvent, ctx: &mut C) {
-        // No slot past 7 exists — the caller's mask check keeps it
-        // out, and this arm counts it if that ever changes.
+        // Slots 8–15 have no member (S16-R5) — the caller's mask check
+        // keeps them out, and this arm counts one if that ever changes.
         member_table!(
             @route self, ctx, slot, on_order_event(event),
             self.order_events_unrouted = self.order_events_unrouted.wrapping_add(1)
@@ -1021,7 +1034,8 @@ impl StrategySet {
             self.enable_refused = self.enable_refused.wrapping_add(1);
             return;
         }
-        // No slot past 7: no member behind it — refuse and count.
+        // No member behind the slot (8–15 reserved, S16-R5; past 15 off
+        // the mask) — refuse and count.
         let bit = member_table!(@bit_of slot, {
             self.enable_refused = self.enable_refused.wrapping_add(1);
             return;
@@ -1033,7 +1047,7 @@ impl StrategySet {
     /// gate (its own state may be stale from before the disable).
     #[inline]
     fn sync_gate_on_enable<C: Ctx>(&mut self, slot: u8, ctx: &mut C) {
-        if slot < 8 && self.enabled & (1u8 << slot) != 0 {
+        if slot < MAX_STRATEGY_SLOTS && self.enabled & ((1 as SlotMask) << slot) != 0 {
             let gate = self.regime_gates[slot as usize];
             self.deliver_gate(slot, gate, ctx);
         }
@@ -1044,8 +1058,8 @@ impl StrategySet {
     /// no-op by construction.
     #[inline]
     fn disable_slot(&mut self, slot: u8) {
-        if slot < 8 {
-            self.enabled &= !(1u8 << slot);
+        if slot < MAX_STRATEGY_SLOTS {
+            self.enabled &= !((1 as SlotMask) << slot);
         }
     }
 }
@@ -1076,7 +1090,7 @@ impl StrategyCounters for StrategySet {
     // (kind="vm" counters), NOT the set aggregates above.
 
     /// Live enable mask (`engine_strategy_enabled_mask`). Shadowed by
-    /// the inherent u8 accessor on method-call syntax — see the trait
+    /// the inherent `SlotMask` accessor on method-call syntax — see the trait
     /// docs; readers use UFCS.
     #[inline]
     fn enabled_mask(&self) -> u64 {
@@ -1285,7 +1299,7 @@ impl StrategyCounters for StrategySet {
             p += 1;
         }
         let mut slot = 0usize;
-        while slot < 8 {
+        while slot < SLOTS {
             let g = self.regime_gates[slot];
             c.gates[slot] = if g.open {
                 0
@@ -1474,7 +1488,7 @@ impl Strategy for StrategySet {
     #[inline(always)]
     fn on_order_event<C: Ctx>(&mut self, event: &OrderEvent, ctx: &mut C) {
         let slot = event.strategy_id;
-        if slot >= 8 || self.enabled & (1u8 << slot) == 0 {
+        if slot >= MAX_STRATEGY_SLOTS || self.enabled & ((1 as SlotMask) << slot) == 0 {
             self.order_events_unrouted = self.order_events_unrouted.wrapping_add(1);
             return;
         }
@@ -1501,7 +1515,7 @@ impl Strategy for StrategySet {
     fn on_fill<C: Ctx>(&mut self, fill: &Fill, ctx: &mut C) {
         if fill.strategy_id != core_types::STRATEGY_ID_NONE {
             let slot = fill.strategy_id;
-            if slot >= 8 || self.enabled & (1u8 << slot) == 0 {
+            if slot >= MAX_STRATEGY_SLOTS || self.enabled & ((1 as SlotMask) << slot) == 0 {
                 self.fills_unrouted = self.fills_unrouted.wrapping_add(1);
                 return;
             }
@@ -1760,7 +1774,7 @@ mod tests {
     /// laws are pinned through the ai-exec member instead — a
     /// Heartbeat then one OrderIntent emits exactly one order when
     /// slot 4 is live and nothing when it is not.
-    const PROBE_BIT: u8 = BIT_AI_EXEC;
+    const PROBE_BIT: SlotMask = BIT_AI_EXEC;
     const PROBE_SLOT: u8 = SLOT_AI_EXEC;
 
     fn tick(venue: VenueId, sym: SymbolId, bid_1e6: i64, ask_1e6: i64) -> Tick {
@@ -1844,7 +1858,7 @@ mod tests {
     /// same mask.
     #[test]
     fn initial_mask_from_names() {
-        const ORACLE: [(&str, u8); 24] = [
+        const ORACLE: [(&str, SlotMask); 24] = [
             ("hyparb", 1),
             ("ai+hyparb", 49),
             ("ai+vrp+xsd+bin15+hyparb", 63),
@@ -1940,7 +1954,18 @@ mod tests {
     fn new_clamps_reserved_bits_to_built_mask() {
         let s = StrategySet::new(0xFF);
         assert_eq!(s.enabled_mask(), BUILT_MASK);
-        const _: () = assert!(BUILT_MASK == 0xFF, "no reserved bit is left since HC11");
+        const _: () = assert!(
+            BUILT_MASK == 0x00FF,
+            "slots 0–7 built since HC11; 8–15 reserved (S16-R5)"
+        );
+        // S16-2: the reserved high byte is cleared, whole or alone — it
+        // never lands on the low byte's members.
+        let s = StrategySet::new(0xFFFF);
+        assert_eq!(s.enabled_mask(), BUILT_MASK);
+        let s = StrategySet::new(0xFF00);
+        assert_eq!(s.enabled_mask(), 0);
+        let s = StrategySet::new((1 as SlotMask) << 11);
+        assert_eq!(s.enabled_mask(), 0, "slot 11 is not slot 3");
         let s = StrategySet::new(0b1000_0000);
         assert_eq!(s.enabled_mask(), BIT_HCV, "slot 7 is built (hcv since HC11)");
         let s = StrategySet::new(BIT_XSD);
@@ -2172,9 +2197,9 @@ mod tests {
     }
 
     /// Migrated from slot 5 in 8g item 6 (§8), from slot 6 in ICDP I4
-    /// (slot 6 is xmm since XMM XH1) and from slot 7 in HC11 (hcv): no
-    /// slot is reserved any more — ids past 7 are the unknown ones
-    /// (probed twice).
+    /// (slot 6 is xmm since XMM XH1) and from slot 7 in HC11 (hcv). Since
+    /// S16-2 the ids past 7 are the RESERVED slots 8–15 (S16-R5; probed
+    /// twice here — the `s16_*` tests take every mask path at 8, 11, 15).
     #[test]
     fn enable_reserved_or_unknown_slot_refused() {
         let mut s = StrategySet::new(0);
@@ -2971,6 +2996,87 @@ mod tests {
             assert_eq!(s.regime_label_of(SLOT_VM), RegimeLabelSet::ANY, "pulled at configure");
             assert!(s.regime_gate(SLOT_VM).open, "slot 5's own gate never closes");
         }
+
+        /// S16-2: every per-slot path at 8, 11, 15 falls to its default arm
+        /// — no relabel, label ANY, a gate that reads open while slot 3's is
+        /// closed, zero per-slot counters, a timer clock that never moves —
+        /// and none of it lands on slot `s & 7`.
+        #[test]
+        fn s16_reserved_slots_fall_to_the_default_arm_on_every_per_slot_path() {
+            let mut s = StrategySet::new(BUILT_MASK);
+            let mut c = ctx();
+            c.now = T0;
+            assert!(s.set_regime_label(SLOT_BIN15, bull_label(REGIME_OFF_SOFT)));
+            for slot in S16_PROBES {
+                assert!(
+                    !s.set_regime_label(slot, bull_label(REGIME_OFF_SOFT)),
+                    "slot {slot}"
+                );
+                assert_eq!(s.regime_label_of(slot), RegimeLabelSet::ANY, "slot {slot}");
+            }
+            s.configure_regime(&params(), WallAnchor::new(T0, WALL0), T0)
+                .unwrap();
+            assert!(
+                !s.regime_gate(SLOT_BIN15).open,
+                "slot 3 shut until the regime is known"
+            );
+            for slot in S16_PROBES {
+                assert!(s.regime_gate(slot).open, "slot {slot}");
+                assert_eq!(
+                    StrategyCounters::slot_counters(&s, slot),
+                    SlotCounters::default(),
+                    "slot {slot}"
+                );
+            }
+            let k = s.regime_counters();
+            assert_eq!(k.gates[SLOT_BIN15 as usize], 1, "slot 3 soft-closed");
+            assert_eq!(k.gates[8..], [0; 8], "slots 8–15 read open");
+            assert_eq!(s.regime_label_of(16), RegimeLabelSet::ANY, "past the mask");
+            assert_eq!(
+                s.regime_gate(200),
+                RegimeGate::OPEN_UNKNOWN,
+                "past the mask"
+            );
+            s.on_timer(T0 + 5 * REGIME_TIMER_NS, &mut c);
+            assert_eq!(s.timer_last_ns[8..], [0; 8], "no clock at 8–15 moves");
+            assert_eq!(c.submitted, 0);
+        }
+
+        /// S16-2: a gate EDGE at a reserved slot. No member can give slot
+        /// 11 a label, so the test writes one into the set; a declaration
+        /// then flips slot 11's gate, and `refresh_gates` tests slot 11's
+        /// enable bit — the shift a `u8` would land on slot 3 (bin15,
+        /// enabled here). Slot 11 is not enabled, so nothing is delivered
+        /// or counted, and slot 3's gate stays open. `sync_gate_on_enable`
+        /// (reached only after a successful enable, which 8–15 never get)
+        /// is called for slot 11 directly.
+        #[test]
+        fn s16_a_gate_edge_at_a_reserved_slot_reaches_no_member() {
+            let mut s = StrategySet::new(BUILT_MASK);
+            let mut c = ctx();
+            c.now = T0;
+            s.regime_labels[11] = bull_label(REGIME_OFF_SOFT);
+            s.configure_regime(&params(), WallAnchor::new(T0, WALL0), T0)
+                .unwrap();
+            assert!(!s.regime_gate(11).open, "fail-closed until known");
+            let minute0 = s.regime().minute();
+            assert_eq!(s.seed_regime(&uptrend_seed(minute0), T0), 80);
+            assert!(s.regime_gate(11).open, "BULL measured: open, silently");
+            assert!(s.regime_gate(SLOT_BIN15).open);
+            let bear = RegimeWord::EMPTY.with_dim(DIM_TREND, TREND_BEAR);
+            s.on_ai(&set_regime_cmd(T0 + 1, 0, bear, 5 * MINUTE_NS), &mut c);
+            let k = s.regime_counters();
+            assert_eq!(k.declared_total, 1);
+            assert!(!s.regime_gate(11).open, "slot 11's gate flipped");
+            assert_eq!(k.gates[11], 1);
+            assert_eq!(k.gate_changes, 0, "slot 11 is not enabled: no delivery");
+            assert!(s.regime_gate(SLOT_BIN15).open, "slot 3's gate never moved");
+            assert_eq!(k.gates[SLOT_BIN15 as usize], 0);
+            s.sync_gate_on_enable(11, &mut c);
+            assert_eq!(s.regime_counters().gate_changes, 0);
+            assert_eq!(s.enabled_mask(), BUILT_MASK);
+            assert_eq!(c.submitted, 0);
+        }
     }
 
     /// S16-1c: each member's name is one parser segment — non-empty,
@@ -3029,7 +3135,7 @@ mod tests {
             [SLOT_HYPARB, SLOT_VRP, SLOT_XSD, SLOT_BIN15, SLOT_AI_EXEC, SLOT_VM, SLOT_XMM, SLOT_HCV],
             [0, 1, 2, 3, 4, 5, 6, 7]
         );
-        let mut or = 0u8;
+        let mut or: SlotMask = 0;
         for m in MEMBERS {
             assert_eq!(m.bit, 1 << m.slot, "{}", m.name);
             assert_eq!(parse_strategy(m.name), Ok(m.bit), "{}", m.name);
@@ -3052,6 +3158,133 @@ mod tests {
                 None
             ]
         );
+    }
+
+    // ---- S16-2: the slot type ------------------------------------------
+    //
+    // The release profile builds with `overflow-checks = false`, so a
+    // `1u8 << slot` left on any mask path would put slot 8 on slot 0
+    // (hyparb), 11 on 3 (BIN15) and 15 on 7 (hcv) without a sound. Debug
+    // test builds panic on that shift instead, so these take every mask
+    // path at the three probe slots, against sets whose `s & 7` members
+    // are ENABLED: an alias shows as a changed mask, a panic or a
+    // delivered callback.
+
+    /// The probe slots: the first, a middle and the last reserved slot.
+    const S16_PROBES: [u8; 3] = [8, 11, 15];
+
+    /// `BUILT_MASK` is the low byte, `all` is still 255, every parsed mask
+    /// fits in it, and a reserved bit names nothing.
+    #[test]
+    fn s16_built_mask_is_the_low_byte_and_all_is_255() {
+        const _: () = assert!(core::mem::size_of::<SlotMask>() == 2);
+        let all: SlotMask = parse_strategy("all").unwrap();
+        assert_eq!(all, 255, "`all` is every BUILT member");
+        for name in MEMBERS.iter().map(|m| m.name).chain(["ai"]) {
+            let m = parse_strategy(name).unwrap();
+            assert_eq!(m & !BUILT_MASK, 0, "{name}: no reserved bit");
+        }
+        for slot in S16_PROBES {
+            let bit = (1 as SlotMask) << slot;
+            assert_eq!(bit & BUILT_MASK, 0, "slot {slot} has no member");
+            assert_eq!(MaskNames(bit).to_string(), "", "slot {slot} names nothing");
+        }
+        assert_eq!(
+            MaskNames(0xFFFF).to_string(),
+            MaskNames(BUILT_MASK).to_string()
+        );
+    }
+
+    /// `EnableStrategy` for 8, 11, 15 passes the wire's shape check
+    /// (core-types admits `0..MAX_STRATEGY_SLOTS`) and is refused and
+    /// counted by the set: the mask stays 0 — slot `s & 7` is not switched
+    /// on. Past 15 it is refused at the wire, and by the set as well.
+    #[test]
+    fn s16_enable_of_a_reserved_slot_is_refused_and_counted_never_aliased() {
+        let mut s = StrategySet::new(0);
+        let mut c = ctx();
+        s.on_start(&mut c).unwrap();
+        for (k, slot) in S16_PROBES.into_iter().enumerate() {
+            let cmd = ai_cmd(AiCmdKind::EnableStrategy, slot);
+            assert_eq!(cmd.validate_shape(), Ok(()), "slot {slot} is on the wire");
+            s.on_ai(&cmd, &mut c);
+            assert_eq!(s.enabled_mask(), 0, "slot {slot} is not slot {}", slot & 7);
+            assert_eq!(
+                s.enable_refused_total(),
+                k as u64 + 1,
+                "slot {slot} counted"
+            );
+        }
+        for slot in [16, 200] {
+            let cmd = ai_cmd(AiCmdKind::EnableStrategy, slot);
+            assert!(cmd.validate_shape().is_err(), "slot {slot} is off the wire");
+            s.on_ai(&cmd, &mut c);
+        }
+        assert_eq!(s.enabled_mask(), 0);
+        assert_eq!(s.enable_refused_total(), 5);
+        assert_eq!(StrategyCounters::ai_enable_refused(&s), 5);
+        assert!(!s.is_halted(), "a reserved-slot refusal is not a halt");
+        assert_eq!(c.submitted, 0);
+    }
+
+    /// `DisableStrategy` for 8, 11, 15 with every built member on: honoured
+    /// and a no-op — hyparb, bin15 and hcv (`s & 7`) stay enabled. The
+    /// disable is the one set path that SHIFTS by the command's slot.
+    #[test]
+    fn s16_disable_of_a_reserved_slot_clears_no_built_bit() {
+        let mut s = StrategySet::new(BUILT_MASK);
+        let mut c = ctx();
+        for slot in S16_PROBES {
+            let cmd = ai_cmd(AiCmdKind::DisableStrategy, slot);
+            assert_eq!(cmd.validate_shape(), Ok(()), "slot {slot} is on the wire");
+            s.on_ai(&cmd, &mut c);
+            assert_eq!(s.enabled_mask(), BUILT_MASK, "slot {} still on", slot & 7);
+        }
+        s.on_ai(&ai_cmd(AiCmdKind::DisableStrategy, 16), &mut c);
+        s.on_ai(&ai_cmd(AiCmdKind::DisableStrategy, 200), &mut c);
+        assert_eq!(s.enabled_mask(), BUILT_MASK);
+        assert_eq!(s.enable_refused_total(), 0, "a disable is never a refusal");
+    }
+
+    /// A fill and an order event stamped 8, 11, 15 — with every built
+    /// member enabled, so the `s & 7` member would take an alias — are
+    /// counted unrouted and reach nobody.
+    #[test]
+    fn s16_fills_and_order_events_for_a_reserved_slot_are_unrouted() {
+        let mut s = StrategySet::new(BUILT_MASK);
+        let mut c = ctx();
+        let sym = make_symbol_id(VenueId::Hyperliquid, 2);
+        for (k, slot) in S16_PROBES.into_iter().enumerate() {
+            let fill = core_types::Fill::new(
+                1,
+                sym,
+                Side::Bid,
+                Price::from_raw(1_000_000),
+                Qty::from_raw(1_000_000),
+                99,
+            )
+            .with_attribution(slot, core_types::FILL_ORIGIN_PAPER);
+            s.on_fill(&fill, &mut c);
+            assert_eq!(s.fills_unrouted(), k as u64 + 1, "fill for slot {slot}");
+            let ev = OrderEvent::new(
+                1,
+                VenueId::Hyperliquid,
+                sym,
+                5,
+                slot,
+                core_types::ORDER_EVENT_CANCELED,
+                core_types::ORDER_EVENT_REASON_CANCEL_REQUESTED,
+                0,
+            );
+            s.on_order_event(&ev, &mut c);
+            assert_eq!(
+                s.order_events_unrouted(),
+                k as u64 + 1,
+                "event for slot {slot}"
+            );
+        }
+        assert_eq!(c.submitted, 0);
+        assert_eq!(s.orders_emitted(), 0);
     }
 
     // ---- HC11 ---------------------------------------------------------

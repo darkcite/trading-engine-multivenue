@@ -12,7 +12,7 @@
 //! name says `wall`. Text fields are fixed byte arrays with an explicit
 //! length (truncated on write — the writer's law, documented per field).
 
-use core_types::{Fill, Order};
+use core_types::{Fill, Order, SlotMask};
 use strategy_core::{
     HarCounters, HarSeriesView, HcvCounters, HyparbCoinView, HyparbCounters, HyparbPoolView,
     RegimeCounters,
@@ -113,10 +113,11 @@ pub struct BootInfo {
     /// Process id.
     pub pid: u32,
     /// `--strategy` mask as requested (`strategy_set::parse_strategy`).
-    pub requested_mask: u8,
+    /// A [`SlotMask`] since S16-2 (the JSON value is the same number).
+    pub requested_mask: SlotMask,
     /// Members whose boot config was present (the set builder's
     /// `configured`); `enabled = requested & configured` at boot.
-    pub configured_mask: u8,
+    pub configured_mask: SlotMask,
     /// 1 when the regime detector configured at boot.
     pub regime_configured: u8,
     /// 1 = paper mode (no live dispatcher).
@@ -140,9 +141,17 @@ pub struct BootInfo {
     pub run_dir_len: u8,
     /// Live bytes of `xmm_coins`.
     pub xmm_coins_len: u8,
-    /// Explicit padding — always zero.
-    _pad: [u8; 4],
+    /// Explicit padding — always zero. 4 → 2 at S16-2: the two masks
+    /// grew a byte each, so the struct keeps its 448 B and no implicit
+    /// padding (pinned below).
+    _pad: [u8; 2],
 }
+
+// S16-2 pins: the two masks grew a byte each (the fields after them sit
+// 2 B later) and `_pad` gave the bytes back, so the size stays 448 B.
+const _: () = assert!(core::mem::size_of::<BootInfo>() == 448);
+const _: () = assert!(core::mem::offset_of!(BootInfo, requested_mask) == 132);
+const _: () = assert!(core::mem::offset_of!(BootInfo, regime_configured) == 136);
 
 impl BootInfo {
     /// The all-zero identity (tests, tools that run the loop without
@@ -168,7 +177,7 @@ impl BootInfo {
         strategy_name_len: 0,
         run_dir_len: 0,
         xmm_coins_len: 0,
-        _pad: [0; 4],
+        _pad: [0; 2],
     };
 
     /// Store `s` into `git_sha` (truncated to the field).
@@ -1071,12 +1080,12 @@ pub struct EngineSnapshot {
     pub schema: u32,
     /// 1 while the set's sticky halt is raised.
     pub halted: u8,
-    /// Live strategy-set enable mask (0 for a plain strategy).
-    pub enabled_mask: u8,
     /// Live bytes of `strategy_kind`.
     pub strategy_kind_len: u8,
-    /// Explicit padding — always zero.
-    pub _pad0: u8,
+    /// Live strategy-set enable mask (0 for a plain strategy). A
+    /// [`SlotMask`] since S16-2: it takes the two bytes `_pad0` and its
+    /// own `u8` held, so `seq` stays at offset 8 (pinned below).
+    pub enabled_mask: SlotMask,
     /// Publish counter (1 = first snapshot after boot).
     pub seq: u64,
     /// Engine-monotonic ns of this publish.
@@ -1123,6 +1132,10 @@ pub struct EngineSnapshot {
     pub recent_fills: RecentRing<Fill, RECENT_FILLS>,
 }
 
+// S16-2: the widened `enabled_mask` fills the header's 4 B after `schema`.
+const _: () = assert!(core::mem::offset_of!(EngineSnapshot, enabled_mask) == 6);
+const _: () = assert!(core::mem::offset_of!(EngineSnapshot, seq) == 8);
+
 impl EngineSnapshot {
     /// The boot value: nothing observed yet. Not `const` (the embedded
     /// `strategy-core` PODs build through `Default`); boot-only —
@@ -1131,9 +1144,8 @@ impl EngineSnapshot {
         Self {
             schema: SNAPSHOT_SCHEMA,
             halted: 0,
-            enabled_mask: 0,
             strategy_kind_len: 0,
-            _pad0: 0,
+            enabled_mask: 0,
             seq: 0,
             mono_ns: 0,
             wall_ns: 0,
@@ -1205,7 +1217,9 @@ mod tests {
         // 24 B more in that block (368 B: the `not_writable` refusal,
         // options' margin and eapi's weight) fit the same alignment. BX13's
         // 56 B more (424 B: spot's weight, spot's day, the held cycles)
-        // cross it: 31,872 B, 896 B left.
+        // cross it: 31,872 B, 896 B left. S16-2's 8 B more (`regime.gates`
+        // 8 → 16; the widened masks reuse header and pad bytes) fit the
+        // same alignment: still 31,872 B.
         let n = core::mem::size_of::<EngineSnapshot>();
         assert!(n <= 32 * 1024, "EngineSnapshot grew to {n} B");
         assert_eq!(n, 31_872, "the BX13 figure: a change states its own");

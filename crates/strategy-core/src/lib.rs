@@ -34,7 +34,7 @@ use core_types::regime::REL_UNKNOWN;
 use core_types::{
     AiCmd, CancelReq, ChannelEvent, DepthTopK, Fill, OptSummary, Order, OrderEvent,
     RegimeLabelSet, RegimeWord, RuleTableV2, Signal, SymbolId, Tick, TradePrint, VenueId,
-    REGIME_OFF_HARD, REGIME_OFF_SOFT, REGIME_PROFILES, SYMBOL_ID_NONE,
+    MAX_STRATEGY_SLOTS, REGIME_OFF_HARD, REGIME_OFF_SOFT, REGIME_PROFILES, SYMBOL_ID_NONE,
 };
 
 /// Error type returned from `Strategy::on_start`. Startup errors are
@@ -222,7 +222,7 @@ pub trait StrategyCounters {
     // they swallow AI cmds and ruleset tables via the trait defaults.
     //
     // NOTE on `enabled_mask`: `StrategySet` also has an *inherent*
-    // `enabled_mask(&self) -> u8`; method-call syntax on the concrete
+    // `enabled_mask(&self) -> SlotMask`; method-call syntax on the concrete
     // type resolves to the inherent one, so the cli reads this via
     // UFCS (`StrategyCounters::enabled_mask(...)`) exactly like the
     // other rows.
@@ -768,8 +768,9 @@ pub struct RegimeCounters {
     pub raw: [[i64; 4]; 4],
     /// Presence bits per profile (`core_regime::RAW_*`).
     pub raw_present: [u8; 4],
-    /// Per-slot gate: 0 open, 1 soft-closed, 2 hard-closed.
-    pub gates: [u8; 8],
+    /// Per-slot gate: 0 open, 1 soft-closed, 2 hard-closed — every slot
+    /// the mask can name (S16-2: 16; a slot with no member reads open).
+    pub gates: [u8; MAX_STRATEGY_SLOTS as usize],
     /// Minutes judged since boot.
     pub minutes_judged: u64,
     /// Seed rows applied at boot.
@@ -796,7 +797,7 @@ impl Default for RegimeCounters {
             disagree: [0; 4],
             raw: [[0; 4]; 4],
             raw_present: [0; 4],
-            gates: [0; 8],
+            gates: [0; MAX_STRATEGY_SLOTS as usize],
             minutes_judged: 0,
             seed_rows: 0,
             declared_total: 0,
@@ -2431,7 +2432,7 @@ mod tests {
         assert_eq!(c.declared[1], RegimeWord::EMPTY);
         assert_eq!(c.declared_ts_ns[0], 0);
         assert_eq!(c.declared_ttl_ns[0], 0);
-        assert_eq!(c.gates, [0; 8]);
+        assert_eq!(c.gates, [0; 16], "S16-2: 16 slots, 16 gates");
         assert_eq!(c.configured, 0);
         assert_eq!(core::mem::size_of::<RegimeGate>(), 40);
     }

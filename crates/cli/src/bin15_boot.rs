@@ -98,7 +98,7 @@ pub struct Bin15Boot {
 
 /// Whether the operator asked for the member.
 #[must_use]
-pub fn bin15_wanted(requested: u8) -> bool {
+pub fn bin15_wanted(requested: core_types::SlotMask) -> bool {
     requested & strategy_set::BIT_BIN15 != 0
 }
 

@@ -48,9 +48,9 @@ use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
 use core_types::{
     make_symbol_id, AiCmd, Capture, ChannelEvent, DepthTopK, Fill, NsTs, OptSummary, Order,
-    OrderEvent, RuleTableSlot, Signal, SymbolId, Tick, TradePrint, VenueId, AI_RING_SIZE,
-    DEPTH_RING_SIZE, EVENT_LANE_ASSET_CTX, EVENT_LANE_FUNDING, EVENT_RING_SIZE, OPT_RING_SIZE,
-    RULE_TABLE_RING_SLOTS, TRADE_RING_SIZE,
+    OrderEvent, RuleTableSlot, Signal, SlotMask, SymbolId, Tick, TradePrint, VenueId,
+    AI_RING_SIZE, DEPTH_RING_SIZE, EVENT_LANE_ASSET_CTX, EVENT_LANE_FUNDING, EVENT_RING_SIZE,
+    MAX_STRATEGY_SLOTS, OPT_RING_SIZE, RULE_TABLE_RING_SLOTS, TRADE_RING_SIZE,
 };
 use engine::{
     Engine, ENGINE_EVENTS_FILE, ENGINE_FILLS_FILE, ENGINE_ORDERS_FILE, FILL_RING_SIZE,
@@ -3550,7 +3550,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     cons: Consumers,
     mut disp: D,
     obs: Observability,
-    requested_mask: u8,
+    requested_mask: SlotMask,
     vrp: Option<&crate::vrp_boot::VrpBoot>,
     xsd: Option<&crate::xsd_boot::XsdBoot>,
     bin15: Option<&crate::bin15_boot::Bin15Boot>,
@@ -4174,14 +4174,18 @@ const REQUIRE_LABEL_SLOTS: [u8; 5] = [
 
 /// RG8: the first enabled, label-required slot whose label set is ANY —
 /// `None` when the law holds (or is off).
-fn unlabelled_required_slot(set: &strategy_set::StrategySet, mask: u8, require: bool) -> Option<u8> {
+fn unlabelled_required_slot(
+    set: &strategy_set::StrategySet,
+    mask: SlotMask,
+    require: bool,
+) -> Option<u8> {
     if !require {
         return None;
     }
     let mut i = 0usize;
     while i < REQUIRE_LABEL_SLOTS.len() {
         let slot = REQUIRE_LABEL_SLOTS[i];
-        if mask & (1u8 << slot) != 0 && set.regime_label_of(slot).n == 0 {
+        if mask & ((1 as SlotMask) << slot) != 0 && set.regime_label_of(slot).n == 0 {
             return Some(slot);
         }
         i += 1;
@@ -8449,8 +8453,10 @@ pub struct RegimeMetricIds {
     pub flips: [[core_metrics::CounterId; 6]; 2],
     /// `engine_regime_{fast,slow}_disagree_total`.
     pub disagree: [core_metrics::CounterId; 2],
-    /// `engine_strategy_regime_gate_{0..7}` (0 open / 1 soft-closed / 2 hard-closed).
-    pub gates: [GaugeId; 8],
+    /// `engine_strategy_regime_gate_{0..15}` (0 open / 1 soft-closed / 2
+    /// hard-closed): one per slot the mask can name (S16-2; 8–15 have no
+    /// member and read 0).
+    pub gates: [GaugeId; MAX_STRATEGY_SLOTS as usize],
     /// `engine_regime_minutes_judged_total`.
     pub minutes_judged: core_metrics::CounterId,
     /// `engine_regime_seed_rows` (gauge).
@@ -8479,7 +8485,7 @@ fn register_regime_metrics(
     let mut source = [GaugeId::default(); 2];
     let mut declared_age = [GaugeId::default(); 2];
     let mut raw = [[GaugeId::default(); 4]; 2];
-    let mut gates = [GaugeId::default(); 8];
+    let mut gates = [GaugeId::default(); MAX_STRATEGY_SLOTS as usize];
     for (p, pname) in REGIME_PROFILE_NAMES.iter().enumerate() {
         for (w, wname) in REGIME_WORD_NAMES.iter().enumerate() {
             words[p][w] = gauge(&format!("engine_regime_{pname}_{wname}"))?;
@@ -8563,8 +8569,8 @@ fn mirror_regime_metrics<S: strategy_core::StrategyCounters>(
         reg.counter(ids.disagree[p])
             .inc(cur.disagree[p].saturating_sub(last.disagree[p]));
     }
-    for slot in 0..8usize {
-        reg.gauge(ids.gates[slot]).set(i64::from(cur.gates[slot]));
+    for (g, v) in ids.gates.iter().zip(cur.gates) {
+        reg.gauge(*g).set(i64::from(v));
     }
     reg.counter(ids.minutes_judged)
         .inc(cur.minutes_judged.saturating_sub(last.minutes_judged));
@@ -8819,7 +8825,15 @@ fn fill_snapshot<S, D>(
     // identity never changes, so it is not re-copied every second.
     out.set_strategy_kind(Sc::strategy_kind(strat).as_bytes());
     out.halted = u8::from(Sc::is_halted(strat));
-    out.enabled_mask = Sc::enabled_mask(strat) as u8;
+    // The trait reads the mask as a u64; the set's is a `SlotMask`, so it
+    // always fits — a wider value saturates (every bit on) rather than
+    // dropping its high bits.
+    let mask = Sc::enabled_mask(strat);
+    debug_assert!(
+        mask <= u64::from(SlotMask::MAX),
+        "enable mask {mask:#x} past SlotMask"
+    );
+    out.enabled_mask = SlotMask::try_from(mask).unwrap_or(SlotMask::MAX);
 
     let k = &mut out.counters;
     k.iterations = eng.iterations;
@@ -13040,7 +13054,9 @@ mod tests {
         // gauges (417); XH5d-1 two gauges (419); XH5d-3b three counters
         // (527); XH4i-5 the outcome mode's seventeen (544); BX11 the
         // Binance arm's family, forty-one counters and thirty-one gauges
-        // (585 / 450 of 640 / 512).
+        // (585 / 450 of 640 / 512). S16-2 eight gauges, the regime gate of
+        // slots 8–15 (`engine_strategy_regime_gate_8` … `_15`): measured
+        // 595 / 468 of 640 / 512 with them (the lanes since BX11 the rest).
         assert!(reg.gauges_len() <= core_metrics::MAX_GAUGES);
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).expect("/metrics fits its buffer");
@@ -14264,6 +14280,36 @@ mod tests {
         mirror_vm_metrics(&reg, &ids, &Bare, &mut stale);
         assert_eq!(reg.counter(ids.fires).get(), 0, "regression saturates");
         assert_eq!(stale.fires, 0, "snapshot re-bases to the source");
+    }
+
+    /// S16-2: the regime family registers one gate gauge per slot the mask
+    /// can name — `engine_strategy_regime_gate_0` … `_15` — and the mirror
+    /// sets each from its own slot's gate (slot 11's value is not slot 3's).
+    #[test]
+    fn regime_gate_gauges_cover_every_slot() {
+        struct Gates;
+        impl strategy_core::StrategyCounters for Gates {
+            fn regime_counters(&self) -> strategy_core::RegimeCounters {
+                let mut c = strategy_core::RegimeCounters::default();
+                for (k, g) in c.gates.iter_mut().enumerate() {
+                    *g = (k % 3) as u8;
+                }
+                c
+            }
+        }
+        let mut reg = MetricsRegistry::new();
+        let ids = register_regime_metrics(&mut reg).unwrap();
+        assert_eq!(ids.gates.len(), 16);
+        let mut last = strategy_core::RegimeCounters::default();
+        mirror_regime_metrics(&reg, &ids, &Gates, &mut last, 0);
+        for (k, id) in ids.gates.iter().enumerate() {
+            let g = reg.gauge(*id);
+            assert_eq!(
+                g.name(),
+                format!("engine_strategy_regime_gate_{k}").as_bytes()
+            );
+            assert_eq!(g.get(), (k % 3) as i64, "slot {k}");
+        }
     }
 
     /// RG8: `[labels] require = 1` refuses an ENABLED signal-carrying coded

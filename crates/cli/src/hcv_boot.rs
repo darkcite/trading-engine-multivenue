@@ -95,7 +95,7 @@ pub struct HcvBoot {
 
 /// Whether the operator asked for the member.
 #[must_use]
-pub fn hcv_wanted(requested: u8) -> bool {
+pub fn hcv_wanted(requested: core_types::SlotMask) -> bool {
     requested & strategy_set::BIT_HCV != 0
 }
 

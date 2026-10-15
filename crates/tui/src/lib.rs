@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use core_types::regime::{DIM_COUNT, DIM_SOURCE};
-use core_types::{RegimeWord, REGIME_PROFILES};
+use core_types::{RegimeWord, SlotMask, REGIME_PROFILES};
 use engine_snapshot::{EngineSnapshot, SnapshotCell, SLOT_NAMES, SNAPSHOT_SLOTS, VENUE_NAMES};
 use ratatui::layout::Constraint;
 
@@ -667,7 +667,7 @@ fn text(b: &[u8]) -> &str {
     core::str::from_utf8(b).unwrap_or("?")
 }
 
-fn yes_no(bit: u8) -> &'static str {
+fn yes_no(bit: SlotMask) -> &'static str {
     if bit != 0 {
         "yes"
     } else {

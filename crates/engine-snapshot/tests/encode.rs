@@ -602,6 +602,30 @@ fn fixed_snapshot_renders_byte_exact_header_sections() {
     assert_balanced(body.as_bytes());
 }
 
+/// S16-2: the three masks are `SlotMask`s — a value past a byte encodes
+/// whole — while the schema-2 per-slot rows and `regime.gates` stay at 8
+/// (16 is S16-5's schema 3): slot 11's bit and gate show on no slot-3 row.
+#[test]
+fn slot_masks_encode_whole_and_the_slot_rows_stay_at_eight() {
+    let mut s = Box::new(EngineSnapshot::empty());
+    s.boot.requested_mask = 0x8001;
+    s.boot.configured_mask = 0x0F01;
+    s.enabled_mask = 0x0801;
+    s.regime.gates[11] = 2;
+    let mut buf = vec![0u8; STATE_JSON_MAX];
+    let n = encode_state_json(&s, &mut buf).unwrap();
+    let body = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(
+        body.contains("\"requested_mask\":32769,\"configured_mask\":3841,\"enabled_mask\":2049,")
+    );
+    assert!(body.contains("\"gates\":[0,0,0,0,0,0,0,0],"));
+    assert!(
+        body.contains("{\"slot\":3,\"name\":\"bin15\",\"configured\":0,\"enabled\":0,\"gate\":0,")
+    );
+    assert!(body.contains("{\"slot\":7,"));
+    assert!(!body.contains("{\"slot\":8,"));
+}
+
 #[test]
 fn recent_rings_render_oldest_first_with_ages() {
     let mut s = Box::new(EngineSnapshot::empty());

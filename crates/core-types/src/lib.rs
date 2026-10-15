@@ -2516,10 +2516,30 @@ pub const AI_CMD_FLAG_CLEAR_SPEC: u16 = 1 << 0;
 /// `AiCmd::strategy_id` sentinel meaning "no strategy slot".
 pub const STRATEGY_SLOT_NONE: u8 = 0xFF;
 
-/// Hard ceiling on strategy-set slots. The runtime enable mask is a
-/// `u8` bitmask (design §7), so slot indices are wire-bounded to 0..8
-/// forever.
-pub const MAX_STRATEGY_SLOTS: u8 = 8;
+/// Hard ceiling on strategy-set slots: slot indices are
+/// `0..MAX_STRATEGY_SLOTS`. The bound is the width of [`SlotMask`], the
+/// runtime enable mask's type (design §7), which the const assert below
+/// pins. 8 → 16 at S16-2 (ruling S16-R1: 16, not 32 — the ceiling of the
+/// Binance cid's one hex slot digit, the router's per-submit line and the
+/// halt latch's line). The slot byte itself (`Order::strategy_id`,
+/// `AiCmd::strategy_id`, …) was always a full `u8` on every wire and in
+/// every capture, so the change moved no format.
+pub const MAX_STRATEGY_SLOTS: u8 = 16;
+
+/// A set of strategy slots, bit `s` = slot `s` (S16-2): the strategy
+/// set's enable mask, and every mask built from it (the boot's requested
+/// and configured masks, `/state`'s). A slot's bit is
+/// `(1 as SlotMask) << slot` for `slot < MAX_STRATEGY_SLOTS`, never
+/// `1u8 << slot`: the release profile builds with `overflow-checks =
+/// false`, where a `u8` shift by a slot ≥ 8 silently lands on slot
+/// `s & 7` (slot 11 → slot 3, BIN15) — debug builds panic on it instead,
+/// which is why every mask path has tests at slots 8, 11 and 15.
+pub type SlotMask = u16;
+
+const _: () = assert!(
+    MAX_STRATEGY_SLOTS as u32 <= SlotMask::BITS,
+    "every slot must have a bit in a SlotMask"
+);
 
 /// Strategy-set slot of `strategy-ai-exec` (design §7). `OrderIntent`
 /// commands must target exactly this slot.
@@ -5935,6 +5955,35 @@ mod ai_cmd_tests {
             st.validate_shape(),
             Err(AiCmdShapeError::BadStrategySlot(STRATEGY_SLOT_AI_EXEC))
         );
+    }
+
+    /// S16-2: the slot range is the [`SlotMask`]'s width. Enable, Disable
+    /// and SetParam for slots 8–15 pass the shape check — the strategy
+    /// set, not the wire, refuses a slot with no member (and counts it);
+    /// 16, anything past it and the sentinel stay refused here.
+    #[test]
+    fn validate_admits_slots_8_to_15() {
+        const _: () = assert!(MAX_STRATEGY_SLOTS == 16 && SlotMask::BITS == 16);
+        for kind in [
+            AiCmdKind::EnableStrategy,
+            AiCmdKind::DisableStrategy,
+            AiCmdKind::SetParam,
+        ] {
+            for slot in [0, 7, 8, 11, 15] {
+                let mut c = valid(kind);
+                c.strategy_id = slot;
+                assert_eq!(c.validate_shape(), Ok(()), "{kind:?} slot {slot}");
+            }
+            for slot in [16, 17, 200, STRATEGY_SLOT_NONE] {
+                let mut c = valid(kind);
+                c.strategy_id = slot;
+                assert_eq!(
+                    c.validate_shape(),
+                    Err(AiCmdShapeError::BadStrategySlot(slot)),
+                    "{kind:?} slot {slot}"
+                );
+            }
+        }
     }
 
     #[test]
