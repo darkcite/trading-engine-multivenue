@@ -1484,6 +1484,15 @@ name = "pine-ir"
 version = "0.1.0"
 
 [[package]]
+name = "pine-spec"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "pine-ir",
+ "proptest",
+]
+
+[[package]]
 name = "pine-vm"
 version = "0.1.0"
 dependencies = [

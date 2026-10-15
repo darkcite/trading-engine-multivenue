@@ -1,0 +1,673 @@
+{
+  "schema": 1,
+  "captured_utc": "2026-10-15",
+  "sources": {
+    "v5": "https://www.tradingview.com/pine-script-reference/v5/",
+    "v6": "https://www.tradingview.com/pine-script-reference/v6/",
+    "migration": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/"
+  },
+  "namespaces": [],
+  "switches": [
+    {
+      "id": "int_div",
+      "row": "W1",
+      "mech": "switch",
+      "owner": "pine-sema",
+      "readings": [
+        "const_trunc",
+        "fraction"
+      ],
+      "v5": "const_trunc",
+      "v6": "fraction",
+      "normative": true,
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Fractional division of constants",
+      "pin": "pin:W1-int-div",
+      "doc": "int / int: const_trunc truncates iff both operands are const, else a float result; fraction always yields the fractional result"
+    },
+    {
+      "id": "and_or",
+      "row": "W3",
+      "mech": "switch",
+      "owner": "pine-sema",
+      "readings": [
+        "strict",
+        "lazy"
+      ],
+      "v5": "strict",
+      "v6": "lazy",
+      "normative": true,
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Lazy evaluation of conditions",
+      "pin": "pin:W3-lazy-and-or",
+      "doc": "and/or: strict evaluates both operands (B_AND/B_OR); lazy skips the right operand when decided (jumps)"
+    },
+    {
+      "id": "bool_na",
+      "row": "W13",
+      "mech": "switch",
+      "owner": "pine-sema",
+      "readings": [
+        "nullable",
+        "never"
+      ],
+      "v5": "nullable",
+      "v6": "never",
+      "normative": true,
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Boolean values cannot be na",
+      "pin": "pin:W13-bool-na",
+      "doc": "bool na: nullable keeps a validity bit and NA_TRACKED rings; never has no validity and ring_flag::INIT_FALSE"
+    },
+    {
+      "id": "neg_index",
+      "row": "W15",
+      "mech": "switch",
+      "owner": "pine-std",
+      "readings": [
+        "refused",
+        "from_end"
+      ],
+      "v5": "refused",
+      "v6": "from_end",
+      "normative": true,
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Negative indices in arrays",
+      "pin": "pin:W15-neg-index",
+      "doc": "negative array index: refused faults CollectionBounds; from_end makes -1 the last element for get/set/insert/remove"
+    },
+    {
+      "id": "margin_default",
+      "row": "W18",
+      "mech": "data",
+      "owner": "pine-sema (decl fold)",
+      "readings": [],
+      "v5": "",
+      "v6": "",
+      "normative": true,
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Default margin percentage",
+      "pin": "pin:W18-margin-default",
+      "doc": "the strategy declaration's per-dialect margin_long / margin_short default rows (v5 0, v6 100)"
+    },
+    {
+      "id": "exit_pairs",
+      "row": "W23",
+      "mech": "switch",
+      "owner": "pine-std",
+      "readings": [
+        "absolute_wins",
+        "both"
+      ],
+      "v5": "absolute_wins",
+      "v6": "both",
+      "normative": true,
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section strategy.exit() evaluates parameter pairs",
+      "pin": "pin:W23-exit-legs",
+      "doc": "strategy.exit: absolute_wins drops the relative leg of a pair given with its absolute one; both sends both legs to the broker, whichever triggers first fills"
+    },
+    {
+      "id": "intrabar_orders",
+      "row": "W21",
+      "mech": "normative",
+      "owner": "pine-broker, hosts",
+      "readings": [],
+      "v5": "",
+      "v6": "",
+      "normative": true,
+      "source": "https://www.tradingview.com/pine-script-docs/language/execution-model/ section Executions on realtime bars",
+      "pin": "pin:W21-intrabar-commit",
+      "doc": "intents placed or filled on ticks commit (00-INDEX 3.12); v5 commit, v6 commit"
+    },
+    {
+      "id": "sma_na",
+      "row": "W5",
+      "mech": "data",
+      "owner": "pine-std",
+      "readings": [],
+      "v5": "",
+      "v6": "",
+      "normative": true,
+      "source": "https://www.tradingview.com/pine-script-reference/v6/#fun_ta.sma",
+      "pin": "pin:W5-sma-na",
+      "doc": "TA_SMA.na = skip in both dialects (via REVIEW 4.1; no pine-script-docs page states it)"
+    },
+    {
+      "id": "tf_multiplier",
+      "row": "MG-16",
+      "mech": "switch",
+      "owner": "pine-std",
+      "readings": [
+        "omit_one",
+        "always"
+      ],
+      "v5": "omit_one",
+      "v6": "always",
+      "normative": true,
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Timeframes must include a multiplier",
+      "pin": "pin:00-tf-multiplier",
+      "doc": "timeframe.period: omit_one omits a multiplier of 1 (\"D\"); always writes it (\"1D\")"
+    },
+    {
+      "id": "for_bound",
+      "row": "MG-23",
+      "mech": "switch",
+      "owner": "pine-sema",
+      "readings": [
+        "fixed_at_start",
+        "each_iteration"
+      ],
+      "v5": "fixed_at_start",
+      "v6": "each_iteration",
+      "normative": true,
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Dynamic for loop boundaries",
+      "pin": "pin:00-for-bound",
+      "doc": "for loop bound: fixed_at_start evaluates it once before the first iteration; each_iteration before every iteration"
+    },
+    {
+      "id": "color_consts",
+      "row": "MG-9",
+      "mech": "data",
+      "owner": "pine-spec",
+      "readings": [],
+      "v5": "",
+      "v6": "",
+      "normative": true,
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Color changes",
+      "pin": "pin:00-color-consts",
+      "doc": "per-dialect Const rows of color.red / color.teal / color.yellow (v5 values, v6 values)"
+    },
+    {
+      "id": "ema_seed",
+      "row": "U01",
+      "mech": "switch",
+      "owner": "pine-std",
+      "readings": [
+        "first_value",
+        "sma"
+      ],
+      "v5": "first_value",
+      "v6": "first_value",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U01-ema-seed",
+      "doc": "ta.ema seed: first_value starts at the first non-na value; sma at the SMA of the first length values; applies to every EMA-based ta.*. Default: REVIEW 4.2, unverified"
+    },
+    {
+      "id": "kc_basis",
+      "row": "U02",
+      "mech": "switch",
+      "owner": "pine-std",
+      "readings": [
+        "ema_range",
+        "rma_range"
+      ],
+      "v5": "ema_range",
+      "v6": "ema_range",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U02-kc-basis",
+      "doc": "ta.kc bands: ema_range smooths the span with ta.ema, rma_range with ta.rma; ta.kcw = (upper - lower) / basis under either. Default: REVIEW 4.2's reading of the v6 reference, UNPINNED"
+    },
+    {
+      "id": "rising_falling",
+      "row": "U03",
+      "mech": "switch",
+      "owner": "pine-std",
+      "readings": [
+        "gt_all_prior",
+        "monotone"
+      ],
+      "v5": "gt_all_prior",
+      "v6": "gt_all_prior",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U03-rising-falling",
+      "doc": "ta.rising/falling: gt_all_prior is src > src[i] for every i in 1..=length; monotone is src[i] > src[i+1] for every i in 0..length. Default: REVIEW 4.2"
+    },
+    {
+      "id": "round_ties",
+      "row": "U04",
+      "mech": "switch",
+      "owner": "pine-std, pine-sema (constant folding)",
+      "readings": [
+        "half_up",
+        "half_away"
+      ],
+      "v5": "half_up",
+      "v6": "half_up",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U04-round-ties",
+      "doc": "math.round ties: half_up toward +inf (-2.5 -> -2); half_away away from zero (sema may lower to I_F2I + ROUND only under half_away). Default: REVIEW 4.2"
+    },
+    {
+      "id": "int_of_na",
+      "row": "U05",
+      "mech": "switch",
+      "owner": "pine-sema",
+      "readings": [
+        "na",
+        "fault"
+      ],
+      "v5": "na",
+      "v6": "na",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U05-int-of-na",
+      "doc": "int(na): na via I_F2I; fault via $op.int_strict (InvalidCast). Default: REVIEW 4.2"
+    },
+    {
+      "id": "float_eq_v6",
+      "row": "U06",
+      "mech": "switch",
+      "owner": "pine-sema",
+      "readings": [
+        "exact",
+        "round9"
+      ],
+      "v5": "exact",
+      "v6": "exact",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U06-float-eq-v6",
+      "doc": "v6 float ==: exact uses F_EQ/F_NE; round9 uses $op.eq_round9/$op.ne_round9. Default exact: the migration guide has no float-equality section (read 2026-09-23)"
+    },
+    {
+      "id": "str_match_none",
+      "row": "U07",
+      "mech": "switch",
+      "owner": "pine-std",
+      "readings": [
+        "empty",
+        "na"
+      ],
+      "v5": "empty",
+      "v6": "empty",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U07-str-match-none",
+      "doc": "str.match with no match: empty returns \"\"; na. Default: REVIEW 4.2"
+    },
+    {
+      "id": "tostring_default",
+      "row": "U08",
+      "mech": "switch",
+      "owner": "pine-std",
+      "readings": [
+        "frac_upto_8",
+        "frac_upto_10"
+      ],
+      "v5": "frac_upto_8",
+      "v6": "frac_upto_8",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U08-tostring-precision",
+      "doc": "str.tostring default format: frac_upto_8 is \"#.########\"; frac_upto_10 is REVIEW 4.2's reading. Default from the Strings docs page (read 2026-09-23)"
+    },
+    {
+      "id": "margin_call_size",
+      "row": "U09",
+      "mech": "owner",
+      "owner": "pine-broker",
+      "readings": [],
+      "v5": "",
+      "v6": "",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U09-margin-call-size",
+      "doc": "impl-05's switch (pine-broker cannot read pine-spec); proposed cover_x4, alternatives cover_x1, full. REVIEW 4.2"
+    },
+    {
+      "id": "risk_rules",
+      "row": "U10",
+      "mech": "owner",
+      "owner": "pine-broker",
+      "readings": [],
+      "v5": "",
+      "v6": "",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U10-risk-rules",
+      "doc": "impl-05's switch; proposed flatten_every_tick, alternative flatten_next_open. REVIEW 4.2"
+    },
+    {
+      "id": "close_immediately",
+      "row": "U11",
+      "mech": "owner",
+      "owner": "pine-broker",
+      "readings": [],
+      "v5": "",
+      "v6": "",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U11-close-immediately",
+      "doc": "impl-05's switch; proposed same_tick (fills at the evaluation's price), alternative next_fill_point. REVIEW 4.2"
+    },
+    {
+      "id": "lookahead_off_rt",
+      "row": "U12",
+      "mech": "switch",
+      "owner": "pine-std (request.security)",
+      "readings": [
+        "developing",
+        "last_confirmed"
+      ],
+      "v5": "developing",
+      "v6": "developing",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U12-lookahead-off-realtime",
+      "doc": "lookahead_off on a realtime bar: developing reads the developing HTF value; last_confirmed. Default: REVIEW 4.2"
+    },
+    {
+      "id": "ta_in_loop",
+      "row": "U13",
+      "mech": "switch",
+      "owner": "pine-sema",
+      "readings": [
+        "per_call",
+        "per_iteration"
+      ],
+      "v5": "per_call",
+      "v6": "per_call",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U13-ta-in-loop",
+      "doc": "ta.* in a loop: per_call is one block per site advanced by every execution; per_iteration one block per iteration index. Default: design note 6"
+    },
+    {
+      "id": "ternary_arms",
+      "row": "U14",
+      "mech": "switch",
+      "owner": "pine-sema",
+      "readings": [
+        "selected_only",
+        "both"
+      ],
+      "v5": "selected_only",
+      "v6": "selected_only",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U14-ternary-unselected-arm",
+      "doc": "ternary: selected_only evaluates only the selected arm; both. Default: REVIEW 4.2"
+    },
+    {
+      "id": "float_div_zero",
+      "row": "U15",
+      "mech": "switch",
+      "owner": "pine-sema",
+      "readings": [
+        "na",
+        "ieee"
+      ],
+      "v5": "na",
+      "v6": "na",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U15-float-div-zero",
+      "doc": "float division by zero: na is F_DIV with NA_ON_NONFINITE; ieee without it. Default: the opcode flag exists for it (00-INDEX 3.6.1)"
+    },
+    {
+      "id": "block_local",
+      "row": "U16",
+      "mech": "switch",
+      "owner": "pine-sema",
+      "readings": [
+        "carry",
+        "na"
+      ],
+      "v5": "carry",
+      "v6": "carry",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U16-block-local-carry",
+      "doc": "block-local slot on skipped bars: carry emits no NA_SET; na emits NA_SET. Default: 00-INDEX 3.6.4"
+    },
+    {
+      "id": "barstate_fixups",
+      "row": "U17",
+      "mech": "switch",
+      "owner": "pine-sema (prologue)",
+      "readings": [
+        "contract",
+        "isnew_false_rt_confirm"
+      ],
+      "v5": "contract",
+      "v6": "contract",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U17-barstate-table",
+      "doc": "barstate table: contract is 00-INDEX 3.6.5 as written; isnew_false_rt_confirm reads barstate.isnew false in step_bar of a REALTIME bar. Default: 00-INDEX 3.6.5"
+    },
+    {
+      "id": "ta_na",
+      "row": "U18",
+      "mech": "data",
+      "owner": "pine-std",
+      "readings": [],
+      "v5": "",
+      "v6": "",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U18-ta-na-propagation",
+      "doc": "the na column of every ta.* overload with a source argument: propagate for ta.change, ta.mom, ta.roc, ta.swma, ta.alma, ta.linreg, ta.percentrank; skip for the others (REVIEW 4.1 W5 note, unverified)"
+    },
+    {
+      "id": "rma_seed",
+      "row": "00",
+      "mech": "switch",
+      "owner": "pine-std",
+      "readings": [
+        "sma",
+        "first_value"
+      ],
+      "v5": "sma",
+      "v6": "sma",
+      "normative": false,
+      "source": "",
+      "pin": "pin:00-rma-seed",
+      "doc": "ta.rma seed: sma starts Wilder's recurrence at the SMA of the first length values; first_value; applies to every RMA-based ta.*. Default: impl-04 v1 4, unverified"
+    },
+    {
+      "id": "mod_floor",
+      "row": "M1",
+      "mech": "normative",
+      "owner": "pine-vm",
+      "readings": [],
+      "v5": "",
+      "v6": "",
+      "normative": true,
+      "source": "https://www.tradingview.com/pine-script-docs/language/operators/ section Arithmetic operators",
+      "pin": "pin:06-mod-sign",
+      "doc": "% on int and float is floored: a - b*floor(a / b), the sign of the divisor (-1 % 100 = 99), same in both dialects; F_MOD / I_MOD (CAR-06-1)"
+    }
+  ],
+  "deltas": [
+    {
+      "id": "W1",
+      "what": "int / int: v5 truncates only when both operands are const, v6 yields the fraction",
+      "mech": "switch",
+      "switch": "int_div",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Fractional division of constants",
+      "pin": "pin:W1-int-div"
+    },
+    {
+      "id": "W3",
+      "what": "and/or: v5 strict, v6 lazy",
+      "mech": "switch",
+      "switch": "and_or",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Lazy evaluation of conditions",
+      "pin": "pin:W3-lazy-and-or"
+    },
+    {
+      "id": "W13",
+      "what": "v6 bools are never na; na()/nz()/fixnan() reject bool (switch + data: the bool overloads of na, nz, fixnan are versions [5])",
+      "mech": "switch",
+      "switch": "bool_na",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Boolean values cannot be na",
+      "pin": "pin:W13-bool-na"
+    },
+    {
+      "id": "W15",
+      "what": "v6 array.get/set/insert/remove accept negative indices",
+      "mech": "switch",
+      "switch": "neg_index",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Negative indices in arrays",
+      "pin": "pin:W15-neg-index"
+    },
+    {
+      "id": "W18",
+      "what": "margin_long / margin_short default: v5 0, v6 100",
+      "mech": "data",
+      "switch": "",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Default margin percentage",
+      "pin": "pin:W18-margin-default"
+    },
+    {
+      "id": "W23",
+      "what": "strategy.exit with both an absolute and a relative leg of a pair: v5 uses the absolute one, v6 whichever triggers first",
+      "mech": "switch",
+      "switch": "exit_pairs",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section strategy.exit() evaluates parameter pairs",
+      "pin": "pin:W23-exit-legs"
+    },
+    {
+      "id": "MG-3",
+      "what": "v6: dynamic requests are always available (sema refuses a request.* whose symbol or timeframe is not simple, in both dialects)",
+      "mech": "static",
+      "switch": "",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Dynamic requests",
+      "pin": ""
+    },
+    {
+      "id": "MG-4",
+      "what": "v6: numeric -> bool casts must be explicit (sema: implicit cast only in v5)",
+      "mech": "static",
+      "switch": "",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Explicit \"bool\" casting",
+      "pin": ""
+    },
+    {
+      "id": "MG-6",
+      "what": "v6: unique-type parameters reject na (data + static: pf::UNIQUE; sema refuses na for it in v6)",
+      "mech": "data",
+      "switch": "",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Unique parameters cannot be na",
+      "pin": ""
+    },
+    {
+      "id": "MG-8",
+      "what": "v6: mutable variables are always series (sema's qualifier inference)",
+      "mech": "static",
+      "switch": "",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Mutable variables are always \"series\"",
+      "pin": ""
+    },
+    {
+      "id": "MG-9",
+      "what": "color.red #FF5252 -> #F23645, color.teal #00897B -> #089981, color.yellow #FFEB3B -> #FDD835",
+      "mech": "data",
+      "switch": "",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Color changes",
+      "pin": "pin:00-color-consts"
+    },
+    {
+      "id": "MG-10",
+      "what": "when removed from strategy.entry, .order, .exit, .close, .close_all, .cancel, .cancel_all",
+      "mech": "data",
+      "switch": "",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Removal of when parameter",
+      "pin": ""
+    },
+    {
+      "id": "MG-12",
+      "what": "more than 9 000 orders: v5 raises a runtime error and halts, v6 trims (neither broker caps orders; fixtures stay under 9 000)",
+      "mech": "not_emulated",
+      "switch": "",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Excess orders are trimmed",
+      "pin": ""
+    },
+    {
+      "id": "MG-14",
+      "what": "v6: no [] on literals (sema)",
+      "mech": "static",
+      "switch": "",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section No history for literal values",
+      "pin": ""
+    },
+    {
+      "id": "MG-15",
+      "what": "v6: no [] directly on a UDT field (sema)",
+      "mech": "static",
+      "switch": "",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section History of UDT fields",
+      "pin": ""
+    },
+    {
+      "id": "MG-16",
+      "what": "v6: timeframe.period always includes a multiplier",
+      "mech": "switch",
+      "switch": "tf_multiplier",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Timeframes must include a multiplier",
+      "pin": "pin:00-tf-multiplier"
+    },
+    {
+      "id": "MG-18",
+      "what": "v6: a parameter may be given only once (sema)",
+      "mech": "static",
+      "switch": "",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Cannot repeat parameters",
+      "pin": ""
+    },
+    {
+      "id": "MG-19",
+      "what": "v6: offset accepts simple or weaker (per-dialect offset parameter rows)",
+      "mech": "data",
+      "switch": "",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section No series offset values",
+      "pin": ""
+    },
+    {
+      "id": "MG-20",
+      "what": "v6: linewidth >= 1 (plot* are captures; linewidth is never read)",
+      "mech": "not_emulated",
+      "switch": "",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Minimum linewidth is 1",
+      "pin": ""
+    },
+    {
+      "id": "MG-22",
+      "what": "transp removed from bgcolor, fill, plot, plotarrow, plotchar, plotshape",
+      "mech": "data",
+      "switch": "",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section The transp parameter is removed",
+      "pin": ""
+    },
+    {
+      "id": "MG-23",
+      "what": "v6 for loops re-evaluate their bound before each iteration; v5 fixes it before the first",
+      "mech": "switch",
+      "switch": "for_bound",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ section Dynamic for loop boundaries",
+      "pin": "pin:00-for-bound"
+    }
+  ],
+  "entries": []
+}

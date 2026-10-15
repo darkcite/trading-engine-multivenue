@@ -1,0 +1,1105 @@
+{
+  "schema": 1,
+  "captured_utc": "2026-09-24",
+  "sources": {
+    "v5": "https://www.tradingview.com/pine-script-reference/v5/",
+    "v6": "https://www.tradingview.com/pine-script-reference/v6/",
+    "migration": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/"
+  },
+  "namespaces": [
+    "$op",
+    "barmerge",
+    "color",
+    "line",
+    "map",
+    "math",
+    "request",
+    "strategy",
+    "ta"
+  ],
+  "switches": [
+    {
+      "id": "int_div",
+      "row": "W1",
+      "mech": "switch",
+      "owner": "pine-sema",
+      "readings": [
+        "const_trunc",
+        "fraction"
+      ],
+      "v5": "const_trunc",
+      "v6": "fraction",
+      "normative": true,
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ sectionFractional division of constants",
+      "pin": "pin:W1-int-div",
+      "doc": "int / int: v5 truncates only when both operands are const; v6 yields the fraction"
+    },
+    {
+      "id": "margin_default",
+      "row": "W18",
+      "mech": "data",
+      "owner": "pine-sema",
+      "readings": [],
+      "v5": "",
+      "v6": "",
+      "normative": true,
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ sectionDefault margin percentage",
+      "pin": "pin:W18-margin-default",
+      "doc": "the strategy declaration's per-dialect margin_long / margin_short default rows"
+    },
+    {
+      "id": "ema_seed",
+      "row": "U01",
+      "mech": "switch",
+      "owner": "pine-std",
+      "readings": [
+        "first_value",
+        "sma"
+      ],
+      "v5": "first_value",
+      "v6": "first_value",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U01-ema-seed",
+      "doc": "ta.ema seed; default is REVIEW 4.2's reading, unverified"
+    },
+    {
+      "id": "margin_call_size",
+      "row": "U09",
+      "mech": "owner",
+      "owner": "pine-broker",
+      "readings": [],
+      "v5": "",
+      "v6": "",
+      "normative": false,
+      "source": "",
+      "pin": "pin:U09-margin-call-size",
+      "doc": "impl-05's switch (pine-broker cannot read pine-spec); proposed cover_x4"
+    }
+  ],
+  "deltas": [
+    {
+      "id": "W1",
+      "what": "int / int division",
+      "mech": "switch",
+      "switch": "int_div",
+      "subjects": [],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ sectionFractional division of constants",
+      "pin": "pin:W1-int-div"
+    },
+    {
+      "id": "W18",
+      "what": "margin_long / margin_short default 0 -> 100",
+      "mech": "data",
+      "switch": "",
+      "subjects": [
+        "strategy"
+      ],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ sectionDefault margin percentage",
+      "pin": "pin:W18-margin-default"
+    },
+    {
+      "id": "MG-9",
+      "what": "color.red, color.teal, color.yellow changed value",
+      "mech": "data",
+      "switch": "",
+      "subjects": [
+        "color.red"
+      ],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ sectionColor changes",
+      "pin": "pin:00-color-consts"
+    },
+    {
+      "id": "MG-10",
+      "what": "when removed from the order functions",
+      "mech": "data",
+      "switch": "",
+      "subjects": [
+        "strategy.entry"
+      ],
+      "source": "https://www.tradingview.com/pine-script-docs/migration-guides/to-pine-version-6/ sectionRemoval of when parameter",
+      "pin": ""
+    }
+  ],
+  "entries": [
+    {
+      "ns": "",
+      "name": "close",
+      "tier": 1,
+      "scope": "in",
+      "decline": "",
+      "type_name": false,
+      "doc": "Close of the current bar.",
+      "overloads": [],
+      "values": [
+        {
+          "versions": [
+            5,
+            6
+          ],
+          "ty": "float",
+          "qual": "series",
+          "src": "slot",
+          "v": "F_CLOSE"
+        }
+      ]
+    },
+    {
+      "ns": "color",
+      "name": "red",
+      "tier": 1,
+      "scope": "in",
+      "decline": "",
+      "type_name": false,
+      "doc": "Named colour; value changed in v6 (migration guide).",
+      "overloads": [],
+      "values": [
+        {
+          "versions": [
+            5
+          ],
+          "ty": "color",
+          "qual": "const",
+          "src": "const",
+          "v": {
+            "rgb": "#FF5252",
+            "transp": 0
+          }
+        },
+        {
+          "versions": [
+            6
+          ],
+          "ty": "color",
+          "qual": "const",
+          "src": "const",
+          "v": {
+            "rgb": "#F23645",
+            "transp": 0
+          }
+        }
+      ]
+    },
+    {
+      "ns": "math",
+      "name": "pi",
+      "tier": 1,
+      "scope": "in",
+      "decline": "",
+      "type_name": false,
+      "doc": "The constant pi.",
+      "overloads": [],
+      "values": [
+        {
+          "versions": [
+            5,
+            6
+          ],
+          "ty": "float",
+          "qual": "const",
+          "src": "const",
+          "v": 3.141592653589793
+        }
+      ]
+    },
+    {
+      "ns": "barmerge",
+      "name": "gaps_off",
+      "tier": 2,
+      "scope": "in",
+      "decline": "",
+      "type_name": false,
+      "doc": "request.security gaps: off (unique type, code 0).",
+      "overloads": [],
+      "values": [
+        {
+          "versions": [
+            5,
+            6
+          ],
+          "ty": "int",
+          "qual": "const",
+          "src": "const",
+          "v": 0
+        }
+      ]
+    },
+    {
+      "ns": "barmerge",
+      "name": "lookahead_off",
+      "tier": 2,
+      "scope": "in",
+      "decline": "",
+      "type_name": false,
+      "doc": "request.security lookahead: off (unique type, code 0).",
+      "overloads": [],
+      "values": [
+        {
+          "versions": [
+            5,
+            6
+          ],
+          "ty": "int",
+          "qual": "const",
+          "src": "const",
+          "v": 0
+        }
+      ]
+    },
+    {
+      "ns": "",
+      "name": "nz",
+      "tier": 1,
+      "scope": "in",
+      "decline": "",
+      "type_name": false,
+      "doc": "Replaces na with a replacement value.",
+      "values": [],
+      "overloads": [
+        {
+          "id": "NZ_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "source",
+              "ty": "float",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "source",
+              "ty": "float",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "float",
+                "v": 0.0
+              }
+            }
+          ],
+          "ret": [
+            "float"
+          ],
+          "ret_qual": "join",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "NZ_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "source",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "replacement",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "int",
+                "v": 0
+              }
+            }
+          ],
+          "ret": [
+            "int"
+          ],
+          "ret_qual": "join",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "NZ_B",
+          "versions": [
+            5
+          ],
+          "params": [
+            {
+              "name": "source",
+              "ty": "bool",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "replacement",
+              "ty": "bool",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "bool",
+                "v": false
+              }
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "join",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ]
+    },
+    {
+      "ns": "math",
+      "name": "max",
+      "tier": 1,
+      "scope": "in",
+      "decline": "",
+      "type_name": false,
+      "doc": "The greatest of several values.",
+      "values": [],
+      "overloads": [
+        {
+          "id": "MATH_MAX_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "number0",
+              "ty": "float",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "number1",
+              "ty": "float",
+              "qual": "series",
+              "flags": [
+                "variadic"
+              ],
+              "default": null
+            }
+          ],
+          "ret": [
+            "float"
+          ],
+          "ret_qual": "join",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "propagate",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATH_MAX_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "number0",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "number1",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "variadic"
+              ],
+              "default": null
+            }
+          ],
+          "ret": [
+            "int"
+          ],
+          "ret_qual": "join",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "propagate",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ]
+    },
+    {
+      "ns": "ta",
+      "name": "sma",
+      "tier": 1,
+      "scope": "in",
+      "decline": "",
+      "type_name": false,
+      "doc": "Simple moving average.",
+      "values": [],
+      "overloads": [
+        {
+          "id": "TA_SMA",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "source",
+              "ty": "float",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "length",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "float"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "stateful"
+          ],
+          "state": {
+            "k": "param",
+            "param": "length",
+            "elem": 8,
+            "hdr": 24,
+            "plus": 0
+          },
+          "warmup": {
+            "k": "param",
+            "param": "length"
+          },
+          "na": "skip",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ]
+    },
+    {
+      "ns": "ta",
+      "name": "highest",
+      "tier": 1,
+      "scope": "in",
+      "decline": "",
+      "type_name": false,
+      "doc": "Highest value over a number of bars.",
+      "values": [],
+      "overloads": [
+        {
+          "id": "TA_HIGHEST",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "length",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "float"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "stateful"
+          ],
+          "state": {
+            "k": "param",
+            "param": "length",
+            "elem": 8,
+            "hdr": 16,
+            "plus": 0
+          },
+          "warmup": {
+            "k": "param",
+            "param": "length"
+          },
+          "na": "skip",
+          "sx": [
+            "implicit_bar"
+          ],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "TA_HIGHEST_SRC",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "source",
+              "ty": "float",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "length",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "float"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "stateful"
+          ],
+          "state": {
+            "k": "param",
+            "param": "length",
+            "elem": 8,
+            "hdr": 16,
+            "plus": 0
+          },
+          "warmup": {
+            "k": "param",
+            "param": "length"
+          },
+          "na": "skip",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ]
+    },
+    {
+      "ns": "request",
+      "name": "security",
+      "tier": 2,
+      "scope": "in",
+      "decline": "",
+      "type_name": false,
+      "doc": "Another symbol / timeframe (abbreviated parameter list).",
+      "values": [],
+      "overloads": [
+        {
+          "id": "REQUEST_SECURITY",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__out",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__ty",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "symbol",
+              "ty": "string",
+              "qual": "simple",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "timeframe",
+              "ty": "string",
+              "qual": "simple",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "expression",
+              "ty": "T",
+              "qual": "series",
+              "flags": [
+                "tuple_ok"
+              ],
+              "default": null
+            },
+            {
+              "name": "gaps",
+              "ty": "int",
+              "qual": "simple",
+              "flags": [
+                "optional",
+                "unique"
+              ],
+              "default": {
+                "k": "value",
+                "v": "barmerge.gaps_off"
+              }
+            },
+            {
+              "name": "lookahead",
+              "ty": "int",
+              "qual": "simple",
+              "flags": [
+                "optional",
+                "unique"
+              ],
+              "default": {
+                "k": "value",
+                "v": "barmerge.lookahead_off"
+              }
+            }
+          ],
+          "ret": [
+            "T"
+          ],
+          "ret_qual": "series",
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color"
+            ]
+          },
+          "abi": "lowered",
+          "bf": [
+            "stateful",
+            "needs_ctx"
+          ],
+          "state": {
+            "k": "fixed",
+            "bytes": 32
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [
+            "request",
+            "implicit_bar"
+          ],
+          "plot": null,
+          "input": null
+        }
+      ]
+    },
+    {
+      "ns": "map",
+      "name": "new",
+      "tier": 3,
+      "scope": "in",
+      "decline": "",
+      "type_name": false,
+      "doc": "A new map; K and V from the call's type arguments.",
+      "values": [],
+      "overloads": [
+        {
+          "id": "MAP_NEW",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            }
+          ],
+          "ret": [
+            "map<K,V>"
+          ],
+          "ret_qual": "series",
+          "tv": {
+            "K": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "string",
+              "enum"
+            ],
+            "V": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "string",
+              "enum",
+              "udt"
+            ]
+          },
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "map"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ]
+    },
+    {
+      "ns": "$op",
+      "name": "add_str",
+      "tier": 1,
+      "scope": "in",
+      "decline": "",
+      "type_name": false,
+      "doc": "The + operator on two strings.",
+      "values": [],
+      "overloads": [
+        {
+          "id": "OP_ADD_STR",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "a",
+              "ty": "string",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "b",
+              "ty": "string",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "string"
+          ],
+          "ret_qual": "join",
+          "abi": "call",
+          "bf": [
+            "str_alloc"
+          ],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ]
+    },
+    {
+      "ns": "",
+      "name": "strategy",
+      "tier": 1,
+      "scope": "in",
+      "decline": "",
+      "type_name": false,
+      "doc": "The strategy declaration (abbreviated parameter list).",
+      "values": [],
+      "overloads": [
+        {
+          "id": "STRATEGY",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "title",
+              "ty": "string",
+              "qual": "const",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "margin_long",
+              "ty": "float",
+              "qual": "const",
+              "versions": [
+                5
+              ],
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "float",
+                "v": 0.0
+              }
+            },
+            {
+              "name": "margin_long",
+              "ty": "float",
+              "qual": "const",
+              "versions": [
+                6
+              ],
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "float",
+                "v": 100.0
+              }
+            },
+            {
+              "name": "margin_short",
+              "ty": "float",
+              "qual": "const",
+              "versions": [
+                5
+              ],
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "float",
+                "v": 0.0
+              }
+            },
+            {
+              "name": "margin_short",
+              "ty": "float",
+              "qual": "const",
+              "versions": [
+                6
+              ],
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "float",
+                "v": 100.0
+              }
+            }
+          ],
+          "ret": [],
+          "ret_qual": "const",
+          "abi": "folded",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [
+            "decl"
+          ],
+          "plot": null,
+          "input": null
+        }
+      ]
+    },
+    {
+      "ns": "strategy",
+      "name": "entry",
+      "tier": 1,
+      "scope": "in",
+      "decline": "",
+      "type_name": false,
+      "doc": "Enter a position (abbreviated parameter list).",
+      "values": [],
+      "overloads": [
+        {
+          "id": "STRATEGY_ENTRY",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "string",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "direction",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "unique"
+              ],
+              "default": null
+            },
+            {
+              "name": "qty",
+              "ty": "float",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "na"
+              }
+            },
+            {
+              "name": "when",
+              "ty": "bool",
+              "qual": "series",
+              "versions": [
+                5
+              ],
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "bool",
+                "v": true
+              }
+            }
+          ],
+          "ret": [],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "intent"
+          ],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ]
+    },
+    {
+      "ns": "line",
+      "name": "new",
+      "tier": 4,
+      "scope": "in",
+      "decline": "",
+      "type_name": false,
+      "doc": "T4: name only until the tier is authored.",
+      "overloads": [],
+      "values": []
+    }
+  ]
+}

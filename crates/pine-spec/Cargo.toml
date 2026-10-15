@@ -1,0 +1,24 @@
+[package]
+name         = "pine-spec"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "The Pine v5/v6 built-in specification (spec/builtins.json) lowered at build time into static, no_std, allocation-free tables: entries, overloads, parameters, values, the switch and delta tables, a CHD perfect hash, and the frozen conformance chart."
+build        = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+pine-ir = { workspace = true }
+
+[build-dependencies]
+pine-ir     = { workspace = true }
+core-crypto = { workspace = true }
+
+[dev-dependencies]
+core-crypto = { workspace = true }
+proptest    = { workspace = true }
