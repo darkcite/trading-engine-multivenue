@@ -31,6 +31,8 @@
     clippy::undocumented_unsafe_blocks
 )]
 
+pub mod barclock;
+
 /// Monotonic nanoseconds since some unspecified starting point. Values
 /// are comparable across calls on the same process/run.
 pub type NsTs = u64;
