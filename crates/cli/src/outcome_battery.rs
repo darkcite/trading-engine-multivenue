@@ -103,12 +103,13 @@ use exec_hyperliquid::recon::{open_orders_request, scan_open_orders, OpenOrder, 
 use exec_hyperliquid::rules::OutcomeRules;
 use exec_hyperliquid::userws::{scan_user_fills, UserFill};
 use exec_hyperliquid::Network;
+use ingress_hyperliquid::{parse_l2book_header, HlL2BookFrame};
 use tracing::{error, info, warn};
 
 use crate::bin15_live::EXPIRES_MS;
 use crate::exec_boot::BIN15_SLOT;
 use crate::xmm_battery::{
-    dec_1e8, find, has, now_ms, release, Drive, Info, Tally, Tap, TapRow, BOOT_WAIT, E8, STEP_WAIT,
+    has, now_ms, release, Drive, Info, Tally, Tap, TapRow, BOOT_WAIT, E8, STEP_WAIT,
 };
 use crate::xmm_live::{arm_cfg, spawn_gateway, GatewayStop};
 
@@ -338,41 +339,53 @@ impl OutcomeReport {
     }
 }
 
-/// The top of a leg's book, ×1e8 (0: that side is empty).
+/// The top of a leg's book, ×1e8 (0: that side is empty), and the
+/// snapshot's venue time, ms. `crate::hl_outcome_probe` reads its touch
+/// from it too ([`book_of`]).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-struct Top {
-    bid: i64,
-    bid_sz: i64,
-    ask: i64,
-    ask_sz: i64,
+pub(crate) struct Top {
+    pub(crate) bid: i64,
+    pub(crate) bid_sz: i64,
+    pub(crate) ask: i64,
+    pub(crate) ask_sz: i64,
+    pub(crate) time_ms: u64,
 }
 
-/// The decimal string at the start of `s`, up to its closing quote, ×1e8.
-fn quoted_1e8(s: &[u8]) -> Option<i64> {
-    let end = s.iter().position(|&c| c == b'"')?;
-    dec_1e8(&s[..end])
-}
+/// The engine's `l2Book` frame states ×1e6; a [`Top`] ×1e8.
+const FRAME_TO_1E8: i64 = 100;
 
-/// One side's first level `(px, sz)` ×1e8 — `(0, 0)` for an empty side;
-/// `None` for a level no outcome book states (a price above $1, a size past
-/// [`MAX_BOOK_SZ_1E8`]), so the price math downstream stays in range.
-fn first_level(side: &[u8]) -> Option<(i64, i64)> {
-    let px_key = br#""px":""#;
-    let Some(p) = find(side, px_key) else {
+/// One side's touch `(px, sz)` ×1e8 out of the frame — `(0, 0)` for a side
+/// with no level; `None` for a level no outcome book states (a price not
+/// above 0 or above $1, a size not above 0 or past [`MAX_BOOK_SZ_1E8`]),
+/// checked at the frame's scale before it is scaled, so the price math
+/// downstream stays in range.
+fn side_1e8(levels: u16, px_1e6: i64, sz_1e6: i64) -> Option<(i64, i64)> {
+    if levels == 0 {
         return Some((0, 0));
-    };
-    let px = quoted_1e8(&side[p + px_key.len()..])?;
-    let sz_key = br#""sz":""#;
-    let s = find(side, sz_key)? + sz_key.len();
-    let sz = quoted_1e8(&side[s..])?;
-    (px > 0 && px <= E8 && sz > 0 && sz <= MAX_BOOK_SZ_1E8).then_some((px, sz))
+    }
+    let px_ok = px_1e6 > 0 && px_1e6 <= E8 / FRAME_TO_1E8;
+    let sz_ok = sz_1e6 > 0 && sz_1e6 <= MAX_BOOK_SZ_1E8 / FRAME_TO_1E8;
+    (px_ok && sz_ok).then_some((px_1e6 * FRAME_TO_1E8, sz_1e6 * FRAME_TO_1E8))
 }
 
-/// An `l2Book` answer's top: `null` (no book) reads empty; anything that is
-/// not a book stated in range is an error — never priced off.
-fn book_of(body: &[u8]) -> Result<Top, String> {
+/// An `l2Book` answer's top — THE reader of a REST `l2Book` answer (this
+/// battery's and `crate::hl_outcome_probe`'s), on the engine's own parser
+/// (`parse_l2book_header`, the ingress's for every push): `null` (no book)
+/// is `None`; anything that is not a book stated in range is an error —
+/// never priced off. That takes in a side whose best level is `null` or
+/// priced under 1e-6 (it reads 0): the whole answer is refused, fail-safe
+/// (the probe skips the sample, the battery prices nothing off it), where
+/// the probe read that side empty before this reader was shared. Its 1e-6
+/// resolution holds the outcome grid (1e-4, whole contracts:
+/// `OutcomeRules`) and every five-significant-figure price from 0.01 up;
+/// under 0.01 a price past six decimals reads truncated, as the engine
+/// reads it. `floor_tick` of it is the true price's (every 1e-4 price is
+/// exact at 1e-6), but `ceil_tick` of such an ask can land a tick low, and
+/// a percentage step (`sale_px`, `under`) can floor a tick deeper (the
+/// safe side) — neither reachable on a book held to the 1e-4 grid.
+pub(crate) fn book_of(body: &[u8]) -> Result<Option<Top>, String> {
     if body.trim_ascii() == b"null" {
-        return Ok(Top::default());
+        return Ok(None);
     }
     let malformed = || {
         let n = body.len().min(96);
@@ -381,39 +394,28 @@ fn book_of(body: &[u8]) -> Result<Top, String> {
             String::from_utf8_lossy(&body[..n])
         )
     };
-    let key = br#""levels":["#;
-    let at = find(body, key).ok_or_else(malformed)? + key.len();
-    let rest = &body[at..];
-    if rest.first() != Some(&b'[') {
+    let mut f = HlL2BookFrame::ZERO;
+    if !parse_l2book_header(body, 0, &mut f) {
         return Err(malformed());
     }
-    // The level objects hold no bracket: a side's array ends at its first `]`.
-    let bids_end = rest.iter().position(|&c| c == b']').ok_or_else(malformed)?;
-    let (bid, bid_sz) = first_level(&rest[1..bids_end]).ok_or_else(malformed)?;
-    let after = &rest[bids_end + 1..];
-    let a0 = after
-        .iter()
-        .position(|&c| c == b'[')
-        .ok_or_else(malformed)?
-        + 1;
-    let a1 = after[a0..]
-        .iter()
-        .position(|&c| c == b']')
-        .ok_or_else(malformed)?
-        + a0;
-    let (ask, ask_sz) = first_level(&after[a0..a1]).ok_or_else(malformed)?;
-    Ok(Top {
+    let (bid, bid_sz) =
+        side_1e8(f.n_bids, f.best_bid_px_1e6, f.best_bid_sz_1e6).ok_or_else(malformed)?;
+    let (ask, ask_sz) =
+        side_1e8(f.n_asks, f.best_ask_px_1e6, f.best_ask_sz_1e6).ok_or_else(malformed)?;
+    Ok(Some(Top {
         bid,
         bid_sz,
         ask,
         ask_sz,
-    })
+        time_ms: f.ts_ns / 1_000_000,
+    }))
 }
 
-/// The `l2Book` of leg `enc`, read now.
+/// The `l2Book` of leg `enc`, read now — `null` (no book) reads empty.
 fn book(info: &mut Info, enc: u32) -> Result<Top, String> {
     let body = format!("{{\"type\":\"l2Book\",\"coin\":\"#{enc}\"}}");
     info.read(body.as_bytes(), book_of)?
+        .map(Option::unwrap_or_default)
 }
 
 /// `px` on the grid, rounded down.
@@ -1801,43 +1803,138 @@ mod tests {
         let two = br##"{"coin":"#154150","time":1791451999803,"levels":[[{"px":"0.39583","sz":"44.0","n":2},{"px":"0.37583","sz":"25.0","n":1}],[{"px":"0.43583","sz":"40.0","n":1},{"px":"0.43584","sz":"25.0","n":1}]]}"##;
         assert_eq!(
             book_of(two),
-            Ok(Top {
+            Ok(Some(Top {
                 bid: 39_583_000,
                 bid_sz: 44 * E8,
                 ask: 43_583_000,
                 ask_sz: 40 * E8,
-            })
+                time_ms: 1_791_451_999_803,
+            }))
         );
         let no_bid =
             br##"{"coin":"#154151","time":1,"levels":[[],[{"px":"0.6","sz":"3.0","n":1}]]}"##;
         assert_eq!(
             book_of(no_bid),
-            Ok(Top {
+            Ok(Some(Top {
                 ask: 60_000_000,
                 ask_sz: 3 * E8,
+                time_ms: 1,
                 ..Top::default()
-            })
+            }))
         );
         let no_ask =
             br##"{"coin":"#154151","time":1,"levels":[[{"px":"0.2","sz":"7.0","n":1}],[]]}"##;
         assert_eq!(
             book_of(no_ask),
-            Ok(Top {
+            Ok(Some(Top {
                 bid: 20_000_000,
                 bid_sz: 7 * E8,
+                time_ms: 1,
                 ..Top::default()
-            })
+            }))
         );
-        assert_eq!(book_of(b" null\n"), Ok(Top::default()));
+        assert_eq!(book_of(b" null\n"), Ok(None));
         for bad in [
             &b"{\"error\":\"rate limited\"}"[..],
             &b"{\"levels\":[[{\"px\":\"0.4\""[..],
-            &br##"{"levels":[[{"px":"30000000","sz":"1.0","n":1}],[]]}"##[..],
-            &br##"{"levels":[[{"px":"0.4","sz":"-1.0","n":1}],[]]}"##[..],
-            &br##"{"levels":[[{"px":"0.4","sz":"9999999999.0","n":1}],[]]}"##[..],
+            &br##"{"time":1,"levels":[[{"px":"30000000","sz":"1.0","n":1}],[]]}"##[..],
+            &br##"{"time":1,"levels":[[{"px":"0.4","sz":"-1.0","n":1}],[]]}"##[..],
+            &br##"{"time":1,"levels":[[{"px":"0.4","sz":"9999999999.0","n":1}],[]]}"##[..],
         ] {
             assert!(book_of(bad).is_err(), "{}", String::from_utf8_lossy(bad));
         }
+    }
+
+    /// The shared reader at its edges: a stated level is in range — a price
+    /// in (0, $1], a size in (0, 10⁸ contracts] — or the answer is an error
+    /// with a short excerpt, never a book; a side with no level reads
+    /// (0, 0); the venue's time is carried, and an answer without it is not
+    /// a book (the engine's parser requires it).
+    #[test]
+    fn the_shared_reader_keeps_its_bounds() {
+        let edges = br##"{"coin":"#1","time":7,"levels":[[{"px":"0.0012","sz":"5.0","n":1}],[{"px":"1.0","sz":"100000000.0","n":1}]]}"##;
+        assert_eq!(
+            book_of(edges),
+            Ok(Some(Top {
+                bid: 120_000,
+                bid_sz: 5 * E8,
+                ask: E8,
+                ask_sz: MAX_BOOK_SZ_1E8,
+                time_ms: 7,
+            }))
+        );
+        let empty = br##"{"coin":"#1","time":7,"levels":[[],[]]}"##;
+        assert_eq!(
+            book_of(empty),
+            Ok(Some(Top {
+                time_ms: 7,
+                ..Top::default()
+            }))
+        );
+        let head = "not an l2Book answer: ";
+        for bad in [
+            r##"{"coin":"#1","time":7,"levels":[[{"px":"1.0001","sz":"1.0","n":1}],[]]}"##,
+            r##"{"coin":"#1","time":7,"levels":[[],[{"px":"0.0","sz":"1.0","n":1}]]}"##,
+            r##"{"coin":"#1","time":7,"levels":[[],[{"px":"-0.5","sz":"1.0","n":1}]]}"##,
+            r##"{"coin":"#1","time":7,"levels":[[],[{"px":"0.5","sz":"0.0","n":1}]]}"##,
+            r##"{"coin":"#1","time":7,"levels":[[],[{"px":"0.5","sz":"100000000.01","n":1}]]}"##,
+            r##"{"coin":"#1","levels":[[],[]]}"##,
+            r##"{"coin":"#1","time":7,"levels":[[]]}"##,
+            r##"{"coin":"#1","time":7,"levels":{}}"##,
+            "[]",
+            "",
+        ] {
+            let e = book_of(bad.as_bytes()).expect_err(bad);
+            assert_eq!(e, format!("{head}{bad}"));
+        }
+        let long = format!(r#"{{"error":"{}"}}"#, "x".repeat(500));
+        let e = book_of(long.as_bytes()).expect_err("an error");
+        assert_eq!(e, format!("{head}{}", &long[..96]), "the excerpt is short");
+    }
+
+    /// The reader's 1e-6 edges: a price past six decimals reads truncated,
+    /// never rounded — `floor_tick` of it is the true price's, `ceil_tick`
+    /// of such an ask a tick low; a side whose best level is `null` or
+    /// priced under 1e-6 (the engine's frame reads it 0, which the probe
+    /// once read as empty) refuses the whole answer; and an excerpt cut
+    /// inside a multi-byte character is lossy, never a panic.
+    #[test]
+    fn the_shared_reader_truncates_and_refuses_a_level_it_cannot_price() {
+        let fine = br##"{"coin":"#1","time":7,"levels":[[{"px":"0.0011009","sz":"5.0","n":1}],[{"px":"0.0012001","sz":"3.0","n":1}]]}"##;
+        assert_eq!(
+            book_of(fine),
+            Ok(Some(Top {
+                bid: 110_000,
+                bid_sz: 5 * E8,
+                ask: 120_000,
+                ask_sz: 3 * E8,
+                time_ms: 7,
+            })),
+            "0.0011009 and 0.0012001 read 0.0011 and 0.0012: truncated"
+        );
+        assert_eq!(floor_tick(110_000), floor_tick(110_090));
+        assert_eq!((ceil_tick(120_000), ceil_tick(120_010)), (120_000, 130_000));
+        let head = "not an l2Book answer: ";
+        for bad in [
+            r##"{"coin":"#1","time":7,"levels":[[{"px":"0.0000009","sz":"1.0","n":1}],[]]}"##,
+            r##"{"coin":"#1","time":7,"levels":[[],[{"px":"0.0000009","sz":"1.0","n":1}]]}"##,
+            r##"{"coin":"#1","time":7,"levels":[[null],[{"px":"0.5","sz":"1.0","n":1}]]}"##,
+            r##"{"coin":"#1","time":7,"levels":[[{"px":"0.4","sz":"1.0","n":1}],[null]]}"##,
+        ] {
+            let mut f = HlL2BookFrame::ZERO;
+            assert!(parse_l2book_header(bad.as_bytes(), 0, &mut f), "{bad}");
+            assert!(
+                (f.n_bids > 0 && f.best_bid_px_1e6 == 0)
+                    || (f.n_asks > 0 && f.best_ask_px_1e6 == 0),
+                "the engine's frame reads a stated side 0: {bad}"
+            );
+            let e = book_of(bad.as_bytes()).expect_err(bad);
+            assert_eq!(e, format!("{head}{bad}"));
+        }
+        let cut = format!(r#"{{"error":"{}{}"}}"#, "x".repeat(85), "é".repeat(10));
+        assert!(!cut.is_char_boundary(96), "the 96-byte cut splits an 'é'");
+        let e = book_of(cut.as_bytes()).expect_err("an error");
+        assert_eq!(e, format!("{head}{}\u{FFFD}", &cut[..95]));
     }
 
     /// Every price is on the grid and in range; a rest never crosses; the
@@ -1850,6 +1947,7 @@ mod tests {
             bid_sz: 44 * E8,
             ask: 43_583_000,
             ask_sz: 40 * E8,
+            time_ms: 0,
         };
         let px1 = rest_bid(top).expect("room under the bid");
         assert_eq!(px1, 35_620_000, "10 % under 0.39583, floored to 1e-4");
@@ -1872,6 +1970,7 @@ mod tests {
                 bid_sz: E8 * 1_000,
                 ask,
                 ask_sz: E8 * 1_000,
+                time_ms: 0,
             };
             for usd in [MIN_USD, 5, MAX_USD] {
                 for px in [

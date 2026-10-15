@@ -72,8 +72,10 @@ use exec_hyperliquid::rules::OutcomeRules;
 use exec_hyperliquid::sign::{sign_action, Vault};
 use exec_hyperliquid::{HlConfig, HlHttp, Network, Nonce};
 use ingress_hyperliquid::discovery::{HlDiscovery, HlOutcomeSpec};
-use ingress_hyperliquid::{parse_l2book_header, HlCoinTable, HlL2BookFrame};
+use ingress_hyperliquid::HlCoinTable;
 use rustls::ClientConfig;
+
+use crate::outcome_battery::book_of;
 
 const E8: i64 = 100_000_000;
 
@@ -217,6 +219,22 @@ impl Touch {
             self.ask_1e8
         }
     }
+}
+
+/// Leg `enc`'s touch out of its `l2Book` answer, by the one reader of that
+/// answer (`outcome_battery::book_of`, the engine's `l2Book` parser under
+/// it). `null` (no book) is unreadable here, as an answer that is not a
+/// book in range is: the offset is skipped, never planned off one leg.
+fn touch_of(body: &[u8], enc: u64) -> Result<Touch, String> {
+    let t = book_of(body)
+        .map_err(|e| format!("l2Book #{enc}: unreadable ({e})"))?
+        .ok_or_else(|| format!("l2Book #{enc}: unreadable"))?;
+    Ok(Touch {
+        bid_1e8: t.bid,
+        ask_1e8: t.ask,
+        ask_sz_1e8: t.ask_sz,
+        time_ms: t.time_ms,
+    })
 }
 
 /// What one offset does.
@@ -599,16 +617,7 @@ impl Venue {
     fn book(&mut self, enc: u64) -> Result<Touch, String> {
         let req = format!(r##"{{"type":"l2Book","coin":"#{enc}"}}"##);
         let b = self.read(req.as_bytes())?;
-        let mut f = HlL2BookFrame::ZERO;
-        if !parse_l2book_header(&b, 0, &mut f) {
-            return Err(format!("l2Book #{enc}: unreadable"));
-        }
-        Ok(Touch {
-            bid_1e8: f.best_bid_px_1e6 * 100,
-            ask_1e8: f.best_ask_px_1e6 * 100,
-            ask_sz_1e8: f.best_ask_sz_1e6 * 100,
-            time_ms: f.ts_ns / 1_000_000,
-        })
+        touch_of(&b, enc)
     }
 
     /// The underlying perp's mid x1e8, from `allMids`.
@@ -1136,6 +1145,59 @@ mod tests {
             ask_sz_1e8: sz * E8,
             time_ms: 0,
         }
+    }
+
+    /// The probe and the battery read one `l2Book` answer alike: the
+    /// probe's touch is the battery's top (`outcome_battery::book_of`) —
+    /// and, on every book in range, what the probe read before the reader
+    /// was shared (the engine's frame ×100). `null` stays unreadable here
+    /// (the battery reads it empty), and so does a book out of range.
+    #[test]
+    fn the_touch_is_the_shared_reader_s() {
+        use ingress_hyperliquid::{parse_l2book_header, HlL2BookFrame};
+        let books: [&[u8]; 4] = [
+            br##"{"coin":"#154150","time":1791451999803,"levels":[[{"px":"0.39583","sz":"44.0","n":2},{"px":"0.37583","sz":"25.0","n":1}],[{"px":"0.43583","sz":"40.0","n":1},{"px":"0.43584","sz":"25.0","n":1}]]}"##,
+            br##"{"coin":"#154150","time":1791451999900,"levels":[[{"px":"0.9928","sz":"300.0","n":3}],[{"px":"0.99909","sz":"12.0","n":1}]]}"##,
+            br##"{"coin":"#154151","time":1791451999901,"levels":[[{"px":"0.00091","sz":"5000.0","n":1}],[]]}"##,
+            br##"{"coin":"#154151","time":1791451999902,"levels":[[],[{"px":"0.0072","sz":"140.0","n":1}]]}"##,
+        ];
+        for b in books {
+            let top = book_of(b).expect("a book").expect("not null");
+            let t = touch_of(b, 154_150).expect("a touch");
+            assert_eq!(
+                (t.bid_1e8, t.ask_1e8, t.ask_sz_1e8, t.time_ms),
+                (top.bid, top.ask, top.ask_sz, top.time_ms)
+            );
+            let mut f = HlL2BookFrame::ZERO;
+            assert!(parse_l2book_header(b, 0, &mut f));
+            let before = Touch {
+                bid_1e8: f.best_bid_px_1e6 * 100,
+                ask_1e8: f.best_ask_px_1e6 * 100,
+                ask_sz_1e8: f.best_ask_sz_1e6 * 100,
+                time_ms: f.ts_ns / 1_000_000,
+            };
+            assert_eq!(t, before, "{}", String::from_utf8_lossy(b));
+        }
+        assert_eq!(
+            touch_of(books[1], 154_150),
+            Ok(Touch {
+                bid_1e8: 99_280_000,
+                ask_1e8: 99_909_000,
+                ask_sz_1e8: 12 * E8,
+                time_ms: 1_791_451_999_900,
+            })
+        );
+        assert_eq!(book_of(b"null"), Ok(None));
+        assert_eq!(
+            touch_of(b"null", 7),
+            Err(String::from("l2Book #7: unreadable"))
+        );
+        let far = br##"{"time":1,"levels":[[{"px":"30000000","sz":"1.0","n":1}],[]]}"##;
+        let e = touch_of(far, 7).expect_err("out of range");
+        assert!(
+            e.starts_with("l2Book #7: unreadable (not an l2Book answer: "),
+            "{e}"
+        );
     }
 
     #[test]
