@@ -217,3 +217,23 @@ fn each_invalid_chart_names_its_rule() {
         }
     }
 }
+
+/// Landing guard: the authored file carries no "TODO:" and no trace of the authoring lane's
+/// validation merger (`author/tools/merge.py`). The merger substitutes ordinary-looking fallback
+/// values in place (nothing in-band marks them) and records each substitution in a
+/// `fallbacks.json` it writes beside any output named `builtins.json`; that sidecar, or its
+/// note, next to or inside the spec means the file is a check artifact, not the authored one.
+#[test]
+fn builtins_has_no_merger_placeholder() {
+    let src = String::from_utf8(read("spec/builtins.json")).expect("utf-8");
+    assert!(!src.contains("TODO:"), "spec/builtins.json holds a TODO: string");
+    assert!(
+        !src.contains("validation-only fallback"),
+        "spec/builtins.json holds the merger note"
+    );
+    let sidecar = std::path::Path::new(MANIFEST).join("spec/fallbacks.json");
+    assert!(
+        !sidecar.exists(),
+        "spec/fallbacks.json: builtins.json is a merger check artifact"
+    );
+}
