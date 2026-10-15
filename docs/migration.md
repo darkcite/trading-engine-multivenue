@@ -6,6 +6,66 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-15 — S16: sixteen strategy slots
+
+**What changed**
+- `core_types::MAX_STRATEGY_SLOTS` 8 → 16 and `SlotMask = u16`; every other
+  slot bound derives from it. Slots 0–7 are the built members, unchanged;
+  **8–15 are RESERVED** (no member; `BUILT_MASK` stays 0x00FF, so `all` = 255
+  and the enable mask is 255 as before).
+- **One `STRATEGY` parser** (`strategy_set::parse_strategy`, S16-1c): `all`
+  alone, or `+`-joined member names (`hyparb`, `vrp`, `xsd`, `bin15`,
+  `ai-exec`, `vm`, `xmm`, `hcv`) and `ai` (= ai-exec + vm), any order;
+  overlapping or repeated segments (`ai+vm`, `vrp+vrp`) are the union.
+  Refused: empty, an empty segment, an unknown name (case-sensitive), `all`
+  beside anything. Every string the old `MASK_TABLE` accepted gives the same
+  mask.
+- New subcommand `multivenue-engine strategy-mask <STRATEGY>`: prints
+  `<mask>\t<members>` (slot order), exit 0; else stderr, exit 78 (`-h` /
+  `--help` too). Example: `ai+vrp` → `50\tvrp+ai-exec+vm`.
+- `--arm-live` / `--halt-slot` take 0–15; 8–15 are refused at boot as
+  reserved (as is an exec artifact whose `live_mask` names them), naming the
+  slots; 16, 255 and duplicates refused.
+- `LEDGER_RESTING` 512 → 1 024 (64 open orders per slot × 16);
+  `HALT_FILE_MAX` 512 → 640 B; `INST_EXPOSURE_MAX` `i64::MAX / 1024`.
+- `/metrics`: `engine_strategy_regime_gate_8..15` (read 0).
+- `/state` `"v"` **3** (S16-5): the per-slot arrays (`slots`,
+  `regime.gates`, `exec.halted`) at 16, index paths unchanged; the dashboard
+  reads 2 and 3. `bin15-flip.sh` / `xmm-flip.sh` still take only the built
+  slots 0–7 in `ARM_LIVE` (8–15 refused before the restart, not after it).
+- Hyperliquid and Binance (S16-4) read a slot 8–15 id as that slot, on the
+  path an off-owner slot 0–7 id takes; BIN15's cloid and the Binance cids of
+  slots 0–7 are byte-identical.
+
+**Impact**
+- **No wire or capture format changed — no PMLR bump.** `strategy_id` was
+  already a full `u8` in `Order` @41, `Fill` @13, `OrderEvent` @29, `AiCmd`
+  @42 and `ExecRecord.slot` @63; old captures replay byte-identically.
+  `0xFF` stays unattributed.
+- An `exec.toml` with 64 open orders per slot stays valid (the boot's equal
+  share is 1 024 / 16 = 64). Old 8-slot halt files parse unchanged.
+- `refused_by_slot` buckets 15 and 14 now hold the unstamped refusals (`0xFF`,
+  `0xFE`; before, 7 and 6) — not a member's number.
+- **Newly bootable from launchd (after the wrapper patch):** any `+`-joined
+  set of member names, e.g. `bin15+xmm` (72) or `vrp+hcv`, where the old
+  wrapper allow-listed 20 strings; `all` is refused there (exit 78).
+- **Rollback door:** an older 8-slot binary decodes a live order from a slot
+  ≥ 8 as Foreign (HL: never booked, recon reports it; Binance: the BX-8 drift
+  check halts the shared account). Safe while no member sits at 8–15.
+
+**Migration steps**
+1. Deploy in this order: `cargo build --release -p cli` → check
+   `multivenue-engine strategy-mask ai+vrp+xsd+bin15+hyparb+xmm+hcv` prints
+   `255\thyparb+vrp+xsd+bin15+ai-exec+vm+xmm+hcv` → apply the
+   `scripts/engine-wrapper.sh` patch (it resolves `STRATEGY` through
+   `strategy-mask` and refuses `all`; an older binary makes it refuse with
+   "rebuild it") → restart.
+2. `~/multivenue/strategy.conf` needs no edit unless it says `STRATEGY=all`,
+   which the patched wrapper refuses: name the members instead.
+3. A binary rollback rolls the wrapper back with it.
+4. Readers of `/state`: accept `"v": 3`; index the per-slot
+   arrays by slot as before.
+
 ## 2026-10-15 — `Tick.venue_seq` for pm / hl / deribit is a per-instrument arrival ordinal (HK31, HK32)
 
 **What changed**
@@ -508,7 +568,8 @@ to `main`, a release build and a restart; then watch the Hypercall poller's
 - `strategy-set`: the bootable name `bin15+xmm` (mask 72: bin15 8 + xmm 64)
   — the testnet engine-instance check's set, slot 3's member beside slot
   6's. The wrapper's allow-list does not carry it: the launchd engine cannot
-  boot it.
+  boot it (it can from the S16 deploy, which resolves any `+`-joined set of
+  member names through `strategy-mask`; see "2026-10-15 — S16").
 - `multivenue-engine xmm-preflight --exec <toml> --arm-live <list> --xmm
   <toml> --strategy <set> [--env-file <path>]`: slot 6's boot checks up to
   its first network read, sending nothing. Exit 0 PASS (the report on
