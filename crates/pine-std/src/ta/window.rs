@@ -4,13 +4,15 @@
 //! `ta.*` windows (impl-04 §4.13.6): `ta.variance`, `ta.stdev`.
 
 use crate::args::out1;
-use crate::state::{mono_push, mono_query, win_push, win_repoint, MonoCell, MonoHdr, WinHdr};
+use crate::state::{
+    mono_push, mono_query, win_at, win_push, win_repoint, MonoCell, MonoHdr, WinHdr,
+};
 use pine_ir::{abi, argwin, FaultKind, SiteId};
 use pine_vm::Frame;
 
 /// Window variance over `[src, len, biased, out]`: `sum2/n − mean²`, clamped at 0 before any
 /// `sqrt` (§4.5 item 3); `biased == false` scales by `n/(n−1)`. `skip` na (W5/U18). An na
-/// `biased` (v5) yields na.
+/// `biased` (v5) yields na (`pin:04-biased-na`).
 #[inline(always)]
 fn variance(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(f64, u16), FaultKind> {
     if args.len() != 4 {
@@ -113,41 +115,108 @@ pub fn bi_extreme<const MAX: bool, const SRC: bool, const BARS: bool>(
     Ok(())
 }
 
+/// The Bollinger core over `[src, len, …]`: `(mid, population stdev)` from one set of sums,
+/// variance clamped at 0; `skip` na.
+fn bb_core(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(f64, f64), FaultKind> {
+    let src = f.f64_arg(args[0]);
+    let Some(len) = f.i64_arg(args[1]) else {
+        return Ok((f64::NAN, f64::NAN));
+    };
+    let (h, ring) = f.state_split::<WinHdr, f64>(site);
+    if len < 1 || len > ring.len() as i64 {
+        return Err(FaultKind::ScriptRefused);
+    }
+    let len = len as u32;
+    if h.len != len {
+        win_repoint(h, ring, len);
+    }
+    if !src.is_nan() {
+        win_push(h, ring, src);
+    }
+    if h.n < len {
+        return Ok((f64::NAN, f64::NAN));
+    }
+    let n = len as f64;
+    let m = h.sum / n;
+    let v = h.sum2 / n - m * m;
+    Ok((m, if v > 0.0 { v.sqrt() } else { 0.0 }))
+}
+
 /// `ta.bb(series, length, mult) -> (middle, upper, lower)` — window `[src, len, mult, mid, up,
-/// lo]`: `sma ± mult × stdev` (population) from one set of sums, variance clamped at 0; `skip` na.
+/// lo]`: `sma ± mult × stdev`.
 pub fn bi_ta_bb(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 6 {
         return Err(FaultKind::Internal);
     }
-    let src = f.f64_arg(args[0]);
-    let len = f.i64_arg(args[1]);
     let mult = f.f64_arg(args[2]);
-    let (mid, sd) = match len {
-        None => (f64::NAN, f64::NAN),
-        Some(len) => {
-            let (h, ring) = f.state_split::<WinHdr, f64>(site);
-            if len < 1 || len > ring.len() as i64 {
-                return Err(FaultKind::ScriptRefused);
-            }
-            let len = len as u32;
-            if h.len != len {
-                win_repoint(h, ring, len);
-            }
-            if !src.is_nan() {
-                win_push(h, ring, src);
-            }
-            if h.n < len {
-                (f64::NAN, f64::NAN)
-            } else {
-                let n = len as f64;
-                let m = h.sum / n;
-                let v = h.sum2 / n - m * m;
-                (m, if v > 0.0 { v.sqrt() } else { 0.0 })
-            }
-        }
-    };
+    let (mid, sd) = bb_core(f, site, args)?;
     f.set_f64_arg(args[3], mid);
     f.set_f64_arg(args[4], mult.mul_add(sd, mid));
     f.set_f64_arg(args[5], (-mult).mul_add(sd, mid));
+    Ok(())
+}
+
+/// `ta.bbw(series, length, mult)` = `(upper − lower) / middle`.
+pub fn bi_ta_bbw(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 4 {
+        return Err(FaultKind::Internal);
+    }
+    let mult = f.f64_arg(args[2]);
+    let (mid, sd) = bb_core(f, site, args)?;
+    let (up, lo) = (mult.mul_add(sd, mid), (-mult).mul_add(sd, mid));
+    f.set_f64_arg(args[3], (up - lo) / mid);
+    Ok(())
+}
+
+/// `ta.linreg(source, length, offset)` — block `WinHdr` + `[ring | x column]`: least squares over
+/// `x = len − 1 − k` for the value `k` back, `intercept + slope × (len − 1 − offset)`;
+/// `propagate` na (an na inside the window makes the output na). `len == 1` is the value itself.
+pub fn bi_ta_linreg(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 4 {
+        return Err(FaultKind::Internal);
+    }
+    let src = f.f64_arg(args[0]);
+    let (len, off) = (f.i64_arg(args[1]), f.i64_arg(args[2]));
+    let (Some(len), Some(off)) = (len, off) else {
+        f.set_f64_arg(args[3], f64::NAN);
+        return Ok(());
+    };
+    let out = {
+        let (h, tail) = f.state_split::<WinHdr, f64>(site);
+        let cap = tail.len() / 2;
+        if len < 1 || len > cap as i64 {
+            return Err(FaultKind::ScriptRefused);
+        }
+        let (ring, xs) = tail.split_at_mut(cap);
+        let len = len as u32;
+        if h.len != len {
+            win_repoint(h, ring, len);
+            let mut k = 0u32;
+            while k < len {
+                xs[k as usize] = (len - 1 - k) as f64;
+                k += 1;
+            }
+        }
+        win_push(h, ring, src);
+        if h.n < len || h.na_in != 0 {
+            f64::NAN
+        } else if len == 1 {
+            src
+        } else {
+            let n = len as f64;
+            let sx = n * (n - 1.0) / 2.0;
+            let sxx = (n - 1.0) * n * (2.0 * n - 1.0) / 6.0;
+            let mut sxy = 0.0f64;
+            let mut k = 0u32;
+            while k < len {
+                sxy = win_at(h, ring, k).mul_add(xs[k as usize], sxy);
+                k += 1;
+            }
+            let slope = (n * sxy - sx * h.sum) / (n * sxx - sx * sx);
+            let icept = (h.sum - slope * sx) / n;
+            slope.mul_add(n - 1.0 - off as f64, icept)
+        }
+    };
+    f.set_f64_arg(args[3], out);
     Ok(())
 }

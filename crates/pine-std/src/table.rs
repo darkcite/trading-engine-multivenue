@@ -12,7 +12,9 @@ use pine_ir::{FaultKind, OverloadId, SiteId};
 use pine_spec::{ov, Abi, NaPolicy, StateShape, OVERLOADS, OVERLOAD_COUNT};
 use pine_vm::{bf, BuiltinEntry, BuiltinFn, BuiltinTable, Frame};
 
-use crate::state::{AtrHdr, Ewma, MacdHdr, MonoCell, MonoHdr, Prev, RsiHdr, Seq, WinHdr};
+use crate::state::{
+    AtrHdr, Ewma, KcHdr, MacdHdr, MonoCell, MonoHdr, Prev, Rng64, RsiHdr, Seq, StHdr, WinHdr,
+};
 use crate::{math, ta};
 
 /// Body of every row pine-std does not serve in the active tiers, and of every folded row.
@@ -149,6 +151,14 @@ const MONO: Blk = Blk::Win {
 };
 const RSI: Blk = Blk::Fixed(size_of::<RsiHdr>() as u32);
 const MACD: Blk = Blk::Fixed(size_of::<MacdHdr>() as u32);
+const RNG: Blk = Blk::Fixed(size_of::<Rng64>() as u32);
+const KC: Blk = Blk::Fixed(size_of::<KcHdr>() as u32);
+const ST: Blk = Blk::Fixed(size_of::<StHdr>() as u32);
+const WIN2: Blk = Blk::Win {
+    hdr: size_of::<WinHdr>() as u32,
+    elem: 16,
+};
+const SWMA: Blk = Blk::Fixed(size_of::<WinHdr>() as u32 + 4 * 8);
 const SEQ: Blk = Blk::Win {
     hdr: size_of::<Seq>() as u32,
     elem: 8,
@@ -330,6 +340,129 @@ const fn build() -> Built {
         row(ov::STRING, math::bi_cast_id, 1, 0, Blk::None),
     );
     let st = bf::STATEFUL;
+    put(
+        &mut b,
+        ov::TA_BBW,
+        row(skip(ov::TA_BBW), ta::window::bi_ta_bbw, 4, st, WIN),
+    );
+    put(
+        &mut b,
+        ov::TA_LINREG,
+        row(ov::TA_LINREG, ta::window::bi_ta_linreg, 4, st, WIN2),
+    );
+    put(
+        &mut b,
+        ov::TA_SWMA,
+        row(ov::TA_SWMA, ta::ma::bi_ta_swma, 2, st, SWMA),
+    );
+    put(
+        &mut b,
+        ov::TA_WMA,
+        row(skip(ov::TA_WMA), ta::ma::bi_ta_wma, 4, st, WIN2),
+    );
+    put(
+        &mut b,
+        ov::TA_KC,
+        row(skip(ov::TA_KC), ta::osc::bi_ta_kc, 4, st, KC),
+    );
+    put(
+        &mut b,
+        ov::TA_KCW,
+        row(skip(ov::TA_KCW), ta::osc::bi_ta_kcw, 4, st, KC),
+    );
+    let sup = ta::osc::bi_ta_supertrend;
+    put(
+        &mut b,
+        ov::TA_SUPERTREND,
+        row(ov::TA_SUPERTREND, sup, 4, st, ST),
+    );
+    put(
+        &mut b,
+        ov::OP_INT_STRICT,
+        row(ov::OP_INT_STRICT, math::bi_int_strict, 1, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::COLOR_B,
+        row(ov::COLOR_B, math::bi_color_chan::<2>, 1, 0, Blk::None),
+    );
+    let grad = math::bi_color_from_gradient;
+    put(
+        &mut b,
+        ov::COLOR_FROM_GRADIENT,
+        row(ov::COLOR_FROM_GRADIENT, grad, 1, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::COLOR_G,
+        row(ov::COLOR_G, math::bi_color_chan::<1>, 1, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::COLOR_NEW,
+        row(ov::COLOR_NEW, math::bi_color_new, 1, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::COLOR_R,
+        row(ov::COLOR_R, math::bi_color_chan::<0>, 1, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::COLOR_RGB,
+        row(ov::COLOR_RGB, math::bi_color_rgb, 1, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::COLOR_T,
+        row(ov::COLOR_T, math::bi_color_chan::<3>, 1, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::FIXNAN_F,
+        row(ov::FIXNAN_F, math::bi_fixnan, 1, st, PREV),
+    );
+    put(
+        &mut b,
+        ov::FIXNAN_I,
+        row(ov::FIXNAN_I, math::bi_fixnan, 1, st, PREV),
+    );
+    put(
+        &mut b,
+        ov::FIXNAN_C,
+        row(ov::FIXNAN_C, math::bi_fixnan, 1, st, PREV),
+    );
+    put(
+        &mut b,
+        ov::FIXNAN_B,
+        row(ov::FIXNAN_B, math::bi_fixnan, 1, st, PREV),
+    );
+    put(
+        &mut b,
+        ov::MATH_RANDOM,
+        row(ov::MATH_RANDOM, math::bi_random, 1, st, RNG),
+    );
+    put(
+        &mut b,
+        ov::MATH_ROUND_I,
+        row(ov::MATH_ROUND_I, math::bi_round, 1, 0, Blk::None),
+    );
+    let mt = math::bi_round_to_mintick;
+    put(
+        &mut b,
+        ov::MATH_ROUND_TO_MINTICK,
+        row(ov::MATH_ROUND_TO_MINTICK, mt, 1, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::MATH_SUM,
+        row(skip(ov::MATH_SUM), math::bi_sum, 2, st, WIN),
+    );
+    put(
+        &mut b,
+        ov::TA_ROC,
+        row(ov::TA_ROC, ta::seq::bi_roc, 2, st, SEQ),
+    );
     put(
         &mut b,
         ov::TA_BB,

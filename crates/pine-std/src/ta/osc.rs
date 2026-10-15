@@ -40,7 +40,7 @@ fn tr_step(p: &mut Prev, h: f64, l: f64, c: f64, handle_na: bool) -> f64 {
 }
 
 /// `ta.tr(handle_na)` — window `[handle_na, out]`; an na `handle_na` (v5) reads as `false`, the
-/// documented non-handling behaviour.
+/// documented non-handling behaviour (`pin:04-handle-na`).
 pub fn bi_ta_tr(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 2 {
         return Err(FaultKind::Internal);
@@ -191,5 +191,131 @@ pub fn bi_ta_macd(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), F
     f.set_f64_arg(args[4], m);
     f.set_f64_arg(args[5], g);
     f.set_f64_arg(args[6], m - g);
+    Ok(())
+}
+
+const KC_BASIS: [u8; 2] = sw::both(Sw::KcBasis);
+
+/// The Keltner step shared by `ta.kc` and `ta.kcw`: `(mid, up, lo)` over
+/// `[src, len, mult, useTrueRange, …]`; `skip` na holds the value.
+fn kc(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(f64, f64, f64), FaultKind> {
+    let src = f.f64_arg(args[0]);
+    let mult = f.f64_arg(args[2]);
+    let use_tr = f.bool_arg(args[3]) == Some(true);
+    let Some(len) = length(f, args[1])? else {
+        return Ok((f64::NAN, f64::NAN, f64::NAN));
+    };
+    let d = f.dialect();
+    let ema_sma = sw::pick(EMA_SEED, d) == swr::EMA_SEED_SMA;
+    let rma_band = sw::pick(KC_BASIS, d) == swr::KC_BASIS_RMA_RANGE;
+    let band_sma = if rma_band {
+        sw::pick(RMA_SEED, d) == swr::RMA_SEED_SMA
+    } else {
+        ema_sma
+    };
+    let (h, l, c) = hlc(f);
+    let (mid, band) = if src.is_nan() {
+        let s = f.state_ro::<crate::state::KcHdr>(site);
+        (ewma_hold(&s.mid), ewma_hold(&s.band))
+    } else {
+        let s = f.state::<crate::state::KcHdr>(site);
+        let a = 2.0 / (len as f64 + 1.0);
+        let mid = ewma_step(&mut s.mid, src, a, len, ema_sma);
+        let span = if use_tr {
+            tr_step(&mut s.prev, h, l, c, false)
+        } else {
+            h - l
+        };
+        let ab = if rma_band { 1.0 / len as f64 } else { a };
+        let band = if span.is_nan() {
+            ewma_hold(&s.band)
+        } else {
+            ewma_step(&mut s.band, span, ab, len, band_sma)
+        };
+        (mid, band)
+    };
+    Ok((mid, mult.mul_add(band, mid), (-mult).mul_add(band, mid)))
+}
+
+/// `ta.kc(series, length, mult, useTrueRange) -> (middle, upper, lower)`; the band per
+/// `Sw::KcBasis` (`pin:U02-kc-basis`).
+pub fn bi_ta_kc(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 7 {
+        return Err(FaultKind::Internal);
+    }
+    let (m, u, l) = kc(f, site, args)?;
+    f.set_f64_arg(args[4], m);
+    f.set_f64_arg(args[5], u);
+    f.set_f64_arg(args[6], l);
+    Ok(())
+}
+
+/// `ta.kcw(series, length, mult, useTrueRange)` = `(upper − lower) / middle`.
+pub fn bi_ta_kcw(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 5 {
+        return Err(FaultKind::Internal);
+    }
+    let (m, u, l) = kc(f, site, args)?;
+    f.set_f64_arg(args[4], (u - l) / m);
+    Ok(())
+}
+
+/// `ta.supertrend(factor, atrPeriod) -> (supertrend, direction)` — the reference manual's
+/// recurrence: bands `hl2 ± factor × atr` clamped against the previous final bands (`nz`) and
+/// the previous close; direction 1 while `na(atr[1])`, then flips on a close through the held
+/// band; −1 selects the lower band (`pin:04-ta-reference`).
+pub fn bi_ta_supertrend(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 4 {
+        return Err(FaultKind::Internal);
+    }
+    let factor = f.f64_arg(args[0]);
+    let Some(len) = length(f, args[1])? else {
+        f.set_f64_arg(args[2], f64::NAN);
+        crate::args::set_num_out(f, args[3], f64::NAN);
+        return Ok(());
+    };
+    let sma = sw::pick(RMA_SEED, f.dialect()) == swr::RMA_SEED_SMA;
+    let (h, l, c) = hlc(f);
+    let (st, dir) = {
+        let s = f.state::<crate::state::StHdr>(site);
+        let atr_was_na = s.atr.ew.seeded == 0;
+        let tr = tr_step(&mut s.atr.prev, h, l, c, true);
+        let atr = if tr.is_nan() {
+            ewma_hold(&s.atr.ew)
+        } else {
+            ewma_step(&mut s.atr.ew, tr, 1.0 / len as f64, len, sma)
+        };
+        let src = (h + l) / 2.0;
+        let (mut up, mut dn) = (factor.mul_add(atr, src), (-factor).mul_add(atr, src));
+        let (pu, pd) = (s.up, s.dn); // nz(): a stored na is kept as 0
+        let c1 = if s.primed != 0 { s.close1 } else { f64::NAN };
+        if !(dn > pd || c1 < pd) {
+            dn = pd;
+        }
+        if !(up < pu || c1 > pu) {
+            up = pu;
+        }
+        let dir = if atr_was_na {
+            1
+        } else if s.dir == 1 {
+            if c > up {
+                -1
+            } else {
+                1
+            }
+        } else if c < dn {
+            1
+        } else {
+            -1
+        };
+        s.up = if up.is_nan() { 0.0 } else { up };
+        s.dn = if dn.is_nan() { 0.0 } else { dn };
+        s.close1 = c;
+        s.dir = dir;
+        s.primed = 1;
+        (if dir == -1 { dn } else { up }, dir)
+    };
+    f.set_f64_arg(args[2], st);
+    crate::args::set_num_out(f, args[3], dir as f64);
     Ok(())
 }

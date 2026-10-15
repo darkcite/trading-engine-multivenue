@@ -292,7 +292,7 @@ fn regex_subset_accepts_and_refuses() {
 
 #[test]
 fn regex_matches_reference_table() {
-    let t: [(&str, &str, Option<(usize, usize)>); 18] = [
+    let t: [(&str, &str, Option<(usize, usize)>); 22] = [
         ("abc", "xxabcxx", Some((2, 5))),
         ("a+", "baaab", Some((1, 4))),
         ("a*", "baaab", Some((0, 0))),
@@ -311,6 +311,10 @@ fn regex_matches_reference_table() {
         ("[\\d,]+", "v=1,234;", Some((2, 7))),
         ("x?y", "xxy", Some((1, 3))),
         ("", "abc", Some((0, 0))),
+        ("a.c", "a\u{e9}c", Some((0, 4))),
+        ("^.$", "\u{20ac}", Some((0, 3))),
+        ("^..$", "\u{1f600}x", Some((0, 5))),
+        ("a.b", "a\nb", None),
     ];
     for (p, s, want) in t {
         assert_eq!(regex_find(p, s), want, "{p} on {s:?}");

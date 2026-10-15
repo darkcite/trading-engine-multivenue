@@ -1,106 +1,49 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! impl-04 §7.6 — `math.*` and the cast bodies, driven through `pine_vm::verify` + `VmInstance`
-//! with pine-vm's hand-assembly builder and a probe row appended to `BUILTINS` (§7.1).
+//! impl-04 §7.6 — `math.*` and the cast bodies, driven through `pine_std::testing` (§7.1).
 //!
 //! COPY-DOCTRINE: test support, may allocate.
 
 use pine_ir::*;
 use pine_spec::ov;
-use pine_std::BUILTINS;
-use pine_vm::testkit::*;
-use pine_vm::*;
-
-/// Captures every window entry as plot `k` (i64 entries as f64, na as NaN).
-fn probe(fr: &mut Frame<'_>, _: SiteId, a: &[u16]) -> Result<(), FaultKind> {
-    let mut k = 0usize;
-    while k < a.len() {
-        let v = if argwin::is_i64(a[k]) {
-            fr.i64_arg(a[k]).map_or(f64::NAN, |x| x as f64)
-        } else {
-            fr.f64_arg(a[k])
-        };
-        fr.plot_set(k as u32, v);
-        k += 1;
-    }
-    Ok(())
-}
-
-fn table() -> &'static BuiltinTable {
-    let mut v: Vec<BuiltinEntry> = BUILTINS.entries.to_vec();
-    v.push(BuiltinEntry {
-        f: probe,
-        cost: 1,
-        n_out: 0,
-        flags: bf::CAPTURE,
-        state_bytes_min: 0,
-    });
-    let entries: &'static [BuiltinEntry] = Box::leak(v.into_boxed_slice());
-    Box::leak(Box::new(BuiltinTable {
-        spec_sha256: pine_spec::SPEC_SHA256,
-        entries,
-    }))
-}
+use pine_std::testing::{Call, Harness, Script, Src, TestCtx, CHART};
+use pine_vm::testkit::bar;
 
 #[derive(Clone, Copy)]
 enum V {
     F(f64),
     I(Option<i64>),
 }
-
 /// Call `id` once on `inputs`, its output in the `int` lane when `out_i64`; return the output.
 fn call(id: OverloadId, inputs: &[V], out_i64: bool) -> f64 {
-    let mut t = Tb::new(ExecMode::BarClose, 8, 8, 0, 0);
-    t.spec = pine_spec::SPEC_SHA256;
-    t.n_plots = 1;
-    let (mut nf, mut ni) = (0u32, 0u32);
-    let mut win: Vec<u16> = Vec::new();
-    for v in inputs {
-        match *v {
-            V::F(x) => {
-                let s = t.f(nf);
-                nf += 1;
-                let k = t.kf(x);
-                t.emit(op::F_CONST, 0, s, k, 0);
-                win.push(argwin::f64(s));
-            }
-            V::I(x) => {
-                let s = t.i(ni);
-                ni += 1;
-                let k = t.k(x.unwrap_or(0) as u64);
-                t.emit(op::I_CONST, if x.is_some() { flg::VLD } else { 0 }, s, k, 0);
-                win.push(argwin::i64(s));
-            }
-        }
-    }
-    let out = if out_i64 {
-        argwin::i64(t.i(ni))
-    } else {
-        argwin::f64(t.f(nf))
-    };
-    win.push(out);
-    let w = t.win(&win);
-    t.emit(op::CALL_BUILTIN, 0, SiteId::NONE.0, id.0, w);
-    let wp = t.win(&[out]);
-    t.emit(
-        op::CALL_BUILTIN,
-        0,
-        SiteId::NONE.0,
-        pine_spec::OVERLOAD_COUNT as u16,
-        wp,
-    );
-    t.emit(op::HALT, 0, 0, 0, 0);
-    let p = t.build();
-    let v = verify(&p, table()).expect("verifies");
-    let mut ar = Arena::new(p.layout.total_bytes as usize);
-    let mut ctx = Ctx { now: 0 };
-    let mut vm = VmInstance::new(v, ar.slice());
-    assert_eq!(
-        vm.step_bar(&bar(0, 1.0, barflag::CONFIRMED), &mut ctx),
-        StepOutcome::Ok
-    );
-    vm.plots()[0]
+    let ins: Vec<(Lane, Src)> = inputs
+        .iter()
+        .map(|v| match *v {
+            V::F(x) => (Lane::F64, Src::Const(x.to_bits())),
+            V::I(Some(x)) => (Lane::I64, Src::Const(x as u64)),
+            V::I(None) => (Lane::I64, Src::Na),
+        })
+        .collect();
+    let outs = [if out_i64 { Lane::I64 } else { Lane::F64 }];
+    let calls = [Call {
+        ov: id,
+        inputs: &ins,
+        outputs: &outs,
+        site_bytes: 0,
+        guard: None,
+    }];
+    let mode = ExecMode::BarClose;
+    let mut h = Harness::build(&Script {
+        calls: &calls,
+        mode,
+        dialect: Dialect::V6,
+        intent_cap: 0,
+        chart: CHART,
+    });
+    let o = h.step_bar(&bar(0, 1.0, barflag::CONFIRMED), &mut TestCtx::default());
+    assert_eq!(o, StepOutcome::Ok);
+    h.out(0, 0)
 }
 
 fn same(a: f64, b: f64) -> bool {
@@ -172,5 +115,118 @@ fn math_unary_rows_follow_f64_and_propagate_na() {
     );
     assert!(call(ov::MATH_AVG, &[V::F(1.0), V::F(f64::NAN)], false).is_nan());
     assert_eq!(call(ov::MATH_ABS_I, &[V::I(Some(-5))], true), 5.0);
-    assert!(call(ov::MATH_ABS_I, &[V::I(Some(i64::MIN))], true).is_nan());
+    // `i64::wrapping_abs` (§4.13.1): MIN stays MIN.
+    assert_eq!(
+        call(ov::MATH_ABS_I, &[V::I(Some(i64::MIN))], true),
+        i64::MIN as f64
+    );
+}
+
+fn dialect_reads(sw: pine_spec::Sw) -> u8 {
+    pine_spec::sw(sw, Dialect::V6)
+}
+
+#[test]
+fn round_ties_switch() {
+    let half_up = dialect_reads(pine_spec::Sw::RoundTies) == pine_spec::swr::ROUND_TIES_HALF_UP;
+    let r = |x: f64| call(ov::MATH_ROUND_I, &[V::F(x)], true);
+    assert_eq!(r(2.5), 3.0);
+    assert_eq!(r(-2.5), if half_up { -2.0 } else { -3.0 });
+    assert_eq!(
+        r(0.499_999_999_999_999_94),
+        0.0,
+        "no x + 0.5 double rounding"
+    );
+    assert_eq!(r(-0.4), 0.0);
+    assert_eq!(r(1e15 + 0.5), 1e15 + 1.0);
+    assert!(r(f64::NAN).is_nan() && r(f64::INFINITY).is_nan() && r(1e19).is_nan());
+}
+
+#[test]
+fn round_to_mintick_is_integer_exact() {
+    // CHART: mintick 0.01.
+    let m = |x: f64| call(ov::MATH_ROUND_TO_MINTICK, &[V::F(x)], false);
+    assert_eq!(m(1.234), 1.23);
+    assert_eq!(m(1.236), 1.24);
+    assert_eq!(m(100.005), 100.01);
+    assert_eq!(m(-0.004), 0.0);
+    assert!(m(f64::NAN).is_nan() && m(f64::INFINITY).is_nan());
+}
+
+#[test]
+fn int_strict_faults_invalid_cast() {
+    assert_eq!(call(ov::OP_INT_STRICT, &[V::F(-3.9)], true), -3.0);
+    for x in [f64::NAN, f64::INFINITY, 9.3e18] {
+        let ins = [(Lane::F64, Src::Const(x.to_bits()))];
+        let calls = [Call {
+            ov: ov::OP_INT_STRICT,
+            inputs: &ins,
+            outputs: &[Lane::I64],
+            site_bytes: 0,
+            guard: None,
+        }];
+        let mode = ExecMode::BarClose;
+        let mut h = Harness::build(&Script {
+            calls: &calls,
+            mode,
+            dialect: Dialect::V6,
+            intent_cap: 0,
+            chart: CHART,
+        });
+        let o = h.step_bar(&bar(0, 1.0, barflag::CONFIRMED), &mut TestCtx::default());
+        assert_ne!(o, StepOutcome::Ok);
+        assert_eq!(
+            h.last_fault().map(|f| f.0),
+            Some(FaultKind::InvalidCast),
+            "{x}"
+        );
+    }
+}
+
+#[test]
+fn pow_nonfinite_follows_float_div_zero() {
+    let na = dialect_reads(pine_spec::Sw::FloatDivZero) == pine_spec::swr::FLOAT_DIV_ZERO_NA;
+    let r = call(ov::MATH_POW, &[V::F(0.0), V::F(-1.0)], false);
+    assert_eq!(r.is_nan(), na);
+    if !na {
+        assert_eq!(r, f64::INFINITY);
+    }
+}
+
+#[test]
+fn color_rows_pack_and_unpack() {
+    let c = pine_ir::color::pack(10, 20, 30, 40);
+    assert_eq!(call(ov::COLOR_R, &[V::I(Some(c))], false), 10.0);
+    assert_eq!(call(ov::COLOR_G, &[V::I(Some(c))], false), 20.0);
+    assert_eq!(call(ov::COLOR_B, &[V::I(Some(c))], false), 30.0);
+    assert_eq!(call(ov::COLOR_T, &[V::I(Some(c))], false), 40.0);
+    assert!(call(ov::COLOR_R, &[V::I(None)], false).is_nan());
+    let n = call(ov::COLOR_NEW, &[V::I(Some(c)), V::F(70.4)], true) as i64;
+    assert_eq!(n, pine_ir::color::pack(10, 20, 30, 70));
+    let rgb = call(
+        ov::COLOR_RGB,
+        &[V::F(300.0), V::F(-5.0), V::F(127.5), V::F(0.0)],
+        true,
+    ) as i64;
+    assert_eq!(rgb, pine_ir::color::pack(255, 0, 128, 0));
+    let (lo, hi) = (
+        pine_ir::color::pack(0, 0, 0, 0),
+        pine_ir::color::pack(200, 100, 50, 100),
+    );
+    let g = |v: f64| {
+        call(
+            ov::COLOR_FROM_GRADIENT,
+            &[
+                V::F(v),
+                V::F(0.0),
+                V::F(10.0),
+                V::I(Some(lo)),
+                V::I(Some(hi)),
+            ],
+            true,
+        ) as i64
+    };
+    assert_eq!(g(5.0), pine_ir::color::pack(100, 50, 25, 50));
+    assert_eq!(g(-3.0), lo);
+    assert_eq!(g(30.0), hi);
 }

@@ -246,17 +246,36 @@ fn zone(d: &[u8]) -> (i32, Vec<(i64, i32)>) {
     (base, dedup)
 }
 
+/// The tzdata release of `dir`: `+VERSION` (macOS) or the `# version` line of `tzdata.zi`
+/// (Linux tzdata). A directory without either is refused: the table must name its source.
+fn tz_version(dir: &str) -> (String, String) {
+    let plus = format!("{dir}/+VERSION");
+    if let Ok(v) = std::fs::read_to_string(&plus) {
+        return (v.trim().to_string(), plus);
+    }
+    let zi = format!("{dir}/tzdata.zi");
+    if let Ok(t) = std::fs::read_to_string(&zi) {
+        if let Some(v) = t.lines().next().and_then(|l| l.strip_prefix("# version ")) {
+            return (v.trim().to_string(), zi);
+        }
+    }
+    panic!("{dir}: no +VERSION or tzdata.zi '# version' line; cannot name the tzdata release");
+}
+
 fn main() {
     let dir = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "/usr/share/zoneinfo".to_string());
+    let (version, from) = tz_version(&dir);
     let mut s = String::new();
     s.push_str("// SPDX-License-Identifier: Apache-2.0\n// Copyright 2026 Anton (darkcite)\n\n");
     s.push_str("//! **Generated** by `gen-tz` from TZif files — do not edit (impl-04 §4.12).\n");
     s.push_str(
         "//! Transitions 2000-01-01 … 2040-01-01 (UTC seconds); the first and last offsets\n",
     );
-    s.push_str("//! hold outside. Input list (name ← file):\n");
+    s.push_str("//! hold outside.\n");
+    let _ = writeln!(s, "//! Source: TZif files under `{dir}`, tzdata release `{version}`\n//! (read from `{from}`).");
+    s.push_str("//! Input list (name ← file):\n");
     for (n, f) in ZONES {
         let _ = writeln!(s, "//! - `{n}` ← `{f}`");
     }

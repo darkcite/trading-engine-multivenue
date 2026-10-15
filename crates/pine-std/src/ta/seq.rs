@@ -6,7 +6,9 @@
 
 use crate::args::out1;
 use crate::state::{seq_push_back, Prev, Seq};
+use crate::sw;
 use pine_ir::{FaultKind, SiteId, NA_I64};
+use pine_spec::{swr, Sw};
 use pine_vm::Frame;
 
 const OVER: u8 = 1;
@@ -114,5 +116,36 @@ pub fn bi_change_b(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), 
     };
     let r = matches!(old, Some(o) if o != NA_I64 && code != NA_I64 && o != code);
     f.set_bool_arg(dst, r);
+    Ok(())
+}
+
+const DIV0: [u8; 2] = sw::both(Sw::FloatDivZero);
+
+/// `ta.roc(source, length)`: `100 × (src − src[len]) / src[len]` over the site's ring; a
+/// non-finite quotient (÷0) is na under `Sw::FloatDivZero = na`, IEEE otherwise.
+pub fn bi_roc(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    let src = f.f64_arg(args[0]);
+    let dst = out1(args)?;
+    let Some(k) = lag(f, args)? else {
+        f.set_f64_arg(dst, f64::NAN);
+        return Ok(());
+    };
+    let na_nonfinite = sw::pick(DIV0, f.dialect()) == swr::FLOAT_DIV_ZERO_NA;
+    let old = {
+        let (h, ring) = f.state_split::<Seq, f64>(site);
+        if k as usize >= ring.len() {
+            return Err(FaultKind::ScriptRefused);
+        }
+        seq_push_back(h, ring, src, k)
+    };
+    let r = old.map_or(f64::NAN, |o| 100.0 * (src - o) / o);
+    f.set_f64_arg(
+        dst,
+        if na_nonfinite && r.is_infinite() {
+            f64::NAN
+        } else {
+            r
+        },
+    );
     Ok(())
 }

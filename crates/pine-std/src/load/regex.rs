@@ -6,8 +6,9 @@
 //!
 //! Subset: literals, `.`, `\d \D \w \W \s \S`, classes `[a-z…]` / `[^…]`, anchors `^ $`, groups
 //! `( )` (group 0 only), alternation `|`, quantifiers `* + ?` and `{m}`, `{m,}`, `{m,n}` with
-//! `m, n ≤ 32`. No backreferences, lookaround, lazy or possessive quantifiers. Matching is over
-//! bytes (`.` and a negated class consume one byte; `.` does not match `\n`).
+//! `m, n ≤ 32`. No backreferences, lookaround, lazy or possessive quantifiers. `.` matches one
+//! UTF-8 code point except `\n` (`pin:04-regex-dot`), compiled to a byte automaton; classes and
+//! the predefined escapes match single bytes.
 
 use super::{code, err, LoadErr};
 
@@ -20,7 +21,6 @@ const MAX_REPEAT: u32 = 32;
 const INF: u8 = u8::MAX;
 
 const OP_CHAR: u8 = 0;
-const OP_ANY: u8 = 1;
 const OP_CLASS: u8 = 2;
 const OP_SPLIT: u8 = 3;
 const OP_JMP: u8 = 4;
@@ -79,6 +79,9 @@ struct Parser<'p> {
     nodes: [Node; MAX_NODES],
     n: usize,
     prog: RegexProg,
+    /// Class indices of `.`'s automaton (ASCII but `\n`, 2-, 3-, 4-byte leads, continuation),
+    /// allocated at the first `.`.
+    dot: Option<[u8; 5]>,
 }
 
 const fn refuse(at: usize, why: &'static str) -> LoadErr {
@@ -384,7 +387,7 @@ impl Parser<'_> {
         let nd = self.nodes[id as usize];
         match nd.kind {
             K_CHAR => self.emit(OP_CHAR, nd.a, 0, 0).map(drop),
-            K_ANY => self.emit(OP_ANY, 0, 0, 0).map(drop),
+            K_ANY => self.gen_dot(),
             K_CLASS => self.emit(OP_CLASS, nd.a, 0, 0).map(drop),
             K_BOL => self.emit(OP_BOL, 0, 0, 0).map(drop),
             K_EOL => self.emit(OP_EOL, 0, 0, 0).map(drop),
@@ -405,6 +408,68 @@ impl Parser<'_> {
             }
             _ => self.gen_rep(nd),
         }
+    }
+
+    /// `.` as a UTF-8 automaton: `[^\n\x80-\xFF] | lead2 cont | lead3 cont cont |
+    /// lead4 cont cont cont`, alternatives in that priority order.
+    fn gen_dot(&mut self) -> Result<(), LoadErr> {
+        let k = match self.dot {
+            Some(k) => k,
+            None => {
+                let mut k = [0u8; 5];
+                let ranges: [(u8, u8); 5] = [
+                    (0x00, 0x7F),
+                    (0xC2, 0xDF),
+                    (0xE0, 0xEF),
+                    (0xF0, 0xF4),
+                    (0x80, 0xBF),
+                ];
+                let mut r = 0usize;
+                while r < 5 {
+                    let mut set = [0u64; 4];
+                    let mut c = ranges[r].0 as u16;
+                    while c <= ranges[r].1 as u16 {
+                        if c != b'\n' as u16 {
+                            class_set(&mut set, c as u8);
+                        }
+                        c += 1;
+                    }
+                    k[r] = self.new_class(set)?;
+                    r += 1;
+                }
+                self.dot = Some(k);
+                k
+            }
+        };
+        let mut jmps = [0u16; 3];
+        let mut b = 0usize;
+        while b < 4 {
+            let sp = if b < 3 {
+                let sp = self.emit(OP_SPLIT, 0, 0, 0)?;
+                self.prog.insts[sp as usize].x = sp + 1;
+                Some(sp)
+            } else {
+                None
+            };
+            self.emit(OP_CLASS, k[b], 0, 0)?;
+            let mut c = 0usize;
+            while c < b {
+                self.emit(OP_CLASS, k[4], 0, 0)?;
+                c += 1;
+            }
+            if let Some(sp) = sp {
+                jmps[b] = self.emit(OP_JMP, 0, 0, 0)?;
+                self.prog.insts[sp as usize].y = self.prog.n;
+            }
+            b += 1;
+        }
+        let end = self.prog.n;
+        let mut j = 0usize;
+        while j < 3 {
+            self.prog.insts[jmps[j] as usize].x = end;
+            j += 1;
+        }
+        Ok(())
     }
 
     fn gen_rep(&mut self, nd: Node) -> Result<(), LoadErr> {
@@ -456,6 +521,7 @@ pub fn regex_compile(pat: &[u8]) -> Result<RegexProg, LoadErr> {
             n_classes: 0,
             _pad: 0,
         },
+        dot: None,
     };
     let root = p.alt(0)?;
     if p.i != pat.len() {
@@ -564,7 +630,6 @@ impl RegexProg {
                         break;
                     }
                     (OP_CHAR, Some(&c)) => c == i.a,
-                    (OP_ANY, Some(&c)) => c != b'\n',
                     (OP_CLASS, Some(&c)) => class_has(&self.classes[i.a as usize], c),
                     _ => false,
                 };

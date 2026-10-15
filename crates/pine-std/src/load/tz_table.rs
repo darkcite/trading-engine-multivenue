@@ -3,7 +3,10 @@
 
 //! **Generated** by `gen-tz` from TZif files — do not edit (impl-04 §4.12).
 //! Transitions 2000-01-01 … 2040-01-01 (UTC seconds); the first and last offsets
-//! hold outside. Input list (name ← file):
+//! hold outside.
+//! Source: TZif files under `/usr/share/zoneinfo`, tzdata release `2026c`
+//! (read from `/usr/share/zoneinfo/tzdata.zi`).
+//! Input list (name ← file):
 //! - `UTC` ← `UTC`
 //! - `Etc/UTC` ← `Etc/UTC`
 //! - `GMT` ← `GMT`

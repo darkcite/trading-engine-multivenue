@@ -15,13 +15,13 @@ pine-spec = { workspace = true }
 core-time = { workspace = true }
 
 [features]
-testing = []              # exposes pine_std::testing to crates/bench
+testing = ["pine-vm/testkit"]   # exposes pine_std::testing to crates/bench
 avx2    = []              # x86_64 AVX2+FMA kernel twins in src/simd.rs; off until an x86_64 gate host exists
 
 [dev-dependencies]
 proptest = { workspace = true }
-# Body tests drive bodies through pine-vm's own verify + VmInstance (impl-04 §7.1).
-pine-vm  = { workspace = true, features = ["testkit"] }
+# Body tests use pine_std::testing (impl-04 §7.1).
+pine-std = { path = ".", features = ["testing"] }
 
 [[bin]]
 name = "scope-ledger"

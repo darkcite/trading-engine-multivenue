@@ -24,6 +24,8 @@ mod ta;
 mod table;
 
 pub mod scope;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 pub use load::{
     code, fmt_compile, regex_compile, resolve_input, session_parse, tf_on_bar_clock, tf_parts,

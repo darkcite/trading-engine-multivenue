@@ -53,6 +53,12 @@ fn back(h: &WinHdr, cap: u32, k: u32) -> u32 {
     }
 }
 
+/// The value accepted `k` values ago (`k = 0`: the newest); `k < min(n, ring.len())`.
+#[inline(always)]
+pub fn win_at(h: &WinHdr, ring: &[f64], k: u32) -> f64 {
+    at(ring, back(h, ring.len() as u32, k))
+}
+
 /// Recompute `sum`, `sum2`, `na_in` exactly over the newest `len` accepted values and make `len`
 /// the window (cold start or a `series` length change). `1 ≤ len ≤ ring.len()`.
 pub fn win_repoint(h: &mut WinHdr, ring: &[f64], len: u32) {
@@ -267,7 +273,7 @@ const _: () =
 unsafe impl pine_vm::Pod for MonoCell {}
 
 /// Accept the non-na `v` into the deque: drop dominated cells from the back (`MAX`: `≤ v`;
-/// else `≥ v`, so the newest of equal values wins), append, evict cells older than the tail.
+/// else `≥ v`, so the newest of equal values wins, `pin:04-extreme-tie`), append, evict cells older than the tail.
 pub fn mono_push<const MAX: bool>(h: &mut MonoHdr, q: &mut [MonoCell], v: f64) {
     let cap = q.len() as u32;
     debug_assert!(cap > 0 && h.count <= cap && h.front < cap);
@@ -350,3 +356,54 @@ const _: () =
     assert!(core::mem::size_of::<MacdHdr>() == 72 && core::mem::align_of::<MacdHdr>() == 8);
 // SAFETY: repr(C) of cold-at-zero blocks; all-zero is every part cold.
 unsafe impl StateBlock for MacdHdr {}
+
+/// `math.random`'s generator state (splitmix64).
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct Rng64 {
+    /// The splitmix64 state.
+    pub s: u64,
+    /// 0 = not yet seeded.
+    pub seeded: u32,
+    /// Always zero.
+    pub _pad: u32,
+}
+const _: () = assert!(core::mem::size_of::<Rng64>() == 16 && core::mem::align_of::<Rng64>() == 8);
+// SAFETY: repr(C) POD; all-zero is `seeded == 0`: never executed.
+unsafe impl StateBlock for Rng64 {}
+
+/// `ta.kc`/`ta.kcw`'s block: the true range's previous close, the basis and band smoothers.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct KcHdr {
+    /// `tr`'s previous close.
+    pub prev: Prev,
+    /// `ema(src, len)`.
+    pub mid: Ewma,
+    /// `ema` or `rma` of the span (`Sw::KcBasis`).
+    pub band: Ewma,
+}
+const _: () = assert!(core::mem::size_of::<KcHdr>() == 64 && core::mem::align_of::<KcHdr>() == 8);
+// SAFETY: repr(C) of cold-at-zero blocks; all-zero is every part cold.
+unsafe impl StateBlock for KcHdr {}
+
+/// `ta.supertrend`'s block: the ATR, the final bands, the previous close and direction.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct StHdr {
+    /// `ta.atr(atrPeriod)`.
+    pub atr: AtrHdr,
+    /// The previous final upper band (0 = `nz(na)`, the cold value).
+    pub up: f64,
+    /// The previous final lower band.
+    pub dn: f64,
+    /// The previous close.
+    pub close1: f64,
+    /// The previous direction (1 or −1; 0 before the first execution).
+    pub dir: i32,
+    /// 0 = never executed.
+    pub primed: u32,
+}
+const _: () = assert!(core::mem::size_of::<StHdr>() == 72 && core::mem::align_of::<StHdr>() == 8);
+// SAFETY: repr(C) POD; all-zero is `primed == 0` with zeroed (= `nz`) bands: never executed.
+unsafe impl StateBlock for StHdr {}

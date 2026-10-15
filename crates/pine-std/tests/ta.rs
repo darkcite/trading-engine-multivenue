@@ -2,94 +2,56 @@
 // Copyright 2026 Anton (darkcite)
 
 //! impl-04 §7.7 — `ta.sma`, `ta.ema`, `ta.rma` (T15): brute-force agreement, Wilder vs EMA, I4
-//! (zero is cold) and I5 (ticks never advance builtin state), through `verify` + `VmInstance`.
+//! (zero is cold) and I5 (ticks never advance builtin state), through `pine_std::testing`.
 //!
 //! COPY-DOCTRINE: test support, may allocate.
 
 use pine_ir::*;
 use pine_spec::{ov, swr, Sw, OVERLOADS};
-use pine_std::BUILTINS;
-use pine_vm::testkit::*;
-use pine_vm::*;
+use pine_std::testing::{Call, Harness, Script, Src, TestCtx, CHART, CLOSE};
+use pine_vm::testkit::bar;
 
-fn probe(fr: &mut Frame<'_>, _: SiteId, a: &[u16]) -> Result<(), FaultKind> {
-    let mut k = 0usize;
-    while k < a.len() {
-        let v = if argwin::is_i64(a[k]) {
-            fr.i64_arg(a[k]).map_or(f64::NAN, |x| x as f64)
-        } else {
-            fr.f64_arg(a[k])
-        };
-        fr.plot_set(k as u32, v);
-        k += 1;
-    }
-    Ok(())
-}
-
-fn table() -> &'static BuiltinTable {
-    let mut v: Vec<BuiltinEntry> = BUILTINS.entries.to_vec();
-    v.push(BuiltinEntry {
-        f: probe,
-        cost: 1,
-        n_out: 0,
-        flags: bf::CAPTURE,
-        state_bytes_min: 0,
-    });
-    let entries: &'static [BuiltinEntry] = Box::leak(v.into_boxed_slice());
-    Box::leak(Box::new(BuiltinTable {
-        spec_sha256: pine_spec::SPEC_SHA256,
-        entries,
-    }))
-}
-
-/// `id(close, len)` plotted every bar; `ticks` forming-bar re-evaluations before each confirm.
+/// `id(close, len)` captured every bar; `ticks` forming-bar re-evaluations before each confirm.
 fn run(id: OverloadId, len: i64, closes: &[f64], ticks: u32, reset_at: Option<usize>) -> Vec<f64> {
     let mode = if ticks > 0 {
         ExecMode::Realtime
     } else {
         ExecMode::BarClose
     };
-    let mut t = Tb::new(mode, 2, 2, 0, 0);
-    t.spec = pine_spec::SPEC_SHA256;
-    t.n_plots = 1;
     let bytes = OVERLOADS[id.0 as usize].state.block_bytes(len as u32);
-    let site = t.state(StateKind::Builtin, bytes);
-    let (fo, il) = (t.f(0), t.i(0));
-    let k = t.k(len as u64);
-    t.emit(op::I_CONST, flg::VLD, il, k, 0);
-    let w = t.win(&[argwin::f64(abi::F_CLOSE), argwin::i64(il), argwin::f64(fo)]);
-    t.emit(op::CALL_BUILTIN, 0, site, id.0, w);
-    let wp = t.win(&[argwin::f64(fo)]);
-    t.emit(
-        op::CALL_BUILTIN,
-        0,
-        SiteId::NONE.0,
-        pine_spec::OVERLOAD_COUNT as u16,
-        wp,
-    );
-    t.emit(op::HALT, 0, 0, 0, 0);
-    let p = t.build();
-    let v = verify(&p, table()).expect("verifies");
-    let mut ar = Arena::new(p.layout.total_bytes as usize);
-    let mut ctx = Ctx { now: 0 };
-    let mut vm = VmInstance::new(v, ar.slice());
+    let ins = [CLOSE, (Lane::I64, Src::Const(len as u64))];
+    let calls = [Call {
+        ov: id,
+        inputs: &ins,
+        outputs: &[Lane::F64],
+        site_bytes: bytes,
+        guard: None,
+    }];
+    let mut h = Harness::build(&Script {
+        calls: &calls,
+        mode,
+        dialect: Dialect::V6,
+        intent_cap: 0,
+        chart: CHART,
+    });
+    let mut ctx = TestCtx::default();
     let mut out = Vec::new();
     for (i, &c) in closes.iter().enumerate() {
         if reset_at == Some(i) {
-            vm.reset();
+            h.reset();
             out.clear();
         }
         let mut j = 0;
         while j < ticks {
             let tick = bar(i as u32, c * (1.5 + j as f64), barflag::REALTIME);
-            assert_eq!(vm.step_tick(&tick, &mut ctx), StepOutcome::Ok);
+            assert_eq!(h.step_tick(&tick, &mut ctx), StepOutcome::Ok);
             j += 1;
         }
         assert_eq!(
-            vm.step_bar(&bar(i as u32, c, barflag::CONFIRMED), &mut ctx),
+            h.step_bar(&bar(i as u32, c, barflag::CONFIRMED), &mut ctx),
             StepOutcome::Ok
         );
-        out.push(vm.plots()[0]);
+        out.push(h.out(0, 0));
     }
     out
 }
@@ -213,23 +175,25 @@ fn ticks_never_advance_builtin_state() {
 #[test]
 fn ta_length_out_of_range_refuses() {
     // Length 0 faults ScriptRefused (pin:04-ta-reference) instead of a silent na.
-    let c = tape(3);
-    let mut t = Tb::new(ExecMode::BarClose, 2, 2, 0, 0);
-    t.spec = pine_spec::SPEC_SHA256;
-    let site = t.state(StateKind::Builtin, 24);
-    let (fo, il) = (t.f(0), t.i(0));
-    let k = t.k(0);
-    t.emit(op::I_CONST, flg::VLD, il, k, 0);
-    let w = t.win(&[argwin::f64(abi::F_CLOSE), argwin::i64(il), argwin::f64(fo)]);
-    t.emit(op::CALL_BUILTIN, 0, site, ov::TA_EMA.0, w);
-    t.emit(op::HALT, 0, 0, 0, 0);
-    let p = t.build();
-    let v = verify(&p, table()).expect("verifies");
-    let mut ar = Arena::new(p.layout.total_bytes as usize);
-    let mut vm = VmInstance::new(v, ar.slice());
-    let o = vm.step_bar(&bar(0, c[0], barflag::CONFIRMED), &mut Ctx { now: 0 });
+    let ins = [CLOSE, (Lane::I64, Src::Const(0))];
+    let calls = [Call {
+        ov: ov::TA_EMA,
+        inputs: &ins,
+        outputs: &[Lane::F64],
+        site_bytes: 24,
+        guard: None,
+    }];
+    let mode = ExecMode::BarClose;
+    let mut h = Harness::build(&Script {
+        calls: &calls,
+        mode,
+        dialect: Dialect::V6,
+        intent_cap: 0,
+        chart: CHART,
+    });
+    let o = h.step_bar(&bar(0, 100.0, barflag::CONFIRMED), &mut TestCtx::default());
     assert_ne!(o, StepOutcome::Ok);
-    assert_eq!(vm.last_fault().map(|f| f.0), Some(FaultKind::ScriptRefused));
+    assert_eq!(h.last_fault().map(|f| f.0), Some(FaultKind::ScriptRefused));
 }
 
 #[derive(Clone, Copy)]
@@ -244,8 +208,7 @@ enum In {
 fn run_g(id: OverloadId, ins: &[In], len: u32, bars: &[(f64, f64, f64)]) -> Vec<f64> {
     run_o(id, ins, len, bars, false)
 }
-
-/// As `run_g`; `out_i64` puts the output in the i64 lane (bool/int results, plotted 0/1/value).
+/// As `run_g`; `out_i64` puts the output in the i64 lane (bool/int results).
 fn run_o(
     id: OverloadId,
     ins: &[In],
@@ -253,68 +216,41 @@ fn run_o(
     bars: &[(f64, f64, f64)],
     out_i64: bool,
 ) -> Vec<f64> {
-    let mut t = Tb::new(ExecMode::BarClose, 2, 4, 0, 0);
-    t.spec = pine_spec::SPEC_SHA256;
-    t.n_plots = 1;
+    let inputs: Vec<(Lane, Src)> = ins
+        .iter()
+        .map(|x| match *x {
+            In::Close => CLOSE,
+            In::F(v) => (Lane::F64, Src::Const(v.to_bits())),
+            In::Int(v) => (Lane::I64, Src::Const(v as u64)),
+            In::Bool(b) => (Lane::I64, Src::Const(b as u64)),
+        })
+        .collect();
+    let lane = if out_i64 { Lane::I64 } else { Lane::F64 };
     let bytes = OVERLOADS[id.0 as usize].state.block_bytes(len);
-    let site = t.state(StateKind::Builtin, bytes);
-    let fo = t.f(0);
-    let mut win = Vec::new();
-    let mut ni = 0u32;
-    for x in ins {
-        match *x {
-            In::Close => win.push(argwin::f64(abi::F_CLOSE)),
-            In::F(x) => {
-                let s = t.f(1);
-                let k = t.kf(x);
-                t.emit(op::F_CONST, 0, s, k, 0);
-                win.push(argwin::f64(s));
-            }
-            In::Int(v) => {
-                let s = t.i(ni);
-                ni += 1;
-                let k = t.k(v as u64);
-                t.emit(op::I_CONST, flg::VLD, s, k, 0);
-                win.push(argwin::i64(s));
-            }
-            In::Bool(b) => {
-                let s = t.i(ni);
-                ni += 1;
-                let k = t.k(b as u64);
-                t.emit(op::I_CONST, flg::VLD, s, k, 0);
-                win.push(argwin::i64(s));
-            }
-        }
-    }
-    let out = if out_i64 {
-        argwin::i64(t.i(3))
-    } else {
-        argwin::f64(fo)
-    };
-    win.push(out);
-    let w = t.win(&win);
-    t.emit(op::CALL_BUILTIN, 0, site, id.0, w);
-    let wp = t.win(&[out]);
-    t.emit(
-        op::CALL_BUILTIN,
-        0,
-        SiteId::NONE.0,
-        pine_spec::OVERLOAD_COUNT as u16,
-        wp,
-    );
-    t.emit(op::HALT, 0, 0, 0, 0);
-    let p = t.build();
-    let v = verify(&p, table()).expect("verifies");
-    let mut ar = Arena::new(p.layout.total_bytes as usize);
-    let mut ctx = Ctx { now: 0 };
-    let mut vm = VmInstance::new(v, ar.slice());
+    let outs = [lane];
+    let calls = [Call {
+        ov: id,
+        inputs: &inputs,
+        outputs: &outs,
+        site_bytes: bytes,
+        guard: None,
+    }];
+    let mode = ExecMode::BarClose;
+    let mut h = Harness::build(&Script {
+        calls: &calls,
+        mode,
+        dialect: Dialect::V6,
+        intent_cap: 0,
+        chart: CHART,
+    });
+    let mut ctx = TestCtx::default();
     let mut out = Vec::new();
-    for (i, &(h, l, c)) in bars.iter().enumerate() {
+    for (i, &(hi, lo, c)) in bars.iter().enumerate() {
         let mut b = bar(i as u32, c, barflag::CONFIRMED);
-        b.high_1e6 = scale::to_1e6(h).unwrap();
-        b.low_1e6 = scale::to_1e6(l).unwrap();
-        assert_eq!(vm.step_bar(&b, &mut ctx), StepOutcome::Ok);
-        out.push(vm.plots()[0]);
+        b.high_1e6 = scale::to_1e6(hi).unwrap();
+        b.low_1e6 = scale::to_1e6(lo).unwrap();
+        assert_eq!(h.step_bar(&b, &mut ctx), StepOutcome::Ok);
+        out.push(h.out(0, 0));
     }
     out
 }
@@ -501,62 +437,36 @@ fn ta_highest_lowest_equal_bruteforce() {
         }
     }
 }
-
-/// A 3-output row over `[close, ints…, floats…]` → `(o0, o1, o2)` per bar; outputs prefilled with
-/// a sentinel so an unwritten output shows.
+/// A 3-output row over `[close, ints…, floats…]` → `(o0, o1, o2)` per bar.
 fn run3(id: OverloadId, ints: &[i64], fl: &[f64], len: u32, c: &[f64]) -> Vec<[f64; 3]> {
-    let mut t = Tb::new(ExecMode::BarClose, 8, 4, 0, 0);
-    t.spec = pine_spec::SPEC_SHA256;
-    t.n_plots = 3;
+    let mut inputs = vec![CLOSE];
+    inputs.extend(ints.iter().map(|&v| (Lane::I64, Src::Const(v as u64))));
+    inputs.extend(fl.iter().map(|&v| (Lane::F64, Src::Const(v.to_bits()))));
     let bytes = OVERLOADS[id.0 as usize].state.block_bytes(len);
-    let site = t.state(StateKind::Builtin, bytes);
-    let mut win = vec![argwin::f64(abi::F_CLOSE)];
-    for (k, &v) in ints.iter().enumerate() {
-        let s = t.i(k as u32);
-        let kk = t.k(v as u64);
-        t.emit(op::I_CONST, flg::VLD, s, kk, 0);
-        win.push(argwin::i64(s));
-    }
-    for (k, &v) in fl.iter().enumerate() {
-        let s = t.f(k as u32);
-        let kk = t.kf(v);
-        t.emit(op::F_CONST, 0, s, kk, 0);
-        win.push(argwin::f64(s));
-    }
-    let outs = [
-        argwin::f64(t.f(5)),
-        argwin::f64(t.f(6)),
-        argwin::f64(t.f(7)),
-    ];
-    let ks = t.kf(-12345.0);
-    for o in outs {
-        t.emit(op::F_CONST, 0, o, ks, 0);
-    }
-    win.extend(outs);
-    let w = t.win(&win);
-    t.emit(op::CALL_BUILTIN, 0, site, id.0, w);
-    let wp = t.win(&outs);
-    t.emit(
-        op::CALL_BUILTIN,
-        0,
-        SiteId::NONE.0,
-        pine_spec::OVERLOAD_COUNT as u16,
-        wp,
-    );
-    t.emit(op::HALT, 0, 0, 0, 0);
-    let p = t.build();
-    let v = verify(&p, table()).expect("verifies");
-    let mut ar = Arena::new(p.layout.total_bytes as usize);
-    let mut ctx = Ctx { now: 0 };
-    let mut vm = VmInstance::new(v, ar.slice());
+    let outs = [Lane::F64; 3];
+    let calls = [Call {
+        ov: id,
+        inputs: &inputs,
+        outputs: &outs,
+        site_bytes: bytes,
+        guard: None,
+    }];
+    let mode = ExecMode::BarClose;
+    let mut h = Harness::build(&Script {
+        calls: &calls,
+        mode,
+        dialect: Dialect::V6,
+        intent_cap: 0,
+        chart: CHART,
+    });
+    let mut ctx = TestCtx::default();
     let mut out = Vec::new();
     for (i, &x) in c.iter().enumerate() {
         assert_eq!(
-            vm.step_bar(&bar(i as u32, x, barflag::CONFIRMED), &mut ctx),
+            h.step_bar(&bar(i as u32, x, barflag::CONFIRMED), &mut ctx),
             StepOutcome::Ok
         );
-        let p = vm.plots();
-        out.push([p[0], p[1], p[2]]);
+        out.push([h.out(0, 0), h.out(0, 1), h.out(0, 2)]);
     }
     out
 }
@@ -650,4 +560,242 @@ fn ta_rsi_matches_reference() {
     }
     let ticks = run(ov::TA_RSI, 14, &c, 2, None);
     assert!(bits_eq(&got, &ticks));
+}
+
+#[test]
+fn math_sum_fixnan_random_and_roc() {
+    let c = tape(200);
+    let b: Vec<(f64, f64, f64)> = c.iter().map(|&x| (x, x, x)).collect();
+    let sum = run_g(ov::MATH_SUM, &[In::Close, In::Int(5)], 5, &b);
+    for i in 4..c.len() {
+        assert!(
+            (sum[i] - c[i - 4..=i].iter().sum::<f64>()).abs() < 1e-9,
+            "sum {i}"
+        );
+    }
+    assert!(sum[3].is_nan());
+    let fx = run_g(ov::FIXNAN_F, &[In::Close], 0, &b);
+    assert_eq!(fx, c);
+    let fna = run_g(ov::FIXNAN_F, &[In::F(f64::NAN)], 0, &b);
+    assert!(fna.iter().all(|x| x.is_nan()));
+    let r1 = run_g(
+        ov::MATH_RANDOM,
+        &[In::F(-1.0), In::F(1.0), In::Int(42)],
+        0,
+        &b,
+    );
+    let r2 = run_g(
+        ov::MATH_RANDOM,
+        &[In::F(-1.0), In::F(1.0), In::Int(42)],
+        0,
+        &b,
+    );
+    assert!(bits_eq(&r1, &r2), "replayable");
+    assert!(r1.iter().all(|&x| (-1.0..1.0).contains(&x)));
+    assert!(r1.windows(2).any(|w| w[0] != w[1]));
+    let roc = run_g(ov::TA_ROC, &[In::Close, In::Int(3)], 3, &b);
+    for i in 3..c.len() {
+        let want = 100.0 * (c[i] - c[i - 3]) / c[i - 3];
+        assert!((roc[i] - want).abs() < 1e-9, "roc {i}");
+    }
+    assert!(roc[2].is_nan());
+}
+
+/// One call of `id` over HLC bars with explicit inputs, every output per bar; `ticks` forming-bar
+/// re-evaluations before each confirm.
+fn run_n(
+    id: OverloadId,
+    ins: &[(Lane, Src)],
+    outs: &[Lane],
+    bars: &[(f64, f64, f64)],
+    ticks: u32,
+) -> Vec<Vec<f64>> {
+    let mode = if ticks > 0 {
+        ExecMode::Realtime
+    } else {
+        ExecMode::BarClose
+    };
+    let bytes = OVERLOADS[id.0 as usize].state.block_bytes(0);
+    let calls = [Call {
+        ov: id,
+        inputs: ins,
+        outputs: outs,
+        site_bytes: bytes,
+        guard: None,
+    }];
+    let mut h = Harness::build(&Script {
+        calls: &calls,
+        mode,
+        dialect: Dialect::V6,
+        intent_cap: 0,
+        chart: CHART,
+    });
+    let mut ctx = TestCtx::default();
+    let mut out = Vec::new();
+    for (i, &(hi, lo, c)) in bars.iter().enumerate() {
+        let mk = |x: f64, fl: u32| {
+            let mut b = bar(i as u32, c * x, fl);
+            b.high_1e6 = scale::to_1e6(hi * x).unwrap();
+            b.low_1e6 = scale::to_1e6(lo * x).unwrap();
+            b
+        };
+        for j in 0..ticks {
+            assert_eq!(
+                h.step_tick(&mk(1.1 + j as f64 * 0.1, barflag::REALTIME), &mut ctx),
+                StepOutcome::Ok
+            );
+        }
+        assert_eq!(
+            h.step_bar(&mk(1.0, barflag::CONFIRMED), &mut ctx),
+            StepOutcome::Ok
+        );
+        out.push((0..outs.len()).map(|j| h.out(0, j)).collect());
+    }
+    out
+}
+
+fn fx(b: &[(f64, f64, f64)]) -> Vec<(f64, f64, f64)> {
+    let r = |x: f64| scale::from_1e6(scale::to_1e6(x).unwrap());
+    b.iter().map(|&(h, l, c)| (r(h), r(l), r(c))).collect()
+}
+
+#[test]
+fn kc_basis_switch_and_kcw() {
+    let b = fx(&hlc_tape(300));
+    let c: Vec<f64> = b.iter().map(|x| x.2).collect();
+    let d = Dialect::V6;
+    let ema_sma = pine_spec::sw(Sw::EmaSeed, d) == swr::EMA_SEED_SMA;
+    let rma = pine_spec::sw(Sw::KcBasis, d) == swr::KC_BASIS_RMA_RANGE;
+    let rma_sma = pine_spec::sw(Sw::RmaSeed, d) == swr::RMA_SEED_SMA;
+    let mid = smooth_ref(&c, 10, 2.0 / 11.0, ema_sma);
+    let span: Vec<f64> = b.iter().map(|x| x.0 - x.1).collect();
+    let band = if rma {
+        smooth_ref(&span, 10, 0.1, rma_sma)
+    } else {
+        smooth_ref(&span, 10, 2.0 / 11.0, ema_sma)
+    };
+    let ins = [
+        CLOSE,
+        (Lane::I64, Src::Const(10)),
+        (Lane::F64, Src::Const(1.5f64.to_bits())),
+        (Lane::I64, Src::Const(0)),
+    ];
+    let kc = run_n(ov::TA_KC, &ins, &[Lane::F64; 3], &b, 0);
+    let kcw = run_n(ov::TA_KCW, &ins, &[Lane::F64], &b, 0);
+    let ticks = run_n(ov::TA_KC, &ins, &[Lane::F64; 3], &b, 2);
+    for i in 0..b.len() {
+        let (m, u, l) = (
+            mid[i],
+            1.5f64.mul_add(band[i], mid[i]),
+            (-1.5f64).mul_add(band[i], mid[i]),
+        );
+        assert!(
+            close_eq(kc[i][0], m) && close_eq(kc[i][1], u) && close_eq(kc[i][2], l),
+            "kc {i}"
+        );
+        assert!(close_eq(kcw[i][0], (u - l) / m), "kcw {i}");
+        assert!(bits_eq(&kc[i], &ticks[i]), "I5 {i}");
+    }
+}
+
+#[test]
+fn ta_supertrend_is_stable_under_replay() {
+    let b = fx(&hlc_tape(400));
+    let ins = [
+        (Lane::F64, Src::Const(3.0f64.to_bits())),
+        (Lane::I64, Src::Const(10)),
+    ];
+    let a = run_n(ov::TA_SUPERTREND, &ins, &[Lane::F64, Lane::F64], &b, 0);
+    let t = run_n(ov::TA_SUPERTREND, &ins, &[Lane::F64, Lane::F64], &b, 3);
+    for i in 0..b.len() {
+        assert!(bits_eq(&a[i], &t[i]), "replay {i}");
+        assert!(a[i][1] == 1.0 || a[i][1] == -1.0, "dir {i}");
+    }
+    // A held direction keeps the close on its side of the line: −1 (lower band) needs
+    // `close >= line`, 1 (upper band) needs `close <= line`.
+    for i in 20..b.len() {
+        if a[i - 1][1] == a[i][1] {
+            if a[i][1] == -1.0 {
+                assert!(b[i].2 >= a[i][0], "{i}");
+            } else {
+                assert!(b[i].2 <= a[i][0], "{i}");
+            }
+        }
+    }
+    assert!(a.iter().any(|x| x[1] == -1.0) && a.iter().any(|x| x[1] == 1.0));
+}
+
+#[test]
+fn wma_and_swma_are_exact_weighted_sums() {
+    let c = tape(2500);
+    for len in [1usize, 4, 15] {
+        let got = run(ov::TA_WMA, len as i64, &c, 0, None);
+        let ticks = run(ov::TA_WMA, len as i64, &c, 2, None);
+        assert!(bits_eq(&got, &ticks), "I5 wma {len}");
+        let den = (len * (len + 1) / 2) as f64;
+        for i in 0..c.len() {
+            if i + 1 < len {
+                assert!(got[i].is_nan());
+                continue;
+            }
+            let want: f64 = (0..len).map(|k| c[i - k] * (len - k) as f64).sum::<f64>() / den;
+            assert!((got[i] - want).abs() < 1e-9, "wma {len} {i}");
+        }
+    }
+    let b: Vec<(f64, f64, f64)> = c.iter().map(|&x| (x, x, x)).collect();
+    let sw = run_g(ov::TA_SWMA, &[In::Close], 0, &b);
+    for i in 0..c.len() {
+        if i < 3 {
+            assert!(sw[i].is_nan());
+            continue;
+        }
+        let want = (c[i] + c[i - 3]) / 6.0 + (c[i - 1] + c[i - 2]) * (2.0 / 6.0);
+        assert!((sw[i] - want).abs() < 1e-9, "swma {i}");
+    }
+    let na = run_g(ov::TA_SWMA, &[In::F(f64::NAN)], 0, &b);
+    assert!(na.iter().all(|x| x.is_nan()));
+}
+
+#[test]
+fn linreg_and_bbw_match_bruteforce() {
+    let c = tape(800);
+    let b: Vec<(f64, f64, f64)> = c.iter().map(|&x| (x, x, x)).collect();
+    for (len, off) in [(1usize, 0i64), (10, 0), (10, 2)] {
+        let got = run_g(
+            ov::TA_LINREG,
+            &[In::Close, In::Int(len as i64), In::Int(off)],
+            len as u32,
+            &b,
+        );
+        for i in 0..c.len() {
+            if i + 1 < len {
+                assert!(got[i].is_nan());
+                continue;
+            }
+            let want = if len == 1 {
+                c[i]
+            } else {
+                let n = len as f64;
+                let pts: Vec<(f64, f64)> =
+                    (0..len).map(|k| ((len - 1 - k) as f64, c[i - k])).collect();
+                let mx = pts.iter().map(|p| p.0).sum::<f64>() / n;
+                let my = pts.iter().map(|p| p.1).sum::<f64>() / n;
+                let sxy: f64 = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+                let sxx: f64 = pts.iter().map(|p| (p.0 - mx) * (p.0 - mx)).sum();
+                let slope = sxy / sxx;
+                my - slope * mx + slope * (n - 1.0 - off as f64)
+            };
+            assert!(
+                (got[i] - want).abs() < 1e-6,
+                "linreg {len} {off} {i}: {} vs {want}",
+                got[i]
+            );
+        }
+    }
+    let bb = run3(ov::TA_BB, &[20], &[2.0], 20, &c);
+    let bbw = run_g(ov::TA_BBW, &[In::Close, In::Int(20), In::F(2.0)], 20, &b);
+    for i in 0..c.len() {
+        let want = (bb[i][1] - bb[i][2]) / bb[i][0];
+        assert!(close_eq(bbw[i], want), "bbw {i}");
+    }
 }

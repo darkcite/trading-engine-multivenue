@@ -388,7 +388,7 @@ pub fn fmt_compile(template: &[u8]) -> Result<FmtProg, LoadErr> {
                 i = c.placeholder(i)?;
                 from = i;
             }
-            b'}' if !q => return Err(bad(i, "unbalanced '}'")),
+            b'}' if !q => return Err(bad(i, "unbalanced '}'")), // pin:04-fmt-brace
             _ => i += 1,
         }
     }
