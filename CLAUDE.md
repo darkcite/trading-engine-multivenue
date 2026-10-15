@@ -201,19 +201,23 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   candles.db as 1 m capture bars, a candidate primary per `har_seed compare`.
 - **The HK housekeeping lane (risk-policy "HK", "HK, part 2").** HK1–HK10
   (2026-10-13) closed Section A of that day's survey; HK11–HK17 (2026-10-14)
-  Section B and the day's findings.
+  Section B and the day's findings; HK18–HK23 (2026-10-15) the follow-ups.
 - **The S3 archive (HK11, HK18, HK20).** Uploads are paced in 64 KiB pieces
   under `MULTIVENUE_S3_MAX_UPLOAD_MIBPS`, 20 MiB/s since HK20 (the link's
   ~5 MB/s binds; the feed delays stayed near their no-upload band). An
   uncapped push (8 MiB writes) stalled the feeds on 2026-10-14. A weekday's
   capture (6.0–6.4 GB stored) takes ~20 min; the nightly budget, 8400 s, is
-  a ceiling. A SIGTERM aborts the upload in flight. `push-derived` keys keep their path under the
-  store's root, and candles go up zstd'd.
+  a ceiling. A SIGTERM aborts the upload in flight, and is held across each
+  multipart initiate attempt so the abort can name it (HK21). The nightly
+  cycle first runs `abort-stale` (incomplete uploads over 24 h; `uploads`
+  lists them). `push-derived` keys keep their path under the store's root,
+  `--path` too, and candles go up zstd'd.
 - **Gates at HEAD (the HK lane's close, 2026-10-14):**
   - clippy clean.
   - nextest 4 652 passed (10 skipped: the five `#[ignore]`d live smokes,
-    four alloc child helpers and a fixture regenerator; one nextest `LEAK`
-    is a pass). Only the scrape hammer runs alone (`.config/nextest.toml`):
+    four alloc child helpers and a fixture regenerator). A random `LEAK` at
+    ~0.2 s under nextest < 0.9.145 on macOS is nextest's pipe race, not the
+    test (HK23). Only the scrape hammer runs alone (`.config/nextest.toml`):
     the alloc tests' reds under load were libtest's runner thread, no longer
     counted (A-S7-101, HK14). nextest runs no doctests: core-ring's
     `Mailbox` `compile_fail` doctest needs `cargo test --doc -p core-ring`.
@@ -235,9 +239,10 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   - **Disk:** 26 GiB free on 2026-10-14 after the worktree cleanup. Writers
     do not retry after ENOSPC; a restart is the recovery.
   - **S3:** bucket versioning and `AbortIncompleteMultipartUpload` are not
-    set; once set, that lifecycle rule is the only backstop for an upload
-    orphaned by a SIGTERM during its initiate POST (HK11). The `s3.env`
-    credential pair was once pasted in chat: rotate it.
+    set; the nightly `abort-stale` (HK21) now clears what a lost initiate
+    answer orphans, so the rule is a second backstop, not the only one. The
+    `s3.env` credential pair was once pasted in chat: rotate it.
+  - **nextest:** upgrade to ≥ 0.9.145 (0.9.143 installed; HK23).
   - **Polymarket parse errors** trickle at ~0.17 % of messages with no
     reconnects (420 in 243 658 over 08:34–10:46Z on 2026-10-14). Since HK19
     `strategy.conf`'s `RAW_TAP=pm` makes the wrapper pass `--raw-tap pm`

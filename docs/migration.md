@@ -6,6 +6,42 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-15 — S3 archiver: `uploads` / `abort-stale`; the cycle sweeps orphans; `--path` keys (HK21)
+
+**What changed**
+- New verbs `archive-run.py uploads [--prefix]` and `abort-stale
+  [--older-than-h 24] [--prefix]` (exit 1 when an upload's start does not
+  parse).
+- `scripts/archive-cycle.sh` runs `abort-stale` before `push-pending`
+  (non-fatal); the push's `--budget-s` is what is left of
+  `S3_CYCLE_BUDGET_S`, and none left exits 5.
+- `push-derived <kind> --path P` with P under the kind's root keys by the
+  path relative to it (was the basename).
+- `launchd/com.multivenue.archive.plist`: `ExitTimeOut` 60.
+
+**Impact**
+- Incomplete uploads over a day old are aborted nightly, each logged.
+- A SIGTERM delays an archiver's exit by at most ~30 s (one held initiate).
+
+**Migration steps**
+1. Re-render the archive agent ALONE (not `install-launchd.sh`, which
+   restarts the engine): `sed` the template's `@REPO@`/`@HOME@` into
+   `~/Library/LaunchAgents/com.multivenue.archive.plist`, then `launchctl
+   bootout` and `bootstrap` that label. Done on this Mac 2026-10-15.
+
+## 2026-10-15 — nextest ≥ 0.9.145 recommended (HK23)
+
+**What changed**
+- `.config/nextest.toml`: `nextest-version = { recommended = "0.9.145" }`.
+
+**Impact**
+- An older nextest prints a warning; on macOS it also reports random LEAKs
+  (a pipe race fixed in 0.9.145, risk-policy "HK23").
+
+**Migration steps**
+1. `cargo binstall cargo-nextest` (or install the checked binary under
+   `target/hk/leak/`).
+
 ## 2026-10-15 — S3 archiver: the upload cap's default 1 → 20 MiB/s (HK20)
 
 **What changed**

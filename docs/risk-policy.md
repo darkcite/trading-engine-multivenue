@@ -15965,3 +15965,109 @@ repeated roll (both arms; nothing armed today).
 - **Watch:** the 00:30Z check-in of 2026-10-16 reads the first night at 20.
   If the delays misbehave on the link's bad hours, lower the cap in
   `s3.env` (no code change).
+
+### HK21 — the archiver clears orphaned uploads; a SIGTERM during the initiate no longer orphans one (`claude-worker` objstore, archive; `scripts/archive-cycle.sh`; the archive plist), 2026-10-15
+
+- **Why.** The bucket has no `AbortIncompleteMultipartUpload` rule, and
+  HK11 left one window: a SIGTERM after the bucket made an upload but before
+  its id was in hand unwound with nothing to abort. Orphans were cleared by
+  a scratch script (`target/hk/s3_abort_orphans.py`).
+- **Verbs.** `archive-run.py uploads [--prefix]` lists incomplete multipart
+  uploads (`list_multipart`, following both markers). `abort-stale
+  [--older-than-h 24] [--prefix]` aborts those begun over a day ago — a push
+  in flight is younger, a night's cycle being ≤ 8400 s — and logs each
+  (`archive: aborted <key> initiated=<t>`). A start it cannot read (naive or
+  unparsable `Initiated`) is never judged: counted as `unparsed=`, exit 1, so
+  a provider format change cannot pass for "nothing stale". An abort is the
+  client's one DELETE verb and touches only parts that never completed
+  (S-LAW 11).
+- **The cycle.** `archive-cycle.sh` runs `abort-stale` before the push,
+  non-fatal. Its time comes out of `S3_CYCLE_BUDGET_S`: the push gets what is
+  left, and none left exits 5 (`--budget-s 0` would mean unbounded).
+  `${=NET_PREFIX}`: zsh never word-splits the plain form, so
+  `S3_NICE_NETWORK=1` would have run "taskpolicy -b" as one word, exit 127
+  (pre-existing; unset live, never hit).
+- **The SIGTERM hold.** `multipart_put` holds SIGTERM (blocked, not ignored)
+  across each initiate ATTEMPT: a failed attempt releases it before its
+  backoff; the answering one keeps it until the upload id is inside the
+  abort's try, where the held signal lands. The initiate, the abort and the
+  listing run on `CONTROL_TIMEOUT_S` = 15 s, so a stalled attempt delays a
+  stop by its connect plus its read, ≤ ~30 s. The first version held across
+  the whole retry loop — up to 6 × 900 s, past launchd's 20 s before SIGKILL;
+  the review caught it. `pthread_sigmask` runs a pending handler before it
+  returns, so `_hold_term` unblocks again if the handler raises out of the
+  blocking call itself. It holds on the main thread of a single-threaded
+  process (the archiver). An attempt whose answer was LOST made an upload no
+  one can name: `abort-stale` clears it the next night.
+- **launchd.** `ExitTimeOut` 60 in `launchd/com.multivenue.archive.plist`
+  (the engine's; the default is 20 s). The installed agent was re-rendered
+  and re-bootstrapped alone (backup `com.multivenue.archive.plist.bak-…-hk21`
+  in `~/Library/LaunchAgents`); `launchctl print` says `exit timeout = 60`.
+  Not through `install-launchd.sh`, which restarts the engine.
+- **`push-derived --path`.** A path under the kind's root is keyed by the
+  path relative to it, as the default run keys it; only the parent is
+  resolved, so a symlink keys by its own name.
+- **Tests.** The listing across pages (two uploads of one key, split by the
+  upload-id marker); the age sweep; unreadable starts; the held SIGTERM
+  reaching the abort; a failed attempt releasing before its backoff (no
+  sleep, one POST); the handler raising inside the blocking call; the control
+  timeouts; `--path` keys with symlinks both ways. A fixture restores the
+  mask and the handler (SIGTERM ignored meanwhile), so a regression cannot
+  leave SIGTERM blocked for later tests or kill the runner. Break-and-watch:
+  the two new SIGTERM tests fail on the whole-loop hold and on the unguarded
+  block. Worker suites (archive, config, agent, objstore, retention) 185
+  passed; ruff clean.
+- **Live.** `uploads`: 0 incomplete; `abort-stale`: aborted 0, kept 0,
+  unparsed 0. It runs nightly from 2026-10-15 21:30Z.
+
+### HK22 — one `l2Book` reader for the outcome battery and the H90 probe (`cli`), 2026-10-15
+
+- **Why.** Flagged when `xmm` merged: the H90 dust-test probe
+  (`hl_outcome_probe`) and the outcome battery each read Hyperliquid's REST
+  `l2Book` answer with a parser of their own.
+- **What.** `outcome_battery::book_of`, on the engine's own
+  `ingress_hyperliquid::parse_l2book_header`, is the one reader: `null` is no
+  book; anything not a book stated in range (price in (0, $1], size in
+  (0, 1e8 contracts], checked at 1e6 scale before the ×100) is an error,
+  never priced off. The probe's `touch_of` maps its `Top`; `null` keeps
+  "l2Book #<enc>: unreadable". The battery's hand scanner is gone.
+- **Narrowings, all fail-safe.** The probe refuses an out-of-range book and a
+  side whose best level is `null` or priced under 1e-6, which it read empty
+  (it skips that sample); the battery requires `time` and well-formed levels.
+  Under 0.01 a price past six decimals reads truncated, as the engine reads
+  it: `floor_tick` is unchanged; `ceil_tick` of such an ask can land a tick
+  low and a percentage step (`sale_px`, `under`) floor a tick deeper —
+  neither reachable on a book held to the 1e-4 grid. The probe buys only at
+  asks ≥ 0.50, which read exactly.
+- **Reviews.** risk / alloc / zero-copy: SHIP. Allocation only on error
+  paths; the battery parses in place from the response buffer.
+- **Tests.** The reader's bounds and exact error text; its 1e-6 edges
+  (truncation not rounding, sub-1e-6 and `null` levels refused, a 96-byte
+  cut through a multi-byte character lossy, never a panic); the probe's
+  touch equal to the battery's top and the old mapping. cli nextest 627
+  passed; clippy clean.
+- **Left.** core-parse's `scan_u64` uses `wrapping_mul`: a 20-digit whole
+  part wraps (`"18446744073709551616.5"` reads 0.5). Pre-existing, the
+  engine's hot path: its own reviewed cut. `hyparb_rehearsal`'s depth
+  reader, and the probe's `dec_1e8` / `mid_of` (copies of `xmm_battery`'s).
+
+### HK23 — the nextest `LEAK`: a nextest race, no test at fault, 2026-10-15
+
+- **Seen.** `ingress-hypercall`
+  `discovery::tests::a_series_inside_the_blackout_is_never_selected` marked
+  LEAK at 0.212 s under a full run: its usual 6–13 ms plus nextest's 200 ms
+  leak timeout. It parses an `include_bytes!` fixture and spawns nothing.
+- **Cause.** cargo-nextest 0.9.143 on macOS: std makes a pipe with `pipe()`
+  and only then marks it close-on-exec (macOS has no `pipe2`), and nextest
+  spawns tests from several threads, so a test spawned in that gap inherits
+  a sibling's capture pipe and holds it open past the sibling's exit.
+  Fixed upstream in 0.9.145 (2026-09-16).
+- **Evidence.** 14 full runs: 5 LEAKs on 5 different tests in 4 crates, none
+  of which spawns. A probe crate (64 no-op tests, one process in eight
+  sleeping 1 s, 8 960 runs each): 0.9.143 started 89 tests holding a
+  sibling's pipe and reported 11 LEAKs; 0.9.148 0 and 0. Full workspace,
+  alternating: 0.9.143 one LEAK in three runs, 0.9.148 none in three.
+- **What changed.** `.config/nextest.toml` recommends 0.9.145 (a warning on
+  older, never a failure). No test, timeout or `leak-timeout` touched.
+- **Operator.** Upgrade cargo-nextest to ≥ 0.9.145; a checked 0.9.148
+  binary is at `target/hk/leak/nextest-0.9.148/cargo-nextest`.

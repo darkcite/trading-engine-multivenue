@@ -13,6 +13,12 @@
 # Add a test here only with the reason it is load-sensitive; never to hide
 # a test that fails alone.
 
+# HK23 (2026-10-15): before 0.9.145, nextest on macOS could hand a test a
+# sibling's capture pipe (std makes a pipe, THEN marks it close-on-exec; no
+# pipe2 there), and a random test spawning nothing was reported LEAK at
+# ~0.2 s. A LEAK under an older nextest is that race, not the test.
+nextest-version = { recommended = "0.9.145" }
+
 [test-groups]
 load-sensitive = { max-threads = 1 }
 
