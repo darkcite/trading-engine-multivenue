@@ -98,8 +98,11 @@ impl Parser<'_, '_> {
             self.recovering = false;
             self.in_list = 0;
             let first = self.peek();
+            let run = self.doc_run(first.lo);
             let s = self.stmt();
-            self.attach_doc(s, first.lo);
+            if let Some((lo, len)) = run {
+                self.build.doc(s, lo, len);
+            }
             self.build.item(s);
             if self.recovering
                 && self.peek().kind == TokKind::Newline
@@ -433,7 +436,7 @@ impl Parser<'_, '_> {
 
     /// Lookahead 3: WORD `(` … matching `)` `=>`.
     pub(super) fn is_function_declaration(&self) -> bool {
-        if self.peek_at(1).kind != TokKind::LParen {
+        if self.peek().kind != TokKind::Ident || self.peek_at(1).kind != TokKind::LParen {
             return false;
         }
         let save = 1usize;
@@ -504,22 +507,35 @@ impl Parser<'_, '_> {
     }
 
     /// `if = "if" expr block [ "else" ( if | block ) ]`.
+    ///
+    /// An `else if` chain of any length is parsed iteratively (it must not recurse); its `If`
+    /// nodes are allocated innermost first, which keeps the arena in postorder.
     fn if_stmt(&mut self) -> NodeId {
-        let from = self.pos;
-        let t = self.bump();
-        let cond = self.expr(0);
-        let then = self.block();
+        let mark = self.if_chain.len();
         let mut otherwise = NodeId::NONE;
-        if self.peek().kind == TokKind::Else && self.closed_block_since(from) {
-            self.bump();
-            otherwise = if self.peek().kind == TokKind::If {
-                self.if_stmt()
-            } else {
-                self.block()
-            };
+        loop {
+            let from = self.pos;
+            let t = self.bump();
+            let cond = self.expr(0);
+            let then = self.block();
+            self.if_chain.push((t.lo, cond, then));
+            if self.peek().kind == TokKind::Else && self.closed_block_since(from) {
+                self.bump();
+                if self.peek().kind == TokKind::If {
+                    continue;
+                }
+                otherwise = self.block();
+            }
+            break;
         }
-        let span = Span::new(self.file, t.lo, self.prev_hi());
-        self.alloc(NodeKind::If, 0, [cond.0, then.0, otherwise.0, 0], span)
+        let hi = self.prev_hi();
+        while self.if_chain.len() > mark {
+            let (lo, cond, then) = self.if_chain[self.if_chain.len() - 1];
+            self.if_chain.pop();
+            let span = Span::new(self.file, lo, hi);
+            otherwise = self.alloc(NodeKind::If, 0, [cond.0, then.0, otherwise.0, 0], span);
+        }
+        otherwise
     }
 
     /// `for` and `for … in`.

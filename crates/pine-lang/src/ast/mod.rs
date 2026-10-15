@@ -26,6 +26,9 @@ pub struct Ast {
     pub(crate) extra: Vec<NodeId>,
     pub(crate) annos: Vec<Annotation>,
     pub(crate) docs: Vec<DocRun>,
+    /// `in_run[i]`: annotation `i` belongs to some statement's doc run (built once at load, so
+    /// the printer and `structurally_eq` classify annotations in O(1) without allocating).
+    pub(crate) in_run: Vec<bool>,
 }
 
 /// Fixed prefix, one list, fixed suffix: every node's children in source order.
@@ -315,6 +318,7 @@ mod tests {
             extra: vec![NodeId(4)],
             annos: vec![],
             docs: vec![],
+            in_run: vec![],
         };
         let mut depth = 0i32;
         let mut max = 0i32;

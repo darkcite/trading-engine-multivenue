@@ -83,15 +83,7 @@ pub fn structurally_eq(a: &Ast, a_syms: &SymTable, b: &Ast, b_syms: &SymTable) -
 
 /// Annotation `i` belongs to some statement's doc run.
 fn in_doc_run(ast: &Ast, i: usize) -> bool {
-    let mut k = 0usize;
-    while k < ast.docs.len() {
-        let d = ast.docs[k];
-        if (d.lo as usize..(d.lo + d.len) as usize).contains(&i) {
-            return true;
-        }
-        k += 1;
-    }
-    false
+    ast.in_run.get(i).copied().unwrap_or(false)
 }
 
 /// Same kinds and texts, pairwise.

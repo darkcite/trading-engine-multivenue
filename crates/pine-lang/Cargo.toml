@@ -16,3 +16,4 @@ pine-ir = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+core-alloc = { workspace = true }

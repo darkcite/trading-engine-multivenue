@@ -237,3 +237,45 @@ fn line_col_matches_the_lexer_line_rule() {
     assert_eq!(line_col(src, 7), (4, 1));
     assert_eq!(line_col(src, 99), (4, 2));
 }
+
+#[test]
+fn doc_runs_survive_documented_statements_inside_the_body() {
+    let src = "//@version=6\n//@function f\nf(x) =>\n    //@variable inner\n    y = x\n    y\n\
+               //@variable after\nz = 1\n";
+    let mut syms = SymTable::new();
+    let ast = parse(src, FileId::ROOT, &mut syms).expect("parses");
+    let Node::Script { body } = ast.node(ast.root()) else {
+        panic!()
+    };
+    let outer: Vec<&str> = ast
+        .doc(body[0])
+        .iter()
+        .map(|a| syms.resolve(a.text))
+        .collect();
+    assert_eq!(outer, vec!["f"]);
+    let Node::FuncDecl { body: fb, .. } = ast.node(body[0]) else {
+        panic!()
+    };
+    let Node::Block { stmts } = ast.node(fb) else {
+        panic!()
+    };
+    let inner: Vec<&str> = ast
+        .doc(stmts[0])
+        .iter()
+        .map(|a| syms.resolve(a.text))
+        .collect();
+    assert_eq!(inner, vec!["inner"]);
+    let last: Vec<&str> = ast
+        .doc(body[1])
+        .iter()
+        .map(|a| syms.resolve(a.text))
+        .collect();
+    assert_eq!(last, vec!["after"]);
+}
+
+#[test]
+fn a_function_name_must_be_a_word() {
+    let mut syms = SymTable::new();
+    let r = parse("//@version=6\nexport 1(x) => x\n", FileId::ROOT, &mut syms);
+    assert!(r.is_err(), "`export 1(x) => x` must be refused");
+}

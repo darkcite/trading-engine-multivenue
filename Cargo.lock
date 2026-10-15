@@ -1487,6 +1487,7 @@ version = "0.1.0"
 name = "pine-lang"
 version = "0.1.0"
 dependencies = [
+ "core-alloc",
  "pine-ir",
  "proptest",
 ]

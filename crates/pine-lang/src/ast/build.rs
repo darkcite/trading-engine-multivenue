@@ -34,6 +34,7 @@ impl Builder {
                 extra: Vec::with_capacity(src_len / 8 + 1),
                 annos: Vec::new(),
                 docs: Vec::new(),
+                in_run: Vec::new(),
             },
             scratch: Vec::with_capacity(64),
         }
@@ -148,7 +149,19 @@ impl Builder {
     ) -> Ast {
         self.ast.version_span = version_span;
         self.ast.sym_bound = syms.len() as u32;
+        let mut in_run = vec![false; annos.len()];
+        let mut k = 0usize;
+        while k < self.ast.docs.len() {
+            let d = self.ast.docs[k];
+            let mut i = d.lo as usize;
+            while i < (d.lo + d.len) as usize {
+                in_run[i] = true;
+                i += 1;
+            }
+            k += 1;
+        }
         self.ast.annos = annos;
+        self.ast.in_run = in_run;
         self.ast
     }
 }

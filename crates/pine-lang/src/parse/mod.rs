@@ -66,8 +66,8 @@ pub(crate) fn parse_with_policy(
         recovering: false,
         last_error: NodeId::NONE,
         annos,
-        anno_next: 0,
         loop_depth: 0,
+        if_chain: Vec::new(),
         in_list: 0,
         scope_depth: 0,
     };
@@ -102,11 +102,11 @@ pub(super) struct Parser<'s, 'p> {
     recovering: bool,
     last_error: NodeId,
     annos: Vec<Annotation>,
-    /// The first annotation not yet behind the parse position (doc runs).
-    anno_next: usize,
     /// Open lists (arguments, tuples, parameters, type arguments) of the current statement:
     /// their `,` is in the synchronisation set.
     in_list: u32,
+    /// The links `(lo, cond, then)` of the `else if` chains being parsed, innermost last.
+    if_chain: Vec<(u32, NodeId, NodeId)>,
     /// Enclosing loop bodies (2010); reset inside a function body.
     loop_depth: u32,
     /// Enclosing blocks and bodies: 0 is the global scope (2027).
@@ -165,6 +165,13 @@ impl Parser<'_, '_> {
             self.diags.at(c, self.file, at.lo, at.hi, msg);
         }
         let start = self.pos;
+        // At a statement boundary (a node built after its block's `Dedent`, e.g. a too-deep `If`
+        // chain) the statement is already consumed: skip nothing.
+        if self.pos > 0 && self.toks[self.pos - 1].kind == TokKind::Dedent {
+            self.recovering = true;
+            self.last_error = self.build.leaf(NodeKind::Error, 0, 0, 0, at);
+            return self.last_error;
+        }
         let mut depth = 0u32;
         loop {
             let t = self.peek();
@@ -258,13 +265,11 @@ impl Parser<'_, '_> {
         }
     }
 
-    /// Attach the doc run ending on the line above the statement starting at `lo` (§3.7, §4.9):
-    /// the maximal run of lines holding one non-script-level annotation each, directly above.
-    fn attach_doc(&mut self, stmt: NodeId, lo: u32) {
-        while self.anno_next < self.annos.len() && self.annos[self.anno_next].span.hi <= lo {
-            self.anno_next += 1;
-        }
-        let end = self.anno_next;
+    /// The doc run ending on the line above the statement starting at `lo` (§3.7, §4.9): the
+    /// maximal run of lines holding one non-script-level annotation each, directly above.
+    /// Computed before the statement is parsed, so its block's own runs cannot interfere.
+    fn doc_run(&self, lo: u32) -> Option<(u32, u32)> {
+        let end = self.annos.partition_point(|a| a.span.hi <= lo);
         let mut k = end;
         let mut below = lo;
         while k > 0 {
@@ -283,7 +288,9 @@ impl Parser<'_, '_> {
             k -= 1;
         }
         if k < end {
-            self.build.doc(stmt, k as u32, (end - k) as u32);
+            Some((k as u32, (end - k) as u32))
+        } else {
+            None
         }
     }
 }
