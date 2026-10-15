@@ -51,11 +51,17 @@
 //! name the phase that will supply it.
 
 use crate::icdp::{parse_value, strip_comment, Value};
+use core_types::SlotMask;
 use std::path::Path;
 
-/// Strategy slots the artifact may address. Mirrors
-/// `exec_router::EXEC_SLOTS` and `strategy_set`'s slot count.
-pub const EXEC_SLOTS: usize = 8;
+// Every slot the artifact may address has a bit in a `live_mask`.
+const _: () = assert!(EXEC_SLOTS <= SlotMask::BITS as usize);
+
+/// Strategy slots the artifact may address:
+/// `core_types::MAX_STRATEGY_SLOTS` (16 since S16-3), derived — as
+/// `exec_router::EXEC_SLOTS` is — rather than restated, so the three
+/// cannot drift (`cli::exec_boot` const-asserts they agree).
+pub const EXEC_SLOTS: usize = core_types::MAX_STRATEGY_SLOTS as usize;
 
 /// An `exec.toml` that could not be read or did not hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,8 +418,9 @@ pub const ALO_REJECT_PCT_MAX: i64 = 100;
 /// shared fixed array of this size. Duplicated rather than imported —
 /// `exec-router` depends on this crate, so the dependency cannot run
 /// the other way — and `cli::exec_boot` const-asserts the two agree,
-/// that crate being the one that depends on both.
-pub const LEDGER_RESTING_MIRROR: usize = 512;
+/// that crate being the one that depends on both. 1 024 since S16-3
+/// (ruling S16-R2: sixteen slots at 64 open orders each; 512 at eight).
+pub const LEDGER_RESTING_MIRROR: usize = 1024;
 
 /// The most `max_open_orders` a single live slot may claim.
 ///
@@ -421,7 +428,12 @@ pub const LEDGER_RESTING_MIRROR: usize = 512;
 /// rather than a sum check because the slots are validated one at a
 /// time and independently: a sum rule would make a legal slot's
 /// legality depend on a later section of the file.
+///
+/// 64 at sixteen slots, as it was at eight — S16-R2 doubled the table
+/// with the slot count, so the shipped `max_open_orders = 64` (BIN15's
+/// artifact included) is still legal.
 pub const MAX_OPEN_ORDERS_PER_SLOT: usize = LEDGER_RESTING_MIRROR / EXEC_SLOTS;
+const _: () = assert!(MAX_OPEN_ORDERS_PER_SLOT == 64);
 
 /// `exec.toml` as parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,19 +468,24 @@ impl ExecFile {
 
     /// Bit `i` set = slot `i` asks to be live. Respects `enabled = 0`.
     /// This is what the `--arm-live` interlock compares against.
+    ///
+    /// A [`SlotMask`] since S16-3: the `u8` of eight slots would, in a
+    /// release build (`overflow-checks = false`), have put a live slot
+    /// 11 on bit 3 — BIN15's — and the interlock, aliasing the same
+    /// way, would have agreed.
     #[must_use]
-    pub fn live_mask(&self) -> u8 {
+    pub fn live_mask(&self) -> SlotMask {
         if !self.enabled {
             return 0;
         }
-        let mut m = 0u8;
+        let mut m: SlotMask = 0;
         for s in &self.slots {
             // The parser refuses `slot >= EXEC_SLOTS`, so this holds —
             // but bound it here anyway: a silent masked shift would set
             // the WRONG live bit, and this mask is what the arming
-            // interlock compares against.
+            // interlock compares against. `EXEC_SLOTS <= SlotMask::BITS`.
             if s.is_live() && s.slot < EXEC_SLOTS {
-                m |= 1u8 << s.slot;
+                m |= (1 as SlotMask) << s.slot;
             }
         }
         m
@@ -1586,8 +1603,32 @@ mode = "paper"
 
     #[test]
     fn an_out_of_range_or_unparseable_slot_is_refused() {
-        expect_err("[exec]\n[exec.slot.8]\nmode = \"paper\"\n", "out of range");
+        // S16-3: 16 is the first slot past the table (8 was, at eight).
+        expect_err("[exec]\n[exec.slot.16]\nmode = \"paper\"\n", "out of range");
+        expect_err("[exec]\n[exec.slot.255]\nmode = \"paper\"\n", "out of range");
         expect_err("[exec]\n[exec.slot.x]\nmode = \"paper\"\n", "must be an integer");
+        let f = parse("[exec]\n[exec.slot.15]\nmode = \"paper\"\n").unwrap();
+        assert_eq!(f.slot(15).mode, "paper");
+    }
+
+    /// S16-3: a live slot 11 is bit 11 of the live mask — never bit 3,
+    /// BIN15's (the `u8` mask's alias) — and its open-order share is
+    /// still 64 at sixteen slots (S16-R2); 65 is refused.
+    #[test]
+    fn a_live_slot_11_is_bit_11_and_keeps_a_share_of_64() {
+        let live11 = MINIMAL_LIVE.replace("[exec.slot.3]", "[exec.slot.11]");
+        let f = parse(&live11).unwrap();
+        assert!(f.slot(11).is_live());
+        assert!(!f.slot(3).is_live(), "slot 3 is paper by default");
+        assert_eq!(f.live_mask(), 1 << 11);
+        assert_eq!(f.slot(11).max_open_orders, 64);
+        assert_eq!(MAX_OPEN_ORDERS_PER_SLOT, 64);
+        assert_eq!(LEDGER_RESTING_MIRROR, 64 * EXEC_SLOTS);
+        let over = live11.replace("max_open_orders = 64", "max_open_orders = 65");
+        assert_ne!(over, live11, "the example spells the key this way");
+        expect_err(&over, "exceeds 64");
+        let live15 = MINIMAL_LIVE.replace("[exec.slot.3]", "[exec.slot.15]");
+        assert_eq!(parse(&live15).unwrap().live_mask(), 1 << 15);
     }
 
     #[test]

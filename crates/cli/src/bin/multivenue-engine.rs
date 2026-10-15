@@ -3622,7 +3622,7 @@ fn boot_hyparb_live_arm(
 fn wire_exec_halts<L: clob_dispatcher::OrderDispatch>(
     exec_dispatcher: &mut exec_router::RoutedDispatcher<clob_dispatcher::PaperDispatcher, L>,
     eb: &cli::exec_boot::ExecBoot,
-    halt_mask: u8,
+    halt_mask: core_types::SlotMask,
     aliases: clob_dispatcher::RouteAliases,
 ) {
     exec_dispatcher.set_route_aliases(aliases);
@@ -3635,14 +3635,14 @@ fn wire_exec_halts<L: clob_dispatcher::OrderDispatch>(
         // **A halt file that halted nothing.** A mistyped slot, a slot
         // that is not live, a line this binary could not parse — or,
         // since the E7 review, a file that exists and could not be
-        // READ (permissions, over 512 B, not a regular file). Silence
+        // READ (permissions, over `HALT_FILE_MAX` — 640 B since S16-3 —, not a regular file). Silence
         // here would be the inverse of the failure below and strictly
         // worse: an operator who asked for a halt, got a clean boot
         // log, and an engine that trades.
         error!(
             file = %cli::exec_boot::halt_file_path(&eb.path).display(),
             "exec: exec.HALT IS PRESENT BUT HALTED NOTHING — check that it is a plain \
-             file under 512 B this process can read, that the slot numbers are right \
+             file under 640 B this process can read, that the slot numbers are right \
              (a line is `slot=<n> reason=<word>`, or a bare number) and that those \
              slots are LIVE. The engine is trading."
         );
@@ -3670,14 +3670,11 @@ fn wire_exec_halts<L: clob_dispatcher::OrderDispatch>(
         // Live slots only — `halt_slot` refuses the rest, and says so
         // here rather than claiming a paper slot will refuse orders it
         // never routes through the latch.
-        let mut halted = 0u8;
+        // Bit `s` is slot `s` alone (S16-3, `exec_boot::apply_halt_mask`'s
+        // tests): a halt of slot 11 never lands on slot 3.
+        let (halted, not_live) = cli::exec_boot::apply_halt_mask(exec_dispatcher, halt_mask);
         for slot in 0..exec_router::EXEC_SLOTS {
-            if halt_mask & (1u8 << slot) == 0 {
-                continue;
-            }
-            if exec_dispatcher.halt_slot(slot, exec_router::HaltReason::Operator) {
-                halted |= 1u8 << slot;
-            } else {
+            if cli::exec_boot::slot_in(not_live, slot) {
                 warn!(slot, "--halt-slot: slot is not LIVE — nothing to halt, flag ignored for it");
             }
         }
@@ -4068,7 +4065,7 @@ fn run(args: RunArgs) -> ExitCode {
     let halt_mask = match args
         .halt_slot
         .as_deref()
-        .map_or(Ok(0u8), cli::exec_boot::parse_halt_slots)
+        .map_or(Ok(0), cli::exec_boot::parse_halt_slots)
     {
         Ok(m) => m,
         Err(reason) => {
@@ -6174,7 +6171,7 @@ fn run(args: RunArgs) -> ExitCode {
                     // another LIVE member's perp (a paper member is no
                     // claim; since XH5a a live one can sit beside slot 6).
                     if let (Some(_), Some(xb)) = (eb.gateway_live(), xmm_boot.as_ref()) {
-                        let live = |slot: u8| eb.live_mask & (1u8 << slot) != 0;
+                        let live = |slot: u8| eb.slot_live(usize::from(slot));
                         let n = usize::from(xb.params.n_perps).min(xb.coins.len());
                         let bound: Vec<(&str, core_types::SymbolId)> = xb.coins[..n]
                             .iter()

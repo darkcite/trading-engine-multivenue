@@ -556,6 +556,34 @@ fn bench_strategy_set(c: &mut Criterion) {
     });
 }
 
+// -----------------------------------------------------------------
+// 14. S16-3 review — the router ledger's resting-table lookup, what a
+//     live fill, cancel or modify pays per key (`Ledger::locate`; an
+//     XMM requote pays two): a miss (a cancel of a key no row holds —
+//     the arm's `NoSuchOrder` reading, nothing mutated) and a hit (a
+//     queued modify's asked hold on a held key, rewritten to the same
+//     values every iteration). Eight rows resting, the high-water mark
+//     at eight: the scan is the live prefix, not the 1 024-row table.
+// -----------------------------------------------------------------
+
+fn bench_ledger(c: &mut Criterion) {
+    use exec_router::{Ledger, EXEC_SLOTS};
+    let mut l = Box::new(Ledger::new(core_time::WallAnchor::now()));
+    let mut k = 0u64;
+    while k < 8 {
+        l.on_submit(k + 1, k as usize % EXEC_SLOTS, 100, 1_000_000, true, 500_000);
+        k += 1;
+    }
+    c.bench_function("ledger/locate_miss", |b| {
+        b.iter(|| l.on_cancel(black_box(u64::MAX - 1), black_box(3)));
+    });
+    c.bench_function("ledger/locate_hit", |b| {
+        b.iter(|| {
+            l.on_modify_asked(black_box(5), black_box(9_999_999), black_box(4), 1_000_000, 500_000);
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_clock,
@@ -571,5 +599,6 @@ criterion_group!(
     bench_long_vol_day_close,
     bench_bin15_late,
     bench_strategy_set,
+    bench_ledger,
 );
 criterion_main!(benches);

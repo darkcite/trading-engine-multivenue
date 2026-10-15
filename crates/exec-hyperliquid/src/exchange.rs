@@ -1236,7 +1236,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             Err(_) => false,
         };
         if read {
-            // COPY: [i64; EXEC_SLOTS] (64 B) of day spend, stack → arm,
+            // COPY: [i64; EXEC_SLOTS] (128 B since S16-3) of day spend, stack → arm,
             // once per UTC day — `scan_day_bought` zeroes its target on
             // every failure and a failed read must leave the standing
             // figure — rejected: scanning straight into `day_bought_1e6`.
@@ -2147,7 +2147,8 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// `Stranded` until its next request re-marks it.
     fn strand(&mut self, mask: u8, k: u64) {
         let mut s = 0usize;
-        while s < core_config::exec::EXEC_SLOTS {
+        // `HL_SLOTS` (8): `mask >> s` is exact on the `u8` (S16-4 widens).
+        while s < crate::cloid::HL_SLOTS {
             // Branchless: a slot outside the mask adds nothing.
             self.slot_left[s] = self.slot_left[s].wrapping_add(k * u64::from((mask >> s) & 1));
             s += 1;
@@ -2947,9 +2948,10 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
     /// [`DispatchError::QueueFull`], as `cancel_all`'s.
     fn cancel_slot(&mut self, slot: u8) -> Result<(), DispatchError> {
         let s = usize::from(slot);
-        if s >= core_config::exec::EXEC_SLOTS {
-            // Not a slot the router names: the venue-wide verb —
-            // over-cancel, never under.
+        if s >= crate::cloid::HL_SLOTS {
+            // Not a slot this arm's masks name (a router slot ≥ 8 until
+            // S16-4, or none): the venue-wide verb — over-cancel, never
+            // under. Also what keeps `1u8 << slot` below exact.
             return self.cancel_all();
         }
         self.counters.cancel_all_runs = self.counters.cancel_all_runs.wrapping_add(1);
@@ -2964,7 +2966,7 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
     /// the slot's request, `Clear` otherwise.
     fn cancel_slot_state(&self, slot: u8) -> clob_dispatcher::CancelAllState {
         let s = usize::from(slot);
-        if s >= core_config::exec::EXEC_SLOTS {
+        if s >= crate::cloid::HL_SLOTS {
             return self.cancel_all_state();
         }
         let bit = 1u8 << slot;

@@ -41,6 +41,30 @@
 
 use core_config::exec::EXEC_SLOTS;
 
+/// **The slots this arm's own masks can name** — 8 until S16-4 widens
+/// them. S16-3 grew the router to sixteen slots (`EXEC_SLOTS`); until
+/// S16-4 this arm stays at eight, safely: [`encode`] masks into all
+/// sixteen (so a slot-11 order's cloid names slot 11, never slot 3 —
+/// BIN15's — as `& 7` would), and [`decode`] refuses a slot byte at or
+/// above this, so such a cloid reads `Foreign` and is never booked
+/// against a slot; a halt of slot ≥ 8 cancels venue-wide (over-cancel,
+/// never under). No member trades slots 8–15 (S16-R5: `BUILT_MASK`
+/// 0x00FF, held under this at compile time by `cli::exec_boot`), so none
+/// of it is reachable yet.
+///
+/// **The S16-4 sites** — the `u8` slot masks and the `>= 8` slot
+/// refusals that widen with this:
+///
+/// * `recon`: `ALL_SLOTS`, `ours_on_leg`, and its `HL_SLOTS <= 8` assert;
+/// * `exchange`: `PendingSweep.slots`, the sweep and strand masks, and
+///   `cancel_slot` / `cancel_slot_state`'s venue-wide fallback;
+/// * `gateway`: `GatewayCfg::production`'s `1u8 << (slot & 7)` (behind its
+///   `debug_assert!`), and the `>= 8` refusals in `HlGateway::admit` and
+///   `HlGateway::sweep_cancel_ours`;
+/// * `arm`: `HlGatewayArm::new`'s `cfg.slot >= 8` refusal (`ArmErr::Slot`).
+pub const HL_SLOTS: usize = 8; // S16-4: widen to `EXEC_SLOTS`.
+const _: () = assert!(HL_SLOTS <= EXEC_SLOTS);
+
 /// `'M'`, `'V'` — the marker that says an engine placed this order.
 pub const MAGIC: [u8; 2] = [0x4D, 0x56];
 
@@ -100,7 +124,7 @@ pub fn decode(cloid: &[u8; 16]) -> Owner {
     // get wrong.
     let magic_ok = (cloid[0] == MAGIC[0]) & (cloid[1] == MAGIC[1]);
     let slot = cloid[SLOT_BYTE];
-    let slot_ok = (slot as usize) < EXEC_SLOTS;
+    let slot_ok = (slot as usize) < HL_SLOTS;
     // The reserved bytes must be zero. A cloid with our magic but a
     // dirty reserve is not one we wrote, and treating it as ours would
     // be the one case where the marker gave false confidence.
@@ -177,7 +201,7 @@ mod tests {
 
     #[test]
     fn a_cloid_round_trips_through_every_slot() {
-        for slot in 0..EXEC_SLOTS as u8 {
+        for slot in 0..HL_SLOTS as u8 {
             for oid in [0u64, 1, 42, u64::MAX, 0x0123_4567_89ab_cdef] {
                 let c = encode(slot, oid);
                 assert_eq!(
@@ -288,10 +312,18 @@ mod tests {
     fn the_encoder_masks_and_the_decoder_refuses() {
         let c = encode(0xFF, 9);
         assert_eq!(c[SLOT_BYTE], (EXEC_SLOTS - 1) as u8);
+        // S16-3: slot 15 is past this arm's `HL_SLOTS` until S16-4.
+        assert_eq!(decode(&c), Owner::Foreign);
+        // A slot-11 order names slot 11 — never BIN15's slot 3 — and,
+        // until S16-4, reads `Foreign` rather than booking anywhere.
+        let c = encode(11, 9);
+        assert_eq!(c[SLOT_BYTE], 11);
+        assert_eq!(decode(&c), Owner::Foreign);
+        let top = encode((HL_SLOTS - 1) as u8, 9);
         assert_eq!(
-            decode(&c),
+            decode(&top),
             Owner::Ours {
-                strategy_id: (EXEC_SLOTS - 1) as u8,
+                strategy_id: (HL_SLOTS - 1) as u8,
                 client_oid: 9
             }
         );

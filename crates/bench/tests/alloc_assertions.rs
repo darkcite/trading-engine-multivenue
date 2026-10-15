@@ -8941,7 +8941,7 @@ fn hl_exchange_reconcile_compare_is_zero_alloc() {
     }
     page.push(']');
     let page = page.into_bytes();
-    let mut bought = [0i64; 8];
+    let mut bought = [0i64; core_config::exec::EXEC_SLOTS];
     let mut req = [0u8; MAX_DAY_REQ];
     let _ = scan_day_bought(&page, DAY0_MS, &mut bought).expect("prime");
 

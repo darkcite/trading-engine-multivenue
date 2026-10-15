@@ -663,8 +663,9 @@ pub fn scan_open_orders(body: &[u8], out: &mut [OpenOrder]) -> Result<usize, Sca
 /// sweep carries `1 << slot` (XMM XH5a).
 pub const ALL_SLOTS: u8 = u8::MAX;
 
-// A slot mask is one byte: one bit per value of the cloid's slot byte.
-const _: () = assert!(core_config::exec::EXEC_SLOTS <= 8);
+// A slot mask is one byte: one bit per slot `decode` can return (S16-4
+// widens it to `core_types::SlotMask` with `HL_SLOTS`).
+const _: () = assert!(crate::cloid::HL_SLOTS <= 8);
 
 /// Of the orders the venue says are resting, which are **ours, on this
 /// leg, of these slots** — returns how many oids were written to `out`.
@@ -707,7 +708,7 @@ pub fn ours_on_leg(
         else {
             continue;
         };
-        // `strategy_id < EXEC_SLOTS` (≤ 8) by `decode`: the shift is exact.
+        // `strategy_id < HL_SLOTS` (≤ 8) by `decode`: the shift is exact.
         if slots & (1u8 << strategy_id) == 0 {
             continue;
         }

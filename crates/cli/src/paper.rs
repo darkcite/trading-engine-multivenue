@@ -8911,7 +8911,11 @@ fn fill_snapshot<S, D>(
     ex.refused_unseeded = ec.refused_unseeded;
     ex.cancel_all_failures = ec.cancel_all_failures;
     ex.cancel_all_stranded = ec.cancel_all_stranded;
-    ex.halted = ec.halted;
+    // S16-5: `/state` keeps its eight halt bytes until its schema 3;
+    // slots 8–15 have no member (S16-R5), so theirs read 0 anyway.
+    for (d, s) in ex.halted.iter_mut().zip(ec.halted.iter()) {
+        *d = *s;
+    }
     // E7: the ledger's alarms and the live arm's numbers reach the
     // surface an operator actually reads.
     ex.ledger_fills_unbound = ec.ledger_fills_unbound;

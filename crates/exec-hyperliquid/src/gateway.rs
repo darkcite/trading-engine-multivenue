@@ -422,6 +422,14 @@ impl GatewayCfg {
         master: [u8; 20],
         slot: u8,
     ) -> Self {
+        // S16-4: `slots` is a `u8` mask, where `& 7` would read slot 11 as
+        // slot 3 (BIN15's). No caller passes a slot ≥ 8 today (each passes
+        // its member's slot, and `HlGatewayArm::new` refuses one); S16-4
+        // widens the mask with `cloid::HL_SLOTS`.
+        debug_assert!(
+            slot < 8,
+            "S16-4: the gateway's u8 slot mask holds slots 0..8 only"
+        );
         Self {
             host,
             port: crate::config::HTTPS_PORT,
