@@ -138,6 +138,13 @@ impl<'p> VmInstance<'p> {
             } else {
                 NA_I64 as u64
             };
+            debug_assert!(
+                d.off % 8 == 0
+                    && d.off >= l.rings_off
+                    && d.off as u64 + 8 * (d.mask as u64 + 1)
+                        <= l.rings_off as u64 + l.rings_bytes as u64,
+                "rule 4: ring span outside the rings region"
+            );
             let mut k = 0u64;
             while k <= d.mask as u64 {
                 // SAFETY: rule 4 — the ring's cells lie inside the rings region.
@@ -156,6 +163,12 @@ impl<'p> VmInstance<'p> {
         // Varip mask, and dirty := varip (the first checkpoint).
         if self.realtime {
             let n = l.dirty_words as usize;
+            debug_assert!(
+                l.dirty_words as u64
+                    == (l.str_persist_off as u64 + l.str_persist_bytes as u64).div_ceil(512)
+                    && l.dirty_off as u64 + 16 * n as u64 <= l.total_bytes as u64,
+                "rule 18 (I-7): dirty region does not hold 2 × dirty_words words"
+            );
             // SAFETY: rule 18 (I-7) — the dirty region holds 2 × dirty_words words.
             let (dirty, varip) = unsafe {
                 (
@@ -301,6 +314,10 @@ impl<'p> VmInstance<'p> {
     /// these slots before any read, and rule 8 forbids every other writer.
     fn populate(&mut self, bar: &Bar, tick: bool, ticked: bool) {
         let c = &mut self.core;
+        debug_assert!(
+            c.f_len >= abi::RESERVED_F as u32 && c.i_len >= abi::RESERVED_I as u32,
+            "rule 3: lanes shorter than the reserved-slot ABI"
+        );
         // SAFETY: rule 3 — f64_len >= 5, i64_len >= 10.
         unsafe {
             *c.f.add(abi::F_OPEN as usize) = scale::from_1e6(bar.open_1e6);
@@ -314,6 +331,10 @@ impl<'p> VmInstance<'p> {
             let mut k = 0usize;
             while k < BARSTATE.len() {
                 let row = &BARSTATE[k];
+                debug_assert!(
+                    row.slot < abi::RESERVED_I,
+                    "rule 3: barstate slot not reserved"
+                );
                 let v = eval(if tick { row.tick } else { row.bar }, bar.flags, c.bar_index, ticked);
                 *c.i.add(row.slot as usize) = v as i64;
                 k += 1;

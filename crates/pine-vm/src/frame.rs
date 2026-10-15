@@ -173,9 +173,16 @@ impl Core {
         unsafe { *self.states.add(site as usize) }
     }
 
+    /// The `CollHeader` at the start of the pool block at frame offset `off`.
+    ///
+    /// # Safety
+    /// `off` is the `off` of a verified `Collection` / `Object` `StateDesc` (rule 6: the
+    /// block is 8-aligned, `>= 32` bytes and inside the pool), so the 32-byte header fits
+    /// it. The caller upholds the aliasing rules for whatever reference it forms.
     #[inline(always)]
-    pub(crate) fn hdr_ptr(&self, off: u32) -> *mut CollHeader {
-        // SAFETY: off is a verified block offset (rule 6); blocks are 8-aligned
+    pub(crate) unsafe fn hdr_ptr(&self, off: u32) -> *mut CollHeader {
+        debug_assert!(off % 8 == 0, "rule 6: pool block offset not 8-aligned");
+        // SAFETY: caller — off is a verified block offset (rule 6); blocks are 8-aligned
         // and >= 32 bytes; CollHeader is align 4.
         unsafe { self.base.add(off as usize) as *mut CollHeader }
     }
@@ -194,7 +201,7 @@ impl Core {
         if d.kind != StateKind::Collection {
             return Err(FaultKind::ScriptRefused);
         }
-        // SAFETY: d is a verified Collection block (rule 6: bytes >= 32).
+        // SAFETY: rule 6 — d is a verified Collection block (bytes >= 32): hdr_ptr's contract.
         let g = unsafe { (*self.hdr_ptr(d.off)).gen };
         if g != r.gen() {
             return Err(FaultKind::ScriptRefused);
@@ -205,7 +212,7 @@ impl Core {
     /// The storage words of a collection: `[data_off, end of the owning block)`.
     /// Returns (frame offset, words, owner descriptor).
     pub(crate) fn coll_payload(&self, d: StateDesc) -> Result<(u32, usize, StateDesc), FaultKind> {
-        // SAFETY: d verified (rule 6).
+        // SAFETY: rule 6 — d is a verified Collection block (coll_desc): hdr_ptr's contract.
         let h = unsafe { *self.hdr_ptr(d.off) };
         let owner = if h.view == 0 {
             d
@@ -534,7 +541,8 @@ impl<'a> Frame<'a> {
         if c.jrnl_on {
             c.touch_block(d.off, d.bytes);
         }
-        let h = c.hdr_ptr(d.off);
+        // SAFETY: rule 6 — d is a verified Collection block (checked above): hdr_ptr's contract.
+        let h = unsafe { c.hdr_ptr(d.off) };
         // SAFETY: verified Collection block (rule 6), header in its first 32 bytes.
         let gen = CollRef::next_gen(unsafe { (*h).gen });
         // SAFETY: as above.
@@ -562,7 +570,8 @@ impl<'a> Frame<'a> {
         let c = &*self.core;
         let d = c.coll_desc(r)?;
         let (lo, n, _) = c.coll_payload(d)?;
-        // SAFETY: coll_payload bounded [lo, lo + 8n) inside the owning block.
+        // SAFETY: rule 6 — hdr_ptr on the verified Collection block coll_desc returned;
+        // coll_payload bounded [lo, lo + 8n) inside the owning block.
         unsafe { Ok((&*c.hdr_ptr(d.off), core::slice::from_raw_parts(c.base.add(lo as usize) as *const u64, n))) }
     }
 
@@ -577,7 +586,8 @@ impl<'a> Frame<'a> {
                 c.touch_block(owner.off, owner.bytes);
             }
         }
-        // SAFETY: as `coll`; header [d.off, d.off+32) and storage [lo, ...) are disjoint
+        // SAFETY: rule 6 — as `coll` (hdr_ptr on a verified Collection block); header
+        // [d.off, d.off+32) and storage [lo, ...) are disjoint
         // (lo >= owner.off + 32, and a view's header lies in its own block, rule 6 disjointness).
         unsafe { Ok((&mut *c.hdr_ptr(d.off), core::slice::from_raw_parts_mut(c.base.add(lo as usize) as *mut u64, n))) }
     }
@@ -679,13 +689,15 @@ impl<'a> Frame<'a> {
         if c.intent_len >= c.intent_cap {
             return Err(FaultKind::PoolFull);
         }
-        // SAFETY: intent_len < intent_cap; the intents region holds intent_cap slots (rule 1).
+        // SAFETY: intent_len < intent_cap; the intents region holds intent_cap slots (rule 1);
+        // `i` cannot overlap the slot: no `Frame` accessor lends the intents region.
         unsafe {
             let dst = c.intents.add(c.intent_len as usize);
             // COPY: one 128 B OrderIntent into its buffer slot, <= intent_cap per evaluation — the
             // ring-slot publish (a POD moves once into its final slot) — building in place rejected:
-            // the frozen signature takes &OrderIntent (contract §3.7).
-            dst.write(*i);
+            // the frozen signature takes &OrderIntent (contract §3.7). A direct slot-to-slot copy:
+            // `dst.write(*i)` could materialise `*i` on the stack first (a second 128 B copy).
+            core::ptr::copy_nonoverlapping(core::ptr::from_ref(i), dst, 1);
             (*dst).seq = c.intent_len;
         }
         c.intent_len += 1;

@@ -289,3 +289,6 @@ const _: () = assert!(core::mem::size_of::<SizingMode>() == 16);
 const _: () = assert!(core::mem::size_of::<NativeCfg>() == 72);
 const _: () = assert!(core::mem::size_of::<TvCfg>() == 24);
 const _: () = assert!(core::mem::size_of::<BrokerCounters>() == 26 * 8);
+// 8 + 16 (SizingMode) + 8 pad + 7 × 16 (i128, align 16) + 4 × 4 + 26 × 8 (BrokerCounters).
+const _: () = assert!(core::mem::size_of::<RunRecord>() == 368);
+const _: () = assert!(core::mem::align_of::<RunRecord>() == 16);

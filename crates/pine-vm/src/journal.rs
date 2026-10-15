@@ -19,7 +19,10 @@ impl Core {
     #[inline(always)]
     pub(crate) fn touch_word(&mut self, off: u32) {
         let w = (off >> 3) as usize;
-        debug_assert!(off % 8 == 0 && w >> 6 < self.dirty_words as usize, "touch_word outside the dirty range");
+        debug_assert!(
+            off % 8 == 0 && w >> 6 < self.dirty_words as usize,
+            "rule 18 (I-7): touch_word outside the dirty range"
+        );
         // SAFETY: rule 18 (I-7) — dirty_words covers every word below str_persist end, and
         // every journaled offset lies below it (rule 1 region order).
         let d = unsafe { &mut *self.dirty.add(w >> 6) };
@@ -36,6 +39,10 @@ impl Core {
     pub(crate) fn touch_block(&mut self, off: u32, len: u32) {
         let w = (off >> 3) as usize;
         debug_assert!(off % 8 == 0 && len % 8 == 0 && len > 0);
+        debug_assert!(
+            ((off as usize + len as usize - 1) >> 3) >> 6 < self.dirty_words as usize,
+            "rule 18 (I-7): touch_block outside the dirty range"
+        );
         // SAFETY: as touch_word.
         let d = unsafe { *self.dirty.add(w >> 6) };
         if d & (1u64 << (w & 63)) != 0 {
@@ -50,6 +57,10 @@ impl Core {
     fn record(&mut self, off: u32, len: u32) {
         debug_assert!(self.bits_clear(off, len), "a unit journaled twice in one tick");
         let need = 8 + len;
+        debug_assert!(
+            self.jrnl_lo <= self.jrnl_top && self.jrnl_top <= self.jrnl_hi && self.jrnl_hi % 8 == 0,
+            "rule 18: journal cursor outside [jrnl_lo, jrnl_hi]"
+        );
         if self.jrnl_top - self.jrnl_lo < need {
             // Unreachable for a verified program (rule 18, I-8). Defence: poison the
             // instance; step_tick reports Fault(JournalFull) and latches.
@@ -79,8 +90,16 @@ impl Core {
         while p < self.jrnl_hi {
             // SAFETY: p walks record boundaries written by `record` (8-aligned headers).
             let h = unsafe { (self.base.add(p as usize) as *const JrnlHdr).read() };
-            debug_assert!(h.len > 0 && h.len % 8 == 0 && p + 8 + h.len <= self.jrnl_hi);
-            // SAFETY: the record's target range was a verified unit when recorded.
+            debug_assert!(
+                h.len > 0 && h.len % 8 == 0 && p + 8 + h.len <= self.jrnl_hi,
+                "rule 18: malformed journal record"
+            );
+            debug_assert!(
+                ((h.off + h.len - 1) >> 9) < self.dirty_words,
+                "rule 18 (I-7): journaled unit outside the dirty range"
+            );
+            // SAFETY: rule 18 — the record's target range was a verified unit when recorded,
+            // below str_persist end (I-7).
             unsafe {
                 // COPY: a unit's pre-image back into the frame, <= jrnl_bytes per undo — restoring
                 // the checkpoint is the point of D16 — replaying a snapshot rejected: O(arena).
@@ -98,7 +117,11 @@ impl Core {
             let b0 = w & 63;
             let k = (64 - b0).min(n);
             let m = if k == 64 { !0u64 } else { ((1u64 << k) - 1) << b0 };
-            // SAFETY: w >> 6 < dirty_words (the unit lies below str_persist end).
+            debug_assert!(
+                w >> 6 < self.dirty_words as usize,
+                "rule 18: dirty word out of range"
+            );
+            // SAFETY: rule 18 (I-7) — w >> 6 < dirty_words (the unit lies below str_persist end).
             let d = unsafe { &mut *self.dirty.add(w >> 6) };
             *d = if on { *d | m } else { *d & !m };
             w += k;
@@ -110,7 +133,11 @@ impl Core {
         let mut w = (off >> 3) as usize;
         let end = w + (len >> 3) as usize;
         while w < end {
-            // SAFETY: debug-only walk inside the dirty range.
+            debug_assert!(
+                w >> 6 < self.dirty_words as usize,
+                "rule 18: dirty word out of range"
+            );
+            // SAFETY: rule 18 (I-7) — debug-only walk inside the dirty range.
             if unsafe { *self.dirty.add(w >> 6) } & (1u64 << (w & 63)) != 0 {
                 return false;
             }
@@ -123,7 +150,7 @@ impl Core {
     pub(crate) fn dirty_is_varip(&self) -> bool {
         let mut k = 0usize;
         while k < self.dirty_words as usize {
-            // SAFETY: k < dirty_words.
+            // SAFETY: rule 18 — k < dirty_words; rule 1 sizes the dirty region 2 × dirty_words.
             if unsafe { *self.dirty.add(k) != *self.varip.add(k) } {
                 return false;
             }

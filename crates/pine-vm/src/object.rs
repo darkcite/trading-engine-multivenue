@@ -24,7 +24,8 @@ pub(crate) unsafe fn o_new<const J: bool>(c: &mut Core, dst: u16, site: u16, n: 
     if J {
         c.touch_block(d.off, d.bytes);
     }
-    let h = c.hdr_ptr(d.off);
+    // SAFETY: rule 15 — `site` is a verified Object block (rule 6: >= 32 B): hdr_ptr's contract.
+    let h = unsafe { c.hdr_ptr(d.off) };
     // SAFETY: verified Object block; fields [off+32, off+32+8n) inside it.
     unsafe {
         let gen = CollRef::next_gen((*h).gen);
@@ -48,8 +49,9 @@ pub(crate) unsafe fn o_new<const J: bool>(c: &mut Core, dst: u16, site: u16, n: 
     Ok(())
 }
 
-/// Resolve the object named by i64 slot `h`, and check `field < len`.
-/// Returns the block and the field's frame offset.
+/// Resolve the object named by i64 slot `h`, and check `field < len` and
+/// `field <` the block's field capacity `(bytes - 32) / 8`. Returns the block
+/// and the field's frame offset, which lies inside the block.
 ///
 /// # Safety
 /// Rule 8 bounds `h` < i64_len.
@@ -69,13 +71,25 @@ pub(crate) unsafe fn o_field(c: &Core, h: u16, field: u16) -> Result<(StateDesc,
     if d.kind != StateKind::Object {
         return Err(FaultKind::ScriptRefused);
     }
-    // SAFETY: verified Object block.
+    // SAFETY: rule 6 — d is a verified Object block (>= 32 B): hdr_ptr's contract.
     let hd = unsafe { *c.hdr_ptr(d.off) };
     if hd.gen != r.gen() {
         return Err(FaultKind::ScriptRefused);
     }
-    if field as u32 >= hd.len {
+    // The field capacity from the verified descriptor (rule 6: bytes >= 32, so no underflow),
+    // not from the arena-resident header: the field address is in the block whatever `hd` holds.
+    let cap = (d.bytes - 32) / 8;
+    debug_assert!(
+        hd.len <= cap,
+        "rule 15: object len {} > block capacity {cap}",
+        hd.len
+    );
+    if field as u32 >= hd.len || field as u32 >= cap {
         return Err(FaultKind::Internal);
     }
+    debug_assert!(
+        32 + 8 * field as u32 + 8 <= d.bytes,
+        "rule 15: field outside its block"
+    );
     Ok((d, d.off + 32 + 8 * field as u32))
 }

@@ -4,7 +4,7 @@
 //! `S_PERSIST` (contract §3.6.3). The scratch arena (`str_concat`,
 //! `str_alloc`) lives on `Frame`.
 
-use pine_ir::{str_region, FaultKind, StrRef};
+use pine_ir::{abi, str_region, FaultKind, StrRef};
 
 use crate::frame::{Core, StrBad};
 
@@ -15,6 +15,10 @@ use crate::frame::{Core, StrBad};
 /// `str_persist`, outside every ring, with matching varip class.
 #[inline(always)]
 pub(crate) unsafe fn s_persist<const J: bool>(c: &mut Core, dst: u16, a: u16, cell: u16) -> Result<(), FaultKind> {
+    debug_assert!(
+        (a as u32) < c.i_len && (dst as u32) < c.i_len && dst >= abi::RESERVED_I,
+        "rule 8: S_PERSIST dst / a outside the i64 lane (or dst reserved)"
+    );
     // SAFETY: forwarded (rule 8).
     unsafe {
         if !c.ivalid(a) {
@@ -37,6 +41,10 @@ pub(crate) unsafe fn s_persist<const J: bool>(c: &mut Core, dst: u16, a: u16, ce
         };
         let rel = cell as u32 * c.cell_bytes;
         let dst_off = c.persist_off + rel;
+        debug_assert!(
+            c.cell_bytes != 0 && rel as u64 + c.cell_bytes as u64 <= c.persist_bytes as u64,
+            "rule 25: S_PERSIST cell outside str_persist"
+        );
         if src != dst_off {
             if J {
                 c.touch_block(dst_off, c.cell_bytes);
@@ -45,6 +53,8 @@ pub(crate) unsafe fn s_persist<const J: bool>(c: &mut Core, dst: u16, a: u16, ce
             // store — a scratch string dies with its evaluation and a var string must survive it —
             // keeping the scratch bytes alive rejected: the arena resets every evaluation (§3.4).
             // memmove: a substring view of this very cell may overlap it.
+            // SAFETY: rule 25 — [dst_off, dst_off + cell_bytes) lies in str_persist and len <=
+            // cell_bytes (checked above); the source is a live arena string (arena_off).
             core::ptr::copy(c.base.add(src as usize), c.base.add(dst_off as usize), len as usize);
         }
         c.wiv::<J>(dst, StrRef::persist(rel, len).0 as i64, true);

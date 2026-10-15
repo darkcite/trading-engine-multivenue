@@ -304,12 +304,13 @@ pub(crate) fn run<const J: bool>(fr: &mut Frame<'_>, x: &Exec) -> Result<u32, (F
                 op::HIST_F => {
                     debug_assert!((ins.a as u32) < x.rings_len, "rule 8");
                     let r = *x.rings.add(ins.a as usize);
-                    let (k, inr) = hist_k(c, ins, x.consts, r.mask);
+                    let (k, inr) = hist_k(c, ins, x.consts, x.consts_len, r.mask);
                     let v = if !inr {
                         f64::NAN
                     } else if k == 0 {
                         c.rf(r.slot)
                     } else {
+                        // SAFETY: rule 8 — `a` < rings.len(), so `r` is a rule-4 ring.
                         f64::from_bits(*cell_ptr(c, &r, x.head, k))
                     };
                     c.wf::<J>(ins.dst, v)
@@ -317,12 +318,13 @@ pub(crate) fn run<const J: bool>(fr: &mut Frame<'_>, x: &Exec) -> Result<u32, (F
                 op::HIST_I => {
                     debug_assert!((ins.a as u32) < x.rings_len, "rule 8");
                     let r = *x.rings.add(ins.a as usize);
-                    let (k, inr) = hist_k(c, ins, x.consts, r.mask);
+                    let (k, inr) = hist_k(c, ins, x.consts, x.consts_len, r.mask);
                     let (v, ok) = if !inr {
                         if r.flags & ring_flag::INIT_FALSE != 0 { (0, true) } else { (NA_I64, false) }
                     } else if k == 0 {
                         (c.ri(r.slot), c.ivalid(r.slot))
                     } else {
+                        // SAFETY: rule 8 — `a` < rings.len(), so `r` is a rule-4 ring.
                         let w = *cell_ptr(c, &r, x.head, k) as i64;
                         (w, !(ins.flags & flg::NA_TRACKED != 0 && w == NA_I64))
                     };
@@ -412,6 +414,7 @@ pub(crate) fn run<const J: bool>(fr: &mut Frame<'_>, x: &Exec) -> Result<u32, (F
                 }
                 op::O_GET_F => match o_field(c, ins.a, ins.b) {
                     Ok((_, off)) => {
+                        // SAFETY: rule 15 — o_field returned an offset inside the Object block.
                         let v = f64::from_bits(*(c.base.add(off as usize) as *const u64));
                         c.wf::<J>(ins.dst, v)
                     }
@@ -419,6 +422,7 @@ pub(crate) fn run<const J: bool>(fr: &mut Frame<'_>, x: &Exec) -> Result<u32, (F
                 },
                 op::O_GET_I => match o_field(c, ins.a, ins.b) {
                     Ok((_, off)) => {
+                        // SAFETY: rule 15 — o_field returned an offset inside the Object block.
                         let w = *(c.base.add(off as usize) as *const i64);
                         let ok = !(ins.flags & flg::NA_TRACKED != 0 && w == NA_I64);
                         c.wiv::<J>(ins.dst, w, ok);
@@ -437,6 +441,7 @@ pub(crate) fn run<const J: bool>(fr: &mut Frame<'_>, x: &Exec) -> Result<u32, (F
                         if J {
                             c.touch_block(d.off, d.bytes);
                         }
+                        // SAFETY: rule 15 — o_field returned an offset inside the Object block.
                         *(c.base.add(off as usize) as *mut i64) = w;
                     }
                     Err(k) => return Err((k, here)),
