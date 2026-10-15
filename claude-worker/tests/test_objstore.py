@@ -21,13 +21,16 @@ import hmac
 import json
 import os
 import pathlib
+import select
 import signal
+import threading
 import typing
 import urllib.parse
 
 import httpx
 import pytest
 
+import claude_worker.archive
 import claude_worker.objstore
 import tests.fake_s3
 
@@ -562,33 +565,30 @@ def test_list_multipart_follows_both_markers_across_pages() -> None:
     assert fake_s3.count("GET") == 3
 
 
+_Handler = typing.Callable[[int, object], None]
+
+
 @pytest.fixture
-def sigterm_exits() -> typing.Iterator[None]:
-    """SIGTERM raises SystemExit(143), as `archive-run.py`'s handler does.
-    Afterwards the mask AND the handler are restored — SIGTERM ignored while
-    the mask is, so a regression that left it blocked and pending can neither
-    leak into later tests nor kill the runner."""
+def sigterm_exits() -> typing.Iterator[_Handler]:
+    """SIGTERM raises SystemExit(143), as the archiver's `_terminate` does;
+    the handler before is restored afterwards, so a regression that left a
+    deferral installed cannot leak into later tests."""
 
     def terminate(_signum: int, _frame: object) -> None:
         raise SystemExit(143)
 
-    mask = signal.pthread_sigmask(signal.SIG_BLOCK, ())
     before = signal.signal(signal.SIGTERM, terminate)
     try:
-        yield
+        yield terminate
     finally:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-        signal.signal(signal.SIGTERM, before)
+        try:
+            signal.signal(signal.SIGTERM, before)
+        except SystemExit:  # a late SIGTERM ran `terminate` inside the swap
+            signal.signal(signal.SIGTERM, before)
 
 
-def _sigterm_blocked() -> bool:
-    return signal.SIGTERM in signal.pthread_sigmask(signal.SIG_BLOCK, ())
-
-
-@pytest.mark.usefixtures("sigterm_exits")
 def test_sigterm_during_the_initiate_is_held_until_the_abort_can_reach_it(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, sigterm_exits: _Handler
 ) -> None:
     """Delivered during the initiate, SIGTERM used to unwind before the upload
     id was known: an orphan. Held, it lands inside the abort's try."""
@@ -602,12 +602,125 @@ def test_sigterm_during_the_initiate_is_held_until_the_abort_can_reach_it(
         store.multipart_put("v1/runs/mbp-m4/run-1/obj.bin", src, part_size=part)
     assert fake_s3.uploads == {}, "the held SIGTERM must reach the abort"
     assert any(m == "DELETE" and "uploadId" in q for m, _p, q in fake_s3.requests)
-    assert not _sigterm_blocked()
+    assert signal.getsignal(signal.SIGTERM) is sigterm_exits
+
+
+def test_the_hold_holds_when_another_thread_takes_the_signal(
+    tmp_path: pathlib.Path, sigterm_exits: _Handler
+) -> None:
+    """The first HK21 hold was a per-thread mask: in a threaded process the
+    OS hands SIGTERM to a thread that does not block it, and the handler still
+    ran on the main thread mid-initiate (an orphan; seen in the full suite,
+    where earlier tests leave threads). Sent to another thread on purpose,
+    and waited for on the wakeup fd (written once the signal is tripped), so
+    it is taken inside the initiate, never after."""
+    stop = threading.Event()
+    other = threading.Thread(target=stop.wait, daemon=True)
+    other.start()
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_w, False)
+    old_wake = signal.set_wakeup_fd(wake_w)
+    try:
+        assert other.ident is not None
+        ident = other.ident
+
+        def to_the_other_thread() -> None:
+            signal.pthread_kill(ident, signal.SIGTERM)
+            select.select([wake_r], [], [], 5.0)
+
+        fake_s3 = tests.fake_s3.FakeS3()
+        fake_s3.on_initiate = to_the_other_thread
+        store = make_store(fake_s3)
+        part = 5 * 1024 * 1024
+        src = tmp_path / "obj.bin"
+        src.write_bytes(b"f" * (part + 16))
+        with pytest.raises(SystemExit):
+            store.multipart_put("v1/runs/mbp-m4/run-1/obj.bin", src, part_size=part)
+    finally:
+        signal.set_wakeup_fd(old_wake)
+        os.close(wake_r)
+        os.close(wake_w)
+        stop.set()
+        other.join()
+    assert fake_s3.uploads == {}, "the deferred SIGTERM must reach the abort"
+    assert signal.getsignal(signal.SIGTERM) is sigterm_exits
+
+
+def test_the_archivers_one_shot_handler_exits_once_and_aborts(tmp_path: pathlib.Path) -> None:
+    """The real handler (`archive._terminate`, one-shot): two SIGTERMs during
+    the initiate give ONE SystemExit(143), the abort runs, and the handler is
+    left SIG_IGN, as `_terminate` leaves it."""
+    fake_s3 = tests.fake_s3.FakeS3()
+
+    def twice() -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    fake_s3.on_initiate = twice
+    store = make_store(fake_s3)
+    part = 5 * 1024 * 1024
+    src = tmp_path / "obj.bin"
+    src.write_bytes(b"f" * (part + 16))
+    before = signal.signal(signal.SIGTERM, claude_worker.archive._terminate)
+    try:
+        with pytest.raises(SystemExit) as exited:
+            store.multipart_put("v1/runs/mbp-m4/run-1/obj.bin", src, part_size=part)
+        after = signal.getsignal(signal.SIGTERM)
+    finally:
+        signal.signal(signal.SIGTERM, before)
+    assert exited.value.code == claude_worker.archive.EXIT_TERMINATED
+    assert fake_s3.uploads == {}
+    assert any(m == "DELETE" and "uploadId" in q for m, _p, q in fake_s3.requests)
+    assert after == signal.SIG_IGN
+
+
+def test_off_the_main_thread_nothing_is_deferred(sigterm_exits: _Handler) -> None:
+    """``signal.signal`` refuses off the main thread: no deferral there."""
+    got: list[object] = []
+    worker = threading.Thread(target=lambda: got.append(claude_worker.objstore._deferral()))
+    worker.start()
+    worker.join()
+    assert got == [None]
+    assert signal.getsignal(signal.SIGTERM) is sigterm_exits
 
 
 @pytest.mark.usefixtures("sigterm_exits")
+def test_no_python_handler_no_deferral() -> None:
+    """SIG_IGN / SIG_DFL have nothing to unwind through: deferring would only
+    make the orphan certain (SIG_DFL dies at the release instead)."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    assert claude_worker.objstore._deferral() is None
+
+
+def test_a_release_cut_short_is_finished_by_the_next(
+    monkeypatch: pytest.MonkeyPatch, sigterm_exits: _Handler
+) -> None:
+    """A KeyboardInterrupt inside the release's swap must not strand the
+    recorder (it would swallow every later SIGTERM): the deferral is dropped
+    only once released, so the next release finishes it."""
+    store = make_store(tests.fake_s3.FakeS3())
+    store._hold()
+    assert signal.getsignal(signal.SIGTERM) != sigterm_exits
+    real = signal.signal
+    cut: list[bool] = []
+
+    def interrupted_once(signum: int, handler: typing.Any) -> typing.Any:
+        if not cut:
+            cut.append(True)
+            raise KeyboardInterrupt
+        return real(signum, handler)
+
+    monkeypatch.setattr(signal, "signal", interrupted_once)
+    with pytest.raises(KeyboardInterrupt):
+        store._release_held()
+    monkeypatch.undo()
+    assert signal.getsignal(signal.SIGTERM) != sigterm_exits, "still the deferral"
+    store._release_held()
+    assert signal.getsignal(signal.SIGTERM) is sigterm_exits
+
+
 def test_a_failed_initiate_attempt_releases_sigterm_before_its_backoff(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, sigterm_exits: _Handler
 ) -> None:
     """The hold is one attempt, not the retry loop (a stalled loop held a stop
     for up to 6 x 900 s): a SIGTERM during an attempt that failed is delivered
@@ -625,28 +738,7 @@ def test_a_failed_initiate_attempt_releases_sigterm_before_its_backoff(
     assert slept == [], "released before the backoff"
     assert fake_s3.count("POST") == 1
     assert fake_s3.uploads == {}
-    assert not _sigterm_blocked()
-
-
-@pytest.mark.usefixtures("sigterm_exits")
-def test_a_sigterm_inside_the_blocking_call_leaves_it_unblocked(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """`pthread_sigmask` runs a pending handler before it returns, so the exit
-    can come out of the very call that blocked SIGTERM."""
-    real = signal.pthread_sigmask
-
-    def handler_runs_inside(how: int, mask: typing.Iterable[int]) -> set[int]:
-        previous = real(how, mask)
-        if how == signal.SIG_BLOCK and signal.SIGTERM in set(mask):
-            raise SystemExit(143)
-        return previous
-
-    monkeypatch.setattr(signal, "pthread_sigmask", handler_runs_inside)
-    with pytest.raises(SystemExit):
-        claude_worker.objstore._hold_term()
-    monkeypatch.undo()
-    assert not _sigterm_blocked()
+    assert signal.getsignal(signal.SIGTERM) is sigterm_exits
 
 
 def test_the_control_requests_run_on_the_short_timeout(tmp_path: pathlib.Path) -> None:

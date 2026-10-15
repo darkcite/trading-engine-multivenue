@@ -55,6 +55,7 @@ import pathlib
 import random
 import re
 import signal
+import threading
 import time
 import typing
 import urllib.parse
@@ -372,8 +373,8 @@ class ObjectStore:
         self._creds = creds
         self._http = http_client
         self._timeout_s = timeout_s
-        # HK21: True while a ``hold_term`` request's SIGTERM is still held.
-        self._term_held = False
+        # HK21: set while a ``hold_term`` request's SIGTERM is still deferred.
+        self._term_held: _HeldTerm | None = None
         self._clock = clock
         self._sleep = sleep
         self._rng = rng if rng is not None else random.Random(0)
@@ -493,9 +494,9 @@ class ObjectStore:
                 content_length=length,
                 timeout_s=self._timeout_s if timeout_s is None else timeout_s,
             )
-            if hold_term:
-                self._term_held = _hold_term()
             try:
+                if hold_term:
+                    self._hold()
                 response = self._http.send(request, stream=stream_response)
             except httpx.TransportError as exc:
                 last = ObjStoreError(
@@ -526,11 +527,24 @@ class ObjectStore:
                 self._sleep(delay * (0.8 + 0.4 * self._rng.random()))
         raise last if last is not None else ObjStoreError(f"{method} {key or '/'}: no attempt made")
 
+    def _hold(self) -> None:
+        """Defer SIGTERM for one attempt (HK21). The deferral is kept BEFORE
+        it is installed, so every release path can find it, even one taken
+        by an exception between the two."""
+        held = _deferral()
+        if held is not None:
+            self._term_held = held
+            signal.signal(signal.SIGTERM, held.record)
+
     def _release_held(self) -> None:
         """Release what a ``hold_term`` request left held; a no-op when none
-        is. A SIGTERM held meanwhile raises out of this call."""
-        held, self._term_held = self._term_held, False
-        _release_term(held)
+        is. A SIGTERM held meanwhile raises out of this call. Idempotent: the
+        deferral is dropped only once released, so a release cut short is
+        finished by the next."""
+        held = self._term_held
+        if held is not None:
+            _release_term(held)
+            self._term_held = None
 
     # -- verbs --------------------------------------------------------------
 
@@ -709,13 +723,14 @@ class ObjectStore:
         if parts_total > MAX_PARTS:
             raise ObjStoreError(f"{parts_total} parts exceeds the {MAX_PARTS} limit")
 
-        # HK21: the initiate runs with SIGTERM HELD (blocked, not ignored),
-        # one attempt at a time. Delivered after the bucket made the upload but
-        # before its id is in hand, a SIGTERM's SystemExit would leave nothing
-        # to abort: an orphan. A failed attempt releases it before its backoff;
-        # the answering one keeps it until the id is in hand, released inside
-        # the try below, where the abort reaches it. An attempt whose answer
-        # was LOST made an upload no one can name: `abort-stale` clears those.
+        # HK21: the initiate runs with SIGTERM DEFERRED (recorded, then raised
+        # again), one attempt at a time. Acted on after the bucket made the
+        # upload but before its id is in hand, a SIGTERM's SystemExit would
+        # leave nothing to abort: an orphan. A failed attempt releases it
+        # before its backoff; the answering one keeps it until the id is in
+        # hand, released inside the try below, where the abort reaches it. An
+        # attempt whose answer was LOST made an upload no one can name:
+        # `abort-stale` clears those.
         try:
             initiate = self._send(
                 "POST",
@@ -881,35 +896,48 @@ def _file_chunks(
             yield chunk
 
 
-def _hold_term() -> bool:
-    """Block SIGTERM; True when this call blocked it (HK21).
+class _HeldTerm:
+    """The SIGTERM handler a hold replaced, and whether one arrived (HK21)."""
 
-    Holds only on the main thread of a single-threaded process (the
-    archiver's case): Python runs handlers on the main thread, and in a
-    threaded process another thread would take the signal. Where the
-    platform has no per-thread mask nothing is held, and `abort-stale` is
-    what clears an upload orphaned during its initiate.
+    __slots__ = ("previous", "seen")
 
-    ``pthread_sigmask`` runs a pending handler before it returns, so its
-    SystemExit can come out of the very call that blocked SIGTERM: that exit
-    unblocks first, so none leaves SIGTERM blocked."""
-    if not hasattr(signal, "pthread_sigmask"):
-        return False
-    if signal.SIGTERM in signal.pthread_sigmask(signal.SIG_BLOCK, ()):
-        return False
-    try:
-        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
-    except BaseException:
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
-        raise
-    return True
+    def __init__(self, previous: typing.Any) -> None:  # whatever getsignal gave
+        self.previous = previous
+        self.seen = False
+
+    def record(self, _signum: int, _frame: object) -> None:
+        self.seen = True
 
 
-def _release_term(held: bool) -> None:
-    """Unblock what `_hold_term` blocked. A SIGTERM held meanwhile is
-    delivered inside this call: its handler's SystemExit comes out of here."""
-    if held:
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+def _deferral() -> _HeldTerm | None:
+    """A deferral of SIGTERM, not yet installed (HK21): while its ``record``
+    is the handler, a SIGTERM is recorded, not acted on, until
+    `_release_term`.
+
+    A deferral, not a mask: Python runs a handler on the main thread whichever
+    thread the OS hands the signal to, so it holds in a threaded process too,
+    where a per-thread mask did not (another thread took the signal; the
+    first HK21 cut). None — nothing deferred, `abort-stale` clears what an
+    orphaned initiate leaves — off the main thread (``signal.signal`` refuses
+    there) and when there is no Python handler to unwind through (None,
+    SIG_DFL, SIG_IGN: deferring those would only make the orphan certain)."""
+    if threading.current_thread() is not threading.main_thread():
+        return None
+    previous = signal.getsignal(signal.SIGTERM)
+    if not callable(previous):
+        return None
+    return _HeldTerm(previous)
+
+
+def _release_term(held: _HeldTerm) -> None:
+    """Put the replaced handler back (only if the deferral is still the
+    handler: idempotent) and raise a SIGTERM recorded meanwhile again, once,
+    so its handler's SystemExit comes out of this call."""
+    if signal.getsignal(signal.SIGTERM) == held.record:  # bound methods: ==
+        signal.signal(signal.SIGTERM, held.previous)
+    if held.seen:
+        held.seen = False
+        signal.raise_signal(signal.SIGTERM)
 
 
 def _paced_chunks(
