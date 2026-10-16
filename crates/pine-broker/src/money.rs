@@ -64,6 +64,20 @@ pub(crate) const fn pct_1e12(v_1e12: i128, pct_1e6: i64) -> i128 {
     mul_div(v_1e12, pct_1e6 as i128, 100 * E6)
 }
 
+/// A9 — `v` as a percentage of one trade's base, ×1e6: `v / (entry_px × |qty|) × 100`, i.e.
+/// sat_i64(mul_div(v, 100·E6, entry_px·|qty|)), truncated toward zero; `None` on a zero base.
+/// The base is `pine-std`'s per-trade percent accessors' (`profit_percent`, `max_runup_percent`,
+/// `max_drawdown_percent`): entry price × |size|, no point value (`pin:04-trade-pct-provisional`).
+pub(crate) const fn trade_pct_1e6(v_1e12: i128, entry_px_1e6: i64, qty_1e6: i64) -> Option<i64> {
+    // `|i64| · |i64| < 2^126`: the product of two `i64` always fits an `i128`.
+    let q = qty_1e6 as i128;
+    let base = entry_px_1e6 as i128 * if q < 0 { -q } else { q };
+    if base == 0 {
+        return None;
+    }
+    Some(sat_i64(mul_div(v_1e12, 100 * E6, base)))
+}
+
 /// Contracts ×1e6 that `v` buys at `px` with `pv`: sat_i64(mul_div(v, E6, px·pv)); 0 if px·pv ≤ 0.
 pub(crate) const fn qty_for_value(v_1e12: i128, px_1e6: i64, pv_1e6: i64) -> i64 {
     // The product of two `i64` always fits an `i128`.
@@ -131,9 +145,35 @@ pub(crate) const fn ceil_tick(px_1e6: i64, tick_1e6: i64) -> i64 {
 mod tests {
     use super::{
         ceil_tick, e12_to_1e6_ceil, e12_to_1e6_floor, floor_step, floor_tick, mul_div, pct_1e12,
-        qty_for_value, round_tick, sat_i64, ticks_px, usd_1e6_to_1e12, value_1e12, E6, SAT,
+        qty_for_value, round_tick, sat_i64, ticks_px, trade_pct_1e6, usd_1e6_to_1e12, value_1e12,
+        E6, SAT,
     };
     use proptest::prelude::{any, prop_assert, prop_assert_eq, proptest, ProptestConfig};
+
+    #[test]
+    fn trade_pct_is_value_over_entry_notional_truncated() {
+        // $2.50 on 2 × $100 = 1.25 %; a loss keeps its sign; a short's base is |qty|.
+        let v = 2_500_000_000_000;
+        assert_eq!(
+            trade_pct_1e6(v, 100 * 1_000_000, 2_000_000),
+            Some(1_250_000)
+        );
+        assert_eq!(
+            trade_pct_1e6(-v, 100 * 1_000_000, -2_000_000),
+            Some(-1_250_000)
+        );
+        // 1/3 % truncates toward zero.
+        assert_eq!(
+            trade_pct_1e6(1_000_000_000_000, 300 * 1_000_000, 1_000_000),
+            Some(333_333)
+        );
+        assert_eq!(
+            trade_pct_1e6(-1_000_000_000_000, 300 * 1_000_000, 1_000_000),
+            Some(-333_333)
+        );
+        assert_eq!(trade_pct_1e6(v, 0, 2_000_000), None);
+        assert_eq!(trade_pct_1e6(i128::MAX, 1, 1), Some(i64::MAX));
+    }
 
     #[test]
     fn mul_div_truncates_toward_zero() {

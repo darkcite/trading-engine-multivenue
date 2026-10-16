@@ -10,7 +10,9 @@
 use crate::cap;
 use crate::closed::ClosedRing;
 use crate::fault::{BrokerFault, InternalDefect, ScriptRefusal};
-use crate::money::{e12_to_1e6_ceil, e12_to_1e6_floor, mul_div, usd_1e6_to_1e12, E6};
+use crate::money::{
+    e12_to_1e6_ceil, e12_to_1e6_floor, mul_div, trade_pct_1e6, usd_1e6_to_1e12, E6,
+};
 use pine_ir::{trade_flag, BrokerView, StrKey, Sym, TradeRec};
 
 /// `cap::LOTS − 1`: the ring mask (`LOTS` is a power of two).
@@ -94,6 +96,13 @@ pub(crate) struct Book {
     trough_equity_1e12: i128,
     max_drawdown_1e12: i128,
     max_runup_1e12: i128,
+    /// A9 — the largest per-trade `max_drawdown` / `max_runup` percent seen, ×1e6.
+    max_dd_pct_1e6: i64,
+    max_ru_pct_1e6: i64,
+    /// A9 — Σ closed-trade `profit_percent` ×1e6: all, winning, losing.
+    sum_trade_pct_1e6: i64,
+    sum_win_pct_1e6: i64,
+    sum_loss_pct_1e6: i64,
     max_held_all_1e6: i64,
     max_held_long_1e6: i64,
     max_held_short_1e6: i64,
@@ -135,6 +144,11 @@ impl Book {
             trough_equity_1e12: 0,
             max_drawdown_1e12: 0,
             max_runup_1e12: 0,
+            max_dd_pct_1e6: 0,
+            max_ru_pct_1e6: 0,
+            sum_trade_pct_1e6: 0,
+            sum_win_pct_1e6: 0,
+            sum_loss_pct_1e6: 0,
             max_held_all_1e6: 0,
             max_held_long_1e6: 0,
             max_held_short_1e6: 0,
@@ -181,6 +195,11 @@ impl Book {
         self.trough_equity_1e12 = initial;
         self.max_drawdown_1e12 = 0;
         self.max_runup_1e12 = 0;
+        self.max_dd_pct_1e6 = 0;
+        self.max_ru_pct_1e6 = 0;
+        self.sum_trade_pct_1e6 = 0;
+        self.sum_win_pct_1e6 = 0;
+        self.sum_loss_pct_1e6 = 0;
         self.max_held_all_1e6 = 0;
         self.max_held_long_1e6 = 0;
         self.max_held_short_1e6 = 0;
@@ -414,10 +433,17 @@ impl Book {
             c.exit_ms = time_ms;
             c.exit_bar = bar_index;
             self.netprofit_1e12 = self.netprofit_1e12.saturating_add(c_pnl);
+            // A9: the closed record's percents, read as `closedtrades.*_percent` reads it.
+            let (c_ru, c_dd) = (c.max_runup_1e6, c.max_drawdown_1e6);
+            self.roll_trade_pcts(c_ru, c_dd, l_entry, c_qty);
+            let c_pct = trade_pct_1e6(c_pnl, l_entry, c_qty).unwrap_or(0);
+            self.sum_trade_pct_1e6 = self.sum_trade_pct_1e6.saturating_add(c_pct);
             if c_pnl > 0 {
+                self.sum_win_pct_1e6 = self.sum_win_pct_1e6.saturating_add(c_pct);
                 self.grossprofit_1e12 = self.grossprofit_1e12.saturating_add(c_pnl);
                 self.wintrades += 1;
             } else if c_pnl < 0 {
+                self.sum_loss_pct_1e6 = self.sum_loss_pct_1e6.saturating_add(c_pct);
                 self.grossloss_1e12 = self.grossloss_1e12.saturating_sub(c_pnl);
                 self.losstrades += 1;
             } else {
@@ -511,6 +537,13 @@ impl Book {
             l.max_runup_1e6 = l.max_runup_1e6.max(e12_to_1e6_floor(gross.max(0)));
             l.max_drawdown_1e6 = l.max_drawdown_1e6.max(e12_to_1e6_ceil((-gross).max(0)));
             open = open.saturating_add(l.pnl_1e12);
+            let (ru, dd, e, q) = (
+                l.max_runup_1e6,
+                l.max_drawdown_1e6,
+                l.entry_px_1e6,
+                l.qty_1e6,
+            );
+            self.roll_trade_pcts(ru, dd, e, q);
             i += 1;
         }
         self.mark_1e6 = px_1e6;
@@ -525,6 +558,24 @@ impl Book {
             .max_runup_1e12
             .max(eq.saturating_sub(self.trough_equity_1e12));
         self.refresh_view();
+    }
+
+    /// A9 — roll `strategy.max_runup_percent` / `max_drawdown_percent`: the reference's per-trade
+    /// formula (`Highest|Lowest Value During Trade / (Entry Price x Quantity) * 100`) taken
+    /// literally, the largest over every trade's record as `opentrades.*` / `closedtrades.*` read
+    /// it (`pin:04-max-dd-pct-provisional`, `pin:04-max-runup-pct-provisional`). Called for each
+    /// open trade at every mark and for each closed slice; a zero base adds nothing.
+    fn roll_trade_pcts(&mut self, ru_1e6: i64, dd_1e6: i64, entry_px_1e6: i64, qty_1e6: i64) {
+        if ru_1e6 != 0 {
+            if let Some(p) = trade_pct_1e6(usd_1e6_to_1e12(ru_1e6), entry_px_1e6, qty_1e6) {
+                self.max_ru_pct_1e6 = self.max_ru_pct_1e6.max(p);
+            }
+        }
+        if dd_1e6 != 0 {
+            if let Some(p) = trade_pct_1e6(usd_1e6_to_1e12(dd_1e6), entry_px_1e6, qty_1e6) {
+                self.max_dd_pct_1e6 = self.max_dd_pct_1e6.max(p);
+            }
+        }
     }
 
     /// `initial_capital + netprofit + openprofit` (I9).
@@ -564,7 +615,12 @@ impl Book {
         v.initial_capital_1e12 = self.initial_1e12;
         v.max_drawdown_1e12 = self.max_drawdown_1e12;
         v.max_runup_1e12 = self.max_runup_1e12;
-        v._pad = [0; 6];
+        v.max_drawdown_pct_1e6 = self.max_dd_pct_1e6;
+        v.max_runup_pct_1e6 = self.max_ru_pct_1e6;
+        v.sum_trade_pct_1e6 = self.sum_trade_pct_1e6;
+        v.sum_win_pct_1e6 = self.sum_win_pct_1e6;
+        v.sum_loss_pct_1e6 = self.sum_loss_pct_1e6;
+        v._pad = [0; 1];
     }
 }
 
@@ -575,8 +631,8 @@ mod tests {
 
     use super::{Book, FillSrc};
     use crate::fault::{BrokerFault, InternalDefect, ScriptRefusal};
-    use crate::money::value_1e12;
-    use pine_ir::{trade_flag, StrKey, Sym};
+    use crate::money::{trade_pct_1e6, usd_1e6_to_1e12, value_1e12};
+    use pine_ir::{trade_flag, StrKey, Sym, TradeRec};
     use proptest::prelude::{prop_assert, prop_assert_eq, proptest, ProptestConfig};
 
     const PV: i64 = 1_000_000;
@@ -646,6 +702,92 @@ mod tests {
             assert_eq!(fees, b.commission_1e12(), "I13");
         }
         assert_eq!(v.closed_retained, v.closedtrades.min(9000), "I12");
+        if v.closedtrades <= 9000 {
+            check_a9(b);
+        }
+    }
+
+    /// A9: the view's five percent aggregates are the records' own, recomputed from scratch —
+    /// the per-trade maxima over every open and closed record, the sums over the closed ones.
+    fn check_a9(b: &Book) {
+        let pct = |v: i128, t: &TradeRec| trade_pct_1e6(v, t.entry_px_1e6, t.qty_1e6);
+        let (mut dd, mut ru, mut all, mut win, mut loss) = (0_i64, 0_i64, 0_i64, 0_i64, 0_i64);
+        let mut roll = |t: &TradeRec| {
+            dd = dd.max(pct(usd_1e6_to_1e12(t.max_drawdown_1e6), t).unwrap_or(0));
+            ru = ru.max(pct(usd_1e6_to_1e12(t.max_runup_1e6), t).unwrap_or(0));
+        };
+        let mut i = 0;
+        while let Some(t) = b.open_trade(i) {
+            roll(t);
+            i += 1;
+        }
+        let mut i = 0;
+        while let Some(t) = b.closed_trade(i) {
+            roll(t);
+            let p = pct(t.pnl_1e12, t).unwrap_or(0);
+            all = all.saturating_add(p);
+            if t.pnl_1e12 > 0 {
+                win = win.saturating_add(p);
+            } else if t.pnl_1e12 < 0 {
+                loss = loss.saturating_add(p);
+            }
+            i += 1;
+        }
+        let v = b.view();
+        assert_eq!(
+            (v.max_drawdown_pct_1e6, v.max_runup_pct_1e6),
+            (dd, ru),
+            "A9 maxima"
+        );
+        assert_eq!(
+            (v.sum_trade_pct_1e6, v.sum_win_pct_1e6, v.sum_loss_pct_1e6),
+            (all, win, loss),
+            "A9 sums"
+        );
+        assert_eq!(v._pad, [0; 1]);
+    }
+
+    /// A9 by hand: long 2 @ 100 marked 90 then 110 (drawdown and run-up $20 on a $200 base:
+    /// 10 % each), closed @ 105 (+$10: +5 %); short 1 @ 200 marked 210 ($10: 5 %), closed @ 204
+    /// (−$4: −2 %). Maxima 10 % / 10 %; Σ all +3 %, winners +5 %, losers −2 %. `reset` zeroes.
+    #[test]
+    fn a9_percent_aggregates_follow_the_records() {
+        let mut b = Book::new(CAP, PV, false);
+        let v = b.view();
+        assert_eq!(
+            (
+                v.max_drawdown_pct_1e6,
+                v.max_runup_pct_1e6,
+                v.sum_trade_pct_1e6
+            ),
+            (0, 0, 0)
+        );
+        b.apply_fill(qty(2), px(100), 0, &src(1), 0, 0, 0).unwrap();
+        b.mark(px(90));
+        assert_eq!(
+            b.view().max_drawdown_pct_1e6,
+            10_000_000,
+            "an open trade counts"
+        );
+        b.mark(px(110));
+        b.apply_fill(-qty(2), px(105), 0, &close(2, 0), 1, 0, 0)
+            .unwrap();
+        b.apply_fill(-qty(1), px(200), 0, &src(3), 2, 0, 0).unwrap();
+        b.mark(px(210));
+        b.apply_fill(qty(1), px(204), 0, &close(4, 0), 3, 0, 0)
+            .unwrap();
+        let v = *b.view();
+        assert_eq!(
+            (v.max_drawdown_pct_1e6, v.max_runup_pct_1e6),
+            (10_000_000, 10_000_000)
+        );
+        assert_eq!(
+            (v.sum_trade_pct_1e6, v.sum_win_pct_1e6, v.sum_loss_pct_1e6),
+            (3_000_000, 5_000_000, -2_000_000)
+        );
+        check(&b);
+        b.reset(CAP, PV, false);
+        assert_eq!(*b.view(), *Book::new(CAP, PV, false).view());
     }
 
     #[test]

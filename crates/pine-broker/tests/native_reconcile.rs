@@ -609,3 +609,42 @@ fn a_boot_short_is_closed_and_stopped_only_through_short_opened_ids() {
         "an exit from a long id never stops a boot short"
     );
 }
+
+/// Amendment A9 in native mode: 10 @ 100 ($1 000 base) marked at bar closes 90 and 110 (10 %
+/// drawdown and run-up), flattened @ 95 (−$50: −5 %). The aggregates ride `on_fill` and
+/// `open_bar`, the book's one transition and its marks.
+#[test]
+fn a9_percent_aggregates_ride_on_fill_and_open_bar() {
+    let mut b = broker(cfg());
+    let mut out = EngineIntentBuf::new();
+    b.apply_intents(&[entry()], NOW).unwrap();
+    b.reconcile(&quote(100 * E, 100 * E), NOW, &mut out)
+        .unwrap();
+    fill_all(&mut b, &out, 100 * E);
+    for (i, c) in [(1, 90), (2, 110)] {
+        b.open_bar(&Bar {
+            open_1e6: c * E,
+            high_1e6: c * E,
+            low_1e6: c * E,
+            close_1e6: c * E,
+            index: i,
+            ..Bar::default()
+        });
+    }
+    let v = *b.view();
+    assert_eq!(
+        (v.max_drawdown_pct_1e6, v.max_runup_pct_1e6),
+        (10 * E, 10 * E)
+    );
+    b.flatten(&quote(95 * E, 95 * E), NOW, &mut out).unwrap();
+    let oid = out.as_slice()[0].client_oid;
+    b.on_ack(oid);
+    b.on_fill(oid, -10 * E, 95 * E, 0, 1, 0).unwrap();
+    let v = *b.view();
+    assert_eq!((v.closedtrades, v.losstrades), (1, 1));
+    assert_eq!(
+        (v.sum_trade_pct_1e6, v.sum_win_pct_1e6, v.sum_loss_pct_1e6),
+        (-5 * E, 0, -5 * E)
+    );
+    assert_eq!(v._pad, [0; 1]);
+}

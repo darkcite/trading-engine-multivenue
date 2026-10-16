@@ -254,8 +254,24 @@ pub struct BrokerView {
     pub max_drawdown_1e12: i128,
     /// `strategy.max_runup` ×1e12 (≥ 0).
     pub max_runup_1e12: i128,
+    /// A9: `strategy.max_drawdown_percent` ×1e6 (≥ 0) — the largest per-trade
+    /// `max_drawdown / (entry_price × |size|) × 100` over every trade, open or
+    /// closed, as `closedtrades.max_drawdown_percent` reads each record
+    /// (`pin:04-max-dd-pct-provisional`); a zero-base trade adds nothing.
+    pub max_drawdown_pct_1e6: i64,
+    /// A9: `strategy.max_runup_percent` ×1e6 (≥ 0) — the same over the
+    /// per-trade `max_runup` (`pin:04-max-runup-pct-provisional`).
+    pub max_runup_pct_1e6: i64,
+    /// A9: Σ closed-trade `profit_percent` ×1e6 — `pnl / (entry_price ×
+    /// |size|) × 100` per closed record, truncated toward zero, saturating
+    /// (`pin:04-avg-trade-pct-provisional`).
+    pub sum_trade_pct_1e6: i64,
+    /// A9: the same Σ over winning closed trades (`pnl > 0`; ≥ 0).
+    pub sum_win_pct_1e6: i64,
+    /// A9: the same Σ over losing closed trades (`pnl < 0`; ≤ 0).
+    pub sum_loss_pct_1e6: i64,
     /// Always zero.
-    pub _pad: [u64; 6],
+    pub _pad: [u64; 1],
 }
 
 const _: () = assert!(core::mem::size_of::<IntentKind>() == 1);

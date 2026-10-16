@@ -1533,11 +1533,13 @@ const fn build() -> Built {
     );
     // Operator ruling 2026-10-16: `openprofit_percent` from the reference's formula
     // (`pin:04-openprofit-pct-provisional`) and the per-trade percents
-    // (`pin:04-trade-pct-provisional`). `max_drawdown_percent`, `max_runup_percent`,
-    // `avg_trade_percent`, `avg_winning_trade_percent`, `avg_losing_trade_percent` stay stubs:
-    // BrokerView carries no equity peak / trough and no Σ per-trade percent.
+    // (`pin:04-trade-pct-provisional`). Amendment A9 (lead ruling 2026-10-16): `max_drawdown_percent`,
+    // `max_runup_percent`, `avg_trade_percent`, `avg_winning_trade_percent` and
+    // `avg_losing_trade_percent` read `BrokerView`'s five A9 aggregates
+    // (`pin:04-max-dd-pct-provisional`, `pin:04-max-runup-pct-provisional`,
+    // `pin:04-avg-trade-pct-provisional`).
     {
-        let rows: [(OverloadId, BuiltinFn); 7] = [
+        let rows: [(OverloadId, BuiltinFn); 12] = [
             (
                 ov::STRATEGY_OPENPROFIT_PERCENT_VAR,
                 s::bi_var::<{ Var::OpenProfitPct as u8 }>,
@@ -1565,6 +1567,26 @@ const fn build() -> Built {
             (
                 ov::STRATEGY_CLOSEDTRADES_MAX_DRAWDOWN_PERCENT,
                 s::bi_trade::<false, { Fld::MaxDrawdownPct as u8 }>,
+            ),
+            (
+                ov::STRATEGY_MAX_DRAWDOWN_PERCENT_VAR,
+                s::bi_var::<{ Var::MaxDrawdownPct as u8 }>,
+            ),
+            (
+                ov::STRATEGY_MAX_RUNUP_PERCENT_VAR,
+                s::bi_var::<{ Var::MaxRunupPct as u8 }>,
+            ),
+            (
+                ov::STRATEGY_AVG_TRADE_PERCENT_VAR,
+                s::bi_var::<{ Var::AvgTradePct as u8 }>,
+            ),
+            (
+                ov::STRATEGY_AVG_WINNING_TRADE_PERCENT_VAR,
+                s::bi_var::<{ Var::AvgWinTradePct as u8 }>,
+            ),
+            (
+                ov::STRATEGY_AVG_LOSING_TRADE_PERCENT_VAR,
+                s::bi_var::<{ Var::AvgLossTradePct as u8 }>,
             ),
         ];
         let mut k = 0;

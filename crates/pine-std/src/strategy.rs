@@ -534,6 +534,22 @@ pub enum Var {
     /// reference's "`openPL / realizedEquity * 100`", realized equity = initial capital plus the
     /// closed trades' net profit (`pin:04-openprofit-pct-provisional`, operator ruling 2026-10-16).
     OpenProfitPct,
+    /// A9 `max_drawdown_percent` = `BrokerView::max_drawdown_pct_1e6` — the reference's
+    /// per-trade `Lowest Value During Trade / (Entry Price x Quantity) * 100`, the largest over
+    /// every trade, open or closed (`pin:04-max-dd-pct-provisional`); na before the first trade.
+    MaxDrawdownPct,
+    /// A9 `max_runup_percent` = `BrokerView::max_runup_pct_1e6` — the same over
+    /// `Highest Value During Trade` (`pin:04-max-runup-pct-provisional`); na before the first trade.
+    MaxRunupPct,
+    /// A9 `avg_trade_percent` = Σ closed `profit_percent` / `closedtrades` ("the sum of all profit
+    /// and loss percentages divided by the number of closed trades"; `÷0 → na`;
+    /// `pin:04-avg-trade-pct-provisional`).
+    AvgTradePct,
+    /// A9 `avg_winning_trade_percent` = Σ winning `profit_percent` / `wintrades` (`÷0 → na`).
+    AvgWinTradePct,
+    /// A9 `avg_losing_trade_percent` = −Σ losing `profit_percent` / `losstrades` — a positive
+    /// amount, as `avg_losing_trade` (`÷0 → na`; `pin:04-avg-trade-pct-provisional`).
+    AvgLossTradePct,
 }
 
 /// What a variable read yields before it is written.
@@ -609,6 +625,13 @@ fn read_var(b: &pine_ir::BrokerView, v: u8) -> Val {
     const AW: u8 = Var::AvgWinTrade as u8;
     const AL: u8 = Var::AvgLossTrade as u8;
     const OPP: u8 = Var::OpenProfitPct as u8;
+    const MDP: u8 = Var::MaxDrawdownPct as u8;
+    const MRP: u8 = Var::MaxRunupPct as u8;
+    const ATP: u8 = Var::AvgTradePct as u8;
+    const AWP: u8 = Var::AvgWinTradePct as u8;
+    const ALP: u8 = Var::AvgLossTradePct as u8;
+    // A9: no trade yet (none open, none ever closed) → the per-trade maxima read na.
+    let traded = b.opentrades != 0 || b.closedtrades != 0;
     let ic = scale::from_1e12(b.initial_capital_1e12);
     match v {
         PS => Val::F(scale::from_1e6(b.position_size_1e6)),
@@ -649,6 +672,20 @@ fn read_var(b: &pine_ir::BrokerView, v: u8) -> Val {
         OPP => Val::F(pct(
             scale::from_1e12(b.openprofit_1e12),
             scale::from_1e12(b.initial_capital_1e12 + b.netprofit_1e12),
+        )),
+        MDP if traded => Val::F(scale::from_1e6(b.max_drawdown_pct_1e6)),
+        MRP if traded => Val::F(scale::from_1e6(b.max_runup_pct_1e6)),
+        ATP => Val::F(div_na(
+            scale::from_1e6(b.sum_trade_pct_1e6),
+            b.closedtrades as f64,
+        )),
+        AWP => Val::F(div_na(
+            scale::from_1e6(b.sum_win_pct_1e6),
+            b.wintrades as f64,
+        )),
+        ALP => Val::F(div_na(
+            scale::from_1e6(b.sum_loss_pct_1e6.saturating_neg()),
+            b.losstrades as f64,
         )),
         _ => Val::F(f64::NAN),
     }
@@ -740,7 +777,9 @@ pub enum Fld {
     ExitId,
     /// `entry_comment` / `exit_comment`: not carried → na (`pin:04-strategy-edges`).
     Comment,
-    /// `profit_percent`: `profit / (entry_price × |size|) × 100`, losses negative.
+    /// `profit_percent`: `profit / (entry_price × |size|) × 100`, losses negative. The one
+    /// definition: `pine-broker` sums the same quotient per closed record (×1e6, truncated) into
+    /// `BrokerView::sum_*_pct_1e6` for the `avg_*_percent` variables (A9).
     ProfitPct,
     /// `max_runup_percent`: the reference's `Highest Value During Trade / (Entry Price x
     /// Quantity) * 100` — `max_runup / (entry_price × |size|) × 100`.

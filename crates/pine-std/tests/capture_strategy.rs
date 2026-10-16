@@ -685,7 +685,12 @@ fn view() -> BrokerView {
         initial_capital_1e12: 10_000_000_000_000_000,
         max_drawdown_1e12: 75_000_000_000_000,
         max_runup_1e12: 300_000_000_000_000,
-        _pad: [0; 6],
+        max_drawdown_pct_1e6: 12_500_000,
+        max_runup_pct_1e6: 31_250_000,
+        sum_trade_pct_1e6: 3_500_000,
+        sum_win_pct_1e6: 9_000_000,
+        sum_loss_pct_1e6: -5_500_000,
+        _pad: [0; 1],
     }
 }
 
@@ -1230,4 +1235,63 @@ fn strategy_percent_reads_follow_the_reference_formulas() {
             }
         }
     }
+}
+
+/// Amendment A9 (lead ruling 2026-10-16): `strategy.max_drawdown_percent` /
+/// `max_runup_percent` read `BrokerView::max_*_pct_1e6` (the reference's per-trade formula, the
+/// largest over every trade, `pin:04-max-dd-pct-provisional`, `pin:04-max-runup-pct-provisional`;
+/// na before the first trade); `avg_trade_percent` / `avg_winning_trade_percent` /
+/// `avg_losing_trade_percent` = Σ closed `profit_percent` / closed, wins, losses (the losing one a
+/// positive amount, as `avg_losing_trade`; `pin:04-avg-trade-pct-provisional`); ÷0 and no broker → na.
+#[test]
+fn a9_percent_vars_read_the_broker_aggregates() {
+    let fl = Lane::F64;
+    let rows = [
+        (ov::STRATEGY_MAX_DRAWDOWN_PERCENT_VAR, fl),
+        (ov::STRATEGY_MAX_RUNUP_PERCENT_VAR, fl),
+        (ov::STRATEGY_AVG_TRADE_PERCENT_VAR, fl),
+        (ov::STRATEGY_AVG_WINNING_TRADE_PERCENT_VAR, fl),
+        (ov::STRATEGY_AVG_LOSING_TRADE_PERCENT_VAR, fl),
+    ];
+    let b = view();
+    let mut ctx = TestCtx {
+        broker: Some(b),
+        ..TestCtx::default()
+    };
+    let got = read_vars(&rows, &mut ctx);
+    let want = [
+        scale::from_1e6(b.max_drawdown_pct_1e6),
+        scale::from_1e6(b.max_runup_pct_1e6),
+        scale::from_1e6(b.sum_trade_pct_1e6) / 7.0,
+        scale::from_1e6(b.sum_win_pct_1e6) / 4.0,
+        scale::from_1e6(-b.sum_loss_pct_1e6) / 2.0,
+    ];
+    for (k, (g, w)) in got.iter().zip(want).enumerate() {
+        assert_eq!(g.to_bits(), w.to_bits(), "row {k}: {g} vs {w}");
+    }
+    assert_eq!(got[0], 12.5);
+    assert_eq!(got[4], 2.75, "a positive amount");
+    // No trade at all: every A9 read is na.
+    ctx.broker = Some(BrokerView {
+        opentrades: 0,
+        closedtrades: 0,
+        wintrades: 0,
+        losstrades: 0,
+        ..b
+    });
+    assert!(read_vars(&rows, &mut ctx).iter().all(|v| v.is_nan()));
+    // One open trade, nothing closed: the maxima read, the averages are ÷0 → na.
+    ctx.broker = Some(BrokerView {
+        opentrades: 1,
+        closedtrades: 0,
+        wintrades: 0,
+        losstrades: 0,
+        ..b
+    });
+    let got = read_vars(&rows, &mut ctx);
+    assert_eq!((got[0], got[1]), (12.5, 31.25));
+    assert!(got[2..].iter().all(|v| v.is_nan()));
+    assert!(read_vars(&rows, &mut TestCtx::default())
+        .iter()
+        .all(|v| v.is_nan()));
 }
