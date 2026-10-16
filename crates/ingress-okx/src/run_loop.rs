@@ -288,6 +288,11 @@ pub struct Driver {
     book_chains: [OkxSeqChain; OKX_MAX_SYMBOLS],
     /// Trades monotonic-`seqId` monitors, same indexing.
     trade_seqs: [TradeSeqMonitor; OKX_MAX_SYMBOLS],
+    /// HK39: each instrument's `bbo-tbt` arrival sequencer keyed on the
+    /// venue `ts` — the `Tick.venue_seq` law (crate docs) — same indexing.
+    /// Its ordinal is process-lifetime, so it never falls under a book;
+    /// its clock is per connection ([`Self::reset_for_reconnect`]).
+    bbo_seq: [core_types::ArrivalSeq; OKX_MAX_SYMBOLS],
     /// M2.3: configured option FAMILY strings (`opt-summary`
     /// subscribe args; `(len, bytes)` rows, `n_families` valid).
     /// Boot-set, connection-independent.
@@ -376,7 +381,7 @@ impl Driver {
             i += 1;
         }
         // COPY: the 3 208 B symbol table and the ≤ 400 B family table above
-        // move into the driver, and the 7 696 B driver returns by value — once
+        // move into the driver, and the 8 976 B driver returns by value — once
         // per connection, at boot — the driver holds its tables INLINE so
         // every hot lookup walks contiguous rows with no pointer to chase —
         // rejected: a `Box` per table (a heap hop on the hot lookup) and a
@@ -396,6 +401,7 @@ impl Driver {
             subs: SubTable::new(),
             book_chains: [OkxSeqChain::new(); OKX_MAX_SYMBOLS],
             trade_seqs: [TradeSeqMonitor::new(); OKX_MAX_SYMBOLS],
+            bbo_seq: [core_types::ArrivalSeq::ZERO; OKX_MAX_SYMBOLS],
             families: fam,
             n_families,
             subscribed: false,
@@ -471,6 +477,11 @@ impl Driver {
         self.subscribed = false;
         // VT2: a new connection is a new offset; the threshold stays.
         self.feed_clock.reset();
+        // HK39: every instrument's ordinal stays (monotone — no book sees
+        // it fall); its clock is zeroed, so a reconnect clears a clock a
+        // far-future `ts` poisoned. rx is cleared and the old socket gone:
+        // no push of the old connection can follow.
+        core_types::ArrivalSeq::reset_clocks(&mut self.bbo_seq);
     }
 }
 
@@ -1117,11 +1128,18 @@ fn handle_data_frame<C: Capture>(
                                 let now = now_ns();
                                 let venue_time_ms = f.ts_ns / 1_000_000;
                                 let judged = drv.feed_clock.judge(venue_time_ms, now);
+                                // HK39 (ruling HK-R26): the instrument's
+                                // arrival ordinal keyed on `ts`, NOT
+                                // `seqId` (crate docs) — an older `ts`
+                                // takes 0 (dropped by every book) and is
+                                // counted.
+                                let venue_seq = drv.bbo_seq[sym_idx].next(venue_time_ms);
+                                status.note_arrival_seq(venue_seq);
                                 tick = Tick::new_stamped(
                                     now,
                                     VenueId::Okx,
                                     sym,
-                                    f.seq_id as u32,
+                                    venue_seq,
                                     Price::from_raw(f.bid_px_1e6),
                                     Qty::from_raw(f.bid_qty_1e6),
                                     Price::from_raw(f.ask_px_1e6),
@@ -2454,12 +2472,147 @@ mod tests {
         let tick = *cons.try_pop_ref().expect("tick must be pushed");
         assert_eq!(tick.sym, SYM_BTC);
         assert_eq!(tick.venue, VenueId::Okx as u8);
-        assert_eq!(tick.venue_seq, 363_996_337u32);
+        // HK39: the instrument's first arrival ordinal, keyed on `ts` (old
+        // law: `seqId` 363 996 337 as u32).
+        assert_eq!(tick.venue_seq, 1);
+        assert_eq!(status.seq_regressions_total(), 0);
         assert_eq!(tick.bid_px.raw(), 111_050_000);
         assert_eq!(tick.ask_px.raw(), 111_060_000);
         assert_eq!(tick.bid_qty.raw(), 7_000_000);
         assert_eq!(tick.ask_qty.raw(), 5_000_000);
         assert!(tick.ts_ns > 0);
+    }
+
+    /// HK39 rig: a steady driver over the test symbols (`BTC-USDT`,
+    /// `ETH-USD-SWAP`); `push` drives one `bbo-tbt` push and returns its
+    /// tick.
+    struct BboRig {
+        t: TestTransport,
+        d: Driver,
+        prod: Producer<Tick, TICK_RING_CAP>,
+        cons: core_ring::Consumer<Tick, TICK_RING_CAP>,
+        status: IngressStatus,
+    }
+
+    impl BboRig {
+        fn new() -> Self {
+            let (prod, cons) = ring_pair();
+            Self {
+                t: TestTransport::with_capacity(16 * 1024),
+                d: steady_driver(false),
+                prod,
+                cons,
+                status: IngressStatus::new(),
+            }
+        }
+
+        /// One `bbo-tbt` push for `inst` stamped `ts` (ms) with `seqId`
+        /// `seq` and best bid `bid`.
+        fn push(&mut self, inst: &str, ts: u64, seq: u64, bid: &str) -> Tick {
+            let body = format!(
+                r#"{{"arg":{{"channel":"bbo-tbt","instId":"{inst}"}},"data":[{{"asks":[["111.06","5","0","2"]],"bids":[["{bid}","7","0","2"]],"ts":"{ts}","seqId":{seq}}}]}}"#
+            );
+            let mut frame = [0u8; 512];
+            let n = wrap_text_frame(body.as_bytes(), &mut frame);
+            self.t.inject_incoming(&frame[..n]);
+            drive_one(
+                &mut self.t,
+                &mut self.d,
+                b"h",
+                b"/",
+                &mut self.prod,
+                &self.status,
+                &mut NullCapture,
+            )
+            .unwrap();
+            *self
+                .cons
+                .try_pop_ref()
+                .expect("a parsed bbo-tbt push is a tick")
+        }
+
+        /// A reconnect, then the steady shape `steady_driver` builds.
+        fn reconnect(&mut self) {
+            self.d.reset_for_reconnect(9);
+            self.d.set_state(State::Steady);
+            self.d.subscribed = true;
+        }
+    }
+
+    /// A live stamp (2026-10-16).
+    const T0: u64 = 1_792_139_400_123;
+
+    /// HK39 (ruling HK-R26): two pushes in one `ts` take successive
+    /// ordinals and both apply — the later arrival is the touch; a `seqId`
+    /// across 2^32 is irrelevant (old law: its low 32 bits fell from
+    /// `u32::MAX` to 1 and every later push was `Stale` until a restart).
+    #[test]
+    fn same_ts_pushes_take_successive_ordinals_and_a_seq_id_past_2_32_is_irrelevant() {
+        use book_builder::{ApplyOutcome, TopOfBook};
+        let mut r = BboRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        let a = r.push("BTC-USDT", T0, 0xFFFF_FFFF, "111.04");
+        let b = r.push("BTC-USDT", T0, 0x1_0000_0001, "111.05");
+        let c = r.push("BTC-USDT", T0 + 10, 0x1_0000_0002, "111.03");
+        assert_eq!((a.venue_seq, b.venue_seq, c.venue_seq), (1, 2, 3));
+        assert_eq!(book.apply(&a), ApplyOutcome::Applied);
+        assert_eq!(
+            book.apply(&b),
+            ApplyOutcome::Applied,
+            "same ts, later arrival"
+        );
+        assert_eq!(book.bid_px.raw(), 111_050_000);
+        assert_eq!(book.apply(&c), ApplyOutcome::Applied, "seqId past 2^32");
+        assert_eq!(book.bid_px.raw(), 111_030_000);
+        assert_eq!(r.status.seq_regressions_total(), 0);
+    }
+
+    /// HK39: a push OLDER than its instrument's newest `ts` takes 0 —
+    /// `Stale` at the book — takes no ordinal and is counted; a `seqId`
+    /// DROP (the maintenance reset `bbo-tbt` cannot signal: no snapshot)
+    /// with a newer `ts` applies. Old law: the reset `seqId` was `Stale`
+    /// until a restart.
+    #[test]
+    fn an_older_ts_is_stale_and_counted_and_a_seq_id_reset_with_a_newer_ts_applies() {
+        use book_builder::{ApplyOutcome, TopOfBook};
+        let mut r = BboRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        let newest = r.push("BTC-USDT", T0, 346_500_248_290, "111.05");
+        let older = r.push("BTC-USDT", T0 - 20, 346_500_248_291, "111.01");
+        assert_eq!((newest.venue_seq, older.venue_seq), (1, 0));
+        assert_eq!(book.apply(&newest), ApplyOutcome::Applied);
+        assert_eq!(book.apply(&older), ApplyOutcome::Stale);
+        assert_eq!(r.status.seq_regressions_total(), 1);
+        let reset = r.push("BTC-USDT", T0 + 10, 5, "111.02");
+        assert_eq!(reset.venue_seq, 2, "the older push took no ordinal");
+        assert_eq!(book.apply(&reset), ApplyOutcome::Applied, "seqId reset");
+        assert_eq!(book.bid_px.raw(), 111_020_000);
+        assert_eq!(book.gaps(), 0);
+        assert_eq!(r.status.seq_regressions_total(), 1);
+    }
+
+    /// HK39: each instrument counts from 1 on its own clock; a far-future
+    /// `ts` poisons only its instrument (later pushes counted); a reconnect
+    /// clears every clock and keeps every ordinal.
+    #[test]
+    fn reconnect_clears_every_clock_and_keeps_the_ordinals() {
+        use book_builder::{ApplyOutcome, TopOfBook};
+        let mut r = BboRig::new();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        assert_eq!(r.push("BTC-USDT", T0, 10, "111.05").venue_seq, 1);
+        assert_eq!(r.push("ETH-USD-SWAP", T0 + 1, 20, "111.05").venue_seq, 1);
+        let poison = r.push("BTC-USDT", T0 + 86_400_000, 11, "111.05");
+        assert_eq!(poison.venue_seq, 2);
+        assert_eq!(r.push("BTC-USDT", T0 + 2, 12, "111.04").venue_seq, 0);
+        assert_eq!(r.push("ETH-USD-SWAP", T0 + 2, 21, "111.05").venue_seq, 2);
+        assert_eq!(r.status.seq_regressions_total(), 1);
+        assert_eq!(book.apply(&poison), ApplyOutcome::Applied);
+        r.reconnect();
+        let after = r.push("BTC-USDT", T0 + 3, 13, "111.03");
+        assert_eq!(after.venue_seq, 3, "the clock cleared, the ordinal kept");
+        assert_eq!(book.apply(&after), ApplyOutcome::Applied);
+        assert_eq!(r.push("ETH-USD-SWAP", T0, 22, "111.05").venue_seq, 3);
+        assert_eq!(r.status.seq_regressions_total(), 1);
     }
 
     #[test]
