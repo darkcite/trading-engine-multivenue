@@ -630,7 +630,15 @@ Binance options (`optionMarkPrice`) ticks carried `venue_seq` 0, which
 every `TopOfBook` dropped as `Stale`: the ordinal is keyed on each mark
 element's own `E` (ms); a missing `E` reads 0. Both count a 0 on their
 venue's `seq_regressions_total` (Binance options share Binance's). The
-option ticks keep `venue_time_ms` 0.
+option ticks keep `venue_time_ms` 0 (until HK42, below).
+
+HK42, appended 2026-10-16 — **Binance option `Tick`s carry `E` as
+`venue_time_ms` and the VT2 stale flag** (rulings HK-R29, HK-R30; no
+layout change): the options connection's own `FeedClock` judges each
+element's `E` at Binance's threshold (1 000 ms default, `--stale-after-ms
+bn:` included); a late tick carries `TICK_FLAG_STALE`. Their regressions,
+stale ticks and feed delay are counted on the options slot
+(`engine_ingress_binance_options_*`), no longer on `binance`'s.
 
 MX2, appended 2026-09-23 — `mexc` (VenueId 7; spot + futures share
 one label; data-only, ruling O-MX1). The per-venue law

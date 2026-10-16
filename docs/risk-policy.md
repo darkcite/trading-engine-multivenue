@@ -16839,3 +16839,54 @@ cycle (06:45:11Z) and then `iv_digest`, and `recommit-ruleset.sh` waits
 behind any live worker (bounded 30 min) — it re-committed at ~06:52Z and
 the rows came back (2). **A deploy restart belongs off :46** (the candles
 hour); :16 and :31 were clean today. Then `git push origin main`.
+
+## HK, part 6 — Binance options: venue time, staleness, own counters (2026-10-16)
+
+**Ask (Anton):** "Binance option ticks still carry no venue timestamp … feed
+the feed-staleness check" and "Binance option out-of-order ticks are
+counted together with Binance's other books … A separate counter would fix
+that." **Plan:** project doc `claude/hk-part6-plan-2026-10-16.md`.
+**Commit:** `8c15fdc` HK42; this section and the docs are HK43.
+
+| id | ruling (operator, 2026-10-16) |
+|---|---|
+| HK-R29 | Option ticks carry `E` as `venue_time_ms`; the options connection judges staleness from it on its own clock at Binance's default 1 000 ms (`--stale-after-ms bn:` applies). A late tick is flagged `TICK_FLAG_STALE`; per VT3/VT4 members do not mark or quote on it. |
+| HK-R30 | Three options-only metrics: `engine_ingress_binance_options_seq_regressions_total`, `…_options_stale_ticks_total`, `…_options_feed_delay_ema_ms`; `binance`'s then cover the bookTicker connections only. |
+| HK-R31 | One cut, gates and a review, deploy off :46, docs, push. |
+
+- **HK42 (`8c15fdc`).** The eapi lane builds option ticks with
+  `Tick::new_stamped(…, E, stale flag)`: `feed_clock.judge(E, ts_ns)` on
+  the options Driver's own `FeedClock` (it sat idle before), a stale tick
+  counted. A second `IngressStatus` slot, `binance_options`
+  (`IngressStatusSet`), reaches the lane as an `Arc` in
+  `StreamLane::Eapi(table, seqs, Arc<IngressStatus>)`: it reuses
+  `note_arrival_seq`, `inc_stale_ticks` and `set_feed_delay_ema_ms`
+  unchanged (no copied judge), costs one 192-B slot at boot, and only its
+  three cells are written and published; messages, rows, parse errors and
+  ring drops still count on `binance`. Per tick: one predicted compare for
+  the regression, one for the stale flag; the delay gauge once per push.
+  `E` = 0 is never stale (`judge` short-circuits).
+- **Found on the way:** `--stale-after-ms bn:` never reached the eapi and
+  markPrice drivers (paper.rs set it on the bookTicker slots only); it is
+  now set on every Binance slot (the markPrice lane never judges, so
+  nothing changes there).
+- Metrics registered and published the HK37 way (gauges holding the
+  totals); the gauge registry is 472 of 512 by count (+3).
+- Tests: `E` lands in `venue_time_ms`; a tick 5 s behind the learned
+  offset is flagged and counted on the options slot, a caught-up one is
+  not; `set_stale_after_ms(10 000)` lets a 9-s-late tick through; the
+  options delay gauge moves; Binance's stale, regression and delay stay 0
+  while its `ticks_total` counts the rows. Gates: nextest 4 755, alloc 127
+  (the eapi window at 0 B), copy-audit new 0, license.
+
+### The deploy (2026-10-16)
+
+`cargo build --release -p cli` at `8c15fdc`; `exec-smoke --offline` PASS;
+`pkill -TERM` 07:16:05Z (one minute past :15, off the :45 candles hour).
+Booted `8c15fdc996de`, `/state` v3, mask 255, halted 0, the nine feeds up,
+`engine_vm_rows_active` 2 at once (no worker cycle in the way). Over the
+first two minutes: `binance_options_seq_regressions_total` 0,
+`binance_options_stale_ticks_total` 0, `binance_options_feed_delay_ema_ms`
+141 → 58–68 ms as the clock learned (bookTicker's `binance` delay 8–36
+ms); `binance_seq_regressions_total` and `…_stale_ticks_total` 0; okx and
+HL 0. Then `git push origin main`.

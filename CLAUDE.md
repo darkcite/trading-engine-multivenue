@@ -87,8 +87,8 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   - Beside it: `caffeinate`, hourly `candles`, 5-min `regime`, nightly
     `retention` (PROTECT_DAYS 1, every delete gated on S3 `verify`),
     `archive` (04:30 local) and the read-only `dashboard`.
-  - It runs the release build of HK, part 5 (`30ed1b4`, booted
-    2026-10-16 06:47Z; `/state` `boot.git_sha` names the commit) with the mask
+  - It runs the release build of HK, part 6 (`8c15fdc`, booted
+    2026-10-16 07:17Z; `/state` `boot.git_sha` names the commit) with the mask
     `strategy.conf` names (`ai+vrp+xsd+bin15+hyparb+xmm+hcv`).
     `strategy.conf` also exports `BYBIT_REST_HOST=api.bytick.com`
     (HK17) and `RAW_TAP=pm,hl` (rejects only, HK-R23). `/state`
@@ -226,7 +226,9 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   parse error; HK39–HK40 ("HK, part 5", 2026-10-16): OKX `bbo-tbt` and
   Binance options join the ordinal, keyed on the venue `ts` and the mark
   element's `E` (Binance option touches now reach `TopOfBook`; ai-exec is
-  the only reader).
+  the only reader); HK42 ("HK, part 6"): option ticks carry `E` as venue
+  time, judged stale at 1 000 ms on their own clock, and count on
+  `engine_ingress_binance_options_*`.
 - **S16, sixteen strategy slots (risk-policy "S16", 2026-10-15).** S16-1..6
   on main and deployed 2026-10-15 22:32Z: member table, `STRATEGY` parser +
   `strategy-mask` (the wrapper resolves through it; `all` refused),
@@ -247,7 +249,7 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   `--path` too, and candles go up zstd'd.
 - **Gates at HEAD (HK, part 4, 2026-10-16):**
   - clippy clean.
-  - nextest 4 754 passed (10 skipped: the five `#[ignore]`d live smokes,
+  - nextest 4 755 passed (10 skipped: the five `#[ignore]`d live smokes,
     four alloc child helpers and a fixture regenerator), under nextest
     0.9.148. A random `LEAK` at ~0.2 s under nextest < 0.9.145 on macOS is
     nextest's pipe race, not the test (HK23). Only the scrape hammer runs alone (`.config/nextest.toml`):

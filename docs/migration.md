@@ -6,6 +6,31 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-16 — Binance options: `venue_time_ms`, the stale flag and `engine_ingress_binance_options_*` (HK42)
+
+**What changed**
+- Binance option `Tick`s carry each mark element's `E` as `venue_time_ms`
+  and are judged by the options connection's own feed clock at Binance's
+  threshold (1 000 ms default; `--stale-after-ms bn:` now reaches the
+  options and markPrice slots too): a late tick carries `TICK_FLAG_STALE`.
+- New gauges `engine_ingress_binance_options_seq_regressions_total`,
+  `engine_ingress_binance_options_stale_ticks_total`,
+  `engine_ingress_binance_options_feed_delay_ema_ms` (an
+  `IngressStatusSet.binance_options` slot). The options lane no longer
+  writes `engine_ingress_binance_seq_regressions_total`,
+  `…_stale_ticks_total` or `…_feed_delay_ema_ms`: those are the
+  bookTicker connections' now. Messages, rows, parse errors and ring drops
+  still count on `binance`.
+
+**Impact**
+- Members do not mark or quote on a stale option tick (VT3/VT4); ai-exec
+  is today's only reader of option books.
+- Captures: option `Tick` rows carry `E` and the stale bit from the deploy
+  on (no layout change).
+
+**Migration steps**
+1. None: the routine restart of a binary built from this change.
+
 ## 2026-10-16 — `Tick.venue_seq` for okx and Binance options is the arrival ordinal (HK39, HK40)
 
 **What changed**
