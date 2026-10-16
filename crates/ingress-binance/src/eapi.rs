@@ -81,6 +81,13 @@
 //! `seq_regressions_total`; an absent `E` reads 0 (the summary still
 //! flows). A reconnect zeroes the clocks; the ordinals stay. Until HK40
 //! every option `Tick` carried 0, `Stale` at every book.
+//!
+//! HK42 (rulings HK-R29/R30): the same `E` is the `Tick`'s
+//! `venue_time_ms`, judged by the options connection's own clock
+//! (`TICK_FLAG_STALE` past Binance's 1 000 ms, or `--stale-after-ms bn:`;
+//! an absent `E` is never stale); the regressions, the stale ticks and
+//! the feed-delay gauge count on the options connections' OWN status
+//! slot (`engine_ingress_binance_options_*`), not Binance's.
 
 use core_parse::{
     find_field, scan_number_sci_1e9, scan_price_1e6, scan_u64, skip_json_value, skip_string,

@@ -591,7 +591,11 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
     let mut table = ingress_binance::eapi::EapiSymbolTable::new();
     table.insert(b"BTC-260925-86000-C", (1 << 24) | 1025).unwrap();
     table.insert(b"BTC-260925-86000-P", (1 << 24) | 1026).unwrap();
-    let mut odriver = bwl::Driver::new_eapi(0xBA08u64, table);
+    let mut odriver = bwl::Driver::new_eapi(
+        0xBA08u64,
+        table,
+        std::sync::Arc::new(core_metrics::IngressStatus::new()),
+    );
     bwl::note_transport_ready(&mut odriver, core_net::Status::Ready);
     let mut otransport = TestTransport::with_capacity(128 * 1024);
     for step in 0..2 {

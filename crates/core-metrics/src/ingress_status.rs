@@ -215,8 +215,10 @@ pub struct IngressStatus {
     /// from Q-MX1's last-seen check; its trade judge stays). HK39: OKX
     /// `bbo-tbt` counts a tick whose venue `ts` is older than its
     /// instrument's newest (not its `seqId`, which may reset); HK40:
-    /// Binance options count a mark element whose `E` is older — both
-    /// on their venue's counter (Binance options share Binance's).
+    /// Binance options count a mark element whose `E` is older — on the
+    /// options connections' own slot since HK42
+    /// (`engine_ingress_binance_options_seq_regressions_total`), so
+    /// Binance's counter is its bookTicker connections' alone.
     seq_regressions_total: AtomicU64,
     /// Channel resubscribes triggered by integrity monitors.
     resubscribes_total: AtomicU64,

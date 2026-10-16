@@ -759,10 +759,16 @@ pub struct IngressStatusSet {
     /// [`IngressStatus`] slot; they ride here so the metrics
     /// publisher reaches them the same way.
     pub hl_roll: Arc<ingress_hyperliquid::family::HlRollStatus>,
+    /// HK42: the Binance OPTIONS connections' own slot, written by the
+    /// eapi lane on the `binance` thread (one writer). Only its seq
+    /// regressions, stale ticks and feed-delay gauge are written and
+    /// published (`engine_ingress_binance_options_*`); the lane's
+    /// messages, rows and drops stay on `binance`.
+    pub binance_options: Arc<IngressStatus>,
 }
 
 impl IngressStatusSet {
-    /// Allocate all ten slots + the HL roll and Hypercall counters (boot
+    /// Allocate all eleven slots + the HL roll and Hypercall counters (boot
     /// only).
     pub fn new() -> Self {
         Self {
@@ -778,6 +784,7 @@ impl IngressStatusSet {
             hypercall: Arc::new(IngressStatus::new()),
             hc: Arc::new(ingress_hypercall::HcCounters::new()),
             hl_roll: Arc::new(ingress_hyperliquid::family::HlRollStatus::new()),
+            binance_options: Arc::new(IngressStatus::new()),
         }
     }
 }
@@ -1160,6 +1167,7 @@ pub fn spawn_binance_multi(
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
     mut opt_tx: Producer<OptSummary, OPT_RING_SIZE>,
     status: Arc<IngressStatus>,
+    opt_status: Arc<IngressStatus>,
     core_id: usize,
     run_dir: &Path,
     epoch_ns: u64,
@@ -1215,10 +1223,15 @@ pub fn spawn_binance_multi(
             let mut conns: Vec<bwl::MultiConn<'_, TlsTransport>> = Vec::with_capacity(specs.len());
             for (i, spec) in specs.into_iter().enumerate() {
                 // M2.4/BX0-F2: an options spec builds the mark-array
-                // lane driver; WS5: a markPrice spec builds the mark
-                // lane; bookTicker slots stay byte-identical.
-                let drv = match spec.eapi {
-                    Some(table) => bwl::Driver::new_eapi(now_ns().wrapping_add(i as u64), table),
+                // lane driver (HK42: on the options slot); WS5: a
+                // markPrice spec builds the mark lane; bookTicker slots
+                // stay byte-identical.
+                let mut drv = match spec.eapi {
+                    Some(table) => bwl::Driver::new_eapi(
+                        now_ns().wrapping_add(i as u64),
+                        table,
+                        opt_status.clone(),
+                    ),
                     None if spec.mark_price => {
                         bwl::Driver::new_mark_price(now_ns().wrapping_add(i as u64), spec.sym)
                     }
@@ -1227,15 +1240,15 @@ pub fn spawn_binance_multi(
                         // VT2: a spot slot carries the aggTrade sentinel
                         // (`<symbol>@aggTrade` from the path); USDS-M
                         // stamps its bookTicker directly.
-                        let mut d = match (spec.spot_sentinel, spot_stream_symbol(&spec.path)) {
+                        match (spec.spot_sentinel, spot_stream_symbol(&spec.path)) {
                             (true, Some(_)) => bwl::Driver::new_spot_sentinel(seed, spec.sym),
                             _ => bwl::Driver::new(seed, spec.sym),
-                        };
-                        // one estimator per CONNECTION, same threshold.
-                        d.set_stale_after_ms(stale_after_ms);
-                        d
+                        }
                     }
                 };
+                // One estimator per CONNECTION, same threshold — HK42: the
+                // options slot's too (it judges each mark's `E`).
+                drv.set_stale_after_ms(stale_after_ms);
                 // COPY: the slot (its Driver inline, ≈ 3.5 KB) moves into
                 // the Vec once at boot — see `MultiConn::new`.
                 conns.push(bwl::MultiConn::new(
@@ -4306,6 +4319,17 @@ impl Observability {
             let ingress_hl_trades_empty = reg
                 .register_gauge("engine_ingress_hyperliquid_trades_empty_total")
                 .map_err(|_| "register engine_ingress_hyperliquid_trades_empty_total")?;
+            // HK42: the Binance options connections' own three, out of
+            // the venue's (`IngressStatusSet::binance_options`).
+            let ingress_bn_opt_seq_regressions = reg
+                .register_gauge("engine_ingress_binance_options_seq_regressions_total")
+                .map_err(|_| "register engine_ingress_binance_options_seq_regressions_total")?;
+            let ingress_bn_opt_stale_ticks = reg
+                .register_gauge("engine_ingress_binance_options_stale_ticks_total")
+                .map_err(|_| "register engine_ingress_binance_options_stale_ticks_total")?;
+            let ingress_bn_opt_feed_delay = reg
+                .register_gauge("engine_ingress_binance_options_feed_delay_ema_ms")
+                .map_err(|_| "register engine_ingress_binance_options_feed_delay_ema_ms")?;
             let ingress_bybit_state = reg
                 .register_gauge("engine_ingress_bybit_state")
                 .map_err(|_| "register engine_ingress_bybit_state")?;
@@ -4537,6 +4561,9 @@ impl Observability {
                 ingress_hl_outcome_bbo_one_sided,
                 ingress_hl_unsub_acks,
                 ingress_hl_trades_empty,
+                ingress_bn_opt_seq_regressions,
+                ingress_bn_opt_stale_ticks,
+                ingress_bn_opt_feed_delay,
                 ingress_bybit_state,
                 ingress_rpc_state,
                 ingress_mexc_state,
@@ -4928,6 +4955,12 @@ pub struct EngineCounters {
     pub ingress_hl_unsub_acks: core_metrics::GaugeId,
     /// HK37: `engine_ingress_hyperliquid_trades_empty_total`.
     pub ingress_hl_trades_empty: core_metrics::GaugeId,
+    /// HK42: `engine_ingress_binance_options_seq_regressions_total`.
+    pub ingress_bn_opt_seq_regressions: core_metrics::GaugeId,
+    /// HK42: `engine_ingress_binance_options_stale_ticks_total`.
+    pub ingress_bn_opt_stale_ticks: core_metrics::GaugeId,
+    /// HK42: `engine_ingress_binance_options_feed_delay_ema_ms`.
+    pub ingress_bn_opt_feed_delay: core_metrics::GaugeId,
     /// WS9: per-ingress state gauge, Bybit v5 public WS.
     pub ingress_bybit_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: Polygon JSON-RPC.
@@ -9956,6 +9989,12 @@ where
                         .set(ing.hl_roll.unsub_acks() as i64);
                     reg.gauge(ids.ingress_hl_trades_empty)
                         .set(ing.hl_roll.trades_empty() as i64);
+                    reg.gauge(ids.ingress_bn_opt_seq_regressions)
+                        .set(ing.binance_options.seq_regressions_total() as i64);
+                    reg.gauge(ids.ingress_bn_opt_stale_ticks)
+                        .set(ing.binance_options.stale_ticks_total() as i64);
+                    reg.gauge(ids.ingress_bn_opt_feed_delay)
+                        .set(ing.binance_options.feed_delay_ema_ms() as i64);
                     reg.gauge(ids.ingress_hyperliquid_state)
                         .set(ing.hyperliquid.state() as i64);
                     reg.gauge(ids.ingress_bybit_state)
@@ -13069,6 +13108,8 @@ mod tests {
         // (585 / 450 of 640 / 512). S16-2 eight gauges, the regime gate of
         // slots 8–15 (`engine_strategy_regime_gate_8` … `_15`): measured
         // 595 / 468 of 640 / 512 with them (the lanes since BX11 the rest).
+        // HK42 three gauges, the Binance options connections' own
+        // (`engine_ingress_binance_options_*`).
         assert!(reg.gauges_len() <= core_metrics::MAX_GAUGES);
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).expect("/metrics fits its buffer");

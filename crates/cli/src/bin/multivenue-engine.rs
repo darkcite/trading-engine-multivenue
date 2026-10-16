@@ -4880,6 +4880,7 @@ fn run(args: RunArgs) -> ExitCode {
             bn_event_prod,
             bn_opt_prod,
             statuses.binance.clone(),
+            statuses.binance_options.clone(),
             2,
             &run_dir,
             epoch_ns,
