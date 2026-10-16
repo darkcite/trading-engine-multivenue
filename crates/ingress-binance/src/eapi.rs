@@ -70,6 +70,24 @@
 //! `/eoptions/…` `@ticker`/`@index` streams answer HTTP 404. The
 //! stream carries no open interest: `OptSummary.flags` is MARK_PX
 //! only (the OKX-asymmetry mechanism, docs/wire-format.md).
+//!
+//! HK40 (ruling HK-R27, 2026-10-16): the elements carry no venue
+//! sequence, so a row's `Tick.venue_seq` is its option's **arrival
+//! ordinal** — the lane's per-row `core_types::ArrivalSeq`, keyed on the
+//! element's OWN `E` (a bare ms number; elements of one push can differ —
+//! the K6 push's 1790161477975 and …974), stamped where the row's
+//! `Tick` is built: 1, 2, 3, … while `E` does not go back. An OLDER `E`
+//! carries 0 — every `book_builder::TopOfBook` drops it — and counts on
+//! `seq_regressions_total`; an absent `E` reads 0 (the summary still
+//! flows). A reconnect zeroes the clocks; the ordinals stay. Until HK40
+//! every option `Tick` carried 0, `Stale` at every book.
+//!
+//! HK42 (rulings HK-R29/R30): the same `E` is the `Tick`'s
+//! `venue_time_ms`, judged by the options connection's own clock
+//! (`TICK_FLAG_STALE` past Binance's 1 000 ms, or `--stale-after-ms bn:`;
+//! an absent `E` is never stale); the regressions, the stale ticks and
+//! the feed-delay gauge count on the options connections' OWN status
+//! slot (`engine_ingress_binance_options_*`), not Binance's.
 
 use core_parse::{
     find_field, scan_number_sci_1e9, scan_price_1e6, scan_u64, skip_json_value, skip_string,
@@ -749,13 +767,20 @@ impl EapiSymbolTable {
     /// path: length gate, then a bytewise compare.
     #[inline]
     pub fn lookup(&self, wire_sym: &[u8]) -> Option<SymbolId> {
+        self.lookup_row(wire_sym).map(|(_, sym)| sym)
+    }
+
+    /// [`Self::lookup`] with the symbol's ROW, which indexes the lane's
+    /// per-option state (HK40: its arrival sequencer).
+    #[inline]
+    pub fn lookup_row(&self, wire_sym: &[u8]) -> Option<(usize, SymbolId)> {
         debug_assert!(self.len <= EAPI_TABLE_MAX);
         let n = wire_sym.len();
         let mut i = 0;
         while i < self.len {
             let row = &self.rows[i];
             if row.0 as usize == n && &row.1[..n] == wire_sym {
-                return Some(row.2);
+                return Some((i, row.2));
             }
             i += 1;
         }
@@ -919,7 +944,7 @@ pub fn eapi_elem_symbol(elem: &[u8]) -> Option<&[u8]> {
 
 /// One parsed element of a `<uly>@optionMarkPrice` array: the BBO, the
 /// mark/IV/greeks surface and the underlying's index, from ONE venue
-/// push. `Copy` POD, 88 B — over the one-line by-value budget, so
+/// push. `Copy` POD, 96 B — over the one-line by-value budget, so
 /// [`parse_eapi_mark`] FILLS a caller-owned frame instead of returning
 /// one (the lane keeps a single frame for its whole walk).
 #[repr(C)]
@@ -947,9 +972,12 @@ pub struct EapiMarkFrame {
     pub vega_1e6: i64,
     /// `t` theta ×1e6.
     pub theta_1e6: i64,
+    /// `E` the element's event time (ms; 0 when absent) — HK40: the key
+    /// of its option's arrival sequencer (`Tick.venue_seq`).
+    pub event_time_ms: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<EapiMarkFrame>() == 88);
+const _: () = assert!(core::mem::size_of::<EapiMarkFrame>() == 96);
 
 impl EapiMarkFrame {
     /// All-zero frame — the lane's reusable parse target.
@@ -965,6 +993,7 @@ impl EapiMarkFrame {
         gamma_1e9: 0,
         vega_1e6: 0,
         theta_1e6: 0,
+        event_time_ms: 0,
     };
 }
 
@@ -978,7 +1007,10 @@ impl EapiMarkFrame {
 /// must be positive); the four BBO fields are OPTIONAL — an unquoted
 /// side reads `"0.000"`, which parses as 0 like an absent or empty one
 /// (the one-sided/empty-book precedent: the lane skips the `Tick` when
-/// both sides are zero and still captures the summary).
+/// both sides are zero and still captures the summary). `E` (a bare ms
+/// number) is OPTIONAL too: absent or malformed reads 0 — the summary
+/// still flows, and the option's `Tick` keys older than any stamped one
+/// (HK40: dropped by every book, counted).
 #[inline]
 pub fn parse_eapi_mark(elem: &[u8], out: &mut EapiMarkFrame) -> bool {
     parse_mark_fields(elem, out).is_some()
@@ -1033,6 +1065,10 @@ fn parse_mark_fields(elem: &[u8], out: &mut EapiMarkFrame) -> Option<()> {
     out.bid_qty_1e6 = q_1e6_or_zero(elem, b"\"bq\":");
     out.ask_px_1e6 = q_1e6_or_zero(elem, b"\"ao\":");
     out.ask_qty_1e6 = q_1e6_or_zero(elem, b"\"aq\":");
+    out.event_time_ms = match find_field(elem, b"\"E\":") {
+        Some(pos) => scan_u64(elem, skip_ws(elem, pos)).map_or(0, |(ms, _)| ms),
+        None => 0,
+    };
     Some(())
 }
 
@@ -1702,6 +1738,7 @@ mod tests {
         let pairs = [
             ("s", "\"X\""),
             ("mp", "\"1.5\""),
+            ("E", "1790161477974"),
             ("i", "\"100.0\""),
             ("bo", "\"0.000\""),
             ("ao", "\"0.000\""),
@@ -1717,6 +1754,9 @@ mod tests {
         assert_eq!((f.bid_px_1e6, f.ask_px_1e6, f.bid_qty_1e6, f.ask_qty_1e6), (0, 0, 0, 0));
         assert_eq!(f.mark_px_1e9, 1_500_000_000);
         assert_eq!(f.theta_1e6, -2_000_000);
+        assert_eq!(f.event_time_ms, 1_790_161_477_974);
+        let no_e = mark(elem_without("E", &pairs).as_bytes()).expect("`E` is optional");
+        assert_eq!(no_e.event_time_ms, 0, "an absent `E` reads 0 (HK40)");
         for optional in ["bo", "ao", "bq", "aq"] {
             assert!(
                 mark(elem_without(optional, &pairs).as_bytes()).is_some(),
@@ -1939,6 +1979,7 @@ mod proptests {
                     gamma_1e9: i64::from(g_f) * 10,
                     vega_1e6: (i64::from(v_i) * 1_000_000_000 + i64::from(v_f) * 10) / 1000,
                     theta_1e6: -(i64::from(t_i) * 1_000_000_000 + i64::from(t_f) * 10) / 1000,
+                    event_time_ms: 1_790_161_477_974,
                 }));
             }
             frame.push_str("]}");
@@ -1967,6 +2008,7 @@ mod proptests {
                             prop_assert_eq!(got.gamma_1e9, want.gamma_1e9);
                             prop_assert_eq!(got.vega_1e6, want.vega_1e6);
                             prop_assert_eq!(got.theta_1e6, want.theta_1e6);
+                            prop_assert_eq!(got.event_time_ms, want.event_time_ms);
                             hits += 1;
                         } else {
                             prop_assert!(expect[seen].is_none(), "a selected row did not resolve");

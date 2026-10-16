@@ -325,9 +325,11 @@ fn audit_ticks(venue: &str, r: &PmlrReader<Tick>, out: &mut VenueAudit) {
         // Tick venue_seq is u32 and venue-specific; regression counting
         // is informational (BN bookTicker gaps are legitimate; PM's is
         // the ingress's per-asset arrival ordinal since HK31, HL's and
-        // Deribit quotes' since HK32 — 0 on an out-of-order tick, each
-        // counted here — and a ms timestamp's low 32 bits in older
-        // captures). Same-value repeats are legal everywhere.
+        // Deribit quotes' since HK32, Binance's, Bybit's and MEXC's since
+        // HK36, OKX's and Binance options' since HK39 / HK40 — 0 on an
+        // out-of-order tick, each counted here — and a ms
+        // timestamp's or venue id's low 32 bits in older captures).
+        // Same-value repeats are legal everywhere.
         if let Some(last) = s.last_seq {
             if (t.venue_seq as u64) < last {
                 s.seq_regressions += 1;

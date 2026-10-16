@@ -158,6 +158,10 @@ pub struct Driver {
     want_tickers: bool,
     /// Per-symbol BBO state, indexed by symbol-table row.
     bbo: [BboState; BYBIT_MAX_SYMBOLS],
+    /// HK36: per-symbol `orderbook.1` sequencers keyed on the full `u`,
+    /// same indexing (crate docs). Clocks zeroed on reconnect and, per
+    /// symbol, on a snapshot; ordinals process-lifetime.
+    book_seq: [core_types::ArrivalSeq; BYBIT_MAX_SYMBOLS],
     /// Set once the subscribe batch has been queued this session.
     subscribed: bool,
     /// Set when THIS session's subscribe ack came back success.
@@ -191,7 +195,7 @@ impl Driver {
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
         // COPY: the 2 056 B symbol table moves into the driver, and the
-        // 4 296 B driver returns by value — once per connection, at boot —
+        // 5 320 B driver returns by value — once per connection, at boot —
         // the driver holds its table INLINE so every hot lookup walks
         // contiguous rows with no pointer to chase — rejected: a `Box` (a
         // heap hop on the hot lookup) and a two-phase in-place init behind
@@ -207,6 +211,7 @@ impl Driver {
             symbols,
             want_tickers,
             bbo: [BboState::default(); BYBIT_MAX_SYMBOLS],
+            book_seq: [core_types::ArrivalSeq::ZERO; BYBIT_MAX_SYMBOLS],
             subscribed: false,
             subs_ok: false,
             subs_ever_acked: false,
@@ -280,6 +285,11 @@ impl Driver {
         self.subs_ok = false;
         // VT2: a new connection is a new offset; the threshold stays.
         self.feed_clock.reset();
+        // HK36: every symbol's ordinal stays (monotone — no book sees it
+        // fall); its clock is zeroed, so a reconnect clears a clock a
+        // far-future `u` poisoned. rx is cleared and the old socket gone:
+        // no push of the old connection can follow.
+        core_types::ArrivalSeq::reset_clocks(&mut self.book_seq);
     }
 }
 
@@ -788,9 +798,14 @@ fn handle_data_frame<C: Capture>(
             let now = now_ns();
             let judged = drv.feed_clock.judge(frame.venue_time_ms, now);
             status.set_feed_delay_ema_ms(drv.feed_clock.delay_ema_ms());
-            let st = &mut drv.bbo[sym_idx as usize];
+            let row = sym_idx as usize;
+            let st = &mut drv.bbo[row];
             if frame.is_snapshot == 1 {
                 *st = BboState::default();
+                // HK36: a snapshot re-seeds the symbol — after a venue
+                // restart its `u` restarts at 1 under one — so its clock
+                // is zeroed (counting nothing); its ordinal stays.
+                drv.book_seq[row].reset_clock();
             }
             if frame.has_bid == 1 {
                 st.bid_px_1e6 = frame.bid_px_1e6;
@@ -803,11 +818,16 @@ fn handle_data_frame<C: Capture>(
             // Emit only when both sides are live (a one-sided book is
             // not a BBO; the next delta completes it).
             if st.bid_qty_1e6 > 0 && st.ask_qty_1e6 > 0 {
+                // HK36 (ruling HK-R22): the symbol's arrival ordinal keyed
+                // on the full `u` (crate docs) — a backward `u` takes 0
+                // (dropped by every book) and is counted.
+                let venue_seq = drv.book_seq[row].next(frame.update_id);
+                status.note_arrival_seq(venue_seq);
                 let tick = Tick::new_stamped(
                     now,
                     VenueId::Bybit,
                     sym,
-                    (frame.update_id & 0xFFFF_FFFF) as u32,
+                    venue_seq,
                     Price::from_raw(st.bid_px_1e6),
                     Qty::from_raw(st.bid_qty_1e6),
                     Price::from_raw(st.ask_px_1e6),
@@ -948,8 +968,8 @@ impl<'a, T: Transport> BybitConn<'a, T> {
         keepalive: core_net::Keepalive,
         backoff: core_net::Backoff,
     ) -> Self {
-        // COPY: the Driver (4 296 B, its symbol table inline) moves into its
-        // slot here and, with the slot (5 488 B), into the boot's Vec — two
+        // COPY: the Driver (5 320 B, its symbol table inline) moves into its
+        // slot here and, with the slot (6 512 B), into the boot's Vec — two
         // moves per connection, once, at boot — rejected: a two-phase
         // in-place init behind `&mut` (every constructor split, for a
         // boot-only cost).
@@ -1487,7 +1507,9 @@ mod tests {
         assert_eq!(t1.venue, VenueId::Bybit as u8);
         assert_eq!(t1.bid_px.raw(), 50_005_120_000);
         assert_eq!(t1.ask_px.raw(), 50_006_340_000);
-        assert_eq!(t1.venue_seq, 100);
+        // HK36: arrival ordinals keyed on `u` 100, 101 (old law: the
+        // ids' low 32 bits).
+        assert_eq!(t1.venue_seq, 1);
         let t2 = *cons
             .try_pop_ref()
             .expect("delta tick — ask side carried forward");
@@ -1497,10 +1519,58 @@ mod tests {
             50_006_340_000,
             "unchanged side survives the delta"
         );
-        assert_eq!(t2.venue_seq, 101);
+        assert_eq!(t2.venue_seq, 2);
         assert_eq!(cap.ticks, 2);
         assert_eq!(status.ticks_total(), 2);
         assert_eq!(status.parse_errors_total(), 0);
+    }
+
+    /// HK36: `u` crossing a 2^32 boundary takes a HIGHER `venue_seq` and
+    /// applies (old law: its low 32 bits fell to 1 — `Stale` until a
+    /// restart); a backward `u` takes 0, `Stale` at the book, counted; a
+    /// snapshot (after a venue restart `u` restarts at 1 under one) zeroes
+    /// that symbol's clock only, counting nothing; a reconnect zeroes
+    /// every clock; ordinals are kept throughout.
+    #[test]
+    fn a_full_u_across_2_32_applies_and_snapshot_and_reconnect_clear_the_clock() {
+        use book_builder::{ApplyOutcome, TopOfBook};
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+        let mut book = TopOfBook::empty(SYM_BTC);
+        let mut push = |d: &mut Driver, sym: &str, kind: &str, bid: &str, u: u64| -> Tick {
+            let f = format!(
+                r#"{{"topic":"orderbook.1.{sym}","type":"{kind}","ts":1,"data":{{"s":"{sym}","b":[["{bid}","1.5"]],"a":[["50006.34","2.0"]],"u":{u},"seq":1}}}}"#
+            );
+            t.inject_incoming(&ws_text_frame(f.as_bytes()));
+            drive_one(&mut t, d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+            *cons.try_pop_ref().expect("a two-sided push is a tick")
+        };
+        let below = push(&mut d, "BTCUSDT", "snapshot", "50005.12", 0xFFFF_FFFF);
+        let above = push(&mut d, "BTCUSDT", "delta", "50005.50", 0x1_0000_0001);
+        assert_eq!((below.venue_seq, above.venue_seq), (1, 2));
+        assert_eq!(book.apply(&below), ApplyOutcome::Applied);
+        assert_eq!(book.apply(&above), ApplyOutcome::Applied, "past 2^32");
+        let back = push(&mut d, "BTCUSDT", "delta", "50005.12", 0xFFFF_FFFF);
+        assert_eq!(back.venue_seq, 0, "a backward u");
+        assert_eq!(book.apply(&back), ApplyOutcome::Stale);
+        assert_eq!(status.seq_regressions_total(), 1);
+        let eth = push(&mut d, "ETHUSDT", "delta", "3000.1", 50);
+        assert_eq!(eth.venue_seq, 1, "symbols are independent");
+        let restarted = push(&mut d, "BTCUSDT", "snapshot", "50004.00", 1);
+        assert_eq!(restarted.venue_seq, 3, "the snapshot cleared the clock");
+        assert_eq!(book.apply(&restarted), ApplyOutcome::Applied);
+        assert_eq!(push(&mut d, "BTCUSDT", "delta", "50004.50", 2).venue_seq, 4);
+        let eth_back = push(&mut d, "ETHUSDT", "delta", "3000.2", 49);
+        assert_eq!(eth_back.venue_seq, 0, "the other symbol's clock stood");
+        assert_eq!(status.seq_regressions_total(), 2);
+        d.reset_for_reconnect(9);
+        d.set_state(State::Steady);
+        d.subscribed = true;
+        let eth_after = push(&mut d, "ETHUSDT", "delta", "3000.3", 7);
+        assert_eq!(eth_after.venue_seq, 2, "a reconnect clears every clock");
+        assert_eq!(status.seq_regressions_total(), 2);
     }
 
     /// VT2 helper: one two-sided `orderbook.1` snapshot stamped `cts`

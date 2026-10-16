@@ -591,7 +591,11 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
     let mut table = ingress_binance::eapi::EapiSymbolTable::new();
     table.insert(b"BTC-260925-86000-C", (1 << 24) | 1025).unwrap();
     table.insert(b"BTC-260925-86000-P", (1 << 24) | 1026).unwrap();
-    let mut odriver = bwl::Driver::new_eapi(0xBA08u64, table);
+    let mut odriver = bwl::Driver::new_eapi(
+        0xBA08u64,
+        table,
+        std::sync::Arc::new(core_metrics::IngressStatus::new()),
+    );
     bwl::note_transport_ready(&mut odriver, core_net::Status::Ready);
     let mut otransport = TestTransport::with_capacity(128 * 1024);
     for step in 0..2 {
@@ -2830,6 +2834,11 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
         br##"{"channel":"subscriptionResponse","data":{"method":"unsubscribe","subscription":{"type":"trades","coin":"#330"}}}"##,
     ];
 
+    // HK37: a fresh leg's empty `trades` snapshot — venue data,
+    // counted as a message (`HlRollStatus::trades_empty`), never as a
+    // parse error — rides the measured window too.
+    const TRADES_EMPTY: &[u8] = br#"{"channel":"trades","data":[]}"#;
+
     let mut stream: Vec<u8> = Vec::with_capacity(256 * 1024);
     for ack in ACKS {
         push_text_frame(&mut stream, ack);
@@ -2837,6 +2846,7 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     for unsub in UNSUBS {
         push_text_frame(&mut stream, unsub);
     }
+    push_text_frame(&mut stream, TRADES_EMPTY);
     for c in 0..CYCLES {
         push_text_frame(&mut stream, BBO_BTC);
         push_text_frame(&mut stream, if c % 2 == 0 { L2_BTC_A } else { L2_BTC_B });
@@ -2920,10 +2930,13 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     assert_eq!(prints, 2 * CYCLES);
     assert_eq!(status.trade_ring_drops_total(), 0);
     assert!(driver.is_verified());
-    // 9 acks + 3 unsubscribe echoes (HK1) + per cycle: bbo(1) +
-    // l2Book(1) + trades rows(2) + bbo(1) + l2Book(1) = 6. WS Pings are
-    // activity, not messages.
-    assert_eq!(status.msgs_total(), (9 + UNSUBS.len() + 6 * CYCLES) as u64);
+    // 9 acks + 3 unsubscribe echoes (HK1) + 1 empty trades snapshot
+    // (HK37) + per cycle: bbo(1) + l2Book(1) + trades rows(2) + bbo(1)
+    // + l2Book(1) = 6. WS Pings are activity, not messages.
+    assert_eq!(
+        status.msgs_total(),
+        (9 + UNSUBS.len() + 1 + 6 * CYCLES) as u64
+    );
     assert_eq!(status.parse_errors_total(), 0);
     assert_eq!(status.gaps_total(), 0);
     assert_eq!(status.resubscribes_total(), 0);

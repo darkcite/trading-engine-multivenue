@@ -371,7 +371,10 @@ pub struct Tick {
     /// Hyperliquid (`hl` `bbo` + outcome `l2Book` touch) and Deribit
     /// (`quote`) (HK32) emit none: there it is the ingress's per-instrument
     /// arrival ordinal ([`ArrivalSeq`] — 1, 2, 3, … per process; 0 = a
-    /// tick older than its instrument's newest).
+    /// tick older than its instrument's newest). Binance (`bookTicker`
+    /// `u`), Bybit (`orderbook.1` `u`) and MEXC (book `version`) emit a
+    /// full `u64` this slot cannot hold (HK36): the same ordinal, keyed on
+    /// that id (0 = an id behind its instrument's newest).
     pub venue_seq: u32,
     /// Best bid price (fixed-point).
     pub bid_px: Price,

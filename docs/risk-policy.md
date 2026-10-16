@@ -2860,7 +2860,7 @@ Deribit's ≤ 64 B memmem needle per subscribe result; the RPC signal
 payload's 8 B word encodes. On the auditor's flag (ruling Q12): the
 1 080 B `TlsTransport` moving into its slot once per reconnect (Bybit,
 MEXC — Binance's marker), and the boot moves at MEASURED sizes — the
-OKX (7 696 B), Deribit (9 520 B), Bybit (4 296 B; slot 5 488 B), MEXC
+OKX (7 696 B; 8 976 B since HK39), Deribit (9 520 B), Bybit (4 296 B; slot 5 488 B), MEXC
 (1 792 B; slot 3 008 B) and Polymarket (10 536 B) drivers with the
 tables they take by value.
 
@@ -16674,3 +16674,219 @@ check. Then `git push origin main` (S16-R4).
 
 - **A member at slots 8–15** (S16-R5): its own ruling. Its first live order
   closes the rollback door above.
+
+## HK, part 4 — Hyperliquid's parse errors and the u32 `venue_seq` (2026-10-16)
+
+**Ask (Anton):** "HL parse errors … venue_seq on Binance, Bybit and MEXC is
+still truncated to u32". **Plan:** project doc
+`claude/hk-part4-plan-2026-10-16.md`. **Commits:** `fba0c3c` HK36,
+`0968414` HK37; this section and the migration entries are HK38.
+
+| id | ruling (operator, 2026-10-16) |
+|---|---|
+| HK-R22 | `venue_seq` for Binance / Bybit / MEXC: HK31/HK32's `ArrivalSeq`, keyed on the venue's FULL u64 id; the book sees an ordinal; a backward id takes 0 and is counted; `TopOfBook` untouched; captures carry the ordinal from the deploy on. |
+| HK-R23 | The HL rejects tap: `RAW_TAP=pm,hl` (rejects only) at once, with an off-grid restart (04:16:05Z; backup `strategy.conf.bak-20261016T0413Z-hk-hltap`). It stays on: a rejects-only tap costs its 64-B header while nothing is rejected. |
+| HK-R24 | HL parse errors: fix as a cut if the cause is clear (as HK-R17). |
+| HK-R25 | Deploy, then push. |
+
+### HK36 — the arrival ordinal keyed on the venue id (`fba0c3c`)
+
+- **Why it was a live hazard.** `Tick.venue_seq` is a `u32`;
+  `book_builder::TopOfBook::apply` drops `venue_seq <= last` as `Stale`.
+  Binance (`bookTicker` `u`), Bybit (`orderbook.1` `u`) and the MEXC book
+  (`version`) put their u64 id's low 32 bits there, and those ids are far
+  past 2^32 (2026-10-16 REST: Binance USDⓈ-M BTCUSDT 11 833 358 963 074,
+  ~2 755 wraps; spot 101 509 388 118; MEXC spot 83 810 244 855, futures
+  42 677 422 185; Bybit linear 1 253 051, restarted after a venue
+  restart). At a low-32 wrap the instrument would be `Stale` in every book
+  until a restart. No member of the set reads these books today (HK32
+  review), so nothing was lost yet.
+- **The law.** `ArrivalSeq` takes a generic u64 key (`last_ms` →
+  `last_key`, same compare) and gains a per-row `reset_clock`
+  (`reset_clocks` loops it); Polymarket, Hyperliquid and Deribit are
+  byte-identical. Binance: one sequencer per Driver (each connection is one
+  symbol). Bybit: `[ArrivalSeq; 64]` by table row; every `snapshot` zeroes
+  its symbol's clock without counting (`u` restarts at 1 under one after a
+  venue restart; the clock then holds the snapshot's `u`, so a backward
+  delta after it is still caught). MEXC: `[ArrivalSeq; 16]` by row (a power
+  of two, asserted), stamped on every parsed book push, so republications
+  feed the check and their ordinals skip. Reconnect → `reset_clocks` on all
+  three. Same-id re-pushes take the next ordinal — the same touch: 2.1 % of
+  Binance ticks used to be dropped as `Stale` and now apply.
+- **MEXC's book check moved** from Q-MX1's last-seen compare to the
+  sequencer: a version behind the NEWEST counts on every push, and an
+  absent version counts (its tick was 0 and dropped silently before — now
+  an alarm). The trade check is unchanged; `ChannelEvent.venue_seq` keeps
+  the full u64.
+- **Exhaustion.** A u32 ordinal at Binance's busiest ~810 ticks/s lasts ~61
+  days of process uptime; daily-restart boots a new process five times a
+  day, so the bound is unreachable in operation (documented at the
+  `debug_assert`).
+- **Captures and replay.** The `Tick` row carries the ordinal; the venue
+  book id is in no capture row (only in raw-tap frames when the tap is on).
+  Replaying several runs as one stream restarts the ordinal per run without
+  a rebase: a `MultiBook` reader (latency-arb, cross-arb, rule-tree — all
+  outside the set) would drop a later run's ticks until its ordinal passes
+  the earlier run's.
+- **Not changed (rulings):** OKX `seqId as u32`
+  (`ingress-okx/src/run_loop.rs:1124`; BTC-USDT-SWAP seqId
+  346 500 248 290, already past 2^32, and OKX may reset it after
+  maintenance); Binance options ticks carry `venue_seq` 0, which every book
+  drops as `Stale`. Both ruled and fixed the same day: HK39 / HK40 ("HK,
+  part 5").
+- Review: risk / alloc SHIP WITH FIXES, applied (the `paper.rs` COPY sizes —
+  Bybit 6 512 B, MEXC 3 264 B — a MEXC row `debug_assert`, the replay
+  note). Captured before the deploy: 0 regressions in 2 M Binance, 145 k
+  Bybit and 29 k MEXC ticks.
+
+### HK37 — Hyperliquid's empty `trades` snapshot (`0968414`)
+
+- **Finding (the rejects tap, 04:16–04:46Z):** `parse_errors_total` and the
+  tap agreed record for record — 16 — and all 16 were the same 30 bytes,
+  `{"channel":"trades","data":[]}`: the venue's empty trades SNAPSHOT on a
+  `trades` subscribe to a HIP-4 outcome leg that has not printed. 4 at
+  boot, up to 6 a 15-minute roll (3 live families × 2 fresh legs; the 04:45
+  roll was predicted at +6 and moved 10 → 16), up to 8 at the 06:00Z daily
+  roll: the long-standing ~21/h. The frame classifies as `Data(Trades)` but
+  names no `coin`, so the lookup failed and the catch-all
+  (`run_loop.rs:1957`) counted it and tapped it. Valid, empty venue data;
+  nothing lost — but the counter hid any real reject.
+- **Fix (HK1's unsubscribe-echo model):** `is_empty_data_array` (lib.rs,
+  beside `extract_coin`: `"data":`, JSON whitespace, `[`, whitespace, `]`;
+  borrowing, zero-alloc), asked only once the coin lookup has failed, so a
+  push that resolves pays nothing new → `Dispatch::TradesEmpty`: a message
+  and `HlRollStatus::trades_empty`, published as
+  `engine_ingress_hyperliquid_trades_empty_total`; not a parse error, not a
+  reject. A broken array, rows for an unconfigured coin and an empty array
+  on any other channel still count and tap. Tests: the tap's 30 bytes ×16
+  (0 parse errors, 16 empty, no tick, no print), the negatives, a normal
+  push unchanged; the HL frame fuzzer 60 s, 2.95 M runs, clean.
+
+### The deploy (2026-10-16)
+
+`cargo build --release -p cli` at `0968414` (1 m 40 s); `exec-smoke
+--offline` PASS; `pkill -TERM` 05:16:05Z (one minute past the :15 roll).
+Booted `09684149a287`, `/state` v3, mask 255, halted 0, the nine feeds up,
+`engine_vm_rows_active` 2. At boot `hyperliquid_parse_errors_total` 0 and
+`hyperliquid_trades_empty_total` 4 (the boot burst, now where it belongs);
+`seq_regressions_total` 0 for binance / bybit / mexc. Across the 05:30
+roll (two families rolled by 05:31:34Z): `parse_errors_total` stayed 0,
+`trades_empty_total` went 4 → 8, the HL rejects tap stayed at its 64-B
+header; `seq_regressions_total` binance 0, bybit 0, mexc 3 in the first
+quarter hour (the previous binary counted 13 in its last hour under
+Q-MX1's law). Then `git push origin main` (HK-R25).
+
+## HK, part 5 — OKX and Binance options `venue_seq` (2026-10-16)
+
+**Ask (Anton):** "address these: 1. OKX truncates its sequence number the
+same way … 2. Binance options ticks carry a sequence of 0 …". **Plan:**
+project doc `claude/hk-part5-plan-2026-10-16.md`. **Commits:** `975aa2f`
+HK39, `30ed1b4` HK40; this section and the docs are HK41.
+
+| id | ruling (operator, 2026-10-16) |
+|---|---|
+| HK-R26 | OKX `bbo-tbt`: the arrival ordinal keyed on the venue `ts` (ms), the HK31/HK32 law — not on `seqId`, which OKX documents may reset after maintenance (and `bbo-tbt` has no snapshot to signal it). |
+| HK-R27 | Binance options (eapi `optionMarkPrice`): the arrival ordinal keyed on each mark element's event time `E` (ms). |
+| HK-R28 | One cut each, gates and reviews, deploy, push. |
+
+- **HK39 (`975aa2f`).** `bbo-tbt` put `seqId as u32` into `Tick.venue_seq`
+  (BTC-USDT-SWAP seqId 346 500 248 290, past 2^32). Now `bbo_seq:
+  [ArrivalSeq; OKX_MAX_SYMBOLS]` by symbol row, keyed on the push's `ts`;
+  reconnect → `reset_clocks`; a 0 counts on `okx_seq_regressions_total`.
+  `bbo-tbt` is each OKX instrument's only `Tick` source (`books` feeds the
+  `OkxSeqChain` and the depth lane; trades / mark / funding /
+  opt-summary feed events), and there is one OKX connection. Same-ms
+  tick-by-tick pushes take successive ordinals; a `seqId` drop with a newer
+  `ts` applies. `OkxBboFrame.seq_id` and its per-push memmem scan are gone
+  (nothing read them any more; the frame stays 64 B). The `books` `seqId`
+  chain and the `trades` check are unchanged. OKX Driver 7 696 → 8 976 B.
+- **HK40 (`30ed1b4`).** The eapi option ticks carried `venue_seq` 0, which
+  every `TopOfBook` dropped as `Stale`. Every element of the
+  `optionMarkPrice` array carries its own `E` (elements of one array differ
+  by a millisecond); each option row's `ArrivalSeq` is keyed on it; a
+  missing / malformed `E` reads 0 (the summary still flows; the tick is 0
+  and counted after the first real `E`). The sequencers are ONE fixed
+  boot-time block, `Box<[ArrivalSeq; EAPI_TABLE_MAX]>` in the eapi lane,
+  built from a `vec!` without a stack temporary and never grown: the 200+
+  per-symbol bookTicker Drivers carry 8 B for it (Driver 3 416 → 3 424 B),
+  not 1 280 B. The option ticks keep `venue_time_ms` 0 (`E` could feed
+  it and the VT2 feed clock — a follow-up, not ruled).
+- **What changes live (review finding 1):** Binance option touches now
+  reach `TopOfBook`. The only engine reader is ai-exec (slot 4,
+  `strategy-ai-exec/src/lib.rs:580-600`): a `SetFairValue` naming a Binance
+  option `SymbolId` claimed a book that stayed empty and never quoted; now
+  it can place paper post-only quotes at mid when |mid − (fair + bias)| ≥
+  edge. It takes an AI or operator command naming such a symbol. vrp, xsd,
+  xmm, bin15, hyparb, hcv, vm, the dispatcher's paper matcher, the
+  paper.rs and exec-router marks do not read `venue_seq` and are
+  unaffected.
+- Gates: nextest 4 754 (+6), alloc 127 (the OKX run loop and the Binance
+  run loop with the eapi window at 0 B), copy-audit new 0, license. Review:
+  risk / alloc SHIP WITH FIXES; applied (the fixed-size Box, the dead
+  `seqId` scan, the docs below).
+
+### The deploy (2026-10-16)
+
+`cargo build --release -p cli` at `30ed1b4` (1 m 44 s); `exec-smoke
+--offline` PASS. The Mac link dropped at ~06:40Z with the restart already
+armed on the Mac; `pkill -TERM` fired at 06:46:05Z. Booted `30ed1b431f69`,
+`/state` v3, mask 255, halted 0, the nine feeds up; at ~2 min
+`seq_regressions_total` binance 0, okx 0, bybit 0, mexc 0, HL
+`parse_errors_total` 0 (`trades_empty_total` 4 — the boot burst),
+`engine_ingress_binance_options_selected` 64. `engine_vm_rows_active`
+read 0 until 06:52Z: the boot landed one minute into the hourly `candles`
+cycle (06:45:11Z) and then `iv_digest`, and `recommit-ruleset.sh` waits
+behind any live worker (bounded 30 min) — it re-committed at ~06:52Z and
+the rows came back (2). **A deploy restart belongs off :46** (the candles
+hour); :16 and :31 were clean today. Then `git push origin main`.
+
+## HK, part 6 — Binance options: venue time, staleness, own counters (2026-10-16)
+
+**Ask (Anton):** "Binance option ticks still carry no venue timestamp … feed
+the feed-staleness check" and "Binance option out-of-order ticks are
+counted together with Binance's other books … A separate counter would fix
+that." **Plan:** project doc `claude/hk-part6-plan-2026-10-16.md`.
+**Commit:** `8c15fdc` HK42; this section and the docs are HK43.
+
+| id | ruling (operator, 2026-10-16) |
+|---|---|
+| HK-R29 | Option ticks carry `E` as `venue_time_ms`; the options connection judges staleness from it on its own clock at Binance's default 1 000 ms (`--stale-after-ms bn:` applies). A late tick is flagged `TICK_FLAG_STALE`; per VT3/VT4 members do not mark or quote on it. |
+| HK-R30 | Three options-only metrics: `engine_ingress_binance_options_seq_regressions_total`, `…_options_stale_ticks_total`, `…_options_feed_delay_ema_ms`; `binance`'s then cover the bookTicker connections only. |
+| HK-R31 | One cut, gates and a review, deploy off :46, docs, push. |
+
+- **HK42 (`8c15fdc`).** The eapi lane builds option ticks with
+  `Tick::new_stamped(…, E, stale flag)`: `feed_clock.judge(E, ts_ns)` on
+  the options Driver's own `FeedClock` (it sat idle before), a stale tick
+  counted. A second `IngressStatus` slot, `binance_options`
+  (`IngressStatusSet`), reaches the lane as an `Arc` in
+  `StreamLane::Eapi(table, seqs, Arc<IngressStatus>)`: it reuses
+  `note_arrival_seq`, `inc_stale_ticks` and `set_feed_delay_ema_ms`
+  unchanged (no copied judge), costs one 192-B slot at boot, and only its
+  three cells are written and published; messages, rows, parse errors and
+  ring drops still count on `binance`. Per tick: one predicted compare for
+  the regression, one for the stale flag; the delay gauge once per push.
+  `E` = 0 is never stale (`judge` short-circuits).
+- **Found on the way:** `--stale-after-ms bn:` never reached the eapi and
+  markPrice drivers (paper.rs set it on the bookTicker slots only); it is
+  now set on every Binance slot (the markPrice lane never judges, so
+  nothing changes there).
+- Metrics registered and published the HK37 way (gauges holding the
+  totals); the gauge registry is 472 of 512 by count (+3).
+- Tests: `E` lands in `venue_time_ms`; a tick 5 s behind the learned
+  offset is flagged and counted on the options slot, a caught-up one is
+  not; `set_stale_after_ms(10 000)` lets a 9-s-late tick through; the
+  options delay gauge moves; Binance's stale, regression and delay stay 0
+  while its `ticks_total` counts the rows. Gates: nextest 4 755, alloc 127
+  (the eapi window at 0 B), copy-audit new 0, license.
+
+### The deploy (2026-10-16)
+
+`cargo build --release -p cli` at `8c15fdc`; `exec-smoke --offline` PASS;
+`pkill -TERM` 07:16:05Z (one minute past :15, off the :45 candles hour).
+Booted `8c15fdc996de`, `/state` v3, mask 255, halted 0, the nine feeds up,
+`engine_vm_rows_active` 2 at once (no worker cycle in the way). Over the
+first two minutes: `binance_options_seq_regressions_total` 0,
+`binance_options_stale_ticks_total` 0, `binance_options_feed_delay_ema_ms`
+141 → 58–68 ms as the clock learned (bookTicker's `binance` delay 8–36
+ms); `binance_seq_regressions_total` and `…_stale_ticks_total` 0; okx and
+HL 0. Then `git push origin main`.

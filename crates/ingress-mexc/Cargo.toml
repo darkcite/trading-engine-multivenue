@@ -22,8 +22,10 @@ memchr       = { workspace = true }
 mio          = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
+# HK36: the sequencer tests apply its ticks to `TopOfBook`.
+book-builder = { workspace = true }
+proptest     = { workspace = true }
 # TLS-loopback integration test (tests/mexc_tls_loopback.rs) — the
 # binance/okx pattern; test-only, never linked into release.
-rcgen    = { workspace = true }
-rustls   = { workspace = true }
+rcgen        = { workspace = true }
+rustls       = { workspace = true }

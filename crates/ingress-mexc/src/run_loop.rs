@@ -151,9 +151,6 @@ pub enum RunResult {
 #[derive(Copy, Clone, Debug)]
 #[repr(C, align(64))]
 struct RowState {
-    /// Last-seen full-width book seq (spot `version` / futures
-    /// `version`); 0 = none yet. Process-lifetime.
-    last_book_seq: u64,
     /// Last-seen full-width trade seq (spot `tradeId` leading digits /
     /// futures `i`); 0 = none yet. Process-lifetime.
     last_trade_seq: u64,
@@ -175,19 +172,18 @@ struct RowState {
     /// ABSENT until a fresh tick) for as long as the touch stays put.
     /// Connection-scoped with `last_bbo`.
     last_stale: u8,
-    _pad: [u8; 2],
+    _pad: [u8; 10],
 }
 
 impl RowState {
     const EMPTY: Self = Self {
-        last_book_seq: 0,
         last_trade_seq: 0,
         funding_next_ms: 0,
         last_bbo: [0; 4],
         funding_cycle_ms: 0,
         confirmed: 0,
         last_stale: 0,
-        _pad: [0; 2],
+        _pad: [0; 10],
     };
 }
 
@@ -198,6 +194,10 @@ const _ROW_SIZE: () = assert!(::core::mem::size_of::<RowState>() == 64);
 const fn class_mask(class: MexcClass) -> u8 {
     ((1u16 << class.channels_per_symbol()) - 1) as u8
 }
+
+// HK36: `book_seq[row % MEXC_MAX_SYMBOLS_PER_CONN]` relies on the capacity
+// being a power of two (the `%` is a mask that only drops the bounds check).
+const _: () = assert!(MEXC_MAX_SYMBOLS_PER_CONN.is_power_of_two());
 
 /// Mutable per-connection state owned by the run-loop. Preallocated at
 /// construction; never reallocates in steady state.
@@ -223,6 +223,10 @@ pub struct Driver {
     symbols: MexcSymbolTable,
     /// Per-row state, indexed by symbol-table row.
     rows: [RowState; MEXC_MAX_SYMBOLS_PER_CONN],
+    /// HK36: per-row book sequencers keyed on the full `version`, same
+    /// indexing (crate docs). Clocks zeroed on reconnect; ordinals
+    /// process-lifetime.
+    book_seq: [core_types::ArrivalSeq; MEXC_MAX_SYMBOLS_PER_CONN],
     /// Set once the subscribe set has been queued this session.
     subscribed: bool,
     /// WS2: PROCESS-LIFETIME flag — true once ANY pair has ever been
@@ -262,7 +266,7 @@ impl Driver {
         );
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
-        // COPY: the 520 B symbol table moves into the driver, and the 1 792 B
+        // COPY: the 520 B symbol table moves into the driver, and the 2 048 B
         // driver returns by value — once per connection, at boot — the
         // driver holds its table INLINE so every hot lookup walks contiguous
         // rows with no pointer to chase — rejected: a `Box` (a heap hop on
@@ -279,6 +283,7 @@ impl Driver {
             class,
             symbols,
             rows: [RowState::EMPTY; MEXC_MAX_SYMBOLS_PER_CONN],
+            book_seq: [core_types::ArrivalSeq::ZERO; MEXC_MAX_SYMBOLS_PER_CONN],
             subscribed: false,
             ever_confirmed: false,
             establish_budget_ns: core_net::ESTABLISH_BUDGET_NS,
@@ -367,10 +372,11 @@ impl Driver {
         n
     }
 
-    /// Reset per-connection state for a reconnect. Confirmations are
-    /// connection-scoped; `ever_confirmed`, the seqs, the funding seeds,
-    /// the establishment budget and the drop-log limiter are
-    /// process-lifetime — untouched here.
+    /// Reset per-connection state for a reconnect. Confirmations and the
+    /// book sequencers' clocks are connection-scoped; `ever_confirmed`,
+    /// the trade seqs, the book ordinals, the funding seeds, the
+    /// establishment budget and the drop-log limiter are process-lifetime
+    /// — untouched here.
     pub fn reset_for_reconnect(&mut self, nonce_seed: u64) {
         self.state = State::Connecting;
         self.rx.clear();
@@ -390,6 +396,12 @@ impl Driver {
         self.session_ticks = 0;
         // VT2: a new connection is a new offset; the threshold stays.
         self.feed_clock.reset();
+        // HK36: every row's ordinal stays (monotone — no book sees it
+        // fall); its clock is zeroed, so a reconnect clears a clock a
+        // venue-side `version` reset or a far-future one poisoned. rx is
+        // cleared and the old socket gone: no push of the old connection
+        // can follow.
+        core_types::ArrivalSeq::reset_clocks(&mut self.book_seq);
     }
 
     /// Ticks this connection published since its session began (O-HC16).
@@ -1082,8 +1094,10 @@ fn note_confirmed(drv: &mut Driver, row: usize, channel: MexcChannel) {
     }
 }
 
-/// Q-MX1 regression judge: `v` strictly below the last-seen full-width
-/// value counts once; 0 = absent never counts and never overwrites.
+/// Q-MX1 regression judge of the TRADE stream: `v` strictly below the
+/// last-seen full-width value counts once; 0 = absent never counts and
+/// never overwrites. (The book stream's judge is its row's
+/// `core_types::ArrivalSeq`, HK36.)
 #[inline]
 fn note_seq(last: &mut u64, v: u64, status: &IngressStatus) {
     if v == 0 {
@@ -1255,6 +1269,17 @@ fn handle_data_frame<C: Capture>(
                 scan.ask_qty_1e6,
             ];
             let stale = judged.stale as u8;
+            // HK36 (ruling HK-R22): the row's arrival ordinal keyed on the
+            // full `version` (crate docs), stamped on EVERY parsed push —
+            // a republication still feeds the regression check, and takes
+            // an ordinal no book sees (a gap, as the skipped versions
+            // were). A version behind the row's newest takes 0 (dropped by
+            // every book) and is counted. `row < MEXC_MAX_SYMBOLS_PER_CONN`
+            // by construction (the table's capacity); the `%`
+            // (a power of two: a mask) only drops the bounds check.
+            debug_assert!(row < MEXC_MAX_SYMBOLS_PER_CONN, "a MEXC row past the table");
+            let venue_seq = drv.book_seq[row % MEXC_MAX_SYMBOLS_PER_CONN].next(scan.seq);
+            status.note_arrival_seq(venue_seq);
             // A tick is a BBO CHANGE (the house doctrine: Binance
             // bookTicker, Bybit orderbook.1 and OKX bbo-tbt push on
             // change). MEXC republishes an UNCHANGED quote — spot
@@ -1262,7 +1287,7 @@ fn handle_data_frame<C: Capture>(
             // 2026-09-23: 96.5–99.9 % of spot pushes byte-identical to
             // the previous one), futures `depth.full` whenever a deeper
             // level moves (26–79 %). Such a push is a msg, not a tick:
-            // no ring slot, no capture row; its version still feeds the
+            // no ring slot, no capture row; its version still fed the
             // regression check and its stamp the feed clock above.
             // An unchanged quote whose STALE verdict flipped IS a tick:
             // the vm mirrors the latest tick's flag (VT3 — reads go
@@ -1273,7 +1298,6 @@ fn handle_data_frame<C: Capture>(
             // lag.
             let changed = match drv.rows.get_mut(row) {
                 Some(r) => {
-                    note_seq(&mut r.last_book_seq, scan.seq, status);
                     let changed = r.last_bbo != bbo || r.last_stale != stale;
                     r.last_bbo = bbo;
                     r.last_stale = stale;
@@ -1296,7 +1320,7 @@ fn handle_data_frame<C: Capture>(
                     now,
                     VenueId::Mexc,
                     sym,
-                    (scan.seq & 0xFFFF_FFFF) as u32,
+                    venue_seq,
                     Price::from_raw(scan.bid_px_1e6),
                     Qty::from_raw(scan.bid_qty_1e6),
                     Price::from_raw(scan.ask_px_1e6),
@@ -1513,8 +1537,8 @@ impl<'a, T: Transport> MexcConn<'a, T> {
         keepalive: core_net::Keepalive,
         backoff: core_net::Backoff,
     ) -> Self {
-        // COPY: the Driver (1 792 B, its symbol table inline) moves into its
-        // slot here and, with the slot (3 008 B), into the boot's Vec — two
+        // COPY: the Driver (2 048 B, its symbol table inline) moves into its
+        // slot here and, with the slot (3 264 B), into the boot's Vec — two
         // moves per connection, once, at boot — rejected: a two-phase
         // in-place init behind `&mut` (every constructor split, for a
         // boot-only cost).
@@ -1756,6 +1780,16 @@ mod tests {
     const SYM_FBTC: u32 = (7 << 24) | 513;
     const SYM_FXAU: u32 = (7 << 24) | 514;
     const H8: u64 = 8 * MS_PER_HOUR;
+
+    /// HK36: a sequencer fed `keys` — what a row's must equal after the
+    /// same pushes (its fields are private to core-types).
+    fn fed(keys: &[u64]) -> core_types::ArrivalSeq {
+        let mut s = core_types::ArrivalSeq::ZERO;
+        for &k in keys {
+            s.next(k);
+        }
+        s
+    }
 
     fn spot_symbols() -> MexcSymbolTable {
         let mut t = MexcSymbolTable::new();
@@ -2089,7 +2123,9 @@ mod tests {
         assert_eq!(tick.bid_qty.raw(), 380_497);
         assert_eq!(tick.ask_px.raw(), 80_535_890_000);
         assert_eq!(tick.ask_qty.raw(), 333_363);
-        assert_eq!(tick.venue_seq, (81_721_676_217u64 & 0xFFFF_FFFF) as u32, "truncated version");
+        // HK36: the row's first ordinal, keyed on the full version (old
+        // law: its low 32 bits).
+        assert_eq!(tick.venue_seq, 1, "the first ordinal");
         assert_eq!(tick.venue_time_ms, enc::SEND_TIME, "sendTime (createTime absent)");
         assert!(!tick.is_stale());
         assert_eq!(cap.ticks.len(), 1, "captured before the push");
@@ -2097,7 +2133,7 @@ mod tests {
         assert_eq!(status.ticks_total(), 1);
         assert_eq!(status.parse_errors_total(), 0);
         assert_eq!(d.sub_count(), 1, "data confirms the pair");
-        assert_eq!(d.rows[0].last_book_seq, 81_721_676_217, "full width kept");
+        assert_eq!(d.book_seq[0], fed(&[81_721_676_217]), "full width kept");
     }
 
     #[test]
@@ -2261,9 +2297,10 @@ mod tests {
         assert_eq!(tick.bid_qty.raw(), 31_288_000_000, "contracts ×1e6");
         assert_eq!(tick.ask_px.raw(), 80_468_700_000);
         assert_eq!(tick.ask_qty.raw(), 3_446_000_000);
-        assert_eq!(tick.venue_seq, (41_925_002_140u64 & 0xFFFF_FFFF) as u32);
+        // HK36: the first ordinal (old law: the version's low 32 bits).
+        assert_eq!(tick.venue_seq, 1);
         assert_eq!(tick.venue_time_ms, 1_789_897_581_009, "cts");
-        assert_eq!(d.rows[0].last_book_seq, 41_925_002_140);
+        assert_eq!(d.book_seq[0], fed(&[41_925_002_140]));
     }
 
     #[test]
@@ -2485,25 +2522,29 @@ mod tests {
         push(&mut t, book_push(b"BTCUSDT", b"1", b"2", b"100", 2)); // equal: fine
         push(&mut t, book_push(b"BTCUSDT", b"1", b"2", b"150", 3)); // skip ahead: fine
         push(&mut t, book_push(b"ETHUSDT", b"1", b"2", b"5", 4)); // other symbol: own state
-        push(&mut t, book_push(b"BTCUSDT", b"1", b"2", b"", 5)); // absent: never counts
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.seq_regressions_total(), 0);
         assert_eq!(status.gaps_total(), 0, "no chain law on this venue");
         push(&mut t, book_push(b"BTCUSDT", b"1", b"2", b"149", 6)); // regression
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.seq_regressions_total(), 1);
-        push(&mut t, book_push(b"BTCUSDT", b"1", b"2", b"149", 7)); // last-seen, not max
+        // HK36: the book's judge is its row's `ArrivalSeq` — behind the
+        // NEWEST (150), not the last-seen, counts again (old law: once),
+        // and so does an absent version (old law: never counted; its tick
+        // was and is `venue_seq` 0, dropped by every book).
+        push(&mut t, book_push(b"BTCUSDT", b"1", b"2", b"149", 7));
+        push(&mut t, book_push(b"BTCUSDT", b"1", b"2", b"", 8));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
-        assert_eq!(status.seq_regressions_total(), 1);
+        assert_eq!(status.seq_regressions_total(), 3);
         // Trade stream: judged by the push's largest id, independent of
         // the book stream and of intra-push order.
         push(&mut t, deals_push(b"BTCUSDT", &[b"20X0_1", b"10X0_2"]));
         push(&mut t, deals_push(b"BTCUSDT", &[b"21X0_1"]));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
-        assert_eq!(status.seq_regressions_total(), 1);
+        assert_eq!(status.seq_regressions_total(), 3);
         push(&mut t, deals_push(b"BTCUSDT", &[b"15X0_1", b"X"]));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
-        assert_eq!(status.seq_regressions_total(), 2);
+        assert_eq!(status.seq_regressions_total(), 4);
         assert_eq!(status.parse_errors_total(), 0);
     }
 
@@ -2519,6 +2560,48 @@ mod tests {
         t.inject_incoming(&text(br#"{"symbol":"BTC_USDT","data":[{"p":1,"v":1,"T":1,"t":5,"i":"16270106000"}],"channel":"push.deal","ts":9}"#));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.seq_regressions_total(), 2);
+    }
+
+    /// HK36: a `version` crossing a 2^32 boundary takes a HIGHER
+    /// `venue_seq` and applies (old law: its low 32 bits fell to 1 —
+    /// `Stale` until a restart); a backward version takes 0, `Stale` at
+    /// the book, counted; a reconnect zeroes the clock (a venue-side
+    /// version reset applies again) and keeps the ordinal.
+    #[test]
+    fn a_full_version_across_2_32_applies_backward_counts_and_reconnect_clears() {
+        use book_builder::{ApplyOutcome, TopOfBook};
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = steady(MexcClass::Futures);
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+        let mut book = TopOfBook::empty(SYM_FBTC);
+        // The ask size counts the pushes, so every push is a BBO change.
+        let mut n = 0u64;
+        let mut push = |t: &mut TestTransport, d: &mut Driver, v: u64| -> Tick {
+            n += 1;
+            let f = format!(
+                r#"{{"symbol":"BTC_USDT","data":{{"asks":[[2,{n},1]],"bids":[[1,1,1]],"version":{v}}},"channel":"push.depth.full","ts":9}}"#
+            );
+            t.inject_incoming(&text(f.as_bytes()));
+            drive(t, d, &mut prod, &status, &mut NullCapture).unwrap();
+            *cons.try_pop_ref().expect("a changed BBO is a tick")
+        };
+        let below = push(&mut t, &mut d, 0xFFFF_FFFF);
+        let above = push(&mut t, &mut d, 0x1_0000_0001);
+        assert_eq!((below.venue_seq, above.venue_seq), (1, 2));
+        assert_eq!(book.apply(&below), ApplyOutcome::Applied);
+        assert_eq!(book.apply(&above), ApplyOutcome::Applied, "past 2^32");
+        let back = push(&mut t, &mut d, 0xFFFF_FFFF);
+        assert_eq!(back.venue_seq, 0, "a backward version");
+        assert_eq!(book.apply(&back), ApplyOutcome::Stale);
+        assert_eq!(status.seq_regressions_total(), 1);
+        d.reset_for_reconnect(9);
+        d.state = State::Steady;
+        d.subscribed = true;
+        let after = push(&mut t, &mut d, 5);
+        assert_eq!(after.venue_seq, 3, "the clock cleared, the ordinal kept");
+        assert_eq!(book.apply(&after), ApplyOutcome::Applied);
+        assert_eq!(status.seq_regressions_total(), 1);
     }
 
     // ---- staleness -----------------------------------------------------
@@ -2568,7 +2651,7 @@ mod tests {
         assert!(cons.try_pop_ref().is_none(), "one side is not a BBO");
         assert_eq!(status.parse_errors_total(), 0);
         assert_eq!(status.msgs_total(), 1);
-        assert_eq!(d.rows[0].last_book_seq, 9, "its version still counts");
+        assert_eq!(d.book_seq[0], fed(&[9]), "its version still counts");
     }
 
     /// The BBO-change doctrine (measured live 2026-09-23: spot
@@ -2590,7 +2673,7 @@ mod tests {
         assert!(cons.try_pop_ref().is_none(), "two republications are not");
         assert_eq!(status.msgs_total(), 3);
         assert_eq!(status.ticks_total(), 1);
-        assert_eq!(d.rows[0].last_book_seq, 12, "the seq check saw every push");
+        assert_eq!(d.book_seq[0], fed(&[10, 11, 12]), "the seq check saw every push");
         // A changed BBO emits.
         t.inject_incoming(&binary(&book_push(b"BTCUSDT", b"1", b"3", b"13", t0 + 30)));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
@@ -2710,15 +2793,19 @@ mod tests {
             !cons.try_pop_ref().unwrap().is_stale(),
             "5 s under a 10 s threshold"
         );
-        // Reconnect: a fresh offset; confirmations clear; seqs and the
-        // funding seed survive.
+        // Reconnect: a fresh offset; confirmations and the book clock
+        // clear; the book ordinal, the trade seqs and the funding seed
+        // survive.
         assert!(d.set_funding_seed(SYM_FBTC, 77, 8));
         d.ever_confirmed = true;
         d.reset_for_reconnect(9);
         assert_eq!(d.state(), State::Connecting);
         assert_eq!(d.sub_count(), 0);
         assert!(d.ever_confirmed, "process-lifetime");
-        assert_eq!(d.rows[0].last_book_seq, 2);
+        // HK36: the book clock is zeroed, the ordinal kept.
+        let mut want = fed(&[1, 2]);
+        want.reset_clock();
+        assert_eq!(d.book_seq[0], want);
         assert_eq!(d.rows[0].funding_next_ms, 77);
         d.state = State::Steady;
         d.subscribed = true;

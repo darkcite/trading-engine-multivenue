@@ -7,6 +7,7 @@
 //! `docs/phase-8-plan.md` §4.1 (venue facts verified 2026-08-14):
 //!
 //! * `bbo-tbt`   — 1-level book, 10 ms cadence, free tier → [`core_types::Tick`]
+//!   (`venue_seq`: the arrival ordinal — see "Sequence numbers" below)
 //! * `trades`    — per-trade pushes, `seqId`-monotonic
 //! * `mark-price` — 200 ms cadence
 //! * `funding-rate` — 30–90 s push cadence; interval 1h–8h (read `fundingTime`)
@@ -23,6 +24,29 @@
 //! legitimately *reset* (`seqId < prevSeqId`, chain intact). Any true
 //! break ⇒ resubscribe + `gaps_total`. `trades` carries a
 //! per-instrument monotonic `seqId` checked by [`TradeSeqMonitor`].
+//!
+//! ## Sequence numbers on the Tick lane
+//!
+//! HK39 (ruling HK-R26, 2026-10-16): a `bbo-tbt` push's `Tick.venue_seq`
+//! is its instrument's **arrival ordinal** — the run loop's per-row
+//! `core_types::ArrivalSeq`, keyed on the push's `ts` (ms; in full in
+//! `Tick.venue_time_ms`, VT2), stamps each parsed push 1, 2, 3, … in
+//! arrival order (one connection per instrument: the venue's order) while
+//! its `ts` does not go back; same-`ts` pushes take successive ordinals
+//! (the later arrival is the touch). A push OLDER than its instrument's
+//! newest carries 0 — every `book_builder::TopOfBook` drops it — and is
+//! counted on `seq_regressions_total`. The ordinal is monotone for the
+//! life of the process; a reconnect zeroes only the clock. Until HK39 the
+//! seq was `seqId as u32`: the live `seqId` is past 2^32 (BTC-USDT-SWAP
+//! 346 500 248 290 on 2026-10-16), so its low 32 bits wrap, after which
+//! every push of the instrument was `Stale` until a restart, and
+//! maintenance may reset `seqId` (above), which `bbo-tbt` — no snapshot —
+//! cannot signal. `bbo-tbt` is each instrument's ONLY `Tick` source:
+//! `books` feeds the chain and the depth lane (`DepthTopK`); `trades`,
+//! `mark-price`, `funding-rate` and `opt-summary` feed capture events,
+//! the venue-event lane and `OptSummary`. `bbo-tbt`'s `seqId` is not
+//! read: the Tick is keyed on `ts`; the `books` channel's `seqId` chain
+//! still is, and `trades` keeps its monotonic `seqId` check (above).
 //!
 //! ## Keepalive
 //!
@@ -364,12 +388,11 @@ pub fn parse_opt_summary_row(row: &[u8]) -> Option<OkxOptSummaryFrame> {
 // ---------------------------------------------------------------
 
 /// Parsed `bbo-tbt` push (one level per side; a missing side is
-/// px = 0, qty = 0 — legitimate for one-sided books).
+/// px = 0, qty = 0 — legitimate for one-sided books). No `seqId`: the
+/// push's is not read — the Tick is keyed on `ts` (HK39: crate docs).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(C, align(64))]
 pub struct OkxBboFrame {
-    /// `seqId` from the data row (0 when the venue omits it).
-    pub seq_id: i64,
     /// Venue event time (`ts`, ms) converted to ns.
     pub ts_ns: NsTs,
     /// Best bid price ×1e6 (0 = side empty).
@@ -383,20 +406,19 @@ pub struct OkxBboFrame {
     /// Resolved symbol (venue-namespaced, bits 31..24 = Okx).
     pub sym: SymbolId,
     // Explicit tail padding — keeps the slot exactly 64 B.
-    _pad: [u8; 12],
+    _pad: [u8; 20],
 }
 
 impl OkxBboFrame {
     /// The all-zero frame — the in-place parse's starting slot.
     pub const ZERO: Self = Self {
-        seq_id: 0,
         ts_ns: 0,
         bid_px_1e6: 0,
         bid_qty_1e6: 0,
         ask_px_1e6: 0,
         ask_qty_1e6: 0,
         sym: 0,
-        _pad: [0; 12],
+        _pad: [0; 20],
     };
 }
 
@@ -718,20 +740,18 @@ fn parse_bbo_fill(payload: &[u8], sym: SymbolId, out: &mut OkxBboFrame) -> Optio
     let bids_pos = find_field(payload, b"\"bids\":")?;
     let (bid_px_1e6, bid_qty_1e6) = scan_bbo_side(payload, bids_pos)?;
     let ts_ns = scan_quoted_ms_to_ns(payload, b"\"ts\":")?;
-    let seq_id = scan_seq_field(payload, b"\"seqId\":").unwrap_or(0);
     // A frame with both sides empty carries no information.
     if ask_px_1e6 == 0 && bid_px_1e6 == 0 {
         return None;
     }
     *out = OkxBboFrame {
-        seq_id,
         ts_ns,
         bid_px_1e6,
         bid_qty_1e6,
         ask_px_1e6,
         ask_qty_1e6,
         sym,
-        _pad: [0; 12],
+        _pad: [0; 20],
     };
     Some(())
 }
@@ -1384,7 +1404,6 @@ mod tests {
         assert_eq!(f.bid_px_1e6, 111_050_000);
         assert_eq!(f.bid_qty_1e6, 57_745_000_000);
         assert_eq!(f.ts_ns, 1_670_324_386_802 * 1_000_000);
-        assert_eq!(f.seq_id, 363_996_337);
     }
 
     #[test]
@@ -1404,10 +1423,13 @@ mod tests {
         assert!(parse_bbo_view(both_empty, 0).is_none());
     }
 
+    /// HK39: `seqId` is not read — a push without one parses whole.
     #[test]
-    fn parse_bbo_defaults_seq_to_zero_when_absent() {
+    fn parse_bbo_needs_no_seq_id() {
         let b = br#"{"asks":[["2","1","0","1"]],"bids":[["1","1","0","1"]],"ts":"1000"}"#;
-        assert_eq!(parse_bbo_view(b, 0).unwrap().seq_id, 0);
+        let f = parse_bbo_view(b, 0).unwrap();
+        assert_eq!((f.ask_px_1e6, f.bid_px_1e6), (2_000_000, 1_000_000));
+        assert_eq!(f.ts_ns, 1_000 * 1_000_000);
     }
 
     // ---- parse_trade ---------------------------------------------
@@ -1760,8 +1782,8 @@ mod proptests {
             prop_assert_eq!(f.ask_qty_1e6, aq as i64);
             prop_assert_eq!(f.bid_px_1e6, bp as i64);
             prop_assert_eq!(f.bid_qty_1e6, bq as i64);
+            // HK39: any `seqId` rides along unread (the fields above hold).
             prop_assert_eq!(f.ts_ns, ts * 1_000_000);
-            prop_assert_eq!(f.seq_id, seq);
         }
 
         /// VT2: the staleness judge over arbitrary stamp/receive

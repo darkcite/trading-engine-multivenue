@@ -269,7 +269,7 @@ text{dominant-baseline:auto}
 <text x="854.4" y="719.0" font-size="6.6" fill="#7c8798">fires when now − last ≥ strat.timer_period_ns()</text>
 <text x="49" y="752" font-size="7.1" fill="#7c8798">Strategy members are struct fields, not threads: slots 0–6 all evaluate in-line, in slot order, inside this one call.  StampCtx stamps Order.strategy_id per slot before EngineCtx::submit — that byte is what the exec router reads later.</text>
 <rect x="36" y="774" width="1024" height="196" rx="9" fill="rgba(4,120,87,0.035)" stroke="#047857" stroke-width="1.15"/>
-<text x="49" y="791" font-size="9.4" font-weight="700" fill="#047857">STRATEGY SLOTS — StrategySet, one u8 enable mask, MAX 8 · BUILT_MASK = 127 (strategy-set/src/lib.rs:178)</text>
+<text x="49" y="791" font-size="9.4" font-weight="700" fill="#047857">STRATEGY SLOTS — StrategySet, one u16 SlotMask, MAX 16 · BUILT_MASK = 255 (0–7; 8–15 reserved, S16 2026-10-15)</text>
 <text x="73.0" y="812" font-size="6.9" font-weight="700" text-anchor="middle" letter-spacing="0.2" fill="#7c8798">slot</text>
 <text x="118" y="812" font-size="6.9" font-weight="700" text-anchor="end" letter-spacing="0.2" fill="#7c8798">bit</text>
 <text x="122" y="812" font-size="6.9" font-weight="700" letter-spacing="0.2" fill="#7c8798">carrier</text>
@@ -277,12 +277,12 @@ text{dominant-baseline:auto}
 <text x="714" y="812" font-size="6.9" font-weight="700" letter-spacing="0.2" fill="#7c8798">state today</text>
 <text x="904" y="812" font-size="6.9" font-weight="700" letter-spacing="0.2" fill="#7c8798">tenancy</text>
 <line x1="54" y1="815.6" x2="1046" y2="815.6" stroke="#94a3b8" stroke-width="0.8" stroke-linecap="round" opacity="0.55"/>
-<text x="73.0" y="825.6" font-size="7.15" text-anchor="middle" fill="#7c8798">0</text>
-<text x="118" y="825.6" font-size="7.15" text-anchor="end" fill="#7c8798">1</text>
-<text x="122" y="825.6" font-size="7.15" fill="#7c8798">coded member</text>
-<text x="314" y="825.6" font-size="7.15" fill="#7c8798">the first member ever written; still composed into the set</text>
-<text x="714" y="825.6" font-size="7.15" fill="#b45309">built, OFF in every wrapper mask</text>
-<text x="904" y="825.6" font-size="7.15" fill="#9aa5b4">original</text>
+<text x="73.0" y="825.6" font-size="7.15" text-anchor="middle" font-weight="700" fill="#14181f">0</text>
+<text x="118" y="825.6" font-size="7.15" text-anchor="end" fill="#3f4a5a">1</text>
+<text x="122" y="825.6" font-size="7.15" font-weight="700" fill="#14181f">coded member</text>
+<text x="314" y="825.6" font-size="7.15" fill="#3f4a5a">evaluated in-line on the engine thread, every tick, from its own crate</text>
+<text x="714" y="825.6" font-size="7.15" font-weight="700" fill="#047857">live in paper</text>
+<text x="904" y="825.6" font-size="7.15" fill="#9aa5b4">displaced its predecessor, 09-23</text>
 <rect x="52" y="830.4" width="998" height="13.4" fill="rgba(148,163,184,0.07)" rx="2.5"/>
 <text x="73.0" y="839.0" font-size="7.15" font-weight="700" text-anchor="middle" fill="#14181f">1</text>
 <text x="118" y="839.0" font-size="7.15" text-anchor="end" fill="#3f4a5a">2</text>
@@ -323,20 +323,20 @@ text{dominant-baseline:auto}
 <text x="714" y="905.9999999999999" font-size="7.15" font-weight="700" fill="#047857">live in paper</text>
 <text x="904" y="905.9999999999999" font-size="7.15" fill="#9aa5b4">took a free slot</text>
 <rect x="52" y="910.7999999999998" width="998" height="13.4" fill="rgba(148,163,184,0.07)" rx="2.5"/>
-<text x="73.0" y="919.3999999999999" font-size="7.15" text-anchor="middle" fill="#9aa5b4">7</text>
-<text x="118" y="919.3999999999999" font-size="7.15" text-anchor="end" fill="#9aa5b4">128</text>
-<text x="122" y="919.3999999999999" font-size="7.15" fill="#9aa5b4">— open —</text>
-<text x="314" y="919.3999999999999" font-size="7.15" fill="#9aa5b4">the next coded member claims it the way the last four each did</text>
-<text x="714" y="919.3999999999999" font-size="7.15" fill="#9aa5b4">reserved, unbuilt</text>
-<text x="904" y="919.3999999999999" font-size="7.15" fill="#9aa5b4">—</text>
-<text x="56" y="939.7999999999998" font-size="7.4" fill="#3f4a5a"><tspan font-weight="700" fill="#7c8798">the mask is one bit per slot</tspan><tspan fill="#3f4a5a"> — the AI pair alone is 48; with one coded member alongside it, 50, 52 or 56; with all three, 62; every built member at once is BUILT_MASK = 127.</tspan></text>
-<text x="56" y="951.2999999999998" font-size="7.0" fill="#9aa5b4">Which named combinations the wrapper permits is a deployment detail, not an architectural one: scripts/engine-wrapper.sh allow-lists 13 of them, never the first member and never all, and it always passes --paper and never --exec.  Two displaced members still boot as standalone arms outside the set; a third has no reachable boot path at all.</text>
+<text x="73.0" y="919.3999999999999" font-size="7.15" text-anchor="middle" font-weight="700" fill="#14181f">7</text>
+<text x="118" y="919.3999999999999" font-size="7.15" text-anchor="end" fill="#3f4a5a">128</text>
+<text x="122" y="919.3999999999999" font-size="7.15" font-weight="700" fill="#14181f">coded member</text>
+<text x="314" y="919.3999999999999" font-size="7.15" fill="#3f4a5a">evaluated in-line on the engine thread, every tick, from its own crate</text>
+<text x="714" y="919.3999999999999" font-size="7.15" font-weight="700" fill="#047857">live in paper</text>
+<text x="904" y="919.3999999999999" font-size="7.15" fill="#9aa5b4">took the last free slot, 09-26</text>
+<text x="56" y="939.7999999999998" font-size="7.4" fill="#3f4a5a"><tspan font-weight="700" fill="#7c8798">the mask is one bit per slot</tspan><tspan fill="#3f4a5a"> — the AI pair alone is 48; every built member at once is BUILT_MASK = 255; slots 8–15 are reserved (no member) and arming one is refused.</tspan></text>
+<text x="56" y="951.2999999999998" font-size="7.0" fill="#9aa5b4">Which set boots is a deployment detail: scripts/engine-wrapper.sh resolves any +-joined member names via strategy-mask (never all) and always passes --paper, never --exec. Two displaced members still boot as standalone arms; a third has no reachable boot path.</text>
 <rect x="36" y="984" width="1024" height="134" rx="9" fill="rgba(180,83,9,0.055)" stroke="#b45309" stroke-width="1.15" stroke-dasharray="6 3.5"/>
 <text x="49" y="1001" font-size="9.4" font-weight="700" fill="#b45309">EXECUTION — per-slot routing, the E6 risk gate and the live arm, armed only by the two-switch interlock</text>
 <rect x="51" y="1010" width="300" height="98" rx="7" fill="rgba(63,74,90,0.05)" stroke="#3f4a5a" stroke-width="1.0"/>
 <text x="62" y="1025" font-size="8.4" font-weight="700" fill="#3f4a5a">ExecRoute — per slot, not per process</text>
 <text x="62" y="1037.5" font-size="6.9" fill="#7c8798">ExecMode: Paper 0 (default + fail-safe) · Live 1 · Off 2</text>
-<text x="62" y="1046.9" font-size="6.9" fill="#7c8798">unknown byte ⇒ Paper.  8 slots × 8 venues, boot-fixed.</text>
+<text x="62" y="1046.9" font-size="6.9" fill="#7c8798">unknown byte ⇒ Paper.  16 slots × 8 venues, boot-fixed.</text>
 <text x="62" y="1056.3" font-size="6.9" fill="#7c8798">LAW E-1: a live slot whose venue bit is clear gets</text>
 <text x="62" y="1065.7" font-size="6.9" fill="#7c8798">NoLiveRoute — it NEVER silently falls back to paper.</text>
 <text x="62" y="1075.1" font-size="6.9" fill="#7c8798">RoutedDispatcher branches on Order.strategy_id.</text>

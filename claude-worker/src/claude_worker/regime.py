@@ -1088,15 +1088,30 @@ def state_url(env: typing.Mapping[str, str] | None = None) -> str:
     return url[: -len("/metrics")] + "/state" if url.endswith("/metrics") else url + "/state"
 
 
+#: The ``/state`` schemas whose regime block :func:`engine_regime_sample`
+#: reads. Schema 2 (HK) and 3 (S16-5: per-slot arrays at 16) changed no
+#: field the sample reads (``boot.pid``, ``seq``, ``regime.profiles`` /
+#: ``configured`` / ``minutes_judged``, ``vm.rows_active`` /
+#: ``regime_hard_exits``); the old ``== 1`` gate dropped every sample from
+#: schema 2 on (``engine=unreachable``) — HK34. An unknown schema is still
+#: refused: its layout is not known to hold those fields.
+ENGINE_STATE_SCHEMAS: tuple[int, ...] = (1, 2, 3)
+
+
 def engine_state(url: str, timeout_s: float = 2.0) -> dict[str, object] | None:
-    """The engine's ``/state`` document; ``None`` when unreachable or not
-    served (a pre-RG6 binary answers 404) — never an error."""
+    """The engine's ``/state`` document; ``None`` when unreachable, not
+    served (a pre-RG6 binary answers 404) or of a schema outside
+    :data:`ENGINE_STATE_SCHEMAS` — never an error."""
     try:
         with urllib.request.urlopen(url, timeout=timeout_s) as resp:  # loopback only
             obj = json.loads(resp.read().decode("utf-8", errors="replace"))
     except OSError, ValueError:
         return None
-    return obj if isinstance(obj, dict) and obj.get("v") == 1 else None
+    if not isinstance(obj, dict):
+        return None
+    v = obj.get("v")
+    # `bool` is an `int`: a `"v": true` must not read as schema 1.
+    return obj if type(v) is int and v in ENGINE_STATE_SCHEMAS else None
 
 
 def engine_regime_sample(state: dict[str, object]) -> dict[str, object] | None:

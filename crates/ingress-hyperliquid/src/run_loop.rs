@@ -94,12 +94,13 @@ use core_types::{
 use crate::discovery::{parse_outcome_spec, HlOutcomeSpec};
 use crate::family::{pack_roll_seq, HlFamilyTable, HlRollStatus, ROLL_ACK_ALL, ROLL_CHANNELS};
 use crate::{
-    bit_of, classify, coin_wants_asset_ctx, expected_mask, extract_coin, is_outcome_coin,
-    is_unsub_response, outcome_meta_description, parse_active_asset_ctx, parse_all_mids, parse_bbo,
-    parse_l2book_depth, parse_l2book_header, parse_outcome_meta, parse_sub_response, parse_trade,
-    sub_id_of, subscription_parts, GlobalBits, HlChannel, HlCoinTable, HlMsgKind, HlStaleness,
-    HlSubVerb, MaskBits, ALL_MIDS_BIT, CHANNELS_PER_COIN, HL_MAX_COINS, OUTCOME_CREATED,
-    OUTCOME_ENC_NONE, OUTCOME_META_BIT, OUTCOME_SETTLED, PING_PAYLOAD,
+    bit_of, classify, coin_wants_asset_ctx, expected_mask, extract_coin, is_empty_data_array,
+    is_outcome_coin, is_unsub_response, outcome_meta_description, parse_active_asset_ctx,
+    parse_all_mids, parse_bbo, parse_l2book_depth, parse_l2book_header, parse_outcome_meta,
+    parse_sub_response, parse_trade, sub_id_of, subscription_parts, GlobalBits, HlChannel,
+    HlCoinTable, HlMsgKind, HlStaleness, HlSubVerb, MaskBits, ALL_MIDS_BIT, CHANNELS_PER_COIN,
+    HL_MAX_COINS, OUTCOME_CREATED, OUTCOME_ENC_NONE, OUTCOME_META_BIT, OUTCOME_SETTLED,
+    PING_PAYLOAD,
 };
 
 // ---------------------------------------------------------------
@@ -1305,6 +1306,11 @@ enum Dispatch {
     },
     /// `trades` push scanned.
     Trades { scan: TradeScan },
+    /// HK37: the venue's empty `trades` snapshot on subscribe to a
+    /// coin that has not printed (a fresh HIP-4 outcome leg) — no
+    /// coin, no rows; well-formed, counted on its own
+    /// (`HlRollStatus::trades_empty`), never as a rejection.
+    TradesEmpty,
     /// `activeAssetCtx` / `allMids` / `outcomeMetaUpdates` push
     /// validated (slow-lane capture).
     Slow,
@@ -1952,6 +1958,12 @@ fn handle_data_frame<C: Capture>(
                             // Handled above.
                             HlChannel::AllMids | HlChannel::OutcomeMetaUpdates => Dispatch::Nothing,
                         },
+                        // HK37: an empty `trades` snapshot names no
+                        // coin. Asked only once the lookup has failed,
+                        // so a push that resolves pays nothing new.
+                        None if channel == HlChannel::Trades && is_empty_data_array(payload) => {
+                            Dispatch::TradesEmpty
+                        }
                         // Data for a coin we never configured — a
                         // mapping bug or venue noise; count it.
                         _ => Dispatch::Nothing,
@@ -1978,6 +1990,10 @@ fn handle_data_frame<C: Capture>(
         Dispatch::OutcomeBboOneSided => {
             status.add_msgs(1);
             drv.roll_status.inc_outcome_bbo_one_sided();
+        }
+        Dispatch::TradesEmpty => {
+            status.add_msgs(1);
+            drv.roll_status.inc_trades_empty();
         }
         Dispatch::SubAck { id, kind, bit } => {
             status.add_msgs(1);
@@ -3309,6 +3325,79 @@ mod tests {
         assert_eq!(status.parse_errors_total(), 1, "an unknown channel is still a rejection");
         assert_eq!(cap.rejects, 1);
         assert_eq!(d.roll_status.unsub_acks(), 3);
+    }
+
+    /// HK37: a fresh HIP-4 leg's empty `trades` snapshot is venue data,
+    /// not a rejection. The venue answers a `trades` subscribe to a leg
+    /// that has not printed with `{"channel":"trades","data":[]}` — no
+    /// coin, so the lookup failed and the catch-all counted it: the
+    /// 16 records of the 2026-10-16 reject tap (4 at boot, then every
+    /// roll) were all these 30 bytes, ~21 an hour. Now: a message and
+    /// its own count; no parse error, no reject tap, no tick, no print.
+    #[test]
+    fn an_empty_trades_snapshot_is_counted_not_rejected() {
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = verified_driver();
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+        let (tp, mut tc) = Ring::<TradePrint, TRADE_RING_SIZE>::new().split();
+        d.set_trade_lane(tp);
+        let mut cap = CountingCapture::default();
+        // The tap's payload, verbatim, as many times as the tap held it.
+        const SNAP: &[u8] = br#"{"channel":"trades","data":[]}"#;
+        assert_eq!(SNAP.len(), 30);
+        let mut i = 0;
+        while i < 16 {
+            inject_text(&mut t, SNAP);
+            i += 1;
+        }
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(d.roll_status.trades_empty(), 16);
+        assert_eq!(status.parse_errors_total(), 0);
+        assert_eq!(status.msgs_total(), 16);
+        assert_eq!(status.ticks_total(), 0);
+        assert_eq!(cap.rejects, 0, "venue data is never tapped as a reject");
+        assert_eq!(cap.raw_frames, 16, "still tapped raw, like every frame");
+        assert_eq!((cap.ticks, cap.events), (0, 0));
+        assert!(cons.try_pop_ref().is_none());
+        assert!(tc.try_pop_ref().is_none());
+
+        // JSON whitespace in the array is the same snapshot.
+        inject_text(&mut t, br#"{"channel":"trades","data": [ ]}"#);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(d.roll_status.trades_empty(), 17);
+        assert_eq!(status.parse_errors_total(), 0);
+        assert_eq!(status.msgs_total(), 17);
+
+        // Still rejections, each tapped: a broken array, a row for a
+        // coin we never configured, an empty array on another channel.
+        inject_text(&mut t, br#"{"channel":"trades","data":[}"#);
+        inject_text(
+            &mut t,
+            br#"{"channel":"trades","data":[{"coin":"UNKNOWN","side":"B","px":"1","sz":"1","hash":"0x1","time":1,"tid":1}]}"#,
+        );
+        inject_text(&mut t, br#"{"channel":"bbo","data":[]}"#);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(status.parse_errors_total(), 3);
+        assert_eq!(cap.rejects, 3);
+        assert_eq!(d.roll_status.trades_empty(), 17);
+        assert_eq!(status.msgs_total(), 17);
+        assert!(cons.try_pop_ref().is_none());
+        assert!(tc.try_pop_ref().is_none());
+
+        // A real push on a configured coin is untouched: its rows, its
+        // prints, no new snapshot count.
+        inject_text(
+            &mut t,
+            br#"{"channel":"trades","data":[{"coin":"BTC","side":"B","px":"1.0","sz":"1.0","hash":"0x1","time":1000,"tid":1},{"coin":"BTC","side":"A","px":"1.1","sz":"2.0","hash":"0x2","time":1001,"tid":2}]}"#,
+        );
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(status.msgs_total(), 19, "both rows counted");
+        assert_eq!(status.parse_errors_total(), 3);
+        assert_eq!(d.roll_status.trades_empty(), 17);
+        assert_eq!(tc.try_pop_ref().expect("first print").tid, 1);
+        assert_eq!(tc.try_pop_ref().expect("second print").tid, 2);
+        assert!(tc.try_pop_ref().is_none());
     }
 
     /// BIN15 O8: a HIP-4 outcome leg's touch comes from `l2Book`,

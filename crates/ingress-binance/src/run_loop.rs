@@ -125,9 +125,12 @@ pub enum RunResult {
 /// What a Binance connection slot carries (M2.4). The venue's lanes
 /// share ONE thread + ONE tick producer (single-writer law); the lane
 /// tag drives per-slot parse dispatch — monomorphic match, no `dyn`.
-// Doctrine: the `Eapi` payload is deliberately inline — one slot per
-// connection, preallocated at boot; `Box` is forbidden (CLAUDE.md
-// zero-alloc rules), and the size delta buys pointer-chase-free access.
+// Doctrine: the `Eapi` payload (the table) is deliberately inline — one
+// slot per connection, preallocated at boot; the size delta buys
+// pointer-chase-free row lookups. HK40: the option sequencers are one
+// boot-time heap block — a fixed-size `Box<[_; N]>`, never grown — so the
+// 200+ bookTicker Drivers do not carry 1 280 B of option state; no
+// allocation after boot.
 #[allow(clippy::large_enum_variant)]
 pub enum StreamLane {
     /// `/ws/<symbol>@bookTicker` — the M1c spot/usdm lane (`sym`
@@ -145,8 +148,19 @@ pub enum StreamLane {
     /// M2.4 / BX0-F2 options combined stream (`<uly>@optionMarkPrice`
     /// per underlying on fstream `/market`): each push is one array of
     /// the whole chain; the table's rows yield BBO → `Tick` and
-    /// mark/IV/greeks/index → `OptSummary`.
-    Eapi(crate::eapi::EapiSymbolTable),
+    /// mark/IV/greeks/index → `OptSummary`. HK40: beside the table, its
+    /// rows' arrival sequencers — one `core_types::ArrivalSeq` per table
+    /// row (`EAPI_TABLE_MAX`, one boot-time block), keyed on each
+    /// element's `E` (`handle_eapi_frame`); clocks zeroed on reconnect,
+    /// ordinals process-lifetime. HK42: and the options connections' OWN
+    /// status slot — their seq regressions, stale ticks and feed-delay
+    /// gauge (`engine_ingress_binance_options_*`), never the venue's
+    /// shared slot, which keeps the bookTicker connections' alone.
+    Eapi(
+        crate::eapi::EapiSymbolTable,
+        Box<[core_types::ArrivalSeq; crate::eapi::EAPI_TABLE_MAX]>,
+        std::sync::Arc<core_metrics::IngressStatus>,
+    ),
 }
 
 /// Mutable per-connection state owned by the run-loop. Preallocated at
@@ -176,7 +190,8 @@ pub struct Driver {
     lane: StreamLane,
     /// VT2: THIS connection's venue-clock offset estimator + staleness
     /// judge for `bookTicker` (USDS-M `T`/`E` directly; spot through the
-    /// aggTrade sentinel below). One per connection by doctrine — the
+    /// aggTrade sentinel below; HK42 an options slot's ticks from each
+    /// mark element's `E`). One per connection by doctrine — the
     /// multi-conn lane owns one driver per socket; reset on reconnect;
     /// threshold = venue default or `--stale-after-ms bn:<ms>` via
     /// [`Self::set_stale_after_ms`].
@@ -195,6 +210,11 @@ pub struct Driver {
     sentinel_time_ms: u64,
     /// Latest sentinel verdict (`TICK_FLAG_STALE` or 0).
     sentinel_stale_flag: u8,
+    /// HK36: the slot's `bookTicker` sequencer, keyed on the full `u`
+    /// ([`handle_text_frame`]). The connection is single-symbol, so its
+    /// one row is the symbol's; its clock is zeroed on reconnect, its
+    /// ordinal kept (`core_types::ArrivalSeq`).
+    tick_seq: core_types::ArrivalSeq,
     /// `!Sync` marker.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
 }
@@ -241,6 +261,7 @@ impl Driver {
             sentinel: false,
             sentinel_time_ms: 0,
             sentinel_stale_flag: 0,
+            tick_seq: core_types::ArrivalSeq::ZERO,
             _not_sync: ::core::marker::PhantomData,
         }
     }
@@ -292,8 +313,13 @@ impl Driver {
 
     /// M2.4 / BX0-F2: an options combined-stream slot carrying the
     /// selected chain's table. RX is sized for the push — a whole
-    /// underlying's chain per frame ([`EAPI_RX_BUF_SIZE`]).
-    pub fn new_eapi(nonce_seed: u64, table: crate::eapi::EapiSymbolTable) -> Self {
+    /// underlying's chain per frame ([`EAPI_RX_BUF_SIZE`]). `opt_status`
+    /// is the options connections' own status slot (HK42).
+    pub fn new_eapi(
+        nonce_seed: u64,
+        table: crate::eapi::EapiSymbolTable,
+        opt_status: std::sync::Arc<core_metrics::IngressStatus>,
+    ) -> Self {
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
         // COPY: the 3 208 B boot table (`EAPI_TABLE_MAX` 80 rows × 40 B —
@@ -302,8 +328,7 @@ impl Driver {
         // spec, and before moving on with the Driver (`MultiConn::new`)
         // — the lane holds it INLINE so every per-element lookup walks
         // contiguous rows with no pointer to chase — rejected: a `Box`
-        // (a heap hop on the options path, and the crate's no-`Box`
-        // rule).
+        // (a heap hop on every row lookup of the options path).
         Self {
             state: State::Connecting,
             rx: IoBuf::with_capacity(EAPI_RX_BUF_SIZE),
@@ -313,13 +338,24 @@ impl Driver {
             last_activity_ns: 0,
             mask_counter: 0,
             sym: 0,
-            lane: StreamLane::Eapi(table),
-            // Options tickers are never judged (no bookTicker on this
-            // slot); the estimator sits idle.
+            // HK40: the per-row sequencers, one 1 280 B block allocated
+            // here at boot (no stack temporary: built on the heap, then
+            // typed to its fixed length) and only indexed after.
+            lane: StreamLane::Eapi(
+                table,
+                vec![core_types::ArrivalSeq::ZERO; crate::eapi::EAPI_TABLE_MAX]
+                    .into_boxed_slice()
+                    .try_into()
+                    .expect("EAPI_TABLE_MAX sequencers"),
+                opt_status,
+            ),
+            // HK42: judges each mark element's `E`; the operator threshold
+            // re-arms it like every slot's (`set_stale_after_ms`).
             feed_clock: FeedClock::new(core_types::VenueId::Binance.default_stale_after_ms()),
             sentinel: false,
             sentinel_time_ms: 0,
             sentinel_stale_flag: 0,
+            tick_seq: core_types::ArrivalSeq::ZERO,
             _not_sync: ::core::marker::PhantomData,
         }
     }
@@ -350,6 +386,15 @@ impl Driver {
         self.feed_clock.reset();
         self.sentinel_time_ms = 0;
         self.sentinel_stale_flag = 0;
+        // HK36: the ordinal stays (monotone — no book sees it fall); the
+        // clock is zeroed, so a venue-side `u` reset or a far-future id
+        // clears at the reconnect. rx is cleared and the old socket gone:
+        // no tick of the old connection can follow.
+        self.tick_seq.reset_clock();
+        // HK40: the options lane's per-row sequencers, the same law.
+        if let StreamLane::Eapi(_, seqs, _) = &mut self.lane {
+            core_types::ArrivalSeq::reset_clocks(&mut seqs[..]);
+        }
     }
 }
 
@@ -703,11 +748,17 @@ fn handle_eapi_frame<C: Capture>(
     capture: &mut C,
 ) {
     // Disjoint field borrows: the frame is a view into `rx`, the table
-    // is read-only; nothing on the driver is written.
-    let Driver { rx, lane, .. } = drv;
+    // is read-only; only the lane's sequencers (HK40) and the
+    // connection's clock (HK42) are written.
+    let Driver {
+        rx,
+        lane,
+        feed_clock,
+        ..
+    } = drv;
     let payload = &rx.filled()[payload_range];
     capture.raw_frame(now_ns(), payload);
-    let StreamLane::Eapi(table) = lane else {
+    let StreamLane::Eapi(table, seqs, opt_status) = lane else {
         debug_assert!(false, "options handler on a non-options slot");
         return;
     };
@@ -724,7 +775,7 @@ fn handle_eapi_frame<C: Capture>(
     };
     let ts_ns = now_ns();
     let mut rows = 0u64;
-    // One parse target for the whole walk (88 B — filled in place,
+    // One parse target for the whole walk (96 B — filled in place,
     // never returned by value).
     let mut f = crate::eapi::EapiMarkFrame::ZERO;
     loop {
@@ -738,9 +789,9 @@ fn handle_eapi_frame<C: Capture>(
                 break;
             }
         };
-        let sym = match crate::eapi::eapi_elem_symbol(elem) {
-            Some(s) => match table.lookup(s) {
-                Some(sym) => sym,
+        let (row, sym) = match crate::eapi::eapi_elem_symbol(elem) {
+            Some(s) => match table.lookup_row(s) {
+                Some(hit) => hit,
                 // Not in the selected chain — the common case.
                 None => continue,
             },
@@ -778,17 +829,31 @@ fn handle_eapi_frame<C: Capture>(
             status.inc_opt_ring_drops();
         }
         if f.bid_px_1e6 != 0 || f.ask_px_1e6 != 0 {
-            let tick = Tick::new(
+            // HK40 (ruling HK-R27): the mark array carries no venue
+            // sequence (the Tick's 0 was `Stale` at every book), so the
+            // option's arrival ordinal is keyed on its element's `E` — an
+            // older `E` takes 0 (dropped by every book) and is counted.
+            // HK42 (rulings HK-R29/R30): the same `E` is the tick's venue
+            // time, judged by THIS connection's clock (an absent `E` reads
+            // 0: never stale); both counts land on the options slot.
+            let venue_seq = seqs[row].next(f.event_time_ms);
+            opt_status.note_arrival_seq(venue_seq);
+            let judged = feed_clock.judge(f.event_time_ms, ts_ns);
+            let tick = Tick::new_stamped(
                 ts_ns,
                 core_types::VenueId::Binance,
                 sym,
-                // The mark array carries no venue sequence.
-                0,
+                venue_seq,
                 Price::from_raw(f.bid_px_1e6),
                 Qty::from_raw(f.bid_qty_1e6),
                 Price::from_raw(f.ask_px_1e6),
                 Qty::from_raw(f.ask_qty_1e6),
+                f.event_time_ms,
+                (judged.stale as u8) * TICK_FLAG_STALE,
             );
+            if tick.is_stale() {
+                opt_status.inc_stale_ticks();
+            }
             capture.tick(&tick);
             if !producer.try_push_ref(&tick) {
                 status.inc_ring_drops();
@@ -796,6 +861,9 @@ fn handle_eapi_frame<C: Capture>(
         }
         rows += 1;
     }
+    // HK42: the gauge once a push, not per tick (its reading is the last
+    // value).
+    opt_status.set_feed_delay_ema_ms(feed_clock.delay_ema_ms());
     status.add_msgs(1);
     status.add_ticks(rows);
 }
@@ -881,7 +949,7 @@ fn handle_text_frame<C: Capture>(
     capture: &mut C,
 ) {
     // M2.4/WS5: per-slot lane dispatch (monomorphic).
-    if matches!(drv.lane, StreamLane::Eapi(_)) {
+    if matches!(drv.lane, StreamLane::Eapi(..)) {
         return handle_eapi_frame(drv, payload_range, producer, opt_tx, status, capture);
     }
     if matches!(drv.lane, StreamLane::MarkPrice) {
@@ -896,6 +964,7 @@ fn handle_text_frame<C: Capture>(
         sentinel,
         sentinel_time_ms,
         sentinel_stale_flag,
+        tick_seq,
         ..
     } = drv;
     let payload = &rx.filled()[payload_range];
@@ -971,10 +1040,20 @@ fn handle_text_frame<C: Capture>(
         } else {
             (0, 0)
         };
-        // `update_id` fits comfortably in u32 over the lifetime of a
-        // connection (Binance resets on (re)connect). Truncate for the
-        // venue_seq slot; it's only used for monotonicity checks.
-        let venue_seq = (f.update_id & 0xFFFF_FFFF) as u32;
+        // HK36 (ruling HK-R22): `u` is the symbol's order-book update id,
+        // a FULL u64 — process- and connection-independent (USDⓈ-M ids
+        // are already past 2^32), so its low 32 bits wrapped and every
+        // later tick of the symbol was `Stale` until a restart. The id is
+        // monotone per symbol on this stream, the connection's ONLY tick
+        // source (the spot sentinel's aggTrade is capture-only; spot and
+        // USDⓈ-M are different symbols on different sockets), so the
+        // slot's sequencer keys on it: a backward id takes 0 (dropped by
+        // every book) and is counted; a same-id duplicate takes the next
+        // ordinal (the same touch). A venue-side id reset counts until the
+        // next reconnect zeroes the clock (the venue closes every
+        // connection within 24 h).
+        let venue_seq = tick_seq.next(f.update_id);
+        status.note_arrival_seq(venue_seq);
         let tick = Tick::new_stamped(
             ts_ns,
             core_types::VenueId::Binance,
@@ -2070,7 +2149,7 @@ mod tests {
         let put: SymbolId = (1 << 24) | 1026;
         table.insert(b"BTC-260925-86000-C", call).unwrap();
         table.insert(b"BTC-260925-86000-P", put).unwrap();
-        let mut d = Driver::new_eapi(7, table);
+        let mut d = Driver::new_eapi(7, table, std::sync::Arc::new(core_metrics::IngressStatus::new()));
         d.set_state(State::Steady);
 
         let mut t = TestTransport::with_capacity(64 * 1024);
@@ -2118,8 +2197,12 @@ mod tests {
         let tp = *cons.try_pop_ref().expect("put tick");
         assert_eq!(tp.sym, put);
         assert_eq!((tp.bid_px.raw(), tp.ask_px.raw()), (905_000_000, 920_000_000));
+        // HK40: each option's first arrival ordinal, keyed on its own `E`
+        // (old law: 0, `Stale` at every book).
+        assert_eq!(tp.venue_seq, 1);
         let tc = *cons.try_pop_ref().expect("call tick");
         assert_eq!(tc.sym, call);
+        assert_eq!(tc.venue_seq, 1, "its own sequencer");
         assert_eq!((tc.bid_px.raw(), tc.ask_px.raw()), (800_000_000, 810_000_000));
         assert_eq!((tc.bid_qty.raw(), tc.ask_qty.raw()), (5_080_000, 1_100_000));
         assert!(
@@ -2154,6 +2237,7 @@ mod tests {
         assert_eq!(status.parse_errors_total(), 2);
         assert_eq!(status.msgs_total(), 4, "four clean frames (the foreign one is not)");
         assert_eq!(status.ticks_total(), 3, "one per emitted row");
+        assert_eq!(status.seq_regressions_total(), 0);
     }
 
     /// BX0-F2 at the measured size: a 752-element push (~250 KB, the
@@ -2164,7 +2248,7 @@ mod tests {
         let mut table = crate::eapi::EapiSymbolTable::new();
         table.insert(b"BTC-260925-10100-C", 11).unwrap();
         table.insert(b"BTC-260925-10701-P", 12).unwrap();
-        let mut d = Driver::new_eapi(9, table);
+        let mut d = Driver::new_eapi(9, table, std::sync::Arc::new(core_metrics::IngressStatus::new()));
         d.set_state(State::Steady);
         let mut body = String::from(r#"{"stream":"btcusdt@optionMarkPrice","data":["#);
         for k in 0..752u32 {
@@ -2202,12 +2286,203 @@ mod tests {
             &mut cap,
         )
         .unwrap();
-        assert_eq!(cons.try_pop_ref().map(|t| t.sym), Some(11));
-        assert_eq!(cons.try_pop_ref().map(|t| t.sym), Some(12));
+        // HK40: each selected option's first ordinal (old law: 0).
+        assert_eq!(
+            cons.try_pop_ref().map(|t| (t.sym, t.venue_seq)),
+            Some((11, 1))
+        );
+        assert_eq!(
+            cons.try_pop_ref().map(|t| (t.sym, t.venue_seq)),
+            Some((12, 1))
+        );
         assert!(cons.try_pop_ref().is_none());
         assert_eq!(cap.summaries.len(), 2);
         assert!(cap.rejects.is_empty());
         assert_eq!((status.msgs_total(), status.ticks_total()), (1, 2));
+    }
+
+    /// HK40 rig: an options slot over a call and a put (steady); `push`
+    /// drives one `optionMarkPrice` push of `(symbol, E, bid)` elements
+    /// and returns its ticks in wire order. HK42: `opt` is the options
+    /// slot the driver writes; `status` the venue's shared one.
+    struct MarkRig {
+        d: Driver,
+        status: core_metrics::IngressStatus,
+        opt: std::sync::Arc<core_metrics::IngressStatus>,
+    }
+
+    const CALL: SymbolId = (1 << 24) | 1025;
+    const PUT: SymbolId = (1 << 24) | 1026;
+    /// A live `E` (the K6 push, 2026-09-23).
+    const E0: u64 = 1_790_161_477_974;
+
+    impl MarkRig {
+        fn new() -> Self {
+            let mut table = crate::eapi::EapiSymbolTable::new();
+            table.insert(b"BTC-260925-86000-C", CALL).unwrap();
+            table.insert(b"BTC-260925-86000-P", PUT).unwrap();
+            let opt = std::sync::Arc::new(core_metrics::IngressStatus::new());
+            let mut d = Driver::new_eapi(7, table, opt.clone());
+            d.set_state(State::Steady);
+            Self {
+                d,
+                status: core_metrics::IngressStatus::new(),
+                opt,
+            }
+        }
+
+        fn push(&mut self, elems: &[(&str, u64, &str)]) -> Vec<Tick> {
+            let mut body = String::from(r#"{"stream":"btcusdt@optionMarkPrice","data":["#);
+            for (k, (s, e, bid)) in elems.iter().enumerate() {
+                if k > 0 {
+                    body.push(',');
+                }
+                body.push_str(&format!(
+                    r#"{{"s":"BTC-260925-86000-{s}","mp":"809.784","E":{e},"e":"markPrice","i":"85879.82826087","bo":"{bid}","ao":"810.000","bq":"5.08","aq":"1.10","vo":"0.349","d":"0.48723426","t":"-227.33432684","g":"0.00018682","v":"24.52223767"}}"#
+                ));
+            }
+            body.push_str("]}");
+            let mut t = TestTransport::with_capacity(64 * 1024);
+            t.inject_incoming(&ws_text_frame(body.as_bytes()));
+            let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+            let (mut prod, mut cons) = ring.split();
+            let (mut otx, _orx) = opt_ring_pair();
+            let (mut etx, _erx) = event_ring_pair();
+            super::drive_one(
+                &mut t,
+                &mut self.d,
+                b"host",
+                b"/",
+                &mut prod,
+                &mut etx,
+                core_types::EVENT_LANE_FUNDING,
+                &mut otx,
+                &self.status,
+                &mut NullCapture,
+            )
+            .unwrap();
+            let mut out = Vec::new();
+            while let Some(t) = cons.try_pop_ref() {
+                out.push(*t);
+            }
+            out
+        }
+    }
+
+    /// HK40 (ruling HK-R27): two mark pushes for one option take ordinals
+    /// 1, 2 and both apply at a `TopOfBook` (old law: both 0, `Stale`); an
+    /// older `E` takes 0 — `Stale`, no ordinal, counted — and the push back
+    /// at the newest `E` applies.
+    #[test]
+    fn mark_pushes_take_ordinals_and_an_older_e_is_stale_and_counted() {
+        use book_builder::{ApplyOutcome, TopOfBook};
+        let mut r = MarkRig::new();
+        let mut book = TopOfBook::empty(CALL);
+        let a = r.push(&[("C", E0, "800.000")]);
+        let b = r.push(&[("C", E0 + 1_000, "801.000")]);
+        assert_eq!((a[0].venue_seq, b[0].venue_seq), (1, 2));
+        assert_eq!(book.apply(&a[0]), ApplyOutcome::Applied);
+        assert_eq!(book.apply(&b[0]), ApplyOutcome::Applied);
+        assert_eq!(book.bid_px.raw(), 801_000_000);
+        let older = r.push(&[("C", E0, "799.000")]);
+        assert_eq!(older[0].venue_seq, 0, "an older E");
+        assert_eq!(book.apply(&older[0]), ApplyOutcome::Stale);
+        // HK42: on the options slot, not the venue's.
+        assert_eq!(r.opt.seq_regressions_total(), 1);
+        assert_eq!(r.status.seq_regressions_total(), 0);
+        let back = r.push(&[("C", E0 + 1_000, "802.000")]);
+        assert_eq!(back[0].venue_seq, 3, "the older push took no ordinal");
+        assert_eq!(book.apply(&back[0]), ApplyOutcome::Applied);
+        assert_eq!(book.gaps(), 0);
+        assert_eq!(r.opt.seq_regressions_total(), 1);
+        assert_eq!(r.status.seq_regressions_total(), 0);
+    }
+
+    /// HK40: the options in one mark array each take their OWN ordinal —
+    /// one array is one `E` per element, not one sequence.
+    #[test]
+    fn options_in_one_array_each_take_their_own_ordinal() {
+        use book_builder::{ApplyOutcome, TopOfBook};
+        let mut r = MarkRig::new();
+        let mut calls = TopOfBook::empty(CALL);
+        let mut puts = TopOfBook::empty(PUT);
+        let first = r.push(&[("C", E0 + 1, "800.000"), ("P", E0, "905.000")]);
+        let second = r.push(&[("C", E0 + 1_001, "801.000"), ("P", E0 + 1_000, "906.000")]);
+        let seqs: Vec<(SymbolId, u32)> = first
+            .iter()
+            .chain(&second)
+            .map(|t| (t.sym, t.venue_seq))
+            .collect();
+        assert_eq!(seqs, [(CALL, 1), (PUT, 1), (CALL, 2), (PUT, 2)]);
+        for t in first.iter().chain(&second) {
+            let book = if t.sym == CALL { &mut calls } else { &mut puts };
+            assert_eq!(book.apply(t), ApplyOutcome::Applied);
+        }
+        assert_eq!(
+            (calls.bid_px.raw(), puts.bid_px.raw()),
+            (801_000_000, 906_000_000)
+        );
+        assert_eq!(r.opt.seq_regressions_total(), 0);
+    }
+
+    /// HK40: a far-future `E` poisons only its option's clock (later pushes
+    /// counted); a reconnect zeroes every option's clock and keeps its
+    /// ordinal.
+    #[test]
+    fn reconnect_clears_the_option_clocks_and_keeps_the_ordinals() {
+        use book_builder::{ApplyOutcome, TopOfBook};
+        let mut r = MarkRig::new();
+        let mut book = TopOfBook::empty(CALL);
+        let poison = r.push(&[("C", E0 + 86_400_000, "800.000"), ("P", E0, "905.000")]);
+        assert_eq!((poison[0].venue_seq, poison[1].venue_seq), (1, 1));
+        assert_eq!(book.apply(&poison[0]), ApplyOutcome::Applied);
+        let stuck = r.push(&[("C", E0 + 1_000, "801.000"), ("P", E0 + 1_000, "906.000")]);
+        assert_eq!((stuck[0].venue_seq, stuck[1].venue_seq), (0, 2));
+        assert_eq!(r.opt.seq_regressions_total(), 1);
+        r.d.reset_for_reconnect(9);
+        r.d.set_state(State::Steady);
+        let after = r.push(&[("C", E0 + 2_000, "802.000"), ("P", E0, "907.000")]);
+        assert_eq!(
+            (after[0].venue_seq, after[1].venue_seq),
+            (2, 3),
+            "the clocks cleared, the ordinals kept"
+        );
+        assert_eq!(book.apply(&after[0]), ApplyOutcome::Applied);
+        assert_eq!(r.opt.seq_regressions_total(), 1);
+        assert_eq!(r.status.seq_regressions_total(), 0);
+    }
+
+    /// HK42 (rulings HK-R29/R30): a mark element's `E` is its tick's venue
+    /// time; an `E` later than the connection's learned offset by more
+    /// than the 1 000 ms default is flagged stale and counted — on the
+    /// options slot, with its delay gauge; the venue's slot sees none of
+    /// it. The operator threshold re-arms the options clock.
+    #[test]
+    fn option_ticks_carry_e_and_a_late_one_is_stale_on_the_options_slot() {
+        let mut r = MarkRig::new();
+        // The put teaches the clock at `E0 + 5 s`; the call's `E0` (its
+        // own row's first, so no regression) is 5 s late.
+        let a = r.push(&[("P", E0 + 5_000, "905.000"), ("C", E0, "800.000")]);
+        assert_eq!((a[0].venue_time_ms, a[1].venue_time_ms), (E0 + 5_000, E0));
+        assert_eq!((a[0].flags, a[1].flags), (0, TICK_FLAG_STALE));
+        assert_eq!((a[0].venue_seq, a[1].venue_seq), (1, 1));
+        assert_eq!(r.opt.stale_ticks_total(), 1);
+        assert!(r.opt.feed_delay_ema_ms() > 0, "the options gauge moved");
+        // A fresh one (the call caught up) is not flagged.
+        let b = r.push(&[("C", E0 + 5_000, "801.000")]);
+        assert_eq!((b[0].venue_time_ms, b[0].flags), (E0 + 5_000, 0));
+        assert_eq!(r.opt.stale_ticks_total(), 1);
+        // `--stale-after-ms bn:10000` reaches this clock too: 9 s late passes.
+        r.d.set_stale_after_ms(10_000);
+        let c = r.push(&[("P", E0 + 20_000, "906.000"), ("C", E0 + 11_000, "802.000")]);
+        assert_eq!((c[0].flags, c[1].flags), (0, 0));
+        assert_eq!(r.opt.stale_ticks_total(), 1);
+        assert_eq!(r.opt.seq_regressions_total(), 0);
+        // The venue's slot: none of the three.
+        assert_eq!(r.status.stale_ticks_total(), 0);
+        assert_eq!(r.status.seq_regressions_total(), 0);
+        assert_eq!(r.status.feed_delay_ema_ms(), 0);
+        assert_eq!(r.status.ticks_total(), 5, "the rows still count on the venue");
     }
 
     #[test]
@@ -2244,7 +2519,10 @@ mod tests {
         assert_eq!(tick.sym, 42);
         assert_eq!(tick.bid_px.raw(), 25_351_900);
         assert_eq!(tick.ask_px.raw(), 25_365_200);
-        assert_eq!(tick.venue_seq, 400_900_217u32);
+        // HK36: the slot's first ordinal, keyed on `u` = 400 900 217 (old
+        // law: the id's low 32 bits).
+        assert_eq!(tick.venue_seq, 1);
+        assert_eq!(status.seq_regressions_total(), 0);
         // VT2: a SPOT push carries no stamp — unknown, never stale.
         assert_eq!(tick.venue_time_ms, 0);
         assert!(!tick.is_stale());
@@ -2375,6 +2653,45 @@ mod tests {
         let after = push_usdm_book_ticker(&mut t, &mut d, &mut prod, &mut cons, &status, t0 - 60_000, 3);
         assert!(!after.is_stale(), "a reconnect starts a fresh offset");
         assert_eq!(after.venue_time_ms, t0 - 60_000);
+    }
+
+    /// HK36: `u` crossing a 2^32 boundary takes a HIGHER `venue_seq` and
+    /// applies (old law: its low 32 bits fell to 1 and every later tick
+    /// of the symbol was `Stale` until a restart); a backward `u` takes 0,
+    /// `Stale` at the book, counted; a reconnect zeroes the clock (a
+    /// venue-side id reset applies again) and keeps the ordinal.
+    #[test]
+    fn a_full_u_across_2_32_applies_a_backward_u_is_counted_and_reconnect_clears() {
+        use book_builder::{ApplyOutcome, TopOfBook};
+        let mut t = TestTransport::with_capacity(16 * 1024);
+        let mut d = build_driver(7, 42);
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let status = core_metrics::IngressStatus::new();
+        let mut book = TopOfBook::empty(42);
+        let t0: u64 = 1_755_216_000_000;
+        let mut push = |d: &mut Driver, u: u64| {
+            push_usdm_book_ticker(&mut t, d, &mut prod, &mut cons, &status, t0, u)
+        };
+        let below = push(&mut d, 0xFFFF_FFFF);
+        let above = push(&mut d, 0x1_0000_0001);
+        assert_eq!((below.venue_seq, above.venue_seq), (1, 2));
+        assert_eq!(book.apply(&below), ApplyOutcome::Applied);
+        assert_eq!(book.apply(&above), ApplyOutcome::Applied, "past 2^32");
+        let back = push(&mut d, 0xFFFF_FFFF);
+        assert_eq!(back.venue_seq, 0, "a backward u");
+        assert_eq!(book.apply(&back), ApplyOutcome::Stale);
+        assert_eq!(status.seq_regressions_total(), 1);
+        d.reset_for_reconnect(9);
+        d.set_state(State::Steady);
+        let restarted = push(&mut d, 5);
+        assert_eq!(
+            restarted.venue_seq, 3,
+            "the clock cleared, the ordinal kept"
+        );
+        assert_eq!(book.apply(&restarted), ApplyOutcome::Applied);
+        assert_eq!(status.seq_regressions_total(), 1);
     }
 
     #[test]

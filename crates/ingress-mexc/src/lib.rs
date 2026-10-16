@@ -70,16 +70,26 @@
 //! Carried everywhere: spot book `version` (ASCII digits in body field
 //! 5), spot trade = the LEADING DIGITS of the `tradeId` string
 //! ([`trade_id_seq`]), futures book `version`, futures deal `i`.
-//! `Tick::venue_seq` is `u32` (truncated `v & 0xFFFF_FFFF`, the Bybit
-//! law); `ChannelEvent::venue_seq` is the full `u64`. The §6.2 chain
-//! law does NOT apply — these are sampled/snapshot streams that skip
+//! `ChannelEvent::venue_seq` is the full `u64`. `Tick::venue_seq`
+//! (`u32`; HK36, ruling HK-R22) is the row's arrival ordinal from a
+//! `core_types::ArrivalSeq` keyed on the FULL book `version` (truncated
+//! to its low 32 bits it wrapped, and every later tick of the symbol was
+//! `Stale` until a restart). The version is monotone per symbol on its
+//! class's one book stream — the only tick source (spot and futures are
+//! different symbols on different connections) — and is stamped on
+//! every parsed book push, republications included. The §6.2 chain law
+//! does NOT apply — these are sampled/snapshot streams that skip
 //! versions by design — so no `TradeGap`/`BookGap` is ever emitted.
 //! Instead the driver counts seq REGRESSIONS
-//! (`IngressStatus::inc_seq_regressions`): a value strictly below the
-//! last-seen full-width value of the same symbol × stream (book / trade);
-//! 0 = absent and never counts. A trade push carrying several prints
-//! is judged by its LARGEST id, so the venue's intra-push print order
-//! cannot manufacture a regression.
+//! (`IngressStatus::inc_seq_regressions`). Book: a version behind the
+//! row's NEWEST on this connection — absent (0) included — takes 0,
+//! dropped by every book, and counts once per push; a same-version
+//! republication takes the next ordinal (the same touch); a reconnect
+//! zeroes the clocks (a venue-side version reset counts until then),
+//! the ordinals stay. Trade: a value strictly below the last-seen
+//! full-width value of the same symbol; 0 = absent and never counts. A
+//! trade push carrying several prints is judged by its LARGEST id, so
+//! the venue's intra-push print order cannot manufacture a regression.
 //!
 //! ## Subscribe / ack law (plan §4 D7)
 //!

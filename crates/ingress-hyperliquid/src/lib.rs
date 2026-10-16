@@ -286,6 +286,26 @@ pub fn extract_coin(payload: &[u8]) -> Option<&[u8]> {
     payload.get(start..start + rel_end)
 }
 
+/// HK37: whether the payload's `data` is the EMPTY array — the
+/// `trades` snapshot the venue sends on subscribe to a coin that has
+/// not printed yet (a fresh HIP-4 outcome leg:
+/// `{"channel":"trades","data":[]}`, 30 B), which carries no `coin`
+/// for [`extract_coin`] to find. JSON whitespace after `"data":` and
+/// inside the brackets is tolerated (`"data": [ ]`). Borrowing,
+/// zero-alloc; one bounded `"data":` search plus two whitespace skips.
+#[inline]
+#[must_use]
+pub fn is_empty_data_array(payload: &[u8]) -> bool {
+    let Some(pos) = find_field(payload, b"\"data\":") else {
+        return false;
+    };
+    let pos = skip_ws(payload, pos);
+    if payload.get(pos) != Some(&b'[') {
+        return false;
+    }
+    payload.get(skip_ws(payload, pos + 1)) == Some(&b']')
+}
+
 /// Whether `activeAssetCtx` applies to this coin — perps only:
 /// outcome (`#`) and spot (`@`) coins are skipped (crate-header
 /// *coin gating* note).
@@ -1727,6 +1747,42 @@ mod tests {
         assert_eq!(extract_coin(b"{\"channel\":\"pong\"}"), None);
     }
 
+    /// HK37: the empty `trades` snapshot and its edges. Every `false`
+    /// here stays a parse error in the run loop.
+    #[test]
+    fn empty_data_array_is_exactly_an_empty_array() {
+        // The 30 bytes of the 2026-10-16 tap, verbatim — no coin.
+        let snap = br#"{"channel":"trades","data":[]}"#;
+        assert_eq!(snap.len(), 30);
+        assert!(is_empty_data_array(snap));
+        assert_eq!(extract_coin(snap), None);
+        // JSON whitespace after the colon and inside the brackets.
+        assert!(is_empty_data_array(
+            br#"{"channel": "trades", "data": [ ]}"#
+        ));
+        assert!(is_empty_data_array(
+            b"{\"channel\":\"trades\",\"data\":\n\t[\r\n \t]}"
+        ));
+        // Not empty: a real push, a broken one, an object.
+        assert!(!is_empty_data_array(TRADES));
+        assert!(!is_empty_data_array(br#"{"channel":"trades","data":[}"#));
+        assert!(!is_empty_data_array(
+            br#"{"channel":"trades","data":[ {}]}"#
+        ));
+        assert!(!is_empty_data_array(BBO));
+        assert!(!is_empty_data_array(br#"{"channel":"bbo","data":{}}"#));
+        // No `"data":` key at all (and a key that only ends in it).
+        assert!(!is_empty_data_array(b""));
+        assert!(!is_empty_data_array(br#"{"channel":"trades"}"#));
+        assert!(!is_empty_data_array(br#"{"channel":"trades","xdata":[]}"#));
+        assert!(!is_empty_data_array(br#"{"channel":"trades","data":"[]"}"#));
+        // Truncated after the key, after `[`, inside the whitespace.
+        assert!(!is_empty_data_array(br#"{"channel":"trades","data":"#));
+        assert!(!is_empty_data_array(br#"{"channel":"trades","data": "#));
+        assert!(!is_empty_data_array(br#"{"channel":"trades","data":["#));
+        assert!(!is_empty_data_array(br#"{"channel":"trades","data":[  "#));
+    }
+
     #[test]
     fn asset_ctx_gating_skips_outcome_and_spot_coins() {
         assert!(coin_wants_asset_ctx(b"BTC"));
@@ -2446,6 +2502,7 @@ mod proptests {
             let _ = parse_all_mids(&buf);
             let _ = parse_outcome_meta_view(&buf);
             let _ = parse_sub_response(&buf);
+            let _ = is_empty_data_array(&buf);
         }
     }
 }

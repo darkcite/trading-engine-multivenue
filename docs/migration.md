@@ -6,6 +6,111 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-16 — Binance options: `venue_time_ms`, the stale flag and `engine_ingress_binance_options_*` (HK42)
+
+**What changed**
+- Binance option `Tick`s carry each mark element's `E` as `venue_time_ms`
+  and are judged by the options connection's own feed clock at Binance's
+  threshold (1 000 ms default; `--stale-after-ms bn:` now reaches the
+  options and markPrice slots too): a late tick carries `TICK_FLAG_STALE`.
+- New gauges `engine_ingress_binance_options_seq_regressions_total`,
+  `engine_ingress_binance_options_stale_ticks_total`,
+  `engine_ingress_binance_options_feed_delay_ema_ms` (an
+  `IngressStatusSet.binance_options` slot). The options lane no longer
+  writes `engine_ingress_binance_seq_regressions_total`,
+  `…_stale_ticks_total` or `…_feed_delay_ema_ms`: those are the
+  bookTicker connections' now. Messages, rows, parse errors and ring drops
+  still count on `binance`.
+
+**Impact**
+- Members do not mark or quote on a stale option tick (VT3/VT4); ai-exec
+  is today's only reader of option books.
+- Captures: option `Tick` rows carry `E` and the stale bit from the deploy
+  on (no layout change).
+
+**Migration steps**
+1. None: the routine restart of a binary built from this change.
+
+## 2026-10-16 — `Tick.venue_seq` for okx and Binance options is the arrival ordinal (HK39, HK40)
+
+**What changed**
+- OKX `bbo-tbt` (`seqId as u32` before) and Binance options (`optionMarkPrice`,
+  `venue_seq` 0 before) now stamp the per-instrument arrival ordinal: OKX
+  keyed on the venue `ts` (ms; rulings HK-R26 — `seqId` may reset after
+  maintenance), Binance options on each mark element's `E` (HK-R27). An
+  older key gives 0, counted on the venue's `seq_regressions_total`
+  (Binance options share Binance's). No layout change.
+- `OkxBboFrame` no longer carries `seq_id` (its scan is gone from the hot
+  path); the `books` `seqId` chain and the `trades` check are unchanged.
+
+**Impact**
+- Live: Binance option touches reach `TopOfBook` for the first time (every
+  one was `Stale` before). The only engine reader is ai-exec (slot 4): a
+  fair value set on a Binance option `SymbolId` (an AI or operator command)
+  can now produce paper post-only quotes there; marks, risk and the other
+  members are unaffected. OKX ticks keep flowing through a `seqId` reset.
+- Captures from the deploy on: okx / Binance-option `Tick` rows carry the
+  ordinal (OKX's `seqId` is in no tick row; the `books` capture keeps it).
+
+**Migration steps**
+1. None: the routine restart of a binary built from this change.
+
+## 2026-10-16 — HL ingress: `engine_ingress_hyperliquid_trades_empty_total` (HK37)
+
+**What changed**
+- New gauge `engine_ingress_hyperliquid_trades_empty_total`: the venue's
+  empty `trades` snapshot (`{"channel":"trades","data":[]}`), sent on
+  subscribe to a HIP-4 outcome leg that has not printed yet. It names no
+  coin, so it used to count in
+  `engine_ingress_hyperliquid_parse_errors_total` and was tapped as a parse
+  reject; now it counts in `…_msgs_total` and this gauge, with no reject
+  tap.
+
+**Impact**
+- Metrics: HL `…_parse_errors_total` falls by the whole of its steady
+  rate (≈ 21 an hour, 4 at boot; 100 % of the 2026-10-16 reject tap). A
+  `trades` push with rows for an unconfigured coin, a broken array, or an
+  empty array on any other channel still counts there.
+- Captures: with the raw tap on, the snapshots stop appearing as rejects.
+
+**Migration steps**
+1. None: the routine restart of a binary built from this change.
+
+## 2026-10-16 — `Tick.venue_seq` for bn / bybit / mexc is the arrival ordinal keyed on the venue id (HK36)
+
+**What changed**
+- `Tick.venue_seq` for Binance (`bookTicker` `u`), Bybit (`orderbook.1`
+  `u`) and the MEXC book (`version`, spot and futures) was the venue's u64
+  id cut to its low 32 bits. It is now HK31/HK32's per-instrument arrival
+  ordinal, keyed on that FULL id (ruling HK-R22): 1, 2, 3, … while the id
+  does not go back, 0 for an id behind the instrument's newest (counted on
+  `engine_ingress_<venue>_seq_regressions_total`). No layout change.
+- `core_types::ArrivalSeq` takes a generic u64 key (`last_ms` → `last_key`)
+  and gains a per-row `reset_clock`; Polymarket, Hyperliquid and Deribit
+  are byte-identical.
+- MEXC's book regression check moved from Q-MX1's last-seen compare to the
+  sequencer: a version behind the NEWEST counts on every push, an absent
+  version counts; its trade check is unchanged.
+
+**Impact**
+- Live: these three venues' ids are past 2^32 already (Binance USDⓈ-M
+  BTCUSDT 11.8 × 10^12 on 2026-10-16), so a low-32 wrap would have left the
+  instrument `Stale` in every `TopOfBook` until a restart; no member of
+  the set reads those books today. Same-id re-pushes (2.1 % of Binance
+  ticks) now apply as the same touch instead of `Stale`.
+- Captures from the deploy on: the `Tick` row carries the ordinal; the
+  venue's book id is in no capture row (only in raw-tap frames when the
+  tap is on). Research keyed on the truncated id must use older runs.
+- Replaying several runs as one stream: the ordinal restarts at 1 each
+  run and is not rebased, so a `MultiBook` reader (latency-arb,
+  cross-arb, rule-tree — all outside the set) would drop a later run's
+  ticks until its ordinal passes the earlier run's.
+- OKX `seqId as u32` and Binance options' `venue_seq` 0: addressed the
+  same day (HK39 / HK40, the entry above).
+
+**Migration steps**
+1. None: the routine restart of a binary built from this change.
+
 ## 2026-10-15 — S16: sixteen strategy slots
 
 **What changed**

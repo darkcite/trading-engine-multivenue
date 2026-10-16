@@ -44,8 +44,11 @@ pub enum ApplyOutcome {
     /// Applied, but `venue_seq` jumped by more than one — the venue
     /// skipped sequence numbers upstream of us. (Polymarket's seq is the
     /// ingress's dense per-asset ordinal since HK31, Hyperliquid's and
-    /// Deribit quotes' since HK32: a gap there is a tick this book never
-    /// received — a ring drop, or a consumer that skips some ticks.)
+    /// Deribit quotes' since HK32, Binance's and Bybit's since HK36: a gap
+    /// there is a tick this book never received — a ring drop, or a
+    /// consumer that skips some ticks. MEXC's HK36 ordinal also advances
+    /// on the republications its ingress does not emit: gaps are normal
+    /// there, as the skipped versions were.)
     AppliedGap = 1,
     /// Dropped: `venue_seq` is not newer than the last applied.
     /// Out-of-order delivery or duplicate.

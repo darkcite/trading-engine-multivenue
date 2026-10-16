@@ -162,6 +162,7 @@ fn binance_coinm_live_smoke() {
         ev_prod,
         opt_prod,
         status.clone(),
+        Arc::new(IngressStatus::new()),
         9,
         &run_dir,
         epoch_ns,
