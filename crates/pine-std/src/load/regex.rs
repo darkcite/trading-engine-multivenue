@@ -7,8 +7,11 @@
 //! Subset: literals, `.`, `\d \D \w \W \s \S`, classes `[a-z…]` / `[^…]`, anchors `^ $`, groups
 //! `( )` (group 0 only), alternation `|`, quantifiers `* + ?` and `{m}`, `{m,}`, `{m,n}` with
 //! `m, n ≤ 32`. No backreferences, lookaround, lazy or possessive quantifiers. `.` matches one
-//! UTF-8 code point except `\n` (`pin:04-regex-dot`), compiled to a byte automaton; classes and
-//! the predefined escapes match single bytes.
+//! UTF-8 code point except `\n` (`pin:04-regex-dot`), compiled to a byte automaton. A negated
+//! class `[^…]` and `\D \W \S` match one code point the same way: an ASCII byte outside the set
+//! (`\n` included unless listed), or any multi-byte UTF-8 sequence (`pin:04-regex-negclass`); a
+//! negated class listing a non-ASCII byte is refused (its members are bytes, not code points).
+//! Positive classes and `\d \w \s` match single bytes.
 
 use super::{code, err, LoadErr};
 
@@ -62,6 +65,8 @@ const K_EMPTY: u8 = 5;
 const K_CAT: u8 = 6;
 const K_ALT: u8 = 7;
 const K_REP: u8 = 8;
+/// A negated class, code-point-wide; `a` = the class index of its ASCII part.
+const K_NCLASS: u8 = 9;
 
 /// An AST node in a fixed arena: `kind`, byte/class/min `a`, max `b`, children `l`, `r`.
 #[derive(Clone, Copy, Default)]
@@ -73,14 +78,15 @@ struct Node {
     r: u16,
 }
 
-struct Parser<'p> {
+struct Parser<'p, 'o> {
     s: &'p [u8],
     i: usize,
     nodes: [Node; MAX_NODES],
     n: usize,
-    prog: RegexProg,
+    /// The program under construction, written in place (`regex_compile_into`).
+    prog: &'o mut RegexProg,
     /// Class indices of `.`'s automaton (ASCII but `\n`, 2-, 3-, 4-byte leads, continuation),
-    /// allocated at the first `.`.
+    /// allocated at the first `.` or code-point-wide negated class.
     dot: Option<[u8; 5]>,
 }
 
@@ -113,12 +119,12 @@ fn add_predef(set: &mut [u64; 4], k: u8) {
     }
 }
 
-fn negate(set: &mut [u64; 4]) {
-    let mut k = 0usize;
-    while k < 4 {
-        set[k] = !set[k];
-        k += 1;
-    }
+/// The ASCII part of the complement of an ASCII-only `set` (`pin:04-regex-negclass`).
+fn negate_ascii(set: &mut [u64; 4]) {
+    set[0] = !set[0];
+    set[1] = !set[1];
+    set[2] = 0;
+    set[3] = 0;
 }
 
 /// A literal escape (`\n`, `\t`, `\r`, or an escaped punctuation byte); `None` otherwise.
@@ -133,7 +139,7 @@ fn literal_escape(c: u8) -> Option<u8> {
     }
 }
 
-impl Parser<'_> {
+impl Parser<'_, '_> {
     fn node(&mut self, kind: u8, a: u8, b: u8, l: u16, r: u16) -> Result<u16, LoadErr> {
         if self.n == MAX_NODES {
             return Err(refuse(self.i, "pattern exceeds REGEX_MAX_STATES"));
@@ -277,11 +283,14 @@ impl Parser<'_> {
                 }
                 let mut set = [0u64; 4];
                 add_predef(&mut set, lower);
-                if e.is_ascii_uppercase() {
-                    negate(&mut set);
-                }
+                let kind = if e.is_ascii_uppercase() {
+                    negate_ascii(&mut set);
+                    K_NCLASS
+                } else {
+                    K_CLASS
+                };
                 let k = self.new_class(set)?;
-                self.node(K_CLASS, k, 0, 0, 0)
+                self.node(kind, k, 0, 0, 0)
             }
             b')' => Err(refuse(at, "unbalanced ')'")),
             b'*' | b'+' | b'?' | b'{' => Err(refuse(at, "quantifier without an operand")),
@@ -360,11 +369,17 @@ impl Parser<'_> {
                 class_set(&mut set, lo);
             }
         }
-        if neg {
-            negate(&mut set);
-        }
+        let kind = if neg {
+            if set[2] | set[3] != 0 {
+                return Err(refuse(open, "a negated class with a non-ASCII member"));
+            }
+            negate_ascii(&mut set);
+            K_NCLASS
+        } else {
+            K_CLASS
+        };
         let k = self.new_class(set)?;
-        self.node(K_CLASS, k, 0, 0, 0)
+        self.node(kind, k, 0, 0, 0)
     }
 
     fn emit(&mut self, op: u8, a: u8, x: u16, y: u16) -> Result<u16, LoadErr> {
@@ -387,7 +402,11 @@ impl Parser<'_> {
         let nd = self.nodes[id as usize];
         match nd.kind {
             K_CHAR => self.emit(OP_CHAR, nd.a, 0, 0).map(drop),
-            K_ANY => self.gen_dot(),
+            K_ANY => {
+                let k = self.utf8_classes()?;
+                self.gen_utf8(k[0])
+            }
+            K_NCLASS => self.gen_utf8(nd.a),
             K_CLASS => self.emit(OP_CLASS, nd.a, 0, 0).map(drop),
             K_BOL => self.emit(OP_BOL, 0, 0, 0).map(drop),
             K_EOL => self.emit(OP_EOL, 0, 0, 0).map(drop),
@@ -410,10 +429,10 @@ impl Parser<'_> {
         }
     }
 
-    /// `.` as a UTF-8 automaton: `[^\n\x80-\xFF] | lead2 cont | lead3 cont cont |
-    /// lead4 cont cont cont`, alternatives in that priority order.
-    fn gen_dot(&mut self) -> Result<(), LoadErr> {
-        let k = match self.dot {
+    /// The classes of the UTF-8 automaton (ASCII but `\n`, 2-, 3-, 4-byte leads, continuation),
+    /// allocated once, at the first `.` or code-point-wide negated class.
+    fn utf8_classes(&mut self) -> Result<[u8; 5], LoadErr> {
+        Ok(match self.dot {
             Some(k) => k,
             None => {
                 let mut k = [0u8; 5];
@@ -440,7 +459,14 @@ impl Parser<'_> {
                 self.dot = Some(k);
                 k
             }
-        };
+        })
+    }
+
+    /// One code point as a UTF-8 automaton: `first | lead2 cont | lead3 cont cont |
+    /// lead4 cont cont cont`, alternatives in that priority order; `first` is the ASCII class
+    /// (`.`: `[^\n\x80-\xFF]`; a negated class: its ASCII complement).
+    fn gen_utf8(&mut self, first: u8) -> Result<(), LoadErr> {
+        let k = self.utf8_classes()?;
         let mut jmps = [0u16; 3];
         let mut b = 0usize;
         while b < 4 {
@@ -451,7 +477,7 @@ impl Parser<'_> {
             } else {
                 None
             };
-            self.emit(OP_CLASS, k[b], 0, 0)?;
+            self.emit(OP_CLASS, if b == 0 { first } else { k[b] }, 0, 0)?;
             let mut c = 0usize;
             while c < b {
                 self.emit(OP_CLASS, k[4], 0, 0)?;
@@ -507,20 +533,44 @@ impl Parser<'_> {
     }
 }
 
+impl RegexProg {
+    /// The empty program (no instructions): the cache slot's state before a compile.
+    pub const EMPTY: Self = Self {
+        classes: [[0; 4]; MAX_CLASSES],
+        insts: [RxInst {
+            op: 0,
+            a: 0,
+            x: 0,
+            y: 0,
+            _pad: 0,
+        }; REGEX_MAX_STATES],
+        n: 0,
+        n_classes: 0,
+        _pad: 0,
+    };
+}
+
 /// Compile `pat`: 5004 for anything outside the subset or over `REGEX_MAX_STATES`.
 pub fn regex_compile(pat: &[u8]) -> Result<RegexProg, LoadErr> {
+    let mut prog = RegexProg::EMPTY;
+    regex_compile_into(pat, &mut prog)?;
+    // COPY: RegexProg 2 568 B, once per load-time compile — the frozen §3.7 signature returns
+    // the program by value — a run-time (re)compile uses `regex_compile_into` (no copy).
+    Ok(prog)
+}
+
+/// Compile `pat` into `out` in place (the `RegexCache` slot of a run-time `str.match` pattern):
+/// no heap, no copy of the program. On `Err` the slot holds a partial program and must not
+/// be run; the caller keeps its own validity flag. Same refusals as `regex_compile`.
+pub fn regex_compile_into(pat: &[u8], out: &mut RegexProg) -> Result<(), LoadErr> {
+    out.n = 0;
+    out.n_classes = 0;
     let mut p = Parser {
         s: pat,
         i: 0,
         nodes: [Node::default(); MAX_NODES],
         n: 0,
-        prog: RegexProg {
-            classes: [[0; 4]; MAX_CLASSES],
-            insts: [RxInst::default(); REGEX_MAX_STATES],
-            n: 0,
-            n_classes: 0,
-            _pad: 0,
-        },
+        prog: out,
         dot: None,
     };
     let root = p.alt(0)?;
@@ -529,7 +579,7 @@ pub fn regex_compile(pat: &[u8]) -> Result<RegexProg, LoadErr> {
     }
     p.gen(root)?;
     p.emit(OP_MATCH, 0, 0, 0)?;
-    Ok(p.prog)
+    Ok(())
 }
 
 /// A Pike-VM thread list: program counters in priority order with each thread's match start,
@@ -608,13 +658,20 @@ impl RegexProg {
     /// within the subset's priorities; `None` without a match. Work ≤ `(len + 1) × states`.
     #[must_use]
     pub fn find(&self, s: &[u8]) -> Option<(usize, usize)> {
-        let mut cur = Threads::new();
-        let mut nxt = Threads::new();
+        // Two thread lists, flipped by index each byte (no swap of 2 × 1 576 B per byte).
+        let mut ts = [Threads::new(), Threads::new()];
+        let mut c = 0usize;
         let mut found: Option<(usize, usize)> = None;
         let mut pos = 0usize;
         loop {
+            let (lo, hi) = ts.split_at_mut(1);
+            let (cur, nxt) = if c == 0 {
+                (&mut lo[0], &mut hi[0])
+            } else {
+                (&mut hi[0], &mut lo[0])
+            };
             if found.is_none() {
-                self.add(&mut cur, 0, pos as u32, pos, s);
+                self.add(cur, 0, pos as u32, pos, s);
             }
             if cur.n == 0 && found.is_some() {
                 break;
@@ -629,12 +686,12 @@ impl RegexProg {
                         found = Some((st as usize, pos));
                         break;
                     }
-                    (OP_CHAR, Some(&c)) => c == i.a,
-                    (OP_CLASS, Some(&c)) => class_has(&self.classes[i.a as usize], c),
+                    (OP_CHAR, Some(&ch)) => ch == i.a,
+                    (OP_CLASS, Some(&ch)) => class_has(&self.classes[i.a as usize], ch),
                     _ => false,
                 };
                 if hit {
-                    self.add(&mut nxt, pc + 1, st, pos + 1, s);
+                    self.add(nxt, pc + 1, st, pos + 1, s);
                 }
                 k += 1;
             }
@@ -642,7 +699,7 @@ impl RegexProg {
                 break;
             }
             pos += 1;
-            core::mem::swap(&mut cur, &mut nxt);
+            c ^= 1;
         }
         found
     }

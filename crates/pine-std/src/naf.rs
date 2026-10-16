@@ -29,3 +29,16 @@ pub fn fmin(a: f64, b: f64) -> f64 {
         b
     }
 }
+
+/// Pine's float `/` under `Sw::FloatDivZero` (U15): with `na_nonfinite` (the `na` reading, `F_DIV`
+/// with `NA_ON_NONFINITE`) an infinite quotient is na; IEEE otherwise. `0/0` is NaN either way.
+#[inline(always)]
+#[must_use]
+pub fn fdiv(a: f64, b: f64, na_nonfinite: bool) -> f64 {
+    let q = a / b;
+    if na_nonfinite && q.is_infinite() {
+        f64::NAN
+    } else {
+        q
+    }
+}

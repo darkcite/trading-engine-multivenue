@@ -10,10 +10,10 @@
 use crate::BUILTINS;
 use pine_ir::{
     abi, argwin, op, Bar, BarCtx, BrokerView, ChartInfo, Dialect, ExecMode, FaultKind, Lane,
-    OrderIntent, OverloadId, SharedSeries, SiteId, StateKind, StepOutcome, TradeRec,
+    OrderIntent, OverloadId, SharedSeries, SiteId, StateKind, StepOutcome, StrRef, TradeRec,
 };
 use pine_vm::testkit::{Arena, Tb};
-use pine_vm::{bf, verify, BuiltinEntry, BuiltinTable, Frame, VmInstance};
+use pine_vm::{bf, verify, BuiltinEntry, BuiltinTable, Frame, StrPiece, VmInstance};
 use std::sync::OnceLock;
 
 /// The shared-series key the feed builtin reads (`TestCtx::feed`).
@@ -155,8 +155,26 @@ fn bi_probe(fr: &mut Frame<'_>, _: SiteId, a: &[u16]) -> Result<(), FaultKind> {
     Ok(())
 }
 
+/// Concat body: `[a, b, out]` — `a + b` as a `SCRATCH` string (a runtime-built string for tests
+/// that need one, e.g. a dynamic order id).
+fn bi_concat(fr: &mut Frame<'_>, _: SiteId, a: &[u16]) -> Result<(), FaultKind> {
+    let (x, y) = (fr.i64_arg(a[0]), fr.i64_arg(a[1]));
+    let (Some(x), Some(y)) = (x, y) else {
+        fr.set_i64_arg(a[2], None);
+        return Ok(());
+    };
+    let r = fr.str_concat(&[
+        StrPiece::Ref(StrRef(x as u64)),
+        StrPiece::Ref(StrRef(y as u64)),
+    ])?;
+    fr.set_i64_arg(a[2], Some(r.0 as i64));
+    Ok(())
+}
+
 const FEED: u16 = pine_spec::OVERLOAD_COUNT as u16;
 const PROBE: u16 = FEED + 1;
+/// The test-only string concatenation row (`[a: string, b: string] → string`).
+pub const CONCAT: OverloadId = OverloadId(PROBE + 1);
 
 fn table() -> &'static BuiltinTable {
     static T: OnceLock<BuiltinTable> = OnceLock::new();
@@ -175,6 +193,13 @@ fn table() -> &'static BuiltinTable {
             cost: 1,
             n_out: 0,
             flags: bf::CAPTURE,
+            state_bytes_min: 0,
+        });
+        v.push(BuiltinEntry {
+            f: bi_concat,
+            cost: 1,
+            n_out: 1,
+            flags: bf::STR_ALLOC,
             state_bytes_min: 0,
         });
         BuiltinTable {
@@ -261,6 +286,12 @@ fn feed(t: &mut Tb, c: u16, e: u16) {
 impl Harness {
     /// Lay out and verify the program; panics naming the verifier error on a bad layout.
     pub fn build(s: &Script<'_>) -> Harness {
+        Harness::build_plots(s, 0)
+    }
+
+    /// As [`Harness::build`], with `user_plots` plot indices `[0, user_plots)` reserved for the
+    /// capture rows under test (their `__plot` constants); the probes' plots follow them.
+    pub fn build_plots(s: &Script<'_>, user_plots: u32) -> Harness {
         let (mut nf, mut ni) = (1u32, 2u32); // i(0): feed column, i(1): probe base
         for c in s.calls {
             for (l, src) in c.inputs {
@@ -280,7 +311,7 @@ impl Harness {
         let mut slots = Slots { f: 1, i: 2 };
         let mut outs: Vec<Vec<u16>> = Vec::new();
         let mut base = Vec::new();
-        let mut plots = 0u32;
+        let mut plots = user_plots;
         for c in s.calls {
             let site = if c.site_bytes > 0 {
                 let kind = if BUILTINS.entries[c.ov.0 as usize].flags & bf::COLLECTION != 0 {
@@ -354,6 +385,11 @@ impl Harness {
     /// NaN).
     pub fn out(&self, k: usize, j: usize) -> f64 {
         self.vm.plots()[(self.base[k] + j as u32) as usize]
+    }
+
+    /// Plot index `i` of the last evaluation (a capture row's own index).
+    pub fn plot(&self, i: u32) -> f64 {
+        self.vm.plots()[i as usize]
     }
 
     /// The intents of the last evaluation.

@@ -148,6 +148,8 @@ fn state_zero_is_cold_for_the_moving_averages() {
         ov::TA_RMA,
         ov::TA_CHANGE_F,
         ov::TA_MOM,
+        ov::TA_HMA,
+        ov::TA_VWMA,
     ] {
         // N bars after `reset` equal N bars on a fresh instance, bit for bit.
         let fresh = run(id, 10, &c[150..], 0, None);
@@ -165,6 +167,8 @@ fn ticks_never_advance_builtin_state() {
         ov::TA_RMA,
         ov::TA_CHANGE_F,
         ov::TA_MOM,
+        ov::TA_HMA,
+        ov::TA_VWMA,
     ] {
         let closes_only = run(id, 7, &c, 0, None);
         let with_ticks = run(id, 7, &c, 3, None);
@@ -798,4 +802,1122 @@ fn linreg_and_bbw_match_bruteforce() {
         let want = (bb[i][1] - bb[i][2]) / bb[i][0];
         assert!(close_eq(bbw[i], want), "bbw {i}");
     }
+}
+
+/// One bar of the general runner: `(high, low, close, volume, feed column 0)`.
+type Bx = (f64, f64, f64, f64, f64);
+
+/// One call of `id` over full bars with explicit inputs (`Src::Feed(0)` reads the bar's feed
+/// value), every output per bar; `len` sizes a window block; `ticks` forming-bar re-evaluations
+/// (scaled prices, the same feed) before each confirm.
+fn run_x(
+    id: OverloadId,
+    ins: &[(Lane, Src)],
+    outs: &[Lane],
+    len: u32,
+    bars: &[Bx],
+    ticks: u32,
+) -> Vec<Vec<f64>> {
+    let mode = if ticks > 0 {
+        ExecMode::Realtime
+    } else {
+        ExecMode::BarClose
+    };
+    let bytes = OVERLOADS[id.0 as usize].state.block_bytes(len);
+    let calls = [Call {
+        ov: id,
+        inputs: ins,
+        outputs: outs,
+        site_bytes: bytes,
+        guard: None,
+    }];
+    let mut h = Harness::build(&Script {
+        calls: &calls,
+        mode,
+        dialect: Dialect::V6,
+        intent_cap: 0,
+        chart: CHART,
+    });
+    let mut ctx = TestCtx::default();
+    let mut out = Vec::new();
+    for (i, &(hi, lo, c, v, fd)) in bars.iter().enumerate() {
+        ctx.feed = vec![fd];
+        let mk = |x: f64, fl: u32| {
+            let mut b = bar(i as u32, c * x, fl);
+            b.high_1e6 = scale::to_1e6(hi * x).unwrap();
+            b.low_1e6 = scale::to_1e6(lo * x).unwrap();
+            b.volume_1e6 = scale::to_1e6(v * x).unwrap();
+            b
+        };
+        for j in 0..ticks {
+            assert_eq!(
+                h.step_tick(&mk(1.1 + j as f64 * 0.1, barflag::REALTIME), &mut ctx),
+                StepOutcome::Ok
+            );
+        }
+        assert_eq!(
+            h.step_bar(&mk(1.0, barflag::CONFIRMED), &mut ctx),
+            StepOutcome::Ok
+        );
+        out.push((0..outs.len()).map(|j| h.out(0, j)).collect());
+    }
+    out
+}
+
+/// Full bars from the HLC tape (1e-6 exact), volume cycling 1..7, the feed = the close.
+fn bx_tape(n: usize) -> Vec<Bx> {
+    fx(&hlc_tape(n))
+        .iter()
+        .enumerate()
+        .map(|(i, &(h, l, c))| (h, l, c, 1.0 + (i % 7) as f64, c))
+        .collect()
+}
+
+fn col(r: &[Vec<f64>], j: usize) -> Vec<f64> {
+    r.iter().map(|x| x[j]).collect()
+}
+
+fn fconst(v: f64) -> (Lane, Src) {
+    (Lane::F64, Src::Const(v.to_bits()))
+}
+
+fn iconst(v: i64) -> (Lane, Src) {
+    (Lane::I64, Src::Const(v as u64))
+}
+
+const FEED: (Lane, Src) = (Lane::F64, Src::Feed(0));
+
+/// The reference manual's `pine_sar`, transcribed line by line over the chart history (every
+/// bar executes, so the site's history is the chart's).
+fn pine_sar(b: &[Bx], start: f64, inc: f64, max: f64) -> Vec<f64> {
+    let mx = |a: f64, b: f64| {
+        if a.is_nan() || b.is_nan() {
+            f64::NAN
+        } else if a >= b {
+            a
+        } else {
+            b
+        }
+    };
+    let mn = |a: f64, b: f64| {
+        if a.is_nan() || b.is_nan() {
+            f64::NAN
+        } else if a <= b {
+            a
+        } else {
+            b
+        }
+    };
+    let hist = |i: usize, k: usize, f: fn(&Bx) -> f64| if i >= k { f(&b[i - k]) } else { f64::NAN };
+    let (mut result, mut max_min, mut acceleration) = (f64::NAN, f64::NAN, f64::NAN);
+    let mut is_below = false;
+    let mut out = Vec::new();
+    for (bar_index, x) in b.iter().enumerate() {
+        let (high, low, close) = (x.0, x.1, x.2);
+        let mut is_first_trend_bar = false;
+        if bar_index == 1 {
+            if close > hist(bar_index, 1, |x| x.2) {
+                is_below = true;
+                max_min = high;
+                result = hist(bar_index, 1, |x| x.1);
+            } else {
+                is_below = false;
+                max_min = low;
+                result = hist(bar_index, 1, |x| x.0);
+            }
+            is_first_trend_bar = true;
+            acceleration = start;
+        }
+        result += acceleration * (max_min - result);
+        if is_below {
+            if result > low {
+                is_first_trend_bar = true;
+                is_below = false;
+                result = mx(high, max_min);
+                max_min = low;
+                acceleration = start;
+            }
+        } else if result < high {
+            is_first_trend_bar = true;
+            is_below = true;
+            result = mn(low, max_min);
+            max_min = high;
+            acceleration = start;
+        }
+        if !is_first_trend_bar {
+            if is_below {
+                if high > max_min {
+                    max_min = high;
+                    acceleration = mn(acceleration + inc, max);
+                }
+            } else if low < max_min {
+                max_min = low;
+                acceleration = mn(acceleration + inc, max);
+            }
+        }
+        if is_below {
+            result = mn(result, hist(bar_index, 1, |x| x.1));
+            if bar_index > 1 {
+                result = mn(result, hist(bar_index, 2, |x| x.1));
+            }
+        } else {
+            result = mx(result, hist(bar_index, 1, |x| x.0));
+            if bar_index > 1 {
+                result = mx(result, hist(bar_index, 2, |x| x.0));
+            }
+        }
+        out.push(result);
+    }
+    out
+}
+
+#[test]
+fn ta_sar_is_the_manuals_pine_sar() {
+    // pin:04-sar-literal: bit-equal to the transcribed reference, and I5 under ticks.
+    let b = bx_tape(600);
+    let ins = [fconst(0.02), fconst(0.02), fconst(0.2)];
+    let got = col(&run_x(ov::TA_SAR, &ins, &[Lane::F64], 0, &b, 0), 0);
+    let tk = col(&run_x(ov::TA_SAR, &ins, &[Lane::F64], 0, &b, 2), 0);
+    let want = pine_sar(&b, 0.02, 0.02, 0.2);
+    assert!(bits_eq(&got, &want), "sar vs pine_sar");
+    assert!(bits_eq(&got, &tk), "I5 sar");
+    assert!(got[0].is_nan() && !got[1].is_nan());
+    // Both sides of the price occur (the recurrence flips).
+    assert!((2..b.len()).any(|i| got[i] < b[i].1) && (2..b.len()).any(|i| got[i] > b[i].0));
+}
+
+fn wma_ref(x: &[f64], i: usize, len: usize) -> f64 {
+    let den = (len * (len + 1) / 2) as f64;
+    (0..len).map(|k| x[i - k] * (len - k) as f64).sum::<f64>() / den
+}
+
+#[test]
+fn ta_hma_matches_bruteforce() {
+    let b = bx_tape(700);
+    let c: Vec<f64> = b.iter().map(|x| x.2).collect();
+    for len in [2usize, 9, 16] {
+        let got = col(
+            &run_x(
+                ov::TA_HMA,
+                &[FEED, iconst(len as i64)],
+                &[Lane::F64],
+                len as u32,
+                &b,
+                0,
+            ),
+            0,
+        );
+        let half = len / 2;
+        let sq = (len as f64).sqrt().floor() as usize;
+        let diff: Vec<f64> = (0..c.len())
+            .map(|i| {
+                if i + 1 < len {
+                    f64::NAN
+                } else {
+                    2.0 * wma_ref(&c, i, half) - wma_ref(&c, i, len)
+                }
+            })
+            .collect();
+        for (i, &g) in got.iter().enumerate() {
+            if i + 2 < len + sq {
+                assert!(g.is_nan(), "hma {len} warm-up {i}");
+            } else {
+                let want = wma_ref(&diff, i, sq);
+                assert!((g - want).abs() < 1e-9, "hma {len} {i}: {g} vs {want}");
+            }
+        }
+    }
+    // len 1 has a half of 0: refused as ta.wma(src, 0) is (pin:04-hma-half).
+    let calls = [Call {
+        ov: ov::TA_HMA,
+        inputs: &[CLOSE, (Lane::I64, Src::Const(1))],
+        outputs: &[Lane::F64],
+        site_bytes: OVERLOADS[ov::TA_HMA.0 as usize].state.block_bytes(1),
+        guard: None,
+    }];
+    let mut h = Harness::build(&Script {
+        calls: &calls,
+        mode: ExecMode::BarClose,
+        dialect: Dialect::V6,
+        intent_cap: 0,
+        chart: CHART,
+    });
+    let o = h.step_bar(&bar(0, 100.0, barflag::CONFIRMED), &mut TestCtx::default());
+    assert_ne!(o, StepOutcome::Ok);
+    assert_eq!(h.last_fault().map(|f| f.0), Some(FaultKind::ScriptRefused));
+}
+
+#[test]
+fn ta_vwma_is_the_pair_window() {
+    let mut b = bx_tape(400);
+    // An na source on a few bars (skip: the pair is not accepted), a zero-volume stretch.
+    for i in [50usize, 51, 120] {
+        b[i].4 = f64::NAN;
+    }
+    for x in b.iter_mut().skip(300).take(12) {
+        x.3 = 0.0;
+    }
+    let len = 10usize;
+    let got = col(
+        &run_x(ov::TA_VWMA, &[FEED, iconst(10)], &[Lane::F64], 10, &b, 0),
+        0,
+    );
+    let tk = col(
+        &run_x(ov::TA_VWMA, &[FEED, iconst(10)], &[Lane::F64], 10, &b, 2),
+        0,
+    );
+    assert!(bits_eq(&got, &tk), "I5 vwma");
+    let acc: Vec<(f64, f64)> = b
+        .iter()
+        .filter(|x| !x.4.is_nan())
+        .map(|x| (x.4, x.3))
+        .collect();
+    let mut k = 0usize;
+    for i in 0..b.len() {
+        if !b[i].4.is_nan() {
+            k += 1;
+        }
+        if k < len {
+            assert!(got[i].is_nan(), "warm-up {i}");
+            continue;
+        }
+        let w = &acc[k - len..k];
+        let sv: f64 = w.iter().map(|p| p.1).sum();
+        if sv == 0.0 {
+            assert!(got[i].is_nan(), "zero-volume window {i}");
+            continue;
+        }
+        let want = w.iter().map(|p| p.0 * p.1).sum::<f64>() / sv;
+        assert!(
+            (got[i] - want).abs() < 1e-9,
+            "vwma {i}: {} vs {want}",
+            got[i]
+        );
+    }
+    assert!(got[311].is_nan());
+}
+
+/// The manual's `pine_alma` at bar `i` (na while fewer than `len` values exist or any is na).
+fn pine_alma(x: &[f64], i: usize, len: usize, offset: f64, sigma: f64, floor: bool) -> f64 {
+    let m = offset * (len - 1) as f64;
+    let m = if floor { m.floor() } else { m };
+    let s = len as f64 / sigma;
+    let (mut norm, mut sum) = (0.0f64, 0.0f64);
+    for k in 0..len {
+        let d = k as f64 - m;
+        let weight = (-(d * d) / (2.0 * (s * s))).exp();
+        norm += weight;
+        let back = len - k - 1;
+        let v = if i >= back { x[i - back] } else { f64::NAN };
+        sum += v * weight;
+    }
+    sum / norm
+}
+
+/// I26: the fixed-weight windows recomputed from the values equal the emitted value bit for bit.
+#[test]
+fn fixed_weight_windows_are_recompute_exact() {
+    let b = bx_tape(1500);
+    let c: Vec<f64> = b.iter().map(|x| x.2).collect();
+    // ta.alma: three parameter sets, the floor flag both ways, and an na hole (propagate).
+    let mut bn = b.clone();
+    bn[700].4 = f64::NAN;
+    let cn: Vec<f64> = bn.iter().map(|x| x.4).collect();
+    for (len, off, sig, fl) in [
+        (9usize, 0.85, 6.0, false),
+        (9, 0.85, 6.0, true),
+        (20, 0.5, 3.0, false),
+    ] {
+        let ins = [
+            FEED,
+            iconst(len as i64),
+            fconst(off),
+            fconst(sig),
+            (Lane::I64, Src::Const(fl as u64)),
+        ];
+        let got = col(
+            &run_x(ov::TA_ALMA, &ins, &[Lane::F64], len as u32, &bn, 0),
+            0,
+        );
+        let tk = col(
+            &run_x(ov::TA_ALMA, &ins, &[Lane::F64], len as u32, &bn, 2),
+            0,
+        );
+        assert!(bits_eq(&got, &tk), "I5 alma");
+        for (i, &g) in got.iter().enumerate() {
+            let want = pine_alma(&cn, i, len, off, sig, fl);
+            assert!(
+                (g.is_nan() && want.is_nan()) || g.to_bits() == want.to_bits(),
+                "alma {len} {fl} {i}: {g} vs {want}"
+            );
+        }
+        assert!(got[700].is_nan() && got[700 + len - 1].is_nan() && !got[700 + len].is_nan());
+    }
+    // ta.wma: newest-first fused dot with weights len − k.
+    for len in [1usize, 7, 30] {
+        let got = col(
+            &run_x(
+                ov::TA_WMA,
+                &[FEED, iconst(len as i64)],
+                &[Lane::F64],
+                len as u32,
+                &b,
+                0,
+            ),
+            0,
+        );
+        for i in len - 1..c.len() {
+            let mut acc = 0.0f64;
+            for k in 0..len {
+                acc = c[i - k].mul_add((len - k) as f64, acc);
+            }
+            let want = acc / (len as f64 * (len as f64 + 1.0) / 2.0);
+            assert_eq!(got[i].to_bits(), want.to_bits(), "wma {len} {i}");
+        }
+    }
+    // ta.cog: `−num / sum`, both from one newest-first pass (pine_cog, unfused).
+    for len in [1usize, 10] {
+        let got = col(
+            &run_x(
+                ov::TA_COG,
+                &[FEED, iconst(len as i64)],
+                &[Lane::F64],
+                len as u32,
+                &b,
+                0,
+            ),
+            0,
+        );
+        for i in len - 1..c.len() {
+            let (mut num, mut sum) = (0.0f64, 0.0f64);
+            for k in 0..len {
+                num += c[i - k] * (k + 1) as f64;
+                sum += c[i - k];
+            }
+            assert_eq!(got[i].to_bits(), (-num / sum).to_bits(), "cog {len} {i}");
+        }
+    }
+    // ta.swma.
+    let got = col(&run_x(ov::TA_SWMA, &[FEED], &[Lane::F64], 0, &b, 0), 0);
+    for i in 3..c.len() {
+        let want = (c[i] + c[i - 3]) / 6.0 + (c[i - 1] + c[i - 2]) * (2.0 / 6.0);
+        assert_eq!(got[i].to_bits(), want.to_bits(), "swma {i}");
+    }
+    // ta.linreg: Σxy fused newest first against the cached x column, the closed forms.
+    for (len, off) in [(10usize, 0i64), (25, 3)] {
+        let ins = [FEED, iconst(len as i64), iconst(off)];
+        let got = col(
+            &run_x(ov::TA_LINREG, &ins, &[Lane::F64], len as u32, &b, 0),
+            0,
+        );
+        for i in 2 * len..c.len() {
+            let n = len as f64;
+            let sx = n * (n - 1.0) / 2.0;
+            let sxx = (n - 1.0) * n * (2.0 * n - 1.0) / 6.0;
+            let mut sxy = 0.0f64;
+            for k in 0..len {
+                sxy = c[i - k].mul_add((len - 1 - k) as f64, sxy);
+            }
+            // The rolling Σy is the body's own (I27 bounds it); recompute it exactly and require
+            // agreement to a few ulps, the dot product bit for bit through `sxy`.
+            let sy: f64 = (0..len).map(|k| c[i - k]).sum();
+            let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+            let icept = (sy - slope * sx) / n;
+            let want = slope.mul_add(n - 1.0 - off as f64, icept);
+            assert!(
+                (got[i] - want).abs() <= want.abs() * 1e-12,
+                "linreg {len} {i}"
+            );
+        }
+    }
+}
+
+fn rel_eq(a: f64, b: f64) -> bool {
+    (a.is_nan() && b.is_nan()) || (a - b).abs() <= 1e-9 * (1.0 + b.abs())
+}
+
+/// The output of `id` over `bars`, and the same run with ticks (I5) — asserted bit-equal.
+fn run_i5(id: OverloadId, ins: &[(Lane, Src)], outs: &[Lane], len: u32, b: &[Bx]) -> Vec<Vec<f64>> {
+    let a = run_x(id, ins, outs, len, b, 0);
+    let t = run_x(id, ins, outs, len, b, 2);
+    for i in 0..a.len() {
+        assert!(bits_eq(&a[i], &t[i]), "I5 {id:?} bar {i}");
+    }
+    a
+}
+
+const HIGH: (Lane, Src) = (Lane::F64, Src::Reserved(Lane::F64, abi::F_HIGH));
+const LOW: (Lane, Src) = (Lane::F64, Src::Reserved(Lane::F64, abi::F_LOW));
+
+/// T23 — the windowed oscillators against brute force over the chart history.
+#[test]
+fn oscillator_windows_match_reference() {
+    let b = bx_tape(600);
+    let c: Vec<f64> = b.iter().map(|x| x.2).collect();
+    let len = 14usize;
+    let l = len as u32;
+    let dev = col(
+        &run_i5(ov::TA_DEV, &[FEED, iconst(14)], &[Lane::F64], l, &b),
+        0,
+    );
+    let cci = col(
+        &run_i5(ov::TA_CCI, &[FEED, iconst(14)], &[Lane::F64], l, &b),
+        0,
+    );
+    let stoch = col(
+        &run_i5(
+            ov::TA_STOCH,
+            &[FEED, HIGH, LOW, iconst(14)],
+            &[Lane::F64],
+            l,
+            &b,
+        ),
+        0,
+    );
+    let wpr = col(&run_i5(ov::TA_WPR, &[iconst(14)], &[Lane::F64], l, &b), 0);
+    let cmo = col(
+        &run_i5(ov::TA_CMO, &[FEED, iconst(14)], &[Lane::F64], l, &b),
+        0,
+    );
+    let mfi = col(
+        &run_i5(ov::TA_MFI, &[FEED, iconst(14)], &[Lane::F64], l, &b),
+        0,
+    );
+    for i in 0..c.len() {
+        if i + 1 < len {
+            assert!(dev[i].is_nan() && cci[i].is_nan() && stoch[i].is_nan() && wpr[i].is_nan());
+        } else {
+            let w = &c[i + 1 - len..=i];
+            let mean = w.iter().sum::<f64>() / len as f64;
+            let d = w.iter().map(|x| (x - mean).abs()).sum::<f64>() / len as f64;
+            assert!(rel_eq(dev[i], d), "dev {i}");
+            assert!(rel_eq(cci[i], (c[i] - mean) / (0.015 * d)), "cci {i}");
+            let bw = &b[i + 1 - len..=i];
+            let hh = bw
+                .iter()
+                .map(|x| x.0)
+                .fold(f64::MIN, |a, x| if x > a { x } else { a });
+            let ll = bw
+                .iter()
+                .map(|x| x.1)
+                .fold(f64::MAX, |a, x| if x < a { x } else { a });
+            assert!(
+                rel_eq(stoch[i], 100.0 * (c[i] - ll) / (hh - ll)),
+                "stoch {i}"
+            );
+            assert!(rel_eq(wpr[i], -100.0 * (hh - c[i]) / (hh - ll)), "wpr {i}");
+        }
+        // W(len + 1): the first execution only primes `ta.change` (pin:04-first-change).
+        if i < len {
+            assert!(cmo[i].is_nan() && mfi[i].is_nan(), "warm-up {i}");
+            continue;
+        }
+        let (mut s1, mut s2, mut up, mut lo) = (0.0, 0.0, 0.0, 0.0);
+        for j in i + 1 - len..=i {
+            let m = c[j] - c[j - 1];
+            if m >= 0.0 {
+                s1 += m;
+            } else {
+                s2 -= m;
+            }
+            up += b[j].3 * if m <= 0.0 { 0.0 } else { c[j] };
+            lo += b[j].3 * if m >= 0.0 { 0.0 } else { c[j] };
+        }
+        assert!(rel_eq(cmo[i], 100.0 * (s1 - s2) / (s1 + s2)), "cmo {i}");
+        let want = 100.0 - 100.0 / (1.0 + up / lo);
+        assert!(
+            rel_eq(mfi[i], want) || (lo == 0.0 && mfi[i].is_nan()),
+            "mfi {i}"
+        );
+    }
+    // A flat window divides by zero per Sw::FloatDivZero (`na` in both dialects today).
+    let flat: Vec<Bx> = (0..30).map(|_| (100.0, 100.0, 100.0, 1.0, 100.0)).collect();
+    let na0 = pine_spec::sw(Sw::FloatDivZero, Dialect::V6) == swr::FLOAT_DIV_ZERO_NA;
+    let st = col(
+        &run_x(
+            ov::TA_STOCH,
+            &[FEED, HIGH, LOW, iconst(5)],
+            &[Lane::F64],
+            5,
+            &flat,
+            0,
+        ),
+        0,
+    );
+    let cc = col(
+        &run_x(ov::TA_CCI, &[FEED, iconst(5)], &[Lane::F64], 5, &flat, 0),
+        0,
+    );
+    assert!(st[10].is_nan() && cc[10].is_nan(), "0/0 is na either way");
+    // A rising tape: `lower` is 0, so `upper / lower` is +inf — na under `na`, 100 under `ieee`.
+    let rise: Vec<Bx> = (0..30)
+        .map(|i| {
+            let x = 100.0 + i as f64;
+            (x, x, x, 1.0, x)
+        })
+        .collect();
+    let mf = col(
+        &run_x(ov::TA_MFI, &[FEED, iconst(5)], &[Lane::F64], 5, &rise, 0),
+        0,
+    );
+    assert!(
+        if na0 {
+            mf[10].is_nan()
+        } else {
+            mf[10] == 100.0
+        },
+        "mfi ÷0 per U15"
+    );
+}
+
+/// A recursive smoother over a series with na holes (skip: hold), seeded per `sma_seed`.
+fn sm_ref(xs: &[f64], len: usize, alpha: f64, sma_seed: bool) -> Vec<f64> {
+    let (mut v, mut acc, mut n) = (f64::NAN, 0.0f64, 0usize);
+    let mut out = Vec::new();
+    for &x in xs {
+        if !x.is_nan() {
+            n += 1;
+            if !v.is_nan() {
+                v = alpha.mul_add(x - v, v);
+            } else if !sma_seed {
+                v = x;
+            } else {
+                acc += x;
+                if n >= len {
+                    v = acc / len as f64;
+                }
+            }
+        }
+        out.push(v);
+    }
+    out
+}
+
+/// T23 — the recursive oscillators (`ta.tsi`, `ta.dmi`) against compositions of the smoother.
+#[test]
+fn oscillator_smoothers_match_reference() {
+    let b = bx_tape(700);
+    let c: Vec<f64> = b.iter().map(|x| x.2).collect();
+    let d = Dialect::V6;
+    let ema_sma = pine_spec::sw(Sw::EmaSeed, d) == swr::EMA_SEED_SMA;
+    let rma_sma = pine_spec::sw(Sw::RmaSeed, d) == swr::RMA_SEED_SMA;
+    // tsi(13, 25): ema(ema(m, long), short) / ema(ema(|m|, long), short) (pin:04-tsi-order).
+    let tsi = col(
+        &run_i5(
+            ov::TA_TSI,
+            &[FEED, iconst(13), iconst(25)],
+            &[Lane::F64],
+            0,
+            &b,
+        ),
+        0,
+    );
+    let m: Vec<f64> = (0..c.len())
+        .map(|i| if i == 0 { f64::NAN } else { c[i] - c[i - 1] })
+        .collect();
+    let am: Vec<f64> = m.iter().map(|x| x.abs()).collect();
+    let (al, as_) = (2.0 / 26.0, 2.0 / 14.0);
+    let num = sm_ref(&sm_ref(&m, 25, al, ema_sma), 13, as_, ema_sma);
+    let den = sm_ref(&sm_ref(&am, 25, al, ema_sma), 13, as_, ema_sma);
+    for i in 0..c.len() {
+        let want = num[i] / den[i];
+        assert!(
+            (tsi[i].is_nan() && want.is_nan()) || tsi[i].to_bits() == want.to_bits(),
+            "tsi {i}"
+        );
+        assert!(tsi[i].is_nan() || tsi[i].abs() <= 1.0, "tsi range {i}");
+    }
+    assert!(!tsi[100].is_nan());
+    // dmi(14, 10): three outputs, every one written.
+    let r = run_i5(
+        ov::TA_DMI,
+        &[iconst(14), iconst(10)],
+        &[Lane::F64; 3],
+        0,
+        &b,
+    );
+    let n = b.len();
+    let mut tr = vec![f64::NAN; n];
+    let mut pdm = vec![f64::NAN; n];
+    let mut mdm = vec![f64::NAN; n];
+    for i in 1..n {
+        let (h, l, _, _, _) = b[i];
+        let (h1, l1, c1, _, _) = b[i - 1];
+        let (up, down) = (h - h1, l1 - l);
+        pdm[i] = if up > down && up > 0.0 { up } else { 0.0 };
+        mdm[i] = if down > up && down > 0.0 { down } else { 0.0 };
+        let mx = |a: f64, b: f64| if a >= b { a } else { b };
+        tr[i] = mx(mx(h - l, (h - c1).abs()), (l - c1).abs());
+    }
+    let t = sm_ref(&tr, 14, 1.0 / 14.0, rma_sma);
+    let p = sm_ref(&pdm, 14, 1.0 / 14.0, rma_sma);
+    let q = sm_ref(&mdm, 14, 1.0 / 14.0, rma_sma);
+    let pdi: Vec<f64> = (0..n).map(|i| 100.0 * p[i] / t[i]).collect();
+    let mdi: Vec<f64> = (0..n).map(|i| 100.0 * q[i] / t[i]).collect();
+    let dx: Vec<f64> = (0..n)
+        .map(|i| 100.0 * (pdi[i] - mdi[i]).abs() / (pdi[i] + mdi[i]))
+        .collect();
+    let adx = sm_ref(&dx, 10, 0.1, rma_sma);
+    for i in 0..n {
+        assert!(
+            bits_eq(&r[i], &[pdi[i], mdi[i], adx[i]]),
+            "dmi {i}: {:?}",
+            r[i]
+        );
+    }
+    assert!(!r[100][2].is_nan() && r[100][0] > 0.0 && r[100][1] > 0.0);
+}
+
+/// One call of `id` over full bars with per-bar feed columns, optionally guarded by feed column
+/// `guard` (a conditional site, I6); every output per bar.
+fn run_feed(
+    id: OverloadId,
+    ins: &[(Lane, Src)],
+    outs: &[Lane],
+    len: u32,
+    bars: &[Bx],
+    feed: &[Vec<f64>],
+    guard: Option<u16>,
+) -> Vec<Vec<f64>> {
+    let calls = [Call {
+        ov: id,
+        inputs: ins,
+        outputs: outs,
+        site_bytes: OVERLOADS[id.0 as usize].state.block_bytes(len),
+        guard,
+    }];
+    let mut h = Harness::build(&Script {
+        calls: &calls,
+        mode: ExecMode::BarClose,
+        dialect: Dialect::V6,
+        intent_cap: 0,
+        chart: CHART,
+    });
+    let mut ctx = TestCtx::default();
+    let mut out = Vec::new();
+    for (i, &(hi, lo, c, v, _)) in bars.iter().enumerate() {
+        ctx.feed = feed[i].clone();
+        let mut b = bar(i as u32, c, barflag::CONFIRMED);
+        b.high_1e6 = scale::to_1e6(hi).unwrap();
+        b.low_1e6 = scale::to_1e6(lo).unwrap();
+        b.volume_1e6 = scale::to_1e6(v).unwrap();
+        assert_eq!(h.step_bar(&b, &mut ctx), StepOutcome::Ok);
+        out.push((0..outs.len()).map(|j| h.out(0, j)).collect());
+    }
+    out
+}
+
+fn fcol(c: u16, lane: Lane) -> (Lane, Src) {
+    (lane, Src::Feed(c))
+}
+
+/// T24 — `ta.cum`, `ta.barssince`, `ta.valuewhen` (all four source types) against references.
+#[test]
+fn ta_cum_barssince_valuewhen_match_reference() {
+    let b = bx_tape(300);
+    // Feed: [source (na every 7th), condition (false for the first 5 bars), int source].
+    let feed: Vec<Vec<f64>> = (0..b.len())
+        .map(|i| {
+            let src = if i % 7 == 3 { f64::NAN } else { b[i].2 };
+            let cond = if i >= 5 && (i * 7919) % 5 < 2 {
+                1.0
+            } else {
+                0.0
+            };
+            vec![src, cond, (i as f64 * 3.0).floor()]
+        })
+        .collect();
+    let cum = col(
+        &run_feed(
+            ov::TA_CUM,
+            &[fcol(0, Lane::F64)],
+            &[Lane::F64],
+            0,
+            &b,
+            &feed,
+            None,
+        ),
+        0,
+    );
+    let bs = col(
+        &run_feed(
+            ov::TA_BARSSINCE,
+            &[fcol(1, Lane::I64)],
+            &[Lane::I64],
+            0,
+            &b,
+            &feed,
+            None,
+        ),
+        0,
+    );
+    let occ = 1i64;
+    let vw = |id: OverloadId, src: (Lane, Src), out: Lane| {
+        col(
+            &run_feed(
+                id,
+                &[fcol(1, Lane::I64), src, iconst(occ)],
+                &[out],
+                occ as u32,
+                &b,
+                &feed,
+                None,
+            ),
+            0,
+        )
+    };
+    let vf = vw(ov::TA_VALUEWHEN_F, fcol(0, Lane::F64), Lane::F64);
+    let vi = vw(ov::TA_VALUEWHEN_I, fcol(2, Lane::I64), Lane::I64);
+    let vc = vw(ov::TA_VALUEWHEN_C, fcol(2, Lane::I64), Lane::I64);
+    let vb = vw(ov::TA_VALUEWHEN_B, fcol(1, Lane::I64), Lane::I64);
+    let (mut acc, mut since, mut trues) = (0.0f64, None::<i64>, Vec::new());
+    for i in 0..b.len() {
+        let (src, cond, isrc) = (feed[i][0], feed[i][1] != 0.0, feed[i][2]);
+        if !src.is_nan() {
+            acc += src;
+        }
+        assert_eq!(cum[i].to_bits(), acc.to_bits(), "cum {i}");
+        since = if cond { Some(0) } else { since.map(|s| s + 1) };
+        assert!(
+            since.map_or(bs[i].is_nan(), |s| bs[i] == s as f64),
+            "barssince {i}: {} vs {since:?}",
+            bs[i]
+        );
+        if cond {
+            trues.push((src, isrc));
+        }
+        let want = trues.len().checked_sub(1 + occ as usize).map(|k| trues[k]);
+        match want {
+            None => assert!(vf[i].is_nan() && vi[i].is_nan() && vc[i].is_nan() && vb[i] == 0.0),
+            Some((s, n)) => {
+                assert!(
+                    (s.is_nan() && vf[i].is_nan()) || vf[i] == s,
+                    "valuewhen f {i}"
+                );
+                assert!(vi[i] == n && vc[i] == n, "valuewhen i/c {i}");
+                assert_eq!(vb[i], 1.0, "valuewhen b {i}: the condition was true there");
+            }
+        }
+    }
+    assert!(bs[3].is_nan() && trues.len() > 20);
+}
+
+/// U03 — the dialect's `Sw::RisingFalling` reading against brute force, on a sequence that tells
+/// the two readings apart (`[1, 3, 2, 4]`, len 3: `gt_all_prior` true, `monotone` false).
+#[test]
+fn rising_falling_switch() {
+    let d = Dialect::V6;
+    let mono = pine_spec::sw(Sw::RisingFalling, d) == swr::RISING_FALLING_MONOTONE;
+    let b = bx_tape(400);
+    let c: Vec<f64> = b.iter().map(|x| x.2).collect();
+    let len = 3usize;
+    let feed: Vec<Vec<f64>> = c.iter().map(|&x| vec![x]).collect();
+    let ins = [fcol(0, Lane::F64), iconst(len as i64)];
+    let up = col(
+        &run_feed(
+            ov::TA_RISING,
+            &ins,
+            &[Lane::I64],
+            len as u32,
+            &b,
+            &feed,
+            None,
+        ),
+        0,
+    );
+    let dn = col(
+        &run_feed(
+            ov::TA_FALLING,
+            &ins,
+            &[Lane::I64],
+            len as u32,
+            &b,
+            &feed,
+            None,
+        ),
+        0,
+    );
+    for i in 0..c.len() {
+        let (mut r, mut f) = (i >= len, i >= len);
+        for k in 1..=len.min(i) {
+            let (a, p) = if mono {
+                (c[i - k + 1], c[i - k])
+            } else {
+                (c[i], c[i - k])
+            };
+            r &= a > p;
+            f &= a < p;
+        }
+        assert_eq!(up[i] == 1.0, r, "rising {i}");
+        assert_eq!(dn[i] == 1.0, f, "falling {i}");
+    }
+    assert!(up.contains(&1.0) && dn.contains(&1.0));
+    let seq = [1.0, 3.0, 2.0, 4.0];
+    let b4: Vec<Bx> = seq.iter().map(|&x| (x, x, x, 1.0, x)).collect();
+    let f4: Vec<Vec<f64>> = seq.iter().map(|&x| vec![x]).collect();
+    let r4 = col(
+        &run_feed(ov::TA_RISING, &ins, &[Lane::I64], 3, &b4, &f4, None),
+        0,
+    );
+    assert_eq!(r4[3] == 1.0, !mono, "the readings differ on [1, 3, 2, 4]");
+}
+
+/// `ta.pivothigh`/`ta.pivotlow`: the block holds `left + right + 1` values (one fewer refuses);
+/// a pivot is reported `right` executions late, strictly beyond every neighbour.
+#[test]
+fn pivot_window_is_left_plus_right_plus_one() {
+    let b = bx_tape(500);
+    let (l, r) = (3usize, 2usize);
+    let w = l + r + 1;
+    let spec = &OVERLOADS[ov::TA_PIVOTHIGH.0 as usize].state;
+    assert_eq!(spec.block_bytes((l + r) as u32), 16 + 8 * w as u32);
+    let feed: Vec<Vec<f64>> = b.iter().map(|x| vec![x.2]).collect();
+    let lr = [iconst(l as i64), iconst(r as i64)];
+    let src_lr = [fcol(0, Lane::F64), iconst(l as i64), iconst(r as i64)];
+    let n = (l + r) as u32;
+    let ph = col(
+        &run_feed(ov::TA_PIVOTHIGH, &lr, &[Lane::F64], n, &b, &feed, None),
+        0,
+    );
+    let pl = col(
+        &run_feed(ov::TA_PIVOTLOW, &lr, &[Lane::F64], n, &b, &feed, None),
+        0,
+    );
+    let phs = col(
+        &run_feed(
+            ov::TA_PIVOTHIGH_SRC,
+            &src_lr,
+            &[Lane::F64],
+            n,
+            &b,
+            &feed,
+            None,
+        ),
+        0,
+    );
+    let pls = col(
+        &run_feed(
+            ov::TA_PIVOTLOW_SRC,
+            &src_lr,
+            &[Lane::F64],
+            n,
+            &b,
+            &feed,
+            None,
+        ),
+        0,
+    );
+    let piv = |xs: &[f64], i: usize, hi: bool| -> f64 {
+        if i + 1 < w {
+            return f64::NAN;
+        }
+        let ctr = xs[i - r];
+        let ok =
+            (i + 1 - w..=i)
+                .filter(|&j| j != i - r)
+                .all(|j| if hi { ctr > xs[j] } else { ctr < xs[j] });
+        if ok {
+            ctr
+        } else {
+            f64::NAN
+        }
+    };
+    let (hs, ls, cs): (Vec<f64>, Vec<f64>, Vec<f64>) = (
+        b.iter().map(|x| x.0).collect(),
+        b.iter().map(|x| x.1).collect(),
+        b.iter().map(|x| x.2).collect(),
+    );
+    let mut found = 0;
+    for i in 0..b.len() {
+        assert!(bits_eq(&[ph[i]], &[piv(&hs, i, true)]), "pivothigh {i}");
+        assert!(bits_eq(&[pl[i]], &[piv(&ls, i, false)]), "pivotlow {i}");
+        assert!(
+            bits_eq(&[phs[i]], &[piv(&cs, i, true)]),
+            "pivothigh(src) {i}"
+        );
+        assert!(
+            bits_eq(&[pls[i]], &[piv(&cs, i, false)]),
+            "pivotlow(src) {i}"
+        );
+        found += !ph[i].is_nan() as usize;
+    }
+    assert!(found > 5, "the tape has pivots");
+    // One value short of left + right + 1: refused.
+    let calls = [Call {
+        ov: ov::TA_PIVOTHIGH,
+        inputs: &lr,
+        outputs: &[Lane::F64],
+        site_bytes: spec.block_bytes(n - 1),
+        guard: None,
+    }];
+    let mut h = Harness::build(&Script {
+        calls: &calls,
+        mode: ExecMode::BarClose,
+        dialect: Dialect::V6,
+        intent_cap: 0,
+        chart: CHART,
+    });
+    let o = h.step_bar(&bar(0, 100.0, barflag::CONFIRMED), &mut TestCtx::default());
+    assert_ne!(o, StepOutcome::Ok);
+    assert_eq!(h.last_fault().map(|f| f.0), Some(FaultKind::ScriptRefused));
+}
+
+/// I6 — a stateful site skipped by a false branch produces, on its next execution, exactly what
+/// it would have without the skipped bars.
+#[test]
+fn conditional_site_does_not_advance() {
+    let b = bx_tape(400);
+    let run_on = |i: usize| (i * 2654435761usize) % 3 != 0;
+    let feed: Vec<Vec<f64>> = b
+        .iter()
+        .enumerate()
+        .map(|(i, x)| vec![x.2, if run_on(i) { 1.0 } else { 0.0 }])
+        .collect();
+    let kept: Vec<usize> = (0..b.len()).filter(|&i| run_on(i)).collect();
+    let bk: Vec<Bx> = kept.iter().map(|&i| b[i]).collect();
+    let fk: Vec<Vec<f64>> = kept.iter().map(|&i| feed[i].clone()).collect();
+    let src = fcol(0, Lane::F64);
+    let rows: [(OverloadId, Vec<(Lane, Src)>, Lane, u32); 12] = [
+        (ov::TA_SMA, vec![src, iconst(9)], Lane::F64, 9),
+        (ov::TA_EMA, vec![src, iconst(9)], Lane::F64, 0),
+        (ov::TA_HMA, vec![src, iconst(9)], Lane::F64, 9),
+        (ov::TA_VWMA, vec![src, iconst(9)], Lane::F64, 9),
+        (
+            ov::TA_ALMA,
+            vec![src, iconst(9), fconst(0.85), fconst(6.0), iconst(0)],
+            Lane::F64,
+            9,
+        ),
+        (ov::TA_CMO, vec![src, iconst(9)], Lane::F64, 9),
+        (ov::TA_TSI, vec![src, iconst(5), iconst(9)], Lane::F64, 0),
+        (
+            ov::TA_SAR,
+            vec![fconst(0.02), fconst(0.02), fconst(0.2)],
+            Lane::F64,
+            0,
+        ),
+        (ov::TA_WPR, vec![iconst(9)], Lane::F64, 9),
+        (ov::TA_RISING, vec![src, iconst(3)], Lane::I64, 3),
+        (ov::TA_PIVOTHIGH, vec![iconst(2), iconst(2)], Lane::F64, 4),
+        (ov::TA_CUM, vec![src], Lane::F64, 0),
+    ];
+    for (id, ins, lane, len) in rows.iter() {
+        let all = col(&run_feed(*id, ins, &[*lane], *len, &b, &feed, Some(1)), 0);
+        let sub = col(&run_feed(*id, ins, &[*lane], *len, &bk, &fk, None), 0);
+        for (j, &i) in kept.iter().enumerate() {
+            assert!(bits_eq(&[all[i]], &[sub[j]]), "{id:?} bar {i}");
+        }
+    }
+}
+
+/// `ta.vwap(source, anchor[, stdev_mult])` (§4.13.8): `(src, anchor)` per bar from feed columns
+/// 0 and 1, volume from the bar; every output per bar; `ticks` forming-bar re-evaluations.
+fn run_vwap(bands: bool, b: &[(f64, f64, bool)], ticks: u32) -> Vec<Vec<f64>> {
+    let id = if bands {
+        ov::TA_VWAP_FFF
+    } else {
+        ov::TA_VWAP_F
+    };
+    let mut ins = vec![(Lane::F64, Src::Feed(0)), (Lane::I64, Src::Feed(1))];
+    if bands {
+        ins.push(fconst(2.0));
+    }
+    let outs: &[Lane] = if bands { &[Lane::F64; 3] } else { &[Lane::F64] };
+    let calls = [Call {
+        ov: id,
+        inputs: &ins,
+        outputs: outs,
+        site_bytes: OVERLOADS[id.0 as usize].state.block_bytes(0),
+        guard: None,
+    }];
+    let mode = if ticks > 0 {
+        ExecMode::Realtime
+    } else {
+        ExecMode::BarClose
+    };
+    let mut h = Harness::build(&Script {
+        calls: &calls,
+        mode,
+        dialect: Dialect::V6,
+        intent_cap: 0,
+        chart: CHART,
+    });
+    let mut ctx = TestCtx::default();
+    let mut out = Vec::new();
+    for (i, &(src, vol, anchor)) in b.iter().enumerate() {
+        ctx.feed = vec![src, if anchor { 1.0 } else { 0.0 }];
+        let mk = |x: f64, fl: u32| {
+            let mut bb = bar(i as u32, 100.0, fl);
+            bb.volume_1e6 = scale::to_1e6(vol * x).unwrap();
+            bb
+        };
+        for j in 0..ticks {
+            let t = mk(1.5 + j as f64, barflag::REALTIME);
+            assert_eq!(h.step_tick(&t, &mut ctx), StepOutcome::Ok);
+        }
+        let c = mk(1.0, barflag::CONFIRMED);
+        assert_eq!(h.step_bar(&c, &mut ctx), StepOutcome::Ok);
+        out.push((0..outs.len()).map(|j| h.out(0, j)).collect());
+    }
+    out
+}
+
+/// `ta.vwap` resets on the anchor, is na before the first true anchor (the reference's remark),
+/// skips an na source, is na while `Σ volume == 0`, and its bands are `vwap ± mult · sd` with
+/// `sd² = Σ v·p² / Σ v − vwap²`; forming ticks never advance it (I5).
+#[test]
+fn ta_vwap_function_resets_on_the_anchor() {
+    let b: Vec<(f64, f64, bool)> = (0..300)
+        .map(|i| {
+            let src = if i == 40 || i == 41 {
+                f64::NAN
+            } else {
+                100.0 + ((i * 37) % 23) as f64 * 0.25
+            };
+            let vol = if (200..205).contains(&i) {
+                0.0
+            } else {
+                1.0 + (i % 5) as f64
+            };
+            (src, vol, i == 7 || i % 50 == 0 && i > 0 || i == 200)
+        })
+        .collect();
+    let one = col(&run_vwap(false, &b, 0), 0);
+    let three = run_vwap(true, &b, 0);
+    let tk = run_vwap(true, &b, 2);
+    let (mut sv, mut spv, mut sp2v, mut started) = (0.0f64, 0.0f64, 0.0f64, false);
+    for (i, &(p, v, a)) in b.iter().enumerate() {
+        if a {
+            (sv, spv, sp2v, started) = (0.0, 0.0, 0.0, true);
+        }
+        if started && !p.is_nan() {
+            sv += v;
+            spv += v * p;
+            sp2v += v * p * p;
+        }
+        let (m, sd) = if !started || sv == 0.0 {
+            (f64::NAN, f64::NAN)
+        } else {
+            let m = spv / sv;
+            let var = sp2v / sv - m * m;
+            (m, if var > 0.0 { var.sqrt() } else { 0.0 })
+        };
+        assert!(close_eq(one[i], m), "vwap {i}: {} vs {m}", one[i]);
+        assert!(close_eq(three[i][0], m), "vwap3 {i}");
+        assert!(close_eq(three[i][1], m + 2.0 * sd), "upper {i}");
+        assert!(close_eq(three[i][2], m - 2.0 * sd), "lower {i}");
+        assert!(
+            three[i]
+                .iter()
+                .zip(&tk[i])
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "I5 vwap {i}"
+        );
+    }
+    assert!(
+        one[..7].iter().all(|x| x.is_nan()),
+        "na before the first anchor"
+    );
+    assert!(one[200..205].iter().all(|x| x.is_nan()), "Σ volume 0 is na");
+    assert!(!one[205].is_nan());
 }

@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! `ta.*` oscillators, bands, trend (impl-04 §4.13.7): `ta.tr`, `ta.atr`.
+//! `ta.*` oscillators, bands, trend (impl-04 §4.13.7): `ta.tr`, `ta.atr`, `ta.rsi`, `ta.macd`,
+//! `ta.kc`, `ta.kcw`, `ta.supertrend`, `ta.sar`, `ta.cmo`, `ta.mfi`, `ta.tsi`, `ta.dmi`.
 
 use crate::args::out1;
-use crate::naf::fmax;
-use crate::state::{ewma_hold, ewma_step, AtrHdr, Prev};
+use crate::naf::{fdiv, fmax, fmin};
+use crate::state::{
+    ewma_hold, ewma_step, winp_push, winp_repoint, AtrHdr, CmoHdr, DmiHdr, Ewma, MfiHdr, Prev,
+    TsiHdr,
+};
 use crate::sw;
 use pine_ir::{abi, argwin, FaultKind, SiteId};
 use pine_spec::{swr, Sw};
@@ -317,5 +321,330 @@ pub fn bi_ta_supertrend(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result
     };
     f.set_f64_arg(args[2], st);
     crate::args::set_num_out(f, args[3], dir as f64);
+    Ok(())
+}
+
+/// `ta.sar(start, inc, max)` — window `[start, inc, max, out]`: the reference manual's
+/// `pine_sar`, ported literally (`pin:04-sar-literal`). `bar_index` reads as the site's own
+/// execution index and `high[k]`/`low[k]`/`close[1]` as the values at the site's `k`-th previous
+/// execution (the implicit-history reading of `ta.tr`, `pin:04-ta-reference`). Pine's `na`
+/// comparisons are `false` (NaN compares false) and `math.max`/`math.min` propagate `na`
+/// (`naf`); the arithmetic is unfused, as written.
+pub fn bi_ta_sar(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 4 {
+        return Err(FaultKind::Internal);
+    }
+    let (start, inc, max) = (f.f64_arg(args[0]), f.f64_arg(args[1]), f.f64_arg(args[2]));
+    let (h, l, c) = hlc(f);
+    let out = {
+        let s = f.state::<crate::state::SarHdr>(site);
+        let bar_index = s.n;
+        if bar_index == 0 {
+            // Bar 0 of `pine_sar`: every `var` is na, so `result` stays na and no branch fires.
+            s.result = f64::NAN;
+            s.accel = f64::NAN;
+            s.max_min = c; // `close[1]` for the next execution; `maxMin` is na here.
+            s.is_below = 0;
+            s.high1 = h;
+            s.low1 = l;
+            s.n = 1;
+            f64::NAN
+        } else {
+            let (mut result, mut max_min, mut accel) = (s.result, s.max_min, s.accel);
+            let mut is_below = s.is_below != 0;
+            let mut first = false;
+            if bar_index == 1 {
+                let close1 = s.max_min;
+                if c > close1 {
+                    is_below = true;
+                    max_min = h;
+                    result = s.low1;
+                } else {
+                    is_below = false;
+                    max_min = l;
+                    result = s.high1;
+                }
+                first = true;
+                accel = start;
+            }
+            result += accel * (max_min - result);
+            if is_below {
+                if result > l {
+                    first = true;
+                    is_below = false;
+                    result = fmax(h, max_min);
+                    max_min = l;
+                    accel = start;
+                }
+            } else if result < h {
+                first = true;
+                is_below = true;
+                result = fmin(l, max_min);
+                max_min = h;
+                accel = start;
+            }
+            if !first {
+                if is_below {
+                    if h > max_min {
+                        max_min = h;
+                        accel = fmin(accel + inc, max);
+                    }
+                } else if l < max_min {
+                    max_min = l;
+                    accel = fmin(accel + inc, max);
+                }
+            }
+            if is_below {
+                result = fmin(result, s.low1);
+                if bar_index > 1 {
+                    result = fmin(result, s.low2);
+                }
+            } else {
+                result = fmax(result, s.high1);
+                if bar_index > 1 {
+                    result = fmax(result, s.high2);
+                }
+            }
+            s.result = result;
+            s.max_min = max_min;
+            s.accel = accel;
+            s.is_below = is_below as u32;
+            s.high2 = s.high1;
+            s.high1 = h;
+            s.low2 = s.low1;
+            s.low1 = l;
+            s.n = bar_index.saturating_add(1);
+            result
+        }
+    };
+    f.set_f64_arg(args[3], out);
+    Ok(())
+}
+
+const DIV0: [u8; 2] = sw::both(Sw::FloatDivZero);
+
+/// One step of a `MfiHdr` window over `ta.change(src)` with `skip` na: `accept` is false for an
+/// execution the row does not accept (the window is unchanged); otherwise `pair(src, change)`
+/// gives the `(a, b)` it enters. The first accepted execution only sets `prev` — its change is na
+/// and the spec's `W(len + 1)` excludes it (`pin:04-first-change`). Returns `(Σa, Σb)`, `None`
+/// while fewer than `len` pairs were accepted.
+#[inline(always)]
+fn change_pairs(
+    h: &mut MfiHdr,
+    ring: &mut [[f64; 2]],
+    len: u32,
+    src: f64,
+    accept: bool,
+    pair: impl Fn(f64, f64) -> (f64, f64),
+) -> Option<(f64, f64)> {
+    let primed = h.win.len != 0;
+    if !primed {
+        if !accept {
+            return None;
+        }
+        h.prev = src;
+        winp_repoint(&mut h.win, ring, len);
+        return None;
+    }
+    if h.win.len != len {
+        winp_repoint(&mut h.win, ring, len);
+    }
+    if accept {
+        let (a, b) = pair(src, src - h.prev);
+        h.prev = src;
+        winp_push(&mut h.win, ring, a, b);
+    }
+    if h.win.n < len {
+        None
+    } else {
+        Some((h.win.sum, h.win.sum2))
+    }
+}
+
+/// The `[src, len, out]` frame of `ta.cmo`/`ta.mfi`: the window length, or `None` (na length).
+#[inline(always)]
+fn pair_len(f: &Frame<'_>, args: &[u16]) -> Result<Option<i64>, FaultKind> {
+    if args.len() != 3 {
+        return Err(FaultKind::Internal);
+    }
+    Ok(f.i64_arg(args[1]))
+}
+
+/// `ta.cmo(series, length)` — the manual's `f_cmo`: `mom = ta.change(src)`,
+/// `sm1 = math.sum(mom >= 0 ? mom : 0, length)`, `sm2 = math.sum(mom >= 0 ? 0 : −mom, length)`,
+/// `100 × (sm1 − sm2) / (sm1 + sm2)` (÷0 per `Sw::FloatDivZero`). `skip` na.
+pub fn bi_ta_cmo(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    let Some(len) = pair_len(f, args)? else {
+        f.set_f64_arg(args[2], f64::NAN);
+        return Ok(());
+    };
+    let src = f.f64_arg(args[0]);
+    let na0 = sw::pick(DIV0, f.dialect()) == swr::FLOAT_DIV_ZERO_NA;
+    let r = {
+        let (h, ring) = f.state_split::<CmoHdr, [f64; 2]>(site);
+        if len < 1 || len > ring.len() as i64 {
+            return Err(FaultKind::ScriptRefused);
+        }
+        change_pairs(h, ring, len as u32, src, !src.is_nan(), |_, m| {
+            if m >= 0.0 {
+                (m, 0.0)
+            } else {
+                (0.0, -m)
+            }
+        })
+    };
+    let v = r.map_or(f64::NAN, |(s1, s2)| fdiv(100.0 * (s1 - s2), s1 + s2, na0));
+    f.set_f64_arg(args[2], v);
+    Ok(())
+}
+
+/// `ta.mfi(series, length)` — the manual's `pine_mfi`: `upper = Σ volume × (change ≤ 0 ? 0 :
+/// src)`, `lower = Σ volume × (change ≥ 0 ? 0 : src)`, `100 − 100 / (1 + upper / lower)`, each `/`
+/// per `Sw::FloatDivZero`. `skip` na over the `(source, volume)` pair: an execution is accepted
+/// only when both are non-na (`pin:04-volume-pair-skip`).
+pub fn bi_ta_mfi(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    let Some(len) = pair_len(f, args)? else {
+        f.set_f64_arg(args[2], f64::NAN);
+        return Ok(());
+    };
+    let src = f.f64_arg(args[0]);
+    let vol = f.f64_arg(argwin::f64(abi::F_VOLUME));
+    let na0 = sw::pick(DIV0, f.dialect()) == swr::FLOAT_DIV_ZERO_NA;
+    let r = {
+        let (h, ring) = f.state_split::<MfiHdr, [f64; 2]>(site);
+        if len < 1 || len > ring.len() as i64 {
+            return Err(FaultKind::ScriptRefused);
+        }
+        let ok = !src.is_nan() && !vol.is_nan();
+        change_pairs(h, ring, len as u32, src, ok, |x, ch| {
+            (
+                vol * if ch <= 0.0 { 0.0 } else { x },
+                vol * if ch >= 0.0 { 0.0 } else { x },
+            )
+        })
+    };
+    let v = r.map_or(f64::NAN, |(up, lo)| {
+        100.0 - fdiv(100.0, 1.0 + fdiv(up, lo, na0), na0)
+    });
+    f.set_f64_arg(args[2], v);
+    Ok(())
+}
+
+/// `ta.tsi(source, short_length, long_length)` — window `[src, short, long, out]`: with
+/// `m = ta.change(src)`, `ema(ema(m, long), short) / ema(ema(|m|, long), short)` — the long
+/// smoothing first, as TradingView's TSI's `double_smooth`, and no `× 100` (the manual's range is
+/// [−1, 1]) (`pin:04-tsi-order`); seeds per `Sw::EmaSeed`; ÷0 per `Sw::FloatDivZero`. `skip` na:
+/// every smoother holds; the first accepted execution has no change.
+pub fn bi_ta_tsi(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 4 {
+        return Err(FaultKind::Internal);
+    }
+    let src = f.f64_arg(args[0]);
+    let (sl, ll) = (length(f, args[1])?, length(f, args[2])?);
+    let (Some(sl), Some(ll)) = (sl, ll) else {
+        f.set_f64_arg(args[3], f64::NAN);
+        return Ok(());
+    };
+    let d = f.dialect();
+    let sma = sw::pick(EMA_SEED, d) == swr::EMA_SEED_SMA;
+    let na0 = sw::pick(DIV0, d) == swr::FLOAT_DIV_ZERO_NA;
+    let (num, den) = {
+        let s = f.state::<TsiHdr>(site);
+        if !src.is_nan() && s.prev.primed != 0 {
+            let m = src - s.prev.v;
+            let (al, as_) = (2.0 / (ll as f64 + 1.0), 2.0 / (sl as f64 + 1.0));
+            let m1 = ewma_step(&mut s.m1, m, al, ll, sma);
+            if !m1.is_nan() {
+                ewma_step(&mut s.m2, m1, as_, sl, sma);
+            }
+            let a1 = ewma_step(&mut s.a1, m.abs(), al, ll, sma);
+            if !a1.is_nan() {
+                ewma_step(&mut s.a2, a1, as_, sl, sma);
+            }
+        }
+        if !src.is_nan() {
+            s.prev.v = src;
+            s.prev.primed = 1;
+        }
+        (ewma_hold(&s.m2), ewma_hold(&s.a2))
+    };
+    f.set_f64_arg(args[3], fdiv(num, den, na0));
+    Ok(())
+}
+
+/// Feed a non-na `v` to a Wilder smoother (`rma` is `skip`: an na is not fed, the value holds).
+#[inline(always)]
+fn rma_feed(e: &mut Ewma, v: f64, len: u32, sma: bool) -> f64 {
+    if v.is_nan() {
+        ewma_hold(e)
+    } else {
+        ewma_step(e, v, 1.0 / len as f64, len, sma)
+    }
+}
+
+/// `ta.dmi(diLength, adxSmoothing) -> (+DI, −DI, ADX)` — window `[diLen, adxLen, +di, −di,
+/// adx]`, the §4.13.7 row literally: `up = high − high[1]`, `down = low[1] − low`;
+/// `+DM = up > down && up > 0 ? up : 0`, `−DM = down > up && down > 0 ? down : 0`; `TR` = the
+/// `ta.tr` variable; each smoothed by `rma(·, diLen)` (seed per `Sw::RmaSeed`);
+/// `±DI = 100 × rma(±DM) / rma(TR)`; `DX = 100 × |+DI − −DI| / (+DI + −DI)`;
+/// `ADX = rma(DX, adxLen)`; each `/` per `Sw::FloatDivZero`. History is the site's previous
+/// execution; an na term is not fed to its `rma` (the inner rows' own rule, `pin:04-ta-composed`).
+pub fn bi_ta_dmi(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 5 {
+        return Err(FaultKind::Internal);
+    }
+    let (dl, al) = (length(f, args[0])?, length(f, args[1])?);
+    let (Some(dl), Some(al)) = (dl, al) else {
+        let mut k = 2usize;
+        while k < 5 {
+            f.set_f64_arg(args[k], f64::NAN);
+            k += 1;
+        }
+        return Ok(());
+    };
+    let d = f.dialect();
+    let sma = sw::pick(RMA_SEED, d) == swr::RMA_SEED_SMA;
+    let na0 = sw::pick(DIV0, d) == swr::FLOAT_DIV_ZERO_NA;
+    let (h, l, c) = hlc(f);
+    let (pdi, mdi, adx) = {
+        let s = f.state::<DmiHdr>(site);
+        let (tr, pdm, mdm) = if s.primed != 0 {
+            let up = h - s.h1;
+            let down = s.l1 - l;
+            let pdm = if up.is_nan() || down.is_nan() {
+                f64::NAN
+            } else if up > down && up > 0.0 {
+                up
+            } else {
+                0.0
+            };
+            let mdm = if up.is_nan() || down.is_nan() {
+                f64::NAN
+            } else if down > up && down > 0.0 {
+                down
+            } else {
+                0.0
+            };
+            let tr = fmax(fmax(h - l, (h - s.c1).abs()), (l - s.c1).abs());
+            (tr, pdm, mdm)
+        } else {
+            (f64::NAN, f64::NAN, f64::NAN)
+        };
+        s.h1 = h;
+        s.l1 = l;
+        s.c1 = c;
+        s.primed = 1;
+        let t = rma_feed(&mut s.tr, tr, dl, sma);
+        let p = rma_feed(&mut s.p, pdm, dl, sma);
+        let m = rma_feed(&mut s.m, mdm, dl, sma);
+        let pdi = fdiv(100.0 * p, t, na0);
+        let mdi = fdiv(100.0 * m, t, na0);
+        let dx = fdiv(100.0 * (pdi - mdi).abs(), pdi + mdi, na0);
+        let adx = rma_feed(&mut s.adx, dx, al, sma);
+        (pdi, mdi, adx)
+    };
+    f.set_f64_arg(args[2], pdi);
+    f.set_f64_arg(args[3], mdi);
+    f.set_f64_arg(args[4], adx);
     Ok(())
 }

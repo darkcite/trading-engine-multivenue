@@ -230,3 +230,299 @@ fn color_rows_pack_and_unpack() {
     assert_eq!(g(-3.0), lo);
     assert_eq!(g(30.0), hi);
 }
+
+// ---- T11: the zero-copy str.* family ------------------------------------------------------
+
+fn st(x: &'static str) -> (Lane, Src) {
+    (Lane::I64, Src::Str(x))
+}
+
+fn it(x: i64) -> (Lane, Src) {
+    (Lane::I64, Src::Const(x as u64))
+}
+
+const NA_S: (Lane, Src) = (Lane::I64, Src::Na);
+
+/// One evaluation of `rows` (each one i64-lane output; `Src::Out` chains them); every output.
+fn str_rows(rows: &[(OverloadId, Vec<(Lane, Src)>)]) -> Vec<f64> {
+    let outs = [Lane::I64];
+    let calls: Vec<Call> = rows
+        .iter()
+        .map(|(id, ins)| Call {
+            ov: *id,
+            inputs: ins,
+            outputs: &outs,
+            site_bytes: 0,
+            guard: None,
+        })
+        .collect();
+    let mut h = Harness::build(&Script {
+        calls: &calls,
+        mode: ExecMode::BarClose,
+        dialect: Dialect::V6,
+        intent_cap: 0,
+        chart: CHART,
+    });
+    let o = h.step_bar(&bar(0, 1.0, barflag::CONFIRMED), &mut TestCtx::default());
+    assert_eq!(o, StepOutcome::Ok);
+    (0..rows.len()).map(|k| h.out(k, 0)).collect()
+}
+
+/// A CONST `StrRef` read back through the f64 plot lane (exact: region 0, offset < 2^21):
+/// `(offset, length)`.
+fn konst(v: f64) -> (u64, u64) {
+    let r = v as u64;
+    assert!(
+        (0.0..9.0e15).contains(&v) && r >> 62 == 0,
+        "not a CONST ref: {v}"
+    );
+    (r >> 32, r & 0xFFFF_FFFF)
+}
+
+#[test]
+fn str_substring_indexes_characters() {
+    let s = "h\u{e9}llo w\u{f6}rld"; // 11 characters, 13 bytes
+    let rows = vec![
+        (ov::STR_SUBSTRING, vec![st(s), it(1), it(4)]), // 0: "éll"
+        (
+            ov::OP_EQ_STR,
+            vec![(Lane::I64, Src::Out(0, 0)), st("\u{e9}ll")],
+        ),
+        (ov::STR_LENGTH, vec![(Lane::I64, Src::Out(0, 0))]),
+        (ov::STR_SUBSTRING, vec![st(s), it(-3), it(100)]), // 3: clamped → s
+        (ov::OP_EQ_STR, vec![(Lane::I64, Src::Out(3, 0)), st(s)]),
+        (ov::STR_SUBSTRING, vec![st(s), it(5), it(2)]), // 5: begin > end → ""
+        (ov::STR_LENGTH, vec![(Lane::I64, Src::Out(5, 0))]),
+        (ov::STR_POS, vec![st(s), st("w\u{f6}")]),
+        (ov::STR_POS, vec![st(s), st("zz")]),
+        (ov::STR_SUBSTRING, vec![st(s), (Lane::I64, Src::Na), it(2)]),
+        (ov::STR_LENGTH, vec![st(s)]),
+        (ov::STR_LENGTH, vec![NA_S]),
+        (ov::STR_POS, vec![st(s), st("")]),
+    ];
+    let g = str_rows(&rows);
+    assert_eq!((g[1], g[2]), (1.0, 3.0));
+    assert_eq!(g[4], 1.0);
+    assert_eq!(g[6], 0.0);
+    assert_eq!(g[7], 6.0, "a character index, not the byte index 7");
+    assert!(g[8].is_nan() && g[9].is_nan());
+    assert_eq!(g[10], 11.0);
+    assert!(g[11].is_nan());
+    assert_eq!(g[12], 0.0);
+}
+
+#[test]
+fn str_views_share_the_source_region() {
+    let s = "h\u{e9}llo w\u{f6}rld";
+    let rows = vec![
+        (ov::STR_TOSTRING_S, vec![st(s)]),
+        (ov::STR_SUBSTRING, vec![st(s), it(1), it(4)]),
+        (ov::STR_TOSTRING_S, vec![st("  ab \t")]),
+        (ov::STR_TRIM, vec![st("  ab \t")]),
+        (ov::STR_TRIM, vec![st("   ")]),
+        (ov::STR_TRIM, vec![NA_S]),
+    ];
+    let g = str_rows(&rows);
+    let (o0, l0) = konst(g[0]);
+    assert_eq!(l0, 13);
+    assert_eq!(
+        konst(g[1]),
+        (o0 + 1, 4),
+        "substring is a view at the char's byte offset"
+    );
+    let (o2, l2) = konst(g[2]);
+    assert_eq!(l2, 6);
+    assert_eq!(konst(g[3]), (o2 + 2, 2), "trim is a view");
+    assert_eq!(konst(g[4]).1, 0);
+    assert!(g[5].is_nan());
+    // Searches and comparisons: na → false; byte equality.
+    let rows = vec![
+        (ov::STR_CONTAINS, vec![st(s), st("o w")]),
+        (ov::STR_CONTAINS, vec![st(s), st("ow")]),
+        (ov::STR_STARTSWITH, vec![st(s), st("h\u{e9}")]),
+        (ov::STR_ENDSWITH, vec![st(s), st("rld")]),
+        (ov::STR_ENDSWITH, vec![st(s), st("rl")]),
+        (ov::STR_CONTAINS, vec![NA_S, st("")]),
+        (ov::OP_EQ_STR, vec![NA_S, NA_S]),
+        (ov::OP_NE_STR, vec![NA_S, st("a")]),
+        (ov::OP_NE_STR, vec![st("a"), st("b")]),
+        (ov::OP_EQ_STR, vec![st("ab"), st("ab")]),
+    ];
+    assert_eq!(
+        str_rows(&rows),
+        vec![1., 0., 1., 1., 0., 0., 0., 0., 1., 1.]
+    );
+}
+
+/// `str.tonumber`: the §4.13.2 grammar, else na.
+#[test]
+fn str_tonumber_grammar() {
+    let ok: [(&'static str, f64); 8] = [
+        ("12", 12.0),
+        ("  -3.25 ", -3.25),
+        ("+.5", 0.5),
+        ("7.", 7.0),
+        ("1e3", 1000.0),
+        ("2.5E-2", 0.025),
+        ("0.1", 0.1),
+        ("-0", -0.0),
+    ];
+    let bad = [
+        "", " ", "abc", "1.2.3", "inf", "NaN", "0x10", "1e", "--1", ".", "1 2",
+    ];
+    let mut rows: Vec<(OverloadId, Vec<(Lane, Src)>)> = Vec::new();
+    for (t, _) in ok {
+        rows.push((ov::STR_TONUMBER, vec![st(t)]));
+    }
+    for t in bad {
+        rows.push((ov::STR_TONUMBER, vec![st(t)]));
+    }
+    rows.push((ov::STR_TONUMBER, vec![NA_S]));
+    // The output lane is f64: rebuild with an f64 output.
+    let outs = [Lane::F64];
+    let calls: Vec<Call> = rows
+        .iter()
+        .map(|(id, ins)| Call {
+            ov: *id,
+            inputs: ins,
+            outputs: &outs,
+            site_bytes: 0,
+            guard: None,
+        })
+        .collect();
+    let mut h = Harness::build(&Script {
+        calls: &calls,
+        mode: ExecMode::BarClose,
+        dialect: Dialect::V6,
+        intent_cap: 0,
+        chart: CHART,
+    });
+    let o = h.step_bar(&bar(0, 1.0, barflag::CONFIRMED), &mut TestCtx::default());
+    assert_eq!(o, StepOutcome::Ok);
+    for (k, (t, w)) in ok.iter().enumerate() {
+        assert_eq!(h.out(k, 0).to_bits(), w.to_bits(), "{t:?}");
+    }
+    for k in ok.len()..rows.len() {
+        assert!(h.out(k, 0).is_nan(), "row {k}");
+    }
+}
+
+/// `rows` over bars whose feed column 0 is `feed[i]`; every row's i64 output per bar. A fault
+/// stops the run and is returned.
+fn str_bars(
+    rows: &[(OverloadId, Vec<(Lane, Src)>)],
+    feed: &[f64],
+    d: Dialect,
+) -> Result<Vec<Vec<f64>>, FaultKind> {
+    let outs = [Lane::I64];
+    let calls: Vec<Call> = rows
+        .iter()
+        .map(|(id, ins)| Call {
+            ov: *id,
+            inputs: ins,
+            outputs: &outs,
+            site_bytes: pine_spec::OVERLOADS[id.0 as usize].state.block_bytes(0),
+            guard: None,
+        })
+        .collect();
+    let mut h = Harness::build(&Script {
+        calls: &calls,
+        mode: ExecMode::BarClose,
+        dialect: d,
+        intent_cap: 0,
+        chart: CHART,
+    });
+    let mut ctx = TestCtx::default();
+    let mut out = Vec::new();
+    for (i, &x) in feed.iter().enumerate() {
+        ctx.feed = vec![x];
+        if h.step_bar(&bar(i as u32, 1.0, barflag::CONFIRMED), &mut ctx) != StepOutcome::Ok {
+            return Err(h.last_fault().unwrap().0);
+        }
+        out.push((0..rows.len()).map(|k| h.out(k, 0)).collect());
+    }
+    Ok(out)
+}
+
+/// One site's `RegexCache` follows a `series` pattern: a changed pattern recompiles in place, a
+/// repeated one reuses the cache; the match is a view of the source; a run-time pattern outside
+/// the subset is `ScriptRefused`.
+#[test]
+fn str_match_caches_and_recompiles() {
+    let feed_i = (Lane::I64, Src::Feed(0));
+    let rows = vec![
+        // 0: the pattern, "x[0-9]+" (feed 0) or "[0-9]+" (feed 1).
+        (ov::STR_SUBSTRING, vec![st("x[0-9]+"), feed_i, it(7)]),
+        // 1: the match in "ax123b".
+        (
+            ov::STR_MATCH,
+            vec![st("ax123b"), (Lane::I64, Src::Out(0, 0))],
+        ),
+        (ov::STR_LENGTH, vec![(Lane::I64, Src::Out(1, 0))]),
+        (ov::OP_EQ_STR, vec![(Lane::I64, Src::Out(1, 0)), st("x123")]),
+        (ov::STR_TOSTRING_S, vec![st("ax123b")]),
+    ];
+    let feed = [0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0];
+    let g = str_bars(&rows, &feed, Dialect::V6).unwrap();
+    for (i, &x) in feed.iter().enumerate() {
+        let x = x as i64;
+        assert_eq!(g[i][2], (4 - x) as f64, "bar {i}: match length");
+        assert_eq!(g[i][3], (x == 0) as u8 as f64, "bar {i}: match text");
+        let (src, m) = (konst(g[i][4]), konst(g[i][1]));
+        assert_eq!(m, (src.0 + 1 + x as u64, (4 - x) as u64), "bar {i}: a view");
+    }
+    // A run-time pattern outside the subset ("x[0-9]" cut to "x[0-") is refused.
+    let rows = vec![
+        (ov::STR_SUBSTRING, vec![st("x[0-9]+"), it(0), feed_i]),
+        (ov::STR_MATCH, vec![st("ax1"), (Lane::I64, Src::Out(0, 0))]),
+    ];
+    assert_eq!(
+        str_bars(&rows, &[7.0, 4.0], Dialect::V6).unwrap_err(),
+        FaultKind::ScriptRefused
+    );
+}
+
+/// No match → `""` in both dialects (U07's default reading, `pin:U07-str-match-none`); na
+/// source or pattern → na.
+#[test]
+fn str_match_none_switch() {
+    let rows = vec![
+        (ov::STR_MATCH, vec![st("abc"), st("\\d+")]),
+        (ov::STR_LENGTH, vec![(Lane::I64, Src::Out(0, 0))]),
+        (ov::STR_MATCH, vec![NA_S, st("a")]),
+        (ov::STR_MATCH, vec![st("abc"), NA_S]),
+        (ov::STR_MATCH, vec![st("abc"), st("^b")]),
+        (ov::STR_LENGTH, vec![(Lane::I64, Src::Out(4, 0))]),
+    ];
+    for d in [Dialect::V5, Dialect::V6] {
+        let empty =
+            pine_spec::sw(pine_spec::Sw::StrMatchNone, d) == pine_spec::swr::STR_MATCH_NONE_EMPTY;
+        let g = &str_bars(&rows, &[0.0], d).unwrap()[0];
+        if empty {
+            assert_eq!((g[1], g[5]), (0.0, 0.0), "{d:?}: \"\"");
+        } else {
+            assert!(g[0].is_nan() && g[4].is_nan(), "{d:?}: na");
+        }
+        assert!(g[2].is_nan() && g[3].is_nan());
+    }
+}
+
+/// `$op.add_str`: one scratch string; na operand → na.
+#[test]
+fn add_str_concatenates_and_propagates_na() {
+    let rows = vec![
+        (ov::OP_ADD_STR, vec![st("h\u{e9}l"), st("lo")]),
+        (
+            ov::OP_EQ_STR,
+            vec![(Lane::I64, Src::Out(0, 0)), st("h\u{e9}llo")],
+        ),
+        (ov::STR_LENGTH, vec![(Lane::I64, Src::Out(0, 0))]),
+        (ov::OP_ADD_STR, vec![NA_S, st("x")]),
+        (ov::OP_ADD_STR, vec![st(""), st("")]),
+        (ov::STR_LENGTH, vec![(Lane::I64, Src::Out(4, 0))]),
+    ];
+    let g = &str_bars(&rows, &[0.0, 0.0], Dialect::V6).unwrap()[1];
+    assert_eq!((g[1], g[2]), (1.0, 5.0));
+    assert!(g[3].is_nan());
+    assert_eq!(g[5], 0.0);
+}

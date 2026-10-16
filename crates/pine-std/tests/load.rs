@@ -237,6 +237,26 @@ fn regex_find(p: &str, s: &str) -> Option<(usize, usize)> {
     regex_compile(p.as_bytes()).unwrap().find(s.as_bytes())
 }
 
+/// A reused slot (`regex_compile_into`, the run-time `RegexCache` path) answers exactly as a
+/// fresh `regex_compile`, whatever the slot held before.
+#[test]
+fn regex_compile_into_reuses_a_slot() {
+    let mut slot = RegexProg::EMPTY;
+    let cases: [(&str, &str); 6] = [
+        ("[^0-9]+(ab)*\\d{2,5}", "xyabab123456"),
+        ("a", "bab"),
+        ("^ab$", "ab"),
+        (".", "\u{e9}x"),
+        ("(a|)b", "zb"),
+        ("x{3}", "xx"),
+    ];
+    for (p, s) in cases {
+        regex_compile_into(p.as_bytes(), &mut slot).unwrap();
+        assert_eq!(slot.find(s.as_bytes()), regex_find(p, s), "{p} on {s}");
+    }
+    assert!(regex_compile_into(b"(a", &mut slot).is_err());
+}
+
 #[test]
 fn regex_subset_accepts_and_refuses() {
     for p in [
@@ -319,6 +339,31 @@ fn regex_matches_reference_table() {
     for (p, s, want) in t {
         assert_eq!(regex_find(p, s), want, "{p} on {s:?}");
     }
+}
+
+/// `pin:04-regex-negclass`: `[^…]`, `\D \W \S` step one UTF-8 code point, like `.`; a negated
+/// class listing a non-ASCII byte is refused.
+#[test]
+fn regex_negated_classes_are_code_point_wide() {
+    let t: [(&str, &str, Option<(usize, usize)>); 10] = [
+        ("[^a]", "\u{e9}", Some((0, 2))),
+        ("^[^a]$", "\u{20ac}", Some((0, 3))),
+        ("^[^0-9]{2}$", "\u{1f600}\u{e9}", Some((0, 6))),
+        ("\\D+", "1\u{e9}2", Some((1, 3))),
+        ("\\W", "a\u{e9}", Some((1, 3))),
+        ("\\S\\S", "\u{1f600}x", Some((0, 5))),
+        ("^\\D$", "\u{1f600}", Some((0, 4))),
+        ("[^a]", "\n", Some((0, 1))),
+        ("[^a]+", "aabca", Some((2, 4))),
+        ("\\d\\D\\d", "1\u{20ac}2", Some((0, 5))),
+    ];
+    for (p, s, want) in t {
+        assert_eq!(regex_find(p, s), want, "{p} on {s:?}");
+    }
+    let e = regex_compile("[^\u{e9}]".as_bytes())
+        .err()
+        .expect("refused");
+    assert_eq!(e.code, code::REGEX_UNSUPPORTED);
 }
 
 proptest::proptest! {

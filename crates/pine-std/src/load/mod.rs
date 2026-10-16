@@ -16,7 +16,7 @@ mod tz_table;
 
 pub use fmt::{fmt_compile, FmtProg, FMT_MAX_SEGMENTS};
 pub use input::{resolve_input, InputResolved};
-pub use regex::{regex_compile, RegexProg, REGEX_MAX_STATES};
+pub use regex::{regex_compile, regex_compile_into, RegexProg, REGEX_MAX_STATES};
 pub use session::{session_parse, SessionRange, SessionSpec};
 pub use tf::{tf_on_bar_clock, tf_parts, tf_seconds, tf_string, TfParts, TfUnit, MONTH_SORT_S};
 pub use tz::{tz_lookup, tz_offset_s, TzId, TZ_UTC};

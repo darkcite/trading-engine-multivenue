@@ -15,22 +15,26 @@
 #![deny(unused_must_use)]
 
 mod args;
+mod capture;
 mod load;
 mod math;
 mod naf;
 mod state;
+mod strategy;
+mod strs;
 mod sw;
 mod ta;
 mod table;
+mod time;
 
 pub mod scope;
 #[cfg(feature = "testing")]
 pub mod testing;
 
 pub use load::{
-    code, fmt_compile, regex_compile, resolve_input, session_parse, tf_on_bar_clock, tf_parts,
-    tf_seconds, tf_string, tz_lookup, tz_offset_s, FmtProg, InputResolved, LoadErr, RegexProg,
-    SessionRange, SessionSpec, TfParts, TfUnit, TzId, FMT_MAX_SEGMENTS, MONTH_SORT_S,
-    REGEX_MAX_STATES, TZ_UTC,
+    code, fmt_compile, regex_compile, regex_compile_into, resolve_input, session_parse,
+    tf_on_bar_clock, tf_parts, tf_seconds, tf_string, tz_lookup, tz_offset_s, FmtProg,
+    InputResolved, LoadErr, RegexProg, SessionRange, SessionSpec, TfParts, TfUnit, TzId,
+    FMT_MAX_SEGMENTS, MONTH_SORT_S, REGEX_MAX_STATES, TZ_UTC,
 };
 pub use table::{served, Served, BUILTINS};

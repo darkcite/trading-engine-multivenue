@@ -407,3 +407,340 @@ pub struct StHdr {
 const _: () = assert!(core::mem::size_of::<StHdr>() == 72 && core::mem::align_of::<StHdr>() == 8);
 // SAFETY: repr(C) POD; all-zero is `primed == 0` with zeroed (= `nz`) bands: never executed.
 unsafe impl StateBlock for StHdr {}
+
+/// `ta.sar`'s block (the reference manual's `pine_sar`, `pin:04-sar-literal`): its three `var`
+/// floats, the site's previous two highs and lows, its execution count and `isBelow`.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct SarHdr {
+    /// `var float result`.
+    pub result: f64,
+    /// `var float maxMin`; between the first and second executions it holds the first close
+    /// (`close[1]` for the `bar_index == 1` branch — `maxMin` is `na` there and reassigned before
+    /// any read).
+    pub max_min: f64,
+    /// `var float acceleration`.
+    pub accel: f64,
+    /// `high[1]` (the site's previous execution).
+    pub high1: f64,
+    /// `high[2]`.
+    pub high2: f64,
+    /// `low[1]`.
+    pub low1: f64,
+    /// `low[2]`.
+    pub low2: f64,
+    /// Executions so far (saturating): the literal `bar_index` of the next execution.
+    pub n: u32,
+    /// `var bool isBelow` (0 = false).
+    pub is_below: u32,
+}
+const _: () = assert!(core::mem::size_of::<SarHdr>() == 64 && core::mem::align_of::<SarHdr>() == 8);
+// SAFETY: repr(C) POD; all-zero is `n == 0` (never executed) with `isBelow == false`; every other
+// field is written by the first two executions before it is read.
+unsafe impl StateBlock for SarHdr {}
+
+/// `ta.hma`'s block: one `WinHdr` per ring — `wma(src, len/2)`, `wma(src, len)`, and the outer
+/// `wma(diff, ⌊√len⌋)` — over the three thirds of the tail.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct HmaHdr {
+    /// The three windows: half, full, outer.
+    pub w: [WinHdr; 3],
+}
+const _: () =
+    assert!(core::mem::size_of::<HmaHdr>() == 120 && core::mem::align_of::<HmaHdr>() == 8);
+// SAFETY: repr(C) array of cold-at-zero `WinHdr`s; all-zero is every `len == 0`: never executed.
+unsafe impl StateBlock for HmaHdr {}
+
+/// A window over `(src, vol)` pairs (operator ruling A5, `ta.vwma`): `win.sum = Σ src·vol`,
+/// `sum_v = Σ vol`, `win.sum2` stays 0; `pos/n/len/na_in/recompute` keep `WinHdr`'s meaning.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct Win2Hdr {
+    /// The window bookkeeping; `sum` is `Σ src·vol`.
+    pub win: WinHdr,
+    /// `Σ vol`.
+    pub sum_v: f64,
+}
+const _: () =
+    assert!(core::mem::size_of::<Win2Hdr>() == 48 && core::mem::align_of::<Win2Hdr>() == 8);
+// SAFETY: repr(C) POD; all-zero is `win.len == 0`: never executed.
+unsafe impl StateBlock for Win2Hdr {}
+
+/// `ta.alma`'s block (operator ruling A5): the window, and the weight-cache key `m`, `s` (the
+/// manual's own, with `win.len`) and `norm = Σ weights`; the tail is `[ring | weights]`.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct AlmaHdr {
+    /// The window bookkeeping.
+    pub win: WinHdr,
+    /// `m = offset × (length − 1)` (floored when `floor`).
+    pub m: f64,
+    /// `s = length / sigma`.
+    pub s: f64,
+    /// `Σ weights`.
+    pub norm: f64,
+}
+const _: () =
+    assert!(core::mem::size_of::<AlmaHdr>() == 64 && core::mem::align_of::<AlmaHdr>() == 8);
+// SAFETY: repr(C) POD; all-zero is `win.len == 0`: never executed (the weights rebuild first).
+unsafe impl StateBlock for AlmaHdr {}
+
+#[inline(always)]
+fn at2(ring: &[[f64; 2]], i: u32) -> [f64; 2] {
+    debug_assert!((i as usize) < ring.len());
+    // SAFETY: every caller passes an index produced by `back`, which is `< ring.len()`.
+    unsafe { *ring.get_unchecked(i as usize) }
+}
+
+/// `win_repoint` over pairs: recompute `Σ src·vol`, `Σ vol` exactly over the newest `len` pairs
+/// and make `len` the window. `1 ≤ len ≤ ring.len()`; pairs are never na (`skip`).
+pub fn win2_repoint(h: &mut Win2Hdr, ring: &[[f64; 2]], len: u32) {
+    let cap = ring.len() as u32;
+    debug_assert!(len >= 1 && len <= cap);
+    h.win.len = len;
+    let have = if h.win.n < len { h.win.n } else { len };
+    let (mut s, mut sv) = (0.0f64, 0.0f64);
+    let mut k = 0u32;
+    while k < have {
+        let p = at2(ring, back(&h.win, cap, k));
+        s = p[0].mul_add(p[1], s);
+        sv += p[1];
+        k += 1;
+    }
+    h.win.sum = s;
+    h.win.sum2 = 0.0;
+    h.sum_v = sv;
+    h.win.na_in = 0;
+    h.win.recompute = WIN_RECOMPUTE;
+}
+
+/// `win_push` over pairs: accept the non-na pair `(src, vol)`.
+pub fn win2_push(h: &mut Win2Hdr, ring: &mut [[f64; 2]], src: f64, vol: f64) {
+    let cap = ring.len() as u32;
+    debug_assert!(h.win.len >= 1 && h.win.len <= cap);
+    debug_assert!(!src.is_nan() && !vol.is_nan());
+    if h.win.n >= h.win.len {
+        let old = at2(ring, back(&h.win, cap, h.win.len - 1));
+        h.win.sum -= old[0] * old[1];
+        h.sum_v -= old[1];
+    }
+    h.win.sum = src.mul_add(vol, h.win.sum);
+    h.sum_v += vol;
+    debug_assert!(h.win.pos < cap);
+    // SAFETY: `pos < cap` holds: it starts at 0 and wraps by compare below.
+    unsafe { *ring.get_unchecked_mut(h.win.pos as usize) = [src, vol] };
+    h.win.pos = if h.win.pos + 1 == cap {
+        0
+    } else {
+        h.win.pos + 1
+    };
+    h.win.n = h.win.n.saturating_add(1);
+    if h.win.recompute == 0 {
+        let l = h.win.len;
+        win2_repoint(h, ring, l);
+    } else {
+        h.win.recompute -= 1;
+    }
+}
+
+/// Two monotonic deques over the two halves of the tail (`ta.stoch`, `ta.wpr`): `highest(high)`
+/// and `lowest(low)`.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct Mono2Hdr {
+    /// The max deque (first half).
+    pub hi: MonoHdr,
+    /// The min deque (second half).
+    pub lo: MonoHdr,
+}
+const _: () =
+    assert!(core::mem::size_of::<Mono2Hdr>() == 32 && core::mem::align_of::<Mono2Hdr>() == 4);
+// SAFETY: repr(C) of two cold-at-zero `MonoHdr`s; all-zero is both `n == 0`.
+unsafe impl StateBlock for Mono2Hdr {}
+
+/// `ta.mfi`'s and `ta.cmo`'s block: a window of `(a, b)` pairs over `ta.change(src)` —
+/// `win.sum = Σa`, `win.sum2 = Σb` (not a sum of squares here) — and the previous accepted
+/// source. Cold is `win.len == 0`; the execution that leaves it sets `prev`.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct MfiHdr {
+    /// The pair window.
+    pub win: WinHdr,
+    /// The previous accepted source (`src[1]` of `ta.change`).
+    pub prev: f64,
+}
+const _: () = assert!(core::mem::size_of::<MfiHdr>() == 48 && core::mem::align_of::<MfiHdr>() == 8);
+// SAFETY: repr(C) POD; all-zero is `win.len == 0`: never executed (`prev` is set before a read).
+unsafe impl StateBlock for MfiHdr {}
+
+/// `ta.cmo`'s block: the same layout as [`MfiHdr`] (Σ gains, Σ losses, previous source).
+pub type CmoHdr = MfiHdr;
+
+/// `win_repoint` over `(a, b)` pairs into `sum = Σa`, `sum2 = Σb`; pairs are never na.
+pub fn winp_repoint(h: &mut WinHdr, ring: &[[f64; 2]], len: u32) {
+    let cap = ring.len() as u32;
+    debug_assert!(len >= 1 && len <= cap);
+    h.len = len;
+    let have = if h.n < len { h.n } else { len };
+    let (mut a, mut b) = (0.0f64, 0.0f64);
+    let mut k = 0u32;
+    while k < have {
+        let p = at2(ring, back(h, cap, k));
+        a += p[0];
+        b += p[1];
+        k += 1;
+    }
+    h.sum = a;
+    h.sum2 = b;
+    h.na_in = 0;
+    h.recompute = WIN_RECOMPUTE;
+}
+
+/// `win_push` over `(a, b)` pairs into `sum = Σa`, `sum2 = Σb`; accept the non-na pair.
+pub fn winp_push(h: &mut WinHdr, ring: &mut [[f64; 2]], a: f64, b: f64) {
+    let cap = ring.len() as u32;
+    debug_assert!(h.len >= 1 && h.len <= cap);
+    debug_assert!(!a.is_nan() && !b.is_nan());
+    if h.n >= h.len {
+        let old = at2(ring, back(h, cap, h.len - 1));
+        h.sum -= old[0];
+        h.sum2 -= old[1];
+    }
+    h.sum += a;
+    h.sum2 += b;
+    debug_assert!(h.pos < cap);
+    // SAFETY: `pos < cap` holds: it starts at 0 and wraps by compare below.
+    unsafe { *ring.get_unchecked_mut(h.pos as usize) = [a, b] };
+    h.pos = if h.pos + 1 == cap { 0 } else { h.pos + 1 };
+    h.n = h.n.saturating_add(1);
+    if h.recompute == 0 {
+        let l = h.len;
+        winp_repoint(h, ring, l);
+    } else {
+        h.recompute -= 1;
+    }
+}
+
+/// `ta.tsi`'s block: the previous source and the four EMAs — `ema(m, long)`, `ema(·, short)` of
+/// it, and the same pair over `|m|`.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct TsiHdr {
+    /// `ta.change`'s previous source.
+    pub prev: Prev,
+    /// `ema(m, long)`.
+    pub m1: Ewma,
+    /// `ema(ema(m, long), short)`.
+    pub m2: Ewma,
+    /// `ema(|m|, long)`.
+    pub a1: Ewma,
+    /// `ema(ema(|m|, long), short)`.
+    pub a2: Ewma,
+}
+const _: () =
+    assert!(core::mem::size_of::<TsiHdr>() == 112 && core::mem::align_of::<TsiHdr>() == 8);
+// SAFETY: repr(C) of cold-at-zero blocks; all-zero is every part cold.
+unsafe impl StateBlock for TsiHdr {}
+
+/// `ta.dmi`'s block: the previous high/low/close and Wilder's four smoothers.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct DmiHdr {
+    /// `high` at the site's previous execution.
+    pub h1: f64,
+    /// `low` at the previous execution.
+    pub l1: f64,
+    /// `close` at the previous execution.
+    pub c1: f64,
+    /// 0 = never executed.
+    pub primed: u32,
+    /// Always zero.
+    pub _pad: u32,
+    /// `rma(tr, diLen)`.
+    pub tr: Ewma,
+    /// `rma(+DM, diLen)`.
+    pub p: Ewma,
+    /// `rma(−DM, diLen)`.
+    pub m: Ewma,
+    /// `rma(DX, adxLen)`.
+    pub adx: Ewma,
+}
+const _: () =
+    assert!(core::mem::size_of::<DmiHdr>() == 128 && core::mem::align_of::<DmiHdr>() == 8);
+// SAFETY: repr(C) POD of cold-at-zero parts; all-zero is `primed == 0` and every smoother cold.
+unsafe impl StateBlock for DmiHdr {}
+
+/// `ta.cum`'s running total.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct Cum {
+    /// The total.
+    pub acc: f64,
+    /// Executions so far (saturating); 0 = never executed.
+    pub n: u32,
+    /// Always zero.
+    pub _pad: u32,
+}
+const _: () = assert!(core::mem::size_of::<Cum>() == 16 && core::mem::align_of::<Cum>() == 8);
+// SAFETY: repr(C) POD; all-zero is `n == 0` with a zero total: never executed.
+unsafe impl StateBlock for Cum {}
+
+/// The value pushed `k` pushes before the newest, without pushing; `None` while fewer than
+/// `k + 1` values were pushed. `k < ring.len()` (checked by the caller).
+#[inline]
+pub fn seq_peek<T: Copy>(h: &Seq, ring: &[T], k: u32) -> Option<T> {
+    let cap = ring.len() as u32;
+    debug_assert!(k < cap && h.pos < cap);
+    if h.n <= k {
+        return None;
+    }
+    let newest = if h.pos == 0 { cap - 1 } else { h.pos - 1 };
+    let at = if newest >= k {
+        newest - k
+    } else {
+        cap - (k - newest)
+    };
+    debug_assert!(at < cap);
+    // SAFETY: `at < cap` by construction from `pos < cap` and `k < cap`.
+    Some(unsafe { *ring.get_unchecked(at as usize) })
+}
+
+/// `ta.vwap(source, anchor[, stdev_mult])`'s block (§4.13.8): the anchored sums.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VwapHdr {
+    /// Σ volume since the last anchor.
+    pub sv: f64,
+    /// Σ volume · source.
+    pub spv: f64,
+    /// Σ volume · source² (the bands).
+    pub sp2v: f64,
+    /// 0 = the anchor was never true (the output is na until it is).
+    pub started: u32,
+    /// Always zero.
+    pub _pad: u32,
+    /// Always zero.
+    pub _rsv: [u64; 4],
+}
+const _: () =
+    assert!(core::mem::size_of::<VwapHdr>() == 64 && core::mem::align_of::<VwapHdr>() == 8);
+// SAFETY: repr(C) POD; all-zero is `started == 0` with zero sums: the anchor never seen.
+unsafe impl StateBlock for VwapHdr {}
+
+/// `str.match`'s block (§3.6, §4.13.4): the compiled pattern and the FNV-1a of its bytes.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct RegexCache {
+    /// FNV-1a 64 of the pattern bytes (0 is remapped to 1); 0 = nothing compiled.
+    pub key: u64,
+    /// Always zero.
+    pub _pad: u64,
+    /// The compiled program.
+    pub prog: crate::load::RegexProg,
+}
+const _: () =
+    assert!(core::mem::size_of::<RegexCache>() == 2584 && core::mem::align_of::<RegexCache>() == 8);
+// SAFETY: repr(C) POD (`RegexProg` is repr(C) + Copy of integers); all-zero is `key == 0`,
+// nothing compiled, and the zero program is never run.
+unsafe impl StateBlock for RegexCache {}
