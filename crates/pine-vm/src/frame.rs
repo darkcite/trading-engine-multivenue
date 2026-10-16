@@ -684,9 +684,11 @@ impl<'a> Frame<'a> {
     /// The calling site's block, journaled as a whole on first touch in a tick exactly as
     /// [`Frame::state`], together with the bytes of string argument `e` exactly as
     /// [`Frame::str_arg`] resolves them (any region; `None` = na; a stale ref latches the defect
-    /// flag). The block lies in the pool region and the string in CONST, SCRATCH or PERSIST —
-    /// disjoint frame regions (rule 1) — so a body can compile from the string straight into
-    /// the block (contract A7.1). Same release check and defect as `state`.
+    /// flag). The block is a `Builtin` block, which rule 6 places in the STATES region
+    /// (`[states_off, states_off + states_bytes)`; only `Collection` blocks live in the pool),
+    /// and the string in CONST, SCRATCH or PERSIST — disjoint frame regions (rule 1) — so a body
+    /// can compile from the string straight into the block (contract A7.1). Same release check
+    /// and defect as `state`.
     pub fn state_and_str<T: StateBlock>(&mut self, site: SiteId, e: u16) -> (&mut T, Option<&[u8]>) {
         const { assert!(core::mem::align_of::<T>() <= 8) };
         let src = self.str_arg(e).map(span_of);
@@ -708,12 +710,15 @@ impl<'a> Frame<'a> {
                 );
                 // SAFETY: (p, n) is the slice str_arg resolved (the program's CONST blob, or
                 // bounds-checked SCRATCH / PERSIST bytes); rule 1 places those regions apart from
-                // the pool block lent below, so the shared and the unique borrow never overlap.
+                // the STATES region holding the Builtin block lent below (rule 6), so the shared
+                // and the unique borrow never overlap.
                 Some(unsafe { core::slice::from_raw_parts(p, n) })
             }
             None => None,
         };
-        // SAFETY: as above (the release check precedes it); disjoint from `bytes` (rule 1).
+        // SAFETY: rule 23 as `state` — `blk` is this call's verified Builtin block in the STATES
+        // region (rule 6), size_of::<T>() <= cur_bytes and the site / STATEFUL release check
+        // precede it, 8-aligned; disjoint from `bytes` (CONST / SCRATCH / PERSIST, rule 1).
         (unsafe { &mut *(blk as *mut T) }, bytes)
     }
 
