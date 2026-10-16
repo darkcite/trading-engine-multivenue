@@ -7,6 +7,7 @@
 //! COPY-DOCTRINE: load time only — `verify` sorts span lists and builds small
 //! bitsets once per program; nothing here runs after `VmInstance::new`.
 
+mod charge;
 mod code;
 mod layout;
 
@@ -89,6 +90,23 @@ impl VerifyError {
 pub struct Verified<'p> {
     pub(crate) prog: &'p PineProgram,
     pub(crate) table: &'static BuiltinTable,
+    /// A10: computed once by `verify`; see `static_charge`.
+    pub(crate) charge: Option<u32>,
+}
+
+impl Verified<'_> {
+    /// Amendment A10: an upper bound on the budget units ONE evaluation of this program's own
+    /// code can charge — the maximum over every control-flow path from pc 0 of the sum of the
+    /// per-instruction charges the interpreter makes (`BUDGET` its `(b << 16) | a`, a forward
+    /// `CALL` 1, `CALL_BUILTIN` its entry's `cost`, everything else 0). `Some` only when the
+    /// code is acyclic: no backward jump or `CALL` (`target <= pc`) and no `RET`; `None` as
+    /// well when the maximum exceeds `u32::MAX`. Sub-programs are excluded: each child is
+    /// verified on its own and carries its own bound. Every evaluation's charge (the
+    /// `max_insns` counter) is `<=` it, so a bound below `meta.insn_budget_per_eval` means the
+    /// program can never fault `InsnBudget`. Computed at verify time; reading it is a load.
+    pub const fn static_charge(&self) -> Option<u32> {
+        self.charge
+    }
 }
 
 impl core::fmt::Debug for Verified<'_> {
@@ -97,6 +115,7 @@ impl core::fmt::Debug for Verified<'_> {
             .field("code_len", &self.prog.code.len())
             .field("mode", &self.prog.mode)
             .field("subprograms", &self.prog.subprograms.len())
+            .field("static_charge", &self.charge)
             .finish()
     }
 }
@@ -111,7 +130,10 @@ pub(crate) fn e(rule: u16, pc: u32, detail: u32) -> VerifyError {
 /// Verify `p` (and, recursively, its sub-programs) against `t`.
 pub fn verify<'p>(p: &'p PineProgram, t: &'static BuiltinTable) -> Result<Verified<'p>, VerifyError> {
     verify_at(p, t, 0)?;
-    Ok(Verified { prog: p, table: t })
+    // A10: after every rule has passed (charge::static_charge relies on rules 8-10); it never
+    // refuses, so what `verify` accepts and refuses is unchanged.
+    let charge = charge::static_charge(p, t);
+    Ok(Verified { prog: p, table: t, charge })
 }
 
 fn verify_at(p: &PineProgram, t: &'static BuiltinTable, depth: u32) -> Result<(), VerifyError> {
