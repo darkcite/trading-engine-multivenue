@@ -6,8 +6,8 @@
 use pine_ir::{ExecMode, InputOverride, InputValue};
 use pine_screen::handoff::{
     b3_argv, cutplan_tsv, manifest_toml, null_trial_id, read_handoff, run_windows, t2_trial_id,
-    validate_windows, write_handoff, Handoff, HandoffErr, ManifestNums, Window, HANDOFF_SCHEMA,
-    MAX_WINDOW_NS,
+    validate_windows, write_handoff, Handoff, HandoffErr, ManifestErr, ManifestNums, Window,
+    HANDOFF_SCHEMA, MAX_WINDOW_NS,
 };
 use pine_screen::ids::{fee_digest, hex32};
 use std::path::PathBuf;
@@ -237,7 +237,7 @@ fn handoff_manifest_names_every_contract_key() {
         },
         InputOverride {
             name: "src".into(),
-            value: InputValue::Str("hl\"c3".into()),
+            value: InputValue::Str("hl c3".into()),
         },
         InputOverride {
             name: "useAtr".into(),
@@ -248,7 +248,7 @@ fn handoff_manifest_names_every_contract_key() {
         "BINANCE:BTCUSDT.P".to_string(),
         "binance_usdm:btcusdt".to_string(),
     )];
-    let m = manifest_toml(&h, 6, "binance", &nums, &inputs, &tm);
+    let m = manifest_toml(&h, 6, "binance", &nums, &inputs, &tm).expect("escape-free");
     let keys = [
         "sha256",
         "file",
@@ -324,9 +324,81 @@ fn handoff_manifest_names_every_contract_key() {
     let inputs_block = &m[inp..sym];
     assert!(inputs_block.contains("length = 14\n"));
     assert!(inputs_block.contains("mult = 3000000\n"));
-    assert!(inputs_block.contains("src = \"hl\\\"c3\"\n"));
+    assert!(inputs_block.contains("src = \"hl c3\"\n"));
     assert!(inputs_block.contains("useAtr = 1\n"));
     assert!(m[sym..].contains("\"BINANCE:BTCUSDT.P\" = \"binance_usdm:btcusdt\"\n"));
+}
+
+/// `pin:07-manifest-no-escapes` (lead ruling 2026-10-16): the impl-08 manifest grammar allows no
+/// escape inside a quoted string (6006), so a value or quoted key that would need one — `"`, `\`,
+/// a control character U+0000–U+001F, U+007F — is refused with the field named, never escaped.
+#[test]
+fn handoff_manifest_refuses_a_value_that_needs_an_escape() {
+    let nums = ManifestNums {
+        pyramiding: 1,
+        t1_max_concurrent_1e6: 0,
+        t1_turnover_day_p99_1e6: 0,
+    };
+    let ok_tm = vec![("BINANCE:BTCUSDT.P".to_string(), "k".to_string())];
+    let input = |name: &str, v: &str| {
+        vec![InputOverride {
+            name: name.into(),
+            value: InputValue::Str(v.into()),
+        }]
+    };
+    let h = handoff(PathBuf::from("/x"));
+    let refused = |e: &str| Err(ManifestErr::NeedsEscape(e.to_string()));
+    // Every escape-needing character, in an input value.
+    for bad in [
+        "a\"b", "a\\b", "a\nb", "a\tb", "a\rb", "a\u{1}b", "a\u{1f}b", "a\u{7f}b",
+    ] {
+        assert_eq!(
+            manifest_toml(&h, 6, "binance", &nums, &input("src", bad), &ok_tm),
+            refused("script.inputs.src"),
+            "{bad:?}"
+        );
+    }
+    // A quoted input key, the venue, the script file and symbol, a ticker-map key and value.
+    let key = "my \"src\"";
+    assert_eq!(
+        manifest_toml(&h, 6, "binance", &nums, &input(key, "x"), &ok_tm),
+        refused(&format!("script.inputs.{key}"))
+    );
+    assert_eq!(
+        manifest_toml(&h, 6, "bin\"ance", &nums, &[], &ok_tm),
+        refused("venue")
+    );
+    let hf = Handoff {
+        script: "a\\b.pine".into(),
+        ..handoff(PathBuf::from("/x"))
+    };
+    assert_eq!(
+        manifest_toml(&hf, 6, "binance", &nums, &[], &ok_tm),
+        refused("file")
+    );
+    let hs = Handoff {
+        symbol_key: "binance_usdm:btc\nusdt".into(),
+        ..handoff(PathBuf::from("/x"))
+    };
+    assert_eq!(
+        manifest_toml(&hs, 6, "binance", &nums, &[], &ok_tm),
+        refused("symbol")
+    );
+    for tm in [
+        vec![("BINANCE:\"X".to_string(), "k".to_string())],
+        vec![("BINANCE:X".to_string(), "k\\".to_string())],
+    ] {
+        let f = format!("script.symbols.{}", tm[0].0);
+        assert_eq!(
+            manifest_toml(&h, 6, "binance", &nums, &[], &tm),
+            refused(&f)
+        );
+    }
+    // Everything else passes through verbatim: spaces, ':', '.', non-ASCII.
+    let m = manifest_toml(&h, 6, "binance", &nums, &input("src", "hl c3 · é"), &ok_tm)
+        .expect("escape-free");
+    assert!(m.contains("  src = \"hl c3 · é\"\n"));
+    assert!(!m.contains('\\'));
 }
 
 #[test]

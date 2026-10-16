@@ -40,7 +40,7 @@ use core_time::barclock;
 use pine_ir::ExecMode;
 use pine_screen::handoff::{
     manifest_toml, null_trial_id, run_windows, t2_trial_id, write_handoff, Handoff, HandoffErr,
-    ManifestNums, Window, MIN_SCORE_DAYS, TARGET_CLOSED_T2,
+    ManifestErr, ManifestNums, Window, MIN_SCORE_DAYS, TARGET_CLOSED_T2,
 };
 use pine_screen::ids::parse_hex32;
 use pine_screen::rows::RowsFile;
@@ -908,6 +908,8 @@ pub fn handoff_verb(a: &super::HandoffArgs) -> Result<String, PineErr> {
             t1_max_concurrent_1e6: rec.summary.max_concurrent_1e6,
             t1_turnover_day_p99_1e6: rec.summary.turnover_day_p99_1e6,
         };
+        // pin:07-manifest-no-escapes: a value the impl-08 grammar could only carry as an escape
+        // is refused (exit 5), never escaped.
         let manifest = manifest_toml(
             &h,
             loaded.meta().dialect as u8,
@@ -915,7 +917,13 @@ pub fn handoff_verb(a: &super::HandoffArgs) -> Result<String, PineErr> {
             &nums,
             &[],
             &[],
-        );
+        )
+        .map_err(|e| match e {
+            ManifestErr::NeedsEscape(field) => PineErr::Data(format!(
+                "{}: manifest field `{field}` needs a TOML escape the impl-08 grammar refuses",
+                p.script
+            )),
+        })?;
         debug_assert!(matches!(h.mode, ExecMode::BarClose | ExecMode::Realtime));
         write_handoff(&h, &bytes, &manifest).map_err(herr)?;
         let (pull, est) = cost_of(&plan);

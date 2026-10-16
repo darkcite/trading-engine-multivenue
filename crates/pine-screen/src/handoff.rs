@@ -587,36 +587,43 @@ pub struct ManifestNums {
     pub t1_turnover_day_p99_1e6: i64,
 }
 
-/// A TOML basic string.
-fn toml_str(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 2);
-    o.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            '\t' => o.push_str("\\t"),
-            '\r' => o.push_str("\\r"),
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                let _ = write!(o, "\\u{:04X}", c as u32);
-            }
-            c => o.push(c),
-        }
-    }
-    o.push('"');
-    o
+/// Why [`manifest_toml`] refused to write a manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestErr {
+    /// The named field (`file`, `symbol`, `venue`, `script.inputs.<name>`, the key of
+    /// `script.symbols`, …) holds a character a TOML basic string can carry only as an escape
+    /// (`"`, `\`, a control character U+0000–U+001F or U+007F). The impl-08 manifest grammar
+    /// allows no escape inside a quoted string and refuses one with 6006, so the writer refuses
+    /// first (`pin:07-manifest-no-escapes`, lead ruling 2026-10-16).
+    NeedsEscape(String),
 }
 
-/// A TOML key: bare when `[A-Za-z0-9_-]+`, quoted otherwise.
-fn toml_key(k: &str) -> String {
+/// True when `c` could appear in a TOML basic string only as an escape.
+fn needs_escape(c: char) -> bool {
+    c == '"' || c == '\\' || (c as u32) < 0x20 || c as u32 == 0x7f
+}
+
+/// `s` as a TOML basic string with no escape in it; `field` names it in the refusal.
+fn toml_str(field: &str, s: &str) -> Result<String, ManifestErr> {
+    if s.chars().any(needs_escape) {
+        return Err(ManifestErr::NeedsEscape(field.to_string()));
+    }
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    o.push_str(s);
+    o.push('"');
+    Ok(o)
+}
+
+/// A TOML key: bare when `[A-Za-z0-9_-]+`, quoted (escape-free, as [`toml_str`]) otherwise.
+fn toml_key(field: &str, k: &str) -> Result<String, ManifestErr> {
     if !k.is_empty()
         && k.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     {
-        k.to_string()
+        Ok(k.to_string())
     } else {
-        toml_str(k)
+        toml_str(field, k)
     }
 }
 
@@ -627,6 +634,9 @@ fn toml_key(k: &str) -> String {
 // pin:07-manifest-bool-int: "Integer TOML" — a `bool` input override is written `1` / `0`.
 // pin:07-manifest-no-provenance: `[script.provenance]` is optional (contract §3.14) and the
 // hand-off has none of its values; it is not written.
+// pin:07-manifest-no-escapes: the impl-08 grammar has no string escapes (6006), so a value or quoted
+// key that would need one (`"`, `\`, a control character) is refused with
+// [`ManifestErr::NeedsEscape`] naming its field — never escaped, never altered.
 pub fn manifest_toml(
     h: &Handoff,
     dialect: u8,
@@ -634,7 +644,7 @@ pub fn manifest_toml(
     nums: &ManifestNums,
     inputs: &[InputOverride],
     ticker_map: &[(String, String)],
-) -> String {
+) -> Result<String, ManifestErr> {
     let l = crate::SCREEN_LIMITS;
     let n = h.sizing_notional_1e6;
     let cap_instance = (i64::from(nums.pyramiding.max(1)).saturating_mul(n))
@@ -647,15 +657,23 @@ pub fn manifest_toml(
     let _ = writeln!(
         s,
         "sha256            = {}",
-        toml_str(&hex(&h.source_sha256))
+        toml_str("sha256", &hex(&h.source_sha256))?
     );
-    let _ = writeln!(s, "file              = {}", toml_str(&h.script));
+    let _ = writeln!(s, "file              = {}", toml_str("file", &h.script)?);
     let _ = writeln!(s, "dialect           = {dialect}");
     let _ = writeln!(s, "enabled           = 1");
-    let _ = writeln!(s, "mode              = {}", toml_str(mode_str(h.mode)));
-    let _ = writeln!(s, "symbol            = {}", toml_str(&h.symbol_key));
+    let _ = writeln!(
+        s,
+        "mode              = {}",
+        toml_str("mode", mode_str(h.mode))?
+    );
+    let _ = writeln!(
+        s,
+        "symbol            = {}",
+        toml_str("symbol", &h.symbol_key)?
+    );
     let _ = writeln!(s, "timeframe_s       = {}", h.timeframe_s);
-    let _ = writeln!(s, "venue             = {}", toml_str(venue));
+    let _ = writeln!(s, "venue             = {}", toml_str("venue", venue)?);
     let _ = writeln!(s, "max_bars_back     = {}", l.max_bars_back);
     let _ = writeln!(s, "coalesce_ms       = 250");
     let _ = writeln!(s, "coalesce_bps      = 0");
@@ -673,16 +691,23 @@ pub fn manifest_toml(
     let _ = writeln!(s, "intent_cap        = {}", l.intent_cap);
     let _ = writeln!(s, "\n  [script.inputs]");
     for o in inputs {
+        let field = format!("script.inputs.{}", o.name);
         let v = match &o.value {
             InputValue::Int(v) | InputValue::Float1e6(v) => v.to_string(),
             InputValue::Bool(b) => u8::from(*b).to_string(),
-            InputValue::Str(t) => toml_str(t),
+            InputValue::Str(t) => toml_str(&field, t)?,
         };
-        let _ = writeln!(s, "  {} = {v}", toml_key(&o.name));
+        let _ = writeln!(s, "  {} = {v}", toml_key(&field, &o.name)?);
     }
     let _ = writeln!(s, "  [script.symbols]");
     for (tv, key) in ticker_map {
-        let _ = writeln!(s, "  {} = {}", toml_str(tv), toml_str(key));
+        let field = format!("script.symbols.{tv}");
+        let _ = writeln!(
+            s,
+            "  {} = {}",
+            toml_str(&field, tv)?,
+            toml_str(&field, key)?
+        );
     }
-    s
+    Ok(s)
 }

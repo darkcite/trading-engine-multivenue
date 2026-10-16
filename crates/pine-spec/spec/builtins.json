@@ -38216,7 +38216,7 @@
             "k": "param",
             "param": "length"
           },
-          "na": "skip",
+          "na": "propagate",
           "sx": [
             "work_linear"
           ],
