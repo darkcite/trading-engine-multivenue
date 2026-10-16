@@ -526,3 +526,442 @@ fn add_str_concatenates_and_propagates_na() {
     assert!(g[3].is_nan());
     assert_eq!(g[5], 0.0);
 }
+
+// ---- T13: the copying str.* family (contract A7.2) -----------------------------------------
+
+fn o(k: u16) -> (Lane, Src) {
+    (Lane::I64, Src::Out(k, 0))
+}
+
+/// `str.upper` / `str.lower`: ASCII letters only (`pin:04-case-ascii`), other bytes kept; a source
+/// with nothing to change comes back as itself (zero-copy); na → na.
+#[test]
+fn str_case_is_ascii_only_and_in_place() {
+    let rows = vec![
+        (ov::STR_UPPER, vec![st("aBc\u{e9}z1")]),
+        (ov::OP_EQ_STR, vec![o(0), st("ABC\u{e9}Z1")]),
+        (ov::STR_LOWER, vec![st("AbC\u{c9}")]),
+        (ov::OP_EQ_STR, vec![o(2), st("abc\u{c9}")]),
+        (ov::STR_UPPER, vec![st("ABC-1")]),
+        (ov::STR_TOSTRING_S, vec![st("ABC-1")]),
+        (ov::STR_UPPER, vec![NA_S]),
+        (ov::STR_LOWER, vec![NA_S]),
+    ];
+    let g = str_rows(&rows);
+    assert_eq!((g[1], g[3]), (1.0, 1.0));
+    assert_eq!(
+        konst(g[4]),
+        konst(g[5]),
+        "nothing to change: the source itself"
+    );
+    assert!(g[6].is_nan() && g[7].is_nan());
+}
+
+/// `str.replace`: the N-th non-overlapping match (0 = first, the reference's example); no such
+/// occurrence, a negative one or an empty target → the source itself (`pin:04-replace-edges`);
+/// any na → na.
+#[test]
+fn str_replace_nth_and_edges() {
+    let src = "FTX:BTCUSD / FTX:BTCEUR";
+    let rows = vec![
+        (
+            ov::STR_REPLACE,
+            vec![st(src), st("FTX"), st("BINANCE"), it(0)],
+        ),
+        (ov::OP_EQ_STR, vec![o(0), st("BINANCE:BTCUSD / FTX:BTCEUR")]),
+        (
+            ov::STR_REPLACE,
+            vec![st(src), st("FTX"), st("BINANCE"), it(1)],
+        ),
+        (ov::OP_EQ_STR, vec![o(2), st("FTX:BTCUSD / BINANCE:BTCEUR")]),
+        (ov::STR_TOSTRING_S, vec![st(src)]),
+        (ov::STR_REPLACE, vec![st(src), st("FTX"), st("X"), it(2)]),
+        (ov::STR_REPLACE, vec![st(src), st("FTX"), st("X"), it(-1)]),
+        (ov::STR_REPLACE, vec![st(src), st(""), st("X"), it(0)]),
+        // "aaa": "aa" occurs once non-overlapping, so occurrence 1 does not exist.
+        (ov::STR_REPLACE, vec![st("aaa"), st("aa"), st("b"), it(1)]),
+        (ov::STR_TOSTRING_S, vec![st("aaa")]),
+        (ov::STR_REPLACE, vec![st("abc"), st("b"), st(""), it(0)]),
+        (ov::OP_EQ_STR, vec![o(10), st("ac")]),
+        (ov::STR_REPLACE, vec![NA_S, st("a"), st("b"), it(0)]),
+        (ov::STR_REPLACE, vec![st("a"), st("a"), NA_S, it(0)]),
+        (ov::STR_REPLACE, vec![st("a"), st("a"), st("b"), NA_S]),
+    ];
+    let g = str_rows(&rows);
+    assert_eq!((g[1], g[3], g[11]), (1.0, 1.0, 1.0));
+    for k in [5, 6, 7] {
+        assert_eq!(konst(g[k]), konst(g[4]), "row {k}: the source itself");
+    }
+    assert_eq!(konst(g[8]), konst(g[9]));
+    assert!(g[12].is_nan() && g[13].is_nan() && g[14].is_nan());
+}
+
+/// `str.replace_all`: every non-overlapping match, left to right; none → the source itself.
+#[test]
+fn str_replace_all_sizes_then_fills() {
+    let rows = vec![
+        (ov::STR_REPLACE_ALL, vec![st("a.b.c."), st("."), st("--")]),
+        (ov::OP_EQ_STR, vec![o(0), st("a--b--c--")]),
+        (ov::STR_REPLACE_ALL, vec![st("aaaaa"), st("aa"), st("b")]),
+        (ov::OP_EQ_STR, vec![o(2), st("bba")]),
+        (ov::STR_REPLACE_ALL, vec![st("xyz"), st("q"), st("r")]),
+        (ov::STR_TOSTRING_S, vec![st("xyz")]),
+        (ov::STR_REPLACE_ALL, vec![st("xyz"), st(""), st("r")]),
+        (ov::STR_REPLACE_ALL, vec![st("x"), NA_S, st("r")]),
+        // A SCRATCH source: the fresh range lies past it (A7.2's disjointness, debug-asserted).
+        (ov::STR_UPPER, vec![st("ab-ab")]),
+        (ov::STR_REPLACE_ALL, vec![o(8), st("AB"), st("c")]),
+        (ov::OP_EQ_STR, vec![o(9), st("c-c")]),
+    ];
+    let g = str_rows(&rows);
+    assert_eq!((g[1], g[3], g[10]), (1.0, 1.0, 1.0));
+    assert_eq!(konst(g[4]), konst(g[5]));
+    assert_eq!(konst(g[6]), konst(g[5]));
+    assert!(g[7].is_nan());
+}
+
+/// `str.repeat`: the reference's example; 0 → ""; 1 → the source itself; na source → na (the
+/// remark); a negative count → `ScriptRefused` (`pin:04-repeat-negative`); an output larger than
+/// the arena → `StrArenaFull`, nothing written.
+#[test]
+fn str_repeat_example_edges_and_arena_full() {
+    let rows = vec![
+        (ov::STR_REPEAT, vec![st("?"), it(3), st(",")]),
+        (ov::OP_EQ_STR, vec![o(0), st("?,?,?")]),
+        (ov::STR_REPEAT, vec![st("ab"), it(0), st(",")]),
+        (ov::STR_LENGTH, vec![o(2)]),
+        (ov::STR_REPEAT, vec![st("ab"), it(1), st(",")]),
+        (ov::STR_TOSTRING_S, vec![st("ab")]),
+        (ov::STR_REPEAT, vec![NA_S, it(2), st("")]),
+        (ov::STR_REPEAT, vec![st("ab"), it(2), st("")]),
+        (ov::OP_EQ_STR, vec![o(7), st("abab")]),
+        (ov::STR_REPEAT, vec![st(""), it(1_000_000_000), st("")]),
+        (ov::STR_LENGTH, vec![o(9)]),
+    ];
+    let g = str_rows(&rows);
+    assert_eq!((g[1], g[3], g[8], g[10]), (1.0, 0.0, 1.0, 0.0));
+    assert_eq!(konst(g[4]), konst(g[5]));
+    assert!(g[6].is_nan());
+    let neg = vec![(ov::STR_REPEAT, vec![st("ab"), it(-1), st("")])];
+    assert_eq!(
+        str_bars(&neg, &[0.0], Dialect::V6).unwrap_err(),
+        FaultKind::ScriptRefused
+    );
+    let big = vec![(ov::STR_REPEAT, vec![st("ab"), it(1_000_000), st(",")])];
+    assert_eq!(
+        str_bars(&big, &[0.0], Dialect::V6).unwrap_err(),
+        FaultKind::StrArenaFull
+    );
+}
+
+// ---- T12: str.tostring(int / float / bool[, format]) ----------------------------------------
+
+fn ft(x: f64) -> (Lane, Src) {
+    (Lane::F64, Src::Const(x.to_bits()))
+}
+
+/// impl-04 T12 / U08: the default rendering in both dialects follows `Sw::TostringDefault` (8 or
+/// 10 digits — the renderer's two shapes are pinned in `strnum::tests`); trailing zeros trimmed;
+/// `0.5`, not `.5`; na → `"NaN"` (the reference).
+#[test]
+fn tostring_default_switch() {
+    let rows = vec![
+        (ov::STR_TOSTRING_F, vec![ft(1.0 / 3.0)]),
+        (ov::OP_EQ_STR, vec![o(0), st("0.33333333")]),
+        (ov::OP_EQ_STR, vec![o(0), st("0.3333333333")]),
+        (ov::STR_TOSTRING_F, vec![ft(0.5)]),
+        (ov::OP_EQ_STR, vec![o(3), st("0.5")]),
+        (ov::STR_TOSTRING_F, vec![ft(-12.0)]),
+        (ov::OP_EQ_STR, vec![o(5), st("-12")]),
+        (ov::STR_TOSTRING_F, vec![ft(f64::NAN)]),
+        (ov::OP_EQ_STR, vec![o(7), st("NaN")]),
+    ];
+    for d in [Dialect::V5, Dialect::V6] {
+        let ten = pine_spec::sw(pine_spec::Sw::TostringDefault, d)
+            == pine_spec::swr::TOSTRING_DEFAULT_FRAC_UPTO_10;
+        let g = &str_bars(&rows, &[0.0], d).unwrap()[0];
+        assert_eq!((g[1], g[2]), (!ten as u8 as f64, ten as u8 as f64), "{d:?}");
+        assert_eq!((g[4], g[6], g[8]), (1.0, 1.0, 1.0), "{d:?}");
+    }
+}
+
+/// `str.tostring` of int / bool, and with a `format`: the reference's `'#'` and `'#.000'`
+/// examples, grouping, a quoted affix, `format.mintick` (snapped, trailing zeros); na → `"NaN"`;
+/// a run-time pattern outside the subset → `ScriptRefused` (`pin:04-tostring-bad-pattern`).
+#[test]
+fn tostring_overloads_and_formats() {
+    let rows = vec![
+        (ov::STR_TOSTRING_I, vec![it(-9_007_199_254_740_993)]),
+        (ov::OP_EQ_STR, vec![o(0), st("-9007199254740993")]),
+        (ov::STR_TOSTRING_B, vec![it(1)]),
+        (ov::OP_EQ_STR, vec![o(2), st("true")]),
+        (ov::STR_TOSTRING_FS, vec![ft(3.99), st("#")]),
+        (ov::OP_EQ_STR, vec![o(4), st("4")]),
+        (ov::STR_TOSTRING_FS, vec![ft(1.5), st("#.000")]),
+        (ov::OP_EQ_STR, vec![o(6), st("1.500")]),
+        (
+            ov::STR_TOSTRING_FS,
+            vec![ft(1234567.891), st("'$'#,##0.00' ok'")],
+        ),
+        (ov::OP_EQ_STR, vec![o(8), st("$1,234,567.89 ok")]),
+        (ov::STR_TOSTRING_FS, vec![ft(1.23456), st("mintick")]),
+        (ov::OP_EQ_STR, vec![o(10), st("1.23")]),
+        (ov::STR_TOSTRING_FS, vec![ft(2.0), st("mintick")]),
+        (ov::OP_EQ_STR, vec![o(12), st("2.00")]),
+        (ov::STR_TOSTRING_IS, vec![it(1234), st("#,###")]),
+        (ov::OP_EQ_STR, vec![o(14), st("1,234")]),
+        (ov::STR_TOSTRING_FS, vec![ft(0.256), st("#.#%")]),
+        (ov::OP_EQ_STR, vec![o(16), st("25.6%")]),
+        (ov::STR_TOSTRING_I, vec![NA_S]),
+        (ov::OP_EQ_STR, vec![o(18), st("NaN")]),
+        (ov::STR_TOSTRING_FS, vec![ft(f64::NAN), st("#.00")]),
+        (ov::OP_EQ_STR, vec![o(20), st("NaN")]),
+        (ov::STR_TOSTRING_FS, vec![ft(1.0), NA_S]),
+    ];
+    let g = &str_bars(&rows, &[0.0], Dialect::V6).unwrap()[0];
+    for k in (1..22).step_by(2) {
+        assert_eq!(g[k], 1.0, "row {k}");
+    }
+    assert!(g[22].is_nan());
+    let bad = vec![(ov::STR_TOSTRING_FS, vec![ft(1.0), st("#E0")])];
+    assert_eq!(
+        str_bars(&bad, &[0.0], Dialect::V6).unwrap_err(),
+        FaultKind::ScriptRefused
+    );
+}
+
+// ---- T13: str.format / str.format_time -------------------------------------------------------
+
+/// `__types` for argument types `ts` (4 bits each, argument 0 lowest; impl-04 §3.4).
+fn types(ts: &[Ty]) -> (Lane, Src) {
+    let mut v = 0u64;
+    for (k, t) in ts.iter().enumerate() {
+        v |= (*t as u64) << (4 * k);
+    }
+    it(v as i64)
+}
+
+/// `str.format`: plain, number-pattern, keyword (`pin:04-fmt-keywords`), quoted and date
+/// placeholders; a missing argument stays `{n}` (`pin:04-fmt-missing-arg`); a SCRATCH string
+/// argument is lent with the range (A7.2); na template → na; an unbalanced `series` template →
+/// `ScriptRefused` (the reference: a runtime error).
+#[test]
+fn str_format_placeholders() {
+    use Ty::{Float as F, Int as I, String as S};
+    let rows = vec![
+        (
+            ov::STR_FORMAT_F,
+            vec![types(&[F, I]), st("{0} and {1}"), ft(1.5), it(7)],
+        ),
+        (ov::OP_EQ_STR, vec![o(0), st("1.5 and 7")]),
+        (
+            ov::STR_FORMAT_F,
+            vec![types(&[F]), st("x={0,number,#.##}"), ft(4.56789)],
+        ),
+        (ov::OP_EQ_STR, vec![o(2), st("x=4.57")]),
+        (
+            ov::STR_FORMAT_F,
+            vec![
+                types(&[F, F, F]),
+                st("{0,number}|{1,number,integer}|{2,number,percent}"),
+                ft(1234.5),
+                ft(2.5),
+                ft(0.256),
+            ],
+        ),
+        (ov::OP_EQ_STR, vec![o(4), st("1,234.5|2|26%")]),
+        (
+            ov::STR_FORMAT_F,
+            vec![types(&[F]), st("{0,number,currency}"), ft(-1.5)],
+        ),
+        (ov::OP_EQ_STR, vec![o(6), st("-$1.50")]),
+        (ov::STR_UPPER, vec![st("x")]),
+        (
+            ov::STR_FORMAT_S,
+            vec![types(&[S]), st("'{'{0}'}' it''s"), o(8)],
+        ),
+        (ov::OP_EQ_STR, vec![o(9), st("{X} it's")]),
+        (
+            ov::STR_FORMAT_I,
+            vec![
+                types(&[I]),
+                st("{0,date,yyyy-MM-dd HH:mm:ss} {1}"),
+                it(1_704_585_600_000),
+            ],
+        ),
+        (ov::OP_EQ_STR, vec![o(11), st("2024-01-07 00:00:00 {1}")]),
+        (ov::STR_FORMAT_I, vec![types(&[I]), NA_S, it(1)]),
+        (
+            ov::STR_FORMAT_F,
+            vec![types(&[F]), st("<{0}>"), ft(f64::NAN)],
+        ),
+        (ov::OP_EQ_STR, vec![o(14), st("<NaN>")]),
+    ];
+    let g = &str_bars(&rows, &[0.0], Dialect::V6).unwrap()[0];
+    for k in [1, 3, 5, 7, 10, 12, 15] {
+        assert_eq!(g[k], 1.0, "row {k}");
+    }
+    assert!(g[13].is_nan());
+    let bad = vec![(ov::STR_FORMAT_I, vec![types(&[I]), st("ab {0"), it(1)])];
+    assert_eq!(
+        str_bars(&bad, &[0.0], Dialect::V6).unwrap_err(),
+        FaultKind::ScriptRefused
+    );
+}
+
+/// `str.format_time`: the reference's ISO default pattern with `Z`, 12-hour `h` + `a`, names
+/// (`pin:04-date-tokens`), a zone offset; na → na; an unknown zone → `ScriptRefused`.
+#[test]
+fn str_format_time_tokens_and_zone() {
+    let t = 1_704_585_600_000 + 13 * 3_600_000 + 30 * 60_000 + 42_007; // Sun 2024-01-07 13:30:42.007Z
+    let rows = vec![
+        (
+            ov::STR_FORMAT_TIME,
+            vec![it(t), st("yyyy-MM-dd'T'HH:mm:ssZ"), st("Asia/Tokyo")],
+        ),
+        (ov::OP_EQ_STR, vec![o(0), st("2024-01-07T22:30:42+0900")]),
+        (
+            ov::STR_FORMAT_TIME,
+            vec![it(t), st("EEEE, MMMM d yy h:m a S"), st("Asia/Tokyo")],
+        ),
+        (
+            ov::OP_EQ_STR,
+            vec![o(2), st("Sunday, January 7 24 10:30 PM 7")],
+        ),
+        (
+            ov::STR_FORMAT_TIME,
+            vec![it(t), st("EEE MMM dd HH:mm:ss.SSS"), st("Asia/Tokyo")],
+        ),
+        (ov::OP_EQ_STR, vec![o(4), st("Sun Jan 07 22:30:42.007")]),
+        (
+            ov::STR_FORMAT_TIME,
+            vec![NA_S, st("yyyy"), st("Asia/Tokyo")],
+        ),
+        (ov::STR_FORMAT_TIME, vec![it(t), st("yyyy"), NA_S]),
+    ];
+    let g = &str_bars(&rows, &[0.0], Dialect::V6).unwrap()[0];
+    assert_eq!((g[1], g[3], g[5]), (1.0, 1.0, 1.0));
+    assert!(g[6].is_nan() && g[7].is_nan());
+    let bad = vec![(
+        ov::STR_FORMAT_TIME,
+        vec![it(t), st("yyyy"), st("Mars/Base")],
+    )];
+    assert_eq!(
+        str_bars(&bad, &[0.0], Dialect::V6).unwrap_err(),
+        FaultKind::ScriptRefused
+    );
+    let badpat = vec![(
+        ov::STR_FORMAT_TIME,
+        vec![it(t), st("yyyy Q"), st("Asia/Tokyo")],
+    )];
+    assert_eq!(
+        str_bars(&badpat, &[0.0], Dialect::V6).unwrap_err(),
+        FaultKind::ScriptRefused
+    );
+}
+
+/// impl-04 I12: every string builder is all-or-nothing — on `StrArenaFull` the output slot keeps
+/// its previous value (bits and validity). Driven on a 64-byte scratch arena through pine-vm's
+/// program builder with pine-std's own `BUILTINS`.
+#[test]
+fn string_builders_are_all_or_nothing() {
+    use pine_vm::testkit::{arena, Arena, Ctx, Tb};
+    let long: &'static str = Box::leak("a".repeat(100).into_boxed_str());
+    // (overload, inputs as CONST strings or ints, output entry is appended)
+    enum In {
+        S(&'static str),
+        I(i64),
+        F(f64),
+    }
+    let cases: Vec<(OverloadId, Vec<In>)> = vec![
+        (ov::STR_UPPER, vec![In::S(long)]),
+        (
+            ov::STR_LOWER,
+            vec![In::S(
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            )],
+        ),
+        (
+            ov::STR_REPLACE,
+            vec![In::S(long), In::S("a"), In::S("bb"), In::I(0)],
+        ),
+        (
+            ov::STR_REPLACE_ALL,
+            vec![In::S(long), In::S("a"), In::S("b")],
+        ),
+        (ov::STR_REPEAT, vec![In::S("ab"), In::I(50), In::S("")]),
+        (
+            ov::STR_FORMAT_S,
+            vec![In::I(Ty::String as i64), In::S("{0}{0}"), In::S(long)],
+        ),
+        (
+            ov::STR_FORMAT_TIME,
+            vec![In::I(0), In::S(&long[..0]), In::S("Asia/Tokyo")],
+        ),
+        (
+            ov::STR_TOSTRING_FS,
+            vec![
+                In::F(1.0),
+                In::S("0000000000000000000000000000000000000000000000000000000000000000000000"),
+            ],
+        ),
+    ];
+    for (k, (id, ins)) in cases.into_iter().enumerate() {
+        let mut t = Tb::new(ExecMode::BarClose, 1, 6, 0, 0);
+        t.scratch = 64;
+        t.spec = pine_spec::SPEC_SHA256;
+        let out = t.i(5);
+        let keep = t.kstr("keep");
+        t.emit(op::I_CONST, flg::VLD, out, keep, 0);
+        let mut win = Vec::new();
+        for (j, x) in ins.iter().enumerate() {
+            match x {
+                In::S(s) => {
+                    // A format_time pattern of 100 `y`s renders a 100-digit year.
+                    let s: &str = if id == ov::STR_FORMAT_TIME && j == 1 {
+                        Box::leak("y".repeat(100).into_boxed_str())
+                    } else {
+                        s
+                    };
+                    let c = t.kstr(s);
+                    t.emit(op::I_CONST, flg::VLD, t.i(j as u32), c, 0);
+                    win.push(argwin::i64(t.i(j as u32)));
+                }
+                In::I(v) => {
+                    let c = t.k(*v as u64);
+                    t.emit(op::I_CONST, flg::VLD, t.i(j as u32), c, 0);
+                    win.push(argwin::i64(t.i(j as u32)));
+                }
+                In::F(v) => {
+                    let c = t.kf(*v);
+                    t.emit(op::F_CONST, 0, t.f(0), c, 0);
+                    win.push(argwin::f64(t.f(0)));
+                }
+            }
+        }
+        win.push(argwin::i64(out));
+        let w = t.win(&win);
+        t.emit(op::CALL_BUILTIN, 0, SiteId::NONE.0, id.0, w);
+        t.emit(op::HALT, 0, 0, 0, 0);
+        let p = t.build();
+        let v = pine_vm::verify(&p, &pine_std::BUILTINS).expect("verifies");
+        let mut a = Arena::new(p.layout.total_bytes as usize);
+        let mut vm = pine_vm::VmInstance::new(v, a.slice());
+        let o = vm.step_bar(&bar(0, 1.0, barflag::CONFIRMED), &mut Ctx { now: 0 });
+        assert_eq!(o, StepOutcome::Fault(FaultKind::StrArenaFull), "case {k}");
+        let img = arena(&vm);
+        let at = p.layout.i64_off as usize + 8 * out as usize;
+        let bits = u64::from_le_bytes(img[at..at + 8].try_into().unwrap());
+        assert_eq!(
+            bits, t.consts[keep as usize],
+            "case {k}: the slot keeps its value"
+        );
+        let vb = p.layout.f64_len as usize + out as usize;
+        let word = u64::from_le_bytes(
+            img[p.layout.valid_off as usize + 8 * (vb / 64)..][..8]
+                .try_into()
+                .unwrap(),
+        );
+        assert!(word >> (vb % 64) & 1 == 1, "case {k}: and its validity");
+    }
+}

@@ -15,6 +15,7 @@ mod tz;
 mod tz_table;
 
 pub use fmt::{fmt_compile, FmtProg, FMT_MAX_SEGMENTS};
+pub(crate) use fmt::{num_pat_of, seg, NumPat};
 pub use input::{resolve_input, InputResolved};
 pub use regex::{regex_compile, regex_compile_into, RegexProg, REGEX_MAX_STATES};
 pub use session::{session_parse, SessionRange, SessionSpec};

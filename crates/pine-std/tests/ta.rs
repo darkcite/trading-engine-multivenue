@@ -1921,3 +1921,146 @@ fn ta_vwap_function_resets_on_the_anchor() {
     assert!(one[200..205].iter().all(|x| x.is_nan()), "Σ volume 0 is na");
     assert!(!one[205].is_nan());
 }
+
+/// The bars of the cumulative-variable tests: 6-hour bars (a UTC day every 4), varied
+/// high/low/close and volume.
+fn cum_bars(n: u32) -> Vec<Bar> {
+    (0..n)
+        .map(|i| {
+            let c = 100.0 + ((i * 37) % 23) as f64 - 11.0;
+            let mut b = bar(i, c, barflag::CONFIRMED);
+            b.high_1e6 = scale::to_1e6(c + 1.0 + (i % 3) as f64).unwrap();
+            b.low_1e6 = scale::to_1e6(c - 2.0 + (i % 2) as f64).unwrap();
+            b.volume_1e6 = scale::to_1e6(1.0 + ((i * 13) % 7) as f64).unwrap();
+            b.open_ms = i as i64 * 21_600_000;
+            b.close_ms = b.open_ms + 21_600_000;
+            b
+        })
+        .collect()
+}
+
+/// The `ta.vwap` variable's reference: Σ v·hlc3 / Σ v over the bar's UTC day so far.
+fn vwap_var_reference(bars: &[Bar]) -> Vec<f64> {
+    let (mut sv, mut spv, mut day) = (0.0f64, 0.0f64, i64::MIN);
+    bars.iter()
+        .map(|b| {
+            let d = b.open_ms.div_euclid(86_400_000);
+            if d != day {
+                (sv, spv, day) = (0.0, 0.0, d);
+            }
+            let p = |x: i64| x as f64 / 1e6;
+            let src = (p(b.high_1e6) + p(b.low_1e6) + p(b.close_1e6)) / 3.0;
+            sv += p(b.volume_1e6);
+            spv += p(b.volume_1e6) * src;
+            spv / sv
+        })
+        .collect()
+}
+
+/// impl-04 T26 (§4.13.8, §1.4 item 6): a builtin series variable is advanced by an unguarded
+/// prelude call, so a read under a branch that was false on earlier bars still sees every bar —
+/// here the `ta.vwap` variable (hlc3, reset at the UTC day), read through a guarded
+/// `math.abs`. The same call placed inside the branch (the per-site rule) misses the false bars:
+/// that is why sema hoists the variables.
+#[test]
+fn builtin_series_advance_under_a_false_branch() {
+    let bars = cum_bars(40);
+    let want = vwap_var_reference(&bars);
+    let branch: Vec<f64> = (0..bars.len())
+        .map(|i| ((i % 5) == 4) as u8 as f64)
+        .collect();
+    let run = |hoisted: bool| -> Vec<f64> {
+        let vw = &OVERLOADS[ov::TA_VWAP_VAR.0 as usize];
+        let read = [(Lane::F64, Src::Out(0, 0))];
+        let calls = [
+            Call {
+                ov: ov::TA_VWAP_VAR,
+                inputs: &[],
+                outputs: &[Lane::F64],
+                site_bytes: vw.state.block_bytes(0),
+                guard: if hoisted { None } else { Some(0) },
+            },
+            Call {
+                ov: ov::MATH_ABS_F,
+                inputs: &read,
+                outputs: &[Lane::F64],
+                site_bytes: 0,
+                guard: Some(0),
+            },
+        ];
+        let mut h = Harness::build(&Script {
+            calls: &calls,
+            mode: ExecMode::BarClose,
+            dialect: Dialect::V6,
+            intent_cap: 0,
+            chart: CHART,
+        });
+        let mut ctx = TestCtx::default();
+        let mut out = Vec::new();
+        for (i, b) in bars.iter().enumerate() {
+            ctx.feed = vec![branch[i]];
+            assert_eq!(h.step_bar(b, &mut ctx), StepOutcome::Ok);
+            out.push(h.out(1, 0));
+        }
+        out
+    };
+    let hoisted = run(true);
+    let inside = run(false);
+    let mut differs = false;
+    for i in 0..bars.len() {
+        if branch[i] == 1.0 {
+            assert!(
+                close_eq(hoisted[i], want[i]),
+                "bar {i}: {} vs {}",
+                hoisted[i],
+                want[i]
+            );
+            differs |= !close_eq(inside[i], want[i]);
+        }
+    }
+    assert!(differs, "a call inside the branch skips the false bars");
+}
+
+/// The `ta.vwap` variable on every bar: the day reset, a forming tick never advances it (I5).
+#[test]
+fn ta_vwap_variable_resets_at_the_utc_day() {
+    let bars = cum_bars(24);
+    let want = vwap_var_reference(&bars);
+    let vw = &OVERLOADS[ov::TA_VWAP_VAR.0 as usize];
+    let calls = [Call {
+        ov: ov::TA_VWAP_VAR,
+        inputs: &[],
+        outputs: &[Lane::F64],
+        site_bytes: vw.state.block_bytes(0),
+        guard: None,
+    }];
+    let mut h = Harness::build(&Script {
+        calls: &calls,
+        mode: ExecMode::Realtime,
+        dialect: Dialect::V6,
+        intent_cap: 0,
+        chart: CHART,
+    });
+    let mut ctx = TestCtx::default();
+    for (i, b) in bars.iter().enumerate() {
+        let mut t = *b;
+        t.flags = barflag::REALTIME;
+        t.volume_1e6 *= 3;
+        assert_eq!(h.step_tick(&t, &mut ctx), StepOutcome::Ok);
+        assert_eq!(h.step_bar(b, &mut ctx), StepOutcome::Ok);
+        assert!(
+            close_eq(h.out(0, 0), want[i]),
+            "bar {i}: {} vs {}",
+            h.out(0, 0),
+            want[i]
+        );
+        if i % 4 == 0 {
+            let p = |x: i64| x as f64 / 1e6;
+            let hlc3 = (p(b.high_1e6) + p(b.low_1e6) + p(b.close_1e6)) / 3.0;
+            assert!(
+                close_eq(h.out(0, 0), hlc3),
+                "bar {i}: a new UTC day starts from its bar"
+            );
+        }
+    }
+}

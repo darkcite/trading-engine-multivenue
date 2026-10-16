@@ -728,6 +728,28 @@ const _: () =
 // SAFETY: repr(C) POD; all-zero is `started == 0` with zero sums: the anchor never seen.
 unsafe impl StateBlock for VwapHdr {}
 
+/// The `ta.vwap` variable's block (§4.13.8): the sums since the current UTC day began.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VwapVar {
+    /// Σ volume since the day began.
+    pub sv: f64,
+    /// Σ volume · hlc3.
+    pub spv: f64,
+    /// The UTC day (`time.div_euclid(86 400 000)`) the sums belong to.
+    pub day: i64,
+    /// 0 = no bar seen yet.
+    pub started: u32,
+    /// Always zero.
+    pub _pad: u32,
+    /// Always zero.
+    pub _rsv: [u64; 2],
+}
+const _: () =
+    assert!(core::mem::size_of::<VwapVar>() == 48 && core::mem::align_of::<VwapVar>() == 8);
+// SAFETY: repr(C) POD; all-zero is `started == 0` with zero sums: no bar seen.
+unsafe impl StateBlock for VwapVar {}
+
 /// `str.match`'s block (§3.6, §4.13.4): the compiled pattern and the FNV-1a of its bytes.
 #[derive(Clone, Copy)]
 #[repr(C)]

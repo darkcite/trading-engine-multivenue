@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! The cumulative `ta.*` series (impl-04 §4.13.8): the `ta.vwap` function forms. The variables
-//! (`ta.accdist obv pvt iii nvi pvi wad wvad`, the `ta.vwap` variable) stay stubs: the captured
-//! reference states no formula (nor the variable's source) for them —
-//! `pin:04-cum-series-formula-open`.
+//! The cumulative `ta.*` series (impl-04 §4.13.8): the `ta.vwap` function forms and the `ta.vwap`
+//! variable. The variables `ta.accdist obv pvt iii nvi pvi wad wvad` stay stubs: the reference
+//! (`ref-v6-vars.json`) gives each only a name ("On Balance Volume." …) and no formula —
+//! `pin:04-cum-series-formula-open`. The `ta.vwap` variable's text names its source ("It uses
+//! hlc3 as its source series"), so it is served.
 
-use crate::state::VwapHdr;
+use crate::state::{VwapHdr, VwapVar};
 use pine_ir::{abi, argwin, FaultKind, SiteId};
 use pine_vm::Frame;
 
@@ -72,5 +73,47 @@ pub fn bi_ta_vwap_bands(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result
     f.set_f64_arg(args[3], m);
     f.set_f64_arg(args[4], mult.mul_add(sd, m));
     f.set_f64_arg(args[5], (-mult).mul_add(sd, m));
+    Ok(())
+}
+
+const DAY_MS: i64 = 86_400_000;
+
+/// The `ta.vwap` variable — window `[out]`, block `VwapVar`: the volume-weighted average of
+/// `hlc3` (the reference: "It uses hlc3 as its source series") since the bar's UTC day began
+/// (§4.13.8, `pin:04-exchange-tz`). A sema prelude call advances it on every bar (§1.4 item 6).
+/// An na `hlc3` or volume adds nothing and the bar's value is na (`na: propagate`,
+/// `pin:04-cum-na`); na while `Σ volume == 0`.
+pub fn bi_ta_vwap_var(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 1 {
+        return Err(FaultKind::Internal);
+    }
+    let src = (f.f64_arg(argwin::f64(abi::F_HIGH))
+        + f.f64_arg(argwin::f64(abi::F_LOW))
+        + f.f64_arg(argwin::f64(abi::F_CLOSE)))
+        / 3.0;
+    let vol = f.f64_arg(argwin::f64(abi::F_VOLUME));
+    let day = f
+        .i64_arg(argwin::i64(abi::I_TIME))
+        .unwrap_or(0)
+        .div_euclid(DAY_MS);
+    let s = f.state::<VwapVar>(site);
+    if s.started == 0 || s.day != day {
+        s.sv = 0.0;
+        s.spv = 0.0;
+        s.day = day;
+        s.started = 1;
+    }
+    let v = if src.is_nan() || vol.is_nan() {
+        f64::NAN
+    } else {
+        s.sv += vol;
+        s.spv += vol * src;
+        if s.sv == 0.0 {
+            f64::NAN
+        } else {
+            s.spv / s.sv
+        }
+    };
+    f.set_f64_arg(args[0], v);
     Ok(())
 }

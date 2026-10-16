@@ -18,7 +18,7 @@ const MAX_ARG: u32 = 14;
 const MAX_FRAC: u8 = 16;
 
 /// Segment kinds.
-mod seg {
+pub(crate) mod seg {
     pub const LIT: u8 = 0;
     pub const ARG: u8 = 1;
     pub const NUMBER: u8 = 2;
@@ -34,13 +34,13 @@ mod seg {
 /// argument `arg` with number pattern `pat` (`NUMPAT`) or a date pattern range (`DATE`/`TIME`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
-struct FmtSeg {
-    kind: u8,
-    arg: u8,
-    pat: u8,
+pub(crate) struct FmtSeg {
+    pub(crate) kind: u8,
+    pub(crate) arg: u8,
+    pub(crate) pat: u8,
     _pad: u8,
-    off: u16,
-    len: u16,
+    pub(crate) off: u16,
+    pub(crate) len: u16,
 }
 const _: () = assert!(core::mem::size_of::<FmtSeg>() == 8 && core::mem::align_of::<FmtSeg>() == 2);
 
@@ -48,17 +48,17 @@ const _: () = assert!(core::mem::size_of::<FmtSeg>() == 8 && core::mem::align_of
 /// template ranges, apostrophe quoting).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
-struct NumPat {
-    min_int: u8,
-    min_frac: u8,
-    max_frac: u8,
-    group: u8,
-    percent: u8,
+pub(crate) struct NumPat {
+    pub(crate) min_int: u8,
+    pub(crate) min_frac: u8,
+    pub(crate) max_frac: u8,
+    pub(crate) group: u8,
+    pub(crate) percent: u8,
     _pad: [u8; 3],
-    pre_off: u16,
-    pre_len: u16,
-    suf_off: u16,
-    suf_len: u16,
+    pub(crate) pre_off: u16,
+    pub(crate) pre_len: u16,
+    pub(crate) suf_off: u16,
+    pub(crate) suf_len: u16,
 }
 const _: () = assert!(core::mem::size_of::<NumPat>() == 16 && core::mem::align_of::<NumPat>() == 2);
 
@@ -66,9 +66,9 @@ const _: () = assert!(core::mem::size_of::<NumPat>() == 16 && core::mem::align_o
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct FmtProg {
-    segs: [FmtSeg; FMT_MAX_SEGMENTS],
-    pats: [NumPat; MAX_PATS],
-    n_segs: u8,
+    pub(crate) segs: [FmtSeg; FMT_MAX_SEGMENTS],
+    pub(crate) pats: [NumPat; MAX_PATS],
+    pub(crate) n_segs: u8,
     n_pats: u8,
     _pad: [u8; 6],
 }
@@ -332,6 +332,15 @@ fn num_pat(t: &[u8], a: usize, b: usize) -> Result<NumPat, LoadErr> {
     p.suf_off = s0 as u16;
     p.suf_len = (b - s0) as u16;
     Ok(p)
+}
+
+/// Compile a whole string as one number pattern (`str.tostring(x, format)` at run time; no heap,
+/// the 16-byte result by value). Affix ranges index `t`.
+pub(crate) fn num_pat_of(t: &[u8]) -> Result<NumPat, LoadErr> {
+    if t.len() > u16::MAX as usize {
+        return Err(bad(0, "pattern longer than 65535 bytes"));
+    }
+    num_pat(t, 0, t.len())
 }
 
 /// Prefix/suffix characters: `%` sets percent; `;`, `E`, `¤` (0xC2 0xA4), `‰` are unsupported.

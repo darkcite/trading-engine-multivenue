@@ -172,21 +172,32 @@ fn tf_of(f: &Frame<'_>, e: u16) -> Option<u32> {
     }
 }
 
+/// Seconds of one month as `timeframe.in_seconds` reports them: the reference's remark —
+/// "calculations use 2628003 as the number of seconds in one month" (`pin:04-tf-month-seconds`,
+/// lead ruling 2026-10-16). Only this body uses it; `tf_seconds` (the load-time sort key) keeps
+/// `MONTH_SORT_S`.
+pub(crate) const IN_SECONDS_MONTH: i64 = 2_628_003;
+
 /// `timeframe.in_seconds(timeframe)` — window `[timeframe, out]`: `tf_seconds`, `""` → the
-/// chart's `timeframe_s`; na or unparsable → na. The value is `tf_seconds`' (`"1M"` =
-/// `MONTH_SORT_S`), not checked against the bar clock.
+/// chart's `timeframe_s`; na or unparsable → na. A month timeframe (`N` months, the sort key
+/// `N × MONTH_SORT_S`) reports `N × 2 628 003` (`pin:04-tf-month-seconds`); every other unit is
+/// `tf_seconds`' value. Not checked against the bar clock.
 pub fn bi_tf_in_seconds(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 2 {
         return Err(FaultKind::Internal);
     }
-    let v = match f.str_arg(args[0]) {
+    let secs = match f.str_arg(args[0]) {
         None => None,
         Some(s) => match tf_seconds(s) {
-            Ok(None) => Some(f.meta().chart.timeframe_s as i64),
-            Ok(Some(x)) => Some(x as i64),
+            Ok(None) => Some(f.meta().chart.timeframe_s),
+            Ok(Some(x)) => Some(x),
             Err(_) => None,
         },
     };
+    let v = secs.map(|x| match crate::load::tf_parts(x) {
+        Some(p) if p.unit == crate::load::TfUnit::Month => p.mult as i64 * IN_SECONDS_MONTH,
+        _ => x as i64,
+    });
     f.set_i64_arg(args[1], v);
     Ok(())
 }

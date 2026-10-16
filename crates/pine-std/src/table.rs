@@ -735,6 +735,17 @@ const fn build() -> Built {
     );
     put(
         &mut b,
+        ov::TA_VWAP_VAR,
+        row(
+            ov::TA_VWAP_VAR,
+            ta::cum::bi_ta_vwap_var,
+            2,
+            st,
+            Blk::Fixed(size_of::<crate::state::VwapVar>() as u32),
+        ),
+    );
+    put(
+        &mut b,
         ov::TA_VWAP_FFF,
         row(
             skip(ov::TA_VWAP_FFF),
@@ -2000,6 +2011,165 @@ const fn build() -> Built {
         &mut b,
         ov::OP_ADD_STR,
         row(ov::OP_ADD_STR, sx::bi_add_str, 2, bf::STR_ALLOC, Blk::None),
+    );
+    // T13 — the copying str.* family on `Frame::str_alloc_with` (contract A7.2).
+    use crate::strbuild as sb;
+    put(
+        &mut b,
+        ov::STR_UPPER,
+        row(
+            ov::STR_UPPER,
+            sb::bi_case::<true>,
+            2,
+            bf::STR_ALLOC,
+            Blk::None,
+        ),
+    );
+    put(
+        &mut b,
+        ov::STR_LOWER,
+        row(
+            ov::STR_LOWER,
+            sb::bi_case::<false>,
+            2,
+            bf::STR_ALLOC,
+            Blk::None,
+        ),
+    );
+    put(
+        &mut b,
+        ov::STR_REPLACE,
+        row(ov::STR_REPLACE, sb::bi_replace, 3, bf::STR_ALLOC, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::STR_REPLACE_ALL,
+        row(
+            ov::STR_REPLACE_ALL,
+            sb::bi_replace_all,
+            3,
+            bf::STR_ALLOC,
+            Blk::None,
+        ),
+    );
+    put(
+        &mut b,
+        ov::STR_REPEAT,
+        row(ov::STR_REPEAT, sb::bi_repeat, 3, bf::STR_ALLOC, Blk::None),
+    );
+    // T12 — the exact number renderer and str.tostring(int / float / bool[, format]).
+    use crate::strnum as sn;
+    put(
+        &mut b,
+        ov::STR_TOSTRING_I,
+        row(
+            ov::STR_TOSTRING_I,
+            sn::bi_tostring_i,
+            2,
+            bf::STR_ALLOC,
+            Blk::None,
+        ),
+    );
+    put(
+        &mut b,
+        ov::STR_TOSTRING_F,
+        row(
+            ov::STR_TOSTRING_F,
+            sn::bi_tostring_f,
+            4,
+            bf::STR_ALLOC,
+            Blk::None,
+        ),
+    );
+    put(
+        &mut b,
+        ov::STR_TOSTRING_B,
+        row(
+            ov::STR_TOSTRING_B,
+            sn::bi_tostring_b,
+            1,
+            bf::STR_ALLOC,
+            Blk::None,
+        ),
+    );
+    put(
+        &mut b,
+        ov::STR_TOSTRING_FS,
+        row(
+            ov::STR_TOSTRING_FS,
+            sn::bi_tostring_fmt::<false>,
+            4,
+            bf::STR_ALLOC,
+            Blk::None,
+        ),
+    );
+    put(
+        &mut b,
+        ov::STR_TOSTRING_IS,
+        row(
+            ov::STR_TOSTRING_IS,
+            sn::bi_tostring_fmt::<true>,
+            4,
+            bf::STR_ALLOC,
+            Blk::None,
+        ),
+    );
+    // T13 — str.format (scalar arguments) and str.format_time.
+    use crate::strfmt as sf;
+    put(
+        &mut b,
+        ov::STR_FORMAT_B,
+        row(
+            ov::STR_FORMAT_B,
+            sf::bi_str_format,
+            8,
+            bf::STR_ALLOC,
+            Blk::None,
+        ),
+    );
+    put(
+        &mut b,
+        ov::STR_FORMAT_F,
+        row(
+            ov::STR_FORMAT_F,
+            sf::bi_str_format,
+            8,
+            bf::STR_ALLOC,
+            Blk::None,
+        ),
+    );
+    put(
+        &mut b,
+        ov::STR_FORMAT_I,
+        row(
+            ov::STR_FORMAT_I,
+            sf::bi_str_format,
+            8,
+            bf::STR_ALLOC,
+            Blk::None,
+        ),
+    );
+    put(
+        &mut b,
+        ov::STR_FORMAT_S,
+        row(
+            ov::STR_FORMAT_S,
+            sf::bi_str_format,
+            8,
+            bf::STR_ALLOC,
+            Blk::None,
+        ),
+    );
+    put(
+        &mut b,
+        ov::STR_FORMAT_TIME,
+        row(
+            ov::STR_FORMAT_TIME,
+            sf::bi_format_time,
+            6,
+            bf::STR_ALLOC,
+            Blk::None,
+        ),
     );
     b
 }

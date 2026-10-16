@@ -288,14 +288,15 @@ pub fn bi_str_match(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(),
     };
     let key = fnv1a(pat);
     if f.state_ro::<crate::state::RegexCache>(site).key != key {
-        let mut local = crate::load::RegexProg::EMPTY;
-        crate::load::regex_compile_into(pat, &mut local).map_err(|_| FaultKind::ScriptRefused)?;
-        let c = f.state::<crate::state::RegexCache>(site);
-        // COPY: the freshly compiled RegexProg 2 568 B into the site's cache, once per pattern
-        // change — `Frame` lends the pattern bytes and the state block only one at a time, so the
-        // compile cannot write the block in place (CAR: a `Frame` accessor lending both) —
-        // compiling on every call rejected: the work is O(pattern), the copy O(1) per change.
-        c.prog = local;
+        // A7.1: the pattern bytes and the block in one lend — the compile writes the cache in
+        // place (no stack program, no copy). The key goes cold first, so a refused pattern
+        // leaves no key naming the partial program `regex_compile_into` may have written.
+        let (c, pat) = f.state_and_str::<crate::state::RegexCache>(site, args[1]);
+        c.key = 0;
+        let Some(pat) = pat else {
+            return Err(FaultKind::Internal);
+        };
+        crate::load::regex_compile_into(pat, &mut c.prog).map_err(|_| FaultKind::ScriptRefused)?;
         c.key = key;
     }
     let none_empty =

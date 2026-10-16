@@ -294,3 +294,37 @@ fn timestamp_carries_fields() {
     assert_eq!(&got[0][..5], &[sun, sun, sun, sun, sun]);
     assert_eq!((got[0][5], got[0][6]), (0.0, -1000.0));
 }
+
+/// `timeframe.in_seconds` on month timeframes: `N × 2 628 003` — the reference's remark
+/// ("calculations use 2628003 as the number of seconds in one month"; lead ruling
+/// `pin:04-tf-month-seconds`) — while `tf_seconds`, the load-time sort key, keeps
+/// `MONTH_SORT_S`. Other units are unchanged.
+#[test]
+fn tf_in_seconds_month_is_2628003() {
+    let rows = vec![
+        (ov::TIMEFRAME_IN_SECONDS, vec![s("M")]),
+        (ov::TIMEFRAME_IN_SECONDS, vec![s("1M")]),
+        (ov::TIMEFRAME_IN_SECONDS, vec![s("3M")]),
+        (ov::TIMEFRAME_IN_SECONDS, vec![s("12M")]),
+        (ov::TIMEFRAME_IN_SECONDS, vec![s("1W")]),
+        (ov::TIMEFRAME_IN_SECONDS, vec![s("15")]),
+        (ov::TIMEFRAME_IN_SECONDS, vec![(Lane::I64, Src::Na)]),
+    ];
+    let got = run(&rows, &[0], Dialect::V6);
+    assert_eq!(
+        &got[0][..6],
+        &[
+            2_628_003.0,
+            2_628_003.0,
+            7_884_009.0,
+            31_536_036.0,
+            604_800.0,
+            900.0
+        ]
+    );
+    assert!(got[0][6].is_nan());
+    assert_eq!(
+        pine_std::tf_seconds(b"1M"),
+        Ok(Some(pine_std::MONTH_SORT_S))
+    );
+}
