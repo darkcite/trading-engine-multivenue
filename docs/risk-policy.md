@@ -15086,6 +15086,7 @@ WebSocket gateway arm, off the engine thread), at a safe minute.
 | exec | `max_open_orders` | 8 | IoC only; four 15 m families end on the same second |
 | exec | `halt_on_loss_usd_1e6` | $4 | halts with ≥ $1 (the venue's minimum) left |
 | exec | `halt_on_recon_drift_usd_1e6` | $1 | on a $5 account, $1 is a large drift |
+| exec | `request_topup_weight` | 1 000 requests ($0.50) | XMM XH5c-2: one purchase must cost at most a quarter of the $4 loss bound (5 000 = $2.50 was refused at boot, 2026-10-16 20:37Z) |
 | exec | `halt_on_reject_streak` / `halt_on_asset_refusal_streak` | 5 / 3 | unchanged |
 | exec | `halt_on_ws_gap_ms` / `halt_on_recon_stale_ms` | 30 s / 300 s | unchanged |
 | exec | `halt_on_alo_reject_pct` | 20 | the gateway's window halt (XH-7) |
