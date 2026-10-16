@@ -16032,7 +16032,7 @@ fn hl_gateway_outcome_arm_is_zero_alloc() {
                 .is_err(),
         ) << 3;
         *acc ^= u64::from(
-            arm.submit(&leg(seq + 3, k, LEG_YES, ORDER_KIND_MAKER, 300_050))
+            arm.submit(&leg(seq + 3, k, LEG_YES, ORDER_KIND_MAKER, 300_055))
                 .is_err(),
         ) << 4;
         answer(gw, n);

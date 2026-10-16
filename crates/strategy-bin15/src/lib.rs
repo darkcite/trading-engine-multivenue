@@ -121,17 +121,30 @@ const TAU_15M_MINUTES: i128 = 15;
 /// Minutes in the 8 h tenor.
 const TAU_8H_MINUTES: i128 = 480;
 
-/// HIP-4 price tick ×1e6: 1e-4 of a dollar of payout.
+/// The smallest edge a law may ask for ×1e6 (1e-4 of a dollar of payout).
+/// NOT the venue's price law: that is [`PX_SIG_FIGS`] (H90 G2).
 pub const GRID_TICK_1E6: i64 = 100;
+
+/// HIP-4 price law: at most this many significant figures. BIN15 H90 G2
+/// (2026-10-16): mainnet accepted and filled IoCs at 0.99909 and 0.99911
+/// (doc 33 §9 / §9b), so the 1e-4 tick the grid carried until then was
+/// stricter than the venue and skipped real asks. In ×1e6 units a price at
+/// or above 0.1 is a multiple of 10 (1e-5); below 0.1 every ×1e6 value
+/// already has at most five figures.
+pub const PX_SIG_FIGS: u32 = 5;
+
+/// The ×1e6 level at and above which a price has six digits, so its last
+/// one must be 0 to keep [`PX_SIG_FIGS`] figures.
+const PX_SIX_DIGITS_1E6: i64 = 100_000;
 
 /// HIP-4 lot ×1e6: one whole contract.
 pub const GRID_LOT_1E6: i64 = 1_000_000;
 
-/// Lowest quotable binary price ×1e6 (0.001).
-pub const GRID_PX_MIN_1E6: i64 = 1_000;
+/// Lowest binary price ×1e6 (0.00001).
+pub const GRID_PX_MIN_1E6: i64 = 10;
 
-/// Highest quotable binary price ×1e6 (0.999).
-pub const GRID_PX_MAX_1E6: i64 = 999_000;
+/// Highest binary price ×1e6 (0.99999).
+pub const GRID_PX_MAX_1E6: i64 = 999_990;
 
 /// Minimum order notional ×1e6 ($1). MEASURED, not read from a doc:
 /// the venue refuses `Order must have minimum value of 1 USDC.` (testnet,
@@ -1894,7 +1907,7 @@ impl Bin15Strategy {
     #[inline]
     #[must_use]
     pub fn on_grid(px_1e6: i64, qty_1e6: i64) -> bool {
-        px_1e6 % GRID_TICK_1E6 == 0
+        (px_1e6 < PX_SIX_DIGITS_1E6 || px_1e6 % 10 == 0)
             && qty_1e6 % GRID_LOT_1E6 == 0
             && (GRID_PX_MIN_1E6..=GRID_PX_MAX_1E6).contains(&px_1e6)
             && (px_1e6 as i128 * qty_1e6 as i128) / 1_000_000 >= GRID_MIN_NOTIONAL_1E6

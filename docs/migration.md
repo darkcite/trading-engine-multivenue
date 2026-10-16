@@ -6,6 +6,36 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-16 — HIP-4 outcome prices: the venue's five-significant-figure law replaces the 1e-4 tick (BIN15 H90 G2)
+
+**What changed**
+- `exec_hyperliquid::rules::OutcomeRules::check` accepts a price with at most
+  `PX_SIG_FIGS` = 5 significant figures in [0.00001, 0.99999]. It was a 1e-4
+  tick in [0.001, 0.999]. Mainnet accepted and filled IoCs at 0.99909 and
+  0.99911 (vault doc 33 §9 / §9b), so the old rule refused real asks.
+  - New: `OutcomeRules::sig_figs_ok` and `OutcomeRules::PX_SIG_FIGS`.
+  - `TICK_1E8` stays, as the outcome battery's and the probe's own walking
+    step only.
+- `strategy_bin15::Bin15Strategy::on_grid` follows the same law at ×1e6:
+  - a price ≥ 0.1 is a multiple of 10;
+  - `GRID_PX_MIN_1E6` = 10 and `GRID_PX_MAX_1E6` = 999 990;
+  - the new `PX_SIG_FIGS`.
+  - `GRID_TICK_1E6` (1e-4) remains only as the smallest edge a law may ask
+    for.
+- Agreement:
+  - `cli::bin15_boot` holds both at compile time (`PX_SIG_FIGS`, lot, range,
+    $1).
+  - Its agreement test now walks EVERY ×1e6 price (was a step of 50).
+- **The harness:** `backtest::fill`'s HIP-4 grid gate calls `OutcomeRules::check`.
+  The `PREDICTION_TICK_1E6`, `PREDICTION_LOT_1E6`, `PREDICTION_PX_MIN_1E6`,
+  `PREDICTION_PX_MAX_1E6` and `PREDICTION_MIN_NOTIONAL_1E6` constants are
+  removed. Replays of tapes with five-figure asks can now fill them.
+- `hl_outcome_probe::venue_price` is `OutcomeRules`' law, with no copy of its
+  own.
+
+**Operator action:** none. Paper and replay entries at five-figure asks (such
+as 0.94372) are no longer skipped (`skipped_grid`).
+
 ## 2026-10-16 — Binance options: `venue_time_ms`, the stale flag and `engine_ingress_binance_options_*` (HK42)
 
 **What changed**

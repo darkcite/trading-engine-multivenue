@@ -30,7 +30,7 @@ use tracing::{info, warn};
 // two would refuse every leg order (`refused_rules`): held at compile time.
 const _: () = {
     use exec_hyperliquid::rules::OutcomeRules as R;
-    assert!(strategy_bin15::GRID_TICK_1E6 * 100 == R::TICK_1E8);
+    assert!(strategy_bin15::PX_SIG_FIGS == R::PX_SIG_FIGS);
     assert!(strategy_bin15::GRID_LOT_1E6 * 100 == R::LOT_1E8);
     assert!(strategy_bin15::GRID_PX_MIN_1E6 * 100 == R::PX_MIN_1E8);
     assert!(strategy_bin15::GRID_PX_MAX_1E6 * 100 == R::PX_MAX_1E8);
@@ -579,11 +579,11 @@ pub fn day_cap_warning(params: &strategy_bin15::Bin15Params) -> String {
 mod tests {
     use super::*;
 
-    /// XH4i-3a (risk review r1): BIN15's grid test and the gateway arm's
-    /// `OutcomeRules::check` agree on every price around the grid — each
-    /// tick and between ticks, past both ends — and on sizes around the lot
-    /// and the $1 floor: no order BIN15 lets through is refused, and none
-    /// it holds back would pass.
+    /// XH4i-3a (risk review r1), H90 G2: BIN15's grid test and the gateway
+    /// arm's `OutcomeRules::check` agree on EVERY ×1e6 price from below zero
+    /// to past one — so on the five-figure law at every level and past both
+    /// ends — and on sizes around the lot and the $1 floor: no order BIN15
+    /// lets through is refused, and none it holds back would pass.
     #[test]
     fn bin15_s_grid_test_and_the_outcome_rules_agree() {
         let qtys = [
@@ -607,7 +607,7 @@ mod tests {
                     "px {px} qty {q}"
                 );
             }
-            px += 50;
+            px += 1;
         }
     }
 
