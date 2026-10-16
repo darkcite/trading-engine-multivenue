@@ -74,14 +74,36 @@ const NA_I: (Lane, Src) = (Lane::I64, Src::Na);
 const I: &[Lane] = &[Lane::I64];
 const F: &[Lane] = &[Lane::F64];
 
-/// The fault `id` returns for `k`: pine-vm admits `StrArenaFull` / `PoolFull` only from rows
-/// declaring `STR_ALLOC` / `POOL` (`pin:04-coll-undeclared-fault`); otherwise `Internal`.
-fn declared(id: OverloadId, k: FaultKind) -> FaultKind {
-    let fl = pine_spec::OVERLOADS[id.0 as usize].bf;
-    match k {
-        FaultKind::StrArenaFull if fl & pine_vm::bf::STR_ALLOC == 0 => FaultKind::Internal,
-        FaultKind::PoolFull if fl & pine_vm::bf::POOL == 0 => FaultKind::Internal,
-        _ => k,
+/// Spec 7d2ac894…: every collection row that stores or returns a string declares `STR_ALLOC`, and
+/// every one that may take a cell or grow declares `POOL` (F10), so a full cell / arena is
+/// `StrArenaFull` and a push beyond `__cap` `PoolFull` — no `Internal` fallback any more.
+#[test]
+fn collection_rows_declare_their_faults() {
+    let fl = |id: OverloadId| pine_spec::OVERLOADS[id.0 as usize].bf;
+    for id in [
+        ov::ARRAY_GET,
+        ov::ARRAY_SET,
+        ov::ARRAY_POP,
+        ov::ARRAY_SHIFT,
+        ov::ARRAY_REMOVE,
+        ov::ARRAY_FIRST,
+        ov::ARRAY_LAST,
+        ov::MAP_GET,
+        ov::MAP_REMOVE,
+    ] {
+        assert!(fl(id) & pine_vm::bf::STR_ALLOC != 0, "{id:?}");
+    }
+    for id in [
+        ov::ARRAY_PUSH,
+        ov::ARRAY_UNSHIFT,
+        ov::ARRAY_INSERT,
+        ov::MAP_PUT,
+    ] {
+        let f = fl(id);
+        assert!(
+            f & pine_vm::bf::STR_ALLOC != 0 && f & pine_vm::bf::POOL != 0,
+            "{id:?}"
+        );
     }
 }
 
@@ -250,7 +272,7 @@ fn coll_block_bytes_matches_layout() {
         let r = once(&calls, Dialect::V6);
         match want {
             Ok(()) => assert_eq!(r.unwrap()[4], 3.0),
-            Err(k) => assert_eq!(r, Err(declared(ov::ARRAY_SET, k))),
+            Err(k) => assert_eq!(r, Err(k)),
         }
     }
     // Under one word per string cell: Internal.
@@ -408,7 +430,7 @@ fn collection_fault_table_core_rows() {
         (
             vec![arr(4), c(ov::ARRAY_PUSH, vec![o(0), ft(1.0)], &[])],
             Dialect::V6,
-            Err(declared(ov::ARRAY_PUSH, FaultKind::PoolFull)),
+            Err(FaultKind::PoolFull),
         ),
         (
             vec![arr(3), c(ov::ARRAY_PUSH, vec![o(0), ft(1.0)], &[])],
@@ -502,7 +524,7 @@ fn collection_fault_table_core_rows() {
                 c(ov::ARRAY_PUSH, vec![o(0), o(1)], &[]),
             ],
             Dialect::V6,
-            Err(declared(ov::ARRAY_PUSH, FaultKind::StrArenaFull)),
+            Err(FaultKind::StrArenaFull),
         ),
     ];
     for (k, (calls, d, want)) in cases.iter().enumerate() {
@@ -564,8 +586,10 @@ fn coll_slice_writes_reach_the_owner() {
 }
 
 /// Strings: a `CONST` element is its ref (zero-copy); a runtime-built one is copied into a cell
-/// and its read needs `STR_ALLOC`, which pine-spec's `array.get` row lacks
-/// (`pin:04-coll-read-str-alloc`, a CAR): `Internal` until the row carries it.
+/// and read back through `str_alloc` (the `array.get` row is `STR_ALLOC`, spec 7d2ac894…). I13 /
+/// I14 through `array.get`: an element built in SCRATCH on bar 0 reads back by bytes on every
+/// later bar (scratch reset in between); a string of exactly the cell's bytes round-trips, one
+/// byte more is `StrArenaFull` and leaves the array as it was.
 #[test]
 fn string_elements_const_and_owned() {
     let sb = coll_block_bytes(CollKind::Array, Ty::String, Ty::Void, 4, 16);
@@ -587,15 +611,44 @@ fn string_elements_const_and_owned() {
         c(ov::OP_ADD_STR, vec![st("ab"), st("cd")], I),
         c(ov::ARRAY_PUSH, vec![o(0), o(1)], &[]),
         c(ov::ARRAY_GET, vec![o(0), it(0)], I),
+        c(ov::OP_EQ_STR, vec![o(3), st("abcd")], I),
     ];
-    let get_has_str_alloc =
-        pine_spec::OVERLOADS[ov::ARRAY_GET.0 as usize].bf & pine_vm::bf::STR_ALLOC != 0;
-    let r = once(&calls, Dialect::V6);
-    if get_has_str_alloc {
-        assert!(r.is_ok());
-    } else {
-        assert_eq!(r, Err(FaultKind::Internal));
+    assert_eq!(once(&calls, Dialect::V6).unwrap()[4], 1.0);
+    // I13 across bars: built and pushed on bar 0 only, read on every bar.
+    let mut owner = new(ov::ARRAY_NEW_STRING, Ty::String, 4, sb, vec![it(0), NA_I]);
+    owner.guard = Some(0);
+    let mut cat = c(ov::OP_ADD_STR, vec![st("abcdefgh"), st("ijklmnop")], I);
+    cat.guard = Some(0);
+    let mut push = c(ov::ARRAY_PUSH, vec![o(0), o(1)], &[]);
+    push.guard = Some(0);
+    let calls = vec![
+        owner,
+        cat,
+        push,
+        c(ov::OP_ADD_STR, vec![st("scratch"), st("-noise")], I),
+        c(ov::ARRAY_GET, vec![o(0), it(0)], I),
+        c(ov::OP_EQ_STR, vec![o(4), st("abcdefghijklmnop")], I),
+        c(ov::ARRAY_SIZE, vec![o(0)], I),
+    ];
+    let feed: Vec<Vec<f64>> = (0..12).map(|i| vec![(i == 0) as u8 as f64]).collect();
+    let (r, a) = run(&calls, &feed, Dialect::V6);
+    for (b, row) in r.unwrap().iter().enumerate() {
+        assert_eq!((row[5], row[6]), (1.0, 1.0), "bar {b}");
     }
+    assert_eq!(a, 0, "array.get of an owned string allocated");
+    // I14: 17 bytes into a 16-byte cell — StrArenaFull, nothing changed (a later call never runs).
+    let calls = vec![
+        new(
+            ov::ARRAY_NEW_STRING,
+            Ty::String,
+            4,
+            sb,
+            vec![it(1), st("k")],
+        ),
+        c(ov::OP_ADD_STR, vec![st("abcdefgh"), st("ijklmnopq")], I),
+        c(ov::ARRAY_SET, vec![o(0), it(0), o(1)], &[]),
+    ];
+    assert_eq!(once(&calls, Dialect::V6), Err(FaultKind::StrArenaFull));
 }
 
 /// The accessors allocate nothing: a `var`-like owner (created on bar 0 only) pushed, read, set and
@@ -1280,4 +1333,377 @@ fn array_binary_search_rows() {
     ];
     let r = once(&calls, Dialect::V6).unwrap();
     assert_eq!((r[5], r[6], r[7], r[8], r[9]), (1.0, 2.0, -1.0, 2.0, -1.0));
+}
+
+/// `array.fill` (`pin:04-array-fill-no-grow`): `[from, to)` of the existing elements, `to` na =
+/// the size; the size never changes; `from > to`, `to > size`, a negative or na `from` is
+/// `CollectionBounds`. A runtime-built string fills each element with its own cell, re-fillable.
+#[test]
+fn array_fill_sets_existing_elements_only() {
+    let b = float_block(8);
+    let base = || {
+        let mut v = vec![new(
+            ov::ARRAY_NEW_FLOAT,
+            Ty::Float,
+            8,
+            b,
+            vec![it(0), ft(0.0)],
+        )];
+        for x in 1..=5 {
+            v.push(c(ov::ARRAY_PUSH, vec![o(0), ft(x as f64)], &[]));
+        }
+        v
+    };
+    let mut calls = base();
+    calls.push(c(ov::ARRAY_FILL, vec![o(0), ft(9.0), it(1), it(3)], &[]));
+    for i in 0..5 {
+        calls.push(c(ov::ARRAY_GET, vec![o(0), it(i)], F));
+    }
+    calls.push(c(ov::ARRAY_SIZE, vec![o(0)], I));
+    let r = once(&calls, Dialect::V6).unwrap();
+    assert_eq!(&r[7..13], &[1.0, 9.0, 9.0, 4.0, 5.0, 5.0]);
+    let mut calls = base();
+    calls.push(c(ov::ARRAY_FILL, vec![o(0), ft(7.0), it(0), NA_I], &[]));
+    calls.push(c(ov::ARRAY_SUM_F, vec![o(0)], F));
+    calls.push(c(ov::ARRAY_SIZE, vec![o(0)], I));
+    let r = once(&calls, Dialect::V6).unwrap();
+    assert_eq!((r[7], r[8]), (35.0, 5.0));
+    for (from, to) in [
+        (it(3), it(2)),
+        (it(0), it(6)),
+        (it(-1), it(2)),
+        (NA_I, it(2)),
+        (it(0), it(-1)),
+    ] {
+        let mut calls = base();
+        calls.push(c(ov::ARRAY_FILL, vec![o(0), ft(7.0), from, to], &[]));
+        assert_eq!(once(&calls, Dialect::V6), Err(FaultKind::CollectionBounds));
+    }
+    // Strings: 4 elements, each re-filled every bar with a SCRATCH string (cells released first).
+    let sb = coll_block_bytes(CollKind::Array, Ty::String, Ty::Void, 4, 16);
+    let mut owner = new(
+        ov::ARRAY_NEW_STRING,
+        Ty::String,
+        4,
+        sb,
+        vec![it(4), st("k")],
+    );
+    owner.guard = Some(0);
+    let calls = vec![
+        owner,
+        c(ov::OP_ADD_STR, vec![st("xy"), st("z")], I),
+        c(ov::ARRAY_FILL, vec![o(0), o(1), it(0), NA_I], &[]),
+        c(ov::ARRAY_GET, vec![o(0), it(3)], I),
+        c(ov::OP_EQ_STR, vec![o(3), st("xyz")], I),
+    ];
+    let feed: Vec<Vec<f64>> = (0..10).map(|i| vec![(i == 0) as u8 as f64]).collect();
+    let (r, a) = run(&calls, &feed, Dialect::V6);
+    for row in r.unwrap() {
+        assert_eq!(row[4], 1.0);
+    }
+    assert_eq!(a, 0, "array.fill allocated");
+}
+
+/// `array.variance` / `stdev` (`pin:04-array-variance-two-pass`): mean, then Σ(x − mean)², over
+/// the non-na values; biased ÷ n, unbiased ÷ (n − 1); empty → na.
+#[test]
+fn array_variance_stdev_two_pass() {
+    let b = float_block(8);
+    let xs = [1.0, 2.0, f64::NAN, 3.0, 4.0];
+    let mut calls = vec![new(
+        ov::ARRAY_NEW_FLOAT,
+        Ty::Float,
+        8,
+        b,
+        vec![it(0), ft(0.0)],
+    )];
+    for x in xs {
+        calls.push(c(ov::ARRAY_PUSH, vec![o(0), ft(x)], &[]));
+    }
+    let k = calls.len();
+    calls.push(c(ov::ARRAY_VARIANCE_F, vec![o(0), it(1)], F));
+    calls.push(c(ov::ARRAY_VARIANCE_F, vec![o(0), it(0)], F));
+    calls.push(c(ov::ARRAY_STDEV_F, vec![o(0), it(1)], F));
+    calls.push(c(ov::ARRAY_STDEV_F, vec![o(0), it(0)], F));
+    let r = once(&calls, Dialect::V6).unwrap();
+    let ss = 5.0f64; // mean 2.5: 2.25 + 0.25 + 0.25 + 2.25
+    assert_eq!(r[k], ss / 4.0);
+    assert_eq!(r[k + 1], ss / 3.0);
+    assert_eq!(r[k + 2], (ss / 4.0).sqrt());
+    assert_eq!(r[k + 3], (ss / 3.0).sqrt());
+    let calls = vec![
+        new(ov::ARRAY_NEW_FLOAT, Ty::Float, 8, b, vec![it(1), ft(2.0)]),
+        c(ov::ARRAY_VARIANCE_F, vec![o(0), it(1)], F),
+        c(ov::ARRAY_VARIANCE_F, vec![o(0), it(0)], F),
+        c(ov::ARRAY_CLEAR, vec![o(0)], &[]),
+        c(ov::ARRAY_STDEV_F, vec![o(0), it(1)], F),
+    ];
+    let r = once(&calls, Dialect::V6).unwrap();
+    assert_eq!(r[1], 0.0);
+    assert!(r[2].is_nan() && r[4].is_nan());
+}
+
+/// `array.copy` / `array.from` / `array.concat` copy elements: a copy is independent of its
+/// source; runtime-built strings get their own cells (also `concat(a, a)`); past `__cap` /
+/// `cap` is `PoolFull`; a view as `concat`'s `id1` is `CollectionBounds`.
+#[test]
+fn array_copy_from_concat() {
+    let b = float_block(4);
+    let calls = vec![
+        new(
+            ov::ARRAY_FROM_AF,
+            Ty::Float,
+            4,
+            b,
+            vec![ft(1.5), ft(2.5), ft(3.5)],
+        ),
+        new(ov::ARRAY_COPY, Ty::Float, 4, b, vec![o(0)]),
+        c(ov::ARRAY_SET, vec![o(0), it(1), ft(9.0)], &[]),
+        c(ov::ARRAY_GET, vec![o(1), it(1)], F),
+        c(ov::ARRAY_SIZE, vec![o(1)], I),
+        new(ov::ARRAY_SLICE, Ty::Float, 0, 32, vec![o(0), it(1), it(3)]),
+        new(ov::ARRAY_COPY, Ty::Float, 4, b, vec![o(5)]),
+        c(ov::ARRAY_SUM_F, vec![o(6)], F),
+    ];
+    let r = once(&calls, Dialect::V6).unwrap();
+    assert_eq!((r[3], r[4], r[7]), (2.5, 3.0, 12.5));
+    // Past __cap.
+    let calls = vec![
+        new(
+            ov::ARRAY_FROM_AF,
+            Ty::Float,
+            4,
+            b,
+            vec![ft(1.0), ft(2.0), ft(3.0)],
+        ),
+        new(ov::ARRAY_COPY, Ty::Float, 2, float_block(2), vec![o(0)]),
+    ];
+    assert_eq!(once(&calls, Dialect::V6), Err(FaultKind::PoolFull));
+    let calls = vec![new(
+        ov::ARRAY_FROM_AF,
+        Ty::Float,
+        2,
+        float_block(2),
+        vec![ft(1.0), ft(2.0), ft(3.0)],
+    )];
+    assert_eq!(once(&calls, Dialect::V6), Err(FaultKind::PoolFull));
+    // Strings: from, copy and concat(a, a) of owned cells.
+    let sb = coll_block_bytes(CollKind::Array, Ty::String, Ty::Void, 6, 16);
+    let calls = vec![
+        c(ov::OP_ADD_STR, vec![st("ab"), st("cd")], I),
+        new(ov::ARRAY_FROM_AS, Ty::String, 6, sb, vec![o(0), st("k")]),
+        new(ov::ARRAY_COPY, Ty::String, 6, sb, vec![o(1)]),
+        c(ov::ARRAY_CONCAT, vec![o(1), o(1)], I),
+        c(ov::ARRAY_CONCAT, vec![o(3), o(2)], I),
+        c(ov::ARRAY_SET, vec![o(2), it(0), st("zz")], &[]),
+        c(ov::ARRAY_SIZE, vec![o(1)], I),
+        c(ov::ARRAY_GET, vec![o(1), it(2)], I),
+        c(ov::OP_EQ_STR, vec![o(7), st("abcd")], I),
+        c(ov::ARRAY_GET, vec![o(1), it(4)], I),
+        c(ov::OP_EQ_STR, vec![o(9), st("abcd")], I),
+        c(ov::ARRAY_GET, vec![o(1), it(5)], I),
+        c(ov::OP_EQ_STR, vec![o(11), st("k")], I),
+    ];
+    let r = once(&calls, Dialect::V6).unwrap();
+    assert_eq!((r[6], r[8], r[10], r[12]), (6.0, 1.0, 1.0, 1.0));
+    // concat past cap; a view as id1.
+    let calls = vec![
+        new(
+            ov::ARRAY_FROM_AF,
+            Ty::Float,
+            4,
+            b,
+            vec![ft(1.0), ft(2.0), ft(3.0)],
+        ),
+        c(ov::ARRAY_CONCAT, vec![o(0), o(0)], I),
+    ];
+    assert_eq!(once(&calls, Dialect::V6), Err(FaultKind::PoolFull));
+    let calls = vec![
+        new(ov::ARRAY_FROM_AF, Ty::Float, 4, b, vec![ft(1.0), ft(2.0)]),
+        new(ov::ARRAY_SLICE, Ty::Float, 0, 32, vec![o(0), it(0), it(1)]),
+        c(ov::ARRAY_CONCAT, vec![o(1), o(0)], I),
+    ];
+    assert_eq!(once(&calls, Dialect::V6), Err(FaultKind::CollectionBounds));
+}
+
+/// `array.join` (`pin:04-array-join-render`): elements as `str.tostring` renders them, na as
+/// `"NaN"`, separated by the separator (a SCRATCH one too); empty → `""`; a na separator → na;
+/// 0 B/op.
+#[test]
+fn array_join_renders_in_place() {
+    let b = float_block(4);
+    let ib = coll_block_bytes(CollKind::Array, Ty::Int, Ty::Void, 4, 16);
+    let sb = coll_block_bytes(CollKind::Array, Ty::String, Ty::Void, 4, 16);
+    let calls = vec![
+        new(
+            ov::ARRAY_FROM_AF,
+            Ty::Float,
+            4,
+            b,
+            vec![ft(1.5), ft(f64::NAN), ft(2.0)],
+        ),
+        c(ov::ARRAY_JOIN_AF, vec![o(0), st(",")], I),
+        c(ov::OP_EQ_STR, vec![o(1), st("1.5,NaN,2")], I),
+        new(ov::ARRAY_FROM_AI, Ty::Int, 4, ib, vec![it(1), it(-2), NA_I]),
+        c(ov::ARRAY_JOIN_AI, vec![o(3), st(", ")], I),
+        c(ov::OP_EQ_STR, vec![o(4), st("1, -2, NaN")], I),
+        c(ov::OP_ADD_STR, vec![st("b"), st("c")], I),
+        new(
+            ov::ARRAY_FROM_AS,
+            Ty::String,
+            4,
+            sb,
+            vec![st("a"), o(6), NA_I],
+        ),
+        c(ov::OP_ADD_STR, vec![st("-"), st("-")], I),
+        c(ov::ARRAY_JOIN_AS, vec![o(7), o(8)], I),
+        c(ov::OP_EQ_STR, vec![o(9), st("a--bc--NaN")], I),
+        new(ov::ARRAY_SLICE, Ty::Float, 0, 32, vec![o(0), it(1), it(1)]),
+        c(ov::ARRAY_JOIN_AF, vec![o(11), st(",")], I),
+        c(ov::OP_EQ_STR, vec![o(12), st("")], I),
+        c(ov::ARRAY_JOIN_AF, vec![o(0), NA_I], I),
+    ];
+    let feed: Vec<Vec<f64>> = (0..6).map(|_| vec![0.0]).collect();
+    let (r, a) = run(&calls, &feed, Dialect::V6);
+    for row in r.unwrap() {
+        assert_eq!((row[2], row[5], row[10], row[13]), (1.0, 1.0, 1.0, 1.0));
+        assert!(row[14].is_nan(), "na separator");
+    }
+    assert_eq!(a, 0, "array.join allocated");
+}
+
+/// String `array.sort` (bytewise, na last ascending / first descending, CONST and owned cells
+/// mixed) and `array.sort_indices` (a stable order: ties by index; the source unchanged).
+#[test]
+fn array_sort_strings_and_sort_indices() {
+    let sb = coll_block_bytes(CollKind::Array, Ty::String, Ty::Void, 8, 16);
+    let ib = coll_block_bytes(CollKind::Array, Ty::Int, Ty::Void, 8, 16);
+    let b = float_block(8);
+    let mut calls = vec![
+        c(ov::OP_ADD_STR, vec![st("b"), st("b")], I),
+        new(
+            ov::ARRAY_FROM_AS,
+            Ty::String,
+            8,
+            sb,
+            vec![st("c"), o(0), NA_I, st("a"), st("bb"), st("B")],
+        ),
+        new(ov::ARRAY_SORT_INDICES_AS, Ty::Int, 8, ib, vec![o(1), it(0)]),
+        c(ov::ARRAY_JOIN_AI, vec![o(2), st(",")], I),
+        c(ov::OP_EQ_STR, vec![o(3), st("5,3,1,4,0,2")], I),
+        c(ov::ARRAY_SORT_AS, vec![o(1), it(1)], &[]),
+        c(ov::ARRAY_JOIN_AS, vec![o(1), st(",")], I),
+        c(ov::OP_EQ_STR, vec![o(6), st("NaN,c,bb,bb,a,B")], I),
+        c(ov::ARRAY_SORT_AS, vec![o(1), it(0)], &[]),
+        c(ov::ARRAY_JOIN_AS, vec![o(1), st(",")], I),
+        c(ov::OP_EQ_STR, vec![o(9), st("B,a,bb,bb,c,NaN")], I),
+        new(
+            ov::ARRAY_FROM_AF,
+            Ty::Float,
+            8,
+            b,
+            vec![ft(2.0), ft(f64::NAN), ft(1.0), ft(2.0), ft(-0.0), ft(0.0)],
+        ),
+        new(
+            ov::ARRAY_SORT_INDICES_AF,
+            Ty::Int,
+            8,
+            ib,
+            vec![o(11), it(1)],
+        ),
+        c(ov::ARRAY_JOIN_AI, vec![o(12), st(",")], I),
+        c(ov::OP_EQ_STR, vec![o(13), st("1,0,3,2,5,4")], I),
+        c(ov::ARRAY_GET, vec![o(11), it(0)], F),
+    ];
+    calls.push(c(ov::ARRAY_SIZE, vec![o(12)], I));
+    let feed: Vec<Vec<f64>> = (0..4).map(|_| vec![0.0]).collect();
+    let (r, a) = run(&calls, &feed, Dialect::V6);
+    for row in r.unwrap() {
+        assert_eq!(
+            (row[4], row[7], row[10], row[14], row[15], row[16]),
+            (1.0, 1.0, 1.0, 1.0, 2.0, 6.0)
+        );
+    }
+    assert_eq!(a, 0, "sort / sort_indices allocated");
+}
+
+/// `map.copy` (same pairs, same order, owned strings in the copy's own cells, independent of the
+/// source) and `map.put_all` (`id2`'s pairs in order: replace in place / append; new keys past
+/// `cap` → `PoolFull`, checked before any write; `put_all(m, m)` changes nothing).
+#[test]
+fn map_copy_and_put_all() {
+    let mcopy = |src: u16, cap: u32| C {
+        id: ov::MAP_COPY,
+        ins: vec![
+            it(enc(Ty::String)),
+            it(enc(Ty::String)),
+            it(cap as i64),
+            o(src),
+        ],
+        outs: I.to_vec(),
+        bytes: coll_block_bytes(CollKind::Map, Ty::String, Ty::String, cap, 16),
+        guard: None,
+    };
+    let keys = |m: u16| {
+        new(
+            ov::MAP_KEYS,
+            Ty::String,
+            4,
+            coll_block_bytes(CollKind::Array, Ty::String, Ty::Void, 4, 16),
+            vec![o(m)],
+        )
+    };
+    let calls = vec![
+        map_new(Ty::String, Ty::String, 4),                     // 0
+        c(ov::OP_ADD_STR, vec![st("k"), st("1")], I),           // 1
+        c(ov::OP_ADD_STR, vec![st("v"), st("1")], I),           // 2
+        c(ov::MAP_PUT, vec![o(0), o(1), o(2)], I),              // 3
+        c(ov::MAP_PUT, vec![o(0), st("k2"), st("v2")], I),      // 4
+        mcopy(0, 4),                                            // 5
+        c(ov::MAP_PUT, vec![o(0), st("k1"), st("changed")], I), // 6
+        c(ov::MAP_GET, vec![o(5), st("k1")], I),                // 7
+        c(ov::OP_EQ_STR, vec![o(7), st("v1")], I),              // 8
+        keys(5),                                                // 9
+        c(ov::ARRAY_JOIN_AS, vec![o(9), st(",")], I),           // 10
+        c(ov::OP_EQ_STR, vec![o(10), st("k1,k2")], I),          // 11
+        map_new(Ty::String, Ty::String, 4),                     // 12
+        c(ov::MAP_PUT, vec![o(12), st("k2"), st("x")], I),      // 13
+        c(ov::MAP_PUT, vec![o(12), st("k0"), st("y")], I),      // 14
+        c(ov::MAP_PUT_ALL, vec![o(12), o(5)], &[]),             // 15
+        keys(12),                                               // 16
+        c(ov::ARRAY_JOIN_AS, vec![o(16), st(",")], I),          // 17
+        c(ov::OP_EQ_STR, vec![o(17), st("k2,k0,k1")], I),       // 18
+        c(ov::MAP_GET, vec![o(12), st("k2")], I),               // 19
+        c(ov::OP_EQ_STR, vec![o(19), st("v2")], I),             // 20
+        c(ov::MAP_GET, vec![o(12), st("k1")], I),               // 21
+        c(ov::OP_EQ_STR, vec![o(21), st("v1")], I),             // 22
+        c(ov::MAP_PUT_ALL, vec![o(12), o(12)], &[]),            // 23
+        c(ov::MAP_SIZE, vec![o(12)], I),                        // 24
+    ];
+    let feed: Vec<Vec<f64>> = (0..4).map(|_| vec![0.0]).collect();
+    let (r, a) = run(&calls, &feed, Dialect::V6);
+    for row in r.unwrap() {
+        assert_eq!(
+            (row[8], row[11], row[18], row[20], row[22], row[24]),
+            (1.0, 1.0, 1.0, 1.0, 1.0, 3.0)
+        );
+    }
+    assert_eq!(a, 0, "map.copy / put_all allocated");
+    // New keys past cap: PoolFull, the target unchanged (checked first); copy past __cap too.
+    let calls = vec![
+        map_new(Ty::String, Ty::String, 2),
+        c(ov::MAP_PUT, vec![o(0), st("a"), st("1")], I),
+        map_new(Ty::String, Ty::String, 4),
+        c(ov::MAP_PUT, vec![o(2), st("b"), st("2")], I),
+        c(ov::MAP_PUT, vec![o(2), st("c"), st("3")], I),
+        c(ov::MAP_PUT_ALL, vec![o(0), o(2)], &[]),
+    ];
+    assert_eq!(once(&calls, Dialect::V6), Err(FaultKind::PoolFull));
+    let calls = vec![
+        map_new(Ty::String, Ty::String, 4),
+        c(ov::MAP_PUT, vec![o(0), st("a"), st("1")], I),
+        c(ov::MAP_PUT, vec![o(0), st("b"), st("2")], I),
+        mcopy(0, 1),
+    ];
+    assert_eq!(once(&calls, Dialect::V6), Err(FaultKind::PoolFull));
 }

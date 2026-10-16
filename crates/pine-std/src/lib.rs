@@ -15,6 +15,7 @@
 #![deny(unused_must_use)]
 
 mod args;
+mod barvar;
 mod capture;
 mod coll;
 mod load;

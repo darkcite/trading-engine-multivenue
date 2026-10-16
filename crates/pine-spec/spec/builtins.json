@@ -1969,7 +1969,10 @@
           ],
           "ret_qual": "series",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "pool",
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -2055,7 +2058,8 @@
           "abi": "call",
           "bf": [
             "collection",
-            "pool"
+            "pool",
+            "str_alloc"
           ],
           "state": {
             "k": "array"
@@ -2399,7 +2403,10 @@
           "ret": [],
           "ret_qual": "const",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "pool",
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -2456,7 +2463,9 @@
           ],
           "ret_qual": "series",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -2549,7 +2558,8 @@
           "abi": "call",
           "bf": [
             "collection",
-            "pool"
+            "pool",
+            "str_alloc"
           ],
           "state": {
             "k": "array"
@@ -2844,7 +2854,8 @@
           "abi": "call",
           "bf": [
             "collection",
-            "pool"
+            "pool",
+            "str_alloc"
           ],
           "state": {
             "k": "array"
@@ -2967,7 +2978,9 @@
           ],
           "ret_qual": "series",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -3158,7 +3171,10 @@
           "ret": [],
           "ret_qual": "const",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "pool",
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -3226,7 +3242,9 @@
           ],
           "ret_qual": "series",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -3269,7 +3287,9 @@
           ],
           "ret_qual": "series",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -3312,7 +3332,9 @@
           ],
           "ret_qual": "series",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -3356,7 +3378,9 @@
           ],
           "ret_qual": "series",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -3870,7 +3894,8 @@
           "abi": "call",
           "bf": [
             "collection",
-            "pool"
+            "pool",
+            "str_alloc"
           ],
           "state": {
             "k": "array"
@@ -4393,7 +4418,8 @@
           "abi": "call",
           "bf": [
             "collection",
-            "pool"
+            "pool",
+            "str_alloc"
           ],
           "state": {
             "k": "array"
@@ -4719,7 +4745,9 @@
           ],
           "ret_qual": "series",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -4781,7 +4809,10 @@
           "ret": [],
           "ret_qual": "const",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "pool",
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -4921,7 +4952,9 @@
           ],
           "ret_qual": "series",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -5045,7 +5078,9 @@
           "ret": [],
           "ret_qual": "const",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -5102,7 +5137,9 @@
           ],
           "ret_qual": "series",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -6170,7 +6207,10 @@
           "ret": [],
           "ret_qual": "const",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "pool",
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -18561,7 +18601,8 @@
           "abi": "call",
           "bf": [
             "collection",
-            "pool"
+            "pool",
+            "str_alloc"
           ],
           "state": {
             "k": "map"
@@ -18632,7 +18673,9 @@
           ],
           "ret_qual": "series",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -18724,7 +18767,8 @@
           "abi": "call",
           "bf": [
             "collection",
-            "pool"
+            "pool",
+            "str_alloc"
           ],
           "state": {
             "k": "map"
@@ -18897,7 +18941,10 @@
           ],
           "ret_qual": "series",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "pool",
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -18967,7 +19014,10 @@
           "ret": [],
           "ret_qual": "const",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "pool",
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -19039,7 +19089,9 @@
           ],
           "ret_qual": "series",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },
@@ -19196,7 +19248,8 @@
           "abi": "call",
           "bf": [
             "collection",
-            "pool"
+            "pool",
+            "str_alloc"
           ],
           "state": {
             "k": "map"
@@ -27230,7 +27283,8 @@
           "abi": "call",
           "bf": [
             "collection",
-            "pool"
+            "pool",
+            "str_alloc"
           ],
           "state": {
             "k": "array"
@@ -33498,9 +33552,11 @@
             },
             {
               "name": "type",
-              "ty": "string",
+              "ty": "int",
               "qual": "simple",
-              "flags": [],
+              "flags": [
+                "unique"
+              ],
               "default": null
             },
             {
@@ -33611,9 +33667,11 @@
             },
             {
               "name": "type",
-              "ty": "string",
+              "ty": "int",
               "qual": "simple",
-              "flags": [],
+              "flags": [
+                "unique"
+              ],
               "default": null
             },
             {
@@ -36642,7 +36700,7 @@
             "k": "recursive",
             "param": "diLength"
           },
-          "na": "propagate",
+          "na": "custom",
           "sx": [
             "implicit_bar"
           ],

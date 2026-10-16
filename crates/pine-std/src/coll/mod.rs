@@ -21,6 +21,7 @@
 
 pub(crate) mod array;
 pub(crate) mod map;
+pub(crate) mod part3;
 pub(crate) mod split;
 pub(crate) mod stats;
 
@@ -474,7 +475,7 @@ pub(crate) fn store(
 /// The value of element word `w` as a string output: na, a `CONST` ref's bits (zero-copy), or an
 /// owned cell copied into scratch through `str_alloc` (§4.16.4). `can_alloc` is the calling row's
 /// `STR_ALLOC` flag: a row without it cannot hand out a runtime-built element and faults
-/// `Internal` (`pin:04-coll-read-str-alloc`: pine-spec's F10 flag missing on the row, a CAR).
+/// `Internal` (since spec 7d2ac894… every string-returning row declares it, F10).
 pub(crate) fn read_str(
     f: &mut Frame<'_>,
     owner: CollRef,

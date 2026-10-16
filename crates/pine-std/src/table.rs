@@ -2190,35 +2190,76 @@ const fn build() -> Built {
     use crate::coll::map as cm;
     use crate::coll::stats as cs;
     const COLL: u8 = bf::COLLECTION | bf::POOL;
+    // F10 (impl-04 §4.16.4): a row that stores or returns a string is `STR_ALLOC`; one that may
+    // take a cell or grow is `POOL` (spec 7d2ac894…).
+    const COLL_S: u8 = COLL | bf::STR_ALLOC;
+    const S: u8 = bf::STR_ALLOC;
+    const SP: u8 = bf::STR_ALLOC | bf::POOL;
     put(
         &mut b,
         ov::ARRAY_NEW,
-        row(ov::ARRAY_NEW, ca::bi_array_new, 4, COLL, Blk::Coll),
+        row(
+            ov::ARRAY_NEW,
+            ca::bi_array_new::<{ ov::ARRAY_NEW.0 }>,
+            4,
+            COLL_S,
+            Blk::Coll,
+        ),
     );
     put(
         &mut b,
         ov::ARRAY_NEW_FLOAT,
-        row(ov::ARRAY_NEW_FLOAT, ca::bi_array_new, 4, COLL, Blk::Coll),
+        row(
+            ov::ARRAY_NEW_FLOAT,
+            ca::bi_array_new::<{ ov::ARRAY_NEW_FLOAT.0 }>,
+            4,
+            COLL,
+            Blk::Coll,
+        ),
     );
     put(
         &mut b,
         ov::ARRAY_NEW_INT,
-        row(ov::ARRAY_NEW_INT, ca::bi_array_new, 4, COLL, Blk::Coll),
+        row(
+            ov::ARRAY_NEW_INT,
+            ca::bi_array_new::<{ ov::ARRAY_NEW_INT.0 }>,
+            4,
+            COLL,
+            Blk::Coll,
+        ),
     );
     put(
         &mut b,
         ov::ARRAY_NEW_BOOL,
-        row(ov::ARRAY_NEW_BOOL, ca::bi_array_new, 4, COLL, Blk::Coll),
+        row(
+            ov::ARRAY_NEW_BOOL,
+            ca::bi_array_new::<{ ov::ARRAY_NEW_BOOL.0 }>,
+            4,
+            COLL,
+            Blk::Coll,
+        ),
     );
     put(
         &mut b,
         ov::ARRAY_NEW_COLOR,
-        row(ov::ARRAY_NEW_COLOR, ca::bi_array_new, 4, COLL, Blk::Coll),
+        row(
+            ov::ARRAY_NEW_COLOR,
+            ca::bi_array_new::<{ ov::ARRAY_NEW_COLOR.0 }>,
+            4,
+            COLL,
+            Blk::Coll,
+        ),
     );
     put(
         &mut b,
         ov::ARRAY_NEW_STRING,
-        row(ov::ARRAY_NEW_STRING, ca::bi_array_new, 4, COLL, Blk::Coll),
+        row(
+            ov::ARRAY_NEW_STRING,
+            ca::bi_array_new::<{ ov::ARRAY_NEW_STRING.0 }>,
+            4,
+            COLL_S,
+            Blk::Coll,
+        ),
     );
     put(
         &mut b,
@@ -2243,22 +2284,22 @@ const fn build() -> Built {
     put(
         &mut b,
         ov::ARRAY_GET,
-        row(ov::ARRAY_GET, ca::bi_array_get, 2, 0, Blk::None),
+        row(ov::ARRAY_GET, ca::bi_array_get, 2, S, Blk::None),
     );
     put(
         &mut b,
         ov::ARRAY_SET,
-        row(ov::ARRAY_SET, ca::bi_array_set, 2, 0, Blk::None),
+        row(ov::ARRAY_SET, ca::bi_array_set, 2, S, Blk::None),
     );
     put(
         &mut b,
         ov::ARRAY_PUSH,
-        row(ov::ARRAY_PUSH, ca::bi_array_push, 2, 0, Blk::None),
+        row(ov::ARRAY_PUSH, ca::bi_array_push, 2, SP, Blk::None),
     );
     put(
         &mut b,
         ov::ARRAY_POP,
-        row(ov::ARRAY_POP, ca::bi_array_pop, 2, 0, Blk::None),
+        row(ov::ARRAY_POP, ca::bi_array_pop, 2, S, Blk::None),
     );
     put(
         &mut b,
@@ -2291,37 +2332,43 @@ const fn build() -> Built {
     put(
         &mut b,
         ov::STR_SPLIT,
-        row(ov::STR_SPLIT, crate::coll::split::bi_str_split, 8, COLL, Blk::Coll),
+        row(
+            ov::STR_SPLIT,
+            crate::coll::split::bi_str_split,
+            8,
+            COLL_S,
+            Blk::Coll,
+        ),
     );
     put(
         &mut b,
         ov::ARRAY_FIRST,
-        row(ov::ARRAY_FIRST, ca::bi_array_first, 2, 0, Blk::None),
+        row(ov::ARRAY_FIRST, ca::bi_array_first, 2, S, Blk::None),
     );
     put(
         &mut b,
         ov::ARRAY_LAST,
-        row(ov::ARRAY_LAST, ca::bi_array_last, 2, 0, Blk::None),
+        row(ov::ARRAY_LAST, ca::bi_array_last, 2, S, Blk::None),
     );
     put(
         &mut b,
         ov::ARRAY_SHIFT,
-        row(ov::ARRAY_SHIFT, ca::bi_array_shift, 4, 0, Blk::None),
+        row(ov::ARRAY_SHIFT, ca::bi_array_shift, 4, S, Blk::None),
     );
     put(
         &mut b,
         ov::ARRAY_REMOVE,
-        row(ov::ARRAY_REMOVE, ca::bi_array_remove, 4, 0, Blk::None),
+        row(ov::ARRAY_REMOVE, ca::bi_array_remove, 4, S, Blk::None),
     );
     put(
         &mut b,
         ov::ARRAY_UNSHIFT,
-        row(ov::ARRAY_UNSHIFT, ca::bi_array_unshift, 4, 0, Blk::None),
+        row(ov::ARRAY_UNSHIFT, ca::bi_array_unshift, 4, SP, Blk::None),
     );
     put(
         &mut b,
         ov::ARRAY_INSERT,
-        row(ov::ARRAY_INSERT, ca::bi_array_insert, 4, 0, Blk::None),
+        row(ov::ARRAY_INSERT, ca::bi_array_insert, 4, SP, Blk::None),
     );
     put(
         &mut b,
@@ -2336,7 +2383,13 @@ const fn build() -> Built {
     put(
         &mut b,
         ov::ARRAY_LASTINDEXOF,
-        row(ov::ARRAY_LASTINDEXOF, ca::bi_array_lastindexof, 8, 0, Blk::None),
+        row(
+            ov::ARRAY_LASTINDEXOF,
+            ca::bi_array_lastindexof,
+            8,
+            0,
+            Blk::None,
+        ),
     );
     put(
         &mut b,
@@ -2411,37 +2464,73 @@ const fn build() -> Built {
     put(
         &mut b,
         ov::ARRAY_BINARY_SEARCH_AF,
-        row(ov::ARRAY_BINARY_SEARCH_AF, cs::bi_array_binary_search, 4, 0, Blk::None),
+        row(
+            ov::ARRAY_BINARY_SEARCH_AF,
+            cs::bi_array_binary_search,
+            4,
+            0,
+            Blk::None,
+        ),
     );
     put(
         &mut b,
         ov::ARRAY_BINARY_SEARCH_AI,
-        row(ov::ARRAY_BINARY_SEARCH_AI, cs::bi_array_binary_search, 4, 0, Blk::None),
+        row(
+            ov::ARRAY_BINARY_SEARCH_AI,
+            cs::bi_array_binary_search,
+            4,
+            0,
+            Blk::None,
+        ),
     );
     put(
         &mut b,
         ov::ARRAY_BINARY_SEARCH_LEFTMOST_AF,
-        row(ov::ARRAY_BINARY_SEARCH_LEFTMOST_AF, cs::bi_array_binary_search_leftmost, 4, 0, Blk::None),
+        row(
+            ov::ARRAY_BINARY_SEARCH_LEFTMOST_AF,
+            cs::bi_array_binary_search_leftmost,
+            4,
+            0,
+            Blk::None,
+        ),
     );
     put(
         &mut b,
         ov::ARRAY_BINARY_SEARCH_LEFTMOST_AI,
-        row(ov::ARRAY_BINARY_SEARCH_LEFTMOST_AI, cs::bi_array_binary_search_leftmost, 4, 0, Blk::None),
+        row(
+            ov::ARRAY_BINARY_SEARCH_LEFTMOST_AI,
+            cs::bi_array_binary_search_leftmost,
+            4,
+            0,
+            Blk::None,
+        ),
     );
     put(
         &mut b,
         ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AF,
-        row(ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AF, cs::bi_array_binary_search_rightmost, 4, 0, Blk::None),
+        row(
+            ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AF,
+            cs::bi_array_binary_search_rightmost,
+            4,
+            0,
+            Blk::None,
+        ),
     );
     put(
         &mut b,
         ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AI,
-        row(ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AI, cs::bi_array_binary_search_rightmost, 4, 0, Blk::None),
+        row(
+            ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AI,
+            cs::bi_array_binary_search_rightmost,
+            4,
+            0,
+            Blk::None,
+        ),
     );
     put(
         &mut b,
         ov::MAP_GET,
-        row(ov::MAP_GET, cm::bi_map_get, 4, 0, Blk::None),
+        row(ov::MAP_GET, cm::bi_map_get, 4, S, Blk::None),
     );
     put(
         &mut b,
@@ -2451,12 +2540,12 @@ const fn build() -> Built {
     put(
         &mut b,
         ov::MAP_PUT,
-        row(ov::MAP_PUT, cm::bi_map_put, 6, 0, Blk::None),
+        row(ov::MAP_PUT, cm::bi_map_put, 6, SP, Blk::None),
     );
     put(
         &mut b,
         ov::MAP_REMOVE,
-        row(ov::MAP_REMOVE, cm::bi_map_remove, 8, 0, Blk::None),
+        row(ov::MAP_REMOVE, cm::bi_map_remove, 8, S, Blk::None),
     );
     put(
         &mut b,
@@ -2466,12 +2555,203 @@ const fn build() -> Built {
     put(
         &mut b,
         ov::MAP_KEYS,
-        row(ov::MAP_KEYS, cm::bi_map_keys, 4, COLL, Blk::Coll),
+        row(ov::MAP_KEYS, cm::bi_map_keys, 4, COLL_S, Blk::Coll),
     );
     put(
         &mut b,
         ov::MAP_VALUES,
-        row(ov::MAP_VALUES, cm::bi_map_values, 4, COLL, Blk::Coll),
+        row(ov::MAP_VALUES, cm::bi_map_values, 4, COLL_S, Blk::Coll),
+    );
+    // T34 rest (impl-04 §4.16.6): fill, float variance / stdev, copy, from, concat, join,
+    // string sort, sort_indices; map.copy / put_all. Left as stubs (lead rulings):
+    // `array.avg/stdev/variance` of an int array — the reference returns `series int` and names
+    // no rounding (`pin:04-array-int-stats-open`); `array.median/mode/percentile_*` — a selection
+    // needs a scratch region a collection block does not have (`pin:04-array-select-open`, a
+    // later CAR); `array.abs/standardize` — the reference returns a new array but pine-spec's
+    // rows carry neither `COLLECTION` nor a block (`StateShape::None`), so no creator body can
+    // match them (a pine-spec request).
+    use crate::coll::part3 as c3;
+    put(
+        &mut b,
+        ov::ARRAY_FILL,
+        row(ov::ARRAY_FILL, c3::bi_array_fill, 8, SP, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_VARIANCE_F,
+        row(
+            ov::ARRAY_VARIANCE_F,
+            c3::bi_array_variance_f,
+            8,
+            0,
+            Blk::None,
+        ),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_STDEV_F,
+        row(ov::ARRAY_STDEV_F, c3::bi_array_stdev_f, 8, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_COPY,
+        row(ov::ARRAY_COPY, c3::bi_array_copy, 8, COLL_S, Blk::Coll),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_CONCAT,
+        row(ov::ARRAY_CONCAT, c3::bi_array_concat, 8, SP, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_FROM_AT,
+        row(
+            ov::ARRAY_FROM_AT,
+            c3::bi_array_from::<{ ov::ARRAY_FROM_AT.0 }>,
+            8,
+            COLL_S,
+            Blk::Coll,
+        ),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_FROM_AS,
+        row(
+            ov::ARRAY_FROM_AS,
+            c3::bi_array_from::<{ ov::ARRAY_FROM_AS.0 }>,
+            8,
+            COLL_S,
+            Blk::Coll,
+        ),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_FROM_AI,
+        row(
+            ov::ARRAY_FROM_AI,
+            c3::bi_array_from::<{ ov::ARRAY_FROM_AI.0 }>,
+            8,
+            COLL,
+            Blk::Coll,
+        ),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_FROM_AF,
+        row(
+            ov::ARRAY_FROM_AF,
+            c3::bi_array_from::<{ ov::ARRAY_FROM_AF.0 }>,
+            8,
+            COLL,
+            Blk::Coll,
+        ),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_FROM_AB,
+        row(
+            ov::ARRAY_FROM_AB,
+            c3::bi_array_from::<{ ov::ARRAY_FROM_AB.0 }>,
+            8,
+            COLL,
+            Blk::Coll,
+        ),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_FROM_AC,
+        row(
+            ov::ARRAY_FROM_AC,
+            c3::bi_array_from::<{ ov::ARRAY_FROM_AC.0 }>,
+            8,
+            COLL,
+            Blk::Coll,
+        ),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_JOIN_AF,
+        row(ov::ARRAY_JOIN_AF, c3::bi_array_join, 8, S, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_JOIN_AI,
+        row(ov::ARRAY_JOIN_AI, c3::bi_array_join, 8, S, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_JOIN_AS,
+        row(ov::ARRAY_JOIN_AS, c3::bi_array_join, 8, S, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_SORT_AS,
+        row(ov::ARRAY_SORT_AS, c3::bi_array_sort_str, 16, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_SORT_INDICES_AF,
+        row(
+            ov::ARRAY_SORT_INDICES_AF,
+            c3::bi_array_sort_indices,
+            16,
+            COLL,
+            Blk::Coll,
+        ),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_SORT_INDICES_AI,
+        row(
+            ov::ARRAY_SORT_INDICES_AI,
+            c3::bi_array_sort_indices,
+            16,
+            COLL,
+            Blk::Coll,
+        ),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_SORT_INDICES_AS,
+        row(
+            ov::ARRAY_SORT_INDICES_AS,
+            c3::bi_array_sort_indices,
+            16,
+            COLL,
+            Blk::Coll,
+        ),
+    );
+    put(
+        &mut b,
+        ov::MAP_COPY,
+        row(ov::MAP_COPY, cm::bi_map_copy, 8, COLL_S, Blk::Coll),
+    );
+    put(
+        &mut b,
+        ov::MAP_PUT_ALL,
+        row(ov::MAP_PUT_ALL, cm::bi_map_put_all, 8, SP, Blk::None),
+    );
+    // The bar's prelude series (`ValueSrc::Call`): the reference's literal definitions.
+    use crate::barvar as bv;
+    put(
+        &mut b,
+        ov::HL2_VAR,
+        row(ov::HL2_VAR, bv::bi_hl2, 1, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::HLC3_VAR,
+        row(ov::HLC3_VAR, bv::bi_hlc3, 1, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::OHLC4_VAR,
+        row(ov::OHLC4_VAR, bv::bi_ohlc4, 1, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::HLCC4_VAR,
+        row(ov::HLCC4_VAR, bv::bi_hlcc4, 1, 0, Blk::None),
     );
     b
 }

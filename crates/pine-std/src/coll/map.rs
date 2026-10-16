@@ -16,6 +16,12 @@ use pine_ir::{argwin, CollKind, FaultKind, SiteId, StrRef, Ty, NA_I64};
 use pine_spec::ov;
 use pine_vm::Frame;
 
+/// The rows' `STR_ALLOC` flags as pine-spec gives them (F10, spec 7d2ac894…): a row with it hands
+/// out a runtime-built string value through `str_alloc`.
+const GET_STR: bool = flags(ov::MAP_GET) & pine_vm::bf::STR_ALLOC != 0;
+const PUT_STR: bool = flags(ov::MAP_PUT) & pine_vm::bf::STR_ALLOC != 0;
+const REMOVE_STR: bool = flags(ov::MAP_REMOVE) & pine_vm::bf::STR_ALLOC != 0;
+
 const FNV_OFF: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0100_0000_01b3;
 
@@ -206,7 +212,7 @@ fn map_get(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> 
         Some(s) => f.coll(o.owner)?.1[(lay.vals + s) as usize],
         None => na_word(o.elem),
     };
-    put_elem(f, args[2], &o, &vlay(&lay), w, false)
+    put_elem(f, args[2], &o, &vlay(&lay), w, GET_STR)
 }
 
 /// `map.contains(id, key)` — `[id, key, out]`.
@@ -244,14 +250,14 @@ fn map_put(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> 
         Some(s) => {
             let old = f.coll(o.owner)?.1[(lay.vals + s) as usize];
             // The previous value is handed out before anything changes.
-            put_elem(f, args[3], &o, &vl, old, false)?;
+            put_elem(f, args[3], &o, &vl, old, PUT_STR)?;
             s
         }
         None => {
             if o.len >= lay.cap {
                 return Err(FaultKind::PoolFull);
             }
-            put_elem(f, args[3], &o, &vl, na_word(o.elem), false)?;
+            put_elem(f, args[3], &o, &vl, na_word(o.elem), PUT_STR)?;
             let s = o.len;
             let (h, words) = f.coll_mut(o.owner)?;
             let kw = if matches!(o.key, Ty::String) {
@@ -296,10 +302,10 @@ fn map_remove(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKin
     let k = key_in(f, args[1], o.key)?;
     let vl = vlay(&lay);
     let Some(s) = find(f, &o, &lay, &k)?.0 else {
-        return put_elem(f, args[2], &o, &vl, na_word(o.elem), false);
+        return put_elem(f, args[2], &o, &vl, na_word(o.elem), REMOVE_STR);
     };
     let old = f.coll(o.owner)?.1[(lay.vals + s) as usize];
-    put_elem(f, args[2], &o, &vl, old, false)?;
+    put_elem(f, args[2], &o, &vl, old, REMOVE_STR)?;
     let (h, words) = f.coll_mut(o.owner)?;
     let (kw, vw) = (words[s as usize], words[(lay.vals + s) as usize]);
     if matches!(o.key, Ty::String) {
@@ -437,6 +443,220 @@ fn keys_or_values<const VALUES: bool>(
     Ok(())
 }
 
+// ---- copy / put_all ---------------------------------------------------------------------------
+
+/// The store form of stored string word `w` of a block whose storage starts at `sp` and whose
+/// cells (of `cell_w` words) start at word `cells`: na, a `CONST` ref, or the cell's bytes.
+fn stored_val(sp: *const u64, cells: u32, cell_w: u32, w: u64) -> StrVal {
+    if w == NA_I64 as u64 {
+        return StrVal::Na;
+    }
+    match as_owned(w) {
+        // SAFETY: the cell `[cells + c·cell_w, +cell_w)` lies in the block at `sp` (F8: unmoved
+        // for the evaluation); `n` ≤ its bytes (stored so).
+        Some((c, n)) => StrVal::Bytes(
+            unsafe { sp.add((cells + c * cell_w) as usize).cast::<u8>() },
+            n,
+        ),
+        None => StrVal::Const(w),
+    }
+}
+
+/// `map.copy(id)` — `[__elem, __key, __cap, id, out]`: a new map of the same pairs in the same
+/// insertion order (shallow, verified, maps page); runtime-built string keys / values copied into
+/// the new block's own cells, the index rebuilt. More pairs than `__cap` is `PoolFull`, a string
+/// longer than the new cell `StrArenaFull`. `pin:04-map-copy-self`: `m := map.copy(m)` (the source
+/// is the block this site re-creates) keeps the pairs in place under a new generation.
+fn map_copy(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 5 {
+        return Err(FaultKind::Internal);
+    }
+    let (o, sl) = map(f, args[3])?;
+    if f.i64_arg(args[0]).and_then(elem_ty) != Some(o.elem)
+        || f.i64_arg(args[1]).and_then(elem_ty) != Some(o.key)
+    {
+        return Err(FaultKind::Internal);
+    }
+    let cap = f.i64_arg(args[2]);
+    if o.owner.site() == site {
+        if cap != Some(sl.cap as i64) {
+            return Err(FaultKind::Internal);
+        }
+        let h0 = *f.coll(o.owner)?.0;
+        let r = f.coll_init(site, CollKind::Map, o.elem, o.key, 0)?;
+        let (h, _) = f.coll_mut(r)?;
+        h.cap = h0.cap;
+        h.len = h0.len;
+        h.idx_off = h0.idx_off;
+        h.idx_mask = h0.idx_mask;
+        f.set_i64_arg(args[4], Some(r.0 as i64));
+        return Ok(());
+    }
+    let n = o.len;
+    let sp: *const u64 = f.coll(o.owner)?.1.as_ptr();
+    let (r, dl) = create(f, site, CollKind::Map, o.elem, o.key, cap, n)?;
+    let (ks, vs) = (matches!(o.key, Ty::String), matches!(o.elem, Ty::String));
+    let mut k = 0u32;
+    while k < n {
+        // SAFETY: the source map's key / value words `k < len <= cap` (F8).
+        let (kw, vw) = unsafe { (*sp.add(k as usize), *sp.add((sl.vals + k) as usize)) };
+        let kv = if ks {
+            stored_val(sp, sl.kcells, sl.cell_w, kw)
+        } else {
+            StrVal::Na
+        };
+        let vv = if vs {
+            stored_val(sp, sl.vcells, sl.cell_w, vw)
+        } else {
+            StrVal::Na
+        };
+        str_fits(kv, &dl)?;
+        str_fits(vv, &dl)?;
+        k += 1;
+    }
+    let vl = vlay(&dl);
+    let (_, words) = f.coll_mut(r)?;
+    let (kp, vp) = (kpool_at(&dl), dl.pool as usize + ks as usize);
+    let mut k = 0u32;
+    while k < n {
+        // SAFETY: as above.
+        let (kw, vw) = unsafe { (*sp.add(k as usize), *sp.add((sl.vals + k) as usize)) };
+        words[k as usize] = if ks {
+            let mut p = Pool::of_word(words[kp]);
+            let w = store(
+                &mut p,
+                words,
+                dl.kcells,
+                &dl,
+                stored_val(sp, sl.kcells, sl.cell_w, kw),
+            )?;
+            words[kp] = p.to_word();
+            w
+        } else {
+            kw
+        };
+        words[(dl.vals + k) as usize] = if vs {
+            let mut p = Pool::of_word(words[vp]);
+            let w = store(
+                &mut p,
+                words,
+                dl.vcells,
+                &vl,
+                stored_val(sp, sl.vcells, sl.cell_w, vw),
+            )?;
+            words[vp] = p.to_word();
+            w
+        } else {
+            vw
+        };
+        k += 1;
+    }
+    let no = resolve(f, Some(r))?;
+    rebuild(f, &no, &dl, n)?;
+    f.set_i64_arg(args[4], Some(r.0 as i64));
+    Ok(())
+}
+
+/// `map.put_all(id, id2)` — `[id, id2]`: `id2`'s pairs put into `id` in `id2`'s order (verified,
+/// maps page): a present key's value replaced in place, a new key appended. All checks first:
+/// the new keys past `id`'s `cap` is `PoolFull`, a string longer than `id`'s cell `StrArenaFull`.
+/// `put_all(m, m)` puts every pair onto itself — nothing changes (the literal reading).
+fn map_put_all(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 2 {
+        return Err(FaultKind::Internal);
+    }
+    let (o, lay) = map(f, args[0])?;
+    let (o2, l2) = map(f, args[1])?;
+    if o.elem != o2.elem || o.key != o2.key {
+        return Err(FaultKind::Internal);
+    }
+    if o.owner == o2.owner {
+        return Ok(());
+    }
+    let (ks, vs) = (matches!(o.key, Ty::String), matches!(o.elem, Ty::String));
+    let sp: *const u64 = f.coll(o2.owner)?.1.as_ptr();
+    let key_at = |k: u32| -> KeyIn {
+        // SAFETY: `id2`'s key word `k < len <= cap` (F8: unmoved).
+        let w = unsafe { *sp.add(k as usize) };
+        if ks {
+            let sv = stored_val(sp, l2.kcells, l2.cell_w, w);
+            let word = match sv {
+                StrVal::Const(b) => b,
+                _ => NA_I64 as u64,
+            };
+            KeyIn { word, sv }
+        } else {
+            KeyIn {
+                word: w,
+                sv: StrVal::Na,
+            }
+        }
+    };
+    let mut fresh = 0u32;
+    let mut k = 0u32;
+    while k < o2.len {
+        let ki = key_at(k);
+        str_fits(ki.sv, &lay)?;
+        if vs {
+            // SAFETY: `id2`'s value word `k < len` (F8).
+            let vw = unsafe { *sp.add((l2.vals + k) as usize) };
+            str_fits(stored_val(sp, l2.vcells, l2.cell_w, vw), &lay)?;
+        }
+        fresh += find(f, &o, &lay, &ki)?.0.is_none() as u32;
+        k += 1;
+    }
+    if o.len as u64 + fresh as u64 > lay.cap as u64 {
+        return Err(FaultKind::PoolFull);
+    }
+    let vl = vlay(&lay);
+    let mut k = 0u32;
+    while k < o2.len {
+        let ki = key_at(k);
+        // SAFETY: as above.
+        let vw = unsafe { *sp.add((l2.vals + k) as usize) };
+        let (slot, j) = find(f, &o, &lay, &ki)?;
+        let (h, words) = f.coll_mut(o.owner)?;
+        let s = match slot {
+            Some(s) => s,
+            None => {
+                let s = h.len;
+                words[s as usize] = if ks {
+                    let at = kpool_at(&lay);
+                    let mut p = Pool::of_word(words[at]);
+                    let w = store(&mut p, words, lay.kcells, &lay, ki.sv)?;
+                    words[at] = p.to_word();
+                    w
+                } else {
+                    ki.word
+                };
+                words[(lay.vals + s) as usize] = NA_I64 as u64;
+                set_ent(words, &lay, j, s + 1);
+                h.len = s + 1;
+                s
+            }
+        };
+        let at = (lay.vals + s) as usize;
+        if vs {
+            let pa = vpool_at(&o, &lay);
+            let mut p = Pool::of_word(words[pa]);
+            let old = words[at];
+            release(&mut p, words, lay.vcells, lay.cell_w, old);
+            words[at] = store(
+                &mut p,
+                words,
+                lay.vcells,
+                &vl,
+                stored_val(sp, l2.vcells, l2.cell_w, vw),
+            )?;
+            words[pa] = p.to_word();
+        } else {
+            words[at] = vw;
+        }
+        k += 1;
+    }
+    Ok(())
+}
+
 fn map_keys(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     keys_or_values::<false>(f, site, args)
 }
@@ -470,6 +690,14 @@ pub fn bi_map_clear(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(),
 /// The `map.keys` row.
 pub fn bi_map_keys(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     map_keys(f, site, args).map_err(|k| declared(flags(ov::MAP_KEYS), k))
+}
+/// The `map.copy` row.
+pub fn bi_map_copy(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    map_copy(f, site, args).map_err(|k| declared(flags(ov::MAP_COPY), k))
+}
+/// The `map.put_all` row.
+pub fn bi_map_put_all(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    map_put_all(f, args).map_err(|k| declared(flags(ov::MAP_PUT_ALL), k))
 }
 /// The `map.values` row.
 pub fn bi_map_values(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {

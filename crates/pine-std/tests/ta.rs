@@ -2064,3 +2064,54 @@ fn ta_vwap_variable_resets_at_the_utc_day() {
         }
     }
 }
+
+/// The bar's prelude series: `hl2 hlc3 ohlc4 hlcc4` are the reference's literal definitions over
+/// the bar's prices (left-to-right sums), bit for bit.
+#[test]
+fn bar_prelude_series_match_reference() {
+    let p = |x: i64| x as f64 / 1e6;
+    for id in [ov::HL2_VAR, ov::HLC3_VAR, ov::OHLC4_VAR, ov::HLCC4_VAR] {
+        assert_eq!(pine_std::served(id), pine_std::Served::Body, "{id:?}");
+        let outs = [Lane::F64];
+        let calls = [Call {
+            ov: id,
+            inputs: &[],
+            outputs: &outs,
+            site_bytes: 0,
+            guard: None,
+        }];
+        let mut h = Harness::build(&Script {
+            calls: &calls,
+            mode: ExecMode::BarClose,
+            dialect: Dialect::V6,
+            intent_cap: 0,
+            chart: CHART,
+        });
+        let mut ctx = TestCtx::default();
+        for (i, &(o, hi, lo, c)) in [
+            (10.0, 12.5, 9.25, 11.0),
+            (101.1, 103.7, 99.9, 100.3),
+            (0.3, 0.7, 0.1, 0.2),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut b = bar(i as u32, c, barflag::CONFIRMED);
+            b.open_1e6 = scale::to_1e6(o).unwrap();
+            b.high_1e6 = scale::to_1e6(hi).unwrap();
+            b.low_1e6 = scale::to_1e6(lo).unwrap();
+            assert_eq!(h.step_bar(&b, &mut ctx), StepOutcome::Ok);
+            let (o, hi, lo, c) = (p(b.open_1e6), p(b.high_1e6), p(b.low_1e6), p(b.close_1e6));
+            let want = if id == ov::HL2_VAR {
+                (hi + lo) / 2.0
+            } else if id == ov::HLC3_VAR {
+                (hi + lo + c) / 3.0
+            } else if id == ov::OHLC4_VAR {
+                (o + hi + lo + c) / 4.0
+            } else {
+                (hi + lo + c + c) / 4.0
+            };
+            assert_eq!(h.out(0, 0).to_bits(), want.to_bits(), "{id:?} bar {i}");
+        }
+    }
+}

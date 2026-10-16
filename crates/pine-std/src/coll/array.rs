@@ -20,7 +20,7 @@ const NEG: [u8; 2] = sw::both(Sw::NegIndex);
 const BOOL_NA: [u8; 2] = sw::both(Sw::BoolNa);
 
 /// The row's `STR_ALLOC` flag as pine-spec gives it (F10): without it a body cannot hand out a
-/// runtime-built string element (`pin:04-coll-read-str-alloc`).
+/// runtime-built string element (every string-returning row carries it since spec 7d2ac894…).
 const fn str_alloc(id: pine_ir::OverloadId) -> bool {
     OVERLOADS[id.0 as usize].bf & bf::STR_ALLOC != 0
 }
@@ -33,10 +33,10 @@ pub(super) const fn flags(id: pine_ir::OverloadId) -> u8 {
 }
 
 /// The fault a row may return: pine-vm's `flag_ok` admits `StrArenaFull` only from a `STR_ALLOC`
-/// row and `PoolFull` only from a `POOL` / `INTENT` row; pine-spec's accessor rows carry neither
-/// (§4.16.4 F10 says every row that stores or returns a string is `STR_ALLOC`, §4.16.5 that
-/// `push` beyond `cap` is `PoolFull`), so until the rows declare them such a fault is `Internal`
-/// (`pin:04-coll-undeclared-fault`, a CAR on pine-spec).
+/// row and `PoolFull` only from a `POOL` / `INTENT` row. Since spec 7d2ac894… every collection
+/// row that stores or returns a string is `STR_ALLOC` and every one that may take a cell or grow
+/// is `POOL` (§4.16.4 F10, §4.16.5), so on those rows this is the identity; it stays as the guard
+/// for a row that does not declare the kind (`pin:04-coll-undeclared-fault`: `Internal`).
 pub(super) const fn declared(fl: u8, k: FaultKind) -> FaultKind {
     match k {
         FaultKind::StrArenaFull if fl & bf::STR_ALLOC == 0 => FaultKind::Internal,
@@ -45,7 +45,9 @@ pub(super) const fn declared(fl: u8, k: FaultKind) -> FaultKind {
     }
 }
 
-// Every `array.new*` row shares one body: their flags must agree.
+// Every `array.new*` row shares one body, instantiated per row (`bi_array_new::<ID>`) so each
+// declares its faults by its own row's flags: pine-spec gives `STR_ALLOC` to `array.new<T>` and
+// `array.new_string` only. The rows may differ by that flag alone.
 const _: () = {
     let ids = [
         ov::ARRAY_NEW_FLOAT,
@@ -56,9 +58,10 @@ const _: () = {
     ];
     let mut k = 0;
     while k < ids.len() {
-        assert!(flags(ids[k]) == flags(ov::ARRAY_NEW));
+        assert!(flags(ids[k]) & !bf::STR_ALLOC == flags(ov::ARRAY_NEW) & !bf::STR_ALLOC);
         k += 1;
     }
+    assert!(str_alloc(ov::ARRAY_NEW) && str_alloc(ov::ARRAY_NEW_STRING));
 };
 
 fn from_end(d: Dialect) -> bool {
@@ -393,9 +396,14 @@ fn array_clear(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKi
 
 // ---- the rows (pine-vm `flag_ok`: a fault the row's flags do not declare is `Internal`) ----
 
-/// The `array.new` row: `array_new` with its faults declared.
-pub fn bi_array_new(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
-    array_new(f, site, args).map_err(|k| declared(flags(ov::ARRAY_NEW), k))
+/// The `array.new*` rows (`ID` = the row's `OverloadId`): `array_new` with its faults declared
+/// by that row's own flags.
+pub fn bi_array_new<const ID: u16>(
+    f: &mut Frame<'_>,
+    site: SiteId,
+    args: &[u16],
+) -> Result<(), FaultKind> {
+    array_new(f, site, args).map_err(|k| declared(flags(pine_ir::OverloadId(ID)), k))
 }
 
 /// The `map.new` row: `map_new` with its faults declared.
