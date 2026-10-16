@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// MACD signal cross. OUR CODE, typed from the public rule: MACD(12, 26, 9) — long when the MACD line
+// crosses above its signal line, flat on the cross below.
+strategy("PVM7 MACD cross", overlay = false, initial_capital = 100000,
+     default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0)
+
+fast = input.int(12, "Fast length",   minval = 1, maxval = 200)
+slow = input.int(26, "Slow length",   minval = 2, maxval = 400)
+sig  = input.int(9,  "Signal length", minval = 1, maxval = 100)
+
+[macdLine, signalLine, hist] = ta.macd(close, fast, slow, sig)
+crossUp = ta.crossover(macdLine, signalLine)
+crossDn = ta.crossunder(macdLine, signalLine)
+
+if crossUp
+    strategy.entry("L", strategy.long)
+if crossDn
+    strategy.close("L")
+
+plot(macdLine,   "MACD")
+plot(signalLine, "Signal")
+plot(hist,       "Histogram")
+hline(0, "Zero")

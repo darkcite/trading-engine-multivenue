@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
+# impl-07 §4.7 / §3.12.3 — the priors: one row per screened script, each justified by the rule's own
+# structure in the comment line above it, never by a backtest. Columns (tab-separated):
+# script	hold_bars	trades_per_1k_bars	builtins (comma-separated Pine names, §4.0.1 column 5)
+# ATR-band flips are slow: ~1.8 × atrLen
+pvm7_supertrend	18	55	ta.supertrend,strategy.entry,strategy.close,plot,color.green,color.red
+# signal crossings recur on the slow EMA's span (26); long-only takes every other one
+pvm7_macd_cross	13	38	ta.macd,ta.ema,ta.crossover,ta.crossunder,plot,hline
+# exit at the basis ≈ half the 20-bar window after a 2σ break
+pvm7_bb_breakout	10	25	ta.bb,ta.sma,ta.stdev,ta.crossover,ta.crossunder,fill
+# RSI 30 → 50 typically inside a handful of bars
+pvm7_rsi_mr	6	165	ta.rsi,ta.rma,ta.crossover,input.int,hline
+# the exit channel is 10 bars
+pvm7_donchian	10	20	ta.highest,ta.lowest,na,strategy.entry,strategy.exit
+# a full 8…55 stack survives about the middle EMA's span
+pvm7_ma_ribbon	21	15	ta.ema,plot,fill
+# the momentum term's half window after a release
+pvm7_keltner_squeeze	10	20	ta.bb,ta.kc,ta.linreg,ta.highest,ta.lowest,ta.sma,math.avg,bgcolor,barcolor
+# a chandelier holds about one ATR window
+pvm7_atr_trail	22	25	ta.atr,ta.tr,ta.rma,na,math.max,strategy.position_size,strategy.exit
+# a chandelier holds about one ATR window (the tick twin: same rule, same structure)
+pvm7_atr_trail_tick	22	25	ta.atr,ta.tr,ta.rma,na,math.max,strategy.position_size,strategy.exit
+# at most one entry a UTC day, flat at the roll: half a day of 1 h bars
+pvm7_orb	12	40	time,timeframe.change,math.max,math.min,strategy.entry,strategy.close
+# a take-profit one 0.5 % step away
+pvm7_grid	4	120	ta.sma,strategy.order,strategy.cancel_all,math.round_to_mintick

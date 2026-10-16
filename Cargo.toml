@@ -72,6 +72,7 @@ members = [
     "crates/pine-broker",
     "crates/pine-ir",
     "crates/pine-lang",
+    "crates/pine-screen",
     "crates/pine-sema",
     "crates/pine-spec",
     "crates/pine-std",
@@ -245,6 +246,7 @@ strategy-xsd          = { path = "crates/strategy-xsd" }
 pine-broker = { path = "crates/pine-broker" }
 pine-ir = { path = "crates/pine-ir" }
 pine-lang = { path = "crates/pine-lang" }
+pine-screen = { path = "crates/pine-screen" }
 pine-sema = { path = "crates/pine-sema" }
 pine-spec = { path = "crates/pine-spec" }
 pine-std = { path = "crates/pine-std" }

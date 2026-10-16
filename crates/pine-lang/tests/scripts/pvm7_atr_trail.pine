@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// ATR trailing stop (chandelier). OUR CODE, typed from the public rule: the stop sits mult ATRs below
+// the close and may only ratchet upward while long. Exercises the self-referential recurrence, var,
+// na() and the broker read-back. pvm7_atr_trail_tick.pine is this file with calc_on_every_tick = true.
+strategy("PVM7 ATR trailing stop", overlay = true, initial_capital = 100000,
+     default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0)
+
+len  = input.int(22, "ATR length", minval = 1, maxval = 200)
+mult = input.float(3.0, "Multiple", minval = 0.5, maxval = 10.0, step = 0.1)
+
+a   = ta.atr(len)
+raw = close - mult * a
+
+var float stopLong = na
+stopLong := na(stopLong[1]) ? raw : (close > stopLong[1] ? math.max(raw, stopLong[1]) : raw)
+
+if close > stopLong and strategy.position_size == 0
+    strategy.entry("L", strategy.long)
+if strategy.position_size > 0
+    strategy.exit("X", "L", stop = stopLong)
+
+plot(stopLong, "Trail", color = color.orange)

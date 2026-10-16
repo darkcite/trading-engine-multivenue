@@ -1504,6 +1504,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pine-screen"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "core-time",
+ "libc",
+ "pine-broker",
+ "pine-ir",
+ "pine-lang",
+ "pine-sema",
+ "pine-std",
+ "pine-vm",
+]
+
+[[package]]
 name = "pine-sema"
 version = "0.1.0"
 dependencies = [

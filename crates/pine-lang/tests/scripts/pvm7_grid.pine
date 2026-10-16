@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// Five-level grid. OUR CODE, typed from the public rule: five price levels stepPct apart around a
+// slow moving-average anchor (pin:07-grid-levels-centered: anchor -2..+2 steps); one unit is bought
+// at each level touched and each takes profit one step above its level. Array-free: the five levels
+// are unrolled.
+strategy("PVM7 Grid", overlay = true, initial_capital = 100000,
+     default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 5,
+     calc_on_every_tick = true)
+
+stepPct   = input.float(0.5, "Step %", minval = 0.1, maxval = 5.0, step = 0.1)
+anchorLen = input.int(200, "Anchor length", minval = 10, maxval = 1000)
+
+anchor = ta.sma(close, anchorLen)
+stp    = anchor * stepPct / 100
+
+lv1 = math.round_to_mintick(anchor - 2 * stp)
+lv2 = math.round_to_mintick(anchor - 1 * stp)
+lv3 = math.round_to_mintick(anchor)
+lv4 = math.round_to_mintick(anchor + 1 * stp)
+lv5 = math.round_to_mintick(anchor + 2 * stp)
+
+// Re-arm every evaluation so the levels follow the anchor; each level's buy is its own OCA group
+// (pin:07-grid-oca), its take-profit a limit exit one step up.
+strategy.cancel_all()
+if not na(anchor)
+    strategy.order("B1", strategy.long, 1, limit = lv1, oca_name = "G1", oca_type = strategy.oca.cancel)
+    strategy.order("B2", strategy.long, 1, limit = lv2, oca_name = "G2", oca_type = strategy.oca.cancel)
+    strategy.order("B3", strategy.long, 1, limit = lv3, oca_name = "G3", oca_type = strategy.oca.cancel)
+    strategy.order("B4", strategy.long, 1, limit = lv4, oca_name = "G4", oca_type = strategy.oca.cancel)
+    strategy.order("B5", strategy.long, 1, limit = lv5, oca_name = "G5", oca_type = strategy.oca.cancel)
+    strategy.exit("T1", "B1", limit = math.round_to_mintick(lv1 + stp))
+    strategy.exit("T2", "B2", limit = math.round_to_mintick(lv2 + stp))
+    strategy.exit("T3", "B3", limit = math.round_to_mintick(lv3 + stp))
+    strategy.exit("T4", "B4", limit = math.round_to_mintick(lv4 + stp))
+    strategy.exit("T5", "B5", limit = math.round_to_mintick(lv5 + stp))
+
+plot(anchor, "Anchor")

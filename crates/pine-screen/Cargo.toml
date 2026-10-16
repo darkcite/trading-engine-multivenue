@@ -1,0 +1,25 @@
+[package]
+name                   = "pine-screen"
+version                = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description = "PVM tier-1 runner: bar files (Bar rows, mapped read-only), the contract §3.15.3 step loop over TvBroker, TrialSummary rows, daily return series, the fee hurdle, the tier-2 hand-off. No clock."
+
+[dependencies]            # contract §2 (A2; A3 accepted CAR-07-1, CAR-07-2) — nothing else
+pine-ir     = { workspace = true }
+pine-lang   = { workspace = true }   # CAR-07-2 (A3): compile_trial parses (contract §3.8.1)
+pine-sema   = { workspace = true }
+pine-vm     = { workspace = true }
+pine-std    = { workspace = true }
+pine-broker = { workspace = true }
+core-time   = { workspace = true }   # barclock only; the clock reads are forbidden (I17)
+core-crypto = { workspace = true }   # A2 (CAR-09-1): SHA-256 of bar bodies, return series, ids
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"                         # CAR-07-1 (A3): the read-only mmap (core-io's precedent)
+
+[dev-dependencies]
+pine-std = { workspace = true, features = ["testing"] }   # hand-built programs (impl-04 v4 §7.1) for two §7.6 tests

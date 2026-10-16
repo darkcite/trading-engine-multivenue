@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// Opening-range breakout. OUR CODE, typed from the public rule: the first orMin minutes of the UTC
+// day set the range high and low; go long when the close breaks above the range high, and be flat at
+// the day roll (pin:07-orb-roll — the close is placed on the new day's first bar).
+strategy("PVM7 Opening range breakout", overlay = true, initial_capital = 100000,
+     default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0)
+
+orMin = input.int(30, "Opening range, minutes", minval = 1, maxval = 1439)
+
+dayOpen = time("D")
+newDay  = timeframe.change("D")
+inRange = time < dayOpen + orMin * 60000
+
+var float orHigh = na
+var float orLow  = na
+
+if newDay
+    strategy.close("L")
+    orHigh := na
+    orLow  := na
+if inRange
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow)  ? low  : math.min(orLow, low)
+if not inRange and not na(orHigh) and close > orHigh
+    strategy.entry("L", strategy.long)
+
+plot(orHigh, "OR high")
+plot(orLow,  "OR low")

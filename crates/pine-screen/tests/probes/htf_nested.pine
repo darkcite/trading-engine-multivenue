@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+// impl-07 §4.3.2 probe (ours): a daily sub-program that itself requests the 4-h close, and the same
+// 4-h request at the top level — one key, one instance (P4); the child is stepped before its parent.
+strategy("htf nested")
+inner() => request.security(syminfo.tickerid, "240", close)
+d = request.security(syminfo.tickerid, "D", inner())
+h = request.security(syminfo.tickerid, "240", close)
+plot(d)
+plot(h)
