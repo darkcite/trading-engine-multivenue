@@ -68,7 +68,8 @@ pub(crate) mod cap {
     /// Native: largest `max_open` accepted (`5105` above it) — `core_fill::MAX_OPEN_PER_SYM`
     /// (`crates/core-fill/src/lib.rs:66`), restated because this crate may not depend on `core-fill`.
     pub(crate) const MAX_OPEN: u32 = 8;
-    /// Native: single-direction `ProgramMeta::entry_dirs` rows retained for the D19 boot check
-    /// (A6.3; `pin:05-entry-dirs-cap` — rows past it never reach the boot trade, fail-closed).
+    /// Native: single-direction ids (their `ProgramMeta::entry_dirs` rows OR-merged) retained for
+    /// the D19 boot check (A6.3; `pin:05-entry-dirs-cap` — the smallest ids are kept, any other id
+    /// never reaches the boot trade, fail-closed).
     pub(crate) const BOOT_IDS: usize = 256;
 }

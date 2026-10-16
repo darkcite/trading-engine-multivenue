@@ -104,8 +104,12 @@ pub(crate) struct PendingOrder {
     pub(crate) gen_eq_lo: u64,
     /// … and high 64 bits (split: an `i128` would raise the record's field alignment).
     pub(crate) gen_eq_hi: i64,
+    /// Native entry: what this record's own fills opened on its side (past flat), unsigned,
+    /// cumulative — the bound of a deferred reversal's remainder (`pin:05-reversal-own-qty`).
+    /// Kept across a re-commit on the same side, like `DEFERRED`.
+    pub(crate) opened_1e6: i64,
     /// Always zero.
-    pub(crate) _pad: [u32; 4],
+    pub(crate) _pad: [u32; 2],
 }
 
 const _: () = assert!(core::mem::size_of::<PendingOrder>() == 128);
@@ -298,38 +302,20 @@ impl OrderTable {
         counters.intents_committed += 1;
         match it.kind {
             IntentKind::Entry => match key_of(it, ctx) {
-                Some((k, _)) if k == IntentKind::CloseAll as u8 => {
+                Some((k, key)) if k == IntentKind::CloseAll as u8 => {
                     counters.entries_refused_allow_entry_in += 1;
-                    let close = OrderIntent {
-                        kind: IntentKind::CloseAll,
-                        side: IntentSide::Long,
-                        flags: 0,
-                        oca_type: OcaType::None,
-                        id: StrKey::NONE,
-                        from_entry: StrKey::NONE,
-                        oca_name: StrKey::NONE,
-                        qty_1e6: 0,
-                        limit_1e6: 0,
-                        stop_1e6: 0,
-                        ..*it
-                    };
-                    self.upsert(
-                        &close,
-                        StrKey::NONE,
-                        pflag::ALLOW_ENTRY_CLOSE,
-                        ctx,
-                        counters,
-                    )
+                    // The entry is read in place as a bare market close-all (`upsert`'s override).
+                    self.upsert(it, k, key, pflag::ALLOW_ENTRY_CLOSE, ctx, counters)
                 }
-                Some(_) => self.upsert(it, it.id, 0, ctx, counters),
+                Some((k, key)) => self.upsert(it, k, key, 0, ctx, counters),
                 None => {
                     counters.entries_refused_allow_entry_in += 1;
                     Ok(())
                 }
             },
-            IntentKind::Order => self.upsert(it, it.id, 0, ctx, counters),
-            IntentKind::Close => self.upsert(it, it.from_entry, 0, ctx, counters),
-            IntentKind::CloseAll => self.upsert(it, StrKey::NONE, 0, ctx, counters),
+            IntentKind::Order => self.upsert(it, it.kind as u8, it.id, 0, ctx, counters),
+            IntentKind::Close => self.upsert(it, it.kind as u8, it.from_entry, 0, ctx, counters),
+            IntentKind::CloseAll => self.upsert(it, it.kind as u8, StrKey::NONE, 0, ctx, counters),
             IntentKind::Cancel => {
                 self.cancel(Some(it.id));
                 exits.cancel(Some(it.id));
@@ -460,36 +446,53 @@ impl OrderTable {
         Ok(())
     }
 
-    /// Create or modify the record keyed `(kind, key)` (§4.3 "Modification").
+    /// Create or modify the record keyed `(kind, key)` (§4.3 "Modification"). `kind` other than
+    /// `it.kind` is the `allow_entry_in` override (§4.4.3): the entry `it` commits as a bare market
+    /// close-all — long side, no OCA, no quantity, no prices, no flags — read in place (its
+    /// `qty_pct_1e6`, `id_sym`, `comment_sym` kept), never rebuilt as a local intent.
     fn upsert(
         &mut self,
         it: &OrderIntent,
+        kind: u8,
         key: StrKey,
         extra: u8,
         ctx: &CommitCtx,
         counters: &mut BrokerCounters,
     ) -> Result<(), BrokerFault> {
-        let kind = it.kind as u8;
+        let bare = kind != it.kind as u8;
+        let (side, flags, oca_type, oca_name) = if bare {
+            (IntentSide::Long as u8, 0, OcaType::None, StrKey::NONE)
+        } else {
+            (it.side as u8, it.flags, it.oca_type, it.oca_name)
+        };
         let existing = self.find(kind, key);
         let skip = existing.unwrap_or(usize::MAX);
-        if it.oca_type != OcaType::None
-            && !self.group_live(it.oca_name, it.oca_type as u8, skip)
+        if oca_type != OcaType::None
+            && !self.group_live(oca_name, oca_type as u8, skip)
             && self.live_groups(skip) >= cap::OCA_GROUPS
         {
             return Err(BrokerFault::Script(ScriptRefusal::OcaGroupsFull));
         }
-        let (i, seq, filled, reduced, sent, deferred) = match existing {
+        let (i, seq, filled, reduced, sent, deferred, opened) = match existing {
             Some(i) => {
                 counters.intents_modified += 1;
                 let o = &self.orders[i];
                 // A modification keeps its venue order (native requotes it, §4.3), and a deferred
-                // remainder on the same side (§4.12.4 rule 3).
-                let keep = if o.side == it.side as u8 {
-                    o.flags & pflag::DEFERRED
+                // remainder on the same side with what the record already opened (§4.12.4 rule 3).
+                let (keep, opened) = if o.side == side {
+                    (o.flags & pflag::DEFERRED, o.opened_1e6)
                 } else {
-                    0
+                    (0, 0)
                 };
-                (i, o.seq, o.filled_1e6, o.oca_reduced_1e6, o.sent, keep)
+                (
+                    i,
+                    o.seq,
+                    o.filled_1e6,
+                    o.oca_reduced_1e6,
+                    o.sent,
+                    keep,
+                    opened,
+                )
             }
             None => {
                 if self.len() == cap::ORDERS {
@@ -498,26 +501,26 @@ impl OrderTable {
                 let s = self.next_seq;
                 self.next_seq = self.next_seq.wrapping_add(1);
                 self.n += 1;
-                (self.len() - 1, s, 0, 0, 0, 0)
+                (self.len() - 1, s, 0, 0, 0, 0, 0)
             }
         };
-        let has_l = it.flags & intent_flag::LIMIT != 0;
-        let has_s = it.flags & intent_flag::STOP != 0;
+        let has_l = flags & intent_flag::LIMIT != 0;
+        let has_s = flags & intent_flag::STOP != 0;
         let ot = match (has_l, has_s) {
             (true, true) => otype::STOP_LIMIT,
             (true, false) => otype::LIMIT,
             (false, true) => otype::STOP,
             (false, false) => otype::MARKET,
         };
-        let imm = if it.flags & intent_flag::IMMEDIATELY != 0 {
+        let imm = if flags & intent_flag::IMMEDIATELY != 0 {
             pflag::IMMEDIATELY
         } else {
             0
         };
         self.orders[i] = PendingOrder {
             id: key,
-            oca_name: it.oca_name,
-            qty_1e6: it.qty_1e6,
+            oca_name,
+            qty_1e6: if bare { 0 } else { it.qty_1e6 },
             qty_pct_1e6: it.qty_pct_1e6,
             limit_1e6: if has_l {
                 round_tick(it.limit_1e6, ctx.round_tick_1e6)
@@ -537,17 +540,18 @@ impl OrderTable {
             id_sym: it.id_sym,
             comment_sym: it.comment_sym,
             kind,
-            side: it.side as u8,
+            side,
             otype: ot,
             state: state::WORKING,
-            oca_type: it.oca_type as u8,
+            oca_type: oca_type as u8,
             flags: imm | extra | deferred,
             sent,
             latch: 0,
             gen_open: 0,
             gen_eq_lo: 0,
             gen_eq_hi: 0,
-            _pad: [0; 4],
+            opened_1e6: opened,
+            _pad: [0; 2],
         };
         Ok(())
     }

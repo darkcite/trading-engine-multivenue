@@ -406,6 +406,7 @@ impl NativeBroker {
         };
         let wrong_side = (qty_1e6 > 0) != (o_side == 0);
         let over = o_filled.saturating_add(q_abs) > o_qty;
+        let pos_before = self.book.view().position_size_1e6;
         self.book
             .apply_fill(qty_1e6, px_1e6, fee_1e12, &src, bar_index, time_ms, cause)?;
         if wrong_side || over {
@@ -421,8 +422,19 @@ impl NativeBroker {
         let filled = o_filled + q_abs;
         self.sent.get_mut(i).filled_1e6 = filled;
         if let Some(k) = owner_order {
+            // What this fill opened past flat on its own side (`pin:05-reversal-own-qty`).
+            let pos_after = self.book.view().position_size_1e6;
+            let (before, after) = if qty_1e6 > 0 {
+                (pos_before, pos_after)
+            } else {
+                (pos_before.saturating_neg(), pos_after.saturating_neg())
+            };
+            let opened = after.max(0).saturating_sub(before.max(0)).max(0);
             let p = self.orders.get_mut(k);
             p.filled_1e6 = p.filled_1e6.saturating_add(q_abs);
+            if p.kind == IntentKind::Entry as u8 {
+                p.opened_1e6 = p.opened_1e6.saturating_add(opened);
+            }
             self.orders.on_member_fill(k, q_abs, &mut self.counters);
             // Done at its size (§4.13 line 6) — the size it WANTS: a send cut short by outstanding
             // reducers (`DEFERRED`, §4.12.4 rules 2–3) leaves the record alive for the remainder,
@@ -937,6 +949,11 @@ impl NativeBroker {
     /// `pin:05-preempt-reducers`: the literal "cancel every resting reducer", whether or not the
     /// close's own room suffices; a reversal is included (rule 3 alone could wait forever on a
     /// take-profit that never fills). Reducing makers are held while it holds.
+    /// `pin:05-stop-limit-preempt-lag`: this runs before step 5's `order_triggers`, so a
+    /// stop-limit entry still `Working` wants nothing here; on the quote that triggers a reversing
+    /// stop-limit no reducer is taken back, and its send is rule 3's `q_open + |pos| − R`, which
+    /// never passes the target. It preempts at a later reconcile that finds it triggered and
+    /// wanting to fire (a plain stop entry, judged from the touch alone, preempts at once).
     fn reducers_preempted(&self, q: &Quote) -> bool {
         let pos = self.book.view().position_size_1e6;
         if pos == 0 {
@@ -1123,7 +1140,6 @@ impl NativeBroker {
         }
         want = (want - filled - reduced).max(0);
         let adds = pos == 0 || (pos > 0) == w.buy;
-        let mut scratch = BrokerCounters::default();
         let (close, open, reversal) = if kind == IntentKind::Entry as u8 {
             let bound = self.decl.risk.max_position_size_1e6;
             let max_pos = if bound > 0 {
@@ -1132,10 +1148,11 @@ impl NativeBroker {
                 0
             };
             let entries = self.outstanding_entries(w.buy, i);
+            // A dry run counts nothing (and zeroes no scratch counters).
             let counters = if commit {
-                &mut self.counters
+                Some(&mut self.counters)
             } else {
-                &mut scratch
+                None
             };
             let sized = size_entry_fill(
                 &self.book,
@@ -1203,6 +1220,11 @@ impl NativeBroker {
     /// late reducer fill crossing zero. Its `pyramiding` was judged at its first send.
     /// `pin:05-reversal-target`: the target is `q_open` on the entry's side at the current
     /// sizing; a position already past it (other fills) ends the record without a send.
+    /// `pin:05-reversal-own-qty` (lead ruling N1): the part of the remainder past flat is bounded
+    /// by `q_open − opened`, what this record's own fills have not opened yet — so a fill of the
+    /// new trade's own exit while an old reducer's cancel is pending is never re-sold; a record
+    /// that opened its whole `q_open` is done. The gates judge the worst case: the reducers in
+    /// flight that move its way fill first, so the send opens `send + R_dir − flat` (review minor).
     fn size_deferred_reversal(
         &mut self,
         i: usize,
@@ -1214,22 +1236,21 @@ impl NativeBroker {
         let pos = self.book.view().position_size_1e6;
         let toward = if w.buy { pos } else { pos.saturating_neg() };
         let remaining = q_open.saturating_sub(toward);
-        if remaining <= 0 {
+        let left = q_open.saturating_sub(self.orders.get(i).opened_1e6);
+        if remaining <= 0 || left <= 0 {
             if commit {
-                self.orders.kill(i); // on target
+                self.orders.kill(i); // on target, or it opened all it may
             }
             return 0;
         }
+        let flat_dist = toward.saturating_neg().max(0);
+        let bounded = remaining.min(flat_dist.saturating_add(left));
         let r_dir = self.outstanding_reducing_dir(w.buy);
-        let send = floor_step(
-            remaining.saturating_sub(r_dir).max(0),
-            self.cfg.qty_step_1e6,
-        );
+        let send = floor_step(bounded.saturating_sub(r_dir).max(0), self.cfg.qty_step_1e6);
         if send == 0 {
             return 0; // the reducers in flight cover it: wait for their dispositions
         }
-        let flat_dist = toward.saturating_neg().max(0);
-        let open = send.saturating_sub(flat_dist).max(0);
+        let open = send.saturating_add(r_dir).saturating_sub(flat_dist).max(0);
         if open > 0 && !self.gates_pass(w.buy, toward.max(0), open, px, commit) {
             if commit {
                 self.orders.kill(i);
@@ -1470,8 +1491,8 @@ impl NativeBroker {
 
     /// Σ|qty| of the open trades a `strategy.close(id)` closes: those whose entry id is `id`, and
     /// the D19 boot trade when the script opens `id` in exactly the boot position's direction
-    /// (amendment A6.3, `pin:05-boot-close-dir`, operator ruling 2026-10-16; reduce-only).
-    /// RISK-REVIEW: needs the risk-reviewer's sign-off before live.
+    /// (amendment A6.3, `pin:05-boot-close-dir`, operator ruling 2026-10-16; reduce-only; signed
+    /// off by the risk re-review with N1–N3).
     fn open_qty_of(&self, id: StrKey) -> i64 {
         let mut t = 0;
         let mut sum = 0_i64;

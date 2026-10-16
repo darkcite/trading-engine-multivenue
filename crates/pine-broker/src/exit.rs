@@ -18,12 +18,17 @@ use pine_ir::{entry_dir, intent_flag as f, BrokerCounters, EntryDir, OrderIntent
 
 /// The ids a `strategy.close(id)` / `strategy.exit(from_entry = id)` may reach the D19 boot trade
 /// through (amendment A6.3, `pin:05-boot-close-dir`, operator ruling 2026-10-16): those whose
-/// `ProgramMeta::entry_dirs` row is EXACTLY one direction bit, that of the boot position. A row
-/// with both bits, or no row, never reaches it. Loaded once at construction; inline (no
-/// allocation). `pin:05-entry-dirs-cap`: past `cap::BOOT_IDS` single-direction rows the rest are
-/// not retained, so those ids never reach the boot trade (fail-closed; `close_all`, an exit
-/// without `from_entry`, the flatten and the risk halts still do).
-#[derive(Debug, Clone, Copy)]
+/// `ProgramMeta::entry_dirs` rows, OR-merged, are EXACTLY one direction bit, that of the boot
+/// position. Merged rows with both bits, or no row, never reach it. Loaded once at construction;
+/// inline (no allocation), kept sorted by id.
+/// `pin:05-entry-dirs-merge` (lead ruling N2, fail closed): every row of an id is merged before
+/// deciding, so duplicated or unsorted rows (A6.1 promises one sorted row per id) can only take
+/// a reach away, never grant one.
+/// `pin:05-entry-dirs-cap`: past `cap::BOOT_IDS` single-direction ids only the `cap::BOOT_IDS`
+/// smallest are retained (the first ones of A6.1's sorted rows, whatever the input order), so
+/// any other id never reaches the boot trade (fail closed; `close_all`, an exit without
+/// `from_entry`, the flatten and the risk halts still do).
+#[derive(Debug, Clone)]
 pub(crate) struct BootDirs {
     ids: [StrKey; cap::BOOT_IDS],
     dirs: [u8; cap::BOOT_IDS],
@@ -40,19 +45,61 @@ impl BootDirs {
         }
     }
 
-    /// Keep the single-direction rows of `rows` (load time).
+    /// Keep the ids whose merged rows are one direction (load time; O(rows²), no allocation).
     pub(crate) fn load(&mut self, rows: &[EntryDir]) {
         self.n = 0;
         let mut i = 0;
-        while i < rows.len() && self.n < cap::BOOT_IDS {
-            let r = &rows[i];
-            if r.dirs == entry_dir::LONG || r.dirs == entry_dir::SHORT {
-                self.ids[self.n] = r.id;
-                self.dirs[self.n] = r.dirs;
-                self.n += 1;
+        while i < rows.len() {
+            let id = rows[i].id;
+            // The id's first row decides once, over every row of the id.
+            let mut first = true;
+            let mut j = 0;
+            while j < i {
+                if rows[j].id == id {
+                    first = false;
+                    break;
+                }
+                j += 1;
+            }
+            if first {
+                let mut dirs = 0;
+                let mut k = i;
+                while k < rows.len() {
+                    if rows[k].id == id {
+                        dirs |= rows[k].dirs;
+                    }
+                    k += 1;
+                }
+                if dirs == entry_dir::LONG || dirs == entry_dir::SHORT {
+                    self.insert(id, dirs);
+                }
             }
             i += 1;
         }
+    }
+
+    /// Insert `id` in id order; when full, it displaces the largest id if it is smaller.
+    fn insert(&mut self, id: StrKey, dirs: u8) {
+        let mut at = 0;
+        while at < self.n && self.ids[at].0 < id.0 {
+            at += 1;
+        }
+        if at == cap::BOOT_IDS {
+            return; // larger than every retained id of a full table
+        }
+        let mut k = if self.n < cap::BOOT_IDS {
+            self.n += 1;
+            self.n - 1
+        } else {
+            cap::BOOT_IDS - 1 // the largest falls off
+        };
+        while k > at {
+            self.ids[k] = self.ids[k - 1];
+            self.dirs[k] = self.dirs[k - 1];
+            k -= 1;
+        }
+        self.ids[at] = id;
+        self.dirs[at] = dirs;
     }
 
     /// Does `id` reach a boot trade that is long (`long`) or short?

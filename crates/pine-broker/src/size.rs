@@ -68,7 +68,7 @@ pub(crate) struct EntrySize {
 /// §4.7.5; TV `pyramiding = FillTime`). `gen_eval`: the evaluation that generated the order (the
 /// same-tick exception); `max_pos_1e6`: `strategy.risk.max_position_size` in contracts (0 = none,
 /// already N-rule-scaled under `FixedNotional`). `None`: the order dies (`pyramiding`, or clamped to
-/// zero), counted.
+/// zero), counted in `counters` when given (`None`: a dry run that counts nothing).
 pub(crate) fn size_entry_fill(
     book: &Book,
     long: bool,
@@ -77,7 +77,7 @@ pub(crate) fn size_entry_fill(
     pyramiding: u32,
     max_pos_1e6: i64,
     outstanding_entries: u32,
-    counters: &mut BrokerCounters,
+    counters: Option<&mut BrokerCounters>,
 ) -> Option<EntrySize> {
     size_entry(
         book,
@@ -119,7 +119,7 @@ pub(crate) fn size_entry(
     pyramiding: u32,
     max_pos_1e6: i64,
     outstanding_entries: u32,
-    counters: &mut BrokerCounters,
+    mut counters: Option<&mut BrokerCounters>,
 ) -> Option<EntrySize> {
     let pos = book.view().position_size_1e6;
     let adds = pos != 0 && (pos > 0) == long;
@@ -139,7 +139,9 @@ pub(crate) fn size_entry(
             }
         }
         if count >= pyramiding.max(1) {
-            counters.entries_refused_pyramiding += 1;
+            if let Some(c) = counters.as_deref_mut() {
+                c.entries_refused_pyramiding += 1;
+            }
             return None;
         }
     }
@@ -155,7 +157,9 @@ pub(crate) fn size_entry(
         let room = (max_pos_1e6 - held).max(0);
         if open > room {
             open = room;
-            counters.entries_clamped_max_position += 1;
+            if let Some(c) = counters {
+                c.entries_clamped_max_position += 1;
+            }
         }
         if open == 0 {
             return None;
@@ -242,15 +246,21 @@ mod tests {
         let mut c = BrokerCounters::default();
         fill(&mut b, PV, 1, lot_flag::PYRAMID);
         // pyramiding = 1: a same-direction entry is refused.
-        assert_eq!(size_entry_fill(&b, true, PV, 2, 1, 0, 0, &mut c), None);
+        assert_eq!(
+            size_entry_fill(&b, true, PV, 2, 1, 0, 0, Some(&mut c)),
+            None
+        );
         assert_eq!(c.entries_refused_pyramiding, 1);
         // pyramiding 0 reads as 1; pyramiding 2 admits it.
-        assert_eq!(size_entry_fill(&b, true, PV, 2, 0, 0, 0, &mut c), None);
-        assert!(size_entry_fill(&b, true, PV, 2, 2, 0, 0, &mut c).is_some());
+        assert_eq!(
+            size_entry_fill(&b, true, PV, 2, 0, 0, 0, Some(&mut c)),
+            None
+        );
+        assert!(size_entry_fill(&b, true, PV, 2, 2, 0, 0, Some(&mut c)).is_some());
         // `strategy.order` trades are never counted.
         let mut o = Book::new(1_000_000 * PV, PV, false);
         fill(&mut o, PV, 1, 0);
-        assert!(size_entry_fill(&o, true, PV, 2, 1, 0, 0, &mut c).is_some());
+        assert!(size_entry_fill(&o, true, PV, 2, 1, 0, 0, Some(&mut c)).is_some());
     }
 
     #[test]
@@ -259,9 +269,12 @@ mod tests {
         let mut c = BrokerCounters::default();
         fill(&mut b, PV, 7, lot_flag::PYRAMID | lot_flag::PRICE_BASED);
         // Generated in the same evaluation (7): excluded from the count.
-        assert!(size_entry_fill(&b, true, PV, 7, 1, 0, 0, &mut c).is_some());
+        assert!(size_entry_fill(&b, true, PV, 7, 1, 0, 0, Some(&mut c)).is_some());
         // Another evaluation: counted.
-        assert_eq!(size_entry_fill(&b, true, PV, 8, 1, 0, 0, &mut c), None);
+        assert_eq!(
+            size_entry_fill(&b, true, PV, 8, 1, 0, 0, Some(&mut c)),
+            None
+        );
     }
 
     #[test]
@@ -270,7 +283,7 @@ mod tests {
         let mut c = BrokerCounters::default();
         fill(&mut b, 15 * PV, 1, lot_flag::PYRAMID);
         // 15 long → short 5: close 15, open 5 (one fill of 20); a reversal is not pyramiding.
-        let r = size_entry_fill(&b, false, 5 * PV, 2, 1, 0, 0, &mut c);
+        let r = size_entry_fill(&b, false, 5 * PV, 2, 1, 0, 0, Some(&mut c));
         assert_eq!(
             r,
             Some(EntrySize {
@@ -279,7 +292,7 @@ mod tests {
             })
         );
         // max_position_size 3: the opening part clamps to 3.
-        let r = size_entry_fill(&b, false, 5 * PV, 2, 1, 3 * PV, 0, &mut c);
+        let r = size_entry_fill(&b, false, 5 * PV, 2, 1, 3 * PV, 0, Some(&mut c));
         assert_eq!(
             r,
             Some(EntrySize {
@@ -289,14 +302,14 @@ mod tests {
         );
         // Adding to 15 long under max 16 with pyramiding 2: 1 of 5; under max 15: dies.
         assert_eq!(
-            size_entry_fill(&b, true, 5 * PV, 2, 2, 16 * PV, 0, &mut c),
+            size_entry_fill(&b, true, 5 * PV, 2, 2, 16 * PV, 0, Some(&mut c)),
             Some(EntrySize {
                 close_1e6: 0,
                 open_1e6: PV
             })
         );
         assert_eq!(
-            size_entry_fill(&b, true, 5 * PV, 2, 2, 15 * PV, 0, &mut c),
+            size_entry_fill(&b, true, 5 * PV, 2, 2, 15 * PV, 0, Some(&mut c)),
             None
         );
         assert_eq!(c.entries_clamped_max_position, 3);

@@ -845,7 +845,7 @@ impl TvBroker {
                 self.decl.pyramiding,
                 self.max_position(px),
                 0,
-                &mut self.counters,
+                Some(&mut self.counters),
             ) else {
                 self.orders.kill(i);
                 return Ok(false);

@@ -20717,6 +20717,125 @@ fn pvm_native_event(
     errs
 }
 
+/// PVM-3's second broker, one scripted cycle per event (Maker column, the venue answering at once:
+/// a `Cancel` confirmed, an IoC filled in full at its price, a maker acked and left resting):
+/// long 10; an 80 % take-profit rests; a 50 % close is cut short by it (`|pos| − R`), takes it
+/// back and finishes (`pflag::DEFERRED` on a close); the take-profit rests again; a short entry
+/// reverses over it (`q_open + |pos| − R`) and sends its deferred remainder
+/// (`size_deferred_reversal`); a trail-only exit on the short arms on a dip (`step_trails`) and
+/// fires on the rebound, flat again. Returns the calls that answered `Err` and the tally
+/// `[close IoCs, reversal IoCs, trail IoCs, take-backs]` (2, 2, 2, 2 per cycle).
+fn pvm_native_cycle(
+    b: &mut pine_broker::NativeBroker,
+    out: &mut pine_broker::EngineIntentBuf,
+    i: u32,
+) -> (u32, [u32; 4]) {
+    let t = 10_000;
+    let mut errs = 0_u32;
+    let mut tally = [0_u32; 4];
+    let entry = |id: u64, side: pine_ir::IntentSide| pine_ir::OrderIntent {
+        kind: pine_ir::IntentKind::Entry,
+        id: pine_ir::StrKey(id),
+        side,
+        ..pine_ir::OrderIntent::default()
+    };
+    let steps: [(Option<pine_ir::OrderIntent>, i64); 13] = [
+        (Some(entry(1, pine_ir::IntentSide::Long)), 0),
+        (
+            Some(pine_ir::OrderIntent {
+                kind: pine_ir::IntentKind::Exit,
+                id: pine_ir::StrKey(9),
+                from_entry: pine_ir::StrKey(1),
+                flags: pine_ir::intent_flag::LIMIT | pine_ir::intent_flag::QTY_PCT,
+                limit_1e6: 110 * PVM_E,
+                qty_pct_1e6: 80 * PVM_E,
+                ..pine_ir::OrderIntent::default()
+            }),
+            0,
+        ),
+        (
+            Some(pine_ir::OrderIntent {
+                kind: pine_ir::IntentKind::Close,
+                from_entry: pine_ir::StrKey(1),
+                flags: pine_ir::intent_flag::QTY_PCT,
+                qty_pct_1e6: 50 * PVM_E,
+                ..pine_ir::OrderIntent::default()
+            }),
+            0,
+        ),
+        (None, 0),
+        (None, 0),
+        (None, 0),
+        (Some(entry(2, pine_ir::IntentSide::Short)), 0),
+        (None, 0),
+        (
+            Some(pine_ir::OrderIntent {
+                kind: pine_ir::IntentKind::Exit,
+                id: pine_ir::StrKey(10),
+                from_entry: pine_ir::StrKey(2),
+                flags: pine_ir::intent_flag::TRAIL_POINTS | pine_ir::intent_flag::TRAIL_OFFSET,
+                trail_points_1e6: 10 * PVM_E,
+                trail_offset_1e6: 20 * PVM_E,
+                ..pine_ir::OrderIntent::default()
+            }),
+            0,
+        ),
+        // The dip arms the short's trail at 99.80; the rebound to 100.05 passes its stop.
+        (None, -20 * t),
+        (None, 5 * t),
+        (None, 5 * t),
+        (None, 0),
+    ];
+    let mut k = 0;
+    while k < steps.len() {
+        let (it, dx) = steps[k];
+        let now = 20_000_000_000_u64 + u64::from(i) * 1_000_000 + k as u64 * 1_000;
+        let px = 100 * PVM_E + dx;
+        b.open_bar(&pine_ir::Bar {
+            close_1e6: px,
+            index: i,
+            ..pine_ir::Bar::default()
+        });
+        if let Some(it) = it {
+            errs += u32::from(b.apply_intents(&[it], now).is_err());
+        }
+        let q = pine_ir::Quote {
+            bid_1e6: px,
+            ask_1e6: px,
+            bid_qty_1e6: 100 * PVM_E,
+            ask_qty_1e6: 100 * PVM_E,
+            ts_ns: now,
+            ..pine_ir::Quote::default()
+        };
+        errs += u32::from(b.reconcile(&q, now, out).is_err());
+        let mut j = 0;
+        while j < out.len() {
+            let e = out.as_slice()[j];
+            let signed = if e.side == 0 { e.qty_1e6 } else { -e.qty_1e6 };
+            match (e.verb, e.primitive) {
+                (pine_ir::EngineVerb::Cancel, _) => {
+                    tally[3] += u32::from(e.flags == 1);
+                    b.on_cancelled(e.client_oid);
+                }
+                (pine_ir::EngineVerb::Submit, pine_ir::Primitive::MakerPostOnly)
+                | (pine_ir::EngineVerb::Modify, _) => b.on_ack(e.client_oid),
+                (pine_ir::EngineVerb::Submit, p) => {
+                    let reduce = p == pine_ir::Primitive::ReduceOnlyIoc;
+                    tally[0] += u32::from(reduce && e.id == pine_ir::StrKey(1));
+                    tally[1] += u32::from(!reduce && e.id == pine_ir::StrKey(2));
+                    tally[2] += u32::from(reduce && e.id == pine_ir::StrKey(10));
+                    b.on_ack(e.client_oid);
+                    let r = b.on_fill(e.client_oid, signed, e.px_1e6, 0, i, 0);
+                    errs += u32::from(r.is_err());
+                }
+            }
+            j += 1;
+        }
+        k += 1;
+    }
+    (errs, tally)
+}
+
 #[test]
 fn pine_broker_native_reconcile_is_zero_alloc() {
     // Gate PVM-3 (impl-05 §7.11): 1 000 × (open_bar + apply_intents + reconcile + on_ack +
@@ -20774,6 +20893,11 @@ fn pine_broker_native_reconcile_is_zero_alloc() {
     );
     assert_eq!(fresh.view().position_size_1e6, 3 * PVM_E);
 
+    // The scripted cycle's broker (trails, a deferred reversal, a close cut short).
+    let mut sc = match pine_broker::NativeBroker::new(&meta, cfg) {
+        Ok(b) => b,
+        Err(c) => panic!("gate PVM-3: refused {c:?}"),
+    };
     let mut out = pine_broker::EngineIntentBuf::new();
     let mut i = 0_u32;
     while i < 16 {
@@ -20782,13 +20906,29 @@ fn pine_broker_native_reconcile_is_zero_alloc() {
             0,
             "warm-up event {i} faulted"
         );
+        let (e, tally) = pvm_native_cycle(&mut sc, &mut out, i);
+        assert_eq!(e, 0, "warm-up cycle {i} faulted");
+        assert_eq!(tally, [2, 2, 2, 2], "warm-up cycle {i} ran off its script");
+        assert_eq!(
+            sc.view().position_size_1e6,
+            0,
+            "warm-up cycle {i} ends flat"
+        );
         i += 1;
     }
     let c0 = *b.counters();
     let g = core_alloc::AllocGuard::new();
     let mut errs = 0_u32;
+    let mut tally = [0_u32; 4];
     while i < 1_016 {
         errs += pvm_native_event(&mut b, &mut out, i);
+        let (e, t) = pvm_native_cycle(&mut sc, &mut out, i);
+        errs += e;
+        let mut k = 0;
+        while k < 4 {
+            tally[k] += t[k];
+            k += 1;
+        }
         i += 1;
     }
     let (allocs, bytes, deallocs) = g.delta();
@@ -20802,6 +20942,14 @@ fn pine_broker_native_reconcile_is_zero_alloc() {
         errs, 0,
         "gate PVM-3: {errs} broker calls answered Err in the window"
     );
+    // The scripted broker ran its cycle 1 000 times: two close sends (cut short, then the rest),
+    // two reversal sends (then the deferred remainder), two trail fires, two take-backs, flat.
+    assert_eq!(
+        tally,
+        [2_000, 2_000, 2_000, 2_000],
+        "gate PVM-3: the cycle ran off its script"
+    );
+    assert_eq!(sc.view().position_size_1e6, 0);
     // The window did what the gate says: makers sent, requoted and filled.
     let c = *b.counters();
     assert!(

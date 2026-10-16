@@ -16,6 +16,11 @@ const NOW: u64 = 10_000_000_000;
 const STALE: i64 = 2_000_000_000;
 
 fn broker(max_open: u32) -> NativeBroker {
+    broker_day(max_open, 1_000_000 * E)
+}
+
+/// `broker` with its `cap_day_1e6`.
+fn broker_day(max_open: u32, cap_day_1e6: i64) -> NativeBroker {
     let meta = ProgramMeta {
         chart: ChartInfo {
             symbol_hash: 1,
@@ -38,7 +43,7 @@ fn broker(max_open: u32) -> NativeBroker {
     let cfg = NativeCfg {
         unit_notional_1e6: 1_000 * E,
         cap_instance_1e6: 100_000 * E,
-        cap_day_1e6: 1_000_000 * E,
+        cap_day_1e6,
         min_notional_1e6: 0,
         qty_step_1e6: 1_000,
         tick_1e6: 10_000,
@@ -639,4 +644,271 @@ fn a_replacement_acked_after_its_owner_moved_links_the_right_record() {
     b.on_fill(md.client_oid, md.qty_1e6, 92 * E, 0, 1, 0)
         .unwrap();
     assert_eq!(b.open_trade(0).map(|t| t.entry_id), Some(StrKey(3)));
+}
+
+/// Long 10 at 100 with a 40 % take-profit (4) resting from entry 1, then a market short entry 2
+/// (a reversal): returns `(pos, the TP, the reversal's first send)` — that send is
+/// `q_open + |pos| − R` (= 16), the TP taken back in the same reconcile.
+fn reversal_over_a_resting_tp(
+    b: &mut NativeBroker,
+    out: &mut EngineIntentBuf,
+) -> (i64, pine_ir::EngineIntent, pine_ir::EngineIntent) {
+    let pos = long_at_100(b, out);
+    let ex = OrderIntent {
+        kind: IntentKind::Exit,
+        id: StrKey(9),
+        from_entry: StrKey(1),
+        flags: f::LIMIT | f::QTY_PCT,
+        limit_1e6: 110 * E,
+        qty_pct_1e6: 40 * E,
+        ..OrderIntent::default()
+    };
+    let tp = rest_tp(b, out, ex);
+    let short = OrderIntent {
+        kind: IntentKind::Entry,
+        id: StrKey(2),
+        side: pine_ir::IntentSide::Short,
+        ..OrderIntent::default()
+    };
+    b.apply_intents(&[short], NOW).unwrap();
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, out)
+        .unwrap();
+    assert_eq!(out.len(), 2);
+    assert_eq!(out.as_slice()[0].verb, EngineVerb::Cancel);
+    let s1 = out.as_slice()[1];
+    assert_eq!(
+        (s1.side, s1.flags, s1.qty_1e6),
+        (1, 0, 2 * pos - tp.qty_1e6)
+    );
+    (pos, tp, s1)
+}
+
+#[test]
+fn a_reversal_never_re_opens_what_its_own_trade_closed() {
+    // Lead ruling N1 (`pin:05-reversal-own-qty`): the position crossed zero while the old TP's
+    // cancel is pending, and the NEW trade's own take-profit fills in that window. The deferred
+    // remainder is bounded by what this record itself opened: it never sends more than
+    // `q_open − opened` on the new side, so it does not re-sell what that take-profit bought.
+    let mut b = broker(4);
+    let mut out = EngineIntentBuf::new();
+    let (pos, tp1, s1) = reversal_over_a_resting_tp(&mut b, &mut out);
+    let r = tp1.qty_1e6;
+    fill(&mut b, &s1, 100 * E);
+    let opened = pos - r;
+    assert_eq!(
+        b.view().position_size_1e6,
+        -opened,
+        "crossed zero, short of target"
+    );
+    // The new trade's own take-profit (buy at 99) rests, cut to |pos| − R.
+    let tp2x = OrderIntent {
+        kind: IntentKind::Exit,
+        id: StrKey(10),
+        from_entry: StrKey(2),
+        flags: f::LIMIT,
+        limit_1e6: 99 * E,
+        ..OrderIntent::default()
+    };
+    b.apply_intents(&[tp2x], NOW).unwrap();
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert_eq!(out.len(), 1);
+    let tp2 = out.as_slice()[0];
+    assert_eq!(
+        (tp2.verb, tp2.primitive, tp2.side, tp2.flags, tp2.qty_1e6),
+        (
+            EngineVerb::Submit,
+            Primitive::MakerPostOnly,
+            0,
+            1,
+            opened - r
+        )
+    );
+    // The venue fills it while the old TP's cancel is still unconfirmed.
+    fill(&mut b, &tp2, 99 * E);
+    assert_eq!(b.view().position_size_1e6, -(opened - tp2.qty_1e6));
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert!(
+        out.is_empty(),
+        "the old TP still covers the remainder: nothing re-sold over the new trade's own exit"
+    );
+    // The old TP's cancel lands: the record sends exactly what it has not opened yet.
+    b.on_cancelled(tp1.client_oid);
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    let sells: Vec<_> = out
+        .as_slice()
+        .iter()
+        .filter(|e| e.verb == EngineVerb::Submit && e.flags == 0 && e.side == 1)
+        .copied()
+        .collect();
+    assert_eq!(sells.len(), 1);
+    assert_eq!(
+        sells[0].qty_1e6,
+        pos - opened,
+        "q_open − opened, not q_open − |pos|"
+    );
+    fill(&mut b, &sells[0], 100 * E);
+    // The record opened q_open in all: it is done; nothing more is sold.
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert!(out
+        .as_slice()
+        .iter()
+        .all(|e| !(e.verb == EngineVerb::Submit && e.flags == 0 && e.side == 1)));
+}
+
+#[test]
+fn a_deferred_reversal_gates_the_worst_case_with_the_reducers_in_flight() {
+    // Review minor (§4.12.3 gates 5–6, §4.12.4 rule 3): the deferred send's increasing part is
+    // judged as if the outstanding reducers moving its way fill first (`send + R_dir − flat`).
+    // Day cap 2 800: the entry (1 000) and the first send's opening part (1 000) fit; the venue
+    // fills 10 of the 16 (flat) — day 2 000 — and the remainder 6 with R_dir 4 opens 10 worst
+    // case (+1 000 > 800 left), so the record dies, counted; without R_dir it would pass (600).
+    let mut b = broker_day(4, 2_800 * E);
+    let mut out = EngineIntentBuf::new();
+    let (pos, _tp1, s1) = reversal_over_a_resting_tp(&mut b, &mut out);
+    b.on_ack(s1.client_oid);
+    b.on_fill(s1.client_oid, -pos, 100 * E, 0, 1, 0).unwrap();
+    b.on_cancelled(s1.client_oid);
+    assert_eq!(b.view().position_size_1e6, 0);
+    let caps = b.counters().skipped_cap;
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert!(
+        out.as_slice().iter().all(|e| e.verb != EngineVerb::Submit),
+        "refused at the worst case: {:?}",
+        out.as_slice()
+    );
+    assert_eq!(b.counters().skipped_cap, caps + 1);
+}
+
+#[test]
+fn a_close_with_qty_or_pct_cut_short_by_a_resting_reducer_finishes_at_its_size() {
+    // §4.12.4 rule 2 with an explicit size: the close wants half of entry 1 (pct 50, or qty 0.5
+    // scaled ×10 by the unit, §4.7.2); an 80 % take-profit rests, so the first send is
+    // |pos| − R = 2; after the cancel the rest (5 − 2, judged against total + filled) follows,
+    // and the close ends at its size — half the trade, not the rest of it.
+    let explicit = [
+        OrderIntent {
+            kind: IntentKind::Close,
+            from_entry: StrKey(1),
+            flags: f::QTY_PCT,
+            qty_pct_1e6: 50 * E,
+            ..OrderIntent::default()
+        },
+        OrderIntent {
+            kind: IntentKind::Close,
+            from_entry: StrKey(1),
+            flags: f::QTY,
+            qty_1e6: E / 2,
+            ..OrderIntent::default()
+        },
+    ];
+    for close in explicit {
+        let mut b = broker(4);
+        let mut out = EngineIntentBuf::new();
+        let pos = long_at_100(&mut b, &mut out);
+        let ex = OrderIntent {
+            kind: IntentKind::Exit,
+            id: StrKey(9),
+            from_entry: StrKey(1),
+            flags: f::LIMIT | f::QTY_PCT,
+            limit_1e6: 110 * E,
+            qty_pct_1e6: 80 * E,
+            ..OrderIntent::default()
+        };
+        let tp = rest_tp(&mut b, &mut out, ex);
+        let r = tp.qty_1e6;
+        b.apply_intents(&[close], NOW).unwrap();
+        b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.as_slice()[0].verb, EngineVerb::Cancel);
+        let c1 = out.as_slice()[1];
+        assert_eq!(
+            (c1.primitive, c1.side, c1.qty_1e6),
+            (Primitive::ReduceOnlyIoc, 1, pos - r)
+        );
+        fill(&mut b, &c1, 100 * E);
+        b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+            .unwrap();
+        assert!(out.is_empty(), "R covers the rest until the cancel lands");
+        b.on_cancelled(tp.client_oid);
+        b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        let c2 = out.as_slice()[0];
+        assert_eq!(
+            (c2.primitive, c2.side, c2.qty_1e6),
+            (Primitive::ReduceOnlyIoc, 1, pos / 2 - (pos - r))
+        );
+        fill(&mut b, &c2, 100 * E);
+        assert_eq!(b.view().position_size_1e6, pos / 2, "half the trade");
+        b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+            .unwrap();
+        assert!(
+            out.as_slice()
+                .iter()
+                .all(|e| e.primitive != Primitive::ReduceOnlyIoc),
+            "the close is done at its size"
+        );
+    }
+}
+
+#[test]
+fn a_stop_limit_reversal_does_not_preempt_on_its_trigger_quote() {
+    // `pin:05-stop-limit-preempt-lag`: the take-back decision (§4.12.4 rule 2) is made before
+    // step 5 moves a stop-limit to its limit stage, so on the quote that triggers a reversing
+    // stop-limit the resting reducers are not taken back — its send is still rule 3's
+    // `q_open + |pos| − R`, never past the target. A plain stop entry preempts at once.
+    let mk = |flags: u16| OrderIntent {
+        kind: IntentKind::Entry,
+        id: StrKey(2),
+        side: pine_ir::IntentSide::Short,
+        flags,
+        stop_1e6: 99 * E,
+        limit_1e6: if flags & f::LIMIT != 0 {
+            98 * E + 500_000
+        } else {
+            0
+        },
+        ..OrderIntent::default()
+    };
+    let touch = quote(98 * E + 900_000, 98 * E + 900_000, NOW);
+    // The unit at the bid 98.9: 1 000 / 98.9 floored to the 0.001 step.
+    let u = 10_111_000;
+    let run = |entry: OrderIntent| {
+        let mut b = broker(4);
+        let mut out = EngineIntentBuf::new();
+        let pos = long_at_100(&mut b, &mut out);
+        let ex = OrderIntent {
+            kind: IntentKind::Exit,
+            id: StrKey(9),
+            from_entry: StrKey(1),
+            flags: f::LIMIT | f::QTY_PCT,
+            limit_1e6: 110 * E,
+            qty_pct_1e6: 40 * E,
+            ..OrderIntent::default()
+        };
+        let tp = rest_tp(&mut b, &mut out, ex);
+        b.apply_intents(&[entry], NOW).unwrap();
+        b.reconcile(&touch, NOW, &mut out).unwrap();
+        (pos, tp.qty_1e6, out.as_slice().to_vec())
+    };
+    let (pos, r, sl) = run(mk(f::STOP | f::LIMIT));
+    assert_eq!(sl.len(), 1, "no take-back on the trigger quote: {sl:?}");
+    assert_eq!(
+        (sl[0].verb, sl[0].primitive, sl[0].side, sl[0].qty_1e6),
+        (EngineVerb::Submit, Primitive::TakerIoc, 1, pos + u - r)
+    );
+    let (_, _, st) = run(mk(f::STOP));
+    assert_eq!(st.len(), 2);
+    assert_eq!(
+        st[0].verb,
+        EngineVerb::Cancel,
+        "a plain stop takes the TP back at once"
+    );
+    assert_eq!((st[1].side, st[1].qty_1e6), (1, pos + u - r));
 }

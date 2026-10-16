@@ -45,6 +45,11 @@ fn broker_dirs(c: NativeCfg, dirs: &[(u64, u8)]) -> NativeBroker {
         })
         .collect();
     rows.sort_by_key(|r| r.id.0);
+    broker_rows(c, rows)
+}
+
+/// A broker given `entry_dirs` exactly as listed (any order, any duplicates).
+fn broker_rows(c: NativeCfg, rows: Vec<EntryDir>) -> NativeBroker {
     let meta = ProgramMeta {
         chart: ChartInfo {
             symbol_hash: 1,
@@ -400,8 +405,12 @@ fn repeated_flattens_against_a_filling_venue_never_cross_zero() {
 
 /// A close of `id` against a 5-contract long boot trade: what `reconcile` sends.
 fn boot_close(dirs: &[(u64, u8)], id: u64) -> Vec<pine_ir::EngineIntent> {
-    let mut b = broker_dirs(cfg(), dirs);
-    b.reconcile_boot(5 * E, 100 * E, 0);
+    close_boot(broker_dirs(cfg(), dirs), 5 * E, id)
+}
+
+/// A close of `id` against a boot trade of `pos` on broker `b`: what `reconcile` sends.
+fn close_boot(mut b: NativeBroker, pos: i64, id: u64) -> Vec<pine_ir::EngineIntent> {
+    b.reconcile_boot(pos, 100 * E, 0);
     let close = OrderIntent {
         kind: IntentKind::Close,
         from_entry: StrKey(id),
@@ -488,5 +497,115 @@ fn an_exit_from_an_opposite_id_does_not_cover_the_boot_trade_but_close_all_does(
         out.as_slice()[0].qty_1e6,
         5 * E,
         "close_all reaches the boot trade"
+    );
+}
+
+fn row(id: u64, dirs: u8) -> EntryDir {
+    EntryDir {
+        id: StrKey(id),
+        dirs,
+        _pad: [0; 7],
+    }
+}
+
+#[test]
+fn entry_dirs_rows_for_one_id_merge_before_the_boot_check() {
+    // Lead ruling N2 (`pin:05-entry-dirs-merge`, fail closed): every row of an id is OR-merged
+    // before deciding; an id whose merged directions are not exactly one never reaches the boot
+    // trade, whatever the rows' order.
+    let (l, s) = (entry_dir::LONG, entry_dir::SHORT);
+    let mixed = [
+        vec![row(42, l), row(42, s)],
+        vec![row(42, s), row(42, l)],
+        vec![row(42, l), row(7, s), row(42, s)],
+        vec![row(42, l), row(42, l | s)],
+    ];
+    for rows in mixed {
+        assert!(
+            close_boot(broker_rows(cfg(), rows.clone()), 5 * E, 42).is_empty(),
+            "merged both directions must not reach: {rows:?}"
+        );
+    }
+    // A duplicated single direction, unsorted, still reaches it.
+    let sent = close_boot(
+        broker_rows(cfg(), vec![row(42, l), row(7, s), row(42, l)]),
+        5 * E,
+        42,
+    );
+    assert_eq!(sent.len(), 1);
+    assert_eq!((sent[0].side, sent[0].qty_1e6), (1, 5 * E));
+}
+
+#[test]
+fn the_257th_single_direction_id_never_reaches_the_boot_trade() {
+    // `pin:05-entry-dirs-cap`: 256 single-direction ids are retained — the 256 smallest, so the
+    // input order does not matter — and any other id never reaches the boot trade (fail closed).
+    let sorted: Vec<EntryDir> = (1..=257).map(|id| row(id, entry_dir::LONG)).collect();
+    let mut reversed = sorted.clone();
+    reversed.reverse();
+    for rows in [sorted, reversed] {
+        assert!(
+            close_boot(broker_rows(cfg(), rows.clone()), 5 * E, 257).is_empty(),
+            "the 257th id reaches nothing"
+        );
+        assert_eq!(
+            close_boot(broker_rows(cfg(), rows.clone()), 5 * E, 256).len(),
+            1
+        );
+        assert_eq!(close_boot(broker_rows(cfg(), rows), 5 * E, 1).len(), 1);
+    }
+    // Ids whose rows merge to both directions take no slot: 256 more single ones all fit.
+    let mut rows: Vec<EntryDir> = (1..=300)
+        .map(|id| row(id, entry_dir::LONG | entry_dir::SHORT))
+        .collect();
+    rows.extend((1_000..1_256).map(|id| row(id, entry_dir::LONG)));
+    assert_eq!(close_boot(broker_rows(cfg(), rows), 5 * E, 1_255).len(), 1);
+}
+
+#[test]
+fn a_boot_short_is_closed_and_stopped_only_through_short_opened_ids() {
+    // A6.3 mirrored on a short boot position (`pin:05-boot-close-dir`).
+    let dirs = [(42, entry_dir::SHORT), (43, entry_dir::LONG)];
+    let sent = close_boot(broker_dirs(cfg(), &dirs), -5 * E, 42);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        (
+            sent[0].primitive,
+            sent[0].side,
+            sent[0].qty_1e6,
+            sent[0].flags
+        ),
+        (Primitive::ReduceOnlyIoc, 0, 5 * E, 1)
+    );
+    assert!(
+        close_boot(broker_dirs(cfg(), &dirs), -5 * E, 43).is_empty(),
+        "a long-opened id never closes a boot short"
+    );
+    let stop = |from: u64| {
+        let mut b = broker_dirs(cfg(), &dirs);
+        b.reconcile_boot(-5 * E, 100 * E, 0);
+        let ex = OrderIntent {
+            kind: IntentKind::Exit,
+            id: StrKey(9),
+            from_entry: StrKey(from),
+            flags: f::LOSS,
+            loss_ticks_1e6: 100 * E,
+            ..OrderIntent::default()
+        };
+        b.apply_intents(&[ex], NOW).unwrap();
+        let mut out = EngineIntentBuf::new();
+        b.reconcile(&quote(101 * E, 101 * E), NOW, &mut out)
+            .unwrap();
+        out.as_slice().to_vec()
+    };
+    let s = stop(42);
+    assert_eq!(s.len(), 1);
+    assert_eq!(
+        (s[0].primitive, s[0].side, s[0].qty_1e6, s[0].id),
+        (Primitive::ReduceOnlyIoc, 0, 5 * E, StrKey(9))
+    );
+    assert!(
+        stop(43).is_empty(),
+        "an exit from a long id never stops a boot short"
     );
 }

@@ -11,7 +11,11 @@
 //! * `book_mutated_from_the_walk_and_on_fill_only` (I25) — `Book`'s mutators (`apply_fill`,
 //!   `mark`, `set_liquidation_price`, `reset`, a `&mut` loan of the book) are reached only from the TV
 //!   walk and `NativeBroker::on_fill` / `open_bar` / `reconcile_boot`;
-//! * `one_dependency_and_it_is_pine_ir` (I2).
+//! * `one_dependency_and_it_is_pine_ir` (I2);
+//! * `copies_are_marked_and_tables_are_not_copy` (§4.17, the alloc / zero-copy re-audit's
+//!   minors) — a struct-update base read through a borrow (`..*x`) carries a `// COPY:` marker
+//!   within the 8 lines above it or above its literal; `BrokerCounters::default()` (208 B zeroed)
+//!   only inside a `fn new`; the inline tables derive no `Copy`.
 //!
 //! Each gate is a function over source text, proven live by a test that runs it over a scratch
 //! string containing a violating line. Test code: allocation is fine here.
@@ -495,6 +499,90 @@ fn workspace_members() -> Vec<String> {
         .collect()
 }
 
+/// Inline tables of several cache lines: never `Copy`, so a by-value copy is a compile error.
+const NOT_COPY: [&str; 7] = [
+    "BootDirs",
+    "ExitTable",
+    "OrderTable",
+    "SentTable",
+    "Book",
+    "NativeBroker",
+    "TvBroker",
+];
+
+/// The §4.17 copy gate over one file (see the module doc).
+fn gate_copies(file: &str, raw: &str) -> Vec<String> {
+    let code = code_of(raw);
+    let raw_lines: Vec<&str> = raw.lines().collect();
+    let line_of = |at: usize| code[..at].matches('\n').count() + 1;
+    let marked = |line: usize| {
+        let lo = line.saturating_sub(9);
+        raw_lines[lo..line.min(raw_lines.len())]
+            .iter()
+            .any(|l| l.contains("// COPY:"))
+    };
+    let mut v = Vec::new();
+    let mut from = 0;
+    while let Some(k) = code[from..].find("..*") {
+        let at = from + k;
+        from = at + 3;
+        // The literal's opening brace: the first unmatched `{` before the base.
+        let mut depth = 0_i32;
+        let mut open = None;
+        for (j, ch) in code[..at].char_indices().rev() {
+            if ch == '}' {
+                depth += 1;
+            } else if ch == '{' {
+                if depth == 0 {
+                    open = Some(j);
+                    break;
+                }
+                depth -= 1;
+            }
+        }
+        let line = line_of(at);
+        if !marked(line) && !open.is_some_and(|o| marked(line_of(o))) {
+            v.push(format!("{file}:{line}: unmarked struct-update copy `..*`"));
+        }
+    }
+    let news: Vec<(usize, usize)> = fn_bodies(&code)
+        .into_iter()
+        .filter(|(n, _, _)| n == "new")
+        .map(|(_, s, e)| (s, e))
+        .collect();
+    let mut from = 0;
+    while let Some(k) = code[from..].find("BrokerCounters::default()") {
+        let at = from + k;
+        from = at + 1;
+        if !news.iter().any(|&(s, e)| s <= at && at < e) {
+            v.push(format!(
+                "{file}:{}: BrokerCounters::default() outside a constructor",
+                line_of(at)
+            ));
+        }
+    }
+    for name in NOT_COPY {
+        let decl = format!("struct {name} ");
+        let Some(at) = code.find(&decl) else {
+            continue;
+        };
+        // The attributes directly above the declaration.
+        let line = line_of(at);
+        let mut l = line - 1;
+        while l > 0 {
+            let t = code.lines().nth(l - 1).unwrap_or("").trim();
+            if !(t.is_empty() || t.starts_with("#[")) {
+                break;
+            }
+            if t.starts_with("#[derive(") && t.contains("Copy") {
+                v.push(format!("{file}:{line}: `{name}` derives Copy"));
+            }
+            l -= 1;
+        }
+    }
+    v
+}
+
 fn run_gate(g: fn(&str, &str) -> Vec<String>) -> Vec<String> {
     let mut v = Vec::new();
     for (f, raw) in sources() {
@@ -542,7 +630,37 @@ fn one_dependency_and_it_is_pine_ir() {
     assert!(v.is_empty(), "{v:#?}");
 }
 
+#[test]
+fn copies_are_marked_and_tables_are_not_copy() {
+    let v = run_gate(gate_copies);
+    assert!(v.is_empty(), "{v:#?}");
+}
+
 // ------------------------------------------------- the gates are live ----
+
+#[test]
+fn the_copy_gate_is_live() {
+    let ok = "fn new() -> Self { Self { c: BrokerCounters::default() } }\n\
+              fn m(&self) -> S {\n    // COPY: s, 64 B — why — alternative\n    let so = S {\n\
+              a: 1,\n        b: 2,\n        c: 3,\n        d: 4,\n        e: 5,\n        f: 6,\n\
+              ..*self.s()\n    };\n    so\n}\n\
+              #[derive(Debug, Clone)]\npub(crate) struct BootDirs {\n    n: usize,\n}\n\
+              #[derive(Clone, Copy)]\nstruct Small {\n    n: u8,\n}\n";
+    assert!(
+        gate_copies("ok.rs", ok).is_empty(),
+        "{:?}",
+        gate_copies("ok.rs", ok)
+    );
+    // The three minors as they stood before the fix (orders.rs `commit`, native `size_order`,
+    // exit.rs `BootDirs`).
+    for bad in [
+        "fn commit(it: &OrderIntent) {\n    let close = OrderIntent {\n        flags: 0,\n        ..*it\n    };\n}\n",
+        "fn size_order(&mut self) {\n    let mut scratch = BrokerCounters::default();\n}\n",
+        "/// Doc.\n#[derive(Debug, Clone, Copy)]\npub(crate) struct BootDirs {\n    n: usize,\n}\n",
+    ] {
+        assert_eq!(gate_copies("bad.rs", bad).len(), 1, "missed: {bad}");
+    }
+}
 
 #[test]
 fn the_float_scale_clock_dyn_gate_is_live() {
