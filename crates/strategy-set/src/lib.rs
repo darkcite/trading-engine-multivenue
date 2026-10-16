@@ -33,15 +33,18 @@
 //! | 5 | `strategy-vm` | built (8g item 6) |
 //! | 6 | `strategy-xmm` | built (XMM XH1, 2026-09-26 — **was `strategy-icdp`**, unlinked the same day, O-XH1; lands DARK until XH3) — configured only when `~/multivenue/xmm.toml` resolves |
 //! | 7 | `strategy-hcv` | built (HC11, 2026-09-26 — Hypercall S1; lands DARK, paper only, in no configured mask, O-HC18) — configured only when `~/multivenue/hcv.toml` resolves |
-//! | 8–15 | — | **reserved** (S16-2, ruling S16-R5): no member; an `EnableStrategy` is refused and counted |
+//! | 8 | `strategy-pine` | built (PVM impl-08 T4, 2026-10-16 — third-party Pine scripts; **PAPER ONLY** by ruling: `exec.toml` refuses a live slot 8 at parse, `exec_boot` refuses `--arm-live 8`); selectable by name only — `all` stays the eight production members ([`ALL_MASK`], pin:08-all-excludes-pine); an `EnableStrategy(8)` is refused (the AI never arms third-party code) |
+//! | 9–15 | — | **reserved** (S16-2, ruling S16-R5): no member; an `EnableStrategy` is refused and counted |
 //!
 //! Slots 0–7 are all built since HC11 (slot 7 was never assigned before,
-//! so no capture carries rows of another member under it). Slots 8–15 are
-//! reserved (S16-2, ruling S16-R5): every mask is a
-//! [`core_types::SlotMask`] and every per-slot array is
-//! [`core_types::MAX_STRATEGY_SLOTS`] long, but no member stands there, so
-//! [`BUILT_MASK`] stays `0x00FF` and an `EnableStrategy` for 8–15 — like
-//! one past 15 — is refused (counted). Slot 2 changed hands on 2026-09-12:
+//! so no capture carries rows of another member under it). Slot 8 is built
+//! since PVM impl-08 T4 (2026-10-16; never assigned before either): the Pine
+//! member, PAPER ONLY, outside `all` ([`ALL_MASK`] stays `0x00FF`, so
+//! [`BUILT_MASK`] is `0x01FF`). Slots 9–15 are reserved (S16-2, ruling
+//! S16-R5): every mask is a [`core_types::SlotMask`] and every per-slot
+//! array is [`core_types::MAX_STRATEGY_SLOTS`] long, but no member stands
+//! there, and an `EnableStrategy` for 9–15 — like one past 15, and like 8 —
+//! is refused (counted). Slot 2 changed hands on 2026-09-12:
 //! `strategy-cross-arb` was unlinked (the crate stays in the workspace
 //! — the `strategy-ev` precedent) and `strategy-xsd` took the number.
 //! Slot 6 changed hands on 2026-09-26 the same way: `strategy-icdp`
@@ -197,7 +200,7 @@ const _: () = assert!(
 );
 
 /// S16-2: the per-slot arrays' length — every slot a [`SlotMask`] can
-/// name, member or not (8–15 reserved: their entries keep their boot
+/// name, member or not (9–15 reserved: their entries keep their boot
 /// values and their gates read open).
 const SLOTS: usize = MAX_STRATEGY_SLOTS as usize;
 
@@ -248,8 +251,9 @@ macro_rules! member_gen {
             pub const $bn: SlotMask = 1 << $sn;
         )*
         /// Every built member's bit: the OR of the member table's rows
-        /// (slots 0–7, all of them since HC11; 8–15 are reserved, S16-R5,
-        /// so this is `0x00FF`).
+        /// (slots 0–7 since HC11, and slot 8 — pine — since PVM impl-08 T4;
+        /// 9–15 are reserved, S16-R5, so this is `0x01FF`). NOT what `all`
+        /// means: that is [`ALL_MASK`] (pin:08-all-excludes-pine).
         pub const BUILT_MASK: SlotMask = $($bn)|*;
         /// The member table's rows in slot order: every member's slot,
         /// bit, `--strategy` name and `regime.toml` label key. Boot-only
@@ -310,6 +314,18 @@ macro_rules! member_gen {
     ) => {
         $(
             if $s.enabled & $bn != 0 {
+                $s.$f.$m($a, &mut StampCtx::new(&mut *$c, $sn));
+            }
+        )*
+    };
+    // `@gated`, further limited by `$mask` (a const: the excluded rows'
+    // branches fold away) — PVM impl-08: the unattributed-fill fan-out
+    // leaves slot 8 out.
+    (@gated_mask $s:ident, $c:ident, $mask:expr, $m:ident($a:ident) ;
+        $(($sn:ident = $sv:expr, $bn:ident, $f:ident: $ty:ty, $nm:literal, $rk:expr)),* $(,)?
+    ) => {
+        $(
+            if $s.enabled & ($mask) & $bn != 0 {
                 $s.$f.$m($a, &mut StampCtx::new(&mut *$c, $sn));
             }
         )*
@@ -429,6 +445,10 @@ macro_rules! member_table {
                 xmm: strategy_xmm::XmmStrategy, "xmm", Some("xmm")),
             (SLOT_HCV = 7, BIT_HCV,
                 hcv: strategy_hcv::HcvStrategy, "hcv", None),
+            // PVM impl-08 T4 (ruling 2026-10-16): slot 8, PAPER ONLY; no
+            // `regime.toml` section (pine scripts carry their own logic).
+            (SLOT_PINE = strategy_pine::SLOT_PINE, BIT_PINE,
+                pine: strategy_pine::PineStrategy, "pine", None),
         }
     };
 }
@@ -455,6 +475,24 @@ pub const SET_AI_EXEC_SLOTS: usize = 64;
 /// rulesets). The one [`parse_strategy`] segment that names more than one
 /// member.
 pub const AI_MASK: SlotMask = BIT_AI_EXEC | BIT_VM;
+
+/// What `--strategy all` means: the eight production members, slots 0–7
+/// (`0x00FF`) — unchanged by the Pine member's arrival (PVM impl-08 T4, lead
+/// ruling 2026-10-16, pin:08-all-excludes-pine), so nothing about `all` or
+/// the wrapper changes. The Pine member (slot 8) is selectable by name only
+/// (`…+pine`).
+pub const ALL_MASK: SlotMask =
+    BIT_HYPARB | BIT_VRP | BIT_XSD | BIT_BIN15 | BIT_AI_EXEC | BIT_VM | BIT_XMM | BIT_HCV;
+const _: () = assert!(
+    ALL_MASK == 0x00FF,
+    "`all` is slots 0–7, as before slot 8 was built"
+);
+const _: () = assert!(ALL_MASK & BIT_PINE == 0 && BUILT_MASK == ALL_MASK | BIT_PINE);
+
+/// The members an unattributed (`STRATEGY_ID_NONE`) fill fans out to:
+/// every built member but pine (PVM impl-08 §2.2: slot 8 receives only the
+/// fills attributed to it, I41).
+pub const UNATTRIBUTED_FILL_MASK: SlotMask = BUILT_MASK & !BIT_PINE;
 
 /// Why [`parse_strategy`] refused a `--strategy` value. Its `Display`
 /// names the fault, then the valid names.
@@ -494,7 +532,8 @@ impl core::fmt::Display for StrategyParseErr<'_> {
 /// ruling S16-R3) — the ONE parser: the engine's boot, its
 /// `strategy-mask` subcommand and, through that, the launchd wrapper.
 ///
-/// `all` alone is every built member ([`BUILT_MASK`]). Anything else is
+/// `all` alone is the eight production members ([`ALL_MASK`], `0x00FF` —
+/// the Pine member, slot 8, is named, never implied). Anything else is
 /// `+`-joined segments in any order, each a member's name ([`MEMBERS`])
 /// or `ai` ([`AI_MASK`]); the mask is the OR of theirs, so an overlap or a
 /// repeat is the union (`ai+vm` = `ai`, `vrp+vrp` = `vrp`). Refused: the
@@ -511,7 +550,7 @@ pub fn parse_strategy(s: &str) -> Result<SlotMask, StrategyParseErr<'_>> {
         return Err(StrategyParseErr::Empty);
     }
     if s == "all" {
-        return Ok(BUILT_MASK);
+        return Ok(ALL_MASK);
     }
     let mut mask: SlotMask = 0;
     for seg in s.split('+') {
@@ -559,7 +598,7 @@ member_table! {
     /// map, routing and boot semantics.
     pub struct StrategySet {
         /// Runtime enable mask (bits per the slot map). Only
-        /// [`BUILT_MASK`] bits are ever set: 8–15 are reserved (S16-R5).
+        /// [`BUILT_MASK`] bits are ever set: 9–15 are reserved (S16-R5).
         enabled: SlotMask,
         /// Initial mask as passed to [`Self::new`] — `on_start` validates
         /// exactly these members.
@@ -628,7 +667,7 @@ pub const REGIME_TIMER_NS: u64 = 1_000_000_000;
 
 impl StrategySet {
     /// Build the set with all members default-constructed and the
-    /// given initial enable mask. Reserved bits (8–15, S16-R5) in
+    /// given initial enable mask. Reserved bits (9–15, S16-R5) in
     /// `initial_mask` are silently cleared to `BUILT_MASK` — no member
     /// stands behind them and the cli builds masks via
     /// [`parse_strategy`], so anything else is caller error contained
@@ -900,10 +939,23 @@ impl StrategySet {
         &mut self.hyparb
     }
 
+    /// PVM impl-08 §3.5: the boot seam, like [`Self::bin15_mut`] — the cli
+    /// configures slot 8 before `start` (T19). Boot-only.
+    #[inline]
+    pub fn pine_mut(&mut self) -> &mut strategy_pine::PineStrategy {
+        &mut self.pine
+    }
+
+    /// PVM impl-08 §3.7 (R2): the Pine member, read-only.
+    #[inline]
+    pub fn pine(&self) -> &strategy_pine::PineStrategy {
+        &self.pine
+    }
+
     /// X1: deliver an attributed fill to exactly one enabled slot.
     #[inline(always)]
     fn route_fill_to_slot<C: Ctx>(&mut self, slot: u8, fill: &Fill, ctx: &mut C) {
-        // Slots 8–15 have no member (S16-R5) and no slot past 15 exists:
+        // Slots 9–15 have no member (S16-R5) and no slot past 15 exists:
         // a fill stamped with one is a bug upstream, not a member to
         // deliver to.
         member_table!(
@@ -925,7 +977,7 @@ impl StrategySet {
     /// the [`Self::route_fill_to_slot`] law.
     #[inline(always)]
     fn route_order_event_to_slot<C: Ctx>(&mut self, slot: u8, event: &OrderEvent, ctx: &mut C) {
-        // Slots 8–15 have no member (S16-R5) — the caller's mask check
+        // Slots 9–15 have no member (S16-R5) — the caller's mask check
         // keeps them out, and this arm counts one if that ever changes.
         member_table!(
             @route self, ctx, slot, on_order_event(event),
@@ -1034,7 +1086,14 @@ impl StrategySet {
             self.enable_refused = self.enable_refused.wrapping_add(1);
             return;
         }
-        // No member behind the slot (8–15 reserved, S16-R5; past 15 off
+        // PVM impl-08 §4.7.6: the AI never arms third-party code — slot 8
+        // (pine) is refused and counted like a reserved slot. Disable and
+        // Halt are honoured (below, and in `on_ai`).
+        if slot == SLOT_PINE {
+            self.enable_refused = self.enable_refused.wrapping_add(1);
+            return;
+        }
+        // No member behind the slot (9–15 reserved, S16-R5; past 15 off
         // the mask) — refuse and count.
         let bit = member_table!(@bit_of slot, {
             self.enable_refused = self.enable_refused.wrapping_add(1);
@@ -1259,6 +1318,26 @@ impl StrategyCounters for StrategySet {
         self.bin15.bin15_counters()
     }
     #[inline]
+    fn pine_counters(&self) -> strategy_core::PineCounters {
+        self.pine.pine_counters()
+    }
+
+    fn pine_scripts_view(&self, out: &mut [strategy_core::PineScriptView]) -> u32 {
+        self.pine.pine_scripts_view(out)
+    }
+
+    fn pine_incidents_view(&self, out: &mut [strategy_core::PineIncident], from_seq: u64) -> u32 {
+        self.pine.pine_incidents_view(out, from_seq)
+    }
+
+    fn pine_tape_view(&self, out: &mut [strategy_core::PineTapeRec], from_seq: u64) -> u32 {
+        self.pine.pine_tape_view(out, from_seq)
+    }
+
+    fn pine_seq_view(&self, out: &mut [strategy_core::PineSeqRec], from_seq: u64) -> u32 {
+        self.pine.pine_seq_view(out, from_seq)
+    }
+
     fn bin15_families_view(&self, out: &mut [strategy_core::Bin15FamilyView]) -> u32 {
         self.bin15.bin15_families_view(out)
     }
@@ -1522,7 +1601,9 @@ impl Strategy for StrategySet {
             self.route_fill_to_slot(slot, fill, ctx);
             return;
         }
-        member_table! { @gated self, ctx, on_fill(fill) }
+        // PVM impl-08 §2.2: slot 8 is left out — it receives only the fills
+        // attributed to it (I41).
+        member_table! { @gated_mask self, ctx, UNATTRIBUTED_FILL_MASK, on_fill(fill) }
     }
 
     /// Set-level routing per §7 (module docs), then fan-out.
@@ -1933,7 +2014,7 @@ mod tests {
         assert_eq!(
             Unknown("nope").to_string(),
             "unknown name `nope` — valid: `+`-joined names from hyparb, vrp, xsd, bin15, \
-             ai-exec, vm, xmm, hcv, ai (= ai-exec+vm); or `all` alone",
+             ai-exec, vm, xmm, hcv, pine, ai (= ai-exec+vm); or `all` alone",
             "the refusal names the valid set"
         );
     }
@@ -1950,32 +2031,59 @@ mod tests {
         assert_eq!(parse_strategy("xmm+bin15"), Ok(72), "refused before S16-1c");
     }
 
+    /// A fresh set's enabled mask, in its own stack frame.
+    #[inline(never)]
+    fn mask_after_new(m: SlotMask) -> SlotMask {
+        StrategySet::new(m).enabled_mask()
+    }
+
     #[test]
     fn new_clamps_reserved_bits_to_built_mask() {
-        let s = StrategySet::new(0xFF);
-        assert_eq!(s.enabled_mask(), BUILT_MASK);
+        // Each set is built in `mask_after_new`'s own frame: the set is
+        // ~176 KiB by value, and a dozen debug locals of it sit at the test
+        // thread's 2 MiB stack (slot 8's member tipped it over).
+        assert_eq!(mask_after_new(0xFF), ALL_MASK);
+        // PVM impl-08 T4 changed this pin (was `BUILT_MASK == 0x00FF`):
+        // slot 8 is built (pine), 9–15 stay reserved.
         const _: () = assert!(
-            BUILT_MASK == 0x00FF,
-            "slots 0–7 built since HC11; 8–15 reserved (S16-R5)"
+            BUILT_MASK == 0x01FF,
+            "slots 0–7 built since HC11, 8 (pine) since PVM impl-08 T4; 9–15 reserved (S16-R5)"
         );
-        // S16-2: the reserved high byte is cleared, whole or alone — it
-        // never lands on the low byte's members.
-        let s = StrategySet::new(0xFFFF);
-        assert_eq!(s.enabled_mask(), BUILT_MASK);
-        let s = StrategySet::new(0xFF00);
-        assert_eq!(s.enabled_mask(), 0);
-        let s = StrategySet::new((1 as SlotMask) << 11);
-        assert_eq!(s.enabled_mask(), 0, "slot 11 is not slot 3");
-        let s = StrategySet::new(0b1000_0000);
-        assert_eq!(s.enabled_mask(), BIT_HCV, "slot 7 is built (hcv since HC11)");
-        let s = StrategySet::new(BIT_XSD);
-        assert_eq!(s.enabled_mask(), BIT_XSD, "slot 2 is built now (XSD-3)");
-        let s = StrategySet::new(BIT_XMM);
-        assert_eq!(s.enabled_mask(), BIT_XMM, "slot 6 is built (xmm since XMM XH1)");
-        let s = StrategySet::new(BIT_AI_EXEC);
-        assert_eq!(s.enabled_mask(), BIT_AI_EXEC, "slot 4 is built now");
-        let s = StrategySet::new(BIT_VM);
-        assert_eq!(s.enabled_mask(), BIT_VM, "slot 5 is built now (8g)");
+        // S16-2: the reserved bits are cleared, whole or alone — they never
+        // land on the low byte's members. Bit 8 is pine's own.
+        assert_eq!(mask_after_new(0xFFFF), BUILT_MASK);
+        assert_eq!(
+            mask_after_new(0xFF00),
+            BIT_PINE,
+            "of the high byte only slot 8 is built"
+        );
+        assert_eq!(mask_after_new(0xFE00), 0, "9–15 reserved");
+        assert_eq!(
+            mask_after_new((1 as SlotMask) << 11),
+            0,
+            "slot 11 is not slot 3"
+        );
+        assert_eq!(
+            mask_after_new(0b1000_0000),
+            BIT_HCV,
+            "slot 7 is built (hcv since HC11)"
+        );
+        assert_eq!(
+            mask_after_new(BIT_XSD),
+            BIT_XSD,
+            "slot 2 is built now (XSD-3)"
+        );
+        assert_eq!(
+            mask_after_new(BIT_XMM),
+            BIT_XMM,
+            "slot 6 is built (xmm since XMM XH1)"
+        );
+        assert_eq!(
+            mask_after_new(BIT_AI_EXEC),
+            BIT_AI_EXEC,
+            "slot 4 is built now"
+        );
+        assert_eq!(mask_after_new(BIT_VM), BIT_VM, "slot 5 is built now (8g)");
     }
 
     #[test]
@@ -3130,10 +3238,21 @@ mod tests {
     #[test]
     fn the_member_table_is_the_slot_map() {
         let slots: Vec<u8> = MEMBERS.iter().map(|m| m.slot).collect();
-        assert_eq!(slots, [0, 1, 2, 3, 4, 5, 6, 7], "wire-stable");
+        // PVM impl-08 T4 appended slot 8 (pine).
+        assert_eq!(slots, [0, 1, 2, 3, 4, 5, 6, 7, 8], "wire-stable");
         assert_eq!(
-            [SLOT_HYPARB, SLOT_VRP, SLOT_XSD, SLOT_BIN15, SLOT_AI_EXEC, SLOT_VM, SLOT_XMM, SLOT_HCV],
-            [0, 1, 2, 3, 4, 5, 6, 7]
+            [
+                SLOT_HYPARB,
+                SLOT_VRP,
+                SLOT_XSD,
+                SLOT_BIN15,
+                SLOT_AI_EXEC,
+                SLOT_VM,
+                SLOT_XMM,
+                SLOT_HCV,
+                SLOT_PINE
+            ],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8]
         );
         let mut or: SlotMask = 0;
         for m in MEMBERS {
@@ -3143,7 +3262,10 @@ mod tests {
         }
         assert_eq!(or, BUILT_MASK);
         let names: Vec<&str> = MEMBERS.iter().map(|m| m.name).collect();
-        assert_eq!(names, ["hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "hcv"]);
+        assert_eq!(
+            names,
+            ["hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "hcv", "pine"]
+        );
         let keys: Vec<Option<&str>> = MEMBERS.iter().map(|m| m.regime_key).collect();
         assert_eq!(
             keys,
@@ -3155,6 +3277,7 @@ mod tests {
                 Some("ai_exec"),
                 None,
                 Some("xmm"),
+                None,
                 None
             ]
         );
@@ -3171,15 +3294,20 @@ mod tests {
     // delivered callback.
 
     /// The probe slots: the first, a middle and the last reserved slot.
-    const S16_PROBES: [u8; 3] = [8, 11, 15];
+    /// PVM impl-08 T4 moved the first from 8 to 9 — slot 8 is the Pine
+    /// member now; its own mask paths are taken by the `pine_*` tests below.
+    const S16_PROBES: [u8; 3] = [9, 11, 15];
 
-    /// `BUILT_MASK` is the low byte, `all` is still 255, every parsed mask
-    /// fits in it, and a reserved bit names nothing.
+    /// `all` is still 255, every parsed mask fits `BUILT_MASK` (the low byte
+    /// plus slot 8 since PVM impl-08 T4), and a reserved bit names nothing.
     #[test]
     fn s16_built_mask_is_the_low_byte_and_all_is_255() {
         const _: () = assert!(core::mem::size_of::<SlotMask>() == 2);
         let all: SlotMask = parse_strategy("all").unwrap();
-        assert_eq!(all, 255, "`all` is every BUILT member");
+        assert_eq!(
+            all, 255,
+            "`all` is the eight production members (pin:08-all-excludes-pine)"
+        );
         for name in MEMBERS.iter().map(|m| m.name).chain(["ai"]) {
             let m = parse_strategy(name).unwrap();
             assert_eq!(m & !BUILT_MASK, 0, "{name}: no reserved bit");
@@ -3195,7 +3323,7 @@ mod tests {
         );
     }
 
-    /// `EnableStrategy` for 8, 11, 15 passes the wire's shape check
+    /// `EnableStrategy` for 9, 11, 15 passes the wire's shape check
     /// (core-types admits `0..MAX_STRATEGY_SLOTS`) and is refused and
     /// counted by the set: the mask stays 0 — slot `s & 7` is not switched
     /// on. Past 15 it is refused at the wire, and by the set as well.
@@ -3227,8 +3355,8 @@ mod tests {
         assert_eq!(c.submitted, 0);
     }
 
-    /// `DisableStrategy` for 8, 11, 15 with every built member on: honoured
-    /// and a no-op — hyparb, bin15 and hcv (`s & 7`) stay enabled. The
+    /// `DisableStrategy` for 9, 11, 15 with every built member on: honoured
+    /// and a no-op — vrp, bin15 and hcv (`s & 7`) stay enabled. The
     /// disable is the one set path that SHIFTS by the command's slot.
     #[test]
     fn s16_disable_of_a_reserved_slot_clears_no_built_bit() {
@@ -3246,7 +3374,7 @@ mod tests {
         assert_eq!(s.enable_refused_total(), 0, "a disable is never a refusal");
     }
 
-    /// A fill and an order event stamped 8, 11, 15 — with every built
+    /// A fill and an order event stamped 9, 11, 15 — with every built
     /// member enabled, so the `s & 7` member would take an alias — are
     /// counted unrouted and reach nobody.
     #[test]
@@ -3285,6 +3413,131 @@ mod tests {
         }
         assert_eq!(c.submitted, 0);
         assert_eq!(s.orders_emitted(), 0);
+    }
+
+    // ---- PVM impl-08 T4: slot 8, the Pine member (I41) ------------------
+
+    /// `all` keeps meaning slots 0–7; pine is selectable by name only, in
+    /// any combination; `BUILT_MASK` carries it (pin:08-all-excludes-pine).
+    #[test]
+    fn pine_is_slot_8_by_name_only_and_all_excludes_it() {
+        assert_eq!(SLOT_PINE, 8);
+        assert_eq!(BIT_PINE, 0x0100);
+        assert_eq!(BUILT_MASK, 0x01FF);
+        assert_eq!(parse_strategy("all"), Ok(0x00FF));
+        assert_eq!(parse_strategy("all"), Ok(ALL_MASK));
+        assert_eq!(parse_strategy("pine"), Ok(BIT_PINE));
+        assert_eq!(parse_strategy("ai+pine"), Ok(AI_MASK | BIT_PINE));
+        assert_eq!(
+            parse_strategy("ai+vrp+xsd+bin15+hyparb+xmm+hcv+pine"),
+            Ok(0x01FF)
+        );
+        assert_eq!(
+            parse_strategy("all+pine"),
+            Err(StrategyParseErr::AllNotAlone)
+        );
+        assert_eq!(MaskNames(BIT_PINE | BIT_BIN15).to_string(), "bin15+pine");
+        assert_eq!(UNATTRIBUTED_FILL_MASK & BIT_PINE, 0);
+    }
+
+    /// An unconfigured slot 8 in the boot mask refuses the boot (F19: the
+    /// set forwards `on_start` with `?`) — fail closed until T19's `--pine`.
+    #[test]
+    fn pine_in_the_boot_mask_refuses_on_start_until_configured() {
+        let mut s = StrategySet::new(BIT_PINE);
+        let mut c = ctx();
+        assert!(matches!(
+            s.on_start(&mut c),
+            Err(StrategyError::Config(m)) if m == strategy_pine::NOT_CONFIGURED
+        ));
+        assert_eq!(
+            s.pine().pine_counters(),
+            strategy_core::PineCounters::default()
+        );
+    }
+
+    /// I41: `EnableStrategy(8)` refused and counted (the AI never arms
+    /// third-party code); `DisableStrategy(8)` honoured, clearing bit 8
+    /// alone; a halt clears it too.
+    #[test]
+    fn pine_enable_8_refused_disable_8_honoured() {
+        let mut s = StrategySet::new(0);
+        let mut c = ctx();
+        s.on_start(&mut c).unwrap();
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_PINE), &mut c);
+        assert_eq!(s.enabled_mask(), 0, "slot 8 is never enabled by the AI");
+        assert_eq!(s.enable_refused_total(), 1);
+        assert_eq!(mask_after_disable_8(), BUILT_MASK & !BIT_PINE);
+        assert_eq!(c.submitted, 0);
+    }
+
+    #[inline(never)]
+    fn mask_after_disable_8() -> SlotMask {
+        let mut s = StrategySet::new(BUILT_MASK);
+        let mut c = ctx();
+        s.on_ai(&ai_cmd(AiCmdKind::DisableStrategy, SLOT_PINE), &mut c);
+        assert_eq!(s.enable_refused_total(), 0, "a disable is never a refusal");
+        s.enabled_mask()
+    }
+
+    /// I41: slot 8 receives only the fills attributed to it — never the
+    /// unattributed fan-out — and every other member's routing is as
+    /// before. (The inert shell counts each callback it is handed in
+    /// `callbacks_ignored`, which is what this observes.)
+    #[test]
+    fn pine_receives_only_fills_attributed_to_slot_8() {
+        let mut s = StrategySet::new(BIT_PINE | BIT_VRP);
+        let mut c = ctx();
+        let sym = make_symbol_id(VenueId::Hyperliquid, 2);
+        let fill = core_types::Fill::new(
+            1,
+            sym,
+            Side::Bid,
+            Price::from_raw(1_000_000),
+            Qty::from_raw(1_000_000),
+            99,
+        );
+        // Unattributed: fans out — but not to slot 8.
+        s.on_fill(&fill, &mut c);
+        assert_eq!(s.pine().pine_counters().callbacks_ignored, 0);
+        // Attributed to 8: slot 8 alone, nothing unrouted.
+        s.on_fill(
+            &fill.with_attribution(SLOT_PINE, core_types::FILL_ORIGIN_PAPER),
+            &mut c,
+        );
+        assert_eq!(s.pine().pine_counters().callbacks_ignored, 1);
+        assert_eq!(s.fills_unrouted(), 0);
+        // Attributed to 8 while 8 is disabled: counted unrouted, not delivered.
+        s.on_ai(&ai_cmd(AiCmdKind::DisableStrategy, SLOT_PINE), &mut c);
+        s.on_fill(
+            &fill.with_attribution(SLOT_PINE, core_types::FILL_ORIGIN_PAPER),
+            &mut c,
+        );
+        assert_eq!(s.fills_unrouted(), 1);
+        assert_eq!(s.pine().pine_counters().callbacks_ignored, 1);
+        // Once disabled, the AI cannot bring slot 8 back.
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_PINE), &mut c);
+        assert_eq!(s.enabled_mask(), BIT_VRP, "re-enable refused");
+        assert_eq!(c.submitted, 0);
+        assert_eq!(
+            StrategyCounters::pine_counters(&s),
+            s.pine().pine_counters()
+        );
+    }
+
+    /// Slot 8 never lowers the set's timer period (`u64::MAX`).
+    #[test]
+    fn pine_never_lowers_the_timer_period() {
+        assert_eq!(
+            strategy_pine::PineStrategy::new().timer_period_ns(),
+            u64::MAX
+        );
+        assert_eq!(timer_with(BIT_PINE | BIT_VRP), timer_with(BIT_VRP));
+    }
+
+    #[inline(never)]
+    fn timer_with(m: SlotMask) -> u64 {
+        StrategySet::new(m).timer_period_ns()
     }
 
     // ---- HC11 ---------------------------------------------------------

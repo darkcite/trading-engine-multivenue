@@ -77,6 +77,8 @@ members = [
     "crates/pine-spec",
     "crates/pine-std",
     "crates/pine-vm",
+    # impl-08 T4: the slot-8 Pine member (PAPER ONLY, ruling 2026-10-16)
+    "crates/strategy-pine",
 
     # --- execution ---
     "crates/clob-dispatcher",
@@ -251,6 +253,7 @@ pine-sema = { path = "crates/pine-sema" }
 pine-spec = { path = "crates/pine-spec" }
 pine-std = { path = "crates/pine-std" }
 pine-vm = { path = "crates/pine-vm" }
+strategy-pine = { path = "crates/strategy-pine" }
 
 clob-dispatcher = { path = "crates/clob-dispatcher" }
 exec-router     = { path = "crates/exec-router" }

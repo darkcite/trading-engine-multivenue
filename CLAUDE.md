@@ -14,17 +14,18 @@ MEXC (data-only), Hypercall options (slot 7's S1 member trades them in
 PAPER since the 2026-09-26 go-live; the HC9 order arm runs as operator
 verbs only),
 Polymarket CLOB, Polygon RPC, plus a boot-selected options ladder.
-Strategies are composed at boot from a 16-slot set (0–7 built, 8–15
-reserved; S16) and may trade
+Strategies are composed at boot from a 16-slot set (0–8 built — 8 is pine,
+paper only, selectable by name; 9–15 reserved; S16) and may trade
 **any subset** of that universe; **Polymarket is one venue among several, not
 the target**. v1 runs on a MacBook Pro M4 on free-tier APIs. Claude (via the
 `claude-worker` Python process, and in-session) is an **offline strategy
 researcher** — never in the hot path.
 
 Slots (`crates/strategy-set`, one `member_table!` row and one `SlotMask`
-(u16) bit each; 16 since S16, 2026-10-15; `all` = `BUILT_MASK` 0x00FF = 255,
-the enable mask today; 8–15 RESERVED, no member — arming one is refused at
-boot, adding one is its own ruling; risk-policy "S16"):
+(u16) bit each; 16 since S16, 2026-10-15; `all` = `ALL_MASK` 0x00FF = 255,
+the enable mask today (`BUILT_MASK` 0x01FF since slot 8); 9–15 RESERVED, no
+member — arming one is refused at boot, adding one is its own ruling;
+risk-policy "S16", "PVM — slot 8, paper only"):
 0 hyparb (HyperEVM ↔ HL Core arb, since HYPARB H0 2026-09-23 — lands DARK,
 O-H8; boots only with `~/multivenue/hyparb.toml` + the pool ingress, H5;
 `latency-arb` unlinked, its name refuses the boot) · 1 vrp ·
@@ -39,7 +40,11 @@ held-quote law; in the live mask since the go-live, 2026-09-26 20:15Z
 (O-HC25; it landed DARK, O-HC18); boots only with
 `~/multivenue/hcv.toml`; a live slot 7 refuses the boot; its book persists
 in `hcv-state.tsv` by contract since HC11b, written off the engine thread;
-risk-policy "HYPERCALL — slot 7"). Member timers run per
+risk-policy "HYPERCALL — slot 7") · 8 pine (third-party Pine scripts,
+`strategy-pine`, PVM impl-08; PAPER ONLY by ruling 2026-10-16: a live
+`[exec.slot.8]` refuses at parse, `--arm-live 8` at boot, the AI's enable is
+refused; not in `all`; a `STRATEGY` naming it refuses the boot until T19's
+`--pine`). Member timers run per
 slot (each on its own period). The engine boots the `STRATEGY` named in
 `~/multivenue/strategy.conf` through `scripts/engine-wrapper.sh`: `+`-joined
 member names or `ai` (= ai-exec+vm, 48), any order, parsed once by
@@ -234,9 +239,10 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   `strategy-mask` (the wrapper resolves through it; `all` refused),
   `SlotMask`, exec router / ledger (`LEDGER_RESTING` 1 024 with a
   high-water mark) / boot, the HL and Binance arms, `/state` schema 3.
-  Slots 8–15 are reserved: arming one is refused (S16-R5); a member there
-  needs its own ruling. Release builds have `overflow-checks =
-  false`: never write `1u8 << slot`; debug tests at slots 8/11/15 guard it.
+  Slots 9–15 are reserved: arming one is refused (S16-R5); a member there
+  needs its own ruling (slot 8 is pine since 2026-10-16, paper only).
+  Release builds have `overflow-checks = false`: never write
+  `1u8 << slot`; debug tests at slots 8/11/15 guard it.
 - **The S3 archive (HK11, HK18, HK20).** Uploads are paced in 64 KiB pieces
   under `MULTIVENUE_S3_MAX_UPLOAD_MIBPS`, 20 MiB/s since HK20 (the link's
   ~5 MB/s binds; the feed delays stayed near their no-upload band). An

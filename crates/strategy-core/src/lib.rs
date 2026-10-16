@@ -447,6 +447,48 @@ pub trait StrategyCounters {
         0
     }
 
+    /// PVM impl-08 §3.4: the Pine member's (slot 8) aggregate observables
+    /// (`engine_pine_*`), mirrored by the cli's 5 s block like
+    /// [`Self::bin15_counters`].
+    #[inline]
+    fn pine_counters(&self) -> PineCounters {
+        PineCounters::default()
+    }
+
+    /// PVM impl-08 §3.4: copy the per-script view into `out`
+    /// (`min(out.len())` rows), returning how many scripts are loaded.
+    /// Cold path; never allocates.
+    #[inline]
+    fn pine_scripts_view(&self, out: &mut [PineScriptView]) -> u32 {
+        let _ = out;
+        0
+    }
+
+    /// PVM impl-08 §3.4: copy the incidents with `seq >= from_seq` still in
+    /// the ring into `out`, returning the count. One older than the ring's
+    /// tail is gone (counted; the reader sees a seq gap).
+    #[inline]
+    fn pine_incidents_view(&self, out: &mut [PineIncident], from_seq: u64) -> u32 {
+        let _ = (out, from_seq);
+        0
+    }
+
+    /// PVM impl-08 §3.4: the decision-tape records with `seq >= from_seq`
+    /// still in the ring (8g), copied into `out`; returns the count.
+    #[inline]
+    fn pine_tape_view(&self, out: &mut [PineTapeRec], from_seq: u64) -> u32 {
+        let _ = (out, from_seq);
+        0
+    }
+
+    /// PVM impl-08 §3.4: the sequencing-tape records with `seq >= from_seq`
+    /// still in the ring (8g-A), copied into `out`; returns the count.
+    #[inline]
+    fn pine_seq_view(&self, out: &mut [PineSeqRec], from_seq: u64) -> u32 {
+        let _ = (out, from_seq);
+        0
+    }
+
     /// HYPARB H4: the slot-0 member's observables (`engine_hyparb_*`),
     /// mirrored by the cli's generic 5 s block like [`Self::bin15_counters`].
     #[inline]
@@ -1708,6 +1750,314 @@ pub struct Bin15FamilyView {
     /// BIN15 O6: σ√τ ×1e9, the denominator behind `d_1e6`.
     pub den_1e9: i64,
 }
+
+/// PVM impl-08 §3.4: the Pine member's (slot 8) aggregate observables
+/// (`engine_pine_*`), mirrored by the cli's 5 s block like
+/// [`Bin15Counters`]. Totals unless marked "level". POD, all `u64`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PineCounters {
+    /// Level: scripts loaded.
+    pub scripts_loaded: u64,
+    /// Level: scripts whose manifest `enabled = 1`.
+    pub scripts_enabled: u64,
+    /// Level: enabled, not disabled, warm, route not Off.
+    pub scripts_armed: u64,
+    /// Level: D13-disabled scripts. Any non-zero is an incident.
+    pub scripts_faulted: u64,
+    /// Level: scripts still discarding intents (cold start).
+    pub scripts_cold: u64,
+    /// Bars confirmed.
+    pub bars_confirmed: u64,
+    /// Bars gapped.
+    pub bars_gapped: u64,
+    /// First bucket after boot (partial).
+    pub bars_partial_boot: u64,
+    /// A print older than its row's forming bucket, dropped.
+    pub prints_late: u64,
+    /// An input whose `ts_ns` < E (E unchanged).
+    pub event_ts_regressions: u64,
+    /// Bar evaluations.
+    pub bar_evals: u64,
+    /// Tick evaluations.
+    pub tick_evals: u64,
+    /// Ticks coalesced.
+    pub ticks_coalesced: u64,
+    /// Ticks deferred by the per-event budget.
+    pub ticks_budgeted: u64,
+    /// `calc_on_order_fills` re-evaluations.
+    pub cof_evals: u64,
+    /// Intents discarded (warm-up, cold, `enabled = 0`).
+    pub intents_discarded: u64,
+    /// Submits.
+    pub submits: u64,
+    /// Modifies.
+    pub modifies: u64,
+    /// Cancels.
+    pub cancels: u64,
+    /// Submit / Modify `Err` (any `SubmitErr`).
+    pub submit_errors: u64,
+    /// Cancel `Err`.
+    pub cancel_errors: u64,
+    /// Acks.
+    pub acks: u64,
+    /// `on_cancelled` calls.
+    pub cancelled_reported: u64,
+    /// Settle points.
+    pub settle_points: u64,
+    /// Fills.
+    pub fills: u64,
+    /// A slot-8 cloid from another epoch (the venue snapshot at boot).
+    pub fills_prior_boot: u64,
+    /// Not slot 8 (engine hosts) — a routing defect upstream.
+    pub fills_foreign: u64,
+    /// Fills after a cancel.
+    pub late_fills_after_cancel: u64,
+    /// ALERT: a reducer that would flip the position.
+    pub late_reducer_flips: u64,
+    /// A live fill booked with the model fee.
+    pub fee_modelled_live: u64,
+    /// Refusal-streak trips.
+    pub refusal_trips: u64,
+    /// Increasing submits withheld by a tripped streak.
+    pub entries_suppressed: u64,
+    /// Flattens started.
+    pub flattens_started: u64,
+    /// Flatten attempts.
+    pub flatten_attempts: u64,
+    /// Level: ALERT — a disabled script still holds a position.
+    pub flatten_stuck: u64,
+    /// The boot-exit policy closed an adopted position.
+    pub boot_guard_flattens: u64,
+    /// Incidents.
+    pub incidents: u64,
+    /// Sequencing-tape records.
+    pub seq_records: u64,
+    /// Sequencing-tape drops — non-zero voids 8g for the boot.
+    pub seq_dropped: u64,
+    /// Decision-tape records.
+    pub tape_records: u64,
+    /// Decision-tape drops — non-zero voids 8g for the boot.
+    pub tape_dropped: u64,
+    /// Callbacks the member ignores by design (counted, dropped).
+    pub callbacks_ignored: u64,
+}
+
+/// Rows one Pine view carries (= `strategy_pine::MAX_SCRIPTS`).
+pub const PINE_VIEW_SCRIPTS: usize = 8;
+
+/// PVM impl-08 §3.4: one Pine script as `/metrics` and `/state` read it.
+/// 128 B, no interior padding.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PineScriptView {
+    /// First 8 bytes of the source SHA-256, big-endian.
+    pub sha_lo: u64,
+    /// Bar evaluations.
+    pub bar_evals: u64,
+    /// Tick evaluations.
+    pub tick_evals: u64,
+    /// Submits.
+    pub submits: u64,
+    /// Submit errors.
+    pub submit_errors: u64,
+    /// Fills.
+    pub fills: u64,
+    /// Broker counters (UNJUDGED inputs): skipped for a cap.
+    pub skipped_cap: u64,
+    /// Skipped for `max_open`.
+    pub skipped_max_open: u64,
+    /// IoC remainders cancelled.
+    pub ioc_remainder_cancelled: u64,
+    /// Position ×1e6 (fills only, E-5).
+    pub position_1e6: i64,
+    /// Average price ×1e6.
+    pub avg_px_1e6: i64,
+    /// Equity ×1e6 (`BrokerView::equity_1e12 / 1e6`, floored).
+    pub equity_1e6: i64,
+    /// Chart timeframe, s.
+    pub timeframe_s: u32,
+    /// Coalescing gap, ms.
+    pub coalesce_ms: u32,
+    /// `VmCounters::max_insns` (sizes `insn_budget`).
+    pub max_insns: u32,
+    /// Fault pc.
+    pub fault_pc: u32,
+    /// Fault bar.
+    pub fault_bar: u32,
+    /// Chart symbol.
+    pub sym: SymbolId,
+    /// Script index.
+    pub script: u8,
+    /// Manifest `enabled`.
+    pub enabled: u8,
+    /// D13 disabled, sticky.
+    pub disabled: u8,
+    /// Realtime mode.
+    pub realtime: u8,
+    /// Still cold.
+    pub cold: u8,
+    /// `FaultKind` as `u8`; 0 none; 0xFE broker refusal; 0xFD sub fault.
+    pub fault_kind: u8,
+    /// Flatten stuck.
+    pub flatten_stuck: u8,
+    /// Entries suppressed.
+    pub entries_suppressed: u8,
+}
+
+/// `PineIncident::event` values (PVM impl-08 §3.4).
+pub mod pine_incident {
+    /// VM fault of the script.
+    pub const FAULT: u8 = 1;
+    /// VM fault of a sub-program (every parent disabled).
+    pub const SUB_FAULT: u8 = 2;
+    /// `BrokerFault::Script`.
+    pub const BROKER_REFUSAL: u8 = 3;
+    /// Fault during warm-up.
+    pub const WARM_FAULT: u8 = 4;
+    /// Flatten stuck.
+    pub const FLATTEN_STUCK: u8 = 5;
+    /// A reducer that would have flipped the position.
+    pub const LATE_FLIP: u8 = 6;
+    /// The boot-exit policy closed an adopted position.
+    pub const BOOT_GUARD: u8 = 7;
+    /// The refusal streak tripped.
+    pub const REFUSAL_TRIP: u8 = 8;
+}
+
+/// PVM impl-08 §3.4: one out-of-band incident (8e). 128 B.
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PineIncident {
+    /// Gapless per boot.
+    pub seq: u64,
+    /// Event time, UTC ms.
+    pub utc_ms: i64,
+    /// Full source SHA-256 (the provenance of a third-party artifact).
+    pub sha256: [u8; 32],
+    /// Position ×1e6.
+    pub position_1e6: i64,
+    /// Bar index.
+    pub bar_index: u32,
+    /// `VmInstance::last_fault`'s pc; `u32::MAX` outside the loop.
+    pub pc: u32,
+    /// Coalescing gap, ms.
+    pub coalesce_ms: u32,
+    /// Refusal / sub index / attempts, per event.
+    pub detail: u32,
+    /// Script index.
+    pub script: u8,
+    /// `pine_incident::*`.
+    pub event: u8,
+    /// Fault kind.
+    pub fault_kind: u8,
+    /// 0 script, 1 sub-program, 2 broker, 3 host.
+    pub source: u8,
+    /// Padding.
+    pub _pad0: u32,
+    /// Padding.
+    pub _pad1: [u64; 6],
+}
+
+/// `PineTapeRec::kind` values (PVM impl-08 §4.9.2).
+pub mod pine_tape {
+    /// Boot header.
+    pub const BOOT_HDR: u8 = 1;
+    /// Boot: one script.
+    pub const BOOT_SCRIPT: u8 = 2;
+    /// Boot: venue state.
+    pub const BOOT_STATE: u8 = 3;
+    /// Boot: warm-up.
+    pub const BOOT_WARM: u8 = 4;
+    /// A bar evaluation.
+    pub const EVAL_BAR: u8 = 5;
+    /// A tick evaluation.
+    pub const EVAL_TICK: u8 = 6;
+    /// A dispatch.
+    pub const DISPATCH: u8 = 7;
+    /// A disposition.
+    pub const DISPOSITION: u8 = 8;
+    /// A fill.
+    pub const FILL: u8 = 9;
+    /// A fault.
+    pub const FAULT: u8 = 10;
+    /// A guard.
+    pub const GUARD: u8 = 11;
+}
+
+/// PVM impl-08 §3.4: one decision (8g). 64 B; every field an integer.
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PineTapeRec {
+    /// Gapless per boot.
+    pub seq: u64,
+    /// The `PineSeqRec` seq of the callback it happened in (0 = boot).
+    pub seq_ref: u64,
+    /// Payload word 0.
+    pub x0: i64,
+    /// Payload word 1.
+    pub x1: i64,
+    /// Payload word 2.
+    pub x2: u64,
+    /// Auxiliary word.
+    pub aux: u64,
+    /// Bar index.
+    pub bar_index: u32,
+    /// `NativeBroker` client oid (never the `u64` with the epoch).
+    pub oid: u32,
+    /// `pine_tape::*`.
+    pub kind: u8,
+    /// Script index.
+    pub script: u8,
+    /// Small field a.
+    pub a: u8,
+    /// Small field b.
+    pub b: u8,
+    /// Small field c.
+    pub c: u32,
+}
+
+/// `PineSeqRec::kind` values (PVM impl-08 §3.4).
+pub mod pine_seq {
+    /// A `Tick`.
+    pub const TICK: u8 = 1;
+    /// A `ChannelEvent`.
+    pub const EVENT: u8 = 2;
+    /// A `Fill`.
+    pub const FILL: u8 = 3;
+}
+
+/// PVM impl-08 §3.4: one input slot 8 consumed, as received (8g-A replays
+/// these). 128 B.
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PineSeqRec {
+    /// Gapless per boot.
+    pub seq: u64,
+    /// `ctx.now_ns()` at the callback: written, never read by the member (I5).
+    pub pop_ns: u64,
+    /// E after this input.
+    pub e_ns: u64,
+    /// `pine_seq::*`.
+    pub kind: u8,
+    /// Padding.
+    pub _pad0: [u8; 7],
+    /// Padding.
+    pub _pad1: [u64; 4],
+    /// The `Tick` / `ChannelEvent` / `Fill`, byte for byte (64 B each).
+    pub payload: [u64; 8],
+}
+
+const _: () = assert!(core::mem::size_of::<PineScriptView>() == 128);
+const _: () = assert!(
+    core::mem::size_of::<PineIncident>() == 128 && core::mem::align_of::<PineIncident>() == 64
+);
+const _: () = assert!(
+    core::mem::size_of::<PineTapeRec>() == 64 && core::mem::align_of::<PineTapeRec>() == 64
+);
+const _: () =
+    assert!(core::mem::size_of::<PineSeqRec>() == 128 && core::mem::align_of::<PineSeqRec>() == 64);
+const _: () = assert!(core::mem::size_of::<PineCounters>() == 42 * 8);
 
 /// One entered XSD position as the cli persists it (`xsd-state.tsv`)
 /// and `/state` shows it. POD.

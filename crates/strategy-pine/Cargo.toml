@@ -1,0 +1,29 @@
+[package]
+name         = "strategy-pine"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "PVM slot-8 member: N third-party Pine scripts on one router slot, every order through pine-broker's NativeBroker — PAPER ONLY by ruling (2026-10-16)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+pine-ir       = { workspace = true }
+pine-lang     = { workspace = true }   # CAR-08-1: parse + version_of + Ast (00-INDEX §3.8.1)
+pine-sema     = { workspace = true }
+pine-vm       = { workspace = true }
+pine-std      = { workspace = true }
+pine-broker   = { workspace = true }
+strategy-core = { workspace = true }
+core-types    = { workspace = true }
+core-config   = { workspace = true }
+core-time     = { workspace = true }
+core-crypto   = { workspace = true }   # A2 (§2 prose): SHA-256 of the .pine source
+core-fill     = { workspace = true }   # CAR-08-2: ORDER_KIND_*, is_fill_evidence, expiry_at, ACTIVATION_NS_DEFAULT
+
+[dev-dependencies]
+core-alloc    = { workspace = true }   # CountingAllocator in the crate's own zero-alloc tests

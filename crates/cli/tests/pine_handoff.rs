@@ -2,8 +2,8 @@
 // Copyright 2026 Anton (darkcite)
 
 //! impl-07 §7.11 — `multivenue-engine pine handoff | report`: the pre-registered selection (I24),
-//! the ≤ 2 h windows over the v3 tape (I23), the manifest round trip (I25 — through a minimal
-//! local parser until impl-08's `core_config::pine::parse_manifest` lands,
+//! the ≤ 2 h windows over the v3 tape (I23), the manifest round trip (I25 — through impl-08's
+//! `core_config::pine::parse_manifest`, which retired the local minimal parser of
 //! pin:07-manifest-parser-impl08), the cost, and the report's deliverables with tier 2 pending,
 //! joined, and refused (I26).
 
@@ -273,37 +273,6 @@ fn pine_handoff_prints_the_cost() {
     );
 }
 
-/// A minimal TOML reader for the manifest's own subset: `[[script]]`, `[script.inputs]`,
-/// `[script.symbols]`, `key = <int | "basic string">` (pin:07-manifest-parser-impl08).
-fn parse_manifest_min(t: &str) -> Vec<(String, String, String)> {
-    let mut table = String::new();
-    let mut out = Vec::new();
-    for raw in t.lines() {
-        let l = raw.trim();
-        if l.is_empty() || l.starts_with('#') {
-            continue;
-        }
-        if l.starts_with('[') {
-            assert!(
-                ["[[script]]", "[script.inputs]", "[script.symbols]"].contains(&l),
-                "table {l}"
-            );
-            table = l.to_owned();
-            continue;
-        }
-        let (k, v) = l.split_once('=').expect("key = value");
-        let (k, v) = (k.trim(), v.trim());
-        let ok_int = v.parse::<i64>().is_ok();
-        let ok_str = v.len() >= 2 && v.starts_with('"') && v.ends_with('"');
-        assert!(
-            ok_int || ok_str,
-            "{k} = {v}: integer TOML or a basic string"
-        );
-        out.push((table.clone(), k.to_owned(), v.trim_matches('"').to_owned()));
-    }
-    out
-}
-
 #[test]
 fn pine_handoff_manifest_round_trips() {
     let fx = screened("manifest");
@@ -312,62 +281,39 @@ fn pine_handoff_manifest_round_trips() {
     assert!(o.status.success(), "{}", err(&o));
     let d = &handoff_dirs(&fx.run)[0];
     let h = read_handoff(d).unwrap();
-    let kv = parse_manifest_min(&std::fs::read_to_string(d.join("manifest.toml")).unwrap());
-    let get = |k: &str| {
-        kv.iter()
-            .find(|x| x.0 == "[[script]]" && x.1 == k)
-            .unwrap_or_else(|| panic!("no {k}"))
-            .2
-            .clone()
-    };
-    for k in [
-        "sha256",
-        "file",
-        "dialect",
-        "enabled",
-        "mode",
-        "symbol",
-        "timeframe_s",
-        "venue",
-        "max_bars_back",
-        "coalesce_ms",
-        "coalesce_bps",
-        "insn_budget",
-        "qty_notional_1e6",
-        "limit_primitive",
-        "cross_ticks",
-        "cap_instance_1e6",
-        "cap_day_1e6",
-        "max_open",
-        "collection_cap",
-        "str_persist_bytes",
-        "str_cell_bytes",
-        "str_scratch_bytes",
-        "intent_cap",
-    ] {
-        let _ = get(k);
-    }
-    let script = std::fs::read(d.join(get("file"))).unwrap();
-    assert_eq!(get("sha256"), hex(&core_crypto::sha256(&script)));
+    // impl-08 T1: the round trip goes through the engine's own parser,
+    // `core_config::pine::parse_manifest` (was a local minimal reader,
+    // pin:07-manifest-parser-impl08 — retired).
+    let text = std::fs::read_to_string(d.join("manifest.toml")).unwrap();
+    let m = core_config::pine::parse_manifest(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+    assert_eq!(m.scripts.len(), 1);
+    let s = &m.scripts[0];
+    let script = std::fs::read(d.join(&s.file)).unwrap();
+    assert_eq!(hex(&s.sha256), hex(&core_crypto::sha256(&script)));
     assert_eq!(script, SMA_CROSS.as_bytes());
-    assert_eq!(get("dialect"), "6");
-    assert_eq!(get("enabled"), "1");
-    assert_eq!(get("mode"), "bar_close");
-    assert_eq!(get("symbol"), KEY);
-    assert_eq!(get("timeframe_s"), "3600");
-    assert_eq!(get("venue"), "binance"); // pin:07-manifest-venue
-    assert_eq!(get("qty_notional_1e6"), NOTIONAL.to_string());
-    assert_eq!(get("limit_primitive"), "ioc");
-    assert_eq!(get("cross_ticks"), "2");
-    assert_eq!(get("max_open"), "8");
-    let cap_i: i64 = get("cap_instance_1e6").parse().unwrap();
-    let cap_d: i64 = get("cap_day_1e6").parse().unwrap();
-    assert!(cap_i >= NOTIONAL && cap_d >= 4 * NOTIONAL);
+    assert_eq!(s.dialect, 6);
+    assert!(s.enabled);
+    assert_eq!(s.mode, core_config::pine::PineMode::BarClose);
+    assert_eq!(s.symbol, KEY);
+    assert_eq!(s.timeframe_s, 3600);
+    // pin:07-manifest-venue CONFIRMED by impl-08 §3.3/§4.1.2: `venue` is an `exec.toml` venue
+    // name (`binance`), not the canonical key's `<venue>_<class>` prefix (`binance_usdm`).
+    assert_eq!(s.venue, "binance");
+    assert!(core_config::exec::venue_id_from_name(&s.venue).is_some());
+    assert_eq!(s.qty_notional_1e6, NOTIONAL);
+    assert_eq!(
+        s.limit_primitive,
+        core_config::pine::PineLimitPrimitive::Ioc
+    );
+    assert_eq!(s.cross_ticks, 2);
+    assert_eq!(s.max_open, 8);
+    assert!(s.cap_instance_1e6 >= NOTIONAL && s.cap_day_1e6 >= 4 * NOTIONAL);
     // The manifest names the hand-off's chart and program.
     assert_eq!(h.manifest, "manifest.toml");
     assert_eq!(h.symbol_key, KEY);
-    // No overrides in a screen: the two sub-tables are present and empty.
-    assert!(kv.iter().all(|x| x.0 == "[[script]]"));
+    // No overrides in a screen: the two sub-tables are present and empty; no provenance.
+    assert!(s.inputs.is_empty() && s.symbols.is_empty() && s.provenance.is_none());
+    assert!(text.contains("[script.inputs]") && text.contains("[script.symbols]"));
 }
 
 #[test]

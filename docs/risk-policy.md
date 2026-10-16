@@ -16366,7 +16366,7 @@ doc `claude/s16-plan-2026-10-15.md` (inventory:
 | S16-R2 | **`LEDGER_RESTING` 512 → 1 024**: 64 open orders per slot × 16. The sweep-deferral argument is re-derived below. |
 | S16-R3 | **One declarative member table** in strategy-set, and one `+`-joined `STRATEGY` parser over it in place of the whole-string allow-lists. Overlapping or repeated segments (`ai+vm`, `vrp+vrp`) are ACCEPTED as the union. launchd may boot ANY combination of named members; `all` is refused at the wrapper. |
 | S16-R4 | One commit per cut on `main`, prefix `S16:`; release build and restart at a quiet point; push at the end. |
-| S16-R5 | **Slots 8–15 are RESERVED**: no member, `BUILT_MASK` stays 0x00FF. Adding a member there needs its own ruling. |
+| S16-R5 | **Slots 8–15 are RESERVED**: no member, `BUILT_MASK` stays 0x00FF. Adding a member there needs its own ruling. *Amended 2026-10-16 (PVM, operator ruling): slot 8 holds the Pine member, PAPER ONLY; `BUILT_MASK` is 0x01FF and `all` is `ALL_MASK` 0x00FF; 9–15 stay reserved — see "PVM — slot 8, paper only".* |
 | S16-R6 | The `/state` snapshot schema 2 → 3 (S16-5): per-slot arrays grow to 16, index paths unchanged, the dashboard reads both. |
 
 ### The hazard: a shift that lands on BIN15
@@ -16411,6 +16411,9 @@ doc `claude/s16-plan-2026-10-15.md` (inventory:
   exists.** Today none can (no member sits there); the first member at 8–15
   closes the door, which is one reason it needs its own ruling.
 - A binary rollback also needs the wrapper rolled back (S16-1, below).
+- *Amended 2026-10-16 (PVM):* slot 8 is built (the Pine member) and PAPER ONLY, so the
+  S16-R5 refusal now names 9–15 and slot 8 is refused by its own paper-only checks; no live
+  order from slot 8 can exist, so the door stays shut ("PVM — slot 8, paper only").
 
 ### Formats: no version bump
 
@@ -16674,6 +16677,9 @@ check. Then `git push origin main` (S16-R4).
 
 - **A member at slots 8–15** (S16-R5): its own ruling. Its first live order
   closes the rollback door above.
+- *Amended 2026-10-16 (PVM):* slot 8 now holds the Pine member by its own ruling — paper
+  only, so it places no live order and the door stays shut; slots 9–15 remain open
+  questions ("PVM — slot 8, paper only").
 
 ## HK, part 4 — Hyperliquid's parse errors and the u32 `venue_seq` (2026-10-16)
 
@@ -16890,3 +16896,60 @@ first two minutes: `binance_options_seq_regressions_total` 0,
 141 → 58–68 ms as the clock learned (bookTicker's `binance` delay 8–36
 ms); `binance_seq_regressions_total` and `…_stale_ticks_total` 0; okx and
 HL 0. Then `git push origin main`.
+
+## PVM — slot 8, paper only (operator ruling 2026-10-16)
+
+**Ruling (operator, 2026-10-16):** the Pine member (`crates/strategy-pine`, PVM impl-08 —
+third-party Pine scripts, every order through `pine-broker`'s `NativeBroker`) takes **slot 8,
+PAPER ONLY**: it is refused in every live arm. The running engine's `~/multivenue` configs,
+wrapper and `strategy.conf` are untouched. The live venues for a later ruling are Binance and
+Hyperliquid (O-PVM-2). Lead ruling: `all` keeps meaning the eight production members.
+
+| fact | value |
+|---|---|
+| member table | nine rows; slot 8 = `pine` (`strategy_set::SLOT_PINE`, `BIT_PINE` 0x0100), no `regime.toml` label |
+| `strategy_set::BUILT_MASK` | **0x01FF** (the OR of the rows; `StrategySet::new` clamps to it) |
+| `strategy_set::ALL_MASK` | **0x00FF = `--strategy all`**, unchanged; pine is selectable by name only (`…+pine`) |
+| slots 9–15 | still RESERVED: S16-R5's refusal (`(artifact \| flag) & !BUILT_MASK`) names them |
+| unattributed fills | `UNATTRIBUTED_FILL_MASK = BUILT_MASK & !BIT_PINE`: slot 8 receives only fills attributed to it |
+| surfaces | `/state` slot 8 reads `"pine"` (schema 3, additive — the HC11 precedent); audit-pnl labels it `pine`; the tui shows it as a member row |
+
+**The refusals — each fail-closed, each on its own:**
+
+1. **Parse.** `core_config::exec` refuses `[exec.slot.8] mode = "live"` before any other live
+   rule, whatever its name, venues or `[exec.slot.8.pine]` say. The `[exec.slot.8.pine]` section
+   (impl-08 §4.8: `min_coalesce_ms`, `event_insn_budget`, `boot_exit_policy`, …) is recognised
+   only at slot 8, after `[exec]`, once; its refusals start with their code (`6004` unknown key,
+   `6006` out of range, `6005` missing on Live). Without it the artifact parses exactly as
+   before.
+2. **Boot (`cli::exec_boot::resolve`).** `(artifact live mask | --arm-live) & PAPER_ONLY_MASK`
+   (= `BIT_PINE`) refuses FIRST — before the S16-R5 check and before the interlock compare — so
+   `--arm-live 8` is refused beside any artifact. The per-slot table build refuses a Live mode
+   at `PINE_SLOT` on its own as well.
+3. **AI plane.** `EnableStrategy(8)` is refused and counted (`enable_refused`): the AI never
+   arms third-party code. `DisableStrategy(8)` and `HaltRequest` are honoured.
+4. **A boot that names pine (F19).** Until impl-08 T19 lands `--pine <manifest>`, this binary
+   cannot configure slot 8, and the set arm boots `requested & configured` — `ai+pine` would
+   have booted as `ai`, silently. The `run` command (`Cmd::Run`, before `run` is entered: before
+   the config load, the ingress threads, the exec artifact and every live or gateway arm)
+   refuses any `--strategy` naming pine, exit 1: "pine: requested by --strategy but this binary
+   cannot configure it (impl-08 T19 --pine) — boot aborted" (`cli::pine_boot::check_requested`).
+   `strategy-mask` still resolves the name (`pine` → `256\tpine`), so a `STRATEGY` naming it
+   passes the wrapper and refuses at the boot. The unconfigured member's own `on_start` refuses
+   too (F19).
+
+**No rollback door is needed.** No live order from slot 8 can exist (refusals 1–3), so an
+older binary never meets a slot-8 cloid or cid; S16-R5's door stays shut. Slot 8's live-arming
+ruling must reopen this.
+
+**Bench.** `bench/benches/hot_path.rs` builds `StrategySet::new(BUILT_MASK)`, so
+`strategy_set/on_tick_all` now includes the inert pine member (one branch and one counter); a
+`bench-check` drift there is this, and the re-baseline is the operator's.
+
+**Tests:** `core-config` `tests/pine_manifest.rs` (`slot8_live_section_is_refused_paper_only`,
+`slot8_section_defaults_and_ranges`, `slot8_live_requires_three_keys`,
+`exec_toml_without_slot8_section_is_unchanged`); `cli` `exec_boot`
+`pine_slot_8_is_refused_in_every_live_arm`; `cli` `pine_boot`
+`a_requested_pine_refuses_and_nothing_else_does` and `tests/pine_boot_refusal.rs` (the real
+binary); `strategy-set` `pine_is_slot_8_by_name_only_and_all_excludes_it`,
+`pine_enable_8_refused_disable_8_honoured`, `pine_receives_only_fills_attributed_to_slot_8`.

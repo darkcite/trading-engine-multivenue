@@ -30,3 +30,5 @@ strategy-xsd         = { workspace = true }
 strategy-xmm         = { workspace = true }
 # HC11: the slot-7 member (Hypercall S1 — DARK, paper only).
 strategy-hcv         = { workspace = true }
+# PVM impl-08 T4: the slot-8 member (Pine scripts — PAPER ONLY, ruling 2026-10-16).
+strategy-pine        = { workspace = true }

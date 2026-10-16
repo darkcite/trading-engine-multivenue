@@ -41,6 +41,9 @@ pub mod icdp;
 /// XSD-F: the descriptor law — an instrument's fee class from its §9.4
 /// descriptor (mirrored in `claude_worker.instrument_class`).
 pub mod instrument_class;
+/// PVM impl-08 T1/T2: the Pine member's manifest (`~/multivenue/pine/<name>.toml`)
+/// and the `[exec.slot.8.pine]` section.
+pub mod pine;
 /// RG2: the regime detector's parameter artifact (`regime.toml`) + seed file.
 pub mod regime;
 pub mod universe;

@@ -1677,6 +1677,9 @@ fn main() -> ExitCode {
         Cmd::StrategyMask(args) => strategy_mask(&args),
         Cmd::Run(args) => {
             init_tracing();
+            if let Some(code) = pine_refusal(&args.strategy) {
+                return code;
+            }
             run(args)
         }
         Cmd::PrintConfig(args) => {
@@ -1741,6 +1744,24 @@ fn main() -> ExitCode {
             // JSON lines only on stdout.
             init_tracing_stderr();
             hl_outcome_probe(&args)
+        }
+    }
+}
+
+/// PVM impl-08 (F19, risk-policy "PVM — slot 8, paper only"): slot 8
+/// (pine) cannot be configured by this binary until T19's `--pine`, and the
+/// set arm would otherwise DROP it silently (`engine_loop_set_full` boots
+/// `requested & configured`, so `ai+pine` would boot as `ai`). Refused in
+/// the `Cmd::Run` arm, before `run` is entered — before the config load,
+/// the ingress threads, the exec artifact and every live or gateway arm —
+/// so there is nothing started to join. `Some(exit 1)` when refused.
+fn pine_refusal(strategy: &str) -> Option<ExitCode> {
+    let requested = strategy_set::parse_strategy(strategy).ok()?;
+    match cli::pine_boot::check_requested(requested) {
+        Ok(()) => None,
+        Err(reason) => {
+            error!("{reason}");
+            Some(ExitCode::from(1))
         }
     }
 }
@@ -3839,6 +3860,8 @@ fn run(args: RunArgs) -> ExitCode {
     // reader below. `Err` is a legacy standalone arm (`rule-tree`, `ev`)
     // or the refusal at the arm match, which logs the error.
     let set_mask = strategy_set::parse_strategy(&args.strategy);
+    // PVM impl-08: a `--strategy` naming slot 8 (pine) never gets here —
+    // the `Cmd::Run` arm refuses it first ([`pine_refusal`], F19).
     let cfg = match Config::load(args.env_file.as_deref()) {
         Ok(c) => c,
         Err(e) => {

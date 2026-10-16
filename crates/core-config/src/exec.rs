@@ -448,6 +448,10 @@ pub struct ExecFile {
     /// **BX6** — `[exec.binance]`, the Binance arm's account and venue
     /// knobs (plan §3.12). Required when a live slot names binance.
     pub binance: Option<ExecBinance>,
+    /// **PVM impl-08 T2** — `[exec.slot.8.pine]`, the Pine member's slot-level
+    /// knobs (impl-08 §4.8, re-baselined to slot 8). `None` = the section is
+    /// absent: the artifact parses exactly as before the section existed (I42).
+    pub pine8: Option<crate::pine::PineSlotCfg>,
 }
 
 impl ExecFile {
@@ -815,6 +819,22 @@ enum Sec {
     Policy(usize),
     Slot(usize, usize),
     Binance(usize),
+    /// PVM impl-08 T2: `[exec.slot.8.pine]` at this line.
+    Pine8(usize),
+}
+
+/// PVM impl-08 T2: a `core_config::pine` refusal as an `ExecError` whose
+/// message starts with the code, names the section, the line and the key
+/// (impl-08 §3.3: `6005 [exec.slot.8.pine] line 212: missing key …`).
+fn pine_err(e: &crate::pine::PineCfgError) -> ExecError {
+    err(format!(
+        "{} [{}] line {}: {} {}",
+        e.code,
+        crate::pine::PINE_SECTION,
+        e.line,
+        e.why,
+        e.key
+    ))
 }
 
 type Kv = Vec<(String, Value, usize)>;
@@ -946,6 +966,19 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
         line,
     };
     let names = |venue: &str| venue_id_from_name(venue).is_some_and(|id| s.venues.contains(&id));
+
+    // PVM impl-08 T2 (operator ruling 2026-10-16, pin:08-slot8-paper-only):
+    // slot 8 holds the Pine member — third-party scripts — and is PAPER ONLY.
+    // A live slot 8 is refused HERE, at parse, before any other live rule is
+    // judged (I42), whatever its name, venues or `[exec.slot.8.pine]`
+    // section say; `cli::exec_boot` refuses `--arm-live 8` on its own too.
+    if s.is_live() && slot == crate::pine::PINE_SLOT {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `mode = \"live\"` is refused — slot {slot} is the Pine \
+             member, PAPER ONLY by ruling (2026-10-16). Arming it is its own live-arming \
+             ruling; use \"paper\" or \"off\"."
+        )));
+    }
 
     // A live slot with no venue can never dispatch anything — it would
     // refuse every order it emitted with `NoLiveRoute` and look like a
@@ -1215,6 +1248,8 @@ pub fn parse(src: &str) -> Result<ExecFile, ExecError> {
     let mut policy: Option<Kv> = None;
     let mut slots: Vec<ExecSlot> = Vec::new();
     let mut binance: Option<ExecBinance> = None;
+    let mut pine8: Option<crate::pine::PineSlotCfg> = None;
+    let mut pine8_seen = false;
 
     fn close(
         sec: &Sec,
@@ -1222,6 +1257,7 @@ pub fn parse(src: &str) -> Result<ExecFile, ExecError> {
         policy: &mut Option<Kv>,
         slots: &mut Vec<ExecSlot>,
         binance: &mut Option<ExecBinance>,
+        pine8: &mut Option<crate::pine::PineSlotCfg>,
     ) -> Result<(), ExecError> {
         let kv = std::mem::take(cur);
         match sec {
@@ -1229,6 +1265,9 @@ pub fn parse(src: &str) -> Result<ExecFile, ExecError> {
             Sec::Policy(_) => *policy = Some(kv),
             Sec::Slot(n, ln) => slots.push(finish_slot(&kv, *n, *ln)?),
             Sec::Binance(ln) => *binance = Some(finish_binance(&kv, *ln)?),
+            Sec::Pine8(_) => {
+                *pine8 = Some(crate::pine::parse_slot8(&kv).map_err(|e| pine_err(&e))?);
+            }
         }
         Ok(())
     }
@@ -1244,8 +1283,37 @@ pub fn parse(src: &str) -> Result<ExecFile, ExecError> {
                 .strip_suffix(']')
                 .ok_or_else(|| err(format!("line {ln}: unterminated section header")))?
                 .trim();
-            close(&sec, &mut cur, &mut policy, &mut slots, &mut binance)?;
+            close(
+                &sec,
+                &mut cur,
+                &mut policy,
+                &mut slots,
+                &mut binance,
+                &mut pine8,
+            )?;
             sec = match name {
+                // PVM impl-08 T2 (§4.8): recognised ONLY as `[exec.slot.8.pine]`,
+                // anywhere after `[exec]`, at most once. Any other
+                // `[exec.slot.<n>.pine]` falls to the slot arm below and is
+                // refused there (not an integer slot).
+                crate::pine::PINE_SECTION if pine8_seen => {
+                    return Err(err(format!(
+                        "{} [{}] line {ln}: duplicate section",
+                        crate::pine::CODE_OUT_OF_RANGE,
+                        crate::pine::PINE_SECTION
+                    )))
+                }
+                crate::pine::PINE_SECTION if policy.is_none() => {
+                    return Err(err(format!(
+                        "{} [{}] line {ln}: the section must come after [exec]",
+                        crate::pine::CODE_UNKNOWN_KEY,
+                        crate::pine::PINE_SECTION
+                    )))
+                }
+                crate::pine::PINE_SECTION => {
+                    pine8_seen = true;
+                    Sec::Pine8(ln)
+                }
                 "exec" if policy.is_none() => Sec::Policy(ln),
                 "exec" => return Err(err(format!("line {ln}: duplicate section [exec]"))),
                 "exec.binance" if binance.is_none() => Sec::Binance(ln),
@@ -1288,21 +1356,52 @@ pub fn parse(src: &str) -> Result<ExecFile, ExecError> {
             Sec::Policy(_) => &EXEC_KEYS,
             Sec::Slot(_, _) => &SLOT_KEYS,
             Sec::Binance(_) => &BINANCE_KEYS,
+            Sec::Pine8(_) => &crate::pine::SLOT_KEYS,
         };
+        let pine = matches!(sec, Sec::Pine8(_));
         // Law 1: an optional key must still be a KNOWN key.
         if !known.contains(&key) {
+            if pine {
+                return Err(err(format!(
+                    "{} [{}] line {ln}: unknown key {key}",
+                    crate::pine::CODE_UNKNOWN_KEY,
+                    crate::pine::PINE_SECTION
+                )));
+            }
             return Err(err(format!("line {ln}: unknown key `{key}`")));
         }
         if cur.iter().any(|(k, _, _)| k == key) {
+            if pine {
+                return Err(err(format!(
+                    "{} [{}] line {ln}: duplicate key {key}",
+                    crate::pine::CODE_OUT_OF_RANGE,
+                    crate::pine::PINE_SECTION
+                )));
+            }
             return Err(err(format!("line {ln}: duplicate key `{key}`")));
         }
-        cur.push((
-            key.to_owned(),
-            parse_value(val, ln).map_err(|e| err(e.0))?,
-            ln,
-        ));
+        let value = match parse_value(val, ln) {
+            Ok(v) => v,
+            Err(e) if pine => {
+                return Err(err(format!(
+                    "{} [{}] line {ln}: malformed value {key} ({})",
+                    crate::pine::CODE_OUT_OF_RANGE,
+                    crate::pine::PINE_SECTION,
+                    e.0
+                )))
+            }
+            Err(e) => return Err(err(e.0)),
+        };
+        cur.push((key.to_owned(), value, ln));
     }
-    close(&sec, &mut cur, &mut policy, &mut slots, &mut binance)?;
+    close(
+        &sec,
+        &mut cur,
+        &mut policy,
+        &mut slots,
+        &mut binance,
+        &mut pine8,
+    )?;
 
     let policy = policy.ok_or_else(|| err("missing `[exec]` section"))?;
     // BX6: a live slot on binance reads the arm's account knobs; without
@@ -1328,6 +1427,7 @@ pub fn parse(src: &str) -> Result<ExecFile, ExecError> {
         enabled: enabled_i == 1,
         slots,
         binance,
+        pine8,
     })
 }
 

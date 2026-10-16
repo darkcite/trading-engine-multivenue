@@ -80,6 +80,9 @@ pub mod paper;
 pub mod persist;
 /// impl-07 T11+: `multivenue-engine pine <SUBVERB>` — the tier-1 Pine screener's operator verbs.
 pub mod pine;
+/// PVM impl-08: the slot-8 (Pine member) boot seam — today the F19 refusal of a requested,
+/// unconfigurable slot 8.
+pub mod pine_boot;
 pub mod pinning;
 pub mod regime_boot;
 pub mod sigint;

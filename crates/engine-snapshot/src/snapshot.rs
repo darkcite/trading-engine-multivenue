@@ -31,7 +31,8 @@ use strategy_core::{
 /// **3 (S16-5, ruling S16-R6):** every per-slot array — `slots`,
 /// `regime.gates`, `exec.halted` — grows from 8 to [`SNAPSHOT_SLOTS`]
 /// (16) entries; an index means the same slot in both versions, slots
-/// 8–15 are `"reserved"` (no member). Masks were already `SlotMask`s
+/// 8–15 are `"reserved"` (no member; slot 8 is `"pine"` since PVM impl-08
+/// T4, additive). Masks were already `SlotMask`s
 /// in schema 2. The dashboard reads either version.
 pub const SNAPSHOT_SCHEMA: u32 = 3;
 /// Orders kept in the `recent` ring.
@@ -81,7 +82,8 @@ pub const RUN_DIR_MAX: usize = 160;
 /// (the name, `"reserved"` → `"hcv"`, is additive).
 /// **Slots 8–15 appeared in schema 3 (S16-5)** as
 /// [`RESERVED_SLOT_NAME`]; a member taking one later is additive in the
-/// same way. This is a copy of the `strategy-set` member table's names
+/// same way — **slot 8 is `"pine"` since PVM impl-08 T4** (2026-10-16; the
+/// Pine member, paper only). This is a copy of the `strategy-set` member table's names
 /// (the snapshot crate does not link the members): the cli's
 /// `exec_boot` snapshot-parity test is the guard against drift.
 pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
@@ -93,7 +95,7 @@ pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
     "vm",
     "xmm",
     "hcv",
-    RESERVED_SLOT_NAME,
+    "pine",
     RESERVED_SLOT_NAME,
     RESERVED_SLOT_NAME,
     RESERVED_SLOT_NAME,

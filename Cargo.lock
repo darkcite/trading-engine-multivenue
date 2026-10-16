@@ -2193,6 +2193,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "strategy-pine"
+version = "0.1.0"
+dependencies = [
+ "core-alloc",
+ "core-config",
+ "core-crypto",
+ "core-fill",
+ "core-time",
+ "core-types",
+ "pine-broker",
+ "pine-ir",
+ "pine-lang",
+ "pine-sema",
+ "pine-std",
+ "pine-vm",
+ "strategy-core",
+]
+
+[[package]]
 name = "strategy-rule-tree"
 version = "0.1.0"
 dependencies = [
@@ -2218,6 +2237,7 @@ dependencies = [
  "strategy-core",
  "strategy-hcv",
  "strategy-hyparb",
+ "strategy-pine",
  "strategy-vm",
  "strategy-vrp",
  "strategy-xmm",
