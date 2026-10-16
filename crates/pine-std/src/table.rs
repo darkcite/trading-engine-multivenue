@@ -8,9 +8,9 @@
 //! re-points a body, and a body whose facts disagree with the spec's row does not build (I2).
 
 use core::mem::size_of;
-use pine_ir::{FaultKind, OverloadId, SiteId};
-use pine_spec::{ov, Abi, NaPolicy, StateShape, OVERLOADS, OVERLOAD_COUNT};
-use pine_vm::{bf, BuiltinEntry, BuiltinFn, BuiltinTable, Frame};
+use pine_ir::{Dialect, FaultKind, OverloadId, SiteId};
+use pine_spec::{ov, pf, Abi, NaPolicy, StateShape, OVERLOADS, OVERLOAD_COUNT, PARAMS};
+use pine_vm::{ar, bf, BuiltinEntry, BuiltinFn, BuiltinTable, Frame};
 
 use crate::state::{
     AlmaHdr, AtrHdr, Cum, DmiHdr, Ewma, HmaHdr, KcHdr, MacdHdr, MfiHdr, Mono2Hdr, MonoCell,
@@ -211,6 +211,82 @@ const WORDS: usize = OVERLOAD_COUNT.div_ceil(64);
 struct Built {
     t: [BuiltinEntry; OVERLOAD_COUNT],
     body: [u64; WORDS],
+    arity: [[u8; 2]; OVERLOAD_COUNT],
+}
+
+/// `a == b`, bytewise, in a `const` context.
+const fn same(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut k = 0;
+    while k < a.len() {
+        if a[k] != b[k] {
+            return false;
+        }
+        k += 1;
+    }
+    true
+}
+
+/// The rule-22 arity row of overload `i` (amendment A8), `[ar::col(d)]` per dialect: the count
+/// of `d`'s parameter rows — synthetic leading rows included, as pine-sema's `window` emits one
+/// entry per row — with `ar::VARIADIC` and the variadic row counted 0 when `d` has one
+/// (pin:04-arity-variadic-min0: sema's binder lets a variadic row bind no argument), and
+/// `ar::ABSENT` where the overload is not in `d`. An `abi: lowered` row's window is impl-04
+/// §3.4's: `request.security` = its synthetic rows, then `gaps`, `lookahead` (5 inputs); any
+/// other lowered row has no window spec and is `ABSENT` (pin:04-arity-lowered; `build` asserts
+/// it has no body). A row that breaks the shape the window relies on is a const-evaluation
+/// panic: the crate does not build (I2).
+const fn arity_of(i: usize) -> [u8; 2] {
+    let s = &OVERLOADS[i];
+    let ds = [Dialect::V5, Dialect::V6];
+    let mut out = [ar::ABSENT; 2];
+    let lowered = matches!(s.abi, Abi::Lowered);
+    if lowered && i != ov::REQUEST_SECURITY.0 as usize {
+        return out;
+    }
+    let mut d = 0;
+    while d < 2 {
+        let dl = ds[d];
+        let mut k = s.p_lo as usize;
+        let (mut n, mut var, mut user) = (0u32, false, false);
+        while k < s.p_hi as usize {
+            let p = &PARAMS[k];
+            let nm = p.name.as_bytes();
+            let in_win = !lowered
+                || p.flags & pf::SYNTHETIC != 0
+                || same(nm, b"gaps")
+                || same(nm, b"lookahead");
+            if p.versions.has(dl) && in_win {
+                assert!(!var, "a variadic row is not the dialect's last parameter");
+                if p.flags & pf::SYNTHETIC != 0 {
+                    assert!(!user, "a synthetic row follows a user parameter");
+                    assert!(p.flags & pf::VARIADIC == 0, "a synthetic row is variadic");
+                } else {
+                    user = true;
+                }
+                if p.flags & pf::VARIADIC != 0 {
+                    var = true;
+                } else {
+                    n += 1;
+                }
+            }
+            k += 1;
+        }
+        if s.versions.has(dl) {
+            assert!(n < ar::ABSENT as u32, "an input count does not fit 7 bits");
+            assert!(
+                !lowered || (n == 5 && !var),
+                "request.security's window differs from impl-04 §3.4"
+            );
+            out[ar::col(dl)] = n as u8 | if var { ar::VARIADIC } else { 0 };
+        } else {
+            assert!(n == 0 && !var, "a parameter row in a dialect its overload is not in");
+        }
+        d += 1;
+    }
+    out
 }
 
 const fn put(b: &mut Built, id: OverloadId, e: BuiltinEntry) {
@@ -224,10 +300,16 @@ const fn build() -> Built {
     let mut b = Built {
         t: [stub(0); OVERLOAD_COUNT],
         body: [0; WORDS],
+        arity: [[0; 2]; OVERLOAD_COUNT],
     };
     let mut i = 1;
     while i < OVERLOAD_COUNT {
         b.t[i] = stub(i);
+        i += 1;
+    }
+    let mut i = 0;
+    while i < OVERLOAD_COUNT {
+        b.arity[i] = arity_of(i);
         i += 1;
     }
     let mut k = 0;
@@ -2753,17 +2835,26 @@ const fn build() -> Built {
         ov::HLCC4_VAR,
         row(ov::HLCC4_VAR, bv::bi_hlcc4, 1, 0, Blk::None),
     );
+    let mut i = 0;
+    while i < OVERLOAD_COUNT {
+        let none = b.arity[i][0] == ar::ABSENT && b.arity[i][1] == ar::ABSENT;
+        let body = b.body[i / 64] & (1 << (i % 64)) != 0;
+        assert!(!(none && body), "a body on a row with no window in either dialect");
+        i += 1;
+    }
     b
 }
 
 const BUILT: Built = build();
 static ENTRIES: [BuiltinEntry; OVERLOAD_COUNT] = BUILT.t;
 static BODY: [u64; WORDS] = BUILT.body;
+static ARITY: [[u8; 2]; OVERLOAD_COUNT] = BUILT.arity;
 
 /// The builtin table `pine_vm::verify` is given (contract §3.8.3).
 pub static BUILTINS: BuiltinTable = BuiltinTable {
     spec_sha256: pine_spec::SPEC_SHA256,
     entries: &ENTRIES,
+    arity: &ARITY,
 };
 
 /// How an overload is served (the G4 ledger, sema's refusal, impl-04 §1.4 item 8).
@@ -2800,4 +2891,26 @@ pub fn served(ov: OverloadId) -> Served {
         k += 1;
     }
     Served::Unreachable
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A8: the arity column is parallel to `entries` and carries pine-spec's dialect-gated rows.
+    #[test]
+    fn arity_column_follows_pine_spec_per_dialect() {
+        assert_eq!(BUILTINS.arity.len(), BUILTINS.entries.len());
+        let a = |o: OverloadId| BUILTINS.arity[o.0 as usize];
+        // `__plot` + 16 Pine parameters in each dialect (`transp` v5, `linestyle` v6).
+        assert_eq!(a(ov::PLOT), [17, 17]);
+        // `when` is v5 only.
+        assert_eq!(a(ov::STRATEGY_ENTRY), [11, 10]);
+        // impl-04 §3.4: `__key`, `__out`, `__ty`, `gaps`, `lookahead`.
+        assert_eq!(a(ov::REQUEST_SECURITY), [5, 5]);
+        assert_eq!(a(ov::REQUEST_SECURITY_LOWER_TF), [ar::ABSENT; 2]);
+        assert_eq!(a(ov::TA_HIGHEST), [1, ar::ABSENT]);
+        // `str.format`: its trailing arguments are variadic.
+        assert_eq!(a(ov::STR_FORMAT_F)[1] & ar::VARIADIC, ar::VARIADIC);
+    }
 }

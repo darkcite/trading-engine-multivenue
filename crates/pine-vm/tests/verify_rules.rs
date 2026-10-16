@@ -345,13 +345,70 @@ fn rule_22_arg_win_output_aliasing_an_input_is_refused() {
     assert!(verify(&concat_over(&[k, k, o]), &TABLE).is_ok(), "a repeated input is no alias");
 }
 
-/// Tripwire for CAR-vm-arity: a short window whose last input is NOT also read by the window
-/// still verifies — `BuiltinEntry` has no input count to compare `n` with. When the CAR lands
-/// this becomes a refusal and this test flips.
+/// Sub-code 6 (amendment A8, was the CAR-vm-arity tripwire): a short window whose last input is
+/// NOT also read by the window — `CONCAT` has 2 inputs, so `[s, k]` is one input and an output.
 #[test]
-fn rule_22_gap_short_window_without_alias_needs_car_vm_arity() {
+fn rule_22_arg_win_short_window_without_alias_is_refused() {
     let (s, k) = (argwin::i64(10), argwin::i64(11));
-    assert!(verify(&concat_over(&[s, k]), &TABLE).is_ok());
+    assert_eq!(verify(&concat_over(&[s, k]), &TABLE).err(), arg_win_at_call(6));
+}
+
+/// Sub-code 6: the input count must equal the row's arity — one too many or too few is refused.
+#[test]
+fn rule_22_arg_win_input_count_must_equal_the_arity() {
+    let (s, k, o) = (argwin::i64(10), argwin::i64(11), argwin::i64(12));
+    assert!(verify(&concat_over(&[s, k, o]), &TABLE).is_ok(), "control: 2 inputs + 1 output");
+    assert_eq!(verify(&concat_over(&[s, k, s, o]), &TABLE).err(), arg_win_at_call(6));
+    assert_eq!(verify(&concat_over(&[s, o]), &TABLE).err(), arg_win_at_call(6));
+    assert_eq!(verify(&concat_over(&[o]), &TABLE).err(), arg_win_at_call(6));
+}
+
+/// `stub::ENTRIES` with `CONCAT` variadic (minimum 1) in v5 and absent from v6.
+static ARITY_V: [[u8; 2]; 9] = [
+    [1, 1],
+    [ar::VARIADIC | 1, ar::ABSENT],
+    [1, 1],
+    [2, 2],
+    [1, 1],
+    [2, 2],
+    [2, 2],
+    [0, 0],
+    [1, 1],
+];
+static TABLE_V: BuiltinTable =
+    BuiltinTable { spec_sha256: [7; 32], entries: &ENTRIES, arity: &ARITY_V };
+/// `stub::ENTRIES` with an `arity` column shorter than `entries`.
+static TABLE_SHORT: BuiltinTable =
+    BuiltinTable { spec_sha256: [7; 32], entries: &ENTRIES, arity: &[] };
+
+fn concat_over_in(d: Dialect, entries: &[u16]) -> PineProgram {
+    let mut p = concat_over(entries);
+    p.dialect = d;
+    p.meta.dialect = d;
+    p
+}
+
+/// Sub-code 6: a variadic row accepts its minimum and more, and refuses fewer.
+#[test]
+fn rule_22_arg_win_variadic_row_is_a_minimum() {
+    let (s, k, o) = (argwin::i64(10), argwin::i64(11), argwin::i64(12));
+    let ok = |w: &[u16]| verify(&concat_over_in(Dialect::V5, w), &TABLE_V).is_ok();
+    assert!(ok(&[s, o]), "the minimum");
+    assert!(ok(&[s, k, o]) && ok(&[s, k, s, k, o]), "more than the minimum");
+    let p = concat_over_in(Dialect::V5, &[o]);
+    assert_eq!(verify(&p, &TABLE_V).err(), arg_win_at_call(6));
+}
+
+/// Sub-code 6: an overload absent from the program's dialect cannot be emitted legally, and a
+/// table whose `arity` column does not cover the row is refused the same way.
+#[test]
+fn rule_22_arg_win_overload_absent_in_the_dialect_is_refused() {
+    let (s, k, o) = (argwin::i64(10), argwin::i64(11), argwin::i64(12));
+    let p = concat_over_in(Dialect::V6, &[s, k, o]);
+    assert_eq!(verify(&p, &TABLE_V).err(), arg_win_at_call(6));
+    assert_eq!(verify(&concat_over(&[s, k, o]), &TABLE_SHORT).err(), arg_win_at_call(6));
+    assert_eq!(ar::col(Dialect::V5), 0);
+    assert_eq!(ar::col(Dialect::V6), 1);
 }
 
 #[test]

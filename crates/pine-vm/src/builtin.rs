@@ -46,12 +46,37 @@ pub struct BuiltinEntry {
 const _: () = assert!(core::mem::size_of::<BuiltinEntry>() == 16);
 const _: () = assert!(core::mem::align_of::<BuiltinEntry>() == 8);
 
+/// `BuiltinTable::arity` cells (amendment A8): one `u8` per overload per dialect.
+pub mod ar {
+    use pine_ir::Dialect;
+
+    /// The low 7 bits: the window's input count, synthetic leading parameters included.
+    pub const COUNT: u8 = 0x7F;
+    /// Variadic: `COUNT` is then the minimum input count.
+    pub const VARIADIC: u8 = 1 << 7;
+    /// `COUNT == ABSENT`: the overload does not exist in this dialect.
+    pub const ABSENT: u8 = 0x7F;
+
+    /// The column of `d` in an arity row: v5 → 0, v6 → 1.
+    #[inline]
+    #[must_use]
+    pub const fn col(d: Dialect) -> usize {
+        match d {
+            Dialect::V5 => 0,
+            Dialect::V6 => 1,
+        }
+    }
+}
+
 /// `pine_std::BUILTINS`, indexed by `OverloadId`.
 pub struct BuiltinTable {
     /// `== pine_spec::SPEC_SHA256`.
     pub spec_sha256: [u8; 32],
     /// One entry per overload.
     pub entries: &'static [BuiltinEntry],
+    /// Cold, parallel to `entries` (same length), `[OverloadId][ar::col(dialect)]`: read by
+    /// `verify` (rule 22) only (amendment A8).
+    pub arity: &'static [[u8; 2]],
 }
 
 /// All-zero is the block's cold state; `#[repr(C)]`, no references, no `NonZero*`,

@@ -132,9 +132,12 @@ static ENTRIES: [BuiltinEntry; 7] = [
         state_bytes_min: 0,
     },
 ];
+/// Input counts by body: plot 2, concat 2, sacc 1, upcat 3, probe 3, eq 2, fail 0.
+static ARITY: [[u8; 2]; 7] = [[2, 2], [2, 2], [1, 1], [3, 3], [3, 3], [2, 2], [0, 0]];
 static TABLE: BuiltinTable = BuiltinTable {
     spec_sha256: [7; 32],
     entries: &ENTRIES,
+    arity: &ARITY,
 };
 const PLOT: u16 = 0;
 const CONCAT: u16 = 1;

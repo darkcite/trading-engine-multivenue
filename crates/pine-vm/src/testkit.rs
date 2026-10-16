@@ -435,7 +435,11 @@ pub mod stub {
         BuiltinEntry { f: now, cost: 1, n_out: 1, flags: bf::NEEDS_CTX, state_bytes_min: 0 },
         BuiltinEntry { f: slen, cost: 1, n_out: 1, flags: 0, state_bytes_min: 0 },
     ];
-    pub static TABLE: BuiltinTable = BuiltinTable { spec_sha256: [7; 32], entries: &ENTRIES };
+    /// Input counts by body (both dialects; no stub row is variadic).
+    pub static ARITY: [[u8; 2]; 9] =
+        [[1, 1], [2, 2], [1, 1], [2, 2], [1, 1], [2, 2], [2, 2], [0, 0], [1, 1]];
+    pub static TABLE: BuiltinTable =
+        BuiltinTable { spec_sha256: [7; 32], entries: &ENTRIES, arity: &ARITY };
     pub const ACC: u16 = 0;
     pub const CONCAT: u16 = 1;
     pub const ENTRY: u16 = 2;

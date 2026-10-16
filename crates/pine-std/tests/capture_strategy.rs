@@ -9,8 +9,9 @@
 use pine_ir::*;
 use pine_spec::{ov, params, DefaultKind, OVERLOADS};
 use pine_std::testing::{Call, Harness, Script, Src, TestCtx, CHART, CONCAT};
-use pine_std::{served, Served};
+use pine_std::{served, Served, BUILTINS};
 use pine_vm::testkit::bar;
+use pine_vm::{ar, rule};
 
 // ---- helpers ------------------------------------------------------------------------------
 
@@ -41,6 +42,33 @@ fn win(id: OverloadId, d: Dialect, set: &[(&str, Src)]) -> Vec<(Lane, Src)> {
         };
         v.push((lane, src));
     }
+    v
+}
+
+/// The full window of `id` in `d` (rule 22, amendment A8): `win`'s spec defaults, with `set`
+/// overriding a parameter's lane and source by name (a generic `T` series picks its lane here).
+/// Its length is checked against `BUILTINS.arity`, the count the verifier holds it to.
+fn full_win(id: OverloadId, d: Dialect, set: &[(&str, Lane, Src)]) -> Vec<(Lane, Src)> {
+    let mut v = win(id, d, &[]);
+    let names: Vec<&str> = params(&OVERLOADS[id.0 as usize])
+        .iter()
+        .filter(|p| p.versions.has(d))
+        .map(|p| p.name.as_str())
+        .collect();
+    for &(n, l, s) in set {
+        let k = names
+            .iter()
+            .position(|x| *x == n)
+            .unwrap_or_else(|| panic!("{id:?} {d:?} has no parameter {n}"));
+        v[k] = (l, s);
+    }
+    let a = BUILTINS.arity[id.0 as usize][ar::col(d)];
+    assert_eq!(a & ar::VARIADIC, 0, "{id:?} {d:?}");
+    assert_eq!(
+        v.len(),
+        (a & ar::COUNT) as usize,
+        "{id:?} {d:?}: window ≠ arity"
+    );
     v
 }
 
@@ -181,22 +209,37 @@ fn capture_writes_only_its_indices() {
     for d in [Dialect::V5, Dialect::V6] {
         // plot → 0, plotshape(bool) → 1, plotchar(float) → 2, plotcandle → 3..=6, bgcolor → 7,
         // barcolor(na) → 8, plotarrow → 9, hline → 10; fill reserves 11 and writes nothing.
-        let p_plot = [(Lane::I64, i(0)), (Lane::F64, Src::Feed(0))];
-        let p_shape = [(Lane::I64, i(1)), (Lane::I64, Src::Feed(1))];
-        let p_char = [(Lane::I64, i(2)), (Lane::F64, Src::Feed(0))];
-        let p_candle = [
-            (Lane::I64, i(3)),
-            (Lane::F64, f(1.0)),
-            (Lane::F64, f(4.0)),
-            (Lane::F64, Src::Na),
-            (Lane::F64, Src::Feed(0)),
-        ];
+        // Each window is the overload's full arity in `d` (A8); the rest take spec defaults.
+        let (fl, il) = (Lane::F64, Lane::I64);
+        let at = |k: i64| ("__plot", il, i(k));
+        let p_plot = full_win(ov::PLOT, d, &[at(0), ("series", fl, Src::Feed(0))]);
+        let p_shape = full_win(ov::PLOTSHAPE, d, &[at(1), ("series", il, Src::Feed(1))]);
+        let p_char = full_win(ov::PLOTCHAR, d, &[at(2), ("series", fl, Src::Feed(0))]);
+        let p_candle = full_win(
+            ov::PLOTCANDLE,
+            d,
+            &[
+                at(3),
+                ("open", fl, f(1.0)),
+                ("high", fl, f(4.0)),
+                ("low", fl, Src::Na),
+                ("close", fl, Src::Feed(0)),
+            ],
+        );
         let red = color::pack(255, 0, 0, 0);
-        let p_bg = [(Lane::I64, i(7)), (Lane::I64, Src::Const(red as u64))];
-        let p_bar = [(Lane::I64, i(8)), (Lane::I64, Src::Na)];
-        let p_arrow = [(Lane::I64, i(9)), (Lane::F64, f(-2.5))];
-        let p_hline = [(Lane::I64, i(10)), (Lane::F64, f(50.0))];
-        let p_fill = [(Lane::I64, i(11)), (Lane::I64, i(0)), (Lane::I64, i(10))];
+        let p_bg = full_win(
+            ov::BGCOLOR,
+            d,
+            &[at(7), ("color", il, Src::Const(red as u64))],
+        );
+        let p_bar = full_win(ov::BARCOLOR, d, &[at(8), ("color", il, Src::Na)]);
+        let p_arrow = full_win(ov::PLOTARROW, d, &[at(9), ("series", fl, f(-2.5))]);
+        let p_hline = full_win(ov::HLINE, d, &[at(10), ("price", fl, f(50.0))]);
+        let p_fill = full_win(
+            ov::FILL_PPF,
+            d,
+            &[at(11), ("plot1", il, i(0)), ("plot2", il, i(10))],
+        );
         let calls = [
             call(ov::PLOT, &p_plot, &[Lane::I64]),
             call(ov::PLOTSHAPE, &p_shape, &[]),
@@ -559,14 +602,13 @@ fn v5_when_not_true_pushes_nothing() {
             &[("id", Src::Str("A")), ("direction", i(0)), ("when", i(1))],
         );
         assert_eq!((r, v.len()), (StepOutcome::Ok, 1), "{id:?}");
-        // A window of the wrong dialect's length is a sema defect.
-        let ins = w5.clone();
-        let calls = [call(id, &ins, &[])];
-        let mut h = Harness::build(&script(&calls, Dialect::V6, 1));
-        assert_eq!(
-            step(&mut h, &mut TestCtx::default(), 0),
-            StepOutcome::Fault(FaultKind::Internal)
-        );
+        // A window of the wrong dialect's length is a sema defect, refused at load: rule 22
+        // sub-code 6 (A8), the v5 window being one input past the overload's v6 arity.
+        let calls = [call(id, &w5, &[])];
+        let e = Harness::try_build(&script(&calls, Dialect::V6, 1))
+            .err()
+            .unwrap_or_else(|| panic!("{id:?}: a v5 window in a v6 program verified"));
+        assert_eq!((e.rule, e.detail), (rule::ARG_WIN, 6), "{id:?}");
     }
 }
 

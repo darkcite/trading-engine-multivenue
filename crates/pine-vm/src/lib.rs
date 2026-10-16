@@ -21,7 +21,7 @@ mod strings;
 mod switch;
 mod verify;
 
-pub use builtin::{bf, BuiltinEntry, BuiltinFn, BuiltinTable, Pod, StateBlock};
+pub use builtin::{ar, bf, BuiltinEntry, BuiltinFn, BuiltinTable, Pod, StateBlock};
 pub use frame::{Frame, StrPiece};
 pub use instance::VmInstance;
 pub use verify::{rule, verify, Verified, VerifyError};

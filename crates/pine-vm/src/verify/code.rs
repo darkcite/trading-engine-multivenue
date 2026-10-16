@@ -7,7 +7,7 @@
 use pine_ir::{abi, argwin, flg, op, ring_flag, Insn, Lane, PineProgram, SiteId, StateKind};
 
 use super::{e, rule, VerifyError, NO_PC};
-use crate::builtin::{bf, BuiltinTable};
+use crate::builtin::{ar, bf, BuiltinTable};
 use crate::journal::in_string_ring;
 
 /// Operand roles.
@@ -204,7 +204,8 @@ pub(crate) fn check(p: &PineProgram, t: &'static BuiltinTable) -> Result<(), Ver
             let ent = t.entries[ins.a as usize];
             // 22 ArgWin — `detail` is the sub-code: 0 window offset past `argwin`, 1 window end
             // past `argwin`, 2 `n < n_out`, 3 an entry's slot outside its lane, 4 an output on a
-            // reserved slot, 5 an output naming an input entry of the same window.
+            // reserved slot, 5 an output naming an input entry of the same window, 6 an input
+            // count that is not the overload's arity in the program's dialect (A8).
             let w = ins.b as usize;
             if w >= p.argwin.len() {
                 return Err(e(rule::ARG_WIN, at, 0));
@@ -233,8 +234,8 @@ pub(crate) fn check(p: &PineProgram, t: &'static BuiltinTable) -> Result<(), Ver
             // outputs, and is silent on one slot being both: the literal reading refuses it.
             // An output equal to an input entry (same lane bit, same slot) is a short window
             // whose last input was taken for the output (the pine-sema `plot` defect), or a
-            // body writing a slot it still reads. A missing output on an unshared slot needs
-            // the overload's input count (CAR-vm-arity).
+            // body writing a slot it still reads. A missing output on an unshared slot is
+            // sub-code 6 below (amendment A8).
             let n_in = n - ent.n_out as usize;
             let mut o = n_in;
             while o < n {
@@ -247,6 +248,24 @@ pub(crate) fn check(p: &PineProgram, t: &'static BuiltinTable) -> Result<(), Ver
                     i += 1;
                 }
                 o += 1;
+            }
+            // Sub-code 6 (amendment A8): `n_in` equals the overload's input count in the
+            // program's dialect (`>=` when variadic); an overload absent from the dialect, or a
+            // table whose `arity` column is short, cannot have been emitted legally.
+            let cell = match t.arity.get(ins.a as usize) {
+                Some(r) => r[ar::col(p.dialect)],
+                None => ar::ABSENT,
+            };
+            let want = (cell & ar::COUNT) as usize;
+            let ok = if want == ar::ABSENT as usize {
+                false
+            } else if cell & ar::VARIADIC != 0 {
+                n_in >= want
+            } else {
+                n_in == want
+            };
+            if !ok {
+                return Err(e(rule::ARG_WIN, at, 6));
             }
             // 23 SiteKind
             let st = ent.flags & bf::STATEFUL != 0;

@@ -220,6 +220,17 @@ fn run_o(
     bars: &[(f64, f64, f64)],
     out_i64: bool,
 ) -> Vec<f64> {
+    run_od(id, ins, len, bars, out_i64, Dialect::V6)
+}
+/// As `run_o`, in a `d` program (a v5-only overload runs in v5: rule 22, amendment A8).
+fn run_od(
+    id: OverloadId,
+    ins: &[In],
+    len: u32,
+    bars: &[(f64, f64, f64)],
+    out_i64: bool,
+    d: Dialect,
+) -> Vec<f64> {
     let inputs: Vec<(Lane, Src)> = ins
         .iter()
         .map(|x| match *x {
@@ -243,7 +254,7 @@ fn run_o(
     let mut h = Harness::build(&Script {
         calls: &calls,
         mode,
-        dialect: Dialect::V6,
+        dialect: d,
         intent_cap: 0,
         chart: CHART,
     });
@@ -413,7 +424,8 @@ fn ta_highest_lowest_equal_bruteforce() {
         let ls = run_g(ov::TA_LOWEST_SRC, &[In::Close, ii], cap, &b);
         let hb = run_g(ov::TA_HIGHESTBARS_SRC, &[In::Close, ii], cap, &b);
         let lb = run_g(ov::TA_LOWESTBARS_SRC, &[In::Close, ii], cap, &b);
-        let hh = run_g(ov::TA_HIGHEST, &[ii], cap, &b);
+        // ta.highest(length) (implicit `high`) is v5-only in pine-spec: it runs in a v5 program.
+        let hh = run_od(ov::TA_HIGHEST, &[ii], cap, &b, false, Dialect::V5);
         for i in 0..c.len() {
             if i + 1 < len as usize {
                 assert!(hs[i].is_nan() && ls[i].is_nan() && hb[i].is_nan() && hh[i].is_nan());

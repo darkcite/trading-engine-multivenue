@@ -13,7 +13,9 @@ use pine_ir::{
     OrderIntent, OverloadId, SharedSeries, SiteId, StateKind, StepOutcome, StrRef, TradeRec,
 };
 use pine_vm::testkit::{Arena, Tb};
-use pine_vm::{bf, verify, BuiltinEntry, BuiltinTable, Frame, StrPiece, VmInstance};
+use pine_vm::{
+    ar, bf, verify, BuiltinEntry, BuiltinTable, Frame, StrPiece, VerifyError, VmInstance,
+};
 use std::sync::OnceLock;
 
 /// The shared-series key the feed builtin reads (`TestCtx::feed`).
@@ -238,9 +240,16 @@ fn table() -> &'static BuiltinTable {
             flags: bf::STR_ALLOC,
             state_bytes_min: 0,
         });
+        // The test rows' arity (amendment A8): feed `[col]`, probe `[base, e…]` (variadic,
+        // at least `base`), concat `[a, b]`; the same in both dialects.
+        let mut a: Vec<[u8; 2]> = BUILTINS.arity.to_vec();
+        a.push([1, 1]);
+        a.push([ar::VARIADIC | 1; 2]);
+        a.push([2, 2]);
         BuiltinTable {
             spec_sha256: pine_spec::SPEC_SHA256,
             entries: Box::leak(v.into_boxed_slice()),
+            arity: Box::leak(a.into_boxed_slice()),
         }
     })
 }
@@ -328,6 +337,17 @@ impl Harness {
     /// As [`Harness::build`], with `user_plots` plot indices `[0, user_plots)` reserved for the
     /// capture rows under test (their `__plot` constants); the probes' plots follow them.
     pub fn build_plots(s: &Script<'_>, user_plots: u32) -> Harness {
+        Harness::try_build_plots(s, user_plots).unwrap_or_else(|e| panic!("verify: {e:?}"))
+    }
+
+    /// As [`Harness::build`], returning the verifier's refusal instead of panicking (a test that
+    /// a wrong window is refused at load, amendment A8).
+    pub fn try_build(s: &Script<'_>) -> Result<Harness, VerifyError> {
+        Harness::try_build_plots(s, 0)
+    }
+
+    /// As [`Harness::build_plots`], returning the verifier's refusal instead of panicking.
+    pub fn try_build_plots(s: &Script<'_>, user_plots: u32) -> Result<Harness, VerifyError> {
         let (mut nf, mut ni) = (1u32, 2u32); // i(0): feed column, i(1): probe base
         for c in s.calls {
             for (l, src) in c.inputs {
@@ -399,12 +419,12 @@ impl Harness {
         let mut prog = t.build();
         prog.meta.chart = s.chart;
         let p: &'static pine_ir::PineProgram = Box::leak(Box::new(prog));
-        let v = verify(p, table()).unwrap_or_else(|e| panic!("verify: {e:?}"));
+        let v = verify(p, table())?;
         let ar: &'static mut Arena = Box::leak(Box::new(Arena::new(p.layout.total_bytes as usize)));
-        Harness {
+        Ok(Harness {
             vm: VmInstance::new(v, ar.slice()),
             base,
-        }
+        })
     }
 
     /// One confirmed bar.
