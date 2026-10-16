@@ -225,6 +225,26 @@ fn program_meta_carries_the_dialect() {
 }
 
 #[test]
+fn program_meta_carries_entry_dirs() {
+    // Amendment A6: the broker matches a boot trade only by a direction-checked constant id.
+    assert_eq!(ProgramMeta::default().entry_dirs.len(), 0);
+    assert_eq!((entry_dir::LONG, entry_dir::SHORT), (1, 2));
+    assert_eq!(
+        (
+            core::mem::size_of::<EntryDir>(),
+            core::mem::align_of::<EntryDir>()
+        ),
+        (16, 8)
+    );
+    let e = EntryDir {
+        id: StrKey(7),
+        dirs: entry_dir::LONG,
+        ..EntryDir::default()
+    };
+    assert_eq!((e.id, e.dirs, e._pad), (StrKey(7), 1, [0; 7]));
+}
+
+#[test]
 fn plot_and_hline_handles_are_frozen() {
     // Amendment A4.2: two i64-lane handle types after `Enum`; 13.. stay unassigned.
     assert_eq!((Ty::Plot as u8, Ty::Hline as u8), (11, 12));

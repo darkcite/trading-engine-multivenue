@@ -7,7 +7,7 @@
 //! `pine_sema::compile`, verified once by `pine_vm::verify`, and then only
 //! ever borrowed — it is never cloned per instance (P1).
 
-use crate::ids::{Dialect, Span, Sym};
+use crate::ids::{Dialect, Span, StrKey, Sym};
 use crate::isa::Insn;
 use crate::layout::{FrameLayout, PlotDesc};
 use crate::symtab::SymTable;
@@ -294,6 +294,35 @@ pub struct SubProgram {
     pub program: Box<PineProgram>,
 }
 
+/// One constant order id the script can open a trade under, with the
+/// directions its `strategy.entry` / `strategy.order` call sites can open it
+/// in (amendment A6). `pine-sema` lists every call site whose `id` folds to a
+/// constant; a direction that does not fold sets both bits. `pine-broker`
+/// lets `strategy.close(id)` / `strategy.exit(from_entry = id)` reach the D19
+/// boot trade only when `dirs` is exactly the boot position's direction
+/// (`pin:05-boot-close-dir`, operator ruling 2026-10-16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct EntryDir {
+    /// `str_key` of the id's bytes (the key a runtime-built id also gets).
+    pub id: StrKey,
+    /// [`entry_dir`] bits.
+    pub dirs: u8,
+    /// Zero.
+    pub _pad: [u8; 7],
+}
+
+const _: () = assert!(core::mem::size_of::<EntryDir>() == 16);
+const _: () = assert!(core::mem::align_of::<EntryDir>() == 8);
+
+/// [`EntryDir::dirs`] bits (amendment A6).
+pub mod entry_dir {
+    /// A call site opens the id long (`strategy.long`).
+    pub const LONG: u8 = 1 << 0;
+    /// A call site opens the id short (`strategy.short`).
+    pub const SHORT: u8 = 1 << 1;
+}
+
 /// Everything the host, the broker and the harnesses need to know about a
 /// program, computed by `pine-sema`.
 #[derive(Debug, Clone)]
@@ -334,6 +363,9 @@ pub struct ProgramMeta {
     pub inputs: Vec<InputDesc>,
     /// Every captured plot index; `plots[i].index == i`.
     pub plots: Vec<PlotDesc>,
+    /// The script's constant entry ids and their directions, sorted by `id`,
+    /// one row per id (amendment A6).
+    pub entry_dirs: Vec<EntryDir>,
 }
 
 impl Default for ProgramMeta {
@@ -356,6 +388,7 @@ impl Default for ProgramMeta {
             decl: StrategyDecl::default(),
             inputs: Vec::new(),
             plots: Vec::new(),
+            entry_dirs: Vec::new(),
         }
     }
 }

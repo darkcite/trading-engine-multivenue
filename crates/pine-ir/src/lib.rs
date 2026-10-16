@@ -97,9 +97,9 @@ pub use layout::{
 };
 pub use outcome::{FaultKind, StepOutcome, VmCounters};
 pub use program::{
-    decl_flag, input_flag, AllowEntry, ChartInfo, CommissionType, CompileLimits, CompileOpts,
-    ExecMode, InputDesc, InputKind, InputOverride, InputValue, PineProgram, ProgramMeta, QtyType,
-    RiskRules, ScriptKind, StrategyDecl, SubProgram,
+    decl_flag, entry_dir, input_flag, AllowEntry, ChartInfo, CommissionType, CompileLimits,
+    CompileOpts, EntryDir, ExecMode, InputDesc, InputKind, InputOverride, InputValue, PineProgram,
+    ProgramMeta, QtyType, RiskRules, ScriptKind, StrategyDecl, SubProgram,
 };
 pub use symtab::SymTable;
 pub use trial::{trial_flag, TrialSummary, RET_SERIES_EXT};
