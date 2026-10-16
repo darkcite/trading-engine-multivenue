@@ -74,16 +74,42 @@ pub fn compile_src(src: &str, opts: &CompileOpts) -> Result<PineProgram, Vec<Dia
     compile_with_libs(src, opts, &mut LibCache::empty())
 }
 
-/// Every diagnostic code of a refusal, in order.
+/// A `3024 … unserved=1`: a row the lane's pine-std snapshot has no body for yet (§4.5 step 9,
+/// `pine_std::served`). It is the snapshot's refusal, not the script's.
+pub fn is_unserved(d: &Diag) -> bool {
+    d.code.0 == 3024 && d.msg.contains(" unserved=1")
+}
+
+/// Every diagnostic code of a refusal, in order, without [`is_unserved`] ones; a refusal made
+/// only of those reads as [`NOT_IMPLEMENTED`] (what an accepted script returns until T19, §6).
 pub fn codes(r: &Result<PineProgram, Vec<Diag>>) -> Vec<u16> {
     match r {
         Ok(_) => Vec::new(),
-        Err(ds) => ds.iter().map(|d| d.code.0).collect(),
+        Err(ds) => {
+            let v: Vec<u16> = ds
+                .iter()
+                .filter(|d| !is_unserved(d))
+                .map(|d| d.code.0)
+                .collect();
+            if v.is_empty() {
+                vec![NOT_IMPLEMENTED]
+            } else {
+                v
+            }
+        }
     }
 }
 
-/// The refusal's diagnostics (panics on `Ok`).
+/// The refusal's diagnostics without [`is_unserved`] ones (panics on `Ok`).
 pub fn diags(r: Result<PineProgram, Vec<Diag>>) -> Vec<Diag> {
+    match r {
+        Ok(_) => panic!("expected a refusal"),
+        Err(ds) => ds.into_iter().filter(|d| !is_unserved(d)).collect(),
+    }
+}
+
+/// The refusal's diagnostics, all of them (panics on `Ok`).
+pub fn all_diags(r: Result<PineProgram, Vec<Diag>>) -> Vec<Diag> {
     match r {
         Ok(_) => panic!("expected a refusal"),
         Err(ds) => ds,

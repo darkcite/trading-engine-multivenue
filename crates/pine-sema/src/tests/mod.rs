@@ -6,6 +6,12 @@
 //!
 //! Private tests (impl-02 §7.12): alternative readings through `compile_with`, internal shapes.
 
+mod decl;
 mod fold;
+mod infer;
+mod inputs;
+mod ir_shapes;
+mod mono;
+mod overload;
 mod readings;
 mod types;

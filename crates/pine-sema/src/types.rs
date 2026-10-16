@@ -152,10 +152,6 @@ pub(crate) const fn is_collection(t: TypeQ) -> bool {
 }
 
 /// The qualifier join: the strongest wins (`Const < Input < Simple < Series`, §4.4.2).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called by pass 3, infer.rs (impl-02 T6)")
-)]
 pub(crate) const fn join(a: Qual, b: Qual) -> Qual {
     if (a as u8) >= (b as u8) {
         a
@@ -166,10 +162,6 @@ pub(crate) const fn join(a: Qual, b: Qual) -> Qual {
 
 /// A parameter qualified `param` admits an argument qualified `arg` iff `arg` is equal or weaker
 /// (§4.4.2: "… not one that is stronger").
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called by pass 3, overload.rs (impl-02 T7)")
-)]
 pub(crate) const fn admits(param: Qual, arg: Qual) -> bool {
     (arg as u8) <= (param as u8)
 }
@@ -189,10 +181,6 @@ pub(crate) enum Conv {
 
 /// The implicit conversion from `from` to `to` in dialect `d` under `rd`, `None` when there is
 /// none (`3007`). `Ty::Void` is the untyped `na`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called by pass 3, infer.rs (impl-02 T6)")
-)]
 pub(crate) fn conv(
     from: TypeQ,
     to: TypeQ,

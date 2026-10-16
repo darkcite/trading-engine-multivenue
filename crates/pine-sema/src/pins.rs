@@ -69,6 +69,77 @@ pub(crate) enum IntCast {
     RoundHalfAway,
 }
 
+/// `pin:02-var-qualifier` — the v5 qualifier of a reassigned variable (§4.4.2). v6 is `series`
+/// (MG-8); v5's documentation says some mutable variables are "erroneously qualified as
+/// 'const'". Probe (v5): `x = 5` · `x := 6` · `f(simple int a) => a` · `plot(f(x))`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VarQualifier {
+    /// Default: `series`, as v6.
+    Series,
+    /// The join of the initialiser and every assigned value (v5's documented misqualification).
+    #[cfg_attr(not(test), allow(dead_code))] // selected only through compile_with (§7.12)
+    Join,
+}
+
+/// `pin:06-na-compare` — what `!=` gives when an operand is `na`. Acts in §4.14.2. Probe:
+/// `x = bar_index > 0 ? 1 : na` · `plot(x != 1 ? 1 : 0)` on bar 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NaCompare {
+    /// Default: both `==` and `!=` are false when either operand is `na` (contract §3.6.1).
+    FalseBoth,
+    /// `!=` is `B_NOT` of `==`: true when either operand is `na`.
+    #[cfg_attr(not(test), allow(dead_code))] // selected only through compile_with (§7.12)
+    NeTrue,
+}
+
+/// `pin:02-na-condition` — where an `na` condition (a v5 `bool`, class A) sends a branch. Acts in
+/// §4.14.3. Probe (v5): `b = bar_index > 0 ? true : na` · `x = if b` · `    1` · `else` · `    2`
+/// · `plot(x)` on bar 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NaCondition {
+    /// Default: `na` reads as `false` — the `else` arm runs (`JNA_I c → else`).
+    AsFalse,
+    /// No arm runs; a value-returning structure yields `na` (`JNA_I c → end`).
+    #[cfg_attr(not(test), allow(dead_code))] // selected only through compile_with (§7.12)
+    NaResult,
+}
+
+/// `pin:02-for-step` — a `for … by s` whose step does not fold. Acts in §4.14.4. The loops page
+/// documents a positive step and is silent on a computed one. Probe:
+/// `s = bar_index % 2 + 1` · `for i = 0 to 4 by s` · `    x += 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForStep {
+    /// Default — conservative: `3008`.
+    RefuseDynamic,
+    /// The step's absolute value is used; a zero step runs no iteration.
+    #[cfg_attr(not(test), allow(dead_code))] // selected only through compile_with (§7.12)
+    RuntimeAbs,
+}
+
+/// `pin:02-once-flag` — is a `once` block's flag rolled back with a tick? Acts in §4.14.4. The
+/// conditional-structures page says "evaluated only once" and is silent on realtime ticks.
+/// Probe: `once` · `    label.new(bar_index, high)` on a realtime bar with several ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnceFlag {
+    /// Default: a `var` flag — a tick that ran the body and is rolled back runs it again.
+    VarLike,
+    /// A `varip` flag — the first tick that runs the body is the only one.
+    #[cfg_attr(not(test), allow(dead_code))] // selected only through compile_with (§7.12)
+    VaripLike,
+}
+
+/// `pin:06-cond-call-state` — does a stateful call in an `if` / `switch` block advance on bars
+/// the block skips? Acts in §4.7.5 (`hoist.rs`). Probe: `if bar_index % 2 == 0` ·
+/// `    x := ta.sma(close, 3)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CondCallState {
+    /// Default: its block advances only when the block runs (design note §6).
+    ExecutedOnly,
+    /// The call is hoisted before the outermost `if` / `switch` region and runs every bar.
+    #[cfg_attr(not(test), allow(dead_code))] // selected only through compile_with (§7.12)
+    EveryBar,
+}
+
 /// Every sema-local pin, one field each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Pins {
@@ -82,6 +153,18 @@ pub(crate) struct Pins {
     pub(crate) color_alpha: ColorAlpha,
     /// `pin:02-int-cast`.
     pub(crate) int_cast: IntCast,
+    /// `pin:02-var-qualifier`.
+    pub(crate) var_qualifier: VarQualifier,
+    /// `pin:06-na-compare`.
+    pub(crate) na_compare: NaCompare,
+    /// `pin:02-na-condition`.
+    pub(crate) na_condition: NaCondition,
+    /// `pin:02-for-step`.
+    pub(crate) for_step: ForStep,
+    /// `pin:02-once-flag`.
+    pub(crate) once_flag: OnceFlag,
+    /// `pin:06-cond-call-state`.
+    pub(crate) cond_call_state: CondCallState,
 }
 
 /// The default reading of every pin.
@@ -91,4 +174,10 @@ pub(crate) const DEFAULT: Pins = Pins {
     for_counter_shadow: ForCounterShadow::Refuse,
     color_alpha: ColorAlpha::RoundHalfUp,
     int_cast: IntCast::Trunc,
+    var_qualifier: VarQualifier::Series,
+    na_compare: NaCompare::FalseBoth,
+    na_condition: NaCondition::AsFalse,
+    for_step: ForStep::RefuseDynamic,
+    once_flag: OnceFlag::VarLike,
+    cond_call_state: CondCallState::ExecutedOnly,
 };

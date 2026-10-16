@@ -22,10 +22,14 @@ use crate::types::{is_collection, type_ref, Named};
 
 /// What pass 2 learned: per file (root first), per node, the binding of each resolved `Ident`.
 #[derive(Debug)]
-#[expect(dead_code, reason = "read by pass 3's inference (impl-02 T6, §4.4)")]
 pub(crate) struct Resolved {
-    /// `uses[file][node]`: `Some` for an `Ident` bound to a user declaration.
+    /// `uses[file][node]`: `Some` for an `Ident` bound to a user declaration, and for the
+    /// declaring `Name` of a variable, parameter or counter (its own binding).
     pub(crate) uses: Vec<Vec<Option<Binding>>>,
+    /// `fns[set]`: the `(file, FuncDecl)`s of a user overload set, source order.
+    pub(crate) fns: Vec<Vec<(usize, NodeId)>>,
+    /// `reassigned[var id]`: reassigned anywhere (`:=`, compound, tuple).
+    pub(crate) reassigned: Vec<bool>,
 }
 
 /// Run pass 2 over the root and every library that parsed.
@@ -52,6 +56,7 @@ pub(crate) fn resolve(
         );
     }
     let mut uses = Vec::with_capacity(1 + graph.libs.len());
+    let mut out = Out::default();
     let cx = Cx {
         syms,
         tops: &tops,
@@ -59,20 +64,57 @@ pub(crate) fn resolve(
     };
     counters.udts = bases[0].0;
     counters.enums = bases[0].1;
-    uses.push(File::run(root, &graph.edges[0], &cx, diags, &mut counters));
+    uses.push(File::run(
+        root,
+        0,
+        &graph.edges[0],
+        &cx,
+        diags,
+        &mut counters,
+        &mut out,
+    ));
     let mut f = 0;
     while f < graph.libs.len() {
         match &graph.libs[f] {
             Some(ast) => uses.push({
                 counters.udts = bases[f + 1].0;
                 counters.enums = bases[f + 1].1;
-                File::run(ast, &graph.edges[f + 1], &cx, diags, &mut counters)
+                File::run(
+                    ast,
+                    f + 1,
+                    &graph.edges[f + 1],
+                    &cx,
+                    diags,
+                    &mut counters,
+                    &mut out,
+                )
             }),
             None => uses.push(Vec::new()),
         }
         f += 1;
     }
-    Resolved { uses }
+    let mut fns = vec![Vec::new(); counters.fn_sets as usize];
+    for (set, file, n) in out.fn_decls {
+        fns[set as usize].push((file, n));
+    }
+    let mut reassigned = vec![false; counters.vars as usize];
+    for (id, r) in out.vars {
+        reassigned[id as usize] = r;
+    }
+    Resolved {
+        uses,
+        fns,
+        reassigned,
+    }
+}
+
+/// What every file adds to [`Resolved`] besides its `uses`.
+#[derive(Debug, Default)]
+struct Out {
+    /// `(set, file, FuncDecl)`.
+    fn_decls: Vec<(u32, usize, NodeId)>,
+    /// `(var id, reassigned)`.
+    vars: Vec<(u32, bool)>,
 }
 
 /// The top-level declarations of a file, `(name, export, type)`, in source order: what an
@@ -160,6 +202,10 @@ struct File<'a> {
     must_fold: Vec<(NodeId, Option<Ty>, &'static str)>,
     /// Uses of a global variable from a library function body (§4.2.2): `(use, var id)`.
     lib_global_uses: Vec<(NodeId, u32)>,
+    /// This file's index (root 0).
+    file: usize,
+    /// `(set, file, FuncDecl)` of every user function declared here.
+    fn_decls: Vec<(u32, usize, NodeId)>,
 }
 
 /// `pine_spec::lookup(name)` is a built-in value (`close`, `bar_index`, …).
@@ -170,10 +216,12 @@ fn is_builtin_value(name: &str) -> bool {
 impl<'a> File<'a> {
     fn run(
         ast: &'a Ast,
+        file: usize,
         imports: &[crate::imports::Import],
         cx: &Cx<'a>,
         diags: &'a mut Vec<Diag>,
         counters: &'a mut Counters,
+        out: &mut Out,
     ) -> Vec<Option<Binding>> {
         let syms = cx.syms;
         let mut f = File {
@@ -194,6 +242,8 @@ impl<'a> File<'a> {
             var_base: 0,
             must_fold: Vec::new(),
             lib_global_uses: Vec::new(),
+            file,
+            fn_decls: Vec::new(),
         };
         f.scopes.open(ScopeKind::Global);
         for imp in imports {
@@ -209,6 +259,10 @@ impl<'a> File<'a> {
         f.scopes.close();
         f.report_shadowing();
         f.check_constants();
+        for (k, v) in f.vars.iter().enumerate() {
+            out.vars.push((f.var_base + k as u32, v.reassigned));
+        }
+        out.fn_decls.append(&mut f.fn_decls);
         f.uses
     }
 
@@ -243,11 +297,13 @@ impl<'a> File<'a> {
                     let n = self.ast.sym(name);
                     self.check_builtin_function_name(n, self.ast.span(name));
                     // One binding per overload set: a second function of one name overloads it.
-                    if let Some((Binding::Fns { .. }, _)) = self.scopes.lookup(n) {
+                    if let Some((Binding::Fns { set }, _)) = self.scopes.lookup(n) {
+                        self.fn_decls.push((set, self.file, s));
                         continue;
                     }
                     let set = self.counters.fn_sets;
                     self.counters.fn_sets += 1;
+                    self.fn_decls.push((set, self.file, s));
                     self.declare(n, Binding::Fns { set }, at);
                 }
                 Node::TypeDecl { name, .. } => {
@@ -284,6 +340,7 @@ impl<'a> File<'a> {
                 self.shadowing.push((name, at));
             }
         }
+        self.uses[name_node.0 as usize] = Some(b);
         self.declare(name, b, at);
     }
 
@@ -460,6 +517,7 @@ impl<'a> File<'a> {
                 }
                 self.scopes.open(ScopeKind::Block);
                 let c = self.new_counter();
+                self.uses[counter.0 as usize] = Some(c);
                 self.declare(ast.sym(counter), c, ast.span(counter));
                 self.loop_body(body);
                 self.scopes.close();
@@ -473,6 +531,7 @@ impl<'a> File<'a> {
                 self.scopes.open(ScopeKind::Block);
                 for &b in binders {
                     let c = self.new_counter();
+                    self.uses[b.0 as usize] = Some(c);
                     self.declare(ast.sym(b), c, ast.span(b));
                 }
                 self.loop_body(body);
@@ -522,6 +581,7 @@ impl<'a> File<'a> {
         for (k, &p) in params.iter().enumerate() {
             if let Node::Param { name, .. } = ast.node(p) {
                 let index = u8::try_from(k).unwrap_or(u8::MAX);
+                self.uses[name.0 as usize] = Some(Binding::Param { index });
                 self.declare(ast.sym(name), Binding::Param { index }, ast.span(name));
             }
         }

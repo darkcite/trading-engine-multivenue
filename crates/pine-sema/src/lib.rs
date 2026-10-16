@@ -12,13 +12,22 @@
 #![deny(missing_docs, unused_must_use, unreachable_pub)]
 
 mod code;
+mod decl;
 mod fold;
+mod hoist;
 mod imports;
+mod infer;
+mod inputs;
+mod ir;
 mod libcache;
 pub mod limits;
+mod lower;
+mod mono;
+mod overload;
 mod pins;
 mod resolve;
 mod scope;
+mod sites;
 mod sw;
 #[cfg(test)]
 mod tests;
@@ -66,7 +75,58 @@ fn compile_with(
         return Err(finish(diags));
     }
     let graph = imports::load(ast, &mut syms, libs, &mut diags);
-    let _resolved = resolve::resolve(ast, &graph, &syms, rd, &mut diags);
+    let resolved = resolve::resolve(ast, &graph, &syms, rd, &mut diags);
+    // Pass 3 types a program pass 2 accepted: a refused name would only cascade (§4.1).
+    if diags.is_empty() {
+        let tiers = opts.limits.active_tiers;
+        let typed = infer::infer(
+            ast,
+            &graph,
+            &resolved,
+            &mut syms,
+            rd,
+            tiers,
+            &opts.inputs,
+            &mut diags,
+        );
+        let _decl = decl::check(ast, &typed, opts, &syms, &mut diags);
+        // Pass 4 (§4.6): the Instantiation tree and its caps.
+        let mut files: Vec<Option<&Ast>> = vec![Some(ast)];
+        for l in &graph.libs {
+            files.push(l.as_ref());
+        }
+        let tree = mono::build(&typed, &files, &syms, &mut diags);
+        // Lowering reads a program passes 1–4 accepted; a row the pine-std snapshot cannot serve
+        // yet (`3024 … unserved=1`) is the snapshot's refusal, not the program's, so it does not
+        // stop lowering — the result is the same whichever rows the snapshot serves.
+        let accepted = diags
+            .iter()
+            .all(|d| d.code.0 == 3024 && d.msg.contains(" unserved=1"));
+        if accepted && !tree.nodes.is_empty() {
+            let knobs = lower::Knobs {
+                cap: opts.limits.collection_cap,
+                mintick_1e6: opts.chart.mintick_1e6,
+            };
+            let d = ast.dialect();
+            let ir = lower::lower(&typed, &tree, &resolved, &files, &syms, rd, d, knobs);
+            let udt_fields: Vec<u16> = typed.udts.iter().map(|u| u.fields.len() as u16).collect();
+            // `pin:02-site-cap-undeclared` — §4.10.4's `C` is `M` when set; the declared `D`
+            // joins with the layout pass (T17/T18).
+            let cx = sites::SiteCtx {
+                d,
+                cap: opts.limits.max_bars_back,
+                collection_cap: opts.limits.collection_cap,
+                udt_fields: &udt_fields,
+            };
+            let r = ir.and_then(|mut ir| {
+                hoist::run(&mut ir, rd)?;
+                sites::number(&ir, &cx).map(|s| (ir, s))
+            });
+            if let Err(d) = r {
+                diags.push(d);
+            }
+        }
+    }
     if diags.is_empty() {
         let msg = "not implemented: emission".to_owned();
         diags.push(diag(ReasonCode::Internal, ast.span(ast.root()), msg));
