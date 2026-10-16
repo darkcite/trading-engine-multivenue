@@ -16,6 +16,7 @@
 //!    `parse_outcome_meta`).
 //! 4. The subscribe-ack parser (`parse_sub_response`) and the
 //!    unsubscribe-echo test (`is_unsub_response`, HK1).
+//! 5. The empty-`trades`-snapshot test (`is_empty_data_array`, HK37).
 //!
 //! None of these may panic, allocate, or read out of bounds on any
 //! input — results are consumed and otherwise ignored.
@@ -74,4 +75,7 @@ fuzz_target!(|data: &[u8]| {
     // --- subscribe acks ---------------------------------------------
     std::hint::black_box(ingress_hyperliquid::parse_sub_response(data));
     std::hint::black_box(ingress_hyperliquid::is_unsub_response(data));
+
+    // --- empty trades snapshot (HK37) -------------------------------
+    std::hint::black_box(ingress_hyperliquid::is_empty_data_array(data));
 });

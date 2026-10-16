@@ -997,8 +997,10 @@ mod tests {
 // ---------------------------------------------------------------
 
 /// Roll counters shared between the ingress thread (single writer)
-/// and the metrics reader — plus the one other HIP-4 venue fact
-/// counted here, the outcome legs' one-sided `bbo` drop (BIN15 O8).
+/// and the metrics reader — plus the other HIP-4 venue facts counted
+/// here: the outcome legs' one-sided `bbo` drop (BIN15 O8), a roll's
+/// `unsubscribe` echoes (HK1) and a fresh leg's empty `trades`
+/// snapshot (HK37).
 ///
 /// These could not go in `core_metrics::IngressStatus`: that slot is
 /// size-locked at 192 B (three cache lines, asserted), and it is
@@ -1012,6 +1014,7 @@ pub struct HlRollStatus {
     families_dormant: ::core::sync::atomic::AtomicU64,
     outcome_bbo_one_sided: ::core::sync::atomic::AtomicU64,
     unsub_acks: ::core::sync::atomic::AtomicU64,
+    trades_empty: ::core::sync::atomic::AtomicU64,
 }
 
 impl HlRollStatus {
@@ -1026,6 +1029,7 @@ impl HlRollStatus {
             families_dormant: AtomicU64::new(0),
             outcome_bbo_one_sided: AtomicU64::new(0),
             unsub_acks: AtomicU64::new(0),
+            trades_empty: AtomicU64::new(0),
         }
     }
 
@@ -1034,6 +1038,15 @@ impl HlRollStatus {
     #[inline]
     pub fn inc_unsub_acks(&self) {
         self.unsub_acks
+            .fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// HK37: the venue answered a `trades` subscribe with its empty
+    /// snapshot (`"data":[]`, no coin) — a leg that has not printed;
+    /// up to six a 15-minute roll, never a parse error.
+    #[inline]
+    pub fn inc_trades_empty(&self) {
+        self.trades_empty
             .fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
     }
 
@@ -1121,6 +1134,14 @@ impl HlRollStatus {
     #[must_use]
     pub fn unsub_acks(&self) -> u64 {
         self.unsub_acks
+            .load(::core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `engine_ingress_hyperliquid_trades_empty_total`.
+    #[inline]
+    #[must_use]
+    pub fn trades_empty(&self) -> u64 {
+        self.trades_empty
             .load(::core::sync::atomic::Ordering::Relaxed)
     }
 }

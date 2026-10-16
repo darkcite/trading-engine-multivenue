@@ -6,6 +6,27 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-16 — HL ingress: `engine_ingress_hyperliquid_trades_empty_total` (HK37)
+
+**What changed**
+- New gauge `engine_ingress_hyperliquid_trades_empty_total`: the venue's
+  empty `trades` snapshot (`{"channel":"trades","data":[]}`), sent on
+  subscribe to a HIP-4 outcome leg that has not printed yet. It names no
+  coin, so it used to count in
+  `engine_ingress_hyperliquid_parse_errors_total` and was tapped as a parse
+  reject; now it counts in `…_msgs_total` and this gauge, with no reject
+  tap.
+
+**Impact**
+- Metrics: HL `…_parse_errors_total` falls by the whole of its steady
+  rate (≈ 21 an hour, 4 at boot; 100 % of the 2026-10-16 reject tap). A
+  `trades` push with rows for an unconfigured coin, a broken array, or an
+  empty array on any other channel still counts there.
+- Captures: with the raw tap on, the snapshots stop appearing as rejects.
+
+**Migration steps**
+1. None: the routine restart of a binary built from this change.
+
 ## 2026-10-15 — S16: sixteen strategy slots
 
 **What changed**
