@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use clob_dispatcher::{DispatchError, DispatchStats, OrderDispatch};
 use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
 use core_ring::Producer;
-use core_types::{CancelReq, ChannelEvent, Fill, ModifyReq, NsTs, Order, Side, Tick};
+use core_types::{CancelReq, ChannelEvent, Fill, ModifyReq, NsTs, Order, Side, SlotMask, Tick};
 
 use crate::action::{encode_order, OrderWire, Tif, MAX_ACTION};
 use crate::asset::{AssetTable, RollOf};
@@ -425,9 +425,10 @@ struct PendingSweep {
     /// cloid's slot byte (LAW E-9), which `recon::ours_on_leg` reads.
     /// [`crate::recon::ALL_SLOTS`] for a roll (a retired leg is nobody's
     /// to keep), `1 << slot` for a halted slot's cancel. A second
-    /// request for a leg already pending ORs its slots in.
-    slots: u8,
-    _pad2: [u8; 7],
+    /// request for a leg already pending ORs its slots in. A
+    /// [`SlotMask`] since S16-4 (sixteen slots).
+    slots: SlotMask,
+    _pad2: [u8; 6],
 }
 
 impl PendingSweep {
@@ -438,14 +439,19 @@ impl PendingSweep {
         defers: 0,
         coin: [0; crate::asset::COIN_MAX],
         slots: 0,
-        _pad2: [0; 7],
+        _pad2: [0; 6],
     };
 }
 
 // XMM XH5a: `slots` took a byte of the padding — the entry stays 36 B, a
 // by-value copy within the ≤ 64 B allowance (`sweep_one_pending`'s
-// snapshot, `drop_sweep`'s swap).
+// snapshot, `drop_sweep`'s swap). S16-4 re-pin: `slots` widened to a
+// `SlotMask` (u16) at offset 28 — 2-aligned after the 20 B coin — and
+// took a second byte of the padding, so the entry is still 36 B and the
+// `[PendingSweep; MAX_PENDING_SWEEPS]` table still 576 B.
 const _: () = assert!(core::mem::size_of::<PendingSweep>() == 36);
+const _: () = assert!(core::mem::offset_of!(PendingSweep, slots) == 28);
+const _: () = assert!(core::mem::size_of::<[PendingSweep; MAX_PENDING_SWEEPS]>() == 576);
 
 /// How many ended legs can await a sweep at once.
 ///
@@ -517,12 +523,15 @@ const SWEEP_CANCELS_PER_IDLE: usize = 8;
 ///
 /// So the bound is sized against the largest leg a VALID
 /// configuration can produce. `core_config::exec` refuses a live slot
-/// above `MAX_OPEN_ORDERS_PER_SLOT` (64) and there are 8 slots, so no
-/// leg can legitimately carry more than 512 of our orders — 64
-/// deferrals at [`SWEEP_CANCELS_PER_IDLE`] a call. 256 is four times
-/// that: it cannot fire on a sweep that is merely long, and it still
-/// terminates an entry that is making no progress at all within
-/// about half a second of idle moments.
+/// above `MAX_OPEN_ORDERS_PER_SLOT` (64) and there are `EXEC_SLOTS`
+/// (16, since S16-4) slots, so no leg can legitimately carry more than
+/// 16 × 64 = 1 024 of our orders — 128 calls at
+/// [`SWEEP_CANCELS_PER_IDLE`] (8) a call, 127 of them deferrals, the
+/// selection truncated at [`crate::recon::MAX_OPEN_ORDERS`] (256) for
+/// the first (1 024 − 256) / 8 = 96. 256 is twice that (it was four
+/// times at eight slots' 512): it cannot fire on a sweep that is merely
+/// long, and it still terminates an entry that is making no progress at
+/// all within about half a second of idle moments.
 const SWEEP_MAX_DEFERS: u16 = 256;
 
 /// What one [`HlExchange::sweep_one_pending`] call should do with a
@@ -574,8 +583,9 @@ enum SweepOutcome {
 /// for each of them spends one of [`SWEEP_TRIES`] (8) every time.
 /// Past **N > 312** the retries run out and the entry is dropped with
 /// the remainder reported as `sweep_left`. Commit 2's boot rule
-/// allows 64 open orders on each of 8 slots, so a leg of 512 is a
-/// valid configuration and that abandonment is reachable.
+/// allows 64 open orders on each of `EXEC_SLOTS` (16 since S16-4)
+/// slots, so a leg of 1 024 is a valid configuration and that
+/// abandonment is reachable.
 ///
 /// So truncation with a clean budget defers like any other
 /// incomplete call. It is still never `Done` — we could not see the
@@ -1236,7 +1246,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             Err(_) => false,
         };
         if read {
-            // COPY: [i64; EXEC_SLOTS] (64 B) of day spend, stack → arm,
+            // COPY: [i64; EXEC_SLOTS] (128 B since S16-3) of day spend, stack → arm,
             // once per UTC day — `scan_day_bought` zeroes its target on
             // every failure and a failed read must leave the standing
             // figure — rejected: scanning straight into `day_bought_1e6`.
@@ -2104,7 +2114,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         asset: u32,
         coin: [u8; crate::asset::COIN_MAX],
         coin_len: u8,
-        slots: u8,
+        slots: SlotMask,
     ) {
         if self.merge_sweep(asset, slots) {
             return;
@@ -2127,7 +2137,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         asset: u32,
         coin: [u8; crate::asset::COIN_MAX],
         coin_len: u8,
-        slots: u8,
+        slots: SlotMask,
     ) {
         debug_assert!(self.sweeps_n < MAX_PENDING_SWEEPS);
         self.sweeps[self.sweeps_n] = PendingSweep {
@@ -2137,7 +2147,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             defers: 0,
             coin,
             slots,
-            _pad2: [0; 7],
+            _pad2: [0; 6],
         };
         self.sweeps_n += 1;
     }
@@ -2145,8 +2155,9 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// **XMM XH5a** — `k` legs carrying the slots in `mask` were given up
     /// on or could not be queued: each such slot's confirmation reads
     /// `Stranded` until its next request re-marks it.
-    fn strand(&mut self, mask: u8, k: u64) {
+    fn strand(&mut self, mask: SlotMask, k: u64) {
         let mut s = 0usize;
+        // `EXEC_SLOTS` (16) ≤ `SlotMask::BITS`: `mask >> s` is exact.
         while s < core_config::exec::EXEC_SLOTS {
             // Branchless: a slot outside the mask adds nothing.
             self.slot_left[s] = self.slot_left[s].wrapping_add(k * u64::from((mask >> s) & 1));
@@ -2290,7 +2301,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// too (XMM XH5a: OR'd in — its next pass selects the union), and
     /// the leg is covered: it must not read as a failure to queue, nor
     /// gain a second entry racing the first.
-    fn merge_sweep(&mut self, asset: u32, slots: u8) -> bool {
+    fn merge_sweep(&mut self, asset: u32, slots: SlotMask) -> bool {
         // One bounds check for the walk, not one per entry.
         let live = &mut self.sweeps[..self.sweeps_n];
         let mut i = 0usize;
@@ -2312,7 +2323,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// not hold every live leg: the legs left out are counted once
     /// (`cancel_all_unqueued`) and stranded for `slots`, so each one's
     /// confirmation says so and the router asks again.
-    fn request_sweeps(&mut self, slots: u8) -> Result<(), DispatchError> {
+    fn request_sweeps(&mut self, slots: SlotMask) -> Result<(), DispatchError> {
         // Collected first: `merge_sweep` and `push_sweep` borrow `self`
         // mutably and `for_each_live` borrows it immutably.
         let mut syms = [0u32; crate::asset::ASSET_SLOTS];
@@ -2948,14 +2959,16 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
     fn cancel_slot(&mut self, slot: u8) -> Result<(), DispatchError> {
         let s = usize::from(slot);
         if s >= core_config::exec::EXEC_SLOTS {
-            // Not a slot the router names: the venue-wide verb —
-            // over-cancel, never under.
+            // Unreachable — the router bounds every slot below
+            // `EXEC_SLOTS` — and not a slot any mask names: the
+            // venue-wide verb, over-cancel, never under. Also what keeps
+            // the shift below exact.
             return self.cancel_all();
         }
         self.counters.cancel_all_runs = self.counters.cancel_all_runs.wrapping_add(1);
         // Relative to THIS request, as `cancel_all_mark` is.
         self.slot_mark[s] = self.slot_left[s];
-        self.request_sweeps(1u8 << slot)
+        self.request_sweeps((1 as SlotMask) << slot)
     }
 
     /// `slot`'s confirmation, as `cancel_all_state` is the venue-wide
@@ -2965,9 +2978,10 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
     fn cancel_slot_state(&self, slot: u8) -> clob_dispatcher::CancelAllState {
         let s = usize::from(slot);
         if s >= core_config::exec::EXEC_SLOTS {
+            // `cancel_slot`'s venue-wide fallback, confirmed as such.
             return self.cancel_all_state();
         }
-        let bit = 1u8 << slot;
+        let bit = (1 as SlotMask) << slot;
         let live = &self.sweeps[..self.sweeps_n];
         let mut i = 0usize;
         while i < live.len() {
@@ -3542,6 +3556,61 @@ mod tests {
         x.drop_sweep(0);
         x.drop_sweep(0);
         assert_eq!(x.cancel_slot_state(3), CancelAllState::Clear);
+    }
+
+    /// **S16-4 — a halt of slot 11 sweeps slot 11's orders, never BIN15's
+    /// slot 3's.** Before the cut a slot ≥ 8 fell back to the venue-wide
+    /// verb; a `u8` mask's `1 << 11` would have aliased onto slot 3 in a
+    /// release build. Each slot now carries its own bit of a `SlotMask`,
+    /// and only a slot past `EXEC_SLOTS` keeps the venue-wide fallback.
+    #[test]
+    fn a_slot_11_halt_sweeps_slot_11_alone_and_never_slot_3() {
+        use clob_dispatcher::CancelAllState;
+        let mut x = exchange_at("127.0.0.1");
+        x.on_venue_event(&roll(3253, 0, false, 4096));
+        x.cancel_slot(11).expect("queued");
+        assert_eq!(x.sweeps_n, 2, "one entry per live leg");
+        assert!(
+            x.sweeps[..2].iter().all(|e| e.slots == 1 << 11),
+            "slot 11's orders alone — not slot 3's, not every slot's"
+        );
+        assert_eq!(x.cancel_slot_state(11), CancelAllState::Working);
+        assert_eq!(x.cancel_slot_state(3), CancelAllState::Clear, "3 not asked");
+        assert_eq!(x.cancel_all_state(), CancelAllState::Working);
+
+        // Slot 3 halts too: OR'd in beside 11, neither absorbs the other.
+        x.cancel_slot(3).expect("merged");
+        assert!(x.sweeps[..2]
+            .iter()
+            .all(|e| e.slots == (1 << 3) | (1 << 11)));
+        x.drop_sweep(0);
+        x.drop_sweep(0);
+
+        // And the other way round: slot 3's halt leaves slot 11 alone.
+        x.cancel_slot(3).expect("queued");
+        assert!(x.sweeps[..2].iter().all(|e| e.slots == 1 << 3));
+        assert_eq!(x.cancel_slot_state(11), CancelAllState::Clear);
+        // Given up on: stranded for slot 3 alone.
+        x.sweeps[0].tries = 1;
+        x.spend_try(0);
+        x.sweeps[0].tries = 1;
+        x.spend_try(0);
+        assert_eq!(x.cancel_slot_state(3), CancelAllState::Stranded);
+        assert_eq!(x.cancel_slot_state(11), CancelAllState::Clear);
+
+        // Slot 15, the top: its own bit.
+        x.cancel_slot(15).expect("queued");
+        assert!(x.sweeps[..2].iter().all(|e| e.slots == 1 << 15));
+        x.drop_sweep(0);
+        x.drop_sweep(0);
+
+        // Past the slot space (unreachable through the router): the
+        // venue-wide verb — over-cancel, never under.
+        x.cancel_slot(16).expect("queued");
+        assert!(x.sweeps[..2]
+            .iter()
+            .all(|e| e.slots == crate::recon::ALL_SLOTS));
+        assert_eq!(x.cancel_slot_state(16), x.cancel_all_state());
     }
 
     // ---------- E5: the budget counts what left the host ----------
@@ -4492,12 +4561,13 @@ mod tests {
     /// **The regression the budget introduced, and the reason
     /// `truncated` had to stop meaning failure.**
     ///
-    /// Commit 2's boot rule allows 64 open orders on each of 8 slots,
-    /// so a leg of 512 is a valid configuration. With truncation
-    /// classed as `Retry`, the selection sits at the 256 ceiling for
-    /// `(512 - 256) / 8 = 32` calls, each spending one of 8 tries —
-    /// abandoned long before the end, with the remainder reported as
-    /// `sweep_left`: quotes resting on a retired instance.
+    /// Commit 2's boot rule allows 64 open orders on each of
+    /// `EXEC_SLOTS` (16 since S16-4) slots, so a leg of 1 024 is a valid
+    /// configuration. With truncation classed as `Retry`, the selection
+    /// sits at the 256 ceiling for `(1 024 - 256) / 8 = 96` calls, each
+    /// spending one of 8 tries — abandoned long before the end, with the
+    /// remainder reported as `sweep_left`: quotes resting on a retired
+    /// instance.
     #[test]
     fn a_leg_larger_than_one_buffer_is_not_abandoned() {
         for total in [312usize, 313, 512, 1024] {

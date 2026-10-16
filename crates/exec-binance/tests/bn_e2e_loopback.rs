@@ -3640,6 +3640,88 @@ fn a_spot_order_of_ours_resting_at_boot_refuses_the_boot() {
     }
 }
 
+/// **S16-4: an off-owner slot's order — slot 11 as slot 5 — takes the path
+/// an off-owner slot 0..8 order took at eight slots.** Before the cut a
+/// slot digit past `7` classified `Foreign` (a stranger's: that boot
+/// proceeds, BX-8 counts it); now every hex digit is a router slot, so this
+/// epoch's id of a slot the arm does not own is OURS and not in the order
+/// table — a ghost (BX-9), exactly as slot 5's: on spot (no cancel, BX-17)
+/// the boot is refused naming its row, the order never cancelled.
+#[test]
+fn an_off_owner_slot_11_order_is_classified_as_an_off_owner_slot_5_order() {
+    for slot in [5u8, 11, 15] {
+        assert_ne!(slot, SLOT, "an off-owner slot");
+        let c = format!("mv{EPOCH:08x}{slot:x}{:016x}00000", 77u64);
+        let venue = Venue::start();
+        let rest = SpotOrder {
+            oid: 7_201,
+            cid: c.clone(),
+            symbol: "BTCUSDT",
+            buy: true,
+            tif: "GTC",
+            qty: 100_000,
+            px: 6_000_000_000_000,
+            executed: 0,
+            quote: 0,
+            status: "NEW",
+        };
+        venue.with(|v| v.spot_orders.push(rest));
+        assert_eq!(Rig::boot_gateway(&venue, Opts::spot_only(&[b"BTCUSDT"])).err(), Some(BootErr::SpotStray(0)), "slot {slot}: {c}");
+        venue.with(|v| {
+            assert!(v.spot_orders[0].open(), "slot {slot}: never cancelled");
+            assert!(v.spot_places.is_empty());
+        });
+    }
+}
+
+/// **S16-4 (the risk review): on USDⓈ-M an off-owner slot 8..16's order and
+/// trade take slot 5's path.** At boot (the REST route: cancels by venue
+/// order id) this epoch's id of an off-owner slot, not in the order table,
+/// is a ghost and another epoch's an orphan (BX-9) — each cancelled by its
+/// venue order id, never by a cancel-all; the stranger's stays. On the
+/// stream, a trade under this epoch's off-owner id books as a member trade
+/// at the slot it names — slot 10 never as `10 & 7 == 2`, the owner's — and
+/// one under another epoch's books to the owner (`TRADE_BY_ORPHAN`), as
+/// slot 5's do; the owner's position moves with the orphan's alone.
+#[test]
+fn an_off_owner_slot_11_usdm_order_and_trade_take_slot_5_s_path() {
+    for slot in [5u8, 10, 11, 15] {
+        assert_ne!(slot, SLOT, "an off-owner slot");
+        let id = |epoch: u32, oid: u64| format!("mv{epoch:08x}{slot:x}{oid:016x}00000");
+        let venue = Venue::start();
+        venue.with(|v| {
+            for (oid, cid) in [(7_101, id(EPOCH, 88)), (7_102, id(OLD_EPOCH, 89))] {
+                let mut o = v.orders[0].clone();
+                o.oid = oid;
+                o.cid = cid;
+                v.orders.push(o);
+            }
+        });
+        let rig = Rig::boot_rest_hmac(&venue, 60_000_000_000, 60_000);
+        venue.with(|v| {
+            let status = |oid: u64| v.orders.iter().find(|o| o.oid == oid).map(|o| o.status);
+            assert_eq!(status(7_101), Some("CANCELED"), "slot {slot}: this epoch's ghost");
+            assert_eq!(status(7_102), Some("CANCELED"), "slot {slot}: another epoch's orphan");
+            assert_eq!(status(7_002), Some("NEW"), "slot {slot}: the stranger's stays");
+            let by_id = v.log.iter().filter(|l| l.as_str() == "DELETE /fapi/v1/order").count();
+            assert_eq!(by_id, 3, "slot {slot}: the three by venue order id: {:?}", v.log);
+            assert!(!v.log.iter().any(|l| l == "DELETE /fapi/v1/allOpenOrders"), "slot {slot}: never a cancel-all");
+        });
+        let mut e = rig.e;
+        let p0 = e.pos().unwrap_or(0);
+        venue.with(|v| v.user_q.push_back(venue_trade(9_960, &id(EPOCH, 90), 9_860, "TRADE")));
+        e.until("this epoch's off-owner trade", |e| e.fills.len() == 1);
+        assert_eq!((e.fills[0].strategy_id, e.fills[0].order_id), (slot, 90), "slot {slot}: a member trade at its slot");
+        assert_eq!(e.pos().unwrap_or(0), p0, "slot {slot}: the owner's position is untouched");
+        venue.with(|v| v.user_q.push_back(venue_trade(9_961, &id(OLD_EPOCH, 91), 9_861, "TRADE")));
+        e.until("another epoch's trade", |e| e.fills.len() == 2);
+        assert_eq!(e.fills[1].strategy_id, SLOT, "slot {slot}: an orphan's books to the owner");
+        assert_eq!(e.pos(), Some(p0 - 1_000), "slot {slot}: the owner holds what the venue sold");
+        let rig = Rig { e, ..rig };
+        let _journal = rig.shutdown();
+    }
+}
+
 /// **BX8 (the risk review): an in-doubt order the venue names REJECTED is
 /// ended.** The IoC's answer and its reports are lost, and the venue holds
 /// it REJECTED (it never traded): the next session's `order.status`

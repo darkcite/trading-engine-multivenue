@@ -134,13 +134,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use core_config::exec::EXEC_SLOTS;
 use core_net::{
     ws_frame_in_place, ws_unmask_in_place, Backoff, KeepaliveCfg, TlsTransport, WsOpcode,
     WS_CLIENT_HDR_MAX,
 };
 use core_time::now_ns;
 use core_types::{
-    ORDER_EVENT_REASON_CANCEL_REQUESTED, ORDER_EVENT_REASON_EXPIRED, ORDER_EVENT_REASON_NONE,
+    SlotMask, ORDER_EVENT_REASON_CANCEL_REQUESTED, ORDER_EVENT_REASON_EXPIRED,
+    ORDER_EVENT_REASON_NONE,
 };
 use exec_gateway::stats::{
     CONGESTION_BUSY, CONGESTION_NONE, CONGESTION_RATE_LIMITED, CONGESTION_THROTTLED,
@@ -396,8 +398,9 @@ pub struct GatewayCfg {
     pub master: [u8; 20],
     /// The strategy slots this gateway posts for, as a bit mask (bit `s`
     /// = slot `s`); a command for any other slot is refused unsent — two
-    /// arms can share an account, never a cloid namespace.
-    pub slots: u8,
+    /// arms can share an account, never a cloid namespace. A [`SlotMask`]
+    /// since S16-4 (sixteen slots).
+    pub slots: SlotMask,
     /// A post's answer deadline ([`POST_TIMEOUT_NS`] in production).
     pub post_timeout_ns: u64,
     /// The idle policy.
@@ -422,13 +425,23 @@ impl GatewayCfg {
         master: [u8; 20],
         slot: u8,
     ) -> Self {
+        // S16-4: a `SlotMask` names all sixteen slots, so slot 11 is bit
+        // 11 — never `& 7`'s slot 3 (BIN15's). Every caller passes its
+        // member's slot, which `HlGatewayArm::new` bounds. Past the mask's
+        // width a release build's `<<` would wrap (19 → bit 3, BIN15's):
+        // `checked_shl` gives such a slot the EMPTY mask instead — a
+        // gateway that refuses every command, fail-closed.
+        debug_assert!(
+            usize::from(slot) < EXEC_SLOTS,
+            "a gateway's slot is a router slot"
+        );
         Self {
             host,
             port: crate::config::HTTPS_PORT,
             tls,
             network,
             master,
-            slots: 1u8 << (slot & 7),
+            slots: (1 as SlotMask).checked_shl(u32::from(slot)).unwrap_or(0),
             post_timeout_ns: POST_TIMEOUT_NS,
             idle: Idle::new(
                 exec_gateway::idle::SPIN_POLLS_DEFAULT,
@@ -934,6 +947,17 @@ fn read_end(item: &ItemRef, kind: u8, read: u8, rows: u64, now: u64) -> ExecEven
         slot: item.slot,
         ..ExecEvent::default()
     }
+}
+
+/// S16-4: is `slot` one of the gateway's `slots`? A byte at or past
+/// `EXEC_SLOTS` — [`SWEEP_SLOT`], [`SLOT_FOREIGN`], a nonsense one — never
+/// is; the bound goes first, so the shift is exact (a `u8` mask's
+/// `1 << 11` would alias slot 11 onto BIN15's slot 3 in a release build).
+/// The one test `HlGateway::admit` and `HlGateway::sweep_cancel_ours`
+/// share.
+#[inline(always)]
+fn owns_slot(slots: SlotMask, slot: u8) -> bool {
+    usize::from(slot) < EXEC_SLOTS && slots & ((1 as SlotMask) << slot) != 0
 }
 
 /// Our slot and client id from a row's cloid, or foreign.
@@ -1757,7 +1781,7 @@ pub struct HlGateway {
     server_name: ServerName<'static>,
     tls: Arc<ClientConfig>,
     master_hex: String,
-    slots: u8,
+    slots: SlotMask,
     sk: secp256k1::SecretKey,
     network: Network,
     nonce: NonceSource,
@@ -2301,7 +2325,7 @@ impl HlGateway {
     /// Put one command into its class batch, or refuse it unsent.
     fn admit(&mut self, c: &HlCmd, now: u64) {
         let growth = grows(c.kind);
-        let refusal = if c.slot >= 8 || self.slots & (1u8 << c.slot) == 0 {
+        let refusal = if !owns_slot(self.slots, c.slot) {
             Some(REASON_LOCAL)
         } else if growth && self.rt.stats.halt_reason() != HALT_NONE {
             Some(REASON_HALTED)
@@ -2893,7 +2917,7 @@ impl HlGateway {
         while i < n {
             let h = self.rt.sweep_hits[i];
             i += 1;
-            if h.slot >= 8 || self.slots & (1u8 << h.slot) == 0 {
+            if !owns_slot(self.slots, h.slot) {
                 continue;
             }
             mine += 1;
@@ -3134,6 +3158,57 @@ mod tests {
             ASSET_UNKNOWN,
             "slot 6's map, as before"
         );
+    }
+
+    /// **S16-4 — a slot-11 gateway posts for slot 11 and refuses BIN15's
+    /// slot 3**; a slot-3 gateway is as before. A `u8` mask's `1 << 11`
+    /// read as slot 3 in a release build.
+    #[test]
+    fn a_slot_11_gateway_owns_slot_11_and_never_slot_3() {
+        let tls = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let at = |slot: u8| {
+            GatewayCfg::production(
+                "localhost".to_string(),
+                Arc::clone(&tls),
+                Network::Testnet,
+                [0xA5; 20],
+                slot,
+            )
+            .slots
+        };
+        let eleven = at(11);
+        assert_eq!(eleven, 1 << 11);
+        assert!(owns_slot(eleven, 11));
+        assert!(!owns_slot(eleven, 3), "BIN15's slot is not slot 11's");
+        let three = at(3);
+        assert_eq!(three, 1 << 3, "slot 3's mask unchanged");
+        assert!(owns_slot(three, 3));
+        assert!(!owns_slot(three, 11));
+        assert_eq!(at(15), 1 << 15);
+        assert!(owns_slot(at(15), 15));
+        // Past the slot space, whatever the mask says.
+        let mut b = 16u16;
+        while b <= u16::from(u8::MAX) {
+            assert!(!owns_slot(SlotMask::MAX, b as u8), "byte {b}");
+            b += 1;
+        }
+        assert!(!owns_slot(SlotMask::MAX, SWEEP_SLOT));
+        assert!(!owns_slot(SlotMask::MAX, SLOT_FOREIGN));
+        // Every slot's gateway owns its own slot and no other.
+        let mut s = 0u8;
+        while usize::from(s) < EXEC_SLOTS {
+            let m = at(s);
+            let mut t = 0u8;
+            while usize::from(t) < EXEC_SLOTS {
+                assert_eq!(owns_slot(m, t), s == t, "gateway {s}, slot {t}");
+                t += 1;
+            }
+            s += 1;
+        }
     }
 
     #[test]

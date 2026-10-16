@@ -70,8 +70,10 @@ EXIT_GATE: int = 3
 EXIT_TRANSPORT: int = 4
 EXIT_STATE: int = 5
 
-# Mirror of `core_types::MAX_STRATEGY_SLOTS` (u8 enable-mask ceiling).
-_MAX_STRATEGY_SLOTS: int = 8
+# Mirror of `core_types::MAX_STRATEGY_SLOTS` — the width of the engine's
+# `SlotMask` (u16 since S16-2). Slots 8-15 are reserved (no member): the
+# engine's strategy set refuses an enable there and counts it.
+_MAX_STRATEGY_SLOTS: int = 16
 _MAX_PARAM_ID: int = 0xFFFF
 _NS_PER_S: float = 1e9
 _PX_QTY_SCALE: float = 1e6

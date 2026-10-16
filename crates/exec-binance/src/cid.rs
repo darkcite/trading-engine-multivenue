@@ -7,7 +7,7 @@
 //! mv  EEEEEEEE  S  OOOOOOOOOOOOOOOO  00000     32 chars, [a-z0-9] only
 //! │   │         │  │                 └ reserved tail, always "00000" (D7)
 //! │   │         │  └ client_oid, 16 lower-hex (u64)
-//! │   │         └ slot, 1 lower-hex (0..=7)
+//! │   │         └ slot, 1 lower-hex (0..=CID_SLOT_MAX = EXEC_SLOTS - 1 = 15)
 //! │   └ boot epoch = low 32 bits of unix seconds at boot, 8 lower-hex
 //! └ prefix
 //! ```
@@ -29,9 +29,13 @@
 //!   `settlement_autoclose-`): booked to the instrument's OWNER slot (BX-7),
 //!   the last with `FILL_FLAG_SETTLEMENT`;
 //! * [`CidClass::Foreign`] — anything else, including an `mv` id with a
-//!   non-zero tail, a slot past 7, upper-case hex or the wrong length
+//!   non-zero tail, a slot past [`CID_SLOT_MAX`] (none since S16-4: the
+//!   one nibble names 0..=15, every router slot), upper-case hex or the
+//!   wrong length
 //!   (BX-8: recon drift on a dedicated account, a drift HALT on a shared
 //!   one).
+
+use core_config::exec::EXEC_SLOTS;
 
 /// The id's length, every product (D7).
 pub const CID_LEN: usize = 32;
@@ -39,8 +43,11 @@ pub const CID_LEN: usize = 32;
 pub const CID_PREFIX: [u8; 2] = *b"mv";
 /// The reserved tail (D7).
 pub const CID_TAIL: [u8; 5] = *b"00000";
-/// The highest slot an id of ours can name (`EXEC_SLOTS - 1`).
-pub const CID_SLOT_MAX: u8 = 7;
+/// The highest slot an id of ours can name (`EXEC_SLOTS - 1`; 15 since
+/// S16-4). The slot is ONE lower-hex digit of the id, so it can name
+/// 0..=15 and no more: the assert below holds every router slot inside it.
+pub const CID_SLOT_MAX: u8 = (EXEC_SLOTS - 1) as u8;
+const _: () = assert!(EXEC_SLOTS >= 1 && EXEC_SLOTS - 1 <= 0x0F, "every router slot must fit the cid's one hex digit");
 
 const OFF_EPOCH: usize = 2;
 const OFF_SLOT: usize = 10;
@@ -128,7 +135,7 @@ impl CidPrefix {
     /// before a command exists).
     #[inline(always)]
     pub fn render(&self, slot: u8, client_oid: u64, out: &mut [u8; CID_LEN]) {
-        debug_assert!(slot <= CID_SLOT_MAX, "a slot past EXEC_SLOTS");
+        debug_assert!(slot <= CID_SLOT_MAX, "a slot past CID_SLOT_MAX (EXEC_SLOTS - 1): not a router slot");
         let hi = hex8((client_oid >> 32) as u32);
         let lo = hex8(client_oid as u32);
         // COPY: the 10 B prefix, 2 × 8 B of hex and the 5 B tail into the
@@ -259,6 +266,9 @@ fn classify_mv(id: &[u8], epoch: u32) -> CidClass {
     ) else {
         return CidClass::Foreign;
     };
+    // A slot no router runs. Since S16-4 the one nibble's 0..=15 are all
+    // router slots, so this refuses nothing at `EXEC_SLOTS` 16; it stays
+    // the definition of "a slot we run" should `EXEC_SLOTS` ever narrow.
     if slot > CID_SLOT_MAX {
         return CidClass::Foreign;
     }
@@ -290,6 +300,54 @@ mod tests {
         let id = render(0x6512_ab0f, 3, 0x0123_4567_89ab_cdef);
         assert_eq!(&id, b"mv6512ab0f30123456789abcdef00000");
         assert!(id.iter().all(|b| b.is_ascii_digit() || b.is_ascii_lowercase()));
+    }
+
+    /// **S16-4 — the ids of slots 0..8 are byte-identical to S16-3's.**
+    /// Captured from HEAD 61d42c6 before the widening (`target/hk/s16/s4/
+    /// golden.txt`): an order resting across the upgrade classifies to the
+    /// slot that placed it.
+    #[test]
+    fn the_ids_of_slots_3_and_6_are_unchanged_by_the_widening() {
+        const GOLDEN: [(u32, u8, u64, &[u8; CID_LEN]); 6] = [
+            (0x6512_ab0f, 3, 1, b"mv6512ab0f3000000000000000100000"),
+            (0x6512_ab0f, 3, 0x0123_4567_89ab_cdef, b"mv6512ab0f30123456789abcdef00000"),
+            (0x6512_ab0f, 6, 1, b"mv6512ab0f6000000000000000100000"),
+            (0x6512_ab0f, 6, 0x0123_4567_89ab_cdef, b"mv6512ab0f60123456789abcdef00000"),
+            (7, 0, 1, b"mv000000070000000000000000100000"),
+            (7, 7, 0x0123_4567_89ab_cdef, b"mv0000000770123456789abcdef00000"),
+        ];
+        for (epoch, slot, oid, want) in GOLDEN {
+            assert_eq!(&render(epoch, slot, oid), want, "slot {slot}");
+            assert_eq!(classify(want, epoch), CidClass::Ours { slot, client_oid: oid });
+        }
+    }
+
+    /// **S16-4 — every router slot round-trips, 0..=15**, each under its
+    /// own digit: slot 11 is `b`, never BIN15's `3`.
+    #[test]
+    fn every_slot_0_to_15_round_trips() {
+        assert_eq!(CID_SLOT_MAX, 15);
+        for slot in 0..=CID_SLOT_MAX {
+            for oid in [0u64, 1, 42, u64::MAX, 0x0123_4567_89ab_cdef] {
+                let id = render(7, slot, oid);
+                assert_eq!(id[OFF_SLOT], HEX[usize::from(slot)]);
+                assert_eq!(classify(&id, 7), CidClass::Ours { slot, client_oid: oid }, "slot {slot}");
+                assert_eq!(classify(&id, 6), CidClass::Orphan { epoch: 7, slot, client_oid: oid });
+            }
+        }
+        assert_eq!(&render(7, 11, 1)[..], b"mv00000007b000000000000000100000");
+        // Slot 16 has no digit: `g` (or anything past `f`) is not ours.
+        let mut g = render(7, 15, 1);
+        g[OFF_SLOT] = b'g';
+        assert_eq!(classify(&g, 7), CidClass::Foreign);
+    }
+
+    /// Slot 16 is not a router slot: `render` refuses it in debug.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "a slot past CID_SLOT_MAX")]
+    fn slot_16_is_refused() {
+        let _ = render(7, 16, 1);
     }
 
     #[test]
@@ -333,9 +391,11 @@ mod tests {
         let at = u.iter().rposition(|&b| b == b'a').unwrap();
         u[at] = b'A';
         assert_eq!(p.classify(&u), CidClass::Foreign);
-        // A slot past 7.
+        // A slot digit that is not lower hex (S16-4: '8'..='f' are slots).
         let mut s = good;
-        s[OFF_SLOT] = b'8';
+        s[OFF_SLOT] = b'g';
+        assert_eq!(p.classify(&s), CidClass::Foreign);
+        s[OFF_SLOT] = b'B';
         assert_eq!(p.classify(&s), CidClass::Foreign);
         // Too short / too long.
         assert_eq!(p.classify(&good[..31]), CidClass::Foreign);

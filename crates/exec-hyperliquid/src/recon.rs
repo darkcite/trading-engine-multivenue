@@ -44,6 +44,7 @@
 //! position that reconciles by not being there.
 
 use core_parse::{find_field, skip_ws};
+use core_types::SlotMask;
 
 /// How many balance rows the reconciler must be able to hold.
 ///
@@ -661,10 +662,12 @@ pub fn scan_open_orders(body: &[u8], out: &mut [OpenOrder]) -> Result<usize, Sca
 /// **Every slot** — the mask a sweep of a retired leg carries (LAW E-8:
 /// a leg whose instance ended is nobody's to keep). A halted slot's
 /// sweep carries `1 << slot` (XMM XH5a).
-pub const ALL_SLOTS: u8 = u8::MAX;
+pub const ALL_SLOTS: SlotMask = SlotMask::MAX;
 
-// A slot mask is one byte: one bit per value of the cloid's slot byte.
-const _: () = assert!(core_config::exec::EXEC_SLOTS <= 8);
+// S16-4: a slot mask is a `SlotMask` — one bit per slot `decode` can
+// return (`< EXEC_SLOTS`), so `(1 as SlotMask) << slot` is exact and
+// never aliases slot 11 onto BIN15's slot 3 the way a `u8` would.
+const _: () = assert!(core_config::exec::EXEC_SLOTS <= SlotMask::BITS as usize);
 
 /// Of the orders the venue says are resting, which are **ours, on this
 /// leg, of these slots** — returns how many oids were written to `out`.
@@ -691,7 +694,7 @@ pub fn ours_on_leg(
     rows: &[OpenOrder],
     body: &[u8],
     coin: &[u8],
-    slots: u8,
+    slots: SlotMask,
     out: &mut [u64],
 ) -> usize {
     let mut n = 0usize;
@@ -707,8 +710,10 @@ pub fn ours_on_leg(
         else {
             continue;
         };
-        // `strategy_id < EXEC_SLOTS` (≤ 8) by `decode`: the shift is exact.
-        if slots & (1u8 << strategy_id) == 0 {
+        // `strategy_id < EXEC_SLOTS` (≤ `SlotMask::BITS`) by `decode`: the
+        // shift is exact.
+        debug_assert!(usize::from(strategy_id) < core_config::exec::EXEC_SLOTS);
+        if slots & ((1 as SlotMask) << strategy_id) == 0 {
             continue;
         }
         if n >= out.len() {
@@ -1542,6 +1547,55 @@ mod tests {
         assert_eq!(k, 3, "a roll takes every slot's");
         let k = ours_on_leg(&rows[..n], &body, b"#195641", 1 << 5, &mut out);
         assert_eq!(k, 0, "a slot with nothing resting selects nothing");
+    }
+
+    /// **S16-4 — slot 11's sweep is slot 11's, never BIN15's slot 3's.**
+    /// A `u8` mask's `1 << 11` would alias onto slot 3 in a release build
+    /// (`overflow-checks = false`); the `SlotMask` names each of sixteen
+    /// slots. A slot byte past the slot space (16, 0xFF) is not ours.
+    #[test]
+    fn a_slot_11_sweep_selects_slot_11_alone_and_never_slot_3() {
+        let hex = |slot: u8, oid: u64| {
+            let c = crate::cloid::encode(slot, oid);
+            let mut h = [0u8; 34];
+            let n = crate::cloid::to_hex(&c, &mut h);
+            String::from_utf8(h[..n].to_vec()).expect("ascii")
+        };
+        let (three, eleven, fifteen) = (hex(3, 0x65), hex(11, 0x66), hex(15, 0x67));
+        // Slot byte 16 and 0xFF under our magic: written by someone else.
+        let sixteen = "0x4d561000000000000000000000000068";
+        let ff = "0x4d56ff00000000000000000000000069";
+        let body = format!(
+            r##"[
+              {{"coin":"#195641","oid":11,"cloid":"{three}"}},
+              {{"coin":"#195641","oid":12,"cloid":"{eleven}"}},
+              {{"coin":"#195641","oid":13,"cloid":"{fifteen}"}},
+              {{"coin":"#195641","oid":14,"cloid":"{sixteen}"}},
+              {{"coin":"#195641","oid":15,"cloid":"{ff}"}}
+            ]"##
+        )
+        .into_bytes();
+        let mut rows = [OpenOrder::default(); MAX_OPEN_ORDERS];
+        let n = scan_open_orders(&body, &mut rows).expect("scans");
+        assert_eq!(n, 5);
+        let mut out = [0u64; MAX_OPEN_ORDERS];
+        let bit = |s: u8| (1 as SlotMask) << s;
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", bit(11), &mut out);
+        assert_eq!(&out[..k], &[12], "slot 11's, and not slot 3's");
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", bit(3), &mut out);
+        assert_eq!(&out[..k], &[11], "slot 3's, and not slot 11's");
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", bit(15), &mut out);
+        assert_eq!(&out[..k], &[13]);
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", ALL_SLOTS, &mut out);
+        assert_eq!(
+            &out[..k],
+            &[11, 12, 13],
+            "slot bytes 16 and 0xFF are not ours"
+        );
+        assert_eq!(
+            crate::cloid::decode(&crate::cloid::from_hex(sixteen.as_bytes()).expect("hex")),
+            crate::cloid::Owner::Foreign
+        );
     }
 
     #[test]

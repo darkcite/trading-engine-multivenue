@@ -30,8 +30,9 @@
 
 use crate::inst::PRODUCTS;
 
-/// The slot count (`EXEC_SLOTS`).
-pub const SLOTS: usize = 8;
+/// The slot count: the router's `EXEC_SLOTS` (16 since S16-4), so every
+/// per-slot array here and in the arm is indexed by any router slot.
+pub const SLOTS: usize = core_config::exec::EXEC_SLOTS;
 
 /// The ratio of an unbounded or unreadable account: always at risk.
 pub const RATIO_UNBOUNDED: i64 = i64::MAX;
@@ -173,5 +174,26 @@ mod tests {
         assert!(m.at_risk(2) && m.at_risk(5), "a margin call reaches every Binance slot");
         assert!(!m.at_risk(0), "a slot trading no Binance product is not the arm's");
         assert!(!m.at_risk(99), "an out-of-range slot never panics");
+    }
+
+    /// **S16-4 — the side table holds slot 15**, and slot 11's threshold
+    /// is its own, never BIN15's slot 3's.
+    #[test]
+    fn the_side_table_holds_slots_11_and_15() {
+        assert_eq!(SLOTS, 16);
+        let mut lim = [0i64; SLOTS];
+        lim[11] = 600_000;
+        lim[15] = 700_000;
+        let mut prod = [0u8; SLOTS];
+        prod[11] = 1 << PRODUCT_USDM;
+        prod[15] = 1 << PRODUCT_SPOT;
+        let mut m = MarginBook::new(lim, prod);
+        m.sample(PRODUCT_USDM, 650_000);
+        assert!(m.at_risk(11), "slot 11 trades usdm at 65 % > 60 %");
+        assert!(!m.at_risk(3), "slot 3 is not slot 11");
+        assert!(!m.at_risk(15), "slot 15 trades no usdm");
+        m.sample(PRODUCT_SPOT, 700_000);
+        assert!(m.at_risk(15));
+        assert!(!m.at_risk(16), "past the slots never panics");
     }
 }

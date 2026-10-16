@@ -40,6 +40,8 @@ pub struct JsonOverflow;
 /// Upper bound of a full-snapshot body (256 rows, 64 + 64 recents,
 /// every text field at capacity) — the server's response buffer must
 /// hold this plus its header budget; `tests/encode.rs` pins it.
+/// Schema 3 (S16-5, sixteen slot rows, gates and halt words at their
+/// widest) measures 143,064 B: ≈ 20 KiB under the bound.
 pub const STATE_JSON_MAX: usize = 160 * 1024;
 
 /// Profile names in `RegimeCounters` index order (only
@@ -47,7 +49,7 @@ pub const STATE_JSON_MAX: usize = 160 * 1024;
 const PROFILE_NAMES: [&str; 2] = ["fast", "slow"];
 
 /// Encode `s` as the `/state` JSON body into `dst`; `Ok(len)` or
-/// [`JsonOverflow`]. Zero-alloc; ≈ 100 KB for a full snapshot.
+/// [`JsonOverflow`]. Zero-alloc; ≈ 140 KB for a full snapshot (schema 3).
 pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, JsonOverflow> {
     let mut c = Cursor::new(dst);
     c.put(b"{\"v\":");
@@ -1721,9 +1723,11 @@ mod tests {
         let mut buf = vec![0u8; STATE_JSON_MAX];
         let n = encode_state_json(&s, &mut buf).unwrap();
         let body = core::str::from_utf8(&buf[..n]).unwrap();
-        assert!(body.starts_with("{\"v\":2,\"seq\":0,"), "{body}");
+        assert!(body.starts_with("{\"v\":3,\"seq\":0,"), "{body}");
         assert!(body.ends_with("\"fills\":[]}}"), "{body}");
         assert!(body.contains("\"slots\":[{\"slot\":0,\"name\":\"hyparb\""));
+        // S16-5 (schema 3): sixteen rows, the reserved last.
+        assert!(body.contains("{\"slot\":15,\"name\":\"reserved\","));
         assert!(body.contains("\"venue\":\"rpc\""));
         // MX2: MEXC is appended after rpc — the array order is the
         // `/state` contract, so it must render LAST.

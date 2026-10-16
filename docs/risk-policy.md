@@ -342,7 +342,8 @@ warning is deleted.
 
 **These caps are per SLOT, not global.** `max_open_orders = 64` on a slot
 is not the global "max total open orders 64" above — eight slots at 64 is
-512. The global line still binds, and E6 must enforce both.
+512 (sixteen slots, 1 024, since S16-3, 2026-10-15; see "S16"). The global
+line still binds, and E6 must enforce both.
 
 **`0` means UNSET, and unset is NEVER "unlimited"** — the same ruling this
 document already made for the Deribit coin caps. A live slot with a zero
@@ -401,8 +402,10 @@ through `boot_queued_live` on ONE switch, while the new path requires
 two. `--live` now `conflicts_with = "exec"`, so the two can never be
 combined, but the asymmetry is recorded here deliberately rather than
 left implicit: what keeps the legacy path unreachable in the managed
-fleet is `scripts/engine-wrapper.sh`'s strategy allow-list and its
-hard-coded `--paper`, not the flag's own design. Since HD3 the path posts
+fleet is `scripts/engine-wrapper.sh`'s strategy allow-list (from the S16
+deploy, `strategy-mask`'s parse: member names only, `all` refused; see
+"S16") and its hard-coded `--paper`, not the flag's own design. Since
+HD3 the path posts
 through `core_net::HttpsPost`. Polymarket is expected to refuse its orders
 (its documented `POST /order` contract, not tested against the venue —
 HD3, below); the wrapper remains the control.
@@ -2133,7 +2136,8 @@ success while the real quote stays resting at the venue, and nothing
 downstream can detect the difference. `StampCtx` stamps a cancel's
 `strategy_id` exactly as it stamps an order's, because an unstamped
 cancel would route by slot `0xFF & 7` — a member able to pull another
-member's quote.
+member's quote. (At sixteen slots `0xFF & 15` = 15, a reserved slot;
+S16-3, 2026-10-15.)
 
 #### The capture gap — opened by commit 3, CLOSED by commit 4a (2026-09-19)
 
@@ -4027,8 +4031,9 @@ were complete.
 
 #### The shared table can no longer switch the clamp off
 
-`max_open_orders` is counted out of one 512-row array shared by every
-live slot. When that array filled, the first cut bumped
+`max_open_orders` is counted out of one 512-row array (1 024 since S16-3,
+2026-10-15; see "S16") shared by every live slot. When that array
+filled, the first cut bumped
 `resting_full` and returned **without incrementing the slot's
 count** — so the count froze and every later order passed. A clamp
 switched off by the table it depends on, failing open, for the rest
@@ -4088,7 +4093,8 @@ venue byte in the key so a second venue's family table cannot evict
 the first's) and
 `LEDGER_RESTING = 512` (`EXEC_SLOTS × max_open_orders` at the shipped
 64 — sized TO the clamp, so filling up is not reachable while the
-clamp is doing its job). Past either, the request is refused into
+clamp is doing its job; 1 024 = 16 × 64 since S16-3, 2026-10-15, see
+"S16"). Past either, the request is refused into
 `binds_refused` / `resting_full` rather than overwriting a live row.
 An overwritten binding books a real position against the wrong
 outcome; if `resting_full` is ever non-zero, either the clamps are
@@ -4436,7 +4442,8 @@ orders was truncated for about `N / 256` calls. After it, progress is
 eight tries every time. **Past N > 312 the entry is abandoned with the
 remainder reported as `sweep_left`**, and commit 2's boot rule allows
 64 open orders on each of 8 slots, so a 512-order leg is a valid
-configuration. Truncation now defers: still never `Done`, because we
+configuration (16 slots and a 1 024-order leg since S16; re-derived under
+"S16"). Truncation now defers: still never `Done`, because we
 could not see the end of the selection, but continued rather than
 counted against.
 
@@ -4455,7 +4462,8 @@ reveal progress while the leg exceeds the buffer — a 312-order leg
 reports 256 selected on each of its first seven calls while eight
 orders really are being cancelled each time. So it is a total count,
 sized at 256: four times the 64 deferrals the largest valid
-configuration can need, and still terminating a genuinely stuck entry
+configuration can need (twice the 128 at sixteen slots since S16; see
+"S16"), and still terminating a genuinely stuck entry
 inside about half a second of idle moments. `sweep_stalled` counts it.
 
 A PAPER boot reaches the same call and gets the trait's default: a
@@ -4881,7 +4889,8 @@ The writer uses a fixed 64-byte buffer and no `format!` — it runs on
 the engine thread — and renders two digits rather than one. With
 `EXEC_SLOTS == 8` one digit is correct today and would silently
 mod-10 wrap the moment the table grew, in the one file an operator
-reads after an incident.
+reads after an incident. (It grew: `EXEC_SLOTS` is 16 since S16-3,
+2026-10-15, and the two digits render slots 10–15.)
 
 #### `--halt-slot`, the operator's switch
 
@@ -5135,7 +5144,8 @@ refusal, because a refusal at least prints something.
   a directory, a device, a socket, a FIFO, and a symlink to any of
   them, since `metadata` follows;
 * refuse anything larger than a file we would have written
-  (`HALT_FILE_MAX`, 512 B);
+  (`HALT_FILE_MAX`, 512 B; 640 B since S16-3, 2026-10-15 — 128 + 16 × 31
+  = 624, old files parse; see "S16");
 * open with **`O_NONBLOCK`**, so even a FIFO swapped in between the
   `stat` and the `open` returns instead of hanging;
 * read into the caller's fixed buffer — **zero allocation**, since
@@ -6545,8 +6555,9 @@ of the API key owner", where this dispatcher puts the maker address. Its
 CLOB V2 migration page says V1-signed orders "are no longer supported on
 production" since 2026-04-28, and this signer is V1 (domain version
 `"1"`, the `taker` / `nonce` / `feeRateBps` struct). What keeps the path
-out of the managed fleet is unchanged: the wrapper's allow-list and its
-hard-coded `--paper`.
+out of the managed fleet is unchanged: the wrapper's allow-list (from the
+S16 deploy, `strategy-mask`'s parse: member names only, `all` refused; see
+"S16") and its hard-coded `--paper`.
 
 ### HD2: `HlHttp` moved onto `HttpsPost` — the HL order path (2026-10-05)
 
@@ -13760,7 +13771,9 @@ The first part of XH5e (plan §3.5; A-S7-37). Nothing is armed and no file in
   recipe live (top-ups 10 000 / 100 000, the −$50 bound, reads stale after
   180 s). Tests pin both to their templates.
 - **`bin15+xmm`** joins the bootable names (mask 72): the testnet
-  engine-instance check's set. The wrapper's allow-list does not carry it.
+  engine-instance check's set. The wrapper's allow-list does not carry it
+  (from the S16 deploy the wrapper resolves any `+`-joined set of member
+  names through `strategy-mask`, so launchd can boot it; see "S16").
 - **Copies:** the plan's move out of its `Result` at boot, noted; the key
   moves as its box, never its bytes. None on a hot path; nothing runs after
   boot, so no alloc gate is new.
@@ -14725,7 +14738,8 @@ The arm's laws, which bind the verbs now and the engine later:
 ## HYPERCALL — slot 7, the S1 member (HC11, rulings O-HC18..O-HC23, 2026-09-26): DARK, paper only
 
 `crates/strategy-hcv` (`HcvStrategy`) is slot 7 of the set. Its names are
-`hcv`, `ai+hcv` and `ai+vrp+xsd+bin15+hyparb+xmm+hcv`; `all` (`BUILT_MASK`
+`hcv`, `ai+hcv` and `ai+vrp+xsd+bin15+hyparb+xmm+hcv` (since S16-1c,
+2026-10-15, any `+`-joined set naming it; see "S16"); `all` (`BUILT_MASK`
 = 255) composes it too, inert without its artifact.
 
 **DARK (O-HC18).** Paper only and in no configured mask: `strategy.conf` is
@@ -16337,3 +16351,326 @@ Gates at `9f5bc8c`: clippy clean; nextest 4 693 passed (10 skipped); alloc
   this is the old rate is unknown (no counter history). `RAW_TAP=pm,hl`
   (rejects only) at a boot would name them.
 
+## S16 — sixteen strategy slots (2026-10-15)
+
+**Ask (Anton):** "proceed with the 16 slots implementation". **Plan:** project
+doc `claude/s16-plan-2026-10-15.md` (inventory:
+`claude/slots-16-analysis-2026-10-15.md`). **Commits:** `f20fb1a` S16-1a,
+`8dbc689` S16-1b, `afdc431` S16-1c, `d911044` S16-2, `61d42c6` S16-3,
+`e8ae9cd` S16-4, `5b56e71` S16-5; S16-6 the wrapper patch and these docs.
+**Deployed 2026-10-15 22:32Z** (`5b56e71`; below).
+
+| id | ruling (operator, 2026-10-15) |
+|---|---|
+| S16-R1 | **16 slots, not 32.** 16 is the ceiling of three structures: the Binance cid carries the slot in one hex digit; the router's per-submit lookup (`modes[16]` + `venue_mask[16]` = 48 B) fits cache line 0 of `ExecRoute`; the halt latch `HaltState` stays one 64-B line. |
+| S16-R2 | **`LEDGER_RESTING` 512 → 1 024**: 64 open orders per slot × 16. The sweep-deferral argument is re-derived below. |
+| S16-R3 | **One declarative member table** in strategy-set, and one `+`-joined `STRATEGY` parser over it in place of the whole-string allow-lists. Overlapping or repeated segments (`ai+vm`, `vrp+vrp`) are ACCEPTED as the union. launchd may boot ANY combination of named members; `all` is refused at the wrapper. |
+| S16-R4 | One commit per cut on `main`, prefix `S16:`; release build and restart at a quiet point; push at the end. |
+| S16-R5 | **Slots 8–15 are RESERVED**: no member, `BUILT_MASK` stays 0x00FF. Adding a member there needs its own ruling. |
+| S16-R6 | The `/state` snapshot schema 2 → 3 (S16-5): per-slot arrays grow to 16, index paths unchanged, the dashboard reads both. |
+
+### The hazard: a shift that lands on BIN15
+
+- **Release builds do not check shifts.** `Cargo.toml:261` sets
+  `overflow-checks = false` for release, so `1u8 << slot` at slot ≥ 8 does
+  not panic: the shift amount is masked to three bits and the bit lands on
+  slot `s & 7`. **Slot 11 aliases onto slot 3 — BIN15, the live-capable
+  member.** Shown, not argued: in S16-2 a release build with the old shift,
+  told to "disable slot 8", switched off slot 0. Every mask in the tree was a
+  `u8`, so widening the slot count without widening every mask turns a
+  request about a reserved slot into an action on a real one, silently.
+- **The cure is one type and one constant.** `core_types::MAX_STRATEGY_SLOTS
+  = 16` (`core-types/src/lib.rs:2527`) and `pub type SlotMask = u16`
+  (`:2537`), asserted to hold every slot. Every other slot bound is DERIVED,
+  not restated: `EXEC_SLOTS` (`exec-router/src/route.rs:52`; a power of two
+  and ≤ 0xFE, both const-asserted), `EXEC_COUNTER_SLOTS`, `SNAPSHOT_SLOTS`
+  (S16-5), Binance `margin::SLOTS` and `cid::CID_SLOT_MAX` (S16-4). The
+  shifts that remain are `(1 as SlotMask) << slot`, bounded by the constant.
+- **The guard is the debug tests at slots 8, 11 and 15 on every mask path**
+  — enable refused and counted, disable, fills and order events unrouted,
+  labels / gates / timers / counters, a gate edge at slot 11 reaching no
+  member, the AI shape; and (S16-3) arm, halt, mask and out-of-range on
+  every `exec_boot` reader, the Binance and HL arm predicates and the routed
+  halt. A debug build panics on the over-wide shift, so a regression to
+  `1u8 << slot` fails them (break-and-watch on five sites). A live mask with
+  bits 11|15 is pinned never to read as slot 3 or 7.
+
+### S16-R5 and the rollback door
+
+- **Arming an unbuilt slot is refused at boot, before the interlock
+  compare, naming the slots** — an exec artifact whose `live_mask` names
+  8–15, or `--arm-live 11`. `--arm-live` / `--halt-slot` take 0–15 (16, 255
+  and duplicates refused). `SLOT_NAMES` (`cli/src/exec_boot.rs:195`) is
+  built from `strategy_set::MEMBERS`, "reserved" for 8–15. An AI `Enable`
+  of 8–15 passes the frame's shape check and is refused and counted by the
+  set.
+- **The rollback door.** An older 8-slot binary decodes a live order from a
+  slot ≥ 8 as Foreign: on Hyperliquid it is never booked and recon reports
+  it; on Binance the BX-8 drift check halts the shared account. **Rolling
+  the binary back is safe only while no live order from a slot ≥ 8
+  exists.** Today none can (no member sits there); the first member at 8–15
+  closes the door, which is one reason it needs its own ruling.
+- A binary rollback also needs the wrapper rolled back (S16-1, below).
+
+### Formats: no version bump
+
+`strategy_id` is a full `u8` in every wire and on-disk record — `Order` @41,
+`Fill` @13, `OrderEvent` @29, `AiCmd` @42, `ExecRecord.slot` @63 — so sixteen
+slots need **no PMLR version bump, and old captures replay byte-identically**.
+`0xFF` (`STRATEGY_ID_NONE`) stays unattributed and out of range.
+
+### S16-1 — the member table and one STRATEGY parser (`strategy-set`, `cli`), 2026-10-15
+
+- **S16-1a** (`f20fb1a`) benched the set's fan-out BEFORE the refactor:
+  `strategy_set/{on_tick_all, on_tick_none, on_fill_routed, on_timer_all}`
+  (`hot_path.rs` section 13) = 4.63 / 2.26 / 1.75 / 2.26 ns, median of 3.
+  `on_timer_all` is bimodal run to run (2.26 / 2.51 ns, inside the 15 % gate).
+- **S16-1b** (`8dbc689`, behaviour-identical): the eight members' 27 fan-out
+  sites come from `member_table!` (one row per member, in slot order;
+  `strategy-set/src/lib.rs:412`) through `member_gen!` (`:233`).
+  `pub const MEMBERS: &[Member]` (slot, bit, name, regime key) is the table as
+  data; a const block asserts the slots strictly increase, stay below
+  `MAX_STRATEGY_SLOTS`, and `bit == 1 << slot`. Static dispatch, no
+  allocation. **The expanded bodies are byte-identical; a 4 000-step
+  all-member digest is identical before and after in three scenarios;**
+  `on_tick_all` 4.6277 → 4.6279 ns.
+- **S16-1c** (`afdc431`): `strategy_set::parse_strategy` (`lib.rs:509`) —
+  `all` alone → `BUILT_MASK`; else `+`-joined member names or `ai` (= ai-exec
+  | vm), any order, OR'd, overlaps the union. Refused: the empty string, an
+  empty segment, an unknown name (case-sensitive, untrimmed), `all` beside
+  anything. The old `MASK_TABLE`'s 24 strings are the test oracle (same
+  masks); every mask 1..=255 round-trips. The engine parses once.
+  `multivenue-engine strategy-mask <STRATEGY>` prints `<mask>\t<members>`
+  (slot order) and exits 0, else stderr and exit 78; it runs before
+  tracing / `.env` / discovery and has no help flag, so `-h` / `--help`
+  reach the parser and get 78 (review F1).
+- **The wrapper patch is NOT in S16-1c**: `scripts/engine-wrapper.sh` runs
+  from the working tree, and the running binary has no `strategy-mask`. It
+  shipped with the deploy (S16-6): the wrapper refuses `STRATEGY=all` (exit
+  78) and resolves the string through `strategy-mask`, replacing its
+  whole-string allow-list; its `*hyparb*` / `*xmm*` / `*hcv*` substring tests
+  become `*+hyparb+*` / `*+xmm+*` / `*+hcv+*` against the resolved member
+  list. An older release binary has no subcommand, and the patched wrapper
+  refuses with "rebuild it". **Order: build release → check `strategy-mask`
+  → apply the wrapper patch → restart. A binary rollback needs the wrapper
+  rolled back too.**
+
+### S16-2 — one slot type through the strategy set (`core-types`, `strategy-set`, `engine`), 2026-10-15
+
+- `BIT_*`, `BUILT_MASK` (0x00FF), `enabled` / `initial`, `AI_MASK`,
+  `parse_strategy`, `MaskNames` and `Member.bit` are `SlotMask`; per-slot
+  timers, regime labels and gates are sized by `MAX_STRATEGY_SLOTS`;
+  strategy-core `RegimeCounters.gates` is `[u8; 16]`. The AI shape checks
+  (Enable / Disable / SetParam) admit 8..=15; the set refuses an unbuilt slot
+  and counts it.
+- **16 regime-gate gauges**: `engine_strategy_regime_gate_8..15` are new and
+  **read 0 today** (worst-case registry 595 / 468 of 640 / 512). The
+  snapshot's mask read saturates instead of narrowing silently. engine-snapshot
+  BootInfo requested / configured and the enabled masks are `SlotMask` in
+  their old padding (448 B and 31 872 B, offsets pinned, JSON values
+  unchanged); the per-slot rows stayed 8 until S16-5.
+- The exec router, config and venue arms kept 8-slot `u8` masks through
+  S16-2; no AI path reaches them with a slot ≥ 8 (reviewed).
+- **Bench:** `strategy_set/on_tick_none` re-baselined 2.26 → 2.51 ns — LLVM's
+  block layout of the inlined `on_tick`, not the u16 test (arrays back at 8
+  measure the same). `on_tick_all`, the production path, unchanged.
+
+### S16-3 — exec router, config and boot (`exec-router`, `core-config`, `clob-dispatcher`, `cli`), 2026-10-15
+
+- **ExecRoute 832 → 1 664 B.** `modes[16]` @0 and `venue_mask[16]` @16 stay
+  in line 0: a paper submit still touches one line, a live one line 0 + ≤ 4
+  clamp lines, as at 8. `mode` / `venue_allowed` index with
+  `& (EXEC_SLOTS − 1)` and zero an out-of-range id by multiplication
+  (`route.rs:477`, `:498`): `0xFF` and `0xFE` (`split::NO_SLOT`) index 15 and
+  14 and still resolve Paper / not allowed.
+- **Halt.** `HALT_FILE_MAX` 512 → 640 (`halt.rs:190`; 128 + 16 × 31 = 624).
+  **Old 8-slot halt files parse unchanged**; `HaltState` is still one 64-B
+  line. `apply_halt_mask` (`exec_boot.rs:505`) makes the old loop's latch
+  decisions.
+- **Counters.** RouteCounters 448 B; clob-dispatcher ExecCounters 1 080 B.
+  **Unstamped refusals now land in the reserved slots' buckets**: `0xFF` in
+  `refused_by_slot[15]`, `0xFE` in `[14]` (`counters.rs` `& 15`); at eight
+  slots they landed in `[7]` and `[6]`. **Do not read buckets 14 and 15 as a
+  member's number** (before S16-3, `[7]` mixed them into hcv's).
+- **Ledger.** `LEDGER_RESTING` 512 → 1 024 (`ledger.rs:118`, const-asserted
+  `LEDGER_RESTING / EXEC_SLOTS == 64`; core-config's mirror
+  `exec.rs:423`, still const-asserted equal in `cli::exec_boot`), so the boot
+  rule "a live slot's `max_open_orders` ≤ its equal share" still reads 64.
+  `seeded` / `unmarked` are `SlotMask`; instrument rows 192 → 320 B; Ledger
+  82 368 → 146 048 B. `INST_EXPOSURE_MAX` `i64::MAX / 512` → `/ 1024`
+  (`ledger.rs:172`): a clamp only, ~$9 bn an instrument, so 1 024 rows at
+  the clamp still sum inside i64 — the boundary test sums them exactly, no
+  saturation.
+- **The ledger high-water mark** (review). **The 1 024-row table had doubled
+  every live fill / cancel / modify lookup** — scratch A/B on an M4 Pro,
+  ~150 → ~280 ns warm p50 — because each occupancy scan walked the whole
+  table. `resting_hi` (a u16 in existing padding, size unchanged) bounds
+  every occupancy scan (locate, `working_on`, the asked-oid pass,
+  `clear_resting_slot`, `drop_resting_on`) to the live prefix. Only
+  `occupy` / `release` move it — the two places a row's liveness changes;
+  debug builds check the invariant on every occupy / release / locate; a
+  200 000-op randomized walk over slots 0..16 matches a full-table reference
+  on every lookup, count and notional. **With 8 rows resting a lookup is ~3
+  ns on a miss, ~7 ns on a hit**: new bench samples `ledger/locate_miss` 3.03
+  ns, `ledger/locate_hit` 6.78 ns; the 20 existing samples within tolerance.
+- **Boot.** core-config `live_mask` is a `SlotMask`. `exec_boot::slot_in(mask,
+  slot)` (`exec_boot.rs:212`) is the one range-checked mask test (11
+  readers). Compile-time guards refuse a built slot past the HL arm's
+  `HL_SLOTS` (8) or Binance's `CID_SLOT_MAX` (7) until S16-4 widens them —
+  otherwise a halt of a slot ≥ 8 would reach HL as a `cancel_all`.
+- **The HL stop-gap until S16-4.** `cloid::HL_SLOTS = 8`
+  (`exec-hyperliquid/src/cloid.rs:65`) bounds strand / `cancel_slot` / recon
+  (slots ≥ 8 decode Foreign); the gateway's `1u8 << (slot & 7)` carries a
+  `debug_assert` and an S16-4 marker; the S16-4 site list is in `cloid.rs`.
+  BIN15's cloid bytes unchanged.
+- Reviews: S16-1b risk / alloc SHIP; S16-1c risk SHIP (F1 applied); S16-2
+  risk / alloc SHIP; S16-3 risk / alloc SHIP WITH FIXES, applied. Gates on
+  every cut: clippy clean, nextest workspace, alloc, copy-audit new 0,
+  license, bench-check.
+
+### S16-4 — the venue arms (`e8ae9cd`), 2026-10-15
+
+- **Hyperliquid:** the S16-3 stop-gap `cloid::HL_SLOTS` is gone; `decode`
+  accepts a slot byte below `EXEC_SLOTS` (16 and up, and `0xFF`, still read
+  Foreign); `encode` gains a `debug_assert` (its `& 15` is unreachable past
+  15: the router sends a slot ≥ 16 to Paper / NoLiveRoute and the gateway's
+  `admit` refuses first). recon `ALL_SLOTS` = `SlotMask::MAX`,
+  `ours_on_leg(slots: SlotMask)`. `PendingSweep.slots` is a `SlotMask` in the
+  old padding (u16 @28, still 36 B; `[PendingSweep; 16]` = 576 B, pinned).
+  **A halt of slot s cancels only slot s's orders** (`cancel_slot` /
+  `cancel_slot_state`; the stop-gap's venue-wide cancel for 8–15 is gone; a
+  slot ≥ 16 keeps the venue-wide verb — unreachable, over-cancel never
+  under). The gateway's `GatewayCfg.slots` / `HlGateway.slots` are
+  `SlotMask`; `production()` builds its mask with
+  `checked_shl(..).unwrap_or(0)` (a slot past the width owns nothing: fail
+  closed); `owns_slot` bounds before it shifts and replaces the `>= 8`
+  refusals in `admit` and `sweep_cancel_ours`; the arm refuses
+  `cfg.slot >= EXEC_SLOTS`. The mask never crosses a process: the
+  engine–gateway duplex is an in-process SPSC ring, and `HlCmd` /
+  `ExecEvent` carry `slot: u8`.
+- **Binance:** `cid::CID_SLOT_MAX` = `EXEC_SLOTS − 1` = 15, asserted to fit
+  the cid's one hex digit (the S16-R1 ceiling); `margin::SLOTS` =
+  `EXEC_SLOTS` (`MarginBook`'s arrays and the arm's `day_bought_1e6` 16 wide,
+  boot-allocated). `venue_day_bought(8..15)` answers `(day, 0)` where it
+  answered `None`; no route reads it.
+- **A slot byte 8–15 that read Foreign now reads as that slot, and takes
+  exactly the path an off-owner slot 0–7 id takes.** Hyperliquid: on a
+  gateway arm an off-slot fill counts `fills_foreign` and books nothing, a
+  listed order marks the account shared, `admit` refuses it; the blocking
+  arm books such a fill to that slot's reconciler sheet, as it books slot
+  5's; the boot / shutdown sweep cancels MV cloids as before (HL cloids
+  carry no epoch). Binance (BX-9): a this-epoch off-owner id is a ghost and
+  an other-epoch id an **Orphan**, as for slot 5 — cancelled by venue order
+  id (never `allOpenOrders`), or the boot refused `SpotStray` / `OptStray`
+  on spot / options, and an orphan's fill is booked to the owner slot
+  (`TRADE_BY_ORPHAN`); before, 8–15 counted toward BX-8 drift (a halt on a
+  shared account). Nothing in this engine emits 8–15 while S16-R5 holds:
+  the exposure is a second engine process on the account, or a rollback
+  from a build that ran a member there.
+- **Byte identity:** BIN15's cloid (prefix `0x4d5603`) and the Binance cids
+  of slots 0–7 are unchanged — golden tests pinned from the pre-cut
+  encoders — so orders resting from before the deploy reconcile as our own.
+  No persisted file has a per-slot layout (journal records carry their own
+  `slot` field; anchor, budget and top-up files are per account; day-bought
+  is read back from the venue), so a rollback either way reads what the
+  other wrote.
+- **The S16-3 compile-time guards in `exec_boot` are removed** (both arms
+  now carry `EXEC_SLOTS`); the runtime S16-R5 refusal stands.
+- Tests: cloid / cid round trips 0–15 and goldens; the recon, exchange and
+  gateway sweeps of slot 11 never touch slot 3 (nor the `& 7` alias of a
+  fixture's own slot); a 16 × 16 gateway ownership matrix; the arm takes
+  8 / 11 / 15 and refuses 16+; a slot 8–15 event on a gateway arm is another
+  slot's, as slot 5's; `userws` routes 11 / 15 to themselves; Binance
+  off-owner and orphan ids at 5 / 10 / 11 / 15 on spot and USDⓈ-M. Gates:
+  nextest 4 735 (workspace) + the review's 886 (exec-hyperliquid +
+  exec-binance), alloc 127, copy-audit new 0. Review: risk SHIP WITH FIXES
+  (the orphan half of the claim, the slot-11 path tests, the encode assert),
+  applied.
+
+### The sweep-deferral argument at 1 024 orders (Hyperliquid; in force since S16-4)
+
+E6 ("The invariant deferral rests on", above) sized `SWEEP_MAX_DEFERS` at
+256 as four times the deferrals the largest valid configuration could need:
+64 open orders on each of 8 slots, a 512-order leg. Re-derived at sixteen:
+
+- **The largest valid leg is 16 × 64 = 1 024 of our orders.** At
+  `SWEEP_CANCELS_PER_IDLE` = 8 (`exec-hyperliquid/src/exchange.rs:490`) it
+  takes 1 024 / 8 = **128 calls, 127 of them deferred** (the last completes).
+- The selection is truncated at `MAX_OPEN_ORDERS` = 256 (`recon.rs:466`) for
+  the first (1 024 − 256) / 8 = **96 calls** — deferrals, not retries, since
+  E6.
+- **`SWEEP_MAX_DEFERS` = 256 (`exchange.rs:526`) is unchanged: the margin is
+  now 2× (it was 4× at 512).** A genuinely stuck entry still trips the guard
+  after ~256 idle moments, ~0.5 s at the 2 ms cadence; `sweep_stalled` counts
+  it.
+- `a_leg_larger_than_one_buffer_is_not_abandoned` (`exchange.rs:4504`)
+  already sweeps a 1 024-order leg.
+- Today the bound is not reachable: with 8–15 reserved no more than 8 × 64 =
+  512 can be live. **Raising `max_open_orders` past 64, or the slot count past
+  16, re-opens this argument** — `SWEEP_MAX_DEFERS` would be sized first.
+
+### S16-5 — surfaces (`5b56e71`), 2026-10-15
+
+- **`/state` schema 3** (S16-R6): `SNAPSHOT_SCHEMA` 3, `SNAPSHOT_SLOTS` =
+  `MAX_STRATEGY_SLOTS`, `SLOT_NAMES` 16 (8–15 `"reserved"`, the exec_boot
+  word). The name table stays a copy — depending on strategy-set would pull
+  every member into engine-snapshot and the tui — so the exec_boot parity
+  test, now over all 16 and derived from `BUILT_MASK`, is the guard.
+  `EngineSnapshot` 31 872 → **32 064 B** (704 B under 32 KiB, re-pinned). The
+  JSON writer already looped to `SNAPSHOT_SLOTS`: 16 slot rows, gates and
+  `exec.halted` words, zero-alloc. Worst case **143 064 B** against
+  `STATE_JSON_MAX` 160 KiB, and a test now keeps 16 KiB of that as headroom;
+  an oversized body is refused (`JsonOverflow`, HTTP 500), never cut. Index
+  paths are unchanged (`exec.halted.3` is still slot 3).
+- paper: the `/state` halt copy is all 16 (`ex.halted = ec.halted`: a length
+  mismatch is a type error).
+- `audit_pnl` labels come from `exec_boot::SLOT_NAMES` (the member table):
+  8–15 `reserved`, 16+ `unknown`, `0xFF` `unattributed`.
+- tui: 16 rows; a reserved slot shows only when something is set on it
+  (requested / configured / enabled bit, gate, halt, orders).
+- dashboard: 16 names (slot 7 had read a stale `reserved`: it is hcv) and 16
+  colours (0–7 unchanged); every per-slot array is walked by its own length,
+  so schema 2 (the pre-deploy engine) and 3 both render; idle reserved rows
+  fold into one line; a reserved slot reads `<n>:reserved`, 255
+  `unattributed`.
+- worker `news/cascade.py`: the accepted slot range stays the BUILT members
+  0–7 (`SLOT_BUILT_MAX`; a command to 8–15 could only be refused); the prompt
+  says 8–15 are reserved.
+- `bin15-flip.sh` / `xmm-flip.sh`: `arm_with` looped `i < 8` and would have
+  dropped an armed slot 8–15 — now 16. **`arm_ok` still accepts only the
+  built slots 0–7** (review): the engine refuses to arm 8–15 at boot, but
+  only AFTER the flip has restarted it — a launchd relaunch loop — so the
+  script refuses first, naming 8–15 reserved.
+- Gates: nextest 4 741, alloc 127, copy-audit new 0, worker suite 1 791.
+  Review: SHIP WITH FIXES (the flip scripts, the dashboard's names and idle
+  rule, the JSON headroom test), applied.
+- Not in S16: `claude_worker/regime.py` accepts only `/state` `"v": 1`, so
+  its RG7 engine sample has been off since schema 2 (the operator's call).
+
+### The S16 deploy (2026-10-15)
+
+`cargo build --release -p cli` at `5b56e71` (1 m 41 s); `exec-smoke
+--offline` PASS (39 rows, 9 encoders); on the new binary
+`multivenue-engine strategy-mask ai+vrp+xsd+bin15+hyparb+xmm+hcv` →
+`255\thyparb+vrp+xsd+bin15+ai-exec+vm+xmm+hcv`. The wrapper patch was then
+applied to the working tree and its STRATEGY block run against the release
+binary: the production string → 255, `ai` → 48, `bin15+xmm` → 72, `ai+vm`
+→ 48, `vrp+vrp` → 2; `all`, `nope`, `-h`, `--help` and the empty string →
+exit 78. `pkill -TERM` at 22:31:05Z (one minute past the :30 settlement);
+launchd relaunched through the patched wrapper, which logged `STRATEGY=…
+— mask 255, members +hyparb+vrp+xsd+bin15+ai-exec+vm+xmm+hcv+`; booted
+22:32:27Z.
+
+Verified on `/state` and `/metrics`: `boot.git_sha` `5b56e71258a8`, `"v": 3`,
+paper, halted 0; 16 slot rows (0–7 the members, enabled; 8–15 `reserved`,
+off); enable mask 255; 16 gates, 16 `exec.halted` words (all `none`); the 16
+gauges `engine_strategy_regime_gate_0..15` (0); the nine feeds up (delays
+4–58 ms), `seq_regressions` 0 everywhere; `engine_vm_rows_active` 2. The
+boot tell `slots=16` prints with an exec artifact only (`exec: artifact
+configured … slots=`), and none is configured today, so `/state` is the
+check. Then `git push origin main` (S16-R4).
+
+### Open after S16 (rulings)
+
+- **A member at slots 8–15** (S16-R5): its own ruling. Its first live order
+  closes the rollback door above.

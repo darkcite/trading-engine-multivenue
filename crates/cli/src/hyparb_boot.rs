@@ -78,7 +78,7 @@ pub struct HyparbBoot {
 
 /// Whether the operator asked for the member.
 #[must_use]
-pub fn hyparb_wanted(requested: u8) -> bool {
+pub fn hyparb_wanted(requested: core_types::SlotMask) -> bool {
     requested & strategy_set::BIT_HYPARB != 0
 }
 

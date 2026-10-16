@@ -56,7 +56,7 @@ pub struct XmmBoot {
 
 /// Whether the operator asked for the member.
 #[must_use]
-pub fn xmm_wanted(requested: u8) -> bool {
+pub fn xmm_wanted(requested: core_types::SlotMask) -> bool {
     requested & strategy_set::BIT_XMM != 0
 }
 

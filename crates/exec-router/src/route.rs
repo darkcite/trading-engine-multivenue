@@ -29,23 +29,27 @@
 //!
 //! ## Layout
 //!
-//! `#[repr(C, align(64))]`, 832 bytes = thirteen cache lines, with
-//! **both hot arrays in the first 16 bytes** so the per-submit lookup
-//! touches one line and never pointer-chases; the E6 clamps sit on
-//! lines 2–4, the halt thresholds on lines 5–11 and XH4e's perp limits
-//! on lines 12–13, none of which a paper submit ever reads. (512 B until
+//! `#[repr(C, align(64))]`, 1 664 bytes = twenty-six cache lines, with
+//! **both hot arrays in the first 48 bytes** (`modes` 16 B at 0,
+//! `venue_mask` 32 B at 16) so the per-submit lookup touches one line
+//! and never pointer-chases; the E6 clamps fill the rest of lines 0–7,
+//! the halt thresholds sit on lines 8–21 and XH4e's perp limits on
+//! lines 22–25, none of which a paper submit ever reads. (512 B until
 //! E7's session bound grew `HaltLimits` 32 → 48 B, 640 B until XH4d's
-//! ALO threshold grew it to 56 B, 704 B until XH4e's `PerpLimits`; the
-//! halt table is read on the halt poll and the perp limits on a live
-//! order only, so the extra lines cost nothing hot.)
+//! ALO threshold grew it to 56 B, 704 B until XH4e's `PerpLimits`, 832 B
+//! at eight slots until S16-3 doubled every array; the halt table is
+//! read on the halt poll and the perp limits on a live order only, so
+//! the extra lines cost nothing hot.) Sixteen slots is the most the
+//! one-line lookup holds: 16 + 2 × 16 = 48 B, and 32 slots would be 96.
 
 use crate::mode::ExecMode;
+use core_types::SlotMask;
 
-/// Strategy slots the table covers. Matches `strategy_set`'s slot
-/// count (0 hyparb · 1 vrp · 2 xsd · 3 bin15 · 4 ai-exec ·
-/// 5 vm · 6 xmm · 7 reserved) and is a power of two so the
-/// range mask is a single `&`.
-pub const EXEC_SLOTS: usize = 8;
+/// Strategy slots the table covers: `core_types::MAX_STRATEGY_SLOTS`
+/// (16 since S16-3; 0 hyparb · 1 vrp · 2 xsd · 3 bin15 · 4 ai-exec ·
+/// 5 vm · 6 xmm · 7 hcv · 8–15 reserved), derived rather than restated,
+/// and a power of two so the range mask is a single `&`.
+pub const EXEC_SLOTS: usize = core_types::MAX_STRATEGY_SLOTS as usize;
 
 /// Every hot-path bounds argument in this module — and in
 /// [`crate::counters`] — rests on `EXEC_SLOTS` being a power of two,
@@ -55,6 +59,12 @@ pub const EXEC_SLOTS: usize = 8;
 /// that a later edit could delete.
 const _: () = assert!(EXEC_SLOTS.is_power_of_two());
 const _: () = assert!(EXEC_SLOTS <= u8::MAX as usize + 1);
+// The live and off masks are `SlotMask`s: one bit per slot.
+const _: () = assert!(EXEC_SLOTS <= core_types::SlotMask::BITS as usize);
+// `split::NO_SLOT` (0xFE) and `STRATEGY_ID_NONE` (0xFF) must stay out
+// of range: the `in_range` multiply in `mode`/`venue_allowed` is what
+// keeps `0xFF & (EXEC_SLOTS - 1)` (= 15) from reading slot 15's mode.
+const _: () = assert!(EXEC_SLOTS <= 0xFE);
 
 /// Venues a `venue_mask` word can express. `core_types::VenueId` is
 /// 0..=8 since HYPARB (O-H11: … · Bybit · Mexc · HyperEvm), which
@@ -285,8 +295,8 @@ impl HaltLimits {
 /// instrument row (never the HIP-4 family clamps), and while any linear
 /// row holds a position of the slot that no mark prices, only exits pass
 /// (XH2-C). A slot that sets neither — every slot but a maker on perps —
-/// is judged exactly as before. 16 B; the table's eight are its last two
-/// lines.
+/// is judged exactly as before. 16 B; the table's sixteen are its last
+/// four lines.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct PerpLimits {
@@ -353,31 +363,40 @@ pub struct ExecRoute {
     cap_instance_usd_1e6: [i64; EXEC_SLOTS],
     /// **E6** — per-slot day clamp, USD x1e6, filled buy turnover.
     cap_day_usd_1e6: [i64; EXEC_SLOTS],
-    /// Pad the hot arrays + clamp fields (248 B since HYPARB widened
-    /// `venue_mask` to `u16`; 240 B before) to a whole number of lines
-    /// (256 B, four of them), so the halt table that follows starts
-    /// on a line boundary — which this field only achieves by sitting
-    /// BEFORE `halts`; an earlier layout declared it after and the
-    /// comment was describing tail padding. E1 reserved 16 B here
-    /// "for E6's clamps"; E6 needs 128 B, so the struct grew by two
-    /// lines. What the reservation actually bought is what it was for:
-    /// the hot arrays did not move. `modes` and `venue_mask` are still
-    /// at offsets 0 and 8, so the per-submit lookup still costs ONE
-    /// line, and the E6 clamps — read only on the live arm, after the
-    /// mode branch has already resolved — sit on lines 2 and 3 where
-    /// a paper boot never touches them.
-    _pad: [u8; 8],
+    /// Pad the hot arrays + clamp fields — 31 B a slot, 496 B at
+    /// sixteen slots (S16-3; 248 B at eight, 240 B before HYPARB widened
+    /// `venue_mask` to `u16`) — to a whole number of lines (512 B, eight
+    /// of them), so the halt table that follows starts on a line
+    /// boundary — which this field only achieves by sitting BEFORE
+    /// `halts`; an earlier layout declared it after and the comment was
+    /// describing tail padding. E1 reserved 16 B here "for E6's clamps";
+    /// E6 needed 128 B (at eight slots), so the struct grew. What the
+    /// reservation actually bought is what it was for: the hot arrays
+    /// did not move. `modes` and `venue_mask` are at offsets 0 and 16
+    /// (0 and 8 at eight slots), both inside line 0, so the per-submit
+    /// lookup still costs ONE line, and the E6 clamps — read only on the
+    /// live arm, after the mode branch has already resolved — sit after
+    /// them where a paper boot never reads them.
+    _pad: [u8; 16],
     /// **E6 commit 3** — per-slot halt thresholds. 56 B each (32 B
     /// before E7's session bound, 48 B before XH4d's ALO threshold),
-    /// eight of them: lines 5–11.
+    /// sixteen of them: 896 B at offset 512, lines 8–21.
     halts: [HaltLimits; EXEC_SLOTS],
-    /// **XH4e** — per-slot perp limits, 16 B each: lines 12–13.
+    /// **XH4e** — per-slot perp limits, 16 B each: 256 B at offset
+    /// 1 408, lines 22–25.
     perp: [PerpLimits; EXEC_SLOTS],
 }
 
-const _: () = assert!(core::mem::size_of::<ExecRoute>() == 832);
-const _: () = assert!(core::mem::offset_of!(ExecRoute, halts) == 256);
-const _: () = assert!(core::mem::offset_of!(ExecRoute, perp) == 704);
+// S16-3 re-pin (832 → 1 664 B): every per-slot array doubled. The pins
+// carry the one-line claim: `modes` (16 B) at 0 and `venue_mask` (32 B)
+// at 16 end at 48, inside line 0, so a submit's mode + venue lookup is
+// one line; the halt table starts on a line (that is `_pad`'s job).
+const _: () = assert!(core::mem::size_of::<ExecRoute>() == 1664);
+const _: () = assert!(core::mem::offset_of!(ExecRoute, modes) == 0);
+const _: () = assert!(core::mem::offset_of!(ExecRoute, venue_mask) == 16);
+const _: () = assert!(core::mem::offset_of!(ExecRoute, venue_mask) + 2 * EXEC_SLOTS <= 64);
+const _: () = assert!(core::mem::offset_of!(ExecRoute, halts) == 512);
+const _: () = assert!(core::mem::offset_of!(ExecRoute, perp) == 1408);
 
 impl Default for ExecRoute {
     #[inline]
@@ -401,7 +420,7 @@ impl ExecRoute {
             cap_instance_usd_1e6: [0i64; EXEC_SLOTS],
             cap_day_usd_1e6: [0i64; EXEC_SLOTS],
             halts: [HaltLimits::none(); EXEC_SLOTS],
-            _pad: [0u8; 8],
+            _pad: [0u8; 16],
             perp: [PerpLimits::none(); EXEC_SLOTS],
         }
     }
@@ -449,9 +468,10 @@ impl ExecRoute {
     /// index, no bounds check.**
     ///
     /// Out-of-range ids (every id >= [`EXEC_SLOTS`], which includes
-    /// `core_types::STRATEGY_ID_NONE` = 0xFF) resolve to
-    /// [`ExecMode::Paper`] by arithmetic rather than by branch: the
-    /// in-range flag multiplies the loaded byte to zero.
+    /// `core_types::STRATEGY_ID_NONE` = 0xFF and `split::NO_SLOT` =
+    /// 0xFE — masked, slots 15 and 14) resolve to [`ExecMode::Paper`]
+    /// by arithmetic rather than by branch: the in-range flag
+    /// multiplies the loaded byte to zero.
     #[inline(always)]
     #[must_use]
     pub fn mode(&self, strategy_id: u8) -> ExecMode {
@@ -501,26 +521,31 @@ impl ExecRoute {
     /// Bit `i` set = slot `i` is [`ExecMode::Live`]. Cold; this is
     /// what the `--arm-live` interlock compares against, so it is the
     /// single definition of "the set of slots the artifact arms".
+    ///
+    /// A [`SlotMask`] (S16-3): `i < EXEC_SLOTS <= SlotMask::BITS`, so
+    /// the shift is exact — the `u8` this was at eight slots would, in a
+    /// release build (`overflow-checks = false`), have put a live slot
+    /// 11 on bit 3, BIN15's, and the interlock would have agreed.
     #[inline]
     #[must_use]
-    pub fn live_mask(&self) -> u8 {
-        let mut m = 0u8;
-        let mut i = 0usize;
-        while i < EXEC_SLOTS {
-            m |= ((self.modes[i] == ExecMode::Live as u8) as u8) << i;
-            i += 1;
-        }
-        m
+    pub fn live_mask(&self) -> SlotMask {
+        self.mode_mask(ExecMode::Live)
     }
 
     /// Bit `i` set = slot `i` is [`ExecMode::Off`]. Cold; boot tell.
     #[inline]
     #[must_use]
-    pub fn off_mask(&self) -> u8 {
-        let mut m = 0u8;
+    pub fn off_mask(&self) -> SlotMask {
+        self.mode_mask(ExecMode::Off)
+    }
+
+    /// Bit `i` set = slot `i` is in `mode`. The one shift both masks use.
+    #[inline]
+    fn mode_mask(&self, mode: ExecMode) -> SlotMask {
+        let mut m: SlotMask = 0;
         let mut i = 0usize;
         while i < EXEC_SLOTS {
-            m |= ((self.modes[i] == ExecMode::Off as u8) as u8) << i;
+            m |= SlotMask::from(self.modes[i] == mode as u8) << i;
             i += 1;
         }
         m
@@ -705,11 +730,11 @@ mod tests {
     }
 
     #[test]
-    fn layout_is_thirteen_cache_lines_with_the_hot_arrays_first() {
+    fn layout_is_twenty_six_cache_lines_with_the_hot_arrays_first() {
         assert_eq!(
             core::mem::size_of::<ExecRoute>(),
-            832,
-            "thirteen cache lines"
+            1664,
+            "twenty-six cache lines (S16-3: sixteen slots)"
         );
         assert_eq!(
             core::mem::size_of::<PerpLimits>(),
@@ -725,9 +750,10 @@ mod tests {
         assert_eq!(core::mem::align_of::<ExecRoute>(), 64);
         assert_eq!(
             core::mem::offset_of!(ExecRoute, halts),
-            256,
+            512,
             "the halt table starts on a line boundary — that is what `_pad` is for"
         );
+        assert_eq!(core::mem::offset_of!(ExecRoute, perp), 1408);
         // The hot arrays must sit inside the FIRST cache line, or the
         // per-submit lookup costs two lines instead of one.
         let r = ExecRoute::all_paper();
@@ -753,15 +779,86 @@ mod tests {
     }
 
     #[test]
-    fn strategy_id_none_fails_closed_to_paper_even_when_slot_7_is_live() {
-        // 0xFF & 7 == 7. If the range check were missing, an
-        // un-stamped order would inherit slot 7's mode — this is the
-        // exact aliasing the `in_range` multiply exists to kill.
+    fn strategy_id_none_fails_closed_to_paper_even_when_slot_15_is_live() {
+        // 0xFF & 15 == 15 (S16-3; `& 7` == 7 at eight slots). If the
+        // range check were missing, an un-stamped order would inherit
+        // slot 15's mode — this is the exact aliasing the `in_range`
+        // multiply exists to kill.
         let mut r = ExecRoute::all_paper();
-        r.set_slot(7, ExecMode::Live, &[4], SlotCaps::none(), HaltLimits::none()).unwrap();
-        assert_eq!(r.mode(7), ExecMode::Live);
+        r.set_slot(15, ExecMode::Live, &[4], SlotCaps::none(), HaltLimits::none()).unwrap();
+        assert_eq!(r.mode(15), ExecMode::Live);
+        assert!(r.venue_allowed(15, 4));
         assert_eq!(r.mode(STRATEGY_ID_NONE), ExecMode::Paper);
         assert!(!r.venue_allowed(STRATEGY_ID_NONE, 4));
+    }
+
+    #[test]
+    fn no_slot_0xfe_fails_closed_to_paper_even_when_slot_14_is_live() {
+        // `split::NO_SLOT` = 0xFE masks onto slot 14.
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(14, ExecMode::Live, &[4], SlotCaps::none(), HaltLimits::none()).unwrap();
+        assert_eq!(r.mode(14), ExecMode::Live);
+        assert_eq!(r.mode(0xFE), ExecMode::Paper);
+        assert!(!r.venue_allowed(0xFE, 4));
+        assert_eq!(r.mode(16), ExecMode::Paper, "the first id past the table");
+        assert_eq!(r.mode(16 + 3), ExecMode::Paper, "19 masks onto BIN15's slot 3");
+    }
+
+    /// S16-3: the masks are `SlotMask`s. A live slot 11 is bit 11 and
+    /// never bit 3 (BIN15's), an off slot 15 is bit 15 and never bit 7 —
+    /// the `u8` masks of eight slots would have aliased both in a
+    /// release build and panicked here in a debug one.
+    #[test]
+    fn slots_11_and_15_are_their_own_bits_in_the_live_and_off_masks() {
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(11, ExecMode::Live, &[4], SlotCaps::none(), HaltLimits::none()).unwrap();
+        r.set_slot(15, ExecMode::Off, &[], SlotCaps::none(), HaltLimits::none()).unwrap();
+        assert_eq!(r.live_mask(), 1 << 11);
+        assert_eq!(r.off_mask(), 1 << 15);
+        assert_eq!(r.mode(11), ExecMode::Live);
+        assert_eq!(r.mode(3), ExecMode::Paper, "a live slot 11 does not make slot 3 live");
+        assert_eq!(r.mode(15), ExecMode::Off);
+        assert_eq!(r.mode(7), ExecMode::Paper);
+        assert!(r.venue_allowed(11, 4));
+        assert!(!r.venue_allowed(3, 4), "slot 3 has no venue");
+        assert!(r.venue_live(4));
+        assert!(r.any_live());
+        // Both directions: a live slot 3 is bit 3 alone.
+        let mut b = ExecRoute::all_paper();
+        b.set_slot(3, ExecMode::Live, &[4], SlotCaps::none(), HaltLimits::none()).unwrap();
+        assert_eq!(b.live_mask(), 1 << 3);
+        assert_eq!(b.mode(11), ExecMode::Paper);
+        // Every slot live: the mask is every bit, no more.
+        let mut all = ExecRoute::all_paper();
+        for s in 0..EXEC_SLOTS {
+            all.set_slot(s, ExecMode::Live, &[4], SlotCaps::none(), HaltLimits::none()).unwrap();
+        }
+        assert_eq!(all.live_mask(), SlotMask::MAX);
+        assert_eq!(all.off_mask(), 0);
+    }
+
+    #[test]
+    fn slot_11_and_15_caps_round_trip_and_slot_16_is_refused() {
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            11,
+            ExecMode::Live,
+            &[4, 6],
+            SlotCaps::new(1, 2, 3, 64),
+            HaltLimits::new(5, 6, 7, 8, 9),
+        )
+        .unwrap();
+        r.set_perp_limits(15, PerpLimits::new(10, 20)).unwrap();
+        assert_eq!(r.caps_at(11), Some(SlotCaps::new(1, 2, 3, 64)));
+        assert_eq!(r.halts_at(11), Some(HaltLimits::new(5, 6, 7, 8, 9)));
+        assert_eq!(r.venue_mask_at(11), Some(0b0101_0000));
+        assert_eq!(r.caps_at(3), Some(SlotCaps::none()), "slot 3 untouched");
+        assert_eq!(r.perp_at(15), Some(PerpLimits::new(10, 20)));
+        assert!(!r.perp_at(7).unwrap().is_set(), "slot 7 untouched");
+        assert_eq!(
+            r.set_slot(16, ExecMode::Live, &[4], SlotCaps::none(), HaltLimits::none()),
+            Err(ExecRouteErr::SlotOutOfRange(16))
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@
 //! name says `wall`. Text fields are fixed byte arrays with an explicit
 //! length (truncated on write — the writer's law, documented per field).
 
-use core_types::{Fill, Order};
+use core_types::{Fill, Order, SlotMask, MAX_STRATEGY_SLOTS};
 use strategy_core::{
     HarCounters, HarSeriesView, HcvCounters, HyparbCoinView, HyparbCounters, HyparbPoolView,
     RegimeCounters,
@@ -27,14 +27,25 @@ use strategy_core::{
 /// are gone (slot 6 has been xmm since XH1 and they read zeros); the
 /// `xmm` object and `boot.xmm_hash` take their place. The dashboard
 /// reads either version.
-pub const SNAPSHOT_SCHEMA: u32 = 2;
+///
+/// **3 (S16-5, ruling S16-R6):** every per-slot array — `slots`,
+/// `regime.gates`, `exec.halted` — grows from 8 to [`SNAPSHOT_SLOTS`]
+/// (16) entries; an index means the same slot in both versions, slots
+/// 8–15 are `"reserved"` (no member). Masks were already `SlotMask`s
+/// in schema 2. The dashboard reads either version.
+pub const SNAPSHOT_SCHEMA: u32 = 3;
 /// Orders kept in the `recent` ring.
 pub const RECENT_ORDERS: usize = 64;
 /// Fills kept in the `recent` ring.
 pub const RECENT_FILLS: usize = 64;
-/// Strategy-set slots mirrored (the wire-stable slot map; every slot
-/// is a member since HC11).
-pub const SNAPSHOT_SLOTS: usize = 8;
+/// Strategy-set slots mirrored (the wire-stable slot map): every slot
+/// a [`SlotMask`] can name — 0–7 are the members, 8–15 are reserved
+/// (S16-R5) and read zeros. Schema 3 widened it from 8 (S16-5).
+pub const SNAPSHOT_SLOTS: usize = MAX_STRATEGY_SLOTS as usize;
+/// The name of a slot no member stands in — the same word
+/// `cli::exec_boot::UNBUILT_SLOT_NAME` uses (its snapshot-parity test
+/// holds the two tables equal).
+pub const RESERVED_SLOT_NAME: &str = "reserved";
 /// Ingress lanes mirrored, in the cli's T1(c) order:
 /// pm, bn, okx, deribit, hl, bybit, rpc, mexc (MX2 — appended, never
 /// reordered: the index is the `/state` array position), hyperevm
@@ -68,8 +79,28 @@ pub const RUN_DIR_MAX: usize = 160;
 /// **Slot 7 was reserved until HC11 (2026-09-26)**: it is `strategy-hcv`
 /// since — no member ever stood there before, so no row changed meaning
 /// (the name, `"reserved"` → `"hcv"`, is additive).
+/// **Slots 8–15 appeared in schema 3 (S16-5)** as
+/// [`RESERVED_SLOT_NAME`]; a member taking one later is additive in the
+/// same way. This is a copy of the `strategy-set` member table's names
+/// (the snapshot crate does not link the members): the cli's
+/// `exec_boot` snapshot-parity test is the guard against drift.
 pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
-    "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "hcv",
+    "hyparb",
+    "vrp",
+    "xsd",
+    "bin15",
+    "ai-exec",
+    "vm",
+    "xmm",
+    "hcv",
+    RESERVED_SLOT_NAME,
+    RESERVED_SLOT_NAME,
+    RESERVED_SLOT_NAME,
+    RESERVED_SLOT_NAME,
+    RESERVED_SLOT_NAME,
+    RESERVED_SLOT_NAME,
+    RESERVED_SLOT_NAME,
+    RESERVED_SLOT_NAME,
 ];
 
 /// Ingress index → venue name (see [`SNAPSHOT_VENUES`]).
@@ -112,11 +143,12 @@ pub struct BootInfo {
     pub hcv_hash: [u8; 32],
     /// Process id.
     pub pid: u32,
-    /// `--strategy` mask as requested (`mask_for_name`).
-    pub requested_mask: u8,
+    /// `--strategy` mask as requested (`strategy_set::parse_strategy`).
+    /// A [`SlotMask`] since S16-2 (the JSON value is the same number).
+    pub requested_mask: SlotMask,
     /// Members whose boot config was present (the set builder's
     /// `configured`); `enabled = requested & configured` at boot.
-    pub configured_mask: u8,
+    pub configured_mask: SlotMask,
     /// 1 when the regime detector configured at boot.
     pub regime_configured: u8,
     /// 1 = paper mode (no live dispatcher).
@@ -140,9 +172,17 @@ pub struct BootInfo {
     pub run_dir_len: u8,
     /// Live bytes of `xmm_coins`.
     pub xmm_coins_len: u8,
-    /// Explicit padding — always zero.
-    _pad: [u8; 4],
+    /// Explicit padding — always zero. 4 → 2 at S16-2: the two masks
+    /// grew a byte each, so the struct keeps its 448 B and no implicit
+    /// padding (pinned below).
+    _pad: [u8; 2],
 }
+
+// S16-2 pins: the two masks grew a byte each (the fields after them sit
+// 2 B later) and `_pad` gave the bytes back, so the size stays 448 B.
+const _: () = assert!(core::mem::size_of::<BootInfo>() == 448);
+const _: () = assert!(core::mem::offset_of!(BootInfo, requested_mask) == 132);
+const _: () = assert!(core::mem::offset_of!(BootInfo, regime_configured) == 136);
 
 impl BootInfo {
     /// The all-zero identity (tests, tools that run the loop without
@@ -168,7 +208,7 @@ impl BootInfo {
         strategy_name_len: 0,
         run_dir_len: 0,
         xmm_coins_len: 0,
-        _pad: [0; 4],
+        _pad: [0; 2],
     };
 
     /// Store `s` into `git_sha` (truncated to the field).
@@ -1071,12 +1111,12 @@ pub struct EngineSnapshot {
     pub schema: u32,
     /// 1 while the set's sticky halt is raised.
     pub halted: u8,
-    /// Live strategy-set enable mask (0 for a plain strategy).
-    pub enabled_mask: u8,
     /// Live bytes of `strategy_kind`.
     pub strategy_kind_len: u8,
-    /// Explicit padding — always zero.
-    pub _pad0: u8,
+    /// Live strategy-set enable mask (0 for a plain strategy). A
+    /// [`SlotMask`] since S16-2: it takes the two bytes `_pad0` and its
+    /// own `u8` held, so `seq` stays at offset 8 (pinned below).
+    pub enabled_mask: SlotMask,
     /// Publish counter (1 = first snapshot after boot).
     pub seq: u64,
     /// Engine-monotonic ns of this publish.
@@ -1123,6 +1163,10 @@ pub struct EngineSnapshot {
     pub recent_fills: RecentRing<Fill, RECENT_FILLS>,
 }
 
+// S16-2: the widened `enabled_mask` fills the header's 4 B after `schema`.
+const _: () = assert!(core::mem::offset_of!(EngineSnapshot, enabled_mask) == 6);
+const _: () = assert!(core::mem::offset_of!(EngineSnapshot, seq) == 8);
+
 impl EngineSnapshot {
     /// The boot value: nothing observed yet. Not `const` (the embedded
     /// `strategy-core` PODs build through `Default`); boot-only —
@@ -1131,9 +1175,8 @@ impl EngineSnapshot {
         Self {
             schema: SNAPSHOT_SCHEMA,
             halted: 0,
-            enabled_mask: 0,
             strategy_kind_len: 0,
-            _pad0: 0,
+            enabled_mask: 0,
             seq: 0,
             mono_ns: 0,
             wall_ns: 0,
@@ -1205,10 +1248,15 @@ mod tests {
         // 24 B more in that block (368 B: the `not_writable` refusal,
         // options' margin and eapi's weight) fit the same alignment. BX13's
         // 56 B more (424 B: spot's weight, spot's day, the held cycles)
-        // cross it: 31,872 B, 896 B left.
+        // cross it: 31,872 B, 896 B left. S16-2's 8 B more (`regime.gates`
+        // 8 → 16; the widened masks reuse header and pad bytes) fit the
+        // same alignment: still 31,872 B. S16-5's schema 3 widens the
+        // per-slot arrays 8 → 16: `slots` +192 B (three 64 B lines);
+        // `exec.halted`'s +8 B fit the 64 B alignment. 32,064 B, 704 B
+        // left.
         let n = core::mem::size_of::<EngineSnapshot>();
         assert!(n <= 32 * 1024, "EngineSnapshot grew to {n} B");
-        assert_eq!(n, 31_872, "the BX13 figure: a change states its own");
+        assert_eq!(n, 32_064, "the S16-5 figure: a change states its own");
         assert_eq!(core::mem::size_of::<VmRowView>(), 48);
         assert_eq!(core::mem::size_of::<HarSnapshot>(), 2_216);
     }

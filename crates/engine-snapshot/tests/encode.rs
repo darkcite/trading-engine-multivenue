@@ -7,10 +7,10 @@
 //! never a runtime branch); a fixed small snapshot renders byte-exact
 //! (the schema pin); the body is structurally balanced JSON.
 
-use core_types::{Fill, Order, Price, Qty, Side, VenueId, RULE_TABLE_ROWS};
+use core_types::{Fill, Order, Price, Qty, Side, SlotMask, VenueId, RULE_TABLE_ROWS};
 use engine_snapshot::{
-    encode_state_json, EngineSnapshot, JsonOverflow, RECENT_FILLS, RECENT_ORDERS,
-    RUN_DIR_MAX, STATE_JSON_MAX,
+    encode_state_json, EngineSnapshot, JsonOverflow, HALT_REASON_WORDS, RECENT_FILLS,
+    RECENT_ORDERS, RUN_DIR_MAX, SLOT_NAMES, SNAPSHOT_SLOTS, STATE_JSON_MAX,
 };
 use strategy_core::VmRowView;
 
@@ -21,7 +21,16 @@ fn full_snapshot() -> Box<EngineSnapshot> {
     s.mono_ns = u64::MAX;
     s.wall_ns = u64::MAX;
     s.halted = 1;
-    s.enabled_mask = 0xFF;
+    // S16-5: all sixteen slots at their widest render — every mask bit,
+    // every gate byte, every halt byte on the longest reason word.
+    s.enabled_mask = SlotMask::MAX;
+    s.boot.requested_mask = SlotMask::MAX;
+    s.boot.configured_mask = SlotMask::MAX;
+    s.regime.gates = [u8::MAX; SNAPSHOT_SLOTS];
+    let longest = (0..HALT_REASON_WORDS.len())
+        .max_by_key(|&i| HALT_REASON_WORDS[i].len())
+        .unwrap();
+    s.exec.halted = [longest as u8; SNAPSHOT_SLOTS];
     s.set_strategy_kind(&[b'k'; 16]);
     s.boot.set_git_sha(&[b'f'; 48]);
     s.boot.set_strategy_name(&[b's'; 48]);
@@ -381,6 +390,9 @@ fn full_snapshot_fits_the_budget_and_is_balanced() {
     let mut buf = vec![0u8; STATE_JSON_MAX];
     let n = encode_state_json(&s, &mut buf).expect("full snapshot must fit STATE_JSON_MAX");
     assert!(n > 64 * 1024, "a full body is tens of KB; got {n}");
+    // S16-5: schema 3 measured 143 064 B; keep a 16 KiB margin under the
+    // bound so the next widening fails here, not in a live 500.
+    assert!(n <= STATE_JSON_MAX - 16 * 1024, "full body {n} B: under 16 KiB of headroom");
     assert_balanced(&buf[..n]);
     // Every section present exactly once at the top level.
     let body = core::str::from_utf8(&buf[..n]).unwrap();
@@ -563,7 +575,7 @@ fn fixed_snapshot_renders_byte_exact_header_sections() {
     let n = encode_state_json(&s, &mut buf).unwrap();
     let body = core::str::from_utf8(&buf[..n]).unwrap();
     let expected_head = concat!(
-        "{\"v\":2,\"seq\":3,",
+        "{\"v\":3,\"seq\":3,",
         "\"now\":{\"mono_ns\":\"10000000000\",\"wall_ns\":\"1700000000000000000\",\"uptime_s\":6},",
         "\"boot\":{\"pid\":4242,\"git_sha\":\"3ee1b8b\",\"binary_mtime_ns\":\"0\",",
         "\"boot_wall_ns\":\"1699999994000000000\",\"run_epoch_ns\":\"0\",\"run_dir\":\"/tmp/run-1\",",
@@ -581,7 +593,7 @@ fn fixed_snapshot_renders_byte_exact_header_sections() {
         "\"latency\":{\"ingest\":{\"p50_ns\":100,\"p99_ns\":1000},",
         "\"decide\":{\"p50_ns\":200,\"p99_ns\":2000},\"ack\":{\"p50_ns\":300,\"p99_ns\":3000}},",
         "\"regime\":{\"configured\":0,\"minutes_judged\":0,\"seed_rows\":0,\"declared_total\":0,",
-        "\"gate_changes\":0,\"gates\":[0,0,0,0,0,0,0,0],\"profiles\":[",
+        "\"gate_changes\":0,\"gates\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],\"profiles\":[",
         "{\"name\":\"fast\",\"measured\":{\"hex\":\"0004808080808080\",\"dims\":[128,128,128,128,128,128,4]},",
     );
     assert!(
@@ -600,6 +612,41 @@ fn fixed_snapshot_renders_byte_exact_header_sections() {
         "\"recent\":{\"orders_total\":0,\"orders\":[],\"fills_total\":0,\"fills\":[]}}"
     ));
     assert_balanced(body.as_bytes());
+}
+
+/// S16-2: the three masks are `SlotMask`s — a value past a byte encodes
+/// whole. S16-5 (schema 3): the per-slot rows and `regime.gates` carry
+/// all sixteen slots — slot 11's bits and gate land on slot 11's own row
+/// (named `reserved`), never on slot 3's.
+#[test]
+fn slot_masks_encode_whole_and_the_slot_rows_carry_sixteen() {
+    let mut s = Box::new(EngineSnapshot::empty());
+    s.boot.requested_mask = 0x8001;
+    s.boot.configured_mask = 0x0F01;
+    s.enabled_mask = 0x0801;
+    s.regime.gates[11] = 2;
+    let mut buf = vec![0u8; STATE_JSON_MAX];
+    let n = encode_state_json(&s, &mut buf).unwrap();
+    let body = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(
+        body.contains("\"requested_mask\":32769,\"configured_mask\":3841,\"enabled_mask\":2049,")
+    );
+    assert!(body.contains("\"gates\":[0,0,0,0,0,0,0,0,0,0,0,2,0,0,0,0],"));
+    assert!(
+        body.contains("{\"slot\":3,\"name\":\"bin15\",\"configured\":0,\"enabled\":0,\"gate\":0,")
+    );
+    assert!(body.contains(
+        "{\"slot\":11,\"name\":\"reserved\",\"configured\":1,\"enabled\":1,\"gate\":2,"
+    ));
+    assert_eq!(body.matches("{\"slot\":").count(), SNAPSHOT_SLOTS);
+    assert!(!body.contains("{\"slot\":16,"));
+    // `exec.halted` is per-slot too: sixteen words.
+    let h = body.find("\"halted\":[\"").expect("exec.halted");
+    let end = h + body[h..].find(']').unwrap();
+    assert_eq!(body[h..end].matches(',').count() + 1, SNAPSHOT_SLOTS);
+    // Slots 8–15 are reserved; 0–7 keep their members.
+    assert!(SLOT_NAMES[8..].iter().all(|n| *n == engine_snapshot::RESERVED_SLOT_NAME));
+    assert!(SLOT_NAMES[..8].iter().all(|n| *n != engine_snapshot::RESERVED_SLOT_NAME));
 }
 
 #[test]

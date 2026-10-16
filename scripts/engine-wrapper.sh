@@ -136,9 +136,8 @@ fi
 # engine refuses the boot and KeepAlive relaunches — check the launchd
 # log, then fix the file or drop the mask back to `ai`.
 #
-# XMM XH1 (2026-09-26): slot 6 is the xmm member (`xmm`, `ai+xmm`,
-# `ai+vrp+xsd+bin15+hyparb+xmm`); `icdp` and `ai+icdp` are GONE (the
-# engine refuses them too — the crate keeps only its offline backtest).
+# XMM XH1 (2026-09-26): slot 6 is the xmm member (`xmm`); `icdp` is GONE
+# (the engine refuses it — the crate keeps only its offline backtest).
 # Its artifact is ~/multivenue/xmm.toml, and an absent one with the bit
 # REQUESTED refuses the boot (the F19 law). Since XH2 it quotes on the
 # paper queue law; XH3 runs it in paper (the runbook: docs/risk-policy.md,
@@ -146,45 +145,59 @@ fi
 # refuses). A live slot 6 refuses the boot until XH4.
 #
 # HC11 (2026-09-26): slot 7 is the hcv member — Hypercall S1, DARK: paper
-# only and in no configured mask (O-HC18). Its names (`hcv`, `ai+hcv`,
-# `ai+vrp+xsd+bin15+hyparb+xmm+hcv`) are here so switching it on is ONE
-# strategy.conf line. Its artifact is ~/multivenue/hcv.toml (absent with
-# the bit REQUESTED refuses the boot — the F19 law); its hedges must be in
-# universe.toml [hyperliquid] coins and its options in [hypercall]. A live
-# slot 7 refuses the boot (exec_boot).
+# only and in no configured mask (O-HC18). Naming `hcv` in STRATEGY
+# switches it on: ONE strategy.conf line. Its artifact is
+# ~/multivenue/hcv.toml (absent with the bit REQUESTED refuses the boot —
+# the F19 law); its hedges must be in universe.toml [hyperliquid] coins
+# and its options in [hypercall]. A live slot 7 refuses the boot
+# (exec_boot).
 STRATEGY="ai"
 if [ -f "$HOME/multivenue/strategy.conf" ]; then
   . "$HOME/multivenue/strategy.conf"
 fi
-# XSD-3 (2026-09-12): the slot-2 cross-sectional member joins the
-# allow-list (`ai+xsd`, `ai+vrp+xsd`, `xsd`); it boots only when
-# ~/multivenue/xsd.toml + xsd-table.tsv resolve (absent ⇒ the bit stays
-# unset, the rest of the mask boots). Paper only, like every member.
+# XSD-3 (2026-09-12): the slot-2 cross-sectional member (`xsd`) boots
+# only when ~/multivenue/xsd.toml + xsd-table.tsv resolve (absent ⇒ the
+# bit stays unset, the rest of the mask boots). Paper only, like every
+# member.
 #
-# BIN15 O4b (2026-09-12): the slot-3 rolling-binary member joins with
-# five names (`bin15`, `ai+bin15`, `ai+vrp+bin15`, `ai+xsd+bin15`,
-# `ai+vrp+xsd+bin15`). UNLIKE xsd, an absent ~/multivenue/bin15.toml
-# with the bit REQUESTED refuses the boot rather than clearing the bit
-# (the icdp/F19 law) — booting `ai+bin15` silently as `ai` is how an
-# operator comes to watch a member that was never there. `rule-tree` is
-# GONE from the set: slot 3 is bin15, and the name was never in this
-# allow-list.
+# BIN15 O4b (2026-09-12): the slot-3 rolling-binary member (`bin15`).
+# UNLIKE xsd, an absent ~/multivenue/bin15.toml with the bit REQUESTED
+# refuses the boot rather than clearing the bit (the icdp/F19 law) —
+# booting `ai+bin15` silently as `ai` is how an operator comes to watch a
+# member that was never there. `rule-tree` is GONE from the set: slot 3
+# is bin15 (the engine refuses the name).
 #
-# HYPARB H0 (2026-09-23): slot 0 is the hyparb member (`hyparb`,
-# `ai+hyparb`, `ai+vrp+xsd+bin15+hyparb`); `latency-arb` was never in
-# this list and is now gone from the engine too (O-H1). The names are
-# here so they CAN be set later — the member lands DARK (O-H8): nothing
-# edits strategy.conf until HZ and H8 are green. Since H5 the engine
-# boots slot 0 only with its artifact (~/multivenue/hyparb.toml) and the
-# pool ingress — see the HYPARB block at the end.
-case "$STRATEGY" in
-  ai|ai+vrp|vrp|ai+xsd|ai+vrp+xsd|xsd) ;;
-  bin15|ai+bin15|ai+vrp+bin15|ai+xsd+bin15|ai+vrp+xsd+bin15) ;;
-  hyparb|ai+hyparb|ai+vrp+xsd+bin15+hyparb) ;;
-  xmm|ai+xmm|ai+vrp+xsd+bin15+hyparb+xmm) ;;
-  hcv|ai+hcv|ai+vrp+xsd+bin15+hyparb+xmm+hcv) ;;
-  *) echo "engine-wrapper: refusing STRATEGY=$STRATEGY (allowed: ai, ai+vrp, vrp, ai+xsd, ai+vrp+xsd, xsd, bin15, ai+bin15, ai+vrp+bin15, ai+xsd+bin15, ai+vrp+xsd+bin15, hyparb, ai+hyparb, ai+vrp+xsd+bin15+hyparb, xmm, ai+xmm, ai+vrp+xsd+bin15+hyparb+xmm, hcv, ai+hcv, ai+vrp+xsd+bin15+hyparb+xmm+hcv)" >&2; exit 78 ;;
+# HYPARB H0 (2026-09-23): slot 0 is the hyparb member (`hyparb`);
+# `latency-arb` is gone from the engine (O-H1). The member lands DARK
+# (O-H8): nothing edits strategy.conf until HZ and H8 are green. Since
+# H5 the engine boots slot 0 only with its artifact
+# (~/multivenue/hyparb.toml) and the pool ingress — see the HYPARB block
+# at the end.
+#
+# S16-1c (ruling S16-R3): ONE parser, no allow-list here. STRATEGY is
+# `+`-joined member names in any order (`ai` = ai-exec + vm; an overlap or
+# a repeat is the union), resolved by the binary exec'd below:
+# `strategy-mask` prints `<mask>\t<members in slot order>`, or refuses
+# with the valid names (exit 78), so this check and the engine's boot can
+# never disagree again (the BIN15 O5 drift). `all` is refused HERE only:
+# launchd boots name their members, so a member added later never joins
+# the live engine unasked. STRATEGY_MEMBERS is `+<members>+` for the
+# whole-name tests below (`*+hyparb+*`): `ai` carries ai-exec and vm.
+if [ "$STRATEGY" = "all" ]; then
+  echo "engine-wrapper: refusing STRATEGY=all — launchd boots name their members" >&2
+  exit 78
+fi
+STRATEGY_RESOLVED="$(./target/release/multivenue-engine strategy-mask "$STRATEGY")" || {
+  echo "engine-wrapper: refusing STRATEGY=$STRATEGY (an older release binary has no strategy-mask: rebuild it)" >&2
+  exit 78
+}
+# The answer's shape, not just its exit code: `<1..255>\t<members>`.
+case "$STRATEGY_RESOLVED" in
+  [1-9]*$'\t'?*) ;;
+  *) echo "engine-wrapper: refusing STRATEGY=$STRATEGY (strategy-mask answered '$STRATEGY_RESOLVED')" >&2; exit 78 ;;
 esac
+STRATEGY_MEMBERS="+${STRATEGY_RESOLVED#*$'\t'}+"
+echo "engine-wrapper: STRATEGY=$STRATEGY — mask ${STRATEGY_RESOLVED%%$'\t'*}, members $STRATEGY_MEMBERS" >&2
 
 # XSD-1 (2026-09-12, measured live): a launchd agent inherits macOS's
 # 256-descriptor SOFT limit, and the Binance lane is ONE socket per
@@ -243,8 +256,8 @@ fi
 # any one alone refuses). The wallet key HYPEREVM_MAINNET_KEY comes from
 # the repo .env sourced above. HYPARB_LIVE and EVM_TESTNET are exclusive.
 HYPARB_ARGS=()
-case "$STRATEGY" in
-  *hyparb*) HYPARB_ARGS=(--hyperevm-path "${HYPEREVM_PATH:-/}") ;;
+case "$STRATEGY_MEMBERS" in
+  *+hyparb+*) HYPARB_ARGS=(--hyperevm-path "${HYPEREVM_PATH:-/}") ;;
   *) if [ -n "${HYPEREVM_PATH:-}" ]; then HYPARB_ARGS=(--hyperevm-path "$HYPEREVM_PATH"); fi ;;
 esac
 if [ -n "${HYPARB_LIVE:-}" ] && [ -n "${EVM_TESTNET:-}${EVM_HYBRID:-}" ]; then
@@ -260,8 +273,8 @@ if [ -n "${HYPARB_TOML:-}" ] && [ -n "${EVM_TESTNET:-}" ]; then
     echo "engine-wrapper: refusing — HYPARB_TOML=$HYPARB_TOML is not a file" >&2
     exit 78
   fi
-  case "$STRATEGY" in
-    *hyparb*) ;;
+  case "$STRATEGY_MEMBERS" in
+    *+hyparb+*) ;;
     *) echo "engine-wrapper: refusing — EVM_TESTNET without hyparb in STRATEGY=$STRATEGY" >&2; exit 78 ;;
   esac
   # HYPARB go-live (2026-09-24): the shadow's wallet key. The engine reads
@@ -308,8 +321,8 @@ elif [ -n "${HYPARB_TOML:-}" ] && [ -n "${HYPARB_LIVE:-}" ]; then
     echo "engine-wrapper: refusing — HYPARB_TOML=$HYPARB_TOML is not a file" >&2
     exit 78
   fi
-  case "$STRATEGY" in
-    *hyparb*) ;;
+  case "$STRATEGY_MEMBERS" in
+    *+hyparb+*) ;;
     *) echo "engine-wrapper: refusing — HYPARB_LIVE without hyparb in STRATEGY=$STRATEGY" >&2; exit 78 ;;
   esac
   case ",${ARM_LIVE:-}," in
@@ -344,8 +357,8 @@ if [ -n "${XMM_TOML:-}" ]; then
     echo "engine-wrapper: refusing — XMM_TOML=$XMM_TOML is not a file" >&2
     exit 78
   fi
-  case "$STRATEGY" in
-    *xmm*) ;;
+  case "$STRATEGY_MEMBERS" in
+    *+xmm+*) ;;
     *) echo "engine-wrapper: refusing — XMM_TOML without xmm in STRATEGY=$STRATEGY" >&2; exit 78 ;;
   esac
   XMM_ARGS=(--xmm "$XMM_TOML")
@@ -357,8 +370,8 @@ fi
 # and STRATEGY must carry hcv. Paper only: nothing here can arm slot 7.
 HCV_ARGS=()
 if [ -n "${HCV_TOML:-}${HCV_EVENTS:-}" ]; then
-  case "$STRATEGY" in
-    *hcv*) ;;
+  case "$STRATEGY_MEMBERS" in
+    *+hcv+*) ;;
     *) echo "engine-wrapper: refusing — HCV_TOML/HCV_EVENTS without hcv in STRATEGY=$STRATEGY" >&2; exit 78 ;;
   esac
 fi

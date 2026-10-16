@@ -512,6 +512,27 @@ def test_assessment_halt_is_not_a_kind() -> None:
     ) is None
 
 
+def test_disable_slot_range_is_the_built_members() -> None:
+    """S16-5: the engine has 16 slots, but 8-15 are reserved (no member) —
+    the analyst may name only a built slot, 0-7, and its prompt says so."""
+    cascade = claude_worker.news.cascade
+    assert cascade.SLOT_BUILT_MAX == 7
+
+    def disable(slot: int) -> str:
+        return _assessment_json(
+            actions=[{"kind": "disable_paper_slot", "slot": slot, "venue": "okx",
+                      "until_ts": NOW + 3600}]
+        )
+
+    for slot in (0, 7):
+        got = _parse(disable(slot))
+        assert got is not None and got.actions[0].slot == slot
+    for slot in (-1, 8, 11, 15, 16):
+        assert _parse(disable(slot)) is None, slot
+    shape = cascade.ANALYST_SYSTEM.split("disable_paper_slot")[1].split("\n")[0]
+    assert "0..7" in shape and "8..15 are reserved" in shape
+
+
 def test_assessment_evidence_subset() -> None:
     assert _parse(_assessment_json(evidence=["made|up"])) is None
     assert _parse(_assessment_json(evidence=[])) is not None

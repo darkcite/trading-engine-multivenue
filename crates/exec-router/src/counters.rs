@@ -176,6 +176,16 @@ pub struct RouteCounters {
     pub refused_foreign_row: u64,
 }
 
+// S16-3 re-pin (320 → 448 B, five lines → seven): the sixteen aggregates
+// fill lines 0–1, each per-slot array is now two lines of its own
+// (`live_submits_by_slot` lines 2–3, `refused_by_slot` lines 4–5), and
+// the foreign-row refusal keeps its cold line, now line 6. A live submit
+// touches its aggregate's line and its slot's line, as at eight slots.
+const _: () = assert!(core::mem::size_of::<RouteCounters>() == 448);
+const _: () = assert!(core::mem::offset_of!(RouteCounters, live_submits_by_slot) == 128);
+const _: () = assert!(core::mem::offset_of!(RouteCounters, refused_by_slot) == 128 + 8 * EXEC_SLOTS);
+const _: () = assert!(core::mem::offset_of!(RouteCounters, refused_foreign_row) == 384);
+
 impl RouteCounters {
     /// A zeroed set.
     #[inline]
@@ -363,13 +373,15 @@ mod tests {
     #[test]
     fn counters_are_cache_line_aligned() {
         assert_eq!(core::mem::align_of::<RouteCounters>(), 64);
-        // Four lines were full (16 aggregates + two per-slot arrays of 8 =
-        // 32 u64 = 256 B; XH4e's XH2-C refusals shared `refused_unpriced`
-        // rather than grow it). XMM XH5a grew it to FIVE on purpose: the
-        // foreign-row refusal is its own operator action (folded into
-        // another clamp's count it would send the operator to the wrong
-        // number), and it takes a cold fifth line after the arrays.
-        assert_eq!(core::mem::size_of::<RouteCounters>(), 320);
+        // Four lines were full at eight slots (16 aggregates + two
+        // per-slot arrays of 8 = 32 u64 = 256 B; XH4e's XH2-C refusals
+        // shared `refused_unpriced` rather than grow it). XMM XH5a grew it
+        // to FIVE on purpose: the foreign-row refusal is its own operator
+        // action (folded into another clamp's count it would send the
+        // operator to the wrong number), and it takes a cold line after
+        // the arrays. S16-3: sixteen slots double the arrays — 16 + 32 =
+        // 48 u64 = 384 B, plus that line: SEVEN.
+        assert_eq!(core::mem::size_of::<RouteCounters>(), 448);
     }
 
     #[test]
@@ -401,10 +413,23 @@ mod tests {
     #[test]
     fn an_out_of_range_id_never_reads_past_the_array() {
         let mut c = RouteCounters::new();
-        // 0xFF & 7 == 7 — lands in a real bucket, no UB.
+        // 0xFF & 15 == 15 (S16-3) — lands in a real bucket, no UB.
         c.on_refused_off(STRATEGY_ID_NONE);
         assert_eq!(c.refused_off, 1);
-        assert_eq!(c.refused_at(7), Some(1));
+        assert_eq!(c.refused_at(15), Some(1));
+    }
+
+    /// S16-3: slots 11 and 15 count in their own buckets, never in
+    /// slot 3's or 7's (their `& 7` aliases at eight slots).
+    #[test]
+    fn slots_11_and_15_count_in_their_own_buckets() {
+        let mut c = RouteCounters::new();
+        c.on_live_submit(11);
+        c.on_refused_no_route(15);
+        assert_eq!(c.live_submits_at(11), Some(1));
+        assert_eq!(c.live_submits_at(3), Some(0));
+        assert_eq!(c.refused_at(15), Some(1));
+        assert_eq!(c.refused_at(7), Some(0));
     }
 
     #[test]

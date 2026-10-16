@@ -14,13 +14,17 @@ MEXC (data-only), Hypercall options (slot 7's S1 member trades them in
 PAPER since the 2026-09-26 go-live; the HC9 order arm runs as operator
 verbs only),
 Polymarket CLOB, Polygon RPC, plus a boot-selected options ladder.
-Strategies are composed at boot from an 8-slot set and may trade
+Strategies are composed at boot from a 16-slot set (0–7 built, 8–15
+reserved; S16) and may trade
 **any subset** of that universe; **Polymarket is one venue among several, not
 the target**. v1 runs on a MacBook Pro M4 on free-tier APIs. Claude (via the
 `claude-worker` Python process, and in-session) is an **offline strategy
 researcher** — never in the hot path.
 
-Slots (`crates/strategy-set`, one enable bit each; `all` = `BUILT_MASK` 255):
+Slots (`crates/strategy-set`, one `member_table!` row and one `SlotMask`
+(u16) bit each; 16 since S16, 2026-10-15; `all` = `BUILT_MASK` 0x00FF = 255,
+the enable mask today; 8–15 RESERVED, no member — arming one is refused at
+boot, adding one is its own ruling; risk-policy "S16"):
 0 hyparb (HyperEVM ↔ HL Core arb, since HYPARB H0 2026-09-23 — lands DARK,
 O-H8; boots only with `~/multivenue/hyparb.toml` + the pool ingress, H5;
 `latency-arb` unlinked, its name refuses the boot) · 1 vrp ·
@@ -36,9 +40,14 @@ held-quote law; in the live mask since the go-live, 2026-09-26 20:15Z
 `~/multivenue/hcv.toml`; a live slot 7 refuses the boot; its book persists
 in `hcv-state.tsv` by contract since HC11b, written off the engine thread;
 risk-policy "HYPERCALL — slot 7"). Member timers run per
-slot (each on its own period). The engine boots the mask named in
-`~/multivenue/strategy.conf` through `scripts/engine-wrapper.sh` (allow-list
-in the script; `ai` = 48 is the floor every name includes).
+slot (each on its own period). The engine boots the `STRATEGY` named in
+`~/multivenue/strategy.conf` through `scripts/engine-wrapper.sh`: `+`-joined
+member names or `ai` (= ai-exec+vm, 48), any order, parsed once by
+`strategy_set::parse_strategy`; `multivenue-engine strategy-mask <STRATEGY>`
+prints `<mask>\t<members>` or exits 78. Since the S16 deploy (2026-10-15)
+the wrapper resolves `STRATEGY` through `strategy-mask` (any named combination; `all`
+refused) instead of its allow-list; a binary rollback rolls the wrapper back
+too.
 
 ## Where to look — and where not to
 
@@ -78,8 +87,8 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   - Beside it: `caffeinate`, hourly `candles`, 5-min `regime`, nightly
     `retention` (PROTECT_DAYS 1, every delete gated on S3 `verify`),
     `archive` (04:30 local) and the read-only `dashboard`.
-  - It runs the release build of the HK lane's close (HK17, built and booted
-    2026-10-14; `/state` `boot.git_sha` names the commit) with the mask
+  - It runs the release build of the S16 lane (`5b56e71`, booted
+    2026-10-15 22:32Z; `/state` `boot.git_sha` names the commit) with the mask
     `strategy.conf` names (`ai+vrp+xsd+bin15+hyparb+xmm+hcv`).
     `strategy.conf` also exports `BYBIT_REST_HOST=api.bytick.com`
     (HK17). `/state` `exec.configured` is 0 (no
@@ -210,6 +219,14 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   (2026-10-13) closed Section A of that day's survey; HK11–HK17 (2026-10-14)
   Section B and the day's findings; HK18–HK23 (2026-10-15) the follow-ups;
   HK24–HK33 ("HK, part 3", 2026-10-15) the rest of the housekeeping.
+- **S16, sixteen strategy slots (risk-policy "S16", 2026-10-15).** S16-1..6
+  on main and deployed 2026-10-15 22:32Z: member table, `STRATEGY` parser +
+  `strategy-mask` (the wrapper resolves through it; `all` refused),
+  `SlotMask`, exec router / ledger (`LEDGER_RESTING` 1 024 with a
+  high-water mark) / boot, the HL and Binance arms, `/state` schema 3.
+  Slots 8–15 are reserved: arming one is refused (S16-R5); a member there
+  needs its own ruling. Release builds have `overflow-checks =
+  false`: never write `1u8 << slot`; debug tests at slots 8/11/15 guard it.
 - **The S3 archive (HK11, HK18, HK20).** Uploads are paced in 64 KiB pieces
   under `MULTIVENUE_S3_MAX_UPLOAD_MIBPS`, 20 MiB/s since HK20 (the link's
   ~5 MB/s binds; the feed delays stayed near their no-upload band). An

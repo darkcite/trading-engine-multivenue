@@ -1001,6 +1001,7 @@ impl BnArm {
                 self.c.sweeps_stranded += u64::from(e.flags & EVT_F_SWEEP_STRANDED != 0);
             }
             EVT_DAY => {
+                // A router slot (`SLOTS` = `EXEC_SLOTS`, 16 since S16-4).
                 if (e.slot as usize) < SLOTS {
                     self.day_bought_1e6[e.slot as usize] = e.b;
                     self.seen.day = e.a as u64;

@@ -57,9 +57,14 @@ const OID_OFF: usize = 8;
 /// must produce a cloid that decodes to SOMETHING traceable rather
 /// than a panic between the strategy and the venue. The router refuses
 /// the order on the mode lookup long before here; this is belt.
+/// (S16-4 risk review: a debug build fails closed on such a slot.)
 #[inline(always)]
 #[must_use]
 pub fn encode(strategy_id: u8, client_oid: u64) -> [u8; 16] {
+    debug_assert!(
+        usize::from(strategy_id) < EXEC_SLOTS,
+        "cloid::encode: slot {strategy_id} is outside the router's EXEC_SLOTS"
+    );
     let mut c = [0u8; 16];
     c[0] = MAGIC[0];
     c[1] = MAGIC[1];
@@ -100,7 +105,9 @@ pub fn decode(cloid: &[u8; 16]) -> Owner {
     // get wrong.
     let magic_ok = (cloid[0] == MAGIC[0]) & (cloid[1] == MAGIC[1]);
     let slot = cloid[SLOT_BYTE];
-    let slot_ok = (slot as usize) < EXEC_SLOTS;
+    // S16-4: every router slot (`EXEC_SLOTS`, 16) is one this arm names;
+    // a slot byte at or above it is not one we wrote.
+    let slot_ok = usize::from(slot) < EXEC_SLOTS;
     // The reserved bytes must be zero. A cloid with our magic but a
     // dirty reserve is not one we wrote, and treating it as ours would
     // be the one case where the marker gave false confidence.
@@ -177,8 +184,19 @@ mod tests {
 
     #[test]
     fn a_cloid_round_trips_through_every_slot() {
+        // S16-4: all sixteen — slots 8..16 decode as themselves, never
+        // as `slot & 7` (slot 11 is not BIN15's slot 3).
         for slot in 0..EXEC_SLOTS as u8 {
-            for oid in [0u64, 1, 42, u64::MAX, 0x0123_4567_89ab_cdef] {
+            for oid in [
+                0u64,
+                1,
+                2,
+                42,
+                u64::MAX,
+                u64::MAX - 1,
+                1 << 63,
+                0x0123_4567_89ab_cdef,
+            ] {
                 let c = encode(slot, oid);
                 assert_eq!(
                     decode(&c),
@@ -283,18 +301,94 @@ mod tests {
 
     /// A slot byte above the slot space is masked on the way OUT (so a
     /// buggy member still produces something traceable) but refused on
-    /// the way IN (so a venue row cannot invent a slot).
+    /// the way IN (so a venue row cannot invent a slot). S16-4 risk
+    /// review: the mask is the release build's belt — a debug build
+    /// fails closed (`a_slot_past_the_slot_space_fails_closed_in_debug`).
     #[test]
     fn the_encoder_masks_and_the_decoder_refuses() {
-        let c = encode(0xFF, 9);
+        let c = if cfg!(debug_assertions) {
+            encode(15, 9)
+        } else {
+            encode(0xFF, 9)
+        };
         assert_eq!(c[SLOT_BYTE], (EXEC_SLOTS - 1) as u8);
+        // S16-4: slot 15 is a slot this arm names.
         assert_eq!(
             decode(&c),
             Owner::Ours {
-                strategy_id: (EXEC_SLOTS - 1) as u8,
+                strategy_id: 15,
                 client_oid: 9
             }
         );
+        // A slot-11 order names slot 11 — never BIN15's slot 3.
+        let c = encode(11, 9);
+        assert_eq!(c[SLOT_BYTE], 11);
+        assert_eq!(
+            decode(&c),
+            Owner::Ours {
+                strategy_id: 11,
+                client_oid: 9
+            }
+        );
+        // A slot byte past the slot space, written by someone else.
+        for bad in [EXEC_SLOTS as u8, 16, 0x80, 0xFE, 0xFF] {
+            let mut c = encode(0, 9);
+            c[SLOT_BYTE] = bad;
+            assert_eq!(decode(&c), Owner::Foreign, "slot byte {bad:#x}");
+        }
+    }
+
+    /// S16-4 risk review: no caller passes a slot at or past `EXEC_SLOTS`
+    /// (the router refuses it first); a debug build that did would stop
+    /// here rather than mask it into another slot.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "outside the router's EXEC_SLOTS")]
+    fn a_slot_past_the_slot_space_fails_closed_in_debug() {
+        let _ = encode(EXEC_SLOTS as u8, 9);
+    }
+
+    /// **S16-4 — the cloids of slots 0..8 are byte-identical to S16-3's.**
+    /// Captured from HEAD 61d42c6 before the widening (`target/hk/s16/s4/
+    /// golden.txt`): BIN15 (slot 3) keeps its `0x4d5603…` prefix, XMM
+    /// (slot 6) its `0x4d5606…`, so an order resting across the upgrade
+    /// decodes to the slot that placed it.
+    #[test]
+    fn the_cloids_of_slots_0_3_and_6_are_unchanged_by_the_widening() {
+        const GOLDEN: [(u8, u64, &str); 6] = [
+            (0, 1, "0x4d560000000000000000000000000001"),
+            (
+                0,
+                0x0123_4567_89AB_CDEF,
+                "0x4d560000000000000123456789abcdef",
+            ),
+            (3, 1, "0x4d560300000000000000000000000001"),
+            (
+                3,
+                0x0123_4567_89AB_CDEF,
+                "0x4d560300000000000123456789abcdef",
+            ),
+            (6, 1, "0x4d560600000000000000000000000001"),
+            (
+                6,
+                0x0123_4567_89AB_CDEF,
+                "0x4d560600000000000123456789abcdef",
+            ),
+        ];
+        for (slot, oid, want) in GOLDEN {
+            let c = encode(slot, oid);
+            let mut hex = [0u8; 34];
+            let n = to_hex(&c, &mut hex);
+            assert_eq!(core::str::from_utf8(&hex[..n]).unwrap(), want);
+            assert_eq!(from_hex(want.as_bytes()), Some(c));
+            assert_eq!(
+                decode(&c),
+                Owner::Ours {
+                    strategy_id: slot,
+                    client_oid: oid
+                }
+            );
+        }
     }
 
     /// Decoding must be total: no input panics, and nothing that is

@@ -41,6 +41,7 @@
 
 use std::path::{Path, PathBuf};
 
+use core_types::SlotMask;
 use exec_router::{ExecMode, ExecRoute, HaltLimits, PerpLimits, SlotCaps, EXEC_SLOTS};
 
 /// **E6 — the mirrored constants, held in agreement.**
@@ -167,11 +168,37 @@ const _: () = assert!(
         <= exec_hyperliquid::exchange::MAX_PENDING_SWEEPS
 );
 
-/// Slot names, for boot tells and refusal messages. Index = slot;
-/// mirrors `strategy-set`'s composition order.
-pub const SLOT_NAMES: [&str; EXEC_SLOTS] = [
-    "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "hcv",
-];
+/// The name of a slot with no built member — `strategy-set`'s own word
+/// for slots 8–15 (S16-R5), and `/state`'s for slot 7 before HC11.
+pub const UNBUILT_SLOT_NAME: &str = "reserved";
+
+/// Slot names, for boot tells and refusal messages. Index = slot.
+/// Derived from `strategy_set::MEMBERS` — the member table's own names,
+/// so the two cannot drift — and [`UNBUILT_SLOT_NAME`] for every slot no
+/// row names (8–15, S16-R5).
+pub const SLOT_NAMES: [&str; EXEC_SLOTS] = {
+    let mut names = [UNBUILT_SLOT_NAME; EXEC_SLOTS];
+    let mut i = 0;
+    while i < strategy_set::MEMBERS.len() {
+        names[strategy_set::MEMBERS[i].slot as usize] = strategy_set::MEMBERS[i].name;
+        i += 1;
+    }
+    names
+};
+
+/// **Is `slot`'s bit set in `mask`?** The one bounded slot test every
+/// mask reader here uses (S16-3): `false` for a slot at or past
+/// [`EXEC_SLOTS`], and otherwise a `SlotMask` shift — never a `u8` one,
+/// which in a release build (`overflow-checks = false`) would read slot
+/// 11 as slot 3, BIN15's.
+#[inline]
+#[must_use]
+pub const fn slot_in(mask: SlotMask, slot: usize) -> bool {
+    slot < EXEC_SLOTS && mask & ((1 as SlotMask) << slot) != 0
+}
+
+// `slot_in`'s shift is exact for every slot it lets through.
+const _: () = assert!(EXEC_SLOTS <= SlotMask::BITS as usize);
 
 /// A resolved execution configuration.
 #[derive(Debug, Clone)]
@@ -187,7 +214,7 @@ pub struct ExecBoot {
     /// of what the slot sections say.
     pub enabled: bool,
     /// Bit `i` set = slot `i` is live.
-    pub live_mask: u8,
+    pub live_mask: SlotMask,
     /// The slots the artifact named, as parsed.
     ///
     /// The hot [`ExecRoute`] carries the four clamps and the halt
@@ -209,10 +236,16 @@ impl ExecBoot {
         self.live_mask != 0
     }
 
+    /// Is `slot` armed live? [`slot_in`] over [`Self::live_mask`].
+    #[must_use]
+    pub const fn slot_live(&self, slot: usize) -> bool {
+        slot_in(self.live_mask, slot)
+    }
+
     /// HYPARB L5: is slot 0 (its own live arm) armed?
     #[must_use]
     pub fn hyparb_live(&self) -> bool {
-        self.live_mask & (1 << HYPEREVM_SLOT) != 0
+        slot_in(self.live_mask, HYPEREVM_SLOT)
     }
 
     /// XMM XH4f: does slot `slot` name the gateway transport?
@@ -227,14 +260,14 @@ impl ExecBoot {
     /// (slot 3's own gateway arm is [`Self::bin15_gateway_live`], XH4i-5).
     #[must_use]
     pub fn gateway_live(&self) -> Option<usize> {
-        (self.live_mask & (1u8 << XMM_SLOT) != 0 && self.gateway_slot(XMM_SLOT)).then_some(XMM_SLOT)
+        (slot_in(self.live_mask, XMM_SLOT) && self.gateway_slot(XMM_SLOT)).then_some(XMM_SLOT)
     }
 
     /// **XMM XH4i-5** — is slot 3 live on a gateway arm of its own (the
     /// outcome mode) rather than on the operator's blocking arm?
     #[must_use]
     pub fn bin15_gateway_live(&self) -> bool {
-        self.live_mask & (1u8 << BIN15_SLOT) != 0 && self.gateway_slot(BIN15_SLOT)
+        slot_in(self.live_mask, BIN15_SLOT) && self.gateway_slot(BIN15_SLOT)
     }
 
     /// **XMM XH5b-3 — slot 6's gateway beside the mainnet-only arms.** Slot
@@ -305,8 +338,7 @@ impl ExecBoot {
         let mut day_max = i64::MAX;
         for s in &self.slots {
             if s.slot == HYPEREVM_SLOT
-                || s.slot >= EXEC_SLOTS
-                || self.live_mask & (1u8 << s.slot) == 0
+                || !slot_in(self.live_mask, s.slot)
                 || !self.route.venue_allowed(s.slot as u8, hl)
                 || self.gateway_slot(s.slot)
             {
@@ -340,7 +372,7 @@ impl ExecBoot {
     pub fn binance_slot(&self) -> Option<usize> {
         let bn = core_types::VenueId::Binance as u8;
         (0..EXEC_SLOTS)
-            .find(|&s| self.live_mask & (1u8 << s) != 0 && self.route.venue_allowed(s as u8, bn))
+            .find(|&s| slot_in(self.live_mask, s) && self.route.venue_allowed(s as u8, bn))
     }
 
     /// Does a live slot OTHER than slot 0 trade Hyperliquid on the
@@ -354,7 +386,7 @@ impl ExecBoot {
         let mut slot = 0usize;
         while slot < EXEC_SLOTS {
             if slot != HYPEREVM_SLOT
-                && self.live_mask & (1u8 << slot) != 0
+                && slot_in(self.live_mask, slot)
                 && self.route.venue_allowed(slot as u8, hl)
                 && !self.gateway_slot(slot)
             {
@@ -371,8 +403,9 @@ impl ExecBoot {
 /// An empty string is an empty set (mask 0) — which pairs with an
 /// artifact that arms nothing, and is how `--arm-live ""` says "I mean
 /// nothing" explicitly.
-pub fn parse_arm_live(spec: &str) -> Result<u8, String> {
-    let mut mask = 0u8;
+pub fn parse_arm_live(spec: &str) -> Result<SlotMask, String> {
+    // A `SlotMask` (S16-3): a `u8` shift by 11 sets bit 3 in release.
+    let mut mask: SlotMask = 0;
     for part in spec.split(',') {
         let p = part.trim();
         if p.is_empty() {
@@ -386,7 +419,7 @@ pub fn parse_arm_live(spec: &str) -> Result<u8, String> {
                 "--arm-live: slot {slot} is out of range (0..{EXEC_SLOTS})"
             ));
         }
-        let bit = 1u8 << slot;
+        let bit = (1 as SlotMask) << slot;
         if mask & bit != 0 {
             return Err(format!("--arm-live: slot {slot} named twice"));
         }
@@ -423,8 +456,9 @@ pub const HALT_FILE: &str = "exec.HALT";
 /// # Errors
 /// A part that is not a slot number, a slot outside `0..EXEC_SLOTS`,
 /// or a slot named twice.
-pub fn parse_halt_slots(spec: &str) -> Result<u8, String> {
-    let mut mask = 0u8;
+pub fn parse_halt_slots(spec: &str) -> Result<SlotMask, String> {
+    // A `SlotMask`, as `parse_arm_live`'s.
+    let mut mask: SlotMask = 0;
     for part in spec.split(',') {
         let p = part.trim();
         if p.is_empty() {
@@ -438,7 +472,7 @@ pub fn parse_halt_slots(spec: &str) -> Result<u8, String> {
                 "--halt-slot: slot {slot} is out of range (0..{EXEC_SLOTS})"
             ));
         }
-        let bit = 1u8 << slot;
+        let bit = (1 as SlotMask) << slot;
         if mask & bit != 0 {
             return Err(format!("--halt-slot: slot {slot} named twice"));
         }
@@ -447,13 +481,42 @@ pub fn parse_halt_slots(spec: &str) -> Result<u8, String> {
     Ok(mask)
 }
 
+/// **Latch `--halt-slot`'s operator halt** on every slot of `halt_mask`
+/// the router holds LIVE. Returns `(halted, not_live)`: the slots that
+/// latched, and the ones named that did not (not live, or already halted
+/// by the halt file — nothing to halt; the caller says so). Bit `s` is slot `s` alone, via [`slot_in`]: a halt
+/// of slot 11 or 15 never lands on slot 3 or 7.
+pub fn apply_halt_mask<P, L>(
+    d: &mut exec_router::RoutedDispatcher<P, L>,
+    halt_mask: SlotMask,
+) -> (SlotMask, SlotMask)
+where
+    P: clob_dispatcher::OrderDispatch,
+    L: clob_dispatcher::OrderDispatch,
+{
+    let mut halted: SlotMask = 0;
+    let mut not_live: SlotMask = 0;
+    for slot in 0..EXEC_SLOTS {
+        if !slot_in(halt_mask, slot) {
+            continue;
+        }
+        let bit = (1 as SlotMask) << slot;
+        if d.halt_slot(slot, exec_router::HaltReason::Operator) {
+            halted |= bit;
+        } else {
+            not_live |= bit;
+        }
+    }
+    (halted, not_live)
+}
+
 /// Render a slot bitmask as `[3]` / `[0,1,2]` / `[]`.
 #[must_use]
-pub fn render_slot_mask(mask: u8) -> String {
+pub fn render_slot_mask(mask: SlotMask) -> String {
     let mut out = String::from("[");
     let mut first = true;
     for s in 0..EXEC_SLOTS {
-        if mask & (1u8 << s) != 0 {
+        if slot_in(mask, s) {
             if !first {
                 out.push(',');
             }
@@ -500,6 +563,25 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
     // --- The interlock -----------------------------------------------
     let artifact_mask = file.live_mask();
     let flag_mask = parse_arm_live(arm_live.unwrap_or(""))?;
+    // S16-R5: a slot with no member in THIS binary is never armed — not
+    // from the artifact, not from the flag. Nothing could trade there,
+    // and an order from such a slot is the one an older binary reads as
+    // Foreign (the rollback door S16-R5 keeps shut until a member, and
+    // its own ruling, arrive). A BUILT slot the `STRATEGY` set leaves
+    // disabled is still armable, as before S16: its member is compiled,
+    // and enabling it is the strategy set's call, not this artifact's.
+    let unbuilt = (artifact_mask | flag_mask) & !strategy_set::BUILT_MASK;
+    if unbuilt != 0 {
+        return Err(format!(
+            "exec: slots {} have no member in THIS binary (S16-R5: slots 8–15 are \
+             reserved) — refusing to arm a slot nothing trades from. ({} marks {} live, \
+             --arm-live names {}.) A member there is its own lane and its own ruling.",
+            render_slot_mask(unbuilt),
+            path.display(),
+            render_slot_mask(artifact_mask),
+            render_slot_mask(flag_mask),
+        ));
+    }
     if artifact_mask != flag_mask {
         return Err(format!(
             "exec: the two arming switches DISAGREE — {} marks slots {} live, \
@@ -707,9 +789,12 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
 /// the master: slot 3's quotes cancelled, its fills booked twice) and beside
 /// slot 6 live on its gateway (A-S7-85: one gateway arm an engine until the
 /// arm's report is per slot and the two gateways split the rate shares).
-fn check_bin15_gateway(slots: &[core_config::exec::ExecSlot], live_mask: u8) -> Result<(), String> {
+fn check_bin15_gateway(
+    slots: &[core_config::exec::ExecSlot],
+    live_mask: SlotMask,
+) -> Result<(), String> {
     let live_gw = |slot: usize| {
-        live_mask & (1u8 << slot) != 0
+        slot_in(live_mask, slot)
             && slots
                 .iter()
                 .any(|s| s.slot == slot && s.transport == core_config::exec::TRANSPORT_GATEWAY)
@@ -729,8 +814,7 @@ fn check_bin15_gateway(slots: &[core_config::exec::ExecSlot], live_mask: u8) -> 
     for s in slots {
         if s.slot != HYPEREVM_SLOT
             && s.slot != BIN15_SLOT
-            && s.slot < EXEC_SLOTS
-            && live_mask & (1u8 << s.slot) != 0
+            && slot_in(live_mask, s.slot)
             && s.venues.contains(&hl)
             && s.transport != core_config::exec::TRANSPORT_GATEWAY
         {
@@ -757,13 +841,13 @@ fn check_bin15_gateway(slots: &[core_config::exec::ExecSlot], live_mask: u8) -> 
 /// BX9, Q-4).
 fn check_binance(
     slots: &[core_config::exec::ExecSlot],
-    live_mask: u8,
+    live_mask: SlotMask,
     section: Option<&core_config::exec::ExecBinance>,
 ) -> Result<(), String> {
     let bn = core_types::VenueId::Binance as u8;
     let live: Vec<usize> = slots
         .iter()
-        .filter(|s| s.slot < EXEC_SLOTS && live_mask & (1u8 << s.slot) != 0 && s.venues.contains(&bn))
+        .filter(|s| slot_in(live_mask, s.slot) && s.venues.contains(&bn))
         .map(|s| s.slot)
         .collect();
     if live.is_empty() {
@@ -936,12 +1020,15 @@ fn check_binance(
 /// **BX6 (obligation 5)** — a live slot with a session bound, traded by
 /// two arms, needs both to judge it ([`PNL_JUDGING_VENUES`]); otherwise
 /// the merged signal never reports it judged and the bound never fires.
-fn check_pnl_judged(slots: &[core_config::exec::ExecSlot], live_mask: u8) -> Result<(), String> {
+fn check_pnl_judged(
+    slots: &[core_config::exec::ExecSlot],
+    live_mask: SlotMask,
+) -> Result<(), String> {
     let bn = core_types::VenueId::Binance as u8;
     for s in slots {
         let bounded = s.halt_on_gain_usd_1e6 != 0 || s.halt_on_loss_usd_1e6 != 0;
         let two_arms = s.venues.contains(&bn) && s.venues.iter().any(|v| *v != bn);
-        if s.slot >= EXEC_SLOTS || live_mask & (1u8 << s.slot) == 0 || !bounded || !two_arms {
+        if !slot_in(live_mask, s.slot) || !bounded || !two_arms {
             continue;
         }
         if let Some(v) = s.venues.iter().find(|v| !PNL_JUDGING_VENUES.contains(v)) {
@@ -1037,10 +1124,10 @@ pub fn check_alias_unique(
 }
 
 /// `3 (bin15)` / `3 (bin15), 5 (vm)` — for the interlock's message.
-fn describe_slots(mask: u8) -> String {
+fn describe_slots(mask: SlotMask) -> String {
     let mut out = String::new();
     for (s, name) in SLOT_NAMES.iter().enumerate() {
-        if mask & (1u8 << s) != 0 {
+        if slot_in(mask, s) {
             if !out.is_empty() {
                 out.push_str(", ");
             }
@@ -1073,10 +1160,10 @@ pub fn render_boot_tell(boot: &ExecBoot) -> Vec<String> {
     for b in &boot.hash {
         hex.push_str(&format!("{b:02x}"));
     }
-    let mut paper = 0u8;
+    let mut paper: SlotMask = 0;
     for s in 0..EXEC_SLOTS {
         if boot.route.mode_at(s) == Some(ExecMode::Paper) {
-            paper |= 1u8 << s;
+            paper |= (1 as SlotMask) << s;
         }
     }
     let mut lines = vec![format!(
@@ -1411,7 +1498,14 @@ mod tests {
         assert_eq!(parse_halt_slots("3,5").unwrap(), 0b0010_1000);
         assert_eq!(parse_halt_slots("").unwrap(), 0);
         assert!(parse_halt_slots("x").unwrap_err().contains("not a slot"));
-        assert!(parse_halt_slots("9").unwrap_err().contains("out of range"));
+        // S16-3: 16 is the first slot past the table (9 was, at eight).
+        assert!(parse_halt_slots("16").unwrap_err().contains("out of range"));
+        assert!(parse_halt_slots("255").unwrap_err().contains("out of range"));
+        // Slot 11 is bit 11 alone — never bit 3 (BIN15's), its `u8` alias.
+        assert_eq!(parse_halt_slots("11").unwrap(), 1 << 11);
+        assert_eq!(parse_halt_slots("15").unwrap(), 1 << 15);
+        assert_eq!(parse_halt_slots("3,11,15").unwrap(), (1 << 3) | (1 << 11) | (1 << 15));
+        assert!(parse_halt_slots("11,11").unwrap_err().contains("twice"));
         assert!(parse_halt_slots("3,3").unwrap_err().contains("twice"));
     }
 
@@ -1821,17 +1915,25 @@ mod tests {
     fn the_hl_address_numbers_come_from_the_slots_the_arm_trades() {
         let hl = core_types::VenueId::Hyperliquid as u8;
         let bn = core_types::VenueId::Binance as u8;
-        let caps = SlotCaps::new(100_000_000, 1_000_000_000, 30_000_000_000, 64);
-        let mut route = ExecRoute::all_paper();
-        let mut slots = Vec::new();
-        let mut live_mask = 0u8;
-        for (slot, venue, floor, weight, day_max, live) in [
-            (0usize, hl, 9_000i64, 1i64, 1i64, true),
+        let boot = boot_of(&[
+            (0, hl, 9_000, 1, 1, true),
             (2, bn, 9_500, 1_000, 10_000, true),
             (3, hl, 2_000, 5_000, 30_000, true),
             (4, hl, 3_000, 6_000, 20_000, true),
             (5, hl, 8_000, 1, 1, false),
-        ] {
+        ]);
+        assert_eq!(boot.hl_address_numbers(), (3_000, 5_000, 20_000));
+    }
+
+    /// An [`ExecBoot`] over hand-built rows `(slot, venue, budget floor,
+    /// top-up weight, top-up day max, live)` — no artifact, so a test can
+    /// arm a slot `resolve` refuses (8–15, S16-R5).
+    fn boot_of(rows: &[(usize, u8, i64, i64, i64, bool)]) -> ExecBoot {
+        let caps = SlotCaps::new(100_000_000, 1_000_000_000, 30_000_000_000, 64);
+        let mut route = ExecRoute::all_paper();
+        let mut slots = Vec::new();
+        let mut live_mask: SlotMask = 0;
+        for &(slot, venue, floor, weight, day_max, live) in rows {
             let mode = if live {
                 ExecMode::Live
             } else {
@@ -1847,11 +1949,11 @@ mod tests {
             s.request_topup_day_max = day_max;
             if live {
                 s.mode = String::from("live");
-                live_mask |= 1u8 << slot;
+                live_mask |= (1 as SlotMask) << slot;
             }
             slots.push(s);
         }
-        let boot = ExecBoot {
+        ExecBoot {
             route,
             hash: [0u8; 32],
             path: PathBuf::from("/tmp/exec.toml"),
@@ -1859,8 +1961,7 @@ mod tests {
             live_mask,
             slots,
             binance: None,
-        };
-        assert_eq!(boot.hl_address_numbers(), (3_000, 5_000, 20_000));
+        }
     }
 
     /// The smallest valid `[exec.binance]` (core-config's own fixture).
@@ -2194,11 +2295,16 @@ mod tests {
     /// map — the very failure that check exists to prevent.
     #[test]
     fn the_slot_map_matches_the_one_state_publishes() {
-        assert_eq!(
-            SLOT_NAMES.len(),
-            engine_snapshot::SLOT_NAMES.len(),
-            "slot map length"
-        );
+        // Schema 3 (S16-5): `/state` publishes all sixteen slots — the
+        // binding fails to compile if the two tables' lengths part — and
+        // names the unbuilt ones (8–15, S16-R5) with this module's word.
+        let published: &[&str; EXEC_SLOTS] = &engine_snapshot::SLOT_NAMES;
+        assert_eq!(engine_snapshot::RESERVED_SLOT_NAME, UNBUILT_SLOT_NAME);
+        for (i, n) in published.iter().enumerate() {
+            if !slot_in(strategy_set::BUILT_MASK, i) {
+                assert_eq!(*n, UNBUILT_SLOT_NAME, "unbuilt slot {i}");
+            }
+        }
         for (i, (mine, theirs)) in SLOT_NAMES
             .iter()
             .zip(engine_snapshot::SLOT_NAMES.iter())
@@ -2439,13 +2545,229 @@ mod tests {
         );
     }
 
+    /// **S16-3** — the slot map comes from the member table: every
+    /// member's name at its slot, [`UNBUILT_SLOT_NAME`] everywhere else.
+    #[test]
+    fn slot_names_are_the_member_table_s_and_reserved_past_it() {
+        for m in strategy_set::MEMBERS {
+            assert_eq!(SLOT_NAMES[m.slot as usize], m.name, "slot {}", m.slot);
+        }
+        assert_eq!(
+            SLOT_NAMES[..8],
+            ["hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "hcv"]
+        );
+        for (s, n) in SLOT_NAMES.iter().enumerate() {
+            let built = strategy_set::BUILT_MASK & (1 << s) != 0;
+            assert_eq!(*n == UNBUILT_SLOT_NAME, !built, "slot {s}");
+        }
+    }
+
+    /// **S16-3** — the masks render and describe slots 11 and 15 as
+    /// themselves; `slot_in` is false past the table.
+    #[test]
+    fn slots_11_and_15_render_and_describe_as_themselves() {
+        assert_eq!(render_slot_mask((1 << 11) | (1 << 15)), "[11,15]");
+        assert_eq!(render_slot_mask((1 << 3) | (1 << 11)), "[3,11]");
+        assert_eq!(render_slot_mask(SlotMask::MAX), "[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]");
+        assert_eq!(describe_slots((1 << 3) | (1 << 11)), "3 (bin15), 11 (reserved)");
+        assert_eq!(describe_slots(1 << 15), "15 (reserved)");
+        assert!(slot_in(1 << 11, 11) && !slot_in(1 << 11, 3));
+        assert!(!slot_in(SlotMask::MAX, 16) && !slot_in(SlotMask::MAX, 255));
+    }
+
+    /// **S16-R5** — a slot with no built member is never armed, from the
+    /// artifact or the flag; a paper section for it still resolves.
+    #[test]
+    fn an_unbuilt_slot_is_never_armed() {
+        let d = tmp();
+        let live11 = MINIMAL_LIVE
+            .replace("[exec.slot.3]", "[exec.slot.11]")
+            .replace("name = \"bin15\"", "name = \"reserved\"");
+        let p = write(&d, "exec.toml", &live11);
+        let e = resolve(Some(&p), Some("11")).unwrap_err();
+        assert!(e.contains("no member") && e.contains("[11]"), "{e}");
+        // The message renders on single spaces (its `\` continuations).
+        assert!(e.contains("are reserved) ") && e.contains("live, --arm-live"), "{e}");
+        assert!(!e.contains("  "), "{e}");
+        // The flag alone, beside an artifact arming slot 3: refused as
+        // unbuilt, never read as slot 3.
+        let p3 = write(&d, "exec3.toml", MINIMAL_LIVE);
+        let e = resolve(Some(&p3), Some("3,15")).unwrap_err();
+        assert!(e.contains("no member") && e.contains("[15]"), "{e}");
+        let e = resolve(Some(&p3), Some("11")).unwrap_err();
+        assert!(e.contains("[11]"), "{e}");
+        assert!(resolve(Some(&p3), Some("3")).unwrap().unwrap().slot_live(3));
+        // A paper section for a reserved slot arms nothing and resolves.
+        let paper11 = write(&d, "exec11.toml", "[exec]\n[exec.slot.11]\nmode = \"paper\"\n");
+        let b = resolve(Some(&paper11), None).unwrap().unwrap();
+        assert_eq!(b.live_mask, 0);
+        assert_eq!(b.route.mode_at(11), Some(ExecMode::Paper));
+    }
+
+    /// **S16-3** — `ExecBoot`'s live questions read bit `s` as slot `s`
+    /// alone: a live 11 or 15 is never slot 3 or 7.
+    #[test]
+    fn a_live_mask_of_11_and_15_never_reads_as_3_or_7() {
+        let mut s3 = core_config::exec::ExecSlot::paper_default(BIN15_SLOT);
+        s3.transport = String::from(core_config::exec::TRANSPORT_GATEWAY);
+        s3.venues = vec![core_types::VenueId::Hyperliquid as u8];
+        let boot = ExecBoot {
+            route: ExecRoute::all_paper(),
+            hash: [0u8; 32],
+            path: PathBuf::from("/tmp/exec.toml"),
+            enabled: true,
+            live_mask: (1 << 11) | (1 << 15),
+            slots: vec![s3],
+            binance: None,
+        };
+        assert!(boot.any_live());
+        assert!(boot.slot_live(11) && boot.slot_live(15));
+        assert!(!boot.slot_live(3) && !boot.slot_live(7) && !boot.slot_live(16));
+        assert!(!boot.bin15_gateway_live(), "slot 3 is not live");
+        assert!(!boot.hyparb_live());
+        assert_eq!(boot.gateway_live(), None);
+    }
+
+    /// **S16-3** — the gateway and session-bound checks read a live 11 as
+    /// slot 11 alone, in both directions.
+    #[test]
+    fn the_mask_checks_read_slot_11_as_slot_11() {
+        let hl = core_types::VenueId::Hyperliquid as u8;
+        let bn = core_types::VenueId::Binance as u8;
+        let okx = core_types::VenueId::Okx as u8;
+        let mut gw3 = core_config::exec::ExecSlot::paper_default(BIN15_SLOT);
+        gw3.mode = String::from("live");
+        gw3.transport = String::from(core_config::exec::TRANSPORT_GATEWAY);
+        gw3.venues = vec![hl];
+        let mut blk11 = core_config::exec::ExecSlot::paper_default(11);
+        blk11.mode = String::from("live");
+        blk11.venues = vec![hl];
+        let slots = [gw3, blk11];
+        // Slot 3 on its gateway beside a live slot 11 on the blocking arm:
+        // refused, naming 11.
+        let e = check_bin15_gateway(&slots, (1 << 3) | (1 << 11)).unwrap_err();
+        assert!(e.contains("slot 11 (reserved)"), "{e}");
+        // A live 11 alone is not slot 3 on its gateway.
+        assert!(check_bin15_gateway(&slots, 1 << 11).is_ok());
+        // Slot 3 alone: slot 11's section is paper by the mask.
+        assert!(check_bin15_gateway(&slots, 1 << 3).is_ok());
+
+        let mut b11 = core_config::exec::ExecSlot::paper_default(11);
+        b11.mode = String::from("live");
+        b11.halt_on_loss_usd_1e6 = 5_000_000;
+        b11.venues = vec![okx, bn];
+        let e = check_pnl_judged(&[b11.clone()], 1 << 11).unwrap_err();
+        assert!(e.contains("slot 11"), "{e}");
+        assert!(check_pnl_judged(&[b11], 1 << 3).is_ok(), "bit 3 is not slot 11");
+    }
+
+    /// **S16-3** — the operator Hyperliquid arm's predicates and the
+    /// Binance owner read a live 11 or 15 as that slot alone — never slot 3
+    /// (BIN15's) or 7, their `u8` aliases — and a live 3 as before. Every
+    /// row is live in the route; the mask alone decides.
+    #[test]
+    fn the_venue_arm_predicates_read_slots_11_and_15_as_themselves() {
+        let hl = core_types::VenueId::Hyperliquid as u8;
+        let bn = core_types::VenueId::Binance as u8;
+        // Hyperliquid: each row's numbers are its own, so the result names
+        // the rows read.
+        let mut b = boot_of(&[
+            (3, hl, 2_000, 5_000, 30_000, true),
+            (7, hl, 9_000, 1, 1, true),
+            (11, hl, 3_000, 6_000, 20_000, true),
+            (15, hl, 8_000, 2, 2, true),
+        ]);
+        for (mask, needed, numbers) in [
+            (1 << 11, true, (3_000, 6_000, 20_000)),
+            (1 << 15, true, (8_000, 2, 2)),
+            ((1 << 11) | (1 << 15), true, (8_000, 2, 2)),
+            (1 << 3, true, (2_000, 5_000, 30_000)),
+            (0, false, (0, 0, 0)),
+        ] {
+            b.live_mask = mask;
+            assert_eq!(b.hl_arm_needed(), needed, "{mask:#06x}");
+            assert_eq!(b.hl_address_numbers(), numbers, "{mask:#06x}");
+            assert_eq!(b.binance_slot(), None, "{mask:#06x}");
+        }
+        // Binance: the one owner, and `check_binance`'s reading of it.
+        let mut b = boot_of(&[
+            (3, bn, 0, 0, 0, true),
+            (7, bn, 0, 0, 0, true),
+            (11, hl, 0, 0, 0, true),
+            (15, bn, 0, 0, 0, true),
+        ]);
+        for (mask, owner) in [
+            (1 << 15, Some(15)),
+            ((1 << 11) | (1 << 15), Some(15)),
+            (1 << 11, None),
+            (1 << 3, Some(3)),
+        ] {
+            b.live_mask = mask;
+            assert_eq!(b.binance_slot(), owner, "{mask:#06x}");
+        }
+        let d = tmp();
+        let p = write(&d, "exec.toml", &format!("{}{BN_SECTION}", bn_live()));
+        let section = resolve(Some(&p), Some("3")).unwrap().unwrap().binance;
+        let s15 = b.slots.iter_mut().find(|s| s.slot == 15).unwrap();
+        s15.halt_on_recon_stale_ms = 1;
+        // Slot 15 owns the arm: its own stale bound is judged, naming it.
+        let e = check_binance(&b.slots, (1 << 11) | (1 << 15), section.as_ref()).unwrap_err();
+        assert!(e.contains("slot 15's halt_on_recon_stale_ms"), "{e}");
+        let e = check_binance(&b.slots, (1 << 3) | (1 << 15), section.as_ref()).unwrap_err();
+        assert!(e.contains("slots [3, 15]"), "{e}");
+        // A live 11 (Hyperliquid) is not slot 3 on Binance; a live 3 owns
+        // the arm as before.
+        assert!(check_binance(&b.slots, 1 << 11, None).is_ok());
+        assert!(check_binance(&b.slots, 1 << 3, section.as_ref()).is_ok());
+        let e = check_binance(&b.slots, 1 << 3, None).unwrap_err();
+        assert!(e.contains("[exec.binance] section"), "{e}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **S16-3** — `--halt-slot`'s mask halts slot 11 alone and reports
+    /// slot 15 (not live) as not halted; BIN15's slot 3 and slot 7 are
+    /// untouched.
+    #[test]
+    fn a_halt_mask_of_11_and_15_halts_11_alone() {
+        let hl = core_types::VenueId::Hyperliquid as u8;
+        let caps = SlotCaps::new(100_000_000, 1_000_000_000, 30_000_000_000, 64);
+        let mut route = ExecRoute::all_paper();
+        for s in [3usize, 7, 11] {
+            route.set_slot(s, ExecMode::Live, &[hl], caps, HaltLimits::none()).unwrap();
+        }
+        let mut d = exec_router::RoutedDispatcher::new(
+            route,
+            clob_dispatcher::PaperDispatcher::new(),
+            exec_router::NullLiveDispatcher::new(),
+            core_time::WallAnchor::new(1, 1),
+        );
+        let (halted, not_live) = apply_halt_mask(&mut d, (1 << 11) | (1 << 15));
+        assert_eq!(halted, 1 << 11);
+        assert_eq!(not_live, 1 << 15);
+        assert!(d.halt().is_halted(11));
+        assert!(!d.halt().is_halted(3), "a halt of 11 never lands on BIN15's 3");
+        assert!(!d.halt().is_halted(7) && !d.halt().is_halted(15));
+        let (halted, not_live) = apply_halt_mask(&mut d, (1 << 3) | (1 << 11));
+        assert_eq!(halted, 1 << 3);
+        assert_eq!(not_live, 1 << 11, "already halted: nothing to latch");
+        assert_eq!(apply_halt_mask(&mut d, 0), (0, 0));
+    }
+
     #[test]
     fn arm_live_parsing() {
         assert_eq!(parse_arm_live("").unwrap(), 0);
         assert_eq!(parse_arm_live("3").unwrap(), 0b0000_1000);
         assert_eq!(parse_arm_live("3,5").unwrap(), 0b0010_1000);
         assert_eq!(parse_arm_live(" 3 , 5 ").unwrap(), 0b0010_1000);
-        assert!(parse_arm_live("8").unwrap_err().contains("out of range"));
+        // S16-3: 16 is the first slot past the table (8 was, at eight).
+        assert!(parse_arm_live("16").unwrap_err().contains("out of range"));
+        assert!(parse_arm_live("255").unwrap_err().contains("out of range"));
+        // Slot 11 arms bit 11 alone — never bit 3, BIN15's (its `u8` alias).
+        assert_eq!(parse_arm_live("11").unwrap(), 1 << 11);
+        assert_eq!(parse_arm_live("11").unwrap() & (1 << 3), 0);
+        assert_eq!(parse_arm_live("15").unwrap(), 1 << 15);
+        assert_eq!(parse_arm_live("3,11").unwrap(), (1 << 3) | (1 << 11));
+        assert!(parse_arm_live("3,11,3").unwrap_err().contains("named twice"));
         assert!(parse_arm_live("x").unwrap_err().contains("not a slot number"));
         assert!(parse_arm_live("3,3").unwrap_err().contains("named twice"));
     }
@@ -2466,11 +2788,12 @@ mod tests {
         assert_eq!(lines.len(), 1, "no live slot, so no second line");
         let l = &lines[0];
         assert!(l.starts_with("exec: artifact configured hash="), "{l}");
-        assert!(l.contains("slots=8"), "{l}");
+        // S16-3: sixteen slots (the boot tell's `slots=16`).
+        assert!(l.contains("slots=16"), "{l}");
         assert!(l.contains("enabled=1"), "{l}");
         assert!(l.contains("live=[]"), "{l}");
         assert!(l.contains("off=[6]"), "{l}");
-        assert!(l.contains("paper=[0,1,2,3,4,5,7]"), "{l}");
+        assert!(l.contains("paper=[0,1,2,3,4,5,7,8,9,10,11,12,13,14,15]"), "{l}");
         // The hash is the artifact's, not a constant.
         let hex: String = b.hash.iter().map(|x| format!("{x:02x}")).collect();
         assert!(l.contains(&hex), "{l}");

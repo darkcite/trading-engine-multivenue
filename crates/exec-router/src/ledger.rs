@@ -68,7 +68,9 @@
 
 use crate::route::EXEC_SLOTS;
 use core_time::WallAnchor;
-use core_types::{net_exposure_1e8, Fill, SymbolId, FILL_ORIGIN_VENUE, SYMBOL_ID_NONE};
+use core_types::{
+    net_exposure_1e8, Fill, SlotMask, SymbolId, FILL_ORIGIN_VENUE, SYMBOL_ID_NONE,
+};
 
 /// Rows the ledger can hold, **one per FAMILY**.
 ///
@@ -104,13 +106,18 @@ pub const LEDGER_ROWS: usize = 16;
 /// Live-arm orders the resting table can hold at once.
 ///
 /// `exec.toml`'s shipped `max_open_orders` is 64 per slot and
-/// [`EXEC_SLOTS`] is 8, so 512 is exactly "every slot at its cap".
+/// [`EXEC_SLOTS`] is 16, so 1 024 is exactly "every slot at its cap"
+/// (S16-R2: 512 at eight slots, raised with the slot count so a slot's
+/// equal share — `core_config::exec::MAX_OPEN_ORDERS_PER_SLOT` — stays
+/// 64 rather than halving to 32 and refusing BIN15's shipped artifact).
 /// Sized to the clamp rather than above it so that the table filling
 /// up is not reachable while the clamp is doing its job — if
 /// [`LedgerCounters::resting_full`] is ever non-zero, either the
 /// clamps are unset or something is not retiring orders, and both are
 /// operator-visible facts rather than silent truncation.
-pub const LEDGER_RESTING: usize = 512;
+pub const LEDGER_RESTING: usize = 1024;
+// Every slot's equal share is the shipped 64.
+const _: () = assert!(LEDGER_RESTING / EXEC_SLOTS == 64);
 
 /// Nanoseconds in a day. The day cap's epoch, matching
 /// `strategy_bin15`'s own `DAY_NS` so the two roll at the same
@@ -155,11 +162,16 @@ pub const INST_CALL: u8 = 1 << 1;
 const INST_STALE: u8 = 1 << 7;
 
 /// **One row's exposure for one slot is clamped here**, USD ×1e6 (about
-/// $18 bn). Every sum over [`LEDGER_INSTRUMENTS`] rows then fits an
-/// `i64` exactly, so the per-slot aggregate is kept by exact adds and
-/// subtracts and cannot drift from a full recompute. No cap is near it,
-/// so a clamped row still refuses whatever a true one would.
-pub const INST_EXPOSURE_MAX: i64 = i64::MAX / 512;
+/// $9 bn). Every sum over [`LEDGER_INSTRUMENTS`] rows — and every sum
+/// over [`LEDGER_RESTING`] resting rows, `Ledger::resting_usd_1e6`'s
+/// terms — then fits an `i64` exactly, so the per-slot aggregates are
+/// kept by exact adds and subtracts and cannot drift from a full
+/// recompute. No cap is near it, so a clamped row still refuses whatever
+/// a true one would. (`i64::MAX / 512`, about $18 bn, until S16-R2 grew
+/// the resting table 512 → 1 024 rows: the divisor is the larger table.)
+pub const INST_EXPOSURE_MAX: i64 = i64::MAX / 1024;
+const _: () = assert!(INST_EXPOSURE_MAX as i128 * LEDGER_RESTING as i128 <= i64::MAX as i128);
+const _: () = assert!(INST_EXPOSURE_MAX as i128 * LEDGER_INSTRUMENTS as i128 <= i64::MAX as i128);
 
 /// What the boot binds one instrument row from (BX6: from discovery).
 #[repr(C)]
@@ -227,8 +239,9 @@ pub enum InstrumentBindErr {
 }
 
 /// One bound instrument: its law, its prices and every slot's signed
-/// position and exposure. `#[repr(C)]`, exactly 192 B — three lines, the
-/// positions and the cached exposures each one line of their own.
+/// position and exposure. `#[repr(C)]`, exactly 320 B — five lines: the
+/// header one, the positions two and the cached exposures two (S16-3;
+/// 192 B, one line each, at eight slots).
 #[repr(C, align(64))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct InstrumentRow {
@@ -252,11 +265,11 @@ struct InstrumentRow {
     /// **XH4e (XH2-C)** — bit `s`: slot `s` holds a position on this
     /// LINEAR row and no mark prices it (none yet, or expired). Kept by
     /// [`Ledger::refresh_instrument`], counted per slot in
-    /// `Ledger::inst_unmarked`.
-    unmarked: u8,
+    /// `Ledger::inst_unmarked`. A [`SlotMask`] since S16-3.
+    unmarked: SlotMask,
     /// **XMM XH5a** — [`InstrumentSpec::owner`].
     owner: u8,
-    _pad1: [u8; 6],
+    _pad1: [u8; 5],
     /// Index = slot. Signed position ×1e6 (base units, or contracts).
     pos_1e6: [i64; EXEC_SLOTS],
     /// Index = slot. Exposure at the row's own prices, USD ×1e6 —
@@ -264,12 +277,17 @@ struct InstrumentRow {
     exp_1e6: [i64; EXEC_SLOTS],
 }
 
-const _: () = assert!(core::mem::size_of::<InstrumentRow>() == 192);
+// S16-3 re-pin (192 → 320 B): the header still fills line 0 exactly
+// (`unmarked` widened into a byte of `_pad1`), and each per-slot array
+// is two whole lines, so a fill's position write and its exposure
+// refresh each touch one line of their own for a slot.
+const _: () = assert!(core::mem::size_of::<InstrumentRow>() == 320);
 const _: () = assert!(core::mem::align_of::<InstrumentRow>() == 64);
+const _: () = assert!(core::mem::offset_of!(InstrumentRow, unmarked) == 56);
 const _: () = assert!(core::mem::offset_of!(InstrumentRow, pos_1e6) == 64);
-const _: () = assert!(core::mem::offset_of!(InstrumentRow, exp_1e6) == 128);
+const _: () = assert!(core::mem::offset_of!(InstrumentRow, exp_1e6) == 64 + 8 * EXEC_SLOTS);
 // XH4e: `InstrumentRow::unmarked` holds one bit per slot.
-const _: () = assert!(EXEC_SLOTS <= 8);
+const _: () = assert!(EXEC_SLOTS <= SlotMask::BITS as usize);
 
 impl InstrumentRow {
     const FREE: Self = Self {
@@ -285,7 +303,7 @@ impl InstrumentRow {
         mark_ns: 0,
         unmarked: 0,
         owner: OWNER_NONE,
-        _pad1: [0; 6],
+        _pad1: [0; 5],
         pos_1e6: [0; EXEC_SLOTS],
         exp_1e6: [0; EXEC_SLOTS],
     };
@@ -478,8 +496,9 @@ const _: () = assert!(core::mem::size_of::<InstProbe>() == 64);
 
 /// One FAMILY's current instance, and the per-slot position in it.
 ///
-/// `#[repr(C)]` and exactly 192 B — three cache lines. A fill touches
-/// one of these and nothing else.
+/// `#[repr(C)]` and exactly 320 B — five cache lines (S16-3; 192 B, three,
+/// at eight slots). A fill touches one of these and nothing else: the
+/// header and its slot's Yes and No positions.
 #[repr(C, align(64))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct FamilyRow {
@@ -532,10 +551,12 @@ struct FamilyRow {
     _pad: [u8; 48],
 }
 
-const _: () = assert!(core::mem::size_of::<FamilyRow>() == 192);
+// S16-3 re-pin: 16 B header + two `[i64; 16]` (256 B) = 272 B, and the
+// same 48 B tail pad rounds it to 320 B — five lines (192 B at eight).
+const _: () = assert!(core::mem::size_of::<FamilyRow>() == 320);
 const _: () = assert!(core::mem::align_of::<FamilyRow>() == 64);
 const _: () = assert!(core::mem::offset_of!(FamilyRow, pos_yes_1e6) == 16);
-const _: () = assert!(core::mem::offset_of!(FamilyRow, pos_no_1e6) == 80);
+const _: () = assert!(core::mem::offset_of!(FamilyRow, pos_no_1e6) == 16 + 8 * EXEC_SLOTS);
 
 /// A free row's family byte. Not a valid index — the roll seq carries
 /// the family in 8 bits and every real one is below [`LEDGER_ROWS`].
@@ -758,8 +779,8 @@ pub struct Ledger {
     /// **Per slot since HYPARB L4** (bit `s` = slot `s`): with two
     /// live arms, each slot is seeded by the reconciler of the arm
     /// that trades it, so slot 0's first reconcile never admits slot
-    /// 3's orders, nor the reverse.
-    seeded: u8,
+    /// 3's orders, nor the reverse. A [`SlotMask`] since S16-3.
+    seeded: SlotMask,
     counters: LedgerCounters,
     /// **BX3** — bound instrument ids, sorted ascending; the free tail
     /// is [`SYMBOL_ID_NONE`] (`u32::MAX`), which sorts last.
@@ -797,6 +818,14 @@ pub struct Ledger {
     /// notional of every order the table could not hold — never released,
     /// like its count.
     resting_usd_1e6: [i64; EXEC_SLOTS],
+    /// **S16-3 review — the resting table's high-water mark.** Every row
+    /// at an index `>=` it is free, and the row below it is live (or it
+    /// is `0`), so every occupancy scan runs over `0..resting_hi` — the
+    /// live prefix — rather than all [`LEDGER_RESTING`] rows: the
+    /// 512 → 1 024 table no longer doubles a live fill's, cancel's or
+    /// modify's lookup. Kept by [`Self::occupy`] and [`Self::release`]
+    /// alone, the only two places a row's liveness changes.
+    resting_hi: u16,
 }
 
 // **No `Default`.** A `Ledger` needs the boot's monotonic→wall
@@ -806,8 +835,17 @@ pub struct Ledger {
 // `Ledger::new` takes the anchor so that forgetting it is a compile
 // error rather than a cap that quietly stops resetting.
 
+// The high-water mark is a `u16`: it reaches `LEDGER_RESTING` itself.
+const _: () = assert!(LEDGER_RESTING <= u16::MAX as usize);
+
 // XMM XH4f: the router's boot move of it states this size (routed.rs).
-const _: () = assert!(core::mem::size_of::<Ledger>() == 82_368);
+// S16-3 re-pin (82 368 → 146 048 B): the 256 instrument rows 192 → 320 B
+// (+32 KiB), the resting table and its four parallel price/size/oid
+// arrays 512 → 1 024 rows (+28 KiB), the 16 family rows 192 → 320 B
+// (+2 KiB) and the per-slot arrays doubled. The S16-3 review's
+// `resting_hi` (u16) sits in the 2 B the u16 `seeded` and the u32 `inst_n`
+// left as padding: the size is unchanged.
+const _: () = assert!(core::mem::size_of::<Ledger>() == 146_048);
 
 impl Ledger {
     /// An empty, UNSEEDED ledger: nothing bound, nothing held,
@@ -837,6 +875,7 @@ impl Ledger {
             resting_qty_asked_1e6: [0; LEDGER_RESTING],
             resting_asked_oid: [0; LEDGER_RESTING],
             resting_usd_1e6: [0; EXEC_SLOTS],
+            resting_hi: 0,
         }
     }
 
@@ -851,7 +890,7 @@ impl Ledger {
     /// of them. [`Self::mark_slot_seeded`] is the per-arm form.
     #[inline]
     pub fn mark_seeded(&mut self) {
-        self.seeded = u8::MAX;
+        self.seeded = SlotMask::MAX;
     }
 
     /// HYPARB L4: slot `slot`'s arm has reconciled. A slot at or above
@@ -859,7 +898,8 @@ impl Ledger {
     #[inline]
     pub fn mark_slot_seeded(&mut self, slot: usize) {
         if slot < EXEC_SLOTS {
-            self.seeded |= 1 << slot;
+            // `slot < EXEC_SLOTS <= SlotMask::BITS`: the shift is exact.
+            self.seeded |= (1 as SlotMask) << slot;
         }
     }
 
@@ -876,7 +916,7 @@ impl Ledger {
     #[inline]
     #[must_use]
     pub const fn is_slot_seeded(&self, slot: usize) -> bool {
-        slot < EXEC_SLOTS && self.seeded & (1 << slot) != 0
+        slot < EXEC_SLOTS && self.seeded & ((1 as SlotMask) << slot) != 0
     }
 
     /// What the ledger had to refuse. Cold; `/metrics` and `/state`.
@@ -1366,8 +1406,11 @@ impl Ledger {
     }
 
     fn drop_resting_on(&mut self, sym_yes: SymbolId, sym_no: SymbolId) {
+        // The live prefix as it stands: a release below may lower the
+        // mark, and every row it passes over is free.
+        let end = self.resting_end();
         let mut j = 0usize;
-        while j < LEDGER_RESTING {
+        while j < end {
             // Three fields read before `release` mutates the row — a
             // reference would hold `self` across that call.
             let (live, sym) = (self.resting[j].live, self.resting[j].sym);
@@ -1773,7 +1816,8 @@ impl Ledger {
         let bare = r.law == LAW_LINEAR && r.mark_1e6 <= 0;
         let mut s = 0usize;
         while s < EXEC_SLOTS {
-            let bit = 1u8 << s;
+            // `s < EXEC_SLOTS <= SlotMask::BITS`: the shift is exact.
+            let bit: SlotMask = 1 << s;
             // A flat slot with nothing cached and nothing counted has
             // nothing to re-price — and skipping it skips the i128
             // divides a mark would otherwise cost every slot on every row.
@@ -2152,19 +2196,19 @@ impl Ledger {
                 self.resting_usd_1e6[slot].saturating_add(mul_1e6(qty_1e6, px_1e6));
             return;
         }
-        self.resting[free] = RestingOrder {
-            client_oid,
-            remaining_1e6: qty_1e6,
-            sym,
-            slot: slot as u8,
-            live: 1,
-            side: resting_side(buy),
-            _pad: [0; 1],
-        };
-        self.resting_px_1e6[free] = px_1e6;
-        self.resting_px_asked_1e6[free] = 0;
-        self.resting_qty_asked_1e6[free] = 0;
-        self.resting_asked_oid[free] = 0;
+        self.occupy(
+            free,
+            RestingOrder {
+                client_oid,
+                remaining_1e6: qty_1e6,
+                sym,
+                slot: slot as u8,
+                live: 1,
+                side: resting_side(buy),
+                _pad: [0; 1],
+            },
+            px_1e6,
+        );
         self.resting_reterm(free, 0);
         self.resting_by_slot[slot] = self.resting_by_slot[slot].saturating_add(1);
     }
@@ -2186,8 +2230,10 @@ impl Ledger {
         if slot >= EXEC_SLOTS {
             return;
         }
+        // The live prefix as it stands, as `drop_resting_on`.
+        let end = self.resting_end();
         let mut i = 0usize;
-        while i < LEDGER_RESTING {
+        while i < end {
             if self.resting[i].live != 0 && usize::from(self.resting[i].slot) == slot {
                 self.release(i);
             }
@@ -2222,8 +2268,9 @@ impl Ledger {
                 if client_oid == 0 {
                     return;
                 }
+                let end = self.resting_end();
                 let mut i = 0usize;
-                while i < LEDGER_RESTING {
+                while i < end {
                     if self.resting_asked_oid[i] == client_oid
                         && self.resting[i].live == 1
                         && self.resting[i].slot as usize == slot
@@ -2353,8 +2400,9 @@ impl Ledger {
         let (mut total, mut held) = (0i64, 0i64);
         let mut hit = LEDGER_RESTING;
         let mut hits = 0u32;
+        let end = self.resting_end();
         let mut i = 0usize;
-        while i < LEDGER_RESTING {
+        while i < end {
             let r = &self.resting[i];
             if r.live == 1 && r.slot as usize == slot {
                 if skip && r.client_oid == skip_oid {
@@ -2395,15 +2443,20 @@ impl Ledger {
     /// verb that counts it (XH4e: a modify's projection, a queued
     /// modify's asked price).
     fn locate(&self, client_oid: u64, slot: usize) -> Found {
+        #[cfg(debug_assertions)]
+        debug_assert!(self.resting_hi_holds(), "a live resting row above the mark");
         if slot >= EXEC_SLOTS {
             return Found::None;
         }
         let mut found = LEDGER_RESTING;
         let mut n = 0usize;
+        // Every live row is below the mark, so two rows under one key are
+        // both in the prefix: `Many` is reported exactly as by a full pass.
+        let end = self.resting_end();
         let mut i = 0usize;
-        while i < LEDGER_RESTING {
-            // By reference: 24 B × 512 rows per venue fill would be a
-            // 12 KiB memcpy for a three-field compare.
+        while i < end {
+            // By reference: 24 B × 1 024 rows per venue fill would be a
+            // 24 KiB memcpy for a three-field compare.
             let r = &self.resting[i];
             if r.live == 1 && r.client_oid == client_oid && r.slot as usize == slot {
                 n += 1;
@@ -2452,8 +2505,40 @@ impl Ledger {
             .saturating_add(new);
     }
 
+    /// **S16-3 review** — the end of the resting table's live prefix:
+    /// every row from here up is free ([`Self::resting_hi`]), so an
+    /// occupancy scan stops here.
+    #[inline(always)]
+    fn resting_end(&self) -> usize {
+        usize::from(self.resting_hi)
+    }
+
+    /// **S16-3 review** — the free row `i` takes `row`, at limit `px_1e6`,
+    /// with no modify held: THE place a resting row becomes live, so the
+    /// one place the high-water mark rises. The caller moves the count
+    /// and the notional.
+    #[inline(always)]
+    fn occupy(&mut self, i: usize, row: RestingOrder, px_1e6: i64) {
+        debug_assert!(i < LEDGER_RESTING && self.resting[i].live == 0 && row.live == 1);
+        self.resting[i] = row;
+        self.resting_px_1e6[i] = px_1e6;
+        self.resting_px_asked_1e6[i] = 0;
+        self.resting_qty_asked_1e6[i] = 0;
+        self.resting_asked_oid[i] = 0;
+        // `i + 1 <= LEDGER_RESTING <= u16::MAX` (pinned above): exact. A
+        // hole below the mark leaves it where it is.
+        self.resting_hi = self.resting_hi.max((i + 1) as u16);
+        #[cfg(debug_assertions)]
+        debug_assert!(self.resting_hi_holds(), "occupy left a live row above the mark");
+    }
+
+    /// The live row `i` goes, with its count and notional: THE place a
+    /// resting row becomes free, so the one place the high-water mark
+    /// falls — past the whole run of free rows the release opened at the
+    /// top of the prefix, never otherwise.
     #[inline]
     fn release(&mut self, i: usize) {
+        debug_assert!(i < self.resting_end() && self.resting[i].live == 1);
         let slot = self.resting[i].slot as usize;
         let old = self.resting_term(i);
         self.resting[i] = RestingOrder::free();
@@ -2465,6 +2550,36 @@ impl Ledger {
             self.resting_by_slot[slot] = self.resting_by_slot[slot].saturating_sub(1);
             self.resting_usd_1e6[slot] = self.resting_usd_1e6[slot].saturating_sub(old);
         }
+        if i + 1 == self.resting_end() {
+            let mut end = i;
+            while end > 0 && self.resting[end - 1].live == 0 {
+                end -= 1;
+            }
+            // `end <= i < LEDGER_RESTING <= u16::MAX`: exact.
+            self.resting_hi = end as u16;
+        }
+        #[cfg(debug_assertions)]
+        debug_assert!(self.resting_hi_holds(), "release left a live row above the mark");
+    }
+
+    /// **S16-3 review (debug only)** — the mark's invariant, by a pass over
+    /// the rows the scans skip: none from the mark up is live, and the
+    /// row just below it is (the mark is tight, so the scans are as short
+    /// as they can be).
+    #[cfg(debug_assertions)]
+    fn resting_hi_holds(&self) -> bool {
+        let end = self.resting_end();
+        if end > LEDGER_RESTING || (end > 0 && self.resting[end - 1].live == 0) {
+            return false;
+        }
+        let mut i = end;
+        while i < LEDGER_RESTING {
+            if self.resting[i].live != 0 {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 }
 
@@ -3252,6 +3367,107 @@ mod tests {
         assert!(!l.is_slot_seeded(EXEC_SLOTS), "no slot past the table");
         l.mark_seeded();
         assert!(l.is_seeded() && l.is_slot_seeded(3) && l.is_slot_seeded(7));
+        assert!(l.is_slot_seeded(11) && l.is_slot_seeded(15), "every slot, not eight");
+    }
+
+    /// **S16-3** — slot 11 is tracked apart from slot 3 (its `& 7` alias
+    /// at eight slots, BIN15's): its seeded bit, its resting order and
+    /// count, and its family position. Debug builds panic on a `u8`
+    /// shift by 11, so this also runs every bit path at a slot ≥ 8.
+    #[test]
+    fn slot_11_is_seeded_rests_and_holds_apart_from_slot_3() {
+        let mut l = Ledger::new(anchor());
+        l.mark_slot_seeded(11);
+        assert!(l.is_slot_seeded(11) && !l.is_slot_seeded(SLOT));
+        l.mark_slot_seeded(15);
+        assert!(l.is_slot_seeded(15) && !l.is_slot_seeded(7));
+        l.mark_slot_seeded(16);
+        assert!(!l.is_slot_seeded(16) && !l.is_slot_seeded(0));
+        l.bind(VENUE, FAM, 20_182, sym(100));
+        l.on_submit(7, 11, sym(100), 5_000_000, true, 0);
+        l.on_submit(7, SLOT, sym(100), 1_000_000, true, 0);
+        assert_eq!(l.slot_resting(11), 1);
+        assert_eq!(l.slot_resting(SLOT), 1);
+        let f = Fill::new(T0, sym(100), Side::Bid, Price::from_raw(500_000), Qty::from_raw(2_000_000), 7)
+            .with_attribution(11, FILL_ORIGIN_VENUE);
+        l.book_fill(&f);
+        assert_eq!(l.position_1e6(11, 20_182), Some((2_000_000, 0)));
+        assert_eq!(l.position_1e6(SLOT, 20_182), Some((0, 0)), "slot 3 holds nothing");
+        assert_eq!(l.slot_resting(11), 1, "3 of 5 still working");
+        l.on_cancel(7, 11);
+        assert_eq!(l.slot_resting(11), 0);
+        assert_eq!(l.slot_resting(SLOT), 1, "slot 3's order of the same id stays");
+        assert_eq!(l.counters().resting_ambiguous, 0);
+    }
+
+    /// **S16-3** — a linear position of slot 11 with no mark sets slot
+    /// 11's `unmarked` bit and count, never slot 3's; slot 15's likewise.
+    #[test]
+    fn slot_11_and_15_unmarked_bits_are_their_own() {
+        let mut l = inst();
+        l.book_fill(&fill(T0, LIN, true, 100 * E6, 2 * E6, 1).with_attribution(11, FILL_ORIGIN_VENUE));
+        assert_eq!(l.unmarked_positions(11), 1);
+        assert_eq!(l.unmarked_positions(SLOT), 0);
+        assert_eq!(l.instrument_position_1e6(11, LIN), Some(2 * E6));
+        assert_eq!(l.instrument_position_1e6(SLOT, LIN), Some(0));
+        l.book_fill(&fill(T0, LIN, false, 100 * E6, E6, 2).with_attribution(15, FILL_ORIGIN_VENUE));
+        assert_eq!(l.unmarked_positions(15), 1);
+        assert_eq!(l.unmarked_positions(7), 0);
+        l.on_mark(LIN, 100 * E6, 100 * E6, 5);
+        assert_eq!(l.unmarked_positions(11), 0, "a mark prices both");
+        assert_eq!(l.unmarked_positions(15), 0);
+        l.expire_marks(6 + MARK_STALE_NS);
+        assert_eq!(l.unmarked_positions(11), 1);
+        assert_eq!(l.unmarked_positions(15), 1);
+        assert_eq!(l.unmarked_positions(SLOT), 0);
+        assert_eq!(l.unmarked_positions(7), 0);
+    }
+
+    /// **S16-R2 — the resting notional stays exact at the boundary**: one
+    /// slot holding every one of the 1 024 rows, each term at the clamp.
+    /// It cannot overflow: a slot holds at most `LEDGER_RESTING` rows and
+    /// each term is at most `INST_EXPOSURE_MAX` = ⌊i64::MAX / 1 024⌋, so
+    /// the sum is at most 1 024 × ⌊i64::MAX / 1 024⌋ ≤ i64::MAX. (At the
+    /// old `i64::MAX / 512` the same table saturated at row 513, and the
+    /// releases below would then have read a drifted sum.)
+    #[test]
+    fn the_resting_notional_is_exact_with_every_row_at_the_clamp() {
+        let mut l = bound();
+        let n = LEDGER_RESTING as u64;
+        for k in 0..n {
+            l.on_submit(k + 1, SLOT, sym(100), i64::MAX, true, i64::MAX);
+        }
+        assert_eq!(l.counters().resting_full, 0);
+        assert_eq!(l.slot_resting(SLOT), LEDGER_RESTING as u32);
+        let full = i64::try_from(n as i128 * INST_EXPOSURE_MAX as i128).unwrap();
+        assert_eq!(l.resting_usd_1e6(SLOT), full, "no saturation");
+        assert!(full > i64::MAX - INST_EXPOSURE_MAX, "the table reaches the top of i64");
+        // Release all but one: every subtraction exact, back to one term.
+        for k in 1..n {
+            l.on_cancel(k + 1, SLOT);
+        }
+        assert_eq!(l.resting_usd_1e6(SLOT), INST_EXPOSURE_MAX);
+        l.on_cancel(1, SLOT);
+        assert_eq!(l.resting_usd_1e6(SLOT), 0);
+        assert_eq!(l.slot_resting(SLOT), 0);
+    }
+
+    /// **S16-R2** — sixteen slots at the shipped 64 open orders each fill
+    /// the resting table exactly, and none of them spills.
+    #[test]
+    fn sixteen_slots_at_64_open_orders_fill_the_table_exactly() {
+        let mut l = bound();
+        for s in 0..EXEC_SLOTS {
+            for k in 0..64u64 {
+                l.on_submit(k + 1, s, sym(100), 1, true, 0);
+            }
+        }
+        for s in 0..EXEC_SLOTS {
+            assert_eq!(l.slot_resting(s), 64, "slot {s}");
+        }
+        assert_eq!(l.counters().resting_full, 0);
+        l.on_submit(999, 11, sym(100), 1, true, 0);
+        assert_eq!(l.counters().resting_full, 1, "the 1 025th has no row");
     }
 
     #[test]
@@ -4243,9 +4459,19 @@ mod tests {
             InstrumentSpec::new(LIN, LAW_LINEAR, 0, 0, 0).owner,
             OWNER_NONE
         );
-        // An owner past the slots is no owner: refused at the bind.
-        let past = InstrumentSpec::new(bn(8), LAW_LINEAR, 0, 0, 0).owned_by(8);
+        // An owner past the slots is no owner: refused at the bind
+        // (16 since S16-3; 8 was, at eight slots).
+        let past = InstrumentSpec::new(bn(8), LAW_LINEAR, 0, 0, 0).owned_by(EXEC_SLOTS as u8);
         assert_eq!(l.bind_instrument(&past), Err(InstrumentBindErr::BadSpec));
+        // S16-3: slot 11 can own a row, and slot 3 (its `& 7` alias at
+        // eight slots, BIN15's) is a stranger to it.
+        let o11 = bn(9);
+        l.bind_instrument(&InstrumentSpec::new(o11, LAW_LINEAR, 0, 0, 0).owned_by(11))
+            .unwrap();
+        let p3 = l.probe_perp(o11, 3, E6, true, 100 * E6, None).unwrap();
+        assert_eq!(p3.refusal, InstRefusal::Foreign);
+        let p11 = l.probe_perp(o11, 11, E6, true, 100 * E6, None).unwrap();
+        assert_eq!(p11.refusal, InstRefusal::None);
     }
 
     /// **XH4e — the resting notional is exact**: after any mix of submits,
@@ -4333,5 +4559,270 @@ mod tests {
             }
             step += 1;
         }
+    }
+
+    // -----------------------------------------------------------------
+    // S16-3 review — the resting table's high-water mark
+    // -----------------------------------------------------------------
+
+    /// The tight mark by brute force: one past the highest live row.
+    fn hi_full(l: &Ledger) -> usize {
+        let mut i = LEDGER_RESTING;
+        while i > 0 && l.resting[i - 1].live == 0 {
+            i -= 1;
+        }
+        i
+    }
+
+    /// [`Ledger::locate`] over the WHOLE table, ignoring the mark: the
+    /// reference the bounded scan must agree with.
+    fn locate_full(l: &Ledger, client_oid: u64, slot: usize) -> Found {
+        let (mut n, mut at, mut i) = (0usize, 0usize, 0usize);
+        while i < LEDGER_RESTING {
+            let r = &l.resting[i];
+            if r.live == 1 && r.client_oid == client_oid && r.slot as usize == slot {
+                if n == 0 {
+                    at = i;
+                }
+                n += 1;
+            }
+            i += 1;
+        }
+        match n {
+            0 => Found::None,
+            1 => Found::One(at),
+            _ => Found::Many,
+        }
+    }
+
+    /// [`Ledger::working_on`] over the WHOLE table, ignoring the mark.
+    fn working_on_full(
+        l: &Ledger,
+        slot: usize,
+        sym: SymbolId,
+        buy: bool,
+        exclude: Option<u64>,
+    ) -> (i64, i64, i64) {
+        let side = resting_side(buy);
+        let (mut total, mut held, mut hits, mut hit) = (0i64, 0i64, 0u32, 0usize);
+        let mut i = 0usize;
+        while i < LEDGER_RESTING {
+            let r = &l.resting[i];
+            if r.live == 1 && r.slot as usize == slot {
+                if exclude == Some(r.client_oid) {
+                    hits += 1;
+                    hit = i;
+                } else if r.sym == sym && r.side == side {
+                    total = total.saturating_add(r.remaining_1e6.max(0));
+                    held = held.saturating_add(l.resting_qty(i));
+                }
+            }
+            i += 1;
+        }
+        let replaced = if hits == 1 { l.resting_term(hit) } else { 0 };
+        (total, held, replaced)
+    }
+
+    /// Some live row's key, from a row at or after `pick` within the
+    /// prefix (wrapping); `None` on an empty table.
+    fn live_key(l: &Ledger, pick: usize) -> Option<(u64, usize)> {
+        let end = usize::from(l.resting_hi);
+        let mut j = 0usize;
+        while j < end {
+            let r = &l.resting[(pick + j) % end];
+            if r.live == 1 {
+                return Some((r.client_oid, r.slot as usize));
+            }
+            j += 1;
+        }
+        None
+    }
+
+    #[test]
+    fn the_resting_mark_falls_across_a_run_of_trailing_frees() {
+        let mut l = bound();
+        for k in 1..=10u64 {
+            l.on_submit(k, SLOT, sym(100), E6, true, E6);
+        }
+        assert_eq!(l.resting_hi, 10);
+        // Rows 7 and 8 go: a run below the top row, so the mark stays.
+        l.on_cancel(8, SLOT);
+        l.on_cancel(9, SLOT);
+        assert_eq!(l.resting_hi, 10);
+        // The top row goes: the mark falls past all three, to row 6's end.
+        l.on_cancel(10, SLOT);
+        assert_eq!(l.resting_hi, 7);
+        l.consume_resting(7, SLOT, E6);
+        assert_eq!(l.resting_hi, 6);
+        assert_eq!(l.slot_resting(SLOT), 6);
+    }
+
+    #[test]
+    fn a_hole_below_the_resting_mark_is_reused_and_the_mark_does_not_grow() {
+        let mut l = bound();
+        for k in 1..=5u64 {
+            l.on_submit(k, SLOT, sym(100), E6, true, E6);
+        }
+        l.on_cancel(3, SLOT);
+        assert_eq!(l.resting_hi, 5);
+        l.on_submit(6, SLOT, sym(100), E6, true, E6);
+        assert_eq!(l.locate(6, SLOT), Found::One(2));
+        assert_eq!(l.resting_hi, 5);
+        // The next submit has no hole: it takes the row AT the mark.
+        l.on_submit(7, SLOT, sym(100), E6, true, E6);
+        assert_eq!(l.locate(7, SLOT), Found::One(5));
+        assert_eq!(l.resting_hi, 6);
+    }
+
+    #[test]
+    fn a_full_resting_table_marks_every_row_and_an_emptied_one_none() {
+        let mut l = bound();
+        let mut k = 0usize;
+        while k < LEDGER_RESTING {
+            l.on_submit(k as u64 + 1, k % EXEC_SLOTS, sym(100), E6, true, E6);
+            k += 1;
+        }
+        assert_eq!(usize::from(l.resting_hi), LEDGER_RESTING);
+        // The last row is found: the bounded scan reaches the table's end.
+        let last = LEDGER_RESTING - 1;
+        assert_eq!(l.locate(last as u64 + 1, last % EXEC_SLOTS), Found::One(last));
+        // Released bottom-up: the mark holds until the top row goes.
+        k = 0;
+        while k < LEDGER_RESTING {
+            l.on_cancel(k as u64 + 1, k % EXEC_SLOTS);
+            k += 1;
+            let want = if k == LEDGER_RESTING { 0 } else { LEDGER_RESTING };
+            assert_eq!(usize::from(l.resting_hi), want);
+        }
+        let mut s = 0usize;
+        while s < EXEC_SLOTS {
+            assert_eq!(l.slot_resting(s), 0);
+            assert_eq!(l.resting_usd_1e6(s), 0);
+            s += 1;
+        }
+    }
+
+    /// **The bounded scans agree with full ones**: 200 000 mixed submits,
+    /// fills (partial and whole), cancels, retirements, priced, asked and
+    /// confirmed modifies, roll drops and slot clears over all sixteen
+    /// slots, the table driven full, empty and between; after every one
+    /// the mark is the tight brute-force one, a lookup and a working-order
+    /// sum agree with whole-table passes, and every slot's count and
+    /// resting notional equal a whole-table recompute.
+    #[test]
+    fn the_resting_mark_bounds_every_scan_without_changing_an_answer() {
+        const STEPS: u64 = 200_000;
+        const OIDS: u64 = 4_096;
+        let syms = [sym(100), sym(101), sym(102)];
+        let mut x = 0xD1B5_4A32_D192_ED03u64;
+        let mut l = bound();
+        let (mut live_n, mut max_hi, mut many) = (0usize, 0usize, 0u32);
+        let mut emptied = 0u32;
+        let mut step = 0u64;
+        while step < STEPS {
+            // Fill, drain and churn, 20 000 steps each, in turn.
+            let phase = (step / 20_000) % 3;
+            let submit_w = [9u64, 1, 4][phase as usize];
+            let r = rng(&mut x);
+            let slot = (r % EXEC_SLOTS as u64) as usize;
+            let s_ix = ((r >> 8) % 3) as usize;
+            let buy = (r >> 12) & 1 == 0;
+            let qty = ((r >> 16) % 6 + 1) as i64 * E6;
+            let px = ((r >> 24) % 900 + 1) as i64 * E6;
+            let pick = (r >> 40) as usize;
+            let fresh = rng(&mut x) % OIDS + 1;
+            // Half the verbs name a live key (a hit, or `Many`), half a
+            // random one (mostly a miss); a drain names live keys only.
+            let key = match live_key(&l, pick) {
+                Some(k) if phase == 1 || pick & 1 == 0 => k,
+                _ => (fresh, slot),
+            };
+            let op = rng(&mut x) % 16;
+            if op < submit_w {
+                if live_n < LEDGER_RESTING {
+                    // One submit in 64 reuses a live key: an ambiguous one.
+                    let (o, s) = if pick % 64 == 0 { key } else { (fresh, slot) };
+                    l.on_submit(o, s, syms[s_ix], qty, buy, px);
+                }
+            } else {
+                match (op - submit_w) % 7 {
+                    0 => l.consume_resting(key.0, key.1, qty),
+                    1 => l.on_cancel(key.0, key.1),
+                    2 => l.on_retired(key.0, key.1),
+                    3 => l.on_modify_asked(key.0, fresh, key.1, qty, px),
+                    4 if live_n < LEDGER_RESTING => {
+                        let p = if pick % 3 == 0 { 0 } else { px };
+                        l.on_modify(key.0, fresh, key.1, syms[s_ix], qty, buy, p);
+                    }
+                    // An asked replacement's retirement: drops a hold.
+                    5 => {
+                        if let Found::One(i) = l.locate(key.0, key.1) {
+                            let asked = l.resting_asked_oid[i];
+                            l.on_retired(asked, key.1);
+                        }
+                    }
+                    _ => {
+                        // Rare bulk paths; a drain also clears a slot whose
+                        // key is ambiguous (no verb can retire those rows).
+                        let stuck = phase == 1 && l.locate(key.0, key.1) == Found::Many;
+                        if stuck || pick % 256 == 1 {
+                            l.clear_resting_slot(key.1);
+                        } else if pick % 512 == 2 {
+                            l.drop_resting_on(syms[s_ix], syms[(s_ix + 1) % 3]);
+                        }
+                    }
+                }
+            }
+            // The mark is the tight one.
+            let hi = usize::from(l.resting_hi);
+            assert_eq!(hi, hi_full(&l), "step {step}");
+            max_hi = max_hi.max(hi);
+            emptied += u32::from(hi == 0 && step > 0);
+            // A lookup and a working-order sum, bounded vs whole-table.
+            let probe = if (r >> 4) & 1 == 0 { key } else { (fresh, slot) };
+            let found = l.locate(probe.0, probe.1);
+            assert_eq!(found, locate_full(&l, probe.0, probe.1), "step {step}");
+            many += u32::from(found == Found::Many);
+            let ex = if pick % 2 == 0 { Some(probe.0) } else { None };
+            assert_eq!(
+                l.working_on(probe.1, syms[s_ix], buy, ex),
+                working_on_full(&l, probe.1, syms[s_ix], buy, ex),
+                "step {step}"
+            );
+            // Every slot's count and notional, by a whole-table recompute.
+            let mut n = [0u32; EXEC_SLOTS];
+            let mut usd = [0i64; EXEC_SLOTS];
+            live_n = 0;
+            let mut i = 0usize;
+            while i < LEDGER_RESTING {
+                if l.resting[i].live == 1 {
+                    let s = l.resting[i].slot as usize;
+                    n[s] += 1;
+                    usd[s] += l.resting_term(i);
+                    live_n += 1;
+                }
+                i += 1;
+            }
+            let mut s = 0usize;
+            while s < EXEC_SLOTS {
+                assert_eq!(l.slot_resting(s), n[s], "step {step} slot {s}");
+                assert_eq!(l.resting_usd_1e6(s), usd[s], "step {step} slot {s}");
+                s += 1;
+            }
+            step += 1;
+        }
+        // The walk covered the range it claims: a full table, an empty
+        // one, and ambiguous keys.
+        assert_eq!(max_hi, LEDGER_RESTING);
+        assert!(emptied > 0, "the table never drained");
+        assert!(many > 0, "no ambiguous key was ever looked up");
+        assert_eq!(l.counters().resting_full, 0);
+        // Every slot cleared: the mark is zero.
+        let mut s = 0usize;
+        while s < EXEC_SLOTS {
+            l.clear_resting_slot(s);
+            s += 1;
+        }
+        assert_eq!(l.resting_hi, 0);
     }
 }

@@ -162,8 +162,9 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
     /// cannot be fed to a wall-clock epoch directly.
     #[inline]
     pub fn new(route: ExecRoute, paper: P, live: L, anchor: core_time::WallAnchor) -> Self {
-        // COPY: boot, once — `route` (832 B, `Copy`) moved in by value,
-        // and the ledger (82 368 B, pinned in `ledger.rs`, its tables
+        // COPY: boot, once — `route` (1 664 B, `Copy`, pinned in
+        // `route.rs`) moved in by value, and the ledger (146 048 B since
+        // S16-3, pinned in `ledger.rs`, its tables
         // inline) built on the stack and moved into its box; rejected:
         // building the ledger in place
         // (`Box::new_uninit` and unsafe field-wise writes) for a cold
@@ -306,7 +307,7 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
         };
         let mut n = 0usize;
         while n < buf.len() {
-            // COPY: kernel → user read of exec.HALT, ≤ 512 B, at most
+            // COPY: kernel → user read of exec.HALT, ≤ HALT_FILE_MAX (640 B), at most
             // once a second behind the mtime gate — the read(2)
             // boundary, straight into the caller's fixed buffer —
             // rejected: mmap, which brings back the blocking and
@@ -593,7 +594,7 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
 
     /// One step of `slot`'s cancel cycle ([`Self::try_cancel_slots`]).
     fn try_cancel_slot(&mut self, slot: usize) {
-        // `slot < EXEC_SLOTS` (8): the byte is exact.
+        // `slot < EXEC_SLOTS` (16): the byte is exact.
         let s = slot as u8;
         match self.halt.cancel_phase(slot) {
             CancelPhase::None => return,
@@ -1637,7 +1638,7 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         }
         let l = self.ledger.counters();
         let bn = self.live.venue_arm_counters(core_types::VenueId::Binance as u8);
-        // COPY: ExecCounters (936 B by repr(C) layout, const-asserted —
+        // COPY: ExecCounters (1 080 B by repr(C) layout since S16-3, const-asserted —
         // two 272 B LiveArmCounters ride inside) returned by value across
         // the OrderDispatch boundary, 1/s for /state + 1/5 s for /metrics
         // (+ once at the drain) —
@@ -1883,12 +1884,13 @@ mod tests {
         );
         d.mark_ledger_seeded();
         assert!(d.submit(&order(3, VenueId::Hyperliquid, 1)).is_ok());
-        for slot in [0u8, 1, 2, 4, 5, 6, 7] {
+        // S16-3: slots 8–15 too — 11 and 15 alias onto 3 and 7 under `& 7`.
+        for slot in [0u8, 1, 2, 4, 5, 6, 7, 8, 11, 15] {
             assert!(d.submit(&order(slot, VenueId::Hyperliquid, 100 + slot as u64)).is_ok());
         }
         assert_eq!(d.live().seen, vec![1], "only slot 3 went live");
         assert_eq!(d.counters().live_submits, 1);
-        assert_eq!(d.counters().paper_submits, 7);
+        assert_eq!(d.counters().paper_submits, 10);
         assert_eq!(d.counters().live_submits_at(3), Some(1));
     }
 
@@ -1934,11 +1936,12 @@ mod tests {
 
     #[test]
     fn an_unstamped_order_goes_to_paper_even_under_a_live_table() {
-        // STRATEGY_ID_NONE == 0xFF; 0xFF & 7 == 7. Arm slot 7 live to
-        // make the aliasing maximally tempting.
+        // STRATEGY_ID_NONE == 0xFF; 0xFF & 15 == 15 (S16-3; `& 7` == 7
+        // at eight slots). Arm slot 15 live to make the aliasing
+        // maximally tempting.
         let mut r = ExecRoute::all_paper();
         r.set_slot(
-            7,
+            15,
             ExecMode::Live,
             &[VenueId::Hyperliquid.to_u8()],
             SlotCaps::none(),
@@ -1952,6 +1955,47 @@ mod tests {
             .is_ok());
         assert!(d.live().seen.is_empty(), "un-stamped must never go live");
         assert_eq!(d.counters().paper_submits, 1);
+    }
+
+    /// **S16-3** — a live slot 11 routes slot 11's orders to the live
+    /// arm and nothing else: slot 3 (its `& 7` alias at eight slots,
+    /// BIN15's) stays paper, and `0xFE` (`split::NO_SLOT`, masked onto
+    /// slot 14) and an unstamped order never go live.
+    #[test]
+    fn a_live_slot_11_routes_only_slot_11() {
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            11,
+            ExecMode::Live,
+            &[VenueId::Hyperliquid.to_u8()],
+            SlotCaps::new(100_000_000, 1_000_000_000, 30_000_000_000, 64),
+            HaltLimits::none(),
+        )
+        .unwrap();
+        r.set_slot(
+            14,
+            ExecMode::Live,
+            &[VenueId::Hyperliquid.to_u8()],
+            SlotCaps::none(),
+            HaltLimits::none(),
+        )
+        .unwrap();
+        assert_eq!(r.live_mask(), (1 << 11) | (1 << 14));
+        let mut d = RoutedDispatcher::new(r, PaperDispatcher::new(), SpyLive::default(), test_anchor());
+        d.mark_ledger_seeded();
+        assert!(d.submit(&order(3, VenueId::Hyperliquid, 1)).is_ok());
+        assert!(d.submit(&order(0xFE, VenueId::Hyperliquid, 2)).is_ok());
+        assert!(d.submit(&order(STRATEGY_ID_NONE, VenueId::Hyperliquid, 3)).is_ok());
+        assert!(d.live().seen.is_empty(), "slot 3, 0xFE and 0xFF are paper");
+        assert_eq!(d.counters().paper_submits, 3);
+        assert!(d.submit(&order(11, VenueId::Hyperliquid, 4)).is_ok());
+        assert_eq!(d.live().seen.len(), 1, "slot 11 went live");
+        assert_eq!(d.counters().live_submits_at(11), Some(1));
+        assert_eq!(d.counters().live_submits_at(3), Some(0));
+        let ec = d.exec_counters();
+        assert_eq!(ec.modes[11], ExecMode::Live.as_u8());
+        assert_eq!(ec.modes[3], ExecMode::Paper.as_u8());
+        assert_eq!(ec.live_submits_by_slot[11], 1);
     }
 
     /// The E1 acceptance property: with an all-paper table the router

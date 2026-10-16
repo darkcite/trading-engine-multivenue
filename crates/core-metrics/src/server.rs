@@ -66,7 +66,7 @@ pub enum MetricsServeEvent<'a> {
 
 const REQ_BUF_SIZE: usize = 4 * 1024;
 // 256 counters + 384 gauges × (63-byte name + value + newline) can
-// approach 64 KiB; the RG6 `/state` body reaches ≈ 100 KB with a full
+// approach 64 KiB; the RG6 `/state` body reaches ≈ 140 KB with a full
 // vm table + recents (`engine_snapshot::STATE_JSON_MAX` = 160 KiB is
 // its pinned bound). 256 KiB keeps the single boot-time allocation
 // ahead of both worst cases with the header budget to spare.

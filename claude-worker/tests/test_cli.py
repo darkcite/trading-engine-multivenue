@@ -152,6 +152,22 @@ def test_push_heartbeat_sends_exactly_one_frame(uds_env: tests.conftest.FakeUdsS
     assert uds_env.cmd_field(0, "kind") == claude_worker.frames.KIND_HEARTBEAT
 
 
+def test_push_enable_reaches_the_wire_for_slots_8_to_15(
+    uds_env: tests.conftest.FakeUdsServer,
+) -> None:
+    # S16-2: the slot range is the engine's SlotMask width (16). A reserved
+    # slot (8-15, no member) is the engine's refusal to make, not ours.
+    for slot in (8, 11, 15):
+        result = _invoke("push", "--kind", "enable", "--strategy", str(slot))
+        assert result.exit_code == 0, (slot, result.output)
+    uds_env.wait_for_frames(6)
+    assert [uds_env.cmd_field(i, "strategy_id") for i in (1, 3, 5)] == [8, 11, 15]
+    assert all(
+        uds_env.cmd_field(i, "kind") == claude_worker.frames.KIND_ENABLE_STRATEGY
+        for i in (1, 3, 5)
+    )
+
+
 def test_push_enable_and_symbol_resolution(
     uds_env: tests.conftest.FakeUdsServer, cli_env: pathlib.Path
 ) -> None:
@@ -387,7 +403,7 @@ _BAD_PUSH: list[tuple[list[str], str]] = [
         "negative-qty",
     ),
     (["--kind", "set-bias", "--sym", "1", "--px", "0.01", "--ttl-s", "0"], "zero-ttl"),
-    (["--kind", "enable", "--strategy", "8"], "slot-out-of-range"),
+    (["--kind", "enable", "--strategy", "16"], "slot-out-of-range"),
     (["--kind", "set-param", "--strategy", "1", "--px", "1"], "missing-param-id"),
     (["--kind", "set-bias", "--sym", "4294967295", "--px", "0.01", "--ttl-s", "5"], "sym-sentinel"),
 ]

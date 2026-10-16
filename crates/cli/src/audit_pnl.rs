@@ -86,7 +86,7 @@ use std::path::{Path, PathBuf};
 use core_io::{PmlrReader, SlotKind};
 use core_types::{
     AiCmd, AiCmdKind, ChannelEvent, ChannelId, Fill, OptSummary, Order, OrderEvent, Price, Qty,
-    Side, Tick, TradePrint, VenueId, REGIME_PROFILES, SYMBOL_ID_NONE,
+    Side, Tick, TradePrint, VenueId, MAX_STRATEGY_SLOTS, REGIME_PROFILES, SYMBOL_ID_NONE,
 };
 
 use crate::backtest::fill::{usd_1e12_to_1e6_ceil, usd_1e12_to_1e6_floor};
@@ -144,23 +144,20 @@ pub const AUDIT_PNL_VERSION: u32 = 2;
 /// was unlinked (it keeps its offline `backtest --member icdp`) and the
 /// slot is the xmm member: rows under slot 6 in a capture taken BEFORE
 /// that date are icdp paper rows wearing this label.
+///
+/// **Slot 3 changed meaning on 2026-09-12 (BIN15 O4b)**: a capture taken
+/// before that date carries rule-tree rows under the `bin15` label —
+/// `docs/migration.md` records the boundary, as for slots 1 and 2.
+/// Slot 7 was reserved until HC11 (2026-09-26, the hcv member).
+///
+/// The names are the member table's ([`crate::exec_boot::SLOT_NAMES`],
+/// derived from `strategy_set::MEMBERS`): slots 8–15 (S16) read
+/// `reserved` — no member stands there, so a row under one is an
+/// anomaly worth seeing by its number rather than as `unknown`.
 fn strategy_label(id: u8) -> &'static str {
     match id {
-        0 => "hyparb",
-        1 => "vrp",
-        2 => "xsd",
-        // BIN15 O4b (2026-09-12): slot 3 is bin15. The NUMBER is
-        // wire-stable, so a capture taken before that date carries
-        // rule-tree rows under this label and one taken after
-        // carries bin15 rows — `docs/migration.md` records the
-        // boundary, exactly as it does for slots 1 and 2.
-        3 => "bin15",
-        4 => "ai-exec",
-        5 => "vm",
-        6 => "xmm",
-        // HC11 (2026-09-26): slot 7 was reserved until the hcv member.
-        7 => "hcv",
         0xFF => "unattributed",
+        _ if id < MAX_STRATEGY_SLOTS => crate::exec_boot::SLOT_NAMES[id as usize],
         _ => "unknown",
     }
 }
@@ -2155,4 +2152,25 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     }
     json.push_str("]}}");
     Ok(json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S16-5: sixteen slot labels — the members at 0–7, `reserved` at
+    /// 8–15 — and the two sentinels past them.
+    #[test]
+    fn strategy_labels_cover_sixteen_slots() {
+        let members = ["hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "hcv"];
+        for (i, m) in members.iter().enumerate() {
+            assert_eq!(strategy_label(i as u8), *m);
+        }
+        for id in 8..MAX_STRATEGY_SLOTS {
+            assert_eq!(strategy_label(id), "reserved", "slot {id}");
+        }
+        assert_eq!(strategy_label(MAX_STRATEGY_SLOTS), "unknown");
+        assert_eq!(strategy_label(0xFE), "unknown");
+        assert_eq!(strategy_label(0xFF), "unattributed");
+    }
 }

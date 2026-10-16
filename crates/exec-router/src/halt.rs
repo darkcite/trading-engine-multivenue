@@ -185,8 +185,9 @@ impl HaltReason {
 }
 
 /// Bytes a rendered halt file can take: the two header lines plus one
-/// `slot=NN reason=<longest word>` line per slot.
-pub const HALT_FILE_MAX: usize = 512;
+/// `slot=NN reason=<longest word>` line per slot. 640 since S16-3
+/// (sixteen slots: 128 + 16 × 31 = 624; 512 held eight, at 376).
+pub const HALT_FILE_MAX: usize = 640;
 
 /// **The render must not be able to truncate.** `put` clamps to the
 /// buffer, so a table that outgrew it would silently write a SHORT
@@ -194,12 +195,13 @@ pub const HALT_FILE_MAX: usize = 512;
 /// exact defect commit 4 exists to fix. Growing `EXEC_SLOTS` past
 /// what fits is a compile error instead.
 ///
-/// `128` is the two header lines (125 B today). `30` is the longest
+/// `128` is the two header lines (125 B today). `31` is the longest
 /// line: `slot=` (5) + two digits (2) + ` reason=` (8) +
-/// `asset-refusals` (14) + `\n` (1); `recon-stale` is shorter.
-/// Written out rather than named, because a `const` used only by a
-/// `const _` assert reads as dead code to the lint.
-const _: () = assert!(128 + EXEC_SLOTS * 30 <= HALT_FILE_MAX);
+/// `alo-reject-rate` (15, XH4d; `asset-refusals`' 14 was the longest
+/// when this read 30) + `\n` (1). Written out rather than named,
+/// because a `const` used only by a `const _` assert reads as dead
+/// code to the lint. A test renders every slot at the longest word.
+const _: () = assert!(128 + EXEC_SLOTS * 31 <= HALT_FILE_MAX);
 
 /// **Render the whole halt state.**
 ///
@@ -441,8 +443,16 @@ pub struct HaltState {
 /// One cache line, and it must stay that way: the router reads it on
 /// every dispatch (`risk_check` step 0a) and on every idle poll, so a
 /// second line here is a second miss on the hot path.
+///
+/// S16-3: at sixteen slots the payload is 56 of the 64 B — `reasons`
+/// (16 B) at 0, `pending_cancel` (16 B) at 16, the three `u64`
+/// counters at 32..56 (at eight slots: 40 B). Thirty-two slots would be
+/// 64 + 24 = 88 B, two lines: one of the three ceilings behind S16-R1.
 const _: () = assert!(core::mem::size_of::<HaltState>() == 64);
 const _: () = assert!(core::mem::align_of::<HaltState>() == 64);
+const _: () = assert!(core::mem::offset_of!(HaltState, pending_cancel) == EXEC_SLOTS);
+const _: () = assert!(core::mem::offset_of!(HaltState, halts) == 32);
+const _: () = assert!(core::mem::offset_of!(HaltState, cancel_all_stranded) + 8 == 56);
 
 impl Default for HaltState {
     #[inline]
@@ -1049,6 +1059,70 @@ mod tests {
         );
         let quiet = HaltSignal::new(1_000_000, 0, 0, 0, false, true, 1_000_000);
         assert_eq!(trigger_for(&quiet, &lim), HaltReason::None);
+    }
+
+    /// S16-3: a halt of slot 15 halts slot 15 alone (not 7, its `& 7`
+    /// alias at eight slots), and slot 11's cancel cycle is its own.
+    #[test]
+    fn a_halt_of_slot_15_halts_only_15_and_slot_11_cycles_alone() {
+        let mut h = HaltState::new();
+        assert!(h.latch(15, HaltReason::WsGap));
+        assert!(h.is_halted(15));
+        let mut s = 0usize;
+        while s < EXEC_SLOTS {
+            assert_eq!(h.is_halted(s), s == 15, "slot {s}");
+            s += 1;
+        }
+        assert!(h.latch(11, HaltReason::RejectStreak));
+        assert!(!h.is_halted(3), "a halt of slot 11 does not halt BIN15's slot 3");
+        h.cancel_requested(11);
+        assert_eq!(h.cancel_phase(11), CancelPhase::Asked);
+        assert_eq!(h.cancel_phase(3), CancelPhase::None);
+        assert_eq!(h.cancel_phase(15), CancelPhase::Wanted);
+        h.cancel_cleared(11);
+        assert_eq!(h.cancel_phase(11), CancelPhase::None);
+        assert!(h.cancel_outstanding(), "15 still owes its cancel");
+        assert!(!h.latch(16, HaltReason::WsGap), "16 is out of range");
+        assert_eq!(h.halts, 2);
+    }
+
+    /// S16-3: every one of sixteen slots halted with the longest word
+    /// fits [`HALT_FILE_MAX`] whole — the render cannot truncate — and
+    /// the two-digit slots read back as themselves.
+    #[test]
+    fn sixteen_slots_at_the_longest_word_fit_the_halt_file_whole() {
+        // The longest word: no reason renders longer.
+        for r in [
+            HaltReason::None,
+            HaltReason::RejectStreak,
+            HaltReason::BudgetFloor,
+            HaltReason::ReconDrift,
+            HaltReason::WsGap,
+            HaltReason::AssetRefusals,
+            HaltReason::Operator,
+            HaltReason::ReconStale,
+            HaltReason::PnlGain,
+            HaltReason::PnlLoss,
+            HaltReason::VenueLock,
+            HaltReason::MarginRisk,
+            HaltReason::AloRejectRate,
+            HaltReason::GatewayHalt,
+        ] {
+            assert!(r.as_str().len() <= HaltReason::AloRejectRate.as_str().len(), "{r:?}");
+        }
+        let reasons = [HaltReason::AloRejectRate; EXEC_SLOTS];
+        let mut buf = [0u8; HALT_FILE_MAX];
+        let n = render_halt_file(&mut buf, &reasons);
+        assert!(n < HALT_FILE_MAX, "rendered {n} of {HALT_FILE_MAX}: no clamp");
+        assert!(n <= 128 + EXEC_SLOTS * 31, "{n}");
+        let text = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(text.ends_with("slot=15 reason=alo-reject-rate\n"), "{text}");
+        assert_eq!(parse_halt_file(text), reasons);
+        // Slot 11 alone reads back as 11, never as 1 or 3.
+        let back = parse_halt_file("slot=11 reason=ws-gap\n");
+        assert_eq!(back[11], HaltReason::WsGap);
+        assert!(!back[1].is_halted() && !back[3].is_halted());
+        assert!(!parse_halt_file("16\n").iter().any(|r| r.is_halted()));
     }
 
     /// BX3: both new words survive `exec.HALT`'s round trip.

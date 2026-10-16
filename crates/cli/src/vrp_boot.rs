@@ -275,7 +275,7 @@ pub fn build_registry(
 /// `ai`. The icdp and xsd boots have always been gated; this is the
 /// same gate.
 #[must_use]
-pub fn vrp_wanted(requested: u8) -> bool {
+pub fn vrp_wanted(requested: core_types::SlotMask) -> bool {
     requested & strategy_set::BIT_VRP != 0
 }
 

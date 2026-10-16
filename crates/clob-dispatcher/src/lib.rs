@@ -1239,8 +1239,13 @@ const _: () = assert!(core::mem::size_of::<LiveArmCounters>() == 272);
 // BX3: + `refused_short`, `refused_unpriced` and `retired[8]` (80 B).
 // BX6: + the two mark counters and the Binance arm's block (16 + 272 B;
 // `arm_bn_present` rides in padding).
-const _: () = assert!(core::mem::size_of::<ExecCounters>() == 936);
-const _: () = assert!(core::mem::offset_of!(ExecCounters, live_submits) == 16);
+// S16-3 (936 → 1 080 B): sixteen slots. `modes` 8 → 16 B pushes the
+// header (`configured`, `modes`, `arm_bn_present` = 18 B) to 24, so
+// `live_submits` moves 16 → 24 (+8); the three halt bytes + `halted`
+// grow 11 → 19 B, padded 16 → 24 (+8); the two per-slot `u64` arrays
+// +64 B each. Copied once per 1 Hz mirror, never on the submit path.
+const _: () = assert!(core::mem::size_of::<ExecCounters>() == 1080);
+const _: () = assert!(core::mem::offset_of!(ExecCounters, live_submits) == 24);
 
 /// **XMM XH4f (D11) — the Hyperliquid gateway arm's numbers** (slot 6's
 /// `exec_hyperliquid::arm::HlGatewayArm`), filled through
@@ -1250,7 +1255,7 @@ const _: () = assert!(core::mem::offset_of!(ExecCounters, live_submits) == 16);
 /// the ones it publishes at its heartbeat), the budget, the rates and the
 /// latencies, and the router's words for the arm's slot. Counters are
 /// totals since boot; the fields after [`Self::refused_foreign_row`] are
-/// levels. [`ExecCounters`] keeps its pinned 936 B.
+/// levels. [`ExecCounters`] keeps its pinned size (1 080 B since S16-3).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct GatewayArmReport {
@@ -2209,10 +2214,11 @@ const _: () = assert!(core::mem::offset_of!(HaltSignal, gateway_halted) == 29);
 const _: () = assert!(core::mem::offset_of!(HaltSignal, alo_reject_permille) == 30);
 const _: () = assert!(core::mem::offset_of!(HaltSignal, recon_age_ns) == 32);
 
-/// Strategy slots [`ExecCounters`] reports on. Mirrors
-/// `exec_router::EXEC_SLOTS`; the two are asserted equal in
-/// `exec-router`'s tests so they cannot drift apart.
-pub const EXEC_COUNTER_SLOTS: usize = 8;
+/// Strategy slots [`ExecCounters`] reports on:
+/// `core_types::MAX_STRATEGY_SLOTS` (16 since S16-3), derived as
+/// `exec_router::EXEC_SLOTS` is, and asserted equal to it in
+/// `exec-router`'s tests and `cli::exec_boot`.
+pub const EXEC_COUNTER_SLOTS: usize = core_types::MAX_STRATEGY_SLOTS as usize;
 
 /// E1: the execution router's counters, carried across the
 /// `OrderDispatch` boundary so the engine loop can mirror them to

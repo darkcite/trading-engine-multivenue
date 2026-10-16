@@ -499,7 +499,11 @@ FALSIFIER_MAX: int = 200
 ALERT_TEXT_MAX: int = 200
 ACTIONS_MAX: int = 6
 PX_OFFSET_BPS_MAX: int = 50
-SLOT_MAX: int = 7
+#: The highest BUILT strategy slot a `disable_paper_slot` may name. The
+#: engine has 16 slots since S16 (`cli._MAX_STRATEGY_SLOTS`), but 8-15 are
+#: reserved — no member stands there, so a command to one could only be
+#: refused by the engine; the analyst's range stays at the members, 0-7.
+SLOT_BUILT_MAX: int = 7
 
 
 class DirectionChannel(typing.NamedTuple):
@@ -681,7 +685,7 @@ def _action_intent(obj: dict[str, object], markets: typing.Container[str]) -> Ac
 
 
 def _action_disable(obj: dict[str, object]) -> Action | None:
-    slot = _whole(obj["slot"], 0, SLOT_MAX)
+    slot = _whole(obj["slot"], 0, SLOT_BUILT_MAX)
     venue = _one_of(obj["venue"], claude_worker.labeling.VENUE_NAMES)
     until_ts = _whole(obj["until_ts"], 1, TS_MAX)
     if slot is None or venue is None or until_ts is None:
@@ -948,8 +952,8 @@ ANALYST_SYSTEM: str = (
     ' {"kind": "declare_vol_high", "profile": "fast"|"slow"|"both", "ttl_s": <int>}\n'
     ' {"kind": "order_intent", "market": "<market name>", "side": "bid"|"ask",'
     ' "px_offset_bps": <int -50..50>, "qty_usd": <number>, "ttl_s": <int>}\n'
-    ' {"kind": "disable_paper_slot", "slot": <int 0..7>, "venue": "<venue>",'
-    ' "until_ts": <unix seconds>}\n'
+    ' {"kind": "disable_paper_slot", "slot": <int 0..7: the members; 8..15 are reserved>,'
+    ' "venue": "<venue>", "until_ts": <unix seconds>}\n'
     ' {"kind": "propose_universe_append", "descriptor": "<descriptor>"}\n'
     ' {"kind": "propose_xsd_drop", "descriptor": "<descriptor>", "before_ts": <unix seconds>}\n'
     ' {"kind": "alert", "severity": "info"|"warn"|"red", "text": "<= 200 chars"}\n'

@@ -87,7 +87,24 @@ const VALUES = {
   fund:['neg','pos'], level:['low','normal','high'], stretch:['ext_down','neutral','ext_up'],
   source:['measured','declared','unknown'],
 };
-const SLOT_NAMES = ['hyparb','vrp','xsd','bin15','ai-exec','vm','xmm','reserved'];
+// Slot map (index = slot). /state schema 2 carries 8 per-slot entries,
+// schema 3 (S16-5) carries 16 — slots 8–15 are reserved (no member). Every
+// per-slot array is walked by ITS OWN length, never by this table's.
+const SLOT_NAMES = ['hyparb','vrp','xsd','bin15','ai-exec','vm','xmm','hcv',
+  'reserved','reserved','reserved','reserved','reserved','reserved','reserved','reserved'];
+// Slots 0–7 keep their colours; 8–15 got eight distinguishable new ones.
+const SLOT_COLORS = ['#e2b13c','#8a93a6','#5b9cf5','#39c26c','#e25b4c','#c78cf5','#4cc3e2','#8a93a6',
+  '#f08c3c','#e26fae','#9fd356','#3cc9a0','#b5895a','#7a7ff0','#d4d46a','#f2a2a2'];
+// 255 is the unattributed stamp (audit_pnl's word); a reserved slot keeps
+// its number, so two of them never read the same.
+const slotName = i => i === 255 ? 'unattributed'
+  : SLOT_NAMES[i] === 'reserved' ? `${i}:reserved` : (SLOT_NAMES[i] || String(i));
+// A reserved slot with nothing on it — schema 3 rows 8–15 on a normal boot.
+// Requested at boot or carrying a halt word is not nothing: shown.
+const slotIdle = s => s.name === 'reserved' && !s.configured && !s.enabled && !s.gate
+  && Number(s.orders_emitted) === 0 && Number(s.orders_dropped) === 0
+  && !(E && E.boot && (Number(E.boot.requested_mask) >> s.slot) & 1)
+  && !(E && E.exec && E.exec.halted && E.exec.halted[s.slot] && E.exec.halted[s.slot] !== 'none');
 const GATE = ['open','soft','HARD'];
 const ING_STATE = ['down','connecting','UP','backoff'];
 const COLORS = { bear:'#e25b4c', neutral:'#8a93a6', bull:'#39c26c', chop:'#e2b13c', mixed:'#8a93a6', trend:'#5b9cf5',
@@ -184,7 +201,8 @@ function renderRegime() {
       const relName = v => v === 255 ? '<span class="dim">?</span>' : ['lagging','inline','leading'][v] || v;
       parts.push(`<div class="kv" style="margin-top:6px"><div>rel syms</div><div>${rel.syms.map((s, i) => i === 0 ? `${s}<span class="dim">:ref</span>` : `${s}<span class="dim">:</span>${relName(rel.fast[i])}<span class="dim">/</span>${relName(rel.slow[i])}`).join('  ')}</div></div>`);
     }
-    parts.push(`<div class="kv"><div>slot gates</div><div>${R.gates.map((g, i) => `${SLOT_NAMES[i]}=<span class="${g === 0 ? 'ok' : g === 2 ? 'bad' : 'warn'}">${GATE[g] || g}</span>`).join('  ')}</div></div>`);
+    // schema 3: 16 gates; a reserved slot's OPEN gate is noise and is left out.
+    parts.push(`<div class="kv"><div>slot gates</div><div>${R.gates.map((g, i) => (g === 0 && SLOT_NAMES[i] === 'reserved') ? '' : `${slotName(i)}=<span class="${g === 0 ? 'ok' : g === 2 ? 'bad' : 'warn'}">${GATE[g] || g}</span>`).filter(x => x).join('  ')}</div></div>`);
   }
   if (W && W.regime) {
     const H = W.regime.history || [];
@@ -218,7 +236,9 @@ function pnlByLabel() { const out = {}; const L = W && W.pnl && W.pnl.latest; if
 function renderStrategies() {
   if (!E) { set('strat', '<span class="muted">n/a</span>'); return; }
   const by = pnlByLabel();
-  const rows = E.slots.map(s => {
+  const shown = E.slots.filter(s => !slotIdle(s));
+  const idle = E.slots.length - shown.length;
+  const rows = shown.map(s => {
     const p = by[s.name];
     const ladder = p && p.fee_ladder_net_usd ? p.fee_ladder_net_usd.map(v => usd(v)).join(' / ') : '<span class="dim">—</span>';
     return [s.slot, esc(s.name), s.configured ? 'yes' : '<span class="dim">no</span>', s.enabled ? '<span class="ok">on</span>' : '<span class="dim">off</span>',
@@ -228,7 +248,8 @@ function renderStrategies() {
       p ? n(p.fills, 0) : '<span class="dim">—</span>', ladder];
   });
   set('strat-sub', `${E.boot.strategy_kind} · latest report ${W && W.pnl && W.pnl.latest ? esc(W.pnl.latest.day) : '—'}`);
-  set('strat', table(['slot','member','cfg','on','gate','orders','drop','fires','fills','net @0/1/tier'], rows, [5,6,7,8]) + xmmBlock());
+  const idleNote = idle ? `<div class="muted">+${idle} reserved slot${idle === 1 ? '' : 's'} idle (/state v${esc(String(E.v))})</div>` : '';
+  set('strat', table(['slot','member','cfg','on','gate','orders','drop','fires','fills','net @0/1/tier'], rows, [5,6,7,8]) + idleNote + xmmBlock());
 }
 
 // ---- xmm (slot 6, XMM XH3; /state schema 2 — tolerant of an older engine) ----
@@ -549,8 +570,8 @@ function renderRecent() {
   const R = E.recent;
   set('recent-sub', `${R.orders_total} orders · ${R.fills_total} fills since boot`);
   const oids = new Map(R.orders.map(o => [o.oid, o]));
-  const orders = R.orders.slice().reverse().slice(0, 20).map(o => [age(o.age_s), `<span style="color:${['#e2b13c','#8a93a6','#5b9cf5','#39c26c','#e25b4c','#c78cf5','#4cc3e2','#8a93a6'][o.slot] || 'inherit'}">${SLOT_NAMES[o.slot] || o.slot}</span>`, ['pm','bn','okx','deribit','hl','ai','bybit','mexc'][o.venue] || o.venue, o.sym, o.side ? 'ASK' : 'BID', px(o.px_1e6), px(o.qty_1e6), o.kind, o.ttl_ns !== '0' ? 'IoC' : '']);
-  const fills = R.fills.slice().reverse().slice(0, 20).map(f => { const o = oids.get(f.oid); return [age(f.age_s), o ? (SLOT_NAMES[o.slot] || o.slot) : '<span class="dim">?</span>', f.sym, f.side ? 'ASK' : 'BID', px(f.px_1e6), px(f.qty_1e6), esc(f.oid)]; });
+  const orders = R.orders.slice().reverse().slice(0, 20).map(o => [age(o.age_s), `<span style="color:${SLOT_COLORS[o.slot] || 'inherit'}">${slotName(o.slot)}</span>`, ['pm','bn','okx','deribit','hl','ai','bybit','mexc'][o.venue] || o.venue, o.sym, o.side ? 'ASK' : 'BID', px(o.px_1e6), px(o.qty_1e6), o.kind, o.ttl_ns !== '0' ? 'IoC' : '']);
+  const fills = R.fills.slice().reverse().slice(0, 20).map(f => { const o = oids.get(f.oid); return [age(f.age_s), o ? slotName(o.slot) : '<span class="dim">?</span>', f.sym, f.side ? 'ASK' : 'BID', px(f.px_1e6), px(f.qty_1e6), esc(f.oid)]; });
   set('recent', `<div class="muted">orders</div>` + table(['age','slot','venue','sym','side','px','qty','kind',''], orders, [3,5,6]) + `<div class="muted" style="margin-top:6px">fills</div>` + table(['age','slot','sym','side','px','qty','oid'], fills, [2,4,5]));
 }
 
