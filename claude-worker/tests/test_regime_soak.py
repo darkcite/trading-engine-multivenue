@@ -127,6 +127,45 @@ def test_engine_regime_sample_reads_the_state_block() -> None:
     assert claude_worker.regime.engine_state(DEAD_URL) is None
 
 
+class _Resp:
+    """A minimal ``urlopen`` response: a context manager with ``read``."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self) -> "_Resp":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body
+
+
+def test_engine_state_takes_the_schemas_the_engine_serves(monkeypatch) -> None:
+    """HK34: schemas 1-3 carry the fields the sample reads; the old ``== 1``
+    gate dropped every sample from schema 2 on. Unknown schemas, a boolean
+    ``v`` and a non-object body are still refused."""
+    body: list[bytes] = [b""]
+    monkeypatch.setattr(
+        claude_worker.regime.urllib.request,
+        "urlopen",
+        lambda url, timeout=2.0: _Resp(body[0]),
+    )
+    for v in (1, 2, 3):
+        doc = _state(61164, [0, 1, 0, 0], [0, 0, 0, 0])
+        doc["v"] = v
+        body[0] = json.dumps(doc).encode()
+        got = claude_worker.regime.engine_state("http://h:1/state")
+        assert got is not None and got["v"] == v
+        sample = claude_worker.regime.engine_regime_sample(got)
+        assert sample is not None and sample["pid"] == 61164
+    for raw in (b'{"v": 4}', b'{"v": 0}', b'{"v": true}', b'{"v": "3"}', b"[3]", b"{}"):
+        body[0] = raw
+        assert claude_worker.regime.engine_state("http://h:1/state") is None, raw
+
+
 def test_cycle_records_the_engine_sample_when_state_answers(tmp_path, monkeypatch) -> None:
     art = tests.regime_fixture.artifact(tmp_path)
     db = tests.regime_fixture.candles_db(tmp_path)
