@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! impl-02 §7.2 — pass 3's types and qualifiers. Until T19 an accepted script is
-//! `[NOT_IMPLEMENTED]`; the fold values and the materialised temporaries are asserted on pass 3's
+//! impl-02 §7.2 — pass 3's types and qualifiers. An accepted script is an `Ok` program (verified
+//! by `common`) or `[NOT_IMPLEMENTED]` for a back-half gap (`passes`); the fold values and the materialised temporaries are asserted on pass 3's
 //! output by the private twins in `src/tests/infer.rs`.
 
 mod common;
@@ -23,7 +23,8 @@ fn run(d: Dialect, body: &str) -> Vec<u16> {
 
 #[track_caller]
 fn accepted(d: Dialect, body: &str) {
-    assert_eq!(run(d, body), vec![NOT_IMPLEMENTED], "v{}: {body}", d as u8);
+    let c = run(d, body);
+    assert!(passes(&c), "v{}: {body}: {c:?}", d as u8);
 }
 
 #[track_caller]
@@ -290,6 +291,6 @@ fn infer_sma_cross_strategy_types() {
             d as u8
         );
         let r = compile_src(&src, &default_opts(d, ExecMode::BarClose));
-        assert_eq!(codes(&r), vec![NOT_IMPLEMENTED], "v{}: {r:?}", d as u8);
+        assert_eq!(codes(&r), vec![ACCEPTED], "v{}: {r:?}", d as u8);
     }
 }

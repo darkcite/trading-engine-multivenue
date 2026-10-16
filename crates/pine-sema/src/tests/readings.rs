@@ -33,8 +33,12 @@ pub(super) fn opts(dialect: Dialect) -> CompileOpts {
             max_bars_back: 5000,
             insn_budget: 2_000_000,
             collection_cap: 64,
+            str_persist_bytes: 4096,
+            str_cell_bytes: 128,
+            str_scratch_bytes: 8192,
+            intent_cap: 32,
+            max_frame_bytes: 16 << 20,
             active_tiers: 0b0111,
-            ..Default::default()
         },
         inputs: Vec::new(),
         ticker_map: Vec::new(),
@@ -48,7 +52,7 @@ fn codes(body: &str, rd: &Readings) -> Vec<u16> {
     let mut syms = SymTable::new();
     let ast = pine_lang::parse(&src, FileId::ROOT, &mut syms).expect("parses");
     match compile_with(&ast, syms, &opts(Dialect::V5), &mut LibCache::empty(), rd) {
-        Ok(_) => Vec::new(),
+        Ok(_) => vec![ACCEPTED],
         Err(ds) => {
             // A row the lane's pine-std snapshot does not serve yet (§4.5 step 9) is the
             // snapshot's refusal: a refusal made only of those reads as `NOT_IMPLEMENTED`.
@@ -67,6 +71,9 @@ fn codes(body: &str, rd: &Readings) -> Vec<u16> {
 }
 
 const NOT_IMPLEMENTED: u16 = 3255;
+
+/// An `Ok` program (T19): what every pass accepting a script now returns.
+const ACCEPTED: u16 = 0;
 
 #[test]
 fn readings_defaults_are_the_dialect_rows() {
@@ -100,7 +107,7 @@ fn readings_shadow_builtin_both() {
     assert_eq!(r.pins.shadow_builtin, ShadowBuiltin::Refuse);
     assert_eq!(codes(src, &r), vec![3004]);
     r.pins.shadow_builtin = ShadowBuiltin::Shadow;
-    assert_eq!(codes(src, &r), vec![NOT_IMPLEMENTED]);
+    assert_eq!(codes(src, &r), vec![ACCEPTED]);
 }
 
 #[test]
@@ -120,7 +127,7 @@ fn readings_for_counter_shadow_both() {
     assert_eq!(r.pins.for_counter_shadow, ForCounterShadow::Refuse);
     assert_eq!(codes(src, &r), vec![3041]);
     r.pins.for_counter_shadow = ForCounterShadow::Shadow;
-    assert_eq!(codes(src, &r), vec![NOT_IMPLEMENTED]);
+    assert_eq!(codes(src, &r), vec![ACCEPTED]);
     let src_in = "s = 0\nfor x in array.from(1, 2)\n    x = 5\n    s += x\nplot(s)\n";
     assert_eq!(codes(src_in, &r), vec![NOT_IMPLEMENTED]);
     r.pins.for_counter_shadow = ForCounterShadow::Refuse;
@@ -136,7 +143,7 @@ fn readings_var_qualifier_both() {
     assert_eq!(r.pins.var_qualifier, VarQualifier::Series);
     assert_eq!(codes(src, &r), vec![3008]);
     r.pins.var_qualifier = VarQualifier::Join;
-    assert_eq!(codes(src, &r), vec![NOT_IMPLEMENTED]);
+    assert_eq!(codes(src, &r), vec![ACCEPTED]);
     // A `series` value assigned raises the join to `series` (the worklist's second round).
     let src = "x = 5\nx := bar_index\nf(simple int a) => a\nplot(f(x))\n";
     assert_eq!(codes(src, &r), vec![3008]);
@@ -276,4 +283,25 @@ fn readings_cond_call_state_every_bar_unhoistable_is_refused() {
     let e = cond_call(body, crate::pins::CondCallState::EveryBar).expect_err("unhoistable");
     assert_eq!(e.code.0, 3039, "{e:?}");
     assert!(e.msg.contains("ta.sma"));
+}
+
+/// `Join` keeps a reassigned all-`const` variable `const`, but its reads are never folded to the
+/// declaration's value: `x = 5; x := 6; plot(x)` plots 6.
+#[test]
+fn readings_var_qualifier_join_reassigned_reads_the_slot() {
+    use pine_ir::{barflag, StepOutcome};
+    use pine_vm::testkit::{bar, Arena, Ctx};
+    let src = "//@version=5\nindicator(\"t\")\nx = 5\nx := 6\nplot(x)\n";
+    let mut r = Readings::of(Dialect::V5);
+    r.pins.var_qualifier = VarQualifier::Join;
+    let mut syms = SymTable::new();
+    let ast = pine_lang::parse(src, FileId::ROOT, &mut syms).expect("parses");
+    let o = opts(Dialect::V5);
+    let p = compile_with(&ast, syms, &o, &mut LibCache::empty(), &r).expect("compiles");
+    let v = pine_vm::verify(&p, &pine_std::BUILTINS).expect("verifies");
+    let mut arena = Arena::new(p.layout.total_bytes as usize);
+    let mut vm = pine_vm::VmInstance::new(v, arena.slice());
+    let out = vm.step_bar(&bar(0, 1.0, barflag::CONFIRMED), &mut Ctx { now: 0 });
+    assert_eq!(out, StepOutcome::Ok);
+    assert_eq!(vm.plots()[0], 6.0);
 }

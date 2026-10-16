@@ -52,7 +52,7 @@ fn mono_explosion_is_refused() {
         ok.push_str(&format!("a{k} = g(close)\n"));
     }
     ok.push_str("plot(close)\n");
-    assert_eq!(run(&ok), vec![NOT_IMPLEMENTED]);
+    assert_eq!(run(&ok), vec![ACCEPTED]);
 }
 
 #[test]
@@ -90,7 +90,7 @@ fn mono_too_many_params_is_refused() {
     let ps: Vec<String> = (0..MAX_PARAMS).map(|k| format!("p{k}")).collect();
     let args: Vec<&str> = (0..MAX_PARAMS).map(|_| "close").collect();
     let body = format!("f({}) => p0\nplot(f({}))\n", ps.join(", "), args.join(", "));
-    assert_eq!(run(&body), vec![NOT_IMPLEMENTED]);
+    assert_eq!(run(&body), vec![ACCEPTED]);
 }
 
 #[test]
@@ -112,5 +112,5 @@ fn mono_mutual_recursion_is_refused() {
 #[test]
 fn mono_overload_calling_other_overload_is_not_recursion() {
     let body = "f(float x) => x * 2\nf(int x) => f(float(x))\nplot(f(3))\n";
-    assert_eq!(run(body), vec![NOT_IMPLEMENTED]);
+    assert_eq!(run(body), vec![ACCEPTED]);
 }

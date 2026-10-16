@@ -429,8 +429,10 @@ pub(crate) struct Ir {
     pub(crate) body: Block,
     /// Every `Const` slot with its `(bits, valid)`, in creation order (the init block's order).
     pub(crate) const_list: Vec<(VSlot, u64, bool)>,
-    /// `Const` slots keyed `(lane, bits, valid)`, program-wide (a lookup index, never iterated).
-    consts: HashMap<(u8, u64, bool), VSlot>,
+    /// `Const` slots keyed `(lane, bits, valid, string)`, program-wide (a lookup index, never
+    /// iterated). A string constant's bits are its `Sym` until emission makes them a `CONST`
+    /// `StrRef`, so `string` is part of the key (an `int` 11 is not `Sym(11)`).
+    consts: HashMap<(u8, u64, bool, bool), VSlot>,
     /// `Reserved` / `Prelude` slots by value row (a lookup index).
     values: HashMap<u32, VSlot>,
     /// Plot indices in code order (§4.14.8): every non-`hline` index, then every `hline`.
@@ -449,7 +451,12 @@ impl Ir {
 
     /// The program-wide `Const` slot of `(lane, bits, valid)`, written once (§4.14.1).
     pub(crate) fn konst(&mut self, info: SlotInfo, bits: u64, valid: bool) -> VSlot {
-        let key = (info.lane as u8, bits, valid);
+        let key = (
+            info.lane as u8,
+            bits,
+            valid,
+            valid && info.ty.ty == pine_ir::Ty::String,
+        );
         if let Some(&v) = self.consts.get(&key) {
             return v;
         }
@@ -460,6 +467,11 @@ impl Ir {
         self.consts.insert(key, v);
         self.const_list.push((v, bits, valid));
         v
+    }
+
+    /// Whether value row `row` already has its slot.
+    pub(crate) fn has_value(&self, row: u32) -> bool {
+        self.values.contains_key(&row)
     }
 
     /// The slot of a built-in value row (`Reserved` or `Prelude`), one per row program-wide.
@@ -473,13 +485,6 @@ impl Ir {
     }
 
     /// `ProgramMeta::entry_dirs` (A6.2): one row per id, sorted by id, the sites' bits OR-ed.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "ProgramMeta::entry_dirs, written by meta.rs (impl-02 T20)"
-        )
-    )]
     pub(crate) fn entry_dirs(&self) -> Vec<pine_ir::EntryDir> {
         let mut rows: Vec<pine_ir::EntryDir> = Vec::with_capacity(self.entry_sites.len());
         let mut sites = self.entry_sites.clone();

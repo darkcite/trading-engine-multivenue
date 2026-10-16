@@ -11,28 +11,36 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs, unused_must_use, unreachable_pub)]
 
+mod audit;
+mod canon;
 mod code;
 mod decl;
+mod emit;
 mod fold;
 mod hoist;
 mod imports;
 mod infer;
 mod inputs;
 mod ir;
+mod layout;
 mod libcache;
 pub mod limits;
 mod lower;
+mod meta;
 mod mono;
+mod nacap;
 mod overload;
 mod pins;
 mod resolve;
 mod scope;
+mod series;
 mod sites;
 mod sw;
 #[cfg(test)]
 mod tests;
 mod types;
 
+pub use canon::canonical_bytes;
 pub use code::ReasonCode;
 pub use libcache::{LibCache, LibKey, LibSource, Sha256Fn};
 
@@ -89,7 +97,7 @@ fn compile_with(
             &opts.inputs,
             &mut diags,
         );
-        let _decl = decl::check(ast, &typed, opts, &syms, &mut diags);
+        let decl = decl::check(ast, &typed, opts, &syms, &mut diags);
         // Pass 4 (§4.6): the Instantiation tree and its caps.
         let mut files: Vec<Option<&Ast>> = vec![Some(ast)];
         for l in &graph.libs {
@@ -110,11 +118,16 @@ fn compile_with(
             let d = ast.dialect();
             let ir = lower::lower(&typed, &tree, &resolved, &files, &syms, rd, d, knobs);
             let udt_fields: Vec<u16> = typed.udts.iter().map(|u| u.fields.len() as u16).collect();
-            // `pin:02-site-cap-undeclared` — §4.10.4's `C` is `M` when set; the declared `D`
-            // joins with the layout pass (T17/T18).
+            // §4.10.4: the effective cap `C = M` when the manifest sets one (a declared `D > M`
+            // is decl.rs's `3017`), else the declaration's `D`, else 0.
+            let cap = if opts.limits.max_bars_back > 0 {
+                opts.limits.max_bars_back
+            } else {
+                decl.max_bars_back
+            };
             let cx = sites::SiteCtx {
                 d,
-                cap: opts.limits.max_bars_back,
+                cap,
                 collection_cap: opts.limits.collection_cap,
                 udt_fields: &udt_fields,
             };
@@ -122,16 +135,107 @@ fn compile_with(
                 hoist::run(&mut ir, rd)?;
                 sites::number(&ir, &cx).map(|s| (ir, s))
             });
-            if let Err(d) = r {
-                diags.push(d);
+            match r {
+                Err(d) => diags.push(d),
+                // Emission runs only on a program every pass accepted, unserved rows included:
+                // an unserved row has no body to call.
+                Ok((ir, sites)) if diags.is_empty() => {
+                    let fe = Front {
+                        decl: &decl,
+                        inputs: &typed.inputs,
+                        opts,
+                        d,
+                        cap: cx.cap,
+                    };
+                    match back(ir, &sites, &fe, syms) {
+                        Ok(p) => return Ok(p),
+                        Err(d) => return Err(finish(vec![d])),
+                    }
+                }
+                Ok(_) => {}
             }
         }
     }
     if diags.is_empty() {
-        let msg = "not implemented: emission".to_owned();
+        // No Instantiation tree to lower: nothing passes 1–4 accepted reaches emission.
+        let msg = "not implemented: emission of a program with no instantiation".to_owned();
         diags.push(diag(ReasonCode::Internal, ast.span(ast.root()), msg));
     }
     Err(finish(diags))
+}
+
+/// What the back half reads from the front.
+struct Front<'a> {
+    decl: &'a decl::Decl,
+    inputs: &'a [pine_ir::InputDesc],
+    opts: &'a CompileOpts,
+    d: pine_ir::Dialect,
+    cap: u32,
+}
+
+/// Passes 5d–5i (§4.8–§4.16): `na` classes, series, layout, emission, meta.
+fn back(
+    mut ir: ir::Ir,
+    sites: &[sites::Site],
+    fe: &Front<'_>,
+    mut syms: SymTable,
+) -> Result<PineProgram, Diag> {
+    let opts = fe.opts;
+    let flag = emit::prepare(&mut ir, &mut syms, fe.d)?;
+    let na = nacap::run(&ir, fe.d);
+    let series = series::run(&ir, sites, fe.cap)?;
+    let intents = meta::intents(&ir, opts.limits.intent_cap)?;
+    let plots = meta::plots(&ir, fe.d);
+    let dm = layout::Demand {
+        d: fe.d,
+        mode: opts.mode,
+        limits: &opts.limits,
+        sites,
+        rings: &series.rings,
+        n_plots: plots.len() as u32,
+        intent_cap: intents,
+        flag,
+    };
+    let pl = layout::build(&ir, &na, &dm)?;
+    audit::recount(
+        &ir,
+        &audit::Want {
+            l: &pl.layout,
+            flag,
+            intents,
+            cap: fe.cap,
+        },
+    )?;
+    let em = emit::emit(&emit::Input {
+        ir: &ir,
+        na: &na,
+        pl: &pl,
+        sites,
+        syms: &syms,
+        flag,
+        budget: opts.limits.insn_budget,
+    })?;
+    let meta = meta::build(meta::MetaIn {
+        ir: &ir,
+        decl: fe.decl,
+        inputs: fe.inputs,
+        opts,
+        d: fe.d,
+        series: &series,
+        intents,
+        plots,
+    });
+    Ok(PineProgram {
+        code: em.code,
+        consts: em.consts,
+        argwin: em.argwin,
+        syms,
+        layout: pl.layout,
+        dialect: fe.d,
+        mode: opts.mode,
+        subprograms: Vec::new(),
+        meta,
+    })
 }
 
 /// Pass 0 (§4.1): every input check, collected.

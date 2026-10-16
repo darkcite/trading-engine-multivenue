@@ -44,7 +44,7 @@ fn is_stateful(o: &Op) -> bool {
 }
 
 /// The slots an op writes.
-fn writes(o: &Op) -> Vec<VSlot> {
+pub(crate) fn writes(o: &Op) -> Vec<VSlot> {
     match o {
         Op::Un { dst, .. }
         | Op::Bin { dst, .. }
@@ -65,7 +65,7 @@ fn writes(o: &Op) -> Vec<VSlot> {
 }
 
 /// The slots an op reads.
-fn reads(o: &Op) -> Vec<VSlot> {
+pub(crate) fn reads(o: &Op) -> Vec<VSlot> {
     match o {
         Op::Un { a, .. } | Op::Mov { a, .. } | Op::NaCheck { a, .. } => vec![*a],
         Op::Bin { a, b, .. } | Op::Cmp { a, b, .. } | Op::Nz { a, b, .. } => vec![*a, *b],

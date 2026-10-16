@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{all_diags, codes, compile_src, is_unserved, v5, NOT_IMPLEMENTED};
+use common::{codes, compile_src, v5, ACCEPTED};
 use pine_ir::DiagCode;
 use pine_sema::ReasonCode;
 
@@ -159,16 +159,12 @@ fn refusal_input_check_foreign_symtable_is_internal() {
 }
 
 #[test]
-fn refusal_accepted_script_reaches_not_implemented() {
+fn refusal_accepted_script_compiles() {
+    // T19: a script every pass accepts is an `Ok` program that pine-vm verifies.
     let r = compile_src(SCRIPT, &v5());
-    assert_eq!(codes(&r), vec![NOT_IMPLEMENTED]);
-    // Either the emission stub, or only rows the lane's pine-std does not serve yet.
-    let ds = all_diags(r);
-    assert!(
-        ds.iter()
-            .all(|d| is_unserved(d) || d.msg.contains("not implemented")),
-        "{ds:?}"
-    );
+    assert_eq!(codes(&r), vec![ACCEPTED], "{r:?}");
+    let p = r.expect("accepted");
+    assert!(pine_vm::verify(&p, &pine_std::BUILTINS).is_ok());
 }
 
 #[test]

@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{codes, compile_with_libs, diags, v5, NOT_IMPLEMENTED};
+use common::{codes, compile_with_libs, diags, v5, ACCEPTED, NOT_IMPLEMENTED};
 use pine_ir::{fnv1a64_continue, FNV1A64_OFFSET};
 use pine_sema::{LibCache, LibKey};
 
@@ -62,7 +62,7 @@ fn imports_default_alias_is_the_lib_name() {
     let r = compile_with_libs(&root("import u/a/1\nimport v/a/1\n"), &v5(), &mut libs);
     assert_eq!(codes(&r), vec![3041]);
     let r = compile_with_libs(&root("import u/a/1\nimport v/a/1 as b\n"), &v5(), &mut libs);
-    assert_eq!(codes(&r), vec![NOT_IMPLEMENTED]);
+    assert_eq!(codes(&r), vec![ACCEPTED]);
 }
 
 #[test]
@@ -152,7 +152,7 @@ fn imports_lock_match_is_pinned() {
     std::fs::write(dir.join("lib.lock"), lock).unwrap();
     let mut libs = LibCache::open(dir, fake_sha).expect("lock parses");
     let r = compile_with_libs(&root("import u/l/1\n"), &v5(), &mut libs);
-    assert_eq!(codes(&r), vec![NOT_IMPLEMENTED]);
+    assert_eq!(codes(&r), vec![ACCEPTED]);
     assert_eq!(libs.loaded().len(), 1);
     assert!(libs.loaded()[0].pinned);
     assert_eq!(libs.loaded()[0].text(), text);
@@ -189,7 +189,7 @@ fn imports_unpinned_library_loads_and_is_listed() {
     write_lib(&dir, &k, &text);
     let mut libs = LibCache::open(dir, fake_sha).expect("no lock");
     let r = compile_with_libs(&root("import u/l/1\n"), &v5(), &mut libs);
-    assert_eq!(codes(&r), vec![NOT_IMPLEMENTED]);
+    assert_eq!(codes(&r), vec![ACCEPTED]);
     assert_eq!(libs.loaded().len(), 1);
     assert!(!libs.loaded()[0].pinned);
     assert_eq!(libs.loaded()[0].key, k);
@@ -204,7 +204,7 @@ fn imports_transitive_walk_loads_grandchildren() {
         (key("u", "c", 1), lib_src("c", "")),
     ]);
     let r = compile_with_libs(&root("import u/a/1\n"), &v5(), &mut libs);
-    assert_eq!(codes(&r), vec![NOT_IMPLEMENTED]);
+    assert_eq!(codes(&r), vec![ACCEPTED]);
     let got: Vec<&str> = libs.loaded().iter().map(|s| s.key.lib.as_str()).collect();
     assert_eq!(got, ["a", "b", "c"]);
     assert!(libs
@@ -261,7 +261,7 @@ fn imports_depth_above_eight_is_refused() {
     entries[7].1 = lib_src("l8", "");
     let mut libs = LibCache::in_memory(entries);
     let r = compile_with_libs(&root("import u/l1/1\n"), &v5(), &mut libs);
-    assert_eq!(codes(&r), vec![NOT_IMPLEMENTED]);
+    assert_eq!(codes(&r), vec![ACCEPTED]);
 }
 
 #[test]
@@ -283,7 +283,7 @@ fn imports_two_versions_of_one_lib_are_not_a_cycle() {
         (key("u", "l", 1), lib_src("l", "")),
     ]);
     let r = compile_with_libs(&root("import u/l/2\n"), &v5(), &mut libs);
-    assert_eq!(codes(&r), vec![NOT_IMPLEMENTED]);
+    assert_eq!(codes(&r), vec![ACCEPTED]);
     assert_eq!(libs.loaded().len(), 2);
 }
 
@@ -337,7 +337,7 @@ fn imports_library_is_reparsed_per_compilation() {
     let mut libs = LibCache::in_memory(vec![(key("u", "l", 1), lib_src("l", ""))]);
     for _ in 0..2 {
         let r = compile_with_libs(&root("import u/l/1\n"), &v5(), &mut libs);
-        assert_eq!(codes(&r), vec![NOT_IMPLEMENTED]);
+        assert_eq!(codes(&r), vec![ACCEPTED]);
     }
     assert_eq!(
         libs.loaded().len(),
@@ -410,7 +410,7 @@ fn imports_non_exported_item_is_refused() {
         &v5(),
         &mut libs,
     );
-    assert_eq!(codes(&r), vec![NOT_IMPLEMENTED]);
+    assert_eq!(codes(&r), vec![ACCEPTED]);
 }
 
 #[test]
@@ -418,6 +418,7 @@ fn imports_library_types_resolve_through_the_alias() {
     let lib = "//@version=5\nlibrary(\"l\")\nexport type P\n    float v = 0.0\ntype H\n    float v = 0.0\nexport f(float x) => x\n";
     let mut libs = LibCache::in_memory(vec![(key("u", "l", 1), lib.to_owned())]);
     let r = compile_with_libs(&root("import u/l/1\nl.P p = l.P.new()\n"), &v5(), &mut libs);
+    // An object site: emission waits for T15's provenance (`not implemented`).
     assert_eq!(codes(&r), vec![NOT_IMPLEMENTED]);
     let r = compile_with_libs(&root("import u/l/1\nl.H h = na\n"), &v5(), &mut libs);
     assert_eq!(codes(&r), vec![3038]);
@@ -429,7 +430,7 @@ fn resolve_library_function_sees_only_const_globals() {
     let ok = lib("const float K = 2.0\nM = 3\nexport f(float x) => x * K + M\n");
     let mut libs = LibCache::in_memory(vec![(key("u", "l", 1), ok)]);
     let r = compile_with_libs(&root("import u/l/1\n"), &v5(), &mut libs);
-    assert_eq!(codes(&r), vec![NOT_IMPLEMENTED]);
+    assert_eq!(codes(&r), vec![ACCEPTED]);
     let bad = lib("G = close\nexport f(float x) => x + G\n");
     let mut libs = LibCache::in_memory(vec![(key("u", "l", 1), bad)]);
     let ds = diags(compile_with_libs(&root("import u/l/1\n"), &v5(), &mut libs));

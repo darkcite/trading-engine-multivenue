@@ -93,13 +93,6 @@ pub(crate) struct Typed {
     /// The index of the root's top level.
     pub(crate) root: usize,
     /// Every `input.*` site reached while typing, in source order (§4.12.1).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "ProgramMeta::inputs, written by meta.rs (impl-02 T20)"
-        )
-    )]
     pub(crate) inputs: Vec<InputDesc>,
     /// `input.source` sites: `(file, call)` → the built-in series each aliases (§4.12.2).
     pub(crate) sources: Vec<((usize, NodeId), Sym)>,
@@ -550,8 +543,19 @@ impl<'a, 's> Infer<'a, 's> {
             self.vars.insert(id, t);
             self.var_na.insert(id, may_na);
             self.cur.locals.push((id, t));
+            // §4.12.3: "Every use folds (window lengths, `request.security` targets, declaration
+            // arguments)" — an `input`-qualified variable carries its value in effect like a
+            // `const` one (a reassigned variable is `series` under the default reading, §4.4.2).
+            // A reassigned variable never folds: under `pin:02-var-qualifier` `Join` its
+            // qualifier can stay `const`/`input` while its value changes at the `:=`.
+            let reassigned = self
+                .res
+                .reassigned
+                .get(id as usize)
+                .copied()
+                .unwrap_or(false);
             match k {
-                Some(k) if t.qual == Qual::Const => {
+                Some(k) if !reassigned && (t.qual == Qual::Const || t.qual == Qual::Input) => {
                     self.var_k.insert(id, k);
                 }
                 _ => {

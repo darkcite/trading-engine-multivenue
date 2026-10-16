@@ -91,6 +91,7 @@ pub(crate) fn lower(
         vars: HashMap::new(),
         params: Vec::new(),
         out: Vec::new(),
+        prelude: Vec::new(),
         region: 0,
         regions: 0,
         declared: Vec::new(),
@@ -104,7 +105,9 @@ pub(crate) fn lower(
         }
     }
     let mut ir = lw.ir;
-    ir.body = Block(lw.out);
+    let mut body = lw.prelude;
+    body.extend(lw.out);
+    ir.body = Block(body);
     // §4.14.8: every `hline` after every other index — shift their `__plot` past the others.
     let base = ir.plots.len() as u64;
     fix_hlines(&mut ir.body, base, d);
@@ -165,6 +168,9 @@ struct Lower<'a> {
     params: Vec<VSlot>,
     /// The block being built.
     out: Vec<Stmt>,
+    /// §4.14.1's prelude: one `CALL_BUILTIN` per referenced `ValueSrc::Call` value, in first-read
+    /// order, every argument defaulted; placed before the body.
+    prelude: Vec<Stmt>,
     /// The region being built (0 = the top level).
     region: u32,
     /// Regions opened so far.
@@ -471,7 +477,7 @@ impl Lower<'_> {
             _ => return Err(self.todo(n, "a `Fold` value (T20)")),
         };
         let info = self.info(ty, kind, Sym::NONE, self.ast.span(n));
-        Ok(self.ir.value(base + i as u32, info))
+        self.value_slot(n, base + i as u32, info)
     }
 
     fn path(&self, n: NodeId) -> Option<String> {
@@ -2534,7 +2540,38 @@ impl Lower<'_> {
             }
         };
         let info = self.info(v.ty, kind, Sym::NONE, at);
-        Ok(Arg::Slot(self.ir.value(i, info)))
+        let root = self.ast.root();
+        Ok(Arg::Slot(self.value_slot(root, i, info)?))
+    }
+
+    /// The slot of value row `row`; the first read of a `ValueSrc::Call` row also lowers its
+    /// prelude call (§4.14.1) — `OverloadId(bits)` with every argument defaulted, its result
+    /// written straight into the prelude slot. `n` only spans the window's defaults.
+    fn value_slot(&mut self, n: NodeId, row: u32, info: SlotInfo) -> Result<VSlot, Diag> {
+        let fresh = !self.ir.has_value(row);
+        let v = self.ir.value(row, info);
+        if !(fresh && matches!(info.kind, SlotKind::Prelude { .. })) {
+            return Ok(v);
+        }
+        let Some(val) = pine_spec::VALUES.get(row as usize) else {
+            return Err(self.todo(n, "a value row out of range"));
+        };
+        let ov = pine_ir::OverloadId(val.bits as u16);
+        let o = pine_spec::overload(ov);
+        let saved = std::mem::take(&mut self.out);
+        let region = std::mem::replace(&mut self.region, 0);
+        let r = self.window(n, o, &[], &[], info.ty);
+        let mut pre = std::mem::replace(&mut self.out, saved);
+        self.region = region;
+        let args = r?;
+        pre.push(Stmt::Op(Op::Call {
+            ov,
+            args,
+            outs: vec![v],
+            span: info.span,
+        }));
+        self.prelude.extend(pre);
+        Ok(v)
     }
 }
 

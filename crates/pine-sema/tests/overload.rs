@@ -26,7 +26,8 @@ fn run(d: Dialect, body: &str) -> Vec<u16> {
 
 #[track_caller]
 fn accepted(d: Dialect, body: &str) {
-    assert_eq!(run(d, body), vec![NOT_IMPLEMENTED], "v{}: {body}", d as u8);
+    let c = run(d, body);
+    assert!(passes(&c), "v{}: {body}: {c:?}", d as u8);
 }
 
 #[track_caller]

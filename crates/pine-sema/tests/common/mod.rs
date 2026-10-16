@@ -66,7 +66,21 @@ pub fn compile_with_libs(
 ) -> Result<PineProgram, Vec<Diag>> {
     let mut syms = SymTable::new();
     let ast = pine_lang::parse(src, FileId::ROOT, &mut syms).expect("test script parses");
-    pine_sema::compile(&ast, syms, opts, libs)
+    let r = pine_sema::compile(&ast, syms, opts, libs);
+    // Every `Ok` program any test compiles must pass pine-vm's verifier (§4.14, I-1…I-8).
+    if let Ok(p) = &r {
+        if let Err(e) = pine_vm::verify(p, &pine_std::BUILTINS) {
+            panic!(
+                "an emitted program fails verify: rule {} pc {} detail {}\n{src}\n{:?}\n{:?}",
+                e.rule,
+                e.pc,
+                e.detail,
+                p.code.get(e.pc as usize),
+                p.layout
+            );
+        }
+    }
+    r
 }
 
 /// Parse and compile `src` with no libraries.
@@ -81,10 +95,10 @@ pub fn is_unserved(d: &Diag) -> bool {
 }
 
 /// Every diagnostic code of a refusal, in order, without [`is_unserved`] ones; a refusal made
-/// only of those reads as [`NOT_IMPLEMENTED`] (what an accepted script returns until T19, §6).
+/// only of those reads as [`NOT_IMPLEMENTED`]; an `Ok` program reads as [`ACCEPTED`] (T19).
 pub fn codes(r: &Result<PineProgram, Vec<Diag>>) -> Vec<u16> {
     match r {
-        Ok(_) => Vec::new(),
+        Ok(_) => vec![ACCEPTED],
         Err(ds) => {
             let v: Vec<u16> = ds
                 .iter()
@@ -116,6 +130,15 @@ pub fn all_diags(r: Result<PineProgram, Vec<Diag>>) -> Vec<Diag> {
     }
 }
 
-/// `3255` "not implemented: emission" — what a script every existing pass accepts returns until
-/// T19 (impl-02 §6).
+/// `3255` "not implemented: …" — a construct the lane's back half does not emit yet (impl-02 §6),
+/// or a script whose only refusals are unserved pine-std rows.
 pub const NOT_IMPLEMENTED: u16 = 3255;
+
+/// What [`codes`] reads for an `Ok` program (T19).
+pub const ACCEPTED: u16 = 0;
+
+/// Every pass accepted the script: an `Ok` program, or a construct the back half does not emit
+/// yet ([`NOT_IMPLEMENTED`]) — what the front-end acceptance tests assert.
+pub fn passes(v: &[u16]) -> bool {
+    v == [ACCEPTED] || v == [NOT_IMPLEMENTED]
+}

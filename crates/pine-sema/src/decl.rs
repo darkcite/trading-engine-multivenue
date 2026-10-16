@@ -34,6 +34,8 @@ pub(crate) struct Decl {
     pub(crate) strategy: StrategyDecl,
     /// `calc_on_order_fills`, `calc_on_every_tick` or `calc_on_every_history_tick` is set.
     pub(crate) uses_intrabar: bool,
+    /// The declaration's `max_bars_back` argument — §4.10.4's `D`; 0 = not declared.
+    pub(crate) max_bars_back: u32,
 }
 
 /// A folded argument or default, strings borrowed.
@@ -306,6 +308,7 @@ pub(crate) fn check(
             _ => ScriptKind::Strategy,
         };
         unsupported(&a, out.kind, opts, diags);
+        out.max_bars_back = declared_mbb(&a, opts, diags);
         if out.kind == ScriptKind::Strategy {
             decl_args = Some(a);
         }
@@ -429,6 +432,43 @@ fn fold_risk(a: &Args<'_>, name: &str, sd: &mut StrategyDecl, f: &mut Fold<'_>) 
         }
         "strategy.risk.max_cons_loss_days" => r.max_cons_loss_days = f.count(a, "count"),
         _ => {}
+    }
+}
+
+/// §4.10.4's `D`: the declaration's own `max_bars_back` argument, when given. Above
+/// `MAX_BARS_BACK_HARD`, or above a manifest cap `M > 0`, is `3017` naming both (sizing below the
+/// script's own requirement would turn its deep reads into silent `na`s); a negative one `3007`.
+/// `pin:02-decl-mbb-zero` — a declared 0 reads as "not declared" (§4.10.4: 0 = none).
+fn declared_mbb(a: &Args<'_>, opts: &CompileOpts, diags: &mut Vec<Diag>) -> u32 {
+    if a.node("max_bars_back").is_none() {
+        return 0;
+    }
+    let Some((v, sp)) = a.get("max_bars_back") else {
+        return 0;
+    };
+    let at = sp.unwrap_or_default();
+    let m = opts.limits.max_bars_back;
+    match v {
+        V::Int(n) if n < 0 => {
+            let msg = format!("`max_bars_back` must be an int >= 0, not {n}");
+            diags.push(diag(ReasonCode::TypeMismatch, at, msg));
+            0
+        }
+        V::Int(n) if n > i64::from(crate::limits::MAX_BARS_BACK_HARD) => {
+            let msg = format!(
+                "declared max_bars_back {n} exceeds {}",
+                crate::limits::MAX_BARS_BACK_HARD
+            );
+            diags.push(diag(ReasonCode::LookbackExceedsCap, at, msg));
+            0
+        }
+        V::Int(n) if m > 0 && n > i64::from(m) => {
+            let msg = format!("declared max_bars_back {n} exceeds the manifest max_bars_back {m}");
+            diags.push(diag(ReasonCode::LookbackExceedsCap, at, msg));
+            0
+        }
+        V::Int(n) => n as u32,
+        _ => 0,
     }
 }
 

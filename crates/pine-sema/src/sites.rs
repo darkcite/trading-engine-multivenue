@@ -30,6 +30,10 @@ pub(crate) struct Site {
     pub(crate) bytes: u32,
     /// The call's span.
     pub(crate) span: Span,
+    /// The resolved window length `L` that sized the block (§4.7.2; 0 for a non-`Param` shape).
+    pub(crate) len: u32,
+    /// The site's `Overload::warmup` in bars (§4.18).
+    pub(crate) warm: u32,
 }
 
 /// The inputs numbering reads besides the IR.
@@ -69,6 +73,8 @@ fn walk(ir: &Ir, b: &Block, flags: u8, cx: &SiteCtx<'_>, out: &mut Vec<Site>) ->
                         flags,
                         bytes: o.state.block_bytes(l),
                         span: *span,
+                        len: l,
+                        warm: warmup(ir, o, args, cx),
                     });
                 } else if o.is_collection() {
                     if cx.collection_cap == 0 {
@@ -90,6 +96,8 @@ fn walk(ir: &Ir, b: &Block, flags: u8, cx: &SiteCtx<'_>, out: &mut Vec<Site>) ->
                     flags,
                     bytes: (32 + 8 * u32::from(n) + 7) & !7,
                     span: *span,
+                    len: 0,
+                    warm: 0,
                 });
             }
             Stmt::Op(_) | Stmt::Break | Stmt::Continue => {}
@@ -137,6 +145,67 @@ fn window_len(
     Ok(l as u32)
 }
 
+/// `Overload::warmup` in bars (§4.18): `None` 0, `Fixed` its bars, `Param` the resolved `L` of
+/// `param` (+ `param2`), `ParamPlus` `L + bars`, `Recursive` `RECURSIVE_WARMUP_FACTOR × L`. A
+/// parameter that does not fold reads the effective cap `C` — the length a `series` window is
+/// sized with (§4.7.2) — and 0 without one (`pin:02-warmup-dynamic-param`: §4.18 names no value
+/// for an unfolded length; the window rule's `C` is the literal reading where one exists).
+fn warmup(ir: &Ir, o: &pine_spec::Overload, args: &[Arg], cx: &SiteCtx<'_>) -> u32 {
+    use pine_spec::WarmKind;
+    let w = o.warmup;
+    let len = || {
+        let a = warm_part(ir, o, args, w.param, cx);
+        let b = if w.param2 == StateSpec::NO_PARAM {
+            0
+        } else {
+            warm_part(ir, o, args, w.param2, cx)
+        };
+        a.saturating_add(b)
+    };
+    match w.kind {
+        WarmKind::None => 0,
+        WarmKind::Fixed => w.bars,
+        WarmKind::Param => len(),
+        WarmKind::ParamPlus => len().saturating_add(w.bars),
+        WarmKind::Recursive => len().saturating_mul(crate::limits::RECURSIVE_WARMUP_FACTOR),
+    }
+}
+
+/// One warm-up part: the folded argument of row `row` (negative reads 0), else `C`.
+fn warm_part(ir: &Ir, o: &pine_spec::Overload, args: &[Arg], row: u8, cx: &SiteCtx<'_>) -> u32 {
+    let ps = pine_spec::params(o);
+    let pos = ps
+        .iter()
+        .take(usize::from(row))
+        .filter(|p| p.versions.has(cx.d))
+        .count();
+    match const_arg(ir, args.get(pos)) {
+        Some((lane, bits, true)) => {
+            let n = if lane == Lane::F64 {
+                f64::from_bits(bits) as i64
+            } else {
+                bits as i64
+            };
+            n.clamp(0, i64::from(u32::MAX)) as u32
+        }
+        _ => cx.cap,
+    }
+}
+
+/// The constant an argument holds, `(lane, bits, valid)`.
+fn const_arg(ir: &Ir, a: Option<&Arg>) -> Option<(Lane, u64, bool)> {
+    match a {
+        Some(Arg::Const { lane, bits, valid }) => Some((*lane, *bits, *valid)),
+        Some(Arg::Slot(v)) => match ir.slots.get(v.0 as usize) {
+            Some(s) if s.kind == SlotKind::Const => {
+                ir.const_of(*v).map(|(bits, valid)| (s.lane, bits, valid))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// One window part: parameter row `row` (all dialects) read through the dialect's window.
 fn part(
     ir: &Ir,
@@ -154,17 +223,7 @@ fn part(
         .filter(|p| p.versions.has(cx.d))
         .count();
     let name = ps.get(usize::from(row)).map_or("", |p| p.name.as_str());
-    let konst = match args.get(pos) {
-        Some(Arg::Const { lane, bits, valid }) => Some((*lane, *bits, *valid)),
-        Some(Arg::Slot(v)) => match ir.slots.get(v.0 as usize) {
-            Some(s) if s.kind == SlotKind::Const => {
-                ir.const_of(*v).map(|(bits, valid)| (s.lane, bits, valid))
-            }
-            _ => None,
-        },
-        _ => None,
-    };
-    match konst {
+    match const_arg(ir, args.get(pos)) {
         Some((lane, bits, true)) => {
             let n = if lane == Lane::F64 {
                 f64::from_bits(bits) as i64

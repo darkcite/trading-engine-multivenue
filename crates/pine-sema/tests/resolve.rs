@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! impl-02 §7.1 — pass 2, lexical resolution (§4.3). Until T19 a script every existing pass
-//! accepts returns only `3255` "not implemented: emission" (§6); `accepted` asserts exactly that.
+//! impl-02 §7.1 — pass 2, lexical resolution (§4.3). A script every pass accepts is an `Ok`
+//! program, or `3255` for a construct the back half does not emit yet; `accepted` asserts that.
 
 mod common;
 
-use common::{codes, compile_src, diags, v5, NOT_IMPLEMENTED};
+use common::{codes, compile_src, diags, passes, v5};
 
 fn script(body: &str) -> String {
     format!("//@version=5\nindicator(\"t\")\n{body}")
@@ -14,11 +14,8 @@ fn script(body: &str) -> String {
 
 #[track_caller]
 fn accepted(body: &str) {
-    assert_eq!(
-        codes(&compile_src(&script(body), &v5())),
-        vec![NOT_IMPLEMENTED],
-        "{body}"
-    );
+    let c = codes(&compile_src(&script(body), &v5()));
+    assert!(passes(&c), "{body}: {c:?}");
 }
 
 #[track_caller]
@@ -172,7 +169,9 @@ fn resolve_name_without_a_row_in_the_dialect_is_not_in_dialect() {
     refused("c = currency.AED\nplot(close)\n", 3005);
     let v6 = "//@version=6\nindicator(\"t\")\nplot(ask)\n";
     let o = common::default_opts(pine_ir::Dialect::V6, pine_ir::ExecMode::BarClose);
-    assert_eq!(codes(&compile_src(v6, &o)), vec![NOT_IMPLEMENTED]);
+    // `ask` is a prelude row the lane's pine-std does not serve yet.
+    let c = codes(&compile_src(v6, &o));
+    assert!(passes(&c), "{c:?}");
 }
 
 #[test]
