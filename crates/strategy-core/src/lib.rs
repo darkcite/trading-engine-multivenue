@@ -1497,23 +1497,6 @@ pub struct Bin15Counters {
     pub takes_filled: u64,
     /// Arm A IoCs that reached their deadline unfilled.
     pub takes_unfilled: u64,
-    /// Arm B resting quotes emitted.
-    pub quotes_submitted: u64,
-    /// Arm B quotes that filled (any quantity), counted when the
-    /// fill arrives under the id the member is currently tracking.
-    ///
-    /// E5: a fill that raced a reprice and came back under the id the
-    /// order carried BEFORE it moved is [`Self::quotes_raced`]
-    /// instead — it belongs to an order the member has already
-    /// replaced, and counting it here would say a resting quote
-    /// filled when a retired one did.
-    pub quotes_filled: u64,
-    /// Arm B quotes that reached their TTL unfilled.
-    pub quotes_expired: u64,
-    /// Closing takes emitted (the only sell the member ever sends).
-    pub closes_submitted: u64,
-    /// Re-prices held: `τ` under the arm's minimum.
-    pub skipped_tau: u64,
     /// Re-prices held: inside `tail_refuse_ns`.
     pub skipped_tail: u64,
     /// Re-prices held: no underlying mark, a cold forecast or a price
@@ -1529,47 +1512,10 @@ pub struct Bin15Counters {
     /// which is the failure that prices four families off a frozen
     /// number while their books track reality.
     pub skipped_mark_stale: u64,
-    /// Re-prices held: the binary book is one-sided or empty.
-    pub skipped_book: u64,
-    /// Re-prices held: a closing take with nothing to close.
-    pub skipped_inventory: u64,
     /// Re-prices held: a notional cap left no room.
     pub skipped_cap: u64,
     /// Re-prices held: the price or size fell off the HIP-4 grid.
     pub skipped_grid: u64,
-    /// **E5: re-prices held because the resting quote is PARTIALLY
-    /// FILLED.**
-    ///
-    /// A MODIFY replaces the venue's remaining size wholesale, so
-    /// moving a partially-filled quote means the member's
-    /// `filled_1e6`/`qty_1e6` pair and the venue's remainder have to
-    /// agree across a race — which is where double-count bugs live.
-    /// A quote that is already working does not need the help; its
-    /// TTL will end it.
-    pub skipped_partial: u64,
-    /// BIN15 P3 (F6): coverage entries NOT taken because the ask did
-    /// not clear `p̂ − e_entry`.
-    ///
-    /// Not a defect — it is the arm working. The bar is `p > a` plus a
-    /// margin, so an instance whose favourite is priced at or above the
-    /// model's own belief is one the member declines to pay for. A
-    /// counter that stays at zero while entries fire on every instance
-    /// means the bound is not binding and the arm is a market order
-    /// wearing a price limit.
-    pub skipped_entry_price: u64,
-    /// BIN15 S5: coverage entries NOT taken YET because the price test
-    /// has not held on `entry_persist_polls` consecutive distinct book
-    /// snapshots. Counted per reprice, like `skipped_entry_price`; zero
-    /// for ever under `entry_persist_polls = 1` (the pre-S5 law).
-    pub skipped_entry_persist: u64,
-    /// BIN15 S5: instances whose coverage entry the elapsed ceiling
-    /// CLOSED — past `entry_elapsed_max_ns` with no run of passing
-    /// snapshots under way (none began by then, or the one that did was
-    /// broken after it). Counted ONCE per instance, not per reprice, so it
-    /// reads as instances; zero for ever with no ceiling. A closed
-    /// instance is silent after, so `skipped_entry_price` stops counting
-    /// its refusals too.
-    pub skipped_entry_elapsed: u64,
     /// Configured families with no live instance (a level, not a total).
     pub families_dormant: u64,
     /// Fills matched to one of this member's pendings.
@@ -1583,53 +1529,6 @@ pub struct Bin15Counters {
     /// things at once and mask the disagreement it exists to report.
     /// See [`Self::settlement_fills`].
     pub unknown_fills: u64,
-    /// **E5 (LAW E-7): Arm B quotes repriced in place with a MODIFY**
-    /// rather than left to expire.
-    ///
-    /// Before E5 this member had no cancel path, so a live quote
-    /// could only be replaced by letting its TTL run out —
-    /// `requote_ttl_ns` was the replace cadence, not a nicety. These
-    /// are the reprices that no longer wait.
-    pub quotes_modified: u64,
-    /// E5: MODIFY attempts the dispatcher refused. The resting quote
-    /// is still at its old price, still reserving its cap room, and
-    /// the member changed nothing.
-    ///
-    /// **`NoSuchOrder` is the common one and is not a defect** — a
-    /// fill or a TTL beat the reprice, which is a race the venue
-    /// wins fair and square.
-    pub quotes_modify_refused: u64,
-    /// **E5 (LAW E-8): Arm B quotes the member CANCELLED** because
-    /// their `ttl_ns` lapsed. The venue has no server-side TTL on
-    /// Gtc/Alo orders, so a quote nobody cancels rests forever —
-    /// before E5 the member simply forgot it, which was correct in
-    /// paper and would have stranded a live quote.
-    pub quotes_cancelled: u64,
-    /// E5: CANCEL attempts the dispatcher did not perform, for any
-    /// reason other than the order already being gone — including a
-    /// dispatcher that does not implement the verb at all
-    /// (`SubmitErr::Unsupported`, which is what every `Ctx` taking
-    /// the trait default answers).
-    ///
-    /// The member clears its own book at its own deadline either way,
-    /// so against a LIVE arm a non-zero value is a quote the member
-    /// has stopped tracking and the venue may still hold — which is
-    /// what E6's reconciliation exists to find. Against a paper arm
-    /// it means the dispatcher never learned to cancel, and its own
-    /// TTL law is what retires the order; read the two apart by which
-    /// arm the slot is routed to, not by this number alone.
-    ///
-    /// `NoSuchOrder` is excluded on purpose — there the order really
-    /// is gone, which is what the member wanted.
-    pub quotes_cancel_refused: u64,
-    /// E5: fills that booked against a quote's PREVIOUS client id —
-    /// a fill that raced a reprice and was answered under the id the
-    /// order had before it moved.
-    ///
-    /// Expected to be small and non-zero. Before the one-generation
-    /// memory these landed in `unknown_fills` and moved no position,
-    /// so the member believed it held less than it did.
-    pub quotes_raced: u64,
     /// Fills the VENUE generated to settle an instance
     /// (`FILL_FLAG_SETTLEMENT`) rather than a trade the member asked
     /// for.

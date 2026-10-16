@@ -1011,20 +1011,8 @@ fn build_bin15_capture_clocked(
         bin15_artifact(&[
             ("families", families_toml),
             ("underlying", "[\"hyperliquid:BTC\"]"),
-            // Arm A only, and never the null arm: this test is about
-            // the pricer reaching a book, not about the A/B design.
-            ("maker_enabled", "0"),
-            ("null_arm", "0"),
-            // $40 is exactly 100 contracts at 0.40, so the clip that
-            // trades is bounded by all three of the resting ask size,
-            // `clip_qty_1e6` and the cap room — and the P&L below is a
-            // whole number of contracts rather than a cap remainder.
             ("cap_instance_usd_1e6", "40000000"),
             ("cap_day_usd_1e6", "40000000"),
-            // BIN15 O9: the EDGE law, not the coverage entry — this
-            // fixture is about the pricer reaching a book, and a $50
-            // coverage entry would not fit the $40 cap above anyway.
-            ("entry_usd_1e6", "0"),
         ]),
     )
     .expect("write bin15.toml");
@@ -1048,7 +1036,7 @@ fn bin15_cfg(replay: &Path, toml: &Path) -> BacktestConfig {
 }
 
 #[test]
-fn member_bin15_prices_takes_and_settles_on_a_synthetic_root() {
+fn member_bin15_prices_and_settles_its_ledger_on_a_synthetic_root() {
     let root = unique_root("bin15");
     let (replay, toml) = build_bin15_capture(&root, 0, "[\"out:BTC:15m\"]");
     let mut cfg = bin15_cfg(&replay, &toml);
@@ -1073,30 +1061,16 @@ fn member_bin15_prices_takes_and_settles_on_a_synthetic_root() {
     );
     assert!(out.summary.contains("anchor=wall (identity)"), "{}", out.summary);
 
-    // It priced, and it took exactly once: one pending take per family,
-    // and after the fill the bid is never rich enough to close.
+    // It priced and rolled. BIN15 H90 G3: the old arms are gone, and this
+    // fixture's late law is off (the example states none), so nothing is
+    // sent — the pricer reaching a book is what this test is about. The
+    // late law's own entries are held by alloc gate 52b and the nightly
+    // accrual's replay.
     assert!(out.summary.contains(" rolls=1 "), "{}", out.summary);
-    assert!(out.summary.contains(" takes_submitted=1 takes_filled=1 "), "{}", out.summary);
-    assert!(out.summary.contains(" takes_unfilled=0 "), "{}", out.summary);
-    // ONE take, though the edge is 60 c and there are two Yes ticks:
-    // the second re-price sees the first IoC still pending and holds.
-    // One pending take per family is what stops a member from
-    // committing the same clip twice while an intent is in flight —
-    // the fill arrives AFTER `on_tick` in the drive, so the pending is
-    // still live when the second tick re-prices.
-    assert!(out.summary.contains(" skipped_cap=0 "), "{}", out.summary);
-    assert!(out.summary.contains(" quotes_submitted=0 "), "maker was off: {}", out.summary);
+    assert!(out.summary.contains(" takes_submitted=0 "), "{}", out.summary);
+    assert!(out.summary.contains(" late_reprices=0 "), "{}", out.summary);
     assert!(out.summary.contains(" unknown_fills=0 "), "{}", out.summary);
-    assert_eq!(out.stats.fills_total, 1, "{}", out.summary);
-    assert_eq!(out.stats.ioc_fills, 1, "{}", out.summary);
-
-    // The arithmetic, by hand: 100 contracts bought at 0.40 against a
-    // strike 11 % in the money, settling at 1.0 ⇒ +$60 at zero fee.
-    let key = "\"net_pnl_usd\":";
-    let i = out.schema1.find(key).expect("net field") + key.len();
-    let j = out.schema1[i..].find(',').expect("comma") + i;
-    let net: f64 = out.schema1[i..j].parse().expect("json number");
-    assert!((59.0..=61.0).contains(&net), "net {net}: {}", out.schema1);
+    assert_eq!(out.stats.fills_total, 0, "{}", out.summary);
 
     // The calibration ledger (the O5 / G6.1 instrument). It is
     // additive: `detail_version` stays 7.
@@ -1137,13 +1111,8 @@ fn member_bin15_replays_a_v3_capture_on_the_venue_clock() {
         "{}",
         out.summary
     );
-    // The same trade and the same settlement as the identity fixture.
-    assert!(out.summary.contains(" takes_submitted=1 takes_filled=1 "), "{}", out.summary);
-    let key = "\"net_pnl_usd\":";
-    let i = out.schema1.find(key).expect("net field") + key.len();
-    let j = out.schema1[i..].find(',').expect("comma") + i;
-    let net: f64 = out.schema1[i..j].parse().expect("json number");
-    assert!((59.0..=61.0).contains(&net), "net {net}: {}", out.schema1);
+    // The same instance as the identity fixture, and nothing sent (G3).
+    assert!(out.summary.contains(" takes_submitted=0 "), "{}", out.summary);
     // Every ledger stamp is a VENUE instant the capture holds a record at
     // (on the old law each would sit 23 s earlier — none of them).
     let detail = std::fs::read_to_string(root.join("detail.json")).expect("detail");

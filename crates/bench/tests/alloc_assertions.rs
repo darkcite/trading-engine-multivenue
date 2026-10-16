@@ -7182,11 +7182,13 @@ fn vrp_member_p4_decision_paths_are_zero_alloc() {
     assert_eq!(bytes, 0, "P4 decision-path hot bytes should be zero: saw {bytes}");
 }
 
-/// Gate 52 (BIN15 O4b, spec §6.4): the bin15 member's live callbacks at
-/// full width — eight families over four underlyings, 100 rolls, 10 000
-/// `Mark` events with their per-minute forecast refresh, both binary
-/// legs ticking, both arms armed, the 1 s timer sweeping pendings, and
-/// every order it emits coming straight back as a fill.
+/// Gate 52 (BIN15 O4b, spec §6.4; narrowed at H90 G3): the bin15
+/// member's live callbacks at full width — eight families over four
+/// underlyings, 100 rolls, 10 000 `Mark` events with their per-minute
+/// forecast refresh, both binary legs ticking and the 1 s timer — with
+/// the late law OFF, so what runs is the S-law pricer, the member's
+/// logged counterfactual, which never trades (the arms it once fed were
+/// retired at H90 G3; gate 52b measures the late law's takes).
 ///
 /// The boot box is not measured: the lookup tables are 17 KiB on the
 /// heap by design (`Box<Bin15Luts>`), the two `VolEngine`s per
@@ -7199,11 +7201,10 @@ fn vrp_member_p4_decision_paths_are_zero_alloc() {
 /// EVERY underlying (one mark moves every binary struck against it), so
 /// a member with eight families on four coins re-prices twenty thousand
 /// times over this tape. An allocation anywhere on that path — a `Vec`
-/// for the arms' candidate list, a `format!` in a counter's name, a
-/// `Box` for a pending — would be invisible at the call site and fatal
-/// at 4 marks a second per coin.
+/// of candidates, a `format!` in a counter's name — would be invisible
+/// at the call site and fatal at 4 marks a second per coin.
 #[test]
-fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
+fn bin15_member_roll_tick_reprice_is_zero_alloc() {
     use core_types::{make_symbol_id, ChannelEvent, ChannelId, Order};
     use strategy_bin15::{
         price, Bin15Params, Bin15Strategy, FAMILY_NATIVE_DAILY, FAMILY_OUT_15M,
@@ -7219,13 +7220,11 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
 
     struct SinkCtx {
         n: u64,
-        last: Option<Order>,
         now: u64,
     }
     impl Ctx for SinkCtx {
-        fn submit(&mut self, order: Order) -> Result<(), SubmitErr> {
+        fn submit(&mut self, _order: Order) -> Result<(), SubmitErr> {
             self.n += 1;
-            self.last = Some(order);
             Ok(())
         }
         fn now_ns(&self) -> u64 {
@@ -7260,22 +7259,10 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
         u += 1;
     }
     params.n_underlyings = BIN15_MAX_UNDERLYINGS;
-    // A daily family's floors are an hour, which no gate window reaches;
-    // shrink them so one tape exercises both kinds' arms.
-    params.tau_min_take_ns = [60_000_000_000, 60_000_000_000];
-    params.tau_min_quote_ns = [120_000_000_000, 120_000_000_000];
-    params.maker_enabled = 1;
-    params.null_arm = 1;
+    // The late law stays OFF (the default): every order would be its, and
+    // gate 52b measures it.
     params.cap_instance_usd_1e6 = 1_000_000_000;
     params.cap_day_usd_1e6 = 1_000_000_000_000;
-    // BIN15 S5: the coverage entry ON, with its persistence gate and its
-    // elapsed ceiling, so the run, the counterfactual, a price refusal and
-    // (in the S3 phase below) the ceiling's close are all under the guard.
-    // The legs tick every 10 s and a failing Yes book lands at 5 s, so
-    // each 15 m instance enters on its third passing snapshot, 30 s in.
-    params.entry_usd_1e6 = 50_000_000;
-    params.entry_persist_polls = 3;
-    params.entry_elapsed_max_ns = 240_000_000_000;
 
     // A real CDF shape, boxed before the guard.
     let mut luts = Box::new(price::Bin15Luts::identity());
@@ -7355,11 +7342,7 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
         )
     };
 
-    let mut ctx = SinkCtx {
-        n: 0,
-        last: None,
-        now: at(0),
-    };
+    let mut ctx = SinkCtx { n: 0, now: at(0) };
     // One mark per underlying before the guard, so the first measured
     // mark is a minute ROLL and not a cold first sighting.
     let mut u = 0usize;
@@ -7394,8 +7377,7 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
             );
         }
         // A strike 10 % below the mark: the Yes leg is a certainty, so
-        // a resident ask at 0.40 is always takeable and the arms run
-        // every time rather than only when the walk happens to cross.
+        // the pricer's φ table is read at its far end on every reprice.
         m.on_venue_event(
             &roll_ev(
                 fam,
@@ -7415,45 +7397,12 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
                 .max(60_000_000_000);
             m.on_venue_event(&mark_ev(ui, mark_px[ui], ts), &mut ctx);
             marks_seen += 1;
-            // Both legs tick every tenth second; both must be
-            // actionable before either arm fires.
+            // Both legs tick every tenth second (a touch change re-prices),
+            // and the 1 s timer sweeps.
             if k % 10 == 0 {
                 m.on_tick(&leg_tick(yes_sym(fam) + 1, ts, 390_000, 600_000), &mut ctx);
                 m.on_tick(&leg_tick(yes_sym(fam), ts, 300_000, 400_000), &mut ctx);
-                // Every order comes straight back as a full fill, so
-                // `book_fill` — which moves the position and clears the
-                // pending — is inside the guard too.
-                if let Some(o) = ctx.last.take() {
-                    if k == 20 {
-                        // XH4i-6: once an instance a gateway's late refusal
-                        // instead of the fill (`on_rejected`: a take written
-                        // off, or a quote's side freed) …
-                        let mut ev = core_types::OrderEvent::ZERO;
-                        ev.client_oid = o.client_oid;
-                        ev.kind = core_types::ORDER_EVENT_REJECTED;
-                        m.on_order_event(&ev, &mut ctx);
-                    } else {
-                        let fill =
-                            core_types::Fill::new(ts, o.sym, o.side, o.px, o.qty, o.client_oid);
-                        m.on_fill(&fill, &mut ctx);
-                    }
-                }
-                // … and the venue's end of a resting quote (`on_canceled`).
-                if k == 30 {
-                    if let Some(q) = m.family(fam).map(|f| f.pend_quote[0].oid) {
-                        let mut ev = core_types::OrderEvent::ZERO;
-                        ev.client_oid = q;
-                        ev.kind = core_types::ORDER_EVENT_CANCELED;
-                        m.on_order_event(&ev, &mut ctx);
-                    }
-                }
                 m.on_timer(ts, &mut ctx);
-            }
-            // BIN15 S5: once per instance a Yes ask the entry's bound
-            // refuses — a failing snapshot — so the gate's price refusal
-            // and a broken run are under the guard too.
-            if k == 5 {
-                m.on_tick(&leg_tick(yes_sym(fam), ts, 980_000, 990_000), &mut ctx);
             }
             k += 1;
         }
@@ -7481,8 +7430,6 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
         let px = 79_000_000_000 + (next() % 20_000_001) as i64 - 10_000_000;
         m.on_venue_event(&mark_ev(0, px, ts), &mut ctx);
         if k == 0 {
-            // BIN15 S5: this instance is bound 830 s into its life, past
-            // the ceiling, so its first coverage reprice CLOSES it.
             m.on_tick(&leg_tick(yes_sym(0) + 1, ts, 390_000, 600_000), &mut ctx);
             m.on_tick(&leg_tick(yes_sym(0), ts, 300_000, 400_000), &mut ctx);
         }
@@ -7509,25 +7456,8 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
         "one mark re-prices every family on its underlying: saw {}",
         counters.reprices
     );
-    assert!(counters.takes_submitted > 0, "the gate must measure real takes");
-    assert!(counters.takes_filled > 0, "and real fills");
-    assert!(counters.quotes_submitted > 0, "and Arm B");
-    assert!(counters.skipped_entry_persist > 0, "and the S5 persistence gate");
-    assert!(counters.skipped_entry_price > 0, "and its price refusal");
-    assert_eq!(counters.skipped_entry_elapsed, 1, "and the S5 ceiling's close, once");
-    // BIN15 S5b: both counterfactuals were stamped under the guard. The last
-    // roll's instance (family 3 — the S3 phase rebinds family 0 only) passed
-    // both tests on its first Yes snapshot, at its own bind second.
-    let last = ROLLS - 1;
-    assert_ne!(last % BIN15_MAX_FAMILIES, 0, "the S3 phase rebinds family 0");
-    let f_last = *m.family(last % BIN15_MAX_FAMILIES).expect("the last roll's family");
-    let t_last = at(1 + last as u64 * MARKS_PER_ROLL);
-    assert_eq!(
-        (f_last.entry_first_ok_ts, f_last.entry_ctl_ok_ts),
-        (t_last, t_last),
-        "the artifact's first fire and the control"
-    );
-    assert!(ctx.n > 0, "the gate must measure real submits");
+    assert_eq!(ctx.n, 0, "late off: the S-law pricer is a counterfactual and never trades");
+    assert_eq!(counters.takes_submitted, 0, "and counted none");
     assert_eq!(
         allocs, 0,
         "strategy-bin15 callbacks allocated {allocs} times ({bytes} B)"
@@ -7553,9 +7483,8 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
 /// σ-cold holds of the first 300 s, the take, its fill or refusal, and the
 /// settle that resets the family's `LateState`.
 ///
-/// The S-law's own arms are held off (a 200 s take floor on two-minute
-/// instances, no maker) so every order in the window is the late law's —
-/// gate 52 measures those arms. Not measured: `configure`, the two boxed
+/// The late law is the member's only trading law since H90 G3, so every
+/// order on the tape is its. Not measured: `configure`, the two boxed
 /// Φ tables (`Box<Bin15Luts>`, `Box<LateLut>`: 16 KiB each, built once at
 /// boot) and the HAR seeds.
 #[test]
@@ -7639,8 +7568,6 @@ fn bin15_late_window_entry_is_zero_alloc() {
     }
     params.n_families = FAMS;
     params.n_underlyings = FAMS;
-    params.tau_min_take_ns = [200_000_000_000, 3_600_000_000_000];
-    params.maker_enabled = 0;
     params.cap_instance_usd_1e6 = 1_000_000_000;
     params.cap_day_usd_1e6 = 1_000_000_000_000;
     // The ruled law (O-H90-5..7): [2, 30) s, p ≥ 0.90, 2 c, two polls, $100.
@@ -7834,7 +7761,7 @@ fn bin15_late_window_entry_is_zero_alloc() {
         "every late order was answered once"
     );
     assert_eq!(ctx.n, counters.late_submitted, "every order on the tape was the late law's");
-    assert_eq!(counters.takes_submitted, counters.late_submitted, "the S-law arms stayed off");
+    assert_eq!(counters.takes_submitted, counters.late_submitted, "every take is a late take");
     assert!(
         ctx.n_yes > 0 && ctx.n_yes < ctx.n,
         "Yes AND No entries: {} of {}",

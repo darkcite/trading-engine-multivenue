@@ -259,48 +259,15 @@ pub fn load_bin15_boot(
     }
     params.n_families = rolling.len();
 
-    params.e_take_1e6 = file.e_take_1e6;
-    params.h_quote_1e6 = file.h_quote_1e6;
-    // One artifact pair of floors, applied to both kinds — except that
-    // a daily binary needs an hour, not a minute (spec §6.4.6, ruling
-    // O-Q7). The 15 m floors come from the file; the daily ones are the
-    // stated 3600 s, and the file cannot lower them, because a daily
-    // quoted a minute before expiry is pure gamma to whoever crosses it.
-    params.tau_min_take_ns = [file.tau_min_take_ns, 3_600_000_000_000];
-    params.tau_min_quote_ns = [file.tau_min_quote_ns, 3_600_000_000_000];
     params.tail_refuse_ns = file.tail_refuse_ns;
     params.requote_ttl_ns = file.requote_ttl_ns;
-    params.requote_thr_1e6 = file.requote_thr_1e6;
-    params.clip_qty_1e6 = file.clip_qty_1e6;
     params.cap_instance_usd_1e6 = file.cap_instance_usd_1e6;
     params.cap_day_usd_1e6 = file.cap_day_usd_1e6;
-    // BIN15 O9: 0 in an artifact written before 2026-09-13, which is
-    // the edge law bit for bit.
-    params.entry_usd_1e6 = file.entry_usd_1e6;
     // BIN15 P0 (F4): absent in an artifact written before 2026-09-13,
     // where the parser supplies the stated 5 s default. That is a
     // BEHAVIOUR CHANGE for such an artifact, deliberately: the old
     // behaviour was pricing off a mark of any age.
     params.mark_stale_ns = file.mark_stale_ns;
-    // BIN15 P3 (F6): absent in an artifact written before 2026-09-13,
-    // where the parser supplies the stated 2 c. That is a BEHAVIOUR
-    // CHANGE for such an artifact, deliberately: the old behaviour was
-    // paying whatever the book asked.
-    params.e_entry_1e6 = file.e_entry_1e6;
-    // BIN15 R0 (2026-09-19): absent = 0 = no floor, the old law bit for
-    // bit; the parser has already bounded a present value to [0, 1e6).
-    params.entry_min_px_1e6 = file.entry_min_px_1e6;
-    // BIN15 S5: absent = 1 and 0 = the pre-S5 law bit for bit (the
-    // first passing snapshot fires; no ceiling); the parser has bounded
-    // both.
-    params.entry_persist_polls = file.entry_persist_polls;
-    params.entry_elapsed_max_ns = file.entry_elapsed_max_ns;
-    // BIN15 S5b (ruling 2026-09-24): the control counterfactual is TODAY'S
-    // law — the stated default bound, whatever this artifact's own
-    // `e_entry_1e6` says. It prices nothing and emits nothing.
-    params.entry_control_e_1e6 = core_config::bin15::E_ENTRY_1E6_DEFAULT;
-    params.maker_enabled = file.maker_enabled;
-    params.null_arm = file.null_arm;
     params.hour_ln_off_1e9 = file.hour_ln_off_1e9;
     params.scale_1e9 = file.scale_1e9;
     // BIN15 H90: absent keys = `late_enabled = 0` = the member as it was;
@@ -435,53 +402,16 @@ pub fn render_boot_tell(boot: &Bin15Boot, dormant: usize) -> String {
     for b in &boot.hash {
         hex.push_str(&format!("{b:02x}"));
     }
-    let entry = entry_law(&boot.params);
     let late = late_law(&boot.params);
     format!(
         "bin15: artifact configured hash={hex} families={} dormant={dormant} \
-         seeds={seeded} daily_seeds={daily} entry={entry} late={late} \
-         cap_instance=${} cap_day=${} mark_stale_ms={}{}",
+         seeds={seeded} daily_seeds={daily} late={late} \
+         cap_instance=${} cap_day=${} mark_stale_ms={}",
         boot.resolved,
         boot.params.cap_instance_usd_1e6 / 1_000_000,
         boot.params.cap_day_usd_1e6 / 1_000_000,
         boot.params.mark_stale_ns / 1_000_000,
-        day_cap_warning(&boot.params)
     )
-}
-
-/// The ENTRY LAW as the boot line spells it (BIN15 O9), because "what
-/// size do we take, and on what" is the first question asked of this
-/// member and the artifact hash alone does not answer it. `edge-only` is
-/// the edge law alone (`entry_usd_1e6 = 0`, the pre-2026-09-13 shape).
-///
-/// Every term that changes WHICH instances are bought is on the line: the
-/// BOUND (P3 F6 — "$50 on every instance" and "$50 whose ask clears the
-/// model by 2 c" are different strategies), the FLOOR (R0) when set, and
-/// since BIN15 S5 the PERSISTENCE (`&persist<n>`, from 2 up) and the
-/// ELAPSED CEILING (`&el<=<s>s`) when set. A term at its off value is
-/// absent, so a pre-S5 artifact prints exactly the line it always did.
-#[must_use]
-pub fn entry_law(p: &strategy_bin15::Bin15Params) -> String {
-    use core::fmt::Write as _;
-    if p.entry_usd_1e6 <= 0 {
-        return String::from("edge-only");
-    }
-    let mut law = format!(
-        "every-15m@${}<=p_hat-{}c",
-        p.entry_usd_1e6 / 1_000_000,
-        p.e_entry_1e6 / 10_000
-    );
-    // Writing into a `String` cannot fail.
-    if p.entry_min_px_1e6 > 0 {
-        let _ = write!(law, "&ask>={}c", p.entry_min_px_1e6 / 10_000);
-    }
-    if p.entry_persist_polls > 1 {
-        let _ = write!(law, "&persist{}", p.entry_persist_polls);
-    }
-    if p.entry_elapsed_max_ns > 0 {
-        let _ = write!(law, "&el<={}s", p.entry_elapsed_max_ns / 1_000_000_000);
-    }
-    law
 }
 
 /// BIN15 H90: the LATE law as the boot line spells it — `off`, or the
@@ -504,74 +434,6 @@ pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
         l.usd_1e6 / 1_000_000,
         l.sigma_k_1e3 / 1_000,
         l.sigma_k_1e3 % 1_000
-    )
-}
-
-/// Instances a 15 m family opens in one UTC day: 96 quarter-hours.
-pub const INSTANCES_PER_DAY_15M: i64 = 96;
-
-/// BIN15 P2 (F2): the entry law's own arithmetic, checked against the
-/// day cap at boot.
-///
-/// The coverage entry takes `entry_usd` on EVERY 15 m instance, so a
-/// live 15 m family WANTS `96 × entry_usd` of day room. Four families
-/// at $50 want $19,200 against a $5,000 cap: the member would trade
-/// the first quarter of the day and refuse the rest — and the
-/// instances it refuses are precisely the ones the calibration gate
-/// needs, which is F2's ledger censoring arriving through the front
-/// door instead of the back one.
-///
-/// A WARNING and not a refusal, deliberately: rationing is a legitimate
-/// operator choice (it is what a risk cap is FOR), and the plan's own
-/// suggested ruling — BTC-only for the first evaluation round, one
-/// family at $4,800/day — is a universe edit, not an artifact edit. But
-/// it may not be silent, because a silently rationed day looks
-/// identical to a quiet market on every counter the member publishes.
-#[must_use]
-pub fn day_cap_warning(params: &strategy_bin15::Bin15Params) -> String {
-    if params.entry_usd_1e6 <= 0 {
-        return String::new();
-    }
-    let mut live_15m = 0i64;
-    let mut f = 0usize;
-    while f < params.n_families {
-        if params.family_kind[f] == strategy_bin15::FAMILY_OUT_15M {
-            live_15m += 1;
-        }
-        f += 1;
-    }
-    let want = live_15m
-        .saturating_mul(INSTANCES_PER_DAY_15M)
-        .saturating_mul(params.entry_usd_1e6 / 1_000_000);
-    let cap = params.cap_day_usd_1e6 / 1_000_000;
-    if want < cap {
-        return format!(" entry_day_want=${want} (fits, ${} headroom)", cap - want);
-    }
-    if want == cap {
-        // The ruled shape (operator, 2026-09-13): the cap is set to
-        // exactly what the entry law wants. That is deliberate and it
-        // is also TIGHT — Arm B's resting BIDS reserve day room too,
-        // and a maker fill is real exposure that is never released. So
-        // with the maker on, an exactly-fitting cap will ration late in
-        // the day, and the operator has to know which of the two arms
-        // gets the last dollar.
-        return format!(
-            " entry_day_want=${want} (fits EXACTLY{})",
-            if params.maker_enabled == 1 {
-                " — no headroom for the maker arm, which also books day room"
-            } else {
-                ", maker off"
-            }
-        );
-    }
-    format!(
-        " entry_day_want=${want} OVER cap_day=${cap} - WARNING: {live_15m} live \
-         15 m famil{} x {INSTANCES_PER_DAY_15M} instances x ${} exceeds the day cap, \
-         so the cap will RATION the day and the instances it refuses are the ones \
-         the calibration gate needs. Raise cap_day_usd_1e6, lower entry_usd_1e6, or \
-         run fewer 15 m families",
-        if live_15m == 1 { "y" } else { "ies" },
-        params.entry_usd_1e6 / 1_000_000
     )
 }
 
@@ -781,82 +643,6 @@ mod tests {
         assert_eq!(late_law(&p), "8-30s:p>=0.92:ask<=p-1c:persist2:$100:k1.550");
     }
 
-    /// BIN15 S5: the entry law on the boot line — every term that changes
-    /// which instances are bought, and none at its off value, so a pre-S5
-    /// artifact prints the line it always did.
-    #[test]
-    fn the_boot_line_spells_the_whole_entry_law() {
-        let mut p = strategy_bin15::Bin15Params::default();
-        assert_eq!(entry_law(&p), "edge-only");
-        p.entry_usd_1e6 = 50_000_000;
-        assert_eq!(entry_law(&p), "every-15m@$50<=p_hat-2c", "the pre-S5 line, unchanged");
-        p.entry_min_px_1e6 = 700_000;
-        assert_eq!(entry_law(&p), "every-15m@$50<=p_hat-2c&ask>=70c");
-        p.entry_min_px_1e6 = 0;
-        p.e_entry_1e6 = 30_000;
-        p.entry_persist_polls = 3;
-        p.entry_elapsed_max_ns = 240_000_000_000;
-        assert_eq!(entry_law(&p), "every-15m@$50<=p_hat-3c&persist3&el<=240s");
-    }
-
-    /// BIN15 P2 (F2): the entry law's arithmetic against the day cap,
-    /// on the boot line where the operator will actually read it.
-    #[test]
-    fn the_boot_line_says_whether_the_entry_law_fits_the_day_cap() {
-        let mut p = strategy_bin15::Bin15Params {
-            n_families: 4,
-            family_kind: [strategy_bin15::FAMILY_OUT_15M; strategy_bin15::BIN15_MAX_FAMILIES],
-            entry_usd_1e6: 50_000_000,   // $50
-            cap_day_usd_1e6: 5_000_000_000, // $5 000
-            ..strategy_bin15::Bin15Params::default()
-        };
-        // Four families x 96 instances x $50 = $19 200 against $5 000.
-        let w = day_cap_warning(&p);
-        assert!(w.contains("entry_day_want=$19200"), "{w}");
-        assert!(w.contains("OVER cap_day=$5000"), "{w}");
-        assert!(w.contains("WARNING"), "{w}");
-        assert!(w.contains("4 live 15 m families"), "{w}");
-        assert!(!w.contains("  "), "no doubled spaces: {w}");
-
-        // The RULED shape (operator, 2026-09-13): $30,000, which is the
-        // $19,200 the entry law wants plus $10,800 for the maker arm.
-        p.cap_day_usd_1e6 = 30_000_000_000;
-        let w = day_cap_warning(&p);
-        assert!(w.contains("entry_day_want=$19200 (fits, $10800 headroom)"), "{w}");
-        assert!(!w.contains("WARNING"), "{w}");
-        assert!(!w.contains("EXACTLY"), "{w}");
-        // The SUPERSEDED exact-fit shape still has its own tell, because
-        // a cap set to exactly the entry want leaves the two arms
-        // competing for the last dollar and the operator must see that.
-        p.cap_day_usd_1e6 = 19_200_000_000;
-        let w = day_cap_warning(&p);
-        assert!(w.contains("entry_day_want=$19200 (fits EXACTLY"), "{w}");
-        assert!(w.contains("no headroom for the maker arm"), "{w}");
-        assert!(!w.contains("WARNING"), "{w}");
-        // Same exact cap, maker off: the entry arm has the day to itself.
-        p.maker_enabled = 0;
-        assert!(day_cap_warning(&p).contains("(fits EXACTLY, maker off)"));
-        p.maker_enabled = 1;
-
-        // The alternative ruling the plan suggested: BTC only under the
-        // old $5 000, which fits with room to spare.
-        p.cap_day_usd_1e6 = 5_000_000_000;
-        p.n_families = 1;
-        let w = day_cap_warning(&p);
-        assert!(w.contains("entry_day_want=$4800 (fits, $200 headroom)"), "{w}");
-        assert!(!w.contains("WARNING"), "{w}");
-
-        // A daily family opens one instance a day, not 96, so it does
-        // not enter the arithmetic at all.
-        p.n_families = 2;
-        p.family_kind[1] = strategy_bin15::FAMILY_NATIVE_DAILY;
-        assert!(day_cap_warning(&p).contains("$4800 (fits, $200 headroom)"));
-
-        // And with the entry law off there is nothing to say.
-        p.entry_usd_1e6 = 0;
-        assert_eq!(day_cap_warning(&p), "");
-    }
-
     #[test]
     fn the_committed_example_boots_against_the_universe_it_documents() {
         let (dir, artifact) = scratch("example", &[]);
@@ -887,38 +673,10 @@ mod tests {
         assert_eq!(boot.params.scale_1e9, 980_000_000);
         assert_eq!(boot.luts.phi[0], 500_000);
         assert_eq!(boot.luts.recal[0][0], 0);
-        // The daily floors are the member's, and the file cannot lower
-        // them: a daily quoted a minute before expiry is pure gamma to
-        // whoever crosses it.
-        assert_eq!(boot.params.tau_min_take_ns, [60_000_000_000, 3_600_000_000_000]);
-        assert_eq!(boot.params.tau_min_quote_ns, [120_000_000_000, 3_600_000_000_000]);
         // A cold boot is legal: four underlyings, no seed files.
         assert_eq!(boot.seeds.len(), 4);
         assert!(boot.seeds.iter().all(Bin15Seed::is_empty));
         assert!(render_boot_tell(&boot, 3).contains("families=8 dormant=3 seeds=0 daily_seeds=0"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// BIN15 S5b (ruling 2026-09-24): the control counterfactual is TODAY'S
-    /// law — the stated default bound — whatever the artifact's own
-    /// `e_entry_1e6` says, so no artifact moves its own control.
-    #[test]
-    fn the_control_bound_is_todays_law_whatever_the_artifact_says() {
-        let (dir, artifact) = scratch("control", &[]);
-        let moved = EXAMPLE.replacen("e_entry_1e6     = 20000", "e_entry_1e6     = 30000", 1);
-        assert_ne!(moved, EXAMPLE, "the example states its bound on one line");
-        std::fs::write(&artifact, moved).expect("artifact");
-        let boot = load_bin15_boot(
-            Some(&artifact),
-            Some(&dir),
-            &resolver,
-            &rolling(),
-            &rolling_syms(),
-        )
-        .expect("load")
-        .expect("configured");
-        assert_eq!(boot.params.e_entry_1e6, 30_000);
-        assert_eq!(boot.params.entry_control_e_1e6, core_config::bin15::E_ENTRY_1E6_DEFAULT);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

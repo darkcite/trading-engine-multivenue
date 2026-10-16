@@ -7810,58 +7810,16 @@ pub struct Bin15MetricIds {
     pub takes_filled: core_metrics::CounterId,
     /// `engine_bin15_takes_unfilled_total`
     pub takes_unfilled: core_metrics::CounterId,
-    /// `engine_bin15_quotes_submitted_total`
-    pub quotes_submitted: core_metrics::CounterId,
-    /// `engine_bin15_quotes_filled_total`
-    pub quotes_filled: core_metrics::CounterId,
-    /// `engine_bin15_quotes_expired_total`
-    pub quotes_expired: core_metrics::CounterId,
-    /// `engine_bin15_quotes_modified_total` (E5, LAW E-7) — Arm B
-    /// quotes repriced in place instead of waiting for a TTL.
-    pub quotes_modified: core_metrics::CounterId,
-    /// `engine_bin15_quotes_modify_refused_total` (E5). `NoSuchOrder`
-    /// is the common cause and is a race the venue won, not a defect.
-    pub quotes_modify_refused: core_metrics::CounterId,
-    /// `engine_bin15_quotes_cancelled_total` (E5, LAW E-8) — lapsed
-    /// quotes the member took back, because the venue has no
-    /// server-side TTL on a Gtc/Alo order.
-    pub quotes_cancelled: core_metrics::CounterId,
-    /// `engine_bin15_quotes_cancel_refused_total` (E5). **This one
-    /// matters**: the member clears its book at its own deadline
-    /// either way, so a non-zero value is a quote the member has
-    /// stopped tracking and the venue may still hold.
-    pub quotes_cancel_refused: core_metrics::CounterId,
-    /// `engine_bin15_quotes_raced_total` (E5) — fills booked against
-    /// a quote's PREVIOUS client id. Before the one-generation memory
-    /// these landed in `unknown_fills` and moved no position.
-    pub quotes_raced: core_metrics::CounterId,
-    /// `engine_bin15_skipped_partial_total` (E5) — reprices held
-    /// because the resting quote is partially filled.
-    pub skipped_partial: core_metrics::CounterId,
-    /// `engine_bin15_closes_submitted_total`
-    pub closes_submitted: core_metrics::CounterId,
-    /// `engine_bin15_skipped_tau_total`
-    pub skipped_tau: core_metrics::CounterId,
     /// `engine_bin15_skipped_tail_total`
     pub skipped_tail: core_metrics::CounterId,
     /// `engine_bin15_skipped_stale_total`
     pub skipped_stale: core_metrics::CounterId,
     /// `engine_bin15_skipped_mark_stale_total`
     pub skipped_mark_stale: core_metrics::CounterId,
-    /// `engine_bin15_skipped_book_total`
-    pub skipped_book: core_metrics::CounterId,
-    /// `engine_bin15_skipped_inventory_total`
-    pub skipped_inventory: core_metrics::CounterId,
     /// `engine_bin15_skipped_cap_total`
     pub skipped_cap: core_metrics::CounterId,
     /// `engine_bin15_skipped_grid_total`
     pub skipped_grid: core_metrics::CounterId,
-    /// `engine_bin15_skipped_entry_price_total`
-    pub skipped_entry_price: core_metrics::CounterId,
-    /// `engine_bin15_skipped_entry_persist_total` (BIN15 S5)
-    pub skipped_entry_persist: core_metrics::CounterId,
-    /// `engine_bin15_skipped_entry_elapsed_total` (BIN15 S5)
-    pub skipped_entry_elapsed: core_metrics::CounterId,
     /// `engine_bin15_families_dormant_total`
     pub families_dormant: core_metrics::CounterId,
     /// `engine_bin15_fills_total`
@@ -8030,27 +7988,11 @@ fn register_bin15_metrics(
     let takes_submitted = one("engine_bin15_takes_submitted_total")?;
     let takes_filled = one("engine_bin15_takes_filled_total")?;
     let takes_unfilled = one("engine_bin15_takes_unfilled_total")?;
-    let quotes_submitted = one("engine_bin15_quotes_submitted_total")?;
-    let quotes_filled = one("engine_bin15_quotes_filled_total")?;
-    let quotes_expired = one("engine_bin15_quotes_expired_total")?;
-    let quotes_modified = one("engine_bin15_quotes_modified_total")?;
-    let quotes_modify_refused = one("engine_bin15_quotes_modify_refused_total")?;
-    let quotes_cancelled = one("engine_bin15_quotes_cancelled_total")?;
-    let quotes_cancel_refused = one("engine_bin15_quotes_cancel_refused_total")?;
-    let quotes_raced = one("engine_bin15_quotes_raced_total")?;
-    let skipped_partial = one("engine_bin15_skipped_partial_total")?;
-    let closes_submitted = one("engine_bin15_closes_submitted_total")?;
-    let skipped_tau = one("engine_bin15_skipped_tau_total")?;
     let skipped_tail = one("engine_bin15_skipped_tail_total")?;
     let skipped_stale = one("engine_bin15_skipped_stale_total")?;
     let skipped_mark_stale = one("engine_bin15_skipped_mark_stale_total")?;
-    let skipped_book = one("engine_bin15_skipped_book_total")?;
-    let skipped_inventory = one("engine_bin15_skipped_inventory_total")?;
     let skipped_cap = one("engine_bin15_skipped_cap_total")?;
     let skipped_grid = one("engine_bin15_skipped_grid_total")?;
-    let skipped_entry_price = one("engine_bin15_skipped_entry_price_total")?;
-    let skipped_entry_persist = one("engine_bin15_skipped_entry_persist_total")?;
-    let skipped_entry_elapsed = one("engine_bin15_skipped_entry_elapsed_total")?;
     let families_dormant = one("engine_bin15_families_dormant_total")?;
     let fills = one("engine_bin15_fills_total")?;
     let unknown_fills = one("engine_bin15_unknown_fills_total")?;
@@ -8085,27 +8027,11 @@ fn register_bin15_metrics(
         takes_submitted,
         takes_filled,
         takes_unfilled,
-        quotes_submitted,
-        quotes_filled,
-        quotes_expired,
-        quotes_modified,
-        quotes_modify_refused,
-        quotes_cancelled,
-        quotes_cancel_refused,
-        quotes_raced,
-        skipped_partial,
-        closes_submitted,
-        skipped_tau,
         skipped_tail,
         skipped_stale,
         skipped_mark_stale,
-        skipped_book,
-        skipped_inventory,
         skipped_cap,
         skipped_grid,
-        skipped_entry_price,
-        skipped_entry_persist,
-        skipped_entry_elapsed,
         families_dormant,
         fills,
         unknown_fills,
@@ -8148,52 +8074,16 @@ fn mirror_bin15_metrics<S: strategy_core::StrategyCounters>(
         .inc(cur.takes_filled.saturating_sub(last.takes_filled));
     reg.counter(ids.takes_unfilled)
         .inc(cur.takes_unfilled.saturating_sub(last.takes_unfilled));
-    reg.counter(ids.quotes_submitted)
-        .inc(cur.quotes_submitted.saturating_sub(last.quotes_submitted));
-    reg.counter(ids.quotes_filled)
-        .inc(cur.quotes_filled.saturating_sub(last.quotes_filled));
-    reg.counter(ids.quotes_expired)
-        .inc(cur.quotes_expired.saturating_sub(last.quotes_expired));
-    reg.counter(ids.quotes_modified)
-        .inc(cur.quotes_modified.saturating_sub(last.quotes_modified));
-    reg.counter(ids.quotes_modify_refused)
-        .inc(cur
-            .quotes_modify_refused
-            .saturating_sub(last.quotes_modify_refused));
-    reg.counter(ids.quotes_cancelled)
-        .inc(cur.quotes_cancelled.saturating_sub(last.quotes_cancelled));
-    reg.counter(ids.quotes_cancel_refused)
-        .inc(cur
-            .quotes_cancel_refused
-            .saturating_sub(last.quotes_cancel_refused));
-    reg.counter(ids.quotes_raced)
-        .inc(cur.quotes_raced.saturating_sub(last.quotes_raced));
-    reg.counter(ids.skipped_partial)
-        .inc(cur.skipped_partial.saturating_sub(last.skipped_partial));
-    reg.counter(ids.closes_submitted)
-        .inc(cur.closes_submitted.saturating_sub(last.closes_submitted));
-    reg.counter(ids.skipped_tau)
-        .inc(cur.skipped_tau.saturating_sub(last.skipped_tau));
     reg.counter(ids.skipped_tail)
         .inc(cur.skipped_tail.saturating_sub(last.skipped_tail));
     reg.counter(ids.skipped_stale)
         .inc(cur.skipped_stale.saturating_sub(last.skipped_stale));
     reg.counter(ids.skipped_mark_stale)
         .inc(cur.skipped_mark_stale.saturating_sub(last.skipped_mark_stale));
-    reg.counter(ids.skipped_book)
-        .inc(cur.skipped_book.saturating_sub(last.skipped_book));
-    reg.counter(ids.skipped_inventory)
-        .inc(cur.skipped_inventory.saturating_sub(last.skipped_inventory));
     reg.counter(ids.skipped_cap)
         .inc(cur.skipped_cap.saturating_sub(last.skipped_cap));
     reg.counter(ids.skipped_grid)
         .inc(cur.skipped_grid.saturating_sub(last.skipped_grid));
-    reg.counter(ids.skipped_entry_price)
-        .inc(cur.skipped_entry_price.saturating_sub(last.skipped_entry_price));
-    reg.counter(ids.skipped_entry_persist)
-        .inc(cur.skipped_entry_persist.saturating_sub(last.skipped_entry_persist));
-    reg.counter(ids.skipped_entry_elapsed)
-        .inc(cur.skipped_entry_elapsed.saturating_sub(last.skipped_entry_elapsed));
     reg.counter(ids.families_dormant)
         .inc(cur.families_dormant.saturating_sub(last.families_dormant));
     reg.counter(ids.fills)
@@ -13040,6 +12930,13 @@ mod tests {
     /// `the_bin15_family_is_41_counters_and_80_gauges`); the gauge side did
     /// not move.
     ///
+    /// BIN15 H90 G3 (2026-10-16) retired the old arms (the coverage entry,
+    /// Arm A's opening and closing takes, the Arm B maker): their sixteen
+    /// counters — `quotes_*`, `closes_submitted`, `skipped_tau`,
+    /// `skipped_book`, `skipped_inventory`, `skipped_partial`,
+    /// `skipped_entry_*` — go with them, 41 → **25 counters** (pinned by
+    /// `the_bin15_family_is_25_counters_and_80_gauges`).
+    ///
     /// HYPARB H6: the family's size is pinned — `RegErr::Full` is a
     /// refused boot, and the registry is shared by every family.
     /// HC5: the Hypercall family is 31 gauges, every name distinct and
@@ -13416,12 +13313,12 @@ mod tests {
     }
 
     #[test]
-    fn the_bin15_family_is_41_counters_and_80_gauges() {
+    fn the_bin15_family_is_25_counters_and_80_gauges() {
         let mut reg = core_metrics::MetricsRegistry::new();
         let before_c = reg.counters_len();
         let before_g = reg.gauges_len();
         let ids = register_bin15_metrics(&mut reg).expect("register bin15");
-        assert_eq!(reg.counters_len() - before_c, 41, "the counter block");
+        assert_eq!(reg.counters_len() - before_c, 25, "the counter block");
         assert_eq!(reg.gauges_len() - before_g, 80, "8 families x 10 levels");
         assert!(
             reg.gauges_len() <= core_metrics::MAX_GAUGES,

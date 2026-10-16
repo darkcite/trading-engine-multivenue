@@ -206,65 +206,19 @@ DecimalLike: typing.TypeAlias = decimal.Decimal | str | int
 #: artifact is written in, which is the order the spec lists them.
 KNOBS: tuple[tuple[str, int], ...] = (
     ("tau_ns", 900_000_000_000),
-    ("e_take_1e6", 30_000),
-    ("h_quote_1e6", 25_000),
-    ("tau_min_take_ns", 60_000_000_000),
-    ("tau_min_quote_ns", 120_000_000_000),
     ("tail_refuse_ns", 10_000_000_000),
+    # The TTL every order carries (the IoC's lifetime in the paper model).
     ("requote_ttl_ns", 1_000_000_000),
-    ("requote_thr_1e6", 5_000),
-    ("clip_qty_1e6", 500_000_000),
     ("cap_instance_usd_1e6", 1_000_000_000),
-    # OPERATOR RULING 2026-09-13: $30,000/day.
-    #
-    # The entry law alone wants $19,200 (4 live 15 m families x 96
-    # instances x $50), so $30,000 leaves **$10,800 of HEADROOM** — and
-    # the headroom is the point. Arm B's resting BIDS book day room too,
-    # and a maker quote that FILLS is exposure that is never released,
-    # so a cap set to exactly the entry want would have had the two arms
-    # competing for the last dollar late in a full day. At the maker's
-    # 500-contract clip near $0.50 (~$250 a quote) $10,800 is ~43 filled
-    # maker bids a day across every family, against a venue thin enough
-    # to print single-digit trades per instance.
-    #
-    # The superseded numbers, for the record: $5,000 (the O9 default,
-    # which rationed the day after its first quarter and censored the
-    # calibration ledger — F2) and $19,200 (the exact-fit ruling of the
-    # same afternoon).
+    # OPERATOR RULING 2026-09-13: $30,000/day. Since BIN15 H90 G3
+    # (2026-10-16) the late-window entry is the member's only arm, so the
+    # day cap bounds its entries alone; the live artifact states its own.
     ("cap_day_usd_1e6", 30_000_000_000),
     # BIN15 P0 (F4): the underlying mark's shelf life, ns. 5 s is two
     # to five missed Hyperliquid mark prints. Past this age the member
     # HOLDS instead of pricing four families off a frozen number while
     # their books track reality.
     ("mark_stale_ns", 5_000_000_000),
-    # BIN15 O9 (operator ruling 2026-09-13): the coverage-entry
-    # notional, x1e6 USD. 50000000 = $50 on EVERY 15 m instance,
-    # regardless of edge. 0 would be the pre-2026-09-13 edge law.
-    ("entry_usd_1e6", 50_000_000),
-    # BIN15 P3 (F6): the coverage entry's margin over its own belief,
-    # x1e6. 20000 = 2 c. The entry fires only when `ask <= p_hat -
-    # e_entry`, which is the `p > a` profitability bar plus model error
-    # and the exit-leg fee. Distinct from `e_take_1e6` (3 c), which is
-    # the opportunistic taker's edge hunt.
-    ("e_entry_1e6", 20_000),
-    # BIN15 R0 (2026-09-19): the coverage entry's price FLOOR, x1e6.
-    # 0 = no floor = the 2026-09-13 law bit for bit. A preferred-side
-    # ask far under the belief is the venue disagreeing with the
-    # model, and on the paper tape the venue won those; the testnet
-    # research artifact sets 500000 (0.50) or 700000 (0.70) by hand.
-    ("entry_min_px_1e6", 0),
-    # BIN15 S5 (2026-09-24): the coverage entry's PERSISTENCE -- how many
-    # consecutive distinct book snapshots of the preferred leg its price
-    # test must hold on before it fires, in [1, 8]. 1 = the first passing
-    # snapshot fires, the pre-S5 law bit for bit. A persistence rule is a
-    # hand edit of the live artifact, never a fitted default.
-    ("entry_persist_polls", 1),
-    # BIN15 S5: the entry's ELAPSED CEILING, ns after the instance's start
-    # (expiry - 900 s): a run of passing snapshots must BEGIN by then.
-    # 0 = no ceiling.
-    ("entry_elapsed_max_ns", 0),
-    ("maker_enabled", 1),
-    ("null_arm", 1),
 )
 
 #: Ruling O-Q7's eight families, in the order ``universe.toml``'s
