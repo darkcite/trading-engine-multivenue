@@ -7,13 +7,16 @@
 //! loop. Offline path: it may allocate (argv, file reads, the report text).
 //!
 //! Repo convention: one verb, long kebab-case flags, every path explicit, nothing inferred from a
-//! clock or the working directory. The sub-verbs land task by task (impl-07 §6): `prepare` (T11).
+//! clock or the working directory. The sub-verbs land task by task (impl-07 §6): `prepare` (T11),
+//! `run` / `hurdle` / `screen` (T12), `handoff` (T13), `report` (T14).
 //!
 //! Exit codes (§3.11): `0` ok · `1` our defect · `2` argv refusal (nothing executed, nothing
 //! written) · `3` compile refusal · `4` a script fault · `5` data refusal (7001 …) · `6` every
 //! combination dropped by the hurdle · `7` hand-off refusal.
 
+pub mod handoff;
 pub mod prepare;
+pub mod report;
 pub mod run;
 pub mod universe;
 
@@ -41,6 +44,53 @@ pub enum PineVerb {
     Hurdle(HurdleArgs),
     /// Tier 1: scripts x universe x timeframes, threaded, grouped.
     Screen(ScreenArgs),
+    /// Survivors -> hand-off directories for B'3 (cli backtest --strategy pine).
+    Handoff(HandoffArgs),
+    /// Shadow tier-1 runs + B'3's rows -> the three deliverables.
+    Report(ReportArgs),
+}
+
+/// `pine handoff` (§3.11, §4.8).
+#[derive(Debug, Args)]
+pub struct HandoffArgs {
+    /// The screen's run directory.
+    #[arg(long)]
+    pub run: PathBuf,
+    /// The tier-2 chart (a captured instrument's canonical key).
+    #[arg(long)]
+    pub symbol: String,
+    /// `lowest-clearing-tf`, the only accepted value (I24).
+    #[arg(long)]
+    pub select: String,
+    /// `multivenue-archive list --json` saved to a file (JSON lines); `-` reads stdin.
+    #[arg(long)]
+    pub listing: Option<PathBuf>,
+    /// Local log root (`run-*` directories; capture-catalog spans).
+    #[arg(long)]
+    pub local_root: Option<PathBuf>,
+    /// Where B'3 appends its tier-2 rows (default <run>/rows.t2).
+    #[arg(long)]
+    pub t2_rows: Option<PathBuf>,
+    /// JSON on stdout (envelope `"schema": "pvm7-2"`).
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `pine report` (§3.11, §4.9–§4.11). No ordering argument exists (I26).
+#[derive(Debug, Args)]
+pub struct ReportArgs {
+    /// The screen's run directory.
+    #[arg(long)]
+    pub run: PathBuf,
+    /// B'3's tier-2 rows (default <run>/rows.t2; absent: every delta row T2_PENDING).
+    #[arg(long)]
+    pub t2_rows: Option<PathBuf>,
+    /// Trade-print bar files (a root of their own, never the candles root): bar_agreement.
+    #[arg(long)]
+    pub trade_bars: Option<PathBuf>,
+    /// Also the fixed-width tables on stdout.
+    #[arg(long)]
+    pub text: bool,
 }
 
 /// `pine run` (§3.11).
@@ -273,6 +323,8 @@ pub fn main(args: &PineArgs) -> u8 {
         PineVerb::Run(a) => run::run_verb(a).map(|out| print!("{out}")),
         PineVerb::Hurdle(a) => run::hurdle_verb(a).map(|out| print!("{out}")),
         PineVerb::Screen(a) => run::screen_verb(a).map(|out| print!("{out}")),
+        PineVerb::Handoff(a) => handoff::handoff_verb(a).map(|out| print!("{out}")),
+        PineVerb::Report(a) => report::report_verb(a).map(|out| print!("{out}")),
     };
     match res {
         Ok(()) => 0,

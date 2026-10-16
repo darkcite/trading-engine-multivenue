@@ -173,9 +173,9 @@ pub fn parse_input(s: &str) -> Result<InputOverride, PineErr> {
     })
 }
 
-/// The `--lib-dir` cache (`3037` refusal → exit 5).
-pub fn open_libs(lib_dir: Option<&PathBuf>) -> Result<LibCache, PineErr> {
-    let root = match lib_dir {
+/// The `--lib-dir` root (default `~/multivenue/pine/lib`).
+pub fn lib_root(lib_dir: Option<&PathBuf>) -> Result<PathBuf, PineErr> {
+    Ok(match lib_dir {
         Some(d) => d.clone(),
         None => {
             // pin:07-lib-dir-home: the default `~/multivenue/pine/lib` resolves `$HOME`; without
@@ -184,23 +184,52 @@ pub fn open_libs(lib_dir: Option<&PathBuf>) -> Result<LibCache, PineErr> {
                 .ok_or_else(|| PineErr::Usage("--lib-dir not given and $HOME unset".to_owned()))?;
             PathBuf::from(home).join("multivenue/pine/lib")
         }
-    };
-    LibCache::open(root, core_crypto::sha256)
+    })
+}
+
+/// The `--lib-dir` cache (`3037` refusal → exit 5).
+pub fn open_libs(lib_dir: Option<&PathBuf>) -> Result<LibCache, PineErr> {
+    LibCache::open(lib_root(lib_dir)?, core_crypto::sha256)
         .map_err(|d| PineErr::Data(format!("{} {}", d.code.0, d.msg)))
 }
 
-const fn mode_label(m: ExecMode) -> &'static str {
+/// A path as `run.tsv` records it: absolute (`std::path::absolute`, no filesystem access), so
+/// `pine handoff` / `pine report` read the screen's own inputs back from any working directory.
+// pin:07-run-tsv-provenance: §3.12.1's `run.tsv` list names no input paths, but `handoff` and
+// `report` take only `--run` (§3.11) and must find the screen's bars root, universe, scripts,
+// priors, lib dir and timeframes; `run.tsv` gains those keys (`bars_root`, `universe`, `scripts`,
+// `priors`, `lib_dir`, `timeframes`; `script` for a single `run`). Additive: no line changes.
+pub fn abs_path(p: &Path) -> String {
+    std::path::absolute(p)
+        .unwrap_or_else(|_| p.to_path_buf())
+        .display()
+        .to_string()
+}
+
+/// The comma list of `tfs`.
+pub fn tf_list(tfs: &[u32]) -> String {
+    let mut s = String::new();
+    for (i, t) in tfs.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(s, "{t}");
+    }
+    s
+}
+
+pub(crate) const fn mode_label(m: ExecMode) -> &'static str {
     match m {
         ExecMode::BarClose => "bar_close",
         ExecMode::Realtime => "realtime",
     }
 }
 
-fn hex(b: &[u8; 32]) -> String {
+pub(crate) fn hex(b: &[u8; 32]) -> String {
     String::from_utf8_lossy(&hex32(b)).into_owned()
 }
 
-fn chart_info(row: &UniverseRow, tf_s: u32) -> ChartInfo {
+pub(crate) fn chart_info(row: &UniverseRow, tf_s: u32) -> ChartInfo {
     ChartInfo {
         symbol_hash: pine_ir::symbol_hash(row.key.as_bytes()),
         timeframe_s: tf_s,
@@ -235,7 +264,7 @@ const fn verdict_label(v: HurdleVerdict) -> &'static str {
     }
 }
 
-fn refusal_text(r: &Refusal) -> String {
+pub(crate) fn refusal_text(r: &Refusal) -> String {
     match r {
         Refusal::Broker(c) => format!("broker {}", c.0),
         Refusal::ShortWarmup { have, need } => format!("ShortWarmup have={have} need={need}"),
@@ -271,7 +300,7 @@ pub fn fault_text(f: &FaultRecord) -> String {
     )
 }
 
-fn compile_text(e: &CompileRefusal) -> String {
+pub(crate) fn compile_text(e: &CompileRefusal) -> String {
     let code = e.code().0;
     match e {
         CompileRefusal::Parse(ds) | CompileRefusal::Compile(ds) => match ds.first() {
@@ -772,7 +801,13 @@ pub fn check_rows_hdr(out: &Path, hdr: &RowsHdr) -> Result<(), PineErr> {
 /// Write the run directory from `c` (rows.t1 replaced atomically).
 // pin:07-rerun-replaces: a re-run into the same `--out` (same header) replaces rows.t1 and the TSVs
 // rather than appending, so the directory always describes one run.
-pub fn write_run_dir(out: &Path, plan: &Plan, c: &Collected, verb: &str) -> Result<(), PineErr> {
+pub fn write_run_dir(
+    out: &Path,
+    plan: &Plan,
+    c: &Collected,
+    verb: &str,
+    prov: &[(&str, String)],
+) -> Result<(), PineErr> {
     let io = |e: std::io::Error| PineErr::Defect(format!("{}: {e}", out.display()));
     std::fs::create_dir_all(out).map_err(io)?;
     // run.tsv
@@ -786,6 +821,9 @@ pub fn write_run_dir(out: &Path, plan: &Plan, c: &Collected, verb: &str) -> Resu
     let _ = writeln!(r, "notional_1e6\t{}", plan.notional_1e6);
     let _ = writeln!(r, "from_ms\t{}", plan.from_ms);
     let _ = writeln!(r, "to_ms\t{}", plan.to_ms);
+    for (k, v) in prov {
+        let _ = writeln!(r, "{k}\t{v}");
+    }
     let l = SCREEN_LIMITS;
     let _ = writeln!(
         r,
@@ -1156,7 +1194,14 @@ pub fn run_verb(a: &super::RunArgs) -> Result<String, PineErr> {
         c.take(m, ret_dir.as_deref())?;
     }
     if let Some(out) = &a.out {
-        write_run_dir(out, &plan, &c, "run")?;
+        let prov = [
+            ("bars_root", abs_path(&a.bars)),
+            ("universe", abs_path(&a.universe)),
+            ("script", abs_path(&a.script)),
+            ("lib_dir", abs_path(&lib_root(a.lib_dir.as_ref())?)),
+            ("timeframes", tf_list(&tfs)),
+        ];
+        write_run_dir(out, &plan, &c, "run", &prov)?;
     }
     if a.json {
         let mut s = String::from("{\"schema\":");
@@ -1272,7 +1317,15 @@ pub fn screen_verb(a: &super::ScreenArgs) -> Result<String, PineErr> {
     std::fs::create_dir_all(&ret_dir)
         .map_err(|e| PineErr::Defect(format!("{}: {e}", ret_dir.display())))?;
     let c = drive(&si, threads, &libs, Some(&ret_dir))?;
-    write_run_dir(&a.out, &si.plan, &c, "screen")?;
+    let prov = [
+        ("bars_root", abs_path(&a.bars)),
+        ("universe", abs_path(&a.universe)),
+        ("scripts", abs_path(&a.scripts)),
+        ("priors", abs_path(&a.priors)),
+        ("lib_dir", abs_path(&lib_root(a.lib_dir.as_ref())?)),
+        ("timeframes", tf_list(&si.tfs)),
+    ];
+    write_run_dir(&a.out, &si.plan, &c, "screen", &prov)?;
     std::fs::write(a.out.join("throughput.tsv"), throughput_text(&c.meter))
         .map_err(|e| PineErr::Defect(format!("throughput.tsv: {e}")))?;
     if all_dropped(&c) {
