@@ -2,7 +2,7 @@
 // Copyright 2026 Anton (darkcite)
 
 //! `ta.*` order statistics over a window (impl-04 §4.13.6, T25): `ta.percentrank`, `ta.median`,
-//! `ta.mode`, `ta.percentile_nearest_rank`. Selection and sorting run on a **scratch copy** of the window inside the site's own
+//! `ta.mode`, `ta.percentile_nearest_rank`, `ta.percentile_linear_interpolation`. Selection and sorting run on a **scratch copy** of the window inside the site's own
 //! block (`WinHdr` + `[ring | scratch]`), so the ring stays chronological; `select_nth_unstable_by`
 //! and `sort_unstable_by` work in place — no allocation (0 B/op).
 
@@ -51,12 +51,13 @@ fn out_num(f: &mut Frame<'_>, e: u16, v: f64) {
     }
 }
 
-/// The shared `skip` window step of `[src, len, out]` (or `[src, len, p, out]`, `p` handed to
-/// `stat`) over `WinHdr` + `[ring | scratch]`: push a non-na `src`, and once `len` values are
-/// accepted copy the newest `len` into the scratch half and hand `scratch[..len]` to `stat`.
+/// The shared window step of `[src, len, out]` (or `[src, len, p, out]`, `p` handed to `stat`)
+/// over `WinHdr` + `[ring | scratch]`. `SKIP`: push a non-na `src` only, and once `len` values
+/// are accepted copy the newest `len` into the scratch half and hand `scratch[..len]` to `stat`.
+/// `!SKIP` (na included): push every execution's `src`; a na among the newest `len` → na.
 /// Warm-up or a na `len` → na. `len ∉ [1, cap]` → `ScriptRefused` (the site was sized for `cap`).
 #[inline(always)]
-fn scratch_stat(
+fn scratch_stat<const SKIP: bool>(
     f: &mut Frame<'_>,
     site: SiteId,
     args: &[u16],
@@ -84,10 +85,10 @@ fn scratch_stat(
         if h.len != len {
             win_repoint(h, ring, len);
         }
-        if !src.is_nan() {
+        if !SKIP || !src.is_nan() {
             win_push(h, ring, src);
         }
-        if h.n < len {
+        if h.n < len || (!SKIP && h.na_in != 0) {
             f64::NAN
         } else {
             // COPY: the newest `len` window values into the block's scratch half, ≤ cap f64 per
@@ -131,6 +132,52 @@ fn median(w: &mut [f64], _: f64) -> f64 {
         i += 1;
     }
     (best + hi) / 2.0
+}
+
+/// The median of an `int` window (non-empty, no NaN; the values are exact integers): the
+/// reference returns `series int` for the int overload, so an even count takes the **lower**
+/// middle value — always a window member, never a rounded mean (`pin:04-median-int-provisional`,
+/// operator ruling 2026-10-16; to be verified against TradingView in the capture month).
+fn median_lower(w: &mut [f64], _: f64) -> f64 {
+    let n = w.len();
+    let (_, v, _) = w.select_nth_unstable_by((n - 1) / 2, cmp_na_last);
+    *v
+}
+
+/// The linearly interpolated `p`-th percentile of `w` (non-empty, no NaN): the reference says
+/// only "linear interpolation between the two nearest ranks", so the common C = 1 definition
+/// (Excel `PERCENTILE.INC`, NumPy `linear`, Hyndman–Fan type 7) is used: `x = p · (N − 1) / 100`,
+/// `k = ⌊x⌋`, `v = w₍ₖ₎ + (x − k) · (w₍ₖ₊₁₎ − w₍ₖ₎)` over the ascending order statistics
+/// (`pin:04-percentile-linear-provisional`, operator ruling 2026-10-16). A na `p` or one outside
+/// `0..=100` → na (`pin:04-percentile-range`).
+fn linear(w: &mut [f64], p: f64) -> f64 {
+    if !(0.0..=100.0).contains(&p) {
+        return f64::NAN;
+    }
+    let n = w.len();
+    let x = (p * (n - 1) as f64) / 100.0;
+    let k = x.floor() as usize;
+    debug_assert!(k < n);
+    let (_, lo, hi) = w.select_nth_unstable_by(k, cmp_na_last);
+    let lo = *lo;
+    let frac = x - k as f64;
+    if frac == 0.0 || hi.is_empty() {
+        return lo;
+    }
+    // The next order statistic is the smallest of the values ordered after `lo`.
+    let mut next = f64::INFINITY;
+    let mut i = 0usize;
+    while i < hi.len() {
+        debug_assert!(i < hi.len());
+        // SAFETY: `i < hi.len()` (loop bound).
+        let y = unsafe { *hi.get_unchecked(i) };
+        debug_assert!(!y.is_nan());
+        if y < next {
+            next = y;
+        }
+        i += 1;
+    }
+    lo + frac * (next - lo)
 }
 
 /// The mode of `w` (non-empty, no NaN): sort in place, the longest run of equal values; ties →
@@ -187,7 +234,7 @@ pub fn bi_ta_percentile_nearest_rank(
     if args.len() != 4 {
         return Err(FaultKind::Internal);
     }
-    scratch_stat(f, site, args, nearest_rank)
+    scratch_stat::<true>(f, site, args, nearest_rank)
 }
 
 /// `ta.median(source, length)` — `skip` na.
@@ -195,7 +242,32 @@ pub fn bi_ta_median(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(),
     if args.len() != 3 {
         return Err(FaultKind::Internal);
     }
-    scratch_stat(f, site, args, median)
+    scratch_stat::<true>(f, site, args, median)
+}
+
+/// `ta.median(source, length)`, the `int` overload — `skip` na; an even window gives the lower
+/// middle value (`pin:04-median-int-provisional`).
+pub fn bi_ta_median_i(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 3 {
+        return Err(FaultKind::Internal);
+    }
+    scratch_stat::<true>(f, site, args, median_lower)
+}
+
+/// `ta.percentile_linear_interpolation(source, length, percentage)` — C = 1 interpolation
+/// (`pin:04-percentile-linear-provisional`) over the newest `length` **executions**: the
+/// reference's remark "`na` values in the `source` series are included in calculations and will
+/// produce an `na` result" is followed, although pine-spec's row says `na: skip`
+/// (`pin:04-percentile-linear-na`; a pine-spec request to make the row `propagate`).
+pub fn bi_ta_percentile_linear_interpolation(
+    f: &mut Frame<'_>,
+    site: SiteId,
+    args: &[u16],
+) -> Result<(), FaultKind> {
+    if args.len() != 4 {
+        return Err(FaultKind::Internal);
+    }
+    scratch_stat::<false>(f, site, args, linear)
 }
 
 /// `ta.mode(source, length)` (float and int overloads) — `skip` na.
@@ -203,7 +275,7 @@ pub fn bi_ta_mode(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), F
     if args.len() != 3 {
         return Err(FaultKind::Internal);
     }
-    scratch_stat(f, site, args, mode)
+    scratch_stat::<true>(f, site, args, mode)
 }
 
 /// `ta.percentrank(source, length)` = `100 × #(previous length values ≤ current) / length`

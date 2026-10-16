@@ -328,3 +328,95 @@ fn tf_in_seconds_month_is_2628003() {
         Ok(Some(pine_std::MONTH_SORT_S))
     );
 }
+
+/// Operator ruling 2026-10-16 (`pin:04-weekofyear-provisional`): `weekofyear` is the ISO 8601
+/// week. `(UTC ms, week)` pairs from Python's `date.isocalendar()` — year boundaries (1–3 January
+/// in week 52/53, 29–31 December in week 1), 1900…2100 — for the function (UTC, and a zone that
+/// moves the date) and the variable (the bar's open).
+#[test]
+fn weekofyear_is_the_iso_8601_week() {
+    let cases: [(i64, i64); 54] = [
+        (13076910, 1),
+        (1704659117017, 1),
+        (1609467627393, 53),
+        (1609448548230, 53),
+        (1577671999533, 1),
+        (1672614282061, 52),
+        (1792136443310, 42),
+        (1451586627625, 53),
+        (1451850566283, 53),
+        (1104508590467, 53),
+        (1798803764119, 53),
+        (-196707976, 1),
+        (-2208910207218, 1),
+        (4133955225377, 52),
+        (1458307730762, 11),
+        (-500647765955, 7),
+        (2262244543251, 36),
+        (-1662225472116, 18),
+        (-1388674437921, 53),
+        (3859671786393, 17),
+        (-1142994902155, 41),
+        (1932289898754, 13),
+        (-1552105509319, 44),
+        (3537541653392, 6),
+        (222353300526, 3),
+        (-1784358958495, 25),
+        (-1235654153648, 45),
+        (2701896133095, 32),
+        (2526605024854, 4),
+        (-1417894553480, 5),
+        (516481510461, 20),
+        (-1181723080505, 29),
+        (4031359740838, 40),
+        (2598525909953, 18),
+        (-1539627600982, 11),
+        (-806996772484, 23),
+        (319131799395, 7),
+        (-1508452337692, 11),
+        (2283216818044, 19),
+        (-1647400296341, 42),
+        (294700910239, 18),
+        (-1681474689522, 38),
+        (4095060050450, 41),
+        (-700829799853, 42),
+        (1070748574974, 49),
+        (2537634662562, 22),
+        (-575346167784, 41),
+        (3914067630843, 2),
+        (-875049970794, 15),
+        (1284434962241, 37),
+        (-162309369364, 46),
+        (-1041920367599, 52),
+        (-81466475851, 22),
+        (2008203342912, 33),
+    ];
+    let opens: Vec<i64> = cases.iter().map(|c| c.0).collect();
+    let rows: Vec<(OverloadId, Vec<(Lane, Src)>)> = vec![
+        (ov::WEEKOFYEAR, vec![T_IN, s("UTC")]),
+        (ov::WEEKOFYEAR_VAR, vec![]),
+        (ov::WEEKOFYEAR, vec![T_IN, s("Asia/Tokyo")]),
+        (ov::DAYOFWEEK, vec![T_IN, s("Asia/Tokyo")]),
+    ];
+    let got = run(&rows, &opens, Dialect::V6);
+    for (i, &(t, w)) in cases.iter().enumerate() {
+        assert_eq!(got[i][0], w as f64, "{t}");
+        assert_eq!(got[i][1], w as f64, "{t} (variable)");
+        // Tokyo is UTC+9: the week moves only when the local date crosses into a new Monday.
+        let tokyo_monday = got[i][3] == 2.0 && (t.rem_euclid(86_400_000)) >= 15 * 3_600_000;
+        if !tokyo_monday {
+            assert_eq!(got[i][2], w as f64, "{t} (Tokyo)");
+        }
+    }
+    // 2024-12-29 (Sunday) 23:00 UTC is Monday 2024-12-30 in Tokyo: ISO week 1 of 2025.
+    let t = 1_735_513_200_000i64;
+    let got = run(
+        &[
+            (ov::WEEKOFYEAR, vec![T_IN, s("UTC")]),
+            (ov::WEEKOFYEAR, vec![T_IN, s("Asia/Tokyo")]),
+        ],
+        &[t],
+        Dialect::V6,
+    );
+    assert_eq!(got[0], vec![52.0, 1.0]);
+}

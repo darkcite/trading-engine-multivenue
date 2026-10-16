@@ -686,6 +686,27 @@ const _: () = assert!(core::mem::size_of::<Cum>() == 16 && core::mem::align_of::
 // SAFETY: repr(C) POD; all-zero is `n == 0` with a zero total: never executed.
 unsafe impl StateBlock for Cum {}
 
+/// The 32-byte block of the cumulative variables that need the previous bar (§4.13.8):
+/// `ta.obv pvt nvi pvi wad`.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct CumPrev {
+    /// The running total (`obv pvt wad`) or the index's previous value (`nvi pvi`).
+    pub acc: f64,
+    /// `close` at the previous execution (raw; na kept as na); meaningless while `n == 0`.
+    pub pc: f64,
+    /// `volume` at the previous execution (raw); meaningless while `n == 0`.
+    pub pv: f64,
+    /// Executions so far (saturating); 0 = never executed.
+    pub n: u32,
+    /// Always zero.
+    pub _pad: u32,
+}
+const _: () =
+    assert!(core::mem::size_of::<CumPrev>() == 32 && core::mem::align_of::<CumPrev>() == 8);
+// SAFETY: repr(C) POD; all-zero is `n == 0` with a zero total: never executed.
+unsafe impl StateBlock for CumPrev {}
+
 /// The value pushed `k` pushes before the newest, without pushing; `None` while fewer than
 /// `k + 1` values were pushed. `k < ring.len()` (checked by the caller).
 #[inline]

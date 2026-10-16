@@ -530,6 +530,10 @@ pub enum Var {
     AvgWinTrade,
     /// `avg_losing_trade` = `grossloss / losstrades` (a positive amount, as `grossloss`).
     AvgLossTrade,
+    /// `openprofit_percent` = `openprofit / (initial_capital + netprofit) × 100` — the
+    /// reference's "`openPL / realizedEquity * 100`", realized equity = initial capital plus the
+    /// closed trades' net profit (`pin:04-openprofit-pct-provisional`, operator ruling 2026-10-16).
+    OpenProfitPct,
 }
 
 /// What a variable read yields before it is written.
@@ -604,6 +608,7 @@ fn read_var(b: &pine_ir::BrokerView, v: u8) -> Val {
     const AT: u8 = Var::AvgTrade as u8;
     const AW: u8 = Var::AvgWinTrade as u8;
     const AL: u8 = Var::AvgLossTrade as u8;
+    const OPP: u8 = Var::OpenProfitPct as u8;
     let ic = scale::from_1e12(b.initial_capital_1e12);
     match v {
         PS => Val::F(scale::from_1e6(b.position_size_1e6)),
@@ -640,6 +645,10 @@ fn read_var(b: &pine_ir::BrokerView, v: u8) -> Val {
         AL => Val::F(div_na(
             scale::from_1e12(b.grossloss_1e12),
             b.losstrades as f64,
+        )),
+        OPP => Val::F(pct(
+            scale::from_1e12(b.openprofit_1e12),
+            scale::from_1e12(b.initial_capital_1e12 + b.netprofit_1e12),
         )),
         _ => Val::F(f64::NAN),
     }
@@ -731,6 +740,14 @@ pub enum Fld {
     ExitId,
     /// `entry_comment` / `exit_comment`: not carried → na (`pin:04-strategy-edges`).
     Comment,
+    /// `profit_percent`: `profit / (entry_price × |size|) × 100`, losses negative.
+    ProfitPct,
+    /// `max_runup_percent`: the reference's `Highest Value During Trade / (Entry Price x
+    /// Quantity) * 100` — `max_runup / (entry_price × |size|) × 100`.
+    MaxRunupPct,
+    /// `max_drawdown_percent`: `Lowest Value During Trade / (Entry Price x Quantity) * 100` —
+    /// `max_drawdown / (entry_price × |size|) × 100` (a positive amount, as `max_drawdown`).
+    MaxDrawdownPct,
 }
 
 /// The trade a call names, read in place: `OPEN` reads `open_trade(i)`; closed maps `k` to the
@@ -806,6 +823,13 @@ fn read_fld(t: &TradeRec, fld: u8) -> Raw {
     const DD: u8 = Fld::MaxDrawdown as u8;
     const EI: u8 = Fld::EntryId as u8;
     const XI: u8 = Fld::ExitId as u8;
+    const PP: u8 = Fld::ProfitPct as u8;
+    const RP: u8 = Fld::MaxRunupPct as u8;
+    const DP: u8 = Fld::MaxDrawdownPct as u8;
+    // The percent accessors' base: entry price × |quantity| — the reference's formula taken
+    // literally, no point value (`pin:04-trade-pct-provisional`, operator ruling 2026-10-16);
+    // a zero base → na.
+    let base = scale::from_1e6(t.entry_px_1e6) * scale::from_1e6(t.qty_1e6).abs();
     let bar = |b: u32| Raw::V(Val::I(if b == u32::MAX { None } else { Some(b as i64) }));
     let ms = |m: i64| Raw::V(Val::I(if m == 0 { None } else { Some(m) }));
     match fld {
@@ -822,6 +846,9 @@ fn read_fld(t: &TradeRec, fld: u8) -> Raw {
         DD => Raw::V(Val::F(scale::from_1e6(t.max_drawdown_1e6))),
         EI => Raw::S(t.entry_sym),
         XI => Raw::S(t.exit_sym),
+        PP => Raw::V(Val::F(pct(scale::from_1e12(t.pnl_1e12), base))),
+        RP => Raw::V(Val::F(pct(scale::from_1e6(t.max_runup_1e6), base))),
+        DP => Raw::V(Val::F(pct(scale::from_1e6(t.max_drawdown_1e6), base))),
         _ => Raw::Na, // comments are not carried
     }
 }

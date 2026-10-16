@@ -1707,3 +1707,186 @@ fn map_copy_and_put_all() {
     ];
     assert_eq!(once(&calls, Dialect::V6), Err(FaultKind::PoolFull));
 }
+
+/// Brute force over the non-na values `v` (sorted ascending): `[median, mode, nearest(p),
+/// linear(p)]` as the rows define them; `int` takes the lower middle and truncates toward zero.
+fn bf_order(v: &[f64], p: f64, int: bool) -> [f64; 4] {
+    if v.is_empty() {
+        return [f64::NAN; 4];
+    }
+    let n = v.len();
+    let med = if int {
+        v[(n - 1) / 2]
+    } else if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    };
+    let (mut mode, mut best, mut i) = (v[0], 0, 0);
+    while i < n {
+        let mut j = i;
+        while j < n && v[j] == v[i] {
+            j += 1;
+        }
+        if j - i > best {
+            best = j - i;
+            mode = v[i];
+        }
+        i = j;
+    }
+    let (near, lin) = if (0.0..=100.0).contains(&p) {
+        let r = (((p * n as f64) / 100.0).ceil() as usize).clamp(1, n);
+        let x = (p * (n - 1) as f64) / 100.0;
+        let k = x.floor() as usize;
+        let fr = x - k as f64;
+        let l = if fr == 0.0 || k + 1 >= n {
+            v[k]
+        } else {
+            v[k] + fr * (v[k + 1] - v[k])
+        };
+        (v[r - 1], if int { l.trunc() } else { l })
+    } else {
+        (f64::NAN, f64::NAN)
+    };
+    [med, mode, near, lin]
+}
+
+/// Operator ruling 2026-10-16: `array.median / mode / percentile_nearest_rank /
+/// percentile_linear_interpolation` (float and int) and the int `avg / variance / stdev` agree
+/// with a sorted brute force on every bar of a growing array with na, duplicates, negatives and
+/// `±0.0`, the array is left unchanged (no sort, no scratch), and the rows allocate nothing.
+#[test]
+fn array_order_statistics_and_int_moments_match_bruteforce() {
+    for int in [false, true] {
+        let (t, lane, new_id) = if int {
+            (Ty::Int, Lane::I64, ov::ARRAY_NEW_INT)
+        } else {
+            (Ty::Float, Lane::F64, ov::ARRAY_NEW_FLOAT)
+        };
+        let out: &[Lane] = if int { I } else { F };
+        let id = |f: OverloadId, i: OverloadId| if int { i } else { f };
+        let mut owner = new(
+            new_id,
+            t,
+            64,
+            coll_block_bytes(CollKind::Array, t, Ty::Void, 64, 16),
+            vec![it(0), if int { it(0) } else { ft(0.0) }],
+        );
+        owner.guard = Some(0);
+        let p = (Lane::F64, Src::Feed(2));
+        let mut calls = vec![
+            owner,
+            c(ov::ARRAY_PUSH, vec![o(0), (lane, Src::Feed(1))], &[]),
+            c(id(ov::ARRAY_MEDIAN_F, ov::ARRAY_MEDIAN_I), vec![o(0)], out),
+            c(id(ov::ARRAY_MODE_F, ov::ARRAY_MODE_I), vec![o(0)], out),
+            c(
+                id(
+                    ov::ARRAY_PERCENTILE_NEAREST_RANK_F,
+                    ov::ARRAY_PERCENTILE_NEAREST_RANK_I,
+                ),
+                vec![o(0), p],
+                out,
+            ),
+            c(
+                id(
+                    ov::ARRAY_PERCENTILE_LINEAR_INTERPOLATION_F,
+                    ov::ARRAY_PERCENTILE_LINEAR_INTERPOLATION_I,
+                ),
+                vec![o(0), p],
+                out,
+            ),
+            c(ov::ARRAY_GET, vec![o(0), it(0)], out),
+        ];
+        if int {
+            calls.push(c(ov::ARRAY_AVG_I, vec![o(0)], I));
+            calls.push(c(ov::ARRAY_VARIANCE_I, vec![o(0), it(1)], I));
+            calls.push(c(ov::ARRAY_STDEV_I, vec![o(0), it(0)], I));
+        }
+        let pcts = [
+            0.0,
+            10.0,
+            25.0,
+            33.3,
+            50.0,
+            87.5,
+            100.0,
+            -1.0,
+            101.0,
+            f64::NAN,
+        ];
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let feed: Vec<Vec<f64>> = (0..60)
+            .map(|i| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let x = if s % 9 == 0 {
+                    f64::NAN
+                } else if int {
+                    ((s >> 20) % 13) as f64 - 6.0
+                } else if s % 7 == 0 {
+                    -0.0
+                } else {
+                    (((s >> 20) % 13) as f64 - 6.0) * 1.25
+                };
+                vec![(i == 0) as u8 as f64, x, pcts[i % pcts.len()]]
+            })
+            .collect();
+        let (r, allocs) = run(&calls, &feed, Dialect::V6);
+        let r = r.unwrap();
+        assert_eq!(allocs, 0, "int {int}: allocated");
+        let mut hist: Vec<f64> = Vec::new();
+        for (i, f) in feed.iter().enumerate() {
+            hist.push(f[1]);
+            let mut v: Vec<f64> = hist.iter().copied().filter(|x| !x.is_nan()).collect();
+            v.sort_by(|a, b| a.total_cmp(b));
+            let want = bf_order(&v, f[2], int);
+            for (k, &w) in want.iter().enumerate() {
+                let g = r[i][2 + k];
+                assert!(
+                    (g.is_nan() && w.is_nan()) || g == w,
+                    "int {int} bar {i} stat {k} p {}: {g} vs {w}",
+                    f[2]
+                );
+            }
+            // Unchanged: element 0 is still the first push.
+            let g0 = r[i][6];
+            assert!((g0.is_nan() && hist[0].is_nan()) || g0 == hist[0]);
+            if int {
+                let n = v.len() as f64;
+                let (avg, var1, sd0) = if v.is_empty() {
+                    (f64::NAN, f64::NAN, f64::NAN)
+                } else {
+                    let s: f64 = v.iter().sum();
+                    let m = s / n;
+                    let ss: f64 = v.iter().map(|x| (x - m) * (x - m)).sum();
+                    let sd0 = if n > 1.0 {
+                        (ss / (n - 1.0)).sqrt().trunc()
+                    } else {
+                        f64::NAN
+                    };
+                    ((s / n).trunc(), (ss / n).trunc(), sd0)
+                };
+                for (k, w) in [(7, avg), (8, var1), (9, sd0)] {
+                    let g = r[i][k];
+                    assert!(
+                        (g.is_nan() && w.is_nan()) || g == w,
+                        "int moments bar {i} col {k}: {g} vs {w}"
+                    );
+                }
+            }
+        }
+    }
+    // The documented ties: mode → the smallest of the most frequent; even int median → lower.
+    let ib = coll_block_bytes(CollKind::Array, Ty::Int, Ty::Void, 8, 16);
+    let mut calls = vec![new(ov::ARRAY_NEW_INT, Ty::Int, 8, ib, vec![it(0), it(0)])];
+    for x in [7, 3, 7, 3, 9, -1] {
+        calls.push(c(ov::ARRAY_PUSH, vec![o(0), it(x)], &[]));
+    }
+    let k = calls.len();
+    calls.push(c(ov::ARRAY_MODE_I, vec![o(0)], I));
+    calls.push(c(ov::ARRAY_MEDIAN_I, vec![o(0)], I));
+    calls.push(c(ov::ARRAY_AVG_I, vec![o(0)], I));
+    let r = once(&calls, Dialect::V6).unwrap();
+    assert_eq!((r[k], r[k + 1], r[k + 2]), (3.0, 3.0, 4.0));
+}

@@ -202,6 +202,7 @@ const PAIRS: Blk = Blk::Win {
 const TSI: Blk = Blk::Fixed(size_of::<TsiHdr>() as u32);
 const DMI: Blk = Blk::Fixed(size_of::<DmiHdr>() as u32);
 const CUM: Blk = Blk::Fixed(size_of::<Cum>() as u32);
+const CUMP: Blk = Blk::Fixed(size_of::<crate::state::CumPrev>() as u32);
 const SEQ0: Blk = Blk::Fixed(size_of::<Seq>() as u32);
 const VWAP: Blk = Blk::Fixed(size_of::<VwapHdr>() as u32);
 
@@ -851,6 +852,23 @@ const fn build() -> Built {
             VWAP,
         ),
     );
+    // The volume variables (§4.13.8; operator ruling 2026-10-16: the reference examples /
+    // standard definitions, each `pin:04-<slug>-provisional`, see `ta::cum`).
+    {
+        use ta::cum as cu;
+        put(&mut b, ov::TA_OBV_VAR, row(ov::TA_OBV_VAR, cu::bi_ta_obv, 2, st, CUMP));
+        put(&mut b, ov::TA_PVT_VAR, row(ov::TA_PVT_VAR, cu::bi_ta_pvt, 2, st, CUMP));
+        put(&mut b, ov::TA_WAD_VAR, row(ov::TA_WAD_VAR, cu::bi_ta_wad, 2, st, CUMP));
+        put(&mut b, ov::TA_NVI_VAR, row(ov::TA_NVI_VAR, cu::bi_ta_nvi, 2, st, CUMP));
+        put(&mut b, ov::TA_PVI_VAR, row(ov::TA_PVI_VAR, cu::bi_ta_pvi, 2, st, CUMP));
+        put(
+            &mut b,
+            ov::TA_ACCDIST_VAR,
+            row(ov::TA_ACCDIST_VAR, cu::bi_ta_accdist, 2, st, CUM),
+        );
+        put(&mut b, ov::TA_WVAD_VAR, row(ov::TA_WVAD_VAR, cu::bi_ta_wvad, 2, st, CUM));
+        put(&mut b, ov::TA_III_VAR, row(ov::TA_III_VAR, cu::bi_ta_iii, 2, st, CUM));
+    }
     put(
         &mut b,
         ov::TA_BARSSINCE,
@@ -926,6 +944,23 @@ const fn build() -> Built {
         row(
             skip(ov::TA_PERCENTILE_NEAREST_RANK),
             rk::bi_ta_percentile_nearest_rank,
+            4,
+            st,
+            WIN2,
+        ),
+    );
+    put(
+        &mut b,
+        ov::TA_MEDIAN_I,
+        row(skip(ov::TA_MEDIAN_I), rk::bi_ta_median_i, 4, st, WIN2),
+    );
+    // na included (the reference's remark), not the row's `skip` (`pin:04-percentile-linear-na`).
+    put(
+        &mut b,
+        ov::TA_PERCENTILE_LINEAR_INTERPOLATION,
+        row(
+            ov::TA_PERCENTILE_LINEAR_INTERPOLATION,
+            rk::bi_ta_percentile_linear_interpolation,
             4,
             st,
             WIN2,
@@ -1496,6 +1531,49 @@ const fn build() -> Built {
             Blk::None,
         ),
     );
+    // Operator ruling 2026-10-16: `openprofit_percent` from the reference's formula
+    // (`pin:04-openprofit-pct-provisional`) and the per-trade percents
+    // (`pin:04-trade-pct-provisional`). `max_drawdown_percent`, `max_runup_percent`,
+    // `avg_trade_percent`, `avg_winning_trade_percent`, `avg_losing_trade_percent` stay stubs:
+    // BrokerView carries no equity peak / trough and no Σ per-trade percent.
+    {
+        let rows: [(OverloadId, BuiltinFn); 7] = [
+            (
+                ov::STRATEGY_OPENPROFIT_PERCENT_VAR,
+                s::bi_var::<{ Var::OpenProfitPct as u8 }>,
+            ),
+            (
+                ov::STRATEGY_OPENTRADES_PROFIT_PERCENT,
+                s::bi_trade::<true, { Fld::ProfitPct as u8 }>,
+            ),
+            (
+                ov::STRATEGY_OPENTRADES_MAX_RUNUP_PERCENT,
+                s::bi_trade::<true, { Fld::MaxRunupPct as u8 }>,
+            ),
+            (
+                ov::STRATEGY_OPENTRADES_MAX_DRAWDOWN_PERCENT,
+                s::bi_trade::<true, { Fld::MaxDrawdownPct as u8 }>,
+            ),
+            (
+                ov::STRATEGY_CLOSEDTRADES_PROFIT_PERCENT,
+                s::bi_trade::<false, { Fld::ProfitPct as u8 }>,
+            ),
+            (
+                ov::STRATEGY_CLOSEDTRADES_MAX_RUNUP_PERCENT,
+                s::bi_trade::<false, { Fld::MaxRunupPct as u8 }>,
+            ),
+            (
+                ov::STRATEGY_CLOSEDTRADES_MAX_DRAWDOWN_PERCENT,
+                s::bi_trade::<false, { Fld::MaxDrawdownPct as u8 }>,
+            ),
+        ];
+        let mut k = 0;
+        while k < rows.len() {
+            let (id, fun) = rows[k];
+            put(&mut b, id, row(id, fun, 1, cx, Blk::None));
+            k += 1;
+        }
+    }
     put(
         &mut b,
         ov::STRATEGY_POSITION_ENTRY_NAME_VAR,
@@ -1858,6 +1936,28 @@ const fn build() -> Built {
             ov::DAYOFWEEK,
             tm::bi_civil::<{ Civil::DayOfWeek as u8 }>,
             2,
+            0,
+            Blk::None,
+        ),
+    );
+    put(
+        &mut b,
+        ov::WEEKOFYEAR,
+        row(
+            ov::WEEKOFYEAR,
+            tm::bi_civil::<{ Civil::WeekOfYear as u8 }>,
+            2,
+            0,
+            Blk::None,
+        ),
+    );
+    put(
+        &mut b,
+        ov::WEEKOFYEAR_VAR,
+        row(
+            ov::WEEKOFYEAR_VAR,
+            tm::bi_civil_var::<{ Civil::WeekOfYear as u8 }>,
+            1,
             0,
             Blk::None,
         ),
@@ -2645,14 +2745,43 @@ const fn build() -> Built {
         row(ov::MAP_VALUES, cm::bi_map_values, 4, COLL_S, Blk::Coll),
     );
     // T34 rest (impl-04 §4.16.6): fill, float variance / stdev, copy, from, concat, join,
-    // string sort, sort_indices; map.copy / put_all. Left as stubs (lead rulings):
-    // `array.avg/stdev/variance` of an int array — the reference returns `series int` and names
-    // no rounding (`pin:04-array-int-stats-open`); `array.median/mode/percentile_*` — a selection
-    // needs a scratch region a collection block does not have (`pin:04-array-select-open`, a
-    // later CAR); `array.abs/standardize` — the reference returns a new array but pine-spec's
+    // string sort, sort_indices; map.copy / put_all. `array.avg/stdev/variance` of an int array
+    // and `array.median/mode/percentile_*` landed 2026-10-16 (operator ruling, below: int results
+    // toward zero `pin:04-array-int-stats-provisional`; selection without scratch, `coll::order`).
+    // Left as stubs (lead rulings): `array.abs/standardize` — the reference returns a new array but pine-spec's
     // rows carry neither `COLLECTION` nor a block (`StateShape::None`), so no creator body can
     // match them (a pine-spec request).
     use crate::coll::part3 as c3;
+    // Operator ruling 2026-10-16: the order statistics without scratch (a read-only bisection
+    // selection, `coll::order`) and the int moments (`pin:04-array-int-stats-provisional`).
+    {
+        use crate::coll::order as co;
+        let rows: [(OverloadId, BuiltinFn); 11] = [
+            (ov::ARRAY_MEDIAN_F, co::bi_array_median),
+            (ov::ARRAY_MEDIAN_I, co::bi_array_median),
+            (ov::ARRAY_MODE_F, co::bi_array_mode),
+            (ov::ARRAY_MODE_I, co::bi_array_mode),
+            (ov::ARRAY_PERCENTILE_NEAREST_RANK_F, co::bi_array_percentile_nearest_rank),
+            (ov::ARRAY_PERCENTILE_NEAREST_RANK_I, co::bi_array_percentile_nearest_rank),
+            (
+                ov::ARRAY_PERCENTILE_LINEAR_INTERPOLATION_F,
+                co::bi_array_percentile_linear_interpolation,
+            ),
+            (
+                ov::ARRAY_PERCENTILE_LINEAR_INTERPOLATION_I,
+                co::bi_array_percentile_linear_interpolation,
+            ),
+            (ov::ARRAY_AVG_I, co::bi_array_avg_i),
+            (ov::ARRAY_VARIANCE_I, co::bi_array_variance_i),
+            (ov::ARRAY_STDEV_I, co::bi_array_stdev_i),
+        ];
+        let mut k = 0;
+        while k < rows.len() {
+            let (id, fun) = rows[k];
+            put(&mut b, id, row(id, fun, 8, 0, Blk::None));
+            k += 1;
+        }
+    }
     put(
         &mut b,
         ov::ARRAY_FILL,

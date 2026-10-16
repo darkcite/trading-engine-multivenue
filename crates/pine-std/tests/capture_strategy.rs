@@ -1152,3 +1152,82 @@ fn foreign_sym_is_internal() {
         StepOutcome::Fault(FaultKind::Internal)
     );
 }
+
+/// Operator ruling 2026-10-16: `strategy.openprofit_percent` = `openprofit / (initial_capital +
+/// netprofit) × 100` (the reference's `openPL / realizedEquity * 100`,
+/// `pin:04-openprofit-pct-provisional`), and the per-trade `profit_percent`,
+/// `max_runup_percent`, `max_drawdown_percent` = value / (entry price × |size|) × 100
+/// (`pin:04-trade-pct-provisional`), open and closed; ÷0 and no broker → na.
+#[test]
+fn strategy_percent_reads_follow_the_reference_formulas() {
+    let b = view();
+    let mut ctx = TestCtx {
+        broker: Some(b),
+        ..TestCtx::default()
+    };
+    let rows = [(ov::STRATEGY_OPENPROFIT_PERCENT_VAR, Lane::F64)];
+    let got = read_vars(&rows, &mut ctx);
+    let want = scale::from_1e12(b.openprofit_1e12)
+        / scale::from_1e12(b.initial_capital_1e12 + b.netprofit_1e12)
+        * 100.0;
+    assert_eq!(got[0].to_bits(), want.to_bits());
+    assert!((got[0] - (-1.25 / 10_250.5 * 100.0)).abs() < 1e-12);
+    ctx.broker = Some(BrokerView {
+        initial_capital_1e12: -b.netprofit_1e12,
+        ..b
+    });
+    assert!(read_vars(&rows, &mut ctx)[0].is_nan(), "÷0 → na");
+    assert!(read_vars(&rows, &mut TestCtx::default())[0].is_nan());
+
+    let t = trade_rec(9, false);
+    let base = scale::from_1e6(t.entry_px_1e6) * 1.5;
+    let fields = [
+        (
+            ov::STRATEGY_OPENTRADES_PROFIT_PERCENT,
+            ov::STRATEGY_CLOSEDTRADES_PROFIT_PERCENT,
+            scale::from_1e12(t.pnl_1e12) / base * 100.0,
+        ),
+        (
+            ov::STRATEGY_OPENTRADES_MAX_RUNUP_PERCENT,
+            ov::STRATEGY_CLOSEDTRADES_MAX_RUNUP_PERCENT,
+            7.25 / base * 100.0,
+        ),
+        (
+            ov::STRATEGY_OPENTRADES_MAX_DRAWDOWN_PERCENT,
+            ov::STRATEGY_CLOSEDTRADES_MAX_DRAWDOWN_PERCENT,
+            3.125 / base * 100.0,
+        ),
+    ];
+    for (o, c, w) in fields {
+        for (id, n, rec) in [
+            (o, 0, t),
+            (c, 5, t),
+            (
+                o,
+                0,
+                TradeRec {
+                    entry_px_1e6: 0,
+                    ..t
+                },
+            ),
+        ] {
+            let ins = [(Lane::I64, i(n))];
+            let outs = [Lane::F64];
+            let calls = [call(id, &ins, &outs)];
+            let mut h = Harness::build(&script(&calls, Dialect::V6, 0));
+            let mut ctx = TestCtx {
+                broker: Some(view()),
+                open: vec![rec],
+                closed: vec![trade_rec(1, false), rec, trade_rec(2, false)],
+                ..TestCtx::default()
+            };
+            assert_eq!(step(&mut h, &mut ctx, 0), StepOutcome::Ok);
+            let g = h.out(0, 0);
+            if rec.entry_px_1e6 == 0 {
+                assert!(g.is_nan(), "{id:?}: zero base → na");
+            } else {
+                assert_eq!(g.to_bits(), w.to_bits(), "{id:?}: {g} vs {w}");
+            }
+        }
+    }
+}

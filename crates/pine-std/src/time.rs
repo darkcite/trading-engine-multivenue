@@ -5,8 +5,8 @@
 //! fields `year month dayofmonth dayofweek hour minute second` (function and variable forms),
 //! `timenow`, `time_tradingday`, `timeframe.in_seconds`, `timeframe.change`. Every time is UTC
 //! milliseconds; bar boundaries come from `core_time::barclock` only; no clock (`timenow` is the
-//! host's event time). `weekofyear` stays a stub: no reference text defines its numbering
-//! (`pin:04-weekofyear-open`).
+//! host's event time). `weekofyear` (function and variable): the reference does not define its
+//! numbering; operator ruling 2026-10-16 — the ISO 8601 week (`pin:04-weekofyear-provisional`).
 
 use crate::load::{session_parse, tf_seconds, tz_lookup, tz_offset_s, SessionSpec, TzId, TZ_UTC};
 use crate::state::Prev;
@@ -63,6 +63,11 @@ pub enum Civil {
     Minute = 5,
     /// `second`, 0..=59.
     Second = 6,
+    /// `weekofyear`, 1..=53: the ISO 8601 week — weeks start on Monday and week 1 holds the
+    /// year's first Thursday, so 1–3 January may be week 52/53 and 29–31 December week 1
+    /// (`pin:04-weekofyear-provisional`, operator ruling 2026-10-16; to be verified against
+    /// TradingView in the capture month).
+    WeekOfYear = 7,
 }
 
 /// Field `k` of UTC ms `t` shifted by `off_s` seconds (the zone's offset at `t`).
@@ -77,16 +82,29 @@ fn civil_field(t: i64, off_s: i32, k: u8) -> i64 {
     const W: u8 = Civil::DayOfWeek as u8;
     const H: u8 = Civil::Hour as u8;
     const MI: u8 = Civil::Minute as u8;
+    const WK: u8 = Civil::WeekOfYear as u8;
     match k {
         Y => civil_from_days(days).0,
         MO => civil_from_days(days).1 as i64,
         D => civil_from_days(days).2 as i64,
         // 1970-01-01 was a Thursday (5 in 1 = Sunday numbering).
         W => (days + 4).rem_euclid(7) + 1,
+        WK => iso_week(days),
         H => ms / 3_600_000,
         MI => ms / 60_000 % 60,
         _ => ms / 1000 % 60,
     }
+}
+
+/// The ISO 8601 week number of day `days` since 1970-01-01: the week's Thursday (ISO weekday
+/// 1 = Monday … 7 = Sunday; 1970-01-01 was a Thursday) names the ISO year, and the week is
+/// `(thursday − 1 January of that year) / 7 + 1`.
+#[inline]
+fn iso_week(days: i64) -> i64 {
+    let wd = (days + 3).rem_euclid(7) + 1;
+    let thu = days - (wd - 4);
+    let (y, _, _) = civil_from_days(thu);
+    (thu - days_from_civil(y, 1, 1)) / 7 + 1
 }
 
 /// A `series` timezone string at run time: na → `None`; unknown → `Err(ScriptRefused)`

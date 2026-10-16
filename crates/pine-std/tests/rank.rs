@@ -363,3 +363,96 @@ fn ta_percentile_nearest_rank_is_the_ordinal_rank() {
         assert!(got[9].is_nan(), "{p}");
     }
 }
+
+/// Operator ruling 2026-10-16 (`pin:04-median-int-provisional`): the `int` overload of
+/// `ta.median` returns `series int`, an even window giving the lower middle value — a member.
+#[test]
+fn ta_median_int_is_the_lower_middle_skipping_na() {
+    let xs = tape(3000, true);
+    let lower = |w: &[f64]| {
+        let v = sorted(w);
+        v[(v.len() - 1) / 2]
+    };
+    for len in [1u32, 2, 5, 6, 31, 64] {
+        let (got, _) = run(ov::TA_MEDIAN_I, len, &xs, true);
+        same(&got, &bf_skip(&xs, len as usize, lower), "median int");
+    }
+    let xs: Vec<f64> = [3.0, 7.0].to_vec();
+    let (got, _) = run(ov::TA_MEDIAN_I, 2, &xs, true);
+    assert_eq!(got[1], 3.0, "lower middle, not the mean 5");
+}
+
+/// C = 1 linear interpolation (Excel `PERCENTILE.INC`, Hyndman–Fan 7) over the sorted window.
+fn bf_linear(w: &[f64], p: f64) -> f64 {
+    if !(0.0..=100.0).contains(&p) {
+        return f64::NAN;
+    }
+    let v = sorted(w);
+    let x = (p * (v.len() - 1) as f64) / 100.0;
+    let k = x.floor() as usize;
+    let frac = x - k as f64;
+    if frac == 0.0 || k + 1 == v.len() {
+        v[k]
+    } else {
+        v[k] + frac * (v[k + 1] - v[k])
+    }
+}
+
+/// Operator ruling 2026-10-16 (`pin:04-percentile-linear-provisional`, `pin:04-percentile-linear-na`):
+/// `ta.percentile_linear_interpolation` is the C = 1 interpolation over the newest `length`
+/// executions; a na among them gives na (the reference: "`na` values ... are included in
+/// calculations and will produce an `na` result"); it allocates nothing.
+#[test]
+fn ta_percentile_linear_interpolation_is_c1_and_propagates_na() {
+    for holes in [false, true] {
+        let base = tape(1500, holes);
+        let xs: Vec<f64> = base
+            .iter()
+            .enumerate()
+            .map(|(k, v)| v * 1.37 + (k % 5) as f64 * 0.01)
+            .collect();
+        for len in [1u32, 2, 4, 10, 33] {
+            let l = len as usize;
+            for p in [
+                0.0,
+                10.0,
+                25.0,
+                33.3,
+                50.0,
+                87.5,
+                100.0,
+                -1.0,
+                100.5,
+                f64::NAN,
+            ] {
+                let want: Vec<f64> = (0..xs.len())
+                    .map(|t| {
+                        if t + 1 < l || xs[t + 1 - l..=t].iter().any(|v| v.is_nan()) {
+                            return f64::NAN;
+                        }
+                        bf_linear(&xs[t + 1 - l..=t], p)
+                    })
+                    .collect();
+                let (got, allocs) = run_p(
+                    ov::TA_PERCENTILE_LINEAR_INTERPOLATION,
+                    len,
+                    &xs,
+                    false,
+                    Some(p),
+                );
+                same(&got, &want, "percentile_linear_interpolation");
+                assert_eq!(allocs, 0);
+            }
+        }
+    }
+    // 1..=10 at 25 %: x = 2.25 → 3 + 0.25 · (4 − 3).
+    let xs: Vec<f64> = (1..=10).map(|v| v as f64).collect();
+    let (got, _) = run_p(
+        ov::TA_PERCENTILE_LINEAR_INTERPOLATION,
+        10,
+        &xs,
+        false,
+        Some(25.0),
+    );
+    assert_eq!(got[9], 3.25);
+}

@@ -2127,3 +2127,174 @@ fn bar_prelude_series_match_reference() {
         }
     }
 }
+
+/// Bars for the volume variables: repeated closes, flat bars (`high == low`), volume up and down.
+fn vol_bars(n: u32) -> Vec<Bar> {
+    (0..n)
+        .map(|i| {
+            let c = 100.0 + ((i * 37) % 23) as f64 - 11.0 + if i % 9 == 4 { 0.0 } else { 0.25 };
+            let c = if i % 7 == 3 && i > 0 {
+                100.0 + (((i - 1) * 37) % 23) as f64 - 11.0 + 0.25
+            } else {
+                c
+            };
+            let mut b = bar(i, c, barflag::CONFIRMED);
+            let flat = i % 11 == 5;
+            b.open_1e6 = scale::to_1e6(c - 0.5 + (i % 4) as f64 * 0.3).unwrap();
+            if !flat {
+                b.high_1e6 = scale::to_1e6(c + 1.0 + (i % 3) as f64).unwrap();
+                b.low_1e6 = scale::to_1e6(c - 2.0 + (i % 2) as f64).unwrap();
+            }
+            b.volume_1e6 = scale::to_1e6(1.0 + ((i * 13) % 7) as f64).unwrap();
+            b
+        })
+        .collect()
+}
+
+/// The reference examples of `ref-v6-vars.json` evaluated literally (`ta.cum` adds 0 for na;
+/// `x[1]` is na on the first bar), plus TradingView's Accumulation/Distribution study; returns
+/// `[accdist, obv, pvt, iii, nvi, pvi, wad, wvad]` per bar.
+fn vol_vars_reference(bars: &[Bar], na0: bool) -> Vec<[f64; 8]> {
+    let p = |x: i64| x as f64 / 1e6;
+    let div = |a: f64, b: f64| {
+        let q = a / b;
+        if na0 && q.is_infinite() {
+            f64::NAN
+        } else {
+            q
+        }
+    };
+    let nz = |x: f64| if x.is_nan() { 0.0 } else { x };
+    let cum = |acc: &mut f64, t: f64| {
+        if !t.is_nan() {
+            *acc += t;
+        }
+        *acc
+    };
+    let (mut ad, mut obv, mut pvt, mut wad) = (0.0, 0.0, 0.0, 0.0);
+    let (mut nvi, mut pvi) = (f64::NAN, f64::NAN);
+    let (mut pc, mut pv) = (f64::NAN, f64::NAN);
+    let mut out = Vec::new();
+    for b in bars {
+        let (o, h, l, c, v) = (
+            p(b.open_1e6),
+            p(b.high_1e6),
+            p(b.low_1e6),
+            p(b.close_1e6),
+            p(b.volume_1e6),
+        );
+        let ch = c - pc;
+        let t_ad = if (c == h && c == l) || h == l {
+            0.0
+        } else {
+            ((2.0 * c - l - h) / (h - l)) * v
+        };
+        let sign = if ch.is_nan() {
+            f64::NAN
+        } else if ch > 0.0 {
+            1.0
+        } else if ch < 0.0 {
+            -1.0
+        } else {
+            0.0
+        };
+        let (th, tl) = if pc.is_nan() {
+            (f64::NAN, f64::NAN)
+        } else {
+            (if h >= pc { h } else { pc }, if l <= pc { l } else { pc })
+        };
+        let gain = if ch > 0.0 {
+            c - tl
+        } else if ch < 0.0 {
+            c - th
+        } else {
+            0.0
+        };
+        let vi = |prev_idx: f64, up: bool| {
+            let prev = if nz(prev_idx) == 0.0 { 1.0 } else { prev_idx };
+            if nz(c) == 0.0 || nz(pc) == 0.0 {
+                prev
+            } else if (up && v > nz(pv)) || (!up && v < nz(pv)) {
+                prev + ((c - pc) / pc) * prev
+            } else {
+                prev
+            }
+        };
+        nvi = vi(nvi, false);
+        pvi = vi(pvi, true);
+        out.push([
+            cum(&mut ad, t_ad),
+            cum(&mut obv, sign * v),
+            cum(&mut pvt, div(ch, pc) * v),
+            div(2.0 * c - h - l, h - l) * v,
+            nvi,
+            pvi,
+            cum(&mut wad, gain),
+            div(c - o, h - l) * v,
+        ]);
+        (pc, pv) = (c, v);
+    }
+    out
+}
+
+/// Operator ruling 2026-10-16 (`pin:04-{accdist,obv,pvt,iii,nvi,pvi,wad,wvad}-provisional`):
+/// the eight volume variables agree with the reference examples evaluated literally, on every
+/// bar, with flat bars (÷0 per `Sw::FloatDivZero`), unchanged closes and volume up/down days;
+/// a forming tick never advances them (I5); NVI/PVI start at 1.0.
+#[test]
+fn ta_volume_variables_match_the_reference_examples() {
+    let bars = vol_bars(60);
+    let ids = [
+        ov::TA_ACCDIST_VAR,
+        ov::TA_OBV_VAR,
+        ov::TA_PVT_VAR,
+        ov::TA_III_VAR,
+        ov::TA_NVI_VAR,
+        ov::TA_PVI_VAR,
+        ov::TA_WAD_VAR,
+        ov::TA_WVAD_VAR,
+    ];
+    for dialect in [Dialect::V5, Dialect::V6] {
+        let na0 = pine_spec::sw(Sw::FloatDivZero, dialect) == swr::FLOAT_DIV_ZERO_NA;
+        let want = vol_vars_reference(&bars, na0);
+        let calls: Vec<Call> = ids
+            .iter()
+            .map(|&id| Call {
+                ov: id,
+                inputs: &[],
+                outputs: &[Lane::F64],
+                site_bytes: OVERLOADS[id.0 as usize].state.block_bytes(0),
+                guard: None,
+            })
+            .collect();
+        let mut h = Harness::build(&Script {
+            calls: &calls,
+            mode: ExecMode::Realtime,
+            dialect,
+            intent_cap: 0,
+            chart: CHART,
+        });
+        let mut ctx = TestCtx::default();
+        for (i, b) in bars.iter().enumerate() {
+            let mut t = *b;
+            t.flags = barflag::REALTIME;
+            t.volume_1e6 *= 5;
+            t.close_1e6 += 3_000_000;
+            assert_eq!(h.step_tick(&t, &mut ctx), StepOutcome::Ok);
+            assert_eq!(h.step_bar(b, &mut ctx), StepOutcome::Ok);
+            for k in 0..ids.len() {
+                assert!(
+                    close_eq(h.out(k, 0), want[i][k]),
+                    "{dialect:?} bar {i} var {k}: {} vs {}",
+                    h.out(k, 0),
+                    want[i][k]
+                );
+            }
+        }
+        assert_eq!(want[0][4], 1.0);
+        assert_eq!(want[0][5], 1.0);
+        assert_eq!(want[0][1], 0.0);
+        let flat = &want[5];
+        assert!(flat[3].is_nan() || flat[3].is_infinite());
+    }
+}
