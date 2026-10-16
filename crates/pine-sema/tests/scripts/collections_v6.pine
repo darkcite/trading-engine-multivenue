@@ -1,0 +1,9 @@
+//@version=6
+indicator("collections")
+var a = array.new_float(0)
+array.push(a, close)
+plot(array.size(a))
+plot(array.get(a, 0))
+var m = map.new<string, float>()
+map.put(m, "k", close)
+plot(map.get(m, "k"))

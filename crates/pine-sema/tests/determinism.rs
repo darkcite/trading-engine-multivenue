@@ -55,3 +55,33 @@ fn sema_is_deterministic_over_two_lib_caches() {
         assert_eq!(ba, ba2, "{mode:?}: a warm cache");
     }
 }
+
+/// I18 / law P4 (§4.11.5, §4.11.8–§4.11.9): the same `request.security` in two different scripts
+/// — other declarations (`format`, `precision`, title), other code around it, other interning
+/// order — gives equal keys and byte-identical children, for the chart's own symbol and another.
+#[test]
+fn subprogram_key_is_shared_across_scripts() {
+    let o = default_opts(Dialect::V6, ExecMode::BarClose);
+    for target in ["syminfo.tickerid", "\"BINANCE:ETHUSDT.P\""] {
+        let req = format!("request.security({target}, \"D\", ta.sma(close, 5)[1])");
+        let a = format!(
+            "//@version=6\nindicator(\"a\", format = format.volume, precision = 2)\n\
+             x = ta.ema(close, 3)\nplot(x)\nplot({req})\n"
+        );
+        let b = format!(
+            "//@version=6\nindicator(\"bee\", overlay = true)\nlabel_txt = \"zzz\"\n\
+             y = {req}\nplot(y * 2, title = label_txt)\n"
+        );
+        let pa = common::compile_src(&a, &o).expect("a compiles");
+        let pb = common::compile_src(&b, &o).expect("b compiles");
+        assert_eq!(pa.subprograms.len(), 1, "{target}");
+        assert_eq!(pb.subprograms.len(), 1, "{target}");
+        let (sa, sb) = (&pa.subprograms[0], &pb.subprograms[0]);
+        assert_eq!(
+            canonical_bytes(&sa.program),
+            canonical_bytes(&sb.program),
+            "{target}: byte-identical children"
+        );
+        assert_eq!(sa.key, sb.key, "{target}: one key");
+    }
+}

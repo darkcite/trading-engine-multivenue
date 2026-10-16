@@ -1,0 +1,9 @@
+//@version=6
+indicator("security")
+m = ta.sma(close, 5)
+d = request.security(syminfo.tickerid, "D", m[1])
+e = request.security("BINANCE:ETHUSDT.P", "60", close)
+[o, c] = request.security(syminfo.tickerid, "240", [open, close])
+plot(d)
+plot(e)
+plot(o + c)

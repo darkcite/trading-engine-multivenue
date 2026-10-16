@@ -1,0 +1,5 @@
+//@version=6
+indicator("strings")
+string s = bar_index % 2 == 0 ? "even" : "odd"
+plot(s == "even" ? 1 : 0)
+plot(s[1] == "even" ? 1 : 0)

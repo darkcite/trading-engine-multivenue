@@ -35,9 +35,13 @@ fn try_src(src: &str, d: Dialect, rd: &Readings) -> Result<Ir, Diag> {
 }
 
 /// The tests' knobs: `collection_cap` 64, mintick 0.01.
-const KNOBS: lower::Knobs = lower::Knobs {
+const KNOBS: lower::Knobs<'static> = lower::Knobs {
     cap: 64,
     mintick_1e6: 10_000,
+    pointvalue_1e6: 1_000_000,
+    timeframe_s: 3600,
+    strs: [pine_ir::Sym::NONE; 6],
+    own: &[],
 };
 
 pub(super) fn ir_with(body: &str, d: Dialect, rd: &Readings) -> Ir {

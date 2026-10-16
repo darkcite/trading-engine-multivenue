@@ -1,0 +1,11 @@
+//@version=5
+indicator("objects")
+type Pt
+    float x = 0.0
+    int n = 1
+var p = Pt.new(0.0)
+p.x := p.x + close
+p.n += 1
+q = Pt.new(close)
+plot(p.x + q.x)
+plot(p.n)

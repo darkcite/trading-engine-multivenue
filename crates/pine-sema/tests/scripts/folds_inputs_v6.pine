@@ -1,0 +1,9 @@
+//@version=6
+indicator("folds and inputs", format = format.price, precision = 3)
+len = input.int(14, "Length")
+src = input.source(close, "Source")
+hline(1.0)
+plot(ta.sma(src, len) * syminfo.mintick)
+plot(timeframe.isintraday ? timeframe.multiplier : 0)
+plot(syminfo.ticker == "BTCUSDT" ? 1 : 0)
+plotcandle(open, high, low, close)

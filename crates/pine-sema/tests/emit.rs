@@ -890,3 +890,216 @@ fn emit_for_bound_follows_mg23() {
         }
     }
 }
+
+/// §4.17 `ValueSrc::Fold`: `syminfo.*` / `timeframe.*` fold from the options (chart 60 minutes,
+/// mintick 0.1, pointvalue 1, ticker `BTCUSDT`) and lower as constants.
+#[test]
+fn emit_fold_values_execute() {
+    let closes = [1.0, 2.0];
+    for d in [Dialect::V5, Dialect::V6] {
+        let h = format!("//@version={}\nindicator(\"t\")\n", d as u8);
+        let cases = [
+            ("syminfo.mintick", 0.1),
+            ("syminfo.pointvalue", 1.0),
+            ("timeframe.multiplier", 60.0),
+            ("timeframe.isminutes ? 1 : 0", 1.0),
+            ("timeframe.isintraday ? 1 : 0", 1.0),
+            ("timeframe.isdwm ? 1 : 0", 0.0),
+            ("timeframe.period == \"60\" ? 1 : 0", 1.0),
+            ("syminfo.ticker == \"BTCUSDT\" ? 1 : 0", 1.0),
+            ("syminfo.currency == \"USDT\" ? 1 : 0", 1.0),
+            ("str.length(syminfo.tickerid) > 0 ? 1 : 0", 1.0),
+        ];
+        for (e, want) in cases {
+            let src = format!("{h}plot({e})\n");
+            let got = plots_of(&src, d, ExecMode::BarClose, &closes, 0);
+            assert_eq!(got, vec![want; 2], "{e} v{}", d as u8);
+        }
+    }
+}
+
+/// Every `tests/scripts/*.pine` (dialect from its `//@version=`) compiled in both modes.
+fn corpus() -> Vec<(String, ExecMode, PineProgram)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scripts");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .expect("tests/scripts")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "pine"))
+        .collect();
+    files.sort();
+    let mut out = Vec::new();
+    for f in files {
+        let src = std::fs::read_to_string(&f).expect("readable");
+        let d = if src.starts_with("//@version=5") {
+            Dialect::V5
+        } else {
+            Dialect::V6
+        };
+        for mode in [ExecMode::BarClose, ExecMode::Realtime] {
+            let name = f.file_name().unwrap().to_string_lossy().into_owned();
+            match compile_src(&src, &default_opts(d, mode)) {
+                Ok(p) => out.push((name, mode, p)),
+                Err(e) => panic!("{name} {mode:?}: {e:#?}"),
+            }
+        }
+    }
+    out
+}
+
+/// `p` and, depth first, every sub-program of it.
+fn tree(p: &PineProgram) -> Vec<&PineProgram> {
+    let mut v = vec![p];
+    for s in &p.subprograms {
+        v.extend(tree(&s.program));
+    }
+    v
+}
+
+/// §7.7: every test script, in both modes, passes the verifier with all its sub-programs.
+#[test]
+fn emit_every_test_script_verifies() {
+    let c = corpus();
+    assert!(c.len() >= 16, "{} programs", c.len());
+    for (name, mode, p) in &c {
+        for (k, q) in tree(p).into_iter().enumerate() {
+            if let Err(e) = pine_vm::verify(q, &pine_std::BUILTINS) {
+                panic!("{name} {mode:?} program {k}: rule {} pc {}", e.rule, e.pc);
+            }
+        }
+    }
+}
+
+/// I9 (and pine-vm's rule 22): every `CALL_BUILTIN` window has `n ≥ n_out`, every entry inside
+/// its lane, every output a user slot — not reserved, not a constant, not one of the window's
+/// inputs, not another output — and the code ends in `HALT`; over the corpus and its children.
+#[test]
+fn emit_windows_are_in_range_and_outputs_are_user_slots() {
+    use pine_ir::{abi, argwin};
+    let mut windows = 0usize;
+    for (name, mode, p) in &corpus() {
+        for q in tree(p) {
+            assert_eq!(
+                q.code.last().map(|i| i.op),
+                Some(op::HALT),
+                "{name} {mode:?}"
+            );
+            // (is_i64, slot) of every constant slot.
+            let consts: std::collections::BTreeSet<(bool, u16)> = q
+                .code
+                .iter()
+                .filter_map(|i| match i.op {
+                    op::F_CONST => Some((false, i.dst)),
+                    op::I_CONST => Some((true, i.dst)),
+                    _ => None,
+                })
+                .collect();
+            for i in q.code.iter().filter(|i| i.op == op::CALL_BUILTIN) {
+                windows += 1;
+                let w = usize::from(i.b);
+                let n = usize::from(q.argwin[w]);
+                let n_out = pine_std::BUILTINS.entries[usize::from(i.a)].n_out as usize;
+                assert!(n >= n_out, "{name} {mode:?}: {i:?}");
+                let win = &q.argwin[w + 1..w + 1 + n];
+                for e in win {
+                    let len = if argwin::is_i64(*e) {
+                        q.layout.i64_len
+                    } else {
+                        q.layout.f64_len
+                    };
+                    assert!(u32::from(argwin::slot(*e)) < len, "{name} {mode:?}: {i:?}");
+                }
+                let (ins, outs) = win.split_at(n - n_out);
+                for (k, e) in outs.iter().enumerate() {
+                    let (i64l, s) = (argwin::is_i64(*e), argwin::slot(*e));
+                    let floor = if i64l {
+                        abi::RESERVED_I
+                    } else {
+                        abi::RESERVED_F
+                    };
+                    assert!(s >= floor, "{name} {mode:?}: output reserved {i:?}");
+                    assert!(
+                        !consts.contains(&(i64l, s)),
+                        "{name} {mode:?}: output a constant {i:?}"
+                    );
+                    assert!(
+                        !ins.contains(e),
+                        "{name} {mode:?}: output aliases an input {i:?}"
+                    );
+                    assert!(
+                        !outs[..k].contains(e),
+                        "{name} {mode:?}: two outputs alias {i:?}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(windows > 0);
+}
+
+/// W3: v5 `and`/`or` are strict (`B_AND`/`B_OR`, the right operand always evaluated); v6 are
+/// lazy (jumps, no `B_AND`/`B_OR`): a call-site `var` in the right operand advances only on the
+/// bars the left one does not decide.
+#[test]
+fn emit_lazy_and_or_is_jumps_in_v6_and_strict_in_v5() {
+    const F: &str = "f() =>\n    var int k = 0\n    k += 1\n    k\n";
+    let closes = [1.0, 2.0, 3.0, 4.0, 5.0];
+    for (op_txt, body, v5, v6) in [
+        (
+            "and",
+            "b = bar_index >= 3 and f() >= 2\n",
+            [0.0, 0.0, 0.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0, 1.0],
+        ),
+        (
+            "or",
+            "b = bar_index < 3 or f() >= 2\n",
+            [1.0; 5],
+            [1.0, 1.0, 1.0, 0.0, 1.0],
+        ),
+    ] {
+        for (d, want) in [(Dialect::V5, v5), (Dialect::V6, v6)] {
+            let s = format!(
+                "//@version={}\nindicator(\"t\")\n{F}{body}plot(b ? 1 : 0)\n",
+                d as u8
+            );
+            assert_eq!(
+                plots_of(&s, d, ExecMode::BarClose, &closes, 0),
+                want,
+                "{op_txt} {d:?}"
+            );
+            let p = compile_src(&s, &default_opts(d, ExecMode::BarClose)).expect("compiles");
+            let strict = p
+                .code
+                .iter()
+                .filter(|i| i.op == op::B_AND || i.op == op::B_OR)
+                .count();
+            assert_eq!(strict > 0, d == Dialect::V5, "{op_txt} {d:?}");
+        }
+    }
+}
+
+/// U14 `selected_only` (the default in both dialects): only the chosen arm runs — a call-site
+/// `var` in the arm advances on the bars that select it, and no `F_SEL`/`I_SEL` is emitted.
+#[test]
+fn emit_ternary_evaluates_the_selected_arm_only_by_default() {
+    const F: &str = "f() =>\n    var int k = 0\n    k += 1\n    k\n";
+    let closes = [1.0, 2.0, 3.0, 4.0, 5.0];
+    for d in [Dialect::V5, Dialect::V6] {
+        let s = format!(
+            "//@version={}\nindicator(\"t\")\n{F}x = bar_index >= 3 ? f() : 0\nplot(x)\n",
+            d as u8
+        );
+        assert_eq!(
+            plots_of(&s, d, ExecMode::BarClose, &closes, 0),
+            vec![0.0, 0.0, 0.0, 1.0, 2.0],
+            "{d:?}"
+        );
+        let p = compile_src(&s, &default_opts(d, ExecMode::BarClose)).expect("compiles");
+        assert!(
+            !p.code
+                .iter()
+                .any(|i| i.op == op::F_SEL || i.op == op::I_SEL),
+            "{d:?}"
+        );
+    }
+}

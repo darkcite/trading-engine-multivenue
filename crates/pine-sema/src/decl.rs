@@ -36,6 +36,23 @@ pub(crate) struct Decl {
     pub(crate) uses_intrabar: bool,
     /// The declaration's `max_bars_back` argument — §4.10.4's `D`; 0 = not declared.
     pub(crate) max_bars_back: u32,
+    /// The dialect's argument-less `strategy()` fold, no risk rules: a request child's `decl`
+    /// (§4.16's sub-program column).
+    pub(crate) bare: StrategyDecl,
+}
+
+impl Decl {
+    /// A request child's declaration (§4.16): `Indicator`, the argument-less `strategy()` fold,
+    /// no intrabar flag, no declared `max_bars_back`.
+    pub(crate) const fn child(bare: StrategyDecl) -> Self {
+        Self {
+            kind: ScriptKind::Indicator,
+            strategy: bare,
+            uses_intrabar: false,
+            max_bars_back: 0,
+            bare,
+        }
+    }
 }
 
 /// A folded argument or default, strings borrowed.
@@ -332,6 +349,17 @@ pub(crate) fn check(
             out.strategy = fold_strategy(&a, &mut f);
         }
         (None, None) => {}
+    }
+    if let Some(ov) = strategy_ov {
+        let a = Args {
+            ast,
+            root,
+            syms,
+            s: None,
+            ov,
+            d,
+        };
+        out.bare = fold_strategy(&a, &mut f);
     }
     // pin:02-risk-rule-kind — §4.13.1 folds every root top-level `strategy.risk.*` call, whatever
     // the declaration; an indicator's rules land on its default `StrategyDecl`.

@@ -12,6 +12,7 @@ mod fold;
 mod infer;
 mod inputs;
 mod ir_shapes;
+mod lowering;
 mod mono;
 mod nacap;
 mod overload;

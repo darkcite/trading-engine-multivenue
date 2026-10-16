@@ -24,17 +24,28 @@ use crate::limits::MAX_UNROLL;
 use crate::pins::CondCallState;
 use crate::sw::Readings;
 
-/// Run the transforms the readings select.
+/// Run the transforms the readings select — over the body and every request's detached `E`
+/// block (§4.11.2: `E` is lowered like any expression, so its loops and conditional calls follow
+/// the same readings; the child's cone then slices the transformed block).
 pub(crate) fn run(ir: &mut Ir, rd: &Readings) -> Result<(), Diag> {
     if rd.ta_in_loop == swr::TA_IN_LOOP_PER_ITERATION {
         let mut body = std::mem::take(&mut ir.body);
         let r = unroll(ir, &mut body);
         ir.body = body;
         r?;
+        for i in 0..ir.requests.len() {
+            let mut e = std::mem::take(&mut ir.requests[i].e);
+            let r = unroll(ir, &mut e);
+            ir.requests[i].e = e;
+            r?;
+        }
     }
     if rd.pins.cond_call_state == CondCallState::EveryBar {
         let temps: Vec<bool> = ir.slots.iter().map(|s| s.kind == SlotKind::Temp).collect();
         every_bar(&mut ir.body, &temps)?;
+        for i in 0..ir.requests.len() {
+            every_bar(&mut ir.requests[i].e, &temps)?;
+        }
     }
     Ok(())
 }

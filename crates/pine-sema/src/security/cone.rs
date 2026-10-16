@@ -51,6 +51,8 @@ pub(crate) struct Cx<'a> {
     pub(crate) udt_fields: &'a [u16],
     /// This program's depth (the root is 0).
     pub(crate) depth: u32,
+    /// The dialect's argument-less `strategy()` fold — every child's `decl` (§4.16).
+    pub(crate) bare: pine_ir::StrategyDecl,
 }
 
 /// Every key the whole tree has extracted so far (`3031`, §4.11.6).

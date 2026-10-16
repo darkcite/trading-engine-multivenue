@@ -47,11 +47,108 @@ const fn scalar(t: Ty, q: Qual) -> TypeQ {
 
 /// The compilation's knobs lowering reads (§4.14.5): a creator's `__cap`, `sym_precision`.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Knobs {
+pub(crate) struct Knobs<'a> {
     /// `CompileLimits::collection_cap`.
     pub(crate) cap: u32,
     /// `ChartInfo::mintick_1e6`.
     pub(crate) mintick_1e6: i64,
+    /// `ChartInfo::pointvalue_1e6` (`syminfo.pointvalue`, §4.17).
+    pub(crate) pointvalue_1e6: i64,
+    /// `ChartInfo::timeframe_s` (`timeframe.multiplier` / `timeframe.is*`, §4.17).
+    pub(crate) timeframe_s: u32,
+    /// The folded strings (§4.17), interned before lowering — [`FOLD_STR_TICKERID`]: `symbol_key`,
+    /// then `syminfo_strs[0..4]`, then `timeframe.period`; `Sym::NONE` when the program reads none.
+    pub(crate) strs: [Sym; 6],
+    /// The interned target texts that resolve to the chart's own symbol — `symbol_key` and every
+    /// `ticker_map` ticker mapped to it (as 5a's `target` resolves them) — for the child's
+    /// capture defaults (`pin:02-child-capture-decl-defaults`).
+    pub(crate) own: &'a [Sym],
+}
+
+/// [`Knobs::strs`]' index of `syminfo.tickerid`; `ticker` … `type` follow, `timeframe.period` last.
+pub(crate) const FOLD_STR_TICKERID: usize = 0;
+/// [`Knobs::strs`]' index of `timeframe.period`.
+pub(crate) const FOLD_STR_PERIOD: usize = 5;
+
+/// The `K` of a `ValueSrc::Fold` row (§4.17, impl-00 §3.9) from the compilation's knobs, with
+/// [`crate::ir::CTX_SYMINFO`] / [`crate::ir::CTX_TIMEFRAME`] for §4.11.4's `3029`. `None` for a
+/// code the table does not know or a timeframe `tf_parts` refuses (pass 0 checked it).
+pub(crate) fn fold_value(bits: u64, k: &Knobs<'_>) -> Option<(K, u8)> {
+    use pine_spec::Fold as F;
+    use pine_std::TfUnit as U;
+    let code = bits as u8;
+    let sym = crate::ir::CTX_SYMINFO;
+    let tf = crate::ir::CTX_TIMEFRAME;
+    let s = |i: usize| (k.strs[i] != Sym::NONE).then_some(K::Str(k.strs[i]));
+    if code == F::SyminfoMintick as u8 {
+        return Some((K::Float(pine_ir::scale::from_1e6(k.mintick_1e6)), sym));
+    }
+    if code == F::SyminfoPointvalue as u8 {
+        return Some((K::Float(pine_ir::scale::from_1e6(k.pointvalue_1e6)), sym));
+    }
+    if (F::SyminfoTickerid as u8..=F::SyminfoType as u8).contains(&code) {
+        let i = FOLD_STR_TICKERID + usize::from(code - F::SyminfoTickerid as u8);
+        return s(i).map(|v| (v, sym));
+    }
+    if code == F::TimeframePeriod as u8 {
+        return s(FOLD_STR_PERIOD).map(|v| (v, tf));
+    }
+    let p = pine_std::tf_parts(k.timeframe_s)?;
+    let is = |units: &[U]| K::Bool(units.contains(&p.unit));
+    let v = match code {
+        c if c == F::TimeframeMultiplier as u8 => K::Int(i64::from(p.mult)),
+        c if c == F::TimeframeIsSeconds as u8 => is(&[U::Second]),
+        c if c == F::TimeframeIsMinutes as u8 => is(&[U::Minute]),
+        // §4.17: `isintraday` = seconds or minutes; `isdwm` = day, week or month.
+        c if c == F::TimeframeIsIntraday as u8 => is(&[U::Second, U::Minute]),
+        c if c == F::TimeframeIsDaily as u8 => is(&[U::Day]),
+        c if c == F::TimeframeIsWeekly as u8 => is(&[U::Week]),
+        c if c == F::TimeframeIsMonthly as u8 => is(&[U::Month]),
+        c if c == F::TimeframeIsDwm as u8 => is(&[U::Day, U::Week, U::Month]),
+        _ => return None,
+    };
+    Some((v, tf))
+}
+
+/// A §4.14.6 rule: a built-in call lowered to opcodes instead of `CALL_BUILTIN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpRule {
+    /// `na(x)` → `NA_CHECK`.
+    Na,
+    /// `nz(x[, y])` → `NZ_F` / `NZ_I`.
+    Nz,
+    /// `int(float)` → `I_F2I` (or `$op.int_strict` under `IntOfNa = fault`).
+    IntOfFloat,
+    /// `float(int)` → `F_I2F`.
+    FloatOfInt,
+    /// `bool(int | float)` → `I_NE` / `F_NE` against zero.
+    BoolOfNum,
+    /// `math.abs` / `math.sqrt` of one argument.
+    AbsSqrt,
+    /// `math.pow` / two-argument `math.max` / `math.min`.
+    PowMaxMin,
+    /// `math.round(float)` under `RoundTies = half_away`.
+    Round,
+}
+
+/// The §4.14.6 rule of a call of `full` with `n` arguments, the first of type `t0`, if any —
+/// the one table [`Lower`]'s calls and `lowering_table_covers_folded_rows` both read.
+pub(crate) fn op_rule(full: &str, n: usize, t0: Option<Ty>, rd: &Readings) -> Option<OpRule> {
+    Some(match (full, n) {
+        ("na", 1) => OpRule::Na,
+        ("nz", 1 | 2) => OpRule::Nz,
+        ("int", 1) if t0 == Some(Ty::Float) => OpRule::IntOfFloat,
+        ("float", 1) if t0 == Some(Ty::Int) => OpRule::FloatOfInt,
+        ("bool", 1) if matches!(t0, Some(Ty::Int | Ty::Float)) => OpRule::BoolOfNum,
+        ("math.abs" | "math.sqrt", 1) => OpRule::AbsSqrt,
+        ("math.pow" | "math.max" | "math.min", 2) => OpRule::PowMaxMin,
+        ("math.round", 1)
+            if rd.round_ties == swr::ROUND_TIES_HALF_AWAY && t0 == Some(Ty::Float) =>
+        {
+            OpRule::Round
+        }
+        _ => return None,
+    })
 }
 
 /// Lower the root Instantiation's top level.
@@ -67,7 +164,7 @@ pub(crate) fn lower(
     syms: &SymTable,
     rd: &Readings,
     d: Dialect,
-    knobs: Knobs,
+    knobs: Knobs<'_>,
 ) -> Result<Ir, Diag> {
     let ast = files[0].ok_or_else(|| {
         diag(
@@ -183,7 +280,7 @@ struct Lower<'a> {
     /// The plain variables declared in the current region and the regions inside it (U16).
     declared: Vec<VSlot>,
     /// The compilation's knobs.
-    knobs: Knobs,
+    knobs: Knobs<'a>,
     /// `hline` plot sites in code order (indexed after every other plot, §4.14.8).
     hlines: Vec<(pine_ir::PlotKind, Span)>,
     /// Object sites so far, in code order over the expanded program (`pin:02-obj-site-order` —
@@ -493,10 +590,29 @@ impl Lower<'_> {
             ValueSrc::Call => SlotKind::Prelude {
                 value: base + i as u32,
             },
-            _ => return Err(self.todo(n, "a `Fold` value (T20)")),
+            ValueSrc::Fold => return self.fold_slot(v.bits, ty, self.ast.span(n)),
+            ValueSrc::Const => return Err(self.todo(n, "a constant row that did not fold")),
         };
         let info = self.info(ty, kind, Sym::NONE, self.ast.span(n));
         self.value_slot(n, base + i as u32, info)
+    }
+
+    /// A `ValueSrc::Fold` row's value (§4.17): its constant — in a program with a request, moved
+    /// into a slot of its own recorded in `ir.ctx_slots` (§4.11.4 `3029`, as [`Self::expr`] does
+    /// for a folded subtree).
+    fn fold_slot(&mut self, bits: u64, ty: TypeQ, at: Span) -> Result<VSlot, Diag> {
+        let Some((k, kind)) = fold_value(bits, &self.knobs) else {
+            let msg = format!("value fold code {bits} did not fold");
+            return Err(diag(ReasonCode::Internal, at, msg));
+        };
+        let c = self.konst(k, ty, at);
+        if !self.has_requests {
+            return Ok(c);
+        }
+        let t = self.temp(ty, at);
+        self.op(Op::Mov { dst: t, a: c });
+        self.ir.ctx_slots.push((t, kind));
+        Ok(t)
     }
 
     /// [`crate::ir::CTX_SYMINFO`] / [`crate::ir::CTX_TIMEFRAME`] when the folded subtree of `n`
@@ -1050,14 +1166,14 @@ impl Lower<'_> {
             s.op(Op::Un { op: k, dst, a });
             Ok(dst)
         };
-        match (full, given.len()) {
-            ("na", 1) => {
+        match op_rule(full, given.len(), arg_ty(self, 0).map(|t| t.ty), self.rd) {
+            Some(OpRule::Na) => {
                 let a = self.expr(given[0].1)?;
                 let dst = self.temp(ty, at);
                 self.op(Op::NaCheck { dst, a });
                 return Ok(dst);
             }
-            ("nz", 1 | 2) => {
+            Some(OpRule::Nz) => {
                 let a = self.expr(given[0].1)?;
                 let a = self.widen(a, arg_ty(self, 0), ty.ty);
                 let b = if given.len() == 2 {
@@ -1076,7 +1192,7 @@ impl Lower<'_> {
                 self.op(Op::Nz { dst, a, b });
                 return Ok(dst);
             }
-            ("int", 1) if arg_ty(self, 0).is_some_and(|t| t.ty == Ty::Float) => {
+            Some(OpRule::IntOfFloat) => {
                 let a = self.expr(given[0].1)?;
                 if self.rd.int_of_na == swr::INT_OF_NA_FAULT {
                     return Ok(self.call_op("$op.int_strict", &[a], ty, at));
@@ -1084,11 +1200,11 @@ impl Lower<'_> {
                 let round = self.rd.pins.int_cast == IntCast::RoundHalfAway;
                 return un(self, UnOpK::F2i { round }, a);
             }
-            ("float", 1) if arg_ty(self, 0).is_some_and(|t| t.ty == Ty::Int) => {
+            Some(OpRule::FloatOfInt) => {
                 let a = self.expr(given[0].1)?;
                 return un(self, UnOpK::I2f, a);
             }
-            ("bool", 1) if arg_ty(self, 0).is_some_and(|t| matches!(t.ty, Ty::Int | Ty::Float)) => {
+            Some(OpRule::BoolOfNum) => {
                 let t0 = arg_ty(self, 0).map_or(Ty::Int, |t| t.ty);
                 let a = self.expr(given[0].1)?;
                 let zero = if t0 == Ty::Float {
@@ -1106,7 +1222,7 @@ impl Lower<'_> {
                 });
                 return Ok(dst);
             }
-            ("math.abs", 1) | ("math.sqrt", 1) => {
+            Some(OpRule::AbsSqrt) => {
                 let a = self.expr(given[0].1)?;
                 let a = self.widen(a, arg_ty(self, 0), ty.ty);
                 let k = if full == "math.abs" {
@@ -1116,7 +1232,7 @@ impl Lower<'_> {
                 };
                 return un(self, k, a);
             }
-            ("math.pow", 2) | ("math.max", 2) | ("math.min", 2) => {
+            Some(OpRule::PowMaxMin) => {
                 let a = self.expr(given[0].1)?;
                 let a = self.widen(a, arg_ty(self, 0), ty.ty);
                 let b = self.expr(given[1].1)?;
@@ -1132,14 +1248,11 @@ impl Lower<'_> {
                 self.op(Op::Bin { op: k, dst, a, b });
                 return Ok(dst);
             }
-            ("math.round", 1)
-                if self.rd.round_ties == swr::ROUND_TIES_HALF_AWAY
-                    && arg_ty(self, 0).is_some_and(|t| t.ty == Ty::Float) =>
-            {
+            Some(OpRule::Round) => {
                 let a = self.expr(given[0].1)?;
                 return un(self, UnOpK::F2i { round: true }, a);
             }
-            _ => {}
+            None => {}
         }
         if crate::security::is_security(ov) {
             let outs = self.security(n, ov, &[ty])?;
@@ -1240,6 +1353,12 @@ impl Lower<'_> {
             _ => false, // the defaults `barmerge.gaps_off` / `barmerge.lookahead_off` (0)
         };
         let symbol = text(self, sym_n);
+        // The child's chart is the parent's for its own symbol (§4.11.8): `syminfo.tickerid`
+        // (unfolded here), `""`, the chart's key or a ticker mapped to it.
+        let own = match sym_n.and_then(|a| self.cur().k.get(a.0 as usize).copied().flatten()) {
+            Some(K::Str(t)) => symbol.is_empty() || self.knobs.own.contains(&t),
+            _ => true,
+        };
         let tf = text(self, tf_n);
         let (gaps, lookahead) = (flag(self, gaps_n), flag(self, look_n));
         let tuple = matches!(self.ast.node(e_n), Node::Tuple { .. });
@@ -1308,7 +1427,7 @@ impl Lower<'_> {
                 f
             };
             let r = match plot_ov {
-                Some(pov) => self.capture(pov, j as u64, v, at),
+                Some(pov) => self.capture(pov, j as u64, v, own, at),
                 None => Err(self.todo(n, "the `plot` capture of a request")),
             };
             let mut t_ops = std::mem::replace(&mut self.out, saved);
@@ -1334,7 +1453,23 @@ impl Lower<'_> {
 
     /// A child's `plot` capture of `v` at plot index `j` (§4.11.4): `__plot = j`, `series = v`,
     /// every other parameter its default.
-    fn capture(&mut self, pov: OverloadId, j: u64, v: VSlot, at: Span) -> Result<(), Diag> {
+    ///
+    /// `pin:02-child-capture-decl-defaults` — a child has no declaration (§4.11.8 lists its
+    /// options, none of them the parent's `indicator()` / `strategy()`; §4.11.9: nothing in a child
+    /// depends on the parent's source), so the capture's `decl_format` / `decl_precision` defaults
+    /// read the declaration row's own defaults, not the parent's arguments: `format.inherit`, and
+    /// `sym_precision` of the **child's** mintick — the parent's for its own symbol, else 0 (the
+    /// zeroed `ChartInfo`), whose fewest exact decimals are 0. Two scripts requesting the same
+    /// thing therefore share the child and its key (I18, law P4).
+    fn capture(
+        &mut self,
+        pov: OverloadId,
+        j: u64,
+        v: VSlot,
+        own: bool,
+        at: Span,
+    ) -> Result<(), Diag> {
+        use crate::overload::DefaultSrc;
         let o = pine_spec::overload(pov);
         let ps = pine_spec::params(o);
         let mut av = Vec::with_capacity(ps.len());
@@ -1356,7 +1491,12 @@ impl Lower<'_> {
                 av.push(Arg::Slot(v));
                 continue;
             }
-            av.push(self.default_arg(self.ast.root(), o, k as u16, &[], p.sig.ty, at)?);
+            let a = match crate::overload::default_src(o, k as u16, &[]) {
+                DefaultSrc::DeclFormat => self.child_decl_arg("format", p.sig.ty, own, at)?,
+                DefaultSrc::DeclPrecision => self.child_decl_arg("precision", p.sig.ty, own, at)?,
+                _ => self.default_arg(self.ast.root(), o, k as u16, &[], p.sig.ty, at)?,
+            };
+            av.push(a);
         }
         // `plot` returns its handle (the ordinal, `n_out = 1`): the window's last word is an
         // output the body writes, never one of the inputs.
@@ -1377,6 +1517,38 @@ impl Lower<'_> {
             span: at,
         });
         Ok(())
+    }
+
+    /// A child capture's `decl_format` / `decl_precision` default: the `indicator()` row's own
+    /// default for `name` (`strategy()`'s are the same), `sym_precision` over the child's mintick
+    /// (`pin:02-child-capture-decl-defaults`).
+    fn child_decl_arg(&mut self, name: &str, t: TypeQ, own: bool, at: Span) -> Result<Arg, Diag> {
+        let d = self.d;
+        let dv = pine_spec::lookup("indicator")
+            .and_then(|e| {
+                (e.ov_lo..e.ov_hi)
+                    .map(|i| pine_spec::overload(OverloadId(i)))
+                    .find(|o| o.versions.has(d))
+            })
+            .and_then(|o| {
+                pine_spec::params(o)
+                    .iter()
+                    .find(|p| p.versions.has(d) && p.name.as_str() == name)
+            })
+            .map(|p| p.default);
+        let Some(dv) = dv else {
+            let msg = format!("the declaration row has no `{name}`");
+            return Err(diag(ReasonCode::Internal, at, msg));
+        };
+        if dv.kind == pine_spec::DefaultKind::Derived
+            && pine_spec::derived::code(dv.bits) == pine_spec::derived::SYM_PRECISION
+        {
+            let mintick = if own { self.knobs.mintick_1e6 } else { 0 };
+            let p = crate::overload::sym_precision(mintick);
+            let c = self.konst(K::Int(p), scalar(Ty::Int, Qual::Const), at);
+            return Ok(Arg::Slot(c));
+        }
+        self.literal_arg(dv, t, at)
     }
 
     /// One `CALL_BUILTIN` with its window and one fresh output per `tys` (§4.14.5).
@@ -2793,10 +2965,7 @@ impl Lower<'_> {
                 };
                 return Ok(Arg::Slot(self.konst(k, v.ty, at)));
             }
-            ValueSrc::Fold => {
-                let msg = "not implemented: lowering a `Fold` default (T20)".to_owned();
-                return Err(diag(ReasonCode::Internal, at, msg));
-            }
+            ValueSrc::Fold => return Ok(Arg::Slot(self.fold_slot(v.bits, v.ty, at)?)),
         };
         let info = self.info(v.ty, kind, Sym::NONE, at);
         let root = self.ast.root();

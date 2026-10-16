@@ -129,7 +129,7 @@ fn readings_for_counter_shadow_both() {
     r.pins.for_counter_shadow = ForCounterShadow::Shadow;
     assert_eq!(codes(src, &r), vec![ACCEPTED]);
     let src_in = "s = 0\nfor x in array.from(1, 2)\n    x = 5\n    s += x\nplot(s)\n";
-    assert_eq!(codes(src_in, &r), vec![NOT_IMPLEMENTED]);
+    assert_eq!(codes(src_in, &r), vec![ACCEPTED]);
     r.pins.for_counter_shadow = ForCounterShadow::Refuse;
     assert_eq!(codes(src_in, &r), vec![3041]);
 }
@@ -228,6 +228,42 @@ fn readings_ta_in_loop_per_iteration_dynamic_is_refused() {
         .any(|s| matches!(s, crate::ir::Stmt::Loop { .. })));
 }
 
+/// U13 inside a request's expression: the loop of the detached `E` block unrolls too, and the
+/// compiled child holds one `ta.sma` site per copy.
+#[test]
+fn readings_ta_in_loop_per_iteration_unrolls_in_a_request() {
+    use crate::ir::Stmt;
+    let body = "f() =>\n    s = 0.0\n    for i = 0 to 2\n        s += ta.sma(close, 5)\n    s\n\
+                plot(request.security(syminfo.tickerid, \"D\", f()[1]))\n";
+    let r = pine_spec::swr::TA_IN_LOOP_PER_ITERATION;
+    let ir = ta_in_loop(body, r).expect("lowers");
+    assert_eq!(ir.requests.len(), 1);
+    let e = &ir.requests[0].e;
+    assert!(e
+        .0
+        .iter()
+        .any(|s| matches!(s, Stmt::Unrolled { copies } if copies.len() == 3)));
+    assert!(!e.0.iter().any(|s| matches!(s, Stmt::Loop { .. })));
+    // The whole program: the child owns the three per-copy sites.
+    let prog = |reading: u8| {
+        let mut rd = Readings::of(Dialect::V6);
+        rd.ta_in_loop = reading;
+        let src = format!("//@version=6\nindicator(\"t\")\n{body}");
+        let mut syms = SymTable::new();
+        let ast = pine_lang::parse(&src, FileId::ROOT, &mut syms).expect("parses");
+        compile_with(&ast, syms, &opts(Dialect::V6), &mut LibCache::empty(), &rd).expect("compiles")
+    };
+    let (unrolled, per_call) = (prog(r), prog(pine_spec::swr::TA_IN_LOOP_PER_CALL));
+    let states = |p: &pine_ir::PineProgram| p.subprograms[0].program.layout.states.len();
+    assert_eq!(states(&per_call), 1);
+    assert_eq!(states(&unrolled), 3, "one site per copy, in the child");
+    assert_eq!(
+        unrolled.layout.states.len(),
+        per_call.layout.states.len(),
+        "the parent is unchanged"
+    );
+}
+
 // ---- `pin:06-cond-call-state` (§4.7.5, `hoist.rs`) -------------------------------------------
 
 fn cond_call(body: &str, pin: crate::pins::CondCallState) -> Result<crate::ir::Ir, pine_ir::Diag> {
@@ -275,6 +311,27 @@ fn readings_cond_call_state_every_bar_hoists() {
             ..
         })
     )));
+}
+
+/// `EveryBar` inside a request's expression: the conditional call of the detached `E` block is
+/// hoisted before its region there.
+#[test]
+fn readings_cond_call_state_every_bar_hoists_in_a_request() {
+    use crate::ir::{Op, Stmt};
+    let body = "f() =>\n    x = 0.0\n    if bar_index % 2 == 0\n        x := ta.sma(close * 2, 3)\n    x\n\
+                plot(request.security(syminfo.tickerid, \"D\", f()[1]))\n";
+    let sma = pine_ir::OverloadId(pine_spec::lookup("ta.sma").expect("ta.sma").ov_lo);
+    let top = |ir: &crate::ir::Ir| {
+        ir.requests[0]
+            .e
+            .0
+            .iter()
+            .any(|s| matches!(s, Stmt::Op(Op::Call { ov, .. }) if *ov == sma))
+    };
+    let ir = cond_call(body, crate::pins::CondCallState::ExecutedOnly).expect("lowers");
+    assert!(!top(&ir), "the call stays in its block");
+    let ir = cond_call(body, crate::pins::CondCallState::EveryBar).expect("lowers");
+    assert!(top(&ir), "the call runs on every child bar");
 }
 
 #[test]

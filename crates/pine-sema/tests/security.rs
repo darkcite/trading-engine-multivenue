@@ -480,16 +480,11 @@ fn security_lookahead_of_a_bar_reading_call_is_refused() {
     }
 }
 
-/// `3029` or, until a folded `syminfo.*` / `timeframe.*` value lowers outside a request's
-/// targets (T20: `3255 not implemented: lowering a \`Fold\` value`), that gap — the 5a check is
-/// in place (`ir.ctx_slots`) and binds by itself once the fold lowers.
+/// `3029`: a folded `syminfo.*` / `timeframe.*` value in the cone of a request for another
+/// symbol / timeframe (§4.11.4; the fold lowers into an `ir.ctx_slots` slot, §4.17).
 fn ctx_mix(body: &str) -> bool {
     let r = compile_src(&format!("//@version=6\nindicator(\"t\")\n{body}"), &opts());
-    let v = codes(&r);
-    v == [3029]
-        || r.err().is_some_and(|ds| {
-            ds.len() == 1 && ds[0].code.0 == 3255 && ds[0].msg.contains("lowering a `Fold` value")
-        })
+    codes(&r) == [3029]
 }
 
 #[test]
@@ -511,6 +506,12 @@ fn security_syminfo_of_other_symbol_is_refused() {
     assert!(ctx_mix(
         "plot(request.security(syminfo.tickerid, \"D\", close * timeframe.multiplier))\n"
     ));
+    assert!(ctx_mix(&format!(
+        "t = syminfo.ticker\nplot(request.security({eth}, \"60\", t == \"BTCUSDT\" ? close : 0))\n"
+    )));
+    let own = "plot(request.security(syminfo.tickerid, \"60\", close * syminfo.mintick))\n";
+    let r = compile_src(&format!("//@version=6\nindicator(\"t\")\n{own}"), &opts());
+    assert!(r.is_ok(), "the chart's own symbol and timeframe: {r:?}");
 }
 
 /// I19: an admitted `lookahead_on` cone never reads its current bar — run each child on the VM,

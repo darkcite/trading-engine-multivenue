@@ -165,11 +165,14 @@ fn decl_risk_rules_are_folded() {
     );
     assert_eq!(d.strategy.flags & decl_flag::DRAWDOWN_PCT, 0);
     // `max_drawdown` / `max_intraday_loss` take `type = strategy.percent_of_equity` / `cash`
-    // (const int codes, I26); pine-spec types that parameter `string` (a data defect the lead
-    // fixes there), so the call is `3007` until then and its fold is not reachable here.
+    // (const int codes, I26; pine-spec types the parameter `int` since the 2026-10-16 data pass).
     let dd = "//@version=6\nstrategy(\"s\")\nstrategy.risk.max_drawdown(10, strategy.percent_of_equity)\n\
-              plot(close)\n";
-    assert_eq!(fold(dd, Dialect::V6).1, vec![3007]);
+              strategy.risk.max_intraday_loss(250, strategy.cash)\nplot(close)\n";
+    let d = ok(dd, Dialect::V6);
+    assert_eq!(d.strategy.risk.max_drawdown_1e6, 10_000_000);
+    assert_eq!(d.strategy.risk.max_intraday_loss_1e6, 250_000_000);
+    assert_ne!(d.strategy.flags & decl_flag::DRAWDOWN_PCT, 0);
+    assert_eq!(d.strategy.flags & decl_flag::INTRADAY_LOSS_PCT, 0);
 }
 
 #[test]

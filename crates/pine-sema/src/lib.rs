@@ -116,11 +116,25 @@ fn compile_with(
             .iter()
             .all(|d| d.code.0 == 3024 && d.msg.contains(" unserved=1"));
         if accepted && !tree.nodes.is_empty() {
+            let d = ast.dialect();
+            // 5a's `target` (§4.11.8): the chart's key, or a ticker mapped to it.
+            let own: Vec<pine_ir::Sym> = std::iter::once(opts.symbol_key.as_str())
+                .chain(
+                    opts.ticker_map
+                        .iter()
+                        .filter(|m| m.1 == opts.symbol_key)
+                        .map(|m| m.0.as_str()),
+                )
+                .filter_map(|t| syms.get(t))
+                .collect();
             let knobs = lower::Knobs {
                 cap: opts.limits.collection_cap,
                 mintick_1e6: opts.chart.mintick_1e6,
+                pointvalue_1e6: opts.chart.pointvalue_1e6,
+                timeframe_s: opts.chart.timeframe_s,
+                strs: fold_strs(&files, opts, d, &mut syms),
+                own: &own,
             };
-            let d = ast.dialect();
             let ir = lower::lower(&typed, &tree, &resolved, &files, &syms, rd, d, knobs);
             let udt_fields: Vec<u16> = typed.udts.iter().map(|u| u.fields.len() as u16).collect();
             // §4.10.4: the effective cap `C = M` when the manifest sets one (a declared `D > M`
@@ -146,6 +160,7 @@ fn compile_with(
                     cap,
                     udt_fields: &udt_fields,
                     depth: 0,
+                    bare: decl.bare,
                 };
                 let subs =
                     security::cone::extract(&mut ir, &scx, &mut security::cone::Tree::default())?;
@@ -184,6 +199,40 @@ fn compile_with(
         diags.push(diag(ReasonCode::Internal, ast.span(ast.root()), msg));
     }
     Err(finish(diags))
+}
+
+/// The folded strings of §4.17 (`lower::Knobs::strs`), interned only when some file reads a
+/// string `ValueSrc::Fold` row (a `Field` whose member names one), so a program that reads none
+/// keeps its symbol table.
+fn fold_strs(
+    files: &[Option<&pine_lang::Ast>],
+    opts: &CompileOpts,
+    d: pine_ir::Dialect,
+    syms: &mut SymTable,
+) -> [pine_ir::Sym; 6] {
+    const MEMBERS: [&str; 6] = [
+        "tickerid",
+        "ticker",
+        "basecurrency",
+        "currency",
+        "type",
+        "period",
+    ];
+    let reads = files.iter().flatten().any(|a| {
+        (0..a.len() as u32).any(|i| match a.node(pine_ir::NodeId(i)) {
+            pine_lang::Node::Field { member, .. } => MEMBERS.contains(&syms.resolve(a.sym(member))),
+            _ => false,
+        })
+    });
+    if !reads {
+        return [pine_ir::Sym::NONE; 6];
+    }
+    let mut buf = [0u8; 8];
+    let n = pine_std::tf_string(opts.chart.timeframe_s, d, &mut buf);
+    let period = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    let s = &opts.syminfo_strs;
+    let texts = [opts.symbol_key.as_str(), &s[0], &s[1], &s[2], &s[3], period];
+    texts.map(|t| syms.intern(t))
 }
 
 /// What the back half reads from the front.
@@ -280,7 +329,8 @@ fn back(
 }
 
 /// A `request.security` child (§4.11.5, §4.11.8): its own pass 5a one level deeper, then the
-/// whole back half under its own options — no declaration (`Decl::default()`), no inputs, the
+/// whole back half under its own options — no declaration (`Decl::child`: §4.16's `Indicator` and
+/// the argument-less `strategy()` fold), no inputs, the
 /// parent's effective cap (`pin:02-child-cap-parent`: the child has no declaration of its own; the
 /// cap that sized the parent's windows sizes the cone's).
 fn child(
@@ -296,6 +346,7 @@ fn child(
         cap: parent.cap,
         udt_fields: parent.udt_fields,
         depth: parent.depth + 1,
+        bare: parent.bare,
     };
     let subs = security::cone::extract(&mut ir, &scx, tree)?;
     let cx = sites::SiteCtx {
@@ -306,7 +357,7 @@ fn child(
         udt_fields: parent.udt_fields,
     };
     let sites = sites::number(&ir, &cx)?;
-    let decl = decl::Decl::default();
+    let decl = decl::Decl::child(parent.bare);
     let fe = Front {
         decl: &decl,
         inputs: &[],
