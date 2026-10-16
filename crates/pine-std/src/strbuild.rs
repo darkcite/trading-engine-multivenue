@@ -156,9 +156,12 @@ pub fn bi_replace(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), Faul
     // and its pieces live in other strings — a rope of views rejected (contract §3.7: a string
     // is one (off, len) value).
     dst[..at].copy_from_slice(&s[..at]);
-    // COPY: as above (the replacement piece).
+    // COPY: the replacement into the output range after the head, <= len(replacement) — the
+    // result is one contiguous new string — a rope of views rejected (contract §3.7).
     dst[at..at + nr].copy_from_slice(rp);
-    // COPY: as above (the tail after the match).
+    // COPY: the source's tail after the match into the output range, <= len(source) - at -
+    // len(target) — the result is one contiguous new string — a rope of views rejected
+    // (contract §3.7).
     dst[at + nr..].copy_from_slice(&s[at + nt..]);
     f.set_i64_arg(args[4], Some(r.0 as i64));
     Ok(())
@@ -205,12 +208,15 @@ pub fn bi_replace_all(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), 
         // a rope of views rejected (contract §3.7: a string is one (off, len) value).
         dst[w..w + (i - from)].copy_from_slice(&s[from..i]);
         w += i - from;
-        // COPY: as above (the replacement piece).
+        // COPY: the replacement after each unmatched run into the output range, <= len(replacement)
+        // per match, <= the sized total in all — one contiguous new string — a rope of views
+        // rejected (contract §3.7).
         dst[w..w + nr].copy_from_slice(rp);
         w += nr;
         from = i + nt;
     }
-    // COPY: as above (the tail after the last match).
+    // COPY: the source's tail after the last match into the output range, <= len(source) —
+    // one contiguous new string — a rope of views rejected (contract §3.7).
     dst[w..].copy_from_slice(&s[from..]);
     debug_assert!(w + (ns - from) == dst.len());
     f.set_i64_arg(args[3], Some(r.0 as i64));
@@ -262,7 +268,8 @@ pub fn bi_repeat(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), Fault
             dst[w..w + sep.len()].copy_from_slice(sep);
             w += sep.len();
         }
-        // COPY: one repeat of the source into the output range, <= the sized total — as above.
+        // COPY: one repeat of the source into the output range, <= len(source) per repeat, <= the
+        // sized total in all — one contiguous new string — a rope of views rejected (contract §3.7).
         dst[w..w + s.len()].copy_from_slice(s);
         w += s.len();
         i += 1;

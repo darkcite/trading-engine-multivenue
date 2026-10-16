@@ -2360,6 +2360,86 @@ const fn build() -> Built {
     );
     put(
         &mut b,
+        ov::ARRAY_REVERSE,
+        row(ov::ARRAY_REVERSE, cs::bi_array_reverse, 8, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_MIN_F,
+        row(ov::ARRAY_MIN_F, cs::bi_array_min, 16, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_MIN_I,
+        row(ov::ARRAY_MIN_I, cs::bi_array_min, 16, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_MAX_F,
+        row(ov::ARRAY_MAX_F, cs::bi_array_max, 16, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_MAX_I,
+        row(ov::ARRAY_MAX_I, cs::bi_array_max, 16, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_RANGE_F,
+        row(ov::ARRAY_RANGE_F, cs::bi_array_range, 8, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_RANGE_I,
+        row(ov::ARRAY_RANGE_I, cs::bi_array_range, 8, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_EVERY,
+        row(ov::ARRAY_EVERY, cs::bi_array_every, 4, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_SOME,
+        row(ov::ARRAY_SOME, cs::bi_array_some, 4, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_SUM_I,
+        row(ov::ARRAY_SUM_I, cs::bi_array_sum_i, 4, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_BINARY_SEARCH_AF,
+        row(ov::ARRAY_BINARY_SEARCH_AF, cs::bi_array_binary_search, 4, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_BINARY_SEARCH_AI,
+        row(ov::ARRAY_BINARY_SEARCH_AI, cs::bi_array_binary_search, 4, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_BINARY_SEARCH_LEFTMOST_AF,
+        row(ov::ARRAY_BINARY_SEARCH_LEFTMOST_AF, cs::bi_array_binary_search_leftmost, 4, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_BINARY_SEARCH_LEFTMOST_AI,
+        row(ov::ARRAY_BINARY_SEARCH_LEFTMOST_AI, cs::bi_array_binary_search_leftmost, 4, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AF,
+        row(ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AF, cs::bi_array_binary_search_rightmost, 4, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AI,
+        row(ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AI, cs::bi_array_binary_search_rightmost, 4, 0, Blk::None),
+    );
+    put(
+        &mut b,
         ov::MAP_GET,
         row(ov::MAP_GET, cm::bi_map_get, 4, 0, Blk::None),
     );

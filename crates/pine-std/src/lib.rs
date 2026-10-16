@@ -38,9 +38,9 @@ pub mod scope;
 pub mod testing;
 
 pub use load::{
-    code, fmt_compile, regex_compile, regex_compile_into, resolve_input, session_parse,
-    tf_on_bar_clock, tf_parts, tf_seconds, tf_string, tz_lookup, tz_offset_s, FmtProg,
-    InputResolved, LoadErr, RegexProg, SessionRange, SessionSpec, TfParts, TfUnit, TzId,
+    code, fmt_compile, fmt_compile_into, regex_compile, regex_compile_into, resolve_input,
+    session_parse, tf_on_bar_clock, tf_parts, tf_seconds, tf_string, tz_lookup, tz_offset_s,
+    FmtProg, InputResolved, LoadErr, RegexProg, SessionRange, SessionSpec, TfParts, TfUnit, TzId,
     FMT_MAX_SEGMENTS, MONTH_SORT_S, REGEX_MAX_STATES, TZ_UTC,
 };
 pub use coll::{coll_block_bytes, VIEW_BLOCK_BYTES};

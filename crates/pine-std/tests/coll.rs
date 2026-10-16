@@ -1094,3 +1094,190 @@ fn str_split_const_source_is_views() {
         Err(FaultKind::PoolFull)
     );
 }
+
+/// T34 (first part-2 cut): `array.reverse` in place (a view reverses its window of the owner; a
+/// string array moves its element words, the cells stay); `min` / `max` with `nth`
+/// (`pin:04-array-nth`: rank of the non-na values, duplicates counted; past the count → na);
+/// `range` (na skipped, all na → na); `every` / `some` (`pin:04-array-every-some`); 0 B/op.
+#[test]
+fn array_part2_reverse_rank_range_every_some() {
+    let b = float_block(8);
+    let calls = vec![
+        new(ov::ARRAY_NEW_FLOAT, Ty::Float, 8, b, vec![it(0), ft(0.0)]),
+        c(ov::ARRAY_PUSH, vec![o(0), ft(5.0)], &[]),
+        c(ov::ARRAY_PUSH, vec![o(0), ft(f64::NAN)], &[]),
+        c(ov::ARRAY_PUSH, vec![o(0), ft(-2.0)], &[]),
+        c(ov::ARRAY_PUSH, vec![o(0), ft(9.0)], &[]),
+        c(ov::ARRAY_PUSH, vec![o(0), ft(5.0)], &[]), // 5 na -2 9 5
+        c(ov::ARRAY_MIN_F, vec![o(0), it(0)], F),    // 6: -2
+        c(ov::ARRAY_MIN_F, vec![o(0), it(2)], F),    // 7: -2 5 5 9 → 5
+        c(ov::ARRAY_MAX_F, vec![o(0), it(1)], F),    // 8: 9 5 5 -2 → 5 (second highest)
+        c(ov::ARRAY_MAX_F, vec![o(0), it(3)], F),    // 9: -2
+        c(ov::ARRAY_MAX_F, vec![o(0), it(4)], F),    // 10: past the 4 non-na → na
+        c(ov::ARRAY_MIN_F, vec![o(0), it(-1)], F),   // 11: negative → na
+        c(ov::ARRAY_RANGE_F, vec![o(0)], F),         // 12: 11
+        c(ov::ARRAY_REVERSE, vec![o(0)], &[]),       // 5 9 -2 na 5
+        c(ov::ARRAY_GET, vec![o(0), it(1)], F),      // 14: 9
+        c(ov::ARRAY_GET, vec![o(0), it(3)], F),      // 15: na
+        new(ov::ARRAY_SLICE, Ty::Float, 0, 32, vec![o(0), it(1), it(4)]), // 16: 9 -2 na
+        c(ov::ARRAY_REVERSE, vec![o(16)], &[]),      // owner: 5 na -2 9 5
+        c(ov::ARRAY_GET, vec![o(0), it(1)], F),      // 18: na
+        c(ov::ARRAY_GET, vec![o(0), it(3)], F),      // 19: 9
+        c(ov::ARRAY_MIN_F, vec![o(16), it(0)], F),   // 20: -2 through the view
+    ];
+    let r = once(&calls, Dialect::V6).unwrap();
+    assert_eq!((r[6], r[7], r[8], r[9]), (-2.0, 5.0, 5.0, -2.0));
+    assert!(r[10].is_nan() && r[11].is_nan());
+    assert_eq!(r[12], 11.0);
+    assert_eq!(r[14], 9.0);
+    assert!(r[15].is_nan());
+    assert!(r[18].is_nan(), "the view reversed its window of the owner");
+    assert_eq!((r[19], r[20]), (9.0, -2.0));
+    // Ints: na skipped; an all-na array → na; range of one value is 0.
+    let ib = coll_block_bytes(CollKind::Array, Ty::Int, Ty::Void, 4, 16);
+    let calls = vec![
+        new(ov::ARRAY_NEW_INT, Ty::Int, 4, ib, vec![it(2), NA_I]),
+        c(ov::ARRAY_MIN_I, vec![o(0), it(0)], I), // 1: na
+        c(ov::ARRAY_RANGE_I, vec![o(0)], I),      // 2: na
+        c(ov::ARRAY_PUSH, vec![o(0), it(-7)], &[]),
+        c(ov::ARRAY_MAX_I, vec![o(0), it(0)], I), // 4: -7
+        c(ov::ARRAY_RANGE_I, vec![o(0)], I),      // 5: 0
+        c(ov::ARRAY_PUSH, vec![o(0), it(4)], &[]),
+        c(ov::ARRAY_RANGE_I, vec![o(0)], I),     // 7: 11
+        c(ov::ARRAY_MAX_I, vec![o(0), NA_I], I), // 8: na nth → na
+        c(ov::ARRAY_SUM_I, vec![o(0)], I),       // 9: -3, na skipped
+    ];
+    let r = once(&calls, Dialect::V6).unwrap();
+    assert!(r[1].is_nan() && r[2].is_nan() && r[8].is_nan());
+    assert_eq!((r[4], r[5], r[7], r[9]), (-7.0, 0.0, 11.0, -3.0));
+    let calls = vec![
+        new(ov::ARRAY_NEW_INT, Ty::Int, 4, ib, vec![it(2), NA_I]),
+        c(ov::ARRAY_SUM_I, vec![o(0)], I), // all na → na
+        c(ov::ARRAY_PUSH, vec![o(0), it(i64::MAX)], &[]),
+        c(ov::ARRAY_PUSH, vec![o(0), it(2)], &[]),
+        c(ov::ARRAY_SUM_I, vec![o(0)], I), // pin:04-array-sum-int: wraps
+    ];
+    let r = once(&calls, Dialect::V6).unwrap();
+    assert!(r[1].is_nan());
+    assert_eq!(r[4], (i64::MAX.wrapping_add(2)) as f64);
+    // Strings: reverse moves the element words (CONST refs and an owned cell alike).
+    let sb = coll_block_bytes(CollKind::Array, Ty::String, Ty::Void, 4, 16);
+    let calls = vec![
+        new(
+            ov::ARRAY_NEW_STRING,
+            Ty::String,
+            4,
+            sb,
+            vec![it(1), st("x")],
+        ),
+        c(ov::OP_ADD_STR, vec![st("a"), st("b")], I),
+        c(ov::ARRAY_PUSH, vec![o(0), o(1)], &[]),
+        c(ov::ARRAY_PUSH, vec![o(0), st("z")], &[]), // x ab z
+        c(ov::ARRAY_REVERSE, vec![o(0)], &[]),       // z ab x
+        c(ov::ARRAY_INDEXOF, vec![o(0), st("z")], I),
+        c(ov::ARRAY_INDEXOF, vec![o(0), st("ab")], I),
+        c(ov::ARRAY_INDEXOF, vec![o(0), st("x")], I),
+    ];
+    let r = once(&calls, Dialect::V6).unwrap();
+    assert_eq!((r[5], r[6], r[7]), (0.0, 1.0, 2.0));
+    // every / some: v6 bools; an empty array is every = true, some = false.
+    let bb = coll_block_bytes(CollKind::Array, Ty::Bool, Ty::Void, 4, 16);
+    let calls = vec![
+        new(ov::ARRAY_NEW_BOOL, Ty::Bool, 4, bb, vec![it(0), NA_I]),
+        c(ov::ARRAY_EVERY, vec![o(0)], I), // 1: true
+        c(ov::ARRAY_SOME, vec![o(0)], I),  // 2: false
+        c(ov::ARRAY_PUSH, vec![o(0), it(1)], &[]),
+        c(ov::ARRAY_PUSH, vec![o(0), it(1)], &[]),
+        c(ov::ARRAY_EVERY, vec![o(0)], I), // 5: true
+        c(ov::ARRAY_PUSH, vec![o(0), it(0)], &[]),
+        c(ov::ARRAY_EVERY, vec![o(0)], I), // 7: false
+        c(ov::ARRAY_SOME, vec![o(0)], I),  // 8: true
+    ];
+    let r = once(&calls, Dialect::V6).unwrap();
+    assert_eq!((r[1], r[2], r[5], r[7], r[8]), (1.0, 0.0, 1.0, 0.0, 1.0));
+    // v5: an na bool element is not true.
+    let calls = vec![
+        new(ov::ARRAY_NEW_BOOL, Ty::Bool, 4, bb, vec![it(1), NA_I]),
+        c(ov::ARRAY_EVERY, vec![o(0)], I),
+        c(ov::ARRAY_SOME, vec![o(0)], I),
+    ];
+    let r = once(&calls, Dialect::V5).unwrap();
+    assert_eq!((r[1], r[2]), (0.0, 0.0));
+    // 0 B/op: created on bar 0, a push, reverse, min/max/range every bar.
+    let mut owner = new(
+        ov::ARRAY_NEW_FLOAT,
+        Ty::Float,
+        64,
+        float_block(64),
+        vec![it(0), ft(0.0)],
+    );
+    owner.guard = Some(0);
+    let calls = vec![
+        owner,
+        c(ov::ARRAY_PUSH, vec![o(0), (Lane::F64, Src::Feed(1))], &[]),
+        c(ov::ARRAY_REVERSE, vec![o(0)], &[]),
+        c(ov::ARRAY_MAX_F, vec![o(0), it(2)], F),
+        c(ov::ARRAY_RANGE_F, vec![o(0)], F),
+    ];
+    let feed: Vec<Vec<f64>> = (0..40)
+        .map(|i| vec![(i == 0) as u8 as f64, ((i * 37) % 23) as f64])
+        .collect();
+    let (r, a) = run(&calls, &feed, Dialect::V6);
+    let r = r.unwrap();
+    assert_eq!(r[39][4], 22.0);
+    assert_eq!(a, 0, "array part 2 allocated");
+}
+
+/// T34: `binary_search*` over ascending float and int arrays (`pin:04-binary-search`): the
+/// reference's examples (leftmost(3) on `-2 0 1 5 9` is 2, rightmost(3) is 3), first / last
+/// occurrence of a duplicate, the two ends, an na value; an int array takes a float value.
+#[test]
+fn array_binary_search_rows() {
+    let b = float_block(8);
+    let mut calls = vec![new(
+        ov::ARRAY_NEW_FLOAT,
+        Ty::Float,
+        8,
+        b,
+        vec![it(0), ft(0.0)],
+    )];
+    for x in [-2.0, 0.0, 1.0, 5.0, 5.0, 9.0, f64::NAN] {
+        calls.push(c(ov::ARRAY_PUSH, vec![o(0), ft(x)], &[]));
+    }
+    let g0 = calls.len();
+    let probes: [(OverloadId, f64, f64); 11] = [
+        (ov::ARRAY_BINARY_SEARCH_AF, 5.0, 3.0),
+        (ov::ARRAY_BINARY_SEARCH_AF, 3.0, -1.0),
+        (ov::ARRAY_BINARY_SEARCH_AF, f64::NAN, -1.0),
+        (ov::ARRAY_BINARY_SEARCH_LEFTMOST_AF, 3.0, 2.0),
+        (ov::ARRAY_BINARY_SEARCH_LEFTMOST_AF, 5.0, 3.0),
+        (ov::ARRAY_BINARY_SEARCH_LEFTMOST_AF, -5.0, -1.0),
+        (ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AF, 3.0, 3.0),
+        (ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AF, 5.0, 4.0),
+        (ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AF, 10.0, 6.0),
+        (ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AF, f64::NAN, -1.0),
+        (ov::ARRAY_BINARY_SEARCH_AF, 9.0, 5.0),
+    ];
+    for (id, v, _) in probes {
+        calls.push(c(id, vec![o(0), ft(v)], I));
+    }
+    let r = once(&calls, Dialect::V6).unwrap();
+    for (k, (_, v, want)) in probes.iter().enumerate() {
+        assert_eq!(r[g0 + k], *want, "probe {k} ({v})");
+    }
+    let ib = coll_block_bytes(CollKind::Array, Ty::Int, Ty::Void, 4, 16);
+    let calls = vec![
+        new(ov::ARRAY_NEW_INT, Ty::Int, 4, ib, vec![it(0), it(0)]),
+        c(ov::ARRAY_PUSH, vec![o(0), it(1)], &[]),
+        c(ov::ARRAY_PUSH, vec![o(0), it(3)], &[]),
+        c(ov::ARRAY_PUSH, vec![o(0), it(3)], &[]),
+        c(ov::ARRAY_PUSH, vec![o(0), it(7)], &[]),
+        c(ov::ARRAY_BINARY_SEARCH_AI, vec![o(0), ft(3.0)], I), // 5: 1
+        c(ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AI, vec![o(0), ft(3.0)], I), // 6: 2
+        c(ov::ARRAY_BINARY_SEARCH_AI, vec![o(0), ft(3.5)], I), // 7: -1
+        c(ov::ARRAY_BINARY_SEARCH_LEFTMOST_AI, vec![o(0), ft(3.5)], I), // 8: 2
+        c(ov::ARRAY_BINARY_SEARCH_LEFTMOST_AI, vec![o(0), ft(0.0)], I), // 9: -1
+    ];
+    let r = once(&calls, Dialect::V6).unwrap();
+    assert_eq!((r[5], r[6], r[7], r[8], r[9]), (1.0, 2.0, -1.0, 2.0, -1.0));
+}

@@ -427,6 +427,48 @@ fn fmt_templates_accept_and_refuse() {
     assert_eq!(fmt_compile(b"it''s").unwrap().segments(), 2);
 }
 
+/// Audit item 1 (`pin:04-fmt-int-cap`): a number pattern's integer zeros and its grouping size
+/// are `u8`s — 255 is accepted, 256 and 257 are 5005 `BAD_FORMAT` (never a debug overflow panic
+/// or a release wrap / truncation), as a 17th fraction digit is; `#` runs are not capped.
+#[test]
+fn fmt_int_digits_and_group_are_capped() {
+    let num = |body: String| format!("{{0,number,{body}}}");
+    for (n, ok) in [(255, true), (256, false), (257, false)] {
+        let r = fmt_compile(num("0".repeat(n)).as_bytes());
+        assert_eq!(r.is_ok(), ok, "{n} zeros");
+        if let Err(e) = r {
+            assert_eq!(e.code, code::BAD_FORMAT, "{n} zeros");
+        }
+    }
+    for (n, ok) in [(255, true), (256, false), (257, false)] {
+        let r = fmt_compile(num(format!("#,{}", "#".repeat(n))).as_bytes());
+        assert_eq!(r.is_ok(), ok, "group {n}");
+        if let Err(e) = r {
+            assert_eq!(e.code, code::BAD_FORMAT, "group {n}");
+        }
+    }
+    // 256 zeros after a 1-digit group: the zero cap binds, not the group cap.
+    let e = fmt_compile(num(format!("#,{}", "0".repeat(256))).as_bytes()).unwrap_err();
+    assert_eq!(e.code, code::BAD_FORMAT);
+    assert!(fmt_compile(num("#".repeat(300)).as_bytes()).is_ok());
+}
+
+/// `fmt_compile_into` (the run-time form) resets the caller's program: a long template then a
+/// short one compiles exactly as `fmt_compile` of the short one; a failed compile reports 5005.
+#[test]
+fn fmt_compile_into_reuses_the_callers_program() {
+    let mut p = FmtProg::EMPTY;
+    fmt_compile_into(b"{0}{1,number,#.#}{2,date}{3}{4}{5}{6}{7}", &mut p).unwrap();
+    assert_eq!((p.segments(), p.max_arg()), (8, Some(7)));
+    fmt_compile_into(b"a{2}b", &mut p).unwrap();
+    let q = fmt_compile(b"a{2}b").unwrap();
+    assert_eq!((p.segments(), p.max_arg()), (q.segments(), q.max_arg()));
+    let e = fmt_compile_into(b"{0", &mut p).unwrap_err();
+    assert_eq!(e.code, code::BAD_FORMAT);
+    fmt_compile_into(b"plain", &mut p).unwrap();
+    assert_eq!((p.segments(), p.max_arg()), (1, None));
+}
+
 fn desc(kind: InputKind, ty: Ty, flags: u16, min: u64, max: u64) -> InputDesc {
     InputDesc {
         kind,

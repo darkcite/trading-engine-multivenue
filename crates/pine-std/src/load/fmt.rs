@@ -16,6 +16,10 @@ pub const FMT_MAX_SEGMENTS: usize = 32;
 const MAX_PATS: usize = 8;
 const MAX_ARG: u32 = 14;
 const MAX_FRAC: u8 = 16;
+/// `pin:04-fmt-int-cap`: at most 255 `0` digits in a pattern's integer part and a grouping size
+/// of at most 255 (both are `u8` in [`NumPat`]); one more is 5005 `BAD_FORMAT`, as a 17th
+/// fraction digit is. The reference names no bound.
+pub(crate) const MAX_INT: u32 = 255;
 
 /// Segment kinds.
 pub(crate) mod seg {
@@ -42,6 +46,17 @@ pub(crate) struct FmtSeg {
     pub(crate) off: u16,
     pub(crate) len: u16,
 }
+
+impl FmtSeg {
+    const ZERO: FmtSeg = FmtSeg {
+        kind: 0,
+        arg: 0,
+        pat: 0,
+        _pad: 0,
+        off: 0,
+        len: 0,
+    };
+}
 const _: () = assert!(core::mem::size_of::<FmtSeg>() == 8 && core::mem::align_of::<FmtSeg>() == 2);
 
 /// A compiled number pattern (`#`, `0`, `.`, `,` grouping, `%`, literal prefix/suffix as
@@ -62,6 +77,21 @@ pub(crate) struct NumPat {
 }
 const _: () = assert!(core::mem::size_of::<NumPat>() == 16 && core::mem::align_of::<NumPat>() == 2);
 
+impl NumPat {
+    const ZERO: NumPat = NumPat {
+        min_int: 0,
+        min_frac: 0,
+        max_frac: 0,
+        group: 0,
+        percent: 0,
+        _pad: [0; 3],
+        pre_off: 0,
+        pre_len: 0,
+        suf_off: 0,
+        suf_len: 0,
+    };
+}
+
 /// A pre-parsed `str.format` template: ≤ 32 segments, ≤ 8 number patterns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -76,6 +106,30 @@ const _: () = assert!(core::mem::size_of::<FmtProg>() == 392);
 const _: () = assert!(core::mem::align_of::<FmtProg>() == 2);
 
 impl FmtProg {
+    /// The empty program: the initial value [`fmt_compile_into`] fills.
+    pub const EMPTY: FmtProg = FmtProg {
+        segs: [FmtSeg::ZERO; FMT_MAX_SEGMENTS],
+        pats: [NumPat::ZERO; MAX_PATS],
+        n_segs: 0,
+        n_pats: 0,
+        _pad: [0; 6],
+    };
+
+    /// One bit per argument index some placeholder names (bit `n` = `{n…}`).
+    #[must_use]
+    pub(crate) fn arg_mask(&self) -> u16 {
+        let mut m = 0u16;
+        let mut i = 0usize;
+        while i < self.n_segs as usize {
+            let s = self.segs[i];
+            if s.kind != seg::LIT {
+                m |= 1u16 << s.arg; // arg <= MAX_ARG = 14
+            }
+            i += 1;
+        }
+        m
+    }
+
     /// Number of segments.
     #[must_use]
     pub fn segments(&self) -> usize {
@@ -103,12 +157,12 @@ const fn bad(at: usize, why: &'static str) -> LoadErr {
     err(code::BAD_FORMAT, at, why)
 }
 
-struct C<'t> {
+struct C<'t, 'p> {
     t: &'t [u8],
-    p: FmtProg,
+    p: &'p mut FmtProg,
 }
 
-impl C<'_> {
+impl C<'_, '_> {
     fn push(&mut self, s: FmtSeg, at: usize) -> Result<(), LoadErr> {
         if self.p.n_segs as usize == FMT_MAX_SEGMENTS {
             return Err(bad(at, "more than 32 template segments"));
@@ -251,14 +305,17 @@ fn date_pat(t: &[u8], a: usize, b: usize) -> Result<(), LoadErr> {
     Ok(())
 }
 
-/// Compile the number pattern `t[a..b]` (DecimalFormat subset).
-fn num_pat(t: &[u8], a: usize, b: usize) -> Result<NumPat, LoadErr> {
-    let mut p = NumPat::default();
+/// Compile the number pattern `t[a..b]` (DecimalFormat subset). `const`, so the `str.format`
+/// keyword patterns compile at build time.
+const fn num_pat(t: &[u8], a: usize, b: usize) -> Result<NumPat, LoadErr> {
+    let mut p = NumPat::ZERO;
     let mut k = a;
     let mut q = false;
     // Prefix: up to the first unquoted `#`, `0`, `,` or `.`.
     while k < b && (q || !matches!(t[k], b'#' | b'0' | b',' | b'.')) {
-        special(t[k], q, k, &mut p)?;
+        if let Err(e) = special(t[k], q, k, &mut p) {
+            return Err(e);
+        }
         if t[k] == b'\'' {
             q = !q;
         }
@@ -268,6 +325,7 @@ fn num_pat(t: &[u8], a: usize, b: usize) -> Result<NumPat, LoadErr> {
     p.pre_len = (k - a) as u16;
     let num0 = k;
     let (mut digits, mut since_comma, mut comma, mut seen_zero) = (0u32, 0u32, false, false);
+    let mut zeros = 0u32;
     while k < b && matches!(t[k], b'#' | b'0' | b',') {
         match t[k] {
             b',' => {
@@ -276,7 +334,11 @@ fn num_pat(t: &[u8], a: usize, b: usize) -> Result<NumPat, LoadErr> {
             }
             b'0' => {
                 seen_zero = true;
-                p.min_int += 1;
+                zeros += 1;
+                // pin:04-fmt-int-cap (the `u8` field): refused exactly as a 17th fraction digit.
+                if zeros > MAX_INT {
+                    return Err(bad(k, "more than 255 integer '0' digits"));
+                }
                 digits += 1;
                 since_comma += 1;
             }
@@ -290,6 +352,7 @@ fn num_pat(t: &[u8], a: usize, b: usize) -> Result<NumPat, LoadErr> {
         }
         k += 1;
     }
+    p.min_int = zeros as u8; // <= MAX_INT = 255, checked above
     if k < b && t[k] == b'.' {
         k += 1;
         let mut hash = false;
@@ -316,6 +379,10 @@ fn num_pat(t: &[u8], a: usize, b: usize) -> Result<NumPat, LoadErr> {
         if since_comma == 0 {
             return Err(bad(num0, "grouping separator without digits after it"));
         }
+        // pin:04-fmt-int-cap: a grouping size past the `u8` field is refused, never truncated.
+        if since_comma > MAX_INT {
+            return Err(bad(num0, "grouping size above 255"));
+        }
         p.group = since_comma as u8;
     }
     let s0 = k;
@@ -323,7 +390,9 @@ fn num_pat(t: &[u8], a: usize, b: usize) -> Result<NumPat, LoadErr> {
         if !q && matches!(t[k], b'#' | b'0' | b',' | b'.') {
             return Err(bad(k, "digit characters after the suffix began"));
         }
-        special(t[k], q, k, &mut p)?;
+        if let Err(e) = special(t[k], q, k, &mut p) {
+            return Err(e);
+        }
         if t[k] == b'\'' {
             q = !q;
         }
@@ -343,8 +412,17 @@ pub(crate) fn num_pat_of(t: &[u8]) -> Result<NumPat, LoadErr> {
     num_pat(t, 0, t.len())
 }
 
+/// A constant pattern compiled at build time (the `str.format` keyword expansions); a pattern
+/// outside the subset fails the build.
+pub(crate) const fn num_pat_const(t: &[u8]) -> NumPat {
+    match num_pat(t, 0, t.len()) {
+        Ok(p) => p,
+        Err(_) => panic!("a constant number pattern outside the subset"),
+    }
+}
+
 /// Prefix/suffix characters: `%` sets percent; `;`, `E`, `¤` (0xC2 0xA4), `‰` are unsupported.
-fn special(c: u8, quoted: bool, k: usize, p: &mut NumPat) -> Result<(), LoadErr> {
+const fn special(c: u8, quoted: bool, k: usize, p: &mut NumPat) -> Result<(), LoadErr> {
     if quoted {
         return Ok(());
     }
@@ -361,21 +439,23 @@ fn special(c: u8, quoted: bool, k: usize, p: &mut NumPat) -> Result<(), LoadErr>
 }
 
 /// Compile a `str.format` template: 5005 for unbalanced braces, an argument index > 14, an
-/// unsupported pattern letter, more than 32 segments.
+/// unsupported pattern letter, more than 32 segments. Load time; the run time uses
+/// [`fmt_compile_into`].
 pub fn fmt_compile(template: &[u8]) -> Result<FmtProg, LoadErr> {
+    let mut p = FmtProg::EMPTY;
+    fmt_compile_into(template, &mut p)?;
+    Ok(p)
+}
+
+/// [`fmt_compile`] into the caller's program `p` (the run-time form: the 392-byte program is
+/// never returned by value). `p` is reset first; on `Err` its contents are unspecified.
+pub fn fmt_compile_into(template: &[u8], p: &mut FmtProg) -> Result<(), LoadErr> {
+    p.n_segs = 0;
+    p.n_pats = 0;
     if template.len() > u16::MAX as usize {
         return Err(bad(0, "template longer than 65535 bytes"));
     }
-    let mut c = C {
-        t: template,
-        p: FmtProg {
-            segs: [FmtSeg::default(); FMT_MAX_SEGMENTS],
-            pats: [NumPat::default(); MAX_PATS],
-            n_segs: 0,
-            n_pats: 0,
-            _pad: [0; 6],
-        },
-    };
+    let mut c = C { t: template, p };
     let t = template;
     let (mut i, mut from, mut q) = (0usize, 0usize, false);
     while i < t.len() {
@@ -401,6 +481,5 @@ pub fn fmt_compile(template: &[u8]) -> Result<FmtProg, LoadErr> {
             _ => i += 1,
         }
     }
-    c.lit(from, t.len())?;
-    Ok(c.p)
+    c.lit(from, t.len())
 }
