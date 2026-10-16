@@ -1355,7 +1355,7 @@ pub fn spawn_bybit(
                 );
                 // VT2: one estimator per CONNECTION, same threshold.
                 drv.set_stale_after_ms(stale_after_ms);
-                // COPY: the slot (its Driver inline, 5 488 B) moves into the
+                // COPY: the slot (its Driver inline, 6 512 B since HK36) moves into the
                 // Vec once at boot — see `BybitConn::new`.
                 conns.push(ywl::BybitConn::new(
                     drv,
@@ -1496,7 +1496,7 @@ pub fn spawn_mexc(
                         return;
                     }
                 }
-                // COPY: the slot (its Driver inline, 3 008 B) moves into the
+                // COPY: the slot (its Driver inline, 3 264 B since HK36) moves into the
                 // Vec once at boot — see `MexcConn::new`.
                 conns.push(mxl::MexcConn::new(
                     drv,

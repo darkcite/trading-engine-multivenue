@@ -342,7 +342,9 @@ fn mexc_tls_loopback_spot_pb_and_futures_json_through_run_multi() {
     assert_eq!(spot.bid_px.raw(), 80_535_880_000);
     assert_eq!(spot.ask_px.raw(), 80_535_890_000);
     assert_eq!(spot.ask_qty.raw(), 333_363);
-    assert_eq!(spot.venue_seq, (81_721_676_217u64 & 0xFFFF_FFFF) as u32);
+    // HK36: the row's first ordinal, keyed on the full version (old law:
+    // its low 32 bits).
+    assert_eq!(spot.venue_seq, 1);
     assert_eq!(spot.venue_time_ms, 1_789_897_517_479);
     let perp = ticks.iter().find(|t| t.sym == SYM_PERP).expect("futures tick");
     assert_eq!(perp.bid_px.raw(), 80_468_600_000);

@@ -1027,6 +1027,7 @@ dependencies = [
 name = "ingress-binance"
 version = "0.1.0"
 dependencies = [
+ "book-builder",
  "core-metrics",
  "core-net",
  "core-parse",
@@ -1045,6 +1046,7 @@ dependencies = [
 name = "ingress-bybit"
 version = "0.1.0"
 dependencies = [
+ "book-builder",
  "core-metrics",
  "core-net",
  "core-parse",
@@ -1132,6 +1134,7 @@ dependencies = [
 name = "ingress-mexc"
 version = "0.1.0"
 dependencies = [
+ "book-builder",
  "core-metrics",
  "core-net",
  "core-parse",

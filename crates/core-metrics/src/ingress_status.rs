@@ -209,7 +209,10 @@ pub struct IngressStatus {
     /// 0, dropped by every book; [`Self::note_arrival_seq`]). Baselines
     /// (2026-10-15 hour): HL ~0/h, Deribit ~115/h (the backlog after a
     /// host stall); an HL re-send carries the last-change stamp, so an
-    /// occasional HL count is not a stuck clock.
+    /// occasional HL count is not a stuck clock. HK36: Binance and Bybit
+    /// count a tick, the MEXC book every parsed push (republications
+    /// included), whose FULL venue id is behind its instrument's newest — the same 0 (MEXC's book judge moved here
+    /// from Q-MX1's last-seen check; its trade judge stays).
     seq_regressions_total: AtomicU64,
     /// Channel resubscribes triggered by integrity monitors.
     resubscribes_total: AtomicU64,
@@ -340,7 +343,8 @@ impl IngressStatus {
     }
 
     /// HK32: judge one top-of-book tick's `venue_seq` as stamped by
-    /// `core_types::ArrivalSeq` (Polymarket, Hyperliquid, Deribit): 0 is
+    /// `core_types::ArrivalSeq` (Polymarket, Hyperliquid, Deribit; HK36
+    /// Binance, Bybit, MEXC): 0 is
     /// a tick older than its instrument's newest, dropped by every book,
     /// and counted. One predicted compare inline; the count stays cold
     /// ([`Self::inc_seq_regressions`]).

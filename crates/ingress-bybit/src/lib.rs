@@ -19,7 +19,18 @@
 //!   per-symbol BBO state; a delta replaces a side when present
 //!   (empty side array = unchanged; a level with size 0 clears the
 //!   side); a `Tick` is emitted whenever both sides are live and
-//!   something changed. `u` rides as `venue_seq` (truncated).
+//!   something changed. `venue_seq` (HK36, ruling HK-R22) is the
+//!   symbol's arrival ordinal from a `core_types::ArrivalSeq` keyed on
+//!   the FULL `u` (truncated to its low 32 bits it wrapped, and every
+//!   later tick of the symbol was `Stale` until a restart). `u` is
+//!   monotone per symbol on this one stream — the only tick source; spot
+//!   and linear are different instruments on different connections and
+//!   tables. A backward `u` takes 0 (dropped by every book) and counts on
+//!   `seq_regressions_total`; a same-`u` re-push (linear re-sends an
+//!   unchanged level-1 snapshot every 3 s) takes the next ordinal, the
+//!   same touch. After a venue service restart `u` restarts at 1 under a
+//!   `snapshot`, so every snapshot zeroes its symbol's clock (counting
+//!   nothing) and a reconnect zeroes all of them; ordinals stay monotone.
 //! * `publicTrade.<SYM>` — trade prints → `ChannelId::Trade` events
 //!   (§6.5; v0 = px ×1e6, v1 = signed qty ×1e6). Bybit trade ids are
 //!   UUIDs — no venue seq; `venue_seq` = 0 and NO §6.2 chain monitor

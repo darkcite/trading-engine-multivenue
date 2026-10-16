@@ -195,6 +195,11 @@ pub struct Driver {
     sentinel_time_ms: u64,
     /// Latest sentinel verdict (`TICK_FLAG_STALE` or 0).
     sentinel_stale_flag: u8,
+    /// HK36: the slot's `bookTicker` sequencer, keyed on the full `u`
+    /// ([`handle_text_frame`]). The connection is single-symbol, so its
+    /// one row is the symbol's; its clock is zeroed on reconnect, its
+    /// ordinal kept (`core_types::ArrivalSeq`).
+    tick_seq: core_types::ArrivalSeq,
     /// `!Sync` marker.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
 }
@@ -241,6 +246,7 @@ impl Driver {
             sentinel: false,
             sentinel_time_ms: 0,
             sentinel_stale_flag: 0,
+            tick_seq: core_types::ArrivalSeq::ZERO,
             _not_sync: ::core::marker::PhantomData,
         }
     }
@@ -320,6 +326,7 @@ impl Driver {
             sentinel: false,
             sentinel_time_ms: 0,
             sentinel_stale_flag: 0,
+            tick_seq: core_types::ArrivalSeq::ZERO,
             _not_sync: ::core::marker::PhantomData,
         }
     }
@@ -350,6 +357,11 @@ impl Driver {
         self.feed_clock.reset();
         self.sentinel_time_ms = 0;
         self.sentinel_stale_flag = 0;
+        // HK36: the ordinal stays (monotone — no book sees it fall); the
+        // clock is zeroed, so a venue-side `u` reset or a far-future id
+        // clears at the reconnect. rx is cleared and the old socket gone:
+        // no tick of the old connection can follow.
+        self.tick_seq.reset_clock();
     }
 }
 
@@ -896,6 +908,7 @@ fn handle_text_frame<C: Capture>(
         sentinel,
         sentinel_time_ms,
         sentinel_stale_flag,
+        tick_seq,
         ..
     } = drv;
     let payload = &rx.filled()[payload_range];
@@ -971,10 +984,20 @@ fn handle_text_frame<C: Capture>(
         } else {
             (0, 0)
         };
-        // `update_id` fits comfortably in u32 over the lifetime of a
-        // connection (Binance resets on (re)connect). Truncate for the
-        // venue_seq slot; it's only used for monotonicity checks.
-        let venue_seq = (f.update_id & 0xFFFF_FFFF) as u32;
+        // HK36 (ruling HK-R22): `u` is the symbol's order-book update id,
+        // a FULL u64 — process- and connection-independent (USDⓈ-M ids
+        // are already past 2^32), so its low 32 bits wrapped and every
+        // later tick of the symbol was `Stale` until a restart. The id is
+        // monotone per symbol on this stream, the connection's ONLY tick
+        // source (the spot sentinel's aggTrade is capture-only; spot and
+        // USDⓈ-M are different symbols on different sockets), so the
+        // slot's sequencer keys on it: a backward id takes 0 (dropped by
+        // every book) and is counted; a same-id duplicate takes the next
+        // ordinal (the same touch). A venue-side id reset counts until the
+        // next reconnect zeroes the clock (the venue closes every
+        // connection within 24 h).
+        let venue_seq = tick_seq.next(f.update_id);
+        status.note_arrival_seq(venue_seq);
         let tick = Tick::new_stamped(
             ts_ns,
             core_types::VenueId::Binance,
@@ -2244,7 +2267,10 @@ mod tests {
         assert_eq!(tick.sym, 42);
         assert_eq!(tick.bid_px.raw(), 25_351_900);
         assert_eq!(tick.ask_px.raw(), 25_365_200);
-        assert_eq!(tick.venue_seq, 400_900_217u32);
+        // HK36: the slot's first ordinal, keyed on `u` = 400 900 217 (old
+        // law: the id's low 32 bits).
+        assert_eq!(tick.venue_seq, 1);
+        assert_eq!(status.seq_regressions_total(), 0);
         // VT2: a SPOT push carries no stamp — unknown, never stale.
         assert_eq!(tick.venue_time_ms, 0);
         assert!(!tick.is_stale());
@@ -2375,6 +2401,45 @@ mod tests {
         let after = push_usdm_book_ticker(&mut t, &mut d, &mut prod, &mut cons, &status, t0 - 60_000, 3);
         assert!(!after.is_stale(), "a reconnect starts a fresh offset");
         assert_eq!(after.venue_time_ms, t0 - 60_000);
+    }
+
+    /// HK36: `u` crossing a 2^32 boundary takes a HIGHER `venue_seq` and
+    /// applies (old law: its low 32 bits fell to 1 and every later tick
+    /// of the symbol was `Stale` until a restart); a backward `u` takes 0,
+    /// `Stale` at the book, counted; a reconnect zeroes the clock (a
+    /// venue-side id reset applies again) and keeps the ordinal.
+    #[test]
+    fn a_full_u_across_2_32_applies_a_backward_u_is_counted_and_reconnect_clears() {
+        use book_builder::{ApplyOutcome, TopOfBook};
+        let mut t = TestTransport::with_capacity(16 * 1024);
+        let mut d = build_driver(7, 42);
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let status = core_metrics::IngressStatus::new();
+        let mut book = TopOfBook::empty(42);
+        let t0: u64 = 1_755_216_000_000;
+        let mut push = |d: &mut Driver, u: u64| {
+            push_usdm_book_ticker(&mut t, d, &mut prod, &mut cons, &status, t0, u)
+        };
+        let below = push(&mut d, 0xFFFF_FFFF);
+        let above = push(&mut d, 0x1_0000_0001);
+        assert_eq!((below.venue_seq, above.venue_seq), (1, 2));
+        assert_eq!(book.apply(&below), ApplyOutcome::Applied);
+        assert_eq!(book.apply(&above), ApplyOutcome::Applied, "past 2^32");
+        let back = push(&mut d, 0xFFFF_FFFF);
+        assert_eq!(back.venue_seq, 0, "a backward u");
+        assert_eq!(book.apply(&back), ApplyOutcome::Stale);
+        assert_eq!(status.seq_regressions_total(), 1);
+        d.reset_for_reconnect(9);
+        d.set_state(State::Steady);
+        let restarted = push(&mut d, 5);
+        assert_eq!(
+            restarted.venue_seq, 3,
+            "the clock cleared, the ordinal kept"
+        );
+        assert_eq!(book.apply(&restarted), ApplyOutcome::Applied);
+        assert_eq!(status.seq_regressions_total(), 1);
     }
 
     #[test]

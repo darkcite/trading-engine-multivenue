@@ -44,7 +44,7 @@ files predate it (see `docs/migration.md`).
 | -----: | ----: | ------------- | ---------------- | -------------------------------------- |
 |      0 |     8 | ts_ns         | `u64` NsTs       | monotonic ns from `core-time::now_ns` — the ordering key everywhere; venue time never re-times a record |
 |      8 |     4 | sym           | `u32` SymbolId   | venue-namespaced; `SYMBOL_ID_NONE = u32::MAX` invalid |
-|     12 |     4 | venue_seq     | `u32`            | venue-provided sequence, monotonic (`pm` since HK31, `hl` and `deribit` since HK32: the ingress's per-instrument arrival ordinal, and 0 = a tick older than the instrument's newest — "Capture files") |
+|     12 |     4 | venue_seq     | `u32`            | venue-provided sequence, monotonic (`pm` since HK31, `hl` and `deribit` since HK32, `bn`, `bybit` and `mexc` since HK36: the ingress's per-instrument arrival ordinal, and 0 = a tick older than the instrument's newest — "Capture files") |
 |     16 |     8 | bid_px        | `i64` Price      | fixed-point ×1e6                       |
 |     24 |     8 | bid_qty       | `i64` Qty        | fixed-point ×1e6                       |
 |     32 |     8 | ask_px        | `i64` Price      | fixed-point ×1e6                       |
@@ -583,8 +583,40 @@ the instrument's newest (counted on
 and per process, surviving reconnects. One Hyperliquid outcome leg has
 ONE sequence across its two tick sources (one book, one block clock).
 Only `Tick` rows change: `hl-events` / `deribit-events` rows keep their
-venue ids (`tid`, `trade_seq`, `change_id`, the roll codec). The same
-per-run book reset applies when replaying cuts.
+venue ids (`tid`, `trade_seq`, `change_id`, the roll codec). Replaying several
+runs as one stream: the ordinal restarts at 1 with each run, and
+`backtest` `load_and_merge` neither rebases it nor resets the books, so
+a `MultiBook` reader would drop a later run's ticks as `Stale` until its
+ordinal passes the earlier run's last; no member of the strategy set
+reads these books today (`strategy-latency-arb`, `-cross-arb`,
+`-rule-tree` do, outside it).
+
+HK36, appended 2026-10-16 — **`bn`, `bybit` and `mexc` `Tick.venue_seq`
+are the per-instrument arrival ordinal too, keyed on the venue's FULL
+id; no layout change** (ruling HK-R22; `crates/ingress-bybit/src/lib.rs`,
+`crates/ingress-mexc/src/lib.rs` crate docs, the Binance run loop). Until
+HK36 the slot held the low 32 bits of Binance `bookTicker` `u`, Bybit
+`orderbook.1` `u` and the MEXC book `version` (spot and futures) — ids
+that outgrow 2^32 (Binance USDⓈ-M already has), after which every tick
+of the instrument was `Stale` until a restart. Now the ordinal of
+HK31/HK32 is keyed on that full id instead of a ms stamp: 1, 2, 3, … in
+arrival order while the id does not go back (a same-id re-push takes the
+next one), 0 for an id behind the instrument's newest (counted on
+`engine_ingress_<venue>_seq_regressions_total`), dense per instrument
+and per process, surviving reconnects (a reconnect zeroes the id the
+comparison uses; so does every Bybit `snapshot` for its symbol — `u`
+restarts at 1 under one after a venue restart). MEXC numbers every
+parsed book push, the republications it writes no row for included, so
+its ordinals skip. The venue id itself is no longer in the `Tick` row
+(Binance and Bybit book ids are in no capture row — only in the raw
+tap's frames when it is on; MEXC's book `version` neither — its
+`mexc-events` rows keep the trade ids). Replaying several
+runs as one stream: the ordinal restarts at 1 with each run, and
+`backtest` `load_and_merge` neither rebases it nor resets the books, so
+a `MultiBook` reader would drop a later run's ticks as `Stale` until its
+ordinal passes the earlier run's last; no member of the strategy set
+reads these books today (`strategy-latency-arb`, `-cross-arb`,
+`-rule-tree` do, outside it).
 
 MX2, appended 2026-09-23 — `mexc` (VenueId 7; spot + futures share
 one label; data-only, ruling O-MX1). The per-venue law
@@ -604,12 +636,14 @@ one label; data-only, ruling O-MX1). The per-venue law
 - **`venue_seq`** (ruling Q-MX1): spot book `version`, spot trade =
   the LEADING DIGITS of the `tradeId` string (0 when it has none or
   the run overflows `u64`), futures book `version`, futures deal `i`.
-  `Tick.venue_seq` = the low 32 bits, `ChannelEvent.venue_seq` the
-  full `u64`. The §6.2 chain law does NOT apply — these are
+  `Tick.venue_seq` = the low 32 bits (until HK36; now the book's
+  arrival ordinal keyed on the full `version`, see HK36 above),
+  `ChannelEvent.venue_seq` the full `u64`. The §6.2 chain law does NOT apply — these are
   sampled/snapshot streams that skip versions by design — so MEXC
-  emits no `TradeGap`/`BookGap` and `gaps_total` stays 0. A seq
-  strictly below the last-seen one of the same symbol × stream (book /
-  trade) increments `engine_ingress_mexc_seq_regressions_total` (a
+  emits no `TradeGap`/`BookGap` and `gaps_total` stays 0. A trade seq
+  strictly below the last-seen one of the same symbol (since HK36: a
+  book `version` behind the symbol's newest on the connection, absent
+  included) increments `engine_ingress_mexc_seq_regressions_total` (a
   counter, no event row).
 - `Trade` (0): `v0` = px ×1e6, `v1` = qty ×1e6 (spot base units,
   futures contracts) NEGATED when the aggressor sold (spot
