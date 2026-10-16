@@ -307,6 +307,53 @@ fn rule_22_arg_win() {
     assert_eq!(rule_of(&p), rule::ARG_WIN);
 }
 
+/// One `CONCAT` call (2 inputs, `n_out = 1`) over `entries`. Slots: `i(0)` = i64 10, `i(1)` =
+/// i64 11 is a const slot (written once by `I_CONST`, as sema's init block does), `i(2)` = i64
+/// 12; `f(5)` = f64 10 shares the number of `i(0)` but not its lane.
+fn concat_over(entries: &[u16]) -> PineProgram {
+    let mut t = Tb::new(ExecMode::BarClose, 6, 3, 0, 0);
+    let (k, kz) = (t.i(1), t.k(0));
+    t.emit(op::I_CONST, flg::VLD, k, kz, 0); // 0
+    let w = t.win(entries);
+    t.emit(op::CALL_BUILTIN, 0, SiteId::NONE.0, CONCAT, w); // 1
+    t.emit(op::HALT, 0, 0, 0, 0); // 2
+    t.build()
+}
+
+fn arg_win_at_call(detail: u32) -> Option<VerifyError> {
+    Some(VerifyError { rule: rule::ARG_WIN, pc: 1, detail })
+}
+
+/// Sub-code 5, pin:03-argwin-out-alias: the pine-sema `plot` defect shape — the window lacks
+/// its output word, so the last input, a const slot the window also reads, is taken for the
+/// output and the body would overwrite the constant.
+#[test]
+fn rule_22_arg_win_output_naming_a_const_input_is_refused() {
+    let (s, k, o) = (argwin::i64(10), argwin::i64(11), argwin::i64(12));
+    assert!(verify(&concat_over(&[s, k, o]), &TABLE).is_ok(), "control: a fresh output");
+    assert_eq!(verify(&concat_over(&[s, k, k]), &TABLE).err(), arg_win_at_call(5));
+    assert_eq!(verify(&concat_over(&[k, s, k]), &TABLE).err(), arg_win_at_call(5));
+}
+
+/// Sub-code 5 for any input, const or not; the check is per lane, and inputs may repeat a slot.
+#[test]
+fn rule_22_arg_win_output_aliasing_an_input_is_refused() {
+    let (s, k, o) = (argwin::i64(10), argwin::i64(11), argwin::i64(12));
+    assert_eq!(verify(&concat_over(&[s, k, s]), &TABLE).err(), arg_win_at_call(5));
+    let f10 = argwin::f64(10); // f64 slot 10 is not i64 slot 10
+    assert!(verify(&concat_over(&[s, k, f10]), &TABLE).is_ok());
+    assert!(verify(&concat_over(&[k, k, o]), &TABLE).is_ok(), "a repeated input is no alias");
+}
+
+/// Tripwire for CAR-vm-arity: a short window whose last input is NOT also read by the window
+/// still verifies — `BuiltinEntry` has no input count to compare `n` with. When the CAR lands
+/// this becomes a refusal and this test flips.
+#[test]
+fn rule_22_gap_short_window_without_alias_needs_car_vm_arity() {
+    let (s, k) = (argwin::i64(10), argwin::i64(11));
+    assert!(verify(&concat_over(&[s, k]), &TABLE).is_ok());
+}
+
 #[test]
 fn rule_23_site_kind() {
     let mut p = reference().build();

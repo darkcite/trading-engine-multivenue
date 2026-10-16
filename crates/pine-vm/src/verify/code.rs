@@ -202,7 +202,9 @@ pub(crate) fn check(p: &PineProgram, t: &'static BuiltinTable) -> Result<(), Ver
         }
         if ins.op == op::CALL_BUILTIN {
             let ent = t.entries[ins.a as usize];
-            // 22 ArgWin
+            // 22 ArgWin — `detail` is the sub-code: 0 window offset past `argwin`, 1 window end
+            // past `argwin`, 2 `n < n_out`, 3 an entry's slot outside its lane, 4 an output on a
+            // reserved slot, 5 an output naming an input entry of the same window.
             let w = ins.b as usize;
             if w >= p.argwin.len() {
                 return Err(e(rule::ARG_WIN, at, 0));
@@ -226,6 +228,25 @@ pub(crate) fn check(p: &PineProgram, t: &'static BuiltinTable) -> Result<(), Ver
                     return Err(e(rule::ARG_WIN, at, 4));
                 }
                 j += 1;
+            }
+            // pin:03-argwin-out-alias — §3.6.2 lays a window out as the inputs, then the
+            // outputs, and is silent on one slot being both: the literal reading refuses it.
+            // An output equal to an input entry (same lane bit, same slot) is a short window
+            // whose last input was taken for the output (the pine-sema `plot` defect), or a
+            // body writing a slot it still reads. A missing output on an unshared slot needs
+            // the overload's input count (CAR-vm-arity).
+            let n_in = n - ent.n_out as usize;
+            let mut o = n_in;
+            while o < n {
+                let out = p.argwin[w + 1 + o];
+                let mut i = 0usize;
+                while i < n_in {
+                    if p.argwin[w + 1 + i] == out {
+                        return Err(e(rule::ARG_WIN, at, 5));
+                    }
+                    i += 1;
+                }
+                o += 1;
             }
             // 23 SiteKind
             let st = ent.flags & bf::STATEFUL != 0;
