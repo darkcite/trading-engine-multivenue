@@ -98,6 +98,11 @@ pub(crate) fn lower(
         knobs,
         hlines: Vec::new(),
         obj_sites: 0,
+        has_requests: t.insts.iter().any(|i| {
+            i.calls
+                .iter()
+                .any(|c| matches!(c.1, Callee::Builtin(ov) if crate::security::is_security(ov)))
+        }),
     };
     if let Node::Script { body } = ast.node(ast.root()) {
         for &s in body {
@@ -184,6 +189,8 @@ struct Lower<'a> {
     /// Object sites so far, in code order over the expanded program (`pin:02-obj-site-order` —
     /// T14's numbering keeps this order).
     obj_sites: u32,
+    /// The program holds a `request.security` (folded context values then keep a slot, §4.11.4).
+    has_requests: bool,
 }
 
 impl Lower<'_> {
@@ -376,7 +383,18 @@ impl Lower<'_> {
     fn expr(&mut self, n: NodeId) -> Result<VSlot, Diag> {
         let ty = self.ty(n).ok_or_else(|| self.todo(n, "an untyped node"))?;
         if let Some(k) = self.cur().k.get(n.0 as usize).copied().flatten() {
-            return Ok(self.konst(k, ty, self.ast.span(n)));
+            let c = self.konst(k, ty, self.ast.span(n));
+            // §4.11.4 `3029`: a folded `syminfo.*` / `timeframe.*` value keeps a slot of its own
+            // in a program with a request, so 5a can tell the context it was folded in.
+            if self.has_requests {
+                if let Some(kind) = self.ctx_kind(n) {
+                    let t = self.temp(ty, self.ast.span(n));
+                    self.op(Op::Mov { dst: t, a: c });
+                    self.ir.ctx_slots.push((t, kind));
+                    return Ok(t);
+                }
+            }
+            return Ok(c);
         }
         let at = self.ast.span(n);
         match self.ast.node(n) {
@@ -479,6 +497,24 @@ impl Lower<'_> {
         };
         let info = self.info(ty, kind, Sym::NONE, self.ast.span(n));
         self.value_slot(n, base + i as u32, info)
+    }
+
+    /// [`crate::ir::CTX_SYMINFO`] / [`crate::ir::CTX_TIMEFRAME`] when the folded subtree of `n`
+    /// reads a `syminfo.*` / `timeframe.*` value.
+    fn ctx_kind(&self, n: NodeId) -> Option<u8> {
+        let mut kind = 0u8;
+        for m in self.ast.subtree(n) {
+            let m = NodeId(m);
+            if !matches!(self.ast.node(m), Node::Field { .. }) {
+                continue;
+            }
+            match self.path(m) {
+                Some(p) if p.starts_with("syminfo.") => kind |= crate::ir::CTX_SYMINFO,
+                Some(p) if p.starts_with("timeframe.") => kind |= crate::ir::CTX_TIMEFRAME,
+                _ => {}
+            }
+        }
+        (kind != 0).then_some(kind)
     }
 
     fn path(&self, n: NodeId) -> Option<String> {
@@ -851,6 +887,9 @@ impl Lower<'_> {
                 let callee = self.cur().calls.iter().find(|c| c.0 == n).map(|c| c.1);
                 match callee {
                     Some(Callee::User(ti)) => self.inline_with(n, ti as usize, Self::body_tuple),
+                    Some(Callee::Builtin(ov)) if crate::security::is_security(ov) => {
+                        self.security(n, ov, hints)
+                    }
                     Some(Callee::Builtin(ov)) => {
                         let o = pine_spec::overload(ov);
                         let rets = pine_spec::rets(o);
@@ -1102,6 +1141,10 @@ impl Lower<'_> {
             }
             _ => {}
         }
+        if crate::security::is_security(ov) {
+            let outs = self.security(n, ov, &[ty])?;
+            return Ok(outs.first().copied().unwrap_or(VSlot(u32::MAX)));
+        }
         if pine_spec::rets(o).len() > 1 {
             return Err(self.todo(n, "a tuple-returning call outside a tuple binding"));
         }
@@ -1141,6 +1184,199 @@ impl Lower<'_> {
         };
         let key = pine_ir::str_key(self.syms.resolve(id).as_bytes());
         self.ir.entry_sites.push((key, dirs));
+    }
+
+    /// `request.security` (§4.11.2–§4.11.3): the `expression` lowered into a detached block `E`
+    /// (a region of its own, never emitted in the parent), then one `Call` per tuple element with
+    /// the window `[__key (patched in 5a), __out = j, __ty, gaps, lookahead]`, and the child's
+    /// tail — per element the `F_I2F` when it is not `float` and a `plot` capture at index `j`,
+    /// every other parameter defaulted. The target arguments passed pass 3 (§4.11.1), so each
+    /// folds; their text is kept raw and resolved in 5a against the options.
+    fn security(&mut self, n: NodeId, ov: OverloadId, hints: &[TypeQ]) -> Result<Vec<VSlot>, Diag> {
+        let at = self.ast.span(n);
+        let Node::Call { args, .. } = self.ast.node(n) else {
+            return Err(self.todo(n, "a call node"));
+        };
+        let bound = self
+            .cur()
+            .bound
+            .iter()
+            .find(|b| b.0 == n)
+            .map(|b| b.1.clone())
+            .unwrap_or_default();
+        let o = pine_spec::overload(ov);
+        let ps = pine_spec::params(o);
+        let arg = |name: &str| -> Option<NodeId> {
+            for (k, &a) in args.iter().enumerate() {
+                let Some(row) = bound.get(k).copied().flatten() else {
+                    continue;
+                };
+                if ps.get(usize::from(row)).map(|p| p.name.as_str()) == Some(name) {
+                    return Some(match self.ast.node(a) {
+                        Node::NamedArg { value, .. } => value,
+                        _ => a,
+                    });
+                }
+            }
+            None
+        };
+        let (sym_n, tf_n, e_n) = (arg("symbol"), arg("timeframe"), arg("expression"));
+        let (gaps_n, look_n) = (arg("gaps"), arg("lookahead"));
+        let Some(e_n) = e_n else {
+            return Err(self.todo(n, "a request.security without an expression"));
+        };
+        let text = |s: &Self, a: Option<NodeId>| match a
+            .and_then(|a| s.cur().k.get(a.0 as usize).copied().flatten())
+        {
+            Some(K::Str(t)) => s.syms.resolve(t).to_owned(),
+            // `syminfo.tickerid` / `timeframe.period` (pass 3 refused every other non-constant).
+            _ => String::new(),
+        };
+        let flag = |s: &Self, a: Option<NodeId>| match a
+            .and_then(|a| s.cur().k.get(a.0 as usize).copied().flatten())
+        {
+            Some(K::Int(v)) => v == 1,
+            Some(K::Bool(b)) => b,
+            _ => false, // the defaults `barmerge.gaps_off` / `barmerge.lookahead_off` (0)
+        };
+        let symbol = text(self, sym_n);
+        let tf = text(self, tf_n);
+        let (gaps, lookahead) = (flag(self, gaps_n), flag(self, look_n));
+        let tuple = matches!(self.ast.node(e_n), Node::Tuple { .. });
+        let e_region = self.regions + 1;
+        let (rs, e, _) = self.region(|s| {
+            if tuple {
+                s.tuple_values(e_n, hints)
+            } else {
+                let t = hints.first().copied().filter(|t| t.ty != Ty::Void);
+                match t.or_else(|| s.ty(e_n)) {
+                    Some(t) => s.value_as(e_n, t).map(|v| vec![v]),
+                    None => s.expr(e_n).map(|v| vec![v]),
+                }
+            }
+        })?;
+        // The `plot` overload of this dialect (the capture).
+        let plot_ov = pine_spec::lookup("plot").and_then(|e| {
+            (e.ov_lo..e.ov_hi)
+                .map(OverloadId)
+                .find(|&o| pine_spec::overload(o).versions.has(self.d))
+        });
+        let mut outs = Vec::with_capacity(rs.len());
+        let mut tail = Vec::new();
+        for (j, &r) in rs.iter().enumerate() {
+            let t = self.slot_ty(r);
+            let code = match t.ty {
+                Ty::Enum => pine_ir::elem::enumeration(t.a),
+                other => pine_ir::elem::scalar(other),
+            };
+            let c = |bits: u64| Arg::Const {
+                lane: Lane::I64,
+                bits,
+                valid: true,
+            };
+            let out = self.temp(
+                TypeQ {
+                    qual: Qual::Series,
+                    ..t
+                },
+                at,
+            );
+            self.op(Op::Call {
+                ov,
+                args: vec![
+                    c(0),
+                    c(j as u64),
+                    c(u64::from(code)),
+                    c(u64::from(gaps)),
+                    c(u64::from(lookahead)),
+                ],
+                outs: vec![out],
+                span: at,
+            });
+            outs.push(out);
+            // The child's tail (§4.11.4): `F_I2F` unless `float`, then `plot` at index `j`.
+            let saved = std::mem::take(&mut self.out);
+            let v = if t.ty == Ty::Float {
+                r
+            } else {
+                let f = self.temp(scalar(Ty::Float, Qual::Series), at);
+                self.op(Op::Un {
+                    op: UnOpK::I2f,
+                    dst: f,
+                    a: r,
+                });
+                f
+            };
+            let r = match plot_ov {
+                Some(pov) => self.capture(pov, j as u64, v, at),
+                None => Err(self.todo(n, "the `plot` capture of a request")),
+            };
+            let mut t_ops = std::mem::replace(&mut self.out, saved);
+            r?;
+            tail.append(&mut t_ops);
+        }
+        self.ir.requests.push(crate::ir::Request {
+            e,
+            region: e_region,
+            rs,
+            outs: outs.clone(),
+            tail: Block(tail),
+            symbol,
+            tf_s: 0,
+            lookahead,
+            gaps,
+            span: at,
+        });
+        // The raw timeframe text rides in `symbol`'s sibling until 5a resolves it.
+        self.ir.request_tfs.push(tf);
+        Ok(outs)
+    }
+
+    /// A child's `plot` capture of `v` at plot index `j` (§4.11.4): `__plot = j`, `series = v`,
+    /// every other parameter its default.
+    fn capture(&mut self, pov: OverloadId, j: u64, v: VSlot, at: Span) -> Result<(), Diag> {
+        let o = pine_spec::overload(pov);
+        let ps = pine_spec::params(o);
+        let mut av = Vec::with_capacity(ps.len());
+        let mut first = true;
+        for (k, p) in ps.iter().enumerate() {
+            if !p.versions.has(self.d) {
+                continue;
+            }
+            if p.flags & pine_spec::pf::SYNTHETIC != 0 {
+                av.push(Arg::Const {
+                    lane: Lane::I64,
+                    bits: j,
+                    valid: true,
+                });
+                continue;
+            }
+            if first {
+                first = false;
+                av.push(Arg::Slot(v));
+                continue;
+            }
+            av.push(self.default_arg(self.ast.root(), o, k as u16, &[], p.sig.ty, at)?);
+        }
+        // `plot` returns its handle (the ordinal, `n_out = 1`): the window's last word is an
+        // output the body writes, never one of the inputs.
+        let mut outs = Vec::with_capacity(1);
+        for r in pine_spec::rets(o) {
+            outs.push(self.temp(
+                TypeQ {
+                    qual: Qual::Series,
+                    ..r.ty
+                },
+                at,
+            ));
+        }
+        self.op(Op::Call {
+            ov: pov,
+            args: av,
+            outs,
+            span: at,
+        });
+        Ok(())
     }
 
     /// One `CALL_BUILTIN` with its window and one fresh output per `tys` (§4.14.5).
@@ -1701,6 +1937,15 @@ impl Lower<'_> {
         };
         // The initial bound: the bound itself under `fixed_at_start`, the direction's operand.
         let b0 = self.value_as(to, ct)?;
+        // MG-23 `fixed_at_start`: the bound is a value computed once before the loop — a snapshot,
+        // so a body that assigns the bound's variable does not move it.
+        let b0 = if !each && kb.is_none() {
+            let t = self.temp(scalar(ct.ty, Qual::Series), at);
+            self.op(Op::Mov { dst: t, a: b0 });
+            t
+        } else {
+            b0
+        };
         let one = if ct.ty == Ty::Float {
             K::Float(1.0)
         } else {

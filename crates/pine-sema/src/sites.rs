@@ -12,7 +12,7 @@
 //! effective cap `C` (`C == 0` → `3016`). More than `MAX_SITES` → `3015`; a creator under
 //! `collection_cap == 0` → `3018`.
 
-use pine_ir::{state_flag, Diag, Dialect, Lane, Span, StateKind};
+use pine_ir::{elem, state_flag, CollKind, Diag, Dialect, Lane, Span, StateKind, Ty};
 use pine_spec::{StateShape, StateSpec};
 
 use crate::code::{diag, ReasonCode};
@@ -45,6 +45,8 @@ pub(crate) struct SiteCtx<'a> {
     pub(crate) cap: u32,
     /// `CompileLimits::collection_cap`.
     pub(crate) collection_cap: u32,
+    /// `CompileLimits::str_cell_bytes` (a string element's cell, §4.7.1).
+    pub(crate) str_cell_bytes: u32,
     /// `udt_fields[decl]`: each user type's field count.
     pub(crate) udt_fields: &'a [u16],
 }
@@ -82,14 +84,10 @@ fn walk(ir: &Ir, b: &Block, flags: u8, cx: &SiteCtx<'_>, out: &mut Vec<Site>) ->
                         let msg = "a collection needs `collection_cap > 0`".to_owned();
                         return Err(diag(ReasonCode::UnboundedCollection, *span, msg));
                     }
-                    // pine-std request (impl-04 §3.5): `coll_block_bytes` / `VIEW_BLOCK_BYTES`
-                    // are not served by the lane's pine-std yet — the site is numbered with no
-                    // bytes, and the back half refuses it (`3255`) after §4.9's pass, so the
-                    // reference rules still judge collection programs.
                     out.push(Site {
                         kind: StateKind::Collection,
                         flags,
-                        bytes: 0,
+                        bytes: coll_bytes(ir, o, args, cx),
                         span: *span,
                         len: 0,
                         warm: 0,
@@ -129,6 +127,54 @@ fn walk(ir: &Ir, b: &Block, flags: u8, cx: &SiteCtx<'_>, out: &mut Vec<Site>) ->
         }
     }
     Ok(())
+}
+
+/// A collection creator's block bytes (§4.7.1): `array.slice` is a view
+/// (`pine_std::VIEW_BLOCK_BYTES`); every other creator `pine_std::coll_block_bytes(kind, elem, key,
+/// collection_cap, str_cell_bytes)` with `kind` from the row's `StateShape` and `elem` / `key` the
+/// `Ty` of the synthetic `__elem` / `__key` arguments (an enum element reads `Ty::Enum`, a UDT
+/// element `Ty::Udt`; only `Ty::String` changes the size).
+fn coll_bytes(ir: &Ir, o: &pine_spec::Overload, args: &[Arg], cx: &SiteCtx<'_>) -> u32 {
+    if o.id == pine_spec::ov::ARRAY_SLICE {
+        return pine_std::VIEW_BLOCK_BYTES;
+    }
+    let kind = if o.state.shape == StateShape::Map {
+        CollKind::Map
+    } else {
+        CollKind::Array
+    };
+    let ps = pine_spec::params(o);
+    let mut elem = Ty::Void;
+    let mut key = Ty::Void;
+    let mut pos = 0usize;
+    for p in ps {
+        if !p.versions.has(cx.d) {
+            continue;
+        }
+        let name = p.name.as_str();
+        if name == "__elem" || name == "__key" {
+            let t = match const_arg(ir, args.get(pos)) {
+                Some((_, bits, _)) => elem_ty(bits as u16),
+                None => Ty::Void,
+            };
+            if name == "__elem" {
+                elem = t;
+            } else if kind == CollKind::Map {
+                key = t;
+            }
+        }
+        pos += 1;
+    }
+    pine_std::coll_block_bytes(kind, elem, key, cx.collection_cap, cx.str_cell_bytes)
+}
+
+/// The `Ty` of an `elem`-encoded element (`pine_ir::elem`).
+fn elem_ty(e: u16) -> Ty {
+    match elem::as_scalar(e) {
+        Some(t) => t,
+        None if e & elem::SCALAR == 0 && e & elem::ENUM != 0 => Ty::Enum,
+        None => Ty::Udt,
+    }
 }
 
 /// `3046` (§4.9): a creation site — `T.new`, `obj.copy()`, a collection creator — inside a loop

@@ -445,6 +445,45 @@ pub(crate) struct Ir {
     pub(crate) var_decls: Vec<(VSlot, VSlot)>,
     /// `max_bars_back(x, n)` (§4.10.4): `(x's slot, n)`, the variable's own cap.
     pub(crate) var_caps: Vec<(VSlot, u32)>,
+    /// `request.security` calls (§4.11.2–§4.11.3): each one's detached expression block and its
+    /// element calls' outputs, in lowering order.
+    pub(crate) requests: Vec<Request>,
+    /// Each request's raw `timeframe` text (`requests[i]`'s), resolved in 5a.
+    pub(crate) request_tfs: Vec<String>,
+    /// Slots holding a folded `syminfo.*` / `timeframe.*` value ([`CTX_SYMINFO`] /
+    /// [`CTX_TIMEFRAME`] bits) — `3029` in a cone whose target differs (§4.11.4).
+    pub(crate) ctx_slots: Vec<(VSlot, u8)>,
+}
+
+/// A folded `syminfo.*` value.
+pub(crate) const CTX_SYMINFO: u8 = 1;
+/// A folded `timeframe.*` value.
+pub(crate) const CTX_TIMEFRAME: u8 = 2;
+
+/// One `request.security` call (§4.11.2–§4.11.3).
+#[derive(Debug, Clone)]
+pub(crate) struct Request {
+    /// The detached expression block `E` (never emitted in the parent).
+    pub(crate) e: Block,
+    /// `E`'s region id (a slot of a lower region written in `E` is a parent slot, `3028`).
+    pub(crate) region: u32,
+    /// `E`'s result slots `r_0 … r_{k−1}`.
+    pub(crate) rs: Vec<VSlot>,
+    /// The element calls' outputs `out_0 … out_{k−1}` (the parent's slots).
+    pub(crate) outs: Vec<VSlot>,
+    /// The child's tail: per element the `F_I2F` (when not `float`) and the `plot` capture at
+    /// plot index `j` (§4.11.4).
+    pub(crate) tail: Block,
+    /// The target canonical key.
+    pub(crate) symbol: String,
+    /// The target timeframe in seconds.
+    pub(crate) tf_s: u32,
+    /// `barmerge.lookahead_on`.
+    pub(crate) lookahead: bool,
+    /// `barmerge.gaps_on`.
+    pub(crate) gaps: bool,
+    /// The call's span.
+    pub(crate) span: Span,
 }
 
 impl Ir {

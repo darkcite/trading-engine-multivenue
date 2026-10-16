@@ -11,13 +11,33 @@
 //! for §4.6.4's elimination.
 
 use pine_ir::{
-    input_flag, Diag, Dialect, InputDesc, InputKind, InputOverride, InputValue, NodeId, Qual, Span,
-    Sym, SymTable, Ty,
+    input_flag, CompileOpts, Diag, Dialect, InputDesc, InputKind, InputOverride, InputValue,
+    NodeId, PineProgram, Qual, Span, Sym, SymTable, Ty,
 };
 use pine_spec::ValueSrc;
 
 use crate::code::{diag, ReasonCode};
 use crate::infer::K;
+
+/// The `opts.inputs` keys that match no `InputDesc::name` of `p` — a manifest override that would
+/// otherwise be silently ignored (impl-02 §4.12.5). Hosts refuse each with `6004` (unknown key,
+/// contract §3.14) right after `compile`; `compile` itself does not refuse them (the `6000` range
+/// is the hosts'). Keys are compared as bytes against `p.meta.inputs` names through `p.syms`, and
+/// returned in `opts.inputs` order, a repeated unknown key once per occurrence.
+#[must_use]
+pub fn unmatched_input_overrides<'o>(p: &PineProgram, opts: &'o CompileOpts) -> Vec<&'o str> {
+    let mut out = Vec::new();
+    for o in &opts.inputs {
+        let known =
+            p.meta.inputs.iter().any(|d| {
+                d.name != Sym::NONE && p.syms.resolve(d.name).as_bytes() == o.name.as_bytes()
+            });
+        if !known {
+            out.push(o.name.as_str());
+        }
+    }
+    out
+}
 
 /// The descriptors found while typing, one per `(file, call node)`.
 #[derive(Debug, Default)]

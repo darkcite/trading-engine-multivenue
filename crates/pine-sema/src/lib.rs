@@ -44,6 +44,7 @@ mod types;
 
 pub use canon::canonical_bytes;
 pub use code::ReasonCode;
+pub use inputs::unmatched_input_overrides;
 pub use libcache::{LibCache, LibKey, LibSource, Sha256Fn};
 
 use pine_ir::{is_canonical_symbol_key, symbol_hash, CompileOpts, Diag, FileId, PineProgram};
@@ -133,17 +134,28 @@ fn compile_with(
                 d,
                 cap,
                 collection_cap: opts.limits.collection_cap,
+                str_cell_bytes: opts.limits.str_cell_bytes,
                 udt_fields: &udt_fields,
             };
             let r = ir.and_then(|mut ir| {
                 hoist::run(&mut ir, rd)?;
-                sites::number(&ir, &cx).map(|s| (ir, s))
+                // Pass 5a (§4.11.4–§4.11.7): every request becomes a child program.
+                let scx = security::cone::Cx {
+                    opts,
+                    syms: &syms,
+                    cap,
+                    udt_fields: &udt_fields,
+                    depth: 0,
+                };
+                let subs =
+                    security::cone::extract(&mut ir, &scx, &mut security::cone::Tree::default())?;
+                sites::number(&ir, &cx).map(|s| (ir, s, subs))
             });
             match r {
                 Err(d) => diags.push(d),
                 // Emission runs only on a program every pass accepted, unserved rows included:
                 // an unserved row has no body to call.
-                Ok((ir, sites)) if diags.is_empty() => {
+                Ok((ir, sites, subs)) if diags.is_empty() => {
                     let fe = Front {
                         decl: &decl,
                         inputs: &typed.inputs,
@@ -151,14 +163,14 @@ fn compile_with(
                         d,
                         cap: cx.cap,
                     };
-                    match back(ir, &sites, &fe, syms) {
+                    match back(ir, &sites, &fe, syms, subs) {
                         Ok(p) => return Ok(p),
                         Err(d) => return Err(finish(vec![d])),
                     }
                 }
                 // Only unserved rows refused: §4.9's rules still judge the program (pass 5c is
                 // independent of which rows the snapshot serves).
-                Ok((mut ir, sites)) => {
+                Ok((mut ir, sites, _)) => {
                     if let Err(d) = refs::run(&mut ir, &sites) {
                         diags.push(d);
                     }
@@ -189,20 +201,11 @@ fn back(
     sites: &[sites::Site],
     fe: &Front<'_>,
     mut syms: SymTable,
+    subprograms: Vec<pine_ir::SubProgram>,
 ) -> Result<PineProgram, Diag> {
     let opts = fe.opts;
     // Pass 5c (§4.9): references — `3047`, then the `string` field stores' site dispatch.
     refs::run(&mut ir, sites)?;
-    if let Some(s) = sites
-        .iter()
-        .find(|s| s.kind == pine_ir::StateKind::Collection)
-    {
-        // pine-std request (impl-04 §3.5): no `coll_block_bytes` to size the block with yet.
-        let msg = "not implemented: a collection block needs pine_std::coll_block_bytes \
-                   (impl-04 §3.5)"
-            .to_owned();
-        return Err(code::diag(ReasonCode::Internal, s.span, msg));
-    }
     let flag = emit::prepare(&mut ir, &mut syms, fe.d)?;
     let na = nacap::run(&ir, fe.d);
     // §4.10.4: `max_bars_back(x, n)` above `MAX_BARS_BACK_HARD`, or above a manifest `M > 0`.
@@ -249,7 +252,7 @@ fn back(
         budget: opts.limits.insn_budget,
         d: fe.d,
     })?;
-    let meta = meta::build(meta::MetaIn {
+    let mut meta = meta::build(meta::MetaIn {
         ir: &ir,
         decl: fe.decl,
         inputs: fe.inputs,
@@ -259,6 +262,10 @@ fn back(
         intents,
         plots,
     });
+    // `uses_lookahead`: any sub-program of the tree with `lookahead` (contract §3.8).
+    meta.uses_lookahead = subprograms
+        .iter()
+        .any(|s| s.lookahead || s.program.meta.uses_lookahead);
     Ok(PineProgram {
         code: em.code,
         consts: em.consts,
@@ -267,9 +274,47 @@ fn back(
         layout: pl.layout,
         dialect: fe.d,
         mode: opts.mode,
-        subprograms: Vec::new(),
+        subprograms,
         meta,
     })
+}
+
+/// A `request.security` child (§4.11.5, §4.11.8): its own pass 5a one level deeper, then the
+/// whole back half under its own options — no declaration (`Decl::default()`), no inputs, the
+/// parent's effective cap (`pin:02-child-cap-parent`: the child has no declaration of its own; the
+/// cap that sized the parent's windows sizes the cone's).
+fn child(
+    mut ir: ir::Ir,
+    syms: SymTable,
+    opts: &CompileOpts,
+    parent: &security::cone::Cx<'_>,
+    tree: &mut security::cone::Tree,
+) -> Result<PineProgram, Diag> {
+    let scx = security::cone::Cx {
+        opts,
+        syms: &syms,
+        cap: parent.cap,
+        udt_fields: parent.udt_fields,
+        depth: parent.depth + 1,
+    };
+    let subs = security::cone::extract(&mut ir, &scx, tree)?;
+    let cx = sites::SiteCtx {
+        d: opts.dialect,
+        cap: parent.cap,
+        collection_cap: opts.limits.collection_cap,
+        str_cell_bytes: opts.limits.str_cell_bytes,
+        udt_fields: parent.udt_fields,
+    };
+    let sites = sites::number(&ir, &cx)?;
+    let decl = decl::Decl::default();
+    let fe = Front {
+        decl: &decl,
+        inputs: &[],
+        opts,
+        d: opts.dialect,
+        cap: parent.cap,
+    };
+    back(ir, &sites, &fe, syms, subs)
 }
 
 /// Pass 0 (§4.1): every input check, collected.

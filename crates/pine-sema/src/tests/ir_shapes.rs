@@ -757,6 +757,7 @@ fn ir_shapes_structures_sma_cross_strategy_lowers() {
         d: Dialect::V6,
         cap: 500,
         collection_cap: 64,
+        str_cell_bytes: 128,
         udt_fields: &[],
     };
     let sites = crate::sites::number(&r, &cx).expect("numbers");
@@ -1116,6 +1117,7 @@ fn sites_of(body: &str, rd: &Readings) -> Result<Vec<crate::sites::Site>, Diag> 
         d: Dialect::V6,
         cap: 500,
         collection_cap: 64,
+        str_cell_bytes: 128,
         udt_fields: &[4],
     };
     crate::sites::number(&ir, &cx)

@@ -696,3 +696,197 @@ fn emit_string_stores_persist_into_own_cells() {
     assert_eq!(cells.len(), by_cell.len(), "one dst per cell");
     assert_eq!(cells.len(), 2, "s and t own one cell each");
 }
+
+/// Collections (impl-02 §4.7.1, impl-04 §3.5): a creator's block is sized by
+/// `pine_std::coll_block_bytes`, and `array.push` / `array.get` / `array.size` and `map.put` /
+/// `map.get` execute on the VM in both dialects and both modes.
+#[test]
+fn emit_collections_execute() {
+    let closes: Vec<f64> = (0..6).map(|i| 10.0 + i as f64).collect();
+    for d in [Dialect::V5, Dialect::V6] {
+        for mode in [ExecMode::BarClose, ExecMode::Realtime] {
+            let h = format!("//@version={}\nindicator(\"t\")\n", d as u8);
+            let s = format!(
+                "{h}var a = array.new_float(0)\narray.push(a, close)\n\
+                 plot(array.size(a))\nplot(array.get(a, 0))\n\
+                 var m = map.new<string, float>()\nmap.put(m, \"k\", close)\n\
+                 plot(map.get(m, \"k\"))\n"
+            );
+            let p = match compile_src(&s, &default_opts(d, mode)) {
+                Ok(p) => p,
+                Err(e) => panic!("{d:?} {mode:?}: {e:#?}"),
+            };
+            let coll: Vec<_> = p
+                .layout
+                .states
+                .iter()
+                .filter(|s| s.kind == pine_ir::StateKind::Collection)
+                .collect();
+            assert_eq!(coll.len(), 2, "{:?}", p.layout.states);
+            let o = default_opts(d, mode).limits;
+            let arr = pine_std::coll_block_bytes(
+                pine_ir::CollKind::Array,
+                pine_ir::Ty::Float,
+                pine_ir::Ty::Void,
+                o.collection_cap,
+                o.str_cell_bytes,
+            );
+            let map = pine_std::coll_block_bytes(
+                pine_ir::CollKind::Map,
+                pine_ir::Ty::Float,
+                pine_ir::Ty::String,
+                o.collection_cap,
+                o.str_cell_bytes,
+            );
+            assert_eq!((coll[0].bytes, coll[1].bytes), (arr, map));
+            let size = plots_of(&s, d, mode, &closes, 0);
+            let first = plots_of(&s, d, mode, &closes, 1);
+            let got = plots_of(&s, d, mode, &closes, 2);
+            for i in 0..closes.len() {
+                assert_eq!(size[i], (i + 1) as f64, "size {d:?} {mode:?} bar {i}");
+                assert_eq!(first[i], closes[0], "get {d:?} {mode:?} bar {i}");
+                assert_eq!(got[i], closes[i], "map {d:?} {mode:?} bar {i}");
+            }
+        }
+    }
+}
+
+/// §4.14.1: a `ValueSrc::Call` value read three times is computed by one prelude call.
+#[test]
+fn emit_prelude_computes_referenced_call_values_once() {
+    // The first `ValueSrc::Call` bar value the lane's pine-std serves (`hl2` waits for its row).
+    let mut pick = None;
+    for name in ["hl2", "hlc3", "ohlc4", "hlcc4", "ta.tr"] {
+        let Some(e) = pine_spec::lookup(name) else {
+            continue;
+        };
+        let Some(v) = e.values().iter().find(|v| v.versions.has(Dialect::V6)) else {
+            continue;
+        };
+        let ov = pine_ir::OverloadId(v.bits as u16);
+        if v.src == pine_spec::ValueSrc::Call
+            && matches!(pine_std::served(ov), pine_std::Served::Body)
+        {
+            pick = Some((name, ov.0));
+            break;
+        }
+    }
+    let Some((name, ov)) = pick else {
+        eprintln!("skipped: no served prelude value in the lane's pine-std");
+        return;
+    };
+    let p = v6p(&format!(
+        "plot({name})\nplot({name} * 2)\nplot({name} + 1)\n"
+    ));
+    let n = p
+        .code
+        .iter()
+        .filter(|i| i.op == op::CALL_BUILTIN && i.a == ov)
+        .count();
+    assert_eq!(n, 1, "{name}");
+    let s = format!("//@version=6\nindicator(\"t\")\nplot({name})\nplot({name} * 2)\n");
+    let closes = [10.0, 12.0, 11.0];
+    let a = plots_of(&s, Dialect::V6, ExecMode::BarClose, &closes, 0);
+    let b = plots_of(&s, Dialect::V6, ExecMode::BarClose, &closes, 1);
+    assert!(!a[2].is_nan(), "{name}: {a:?}");
+    for i in 0..closes.len() {
+        let same = (a[i].is_nan() && b[i].is_nan()) || b[i] == 2.0 * a[i];
+        assert!(same, "{name} bar {i}: {} vs {}", b[i], a[i]);
+    }
+}
+
+/// W1: v5 `const int / const int` folds to an `int`; a v5 `series` division and every v6
+/// division are float (`F_I2F` + `F_DIV`).
+#[test]
+fn emit_int_div_follows_w1() {
+    let closes = [1.0, 2.0];
+    let one = |d: Dialect, body: &str| {
+        let s = format!("//@version={}\nindicator(\"t\")\n{body}", d as u8);
+        plots_of(&s, d, ExecMode::BarClose, &closes, 0)
+    };
+    assert_eq!(one(Dialect::V5, "plot(7 / 2)\n"), vec![3.0, 3.0]);
+    assert_eq!(one(Dialect::V6, "plot(7 / 2)\n"), vec![3.5, 3.5]);
+    assert_eq!(
+        one(Dialect::V5, "a = bar_index + 7\nplot(a / 2)\n"),
+        vec![3.5, 4.0]
+    );
+    assert_eq!(
+        one(Dialect::V6, "a = bar_index + 7\nplot(a / 2)\n"),
+        vec![3.5, 4.0]
+    );
+    let s = "//@version=5\nindicator(\"t\")\na = bar_index + 7\nplot(a / 2)\n";
+    let p = compile_src(s, &default_opts(Dialect::V5, ExecMode::BarClose)).expect("compiles");
+    assert!(p.code.iter().any(|i| i.op == op::F_DIV));
+    assert!(p.code.iter().any(|i| i.op == op::F_I2F));
+}
+
+/// `pin:02-for-step`: a `by` step that does not fold is refused by default (`3008`).
+#[test]
+fn emit_for_step_non_constant_is_refused_by_default() {
+    for d in [Dialect::V5, Dialect::V6] {
+        let s = format!(
+            "//@version={}\nindicator(\"t\")\nst = bar_index % 2 + 1\nv = 0\n\
+             for i = 0 to 10 by st\n    v += 1\nplot(v)\n",
+            d as u8
+        );
+        let r = compile_src(&s, &default_opts(d, ExecMode::BarClose));
+        assert_eq!(common::codes(&r), vec![3008], "{d:?}");
+    }
+}
+
+/// W13 via `bool_na`: an `if` without `else` yielding a `bool` is `false` in v6, `na` in v5.
+#[test]
+fn emit_bool_if_without_else_is_false_in_v6_na_in_v5() {
+    // v6 has no `na` bool (`na(b)` is v5 only), so each dialect reads `b` its own way.
+    for (d, read, want) in [
+        (Dialect::V5, "plot(na(b) ? -1 : b ? 1 : 0)", -1.0),
+        (Dialect::V6, "plot(b ? 1 : 0)", 0.0),
+    ] {
+        let body = format!("b = if close > 1000\n    true\n{read}\n");
+        let s = format!("//@version={}\nindicator(\"t\")\n{body}", d as u8);
+        let got = plots_of(&s, d, ExecMode::BarClose, &[10.0, 11.0], 0);
+        assert_eq!(got, vec![want, want], "{d:?}");
+    }
+}
+
+/// §4.12.2: an override changes the folded constant and its `InputDesc` (`default_bits`, the
+/// `OVERRIDDEN` flag) and nothing else.
+#[test]
+fn emit_input_override_changes_only_the_value() {
+    let src = "//@version=6\nindicator(\"t\")\nlen = input.int(14, \"L\")\nplot(close * len)\n";
+    let base = default_opts(Dialect::V6, ExecMode::BarClose);
+    let mut over = base.clone();
+    over.inputs = vec![pine_ir::InputOverride {
+        name: "len".to_owned(),
+        value: pine_ir::InputValue::Int(20),
+    }];
+    let a = compile_src(src, &base).expect("compiles");
+    let b = compile_src(src, &over).expect("compiles");
+    assert_eq!(a.code, b.code);
+    assert_eq!(a.argwin, b.argwin);
+    assert_eq!(a.layout, b.layout);
+    assert_eq!(a.consts.len(), b.consts.len());
+    let diff: Vec<usize> = (0..a.consts.len())
+        .filter(|&i| a.consts[i] != b.consts[i])
+        .collect();
+    assert_eq!(diff.len(), 1, "{:?} {:?}", a.consts, b.consts);
+    let (da, db) = (&a.meta.inputs[0], &b.meta.inputs[0]);
+    assert_eq!((da.default_bits, db.default_bits), (14, 20));
+    assert_eq!(da.flags & pine_ir::input_flag::OVERRIDDEN, 0);
+    assert_ne!(db.flags & pine_ir::input_flag::OVERRIDDEN, 0);
+    assert_eq!((da.name, da.ty, da.kind), (db.name, db.ty, db.kind));
+}
+
+/// MG-23: a `for` bound is computed once before the loop in v5 and re-read in the head on every
+/// iteration in v6 — a body that lowers the bound stops a v6 loop early.
+#[test]
+fn emit_for_bound_follows_mg23() {
+    let body = "n = 3\nv = 0\nfor i = 0 to n\n    v += 1\n    n := 1\nplot(v)\n";
+    for (d, want) in [(Dialect::V5, 4.0), (Dialect::V6, 2.0)] {
+        for mode in [ExecMode::BarClose, ExecMode::Realtime] {
+            let s = format!("//@version={}\nindicator(\"t\")\n{body}", d as u8);
+            let got = plots_of(&s, d, mode, &[10.0, 11.0], 0);
+            assert_eq!(got, vec![want, want], "{d:?} {mode:?}");
+        }
+    }
+}

@@ -118,3 +118,46 @@ fn meta_inputs_source_override_aliases_a_series() {
     let body = "src = input.source(close * 2, \"Src\")\nplot(src)\n";
     assert_eq!(run(body, Vec::new()), vec![5006]);
 }
+
+/// §4.12.5 (I23): `unmatched_input_overrides` returns exactly the `opts.inputs` keys no compiled
+/// `InputDesc::name` equals, in `opts.inputs` order; `compile` itself accepts them.
+#[test]
+fn meta_inputs_unmatched_overrides_are_reported() {
+    let body = "len = input.int(14, \"Length\")\nsrc = input.source(close, \"Src\")\n\
+                plot(ta.sma(src, len))\n";
+    let mut o = default_opts(Dialect::V6, ExecMode::BarClose);
+    o.inputs = vec![
+        InputOverride {
+            name: "nope".to_owned(),
+            value: InputValue::Int(3),
+        },
+        InputOverride {
+            name: "len".to_owned(),
+            value: InputValue::Int(20),
+        },
+        InputOverride {
+            name: "Length".to_owned(),
+            value: InputValue::Int(20),
+        },
+        InputOverride {
+            name: "LEN".to_owned(),
+            value: InputValue::Int(20),
+        },
+    ];
+    let src = format!("//@version=6\nindicator(\"t\")\n{body}");
+    let p = match compile_src(&src, &o) {
+        Ok(p) => p,
+        Err(e) => panic!("{e:#?}"),
+    };
+    // The key is the variable (`len`), not the title; bytes compare, so `LEN` is unknown too.
+    assert_eq!(
+        pine_sema::unmatched_input_overrides(&p, &o),
+        vec!["nope", "Length", "LEN"]
+    );
+    o.inputs.retain(|x| x.name == "len");
+    let p = compile_src(&src, &o).expect("compiles");
+    assert!(pine_sema::unmatched_input_overrides(&p, &o).is_empty());
+    let none = default_opts(Dialect::V6, ExecMode::BarClose);
+    let p = compile_src(&src, &none).expect("compiles");
+    assert!(pine_sema::unmatched_input_overrides(&p, &none).is_empty());
+}

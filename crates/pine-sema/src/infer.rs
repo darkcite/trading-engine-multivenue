@@ -1819,8 +1819,22 @@ impl<'a, 's> Infer<'a, 's> {
                     }
                     None => None,
                 };
+                // §4.11.3: a `request.security` of a tuple returns the tuple — one series
+                // element per expression element.
+                let sec_tuple = if crate::security::is_security(p.ov) {
+                    self.security_tuple(n, ov, &p.bound)
+                } else {
+                    None
+                };
                 self.cur.calls.push((n, Callee::Builtin(p.ov)));
                 self.cur.bound.push((n, p.bound));
+                if let Some(items) = sec_tuple {
+                    self.tuples.push(items);
+                    return Ex {
+                        tup: Some((self.tuples.len() - 1) as u32),
+                        ..Ex::of(TypeQ::scalar(Ty::Void, Qual::Series), None)
+                    };
+                }
                 let r = self.result(&p.rets);
                 Ex { k: input_k, ..r }
             }
@@ -1829,6 +1843,45 @@ impl<'a, 's> Infer<'a, 's> {
                 self.push_bad(d)
             }
         }
+    }
+
+    /// The element types of a `request.security` whose `expression` is a tuple, as series.
+    fn security_tuple(
+        &self,
+        n: NodeId,
+        ov: &pine_spec::Overload,
+        bound: &[Option<u16>],
+    ) -> Option<Vec<TypeQ>> {
+        let ps = pine_spec::params(ov);
+        let ast = self.ast();
+        let Node::Call { args, .. } = ast.node(n) else {
+            return None;
+        };
+        for (k, &a) in args.iter().enumerate() {
+            let Some(Some(r)) = bound.get(k).copied() else {
+                continue;
+            };
+            if ps.get(usize::from(r)).map(|p| p.name.as_str()) != Some("expression") {
+                continue;
+            }
+            let v = match ast.node(a) {
+                Node::NamedArg { value, .. } => value,
+                _ => a,
+            };
+            let Node::Tuple { items } = ast.node(v) else {
+                return None;
+            };
+            let mut out = Vec::with_capacity(items.len());
+            for &it in items {
+                let t = self.cur.ty.get(it.0 as usize).copied().flatten()?;
+                out.push(TypeQ {
+                    qual: Qual::Series,
+                    ..t
+                });
+            }
+            return Some(out);
+        }
+        None
     }
 
     fn result(&mut self, rets: &[TypeQ]) -> Ex {

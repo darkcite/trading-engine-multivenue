@@ -29,10 +29,6 @@ pub fn canonical_bytes(p: &PineProgram) -> Vec<u8> {
 
 /// `SubProgram::key` (contract §3.8): FNV-1a 64 over the target, the timeframe, the two barmerge
 /// flags and the child's own code digest (`fnv1a64(&canonical_bytes(&child))`).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "request.security sub-programs (impl-02 T22)")
-)]
 pub(crate) fn sub_key(
     symbol_key: &str,
     timeframe_s: u32,

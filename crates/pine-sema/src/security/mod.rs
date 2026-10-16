@@ -12,7 +12,7 @@
 //! currency is no conversion (`3053`); `calc_bars_count` keeps its default (`3024`); the outputs
 //! are `int`/`float`/`bool`/`color`/enum (`string` → `3044`, a reference → `3024`); every
 //! request's elements together stay within `MAX_REQUEST_ELEMENTS` (`3032`). The cone, the child
-//! IR and the keys are T22; leak-freedom is T23.
+//! IR and the keys are `cone.rs` (T22); leak-freedom is `leak.rs` (T23).
 
 use pine_ir::{is_canonical_symbol_key, CompileOpts, Diag, NodeId, Span, SymTable, Ty, TypeQ};
 use pine_lang::{Ast, Node};
@@ -21,6 +21,9 @@ use pine_spec::pf;
 use crate::code::{diag, ReasonCode};
 use crate::infer::{Callee, Inst, Typed, K};
 use crate::limits::MAX_REQUEST_ELEMENTS;
+
+pub(crate) mod cone;
+pub(crate) mod leak;
 
 /// Whether overload `ov` is `request.security` (§4.11).
 pub(crate) fn is_security(ov: pine_ir::OverloadId) -> bool {

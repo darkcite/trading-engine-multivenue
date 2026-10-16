@@ -70,7 +70,7 @@ fn prep_block(ir: &mut Ir, syms: &mut SymTable, b: &mut Block, d: Dialect) -> Re
         match &mut s {
             Stmt::Op(Op::Call { ov, args, span, .. }) => {
                 let o = pine_spec::overload(*ov);
-                if o.sx & pine_spec::sx::REQUEST != 0 {
+                if o.sx & pine_spec::sx::REQUEST != 0 && !crate::security::is_security(*ov) {
                     return Err(not_yet("a `request.*` sub-program (T21–T23)", *span));
                 }
                 time_bars_back(ir, o, args, d, *span)?;
