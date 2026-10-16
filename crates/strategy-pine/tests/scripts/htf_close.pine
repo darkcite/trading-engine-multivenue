@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// OUR CODE: one request.security("240") sub-program, lookahead off (the P4 dedupe probe, T7).
+strategy("htf close (strategy-pine T7)", overlay = true)
+h = request.security(syminfo.tickerid, "240", close)
+plot(h)
+if close > h
+    strategy.entry("L", strategy.long)
+if close < h
+    strategy.close("L")

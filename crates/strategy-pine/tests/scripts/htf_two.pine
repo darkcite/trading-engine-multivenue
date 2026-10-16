@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// OUR CODE: two distinct request.security sub-programs (1 h and 4 h), lookahead off — the
+// pin:08-sub-charge-own-bound probe (impl-08 T7 ruling, 2026-10-16).
+strategy("htf two (strategy-pine T7 ruling)", overlay = true)
+h1 = request.security(syminfo.tickerid, "60", close)
+h4 = request.security(syminfo.tickerid, "240", close)
+plot(h1)
+plot(h4)
+if close > h1 and h1 > h4
+    strategy.entry("L", strategy.long)
+if close < h4
+    strategy.close("L")

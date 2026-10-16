@@ -1,0 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// OUR CODE: close with lookahead_on and no offset leaks the future; live_bound refuses it (3043).
+strategy("leak (strategy-pine T5)")
+h = request.security(syminfo.tickerid, "240", close, lookahead = barmerge.lookahead_on)
+plot(h)
