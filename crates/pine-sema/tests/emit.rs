@@ -354,3 +354,345 @@ fn emit_input_length_executes_with_the_value_in_effect() {
         }
     }
 }
+
+/// UDT objects (§4.14.7, T15): `O_NEW` + every field stored, field reads and stores, reference
+/// aliasing, `copy()` (method and function forms), a `var` object and a nested one, the v6 `bool`
+/// default, an `na` int field, and `string` field stores — one site, and the site dispatch.
+#[test]
+fn emit_objects_execute() {
+    let closes: Vec<f64> = (0..8).map(|i| 10.0 + i as f64).collect();
+    const PT: &str = "type Pt\n    float x = 0.0\n    int n = 1\n";
+    for d in [Dialect::V5, Dialect::V6] {
+        for mode in [ExecMode::BarClose, ExecMode::Realtime] {
+            let h = format!("//@version={}\nindicator(\"t\")\n{PT}", d as u8);
+            // A `var` object accumulates across bars.
+            let s = format!(
+                "{h}var p = Pt.new(0.0)\np.x := p.x + close\np.n += 1\nplot(p.x)\nplot(p.n)\n"
+            );
+            let (a, b) = (
+                plots_of(&s, d, mode, &closes, 0),
+                plots_of(&s, d, mode, &closes, 1),
+            );
+            let mut acc = 0.0;
+            for i in 0..closes.len() {
+                acc += closes[i];
+                assert_eq!(a[i], acc, "var object {d:?} {mode:?} bar {i}");
+                assert_eq!(b[i], (i + 2) as f64, "var int field {d:?} {mode:?} bar {i}");
+            }
+            // References alias; `copy()` does not.
+            let s = format!(
+                "{h}a = Pt.new(close)\nb = a\nb.x := b.x * 2\nc = a.copy()\nc.x := 0.0\n\
+                 e = Pt.copy(a)\nplot(a.x)\nplot(c.x)\nplot(e.x)\n"
+            );
+            let (a, c, e) = (
+                plots_of(&s, d, mode, &closes, 0),
+                plots_of(&s, d, mode, &closes, 1),
+                plots_of(&s, d, mode, &closes, 2),
+            );
+            for i in 0..closes.len() {
+                assert_eq!(a[i], 2.0 * closes[i], "alias {d:?} {mode:?} bar {i}");
+                assert_eq!(c[i], 0.0, "copy {d:?} {mode:?} bar {i}");
+                assert_eq!(e[i], 2.0 * closes[i], "T.copy {d:?} {mode:?} bar {i}");
+            }
+            // A `var` object nested in a `var` initialiser.
+            let s = format!(
+                "{h}type Box\n    Pt p\nvar b = Box.new(Pt.new(0.0))\nb.p.x := b.p.x + 1\nplot(b.p.x)\n"
+            );
+            let a = plots_of(&s, d, mode, &closes, 0);
+            for (i, g) in a.iter().enumerate() {
+                assert_eq!(*g, (i + 1) as f64, "nested {d:?} {mode:?} bar {i}");
+            }
+            // An `int` field without a default is `na`; a `bool` one is `false` in v6.
+            let s = format!(
+                "{h}type Q\n    int n\n    bool f\nq = Q.new()\nplot(na(q.n) ? 1 : 0)\nplot(q.f ? 1 : 0)\n"
+            );
+            let (a, b) = (
+                plots_of(&s, d, mode, &closes, 0),
+                plots_of(&s, d, mode, &closes, 1),
+            );
+            assert!(a.iter().all(|&g| g == 1.0), "na int field {d:?} {mode:?}");
+            assert!(b.iter().all(|&g| g == 0.0), "bool field {d:?} {mode:?}");
+            // `string` fields: defaults, a store through one site, and the site dispatch.
+            let s = format!(
+                "{h}type L\n    string s = \"a\"\nx = L.new()\ny = L.new(\"b\")\n\
+                 z = close > 12 ? x : y\nz.s := \"c\"\nvar l = L.new()\n\
+                 l.s := close > 13 ? \"hi\" : \"lo\"\n\
+                 plot(x.s == \"c\" ? 1 : 0)\nplot(y.s == \"c\" ? 1 : 0)\n\
+                 plot(y.s == \"b\" ? 1 : 0)\nplot(l.s == \"hi\" ? 1 : 0)\n"
+            );
+            let r = compile_src(&s, &default_opts(d, mode));
+            if common::codes(&r) == vec![common::NOT_IMPLEMENTED] {
+                eprintln!("skipped: {:?}", r.err());
+                continue; // a string row the lane's pine-std does not serve yet
+            }
+            let p: Vec<Vec<f64>> = (0..4).map(|k| plots_of(&s, d, mode, &closes, k)).collect();
+            for (i, &c) in closes.iter().enumerate() {
+                let up = c > 12.0;
+                assert_eq!(
+                    p[0][i],
+                    if up { 1.0 } else { 0.0 },
+                    "x.s {d:?} {mode:?} bar {i}"
+                );
+                assert_eq!(
+                    p[1][i],
+                    if up { 0.0 } else { 1.0 },
+                    "y.s {d:?} {mode:?} bar {i}"
+                );
+                assert_eq!(
+                    p[2][i],
+                    if up { 1.0 } else { 0.0 },
+                    "y.s b {d:?} {mode:?} bar {i}"
+                );
+                assert_eq!(
+                    p[3][i],
+                    if c > 13.0 { 1.0 } else { 0.0 },
+                    "l.s {d:?} {mode:?} {i}"
+                );
+            }
+        }
+    }
+}
+
+/// §4.14.7: a handle from two `Object` sites — `I_MOD` by 65 536, one compare, two
+/// `S_PERSIST` / `O_SET_I` arms.
+#[test]
+fn emit_udt_string_field_dispatch_on_two_sites() {
+    let s = "//@version=6\nindicator(\"t\")\ntype L\n    string s = \"a\"\nx = L.new()\n\
+             y = L.new(\"b\")\nz = close > open ? x : y\nz.s := \"c\"\nplot(close)\n";
+    let p = compile_src(s, &default_opts(Dialect::V6, ExecMode::BarClose)).expect("compiles");
+    let m = p
+        .code
+        .iter()
+        .position(|i| i.op == op::I_MOD)
+        .expect("I_MOD");
+    let k = p.code[m].b;
+    // The divisor is the constant 65 536 (an init-block `I_CONST` of that slot).
+    assert!(p
+        .code
+        .iter()
+        .any(|i| i.op == op::I_CONST && i.dst == k && p.consts[usize::from(i.a)] == 65_536));
+    let tail = &p.code[m..];
+    let count = |o: u8| tail.iter().filter(|i| i.op == o).count();
+    assert_eq!(count(op::I_EQ), 1, "one compare for two candidates");
+    assert_eq!(count(op::S_PERSIST), 2, "two arms");
+    assert_eq!(count(op::O_SET_I), 2, "two arms");
+    // The two arms persist into the two sites' own staging cells.
+    let cells: Vec<u16> = tail
+        .iter()
+        .filter(|i| i.op == op::S_PERSIST)
+        .map(|i| i.b)
+        .collect();
+    assert_ne!(cells[0], cells[1]);
+}
+
+fn v6p(body: &str) -> PineProgram {
+    let src = format!("//@version=6\nindicator(\"t\")\n{body}");
+    match compile_src(&src, &default_opts(Dialect::V6, ExecMode::BarClose)) {
+        Ok(p) => p,
+        Err(e) => panic!("{e:#?}\n{src}"),
+    }
+}
+
+/// The init block's end: the target of the `JNZ g` at pc 0.
+fn init_end(p: &PineProgram) -> usize {
+    assert_eq!(p.code[0].op, op::JNZ);
+    ((u32::from(p.code[0].dst) << 16) | u32::from(p.code[0].a)) as usize
+}
+
+/// I8: one `CALL_BUILTIN` per `Builtin` site, in `SiteId` order; one `O_NEW` per `Object` site.
+#[test]
+fn emit_one_instruction_per_site() {
+    let p = v6p(
+        "type P\n    float v = 0.0\na = ta.sma(close, 5)\nb = ta.sma(close, 9)\no = P.new(a)\n\
+         plot(o.v + b)\n",
+    );
+    let sites: Vec<u16> = p
+        .code
+        .iter()
+        .filter(|i| i.op == op::CALL_BUILTIN && i.dst != pine_ir::SiteId::NONE.0)
+        .map(|i| i.dst)
+        .chain(p.code.iter().filter(|i| i.op == op::O_NEW).map(|i| i.a))
+        .collect();
+    let mut sorted = sites.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), sites.len(), "no site emitted twice");
+    assert_eq!(
+        sorted,
+        (0..p.layout.states.len() as u16).collect::<Vec<_>>()
+    );
+}
+
+/// I9: no constant, move or builtin output writes a reserved slot.
+#[test]
+fn emit_never_writes_a_reserved_slot() {
+    use pine_ir::{abi, argwin};
+    let p = sma_cross(Dialect::V6, ExecMode::BarClose);
+    for i in &p.code {
+        match i.op {
+            op::F_CONST | op::F_MOV => assert!(i.dst >= abi::RESERVED_F, "{i:?}"),
+            op::I_CONST | op::I_MOV => assert!(i.dst >= abi::RESERVED_I, "{i:?}"),
+            op::CALL_BUILTIN => {
+                let w = usize::from(i.b);
+                let n = usize::from(p.argwin[w]);
+                let n_out = pine_std::BUILTINS.entries[usize::from(i.a)].n_out as usize;
+                for e in &p.argwin[w + 1 + n - n_out..w + 1 + n] {
+                    let floor = if argwin::is_i64(*e) {
+                        abi::RESERVED_I
+                    } else {
+                        abi::RESERVED_F
+                    };
+                    assert!(argwin::slot(*e) >= floor, "{i:?}");
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Every `Const` slot is written once, in the init block between the guard and the body.
+#[test]
+fn emit_constants_are_written_once_in_the_init_block() {
+    let p = v6p("x = close * 2.5 + 2.5\ny = bar_index % 7 + 7\nplot(x + y)\n");
+    let end = init_end(&p);
+    let mut seen = std::collections::BTreeSet::new();
+    for i in &p.code[1..end] {
+        if i.op == op::F_CONST || i.op == op::I_CONST {
+            assert!(seen.insert((i.op, i.dst)), "{i:?} written twice");
+        }
+    }
+    assert!(!seen.is_empty());
+}
+
+/// The `NA_CLEAR`s of class-V slots sit in the init block, before the guard's store.
+#[test]
+fn emit_class_v_slots_are_cleared_in_the_init_block() {
+    let p = v6p("type P\n    float v = 0.0\nvar o = P.new()\no.v += 1\nplot(o.v)\n");
+    let end = init_end(&p);
+    let clears: Vec<usize> = (0..p.code.len())
+        .filter(|&k| p.code[k].op == op::NA_CLEAR)
+        .collect();
+    assert!(!clears.is_empty(), "the var handle's validity is read");
+    assert!(clears.iter().all(|&k| k < end));
+}
+
+#[test]
+fn emit_mod_is_floored_opcode() {
+    let p = v6p("a = bar_index % 3\nb = close % 2.5\nplot(a + b)\n");
+    assert!(p.code.iter().any(|i| i.op == op::I_MOD));
+    assert!(p.code.iter().any(|i| i.op == op::F_MOD));
+}
+
+#[test]
+fn emit_float_div_sets_na_on_nonfinite_by_default() {
+    use pine_ir::flg::NA_ON_NONFINITE;
+    let p = v6p("a = close / open\nb = close % open\nc = math.pow(close, open)\nplot(a + b + c)\n");
+    for o in [op::F_DIV, op::F_MOD, op::F_POW] {
+        let i = p.code.iter().find(|i| i.op == o).expect("emitted");
+        assert_ne!(i.flags & NA_ON_NONFINITE, 0, "{o:#x}");
+    }
+}
+
+#[test]
+fn emit_lowered_builtins_never_call() {
+    let p = v6p(
+        "x = bar_index > 2 ? close : na\na = na(x) ? 1.0 : 0.0\nb = nz(x)\nc = float(bar_index)\n\
+         d = int(close)\ne = math.abs(close - open)\nf = math.sqrt(close)\n\
+         g = math.pow(close, 2)\nh = math.max(close, open)\nplot(a + b + c + d + e + f + g + h)\n",
+    );
+    let calls = p.code.iter().filter(|i| i.op == op::CALL_BUILTIN).count();
+    assert_eq!(calls, 1, "only the plot calls");
+}
+
+#[test]
+fn emit_budget_too_small_is_refused() {
+    let mut o = default_opts(Dialect::V6, ExecMode::BarClose);
+    o.limits.insn_budget = 10;
+    let src = "//@version=6\nindicator(\"t\")\nx = close * 2 + open * 3 - high / low\nplot(x)\n";
+    assert_eq!(common::codes(&compile_src(src, &o)), vec![3023]);
+}
+
+#[test]
+fn emit_plot_indices_put_hlines_last() {
+    let p = v6p("hline(1.0)\nplot(close)\nplotcandle(open, high, low, close)\n");
+    let kinds: Vec<pine_ir::PlotKind> = p.meta.plots.iter().map(|x| x.kind).collect();
+    assert_eq!(kinds.len(), 6);
+    assert_eq!(kinds[5], pine_ir::PlotKind::Hline);
+    assert!(kinds[..5].iter().all(|&k| k != pine_ir::PlotKind::Hline));
+}
+
+#[test]
+fn emit_for_counts_down_when_from_exceeds_to() {
+    let s = "//@version=6\nindicator(\"t\")\ns = 0\nm = 0\nfor i = 5 to 1\n    s += i\n    \
+             m := m * 10 + i\nplot(s)\nplot(m)\n";
+    let closes = [10.0, 11.0];
+    assert!(plots_of(s, Dialect::V6, ExecMode::BarClose, &closes, 0)
+        .iter()
+        .all(|&g| g == 15.0));
+    assert!(plots_of(s, Dialect::V6, ExecMode::BarClose, &closes, 1)
+        .iter()
+        .all(|&g| g == 54_321.0));
+}
+
+#[test]
+fn emit_budget_precedes_work_linear_calls() {
+    let wma = pine_spec::lookup("ta.wma").expect("ta.wma");
+    let lin = (wma.ov_lo..wma.ov_hi)
+        .any(|o| pine_spec::overload(pine_ir::OverloadId(o)).sx & pine_spec::sx::WORK_LINEAR != 0);
+    if !lin {
+        eprintln!("skipped: ta.wma carries no sx::WORK_LINEAR in this pine-spec");
+        return;
+    }
+    let p = v6p("plot(ta.wma(close, 300))\n");
+    let c = p
+        .code
+        .iter()
+        .position(|i| i.op == op::CALL_BUILTIN)
+        .expect("call");
+    let b = p.code[c - 1];
+    assert_eq!((b.op, b.a, b.b), (op::BUDGET, 300, 0));
+    let q = v6p("plot(ta.sma(close, 300))\n");
+    assert!(!q.code.iter().any(|i| i.op == op::BUDGET));
+}
+
+#[test]
+fn emit_captures_are_never_eliminated() {
+    let p = v6p("x = close * 3.0\ny = x - open\nplot(y)\n");
+    assert!(p.code.iter().any(|i| i.op == op::F_MUL));
+    assert!(p.code.iter().any(|i| i.op == op::F_SUB));
+}
+
+#[test]
+fn emit_var_guard_flag_is_varip_for_varip() {
+    let p = v6p("varip int n = 0\nn += 1\nplot(n)\n");
+    let end = init_end(&p);
+    // The guard tests its flag (`JZ f → init`); the flag lives in the varip tail.
+    let guard = p.code[end..]
+        .iter()
+        .find(|i| i.op == op::JZ || i.op == op::JNZ)
+        .expect("the varip declaration's guard");
+    assert!(
+        u32::from(guard.b) >= p.layout.i64_varip_from,
+        "flag {} below the varip tail {}",
+        guard.b,
+        p.layout.i64_varip_from
+    );
+}
+
+#[test]
+fn emit_string_stores_persist_into_own_cells() {
+    let p = v6p("s = close > open ? \"u\" : \"d\"\nt = s\nt := \"x\"\nplot(s == t ? 1 : 0)\n");
+    // I11: each cell has exactly one destination slot.
+    let mut by_cell: Vec<(u16, u16)> = p
+        .code
+        .iter()
+        .filter(|i| i.op == op::S_PERSIST)
+        .map(|i| (i.b, i.dst))
+        .collect();
+    by_cell.sort_unstable();
+    by_cell.dedup();
+    let mut cells: Vec<u16> = by_cell.iter().map(|c| c.0).collect();
+    cells.dedup();
+    assert_eq!(cells.len(), by_cell.len(), "one dst per cell");
+    assert_eq!(cells.len(), 2, "s and t own one cell each");
+}

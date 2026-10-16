@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{codes, compile_with_libs, diags, v5, ACCEPTED, NOT_IMPLEMENTED};
+use common::{codes, compile_with_libs, diags, v5, ACCEPTED};
 use pine_ir::{fnv1a64_continue, FNV1A64_OFFSET};
 use pine_sema::{LibCache, LibKey};
 
@@ -418,8 +418,8 @@ fn imports_library_types_resolve_through_the_alias() {
     let lib = "//@version=5\nlibrary(\"l\")\nexport type P\n    float v = 0.0\ntype H\n    float v = 0.0\nexport f(float x) => x\n";
     let mut libs = LibCache::in_memory(vec![(key("u", "l", 1), lib.to_owned())]);
     let r = compile_with_libs(&root("import u/l/1\nl.P p = l.P.new()\n"), &v5(), &mut libs);
-    // An object site: emission waits for T15's provenance (`not implemented`).
-    assert_eq!(codes(&r), vec![NOT_IMPLEMENTED]);
+    // An object of a library type compiles (and verifies, `compile_with_libs`) since T15.
+    assert_eq!(codes(&r), vec![ACCEPTED]);
     let r = compile_with_libs(&root("import u/l/1\nl.H h = na\n"), &v5(), &mut libs);
     assert_eq!(codes(&r), vec![3038]);
 }

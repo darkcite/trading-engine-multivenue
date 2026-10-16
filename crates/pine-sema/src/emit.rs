@@ -11,8 +11,10 @@
 //!
 //! The prelude (§4.14.1) is lowered at the head of the body (`lower.rs`), so it is emitted in
 //! code order before the body. Not emitted yet (refused `3255` naming the gap, never emitted
-//! wrong): UDT objects (T15's provenance decides 3047 and the string-field
-//! dispatch), `request.*` sub-programs (T21–T23), `break` / `continue` inside U13 copies. U17:
+//! wrong): `request.*` sub-programs (T22–T23). `break` / `continue` inside U13 copies jump past
+//! the copies / to the next copy. UDT
+//! objects: `O_NEW` (every field then stored), `O_GET_*`, `O_SET_*`; a `string` field's store
+//! arrives staged by refs.rs (§4.9). U17:
 //! pine-spec carries no `isnew` reading, so this is the `contract` reading — no fixup, reads go
 //! to the reserved slots (§4.14.1).
 
@@ -56,19 +58,13 @@ fn info(ty: Ty, lane: Lane, kind: SlotKind) -> SlotInfo {
 /// not cover yet. Returns `g`.
 pub(crate) fn prepare(ir: &mut Ir, syms: &mut SymTable, d: Dialect) -> Result<VSlot, Diag> {
     let mut body = std::mem::take(&mut ir.body);
-    let r = prep_block(ir, syms, &mut body, false, d);
+    let r = prep_block(ir, syms, &mut body, d);
     ir.body = body;
     r?;
     Ok(ir.slot(info(Ty::Int, Lane::I64, SlotKind::Flag { varip: false })))
 }
 
-fn prep_block(
-    ir: &mut Ir,
-    syms: &mut SymTable,
-    b: &mut Block,
-    unrolled: bool,
-    d: Dialect,
-) -> Result<(), Diag> {
+fn prep_block(ir: &mut Ir, syms: &mut SymTable, b: &mut Block, d: Dialect) -> Result<(), Diag> {
     let mut out: Vec<Stmt> = Vec::with_capacity(b.0.len());
     for mut s in std::mem::take(&mut b.0) {
         match &mut s {
@@ -127,37 +123,24 @@ fn prep_block(
                     *k = K::Dyn(kk);
                 }
             }
-            Stmt::Op(Op::ObjNew { span, .. }) => {
-                return Err(not_yet(
-                    "a UDT object (T15: reference provenance, code 3047)",
-                    *span,
-                ));
-            }
             Stmt::Op(_) => {}
             Stmt::If { then, els, .. } => {
-                prep_block(ir, syms, then, unrolled, d)?;
-                prep_block(ir, syms, els, unrolled, d)?;
+                prep_block(ir, syms, then, d)?;
+                prep_block(ir, syms, els, d)?;
             }
             Stmt::Loop {
                 head, body, step, ..
             } => {
-                prep_block(ir, syms, head, false, d)?;
-                prep_block(ir, syms, body, false, d)?;
-                prep_block(ir, syms, step, false, d)?;
+                prep_block(ir, syms, head, d)?;
+                prep_block(ir, syms, body, d)?;
+                prep_block(ir, syms, step, d)?;
             }
             Stmt::Unrolled { copies } => {
                 for c in copies.iter_mut() {
-                    prep_block(ir, syms, c, true, d)?;
+                    prep_block(ir, syms, c, d)?;
                 }
             }
-            Stmt::Break | Stmt::Continue => {
-                if unrolled {
-                    return Err(not_yet(
-                        "`break` / `continue` inside a U13 unrolled loop",
-                        Span::default(),
-                    ));
-                }
-            }
+            Stmt::Break | Stmt::Continue => {}
         }
         out.push(s);
     }
@@ -229,6 +212,8 @@ pub(crate) struct Input<'a> {
     pub(crate) flag: VSlot,
     /// `limits.insn_budget`.
     pub(crate) budget: u32,
+    /// The dialect.
+    pub(crate) d: Dialect,
 }
 
 /// Emit the program.
@@ -479,8 +464,22 @@ impl Em<'_, '_> {
                 Ok(())
             }
             Stmt::Unrolled { copies } => {
+                // U13 copies (§4.7.4): each copy is one iteration — `continue` jumps to the next
+                // copy, `break` past the last one.
+                let mut brk_all = Vec::new();
                 for c in copies {
+                    self.loops.push((Vec::new(), Vec::new()));
                     self.block(c)?;
+                    let (brk, cnt) = self.loops.pop().unwrap_or_default();
+                    let next = self.here();
+                    for j in cnt {
+                        self.patch(j, next);
+                    }
+                    brk_all.extend(brk);
+                }
+                let end = self.here();
+                for j in brk_all {
+                    self.patch(j, end);
                 }
                 Ok(())
             }
@@ -703,12 +702,51 @@ impl Em<'_, '_> {
                     (units >> 16) as u16,
                 );
             }
-            Op::ObjNew { span, .. } => return Err(not_yet("a UDT object (T15)", *span)),
-            Op::ObjGet { .. } | Op::ObjSet { .. } => {
-                return Err(not_yet("a UDT field access (T15)", Span::default()))
+            Op::ObjNew { dst, span, .. } => {
+                let site = self.next_site;
+                self.next_site += 1;
+                let n = match self.x.sites.get(usize::from(site)) {
+                    Some(s) if s.kind == pine_ir::StateKind::Object => (s.bytes - 32) / 8,
+                    _ => return Err(not_yet("an object site the numbering did not give", *span)),
+                };
+                let d = self.w(*dst)?;
+                self.ins(op::O_NEW, 0, d, site, n as u16);
+            }
+            Op::ObjGet { dst, h, field } => {
+                let (d, hs) = (self.w(*dst)?, self.p(*h)?);
+                if self.i64(*dst) {
+                    let f = self.tracked(*dst);
+                    self.ins(op::O_GET_I, f, d, hs, *field);
+                } else {
+                    self.ins(op::O_GET_F, 0, d, hs, *field);
+                }
+            }
+            Op::ObjSet { h, field, src } => {
+                let si = self.info(*src);
+                if si.ty.ty == Ty::String && !matches!(si.kind, SlotKind::Stage { .. }) {
+                    // CAR-03-1 (a): a field never holds a SCRATCH ref (refs.rs stages it).
+                    return Err(not_yet("an unstaged string field store", si.span));
+                }
+                let (hs, v) = (self.p(*h)?, self.p(*src)?);
+                if self.i64(*src) {
+                    let f = self.tracked(*src);
+                    self.ins(op::O_SET_I, f, hs, *field, v);
+                } else {
+                    self.ins(op::O_SET_F, 0, hs, *field, v);
+                }
             }
         }
         Ok(())
+    }
+
+    /// `NA_TRACKED` on an i64 field access iff the field's type can be `na` in the dialect (a
+    /// v6 `bool` never is, §4.14.7).
+    fn tracked(&self, v: VSlot) -> u8 {
+        if self.info(v).ty.ty == Ty::Bool && self.x.d == Dialect::V6 {
+            0
+        } else {
+            flg::NA_TRACKED
+        }
     }
 
     fn ring(&self, v: VSlot) -> Result<u16, Diag> {

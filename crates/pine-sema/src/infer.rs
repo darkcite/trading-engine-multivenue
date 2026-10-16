@@ -619,6 +619,12 @@ impl<'a, 's> Infer<'a, 's> {
                 e.t
             }
         };
+        if mode == DeclMode::Varip && crate::refs::is_ref(base.ty) {
+            // §4.9 `3048` (impl-06 C043): an object or collection block is journaled whole, so a
+            // `varip` reference cannot be honoured.
+            let msg = format!("`{vname}`: a `varip` variable cannot hold an object or collection");
+            return self.refuse(ReasonCode::VaripReference, at, msg);
+        }
         if let Some(q) = qual {
             if !admits(q, e.t.qual) {
                 let msg = format!(
@@ -1702,6 +1708,11 @@ impl<'a, 's> Infer<'a, 's> {
                 return self.builtin_call(n, &full, argv, &[], at);
             }
         }
+        // `obj.copy()`: the method form of `T.copy(obj)` ([objects][obj]: "`copy()` … can be
+        // called as a method"), when no user method of that name applies (§4.5 step 7 first).
+        if user_err.is_none() && recv.ty == Ty::Udt && name == "copy" {
+            return self.udt_call(n, recv.a, m, argv, at);
+        }
         match user_err {
             Some(d) => self.push_bad(d),
             None => {
@@ -1813,7 +1824,10 @@ impl<'a, 's> Infer<'a, 's> {
                 let r = self.result(&p.rets);
                 Ex { k: input_k, ..r }
             }
-            Err(d) => self.push_bad(d),
+            Err(d) => {
+                let d = crate::security::expression_refusal(full, argv, self.syms).unwrap_or(d);
+                self.push_bad(d)
+            }
         }
     }
 

@@ -13,6 +13,7 @@ mod infer;
 mod inputs;
 mod ir_shapes;
 mod mono;
+mod nacap;
 mod overload;
 mod readings;
 mod types;

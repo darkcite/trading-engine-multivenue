@@ -1057,14 +1057,17 @@ fn ir_shapes_objects_copy_is_shallow_with_string_cells() {
         Op::ObjSet { field: 2, src, .. }
             if r.slots[src.0 as usize].kind == SlotKind::Stage { site: 1, field: 2 }
     )));
-    // A string field store on an arbitrary handle waits for T15's provenance.
-    let e = try_ir(
+    // A string field store on an arbitrary handle is lowered unstaged: refs.rs (§4.9, T15)
+    // stages it through each candidate site's staging slot.
+    let r = ir(
         &format!("{POINT}p = P.new()\np.s := \"z\"\nplot(close)\n"),
         Dialect::V6,
-        &Readings::of(Dialect::V6),
-    )
-    .expect_err("T15");
-    assert_eq!(e.code.0, 3255);
+    );
+    assert!(ops(&r).iter().any(|x| matches!(
+        x,
+        Op::ObjSet { field: 2, src, .. }
+            if r.slots[src.0 as usize].kind == SlotKind::Const
+    )));
 }
 
 #[test]

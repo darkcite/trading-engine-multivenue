@@ -440,6 +440,11 @@ pub(crate) struct Ir {
     /// Amendment A6: one row per `strategy.entry` / `strategy.order` site whose `id` folds —
     /// `(str_key(id), entry_dir bits)`; [`Ir::entry_dirs`] merges them.
     pub(crate) entry_sites: Vec<(pine_ir::StrKey, u8)>,
+    /// Every `var` / `varip` declaration: `(its variable slot, its Guard flag)` — §4.9's
+    /// persistent storage and var-born classification read them.
+    pub(crate) var_decls: Vec<(VSlot, VSlot)>,
+    /// `max_bars_back(x, n)` (§4.10.4): `(x's slot, n)`, the variable's own cap.
+    pub(crate) var_caps: Vec<(VSlot, u32)>,
 }
 
 impl Ir {

@@ -31,6 +31,7 @@ pub(crate) struct Series {
 pub(crate) fn run(ir: &Ir, sites: &[Site], cap: u32) -> Result<Series, Diag> {
     let mut cx = Cx {
         cap,
+        var_caps: &ir.var_caps,
         spans: ir.slots.iter().map(|s| s.span).collect(),
         demand: Vec::new(),
         mbb: 0,
@@ -64,8 +65,10 @@ pub(crate) fn run(ir: &Ir, sites: &[Site], cap: u32) -> Result<Series, Diag> {
     })
 }
 
-struct Cx {
+struct Cx<'a> {
     cap: u32,
+    /// `max_bars_back(x, n)`: a variable's own cap (§4.10.4), the largest when given twice.
+    var_caps: &'a [(VSlot, u32)],
     /// Each slot's span: a refusal names the series read.
     spans: Vec<Span>,
     demand: Vec<(VSlot, u32)>,
@@ -73,7 +76,7 @@ struct Cx {
     err: Option<Diag>,
 }
 
-impl Cx {
+impl Cx<'_> {
     fn want(&mut self, v: VSlot, k: u32) {
         match self.demand.iter_mut().find(|d| d.0 == v) {
             Some(d) => d.1 = d.1.max(k),
@@ -96,12 +99,18 @@ impl Cx {
                         self.want(*src, k);
                     }
                     K::Dyn(_) => {
-                        if self.cap == 0 && self.err.is_none() {
+                        let own = self
+                            .var_caps
+                            .iter()
+                            .filter(|c| c.0 == *src)
+                            .map(|c| c.1)
+                            .max();
+                        let c = own.unwrap_or(self.cap);
+                        if c == 0 && self.err.is_none() {
                             let msg = "a dynamic history offset with no max_bars_back".to_owned();
                             let at = self.spans[src.0 as usize];
                             self.err = Some(diag(ReasonCode::UnboundedLookback, at, msg));
                         }
-                        let c = self.cap;
                         self.want(*src, c);
                     }
                 },

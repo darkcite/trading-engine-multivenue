@@ -383,8 +383,16 @@ impl<'a> File<'a> {
         match ast.node(id) {
             Node::Ident { sym } => self.ident(id, sym),
             Node::Field { .. } => self.field(id),
-            Node::Call { callee, args, .. } => {
+            Node::Call {
+                callee,
+                args,
+                type_args,
+                ..
+            } => {
                 self.callee(callee);
+                for &t in type_args {
+                    self.written_type(t, Qual::Series);
+                }
                 for &a in args {
                     self.node(a);
                 }
@@ -974,11 +982,43 @@ impl<'a> File<'a> {
     /// The `TypeQ` of a written type, its refusal recorded.
     fn written_type(&mut self, node: NodeId, qual: Qual) -> Option<TypeQ> {
         match type_ref(self.ast, self.syms, node, qual, &|p| self.named(p)) {
-            Ok(t) => Some(t),
+            Ok(t) => {
+                self.type_uses(node);
+                Some(t)
+            }
             Err(d) => {
                 self.diags.push(d);
                 None
             }
+        }
+    }
+
+    /// Record the bindings a written type names — its path (a user type, an enum, a library
+    /// alias) and every type argument's — so pass 3 reads them like any other use.
+    fn type_uses(&mut self, node: NodeId) {
+        let ast = self.ast;
+        let Node::TypeRef { path, args, .. } = ast.node(node) else {
+            return;
+        };
+        match ast.node(path) {
+            Node::Ident { sym } => {
+                if let Some((b @ (Binding::Udt { .. } | Binding::Enum { .. }), _)) =
+                    self.scopes.lookup(sym)
+                {
+                    self.uses[path.0 as usize] = Some(b);
+                }
+            }
+            Node::Field { base, .. } => {
+                if let Node::Ident { sym } = ast.node(base) {
+                    if let Some((b @ Binding::Lib { .. }, _)) = self.scopes.lookup(sym) {
+                        self.uses[base.0 as usize] = Some(b);
+                    }
+                }
+            }
+            _ => {}
+        }
+        for &a in args {
+            self.type_uses(a);
         }
     }
 

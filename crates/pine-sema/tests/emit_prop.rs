@@ -7,50 +7,14 @@
 //! templates over the earlier variables (T28 grows it into `arb_script`).
 
 mod common;
+#[path = "common/gen.rs"]
+mod gen;
 
 use common::{compile_src, default_opts};
+use gen::{script, TEMPLATES};
 use pine_ir::{barflag, Dialect, ExecMode, StepOutcome};
 use pine_vm::testkit::{bar, Arena, Ctx};
 use proptest::prelude::*;
-
-/// One statement defining `v{i}` from earlier variables `a`, `b`.
-fn stmt(t: u8, i: usize, a: &str, b: &str, n: u32) -> String {
-    let k = 1 + n % 9;
-    match t {
-        0 => format!("v{i} = ta.sma({a}, {n})\n"),
-        1 => format!("v{i} = ta.ema({a}, {n})\n"),
-        2 => format!("v{i} = {a}[{k}]\n"),
-        3 => format!("v{i} = {a} + {b}\n"),
-        4 => format!("v{i} = {a} > {b} ? {a} : {b}\n"),
-        5 => format!("v{i} = nz({a}, 0.0)\n"),
-        6 => format!("v{i} = math.max({a}, {b})\n"),
-        7 => format!(
-            "if ta.crossover({a}, {b})\n    strategy.entry(\"L\", strategy.long)\nv{i} = {a}\n"
-        ),
-        8 => format!("if {a} < {b}\n    strategy.close(\"L\")\nv{i} = {b}\n"),
-        9 => format!("var float v{i} = 0.0\nv{i} := v{i} * 0.5 + nz({a}) * 0.5\n"),
-        10 => format!("v{i} = ta.rsi({a}, {n})\n"),
-        11 => format!("v{i} = {a} - ta.highest({a}, {n})\n"),
-        12 => format!("int c{i} = bar_index % 3\nv{i} = c{i} == 0 ? {a} : {b}\n"),
-        13 => format!("v{i} = 0.0\nfor j = 0 to 2\n    v{i} += {a}\n"),
-        14 => format!("v{i} = {a}[bar_index % {k}]\n"),
-        15 => format!("v{i} = {a} / {b}\n"),
-        16 => format!("v{i} = ta.change({a})\n"),
-        _ => format!("v{i} = -{a}\n"),
-    }
-}
-
-fn script(d: Dialect, parts: &[(u8, usize, usize, u32)]) -> String {
-    let mut s = format!("//@version={}\nstrategy(\"p\")\nv0 = close\n", d as u8);
-    for (j, &(t, a, b, n)) in parts.iter().enumerate() {
-        let i = j + 1;
-        let a = format!("v{}", a % i);
-        let b = format!("v{}", b % i);
-        s.push_str(&stmt(t, i, &a, &b, n));
-    }
-    s.push_str(&format!("plot(v{})\n", parts.len()));
-    s
-}
 
 fn run(src: &str, d: Dialect, mode: ExecMode) -> bool {
     let Ok(p) = compile_src(src, &default_opts(d, mode)) else {
@@ -74,7 +38,7 @@ proptest! {
 
     #[test]
     fn prop_emitted_programs_verify(
-        parts in prop::collection::vec((0u8..18, 0usize..8, 0usize..8, 2u32..40), 1..8)
+        parts in prop::collection::vec((0u8..TEMPLATES, 0usize..8, 0usize..8, 2u32..40), 1..8)
     ) {
         for d in [Dialect::V5, Dialect::V6] {
             for mode in [ExecMode::BarClose, ExecMode::Realtime] {
@@ -87,7 +51,7 @@ proptest! {
 /// The generator reaches emission: every template compiles to an `Ok` program on its own.
 #[test]
 fn prop_templates_each_compile() {
-    for t in 0u8..18 {
+    for t in 0u8..TEMPLATES {
         for d in [Dialect::V5, Dialect::V6] {
             let src = script(d, &[(t, 0, 0, 5)]);
             assert!(

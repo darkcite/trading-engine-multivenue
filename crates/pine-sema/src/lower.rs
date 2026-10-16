@@ -306,6 +306,7 @@ impl Lower<'_> {
         // one Flag per declaration per Instantiation, `varip` iff the declaration is. A `var`
         // keeps its value on skipped evaluations by definition, so it is never a U16 block-local.
         let flag = self.flag(mode == DeclMode::Varip, self.ast.span(n));
+        self.ir.var_decls.push((v, flag));
         let ((), els, _) = self.region(|s| {
             let src = s.value_as(init, ty)?;
             s.store(v, src);
@@ -984,6 +985,23 @@ impl Lower<'_> {
                 };
                 let path = self.syms.resolve(name).to_owned();
                 return self.value_named(n, &path, ty);
+            }
+            if full == "max_bars_back" {
+                // §4.10.4: `max_bars_back(x, n)` sets `x`'s own cap (series.rs reads it).
+                // The variable and the length, in parameter order (after any synthetic row).
+                let x = given.first().map(|g| g.1);
+                let k = given
+                    .get(1)
+                    .and_then(|g| self.cur().k.get(g.1 .0 as usize).copied().flatten());
+                if let (Some(x), Some(K::Int(c))) = (x, k) {
+                    if let Some(Binding::Var { id, .. }) = self.binding(x) {
+                        if let Some(&v) = self.vars.get(&id) {
+                            self.ir
+                                .var_caps
+                                .push((v, c.clamp(0, i64::from(u32::MAX)) as u32));
+                        }
+                    }
+                }
             }
             return Ok(VSlot(u32::MAX)); // a statement: nothing to evaluate
         }
@@ -2168,7 +2186,7 @@ impl Lower<'_> {
     }
 
     /// `h.f := v` (and the compound forms): `O_SET_*`. A `string` field's store dispatches on
-    /// the handle's provenance (CAR-03-1 (a)), which is §4.9's (T15): refused until then.
+    /// the handle's provenance (CAR-03-1 (a)) in refs.rs.
     fn field_store(
         &mut self,
         n: NodeId,
@@ -2181,12 +2199,8 @@ impl Lower<'_> {
         let h = self.expr(base)?;
         let ut = self.slot_ty(h);
         let (field, ft) = self.field_of(ut.a, self.ast.sym(member), n)?;
-        if ft.ty == Ty::String {
-            return Err(self.todo(
-                n,
-                "a string field store (its site dispatch needs T15's provenance)",
-            ));
-        }
+        // A `string` field's store stays an `ObjSet` whose source is not a staging slot: refs.rs
+        // (§4.9, pass 5c) lowers it through the staging slot of each site in `prov(h)`.
         let src = match op {
             AssignOp::Reassign => self.value_as(value, ft)?,
             _ => {

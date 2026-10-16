@@ -31,8 +31,10 @@ mod mono;
 mod nacap;
 mod overload;
 mod pins;
+mod refs;
 mod resolve;
 mod scope;
+mod security;
 mod series;
 mod sites;
 mod sw;
@@ -103,6 +105,8 @@ fn compile_with(
         for l in &graph.libs {
             files.push(l.as_ref());
         }
+        // Pass 3 (§4.11.1, T21): `request.security` targets and parameters.
+        security::check(&typed, &files, opts, &syms, &mut diags);
         let tree = mono::build(&typed, &files, &syms, &mut diags);
         // Lowering reads a program passes 1–4 accepted; a row the pine-std snapshot cannot serve
         // yet (`3024 … unserved=1`) is the snapshot's refusal, not the program's, so it does not
@@ -152,7 +156,13 @@ fn compile_with(
                         Err(d) => return Err(finish(vec![d])),
                     }
                 }
-                Ok(_) => {}
+                // Only unserved rows refused: §4.9's rules still judge the program (pass 5c is
+                // independent of which rows the snapshot serves).
+                Ok((mut ir, sites)) => {
+                    if let Err(d) = refs::run(&mut ir, &sites) {
+                        diags.push(d);
+                    }
+                }
             }
         }
     }
@@ -181,8 +191,31 @@ fn back(
     mut syms: SymTable,
 ) -> Result<PineProgram, Diag> {
     let opts = fe.opts;
+    // Pass 5c (§4.9): references — `3047`, then the `string` field stores' site dispatch.
+    refs::run(&mut ir, sites)?;
+    if let Some(s) = sites
+        .iter()
+        .find(|s| s.kind == pine_ir::StateKind::Collection)
+    {
+        // pine-std request (impl-04 §3.5): no `coll_block_bytes` to size the block with yet.
+        let msg = "not implemented: a collection block needs pine_std::coll_block_bytes \
+                   (impl-04 §3.5)"
+            .to_owned();
+        return Err(code::diag(ReasonCode::Internal, s.span, msg));
+    }
     let flag = emit::prepare(&mut ir, &mut syms, fe.d)?;
     let na = nacap::run(&ir, fe.d);
+    // §4.10.4: `max_bars_back(x, n)` above `MAX_BARS_BACK_HARD`, or above a manifest `M > 0`.
+    let m = opts.limits.max_bars_back;
+    if let Some(&(v, n)) = ir
+        .var_caps
+        .iter()
+        .find(|c| c.1 > limits::MAX_BARS_BACK_HARD || (m > 0 && c.1 > m))
+    {
+        let msg = format!("max_bars_back({n}) exceeds the cap");
+        let at = ir.slots[v.0 as usize].span;
+        return Err(code::diag(ReasonCode::LookbackExceedsCap, at, msg));
+    }
     let series = series::run(&ir, sites, fe.cap)?;
     let intents = meta::intents(&ir, opts.limits.intent_cap)?;
     let plots = meta::plots(&ir, fe.d);
@@ -214,6 +247,7 @@ fn back(
         syms: &syms,
         flag,
         budget: opts.limits.insn_budget,
+        d: fe.d,
     })?;
     let meta = meta::build(meta::MetaIn {
         ir: &ir,

@@ -313,13 +313,18 @@ impl Reads<'_> {
                 }
             }
             Op::Persist { src, .. } => self.read(*src),
-            Op::ObjSet { src, .. } => self.read(*src),
+            // `O_GET_*` / `O_SET_*` read the handle's validity bit (impl-03 `o_field`: an `na`
+            // handle faults `ScriptRefused`).
+            Op::ObjSet { h, src, .. } => {
+                self.read(*h);
+                self.read(*src);
+            }
+            Op::ObjGet { h, .. } => self.read(*h),
             Op::Hist { k: K::Dyn(_), .. }
             | Op::Hist { .. }
             | Op::Load { .. }
             | Op::NaSet { .. }
             | Op::ObjNew { .. }
-            | Op::ObjGet { .. }
             | Op::Budget { .. } => {}
         }
     }

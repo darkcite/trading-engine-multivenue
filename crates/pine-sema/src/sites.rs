@@ -77,19 +77,27 @@ fn walk(ir: &Ir, b: &Block, flags: u8, cx: &SiteCtx<'_>, out: &mut Vec<Site>) ->
                         warm: warmup(ir, o, args, cx),
                     });
                 } else if o.is_collection() {
+                    in_loop(flags, *span)?;
                     if cx.collection_cap == 0 {
                         let msg = "a collection needs `collection_cap > 0`".to_owned();
                         return Err(diag(ReasonCode::UnboundedCollection, *span, msg));
                     }
                     // pine-std request (impl-04 §3.5): `coll_block_bytes` / `VIEW_BLOCK_BYTES`
-                    // are not served by the lane's pine-std yet.
-                    let msg = "not implemented: a collection block needs \
-                               pine_std::coll_block_bytes (impl-04 §3.5)"
-                        .to_owned();
-                    return Err(diag(ReasonCode::Internal, *span, msg));
+                    // are not served by the lane's pine-std yet — the site is numbered with no
+                    // bytes, and the back half refuses it (`3255`) after §4.9's pass, so the
+                    // reference rules still judge collection programs.
+                    out.push(Site {
+                        kind: StateKind::Collection,
+                        flags,
+                        bytes: 0,
+                        span: *span,
+                        len: 0,
+                        warm: 0,
+                    });
                 }
             }
             Stmt::Op(Op::ObjNew { udt, span, .. }) => {
+                in_loop(flags, *span)?;
                 let n = cx.udt_fields.get(usize::from(*udt)).copied().unwrap_or(0);
                 out.push(Site {
                     kind: StateKind::Object,
@@ -121,6 +129,18 @@ fn walk(ir: &Ir, b: &Block, flags: u8, cx: &SiteCtx<'_>, out: &mut Vec<Site>) ->
         }
     }
     Ok(())
+}
+
+/// `3046` (§4.9): a creation site — `T.new`, `obj.copy()`, a collection creator — inside a loop
+/// body is re-initialised per iteration, staling every earlier reference.
+fn in_loop(flags: u8, at: Span) -> Result<(), Diag> {
+    if flags & state_flag::IN_LOOP == 0 {
+        return Ok(());
+    }
+    let msg = "an object or collection created inside a loop body: each iteration would \
+               re-create its block and stale every earlier reference"
+        .to_owned();
+    Err(diag(ReasonCode::CreationInLoop, at, msg))
 }
 
 /// `L` (§4.7.2): the resolved `param` argument plus, when present, `param2`'s.

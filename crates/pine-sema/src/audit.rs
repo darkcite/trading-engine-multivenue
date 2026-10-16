@@ -86,7 +86,18 @@ pub(crate) fn recount(ir: &Ir, w: &Want<'_>) -> Result<(), Diag> {
     // Rings: one per read slot, capacity from the largest constant offset or the cap.
     let mut caps: Vec<(u32, u32)> = Vec::new();
     for &(v, k) in &hist {
-        let k = if k == u32::MAX { w.cap } else { k };
+        // A dynamic read: the variable's own `max_bars_back(x, n)` cap, else `C` (§4.10.4).
+        let own = ir
+            .var_caps
+            .iter()
+            .filter(|c| c.0 .0 == v)
+            .map(|c| c.1)
+            .max();
+        let k = if k == u32::MAX {
+            own.unwrap_or(w.cap)
+        } else {
+            k
+        };
         match caps.iter_mut().find(|c| c.0 == v) {
             Some(c) => c.1 = c.1.max(k),
             None => caps.push((v, k)),

@@ -305,3 +305,34 @@ fn readings_var_qualifier_join_reassigned_reads_the_slot() {
     assert_eq!(out, StepOutcome::Ok);
     assert_eq!(vm.plots()[0], 6.0);
 }
+
+/// U13 `per_iteration` with `break` / `continue` in the unrolled copies: `continue` skips to the
+/// next copy, `break` past the last; the program verifies and computes the loop's value.
+#[test]
+fn readings_ta_in_loop_per_iteration_break_continue_execute() {
+    use pine_ir::{barflag, StepOutcome};
+    use pine_vm::testkit::{bar, Arena, Ctx};
+    let mut rd = Readings::of(Dialect::V6);
+    rd.ta_in_loop = pine_spec::swr::TA_IN_LOOP_PER_ITERATION;
+    // Iterations 0..4: 1 is skipped (`continue`), 3 breaks: only 0 and 2 add `sma(close, 1)`.
+    let src = "//@version=6\nindicator(\"t\")\ns = 0.0\nn = 0\nfor i = 0 to 4\n    \
+               m = ta.sma(close, 1)\n    if i == 1\n        continue\n    if i == 3\n        \
+               break\n    s += m\n    n += 1\nplot(s)\nplot(n)\n";
+    let mut syms = SymTable::new();
+    let ast = pine_lang::parse(src, FileId::ROOT, &mut syms).expect("parses");
+    let p = compile_with(&ast, syms, &opts(Dialect::V6), &mut LibCache::empty(), &rd)
+        .expect("compiles");
+    let v = pine_vm::verify(&p, &pine_std::BUILTINS).expect("verifies");
+    let mut arena = Arena::new(p.layout.total_bytes as usize);
+    let mut vm = pine_vm::VmInstance::new(v, arena.slice());
+    let mut ctx = Ctx { now: 0 };
+    for i in 0..4u32 {
+        let c = 10.0 + f64::from(i);
+        assert_eq!(
+            vm.step_bar(&bar(i, c, barflag::CONFIRMED), &mut ctx),
+            StepOutcome::Ok
+        );
+        assert_eq!(vm.plots()[1], 2.0, "iterations 0 and 2 accumulate");
+        assert_eq!(vm.plots()[0], 2.0 * c, "bar {i}");
+    }
+}

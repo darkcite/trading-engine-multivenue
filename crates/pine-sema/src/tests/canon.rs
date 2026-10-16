@@ -9,7 +9,7 @@
 use crate::canon::sub_key;
 
 #[test]
-fn sub_keys_differ_by_every_field() {
+fn security_keys_differ_by_every_field() {
     let k = sub_key("binance_usdm:ethusdt", 3600, false, false, 7);
     assert_ne!(k, sub_key("binance_usdm:btcusdt", 3600, false, false, 7));
     assert_ne!(k, sub_key("binance_usdm:ethusdt", 900, false, false, 7));

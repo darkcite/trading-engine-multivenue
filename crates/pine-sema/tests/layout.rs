@@ -5,6 +5,8 @@
 //! with the same demand (I5), in both modes.
 
 mod common;
+#[path = "common/gen.rs"]
+mod gen;
 
 use common::{compile_src, default_opts};
 use pine_ir::{abi, ring_flag, Dialect, ExecMode, FrameLayout, PineProgram};
@@ -83,4 +85,33 @@ fn layout_equals_testkit_builder() {
 #[test]
 fn layout_empty_program_is_valid() {
     check("indicator(\"t\")\nplot(close)\n");
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig {
+        cases: 256,
+        ..proptest::prelude::ProptestConfig::default()
+    })]
+
+    /// I6 (§7.6): for every `Ok` program of the generator — both dialects, both modes — the
+    /// layout passes the verifier (I-1…I-8, `compile_src`), sema's own audit recount accepted it
+    /// (an `Ok` is only returned past `audit::recount`), and pine-vm's testkit builder fed the
+    /// same demand builds the identical `FrameLayout` region by region.
+    #[test]
+    fn prop_layout_supply_equals_demand(
+        parts in proptest::collection::vec(
+            (0u8..gen::TEMPLATES, 0usize..8, 0usize..8, 2u32..40),
+            1..8,
+        )
+    ) {
+        for d in [Dialect::V5, Dialect::V6] {
+            for mode in [ExecMode::BarClose, ExecMode::Realtime] {
+                let src = gen::script(d, &parts);
+                if let Ok(p) = compile_src(&src, &default_opts(d, mode)) {
+                    let want: FrameLayout = tb_of(&p).build().layout;
+                    proptest::prop_assert_eq!(&p.layout, &want, "{:?} {:?}\n{}", d, mode, src);
+                }
+            }
+        }
+    }
 }
