@@ -13,6 +13,8 @@
 //! negated class listing a non-ASCII byte is refused (its members are bytes, not code points).
 //! Positive classes and `\d \w \s` match single bytes.
 
+use core::mem::MaybeUninit;
+
 use super::{code, err, LoadErr};
 
 /// Instruction capacity of a compiled pattern.
@@ -582,11 +584,17 @@ pub fn regex_compile_into(pat: &[u8], out: &mut RegexProg) -> Result<(), LoadErr
     Ok(())
 }
 
+/// The epsilon-closure stack of one `find`: each pc is expanded once per closure and pushes at
+/// most two successors, so `2 × REGEX_MAX_STATES + 1` slots bound it.
+const STACK_LEN: usize = 2 * REGEX_MAX_STATES + 1;
+
 /// A Pike-VM thread list: program counters in priority order with each thread's match start,
-/// and the set of pcs already on the list this step.
+/// and the set of pcs already on the list this step. `pc[..n]` / `start[..n]` are written before
+/// they are read; the slots past `n` are never read, so the lists are left uninitialized and a
+/// reset clears only `n` and the 32 B `on` set (no 1 576 B zero-fill per list per `find`).
 struct Threads {
-    pc: [u16; REGEX_MAX_STATES],
-    start: [u32; REGEX_MAX_STATES],
+    pc: [MaybeUninit<u16>; REGEX_MAX_STATES],
+    start: [MaybeUninit<u32>; REGEX_MAX_STATES],
     n: usize,
     on: [u64; REGEX_MAX_STATES / 64],
 }
@@ -594,8 +602,8 @@ struct Threads {
 impl Threads {
     const fn new() -> Self {
         Self {
-            pc: [0; REGEX_MAX_STATES],
-            start: [0; REGEX_MAX_STATES],
+            pc: [const { MaybeUninit::uninit() }; REGEX_MAX_STATES],
+            start: [const { MaybeUninit::uninit() }; REGEX_MAX_STATES],
             n: 0,
             on: [0; 4],
         }
@@ -604,14 +612,36 @@ impl Threads {
         self.n = 0;
         self.on = [0; 4];
     }
+    /// Thread `k < n`: its pc and match start.
+    fn get(&self, k: usize) -> (u16, u32) {
+        debug_assert!(k < self.n);
+        // SAFETY: `push` wrote `pc[k]` and `start[k]` for every `k < n` since the last `clear`
+        // (the only writer; `n` only grows between clears), and `k < n` is the caller's loop
+        // bound (debug_assert! above).
+        unsafe { (self.pc[k].assume_init(), self.start[k].assume_init()) }
+    }
+    fn push(&mut self, pc: u16, start: u32) {
+        // At most one entry per pc (the `on` set), so `n < REGEX_MAX_STATES` here.
+        self.pc[self.n] = MaybeUninit::new(pc);
+        self.start[self.n] = MaybeUninit::new(start);
+        self.n += 1;
+    }
 }
 
 impl RegexProg {
     /// Follow the epsilon closure of `pc0` at byte position `pos`, appending consuming and
     /// `MATCH` threads to `t` in priority order (an explicit stack, `x` before `y`).
-    fn add(&self, t: &mut Threads, pc0: u16, start: u32, pos: usize, s: &[u8]) {
-        // Each pc is expanded once and pushes at most two successors.
-        let mut stack = [0u16; 2 * REGEX_MAX_STATES + 1];
+    /// `stack` is the caller's scratch (one per `find`, not one per call): its contents on
+    /// entry are irrelevant, every slot is written before it is read.
+    fn add(
+        &self,
+        t: &mut Threads,
+        stack: &mut [u16; STACK_LEN],
+        pc0: u16,
+        start: u32,
+        pos: usize,
+        s: &[u8],
+    ) {
         let mut sp = 1usize;
         stack[0] = pc0;
         while sp > 0 {
@@ -645,11 +675,7 @@ impl RegexProg {
                         sp += 1;
                     }
                 }
-                _ => {
-                    t.pc[t.n] = pc;
-                    t.start[t.n] = start;
-                    t.n += 1;
-                }
+                _ => t.push(pc, start),
             }
         }
     }
@@ -660,6 +686,9 @@ impl RegexProg {
     pub fn find(&self, s: &[u8]) -> Option<(usize, usize)> {
         // Two thread lists, flipped by index each byte (no swap of 2 × 1 576 B per byte).
         let mut ts = [Threads::new(), Threads::new()];
+        // One closure stack per `find`, reused by every `add` (was a 1 026 B zero-fill per live
+        // thread per input byte).
+        let mut stack = [0u16; STACK_LEN];
         let mut c = 0usize;
         let mut found: Option<(usize, usize)> = None;
         let mut pos = 0usize;
@@ -671,7 +700,7 @@ impl RegexProg {
                 (&mut hi[0], &mut lo[0])
             };
             if found.is_none() {
-                self.add(cur, 0, pos as u32, pos, s);
+                self.add(cur, &mut stack, 0, pos as u32, pos, s);
             }
             if cur.n == 0 && found.is_some() {
                 break;
@@ -679,7 +708,7 @@ impl RegexProg {
             nxt.clear();
             let mut k = 0usize;
             while k < cur.n {
-                let (pc, st) = (cur.pc[k], cur.start[k]);
+                let (pc, st) = cur.get(k);
                 let i = self.insts[pc as usize];
                 let hit = match (i.op, s.get(pos)) {
                     (OP_MATCH, _) => {
@@ -691,7 +720,7 @@ impl RegexProg {
                     _ => false,
                 };
                 if hit {
-                    self.add(nxt, pc + 1, st, pos + 1, s);
+                    self.add(nxt, &mut stack, pc + 1, st, pos + 1, s);
                 }
                 k += 1;
             }

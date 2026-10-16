@@ -16,15 +16,18 @@
 
 mod args;
 mod capture;
+mod coll;
 mod load;
 mod math;
 mod naf;
+mod request;
 mod state;
 mod strategy;
 mod strbuild;
 mod strfmt;
 mod strnum;
 mod strs;
+mod simd;
 mod sw;
 mod ta;
 mod table;
@@ -40,4 +43,5 @@ pub use load::{
     InputResolved, LoadErr, RegexProg, SessionRange, SessionSpec, TfParts, TfUnit, TzId,
     FMT_MAX_SEGMENTS, MONTH_SORT_S, REGEX_MAX_STATES, TZ_UTC,
 };
+pub use coll::{coll_block_bytes, VIEW_BLOCK_BYTES};
 pub use table::{served, Served, BUILTINS};

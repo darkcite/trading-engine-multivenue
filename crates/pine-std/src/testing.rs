@@ -95,12 +95,48 @@ pub struct TestCtx {
     pub closed: Vec<TradeRec>,
     /// `now_ms()`.
     pub now_ms: i64,
+    /// Host-published `request.security` series (`shared_series(key, out)` for any key but
+    /// `FEED_KEY`).
+    pub series: Vec<TestSeries>,
+}
+
+/// One published `SharedSeries` (impl-04 §4.14.3), owned by the test.
+#[derive(Default, Clone, Debug)]
+pub struct TestSeries {
+    /// `SubProgram::key`.
+    pub key: u64,
+    /// Output index.
+    pub out: u16,
+    /// Values, oldest first.
+    pub values: Vec<f64>,
+    /// Open times.
+    pub open_ms: Vec<i64>,
+    /// Close times (exclusive).
+    pub close_ms: Vec<i64>,
+    /// Whether the last element is confirmed.
+    pub last_confirmed: bool,
 }
 
 impl BarCtx for TestCtx {
     fn shared_series(&self, key: u64, out_idx: u16) -> Option<SharedSeries<'_>> {
         let i = out_idx as usize;
-        if key != FEED_KEY || i >= self.feed.len() {
+        if key != FEED_KEY {
+            let mut k = 0usize;
+            while k < self.series.len() {
+                let t = &self.series[k];
+                if t.key == key && t.out == out_idx {
+                    return Some(SharedSeries {
+                        values: &t.values,
+                        open_ms: &t.open_ms,
+                        close_ms: &t.close_ms,
+                        last_confirmed: t.last_confirmed,
+                    });
+                }
+                k += 1;
+            }
+            return None;
+        }
+        if i >= self.feed.len() {
             return None;
         }
         Some(SharedSeries {
