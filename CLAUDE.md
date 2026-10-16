@@ -87,11 +87,12 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   - Beside it: `caffeinate`, hourly `candles`, 5-min `regime`, nightly
     `retention` (PROTECT_DAYS 1, every delete gated on S3 `verify`),
     `archive` (04:30 local) and the read-only `dashboard`.
-  - It runs the release build of the S16 lane (`5b56e71`, booted
-    2026-10-15 22:32Z; `/state` `boot.git_sha` names the commit) with the mask
+  - It runs the release build of HK, part 4 (`0968414`, booted
+    2026-10-16 05:17Z; `/state` `boot.git_sha` names the commit) with the mask
     `strategy.conf` names (`ai+vrp+xsd+bin15+hyparb+xmm+hcv`).
     `strategy.conf` also exports `BYBIT_REST_HOST=api.bytick.com`
-    (HK17). `/state` `exec.configured` is 0 (no
+    (HK17) and `RAW_TAP=pm,hl` (rejects only, HK-R23). `/state`
+    `exec.configured` is 0 (no
     route table): nothing is armed.
   - After ANY restart, verify `vm_rows_active ≥ 1` on `/state`.
   - The worker runs from the working tree, so a worker edit is live at its
@@ -218,7 +219,11 @@ The lane records stay where they always were: `docs/risk-policy.md` and
 - **The HK housekeeping lane (risk-policy "HK", "HK, part 2").** HK1–HK10
   (2026-10-13) closed Section A of that day's survey; HK11–HK17 (2026-10-14)
   Section B and the day's findings; HK18–HK23 (2026-10-15) the follow-ups;
-  HK24–HK33 ("HK, part 3", 2026-10-15) the rest of the housekeeping.
+  HK24–HK33 ("HK, part 3", 2026-10-15) the rest of the housekeeping;
+  HK36–HK37 ("HK, part 4", 2026-10-16): the bn / bybit / mexc
+  `Tick.venue_seq` is the arrival ordinal keyed on the full venue id, and
+  HL's empty `trades` snapshot counts on `…_trades_empty_total`, not as a
+  parse error.
 - **S16, sixteen strategy slots (risk-policy "S16", 2026-10-15).** S16-1..6
   on main and deployed 2026-10-15 22:32Z: member table, `STRATEGY` parser +
   `strategy-mask` (the wrapper resolves through it; `all` refused),
@@ -237,9 +242,9 @@ The lane records stay where they always were: `docs/risk-policy.md` and
   cycle first runs `abort-stale` (incomplete uploads over 24 h; `uploads`
   lists them). `push-derived` keys keep their path under the store's root,
   `--path` too, and candles go up zstd'd.
-- **Gates at HEAD (HK, part 3, 2026-10-15):**
+- **Gates at HEAD (HK, part 4, 2026-10-16):**
   - clippy clean.
-  - nextest 4 693 passed (10 skipped: the five `#[ignore]`d live smokes,
+  - nextest 4 748 passed (10 skipped: the five `#[ignore]`d live smokes,
     four alloc child helpers and a fixture regenerator), under nextest
     0.9.148. A random `LEAK` at ~0.2 s under nextest < 0.9.145 on macOS is
     nextest's pipe race, not the test (HK23). Only the scrape hammer runs alone (`.config/nextest.toml`):

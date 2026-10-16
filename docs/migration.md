@@ -27,6 +27,41 @@ Each entry is atomic: one version bump per section. Do not batch.
 **Migration steps**
 1. None: the routine restart of a binary built from this change.
 
+## 2026-10-16 — `Tick.venue_seq` for bn / bybit / mexc is the arrival ordinal keyed on the venue id (HK36)
+
+**What changed**
+- `Tick.venue_seq` for Binance (`bookTicker` `u`), Bybit (`orderbook.1`
+  `u`) and the MEXC book (`version`, spot and futures) was the venue's u64
+  id cut to its low 32 bits. It is now HK31/HK32's per-instrument arrival
+  ordinal, keyed on that FULL id (ruling HK-R22): 1, 2, 3, … while the id
+  does not go back, 0 for an id behind the instrument's newest (counted on
+  `engine_ingress_<venue>_seq_regressions_total`). No layout change.
+- `core_types::ArrivalSeq` takes a generic u64 key (`last_ms` → `last_key`)
+  and gains a per-row `reset_clock`; Polymarket, Hyperliquid and Deribit
+  are byte-identical.
+- MEXC's book regression check moved from Q-MX1's last-seen compare to the
+  sequencer: a version behind the NEWEST counts on every push, an absent
+  version counts; its trade check is unchanged.
+
+**Impact**
+- Live: these three venues' ids are past 2^32 already (Binance USDⓈ-M
+  BTCUSDT 11.8 × 10^12 on 2026-10-16), so a low-32 wrap would have left the
+  instrument `Stale` in every `TopOfBook` until a restart; no member of
+  the set reads those books today. Same-id re-pushes (2.1 % of Binance
+  ticks) now apply as the same touch instead of `Stale`.
+- Captures from the deploy on: the `Tick` row carries the ordinal; the
+  venue's book id is in no capture row (only in raw-tap frames when the
+  tap is on). Research keyed on the truncated id must use older runs.
+- Replaying several runs as one stream: the ordinal restarts at 1 each
+  run and is not rebased, so a `MultiBook` reader (latency-arb,
+  cross-arb, rule-tree — all outside the set) would drop a later run's
+  ticks until its ordinal passes the earlier run's.
+- Not changed: OKX `seqId as u32` (the same truncation; needs a ruling);
+  Binance options ticks carry `venue_seq` 0.
+
+**Migration steps**
+1. None: the routine restart of a binary built from this change.
+
 ## 2026-10-15 — S16: sixteen strategy slots
 
 **What changed**

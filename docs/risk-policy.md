@@ -16674,3 +16674,103 @@ check. Then `git push origin main` (S16-R4).
 
 - **A member at slots 8–15** (S16-R5): its own ruling. Its first live order
   closes the rollback door above.
+
+## HK, part 4 — Hyperliquid's parse errors and the u32 `venue_seq` (2026-10-16)
+
+**Ask (Anton):** "HL parse errors … venue_seq on Binance, Bybit and MEXC is
+still truncated to u32". **Plan:** project doc
+`claude/hk-part4-plan-2026-10-16.md`. **Commits:** `fba0c3c` HK36,
+`0968414` HK37; this section and the migration entries are HK38.
+
+| id | ruling (operator, 2026-10-16) |
+|---|---|
+| HK-R22 | `venue_seq` for Binance / Bybit / MEXC: HK31/HK32's `ArrivalSeq`, keyed on the venue's FULL u64 id; the book sees an ordinal; a backward id takes 0 and is counted; `TopOfBook` untouched; captures carry the ordinal from the deploy on. |
+| HK-R23 | The HL rejects tap: `RAW_TAP=pm,hl` (rejects only) at once, with an off-grid restart (04:16:05Z; backup `strategy.conf.bak-20261016T0413Z-hk-hltap`). It stays on: a rejects-only tap costs its 64-B header while nothing is rejected. |
+| HK-R24 | HL parse errors: fix as a cut if the cause is clear (as HK-R17). |
+| HK-R25 | Deploy, then push. |
+
+### HK36 — the arrival ordinal keyed on the venue id (`fba0c3c`)
+
+- **Why it was a live hazard.** `Tick.venue_seq` is a `u32`;
+  `book_builder::TopOfBook::apply` drops `venue_seq <= last` as `Stale`.
+  Binance (`bookTicker` `u`), Bybit (`orderbook.1` `u`) and the MEXC book
+  (`version`) put their u64 id's low 32 bits there, and those ids are far
+  past 2^32 (2026-10-16 REST: Binance USDⓈ-M BTCUSDT 11 833 358 963 074,
+  ~2 755 wraps; spot 101 509 388 118; MEXC spot 83 810 244 855, futures
+  42 677 422 185; Bybit linear 1 253 051, restarted after a venue
+  restart). At a low-32 wrap the instrument would be `Stale` in every book
+  until a restart. No member of the set reads these books today (HK32
+  review), so nothing was lost yet.
+- **The law.** `ArrivalSeq` takes a generic u64 key (`last_ms` →
+  `last_key`, same compare) and gains a per-row `reset_clock`
+  (`reset_clocks` loops it); Polymarket, Hyperliquid and Deribit are
+  byte-identical. Binance: one sequencer per Driver (each connection is one
+  symbol). Bybit: `[ArrivalSeq; 64]` by table row; every `snapshot` zeroes
+  its symbol's clock without counting (`u` restarts at 1 under one after a
+  venue restart; the clock then holds the snapshot's `u`, so a backward
+  delta after it is still caught). MEXC: `[ArrivalSeq; 16]` by row (a power
+  of two, asserted), stamped on every parsed book push, so republications
+  feed the check and their ordinals skip. Reconnect → `reset_clocks` on all
+  three. Same-id re-pushes take the next ordinal — the same touch: 2.1 % of
+  Binance ticks used to be dropped as `Stale` and now apply.
+- **MEXC's book check moved** from Q-MX1's last-seen compare to the
+  sequencer: a version behind the NEWEST counts on every push, and an
+  absent version counts (its tick was 0 and dropped silently before — now
+  an alarm). The trade check is unchanged; `ChannelEvent.venue_seq` keeps
+  the full u64.
+- **Exhaustion.** A u32 ordinal at Binance's busiest ~810 ticks/s lasts ~61
+  days of process uptime; daily-restart boots a new process five times a
+  day, so the bound is unreachable in operation (documented at the
+  `debug_assert`).
+- **Captures and replay.** The `Tick` row carries the ordinal; the venue
+  book id is in no capture row (only in raw-tap frames when the tap is on).
+  Replaying several runs as one stream restarts the ordinal per run without
+  a rebase: a `MultiBook` reader (latency-arb, cross-arb, rule-tree — all
+  outside the set) would drop a later run's ticks until its ordinal passes
+  the earlier run's.
+- **Not changed (rulings):** OKX `seqId as u32`
+  (`ingress-okx/src/run_loop.rs:1124`; BTC-USDT-SWAP seqId
+  346 500 248 290, already past 2^32, and OKX may reset it after
+  maintenance); Binance options ticks carry `venue_seq` 0, which every book
+  drops as `Stale`.
+- Review: risk / alloc SHIP WITH FIXES, applied (the `paper.rs` COPY sizes —
+  Bybit 6 512 B, MEXC 3 264 B — a MEXC row `debug_assert`, the replay
+  note). Captured before the deploy: 0 regressions in 2 M Binance, 145 k
+  Bybit and 29 k MEXC ticks.
+
+### HK37 — Hyperliquid's empty `trades` snapshot (`0968414`)
+
+- **Finding (the rejects tap, 04:16–04:46Z):** `parse_errors_total` and the
+  tap agreed record for record — 16 — and all 16 were the same 30 bytes,
+  `{"channel":"trades","data":[]}`: the venue's empty trades SNAPSHOT on a
+  `trades` subscribe to a HIP-4 outcome leg that has not printed. 4 at
+  boot, up to 6 a 15-minute roll (3 live families × 2 fresh legs; the 04:45
+  roll was predicted at +6 and moved 10 → 16), up to 8 at the 06:00Z daily
+  roll: the long-standing ~21/h. The frame classifies as `Data(Trades)` but
+  names no `coin`, so the lookup failed and the catch-all
+  (`run_loop.rs:1957`) counted it and tapped it. Valid, empty venue data;
+  nothing lost — but the counter hid any real reject.
+- **Fix (HK1's unsubscribe-echo model):** `is_empty_data_array` (lib.rs,
+  beside `extract_coin`: `"data":`, JSON whitespace, `[`, whitespace, `]`;
+  borrowing, zero-alloc), asked only once the coin lookup has failed, so a
+  push that resolves pays nothing new → `Dispatch::TradesEmpty`: a message
+  and `HlRollStatus::trades_empty`, published as
+  `engine_ingress_hyperliquid_trades_empty_total`; not a parse error, not a
+  reject. A broken array, rows for an unconfigured coin and an empty array
+  on any other channel still count and tap. Tests: the tap's 30 bytes ×16
+  (0 parse errors, 16 empty, no tick, no print), the negatives, a normal
+  push unchanged; the HL frame fuzzer 60 s, 2.95 M runs, clean.
+
+### The deploy (2026-10-16)
+
+`cargo build --release -p cli` at `0968414` (1 m 40 s); `exec-smoke
+--offline` PASS; `pkill -TERM` 05:16:05Z (one minute past the :15 roll).
+Booted `09684149a287`, `/state` v3, mask 255, halted 0, the nine feeds up,
+`engine_vm_rows_active` 2. At boot `hyperliquid_parse_errors_total` 0 and
+`hyperliquid_trades_empty_total` 4 (the boot burst, now where it belongs);
+`seq_regressions_total` 0 for binance / bybit / mexc. Across the 05:30
+roll (two families rolled by 05:31:34Z): `parse_errors_total` stayed 0,
+`trades_empty_total` went 4 → 8, the HL rejects tap stayed at its 64-B
+header; `seq_regressions_total` binance 0, bybit 0, mexc 3 in the first
+quarter hour (the previous binary counted 13 in its last hour under
+Q-MX1's law). Then `git push origin main` (HK-R25).
