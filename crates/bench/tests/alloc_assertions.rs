@@ -20979,3 +20979,256 @@ fn pine_broker_native_reconcile_is_zero_alloc() {
         )
     );
 }
+
+// impl-07 §7.10 — the two `pine-screen` arms (gates PVM-4, PVM-5): the tier-1 bar loop
+// (`pine_screen::run_group`) over a mapped bar file allocates nothing after setup. Drop-in text:
+// every path is fully qualified, so the arms need no `use` line beside the file's own; helpers
+// carry a `pvm_screen_` prefix. The bench crate gains the dev edges `pine-screen`, `pine-sema`
+// and `pine-std` (impl-07 §2.4; `pine-lang`, `pine-ir` are PVM-1's). Each arm runs its group
+// once on a fresh `Workspace` (setup grows the arenas), then again on the same `Workspace` with
+// an `AllocGuard` opened in the probe's `before_loop` and read in `after_loop` — exactly the bar
+// loop — asserted (0, 0, 0).
+
+const PVM_SCREEN_KEY: &str = "binance_usdm:btcusdt";
+/// 2026-01-01T00:00:00Z.
+const PVM_SCREEN_T0: i64 = 1_767_225_600_000;
+const PVM_SCREEN_H: i64 = 3_600_000;
+const PVM_SCREEN_DAY: i64 = 86_400_000;
+const PVM_SCREEN_BARS: usize = 2_000;
+
+/// The probe: an `AllocGuard` opened in `before_loop`, its delta taken in `after_loop`
+/// (`Option<AllocGuard>` is inline: opening it allocates nothing).
+struct PvmScreenProbe {
+    g: Option<core_alloc::AllocGuard>,
+    delta: (u64, u64, u64),
+    loops: u32,
+}
+
+impl pine_screen::LoopProbe for PvmScreenProbe {
+    fn before_loop(&mut self) {
+        self.g = Some(core_alloc::AllocGuard::new());
+    }
+    fn after_loop(&mut self) {
+        if let Some(g) = self.g.take() {
+            self.delta = g.delta();
+        }
+        self.loops += 1;
+    }
+}
+
+/// The impl-07 §4.0 script `name` (crates/pine-lang/tests/scripts) or probe (pine-screen's).
+fn pvm_screen_src(rel: &str) -> String {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(rel);
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("gates PVM-4/5: {}: {e}", p.display()))
+}
+
+/// 2 000 synthetic 1-h bars (and their complete 4-h buckets) written to a temp dir, opened mapped
+/// with the HTF needs of the group.
+fn pvm_screen_bars(
+    tag: &str,
+    needs: &[(String, u32)],
+) -> (std::path::PathBuf, pine_screen::TrialBars) {
+    let dir = std::env::temp_dir().join(format!("pvm-screen-arms-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut rows = Vec::with_capacity(PVM_SCREEN_BARS);
+    let mut prev = 0_i64;
+    let mut i = 0_usize;
+    while i < PVM_SCREEN_BARS {
+        let t = i as f64;
+        let c = ((100.0
+            + 8.0 * (2.0 * std::f64::consts::PI * t / 120.0).sin()
+            + 2.5 * (2.0 * std::f64::consts::PI * t / 31.0).sin())
+            * 100.0)
+            .round() as i64
+            * 10_000;
+        let o = if i == 0 { c } else { prev };
+        let open_ms = PVM_SCREEN_T0 + i as i64 * PVM_SCREEN_H;
+        rows.push(pine_ir::Bar {
+            open_1e6: o,
+            high_1e6: o.max(c) + 50_000,
+            low_1e6: o.min(c) - 50_000,
+            close_1e6: c,
+            volume_1e6: 1_000_000,
+            open_ms,
+            close_ms: open_ms + PVM_SCREEN_H,
+            index: i as u32,
+            flags: pine_ir::barflag::CONFIRMED,
+        });
+        prev = c;
+        i += 1;
+    }
+    let sh = pine_ir::symbol_hash(PVM_SCREEN_KEY.as_bytes());
+    let src: Vec<pine_screen::bars::CandleRow> = rows
+        .iter()
+        .map(|b| pine_screen::bars::CandleRow {
+            open_ms: b.open_ms,
+            open_1e6: b.open_1e6,
+            high_1e6: b.high_1e6,
+            low_1e6: b.low_1e6,
+            close_1e6: b.close_1e6,
+            volume_1e6: b.volume_1e6,
+        })
+        .collect();
+    let mut h4 = Vec::new();
+    pine_screen::bars::bars_from_candles(&src, 3_600, 14_400, &mut h4).expect("gates PVM-4/5: 4-h");
+    for (tf, r) in [(3_600_u32, &rows), (14_400_u32, &h4)] {
+        let p = pine_screen::bar_path(&dir, PVM_SCREEN_KEY, tf).expect("path");
+        pine_screen::bars::write_bar_file(
+            &p,
+            r,
+            tf,
+            sh,
+            1,
+            pine_screen::bar_source::CANDLES,
+            false,
+        )
+        .expect("gates PVM-4/5: write");
+    }
+    let tb = pine_screen::TrialBars::open(&dir, PVM_SCREEN_KEY, 3_600, needs, None)
+        .expect("gates PVM-4/5: open mapped");
+    (dir, tb)
+}
+
+fn pvm_screen_cfg() -> pine_screen::ScreenCfg {
+    pine_screen::ScreenCfg {
+        // 840 warm-up rows ≥ every screened script's `meta.warmup_bars` (pvm7_ma_ribbon's 770
+        // is the largest); 1 152 scored rows.
+        from_ms: PVM_SCREEN_T0 + 35 * PVM_SCREEN_DAY,
+        to_ms: PVM_SCREEN_T0 + 83 * PVM_SCREEN_DAY,
+        notional_1e6: pine_screen::SEL_NOTIONAL_1E6,
+        fee: pine_screen::FeeRow {
+            venue: 1,
+            class: 1,
+            maker_bps: 2,
+            taker_bps: 5,
+        },
+    }
+}
+
+fn pvm_screen_compile(src: &str) -> pine_screen::Loaded {
+    let tm: Vec<(String, String)> = Vec::new();
+    let spec = pine_screen::TrialSpec {
+        source: src,
+        symbol_key: PVM_SCREEN_KEY,
+        chart: pine_ir::ChartInfo {
+            symbol_hash: pine_ir::symbol_hash(PVM_SCREEN_KEY.as_bytes()),
+            timeframe_s: 3_600,
+            venue: 1,
+            mintick_1e6: 10_000,
+            pointvalue_1e6: 1_000_000,
+            qty_step_1e6: 1_000,
+            ..pine_ir::ChartInfo::default()
+        },
+        syminfo_strs: ["BTCUSDT", "BTC", "USDT", "crypto"],
+        inputs: &[],
+        ticker_map: &tm,
+        limits: pine_screen::SCREEN_LIMITS,
+    };
+    pine_screen::compile_trial(&spec, &mut pine_sema::LibCache::empty())
+        .unwrap_or_else(|e| panic!("gates PVM-4/5: compile refused {:?} {e:?}", e.code()))
+}
+
+/// Warm-up run, then the measured run on the same `Workspace`; returns the measured loop delta.
+fn pvm_screen_measure(
+    trials: &[&pine_screen::Loaded],
+    tb: &pine_screen::TrialBars,
+) -> (u64, u64, u64) {
+    let c = pvm_screen_cfg();
+    let mut ws = pine_screen::Workspace::new();
+    let mut out = vec![pine_screen::TrialOutcome::default(); trials.len()];
+    let mut p0 = PvmScreenProbe {
+        g: None,
+        delta: (u64::MAX, u64::MAX, u64::MAX),
+        loops: 0,
+    };
+    pine_screen::run_group(trials, tb, &c, &mut ws, &mut out, &mut p0).expect("warm-up run");
+    let first: Vec<pine_screen::TrialOutcome> = out.clone();
+    for (k, o) in first.iter().enumerate() {
+        assert_eq!(
+            o.status,
+            pine_screen::TrialStatus::Completed,
+            "gates PVM-4/5: trial {k}"
+        );
+    }
+    let mut p1 = PvmScreenProbe {
+        g: None,
+        delta: (u64::MAX, u64::MAX, u64::MAX),
+        loops: 0,
+    };
+    pine_screen::run_group(trials, tb, &c, &mut ws, &mut out, &mut p1).expect("measured run");
+    assert_eq!(p1.loops, 1);
+    for k in 0..out.len() {
+        assert_eq!(
+            out[k].summary, first[k].summary,
+            "gates PVM-4/5: the rerun reproduces trial {k}"
+        );
+    }
+    p1.delta
+}
+
+#[test]
+fn pine_screen_bar_loop_is_zero_alloc() {
+    // Gate PVM-4 (impl-07 §7.10): pvm7_supertrend.pine on a 2 000-bar 1-h file, K = 1.
+    let t = pvm_screen_compile(&pvm_screen_src(
+        "pine-lang/tests/scripts/pvm7_supertrend.pine",
+    ));
+    let (dir, tb) = pvm_screen_bars("k1", &[]);
+    assert_eq!(tb.chart().rows().len(), PVM_SCREEN_BARS);
+    let (allocs, bytes, deallocs) = pvm_screen_measure(&[&t], &tb);
+    assert_eq!(
+        (allocs, bytes),
+        (0, 0),
+        "gate PVM-4: pine-screen bar loop allocated"
+    );
+    assert_eq!(deallocs, 0, "gate PVM-4: {deallocs} frees");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn pine_screen_interleaved_bar_loop_is_zero_alloc() {
+    // Gate PVM-5 (impl-07 §7.10): K = 8 — seven of the eleven scripts + htf_close.pine (one
+    // request.security("240") sub-program over a 4-h file).
+    let mut v = Vec::new();
+    for name in [
+        "pvm7_supertrend",
+        "pvm7_macd_cross",
+        "pvm7_bb_breakout",
+        "pvm7_rsi_mr",
+        "pvm7_donchian",
+        "pvm7_ma_ribbon",
+        "pvm7_keltner_squeeze",
+    ] {
+        v.push(pvm_screen_compile(&pvm_screen_src(&format!(
+            "pine-lang/tests/scripts/{name}.pine"
+        ))));
+    }
+    v.push(pvm_screen_compile(&pvm_screen_src(
+        "pine-screen/tests/probes/htf_close.pine",
+    )));
+    let mut needs: Vec<(String, u32)> = Vec::new();
+    for t in &v {
+        for n in t.htf_needs() {
+            if !needs.contains(n) {
+                needs.push(n.clone());
+            }
+        }
+    }
+    assert_eq!(
+        needs,
+        [(PVM_SCREEN_KEY.to_owned(), 14_400)],
+        "gate PVM-5: one 4-h need"
+    );
+    let (dir, tb) = pvm_screen_bars("k8", &needs);
+    let refs: Vec<&pine_screen::Loaded> = v.iter().collect();
+    assert_eq!(refs.len(), 8);
+    let (allocs, bytes, deallocs) = pvm_screen_measure(&refs, &tb);
+    assert_eq!(
+        (allocs, bytes),
+        (0, 0),
+        "gate PVM-5: pine-screen interleaved bar loop allocated"
+    );
+    assert_eq!(deallocs, 0, "gate PVM-5: {deallocs} frees");
+    let _ = std::fs::remove_dir_all(dir);
+}

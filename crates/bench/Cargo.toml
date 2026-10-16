@@ -82,6 +82,11 @@ strategy-hyparb      = { workspace = true }
 pine-ir              = { workspace = true }
 pine-lang            = { workspace = true }
 pine-broker          = { workspace = true }
+# gates PVM-4/PVM-5: pine-screen's tier-1 bar loop (impl-07 section 7.10) and its bench
+# (benches/pine_screen.rs, section 4.11).
+pine-screen          = { workspace = true }
+pine-sema            = { workspace = true }
+pine-std             = { workspace = true }
 # XMM XH4a gate 95: the order-gateway kit (duplex, in-flight table,
 # deadline queue, reconnect machine, wait policy, latency trackers).
 exec-gateway         = { workspace = true }
@@ -112,4 +117,9 @@ engine-snapshot      = { workspace = true }
 
 [[bench]]
 name = "hot_path"
+harness = false
+
+# impl-07 section 4.11: the tier-1 screener's bar loop, open/validate, trade bucketing, barclock.
+[[bench]]
+name = "pine_screen"
 harness = false

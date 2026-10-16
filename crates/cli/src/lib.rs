@@ -57,6 +57,8 @@ pub mod evm_live;
 pub mod evm_shadow;
 pub mod evm_testnet;
 pub mod exec_boot;
+/// impl-07 T1b: the one `--fee-bps` parser (backtest, `pine`, lane B'3).
+pub mod fee_flags;
 /// HAR H3.4: `har.toml` + the seeds + the engine's own state → the long-tenor set.
 pub mod har_boot;
 /// HAR H3.7: the long-tenor state files, rendered and written off the engine thread.
@@ -76,6 +78,8 @@ pub mod paper;
 /// HC11b: a member's persisted state, rendered and written off the engine
 /// thread (the long-tenor series' and slot 7's book).
 pub mod persist;
+/// impl-07 T11+: `multivenue-engine pine <SUBVERB>` — the tier-1 Pine screener's operator verbs.
+pub mod pine;
 pub mod pinning;
 pub mod regime_boot;
 pub mod sigint;

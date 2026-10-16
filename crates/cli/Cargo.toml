@@ -95,6 +95,15 @@ mio                  = { workspace = true }
 rustls               = { workspace = true }
 rustls-pki-types     = { workspace = true }
 libc                 = "0.2"
+# impl-07 §2.4: `multivenue-engine pine` drives the tier-1 screener (pine-screen) over bar files;
+# pine-lang / pine-spec for the coverage names. pin:07-cli-deps: pine-ir as well — the canonical
+# key check and `symbol_hash` (§3.12.2 names `pine_ir::is_canonical_symbol_key`).
+pine-screen          = { workspace = true }
+pine-lang            = { workspace = true }
+pine-spec            = { workspace = true }
+pine-ir              = { workspace = true }
+# T12: `LibCache::open` (the `--lib-dir` cache, `3037` refusal).
+pine-sema            = { workspace = true }
 
 [dev-dependencies]
 # HYPARB H8: the scripted JSON-RPC node the shadow tests run against.

@@ -78,6 +78,7 @@ use crate::backtest::fill::{
 use crate::backtest::regime::{
     load_set_regime_frames, profile_name, word_string, RegimeMode, RegimeReplay,
 };
+use crate::fee_flags::{parse_fee_bps_flag, FeeLeg};
 
 /// Book capacity the backtest vm is monomorphized with (design §3.6):
 /// the same code as the engine's vm member (VM2 V3: the book
@@ -423,18 +424,6 @@ pub struct ModelParams {
 /// ladder rung.
 pub const OPT_SPREAD_FRAC_MAX: u32 = 1_000_000;
 
-/// Which pair a `--fee-bps <venue>.<class>[.open|.settle]` flag names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FeeLeg {
-    /// The class's ordinary pair (closing trades, and every venue that
-    /// knows no other).
-    Ordinary,
-    /// The charge-once OPENING pair (BIN15 O1).
-    Open,
-    /// The pair charged when a binary instance settles (E7).
-    Settle,
-}
-
 impl Default for ModelParams {
     fn default() -> Self {
         Self {
@@ -615,52 +604,11 @@ pub fn parse_model_params(
         p.latency_ns[vi] = ns;
     }
     for spec in fee_specs {
-        let mut it = spec.split(':');
-        let (vc, mk, tk) = match (it.next(), it.next(), it.next(), it.next()) {
-            (Some(vc), Some(mk), Some(tk), None) => (vc, mk, tk),
-            _ => {
-                return Err(HarnessError::Usage(format!(
-                    "bad --fee-bps {spec:?}: want <venue>[.<class>[.open|.settle]]:<maker_bps>:<taker_bps>"
-                )))
-            }
-        };
-        // XSD-F: `<venue>` = every class (the pre-XSD-F flag, bit for
-        // bit); `<venue>.<class>` = that class alone. Later flags win,
-        // so `bn:10:10 bn.perp:2:5` reads as "spot tier everywhere on
-        // Binance except perps".
-        // BIN15 O1: a trailing `.open` names the OPENING pair of that
-        // class (the charge-once law) instead of its ordinary pair;
-        // E7: a trailing `.settle` names the pair charged when a binary
-        // instance settles. Both require a class — `<venue>.open` reads
-        // as an unknown class, which is the error the operator wants to
-        // see.
-        let (v, class, leg) = match vc.split_once('.') {
-            None => (vc, None, FeeLeg::Ordinary),
-            Some((v, rest)) => {
-                let (c, leg) = if let Some(c) = rest.strip_suffix(".open") {
-                    (c, FeeLeg::Open)
-                } else if let Some(c) = rest.strip_suffix(".settle") {
-                    (c, FeeLeg::Settle)
-                } else {
-                    (rest, FeeLeg::Ordinary)
-                };
-                let class = InstrumentClass::parse_label(c).ok_or_else(|| {
-                    HarnessError::Usage(format!(
-                        "bad --fee-bps {spec:?}: unknown class {c:?} (spot|perp|dated|option|prediction)"
-                    ))
-                })?;
-                (v, Some(class), leg)
-            }
-        };
-        let vi = model_venue(v).ok_or_else(|| {
-            HarnessError::Usage(format!("bad --fee-bps {spec:?}: unknown venue {v:?}"))
-        })?;
-        let mk: u32 = mk.parse().map_err(|_| {
-            HarnessError::Usage(format!("bad --fee-bps {spec:?}: unparseable maker bps"))
-        })?;
-        let tk: u32 = tk.parse().map_err(|_| {
-            HarnessError::Usage(format!("bad --fee-bps {spec:?}: unparseable taker bps"))
-        })?;
+        // T1b (impl-07 §3.13): the per-flag parse lives in `fee_flags` — one grammar, one
+        // function, the same error text; the table writes stay here.
+        let flag = parse_fee_bps_flag(spec).map_err(HarnessError::Usage)?;
+        let (vi, class, leg) = (flag.venue as usize, flag.class, flag.leg);
+        let (mk, tk) = (flag.maker_bps, flag.taker_bps);
         match (class, leg) {
             (None, _) => p.fee_bps[vi] = [(mk, tk); INSTRUMENT_CLASSES],
             (Some(c), FeeLeg::Ordinary) => p.fee_bps[vi][c.index()] = (mk, tk),

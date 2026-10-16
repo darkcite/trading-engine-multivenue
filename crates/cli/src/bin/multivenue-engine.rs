@@ -140,6 +140,9 @@ enum Cmd {
     /// stderr; exit 0 only when a trustworthy report was printed.
     /// H1 slice: hold-model accounting — the §4 fill model lands in H2.
     Backtest(BacktestArgs),
+    /// impl-07: the tier-1 Pine Script screener's operator verbs (`pine prepare` …) — offline,
+    /// over bar files; exit codes per impl-07 §3.11.
+    Pine(cli::pine::PineArgs),
     /// XMM XH2 parity gate (plan §7.3): replay ONE window of one capture
     /// run through the xmm member on the queue law, on the XMM
     /// simulator's venue clock and S1 latencies, and write one TSV row
@@ -1687,6 +1690,10 @@ fn main() -> ExitCode {
         Cmd::Backtest(args) => {
             init_tracing_stderr();
             backtest(args)
+        }
+        Cmd::Pine(args) => {
+            init_tracing_stderr();
+            ExitCode::from(cli::pine::main(&args))
         }
         Cmd::XmmParity(args) => {
             init_tracing_stderr();
