@@ -2860,7 +2860,7 @@ Deribit's ≤ 64 B memmem needle per subscribe result; the RPC signal
 payload's 8 B word encodes. On the auditor's flag (ruling Q12): the
 1 080 B `TlsTransport` moving into its slot once per reconnect (Bybit,
 MEXC — Binance's marker), and the boot moves at MEASURED sizes — the
-OKX (7 696 B), Deribit (9 520 B), Bybit (4 296 B; slot 5 488 B), MEXC
+OKX (7 696 B; 8 976 B since HK39), Deribit (9 520 B), Bybit (4 296 B; slot 5 488 B), MEXC
 (1 792 B; slot 3 008 B) and Polymarket (10 536 B) drivers with the
 tables they take by value.
 
@@ -16732,7 +16732,8 @@ still truncated to u32". **Plan:** project doc
   (`ingress-okx/src/run_loop.rs:1124`; BTC-USDT-SWAP seqId
   346 500 248 290, already past 2^32, and OKX may reset it after
   maintenance); Binance options ticks carry `venue_seq` 0, which every book
-  drops as `Stale`.
+  drops as `Stale`. Both ruled and fixed the same day: HK39 / HK40 ("HK,
+  part 5").
 - Review: risk / alloc SHIP WITH FIXES, applied (the `paper.rs` COPY sizes —
   Bybit 6 512 B, MEXC 3 264 B — a MEXC row `debug_assert`, the replay
   note). Captured before the deploy: 0 regressions in 2 M Binance, 145 k
@@ -16774,3 +16775,67 @@ roll (two families rolled by 05:31:34Z): `parse_errors_total` stayed 0,
 header; `seq_regressions_total` binance 0, bybit 0, mexc 3 in the first
 quarter hour (the previous binary counted 13 in its last hour under
 Q-MX1's law). Then `git push origin main` (HK-R25).
+
+## HK, part 5 — OKX and Binance options `venue_seq` (2026-10-16)
+
+**Ask (Anton):** "address these: 1. OKX truncates its sequence number the
+same way … 2. Binance options ticks carry a sequence of 0 …". **Plan:**
+project doc `claude/hk-part5-plan-2026-10-16.md`. **Commits:** `975aa2f`
+HK39, `30ed1b4` HK40; this section and the docs are HK41.
+
+| id | ruling (operator, 2026-10-16) |
+|---|---|
+| HK-R26 | OKX `bbo-tbt`: the arrival ordinal keyed on the venue `ts` (ms), the HK31/HK32 law — not on `seqId`, which OKX documents may reset after maintenance (and `bbo-tbt` has no snapshot to signal it). |
+| HK-R27 | Binance options (eapi `optionMarkPrice`): the arrival ordinal keyed on each mark element's event time `E` (ms). |
+| HK-R28 | One cut each, gates and reviews, deploy, push. |
+
+- **HK39 (`975aa2f`).** `bbo-tbt` put `seqId as u32` into `Tick.venue_seq`
+  (BTC-USDT-SWAP seqId 346 500 248 290, past 2^32). Now `bbo_seq:
+  [ArrivalSeq; OKX_MAX_SYMBOLS]` by symbol row, keyed on the push's `ts`;
+  reconnect → `reset_clocks`; a 0 counts on `okx_seq_regressions_total`.
+  `bbo-tbt` is each OKX instrument's only `Tick` source (`books` feeds the
+  `OkxSeqChain` and the depth lane; trades / mark / funding /
+  opt-summary feed events), and there is one OKX connection. Same-ms
+  tick-by-tick pushes take successive ordinals; a `seqId` drop with a newer
+  `ts` applies. `OkxBboFrame.seq_id` and its per-push memmem scan are gone
+  (nothing read them any more; the frame stays 64 B). The `books` `seqId`
+  chain and the `trades` check are unchanged. OKX Driver 7 696 → 8 976 B.
+- **HK40 (`30ed1b4`).** The eapi option ticks carried `venue_seq` 0, which
+  every `TopOfBook` dropped as `Stale`. Every element of the
+  `optionMarkPrice` array carries its own `E` (elements of one array differ
+  by a millisecond); each option row's `ArrivalSeq` is keyed on it; a
+  missing / malformed `E` reads 0 (the summary still flows; the tick is 0
+  and counted after the first real `E`). The sequencers are ONE fixed
+  boot-time block, `Box<[ArrivalSeq; EAPI_TABLE_MAX]>` in the eapi lane,
+  built from a `vec!` without a stack temporary and never grown: the 200+
+  per-symbol bookTicker Drivers carry 8 B for it (Driver 3 416 → 3 424 B),
+  not 1 280 B. The option ticks keep `venue_time_ms` 0 (`E` could feed
+  it and the VT2 feed clock — a follow-up, not ruled).
+- **What changes live (review finding 1):** Binance option touches now
+  reach `TopOfBook`. The only engine reader is ai-exec (slot 4,
+  `strategy-ai-exec/src/lib.rs:580-600`): a `SetFairValue` naming a Binance
+  option `SymbolId` claimed a book that stayed empty and never quoted; now
+  it can place paper post-only quotes at mid when |mid − (fair + bias)| ≥
+  edge. It takes an AI or operator command naming such a symbol. vrp, xsd,
+  xmm, bin15, hyparb, hcv, vm, the dispatcher's paper matcher, the
+  paper.rs and exec-router marks do not read `venue_seq` and are
+  unaffected.
+- Gates: nextest 4 754 (+6), alloc 127 (the OKX run loop and the Binance
+  run loop with the eapi window at 0 B), copy-audit new 0, license. Review:
+  risk / alloc SHIP WITH FIXES; applied (the fixed-size Box, the dead
+  `seqId` scan, the docs below).
+
+### The deploy (2026-10-16)
+
+`cargo build --release -p cli` at `30ed1b4` (1 m 44 s); `exec-smoke
+--offline` PASS. The Mac link dropped at ~06:40Z with the restart already
+armed on the Mac; `pkill -TERM` fired at 06:46:05Z. Booted `30ed1b431f69`,
+`/state` v3, mask 255, halted 0, the nine feeds up; at ~2 min
+`seq_regressions_total` binance 0, okx 0, bybit 0, mexc 0, HL
+`parse_errors_total` 0 (`trades_empty_total` 4 — the boot burst),
+`engine_ingress_binance_options_selected` 64. `engine_vm_rows_active`
+read 0 until 06:52Z: the boot landed one minute into the hourly `candles`
+cycle (06:45:11Z) and then `iv_digest`, and `recommit-ruleset.sh` waits
+behind any live worker (bounded 30 min) — it re-committed at ~06:52Z and
+the rows came back (2). **A deploy restart belongs off :46** (the candles
+hour); :16 and :31 were clean today. Then `git push origin main`.

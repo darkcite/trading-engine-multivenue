@@ -44,7 +44,7 @@ files predate it (see `docs/migration.md`).
 | -----: | ----: | ------------- | ---------------- | -------------------------------------- |
 |      0 |     8 | ts_ns         | `u64` NsTs       | monotonic ns from `core-time::now_ns` — the ordering key everywhere; venue time never re-times a record |
 |      8 |     4 | sym           | `u32` SymbolId   | venue-namespaced; `SYMBOL_ID_NONE = u32::MAX` invalid |
-|     12 |     4 | venue_seq     | `u32`            | venue-provided sequence, monotonic (`pm` since HK31, `hl` and `deribit` since HK32, `bn`, `bybit` and `mexc` since HK36: the ingress's per-instrument arrival ordinal, and 0 = a tick older than the instrument's newest — "Capture files") |
+|     12 |     4 | venue_seq     | `u32`            | venue-provided sequence, monotonic (`pm` since HK31, `hl` and `deribit` since HK32, `bn`, `bybit` and `mexc` since HK36, `okx` since HK39 (keyed on its venue `ts`), Binance options since HK40 (keyed on the mark element's `E`): the ingress's per-instrument arrival ordinal, and 0 = a tick older than the instrument's newest — "Capture files") |
 |     16 |     8 | bid_px        | `i64` Price      | fixed-point ×1e6                       |
 |     24 |     8 | bid_qty       | `i64` Qty        | fixed-point ×1e6                       |
 |     32 |     8 | ask_px        | `i64` Price      | fixed-point ×1e6                       |
@@ -617,6 +617,20 @@ a `MultiBook` reader would drop a later run's ticks as `Stale` until its
 ordinal passes the earlier run's last; no member of the strategy set
 reads these books today (`strategy-latency-arb`, `-cross-arb`,
 `-rule-tree` do, outside it).
+
+HK39 / HK40, appended 2026-10-16 — **`okx` `Tick.venue_seq` and the
+Binance options `Tick.venue_seq` are the arrival ordinal too; no layout
+change** (rulings HK-R26, HK-R27). OKX `bbo-tbt` carried `seqId as u32`
+(live ids past 2^32, and OKX documents a `seqId` reset after
+maintenance, which `bbo-tbt` has no snapshot to signal): the ordinal is
+keyed on the venue `ts` (ms) instead — the HK31/HK32 law, so a `seqId`
+reset cannot stall an instrument; `bbo-tbt`'s `seqId` is no longer read
+(the `books` channel's `seqId` chain and the `trades` check still are).
+Binance options (`optionMarkPrice`) ticks carried `venue_seq` 0, which
+every `TopOfBook` dropped as `Stale`: the ordinal is keyed on each mark
+element's own `E` (ms); a missing `E` reads 0. Both count a 0 on their
+venue's `seq_regressions_total` (Binance options share Binance's). The
+option ticks keep `venue_time_ms` 0.
 
 MX2, appended 2026-09-23 — `mexc` (VenueId 7; spot + futures share
 one label; data-only, ruling O-MX1). The per-venue law

@@ -6,6 +6,30 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-16 — `Tick.venue_seq` for okx and Binance options is the arrival ordinal (HK39, HK40)
+
+**What changed**
+- OKX `bbo-tbt` (`seqId as u32` before) and Binance options (`optionMarkPrice`,
+  `venue_seq` 0 before) now stamp the per-instrument arrival ordinal: OKX
+  keyed on the venue `ts` (ms; rulings HK-R26 — `seqId` may reset after
+  maintenance), Binance options on each mark element's `E` (HK-R27). An
+  older key gives 0, counted on the venue's `seq_regressions_total`
+  (Binance options share Binance's). No layout change.
+- `OkxBboFrame` no longer carries `seq_id` (its scan is gone from the hot
+  path); the `books` `seqId` chain and the `trades` check are unchanged.
+
+**Impact**
+- Live: Binance option touches reach `TopOfBook` for the first time (every
+  one was `Stale` before). The only engine reader is ai-exec (slot 4): a
+  fair value set on a Binance option `SymbolId` (an AI or operator command)
+  can now produce paper post-only quotes there; marks, risk and the other
+  members are unaffected. OKX ticks keep flowing through a `seqId` reset.
+- Captures from the deploy on: okx / Binance-option `Tick` rows carry the
+  ordinal (OKX's `seqId` is in no tick row; the `books` capture keeps it).
+
+**Migration steps**
+1. None: the routine restart of a binary built from this change.
+
 ## 2026-10-16 — HL ingress: `engine_ingress_hyperliquid_trades_empty_total` (HK37)
 
 **What changed**
@@ -56,8 +80,8 @@ Each entry is atomic: one version bump per section. Do not batch.
   run and is not rebased, so a `MultiBook` reader (latency-arb,
   cross-arb, rule-tree — all outside the set) would drop a later run's
   ticks until its ordinal passes the earlier run's.
-- Not changed: OKX `seqId as u32` (the same truncation; needs a ruling);
-  Binance options ticks carry `venue_seq` 0.
+- OKX `seqId as u32` and Binance options' `venue_seq` 0: addressed the
+  same day (HK39 / HK40, the entry above).
 
 **Migration steps**
 1. None: the routine restart of a binary built from this change.

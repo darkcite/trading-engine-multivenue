@@ -212,7 +212,11 @@ pub struct IngressStatus {
     /// occasional HL count is not a stuck clock. HK36: Binance and Bybit
     /// count a tick, the MEXC book every parsed push (republications
     /// included), whose FULL venue id is behind its instrument's newest — the same 0 (MEXC's book judge moved here
-    /// from Q-MX1's last-seen check; its trade judge stays).
+    /// from Q-MX1's last-seen check; its trade judge stays). HK39: OKX
+    /// `bbo-tbt` counts a tick whose venue `ts` is older than its
+    /// instrument's newest (not its `seqId`, which may reset); HK40:
+    /// Binance options count a mark element whose `E` is older — both
+    /// on their venue's counter (Binance options share Binance's).
     seq_regressions_total: AtomicU64,
     /// Channel resubscribes triggered by integrity monitors.
     resubscribes_total: AtomicU64,
@@ -344,7 +348,7 @@ impl IngressStatus {
 
     /// HK32: judge one top-of-book tick's `venue_seq` as stamped by
     /// `core_types::ArrivalSeq` (Polymarket, Hyperliquid, Deribit; HK36
-    /// Binance, Bybit, MEXC): 0 is
+    /// Binance, Bybit, MEXC; HK39 OKX; HK40 Binance options): 0 is
     /// a tick older than its instrument's newest, dropped by every book,
     /// and counted. One predicted compare inline; the count stays cold
     /// ([`Self::inc_seq_regressions`]).

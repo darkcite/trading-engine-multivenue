@@ -6,7 +6,10 @@
 //! (HK31), Hyperliquid `bbo` and the outcome-leg `l2Book` touch, Deribit
 //! `quote` (HK32) — and on those whose sequence id is a full `u64` that
 //! the `u32` slot cannot hold — Binance `bookTicker` `u`, Bybit
-//! `orderbook.1` `u`, MEXC book `version` (HK36).
+//! `orderbook.1` `u`, MEXC book `version` (HK36) — and keyed on a venue
+//! stamp again where the venue's sequence can reset or is absent: OKX
+//! `bbo-tbt` on its `ts` (HK39; `seqId` may reset after maintenance),
+//! Binance options on each mark element's `E` (HK40).
 //!
 //! Those streams carry only a millisecond venue stamp, and
 //! `book_builder::TopOfBook::apply` drops `venue_seq <= last` as `Stale`.
@@ -25,8 +28,9 @@
 //! instead of the ms stamp: the same law, a finer clock.
 //!
 //! Valid only on ONE ordered stream per instrument — the arrival order is
-//! then the venue's send order. Each of the three venues has one
-//! connection. Hyperliquid's two tick sources for an outcome leg (`bbo`
+//! then the venue's send order. Each instrument's ticks come from one
+//! connection (Binance: one per bookTicker symbol, one for the options
+//! mark stream). Hyperliquid's two tick sources for an outcome leg (`bbo`
 //! and the `l2Book` touch) are two VIEWS of one book on one block clock,
 //! and share the leg's sequencer: two ordinals feeding one `TopOfBook`
 //! would collide. The later arrival of a block wins it — the venue sends
