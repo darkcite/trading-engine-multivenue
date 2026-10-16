@@ -221,9 +221,13 @@ impl TvBroker {
             position_1e6: self.book.view().position_size_1e6,
             halted: self.risk.halted(),
         };
-        let open = usize::try_from(self.book.view().opentrades).unwrap_or(usize::MAX);
-        self.orders
-            .commit_slice(&mut self.exits, intents, &ctx, open, &mut self.counters)?;
+        self.orders.commit_slice(
+            &mut self.exits,
+            intents,
+            &ctx,
+            &self.book,
+            &mut self.counters,
+        )?;
         let eval = self.orders.eval();
         self.stamp_born(eval);
         if intrabar && self.sw.cof_next_tick == CofNextTick::RestOfSegment {

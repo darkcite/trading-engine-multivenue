@@ -485,6 +485,11 @@ impl ExitTable {
         None
     }
 
+    /// Rule slots in use or once used (the high-water mark; `rule(i)` for `i` below it).
+    pub(crate) fn slots(&self) -> usize {
+        self.nr
+    }
+
     /// Rule slots still free.
     pub(crate) fn free_rules(&self) -> usize {
         let mut used = 0;

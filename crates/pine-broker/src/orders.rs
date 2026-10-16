@@ -6,6 +6,7 @@
 //! modifies its record (I15). Exit rules live in `exit.rs`'s `ExitTable` (§4.5); `commit_slice` is
 //! the one entry point for both. Zero allocation; index loops.
 
+use crate::book::{lot_flag, Book};
 use crate::cap;
 use crate::exit::ExitTable;
 use crate::fault::{BrokerFault, ScriptRefusal};
@@ -189,6 +190,32 @@ fn key_of(it: &OrderIntent, ctx: &CommitCtx) -> Option<(u8, StrKey)> {
     }
 }
 
+/// Whether `intents[from..]` commits an exit rule keyed `id` (Ruling (b)).
+fn exit_in(intents: &[OrderIntent], from: usize, id: StrKey) -> bool {
+    let mut j = from;
+    while j < intents.len() {
+        if intents[j].kind == IntentKind::Exit && intents[j].id == id {
+            return true;
+        }
+        j += 1;
+    }
+    false
+}
+
+/// Whether `intents[from..]` cancels the exit rule keyed `id` — a `Cancel` of that id or a
+/// `CancelAll` (§4.4.3; Ruling (b)).
+fn cancelled_from(intents: &[OrderIntent], from: usize, id: StrKey) -> bool {
+    let mut j = from;
+    while j < intents.len() {
+        let it = &intents[j];
+        if it.kind == IntentKind::CancelAll || (it.kind == IntentKind::Cancel && it.id == id) {
+            return true;
+        }
+        j += 1;
+    }
+    false
+}
+
 /// The pending-order table (§4.4.2).
 pub(crate) struct OrderTable {
     orders: [PendingOrder; cap::ORDERS],
@@ -344,7 +371,7 @@ impl OrderTable {
         exits: &ExitTable,
         intents: &[OrderIntent],
         ctx: &CommitCtx,
-        open_trades: usize,
+        book: &Book,
     ) -> Result<(), BrokerFault> {
         let full = Err(BrokerFault::Script(ScriptRefusal::OrderTableFull));
         let mut new_entries = 0;
@@ -402,24 +429,100 @@ impl OrderTable {
         if self.live_groups(usize::MAX) + new_groups > cap::OCA_GROUPS {
             return Err(BrokerFault::Script(ScriptRefusal::OcaGroupsFull));
         }
-        // Ruling (b): leg sets. CONSERVATIVE upper bound — every live rule (after the slice) times
-        // every trade that is open or could open (pending entries and the slice's entries); a slice
+        // Ruling (b): leg sets. CONSERVATIVE upper bound on what the next `sync` can build (one set
+        // per rule × covered trade, §4.5.1), summed over the rules live AFTER the slice; a slice
         // whose bound exceeds `cap::LEG_SETS` is refused whole, though fewer sets may materialise.
+        // `pin:05-leg-bound-coverage`: the bound follows coverage — a rule retired by a later
+        // `Cancel` / `CancelAll` of the slice counts nothing, and a `from_entry = X` rule counts
+        // only what can carry entry id X (`coverable`). The v1 bound (every live rule before the
+        // slice + every re-commit after its `cancel_all`, times every trade) refused a five-level
+        // grid at three open trades (pvm7_grid).
         if new_rules > 0 || new_entries > 0 {
-            let mut pending = 0;
-            let mut i = 0;
-            while i < self.len() {
-                let o = &self.orders[i];
-                let entry = o.kind == IntentKind::Entry as u8 || o.kind == IntentKind::Order as u8;
-                pending += usize::from(o.is_live() && entry);
-                i += 1;
+            let mut bound = 0_usize;
+            // Rules already in the table and not re-committed by the slice.
+            let mut r = 0;
+            while r < exits.slots() {
+                let rule = exits.rule(r);
+                let id = rule.intent.id;
+                let live = rule.state == crate::exit::rule_state::LIVE
+                    && !exit_in(intents, 0, id)
+                    && !cancelled_from(intents, 0, id);
+                if live {
+                    let c = self.coverable(rule.intent.from_entry, intents, ctx, book);
+                    bound = bound.saturating_add(c);
+                }
+                r += 1;
             }
-            let rules = exits.live_rules() + new_rules;
-            if rules.saturating_mul(open_trades + pending + new_entries) > cap::LEG_SETS {
+            // The slice's rules: the last commit of each id, unless a later intent cancels it.
+            let mut j = 0;
+            while j < n {
+                let it = &intents[j];
+                if it.kind == IntentKind::Exit
+                    && !exit_in(intents, j + 1, it.id)
+                    && !cancelled_from(intents, j + 1, it.id)
+                {
+                    let c = self.coverable(it.from_entry, intents, ctx, book);
+                    bound = bound.saturating_add(c);
+                }
+                j += 1;
+            }
+            if bound > cap::LEG_SETS {
                 return full;
             }
         }
         Ok(())
+    }
+
+    /// Ruling (b): the trades a rule with `from_entry` can cover at the next `sync` — an upper bound
+    /// (§4.5.1; the `born_bar` horizon is ignored). `NONE`: every open trade, every live pending
+    /// entry / order and every entry / order of the slice. `X`: the open trades whose entry id is
+    /// `X` (and a D19 boot trade, which A6.3 may route to any id), plus one per pending key
+    /// `(Entry, X)` / `(Order, X)` live now or committed by the slice — a record fills into at most
+    /// one trade before the next `sync`.
+    fn coverable(
+        &self,
+        from_entry: StrKey,
+        intents: &[OrderIntent],
+        ctx: &CommitCtx,
+        book: &Book,
+    ) -> usize {
+        let any = from_entry == StrKey::NONE;
+        let mut c = 0_usize;
+        let mut t = 0_u32;
+        while let Some(lot) = book.open_trade(t) {
+            let boot = book.lot_flags(t).unwrap_or(0) & lot_flag::BOOT != 0;
+            c += usize::from(any || boot || lot.entry_id == from_entry);
+            t += 1;
+        }
+        const KINDS: [u8; 2] = [IntentKind::Entry as u8, IntentKind::Order as u8];
+        let mut k = 0;
+        while k < KINDS.len() {
+            let kind = KINDS[k];
+            if any {
+                // Every pending record of this kind, and every slice intent of this kind.
+                let mut i = 0;
+                while i < self.len() {
+                    let o = &self.orders[i];
+                    c += usize::from(o.is_live() && o.kind == kind);
+                    i += 1;
+                }
+                let mut j = 0;
+                while j < intents.len() {
+                    c += usize::from(intents[j].kind as u8 == kind);
+                    j += 1;
+                }
+            } else {
+                let mut has = self.find(kind, from_entry).is_some();
+                let mut j = 0;
+                while !has && j < intents.len() {
+                    has = key_of(&intents[j], ctx) == Some((kind, from_entry));
+                    j += 1;
+                }
+                c += usize::from(has);
+            }
+            k += 1;
+        }
+        c
     }
 
     /// Commit one evaluation's intents (W21): validate the whole slice (§4.4.1) and its capacity
@@ -431,11 +534,11 @@ impl OrderTable {
         exits: &mut ExitTable,
         intents: &[OrderIntent],
         ctx: &CommitCtx,
-        open_trades: usize,
+        book: &Book,
         counters: &mut BrokerCounters,
     ) -> Result<(), BrokerFault> {
         validate(intents)?;
-        self.check_capacity(exits, intents, ctx, open_trades)?;
+        self.check_capacity(exits, intents, ctx, book)?;
         self.begin_eval();
         let n = intents.len();
         let mut i = 0;
@@ -650,6 +753,7 @@ impl OrderTable {
 #[cfg(test)]
 mod tests {
     use super::{otype, pflag, state, CommitCtx, OrderTable, PendingOrder};
+    use crate::book::Book;
     use crate::exit::ExitTable;
     use crate::fault::{BrokerFault, ScriptRefusal};
     use crate::switch::ExitReservation;
@@ -657,6 +761,11 @@ mod tests {
         intent_flag as f, AllowEntry, BrokerCounters, IntentKind, IntentSide, OcaType, OrderIntent,
         StrKey,
     };
+
+    /// A flat book (the capacity checks read its open trades).
+    fn flat() -> Book {
+        Book::new(1_000_000 * 1_000_000, 1_000_000, false)
+    }
 
     fn ctx() -> CommitCtx {
         CommitCtx {
@@ -920,16 +1029,19 @@ mod tests {
             k += 1;
         }
         let full = Err(BrokerFault::Script(ScriptRefusal::OrderTableFull));
-        assert_eq!(t.commit_slice(&mut x, &slice, &ctx(), 0, &mut c), full);
+        assert_eq!(
+            t.commit_slice(&mut x, &slice, &ctx(), &flat(), &mut c),
+            full
+        );
         assert_eq!((t.len(), c.intents_committed), (0, 0));
         assert_eq!(
-            t.commit_slice(&mut x, &slice[..64], &ctx(), 0, &mut c),
+            t.commit_slice(&mut x, &slice[..64], &ctx(), &flat(), &mut c),
             Ok(())
         );
         assert_eq!(t.len(), 64);
         // Same-key re-emissions need no new slot.
         assert_eq!(
-            t.commit_slice(&mut x, &slice[..64], &ctx(), 0, &mut c),
+            t.commit_slice(&mut x, &slice[..64], &ctx(), &flat(), &mut c),
             Ok(())
         );
         // The 17th OCA group, anywhere in the slice, refuses the whole slice.
@@ -946,7 +1058,7 @@ mod tests {
             k += 1;
         }
         let oca = Err(BrokerFault::Script(ScriptRefusal::OcaGroupsFull));
-        assert_eq!(t.commit_slice(&mut x, &g, &ctx(), 0, &mut c), oca);
+        assert_eq!(t.commit_slice(&mut x, &g, &ctx(), &flat(), &mut c), oca);
         assert_eq!(t.len(), 0);
         // The 33rd exit rule.
         let mut t = OrderTable::new();
@@ -960,9 +1072,12 @@ mod tests {
             };
             k += 1;
         }
-        assert_eq!(t.commit_slice(&mut x, &e, &ctx(), 0, &mut c), full);
+        assert_eq!(t.commit_slice(&mut x, &e, &ctx(), &flat(), &mut c), full);
         assert_eq!(x.free_rules(), 32);
-        assert_eq!(t.commit_slice(&mut x, &e[..32], &ctx(), 0, &mut c), Ok(()));
+        assert_eq!(
+            t.commit_slice(&mut x, &e[..32], &ctx(), &flat(), &mut c),
+            Ok(())
+        );
         assert_eq!(x.free_rules(), 0);
     }
 
@@ -976,16 +1091,120 @@ mod tests {
             seq: 0,
             ..entry(9)
         };
-        t.commit_slice(&mut x, &[ex], &ctx(), 0, &mut c).unwrap();
+        t.commit_slice(&mut x, &[ex], &ctx(), &flat(), &mut c)
+            .unwrap();
         assert!(x.find(StrKey(9)).is_some());
-        t.commit_slice(&mut x, &[ex], &ctx(), 0, &mut c).unwrap();
+        t.commit_slice(&mut x, &[ex], &ctx(), &flat(), &mut c)
+            .unwrap();
         assert_eq!(c.intents_modified, 1);
         let cx = OrderIntent {
             kind: IntentKind::Cancel,
             seq: 0,
             ..entry(9)
         };
-        t.commit_slice(&mut x, &[cx], &ctx(), 0, &mut c).unwrap();
+        t.commit_slice(&mut x, &[cx], &ctx(), &flat(), &mut c)
+            .unwrap();
         assert!(x.find(StrKey(9)).is_none());
+    }
+
+    /// Ruling (b), `pin:05-leg-bound-coverage`: the leg-set bound sums, over the rules live after
+    /// the slice, the trades each can cover — a `from_entry = X` rule only X's.
+    #[test]
+    fn the_leg_set_bound_follows_coverage_and_the_slice_cancels() {
+        let mut book = flat();
+        let src = crate::book::FillSrc {
+            id: StrKey(1),
+            sym: pine_ir::Sym::NONE,
+            named_entry: StrKey::NONE,
+            born_bar: 0,
+            born_eval: 0,
+            is_entry: true,
+            lot_flags: 0,
+        };
+        let mut k = 0;
+        while k < 30 {
+            book.apply_fill(1_000_000, 100_000_000, 0, &src, 0, 0, 0)
+                .unwrap();
+            k += 1;
+        }
+        let rule = |id: u64, from: u64, seq: u32| OrderIntent {
+            kind: IntentKind::Exit,
+            id: StrKey(id),
+            from_entry: StrKey(from),
+            seq,
+            ..OrderIntent::default()
+        };
+        let cancel_all = OrderIntent {
+            kind: IntentKind::CancelAll,
+            seq: 0,
+            ..OrderIntent::default()
+        };
+        let mut t = OrderTable::new();
+        let mut x = ExitTable::new(ExitReservation::RuleOrder);
+        let mut c = BrokerCounters::default();
+        // Four rules on id 1 over its 30 trades: ≤ 120 sets.
+        let four = [
+            rule(11, 1, 0),
+            rule(12, 1, 1),
+            rule(13, 1, 2),
+            rule(14, 1, 3),
+        ];
+        assert_eq!(t.commit_slice(&mut x, &four, &ctx(), &book, &mut c), Ok(()));
+        // `cancel_all` then the same four: the cancelled four count nothing (v1: 8 × 30).
+        let again = [
+            cancel_all,
+            rule(11, 1, 1),
+            rule(12, 1, 2),
+            rule(13, 1, 3),
+            rule(14, 1, 4),
+        ];
+        assert_eq!(
+            t.commit_slice(&mut x, &again, &ctx(), &book, &mut c),
+            Ok(())
+        );
+        // Re-committed, then cancelled later in the slice: nothing live, nothing counted.
+        let gone = [
+            rule(15, 1, 0),
+            rule(16, 1, 1),
+            OrderIntent {
+                seq: 2,
+                ..cancel_all
+            },
+        ];
+        assert_eq!(t.commit_slice(&mut x, &gone, &ctx(), &book, &mut c), Ok(()));
+        // A fifth rule on id 1 could cover 150 > 128: refused whole, nothing committed.
+        let full = Err(BrokerFault::Script(ScriptRefusal::OrderTableFull));
+        assert_eq!(
+            t.commit_slice(
+                &mut x,
+                &[
+                    rule(11, 1, 0),
+                    rule(12, 1, 1),
+                    rule(13, 1, 2),
+                    rule(14, 1, 3),
+                    rule(15, 1, 4)
+                ],
+                &ctx(),
+                &book,
+                &mut c
+            ),
+            full
+        );
+        assert!(x.find(StrKey(15)).is_none());
+        // A fifth rule on id 2 covers no open trade (and one pending key at most): accepted.
+        let other = [
+            rule(11, 1, 0),
+            rule(12, 1, 1),
+            rule(13, 1, 2),
+            rule(14, 1, 3),
+            rule(15, 2, 4),
+        ];
+        assert_eq!(
+            t.commit_slice(&mut x, &other, &ctx(), &book, &mut c),
+            Ok(())
+        );
+        // A `from_entry = NONE` rule covers every trade: 120 + 0 + 30 > 128, refused.
+        let any = [rule(16, 0, 0)];
+        assert_eq!(t.commit_slice(&mut x, &any, &ctx(), &book, &mut c), full);
     }
 }

@@ -465,3 +465,85 @@ fn w23_v5_takes_the_absolute_level_and_v6_the_one_reached_first() {
     assert_eq!(w23_exit_price(pine_ir::Dialect::V5), 103 * E);
     assert_eq!(w23_exit_price(pine_ir::Dialect::V6), 102 * E);
 }
+
+/// One evaluation of a five-level grid (pvm7_grid's shape): optional `cancel_all`, five
+/// `strategy.order` limit buys `Bi` at `100 − i`, each its own OCA-cancel group, and five
+/// `strategy.exit("Ti", "Bi", limit = level + 6)`.
+fn grid_slice(cancel_all: bool) -> ([OrderIntent; 11], usize) {
+    let mut s = [OrderIntent::default(); 11];
+    let mut n = 0;
+    if cancel_all {
+        s[0] = OrderIntent {
+            kind: IntentKind::CancelAll,
+            ..OrderIntent::default()
+        };
+        n = 1;
+    }
+    let mut i = 1;
+    while i <= 5 {
+        let level = (100 - i) * E;
+        s[n] = OrderIntent {
+            kind: IntentKind::Order,
+            id: StrKey(i as u64),
+            side: IntentSide::Long,
+            flags: f::LIMIT,
+            limit_1e6: level,
+            oca_name: StrKey(100 + i as u64),
+            oca_type: pine_ir::OcaType::Cancel,
+            ..OrderIntent::default()
+        };
+        s[n + 5] = OrderIntent {
+            kind: IntentKind::Exit,
+            id: StrKey(10 + i as u64),
+            from_entry: StrKey(i as u64),
+            flags: f::LIMIT,
+            limit_1e6: level + 6 * E,
+            ..OrderIntent::default()
+        };
+        n += 1;
+        i += 1;
+    }
+    n += 5;
+    let mut k = 0;
+    while k < n {
+        s[k].seq = u32::try_from(k).unwrap_or(0);
+        k += 1;
+    }
+    (s, n)
+}
+
+/// pvm7_grid (pine-screen, `Broker(OrderTableFull)` at bar 201): a grid re-armed every evaluation,
+/// its trades piling up over five falling bars and released by a sixth that reaches every take-
+/// profit, 300 bars (past `cap::ORDERS` 64, `cap::EXIT_RULES` 32 and `cap::LEG_SETS` 128). Each
+/// `Ti` covers only `Bi`'s trades, so the leg sets never exceed the open trades (≤ 25); the v1
+/// capacity bound (every rule × every trade, the slice's cancelled rules counted as live) refused
+/// the slice at 10 open trades with the `cancel_all` and at 25 without (`pin:05-leg-bound-coverage`).
+#[test]
+fn a_re_armed_grid_with_exits_and_cancel_all_runs_past_every_table_capacity() {
+    for cancel_all in [true, false] {
+        let mut b = broker(0);
+        let (slice, n) = grid_slice(cancel_all);
+        let mut peak = 0;
+        let mut k = 0_u32;
+        while k < 300 {
+            let x = if k % 6 < 5 {
+                bar(k, 100, 100, 94, 94) // every level fills on the way down
+            } else {
+                bar(k, 100, 110, 100, 108) // every take-profit (101..105) is reached
+            };
+            run_bar(&mut b, &x, &slice[..n]);
+            peak = peak.max(b.view().opentrades);
+            if k % 6 == 5 {
+                assert_eq!(b.view().opentrades, 0, "bar {k}: the release closes all");
+            }
+            k += 1;
+        }
+        assert_eq!(peak, 25, "cancel_all = {cancel_all}");
+        // Bar 0's orders commit at its close, so the first cycle fills on four bars (20 trades).
+        assert_eq!(
+            b.view().closedtrades,
+            20 + 49 * 25,
+            "cancel_all = {cancel_all}"
+        );
+    }
+}

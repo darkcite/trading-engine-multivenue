@@ -29,11 +29,9 @@ const SCREENED: [(&str, ExecMode); 11] = [
 
 /// Screened scripts that fault today, each an open request to another lane (named in the T2
 /// report). The assertion is exact, so a fix turns this test red until the entry is removed.
-// pvm7_grid: its five `strategy.exit("Ti", "Bi", limit = …)` re-issued each evaluation fill
-// pine-broker's exit tables → `BrokerFault::Script(OrderTableFull)` at bar 201 (bar 301 without the
-// `cancel_all`; without the exits it completes) — exit-rule / leg-set slots are not reclaimed.
-// Request to the pine-broker lane.
-const KNOWN_FAULTS: [&str; 1] = ["pvm7_grid"];
+// (pvm7_grid's `Broker(OrderTableFull)` at bar 201 was pine-broker's leg-set capacity bound;
+// fixed there, `pin:05-leg-bound-coverage` — it screens like the other ten.)
+const KNOWN_FAULTS: [&str; 0] = [];
 
 fn dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../pine-lang/tests/scripts")
