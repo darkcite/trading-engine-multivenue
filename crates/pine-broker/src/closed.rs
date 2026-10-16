@@ -36,11 +36,16 @@ impl ClosedRing {
         self.len
     }
 
-    /// Append a closed trade, overwriting the oldest when full.
-    pub(crate) fn push(&mut self, rec: &TradeRec) {
+    /// Forget every record, in place: no allocation, no free (I3/I4).
+    pub(crate) fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    /// The slot the next closed trade is written into, IN PLACE (§4.17 #1: one copy, lot → ring);
+    /// claims it now, overwriting the oldest when full.
+    pub(crate) fn push_slot(&mut self) -> &mut TradeRec {
         let h = self.head as usize;
-        // COPY: §4.17 #1 — the ring owns an immutable 128-B record while the lot slot is reused.
-        self.recs[h] = *rec;
         self.head = if self.head + 1 == RETAIN {
             0
         } else {
@@ -49,6 +54,7 @@ impl ClosedRing {
         if self.len < RETAIN {
             self.len += 1;
         }
+        &mut self.recs[h]
     }
 
     /// Closed trade `i`, 0 = oldest retained; `None` past `len`.
@@ -70,6 +76,10 @@ mod tests {
     use super::{ClosedRing, RETAIN};
     use pine_ir::TradeRec;
 
+    fn push(r: &mut ClosedRing, t: &TradeRec) {
+        *r.push_slot() = *t;
+    }
+
     fn rec(k: i64) -> TradeRec {
         TradeRec {
             qty_1e6: k,
@@ -83,7 +93,7 @@ mod tests {
         assert!(r.get(0).is_none());
         let mut k = 0;
         while k < 9001 {
-            r.push(&rec(k));
+            push(&mut r, &rec(k));
             k += 1;
         }
         assert_eq!(r.len(), RETAIN);
@@ -91,5 +101,20 @@ mod tests {
         assert_eq!(r.get(0).map(|t| t.qty_1e6), Some(1));
         assert_eq!(r.get(RETAIN - 1).map(|t| t.qty_1e6), Some(9000));
         assert!(r.get(RETAIN).is_none());
+    }
+
+    #[test]
+    fn clear_empties_in_place() {
+        let mut r = ClosedRing::new();
+        push(&mut r, &rec(7));
+        push(&mut r, &rec(8));
+        let p = r.recs.as_ptr();
+        r.clear();
+        assert_eq!(r.len(), 0);
+        assert!(r.get(0).is_none());
+        assert_eq!(r.recs.as_ptr(), p, "clear must not reallocate");
+        *r.push_slot() = rec(9);
+        assert_eq!(r.get(0).map(|t| t.qty_1e6), Some(9));
+        assert_eq!(r.len(), 1);
     }
 }

@@ -6,8 +6,8 @@
 
 use pine_broker::{EngineIntentBuf, NativeBroker};
 use pine_ir::{
-    intent_flag as f, Bar, ChartInfo, EngineVerb, IntentKind, LimitPrimitive, NativeCfg,
-    OrderIntent, Primitive, ProgramMeta, Quote, StrKey, StrategyDecl,
+    entry_dir, intent_flag as f, Bar, ChartInfo, EngineVerb, EntryDir, IntentKind, LimitPrimitive,
+    NativeCfg, OrderIntent, Primitive, ProgramMeta, Quote, StrKey, StrategyDecl,
 };
 
 const E: i64 = 1_000_000;
@@ -31,6 +31,20 @@ fn cfg() -> NativeCfg {
 }
 
 fn broker(c: NativeCfg) -> NativeBroker {
+    broker_dirs(c, &[])
+}
+
+/// A broker whose script opens each `(id, dirs)` (amendment A6: `ProgramMeta::entry_dirs`).
+fn broker_dirs(c: NativeCfg, dirs: &[(u64, u8)]) -> NativeBroker {
+    let mut rows: Vec<EntryDir> = dirs
+        .iter()
+        .map(|&(id, d)| EntryDir {
+            id: StrKey(id),
+            dirs: d,
+            _pad: [0; 7],
+        })
+        .collect();
+    rows.sort_by_key(|r| r.id.0);
     let meta = ProgramMeta {
         chart: ChartInfo {
             symbol_hash: 1,
@@ -48,6 +62,7 @@ fn broker(c: NativeCfg) -> NativeBroker {
             pyramiding: 1,
             ..StrategyDecl::default()
         },
+        entry_dirs: rows,
         ..ProgramMeta::default()
     };
     let mut b = NativeBroker::new(&meta, c).unwrap_or_else(|_| unreachable!());
@@ -309,9 +324,10 @@ fn a_native_risk_trip_flattens_at_the_next_reconcile() {
 }
 
 #[test]
-fn boot_reconciliation_is_pristine_across_open_bar_and_covered_by_any_exit() {
+fn boot_reconciliation_is_pristine_across_open_bar_and_covered_by_a_same_direction_exit() {
     // I34.
-    let mut b = broker(cfg());
+    // A6.3: the script opens id 77 long, so its exit reaches a long boot trade.
+    let mut b = broker_dirs(cfg(), &[(77, entry_dir::LONG)]);
     b.open_bar(&Bar {
         close_1e6: 101 * E,
         index: 2,
@@ -328,7 +344,7 @@ fn boot_reconciliation_is_pristine_across_open_bar_and_covered_by_any_exit() {
     // Non-pristine now: a second boot changes nothing.
     b.reconcile_boot(9 * E, 50 * E, 0);
     assert_eq!(b.view().position_size_1e6, 5 * E);
-    // An exit naming some entry id covers the boot trade: its stop fires for the position.
+    // An exit naming an id the script opens long covers the long boot trade: its stop fires.
     let ex = OrderIntent {
         kind: IntentKind::Exit,
         id: StrKey(9),
@@ -382,23 +398,95 @@ fn repeated_flattens_against_a_filling_venue_never_cross_zero() {
     assert!(b.view().position_size_1e6 < 10 * E);
 }
 
-#[test]
-fn a_close_naming_any_id_closes_the_boot_trade() {
-    // `pin:05-boot-close` (lead ruling).
-    let mut b = broker(cfg());
+/// A close of `id` against a 5-contract long boot trade: what `reconcile` sends.
+fn boot_close(dirs: &[(u64, u8)], id: u64) -> Vec<pine_ir::EngineIntent> {
+    let mut b = broker_dirs(cfg(), dirs);
     b.reconcile_boot(5 * E, 100 * E, 0);
     let close = OrderIntent {
         kind: IntentKind::Close,
-        from_entry: StrKey(42),
+        from_entry: StrKey(id),
         ..OrderIntent::default()
     };
     b.apply_intents(&[close], NOW).unwrap();
     let mut out = EngineIntentBuf::new();
     b.reconcile(&quote(100 * E, 100 * E), NOW, &mut out)
         .unwrap();
-    let e = out.as_slice()[0];
+    out.as_slice().to_vec()
+}
+
+#[test]
+fn a_close_of_an_id_opened_in_the_boot_direction_closes_the_boot_trade() {
+    // A6.3 `pin:05-boot-close-dir` (operator ruling 2026-10-16).
+    let sent = boot_close(&[(42, entry_dir::LONG)], 42);
+    assert_eq!(sent.len(), 1);
+    let e = sent[0];
     assert_eq!(
         (e.primitive, e.side, e.qty_1e6, e.flags),
         (Primitive::ReduceOnlyIoc, 1, 5 * E, 1)
+    );
+}
+
+#[test]
+fn a_close_of_an_opposite_both_or_absent_id_leaves_the_boot_trade() {
+    // A6.3: `strategy.close("Short")` must not close a boot LONG.
+    assert!(
+        boot_close(&[(42, entry_dir::SHORT)], 42).is_empty(),
+        "opposite"
+    );
+    assert!(
+        boot_close(&[(42, entry_dir::LONG | entry_dir::SHORT)], 42).is_empty(),
+        "both directions"
+    );
+    assert!(
+        boot_close(&[(41, entry_dir::LONG)], 42).is_empty(),
+        "absent id"
+    );
+    assert!(boot_close(&[], 42).is_empty(), "no rows");
+}
+
+#[test]
+fn an_exit_from_an_opposite_id_does_not_cover_the_boot_trade_but_close_all_does() {
+    // A6.3: `exit(from_entry = id)` follows the same rule; `close_all` and an exit without
+    // `from_entry` reach the boot trade as before.
+    let mut b = broker_dirs(cfg(), &[(77, entry_dir::SHORT), (78, entry_dir::LONG)]);
+    b.reconcile_boot(5 * E, 100 * E, 0);
+    let ex = |id: u64, from: u64| OrderIntent {
+        kind: IntentKind::Exit,
+        id: StrKey(id),
+        from_entry: StrKey(from),
+        flags: f::LOSS,
+        loss_ticks_1e6: 100 * E,
+        ..OrderIntent::default()
+    };
+    let mut out = EngineIntentBuf::new();
+    b.apply_intents(&[ex(9, 77)], NOW).unwrap();
+    b.reconcile(&quote(99 * E, 99 * E), NOW, &mut out).unwrap();
+    assert!(
+        out.is_empty(),
+        "an exit from a short id never stops a boot long"
+    );
+    // Without `from_entry` the same stop covers it.
+    b.apply_intents(&[ex(10, 0)], NOW).unwrap();
+    b.reconcile(&quote(99 * E, 99 * E), NOW, &mut out).unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        (out.as_slice()[0].id, out.as_slice()[0].qty_1e6),
+        (StrKey(10), 5 * E)
+    );
+
+    let mut c = broker_dirs(cfg(), &[(77, entry_dir::SHORT)]);
+    c.reconcile_boot(5 * E, 100 * E, 0);
+    let all = OrderIntent {
+        kind: IntentKind::CloseAll,
+        ..OrderIntent::default()
+    };
+    c.apply_intents(&[all], NOW).unwrap();
+    c.reconcile(&quote(100 * E, 100 * E), NOW, &mut out)
+        .unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out.as_slice()[0].qty_1e6,
+        5 * E,
+        "close_all reaches the boot trade"
     );
 }

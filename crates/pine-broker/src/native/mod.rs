@@ -20,7 +20,7 @@ use crate::decl::{check_native, decl_hash64};
 use crate::exit::{ExitTable, SyncCtx};
 use crate::fault::{BrokerFault, InternalDefect};
 use crate::money::{floor_step, mul_div, sat_i64, usd_1e6_to_1e12, value_1e12};
-use crate::orders::{otype, CommitCtx, OrderTable};
+use crate::orders::{otype, pflag, CommitCtx, OrderTable};
 use crate::risk::Risk;
 use crate::size::{declared_qty, unit_qty};
 use crate::size::{n_rule_entry, n_rule_scale, size_entry_fill};
@@ -57,10 +57,27 @@ pub struct NativeBroker {
     flatten_pending: bool,
     cof_latch: bool,
     pristine: bool,
+    /// This `reconcile`: a close / close-all / reversal wants to fire, so resting reducers are
+    /// taken back and none is (re)submitted (§4.12.4 rule 2).
+    preempt: bool,
     mark_1e6: i64,
     bars: u32,
     last_bar: Option<u32>,
     cand: [Cand; cap::ORDERS + cap::LEG_SETS],
+}
+
+/// `SentOrder::owner` naming no record or set (beyond every table's capacity).
+const OWNER_NONE: u16 = 0x7FFF;
+// Beyond both owner tables (`LEG_SETS` ≥ `ORDERS`).
+const _: () = assert!(cap::LEG_SETS >= cap::ORDERS && (OWNER_NONE as usize) > cap::LEG_SETS);
+
+/// The orphan owner tag for a sent order of `kind`.
+const fn owner_none(kind: u8) -> u16 {
+    if kind == sent_kind::LEG {
+        OWNER_NONE | OWNER_SET
+    } else {
+        OWNER_NONE
+    }
 }
 
 /// `Cand::what` bit: a leg-set candidate.
@@ -72,7 +89,9 @@ impl NativeBroker {
     pub fn new(meta: &ProgramMeta, cfg: NativeCfg) -> Result<Self, DiagCode> {
         check_native(meta, &cfg)?;
         let d = meta.decl;
-        Ok(Self {
+        // COPY: §4.17 #7 the broker by value, 89 408 B, once at construction — init-time move
+        // into the host's slot — an out-parameter or a boxed broker rejected: the frozen signature.
+        let mut b = Self {
             decl: d,
             chart: meta.chart,
             dialect: meta.dialect,
@@ -95,11 +114,14 @@ impl NativeBroker {
             flatten_pending: false,
             cof_latch: false,
             pristine: true,
+            preempt: false,
             mark_1e6: 0,
             bars: 0,
             last_bar: None,
             cand: [Cand::default(); cap::ORDERS + cap::LEG_SETS],
-        })
+        };
+        b.exits.load_boot_dirs(&meta.entry_dirs);
+        Ok(b)
     }
 
     /// Re-marks the book at `bar.close_1e6` and records `bar.index` for trade records and exit
@@ -162,6 +184,14 @@ impl NativeBroker {
         }
         let any = self.orders.len() > 0 || !self.exits.sets().is_empty();
         let fresh = gate::fresh(q, now_ns, self.cfg.quote_stale_ns);
+        if fresh {
+            // Step 5's trails move with every fresh touch, before the cancels read them: a set
+            // whose take-profit rests still arms and runs its trail (§4.12.4 rule 2).
+            self.step_trails(q);
+        }
+        // §4.12.4 rule 2: a close, a close-all or a reversal that wants to fire takes back every
+        // resting reducer, so it is never covered by them forever.
+        self.preempt = fresh && self.reducers_preempted(q);
         // Step 3: cancels are never gated (I26, I27).
         self.maker_cancels(q, now_ns, fresh, out)?;
         if !fresh {
@@ -326,13 +356,25 @@ impl NativeBroker {
                 .apply_fill(qty_1e6, px_1e6, fee_1e12, &src, bar_index, time_ms, cause)?;
             return self.after_fill();
         };
-        let o = *self.sent.get(i);
-        src.id = o.id;
+        // The scalars the fill reads (the book and the owners are written below).
+        let (o_id, o_kind, o_owner, o_side, o_filled, o_qty, o_maker) = {
+            let o = self.sent.get(i);
+            (
+                o.id,
+                o.kind,
+                o.owner,
+                o.side,
+                o.filled_1e6,
+                o.qty_1e6,
+                o.primitive == Primitive::MakerPostOnly as u8,
+            )
+        };
+        src.id = o_id;
         let mut owner_order = None;
         let mut owner_set = None;
-        match o.kind {
+        match o_kind {
             sent_kind::ORDER => {
-                let k = usize::from(o.owner);
+                let k = usize::from(o_owner);
                 if k < self.orders.len() && usize::from(self.orders.get(k).sent) == i + 1 {
                     let p = self.orders.get(k);
                     src.sym = p.id_sym;
@@ -349,7 +391,7 @@ impl NativeBroker {
                 }
             }
             sent_kind::LEG => {
-                let k = usize::from(o.owner & !OWNER_SET);
+                let k = usize::from(o_owner & !OWNER_SET);
                 if k < self.exits.sets().len() && usize::from(self.exits.set(k).sent) == i + 1 {
                     src.named_entry = self.exits.set(k).entry_id;
                     owner_set = Some(k);
@@ -357,33 +399,35 @@ impl NativeBroker {
             }
             _ => {}
         }
-        let cause = if o.kind == sent_kind::RISK_FLATTEN {
+        let cause = if o_kind == sent_kind::RISK_FLATTEN {
             pine_ir::trade_flag::RISK_FLATTEN
         } else {
             0
         };
-        let wrong_side = (qty_1e6 > 0) != (o.side == 0);
-        let over = o.filled_1e6.saturating_add(q_abs) > o.qty_1e6;
+        let wrong_side = (qty_1e6 > 0) != (o_side == 0);
+        let over = o_filled.saturating_add(q_abs) > o_qty;
         self.book
             .apply_fill(qty_1e6, px_1e6, fee_1e12, &src, bar_index, time_ms, cause)?;
         if wrong_side || over {
             return Err(BrokerFault::Internal(InternalDefect::BookDesync));
         }
-        if o.filled_1e6 == 0 {
-            if o.primitive == Primitive::MakerPostOnly as u8 {
+        if o_filled == 0 {
+            if o_maker {
                 self.counters.maker_filled += 1;
             } else {
                 self.counters.ioc_filled += 1;
             }
         }
-        let filled = o.filled_1e6 + q_abs;
+        let filled = o_filled + q_abs;
         self.sent.get_mut(i).filled_1e6 = filled;
         if let Some(k) = owner_order {
             let p = self.orders.get_mut(k);
             p.filled_1e6 = p.filled_1e6.saturating_add(q_abs);
             self.orders.on_member_fill(k, q_abs, &mut self.counters);
-            if filled >= o.qty_1e6 {
-                // The order is done at the size it was sent with (§4.13 line 6).
+            // Done at its size (§4.13 line 6) — the size it WANTS: a send cut short by outstanding
+            // reducers (`DEFERRED`, §4.12.4 rules 2–3) leaves the record alive for the remainder,
+            // sized again after the reducers' dispositions.
+            if filled >= o_qty && self.orders.get(k).flags & pflag::DEFERRED == 0 {
                 self.orders.kill(k);
             }
         }
@@ -394,7 +438,7 @@ impl NativeBroker {
                 s.state = crate::exit::set_state::DONE;
             }
         }
-        if filled >= o.qty_1e6 {
+        if filled >= o_qty {
             self.unlink_owner(i);
             self.sent.retire(i);
         }
@@ -411,7 +455,7 @@ impl NativeBroker {
         let Some(i) = self.sent.find(client_oid) else {
             return;
         };
-        let o = *self.sent.get(i);
+        let o = self.sent.get(i);
         let ioc = o.primitive != Primitive::MakerPostOnly as u8;
         if ioc && o.acked == 1 && o.state == sent_state::LIVE {
             self.counters.ioc_remainder_cancelled += 1;
@@ -427,7 +471,8 @@ impl NativeBroker {
         if !self.pristine {
             return;
         }
-        self.book = Book::new(
+        // In place: `new` made the crate's one allocation; a fresh `Book` here would be a second.
+        self.book.reset(
             self.decl.initial_capital_1e6,
             self.chart.pointvalue_1e6,
             self.decl.flags & decl_flag::CLOSE_ANY != 0,
@@ -640,32 +685,43 @@ impl NativeBroker {
         let stale = u64::try_from(self.cfg.quote_stale_ns).unwrap_or(0);
         let mut i = 0;
         while i < self.sent.slots() {
-            let o = *self.sent.get(i);
-            let maker = o.primitive == Primitive::MakerPostOnly as u8;
-            if maker
-                && o.state == sent_state::CANCELLING
-                && o.emit_ns.saturating_add(stale) <= now_ns
-            {
+            // The scalars the decision reads (`rest_of` borrows `self` mutably).
+            let (maker, state, emit_ns, set, idx, reduce, side, remaining, o_px, oid) = {
+                let o = self.sent.get(i);
+                (
+                    o.primitive == Primitive::MakerPostOnly as u8,
+                    o.state,
+                    o.emit_ns,
+                    o.kind == sent_kind::LEG,
+                    usize::from(o.owner & !OWNER_SET),
+                    o.reduce,
+                    o.side,
+                    o.qty_1e6 - o.filled_1e6,
+                    o.px_1e6,
+                    o.client_oid,
+                )
+            };
+            if maker && state == sent_state::CANCELLING && emit_ns.saturating_add(stale) <= now_ns {
                 self.emit_cancel(i, now_ns, out)?;
-            } else if maker && o.state == sent_state::LIVE {
-                let set = o.kind == sent_kind::LEG;
-                let idx = usize::from(o.owner & !OWNER_SET);
+            } else if maker && state == sent_state::LIVE {
                 let linked = usize::from(self.owner_sent_checked(set, idx)) == i + 1;
+                let closing_side = u8::from(self.book.view().position_size_1e6 > 0);
                 let cancel = if !linked {
                     true
                 } else if !fresh {
                     !self.owner_alive(set, idx)
+                } else if self.preempt && reduce == 1 && side == closing_side {
+                    true
                 } else {
                     match self.rest_of(set, idx, q)? {
                         None => true,
                         Some((w, qty)) => {
-                            let same_side = u8::from(!w.buy) == o.side;
+                            let same_side = u8::from(!w.buy) == side;
                             let px = self.maker_px(w);
-                            let remaining = o.qty_1e6 - o.filled_1e6;
-                            let changed = px != o.px_1e6 || qty != remaining;
+                            let changed = px != o_px || qty != remaining;
                             !same_side
                                 || (changed
-                                    && !self.has_pending_replacement(o.client_oid)
+                                    && !self.has_pending_replacement(oid)
                                     && !self.requote_fits(w.reduce, qty))
                         }
                     }
@@ -714,37 +770,49 @@ impl NativeBroker {
     ) -> Result<(), BrokerFault> {
         let mut i = 0;
         while i < self.sent.slots() {
-            let o = *self.sent.get(i);
-            if o.primitive == Primitive::MakerPostOnly as u8
-                && o.state == sent_state::LIVE
-                && !self.has_pending_replacement(o.client_oid)
-            {
-                let set = o.kind == sent_kind::LEG;
-                let idx = usize::from(o.owner & !OWNER_SET);
+            // The scalars the decision reads (`rest_of` borrows `self` mutably).
+            let (live_maker, prev, set, idx, side, remaining, o_px) = {
+                let o = self.sent.get(i);
+                (
+                    o.primitive == Primitive::MakerPostOnly as u8 && o.state == sent_state::LIVE,
+                    o.client_oid,
+                    o.kind == sent_kind::LEG,
+                    usize::from(o.owner & !OWNER_SET),
+                    o.side,
+                    o.qty_1e6 - o.filled_1e6,
+                    o.px_1e6,
+                )
+            };
+            if live_maker && !self.has_pending_replacement(prev) {
                 if let Some((w, qty)) = self.rest_of(set, idx, q)? {
                     let px = self.maker_px(w);
-                    let changed = px != o.px_1e6 || qty != o.qty_1e6 - o.filled_1e6;
-                    if changed && u8::from(!w.buy) == o.side && self.requote_fits(w.reduce, qty) {
+                    let changed = px != o_px || qty != remaining;
+                    if changed && u8::from(!w.buy) == side && self.requote_fits(w.reduce, qty) {
+                        // COPY: prev's SentOrder → its replacement's record, 64 B, once per
+                        // Modify — the replacement IS prev's identity (id, owner, side, kind,
+                        // primitive, reduce) with a new price / size — re-listing those six
+                        // fields one by one rejected: the same bytes, written field-wise.
                         let so = SentOrder {
-                            prev_oid: o.client_oid,
+                            prev_oid: prev,
                             px_1e6: px,
                             qty_1e6: qty,
                             emit_ns: now_ns,
-                            ..o
+                            ..*self.sent.get(i)
                         };
+                        let (id, reduce) = (so.id, so.reduce);
                         let (_, oid) = self.sent.issue(so)?;
                         out.push(EngineIntent {
                             verb: EngineVerb::Modify,
                             primitive: Primitive::MakerPostOnly,
-                            side: o.side,
-                            flags: o.reduce,
+                            side,
+                            flags: reduce,
                             client_oid: oid,
-                            prev_client_oid: o.client_oid,
+                            prev_client_oid: prev,
                             _pad0: 0,
                             px_1e6: px,
                             qty_1e6: qty,
                             ttl_ns: 0,
-                            id: o.id,
+                            id,
                             _pad1: [0; 2],
                         })?;
                         self.counters.modifies += 1;
@@ -770,6 +838,9 @@ impl NativeBroker {
         let Some((w, qty)) = self.rest_of(set, idx, q)? else {
             return Ok(false);
         };
+        if w.reduce && self.preempt {
+            return Ok(false); // a close / reversal is taking the position back (rule 2)
+        }
         let mut venue = 0;
         let mut makers = 0;
         let mut k = 0;
@@ -845,6 +916,52 @@ impl NativeBroker {
             self.orders.get_mut(idx).sent = tag;
         }
         Ok(true)
+    }
+
+    /// Move every live set's trail with the touch (§4.5.6; bid for a long's trail, ask for a
+    /// short's). Idempotent for one touch, so `leg_want`'s own step changes nothing after it.
+    fn step_trails(&mut self, q: &Quote) {
+        let mut k = 0;
+        while k < self.exits.sets().len() {
+            let s = self.exits.set_mut(k);
+            if s.state == crate::exit::set_state::LIVE && s.r_1e6 > 0 {
+                let touch = if s.side == 1 { q.bid_1e6 } else { q.ask_1e6 };
+                crate::exit::trail_step(s, touch);
+            }
+            k += 1;
+        }
+    }
+
+    /// A live `Close` with open trades of its id, a live `CloseAll`, or a live entry against the
+    /// position that wants to fire at the touch (a reversal) — §4.12.4 rules 2–3.
+    /// `pin:05-preempt-reducers`: the literal "cancel every resting reducer", whether or not the
+    /// close's own room suffices; a reversal is included (rule 3 alone could wait forever on a
+    /// take-profit that never fills). Reducing makers are held while it holds.
+    fn reducers_preempted(&self, q: &Quote) -> bool {
+        let pos = self.book.view().position_size_1e6;
+        if pos == 0 {
+            return false;
+        }
+        let mut i = 0;
+        while i < self.orders.len() {
+            let o = self.orders.get(i);
+            if o.is_live() {
+                if o.kind == IntentKind::CloseAll as u8 {
+                    return true;
+                }
+                if o.kind == IntentKind::Close as u8 && self.open_qty_of(o.id) > 0 {
+                    return true;
+                }
+                if o.kind == IntentKind::Entry as u8
+                    && (o.side == 0) != (pos > 0)
+                    && order_want(o, q, pos).is_some()
+                {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
     }
 
     /// An IoC of this script awaits its disposition.
@@ -925,8 +1042,9 @@ impl NativeBroker {
     }
 
     /// Size pending order `i` for want `w` at reference price `px` (§4.7, §4.12.3–§4.12.4).
-    /// `commit`: refusals kill the record and count; otherwise a dry run (requote checks) that
-    /// changes nothing. `Ok(0)`: nothing to send now.
+    /// `commit`: refusals kill the record and count, and the record's `pflag::DEFERRED` bit is set
+    /// when outstanding reducers cut the send short of what it wants (§4.12.4 rules 2–3);
+    /// otherwise a dry run (requote checks) that changes nothing. `Ok(0)`: nothing to send now.
     fn size_order(
         &mut self,
         i: usize,
@@ -935,54 +1053,78 @@ impl NativeBroker {
         commit: bool,
     ) -> Result<i64, BrokerFault> {
         let pos = self.book.view().position_size_1e6;
-        // COPY: 128-B record snapshot: sizing borrows `self` mutably.
-        let o = *self.orders.get(i);
+        // The scalars sizing reads (sizing borrows `self` mutably, so no borrow of the record).
+        let (kind, id, qty, qty_pct, filled, reduced, born_eval, deferred) = {
+            let o = self.orders.get(i);
+            (
+                o.kind,
+                o.id,
+                o.qty_1e6,
+                o.qty_pct_1e6,
+                o.filled_1e6,
+                o.oca_reduced_1e6,
+                o.born_eval,
+                o.flags & pflag::DEFERRED != 0,
+            )
+        };
         let pv = self.chart.pointvalue_1e6;
         let step = self.cfg.qty_step_1e6;
         let room = (pos.saturating_abs() - self.outstanding_reducing()).max(0);
         if w.reduce {
-            let want = if o.kind == IntentKind::CloseAll as u8 {
+            let want = if kind == IntentKind::CloseAll as u8 {
                 pos.saturating_abs()
             } else {
-                let total = self.open_qty_of(o.id);
+                let total = self.open_qty_of(id);
                 if total == 0 {
                     if commit {
                         self.orders.kill(i);
                     }
                     return Ok(0);
                 }
-                let w = if o.qty_1e6 > 0 {
-                    self.scaled(o.qty_1e6, px).min(total)
-                } else if o.qty_pct_1e6 > 0 {
-                    let p = mul_div(
-                        i128::from(total),
-                        i128::from(o.qty_pct_1e6),
-                        100 * 1_000_000,
-                    );
+                // What the close wants is judged against the id's quantity before its own fills.
+                let base = total.saturating_add(filled);
+                let w = if qty > 0 {
+                    self.scaled(qty, px).min(base)
+                } else if qty_pct > 0 {
+                    let p = mul_div(i128::from(base), i128::from(qty_pct), 100 * 1_000_000);
                     floor_step(sat_i64(p), step)
                 } else {
-                    total
+                    base
                 };
-                (w - o.filled_1e6).max(0)
+                (w - filled).max(0)
             };
-            return Ok(floor_step(want.min(room), step));
+            let want = floor_step(want, step);
+            if want == 0 && kind == IntentKind::Close as u8 {
+                if commit {
+                    self.orders.kill(i); // it filled what it wanted
+                }
+                return Ok(0);
+            }
+            let send = floor_step(want.min(room), step);
+            if commit {
+                self.set_deferred(i, send < want);
+            }
+            return Ok(send);
         }
         let u = unit_qty(self.cfg.unit_notional_1e6, px, pv);
         let eq = self.book.view().equity_1e12;
         let d = declared_qty(&self.decl, px, pv, eq);
-        let mut want = if o.qty_1e6 > 0 {
-            if o.kind == IntentKind::Entry as u8 {
-                n_rule_entry(u, o.qty_1e6, d)?
+        let mut want = if qty > 0 {
+            if kind == IntentKind::Entry as u8 {
+                n_rule_entry(u, qty, d)?
             } else {
-                n_rule_scale(u, o.qty_1e6, d)
+                n_rule_scale(u, qty, d)
             }
         } else {
             u
         };
-        want = (want - o.filled_1e6 - o.oca_reduced_1e6).max(0);
+        if deferred && kind == IntentKind::Entry as u8 {
+            return Ok(self.size_deferred_reversal(i, w, (want - reduced).max(0), px, commit));
+        }
+        want = (want - filled - reduced).max(0);
         let adds = pos == 0 || (pos > 0) == w.buy;
         let mut scratch = BrokerCounters::default();
-        let (close, open) = if o.kind == IntentKind::Entry as u8 {
+        let (close, open, reversal) = if kind == IntentKind::Entry as u8 {
             let bound = self.decl.risk.max_position_size_1e6;
             let max_pos = if bound > 0 {
                 n_rule_scale(u, bound, d)
@@ -999,7 +1141,7 @@ impl NativeBroker {
                 &self.book,
                 w.buy,
                 want,
-                o.born_eval,
+                born_eval,
                 self.decl.pyramiding,
                 max_pos,
                 entries,
@@ -1011,12 +1153,12 @@ impl NativeBroker {
                 }
                 return Ok(0);
             };
-            (if sz.close_1e6 > 0 { room } else { 0 }, sz.open_1e6)
+            (sz.close_1e6, sz.open_1e6, sz.close_1e6 > 0)
         } else if adds {
-            (0, want)
+            (0, want, false)
         } else {
             let c = want.min(room);
-            (c, want - c)
+            (c, want - c, false)
         };
         let open = floor_step(open, step);
         if open == 0 && close == 0 {
@@ -1033,7 +1175,93 @@ impl NativeBroker {
             }
             return Ok(0);
         }
+        if reversal {
+            // Rule 3: `|pos| + q_open − R` — if every outstanding reducer also fills, the
+            // position lands on the target; if some do not, the remainder is sent after their
+            // dispositions. A reversal is done when the position reached its target, not when
+            // a send filled (a partial IoC, or `R` > 0): it stays alive, `DEFERRED`.
+            let r_dir = self.outstanding_reducing_dir(w.buy);
+            let send = floor_step(
+                close.saturating_add(open).saturating_sub(r_dir).max(0),
+                step,
+            );
+            if commit && send > 0 {
+                self.set_deferred(i, true);
+            }
+            return Ok(send);
+        }
+        if commit {
+            self.set_deferred(i, false);
+        }
         Ok(close.saturating_add(open))
+    }
+
+    /// A deferred reversal (§4.12.4 rule 3): the entry wants the position at `q_open` on its side.
+    /// What remains is `q_open − pos·dir`, of which the outstanding reducers moving that way
+    /// (`R` on the entry's side) are already in flight: it sends the rest, waits while they cover
+    /// it, and is done (killed) once the position reached the target — by its own fills or by a
+    /// late reducer fill crossing zero. Its `pyramiding` was judged at its first send.
+    /// `pin:05-reversal-target`: the target is `q_open` on the entry's side at the current
+    /// sizing; a position already past it (other fills) ends the record without a send.
+    fn size_deferred_reversal(
+        &mut self,
+        i: usize,
+        w: WantIoc,
+        q_open: i64,
+        px: i64,
+        commit: bool,
+    ) -> i64 {
+        let pos = self.book.view().position_size_1e6;
+        let toward = if w.buy { pos } else { pos.saturating_neg() };
+        let remaining = q_open.saturating_sub(toward);
+        if remaining <= 0 {
+            if commit {
+                self.orders.kill(i); // on target
+            }
+            return 0;
+        }
+        let r_dir = self.outstanding_reducing_dir(w.buy);
+        let send = floor_step(
+            remaining.saturating_sub(r_dir).max(0),
+            self.cfg.qty_step_1e6,
+        );
+        if send == 0 {
+            return 0; // the reducers in flight cover it: wait for their dispositions
+        }
+        let flat_dist = toward.saturating_neg().max(0);
+        let open = send.saturating_sub(flat_dist).max(0);
+        if open > 0 && !self.gates_pass(w.buy, toward.max(0), open, px, commit) {
+            if commit {
+                self.orders.kill(i);
+            }
+            return 0;
+        }
+        send
+    }
+
+    /// `R` on one side: the unfilled quantity of outstanding reducing orders that buy (`buy`) or
+    /// sell — those that move the position the way an order on that side does.
+    fn outstanding_reducing_dir(&self, buy: bool) -> i64 {
+        let mut r = 0_i64;
+        let mut i = 0;
+        while i < self.sent.slots() {
+            let o = self.sent.get(i);
+            if o.state != sent_state::FREE && o.reduce == 1 && (o.side == 0) == buy {
+                r = r.saturating_add(o.qty_1e6 - o.filled_1e6);
+            }
+            i += 1;
+        }
+        r
+    }
+
+    /// Set or clear record `i`'s `pflag::DEFERRED` bit.
+    fn set_deferred(&mut self, i: usize, on: bool) {
+        let o = self.orders.get_mut(i);
+        if on {
+            o.flags |= pflag::DEFERRED;
+        } else {
+            o.flags &= !pflag::DEFERRED;
+        }
     }
 
     /// Outstanding increasing entry orders on side `buy`, other than order `skip`'s (native
@@ -1188,11 +1416,15 @@ impl NativeBroker {
         let stale = u64::try_from(self.cfg.quote_stale_ns).unwrap_or(0);
         let mut i = 0;
         while i < self.sent.slots() {
-            let o = *self.sent.get(i);
-            let maker = o.primitive == Primitive::MakerPostOnly as u8;
-            let again =
-                o.state == sent_state::CANCELLING && o.emit_ns.saturating_add(stale) <= now_ns;
-            if maker && (o.state == sent_state::LIVE || again) {
+            let (maker, live, again) = {
+                let o = self.sent.get(i);
+                (
+                    o.primitive == Primitive::MakerPostOnly as u8,
+                    o.state == sent_state::LIVE,
+                    o.state == sent_state::CANCELLING && o.emit_ns.saturating_add(stale) <= now_ns,
+                )
+            };
+            if maker && (live || again) {
                 self.emit_cancel(i, now_ns, out)?;
             }
             i += 1;
@@ -1237,14 +1469,15 @@ impl NativeBroker {
     }
 
     /// Σ|qty| of the open trades a `strategy.close(id)` closes: those whose entry id is `id`, and
-    /// the D19 boot trade whatever `id` names (lead ruling, `pin:05-boot-close`: a held position
-    /// after a restart must be closable by the script's normal exit logic; reduce-only).
+    /// the D19 boot trade when the script opens `id` in exactly the boot position's direction
+    /// (amendment A6.3, `pin:05-boot-close-dir`, operator ruling 2026-10-16; reduce-only).
     /// RISK-REVIEW: needs the risk-reviewer's sign-off before live.
     fn open_qty_of(&self, id: StrKey) -> i64 {
         let mut t = 0;
         let mut sum = 0_i64;
         while let Some(l) = self.book.open_trade(t) {
-            let boot = self.book.lot_flags(t).unwrap_or(0) & lot_flag::BOOT != 0;
+            let boot = self.book.lot_flags(t).unwrap_or(0) & lot_flag::BOOT != 0
+                && self.exits.boot_dirs().reaches(id, l.qty_1e6 > 0);
             if l.entry_id == id || boot {
                 sum = sum.saturating_add(l.qty_1e6.saturating_abs());
             }
@@ -1314,6 +1547,7 @@ impl NativeBroker {
     fn sync_exits(&mut self) -> Result<(), BrokerFault> {
         let ctx = self.sync_ctx();
         self.exits.sync(&self.book, &ctx)?;
+        self.orphan_owners(sent_kind::LEG);
         let mut k = 0;
         while k < self.exits.sets().len() {
             let s = usize::from(self.exits.set(k).sent);
@@ -1322,12 +1556,14 @@ impl NativeBroker {
             }
             k += 1;
         }
+        self.relink_replacements(sent_kind::LEG);
         Ok(())
     }
 
     /// Free retired pending records and re-point order-owned sent orders at their new index.
     fn retire_and_relink(&mut self) {
         self.orders.retire_dead();
+        self.orphan_owners(sent_kind::ORDER);
         let mut k = 0;
         while k < self.orders.len() {
             let s = usize::from(self.orders.get(k).sent);
@@ -1336,18 +1572,54 @@ impl NativeBroker {
             }
             k += 1;
         }
+        self.relink_replacements(sent_kind::ORDER);
+    }
+
+    /// Point every outstanding `kind` sent order at no owner; the relink pass then re-points the
+    /// linked ones. An owner that died (swap-removed, or a set rebuilt away) leaves its orders
+    /// orphaned instead of naming whatever record now sits at its old index.
+    fn orphan_owners(&mut self, kind: u8) {
+        let none = owner_none(kind);
+        let mut i = 0;
+        while i < self.sent.slots() {
+            let o = self.sent.get_mut(i);
+            if o.state != sent_state::FREE && o.kind == kind {
+                o.owner = none;
+            }
+            i += 1;
+        }
+    }
+
+    /// A `Modify`'s replacement awaiting its ack is not linked yet (its `prev` is): it follows
+    /// `prev`'s freshly relinked owner, so `on_ack` links the right record (§4.12.5).
+    fn relink_replacements(&mut self, kind: u8) {
+        let mut j = 0;
+        while j < self.sent.slots() {
+            let (state, k, prev) = {
+                let o = self.sent.get(j);
+                (o.state, o.kind, o.prev_oid)
+            };
+            if state == sent_state::SUBMITTING && k == kind && prev != 0 {
+                let owner = match self.sent.find(prev) {
+                    Some(p) => self.sent.get(p).owner,
+                    None => owner_none(kind),
+                };
+                self.sent.get_mut(j).owner = owner;
+            }
+            j += 1;
+        }
     }
 
     /// Make sent slot `i` its owner's current venue order.
     fn link_owner(&mut self, i: usize) {
-        let o = *self.sent.get(i);
+        let (kind, owner) = (self.sent.get(i).kind, self.sent.get(i).owner);
         let tag = u8::try_from(i + 1).unwrap_or(0);
-        match o.kind {
-            sent_kind::ORDER if usize::from(o.owner) < self.orders.len() => {
-                self.orders.get_mut(usize::from(o.owner)).sent = tag;
+        match kind {
+            sent_kind::ORDER if usize::from(owner) < self.orders.len() => {
+                self.orders.get_mut(usize::from(owner)).sent = tag;
             }
-            sent_kind::LEG if usize::from(o.owner & !OWNER_SET) < self.exits.sets().len() => {
-                self.exits.set_mut(usize::from(o.owner & !OWNER_SET)).sent = tag;
+            sent_kind::LEG if usize::from(owner & !OWNER_SET) < self.exits.sets().len() => {
+                self.exits.set_mut(usize::from(owner & !OWNER_SET)).sent = tag;
             }
             _ => {}
         }
@@ -1355,17 +1627,17 @@ impl NativeBroker {
 
     /// Clear the owner's link to sent slot `i` if it still points there.
     fn unlink_owner(&mut self, i: usize) {
-        let o = *self.sent.get(i);
+        let (kind, owner) = (self.sent.get(i).kind, self.sent.get(i).owner);
         let tag = u8::try_from(i + 1).unwrap_or(0);
-        match o.kind {
-            sent_kind::ORDER if usize::from(o.owner) < self.orders.len() => {
-                let p = self.orders.get_mut(usize::from(o.owner));
+        match kind {
+            sent_kind::ORDER if usize::from(owner) < self.orders.len() => {
+                let p = self.orders.get_mut(usize::from(owner));
                 if p.sent == tag {
                     p.sent = 0;
                 }
             }
-            sent_kind::LEG if usize::from(o.owner & !OWNER_SET) < self.exits.sets().len() => {
-                let s = self.exits.set_mut(usize::from(o.owner & !OWNER_SET));
+            sent_kind::LEG if usize::from(owner & !OWNER_SET) < self.exits.sets().len() => {
+                let s = self.exits.set_mut(usize::from(owner & !OWNER_SET));
                 if s.sent == tag {
                     s.sent = 0;
                 }

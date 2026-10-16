@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! impl-05 §7.9 `native_safety.rs` (part) — a scripted fake venue (the `core-fill` laws restated
-//! for the test, not imported — I2): IoCs judged once at the next touch, capped by displayed size,
-//! remainder cancelled; makers filled on a strict cross at their limit; a `Modify` replaces the
-//! remaining size wholesale and swaps the oid; dispositions only after the last fill (§3.6.3).
-//! Properties: reducers never take the position through zero (I28, I39); two brokers fed the same
-//! inputs write identical instruction streams and views (I36).
+//! impl-05 §7.9 `native_safety.rs` (part) — against the shared scripted fake venue
+//! (`tests/common/venue.rs`). Properties: reducers never take the position through zero (I28,
+//! I39); two brokers fed the same inputs write identical instruction streams and views (I36).
 
+mod common;
+
+use common::venue::Venue;
 use pine_broker::{EngineIntentBuf, NativeBroker};
 use pine_ir::{
-    intent_flag as f, Bar, ChartInfo, EngineIntent, EngineVerb, IntentKind, IntentSide,
-    LimitPrimitive, NativeCfg, OrderIntent, Primitive, ProgramMeta, Quote, StrKey, StrategyDecl,
+    intent_flag as f, Bar, ChartInfo, EngineIntent, IntentKind, IntentSide, LimitPrimitive,
+    NativeCfg, OrderIntent, ProgramMeta, Quote, StrKey, StrategyDecl,
 };
 use proptest::prelude::{prop_assert, prop_assert_eq, proptest, ProptestConfig};
 
@@ -56,136 +56,6 @@ fn broker(maker: bool) -> NativeBroker {
         _pad: [0; 6],
     };
     NativeBroker::new(&meta, cfg).unwrap_or_else(|_| unreachable!())
-}
-
-/// One venue order.
-#[derive(Clone, Copy, Default)]
-struct VOrder {
-    oid: u32,
-    buy: bool,
-    reduce: bool,
-    maker: bool,
-    px: i64,
-    remaining: i64,
-}
-
-/// The fake venue: at most 16 orders.
-struct Venue {
-    orders: [VOrder; 16],
-    n: usize,
-}
-
-impl Venue {
-    fn new() -> Self {
-        Self {
-            orders: [VOrder::default(); 16],
-            n: 0,
-        }
-    }
-
-    fn find(&self, oid: u32) -> Option<usize> {
-        (0..self.n).find(|&i| self.orders[i].oid == oid)
-    }
-
-    fn remove(&mut self, i: usize) {
-        self.orders[i] = self.orders[self.n - 1];
-        self.n -= 1;
-    }
-
-    /// Take the broker's instructions (§3.6.2 host protocol).
-    fn dispatch(&mut self, b: &mut NativeBroker, out: &EngineIntentBuf) {
-        for e in out.as_slice() {
-            match e.verb {
-                EngineVerb::Submit => {
-                    assert!(self.n < 16, "venue overflow");
-                    self.orders[self.n] = VOrder {
-                        oid: e.client_oid,
-                        buy: e.side == 0,
-                        reduce: e.flags & 1 == 1,
-                        maker: e.primitive == Primitive::MakerPostOnly,
-                        px: e.px_1e6,
-                        remaining: e.qty_1e6,
-                    };
-                    self.n += 1;
-                    b.on_ack(e.client_oid);
-                }
-                EngineVerb::Modify => match self.find(e.prev_client_oid) {
-                    Some(i) => {
-                        // Wholesale replacement, fresh oid (clob-dispatcher, §1.5).
-                        self.orders[i].oid = e.client_oid;
-                        self.orders[i].px = e.px_1e6;
-                        self.orders[i].remaining = e.qty_1e6;
-                        b.on_ack(e.client_oid);
-                        b.on_cancelled(e.prev_client_oid);
-                    }
-                    None => {
-                        b.on_cancelled(e.client_oid);
-                        b.on_cancelled(e.prev_client_oid);
-                    }
-                },
-                EngineVerb::Cancel => {
-                    if let Some(i) = self.find(e.client_oid) {
-                        self.remove(i);
-                    }
-                    b.on_cancelled(e.client_oid);
-                }
-            }
-        }
-    }
-
-    /// Judge at touch `q`; returns `false` if a reducing fill took the position through zero.
-    fn judge(&mut self, b: &mut NativeBroker, q: &Quote) -> bool {
-        let mut ok = true;
-        let mut i = 0;
-        while i < self.n {
-            let o = self.orders[i];
-            let (touch, size) = if o.buy {
-                (q.ask_1e6, q.ask_qty_1e6)
-            } else {
-                (q.bid_1e6, q.bid_qty_1e6)
-            };
-            let fill = if o.maker {
-                // Strict cross: the touch trades through the resting level.
-                let crossed = if o.buy { touch < o.px } else { touch > o.px };
-                if crossed {
-                    o.remaining
-                } else {
-                    0
-                }
-            } else {
-                let marketable = if o.buy { touch <= o.px } else { touch >= o.px };
-                if marketable {
-                    o.remaining.min(size)
-                } else {
-                    0
-                }
-            };
-            let px = if o.maker { o.px } else { touch };
-            if fill > 0 {
-                let before = b.view().position_size_1e6;
-                let qty = if o.buy { fill } else { -fill };
-                b.on_fill(o.oid, qty, px, 0, 1, 0)
-                    .unwrap_or_else(|x| panic!("{x:?}"));
-                let after = b.view().position_size_1e6;
-                if o.reduce && before != 0 && after != 0 && (before > 0) != (after > 0) {
-                    ok = false;
-                }
-                self.orders[i].remaining -= fill;
-            }
-            if self.orders[i].remaining == 0 {
-                self.remove(i);
-                continue;
-            }
-            if !o.maker {
-                // IoC remainder cancelled after its fills were delivered (§3.6.3 rule 1).
-                b.on_cancelled(o.oid);
-                self.remove(i);
-                continue;
-            }
-            i += 1;
-        }
-        ok
-    }
 }
 
 /// One scripted event: (price step, intent kind selector, limit offset).
@@ -286,6 +156,57 @@ fn run(ops: &[Op], maker: bool) -> (bool, Vec<EngineIntent>, i64, i128) {
     (ok, log, view.position_size_1e6, view.netprofit_1e12)
 }
 
+/// One scripted event with a delivery delay: (price step, intent selector, limit offset, delay).
+type DOp = (i8, u8, i8, u8);
+
+/// I39: like [`run`], but each event's judged fills reach the broker `delay` events later, after
+/// the acks, wholesale modifies and dispositions of the events between (§3.6.3 kept: a
+/// disposition waits for its oid's last fill). Returns (no flip ever, fills delivered late,
+/// modifies written).
+fn run_delayed(ops: &[DOp], maker: bool) -> (bool, usize, usize) {
+    let mut b = broker(maker);
+    let mut v = Venue::new();
+    let mut out = EngineIntentBuf::new();
+    let mut mid = 100 * E;
+    let mut now = 10_000_000_000_u64;
+    let (mut late, mut modifies) = (0, 0);
+    for (k, &(step, sel, off, delay)) in ops.iter().enumerate() {
+        now += 1_000_000;
+        late += v.deliver(&mut b);
+        mid = (mid + i64::from(step) * 50_000).max(10 * E);
+        let q = Quote {
+            bid_1e6: mid,
+            ask_1e6: mid + 10_000,
+            bid_qty_1e6: 3 * E,
+            ask_qty_1e6: 3 * E,
+            ts_ns: now,
+            ..Quote::default()
+        };
+        let idx = u32::try_from(k).unwrap_or(0);
+        b.open_bar(&Bar {
+            close_1e6: mid,
+            index: idx / 4,
+            ..Bar::default()
+        });
+        if let Some(it) = intent(sel, off, mid, 0) {
+            b.apply_intents(&[it], now)
+                .unwrap_or_else(|x| panic!("{x:?}"));
+        }
+        b.reconcile(&q, now, &mut out)
+            .unwrap_or_else(|x| panic!("{x:?}"));
+        modifies += out
+            .as_slice()
+            .iter()
+            .filter(|e| e.verb == pine_ir::EngineVerb::Modify)
+            .count();
+        v.dispatch(&mut b, &out);
+        v.set_delay(u32::from(delay % 4));
+        v.judge(&mut b, &q);
+    }
+    late += v.drain(&mut b);
+    (v.flips == 0, late, modifies)
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(300))]
 
@@ -308,6 +229,38 @@ proptest! {
         prop_assert_eq!(a.1, b.1);
         prop_assert_eq!((a.2, a.3), (b.2, b.3));
     }
+
+    #[test]
+    fn prop_wholesale_modify_with_delayed_fills_never_flips(
+        ops in proptest::collection::vec((-4_i8..=4, 0_u8..16, -20_i8..=20, 0_u8..8), 1..120),
+        maker in proptest::bool::ANY,
+    ) {
+        let (ok, _, _) = run_delayed(&ops, maker);
+        prop_assert!(ok, "a delayed reducing fill took the position through zero");
+    }
+}
+
+#[test]
+fn the_delayed_venue_delivers_late_fills_and_writes_modifies() {
+    // The property above is not vacuous: a maker scenario with delays books fills late and sees
+    // wholesale modifies (a limit entry walked with the market, then an exit, under delay 3).
+    let mut ops: Vec<DOp> = Vec::new();
+    let mut k = 0_i8;
+    while k < 40 {
+        let sel = match k % 5 {
+            0 => 2,
+            1 => 3,
+            2 => 0,
+            3 => 7,
+            _ => 4,
+        };
+        ops.push((if k % 2 == 0 { -3 } else { 2 }, sel, -(k % 7), 3));
+        k += 1;
+    }
+    let (ok, late, modifies) = run_delayed(&ops, true);
+    assert!(ok);
+    assert!(late > 0, "no fill was delivered late");
+    assert!(modifies > 0, "no wholesale modify was written");
 }
 
 #[test]

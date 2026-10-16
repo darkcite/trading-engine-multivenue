@@ -23,7 +23,7 @@ pub(crate) enum PathTie {
 pub(crate) enum PyramidCheck {
     /// The open-entry-trade count at fill time decides (default).
     FillTime = 0,
-    #[allow(dead_code)] // INCREMENT: alternative reading, wired with its `with_switches` test (T12–T17).
+    #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
     /// The count at generation time decides.
     GenerationTime = 1,
 }
@@ -81,7 +81,7 @@ pub(crate) enum ExitReservation {
 pub(crate) enum ExitQty {
     /// Per covered trade (default).
     PerTrade = 0,
-    #[allow(dead_code)] // INCREMENT: alternative reading, wired with its `with_switches` test (T12–T17).
+    #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
     /// Per call.
     PerCall = 1,
 }
@@ -92,7 +92,7 @@ pub(crate) enum ExitQty {
 pub(crate) enum TrailArmFire {
     /// Fires from the next segment (default).
     NextSegment = 0,
-    #[allow(dead_code)] // INCREMENT: alternative reading, wired with its `with_switches` test (T12–T17).
+    #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
     /// Fires in the same segment.
     SameSegment = 1,
 }
@@ -104,7 +104,7 @@ pub(crate) enum TrailArmFire {
 pub(crate) enum CashPerOrder {
     /// Per fill, split pro rata over the fill's slices (default).
     PerFill = 0,
-    #[cfg_attr(not(test), allow(dead_code))] // INCREMENT: wired with `with_switches` (T17).
+    #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
     /// Per order (first fill only).
     PerOrder = 1,
 }
@@ -115,7 +115,7 @@ pub(crate) enum CashPerOrder {
 pub(crate) enum PctEquityAt {
     /// Equity at fill time (default).
     FillTime = 0,
-    #[allow(dead_code)] // INCREMENT: alternative reading, wired with its `with_switches` test (T12–T17).
+    #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
     /// Equity at order time.
     OrderTime = 1,
 }
@@ -138,7 +138,7 @@ pub(crate) enum PriceRounding {
 pub(crate) enum CofCloseTick {
     /// No execution (default).
     No = 0,
-    #[allow(dead_code)] // INCREMENT: alternative reading, wired with its `with_switches` test (T12–T17).
+    #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
     /// An execution.
     Yes = 1,
 }
@@ -149,7 +149,7 @@ pub(crate) enum CofCloseTick {
 pub(crate) enum CofNextTick {
     /// Eligible from the next path point (default).
     NextPoint = 0,
-    #[allow(dead_code)] // INCREMENT: alternative reading, wired with its `with_switches` test (T12–T17).
+    #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
     /// Eligible for the rest of the current segment.
     RestOfSegment = 1,
 }

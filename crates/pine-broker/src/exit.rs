@@ -13,8 +13,65 @@ use crate::cap;
 use crate::fault::{BrokerFault, InternalDefect, ScriptRefusal};
 use crate::money::{floor_step, mul_div, sat_i64, ticks_px};
 use crate::size::n_rule_scale;
-use crate::switch::ExitReservation;
-use pine_ir::{intent_flag as f, BrokerCounters, OrderIntent, StrKey};
+use crate::switch::{ExitQty, ExitReservation, SWITCHES};
+use pine_ir::{entry_dir, intent_flag as f, BrokerCounters, EntryDir, OrderIntent, StrKey};
+
+/// The ids a `strategy.close(id)` / `strategy.exit(from_entry = id)` may reach the D19 boot trade
+/// through (amendment A6.3, `pin:05-boot-close-dir`, operator ruling 2026-10-16): those whose
+/// `ProgramMeta::entry_dirs` row is EXACTLY one direction bit, that of the boot position. A row
+/// with both bits, or no row, never reaches it. Loaded once at construction; inline (no
+/// allocation). `pin:05-entry-dirs-cap`: past `cap::BOOT_IDS` single-direction rows the rest are
+/// not retained, so those ids never reach the boot trade (fail-closed; `close_all`, an exit
+/// without `from_entry`, the flatten and the risk halts still do).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BootDirs {
+    ids: [StrKey; cap::BOOT_IDS],
+    dirs: [u8; cap::BOOT_IDS],
+    n: usize,
+}
+
+impl BootDirs {
+    /// No row: no id reaches a boot trade (TV mode never has one).
+    pub(crate) const fn empty() -> Self {
+        Self {
+            ids: [StrKey::NONE; cap::BOOT_IDS],
+            dirs: [0; cap::BOOT_IDS],
+            n: 0,
+        }
+    }
+
+    /// Keep the single-direction rows of `rows` (load time).
+    pub(crate) fn load(&mut self, rows: &[EntryDir]) {
+        self.n = 0;
+        let mut i = 0;
+        while i < rows.len() && self.n < cap::BOOT_IDS {
+            let r = &rows[i];
+            if r.dirs == entry_dir::LONG || r.dirs == entry_dir::SHORT {
+                self.ids[self.n] = r.id;
+                self.dirs[self.n] = r.dirs;
+                self.n += 1;
+            }
+            i += 1;
+        }
+    }
+
+    /// Does `id` reach a boot trade that is long (`long`) or short?
+    pub(crate) fn reaches(&self, id: StrKey, long: bool) -> bool {
+        let want = if long {
+            entry_dir::LONG
+        } else {
+            entry_dir::SHORT
+        };
+        let mut i = 0;
+        while i < self.n {
+            if self.ids[i] == id {
+                return self.dirs[i] == want;
+            }
+            i += 1;
+        }
+        false
+    }
+}
 
 /// One `strategy.exit` call site's committed state. 192 B.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -263,7 +320,10 @@ pub(crate) const LEG_ARMED: u8 = 1 << 3;
 /// for a long's trail — `side` 1 — lowest for a short's) and the stop is `anchor ∓ offset`; the
 /// stop never retreats.
 pub(crate) fn trail_step(s: &mut LegSet, px_1e6: i64) -> i64 {
-    if s.trail_act_1e6 == 0 || s.trail_off_1e6 == 0 {
+    // `pin:05-trail-zero-offset`: a given `trail_offset = 0` is a trail (§4.5.2 makes the leg's
+    // presence a matter of the arguments given; §4.8.5: "the switch matters only for a zero
+    // offset"), its stop at the anchor itself. `levels` writes activation 0 for an absent trail.
+    if s.trail_act_1e6 == 0 {
         return 0;
     }
     let long = s.side == 1;
@@ -314,6 +374,10 @@ pub(crate) struct ExitTable {
     cur: usize,
     ns: usize,
     reservation: ExitReservation,
+    /// `exit_qty` (§4.2, §4.5.3).
+    exit_qty: ExitQty,
+    /// A6.3: which `from_entry` ids reach the D19 boot trade.
+    boot: BootDirs,
 }
 
 impl ExitTable {
@@ -327,7 +391,19 @@ impl ExitTable {
             cur: 0,
             ns: 0,
             reservation,
+            exit_qty: SWITCHES.exit_qty,
+            boot: BootDirs::empty(),
         }
+    }
+
+    /// Load `ProgramMeta::entry_dirs` (native construction; A6.3).
+    pub(crate) fn load_boot_dirs(&mut self, rows: &[EntryDir]) {
+        self.boot.load(rows);
+    }
+
+    /// The A6.3 boot-reach table.
+    pub(crate) fn boot_dirs(&self) -> &BootDirs {
+        &self.boot
     }
 
     /// The live sets, in reservation order.
@@ -485,11 +561,14 @@ impl ExitTable {
 
     /// Trails after a path segment `(a, b)` (§4.8.5): an armed trail's anchor moves to the
     /// segment's favourable extreme; an unarmed one whose activation lies inside `[lo, hi]` and is
-    /// reached moving favourably arms there. It fires from the next segment (`trail_arm_fire`
-    /// default).
-    pub(crate) fn after_segment(&mut self, a: i64, b: i64) {
+    /// reached moving favourably arms there. Returns the sets armed by this call (bit `k` = set
+    /// `k`; `cap::LEG_SETS` ≤ 128): the default fires them from the next segment, `trail_arm_fire
+    /// = SameSegment` at this segment's end point (§4.2).
+    pub(crate) fn after_segment(&mut self, a: i64, b: i64) -> u128 {
+        const _: () = assert!(cap::LEG_SETS <= 128);
         let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
         let cur = self.cur;
+        let mut armed = 0_u128;
         let mut k = 0;
         while k < self.ns {
             let s = &mut self.sets[cur][k];
@@ -498,12 +577,17 @@ impl ExitTable {
                 let ext = if long { hi } else { lo };
                 let favourable = if long { b > a } else { b < a };
                 let inside = s.trail_act_1e6 >= lo && s.trail_act_1e6 <= hi;
-                if s.legs & LEG_ARMED != 0 || (favourable && inside) {
+                let was = s.legs & LEG_ARMED != 0;
+                if was || (favourable && inside) {
                     trail_step(s, ext);
+                }
+                if !was && s.legs & LEG_ARMED != 0 {
+                    armed |= 1_u128 << k;
                 }
             }
             k += 1;
         }
+        armed
     }
 
     /// The next live rule in seq order after `after` (`None` = from the start).
@@ -547,20 +631,32 @@ impl ExitTable {
             }
             i += 1;
         }
-        let (old, new) = (self.cur, 1 - self.cur);
+        // The active buffer is `self.cur`; the build writes the other one.
+        let new = 1 - self.cur;
         let mut n = 0;
         let mut ri = self.next_rule(None);
         while let Some(r_i) = ri {
-            // COPY: 192-B rule snapshot: the build writes `self.sets` while reading it (cold: once per rule per sync).
-            let rule = self.rules[r_i];
+            // A borrow of the rule: the build writes `self.sets`, a disjoint field.
+            let rule = &self.rules[r_i];
+            // `exit_qty = PerCall` (`pin:05-exit-qty-per-trade`, the alternative): the call's
+            // explicit `qty` is one budget spread over its covered trades in book order (oldest
+            // first), each taking `min(rest, |T.qty|)`.
+            let per_call = self.exit_qty == ExitQty::PerCall && rule.intent.flags & f::QTY != 0;
+            let mut rest = match ctx.scale {
+                Some((u, d)) => n_rule_scale(u, rule.intent.qty_1e6, d),
+                None => rule.intent.qty_1e6,
+            };
             let mut t = 0;
             while let Some(lot) = book.open_trade(t) {
                 let (born_bar, _) = book.lot_born(t).unwrap_or((u32::MAX, 0));
                 let open_seq = book.lot_open_seq(t).unwrap_or(0);
                 let x = rule.intent.from_entry;
                 let boot = book.lot_flags(t).unwrap_or(0) & crate::book::lot_flag::BOOT != 0;
-                let covered =
-                    x == StrKey::NONE || boot || (lot.entry_id == x && born_bar <= rule.born_bar);
+                // A6.3 `pin:05-boot-close-dir`: a named `from_entry` reaches the boot trade only
+                // when the script opens that id in exactly the boot position's direction.
+                let covered = x == StrKey::NONE
+                    || (boot && self.boot.reaches(x, lot.qty_1e6 > 0))
+                    || (lot.entry_id == x && born_bar <= rule.born_bar);
                 if covered {
                     if n == cap::LEG_SETS {
                         return Err(BrokerFault::Script(ScriptRefusal::OrderTableFull));
@@ -572,11 +668,25 @@ impl ExitTable {
                         None => rule.intent.qty_1e6,
                     };
                     let lv = levels(&rule.intent, lot.entry_px_1e6, ctx.tick_1e6, long, ctx.v6);
-                    let mut s = LegSet {
+                    // Built in place in the inactive buffer (no local staging copy).
+                    let (lo, hi) = self.sets.split_at_mut(1);
+                    let (old_buf, new_buf) = if new == 1 {
+                        (&lo[0], &mut hi[0])
+                    } else {
+                        (&hi[0], &mut lo[0])
+                    };
+                    let s = &mut new_buf[n];
+                    *s = LegSet {
                         exit_id: rule.intent.id,
                         entry_id: lot.entry_id,
                         basis_px_1e6: lot.entry_px_1e6,
-                        req_1e6: set_request(&rule.intent, q, abs, ctx.step_1e6),
+                        req_1e6: if per_call {
+                            let take = rest.min(abs).max(0);
+                            rest -= take;
+                            take
+                        } else {
+                            set_request(&rule.intent, q, abs, ctx.step_1e6)
+                        },
                         tp_1e6: lv.tp_1e6,
                         sl_1e6: lv.sl_1e6,
                         trail_act_1e6: lv.trail_act_1e6,
@@ -591,7 +701,7 @@ impl ExitTable {
                     // Carry: the same (rule, trade) set from the previous build.
                     let mut k = 0;
                     while k < self.ns {
-                        let o = &self.sets[old][k];
+                        let o = &old_buf[k];
                         if usize::from(o.rule) == r_i && o.seq == open_seq {
                             s.state = o.state;
                             s.trail_anchor_1e6 = o.trail_anchor_1e6;
@@ -607,7 +717,6 @@ impl ExitTable {
                         }
                         k += 1;
                     }
-                    self.sets[new][n] = s;
                     n += 1;
                 }
                 t += 1;
@@ -636,13 +745,14 @@ impl ExitTable {
         if k >= self.ns {
             return Err(BrokerFault::Internal(InternalDefect::BookDesync));
         }
-        // COPY: 128-B set snapshot: `book.apply_fill` needs `&mut` while the set is read.
-        let s = self.sets[cur][k];
+        // Borrows only: `book` is a parameter, so the set and its rule are read in place.
+        let s = &self.sets[cur][k];
         if s.state != set_state::LIVE || s.r_1e6 <= 0 {
             return Err(BrokerFault::Internal(
                 crate::fault::InternalDefect::BookDesync,
             ));
         }
+        let r_1e6 = s.r_1e6;
         let rule = &self.rules[usize::from(s.rule)];
         let src = FillSrc {
             id: s.exit_id,
@@ -653,22 +763,30 @@ impl ExitTable {
             is_entry: false,
             lot_flags: 0,
         };
-        let q = if s.side == 1 { -s.r_1e6 } else { s.r_1e6 };
+        let q = if s.side == 1 { -r_1e6 } else { r_1e6 };
         book.apply_fill(q, px_1e6, fee_1e12, &src, bar_index, time_ms, 0)?;
         let set = &mut self.sets[cur][k];
         set.state = set_state::DONE;
-        set.filled_1e6 = set.filled_1e6.saturating_add(s.r_1e6);
+        set.filled_1e6 = set.filled_1e6.saturating_add(r_1e6);
         if self.reservation == ExitReservation::ReduceByFill {
             let mut j = 0;
             while j < self.ns {
                 let o = &mut self.sets[cur][j];
                 if j != k && o.state == set_state::LIVE {
-                    o.req_1e6 = (o.req_1e6 - s.r_1e6).max(0);
+                    o.req_1e6 = (o.req_1e6 - r_1e6).max(0);
                 }
                 j += 1;
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl ExitTable {
+    /// The table on another `exit_qty` reading (I38; `with_switches` only).
+    pub(crate) fn set_exit_qty(&mut self, q: ExitQty) {
+        self.exit_qty = q;
     }
 }
 

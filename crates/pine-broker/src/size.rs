@@ -4,8 +4,8 @@
 //! Quantity resolution (impl-05 §4.7): the declared quantity, the N-rule (D22), and the entry-fill
 //! checks in their order — pyramiding → reversal size → `max_position_size` (the caller then runs
 //! the TV margin funds check and `floor_step`, §4.7.5). `allow_entry_in` is decided at commit
-//! (`orders.rs`). INCREMENT: the native emission-time pyramiding count (§4.12.4) and the
-//! `GenerationTime` reading land with their callers. No allocation; index loops.
+//! (`orders.rs`). Both pyramiding readings (§4.2) are here; native passes its outstanding
+//! same-side entries (§4.12.4). No allocation; index loops.
 
 use crate::book::{lot_flag, Book};
 use crate::fault::{BrokerFault, ScriptRefusal};
@@ -79,18 +79,64 @@ pub(crate) fn size_entry_fill(
     outstanding_entries: u32,
     counters: &mut BrokerCounters,
 ) -> Option<EntrySize> {
+    size_entry(
+        book,
+        long,
+        qty_1e6,
+        gen_eval,
+        None,
+        pyramiding,
+        max_pos_1e6,
+        outstanding_entries,
+        counters,
+    )
+}
+
+/// The open trades opened by `strategy.entry` orders — the pyramiding count with no same-tick
+/// exclusion (what `pyramiding = GenerationTime` stamps at an order's (re)birth, §4.2).
+pub(crate) fn open_entry_trades(book: &Book) -> u32 {
+    let mut count = 0_u32;
+    let mut i = 0;
+    while let Some(flags) = book.lot_flags(i) {
+        if flags & lot_flag::PYRAMID != 0 {
+            count += 1;
+        }
+        i += 1;
+    }
+    count
+}
+
+/// [`size_entry_fill`] with the pyramiding reading chosen: `gen_open = None` counts at the fill
+/// (`FillTime`, the same-tick exception applied); `Some(n)` takes the count `n` stamped at the
+/// order's (re)birth (`GenerationTime`, `pin:05-pyramiding-check`) — whether the fill **adds** to
+/// a same-direction position is still judged at the fill.
+pub(crate) fn size_entry(
+    book: &Book,
+    long: bool,
+    qty_1e6: i64,
+    gen_eval: u32,
+    gen_open: Option<u32>,
+    pyramiding: u32,
+    max_pos_1e6: i64,
+    outstanding_entries: u32,
+    counters: &mut BrokerCounters,
+) -> Option<EntrySize> {
     let pos = book.view().position_size_1e6;
     let adds = pos != 0 && (pos > 0) == long;
     if adds {
         // Native counts outstanding same-side entry orders too (worst case, §4.7.4).
         let mut count = outstanding_entries;
-        let mut i = 0;
-        while let (Some(flags), Some((_, eval))) = (book.lot_flags(i), book.lot_born(i)) {
-            let same_tick = flags & lot_flag::PRICE_BASED != 0 && eval == gen_eval;
-            if flags & lot_flag::PYRAMID != 0 && !same_tick {
-                count += 1;
+        if let Some(n) = gen_open {
+            count += n;
+        } else {
+            let mut i = 0;
+            while let (Some(flags), Some((_, eval))) = (book.lot_flags(i), book.lot_born(i)) {
+                let same_tick = flags & lot_flag::PRICE_BASED != 0 && eval == gen_eval;
+                if flags & lot_flag::PYRAMID != 0 && !same_tick {
+                    count += 1;
+                }
+                i += 1;
             }
-            i += 1;
         }
         if count >= pyramiding.max(1) {
             counters.entries_refused_pyramiding += 1;

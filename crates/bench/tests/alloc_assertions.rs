@@ -20416,3 +20416,418 @@ fn pine_lang_ast_read_is_zero_alloc() {
     }
     assert!(nodes_read > 500, "gate PVM-1: only {nodes_read} nodes read");
 }
+
+// impl-05 §7.11 — the two `pine-broker` arms of `crates/bench/tests/alloc_assertions.rs`
+// (gates PVM-2, PVM-3). Drop-in text: every path is fully qualified, so the arms need no `use`
+// line beside the file's own; helpers carry a `pvm_` prefix. The bench crate gains the dev edges
+// `pine-broker` and `pine-ir` (impl-05 §7.11: "the bench crate gains the dev edge"). Run as the
+// gates do: `cargo test -p bench --test alloc_assertions --release -- --test-threads=1`.
+
+const PVM_E: i64 = 1_000_000;
+
+/// PVM-2's script, one bar-close evaluation: four working records — an entry and a
+/// `strategy.order` that both fill at the next open (two fills, one tick → one
+/// `calc_on_order_fills` re-evaluation), and an entry limit and an entry stop that never fill
+/// (modified every bar, same ids) — plus a `strategy.exit` from the entry with a take-profit
+/// 150 ticks up and a stop-loss 150 ticks down (never reached: the low is 1 below the open).
+/// Every fourth bar close leaves the `strategy.order` out, so the next bar's entry trade stays
+/// open and its take-profit fills at that bar's high (2 above the open): still two fills.
+fn pvm_tv_intents() -> [pine_ir::OrderIntent; 5] {
+    let base = pine_ir::OrderIntent {
+        kind: pine_ir::IntentKind::Entry,
+        ..pine_ir::OrderIntent::default()
+    };
+    [
+        pine_ir::OrderIntent {
+            id: pine_ir::StrKey(1),
+            seq: 0,
+            ..base
+        },
+        pine_ir::OrderIntent {
+            kind: pine_ir::IntentKind::Order,
+            id: pine_ir::StrKey(2),
+            side: pine_ir::IntentSide::Short,
+            flags: pine_ir::intent_flag::QTY,
+            qty_1e6: PVM_E,
+            seq: 1,
+            ..base
+        },
+        pine_ir::OrderIntent {
+            id: pine_ir::StrKey(3),
+            flags: pine_ir::intent_flag::LIMIT,
+            limit_1e6: 50 * PVM_E,
+            seq: 2,
+            ..base
+        },
+        pine_ir::OrderIntent {
+            id: pine_ir::StrKey(4),
+            flags: pine_ir::intent_flag::STOP,
+            stop_1e6: 200 * PVM_E,
+            seq: 3,
+            ..base
+        },
+        pine_ir::OrderIntent {
+            kind: pine_ir::IntentKind::Exit,
+            id: pine_ir::StrKey(9),
+            from_entry: pine_ir::StrKey(1),
+            flags: pine_ir::intent_flag::PROFIT | pine_ir::intent_flag::LOSS,
+            profit_ticks_1e6: 150 * PVM_E,
+            loss_ticks_1e6: 150 * PVM_E,
+            seq: 4,
+            ..base
+        },
+    ]
+}
+
+/// Closed trades whose exit order is `id`, from closed trade `from` on.
+fn pvm_closed_by(b: &pine_broker::TvBroker, from: u32, id: pine_ir::StrKey) -> u32 {
+    let mut n = 0;
+    let mut k = from;
+    while let Some(t) = b.closed_trade(k) {
+        n += u32::from(t.exit_id == id);
+        k += 1;
+    }
+    n
+}
+
+/// One TV bar: `open_bar`, then `submit` at every `Evaluate` (the script's four records at the
+/// bar close, nothing at the intrabar execution). Returns the intrabar evaluations.
+fn pvm_tv_bar(b: &mut pine_broker::TvBroker, i: u32, intents: &[pine_ir::OrderIntent]) -> u32 {
+    let o = 100 * PVM_E + i64::from(i % 7) * 10_000;
+    let x = pine_ir::Bar {
+        open_1e6: o,
+        high_1e6: o + if i % 4 == 0 { 2 * PVM_E } else { PVM_E },
+        low_1e6: o - PVM_E,
+        close_1e6: o + PVM_E / 2,
+        volume_1e6: PVM_E,
+        index: i,
+        open_ms: i64::from(i) * 60_000,
+        ..pine_ir::Bar::default()
+    };
+    let mut intrabar = 0;
+    let mut step = b.open_bar(&x);
+    while let pine_broker::TvStep::Evaluate { intrabar: ib, .. } = step {
+        intrabar += u32::from(ib);
+        // Bar `i % 4 == 3` closes without the `strategy.order` (the records keep their `seq`
+        // order), so bar `i + 1`'s entry trade is open when its high reaches the take-profit.
+        let no_order = [intents[0], intents[2], intents[3], intents[4]];
+        let s: &[pine_ir::OrderIntent] = if ib {
+            &[]
+        } else if i % 4 == 3 {
+            &no_order
+        } else {
+            intents
+        };
+        step = match b.submit(s) {
+            Ok(s) => s,
+            Err(e) => panic!("gate PVM-2: the script faulted: {e:?}"),
+        };
+    }
+    intrabar
+}
+
+#[test]
+fn pine_broker_tv_bar_is_zero_alloc() {
+    // Gate PVM-2 (impl-05 §7.11): after construction, 1 000 × (open_bar + submit cycle) over
+    // bars with four working orders, two fills, one calc_on_order_fills re-evaluation and a
+    // margin check (margin 20 %: the funds check at the entry fill, the margin call check at
+    // every tick and fill) — 0 allocations, 0 B.
+    let meta = pine_ir::ProgramMeta {
+        chart: pine_ir::ChartInfo {
+            symbol_hash: 1,
+            timeframe_s: 60,
+            venue: 0,
+            _pad: [0; 3],
+            mintick_1e6: 10_000,
+            pointvalue_1e6: PVM_E,
+            qty_step_1e6: 0,
+            min_notional_1e6: 0,
+        },
+        decl: pine_ir::StrategyDecl {
+            initial_capital_1e6: 100_000 * PVM_E,
+            default_qty_value_1e6: PVM_E,
+            pyramiding: 1,
+            commission_value_1e6: 100_000,
+            margin_long_pct_1e6: 20 * PVM_E,
+            margin_short_pct_1e6: 20 * PVM_E,
+            flags: pine_ir::decl_flag::CALC_ON_ORDER_FILLS,
+            ..pine_ir::StrategyDecl::default()
+        },
+        uses_intrabar: true,
+        ..pine_ir::ProgramMeta::default()
+    };
+    let cfg = pine_ir::TvCfg {
+        sizing: pine_ir::SizingMode::AsDeclared,
+        day_offset_s: 0,
+        _pad: 0,
+    };
+    let mut b = match pine_broker::TvBroker::new(&meta, cfg) {
+        Ok(b) => b,
+        Err(c) => panic!("gate PVM-2: refused {c:?}"),
+    };
+    let intents = pvm_tv_intents();
+    // Warm-up outside the window: the first bar commits; steady state from the second.
+    let mut i = 0_u32;
+    while i < 8 {
+        pvm_tv_bar(&mut b, i, &intents);
+        i += 1;
+    }
+    let fills0 = b.record().fills;
+    let closed0 = b.view().closedtrades;
+    let c0 = *b.counters();
+    let g = core_alloc::AllocGuard::new();
+    let mut reevals = 0_u32;
+    while i < 1_008 {
+        reevals += pvm_tv_bar(&mut b, i, &intents);
+        i += 1;
+    }
+    let (allocs, bytes, deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "gate PVM-2: TvBroker bar cycle allocated {allocs} times / {bytes} B"
+    );
+    assert_eq!(bytes, 0, "gate PVM-2: {bytes} B");
+    assert_eq!(deallocs, 0, "gate PVM-2: {deallocs} frees");
+    // The window did what the gate says: two fills per bar (on every fourth bar the entry and
+    // the exit's take-profit, at its own tick — its own re-evaluation); no risk trip, no margin
+    // call.
+    let exits = pvm_closed_by(
+        &b,
+        closed0.min(b.view().closed_retained),
+        pine_ir::StrKey(9),
+    );
+    assert_eq!(exits, 250, "the take-profit fills once every fourth bar");
+    assert_eq!(b.record().fills - fills0, 2_000);
+    assert_eq!(reevals, 1_000 + exits);
+    let c = *b.counters();
+    assert_eq!(c.margin_calls, c0.margin_calls);
+    assert_eq!(
+        (c.risk_trips_drawdown, c.risk_trips_intraday_loss),
+        (c0.risk_trips_drawdown, c0.risk_trips_intraday_loss)
+    );
+}
+
+/// PVM-3's six desired records around `mid`: three entry makers, a `strategy.order` maker, an
+/// exit (take-profit maker + synthetic stop-loss) and a synthetic entry stop.
+fn pvm_native_intents(mid: i64, k: i64) -> [pine_ir::OrderIntent; 6] {
+    let t = 10_000;
+    let entry = |id: u64, seq: u32, px: i64| pine_ir::OrderIntent {
+        kind: pine_ir::IntentKind::Entry,
+        id: pine_ir::StrKey(id),
+        flags: pine_ir::intent_flag::LIMIT,
+        limit_1e6: px,
+        seq,
+        ..pine_ir::OrderIntent::default()
+    };
+    [
+        entry(1, 0, mid - (50 + k) * t),
+        entry(2, 1, mid - (80 + k) * t),
+        entry(3, 2, mid - (110 + k) * t),
+        pine_ir::OrderIntent {
+            kind: pine_ir::IntentKind::Order,
+            id: pine_ir::StrKey(4),
+            side: pine_ir::IntentSide::Short,
+            flags: pine_ir::intent_flag::LIMIT | pine_ir::intent_flag::QTY,
+            limit_1e6: mid + (90 + k) * t,
+            qty_1e6: PVM_E,
+            seq: 3,
+            ..pine_ir::OrderIntent::default()
+        },
+        pine_ir::OrderIntent {
+            kind: pine_ir::IntentKind::Exit,
+            id: pine_ir::StrKey(9),
+            flags: pine_ir::intent_flag::PROFIT | pine_ir::intent_flag::LOSS,
+            profit_ticks_1e6: 30 * PVM_E,
+            loss_ticks_1e6: 40 * PVM_E,
+            seq: 4,
+            ..pine_ir::OrderIntent::default()
+        },
+        pine_ir::OrderIntent {
+            kind: pine_ir::IntentKind::Entry,
+            id: pine_ir::StrKey(5),
+            flags: pine_ir::intent_flag::STOP,
+            stop_1e6: mid + 200 * t,
+            seq: 5,
+            ..pine_ir::OrderIntent::default()
+        },
+    ]
+}
+
+/// One native event under the §3.6.2 host protocol, the venue answering at once: a `Submit` is
+/// acked (an IoC also filled in full), a `Modify` acked with its `prev` cancelled, a `Cancel`
+/// confirmed; every fourth event the first maker written fills half.
+/// Returns the calls that answered `Err` (the gate requires none).
+fn pvm_native_event(
+    b: &mut pine_broker::NativeBroker,
+    out: &mut pine_broker::EngineIntentBuf,
+    i: u32,
+) -> u32 {
+    let mut errs = 0_u32;
+    let now = 10_000_000_000_u64 + u64::from(i) * 1_000_000;
+    let mid = 100 * PVM_E + i64::from(i % 20) * 10_000 - 100_000;
+    b.open_bar(&pine_ir::Bar {
+        close_1e6: mid,
+        index: i / 4,
+        open_ms: i64::from(i / 4) * 60_000,
+        ..pine_ir::Bar::default()
+    });
+    let intents = pvm_native_intents(mid, i64::from(i % 3));
+    errs += u32::from(b.apply_intents(&intents, now).is_err());
+    let q = pine_ir::Quote {
+        bid_1e6: mid,
+        ask_1e6: mid + 10_000,
+        bid_qty_1e6: 100 * PVM_E,
+        ask_qty_1e6: 100 * PVM_E,
+        ts_ns: now,
+        ..pine_ir::Quote::default()
+    };
+    errs += u32::from(b.reconcile(&q, now, out).is_err());
+    let mut filled = i % 4 != 0;
+    let mut k = 0;
+    while k < out.len() {
+        let e = out.as_slice()[k];
+        let signed = if e.side == 0 { e.qty_1e6 } else { -e.qty_1e6 };
+        match e.verb {
+            pine_ir::EngineVerb::Submit => {
+                b.on_ack(e.client_oid);
+                if e.primitive != pine_ir::Primitive::MakerPostOnly {
+                    errs += u32::from(
+                        b.on_fill(e.client_oid, signed, e.px_1e6, 0, i / 4, 0)
+                            .is_err(),
+                    );
+                } else if !filled {
+                    filled = true;
+                    let r = b.on_fill(e.client_oid, signed / 2, e.px_1e6, 0, i / 4, 0);
+                    errs += u32::from(r.is_err());
+                }
+            }
+            pine_ir::EngineVerb::Modify => {
+                b.on_ack(e.client_oid);
+                b.on_cancelled(e.prev_client_oid);
+                if !filled {
+                    filled = true;
+                    let r = b.on_fill(e.client_oid, signed / 2, e.px_1e6, 0, i / 4, 0);
+                    errs += u32::from(r.is_err());
+                }
+            }
+            pine_ir::EngineVerb::Cancel => b.on_cancelled(e.client_oid),
+        }
+        k += 1;
+    }
+    errs
+}
+
+#[test]
+fn pine_broker_native_reconcile_is_zero_alloc() {
+    // Gate PVM-3 (impl-05 §7.11): 1 000 × (open_bar + apply_intents + reconcile + on_ack +
+    // on_fill + on_cancelled) with a six-record desired set against the sent orders (makers
+    // resting, requoted by Modify as the touch moves) — 0 B/op.
+    let meta = pine_ir::ProgramMeta {
+        chart: pine_ir::ChartInfo {
+            symbol_hash: 1,
+            timeframe_s: 60,
+            venue: 0,
+            _pad: [0; 3],
+            mintick_1e6: 10_000,
+            pointvalue_1e6: PVM_E,
+            qty_step_1e6: 1_000,
+            min_notional_1e6: 0,
+        },
+        decl: pine_ir::StrategyDecl {
+            initial_capital_1e6: 1_000_000 * PVM_E,
+            default_qty_value_1e6: PVM_E,
+            pyramiding: 4,
+            ..pine_ir::StrategyDecl::default()
+        },
+        ..pine_ir::ProgramMeta::default()
+    };
+    let cfg = pine_ir::NativeCfg {
+        unit_notional_1e6: 1_000 * PVM_E,
+        cap_instance_1e6: 1_000_000 * PVM_E,
+        cap_day_1e6: 1_000_000_000 * PVM_E,
+        min_notional_1e6: 0,
+        qty_step_1e6: 1_000,
+        tick_1e6: 10_000,
+        quote_stale_ns: 2_000_000_000,
+        cross_ticks: 5,
+        max_open: 8,
+        limit_primitive: pine_ir::LimitPrimitive::Maker,
+        live: 0,
+        _pad: [0; 6],
+    };
+    let mut b = match pine_broker::NativeBroker::new(&meta, cfg) {
+        Ok(b) => b,
+        Err(c) => panic!("gate PVM-3: refused {c:?}"),
+    };
+    // D19 boot reconciliation on a fresh broker resets the book in place: no allocation, no free.
+    let mut fresh = match pine_broker::NativeBroker::new(&meta, cfg) {
+        Ok(b) => b,
+        Err(c) => panic!("gate PVM-3: refused {c:?}"),
+    };
+    let g = core_alloc::AllocGuard::new();
+    fresh.reconcile_boot(3 * PVM_E, 100 * PVM_E, 500 * PVM_E);
+    let (allocs, bytes, deallocs) = g.delta();
+    assert_eq!(
+        (allocs, bytes, deallocs),
+        (0, 0, 0),
+        "gate PVM-3: reconcile_boot allocated {allocs} / {bytes} B / freed {deallocs}"
+    );
+    assert_eq!(fresh.view().position_size_1e6, 3 * PVM_E);
+
+    let mut out = pine_broker::EngineIntentBuf::new();
+    let mut i = 0_u32;
+    while i < 16 {
+        assert_eq!(
+            pvm_native_event(&mut b, &mut out, i),
+            0,
+            "warm-up event {i} faulted"
+        );
+        i += 1;
+    }
+    let c0 = *b.counters();
+    let g = core_alloc::AllocGuard::new();
+    let mut errs = 0_u32;
+    while i < 1_016 {
+        errs += pvm_native_event(&mut b, &mut out, i);
+        i += 1;
+    }
+    let (allocs, bytes, deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "gate PVM-3: NativeBroker event cycle allocated {allocs} times / {bytes} B"
+    );
+    assert_eq!(bytes, 0, "gate PVM-3: {bytes} B");
+    assert_eq!(deallocs, 0, "gate PVM-3: {deallocs} frees");
+    assert_eq!(
+        errs, 0,
+        "gate PVM-3: {errs} broker calls answered Err in the window"
+    );
+    // The window did what the gate says: makers sent, requoted and filled.
+    let c = *b.counters();
+    assert!(
+        c.maker_sent > c0.maker_sent,
+        "no maker written in the window"
+    );
+    assert!(c.modifies > c0.modifies, "no Modify written in the window");
+    assert!(
+        c.maker_filled > c0.maker_filled,
+        "no maker filled in the window"
+    );
+    // No halt and no flatten: no risk trip, no unattributed fill.
+    assert_eq!(
+        (
+            c.risk_trips_drawdown,
+            c.risk_trips_intraday_loss,
+            c.risk_trips_intraday_orders,
+            c.risk_trips_cons_loss_days,
+            c.unknown_fills,
+        ),
+        (
+            c0.risk_trips_drawdown,
+            c0.risk_trips_intraday_loss,
+            c0.risk_trips_intraday_orders,
+            c0.risk_trips_cons_loss_days,
+            c0.unknown_fills,
+        )
+    );
+}

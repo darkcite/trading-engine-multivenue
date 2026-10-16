@@ -182,4 +182,13 @@ fn new_allocates_exactly_once() {
         }
     });
     assert_eq!(n, 0, "no native broker call after new may allocate");
+
+    // D19 on a fresh broker: the book is reset in place, never rebuilt (no second ring).
+    let Ok(mut fresh) = NativeBroker::new(&meta, ncfg) else {
+        unreachable!()
+    };
+    let ((), n) = count(|| fresh.reconcile_boot(3 * E, 100 * E, 500 * E));
+    assert_eq!(n, 0, "reconcile_boot must not allocate (I3/I4)");
+    assert_eq!(fresh.view().position_size_1e6, 3 * E);
+    assert_eq!(fresh.view().opentrades, 1);
 }

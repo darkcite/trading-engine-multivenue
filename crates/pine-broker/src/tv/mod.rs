@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! TV-equivalent mode (impl-05 §3.4, §4.8): `TvStep`, `TvBroker` and the resumable per-bar walk.
-//! INCREMENT: margin (§4.9), `strategy.risk.*` and the day roll (§4.10–§4.11) land in T13; the
-//! `with_switches` constructor and the alternative walk readings (`cof_next_tick`,
-//! `close_immediately = NextTick`, `trail_arm_fire = SameSegment`) with their tests in T12/T17.
+//! TV-equivalent mode (impl-05 §3.4, §4.8): `TvStep`, `TvBroker` and the resumable per-bar walk,
+//! with every §4.2 switch reading wired (the alternatives reached through the `#[cfg(test)]`
+//! `with_switches` constructor, I38).
 
 pub(crate) mod cost;
 pub(crate) mod margin;
@@ -18,8 +17,13 @@ use crate::fault::{BrokerFault, InternalDefect};
 use crate::money::{floor_step, mul_div, sat_i64};
 use crate::orders::{otype, pflag, state, CommitCtx, OrderTable};
 use crate::risk::Risk;
-use crate::size::{declared_qty, n_rule_entry, n_rule_scale, size_entry_fill, unit_qty};
-use crate::switch::{CloseImmediately, ForcedFillSlippage, PriceRounding, Switches, SWITCHES};
+use crate::size::{
+    declared_qty, n_rule_entry, n_rule_scale, open_entry_trades, size_entry, unit_qty,
+};
+use crate::switch::{
+    CloseImmediately, CofCloseTick, CofNextTick, ForcedFillSlippage, PctEquityAt, PriceRounding,
+    PyramidCheck, Switches, TrailArmFire, SWITCHES,
+};
 use cost::{commission_1e12, slip};
 use margin::{funds_check, liquidation_price, margin_call_qty};
 use path::{before, path, reach, segment, sort_cands, Cand, Level};
@@ -66,6 +70,12 @@ const LEG_SHIFT: u16 = 13;
 const IDX_MASK: u16 = (1 << 13) - 1;
 /// `Cand::flags` bit: a stop-limit's limit stage re-keyed inside this segment (`a := S`).
 pub(crate) const CAND_REKEYED: u16 = 1;
+/// `Cand::flags` bit: a record born at an intrabar execution inside this segment
+/// (`cof_next_tick = RestOfSegment`): reached from that execution's tick, `late_a`.
+const CAND_LATE: u16 = 2;
+/// `Cand::flags` bit: a trail armed in this segment, tried at its end point
+/// (`trail_arm_fire = SameSegment`).
+const CAND_TAIL: u16 = 4;
 const LEG_TP: u16 = 0;
 const LEG_SL: u16 = 1;
 const LEG_TRAIL: u16 = 2;
@@ -97,6 +107,10 @@ pub struct TvBroker {
     close_work: bool,
     bars: u32,
     last_bar: Option<u32>,
+    /// `cof_next_tick = RestOfSegment`: the tick of the latest intrabar execution in this segment.
+    late_a: i64,
+    /// The current segment's trails have been moved (`after_segment` ran).
+    trailed: bool,
 }
 
 impl TvBroker {
@@ -105,6 +119,8 @@ impl TvBroker {
     pub fn new(meta: &ProgramMeta, cfg: TvCfg) -> Result<Self, DiagCode> {
         check_tv(meta, &cfg)?;
         let d = meta.decl;
+        // COPY: §4.17 #7 the broker by value, 76 096 B, once at construction — init-time move
+        // into the host's slot — an out-parameter or a boxed broker rejected: the frozen signature.
         Ok(Self {
             decl: d,
             chart: meta.chart,
@@ -135,6 +151,8 @@ impl TvBroker {
             close_work: false,
             bars: 0,
             last_bar: None,
+            late_a: 0,
+            trailed: false,
         })
     }
 
@@ -175,6 +193,7 @@ impl TvBroker {
         }
         self.seg = 0;
         self.collected = false;
+        self.trailed = false;
         self.evaluated = false;
         self.close_work = false;
         self.state = WalkState::Walking;
@@ -206,6 +225,10 @@ impl TvBroker {
         self.orders
             .commit_slice(&mut self.exits, intents, &ctx, open, &mut self.counters)?;
         let eval = self.orders.eval();
+        self.stamp_born(eval);
+        if intrabar && self.sw.cof_next_tick == CofNextTick::RestOfSegment {
+            self.admit_late(eval, tick_px);
+        }
         let same_tick = self.sw.close_immediately == CloseImmediately::SameTick;
         if intrabar && same_tick {
             // `immediately` closes born now fill at this execution's tick, before the walk resumes.
@@ -422,34 +445,42 @@ impl TvBroker {
         self.n_cand = 0;
         let mut i = 0;
         while i < self.orders.len() {
-            // COPY: 128-B record snapshot: `push` borrows `self` mutably (collection only).
-            // COPY: 128-B record snapshot: sizing and `apply_fill` borrow `self` mutably.
-            let o = *self.orders.get(i);
+            // The four scalars the admission reads (`push` borrows `self` mutably).
+            let (born_eval, flags, live, seq) = {
+                let o = self.orders.get(i);
+                (o.born_eval, o.flags, o.is_live(), o.seq)
+            };
             let admitted = match admit_after {
-                Some(e) => o.born_eval > e,
+                Some(e) => born_eval > e,
                 None => true,
             } && (!on_close_only
-                || (o.born_eval == eval
+                || (born_eval == eval
                     && (all_on_close
                         || (self.sw.close_immediately == CloseImmediately::SameTick
-                            && o.flags & pflag::IMMEDIATELY != 0))));
-            if o.is_live() && admitted {
+                            && flags & pflag::IMMEDIATELY != 0))));
+            if live && admitted {
                 let lv = self.order_level(i);
-                self.push(lv, a, b, o.seq, u16::try_from(i).unwrap_or(IDX_MASK));
+                self.push(lv, a, b, seq, u16::try_from(i).unwrap_or(IDX_MASK));
             }
             i += 1;
         }
         let mut k = 0;
         while k < self.exits.sets().len() {
-            // COPY: 128-B set snapshot: `push` borrows `self` mutably (collection only).
-            // COPY: 128-B set snapshot: `fill_set` borrows the table mutably.
-            let s = *self.exits.set(k);
+            // The scalars the admission reads (`push` borrows `self` mutably).
+            let (born_eval, live, rule) = {
+                let s = self.exits.set(k);
+                (
+                    s.born_eval,
+                    s.state == set_state::LIVE && s.r_1e6 > 0,
+                    s.rule,
+                )
+            };
             let admitted = match admit_after {
-                Some(e) => s.born_eval > e,
+                Some(e) => born_eval > e,
                 None => true,
-            } && (!on_close_only || (all_on_close && s.born_eval == eval));
-            if s.state == set_state::LIVE && s.r_1e6 > 0 && admitted {
-                let seq = self.exits.rule(usize::from(s.rule)).seq;
+            } && (!on_close_only || (all_on_close && born_eval == eval));
+            if live && admitted {
+                let seq = self.exits.rule(usize::from(rule)).seq;
                 let mut leg = LEG_TP;
                 while leg <= LEG_TRAIL {
                     if let Some(lv) = self.leg_level(k, leg) {
@@ -486,14 +517,23 @@ impl TvBroker {
                     return step;
                 }
                 if self.seg <= 2 {
-                    let (a, b) = segment(&self.path, self.seg);
-                    self.exits.after_segment(a, b);
+                    if !self.trailed {
+                        self.trailed = true;
+                        let (a, b) = segment(&self.path, self.seg);
+                        let armed = self.exits.after_segment(a, b);
+                        if self.sw.trail_arm_fire == TrailArmFire::SameSegment
+                            && self.push_tail(armed, b)
+                        {
+                            continue; // the armed trails' fills at `b`, then the tick
+                        }
+                    }
                     if let Err(f) = self.tick(self.path[self.seg + 1]) {
                         return self.latch(f);
                     }
                 }
                 self.seg += 1;
                 self.collected = false;
+                self.trailed = false;
             } else if !self.evaluated {
                 self.evaluated = true;
                 self.state = WalkState::AwaitingSubmit {
@@ -509,6 +549,11 @@ impl TvBroker {
                 self.seg = 3;
                 self.collect(None, true);
                 self.seg = 4;
+                if let Some(step) = self.run_ticks(false) {
+                    return step;
+                }
+            } else if self.cur < self.n_cand {
+                // The on-close pass resumed after a `cof_close_tick = Yes` execution.
                 if let Some(step) = self.run_ticks(false) {
                     return step;
                 }
@@ -547,10 +592,12 @@ impl TvBroker {
                 }
             }
             let at_close = self.seg >= 2 && px == c;
+            // `cof_close_tick` (§4.2): `No` — a fill at the close (segment 2 at `c`, the close
+            // tick, the on-close pass) requests no execution; `Yes` — every fill tick does.
+            let close_yes = self.sw.cof_close_tick == CofCloseTick::Yes;
             if any
-                && may_evaluate
+                && (close_yes || (may_evaluate && !at_close))
                 && self.decl.flags & decl_flag::CALC_ON_ORDER_FILLS != 0
-                && !at_close
             {
                 self.counters.reevals_on_order_fill += 1;
                 self.state = WalkState::AwaitingSubmit {
@@ -570,6 +617,13 @@ impl TvBroker {
     fn fill(&mut self, k: Cand) -> Result<bool, BrokerFault> {
         let seg = self.seg.min(3);
         let (a, b) = segment(&self.path, seg);
+        let a = if k.flags & CAND_TAIL != 0 {
+            b
+        } else if k.flags & CAND_LATE != 0 {
+            self.late_a
+        } else {
+            a
+        };
         let idx = usize::from(k.what & IDX_MASK);
         if k.what & WHAT_SET != 0 {
             return self.fill_leg(idx, (k.what >> LEG_SHIFT) & 3, a, b);
@@ -577,13 +631,23 @@ impl TvBroker {
         if idx >= self.orders.len() {
             return Ok(false);
         }
-        // COPY: 128-B record snapshot: the stop-limit stage rewrites `self.cand` and the record.
-        let o = *self.orders.get(idx);
-        if !o.is_live() || o.born_eval > self.seg_eval {
+        // The scalars this reads (the stop-limit stage rewrites `self.cand` and the record).
+        let (live, born_eval, stop_1e6, ot, st, seq) = {
+            let o = self.orders.get(idx);
+            (
+                o.is_live(),
+                o.born_eval,
+                o.stop_1e6,
+                o.otype,
+                o.state,
+                o.seq,
+            )
+        };
+        if !live || born_eval > self.seg_eval {
             return Ok(false);
         }
         let a_eff = if k.flags & CAND_REKEYED != 0 {
-            o.stop_1e6
+            stop_1e6
         } else {
             a
         };
@@ -593,16 +657,16 @@ impl TvBroker {
             return Ok(false);
         };
         // A re-keyed limit stage is placed in path order after the stop's tick.
-        if o.otype == otype::STOP_LIMIT && o.state == state::WORKING {
+        if ot == otype::STOP_LIMIT && st == state::WORKING {
             // Stage 1: the stop triggers, no fill; the limit stage takes over from `a := S`.
             self.orders.get_mut(idx).state = state::STOP_TRIGGERED;
             let lim = self.order_level(idx);
             let v = self.verify_for(lim);
-            if let Some((r, _)) = reach(lim, o.stop_1e6, b, v, self.sw.fill_limits_price) {
+            if let Some((r, _)) = reach(lim, stop_1e6, b, v, self.sw.fill_limits_price) {
                 self.cur -= 1;
                 self.cand[self.cur] = Cand {
                     key: r,
-                    seq: o.seq,
+                    seq,
                     what: k.what,
                     flags: CAND_REKEYED,
                 };
@@ -631,26 +695,23 @@ impl TvBroker {
 
     /// The margin call at `px` (§4.9.2; at most one per tick), then the liquidation price (§4.9.3).
     fn margin_check(&mut self, px: i64) -> Result<(), BrokerFault> {
-        // COPY: 256-B view snapshot: `apply_fill` below borrows the book mutably.
-        let v = *self.book.view();
-        let pos = v.position_size_1e6;
+        // The four scalars the call reads (`apply_fill` below borrows the book mutably).
+        let (pos, avg, init, net) = {
+            let v = self.book.view();
+            (
+                v.position_size_1e6,
+                v.position_avg_price_1e6,
+                v.initial_capital_1e12,
+                v.netprofit_1e12,
+            )
+        };
         let m = if pos > 0 {
             self.decl.margin_long_pct_1e6
         } else {
             self.decl.margin_short_pct_1e6
         };
         let pv = self.chart.pointvalue_1e6;
-        let (init, net) = (v.initial_capital_1e12, v.netprofit_1e12);
-        let size = margin_call_qty(
-            pos,
-            v.position_avg_price_1e6,
-            px,
-            init,
-            net,
-            m,
-            pv,
-            self.chart.qty_step_1e6,
-        );
+        let size = margin_call_qty(pos, avg, px, init, net, m, pv, self.chart.qty_step_1e6);
         if size > 0 {
             let buy = pos < 0;
             let fpx = if self.sw.forced_fill_slippage == ForcedFillSlippage::Slipped {
@@ -675,22 +736,22 @@ impl TvBroker {
             self.counters.margin_calls += 1;
             self.exits.rederive_now(self.book.view().position_size_1e6);
         }
-        // COPY: 256-B view snapshot after the call (cold: once per tick).
-        let v = *self.book.view();
-        let pos = v.position_size_1e6;
+        // After the call: the same four scalars, re-read.
+        let (pos, avg, init, net) = {
+            let v = self.book.view();
+            (
+                v.position_size_1e6,
+                v.position_avg_price_1e6,
+                v.initial_capital_1e12,
+                v.netprofit_1e12,
+            )
+        };
         let m = if pos > 0 {
             self.decl.margin_long_pct_1e6
         } else {
             self.decl.margin_short_pct_1e6
         };
-        let p = liquidation_price(
-            pos,
-            v.position_avg_price_1e6,
-            v.initial_capital_1e12,
-            v.netprofit_1e12,
-            m,
-            pv,
-        );
+        let p = liquidation_price(pos, avg, init, net, m, pv);
         self.book.set_liquidation_price(p);
         Ok(())
     }
@@ -739,15 +800,30 @@ impl TvBroker {
 
     /// Size, price and book order `i` at `px` (before slippage when `slipped`); §4.7, §4.8.6.
     fn execute_order(&mut self, i: usize, px0: i64, slipped: bool) -> Result<bool, BrokerFault> {
-        let o = *self.orders.get(i);
+        // The scalars the fill reads (`apply_fill` and the counters borrow `self` mutably).
+        let (kind, side, id, id_sym, born_bar, born_eval, gen_open, ot, filled, qty, qty_pct) = {
+            let o = self.orders.get(i);
+            (
+                o.kind,
+                o.side,
+                o.id,
+                o.id_sym,
+                o.born_bar,
+                o.born_eval,
+                o.gen_open,
+                o.otype,
+                o.filled_1e6,
+                o.qty_1e6,
+                o.qty_pct_1e6,
+            )
+        };
         let pos = self.book.view().position_size_1e6;
         let pv = self.chart.pointvalue_1e6;
         let step = self.chart.qty_step_1e6;
-        let kind = o.kind;
         let buy = if kind == IntentKind::Close as u8 || kind == IntentKind::CloseAll as u8 {
             pos < 0
         } else {
-            o.side == 0
+            side == 0
         };
         let px = if slipped {
             slip(px0, buy, self.decl.slippage_ticks, self.chart.mintick_1e6)
@@ -755,12 +831,17 @@ impl TvBroker {
             px0
         };
         let q_signed: i64 = if kind == IntentKind::Entry as u8 {
-            let q = self.resolve_qty(&o, px)?;
-            let Some(sz) = size_entry_fill(
+            let q = self.resolve_qty(self.orders.get(i), px)?;
+            let gen_open = match self.sw.pyramiding {
+                PyramidCheck::FillTime => None,
+                PyramidCheck::GenerationTime => Some(gen_open),
+            };
+            let Some(sz) = size_entry(
                 &self.book,
                 buy,
                 q,
-                o.born_eval,
+                born_eval,
+                gen_open,
                 self.decl.pyramiding,
                 self.max_position(px),
                 0,
@@ -800,7 +881,7 @@ impl TvBroker {
                 -total
             }
         } else if kind == IntentKind::Order as u8 {
-            let q = floor_step(self.resolve_qty(&o, px)?, step);
+            let q = floor_step(self.resolve_qty(self.orders.get(i), px)?, step);
             if q == 0 {
                 self.counters.sized_to_zero += 1;
                 self.orders.kill(i);
@@ -812,27 +893,23 @@ impl TvBroker {
                 -q
             }
         } else if kind == IntentKind::Close as u8 {
-            let total = self.open_qty_of(o.id);
+            let total = self.open_qty_of(id);
             if total == 0 {
                 self.orders.kill(i); // nothing open with that id: it lapses
                 return Ok(false);
             }
-            let q = if o.qty_1e6 > 0 {
+            let q = if qty > 0 {
                 let q = match self.cfg.sizing {
-                    SizingMode::AsDeclared => o.qty_1e6,
+                    SizingMode::AsDeclared => qty,
                     SizingMode::FixedNotional { notional_1e6 } => {
                         let eq = self.book.view().equity_1e12;
                         let d = declared_qty(&self.decl, px, pv, eq);
-                        n_rule_scale(unit_qty(notional_1e6, px, pv), o.qty_1e6, d)
+                        n_rule_scale(unit_qty(notional_1e6, px, pv), qty, d)
                     }
                 };
                 q.min(total)
-            } else if o.qty_pct_1e6 > 0 {
-                let pct = mul_div(
-                    i128::from(total),
-                    i128::from(o.qty_pct_1e6),
-                    100 * 1_000_000,
-                );
+            } else if qty_pct > 0 {
+                let pct = mul_div(i128::from(total), i128::from(qty_pct), 100 * 1_000_000);
                 floor_step(sat_i64(pct), step)
             } else {
                 total
@@ -860,11 +937,11 @@ impl TvBroker {
             px,
             q_abs,
             pv,
-            o.filled_1e6 == 0,
+            filled == 0,
             self.sw.cash_per_order,
         );
         let is_entry = kind == IntentKind::Entry as u8 || kind == IntentKind::Order as u8;
-        let mut lot_flags = if o.otype == otype::MARKET {
+        let mut lot_flags = if ot == otype::MARKET {
             0
         } else {
             lot_flag::PRICE_BASED
@@ -873,21 +950,21 @@ impl TvBroker {
             lot_flags |= lot_flag::PYRAMID;
         }
         let src = FillSrc {
-            id: o.id,
-            sym: o.id_sym,
+            id,
+            sym: id_sym,
             named_entry: if kind == IntentKind::Close as u8 {
-                o.id
+                id
             } else {
                 StrKey::NONE
             },
-            born_bar: o.born_bar,
-            born_eval: o.born_eval,
+            born_bar,
+            born_eval,
             is_entry,
             lot_flags,
         };
         self.book
             .apply_fill(q_signed, px, fee, &src, self.bar.index, self.bar.open_ms, 0)?;
-        self.orders.get_mut(i).filled_1e6 = o.filled_1e6.saturating_add(q_abs);
+        self.orders.get_mut(i).filled_1e6 = filled.saturating_add(q_abs);
         self.orders.on_member_fill(i, q_abs, &mut self.counters);
         self.orders.kill(i);
         self.risk.note_fill();
@@ -900,8 +977,15 @@ impl TvBroker {
         if k >= self.exits.sets().len() {
             return Ok(false);
         }
-        let s = *self.exits.set(k);
-        if s.state != set_state::LIVE || s.r_1e6 <= 0 || s.born_eval > self.seg_eval {
+        let (sell_side, r_1e6, live) = {
+            let s = self.exits.set(k);
+            (
+                s.side,
+                s.r_1e6,
+                s.state == set_state::LIVE && s.r_1e6 > 0 && s.born_eval <= self.seg_eval,
+            )
+        };
+        if !live {
             return Ok(false);
         }
         let Some(lv) = self.leg_level(k, leg) else {
@@ -914,14 +998,14 @@ impl TvBroker {
         let px = match lv {
             Level::BuyStop(_) | Level::SellStop(_) => slip(
                 px0,
-                s.side == 0,
+                sell_side == 0,
                 self.decl.slippage_ticks,
                 self.chart.mintick_1e6,
             ),
             _ => px0,
         };
         let pv = self.chart.pointvalue_1e6;
-        let fee = commission_1e12(&self.decl, px, s.r_1e6, pv, true, self.sw.cash_per_order);
+        let fee = commission_1e12(&self.decl, px, r_1e6, pv, true, self.sw.cash_per_order);
         self.exits
             .fill_set(k, px, fee, &mut self.book, self.bar.index, self.bar.open_ms)?;
         self.risk.note_fill();
@@ -929,10 +1013,121 @@ impl TvBroker {
         Ok(true)
     }
 
+    /// Stamp the records (re)born at evaluation `eval` with what the generation-time readings
+    /// need (`pyramiding = GenerationTime`, `pct_equity_at = OrderTime`); a no-op on the defaults.
+    fn stamp_born(&mut self, eval: u32) {
+        let gen_py = self.sw.pyramiding == PyramidCheck::GenerationTime;
+        let gen_eq = self.sw.pct_equity_at == PctEquityAt::OrderTime;
+        if !gen_py && !gen_eq {
+            return;
+        }
+        let open = open_entry_trades(&self.book);
+        let eq = self.book.view().equity_1e12;
+        let mut i = 0;
+        while i < self.orders.len() {
+            let o = self.orders.get_mut(i);
+            if o.born_eval == eval {
+                if gen_py {
+                    o.gen_open = open;
+                }
+                if gen_eq {
+                    o.set_gen_equity_1e12(eq);
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// `cof_next_tick = RestOfSegment` (`pin:05-cof-next-tick`, the alternative): the records
+    /// (re)born at the intrabar execution `eval` at `tick_px` become candidates for the rest of
+    /// the current segment, reached from `tick_px`; their stale slots are dropped first. Exit legs
+    /// keep the next-segment rule: sets are derived at segment collection
+    /// (`pin:05-cof-next-tick-exits`).
+    fn admit_late(&mut self, eval: u32, tick_px: i64) {
+        let (a, b) = segment(&self.path, self.seg.min(3));
+        let mut w = self.cur;
+        let mut r = self.cur;
+        while r < self.n_cand {
+            let c = self.cand[r];
+            let idx = usize::from(c.what & IDX_MASK);
+            let reborn = c.what & WHAT_SET == 0
+                && idx < self.orders.len()
+                && self.orders.get(idx).born_eval == eval;
+            if !reborn {
+                // COPY: a 16-B candidate record compacts one slot (§4.17: index records).
+                self.cand[w] = c;
+                w += 1;
+            }
+            r += 1;
+        }
+        self.n_cand = w;
+        let mut i = 0;
+        while i < self.orders.len() {
+            let o = self.orders.get(i);
+            if o.is_live() && o.born_eval == eval {
+                let (seq, lv) = (o.seq, self.order_level(i));
+                let v = self.verify_for(lv);
+                if let Some((key, _)) = reach(lv, tick_px, b, v, self.sw.fill_limits_price) {
+                    if self.n_cand < N_CAND {
+                        self.cand[self.n_cand] = Cand {
+                            key,
+                            seq,
+                            what: u16::try_from(i).unwrap_or(IDX_MASK),
+                            flags: CAND_LATE,
+                        };
+                        self.n_cand += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+        self.late_a = tick_px;
+        self.seg_eval = eval;
+        sort_cands(&mut self.cand[self.cur..self.n_cand], b >= a);
+    }
+
+    /// `trail_arm_fire = SameSegment` (`pin:05-trail-same-segment`, the alternative): the trails
+    /// armed by this segment (`armed`, bit = set) whose stop the end point `b` reaches become the
+    /// candidates at `b`. `true` when there is one.
+    fn push_tail(&mut self, armed: u128, b: i64) -> bool {
+        self.n_cand = 0;
+        self.cur = 0;
+        let mut k = 0;
+        while k < self.exits.sets().len() && k < 128 {
+            if armed & (1_u128 << k) != 0 {
+                if let Some(lv) = self.leg_level(k, LEG_TRAIL) {
+                    if reach(lv, b, b, 0, self.sw.fill_limits_price).is_some()
+                        && self.n_cand < N_CAND
+                    {
+                        let seq = self.exits.rule(usize::from(self.exits.set(k).rule)).seq;
+                        let what =
+                            WHAT_SET | (LEG_TRAIL << LEG_SHIFT) | u16::try_from(k).unwrap_or(0);
+                        self.cand[self.n_cand] = Cand {
+                            key: b,
+                            seq,
+                            what,
+                            flags: CAND_TAIL,
+                        };
+                        self.n_cand += 1;
+                    }
+                }
+            }
+            k += 1;
+        }
+        let (a0, _) = segment(&self.path, self.seg);
+        sort_cands(&mut self.cand[..self.n_cand], b >= a0);
+        self.n_cand > 0
+    }
+
     /// The order's quantity at reference price `px` (§4.7.1–§4.7.2), net of OCA reductions.
     fn resolve_qty(&self, o: &crate::orders::PendingOrder, px: i64) -> Result<i64, BrokerFault> {
         let pv = self.chart.pointvalue_1e6;
-        let eq = self.book.view().equity_1e12;
+        // `pct_equity_at` (`pin:05-pct-equity-time`): `OrderTime` reads the equity stamped at the
+        // order's (re)birth.
+        let eq = match self.sw.pct_equity_at {
+            PctEquityAt::FillTime => self.book.view().equity_1e12,
+            PctEquityAt::OrderTime => o.gen_equity_1e12(),
+        };
         let explicit = o.qty_1e6 > 0;
         let q = match self.cfg.sizing {
             SizingMode::AsDeclared => {
@@ -995,6 +1190,7 @@ impl TvBroker {
         let mut b = Self::new(meta, cfg)?;
         b.sw = sw;
         b.exits = ExitTable::new(sw.exit_reservation);
+        b.exits.set_exit_qty(sw.exit_qty);
         Ok(b)
     }
 }
@@ -1184,5 +1380,208 @@ mod tests {
             ..SWITCHES
         };
         assert_eq!(flat_px(un), Some(97 * E));
+    }
+    fn with(sw: crate::switch::Switches, m: &ProgramMeta) -> TvBroker {
+        TvBroker::with_switches(m, CFG, sw).unwrap_or_else(|_| unreachable!())
+    }
+
+    #[test]
+    fn pyramiding_generation_time() {
+        // `pin:05-pyramiding-check`: pyramiding 1, A (limit 98) born on bar 0, B (limit 96) on
+        // bar 1, both reached on bar 2. FillTime counts A's trade at B's fill → B refused;
+        // GenerationTime counts the trades open at B's birth (none) → B fills.
+        let a = entry_limit(98 * E);
+        let b2 = OrderIntent {
+            id: StrKey(2),
+            limit_1e6: 96 * E,
+            seq: 1,
+            ..entry_limit(0)
+        };
+        let trades = |sw: crate::switch::Switches| {
+            let mut b = with(sw, &meta());
+            run(&mut b, &bar(0, 100 * E, 101 * E, 99 * E, 100 * E), &[a]);
+            run(&mut b, &bar(1, 100 * E, 101 * E, 99 * E, 100 * E), &[b2]);
+            run(&mut b, &bar(2, 100 * E, 100 * E, 95 * E, 96 * E), &[]);
+            (b.view().opentrades, b.counters().entries_refused_pyramiding)
+        };
+        assert_eq!(trades(SWITCHES), (1, 1));
+        let gen = crate::switch::Switches {
+            pyramiding: crate::switch::PyramidCheck::GenerationTime,
+            ..SWITCHES
+        };
+        assert_eq!(trades(gen), (2, 0));
+    }
+
+    #[test]
+    fn pct_equity_at_order_time() {
+        // `pin:05-pct-equity-time`: 10 % of equity; B is generated at bar 1's close (equity
+        // 100 000, the 100-lot A marked at 100) and fills at bar 2's open, 110 (equity 101 000).
+        let mut m = meta();
+        m.decl.pyramiding = 2;
+        m.decl.default_qty_type = pine_ir::QtyType::PercentOfEquity;
+        m.decl.default_qty_value_1e6 = 10 * E;
+        let a = OrderIntent {
+            flags: f::QTY,
+            qty_1e6: 100 * E,
+            ..market_entry()
+        };
+        let b2 = OrderIntent {
+            id: StrKey(2),
+            seq: 1,
+            ..market_entry()
+        };
+        let qty_b = |sw: crate::switch::Switches| {
+            let mut b = with(sw, &m);
+            run(&mut b, &bar(0, 100 * E, 101 * E, 99 * E, 100 * E), &[a]);
+            run(&mut b, &bar(1, 100 * E, 101 * E, 99 * E, 100 * E), &[b2]);
+            run(&mut b, &bar(2, 110 * E, 111 * E, 109 * E, 110 * E), &[]);
+            b.open_trade(1).map(|t| t.qty_1e6)
+        };
+        assert_eq!(qty_b(SWITCHES), Some(91_818_181)); // 10 100 / 110
+        let ot = crate::switch::Switches {
+            pct_equity_at: crate::switch::PctEquityAt::OrderTime,
+            ..SWITCHES
+        };
+        assert_eq!(qty_b(ot), Some(90_909_090)); // 10 000 / 110
+    }
+
+    #[test]
+    fn exit_qty_per_call() {
+        // `pin:05-exit-qty-per-trade`: two 3-lot trades, one exit `qty = 4` at 105. PerTrade:
+        // each set takes min(4, 3) → flat. PerCall: 3 + 1 → 2 left.
+        let mut m = meta();
+        m.decl.pyramiding = 2;
+        let e = |id: u64, seq: u32| OrderIntent {
+            id: StrKey(id),
+            flags: f::QTY,
+            qty_1e6: 3 * E,
+            seq,
+            ..market_entry()
+        };
+        let x = OrderIntent {
+            kind: IntentKind::Exit,
+            id: StrKey(9),
+            flags: f::QTY | f::LIMIT,
+            qty_1e6: 4 * E,
+            limit_1e6: 105 * E,
+            seq: 2,
+            ..OrderIntent::default()
+        };
+        let left = |sw: crate::switch::Switches| {
+            let mut b = with(sw, &m);
+            run(
+                &mut b,
+                &bar(0, 100 * E, 101 * E, 99 * E, 100 * E),
+                &[e(1, 0), e(2, 1), x],
+            );
+            run(&mut b, &bar(1, 100 * E, 101 * E, 99 * E, 100 * E), &[]);
+            run(&mut b, &bar(2, 104 * E, 106 * E, 103 * E, 105 * E), &[]);
+            b.view().position_size_1e6
+        };
+        assert_eq!(left(SWITCHES), 0);
+        let pc = crate::switch::Switches {
+            exit_qty: crate::switch::ExitQty::PerCall,
+            ..SWITCHES
+        };
+        assert_eq!(left(pc), 2 * E);
+    }
+
+    #[test]
+    fn trail_arm_fire_same_segment() {
+        // `pin:05-trail-same-segment` (zero offset): bar 2's path 104→105→95→103 arms the 103
+        // trail on its last segment. NextSegment: the close tick does not admit it, bar 3's open
+        // (101) gaps through → 101. SameSegment: fires at the arming segment's end, 103.
+        let x = OrderIntent {
+            kind: IntentKind::Exit,
+            id: StrKey(9),
+            flags: f::TRAIL_PRICE | f::TRAIL_OFFSET,
+            trail_price_1e6: 103 * E,
+            trail_offset_1e6: 0,
+            seq: 1,
+            ..OrderIntent::default()
+        };
+        let exit_px = |sw: crate::switch::Switches| {
+            let mut b = with(sw, &meta());
+            run(
+                &mut b,
+                &bar(0, 100 * E, 101 * E, 99 * E, 100 * E),
+                &[market_entry(), x],
+            );
+            run(&mut b, &bar(1, 100 * E, 101 * E, 99 * E, 100 * E), &[]);
+            run(&mut b, &bar(2, 104 * E, 105 * E, 95 * E, 103 * E), &[]);
+            run(&mut b, &bar(3, 101 * E, 102 * E, 100 * E, 101 * E), &[]);
+            b.closed_trade(0).map(|t| t.exit_px_1e6)
+        };
+        assert_eq!(exit_px(SWITCHES), Some(101 * E));
+        let same = crate::switch::Switches {
+            trail_arm_fire: crate::switch::TrailArmFire::SameSegment,
+            ..SWITCHES
+        };
+        assert_eq!(exit_px(same), Some(103 * E));
+    }
+
+    fn cof_meta() -> ProgramMeta {
+        let mut m = meta();
+        m.decl.flags |= pine_ir::decl_flag::CALC_ON_ORDER_FILLS;
+        m.uses_intrabar = true;
+        m
+    }
+
+    #[test]
+    fn cof_close_tick_yes() {
+        // `pin:05-cof-close-tick`: the 99 buy limit fills at bar 1's close (path
+        // 100→99.5→102→99). No: no execution; Yes: one.
+        let m = cof_meta();
+        let execs = |sw: crate::switch::Switches| {
+            let mut b = with(sw, &m);
+            run(
+                &mut b,
+                &bar(0, 100 * E, 101 * E, 99_500_000, 100 * E),
+                &[entry_limit(99 * E)],
+            );
+            run(&mut b, &bar(1, 100 * E, 102 * E, 99_500_000, 99 * E), &[]);
+            assert_eq!(b.view().opentrades, 1);
+            b.counters().reevals_on_order_fill
+        };
+        assert_eq!(execs(SWITCHES), 0);
+        let yes = crate::switch::Switches {
+            cof_close_tick: crate::switch::CofCloseTick::Yes,
+            ..SWITCHES
+        };
+        assert_eq!(execs(yes), 1);
+    }
+
+    #[test]
+    fn cof_next_tick_rest_of_segment() {
+        // `pin:05-cof-next-tick`: the entry fills at bar 1's open (100); the execution there
+        // closes it. NextPoint: from segment 1's start, 99. RestOfSegment: at once, 100.
+        let m = cof_meta();
+        let close = OrderIntent {
+            kind: IntentKind::Close,
+            from_entry: StrKey(1),
+            ..OrderIntent::default()
+        };
+        let exit_px = |sw: crate::switch::Switches| {
+            let mut b = with(sw, &m);
+            run(
+                &mut b,
+                &bar(0, 100 * E, 101 * E, 99 * E, 100 * E),
+                &[market_entry()],
+            );
+            let mut step = b.open_bar(&bar(1, 100 * E, 104 * E, 99 * E, 103 * E));
+            let mut sent = false;
+            while let TvStep::Evaluate { intrabar, .. } = step {
+                let s: &[OrderIntent] = if intrabar && !sent { &[close] } else { &[] };
+                sent |= intrabar;
+                step = b.submit(s).unwrap_or_else(|e| panic!("{e:?}"));
+            }
+            b.closed_trade(0).map(|t| t.exit_px_1e6)
+        };
+        assert_eq!(exit_px(SWITCHES), Some(99 * E));
+        let rest = crate::switch::Switches {
+            cof_next_tick: crate::switch::CofNextTick::RestOfSegment,
+            ..SWITCHES
+        };
+        assert_eq!(exit_px(rest), Some(100 * E));
     }
 }

@@ -46,6 +46,10 @@ pub(crate) mod pflag {
     pub(crate) const IMMEDIATELY: u8 = 1 << 0;
     /// A close-all created by `allow_entry_in` (§4.7.5).
     pub(crate) const ALLOW_ENTRY_CLOSE: u8 = 1 << 1;
+    /// Native: the record's last send was cut short by outstanding reducers (`|pos| − R`,
+    /// §4.12.4 rules 2–3), so that send filling is not the record's end — the remainder is sent
+    /// after the reducers' dispositions. Kept across a re-commit on the same side.
+    pub(crate) const DEFERRED: u8 = 1 << 2;
 }
 
 /// One pending entry / `strategy.order` / close / close-all. 128 B.
@@ -94,8 +98,14 @@ pub(crate) struct PendingOrder {
     pub(crate) sent: u8,
     /// Native: once-per-episode counter latches (§4.15).
     pub(crate) latch: u8,
+    /// TV `pyramiding = GenerationTime`: the open entry-trade count at (re)birth (§4.2).
+    pub(crate) gen_open: u32,
+    /// TV `pct_equity_at = OrderTime`: equity ×1e12 at (re)birth, low 64 bits (§4.2).
+    pub(crate) gen_eq_lo: u64,
+    /// … and high 64 bits (split: an `i128` would raise the record's field alignment).
+    pub(crate) gen_eq_hi: i64,
     /// Always zero.
-    pub(crate) _pad: [u32; 9],
+    pub(crate) _pad: [u32; 4],
 }
 
 const _: () = assert!(core::mem::size_of::<PendingOrder>() == 128);
@@ -105,6 +115,27 @@ impl PendingOrder {
     /// Working or a triggered stop-limit.
     pub(crate) const fn is_live(&self) -> bool {
         self.state == state::WORKING || self.state == state::STOP_TRIGGERED
+    }
+
+    /// The equity stamped at (re)birth (`pct_equity_at = OrderTime`).
+    pub(crate) const fn gen_equity_1e12(&self) -> i128 {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+        let bits = ((self.gen_eq_hi as u128) << 64) | self.gen_eq_lo as u128;
+        #[allow(clippy::cast_possible_wrap)]
+        let eq = bits as i128;
+        eq
+    }
+
+    /// Stamp the equity at (re)birth.
+    pub(crate) fn set_gen_equity_1e12(&mut self, eq_1e12: i128) {
+        #[allow(clippy::cast_sign_loss)]
+        let bits = eq_1e12 as u128;
+        #[allow(clippy::cast_possible_truncation)]
+        let lo = bits as u64;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let hi = (bits >> 64) as u64 as i64;
+        self.gen_eq_lo = lo;
+        self.gen_eq_hi = hi;
     }
 }
 
@@ -447,12 +478,18 @@ impl OrderTable {
         {
             return Err(BrokerFault::Script(ScriptRefusal::OcaGroupsFull));
         }
-        let (i, seq, filled, reduced, sent) = match existing {
+        let (i, seq, filled, reduced, sent, deferred) = match existing {
             Some(i) => {
                 counters.intents_modified += 1;
                 let o = &self.orders[i];
-                // A modification keeps its venue order (native requotes it, §4.3).
-                (i, o.seq, o.filled_1e6, o.oca_reduced_1e6, o.sent)
+                // A modification keeps its venue order (native requotes it, §4.3), and a deferred
+                // remainder on the same side (§4.12.4 rule 3).
+                let keep = if o.side == it.side as u8 {
+                    o.flags & pflag::DEFERRED
+                } else {
+                    0
+                };
+                (i, o.seq, o.filled_1e6, o.oca_reduced_1e6, o.sent, keep)
             }
             None => {
                 if self.len() == cap::ORDERS {
@@ -461,7 +498,7 @@ impl OrderTable {
                 let s = self.next_seq;
                 self.next_seq = self.next_seq.wrapping_add(1);
                 self.n += 1;
-                (self.len() - 1, s, 0, 0, 0)
+                (self.len() - 1, s, 0, 0, 0, 0)
             }
         };
         let has_l = it.flags & intent_flag::LIMIT != 0;
@@ -504,10 +541,13 @@ impl OrderTable {
             otype: ot,
             state: state::WORKING,
             oca_type: it.oca_type as u8,
-            flags: imm | extra,
+            flags: imm | extra | deferred,
             sent,
             latch: 0,
-            _pad: [0; 9],
+            gen_open: 0,
+            gen_eq_lo: 0,
+            gen_eq_hi: 0,
+            _pad: [0; 4],
         };
         Ok(())
     }

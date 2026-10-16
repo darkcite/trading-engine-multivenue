@@ -111,7 +111,6 @@ pub(crate) struct Book {
 impl Book {
     /// An empty book. Allocates the closed ring — the only allocation (I3).
     pub(crate) fn new(initial_capital_1e6: i64, pointvalue_1e6: i64, close_any: bool) -> Self {
-        let initial = usd_1e6_to_1e12(initial_capital_1e6);
         let mut b = Self {
             lots: [TradeRec::default(); cap::LOTS],
             lot_born_bar: [0; cap::LOTS],
@@ -121,19 +120,19 @@ impl Book {
             head: 0,
             n: 0,
             next_open_seq: 0,
-            pv_1e6: pointvalue_1e6,
-            close_any,
+            pv_1e6: 0,
+            close_any: false,
             position_1e6: 0,
             avg_px_1e6: 0,
             mark_1e6: 0,
-            initial_1e12: initial,
+            initial_1e12: 0,
             netprofit_1e12: 0,
             grossprofit_1e12: 0,
             grossloss_1e12: 0,
             commission_1e12: 0,
             openprofit_1e12: 0,
-            peak_equity_1e12: initial,
-            trough_equity_1e12: initial,
+            peak_equity_1e12: 0,
+            trough_equity_1e12: 0,
             max_drawdown_1e12: 0,
             max_runup_1e12: 0,
             max_held_all_1e6: 0,
@@ -147,8 +146,52 @@ impl Book {
             closed: ClosedRing::new(),
             view: BrokerView::default(),
         };
-        b.refresh_view();
+        b.reset(initial_capital_1e6, pointvalue_1e6, close_any);
         b
+    }
+
+    /// Back to the empty book of [`Book::new`], IN PLACE: the closed ring is cleared, never
+    /// reallocated (I3/I4 — the D19 boot reconciliation runs after `new`).
+    pub(crate) fn reset(&mut self, initial_capital_1e6: i64, pointvalue_1e6: i64, close_any: bool) {
+        let initial = usd_1e6_to_1e12(initial_capital_1e6);
+        let mut i = 0;
+        while i < cap::LOTS {
+            self.lots[i] = TradeRec::default();
+            self.lot_born_bar[i] = 0;
+            self.lot_born_eval[i] = 0;
+            self.lot_open_seq[i] = 0;
+            self.lot_flags[i] = 0;
+            i += 1;
+        }
+        self.head = 0;
+        self.n = 0;
+        self.next_open_seq = 0;
+        self.pv_1e6 = pointvalue_1e6;
+        self.close_any = close_any;
+        self.position_1e6 = 0;
+        self.avg_px_1e6 = 0;
+        self.mark_1e6 = 0;
+        self.initial_1e12 = initial;
+        self.netprofit_1e12 = 0;
+        self.grossprofit_1e12 = 0;
+        self.grossloss_1e12 = 0;
+        self.commission_1e12 = 0;
+        self.openprofit_1e12 = 0;
+        self.peak_equity_1e12 = initial;
+        self.trough_equity_1e12 = initial;
+        self.max_drawdown_1e12 = 0;
+        self.max_runup_1e12 = 0;
+        self.max_held_all_1e6 = 0;
+        self.max_held_long_1e6 = 0;
+        self.max_held_short_1e6 = 0;
+        self.closedtrades = 0;
+        self.wintrades = 0;
+        self.losstrades = 0;
+        self.eventrades = 0;
+        self.fills = 0;
+        self.closed.clear();
+        self.view = BrokerView::default();
+        self.refresh_view();
     }
 
     /// Ring slot of open trade `i`.
@@ -353,26 +396,29 @@ impl Book {
                 mul_div(l_fee, n, lq)
             };
             let sign = sgn(l_qty);
-            // COPY: §4.17 #1 — the closed slice starts as its lot (128 B), then becomes immutable.
-            let mut c = self.lots[s];
             // `n ≤ |L.qty|`, so the narrowing is exact.
-            c.qty_1e6 = i64::try_from(sign * n).unwrap_or(0);
-            c.fee_1e12 = entry_share.saturating_add(exit_share);
-            c.pnl_1e12 =
-                gross_1e12(sign, px_1e6, l_entry, n, self.pv_1e6).saturating_sub(c.fee_1e12);
+            let c_qty = i64::try_from(sign * n).unwrap_or(0);
+            let c_fee = entry_share.saturating_add(exit_share);
+            let c_pnl = gross_1e12(sign, px_1e6, l_entry, n, self.pv_1e6).saturating_sub(c_fee);
+            let c = self.closed.push_slot();
+            // COPY: §4.17 #1 lot → closed-ring slot, 128 B, once per closed slice — the ring owns
+            // an immutable record while the lot slot is reused — a local staging copy (2×) rejected.
+            *c = self.lots[s];
+            c.qty_1e6 = c_qty;
+            c.fee_1e12 = c_fee;
+            c.pnl_1e12 = c_pnl;
             c.flags = trade_flag::PNL_NET | cause;
             c.exit_id = src.id;
             c.exit_sym = src.sym;
             c.exit_px_1e6 = px_1e6;
             c.exit_ms = time_ms;
             c.exit_bar = bar_index;
-            self.closed.push(&c);
-            self.netprofit_1e12 = self.netprofit_1e12.saturating_add(c.pnl_1e12);
-            if c.pnl_1e12 > 0 {
-                self.grossprofit_1e12 = self.grossprofit_1e12.saturating_add(c.pnl_1e12);
+            self.netprofit_1e12 = self.netprofit_1e12.saturating_add(c_pnl);
+            if c_pnl > 0 {
+                self.grossprofit_1e12 = self.grossprofit_1e12.saturating_add(c_pnl);
                 self.wintrades += 1;
-            } else if c.pnl_1e12 < 0 {
-                self.grossloss_1e12 = self.grossloss_1e12.saturating_sub(c.pnl_1e12);
+            } else if c_pnl < 0 {
+                self.grossloss_1e12 = self.grossloss_1e12.saturating_sub(c_pnl);
                 self.losstrades += 1;
             } else {
                 self.eventrades += 1;
@@ -380,7 +426,7 @@ impl Book {
             self.closedtrades += 1;
             let lot = &mut self.lots[s];
             lot.fee_1e12 -= entry_share;
-            lot.qty_1e6 -= c.qty_1e6;
+            lot.qty_1e6 -= c_qty;
             if lot.qty_1e6 == 0 {
                 self.remove_lot(i);
             }

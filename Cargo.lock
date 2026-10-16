@@ -165,6 +165,7 @@ dependencies = [
  "ingress-rpc",
  "mio 0.8.11",
  "opt-registry",
+ "pine-broker",
  "pine-ir",
  "pine-lang",
  "rcgen",

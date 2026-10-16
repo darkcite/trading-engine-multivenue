@@ -278,3 +278,365 @@ fn flatten_cancels_every_live_maker() {
         (EngineVerb::Cancel, mk.client_oid)
     );
 }
+
+/// Enter long at market (IoC) for the unit quantity and fill it at 100; returns the position.
+fn long_at_100(b: &mut NativeBroker, out: &mut EngineIntentBuf) -> i64 {
+    let entry = OrderIntent {
+        kind: IntentKind::Entry,
+        id: StrKey(1),
+        ..OrderIntent::default()
+    };
+    b.apply_intents(&[entry], NOW).unwrap();
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, out)
+        .unwrap();
+    let e = out.as_slice()[0];
+    b.on_ack(e.client_oid);
+    b.on_fill(e.client_oid, e.qty_1e6, 100 * E, 0, 1, 0)
+        .unwrap();
+    b.view().position_size_1e6
+}
+
+/// A take-profit at 110 from entry 1 resting as a reduce-only maker (`pct` of the trade, 0 =
+/// all); returns its sent intent after the ack.
+fn rest_tp(
+    b: &mut NativeBroker,
+    out: &mut EngineIntentBuf,
+    extra: OrderIntent,
+) -> pine_ir::EngineIntent {
+    b.apply_intents(&[extra], NOW).unwrap();
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, out)
+        .unwrap();
+    let m = out.as_slice()[0];
+    assert_eq!(
+        (m.verb, m.primitive, m.flags),
+        (EngineVerb::Submit, Primitive::MakerPostOnly, 1)
+    );
+    b.on_ack(m.client_oid);
+    m
+}
+
+fn fill(b: &mut NativeBroker, e: &pine_ir::EngineIntent, px: i64) {
+    b.on_ack(e.client_oid);
+    let q = if e.side == 0 { e.qty_1e6 } else { -e.qty_1e6 };
+    b.on_fill(e.client_oid, q, px, 0, 1, 0).unwrap();
+}
+
+#[test]
+fn a_trail_arms_and_fires_while_its_own_take_profit_rests() {
+    // Review B1 (§4.12.4 rule 2, §4.5.6): the trail steps on every fresh touch even though the
+    // set has a resting maker; once through, the take-profit is cancelled and the trail fires.
+    let mut b = broker(4);
+    let mut out = EngineIntentBuf::new();
+    let pos = long_at_100(&mut b, &mut out);
+    let ex = OrderIntent {
+        kind: IntentKind::Exit,
+        id: StrKey(9),
+        from_entry: StrKey(1),
+        flags: f::LIMIT | f::TRAIL_PRICE | f::TRAIL_OFFSET,
+        limit_1e6: 110 * E,
+        trail_price_1e6: 102 * E,
+        trail_offset_1e6: 100 * E, // 100 ticks = 1.00
+        ..OrderIntent::default()
+    };
+    let tp = rest_tp(&mut b, &mut out, ex);
+    assert_eq!((tp.px_1e6, tp.qty_1e6), (110 * E, pos));
+    // The touch passes the activation: the trail arms at 103 (stop 102); the TP keeps resting.
+    b.reconcile(&quote(103 * E, 103 * E + 10_000, NOW), NOW, &mut out)
+        .unwrap();
+    assert!(out.is_empty());
+    // Back through the stop: the TP is taken back first (its covered part waits) …
+    b.reconcile(
+        &quote(101 * E + 500_000, 101 * E + 510_000, NOW),
+        NOW,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(out.len(), 1);
+    let c = out.as_slice()[0];
+    assert_eq!((c.verb, c.client_oid), (EngineVerb::Cancel, tp.client_oid));
+    // … and after its disposition the trail fires for the whole position.
+    b.on_cancelled(tp.client_oid);
+    b.reconcile(
+        &quote(101 * E + 500_000, 101 * E + 510_000, NOW),
+        NOW,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(out.len(), 1);
+    let t = out.as_slice()[0];
+    assert_eq!(
+        (t.verb, t.primitive, t.side, t.qty_1e6, t.id),
+        (
+            EngineVerb::Submit,
+            Primitive::ReduceOnlyIoc,
+            1,
+            pos,
+            StrKey(9)
+        )
+    );
+}
+
+#[test]
+fn a_close_takes_back_a_take_profit_covering_the_position() {
+    // Review B2 (§4.12.4 rule 2): room |pos| − R is 0 while the TP rests; the close cancels it
+    // and fires after the cancel is confirmed — it never waits forever.
+    let mut b = broker(4);
+    let mut out = EngineIntentBuf::new();
+    let pos = long_at_100(&mut b, &mut out);
+    let ex = OrderIntent {
+        kind: IntentKind::Exit,
+        id: StrKey(9),
+        from_entry: StrKey(1),
+        flags: f::LIMIT,
+        limit_1e6: 110 * E,
+        ..OrderIntent::default()
+    };
+    let tp = rest_tp(&mut b, &mut out, ex);
+    let close = OrderIntent {
+        kind: IntentKind::Close,
+        from_entry: StrKey(1),
+        ..OrderIntent::default()
+    };
+    b.apply_intents(&[close], NOW).unwrap();
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert_eq!(
+        out.len(),
+        1,
+        "only the take-back: the close is fully covered"
+    );
+    assert_eq!(
+        (out.as_slice()[0].verb, out.as_slice()[0].client_oid),
+        (EngineVerb::Cancel, tp.client_oid)
+    );
+    b.on_cancelled(tp.client_oid);
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert_eq!(
+        out.len(),
+        1,
+        "the TP is not re-submitted ahead of the close"
+    );
+    let c = out.as_slice()[0];
+    assert_eq!(
+        (c.verb, c.primitive, c.side, c.qty_1e6),
+        (EngineVerb::Submit, Primitive::ReduceOnlyIoc, 1, pos)
+    );
+    fill(&mut b, &c, 100 * E);
+    assert_eq!(b.view().position_size_1e6, 0);
+}
+
+#[test]
+fn a_close_all_cut_short_by_a_resting_reducer_lives_until_it_filled_what_it_wanted() {
+    // Review B2: the close-all is sent for |pos| − R; that send filling is not its end.
+    let mut b = broker(4);
+    let mut out = EngineIntentBuf::new();
+    let pos = long_at_100(&mut b, &mut out);
+    let ex = OrderIntent {
+        kind: IntentKind::Exit,
+        id: StrKey(9),
+        from_entry: StrKey(1),
+        flags: f::LIMIT | f::QTY_PCT,
+        limit_1e6: 110 * E,
+        qty_pct_1e6: 40 * E,
+        ..OrderIntent::default()
+    };
+    let tp = rest_tp(&mut b, &mut out, ex);
+    assert!(tp.qty_1e6 > 0 && tp.qty_1e6 < pos);
+    let all = OrderIntent {
+        kind: IntentKind::CloseAll,
+        ..OrderIntent::default()
+    };
+    b.apply_intents(&[all], NOW).unwrap();
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    // Cancel first, then the uncovered part.
+    assert_eq!(out.len(), 2);
+    assert_eq!(out.as_slice()[0].verb, EngineVerb::Cancel);
+    let c1 = out.as_slice()[1];
+    assert_eq!(
+        (c1.verb, c1.primitive, c1.qty_1e6),
+        (
+            EngineVerb::Submit,
+            Primitive::ReduceOnlyIoc,
+            pos - tp.qty_1e6
+        )
+    );
+    fill(&mut b, &c1, 100 * E);
+    assert_eq!(b.view().position_size_1e6, tp.qty_1e6);
+    b.on_cancelled(tp.client_oid);
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert_eq!(
+        out.len(),
+        1,
+        "the close-all is still alive for the covered part"
+    );
+    let c2 = out.as_slice()[0];
+    assert_eq!(
+        (c2.primitive, c2.side, c2.qty_1e6),
+        (Primitive::ReduceOnlyIoc, 1, tp.qty_1e6)
+    );
+    fill(&mut b, &c2, 100 * E);
+    assert_eq!(b.view().position_size_1e6, 0);
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert!(out.is_empty(), "flat: the close-all lapsed");
+}
+
+#[test]
+fn a_reversal_short_of_its_target_sends_the_remainder_after_the_reducers_dispositions() {
+    // Review B2 (§4.12.4 rule 3): q_open + (|pos| − R) first; the TP is taken back and never
+    // fills, so the position lands short and the rest follows — never past the target.
+    let mut b = broker(4);
+    let mut out = EngineIntentBuf::new();
+    let pos = long_at_100(&mut b, &mut out);
+    let ex = OrderIntent {
+        kind: IntentKind::Exit,
+        id: StrKey(9),
+        from_entry: StrKey(1),
+        flags: f::LIMIT | f::QTY_PCT,
+        limit_1e6: 110 * E,
+        qty_pct_1e6: 40 * E,
+        ..OrderIntent::default()
+    };
+    let tp = rest_tp(&mut b, &mut out, ex);
+    let r = tp.qty_1e6;
+    let short = OrderIntent {
+        kind: IntentKind::Entry,
+        id: StrKey(2),
+        side: pine_ir::IntentSide::Short,
+        ..OrderIntent::default()
+    };
+    b.apply_intents(&[short], NOW).unwrap();
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert_eq!(out.len(), 2);
+    assert_eq!(out.as_slice()[0].verb, EngineVerb::Cancel);
+    let s1 = out.as_slice()[1];
+    // q_open (the unit quantity, = pos here) + |pos| − R.
+    assert_eq!((s1.side, s1.flags, s1.qty_1e6), (1, 0, pos + pos - r));
+    fill(&mut b, &s1, 100 * E);
+    assert_eq!(b.view().position_size_1e6, -(pos - r));
+    // While the TP's cancel is unconfirmed, its quantity still covers the rest: nothing sent.
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert!(out.is_empty());
+    b.on_cancelled(tp.client_oid);
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert_eq!(out.len(), 1);
+    let s2 = out.as_slice()[0];
+    assert_eq!((s2.side, s2.qty_1e6), (1, r));
+    fill(&mut b, &s2, 100 * E);
+    assert_eq!(b.view().position_size_1e6, -pos, "on target");
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert!(out.is_empty(), "done at its target");
+}
+
+#[test]
+fn a_reversal_whose_reducer_fills_lands_on_target_and_sends_nothing_more() {
+    // Review B2 (§4.12.4 rule 3): the TP fills after the reversal (a late reducer fill crossing
+    // zero) — the position is on target and the record is done.
+    let mut b = broker(4);
+    let mut out = EngineIntentBuf::new();
+    let pos = long_at_100(&mut b, &mut out);
+    let ex = OrderIntent {
+        kind: IntentKind::Exit,
+        id: StrKey(9),
+        from_entry: StrKey(1),
+        flags: f::LIMIT | f::QTY_PCT,
+        limit_1e6: 110 * E,
+        qty_pct_1e6: 40 * E,
+        ..OrderIntent::default()
+    };
+    let tp = rest_tp(&mut b, &mut out, ex);
+    let short = OrderIntent {
+        kind: IntentKind::Entry,
+        id: StrKey(2),
+        side: pine_ir::IntentSide::Short,
+        ..OrderIntent::default()
+    };
+    b.apply_intents(&[short], NOW).unwrap();
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    let s1 = out.as_slice()[1];
+    fill(&mut b, &s1, 100 * E);
+    // The TP fills before its cancel lands, then the cancel confirms.
+    b.on_fill(tp.client_oid, -tp.qty_1e6, 110 * E, 0, 1, 0)
+        .unwrap();
+    b.on_cancelled(tp.client_oid);
+    assert_eq!(b.view().position_size_1e6, -pos);
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert!(out.is_empty(), "on target: nothing past it");
+}
+
+#[test]
+fn a_replacement_acked_after_its_owner_moved_links_the_right_record() {
+    // Review B3: between a Modify and its ack, an earlier record dies and is swap-removed, so the
+    // requoted record moves index; the ack must link the replacement to it, not to whatever sits
+    // at its old index.
+    let mut b = broker(6);
+    let mut out = EngineIntentBuf::new();
+    let seq = |mut it: OrderIntent, n: u32| {
+        it.seq = n;
+        it
+    };
+    let three = [
+        seq(limit_entry(1, 95 * E), 0),
+        seq(limit_entry(2, 94 * E), 1),
+        seq(limit_entry(3, 93 * E), 2),
+    ];
+    b.apply_intents(&three, NOW).unwrap();
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert_eq!(out.len(), 3);
+    let m: Vec<_> = out.as_slice().to_vec();
+    let mut k = 0;
+    while k < 3 {
+        b.on_ack(m[k].client_oid);
+        k += 1;
+    }
+    // Requote id 3 (index 2): a Modify, its replacement awaiting the ack.
+    b.apply_intents(&[limit_entry(3, 92 * E)], NOW).unwrap();
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert_eq!(out.len(), 1);
+    let md = out.as_slice()[0];
+    assert_eq!(
+        (md.verb, md.prev_client_oid),
+        (EngineVerb::Modify, m[2].client_oid)
+    );
+    // Id 1 (index 0) is cancelled by the script: the swap-remove moves id 3 to index 0.
+    let cancel1 = OrderIntent {
+        kind: IntentKind::Cancel,
+        id: StrKey(1),
+        ..OrderIntent::default()
+    };
+    b.apply_intents(&[cancel1], NOW).unwrap();
+    // The replacement's ack arrives now.
+    b.on_ack(md.client_oid);
+    b.on_cancelled(m[2].client_oid);
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    // Id 1's maker is taken back; ids 2 and 3 keep theirs untouched (no Cancel, no re-Submit).
+    assert_eq!(out.len(), 1);
+    let c = out.as_slice()[0];
+    assert_eq!(
+        (c.verb, c.client_oid),
+        (EngineVerb::Cancel, m[0].client_oid)
+    );
+    b.on_cancelled(m[0].client_oid);
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert!(
+        out.is_empty(),
+        "every surviving record is linked to its own maker"
+    );
+    // A fill of the replacement books id 3's entry.
+    b.on_fill(md.client_oid, md.qty_1e6, 92 * E, 0, 1, 0)
+        .unwrap();
+    assert_eq!(b.open_trade(0).map(|t| t.entry_id), Some(StrKey(3)));
+}
