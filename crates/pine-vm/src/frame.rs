@@ -296,6 +296,19 @@ fn state_defect() -> ! {
     panic!("pine-vm: builtin state request outside its verified block (our defect)")
 }
 
+/// The (pointer, length) of a resolved string: the raw form an A7 lend combines with a `&mut`.
+#[inline(always)]
+fn span_of(b: &[u8]) -> (*const u8, usize) {
+    (b.as_ptr(), b.len())
+}
+
+/// True when the byte ranges `[a, a + an)` and `[b, b + bn)` share no byte (A7's debug proof).
+#[inline(always)]
+fn spans_disjoint(a: *const u8, an: usize, b: *const u8, bn: usize) -> bool {
+    let (a, b) = (a as usize, b as usize);
+    an == 0 || bn == 0 || a + an <= b || b + bn <= a
+}
+
 /// One piece of a string being built in the scratch arena.
 #[derive(Debug, Clone, Copy)]
 pub enum StrPiece<'a> {
@@ -665,6 +678,93 @@ impl<'a> Frame<'a> {
                 &[]
             }
         }
+    }
+
+    // ---- A7: one lend of a mutable region together with string arguments ----------------
+    /// The calling site's block, journaled as a whole on first touch in a tick exactly as
+    /// [`Frame::state`], together with the bytes of string argument `e` exactly as
+    /// [`Frame::str_arg`] resolves them (any region; `None` = na; a stale ref latches the defect
+    /// flag). The block lies in the pool region and the string in CONST, SCRATCH or PERSIST —
+    /// disjoint frame regions (rule 1) — so a body can compile from the string straight into
+    /// the block (contract A7.1). Same release check and defect as `state`.
+    pub fn state_and_str<T: StateBlock>(&mut self, site: SiteId, e: u16) -> (&mut T, Option<&[u8]>) {
+        const { assert!(core::mem::align_of::<T>() <= 8) };
+        let src = self.str_arg(e).map(span_of);
+        let c = &mut *self.core;
+        if (site.0 != c.cur_site) | (c.cur_flags & bf::STATEFUL == 0) | (core::mem::size_of::<T>() > c.cur_bytes as usize) {
+            state_defect();
+        }
+        if c.jrnl_on {
+            c.touch_block(c.cur_off, c.cur_bytes);
+        }
+        // SAFETY: rule 23 as `state` — [cur_off, cur_off + cur_bytes) is this call's verified
+        // Builtin block, size_of::<T>() <= cur_bytes checked above, 8-aligned (rule 6).
+        let blk = unsafe { c.base.add(c.cur_off as usize) };
+        let bytes = match src {
+            Some((p, n)) => {
+                debug_assert!(
+                    spans_disjoint(p, n, blk, c.cur_bytes as usize),
+                    "state_and_str: string overlaps the state block"
+                );
+                // SAFETY: (p, n) is the slice str_arg resolved (the program's CONST blob, or
+                // bounds-checked SCRATCH / PERSIST bytes); rule 1 places those regions apart from
+                // the pool block lent below, so the shared and the unique borrow never overlap.
+                Some(unsafe { core::slice::from_raw_parts(p, n) })
+            }
+            None => None,
+        };
+        // SAFETY: as above (the release check precedes it); disjoint from `bytes` (rule 1).
+        (unsafe { &mut *(blk as *mut T) }, bytes)
+    }
+
+    /// A fresh scratch range of `len` bytes (contents unspecified until written; the cursor
+    /// moves exactly as [`Frame::str_alloc`]) lent together with the bytes of the `N` string
+    /// arguments `srcs`, each resolved as [`Frame::str_arg`] (`None` = na). The range starts at
+    /// the arena cursor, past every byte a live SCRATCH ref may name, and CONST / PERSIST are
+    /// other regions, so the body writes its output straight into it while reading the sources
+    /// (contract A7.2). `Err(StrArenaFull)` when `len` does not fit; the cursor is then unmoved.
+    /// The entry must be `STR_ALLOC`, as for `str_alloc`.
+    #[allow(clippy::type_complexity)]
+    pub fn str_alloc_with<const N: usize>(
+        &mut self,
+        len: u32,
+        srcs: [u16; N],
+    ) -> Result<(StrRef, &mut [u8], [Option<&[u8]>; N]), FaultKind> {
+        let mut sp: [Option<(*const u8, usize)>; N] = [None; N];
+        let mut k = 0usize;
+        while k < N {
+            sp[k] = self.str_arg(srcs[k]).map(span_of);
+            k += 1;
+        }
+        let c = &mut *self.core;
+        debug_assert!(c.cur_flags & bf::STR_ALLOC != 0, "str_alloc_with: entry not STR_ALLOC");
+        if len > c.scratch_bytes - c.scratch_cur {
+            return Err(FaultKind::StrArenaFull);
+        }
+        let at = c.scratch_cur;
+        c.scratch_cur += len;
+        let r = c.scratch_ref(at, len);
+        // SAFETY: [at, at + len) is inside the scratch region (checked above) and handed out once
+        // per evaluation, as `str_alloc`.
+        let dst = unsafe { c.base.add((c.scratch_off + at) as usize) };
+        let mut out: [Option<&[u8]>; N] = [None; N];
+        k = 0;
+        while k < N {
+            if let Some((p, n)) = sp[k] {
+                debug_assert!(
+                    spans_disjoint(p, n, dst, len as usize),
+                    "str_alloc_with: source {k} overlaps the fresh range"
+                );
+                // SAFETY: (p, n) is the slice str_arg resolved: CONST bytes, PERSIST bytes, or
+                // SCRATCH bytes that arena_off bounded below the old cursor `at` — every one
+                // disjoint from [at, at + len), the unique range lent below.
+                out[k] = Some(unsafe { core::slice::from_raw_parts(p, n) });
+            }
+            k += 1;
+        }
+        // SAFETY: [at, at + len) as above; disjoint from every source slice (proved above).
+        let s = unsafe { core::slice::from_raw_parts_mut(dst, len as usize) };
+        Ok((r, s, out))
     }
 
     // ---- outputs ---------------------------------------------------------------
