@@ -15050,6 +15050,57 @@ independent rebuild exact). **Plan:** vault doc 33. **Nothing here arms a slot.*
   `bin15_late_fires`, `bin15_late_law`) and the stores
   (`claude_worker.bin15_late`) landed with L3.
 
+## BIN15 H90 G3–G4 — the late law alone, and slot 3 LIVE at the $2 / $5 dust frame (rulings O-GL-1..5, 2026-10-16)
+
+**Rulings:** vault doc 37 (O-GL-1..5). **Evidence:** docs 32 and 34 (OOS2:
+H1 not confirmed — C1/C2 pass, the H90 rule fails B2' and B6 on 5.8 days;
+under the engine's own persistence 2, 17 of 17 won). **The removed law:**
+doc 38, recoverable from `9cde761`.
+
+- **G3 — one trading law.** The member trades the H90 late entry only (the
+  section above). The coverage entry, Arm A, Arm B and the null arm are
+  removed from the code; their 13 artifact keys are refused by name. The
+  S-law pricer stays as the logged counterfactual and the ledger.
+  "Today's early coverage entry keeps running on paper as the control
+  (O-H90-2)" above is superseded: there is no control arm any more; the
+  control is the logged `late_ctl_*` counterfactual. `tau_min_take_ns`
+  no longer exists; `tail_refuse_ns` holds the S-law pricer only.
+- **G4 — the frame is the operator's, not a bar's.** O-GL-3: "arm live,
+  keep armed", on the live account in `.env` (≈ $5 USDC), with **no gate
+  wait**: H1's "not confirmed" (doc 34) does not block it, by ruling. It is
+  a FILL test on dust, not a confirmation of the edge.
+
+### BIN15 H90 G4 — slot 3 LIVE at the $2 / $5 frame (operator ruling O-GL-3, 2026-10-16)
+
+Armed by `scripts/bin15-flip.sh live --gateway` (slot 3 on its own
+WebSocket gateway arm, off the engine thread), at a safe minute.
+
+| layer | key | value | why |
+|---|---|--:|---|
+| member (`bin15.toml` live cut) | `late_usd_1e6` | $2 | one order fits the account twice |
+| member | `cap_instance_usd_1e6` | $2 | one entry per instance |
+| member | `cap_day_usd_1e6` | $5 | the ruling's day cap: ≈ the whole balance |
+| exec (`[exec.slot.3]`) | `max_order_usd_1e6` | $2 | = the member's order |
+| exec | `cap_instance_usd_1e6` | $2 | = the member's |
+| exec | `cap_day_usd_1e6` | $5 | = the member's |
+| exec | `max_open_orders` | 8 | IoC only; four 15 m families end on the same second |
+| exec | `halt_on_loss_usd_1e6` | $4 | halts with ≥ $1 (the venue's minimum) left |
+| exec | `halt_on_recon_drift_usd_1e6` | $1 | on a $5 account, $1 is a large drift |
+| exec | `halt_on_reject_streak` / `halt_on_asset_refusal_streak` | 5 / 3 | unchanged |
+| exec | `halt_on_ws_gap_ms` / `halt_on_recon_stale_ms` | 30 s / 300 s | unchanged |
+| exec | `halt_on_alo_reject_pct` | 20 | the gateway's window halt (XH-7) |
+
+- **Every other line of the live cut is the paper artifact's**, byte for
+  byte (the late law at its ruled values: [2, 30) s, p ≥ 0.90, 2 c,
+  persistence 2, k 1.55). The paper copy stays as `bin15.paper-s7.toml`,
+  which the nightly accrual replays at paper's $100 / $1 000 / $30 000.
+- **The agent's approval expires 2026-10-19 ~13:54Z.** After it, every live
+  order is refused, and the reject streak halts slot 3. Renewing it is the
+  operator's.
+- **Disarm:** `scripts/bin15-flip.sh paper` (halts slot 3 through
+  `exec.HALT`, checks the venue shows nothing of ours resting, restarts at a
+  safe minute), or `echo 3 >> ~/multivenue/exec.HALT` for an immediate halt.
+
 ## HK — the housekeeping lane (2026-10-13)
 
 Section A of the 2026-10-13 survey, one `HK:` commit per cut on `main`
