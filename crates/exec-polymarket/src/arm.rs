@@ -40,8 +40,12 @@
 //! drift, legs bought in the last [`DRIFT_SETTLE_NS`] aside — and values
 //! the account: pUSD + each unredeemed leg AT COST, a leg its roll settled
 //! as lost at 0 (an unsettled win is not a gain, a settled loss is a
-//! loss). A leg whose venue balance reads 0 after its settlement has been
-//! redeemed: it leaves the ledger (its pUSD is in the balance). The first
+//! loss). A leg its roll settled against leaves the ledger at once (worth
+//! 0, nothing to redeem; PM15-6d); a won leg — or one whose roll settled
+//! unknown — is asked redeemed (`CMD_REDEEM`, once, at the first read
+//! that shows the venue holding it), and when its venue balance reads 0
+//! it has been: it leaves the ledger (its pUSD is in the balance), and
+//! that read is not judged (its pUSD may predate the credit). The first
 //! read that agrees seeds the router (`reconciled`) and sets the session
 //! anchor (unless the boot restored one). The user channel's silence is
 //! `ws_gap_ns` (pm-user stamps every frame; its `PONG` every 5 s).
@@ -67,9 +71,9 @@ use clob_dispatcher::HaltSignal;
 use core_types::pm_roll::{PM_SETTLED_DOWN, PM_SETTLED_UP};
 
 use crate::cmd::{
-    PmCmd, PmEvt, CMD_RECON, CMD_SUBMIT, CMD_WATCH, EVT_ACK, EVT_BALANCE, EVT_DONE, EVT_FILL,
-    EVT_GAP, EVT_IN_DOUBT, EVT_POSITION, EVT_READ_DONE, EVT_REFUSED, EVT_SENT, PM_CMD_RING,
-    PM_EVT_RING, PM_USER_RING,
+    PmCmd, PmEvt, CMD_RECON, CMD_REDEEM, CMD_SUBMIT, CMD_WATCH, EVT_ACK, EVT_BALANCE, EVT_DONE,
+    EVT_FILL, EVT_GAP, EVT_IN_DOUBT, EVT_POSITION, EVT_READ_DONE, EVT_REFUSED, EVT_SENT,
+    PM_CMD_RING, PM_EVT_RING, PM_USER_RING,
 };
 use crate::gw::WATCH_STOP;
 use crate::user::PUB_USER_RX_NS;
@@ -113,6 +117,8 @@ struct Leg {
     instance: u32,
     leg: u8,
     state: u8,
+    /// Its redemption was asked of pm-gw.
+    asked: bool,
 }
 
 const EMPTY_LEG: Leg = Leg {
@@ -123,6 +129,7 @@ const EMPTY_LEG: Leg = Leg {
     instance: 0,
     leg: 0,
     state: L_FREE,
+    asked: false,
 };
 
 const R_FREE: u8 = 0;
@@ -192,6 +199,10 @@ pub struct ArmCounters {
     pub reads_disagreed: u64,
     /// Legs the venue redeemed (left the ledger).
     pub legs_redeemed: u64,
+    /// Legs their roll settled against (left the ledger at 0).
+    pub legs_lost: u64,
+    /// Redemptions asked of pm-gw.
+    pub redeem_asks: u64,
     /// Legs the ledger could not take (halts).
     pub ledger_full: u64,
 }
@@ -737,6 +748,7 @@ impl PmArm {
             instance,
             leg,
             state: L_OPEN,
+            asked: false,
         };
         let mut c = PmCmd::new(CMD_WATCH, 0);
         c.instance = instance;
@@ -781,13 +793,12 @@ impl PmArm {
             if l.venue_1e6 < 0 {
                 complete = false;
             } else if l.state != L_OPEN && l.venue_1e6 == 0 {
-                // Settled and gone from the account: redeemed.
+                // Settled and gone from the account: redeemed. This read's
+                // pUSD may predate the credit — not judged.
                 self.counters.legs_redeemed += 1;
                 self.legs[k - 1] = EMPTY_LEG;
-                let mut c = PmCmd::new(CMD_WATCH, 0);
-                c.instance = l.instance;
-                c.leg = l.leg | WATCH_STOP;
-                let _ = self.end.cmd.push(&c);
+                complete = false;
+                self.unwatch(l.instance, l.leg);
                 continue;
             } else if now.saturating_sub(l.last_fill_ns) >= DRIFT_SETTLE_NS {
                 let d = (l.venue_1e6 - l.shares_1e6).abs();
@@ -796,6 +807,14 @@ impl PmArm {
                     drift = drift.max(
                         (i128::from(d) * i128::from(l.cost_1e6) / i128::from(l.shares_1e6)) as i64,
                     );
+                }
+            }
+            if l.state != L_OPEN && !l.asked && l.venue_1e6 > 0 {
+                let mut c = PmCmd::new(CMD_REDEEM, 0);
+                c.instance = l.instance;
+                if self.end.cmd.push(&c) {
+                    self.legs[k - 1].asked = true;
+                    self.counters.redeem_asks += 1;
                 }
             }
             if l.state != L_LOST {
@@ -823,16 +842,34 @@ impl PmArm {
         if !settled || pm_rolling_of(ev.sym).is_none() {
             return;
         }
+        let known = ev.v0 == PM_SETTLED_UP || ev.v0 == PM_SETTLED_DOWN;
         let mut k = 0usize;
         while k < LEDGER_LEGS {
-            let l = &mut self.legs[k];
-            if l.state == L_OPEN && l.instance == inst {
-                let won = (l.leg == 0 && ev.v0 == PM_SETTLED_UP)
-                    || (l.leg == 1 && ev.v0 == PM_SETTLED_DOWN);
-                l.state = if won { L_WON } else { L_LOST };
-            }
+            let l = self.legs[k];
             k += 1;
+            if l.state != L_OPEN || l.instance != inst {
+                continue;
+            }
+            let won =
+                (l.leg == 0 && ev.v0 == PM_SETTLED_UP) || (l.leg == 1 && ev.v0 == PM_SETTLED_DOWN);
+            if known && !won {
+                // Worth 0 and nothing to redeem: it leaves at once.
+                self.counters.legs_lost += 1;
+                self.legs[k - 1] = EMPTY_LEG;
+                self.unwatch(l.instance, l.leg);
+            } else {
+                self.legs[k - 1].state = if won { L_WON } else { L_LOST };
+            }
         }
+    }
+
+    /// pm-gw stops reading a leg that left the ledger (a lost push is
+    /// harmless: a position with no leg is ignored).
+    fn unwatch(&mut self, instance: u32, leg: u8) {
+        let mut c = PmCmd::new(CMD_WATCH, 0);
+        c.instance = instance;
+        c.leg = leg | WATCH_STOP;
+        let _ = self.end.cmd.push(&c);
     }
 
     /// Show the arm the roll's order law (`OutcomeMeta`): the tick its

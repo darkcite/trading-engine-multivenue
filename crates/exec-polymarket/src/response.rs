@@ -320,7 +320,7 @@ pub fn classify(m: &[u8]) -> Refusal {
 
 /// The bytes of the string value after `key` (`"key":`), unescaped
 /// spans only — `None` when absent or not a string.
-fn string_field<'a>(body: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+pub(crate) fn string_field<'a>(body: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     let p = skip_ws(body, find_field(body, key)?);
     if p >= body.len() || body[p] != b'"' {
         return None;

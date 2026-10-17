@@ -33,6 +33,12 @@
 //! waiting, and never in a window's last [`QUIET_TAIL_S`] seconds (the
 //! late law's): a read never delays an order by more than one request.
 //!
+//! **Redemption** (PM15-6d, [`crate::redeem`]): `CMD_REDEEM` names a
+//! settled leg's window; its condition joins the redeemer's queue, and the
+//! redeemer takes the idle path's last place — after the account read, on
+//! its own relayer client, one request per pass, never in the quiet tail.
+//! Without a redeemer (redemption by hand) the ask is counted.
+//!
 //! **Halts** (the kit's halt word, the first reason wins): an answer whose
 //! `orderID` is not the digest signed (D-5), a refusal that names the
 //! account or the protocol (`Version`, `Auth`, `Payload`, `Closed`), recon
@@ -54,11 +60,12 @@ use crate::account::PmAccount;
 use crate::amounts::{clears_floors, fak_buy};
 use crate::clob::PmClob;
 use crate::cmd::{
-    PmCmd, PmEvt, CMD_RECON, CMD_SUBMIT, CMD_WATCH, EVT_ACK, EVT_BALANCE, EVT_DONE, EVT_IN_DOUBT,
-    EVT_POSITION, EVT_READ_DONE, EVT_REFUSED, EVT_SENT, LOCAL_AMOUNTS, LOCAL_FLOOR, LOCAL_NO_TOKEN,
-    LOCAL_REQUEST, LOCAL_SIGN, PM_CMD_RING, PM_EVT_RING,
+    PmCmd, PmEvt, CMD_RECON, CMD_REDEEM, CMD_SUBMIT, CMD_WATCH, EVT_ACK, EVT_BALANCE, EVT_DONE,
+    EVT_IN_DOUBT, EVT_POSITION, EVT_READ_DONE, EVT_REFUSED, EVT_SENT, LOCAL_AMOUNTS, LOCAL_FLOOR,
+    LOCAL_NO_TOKEN, LOCAL_REQUEST, LOCAL_SIGN, PM_CMD_RING, PM_EVT_RING,
 };
-use crate::num::{put, put_u64};
+use crate::num::{hex32, put, put_u64};
+use crate::redeem::{RedeemCounters, Redeemer};
 use crate::render::{render_order_tail, render_ts, PREFIX_MAX, TAIL_MAX};
 use crate::response::{read_order_answer, Refusal, Verdict};
 use crate::sign::{sign_order, SIG_MAX};
@@ -135,6 +142,10 @@ pub struct GwCounters {
     pub account_failures: u64,
     /// Account reads completed.
     pub account_reads: u64,
+    /// Redemption asks with no redeemer (redemption by hand).
+    pub redeem_off: u64,
+    /// Redemption asks whose window has left the token table.
+    pub redeem_no_row: u64,
 }
 
 /// pm-gw's core (module docs).
@@ -159,6 +170,8 @@ pub struct PmGateway<W: PmClob> {
     /// the watched tokens; `usize::MAX` = idle).
     account_next_ns: u64,
     account_step: usize,
+    /// The redeemer and its relayer client (`None`: by hand).
+    redeem: Option<(Redeemer, W)>,
 }
 
 impl<W: PmClob> PmGateway<W> {
@@ -198,6 +211,22 @@ impl<W: PmClob> PmGateway<W> {
             watch_n: 0,
             account_next_ns: 0,
             account_step: usize::MAX,
+            redeem: None,
+        }
+    }
+
+    /// Redeem through `r` on the relayer client `rly` (PM15-6d) —
+    /// **boot-only**.
+    pub fn set_redeemer(&mut self, r: Redeemer, rly: W) {
+        self.redeem = Some((r, rly));
+    }
+
+    /// The redeemer's tallies (zero without one).
+    #[must_use]
+    pub fn redeem_counters(&self) -> RedeemCounters {
+        match &self.redeem {
+            Some((r, _)) => r.counters(),
+            None => RedeemCounters::default(),
         }
     }
 
@@ -258,6 +287,7 @@ impl<W: PmClob> PmGateway<W> {
                     }
                     CMD_RECON => self.queue_recon(cmd),
                     CMD_WATCH => self.set_watch(cmd.instance, cmd.leg),
+                    CMD_REDEEM => self.ask_redeem(cmd.instance, now_ns),
                     _ => {}
                 }
             }
@@ -278,9 +308,32 @@ impl<W: PmClob> PmGateway<W> {
             if self.account_step != usize::MAX && !quiet {
                 self.account_one(wall_ns);
                 did = true;
+            } else if !quiet {
+                if let Some((r, rly)) = &mut self.redeem {
+                    if r.due(now_ns) {
+                        r.step(rly, &self.acct, now_ns, wall_ns / 1_000_000_000);
+                        did = true;
+                    }
+                }
             }
         }
         did
+    }
+
+    /// Queue the condition of `instance`'s window for redemption.
+    fn ask_redeem(&mut self, instance: u32, now_ns: u64) {
+        let Some((r, _)) = &mut self.redeem else {
+            self.counters.redeem_off += 1;
+            return;
+        };
+        let cond = match self.tokens.find(instance) {
+            Some(row) => hex32(&row.condition_id[..row.condition_len]),
+            None => None,
+        };
+        match cond {
+            Some(c) => r.ask(&c, now_ns),
+            None => self.counters.redeem_no_row += 1,
+        }
     }
 
     fn set_watch(&mut self, instance: u32, leg: u8) {

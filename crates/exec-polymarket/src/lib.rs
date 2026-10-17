@@ -35,6 +35,7 @@
 //! | [`arm`] | engine | `OrderDispatch`: admission (D-9), the in-flight table, fills once, retirements after them; the ledger, the account's worth and the halt signal (6c) |
 //! | [`run`] | pm-gw, pm-user | the threads' loops (6c) |
 //! | [`venue`] | boot | the venue gate: version 2, the account open, pUSD readable, the allowance (D-8, 6c) |
+//! | [`redeem`] | pm-gw | redemption through the relayer: a Deposit Wallet batch per ripe markets, polled to the chain (D-10, 6d) |
 //!
 //! ## The laws
 //!
@@ -64,6 +65,7 @@ pub mod cmd;
 pub mod gw;
 pub mod l2;
 pub mod num;
+pub mod redeem;
 pub mod render;
 pub mod response;
 pub mod run;
@@ -73,6 +75,9 @@ pub mod tokens;
 pub mod user;
 pub mod userws;
 pub mod venue;
+
+#[cfg(test)]
+mod rig;
 
 /// The CLOB REST host (V2 since the 2026-04-28 cutover; there is no
 /// testnet the arm uses — the venue gate is the self-test plus a FAK

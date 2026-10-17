@@ -16955,7 +16955,7 @@ and 39 (the P0 pre-registration, sha256 `d06d0038…488e`, registered
 06:01Z). **Commits (main, not pushed — R-PM-5):** `3feceac` PM15-2/3,
 `5849b4e` PM15-4, `1c8b014` PM15-5, `babf584` PM15-6a, `03a3191` PM15-8a,
 `a9987fa` PM15-5b, `a391129` PM15-5c, `cc6900b` PM15-6b, `ef8b22c` PM15-5d,
-PM15-6c (this entry's last section).
+`860ab76` PM15-6c, PM15-6d (this entry's last section).
 **Deployed PAPER 2026-10-17 09:22Z (`03a3191`); `a9987fa` (PM15-5b) since 09:49Z; `ef8b22c` (PM15-5d) since 11:41Z.**
 
 | id | ruling (operator, 2026-10-17) |
@@ -17162,10 +17162,46 @@ Alloc gate 130: the arm's submit and drain and the gateway's submit at
 - **Paper unchanged:** with slot 9 paper nothing above is built (no tee,
   no thread, no socket).
 
+### PM15-6d — redemption through the relayer (R-PM-6, plan D-10)
+
+- **Which legs:** a won leg, or one whose roll settled unknown, is asked
+  redeemed once (`CMD_REDEEM`) at the first account read that shows the
+  venue holding it. A leg its roll settled against leaves the arm's ledger
+  at settlement (worth 0, never redeemed; its tokens stay in the wallet,
+  unwatched).
+- **Where:** on pm-gw, after the account read in its idle path, one
+  request per pass, never in a window's last 30 s (the late law orders
+  only there), on its own keep-alive client to
+  `relayer-v2.polymarket.com`. No fourth thread: pm-gw holds the token
+  table the condition ids come from.
+- **The batch:** a market ripens 3 min after its ask; up to 8 ripe markets
+  go in one Deposit Wallet `Batch` the owner signs (deadline + 240 s):
+  the wallet's nonce (`GET /v1/account/transactions/params`), `POST
+  /submit`, then `GET /v1/account/transactions/<id>` every 2 s. `MINED` /
+  `CONFIRMED` redeem the batch; `FAILED` / `INVALID`, a refused submit or
+  90 polls without a terminal state cost each market a try, and a market
+  is dropped after three (redeem it by hand). The quota answer (429) costs
+  no try; a failed request waits 5 min. The boot's first batch begins with
+  `CTF.setApprovalForAll(CtfCollateralAdapter, true)`; each market is
+  `CtfCollateralAdapter.redeemPositions(pUSD, 0, condition, [1, 2])`.
+- **The ledger:** a redeemed leg leaves when its venue balance reads 0;
+  that read is not judged (its pUSD may predate the credit) — the next
+  one is.
+- **Never a halt:** an unredeemed leg is worth its cost in the arm's
+  ledger (conservative); no order depends on the redemption.
+- **The boot:** signature type 3 with `PM15_RELAYER_API_KEY`, proved by
+  reading the wallet's relayer nonce; `PM15_REDEEM=hand` boots without a
+  redeemer (asks counted, `redeem_off`); any other signature type refuses
+  unless redemption is by hand. `pm-exec --key-check` reads the nonce too.
+- **Pinned:** spec J.4's batch (the approval and one market; digest
+  `fdd9b2c8…34b3`, signature `5dc1610b…711c`) and a second batch (two
+  markets, nonce 31), both re-derived by an independent EIP-712 library
+  (eth-account 0.14); J.4 runs in the boot self-test. Alloc gate 131: a
+  full batch cycle at 0 B.
+
 ### Open
 
-- `/state`'s pm15 section and the dashboard's slot-9 panel; the arm's and
-  pm-gw's counters on `/metrics`.
-- PM15-6d: the relayer redemption (D-10, a `WALLET` batch on a cold
-  thread), the flip script with its "FAK priced to miss" probe.
+- `/state`'s pm15 section and the dashboard's slot-9 panel; the arm's,
+  pm-gw's and the redeemer's counters on `/metrics`.
+- PM15-6e: the flip script with its "FAK priced to miss" probe.
 - PM15-7 (PolyBolt, dormant).

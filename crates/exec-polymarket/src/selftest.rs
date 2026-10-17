@@ -11,10 +11,13 @@
 use crate::amounts::{fak_buy, Amounts};
 use crate::l2::L2Secret;
 use crate::num::put_hex;
+use crate::redeem::{approve_adapter_calldata, redeem_calldata};
 use crate::sign::{sign_order, SIG_MAX};
 use signer_eip712::pmv2::{
-    clob_auth_digest, clob_auth_separator, exchange_separator, sign, OrderV2, CHAIN_POLYGON,
-    EXCHANGE_V2, ORDER_V2_TYPE, ORDER_V2_TYPEHASH, SIDE_BUY, SIG_EOA, SIG_POLY_1271,
+    clob_auth_digest, clob_auth_separator, deposit_batch_digest, deposit_call_hash,
+    deposit_wallet_separator, exchange_separator, sign, OrderV2, CHAIN_POLYGON, CONDITIONAL_TOKENS,
+    CTF_COLLATERAL_ADAPTER, EXCHANGE_V2, ORDER_V2_TYPE, ORDER_V2_TYPEHASH, SIDE_BUY, SIG_EOA,
+    SIG_POLY_1271,
 };
 use signer_eip712::{address_from_private_key, keccak256, parse_secret_key};
 
@@ -132,6 +135,36 @@ pub fn run() -> Result<(), SelfTestFail> {
         })
     {
         return Err(SelfTestFail("SDK FAK amounts"));
+    }
+
+    // VER (spec J.4, PM15-6d): the Deposit Wallet's redemption batch —
+    // the adapter's approval, then one market's redemption.
+    let wallet = [
+        0xbc, 0x0f, 0xf0, 0x67, 0xb7, 0x74, 0x0e, 0xff, 0x76, 0xc1, 0xca, 0x93, 0xc8, 0x75, 0xba,
+        0x6b, 0x89, 0x0d, 0x6b, 0x50,
+    ];
+    let cond = [
+        0x53, 0xef, 0xa9, 0xa4, 0xa5, 0xbd, 0xdf, 0xd1, 0x2a, 0x4d, 0x15, 0x46, 0x53, 0xe3, 0x37,
+        0xce, 0xdf, 0x2e, 0xc6, 0x66, 0x78, 0x42, 0xdc, 0xa1, 0x65, 0x03, 0x6a, 0xc2, 0x1f, 0x67,
+        0x65, 0xb7,
+    ];
+    let calls = [
+        deposit_call_hash(&CONDITIONAL_TOKENS, 0, &approve_adapter_calldata()),
+        deposit_call_hash(&CTF_COLLATERAL_ADAPTER, 0, &redeem_calldata(&cond)),
+    ];
+    let d = deposit_batch_digest(
+        &deposit_wallet_separator(CHAIN_POLYGON, wallet),
+        &wallet,
+        0,
+        1_792_225_600,
+        &calls,
+    );
+    let b = sign(&sk, &d).map_err(|_| SelfTestFail("sign"))?;
+    if !same_hex(
+        &b,
+        "5dc1610bfc7e1f4f7a1e79c9015386e665fa4fd885128874c15d332088bc46657c801de630b0c8d5df73b325810b54096b6271de7b1333297e23158e8a87c7711c",
+    ) {
+        return Err(SelfTestFail("VER deposit-wallet redemption batch"));
     }
     Ok(())
 }

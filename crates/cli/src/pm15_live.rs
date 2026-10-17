@@ -19,6 +19,13 @@
 //! artifact (`pm15-pnl-anchor.state`) and restored by every later boot of
 //! the session; the flip starts a new session by setting the file aside.
 //!
+//! **Redemption** (PM15-6d, R-PM-6) runs on pm-gw through Polymarket's
+//! relayer for a Deposit Wallet (type 3) with `PM15_RELAYER_API_KEY`; the
+//! boot proves the key by reading the wallet's relayer nonce.
+//! `PM15_REDEEM=hand` boots without it (the operator redeems; the arm
+//! values a won leg at its cost until then); any other type refuses
+//! unless redemption is by hand.
+//!
 //! **The default stays paper.** Nothing here runs until the artifact
 //! marks slot 9 live and `--arm-live` names it (LAW E-1's two switches),
 //! and P0 (doc 39) or a ruling allows more than the dust test.
@@ -36,6 +43,9 @@ use exec_polymarket::account::PmAccount;
 use exec_polymarket::arm::{PmArm, PmArmCfg};
 use exec_polymarket::cmd::{PmCmd, PmEvt, PM_CMD_RING, PM_EVT_RING, PM_USER_RING};
 use exec_polymarket::gw::{PmGateway, BODY_MIN};
+use exec_polymarket::redeem::{
+    wallet_nonce, Redeemer, RelayerKey, RELAYER_BODY, RELAYER_HOST, RELAYER_RESP,
+};
 use exec_polymarket::run::{run_pm_gw, run_pm_user, PM_USER_TOKEN};
 use exec_polymarket::user::PmUserDriver;
 use exec_polymarket::venue::check_venue;
@@ -75,6 +85,10 @@ pub const ENV_API_KEY: &str = "PM15_API_KEY";
 pub const ENV_API_SECRET: &str = "PM15_API_SECRET";
 /// The CLOB API passphrase.
 pub const ENV_API_PASSPHRASE: &str = "PM15_API_PASSPHRASE";
+/// The relayer API key (polymarket.com → Settings → API Keys).
+pub const ENV_RELAYER_KEY: &str = "PM15_RELAYER_API_KEY";
+/// `hand`: redeem by hand (no relayer).
+pub const ENV_REDEEM: &str = "PM15_REDEEM";
 
 /// Where slot 9's session anchor lives: beside the exec artifact.
 #[must_use]
@@ -123,6 +137,64 @@ fn clob_client(tls: Arc<ClientConfig>) -> Result<HttpsReq, String> {
     .map_err(|e| format!("slot 9's CLOB client: {e:?}"))
 }
 
+/// The redemption the environment names: `Ok(None)` by hand
+/// (`PM15_REDEEM=hand`), else the relayer key (type 3 only).
+///
+/// # Errors
+/// A type the relayer redemption is not built for, or the key missing or
+/// malformed (never its value).
+fn redeem_key(acct: &PmAccount) -> Result<Option<RelayerKey>, String> {
+    if std::env::var(ENV_REDEEM).is_ok_and(|v| v.trim() == "hand") {
+        return Ok(None);
+    }
+    if acct.sig_type != signer_eip712::pmv2::SIG_POLY_1271 {
+        return Err(format!(
+            "signature type {}: the relayer redemption is built for the Deposit Wallet (type 3) \
+             alone — set {ENV_REDEEM}=hand to redeem by hand",
+            acct.sig_type
+        ));
+    }
+    let key = env(ENV_RELAYER_KEY)?;
+    RelayerKey::new(key.trim().as_bytes())
+        .map(Some)
+        .ok_or_else(|| format!("{ENV_RELAYER_KEY} is not a plain token of at most 96 bytes"))
+}
+
+/// The redeemer and its relayer client, the key proved by the wallet's
+/// relayer nonce (`None` by hand). Cold.
+///
+/// # Errors
+/// What [`redeem_key`] refuses, the client, or a key the relayer refuses.
+fn boot_redeemer(
+    acct: &PmAccount,
+    tls: Arc<ClientConfig>,
+) -> Result<Option<(Redeemer, HttpsReq, u64)>, String> {
+    let Some(key) = redeem_key(acct)? else {
+        return Ok(None);
+    };
+    let mut rly = HttpsReq::new(RELAYER_HOST, 443, tls, HEAD_CAP, RELAYER_BODY, RELAYER_RESP)
+        .map_err(|e| format!("slot 9's relayer client: {e:?}"))?;
+    let nonce = wallet_nonce(&mut rly, acct, &key).map_err(|http| {
+        format!(
+            "slot 9's relayer: the wallet's nonce read answered {http} — {ENV_RELAYER_KEY} must \
+             authenticate for the owner"
+        )
+    })?;
+    Ok(Some((
+        Redeemer::new(key, acct.maker, acct.chain_id),
+        rly,
+        nonce,
+    )))
+}
+
+/// The tell's redemption clause.
+fn redeem_text(r: Option<&(Redeemer, HttpsReq, u64)>) -> String {
+    match r {
+        Some((_, _, nonce)) => format!("redemption: the relayer (wallet nonce {nonce})"),
+        None => format!("redemption: BY HAND ({ENV_REDEEM}=hand)"),
+    }
+}
+
 /// An amount ×1e6 as `$d.dddddd`.
 fn usd(v: i64) -> String {
     format!("${}.{:06}", v / 1_000_000, v % 1_000_000)
@@ -165,19 +237,21 @@ pub fn self_test() -> Result<String, String> {
 pub fn key_check(tls: Arc<ClientConfig>) -> Result<String, String> {
     self_test()?;
     let acct = account_from_env()?;
-    let mut clob = clob_client(tls)?;
+    let mut clob = clob_client(Arc::clone(&tls))?;
     let wall_s = WallAnchor::now().wall_of(now_ns()) / 1_000_000_000;
     let facts =
         check_venue(&mut clob, &acct, wall_s, 0).map_err(|e| format!("the venue gate: {e}"))?;
+    let redeem = boot_redeemer(&acct, tls)?;
     // COPY: the two addresses' texts into the tell — a command's one line.
     Ok(format!(
         "pm-exec key-check: PASS — CLOB V2, the account open (signature type {}, owner {}, maker \
-         {}); pUSD {}, the exchange's allowance {}",
+         {}); pUSD {}, the exchange's allowance {}; {}",
         acct.sig_type,
         String::from_utf8_lossy(&acct.poly_address_text),
         String::from_utf8_lossy(&acct.maker_text),
         usd(facts.balance_1e6),
         allowance_text(facts.allowance_1e6),
+        redeem_text(redeem.as_ref()),
     ))
 }
 
@@ -312,6 +386,7 @@ pub fn boot_pm15_arm(
             facts.balance_1e6
         }
     };
+    let redeem = boot_redeemer(&acct, Arc::clone(&tls))?;
     let ws = WsConn::new(
         exec_polymarket::WS_HOST,
         443,
@@ -331,7 +406,7 @@ pub fn boot_pm15_arm(
         tell,
         "pm15: LIVE ARM ARMED — Polymarket CLOB V2, slot 9's FAK BUYs on its own account \
          (signature type {}, owner {}, maker {}): live families 0b{live_families:b}; pUSD {}, the \
-         exchange's allowance {}; session anchor {} ({}); session loss bound ${}",
+         exchange's allowance {}; session anchor {} ({}); session loss bound ${}; {}",
         acct.sig_type,
         String::from_utf8_lossy(&acct.poly_address_text),
         String::from_utf8_lossy(&acct.maker_text),
@@ -344,8 +419,12 @@ pub fn boot_pm15_arm(
             "set now"
         },
         s.halt_on_loss_usd_1e6 / 1_000_000,
+        redeem_text(redeem.as_ref()),
     );
     let mut gw = PmGateway::new(acct, clob, end, specs, now_ns());
+    if let Some((r, rly, _)) = redeem {
+        gw.set_redeemer(r, rly);
+    }
     let mut arm = PmArm::new(
         PmArmCfg {
             slot: PM15_SLOT as u8,

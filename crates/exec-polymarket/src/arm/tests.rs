@@ -13,6 +13,7 @@ use crate::userws::{TS_CONFIRMED, TS_FAILED, TS_MATCHED, TS_MINED};
 use core_ring::{Producer, Ring};
 use core_types::pm_roll::{
     pm_instance_id, pm_mark_sym, pm_pair_of_window, pm_rolling_sym, pm_window_of_open,
+    PM_SETTLED_UNKNOWN,
 };
 use exec_gateway::{duplex, GatewayEnd};
 
@@ -410,7 +411,7 @@ fn read(b: &mut Bench, balance: i64, legs: &[(u32, u8, i64)]) {
 }
 
 #[test]
-fn the_ledger_watches_values_at_cost_realises_a_settled_loss_and_drops_the_redeemed() {
+fn the_ledger_watches_values_at_cost_asks_a_won_leg_redeemed_and_drops_it_once_it_is() {
     let mut b = bench();
     let o = order(0, 0, 930_000, 100_000_000, 1);
     b.arm.submit(&o).unwrap();
@@ -447,27 +448,33 @@ fn the_ledger_watches_values_at_cost_realises_a_settled_loss_and_drops_the_redee
         (1, 1, 0, 0)
     );
     assert_eq!(b.arm.anchor_1e6(), Some(1_093_000_000));
-    // The roll settles Down: the Up leg is lost — worth $93 less.
-    let roll = ChannelEvent::new(
-        0,
-        VenueId::Polymarket,
-        ChannelId::InstrumentRoll,
-        sym(0, 0),
-        core_types::pack_roll_seq(inst(0), 60, pm_pair_of_window(window()), true),
-        0,
-        PM_SETTLED_DOWN,
-        0,
-    );
-    b.arm.on_venue_event(&roll);
+    // The roll settles Up: the Up leg is won — still worth its cost until
+    // it is redeemed, and the first read showing it asks the redemption,
+    // once.
+    b.arm.on_venue_event(&settle(0, PM_SETTLED_UP));
     read(&mut b, 1_000_000_000, &[(inst(0), 0, 100_000_000)]);
     b.arm.on_idle();
-    assert_eq!(b.arm.halt_signal().pnl_delta_usd_1e6, -93_000_000);
-    // Redeemed: the venue holds none — the leg leaves, its watch stops.
-    read(&mut b, 1_000_000_000, &[(inst(0), 0, 0)]);
+    assert_eq!(b.arm.halt_signal().pnl_delta_usd_1e6, 0);
+    let c = cmds(&mut b);
+    assert_eq!(
+        (c.len(), c[0].kind, c[0].instance),
+        (1, CMD_REDEEM, inst(0))
+    );
+    read(&mut b, 1_000_000_000, &[(inst(0), 0, 100_000_000)]);
+    b.arm.on_idle();
+    assert!(cmds(&mut b).is_empty(), "asked once");
+    assert_eq!(b.arm.counters().redeem_asks, 1);
+    // Redeemed: the venue holds none — the leg leaves, its watch stops,
+    // and that read is not judged; the next one is: $1 100 against $1 093.
+    read(&mut b, 1_100_000_000, &[(inst(0), 0, 0)]);
     b.arm.on_idle();
     assert_eq!(b.arm.counters().legs_redeemed, 1);
+    assert_eq!(b.arm.counters().reads_disagreed, 1);
     let c = cmds(&mut b);
     assert_eq!((c[0].kind, c[0].leg), (CMD_WATCH, crate::gw::WATCH_STOP));
+    read(&mut b, 1_100_000_000, &[]);
+    b.arm.on_idle();
+    assert_eq!(b.arm.halt_signal().pnl_delta_usd_1e6, 7_000_000);
     // A drift: a leg whose venue balance disagrees (the fill old enough).
     let o2 = order(0, 1, 900_000, 50_000_000, 2);
     b.arm.on_venue_event(&law(0, 1, 10_000));
@@ -493,5 +500,77 @@ fn the_ledger_watches_values_at_cost_realises_a_settled_loss_and_drops_the_redee
     gw(&mut b, e);
     gw(&mut b, PmEvt::about(EVT_READ_DONE, 0));
     b.arm.on_idle();
-    assert_eq!(b.arm.counters().reads_disagreed, 1);
+    assert_eq!(
+        b.arm.counters().reads_disagreed,
+        2,
+        "the redemption's and this"
+    );
+}
+
+/// A roll settling `v0` for family 0's window.
+fn settle(f: usize, v0: i64) -> ChannelEvent {
+    ChannelEvent::new(
+        0,
+        VenueId::Polymarket,
+        ChannelId::InstrumentRoll,
+        sym(f, 0),
+        core_types::pack_roll_seq(inst(f), 60, pm_pair_of_window(window()), true),
+        0,
+        v0,
+        0,
+    )
+}
+
+/// PM15-6d: a leg its roll settled against leaves the ledger at once —
+/// worth 0, nothing to redeem, its watch stopped; a roll settled unknown
+/// keeps its leg at 0 and asks the redemption (the adapter pays what the
+/// chain says).
+#[test]
+fn a_lost_leg_leaves_at_settlement_and_an_unknown_one_is_redeemed() {
+    let mut b = bench();
+    let o = order(0, 0, 930_000, 100_000_000, 1);
+    b.arm.submit(&o).unwrap();
+    let _ = cmds(&mut b);
+    gw(&mut b, sent(o.client_oid, [3; 32]));
+    assert!(b
+        .user
+        .try_push_ref(&PmEvt::fill([3; 32], 1, 930_000, 100_000_000, TS_MATCHED)));
+    let _ = fills(&mut b);
+    let _ = cmds(&mut b);
+    read(&mut b, 1_000_000_000, &[(inst(0), 0, 100_000_000)]);
+    b.arm.on_idle();
+    assert_eq!(b.arm.anchor_1e6(), Some(1_093_000_000));
+    b.arm.on_venue_event(&settle(0, PM_SETTLED_DOWN));
+    assert_eq!(b.arm.counters().legs_lost, 1);
+    let c = cmds(&mut b);
+    assert_eq!(
+        (c.len(), c[0].kind, c[0].instance, c[0].leg),
+        (1, CMD_WATCH, inst(0), crate::gw::WATCH_STOP)
+    );
+    read(&mut b, 1_000_000_000, &[(inst(0), 0, 100_000_000)]);
+    b.arm.on_idle();
+    assert_eq!(b.arm.halt_signal().pnl_delta_usd_1e6, -93_000_000);
+    assert!(cmds(&mut b).is_empty(), "a loser is never redeemed");
+
+    // Family 1, settled unknown: at 0, and asked redeemed.
+    let o = order(1, 0, 900_000, 10_000_000, 2);
+    b.arm.on_venue_event(&law(1, 0, 10_000));
+    b.arm.submit(&o).unwrap();
+    let _ = cmds(&mut b);
+    gw(&mut b, sent(o.client_oid, [5; 32]));
+    assert!(b
+        .user
+        .try_push_ref(&PmEvt::fill([5; 32], 2, 900_000, 10_000_000, TS_MATCHED)));
+    let _ = fills(&mut b);
+    let _ = cmds(&mut b);
+    b.arm.on_venue_event(&settle(1, PM_SETTLED_UNKNOWN));
+    assert_eq!(b.arm.counters().legs_lost, 1);
+    read(&mut b, 991_000_000, &[(inst(1), 0, 10_000_000)]);
+    b.arm.on_idle();
+    let c = cmds(&mut b);
+    assert_eq!(
+        (c.len(), c[0].kind, c[0].instance),
+        (1, CMD_REDEEM, inst(1))
+    );
+    assert_eq!(b.arm.halt_signal().pnl_delta_usd_1e6, -102_000_000);
 }

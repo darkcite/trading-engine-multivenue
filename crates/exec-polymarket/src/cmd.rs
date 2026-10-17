@@ -30,6 +30,9 @@ pub const CMD_RECON: u8 = 2;
 /// `PmCmd.kind` (PM15-6c): watch a token the arm holds — pm-gw reads its
 /// CONDITIONAL balance at every account read (`instance`, `leg`).
 pub const CMD_WATCH: u8 = 3;
+/// `PmCmd.kind` (PM15-6d): redeem the market of a settled leg the account
+/// still holds (`instance`) — pm-gw queues its condition for the relayer.
+pub const CMD_REDEEM: u8 = 4;
 
 /// One command (engine → pm-gw).
 #[repr(C, align(64))]

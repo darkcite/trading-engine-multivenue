@@ -20748,6 +20748,114 @@ fn pm15_exec_arm_and_gateway_are_zero_alloc() {
         i += 1;
     }
     let (allocs, nbytes, _) = g.delta();
-    assert_eq!((fills, retired), (N, N), "gate 130: each trade booked once, each order retired");
-    assert_eq!(allocs, 0, "gate 130: the arm allocated {allocs} times ({nbytes} B)");
+    assert_eq!(
+        (fills, retired),
+        (N, N),
+        "gate 130: each trade booked once, each order retired"
+    );
+    assert_eq!(
+        allocs, 0,
+        "gate 130: the arm allocated {allocs} times ({nbytes} B)"
+    );
+}
+
+/// Gate 131 (PM15-6d): the relayer redemption — the wallet's nonce read,
+/// the batch (the boot's approval, then eight markets) hashed, signed and
+/// rendered in the client's window, the submit, the poll to its
+/// confirmation — at 0 B per batch.
+#[test]
+fn pm15_relayer_redemption_is_zero_alloc() {
+    use exec_polymarket::account::PmAccount;
+    use exec_polymarket::clob::PmClob;
+    use exec_polymarket::redeem::{
+        Redeemer, RelayerKey, POLL_GAP_NS, REDEEM_AFTER_NS, REDEEM_BATCH, RELAYER_BODY,
+    };
+
+    struct FixedRelayer {
+        body: Box<[u8; RELAYER_BODY]>,
+        resp: &'static [u8],
+        submits: u64,
+    }
+    impl PmClob for FixedRelayer {
+        fn body_mut(&mut self) -> &mut [u8] {
+            &mut self.body[..]
+        }
+        fn request(
+            &mut self,
+            m: core_net::Method,
+            t: &[u8],
+            _extra: &[core_net::Header<'_>],
+            body_len: usize,
+        ) -> Result<(u16, core::ops::Range<usize>), core_net::PostErr> {
+            self.resp = if t.starts_with(b"/v1/account/transactions/params") {
+                br#"{"address":"0x","nonce":"31"}"#
+            } else if m == core_net::Method::Post {
+                self.submits += u64::from(body_len > 4_000);
+                br#"{"transactionID":"0190b317-a1d3-7bec-9b91-eeb6dcd3a620","state":"STATE_NEW"}"#
+            } else {
+                br#"{"transaction_id":"x","state":"STATE_CONFIRMED"}"#
+            };
+            Ok((200, 0..self.resp.len()))
+        }
+        fn resp(&self) -> &[u8] {
+            self.resp
+        }
+    }
+
+    const N: u64 = 16;
+    let key = [0x42u8; 32];
+    let me = signer_eip712::address_from_private_key(&key).unwrap();
+    let acct = PmAccount::new(
+        3,
+        me,
+        Some([0x11; 20]),
+        b"00000000-0000-0000-0000-000000000000",
+        b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        b"pass",
+        signer_eip712::parse_secret_key(&key).unwrap(),
+    )
+    .unwrap();
+    let mut rly = FixedRelayer {
+        body: exec_gateway::boxed_array(0),
+        resp: b"",
+        submits: 0,
+    };
+    let mut r = Redeemer::new(RelayerKey::new(b"relayer-key").unwrap(), [0x11; 20], 137);
+    let mut now = 0u64;
+    let mut g = None;
+    let mut c = 0u64;
+    while c <= N {
+        if c == 1 {
+            // The warm-up batch (the approval; the secp256k1 context) is boot.
+            g = Some(AllocGuard::new());
+        }
+        let mut k = 0usize;
+        while k < REDEEM_BATCH {
+            let mut cond = [0u8; 32];
+            cond[0] = c as u8;
+            cond[1] = k as u8;
+            r.ask(&cond, now);
+            k += 1;
+        }
+        now += REDEEM_AFTER_NS;
+        while r.waiting() > 0 {
+            if r.due(now) {
+                r.step(&mut rly, &acct, now, 1_792_225_360);
+            } else {
+                now += POLL_GAP_NS;
+            }
+        }
+        c += 1;
+    }
+    let (allocs, nbytes, _) = g.unwrap().delta();
+    let k = r.counters();
+    assert_eq!(
+        (k.batches_done, k.redeemed),
+        (N + 1, (N + 1) * REDEEM_BATCH as u64)
+    );
+    assert_eq!(rly.submits, N + 1, "gate 131: every batch is a full one");
+    assert_eq!(
+        allocs, 0,
+        "gate 131: the redeemer allocated {allocs} times ({nbytes} B)"
+    );
 }

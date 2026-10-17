@@ -387,6 +387,70 @@ pub fn eip55(addr: &[u8; 20]) -> [u8; 42] {
     out
 }
 
+/// The Deposit Wallet's `Batch` type string, its `Call` appended
+/// (EIP-712 `encodeType`): what the wallet's owner signs to have the
+/// relayer execute calls from the wallet (spec H.2, PM15-6d).
+pub const DEPOSIT_BATCH_TYPE: &str = "Batch(address wallet,uint256 nonce,uint256 deadline,Call[] calls)Call(address target,uint256 value,bytes data)";
+
+/// The batch's `Call` type string.
+pub const DEPOSIT_CALL_TYPE: &str = "Call(address target,uint256 value,bytes data)";
+
+/// `keccak256(`[`DEPOSIT_BATCH_TYPE`]`)` (pinned by the tests).
+pub const DEPOSIT_BATCH_TYPEHASH: [u8; 32] = [
+    0x71, 0x2e, 0xf6, 0x6e, 0x83, 0x62, 0xc3, 0x87, 0xe8, 0x62, 0xca, 0xbf, 0x09, 0x23, 0xc2, 0x09,
+    0xdb, 0x0f, 0xa2, 0x4c, 0xfc, 0x97, 0xd2, 0x5e, 0xcc, 0xba, 0x7c, 0x86, 0xf3, 0xee, 0x1d, 0xd3,
+];
+
+/// `keccak256(`[`DEPOSIT_CALL_TYPE`]`)` (pinned by the tests).
+pub const DEPOSIT_CALL_TYPEHASH: [u8; 32] = [
+    0x84, 0xfa, 0x2c, 0xf0, 0x5c, 0xd8, 0x8e, 0x99, 0x2e, 0xae, 0x77, 0xe8, 0x51, 0xaf, 0x68, 0xa4,
+    0xee, 0x27, 0x8d, 0xcf, 0xf6, 0xef, 0x50, 0x4e, 0x48, 0x7a, 0x55, 0xb3, 0xba, 0xad, 0xfb, 0xe5,
+];
+
+/// The Deposit Wallet's own domain separator — `"DepositWallet"`, `"1"`,
+/// `chain_id`, the wallet (boot-time, once per wallet).
+#[must_use]
+pub fn deposit_wallet_separator(chain_id: u64, wallet: [u8; 20]) -> [u8; 32] {
+    crate::domain_separator_of(&Eip712Domain::new(b"DepositWallet", b"1", chain_id, wallet))
+}
+
+/// `hashStruct(Call)`: a call of `value` wei to `target` with calldata
+/// `data`.
+#[inline]
+#[must_use]
+pub fn deposit_call_hash(target: &[u8; 20], value: u64, data: &[u8]) -> [u8; 32] {
+    keccak256_parts(&[
+        &DEPOSIT_CALL_TYPEHASH,
+        &enc_address(target),
+        &enc_u64(value),
+        &keccak256(data),
+    ])
+}
+
+/// The digest the wallet's owner signs for a `Batch` on the wallet's
+/// separator `sep`: `calls` are the calls' [`deposit_call_hash`]es in
+/// order (EIP-712 encodes the array as the keccak of their concatenation,
+/// absorbed where the hashes lie).
+#[inline]
+#[must_use]
+pub fn deposit_batch_digest(
+    sep: &[u8; 32],
+    wallet: &[u8; 20],
+    nonce: u64,
+    deadline_s: u64,
+    calls: &[[u8; 32]],
+) -> [u8; 32] {
+    let calls_hash = keccak256(calls.as_flattened());
+    let st = keccak256_parts(&[
+        &DEPOSIT_BATCH_TYPEHASH,
+        &enc_address(wallet),
+        &enc_u64(nonce),
+        &enc_u64(deadline_s),
+        &calls_hash,
+    ]);
+    eip712_digest(sep, &st)
+}
+
 /// Sign `digest` with `sk` (a thin re-export of the crate's signer, so
 /// the arm needs one import): 65 B `r‖s‖v`, `v` ∈ {27, 28}, low-s,
 /// RFC 6979.

@@ -78,7 +78,9 @@ fn u256_small(v: u64) -> [u8; 32] {
 
 #[test]
 fn every_constant_hash_is_the_keccak_of_its_string() {
-    let pairs: [(&[u8], [u8; 32]); 8] = [
+    let pairs: [(&[u8], [u8; 32]); 10] = [
+        (DEPOSIT_BATCH_TYPE.as_bytes(), DEPOSIT_BATCH_TYPEHASH),
+        (DEPOSIT_CALL_TYPE.as_bytes(), DEPOSIT_CALL_TYPEHASH),
         (ORDER_V2_TYPE.as_bytes(), ORDER_V2_TYPEHASH),
         (TYPED_DATA_SIGN_TYPE.as_bytes(), TYPED_DATA_SIGN_TYPEHASH),
         (CLOB_AUTH_TYPE.as_bytes(), CLOB_AUTH_TYPEHASH),
@@ -339,6 +341,71 @@ fn sdk_vectors_clob_auth() {
         let d = clob_auth_digest(&clob_auth_separator(chain), &me(), ts, nonce);
         assert_eq!(hex(&sign(&key(), &d).unwrap()), want, "chain {chain}");
     }
+}
+
+/// The redemption calldata of `condition` on the CtfCollateralAdapter:
+/// `redeemPositions(pUSD, 0, condition, [1, 2])` (spec H.2).
+fn redeem_data(condition: [u8; 32]) -> Vec<u8> {
+    let mut d = vec![0x01, 0xb7, 0x03, 0x7c];
+    d.extend_from_slice(&enc_address(&PUSD));
+    d.extend_from_slice(&[0u8; 32]);
+    d.extend_from_slice(&condition);
+    d.extend_from_slice(&enc_u64(0x80));
+    d.extend_from_slice(&enc_u64(2));
+    d.extend_from_slice(&enc_u64(1));
+    d.extend_from_slice(&enc_u64(2));
+    d
+}
+
+/// VER (spec J.4, re-derived by an independent EIP-712 library): the
+/// Deposit Wallet batch — `CTF.setApprovalForAll(adapter, true)` then
+/// the adapter's `redeemPositions` — for the Hardhat key's wallet, and a
+/// second batch of two redemptions at nonce 31.
+#[test]
+fn ver_vectors_the_deposit_wallet_redemption_batch() {
+    let wallet = hx::<20>("0xBc0fF067b7740Eff76C1ca93c875Ba6B890d6B50");
+    let sep = deposit_wallet_separator(CHAIN_POLYGON, wallet);
+    assert_eq!(
+        hex(&sep),
+        "0xf3a3cae078e925c10a6a1c6ddcaa605e5f695f24f9c02db6d7f779192fa47f0e"
+    );
+    let mut approve = vec![0xa2, 0x2c, 0xb4, 0x65];
+    approve.extend_from_slice(&enc_address(&CTF_COLLATERAL_ADAPTER));
+    approve.extend_from_slice(&enc_u64(1));
+    let cond = hx::<32>("0x53efa9a4a5bddfd12a4d154653e337cedf2ec6667842dca165036ac21f6765b7");
+    let redeem = redeem_data(cond);
+    assert_eq!(
+        hex(&redeem),
+        "0x01b7037c000000000000000000000000c011a7e12a19f7b1f670d46f03b03f3342e82dfb000000000000000000000000000000000000000000000000000000000000000053efa9a4a5bddfd12a4d154653e337cedf2ec6667842dca165036ac21f6765b70000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002"
+    );
+    let calls = [
+        deposit_call_hash(&CONDITIONAL_TOKENS, 0, &approve),
+        deposit_call_hash(&CTF_COLLATERAL_ADAPTER, 0, &redeem),
+    ];
+    let d = deposit_batch_digest(&sep, &wallet, 0, 1_792_225_600, &calls);
+    assert_eq!(
+        hex(&d),
+        "0xfdd9b2c8e598887e41964075f8e656bfc40ece3964b90aca629a2375be1e34b3"
+    );
+    assert_eq!(
+        hex(&sign(&key(), &d).unwrap()),
+        "0x5dc1610bfc7e1f4f7a1e79c9015386e665fa4fd885128874c15d332088bc46657c801de630b0c8d5df73b325810b54096b6271de7b1333297e23158e8a87c7711c"
+    );
+    let mut c2 = [0xab; 32];
+    c2[16..].fill(0xcd);
+    let two = [
+        deposit_call_hash(&CTF_COLLATERAL_ADAPTER, 0, &redeem_data([0x11; 32])),
+        deposit_call_hash(&CTF_COLLATERAL_ADAPTER, 0, &redeem_data(c2)),
+    ];
+    let d = deposit_batch_digest(&sep, &wallet, 31, 1_792_238_800, &two);
+    assert_eq!(
+        hex(&d),
+        "0x77bc3afae039368c2a9c41a4115a29deecf0499ce5cb21f58abf25096ce096a6"
+    );
+    assert_eq!(
+        hex(&sign(&key(), &d).unwrap()),
+        "0x8f89f6b0b9d59f2fa4211d788547b52dc45e757fe2b8953828589dcc0284839664c956b574e60355d2394eb49ab9882bec1ded54ccea422942fc5fb38760ef431b"
+    );
 }
 
 #[test]

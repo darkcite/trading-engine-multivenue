@@ -15,7 +15,8 @@ use core_types::pm_roll::{pm_instance_id, pm_window_of_open};
 use exec_gateway::duplex;
 use ingress_polymarket::gamma15::PmTokenId;
 use signer_eip712::{address_from_private_key, parse_secret_key};
-use std::collections::VecDeque;
+
+use crate::rig::Rig;
 
 const HARDHAT: [u8; 32] = [
     0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff, 0x94,
@@ -27,55 +28,6 @@ const PASS: &[u8] = b"pass-phrase";
 const OPEN: u64 = 1_792_216_800;
 const COND: &[u8] = b"0x53efa9a4a5bddfd12a4d154653e337cedf2ec6667842dca165036ac21f6765b7";
 const WALL: u64 = 1_792_217_690_123_000_000;
-
-#[derive(Debug, Clone)]
-struct Sent {
-    method: Method,
-    target: Vec<u8>,
-    headers: Vec<(Vec<u8>, Vec<u8>)>,
-    body: Vec<u8>,
-}
-
-#[derive(Default)]
-struct Rig {
-    body: Vec<u8>,
-    resp: Vec<u8>,
-    script: VecDeque<Result<(u16, Vec<u8>), PostErr>>,
-    sent: Vec<Sent>,
-}
-
-impl PmClob for Rig {
-    fn body_mut(&mut self) -> &mut [u8] {
-        &mut self.body
-    }
-    fn request(
-        &mut self,
-        method: Method,
-        target: &[u8],
-        extra: &[Header<'_>],
-        body_len: usize,
-    ) -> Result<(u16, core::ops::Range<usize>), PostErr> {
-        self.sent.push(Sent {
-            method,
-            target: target.to_vec(),
-            headers: extra
-                .iter()
-                .map(|(n, v)| (n.to_vec(), v.to_vec()))
-                .collect(),
-            body: self.body[..body_len].to_vec(),
-        });
-        match self.script.pop_front().expect("the script has an answer") {
-            Ok((http, b)) => {
-                self.resp = b;
-                Ok((http, 0..self.resp.len()))
-            }
-            Err(e) => Err(e),
-        }
-    }
-    fn resp(&self) -> &[u8] {
-        &self.resp
-    }
-}
 
 fn account() -> PmAccount {
     let sk = parse_secret_key(&HARDHAT).unwrap();
@@ -505,4 +457,46 @@ fn the_account_read_goes_one_request_a_pass_outside_the_late_tail() {
     let ev = events(&mut b);
     assert_eq!((ev[0].kind, ev[0].why), (EVT_BALANCE, 1));
     assert_eq!(b.gw.counters().account_failures, 1);
+}
+
+/// PM15-6d: a redemption ask names its window's condition to the
+/// redeemer (counted without one, or when the window left the table);
+/// the redeemer's request takes the idle path's last place, after the
+/// account read, and never runs in a window's quiet tail.
+#[test]
+fn a_redemption_ask_queues_its_condition_and_runs_only_off_the_quiet_tail() {
+    let mut b = bench();
+    let mut c = PmCmd::new(CMD_REDEEM, 0);
+    c.instance = instance();
+    assert!(b.eng.cmd.push(&c));
+    b.gw.step(2, WALL);
+    assert_eq!(b.gw.counters().redeem_off, 1, "no redeemer: by hand");
+
+    let mut rly = Rig::with_body(crate::redeem::RELAYER_BODY);
+    rly.answer(500, b"{}");
+    let key = crate::redeem::RelayerKey::new(b"relayer-key").unwrap();
+    b.gw.set_redeemer(crate::redeem::Redeemer::new(key, [0x11; 20], 137), rly);
+    assert!(b.eng.cmd.push(&c));
+    let mut gone = c;
+    gone.instance = pm_instance_id(pm_window_of_open(OPEN).unwrap() + 1, 0).unwrap();
+    assert!(b.eng.cmd.push(&gone));
+    b.gw.step(3, WALL);
+    b.gw.step(3, WALL);
+    assert_eq!(b.gw.redeem_counters().queued, 1);
+    assert_eq!(b.gw.counters().redeem_no_row, 1);
+    // Ripe, but WALL is in the quiet tail: nothing is sent.
+    let t = 3 + crate::redeem::REDEEM_AFTER_NS;
+    b.gw.step(t, WALL);
+    assert_eq!(b.gw.redeem_counters().request_failures, 0);
+    // 100 s into a window: the account read first (one balance request,
+    // then its end), then the redeemer's nonce read (answered 500).
+    let open = OPEN * 1_000_000_000 + 100_000_000_000;
+    b.gw.clob_mut()
+        .answer(200, br#"{"balance":"1000000","allowances":{}}"#);
+    b.gw.step(t, open);
+    b.gw.step(t, open);
+    assert_eq!(b.gw.counters().account_reads, 1);
+    assert_eq!(b.gw.redeem_counters().request_failures, 0);
+    b.gw.step(t, open);
+    assert_eq!(b.gw.redeem_counters().request_failures, 1);
 }
