@@ -119,7 +119,10 @@ pub mod decl_flag {
     pub const DRAWDOWN_PCT: u16 = 1 << 6;
     /// `risk.max_intraday_loss` is a percentage of the day's opening equity.
     pub const INTRADAY_LOSS_PCT: u16 = 1 << 7;
-    /// `calc_on_every_history_tick = true` — refused by both brokers (`5109`).
+    /// `calc_on_every_history_tick = true`. The native broker refuses it (`5109`); the TV broker
+    /// refuses it (`5109`) until its `history_tick` switch reads `PathPoints`, then evaluates the
+    /// history path points (impl-05 §4.8.9, R-P6). Sema sets `uses_intrabar` (refuses a `bar_close`
+    /// compilation with `3052`, CAR-D1-sema-3052).
     pub const CALC_ON_EVERY_HISTORY_TICK: u16 = 1 << 8;
 }
 

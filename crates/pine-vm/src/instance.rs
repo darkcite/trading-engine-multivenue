@@ -7,8 +7,8 @@ use core::cell::Cell;
 use core::marker::PhantomData;
 
 use pine_ir::{
-    abi, ring_flag, scale, Bar, BarCtx, ExecMode, FaultKind, Lane, OrderIntent, PineProgram,
-    StepOutcome, VmCounters, NA_I64,
+    abi, barflag, ring_flag, scale, Bar, BarCtx, ExecMode, FaultKind, Lane, OrderIntent,
+    PineProgram, StepOutcome, VmCounters, NA_I64,
 };
 
 use crate::builtin::BuiltinTable;
@@ -27,6 +27,10 @@ pub struct VmInstance<'p> {
     head: u64,
     bars_seen: u64,
     ticks_this_bar: u32,
+    /// History ticks (`step_tick` on a partial history bar: `CONFIRMED` and `REALTIME` clear) since
+    /// the last `step_bar` — §3.6.5 `ISNEW` for history ticks (CAR-D1), apart from `ticks_this_bar`
+    /// so a `calc_on_order_fills` re-run never makes a history tick "not new".
+    hist_ticks_this_bar: u32,
     counters: VmCounters,
     latched: Option<(FaultKind, u32)>,
     realtime: bool,
@@ -108,6 +112,7 @@ impl<'p> VmInstance<'p> {
             head: 0,
             bars_seen: 0,
             ticks_this_bar: 0,
+            hist_ticks_this_bar: 0,
             counters: VmCounters::default(),
             latched: None,
             realtime: prog.mode == ExecMode::Realtime,
@@ -197,6 +202,7 @@ impl<'p> VmInstance<'p> {
         self.head = 0;
         self.bars_seen = 0;
         self.ticks_this_bar = 0;
+        self.hist_ticks_this_bar = 0;
         self.counters = VmCounters::default();
         self.latched = None;
     }
@@ -214,6 +220,7 @@ impl<'p> VmInstance<'p> {
         // which the §3.15.3 protocol makes exactly the ticks of the bar being confirmed.
         let ticked = self.ticks_this_bar > 0;
         self.ticks_this_bar = 0;
+        self.hist_ticks_this_bar = 0;
         self.counters.bar_evals += 1;
         self.begin_eval(self.bars_seen as i64 - 1);
         let r = self.eval::<false>(bar, ctx, ticked);
@@ -240,7 +247,18 @@ impl<'p> VmInstance<'p> {
             return self.fault(FaultKind::Internal, PC_NONE);
         }
         self.core.undo(); // undo to the checkpoint; the checkpoint is re-established by undo
-        let ticked = self.ticks_this_bar > 0; // §3.6.5 ISNEW: not this bar's first step_tick
+
+        // §3.6.5 ISNEW: not this bar's first step_tick — for a history tick (CAR-D1), not its
+        // first history tick.
+        let hist = bar.flags & (barflag::CONFIRMED | barflag::REALTIME) == 0;
+        let ticked = if hist {
+            self.hist_ticks_this_bar > 0
+        } else {
+            self.ticks_this_bar > 0
+        };
+        if hist {
+            self.hist_ticks_this_bar = self.hist_ticks_this_bar.saturating_add(1);
+        }
         self.ticks_this_bar = self.ticks_this_bar.saturating_add(1);
         self.counters.tick_evals += 1;
         self.begin_eval(self.bars_seen as i64);

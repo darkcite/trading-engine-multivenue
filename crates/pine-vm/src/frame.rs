@@ -588,6 +588,43 @@ impl<'a> Frame<'a> {
         unsafe { Ok((&*c.hdr_ptr(d.off), core::slice::from_raw_parts(c.base.add(lo as usize) as *const u64, n))) }
     }
 
+    /// One field word of a UDT `Object` block (read-only; no journal) — for pine-std's UDT field
+    /// sort / search (impl-04 §4.16.6, R-P5; CAR-R27-1). The checks are `object::o_field`'s: an
+    /// invalid, out-of-range, non-`Object` or stale reference → `ScriptRefused` (as `O_GET_*`);
+    /// `field ≥ len` or past the block's capacity → `Internal` (sema bounds the selector).
+    pub fn obj_field(&self, r: CollRef, field: u32) -> Result<u64, FaultKind> {
+        let c = &*self.core;
+        if !r.is_valid_encoding() || (r.site().0 as u32) >= c.n_states {
+            return Err(FaultKind::ScriptRefused);
+        }
+        // SAFETY: bounded just above.
+        let d = unsafe { c.desc(r.site().0) };
+        if d.kind != StateKind::Object {
+            return Err(FaultKind::ScriptRefused);
+        }
+        // SAFETY: rule 6 — d is a verified Object block (>= 32 B): hdr_ptr's contract.
+        let hd = unsafe { *c.hdr_ptr(d.off) };
+        if hd.gen != r.gen() {
+            return Err(FaultKind::ScriptRefused);
+        }
+        // The capacity from the verified descriptor (rule 6: bytes >= 32), as `o_field`.
+        let cap = (d.bytes - 32) / 8;
+        debug_assert!(
+            hd.len <= cap,
+            "rule 15: object len {} > block capacity {cap}",
+            hd.len
+        );
+        if field >= hd.len || field >= cap {
+            return Err(FaultKind::Internal);
+        }
+        debug_assert!(
+            32 + 8 * field + 8 <= d.bytes,
+            "rule 15: field outside its block"
+        );
+        // SAFETY: field < cap, so [off + 32 + 8·field, +8) lies inside the verified block (rule 6).
+        Ok(unsafe { *(c.base.add((d.off + 32 + 8 * field) as usize) as *const u64) })
+    }
+
     /// Header + storage words, mutable; the block (and a view's owner) journaled on first touch.
     pub fn coll_mut(&mut self, r: CollRef) -> Result<(&mut CollHeader, &mut [u64]), FaultKind> {
         let c = &mut *self.core;

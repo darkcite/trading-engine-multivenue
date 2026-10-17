@@ -114,6 +114,41 @@ fn inst_barstate_tick_column_reads_the_flags_and_isnew_first_tick_only() {
     assert_eq!(bs(&vm), [0, 0, 1, 0, 1, 0, 0, 3]);
 }
 
+/// CAR-D1 (R-P6): a partial history bar (`CONFIRMED` and `REALTIME` clear) through `step_tick` —
+/// `isnew` on its first history tick only, a `calc_on_order_fills` re-run on the full bar stays
+/// new, `isconfirmed` false throughout; the bar-close column is unchanged
+/// (`pin:U17-hist-close-isnew`) and the counter restarts at `step_bar`.
+#[test]
+fn inst_barstate_history_ticks_isnew_first_only_and_cof_reruns_unchanged() {
+    let p = barstate_program();
+    let v = verify(&p, &TABLE).expect("verifies");
+    let mut a = Arena::new(p.layout.total_bytes as usize);
+    let mut vm = VmInstance::new(v, a.slice());
+    let mut ctx = Ctx { now: 0 };
+    let c = barflag::CONFIRMED;
+    assert_eq!(vm.step_bar(&bar(0, 1.0, c), &mut ctx), StepOutcome::Ok);
+    assert_eq!(vm.step_tick(&bar(1, 1.0, 0), &mut ctx), StepOutcome::Ok);
+    assert_eq!(bs(&vm), [0, 0, 0, 1, 0, 1, 0, 1]);
+    assert_eq!(vm.step_tick(&bar(1, 1.0, c), &mut ctx), StepOutcome::Ok);
+    assert_eq!(
+        bs(&vm),
+        [0, 0, 0, 1, 0, 1, 0, 1],
+        "cof re-run on the full bar: isnew true"
+    );
+    assert_eq!(vm.step_tick(&bar(1, 1.0, 0), &mut ctx), StepOutcome::Ok);
+    assert_eq!(
+        bs(&vm),
+        [0, 0, 0, 0, 0, 1, 0, 1],
+        "second history tick: isnew false"
+    );
+    assert_eq!(vm.step_tick(&bar(1, 1.0, 0), &mut ctx), StepOutcome::Ok);
+    assert_eq!(bs(&vm), [0, 0, 0, 0, 0, 1, 0, 1]);
+    assert_eq!(vm.step_bar(&bar(1, 1.0, c), &mut ctx), StepOutcome::Ok);
+    assert_eq!(bs(&vm), [0, 1, 0, 1, 0, 1, 0, 1]);
+    assert_eq!(vm.step_tick(&bar(2, 1.0, 0), &mut ctx), StepOutcome::Ok);
+    assert_eq!(bs(&vm), [0, 0, 0, 1, 0, 1, 0, 2]);
+}
+
 /// Plot `a OP b` for each pair: I_MOD (i64, via F_I2F|VLD so na plots NaN) or F_MOD.
 fn mod_program(int: bool, pairs: &[(u64, u64)], flags: u8) -> PineProgram {
     let mut t = Tb::new(ExecMode::BarClose, 3, 4, 0, 0);

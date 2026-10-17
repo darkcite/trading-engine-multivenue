@@ -41,7 +41,9 @@ pub struct Bar {
 
 /// [`Bar::flags`] bits, frozen. Bits 6..31 are reserved and must be zero.
 pub mod barflag {
-    /// The bar is closed (a history bar, or a live bar at its confirm).
+    /// The bar is closed (a history bar, or a live bar at its confirm). Clear on a live forming bar
+    /// and on a **partial history bar** — the developing bar of a TV-mode history-tick run
+    /// (`calc_on_every_history_tick`, R-P6; impl-05 §4.8.9), which also has `REALTIME` clear.
     pub const CONFIRMED: u32 = 1 << 0;
     /// At least one bucket is missing between this bar and the previous one.
     pub const GAP_BEFORE: u32 = 1 << 1;
