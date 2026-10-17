@@ -232,3 +232,343 @@ fn gen_check_is_byte_stable() {
 fn core_crypto_sha(p: &Path) -> [u8; 32] {
     pine_conformance::chart::sha256_file(p).unwrap()
 }
+
+use pine_conformance::fixture::{Expect, Fixture, Oracle, ReadingBody, Stamp};
+
+/// Every `.fix` on disk with its text, in path order.
+fn disk_fixtures() -> Vec<(String, Fixture)> {
+    let root = workspace_root();
+    let mut files = Vec::new();
+    walk(&root, &root.join("tests/conformance/fixtures"), &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .filter(|r| r.ends_with(".fix"))
+        .map(|r| {
+            let t = std::fs::read_to_string(root.join(&r)).unwrap();
+            let f = Fixture::parse(&t, &r).unwrap_or_else(|e| panic!("{e}"));
+            (t, f)
+        })
+        .collect()
+}
+
+/// I1.
+#[test]
+fn chart_sha_and_capture_stamp_in_every_fixture() {
+    for (_, f) in disk_fixtures() {
+        let id = f.id.as_str();
+        assert_eq!(
+            f.chart_sha256,
+            pine_conformance::chart::spec::SHA256,
+            "{id}"
+        );
+        if f.oracle.is_captured_kind() {
+            if f.expect != Expect::Pending {
+                assert!(
+                    matches!(&f.captured, Stamp::At(u) if pine_conformance::fixture::is_capture_utc(u)),
+                    "{id}: captured"
+                );
+                assert!(matches!(f.tv_build, Stamp::At(_)), "{id}: tv_build");
+                assert!(f.captured_in.is_some(), "{id}: captured_in");
+            }
+        } else {
+            assert_eq!(f.captured, Stamp::NotApplicable, "{id}");
+            assert_eq!(f.tv_build, Stamp::NotApplicable, "{id}");
+        }
+    }
+}
+
+/// I2 and I8 over every `.fix` on disk.
+#[test]
+fn script_sha256_matches_disk() {
+    let root = workspace_root();
+    let all = disk_fixtures();
+    assert!(all.len() >= 300);
+    for (t, f) in &all {
+        assert_eq!(f.render(), *t, "I8 on {}", f.id.as_str());
+        let p = root.join(&f.script);
+        if p.is_file() {
+            assert_eq!(f.script_sha256, core_crypto_sha(&p), "{}", f.id.as_str());
+        } else {
+            // Z001–Z014: impl-01's probes outside the fixture tree (registry).
+            assert!(f.script.starts_with("crates/pine-lang/"), "{}", f.script);
+        }
+    }
+}
+
+/// I3.
+#[test]
+fn every_pine_carries_the_spdx_pair() {
+    let root = workspace_root();
+    let mut files = Vec::new();
+    walk(&root, &root.join("tests/conformance"), &mut files);
+    let pines: Vec<&String> = files.iter().filter(|r| r.ends_with(".pine")).collect();
+    assert!(pines.len() >= 300);
+    for r in pines {
+        let t = std::fs::read_to_string(root.join(r)).unwrap();
+        assert!(
+            t.starts_with(pine_conformance::gen::emit::SPDX_PAIR),
+            "{r}: SPDX pair not on lines 1-2"
+        );
+    }
+}
+
+/// I4.
+#[test]
+fn no_fixture_carries_ohlcv() {
+    for (_, f) in disk_fixtures() {
+        let id = f.id.as_str();
+        for p in &f.plots {
+            let t = p.title.as_str();
+            assert!(
+                !["open", "high", "low", "close", "volume"].contains(&t),
+                "{id}: {t}"
+            );
+            let rest = t
+                .strip_prefix("f_")
+                .and_then(|r| r.strip_prefix(id))
+                .and_then(|r| r.strip_prefix('_'))
+                .unwrap_or_else(|| panic!("{id}: {t} is not f_{id}_…"));
+            assert!(
+                (1..=12).contains(&rest.len())
+                    && rest
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{id}: {t}"
+            );
+        }
+    }
+}
+
+/// I6.
+#[test]
+fn fixture_ids_are_unique_and_dense() {
+    let all = disk_fixtures();
+    let mut per: Vec<(char, Vec<u16>)> = Vec::new();
+    for (_, f) in &all {
+        let g = f.id.group().letter();
+        match per.iter_mut().find(|(x, _)| *x == g) {
+            Some((_, v)) => v.push(f.id.number()),
+            None => per.push((g, vec![f.id.number()])),
+        }
+    }
+    for (g, mut v) in per {
+        assert!("ABCDEFZ".contains(g), "{g}");
+        v.sort_unstable();
+        let want: Vec<u16> = (1..=v.len() as u16).collect();
+        assert_eq!(v, want, "group {g} not dense from 001");
+    }
+}
+
+/// I12 (half 1): every `live_refuse` fixture is refused with exactly its code under
+/// `live_bound = true` in every declared dialect — `compile_only` directly, no bar files.
+///
+/// `pin:06-hyg-standin-syminfo` — the refusal is a compile-time check; the private tree's
+/// `syminfo.tsv` is the stand-in's rows (a `tv` fixture refuses the stand-in by design).
+#[test]
+fn lookahead_fixtures_are_refused_when_live_bound() {
+    use pine_conformance::run::{RunError, Runner, RunnerOptions};
+    let (t, fixtures) = live_tree("live", |f| f.live_refuse.is_some());
+    assert!(!fixtures.is_empty());
+    let mut r = Runner::new(RunnerOptions::new(t.clone())).unwrap();
+    for f in &fixtures {
+        let want = f.live_refuse.unwrap();
+        for d in [pine_ir::Dialect::V5, pine_ir::Dialect::V6] {
+            if !f.dialects.has(d) {
+                continue;
+            }
+            match r.compile_only(f, d, true) {
+                Err(e @ RunError::Compile(_)) => {
+                    assert_eq!(e.code(), Some(want), "{} v{}", f.id.as_str(), d as u8)
+                }
+                other => panic!(
+                    "{} v{}: want refusal {}, got {:?}",
+                    f.id.as_str(),
+                    d as u8,
+                    want.0,
+                    other.err()
+                ),
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// I12 (half 2): D017 / D018 (leak-free `lookahead_on`) compile under `live_bound = true`.
+#[test]
+fn leak_free_lookahead_compiles_live_bound() {
+    use pine_conformance::run::{Runner, RunnerOptions};
+    let (t, fixtures) = live_tree("leakfree", |f| ["D017", "D018"].contains(&f.id.as_str()));
+    assert_eq!(fixtures.len(), 2);
+    let mut r = Runner::new(RunnerOptions::new(t.clone())).unwrap();
+    for f in &fixtures {
+        let d = pine_conformance::run::primary_dialect(f.dialects);
+        assert!(
+            r.compile_only(f, d, true).is_ok(),
+            "{}: {:?}",
+            f.id.as_str(),
+            r.compile_only(f, d, true).err()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// A private tree with the stand-in as `syminfo.tsv` and the scripts of the selected fixtures.
+fn live_tree(tag: &str, pick: impl Fn(&Fixture) -> bool) -> (PathBuf, Vec<Fixture>) {
+    let root = workspace_root();
+    let t = std::env::temp_dir().join(format!("pine-conf-hyg-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&t);
+    let picked: Vec<Fixture> = disk_fixtures()
+        .into_iter()
+        .map(|(_, f)| f)
+        .filter(|f| pick(f))
+        .collect();
+    for f in &picked {
+        let dst = t.join(&f.script);
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::copy(root.join(&f.script), dst).unwrap();
+    }
+    let standin =
+        std::fs::read_to_string(root.join("tests/conformance/syminfo.standin.tsv")).unwrap();
+    let rows: String = standin
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::create_dir_all(t.join("tests/conformance")).unwrap();
+    std::fs::write(t.join("tests/conformance/syminfo.tsv"), rows).unwrap();
+    (t, picked)
+}
+
+/// I18.
+#[test]
+fn fixture_payload_is_under_the_ratchet() {
+    let root = workspace_root();
+    let mut files = Vec::new();
+    walk(&root, &root.join("tests/conformance"), &mut files);
+    let total: u64 = files
+        .iter()
+        .map(|r| std::fs::metadata(root.join(r)).map_or(0, |m| m.len()))
+        .sum();
+    assert!(
+        total <= 8 << 20,
+        "tests/conformance holds {total} bytes > 8 MiB"
+    );
+}
+
+/// Source files of the crate (`src/`), `/`-relative to the crate.
+fn crate_files(sub: &str) -> Vec<(String, String)> {
+    let c = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    walk(&c, &c.join(sub), &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .filter(|r| r.ends_with(".rs"))
+        .map(|r| {
+            let t = std::fs::read_to_string(c.join(&r)).unwrap();
+            (r, t)
+        })
+        .collect()
+}
+
+/// I21: one compile spelling, one instantiation path.
+#[test]
+fn compile_edge_is_isolated() {
+    for (r, t) in crate_files("src") {
+        for tok in [
+            "pine_sema::compile(",
+            "pine_vm::verify(",
+            "VmInstance::new(",
+        ] {
+            if t.contains(tok) {
+                assert_eq!(r, "src/run.rs", "{tok} outside src/run.rs");
+            }
+        }
+    }
+}
+
+/// I22 (D18): no eight-decimal scale token in `src/`, `tests/` or `tests/conformance/`.
+#[test]
+fn no_1e8_anywhere() {
+    let toks = [
+        concat!("1", "e8"),
+        concat!("100_000", "_000"),
+        concat!("_1", "e8"),
+    ];
+    let mut all = crate_files("src");
+    all.extend(crate_files("tests"));
+    let root = workspace_root();
+    let mut conf = Vec::new();
+    walk(&root, &root.join("tests/conformance"), &mut conf);
+    for r in conf {
+        if let Ok(t) = std::fs::read_to_string(root.join(&r)) {
+            all.push((r, t));
+        }
+    }
+    for (r, t) in &all {
+        // pin:06-hyg-i22-own-name — §7.7 names this test `no_…_anywhere` with the token inside.
+        let t = &t.replace(concat!("no_1", "e8_anywhere"), "");
+        for tok in toks {
+            // A token: not inside a longer number or identifier.
+            let mut from = 0;
+            while let Some(i) = t[from..].find(tok) {
+                let (a, b) = (from + i, from + i + tok.len());
+                let before = t[..a].chars().next_back();
+                let after = t[b..].chars().next();
+                let word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+                let num_after = after.is_some_and(|c| c.is_ascii_digit() || c == '_');
+                assert!(
+                    word(before) && !tok.starts_with('_') || num_after,
+                    "{r}: `{tok}` (D18)"
+                );
+                from = b;
+            }
+        }
+    }
+}
+
+/// I23 (P5): no clock in `src/`.
+#[test]
+fn no_clock_in_the_crate() {
+    for (r, t) in crate_files("src") {
+        for tok in [
+            concat!("System", "Time"),
+            concat!("Inst", "ant::"),
+            concat!("UNIX_", "EPOCH"),
+        ] {
+            assert!(!t.contains(tok), "{r}: {tok}");
+        }
+    }
+}
+
+/// I24: every `Refuse` code (expectation or reading) lies in 1000–5199; a sema code is
+/// `3000 + n`, `n ∈ 1..=53` except the retired 25 and 33.
+///
+/// `pin:06-hyg-i24-ranges` — contract §3.3's per-crate ranges are checked at the sema block
+/// (3000–3999) only; the rest at the parser's 1000–5199 bound.
+#[test]
+fn refusal_codes_are_contract_codes() {
+    let ok = |c: u16| {
+        (1000..=5199).contains(&c)
+            && (!(3000..=3999).contains(&c) || {
+                let n = c - 3000;
+                (1..=53).contains(&n) && n != 25 && n != 33
+            })
+    };
+    for (_, f) in disk_fixtures() {
+        let id = f.id.as_str();
+        if let Expect::Refuse { code } = f.expect {
+            assert!(ok(code.0), "{id}: refuse {}", code.0);
+        }
+        if let Some(c) = f.live_refuse {
+            assert!(ok(c.0), "{id}: live_refuse {}", c.0);
+        }
+        for r in &f.readings {
+            if let ReadingBody::Refuse(code) = r.body {
+                assert!(ok(code.0), "{id}: reading refuse {}", code.0);
+            }
+        }
+        let _ = Oracle::Tv;
+    }
+}

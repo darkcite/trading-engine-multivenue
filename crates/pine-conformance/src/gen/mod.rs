@@ -17,6 +17,7 @@ pub mod group_e;
 pub mod group_f;
 pub mod group_z;
 pub mod readings;
+pub mod sheet;
 
 use std::path::Path;
 
@@ -246,11 +247,20 @@ pub fn write(root: &Path) -> std::io::Result<usize> {
     }
     let m = Manifest { rows };
     std::fs::write(root.join(crate::manifest::MANIFEST_TSV), m.render())?;
+    // §4.2: `gen` emits every sheet too (both dialects, §4.7.5).
+    sheet::write(root, pine_ir::Dialect::V6)?;
+    sheet::write(root, pine_ir::Dialect::V5)?;
     Ok(all.len())
 }
 
 /// `new` with `old`'s capture-owned fields.
 fn merge_capture(new: &Fixture, old: &Fixture) -> Fixture {
+    // pin:06-merge-oracle-change — an `authored` cell that became `tv` (its data refusal vanished
+    // when pine-std landed the builtin: A014/A030/A046/A062/A078, 2026-10-17) carries nothing
+    // captured: its `n/a` stamps and authored body are not capture-owned (I1).
+    if !old.oracle.is_captured_kind() || old.captured == Stamp::NotApplicable {
+        return new.clone();
+    }
     let mut m = new.clone();
     m.captured = old.captured.clone();
     m.tv_build = old.tv_build.clone();
@@ -298,5 +308,6 @@ pub fn check(root: &Path) -> Vec<String> {
         Ok(_) => diffs.push(format!("{path}: differs from the .fix files")),
         Err(e) => diffs.push(format!("{path}: {e}")),
     }
+    diffs.extend(sheet::check(root));
     diffs
 }

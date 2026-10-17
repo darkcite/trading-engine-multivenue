@@ -223,7 +223,7 @@ fn row(n: u32, entry_ms: i64, px: &str, pnl: &str) -> TradeRow {
 fn trades_count_mismatch_reported_first() {
     let syms = SymTable::new();
     let e = [row(1, 0, "100", "1.00"), row(2, 7_200_000, "999", "1.00")];
-    let a = [rec(0, 100_000_000, 1_000_000, 1_000_000_000_000, 0)];
+    let a = [rec(0, 100 * 1_000_000, 1_000_000, 1_000_000_000_000, 0)];
     let got = compare_trades(&e, &a, &syms, &SignalTable::default(), PnlBasis::Net);
     assert_eq!(
         got,
@@ -239,7 +239,7 @@ fn trades_count_mismatch_reported_first() {
 fn trades_price_is_exact_at_1e6() {
     let syms = SymTable::new();
     let e = [row(1, 0, "100.000001", "1.00")];
-    let a = [rec(0, 100_000_000, 1_000_000, 1_000_000_000_000, 0)];
+    let a = [rec(0, 100 * 1_000_000, 1_000_000, 1_000_000_000_000, 0)];
     let got = compare_trades(&e, &a, &syms, &SignalTable::default(), PnlBasis::Net);
     assert!(matches!(
         got,
@@ -261,7 +261,7 @@ fn trades_pnl_net_and_gross_bases() {
     // pnl net 1.00, fee 0.10 → gross 1.10.
     let a = [rec(
         0,
-        100_000_000,
+        100 * 1_000_000,
         1_000_000,
         1_000_000_000_000,
         100_000_000_000,
@@ -282,7 +282,7 @@ fn trades_pnl_net_and_gross_bases() {
 fn trades_size_is_exact() {
     let syms = SymTable::new();
     let s = SignalTable::default();
-    let a = [rec(0, 100_000_000, 1_000_000, 1_000_000_000_000, 0)];
+    let a = [rec(0, 100 * 1_000_000, 1_000_000, 1_000_000_000_000, 0)];
     let mut e = row(1, 0, "100", "1.00");
     e.qty = d("1.000001");
     assert!(matches!(
@@ -295,7 +295,7 @@ fn trades_size_is_exact() {
         Some(TradeDiv::Field { field: "qty", .. })
     ));
     // A short trade's size is the magnitude; the side is its own field.
-    let short = [rec(0, 100_000_000, -1_000_000, 1_000_000_000_000, 0)];
+    let short = [rec(0, 100 * 1_000_000, -1_000_000, 1_000_000_000_000, 0)];
     assert!(matches!(
         compare_trades(
             &[row(1, 0, "100", "1.00")],
@@ -318,7 +318,7 @@ fn trades_size_is_exact() {
 fn trades_open_trade_compares_entry_fields_only() {
     let syms = SymTable::new();
     let s = SignalTable::default();
-    let mut a = rec(0, 100_000_000, 1_000_000, 7_000_000_000_000, 0);
+    let mut a = rec(0, 100 * 1_000_000, 1_000_000, 7_000_000_000_000, 0);
     a.flags |= trade_flag::OPEN;
     let mut e = row(1, 0, "100", "999.99");
     e.exit = None;
@@ -359,7 +359,7 @@ fn trades_exit_signal_from_signals_table() {
     )
     .unwrap();
     let idless = |flags: u32| {
-        let mut a = rec(0, 100_000_000, 1_000_000, 1_000_000_000_000, 0);
+        let mut a = rec(0, 100 * 1_000_000, 1_000_000, 1_000_000_000_000, 0);
         a.exit_id = pine_ir::StrKey::NONE;
         a.flags = trade_flag::PNL_NET | flags;
         a
@@ -391,7 +391,7 @@ fn trades_exit_signal_from_signals_table() {
     assert_eq!(
         cmp(
             with_sig("X"),
-            rec(0, 100_000_000, 1_000_000, 1_000_000_000_000, 0)
+            rec(0, 100 * 1_000_000, 1_000_000, 1_000_000_000_000, 0)
         ),
         None
     );
@@ -400,7 +400,7 @@ fn trades_exit_signal_from_signals_table() {
 #[test]
 fn trades_require_pnl_net_flag() {
     let syms = SymTable::new();
-    let mut a = rec(0, 100_000_000, 1_000_000, 1_000_000_000_000, 0);
+    let mut a = rec(0, 100 * 1_000_000, 1_000_000, 1_000_000_000_000, 0);
     a.flags = 0;
     let got = compare_trades(
         &[row(1, 0, "100", "1.00")],

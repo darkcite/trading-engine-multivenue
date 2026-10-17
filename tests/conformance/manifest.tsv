@@ -12,7 +12,7 @@ A010	A	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/A/A010.pine	pendi
 A011	A	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/A/A011.pine	pending
 A012	A	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/A/A012.pine	pending
 A013	A	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/A/A013.pine	pending
-A014	A	56	tv	syn	step	bar_close	3	pin:04-collection-edges	tests/conformance/fixtures/A/A014.pine	n/a
+A014	A	56	tv	syn	step	bar_close	3	pin:04-collection-edges	tests/conformance/fixtures/A/A014.pine	pending
 A015	A	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/A/A015.pine	pending
 A016	A	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/A/A016.pine	pending
 A017	A	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/A/A017.pine	pending
@@ -28,7 +28,7 @@ A026	A	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/A/A026.pine	pendi
 A027	A	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/A/A027.pine	pending
 A028	A	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/A/A028.pine	pending
 A029	A	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/A/A029.pine	pending
-A030	A	56	tv	syn	step	bar_close	3	pin:04-collection-edges	tests/conformance/fixtures/A/A030.pine	n/a
+A030	A	56	tv	syn	step	bar_close	3	pin:04-collection-edges	tests/conformance/fixtures/A/A030.pine	pending
 A031	A	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/A/A031.pine	pending
 A032	A	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/A/A032.pine	pending
 A033	A	56	tv	syn	step	bar_close	1	pin:04-color-edges	tests/conformance/fixtures/A/A033.pine	pending
@@ -44,7 +44,7 @@ A042	A	56	tv	syn	step	bar_close	1	pin:04-color-edges	tests/conformance/fixtures/
 A043	A	56	tv	syn	step	bar_close	1	pin:04-color-edges	tests/conformance/fixtures/A/A043.pine	pending
 A044	A	56	tv	syn	step	bar_close	1	pin:04-color-edges	tests/conformance/fixtures/A/A044.pine	pending
 A045	A	56	tv	syn	step	bar_close	1	pin:04-color-edges	tests/conformance/fixtures/A/A045.pine	pending
-A046	A	56	tv	syn	step	bar_close	3	pin:04-color-edges,pin:04-collection-edges	tests/conformance/fixtures/A/A046.pine	n/a
+A046	A	56	tv	syn	step	bar_close	3	pin:04-color-edges,pin:04-collection-edges	tests/conformance/fixtures/A/A046.pine	pending
 A047	A	56	tv	syn	step	bar_close	1	pin:04-color-edges	tests/conformance/fixtures/A/A047.pine	pending
 A048	A	56	tv	syn	step	bar_close	1	pin:04-color-edges	tests/conformance/fixtures/A/A048.pine	pending
 A049	A	56	tv	syn	step	bar_close	1	pin:04-string-edges	tests/conformance/fixtures/A/A049.pine	pending
@@ -60,7 +60,7 @@ A058	A	56	tv	syn	step	bar_close	1	pin:04-string-edges	tests/conformance/fixtures
 A059	A	56	tv	syn	step	bar_close	1	pin:04-string-edges	tests/conformance/fixtures/A/A059.pine	pending
 A060	A	56	tv	syn	step	bar_close	1	pin:04-string-edges	tests/conformance/fixtures/A/A060.pine	pending
 A061	A	56	tv	syn	step	bar_close	1	pin:04-string-edges	tests/conformance/fixtures/A/A061.pine	pending
-A062	A	56	tv	syn	step	bar_close	3	pin:04-string-edges,pin:04-collection-edges	tests/conformance/fixtures/A/A062.pine	n/a
+A062	A	56	tv	syn	step	bar_close	3	pin:04-string-edges,pin:04-collection-edges	tests/conformance/fixtures/A/A062.pine	pending
 A063	A	56	tv	syn	step	bar_close	1	pin:04-string-edges	tests/conformance/fixtures/A/A063.pine	pending
 A064	A	56	authored	syn	step	bar_close	1	pin:04-string-edges	tests/conformance/fixtures/A/A064.pine	n/a
 A065	A	5	tv	syn	step	bar_close	1	pin:W13-bool-na	tests/conformance/fixtures/A/A065.pine	pending
@@ -76,7 +76,7 @@ A074	A	5	tv	syn	step	bar_close	1	pin:W13-bool-na	tests/conformance/fixtures/A/A0
 A075	A	5	tv	syn	step	bar_close	1	pin:W13-bool-na	tests/conformance/fixtures/A/A075.pine	pending
 A076	A	5	tv	syn	step	bar_close	1	pin:W13-bool-na	tests/conformance/fixtures/A/A076.pine	pending
 A077	A	5	tv	syn	step	bar_close	1	pin:W13-bool-na	tests/conformance/fixtures/A/A077.pine	pending
-A078	A	5	tv	syn	step	bar_close	3	pin:W13-bool-na,pin:04-collection-edges	tests/conformance/fixtures/A/A078.pine	n/a
+A078	A	5	tv	syn	step	bar_close	3	pin:W13-bool-na,pin:04-collection-edges	tests/conformance/fixtures/A/A078.pine	pending
 A079	A	5	tv	syn	step	bar_close	1	pin:W13-bool-na	tests/conformance/fixtures/A/A079.pine	pending
 A080	A	5	tv	syn	step	bar_close	1	pin:W13-bool-na	tests/conformance/fixtures/A/A080.pine	pending
 A081	A	6	authored	syn	step	bar_close	1	pin:W13-bool-na	tests/conformance/fixtures/A/A081.pine	n/a

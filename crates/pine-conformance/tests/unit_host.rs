@@ -62,7 +62,7 @@ fn chart_rows(n: u32) -> Vec<Bar> {
 fn rows_on(from: i64, tf_ms: i64, n: u32) -> Vec<Bar> {
     (0..n)
         .map(|i| {
-            let px = 100_000_000 + i64::from(i % 17) * 1_000_000;
+            let px = 100 * 1_000_000 + i64::from(i % 17) * 1_000_000;
             Bar {
                 open_1e6: px,
                 high_1e6: px + 500_000,

@@ -152,6 +152,13 @@ pub fn render(s: &Script) -> String {
         Prelude::SynT { from_ms, stop_ms } => o.push_str(&syn::syn_t_prelude(from_ms, stop_ms)),
         Prelude::None => {}
     }
+    o.push_str(&render_body(s));
+    o
+}
+
+/// The body lines and the plots — what a sheet concatenates (§4.7.5).
+pub fn render_body(s: &Script) -> String {
+    let mut o = String::with_capacity(512);
     for l in &s.body {
         o.push_str(&indent(l.depth));
         o.push_str(&l.text);

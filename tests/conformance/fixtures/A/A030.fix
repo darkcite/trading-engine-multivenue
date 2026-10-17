@@ -6,8 +6,8 @@ pin	pin:04-collection-edges
 script	tests/conformance/fixtures/A/A030.pine
 script_sha256	6d07cfd49cb8f25d6170b9df776e2b3555663620187757753c4c0e8ac72d1498
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	n/a
-tv_build	n/a
+captured	pending
+tv_build	pending
 captured_in	pending
 driver	syn
 align	step
@@ -19,4 +19,4 @@ oracle	tv
 tier	3
 plot	f_A030_isna	exact
 plot	f_A030_val	exact
-refuse	3010
+pending

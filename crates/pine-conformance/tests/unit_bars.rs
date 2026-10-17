@@ -134,7 +134,7 @@ fn valid_rows(n: u32, tf_s: u32) -> Vec<Bar> {
     let from = (spec::FROM_MS / tf_ms) * tf_ms;
     (0..n)
         .map(|i| Bar {
-            open_1e6: 100_000_000 + i64::from(i),
+            open_1e6: 100 * 1_000_000 + i64::from(i),
             high_1e6: 100_000_100 + i64::from(i),
             low_1e6: 99_999_900,
             close_1e6: 100_000_001 + i64::from(i),

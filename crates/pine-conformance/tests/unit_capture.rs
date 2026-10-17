@@ -302,3 +302,179 @@ fn capture_paste_writes_the_matching_reading() {
     assert!(record_paste(&fix("Z019"), Paste::Compiled, &bad, false).is_err());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// P2 / T18: sheets for both dialects, byte-equal to the tracked files; a shared (`56`) sheet's v5
+/// and v6 texts differ in the version line only (§4.3).
+#[test]
+fn sheets_are_emitted_for_v5_and_v6() {
+    use pine_conformance::gen::sheet;
+    let (v5, v6) = (sheet::sheets(Dialect::V5), sheet::sheets(Dialect::V6));
+    assert!(!v5.is_empty() && !v6.is_empty());
+    for s in v5.iter().chain(&v6) {
+        let disk = std::fs::read_to_string(real_root().join(s.path())).unwrap();
+        assert_eq!(disk, s.text, "{} differs from the generator", s.path());
+    }
+    let mut shared = 0;
+    for s6 in v6.iter().filter(|s| !s.name.contains("-v")) {
+        let s5 = v5.iter().find(|s| s.name == s6.name).expect("twin sheet");
+        assert_eq!(
+            s5.text
+                .replace("//@version=5", "//@version=6")
+                .replace(" · v5 · ", " · v6 · "),
+            s6.text
+        );
+        shared += 1;
+    }
+    assert!(shared > 0);
+}
+
+/// §9 / §4.7.5: a sheet packs only `series` fixtures and stays inside the probe-02 limits; each
+/// fixture sits in one sheet per dialect; every sheet parses in its dialect.
+#[test]
+fn sheet_contains_only_series_fixtures() {
+    use pine_conformance::gen::{cells, sheet};
+    let all = cells();
+    for d in [Dialect::V5, Dialect::V6] {
+        let mut seen: Vec<FixtureId> = Vec::new();
+        for s in sheet::sheets(d) {
+            assert!(
+                !s.ids.is_empty() && s.ids.len() <= sheet::MAX_FIXTURES,
+                "{}",
+                s.name
+            );
+            assert!(s.plots <= sheet::MAX_PLOTS, "{}", s.name);
+            let mut req = (0, 0);
+            for id in &s.ids {
+                let c = all.iter().find(|c| c.script.id == *id).unwrap();
+                assert!(sheet::packable(c), "{} packs {}", s.name, id.as_str());
+                assert!(c.script.dialects.has(d));
+                assert!(!seen.contains(id), "{} packed twice", id.as_str());
+                seen.push(*id);
+                let r = sheet::requests(c);
+                req = (req.0 + usize::from(r > 0), req.1 + r);
+            }
+            assert!(req.0 <= sheet::MAX_REQ_FIXTURES && req.1 <= sheet::MAX_REQUESTS);
+            let mut syms = pine_ir::SymTable::new();
+            assert!(
+                pine_lang::parse(&s.text, pine_ir::FileId::ROOT, &mut syms).is_ok(),
+                "{} does not parse",
+                s.name
+            );
+        }
+        for never in sheet::NEVER_PACKED {
+            assert!(!seen.iter().any(|x| x.as_str() == never), "{never} packed");
+        }
+    }
+}
+
+/// T23 rehearsal: sheet-A-01 (v6) "exported" from OUR engine's own outputs (no TradingView value),
+/// distilled into a private tree, then checked — every fixture our engine runs passes `group_a`.
+///
+/// `pin:06-rehearsal-standin-syminfo` — the rehearsal tree's `syminfo.tsv` is the stand-in's rows
+/// (a `tv` fixture refuses the stand-in by design); the rehearsal proves the path, not the values.
+#[test]
+fn rehearsal_distil_passes_group_a() {
+    use pine_conformance::gen::sheet;
+    use pine_conformance::report::Verdict;
+    use pine_conformance::run::{Runner, RunnerOptions};
+    let s = sheet::sheets(Dialect::V6)
+        .into_iter()
+        .find(|s| s.name == "sheet-A-01")
+        .unwrap();
+    let ids: Vec<&str> = s.ids.iter().map(|x| x.as_str()).collect();
+    let root = tree("rehearsal", &ids);
+    for id in &ids {
+        let p = format!("tests/conformance/fixtures/A/{id}.pine");
+        std::fs::copy(real_root().join(&p), root.join(&p)).unwrap();
+    }
+    std::fs::write(root.join(s.path()), &s.text).unwrap();
+    let standin =
+        std::fs::read_to_string(real_root().join("tests/conformance/syminfo.standin.tsv")).unwrap();
+    let rows: String = standin
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(root.join("tests/conformance/syminfo.tsv"), rows).unwrap();
+    let mut runner = Runner::new(RunnerOptions::new(root.clone())).unwrap();
+    // Our run of each fixture: (titles, keys, row-major values).
+    let mut cols: Vec<(String, Vec<i64>, Vec<f64>, usize)> = Vec::new();
+    let mut n = 0u32;
+    for id in &ids {
+        let f = load(&root, id);
+        let Ok(out) = runner.run(&f, Dialect::V6) else {
+            continue;
+        };
+        n = n.max(out.bars);
+        let w = f.plots.len();
+        for (p, spec) in f.plots.iter().enumerate() {
+            cols.push((
+                spec.title.clone(),
+                out.keys.clone(),
+                out.plots.clone(),
+                p + w * 1000,
+            ));
+        }
+    }
+    assert!(
+        !cols.is_empty(),
+        "our engine runs at least one sheet-A-01 fixture"
+    );
+    let cell = |v: f64| {
+        if v.is_nan() {
+            "NaN".to_string()
+        } else if v.is_infinite() {
+            if v > 0.0 { "Infinity" } else { "-Infinity" }.to_string()
+        } else {
+            format!("{v:e}")
+        }
+    };
+    let mut csv = String::from("time,open,high,low,close,Volume");
+    for (t, ..) in &cols {
+        csv.push(',');
+        csv.push_str(t);
+    }
+    csv.push('\n');
+    for r in 0..i64::from(n) {
+        csv.push_str(&format!(
+            "{},1,2,0.5,1.5,10",
+            1_767_225_600_000 + r * 3_600_000
+        ));
+        for (_, keys, vals, pw) in &cols {
+            let (p, w) = (pw % 1000, pw / 1000);
+            let v = keys
+                .iter()
+                .position(|k| *k == r)
+                .map_or(f64::NAN, |i| vals[i * w + p]);
+            csv.push(',');
+            csv.push_str(&cell(v));
+        }
+        csv.push('\n');
+    }
+    let f17 = parse_format(
+        &FORMAT
+            .replace("time_format\tiso", "time_format\tunix_ms")
+            .replace("digits\t8", "digits\t17"),
+        "rehearsal",
+    )
+    .unwrap();
+    let export = parse_chart_csv(csv.as_bytes(), &f17).unwrap();
+    let sheet_path = root.join(s.path());
+    let rep = distil(&sheet_path, &export, None, None, &stamp(Dialect::V6), false).unwrap();
+    assert!(!rep.written.is_empty());
+    println!(
+        "rehearsal: {} of {} distilled and checked",
+        rep.written.len(),
+        ids.len()
+    );
+    let again = distil(&sheet_path, &export, None, None, &stamp(Dialect::V6), true).unwrap();
+    assert!(again.differing.is_empty(), "P4: verify on its own output");
+    let mut runner = Runner::new(RunnerOptions::new(root.clone())).unwrap();
+    for id in &rep.written {
+        let f = load(&root, id.as_str());
+        assert!(!matches!(f.expect, Expect::Pending));
+        let v = runner.check(&f);
+        assert!(matches!(v, Verdict::Pass), "{}: {v:?}", id.as_str());
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
