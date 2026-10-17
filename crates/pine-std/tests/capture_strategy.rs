@@ -730,7 +730,8 @@ fn view() -> BrokerView {
         initial_capital_1e12: 10_000_000_000_000_000,
         max_drawdown_1e12: 75_000_000_000_000,
         max_runup_1e12: 300_000_000_000_000,
-        max_drawdown_pct_1e6: 12_500_000,
+        // CAR-R33K-1: the broker's f64 drawdown percent, by its bits.
+        max_drawdown_pct_f64_bits: 0.36576484147764066f64.to_bits(),
         max_runup_pct_1e6: 31_250_000,
         sum_trade_pct_1e6: 3_500_000,
         sum_win_pct_1e6: 9_000_000,
@@ -1284,10 +1285,12 @@ fn strategy_percent_reads_follow_the_reference_formulas() {
     }
 }
 
-/// Amendment A9 (lead ruling 2026-10-16): `strategy.max_drawdown_percent` /
-/// `max_runup_percent` read `BrokerView::max_*_pct_1e6` (the reference's per-trade formula, the
-/// largest over every trade, `pin:04-max-dd-pct-provisional`, `pin:04-max-runup-pct-provisional`;
-/// 0 before the first trade, `pin:04-max-pct-zero-before-trade`); `avg_trade_percent` / `avg_winning_trade_percent` /
+/// Amendment A9 (lead ruling 2026-10-16): `strategy.max_runup_percent` reads
+/// `BrokerView::max_runup_pct_1e6` (the reference's per-trade formula, the largest over every
+/// trade, `pin:04-max-runup-pct-provisional`); `strategy.max_drawdown_percent` reads the broker's
+/// f64 `max_drawdown_pct_f64_bits` bit for bit (CAR-R33K-1, `pin:04-max-dd-pct-equity-f64`); both
+/// 0 before the first trade, `pin:04-max-pct-zero-before-trade`; `avg_trade_percent` /
+/// `avg_winning_trade_percent` /
 /// `avg_losing_trade_percent` = Σ closed `profit_percent` / closed, wins, losses (the losing one a
 /// positive amount, as `avg_losing_trade`; `pin:04-avg-trade-pct-provisional`); ÷0 and no broker → na.
 #[test]
@@ -1307,7 +1310,7 @@ fn a9_percent_vars_read_the_broker_aggregates() {
     };
     let got = read_vars(&rows, &mut ctx);
     let want = [
-        scale::from_1e6(b.max_drawdown_pct_1e6),
+        f64::from_bits(b.max_drawdown_pct_f64_bits),
         scale::from_1e6(b.max_runup_pct_1e6),
         scale::from_1e6(b.sum_trade_pct_1e6) / 7.0,
         scale::from_1e6(b.sum_win_pct_1e6) / 4.0,
@@ -1316,7 +1319,8 @@ fn a9_percent_vars_read_the_broker_aggregates() {
     for (k, (g, w)) in got.iter().zip(want).enumerate() {
         assert_eq!(g.to_bits(), w.to_bits(), "row {k}: {g} vs {w}");
     }
-    assert_eq!(got[0], 12.5);
+    // CAR-R33K-1: the f64 read is the broker's bits, no ×1e6 rounding (CAR-R33K-1's trade-10 row).
+    assert_eq!(got[0].to_bits(), 0.36576484147764066f64.to_bits());
     assert_eq!(got[4], 2.75, "a positive amount");
     // No trade at all (the broker's maxima are still 0): the maxima read 0 (TV E118, r33f), the
     // averages are ÷0 → na.
@@ -1325,7 +1329,7 @@ fn a9_percent_vars_read_the_broker_aggregates() {
         closedtrades: 0,
         wintrades: 0,
         losstrades: 0,
-        max_drawdown_pct_1e6: 0,
+        max_drawdown_pct_f64_bits: 0,
         max_runup_pct_1e6: 0,
         ..b
     });
@@ -1341,7 +1345,7 @@ fn a9_percent_vars_read_the_broker_aggregates() {
         ..b
     });
     let got = read_vars(&rows, &mut ctx);
-    assert_eq!((got[0], got[1]), (12.5, 31.25));
+    assert_eq!((got[0], got[1]), (0.36576484147764066, 31.25));
     assert!(got[2..].iter().all(|v| v.is_nan()));
     assert!(read_vars(&rows, &mut TestCtx::default())
         .iter()

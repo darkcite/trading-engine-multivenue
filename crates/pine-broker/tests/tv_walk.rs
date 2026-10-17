@@ -556,8 +556,10 @@ fn a_re_armed_grid_with_exits_and_cancel_all_runs_past_every_table_capacity() {
 }
 
 /// Amendment A9 through the TV walk: long 1 filled @ 100 on bar 1 whose path reaches 90 and 110
-/// ($10 on a $100 base: 10 % drawdown and run-up), closed `immediately` at bar 2's close 104
-/// (+$4: +4 %). `pin:04-max-dd-pct-provisional`, `pin:04-avg-trade-pct-provisional`.
+/// ($10 on a $100 base: 10 % run-up), closed `immediately` at bar 2's close 104 (+$4: +4 %).
+/// `pin:04-avg-trade-pct-provisional`. The drawdown percent is CAR-R33K-1's equity-curve law
+/// (`pin:04-max-dd-pct-equity-f64`): $10 below the $100 000 peak at the path's 90, 0.01 %, and the
+/// close's +$4 leaves it.
 #[test]
 fn a9_percent_aggregates_ride_the_walk() {
     let mut b = broker(0);
@@ -569,9 +571,11 @@ fn a9_percent_aggregates_ride_the_walk() {
     run_bar(&mut b, &bar(1, 100, 110, 90, 105), &[]);
     let v = *b.view();
     assert_eq!(v.opentrades, 1);
+    let eq = (100_000.0f64 + 0.0) + (90.0 - 100.0) * 1.0 * 1.0;
+    let dd = (100_000.0 - eq) / 100_000.0 * 100.0;
     assert_eq!(
-        (v.max_drawdown_pct_1e6, v.max_runup_pct_1e6),
-        (10 * E, 10 * E)
+        (v.max_drawdown_pct_f64_bits, v.max_runup_pct_1e6),
+        (dd.to_bits(), 10 * E)
     );
     assert_eq!(v.sum_trade_pct_1e6, 0, "nothing closed yet");
     run_bar(&mut b, &bar(2, 104, 104, 104, 104), &[close_now(1)]);
@@ -582,7 +586,7 @@ fn a9_percent_aggregates_ride_the_walk() {
         (4 * E, 4 * E, 0)
     );
     assert_eq!(
-        (v.max_drawdown_pct_1e6, v.max_runup_pct_1e6),
-        (10 * E, 10 * E)
+        (v.max_drawdown_pct_f64_bits, v.max_runup_pct_1e6),
+        (dd.to_bits(), 10 * E)
     );
 }

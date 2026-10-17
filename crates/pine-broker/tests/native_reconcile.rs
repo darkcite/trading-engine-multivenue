@@ -613,8 +613,10 @@ fn a_boot_short_is_closed_and_stopped_only_through_short_opened_ids() {
 }
 
 /// Amendment A9 in native mode: 10 @ 100 ($1 000 base) marked at bar closes 90 and 110 (10 %
-/// drawdown and run-up), flattened @ 95 (−$50: −5 %). The aggregates ride `on_fill` and
-/// `open_bar`, the book's one transition and its marks.
+/// run-up), flattened @ 95 (−$50: −5 %). The aggregates ride `on_fill` and `open_bar`, the book's
+/// one transition and its marks. CAR-R33K-1 is shared with native (`pin:04-max-dd-pct-equity-f64`):
+/// the drawdown percent is $100 below the $100 000 peak at 90 (0.1 %); the flatten's −$50 (eq
+/// 99 950, 0.05 %) leaves it.
 #[test]
 fn a9_percent_aggregates_ride_on_fill_and_open_bar() {
     let mut b = broker(cfg());
@@ -634,9 +636,11 @@ fn a9_percent_aggregates_ride_on_fill_and_open_bar() {
         });
     }
     let v = *b.view();
+    let eq = (100_000.0f64 + 0.0) + (90.0 - 100.0) * 10.0 * 1.0;
+    let dd = (100_000.0 - eq) / 100_000.0 * 100.0;
     assert_eq!(
-        (v.max_drawdown_pct_1e6, v.max_runup_pct_1e6),
-        (10 * E, 10 * E)
+        (v.max_drawdown_pct_f64_bits, v.max_runup_pct_1e6),
+        (dd.to_bits(), 10 * E)
     );
     b.flatten(&quote(95 * E, 95 * E), NOW, &mut out).unwrap();
     let oid = out.as_slice()[0].client_oid;
@@ -653,4 +657,7 @@ fn a9_percent_aggregates_ride_on_fill_and_open_bar() {
         f64::from_bits(v.netprofit_f64_bits).to_bits(),
         (-50f64).to_bits()
     );
+    // CAR-R33K-1: the loss leaves the 0.1 % maximum (the flat fill point reads 0.05 %).
+    assert_eq!(v.max_drawdown_pct_f64_bits, dd.to_bits());
+    assert!((100_000.0 - 99_950.0) / 100_000.0 * 100.0 < dd);
 }

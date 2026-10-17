@@ -398,6 +398,47 @@ fn broker_view_netprofit_f64_bits_round_trip() {
     }
 }
 
+/// CAR-R33K-1 (r33m): `BrokerView::max_drawdown_pct_f64_bits` is A9's `max_drawdown_pct_1e6`
+/// re-typed in place — offset 208, eight bytes, the view still 256 B / align 64 with every other
+/// field where it was — and carries an f64 by its bits: the default reads `+0.0` (E118: 0 before
+/// the first trade), and every f64 round-trips exactly.
+#[test]
+fn broker_view_max_drawdown_pct_f64_bits_layout_and_round_trip() {
+    assert_eq!(
+        core::mem::offset_of!(BrokerView, max_drawdown_pct_f64_bits),
+        208
+    );
+    assert_eq!(
+        core::mem::size_of_val(&BrokerView::default().max_drawdown_pct_f64_bits),
+        8
+    );
+    assert_eq!(core::mem::offset_of!(BrokerView, max_drawdown_1e12), 176);
+    assert_eq!(core::mem::offset_of!(BrokerView, max_runup_pct_1e6), 216);
+    assert_eq!(core::mem::offset_of!(BrokerView, netprofit_f64_bits), 248);
+    assert_eq!(core::mem::size_of::<BrokerView>(), 256);
+    assert_eq!(core::mem::align_of::<BrokerView>(), 64);
+    assert_eq!(
+        f64::from_bits(BrokerView::default().max_drawdown_pct_f64_bits).to_bits(),
+        0.0f64.to_bits()
+    );
+    for v in [
+        0.03464000000000233f64,
+        0.36576484147764066,
+        f64::MIN_POSITIVE / 2.0,
+        f64::INFINITY,
+    ] {
+        let b = BrokerView {
+            max_drawdown_pct_f64_bits: v.to_bits(),
+            ..BrokerView::default()
+        };
+        assert_eq!(
+            f64::from_bits(b.max_drawdown_pct_f64_bits).to_bits(),
+            v.to_bits()
+        );
+        assert_ne!(b, BrokerView::default());
+    }
+}
+
 /// CAR-R33-9 (r33i, `pin:U13-ta-in-loop`): the `RESTART` bit and its block layout
 /// `[state b | pre-image b | stamp u64]` — `bytes = 2b + 8`, the body's view `b`.
 #[test]

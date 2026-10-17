@@ -254,11 +254,16 @@ pub struct BrokerView {
     pub max_drawdown_1e12: i128,
     /// `strategy.max_runup` ×1e12 (≥ 0).
     pub max_runup_1e12: i128,
-    /// A9: `strategy.max_drawdown_percent` ×1e6 (≥ 0) — the largest per-trade
-    /// `max_drawdown / (entry_price × |size|) × 100` over every trade, open or
-    /// closed, as `closedtrades.max_drawdown_percent` reads each record
-    /// (`pin:04-max-dd-pct-provisional`); a zero-base trade adds nothing.
-    pub max_drawdown_pct_1e6: i64,
+    /// CAR-R33K-1 (r33m, re-typed from A9's `max_drawdown_pct_1e6: i64`, same
+    /// offset): `strategy.max_drawdown_percent` as TradingView forms it, as
+    /// `f64::to_bits` (the view derives `Eq`) — the running maximum, over every
+    /// path point the broker marks, of `(peak − eq) / peak * 100` in f64, `eq =
+    /// (initial_capital + netprofit) + openprofit` over the f64 reads and `peak`
+    /// the largest `initial_capital + netprofit` after a close (starting at
+    /// `initial_capital`; open profit never raises it)
+    /// (`pin:04-max-dd-pct-equity-f64`, E118 4320/4320 rows). Script-visible
+    /// only: no broker law reads it. `0` (the default) reads `+0.0`.
+    pub max_drawdown_pct_f64_bits: u64,
     /// A9: `strategy.max_runup_percent` ×1e6 (≥ 0) — the same over the
     /// per-trade `max_runup` (`pin:04-max-runup-pct-provisional`).
     pub max_runup_pct_1e6: i64,
@@ -291,6 +296,9 @@ const _: () = assert!(core::mem::offset_of!(TradeRec, pnl_1e12) == 64);
 const _: () = assert!(core::mem::size_of::<BrokerView>() == 256);
 const _: () = assert!(core::mem::align_of::<BrokerView>() == 64);
 const _: () = assert!(core::mem::offset_of!(BrokerView, equity_1e12) == 80);
+// CAR-R33K-1: re-typed in place (i64 → u64 bits); nothing moves.
+const _: () = assert!(core::mem::offset_of!(BrokerView, max_drawdown_pct_f64_bits) == 208);
+const _: () = assert!(core::mem::offset_of!(BrokerView, max_runup_pct_1e6) == 216);
 // CAR-R33-1: the former `_pad: [u64; 1]` slot; nothing else moves.
 const _: () = assert!(core::mem::offset_of!(BrokerView, sum_loss_pct_1e6) == 240);
 const _: () = assert!(core::mem::offset_of!(BrokerView, netprofit_f64_bits) == 248);

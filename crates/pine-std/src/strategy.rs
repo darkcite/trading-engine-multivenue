@@ -562,10 +562,10 @@ pub enum Var {
     /// reference's "`openPL / realizedEquity * 100`", realized equity = initial capital plus the
     /// closed trades' net profit (`pin:04-openprofit-pct-provisional`, operator ruling 2026-10-16).
     OpenProfitPct,
-    /// A9 `max_drawdown_percent` = `BrokerView::max_drawdown_pct_1e6` — the reference's
-    /// per-trade `Lowest Value During Trade / (Entry Price x Quantity) * 100`, the largest over
-    /// every trade, open or closed (`pin:04-max-dd-pct-provisional`); 0 before the first trade
-    /// (`pin:04-max-pct-zero-before-trade`).
+    /// `max_drawdown_percent` = `BrokerView::max_drawdown_pct_f64_bits` (CAR-R33K-1, r33m) — the
+    /// broker's running maximum over its marked path points of `(peak − eq) / peak * 100` in f64,
+    /// `peak` the closed-equity peak (`pin:04-max-dd-pct-equity-f64`, E118 4320/4320 rows; A9's
+    /// per-trade formula fit 51); 0 before the first trade (`pin:04-max-pct-zero-before-trade`).
     MaxDrawdownPct,
     /// A9 `max_runup_percent` = `BrokerView::max_runup_pct_1e6` — the same over
     /// `Highest Value During Trade` (`pin:04-max-runup-pct-provisional`); 0 before the first
@@ -882,7 +882,11 @@ fn read_var(b: &BrokerView, v: u8, x: Fmt, open: Option<f64>) -> Val {
         // `pin:04-max-pct-zero-before-trade` (r33f, retires A9's "na before the first trade"): E118
         // reads `max_drawdown_percent` 0 on all 51 rows before its first trade; the run-up twin
         // follows (the maximum over no trade is 0, as `strategy.max_runup` reads).
-        MDP => Val::F(scale::from_1e6(b.max_drawdown_pct_1e6)),
+        // `pin:04-max-dd-pct-equity-f64` (CAR-R33K-1, r33m; replaces
+        // `pin:04-max-dd-pct-provisional` for this read — the per-trade
+        // `closedtrades.max_drawdown_percent` keeps its own formula): the broker's f64, by its
+        // bits (the default `0` reads `+0.0`).
+        MDP => Val::F(f64::from_bits(b.max_drawdown_pct_f64_bits)),
         MRP => Val::F(scale::from_1e6(b.max_runup_pct_1e6)),
         ATP => Val::F(div_na(
             scale::from_1e6(b.sum_trade_pct_1e6),

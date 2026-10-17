@@ -9,7 +9,10 @@
 //!
 //! CAR-R33-1 (r33h): beside `netprofit_1e12` the book keeps `strategy.netprofit` as TradingView
 //! forms it, an f64 running sum ([`crate::visible`]); it is lent to the script through
-//! `BrokerView::netprofit_f64_bits` and read by no broker law.
+//! `BrokerView::netprofit_f64_bits` and read by no broker law. CAR-R33K-1 (r33m): likewise
+//! `strategy.max_drawdown_percent` — the closed-equity peak and the running f64 maximum folded at
+//! every mark ([`visible::raise_peak`], [`visible::fold_dd_pct`]), lent through
+//! `BrokerView::max_drawdown_pct_f64_bits`; the risk rules keep their integer source.
 
 use crate::cap;
 use crate::closed::ClosedRing;
@@ -126,6 +129,12 @@ pub(crate) struct Book {
     /// CAR-R33-1: the f64 running sum of the closed slices' script-visible profits, in close
     /// order ([`visible::add_slice`]), held as `f64::to_bits` (D18: the book names no float).
     net_f64_bits: u64,
+    /// CAR-R33K-1 (`pin:04-max-dd-pct-equity-f64`): the closed-equity peak `ic + NP` in f64
+    /// ([`visible::raise_peak`]), starting at `ic`, as `f64::to_bits`.
+    dd_peak_bits: u64,
+    /// CAR-R33K-1: `strategy.max_drawdown_percent`, the running maximum of
+    /// [`visible::fold_dd_pct`] over every mark, as `f64::to_bits` (`0` reads `+0.0`).
+    dd_pct_bits: u64,
     grossprofit_1e12: i128,
     grossloss_1e12: i128,
     commission_1e12: i128,
@@ -134,8 +143,8 @@ pub(crate) struct Book {
     trough_equity_1e12: i128,
     max_drawdown_1e12: i128,
     max_runup_1e12: i128,
-    /// A9 — the largest per-trade `max_drawdown` / `max_runup` percent seen, ×1e6.
-    max_dd_pct_1e6: i64,
+    /// A9 — the largest per-trade `max_runup` percent seen, ×1e6 (the drawdown twin is
+    /// `dd_pct_bits`, CAR-R33K-1).
     max_ru_pct_1e6: i64,
     /// A9 — Σ closed-trade `profit_percent` ×1e6: all, winning, losing.
     sum_trade_pct_1e6: i64,
@@ -176,6 +185,8 @@ impl Book {
             initial_1e12: 0,
             netprofit_1e12: 0,
             net_f64_bits: 0,
+            dd_peak_bits: 0,
+            dd_pct_bits: 0,
             grossprofit_1e12: 0,
             grossloss_1e12: 0,
             commission_1e12: 0,
@@ -184,7 +195,6 @@ impl Book {
             trough_equity_1e12: 0,
             max_drawdown_1e12: 0,
             max_runup_1e12: 0,
-            max_dd_pct_1e6: 0,
             max_ru_pct_1e6: 0,
             sum_trade_pct_1e6: 0,
             sum_win_pct_1e6: 0,
@@ -229,6 +239,8 @@ impl Book {
         self.initial_1e12 = initial;
         self.netprofit_1e12 = 0;
         self.net_f64_bits = 0;
+        self.dd_peak_bits = visible::initial_bits(initial);
+        self.dd_pct_bits = 0;
         self.grossprofit_1e12 = 0;
         self.grossloss_1e12 = 0;
         self.commission_1e12 = 0;
@@ -237,7 +249,6 @@ impl Book {
         self.trough_equity_1e12 = initial;
         self.max_drawdown_1e12 = 0;
         self.max_runup_1e12 = 0;
-        self.max_dd_pct_1e6 = 0;
         self.max_ru_pct_1e6 = 0;
         self.sum_trade_pct_1e6 = 0;
         self.sum_win_pct_1e6 = 0;
@@ -526,9 +537,9 @@ impl Book {
             // at that moment — the still-open trades' paid entry fees included (−1602.94 =
             // −1596.94 − six 1 USD entry fees); recorded beside the record, same ring.
             *cum = self.netprofit_1e12.saturating_sub(open_fees);
-            // A9: the closed record's percents, read as `closedtrades.*_percent` reads it.
-            let (c_ru, c_dd) = (c.max_runup_1e6, c.max_drawdown_1e6);
-            self.roll_trade_pcts(c_ru, c_dd, l_entry, c_qty);
+            // A9: the closed record's run-up percent, read as `closedtrades.*_percent` reads it.
+            let c_ru = c.max_runup_1e6;
+            self.roll_runup_pct(c_ru, l_entry, c_qty);
             let c_pct = trade_pct_1e6(c_pnl, l_entry, c_qty).unwrap_or(0);
             self.sum_trade_pct_1e6 = self.sum_trade_pct_1e6.saturating_add(c_pct);
             if c_pnl > 0 {
@@ -552,6 +563,15 @@ impl Book {
                 self.remove_lot(i);
             }
             red_left -= n;
+        }
+        if red > 0 {
+            // CAR-R33K-1 (`pin:04-max-dd-pct-equity-f64`): the closed-equity peak after the close,
+            // before the mark below folds this fill's point.
+            // `pin:04-max-dd-pct-uncaptured-provisional`: once per closing fill, before a
+            // reversal's opening part, `NP` net of the still-open trades' paid entry fees
+            // (`open_fees`, kept current slice by slice above).
+            let np = visible::view_bits(self.net_f64_bits, open_fees);
+            self.dd_peak_bits = visible::raise_peak(self.dd_peak_bits, self.initial_1e12, np);
         }
         if open > 0 {
             let s = self.slot(usize::from(self.n));
@@ -637,7 +657,12 @@ impl Book {
     fn mark_skip(&mut self, px_1e6: i64, skip: usize) {
         let n = usize::from(self.n);
         let pv = self.pv_1e6;
+        let mt = self.mt_1e6;
         let mut open = 0_i128;
+        // CAR-R33K-1: the open trades' f64 open profit (`+0.0` start, oldest first) and paid
+        // entry fees, for the drawdown-percent fold below.
+        let mut op_bits = 0_u64;
+        let mut open_fees = 0_i128;
         let mut i = 0;
         while i < n {
             let s = self.slot(i);
@@ -646,23 +671,31 @@ impl Book {
             let gross = gross_1e12(sgn(l.qty_1e6), px_1e6, l.entry_px_1e6, a, pv);
             l.pnl_1e12 = gross.saturating_sub(l.fee_1e12);
             open = open.saturating_add(l.pnl_1e12);
+            op_bits = visible::add_open(op_bits, px_1e6, l.entry_px_1e6, l.qty_1e6, mt, pv);
+            open_fees = open_fees.saturating_add(l.fee_1e12);
             if s != skip {
                 // `pin:05-trade-excursion`: sampled on the open-profit basis (net of the entry fee).
                 let o = l.pnl_1e12;
                 l.max_runup_1e6 = l.max_runup_1e6.max(e12_to_1e6_floor(o.max(0)));
                 l.max_drawdown_1e6 = l.max_drawdown_1e6.max(e12_to_1e6_ceil((-o).max(0)));
-                let (ru, dd, e, q) = (
-                    l.max_runup_1e6,
-                    l.max_drawdown_1e6,
-                    l.entry_px_1e6,
-                    l.qty_1e6,
-                );
-                self.roll_trade_pcts(ru, dd, e, q);
+                let (ru, e, q) = (l.max_runup_1e6, l.entry_px_1e6, l.qty_1e6);
+                self.roll_runup_pct(ru, e, q);
             }
             i += 1;
         }
         self.mark_1e6 = px_1e6;
         self.openprofit_1e12 = open;
+        // CAR-R33K-1 (`pin:04-max-dd-pct-equity-f64`, shared with native): every marked path point
+        // — a fill's included, the trade it just opened included — folds
+        // `(peak − eq) / peak * 100`, `eq = (ic + NP) + op` with `NP` the view's f64 net profit.
+        let np = visible::view_bits(self.net_f64_bits, open_fees);
+        self.dd_pct_bits = visible::fold_dd_pct(
+            self.dd_pct_bits,
+            self.dd_peak_bits,
+            self.initial_1e12,
+            np,
+            op_bits,
+        );
         let eq = self.equity_1e12();
         self.peak_equity_1e12 = self.peak_equity_1e12.max(eq);
         self.trough_equity_1e12 = self.trough_equity_1e12.min(eq);
@@ -675,20 +708,16 @@ impl Book {
         self.refresh_view();
     }
 
-    /// A9 — roll `strategy.max_runup_percent` / `max_drawdown_percent`: the reference's per-trade
-    /// formula (`Highest|Lowest Value During Trade / (Entry Price x Quantity) * 100`) taken
-    /// literally, the largest over every trade's record as `opentrades.*` / `closedtrades.*` read
-    /// it (`pin:04-max-dd-pct-provisional`, `pin:04-max-runup-pct-provisional`). Called for each
-    /// open trade at every mark and for each closed slice; a zero base adds nothing.
-    fn roll_trade_pcts(&mut self, ru_1e6: i64, dd_1e6: i64, entry_px_1e6: i64, qty_1e6: i64) {
+    /// A9 — roll `strategy.max_runup_percent`: the reference's per-trade formula (`Highest Value
+    /// During Trade / (Entry Price x Quantity) * 100`) taken literally, the largest over every
+    /// trade's record as `opentrades.*` / `closedtrades.*` read it
+    /// (`pin:04-max-runup-pct-provisional`; no capture). Called for each open trade at every mark
+    /// and for each closed slice; a zero base adds nothing. `max_drawdown_percent` left this rule
+    /// for the captured equity-curve law (CAR-R33K-1, [`visible::fold_dd_pct`]).
+    fn roll_runup_pct(&mut self, ru_1e6: i64, entry_px_1e6: i64, qty_1e6: i64) {
         if ru_1e6 != 0 {
             if let Some(p) = trade_pct_1e6(usd_1e6_to_1e12(ru_1e6), entry_px_1e6, qty_1e6) {
                 self.max_ru_pct_1e6 = self.max_ru_pct_1e6.max(p);
-            }
-        }
-        if dd_1e6 != 0 {
-            if let Some(p) = trade_pct_1e6(usd_1e6_to_1e12(dd_1e6), entry_px_1e6, qty_1e6) {
-                self.max_dd_pct_1e6 = self.max_dd_pct_1e6.max(p);
             }
         }
     }
@@ -737,7 +766,8 @@ impl Book {
         v.initial_capital_1e12 = self.initial_1e12;
         v.max_drawdown_1e12 = self.max_drawdown_1e12;
         v.max_runup_1e12 = self.max_runup_1e12;
-        v.max_drawdown_pct_1e6 = self.max_dd_pct_1e6;
+        // CAR-R33K-1: the f64 drawdown percent, as its bits.
+        v.max_drawdown_pct_f64_bits = self.dd_pct_bits;
         v.max_runup_pct_1e6 = self.max_ru_pct_1e6;
         v.sum_trade_pct_1e6 = self.sum_trade_pct_1e6;
         v.sum_win_pct_1e6 = self.sum_win_pct_1e6;
@@ -752,6 +782,9 @@ impl Book {
 mod tests {
     //! §7.4's cases on the book itself (`tests/book.rs` repeats them through the brokers once they
     //! land, T11 / T14).
+    // CAR-R33K-1: the drawdown-percent cases write the f64 law out (test code; the D18 gate and the
+    // crate's float lint cover the book's own code).
+    #![allow(clippy::float_arithmetic)]
 
     use super::{Book, FillSrc};
     use crate::fault::{BrokerFault, InternalDefect, ScriptRefusal};
@@ -835,13 +868,14 @@ mod tests {
         }
     }
 
-    /// A9: the view's five percent aggregates are the records' own, recomputed from scratch —
-    /// the per-trade maxima over every open and closed record, the sums over the closed ones.
+    /// A9: the view's four integer percent aggregates are the records' own, recomputed from
+    /// scratch — the per-trade run-up maximum over every open and closed record, the sums over the
+    /// closed ones. The drawdown percent (CAR-R33K-1) is an equity-curve maximum no record holds:
+    /// it is never negative and never NaN at a positive initial capital.
     fn check_a9(b: &Book) {
         let pct = |v: i128, t: &TradeRec| trade_pct_1e6(v, t.entry_px_1e6, t.qty_1e6);
-        let (mut dd, mut ru, mut all, mut win, mut loss) = (0_i64, 0_i64, 0_i64, 0_i64, 0_i64);
+        let (mut ru, mut all, mut win, mut loss) = (0_i64, 0_i64, 0_i64, 0_i64);
         let mut roll = |t: &TradeRec| {
-            dd = dd.max(pct(usd_1e6_to_1e12(t.max_drawdown_1e6), t).unwrap_or(0));
             ru = ru.max(pct(usd_1e6_to_1e12(t.max_runup_1e6), t).unwrap_or(0));
         };
         let mut i = 0;
@@ -862,11 +896,9 @@ mod tests {
             i += 1;
         }
         let v = b.view();
-        assert_eq!(
-            (v.max_drawdown_pct_1e6, v.max_runup_pct_1e6),
-            (dd, ru),
-            "A9 maxima"
-        );
+        assert_eq!(v.max_runup_pct_1e6, ru, "A9 maximum");
+        let dd = f64::from_bits(v.max_drawdown_pct_f64_bits);
+        assert!(dd >= 0.0 && dd.to_bits() >> 63 == 0, "CAR-R33K-1: {dd}");
         assert_eq!(
             (v.sum_trade_pct_1e6, v.sum_win_pct_1e6, v.sum_loss_pct_1e6),
             (all, win, loss),
@@ -874,16 +906,29 @@ mod tests {
         );
     }
 
-    /// A9 by hand: long 2 @ 100 marked 90 then 110 (drawdown and run-up $20 on a $200 base:
-    /// 10 % each), closed @ 105 (+$10: +5 %); short 1 @ 200 marked 210 ($10: 5 %), closed @ 204
-    /// (−$4: −2 %). Maxima 10 % / 10 %; Σ all +3 %, winners +5 %, losers −2 %. `reset` zeroes.
+    /// `strategy.max_drawdown_percent` as the view lends it (CAR-R33K-1).
+    fn mddp(b: &Book) -> f64 {
+        f64::from_bits(b.view().max_drawdown_pct_f64_bits)
+    }
+
+    /// `pin:04-max-dd-pct-equity-f64` written out: `(peak − ((ic + np) + op)) / peak * 100`.
+    fn law(peak: f64, np: f64, op: f64) -> f64 {
+        let eq = (100_000.0 + np) + op;
+        (peak - eq) / peak * 100.0
+    }
+
+    /// A9 by hand: long 2 @ 100 marked 90 then 110 (run-up $20 on a $200 base: 10 %), closed @ 105
+    /// (+$10: +5 %); short 1 @ 200 marked 210, closed @ 204 (−$4: −2 %). Run-up maximum 10 %;
+    /// Σ all +3 %, winners +5 %, losers −2 %. The drawdown percent is CAR-R33K-1's equity-curve
+    /// law on $100 000: $20 below the $100 000 peak at 90 (0.02 %) — the short's $10 below the
+    /// $100 010 closed-equity peak is less. `reset` zeroes.
     #[test]
     fn a9_percent_aggregates_follow_the_records() {
         let mut b = Book::new(CAP, PV, false);
         let v = b.view();
         assert_eq!(
             (
-                v.max_drawdown_pct_1e6,
+                v.max_drawdown_pct_f64_bits,
                 v.max_runup_pct_1e6,
                 v.sum_trade_pct_1e6
             ),
@@ -891,22 +936,20 @@ mod tests {
         );
         b.apply_fill(qty(2), px(100), 0, &src(1), 0, 0, 0).unwrap();
         b.mark(px(90));
-        assert_eq!(
-            b.view().max_drawdown_pct_1e6,
-            10_000_000,
-            "an open trade counts"
-        );
+        let dd = law(100_000.0, 0.0, (90.0 - 100.0) * 2.0);
+        assert_eq!(mddp(&b).to_bits(), dd.to_bits(), "an open trade counts");
         b.mark(px(110));
         b.apply_fill(-qty(2), px(105), 0, &close(2, 0), 1, 0, 0)
             .unwrap();
         b.apply_fill(-qty(1), px(200), 0, &src(3), 2, 0, 0).unwrap();
         b.mark(px(210));
+        assert!(law(100_010.0, 10.0, -10.0) < dd);
         b.apply_fill(qty(1), px(204), 0, &close(4, 0), 3, 0, 0)
             .unwrap();
         let v = *b.view();
         assert_eq!(
-            (v.max_drawdown_pct_1e6, v.max_runup_pct_1e6),
-            (10_000_000, 10_000_000)
+            (v.max_drawdown_pct_f64_bits, v.max_runup_pct_1e6),
+            (dd.to_bits(), 10_000_000)
         );
         assert_eq!(
             (v.sum_trade_pct_1e6, v.sum_win_pct_1e6, v.sum_loss_pct_1e6),
@@ -915,6 +958,92 @@ mod tests {
         check(&b);
         b.reset(CAP, PV, false);
         assert_eq!(*b.view(), *Book::new(CAP, PV, false).view());
+        // `reset` restores the peak to the initial capital too.
+        b.apply_fill(qty(1), px(100), 0, &src(5), 4, 0, 0).unwrap();
+        b.mark(px(97));
+        assert_eq!(mddp(&b).to_bits(), law(100_000.0, 0.0, -3.0).to_bits());
+    }
+
+    /// CAR-R33K-1 (`pin:04-max-dd-pct-equity-f64`): the peak is the closed equity `ic + NP` —
+    /// open profit never raises it (a long marked +50 then +20 is no drawdown) — taken after a
+    /// close (+30: peak 100 030), and the fold runs at every mark, `(peak − eq) / peak * 100`.
+    #[test]
+    fn max_dd_pct_peak_is_closed_equity_open_profit_never_raises_it() {
+        let mut b = Book::new(CAP, PV, false);
+        b.apply_fill(qty(1), px(100), 0, &src(1), 0, 0, 0).unwrap();
+        b.mark(px(150));
+        b.mark(px(120));
+        assert_eq!(mddp(&b).to_bits(), 0f64.to_bits(), "no drawdown below ic");
+        b.apply_fill(-qty(1), px(130), 0, &close(2, 0), 1, 0, 0)
+            .unwrap();
+        assert_eq!(mddp(&b).to_bits(), 0f64.to_bits());
+        b.apply_fill(qty(1), px(130), 0, &src(3), 2, 0, 0).unwrap();
+        b.mark(px(100));
+        let dd = law(100_030.0, 30.0, -30.0);
+        assert_eq!(mddp(&b).to_bits(), dd.to_bits());
+        // A marked-equity peak (100 050 at 150) would give 0.04998…, not this.
+        assert!(dd < 50.0 / 100_050.0 * 100.0);
+        // A smaller drawdown keeps the maximum.
+        b.mark(px(110));
+        assert_eq!(mddp(&b).to_bits(), dd.to_bits());
+        check(&b);
+    }
+
+    /// CAR-R33K-1: a loss leaves the peak where it was (E118 trade 2: 1 859.2 below the initial
+    /// capital, not below `ic + NP`); the closing fill's own point folds (`eq = ic + NP`, flat);
+    /// the next trade's drawdown adds to the closed loss.
+    #[test]
+    fn max_dd_pct_after_a_loss_measures_from_the_old_peak() {
+        let mut b = Book::new(CAP, PV, false);
+        b.apply_fill(qty(1), px(100), 0, &src(1), 0, 0, 0).unwrap();
+        b.apply_fill(-qty(1), px(90), 0, &close(2, 0), 1, 0, 0)
+            .unwrap();
+        assert_eq!(mddp(&b).to_bits(), law(100_000.0, -10.0, 0.0).to_bits());
+        b.apply_fill(qty(1), px(90), 0, &src(3), 2, 0, 0).unwrap();
+        b.mark(px(85));
+        assert_eq!(mddp(&b).to_bits(), law(100_000.0, -10.0, -5.0).to_bits());
+        check(&b);
+    }
+
+    /// `pin:04-max-dd-pct-uncaptured-provisional` — a short's open profit carries its sign (the
+    /// literal law; no short is captured): short 1 @ 200 marked 210 is $10 below the peak.
+    #[test]
+    fn max_dd_pct_short_follows_the_literal_law() {
+        let mut b = Book::new(CAP, PV, false);
+        b.apply_fill(-qty(1), px(200), 0, &src(1), 0, 0, 0).unwrap();
+        b.mark(px(190));
+        assert_eq!(mddp(&b).to_bits(), 0f64.to_bits());
+        b.mark(px(210));
+        assert_eq!(mddp(&b).to_bits(), law(100_000.0, 0.0, -10.0).to_bits());
+        check(&b);
+    }
+
+    /// `pin:04-max-dd-pct-uncaptured-provisional` — fees and a reversal (uncaptured): the peak is
+    /// taken once per closing fill, after its closed slices and before the opening part. Long 1 @
+    /// 100, reversed by −2 @ 110 (fee $2, $1 per half): the close nets 10 − 1 = 9 (peak 100 009);
+    /// the new short's $1 entry fee is paid after it, so the fill's own point is
+    /// `eq = 100 000 + 8`, 1 below the peak (a peak taken after the whole fill would read 0). Two
+    /// open trades (oldest first) sum their open profits.
+    #[test]
+    fn max_dd_pct_reversal_with_fees_and_several_trades() {
+        let usd = 1_000_000_000_000_i128;
+        let mut b = Book::new(CAP, PV, false);
+        b.apply_fill(qty(1), px(100), 0, &src(1), 0, 0, 0).unwrap();
+        b.apply_fill(-qty(2), px(110), 2 * usd, &src(2), 1, 0, 0)
+            .unwrap();
+        assert_eq!(b.view().position_size_1e6, -qty(1));
+        assert_eq!(b.open_trade(0).map(|t| t.fee_1e12), Some(usd));
+        let dd = law(100_009.0, 8.0, 0.0);
+        assert!(dd > 0.0);
+        assert_eq!(mddp(&b).to_bits(), dd.to_bits());
+        // Several open trades: two longs, the open profit summed oldest first from +0.0.
+        let mut b = Book::new(CAP, PV, false);
+        b.apply_fill(qty(1), px(100), 0, &src(1), 0, 0, 0).unwrap();
+        b.apply_fill(qty(3), px(102), 0, &src(2), 0, 0, 0).unwrap();
+        b.mark(px(95));
+        let op = (0.0 + (95.0 - 100.0) * 1.0) + (95.0 - 102.0) * 3.0;
+        assert_eq!(mddp(&b).to_bits(), law(100_000.0, 0.0, op).to_bits());
+        check(&b);
     }
 
     #[test]

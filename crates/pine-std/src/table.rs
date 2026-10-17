@@ -1580,8 +1580,9 @@ const fn build() -> Built {
     // (`pin:04-trade-pct-provisional`). Amendment A9 (lead ruling 2026-10-16): `max_drawdown_percent`,
     // `max_runup_percent`, `avg_trade_percent`, `avg_winning_trade_percent` and
     // `avg_losing_trade_percent` read `BrokerView`'s five A9 aggregates
-    // (`pin:04-max-dd-pct-provisional`, `pin:04-max-runup-pct-provisional`,
-    // `pin:04-avg-trade-pct-provisional`).
+    // (`pin:04-max-runup-pct-provisional`, `pin:04-avg-trade-pct-provisional`);
+    // `max_drawdown_percent` reads the f64 equity-curve ratio instead (CAR-R33K-1, E118 4320/4320,
+    // `pin:04-max-dd-pct-equity-f64`).
     {
         let rows: [(OverloadId, BuiltinFn); 12] = [
             (

@@ -8,6 +8,12 @@
 //! view can lend it to `pine-std` (`BrokerView::netprofit_f64_bits`). No fill, sizing or risk
 //! rule reads it.
 //!
+//! CAR-R33K-1 (r33m): `strategy.max_drawdown_percent` likewise — a running maximum of an f64 ratio
+//! over the closed-equity peak, folded at every marked path point ([`raise_peak`],
+//! [`fold_dd_pct`]) and lent as `BrokerView::max_drawdown_pct_f64_bits`. Shared with native (the
+//! book is shared); no fill, sizing or risk rule reads it (`risk.rs` keeps its integer
+//! closed-equity peak).
+//!
 //! `px_f64` / `qty_f64` are twins of `pine-std`'s `strategy::px_f64` / `qty_f64`: `pine-broker`
 //! depends on `pine-ir` only (impl-05 I2) and `pine-std` may not depend on `pine-broker`
 //! (contract §2), so the shared home would be `pine_ir::scale` — a pine-ir change outside
@@ -98,9 +104,84 @@ pub(crate) fn view_bits(net_bits: u64, open_fees_1e12: i128) -> u64 {
     (f64::from_bits(net_bits) - scale::from_1e12(open_fees_1e12)).to_bits()
 }
 
+/// `initial_capital` as the script reads it, `ic_1e12 / 1e12` (`pine-std`'s
+/// `strategy.initial_capital` read) — the closed-equity peak's start (CAR-R33K-1).
+#[inline(always)]
+pub(crate) fn initial_bits(ic_1e12: i128) -> u64 {
+    scale::from_1e12(ic_1e12).to_bits()
+}
+
+/// The open profit's f64 running sum after one more open trade marked at `px`:
+/// `op + (px(p) − px(entry)) · qty(q) · pointvalue`, oldest first from `+0.0` — `pine-std`'s
+/// `open_profit_f64` term (`pin:04-openprofit-f64`, r33f; E114 4320/4320), gross of the entry fee,
+/// the signed quantity carrying a short's sign. `pin:04-max-dd-pct-uncaptured-provisional`: the
+/// order over several open trades is that read's (oldest first), uncaptured here.
+#[inline(always)]
+pub(crate) fn add_open(
+    op_bits: u64,
+    px_1e6: i64,
+    entry_px_1e6: i64,
+    qty_1e6: i64,
+    mt_1e6: i64,
+    pv_1e6: i64,
+) -> u64 {
+    let t = (px_f64(px_1e6, mt_1e6) - px_f64(entry_px_1e6, mt_1e6))
+        * qty_f64(qty_1e6)
+        * scale::from_1e6(pv_1e6);
+    (f64::from_bits(op_bits) + t).to_bits()
+}
+
+/// `pin:04-max-dd-pct-equity-f64` (CAR-R33K-1, r33m) — the closed-equity peak after a close:
+/// `peak = max(peak, ic + NP)`, `NP` the f64 net profit as `strategy.netprofit` reads it
+/// ([`view_bits`]); open profit never raises it (E118: a variant whose peak is every marked
+/// equity, the highs included, fits 51/4320 rows; the bar-close equity peak 302).
+///
+/// `pin:04-max-dd-pct-uncaptured-provisional`: taken once per closing fill, after its closed
+/// slices and before a reversal's opening part, `NP` net of the still-open trades' paid entry fees
+/// (fees in the peak, several trades closed by one fill — uncaptured; E118 closes one trade per
+/// fill, commission-free).
+#[inline(always)]
+pub(crate) fn raise_peak(peak_bits: u64, ic_1e12: i128, np_bits: u64) -> u64 {
+    let c = scale::from_1e12(ic_1e12) + f64::from_bits(np_bits);
+    if c > f64::from_bits(peak_bits) {
+        c.to_bits()
+    } else {
+        peak_bits
+    }
+}
+
+/// `pin:04-max-dd-pct-equity-f64` (CAR-R33K-1, r33m) — `strategy.max_drawdown_percent` after
+/// one more marked path point: `mddp = max(mddp, (peak − eq) / peak * 100)` with
+/// `eq = (ic + NP) + op` (`pine-std`'s `strategy.equity` formation, `pin:04-equity-f64`), in
+/// f64 and in exactly that operation order — TV E118 4320/4320 rows bit for bit; `eq = ic + (NP +
+/// op)` fits 3230, `(peak − eq) * 100 / peak` 254, `(1 − eq / peak) * 100` 51. `+0.0` before any
+/// trade (`eq = peak`). The maximum keeps `mddp` unless the new value is strictly larger.
+/// `pin:04-max-dd-pct-uncaptured-provisional`: shorts and several open trades follow the literal
+/// law (`op` from [`add_open`]), uncaptured.
+#[inline(always)]
+pub(crate) fn fold_dd_pct(
+    mddp_bits: u64,
+    peak_bits: u64,
+    ic_1e12: i128,
+    np_bits: u64,
+    op_bits: u64,
+) -> u64 {
+    let peak = f64::from_bits(peak_bits);
+    let eq = (scale::from_1e12(ic_1e12) + f64::from_bits(np_bits)) + f64::from_bits(op_bits);
+    let v = (peak - eq) / peak * 100.0;
+    if v > f64::from_bits(mddp_bits) {
+        v.to_bits()
+    } else {
+        mddp_bits
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{add_slice, px_f64, qty_f64, slice_profit_f64, view_bits};
+    use super::{
+        add_open, add_slice, fold_dd_pct, initial_bits, px_f64, qty_f64, raise_peak,
+        slice_profit_f64, view_bits,
+    };
 
     const MT: i64 = 100_000;
     const PV: i64 = 1_000_000;
@@ -149,5 +230,60 @@ mod tests {
         assert_eq!(view_bits(n, 0), p.to_bits());
         assert_eq!(view_bits(0, 0), 0f64.to_bits());
         assert_eq!(view_bits(0, fe), (-77.2496f64).to_bits());
+    }
+
+    /// CAR-R33K-1's worked rows (TV E118, `pin:04-max-dd-pct-equity-f64`), one fold each.
+    #[test]
+    fn dd_pct_fold_matches_the_car_worked_rows() {
+        let ic: i128 = 1_000_000 * 1_000_000_000_000;
+        let peak0 = initial_bits(ic);
+        assert_eq!(peak0, 1e6f64.to_bits());
+        // Trade 1 open, entry 77249.6, the entry bar's low 76903.2: (1e6 − 999653.6) / 1e6 * 100.
+        let op = add_open(0, 76_903_200_000, 77_249_600_000, 1_000_000, MT, PV);
+        let m1 = fold_dd_pct(0, peak0, ic, 0, op);
+        assert_eq!(m1, 0.03464000000000233f64.to_bits());
+        // Before any trade (eq = peak): +0.0, and a smaller value keeps the maximum.
+        assert_eq!(fold_dd_pct(0, peak0, ic, 0, 0), 0f64.to_bits());
+        let up = add_open(0, 77_254_300_000, 77_249_600_000, 1_000_000, MT, PV);
+        assert_eq!(fold_dd_pct(m1, peak0, ic, 0, up), m1);
+        // Trade 2 after trade 1's −1595.800000000003: the peak stays 1e6 (1859.2 below the
+        // initial capital at its low 75314.0, entry 75577.4).
+        let np = add_slice(0, 77_249_600_000, 75_653_800_000, 1_000_000, 0, 0, MT, PV);
+        assert_eq!(
+            raise_peak(peak0, ic, np),
+            peak0,
+            "a loss never raises the peak"
+        );
+        let op = add_open(0, 75_314_000_000, 75_577_400_000, 1_000_000, MT, PV);
+        let m2 = fold_dd_pct(m1, peak0, ic, np, op);
+        assert_eq!(m2, 0.185920000000007f64.to_bits());
+        // `eq = ic + (NP + op)` (3230/4320 rows) reads 0.18591999999999534 here.
+        let alt = (1e6 - (1e6 + (f64::from_bits(np) + f64::from_bits(op)))) / 1e6 * 100.0;
+        assert_eq!(alt.to_bits(), 0.18591999999999534f64.to_bits());
+        // Trade 10 after the closed-equity peak 1003158.2 (trades 1–8), NP −11.000000000014552,
+        // entry 67260.0, low 66760.0.
+        let peak = 1003158.2f64.to_bits();
+        let np = (-11.000000000014552f64).to_bits();
+        assert_eq!(raise_peak(peak, ic, np), peak);
+        let op = add_open(0, 66_760_000_000, 67_260_000_000, 1_000_000, MT, PV);
+        let m10 = fold_dd_pct(m2, peak, ic, np, op);
+        assert_eq!(m10, 0.36576484147764066f64.to_bits());
+        // A profit raises the peak to `ic + NP` exactly.
+        let win = 3158.2f64.to_bits();
+        assert_eq!(raise_peak(peak0, ic, win), (1e6f64 + 3158.2f64).to_bits());
+        // A short's open profit carries its sign (`pin:04-max-dd-pct-uncaptured-provisional`).
+        let s = add_open(0, 77_259_600_000, 77_249_600_000, -1_000_000, MT, PV);
+        assert!(f64::from_bits(s) < 0.0);
+        assert_eq!(
+            f64::from_bits(add_open(
+                s,
+                77_249_600_000,
+                77_249_600_000,
+                1_000_000,
+                MT,
+                PV
+            )),
+            f64::from_bits(s)
+        );
     }
 }
