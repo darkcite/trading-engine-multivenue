@@ -128,10 +128,13 @@ fn infer_mutable_variable_is_series_v6() {
 
 #[test]
 fn infer_mutable_variable_v5_follows_var_qualifier_pin() {
-    // The default reading (`Series`); `Join` is `readings_var_qualifier_both`.
+    // The default reading (`Join`, TradingView F083): the join of the values assigned, so an
+    // all-`const` reassigned variable is admitted by a `simple` parameter and a `series` value
+    // assigned raises it to `series`. `Series` is `readings_var_qualifier_both`.
+    accepted(V5, "x = 5\nx := 6\nf(simple int a) => a\nplot(f(x))\n");
     refused(
         V5,
-        "x = 5\nx := 6\nf(simple int a) => a\nplot(f(x))\n",
+        "x = 5\nx := bar_index\nf(simple int a) => a\nplot(f(x))\n",
         3008,
     );
 }

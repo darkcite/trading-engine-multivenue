@@ -2666,7 +2666,7 @@ impl Lower<'_> {
             return Err(self.todo(n, "an unknown type"));
         };
         let fields = u.fields.clone();
-        let file = u.file;
+        let defaults = u.defaults.clone();
         let site = self.obj_sites;
         self.obj_sites += 1;
         if what == "copy" {
@@ -2716,20 +2716,28 @@ impl Lower<'_> {
         for (i, &(_, ft, def)) in fields.iter().enumerate() {
             let v = match by_field[i] {
                 Some(a) => self.value_as(a, ft)?,
+                // A declared default: its fold (§4.3.1, §4.17) — any constant form pass 3
+                // folded (a literal, `na`, an enum member's ordinal, `color.red`, a `const`
+                // global, an operator over those), a constant of its own type widened to the
+                // field's (`float x = 1`, §4.4.3).
+                None if def.is_some() => match defaults.get(i).copied().flatten() {
+                    Some((K::Na, _)) => self.konst(K::Na, ft, at),
+                    Some((k, kt))
+                        if (kt.ty == ft.ty && kt.a == ft.a)
+                            || (kt.ty == Ty::Int && ft.ty == Ty::Float) =>
+                    {
+                        let c = self.konst(k, kt, at);
+                        self.widen(c, Some(kt), ft.ty)
+                    }
+                    _ => return Err(self.todo(n, "a field default that does not fold")),
+                },
                 None => {
-                    let fast = self.files.get(file).copied().flatten();
-                    let k = match (def, fast) {
-                        (Some(d), Some(fa)) => match self.literal_k(fa, d) {
-                            Some(k) => k,
-                            None => return Err(self.todo(n, "a field default that does not fold")),
-                        },
-                        _ if ft.ty == Ty::Bool && self.rd.bool_na == swr::BOOL_NA_NEVER => {
-                            K::Bool(false)
-                        }
-                        _ => K::Na,
+                    let k = if ft.ty == Ty::Bool && self.rd.bool_na == swr::BOOL_NA_NEVER {
+                        K::Bool(false)
+                    } else {
+                        K::Na
                     };
-                    let v = self.konst(k, ft, at);
-                    self.widen_slot(v, ft.ty)
+                    self.konst(k, ft, at)
                 }
             };
             vals.push(v);

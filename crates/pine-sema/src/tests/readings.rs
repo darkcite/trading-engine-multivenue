@@ -136,14 +136,16 @@ fn readings_for_counter_shadow_both() {
 
 #[test]
 fn readings_var_qualifier_both() {
-    // v5: a reassigned variable whose values are all `const` is `series` by default and the
-    // join (`const`) under `Join` (§4.4.2), so a `simple` parameter refuses it, then admits it.
+    // v5: a reassigned variable whose values are all `const` is the join (`const`) under the
+    // default `Join` (TradingView F083) and `series` under `Series` (§4.4.2), so a `simple`
+    // parameter admits it, then refuses it.
     let src = "x = 5\nx := 6\nf(simple int a) => a\nplot(f(x))\n";
     let mut r = Readings::of(Dialect::V5);
-    assert_eq!(r.pins.var_qualifier, VarQualifier::Series);
+    assert_eq!(r.pins.var_qualifier, VarQualifier::Join);
+    assert_eq!(codes(src, &r), vec![ACCEPTED]);
+    r.pins.var_qualifier = VarQualifier::Series;
     assert_eq!(codes(src, &r), vec![3008]);
     r.pins.var_qualifier = VarQualifier::Join;
-    assert_eq!(codes(src, &r), vec![ACCEPTED]);
     // A `series` value assigned raises the join to `series` (the worklist's second round).
     let src = "x = 5\nx := bar_index\nf(simple int a) => a\nplot(f(x))\n";
     assert_eq!(codes(src, &r), vec![3008]);

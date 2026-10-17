@@ -138,10 +138,11 @@ pub(crate) struct Typed {
 /// One user type's fields, as lowering reads them (§4.14.7).
 #[derive(Debug, Clone)]
 pub(crate) struct UdtInfo {
-    /// The declaring file.
-    pub(crate) file: usize,
     /// Its `FieldDecl`s' `(name, type, default)`, in order.
     pub(crate) fields: Vec<(Sym, TypeQ, Option<NodeId>)>,
+    /// `defaults[i]`: field `i`'s default folded (§4.3.1 "a field default must fold", §4.17)
+    /// with the default's own type — `None` when it has none or the fold is not one of ours.
+    pub(crate) defaults: Vec<Option<(K, TypeQ)>>,
 }
 
 /// One typed expression.
@@ -415,8 +416,10 @@ impl<'a, 's> Infer<'a, 's> {
         let root = self.finish_inst(None, Vec::new(), Ex::of(void(), None));
         self.inputs.finish();
         let mut udts = Vec::with_capacity(self.udts.len());
-        for &(f, d) in &self.udts {
+        for k in 0..self.udts.len() {
+            let (f, d) = self.udts[k];
             let mut fields = Vec::new();
+            let mut defaults = Vec::new();
             if let Some(ast) = self.files[f] {
                 if let Node::TypeDecl { fields: fs, .. } = ast.node(d) {
                     for &fd in fs {
@@ -428,11 +431,12 @@ impl<'a, 's> Infer<'a, 's> {
                                 type_ref(ast, &*self.syms, ty, Qual::Series, &|p| self.named(f, p))
                                     .unwrap_or(void());
                             fields.push((ast.sym(name), ft, default));
+                            defaults.push(default.and_then(|x| self.field_default(f, x)));
                         }
                     }
                 }
             }
-            udts.push(UdtInfo { file: f, fields });
+            udts.push(UdtInfo { fields, defaults });
         }
         Typed {
             udts,
@@ -590,9 +594,10 @@ impl<'a, 's> Infer<'a, 's> {
             self.cur.locals.push((id, t));
             // §4.12.3: "Every use folds (window lengths, `request.security` targets, declaration
             // arguments)" — an `input`-qualified variable carries its value in effect like a
-            // `const` one (a reassigned variable is `series` under the default reading, §4.4.2).
-            // A reassigned variable never folds: under `pin:02-var-qualifier` `Join` its
-            // qualifier can stay `const`/`input` while its value changes at the `:=`.
+            // `const` one (a reassigned variable is `series` in v6, §4.4.2).
+            // A reassigned variable never folds: under `pin:02-var-qualifier` `Join` (the v5
+            // default since TradingView F083) its qualifier can stay `const`/`input` while its
+            // value changes at the `:=`.
             let reassigned = self
                 .res
                 .reassigned
@@ -1167,7 +1172,9 @@ impl<'a, 's> Infer<'a, 's> {
                 let Node::EnumDecl { members, .. } = east.node(d) else {
                     return Ex::bad();
                 };
-                if members.iter().any(|&x| match east.node(x) {
+                // §4.3 / §4.17: an enum member is `Enum`, `Const`, and folds to its ordinal —
+                // member `k` in declaration order, the i64 lane's value (contract §3.2).
+                if let Some(ord) = members.iter().position(|&x| match east.node(x) {
                     Node::EnumMember { name, .. } => east.sym(name) == m,
                     _ => false,
                 }) {
@@ -1175,7 +1182,7 @@ impl<'a, 's> Infer<'a, 's> {
                         a: decl,
                         ..TypeQ::scalar(Ty::Enum, Qual::Const)
                     };
-                    return Ex::of(t, None);
+                    return Ex::of(t, Some(K::Int(ord as i64)));
                 }
                 let msg = format!("no enum member `{}`", self.syms.resolve(m));
                 return self.refuse(ReasonCode::UnknownName, at, msg);
@@ -2358,6 +2365,23 @@ impl<'a, 's> Infer<'a, 's> {
         let e = self.expr(x);
         self.cur = saved;
         e.t
+    }
+
+    /// A UDT field default `x` of file `f` folded with its type (§4.3.1: "A field default must
+    /// fold (§4.17), else `3008`" — pass 2 checked the form; the value is folded here, like a
+    /// parameter default, in a throwaway frame of the declaring file). Every constant form
+    /// §4.17 folds is one: a literal, `na`, an enum member (its ordinal), a `const` built-in
+    /// value (`color.red`), a `const` global, an operator over those. `None` when it did not
+    /// fold.
+    fn field_default(&mut self, f: usize, x: NodeId) -> Option<(K, TypeQ)> {
+        let fr = self.frame_for(f, Vec::new());
+        let saved = std::mem::replace(&mut self.cur, fr);
+        let e = self.expr(x);
+        self.cur = saved;
+        if e.bad {
+            return None;
+        }
+        e.k.map(|k| (k, e.t))
     }
 
     fn type_inst(&mut self, f: usize, d: NodeId, key: Vec<TypeQ>) -> Result<u32, Diag> {

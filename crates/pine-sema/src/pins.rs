@@ -74,12 +74,17 @@ pub(crate) enum IntCast {
 /// `pin:02-var-qualifier` — the v5 qualifier of a reassigned variable (§4.4.2). v6 is `series`
 /// (MG-8); v5's documentation says some mutable variables are "erroneously qualified as
 /// 'const'". Probe (v5): `x = 5` · `x := 6` · `f(simple int a) => a` · `plot(f(x))`.
+///
+/// Decided by TradingView F083 (v5, r33l): `len = 5` · `len := 6` · `ta.ema(syn, len)` (`length`
+/// is `simple` in both dialects) compiled and ran — row 0 `1, na` (1 of 1 captured rows) — which
+/// refutes `Series` (`3008`) and fits `Join`. The default is `Join`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VarQualifier {
-    /// Default: `series`, as v6.
-    Series,
-    /// The join of the initialiser and every assigned value (v5's documented misqualification).
+    /// `series`, as v6 — refuted in v5 by F083.
     #[cfg_attr(not(test), allow(dead_code))] // selected only through compile_with (§7.12)
+    Series,
+    /// Default: the join of the initialiser and every assigned value (v5's documented
+    /// misqualification; TradingView F083).
     Join,
 }
 
@@ -205,7 +210,7 @@ pub(crate) const DEFAULT: Pins = Pins {
     for_counter_shadow: ForCounterShadow::Refuse,
     color_alpha: ColorAlpha::RoundHalfUp,
     int_cast: IntCast::Trunc,
-    var_qualifier: VarQualifier::Series,
+    var_qualifier: VarQualifier::Join,
     na_compare: NaCompare::FalseBoth,
     na_condition: NaCondition::AsFalse,
     v5_num_to_bool: V5NumToBool::Na,

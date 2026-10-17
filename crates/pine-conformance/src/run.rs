@@ -441,6 +441,37 @@ fn window_range(w: Window, n: u32, open_of: &impl Fn(u32) -> i64) -> (u32, u32) 
     }
 }
 
+/// The capture stamp `YYYY-MM-DDTHH:MMZ` (§4.4.1) as UTC epoch ms; `None` when the fixture has no
+/// valid stamp (pending, not a TradingView fixture). Proleptic Gregorian days from 1970-01-01
+/// (`pin:06-capture-utc-calendar`).
+pub fn capture_ms(s: &crate::fixture::Stamp) -> Option<i64> {
+    let crate::fixture::Stamp::At(t) = s else {
+        return None;
+    };
+    if !crate::fixture::is_capture_utc(t) {
+        return None;
+    }
+    let b = t.as_bytes();
+    let num = |at: usize, n: usize| -> i64 {
+        let mut v = 0i64;
+        let mut i = at;
+        while i < at + n {
+            v = v * 10 + i64::from(b[i] - b'0');
+            i += 1;
+        }
+        v
+    };
+    let (y, m, d, hh, mm) = (num(0, 4), num(5, 2), num(8, 2), num(11, 2), num(14, 2));
+    // Days from the civil date: the year shifted to start in March, 400-year eras.
+    let ys = if m <= 2 { y - 1 } else { y };
+    let era = ys.div_euclid(400);
+    let yoe = ys - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(((days * 24 + hh) * 60 + mm) * 60_000)
+}
+
 /// The compared cells of one evaluated row into the plot buffer.
 #[inline]
 fn copy_row(buf: &mut [f64], row: usize, src: &[usize], plots: &[f64]) {
@@ -713,6 +744,33 @@ impl Runner {
                 to_close_ms: spec::TO_MS + htf_ms,
             }
         };
+        // pin:06-open-trade-export-mark (r33k, E107) — TradingView prints a still-open trade's
+        // run-up / drawdown as of the export: its chart ran on past the compared chart to the
+        // capture minute (E107 trade 45, open from 2026-10-11 04:00: drawdown −3044.9 = the
+        // 2026-10-15 13:00 low 79732.3, two days after `TO_MS`; the chart's own bars give −1077.1).
+        // The bar root's rows after `TO_MS` that closed by the capture stamp are the export's
+        // marks; opened here with the run's other files (load time).
+        let tail_clamp = match (&drive, &f.expect, capture_ms(&f.captured)) {
+            (Drive::Chart(_), Expect::Strategy { .. }, Some(cap)) if cap > spec::TO_MS => {
+                Some(pine_screen::Clamp {
+                    from_open_ms: spec::TO_MS,
+                    to_close_ms: cap,
+                })
+            }
+            _ => None,
+        };
+        let tail_open = match tail_clamp {
+            Some(c) => match self.chart.rows(spec::SYMBOL_KEY, spec::TIMEFRAME_S, c) {
+                Ok(_) => true,
+                // No row of the root closed after the chart and by the capture: nothing to mark.
+                Err(RunError::BarFile {
+                    err: pine_screen::BarFileErr::Empty,
+                    ..
+                }) => false,
+                Err(e) => return Err(e),
+            },
+            None => false,
+        };
         // Owned HTF rows (Syn, Rt); chart files stay borrowed from the `ChartSource`.
         let mut owned: Vec<Vec<Bar>> = Vec::with_capacity(flat.len());
         match &drive {
@@ -757,6 +815,13 @@ impl Runner {
             Drive::Chart(c) => self
                 .chart
                 .opened(spec::SYMBOL_KEY, spec::TIMEFRAME_S, *c)
+                .expect("opened above"),
+            _ => &[],
+        };
+        let tail_rows: &[Bar] = match (tail_open, tail_clamp) {
+            (true, Some(c)) => self
+                .chart
+                .opened(spec::SYMBOL_KEY, spec::TIMEFRAME_S, c)
                 .expect("opened above"),
             _ => &[],
         };
@@ -959,6 +1024,27 @@ impl Runner {
         let res = res.map_err(|h| host_err(h, &key_of, &mut fk));
         self.fault_key = fk;
         res?;
+        // pin:06-open-trade-export-mark — the export's marks of the trades still open: the broker
+        // walks the tail rows (fills, margin and risk rules as on any bar; no script evaluation —
+        // the generated E scripts act only inside `_on` / on `_last`, so after `TO_MS` they commit
+        // nothing). Only when a trade is open: a flat book has nothing the export marks.
+        if let Some(b) = broker.as_mut() {
+            if b.view().opentrades > 0 {
+                let mut k = 0usize;
+                while k < tail_rows.len() {
+                    // COPY: one 64-B Bar per tail row (≤ the rows to the capture) — the index must
+                    // continue the run's, the broker counts bars by index and the clamped file
+                    // restarts at 0 — stepping the file's own index rejected.
+                    let mut tb = tail_rows[k];
+                    tb.index = n_rows.saturating_add(u32::try_from(k).unwrap_or(u32::MAX));
+                    let mut step = b.open_bar(&tb);
+                    while let pine_broker::TvStep::Evaluate { .. } = step {
+                        step = b.submit(&[]).map_err(RunError::Broker)?;
+                    }
+                    k += 1;
+                }
+            }
+        }
         // 16
         let mut trades = Vec::new();
         let mut cum_net = Vec::new();
@@ -1504,5 +1590,27 @@ pub fn dialect_divergence(
             }
         }
         _ => Some((NO_ROW, usize::MAX)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capture_ms;
+    use crate::fixture::Stamp;
+
+    /// `pin:06-open-trade-export-mark` — the capture stamp as UTC epoch ms (E107's
+    /// `2026-10-17T06:31Z`, a leap day, a March start, the epoch and one minute before it); a
+    /// pending or non-TradingView stamp and a malformed one have none.
+    #[test]
+    fn capture_stamps_read_as_utc_ms() {
+        let at = |s: &str| capture_ms(&Stamp::At(s.to_string()));
+        assert_eq!(at("2026-10-17T06:31Z"), Some(1_792_218_660_000));
+        assert_eq!(at("2024-02-29T12:00Z"), Some(1_709_208_000_000));
+        assert_eq!(at("2000-03-01T00:00Z"), Some(951_868_800_000));
+        assert_eq!(at("1970-01-01T00:00Z"), Some(0));
+        assert_eq!(at("1969-12-31T23:59Z"), Some(-60_000));
+        assert_eq!(at("2026-02-29T00:00Z"), None);
+        assert_eq!(capture_ms(&Stamp::Pending), None);
+        assert_eq!(capture_ms(&Stamp::NotApplicable), None);
     }
 }
