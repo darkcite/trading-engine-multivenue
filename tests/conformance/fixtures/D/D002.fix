@@ -7,7 +7,7 @@ script_sha256	3bdd76b5dad8fb50d77d71ca4e17b32f94ce1a030f951c3b765e6f9b9638d9a3
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
 captured	2026-10-17T04:48Z
 tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
-captured_in	5
+captured_in	56
 driver	chart
 align	time
 dialects	56

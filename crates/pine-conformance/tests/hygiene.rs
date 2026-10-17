@@ -440,7 +440,8 @@ fn live_tree(tag: &str, pick: impl Fn(&Fixture) -> bool) -> (PathBuf, Vec<Fixtur
     (t, picked)
 }
 
-/// I18.
+/// I18 — the ratchet the operator grows: 8 MiB, raised to 16 MiB by the operator on 2026-10-17 when
+/// the group-E strategy captures (position series over the chart window, List-of-Trades rows) landed.
 #[test]
 fn fixture_payload_is_under_the_ratchet() {
     let root = workspace_root();
@@ -451,8 +452,8 @@ fn fixture_payload_is_under_the_ratchet() {
         .map(|r| std::fs::metadata(root.join(r)).map_or(0, |m| m.len()))
         .sum();
     assert!(
-        total <= 8 << 20,
-        "tests/conformance holds {total} bytes > 8 MiB"
+        total <= 16 << 20,
+        "tests/conformance holds {total} bytes > 16 MiB"
     );
 }
 

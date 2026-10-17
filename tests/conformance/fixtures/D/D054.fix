@@ -6,14 +6,14 @@ pin	pin:U12-lookahead-off-realtime
 script	tests/conformance/fixtures/D/D054.pine
 script_sha256	8d09ba7272db2ec16bca40ba5775538af2a54f535edee09e59927f9ed38af8b2
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T07:07Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	6
 driver	rt
 align	step
 dialects	56
 mode	realtime
-bars	pending
+bars	80
 window	tail	16
 oracle	tv
 tier	2
@@ -21,4 +21,21 @@ rt	64	16	3	5
 plot	f_D054_rt	exact
 plot	f_D054_done	exact
 plot	f_D054_k	exact
-pending
+series
+64	1	1	214
+65	1	1	223
+66	1	1	218
+67	1	1	0
+68	1	1	219
+69	1	1	215
+70	1	1	218
+71	1	1	220
+72	1	1	0
+73	1	1	217
+74	1	1	226
+75	1	1	228
+76	1	1	218
+77	1	1	0
+78	1	1	220
+79	1	1	220
+end

@@ -5,17 +5,82 @@ title	a declared field default
 script	tests/conformance/fixtures/C/C034.pine
 script_sha256	c60d8da3b11cc2dd00065ff7f43d44c0834d32c772bb021a6fb5c9aef715e530
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T06:40Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	56
 driver	syn
 align	step
 dialects	56
 mode	bar_close
-bars	pending
+bars	24486
 window	head	64
 oracle	tv
 tier	1
 plot	f_C034_isna	exact
 plot	f_C034_val	exact
-pending
+series
+0	0	5
+1	0	5
+2	0	5
+3	0	5
+4	0	5
+5	0	5
+6	0	5
+7	0	5
+8	0	5
+9	0	5
+10	0	5
+11	0	5
+12	0	5
+13	0	5
+14	0	5
+15	0	5
+16	0	5
+17	0	5
+18	0	5
+19	0	5
+20	0	5
+21	0	5
+22	0	5
+23	0	5
+24	0	5
+25	0	5
+26	0	5
+27	0	5
+28	0	5
+29	0	5
+30	0	5
+31	0	5
+32	0	5
+33	0	5
+34	0	5
+35	0	5
+36	0	5
+37	0	5
+38	0	5
+39	0	5
+40	0	5
+41	0	5
+42	0	5
+43	0	5
+44	0	5
+45	0	5
+46	0	5
+47	0	5
+48	0	5
+49	0	5
+50	0	5
+51	0	5
+52	0	5
+53	0	5
+54	0	5
+55	0	5
+56	0	5
+57	0	5
+58	0	5
+59	0	5
+60	0	5
+61	0	5
+62	0	5
+63	0	5
+end

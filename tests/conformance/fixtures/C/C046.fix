@@ -6,14 +6,14 @@ pin	pin:02-once-flag
 script	tests/conformance/fixtures/C/C046.pine
 script_sha256	a4c99ffc4e90d74698601b78a9a6699640406fb2bd4d2d4fdd2c9a5ad373779b
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T07:07Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	6
 driver	rt
 align	step
 dialects	6
 mode	realtime
-bars	pending
+bars	80
 window	tail	16
 oracle	tv
 tier	1
@@ -21,7 +21,24 @@ rt	64	16	3	0
 plot	f_C046_rt	exact
 plot	f_C046_done	exact
 plot	f_C046_ok	exact
-pending
+series
+64	1	1	0
+65	1	1	0
+66	1	1	0
+67	1	1	0
+68	1	1	0
+69	1	1	0
+70	1	1	0
+71	1	1	0
+72	1	1	0
+73	1	1	0
+74	1	1	0
+75	1	1	0
+76	1	1	0
+77	1	1	0
+78	1	1	0
+79	1	1	0
+end
 reading	var_like
 f_C046_ok	0
 end

@@ -5,14 +5,14 @@ title	the varip update counter inside a function
 script	tests/conformance/fixtures/C/C041.pine
 script_sha256	68dd85d1aa9b9579ea1ceec3260a9a2341bfd258b03767226d30cc33df164d82
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T07:07Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	6
 driver	rt
 align	step
 dialects	56
 mode	realtime
-bars	pending
+bars	80
 window	tail	16
 oracle	tv
 tier	1
@@ -21,4 +21,21 @@ plot	f_C041_rt	exact
 plot	f_C041_done	exact
 plot	f_C041_upd	exact
 plot	f_C041_ok	exact
-pending
+series
+64	1	1	214	1
+65	1	1	223	1
+66	1	1	218	1
+67	1	1	222	1
+68	1	1	219	1
+69	1	1	215	1
+70	1	1	218	1
+71	1	1	220	1
+72	1	1	182	1
+73	1	1	217	1
+74	1	1	226	1
+75	1	1	228	1
+76	1	1	218	1
+77	1	1	222	1
+78	1	1	220	1
+79	1	1	220	1
+end
