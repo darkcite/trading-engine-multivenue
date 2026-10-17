@@ -160,6 +160,60 @@ pub fn render_boot_tell(boot: &Pm15Boot) -> String {
     )
 }
 
+/// PM15-8, `multivenue-engine pm15-check`: the deploy's dry check, with
+/// no socket and no thread — the universe file (`--universe`, else the
+/// boot's own default) and `pm15.toml` (`--pm15`, else the default)
+/// resolved exactly as `run` resolves them, minus the options discovery
+/// (no `pm15.toml` `perp` names an option). Returns the boot tell.
+///
+/// # Errors
+/// The refusal `run` would log, with its file.
+pub fn check(universe: Option<&Path>, artifact: Option<&Path>) -> Result<String, String> {
+    let src = crate::universe_boot::read_universe_source(universe)?;
+    let boot = crate::universe_boot::resolve_boot_universe(&crate::universe_boot::UniverseFlags {
+        config_src: src.as_deref(),
+        pm_asset_id: None,
+        pm_sym_id: None,
+        bn_symbol: None,
+        bn_sym_id: None,
+        okx_symbols: None,
+        deribit_symbols: None,
+        hl_coins: None,
+        okx_depth: false,
+        deribit_depth: false,
+    })?;
+    if boot.pm_rolling.is_empty() {
+        return Err(String::from(
+            "universe: `[polymarket] rolling` is empty — slot 9 has no family",
+        ));
+    }
+    let table = ingress_ai::DescriptorTable::from_entries(
+        crate::options_manifest::build_descriptor_entries(
+            &boot.allocated,
+            &[],
+            &[],
+            &[],
+            &[],
+            boot.okx_depth,
+            boot.deribit_depth,
+        ),
+    );
+    match load_pm15_boot(
+        artifact,
+        &|d: &str| table.resolve(d.as_bytes()).map(|(sym, _)| sym),
+        &boot.pm_rolling,
+    )? {
+        Some(b) => Ok(format!(
+            "rolling={} {}",
+            boot.pm_rolling.join(","),
+            render_boot_tell(&b)
+        )),
+        None => Err(String::from(
+            "pm15: no artifact at the default path (~/multivenue/pm15.toml)",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

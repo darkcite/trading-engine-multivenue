@@ -238,6 +238,21 @@ enum Cmd {
     /// lane here and printing a JSON line every 10 s and a final one. No
     /// account, no order, no capture: safe beside the live engine.
     Pm15Probe(Pm15ProbeArgs),
+    /// PM15-8: the deploy's dry check — parse the universe file and
+    /// `pm15.toml` and resolve slot 9's families and nowcast venues
+    /// exactly as `run` would, then print the boot tell. No socket, no
+    /// thread, no `.env`: exit 0, or 78 with the refusal on stderr.
+    Pm15Check(Pm15CheckArgs),
+}
+
+#[derive(Debug, Parser)]
+struct Pm15CheckArgs {
+    /// The universe file (default: the boot's own, ~/multivenue/universe.toml).
+    #[arg(long)]
+    universe: Option<PathBuf>,
+    /// slot 9's artifact (default ~/multivenue/pm15.toml).
+    #[arg(long)]
+    pm15: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -1756,6 +1771,16 @@ fn main() -> ExitCode {
             init_tracing_stderr();
             hl_outcome_probe(&args)
         }
+        Cmd::Pm15Check(args) => match cli::pm15_boot::check(args.universe.as_deref(), args.pm15.as_deref()) {
+            Ok(tell) => {
+                println!("{tell}");
+                ExitCode::SUCCESS
+            }
+            Err(reason) => {
+                eprintln!("pm15-check: {reason}");
+                ExitCode::from(78)
+            }
+        },
         Cmd::Pm15Probe(args) => {
             // JSON lines only on stdout.
             init_tracing_stderr();
