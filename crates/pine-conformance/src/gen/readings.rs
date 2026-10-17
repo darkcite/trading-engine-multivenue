@@ -633,20 +633,28 @@ pub fn stable_sort_order(keys: &[f64], desc: bool) -> Vec<usize> {
 /// bar OHLC prices") also reads as four tick executions at O, H/L, L/H, C before the bar-close
 /// execution (`four_ticks_and_close`), or as the extremes and the close only, the open being the
 /// previous close's continuation (`extremes_and_close`).
-pub const HIST_TICK_RUNS: [(&str, [f64; 2]); 3] = [
+///
+/// R-P18 (operator 2026-10-17): TradingView ran 4 executions per history bar with
+/// `barstate.isconfirmed` true on all 4 (E122 `runs` 4, `conf` 4) —
+/// `three_points_and_close_confirmed`, the three tick points and the close with every
+/// history-tick run reading `isconfirmed` true (CAR-R32-1, applied in pine-vm by the lead).
+pub const HIST_TICK_RUNS: [(&str, [f64; 2]); 4] = [
     ("three_points_and_close", [4.0, 1.0]),
     ("four_ticks_and_close", [5.0, 1.0]),
     ("extremes_and_close", [3.0, 1.0]),
+    ("three_points_and_close_confirmed", [4.0, 4.0]),
 ];
 
 /// E123's per-bar constants (`closenew`: `barstate.isnew` at the bar-close execution; `tnew`:
-/// tick executions with `barstate.isnew`) — `pin:U17-hist-close-isnew`. Both readings take
-/// CAR-D1's tick column (`isnew` on a bar's first history tick only, `tnew = 1`); they differ in
-/// the bar column: `close_isnew` (contract §3.6.5 unchanged, impl-03's provisional) /
-/// `close_not_new` (as a realtime bar's closing update, *Bar states*: `isnew` only on the bar's
-/// first execution).
+/// tick executions with `barstate.isnew and not barstate.isconfirmed`) —
+/// `pin:U17-hist-close-isnew`. The readings differ in the bar column: `close_isnew` (contract
+/// §3.6.5 unchanged, impl-03's provisional) / `close_not_new` (as a realtime bar's closing
+/// update, *Bar states*: `isnew` only on the bar's first execution). R-P18 (2026-10-17): the
+/// tick column follows CAR-R32-1 — a history-tick run reads `isconfirmed` true (E122 `conf` 4),
+/// so no tick run counts and `tnew = 0` in both (it was CAR-D1's `1`, with ticks unconfirmed).
+/// TradingView's E123: `closenew` 1, `tnew` 0 — `close_isnew`.
 pub const HIST_TICK_ISNEW: [(&str, [f64; 2]); 2] =
-    [("close_isnew", [1.0, 1.0]), ("close_not_new", [0.0, 1.0])];
+    [("close_isnew", [1.0, 0.0]), ("close_not_new", [0.0, 0.0])];
 
 /// The r29 broker probes whose readings predict List-of-Trades rows (chart prices): named here
 /// before capture, decided by reading the captured trades against the prediction (§4.9.4,
@@ -671,6 +679,13 @@ pub const BROKER_READINGS: &[(&str, &str, &str, &str)] = &[
         HT_NEXT,
         "next_bar_open",
         "it fills at the next bar's open",
+    ),
+    // R-P18 (2026-10-17): TradingView's outcome (E124 45/45, `pin:05-hist-tick-same-point`).
+    (
+        "E124",
+        HT_NEXT,
+        "same_point",
+        "it fills at point 0 (the open), right after the open's run",
     ),
     (
         "E125",

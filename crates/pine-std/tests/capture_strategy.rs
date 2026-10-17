@@ -387,7 +387,10 @@ fn strategy_calls_build_exact_intents() {
             ],
         );
         assert_eq!(it.kind, IntentKind::Close);
-        assert_eq!((it.id, it.from_entry), (key("L"), key("L")));
+        assert_eq!(
+            (it.id, it.from_entry),
+            (key("Close entry(s) order L"), key("L"))
+        );
         assert_eq!(it.flags, fl::QTY | fl::QTY_PCT | fl::IMMEDIATELY);
 
         let it = one(ov::STRATEGY_CLOSE_ALL, d, &[]);
@@ -478,6 +481,48 @@ fn runtime_ids_equal_constant_ids() {
     assert_eq!(v[0].id_sym, Sym::NONE);
     assert!(v[1].flags & intent_flag::ID_DYNAMIC == 0);
     assert_ne!(v[1].id_sym, Sym::NONE);
+}
+
+#[test]
+fn close_exit_signal_is_close_entry_order_text_e001() {
+    // `pin:05-exit-signal-text` (CI-032): TradingView names the order `strategy.close("L1")`
+    // places "Close entry(s) order L1" (E001's trade 1 Signal). The intent's `id` keys that text
+    // (the broker's `exit_id`), `from_entry` the entry; a runtime id keys the same bytes, and
+    // `id_sym` stays the script's id (`pin:04-close-exit-id-read`).
+    let cat = [(Lane::I64, Src::Str("L")), (Lane::I64, Src::Str("1"))];
+    let mut rt = win(ov::STRATEGY_CLOSE, Dialect::V6, &[]);
+    let names: Vec<&str> = params(&OVERLOADS[ov::STRATEGY_CLOSE.0 as usize])
+        .iter()
+        .filter(|p| p.versions.has(Dialect::V6))
+        .map(|p| p.name.as_str())
+        .collect();
+    let id_at = names.iter().position(|n| *n == "id").unwrap();
+    rt[id_at] = (Lane::I64, Src::Out(0, 0));
+    let k = win(ov::STRATEGY_CLOSE, Dialect::V6, &[("id", Src::Str("L1"))]);
+    let calls = [
+        call(CONCAT, &cat, &[Lane::I64]),
+        call(ov::STRATEGY_CLOSE, &rt, &[]),
+        call(ov::STRATEGY_CLOSE, &k, &[]),
+    ];
+    let mut h = Harness::build(&script(&calls, Dialect::V6, 2));
+    assert_eq!(step(&mut h, &mut TestCtx::default(), 0), StepOutcome::Ok);
+    let v = h.intents();
+    assert_eq!(v.len(), 2);
+    let text = key("Close entry(s) order L1");
+    for it in v {
+        check_structure(it);
+        assert_eq!(it.kind, IntentKind::Close);
+        assert_eq!((it.id, it.from_entry), (text, key("L1")));
+    }
+    assert_ne!(text, key("L1"));
+    assert!(v[0].flags & intent_flag::ID_DYNAMIC != 0);
+    assert_eq!(v[0].id_sym, Sym::NONE);
+    assert!(v[1].flags & intent_flag::ID_DYNAMIC == 0);
+    assert_ne!(
+        v[1].id_sym,
+        Sym::NONE,
+        "the script's id, not the order text"
+    );
 }
 
 #[test]

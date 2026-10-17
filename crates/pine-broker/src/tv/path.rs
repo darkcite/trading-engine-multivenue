@@ -133,18 +133,35 @@ pub(crate) struct Cand {
     pub(crate) seq: u32,
     /// Order index, or leg-set index | leg bits.
     pub(crate) what: u16,
-    /// Walk bits (`tv::CAND_REKEYED`: a stop-limit's limit stage re-keyed with `a := S`).
+    /// Walk bits (`tv::CAND_REKEYED`: a stop-limit's limit stage re-keyed with `a := S`;
+    /// [`CAND_OPEN_MARKET`]: a market order at the open).
     pub(crate) flags: u16,
 }
 
 const _: () = assert!(core::mem::size_of::<Cand>() == 16);
 const _: () = assert!(core::mem::align_of::<Cand>() == 8);
 
+/// `Cand::flags` bit: a pending market order at the open path point (segment 0, reached at the
+/// open). `pin:05-open-market-first` (provisional, R-P19, one TV case — E130 trade 26): at the
+/// open it fills before the stop / limit candidates the open triggers (a gap through them),
+/// whatever their creation order.
+pub(crate) const CAND_OPEN_MARKET: u16 = 8;
+
 /// `x` precedes `y` in path order: ascending reach on an up segment, descending on a down one,
-/// ties by `seq` (I19).
+/// ties by `seq` (I19) — except at the open, where a [`CAND_OPEN_MARKET`] candidate precedes the
+/// stop / limit candidates the open triggers (`pin:05-open-market-first`, provisional, E130 trade
+/// 26); market against market and every other tie keep creation order.
 pub(crate) const fn before(x: &Cand, y: &Cand, up: bool) -> bool {
     if x.key == y.key {
-        x.seq < y.seq
+        let (xm, ym) = (
+            x.flags & CAND_OPEN_MARKET != 0,
+            y.flags & CAND_OPEN_MARKET != 0,
+        );
+        if xm != ym {
+            xm
+        } else {
+            x.seq < y.seq
+        }
     } else if up {
         x.key < y.key
     } else {
@@ -171,7 +188,7 @@ pub(crate) fn sort_cands(c: &mut [Cand], up: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{path, reach, segment, sort_cands, Cand, Level};
+    use super::{path, reach, segment, sort_cands, Cand, Level, CAND_OPEN_MARKET};
     use crate::switch::{FillLimitsPrice, PathTie};
     use pine_ir::Bar;
     use proptest::prelude::{prop_assert, proptest, ProptestConfig};
@@ -283,6 +300,15 @@ mod tests {
         assert_eq!(v, [c(5, 2), c(7, 1), c(7, 3), c(9, 0)]);
         sort_cands(&mut v, false);
         assert_eq!(v, [c(9, 0), c(7, 1), c(7, 3), c(5, 2)]);
+        // `pin:05-open-market-first`: an open market candidate wins its tie whatever its seq;
+        // market against market keeps seq order; it never jumps a different reach.
+        let m = |key: i64, seq: u32| Cand {
+            flags: CAND_OPEN_MARKET,
+            ..c(key, seq)
+        };
+        let mut v = [c(9, 0), m(9, 5), c(9, 1), m(9, 4), c(8, 6)];
+        sort_cands(&mut v, false);
+        assert_eq!(v, [m(9, 4), m(9, 5), c(9, 0), c(9, 1), c(8, 6)]);
     }
 
     proptest! {

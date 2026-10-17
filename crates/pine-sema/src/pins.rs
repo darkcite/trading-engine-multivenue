@@ -109,14 +109,17 @@ pub(crate) enum NaCondition {
 /// `s = bar_index % 2 + 1` · `for i = 0 to 4 by s` · `    x += 1`.
 /// ANSWERED by the capture (CI-004 / F085, operator R-P2): `RuntimeFault` — TradingView runs the
 /// script and stops it with "Error on bar 0: 'step' in loop must be greater than zero.".
+/// R-P17 (CI-053 / F119, operator 2026-10-17): an `na` series step is not refused — TradingView
+/// runs the body exactly once per bar (fixture reading `one_pass`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ForStep {
     /// `3008` (the pre-capture conservative default).
     #[cfg_attr(not(test), allow(dead_code))] // selected only through compile_with (§7.12)
     RefuseDynamic,
-    /// Default: the step is used as written; on entering the `for` statement a step that is not
-    /// greater than zero (`na` included: it is not greater than zero) faults `ScriptRefused`
-    /// through pine-std's `runtime.error` body (no VM change, r27 lead answer 14).
+    /// Default: the step is used as written; on entering the `for` statement a step `<= 0` faults
+    /// `ScriptRefused` through pine-std's `runtime.error` body (no VM change, r27 lead answer
+    /// 14). An `na` step does not fault (R-P17): the first iteration runs, `i + na` is na and the
+    /// bound test ends the loop.
     RuntimeFault,
     /// The step's absolute value is used; a zero step runs no iteration.
     #[cfg_attr(not(test), allow(dead_code))] // selected only through compile_with (§7.12)

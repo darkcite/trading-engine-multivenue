@@ -30,7 +30,7 @@ use crate::switch::{
 };
 use cost::{commission_1e12, slip};
 use margin::{funds_check, liquidation_price, margin_call_qty};
-use path::{before, path, reach, segment, sort_cands, Cand, Level};
+use path::{before, path, reach, segment, sort_cands, Cand, Level, CAND_OPEN_MARKET};
 use pine_ir::{
     barflag, decl_flag, Bar, BrokerCounters, BrokerView, ChartInfo, DiagCode, Dialect, IntentKind,
     OrderIntent, ProgramMeta, RunRecord, SizingMode, StrKey, StrategyDecl, TradeRec, TvCfg,
@@ -45,7 +45,8 @@ pub enum TvStep {
     /// back; the intents it emits commit, W21). `bar` is the **full** bar: on historical bars
     /// TradingView's extra executions see the bar's final OHLCV (§4.3.2) — except a history-tick
     /// run (`history_tick = PathPoints`, §4.8.9), whose `bar` is the developing bar at its path
-    /// point with `barflag::CONFIRMED` dropped (`pin:05-hist-tick-bar`).
+    /// point with `barflag::CONFIRMED` dropped (`pin:05-hist-tick-bar`) — the history-tick
+    /// encoding; the VM reads `barstate.isconfirmed` true on it (CAR-R32-1, TV E122).
     Evaluate {
         /// The full bar.
         bar: Bar,
@@ -87,6 +88,7 @@ const CAND_LATE: u16 = 2;
 /// `Cand::flags` bit: a trail armed in this segment, tried at its end point
 /// (`trail_arm_fire = SameSegment`).
 const CAND_TAIL: u16 = 4;
+// `Cand::flags` bit 8 is `path::CAND_OPEN_MARKET` (`pin:05-open-market-first`), set by `push`.
 const LEG_TP: u16 = 0;
 const LEG_SL: u16 = 1;
 const LEG_TRAIL: u16 = 2;
@@ -284,16 +286,21 @@ impl TvBroker {
         }
         let eval = self.orders.eval();
         self.stamp_born(eval);
-        // `pin:05-hist-tick-next-point` (provisional): an order born at the history-tick run at
-        // point k fills from point k + 1 on, whatever `cof_next_tick` reads.
-        if intrabar && !hist && self.sw.cof_next_tick == CofNextTick::RestOfSegment {
+        // `pin:05-hist-tick-same-point` (R-P18 lead ruling; retires lead answer 9 /
+        // `pin:05-hist-tick-next-point`): an order born at the history-tick run at path point k
+        // fills from point k itself, right after that run — the rest of segment k reached from
+        // `tick_px`, whatever `cof_next_tick` reads. TV E124–E127: 45/45 trades each (a market
+        // order made by the open's run fills at the open; next-point 0/45, E125 2/45). Exit legs
+        // keep `admit_late`'s next-segment rule (`pin:05-cof-next-tick-exits`; uncaptured here).
+        if intrabar && (hist || self.sw.cof_next_tick == CofNextTick::RestOfSegment) {
             self.admit_late(eval, tick_px);
         }
         let same_tick = self.sw.close_immediately == CloseImmediately::SameTick;
         if intrabar && same_tick {
             // `immediately` closes born now fill at this execution's tick, before the walk resumes
-            // — a history-tick run's too, at its path point (`pin:05-hist-tick-immediately`,
-            // provisional).
+            // — a history-tick run's too, at its own path point (`pin:05-hist-tick-immediately`;
+            // TV E125: `strategy.close(immediately = true)` at the run at point 1 exits at point
+            // 1's price, 45/45).
             let mut i = 0;
             while i < self.orders.len() {
                 let o = self.orders.get(i);
@@ -491,11 +498,22 @@ impl TvBroker {
         let v = self.verify_for(lv);
         if let Some((r, _)) = reach(lv, a, b, v, self.sw.fill_limits_price) {
             if self.n_cand < N_CAND {
+                // `pin:05-open-market-first` (provisional, R-P19, one TV case — E130 trade 26: at
+                // the next bar's open a pending `strategy.close` and an older exit stop the open
+                // gapped through both fill; TV takes the close first). A market order collected
+                // for segment 0 is reached at the open (`reach` → `(a, a)`), so the bit orders it
+                // before the stop / limit candidates the open triggers in `before`; segments 1–3,
+                // the on-close pass and every other tie keep creation order (I19).
+                let flags = if self.seg == 0 && lv == Level::Market {
+                    CAND_OPEN_MARKET
+                } else {
+                    0
+                };
                 self.cand[self.n_cand] = Cand {
                     key: r,
                     seq,
                     what,
-                    flags: 0,
+                    flags,
                 };
                 self.n_cand += 1;
             }
@@ -693,7 +711,20 @@ impl TvBroker {
             // `cof_close_tick` (§4.2): `No` — a fill at the close (segment 2 at `c`, the close
             // tick, the on-close pass) requests no execution; `Yes` — every fill tick does.
             let close_yes = self.sw.cof_close_tick == CofCloseTick::Yes;
+            // `pin:05-hist-tick-cof` (R-P18 lead ruling): on a history-tick bar, a fill at path
+            // point k after that point's history-tick run (an order that run created, filled at
+            // its point — `pin:05-hist-tick-same-point`) requests no `calc_on_order_fills`
+            // execution: TV E126 runs 4 times on all 4 320 bars, the 90 fill bars included. The
+            // uncaptured cases keep their execution as before: a fill before a point's run (at
+            // the open from the previous bar, lead answer 8) and a resting order filled inside a
+            // segment or at its end (lead answer 11).
+            let after_hist_run = self.hist
+                && self.bar.flags & barflag::REALTIME == 0
+                && self.seg <= 2
+                && px == self.path[self.seg]
+                && self.hist_done & (1 << self.seg) != 0;
             if any
+                && !after_hist_run
                 && (close_yes || (may_evaluate && !at_close))
                 && self.decl.flags & decl_flag::CALC_ON_ORDER_FILLS != 0
             {
@@ -902,7 +933,8 @@ impl TvBroker {
     /// The developing bar at path point `k` (0–2) of a history-tick run (§4.8.9,
     /// `pin:05-hist-tick-bar`, provisional): the open, the extremes the path has reached, the
     /// point's price as the close; the bar's full volume, its times and index unchanged;
-    /// `barflag::CONFIRMED` dropped.
+    /// `barflag::CONFIRMED` dropped (with `REALTIME` clear, the VM's history-tick mark; it reads
+    /// `isconfirmed` true there, CAR-R32-1 — the broker never reads the flag back).
     fn developing(&self, k: usize) -> Bar {
         let (mut hi, mut lo) = (self.path[0], self.path[0]);
         let mut j = 1;
@@ -1201,11 +1233,11 @@ impl TvBroker {
         }
     }
 
-    /// `cof_next_tick = RestOfSegment` (`pin:05-cof-next-tick`, the alternative): the records
-    /// (re)born at the intrabar execution `eval` at `tick_px` become candidates for the rest of
-    /// the current segment, reached from `tick_px`; their stale slots are dropped first. Exit legs
-    /// keep the next-segment rule: sets are derived at segment collection
-    /// (`pin:05-cof-next-tick-exits`).
+    /// `cof_next_tick = RestOfSegment` (`pin:05-cof-next-tick`, the alternative) and every
+    /// history-tick run (`pin:05-hist-tick-same-point`): the records (re)born at the intrabar
+    /// execution `eval` at `tick_px` become candidates for the rest of the current segment,
+    /// reached from `tick_px`; their stale slots are dropped first. Exit legs keep the
+    /// next-segment rule: sets are derived at segment collection (`pin:05-cof-next-tick-exits`).
     fn admit_late(&mut self, eval: u32, tick_px: i64) {
         let (a, b) = segment(&self.path, self.seg.min(3));
         let mut w = self.cur;

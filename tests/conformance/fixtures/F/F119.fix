@@ -33,3 +33,6 @@ end
 reading	no_loop
 0	0.0
 end
+reading	one_pass
+0	1.0
+end

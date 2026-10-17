@@ -2,8 +2,8 @@
 // Copyright 2026 Anton (darkcite)
 
 //! r27b unit tests on hand bars: the v5 order cap (CI-005 / E110, `pin:05-v5-order-limit`) and
-//! the history-tick walk behind `history_tick = PathPoints` (R-P6, §4.8.9, `pin:05-hist-tick-*`).
-//! Unit tests because the `PathPoints` reading is reached only through `with_switches` (I38).
+//! the history-tick walk behind `history_tick = PathPoints` (R-P6, §4.8.9, `pin:05-hist-tick-*`;
+//! the default since R-P18 — the `Refuse` reading is reached only through `with_switches`, I38).
 
 #[cfg(test)]
 mod tests {
@@ -205,15 +205,24 @@ mod tests {
     }
 
     #[test]
-    fn history_tick_refused_by_default_and_lifted_under_path_points() {
-        // R-P6 / lead answer 6 (`pin:05-hist-tick-refuse`): `Refuse` is the default — 5109 as before.
+    fn history_tick_admitted_by_default_and_refused_under_refuse() {
+        // R-P18 (2026-10-17): `PathPoints` is the default; `Refuse` (R-P6 / lead answer 6,
+        // `pin:05-hist-tick-refuse`, the default until R-P18) still refuses 5109 when selected.
         let m = hist_meta();
-        assert_eq!(TvBroker::new(&m, CFG).err(), Some(code::HISTORY_TICK));
-        assert!(TvBroker::with_switches(&m, CFG, PATH_POINTS).is_ok());
+        assert!(TvBroker::new(&m, CFG).is_ok());
+        assert_eq!(SWITCHES.history_tick, PATH_POINTS.history_tick);
+        let refuse = Switches {
+            history_tick: HistoryTick::Refuse,
+            ..SWITCHES
+        };
+        assert_eq!(
+            TvBroker::with_switches(&m, CFG, refuse).err(),
+            Some(code::HISTORY_TICK)
+        );
         let mut bad = m;
         bad.uses_intrabar = false; // lead answer 13: a mis-paired program refuses 5107
         assert_eq!(
-            TvBroker::with_switches(&bad, CFG, PATH_POINTS).err(),
+            TvBroker::new(&bad, CFG).err(),
             Some(code::INTRABAR_ON_BAR_CLOSE)
         );
     }
@@ -222,7 +231,9 @@ mod tests {
     fn history_tick_three_developing_runs_then_the_confirmed_close() {
         // Lead answers 7, 10 (`pin:05-hist-tick-runs`, `pin:05-hist-tick-bar`): path 100→99→104→103
         // (low first). Runs at the open and the two extremes on the developing bar — full volume,
-        // CONFIRMED dropped, times unchanged — then the bar-close run on the full bar.
+        // CONFIRMED dropped, times unchanged — then the bar-close run on the full bar. CONFIRMED and
+        // REALTIME both clear is how the VM detects a history tick; it reads `isconfirmed` true on
+        // it itself (CAR-R32-1, TV E122) — nothing here reads the flag.
         let mut b = TvBroker::with_switches(&hist_meta(), CFG, PATH_POINTS)
             .unwrap_or_else(|_| unreachable!());
         let x = bar(0, 100 * E, 104 * E, 99 * E, 103 * E);
@@ -263,9 +274,10 @@ mod tests {
     }
 
     #[test]
-    fn history_tick_orders_fill_from_the_next_point() {
-        // Lead answer 9 (`pin:05-hist-tick-next-point`): a market entry created by the run at point
-        // k fills at point k + 1 — 99 (k = 0), 104 (k = 1), the close tick 103 (k = 2).
+    fn history_tick_orders_fill_at_their_own_point() {
+        // `pin:05-hist-tick-same-point` (R-P18 lead ruling, TV E124–E127 45/45; retires lead
+        // answer 9's next point): a market entry created by the run at point k fills at point k,
+        // right after that run — 100 (k = 0), 99 (k = 1), 104 (k = 2); the later runs see it.
         let x0 = bar(0, 100 * E, 104 * E, 99 * E, 103 * E);
         let mut k = 0;
         while k < 3 {
@@ -278,9 +290,45 @@ mod tests {
             );
             assert_eq!(err, None);
             let px = b.open_trade(0).map(|t| t.entry_px_1e6 / E);
-            assert_eq!(px, Some([99, 104, 103][k]), "point {k}");
+            assert_eq!(px, Some([100, 99, 104][k]), "point {k}");
+            assert_eq!(b.view().position_size_1e6, E, "point {k}");
             k += 1;
         }
+        // The next run sees the fill: an entry at the run at point 0, the run at point 1 reads
+        // position 1 (TV E127's `p1` reading, here one point later).
+        let mut b = TvBroker::with_switches(&hist_meta(), CFG, PATH_POINTS)
+            .unwrap_or_else(|_| unreachable!());
+        let mut seen_pos = [0_i64; 4];
+        let mut step = b.open_bar(&x0);
+        let mut n = 0;
+        while let TvStep::Evaluate { .. } = step {
+            seen_pos[n] = b.view().position_size_1e6;
+            let it = if n == 0 { vec![entry()] } else { Vec::new() };
+            step = b.submit(&it).unwrap_or_else(|e| panic!("{e:?}"));
+            n += 1;
+        }
+        assert_eq!((n, seen_pos), (4, [0, E, E, E]));
+    }
+
+    #[test]
+    fn history_tick_fill_at_its_run_point_takes_no_cof_execution_e126() {
+        // `pin:05-hist-tick-cof` (R-P18 lead ruling) — TV E126: with `calc_on_order_fills`, a
+        // market entry created by the open's history-tick run fills at the open right after it
+        // and requests no execution: 4 runs on the fill bar (all 4 320 bars run 4 times).
+        let mut m = hist_meta();
+        m.decl.flags |= decl_flag::CALC_ON_ORDER_FILLS;
+        let mut b =
+            TvBroker::with_switches(&m, CFG, PATH_POINTS).unwrap_or_else(|_| unreachable!());
+        let x0 = bar(0, 100 * E, 104 * E, 99 * E, 103 * E);
+        let (seen, err) = drive(
+            &mut b,
+            &x0,
+            |n, _, _| if n == 0 { vec![entry()] } else { Vec::new() },
+        );
+        assert_eq!(err, None);
+        assert_eq!(seen.len(), 4);
+        assert_eq!(b.counters().reevals_on_order_fill, 0);
+        assert_eq!(b.open_trade(0).map(|t| t.entry_px_1e6), Some(100 * E));
     }
 
     #[test]

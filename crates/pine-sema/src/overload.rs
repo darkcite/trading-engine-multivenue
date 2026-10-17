@@ -895,29 +895,35 @@ pub(crate) fn unserved(ov: OverloadId, at: Span) -> Option<Diag> {
     Some(deferred(e, " unserved=1", at))
 }
 
-/// The UDT field rows (R-P5, Pine 2026: `array.sort(id, order, sort_field)` etc. order an
-/// `array<UDT>` by one field of its elements; v6 only).
+/// The UDT field rows (R-P5, Pine 2026: `array.sort(id, order, sort_field)` and `sort_indices`
+/// order an `array<UDT>` by one field of its elements; v6 only). R-P16 (CI-052, F108): the three
+/// `binary_search*` field rows are gone — see [`BSEARCH_NAMES`].
 const UDT_SORT_ROWS: [OverloadId; 2] = [
     pine_spec::ov::ARRAY_SORT_AT,
     pine_spec::ov::ARRAY_SORT_INDICES_AT,
 ];
-const UDT_SEARCH_ROWS: [OverloadId; 3] = [
-    pine_spec::ov::ARRAY_BINARY_SEARCH_AT,
-    pine_spec::ov::ARRAY_BINARY_SEARCH_LEFTMOST_AT,
-    pine_spec::ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AT,
-];
 
-/// `Some(search)` for a UDT field row: `false` for `sort` / `sort_indices`, `true` for the
-/// three `binary_search*`.
-pub(crate) fn udt_field_row(ov: OverloadId) -> Option<bool> {
-    if UDT_SORT_ROWS.contains(&ov) {
-        Some(false)
-    } else if UDT_SEARCH_ROWS.contains(&ov) {
-        Some(true)
-    } else {
-        None
-    }
+/// `ov` is a UDT field row (`sort` / `sort_indices`).
+pub(crate) fn udt_field_row(ov: OverloadId) -> bool {
+    UDT_SORT_ROWS.contains(&ov)
 }
+
+/// The searches that take no field argument (R-P16).
+///
+/// `pin:02-bsearch-field-refused` — R-P16 (CI-052, operator 2026-10-17): TradingView refuses at
+/// compile `array.binary_search(arr_of_udt, 777, "k_F108")` (and `_leftmost` / `_rightmost`
+/// with a field argument): "The `Ob_F108` user-defined type does not include a field named
+/// "#loc_42"" (F108). pine-spec has no field row for them, and pine-sema refuses such a call
+/// `3007` (`TypeMismatch`, the class of TradingView's compile-time type refusals) before
+/// overload resolution: an `array<UDT>` `id` with a third argument or a `sort_field` named one.
+/// TradingView's text names an internal symbol (`#loc_42`), so the message states the refusal
+/// and quotes its shape with the type's name. v6 is captured; v5 (no field rows ever) takes the
+/// same refusal (literal reading: the function has no field parameter in either dialect).
+pub(crate) const BSEARCH_NAMES: [&str; 3] = [
+    "array.binary_search",
+    "array.binary_search_leftmost",
+    "array.binary_search_rightmost",
+];
 
 /// The row's own `sort_field` default (pine-spec `{"k": "int", "v": 0}`), as a folded value.
 pub(crate) fn sort_field_default(o: &Overload) -> Option<K> {
@@ -937,7 +943,7 @@ pub(crate) fn sort_field_default(o: &Overload) -> Option<K> {
 /// `pin:02-udt-field-selector` — the reference: "An "int" `sort_field` argument specifies a
 /// field by its index, where 0 refers to the first field in the type declaration. A "string"
 /// argument specifies a field by its name"; `sort` / `sort_indices` take "any field of the type
-/// "int", "float", or "string""; `binary_search*` "any of the type's "int" or "float" fields".
+/// "int", "float", or "string"".
 /// Folded here to one `int` constant, `index | (field Ty as i64) << 32` — the index in bits
 /// 0..32, the field's `pine_ir::Ty` byte in bits 32..40 (`Int` 1, `Float` 2, `String` 5), bits
 /// 40..64 zero — which pine-std's `coll::udt_selector` decodes (its `Internal` on any other
@@ -945,7 +951,6 @@ pub(crate) fn sort_field_default(o: &Overload) -> Option<K> {
 /// all as `3007`: a selector that does not fold, a negative or out-of-range index, a name no
 /// field has, and a field of any other type (`bool`, `color`, an enum, a UDT, a collection).
 pub(crate) fn udt_selector(
-    search: bool,
     fields: &[(Sym, TypeQ)],
     sel: Option<K>,
     syms: &SymTable,
@@ -973,19 +978,10 @@ pub(crate) fn udt_selector(
         _ => return Err("`sort_field` is a constant int index or string name".to_owned()),
     };
     let ft = fields[i].1.ty;
-    let ok = if search {
-        matches!(ft, Ty::Int | Ty::Float)
-    } else {
-        matches!(ft, Ty::Int | Ty::Float | Ty::String)
-    };
-    if !ok {
-        let want = if search {
-            "int or float"
-        } else {
-            "int, float or string"
-        };
+    if !matches!(ft, Ty::Int | Ty::Float | Ty::String) {
         return Err(format!(
-            "`sort_field` names field {i} of type {}; this function takes an {want} field",
+            "`sort_field` names field {i} of type {}; this function takes an int, float or \
+             string field",
             ty_name(fields[i].1)
         ));
     }

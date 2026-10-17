@@ -144,15 +144,32 @@ fn entry_sig_ok(e: &TradeRow, a: &TradeRec, syms: &SymTable) -> bool {
     }
 }
 
+/// The exit-order names the broker and pine-std key for TradingView (`pin:05-exit-signal-text`,
+/// impl-05 §4.6.2): `strategy.close(id)`'s prefix, then the ids the broker gives the exits it
+/// generates. Divergence text only — the comparison is by key.
+const CLOSE_ENTRY_PREFIX: &str = "Close entry(s) order ";
+const BROKER_EXIT_NAMES: [&str; 5] = [
+    "Close position order",
+    "Margin call",
+    "Close Position (Max intraday Loss)",
+    "Close Position (Max consecutive loss days)",
+    "Close Position (Max number of filled orders in one day)",
+];
+
+/// `pin:05-exit-signal-text` (CI-032, runner part) — the List of Trades' exit Signal is the exit
+/// ORDER's id, and `exit_id` is its key: a key decides. `exit_sym` is the script's constant id
+/// (display): a `strategy.close(id)` trade keys `Close entry(s) order <id>` while its `exit_sym`
+/// stays `<id>` (pine-std `bi_close`, `pin:04-close-exit-id-read`), so a bare `<id>` never matches.
+///
 /// `pin:06-exit-cause-close` — `TradeRec` records no flag telling `strategy.close` from
 /// `strategy.close_all`: an id-less exit that is neither a liquidation nor a risk flatten matches
 /// either text.
 fn exit_sig_ok(sig: &str, a: &TradeRec, syms: &SymTable, signals: &SignalTable) -> bool {
-    if let Some(t) = sym_text(syms, a.exit_sym) {
-        return t == sig;
-    }
     if a.exit_id != StrKey::NONE && pine_ir::str_key(sig.as_bytes()) == a.exit_id {
         return true;
+    }
+    if let Some(t) = sym_text(syms, a.exit_sym) {
+        return a.exit_id == StrKey::NONE && t == sig;
     }
     if a.flags & trade_flag::LIQUIDATION != 0 {
         return sig == signals.liquidation;
@@ -161,6 +178,32 @@ fn exit_sig_ok(sig: &str, a: &TradeRec, syms: &SymTable, signals: &SignalTable) 
         return sig == signals.risk_flatten;
     }
     sig == signals.close || sig == signals.close_all
+}
+
+/// Our exit Signal as TradingView would print it, for a divergence's text: the text whose key is
+/// `exit_id` among `exit_sym`'s, `Close entry(s) order <exit_sym>` and the broker's names; else
+/// `exit_sym`'s text marked with the key, or `<cause>` for an id-less exit.
+fn our_exit_sig(a: &TradeRec, syms: &SymTable) -> String {
+    let key = |t: &str| pine_ir::str_key(t.as_bytes());
+    let t = sym_text(syms, a.exit_sym);
+    if a.exit_id == StrKey::NONE {
+        return t.unwrap_or("<cause>").to_string();
+    }
+    if let Some(t) = t {
+        if key(t) == a.exit_id {
+            return t.to_string();
+        }
+        let c = format!("{CLOSE_ENTRY_PREFIX}{t}");
+        if key(&c) == a.exit_id {
+            return c;
+        }
+    }
+    for n in BROKER_EXIT_NAMES {
+        if key(n) == a.exit_id {
+            return n.to_string();
+        }
+    }
+    format!("{} (key {:#018x})", t.unwrap_or("<id>"), a.exit_id.0)
 }
 
 fn pnl_on(a: &TradeRec, basis: PnlBasis) -> i128 {
@@ -220,8 +263,7 @@ fn compare_one(
             return field(n, "exit_ms", x.ms.to_string(), a.exit_ms.to_string());
         }
         if !exit_sig_ok(&x.sig, a, syms, signals) {
-            let ours = sym_text(syms, a.exit_sym).unwrap_or("<cause>").to_string();
-            return field(n, "exit_sig", x.sig.clone(), ours);
+            return field(n, "exit_sig", x.sig.clone(), our_exit_sig(a, syms));
         }
         if scaled_half_away(x.px, 6) != i128::from(a.exit_px_1e6) {
             return field(n, "exit_px", x.px.render(), px(a.exit_px_1e6));

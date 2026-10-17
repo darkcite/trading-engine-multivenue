@@ -134,8 +134,9 @@ fn write_typed(f: &mut Frame<'_>, e: u16, ty: i64, v: f64) -> Result<(), FaultKi
 }
 
 /// `request.security` — window `[__key, __out, __ty, gaps, lookahead, out]` (§3.4, `abi:
-/// lowered`); `STATEFUL | NEEDS_CTX`. `gaps_on` emits an element only when it is confirmed and
-/// newer than the last emission (journaled `SecState`, D16); `gaps_off` every aligned value.
+/// lowered`); `STATEFUL | NEEDS_CTX`. `gaps_on` emits an element only when it is confirmed (on a
+/// realtime bar with lookahead off: when it closes by the bar's close, `pin:U12-gaps-on-realtime`)
+/// and newer than the last emission (journaled `SecState`, D16); `gaps_off` every aligned value.
 pub fn bi_security(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 6 {
         return Err(FaultKind::Internal);
@@ -158,8 +159,15 @@ pub fn bi_security(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), 
     };
     let v = match hit {
         Some((v, close, conf)) if gaps => {
+            // `pin:U12-gaps-on-realtime` (lead ruling CI-056, D054 sheet-rt-02 `k` column: k = 0
+            // on the period-closing realtime bars 14:04 / 14:09 / 14:14, k = upd on every other)
+            // — on a realtime bar with lookahead off, the aligned element is due when it closes
+            // by the bar's close, confirmed or not: every update of the period-closing bar emits
+            // (its ticks the developing value, its confirm the confirmed one). The journaled
+            // `SecState` keeps a tick's emission from consuming the confirm's (D16).
+            let due = conf || (rt && !look && close <= pc);
             let st = f.state::<SecState>(site);
-            if conf && (st.primed == 0 || close > st.last_close_ms) {
+            if due && (st.primed == 0 || close > st.last_close_ms) {
                 st.last_close_ms = close;
                 st.primed = 1;
                 v

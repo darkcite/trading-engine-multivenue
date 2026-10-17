@@ -15,6 +15,8 @@
 //! * **Open issues** — CI-019 (`%` sign: F115 int, F116 float), CI-022 (F019's association:
 //!   F117), the R-P2 sema-scope probes (F118 `syn / (2 - 2)`, F119 a `for` with an `na` step; the
 //!   `strategy.order` one is E128).
+//! * **R-P16** (CI-052) — F108 re-authored without its `binary_search*` field lines (TradingView
+//!   refuses them at compile); pending. **R-P17** (CI-053) — F119's `one_pass` reading.
 //!
 //! SYN-1, `align step`, `exact` unless a plot says otherwise. Row notation as group F: `@` stands
 //! for `_<ID>`, a leading `>` is one block level. Values whose type admits `na()` get §4.2.0's
@@ -421,7 +423,14 @@ fn map_plots() -> Vec<(String, String, Tol)> {
     ])
 }
 
-/// F108 / F109: the 2026 UDT field rows (`sort`, `sort_indices`, `binary_search*` by field).
+/// F108 / F109: the 2026 UDT field rows (`sort`, `sort_indices` by field; descending by `w`).
+///
+/// `pin:02-bsearch-field-refused` — R-P16 (CI-052, operator 2026-10-17): TradingView refused
+/// F108's first form at compile, `array.binary_search(arr_F108, 777, "k_F108")` (and the
+/// `_leftmost` / `_rightmost` field forms): "The `Ob_F108` user-defined type does not include a
+/// field named "#loc_42"". pine-sema now refuses a `binary_search*` field argument `3007`, so the
+/// three search lines and their `bs` / `bl` / `br` plots are dropped; the re-authored F108 (sort,
+/// sort_indices, descending by `w`) is pending its capture.
 const UDT_ROWS: &[&str] = &[
     "type Ob@",
     ">int k@ = 0",
@@ -438,9 +447,6 @@ const UDT_ROWS: &[&str] = &[
     "o1@ = array.get(arr@, 1)",
     "o2@ = array.get(arr@, 2)",
     "o3@ = array.get(arr@, 3)",
-    "bs@ = array.binary_search(arr@, 777, \"k@\")",
-    "bl@ = array.binary_search_leftmost(arr@, 800, \"k@\")",
-    "br@ = array.binary_search_rightmost(arr@, 800, \"k@\")",
     "array.sort(arr@, order.descending, \"w@\")",
     "ow@ = array.get(arr@, 0)",
 ];
@@ -453,9 +459,6 @@ fn udt_plots() -> Vec<(String, String, Tol)> {
         ("o3@.id@", "id3", 'i', E),
         ("array.get(ix@, 0)", "ix0", 'i', E),
         ("array.get(ix@, 3)", "ix3", 'i', E),
-        ("bs@", "bs", 'i', E),
-        ("bl@", "bl", 'i', E),
-        ("br@", "br", 'i', E),
         ("ow@.id@", "wid0", 'i', E),
     ])
 }
@@ -727,7 +730,7 @@ fn rows() -> Vec<P> {
         (
             108,
             COLL,
-            "array.sort, sort_indices and binary_search by a UDT field",
+            "array.sort and sort_indices by a UDT field",
             UDT_ROWS,
         ),
         (
@@ -838,6 +841,10 @@ fn rows() -> Vec<P> {
                 ),
                 one("na_default", &[11.0]),
                 one("no_loop", &[0.0]),
+                // R-P17 (CI-053): TradingView runs the body once per bar (cnt = 1 on all
+                // 24 493 bars, v5 and v6) — the first pass runs, `i + na` is na, the bound test
+                // fails.
+                one("one_pass", &[1.0]),
             ],
             ..p(
                 119,

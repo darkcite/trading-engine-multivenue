@@ -205,31 +205,24 @@ mod tests {
         TvCfg, FNV1A64_OFFSET,
     };
 
-    /// `check_tv` on the default `history_tick = Refuse` reading.
+    /// `check_tv` on the default `history_tick = PathPoints` reading (R-P18).
     fn check_tv(m: &ProgramMeta, c: &TvCfg) -> Result<(), DiagCode> {
-        super::check_tv(m, c, false)
+        super::check_tv(m, c, true)
     }
 
     #[test]
     fn history_tick_lifted_under_path_points_5107_when_mis_paired() {
-        // R-P6 / lead answers 6, 13 (`pin:05-hist-tick-refuse`): `PathPoints` lifts 5109 for the
-        // TV broker only; a history-tick program sema did not mark `uses_intrabar` refuses 5107;
-        // the native broker keeps 5109; 5100 / 5101 still come first.
+        // R-P6 / lead answers 6, 13 (`pin:05-hist-tick-refuse`), R-P18 (the default): `PathPoints`
+        // lifts 5109 for the TV broker only; a history-tick program sema did not mark
+        // `uses_intrabar` refuses 5107; the native broker keeps 5109; 5100 / 5101 still come first.
         let mut m = meta();
         m.decl.flags |= decl_flag::CALC_ON_EVERY_HISTORY_TICK;
-        assert_eq!(
-            super::check_tv(&m, &tv(), true),
-            Err(code::INTRABAR_ON_BAR_CLOSE)
-        );
+        assert_eq!(check_tv(&m, &tv()), Err(code::INTRABAR_ON_BAR_CLOSE));
         m.uses_intrabar = true;
-        assert_eq!(super::check_tv(&m, &tv(), true), Ok(()));
-        assert_eq!(check_tv(&m, &tv()), Err(code::HISTORY_TICK));
+        assert_eq!(check_tv(&m, &tv()), Ok(()));
         assert_eq!(check_native(&m, &native()), Err(code::HISTORY_TICK));
         m.nonstandard_chart = true;
-        assert_eq!(
-            super::check_tv(&m, &tv(), true),
-            Err(code::NONSTANDARD_CHART)
-        );
+        assert_eq!(check_tv(&m, &tv()), Err(code::NONSTANDARD_CHART));
     }
 
     fn meta() -> ProgramMeta {
@@ -307,11 +300,14 @@ mod tests {
     }
 
     #[test]
-    fn history_tick_is_refused_5109() {
+    fn history_tick_is_refused_5109_by_native_and_under_refuse() {
+        // R-P18: the TV default admits it; `history_tick = Refuse` (selected explicitly) and the
+        // native broker refuse 5109.
         let mut m = meta();
         m.decl.flags |= decl_flag::CALC_ON_EVERY_HISTORY_TICK;
         m.uses_intrabar = true;
-        assert_eq!(check_tv(&m, &tv()), Err(code::HISTORY_TICK));
+        assert_eq!(check_tv(&m, &tv()), Ok(()));
+        assert_eq!(super::check_tv(&m, &tv(), false), Err(code::HISTORY_TICK));
         assert_eq!(check_native(&m, &native()), Err(code::HISTORY_TICK));
     }
 

@@ -223,6 +223,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn open_market_order_fills_before_a_gapped_stop_e130() {
+        // R-P19, `pin:05-open-market-first` (provisional) — E130 trade 26: long 77565.1, the exit
+        // stop (created first, re-sent every bar) at ~77563, `strategy.close` at a bar close; the
+        // next bar opens at 77500, through the stop: TV fills the close (market) first — exit
+        // "Close entry(s) order L" at 77500 — where creation order (I19) took the stop ("X").
+        // Here: long 100.00, stop 99.80, the close at bar 2, bar 3 opens at 99.00.
+        let m = meta(E);
+        let mut b = broker(&m);
+        let stop = exit(f::STOP, 0, 99_800_000);
+        open_long(&mut b, 10_005, 9_995, &[stop]);
+        let close = OrderIntent {
+            kind: IntentKind::Close,
+            id: close_entry_key(b"L1"),
+            from_entry: L1,
+            seq: 1,
+            ..OrderIntent::default()
+        };
+        run(
+            &mut b,
+            &bar(2, 10_000, 10_005, 9_990, 10_000),
+            &[stop, close],
+        );
+        assert_eq!(b.view().closedtrades, 0);
+        run(&mut b, &bar(3, 9_900, 9_950, 9_850, 9_920), &[]);
+        let t = b.closed_trade(0).map(|t| (t.exit_id, t.exit_px_1e6));
+        assert_eq!(t, Some((str_key(b"Close entry(s) order L1"), 99 * E)));
+        // One exit: the stop found nothing left to close.
+        assert_eq!((b.view().closedtrades, b.view().position_size_1e6), (1, 0));
+    }
+
     /// A broker on `price_rounding = r` (`pin:05-price-rounding`'s other readings).
     fn rounding(m: &ProgramMeta, r: crate::switch::PriceRounding) -> TvBroker {
         let sw = crate::switch::Switches {

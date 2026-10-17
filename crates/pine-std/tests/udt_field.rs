@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! R-P5 (CAR-R27-1 applied): the UDT field rows `ARRAY_SORT_AT`, `ARRAY_SORT_INDICES_AT` and
-//! `ARRAY_BINARY_SEARCH{,_LEFTMOST,_RIGHTMOST}_AT` through `pine_std::testing` — objects built
-//! with `Src::Obj` (`O_NEW` + `O_SET_*`, as sema emits `T.new`), the field named by sema's folded
-//! selector `index | (Ty << 32)` (`pin:02-udt-field-selector`). Covered: ascending / descending
-//! by an int field, a float field with na fields and a string field; `sort_indices`; the three
-//! searches on a sorted array; an na element (`pin:04-udt-sort-na-object`); a selector sema
-//! cannot have built; zero allocation after warm-up.
+//! R-P5 (CAR-R27-1 applied): the UDT field rows `ARRAY_SORT_AT` and `ARRAY_SORT_INDICES_AT`
+//! through `pine_std::testing` — objects built with `Src::Obj` (`O_NEW` + `O_SET_*`, as sema
+//! emits `T.new`), the field named by sema's folded selector `index | (Ty << 32)`
+//! (`pin:02-udt-field-selector`). Covered: ascending / descending by an int field, a float field
+//! with na fields and a string field; `sort_indices`; an na element
+//! (`pin:04-udt-sort-na-object`); a selector sema cannot have built; zero allocation after
+//! warm-up. R-P16 (CI-052, F108): the three `binary_search*` field rows are gone (TradingView
+//! refuses the field argument at compile; pine-sema's `pin:02-bsearch-field-refused`).
 //!
 //! COPY-DOCTRINE: test support, may allocate (outside the counted window).
 
@@ -275,61 +276,8 @@ fn udt_sort_in_place_by_field() {
     assert_eq!(n, 0, "sort by field allocated after warm-up");
 }
 
-/// The three searches over a float field (sorted ascending, an na field last) and an int field
-/// with duplicates, `val` a float or an int (i64 entry): the scalar rows' answers
-/// (`pin:04-binary-search`).
-#[test]
-fn udt_binary_searches_by_float_and_int_field() {
-    let mut calls = Vec::new();
-    let a = five(&mut calls);
-    // px ascending: 0.5 1 2 3 na.
-    sort(&mut calls, a, false, f(PX));
-    let px: [(OverloadId, (Lane, Src), f64); 9] = [
-        (ov::ARRAY_BINARY_SEARCH_AT, ft(2.0), 2.0),
-        (ov::ARRAY_BINARY_SEARCH_AT, ft(1.5), -1.0),
-        (ov::ARRAY_BINARY_SEARCH_AT, ft(f64::NAN), -1.0),
-        (ov::ARRAY_BINARY_SEARCH_LEFTMOST_AT, ft(1.5), 1.0),
-        (ov::ARRAY_BINARY_SEARCH_LEFTMOST_AT, ft(0.1), 0.0),
-        (ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AT, ft(1.5), 2.0),
-        (ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AT, ft(10.0), 4.0),
-        (ov::ARRAY_BINARY_SEARCH_AT, it(3), 3.0),
-        (ov::ARRAY_BINARY_SEARCH_LEFTMOST_AT, ft(0.5), 0.0),
-    ];
-    let k0 = calls.len();
-    for &(id, v, _) in &px {
-        calls.push(c(id, vec![o(a), v, f(PX)], I));
-    }
-    // qty ascending: 2 2 5 9 na.
-    sort(&mut calls, a, false, f(QTY));
-    let qty: [(OverloadId, (Lane, Src), f64); 8] = [
-        (ov::ARRAY_BINARY_SEARCH_LEFTMOST_AT, it(2), 0.0),
-        (ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AT, it(2), 1.0),
-        (ov::ARRAY_BINARY_SEARCH_AT, it(5), 2.0),
-        (ov::ARRAY_BINARY_SEARCH_AT, ft(9.0), 3.0),
-        (ov::ARRAY_BINARY_SEARCH_LEFTMOST_AT, it(3), 1.0),
-        (ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AT, ft(3.0), 2.0),
-        (ov::ARRAY_BINARY_SEARCH_AT, NA_I, -1.0),
-        (ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AT, it(9), 3.0),
-    ];
-    let k1 = calls.len();
-    for &(id, v, _) in &qty {
-        calls.push(c(id, vec![o(a), v, f(QTY)], I));
-    }
-    let (r, n) = run(&calls, 4);
-    for row in r.expect("runs") {
-        for (k, (_, _, want)) in px.iter().enumerate() {
-            assert_eq!(row[k0 + k], *want, "px probe {k}");
-        }
-        for (k, (_, _, want)) in qty.iter().enumerate() {
-            assert_eq!(row[k1 + k], *want, "qty probe {k}");
-        }
-    }
-    assert_eq!(n, 0, "binary_search by field allocated after warm-up");
-}
-
 /// `pin:04-udt-sort-na-object`: an na element is `ScriptRefused` for `sort` and `sort_indices`
-/// (every element is a key; checked before any write) and for a search that reads it; a search
-/// whose bisection never reads it answers.
+/// (every element is a key; checked before any write).
 #[test]
 fn udt_na_element_is_script_refused() {
     let three = |calls: &mut Vec<C>| {
@@ -346,43 +294,16 @@ fn udt_na_element_is_script_refused() {
     three(&mut calls);
     order_of(&mut calls, 0, true, f(QTY), 0);
     assert_eq!(run(&calls, 1).0.err(), Some(FaultKind::ScriptRefused));
-    // [1, na, 3] for 3.0: mid 1 is the na element.
-    let mut calls = Vec::new();
-    three(&mut calls);
-    calls.push(c(ov::ARRAY_BINARY_SEARCH_AT, vec![o(0), ft(3.0), f(PX)], I));
-    assert_eq!(run(&calls, 1).0.err(), Some(FaultKind::ScriptRefused));
-    let mut calls = Vec::new();
-    calls.push(udt_array());
-    for x in [obj(0, 1.0, "a", Some(1)), obj(1, 2.0, "b", Some(2)), NA_I] {
-        calls.push(c(ov::ARRAY_PUSH, vec![o(0), x], &[]));
-    }
-    // [1, 2, na] for 1.0: mids 1 (2.0), 0 (1.0) — the na element is never read.
-    calls.push(c(ov::ARRAY_BINARY_SEARCH_AT, vec![o(0), ft(1.0), f(PX)], I));
-    let k = calls.len() - 1;
-    let r = run(&calls, 1).0.expect("the na element is not read");
-    assert_eq!(r[0][k], 0.0);
 }
 
 /// A selector sema cannot have built is `Internal` (sema and std disagree): a field past the
-/// object's, a `bool` field type for a sort, a `string` field for a search, stray high bits.
+/// object's, a `bool` field type for a sort, stray high bits.
 #[test]
 fn udt_bad_selector_is_internal() {
-    let bad: [(OverloadId, (Lane, Src)); 4] = [
-        (ov::ARRAY_SORT_AT, sel(7, Ty::Int)),
-        (ov::ARRAY_SORT_AT, sel(0, Ty::Bool)),
-        (ov::ARRAY_BINARY_SEARCH_AT, f(NAME)),
-        (ov::ARRAY_SORT_AT, it(1 << 40)),
-    ];
-    for (id, s) in bad {
+    for s in [sel(7, Ty::Int), sel(0, Ty::Bool), it(1 << 40)] {
         let mut calls = Vec::new();
         let a = five(&mut calls);
-        let ins = if id == ov::ARRAY_SORT_AT {
-            vec![o(a), it(0), s]
-        } else {
-            vec![o(a), ft(1.0), s]
-        };
-        let outs: &[Lane] = if id == ov::ARRAY_SORT_AT { &[] } else { I };
-        calls.push(c(id, ins, outs));
+        calls.push(c(ov::ARRAY_SORT_AT, vec![o(a), it(0), s], &[]));
         assert_eq!(run(&calls, 1).0.err(), Some(FaultKind::Internal), "{s:?}");
     }
 }

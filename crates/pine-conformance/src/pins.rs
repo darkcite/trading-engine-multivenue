@@ -603,6 +603,8 @@ pub static PINS: &[Pin] = &[
         readings: &["at_limit", "at_start"],
     },
     // r29 (R-P6, impl-05 §4.8.9): the history-tick pins, provisional default first.
+    // R-P18 (2026-10-17): `three_points_and_close_confirmed` states TradingView's E122 outcome
+    // (runs 4, conf 4: every history-tick run reads `barstate.isconfirmed` true, CAR-R32-1).
     Pin {
         name: "pin:05-hist-tick-runs",
         v5: &[],
@@ -612,14 +614,18 @@ pub static PINS: &[Pin] = &[
             "three_points_and_close",
             "four_ticks_and_close",
             "extremes_and_close",
+            "three_points_and_close_confirmed",
         ],
     },
+    // R-P18 (2026-10-17): `same_point` states TradingView's E124 outcome — an order born at the
+    // history-tick run at point k fills at point k itself (`pin:05-hist-tick-same-point` in
+    // pine-broker, TV E124–E127 45/45 trades; `next_point` 0/45).
     Pin {
         name: "pin:05-hist-tick-next-point",
         v5: &[],
         v6: &["E124"],
         both: &[],
-        readings: &["next_point", "bar_close", "next_bar_open"],
+        readings: &["next_point", "bar_close", "next_bar_open", "same_point"],
     },
     Pin {
         name: "pin:05-hist-tick-immediately",
@@ -808,12 +814,14 @@ pub static PINS: &[Pin] = &[
         v5: &[],
         v6: &[],
         both: &["F085", "F119"],
+        // R-P17 (CI-053, 2026-10-17): `one_pass` — TradingView runs an `na`-step `for` once (F119).
         readings: &[
             "refuse_dynamic",
             "runtime_abs",
             "runtime_fault",
             "na_default",
             "no_loop",
+            "one_pass",
         ],
     },
     Pin {

@@ -398,6 +398,47 @@ fn trades_exit_signal_from_signals_table() {
 }
 
 #[test]
+fn trades_exit_signal_close_entry_order_key_e001() {
+    // pin:05-exit-signal-text (CI-032): a `strategy.close("L1")` trade keys its exit order
+    // "Close entry(s) order L1" (pine-std `bi_close`) while `exit_sym` stays the script's "L1"
+    // (pin:04-close-exit-id-read): the key decides, and the divergence prints TV's text.
+    let mut syms = SymTable::new();
+    let l1 = syms.intern("L1");
+    let s = SignalTable::default();
+    let mut a = rec(0, 100 * 1_000_000, 1_000_000, 1_000_000_000_000, 0);
+    a.exit_id = pine_ir::str_key(b"Close entry(s) order L1");
+    a.exit_sym = l1;
+    let with_sig = |sig: &str| {
+        let mut e = row(1, 0, "100", "1.00");
+        e.exit.as_mut().unwrap().sig = sig.into();
+        e
+    };
+    let cmp = |e: TradeRow, a: TradeRec| compare_trades(&[e], &[a], &syms, &s, PnlBasis::Net);
+    assert_eq!(cmp(with_sig("Close entry(s) order L1"), a), None);
+    assert_eq!(
+        cmp(with_sig("L1"), a),
+        Some(TradeDiv::Field {
+            n: 1,
+            field: "exit_sig",
+            expected: "L1".into(),
+            actual: "Close entry(s) order L1".into(),
+        })
+    );
+    // A broker-named exit (close_all) prints its name; a plain exit id still matches its text.
+    let mut all = a;
+    all.exit_id = pine_ir::str_key(b"Close position order");
+    all.exit_sym = pine_ir::Sym::NONE;
+    assert_eq!(cmp(with_sig("Close position order"), all), None);
+    assert!(matches!(
+        cmp(with_sig("Close entry(s) order L1"), all),
+        Some(TradeDiv::Field { actual, .. }) if actual == "Close position order"
+    ));
+    let mut plain = a;
+    plain.exit_id = pine_ir::str_key(b"L1");
+    assert_eq!(cmp(with_sig("L1"), plain), None);
+}
+
+#[test]
 fn trades_require_pnl_net_flag() {
     let syms = SymTable::new();
     let mut a = rec(0, 100 * 1_000_000, 1_000_000, 1_000_000_000_000, 0);

@@ -112,6 +112,82 @@ fn gaps_on_emits_only_on_new_confirmed_data() {
     }
 }
 
+/// `pin:U12-gaps-on-realtime` (lead ruling CI-056, D054 sheet-rt-02 `k` column): realtime 1-minute
+/// bars of 3 ticks + a confirm under a 5-minute series (the host re-publishes the developing
+/// element per update, confirms it at the period's last bar). `gaps_on`, lookahead off, reads na
+/// on every update of the other bars (k = upd) and a value on every update of the period-closing
+/// bar (k = 0): its ticks the developing value, its confirm the confirmed one — the ticks'
+/// journaled emissions never consume the confirm's.
+#[test]
+fn gaps_on_emits_on_every_update_of_the_period_closing_bar_d054() {
+    const H: i64 = 5 * M;
+    let ins = sec(KEY, Ty::Float, true, false);
+    let calls = [Call {
+        ov: ov::REQUEST_SECURITY,
+        inputs: &ins,
+        outputs: &[Lane::F64],
+        site_bytes: OVERLOADS[ov::REQUEST_SECURITY.0 as usize].state_bytes_min,
+        guard: None,
+    }];
+    let mut h = Harness::build(&Script {
+        calls: &calls,
+        mode: ExecMode::Realtime,
+        dialect: Dialect::V6,
+        intent_cap: 0,
+        chart: CHART,
+    });
+    // Chart bar `i` after update `j` (0..3 ticks, 3 = the confirm): the closed periods, plus the
+    // developing one unless bar `i` closes it at its confirm (value 100 + g, + (j + 1) / 10 while
+    // developing).
+    let series = |i: usize, j: usize| {
+        let g = i / 5;
+        let closes = j == 3 && i % 5 == 4;
+        let mut t = TestSeries {
+            key: KEY,
+            out: 0,
+            last_confirmed: closes,
+            ..TestSeries::default()
+        };
+        for k in 0..=g {
+            let dev = k == g && !closes;
+            let extra = if dev { (j + 1) as f64 / 10.0 } else { 0.0 };
+            t.values.push(100.0 + k as f64 + extra);
+            t.open_ms.push(k as i64 * H);
+            t.close_ms.push((k as i64 + 1) * H);
+        }
+        vec![t]
+    };
+    let mut ctx = TestCtx::default();
+    for i in 0..15usize {
+        let mut seen = Vec::new();
+        for j in 0..4usize {
+            ctx.series = series(i, j);
+            let fl = if j == 3 {
+                barflag::REALTIME | barflag::CONFIRMED
+            } else {
+                barflag::REALTIME
+            };
+            let mut b = bar(i as u32, 1.0, fl);
+            b.open_ms = i as i64 * M;
+            b.close_ms = (i as i64 + 1) * M;
+            let out = if j == 3 {
+                h.step_bar(&b, &mut ctx)
+            } else {
+                h.step_tick(&b, &mut ctx)
+            };
+            assert_eq!(out, StepOutcome::Ok, "bar {i} update {j}");
+            seen.push(h.out(0, 0));
+        }
+        let g = (i / 5) as f64;
+        if i % 5 == 4 {
+            let want = [100.1 + g, 100.2 + g, 100.3 + g, 100.0 + g];
+            assert_eq!(seen, want, "bar {i}: k = 0 (every update emits)");
+        } else {
+            assert!(seen.iter().all(|v| v.is_nan()), "bar {i}: k = upd {seen:?}");
+        }
+    }
+}
+
 /// Nothing published → na; a key the host never published → na, the other key unaffected.
 #[test]
 fn request_nothing_published_is_na_and_keys_do_not_collide() {

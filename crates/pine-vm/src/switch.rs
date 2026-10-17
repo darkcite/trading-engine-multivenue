@@ -39,7 +39,9 @@ pub(crate) struct BsRow {
 /// `pin:U17-barstate-table` — contract §3.6.5 as amended by A2 (CAR-03-4), row for row.
 pub(crate) const BARSTATE: [BsRow; 7] = [
     BsRow { slot: abi::I_BS_ISFIRST, bar: Bs::FirstBar, tick: Bs::FirstBar },
-    BsRow { slot: abi::I_BS_ISCONFIRMED, bar: Bs::Any(barflag::CONFIRMED), tick: Bs::False },
+    // CAR-R32-1 (R-P18, TradingView E122): a history-tick run reads `isconfirmed` true (all four
+    // runs of a history bar); a realtime tick stays unconfirmed.
+    BsRow { slot: abi::I_BS_ISCONFIRMED, bar: Bs::Any(barflag::CONFIRMED), tick: Bs::None(barflag::REALTIME) },
     BsRow { slot: abi::I_BS_ISLAST, bar: Bs::Any(barflag::LAST | barflag::REALTIME), tick: Bs::Any(barflag::LAST | barflag::REALTIME) },
     BsRow { slot: abi::I_BS_ISNEW, bar: Bs::NewUnless(barflag::REALTIME), tick: Bs::NewUnlessLive { rt: barflag::REALTIME, done: barflag::CONFIRMED } },
     BsRow { slot: abi::I_BS_ISREALTIME, bar: Bs::Any(barflag::REALTIME), tick: Bs::Any(barflag::REALTIME) },
@@ -63,6 +65,23 @@ pub(crate) fn eval(rule: Bs, flags: u32, bar_index: i64, ticked: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CAR-R32-1 (TradingView E122: 4 runs, `isconfirmed` true on each): a history tick (no
+    /// `REALTIME` bit) reads confirmed, a realtime tick does not, ticked or not.
+    #[test]
+    fn history_tick_reads_confirmed_realtime_tick_does_not() {
+        let row = BARSTATE
+            .iter()
+            .find(|r| r.slot == abi::I_BS_ISCONFIRMED)
+            .map(|r| r.tick);
+        let Some(rule) = row else {
+            panic!("the isconfirmed row")
+        };
+        for ticked in [false, true] {
+            assert!(eval(rule, 0, 3, ticked), "history tick, ticked {ticked}");
+            assert!(!eval(rule, barflag::REALTIME, 3, ticked), "realtime tick, ticked {ticked}");
+        }
+    }
 
     /// CAR-D1: on a realtime bar the history-tick rule is exactly the old one — every `flags`
     /// with `REALTIME` set, ticked or not.

@@ -64,11 +64,15 @@ fn nonstandard_chart_is_refused_5101() {
 }
 
 #[test]
-fn history_tick_is_refused_5109() {
+fn history_tick_is_admitted_by_tv_refused_5109_by_native() {
+    // R-P18: the TV broker evaluates at the history path points by default (5109 lifted); a
+    // mis-paired program refuses 5107; the native broker keeps 5109.
     let mut m = meta();
     m.decl.flags |= decl_flag::CALC_ON_EVERY_HISTORY_TICK;
+    assert_eq!(refused(&m, tv()), Some(code::INTRABAR_ON_BAR_CLOSE.0));
     m.uses_intrabar = true;
-    assert_eq!(refused(&m, tv()), Some(code::HISTORY_TICK.0));
+    assert_eq!(refused(&m, tv()), None);
+    assert_eq!(refused_native(&m, native()), Some(code::HISTORY_TICK.0));
 }
 
 #[test]

@@ -99,12 +99,12 @@ fn inst_barstate_tick_column_reads_the_flags_and_isnew_first_tick_only() {
     assert_eq!(vm.step_bar(&bar(1, 1.0, c | r), &mut ctx), StepOutcome::Ok);
     assert_eq!(bs(&vm), [0, 1, 1, 1, 1, 0, 0, 1]);
     // History re-executions through step_tick (TV-mode calc_on_order_fills, impl-05 §3.6.1):
-    // the flag rows read the bar; isconfirmed / islastconfhist stay false; isnew stays true.
+    // the flag rows read the bar; isconfirmed true (CAR-R32-1), islastconfhist false; isnew true.
     let hist = c | barflag::LAST_CONFIRMED_HISTORY;
     assert_eq!(vm.step_tick(&bar(2, 1.0, hist), &mut ctx), StepOutcome::Ok);
-    assert_eq!(bs(&vm), [0, 0, 0, 1, 0, 1, 0, 2]);
+    assert_eq!(bs(&vm), [0, 1, 0, 1, 0, 1, 0, 2]);
     assert_eq!(vm.step_tick(&bar(2, 1.0, hist), &mut ctx), StepOutcome::Ok);
-    assert_eq!(bs(&vm), [0, 0, 0, 1, 0, 1, 0, 2], "not REALTIME: isnew true on every tick");
+    assert_eq!(bs(&vm), [0, 1, 0, 1, 0, 1, 0, 2], "not REALTIME: isnew true on every tick");
     assert_eq!(vm.step_bar(&bar(2, 1.0, hist), &mut ctx), StepOutcome::Ok);
     assert_eq!(bs(&vm), [0, 1, 0, 1, 0, 1, 1, 2], "not REALTIME: isnew true although ticks ran");
     // A live forming bar: the tick column equals v4's original constants.
@@ -116,7 +116,7 @@ fn inst_barstate_tick_column_reads_the_flags_and_isnew_first_tick_only() {
 
 /// CAR-D1 (R-P6): a partial history bar (`CONFIRMED` and `REALTIME` clear) through `step_tick` —
 /// `isnew` on its first history tick only, a `calc_on_order_fills` re-run on the full bar stays
-/// new, `isconfirmed` false throughout; the bar-close column is unchanged
+/// new, `isconfirmed` true throughout (CAR-R32-1, TradingView E122); the bar-close column is unchanged
 /// (`pin:U17-hist-close-isnew`) and the counter restarts at `step_bar`.
 #[test]
 fn inst_barstate_history_ticks_isnew_first_only_and_cof_reruns_unchanged() {
@@ -128,25 +128,25 @@ fn inst_barstate_history_ticks_isnew_first_only_and_cof_reruns_unchanged() {
     let c = barflag::CONFIRMED;
     assert_eq!(vm.step_bar(&bar(0, 1.0, c), &mut ctx), StepOutcome::Ok);
     assert_eq!(vm.step_tick(&bar(1, 1.0, 0), &mut ctx), StepOutcome::Ok);
-    assert_eq!(bs(&vm), [0, 0, 0, 1, 0, 1, 0, 1]);
+    assert_eq!(bs(&vm), [0, 1, 0, 1, 0, 1, 0, 1]);
     assert_eq!(vm.step_tick(&bar(1, 1.0, c), &mut ctx), StepOutcome::Ok);
     assert_eq!(
         bs(&vm),
-        [0, 0, 0, 1, 0, 1, 0, 1],
+        [0, 1, 0, 1, 0, 1, 0, 1],
         "cof re-run on the full bar: isnew true"
     );
     assert_eq!(vm.step_tick(&bar(1, 1.0, 0), &mut ctx), StepOutcome::Ok);
     assert_eq!(
         bs(&vm),
-        [0, 0, 0, 0, 0, 1, 0, 1],
+        [0, 1, 0, 0, 0, 1, 0, 1],
         "second history tick: isnew false"
     );
     assert_eq!(vm.step_tick(&bar(1, 1.0, 0), &mut ctx), StepOutcome::Ok);
-    assert_eq!(bs(&vm), [0, 0, 0, 0, 0, 1, 0, 1]);
+    assert_eq!(bs(&vm), [0, 1, 0, 0, 0, 1, 0, 1]);
     assert_eq!(vm.step_bar(&bar(1, 1.0, c), &mut ctx), StepOutcome::Ok);
     assert_eq!(bs(&vm), [0, 1, 0, 1, 0, 1, 0, 1]);
     assert_eq!(vm.step_tick(&bar(2, 1.0, 0), &mut ctx), StepOutcome::Ok);
-    assert_eq!(bs(&vm), [0, 0, 0, 1, 0, 1, 0, 2]);
+    assert_eq!(bs(&vm), [0, 1, 0, 1, 0, 1, 0, 2]);
 }
 
 /// Plot `a OP b` for each pair: I_MOD (i64, via F_I2F|VLD so na plots NaN) or F_MOD.

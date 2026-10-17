@@ -2169,7 +2169,8 @@ impl Lower<'_> {
                     return Err(diag(ReasonCode::QualifierTooWeak, self.ast.span(x), msg));
                 }
                 None if self.rd.pins.for_step == ForStep::RuntimeFault => {
-                    // CI-004 / F085: the step as written, checked once on entering the `for`.
+                    // CI-004 / F085: the step as written, checked once on entering the `for`; an
+                    // `na` step passes the check and runs one pass (R-P17, F119, `step_check`).
                     let v = self.value_as(x, ct)?;
                     self.step_check(v, ct.ty, self.ast.span(x))?;
                     (v, None, false)
@@ -2317,9 +2318,16 @@ impl Lower<'_> {
         Ok(())
     }
 
-    /// CI-004 / F085, `pin:02-for-step` `RuntimeFault`: `if not (s > 0)` call pine-std's
-    /// `runtime.error` (`ScriptRefused`) with TradingView's text. A comparison with `na` is false
-    /// (contract §3.6.1), so an `na` step faults too: it is not greater than zero.
+    /// CI-004 / F085, `pin:02-for-step` `RuntimeFault`: `if s <= 0` call pine-std's
+    /// `runtime.error` (`ScriptRefused`) with TradingView's text.
+    ///
+    /// R-P17 (CI-053, F119, operator 2026-10-17): an `na` step does NOT fault — TradingView runs
+    /// `for i = 0 to 10 by s` with `s` na exactly once per bar (cnt = 1 on all 24 493 bars, v5 and
+    /// v6): the first iteration runs, then `i + na` is na and the bound test fails. A comparison
+    /// with `na` is false (contract §3.6.1), so testing `s <= 0` (not `not (s > 0)`) leaves an
+    /// `na` step to the loop itself: the counter goes na after the first pass (the step slot is
+    /// `can_be_na`, so the add and the head compare carry validity) and the head ends the loop.
+    /// A zero or negative step still faults (F085).
     fn step_check(&mut self, s: VSlot, ty: Ty, at: Span) -> Result<(), Diag> {
         const MSG: &str = "'step' in loop must be greater than zero.";
         let zero = if ty == Ty::Float {
@@ -2328,10 +2336,10 @@ impl Lower<'_> {
             K::Int(0)
         };
         let z = self.konst(zero, scalar(ty, Qual::Const), at);
-        let ok = self.temp(scalar(Ty::Bool, Qual::Series), at);
+        let bad = self.temp(scalar(Ty::Bool, Qual::Series), at);
         self.op(Op::Cmp {
-            op: CmpK::Gt,
-            dst: ok,
+            op: CmpK::Le,
+            dst: bad,
             a: s,
             b: z,
         });
@@ -2346,10 +2354,10 @@ impl Lower<'_> {
             Ok(())
         })?;
         self.push_if(
-            ok,
-            Block::default(),
-            Vec::new(),
+            bad,
             fault,
+            Vec::new(),
+            Block::default(),
             Vec::new(),
             CondKind::If,
         );
@@ -2784,18 +2792,16 @@ impl Lower<'_> {
                 });
                 continue;
             }
-            if p.name.as_str() == "sort_field" {
-                if let Some(search) = crate::overload::udt_field_row(o.id) {
-                    // R-P5: the folded field selector, never the argument as written. A non-UDT
-                    // array was refused `3024 … unserved=1` in pass 3: lowered as written.
-                    if let Some(bits) = self.udt_selector(n, o, search, given)? {
-                        av.push(Arg::Const {
-                            lane: Lane::I64,
-                            bits,
-                            valid: true,
-                        });
-                        continue;
-                    }
+            if p.name.as_str() == "sort_field" && crate::overload::udt_field_row(o.id) {
+                // R-P5: the folded field selector, never the argument as written. A non-UDT
+                // array was refused `3024 … unserved=1` in pass 3: lowered as written.
+                if let Some(bits) = self.udt_selector(n, o, given)? {
+                    av.push(Arg::Const {
+                        lane: Lane::I64,
+                        bits,
+                        valid: true,
+                    });
+                    continue;
                 }
             }
             let mut any = false;
@@ -2827,7 +2833,6 @@ impl Lower<'_> {
         &self,
         n: NodeId,
         o: &'static pine_spec::Overload,
-        search: bool,
         given: &[(u16, NodeId)],
     ) -> Result<Option<u64>, Diag> {
         let ps = pine_spec::params(o);
@@ -2855,7 +2860,7 @@ impl Lower<'_> {
             .get(usize::from(el & pine_ir::elem::DECL_MASK))
             .map(|u| u.fields.iter().map(|f| (f.0, f.1)).collect())
             .unwrap_or_default();
-        crate::overload::udt_selector(search, &fields, sel, self.syms)
+        crate::overload::udt_selector(&fields, sel, self.syms)
             .map(|s| Some(s as u64))
             .map_err(|m| diag(ReasonCode::Internal, self.ast.span(n), m))
     }

@@ -842,9 +842,10 @@ fn first_fault(src: &str, d: Dialect, closes: &[f64]) -> Option<(usize, pine_ir:
 }
 
 /// CI-004 / F085 (`pin:02-for-step` `RuntimeFault`, operator R-P2): a `by` step that does not
-/// fold compiles; on entering the `for`, a step that is not greater than zero (`na` included)
-/// faults `ScriptRefused` on that bar — TradingView's "Error on bar 0: 'step' in loop must be
-/// greater than zero." — through pine-std's `runtime.error` body. A positive dynamic step runs.
+/// fold compiles; on entering the `for`, a step `<= 0` faults `ScriptRefused` on that bar —
+/// TradingView's "Error on bar 0: 'step' in loop must be greater than zero." — through
+/// pine-std's `runtime.error` body. A positive dynamic step runs. An `na` step runs one pass
+/// (R-P17, `for_by_na_step_runs_once_f119`).
 #[test]
 fn emit_for_step_dynamic_not_positive_faults_script_refused() {
     use pine_ir::FaultKind::ScriptRefused;
@@ -861,11 +862,10 @@ fn emit_for_step_dynamic_not_positive_faults_script_refused() {
             Some((0, ScriptRefused)),
             "{d:?}"
         );
-        // Zero, a float step and an `na` step; the fault waits for the bar that reaches it.
+        // Zero and a float step; the fault waits for the bar that reaches it.
         for (step, at) in [
             ("bar_index - bar_index", 0),
             ("bar_index >= 2 ? 0.0 : 1.0", 2),
-            ("bar_index >= 1 ? na : 1", 1),
         ] {
             let s =
                 format!("{h}st = {step}\nc = 0.0\nfor i = 0.0 to 4.0 by st\n    c += 1\nplot(c)\n");
@@ -891,6 +891,85 @@ fn emit_for_step_dynamic_not_positive_faults_script_refused() {
             first_fault(&s, d, &closes),
             Some((0, ScriptRefused)),
             "{d:?} downward"
+        );
+    }
+}
+
+/// R-P17 (CI-053 / F119, `pin:02-for-step` reading `one_pass`): TradingView runs
+/// `int s = syni < 0 ? 1 : na` · `for i = 0 to 10 by s` exactly once per bar (cnt = 1 on all
+/// 24 493 bars, v5 and v6) — the first iteration runs, `i + na` is na and the bound test ends the
+/// loop. No fault. The same for a float counter, a downward loop and a dynamic direction; a bar
+/// whose step is a positive number runs the full loop.
+#[test]
+fn for_by_na_step_runs_once_f119() {
+    let closes = [10.0, 11.0, 12.0, 13.0];
+    for d in [Dialect::V5, Dialect::V6] {
+        let h = format!("//@version={}\nindicator(\"t\")\n", d as u8);
+        // F119's shape (`syni` is never negative, so `s` is always na).
+        let f119 = format!(
+            "{h}int s = bar_index < 0 ? 1 : na\ncnt = 0\nfor i = 0 to 10 by s\n    cnt += 1\n\
+             plot(cnt)\n"
+        );
+        assert_eq!(
+            plots_of(&f119, d, ExecMode::BarClose, &closes, 0),
+            vec![1.0; 4],
+            "{d:?} F119"
+        );
+        for (head, want) in [
+            // A float counter: bar 0's step is 1 (five trips), later bars' is na (one).
+            (
+                "st = bar_index >= 1 ? na : 1.0\nc = 0\nfor i = 0.0 to 4.0 by st",
+                [5.0, 1.0, 1.0, 1.0],
+            ),
+            // Downward: `i - na` is na too.
+            (
+                "int st = bar_index < 0 ? 1 : na\nc = 0\nfor i = 10 to 0 by st",
+                [1.0; 4],
+            ),
+            // A dynamic direction (the bound does not fold).
+            (
+                "int st = bar_index < 0 ? 1 : na\nc = 0\nfor i = 0 to bar_index + 3 by st",
+                [1.0; 4],
+            ),
+        ] {
+            let s = format!("{h}{head}\n    c += 1\nplot(c)\n");
+            assert_eq!(
+                plots_of(&s, d, ExecMode::BarClose, &closes, 0),
+                want,
+                "{d:?} {head}"
+            );
+        }
+    }
+}
+
+/// CI-004 / F085 (`pin:02-for-step` `RuntimeFault`) unchanged by R-P17: a NEGATIVE series step
+/// still faults `ScriptRefused` on bar 0 (TradingView: "Error on bar 0: 'step' in loop must be
+/// greater than zero."), and so does a zero one; only `na` runs one pass.
+#[test]
+fn for_by_negative_series_step_still_faults_f085() {
+    use pine_ir::FaultKind::ScriptRefused;
+    let closes = [10.0, 11.0, 12.0];
+    for d in [Dialect::V5, Dialect::V6] {
+        let h = format!("//@version={}\nindicator(\"t\")\n", d as u8);
+        for step in ["-2 + (bar_index - bar_index)", "bar_index - bar_index"] {
+            let s = format!(
+                "{h}int s = {step}\ncnt = 0\nfor i = 0 to 10 by s\n    cnt += 1\nplot(cnt)\n"
+            );
+            assert_eq!(
+                first_fault(&s, d, &closes),
+                Some((0, ScriptRefused)),
+                "{d:?} {step}"
+            );
+        }
+        // A step that turns negative on bar 2 faults there, after two clean bars.
+        let s = format!(
+            "{h}int s = bar_index >= 2 ? -1 : 2\ncnt = 0\nfor i = 0 to 10 by s\n    cnt += 1\n\
+             plot(cnt)\n"
+        );
+        assert_eq!(
+            first_fault(&s, d, &closes),
+            Some((2, ScriptRefused)),
+            "{d:?}"
         );
     }
 }

@@ -349,3 +349,44 @@ fn strategy_order_negative_qty_literal_is_refused_e128() {
         }
     }
 }
+
+/// R-P16 (CI-052 / F108, `pin:02-bsearch-field-refused`): TradingView refuses at compile
+/// `array.binary_search(arr_of_udt, 777, "k_F108")` and the `_leftmost` / `_rightmost` field forms
+/// ("The `Ob_F108` user-defined type does not include a field named "#loc_42""): `3007`, the
+/// message naming the type — positional, named `sort_field`, by index, and the method form. The
+/// field `sort` / `sort_indices` rows (v6) and the scalar searches still compile.
+#[test]
+fn binary_search_field_argument_is_refused_f108() {
+    use pine_ir::Dialect::{V5, V6};
+    let ind = "indicator(\"t\")\ntype Ob_F108\n    int k_F108 = 0\n    int id_F108 = 0\n\
+               arr = array.new<Ob_F108>()\narray.push(arr, Ob_F108.new(777, 4))";
+    for d in [V5, V6] {
+        for f in ["", "_leftmost", "_rightmost"] {
+            for call in [
+                format!("x = array.binary_search{f}(arr, 777, \"k_F108\")"),
+                format!("x = array.binary_search{f}(arr, 777, 0)"),
+                format!("x = array.binary_search{f}(arr, 777, sort_field = \"k_F108\")"),
+                format!("x = arr.binary_search{f}(800, \"k_F108\")"),
+                format!("x = array.binary_search{f}(id = arr, val = 1.0, sort_field = 1)"),
+            ] {
+                let (c, msg) = r_p2(&format!("{call}\nplot(x)\n"), d, ind);
+                assert_eq!(c, vec![3007], "{d:?} {call}");
+                assert!(
+                    msg.starts_with(&format!("`array.binary_search{f}` takes no field argument"))
+                        && msg.contains("The `Ob_F108` user-defined type does not include a field"),
+                    "{d:?} {call}: {msg}"
+                );
+            }
+        }
+    }
+    // What TradingView runs keeps compiling: the field sorts (v6) and the scalar searches.
+    for body in [
+        "array.sort(arr, order.ascending, \"k_F108\")\nplot(array.size(arr))\n",
+        "ix = array.sort_indices(arr, order.descending, \"k_F108\")\nplot(array.get(ix, 0))\n",
+        "f = array.from(1.0, 2.0)\nplot(array.binary_search(f, 2.0))\n",
+        "f = array.from(1, 2)\nplot(array.binary_search_leftmost(f, 2))\n",
+    ] {
+        let (c, _) = r_p2(body, V6, ind);
+        assert!(common::passes(&c), "{body}: {c:?}");
+    }
+}

@@ -262,16 +262,19 @@ pub(crate) enum FillLimitsPrice {
 }
 
 /// `history_tick` — `calc_on_every_history_tick = true` in TV mode (R-P6; impl-05 §3.7, §4.8.9).
-/// `Refuse` until CAR-D1 is applied and the history-tick fixtures are captured; the native broker
-/// refuses the flag (`5109`) on every reading.
+/// `PathPoints` by default since R-P18 (2026-10-17): the history-tick fixtures are captured (E122:
+/// four runs per history bar, `barstate.isconfirmed` true on all four; E123: `isnew` true at the
+/// close) and CAR-R32-1 is applied in pine-vm (a history-tick run — `CONFIRMED` and `REALTIME`
+/// both clear on its developing bar — reads `isconfirmed` true). The native broker refuses the
+/// flag (`5109`) on every reading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum HistoryTick {
-    /// `5109` at construction (default).
-    Refuse = 0,
+    /// Evaluate at the history path points (`pin:05-hist-tick-*`, provisional) (default, R-P18).
+    PathPoints = 0,
     #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
-    /// Evaluate at the history path points (`pin:05-hist-tick-*`, provisional).
-    PathPoints = 1,
+    /// `5109` at construction (the default until R-P18).
+    Refuse = 1,
 }
 
 /// One reading of every §4.2 switch. 15 bytes, held by value in each broker.
@@ -329,7 +332,7 @@ pub(crate) const SWITCHES: Switches = Switches {
     cof_close_tick: CofCloseTick::No,
     cof_next_tick: CofNextTick::NextPoint,
     fill_limits_price: FillLimitsPrice::AtStart,
-    history_tick: HistoryTick::Refuse,
+    history_tick: HistoryTick::PathPoints,
 };
 
 #[cfg(test)]

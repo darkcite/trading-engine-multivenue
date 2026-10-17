@@ -3014,8 +3014,9 @@ const fn build() -> Built {
         ),
     );
     // R-P5 (CAR-R27-1 applied): the UDT field rows, v6 — `sort` / `sort_indices` by an int, float
-    // or string field, `binary_search*` by an int or float field, keyed through
-    // `Frame::obj_field`; the field arrives as sema's folded selector (`pin:02-udt-field-selector`).
+    // or string field, keyed through `Frame::obj_field`; the field arrives as sema's folded
+    // selector (`pin:02-udt-field-selector`). R-P16 (CI-052, F108): TradingView refuses a
+    // `binary_search*` field argument at compile, so the three `*_AT` search rows are gone.
     put(
         &mut b,
         ov::ARRAY_SORT_AT,
@@ -3030,39 +3031,6 @@ const fn build() -> Built {
             16,
             COLL,
             Blk::Coll,
-        ),
-    );
-    put(
-        &mut b,
-        ov::ARRAY_BINARY_SEARCH_AT,
-        row(
-            ov::ARRAY_BINARY_SEARCH_AT,
-            cs::bi_array_binary_search_at,
-            4,
-            0,
-            Blk::None,
-        ),
-    );
-    put(
-        &mut b,
-        ov::ARRAY_BINARY_SEARCH_LEFTMOST_AT,
-        row(
-            ov::ARRAY_BINARY_SEARCH_LEFTMOST_AT,
-            cs::bi_array_binary_search_leftmost_at,
-            4,
-            0,
-            Blk::None,
-        ),
-    );
-    put(
-        &mut b,
-        ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AT,
-        row(
-            ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AT,
-            cs::bi_array_binary_search_rightmost_at,
-            4,
-            0,
-            Blk::None,
         ),
     );
     put(

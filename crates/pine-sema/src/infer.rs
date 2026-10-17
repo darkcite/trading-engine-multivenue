@@ -1271,19 +1271,17 @@ impl<'a, 's> Infer<'a, 's> {
         out
     }
 
-    /// R-P5: a UDT field row's element type, `val` and `sort_field` selector
+    /// R-P5: a UDT field row's element type and `sort_field` selector
     /// (`pin:02-udt-field-selector`, `overload::udt_selector`; lowering folds the same selector).
     /// `pin:02-udt-rows-udt-only` — the `*_AT` rows are served for an `array<UDT>` only. Their
     /// `T` also admits `bool`, `color` and enums (and, with an explicit `sort_field`, `int`,
     /// `float`, `string`), but the reference says neither how such an array orders nor what
     /// `sort_field` does on one, so those calls keep the `3024 … unserved=1` they had before
-    /// R-P5. A search's `val` must be an int or a float: its field is one, and the reference's
-    /// `string` `val` meets no int / float field (`3007`).
+    /// R-P5.
     fn udt_field_check(
         &mut self,
         e: &pine_spec::Entry,
         ov: &pine_spec::Overload,
-        search: bool,
         argv: &[Arg],
         bound: &[Option<u16>],
         at: Span,
@@ -1300,18 +1298,41 @@ impl<'a, 's> Infer<'a, 's> {
             return Some(overload::deferred(e, " unserved=1", at));
         }
         let full = e.full_str();
-        if search && arg("val").is_some_and(|v| !matches!(v.t.ty, Ty::Int | Ty::Float)) {
-            let msg = format!("`{full}`: `val` of an array of objects is an int or a float");
-            return Some(diag(ReasonCode::TypeMismatch, at, msg));
-        }
         let sel = match arg("sort_field") {
             Some(a) => a.k,
             None => overload::sort_field_default(ov),
         };
         let fields = self.udt_fields(el & pine_ir::elem::DECL_MASK);
-        overload::udt_selector(search, &fields, sel, &*self.syms)
+        overload::udt_selector(&fields, sel, &*self.syms)
             .err()
             .map(|m| diag(ReasonCode::TypeMismatch, at, format!("`{full}`: {m}")))
+    }
+
+    /// R-P16 (CI-052, F108), `pin:02-bsearch-field-refused` (see `overload::BSEARCH_NAMES`): a
+    /// `binary_search*` call over an `array<UDT>` with a field argument — a third argument, or
+    /// one named `sort_field` — refuses `3007`, as TradingView does at compile. `None` for any
+    /// other call (overload resolution then answers it).
+    fn bsearch_field_refusal(&self, full: &str, argv: &[Arg], at: Span) -> Option<Diag> {
+        if !overload::BSEARCH_NAMES.contains(&full) {
+            return None;
+        }
+        let is = |a: &Arg, s: &str| a.name.is_some_and(|n| self.syms.resolve(n) == s);
+        let field = argv.len() > 2 || argv.iter().any(|a| is(a, "sort_field"));
+        let id = argv
+            .iter()
+            .find(|a| is(a, "id"))
+            .or_else(|| argv.iter().find(|a| a.name.is_none()))?;
+        let el = id.t.a;
+        let udt = id.t.ty == Ty::Array && el & (pine_ir::elem::SCALAR | pine_ir::elem::ENUM) == 0;
+        if !(field && udt) {
+            return None;
+        }
+        let ty = self.udt_name(el & pine_ir::elem::DECL_MASK);
+        let msg = format!(
+            "`{full}` takes no field argument: TradingView refuses a field search of an array of \
+             `{ty}` at compile (\"The `{ty}` user-defined type does not include a field named …\")"
+        );
+        Some(diag(ReasonCode::TypeMismatch, at, msg))
     }
 
     // ---- history ----------------------------------------------------------------------------
@@ -1953,6 +1974,9 @@ impl<'a, 's> Infer<'a, 's> {
             let d = overload::deferred(e, extra, at);
             return self.push_bad(d);
         }
+        if let Some(d) = self.bsearch_field_refusal(full, argv, at) {
+            return self.push_bad(d);
+        }
         match overload::builtin(
             e,
             argv,
@@ -2005,8 +2029,8 @@ impl<'a, 's> Infer<'a, 's> {
                 if let Some(d) = overload::unserved(p.ov, at) {
                     self.diags.push(d);
                 }
-                if let Some(search) = overload::udt_field_row(p.ov) {
-                    if let Some(d) = self.udt_field_check(e, ov, search, argv, &p.bound, at) {
+                if overload::udt_field_row(p.ov) {
+                    if let Some(d) = self.udt_field_check(e, ov, argv, &p.bound, at) {
                         self.diags.push(d);
                     }
                 }

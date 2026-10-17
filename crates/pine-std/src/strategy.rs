@@ -11,8 +11,9 @@
 
 use crate::sw;
 use pine_ir::{
-    intent_flag as fl, scale, str_key, str_region, trade_flag, Dialect, FaultKind, IntentKind,
-    IntentSide, OcaType, OrderIntent, OverloadId, SiteId, StrKey, StrRef, Sym, TradeRec,
+    fnv1a64, fnv1a64_continue, intent_flag as fl, scale, str_key, str_region, trade_flag, Dialect,
+    FaultKind, IntentKind, IntentSide, OcaType, OrderIntent, OverloadId, SiteId, StrKey, StrRef,
+    Sym, TradeRec,
 };
 use pine_spec::{ov, pf, swr, Sw, OVERLOADS, PARAMS};
 use pine_vm::Frame;
@@ -136,6 +137,21 @@ fn key_of(f: &Frame<'_>, e: u16, empty_is_none: bool) -> StrKey {
         Some(b) if b.is_empty() && empty_is_none => StrKey::NONE,
         Some(b) => str_key(b),
     }
+}
+
+/// `pin:05-exit-signal-text` (CI-032) — the order `strategy.close(id)` places is named
+/// `"Close entry(s) order " ++ id` by TradingView: its List of Trades prints it as the trade's exit
+/// Signal (E001–E131, every captured `strategy.close` trade).
+const CLOSE_ORDER_PREFIX: &[u8] = b"Close entry(s) order ";
+/// FNV-1a state after [`CLOSE_ORDER_PREFIX`] (compile time).
+const CLOSE_ORDER_SEED: u64 = fnv1a64(CLOSE_ORDER_PREFIX);
+
+/// The key of `CLOSE_ORDER_PREFIX ++ id` without joining the bytes: FNV-1a continues over `id`
+/// from the prefix's state (`str_key`'s zero → 1 rule kept) — no allocation on the bar path.
+#[inline(always)]
+const fn close_order_key(id: &[u8]) -> StrKey {
+    let h = fnv1a64_continue(CLOSE_ORDER_SEED, id);
+    StrKey(if h == 0 { 1 } else { h })
 }
 
 /// The `Sym` of a `CONST`-region string that is exactly an interned symbol (display only).
@@ -385,7 +401,8 @@ fn drop_leg(flags: &mut u16, field: &mut i64, rel: u16, abs: u16) {
 
 // ---- close / close_all / cancel / cancel_all ----------------------------------------------
 
-/// `strategy.close(id, …)` → one `Close` intent: `id` and `from_entry` are both the entry's key.
+/// `strategy.close(id, …)` → one `Close` intent: `from_entry` is the entry's key, `id` the key of
+/// the exit order TradingView places, `Close entry(s) order <id>` (`pin:05-exit-signal-text`).
 pub fn bi_close(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     const ID_: OverloadId = ov::STRATEGY_CLOSE;
     const LEN: [u8; 2] = win_len(ID_);
@@ -405,6 +422,13 @@ pub fn bi_close(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultK
     };
     set_id(f, args[ID.at(d)], &mut it)?;
     it.from_entry = it.id;
+    // `pin:05-exit-signal-text` (CI-032): the broker records this `id` as the closed trade's
+    // `exit_id` (impl-05 §4.6.2), so it keys TradingView's order name; the record stays keyed by
+    // `from_entry`. `id_sym` (and `ID_DYNAMIC`) stay the script's id: `closedtrades.exit_id` keeps
+    // reading it (`pin:04-close-exit-id-read`).
+    if let Some(b) = f.str_arg(args[ID.at(d)]) {
+        it.id = close_order_key(b);
+    }
     put(f, args[QTY.at(d)], &mut it.qty_1e6, &mut it.flags, fl::QTY);
     put(
         f,
@@ -774,6 +798,11 @@ pub enum Fld {
     /// `entry_id` (the `CONST` string of `entry_sym`; dynamic → na).
     EntryId,
     /// `exit_id` (the `CONST` string of `exit_sym`; dynamic → na).
+    ///
+    /// `pin:04-close-exit-id-read` — a `strategy.close(id)` trade's `exit_sym` is the script's
+    /// `id` while its `exit_id` keys `Close entry(s) order <id>` (`bi_close`): no capture reads
+    /// `closedtrades.exit_id` of such a trade, so it keeps reading `<id>` (the r27b behaviour);
+    /// the List of Trades' text is the candidate a capture would decide.
     ExitId,
     /// `entry_comment` / `exit_comment`: not carried → na (`pin:04-strategy-edges`).
     Comment,
