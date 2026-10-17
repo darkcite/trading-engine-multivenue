@@ -275,6 +275,7 @@ pub(crate) fn boot_set(
         slot_caps: caps,
         slot_venue: None,
         route: SlotRoute::Paper,
+        live_venue: None,
         host: HostKind::Replay,
         symbols,
         boot_state: Vec::new(),

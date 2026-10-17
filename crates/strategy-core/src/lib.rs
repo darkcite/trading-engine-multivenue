@@ -1811,6 +1811,11 @@ pub struct PineCounters {
     pub fills_prior_boot: u64,
     /// Not slot 8 (engine hosts) — a routing defect upstream.
     pub fills_foreign: u64,
+    /// PB6: a boot-adopted fill (`FILL_FLAG_ADOPTED`) — counted, never booked (D19 adopted it).
+    pub fills_adopted: u64,
+    /// PB6 (OD-8): a venue-originated fill (liquidation, ADL, orphan, settlement: `order_id`
+    /// 0, origin VENUE) — never booked; the script trading its symbol is disabled, no flatten.
+    pub fills_venue_originated: u64,
     /// Fills after a cancel.
     pub late_fills_after_cancel: u64,
     /// ALERT: a reducer that would flip the position.
@@ -1923,6 +1928,9 @@ pub mod pine_incident {
     pub const BOOT_GUARD: u8 = 7;
     /// The refusal streak tripped.
     pub const REFUSAL_TRIP: u8 = 8;
+    /// PB6 (OD-8): a venue-originated fill (liquidation, ADL, orphan) on the script's symbol —
+    /// disabled without a flatten.
+    pub const VENUE_FILL: u8 = 9;
 }
 
 /// PVM impl-08 §3.4: one out-of-band incident (8e). 128 B.
@@ -2057,7 +2065,7 @@ const _: () = assert!(
 );
 const _: () =
     assert!(core::mem::size_of::<PineSeqRec>() == 128 && core::mem::align_of::<PineSeqRec>() == 64);
-const _: () = assert!(core::mem::size_of::<PineCounters>() == 42 * 8);
+const _: () = assert!(core::mem::size_of::<PineCounters>() == 44 * 8);
 
 /// One entered XSD position as the cli persists it (`xsd-state.tsv`)
 /// and `/state` shows it. POD.

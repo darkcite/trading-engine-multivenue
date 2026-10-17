@@ -50,7 +50,7 @@ use tracing_subscriber::EnvFilter;
 /// and was ignored (`--bn-um-symbol ETHUSDT` beside a flatten closed every
 /// position). Each tool names all of these as conflicts instead; a test
 /// keeps the list whole for the flags to come.
-const BN_TOOL_CONFLICTS: [&str; 57] = [
+const BN_TOOL_CONFLICTS: [&str; 61] = [
     "asset",
     "offline",
     "lifecycle",
@@ -108,6 +108,10 @@ const BN_TOOL_CONFLICTS: [&str; 57] = [
     "bn_eq_ttl_ms",
     "bn_confirm_mainnet",
     "bn_mainnet",
+    "perp_probe",
+    "perp_coins",
+    "perp_leverage",
+    "perp_out",
 ];
 
 /// Top-level CLI.
@@ -598,6 +602,39 @@ struct ExecSmokeArgs {
     /// XH4i-8: each order's notional, USD (2 ..= 25).
     #[arg(long, default_value_t = 5, requires = "hl_outcome")]
     outcome_usd: i64,
+
+    /// **B'4 T27 — the perp limits probe** (`cli::hl_perp_probe`, impl-Bp
+    /// §4.13): after phases A and B, on the TESTNET host only, per coin of
+    /// `--perp-coins`: a post-only BUY just under $10 (refused), one at the
+    /// minimum (rests, then cancelled by cloid), a six-figure price and a
+    /// `szDecimals + 1` size (both refused), `updateLeverage` isolated at
+    /// `--perp-leverage`; writes `--perp-out`, the file the perp boot
+    /// requires (a coin absent from it cannot arm). With `--offline`: the
+    /// probe's offline self-test (a scripted venue; nothing sent, nothing
+    /// written). Exit 67: a coin's answers did not match (left out of the
+    /// file); 68: something may be LEFT ON THE ACCOUNT.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with_all = [
+            "lifecycle", "dry_run", "fill", "sweep", "requote", "recon", "watch",
+            "binance", "binance_probe"
+        ]
+    )]
+    perp_probe: bool,
+
+    /// T27: the perps to probe (comma-separated venue names, ≤ 8).
+    #[arg(long, default_value = "BTC,ETH", requires = "perp_probe")]
+    perp_coins: String,
+
+    /// T27: the isolated leverage the probe sets (exec.toml's
+    /// `[exec.hl_perp] leverage`).
+    #[arg(long, default_value_t = 1, requires = "perp_probe")]
+    perp_leverage: u16,
+
+    /// T27: the probe file (a runtime artifact, never in git).
+    #[arg(long, default_value = cli::hl_perp_probe::DEFAULT_OUT, requires = "perp_probe")]
+    perp_out: String,
 
     /// Show exactly what phase C WOULD send, and send nothing.
     ///
@@ -2420,6 +2457,15 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
     // socket. Do it before anything can fail for a reason that has
     // nothing to do with this binary's signing.
     if args.offline {
+        // T27: `--perp-probe --offline` adds the probe's own self-test (a
+        // scripted venue: nothing sent, nothing written).
+        if args.perp_probe {
+            if let Err(e) = cli::hl_perp_probe::self_test() {
+                error!("exec-smoke --perp-probe: the probe's OFFLINE SELF-TEST FAILED: {e}");
+                return ExitCode::from(exec_hyperliquid::EXIT_SELFTEST as u8);
+            }
+            info!("exec-smoke --perp-probe: the probe's offline self-test passed");
+        }
         return match exec_hyperliquid::smoke::self_test_only() {
             Ok(r) => {
                 println!(
@@ -2592,6 +2638,9 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
                 "exec-smoke: PASSED — the venue verified this binary's signature and rejected a \
                  corrupted one"
             );
+            if args.perp_probe {
+                return exec_perp_probe(&cfg, &args);
+            }
             if args.lifecycle && args.hl_perp {
                 return exec_hl_perp(&cfg, &args);
             }
@@ -3208,6 +3257,27 @@ fn exec_requote(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitC
 /// XMM XH4g: the testnet battery on slot 6's gateway arm
 /// (`cli::xmm_battery`). Runs only after phases A and B, like phase C,
 /// and only against the testnet host.
+/// B'4 T27: the perp limits probe (`cli::hl_perp_probe::run`), TESTNET only.
+fn exec_perp_probe(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {
+    if !cfg.is_testnet() {
+        error!("exec-smoke --perp-probe: the probe runs on TESTNET only");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+    let run_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX));
+    let spec = match cli::hl_perp_probe::ProbeSpec::new(&args.perp_coins, args.perp_leverage, run_s)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            error!("exec-smoke --perp-probe: {e}");
+            return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+        }
+    };
+    let tls = TlsTransport::default_client_config();
+    ExitCode::from(cli::hl_perp_probe::run(cfg, tls, &spec, &args.perp_out))
+}
+
 fn exec_hl_perp(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {
     if !cfg.is_testnet() {
         error!("exec-smoke --hl-perp: the battery runs on TESTNET only");
@@ -6581,6 +6651,10 @@ fn run(args: RunArgs) -> ExitCode {
                     // instruments bound from the boot discovery's rows, its
                     // gateway BOOTED (the BX-19 assertions held, the orphans
                     // swept, the day read) before any member can order.
+                    // PB5 (D19 for Binance): the gateway's Ready snapshot for a
+                    // LIVE slot 8 on the arm — never set while slot 8 is paper
+                    // only (`exec_boot` refuses it live; arming is the operator's).
+                    let mut pine_bn_rows: Option<Vec<cli::pine_boot::LiveBootRow>> = None;
                     let bn_arm = if eb.binance_slot().is_some() {
                         let Some(f4p) = bn_fill_prod.take() else {
                             error!("exec: fill lane 4 producer already taken — boot aborted");
@@ -6663,6 +6737,25 @@ fn run(args: RunArgs) -> ExitCode {
                             Ok(b) => {
                                 warn!("{}", b.tell);
                                 handles.push(b.handle);
+                                // PB1 (I-PB1) + PB5: slot 8 as the arm's owner —
+                                // its facts must be the bound rows (6013), and
+                                // its D19 rows are the gateway's snapshot.
+                                if eb.binance_slot() == Some(core_config::pine::PINE_SLOT) {
+                                    if let Some(pb) = pine_boot.as_ref() {
+                                        if let Err(reason) = cli::pine_bn::check_facts_against_arm(
+                                            &pb.cfg.symbols,
+                                            b.arm.inst(),
+                                        ) {
+                                            error!(reason, "pine: slot 8's facts are not the arm's rows — boot aborted");
+                                            join_reverse(handles);
+                                            return ExitCode::from(1);
+                                        }
+                                    }
+                                    pine_bn_rows = Some(cli::pine_bn::live_rows_from_bn(
+                                        &b.boot_rows,
+                                        b.arm.inst(),
+                                    ));
+                                }
                                 Some((b.arm, b.specs))
                             }
                             Err(reason) => {
@@ -6768,6 +6861,33 @@ fn run(args: RunArgs) -> ExitCode {
                     // keeps the refusing stub, so LAW E-1 stays true by
                     // construction. A Binance shape splits by route venue
                     // (`VenueSplit`), built from the router's own route.
+                    //
+                    // PVM PL3 (impl-08 §4.7.5, D19): the seam where the
+                    // live arm's boot snapshot reaches slot 8's
+                    // configuration — after the arms' venue reads, before
+                    // the loop configures the member. Slot 8 is PAPER
+                    // ONLY: no arm reads for it (`None`), so a paper boot
+                    // passes untouched; the cli never sets the live permit
+                    // (PL2), and arming is the operator's act.
+                    let mut pine_boot = pine_boot;
+                    if let Some(pb) = pine_boot.as_mut() {
+                        if let Err(reason) =
+                            cli::pine_boot::attach_live_boot(&mut pb.cfg, pine_bn_rows.as_deref())
+                        {
+                            error!(
+                                reason,
+                                "pine: slot 8's live boot state refused — boot aborted"
+                            );
+                            if let Some(s) = &xmm_stop {
+                                s.release();
+                            }
+                            if let Some(s) = &bin15_stop {
+                                s.release();
+                            }
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }
+                    }
                     let anchor = core_time::WallAnchor::now();
                     let paper = clob_dispatcher::PaperDispatcher::new();
                     let live_line = cli::exec_boot::render_slot_mask(eb.live_mask);

@@ -13,6 +13,9 @@
 //!   `core_config::exec` refuses `[exec.slot.8] mode = "live"` at parse (I42), `cli::exec_boot`
 //!   refuses `--arm-live 8`, and `cli::pine_boot` refuses any boot naming `pine` until T19, whose
 //!   resolver maps slot 8 to `Paper` or `Off` only. So the Live arm is reachable from tests alone.
+//! - pin:pl2-live-permit (Binance plan PL2): a `Live` route starts only with
+//!   `PineBootCfg::live_venue = Some(v)`, `v` every script's chart venue; a permit off `Live` is a
+//!   host defect. All three refuse `6005` at `on_start` (the code the paper-only refusal used).
 
 use pine_ir::{Bar, Diag, DiagCode};
 
@@ -115,6 +118,12 @@ pub struct PineBootCfg {
     pub slot_venue: Option<core_types::VenueId>,
     /// The resolved route (`Paper` or `Off` for slot 8, pin:08-live-route-test-only).
     pub route: SlotRoute,
+    /// PL2 (Binance plan §2.1): the live permit — the venue of a RESOLVED Live slot 8. Only a
+    /// host that resolved slot 8 Live may set it; the cli never does while slot 8 is paper only
+    /// (`core_config::exec` parse, `exec_boot::resolve`, the per-slot table build). `on_start`
+    /// refuses a `Live` route without it, a permit off `Live`, and a permit naming another venue
+    /// than a script's (`6005`, pin:pl2-live-permit). Tests set it.
+    pub live_venue: Option<core_types::VenueId>,
     /// The host.
     pub host: HostKind,
     /// Every canonical key any script names, resolved.

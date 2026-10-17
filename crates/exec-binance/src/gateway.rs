@@ -320,7 +320,7 @@ use crate::oot::{
     OF_TTL, OOT_CAP, OWE_MEMBER, OWE_TTL, OWE_UNKNOWN, ST_IN_DOUBT, ST_LIVE, ST_SENT,
 };
 use crate::recon::{
-    day_buys_1e6, day_increasing_1e6, judge_positions, scan_cm_account, scan_exercise, scan_opt_margin, scan_opt_positions, scan_pm_account, scan_positions,
+    day_abs_notional_1e6, day_buys_1e6, day_increasing_1e6, judge_positions, scan_cm_account, scan_exercise, scan_opt_margin, scan_opt_positions, scan_pm_account, scan_positions,
     scan_spot_account, scan_um_account, settlement_agrees, ExerciseRow, Leg, PosRow, Verdict, MARGIN_ISOLATED, PM_LOCKED, PM_MARGIN_CALL, SPOT_ASSETS_MAX, TRADES_PAGE,
 };
 use ingress_binance::discovery::BnPermissions;
@@ -947,7 +947,38 @@ struct RowGw {
     spot_1e8: i64,
     /// Spot: the row's index in the armed assets (`u8::MAX`: not spot).
     spot_k: u8,
+    /// PB4 (D19): the venue's `entryPrice` ×1e6 at the last full read (0:
+    /// flat, unlisted or not named).
+    entry_px_1e6: i64,
+    /// PB4 (D19): today's traded notional, both sides ×1e6
+    /// ([`day_abs_notional_1e6`]); meaningful only with `day_read`.
+    day_abs_1e6: i64,
 }
+
+/// **PB4 — one row of the gateway's D19 boot snapshot**
+/// ([`BnGateway::boot_rows`]), taken once, at Ready: the venue's position,
+/// its entry price, today's notional both ways, and whether the day was
+/// read (a full trades page, a failed read: `false`, the figure 0).
+/// Ready itself means the boot's orphan sweep ended with orphans = ghosts
+/// = 0 (E-8). Cold.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BnBootRow {
+    /// The venue's position ×1e6 (signed; the boot's last account read).
+    pub pos_1e6: i64,
+    /// Its `entryPrice` ×1e6 (0 when flat, or when the read named none —
+    /// pin:cli-pb4-entry-optional).
+    pub entry_px_1e6: i64,
+    /// Σ |px × qty| of the row's trades since 00:00Z ×1e6.
+    pub day_abs_1e6: i64,
+    /// The instrument row ([`crate::inst`]).
+    pub row: u16,
+    /// The day's trades were read (else `day_abs_1e6` is 0, not a figure).
+    pub day_read: bool,
+    _pad: [u8; 5],
+}
+
+const _: () = assert!(core::mem::size_of::<BnBootRow>() == 32);
 
 /// One WS API request in flight: the in-flight table's record, in place.
 #[derive(Copy, Clone, Debug)]
@@ -1362,6 +1393,10 @@ pub struct BnGateway<const FILL_N: usize, const J_N: usize = JOURNAL_RING> {
     phase: Phase,
     rows: Vec<RowGw>,
     legs: Vec<Leg>,
+    /// PB4 — the D19 snapshot ([`Self::boot_rows`]), sized at construction,
+    /// written once at Ready.
+    boot_rows: Vec<BnBootRow>,
+    boot_rows_ready: bool,
     sapi_job: Option<Job>,
     held: Fifo<Out, HELD_CAP>,
     recon: ReconStep,
@@ -1749,6 +1784,8 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             phase: Phase::Clock,
             rows,
             legs,
+            boot_rows: vec![BnBootRow::default(); n],
+            boot_rows_ready: false,
             sapi_job: None,
             held: Fifo::new(),
             recon: ReconStep::Idle,
@@ -5087,6 +5124,8 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 self.legs[i].venue_1e6 = 0;
                 self.legs[i].booked_1e6 = self.rows[i].booked_1e6;
                 self.legs[i].px_1e6 = face.unwrap_or(self.rows[i].last_px_1e6);
+                // PB4: unlisted is flat — no entry.
+                self.rows[i].entry_px_1e6 = 0;
             }
             i += 1;
         }
@@ -5116,6 +5155,10 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 return self.recon_failed();
             }
             r.listed = gen;
+            if !account_only {
+                // PB4 (D19): the venue's entry (USDⓈ-M's read; 0 elsewhere).
+                r.entry_px_1e6 = if p.amt_1e6 != 0 { p.entry_px_1e6 } else { 0 };
+            }
             let w = self.wire.row(row);
             if cm && w.flags & INST_OWNED != 0 {
                 isolated |= p.margin == MARGIN_ISOLATED;
@@ -5984,6 +6027,8 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
                 let (inverse, face) = (w.flags & INST_INVERSE != 0, w.unit_1e6);
                 let cur = self.legs[r].venue_1e6;
                 // BX8: a spot row's day is its buys (`day_buys_1e6`).
+                // PB4 (D19): both sides, before the increasing part sorts.
+                self.rows[r].day_abs_1e6 = day_abs_notional_1e6(&self.trades[..n]);
                 self.rows[r].day_spent_1e6 = if self.rows[r].spot_k != u8::MAX {
                     day_buys_1e6(&self.trades[..n])
                 } else {
@@ -6093,6 +6138,37 @@ impl<const FILL_N: usize, const J_N: usize> BnGateway<FILL_N, J_N> {
             // Unread rows retry at recon cadence; the slot stays unseeded
             // until they are read (the arm reports `reconciled` only then).
             self.phase = Phase::Ready;
+            self.snap_boot_rows();
+        }
+    }
+
+    /// PB4 — the D19 snapshot, written once at Ready into the rows sized at
+    /// construction (cold: the boot's; no allocation).
+    fn snap_boot_rows(&mut self) {
+        let mut i = 0;
+        while i < self.boot_rows.len() && i < self.rows.len() {
+            let r = &self.rows[i];
+            self.boot_rows[i] = BnBootRow {
+                pos_1e6: self.legs[i].venue_1e6,
+                entry_px_1e6: r.entry_px_1e6,
+                day_abs_1e6: if r.day_read { r.day_abs_1e6 } else { 0 },
+                row: i as u16,
+                day_read: r.day_read,
+                _pad: [0; 5],
+            };
+            i += 1;
+        }
+        self.boot_rows_ready = true;
+    }
+
+    /// **PB4 — the D19 boot snapshot**, one per bound row in row order,
+    /// taken at Ready (empty before it: the boot did not hold). Cold.
+    #[must_use]
+    pub fn boot_rows(&self) -> &[BnBootRow] {
+        if self.boot_rows_ready {
+            &self.boot_rows
+        } else {
+            &[]
         }
     }
 

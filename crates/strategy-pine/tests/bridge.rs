@@ -278,8 +278,8 @@ fn refusal_streak_is_per_script_and_spares_exits() {
     assert!(sent1 >= 7, "script 1 kept trading: {sent1}");
 }
 
-/// PAPER ONLY (pin:08-live-refused-at-start): a Live route that reaches `on_start` is refused;
-/// no live dispatch path exists in this crate.
+/// pin:pl2-live-permit (replaced pin:08-live-refused-at-start): a Live route WITHOUT the host's
+/// live permit that reaches `on_start` is refused — the cli never sets the permit.
 #[test]
 fn live_route_refuses_on_start() {
     let mut b = boot(vec![rt("rt_entry.pine", 0)]);

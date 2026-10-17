@@ -6304,7 +6304,7 @@ fn state_snapshot_publish_read_encode_is_zero_alloc() {
         slot: u8::MAX,
         account_mode: u8::MAX,
         sweep: u8::MAX,
-        refused: [u32::MAX; 21],
+        refused: [u32::MAX; 22],
         halt_reason: u64::MAX,
         in_doubt: u64::MAX,
         events_other: u64::MAX,
@@ -8996,6 +8996,139 @@ fn hl_exchange_requote_path_is_zero_alloc() {
     assert!(
         x.counters().refused_local >= 2_000,
         "the budget barrier must have refused every one: {}",
+        x.counters().refused_local
+    );
+}
+
+/// **B'4 (impl-Bp §4.15, I34) — the perp submit path allocates nothing.**
+///
+/// Gate 60's shape on the perp arm: the head of `submit` (owner, grid and
+/// minimum against the boot-bound `PerpTable`, the boot-bound asset id),
+/// the scale guards, the LAW E-9 cloid, msgpack and the action JSON in
+/// place — driven through the TRAIT verb (refused at the budget barrier
+/// after its encode half, floor at the ceiling, so no socket) and through
+/// `stage_submit` + `seal` (nonce, signature, envelope). Each pass also
+/// drives one off-grid refusal, which is counted, never rounded, and must
+/// allocate nothing either. The table is bound before the guard through
+/// the test-only `bind_perps_unlevered` (boot work; no venue here).
+#[test]
+fn perp_submit_path_is_zero_alloc() {
+    use clob_dispatcher::OrderDispatch;
+    use core_ring::Ring;
+    use core_types::{Fill, Order, Price, Qty, Side, VenueId};
+    use exec_hyperliquid::config::{HlConfig, Scope};
+    use exec_hyperliquid::exchange::HlExchange;
+    use exec_hyperliquid::perp::PerpWant;
+
+    const META: &[u8] = br#"{"universe":[{"szDecimals":5,"name":"BTC","maxLeverage":40},{"szDecimals":4,"name":"ETH","maxLeverage":25}]}"#;
+    const SYM: u32 = 900;
+    const SLOT: u8 = 8;
+
+    fn perp_order(px_1e6: i64, seq: u64) -> Order {
+        let mut o = Order::new(
+            1,
+            VenueId::Hyperliquid,
+            SYM,
+            Side::Bid,
+            0, // ORDER_KIND_MAKER
+            Price::from_raw(px_1e6),
+            Qty::from_raw(1_000), // 0.001 BTC
+            seq,
+        );
+        o.strategy_id = SLOT;
+        o
+    }
+
+    let cfg = HlConfig::new(
+        Scope::Testnet,
+        exec_hyperliquid::config::HOST_TESTNET,
+        'b',
+        [0x57; 32],
+        [0x58; 20],
+    )
+    .expect("cfg");
+    let (p, _c) = Ring::<Fill, 64>::new().split();
+    let mut x = HlExchange::<64>::new(
+        &cfg,
+        core_net::TlsTransport::default_client_config(),
+        p,
+        std::env::temp_dir().join(format!("mv-bp4-perp-{}.state", std::process::id())),
+        u64::MAX,
+    )
+    .expect("build");
+    x.share_nonce(
+        exec_hyperliquid::NonceStreams::new()
+            .stream(&[0x58; 20])
+            .expect("a stream"),
+    );
+    x.bind_perps_unlevered(
+        META,
+        &[PerpWant {
+            sym: SYM,
+            coin: b"BTC",
+            leverage: 3,
+            min_notional_1e6: 0,
+            owner_slot: SLOT,
+        }],
+    )
+    .expect("bind");
+
+    // Prime: the signing context and the domain separator are boot.
+    let _ = x.submit(&perp_order(100_000_000_000, 1));
+    {
+        let (mp_n, end) = x
+            .stage_submit(&perp_order(100_000_000_000, 1))
+            .expect("warm stage");
+        let _ = x.seal(mp_n, end).expect("warm seal");
+        let (mp_n, end) = x
+            .stage_modify(1, &perp_order(100_000_000_000, 2).with_reduce_only())
+            .expect("warm modify");
+        let _ = x.seal(mp_n, end).expect("warm modify seal");
+    }
+
+    let g = AllocGuard::new();
+    let mut sealed: u64 = 0;
+    let mut i = 1u64;
+    while i <= 2_000 {
+        // Integer prices: always on the grid; $100 000 × 0.001 ≥ $10. Odd passes carry
+        // reduce-only (r28 risk review N1: the perp wire's `r: true` branch, submit and modify).
+        let o = perp_order(100_000_000_000 + (i as i64 % 50) * 1_000_000, i + 1);
+        let o = if i % 2 == 1 { o.with_reduce_only() } else { o };
+        let _ = x.submit(&o);
+        let (mp_n, end) = x.stage_submit(&o).expect("stage");
+        let n = x.seal(mp_n, end).expect("seal");
+        sealed = sealed.wrapping_add(n as u64);
+        let (mp_n, end) = x.stage_modify(i, &o).expect("stage modify");
+        let n = x.seal(mp_n, end).expect("seal modify");
+        sealed = sealed.wrapping_add(n as u64);
+        // 98 765.5 — six significant figures: refused, never rounded.
+        let _ = x.submit(&perp_order(98_765_500_000, i + 1));
+        i += 1;
+    }
+    std::hint::black_box((sealed, x.counters(), x.perp_refusals()));
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "perp submit path allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "perp submit path bytes: saw {bytes}");
+    assert!(sealed > 0, "the envelope half must actually have run");
+    assert_eq!(x.perps().len(), 1, "the perp must be bound");
+    assert_eq!(
+        x.perp_refusals().price_sig_figs,
+        2_000,
+        "every off-grid price refused on the perp arm"
+    );
+    assert_eq!(x.perp_refusals().not_owner, 0, "the owner's orders");
+    assert_eq!(
+        x.counters().submitted,
+        0,
+        "nothing may reach the venue from an allocation gate"
+    );
+    assert!(
+        x.counters().refused_local >= 4_000,
+        "barrier + grid refused every one: {}",
         x.counters().refused_local
     );
 }
@@ -21484,6 +21617,7 @@ fn pvm8_boot(scripts: Vec<core_config::pine::PineScriptCfg>) -> strategy_pine::P
         slot_caps: strategy_pine::SlotCaps8::default(),
         slot_venue: None,
         route: strategy_pine::SlotRoute::Paper,
+        live_venue: None,
         host: strategy_pine::HostKind::Engine,
         symbols: (0..PVM8_COINS.len()).map(pvm8_facts).collect(),
         boot_state: Vec::new(),
@@ -21938,6 +22072,353 @@ fn pine_tape_record_and_view_is_zero_alloc() {
         k.seq_records > 0 && k.tape_records > 0,
         "gate PVM-11: {k:?}"
     );
+}
+
+#[test]
+fn pine_live_settle_is_zero_alloc() {
+    // Binance plan PL1 (impl-08 §4.5.5 live, I-PB7): a Live slot 8 under the host's permit
+    // (PL2; only a test builds one) — IoCs and reduce-only closes waiting the settle window, a
+    // maker requoted (Modify: `prev` waits the window) and cancelled, fills inside the window
+    // and LATE fills after it, every settle point — allocates nothing.
+    use strategy_core::{Strategy, StrategyCounters};
+    let mut maker = pvm8_rt("live_maker.pine", 1, 0, 0);
+    maker.limit_primitive = core_config::pine::PineLimitPrimitive::Maker;
+    maker.cap_instance_1e6 = 48_000_000;
+    let mut cfg = pvm8_boot(vec![pvm8_rt("live_close.pine", 0, 0, 0), maker]);
+    cfg.route = strategy_pine::SlotRoute::Live;
+    cfg.live_venue = Some(VenueId::Hyperliquid);
+    cfg.slot.min_coalesce_ms = Some(0);
+    cfg.slot.event_insn_budget = Some(100_000_000);
+    cfg.slot.boot_exit_policy = Some(core_config::pine::BootExitPolicy::Accept);
+    cfg.slot_caps = strategy_pine::SlotCaps8 {
+        max_order_usd_1e6: 100_000_000,
+        cap_instance_usd_1e6: 100_000_000,
+        cap_day_usd_1e6: 1_000_000_000_000,
+        max_open_orders: 8,
+    };
+    cfg.boot_state = (0..PVM8_COINS.len())
+        .map(|c| strategy_pine::VenueBootState {
+            sym: pvm8_sym(c),
+            position_1e6: 0,
+            avg_px_1e6: 0,
+            day_notional_1e6: 0,
+            resting_swept: true,
+        })
+        .collect();
+    let mut p = pvm8_start(cfg, Vec::new());
+    let mut c = Pvm8Ctx::new();
+    // Fills: every third IoC inside its window (this step), every third + 1 one step later
+    // (after its window reported it: a late fill).
+    let (mut now, mut late) = (0usize, 0usize);
+    let fill = |p: &mut strategy_pine::PineStrategy, c: &mut Pvm8Ctx, k: usize| {
+        let o = c.orders[k % PVM8_REC_CAP];
+        if c.verbs[k % PVM8_REC_CAP] == 0 && o.kind == core_fill::ORDER_KIND_IOC {
+            let mut f = pvm8_fill(&o);
+            f.origin = core_types::FILL_ORIGIN_VENUE;
+            p.on_fill(&f, c);
+        }
+    };
+    pvm8_step(&mut p, &mut c, 0, PVM8_T0 + 10);
+    let before = p.pine_counters();
+    let g = AllocGuard::new();
+    let mut i = 1i64;
+    while i < 1_500 {
+        let mark = c.n;
+        pvm8_step(&mut p, &mut c, i, PVM8_T0 + i * 5_000);
+        // The previous step's orders: their windows ran out in this step (5 s > 2 s).
+        while late < mark {
+            if late % 3 == 1 {
+                fill(&mut p, &mut c, late);
+            }
+            late += 1;
+        }
+        while now < c.n {
+            if now % 3 == 0 {
+                fill(&mut p, &mut c, now);
+            }
+            now += 1;
+        }
+        i += 1;
+    }
+    let (allocs, bytes, deallocs) = g.delta();
+    assert_eq!(
+        (allocs, bytes, deallocs),
+        (0, 0, 0),
+        "PL1: the live settle path allocated"
+    );
+    let k = p.pine_counters();
+    assert!(
+        k.cancelled_reported > before.cancelled_reported
+            && k.fills > before.fills
+            && k.late_fills_after_cancel > before.late_fills_after_cancel
+            && k.modifies > before.modifies,
+        "PL1: {k:?}"
+    );
+}
+
+/// **r28 risk review C5 — Pine on Binance USDⓈ-M: the submit path allocates nothing.**
+///
+/// Slot 8's dispatch path from the member's `Ctx` down: orders built exactly as
+/// `strategy_pine::host::dispatch_one` builds them (`Order::new` … `with_ttl_ns`, the LAW E-9
+/// client oid of `oid::encode_client_oid`, `with_reduce_only` for a flagged one) go through the
+/// set's `StampCtx` (slot 8) over an in-test `Ctx` that maps the verbs onto the dispatcher (the
+/// engine's `EngineCtx` is private; this is its verb mapping) → `RoutedDispatcher` (slot 8 Live,
+/// built in-test — the cli never arms it) → `VenueSplit` → `BnArm::submit` (owner 8, STRICT grid
+/// ON, PB3's `set_ro_min_exempt(true)`) → the command-ring push; the gateway end is drained
+/// in-thread and answers every command. Per four turns: an on-grid IoC, an on-grid maker and its
+/// cancel, an OFF-grid IoC (PB2: refused `OffGrid`, never rounded) and a reduce-only IoC under
+/// the 100 USDT minimum (PB3: exempt, pushed reduce-only). Pinned: 0 B; every off-grid order
+/// refused `OffGrid`, no `MinNotional` refusal, at least one reduce-only below-minimum PLACE
+/// popped. Not in the window: the Pine VM and broker (their arms are `pine_*` above).
+#[test]
+fn pine_binance_submit_path_is_zero_alloc() {
+    use clob_dispatcher::{
+        DispatchError, OrderDispatch, PaperDispatcher, RouteAliases, RETIRED_CANCELED_MEMBER,
+        RETIRED_EXPIRED,
+    };
+    use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
+    use core_types::{
+        CancelReq, ChannelEvent, ChannelId, ModifyReq, NsTs, Order, Side, ORDER_FLAG_REDUCE_ONLY,
+    };
+    use exec_binance::arm::{ArmKnobs, BnArm, Refusal};
+    use exec_binance::cmd::{
+        duplex, BnCmd, BnEvt, EVT_ACK, EVT_DAY, EVT_F_CLOCK_OK, EVT_F_DEADMAN_OK, EVT_F_IOC,
+        EVT_F_ORDER_UP, EVT_F_RECONCILED, EVT_F_USER_UP, EVT_RECON, EVT_RETIRED, EVT_RING,
+        EVT_STATUS, VERB_CANCEL, VERB_PLACE,
+    };
+    use exec_binance::inst::{BindSpec, InstTable, PRODUCT_USDM};
+    use exec_binance::margin::{MarginBook, SLOTS};
+    use exec_gateway::EvtTx;
+    use exec_router::{
+        ExecMode, ExecRoute, HaltLimits, InstrumentSpec, NullLiveDispatcher, RoutedDispatcher,
+        SlotCaps, VenueSplit, LAW_LINEAR,
+    };
+    use strategy_core::{Ctx, SubmitErr};
+    use strategy_pine::oid::encode_client_oid;
+
+    const SLOT: u8 = strategy_pine::SLOT_PINE;
+    const ALIAS: SymbolId = 7;
+    const N: u64 = 400;
+
+    /// The engine's verb mapping (`EngineCtx`), without the engine: no clock (P5).
+    struct RouterCtx<'a, D: OrderDispatch> {
+        d: &'a mut D,
+    }
+    fn err(e: DispatchError) -> SubmitErr {
+        match e {
+            DispatchError::QueueFull => SubmitErr::RingFull,
+            DispatchError::Unsupported => SubmitErr::Unsupported,
+            DispatchError::NoSuchOrder => SubmitErr::NoSuchOrder,
+            _ => SubmitErr::Refused,
+        }
+    }
+    impl<D: OrderDispatch> Ctx for RouterCtx<'_, D> {
+        fn submit(&mut self, order: Order) -> Result<(), SubmitErr> {
+            self.d.submit(&order).map_err(err)
+        }
+        fn cancel(&mut self, req: CancelReq) -> Result<(), SubmitErr> {
+            self.d.cancel(&req).map_err(err)
+        }
+        fn modify(&mut self, prev: u64, order: Order) -> Result<(), SubmitErr> {
+            self.d.modify(&ModifyReq::new(prev, order)).map_err(err)
+        }
+        fn now_ns(&self) -> NsTs {
+            panic!("no clock on the decision path (P5)")
+        }
+    }
+    /// The gateway's emit: only with room (the kit halts on a full ring).
+    fn give(tx: &mut EvtTx<BnEvt, EVT_RING>, e: &BnEvt) -> bool {
+        tx.room() > 0 && tx.emit(e)
+    }
+    /// One Pine instruction as `host::dispatch_one` renders it (script 0, epoch 1).
+    fn pine_order(now: u64, side: Side, maker: bool, px: i64, qty: i64, oid: u32) -> Order {
+        let kind = if maker { ORDER_KIND_MAKER } else { ORDER_KIND_IOC };
+        let ttl = if maker { 0 } else { 1_000_000_000 };
+        Order::new(
+            now,
+            VenueId::Binance,
+            ALIAS,
+            side,
+            kind,
+            Price::from_raw(px),
+            Qty::from_raw(qty),
+            encode_client_oid(1, 0, oid),
+        )
+        .with_ttl_ns(ttl)
+    }
+
+    // Boot-time construction — outside the window.
+    let mut disc = ingress_binance::discovery::BnDiscovery::new();
+    disc.ingest_body(BX6_FAPI).expect("C5 discovery");
+    let (mut t, mut w) = InstTable::new(ALIAS);
+    let row = disc.find(&b"BTCUSDT"[..]).expect("C5 row");
+    t.bind(
+        &mut w,
+        &BindSpec { sym: ALIAS, product: PRODUCT_USDM, row, owned: true, maker_ok: true },
+    )
+    .expect("C5 bind");
+    let (eng, mut gw) = duplex();
+    let mut lim = [0i64; SLOTS];
+    lim[SLOT as usize] = 600_000;
+    let mut prod = [0u8; SLOTS];
+    prod[SLOT as usize] = 1 << PRODUCT_USDM;
+    let mut arm = BnArm::new(
+        eng,
+        t,
+        ArmKnobs {
+            orders_frac_1e6: 1_000_000,
+            qtr_frac_1e6: 1_000_000,
+            owner_slot: SLOT,
+            max_symbols: 20,
+            min_maker_ttl_ns: 5_000_000_000,
+            margin: MarginBook::new(lim, prod),
+            anchor: core_time::WallAnchor::now(),
+            mode: exec_binance::mode::AccountMode::Classic,
+            demo: false,
+            equity_ttl_ns: 30_000_000_000,
+        },
+    );
+    // PB2 (the Pine slot is a strict owner) and PB3 (the knob the boot sets once PB0.2 is
+    // recorded; on here so its branch is in the window).
+    arm.set_strict_grid(true);
+    arm.set_ro_min_exempt(true);
+    let bn = VenueId::Binance.to_u8();
+    let mut route = ExecRoute::all_paper();
+    route
+        .set_slot(
+            SLOT as usize,
+            ExecMode::Live,
+            &[bn],
+            SlotCaps::new(i64::MAX, i64::MAX, i64::MAX, 1_024),
+            HaltLimits::none(),
+        )
+        .expect("C5 route");
+    let split = VenueSplit::new(bn, NullLiveDispatcher::new(), arm, &route);
+    let mut d =
+        RoutedDispatcher::new(route, PaperDispatcher::new(), split, core_time::WallAnchor::now());
+    d.set_route_aliases(RouteAliases::NONE.with(ALIAS, bn).expect("C5 alias"));
+    d.bind_instrument(&InstrumentSpec::new(ALIAS, LAW_LINEAR, 0, 0, 0)).expect("C5 ledger row");
+    let healthy = |now: u64| {
+        let mut s = BnEvt::new(EVT_STATUS, now);
+        s.flags = EVT_F_ORDER_UP | EVT_F_USER_UP | EVT_F_CLOCK_OK | EVT_F_DEADMAN_OK;
+        s
+    };
+    let mark = |now: u64, i: u64| {
+        let px = 65_000_000_000;
+        ChannelEvent::new(now, VenueId::Binance, ChannelId::Mark, ALIAS, i, 0, px, px + 10_000)
+    };
+    let t0 = core_time::now_ns();
+    let mut r = BnEvt::new(EVT_RECON, t0);
+    r.flags = EVT_F_RECONCILED;
+    let mut day = BnEvt::new(EVT_DAY, t0);
+    day.slot = SLOT;
+    day.a = (t0 / 86_400_000_000_000) as i64;
+    assert!(give(&mut gw.evt, &healthy(t0)) && give(&mut gw.evt, &r) && give(&mut gw.evt, &day));
+    d.on_idle();
+    d.on_idle();
+    assert!(d.ledger().is_slot_seeded(SLOT as usize), "C5: slot 8 seeded from the arm's day");
+
+    // One turn: the four Pine instructions, then the gateway answers every command.
+    let mut popped_ro_small = 0u64;
+    let mut placed = 0u64;
+    let mut turn = |d: &mut RoutedDispatcher<_, _>, gw: &mut exec_binance::cmd::BnGatewayEnd, i: u64| {
+        let now = core_time::now_ns();
+        if i % 32 == 0 {
+            let _ = give(&mut gw.evt, &healthy(now));
+            d.on_venue_event(&mark(now, i));
+        }
+        let oid = u32::try_from(i % ((1 << 29) - 2)).expect("oid") + 1;
+        let tick = (i % 100) as i64 * 100_000;
+        {
+            let mut rc = RouterCtx { d: &mut *d };
+            let mut ctx = strategy_set::StampCtx::new(&mut rc, SLOT);
+            match i % 4 {
+                // On the 0.10 tick and the 0.001 step: pushed.
+                0 => {
+                    let o = pine_order(now, Side::Bid, false, 64_000_000_000 + tick, 2_000, oid);
+                    let _ = ctx.submit(o);
+                }
+                // A maker on the grid, then its cancel.
+                1 => {
+                    let o = pine_order(now, Side::Ask, true, 66_000_000_000 + tick, 2_000, oid)
+                        .with_ttl_ns(6_000_000_000);
+                    if ctx.submit(o).is_ok() {
+                        let _ = ctx.cancel(CancelReq::of(&o, now));
+                    }
+                }
+                // PB2: 0.05 off the tick — refused `OffGrid`, never rounded.
+                2 => {
+                    let o = pine_order(now, Side::Bid, false, 64_000_050_000 + tick, 2_000, oid);
+                    let _ = ctx.submit(o);
+                }
+                // PB3: reduce-only, 0.001 × 65 000 = 65 < 100 USDT — exempt, pushed.
+                _ => {
+                    let o = pine_order(now, Side::Ask, false, 65_000_000_000, 1_000, oid)
+                        .with_reduce_only();
+                    let _ = ctx.submit(o);
+                }
+            }
+        }
+        while let Some(gc) = gw.cmd.pop() {
+            let c: BnCmd = *gc;
+            drop(gc);
+            let e = match c.verb {
+                VERB_PLACE if c.kind == ORDER_KIND_MAKER => {
+                    BnEvt::order(EVT_ACK, now, c.client_oid, c.row, c.slot)
+                }
+                VERB_PLACE => {
+                    placed += 1;
+                    popped_ro_small += u64::from(
+                        c.flags & ORDER_FLAG_REDUCE_ONLY != 0 && c.qty_1e6 == 1_000,
+                    );
+                    let a = BnEvt::order(EVT_ACK, now, c.client_oid, c.row, c.slot);
+                    let _ = give(&mut gw.evt, &a);
+                    let mut x = BnEvt::order(EVT_RETIRED, now, c.client_oid, c.row, c.slot);
+                    x.why = RETIRED_EXPIRED;
+                    x.flags = EVT_F_IOC;
+                    x
+                }
+                VERB_CANCEL => {
+                    let mut x = BnEvt::order(EVT_RETIRED, now, c.client_oid, c.row, c.slot);
+                    x.why = RETIRED_CANCELED_MEMBER;
+                    x
+                }
+                _ => BnEvt::new(0, now),
+            };
+            let _ = give(&mut gw.evt, &e);
+        }
+        d.on_idle();
+    };
+    // Warm-up: every branch once, outside the window.
+    let mut i = 0u64;
+    while i < 8 {
+        turn(&mut d, &mut gw, i);
+        i += 1;
+    }
+    let mut before = clob_dispatcher::BinanceArmReport::default();
+    assert!(d.binance_arm_report(core_time::now_ns(), &mut before), "C5: the arm's report");
+    let g = AllocGuard::new();
+    while i < 8 + N {
+        turn(&mut d, &mut gw, i);
+        i += 1;
+    }
+    let (allocs, bytes, deallocs) = g.delta();
+    drop(turn);
+    assert_eq!(
+        (allocs, bytes, deallocs),
+        (0, 0, 0),
+        "C5: Pine's Binance submit path allocated"
+    );
+    let mut rep = clob_dispatcher::BinanceArmReport::default();
+    assert!(d.binance_arm_report(core_time::now_ns(), &mut rep), "C5: the arm's report");
+    let off = Refusal::OffGrid as usize;
+    assert_eq!(
+        rep.refused[off] - before.refused[off],
+        N / 4,
+        "C5 (PB2): every off-grid order refused OffGrid"
+    );
+    assert_eq!(rep.refused[Refusal::MinNotional as usize], 0, "C5 (PB3): none MinNotional");
+    assert!(placed > 0 && popped_ro_small > 0, "C5 (PB3): {placed} placed, {popped_ro_small}");
 }
 
 #[test]

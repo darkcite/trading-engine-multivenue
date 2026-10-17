@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// OUR CODE: rt_close.pine with a fixed default quantity (a Live route refuses percent_of_equity,
+// 5108) — the PL1 alloc probe: enters while flat and closes (reduce-only IoC) while long.
+strategy("live close (strategy-pine PL1)", overlay = true, default_qty_type = strategy.fixed, default_qty_value = 1)
+plot(close)
+if strategy.position_size == 0
+    strategy.entry("L", strategy.long)
+else
+    strategy.close("L")

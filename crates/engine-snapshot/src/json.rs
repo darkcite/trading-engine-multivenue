@@ -1692,7 +1692,7 @@ impl<'a> Cursor<'a> {
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// `PineCounters` as `(name, value)` rows, declaration order (the `/state` `pine` section).
-fn pine_fields(p: &strategy_core::PineCounters) -> [(&'static str, u64); 42] {
+fn pine_fields(p: &strategy_core::PineCounters) -> [(&'static str, u64); 44] {
     [
         ("scripts_loaded", p.scripts_loaded),
         ("scripts_enabled", p.scripts_enabled),
@@ -1721,6 +1721,8 @@ fn pine_fields(p: &strategy_core::PineCounters) -> [(&'static str, u64); 42] {
         ("fills", p.fills),
         ("fills_prior_boot", p.fills_prior_boot),
         ("fills_foreign", p.fills_foreign),
+        ("fills_adopted", p.fills_adopted),
+        ("fills_venue_originated", p.fills_venue_originated),
         ("late_fills_after_cancel", p.late_fills_after_cancel),
         ("late_reducer_flips", p.late_reducer_flips),
         ("fee_modelled_live", p.fee_modelled_live),
@@ -1947,7 +1949,7 @@ mod tests {
             "{body}"
         );
         assert!(
-            body.contains("\"refused\":{\"unbound\":4,\"not_live\":0,") && body.contains("\"deadman_down\":0,\"flags\":9,\"not_writable\":7}}},\"halted\":["),
+            body.contains("\"refused\":{\"unbound\":4,\"not_live\":0,") && body.contains("\"deadman_down\":0,\"flags\":9,\"not_writable\":7,\"off_grid\":0}}},\"halted\":["),
             "{body}"
         );
         // Between the other two: one comma each.
@@ -1956,7 +1958,7 @@ mod tests {
         let n = encode_state_json(&s, &mut buf).unwrap();
         let body = core::str::from_utf8(&buf[..n]).unwrap();
         assert!(body.contains("\"session_pnl_usd_1e6\":0},\"binance_gw\":{\"slot\":2,"), "{body}");
-        assert!(body.contains("\"not_writable\":7}},\"hyperliquid_gw\":{\"slot\":0,"), "{body}");
+        assert!(body.contains("\"not_writable\":7,\"off_grid\":0}},\"hyperliquid_gw\":{\"slot\":0,"), "{body}");
         assert_eq!(crate::bn_mode_word(2), "pm_pro");
         assert_eq!(crate::sweep_word(0), "clear");
         assert_eq!(crate::sweep_word(7), "unknown");

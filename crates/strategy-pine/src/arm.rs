@@ -8,8 +8,9 @@
 //! The levers (§4.7.1) are enforced where they bite: `host::commits` is `may_commit`
 //! (`enabled && !disabled && !cold && route != Off`), `host::flush` dispatches only for
 //! `enabled` scripts and calls no ctx verb on `Off` (I36), and `fault::disable` flattens only a
-//! script that may dispatch. PAPER ONLY: a `Live` route refuses `on_start`
-//! (pin:08-live-refused-at-start); the Live arming half is not built (fail closed).
+//! script that may dispatch. A `Live` route starts only under the host's live permit
+//! (pin:pl2-live-permit, which replaced pin:08-live-refused-at-start); the cli never sets the
+//! permit, so slot 8 stays paper (fail closed) until the arming change.
 //!
 //! COPY-DOCTRINE: `adopt_warm`, `boot_commit` and `finish_boot` run inside `on_start` (boot only);
 //! `late_flip_guard` is hot (I4: no allocation, no clock, no `dyn`).

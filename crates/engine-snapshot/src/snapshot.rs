@@ -702,7 +702,8 @@ pub fn deadman_availability_word(v: u8) -> &'static str {
 /// **BX11 — the Binance arm's local refusal reasons, spelled**, index =
 /// `exec_binance::arm::Refusal` (its `REFUSAL_WORDS`). A copy for the
 /// reason [`HALT_REASON_WORDS`] is one; `cli` pins the two together.
-pub const BN_REFUSAL_WORDS: [&str; 21] = [
+/// PVM PB2: + `off_grid` (additive).
+pub const BN_REFUSAL_WORDS: [&str; 22] = [
     "unbound",
     "not_live",
     "not_owner",
@@ -724,6 +725,7 @@ pub const BN_REFUSAL_WORDS: [&str; 21] = [
     "deadman_down",
     "flags",
     "not_writable",
+    "off_grid",
 ];
 
 /// BX11: the Binance account mode (`exec_binance::mode::AccountMode`, its
@@ -1022,7 +1024,7 @@ pub struct BinanceGwSnapshot {
     /// See [`Self::account_mode`].
     pub demo: u8,
     /// Local refusals by reason ([`BN_REFUSAL_WORDS`]).
-    pub refused: [u32; 21],
+    pub refused: [u32; 22],
     /// The gateway's halt word (0 = running).
     pub halt_reason: u64,
     /// Orders pushed and not terminal / in doubt now / ever put in doubt.
@@ -1112,7 +1114,8 @@ pub struct BinanceGwSnapshot {
     pub margin_options_1e6: i64,
 }
 
-const _: () = assert!(core::mem::size_of::<BinanceGwSnapshot>() == 424);
+// PVM PB2: + the `off_grid` refusal (4 B, padded to the next 8).
+const _: () = assert!(core::mem::size_of::<BinanceGwSnapshot>() == 432);
 
 /// The whole snapshot — see the module docs and plan §6.1.
 #[derive(Copy, Clone)]
@@ -1268,10 +1271,12 @@ mod tests {
         // per-slot arrays 8 → 16: `slots` +192 B (three 64 B lines);
         // `exec.halted`'s +8 B fit the 64 B alignment. 32,064 B, 704 B
         // left. PVM impl-08 T17's `pine` section (`PineCounters`, 336 B) makes it 32,384 B
-        // (it fit the previous alignment slack): 384 B left.
+        // (it fit the previous alignment slack): 384 B left. PVM PB2's
+        // `off_grid` refusal (+8 B in `BinanceGwSnapshot`, 432 B) crosses a
+        // 64 B line: 32,448 B, 320 B left.
         let n = core::mem::size_of::<EngineSnapshot>();
         assert!(n <= 32 * 1024, "EngineSnapshot grew to {n} B");
-        assert_eq!(n, 32_384, "the T17 figure: a change states its own");
+        assert_eq!(n, 32_448, "the PB2 figure: a change states its own");
         assert_eq!(core::mem::size_of::<VmRowView>(), 48);
         assert_eq!(core::mem::size_of::<HarSnapshot>(), 2_216);
     }

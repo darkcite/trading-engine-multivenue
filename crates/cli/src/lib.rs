@@ -66,6 +66,9 @@ pub mod har_writer;
 /// BIN15 H90 L4: the late window's live dust test (`hl-outcome-probe`) —
 /// MAINNET, the operator's to run (ruling O-H90-3).
 pub mod hl_outcome_probe;
+/// B'4 T27: `exec-smoke --perp-probe` — the Hyperliquid perp limits probe
+/// (TESTNET; writes `hl-perp-limits.tsv`, which the perp boot requires).
+pub mod hl_perp_probe;
 /// HYPARB H5: `hyparb.toml` → the slot-0 member's params.
 pub mod hyparb_boot;
 pub mod hyparb_live;
@@ -83,6 +86,12 @@ pub mod pine;
 /// PVM impl-08: the slot-8 (Pine member) boot seam — today the F19 refusal of a requested,
 /// unconfigurable slot 8.
 pub mod pine_boot;
+/// Binance plan PB1 / PB5 / PB9: Pine on Binance USDⓈ-M — live facts from the arm's bound row,
+/// the D19 snapshot, the boot rules (dark: nothing arms).
+pub mod pine_bn;
+/// B'4 T26: the Hyperliquid perp boot state — the router's perp seed (D19) and PL3's rows (dark:
+/// nothing arms).
+pub mod pine_hl;
 /// PVM impl-08 T17: slot 8's `engine_pine_*` family (5 s mirror) and the incident drain / log line.
 pub mod pine_metrics;
 /// PVM impl-08 T18: the `--pine-tape` writer (`seq.bin`, `decisions.bin`, `set.tsv`).

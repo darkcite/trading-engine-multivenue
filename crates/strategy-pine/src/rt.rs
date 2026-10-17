@@ -308,6 +308,9 @@ pub(crate) struct ScriptRt {
     pub(crate) flat_fails: u8,
     /// The broker oid of the attempt in flight (0 = none).
     pub(crate) flat_oid: u32,
+    /// PB6 (risk review C3): a venue-originated fill disabled it while a maker rested — the
+    /// cancels are owed (`fault::run_due`) until no acked maker rests uncancelled.
+    pub(crate) pb6_cancel: bool,
     /// §4.7.8: the boot guard's host `CloseAll` was committed (at most once per boot, I40).
     pub(crate) guard_done: bool,
     /// D19: `reconcile_boot` ran (exactly once per committing script per boot, I38).
@@ -411,8 +414,13 @@ pub(crate) struct Core {
     pub(crate) commits: u64,
     /// `event_insn_budget` (the paper default when unset).
     pub(crate) event_budget: u64,
-    /// The resolved route: `Paper` or `Off` (a `Live` route refuses `on_start`, fail closed).
+    /// The resolved route: `Paper`, `Off`, or `Live` with the host's permit (PL2; without it a
+    /// `Live` route refuses `on_start`, fail closed).
     pub(crate) route: SlotRoute,
+    /// PL1/PL2: the live settle window applies (`route == Live` with the permit).
+    pub(crate) live: bool,
+    /// PL1: `live_settle_ms × 1e6` (§4.8), the live settle window in E ns.
+    pub(crate) settle_window_ns: u64,
     /// The host kind (the settle rule, §4.5.5–§4.5.6).
     pub(crate) host: HostKind,
     /// This boot's client-oid epoch (§4.5.3).
@@ -511,16 +519,48 @@ pub(crate) fn build(st: Staged) -> Result<Box<Core>, PineLoadError> {
         record: _,
     } = st;
     debug_assert!(scripts.len() <= MAX_SCRIPTS);
-    if cfg.route == SlotRoute::Live {
-        // pin:08-live-refused-at-start: slot 8 is PAPER ONLY (ruling 2026-10-16) and this crate
-        // has no live dispatch path; a Live route reaching `on_start` is refused, fail closed.
-        return Err(PineLoadError::new(
-            6005,
-            None,
-            "[exec.slot.8]",
-            "slot 8 is paper only: a Live route is refused at on_start".to_string(),
-        ));
+    // PL2 (pin:pl2-live-permit; replaces pin:08-live-refused-at-start): a Live route starts only
+    // with the host's permit naming every script's venue; no permit, a permit off Live, or one
+    // naming another venue refuses `6005`, fail closed. The cli never sets it (slot 8 is PAPER
+    // ONLY by ruling 2026-10-16; arming is the operator's act).
+    match (cfg.route, cfg.live_venue) {
+        (SlotRoute::Live, None) => {
+            return Err(PineLoadError::new(
+                6005,
+                None,
+                "[exec.slot.8]",
+                "slot 8 has no live permit: a Live route is refused at on_start".to_string(),
+            ));
+        }
+        (SlotRoute::Live, Some(v)) => {
+            let mut k = 0usize;
+            while k < scripts.len() {
+                let f = &cfg.symbols[scripts[k].0.chart];
+                if f.venue != v {
+                    return Err(PineLoadError::new(
+                        6005,
+                        Some(k),
+                        "live_venue",
+                        format!(
+                            "the live permit names {v:?}; `{}` is on {:?}",
+                            f.key, f.venue
+                        ),
+                    ));
+                }
+                k += 1;
+            }
+        }
+        (_, Some(v)) => {
+            return Err(PineLoadError::new(
+                6005,
+                None,
+                "live_venue",
+                format!("a live permit ({v:?}) off a Live route"),
+            ));
+        }
+        (_, None) => {}
     }
+    let live = cfg.route == SlotRoute::Live;
     let mut syms: Vec<core_types::SymbolId> = Vec::with_capacity(plan.rows.len());
     for r in &plan.rows {
         if let Some(f) = facts_of(&cfg.symbols, &r.key) {
@@ -573,6 +613,7 @@ pub(crate) fn build(st: Staged) -> Result<Box<Core>, PineLoadError> {
             flat_slow_ok: false,
             flat_fails: 0,
             flat_oid: 0,
+            pb6_cancel: false,
             guard_done: false,
             adopted: false,
             boot_st: (0, 0, 0),
@@ -710,6 +751,8 @@ pub(crate) fn build(st: Staged) -> Result<Box<Core>, PineLoadError> {
                 .unwrap_or(core_config::pine::EVENT_INSN_BUDGET_DEFAULT),
         ),
         route: cfg.route,
+        live,
+        settle_window_ns: u64::from(cfg.slot.live_settle_ms).saturating_mul(1_000_000),
         host: cfg.host,
         epoch: cfg.oid_epoch,
         activation_ns: cfg.activation_ns,

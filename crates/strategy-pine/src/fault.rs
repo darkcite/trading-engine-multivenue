@@ -44,7 +44,7 @@ use crate::rt::Core;
 use crate::settle::kind;
 use crate::{FLATTEN_RETRIES, INCIDENT_CAP, MAX_SETTLES};
 use pine_broker::{BrokerFault, ScriptRefusal};
-use pine_ir::EngineVerb;
+use pine_ir::{EngineIntent, EngineVerb, Primitive};
 use strategy_core::{pine_incident, Ctx, PineCounters, PineIncident};
 
 /// `PineIncident::source`.
@@ -132,6 +132,54 @@ pub(crate) fn view(core: &Core, out: &mut [PineIncident], from_seq: u64) -> u32 
 
 /// §4.6, the one path: disable script `i` (sticky), push its incident, start its flatten.
 pub(crate) fn disable(core: &mut Core, c: &mut PineCounters, i: usize, cause: Cause) {
+    disable_with(core, c, i, cause, true);
+}
+
+/// PB6 (OD-8): a venue-originated fill (liquidation, ADL, orphan, settlement — `order_id` 0,
+/// origin VENUE, not adopted) on `sym`: every script whose chart symbol is `sym` is disabled
+/// WITHOUT a flatten (its broker no longer holds the venue's position, so a broker flatten would
+/// trade on a wrong size) and gets one `VENUE_FILL` incident; a symbol no script trades is only
+/// counted (by the caller). Its resting makers are CANCELLED (risk review C3: they could still
+/// fill into the broker) — never a submit, never a flatten: the cancels are owed to this
+/// callback's `host::flush` (`run_due` → [`pb6_cancel`]). Returns how many scripts it disabled
+/// now.
+/// pin:pb6-venue-fill-chart-symbol: "the script that trades `f.sym`" is the script whose CHART
+/// symbol is `f.sym` (the symbol its orders go to, pin:08-traded-is-every-chart-symbol).
+/// pin:pb6-cancel-needs-dispatch: as the flatten (pin:08-flatten-needs-dispatch), the cancels
+/// are owed only when the script may dispatch (`enabled`, route not `Off`): such a script never
+/// sent a maker, and `Off` never calls the ctx (I36).
+pub(crate) fn venue_fill(core: &mut Core, c: &mut PineCounters, sym: core_types::SymbolId) -> u32 {
+    let mut n = 0u32;
+    let mut i = 0usize;
+    while i < core.scripts.len() {
+        if core.scripts[i].sym == sym && !core.scripts[i].disabled {
+            let may_dispatch = core.scripts[i].enabled && core.route != crate::SlotRoute::Off;
+            if may_dispatch && maker_uncancelled(core, i) {
+                core.scripts[i].pb6_cancel = true;
+                core.flat_due |= 1u32 << i;
+            }
+            disable_with(
+                core,
+                c,
+                i,
+                Cause {
+                    event: pine_incident::VENUE_FILL,
+                    source: source::HOST,
+                    fault_kind: 0,
+                    pc: u32::MAX,
+                    detail: 0,
+                },
+                false,
+            );
+            n += 1;
+        }
+        i += 1;
+    }
+    n
+}
+
+/// [`disable`], with the flatten (step 4) only when `flatten` (PB6 disables without one).
+fn disable_with(core: &mut Core, c: &mut PineCounters, i: usize, cause: Cause, flatten: bool) {
     if core.scripts[i].disabled {
         return; // pin:08-disable-once
     }
@@ -159,8 +207,9 @@ pub(crate) fn disable(core: &mut Core, c: &mut PineCounters, i: usize, cause: Ca
     s.tick_pending = false;
     s.cof_pending = false;
     core.dirty &= !(1u32 << i);
-    // 4. Flatten (pin:08-flatten-needs-dispatch): `may_dispatch` = enabled && route != Off.
-    if core.scripts[i].enabled && core.route != crate::SlotRoute::Off {
+    // 4. Flatten (pin:08-flatten-needs-dispatch): `may_dispatch` = enabled && route != Off; never
+    // for a venue-originated fill (PB6, OD-8).
+    if flatten && core.scripts[i].enabled && core.route != crate::SlotRoute::Off {
         core.scripts[i].flat_active = true;
         c.flattens_started = c.flattens_started.wrapping_add(1);
         core.flat_due |= 1u32 << i;
@@ -288,12 +337,16 @@ pub(crate) fn on_reported(core: &mut Core, c: &mut PineCounters, i: usize, oid: 
     }
 }
 
-/// A live confirmed bar of disabled script `i`'s chart row: the slow phase owes one attempt.
+/// A live confirmed bar of disabled script `i`'s chart row: the slow phase owes one attempt; a
+/// PB6 cancel that failed is re-sent (pin:pb6-cancel-retry-per-bar).
 #[inline]
 pub(crate) fn on_chart_confirm(core: &mut Core, i: usize) {
     let s = &mut core.scripts[i];
     if s.flat_active && s.flat_stuck {
         s.flat_slow_ok = true;
+        core.flat_due |= 1u32 << i;
+    }
+    if s.pb6_cancel {
         core.flat_due |= 1u32 << i;
     }
 }
@@ -321,21 +374,83 @@ fn finish_if_flat(core: &mut Core, c: &mut PineCounters, i: usize) -> bool {
     true
 }
 
-/// End of a callback (`host::flush`, route `Paper`): one `flatten` call per due script, then its
-/// instructions dispatched in buffer order (cancels never withheld).
+/// End of a callback (`host::flush`, route not `Off`): one `flatten` call per due script, then
+/// its instructions dispatched in buffer order (cancels never withheld); or, for a script PB6
+/// disabled, the cancels of its resting makers ([`pb6_cancel`]).
 pub(crate) fn run_due<C: Ctx>(core: &mut Core, c: &mut PineCounters, ctx: &mut C) {
     let mut i = 0usize;
     while i < core.scripts.len() {
         let bit = 1u32 << i;
         if core.flat_due & bit != 0 {
             core.flat_due &= !bit;
+            // PB6 disables without a flatten and a disable is sticky: never both.
+            debug_assert!(!(core.scripts[i].flat_active && core.scripts[i].pb6_cancel));
             if core.scripts[i].flat_active {
                 call(core, c, i, ctx);
+            } else if core.scripts[i].pb6_cancel {
+                pb6_cancel(core, c, i, ctx);
             }
         }
         i += 1;
     }
     core.flat_due = 0;
+}
+
+/// pin:pb6-cancel-side-unknown: the `DISPATCH` row's side byte of a PB6 cancel — the settle
+/// record keeps no side (nor the limit price or the Pine id), so the row says "unknown" (neither
+/// 0 = bid nor 1 = ask) instead of inventing one.
+pub(crate) const PB6_SIDE_UNKNOWN: u8 = 0xFF;
+
+/// PB6 (risk review C3): one `Cancel` per acked resting maker of disabled script `i` — never a
+/// submit, never a flatten, never gated (I26/I27) — through `host::cancel_one` (the
+/// `dispatch_one` Cancel arm: the `CancelReq`, its tape row, its disposition). The script stays
+/// owed (`pb6_cancel`) while a maker rests uncancelled (a `RingFull` / `Refused` /
+/// `Unsupported` answer); the next confirmed chart bar re-sends.
+/// pin:pb6-cancel-acked-makers: "every working order" = every `kind::MAKER` record not yet gone
+/// (`gone == 0`): an acked maker resting. A record already gone (a cancel answered `Ok` /
+/// `NoSuchOrder`, a refused submit, a modify's replaced `prev`, all live-window waits) was
+/// answered by the venue and waits its window as before; an IoC never rests.
+/// pin:pb6-cancel-retry-per-bar: a failed cancel is re-sent at each later confirmed chart bar of
+/// the script (`on_chart_confirm`, the slow phase's cadence), not on every tick: the broker,
+/// which would re-emit after `quote_stale_ns`, never reconciles a disabled script.
+/// pin:pb6-cancel-tape-row: the row records what the record knows — verb `Cancel`, primitive
+/// `MakerPostOnly` (only a maker rests), side [`PB6_SIDE_UNKNOWN`], flags 0, the result, the
+/// broker oid, px 0 (unknown), qty = the maker's ordered size, id 0 (none), prev 0.
+fn pb6_cancel<C: Ctx>(core: &mut Core, c: &mut PineCounters, i: usize, ctx: &mut C) {
+    let mut k = 0usize;
+    while k < MAX_SETTLES {
+        let (rk, gone, oid, qty) = {
+            let r = &core.scripts[i].settles[k];
+            (r.kind, r.gone, r.oid, r.qty)
+        };
+        if rk == kind::MAKER && gone == 0 {
+            let e = EngineIntent {
+                verb: EngineVerb::Cancel,
+                primitive: Primitive::MakerPostOnly,
+                side: PB6_SIDE_UNKNOWN,
+                client_oid: oid,
+                qty_1e6: qty,
+                ..EngineIntent::default()
+            };
+            let _ = crate::host::cancel_one(core, c, i, &e, ctx);
+        }
+        k += 1;
+    }
+    core.scripts[i].pb6_cancel = maker_uncancelled(core, i);
+}
+
+/// Whether script `i` has an acked maker resting with no cancel answered (pin:pb6-cancel-acked-
+/// makers).
+fn maker_uncancelled(core: &Core, i: usize) -> bool {
+    let t = &core.scripts[i].settles;
+    let mut k = 0usize;
+    while k < MAX_SETTLES {
+        if t[k].kind == kind::MAKER && t[k].gone == 0 {
+            return true;
+        }
+        k += 1;
+    }
+    false
 }
 
 /// §4.6 steps 4–5: one idempotent `flatten` call of script `i`.

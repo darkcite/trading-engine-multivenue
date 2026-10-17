@@ -35,7 +35,7 @@ use crate::oid::decode_client_oid;
 use crate::rt::Core;
 use crate::settle::{self, kind, RETIRED_CAP};
 use crate::SLOT_PINE;
-use core_types::{Fill, Side, FILL_ORIGIN_PAPER};
+use core_types::{Fill, Side, FILL_ORIGIN_PAPER, FILL_ORIGIN_VENUE};
 use pine_broker::BrokerFault;
 use strategy_core::PineCounters;
 
@@ -82,6 +82,23 @@ pub(crate) fn on_fill(core: &mut Core, c: &mut PineCounters, f: &Fill) -> Option
         c.fills_foreign = c.fills_foreign.wrapping_add(1);
         return None;
     }
+    // PB6 (G5, I-PB5): venue-originated fills never reach a broker. An ADOPTED fill is the boot's
+    // starting inventory (D19 already adopted it into the broker): counted, never booked.
+    if f.is_adopted() {
+        c.fills_adopted = c.fills_adopted.wrapping_add(1);
+        return None;
+    }
+    // A venue fill with no member oid (liquidation, ADL, orphan, settlement): the router books
+    // it and the venue holds it, the broker cannot — its script is disabled without a flatten
+    // (OD-8); a symbol no script trades is counted only.
+    // pin:pb6-venue-origin-is-oid-zero: "venue-originated" = `order_id == 0` with origin VENUE
+    // (the arm's booking, gateway.rs `current_oid` 0); any other undecodable oid stays
+    // `fills_prior_boot`.
+    if f.order_id == 0 && f.origin == FILL_ORIGIN_VENUE {
+        c.fills_venue_originated = c.fills_venue_originated.wrapping_add(1);
+        crate::fault::venue_fill(core, c, f.sym);
+        return None;
+    }
     let Some((s, oid)) = decode_client_oid(core.epoch, f.order_id) else {
         // A previous boot's oid (HL's userFills snapshot, §4.5.3): never reaches a broker.
         c.fills_prior_boot = c.fills_prior_boot.wrapping_add(1);
@@ -119,7 +136,15 @@ pub(crate) fn on_fill(core: &mut Core, c: &mut PineCounters, f: &Fill) -> Option
     let pv = core.scripts[i].program.meta.chart.pointvalue_1e6;
     let fee = match noted {
         Some((oid_n, fee_n)) if oid_n == f.order_id => fee_n,
-        _ => model_fee_1e12(px, q_abs, pv, ppm),
+        _ => {
+            // PB12 (OD-12): a live fill books the model (`[exec.slot.8.pine] fee_*_ppm`, the
+            // account's read rate until `bn-fees` has N = 30) and is counted, `/state`-visible.
+            // pin:pb12-fee-modelled-live-is-route: "live" = the member's route is `Live`.
+            if core.route == crate::SlotRoute::Live {
+                c.fee_modelled_live = c.fee_modelled_live.wrapping_add(1);
+            }
+            model_fee_1e12(px, q_abs, pv, ppm)
+        }
     };
     let time_ms = if f.origin == FILL_ORIGIN_PAPER {
         pine_ir::scale::ms_from_ns(sat_i64(core.anchor.wall_of(f.ts_ns)))
@@ -171,7 +196,10 @@ pub(crate) fn on_fill(core: &mut Core, c: &mut PineCounters, f: &Fill) -> Option
     } else if let Some(k) = rec {
         let r = &mut core.scripts[i].settles[k];
         r.filled = r.filled.saturating_add(q_abs);
-        let (judge, filled, qty) = (r.kind == kind::JUDGE, r.filled, r.qty);
+        // PL1: a live record (`until ≠ 0`) is never judged by one fill — it adds to its total and
+        // settles when the fills total its size, else the window reports it (§4.5.7 "live: add to
+        // its filled total").
+        let (judge, filled, qty) = (r.kind == kind::JUDGE && r.until == 0, r.filled, r.qty);
         if judge {
             // The paper matcher judges an IoC once: this fill is terminal.
             if filled < qty {

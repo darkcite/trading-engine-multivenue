@@ -151,7 +151,7 @@ fn full_snapshot() -> Box<EngineSnapshot> {
         sweep: u8::MAX,
         account_mode: u8::MAX,
         demo: u8::MAX,
-        refused: [u32::MAX; 21],
+        refused: [u32::MAX; 22],
         halt_reason: u64::MAX,
         in_flight: u64::MAX,
         in_doubt: u64::MAX,

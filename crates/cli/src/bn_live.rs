@@ -45,7 +45,7 @@ use core_types::{make_symbol_id, Fill, SymbolId, VenueId};
 use exec_binance::arm::{ArmKnobs, BnArm};
 use exec_binance::cmd::{duplex, EVT_F_SWEEP_DONE};
 use exec_binance::config::{BnConfig, Scope};
-use exec_binance::gateway::{BnGateway, GwKnobs, Phase, QUIET_NS, ROTATE_AFTER_NS};
+use exec_binance::gateway::{BnBootRow, BnGateway, GwKnobs, Phase, QUIET_NS, ROTATE_AFTER_NS};
 use exec_binance::inst::{BindSpec, InstTable, OptBindSpec, WireTable, INST_WRITABLE, PRODUCT_COINM, PRODUCT_OPTIONS, PRODUCT_SPOT, PRODUCT_USDM};
 use exec_binance::journal::{spawn_writer, AnchorFile, JournalTx, JOURNAL_RING};
 use exec_binance::margin::{MarginBook, SLOTS};
@@ -128,10 +128,27 @@ pub struct BnBoot {
     pub arm: BnArm,
     /// The `bn-gateway` thread.
     pub handle: std::thread::JoinHandle<()>,
-    /// The ledger rows to bind, one per bound instrument.
+    /// The ledger rows to bind, one per bound instrument — each owned by
+    /// the arm's owner slot (PB8, [`own_rows`]).
     pub specs: Vec<InstrumentSpec>,
     /// The boot tell.
     pub tell: String,
+    /// PB4 — the gateway's D19 snapshot at Ready, one per bound row in row
+    /// order (position, entry, today's notional both ways, day read). PB5
+    /// reads it; nothing does yet.
+    pub boot_rows: Vec<BnBootRow>,
+}
+
+/// **PB8 — the router owner tag** (OD-5, defence in depth): every Binance
+/// instrument row is bound `owned_by(owner)`, so another slot's LIVE order
+/// on it is refused by the router (`InstRefusal::Foreign` →
+/// `ForeignRow`) as well as by the arm (`NotOwner`, BX-7). A paper slot is
+/// never judged by the router, so paper members on the same symbols are
+/// untouched. Boot-only.
+pub fn own_rows(specs: &mut [InstrumentSpec], owner: u8) {
+    for s in specs.iter_mut() {
+        *s = s.owned_by(owner);
+    }
 }
 
 /// One armed product's instruments to bind (BX7: USDⓈ-M, COIN-M; BX8:
@@ -529,6 +546,8 @@ pub fn boot_binance_arm(
              nothing to trade",
         ));
     }
+    // PB8: the router's rows are the owner's alone (OD-5).
+    own_rows(&mut specs, owner);
     // BX7: the E7 bound's USD equity is USDⓈ-M's on a classic account, and
     // COIN-M margins in each coin — exec_boot refuses a bounded classic arm
     // with `coinm` armed or `usdm` not (N1); this is the same law on what
@@ -628,6 +647,13 @@ pub fn boot_binance_arm(
              hold (BX-19); nothing was traded"
         ));
     }
+    // PB4 (D19): the gateway's Ready snapshot, copied before the thread
+    // takes the gateway (cold, boot-only).
+    // COPY: the D19 boot rows, ≤ INST_MAX × 32 B, once per boot — the
+    // gateway moves into its thread next, so nothing can borrow its rows —
+    // rejected: a shared Arc (a lock-free read of a boot-once value costs
+    // more than 8 KiB copied once).
+    let boot_rows = gw.boot_rows().to_vec();
     // BX7: what the boot adopted as the owner slot's starting inventory.
     let (adopted, adopted_usd) = gw.adopted();
     if adopted > 0 {
@@ -654,7 +680,7 @@ pub fn boot_binance_arm(
              after the boot's held read binds at the next boot)"
         );
     }
-    let arm = BnArm::new(
+    let mut arm = BnArm::new(
         eng_end,
         table,
         ArmKnobs {
@@ -670,6 +696,13 @@ pub fn boot_binance_arm(
             equity_ttl_ns: 0,
         },
     );
+    // PB2 (I-PB2, OD-7): the Pine slot's orders are refused off the grid,
+    // never rounded; every other owner keeps BX-5. Dark: slot 8 cannot be
+    // live while its paper-only refusals stand.
+    arm.set_strict_grid(strict_grid_for(owner));
+    // PB3 (OD-6 "once confirmed"; r28 risk review B1): off until PB0.2 is
+    // recorded, and only ever for the strict (Pine) owner.
+    arm.set_ro_min_exempt(ro_min_exempt_for(owner));
     let handle = std::thread::Builder::new()
         .name(String::from("bn-gateway"))
         .spawn(move || {
@@ -764,7 +797,30 @@ pub fn boot_binance_arm(
         handle,
         specs,
         tell,
+        boot_rows,
     })
+}
+
+/// **PB2 — the strict grid's owner**: the Pine slot (8) alone refuses,
+/// never rounds (B'4's E-4P / I28 law, OD-7); the batteries and every
+/// other owner keep BX-5's quantization.
+#[must_use]
+pub const fn strict_grid_for(owner: u8) -> bool {
+    owner as usize == core_config::pine::PINE_SLOT
+}
+
+/// **PB0.2 — the venue's answer on record**: whether Binance USDⓈ-M sends a
+/// reduce-only order below `MIN_NOTIONAL` (`-4164`: "unless you choose reduce
+/// only"). False until the operator records PB0.2 (the docs, then the Demo
+/// drill if wanted — `pvm-binance-pb0`); flipping it is that ruling's commit,
+/// with risk-policy §4, BX-5 and the runbook amended in the same change.
+pub const PB0_2_RECORDED: bool = false;
+
+/// **PB3 — the reduce-only minimum exemption's owner** (r28 risk review B1):
+/// the strict (Pine) owner alone, and only once PB0.2 is recorded.
+#[must_use]
+pub const fn ro_min_exempt_for(owner: u8) -> bool {
+    PB0_2_RECORDED && strict_grid_for(owner)
 }
 
 #[cfg(test)]
@@ -1066,5 +1122,118 @@ mod tests {
         let owned = exec_binance::inst::INST_OWNED;
         assert!(t.hot(t.row_of(usdm[0].sym)).has(owned));
         assert!(!t.hot(t.row_of(usdm[1].sym)).has(owned));
+    }
+
+    /// **PB8 (OD-5)** — every Binance row the boot hands the router is
+    /// owned by the arm's owner (the law and its measures unchanged), and
+    /// the ledger then refuses another slot's probe on it `Foreign` while
+    /// the owner's passes. Break-and-watch: without [`own_rows`] each spec's
+    /// owner is `OWNER_NONE` and slot 4's probe is judged.
+    #[test]
+    fn binance_rows_are_owned_by_the_arms_owner() {
+        let usdm = [inst("btcusdt", 512), inst("ethusdt", 513)];
+        let r = rows();
+        let (_, _, mut specs) =
+            bind_table(&[um(&usdm, &r, &[])], 7, AccountMode::Classic, false).unwrap();
+        let before = specs.clone();
+        assert!(before
+            .iter()
+            .all(|s| s.owner == exec_router::ledger::OWNER_NONE));
+        own_rows(&mut specs, 8);
+        assert_eq!(specs.len(), 2);
+        for (s, b) in specs.iter().zip(&before) {
+            assert_eq!(s.owner, 8);
+            assert_eq!(
+                (s.sym, s.law, s.flags, s.unit_1e6, s.strike_1e6),
+                (b.sym, b.law, b.flags, b.unit_1e6, b.strike_1e6)
+            );
+        }
+        let mut l = exec_router::ledger::Ledger::new(core_time::WallAnchor::now());
+        l.mark_seeded();
+        for s in &specs {
+            l.bind_instrument(s).unwrap();
+        }
+        let e6 = 1_000_000;
+        let foreign = l
+            .probe_instrument(usdm[0].sym, 4, e6, true, 100 * e6, None)
+            .unwrap();
+        assert_eq!(foreign.refusal, exec_router::ledger::InstRefusal::Foreign);
+        let own = l
+            .probe_instrument(usdm[0].sym, 8, e6, true, 100 * e6, None)
+            .unwrap();
+        assert_eq!(own.refusal, exec_router::ledger::InstRefusal::None);
+    }
+
+    /// **PB2** — the strict grid is the Pine slot's alone.
+    #[test]
+    fn the_strict_grid_is_the_pine_slots_alone() {
+        assert!(strict_grid_for(8));
+        for slot in (0..16u8).filter(|s| *s != 8) {
+            assert!(!strict_grid_for(slot), "slot {slot}");
+        }
+    }
+
+    /// r28 risk review B1: the PB3 exemption is off for every owner until
+    /// PB0.2 is recorded; the day it is, the Pine slot alone takes it.
+    #[test]
+    fn the_minimum_exemption_waits_for_pb0_2_and_the_pine_slot() {
+        for slot in (0..16u8).filter(|s| *s != 8) {
+            assert!(!ro_min_exempt_for(slot), "slot {slot}");
+        }
+        assert_eq!(ro_min_exempt_for(8), PB0_2_RECORDED);
+    }
+
+    /// **PB7 (R17)** — a Pine client oid (`epoch << 32 | script << 29 |
+    /// oid`) rides the Binance cid whole: rendered for slot 8 under the
+    /// arm's epoch, it classifies `Ours { 8, oid }` and decodes back to
+    /// (script, oid) under Pine's own epoch — the two epochs are taken at
+    /// different moments and each side decodes with its own. Under another
+    /// arm epoch the same id is an orphan (swept before Ready, BX-9); under
+    /// another Pine epoch it is not this boot's (`fills_prior_boot`).
+    #[test]
+    fn a_pine_client_oid_round_trips_through_the_binance_cid() {
+        use exec_binance::cid::{classify, CidClass, CidPrefix, CID_LEN};
+        use strategy_pine::oid::{decode_client_oid, encode_client_oid, BROKER_OID_BITS};
+        const OID_MASK: u32 = (1 << BROKER_OID_BITS) - 1;
+        let (arm_epoch, pine_epoch) = (1_792_137_674u32, 1_792_137_699u32);
+        let p = CidPrefix::new(arm_epoch);
+        let mut id = [0u8; CID_LEN];
+        for script in 0..strategy_pine::MAX_SCRIPTS as u8 {
+            for oid in [1u32, 2, 0x1234, OID_MASK] {
+                let co = encode_client_oid(pine_epoch, script, oid);
+                p.render(8, co, &mut id);
+                assert!(id
+                    .iter()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()));
+                assert_eq!(
+                    classify(&id, arm_epoch),
+                    CidClass::Ours {
+                        slot: 8,
+                        client_oid: co
+                    }
+                );
+                assert_eq!(
+                    p.classify(&id),
+                    CidClass::Ours {
+                        slot: 8,
+                        client_oid: co
+                    }
+                );
+                assert_eq!(decode_client_oid(pine_epoch, co), Some((script, oid)));
+                assert_eq!(
+                    decode_client_oid(arm_epoch, co),
+                    None,
+                    "never the arm's epoch"
+                );
+                assert_eq!(
+                    classify(&id, arm_epoch + 1),
+                    CidClass::Orphan {
+                        epoch: arm_epoch,
+                        slot: 8,
+                        client_oid: co
+                    }
+                );
+            }
+        }
     }
 }

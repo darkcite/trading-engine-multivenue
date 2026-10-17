@@ -909,6 +909,17 @@ pub trait OrderDispatch {
     fn binance_arm_report(&self, _now_ns: NsTs, _out: &mut BinanceArmReport) -> bool {
         false
     }
+
+    /// **PB13 (Binance plan §2.2 G8) — `slot`'s signed position on the
+    /// ledger's instrument row for `sym`**, ×1e6 (a perp row is one), or
+    /// `None` when the dispatcher keeps no ledger (the default) or binds no
+    /// row for `sym`. Cold: the cli's 5 s Pine-vs-ledger alarm only. Only
+    /// `exec_router::RoutedDispatcher` has a ledger to answer from
+    /// (`Ledger::instrument_position_1e6`).
+    #[inline]
+    fn slot_instrument_position_1e6(&self, _slot: u8, _sym: SymbolId) -> Option<i64> {
+        None
+    }
 }
 
 /// **XMM XH4i-5 — an arm the composition may not hold.** `None` is an
@@ -1129,6 +1140,12 @@ impl<D: OrderDispatch> OrderDispatch for Option<D> {
     fn binance_arm_report(&self, now_ns: NsTs, out: &mut BinanceArmReport) -> bool {
         self.as_ref()
             .is_some_and(|d| d.binance_arm_report(now_ns, out))
+    }
+
+    #[inline]
+    fn slot_instrument_position_1e6(&self, slot: u8, sym: SymbolId) -> Option<i64> {
+        self.as_ref()
+            .and_then(|d| d.slot_instrument_position_1e6(slot, sym))
     }
 }
 
@@ -1560,8 +1577,8 @@ pub struct GatewayArmReport {
 const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 1_016);
 
 /// The Binance arm's local refusal reasons ([`BinanceArmReport::refused`]
-/// — `exec_binance::arm::Refusal`, pinned there).
-pub const BINANCE_REFUSALS: usize = 21;
+/// — `exec_binance::arm::Refusal`, pinned there). PVM PB2: + `off_grid`.
+pub const BINANCE_REFUSALS: usize = 22;
 
 /// **BX11 — the Binance arm's own numbers**
 /// ([`OrderDispatch::binance_arm_report`]): its verbs, its gateway's
@@ -1725,7 +1742,8 @@ pub struct BinanceArmReport {
 // BX11: 75 words — pinned, as the other blocks crossing this boundary are.
 // BX9: + the `not_writable` refusal, options' margin and eapi's weight (79).
 // BX13: + spot's weight, spot's day and the held cycles (86).
-const _: () = assert!(core::mem::size_of::<BinanceArmReport>() == 688);
+// PVM PB2: + the `off_grid` refusal (87).
+const _: () = assert!(core::mem::size_of::<BinanceArmReport>() == 696);
 
 /// **BX3 (F9) — an accepted order that ended without a (further) fill**,
 /// as the arm tells the router ([`OrderDispatch::try_next_retired`]).

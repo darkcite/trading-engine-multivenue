@@ -218,6 +218,7 @@ pub fn boot(scripts: Vec<PineScriptCfg>) -> PineBootCfg {
         slot_caps: SlotCaps8::default(),
         slot_venue: None,
         route: SlotRoute::Paper,
+        live_venue: None,
         host: HostKind::Engine,
         symbols: (0..COINS.len()).map(facts).collect(),
         boot_state: Vec::new(),

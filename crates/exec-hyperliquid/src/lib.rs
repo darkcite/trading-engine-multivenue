@@ -115,6 +115,8 @@ pub mod lifecycle;
 pub mod msgpack;
 pub mod nonce;
 pub mod orderupd;
+pub mod perp;
+pub mod perp_recon;
 pub mod recon;
 pub mod request;
 pub mod response;
@@ -150,6 +152,10 @@ pub use http::{HlHttp, HttpErr, EXCHANGE_PATH, MAX_REQ_BODY, MAX_RESP_BUF};
 pub use lifecycle::{LifecycleReport, LifecycleSpec};
 pub use msgpack::{MsgPackErr, Writer};
 pub use nonce::{Nonce, NonceSource, NonceStreams, SharedNonce};
+pub use perp::{
+    PerpBootError, PerpError, PerpRefusal, PerpRefusals, PerpSpec, PerpTable, PerpWant,
+    PERP_DOC_MIN_NOTIONAL_1E6, PERP_SLOTS,
+};
 pub use recon::{
     drift, net_exposure_1e8, perp_state_request, scan_perp_state, scan_spot_state,
     spot_state_request, PerpPosition, SpotBalance, MAX_SPOT_BALANCES, MAX_STATE_REQ,

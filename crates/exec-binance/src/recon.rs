@@ -73,6 +73,15 @@ pub struct PosRow {
     pub amt_1e6: i64,
     /// `notional` USD ×1e6 (signed, at the mark).
     pub notional_1e6: i64,
+    /// PB4 (D19) — `entryPrice` ×1e6, scanned on a USDⓈ-M read (COIN-M
+    /// unchanged); 0 where the read names none or the row is flat.
+    // pin:cli-pb4-entry-optional — the key is read when present, never
+    // required: REST `/fapi/v2/account` carries it, `/fapi/v3/account`
+    // (whose shape — `notional`, `isolatedWallet` — the WS
+    // `v2/account.status` scanned here matches) does not. PB0.3 decides; a
+    // held row whose entry stays 0 is PB5's to refuse (6013), never a
+    // price.
+    pub entry_px_1e6: i64,
     /// `symbol`.
     pub symbol: Span,
     /// `leverage`, the initial leverage (BX7: COIN-M's classic account
@@ -453,6 +462,8 @@ const P_NOTIONAL: u8 = 1 << 2;
 const P_LEVERAGE: u8 = 1 << 3;
 const P_ISOLATED: u8 = 1 << 4;
 const P_SIDE: u8 = 1 << 5;
+/// PB4: `entryPrice` (optional; a second copy is refused as any key's).
+const P_ENTRY: u8 = 1 << 6;
 /// Every position names its symbol and amount.
 const P_NEED: u8 = P_SYMBOL | P_AMT;
 /// A COIN-M position its leverage and margin type too (BX7, BX-19).
@@ -478,6 +489,14 @@ fn position(frame: &[u8], at: usize, cm: bool) -> Result<PosRow, ScanErr> {
             b"notional" => {
                 p.notional_1e6 = dec_1e6(frame, a, z).map_err(bad)?;
                 P_NOTIONAL
+            }
+            // PB4: USDⓈ-M only (COIN-M's read is unchanged: ignored there).
+            b"entryPrice" if !cm => {
+                p.entry_px_1e6 = dec_1e6(frame, a, z).map_err(bad)?;
+                if p.entry_px_1e6 < 0 {
+                    return Err(ScanErr::BadField);
+                }
+                P_ENTRY
             }
             b"leverage" => {
                 p.leverage = u16::try_from(u64_of(frame, a, z).map_err(bad)?).map_err(|_| ScanErr::BadField)?;
@@ -1027,6 +1046,25 @@ pub fn day_increasing_1e6(trades: &mut [TradeRow], current_pos_1e6: i64, inverse
     spent
 }
 
+/// **PB4 (D19) — the day's traded notional on one row, both sides**:
+/// Σ |px × qty| of `trades` (the row's trades since 00:00Z), ×1e6 — every
+/// buy and every sell, opening or closing (impl-08's `day_notional`; on a
+/// dedicated account with one owner every trade on an owned row is the
+/// owner's, BX-7). Summed exactly in `i128`, floored once, saturated at
+/// `i64::MAX`. Linear rows' USD; an inverse row's figure is price ×
+/// contracts and is not read (Pine trades USDⓈ-M alone, OD-1). Cold.
+#[must_use]
+pub fn day_abs_notional_1e6(trades: &[TradeRow]) -> i64 {
+    let mut sum = 0i128;
+    let mut k = 0;
+    while k < trades.len() {
+        let t = &trades[k];
+        sum = sum.saturating_add((t.px_1e6 as i128 * t.qty_1e6 as i128).saturating_abs());
+        k += 1;
+    }
+    (sum / 1_000_000).min(i64::MAX as i128) as i64
+}
+
 /// A trades page this full may have been cut short: refused, never summed
 /// (the S7-L1 rule; the slot stays unseeded until the next UTC day).
 pub const TRADES_PAGE: usize = 1_000;
@@ -1292,6 +1330,84 @@ mod tests {
         let mut one = [PosRow::default(); 1];
         let two = br#"{"totalMaintMargin":"1","totalMarginBalance":"2","positions":[{"symbol":"A","positionSide":"BOTH","positionAmt":"1"},{"symbol":"B","positionSide":"BOTH","positionAmt":"1"}]}"#;
         assert_eq!(scan_um_account(two, Span { at: 0, len: two.len() as u32 }, &mut one), Err(ArrErr::Truncated));
+    }
+
+    /// **PB4 (D19)** — a USDⓈ-M position's `entryPrice` is read ×1e6 (more
+    /// than six decimals kept to six, as every ×1e6 figure here); a read
+    /// naming none leaves 0 (pin:cli-pb4-entry-optional); a second copy, a
+    /// negative or an unscannable one fails the read; COIN-M's read is
+    /// unchanged (the key ignored there).
+    #[test]
+    fn um_account_scan_reads_entry_price() {
+        let sp = |f: &[u8]| Span {
+            at: 0,
+            len: f.len() as u32,
+        };
+        let f = br#"{"totalMaintMargin":"1","totalMarginBalance":"2","positions":[{"symbol":"BTCUSDT","positionSide":"BOTH","positionAmt":"-0.012","entryPrice":"64123.12345678","notional":"-780"},{"symbol":"ETHUSDT","positionSide":"BOTH","positionAmt":"0","entryPrice":"0.00000"},{"symbol":"SOLUSDT","positionSide":"BOTH","positionAmt":"1"}]}"#;
+        let mut p = [PosRow::default(); 4];
+        assert_eq!(scan_um_account(f, sp(f), &mut p).unwrap().n_pos, 3);
+        assert_eq!((p[0].amt_1e6, p[0].entry_px_1e6), (-12_000, 64_123_123_456));
+        assert_eq!((p[1].amt_1e6, p[1].entry_px_1e6), (0, 0));
+        assert_eq!(
+            (p[2].amt_1e6, p[2].entry_px_1e6),
+            (1_000_000, 0),
+            "no entryPrice: 0"
+        );
+        let twice = br#"{"totalMaintMargin":"1","totalMarginBalance":"2","positions":[{"symbol":"A","positionSide":"BOTH","positionAmt":"1","entryPrice":"1","entryPrice":"2"}]}"#;
+        assert_eq!(
+            scan_um_account(twice, sp(twice), &mut p),
+            Err(ArrErr::Scan(ScanErr::Malformed))
+        );
+        let neg = br#"{"totalMaintMargin":"1","totalMarginBalance":"2","positions":[{"symbol":"A","positionSide":"BOTH","positionAmt":"1","entryPrice":"-1"}]}"#;
+        assert_eq!(
+            scan_um_account(neg, sp(neg), &mut p),
+            Err(ArrErr::Scan(ScanErr::BadField))
+        );
+        let junk = br#"{"totalMaintMargin":"1","totalMarginBalance":"2","positions":[{"symbol":"A","positionSide":"BOTH","positionAmt":"1","entryPrice":"1x"}]}"#;
+        assert_eq!(
+            scan_um_account(junk, sp(junk), &mut p),
+            Err(ArrErr::Scan(ScanErr::BadField))
+        );
+        // COIN-M: the key is not read (its scan is unchanged).
+        let cm = br#"{"positions":[{"symbol":"BTCUSD_PERP","positionSide":"BOTH","positionAmt":"3","leverage":"2","isolated":false,"entryPrice":"x"}]}"#;
+        let mut q = [PosRow::default(); 2];
+        if let Ok(s) = scan_cm_account(cm, sp(cm), &mut q) {
+            assert_eq!((s.n_pos, q[0].entry_px_1e6), (1, 0));
+        }
+    }
+
+    /// **PB4 (D19)** — the day's notional sums |px × qty| over BOTH sides,
+    /// opening and closing alike (unlike [`day_increasing_1e6`]), exactly:
+    /// one floor of the `i128` total; none is 0; it saturates.
+    #[test]
+    fn day_abs_notional_sums_both_sides() {
+        assert_eq!(day_abs_notional_1e6(&[]), 0);
+        // Buy 0.010 @ 65 000, sell 0.004 @ 65 100.5, sell 0.006 @ 64 900.25
+        // = 650 + 260.402 + 389.4015 = 1 299.8035 USD.
+        let tr = [
+            t(1, 1, Side::Bid, 10_000, 65_000_000_000),
+            t(2, 2, Side::Ask, 4_000, 65_100_500_000),
+            t(3, 3, Side::Ask, 6_000, 64_900_250_000),
+        ];
+        assert_eq!(day_abs_notional_1e6(&tr), 1_299_803_500);
+        // The increasing part of the same day (flat at the end) is the buy.
+        let mut inc = tr;
+        assert_eq!(day_increasing_1e6(&mut inc, 0, false, 0), 650_000_000);
+        // Sub-micro parts add before the one floor: each 0.5e-6 floors to 0
+        // alone; their sum (0.5 + 0.5 + 1.0) ×1e-6 keeps 2.
+        let tiny = [
+            t(1, 1, Side::Bid, 1, 500_000),
+            t(2, 2, Side::Ask, 1, 500_000),
+            t(3, 3, Side::Bid, 2, 500_000),
+        ];
+        assert_eq!(day_abs_notional_1e6(&tiny), 2);
+        let half = [
+            t(1, 1, Side::Bid, 1_000, 500_000),
+            t(2, 2, Side::Ask, 1_000, 500_000),
+        ];
+        assert_eq!(day_abs_notional_1e6(&half), 1_000);
+        let huge = [t(1, 1, Side::Bid, i64::MAX, i64::MAX)];
+        assert_eq!(day_abs_notional_1e6(&huge), i64::MAX);
     }
 
     /// BX7 (C2): Portfolio Margin's unified account and the product's

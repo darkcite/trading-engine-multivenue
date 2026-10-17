@@ -334,6 +334,7 @@ pub(crate) fn boot_member(
         },
         slot_venue: None,
         route: SlotRoute::Paper,
+        live_venue: None,
         host: HostKind::Replay,
         symbols,
         boot_state: Vec::new(),

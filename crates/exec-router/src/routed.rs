@@ -41,7 +41,9 @@
 
 use crate::counters::{RetireCounters, RiskRefusal, RouteCounters};
 use crate::halt::{trigger_for, CancelPhase, HaltReason, HaltState};
-use crate::ledger::{InstProbe, InstRefusal, InstrumentBindErr, InstrumentSpec, Ledger};
+use crate::ledger::{
+    InstProbe, InstRefusal, InstrumentBindErr, InstrumentSpec, Ledger, LedgerError, PerpVenuePos,
+};
 use crate::mode::ExecMode;
 use crate::route::{ExecRoute, PerpLimits, SlotCaps, EXEC_SLOTS};
 use clob_dispatcher::{
@@ -163,8 +165,8 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
     #[inline]
     pub fn new(route: ExecRoute, paper: P, live: L, anchor: core_time::WallAnchor) -> Self {
         // COPY: boot, once — `route` (1 664 B, `Copy`, pinned in
-        // `route.rs`) moved in by value, and the ledger (146 048 B since
-        // S16-3, pinned in `ledger.rs`, its tables
+        // `route.rs`) moved in by value, and the ledger (146 240 B since
+        // B'4, pinned in `ledger.rs`, its tables
         // inline) built on the stack and moved into its box; rejected:
         // building the ledger in place
         // (`Box::new_uninit` and unsafe field-wise writes) for a cold
@@ -216,6 +218,50 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
     #[inline]
     pub fn bind_instrument(&mut self, spec: &InstrumentSpec) -> Result<(), InstrumentBindErr> {
         self.ledger.bind_instrument(spec)
+    }
+
+    /// **B'4** — bind one Hyperliquid perp row owned by `slot` (impl-Bp
+    /// §3.12). Boot-only; the boot refuses on any `Err`.
+    ///
+    /// # Errors
+    /// See [`Ledger::bind_perp`].
+    #[inline]
+    pub fn bind_perp(&mut self, sym: SymbolId, slot: u8) -> Result<(), LedgerError> {
+        self.ledger.bind_perp(sym, slot)
+    }
+
+    /// **B'4 (D19)** — seed one perp row from the venue before the first
+    /// order. Boot-only; the boot refuses on any `Err`.
+    ///
+    /// # Errors
+    /// See [`Ledger::seed_perp`].
+    #[inline]
+    pub fn seed_perp(
+        &mut self,
+        sym: SymbolId,
+        pos_1e6: i64,
+        avg_px_1e6: i64,
+        day_open_1e6: i64,
+    ) -> Result<(), LedgerError> {
+        self.ledger
+            .seed_perp(sym, pos_1e6, avg_px_1e6, day_open_1e6)
+    }
+
+    /// **B'4 (I32) — one perp reconciliation of `slot`** against the
+    /// venue's `clearinghouseState` positions: the drift
+    /// ([`Ledger::perp_drift_1e6`]) at or above the slot's
+    /// `halt_on_recon_drift_usd_1e6` latches the sticky `recon-drift` halt
+    /// (cancel and refuse, as every trigger). Returns the drift, USD ×1e6.
+    /// Cold: once per recon cycle, off the order path.
+    pub fn reconcile_perps(&mut self, slot: u8, venue: &[PerpVenuePos]) -> i64 {
+        let drift = self.ledger.perp_drift_1e6(slot, venue);
+        let s = usize::from(slot);
+        if let Some(lim) = self.route.halts_at(s) {
+            if lim.recon_drift_usd_1e6 > 0 && drift >= lim.recon_drift_usd_1e6 {
+                self.halt_slot(s, HaltReason::ReconDrift);
+            }
+        }
+        drift
     }
 
     /// **BX3 (F9)** — the retirements drained so far, by `why`. Cold.
@@ -901,6 +947,12 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
         let qty = order.qty.raw();
         let buy = order.side == Side::Bid;
 
+        // ---- B'4: a Hyperliquid perp row, by the three perp cap laws ---
+        // One compare when no perp is bound (impl-Bp §4.13).
+        if self.ledger.is_perp(order.sym) {
+            return self.judge_perp(order, verb, &caps);
+        }
+
         // ---- BX3: an instrument row is judged by its law -------------
         //
         // A bound instrument (Binance) carries its own law — spot,
@@ -1104,6 +1156,80 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
                 > caps.cap_day_usd_1e6
         {
             return self.refuse(order.strategy_id, RiskRefusal::CapDay);
+        }
+        Ok(())
+    }
+
+    /// **B'4 — the clamps on a Hyperliquid perp row** (impl-Bp §4.13, the
+    /// three cap laws; I31). `max_order_usd` is `px × qty`;
+    /// `max_open_orders` counts what the arm accepted (a PLACE only, LAW
+    /// E-7); `cap_instance` projects `Σ |pos| × price` over the slot's perp
+    /// rows — the order's coin at its limit on BOTH sides, every other row
+    /// at its last fill — and refuses iff `projected > cap && projected >
+    /// current`, so a reduction is never refused; `cap_day` adds only the
+    /// order's OPENING notional, either side, so exiting stays possible.
+    ///
+    /// pin:bp4-perp-exit-exempt-clamp-1 — an EXIT is a pure reduction
+    /// (opening part 0) that carries `ORDER_FLAG_REDUCE_ONLY`, which the
+    /// arm sends to the venue (exec-hyperliquid's perp wire), so N stacked
+    /// exits can never flip the position: the venue refuses the excess. An
+    /// exit is exempt from clamp 1 alone (L1, "a cap never blocks an
+    /// exit"); clamp 2 counts every PLACE, an exit too (O-BX25: the shared
+    /// resting table stays bounded per slot). A reduction without the flag
+    /// is judged by every clamp, inside the stated worst case
+    /// `cap_instance + max_open_orders × max_order` (r28 risk review B2).
+    /// pin:bp4-perp-cap-spans-the-slot — the slot's exposure outside its
+    /// perp rows (family rows, other instrument rows) is added to both
+    /// sides of clamp 3: one `cap_instance` per slot across venues (BX3),
+    /// and the increase test is unchanged by a constant.
+    fn judge_perp(
+        &mut self,
+        order: &Order,
+        verb: RiskVerb,
+        caps: &SlotCaps,
+    ) -> Result<(), DispatchError> {
+        let slot = order.strategy_id;
+        let s = usize::from(slot);
+        // An owned row is its owner's alone (I29's router half).
+        if self.ledger.perp_owner(order.sym) != Some(slot) {
+            return self.refuse(slot, RiskRefusal::ForeignRow);
+        }
+        let px = order.px.raw();
+        let qty = order.qty.raw();
+        if px <= 0 || qty <= 0 {
+            return self.refuse(slot, RiskRefusal::Unpriced);
+        }
+        let opening = self.ledger.perp_opening_1e6(order.sym, order.side, qty, px);
+        let exit = opening == 0 && order.flags & core_types::ORDER_FLAG_REDUCE_ONLY != 0;
+        // ---- 1. this one order: px × qty ------------------------------
+        let notional_1e6 =
+            i64::try_from((px as i128).saturating_mul(qty as i128) / 1_000_000).unwrap_or(i64::MAX);
+        if notional_1e6 > caps.max_order_usd_1e6 && !exit {
+            return self.refuse(slot, RiskRefusal::MaxOrder);
+        }
+        // ---- 2. how many are already working (a PLACE only, an exit too)
+        if matches!(verb, RiskVerb::Place) && self.ledger.slot_resting(s) >= caps.max_open_orders {
+            return self.refuse(slot, RiskRefusal::OpenOrders);
+        }
+        // ---- 3. what it would leave at stake --------------------------
+        self.ledger.observe_mono_clock(order.ts_ns);
+        let (cur, proj) = self
+            .ledger
+            .perp_projection_1e6(slot, order.sym, order.side, qty, px);
+        let rest = self
+            .ledger
+            .slot_exposure_1e6(s)
+            .saturating_sub(self.ledger.perp_exposure_1e6(slot));
+        let current = rest.saturating_add(cur);
+        let projected = rest.saturating_add(proj);
+        if projected > caps.cap_instance_usd_1e6 && projected > current {
+            return self.refuse(slot, RiskRefusal::CapInstance);
+        }
+        // ---- 4. today's opening notional ------------------------------
+        if opening > 0
+            && self.ledger.slot_day_turnover_1e6(s).saturating_add(opening) > caps.cap_day_usd_1e6
+        {
+            return self.refuse(slot, RiskRefusal::CapDay);
         }
         Ok(())
     }
@@ -1758,6 +1884,12 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         out: &mut clob_dispatcher::BinanceArmReport,
     ) -> bool {
         self.live.binance_arm_report(now_ns, out)
+    }
+
+    /// PB13: the ledger's own row — an instrument row, a Hyperliquid perp
+    /// row included (`INST_PERP` rows live in the same table). Cold.
+    fn slot_instrument_position_1e6(&self, slot: u8, sym: SymbolId) -> Option<i64> {
+        self.ledger.instrument_position_1e6(usize::from(slot), sym)
     }
 }
 
@@ -4488,6 +4620,59 @@ mod tests {
         let mut rep = clob_dispatcher::GatewayArmReport::default();
         assert!(d.gateway_arm_report(T0, &mut rep));
         assert_eq!(rep.refused_foreign_row, 1);
+    }
+
+    /// **PVM PB8 (OD-5) — a Binance row owned by the arm's owner (slot 8,
+    /// Pine) is its alone at the router too**: another LIVE Binance slot's
+    /// order on it is refused `ForeignRow` before any number (the arm's
+    /// `NotOwner` is the second wall), its cancel passes, the owner's order
+    /// passes on the row's law, and a paper slot is never judged.
+    #[test]
+    fn a_foreign_slot_on_an_owned_binance_row_is_refused() {
+        const E6: i64 = 1_000_000;
+        let bn = VenueId::Binance.to_u8();
+        let lin = core_types::make_symbol_id(VenueId::Binance, 600);
+        let caps = SlotCaps::new(1_000 * E6, 5_000 * E6, 3_000 * E6, 64);
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(8, ExecMode::Live, &[bn], caps, halt_limits())
+            .unwrap();
+        r.set_slot(2, ExecMode::Live, &[bn], caps, halt_limits())
+            .unwrap();
+        let mut d =
+            RoutedDispatcher::new(r, PaperDispatcher::new(), SpyHalt::default(), test_anchor());
+        d.bind_instrument(&InstrumentSpec::new(lin, crate::LAW_LINEAR, 0, 0, 0).owned_by(8))
+            .unwrap();
+        d.live_mut().sig = healthy();
+        d.on_idle();
+        let bn_order = |oid: u64, slot: u8| {
+            let mut o = leg_order(oid, lin, true, 100 * E6, 5 * E6);
+            o.venue = bn;
+            o.strategy_id = slot;
+            o
+        };
+        let o2 = bn_order(1, 2);
+        assert_eq!(d.submit(&o2), Err(DispatchError::RiskRefused));
+        assert_eq!(d.counters().refused_foreign_row, 1);
+        assert_eq!(d.counters().refused_by_slot[2], 1);
+        assert_eq!(
+            d.cancel(&CancelReq::of(&o2, T0)),
+            Ok(()),
+            "a cancel never meets the gate"
+        );
+        assert!(
+            d.submit(&bn_order(2, 8)).is_ok(),
+            "the owner's order passes"
+        );
+        assert!(
+            d.submit(&bn_order(3, 5)).is_ok(),
+            "a paper slot is never judged"
+        );
+        // The owner's order over its max_order is still judged by the law.
+        let mut big = bn_order(4, 8);
+        big.qty = Qty(20 * E6);
+        assert_eq!(d.submit(&big), Err(DispatchError::RiskRefused));
+        assert_eq!(d.counters().refused_max_order, 1);
+        assert_eq!(d.counters().refused_foreign_row, 1);
     }
 
     /// **BX3 — a Binance order is judged by its instrument's law**: the

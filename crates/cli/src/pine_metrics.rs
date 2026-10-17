@@ -22,7 +22,7 @@
 use strategy_core::{pine_incident, PineCounters, PineIncident};
 
 /// The counter rows, in [`counter_values`] order (which pins the two together).
-pub const PINE_COUNTER_NAMES: [&str; 37] = [
+pub const PINE_COUNTER_NAMES: [&str; 39] = [
     "engine_pine_scripts_faulted_total",
     "engine_pine_bars_confirmed_total",
     "engine_pine_bars_gapped_total",
@@ -46,6 +46,8 @@ pub const PINE_COUNTER_NAMES: [&str; 37] = [
     "engine_pine_fills_total",
     "engine_pine_fills_prior_boot_total",
     "engine_pine_fills_foreign_total",
+    "engine_pine_fills_adopted_total",
+    "engine_pine_fills_venue_originated_total",
     "engine_pine_late_fills_after_cancel_total",
     "engine_pine_late_reducer_flips_total",
     "engine_pine_fee_modelled_live_total",
@@ -72,9 +74,9 @@ pub const PINE_GAUGE_NAMES: [&str; 5] = [
 ];
 
 /// `PineCounters`' counter fields in [`PINE_COUNTER_NAMES`] order.
-// COPY: [u64; 37] (296 B) returned by value — cold, the 5 s mirror; the hcv precedent.
+// COPY: [u64; 39] (312 B) returned by value — cold, the 5 s mirror; the hcv precedent.
 #[must_use]
-pub fn counter_values(c: &PineCounters) -> [u64; 37] {
+pub fn counter_values(c: &PineCounters) -> [u64; 39] {
     [
         c.scripts_faulted,
         c.bars_confirmed,
@@ -99,6 +101,8 @@ pub fn counter_values(c: &PineCounters) -> [u64; 37] {
         c.fills,
         c.fills_prior_boot,
         c.fills_foreign,
+        c.fills_adopted,
+        c.fills_venue_originated,
         c.late_fills_after_cancel,
         c.late_reducer_flips,
         c.fee_modelled_live,
@@ -129,13 +133,153 @@ pub fn gauge_values(c: &PineCounters) -> [i64; 5] {
     ]
 }
 
+/// PB13: the symbols in an ALARMED Pine-vs-ledger drift now (a level).
+pub const PINE_LEDGER_DRIFT_GAUGE: &str = "engine_pine_ledger_drift";
+/// PB13: drift episodes alarmed since boot.
+pub const PINE_LEDGER_DRIFT_COUNTER: &str = "engine_pine_ledger_drift_total";
+
 /// The registered ids of the family.
 #[derive(Copy, Clone, Debug)]
 pub struct PineMetricIds {
     /// The counters, in [`PINE_COUNTER_NAMES`] order.
-    pub counters: [core_metrics::CounterId; 37],
+    pub counters: [core_metrics::CounterId; 39],
     /// The gauges, in [`PINE_GAUGE_NAMES`] order.
     pub gauges: [core_metrics::GaugeId; 5],
+    /// PB13 [`PINE_LEDGER_DRIFT_GAUGE`].
+    pub ledger_drift: core_metrics::GaugeId,
+    /// PB13 [`PINE_LEDGER_DRIFT_COUNTER`].
+    pub ledger_drift_total: core_metrics::CounterId,
+}
+
+/// PB13's table: one row per distinct chart symbol (≤ one per script).
+pub const PINE_LEDGER_ROWS: usize = strategy_pine::MAX_SCRIPTS;
+
+/// One drifting symbol: Σ of its scripts' broker positions vs the ledger's slot-8 row, ×1e6.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PineLedgerDrift {
+    /// The chart symbol.
+    pub sym: core_types::SymbolId,
+    /// Σ scripts' `position_1e6` on it.
+    pub pine_1e6: i64,
+    /// The ledger's slot-8 position on its instrument row.
+    pub ledger_1e6: i64,
+}
+
+/// What one [`PineLedgerAlarm::pass`] found.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct PineLedgerPass {
+    /// The drifts that RAISED the alarm this pass (their second consecutive pass), first `n`.
+    pub raised: [PineLedgerDrift; PINE_LEDGER_ROWS],
+    /// How many of `raised` are set.
+    pub n: usize,
+    /// Symbols in an alarmed episode after this pass (the gauge).
+    pub alarmed: u32,
+}
+
+/// PB13 (Binance plan §2.2 G8) — the Pine-vs-ledger alarm: per Pine chart symbol, Σ of the
+/// scripts' broker positions against the router ledger's slot-8 position. A difference on TWO
+/// consecutive passes raises it once (an ERROR tell + `engine_pine_ledger_drift`); agreement
+/// resets the symbol. Alarm only: the arm's drift halt stays the venue guard. Cold (the 5 s
+/// block), fixed tables, no allocation.
+///
+/// Literal readings:
+/// - pin:pb13-no-row-not-compared: a symbol the ledger binds no row for (`None`: no ledger, a
+///   paper boot, an unbound instrument) is not compared and its count resets — no row is no
+///   evidence of a drift.
+/// - pin:pb13-every-script-counts: every loaded script's broker position counts, a disabled
+///   one included (after a PB6 venue fill its broker keeps the pre-liquidation position while the
+///   ledger books the venue's fill: exactly the drift the operator must be told of).
+/// - pin:pb13-episode-once: an episode alarms once, at its second consecutive differing pass;
+///   later differing passes (whatever the amounts) are the same episode until a pass agrees.
+#[derive(Debug, Default)]
+pub struct PineLedgerAlarm {
+    syms: [core_types::SymbolId; PINE_LEDGER_ROWS],
+    /// Consecutive differing passes per row (saturating at 2: 2 = alarmed).
+    streak: [u8; PINE_LEDGER_ROWS],
+    rows: usize,
+    /// Episodes alarmed since boot.
+    pub episodes: u64,
+}
+
+impl PineLedgerAlarm {
+    /// One 5 s pass. `pine` = `(chart symbol, broker position ×1e6)` per script; `ledger(sym)` =
+    /// the ledger's slot-8 position on `sym`'s row (`None`: no row, pin:pb13-no-row-not-compared).
+    pub fn pass(
+        &mut self,
+        pine: &[(core_types::SymbolId, i64)],
+        ledger: impl Fn(core_types::SymbolId) -> Option<i64>,
+    ) -> PineLedgerPass {
+        let mut out = PineLedgerPass::default();
+        let mut seen = [false; PINE_LEDGER_ROWS];
+        let mut k = 0usize;
+        while k < pine.len() {
+            let sym = pine[k].0;
+            k += 1;
+            let Some(r) = self.row(sym) else {
+                continue; // a table full of other symbols: more symbols than scripts — never
+            };
+            if seen[r] {
+                continue;
+            }
+            seen[r] = true;
+            // Σ over every script on this symbol.
+            let mut sum = 0i64;
+            let mut j = 0usize;
+            while j < pine.len() {
+                if pine[j].0 == sym {
+                    sum = sum.saturating_add(pine[j].1);
+                }
+                j += 1;
+            }
+            match ledger(sym) {
+                Some(l) if l != sum => {
+                    if self.streak[r] < 2 {
+                        self.streak[r] += 1;
+                        if self.streak[r] == 2 {
+                            self.episodes = self.episodes.wrapping_add(1);
+                            out.raised[out.n] = PineLedgerDrift {
+                                sym,
+                                pine_1e6: sum,
+                                ledger_1e6: l,
+                            };
+                            out.n += 1;
+                        }
+                    }
+                }
+                _ => self.streak[r] = 0,
+            }
+        }
+        // A symbol no script reported this pass is not drifting.
+        let mut r = 0usize;
+        while r < self.rows {
+            if !seen[r] {
+                self.streak[r] = 0;
+            }
+            if self.streak[r] == 2 {
+                out.alarmed += 1;
+            }
+            r += 1;
+        }
+        out
+    }
+
+    /// The row of `sym`, bound on first sight; `None` when the table is full.
+    fn row(&mut self, sym: core_types::SymbolId) -> Option<usize> {
+        let mut r = 0usize;
+        while r < self.rows {
+            if self.syms[r] == sym {
+                return Some(r);
+            }
+            r += 1;
+        }
+        if self.rows == PINE_LEDGER_ROWS {
+            return None;
+        }
+        self.syms[self.rows] = sym;
+        self.streak[self.rows] = 0;
+        self.rows += 1;
+        Some(self.rows - 1)
+    }
 }
 
 /// Register the family. Boot-only (pin:08-metrics-registered-with-pine).
@@ -143,7 +287,7 @@ pub struct PineMetricIds {
 /// # Errors
 /// The registry is full or a name is taken (a refused boot, never a silent gap).
 pub fn register(reg: &mut core_metrics::MetricsRegistry) -> Result<PineMetricIds, &'static str> {
-    let mut counters = [core_metrics::CounterId::default(); 37];
+    let mut counters = [core_metrics::CounterId::default(); 39];
     let mut i = 0usize;
     while i < PINE_COUNTER_NAMES.len() {
         counters[i] = reg
@@ -159,7 +303,18 @@ pub fn register(reg: &mut core_metrics::MetricsRegistry) -> Result<PineMetricIds
             .map_err(|_| "register pine gauge")?;
         k += 1;
     }
-    Ok(PineMetricIds { counters, gauges })
+    let ledger_drift = reg
+        .register_gauge(PINE_LEDGER_DRIFT_GAUGE)
+        .map_err(|_| "register pine gauge")?;
+    let ledger_drift_total = reg
+        .register_counter(PINE_LEDGER_DRIFT_COUNTER)
+        .map_err(|_| "register pine counter")?;
+    Ok(PineMetricIds {
+        counters,
+        gauges,
+        ledger_drift,
+        ledger_drift_total,
+    })
 }
 
 /// The 5 s mirror: counters as deltas of the member's cumulative values, gauges as levels.
@@ -182,7 +337,7 @@ pub fn mirror(
         reg.gauge(ids.gauges[k]).set(g[k]);
         k += 1;
     }
-    // COPY: 336 B — the next delta's baseline (the hcv precedent).
+    // COPY: 352 B — the next delta's baseline (the hcv precedent).
     *last = *cur;
 }
 
@@ -198,6 +353,7 @@ pub fn event_name(e: u8) -> &'static str {
         pine_incident::LATE_FLIP => "LATE_FLIP",
         pine_incident::BOOT_GUARD => "BOOT_GUARD",
         pine_incident::REFUSAL_TRIP => "REFUSAL_TRIP",
+        pine_incident::VENUE_FILL => "VENUE_FILL",
         _ => "?",
     }
 }
@@ -289,6 +445,118 @@ mod tests {
         assert_eq!(s.len(), all.len(), "unique");
         // Every `PineCounters` field is mirrored exactly once (42 u64 fields).
         assert_eq!(all.len(), core::mem::size_of::<PineCounters>() / 8);
+        // PB13's two rows: outside `PineCounters`, distinct, fitting.
+        for n in [PINE_LEDGER_DRIFT_GAUGE, PINE_LEDGER_DRIFT_COUNTER] {
+            assert!(n.starts_with("engine_pine_") && n.len() <= core_metrics::NAME_MAX);
+            assert!(!all.contains(&n), "{n}");
+        }
+        assert!(PINE_LEDGER_DRIFT_COUNTER.ends_with("_total"));
+    }
+
+    /// PB13 (Binance plan §2.2 G8): one differing pass is no alarm; the second raises it ONCE
+    /// (per symbol, Σ over its scripts); a third is the same episode; agreement resets, and a new
+    /// difference needs two passes again. A symbol with no ledger row is never compared.
+    #[test]
+    fn a_pine_position_unlike_the_ledgers_raises_the_alarm() {
+        let mut a = PineLedgerAlarm::default();
+        // Two scripts on 901 (Σ = 3), one on 902; the ledger agrees on 902, differs on 901.
+        let pine = [(901u32, 1_000_000i64), (902, -500_000), (901, 2_000_000)];
+        let book = |l901: i64| {
+            move |s: u32| match s {
+                901 => Some(l901),
+                902 => Some(-500_000),
+                _ => None,
+            }
+        };
+        // Agreement: nothing.
+        let p = a.pass(&pine, book(3_000_000));
+        assert_eq!((p.n, p.alarmed, a.episodes), (0, 0, 0));
+        // One differing pass: no alarm yet.
+        let p = a.pass(&pine, book(0));
+        assert_eq!((p.n, p.alarmed, a.episodes), (0, 0, 0));
+        // The second: raised once, with both sides.
+        let p = a.pass(&pine, book(0));
+        assert_eq!((p.n, p.alarmed, a.episodes), (1, 1, 1));
+        assert_eq!(
+            p.raised[0],
+            PineLedgerDrift {
+                sym: 901,
+                pine_1e6: 3_000_000,
+                ledger_1e6: 0
+            }
+        );
+        // A third (other amounts): the same episode — alarmed, not raised again.
+        let p = a.pass(&pine, book(7));
+        assert_eq!((p.n, p.alarmed, a.episodes), (0, 1, 1));
+        // Agreement resets.
+        let p = a.pass(&pine, book(3_000_000));
+        assert_eq!((p.n, p.alarmed), (0, 0));
+        let p = a.pass(&pine, book(0));
+        assert_eq!(
+            (p.n, p.alarmed, a.episodes),
+            (0, 0, 1),
+            "one pass after a reset"
+        );
+        let p = a.pass(&pine, book(0));
+        assert_eq!((p.n, p.alarmed, a.episodes), (1, 1, 2), "a new episode");
+        // pin:pb13-no-row-not-compared: no row (no ledger, a paper boot) — never an alarm, and
+        // it resets a running count.
+        let mut b = PineLedgerAlarm::default();
+        let _ = b.pass(&pine, book(0));
+        let p = b.pass(&pine, |_| None);
+        assert_eq!((p.n, p.alarmed), (0, 0));
+        let p = b.pass(&pine, book(0));
+        assert_eq!((p.n, b.episodes), (0, 0), "the None pass reset the count");
+    }
+
+    /// PB13 through the drain: the member's script view is the Pine side, the gauge and the
+    /// episode counter mirror the alarm (registered with the family).
+    #[test]
+    fn the_drain_mirrors_the_ledger_alarm() {
+        struct Two;
+        impl strategy_core::StrategyCounters for Two {
+            fn strategy_kind(&self) -> &'static str {
+                "pine"
+            }
+            fn pine_counters(&self) -> PineCounters {
+                PineCounters::default()
+            }
+            fn pine_scripts_view(&self, out: &mut [strategy_core::PineScriptView]) -> u32 {
+                out[0] = strategy_core::PineScriptView {
+                    sym: 901,
+                    position_1e6: 2_000_000,
+                    ..Default::default()
+                };
+                1
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("pine-ledger-{}", std::process::id()));
+        let mut d = PineDrain::open(&PineIo {
+            pine_dir: dir.clone(),
+            tape: false,
+            boot_utc_ms: 0,
+        });
+        let mut reg = core_metrics::MetricsRegistry::new();
+        let ids = register(&mut reg).expect("register");
+        let flat = |_| Some(0);
+        d.ledger_pass(&Two, flat);
+        d.mirror(Some((&reg, &ids)), &Two);
+        assert_eq!(reg.gauge(ids.ledger_drift).get(), 0);
+        d.ledger_pass(&Two, flat);
+        d.mirror(Some((&reg, &ids)), &Two);
+        d.ledger_pass(&Two, flat);
+        d.mirror(Some((&reg, &ids)), &Two);
+        assert_eq!(reg.gauge(ids.ledger_drift).get(), 1);
+        assert_eq!(reg.counter(ids.ledger_drift_total).get(), 1, "one episode");
+        d.ledger_pass(&Two, |_| Some(2_000_000));
+        d.mirror(Some((&reg, &ids)), &Two);
+        assert_eq!(
+            reg.gauge(ids.ledger_drift).get(),
+            0,
+            "agreement clears the level"
+        );
+        assert_eq!(reg.counter(ids.ledger_drift_total).get(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `/metrics` shows the family, and a bare boot reports zeros; then deltas and levels.
@@ -514,12 +782,14 @@ mod tests {
         let block = at("if now >= next_report {", at("fn run_engine_loop<", 0));
         let hook = at("hook.drain(eng.strategy());", block);
         let drain = at("d.drain(", block);
+        // PB13: the ledger alarm's pass (the ERROR tell) sits beside the drain, outside the gate.
+        let ledger = at("d.ledger_pass(", block);
         let gate = at(
             "if let (Some(reg), Some(ids)) = (obs.metrics.as_ref(), obs.counter_ids.as_ref())",
             block,
         );
         let mirror = at("d.mirror(", block);
-        assert!(hook < drain && drain < gate && gate < mirror);
+        assert!(hook < drain && drain < ledger && ledger < gate && gate < mirror);
         assert!(!src.contains("d.tick("), "the old in-gate pass is gone");
         let last = at("hook.drain(eng.strategy());", mirror);
         let last_drain = at("d.drain(", last);
@@ -609,6 +879,13 @@ pub struct PineDrain {
     tape: Option<crate::pine_tape::PineTapeWriter>,
     out: Box<[PineIncident]>,
     line: Box<[u8]>,
+    /// PB13: the Pine-vs-ledger alarm, its view scratch, the episodes already mirrored, the
+    /// alarmed level of the last pass.
+    ledger: PineLedgerAlarm,
+    views: Box<[strategy_core::PineScriptView]>,
+    pairs: [(core_types::SymbolId, i64); PINE_LEDGER_ROWS],
+    ledger_mirrored: u64,
+    ledger_alarmed: u32,
 }
 
 impl PineDrain {
@@ -650,21 +927,66 @@ impl PineDrain {
             tape,
             out: vec![PineIncident::default(); 64].into_boxed_slice(),
             line: vec![0u8; 512].into_boxed_slice(),
+            ledger: PineLedgerAlarm::default(),
+            views: vec![strategy_core::PineScriptView::default(); PINE_LEDGER_ROWS]
+                .into_boxed_slice(),
+            pairs: [(0, 0); PINE_LEDGER_ROWS],
+            ledger_mirrored: 0,
+            ledger_alarmed: 0,
         }
     }
 
     /// The 5 s metric mirror (`engine_pine_*`), INSIDE the cli's metrics gate: with the family
-    /// unregistered (`reg` `None`) the baseline only moves. Allocates nothing.
+    /// unregistered (`reg` `None`) the baseline only moves. Allocates nothing. PB13's gauge is
+    /// the last [`Self::ledger_pass`]'s alarmed level, its counter the episodes since.
     pub fn mirror<S: strategy_core::StrategyCounters>(
         &mut self,
         reg: Option<(&core_metrics::MetricsRegistry, &PineMetricIds)>,
         strat: &S,
     ) {
         let cur = strat.pine_counters();
+        let ep = self.ledger.episodes;
         if let Some((r, ids)) = reg {
             mirror(r, ids, &cur, &mut self.last);
+            r.gauge(ids.ledger_drift)
+                .set(i64::from(self.ledger_alarmed));
+            r.counter(ids.ledger_drift_total)
+                .inc(ep.saturating_sub(self.ledger_mirrored));
         } else {
             self.last = cur;
+        }
+        self.ledger_mirrored = ep;
+    }
+
+    /// PB13 (Binance plan §2.2 G8): one Pine-vs-ledger pass on the 5 s block, OUTSIDE the metrics
+    /// gate (the ERROR tell is the alarm): every script's `(chart symbol, broker position)` from
+    /// `pine_scripts_view` against `ledger(sym)` — the router ledger's slot-8 row
+    /// (`OrderDispatch::slot_instrument_position_1e6(8, sym)`). Each drift raised (its second
+    /// consecutive pass) is one ERROR line. Alarm only — nothing halts here. Allocates nothing.
+    pub fn ledger_pass<S: strategy_core::StrategyCounters>(
+        &mut self,
+        strat: &S,
+        ledger: impl Fn(core_types::SymbolId) -> Option<i64>,
+    ) {
+        let n = (strat.pine_scripts_view(&mut self.views) as usize).min(self.views.len());
+        let mut k = 0usize;
+        while k < n {
+            self.pairs[k] = (self.views[k].sym, self.views[k].position_1e6);
+            k += 1;
+        }
+        let p = self.ledger.pass(&self.pairs[..n], ledger);
+        self.ledger_alarmed = p.alarmed;
+        let mut k = 0usize;
+        while k < p.n {
+            let d = p.raised[k];
+            tracing::error!(
+                sym = d.sym,
+                pine_1e6 = d.pine_1e6,
+                ledger_1e6 = d.ledger_1e6,
+                "pine: Pine position unlike the ledger's on two passes (PB13 alarm; the arm's \
+                 drift halt is the venue guard)"
+            );
+            k += 1;
         }
     }
 

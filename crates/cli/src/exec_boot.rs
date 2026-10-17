@@ -1338,6 +1338,349 @@ pub fn log_boot_tell(boot: &ExecBoot) {
     }
 }
 
+// ---- B'4 — the Hyperliquid perp boot sequence (impl-Bp §4.13) -----------
+//
+// Boot only (allocates). NOTHING ARMS here: these build and judge the
+// perp half of a boot that a live slot routing a `hyperliquid:<COIN>` perp
+// would run; wiring it into the binary, and arming, are the operator's.
+
+/// One perp coin a live slot routes (impl-08's route supplies these).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HlPerpRoute<'a> {
+    /// Engine `SymbolId`.
+    pub sym: u32,
+    /// The venue's coin spelling, e.g. `"BTC"`.
+    pub coin: &'a str,
+    /// The slot that owns the coin (the only one that may trade it).
+    pub slot: u8,
+}
+
+/// The probe artifact (`hl-perp-limits.tsv`, §4.13) as `(coin,
+/// min_notional_1e6)` rows.
+///
+/// pin:bp4-limits-tsv — the spec names the file, not its layout: `#`
+/// comments and blank lines skipped; the first other line is a TAB header
+/// that must name `coin` and `min_notional_1e6` (other columns ignored,
+/// for T27 to add); each row's minimum is a positive integer, USD ×1e6; a
+/// coin listed twice is refused. T27's probe writes this layout.
+///
+/// # Errors
+/// A missing header or column, a malformed or non-positive minimum, a
+/// duplicate coin.
+pub fn parse_hl_perp_limits(src: &str) -> Result<Vec<(String, i64)>, String> {
+    let mut cols: Option<(usize, usize, usize)> = None;
+    let mut out: Vec<(String, i64)> = Vec::new();
+    for (i, raw) in src.lines().enumerate() {
+        let ln = i + 1;
+        let l = raw.trim_end_matches('\r');
+        if l.trim().is_empty() || l.trim_start().starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = l.split('\t').collect();
+        let Some((c_coin, c_min, width)) = cols else {
+            let coin = f.iter().position(|h| h.trim() == "coin");
+            let min = f.iter().position(|h| h.trim() == "min_notional_1e6");
+            match (coin, min) {
+                (Some(c), Some(m)) => cols = Some((c, m, f.len())),
+                _ => {
+                    return Err(format!(
+                        "hl-perp-limits line {ln}: the header must name `coin` and \
+                         `min_notional_1e6` (TAB-separated)"
+                    ))
+                }
+            }
+            continue;
+        };
+        if f.len() != width {
+            return Err(format!(
+                "hl-perp-limits line {ln}: {} columns, the header has {width}",
+                f.len()
+            ));
+        }
+        let coin = f[c_coin].trim();
+        if coin.is_empty() {
+            return Err(format!("hl-perp-limits line {ln}: empty coin"));
+        }
+        let min: i64 = f[c_min].trim().parse().map_err(|_| {
+            format!(
+                "hl-perp-limits line {ln}: `{}` is not an integer USD ×1e6",
+                f[c_min].trim()
+            )
+        })?;
+        if min <= 0 {
+            return Err(format!(
+                "hl-perp-limits line {ln}: minimum {min} must be positive"
+            ));
+        }
+        if out.iter().any(|(c, _)| c == coin) {
+            return Err(format!(
+                "hl-perp-limits line {ln}: coin {coin} listed twice"
+            ));
+        }
+        out.push((coin.to_owned(), min));
+    }
+    if cols.is_none() {
+        return Err("hl-perp-limits: no header (the probe file is empty)".to_owned());
+    }
+    Ok(out)
+}
+
+/// §4.13 step 1 and the probe gate: the wants a perp boot binds. Empty
+/// `routes` → no wants and no requirement. Refused: `[exec.hl_perp]`
+/// absent while a live slot routes a perp, `isolated ≠ 1`, a leverage of
+/// 0 or above `u16`, a coin absent from the probe file (it cannot arm).
+/// Duplicates, a delisted or absent coin and a leverage above
+/// `maxLeverage` are refused by the binding itself (step 2).
+///
+/// # Errors
+/// The refusal, as the boot prints it.
+pub fn hl_perp_wants<'a>(
+    cfg: Option<&core_config::exec::ExecHlPerp>,
+    routes: &[HlPerpRoute<'a>],
+    limits: &[(String, i64)],
+) -> Result<Vec<exec_hyperliquid::perp::PerpWant<'a>>, String> {
+    if routes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(cfg) = cfg else {
+        return Err(
+            "exec.toml: a live slot routes a Hyperliquid perp — `[exec.hl_perp]` \
+                    (isolated, leverage, limits) is required"
+                .to_owned(),
+        );
+    };
+    if !cfg.isolated {
+        return Err(format!(
+            "[exec.hl_perp] line {}: isolated must be 1 (isolated margin per coin)",
+            cfg.line
+        ));
+    }
+    if cfg.leverage == 0 {
+        return Err(format!(
+            "[exec.hl_perp] line {}: leverage 0 cannot arm",
+            cfg.line
+        ));
+    }
+    let mut out = Vec::with_capacity(routes.len());
+    for r in routes {
+        let Some((_, min)) = limits.iter().find(|(c, _)| c == r.coin) else {
+            return Err(format!(
+                "perp {}: absent from the probe file ({}) — a coin the probe has not \
+                 measured cannot arm",
+                r.coin, cfg.limits
+            ));
+        };
+        out.push(exec_hyperliquid::perp::PerpWant {
+            sym: r.sym,
+            coin: r.coin.as_bytes(),
+            leverage: cfg.leverage,
+            min_notional_1e6: *min,
+            owner_slot: r.slot,
+        });
+    }
+    Ok(out)
+}
+
+/// A perp boot refusal as the boot prints it.
+#[must_use]
+pub fn render_perp_boot_error(e: exec_hyperliquid::perp::PerpBootError) -> String {
+    use exec_hyperliquid::perp::{PerpBootError, PerpError};
+    match e {
+        PerpBootError::Bind(b) => {
+            let why = match b {
+                PerpError::NotInMeta => "a coin is absent from this boot's `meta` answer",
+                PerpError::Delisted => "a coin is delisted in this boot's `meta` answer",
+                PerpError::LeverageAboveMax => {
+                    "[exec.hl_perp] leverage is above a coin's maxLeverage"
+                }
+                PerpError::LeverageZero => "[exec.hl_perp] leverage 0",
+                PerpError::Duplicate => "a perp coin or symbol is routed twice",
+                PerpError::TableFull => "more perp coins than the table holds",
+                PerpError::MalformedMeta => "the `meta` answer is malformed",
+            };
+            format!("hyperliquid perp boot refused: {why}")
+        }
+        PerpBootError::Leverage { asset } => format!(
+            "hyperliquid perp boot refused: updateLeverage (isolated) for asset {asset} was not \
+             confirmed"
+        ),
+    }
+}
+
+/// impl-Bp §4.13 steps 1–4, the venue I/O injected: the wants (step 1 and
+/// the probe gate), then `bind_and_lever` — in the binary
+/// `HlExchange::boot_perps` over this boot's `{"type":"meta"}` answer —
+/// which binds (step 2), tells once per coin (step 3, pushed onto the
+/// returned lines) and sets the isolated leverage once per coin (step 4).
+///
+/// # Errors
+/// The first refusal, as the boot prints it.
+pub fn boot_hl_perps<B>(
+    cfg: Option<&core_config::exec::ExecHlPerp>,
+    routes: &[HlPerpRoute<'_>],
+    limits_src: Option<&str>,
+    bind_and_lever: B,
+) -> Result<Vec<String>, String>
+where
+    B: FnOnce(
+        &[exec_hyperliquid::perp::PerpWant<'_>],
+        &mut Vec<String>,
+    ) -> Result<(), exec_hyperliquid::perp::PerpBootError>,
+{
+    if routes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let limits = match limits_src {
+        Some(s) => parse_hl_perp_limits(s)?,
+        None => {
+            return Err(format!(
+                "hyperliquid perp boot refused: the probe file{} could not be read — no coin \
+                 can arm without it",
+                cfg.map(|c| format!(" {}", c.limits)).unwrap_or_default()
+            ))
+        }
+    };
+    let wants = hl_perp_wants(cfg, routes, &limits)?;
+    let mut tells: Vec<String> = Vec::with_capacity(wants.len());
+    bind_and_lever(&wants, &mut tells).map_err(render_perp_boot_error)?;
+    Ok(tells)
+}
+
+#[cfg(test)]
+mod hl_perp_boot_tests {
+    use super::*;
+    use exec_hyperliquid::perp::{boot_bind_and_lever, boot_tell, PerpTable, PerpWant};
+
+    const META: &[u8] = br#"{"universe":[{"szDecimals":5,"name":"BTC","maxLeverage":40},{"szDecimals":4,"name":"ETH","maxLeverage":25},{"szDecimals":1,"name":"MATIC","maxLeverage":20,"isDelisted":true}]}"#;
+    const LIMITS: &str = "# hl-perp-limits.tsv (probe)\ncoin\tmin_notional_1e6\tprobed_at\nBTC\t10000000\t2026-10-17\nETH\t12000000\t2026-10-17\nMATIC\t10000000\t2026-10-17\n";
+
+    fn cfg(lev: u16) -> core_config::exec::ExecHlPerp {
+        core_config::exec::ExecHlPerp {
+            isolated: true,
+            leverage: lev,
+            limits: "~/multivenue/hl-perp-limits.tsv".to_owned(),
+            line: 9,
+        }
+    }
+
+    /// The sequence the binary runs, the venue's leverage answer scripted.
+    fn run(
+        cfg: Option<&core_config::exec::ExecHlPerp>,
+        routes: &[HlPerpRoute<'_>],
+        limits: Option<&str>,
+        calls: &mut Vec<(u32, u16)>,
+    ) -> Result<Vec<String>, String> {
+        boot_hl_perps(cfg, routes, limits, |wants: &[PerpWant<'_>], tells| {
+            let mut t = PerpTable::new();
+            boot_bind_and_lever(
+                &mut t,
+                META,
+                wants,
+                |s| tells.push(boot_tell(s)),
+                |asset, lev| {
+                    calls.push((asset, lev));
+                    true
+                },
+            )
+        })
+    }
+
+    const BTC8: HlPerpRoute<'static> = HlPerpRoute {
+        sym: 900,
+        coin: "BTC",
+        slot: 8,
+    };
+    const ETH8: HlPerpRoute<'static> = HlPerpRoute {
+        sym: 901,
+        coin: "ETH",
+        slot: 8,
+    };
+
+    #[test]
+    fn hl_perp_boot_binds_tells_then_levers_once_per_coin() {
+        let mut calls = Vec::new();
+        let tells = run(Some(&cfg(3)), &[BTC8, ETH8], Some(LIMITS), &mut calls).expect("boot");
+        assert_eq!(
+            tells,
+            vec![
+                "perp coin=BTC asset=0 szDecimals=5 maxLev=40 lev=3 min=$10".to_owned(),
+                "perp coin=ETH asset=1 szDecimals=4 maxLev=25 lev=3 min=$12".to_owned(),
+            ]
+        );
+        assert_eq!(calls, vec![(0, 3), (1, 3)]);
+    }
+
+    #[test]
+    fn no_perp_route_needs_nothing() {
+        let mut calls = Vec::new();
+        assert_eq!(run(None, &[], None, &mut calls), Ok(Vec::new()));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn a_perp_route_without_the_section_refuses_boot() {
+        let mut calls = Vec::new();
+        let e = run(None, &[BTC8], Some(LIMITS), &mut calls).expect_err("refused");
+        assert!(e.contains("`[exec.hl_perp]`"), "{e}");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn a_coin_absent_from_the_probe_file_cannot_arm() {
+        let mut calls = Vec::new();
+        let only_btc = "coin\tmin_notional_1e6\nBTC\t10000000\n";
+        let e = run(Some(&cfg(3)), &[BTC8, ETH8], Some(only_btc), &mut calls).expect_err("refused");
+        assert!(e.contains("perp ETH: absent from the probe file"), "{e}");
+        let e = run(Some(&cfg(3)), &[BTC8], None, &mut calls).expect_err("no file");
+        assert!(e.contains("could not be read"), "{e}");
+        assert!(
+            calls.is_empty(),
+            "nothing is levered before every coin can arm"
+        );
+    }
+
+    #[test]
+    fn delisted_absent_duplicate_and_over_max_refuse_boot() {
+        let mut calls = Vec::new();
+        let matic = HlPerpRoute {
+            sym: 902,
+            coin: "MATIC",
+            slot: 8,
+        };
+        let e = run(Some(&cfg(3)), &[matic], Some(LIMITS), &mut calls).expect_err("delisted");
+        assert!(e.contains("delisted"), "{e}");
+        let doge_limits = format!("{LIMITS}DOGE\t10000000\t2026-10-17\n");
+        let doge = HlPerpRoute {
+            sym: 903,
+            coin: "DOGE",
+            slot: 8,
+        };
+        let e = run(Some(&cfg(3)), &[doge], Some(&doge_limits), &mut calls).expect_err("absent");
+        assert!(e.contains("absent from this boot's `meta`"), "{e}");
+        let e = run(Some(&cfg(3)), &[BTC8, BTC8], Some(LIMITS), &mut calls).expect_err("dup");
+        assert!(e.contains("routed twice"), "{e}");
+        let e = run(Some(&cfg(41)), &[BTC8], Some(LIMITS), &mut calls).expect_err("over max");
+        assert!(e.contains("above a coin's maxLeverage"), "{e}");
+        let e = run(Some(&cfg(0)), &[BTC8], Some(LIMITS), &mut calls).expect_err("zero");
+        assert!(e.contains("leverage 0"), "{e}");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn the_probe_file_layout_is_refused_when_malformed() {
+        assert!(parse_hl_perp_limits("").is_err());
+        assert!(parse_hl_perp_limits("coin\tmin\nBTC\t1\n").is_err());
+        assert!(parse_hl_perp_limits("coin\tmin_notional_1e6\nBTC\t-1\n").is_err());
+        assert!(parse_hl_perp_limits("coin\tmin_notional_1e6\nBTC\t1.5\n").is_err());
+        assert!(parse_hl_perp_limits("coin\tmin_notional_1e6\nBTC\t1\nBTC\t2\n").is_err());
+        assert!(parse_hl_perp_limits("coin\tmin_notional_1e6\nBTC\n").is_err());
+        assert_eq!(
+            parse_hl_perp_limits(LIMITS).expect("ok")[1],
+            ("ETH".to_owned(), 12_000_000)
+        );
+    }
+}
+
 /// XMM XH4f / XH5e: `exec.toml.example` with its slot-6 recipe live — the
 /// section's keys uncommented, its paper line dropped (tests: the template
 /// resolves on the gateway; the probe's section is this recipe).

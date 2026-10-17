@@ -16964,8 +16964,10 @@ Hyperliquid (O-PVM-2). Lead ruling: `all` keeps meaning the eight production mem
      `ORDER_KIND_MAKER` keeps the strict-cross law.
    - **`ORDER_FLAG_REDUCE_ONLY` goes on reducing orders only** (the broker's reduce-only sizing:
      exits, closes, the D13 flatten, the guards' `CloseAll`; `pin:08-order-flags-set`). The
-     paper matcher and the exec router ignore the bit, so on paper the broker's sizing is the
-     guard. The bit is a second guard, on live venues only.
+     paper matcher ignores the bit, so on paper the broker's sizing is the guard. Live, it is a
+     second guard against a flip: the exec router reads it on a Hyperliquid perp row (only a
+     flagged reduction is an exit there, "B'4" below), and both arms send it to the venue —
+     exec-hyperliquid on a perp row (`r: true`), exec-binance on USDⓈ-M (r28 risk review B2, C4).
    - **`activation_ns` is taken from the matcher's table** (`pin:08-activation-from-matcher-table`,
      found by G5). It is `core_fill::ACTIVATION_NS_DEFAULT[..8]`, the table `PaperMatcher` judges
      by. With zeros, an IoC was reported cancelled and then filled.
@@ -17201,3 +17203,153 @@ skips the journal.
 `cross_refuses_a_replay_made_in_the_wrong_fills_mode`, `cross_compares_only_the_listed_fields`),
 `tests/pine_verify.rs` (`cross_pairs_a_live_paper_window_with_its_replay_from_boot`,
 `replay_from_boot_recorded_mode_reproduces_the_live_fills`).
+
+## B'4 — Hyperliquid perps (impl-Bp §4.13–§4.14; DARK until the operator arms it, 2026-10-17)
+
+**Status: written BEFORE any perp arms** ("no subsequent E-phase may arm a venue without its own
+entry here first", "Phased loosening"). A perp is a new instrument class on the armed venue.
+**Nothing arms by default:** slot 8 (Pine) stays PAPER ONLY — refusals 1–3 of "PVM — slot 8,
+paper only" stand unchanged, and the cli never sets the PL2 live permit. The code below builds and
+judges the perp half of a boot; wiring it into a live boot and arming are the operator's acts.
+`risk-reviewer` closes this entry before R2. **OPEN until then.**
+
+**LAW E-4P.** A perp asset id is valid only when bound at THIS boot from the venue's own `meta`
+answer, by exact coin name, from an entry that is not delisted; never derived, never carried
+across a boot (`exec_hyperliquid::perp::PerpTable::bind_from_meta`). Refused at boot: a coin
+absent from `meta`, delisted, leverage 0 or above its `maxLeverage`, a coin or symbol routed
+twice. Perps do not roll; the boot binding replaces E-4's roll binding. One boot tell per coin
+(`perp coin=… asset=… szDecimals=… maxLev=… lev=… min=$…`): read the asset id off it.
+
+**Refuse, never round.** A perp order whose price breaks the venue grid (more than 5 significant
+figures and not an integer, or more than `6 − szDecimals` decimals), whose size has more than
+`szDecimals` decimals, or whose value is below the coin's minimum is refused locally before
+signing (`perp::check`; counted in `refused_local` and per `PerpRefusal`). Nothing is rounded.
+impl-08's tick is `perp::tick_1e6(ref, szDecimals)`; past that price decade an off-grid limit is
+refused, never rounded.
+
+**The minimum.** `min_notional_1e6 = max($10 documented, the probe's value)`. The probe file
+(`~/multivenue/hl-perp-limits.tsv`, written by `scripts/exec-smoke.sh --perp-probe`, testnet) is
+an **arming precondition**: a coin absent from it cannot arm (`exec_boot::hl_perp_wants`). The
+slot's `max_order_usd_1e6` must clear every routed coin's minimum or no order passes both
+(impl-08 `6009`).
+
+**Isolated margin, leverage fixed at boot.** `[exec.hl_perp] isolated = 1` is required (any other
+value refuses the boot); `updateLeverage {asset, isCross: false, leverage}` once per coin at boot,
+a non-`default` answer refuses the boot; leverage never changes at runtime. A venue position that
+is not isolated, or whose leverage differs from `exec.toml`, refuses the boot. One coin's loss
+cannot consume another's margin.
+
+**One owner slot per coin.** A bound perp coin has exactly one `owner_slot`; another slot's order
+is refused (`NotOwner`). impl-08 allows one enabled script per (venue, coin) on Live (`6007`).
+
+**The three cap laws for a perp row (O-E4: caps stay exactly paper's).**
+- `max_order_usd` = `px × qty`, unchanged; `max_open_orders` unchanged — it counts every PLACE,
+  an exit's too (O-BX25).
+- **An EXIT** is a pure reduction (its opening part 0) that carries `ORDER_FLAG_REDUCE_ONLY`; the
+  arm sends the flag to the venue (`r: true`, submit and modify), so N stacked exits cannot flip
+  the coin — the venue refuses what would. An exit is exempt from `max_order_usd` alone (L1, "a
+  cap never blocks an exit"). A reduction without the flag is judged by every clamp, inside the
+  stated worst case `cap_instance + max_open_orders × max_order` (r28 risk review B2;
+  `pin:bp4-perp-exit-exempt-clamp-1`).
+- `cap_instance_usd` = `Σ |pos| × price` over the slot's perp rows. The order's coin is priced at
+  the order's limit on BOTH sides of the test; every other row at its last fill. Refused iff
+  `projected > cap && projected > current`: a reduction is never refused.
+- `cap_day_usd` = filled OPENING notional (the part of a fill that increases `|pos|`, either
+  side); a reduction adds nothing, so exiting stays always possible.
+- A perp fill books to its row, never `fills_unbound`.
+
+**Reconciliation and halts.** Each recon cycle reads `clearinghouseState` (counted by the budget
+governor); drift = `Σ |ledger pos − szi| × px` (USD ×1e6) against `halt_on_recon_drift_usd_1e6`
+— a sticky halt; `halt_on_recon_stale_ms` unchanged. The boot seeds each row from
+`clearinghouseState` and today's opening notional from `userFillsByTime` (00:00Z, paged). **The
+anchor extension (T0.6):** the E7 P&L halts must include the perp `accountValue` before a perp
+arms — until T0.6 answers, arming is blocked. What stops it: `exec.HALT`, the E6 halts, the
+drift and stale halts, the E7 bound; **a cancel is never blocked by a cap** (E6).
+
+**Fees.** Measured from `userFills.fee` after the first live fills; an arming decision reads a
+measured row (§4.10).
+
+**What the operator must do to arm (none of it is done by code):**
+1. Run `scripts/exec-smoke.sh --perp-probe --perp-coins <coins> --perp-leverage <lev>` on the
+   TESTNET account (after phases A and B); exit 0, and `hl-perp-limits.tsv` lists every coin to
+   arm. Exit 67: a coin's answers did not match the documented rules (it is left out); exit 68:
+   something may be LEFT ON THE TESTNET ACCOUNT — read and clear it. `--perp-probe --offline` is
+   the cost-free self-test.
+2. `[exec.hl_perp]` in `exec.toml` (`isolated = 1`, `leverage`, `limits`), the slot's caps at
+   paper's (O-E4) with `max_order_usd_1e6 ≥` every coin's minimum.
+3. T0.6 answered and the anchor extension reviewed; impl-08's R0–R4 ramp, **R2 the first perp
+   signature on mainnet**, one coin, the smallest size.
+4. The live-arming ruling for slot 8 (it lifts refusals 1–3 and sets the PL2 permit — the cli
+   never does), and `risk-reviewer` closing this entry.
+
+## PVM — slot 8 on Binance USDⓈ-M (DARK until the operator arms it; PB14, R-P11, 2026-10-17)
+
+**Status: written BEFORE anything arms.** Slot 8 stays PAPER ONLY (refusals 1–3 of "PVM — slot 8,
+paper only" stand; the cli never sets the PL2 permit). Rulings adopted (R-P11, as recommended):
+OD-1 USDⓈ-M only; OD-3 cross margin; OD-5 slot 8 sole owner; OD-6, OD-7, OD-8, OD-11–OD-14. OD-2
+(symbols), OD-4 (caps) and OD-9 / OD-10 (arming) stay the operator's. `risk-reviewer` closes this
+entry before any arming. **OPEN until then.**
+
+1. **BX-1…BX-20 apply unchanged**, except where stated here.
+2. **The facts law (I-PB1).** On a Live route, every Pine symbol's tick, step, `minQty` and
+   minimum are this boot's bound row in the arm (`BnInstHot`). A difference refuses the boot
+   (`6013`). An inexact tick or step at 1e-6, a non-PERPETUAL / non-USDT / TradFi / dated symbol
+   refuses (`6006`); `minQty ≠ stepSize` refuses (`6009`); the minimum is CEILED, never floored.
+   On a Live route the boot's facts come through `pine_boot::symbol_facts` → `pine_bn::live_facts`
+   (the refusing conversion); paper keeps discovery's. Wired, and unreachable until the arming
+   change (a live slot 8 is refused at parse); `check_facts_against_arm` then compares the grid
+   with the arm's bound row (r28 risk review C1).
+3. **BX-5 for slot 8: refuse, never round (I-PB2, OD-7).** A slot-8 order off the bound grid is
+   refused and counted (`Refusal::OffGrid`, word `off_grid`); an on-grid order leaves
+   byte-identical. Non-Pine owners (the batteries) keep BX-5's rounding.
+4. **The minimum.** Refused locally for opening orders. A USDⓈ-M reduce-only order below it is
+   exempt (OD-6) **only once PB0.2 confirms the venue's `-4164` rule** — until then the refusal
+   stands; `minQty` always binds (I-PB3). In code the exemption is the arm's `ro_min_exempt`
+   knob, off by default and honoured only for a strict (Pine) owner: the cli sets it from
+   `bn_live::PB0_2_RECORDED` (false). Recording PB0.2 is the change that flips it, with this item,
+   BX-5 and runbook §15 amended in the same change; the batteries never take it (r28 risk review
+   B1). BTCUSDT's minimum is **50 USDT** (PB0, 2026-10-17).
+5. **Margin (OD-3, R-P11).** CROSSED margin, one-way, single-asset, on a **dedicated
+   sub-account used only by slot 8**; leverage set by `exec-smoke --binance-setup` and asserted
+   at boot, **≤ 3** (`max_leverage`: PB9 refuses an artifact above 3 — `pine-verify --check
+   --exec` now, `exec_boot` at the arming change; the arm asserts every owned row's leverage ≤
+   `max_leverage` at boot, BX-19; r28 risk review C2); the account funded ≥ the slot's
+   `cap_instance_usd_1e6` so
+   account leverage stays ≤ 1×; `halt_on_margin_ratio_1e6` required, well under 800 000. (HL
+   perps stay ISOLATED per coin — "B'4" above.)
+6. **Ownership.** Slot 8 is the arm's one owner (BX-7 as built); every Binance router row is
+   owned by it (PB8), so another slot's order is refused by the router (`Foreign`) and the arm
+   (`NotOwner`).
+7. **D19 — the boot snapshot.** `VenueBootState` per Pine symbol is the gateway's own Ready
+   snapshot: position, entry price (0 when flat), today's notional both ways, the orphan sweep.
+   Refusals: `6013` on a missing or unread row (a full trades page), on resting orders not swept,
+   on a position on a bound symbol no enabled script trades; `6005` on a Live boot without
+   `boot_exit_policy` (OD-11: `protective`). A venue read failure refuses the boot (OD-11).
+8. **Venue-originated fills (I-PB5, OD-8).** An adopted fill is counted, never booked. A
+   liquidation / ADL / orphan / settlement fill (`order_id = 0`, venue origin) is counted, raises
+   one `VENUE_FILL` incident and **disables the script that trades the symbol, without a
+   flatten**; it is never booked by a broker. Its resting makers are cancelled in the same
+   callback (never a submit), a refused cancel re-sent at each later confirmed bar
+   (`pin:pb6-cancel-*`; r28 risk review C3). Residual, open before arming: a script already
+   disabled and flattening when the venue fill arrives keeps its flatten (reduce-only at the
+   venue bounds it).
+9. **The cap laws.** BX3's linear rows; exits exempt from the money clamps; O-BX25; the per-script
+   nesting (`6008`); O-E4: live caps equal paper's. OD-4's shape: per script `unit ≥ 1.5 ×
+   minimum`, `cap_instance = unit`, `cap_day ≈ 8 × unit`, `max_open ≤ 2`; the slot's `max_order
+   ≥ 2 × cap_instance`.
+10. **What stops it.** `exec.HALT`, the E6 halts, `MarginRisk`, `VenueLock`, `ScanFailure`, the
+    E7 bound, the arm's drift halt; a cancel is never blocked. Venue rejects stay invisible to
+    Pine for the first arm (OD-13): the settle window and the slot's reject halt cover them.
+    **The Pine-vs-ledger alarm (PB13, G8):** each cold 5 s pass sums the scripts' broker
+    positions per symbol against the router ledger's row; a difference on two consecutive
+    passes raises one ERROR tell and `engine_pine_ledger_drift` (`_total` counts episodes). An
+    alarm, not a halt — the arm's drift halt stays the venue guard.
+11. **Fees (OD-12).** The account's read rate (`/fapi/v1/commissionRate`, BNB burn off),
+    flagged modelled, until `bn-fees` has N = 30 measured trades (runbook §14).
+12. **The arming preconditions** (runbook §15): the BX13 R0 record on this account; impl-08 R0
+    and R1 artifacts; `pin:U17-barstate-table` pinned; Q1 ruled; measured or declared fees; the
+    setup tool applied; BNB burn off; PB15 green; `risk-reviewer` closed this entry.
+13. **The ramp.** impl-08 R0–R4, **R2 the first Pine order on Binance mainnet**: one script, one
+    symbol, the smallest size. The arming change (lifting the paper-only refusals for slot 8 on
+    Binance only, PB9 called from `exec_boot`, the PL2 permit, the operator's `exec.toml`) is the
+    operator's act at R2 — no session makes it.

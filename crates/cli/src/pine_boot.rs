@@ -17,6 +17,10 @@
 //!   (paper or off — a live slot 8 is refused at parse and at `--arm-live`), facts, and an EMPTY
 //!   `boot_state` (paper boots flat, risk item (a); the member also refuses one off Live).
 //! - **[`warm`]**: the warm-up slices from pine-screen bar files under `--pine-bars`.
+//! - **[`attach_live_boot`]** (Binance plan PL3, D19): the live arm's boot snapshot into
+//!   `boot_state`, at the engine seam after the arms boot; a paper slot 8 passes `None` and is
+//!   untouched. The live permit (`PineBootCfg::live_venue`, PL2) is NEVER set here
+//!   (pin:pl2-cli-never-permits): arming slot 8 is the operator's act, a separate change.
 //!
 //! Literal readings (each derivation from the venues' own documentation):
 //! - pin:08-facts-from-discovery: the ruling above; boot order discovery → facts → `build` →
@@ -373,11 +377,39 @@ pub fn build(
     resolve: impl Fn(&str) -> Option<SymbolId>,
     facts: &DiscoveredFacts<'_>,
 ) -> Result<PineBoot, String> {
+    let live = exec.is_some_and(slot8_is_live);
     build_with(flags, exec, |manifest| {
         manifest_facts(manifest, resolve, |key, sym| {
-            facts_from_discovery(key, sym, facts)
+            symbol_facts(live, key, sym, facts)
         })
     })
+}
+
+/// Whether the resolved artifact routes slot 8 `live` (refused by [`build_with`] today, I42).
+fn slot8_is_live(eb: &ExecBoot) -> bool {
+    eb.slots
+        .iter()
+        .any(|s| s.slot == core_config::pine::PINE_SLOT && s.mode == "live")
+}
+
+/// **PB1 (I-PB1; r28 risk review C1)** — one symbol's facts for the route: a Live slot 8 takes
+/// them through [`crate::pine_bn::live_facts`] (refuse, never floor: product, contract, margin
+/// asset, TradFi, grid; `6006` / `6009`), paper through [`facts_from_discovery`]. Wired now; a
+/// live slot 8 is still refused at parse and by [`build_with`] until the arming change.
+///
+/// # Errors
+/// As the chosen source.
+pub fn symbol_facts(
+    live: bool,
+    key: &str,
+    sym: SymbolId,
+    facts: &DiscoveredFacts<'_>,
+) -> Result<PineSymbolFacts, String> {
+    if live {
+        crate::pine_bn::live_facts(key, sym, facts)
+    } else {
+        facts_from_discovery(key, sym, facts)
+    }
 }
 
 /// [`build`] with the facts from `symbols_of` (the parsed manifest in): the `run` boot reads
@@ -448,6 +480,10 @@ pub fn build_with(
         slot_caps: caps,
         slot_venue,
         route,
+        // PL2 (pin:pl2-cli-never-permits): the cli NEVER sets the live permit while slot 8 is
+        // paper only — `core_config::exec`, `exec_boot::resolve` and the per-slot table build
+        // refuse a live slot 8; arming is the operator's act (a separate change).
+        live_venue: None,
         host: HostKind::Engine,
         symbols,
         // Risk item (a): paper boots flat — EMPTY off Live (the member refuses one otherwise).
@@ -478,6 +514,111 @@ pub fn build_with(
         run_dir: None,
         run_epoch_ns: 0,
     })
+}
+
+/// PL3 (impl-08 §4.7.5, D19): one row of the LIVE arm's boot snapshot for slot 8 — the arm's
+/// own venue reads (Binance: PB5 from `BnBoot::boot_rows`; Hyperliquid: B'4 T26), never the
+/// cli's. Boot only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveBootRow {
+    /// The engine symbol of the bound row.
+    pub sym: SymbolId,
+    /// Signed position ×1e6.
+    pub position_1e6: i64,
+    /// The venue's entry price ×1e6; 0 when flat.
+    pub entry_px_1e6: i64,
+    /// Σ |px × qty| ×1e6 of slot 8's trades on the row since 00:00Z, both directions.
+    pub day_abs_1e6: i64,
+    /// Today's trades were read completely (a full page leaves the row unread).
+    pub day_read: bool,
+    /// The E-8 boot sweep confirmed no slot-8 order rests on the row.
+    pub swept: bool,
+}
+
+/// PL3: hand the live arm's boot snapshot to the member's configuration (impl-08 §4.7.5,
+/// §4.7.8). Off `Live` nothing is read and nothing is attached: `rows` must be `None` (paper
+/// boots flat, risk item (a)). On `Live`: the Q1 policy (`boot_exit_policy`) and the other Live
+/// keys are required (`6005`, `core_config::pine::require_live`); `rows` must exist (`6013`);
+/// every traded symbol (each script's chart symbol, pin:08-traded-is-every-chart-symbol) needs a
+/// row read completely and swept (`6013`); a position on a bound row no ENABLED script trades
+/// refuses (`6013`). The member's configuration then holds one `VenueBootState` per traded
+/// symbol and per held row (§3.2), in row order; `configure` judges them again.
+///
+/// # Errors
+/// The refusal, human-readable, naming its code.
+pub fn attach_live_boot(cfg: &mut PineBootCfg, rows: Option<&[LiveBootRow]>) -> Result<(), String> {
+    if cfg.route != SlotRoute::Live {
+        return match rows {
+            None => Ok(()),
+            Some(r) => Err(format!(
+                "pine: 6013 key=boot_state: {} venue rows handed to a {:?} slot 8 — paper boots \
+                 flat",
+                r.len(),
+                cfg.route
+            )),
+        };
+    }
+    core_config::pine::require_live(&cfg.slot, 0)
+        .map_err(|e| format!("pine: {} key={}: {} (Live)", e.code, e.key, e.why))?;
+    let Some(rows) = rows else {
+        return Err("pine: 6013 key=boot_state: a Live slot 8 without the arm's boot reads".into());
+    };
+    let sym_of = |key: &str| cfg.symbols.iter().find(|f| f.key == key).map(|f| f.sym);
+    let mut traded: Vec<(SymbolId, bool)> = Vec::new();
+    for sc in &cfg.manifest.scripts {
+        let Some(sym) = sym_of(&sc.symbol) else {
+            return Err(format!(
+                "pine: 6006 key=symbol: `{}` has no facts",
+                sc.symbol
+            ));
+        };
+        match traded.iter_mut().find(|t| t.0 == sym) {
+            Some(t) => t.1 |= sc.enabled,
+            None => traded.push((sym, sc.enabled)),
+        }
+    }
+    for (sym, _) in &traded {
+        let Some(r) = rows.iter().find(|r| r.sym == *sym) else {
+            return Err(format!(
+                "pine: 6013 key=symbol: {sym}: no venue boot row for a traded symbol"
+            ));
+        };
+        if !r.day_read {
+            return Err(format!(
+                "pine: 6013 key=symbol: {sym}: today's trades were not read completely"
+            ));
+        }
+        if !r.swept {
+            return Err(format!(
+                "pine: 6013 key=symbol: {sym}: resting slot-8 orders not swept"
+            ));
+        }
+    }
+    for r in rows {
+        let managed = traded.iter().any(|t| t.0 == r.sym && t.1);
+        if r.position_1e6 != 0 && !managed {
+            return Err(format!(
+                "pine: 6013 key=boot_state: venue position {} on {} that no enabled script trades",
+                r.position_1e6, r.sym
+            ));
+        }
+    }
+    cfg.boot_state = rows
+        .iter()
+        .filter(|r| r.position_1e6 != 0 || traded.iter().any(|t| t.0 == r.sym))
+        .map(|r| strategy_pine::VenueBootState {
+            sym: r.sym,
+            position_1e6: r.position_1e6,
+            avg_px_1e6: if r.position_1e6 == 0 {
+                0
+            } else {
+                r.entry_px_1e6
+            },
+            day_notional_1e6: r.day_abs_1e6,
+            resting_swept: r.swept,
+        })
+        .collect();
+    Ok(())
 }
 
 /// The member's activation Δ by venue byte: the paper matcher's own table

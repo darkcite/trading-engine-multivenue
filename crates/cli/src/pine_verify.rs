@@ -1238,6 +1238,15 @@ fn check_cfg(a: &PineVerifyArgs, manifest: &Path) -> Result<PineBootCfg, String>
         };
         crate::pine_boot::replay_facts(m, &universe, ord)
     })?;
+    // PB11 (impl-08 §4.7.7 mitigation 1): an artifact whose slot 8 reaches Binance is judged
+    // offline by PB9's rules too (the facts are the screen universe's — no venue read).
+    // pin:pb11-bn-artifact-is-slot8-venue: "a Binance live artifact" = slot 8 names `binance`
+    // (a live slot 8 is refused at parse until the arming change, so the mode is not judged).
+    if let Some(eb) = eb.as_ref() {
+        if crate::pine_bn::slot8_names_binance(eb) {
+            crate::pine_bn::check_pine_binance(eb, &pb.cfg.manifest, &pb.cfg.symbols)?;
+        }
+    }
     Ok(pb.cfg)
 }
 

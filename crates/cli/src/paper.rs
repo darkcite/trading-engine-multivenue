@@ -6897,12 +6897,13 @@ const BNARM_COUNTER_NAMES: [&str; BNARM_COUNTERS] = [
     "engine_exec_bn_refused_deadman_down_total",
     "engine_exec_bn_refused_flags_total",
     "engine_exec_bn_refused_not_writable_total",
+    "engine_exec_bn_refused_off_grid_total",
 ];
 
 /// `BinanceArmReport`'s totals in [`BNARM_COUNTER_NAMES`] order: one
 /// literal, built in place (the refusals by index — a change of their
 /// count fails to compile here).
-// COPY: [u64; 43] (344 B) returned by value — cold, the 5 s /metrics
+// COPY: [u64; 44] (352 B) returned by value — cold, the 5 s /metrics
 // mirror (then kept as the next delta's baseline); the fields are visited
 // once in the name order — a borrowed view would need the report to be an
 // array, which the POD is not.
@@ -6932,7 +6933,7 @@ fn bnarm_counter_values(r: &clob_dispatcher::BinanceArmReport) -> [u64; BNARM_CO
         r.events_other,
         r.recon_held,
         f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15], f[16], f[17], f[18], f[19],
-        f[20],
+        f[20], f[21],
     ]
 }
 
@@ -10077,6 +10078,17 @@ where
                     utc_ms,
                     &clob_dispatcher::OrderDispatch::matcher_counters(eng.dispatcher()),
                 );
+                // PB13 (Binance plan §2.2 G8): Σ the scripts' broker positions vs the router
+                // ledger's slot-8 rows — an ERROR tell on two consecutive differing passes (alarm
+                // only; a dispatcher with no ledger answers `None`: never compared).
+                let disp = eng.dispatcher();
+                d.ledger_pass(eng.strategy(), |sym| {
+                    clob_dispatcher::OrderDispatch::slot_instrument_position_1e6(
+                        disp,
+                        strategy_pine::SLOT_PINE,
+                        sym,
+                    )
+                });
             }
             // HYPARB H8: hand the period's AMM decisions to the testnet
             // shadow (a ring push each; nothing blocks, nothing is sent

@@ -118,6 +118,11 @@ exec-hyperevm        = { workspace = true, features = ["testnode"] }
 # scripted rustls Hyperliquid the battery's loopback test runs against
 # (tests/xmm_battery_loopback.rs) — test-only the same way.
 exec-hyperliquid     = { workspace = true, features = ["loopback", "testvenue"] }
+# PVM PB10 (Binance plan §2.2): the real Binance gateway in front of its
+# scripted rustls venue (`testvenue`, `BnConfig::loopback`) for
+# tests/pine_bn_loopback.rs. Test-only the same way as the line above:
+# `cargo build -p cli` never has it.
+exec-binance         = { workspace = true, features = ["loopback", "testvenue"] }
 # BX3: the scripted venue's self-signed certificate.
 rcgen                = { workspace = true }
 # PVM B'3 T16 (impl-Bp §4.8): `null_gates_agree_with_the_native_broker_on_a_gate_table`

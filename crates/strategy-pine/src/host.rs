@@ -6,9 +6,11 @@
 //! owns orders and the position; this module translates `EngineIntent`s into the engine's verbs
 //! (`Ctx::submit` / `modify` / `cancel`), reports dispositions, and nothing else.
 //!
-//! **PAPER ONLY.** Slot 8 resolves `Paper` or `Off`. `Off` dispatches nothing and commits nothing
-//! (§4.4.5). A `Live` route never reaches here: `on_start` refuses it
-//! (pin:08-live-refused-at-start), and `flush` asserts it (fail fast, a defect).
+//! **PAPER ONLY on every host the cli builds.** Slot 8 resolves `Paper` or `Off`. `Off`
+//! dispatches nothing and commits nothing (§4.4.5). A `Live` route reaches here only with the
+//! host's live permit (PL2, pin:pl2-live-permit: `on_start` refuses it otherwise, and `flush`
+//! asserts it — fail fast, a defect); its dispositions wait the live settle window (PL1,
+//! `settle`).
 //!
 //! **The risk gate.** Every Submit and Modify goes out through `ctx` — on the engine host the
 //! set's `StampCtx` (strategy_id 8) over the `RoutedDispatcher`, whose E6 gate judges it; a cancel
@@ -25,8 +27,11 @@
 //!   POST_ONLY half RETIRED by the 8d–8f risk review): every Submit or Modify whose
 //!   `EngineIntent::flags` bit 0 is set (the broker's reduce-only sizing: exits, closes, the D13
 //!   flatten, the guards' `CloseAll`) carries `ORDER_FLAG_REDUCE_ONLY`; nothing else sets a flag.
-//!   The paper matcher and the exec router IGNORE the bit, so it is a second guard against a flip
-//!   at a LIVE venue only (slot 8 is paper only today); on paper the broker's sizing is the guard.
+//!   The paper matcher ignores the bit (on paper the broker's sizing is the guard). Live, it is a
+//!   second guard against a flip: the exec router reads it on a Hyperliquid perp row (only a
+//!   flagged reduction is an exit there, r28 risk review B2), and both arms send it to the venue —
+//!   exec-hyperliquid on a perp row, exec-binance on USDⓈ-M (where it is also PB3's minimum
+//!   exemption once PB0.2 is recorded, B1). Slot 8 is paper only today.
 //! - pin:08-no-post-only-paper (risk review BLOCK): no slot-8 order carries
 //!   `ORDER_FLAG_POST_ONLY`. The bit selects the paper QUEUE law, under which a cancel / modify
 //!   `Ok` means only "sent" (the disposition arrives as an order event); slot 8 settles on `Ok`
@@ -115,14 +120,14 @@ pub(crate) fn commit(core: &mut Core, c: &mut PineCounters, i: usize) {
 /// End of a callback: `reconcile` + dispatch every marked script, manifest order (§4.5.1); a
 /// disabled script's mark is dropped. Then D13's owed `flatten` calls (`fault::run_due`).
 pub(crate) fn flush<C: Ctx>(core: &mut Core, c: &mut PineCounters, ctx: &mut C) {
-    // Fail closed: slot 8 has no live path (pin:08-live-refused-at-start); `Off` dispatches
-    // nothing.
+    // Fail closed (PL2, pin:pl2-live-permit): a Live route dispatches only under the host's
+    // permit (`on_start` refused it otherwise); `Off` dispatches nothing.
     assert!(
-        core.route != SlotRoute::Live,
-        "pine: slot 8 is paper only — no live dispatch path"
+        core.route != SlotRoute::Live || core.live,
+        "pine: a Live route without the host's live permit"
     );
     if core.route == SlotRoute::Off {
-        // I36: `Off` never calls the ctx — no reconcile, no flatten.
+        // I36: `Off` never calls the ctx — no reconcile, no flatten, no PB6 cancel.
         core.dirty = 0;
         core.flat_due = 0;
         return;
@@ -255,10 +260,16 @@ pub(crate) fn dispatch_one<C: Ctx>(
                     c.submit_errors = c.submit_errors.wrapping_add(1);
                     settle::report_cancelled(core, c, i, e.client_oid);
                 }
-                Err(_) => {
+                Err(err) => {
                     // Refused / Unsupported (NoSuchOrder: pin:08-submit-nosuch-is-refusal).
                     c.submit_errors = c.submit_errors.wrapping_add(1);
-                    settle::report_cancelled(core, c, i, e.client_oid);
+                    if core.live && err != SubmitErr::Unsupported {
+                        // PL1 (§4.5.4 live): the request may have reached the venue — no ack,
+                        // `on_cancelled` after the window unless its fills total its size.
+                        settle::wait_window(core, i, e.client_oid, err_rec(e, maker));
+                    } else {
+                        settle::report_cancelled(core, c, i, e.client_oid);
+                    }
                     settle::streak_err(core, c, i);
                 }
             }
@@ -296,38 +307,68 @@ pub(crate) fn dispatch_one<C: Ctx>(
                     c.submit_errors = c.submit_errors.wrapping_add(1);
                     settle::report_cancelled(core, c, i, e.client_oid);
                 }
-                Err(_) => {
+                Err(err) => {
                     c.submit_errors = c.submit_errors.wrapping_add(1);
-                    settle::report_cancelled(core, c, i, e.client_oid);
+                    if core.live && err != SubmitErr::Unsupported {
+                        // PL1 (§4.5.4 live): `Refused` / `NoSuchOrder` report `new` after the
+                        // window; nothing about `prev` (pin:08-modify-nosuch-literal).
+                        settle::wait_window(core, i, e.client_oid, err_rec(e, true));
+                    } else {
+                        settle::report_cancelled(core, c, i, e.client_oid);
+                    }
                     settle::streak_err(core, c, i);
                 }
             }
         }
         EngineVerb::Cancel => {
-            // COPY: one `CancelReq` (24 B) per cancel (§4.12 #5) — `Ctx::cancel` takes it by value.
-            let req = CancelReq::new(
-                e_ns,
-                venue,
-                sym,
-                encode_client_oid(epoch, script, e.client_oid),
-            );
-            let res = ctx.cancel(req);
-            crate::tape::dispatch(core, c, i, e, 0, crate::tape::result_code(res));
-            match res {
-                Ok(()) | Err(SubmitErr::NoSuchOrder) => {
-                    c.cancels = c.cancels.wrapping_add(1);
-                    settle::gone(core, c, i, e.client_oid);
-                }
-                Err(SubmitErr::Unsupported) => {
-                    c.cancel_errors = c.cancel_errors.wrapping_add(1);
-                }
-                // RingFull / Refused: nothing — the broker re-emits after `quote_stale_ns`.
-                Err(_) => {
-                    c.cancel_errors = c.cancel_errors.wrapping_add(1);
-                }
-            }
+            let _ = cancel_one(core, c, i, e, ctx);
         }
     }
+}
+
+/// The Cancel arm of [`dispatch_one`], shared with PB6 (`fault::run_due`'s venue-fill cancels,
+/// which have no broker intent and so skip `dispatch_one`'s px/qty/side asserts): the
+/// `CancelReq` for broker oid `e.client_oid`, its §4.9.2 `DISPATCH` row (`e` as given), its
+/// disposition. Never gated (I26/I27). Returns the ctx's answer.
+pub(crate) fn cancel_one<C: Ctx>(
+    core: &mut Core,
+    c: &mut PineCounters,
+    i: usize,
+    e: &EngineIntent,
+    ctx: &mut C,
+) -> Result<(), SubmitErr> {
+    debug_assert!(e.verb == EngineVerb::Cancel);
+    // §4.6: fail fast in every build (the oid would alias another script's bits).
+    assert!(
+        broker_oid_ok(e.client_oid),
+        "pine: broker oid outside 1..2^29"
+    );
+    let script = u8::try_from(i).unwrap_or(u8::MAX);
+    let (venue, sym) = (core.scripts[i].venue, core.scripts[i].sym);
+    // COPY: one `CancelReq` (24 B) per cancel (§4.12 #5) — `Ctx::cancel` takes it by value.
+    let req = CancelReq::new(
+        core.e_ns,
+        venue,
+        sym,
+        encode_client_oid(core.epoch, script, e.client_oid),
+    );
+    let res = ctx.cancel(req);
+    crate::tape::dispatch(core, c, i, e, 0, crate::tape::result_code(res));
+    match res {
+        Ok(()) | Err(SubmitErr::NoSuchOrder) => {
+            c.cancels = c.cancels.wrapping_add(1);
+            settle::gone(core, c, i, e.client_oid);
+        }
+        Err(SubmitErr::Unsupported) => {
+            c.cancel_errors = c.cancel_errors.wrapping_add(1);
+        }
+        // RingFull / Refused: nothing — the broker re-emits after `quote_stale_ns` (PB6: the
+        // next confirmed chart bar re-sends, pin:pb6-cancel-retry-per-bar).
+        Err(_) => {
+            c.cancel_errors = c.cancel_errors.wrapping_add(1);
+        }
+    }
+    res
 }
 
 /// §4.6: a broker oid the engine client oid can carry: `1 ≤ oid < 2^29`.
@@ -349,11 +390,30 @@ fn with_flags(order: Order, e: &EngineIntent) -> Order {
     }
 }
 
+/// PL1: the record a live `Refused` / `NoSuchOrder` waits the window under — its kind by
+/// primitive (the fee rate of a fill that still comes), its size and reduce bit.
+#[inline]
+fn err_rec(e: &EngineIntent, maker: bool) -> Settle {
+    Settle {
+        oid: e.client_oid,
+        kind: if maker { kind::MAKER } else { kind::JUDGE },
+        qty: e.qty_1e6,
+        reduce: e.flags & 1,
+        ..Settle::FREE
+    }
+}
+
 /// `Ok` for a Submit or Modify: `on_ack`, reset the streak, track the disposition.
 fn acked(core: &mut Core, c: &mut PineCounters, i: usize, e: &EngineIntent, maker: bool, ts: u64) {
     core.scripts[i].broker.on_ack(e.client_oid);
     c.acks = c.acks.wrapping_add(1);
     settle::streak_ok(core, i);
+    if core.live && !maker {
+        // PL1 (§4.5.5 live step 2): the IoC is reported after the window unless its fills total
+        // its size first; no gone-evidence judges it (only the venue does).
+        settle::wait_window(core, i, e.client_oid, err_rec(e, false));
+        return;
+    }
     let rec = if maker {
         Settle {
             oid: e.client_oid,

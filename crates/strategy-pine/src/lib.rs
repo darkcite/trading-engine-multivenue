@@ -28,8 +28,9 @@
 //! the slow phase). 8f (T16, `arm`): `reconcile_boot` once per committing script, the four
 //! boot-exit policies and the host `CloseAll` (boot guard, late-flip guard). Orders carry
 //! `ORDER_FLAG_REDUCE_ONLY` from the broker's sizing and never `ORDER_FLAG_POST_ONLY`
-//! (pin:08-order-flags-set, its POST_ONLY half retired; pin:08-no-post-only-paper). PAPER ONLY:
-//! a `Live` route refuses `on_start` (pin:08-live-refused-at-start). Signals, AI, timers and
+//! (pin:08-order-flags-set, its POST_ONLY half retired; pin:08-no-post-only-paper). A `Live`
+//! route starts only under the host's live permit (pin:pl2-live-permit, which replaced
+//! pin:08-live-refused-at-start); the cli never sets it, so slot 8 is paper. Signals, AI, timers and
 //! depth are counted and dropped. The cli boots the member from `run --pine <manifest>` (T19,
 //! paper half): a `--strategy` naming `pine` without `--pine`, or `--pine` without `pine` in the
 //! mask, refuses the boot (F19 both ways). impl-Bp §3.9's read-backs for the replay host (R2, R4,
@@ -259,6 +260,8 @@ impl PineStrategy {
                 fills: 0,
                 fills_prior_boot: 0,
                 fills_foreign: 0,
+                fills_adopted: 0,
+                fills_venue_originated: 0,
                 late_fills_after_cancel: 0,
                 late_reducer_flips: 0,
                 fee_modelled_live: 0,
@@ -944,7 +947,8 @@ impl Strategy for PineStrategy {
         if took {
             coalesce::run_all_cof(core, &mut self.counters);
         }
-        // A broker refusal on the fill disables the script (D13): its flatten is owed now.
+        // A broker refusal on the fill disables the script (D13): its flatten is owed now; a
+        // venue-originated fill (PB6) owes the cancels of its resting makers.
         if took || core.flat_due != 0 {
             host::flush(core, &mut self.counters, ctx);
         }

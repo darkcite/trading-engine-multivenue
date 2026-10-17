@@ -17,7 +17,8 @@ fn pine_pods_sizes_and_alignment() {
     assert_eq!(core::mem::align_of::<PineSeqRec>(), 64);
     assert_eq!(core::mem::size_of::<PineTapeRec>(), 64);
     assert_eq!(core::mem::align_of::<PineTapeRec>(), 64);
-    assert_eq!(core::mem::size_of::<PineCounters>(), 42 * 8);
+    // 44 words since r28 (PB6: `fills_adopted`, `fills_venue_originated`).
+    assert_eq!(core::mem::size_of::<PineCounters>(), 44 * 8);
     assert_eq!(PINE_VIEW_SCRIPTS, 8);
 }
 
