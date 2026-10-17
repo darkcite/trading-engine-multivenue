@@ -2979,15 +2979,15 @@ impl Lower<'_> {
                 )))
             }
             DefaultSrc::TimeframeChange => {
-                // CI-012 / CI-041 (B120 D059, `ta.vwap(src)`): "as if `timeframe.change()` were
-                // passed" — the call itself, at this call site, with its own `timeframe` default.
+                // CI-012 / CI-041 (B120 D059, `ta.vwap(src)`): the reference's default anchor is
+                // "equivalent to passing `timeframe.change()` with \"1D\"" — the call at this
+                // site with the literal "1D", not timeframe.change's own default (the chart's
+                // timeframe). `pin:02-vwap-anchor-1d`, r33c: D059 B120 fit 256/256 only so.
                 let ov = pine_spec::ov::TIMEFRAME_CHANGE;
-                let dv = pine_spec::params(pine_spec::overload(ov))[0].default;
-                let tf = self.literal_arg(dv, scalar(Ty::String, Qual::Series), at)?;
                 let dst = self.temp(t, at);
                 self.op(Op::Call {
                     ov,
-                    args: vec![tf],
+                    args: vec![Arg::Str("1D")],
                     outs: vec![dst],
                     span: at,
                 });

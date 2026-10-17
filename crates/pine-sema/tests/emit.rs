@@ -1382,12 +1382,16 @@ fn emit_function_reads_globals() {
 /// `timeframe.change()` were passed (it used to be 3255 "the derived default TimeframeChange").
 #[test]
 fn emit_vwap_anchor_default_is_timeframe_change() {
+    // `pin:02-vwap-anchor-1d` (r33, D059 B120): the derived anchor is `timeframe.change("1D")`,
+    // and its first execution is false (`pin:04-tf-change-first-false`) — so on minute bars
+    // inside one day the session never anchors and `ta.vwap(close)` stays na, as TradingView
+    // prints before the chart's first day boundary.
     for d in [Dialect::V5, Dialect::V6] {
         let s = format!(
             "//@version={}\nindicator(\"t\")\nv = ta.vwap(close)\nplot(v)\n",
             d as u8
         );
         let got = plots_of(&s, d, ExecMode::BarClose, &[10.0, 11.0, 12.0], 0);
-        assert!(got.iter().all(|v| v.is_finite()), "{d:?} {got:?}");
+        assert!(got.iter().all(|v| v.is_nan()), "{d:?} {got:?}");
     }
 }

@@ -22,6 +22,7 @@
 //! `defval`; no `v := input(…)` (a reassigned whole value names a second input `v`, `3050`).
 //! Grammar 3 = grammar 2 + the rows pine-std began serving in r27b ([`FUZZ_SERVED_V3`]): a row
 //! `pine_std::served` newly calls served grows the alphabet too, so it lands under a version.
+//! Grammar 4 = grammar 3 + the rows pine-std began serving in r33c ([`FUZZ_SERVED_V4`]).
 //! Tier-3 rows (array / map / UDT methods, served since r27–r29) stay outside every alphabet while
 //! the fuzz configs read `DEFAULT_LIMITS.active_tiers = 0b0011`; raising that mask is a version.
 
@@ -149,9 +150,17 @@ pub const FUZZ_SERVED_V3: [pine_ir::OverloadId; 5] = [
     pine_spec::ov::TA_RANGE_I,
 ];
 
+/// Overloads pine-std began serving after grammar 3 was cut (r33c, 2026-10-18: `ta.rci` B099,
+/// `ta.pivot_point_levels` B112). Grammar ≥ 4 admits them; grammars 1–3 never draw them, so their
+/// seeds replay byte-identically (`pin:06-fuzz-grammar-version-gate`). The next row pine-std serves
+/// joins a grammar 5 list.
+pub const FUZZ_SERVED_V4: [pine_ir::OverloadId; 2] =
+    [pine_spec::ov::TA_RCI, pine_spec::ov::TA_PIVOT_POINT_LEVELS];
+
 /// Whether overload `i` is outside grammar `version` because pine-std served it later.
 fn served_later(version: u16, i: u16) -> bool {
-    version < 3 && FUZZ_SERVED_V3.contains(&pine_ir::OverloadId(i))
+    let id = pine_ir::OverloadId(i);
+    (version < 3 && FUZZ_SERVED_V3.contains(&id)) || (version < 4 && FUZZ_SERVED_V4.contains(&id))
 }
 
 /// [`denied`] under grammar `version`: grammar ≥ 2 admits [`FUZZ_ADMIT_V2`].
@@ -210,8 +219,8 @@ pub fn alphabet(d: Dialect, active_tiers: u8) -> Vec<Builtin> {
 }
 
 /// The derived alphabet (§4.8.3) of grammar `version`: `pine_spec::OVERLOADS ∩ active_tiers ∩
-/// dialect − FUZZ_DENY (+ FUZZ_ADMIT_V2 from grammar 2, + FUZZ_SERVED_V3 from grammar 3)`, in
-/// overload order. Load-time; allocates.
+/// dialect − FUZZ_DENY`, plus FUZZ_ADMIT_V2 from grammar 2, FUZZ_SERVED_V3 from grammar 3 and
+/// FUZZ_SERVED_V4 from grammar 4, in overload order. Load-time; allocates.
 pub fn alphabet_for(version: u16, d: Dialect, active_tiers: u8) -> Vec<Builtin> {
     let mut out = Vec::new();
     for (i, ov) in pine_spec::OVERLOADS.iter().enumerate() {

@@ -509,3 +509,84 @@ plot(s, \"p\")
     };
     assert!(matches!(r.check(&f), Verdict::Fail(_)));
 }
+
+/// `pin:06-fault-bars-pending`, `pin:06-broker-fault-row`, `pin:06-broker-script-fault` (r33g,
+/// E110): a v5 strategy creating one order per step, `bars` pending, steps to its fault row; the TV
+/// broker's v5 limit (`Script(OrderTableFull)` on the 9001st order) is `ScriptRefused` on step 9000.
+#[test]
+fn run_maps_a_broker_script_refusal_to_script_refused_on_its_row() {
+    use pine_conformance::fixture::{Dialects, Expect};
+    use pine_conformance::report::Verdict;
+    use pine_conformance::run::RunError;
+    let mut f = temp_fixture(
+        "v5-orders",
+        "//@version=5
+strategy(\"t\", initial_capital = 1000000, default_qty_type = strategy.fixed, default_qty_value = 1)
+var bool t = false
+t := not t
+if t
+    strategy.entry(\"L\", strategy.long)
+else
+    strategy.close(\"L\")
+plot(strategy.closedtrades, \"p\")
+",
+        Dialects::V5,
+    );
+    f.bars = None;
+    f.expect = Expect::Fault {
+        kind: pine_ir::FaultKind::ScriptRefused,
+        row: 9000,
+    };
+    let mut r = runner(pine_conformance::run::DEFAULT_LIMITS);
+    match r.run(&f, Dialect::V5) {
+        Err(RunError::Broker(pine_broker::BrokerFault::Script(_))) => {}
+        other => panic!("expected the broker's v5 order limit, got {other:?}"),
+    }
+    assert_eq!(r.fault_row(), Some(9000));
+    assert!(matches!(r.check(&f), Verdict::Pass));
+    f.expect = Expect::Fault {
+        kind: pine_ir::FaultKind::ScriptRefused,
+        row: 8999,
+    };
+    assert!(matches!(r.check(&f), Verdict::Fail(_)));
+}
+
+/// `pin:06-replay-from-file-start` (r33g, `pin:00-dataset-start`): a chart run replays from the bar
+/// file's first row — here 24 bars before `REPLAY_FROM_MS` — so `var int t0 = time` is that row's
+/// open and every row of `[first row, TO_MS)` is stepped.
+#[test]
+fn chart_replay_starts_at_the_bar_files_first_row() {
+    use pine_conformance::fixture::{Align, Dialects, Driver, Window};
+    let first = spec::REPLAY_FROM_MS - 24 * 3_600_000;
+    let n = ((spec::TO_MS - first) / 3_600_000) as u32;
+    let rows = rows_on(first, 3_600_000, n);
+    let bars = std::env::temp_dir().join(format!("pine-conf-{}-replay-root", std::process::id()));
+    let path = pine_screen::bar_path(&bars, spec::SYMBOL_KEY, spec::TIMEFRAME_S).unwrap();
+    pine_screen::bars::write_bar_file(
+        &path,
+        &rows,
+        spec::TIMEFRAME_S,
+        spec::SYMBOL_HASH,
+        1,
+        pine_screen::bar_source::CANDLES,
+        true,
+    )
+    .expect("bar file");
+    let mut f = temp_fixture(
+        "replay",
+        "//@version=6\nindicator(\"t\")\nvar int t0 = time\nplot(t0, \"p\")\n",
+        Dialects::V6,
+    );
+    f.driver = Driver::Chart;
+    f.align = Align::Time;
+    f.bars = None;
+    f.window = Window::Tail(4);
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut o = pine_conformance::run::RunnerOptions::new(root);
+    o.bars_root = Some(bars);
+    let mut r = pine_conformance::run::Runner::new(o).expect("runner");
+    let out = r.run(&f, Dialect::V6).expect("chart run");
+    assert_eq!(out.bars, n);
+    assert_eq!(out.keys.len(), 4);
+    assert!(out.plots.iter().all(|&v| v == first as f64));
+}

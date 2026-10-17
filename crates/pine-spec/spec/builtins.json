@@ -337,12 +337,12 @@
         "empty",
         "na"
       ],
-      "v5": "empty",
-      "v6": "empty",
+      "v5": "na",
+      "v6": "na",
       "normative": false,
       "source": "",
       "pin": "pin:U07-str-match-none",
-      "doc": "str.match with no match: empty returns \"\"; na. Default: REVIEW 4.2"
+      "doc": "str.match with no match: empty returns \"\"; na. r33c verdict (fixture F063, dialects 56): na in both dialects"
     },
     {
       "id": "tostring_default",
@@ -353,12 +353,12 @@
         "frac_upto_8",
         "frac_upto_10"
       ],
-      "v5": "frac_upto_8",
-      "v6": "frac_upto_8",
+      "v5": "frac_upto_10",
+      "v6": "frac_upto_10",
       "normative": false,
       "source": "",
       "pin": "pin:U08-tostring-precision",
-      "doc": "str.tostring default format: frac_upto_8 is \"#.########\"; frac_upto_10 is REVIEW 4.2's reading. Default from the Strings docs page (read 2026-09-23)"
+      "doc": "str.tostring default format: frac_upto_8 is \"#.########\"; frac_upto_10 is REVIEW 4.2's reading. r33c verdict (fixture F064, dialects 56, 64 rows x 2 columns): frac_upto_10 in both dialects"
     },
     {
       "id": "margin_call_size",
@@ -775,7 +775,7 @@
           "warmup": {
             "k": "none"
           },
-          "na": "propagate",
+          "na": "custom",
           "sx": [],
           "plot": null,
           "input": null
@@ -8432,7 +8432,7 @@
           "warmup": {
             "k": "none"
           },
-          "na": "propagate",
+          "na": "custom",
           "sx": [],
           "plot": null,
           "input": null
@@ -36594,7 +36594,7 @@
             "k": "recursive",
             "param": "length"
           },
-          "na": "skip",
+          "na": "custom",
           "sx": [],
           "plot": null,
           "input": null
@@ -36907,7 +36907,7 @@
             "k": "recursive",
             "param": "length"
           },
-          "na": "skip",
+          "na": "custom",
           "sx": [
             "work_linear"
           ],
@@ -38181,7 +38181,7 @@
             "param": "length",
             "bars": 1
           },
-          "na": "propagate",
+          "na": "custom",
           "sx": [
             "work_linear"
           ],
@@ -38207,6 +38207,33 @@
             6
           ],
           "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
             {
               "name": "type",
               "ty": "string",
@@ -38240,18 +38267,19 @@
           "ret_qual": "series",
           "abi": "call",
           "bf": [
-            "stateful"
+            "collection",
+            "pool"
           ],
           "state": {
-            "k": "fixed",
-            "bytes": 64
+            "k": "array"
           },
           "warmup": {
-            "k": "fixed",
-            "bars": 1
+            "k": "none"
           },
-          "na": "propagate",
-          "sx": [],
+          "na": "custom",
+          "sx": [
+            "implicit_bar"
+          ],
           "plot": null,
           "input": null
         }
@@ -38751,15 +38779,21 @@
             "stateful"
           ],
           "state": {
-            "k": "fixed",
-            "bytes": 64
+            "k": "param",
+            "param": "length",
+            "elem": 8,
+            "hdr": 40,
+            "plus": 0
           },
           "warmup": {
-            "k": "fixed",
+            "k": "param_plus",
+            "param": "length",
             "bars": 1
           },
           "na": "skip",
-          "sx": [],
+          "sx": [
+            "work_linear"
+          ],
           "plot": null,
           "input": null
         }
@@ -38872,7 +38906,7 @@
             "k": "recursive",
             "param": "length"
           },
-          "na": "skip",
+          "na": "custom",
           "sx": [],
           "plot": null,
           "input": null
@@ -40144,7 +40178,7 @@
             "k": "param",
             "param": "length"
           },
-          "na": "skip",
+          "na": "custom",
           "sx": [
             "work_linear"
           ],

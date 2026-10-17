@@ -200,7 +200,15 @@ pub enum HostFault {
         sub: bool,
     },
     /// The broker refused a commit.
-    Broker(BrokerFault),
+    ///
+    /// `pin:06-broker-fault-row` (r33g, E110) — §4.5.2 prints a `BrokerFault` with `bar.index`
+    /// like a script fault: `bar_index` is the chart bar being stepped (the run's step).
+    Broker {
+        /// The refusal.
+        fault: BrokerFault,
+        /// The chart bar's index.
+        bar_index: u32,
+    },
 }
 
 #[cold]
@@ -315,7 +323,12 @@ pub fn step_chart_bar(
                 debug_assert!(intrabar || vm.bars_seen() == u64::from(bar.index) + 1);
                 step = match b.submit(vm.intents()) {
                     Ok(s) => s,
-                    Err(f) => return Err(HostFault::Broker(f)),
+                    Err(fault) => {
+                        return Err(HostFault::Broker {
+                            fault,
+                            bar_index: bar.index,
+                        })
+                    }
                 };
             }
             TvStep::Done => return Ok(()),

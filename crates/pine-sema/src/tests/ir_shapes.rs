@@ -10,7 +10,9 @@
 use pine_ir::{Diag, Dialect, FileId, Lane, OverloadId, SymTable};
 use pine_lang::Ast;
 
-use crate::ir::{BinOpK, Block, CmpK, CondKind, Ir, LoopKind, Op, SlotKind, Stmt, UnOpK, VSlot};
+use crate::ir::{
+    Arg, BinOpK, Block, CmpK, CondKind, Ir, LoopKind, Op, SlotKind, Stmt, UnOpK, VSlot,
+};
 use crate::pins::{ForStep, IntCast, NaCompare, NaCondition, OnceFlag, V5NumToBool};
 use crate::sw::Readings;
 use crate::{imports, infer, lower, mono, resolve, LibCache};
@@ -1200,4 +1202,17 @@ fn sites_window_lengths_and_loops() {
     // A non-positive constant length is `3007`.
     let e = sites_of("plot(ta.sma(close, 0))\n", &rd).expect_err("zero");
     assert_eq!(e.code.0, 3007);
+}
+
+/// `pin:02-vwap-anchor-1d` (r33, D059 B120): `ta.vwap(src)`'s derived `anchor` default is
+/// `timeframe.change("1D")` at the call site, per the reference's "equivalent to passing
+/// timeframe.change() with \"1D\"".
+#[test]
+fn ir_shapes_vwap_anchor_defaults_to_timeframe_change_1d() {
+    let r = ir("v = ta.vwap(close)\nplot(v)\n", Dialect::V6);
+    let tf = pine_spec::ov::TIMEFRAME_CHANGE;
+    let anchored = ops(&r).into_iter().any(|o| {
+        matches!(o, Op::Call { ov, args, .. } if *ov == tf && matches!(args.as_slice(), [Arg::Str("1D")]))
+    });
+    assert!(anchored, "timeframe.change(\"1D\") call for the anchor");
 }

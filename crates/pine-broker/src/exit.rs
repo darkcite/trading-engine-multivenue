@@ -442,6 +442,8 @@ pub(crate) struct ExitTable {
     sets: [[LegSet; cap::LEG_SETS]; 2],
     cur: usize,
     ns: usize,
+    /// The previous build's set count (the inactive buffer after a `sync`), for [`Self::carried`].
+    prev_ns: usize,
     reservation: ExitReservation,
     /// `exit_qty` (§4.2, §4.5.3).
     exit_qty: ExitQty,
@@ -462,6 +464,7 @@ impl ExitTable {
             sets: [[LegSet::default(); cap::LEG_SETS]; 2],
             cur: 0,
             ns: 0,
+            prev_ns: 0,
             reservation,
             exit_qty: SWITCHES.exit_qty,
             boot: BootDirs::empty(),
@@ -636,6 +639,56 @@ impl ExitTable {
         n
     }
 
+    /// Lapse: a `from_entry = NONE` rule lapses when the position it saw next becomes flat
+    /// (`position_1e6` the position now). Run by every `sync`, and by the TV walk right after a
+    /// fill that leaves the position flat (`pin:05-exit-lapse-at-fill`).
+    pub(crate) fn lapse(&mut self, position_1e6: i64) {
+        let mut i = 0;
+        while i < self.nr {
+            if self.rules[i].state == rule_state::LIVE
+                && self.rules[i].intent.from_entry == StrKey::NONE
+            {
+                if position_1e6 != 0 {
+                    self.armed[i] = true;
+                } else if self.armed[i] {
+                    self.rules[i].state = rule_state::LAPSED;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// Whether a live rule was (re)committed at evaluation `eval`.
+    pub(crate) fn born_at(&self, eval: u32) -> bool {
+        let mut i = 0;
+        while i < self.nr {
+            if self.rules[i].state == rule_state::LIVE && self.rules[i].born_eval == eval {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// After a `sync`: the active-buffer index of the set carried from the previous build's set
+    /// `old_k` (same rule slot, same trade), `None` when that set was not rebuilt. Lets the TV walk
+    /// keep its candidates (which name sets by index) across a mid-segment `sync`.
+    pub(crate) fn carried(&self, old_k: usize) -> Option<usize> {
+        if old_k >= self.prev_ns {
+            return None;
+        }
+        let o = &self.sets[1 - self.cur][old_k];
+        let mut k = 0;
+        while k < self.ns {
+            let s = &self.sets[self.cur][k];
+            if s.rule == o.rule && s.seq == o.seq {
+                return Some(k);
+            }
+            k += 1;
+        }
+        None
+    }
+
     /// Re-derive reservations against `position_1e6` without rebuilding (indices stay stable inside
     /// a TV segment, §4.5.4).
     pub(crate) fn rederive_now(&mut self, position_1e6: i64) {
@@ -674,6 +727,45 @@ impl ExitTable {
         armed
     }
 
+    /// Every live trail at a segment's start point `a` (TV walk, before its candidates are
+    /// collected; `pin:05-trail-arm-at-point`, r33d): an unarmed one whose activation `a` already
+    /// reaches arms there, anchor `a` — the gap case `after_segment` never sees (no segment moves
+    /// through the activation); an armed one's anchor moves to `a` when better — the open is a
+    /// tick the previous bar's segments never saw. TV E012 trade 15: activation 80873.4, the next
+    /// bar opens 80960.1 and falls to 80882.7 — armed at the open, the stop 80910.1 (offset 50)
+    /// fills on that segment; trade 6: armed at the entry bar's close 78613.5 ([`Self::arm_born`]),
+    /// the next bar opens 78614.4 — the stop is 78564.4.
+    pub(crate) fn step_at(&mut self, a: i64) {
+        self.trail_where(None, a);
+    }
+
+    /// The sets of rules (re)committed at evaluation `eval`, whose evaluation saw price `px`: an
+    /// unarmed trail `px` already reaches arms there, anchor `px` — a trail is first tried at the
+    /// tick that placed it (`pin:05-trail-arm-at-point`, r33d). TV E012 trade 13: activation
+    /// 79835.0, the exit placed at the entry bar's close 79849.3, the next bar opens 79849.2 —
+    /// the stop is 79799.3 (anchor the close), not 79799.2 (anchor the open).
+    pub(crate) fn arm_born(&mut self, eval: u32, px: i64) {
+        self.trail_where(Some(eval), px);
+    }
+
+    /// `trail_step` at `px` for every live trail set — `born = Some(e)`: only the unarmed sets
+    /// born at evaluation `e` ([`Self::arm_born`]); `None`: all ([`Self::step_at`]).
+    fn trail_where(&mut self, born: Option<u32>, px: i64) {
+        let cur = self.cur;
+        let mut k = 0;
+        while k < self.ns {
+            let s = &mut self.sets[cur][k];
+            let pick = match born {
+                Some(e) => s.legs & LEG_ARMED == 0 && s.born_eval == e,
+                None => true,
+            };
+            if s.state == set_state::LIVE && s.trail_act_1e6 != 0 && pick {
+                trail_step(s, px);
+            }
+            k += 1;
+        }
+    }
+
     /// The next live rule in seq order after `after` (`None` = from the start).
     fn next_rule(&self, after: Option<u32>) -> Option<usize> {
         let mut best: Option<usize> = None;
@@ -701,20 +793,7 @@ impl ExitTable {
     /// and every fill. A full set table refuses with the old sets untouched.
     pub(crate) fn sync(&mut self, book: &Book, ctx: &SyncCtx) -> Result<(), BrokerFault> {
         let pos = book.view().position_size_1e6;
-        // Lapse: a `from_entry = NONE` rule lapses when the position it saw next becomes flat.
-        let mut i = 0;
-        while i < self.nr {
-            if self.rules[i].state == rule_state::LIVE
-                && self.rules[i].intent.from_entry == StrKey::NONE
-            {
-                if pos != 0 {
-                    self.armed[i] = true;
-                } else if self.armed[i] {
-                    self.rules[i].state = rule_state::LAPSED;
-                }
-            }
-            i += 1;
-        }
+        self.lapse(pos);
         // The active buffer is `self.cur`; the build writes the other one.
         let new = 1 - self.cur;
         let mut n = 0;
@@ -823,6 +902,7 @@ impl ExitTable {
             ri = self.next_rule(Some(rule.seq));
         }
         self.legs_created = self.legs_created.saturating_add(fresh);
+        self.prev_ns = self.ns;
         self.cur = new;
         self.ns = n;
         rederive(&mut self.sets[new][..n], pos);

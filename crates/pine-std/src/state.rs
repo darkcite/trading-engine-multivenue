@@ -715,6 +715,37 @@ pub fn winp_fresh_sums(h: &WinHdr, ring: &[[f64; 2]], len: u32) -> (f64, f64) {
     (a.0 + a.1, b.0 + b.1)
 }
 
+/// `Σx` over the newest `len` values (`h.n >= len`, none na), TradingView's `ta.sma` numerator: a
+/// fresh pass each bar, oldest first, Neumaier-compensated (`pin:04-sma-fresh-sum`).
+pub fn win_fresh_sum(h: &WinHdr, ring: &[f64], len: u32) -> f64 {
+    let cap = ring.len() as u32;
+    debug_assert!(len >= 1 && len <= cap && h.n >= len);
+    let mut s = (0.0f64, 0.0f64);
+    let mut k = len;
+    while k > 0 {
+        k -= 1;
+        s = neumaier(s, at(ring, back(h, cap, k)));
+    }
+    s.0 + s.1
+}
+
+/// `(Σ src·vol, Σ vol)` over the newest `len` pairs of a [`Win2Hdr`] ring (`h.win.n >= len`):
+/// each product unfused, both sums a fresh pass oldest first, Neumaier-compensated —
+/// `ta.vwma`'s `ta.sma(src·volume)` and `ta.sma(volume)` numerators (`pin:04-sma-fresh-sum`).
+pub fn win2_fresh_sums(h: &Win2Hdr, ring: &[[f64; 2]], len: u32) -> (f64, f64) {
+    let cap = ring.len() as u32;
+    debug_assert!(len >= 1 && len <= cap && h.win.n >= len);
+    let (mut a, mut b) = ((0.0f64, 0.0f64), (0.0f64, 0.0f64));
+    let mut k = len;
+    while k > 0 {
+        k -= 1;
+        let p = at2(ring, back(&h.win, cap, k));
+        a = neumaier(a, p[0] * p[1]);
+        b = neumaier(b, p[1]);
+    }
+    (a.0 + a.1, b.0 + b.1)
+}
+
 /// `win_push` over `(a, b)` pairs into `sum = Σa`, `sum2 = Σb`; accept the non-na pair.
 pub fn winp_push(h: &mut WinHdr, ring: &mut [[f64; 2]], a: f64, b: f64) {
     let cap = ring.len() as u32;

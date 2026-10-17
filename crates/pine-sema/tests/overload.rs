@@ -320,6 +320,8 @@ fn synthetic_family(full: &str) -> Option<&'static [&'static str]> {
         "request.security" => Some(&["__key", "__out", "__ty"]),
         "array.new" | "array.from" | "array.copy" | "array.slice" | "array.sort_indices"
         | "map.new" | "map.copy" | "map.keys" | "map.values" | "str.split" => Some(COLL),
+        // r33c (B112): an 11-level `array<float>` collection creator (impl-04 amendment, r34).
+        "ta.pivot_point_levels" => Some(COLL),
         f if f.starts_with("array.new_") => Some(COLL),
         "str.format" | "log.info" | "log.warning" | "log.error" => Some(&["__types"]),
         _ => None,

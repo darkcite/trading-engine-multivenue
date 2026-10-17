@@ -167,8 +167,14 @@ pub fn bi_tostring_s(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), F
     Ok(())
 }
 
-/// `$op.eq_str` (`NE` false) / `$op.ne_str` (`NE` true) — window `[a, b, out]`: byte equality;
-/// an na operand → `false` for both (`pin:04-string-edges`, `pin:06-na-compare`).
+/// `$op.eq_str` (`NE` false) / `$op.ne_str` (`NE` true) — window `[a, b, out]`: byte equality.
+///
+/// `pin:04-na-reads-empty` (r33c verdict, TV right; supersedes the "false for both" reading of
+/// `pin:04-string-edges` / `pin:06-na-compare` for strings): an na string operand reads as `""`.
+/// Unlike the numeric, colour and bool types (A005 A021 A037 A069: `na == na` false), `na == na`
+/// is true for strings (A053) and `na != na` false (A054); `switch na` misses `"ab"` (A061).
+/// The same reading gives `+` (A063) and `color.new` (A047) — one law, see [`bi_add_str`].
+/// Not captured: `na == ""` (true under this reading), `na != "ab"` (true).
 pub fn bi_eq_str<const NE: bool>(
     f: &mut Frame<'_>,
     _: SiteId,
@@ -177,10 +183,9 @@ pub fn bi_eq_str<const NE: bool>(
     if args.len() != 3 {
         return Err(FaultKind::Internal);
     }
-    let r = match (f.str_arg(args[0]), f.str_arg(args[1])) {
-        (Some(a), Some(b)) => (a == b) != NE,
-        _ => false,
-    };
+    let a = f.str_arg(args[0]).unwrap_or(b"");
+    let b = f.str_arg(args[1]).unwrap_or(b"");
+    let r = (a == b) != NE;
     f.set_bool_arg(args[2], r);
     Ok(())
 }
@@ -316,19 +321,27 @@ pub fn bi_str_match(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(),
 }
 
 /// `s1 + s2` (`$op.add_str`) — window `[a, b, out]`: `str_concat` of the two refs (the one copy
-/// is pine-vm's, §4.7); an na operand → na (`pin:04-string-edges`); a full arena is
-/// `StrArenaFull`, nothing written.
+/// is pine-vm's, §4.7); a full arena is `StrArenaFull`, nothing written.
+///
+/// `pin:04-na-reads-empty` (r33c verdict, TV right, fixture A063; supersedes "an na operand →
+/// na" of `pin:04-string-edges`): an na operand reads as `""` — `na + "ab"` is `"ab"` (length 2,
+/// not na, on all 64 captured rows). One na operand returns the other's ref as it is (no copy);
+/// both na give `""` (not captured). The same law as `==` / `!=` ([`bi_eq_str`]) and
+/// `color.new`'s na colour (A047).
 pub fn bi_add_str(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 3 {
         return Err(FaultKind::Internal);
     }
     let v = match (str_ref(f, args[0]), str_ref(f, args[1])) {
-        (Some(a), Some(b)) => Some(
+        (Some(a), Some(b)) => {
             f.str_concat(&[pine_vm::StrPiece::Ref(a), pine_vm::StrPiece::Ref(b)])?
-                .0 as i64,
-        ),
-        _ => None,
+                .0
+        }
+        (Some(a), None) => a.0,
+        (None, Some(b)) => b.0,
+        (None, None) => f.str_concat(&[])?.0,
     };
+    let v = Some(v as i64);
     f.set_i64_arg(args[2], v);
     Ok(())
 }

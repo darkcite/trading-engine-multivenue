@@ -295,7 +295,9 @@ fn a_native_risk_trip_flattens_at_the_next_reconcile() {
         },
         ..ProgramMeta::default()
     };
-    meta.decl.risk.max_drawdown_1e6 = 5 * E;
+    // `pin:U10-risk-rules` (r33d): `max_drawdown` reads the closed equity (TV E091), so the
+    // open-equity trip here is the intraday-loss rule's.
+    meta.decl.risk.max_intraday_loss_1e6 = 5 * E;
     let mut r = NativeBroker::new(&meta, cfg()).unwrap_or_else(|_| unreachable!());
     r.open_bar(&Bar {
         close_1e6: 100 * E,
@@ -306,13 +308,13 @@ fn a_native_risk_trip_flattens_at_the_next_reconcile() {
     r.reconcile(&quote(100 * E, 100 * E), NOW, &mut out)
         .unwrap();
     fill_all(&mut r, &out, 100 * E);
-    // 10 contracts lose 1.00 each at the next mark: drawdown 10 ≥ 5 → the flatten is pending.
+    // 10 contracts lose 1.00 each at the next mark: a day loss of 10 ≥ 5 → the flatten is pending.
     r.open_bar(&Bar {
         close_1e6: 99 * E,
         index: 2,
         ..Bar::default()
     });
-    assert_eq!(r.counters().risk_trips_drawdown, 1);
+    assert_eq!(r.counters().risk_trips_intraday_loss, 1);
     r.reconcile(&quote(99 * E, 99 * E), NOW, &mut out).unwrap();
     let e = out.as_slice()[0];
     assert_eq!(
@@ -322,7 +324,7 @@ fn a_native_risk_trip_flattens_at_the_next_reconcile() {
     fill_all(&mut r, &out, 99 * E);
     let c = r.closed_trade(0).copied().unwrap_or_default();
     assert_ne!(c.flags & pine_ir::trade_flag::RISK_FLATTEN, 0);
-    // Halted: a new entry is not committed.
+    // Halted for the day: a new entry is not committed.
     r.apply_intents(&[entry()], NOW).unwrap();
     r.reconcile(&quote(99 * E, 99 * E), NOW, &mut out).unwrap();
     assert!(out.is_empty());

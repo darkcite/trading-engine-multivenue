@@ -335,7 +335,8 @@ fn str_views_share_the_source_region() {
     assert_eq!(konst(g[3]), (o2 + 2, 2), "trim is a view");
     assert_eq!(konst(g[4]).1, 0);
     assert!(g[5].is_nan());
-    // Searches and comparisons: na → false; byte equality.
+    // Searches: na → false. Comparisons: byte equality, an na operand reads as `""`
+    // (`pin:04-na-reads-empty`, r33c: A053 `na == na` true, A054 `na != na` false).
     let rows = vec![
         (ov::STR_CONTAINS, vec![st(s), st("o w")]),
         (ov::STR_CONTAINS, vec![st(s), st("ow")]),
@@ -350,7 +351,7 @@ fn str_views_share_the_source_region() {
     ];
     assert_eq!(
         str_rows(&rows),
-        vec![1., 0., 1., 1., 0., 0., 0., 0., 1., 1.]
+        vec![1., 0., 1., 1., 0., 0., 1., 1., 1., 1.]
     );
 }
 
@@ -507,9 +508,10 @@ fn str_match_none_switch() {
     }
 }
 
-/// `$op.add_str`: one scratch string; na operand → na.
+/// `$op.add_str`: one scratch string; an na operand reads as `""` (`pin:04-na-reads-empty`,
+/// r33c, fixture A063: `na + "ab"` is `"ab"`) — the other operand comes back as itself.
 #[test]
-fn add_str_concatenates_and_propagates_na() {
+fn add_str_concatenates_and_reads_na_as_empty() {
     let rows = vec![
         (ov::OP_ADD_STR, vec![st("h\u{e9}l"), st("lo")]),
         (
@@ -520,11 +522,16 @@ fn add_str_concatenates_and_propagates_na() {
         (ov::OP_ADD_STR, vec![NA_S, st("x")]),
         (ov::OP_ADD_STR, vec![st(""), st("")]),
         (ov::STR_LENGTH, vec![(Lane::I64, Src::Out(4, 0))]),
+        (ov::STR_LENGTH, vec![(Lane::I64, Src::Out(3, 0))]),
+        (ov::OP_ADD_STR, vec![NA_S, NA_S]),
+        (ov::STR_LENGTH, vec![(Lane::I64, Src::Out(7, 0))]),
     ];
     let g = &str_bars(&rows, &[0.0, 0.0], Dialect::V6).unwrap()[1];
     assert_eq!((g[1], g[2]), (1.0, 5.0));
-    assert!(g[3].is_nan());
+    assert!(!g[3].is_nan());
     assert_eq!(g[5], 0.0);
+    assert_eq!(g[6], 1.0);
+    assert_eq!(g[8], 0.0);
 }
 
 // ---- T13: the copying str.* family (contract A7.2) -----------------------------------------

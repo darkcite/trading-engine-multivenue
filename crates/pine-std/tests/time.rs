@@ -155,7 +155,8 @@ fn time_builtins_are_barclock_ms() {
 }
 
 /// `time(tf, session[, tz])` is **na** outside the session — the point of the session form;
-/// days and overnight ranges (the day it starts on), the timezone shift, `""` = 24x7.
+/// days and overnight ranges (the day it **ends** on, `pin:04-session-overnight-day`, r33c /
+/// D056), the timezone shift, `""` = 24x7.
 #[test]
 fn session_time_is_na_outside_the_session() {
     // 2024-01-07 is a Sunday. Minutes 0..2880 of Sunday and Monday, UTC.
@@ -193,8 +194,9 @@ fn session_time_is_na_outside_the_session() {
         let same = |a: f64, b: f64| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
         assert!(same(got[i][0], want(in0)), "every day {i}");
         assert!(same(got[i][1], want(in0 && day == 1)), "Mondays only {i}");
-        // Sunday 22:00 → Monday 02:00 belongs to Sunday.
-        let night = (day == 0 && m >= 1320) || (day == 1 && m < 120);
+        // `:1` is Sunday: Saturday 22:00 → Sunday 02:00; Sunday 22:00 → Monday 02:00 is
+        // Monday's, outside the filter.
+        let night = day == 0 && m < 120;
         assert!(same(got[i][2], want(night)), "overnight {i}");
         let local = m + 120;
         assert!(
@@ -255,8 +257,8 @@ fn timenow_is_ctx_now_ms() {
     assert_eq!(got[1][0], 1_059_999.0);
 }
 
-/// `timeframe.change`: true on the first execution (`pin:04-time-edges`) and when the period
-/// open moves; `timeframe.in_seconds`: `""` → the chart's.
+/// `timeframe.change`: false on the first execution (`pin:04-tf-change-first-false`, r33c /
+/// F091), then true when the period open moves; `timeframe.in_seconds`: `""` → the chart's.
 #[test]
 fn timeframe_change_first_bar() {
     let ts: Vec<i64> = (0..200).map(|m| m * 60_000).collect();
@@ -268,8 +270,16 @@ fn timeframe_change_first_bar() {
     ];
     let got = run(&rows, &ts, Dialect::V6);
     for (i, r) in got.iter().enumerate() {
-        assert_eq!(r[0], (i % 60 == 0) as u8 as f64, "hourly change {i}");
-        assert_eq!(r[1], 1.0, "chart tf: every bar");
+        assert_eq!(
+            r[0],
+            (i > 0 && i % 60 == 0) as u8 as f64,
+            "hourly change {i}"
+        );
+        assert_eq!(
+            r[1],
+            (i > 0) as u8 as f64,
+            "chart tf: every bar but the first"
+        );
         assert_eq!((r[2], r[3]), (60.0, 86_400.0));
     }
 }

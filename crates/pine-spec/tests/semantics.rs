@@ -125,14 +125,14 @@ const SW: [(Sw, &str, u8, u8); 22] = [
     (
         Sw::StrMatchNone,
         "str_match_none",
-        swr::STR_MATCH_NONE_EMPTY,
-        swr::STR_MATCH_NONE_EMPTY,
+        swr::STR_MATCH_NONE_NA,
+        swr::STR_MATCH_NONE_NA,
     ),
     (
         Sw::TostringDefault,
         "tostring_default",
-        swr::TOSTRING_DEFAULT_FRAC_UPTO_8,
-        swr::TOSTRING_DEFAULT_FRAC_UPTO_8,
+        swr::TOSTRING_DEFAULT_FRAC_UPTO_10,
+        swr::TOSTRING_DEFAULT_FRAC_UPTO_10,
     ),
     (
         Sw::LookaheadOffRt,

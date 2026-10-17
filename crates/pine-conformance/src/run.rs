@@ -397,6 +397,23 @@ fn flatten<'a>(p: &'a PineProgram, out: &mut Vec<&'a SubProgram>) {
     }
 }
 
+/// The `SynBars` length of a `Syn` fixture: its `bars`, else `default`.
+///
+/// `pin:06-fault-bars-pending` (r33g, E110) — a `fault` expectation whose `bars` is pending (the
+/// `--paste runtime-error` capture: TradingView halted, so no row count was exported) steps at
+/// least `row + 1` bars: TradingView reached its fault row, so it had that many; nothing after the
+/// fault is observable on either side.
+fn syn_bars(f: &Fixture, default: u32) -> u32 {
+    match (f.bars, &f.expect) {
+        (Some(n), _) => n,
+        (None, Expect::Fault { row, .. }) => {
+            let need = u32::try_from(row.saturating_add(1)).unwrap_or(u32::MAX);
+            default.max(need)
+        }
+        (None, _) => default,
+    }
+}
+
 /// `[lo, hi)` of the compared rows among `n` rows whose open times ascend as `open_of(i)`.
 fn window_range(w: Window, n: u32, open_of: &impl Fn(u32) -> i64) -> (u32, u32) {
     match w {
@@ -452,7 +469,10 @@ fn host_err(h: HostFault, key: &impl Fn(u32) -> i64, fk: &mut Option<i64>) -> Ru
                 sub,
             }
         }
-        HostFault::Broker(b) => RunError::Broker(b),
+        HostFault::Broker { fault, bar_index } => {
+            *fk = Some(key(bar_index));
+            RunError::Broker(fault)
+        }
     }
 }
 
@@ -651,12 +671,18 @@ impl Runner {
         // 9 — the driver and every sub-program's HTF rows.
         let drive = match f.driver {
             Driver::Syn => Drive::Syn(SynBars::new(
-                f.bars.unwrap_or(self.opts.syn_bars_default),
+                syn_bars(f, self.opts.syn_bars_default),
                 spec::FROM_MS,
                 spec::TIMEFRAME_S,
             )),
+            // pin:06-replay-from-file-start (`pin:00-dataset-start`, r33g) — a chart-driven run
+            // replays from the chart file's first row, not from `REPLAY_FROM_MS`: TradingView runs
+            // every script from its first loaded bar (D060's `t0`, 2024-01-01 on the capture chart),
+            // so a value that carries the whole history (a cumulative kernel's level, `nvi`/`pvi`'s
+            // product, `bar_index`) is TradingView's only when the bar root starts where its chart
+            // does. §4.1.3's `REPLAY_FROM_MS` stays the floor every root must reach (barhash, P10).
             Driver::Chart | Driver::SynSig => Drive::Chart(pine_screen::Clamp {
-                from_open_ms: spec::REPLAY_FROM_MS,
+                from_open_ms: i64::MIN,
                 to_close_ms: spec::TO_MS,
             }),
             Driver::Rt => {
@@ -666,10 +692,16 @@ impl Runner {
                 Drive::Rt(SynTape::new(rt, RT_TIMEFRAME_S, spec::FROM_MS))
             }
         };
+        // The replay's first bar: the chart file's first row (`pin:06-replay-from-file-start`);
+        // §4.5.2's HTF warm-up bound counts back from it.
+        let replay_from_ms = match &drive {
+            Drive::Chart(c) => self.chart.rows(spec::SYMBOL_KEY, spec::TIMEFRAME_S, *c)?[0].open_ms,
+            _ => spec::REPLAY_FROM_MS,
+        };
         let sub_clamp = |tf_s: u32| {
             let htf_ms = i64::from(tf_s) * 1000;
             pine_screen::Clamp {
-                from_open_ms: spec::REPLAY_FROM_MS - 500 * htf_ms,
+                from_open_ms: replay_from_ms - 500 * htf_ms,
                 to_close_ms: spec::TO_MS + htf_ms,
             }
         };
@@ -1275,6 +1307,17 @@ impl Runner {
             {
                 Verdict::Pass
             }
+            // pin:06-broker-script-fault (r33g, CI-005 / E110) — a TV broker `Script` refusal is
+            // TradingView's runtime error, `ScriptRefused` on the faulting bar's row: impl-05's
+            // `pin:05-v5-order-limit` ("a plain runtime error (ScriptRefused; no new kind)") and
+            // §4.5.2 (a `BrokerFault` aborts the run like a `StepOutcome::Fault`).
+            (
+                Expect::Fault {
+                    kind: FaultKind::ScriptRefused,
+                    row,
+                },
+                Err(RunError::Broker(pine_broker::BrokerFault::Script(_))),
+            ) if fault_key == Some(*row) => Verdict::Pass,
             (Expect::Fault { kind, row }, Err(e)) => fail(format!(
                 "expected fault {kind:?} on row {row}, got {e:?} on row {fault_key:?}"
             )),

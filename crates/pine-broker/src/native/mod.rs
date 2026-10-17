@@ -1571,19 +1571,19 @@ impl NativeBroker {
             self.day_notional_1e12 = 0;
         }
         self.day = Some(day);
-        let (eq, net) = (
-            self.book.view().equity_1e12,
-            self.book.view().netprofit_1e12,
-        );
-        if self.risk.roll_day(day, eq, net, &mut self.counters) {
+        let eq = self.book.view().equity_1e12;
+        if self.risk.roll_day(day, eq, &mut self.counters) {
             self.flatten_pending = true;
         }
     }
 
     /// The risk rules at a mark or fill (§4.10): a trip sets `flatten_pending`.
     fn check_risk(&mut self) {
-        let (eq, peak) = (self.book.view().equity_1e12, self.book.peak_equity_1e12());
-        if self.risk.check(eq, peak, &mut self.counters) {
+        let (eq, net) = (
+            self.book.view().equity_1e12,
+            self.book.view().netprofit_1e12,
+        );
+        if self.risk.check(eq, net, &mut self.counters) {
             self.flatten_pending = true;
         }
         if self.risk.halted() && self.book.view().position_size_1e6 != 0 {

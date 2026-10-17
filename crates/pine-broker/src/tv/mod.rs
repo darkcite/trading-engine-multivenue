@@ -33,7 +33,8 @@ use margin::{funds_check, liquidation_price, margin_call_qty};
 use path::{before, path, reach, segment, sort_cands, Cand, Level, CAND_OPEN_MARKET};
 use pine_ir::{
     barflag, decl_flag, Bar, BrokerCounters, BrokerView, ChartInfo, DiagCode, Dialect, IntentKind,
-    OrderIntent, ProgramMeta, RunRecord, SizingMode, StrKey, StrategyDecl, TradeRec, TvCfg,
+    OrderIntent, ProgramMeta, QtyType, RunRecord, SizingMode, StrKey, StrategyDecl, TradeRec,
+    TvCfg,
 };
 
 /// What the host does next. 128 B (a 64-B `Bar` + the tag, 64-aligned).
@@ -222,11 +223,8 @@ impl TvBroker {
         } else {
             (bar.open_ms.div_euclid(1000) + i64::from(self.cfg.day_offset_s)).div_euclid(86_400)
         };
-        let (eq, net) = (
-            self.book.view().equity_1e12,
-            self.book.view().netprofit_1e12,
-        );
-        if self.risk.roll_day(day, eq, net, &mut self.counters) {
+        let eq = self.book.view().equity_1e12;
+        if self.risk.roll_day(day, eq, &mut self.counters) {
             if let Err(f) = self.flatten(self.path[0]) {
                 return self.latch(f);
             }
@@ -292,8 +290,24 @@ impl TvBroker {
         // `tick_px`, whatever `cof_next_tick` reads. TV E124–E127: 45/45 trades each (a market
         // order made by the open's run fills at the open; next-point 0/45, E125 2/45). Exit legs
         // keep `admit_late`'s next-segment rule (`pin:05-cof-next-tick-exits`; uncaptured here).
-        if intrabar && (hist || self.sw.cof_next_tick == CofNextTick::RestOfSegment) {
-            self.admit_late(eval, tick_px);
+        // `pin:05-cof-next-tick` (r33d): a `calc_on_order_fills` execution at a path point (the
+        // tick a segment starts from — a fill at the open) admits its orders from that point, as
+        // a history-tick run does; one at a price inside a segment (a limit / stop filled there)
+        // leaves them for the next path point. TV E016 / E031 trade 43, E105 trade 2, E025 trade 37.
+        let at_point = tick_px == self.path[self.seg.min(3)];
+        let late = match self.sw.cof_next_tick {
+            CofNextTick::SamePoint => at_point,
+            CofNextTick::NextPoint => false,
+            CofNextTick::RestOfSegment => true,
+        };
+        if intrabar && (hist || late) {
+            // The exit legs a point execution (re)commits join too (`pin:05-cof-next-tick-exits`,
+            // r33d: E025 trade 39 — a take-profit set at the open's execution fills at its limit
+            // inside O→H, not at the high); a history-tick run's keep the next segment (uncaptured).
+            let legs = !hist
+                && self.sw.cof_next_tick == CofNextTick::SamePoint
+                && self.exits.born_at(eval);
+            self.admit_late(eval, tick_px, legs);
         }
         let same_tick = self.sw.close_immediately == CloseImmediately::SameTick;
         if intrabar && same_tick {
@@ -534,6 +548,16 @@ impl TvBroker {
         }
         let (a, b) = segment(&self.path, self.seg);
         let eval = self.orders.eval();
+        if self.seg <= 2 {
+            // `pin:05-trail-arm-at-point` (r33d, E012): a trail is first tried at the tick that
+            // placed it — the bar-close evaluation's close for an exit committed there (its sets
+            // are built here, at the next bar's first collection) — and a trail already past its
+            // activation at the segment's start arms there; either way it works on this segment.
+            if self.seg == 0 && self.eval_px_1e6 > 0 {
+                self.exits.arm_born(eval, self.eval_px_1e6);
+            }
+            self.exits.step_at(a);
+        }
         let all_on_close = self.decl.flags & decl_flag::ORDERS_ON_CLOSE != 0;
         self.n_cand = 0;
         let mut i = 0;
@@ -697,8 +721,11 @@ impl TvBroker {
             }
             if any {
                 // "on every … order execution event" (§4.10).
-                let (eq, peak) = (self.book.view().equity_1e12, self.book.peak_equity_1e12());
-                if self.risk.check(eq, peak, &mut self.counters) {
+                let (eq, net) = (
+                    self.book.view().equity_1e12,
+                    self.book.view().netprofit_1e12,
+                );
+                if self.risk.check(eq, net, &mut self.counters) {
                     if let Err(f) = self.flatten(px) {
                         return Some(self.latch(f));
                     }
@@ -816,8 +843,11 @@ impl TvBroker {
     /// `tick(px)` (§4.8.7): mark, then the risk rules at that price.
     fn tick(&mut self, px: i64) -> Result<(), BrokerFault> {
         self.book.mark(px);
-        let (eq, peak) = (self.book.view().equity_1e12, self.book.peak_equity_1e12());
-        if self.risk.check(eq, peak, &mut self.counters) {
+        let (eq, net) = (
+            self.book.view().equity_1e12,
+            self.book.view().netprofit_1e12,
+        );
+        if self.risk.check(eq, net, &mut self.counters) {
             self.flatten(px)?;
         }
         self.margin_check(px)
@@ -1006,6 +1036,7 @@ impl TvBroker {
                 o.qty_pct_1e6,
             )
         };
+        let no_rev = self.orders.get(i).flags & pflag::NO_REVERSAL != 0;
         let pos = self.book.view().position_size_1e6;
         let pv = self.chart.pointvalue_1e6;
         let step = self.chart.qty_step_1e6;
@@ -1021,9 +1052,11 @@ impl TvBroker {
         };
         let q_signed: i64 = if kind == IntentKind::Entry as u8 {
             let q = self.resolve_qty(self.orders.get(i), px)?;
-            let gen_open = match self.sw.pyramiding {
-                PyramidCheck::FillTime => None,
-                PyramidCheck::GenerationTime => Some(gen_open),
+            // `pin:05-pyramiding-check`: `AtGeneration` refused at `stamp_born`; no count here.
+            let (gen_open, pyramiding) = match self.sw.pyramiding {
+                PyramidCheck::AtGeneration => (None, u32::MAX),
+                PyramidCheck::FillTime => (None, self.decl.pyramiding),
+                PyramidCheck::GenerationTime => (Some(gen_open), self.decl.pyramiding),
             };
             let Some(sz) = size_entry(
                 &self.book,
@@ -1031,7 +1064,7 @@ impl TvBroker {
                 q,
                 born_eval,
                 gen_open,
-                self.decl.pyramiding,
+                pyramiding,
                 self.max_position(px),
                 0,
                 Some(&mut self.counters),
@@ -1039,31 +1072,43 @@ impl TvBroker {
                 self.orders.kill(i);
                 return Ok(false);
             };
-            // §4.9.1: the funds check on the opening part, before the step floor.
-            let m = if buy {
-                self.decl.margin_long_pct_1e6
+            // `pin:05-reversal-at-generation` (r33d): the reversal part is decided when the order
+            // is (re)born — an entry born with no opposite position closes at most its own
+            // quantity of one met at the fill and opens the rest (TV E057 trade 2: `LA` born flat,
+            // filled against the 1-lot short `SB` opened since, closes it — position 0, exit `LA`).
+            // An entry born against an opposite position keeps the fill-time reversal (uncaptured
+            // when the two differ).
+            let (close, open_req) = if no_rev && sz.close_1e6 > 0 {
+                let c = sz.close_1e6.min(sz.open_1e6);
+                (c, sz.open_1e6 - c)
             } else {
-                self.decl.margin_short_pct_1e6
+                (sz.close_1e6, sz.open_1e6)
             };
-            let pos_r = if sz.close_1e6 > 0 {
+            let open = if open_req > 0 {
+                // §4.9.1: the funds check on the opening part, before the step floor.
+                let m = if buy {
+                    self.decl.margin_long_pct_1e6
+                } else {
+                    self.decl.margin_short_pct_1e6
+                };
+                let pos_r = if close > 0 { 0 } else { pos.saturating_abs() };
+                let eq = self.book.equity_at(px);
+                let mode = self.sw.margin_funds;
+                let Some(open) = funds_check(open_req, pos_r, px, pv, m, eq, step, mode) else {
+                    self.counters.sized_to_zero += 1;
+                    self.orders.kill(i);
+                    return Ok(false);
+                };
+                floor_step(open, step)
+            } else {
                 0
-            } else {
-                pos.saturating_abs()
             };
-            let eq = self.book.equity_at(px);
-            let mode = self.sw.margin_funds;
-            let Some(open) = funds_check(sz.open_1e6, pos_r, px, pv, m, eq, step, mode) else {
-                self.counters.sized_to_zero += 1;
-                self.orders.kill(i);
-                return Ok(false);
-            };
-            let open = floor_step(open, step);
-            if open == 0 {
+            if open == 0 && close == 0 {
                 self.counters.sized_to_zero += 1;
                 self.orders.kill(i);
                 return Ok(false);
             }
-            let total = sz.close_1e6.saturating_add(open);
+            let total = close.saturating_add(open);
             if buy {
                 total
             } else {
@@ -1161,9 +1206,15 @@ impl TvBroker {
             .apply_fill(q_signed, px, fee, &src, self.bar.index, self.bar.open_ms, 0)?;
         self.orders.get_mut(i).filled_1e6 = filled.saturating_add(q_abs);
         self.orders.on_member_fill(i, q_abs, &mut self.counters);
+        if self.decl.default_qty_type == QtyType::FixedContracts
+            && self.cfg.sizing == SizingMode::AsDeclared
+        {
+            let d = self.decl.default_qty_value_1e6;
+            self.orders.kill_reduced_out(d, &mut self.counters);
+        }
         self.orders.kill(i);
         self.risk.note_fill();
-        self.exits.rederive_now(self.book.view().position_size_1e6);
+        self.after_fill_exits();
         Ok(true)
     }
 
@@ -1204,19 +1255,40 @@ impl TvBroker {
         self.exits
             .fill_set(k, px, fee, &mut self.book, self.bar.index, self.bar.open_ms)?;
         self.risk.note_fill();
-        self.exits.rederive_now(self.book.view().position_size_1e6);
+        self.after_fill_exits();
         Ok(true)
     }
 
+    /// The exit table after a fill: reservations re-derived against the new position, and — when
+    /// the fill left the position flat — the `from_entry = NONE` rules that saw a position lapse
+    /// at once (`pin:05-exit-lapse-at-fill`, r33d): they never reach a trade opened later in the
+    /// same segment. TV E121 trade 8: `strategy.exit("TP", limit = avg × 1.01)` (no `from_entry`)
+    /// takes trade 7 at 80060.9 on the L→H segment, the `L2` stop-limit opens trade 8 at 80061.8
+    /// further up — TV exits it at the next bar-close's level (80862.4), not at the high 80528.9 the
+    /// old 80060.9 level would give on the next segment.
+    fn after_fill_exits(&mut self) {
+        let pos = self.book.view().position_size_1e6;
+        if pos == 0 {
+            self.exits.lapse(pos);
+        }
+        self.exits.rederive_now(pos);
+    }
+
     /// Stamp the records (re)born at evaluation `eval` with what the generation-time readings
-    /// need (`pyramiding = GenerationTime`, `pct_equity_at = OrderTime`); a no-op on the defaults.
+    /// need (`pyramiding = GenerationTime`, `pct_equity_at = OrderTime`), mark the entries born
+    /// with no opposite position (`pflag::NO_REVERSAL`), and refuse the entries `pyramiding =
+    /// AtGeneration` refuses (`pin:05-pyramiding-check`, r33d): one in the direction of an open
+    /// position already holding `pyramiding` entry trades dies now, counted in
+    /// `entries_refused_pyramiding` — a pending order of that id it modified dies with it
+    /// (`pin:05-pyramiding-refused-modify`, uncaptured: E035 / E037 met no pending order there).
     fn stamp_born(&mut self, eval: u32) {
         let gen_py = self.sw.pyramiding == PyramidCheck::GenerationTime;
         let gen_eq = self.sw.pct_equity_at == PctEquityAt::OrderTime;
-        if !gen_py && !gen_eq {
-            return;
-        }
         let open = open_entry_trades(&self.book);
+        let pos = self.book.view().position_size_1e6;
+        let full = self.sw.pyramiding == PyramidCheck::AtGeneration
+            && pos != 0
+            && open >= self.decl.pyramiding.max(1);
         let eq = self.book.view().equity_1e12;
         let mut i = 0;
         while i < self.orders.len() {
@@ -1228,27 +1300,65 @@ impl TvBroker {
                 if gen_eq {
                     o.set_gen_equity_1e12(eq);
                 }
+                let entry = o.kind == IntentKind::Entry as u8;
+                // `side` 0 buys: an entry adding to a long, 1 to a short, reversing the other.
+                let adds = pos != 0 && (o.side == 0) == (pos > 0);
+                let opposite = pos != 0 && !adds;
+                if entry && !opposite {
+                    o.flags |= pflag::NO_REVERSAL;
+                }
+                if full && o.is_live() && entry && adds {
+                    self.orders.kill(i);
+                    self.counters.entries_refused_pyramiding += 1;
+                }
             }
             i += 1;
         }
     }
 
-    /// `cof_next_tick = RestOfSegment` (`pin:05-cof-next-tick`, the alternative) and every
-    /// history-tick run (`pin:05-hist-tick-same-point`): the records (re)born at the intrabar
-    /// execution `eval` at `tick_px` become candidates for the rest of the current segment,
-    /// reached from `tick_px`; their stale slots are dropped first. Exit legs keep the
-    /// next-segment rule: sets are derived at segment collection (`pin:05-cof-next-tick-exits`).
-    fn admit_late(&mut self, eval: u32, tick_px: i64) {
+    /// `cof_next_tick = SamePoint` at a path point (`pin:05-cof-next-tick`), `RestOfSegment` (the
+    /// alternative) and every history-tick run (`pin:05-hist-tick-same-point`): the records
+    /// (re)born at the intrabar execution `eval` at `tick_px` become candidates for the rest of the
+    /// current segment, reached from `tick_px`; their stale slots are dropped first. `legs`: the
+    /// exit sets are re-synced now and those (re)born at `eval` join the same way — the remaining
+    /// set candidates are re-indexed across the rebuild (`pin:05-cof-next-tick-exits`); otherwise
+    /// exit legs keep the next-segment rule (sets are derived at segment collection).
+    fn admit_late(&mut self, eval: u32, tick_px: i64, legs: bool) {
         let (a, b) = segment(&self.path, self.seg.min(3));
+        let mut legs = legs;
+        if legs {
+            let ctx = self.sync_ctx(self.path[0]);
+            if let Err(f) = self.exits.sync(&self.book, &ctx) {
+                // A refused build leaves the old sets (and indices) in place.
+                self.latched.get_or_insert(f);
+                legs = false;
+            } else {
+                // `pin:05-trail-arm-at-point`: a trail is first tried at the tick that placed it.
+                self.exits.arm_born(eval, tick_px);
+            }
+            if let Err(f) = self.v5_order_check() {
+                self.latched.get_or_insert(f);
+            }
+        }
         let mut w = self.cur;
         let mut r = self.cur;
         while r < self.n_cand {
-            let c = self.cand[r];
+            let mut c = self.cand[r];
             let idx = usize::from(c.what & IDX_MASK);
-            let reborn = c.what & WHAT_SET == 0
-                && idx < self.orders.len()
-                && self.orders.get(idx).born_eval == eval;
-            if !reborn {
+            let keep = if c.what & WHAT_SET == 0 {
+                !(idx < self.orders.len() && self.orders.get(idx).born_eval == eval)
+            } else if legs {
+                match self.exits.carried(idx) {
+                    Some(k) if self.exits.set(k).born_eval != eval => {
+                        c.what = (c.what & !IDX_MASK) | u16::try_from(k).unwrap_or(IDX_MASK);
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                true
+            };
+            if keep {
                 // COPY: a 16-B candidate record compacts one slot (§4.17: index records).
                 self.cand[w] = c;
                 w += 1;
@@ -1275,6 +1385,40 @@ impl TvBroker {
                 }
             }
             i += 1;
+        }
+        let mut k = 0;
+        while legs && k < self.exits.sets().len() {
+            let (born_eval, live, rule) = {
+                let s = self.exits.set(k);
+                (
+                    s.born_eval,
+                    s.state == set_state::LIVE && s.r_1e6 > 0,
+                    s.rule,
+                )
+            };
+            if live && born_eval == eval {
+                let seq = self.exits.rule(usize::from(rule)).seq;
+                let mut leg = LEG_TP;
+                while leg <= LEG_TRAIL {
+                    if let Some(lv) = self.leg_level(k, leg) {
+                        let v = self.verify_for(lv);
+                        let hit = reach(lv, tick_px, b, v, self.sw.fill_limits_price);
+                        if let (Some((key, _)), true) = (hit, self.n_cand < N_CAND) {
+                            let what =
+                                WHAT_SET | (leg << LEG_SHIFT) | u16::try_from(k).unwrap_or(0);
+                            self.cand[self.n_cand] = Cand {
+                                key,
+                                seq,
+                                what,
+                                flags: CAND_LATE,
+                            };
+                            self.n_cand += 1;
+                        }
+                    }
+                    leg += 1;
+                }
+            }
+            k += 1;
         }
         self.late_a = tick_px;
         self.seg_eval = eval;
@@ -1565,10 +1709,12 @@ mod tests {
 
     #[test]
     fn forced_fill_slippage_slipped_and_unslipped() {
-        // `pin:U10-risk-rules`: the risk flatten at 97 slips 10 ticks (96.90) by default.
+        // `pin:U10-risk-rules`: the risk flatten at 97 slips 10 ticks (96.90) by default. The
+        // intraday-loss rule trips on the open equity (`max_drawdown` reads the closed equity
+        // since r33d, E091).
         let mut m = meta();
         m.decl.slippage_ticks = 10;
-        m.decl.risk.max_drawdown_1e6 = 2 * E;
+        m.decl.risk.max_intraday_loss_1e6 = 2 * E;
         let flat_px = |sw: crate::switch::Switches| {
             let mut b = TvBroker::with_switches(&m, CFG, sw).unwrap_or_else(|_| unreachable!());
             run(
@@ -1594,7 +1740,8 @@ mod tests {
     fn pyramiding_generation_time() {
         // `pin:05-pyramiding-check`: pyramiding 1, A (limit 98) born on bar 0, B (limit 96) on
         // bar 1, both reached on bar 2. FillTime counts A's trade at B's fill → B refused;
-        // GenerationTime counts the trades open at B's birth (none) → B fills.
+        // GenerationTime counts the trades open at B's birth (none) → B fills; AtGeneration (the
+        // default since r33d, TV E121) refuses only at birth → B fills.
         let a = entry_limit(98 * E);
         let b2 = OrderIntent {
             id: StrKey(2),
@@ -1609,7 +1756,12 @@ mod tests {
             run(&mut b, &bar(2, 100 * E, 100 * E, 95 * E, 96 * E), &[]);
             (b.view().opentrades, b.counters().entries_refused_pyramiding)
         };
-        assert_eq!(trades(SWITCHES), (1, 1));
+        assert_eq!(trades(SWITCHES), (2, 0));
+        let fill = crate::switch::Switches {
+            pyramiding: crate::switch::PyramidCheck::FillTime,
+            ..SWITCHES
+        };
+        assert_eq!(trades(fill), (1, 1));
         let gen = crate::switch::Switches {
             pyramiding: crate::switch::PyramidCheck::GenerationTime,
             ..SWITCHES
@@ -1695,9 +1847,12 @@ mod tests {
 
     #[test]
     fn trail_arm_fire_same_segment() {
-        // `pin:05-trail-same-segment` (zero offset): bar 2's path 104→105→95→103 arms the 103
-        // trail on its last segment. NextSegment: the close tick does not admit it, bar 3's open
-        // (101) gaps through → 101. SameSegment: fires at the arming segment's end, 103.
+        // `pin:05-trail-same-segment` (zero offset): the 96 buy limit fills on bar 2's H→L segment
+        // (path 100→103.5→95→103), its trade's set is built for the last segment, which arms the
+        // 103 trail at its end. NextSegment: the close tick does not admit it, bar 3's open (101)
+        // gaps through → 101. SameSegment: fires at the arming segment's end, 103. (Before r33d
+        // the bar opened at 104, past the activation; a trail gapped past its activation now arms
+        // at the open, `pin:05-trail-arm-at-point`.)
         let x = OrderIntent {
             kind: IntentKind::Exit,
             id: StrKey(9),
@@ -1712,10 +1867,15 @@ mod tests {
             run(
                 &mut b,
                 &bar(0, 100 * E, 101 * E, 99 * E, 100 * E),
-                &[market_entry(), x],
+                &[entry_limit(96 * E), x],
             );
             run(&mut b, &bar(1, 100 * E, 101 * E, 99 * E, 100 * E), &[]);
-            run(&mut b, &bar(2, 104 * E, 105 * E, 95 * E, 103 * E), &[]);
+            run(&mut b, &bar(2, 100 * E, 103_500_000, 95 * E, 103 * E), &[]);
+            let entered = b
+                .open_trade(0)
+                .or(b.closed_trade(0))
+                .map(|t| t.entry_px_1e6);
+            assert_eq!(entered, Some(96 * E));
             run(&mut b, &bar(3, 101 * E, 102 * E, 100 * E, 101 * E), &[]);
             b.closed_trade(0).map(|t| t.exit_px_1e6)
         };
@@ -1761,7 +1921,8 @@ mod tests {
     #[test]
     fn cof_next_tick_rest_of_segment() {
         // `pin:05-cof-next-tick`: the entry fills at bar 1's open (100); the execution there
-        // closes it. NextPoint: from segment 1's start, 99. RestOfSegment: at once, 100.
+        // closes it. SamePoint (default, r33d — the execution is at a path point): at once, 100.
+        // NextPoint: from segment 1's start, 99. RestOfSegment: at once, 100.
         let m = cof_meta();
         let close = OrderIntent {
             kind: IntentKind::Close,
@@ -1784,7 +1945,12 @@ mod tests {
             }
             b.closed_trade(0).map(|t| t.exit_px_1e6)
         };
-        assert_eq!(exit_px(SWITCHES), Some(99 * E));
+        assert_eq!(exit_px(SWITCHES), Some(100 * E));
+        let next = crate::switch::Switches {
+            cof_next_tick: crate::switch::CofNextTick::NextPoint,
+            ..SWITCHES
+        };
+        assert_eq!(exit_px(next), Some(99 * E));
         let rest = crate::switch::Switches {
             cof_next_tick: crate::switch::CofNextTick::RestOfSegment,
             ..SWITCHES

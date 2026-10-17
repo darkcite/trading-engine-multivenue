@@ -337,3 +337,81 @@ pub fn bi_ta_percentrank(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Resul
     f.set_f64_arg(args[2], v);
     Ok(())
 }
+
+/// Spearman's ρ of the newest `len` window values against time, ×100 (`ta.rci`'s value): each
+/// value's ascending rank (ties take the average rank), the oldest value's time rank 1, the
+/// newest's `len`; both rank means are `(len + 1) / 2`. With half-integer ranks every deviation,
+/// product and sum below is exact, so only `cov`, the two `sd`s and the final expression round.
+#[inline(always)]
+fn rci_of(h: &WinHdr, ring: &[f64], len: u32) -> f64 {
+    let n = len as f64;
+    let mean = (n + 1.0) / 2.0;
+    let (mut sxy, mut sxx, mut stt) = (0.0f64, 0.0f64, 0.0f64);
+    let mut k = 0u32;
+    while k < len {
+        let x = win_at(h, ring, k);
+        let (mut lt, mut eq) = (0u32, 0u32);
+        let mut j = 0u32;
+        while j < len {
+            let y = win_at(h, ring, j);
+            lt += (y < x) as u32;
+            eq += (y == x) as u32;
+            j += 1;
+        }
+        let dx = lt as f64 + (eq as f64 + 1.0) / 2.0 - mean;
+        let dt = (len - k) as f64 - mean;
+        sxy += dx * dt;
+        sxx += dx * dx;
+        stt += dt * dt;
+        k += 1;
+    }
+    let cov = sxy / n;
+    let (sdx, sdt) = ((sxx / n).sqrt(), (stt / n).sqrt());
+    100.0 * cov / (sdx * sdt)
+}
+
+/// `ta.rci(source, length)` — window `[src, len, out]`, block `WinHdr` + a ring of `length`
+/// values; `skip` na (an na source is not accepted; the window's value is printed again).
+///
+/// `pin:04-rci-tv-arith` (r33c, fitted to TradingView, fixture B099): the reference's
+/// "Spearman's rank correlation coefficient … between `source` and the bar index over `length`
+/// bars … scaled to −100…100" as Pearson's r of the two rank series with population moments —
+/// `100 · cov / (sd_x · sd_t)`, `cov = Σ dx·dt / n`, `sd = √(Σ d² / n)` — bit-exact on all 114
+/// valued rows. The textbook `(1 − 6·Σd² / (n(n² − 1))) · 100` (in thirteen evaluation orders)
+/// misses 100–114 of them by 1–3 ULP. Ties are not captured (SYN-1 has none in B099's window);
+/// the average rank is Spearman's standard. A flat window gives `0 / 0` → na (not captured).
+///
+/// `pin:04-rci-warmup` (r33c, TV right, B099): the first value comes once `length + 1` values
+/// have been accepted — rows 0…13 are na for `length = 14`, row 14 is the first value, and it is
+/// the rank correlation of the newest 14 values (the window ending one bar earlier misses every
+/// row).
+pub fn bi_ta_rci(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 3 {
+        return Err(FaultKind::Internal);
+    }
+    let src = src_of(f, args[0]);
+    let Some(len) = f.i64_arg(args[1]) else {
+        f.set_f64_arg(args[2], f64::NAN);
+        return Ok(());
+    };
+    let v = {
+        let (h, ring) = f.state_split::<WinHdr, f64>(site);
+        if len < 1 || len > ring.len() as i64 {
+            return Err(FaultKind::ScriptRefused);
+        }
+        let len = len as u32;
+        if h.len != len {
+            win_repoint(h, ring, len);
+        }
+        if !src.is_nan() {
+            win_push(h, ring, src);
+        }
+        if h.n <= len {
+            f64::NAN
+        } else {
+            rci_of(h, ring, len)
+        }
+    };
+    f.set_f64_arg(args[2], v);
+    Ok(())
+}

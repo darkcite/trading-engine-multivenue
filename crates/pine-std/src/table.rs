@@ -153,6 +153,17 @@ const fn skip(id: OverloadId) -> OverloadId {
     id
 }
 
+/// A body whose na law is its own (stated at the body, fitted to the TradingView capture)
+/// asserts the row says `custom` (r33c, the r33a spec-owner request: `ta.ema`, `ta.rma`,
+/// `ta.wma`, `ta.hma`, `ta.percentrank`).
+const fn custom(id: OverloadId) -> OverloadId {
+    assert!(
+        matches!(OVERLOADS[id.0 as usize].na, NaPolicy::Custom),
+        "row is not na: custom"
+    );
+    id
+}
+
 const WIN: Blk = Blk::Win {
     hdr: size_of::<WinHdr>() as u32,
     elem: 8,
@@ -482,7 +493,7 @@ const fn build() -> Built {
     put(
         &mut b,
         ov::TA_WMA,
-        row(skip(ov::TA_WMA), ta::ma::bi_ta_wma, 4, st, WIN2),
+        row(custom(ov::TA_WMA), ta::ma::bi_ta_wma, 4, st, WIN2),
     );
     put(
         &mut b,
@@ -728,12 +739,12 @@ const fn build() -> Built {
     put(
         &mut b,
         ov::TA_EMA,
-        row(skip(ov::TA_EMA), ta::ma::bi_ta_ema, 2, bf::STATEFUL, EWMA),
+        row(custom(ov::TA_EMA), ta::ma::bi_ta_ema, 2, bf::STATEFUL, EWMA),
     );
     put(
         &mut b,
         ov::TA_RMA,
-        row(skip(ov::TA_RMA), ta::ma::bi_ta_rma, 2, bf::STATEFUL, EWMA),
+        row(custom(ov::TA_RMA), ta::ma::bi_ta_rma, 2, bf::STATEFUL, EWMA),
     );
     let sma = ta::ma::bi_ta_sma::<{ na(ov::TA_SMA) }>;
     put(
@@ -770,7 +781,7 @@ const fn build() -> Built {
     put(
         &mut b,
         ov::TA_HMA,
-        row(skip(ov::TA_HMA), ta::ma::bi_ta_hma, 4, st, HMA),
+        row(custom(ov::TA_HMA), ta::ma::bi_ta_hma, 4, st, HMA),
     );
     put(
         &mut b,
@@ -958,7 +969,13 @@ const fn build() -> Built {
     put(
         &mut b,
         ov::TA_PERCENTRANK,
-        row(ov::TA_PERCENTRANK, rk::bi_ta_percentrank, 4, st, WIN),
+        row(custom(ov::TA_PERCENTRANK), rk::bi_ta_percentrank, 4, st, WIN),
+    );
+    // r33c — `ta.rci` (B099, `pin:04-rci-tv-arith`): O(length²) rank pass over the window.
+    put(
+        &mut b,
+        ov::TA_RCI,
+        row(skip(ov::TA_RCI), rk::bi_ta_rci, 8, st, WIN),
     );
     put(
         &mut b,
@@ -2458,6 +2475,18 @@ const fn build() -> Built {
             ca::bi_array_new::<{ ov::ARRAY_NEW.0 }>,
             4,
             COLL_S,
+            Blk::Coll,
+        ),
+    );
+    // r33c — `ta.pivot_point_levels` (B112): a creator of an 11-level `array<float>`.
+    put(
+        &mut b,
+        ov::TA_PIVOT_POINT_LEVELS,
+        row(
+            ov::TA_PIVOT_POINT_LEVELS,
+            ta::pivot::bi_ta_pivot_point_levels,
+            4,
+            COLL,
             Blk::Coll,
         ),
     );

@@ -8,6 +8,7 @@ pub mod cum;
 pub mod ma;
 
 pub mod osc;
+pub mod pivot;
 pub mod rank;
 pub mod seq;
 pub mod window;

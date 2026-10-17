@@ -23,11 +23,20 @@ pub(crate) enum PathTie {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum PyramidCheck {
-    /// The open-entry-trade count at fill time decides (default).
-    FillTime = 0,
+    /// At generation only (default, r33d): an entry generated in the direction of an open
+    /// position already holding `pyramiding` entry trades is refused there — it never fills, even
+    /// once the position closes — and one generated below the limit fills whatever the count at
+    /// its fill. TV E035 (a limit placed at 1790622000000 with 2 of 2 trades open) and E037 (a stop
+    /// at 1787068800000) never fill; E121 (pyramiding 1) trade 11: the `L1` limit placed flat fills
+    /// at 80432.3 while trade 10 (`L2`) is open. The fill-time reading filled E035 / E037 once flat
+    /// and refused E121's.
+    AtGeneration = 0,
     #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
-    /// The count at generation time decides.
-    GenerationTime = 1,
+    /// The open-entry-trade count at fill time decides (the reading before r33d).
+    FillTime = 1,
+    #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
+    /// The count stamped at generation decides at the fill, when the fill adds.
+    GenerationTime = 2,
 }
 
 /// `margin_funds` — an entry needing more margin than available funds
@@ -238,11 +247,18 @@ pub(crate) enum CofCloseTick {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum CofNextTick {
-    /// Eligible from the next path point (default).
-    NextPoint = 0,
+    /// From the execution's tick when that tick is a path point (the segment's start: a fill at
+    /// the open, or at a point a segment starts from), else from the next path point (default,
+    /// r33d — R-P18's "an order made at path point k fills at k" for fill executions). TV E016
+    /// E031 trade 43, E105 trade 2 (an order born at the open's execution fills at the open) and
+    /// E025 trade 37 (born at a take-profit filled inside the L→H segment: fills at the high).
+    SamePoint = 0,
     #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
-    /// Eligible for the rest of the current segment.
-    RestOfSegment = 1,
+    /// Eligible from the next path point (the reading before r33d; refuted by E016 / E031 / E105).
+    NextPoint = 1,
+    #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
+    /// Eligible for the rest of the current segment (refuted by E025 trade 37).
+    RestOfSegment = 2,
 }
 
 /// `fill_limits_price` — a verified limit whose segment starts beyond its verification level
@@ -319,7 +335,7 @@ const _: () = assert!(core::mem::align_of::<Switches>() == 1);
 /// The defaults (I38): the §4.2 table's "default" column.
 pub(crate) const SWITCHES: Switches = Switches {
     path_tie: PathTie::LowFirst,
-    pyramiding: PyramidCheck::FillTime,
+    pyramiding: PyramidCheck::AtGeneration,
     margin_funds: MarginFunds::Reject,
     forced_fill_slippage: ForcedFillSlippage::Slipped,
     close_immediately: CloseImmediately::SameTick,
@@ -330,7 +346,7 @@ pub(crate) const SWITCHES: Switches = Switches {
     pct_equity_at: PctEquityAt::FillTime,
     price_rounding: PriceRounding::NeverEarlier,
     cof_close_tick: CofCloseTick::No,
-    cof_next_tick: CofNextTick::NextPoint,
+    cof_next_tick: CofNextTick::SamePoint,
     fill_limits_price: FillLimitsPrice::AtStart,
     history_tick: HistoryTick::PathPoints,
 };

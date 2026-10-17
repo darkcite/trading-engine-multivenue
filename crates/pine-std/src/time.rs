@@ -331,9 +331,12 @@ pub fn bi_tf_in_seconds(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<()
 
 /// `timeframe.change(timeframe)` — window `[timeframe, out]`, block `Prev` (`v` = the last
 /// period open as f64 bits): true when `open_ms(bar.open_ms, tf)` differs from the last
-/// execution's; the first execution is true (`pin:04-time-edges`). A na timeframe (the
-/// parameter's default) is the chart's; one off the bar clock or unparsable → false (a `bool`
-/// result has no na in v6; `pin:04-time-edges`).
+/// execution's. A na timeframe (the parameter's default) is the chart's; one off the bar clock
+/// or unparsable → false (a `bool` result has no na in v6; `pin:04-time-edges`).
+///
+/// `pin:04-tf-change-first-false` (r33c verdict, TV right, fixture F091 — impl-06's
+/// `first_false` reading; supersedes `first_true` of `pin:04-time-edges`): the first execution
+/// has no previous period to differ from and is **false**, whatever the calendar.
 pub fn bi_tf_change(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 2 {
         return Err(FaultKind::Internal);
@@ -349,7 +352,7 @@ pub fn bi_tf_change(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(),
         Some(tf) => {
             let p = barclock::open_ms(open, tf);
             let s = f.state::<Prev>(site);
-            let changed = s.primed == 0 || s.v.to_bits() as i64 != p;
+            let changed = s.primed != 0 && s.v.to_bits() as i64 != p;
             s.v = f64::from_bits(p as u64);
             s.primed = 1;
             changed
@@ -385,12 +388,17 @@ const fn time_layout(k: u8, d: Dialect) -> ([u16; 4], usize) {
     }
 }
 
-/// Is local minute-of-day `m` on day-of-week `dow` (1 = Sunday) inside `sp`? An overnight range
-/// (`start > end`) belongs to the day it **starts** on (`pin:04-time-edges`).
+/// Is local minute-of-day `m` on day-of-week `dow` (1 = Sunday) inside `sp`?
+///
+/// `pin:04-session-overnight-day` (r33c verdict, TV right, fixture D056; supersedes "the day it
+/// starts on" of `pin:04-time-edges`): an overnight range (`start > end`) belongs to the day it
+/// **ends** on — `"2200-0200:2"` (Monday) is Sunday 22:00 → Monday 02:00 on all 256 captured
+/// rows (8 in session, Sunday 22:00/23:00 and Monday 00:00/01:00, twice).
 #[inline]
 fn in_session(sp: &SessionSpec, m: u16, dow: u8) -> bool {
     let today = sp.days & (1 << (dow - 1)) != 0;
-    let yday = sp.days & (1 << ((dow + 5) % 7)) != 0;
+    // Tomorrow's bit: `dow % 7` is tomorrow's `dow − 1` (Saturday 7 → Sunday's bit 0).
+    let tmrw = sp.days & (1 << (dow % 7)) != 0;
     let mut i = 0usize;
     while i < sp.n as usize && i < sp.ranges.len() {
         let r = sp.ranges[i];
@@ -399,7 +407,7 @@ fn in_session(sp: &SessionSpec, m: u16, dow: u8) -> bool {
         let hit = if r.start_min <= r.end_min {
             today && m >= r.start_min && m < r.end_min
         } else {
-            (today && m >= r.start_min) || (yday && m < r.end_min)
+            (tmrw && m >= r.start_min) || (today && m < r.end_min)
         };
         if hit {
             return true;

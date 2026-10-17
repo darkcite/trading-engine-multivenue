@@ -205,15 +205,17 @@ fn intents_modified_per_same_key_modification() {
 }
 
 #[test]
-fn entries_refused_pyramiding_at_the_fill() {
+fn entries_refused_pyramiding_at_generation() {
+    // `pin:05-pyramiding-check` (r33d, `AtGeneration`; TV E035 / E037): entry 2, generated at bar
+    // 1's close with 1 of 1 trades open, is refused there and never fills.
     let mut b = tv(&meta());
     run(&mut b, &flat(0), &[entry(1)]);
-    run(&mut b, &flat(1), &[entry(2)]);
-    assert_eq!(b.view().opentrades, 1);
     assert_eq!(
-        run_moved(&mut b, &flat(2), &[]),
-        ["entries_refused_pyramiding"]
+        run_moved(&mut b, &flat(1), &[entry(2)]),
+        ["intents_committed", "entries_refused_pyramiding"]
     );
+    assert_eq!(b.view().opentrades, 1);
+    assert_eq!(run_moved(&mut b, &flat(2), &[]), Vec::<&str>::new());
     assert_eq!(b.view().opentrades, 1);
 }
 
@@ -342,17 +344,27 @@ fn margin_calls_at_the_tick() {
 
 #[test]
 fn risk_trips_drawdown_once_per_trip() {
+    // `pin:U10-risk-rules` (r33d, TV E091): `max_drawdown` reads the closed equity.
     let mut m = meta();
     m.decl.risk.max_drawdown_1e6 = 2 * E;
     let mut b = tv(&m);
     run(&mut b, &flat(0), &[entry(1)]);
-    run(&mut b, &flat(1), &[]);
+    // The entry fills at bar 1's open (100); the low 90 is an open drawdown of 10: no trip.
     assert_eq!(
-        run_moved(&mut b, &bar(2, 100 * E, 100 * E, 97 * E, 98 * E), &[]),
+        run_moved(
+            &mut b,
+            &bar(1, 100 * E, 100 * E, 90 * E, 97 * E),
+            &[close(1)]
+        ),
+        ["intents_committed"]
+    );
+    // The close fills at bar 2's open, 97: a closed loss of 3 ≥ 2 trips once.
+    assert_eq!(
+        run_moved(&mut b, &bar(2, 97 * E, 98 * E, 96 * E, 97 * E), &[]),
         ["risk_trips_drawdown"]
     );
     assert_eq!(b.view().position_size_1e6, 0);
-    // Halted for good: a further drop trips nothing.
+    // Halted for good: a further entry and drop trip nothing.
     assert_eq!(
         run_moved(&mut b, &bar(3, 98 * E, 98 * E, 90 * E, 91 * E), &[entry(1)]),
         Vec::<&str>::new()
@@ -379,12 +391,13 @@ fn risk_trips_intraday_orders_once_per_trip() {
     m.decl.risk.max_intraday_filled_orders = 1;
     let mut b = tv(&m);
     run(&mut b, &flat(0), &[entry(1)]);
-    run(&mut b, &flat(1), &[close(1)]);
-    // The second fill of the day exceeds the bound.
+    // `pin:U10-risk-rules` (r33d, TV E093): the fill that reaches the bound trips — the entry's
+    // own fill at bar 1's open, flattened at that tick.
     assert_eq!(
-        run_moved(&mut b, &flat(2), &[]),
+        run_moved(&mut b, &flat(1), &[]),
         ["risk_trips_intraday_orders"]
     );
+    assert_eq!(b.view().position_size_1e6, 0);
 }
 
 #[test]

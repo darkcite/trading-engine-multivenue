@@ -6,8 +6,8 @@
 
 use crate::args::out1;
 use crate::state::{
-    ewma_step, win2_push, win2_repoint, win_at, win_bar_gap, win_push, win_repoint, AlmaHdr, Ewma,
-    HmaHdr, Smoother, Win2Hdr, WinHdr,
+    ewma_step, win2_fresh_sums, win2_push, win2_repoint, win_at, win_bar_gap, win_fresh_sum,
+    win_push, win_repoint, AlmaHdr, Ewma, HmaHdr, Smoother, Win2Hdr, WinHdr,
 };
 use crate::sw;
 use pine_ir::{abi, argwin, FaultKind, SiteId};
@@ -20,6 +20,12 @@ const RMA_SEED: [u8; 2] = sw::both(Sw::RmaSeed);
 /// `ta.sma(source, length)` — window `[src, len, out]`. W5: under `skip` an na source is not
 /// accepted and the output is the unchanged window value. `NA` = the row's `Overload::na`, bound
 /// in the table's `const` block (§3.2).
+///
+/// `pin:04-sma-fresh-sum` (r33c verdict, TV right, CI-015's `pin:04-var-fresh-sum` law applied
+/// to `ta.sma`): the mean is a fresh Neumaier sum of the window, oldest first, `/ length` — the
+/// header's rolling sum drifts in the last digit. D002 (`request.security("240", ta.sma(close,
+/// 5))`) bit-exact on all 256 tail rows under this law (an exactly rounded sum also fits); a
+/// plain fresh sum misses 45–57, the rolling sum 153.
 pub fn bi_ta_sma<const NA: u8>(
     f: &mut Frame<'_>,
     site: SiteId,
@@ -51,7 +57,7 @@ pub fn bi_ta_sma<const NA: u8>(
         if h.n < len || h.na_in != 0 {
             f64::NAN
         } else {
-            h.sum / len as f64
+            win_fresh_sum(h, ring, len) / len as f64
         }
     };
     f.set_f64_arg(dst, out);
@@ -292,9 +298,15 @@ fn warm(h: &WinHdr, len: u32) -> bool {
 const DIV0: [u8; 2] = sw::both(Sw::FloatDivZero);
 
 /// `ta.vwma(source, length)` — block `Win2Hdr` + one ring of `(src, volume)` pairs (operator
-/// ruling A5): `Σ(src·vol) / Σ vol`; a zero-volume window divides by 0 per `Sw::FloatDivZero`.
-/// `skip` na applies to the pair: one is accepted only when `source` and `volume` are both
-/// non-na (`pin:04-volume-pair-skip` — the manual's `sma(x·volume)/sma(volume)` as one ring).
+/// ruling A5): the manual's `ta.sma(src·volume, length) / ta.sma(volume, length)`; a
+/// zero-volume window divides by 0 per `Sw::FloatDivZero`. `skip` na applies to the pair: one is
+/// accepted only when `source` and `volume` are both non-na (`pin:04-volume-pair-skip` — the
+/// manual's two `sma`s as one ring).
+///
+/// `pin:04-sma-fresh-sum` (r33c verdict, TV right, fixture B121): each `sma` is `ta.sma`'s law —
+/// a fresh Neumaier sum oldest first (the products `src·vol` unfused) `/ length` — and the two
+/// quotients divide: bit-exact on all 256 tail rows; `Σ(src·vol) / Σ vol` without the two
+/// `/ length` misses 71, plain sums 139.
 pub fn bi_ta_vwma(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 3 {
         return Err(FaultKind::Internal);
@@ -322,7 +334,9 @@ pub fn bi_ta_vwma(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), F
         if h.win.n < len {
             f64::NAN
         } else {
-            h.win.sum / h.sum_v
+            let (spv, sv) = win2_fresh_sums(h, ring, len);
+            let n = len as f64;
+            (spv / n) / (sv / n)
         }
     };
     f.set_f64_arg(

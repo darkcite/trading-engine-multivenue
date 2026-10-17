@@ -432,19 +432,27 @@ fn transp(x: f64) -> u8 {
 }
 
 /// `color.new(color, transp)`.
+///
+/// `pin:04-na-reads-empty` (r33c verdict, TV right, fixture A047; the string `+` / `==` law of
+/// `strs::bi_add_str`): an na `color` reads as the empty colour, packed 0 — channels `(0, 0, 0)`;
+/// the result is not na and `color.r·65536 + color.g·256 + color.b` is 0 on all 64 captured
+/// rows. The transparency it carries is not observed; the literal reading keeps `transp`. An na
+/// `transp` still yields na (not captured, unchanged).
 pub fn bi_color_new(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 3 {
         return Err(FaultKind::Internal);
     }
     let (c, t) = (f.i64_arg(args[0]), f.f64_arg(args[1]));
-    let r = match c {
-        Some(c) if !t.is_nan() => Some(color::pack(
+    let r = if t.is_nan() {
+        None
+    } else {
+        let c = c.unwrap_or(0);
+        Some(color::pack(
             color::r(c),
             color::g(c),
             color::b(c),
             transp(t),
-        )),
-        _ => None,
+        ))
     };
     f.set_i64_arg(args[2], r);
     Ok(())

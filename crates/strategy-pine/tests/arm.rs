@@ -148,8 +148,11 @@ fn reconcile_boot_once_before_first_commit() {
         vec![slice(0, 60, warm_bars(60, 50, 0))],
     );
     let pr = p.rt_probe().expect("core");
+    // `pin:04-qty-float-1e8` (r33f, CI-058): a script reads its quantity as TradingView forms it,
+    // `((q_1e6 · 100) as f64) · 1e-8` — the adopted 120 000 ×1e6 reads 0.12000000000000001.
     assert_eq!(
-        pr.script_plot0[0], 0.12,
+        pr.script_plot0[0],
+        (120_000_i64 * 100) as f64 * 1e-8,
         "the last warm-up bar saw the adopted 0.12"
     );
     assert_eq!(pr.script_pos[0], 120_000);

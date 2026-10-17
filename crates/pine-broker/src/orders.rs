@@ -51,6 +51,10 @@ pub(crate) mod pflag {
     /// §4.12.4 rules 2–3), so that send filling is not the record's end — the remainder is sent
     /// after the reducers' dispositions. Kept across a re-commit on the same side.
     pub(crate) const DEFERRED: u8 = 1 << 2;
+    /// TV entry: its (re)birth saw no opposite position (`pin:05-reversal-at-generation`), so its
+    /// fill closes at most its own quantity of an opposite position met at the fill. Set by the TV
+    /// broker after each commit; unread by native.
+    pub(crate) const NO_REVERSAL: u8 = 1 << 3;
 }
 
 /// One pending entry / `strategy.order` / close / close-all. 128 B.
@@ -734,6 +738,28 @@ impl OrderTable {
                         o.state = state::DEAD;
                     }
                 }
+            }
+            k += 1;
+        }
+    }
+
+    /// TV, `default_qty_type = fixed` (`pin:05-oca-reduce-default`, r33d): a live default-sized
+    /// `oca.reduce` member whose fixed size `default_1e6` the group's fills have used up dies —
+    /// its size is known when placed, as an explicit member's is (`on_member_fill`). TV E061: `SB`
+    /// (default 1 contract) reduced by `LA`'s 1-contract fill is gone; the `SB` re-placed later is a
+    /// new order filling 1 contract (trade 4, short 77792.2), not the reduced one sized to zero.
+    pub(crate) fn kill_reduced_out(&mut self, default_1e6: i64, counters: &mut BrokerCounters) {
+        let mut k = 0;
+        while k < self.len() {
+            let o = &mut self.orders[k];
+            if o.is_live()
+                && o.oca_type == OcaType::Reduce as u8
+                && o.qty_1e6 == 0
+                && o.oca_reduced_1e6 > 0
+                && default_1e6 - o.filled_1e6 - o.oca_reduced_1e6 <= 0
+            {
+                o.state = state::DEAD;
+                counters.orders_cancelled_oca += 1;
             }
             k += 1;
         }

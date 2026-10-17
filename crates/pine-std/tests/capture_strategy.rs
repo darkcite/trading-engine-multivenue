@@ -836,8 +836,9 @@ fn strategy_vars_read_the_broker_exactly() {
 }
 
 /// The derived variables whose reference text states formula and base (T29 ruling):
-/// `*_percent` of the initial capital, `avg_*` over the matching trade count; `÷0 → na`
-/// (`pin:04-strategy-edges`); no broker → na.
+/// `*_percent` of the initial capital, `avg_*` over the matching trade count, rounded to 10
+/// significant digits (`pin:04-avg-trade-sig10`, r33f); `÷0 → na` (`pin:04-strategy-edges`); no
+/// broker → na.
 #[test]
 fn strategy_derived_vars_follow_the_reference_formulas() {
     let fl = Lane::F64;
@@ -865,14 +866,14 @@ fn strategy_derived_vars_follow_the_reference_formulas() {
         np / ic * 100.0,
         gp / ic * 100.0,
         gl / ic * 100.0,
-        np / 7.0,
+        35.78571429, // 250.5 / 7 = 35.785714285714285, to 10 significant digits
         gp / 4.0,
         gl / 2.0,
     ];
     for (k, (g, w)) in got.iter().zip(want).enumerate() {
         assert_eq!(g.to_bits(), w.to_bits(), "row {k}: {g} vs {w}");
     }
-    assert!((got[0] - 2.505).abs() < 1e-12 && (got[3] - 250.5 / 7.0).abs() < 1e-12);
+    assert!((got[0] - 2.505).abs() < 1e-12 && (got[3] - np / 7.0).abs() < 1e-8);
     // ÷0 → na: no initial capital, no trades.
     ctx.broker = Some(BrokerView {
         initial_capital_1e12: 0,
@@ -1285,7 +1286,7 @@ fn strategy_percent_reads_follow_the_reference_formulas() {
 /// Amendment A9 (lead ruling 2026-10-16): `strategy.max_drawdown_percent` /
 /// `max_runup_percent` read `BrokerView::max_*_pct_1e6` (the reference's per-trade formula, the
 /// largest over every trade, `pin:04-max-dd-pct-provisional`, `pin:04-max-runup-pct-provisional`;
-/// na before the first trade); `avg_trade_percent` / `avg_winning_trade_percent` /
+/// 0 before the first trade, `pin:04-max-pct-zero-before-trade`); `avg_trade_percent` / `avg_winning_trade_percent` /
 /// `avg_losing_trade_percent` = Σ closed `profit_percent` / closed, wins, losses (the losing one a
 /// positive amount, as `avg_losing_trade`; `pin:04-avg-trade-pct-provisional`); ÷0 and no broker → na.
 #[test]
@@ -1316,15 +1317,20 @@ fn a9_percent_vars_read_the_broker_aggregates() {
     }
     assert_eq!(got[0], 12.5);
     assert_eq!(got[4], 2.75, "a positive amount");
-    // No trade at all: every A9 read is na.
+    // No trade at all (the broker's maxima are still 0): the maxima read 0 (TV E118, r33f), the
+    // averages are ÷0 → na.
     ctx.broker = Some(BrokerView {
         opentrades: 0,
         closedtrades: 0,
         wintrades: 0,
         losstrades: 0,
+        max_drawdown_pct_1e6: 0,
+        max_runup_pct_1e6: 0,
         ..b
     });
-    assert!(read_vars(&rows, &mut ctx).iter().all(|v| v.is_nan()));
+    let got = read_vars(&rows, &mut ctx);
+    assert_eq!((got[0].to_bits(), got[1].to_bits()), (0, 0));
+    assert!(got[2..].iter().all(|v| v.is_nan()));
     // One open trade, nothing closed: the maxima read, the averages are ÷0 → na.
     ctx.broker = Some(BrokerView {
         opentrades: 1,

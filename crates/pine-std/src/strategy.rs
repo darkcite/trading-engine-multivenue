@@ -11,9 +11,9 @@
 
 use crate::sw;
 use pine_ir::{
-    fnv1a64, fnv1a64_continue, intent_flag as fl, scale, str_key, str_region, trade_flag, Dialect,
-    FaultKind, IntentKind, IntentSide, OcaType, OrderIntent, OverloadId, SiteId, StrKey, StrRef,
-    Sym, TradeRec,
+    fnv1a64, fnv1a64_continue, intent_flag as fl, scale, str_key, str_region, trade_flag, BarCtx,
+    BrokerView, Dialect, FaultKind, IntentKind, IntentSide, OcaType, OrderIntent, OverloadId,
+    SiteId, StrKey, StrRef, Sym, TradeRec,
 };
 use pine_spec::{ov, pf, swr, Sw, OVERLOADS, PARAMS};
 use pine_vm::Frame;
@@ -500,15 +500,15 @@ pub fn bi_cancel_all(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), F
 /// Which `BrokerView` field a variable reads, and how it converts.
 #[derive(Clone, Copy)]
 pub enum Var {
-    /// `position_size` (signed, ×1e6).
+    /// `position_size` (signed, ×1e6; read as [`qty_f64`] forms it).
     PositionSize,
-    /// `position_avg_price` (×1e6; 0 → na).
+    /// `position_avg_price` (×1e6; 0 → na; read as [`px_f64`] forms it).
     PositionAvgPrice,
     /// `equity` (×1e12).
     Equity,
     /// `netprofit` (×1e12).
     NetProfit,
-    /// `openprofit` (×1e12).
+    /// `openprofit` (the f64 sum of [`open_profit_f64`], else ×1e12).
     OpenProfit,
     /// `grossprofit` (×1e12).
     GrossProfit,
@@ -520,11 +520,11 @@ pub enum Var {
     MaxDrawdown,
     /// `max_runup` (×1e12).
     MaxRunup,
-    /// `max_contracts_held_all` (×1e6).
+    /// `max_contracts_held_all` (×1e6; [`qty_f64`]).
     HeldAll,
-    /// `max_contracts_held_long` (×1e6).
+    /// `max_contracts_held_long` (×1e6; [`qty_f64`]).
     HeldLong,
-    /// `max_contracts_held_short` (×1e6).
+    /// `max_contracts_held_short` (×1e6; [`qty_f64`]).
     HeldShort,
     /// `margin_liquidation_price` (×1e6; 0 → na).
     LiqPrice,
@@ -548,11 +548,12 @@ pub enum Var {
     /// `grossloss_percent` = `grossloss / initial_capital × 100` (`grossloss ≥ 0`).
     GrossLossPct,
     /// `avg_trade` = `netprofit / closedtrades` ("the sum of all profits and losses divided by
-    /// the number of closed trades").
+    /// the number of closed trades"), to 10 significant digits ([`round_sig10`]).
     AvgTrade,
-    /// `avg_winning_trade` = `grossprofit / wintrades`.
+    /// `avg_winning_trade` = `grossprofit / wintrades`, to 10 significant digits.
     AvgWinTrade,
-    /// `avg_losing_trade` = `grossloss / losstrades` (a positive amount, as `grossloss`).
+    /// `avg_losing_trade` = `grossloss / losstrades` (a positive amount, as `grossloss`), to 10
+    /// significant digits.
     AvgLossTrade,
     /// `openprofit_percent` = `openprofit / (initial_capital + netprofit) × 100` — the
     /// reference's "`openPL / realizedEquity * 100`", realized equity = initial capital plus the
@@ -560,10 +561,12 @@ pub enum Var {
     OpenProfitPct,
     /// A9 `max_drawdown_percent` = `BrokerView::max_drawdown_pct_1e6` — the reference's
     /// per-trade `Lowest Value During Trade / (Entry Price x Quantity) * 100`, the largest over
-    /// every trade, open or closed (`pin:04-max-dd-pct-provisional`); na before the first trade.
+    /// every trade, open or closed (`pin:04-max-dd-pct-provisional`); 0 before the first trade
+    /// (`pin:04-max-pct-zero-before-trade`).
     MaxDrawdownPct,
     /// A9 `max_runup_percent` = `BrokerView::max_runup_pct_1e6` — the same over
-    /// `Highest Value During Trade` (`pin:04-max-runup-pct-provisional`); na before the first trade.
+    /// `Highest Value During Trade` (`pin:04-max-runup-pct-provisional`); 0 before the first
+    /// trade.
     MaxRunupPct,
     /// A9 `avg_trade_percent` = Σ closed `profit_percent` / `closedtrades` ("the sum of all profit
     /// and loss percentages divided by the number of closed trades"; `÷0 → na`;
@@ -599,29 +602,187 @@ fn write(f: &mut Frame<'_>, e: u16, v: Val) {
     }
 }
 
+// ---- script-visible float formation (r33f) ------------------------------------------------
+
+/// The chart constants the float formations read (`meta.chart`), copied out before the
+/// `BarCtx` borrow.
+#[derive(Clone, Copy)]
+struct Fmt {
+    /// `syminfo.mintick` ×1e6.
+    mt_1e6: i64,
+    /// `syminfo.pointvalue` ×1e6.
+    pv_1e6: i64,
+}
+
+impl Fmt {
+    #[inline(always)]
+    fn of(f: &Frame<'_>) -> Fmt {
+        let c = &f.meta().chart;
+        Fmt {
+            mt_1e6: c.mintick_1e6,
+            pv_1e6: c.pointvalue_1e6,
+        }
+    }
+}
+
+/// `pin:04-qty-float-1e8` (CI-058, r33f) — a quantity reads as TradingView forms it: its
+/// quantity integer at ×1e8 times `1e-8` in f64, `((q_1e6 · 100) as f64) · 1e-8`, not
+/// `q_1e6 / 1e6`. 567/567 distinct captured `position_size` / `opentrades.size` texts of the E
+/// fixtures (E045 1543003 → 1.5430030000000001, E054 13 → 0.000013000000000000001, E132 13258776
+/// → 13.258776000000001); `q / 1e6` fits 495. `max_contracts_held_*` read the same (uncaptured).
 #[inline(always)]
-fn nz_px(v: i64) -> f64 {
+fn qty_f64(q_1e6: i64) -> f64 {
+    (q_1e6 as i128 * 100) as f64 * 1e-8
+}
+
+/// `pin:04-px-float-ticks` (r33f) — a fill price reads as TradingView forms it: its tick count
+/// times the f64 mintick, `(px / mintick) as f64 · mintick`. E082 `position_avg_price`, E107
+/// `opentrades.entry_price`, E108 `closedtrades.entry_price` 45/45 distinct values each (75577.4
+/// → 75577.40000000001; `px / 1e6` fits 24/45); E108's `closedtrades.profit` fits only with the
+/// exit price so formed (45/45 vs 22/45). A price off the tick grid (an average over several
+/// fills — uncaptured) keeps `px / 1e6`.
+#[inline(always)]
+fn px_f64(px_1e6: i64, mt_1e6: i64) -> f64 {
+    if mt_1e6 > 0 && px_1e6 % mt_1e6 == 0 {
+        (px_1e6 / mt_1e6) as f64 * scale::from_1e6(mt_1e6)
+    } else {
+        scale::from_1e6(px_1e6)
+    }
+}
+
+/// A fill price, 0 → na.
+#[inline(always)]
+fn nz_px(v: i64, mt_1e6: i64) -> f64 {
     if v == 0 {
         f64::NAN
     } else {
-        scale::from_1e6(v)
+        px_f64(v, mt_1e6)
+    }
+}
+
+/// `pin:04-trade-profit-f64` (r33f) — a closed trade's `profit` is TradingView's f64
+/// `(exit_price − entry_price) · size · pointvalue` over the script-visible prices and size
+/// (E108 45/45 trades, 4248/4248 rows: −1595.800000000003; `pnl / 1e12` 22/45). Measured on
+/// commission-free trades only: a trade that paid a fee keeps `pnl_1e12 / 1e12` (the f64 fee law
+/// is not captured — E114's equity fits no tried fee formation on every row). The `pointvalue`
+/// factor is last (1 on every capture: its place is unmeasured).
+#[inline(always)]
+fn profit_f64(t: &TradeRec, x: Fmt) -> f64 {
+    if t.flags & trade_flag::OPEN != 0 || t.fee_1e12 != 0 || t.exit_px_1e6 == 0 {
+        return scale::from_1e12(t.pnl_1e12);
+    }
+    (px_f64(t.exit_px_1e6, x.mt_1e6) - px_f64(t.entry_px_1e6, x.mt_1e6))
+        * qty_f64(t.qty_1e6)
+        * scale::from_1e6(x.pv_1e6)
+}
+
+/// `pin:04-openprofit-f64` (r33f) — `strategy.openprofit` is TradingView's f64 sum over the open
+/// trades, oldest first, of `(close − entry_price) · size · pointvalue`, gross of the entry fee,
+/// prices and sizes as the script reads them, the close formed as ticks × mintick too (E114
+/// 4320/4320 rows: −285.3000000000029 at a 0.1 % commission; a `close / 1e6` close 3551/4320,
+/// `openprofit_1e12 / 1e12` 1927/4320). The close is the evaluation bar's,
+/// which is the broker's mark only at a bar-close evaluation — so the f64 sum is taken only when
+/// the same sum in the broker's integers (`gross_1e12`: `sign · trunc(Δpx · |q| · pv / 1e6)`)
+/// equals `BrokerView::openprofit_1e12`; any other mark (a `calc_on_order_fills` execution at a
+/// fill price) or an overflow keeps `openprofit_1e12 / 1e12` (`None`). Summation order for
+/// several open trades is unmeasured (one open trade per captured row).
+fn open_profit_f64(ctx: &dyn BarCtx, b: &BrokerView, close_1e6: i64, x: Fmt) -> Option<f64> {
+    let close = px_f64(close_1e6, x.mt_1e6);
+    let pv = scale::from_1e6(x.pv_1e6);
+    let mut sum = 0.0f64;
+    let mut chk = 0i128;
+    let mut i = 0u32;
+    while i < b.opentrades {
+        let t = ctx.open_trade(i)?;
+        let d = (close_1e6 as i128 - t.entry_px_1e6 as i128)
+            .checked_mul((t.qty_1e6 as i128).abs())?
+            .checked_mul(x.pv_1e6 as i128)?
+            / 1_000_000;
+        chk = chk.checked_add(if t.qty_1e6 < 0 { -d } else { d })?;
+        sum += (close - px_f64(t.entry_px_1e6, x.mt_1e6)) * qty_f64(t.qty_1e6) * pv;
+        i += 1;
+    }
+    if chk == b.openprofit_1e12 {
+        Some(sum)
+    } else {
+        None
+    }
+}
+
+/// Powers of ten exact in binary64 (`10^0 ..= 10^22`).
+const POW10: [f64; 23] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+    1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+];
+
+#[inline(always)]
+fn pow10(k: i32) -> f64 {
+    if (0..=22).contains(&k) {
+        POW10[k as usize]
+    } else {
+        10f64.powi(k)
+    }
+}
+
+/// `pin:04-avg-trade-sig10` (r33f) — TradingView's `avg_trade`, `avg_winning_trade` and
+/// `avg_losing_trade` are the quotient rounded to 10 significant digits (E118 4320/4320 rows
+/// each, 46 distinct triples: 420.06666666666666 reads 420.0666667, 1155.3333333333333 reads
+/// 1155.333333; 12 or 15 digits fit 1427 / 648 rows of `avg_trade`). Rounded as
+/// `round(v · 10^p) / 10^p` with `p = 9 − ⌊log₁₀|v|⌋`, half away from zero (the tie rule and a
+/// decimal-exact rounding are indistinguishable on the capture). na and ±0 pass through.
+#[inline(always)]
+fn round_sig10(v: f64) -> f64 {
+    if !v.is_finite() || v == 0.0 {
+        return v;
+    }
+    let a = v.abs();
+    let mut e = a.log10().floor() as i32;
+    // `log10` may land one off next to a power of ten: settle `e` against the exact powers.
+    if a >= pow10(e + 1) {
+        e += 1;
+    } else if a < pow10(e) {
+        e -= 1;
+    }
+    let p = 9 - e;
+    if p > 300 {
+        return v; // |v| < 1e-291: 10^p overflows — no 10-digit scaling exists (uncaptured)
+    }
+    if p >= 0 {
+        let s = pow10(p);
+        (v * s).round() / s
+    } else {
+        let s = pow10(-p);
+        (v / s).round() * s
     }
 }
 
 /// A `strategy.*` variable: `None` from `broker()` (an indicator) → na.
 pub fn bi_var<const V: u8>(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    const OP: u8 = Var::OpenProfit as u8;
+    const OPP: u8 = Var::OpenProfitPct as u8;
     let e = out_of(args, 0)?;
     let int_out = pine_ir::argwin::is_i64(e);
-    let v = match f.ctx().broker() {
+    let x = Fmt::of(f);
+    let close_1e6 = f.bar().close_1e6;
+    let ctx: &dyn BarCtx = f.ctx();
+    let v = match ctx.broker() {
         None if int_out => Val::I(None),
         None => Val::F(f64::NAN),
-        Some(b) => read_var(b, V),
+        Some(b) => {
+            let open = if V == OP || V == OPP {
+                open_profit_f64(ctx, b, close_1e6, x)
+            } else {
+                None
+            };
+            read_var(b, V, x, open)
+        }
     };
     write(f, e, v);
     Ok(())
 }
 
-fn read_var(b: &pine_ir::BrokerView, v: u8) -> Val {
+/// One variable of `b`; `open` is [`open_profit_f64`]'s sum when the read needs it.
+fn read_var(b: &BrokerView, v: u8, x: Fmt, open: Option<f64>) -> Val {
     const PS: u8 = Var::PositionSize as u8;
     const PAP: u8 = Var::PositionAvgPrice as u8;
     const EQ: u8 = Var::Equity as u8;
@@ -654,24 +815,25 @@ fn read_var(b: &pine_ir::BrokerView, v: u8) -> Val {
     const ATP: u8 = Var::AvgTradePct as u8;
     const AWP: u8 = Var::AvgWinTradePct as u8;
     const ALP: u8 = Var::AvgLossTradePct as u8;
-    // A9: no trade yet (none open, none ever closed) → the per-trade maxima read na.
-    let traded = b.opentrades != 0 || b.closedtrades != 0;
     let ic = scale::from_1e12(b.initial_capital_1e12);
+    let op = open.unwrap_or_else(|| scale::from_1e12(b.openprofit_1e12));
     match v {
-        PS => Val::F(scale::from_1e6(b.position_size_1e6)),
-        PAP => Val::F(nz_px(b.position_avg_price_1e6)),
+        PS => Val::F(qty_f64(b.position_size_1e6)),
+        PAP => Val::F(nz_px(b.position_avg_price_1e6, x.mt_1e6)),
         EQ => Val::F(scale::from_1e12(b.equity_1e12)),
         NP => Val::F(scale::from_1e12(b.netprofit_1e12)),
-        OP => Val::F(scale::from_1e12(b.openprofit_1e12)),
+        OP => Val::F(op),
         GP => Val::F(scale::from_1e12(b.grossprofit_1e12)),
         GL => Val::F(scale::from_1e12(b.grossloss_1e12)),
         IC => Val::F(scale::from_1e12(b.initial_capital_1e12)),
         MDD => Val::F(scale::from_1e12(b.max_drawdown_1e12)),
         MRU => Val::F(scale::from_1e12(b.max_runup_1e12)),
-        HA => Val::F(scale::from_1e6(b.max_contracts_held_all_1e6)),
-        HL => Val::F(scale::from_1e6(b.max_contracts_held_long_1e6)),
-        HS => Val::F(scale::from_1e6(b.max_contracts_held_short_1e6)),
-        LP => Val::F(nz_px(b.margin_liquidation_price_1e6)),
+        HA => Val::F(qty_f64(b.max_contracts_held_all_1e6)),
+        HL => Val::F(qty_f64(b.max_contracts_held_long_1e6)),
+        HS => Val::F(qty_f64(b.max_contracts_held_short_1e6)),
+        // `pin:04-liq-px-1e6` (r33f): the liquidation price is the margin module's computed level,
+        // not a fill price — it keeps `px / 1e6` (uncaptured; mintick 0 selects that arm).
+        LP => Val::F(nz_px(b.margin_liquidation_price_1e6, 0)),
         OT => Val::I(Some(b.opentrades as i64)),
         CT => Val::I(Some(b.closedtrades as i64)),
         WT => Val::I(Some(b.wintrades as i64)),
@@ -681,24 +843,27 @@ fn read_var(b: &pine_ir::BrokerView, v: u8) -> Val {
         NPP => Val::F(pct(scale::from_1e12(b.netprofit_1e12), ic)),
         GPP => Val::F(pct(scale::from_1e12(b.grossprofit_1e12), ic)),
         GLP => Val::F(pct(scale::from_1e12(b.grossloss_1e12), ic)),
-        AT => Val::F(div_na(
+        AT => Val::F(round_sig10(div_na(
             scale::from_1e12(b.netprofit_1e12),
             b.closedtrades as f64,
-        )),
-        AW => Val::F(div_na(
+        ))),
+        AW => Val::F(round_sig10(div_na(
             scale::from_1e12(b.grossprofit_1e12),
             b.wintrades as f64,
-        )),
-        AL => Val::F(div_na(
+        ))),
+        AL => Val::F(round_sig10(div_na(
             scale::from_1e12(b.grossloss_1e12),
             b.losstrades as f64,
-        )),
+        ))),
         OPP => Val::F(pct(
-            scale::from_1e12(b.openprofit_1e12),
+            op,
             scale::from_1e12(b.initial_capital_1e12 + b.netprofit_1e12),
         )),
-        MDP if traded => Val::F(scale::from_1e6(b.max_drawdown_pct_1e6)),
-        MRP if traded => Val::F(scale::from_1e6(b.max_runup_pct_1e6)),
+        // `pin:04-max-pct-zero-before-trade` (r33f, retires A9's "na before the first trade"): E118
+        // reads `max_drawdown_percent` 0 on all 51 rows before its first trade; the run-up twin
+        // follows (the maximum over no trade is 0, as `strategy.max_runup` reads).
+        MDP => Val::F(scale::from_1e6(b.max_drawdown_pct_1e6)),
+        MRP => Val::F(scale::from_1e6(b.max_runup_pct_1e6)),
         ATP => Val::F(div_na(
             scale::from_1e6(b.sum_trade_pct_1e6),
             b.closedtrades as f64,
@@ -773,9 +938,9 @@ pub fn bi_position_entry_name(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Res
 /// Which `TradeRec` field a trade accessor reads.
 #[derive(Clone, Copy)]
 pub enum Fld {
-    /// `entry_price` (0 → na).
+    /// `entry_price` (0 → na; [`px_f64`]).
     EntryPrice,
-    /// `exit_price` (0 → na).
+    /// `exit_price` (0 → na; [`px_f64`]).
     ExitPrice,
     /// `entry_bar_index` (`u32::MAX` → na).
     EntryBar,
@@ -785,9 +950,9 @@ pub enum Fld {
     EntryTime,
     /// `exit_time` (ms; 0 → na).
     ExitTime,
-    /// `size` (signed ×1e6).
+    /// `size` (signed ×1e6; [`qty_f64`]).
     Size,
-    /// `profit` (`pnl_1e12`, net of fees).
+    /// `profit` (`pnl_1e12`, net of fees; a closed commission-free trade per [`profit_f64`]).
     Profit,
     /// `commission` (`fee_1e12`).
     Commission,
@@ -832,6 +997,7 @@ fn trade_read<const OPEN: bool>(
         return Ok(Raw::Na);
     }
     let k = k as u32;
+    let x = Fmt::of(f);
     let ctx = f.ctx();
     let t = if OPEN {
         ctx.open_trade(k)
@@ -848,7 +1014,7 @@ fn trade_read<const OPEN: bool>(
     match t {
         None => Ok(Raw::Na),
         Some(t) if t.flags & trade_flag::PNL_NET == 0 => Err(FaultKind::Internal),
-        Some(t) => Ok(read_fld(t, fld)),
+        Some(t) => Ok(read_fld(t, fld, x)),
     }
 }
 
@@ -877,7 +1043,7 @@ pub fn bi_trade<const OPEN: bool, const F: u8>(
     Ok(())
 }
 
-fn read_fld(t: &TradeRec, fld: u8) -> Raw {
+fn read_fld(t: &TradeRec, fld: u8, x: Fmt) -> Raw {
     const EP: u8 = Fld::EntryPrice as u8;
     const XP: u8 = Fld::ExitPrice as u8;
     const EB: u8 = Fld::EntryBar as u8;
@@ -895,26 +1061,26 @@ fn read_fld(t: &TradeRec, fld: u8) -> Raw {
     const RP: u8 = Fld::MaxRunupPct as u8;
     const DP: u8 = Fld::MaxDrawdownPct as u8;
     // The percent accessors' base: entry price × |quantity| — the reference's formula taken
-    // literally, no point value (`pin:04-trade-pct-provisional`, operator ruling 2026-10-16);
-    // a zero base → na.
-    let base = scale::from_1e6(t.entry_px_1e6) * scale::from_1e6(t.qty_1e6).abs();
+    // literally, no point value (`pin:04-trade-pct-provisional`, operator ruling 2026-10-16),
+    // over the values `entry_price` / `size` read (r33f's formations); a zero base → na.
+    let base = px_f64(t.entry_px_1e6, x.mt_1e6) * qty_f64(t.qty_1e6).abs();
     let bar = |b: u32| Raw::V(Val::I(if b == u32::MAX { None } else { Some(b as i64) }));
     let ms = |m: i64| Raw::V(Val::I(if m == 0 { None } else { Some(m) }));
     match fld {
-        EP => Raw::V(Val::F(nz_px(t.entry_px_1e6))),
-        XP => Raw::V(Val::F(nz_px(t.exit_px_1e6))),
+        EP => Raw::V(Val::F(nz_px(t.entry_px_1e6, x.mt_1e6))),
+        XP => Raw::V(Val::F(nz_px(t.exit_px_1e6, x.mt_1e6))),
         EB => bar(t.entry_bar),
         XB => bar(t.exit_bar),
         ET => ms(t.entry_ms),
         XT => ms(t.exit_ms),
-        SZ => Raw::V(Val::F(scale::from_1e6(t.qty_1e6))),
-        PR => Raw::V(Val::F(scale::from_1e12(t.pnl_1e12))),
+        SZ => Raw::V(Val::F(qty_f64(t.qty_1e6))),
+        PR => Raw::V(Val::F(profit_f64(t, x))),
         CM => Raw::V(Val::F(scale::from_1e12(t.fee_1e12))),
         RU => Raw::V(Val::F(scale::from_1e6(t.max_runup_1e6))),
         DD => Raw::V(Val::F(scale::from_1e6(t.max_drawdown_1e6))),
         EI => Raw::S(t.entry_sym),
         XI => Raw::S(t.exit_sym),
-        PP => Raw::V(Val::F(pct(scale::from_1e12(t.pnl_1e12), base))),
+        PP => Raw::V(Val::F(pct(profit_f64(t, x), base))),
         RP => Raw::V(Val::F(pct(scale::from_1e6(t.max_runup_1e6), base))),
         DP => Raw::V(Val::F(pct(scale::from_1e6(t.max_drawdown_1e6), base))),
         _ => Raw::Na, // comments are not carried

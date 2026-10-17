@@ -319,7 +319,7 @@ fn immediately_close_at_an_intrabar_execution_fills_at_that_tick() {
 }
 
 #[test]
-fn an_order_born_intrabar_waits_for_the_next_segment() {
+fn an_order_born_at_a_point_execution_fills_at_that_point() {
     let mut b = broker(decl_flag::CALC_ON_ORDER_FILLS);
     run_bar(
         &mut b,
@@ -328,8 +328,9 @@ fn an_order_born_intrabar_waits_for_the_next_segment() {
     );
     let mut step = b.open_bar(&bar(1, 100, 102, 99, 101));
     assert!(matches!(step, TvStep::Evaluate { intrabar: true, .. }));
-    // A market close born at that execution is not tried again at the open's tick
-    // (`cof_next_tick = NextPoint`): it fills at the next path point, the low (99).
+    // `pin:05-cof-next-tick` (r33d, `SamePoint`; TV E016 / E031 / E105): the execution is at a
+    // path point (the open's fill), so a market close born there fills at that point (100), not
+    // at the next one (the low, 99 — the reading before r33d).
     let close = OrderIntent {
         kind: IntentKind::Close,
         from_entry: StrKey(1),
@@ -339,11 +340,12 @@ fn an_order_born_intrabar_waits_for_the_next_segment() {
     while let TvStep::Evaluate { .. } = step {
         step = b.submit(&[]).unwrap_or_else(|e| panic!("{e:?}"));
     }
-    assert_eq!(b.closed_trade(0).map(|t| t.exit_px_1e6), Some(99 * E));
+    assert_eq!(b.closed_trade(0).map(|t| t.exit_px_1e6), Some(100 * E));
 }
 
 #[test]
-fn a_drawdown_trip_flattens_at_the_detecting_tick_and_halts() {
+fn a_drawdown_trip_on_the_closed_equity_halts_for_good() {
+    // `pin:U10-risk-rules` (r33d, TV E091): `max_drawdown` measures the closed equity.
     let mut m = meta(0);
     m.decl.risk.max_drawdown_1e6 = 2 * E;
     let cfg = TvCfg {
@@ -357,23 +359,28 @@ fn a_drawdown_trip_flattens_at_the_detecting_tick_and_halts() {
         &bar(0, 100, 101, 99, 100),
         &[entry(1, IntentSide::Long)],
     );
-    // Path 100 → 101 → 97 → 98: the mark at 97 is 4 below the 101 peak (≥ 2): flatten at 97.
-    run_bar(
-        &mut b,
-        &bar(1, 100, 101, 97, 98),
-        &[entry(1, IntentSide::Long)],
-    );
+    // Path 100 → 101 → 97 → 98: an open drawdown of 4 from the 101 mark trips nothing.
+    let close = OrderIntent {
+        kind: IntentKind::Close,
+        from_entry: StrKey(1),
+        ..OrderIntent::default()
+    };
+    run_bar(&mut b, &bar(1, 100, 101, 97, 98), &[close]);
+    assert_eq!(b.counters().risk_trips_drawdown, 0);
+    assert_eq!(b.view().position_size_1e6, E);
+    // The close fills at bar 2's open, 97: the closed equity is 3 below its peak — the trip.
+    run_bar(&mut b, &bar(2, 97, 98, 96, 97), &[]);
     let c = b.closed_trade(0).copied().unwrap_or_default();
     assert_eq!(c.exit_px_1e6, 97 * E);
-    assert_ne!(c.flags & pine_ir::trade_flag::RISK_FLATTEN, 0);
+    assert_eq!(c.flags & pine_ir::trade_flag::RISK_FLATTEN, 0);
     assert_eq!(b.counters().risk_trips_drawdown, 1);
     // Halted for good: the re-emitted entry is not committed.
     run_bar(
         &mut b,
-        &bar(2, 100, 101, 99, 100),
+        &bar(3, 100, 101, 99, 100),
         &[entry(1, IntentSide::Long)],
     );
-    run_bar(&mut b, &bar(3, 100, 101, 99, 100), &[]);
+    run_bar(&mut b, &bar(4, 100, 101, 99, 100), &[]);
     assert_eq!(b.view().position_size_1e6, 0);
 }
 

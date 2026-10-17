@@ -291,11 +291,6 @@ impl Book {
         self.view.margin_liquidation_price_1e6 = px_1e6;
     }
 
-    /// Peak equity ×1e12 sampled so far (§4.6.3).
-    pub(crate) fn peak_equity_1e12(&self) -> i128 {
-        self.peak_equity_1e12
-    }
-
     /// Commission paid ×1e12.
     pub(crate) fn commission_1e12(&self) -> i128 {
         self.commission_1e12
@@ -538,7 +533,17 @@ impl Book {
             self.max_held_short_1e6 = self.max_held_short_1e6.max(ap);
         }
         // INCREMENT: §4.6.2 line 9 (exit sets) lands with `exit.rs` (T8).
-        self.mark(px_1e6);
+        // `pin:05-trade-excursion` (r33d): the trade this fill opens takes no excursion sample at
+        // its own entry fill — its first is the next tick (TV E061 trades 21 / 31 / 43: stop entries
+        // filled inside a segment, the price never back through them — drawdown 0, not the 1 USD
+        // entry fee; E062 trade 156: a market entry at an open that is also the low — the low's
+        // tick gives −1, the fee).
+        let fresh = if open > 0 {
+            self.slot(usize::from(self.n) - 1)
+        } else {
+            usize::MAX
+        };
+        self.mark_skip(px_1e6, fresh);
         Ok(())
     }
 
@@ -564,6 +569,12 @@ impl Book {
 
     /// Re-price every open trade at `px` and roll equity, drawdown and run-up (§4.6.3).
     pub(crate) fn mark(&mut self, px_1e6: i64) {
+        self.mark_skip(px_1e6, usize::MAX);
+    }
+
+    /// [`Self::mark`], the lot in slot `skip` re-priced but not sampled for its excursion (the
+    /// trade a fill just opened; `usize::MAX`: none).
+    fn mark_skip(&mut self, px_1e6: i64, skip: usize) {
         let n = usize::from(self.n);
         let pv = self.pv_1e6;
         let mut open = 0_i128;
@@ -574,18 +585,20 @@ impl Book {
             let a = i128::from(l.qty_1e6).abs();
             let gross = gross_1e12(sgn(l.qty_1e6), px_1e6, l.entry_px_1e6, a, pv);
             l.pnl_1e12 = gross.saturating_sub(l.fee_1e12);
-            // `pin:05-trade-excursion`: sampled on the open-profit basis (net of the entry fee).
-            let o = l.pnl_1e12;
-            l.max_runup_1e6 = l.max_runup_1e6.max(e12_to_1e6_floor(o.max(0)));
-            l.max_drawdown_1e6 = l.max_drawdown_1e6.max(e12_to_1e6_ceil((-o).max(0)));
             open = open.saturating_add(l.pnl_1e12);
-            let (ru, dd, e, q) = (
-                l.max_runup_1e6,
-                l.max_drawdown_1e6,
-                l.entry_px_1e6,
-                l.qty_1e6,
-            );
-            self.roll_trade_pcts(ru, dd, e, q);
+            if s != skip {
+                // `pin:05-trade-excursion`: sampled on the open-profit basis (net of the entry fee).
+                let o = l.pnl_1e12;
+                l.max_runup_1e6 = l.max_runup_1e6.max(e12_to_1e6_floor(o.max(0)));
+                l.max_drawdown_1e6 = l.max_drawdown_1e6.max(e12_to_1e6_ceil((-o).max(0)));
+                let (ru, dd, e, q) = (
+                    l.max_runup_1e6,
+                    l.max_drawdown_1e6,
+                    l.entry_px_1e6,
+                    l.qty_1e6,
+                );
+                self.roll_trade_pcts(ru, dd, e, q);
+            }
             i += 1;
         }
         self.mark_1e6 = px_1e6;
@@ -627,10 +640,16 @@ impl Book {
             .saturating_add(self.openprofit_1e12)
     }
 
-    /// O(1) refresh from the running aggregates (§4.6.4). `margin_liquidation_price_1e6` is the
-    /// TV margin module's (§4.9.3) and is left as it is.
+    /// Refresh from the running aggregates and the open trades' fees (§4.6.4).
+    /// `margin_liquidation_price_1e6` is the TV margin module's (§4.9.3) and is left as it is.
     fn refresh_view(&mut self) {
         let eq = self.equity_1e12();
+        let mut open_fees = 0_i128;
+        let mut i = 0;
+        while i < usize::from(self.n) {
+            open_fees = open_fees.saturating_add(self.lots[self.slot(i)].fee_1e12);
+            i += 1;
+        }
         let entry_name = if self.n == 0 {
             StrKey::NONE
         } else {
@@ -650,8 +669,14 @@ impl Book {
         v.eventrades = self.eventrades;
         v.closed_retained = self.closed.len();
         v.equity_1e12 = eq;
-        v.netprofit_1e12 = self.netprofit_1e12;
-        v.openprofit_1e12 = self.openprofit_1e12;
+        // `pin:05-openprofit-fees` (r33d, shared with native): an open trade's entry fee is paid —
+        // `strategy.netprofit` carries it from the entry fill and `strategy.openprofit` is the open
+        // trades' gross profit; equity is unchanged. TV E114: one long at 77249.6, 0.1 % commission,
+        // close 76964.3 → openprofit −285.3 (gross), equity 999 637.4504 (fee 77.2496 paid); E062's
+        // cumulative P&L after trade 1 of 7 closed at once is −1602.94: its −1596.94 and the six
+        // still-open trades' 1 USD entry fees.
+        v.netprofit_1e12 = self.netprofit_1e12.saturating_sub(open_fees);
+        v.openprofit_1e12 = self.openprofit_1e12.saturating_add(open_fees);
         v.grossprofit_1e12 = self.grossprofit_1e12;
         v.grossloss_1e12 = self.grossloss_1e12;
         v.initial_capital_1e12 = self.initial_1e12;
@@ -713,10 +738,12 @@ mod tests {
         let v = b.view();
         let mut sum = 0_i64;
         let mut fees = 0_i128;
+        let mut open_fees = 0_i128;
         let mut i = 0;
         while let Some(t) = b.open_trade(i) {
             sum += t.qty_1e6;
             fees += t.fee_1e12;
+            open_fees += t.fee_1e12;
             assert_eq!(t.flags, trade_flag::OPEN | trade_flag::PNL_NET);
             i += 1;
         }
@@ -735,8 +762,10 @@ mod tests {
             v.equity_1e12,
             v.initial_capital_1e12 + v.netprofit_1e12 + v.openprofit_1e12
         );
+        // I9 on the closed trades: the view's `netprofit` also carries the open trades' paid entry
+        // fees (`pin:05-openprofit-fees`, r33d).
         assert_eq!(
-            v.netprofit_1e12,
+            v.netprofit_1e12 + open_fees,
             v.grossprofit_1e12 - v.grossloss_1e12,
             "I9"
         );
@@ -893,12 +922,14 @@ mod tests {
             .unwrap();
         b.mark(px(90));
         let v = *b.view();
-        // Open profit is net of the entry fee (`pin:05-openprofit-fees`).
+        // `pin:05-openprofit-fees` (r33d, TV E114): open profit is gross; the paid entry fee is in
+        // `netprofit`; equity carries it once.
+        assert_eq!(v.openprofit_1e12, value_1e12(-px(10), qty(2), PV));
+        assert_eq!(v.netprofit_1e12, -1_000_000_000_000);
         assert_eq!(
-            v.openprofit_1e12,
-            value_1e12(-px(10), qty(2), PV) - 1_000_000_000_000
+            v.equity_1e12,
+            v.initial_capital_1e12 + value_1e12(-px(10), qty(2), PV) - 1_000_000_000_000
         );
-        assert_eq!(v.equity_1e12, v.initial_capital_1e12 + v.openprofit_1e12);
         assert_eq!(v.max_drawdown_1e12, 21 * 1_000_000_000_000);
         check(&b);
     }

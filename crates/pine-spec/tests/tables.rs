@@ -548,7 +548,7 @@ const TYPES: &[&str] = &["__types"];
 
 /// impl-04 §3.4's families: (namespace, name, synthetic parameters in order). `new_*` stands for
 /// every `array.new_<type>` entry.
-const FAMILIES: [(&str, &str, &[&str]); 26] = [
+const FAMILIES: [(&str, &str, &[&str]); 27] = [
     ("", "plot", PLOT),
     ("", "plotshape", PLOT),
     ("", "plotchar", PLOT),
@@ -571,6 +571,8 @@ const FAMILIES: [(&str, &str, &[&str]); 26] = [
     ("map", "keys", COLL),
     ("map", "values", COLL),
     ("str", "split", COLL),
+    // r33c (B112): `ta.pivot_point_levels` returns a new `array<float>` — a collection creator.
+    ("ta", "pivot_point_levels", COLL),
     ("str", "format", TYPES),
     ("log", "info", TYPES),
     ("log", "warning", TYPES),

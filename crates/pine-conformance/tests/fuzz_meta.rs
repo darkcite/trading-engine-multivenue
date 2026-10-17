@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use pine_conformance::fuzz::ast::{self, Expr, HistRef, Program, Stmt};
 use pine_conformance::fuzz::diff::{Harness, Interleaved, ModeVsMode};
 use pine_conformance::fuzz::grammar::{
-    alphabet, alphabet_for, FUZZ_ADMIT_V2, FUZZ_DENY, FUZZ_DENY_NS, FUZZ_SERVED_V3,
+    alphabet, alphabet_for, FUZZ_ADMIT_V2, FUZZ_DENY, FUZZ_DENY_NS, FUZZ_SERVED_V3, FUZZ_SERVED_V4,
 };
 use pine_conformance::fuzz::{
     generate, shrink, GrammarConfig, Predicate, Profile, ShrinkBudget, Signature, GRAMMAR_VERSION,
@@ -117,7 +117,6 @@ fn grammar_2_seeds_are_byte_identical_under_grammar_3() {
 fn grammar_3_admits_the_rows_served_in_r27b() {
     for d in [Dialect::V5, Dialect::V6] {
         let c = cfg(d);
-        assert_eq!(c.grammar_version, 3);
         let ovs = |v: u16| -> Vec<u16> {
             alphabet_for(v, d, c.active_tiers)
                 .iter()
@@ -144,12 +143,56 @@ fn grammar_3_admits_the_rows_served_in_r27b() {
 const GRAMMAR_3_SAMPLE_SHA256: &str =
     "80b5a03a73c8c6515bc9487034e5c8332a5892e92ec2fada3b73a92fbc994713";
 
-/// §4.8.5 for grammar 3: its programs stay byte-identical while the alphabet's tiers stand.
+/// §4.8.5 for grammar 3: its programs stay byte-identical while the alphabet's tiers stand —
+/// pine-std's r33c rows grow only grammar 4's alphabet (`FUZZ_SERVED_V4`).
 #[test]
 fn grammar_3_seeds_are_byte_identical() {
     let got = grammar_sample_digest(3);
     println!("grammar-3 sample digest {got}");
     assert_eq!(got, GRAMMAR_3_SAMPLE_SHA256);
+}
+
+/// Grammar 4 (r33c): exactly the rows pine-std began serving join; grammars 1–3 never draw them,
+/// and grammar 4's alphabet is grammar 3's plus those rows, in overload order.
+#[test]
+fn grammar_4_admits_the_rows_served_in_r33c() {
+    assert_eq!(GRAMMAR_VERSION, 4);
+    for d in [Dialect::V5, Dialect::V6] {
+        let c = cfg(d);
+        assert_eq!(c.grammar_version, 4);
+        let ovs = |v: u16| -> Vec<u16> {
+            alphabet_for(v, d, c.active_tiers)
+                .iter()
+                .map(|b| b.ov)
+                .collect()
+        };
+        let (v3, v4) = (ovs(3), ovs(4));
+        let mut want = v3.clone();
+        for o in FUZZ_SERVED_V4 {
+            assert!(!v3.contains(&o.0), "{o:?} before grammar 4");
+            // A row outside the configured tiers / dialect stays out of grammar 4 too.
+            let ov = &pine_spec::OVERLOADS[o.0 as usize];
+            let e = &pine_spec::ENTRIES[ov.entry as usize];
+            if e.tier.bit() & c.active_tiers != 0 && ov.versions.has(d) && e.versions.has(d) {
+                assert!(v4.contains(&o.0), "{o:?} missing from grammar 4");
+                want.push(o.0);
+            }
+        }
+        want.sort_unstable();
+        assert_eq!(v4, want);
+    }
+}
+
+/// The grammar-4 sample digest, the same sample: recorded at r33 (2026-10-18).
+const GRAMMAR_4_SAMPLE_SHA256: &str =
+    "9d8f2d7b25ac24d62f69f6f66493838547ee427a642fb7958c130800cd7447c4";
+
+/// §4.8.5 for grammar 4.
+#[test]
+fn grammar_4_seeds_are_byte_identical() {
+    let got = grammar_sample_digest(4);
+    println!("grammar-4 sample digest {got}");
+    assert_eq!(got, GRAMMAR_4_SAMPLE_SHA256);
 }
 
 /// Counts `input` calls in `e`, asserting each takes one literal `defval`.
