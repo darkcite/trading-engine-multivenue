@@ -113,6 +113,37 @@ fn security_currency_conversion_is_refused() {
     assert_eq!(run(s), vec![3053]);
 }
 
+/// impl-06 D062 (impl-02 §3.2 row 53, CAR-02-1): `request.currency_rate` of two constant,
+/// byte-different currencies is `3053` in either dialect; byte-equal ones are pine-std's `1.0`.
+#[test]
+fn security_currency_rate_of_two_constants_is_refused() {
+    let d062 = "h_D062 = request.currency_rate(currency.USD, currency.EUR)\n\
+                plot(na(h_D062) ? 1 : 0, \"f_D062_isna\", display = display.data_window)\n\
+                plot(na(h_D062) ? na : h_D062, \"f_D062_val\", display = display.data_window)\n";
+    for d in [Dialect::V5, Dialect::V6] {
+        let r = compile_src(
+            &format!("//@version={}\nindicator(\"D062\")\n{d062}", d as u8),
+            &default_opts(d, ExecMode::BarClose),
+        );
+        if let Err(ds) = &r {
+            for x in ds {
+                eprintln!("v{}: {} {}", d as u8, x.code.0, x.msg);
+            }
+        }
+        assert_eq!(codes(&r), vec![3053], "v{}", d as u8);
+    }
+    assert_eq!(
+        run("plot(request.currency_rate(\"USD\", currency.EUR, true))\n"),
+        vec![3053]
+    );
+    // §4.11: otherwise an ordinary call, emitted and verified (byte-equal constants, a dynamic
+    // argument).
+    let same = "plot(request.currency_rate(currency.USD, \"USD\"))\n";
+    assert_eq!(run(same), vec![common::ACCEPTED]);
+    let dynamic = "c = close > open ? \"USD\" : \"EUR\"\nplot(request.currency_rate(c, \"USD\"))\n";
+    assert_eq!(run(dynamic), vec![common::ACCEPTED]);
+}
+
 #[test]
 fn security_calc_bars_count_is_refused() {
     let s = "plot(request.security(syminfo.tickerid, \"D\", close, calc_bars_count = 50))\n";

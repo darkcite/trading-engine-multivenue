@@ -233,6 +233,9 @@ struct Infer<'a, 's> {
     assigned: HashMap<u32, Qual>,
     tuples: Vec<Vec<TypeQ>>,
     insts: Vec<Inst>,
+    /// TypeInsts whose body's result was already refused (`3012` inside, …): a call of one is
+    /// `bad` too, so no site downstream refuses its `void` a second time.
+    bad_insts: Vec<u32>,
     keys: HashMap<(usize, u32, Vec<TypeQ>), u32>,
     stack: Vec<(usize, NodeId)>,
     cur: Frame,
@@ -294,6 +297,7 @@ impl<'a, 's> Infer<'a, 's> {
             assigned: HashMap::new(),
             tuples: Vec::new(),
             insts: Vec::new(),
+            bad_insts: Vec::new(),
             keys: HashMap::new(),
             stack: Vec::new(),
             cur: Frame::default(),
@@ -1535,7 +1539,14 @@ impl<'a, 's> Infer<'a, 's> {
                 Node::NamedArg { name, value } => (Some(ast.sym(name)), value),
                 _ => (None, a),
             };
-            let e = self.expr(value);
+            let mut e = self.expr(value);
+            if !e.bad && e.no_value() && e.tup.is_none() {
+                // pin:02-once-is-void — a `void` call (a function ending in `once`, a builtin
+                // with no result) passed as an argument carries no value: `3007` here, before
+                // `conv` reads it as the untyped `na`. A tuple keeps its own rules (`TUPLE_OK`).
+                let msg = "an argument has no value (a `void` call)".to_owned();
+                e = self.refuse(ReasonCode::TypeMismatch, ast.span(value), msg);
+            }
             bad |= e.bad;
             let tuple_elem = match e.tup {
                 Some(i) => {
@@ -2071,6 +2082,9 @@ impl<'a, 's> Infer<'a, 's> {
             }
         };
         self.cur.calls.push((n, Callee::User(inst)));
+        if self.bad_insts.contains(&inst) {
+            return Ok(Ex::bad());
+        }
         let r = &self.insts[inst as usize];
         if r.ret_tuple.is_empty() {
             Ok(Ex::of(r.ret, None))
@@ -2118,7 +2132,11 @@ impl<'a, 's> Infer<'a, 's> {
         } else {
             ret
         };
+        let bad = ret.bad;
         let i = self.finish_inst(Some(d), key, ret);
+        if bad {
+            self.bad_insts.push(i);
+        }
         self.cur = saved;
         self.cond = saved_cond;
         self.top = saved_top;

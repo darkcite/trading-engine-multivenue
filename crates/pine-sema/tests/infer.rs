@@ -325,3 +325,21 @@ fn infer_once_is_void_assigning_its_call_is_3007() {
         refused(V6, &format!("{ONCE_TAIL}{tail}"), 3007);
     }
 }
+
+/// `pin:02-once-is-void`: a `void` call passed as an argument — positional or named, to a builtin,
+/// a user function, a UDT constructor or a method — carries no value: `3007` at argument binding
+/// (`conv` would read the `void` as the untyped `na`).
+#[test]
+fn infer_once_is_void_call_as_argument_is_3007() {
+    for tail in [
+        "plot(f())\n",
+        "plot(series = f())\n",
+        "plot(math.abs(f()))\n",
+        "g(x) => x\nplot(g(f()))\n",
+        "type P\n    float v = 0.0\np = P.new(f())\nplot(p.v)\n",
+        "a = array.new<float>()\narray.push(a, f())\nplot(close)\n",
+        "a = array.new<float>()\na.push(f())\nplot(close)\n",
+    ] {
+        refused(V6, &format!("{ONCE_TAIL}{tail}"), 3007);
+    }
+}

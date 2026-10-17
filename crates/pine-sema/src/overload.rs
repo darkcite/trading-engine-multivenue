@@ -485,6 +485,33 @@ pub(crate) fn builtin(
             rets: results(ov, &vars, j),
         });
     }
+    // pin:02-na-v6-non-bool — W13 (contract §3.17, the v6 migration guide: "the na(), nz(), and
+    // fixnan() functions no longer accept 'bool' types") is the only change to `na()` between the
+    // dialects. The v6 reference's argument list (pine-spec's v6 rows) omits UDTs, enums and
+    // `chart.point`, a change the migration guide does not list, so it is invariant (impl-06
+    // §4.2.0; C030 is `dialects 56`, I9): in v6, v5's generic row still takes every non-`bool`
+    // argument no v6 row takes. A `bool` keeps step 8's `3005` (A087).
+    if d == Dialect::V6
+        && e.ns.as_str().is_empty()
+        && e.name.as_str() == "na"
+        && args.first().is_some_and(|a| a.t.ty != Ty::Bool)
+    {
+        for ov in removed.iter().copied() {
+            if !ov.versions.has(Dialect::V5) {
+                continue;
+            }
+            // The row binds as v5 binds it (its parameter rows are v5's); a non-`bool` argument
+            // converts the same in both dialects.
+            if let Ok((_, b, vars, j)) = try_overload(ov, args, targs, Dialect::V5, rd, syms) {
+                after_pick(e, ov, &b.slots, args, at, syms)?;
+                return Ok(Picked {
+                    ov: ov.id,
+                    bound: b.slots,
+                    rets: results(ov, &vars, j),
+                });
+            }
+        }
+    }
     // Step 8: an overload of the other dialect that would pass is `3005`.
     let other = match d {
         Dialect::V5 => Dialect::V6,

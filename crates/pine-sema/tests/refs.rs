@@ -70,6 +70,35 @@ fn refs_fresh_object_into_var_is_escape() {
     assert_eq!(run(&s), vec![3047]);
 }
 
+/// impl-06 C030's generated body, verbatim (SYN-1 + `var Pt o = na` assigned on bar 3, read
+/// through `na(o)`): `dialects 56`, `refuse 3047` — the same code in v5 and v6 (I9).
+const C030_BODY: &str = "var float _s = 1.0\nvar int   _n = 0\n_n := _n + 1\n\
+_hi = math.floor(_s / 127773.0)\n_lo = _s - _hi * 127773.0\n_t  = 16807.0 * _lo - 2836.0 * _hi\n\
+_s := _t > 0.0 ? _t : _t + 2147483647.0\n\
+syn   = 1000.0 + (_s - math.floor(_s / 100000.0) * 100000.0) / 100.0\n\
+syni  = int(_s - math.floor(_s / 1000.0) * 1000.0)\nsynb  = syni >= 500\n\
+synna = syni < 100 ? na : syn\ntype Pt_C030\n    int x_C030\nvar Pt_C030 o_C030 = na\n\
+if _n == 3\n    o_C030 := Pt_C030.new(7)\n\
+plot(na(o_C030) ? 1 : 0, \"f_C030_isna\", display = display.data_window)\n\
+plot(na(o_C030) ? na : o_C030.x_C030, \"f_C030_val\", display = display.data_window)\n";
+
+#[test]
+fn refs_c030_fixture_is_escape_in_both_dialects() {
+    for d in [Dialect::V5, Dialect::V6] {
+        let src = format!(
+            "//@version={}\nindicator(\"C030\", overlay = false)\n{C030_BODY}",
+            d as u8
+        );
+        let r = compile_src(&src, &default_opts(d, ExecMode::BarClose));
+        if let Err(ds) = &r {
+            for x in ds {
+                eprintln!("v{}: {} {}", d as u8, x.code.0, x.msg);
+            }
+        }
+        assert_eq!(codes(&r), vec![3047], "v{}", d as u8);
+    }
+}
+
 /// impl-06 C026: a creation inside a helper called from a `var` initialiser is fresh.
 #[test]
 fn refs_helper_created_object_into_var_is_escape() {

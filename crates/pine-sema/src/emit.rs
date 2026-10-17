@@ -70,7 +70,12 @@ fn prep_block(ir: &mut Ir, syms: &mut SymTable, b: &mut Block, d: Dialect) -> Re
         match &mut s {
             Stmt::Op(Op::Call { ov, args, span, .. }) => {
                 let o = pine_spec::overload(*ov);
-                if o.sx & pine_spec::sx::REQUEST != 0 && !crate::security::is_security(*ov) {
+                // §4.11: `request.currency_rate` is an ordinary call served by pine-std (pass 3
+                // refused two different constants, `3053`).
+                if o.sx & pine_spec::sx::REQUEST != 0
+                    && !crate::security::is_security(*ov)
+                    && *ov != pine_spec::ov::REQUEST_CURRENCY_RATE
+                {
                     return Err(not_yet("a `request.*` sub-program (T21–T23)", *span));
                 }
                 time_bars_back(ir, o, args, d, *span)?;

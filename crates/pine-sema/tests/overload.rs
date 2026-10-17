@@ -52,6 +52,23 @@ fn overload_dialect_filter_reports_not_in_dialect() {
     accepted(V5, "b = true\nx = nz(b, false)\nplot(close)\n");
 }
 
+/// `pin:02-na-v6-non-bool`: W13 removes only `bool` from v6's `na()`, so a UDT or enum argument
+/// (absent from the v6 reference's list) takes v5's generic row in both dialects; `na(bool)` in v6
+/// stays `3005` (impl-06 A087).
+#[test]
+fn overload_na_v6_takes_non_bool_through_generic_row() {
+    let udt = "type P\n    float v = 0.0\nvar P p = na\nplot(na(p) ? 1 : 0)\n";
+    let en = "enum E\n    a\n    b\nE e = na\nplot(na(e) ? 1 : 0)\n";
+    for d in [V5, V6] {
+        for body in [udt, en] {
+            let c = run(d, body);
+            assert_eq!(c, vec![ACCEPTED], "v{}: {body}", d as u8);
+        }
+    }
+    let ds = diags(run_with(V6, "bool b = true\nplot(na(b) ? 1 : 0)\n", 0b0111));
+    assert_eq!(ds[0].code.0, 3005, "{ds:?}");
+}
+
 #[test]
 fn overload_tier_filter_reports_deferred_builtin() {
     let ds = diags(run_with(

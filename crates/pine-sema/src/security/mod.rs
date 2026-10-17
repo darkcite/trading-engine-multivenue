@@ -62,6 +62,10 @@ pub(crate) fn check(
             let Callee::Builtin(ov) = callee else {
                 continue;
             };
+            if ov == pine_spec::ov::REQUEST_CURRENCY_RATE {
+                currency_rate(ast, inst, n, ov, syms, diags);
+                continue;
+            }
             if !is_security(ov) {
                 continue;
             }
@@ -125,6 +129,36 @@ fn path(ast: &Ast, syms: &SymTable, n: NodeId) -> Option<String> {
             Some(format!("{b}.{}", syms.resolve(ast.sym(member))))
         }
         _ => None,
+    }
+}
+
+/// `request.currency_rate(from, to)` with two constant, byte-different currencies is `3053`
+/// (impl-02 §3.2 row 53, CAR-02-1: the engine has no FX source; impl-06 D062). Anything else is
+/// an ordinary call (§4.11): pine-std's `1.0` for byte-equal strings, else `na` (impl-04 §4.14).
+fn currency_rate(
+    ast: &Ast,
+    inst: &Inst,
+    n: NodeId,
+    ov: pine_ir::OverloadId,
+    syms: &SymTable,
+    diags: &mut Vec<Diag>,
+) {
+    let args = bound_args(ast, inst, n, ov);
+    let text = |name: &str| {
+        args.iter()
+            .find(|a| a.name == name)
+            .and_then(|a| match a.k {
+                Some(K::Str(s)) => Some(syms.resolve(s)),
+                _ => None,
+            })
+    };
+    if let (Some(from), Some(to)) = (text("from"), text("to")) {
+        if from != to {
+            let msg = format!(
+                "request.currency_rate(\"{from}\", \"{to}\"): no currency conversion source"
+            );
+            diags.push(diag(ReasonCode::CurrencyConversion, ast.span(n), msg));
+        }
     }
 }
 
