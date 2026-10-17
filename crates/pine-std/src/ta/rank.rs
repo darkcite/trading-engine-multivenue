@@ -270,8 +270,8 @@ pub fn bi_ta_median_i(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(
 /// ([`linear`], `pin:04-percentile-linear-c-half`; TV F104: rows 13, 14 → 1275.44, row 15 →
 /// 1225.03, and B096) over the newest `length` **executions**: the
 /// reference's remark "`na` values in the `source` series are included in calculations and will
-/// produce an `na` result" is followed, although pine-spec's row says `na: skip`
-/// (`pin:04-percentile-linear-na`; a pine-spec request to make the row `propagate`).
+/// produce an `na` result" is followed — pine-spec's row is `na: propagate`
+/// (`pin:04-percentile-linear-na`).
 pub fn bi_ta_percentile_linear_interpolation(
     f: &mut Frame<'_>,
     site: SiteId,

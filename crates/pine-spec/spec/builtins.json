@@ -507,7 +507,7 @@
       "normative": false,
       "source": "",
       "pin": "pin:U18-ta-na-propagation",
-      "doc": "the na column of every ta.* overload with a source argument: propagate for ta.change, ta.mom, ta.roc, ta.swma, ta.alma, ta.linreg, ta.percentrank; skip for the others (REVIEW 4.1 W5 note, unverified)"
+      "doc": "the na column of every ta.* overload with a source argument is the per-overload na field: custom for ta.ema, ta.rma, ta.wma, ta.hma, ta.percentrank (their bodies state the TradingView-fitted law, r33a: B010 B016 B022 B046 B052 B075); propagate for ta.change, ta.mom, ta.roc, ta.swma, ta.alma, ta.linreg, ta.percentile_linear_interpolation; skip for the others"
     },
     {
       "id": "rma_seed",
@@ -536,7 +536,7 @@
       "normative": true,
       "source": "https://www.tradingview.com/pine-script-docs/language/operators/ section Arithmetic operators",
       "pin": "pin:06-mod-sign",
-      "doc": "% on int and float is floored: a - b*floor(a / b), the sign of the divisor (-1 % 100 = 99), same in both dialects; F_MOD / I_MOD (CAR-06-1)"
+      "doc": "% on int and float is truncated (the sign of the dividend): I_MOD = checked_rem, F_MOD = fmod (-1 % 100 = -1), same in both dialects; TradingView F004 F039 F115 F116 (CAR-R31-1, which replaced CAR-06-1's floored reading; the id is kept for the ROWS test)"
     }
   ],
   "deltas": [
