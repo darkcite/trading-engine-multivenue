@@ -14,24 +14,30 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
-use cli::pine_boot::{build, finish_at_loop, DiscoveredFacts, PineFlags};
+use cli::pine_boot::{
+    build, finish_at_loop, warm as warm_bars, write_boot_record, DiscoveredFacts, PineFlags,
+};
 use cli::pine_metrics::{matcher_row, MATCHER_COLS};
 use cli::pine_tape::PineTapeWriter;
 use cli::pine_verify::{
-    check, dec_from_bytes, parse_set_tsv, pool, seq_from_bytes, verify_window, Elig, VerifyCtx,
-    WindowIn, WindowOut, EXCLUDED, EXIT_GREEN, EXIT_RED, EXIT_UNUSABLE,
+    check, dec_from_bytes, load_window, parse_set_tsv, pool, run as verify_run, seq_from_bytes,
+    verify_window, Elig, Loaded, VerifyCtx, VerifyOpts, WindowIn, WindowOut, EXCLUDED, EXIT_GREEN,
+    EXIT_RED, EXIT_UNUSABLE,
 };
 use clob_dispatcher::{OrderDispatch, PaperDispatcher};
+use core_io::{SlotCapture, SlotKind};
 use core_ring::{Producer, Ring};
 use core_time::{now_ns, WallAnchor};
 use core_types::{
     make_symbol_id, CancelReq, ChannelEvent, ChannelId, Fill, Order, Price, Qty, Side, Tick,
     VenueId,
 };
+use engine::ENGINE_ORDERS_FILE;
 use engine::{Engine, FILL_RING_SIZE, SIGNAL_RING_SIZE, TICK_RING_SIZE};
 use ingress_ai::AiIngressStatus;
 use ingress_hyperliquid::discovery::HlDiscovery;
 use pine_ir::{barflag, Bar};
+use pine_screen::bars::{bar_path, bar_source, write_bar_file};
 use strategy_core::{pine_tape, Ctx, SubmitErr};
 use strategy_pine::{PineBootCfg, WarmSlice};
 use strategy_set::{StrategySet, BIT_PINE};
@@ -40,8 +46,10 @@ const T0_MS: i64 = 1_767_225_600_000;
 const JUDGE_WAIT: Duration = Duration::from_millis(420);
 const HDR: &str =
     "// SPDX-License-Identifier: Apache-2.0\n// Copyright 2026 Anton (darkcite)\n//@version=6\n";
-/// Long above 100.5, short below 99.5, flat in between: entries, reversals and fills.
-const REVERSAL: &str = "strategy(\"v rev\", overlay = true)\nplot(close)\nif close > 100.5\n    strategy.entry(\"L\", strategy.long)\nelse if close < 99.5\n    strategy.entry(\"S\", strategy.short)\nelse\n    strategy.close_all()\n";
+/// Long above 100.5, short below 99.5, flat in between: entries, reversals and fills. The
+/// `close[1]` read gives the chart row a warm-up need (a script with no history reach wants no
+/// warm bars and boots cold), so the boot record carries a real chart-row warm digest.
+const REVERSAL: &str = "strategy(\"v rev\", overlay = true)\nplot(close)\nif close > 100.5 and close[1] > 0\n    strategy.entry(\"L\", strategy.long)\nelse if close < 99.5\n    strategy.entry(\"S\", strategy.short)\nelse\n    strategy.close_all()\n";
 
 fn btc() -> u32 {
     make_symbol_id(VenueId::Hyperliquid, 1)
@@ -137,6 +145,39 @@ struct Recorded {
     seq: Vec<strategy_core::PineSeqRec>,
     dec: Vec<strategy_core::PineTapeRec>,
     set: cli::pine_verify::SetTsv,
+    /// The tape directory (`<dir>/tape/<boot_utc_ms>`).
+    tape: PathBuf,
+    /// The run directory (`<dir>/capture/run-<epoch>`): `pine-boot.tsv`, `engine-orders.pmlr`.
+    run: PathBuf,
+}
+
+/// The run's epoch (`run-<epoch_ns>`).
+const RUN_EPOCH_NS: u64 = 1_767_225_590_000_000_000;
+
+/// The warm bars as a pine-screen bar file under `<dir>/bars` (what `--pine-bars` reads).
+fn write_bars(dir: &Path) {
+    let p = bar_path(&dir.join("bars"), "hyperliquid:btc", 60).expect("bar path");
+    std::fs::create_dir_all(p.parent().expect("parent")).expect("bars dir");
+    write_bar_file(
+        &p,
+        &warm()[0].bars,
+        60,
+        pine_ir::symbol_hash(b"hyperliquid:btc"),
+        VenueId::Hyperliquid as u8,
+        bar_source::CANDLES,
+        true,
+    )
+    .expect("bar file");
+}
+
+/// The loader's options for a recorded window.
+fn opts(r: &Recorded) -> VerifyOpts {
+    VerifyOpts {
+        capture: r.dir.join("capture"),
+        manifest_dir: r.dir.clone(),
+        exec: None,
+        bars_root: r.dir.join("bars"),
+    }
 }
 
 /// A G5-style run on the real engine loop with `--pine-tape`: reversals with paper fills.
@@ -149,8 +190,14 @@ fn record(tag: &str) -> Recorded {
     finish_at_loop(&mut cfg, anchor);
     let boot_ms = cfg.boot_utc_ms;
     let mut set = StrategySet::new(BIT_PINE);
-    set.pine_mut().configure(cfg).expect("configure");
-    set.pine_mut().supply_warm(warm()).expect("warm");
+    let needs = set.pine_mut().configure(cfg).expect("configure");
+    // The warm-up from the bar file, as the `run` boot reads it (its digest is recorded).
+    write_bars(&dir);
+    let (slices, cold) = warm_bars(&needs, &dir.join("bars"), boot_ms);
+    assert!(cold.is_empty(), "{cold:?}");
+    set.pine_mut().supply_warm(slices).expect("warm");
+    let run = dir.join("capture").join(format!("run-{RUN_EPOCH_NS}"));
+    std::fs::create_dir_all(&run).expect("run dir");
     let (mut tp, t0) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let tl: [_; 7] = core::array::from_fn(|_| Ring::<Tick, TICK_RING_SIZE>::new().split().1);
     type Ev = Ring<ChannelEvent, { core_types::EVENT_RING_SIZE }>;
@@ -179,7 +226,18 @@ fn record(tag: &str) -> Recorded {
             .split()
             .1,
     );
+    eng.set_order_capture(
+        SlotCapture::open(run.join(ENGINE_ORDERS_FILE), SlotKind::Order, RUN_EPOCH_NS)
+            .expect("orders capture"),
+    );
     eng.start().expect("on_start");
+    // R5: the boot record, as `PineHook::on_started` writes it.
+    let rec = eng
+        .strategy()
+        .pine()
+        .boot_record(RUN_EPOCH_NS, 1)
+        .expect("record");
+    write_boot_record(&run, &rec).expect("boot record");
     let wall_ms = |ts: u64| anchor.wall_of(ts) / 1_000_000;
     let quote = |tp: &mut Producer<Tick, TICK_RING_SIZE>| {
         let ts = now_ns();
@@ -230,7 +288,11 @@ fn record(tag: &str) -> Recorded {
     )
     .expect("set");
     let td = w.dir().to_path_buf();
+    // Drains the order capture into `engine-orders.pmlr` (rule 5's input).
+    eng.stop();
     Recorded {
+        tape: td.clone(),
+        run,
         seq: seq_from_bytes(&std::fs::read(td.join("seq.bin")).expect("seq")).expect("seq"),
         dec: dec_from_bytes(&std::fs::read(td.join("decisions.bin")).expect("dec")).expect("dec"),
         set: parse_set_tsv(&std::fs::read_to_string(td.join("set.tsv")).expect("set"))
@@ -243,11 +305,15 @@ fn window(r: &Recorded, label: &str) -> WindowIn {
     WindowIn {
         label: label.to_string(),
         cfg: boot_cfg(&r.dir, r.dir.join("manifest.toml")),
-        warm: warm(),
+        // The bar file the recorded boot warmed up from (re-read after `configure`).
+        warm: Vec::new(),
         seq: r.seq.clone(),
         dec: r.dec.clone(),
         set: r.set.clone(),
         ineligible: None,
+        record: None,
+        bars_root: Some(r.dir.join("bars")),
+        delivery: Vec::new(),
     }
 }
 
@@ -256,6 +322,9 @@ fn window(r: &Recorded, label: &str) -> WindowIn {
 fn verify_exact_replay_of_a_recorded_window_is_clean() {
     big(|| {
         let r = record("clean");
+        // The recorded boot warmed up from the bar file (BOOT_STATE `cold` = 0).
+        let st = r.dec.iter().find(|d| d.kind == pine_tape::BOOT_STATE);
+        assert_eq!(st.map(|d| d.a), Some(0), "warm boot: {st:?}");
         let w = verify_window(window(&r, "1767225600000"));
         assert_eq!(w.elig, Elig::Eligible, "{w:?}");
         assert_eq!(w.diffs, 0, "{:?}", w.first_diff);
@@ -462,4 +531,177 @@ fn check_mode_reports_the_refusal_code() {
         assert!(msg.contains("refused 6001"), "{msg}");
         let _ = std::fs::remove_dir_all(&dir);
     });
+}
+
+fn loaded(r: &Recorded, o: &VerifyOpts) -> Result<WindowIn, WindowOut> {
+    match load_window(&r.tape, o).expect("readable tapes") {
+        Loaded::Window(w) => Ok(*w),
+        Loaded::Out(w) => Err(w),
+    }
+}
+
+fn reason(w: &WindowOut) -> &str {
+    match &w.elig {
+        Elig::Ineligible(s) => s,
+        Elig::Eligible => panic!("eligible: {w:?}"),
+    }
+}
+
+fn bin(r: &Recorded) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_multivenue-engine"))
+        .arg("pine-verify")
+        .arg("--tape")
+        .arg(&r.tape)
+        .arg("--capture")
+        .arg(r.dir.join("capture"))
+        .arg("--manifest-dir")
+        .arg(&r.dir)
+        .arg("--pine-bars")
+        .arg(r.dir.join("bars"))
+        .output()
+        .expect("spawn")
+}
+
+/// I43 / I45 / I46 end to end through the command: the tape-directory loader rebuilds the boot
+/// from the run's boot record (facts, manifest by hash, warm bars re-read), the replay is clean;
+/// `multivenue-engine pine-verify` prints the `8g` line (one window is short of the pool: exit
+/// 2); one `px_1e6` + 1 on disk is exit 1 with the index printed.
+#[test]
+fn verify_command_replays_a_recorded_window_through_the_loader() {
+    big(|| {
+        let r = record("loader");
+        let o = opts(&r);
+        let w = loaded(&r, &o).expect("a window");
+        assert_eq!(w.cfg.symbols.len(), 1, "facts from the boot record");
+        assert_eq!(w.cfg.symbols[0].sym, btc());
+        assert!(w.ineligible.is_none(), "{:?}", w.ineligible);
+        let out = verify_window(w);
+        assert_eq!(out.elig, Elig::Eligible, "{out:?}");
+        assert_eq!(out.diffs, 0, "{:?}", out.first_diff);
+        assert!(out.orders >= 3 && out.fills >= 3, "{out:?}");
+        let (lines, code) = verify_run(std::slice::from_ref(&r.tape), &o);
+        assert_eq!(code, EXIT_UNUSABLE, "{lines:?}");
+        let last = lines.last().expect("8g line");
+        assert!(last.starts_with("8g windows=1 eligible=1 "), "{last}");
+        assert!(last.contains(" diffs=0 "), "{last}");
+        let p = bin(&r);
+        let stdout = String::from_utf8_lossy(&p.stdout).to_string();
+        assert_eq!(p.status.code(), Some(2), "{stdout}");
+        assert!(stdout.contains("8g windows=1 eligible=1 "), "{stdout}");
+        assert!(stdout.contains(" diffs=0 "), "{stdout}");
+        // I45 on disk: one DISPATCH record's px_1e6 + 1 → exit 1, the index printed.
+        let dpath = r.tape.join("decisions.bin");
+        let mut bytes = std::fs::read(&dpath).expect("dec");
+        let i = r
+            .dec
+            .iter()
+            .position(|d| d.kind == pine_tape::DISPATCH)
+            .expect("a dispatch");
+        let at = i * 64 + 16;
+        let px = i64::from_le_bytes(bytes[at..at + 8].try_into().expect("8")) + 1;
+        bytes[at..at + 8].copy_from_slice(&px.to_le_bytes());
+        std::fs::write(&dpath, &bytes).expect("mutate");
+        let p = bin(&r);
+        let stdout = String::from_utf8_lossy(&p.stdout).to_string();
+        assert_eq!(p.status.code(), Some(1), "{stdout}");
+        assert!(stdout.contains(&format!("decision {i}:")), "{stdout}");
+        // A torn tape is unreadable: exit 2.
+        std::fs::write(&dpath, &bytes[..bytes.len() - 1]).expect("tear");
+        assert_eq!(bin(&r).status.code(), Some(2));
+        let _ = std::fs::remove_dir_all(&r.dir);
+    });
+}
+
+/// pin:08-verify-queue-sym-ineligible: a pine symbol the paper queue law tracks (the record's
+/// `queue_syms`) makes the window ineligible; another queue symbol does not.
+#[test]
+fn verify_queue_tracked_pine_symbol_is_ineligible() {
+    big(|| {
+        let r = record("queue");
+        let o = opts(&r);
+        let p = r.run.join(strategy_pine::BOOT_RECORD_FILE);
+        let mut rec = strategy_pine::BootRecord::parse(&std::fs::read_to_string(&p).expect("rec"))
+            .expect("parse");
+        rec.queue_syms = vec![btc() + 1];
+        write_boot_record(&r.run, &rec).expect("write");
+        assert!(
+            loaded(&r, &o).is_ok(),
+            "another symbol's queue law is not slot 8's"
+        );
+        rec.queue_syms = vec![btc() + 1, btc()];
+        write_boot_record(&r.run, &rec).expect("write");
+        let w = inel(&r, &o);
+        assert!(reason(&w).contains("queue-tracked"), "{w:?}");
+        assert_eq!(pool(&[w]).exit, EXIT_UNUSABLE);
+        let _ = std::fs::remove_dir_all(&r.dir);
+    });
+}
+
+/// Rule 5 (another slot's order on a pine symbol; no `engine-orders.pmlr`) and rule 3 (the
+/// manifest, `exec.toml`, the bar files re-hashed against the boot record) make a window
+/// ineligible — listed, never red.
+#[test]
+fn verify_rules_3_and_5_make_windows_ineligible() {
+    big(|| {
+        let r = record("rules");
+        let o = opts(&r);
+        // Rule 5: a slot-6 order on BTC.
+        let orders = r.run.join(ENGINE_ORDERS_FILE);
+        std::fs::remove_file(&orders).expect("rm");
+        let mut cap =
+            SlotCapture::<Order>::open(&orders, SlotKind::Order, RUN_EPOCH_NS).expect("cap");
+        let mut foreign = order(Side::Bid, 101_000_000, 9, now_ns());
+        foreign.strategy_id = 6;
+        cap.append(&foreign);
+        cap.flush_all().expect("flush");
+        drop(cap);
+        let w = verify_window(loaded(&r, &o).expect("loaded"));
+        assert!(
+            reason(&w).contains("slot 6 ordered on pine symbol"),
+            "{w:?}"
+        );
+        std::fs::remove_file(&orders).expect("rm");
+        let w = verify_window(loaded(&r, &o).expect("loaded"));
+        assert!(reason(&w).contains("rule 5 cannot be shown"), "{w:?}");
+        // Rule 3, exec.toml: the boot had none, so any `--exec` is a changed input.
+        let mut ox = o.clone();
+        ox.exec = Some(r.dir.join("absent-exec.toml"));
+        assert!(reason(&inel(&r, &ox)).starts_with("inputs changed"));
+        // Rule 3, the bar file: one close moved → the chart-row warm digest differs (6013).
+        let mut bars = warm()[0].bars.clone();
+        bars[10].close_1e6 += 1;
+        let bp = bar_path(&r.dir.join("bars"), "hyperliquid:btc", 60).expect("bp");
+        write_bar_file(
+            &bp,
+            &bars,
+            60,
+            pine_ir::symbol_hash(b"hyperliquid:btc"),
+            VenueId::Hyperliquid as u8,
+            bar_source::CANDLES,
+            true,
+        )
+        .expect("bars");
+        let mut w = loaded(&r, &o).expect("loaded");
+        w.ineligible = None;
+        let w = verify_window(w);
+        assert!(
+            reason(&w).contains("inputs changed: warm-up refused"),
+            "{w:?}"
+        );
+        // Rule 3, the manifest: its bytes no longer hash to the record.
+        let mp = r.dir.join("manifest.toml");
+        let mut m = std::fs::read_to_string(&mp).expect("m");
+        m.push_str("# edited\n");
+        std::fs::write(&mp, m).expect("m");
+        let w = inel(&r, &o);
+        assert!(reason(&w).contains("no manifest"), "{w:?}");
+        let _ = std::fs::remove_dir_all(&r.dir);
+    });
+}
+
+fn inel(r: &Recorded, o: &VerifyOpts) -> WindowOut {
+    match loaded(r, o) {
+        Ok(_) => panic!("loaded as a window"),
+        Err(w) => w,
+    }
 }

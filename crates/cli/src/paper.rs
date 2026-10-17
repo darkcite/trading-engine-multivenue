@@ -3972,6 +3972,11 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         let mut i = 0usize;
         while i < boot.params.n_perps as usize {
             disp.track_queue_sym(boot.params.perps[i].hl_sym);
+            // PVM impl-08 (pin:08-verify-queue-sym-ineligible): slot 8's boot record lists every
+            // queue-tracked symbol, so `pine-verify` can refuse a window that shares one.
+            if let Some(h) = pine_hook.as_mut() {
+                h.note_queue_sym(boot.params.perps[i].hl_sym);
+            }
             i += 1;
         }
         tracing::info!("{}", crate::xmm_boot::render_boot_tell(boot));

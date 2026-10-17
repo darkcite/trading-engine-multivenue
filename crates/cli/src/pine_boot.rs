@@ -373,6 +373,23 @@ pub fn build(
     resolve: impl Fn(&str) -> Option<SymbolId>,
     facts: &DiscoveredFacts<'_>,
 ) -> Result<PineBoot, String> {
+    build_with(flags, exec, |manifest| {
+        manifest_facts(manifest, resolve, |key, sym| {
+            facts_from_discovery(key, sym, facts)
+        })
+    })
+}
+
+/// [`build`] with the facts from `symbols_of` (the parsed manifest in): the `run` boot reads
+/// them from discovery, `pine-verify` from the boot record (pin:08-boot-record-facts).
+///
+/// # Errors
+/// As [`build`].
+pub fn build_with(
+    flags: &PineFlags,
+    exec: Option<&ExecBoot>,
+    symbols_of: impl FnOnce(&core_config::pine::PineManifest) -> Result<Vec<PineSymbolFacts>, String>,
+) -> Result<PineBoot, String> {
     let (manifest, bytes) = core_config::pine::load_manifest(&flags.manifest)
         .map_err(|e| format!("pine: manifest {}: {e:?}", flags.manifest.display()))?;
     let manifest_sha256 = core_crypto::sha256(&bytes);
@@ -418,9 +435,7 @@ pub fn build(
         }
     }
     // Every canonical key any script names (chart + `[script.symbols]`), resolved, with facts.
-    let symbols = manifest_facts(&manifest, resolve, |key, sym| {
-        facts_from_discovery(key, sym, facts)
-    })?;
+    let symbols = symbols_of(&manifest)?;
     let fee = FeeModel {
         taker_ppm: slot.fee_taker_ppm,
         maker_ppm: slot.fee_maker_ppm,
@@ -671,6 +686,9 @@ mod tests {
                 client_oid_base: strategy_pine::bootrec::client_oid_base(5, 0),
                 warmup_digest: 0xfeed,
             }],
+            symbols: Vec::new(),
+            queue_syms: vec![7],
+            exec_sha256: [0; 32],
         };
         let p = write_boot_record(&dir, &rec).expect("write");
         assert_eq!(p, dir.join("pine-boot.tsv"));

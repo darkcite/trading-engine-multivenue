@@ -57,6 +57,7 @@ pub mod opt;
 /// PVM B'3 (impl-Bp §3.6–§3.8, §4.5–§4.7): the streamed pine replay;
 /// `backtest --strategy pine` calls [`run_pine_main`] (T13).
 pub(crate) mod pine;
+pub use pine::boot::{replay_from_boot_main, ReplayArgv};
 pub use pine::run::{run_pine_main, PineArgv, PineExit};
 pub mod regime;
 pub mod stale;

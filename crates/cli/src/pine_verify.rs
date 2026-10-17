@@ -32,9 +32,29 @@
 //!   records (`BOOT_SCRIPT`, `BOOT_STATE`, re-hashed by the replay's `configure`) against the
 //!   recorded ones: unequal → "inputs changed", ineligible; the caller's re-hash of `exec.toml`
 //!   and the bar files arrives as [`WindowIn::ineligible`].
-//! - pin:08-verify-queue-syms-untracked: the slot-8-only matcher tracks no queue symbol; a live
-//!   boot that tracked a slot-8 symbol for slot 6's queue law judged pine makers there by it —
-//!   rule 5's literal reading (orders) does not see it; recorded here, not tolerated.
+//! - pin:08-verify-queue-sym-ineligible (lead ruling 2026-10-17; retires
+//!   pin:08-verify-queue-syms-untracked): the slot-8-only matcher tracks no queue symbol, so a
+//!   window whose pine route symbol (any boot-record `symbol`) is also queue-tracked (the record's
+//!   `queue_syms`, slot 6's perps) is INELIGIBLE — listed, never counted, never red.
+//! - pin:08-boot-record-facts: the window's symbol facts are the boot record's (the run's
+//!   `pine-boot.tsv`); no venue and no screen universe is read.
+//! - pin:08-verify-run-join-epoch: a tape directory's run is the `<capture>/run-*` directory
+//!   whose `pine-boot.tsv` client-oid epoch equals `BOOT_HDR`'s `oid_epoch` and whose manifest
+//!   SHA's first word equals `BOOT_STATE`'s — exactly one, else the window is ineligible.
+//! - pin:08-verify-manifest-by-sha: the manifest is the `*.toml` under `--manifest-dir`
+//!   (default `~/multivenue/pine`) whose bytes hash to the record's `manifest_sha256`.
+//! - pin:08-verify-rule3-via-record: rule 3 is re-hashed through the member's own R5 checks —
+//!   the replay boots with `replay = true` and the record (manifest and every script must hash
+//!   to it, `6001`; each script's chart-row warm digest, re-read from the bar root, must equal
+//!   it, `6013`) on the ENGINE host; `exec.toml` (`--exec`) must hash to the record's
+//!   `exec_sha256` (all zeros = the boot had none, and `--exec` must then be absent).
+//! - pin:08-verify-rule5-window: rule 5 reads the run's `engine-orders.pmlr` (absent or torn →
+//!   ineligible: the rule cannot be shown); an order of another slot on a pine symbol whose
+//!   `wall_of(ts_ns)` is at or before `boot + 2 h` makes the window ineligible.
+//! - pin:08-verify-delivery-carried: 8g-A replays `seq.bin`; the run's `pine-delivery.bin` (R6)
+//!   is read (a torn file is unreadable, exit 2) and carried for 8g-B, never compared here.
+
+use std::path::{Path, PathBuf};
 
 use clob_dispatcher::{DispatchError, PaperMatcher};
 use core_types::{CancelReq, ChannelEvent, Fill, ModifyReq, NsTs, Order, Tick, FILL_ORIGIN_PAPER};
@@ -310,6 +330,14 @@ pub struct WindowIn {
     pub set: SetTsv,
     /// A rule-3 (exec.toml, bar files) or rule-5 (`engine-orders.pmlr`) reason the caller found.
     pub ineligible: Option<String>,
+    /// The run's boot record (pin:08-verify-rule3-via-record): when set, the replay boots with
+    /// `replay = true` on it (manifest, scripts and warm digests re-hashed by the member).
+    pub record: Option<PathBuf>,
+    /// The bar root: when set, the warm slices are re-read from it after `configure` (added to
+    /// `warm`), so the chart-row digests are the files' as they are now.
+    pub bars_root: Option<PathBuf>,
+    /// The run's delivery journal (pin:08-verify-delivery-carried; 8g-B's input).
+    pub delivery: Vec<strategy_pine::delivery::PineDeliveryRec>,
 }
 
 /// One window's result.
@@ -387,11 +415,14 @@ pub fn verify_window(w: WindowIn) -> WindowOut {
     let WindowIn {
         label,
         mut cfg,
-        warm,
+        mut warm,
         seq,
         dec,
         set,
         ineligible,
+        record,
+        bars_root,
+        delivery: _,
     } = w;
     let inel = |r: String| out(&label, Elig::Ineligible(r));
     // Rule 2 (pin:08-verify-gap-ineligible).
@@ -423,14 +454,24 @@ pub fn verify_window(w: WindowIn) -> WindowOut {
     cfg.route = SlotRoute::Paper;
     cfg.host = HostKind::Engine;
     cfg.tape = true;
+    // pin:08-verify-rule3-via-record: the member re-hashes the inputs against the record.
+    cfg.replay = record.is_some();
+    cfg.boot_record = record;
+    cfg.warmup = None;
     let boot_ms = cfg.boot_utc_ms;
     // Step 3.
     let mut member = PineStrategy::new();
-    if let Err(e) = member.configure(cfg) {
-        return inel(format!(
-            "inputs changed: configure refused ({}): {}",
-            e.code.0, e.detail
-        ));
+    let needs = match member.configure(cfg) {
+        Ok(n) => n,
+        Err(e) => {
+            return inel(format!(
+                "inputs changed: configure refused ({}): {}",
+                e.code.0, e.detail
+            ))
+        }
+    };
+    if let Some(root) = bars_root.as_deref() {
+        warm.extend(crate::pine_boot::warm(&needs, root, boot_ms).0);
     }
     if let Err(e) = member.supply_warm(warm) {
         return inel(format!(
@@ -604,4 +645,355 @@ pub fn check(cfg: PineBootCfg) -> (u8, String) {
             format!("pine-verify --check: refused {} {}", e.code.0, e.detail),
         ),
     }
+}
+
+// ---------------------------------------------------------------- the tape-directory loader
+
+/// Where `pine-verify` finds a window's run, manifest, `exec.toml` and bars.
+#[derive(Debug, Clone)]
+pub struct VerifyOpts {
+    /// `--capture <root>`: the `run-<epoch_ns>` directories (`pine-boot.tsv`,
+    /// `pine-delivery.bin`, `engine-orders.pmlr`).
+    pub capture: PathBuf,
+    /// `--manifest-dir <dir>` (pin:08-verify-manifest-by-sha).
+    pub manifest_dir: PathBuf,
+    /// `--exec <exec.toml>`: the boot's, re-hashed against the record.
+    pub exec: Option<PathBuf>,
+    /// `--pine-bars <dir>`: the warm bar root.
+    pub bars_root: PathBuf,
+}
+
+/// A loaded tape directory: a window to replay, or one already ineligible.
+pub enum Loaded {
+    /// Replay it.
+    Window(Box<WindowIn>),
+    /// Listed with its reason.
+    Out(WindowOut),
+}
+
+fn read_or(p: &Path) -> Result<Vec<u8>, String> {
+    std::fs::read(p).map_err(|e| format!("unreadable: {}: {e}", p.display()))
+}
+
+/// pin:08-verify-run-join-epoch: the run directory under `capture` whose boot record names
+/// `epoch` and the manifest word `sha_lo` (when the tape has a `BOOT_STATE`).
+fn find_run(
+    capture: &Path,
+    epoch: u64,
+    sha_lo: Option<u64>,
+) -> Result<(PathBuf, strategy_pine::BootRecord), String> {
+    let rd = std::fs::read_dir(capture)
+        .map_err(|e| format!("no run: --capture {}: {e}", capture.display()))?;
+    let mut hits = Vec::new();
+    let mut bad = 0usize;
+    for ent in rd.flatten() {
+        let dir = ent.path();
+        let is_run = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("run-"));
+        let p = dir.join(strategy_pine::BOOT_RECORD_FILE);
+        if !is_run || !p.is_file() {
+            continue;
+        }
+        let Ok(rec) = std::fs::read_to_string(&p)
+            .map_err(|e| e.to_string())
+            .and_then(|t| strategy_pine::BootRecord::parse(&t))
+        else {
+            bad += 1;
+            continue;
+        };
+        let rec_epoch = rec.scripts.first().map_or(0, |s| s.client_oid_base >> 32);
+        let mut lo = [0u8; 8];
+        // COPY: 8 B of the manifest SHA into a word — offline reader — `from_be_bytes` takes
+        // an array.
+        lo.copy_from_slice(&rec.manifest_sha256[..8]);
+        if rec_epoch == epoch && sha_lo.is_none_or(|w| w == u64::from_be_bytes(lo)) {
+            hits.push((dir, rec));
+        }
+    }
+    match hits.len() {
+        1 => Ok(hits.remove(0)),
+        0 => Err(format!(
+            "no run under {} has a boot record for epoch {epoch} ({bad} unreadable records)",
+            capture.display()
+        )),
+        n => Err(format!(
+            "{n} runs under {} claim epoch {epoch}",
+            capture.display()
+        )),
+    }
+}
+
+/// pin:08-verify-manifest-by-sha.
+fn find_manifest(dir: &Path, sha: &[u8; 32]) -> Option<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "toml") && p.is_file())
+        .collect();
+    v.sort();
+    v.into_iter()
+        .find(|p| std::fs::read(p).is_ok_and(|b| core_crypto::sha256(&b) == *sha))
+}
+
+/// pin:08-verify-rule5-window: another slot's order on a pine symbol, by `boot + 2 h`.
+fn rule5(
+    run: &Path,
+    pine_syms: &[core_types::SymbolId],
+    anchor: core_time::WallAnchor,
+    end_ms: i64,
+) -> Option<String> {
+    let p = run.join(engine::ENGINE_ORDERS_FILE);
+    let r = match core_io::PmlrReader::<Order>::open(&p) {
+        Ok(r) if r.slot_kind() == core_io::SlotKind::Order => r,
+        Ok(_) => return Some(format!("rule 5: {} is not an order capture", p.display())),
+        Err(e) => return Some(format!("rule 5 cannot be shown: {}: {e}", p.display())),
+    };
+    r.records()
+        .iter()
+        .find(|o| {
+            o.strategy_id != SLOT_PINE
+                && pine_syms.contains(&o.sym)
+                && i64::try_from(anchor.wall_of(o.ts_ns) / 1_000_000).unwrap_or(i64::MAX) <= end_ms
+        })
+        .map(|o| {
+            format!(
+                "slot {} ordered on pine symbol {} (client oid {})",
+                o.strategy_id, o.sym, o.client_oid
+            )
+        })
+}
+
+/// Load one tape directory (one boot) into a [`WindowIn`] (§4.9.3 steps 1–2): the three tape
+/// files, the run's boot record (the facts, the queue symbols, the exec digest), the manifest
+/// by hash, `exec.toml`, rule 5, the queue rule and the delivery journal.
+///
+/// # Errors
+/// A tape file that is missing or torn, or a torn delivery journal: unreadable (exit 2).
+pub fn load_window(tape_dir: &Path, o: &VerifyOpts) -> Result<Loaded, String> {
+    let label = tape_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let seq = seq_from_bytes(&read_or(&tape_dir.join("seq.bin"))?)?;
+    let dec = dec_from_bytes(&read_or(&tape_dir.join("decisions.bin"))?)?;
+    let set_text = String::from_utf8(read_or(&tape_dir.join("set.tsv"))?)
+        .map_err(|_| "unreadable: set.tsv is not UTF-8".to_string())?;
+    let set = parse_set_tsv(&set_text)?;
+    let inel = |r: String| Ok(Loaded::Out(out(&label, Elig::Ineligible(r))));
+    let Some(hdr) = dec
+        .first()
+        .filter(|r| r.kind == pine_tape::BOOT_HDR)
+        .copied()
+    else {
+        return inel("unusable: decisions.bin does not start with BOOT_HDR".to_string());
+    };
+    let sha_lo = dec
+        .iter()
+        .find(|r| r.kind == pine_tape::BOOT_STATE)
+        .map(|r| r.aux);
+    let (run, rec) = match find_run(&o.capture, hdr.x2, sha_lo) {
+        Ok(x) => x,
+        Err(e) => return inel(e),
+    };
+    // pin:08-verify-queue-sym-ineligible.
+    if let Some(f) = rec.symbols.iter().find(|f| rec.queue_syms.contains(&f.sym)) {
+        return inel(format!(
+            "pine symbol {} ({}) is queue-tracked at this boot",
+            f.key, f.sym
+        ));
+    }
+    let Some(manifest) = find_manifest(&o.manifest_dir, &rec.manifest_sha256) else {
+        return inel(format!(
+            "inputs changed: no manifest under {} hashes to the boot record",
+            o.manifest_dir.display()
+        ));
+    };
+    // pin:08-verify-rule3-via-record: exec.toml.
+    let eb = match o.exec.as_deref() {
+        Some(p) => match crate::exec_boot::resolve(Some(p), None) {
+            Ok(eb) => eb,
+            Err(e) => return inel(format!("inputs changed: exec.toml refused: {e}")),
+        },
+        None => None,
+    };
+    let exec_sha = eb.as_ref().map_or([0u8; 32], |b| b.hash);
+    if exec_sha != rec.exec_sha256 {
+        return inel("inputs changed: exec.toml does not hash to the boot record".to_string());
+    }
+    let flags = crate::pine_boot::PineFlags {
+        manifest,
+        tape: true,
+        bars_root: o.bars_root.clone(),
+        pine_dir: o.manifest_dir.clone(),
+    };
+    // pin:08-boot-record-facts.
+    let syms = rec.symbols.clone();
+    let cfg = match crate::pine_boot::build_with(&flags, eb.as_ref(), |_| Ok(syms)) {
+        Ok(b) => b.cfg,
+        Err(e) => return inel(format!("inputs changed: {e}")),
+    };
+    let anchor = core_time::WallAnchor::new(
+        u64::try_from(hdr.x0).unwrap_or(0),
+        u64::try_from(hdr.x1).unwrap_or(0),
+    );
+    let end_ms = (hdr.aux as i64).saturating_add(WINDOW_MS);
+    let pine_syms: Vec<core_types::SymbolId> = rec.symbols.iter().map(|f| f.sym).collect();
+    let ineligible = rule5(&run, &pine_syms, anchor, end_ms);
+    // pin:08-verify-delivery-carried.
+    let jp = run.join(crate::pine_delivery::DELIVERY_FILE);
+    let delivery = if jp.is_file() {
+        crate::pine_delivery::read_journal(&jp).map_err(|e| format!("unreadable: {e}"))?
+    } else {
+        Vec::new()
+    };
+    Ok(Loaded::Window(Box::new(WindowIn {
+        label,
+        cfg,
+        warm: Vec::new(),
+        seq,
+        dec,
+        set,
+        ineligible,
+        record: Some(run.join(strategy_pine::BOOT_RECORD_FILE)),
+        bars_root: Some(o.bars_root.clone()),
+        delivery,
+    })))
+}
+
+/// `pine-verify --tape <dir> …` (§4.9.6): every window loaded, replayed and pooled. Returns the
+/// lines to print (the per-window lines, then the `8g` line) and the exit code; an unreadable
+/// tape is exit 2 with its reason.
+#[must_use]
+pub fn run(tapes: &[PathBuf], o: &VerifyOpts) -> (Vec<String>, u8) {
+    let mut outs = Vec::with_capacity(tapes.len());
+    for t in tapes {
+        match load_window(t, o) {
+            Ok(Loaded::Window(w)) => outs.push(verify_window(*w)),
+            Ok(Loaded::Out(w)) => outs.push(w),
+            Err(e) => {
+                return (
+                    vec![format!("pine-verify: {}: {e}", t.display())],
+                    EXIT_UNUSABLE,
+                )
+            }
+        }
+    }
+    let mut lines = window_lines(&outs);
+    let v = pool(&outs);
+    lines.push(v.line);
+    (lines, v.exit)
+}
+
+// ---------------------------------------------------------------- the command
+
+/// `multivenue-engine pine-verify` (impl-08 §3.6, §4.9.6).
+#[derive(Debug, clap::Args)]
+pub struct PineVerifyArgs {
+    /// A tape directory (`~/multivenue/pine/tape/<boot_utc_ms>`), one per window; repeatable.
+    #[arg(long = "tape")]
+    pub tapes: Vec<PathBuf>,
+    /// The capture root holding the runs' `run-<epoch_ns>` directories
+    /// (default `~/multivenue/capture`).
+    #[arg(long)]
+    pub capture: Option<PathBuf>,
+    /// 8g-B: impl-Bp's replay-from-boot tapes (T22; refused until it lands).
+    #[arg(long)]
+    pub cross: Option<PathBuf>,
+    /// Where the manifests live (default `~/multivenue/pine`).
+    #[arg(long)]
+    pub manifest_dir: Option<PathBuf>,
+    /// `exec.toml`: with `--tape`, the boot's (re-hashed against the record); with `--check`,
+    /// the slot section to load against.
+    #[arg(long)]
+    pub exec: Option<PathBuf>,
+    /// The warm bar root (default `~/multivenue/pine/bars`).
+    #[arg(long)]
+    pub pine_bars: Option<PathBuf>,
+    /// `--check <manifest.toml>`: run 8a offline (facts from the screen universe, no venue read).
+    #[arg(long)]
+    pub check: Option<PathBuf>,
+    /// `--check`'s facts (default `~/multivenue/pine/screen-universe.tsv`).
+    #[arg(long)]
+    pub universe: Option<PathBuf>,
+}
+
+/// pin:08-verify-defaults: `~/multivenue/<rel>` (`HOME` unset → the relative path).
+fn mv(rel: &str) -> PathBuf {
+    std::env::var_os("HOME")
+        .map_or_else(PathBuf::new, PathBuf::from)
+        .join("multivenue")
+        .join(rel)
+}
+
+/// pin:08-check-synthetic-syms: `--check` reads no engine universe — each canonical key gets an
+/// ordinal symbol id by first appearance (8a's static checks count distinct symbols, never
+/// their values) and its facts from the screen universe (pin:08-replay-facts-screen-universe).
+///
+/// # Errors
+/// The manifest, `exec.toml` or a missing fact, human-readable (exit 1 — the refusal).
+fn check_cfg(a: &PineVerifyArgs, manifest: &Path) -> Result<PineBootCfg, String> {
+    let eb = match a.exec.as_deref() {
+        Some(p) => crate::exec_boot::resolve(Some(p), None)?,
+        None => None,
+    };
+    let flags = crate::pine_boot::PineFlags {
+        manifest: manifest.to_path_buf(),
+        tape: false,
+        bars_root: a.pine_bars.clone().unwrap_or_else(|| mv("pine/bars")),
+        pine_dir: mv("pine"),
+    };
+    let universe = a
+        .universe
+        .clone()
+        .unwrap_or_else(|| mv("pine/screen-universe.tsv"));
+    let pb = crate::pine_boot::build_with(&flags, eb.as_ref(), |m| {
+        let keys = core::cell::RefCell::new(Vec::<String>::new());
+        let ord = |k: &str| {
+            let mut v = keys.borrow_mut();
+            let at = v.iter().position(|x| x == k).unwrap_or_else(|| {
+                v.push(k.to_string());
+                v.len() - 1
+            });
+            core_types::SymbolId::try_from(at + 1).ok()
+        };
+        crate::pine_boot::replay_facts(m, &universe, ord)
+    })?;
+    Ok(pb.cfg)
+}
+
+/// The verb: prints the per-window lines and the `8g` line on stdout; returns the exit code.
+#[must_use]
+pub fn main(a: &PineVerifyArgs) -> u8 {
+    if let Some(m) = a.check.as_deref() {
+        let (code, msg) = match check_cfg(a, m) {
+            Ok(cfg) => check(cfg),
+            Err(e) => (1, format!("pine-verify --check: refused {e}")),
+        };
+        println!("{msg}");
+        return code;
+    }
+    if a.cross.is_some() {
+        // T22 (8g-B) needs impl-Bp's replay-from-boot tapes; not wired in this cut.
+        eprintln!("pine-verify: --cross (8g-B) is not available in this build");
+        return EXIT_UNUSABLE;
+    }
+    if a.tapes.is_empty() {
+        eprintln!("pine-verify: no --tape given");
+        return EXIT_UNUSABLE;
+    }
+    let o = VerifyOpts {
+        capture: a.capture.clone().unwrap_or_else(|| mv("capture")),
+        manifest_dir: a.manifest_dir.clone().unwrap_or_else(|| mv("pine")),
+        exec: a.exec.clone(),
+        bars_root: a.pine_bars.clone().unwrap_or_else(|| mv("pine/bars")),
+    };
+    let (lines, code) = run(&a.tapes, &o);
+    for l in &lines {
+        println!("{l}");
+    }
+    code
 }

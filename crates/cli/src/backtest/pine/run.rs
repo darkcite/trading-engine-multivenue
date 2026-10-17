@@ -775,3 +775,6 @@ fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod gate_tests;

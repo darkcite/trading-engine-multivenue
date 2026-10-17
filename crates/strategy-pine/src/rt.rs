@@ -460,6 +460,10 @@ pub(crate) struct Core {
     /// §4.7.8: the last warm-up evaluation's intents are judged by the boot policy (`arm`), so
     /// `eval_script` does not count them discarded.
     pub(crate) boot_eval: bool,
+    /// pin:08-boot-record-facts: the symbol facts this boot ran on (R5, the boot record; cold).
+    pub(crate) facts: Box<[crate::PineSymbolFacts]>,
+    /// pin:08-boot-record-exec-sha: SHA-256 of the boot's `exec.toml` (R5, the boot record).
+    pub(crate) exec_sha256: [u8; 32],
 }
 
 /// A leaked, 64-aligned arena of exactly `total` bytes (§4.2 step 2, safe Rust).
@@ -756,6 +760,9 @@ pub(crate) fn build(st: Staged) -> Result<Box<Core>, PineLoadError> {
             ]
             .into_boxed_slice(),
         ),
+        exec_sha256: cfg.exec_sha256,
+        // Moved, not copied: the last use of `cfg`.
+        facts: cfg.symbols.into_boxed_slice(),
     }))
 }
 

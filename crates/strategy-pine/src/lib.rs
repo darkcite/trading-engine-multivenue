@@ -492,6 +492,12 @@ impl PineStrategy {
             boot_mono_ns,
             route: core.route,
             scripts,
+            // COPY: the boot's symbol facts (≤ MAX_SYMBOLS rows) — boot only, the record is
+            // owned by the host — a borrow would tie the record to the member.
+            symbols: core.facts.to_vec(),
+            // pin:08-verify-queue-sym-ineligible: the member does not know them; the host sets.
+            queue_syms: Vec::new(),
+            exec_sha256: core.exec_sha256,
         })
     }
 

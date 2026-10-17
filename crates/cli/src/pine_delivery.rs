@@ -172,6 +172,8 @@ pub struct PineHook {
     tape: bool,
     writer: Option<DeliveryWriter>,
     record: Option<PathBuf>,
+    /// pin:08-verify-queue-sym-ineligible: the symbols the paper queue law tracks at this boot.
+    queue_syms: Vec<core_types::SymbolId>,
 }
 
 impl PineHook {
@@ -185,6 +187,16 @@ impl PineHook {
             tape,
             writer: None,
             record: None,
+            queue_syms: Vec::new(),
+        }
+    }
+
+    /// Boot-time, before `eng.start()`: one symbol the paper dispatcher's queue law tracks
+    /// (`track_queue_sym`) — the boot record lists them, and `pine-verify` refuses a window whose
+    /// pine symbol is among them (pin:08-verify-queue-sym-ineligible).
+    pub fn note_queue_sym(&mut self, sym: core_types::SymbolId) {
+        if !self.queue_syms.contains(&sym) {
+            self.queue_syms.push(sym);
         }
     }
 
@@ -192,7 +204,12 @@ impl PineHook {
     /// open the journal. Returns the record's path (`None` when it could not be written,
     /// pin:08-boot-record-write-logged).
     pub fn on_started(&mut self, p: &PineStrategy, boot_mono_ns: u64) -> Option<&Path> {
-        let rec = p.boot_record(self.run_epoch_ns, boot_mono_ns);
+        let rec = p.boot_record(self.run_epoch_ns, boot_mono_ns).map(|mut r| {
+            // COPY: the queue symbols (≤ 8) into the owned record — boot only — the record
+            // renders from its own fields.
+            r.queue_syms.clone_from(&self.queue_syms);
+            r
+        });
         // The set ran slot 8's `on_start` (`eng.start()` returned Ok), so the core exists.
         debug_assert!(rec.is_some(), "pine: boot record before on_start");
         match rec.map(|r| crate::pine_boot::write_boot_record(&self.run_dir, &r)) {

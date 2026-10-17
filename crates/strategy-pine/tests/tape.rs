@@ -84,6 +84,32 @@ fn member_untaped() -> PineStrategy {
     )
 }
 
+/// pin:08-boot-state-cold-final: `BOOT_STATE.a` is each script's boot outcome — 0 for a script
+/// that ends the warm-up walk warm (adopted at its last warm bar), 1 for one that boots cold.
+#[test]
+fn boot_state_cold_is_the_boot_outcome() {
+    let states = |p: &PineStrategy| {
+        let mut dec = vec![PineTapeRec::default(); 64];
+        let (mut from, mut out) = (0u64, Vec::new());
+        loop {
+            let m = p.pine_tape_view(&mut dec, from) as usize;
+            if m == 0 {
+                return out;
+            }
+            for r in &dec[..m] {
+                if r.kind == pine_tape::BOOT_STATE {
+                    out.push(r.a);
+                }
+            }
+            from = dec[m - 1].seq + 1;
+        }
+    };
+    assert_eq!(states(&taped()), vec![0, 0], "both warm");
+    let mut b = boot(vec![rt("rt_entry.pine", 0), script("sma_always.pine", 1)]);
+    b.tape = true;
+    assert_eq!(states(&start(b, Vec::new())), vec![1, 1], "both cold");
+}
+
 /// I44: drained as it goes, both tapes are gapless and match their counters; every decision
 /// names a recorded callback (or the boot); `pop_ns` is the ctx's clock, `e_ns` E after the input.
 /// Undrained past the ring, the overwritten records are counted and the reader sees the gap.

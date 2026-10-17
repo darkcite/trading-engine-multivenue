@@ -18,8 +18,23 @@
 //! - pin:08-boot-record-warm-digest-chart-row: a script's `warmup_digest_hex16` is its CHART row's
 //!   warm slice digest, first 8 bytes little-endian (`BarFileHdr::src_digest64`, what the cli's
 //!   `warm` puts there); `0` for a cold row.
+//! - pin:08-boot-record-facts (lead ruling 2026-10-17): the record carries the per-symbol facts
+//!   the boot ran on, so `pine-verify` rebuilds the boot from the record and never re-reads a
+//!   venue. The magic stays `# pvm-boot-1`; the header and `script` lines are unchanged; after
+//!   the `script` lines come one `symbol` line per `PineBootCfg::symbols` entry (configure
+//!   order): `symbol <key> <sym> <venue byte> <mintick_1e6> <pointvalue_1e6> <qty_step_1e6>
+//!   <min_notional_1e6> <ticker> <basecurrency> <currency> <type> <venue_read 0|1>` (decimal;
+//!   strings verbatim, never containing a TAB or a newline). A replay host (B'3 tier 2) keeps
+//!   its screen-universe facts (pin:08-replay-facts-screen-universe); these lines are 8g's.
+//! - pin:08-verify-queue-sym-ineligible (lead ruling 2026-10-17): then exactly one
+//!   `queue_syms <sym,sym,…>` line — the engine symbols the paper dispatcher's queue law tracks
+//!   at this boot (`-` for none). The member does not know them; the host sets them.
+//! - pin:08-boot-record-exec-sha: then exactly one `exec_sha256 <64 hex>` line (`PineBootCfg::
+//!   exec_sha256`, all zeros without `--exec`): 8g rule 3's `exec.toml` re-hash compares with it
+//!   (no decision record carries it). The three trailing kinds are mandatory, in this order, so
+//!   a record written before them fails the strict parse (fail closed).
 
-use crate::SlotRoute;
+use crate::{PineSymbolFacts, SlotRoute};
 
 /// The record's first line.
 pub const BOOT_RECORD_MAGIC: &str = "# pvm-boot-1";
@@ -58,6 +73,12 @@ pub struct BootRecord {
     pub route: SlotRoute,
     /// One per manifest script, manifest order.
     pub scripts: Vec<BootRecordScript>,
+    /// pin:08-boot-record-facts: the symbol facts the boot ran on (configure order).
+    pub symbols: Vec<PineSymbolFacts>,
+    /// pin:08-verify-queue-sym-ineligible: the symbols the paper queue law tracked (host-set).
+    pub queue_syms: Vec<core_types::SymbolId>,
+    /// pin:08-boot-record-exec-sha: SHA-256 of the boot's `exec.toml` (zeros without one).
+    pub exec_sha256: [u8; 32],
 }
 
 fn hex(out: &mut String, b: &[u8]) {
@@ -117,7 +138,99 @@ impl BootRecord {
             hex(&mut s, &sc.warmup_digest.to_be_bytes());
             s.push('\n');
         }
+        // pin:08-boot-record-facts.
+        for f in &self.symbols {
+            debug_assert!(
+                f.syminfo_strs
+                    .iter()
+                    .chain(core::iter::once(&f.key))
+                    .all(|x| !x.contains(['\t', '\n', '\r'])),
+                "pine: a boot-record string holds a TAB or a newline"
+            );
+            s.push_str(&format!(
+                "symbol\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                f.key,
+                f.sym,
+                f.venue as u8,
+                f.mintick_1e6,
+                f.pointvalue_1e6,
+                f.qty_step_1e6,
+                f.min_notional_1e6,
+                f.syminfo_strs[0],
+                f.syminfo_strs[1],
+                f.syminfo_strs[2],
+                f.syminfo_strs[3],
+                u8::from(f.venue_read)
+            ));
+        }
+        // pin:08-verify-queue-sym-ineligible.
+        s.push_str("queue_syms\t");
+        if self.queue_syms.is_empty() {
+            s.push('-');
+        }
+        for (k, q) in self.queue_syms.iter().enumerate() {
+            if k > 0 {
+                s.push(',');
+            }
+            s.push_str(&q.to_string());
+        }
+        // pin:08-boot-record-exec-sha.
+        s.push_str("\nexec_sha256\t");
+        hex(&mut s, &self.exec_sha256);
+        s.push('\n');
         s
+    }
+
+    /// pin:08-boot-record-facts: one `symbol` line's 12 fields after the kind.
+    fn parse_symbol(f: &[&str]) -> Result<PineSymbolFacts, String> {
+        let int = |s: &str, what: &str| {
+            s.parse::<i64>()
+                .map_err(|_| format!("symbol {what} is not an i64"))
+        };
+        if f[0].is_empty() {
+            return Err("symbol key is empty".to_string());
+        }
+        let venue = f[2]
+            .parse::<u8>()
+            .ok()
+            .and_then(core_types::VenueId::from_u8)
+            .ok_or_else(|| format!("symbol venue `{}` is not a venue byte", f[2]))?;
+        let venue_read = match f[11] {
+            "0" => false,
+            "1" => true,
+            v => return Err(format!("symbol venue_read `{v}` is not 0|1")),
+        };
+        Ok(PineSymbolFacts {
+            key: f[0].to_string(),
+            sym: f[1]
+                .parse::<core_types::SymbolId>()
+                .map_err(|_| "symbol sym is not a u32")?,
+            venue,
+            mintick_1e6: int(f[3], "mintick_1e6")?,
+            pointvalue_1e6: int(f[4], "pointvalue_1e6")?,
+            qty_step_1e6: int(f[5], "qty_step_1e6")?,
+            min_notional_1e6: int(f[6], "min_notional_1e6")?,
+            syminfo_strs: [
+                f[7].to_string(),
+                f[8].to_string(),
+                f[9].to_string(),
+                f[10].to_string(),
+            ],
+            venue_read,
+        })
+    }
+
+    /// pin:08-verify-queue-sym-ineligible: `-` or a comma list of decimal symbols.
+    fn parse_queue(v: &str) -> Result<Vec<core_types::SymbolId>, String> {
+        if v == "-" {
+            return Ok(Vec::new());
+        }
+        v.split(',')
+            .map(|q| {
+                q.parse::<core_types::SymbolId>()
+                    .map_err(|_| format!("queue_syms `{q}` is not a u32"))
+            })
+            .collect()
     }
 
     /// Strict parse: the magic, the four header keys in order, then `script` lines numbered from
@@ -155,9 +268,38 @@ impl BootRecord {
             other => return Err(format!("route `{other}` is not paper|live|off")),
         };
         let mut scripts = Vec::new();
+        let mut symbols = Vec::new();
+        let mut queue_syms: Option<Vec<core_types::SymbolId>> = None;
+        let mut exec_sha256: Option<[u8; 32]> = None;
         for l in lines {
             let f: Vec<&str> = l.split('\t').collect();
-            if f.len() != 8 || f[0] != "script" {
+            // pin:08-boot-record-facts: `script*`, `symbol*`, `queue_syms`, `exec_sha256` — in
+            // that order, the last two exactly once, nothing after.
+            if exec_sha256.is_some() {
+                return Err(format!("a line after exec_sha256: `{l}`"));
+            }
+            if queue_syms.is_some() {
+                if f.len() != 2 || f[0] != "exec_sha256" {
+                    return Err(format!("expected `exec_sha256`, found `{l}`"));
+                }
+                exec_sha256 = Some(unhex::<32>(f[1]).ok_or("exec_sha256 is not 64 lowercase hex")?);
+                continue;
+            }
+            if f[0] == "queue_syms" {
+                if f.len() != 2 {
+                    return Err(format!("not a queue_syms line: `{l}`"));
+                }
+                queue_syms = Some(Self::parse_queue(f[1])?);
+                continue;
+            }
+            if f[0] == "symbol" {
+                if f.len() != 13 {
+                    return Err(format!("not a symbol line: `{l}`"));
+                }
+                symbols.push(Self::parse_symbol(&f[1..])?);
+                continue;
+            }
+            if f.len() != 8 || f[0] != "script" || !symbols.is_empty() {
                 return Err(format!("not a script line: `{l}`"));
             }
             let idx = f[1].parse::<u8>().map_err(|_| "script idx is not a u8")?;
@@ -185,12 +327,17 @@ impl BootRecord {
                 ),
             });
         }
+        let queue_syms = queue_syms.ok_or("missing `queue_syms`")?;
+        let exec_sha256 = exec_sha256.ok_or("missing `exec_sha256`")?;
         Ok(Self {
             manifest_sha256,
             run_epoch_ns,
             boot_mono_ns,
             route,
             scripts,
+            symbols,
+            queue_syms,
+            exec_sha256,
         })
     }
 }
@@ -231,6 +378,32 @@ mod tests {
                     warmup_digest: 0,
                 },
             ],
+            symbols: vec![
+                PineSymbolFacts {
+                    key: "hyperliquid:btc".to_string(),
+                    sym: 4096,
+                    venue: core_types::VenueId::Hyperliquid,
+                    mintick_1e6: 100_000,
+                    pointvalue_1e6: 1_000_000,
+                    qty_step_1e6: 10,
+                    min_notional_1e6: 10_000_000,
+                    syminfo_strs: ["BTC", "BTC", "USDC", "crypto"].map(String::from),
+                    venue_read: true,
+                },
+                PineSymbolFacts {
+                    key: "binance_usdm:ethusdt".to_string(),
+                    sym: 101,
+                    venue: core_types::VenueId::Binance,
+                    mintick_1e6: 10_000,
+                    pointvalue_1e6: 1_000_000,
+                    qty_step_1e6: 0,
+                    min_notional_1e6: 20_000_000,
+                    syminfo_strs: ["ETHUSDT", "ETH", "USDT", "crypto"].map(String::from),
+                    venue_read: false,
+                },
+            ],
+            queue_syms: vec![4096, 4097],
+            exec_sha256: [0xcd; 32],
         }
     }
 
@@ -244,6 +417,28 @@ mod tests {
         assert_eq!(BootRecord::parse(&text).unwrap(), r);
     }
 
+    /// pin:08-boot-record-facts / pin:08-verify-queue-sym-ineligible / pin:08-boot-record-exec-sha:
+    /// the facts, the queue symbols and the exec digest come back exactly; none is `-`.
+    #[test]
+    fn boot_record_carries_facts_queue_syms_and_exec_sha() {
+        let r = rec();
+        let text = r.render();
+        assert!(text.contains(
+            "\nsymbol\thyperliquid:btc\t4096\t4\t100000\t1000000\t10\t10000000\tBTC\tBTC\tUSDC\tcrypto\t1\n"
+        ), "{text}");
+        assert!(text.contains("\nqueue_syms\t4096,4097\nexec_sha256\tcdcd"));
+        assert!(text.ends_with(&format!("{}\n", "cd".repeat(32))));
+        let back = BootRecord::parse(&text).unwrap();
+        assert_eq!(back.symbols, r.symbols);
+        assert_eq!(back.queue_syms, vec![4096, 4097]);
+        let mut none = r.clone();
+        none.queue_syms.clear();
+        none.symbols.clear();
+        let t = none.render();
+        assert!(t.contains("\nqueue_syms\t-\n"), "{t}");
+        assert_eq!(BootRecord::parse(&t).unwrap(), none);
+    }
+
     #[test]
     fn boot_record_parse_is_strict() {
         let good = rec().render();
@@ -254,6 +449,31 @@ mod tests {
             good.replacen("0123456789abcdef", "0123456789ABCDEF", 1),
             good.replacen("boot_mono_ns", "boot_mono", 1),
             format!("{good}\n"),
+            // pin:08-boot-record-facts: the trailing kinds are mandatory, ordered and typed.
+            good.replacen("queue_syms\t4096,4097\n", "", 1),
+            good.replacen(&format!("exec_sha256\t{}\n", "cd".repeat(32)), "", 1),
+            good.replacen("queue_syms\t4096,4097", "queue_syms\t", 1),
+            good.replacen("queue_syms\t4096,4097", "queue_syms\t4096,x", 1),
+            good.replacen("\t4\t100000\t", "\t250\t100000\t", 1),
+            good.replacen("\tcrypto\t1\n", "\tcrypto\t2\n", 1),
+            good.replacen("\tcrypto\t1\n", "\tcrypto\n", 1),
+            good.replacen("symbol\thyperliquid:btc\t", "symbol\t\t", 1),
+            format!("{good}queue_syms\t-\n"),
+            // A well-formed, in-sequence script line after the symbol lines.
+            good.replacen(
+                "queue_syms\t",
+                &format!(
+                    "script\t2\t{}\t0\t0\t0\t0\t{}\nqueue_syms\t",
+                    "0".repeat(64),
+                    "0".repeat(16)
+                ),
+                1,
+            ),
+            // The pre-extension record (no trailing kinds) fails closed.
+            good.split("symbol\t")
+                .next()
+                .unwrap_or_default()
+                .to_string(),
         ] {
             assert!(BootRecord::parse(&bad).is_err(), "accepted: {bad}");
         }

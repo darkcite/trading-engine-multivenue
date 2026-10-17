@@ -143,6 +143,9 @@ enum Cmd {
     /// impl-07: the tier-1 Pine Script screener's operator verbs (`pine prepare` …) — offline,
     /// over bar files; exit codes per impl-07 §3.11.
     Pine(cli::pine::PineArgs),
+    /// PVM impl-08 T21 (§4.9.6): the 8g determinism gate over slot 8's `--pine-tape` windows,
+    /// or `--check <manifest>` (8a offline). Exit 0 green, 1 a difference, 2 unusable.
+    PineVerify(cli::pine_verify::PineVerifyArgs),
     /// XMM XH2 parity gate (plan §7.3): replay ONE window of one capture
     /// run through the xmm member on the queue law, on the XMM
     /// simulator's venue clock and S1 latencies, and write one TSV row
@@ -1166,7 +1169,7 @@ struct BacktestArgs {
     /// PVM B'3: `--strategy pine` replaces it (impl-Bp §3.6).
     #[arg(
         long,
-        required_unless_present_any = ["member", "strategy"],
+        required_unless_present_any = ["member", "strategy", "replay_from_boot"],
         conflicts_with = "member"
     )]
     ruleset: Option<PathBuf>,
@@ -1222,13 +1225,13 @@ struct BacktestArgs {
     /// Capture source: a single `run-<epoch_ns>` directory or a log
     /// root (`MULTIVENUE_LOG_DIR`) containing `run-*` children.
     /// PVM B'3: `--cut-plan` replaces it under `--strategy pine`.
-    #[arg(long, required_unless_present = "cut_plan")]
+    #[arg(long, required_unless_present_any = ["cut_plan", "replay_from_boot"])]
     replay_dir: Option<PathBuf>,
     /// IS/OOS split `N/M`: integers, `N + M == 100`, both >= 10 — or
     /// the carved all-OOS monitor form `0/100` (design §3.4). Echoed
     /// verbatim into the schema-1 report.
     /// PVM B'3: `--split-at-ms` replaces it under `--strategy pine`.
-    #[arg(long, required_unless_present = "split_at_ms")]
+    #[arg(long, required_unless_present_any = ["split_at_ms", "replay_from_boot"])]
     split: Option<String>,
     /// §4.3 fee override `<venue>[.<class>[.open|.settle]]:<maker_bps>:<taker_bps>`,
     /// repeatable (venues: pm|bn|okx|deribit|hl|bybit; XSD-F classes:
@@ -1307,7 +1310,9 @@ struct BacktestArgs {
           requires_all = ["pine_manifest", "trial_id_src"])]
     strategy: Option<String>,
     /// B'3: the 00-INDEX §3.14 manifest the arm boots from.
-    #[arg(long, requires = "strategy")]
+    /// pin:Bp-8g-manifest-flag — shared with `--replay-from-boot` (8g, which requires it),
+    /// so its `requires = "strategy"` is dropped; the legacy arm never reads it.
+    #[arg(long)]
     pine_manifest: Option<PathBuf>,
     /// B'3: directory the manifest's `file` entries resolve against.
     #[arg(long, requires = "pine_manifest")]
@@ -1373,6 +1378,23 @@ struct BacktestArgs {
     /// the legacy argv keeps its required --split).
     #[arg(long, conflicts_with = "split", requires = "strategy")]
     split_at_ms: Option<i64>,
+    /// 8g (impl-Bp §3.10, §4.12): replay the first ≤ 2 h window of a run from its boot.
+    #[arg(long, requires = "pine_manifest",
+          conflicts_with_all = ["ruleset", "member", "strategy", "null_arm", "cut_plan",
+                                "replay_dir", "split", "split_at_ms", "latency_ns",
+                                "latency_ns_venue", "stale_after_ms"])]
+    replay_from_boot: Option<PathBuf>,
+    /// 8g: the boot record (default `<window-root>/pine-boot.tsv`).
+    #[arg(long, requires = "replay_from_boot")]
+    boot_record: Option<PathBuf>,
+    /// 8g: `recorded` (the delivery journal's order, fills from engine-fills.pmlr; needs
+    /// --delivery-journal) or `judged` (the model judges slot 8's orders; a diagnostic).
+    #[arg(long, value_parser = ["recorded", "judged"], default_value = "recorded",
+          requires = "replay_from_boot")]
+    fills: String,
+    /// 8g: impl-08's input journal (`<run>/pine-delivery.bin`).
+    #[arg(long, requires = "replay_from_boot")]
+    delivery_journal: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -1785,6 +1807,11 @@ fn main() -> ExitCode {
         Cmd::Pine(args) => {
             init_tracing_stderr();
             ExitCode::from(cli::pine::main(&args))
+        }
+        Cmd::PineVerify(args) => {
+            // stdout carries the window lines and the `8g` line only.
+            init_tracing_stderr();
+            ExitCode::from(cli::pine_verify::main(&args))
         }
         Cmd::XmmParity(args) => {
             init_tracing_stderr();
@@ -3416,6 +3443,20 @@ fn backtest(args: BacktestArgs) -> ExitCode {
     // PVM B'3 T13 (impl-Bp §3.6): the Pine arm, its own exit codes.
     if args.strategy.is_some() {
         return backtest_pine(args);
+    }
+    // PVM B'3 T19 (impl-Bp §4.12): 8g replay from boot.
+    if let Some(window_root) = args.replay_from_boot {
+        let x = cli::backtest::replay_from_boot_main(&cli::backtest::ReplayArgv {
+            window_root,
+            manifest: args.pine_manifest.unwrap_or_default(),
+            boot_record: args.boot_record,
+            fills: args.fills,
+            delivery_journal: args.delivery_journal,
+        });
+        if !x.stderr.is_empty() {
+            eprintln!("{}", x.stderr);
+        }
+        return ExitCode::from(x.code);
     }
     // Tier 3: `--member <kind>` selects the coded-member arm; the
     // parameter file is the member's own boot artifact.

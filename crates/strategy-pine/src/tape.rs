@@ -370,6 +370,11 @@ pub(crate) fn boot(core: &mut Core, c: &mut PineCounters, h: &BootHdr) {
 
 /// `BOOT_STATE` for script `i` at its `reconcile_boot` (D19): cold, position, avg px, day
 /// notional, the manifest SHA's first word.
+///
+/// pin:08-boot-state-cold-final: `cold` is the script's boot outcome (§4.3.7, decided before the
+/// walk), not the flag's value mid-walk: a script adopted during the warm-up walk is one that
+/// ends warm (`warm::walk` adopts there only then), so it reads 0 however many of its warm bars
+/// had turned it warm; a script adopted in `finish_boot` reads its final flag.
 pub(crate) fn boot_state(core: &mut Core, c: &mut PineCounters, i: usize, st: (i64, i64, i64)) {
     if !core.tape.on {
         return;
@@ -377,7 +382,7 @@ pub(crate) fn boot_state(core: &mut Core, c: &mut PineCounters, i: usize, st: (i
     let mut r = rec(
         strategy_core::pine_tape::BOOT_STATE,
         i,
-        u8::from(core.scripts[i].cold),
+        u8::from(core.scripts[i].cold && !core.warming),
         0,
         0,
     );

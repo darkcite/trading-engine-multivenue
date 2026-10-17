@@ -25,6 +25,8 @@
 //! against a test-only stub member, under their §7.4 names.
 
 pub(crate) mod arm;
+/// T19: `--replay-from-boot` (8g) — the inputs and the refusals (§3.10, §4.12).
+pub(crate) mod boot;
 pub(crate) mod cuts;
 pub(crate) mod drive;
 pub(crate) mod fees;
