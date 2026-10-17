@@ -87,9 +87,6 @@ pub struct PmWindowSpec {
     pub tick_1e6: i64,
     /// `orderMinSize`, shares ×1e6.
     pub min_size_1e6: i64,
-    /// PM15-5b: the venue's published strike, `eventMetadata.priceToBeat`
-    /// ×1e6 — 0 until the PREVIOUS window resolves (≈ open + 116 s).
-    pub strike_1e6: i64,
     /// The Up token.
     pub up: PmTokenId,
     /// The Down token.
@@ -107,7 +104,6 @@ impl PmWindowSpec {
         window: 0,
         tick_1e6: 0,
         min_size_1e6: 0,
-        strike_1e6: 0,
         up: PmTokenId::NONE,
         down: PmTokenId::NONE,
         condition_id: [0; 66],
@@ -146,22 +142,6 @@ impl From<PmDiscoveryErr> for PmLawErr {
     #[inline]
     fn from(_: PmDiscoveryErr) -> Self {
         Self::Shape
-    }
-}
-
-/// PM15-5b: the published strike of a `/events?slug=` answer —
-/// `eventMetadata.priceToBeat` ×1e6 (the venue writes a JSON number with
-/// up to 14 decimals: truncated to 6). 0 while it is unpublished (`null`,
-/// absent) or does not read as a positive number. The key appears in the
-/// event's metadata alone.
-#[must_use]
-pub fn parse_price_to_beat(body: &[u8]) -> i64 {
-    let Some(p) = core_parse::find_field(body, b"\"priceToBeat\":") else {
-        return 0;
-    };
-    match core_parse::scan_number_sci_1e6(body, core_parse::skip_ws(body, p)) {
-        Some((v, _)) if v > 0 => v,
-        _ => 0,
     }
 }
 
@@ -471,19 +451,5 @@ mod tests {
         assert_eq!(&d[..n], b"hype-updown-15m-1792217700");
         assert!(render_slug(&mut d[..10], b"hype", w).is_none());
         assert!(render_slug(&mut d, b"", w).is_none());
-    }
-
-    /// PM15-5b: the published strike, as the venue writes it (a JSON number
-    /// of 14 decimals), truncated to 1e6; null, absent and non-positive are 0.
-    #[test]
-    fn the_published_strike_reads_from_event_metadata() {
-        let body = br#"[{"id":"1","slug":"btc-updown-15m-1792216800","eventMetadata":{"finalPrice":81485.06303622595,"priceToBeat":81465.82952002053},"markets":[{"eventMetadata":null}]}]"#;
-        assert_eq!(parse_price_to_beat(body), 81_465_829_520);
-        assert_eq!(parse_price_to_beat(br#"[{"eventMetadata":{"priceToBeat":0.2036154}}]"#), 203_615);
-        assert_eq!(parse_price_to_beat(br#"[{"eventMetadata":{"priceToBeat":1.5e3}}]"#), 1_500_000_000);
-        assert_eq!(parse_price_to_beat(br#"[{"eventMetadata":null}]"#), 0);
-        assert_eq!(parse_price_to_beat(br#"[{"eventMetadata":{"priceToBeat":null}}]"#), 0);
-        assert_eq!(parse_price_to_beat(br#"[{"eventMetadata":{"priceToBeat":-1}}]"#), 0);
-        assert_eq!(parse_price_to_beat(b"[]"), 0);
     }
 }

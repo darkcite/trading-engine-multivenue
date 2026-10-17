@@ -156,41 +156,6 @@ fn final_touch(p: &[u8], id: &[u8]) -> Option<(i64, i64)> {
     got
 }
 
-/// PM15-5b: the venue's published strike, offered after the window's
-/// CREATED, re-emits CREATED once with `v0` = the strike; a strike known
-/// at the bind rides the first CREATED.
-#[test]
-fn a_published_strike_re_emits_created_once() {
-    let spec = btc_spec();
-    let w = spec.window;
-    let inst = pm_instance_id(w, 0).unwrap();
-    let s = pm_roll_family(0, pm_pair_of_window(w));
-    let mut rig = Rig::new();
-    let mut wire = Wire::default();
-    let mut d = Pm15Driver::new(&[b"btc"], 5_000);
-    let t = (OPEN + 130) * 1_000_000_000;
-    d.offer(&spec, t, t, &mut rig.out(), &mut wire);
-    let ev = rig.lane_events();
-    assert_eq!((ev[0].v0, roll_kind(ev[0].venue_seq)), (0, ROLL_KIND_CREATED));
-    let mut struck = spec;
-    struck.strike_1e6 = 81_465_829_520;
-    d.offer(&struck, t + 1, t + 1, &mut rig.out(), &mut wire);
-    let ev = rig.lane_events();
-    assert_eq!(ev.len(), 1, "the repeat CREATED alone");
-    assert_eq!(roll_kind(ev[0].venue_seq), ROLL_KIND_CREATED);
-    assert_eq!(unpack_roll_seq(ev[0].venue_seq), (inst, PM_TWAP_S, s, false));
-    assert_eq!((ev[0].v0, ev[0].v1), (81_465_829_520, pm_window_end_ns(w) as i64));
-    d.offer(&struck, t + 2, t + 2, &mut rig.out(), &mut wire);
-    assert!(rig.lane_events().is_empty(), "once");
-    assert_eq!(rig.counters.get(Pm15Counter::StrikesPublished as usize), 1);
-
-    // Known at the bind: the first CREATED carries it.
-    let mut rig2 = Rig::new();
-    let mut d2 = Pm15Driver::new(&[b"btc"], 5_000);
-    d2.offer(&struck, t, t, &mut rig2.out(), &mut wire);
-    assert_eq!(rig2.lane_events()[0].v0, 81_465_829_520);
-}
-
 #[test]
 fn the_live_window_replays_into_ticks_rolls_and_its_settlement() {
     let spec = btc_spec();
@@ -449,8 +414,33 @@ fn a_session_lost_restarts_every_ladder_and_resubscribes_what_is_bound() {
     d.on_market_text(book.as_bytes(), now, now, &mut rig.out());
     assert!(d.ladders[2 * s].is_ready());
     assert_eq!(rig.rec.ticks.len(), 1);
-    d.on_market_down();
+    // PM15-5c: a PONG re-asserts the touch unchanged, on the next ordinal.
+    d.on_market_text(b"PONG", now + 5, now + 5, &mut rig.out());
+    assert_eq!(rig.rec.ticks.len(), 2);
+    let (a, b) = (rig.rec.ticks[0], rig.rec.ticks[1]);
+    assert_eq!(
+        (b.bid_px, b.ask_px, b.ask_qty),
+        (a.bid_px, a.ask_px, a.ask_qty)
+    );
+    assert_eq!(
+        (b.ts_ns, b.venue_seq, b.is_stale()),
+        (now + 5, a.venue_seq + 1, false)
+    );
+    assert_eq!(rig.counters.of(Pm15Counter::TouchesReasserted), 1);
+    // The session drops: the touch is withdrawn — stale, both sides zero.
+    d.on_market_down(now + 6, &mut rig.out());
+    assert_eq!(rig.rec.ticks.len(), 3);
+    let w = rig.rec.ticks[2];
+    assert!(w.is_stale());
+    assert_eq!(
+        (w.bid_px.raw(), w.ask_px.raw(), w.venue_seq),
+        (0, 0, a.venue_seq + 2)
+    );
+    assert_eq!(rig.counters.of(Pm15Counter::TouchesWithdrawn), 1);
     assert!(!d.ladders[2 * s].is_ready());
+    // Down, nothing is re-asserted (no ladder is ready).
+    d.on_market_text(b"PONG", now + 7, now + 7, &mut rig.out());
+    assert_eq!(rig.rec.ticks.len(), 3);
     // The next open subscribes the bound tokens again.
     wire.frames.clear();
     assert!(d.on_market_open(&mut wire));
@@ -460,5 +450,5 @@ fn a_session_lost_restarts_every_ladder_and_resubscribes_what_is_bound() {
     // The same snapshot again is a touch the lane has not seen since the
     // session restarted: emitted.
     d.on_market_text(book.as_bytes(), now, now, &mut rig.out());
-    assert_eq!(rig.rec.ticks.len(), 2);
+    assert_eq!(rig.rec.ticks.len(), 4);
 }

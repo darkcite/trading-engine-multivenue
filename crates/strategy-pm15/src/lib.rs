@@ -13,8 +13,9 @@
 //!    the family's two slot pairs; its settled roll closes it.
 //! 2. **The strike**: the previous window's settlement — estimated as the
 //!    mean of the Chainlink reports over `[open − 60, open − 1]` the moment
-//!    the report of `open − 1` arrives, or taken from the venue's
-//!    published `priceToBeat` when a re-emitted created roll carries it.
+//!    the report of `open − 1` arrives. The venue publishes `priceToBeat`
+//!    only once the window resolves, so a window that opened before the
+//!    boot's reports has no strike and is never traded (`hold_strike`).
 //! 3. **The price**: `core_twaplock::report::report_fair` — the reports on
 //!    their own second, the samples `[T − 60, T − 1]`, observed through the
 //!    newest report, the rest a walk from the fast venue's nowcast.
@@ -71,8 +72,12 @@ pub const ONE_1E6: i64 = 1_000_000;
 /// Share granularity ×1e6 (0.01 share).
 pub const SHARE_STEP_1E6: i64 = 10_000;
 
-/// A leg's touch older than this is no book to take from, ns.
-pub const TOUCH_FRESH_NS: u64 = 3_000_000_000;
+/// A leg's touch older than this is no book to take from, ns. The ingress
+/// emits a touch when it changes and re-asserts every touch at each `PONG`
+/// of the market socket (`PM15_MARKET_PING_NS`, 5 s), so a quiet book is
+/// still fresh: 5 s + 3 s for the round trip and the poll. A dead socket
+/// is the stale tick of its down path, not this bound's business.
+pub const TOUCH_FRESH_NS: u64 = 8_000_000_000;
 
 /// The member's configuration (`core_config::pm15`, resolved by the cli's
 /// `pm15_boot`).
@@ -199,7 +204,7 @@ pub struct Market {
     pub end_ns: u64,
     /// The strike ×1e6 (0 = not known yet).
     pub strike_1e6: i64,
-    /// 0 none, 1 estimated, 2 published.
+    /// 0 none, 1 estimated from the reports.
     pub strike_src: u8,
     /// The favoured side the persistence counts (0 none, 1 Up, 2 Down).
     pub persist_side: u8,
@@ -432,13 +437,7 @@ impl Pm15Strategy {
             return;
         }
         if held == inst {
-            // A repeat: the venue's published strike, when it carries one.
-            let m = &mut self.markets[f][pair];
-            if ev.v0 > 0 && m.strike_src != 2 {
-                m.strike_1e6 = ev.v0;
-                m.strike_src = 2;
-                self.counters.strikes_published += 1;
-            }
+            // A repeat CREATED carries nothing new.
             return;
         }
         if held != 0 {
@@ -458,8 +457,6 @@ impl Pm15Strategy {
             window,
             open_ns,
             end_ns,
-            strike_1e6: if ev.v0 > 0 { ev.v0 } else { 0 },
-            strike_src: if ev.v0 > 0 { 2 } else { 0 },
             ..Market::default()
         };
         self.counters.rolls += 1;
@@ -665,12 +662,16 @@ impl Pm15Strategy {
         let p = &self.params;
         let m = &self.markets[f][pair];
         let book = &m.legs[leg];
-        if book.ask_1e6 <= 0
-            || book.ts_ns == 0
-            || now.saturating_sub(book.ts_ns) >= TOUCH_FRESH_NS
-            || book.tick_1e6 <= 0
-        {
+        if book.tick_1e6 <= 0 {
+            self.counters.skip_law += 1;
+            return;
+        }
+        if book.ask_1e6 <= 0 || book.ts_ns == 0 {
             self.counters.skip_book += 1;
+            return;
+        }
+        if now.saturating_sub(book.ts_ns) >= TOUCH_FRESH_NS {
+            self.counters.skip_book_old += 1;
             return;
         }
         // The limit: `p − e`, down onto the leg's tick.

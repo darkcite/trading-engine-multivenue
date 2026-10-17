@@ -28,8 +28,25 @@
 //! STALE (the provider stopped refreshing it) is no quote: both sides
 //! absent until a fresh one arrives.
 //!
+//! ## PM15-5c: the Polymarket rolling 15-minute legs
+//!
+//! Their book is a delta stream: the ingress emits a leg's touch when it
+//! changes (and re-asserts it at each `PONG` of the market socket), so
+//! silence means unchanged, and "the first tick after activation" on a
+//! quiet leg is a LATER price — or none before the IoC's TTL, an unfilled
+//! order the venue would have filled. The venue matches a FAK against the
+//! book as it stands when its taker hold ends ([`PM_TAKER_HOLD_NS`], the
+//! `itode` markets); the law samples the quote in force at submit +
+//! [`PM_HELD_DELAY_NS`] (the activation Δ — the order's way there and the
+//! feed's way back — plus the hold) and judges once. The ingress withdraws
+//! every touch (a stale tick) when its session drops, so a dead socket
+//! leaves no quote in force. Only the rolling LEGS are held: the legacy
+//! Polymarket markets keep the strict-cross law, a rolling mark slot quotes
+//! nothing.
+//!
 //! Zero allocation: fixed arrays; `const fn new`.
 
+use core_types::pm_roll::{pm_rolling_of, PM_OFF_MARK, PM_ROLLING_MAX};
 use core_types::{Side, SymbolId, Tick};
 
 use crate::{judge_ioc, Touch, Verdict};
@@ -42,6 +59,22 @@ pub const HELD_SYMS: usize = 1024;
 
 /// The first option ordinal (`OPT_ORDINAL_BASE + 1`).
 pub const HELD_ORDINAL_FIRST: u32 = 513;
+
+/// PM15-5c: the Polymarket rolling legs, held after the Hypercall
+/// options — four leg offsets per family.
+pub const HELD_PM_LEGS: usize = PM_ROLLING_MAX * PM_OFF_MARK as usize;
+
+/// Quotes the book holds: the Hypercall options, then the rolling legs.
+pub const HELD_QUOTES: usize = HELD_SYMS + HELD_PM_LEGS;
+
+/// PM15-5c: Polymarket's taker hold on its crypto markets (`itode: true`),
+/// ns — 150 ms since 2026-09-04 14:00Z (the venue's changelog).
+pub const PM_TAKER_HOLD_NS: u64 = 150_000_000;
+
+/// PM15-5c: a rolling leg's IoC is judged at the quote in force this long
+/// after submit: the venue's activation Δ plus its taker hold.
+pub const PM_HELD_DELAY_NS: u64 =
+    crate::ACTIVATION_NS_DEFAULT[core_types::VenueId::Polymarket as usize] + PM_TAKER_HOLD_NS;
 
 /// IoCs pending at once.
 pub const HELD_PENDING: usize = 16;
@@ -119,9 +152,46 @@ pub const fn held_index(sym: SymbolId) -> Option<usize> {
     }
 }
 
+/// PM15-5c: whether `sym` is a Polymarket rolling leg (not its mark slot,
+/// not a legacy Polymarket market) — judged by this law.
+#[inline]
+#[must_use]
+pub const fn held_pm_leg(sym: SymbolId) -> bool {
+    matches!(pm_rolling_of(sym), Some((_, off)) if off < PM_OFF_MARK)
+}
+
+/// The book's quote index of `sym`: a Hypercall option ([`held_index`]),
+/// then a Polymarket rolling leg ([`held_pm_leg`]); `None` for every other
+/// symbol.
+#[inline]
+#[must_use]
+pub const fn quote_index(sym: SymbolId) -> Option<usize> {
+    if let Some(i) = held_index(sym) {
+        return Some(i);
+    }
+    match pm_rolling_of(sym) {
+        Some((f, off)) if off < PM_OFF_MARK => {
+            Some(HELD_SYMS + f * PM_OFF_MARK as usize + off as usize)
+        }
+        _ => None,
+    }
+}
+
+/// When an IoC on `sym` is judged, ns after its submit: a rolling leg at
+/// [`PM_HELD_DELAY_NS`], a Hypercall option at [`HELD_DELAY_NS`].
+#[inline]
+#[must_use]
+pub const fn held_delay_ns(sym: SymbolId) -> u64 {
+    if held_pm_leg(sym) {
+        PM_HELD_DELAY_NS
+    } else {
+        HELD_DELAY_NS
+    }
+}
+
 /// The book (module doc).
 pub struct HeldBook {
-    quotes: [HeldQuote; HELD_SYMS],
+    quotes: [HeldQuote; HELD_QUOTES],
     pending: [HeldOrder; HELD_PENDING],
     len: usize,
 }
@@ -137,7 +207,7 @@ impl HeldBook {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            quotes: [EMPTY_QUOTE; HELD_SYMS],
+            quotes: [EMPTY_QUOTE; HELD_QUOTES],
             pending: [EMPTY_ORDER; HELD_PENDING],
             len: 0,
         }
@@ -150,12 +220,12 @@ impl HeldBook {
         self.len
     }
 
-    /// Hold `tick` as its symbol's quote in force (a non-option symbol
-    /// is ignored). A side the tick does not quote is absent; a stale tick
-    /// quotes neither.
+    /// Hold `tick` as its symbol's quote in force (a symbol the book does
+    /// not hold is ignored). A side the tick does not quote is absent; a
+    /// stale tick quotes neither.
     #[inline]
     pub fn on_quote(&mut self, tick: &Tick) {
-        let Some(i) = held_index(tick.sym) else {
+        let Some(i) = quote_index(tick.sym) else {
             return;
         };
         if tick.is_stale() {
@@ -180,13 +250,13 @@ impl HeldBook {
     #[inline]
     #[must_use]
     pub fn quote(&self, sym: SymbolId) -> Option<HeldQuote> {
-        held_index(sym).map(|i| self.quotes[i])
+        quote_index(sym).map(|i| self.quotes[i])
     }
 
-    /// Take an IoC, judged at `now_ns + HELD_DELAY_NS`. `false` when the
-    /// book is full or the symbol is not an option ordinal.
+    /// Take an IoC, judged at its `due_ns` (submit + [`held_delay_ns`]).
+    /// `false` when the book is full or the symbol is not one it holds.
     pub fn submit(&mut self, o: HeldOrder) -> bool {
-        if self.len >= HELD_PENDING || held_index(o.sym).is_none() || o.qty_1e6 <= 0 || o.px_1e6 <= 0 {
+        if self.len >= HELD_PENDING || quote_index(o.sym).is_none() || o.qty_1e6 <= 0 || o.px_1e6 <= 0 {
             return false;
         }
         self.pending[self.len] = o;
@@ -206,7 +276,7 @@ impl HeldBook {
                 i += 1;
                 continue;
             }
-            let v = match held_index(o.sym) {
+            let v = match quote_index(o.sym) {
                 Some(k) => {
                     let q = &mut self.quotes[k];
                     let t = Touch {
@@ -373,5 +443,75 @@ mod tests {
         // Another venue's ordinal 513 is not a Hypercall option.
         assert_eq!(held_index(make_symbol_id(VenueId::Deribit, HELD_ORDINAL_FIRST)), None);
         assert_eq!(held_index(core_types::SYMBOL_ID_NONE), None);
+    }
+
+    /// PM15-5c: a rolling leg is held after the options; a quiet leg fills
+    /// at the quote in force at submit + 350 ms; the mark slot and the
+    /// legacy markets are not held; a withdrawn touch fills nothing.
+    #[test]
+    fn a_rolling_leg_is_judged_at_the_quote_in_force_after_the_hold() {
+        use core_types::pm_roll::{pm_mark_sym, pm_rolling_sym};
+        let leg = pm_rolling_sym(1, 1, 1);
+        assert_eq!(quote_index(leg), Some(HELD_SYMS + 4 + 3));
+        assert_eq!(
+            quote_index(pm_rolling_sym(PM_ROLLING_MAX - 1, 1, 1)),
+            Some(HELD_QUOTES - 1)
+        );
+        assert!(held_pm_leg(leg) && !held_pm_leg(pm_mark_sym(1)));
+        assert_eq!(quote_index(pm_mark_sym(1)), None);
+        assert_eq!(
+            quote_index(make_symbol_id(VenueId::Polymarket, 7)),
+            None,
+            "a legacy market keeps strict cross"
+        );
+        assert_eq!(held_index(leg), None, "hcv's index stays the options'");
+        assert_eq!(held_delay_ns(leg), 350_000_000);
+        assert_eq!(held_delay_ns(sym(0)), HELD_DELAY_NS);
+        let q = |bid: i64, ask: i64| {
+            Tick::new_stamped(
+                1,
+                VenueId::Polymarket,
+                leg,
+                1,
+                Price::from_raw(bid),
+                Qty::from_raw(9_000_000),
+                Price::from_raw(ask),
+                Qty::from_raw(4_000_000),
+                0,
+                0,
+            )
+        };
+        let mut b = HeldBook::new();
+        b.on_quote(&q(950_000, 960_000));
+        let o = HeldOrder::new(
+            held_delay_ns(leg),
+            leg,
+            Side::Bid,
+            970_000,
+            5_000_000,
+            3,
+            9,
+            VenueId::Polymarket as u8,
+        );
+        assert!(b.submit(o));
+        let mut got = None;
+        b.judge_due(349_999_999, |_, v| got = Some(v));
+        assert_eq!(got, None, "inside the hold");
+        // Quiet: nothing changed, and the quote in force fills.
+        b.judge_due(350_000_000, |_, v| got = Some(v));
+        assert_eq!(
+            got,
+            Some(Verdict::Fill {
+                px_1e6: 960_000,
+                qty_1e6: 4_000_000
+            })
+        );
+        // The session drops: the withdrawn touch fills nothing.
+        let mut down = q(0, 0);
+        down.flags = core_types::TICK_FLAG_STALE;
+        b.on_quote(&down);
+        assert!(b.submit(o));
+        b.judge_due(u64::MAX, |_, v| got = Some(v));
+        assert_eq!(got, Some(Verdict::Cancel));
     }
 }

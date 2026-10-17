@@ -2527,8 +2527,9 @@ pub struct PaperMatcher {
     queue: core_fill::QueueBook,
     /// HC11 (O-HC21): Hypercall IoCs, judged by the held-quote law —
     /// the provider's quote in force 2 s after submit
-    /// (`core_fill::held`). Its own table: the strict-cross members'
-    /// 64 slots are not shared with it.
+    /// (`core_fill::held`); PM15-5c: the Polymarket rolling legs' IoCs
+    /// too, at the quote in force after the venue's taker hold. Its own
+    /// table: the strict-cross members' 64 slots are not shared with it.
     held: core_fill::held::HeldBook,
     /// XMM XH2: order events waiting for [`Self::try_next_order_event`],
     /// FIFO.
@@ -2646,11 +2647,15 @@ impl PaperMatcher {
         // HC11 (O-HC21): a Hypercall (venue byte 9) IoC is judged by the
         // held-quote law in its own table; anything else on Hypercall —
         // a maker, which the venue cannot honour post-only — is
-        // unmodellable.
-        if venue == core_types::VenueId::Hypercall.to_u8() {
+        // unmodellable. PM15-5c: so is a Polymarket rolling leg's — its
+        // book is a delta stream (`core_fill::held` module docs); the
+        // member sends IoCs only.
+        if venue == core_types::VenueId::Hypercall.to_u8()
+            || core_fill::held::held_pm_leg(order.sym)
+        {
             if order.kind == core_fill::ORDER_KIND_IOC && px > 0 && qty > 0 {
                 let o = core_fill::held::HeldOrder::new(
-                    now_ns.saturating_add(core_fill::held::HELD_DELAY_NS),
+                    now_ns.saturating_add(core_fill::held::held_delay_ns(order.sym)),
                     order.sym,
                     order.side,
                     px,
@@ -2661,7 +2666,7 @@ impl PaperMatcher {
                 );
                 if self.held.submit(o) {
                     self.counters.intake = self.counters.intake.wrapping_add(1);
-                } else if core_fill::held::held_index(order.sym).is_none() {
+                } else if core_fill::held::quote_index(order.sym).is_none() {
                     self.counters.unroutable = self.counters.unroutable.wrapping_add(1);
                 } else {
                     self.counters.rejected_open_cap =
@@ -2878,19 +2883,19 @@ impl PaperMatcher {
     /// fill pass in emit order over one shared displayed-size budget.
     pub fn observe_tick(&mut self, tick: &Tick, now_ns: NsTs) {
         let sym = tick.sym;
-        // HC11 (O-HC21): the held-quote law — every due Hypercall IoC is
+        // HC11 (O-HC21): the held-quote law — every due held IoC (a
+        // Hypercall option's, PM15-5c a Polymarket rolling leg's) is
         // judged at the first record of ANY venue STAMPED at or after its
         // due instant, against the quote held BEFORE this record is
         // applied (so nothing after the instant leaks into the verdict);
-        // then a Hypercall quote becomes the one in force. The record's
-        // own stamp is the clock, not the drain instant: a quote stamped
-        // before the due instant but drained after it is still in force.
+        // then a held symbol's quote becomes the one in force (the book
+        // ignores every other symbol). The record's own stamp is the
+        // clock, not the drain instant: a quote stamped before the due
+        // instant but drained after it is still in force.
         if self.held.pending_len() > 0 {
             self.judge_held(tick.ts_ns, now_ns);
         }
-        if core_types::symbol_venue_byte(sym) == core_types::VenueId::Hypercall.to_u8() {
-            self.held.on_quote(tick);
-        }
+        self.held.on_quote(tick);
         // XMM XH2: the queue law's book. Every record of the symbol lands
         // what is due (a cancel or an expiry is never held back by a quiet
         // or degraded feed); only fresh two-sided evidence teaches it the
@@ -3360,7 +3365,7 @@ impl PaperMatcher {
         }
     }
 
-    /// Hypercall IoCs pending under the held-quote law (tests, `/state`).
+    /// IoCs pending under the held-quote law (tests, `/state`).
     #[inline]
     #[must_use]
     pub const fn held_pending(&self) -> usize {
@@ -3388,7 +3393,7 @@ pub struct PaperDispatcher {
     /// itself boot-constructed once by the engine, and its fixed arrays
     /// (≈ 60 KiB since XMM XH2: the strict table, the fill and
     /// order-event rings, the AMM and queue books; ≈ 93 KiB since HC11's
-    /// held-quote book, 1 024 quotes) are the same memory
+    /// held-quote book, 1 024 quotes; PM15-5c + 32 rolling legs) are the same memory
     /// either way. It moves by value only at boot — handed on a few times
     /// before the loop starts (the boot's `engine_loop_set_full` →
     /// `run_engine_loop` → `Engine::new`, plus `RoutedDispatcher::new` on
@@ -3849,6 +3854,71 @@ mod tests {
                 VenueId::Hypercall.to_u8()
             )
         );
+    }
+
+    /// PM15-5c: a Polymarket rolling leg's IoC is judged by the held-quote
+    /// law — on a quiet book the quote in force 350 ms after submit fills
+    /// it, at the first record of ANY venue stamped then; a legacy
+    /// Polymarket market keeps the strict-cross table.
+    #[test]
+    fn a_rolling_leg_ioc_fills_on_a_quiet_book_after_the_taker_hold() {
+        let mut m = PaperMatcher::new();
+        let leg = core_types::pm_roll::pm_rolling_sym(0, 1, 0);
+        let book = Tick::new_stamped(
+            500,
+            VenueId::Polymarket,
+            leg,
+            1,
+            Price::from_raw(950_000),
+            Qty::from_raw(9_000_000),
+            Price::from_raw(960_000),
+            Qty::from_raw(300_000_000),
+            0,
+            0,
+        );
+        m.observe_tick(&book, 500);
+        let mut o = Order::new(
+            1_000,
+            VenueId::Polymarket,
+            leg,
+            Side::Bid,
+            core_fill::ORDER_KIND_IOC,
+            Price::from_raw(970_000),
+            Qty::from_raw(200_000_000),
+            41,
+        );
+        o.strategy_id = 9;
+        m.submit(&o, 1_000);
+        assert_eq!(
+            (m.counters.intake, m.held_pending(), m.open_len()),
+            (1, 1, 0)
+        );
+        let other = |ts: u64| {
+            Tick::new_stamped(
+                ts,
+                VenueId::Binance,
+                core_types::make_symbol_id(VenueId::Binance, 1),
+                1,
+                Price::from_raw(1),
+                Qty::from_raw(1),
+                Price::from_raw(2),
+                Qty::from_raw(1),
+                0,
+                0,
+            )
+        };
+        m.observe_tick(&other(350_000_999), 350_000_999);
+        assert!(m.try_next_fill().is_none(), "inside the hold");
+        m.observe_tick(&other(350_001_000), 350_001_000);
+        let f = m.try_next_fill().expect("the quiet book's ask in force");
+        assert_eq!(
+            (f.px.raw(), f.qty.raw(), f.order_id, f.strategy_id),
+            (960_000, 200_000_000, 41, 9)
+        );
+        let mut legacy = o;
+        legacy.sym = core_types::make_symbol_id(VenueId::Polymarket, 7);
+        m.submit(&legacy, 2_000_000_000);
+        assert_eq!((m.held_pending(), m.open_len()), (0, 1));
     }
 
     /// HC11: a Hypercall IoC waiting for its held-quote verdict is an open

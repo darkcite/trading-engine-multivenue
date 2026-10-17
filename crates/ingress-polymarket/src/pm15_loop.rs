@@ -18,7 +18,7 @@
 //!
 //! | record | when |
 //! |---|---|
-//! | `Tick` on a leg slot | a ticking slot's touch changed (prices from the venue, sizes from its ladder, [`crate::book15`]) |
+//! | `Tick` on a leg slot | a ticking slot's touch changed (prices from the venue, sizes from its ladder, [`crate::book15`]); re-asserted unchanged at each `PONG` of the market socket; withdrawn (stale, zero) when the market session drops |
 //! | `InstrumentRoll` created / settled | a window opened / resolved or was retired (`core_types::pm_roll`) |
 //! | `OutcomeMeta` per leg | at creation and at every `tick_size_change` — the order law |
 //! | `Mark` on the `[mark]` slot | each Chainlink report of a family's asset, once per second |
@@ -99,8 +99,6 @@ pub enum Pm15Counter {
     SpecsPending,
     /// A window offered again.
     SpecsDuplicate,
-    /// PM15-5b: a bound window's published strike, re-emitted on CREATED.
-    StrikesPublished,
     /// A window offered too late (over, or older than its slot's).
     SpecsStale,
     /// A window for a family that does not exist.
@@ -137,6 +135,11 @@ pub enum Pm15Counter {
     RtdsReconnects,
     /// Market sessions lost.
     MarketReconnects,
+    /// PM15-5c: touches re-asserted unchanged at a market `PONG`.
+    TouchesReasserted,
+    /// PM15-5c: touches withdrawn (a stale tick) when the market session
+    /// dropped.
+    TouchesWithdrawn,
     /// Discovery: a window's market fetched and venue-law clean.
     DiscoveryOk,
     /// Discovery: a window's market refused by the venue law.
@@ -155,7 +158,6 @@ pub const PM15_COUNTER_NAMES: [&str; PM15_COUNTERS] = [
     "specs_bound",
     "specs_pending",
     "specs_duplicate",
-    "strikes_published",
     "specs_stale",
     "specs_refused",
     "rolls_created",
@@ -174,6 +176,8 @@ pub const PM15_COUNTER_NAMES: [&str; PM15_COUNTERS] = [
     "rtds_rejects",
     "rtds_reconnects",
     "market_reconnects",
+    "touches_reasserted",
+    "touches_withdrawn",
     "discovery_ok",
     "discovery_law_refused",
     "discovery_fetch_errors",
@@ -354,6 +358,9 @@ pub struct Pm15Driver {
     ladders: Box<[Ladder15]>,
     /// The touch last emitted per leg.
     last: [Touch15; PM15_LEGS],
+    /// The venue stamp of the touch last emitted per leg, ms: the
+    /// sequencer's key for its re-assertion and its withdrawal.
+    last_vt: [u64; PM15_LEGS],
     /// The arrival sequencer per leg (`Tick.venue_seq`).
     seq: [ArrivalSeq; PM15_LEGS],
     /// The newest Chainlink second emitted per family.
@@ -379,6 +386,7 @@ impl Pm15Driver {
             acts: PmActions::new(),
             ladders: ladders.into_boxed_slice(),
             last: [TOUCH_UNSEEN; PM15_LEGS],
+            last_vt: [0; PM15_LEGS],
             seq: [ArrivalSeq::ZERO; PM15_LEGS],
             last_mark_s: [0; core_types::pm_roll::PM_ROLLING_MAX],
             market_clock: FeedClock::new(stale_after_ms),
@@ -418,7 +426,6 @@ impl Pm15Driver {
             PmOffer::Bound => Pm15Counter::SpecsBound,
             PmOffer::Pending => Pm15Counter::SpecsPending,
             PmOffer::Duplicate => Pm15Counter::SpecsDuplicate,
-            PmOffer::Strike => Pm15Counter::StrikesPublished,
             PmOffer::Stale => Pm15Counter::SpecsStale,
             PmOffer::Refused => Pm15Counter::SpecsRefused,
         };
@@ -471,9 +478,26 @@ impl Pm15Driver {
         wire.queue(&parts[..n])
     }
 
-    /// The market session is gone: every ladder starts over at the next
-    /// open; the sequencers' and the estimator's clocks reset.
-    pub fn on_market_down(&mut self) {
+    /// The market session is gone: every touch emitted is withdrawn (a
+    /// stale tick, both sides zero — the member and the paper book stop
+    /// trusting it now, not at the idle law's next verdict); every ladder
+    /// starts over at the next open; the sequencers' and the estimator's
+    /// clocks reset.
+    pub fn on_market_down<C: Capture>(&mut self, ts_ns: NsTs, out: &mut Pm15Out<'_, C>) {
+        let mut i = 0usize;
+        while i < PM15_LEGS {
+            if self.last[i] != TOUCH_UNSEEN && self.fams.slot(i / 2).ticks() {
+                let none = Touch15 {
+                    bid_px: 0,
+                    bid_sz: 0,
+                    ask_px: 0,
+                    ask_sz: 0,
+                };
+                self.push_touch(i, none, self.last_vt[i], TICK_FLAG_STALE, ts_ns, out);
+                out.counters.inc(Pm15Counter::TouchesWithdrawn);
+            }
+            i += 1;
+        }
         self.reset_ladders();
         ArrivalSeq::reset_clocks(&mut self.seq);
         self.market_clock.reset();
@@ -489,6 +513,7 @@ impl Pm15Driver {
         while i < PM15_LEGS {
             self.ladders[i].clear();
             self.last[i] = TOUCH_UNSEEN;
+            self.last_vt[i] = 0;
             i += 1;
         }
     }
@@ -506,6 +531,7 @@ impl Pm15Driver {
         out.capture.raw_frame(ts_ns, p);
         out.status.add_msgs(1);
         if p == b"PONG" {
+            self.reassert_touches(ts_ns, out);
             return;
         }
         match kind_of(p) {
@@ -577,6 +603,7 @@ impl Pm15Driver {
                         self.ladders[i].clear();
                         self.last[i] = TOUCH_UNSEEN;
                         self.seq[i].reset_clock();
+                        self.last_vt[i] = 0;
                         leg += 1;
                     }
                     if wire.is_open() {
@@ -602,13 +629,6 @@ impl Pm15Driver {
                     }
                 }
                 PmAction::Created(s) => self.created(s as usize, ts_ns, out),
-                PmAction::Strike(s) => {
-                    // A repeat CREATED carrying the strike: the ledger
-                    // treats a repeat as a no-op, the member takes `v0`.
-                    let s = s as usize;
-                    let ev = self.created_event(s, ts_ns);
-                    emit_event(&ev, out);
-                }
                 PmAction::Settled {
                     slot,
                     instance,
@@ -643,26 +663,20 @@ impl Pm15Driver {
             .store(self.bound() as u64, Ordering::Relaxed);
     }
 
-    /// Slot `s`'s CREATED: `v0` the published strike ×1e6 (0 until the
-    /// venue publishes it), `v1` the window's end ns.
-    fn created_event(&self, s: usize, ts_ns: NsTs) -> ChannelEvent {
-        let b = self.fams.slot(s);
+    /// CREATED, the two legs' order law, and the touches as they stand.
+    fn created<C: Capture>(&mut self, s: usize, ts_ns: NsTs, out: &mut Pm15Out<'_, C>) {
+        let (instance, window) = (self.fams.slot(s).instance, self.fams.slot(s).spec.window);
         let (f, pair) = (s / PM_PAIRS, s % PM_PAIRS);
-        ChannelEvent::new(
+        let ev = ChannelEvent::new(
             ts_ns,
             VenueId::Polymarket,
             ChannelId::InstrumentRoll,
             pm_rolling_sym(f, pair, PM_LEG_UP),
-            pack_roll_seq(b.instance, PM_TWAP_S, s, false),
+            pack_roll_seq(instance, PM_TWAP_S, s, false),
             0,
-            b.spec.strike_1e6,
-            pm_window_end_ns(b.spec.window) as i64,
-        )
-    }
-
-    /// CREATED, the two legs' order law, and the touches as they stand.
-    fn created<C: Capture>(&mut self, s: usize, ts_ns: NsTs, out: &mut Pm15Out<'_, C>) {
-        let ev = self.created_event(s, ts_ns);
+            0,
+            pm_window_end_ns(window) as i64,
+        );
         emit_event(&ev, out);
         out.counters.inc(Pm15Counter::RollsCreated);
         let mut leg = 0u32;
@@ -714,6 +728,44 @@ impl Pm15Driver {
             return;
         }
         self.last[i] = t;
+        self.last_vt[i] = self.last_vt[i].max(venue_ms);
+        self.push_touch(i, t, venue_ms, 0, ts_ns, out);
+    }
+
+    /// The market socket answered our `PING`: it delivers in order, so every
+    /// frame sent before the `PONG` has been read and each touch emitted is
+    /// still the venue's — re-assert it, so a quiet book is not mistaken for
+    /// a stale one (`strategy_pm15::TOUCH_FRESH_NS`). At most one tick per
+    /// leg per `PM15_MARKET_PING_NS`.
+    fn reassert_touches<C: Capture>(&mut self, ts_ns: NsTs, out: &mut Pm15Out<'_, C>) {
+        let mut i = 0usize;
+        while i < PM15_LEGS {
+            if self.last[i] != TOUCH_UNSEEN
+                && self.ladders[i].is_ready()
+                && self.fams.slot(i / 2).ticks()
+            {
+                let t = self.last[i];
+                // The key of the touch re-asserted: the sequencer's newest,
+                // so it takes the next ordinal (a same-key duplicate does).
+                self.push_touch(i, t, self.last_vt[i], 0, ts_ns, out);
+                out.counters.inc(Pm15Counter::TouchesReasserted);
+            }
+            i += 1;
+        }
+    }
+
+    /// Stamp, sequence, capture and push leg `i`'s touch `t`; `flags` is
+    /// OR-ed with the clock's staleness verdict.
+    fn push_touch<C: Capture>(
+        &mut self,
+        i: usize,
+        t: Touch15,
+        venue_ms: u64,
+        flags: u8,
+        ts_ns: NsTs,
+        out: &mut Pm15Out<'_, C>,
+    ) {
+        let (s, leg) = (i / 2, (i % 2) as u32);
         let seq = self.seq[i].next(venue_ms);
         out.status.note_arrival_seq(seq);
         let judged = self.market_clock.judge(venue_ms, ts_ns);
@@ -733,7 +785,7 @@ impl Pm15Driver {
             Price::from_raw(t.ask_px),
             Qty::from_raw(t.ask_sz),
             venue_ms,
-            (judged.stale as u8) * TICK_FLAG_STALE,
+            flags | ((judged.stale as u8) * TICK_FLAG_STALE),
         );
         // §6.5: capture before the push.
         out.capture.tick(&tick);
@@ -1139,7 +1191,7 @@ fn market_down<C: Capture>(
     e: WsErr,
 ) {
     out.counters.note_ws_err(0, e);
-    driver.on_market_down();
+    driver.on_market_down(now, out);
     d.failed(now);
     out.status.inc_reconnects();
     out.status.set_state(IngressState::Backoff);

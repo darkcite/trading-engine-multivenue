@@ -1497,8 +1497,6 @@ pub struct Pm15Counters {
     pub rolls_refused: u64,
     /// Strikes estimated from the Chainlink reports (`[open−60, open−1]`).
     pub strikes_computed: u64,
-    /// Strikes taken from the venue's published `priceToBeat`.
-    pub strikes_published: u64,
     /// Windows whose strike could not be estimated (reports missing).
     pub strikes_missing: u64,
     /// Pricer runs inside the window that produced a price.
@@ -1513,15 +1511,22 @@ pub struct Pm15Counters {
     pub hold_observed: u64,
     /// Pricer holds: shape (past the end, out of range).
     pub hold_shape: u64,
-    /// PM15-5b: evaluations of a market with no strike — it opened before
-    /// the boot's reports and the venue has not published `priceToBeat`.
+    /// Evaluations of a market with no strike: it opened before the
+    /// boot's reports (the venue publishes `priceToBeat` only once the
+    /// window resolves, so none exists while it trades).
     pub hold_strike: u64,
     /// Entries skipped: the belief under `p_min`.
     pub skip_belief: u64,
     /// Entries skipped: the belief held, not yet on `persist` seconds.
     pub skip_persist: u64,
-    /// Entries skipped: no fresh ask on the favoured leg.
+    /// Entries skipped: no ask on the favoured leg (none quoted, or the
+    /// market socket went down — its stale tick).
     pub skip_book: u64,
+    /// Entries skipped: the favoured leg's touch neither changed nor was
+    /// re-asserted by the socket's `PONG` within `TOUCH_FRESH_NS`.
+    pub skip_book_old: u64,
+    /// Entries skipped: the favoured leg has no order law (tick) yet.
+    pub skip_law: u64,
     /// Entries skipped: the ask not `e` under the belief.
     pub skip_price: u64,
     /// Entries skipped: a cap, the order count or the minimum size.
@@ -1563,7 +1568,7 @@ pub struct Pm15Counters {
 
 /// How many cumulative tallies [`Pm15Counters`] carries (its fields from
 /// `rolls` through `settled_unknown`, in order).
-pub const PM15_TALLIES: usize = 29;
+pub const PM15_TALLIES: usize = 30;
 
 /// The metric suffix of each tally, in [`Pm15Counters::tallies`] order.
 pub const PM15_COUNTER_NAMES: [&str; PM15_TALLIES] = [
@@ -1572,7 +1577,6 @@ pub const PM15_COUNTER_NAMES: [&str; PM15_TALLIES] = [
     "rolls_unknown",
     "rolls_refused",
     "strikes_computed",
-    "strikes_published",
     "strikes_missing",
     "reprices",
     "hold_sigma",
@@ -1584,6 +1588,8 @@ pub const PM15_COUNTER_NAMES: [&str; PM15_TALLIES] = [
     "skip_belief",
     "skip_persist",
     "skip_book",
+    "skip_book_old",
+    "skip_law",
     "skip_price",
     "skip_cap",
     "skip_halt",
@@ -1608,7 +1614,6 @@ impl Pm15Counters {
             self.rolls_unknown,
             self.rolls_refused,
             self.strikes_computed,
-            self.strikes_published,
             self.strikes_missing,
             self.reprices,
             self.hold_sigma,
@@ -1620,6 +1625,8 @@ impl Pm15Counters {
             self.skip_belief,
             self.skip_persist,
             self.skip_book,
+            self.skip_book_old,
+            self.skip_law,
             self.skip_price,
             self.skip_cap,
             self.skip_halt,

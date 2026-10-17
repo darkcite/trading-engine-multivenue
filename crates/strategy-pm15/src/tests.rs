@@ -330,13 +330,8 @@ fn the_session_loss_bound_stops_entries_and_other_venues_rolls_are_not_ours() {
     m.on_venue_event(&other, &mut c);
     assert_eq!(m.counters().rolls_refused, 1);
     // Bind, buy at a loss, settle Down: the bound is spent.
-    m.on_venue_event(&roll(w, false, 81_000_000_000), &mut c);
-    assert_eq!(
-        m.counters().strikes_published,
-        0,
-        "a strike at creation is the first bind"
-    );
-    assert_eq!(m.market(0, pm_pair_of_window(w)).strike_src, 2);
+    m.on_venue_event(&roll(w, false, 0), &mut c);
+    assert_eq!(m.market(0, pm_pair_of_window(w)).strike_src, 0);
     let mk = &mut m.markets[0][pm_pair_of_window(w)];
     mk.pos_1e6[0] = 600_000_000;
     mk.cost_1e6[0] = 560_000_000;
@@ -354,7 +349,7 @@ fn an_unfilled_ioc_gives_its_room_back_at_its_deadline() {
         orders: Vec::new(),
     };
     let w = pm_window_of_open(OPEN).unwrap();
-    m.on_venue_event(&roll(w, false, 81_000_000_000), &mut c);
+    m.on_venue_event(&roll(w, false, 0), &mut c);
     let pair = pm_pair_of_window(w);
     m.markets[0][pair].pending = Pending {
         oid: 7,
@@ -385,4 +380,40 @@ fn an_unfilled_ioc_gives_its_room_back_at_its_deadline() {
         &mut c,
     );
     assert_eq!(m.counters().unknown_fills, 1);
+}
+
+/// PM15-5c: each book gate names its reason, and a quiet book — no change
+/// and no re-assertion for 7.9 s — is still a book to take from.
+#[test]
+fn the_book_gates_name_their_reason_and_a_quiet_book_still_takes() {
+    let mut m = member();
+    let now = 100 * S;
+    let mut c = TestCtx {
+        now,
+        orders: Vec::new(),
+    };
+    let w = pm_window_of_open(OPEN).unwrap();
+    let pair = pm_pair_of_window(w);
+    m.on_venue_event(&roll(w, false, 0), &mut c);
+    m.take(0, pair, 0, 990_000, now, &mut c);
+    assert_eq!(m.counters().skip_law, 1, "no order law yet");
+    m.on_venue_event(&law(w, PM_LEG_UP, 10_000), &mut c);
+    m.take(0, pair, 0, 990_000, now, &mut c);
+    assert_eq!(m.counters().skip_book, 1, "no ask yet");
+    m.on_tick(
+        &touch(w, PM_LEG_UP, now - 7_900_000_000, 920_000, 930_000),
+        &mut c,
+    );
+    m.take(0, pair, 0, 990_000, now, &mut c);
+    assert_eq!(c.orders.len(), 1, "{:?}", m.counters());
+    m.markets[0][pair].pending = Pending::default();
+    m.take(0, pair, 0, 990_000, now + 100_000_000, &mut c);
+    assert_eq!(m.counters().skip_book_old, 1, "8 s without a word");
+    // The socket went down: its stale tick takes the book away.
+    let mut down = touch(w, PM_LEG_UP, now, 0, 0);
+    down.flags = core_types::TICK_FLAG_STALE;
+    m.on_tick(&down, &mut c);
+    m.take(0, pair, 0, 990_000, now, &mut c);
+    assert_eq!(m.counters().skip_book, 2);
+    assert_eq!(c.orders.len(), 1);
 }

@@ -816,12 +816,14 @@ impl Default for IngressStatusSet {
 /// clocks. The subscribe-time snapshot of every bound token can arrive as
 /// ONE array frame (16 slots × 2 legs × ≤ 12 KiB measured per market), so
 /// the receive window is 1 MiB; the venue pings nothing, our `PING` every
-/// 10 s keeps the idle law fed.
+/// 5 s (`PM15_MARKET_PING_NS`) keeps the idle law fed. PM15-5c: idle at
+/// 12 s — two missed `PONG`s and a margin — so a silent session is down
+/// (its touches withdrawn) well inside a 20 s late window.
 pub const PM15_MARKET_WS: core_net::WsCfg = core_net::WsCfg {
     rx_cap: 1 << 20,
     tx_cap: 64 * 1024,
     establish_ns: 10_000_000_000,
-    idle_ns: 30_000_000_000,
+    idle_ns: 12_000_000_000,
 };
 
 /// PM15: the RTDS socket (one report a second per asset, ≈ 300 B each).
