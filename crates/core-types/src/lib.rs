@@ -48,6 +48,9 @@ pub use instrument_class::{InstrumentClass, ALL_CLASSES, INSTRUMENT_CLASSES};
 /// the top-of-book streams that carry no sequence number.
 pub mod arrival_seq;
 pub use arrival_seq::ArrivalSeq;
+/// PM15: Polymarket's rolling 15-minute up/down families — the slot pool,
+/// the window arithmetic and the roll-event conventions.
+pub mod pm_roll;
 
 // ---------------------------------------------------------------
 // Identifiers
@@ -1608,6 +1611,11 @@ pub enum ChannelId {
     /// | 32..48 | settlement TWAP seconds (`seconds:`, 0 = settle at `T`) |
     /// | 48..56 | family index in the boot `rolling` list |
     /// | 56..64 | 0 = created, 1 = settled |
+    ///
+    /// PM15: the same channel carries Polymarket's rolling 15-minute
+    /// up/down families (venue byte Polymarket), with the window index
+    /// in the outcome field and the strike unpublished at creation —
+    /// see [`pm_roll`].
     InstrumentRoll = 13,
     /// HC3: ONE quote provider's side of a Hypercall indicative quote —
     /// the per-provider detail behind the venue's `best_bid`/`best_ask`
