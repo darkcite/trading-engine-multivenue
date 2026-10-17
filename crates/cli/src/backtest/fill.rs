@@ -984,6 +984,15 @@ pub struct FillEngine {
     /// PVM B'3: the pine arm's bookkeeping (`OrderDone` queue, per-order
     /// filled totals). `None` — every legacy caller — is inert.
     pine: Option<Box<PineBook>>,
+    /// PVM B'3 T19b (impl-Bp §4.12 F5): `true` takes a strict-table
+    /// order's activation Δ by the wire `symbol_venue_byte` — the paper
+    /// dispatcher's law, which gives the legacy anchor sym 7 Polymarket's
+    /// Δ — instead of `model_venue_byte`. Off by default (every legacy
+    /// caller byte-identical); set by the 8g judged replay only.
+    /// pin:Bp-f5-switch-strict-delta — the switch moves the place's and a
+    /// modify's re-armed Δ; the fee column and the queue law stay on
+    /// `model_venue_byte` (F5 names the Δ only).
+    delta_by_symbol_venue: bool,
     /// HYPARB H2: pool state for AMM swaps, rebuilt from the tape's
     /// pool-event signals — the SAME `core_fill::AmmBook` the engine's
     /// paper matcher keeps. Boxed: 16 KiB of fixed arrays.
@@ -1106,6 +1115,7 @@ impl FillEngine {
             binary_halted: BTreeSet::new(),
             lifecycle: LifecycleReplay::default(),
             pine: None,
+            delta_by_symbol_venue: false,
             prediction_grid_refused: 0,
             prediction_short_refused_1e6: 0,
             prediction_short_refused_fills: 0,
@@ -1354,8 +1364,8 @@ impl FillEngine {
         self.open[i].px_1e6 = px;
         self.open[i].remaining_1e6 = qty;
         self.open[i].client_oid = order.client_oid;
-        self.open[i].t_active_ns =
-            emit_virt.saturating_add(self.params.latency_ns[o.venue as usize]);
+        self.open[i].t_active_ns = emit_virt
+            .saturating_add(self.params.latency_ns[self.delta_venue(o.sym, o.venue as usize)]);
         self.lifecycle.modifies += 1;
     }
 
@@ -1690,7 +1700,8 @@ impl FillEngine {
         }
         self.open[self.open_len] = OpenOrder {
             seq: self.seq_next,
-            t_active_ns: emit_virt.saturating_add(self.params.latency_ns[venue]),
+            t_active_ns: emit_virt
+                .saturating_add(self.params.latency_ns[self.delta_venue(order.sym, venue)]),
             expiry_ns: core_fill::expiry_at(emit_virt, order.ttl_ns),
             sym: order.sym,
             side: order.side,
@@ -2082,6 +2093,23 @@ impl FillEngine {
     /// PVM B'3: enable the `OrderDone` queue (the pine arm only; reserves
     /// at boot).
     #[cfg_attr(not(test), allow(dead_code))]
+    /// PVM B'3 T19b (impl-Bp §4.12 F5): judge activation Δ by the paper
+    /// dispatcher's `symbol_venue_byte` law (8g `--fills judged` only).
+    pub(crate) fn set_paper_delta_law(&mut self, on: bool) {
+        self.delta_by_symbol_venue = on;
+    }
+
+    /// The Δ column of a strict-table order on `sym` whose model venue is
+    /// `model_venue` (pin:Bp-f5-switch-strict-delta).
+    #[inline]
+    fn delta_venue(&self, sym: u32, model_venue: usize) -> usize {
+        if self.delta_by_symbol_venue {
+            symbol_venue_byte(sym) as usize
+        } else {
+            model_venue
+        }
+    }
+
     pub(crate) fn enable_pine_bookkeeping(&mut self, done_cap: usize) {
         self.pine = Some(Box::new(PineBook {
             done: Vec::with_capacity(done_cap),

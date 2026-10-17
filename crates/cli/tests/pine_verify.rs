@@ -505,6 +505,28 @@ fn verify_unusable_tape_exits_2() {
         let mut off = window(&r, "1767225600000");
         off.set.rows[0].1 = 0x00FF;
         assert!(matches!(verify_window(off).elig, Elig::Ineligible(s) if s.contains("disabled")));
+        // Rules 4/6 fail closed (risk review r21): no rows, a row gap over 10 s, a drop in the
+        // first row, and a short row are each ineligible, never a pass.
+        let mut empty = window(&r, "1767225600000");
+        empty.set.rows.clear();
+        assert!(matches!(verify_window(empty).elig, Elig::Ineligible(s) if s.contains("no rows")));
+        let mut gap = window(&r, "1767225600000");
+        let mut late = gap.set.rows[gap.set.rows.len() - 1].clone();
+        late.0 += 10_001;
+        gap.set.rows.push(late);
+        assert!(matches!(verify_window(gap).elig, Elig::Ineligible(s) if s.contains("10 s apart")));
+        let k = r
+            .set
+            .names
+            .iter()
+            .position(|n| n == "rejected_open_cap")
+            .expect("column");
+        let mut drop0 = window(&r, "1767225600000");
+        drop0.set.rows[0].2[k] = 1;
+        assert!(matches!(verify_window(drop0).elig, Elig::Ineligible(s) if s.contains("dropped")));
+        let mut short = window(&r, "1767225600000");
+        short.set.rows[0].2.truncate(k);
+        assert!(matches!(verify_window(short).elig, Elig::Ineligible(s) if s.contains("dropped")));
         assert!(seq_from_bytes(&[0u8; 129]).is_err());
         assert!(dec_from_bytes(&[0u8; 65]).is_err());
         let _ = std::fs::remove_dir_all(&r.dir);

@@ -650,7 +650,9 @@ impl PineDrain {
                 Err(e) => tracing::error!(error = %e, "pine: tape write failed"),
             }
             let mask = u16::try_from(strat.enabled_mask() & 0xFFFF).unwrap_or(u16::MAX);
-            let _ = t.set_line(utc_ms, mask, &matcher_row(matcher));
+            if let Err(e) = t.set_line(utc_ms, mask, &matcher_row(matcher)) {
+                tracing::error!(error = %e, "pine: set.tsv write failed — window void");
+            }
         }
     }
 }

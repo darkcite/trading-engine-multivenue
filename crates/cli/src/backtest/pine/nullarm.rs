@@ -38,8 +38,11 @@
 //!   peak signed quantity, the bar indices of the last marks seen, net
 //!   `pnl_1e12` (cash change − fees) and `PNL_NET`; a fill that crosses
 //!   zero closes the episode with its closing part and opens the next with
-//!   the rest. An episode open at the end is not fed (pin:Bp-open-trades-unread
-//!   binds both arms alike).
+//!   the rest. An episode open at a completed run's end is fed once through
+//!   `on_open_trade_at_end`, as the signal's open trades are (R4c; the
+//!   former pin:Bp-open-trades-unread is retired): its `TradeRec` carries
+//!   the entry side only — `entry_ms`, the increasing fills' VWAP, the peak
+//!   signed quantity, `entry_bar`, `PNL_NET` (pin:Bp-null-open-episode-trade).
 //! - pin:Bp-null-fill-counts — `ioc_filled` / `maker_filled` count orders
 //!   with a fill at their disposition; `ioc_remainder_cancelled` an IoC
 //!   judged with less than its quantity filled.
@@ -829,6 +832,26 @@ impl NullArm {
         }
     }
 
+    /// pin:Bp-null-open-episode-trade: the episode open at the end, once.
+    fn feed_open_at_end(&mut self) {
+        let Some(ep) = self.ep.as_ref() else {
+            return;
+        };
+        let t = TradeRec {
+            entry_ms: ep.entry_ms,
+            entry_px_1e6: if ep.inc_qty == 0 {
+                0
+            } else {
+                (ep.inc_px_qty / ep.inc_qty) as i64
+            },
+            qty_1e6: ep.peak_1e6,
+            entry_bar: ep.entry_bar,
+            flags: pine_ir::trade_flag::PNL_NET,
+            ..TradeRec::default()
+        };
+        self.accum.on_open_at_end(&t);
+    }
+
     fn close_episode(&mut self, exit_ms: i64) {
         let Some(ep) = self.ep.take() else {
             return;
@@ -1174,6 +1197,15 @@ impl NullArms {
         }
     }
 
+    /// Every arm's episode open at a completed run's end, once.
+    pub(crate) fn feed_open_at_end(&mut self) {
+        let mut a = 0;
+        while a < self.arms.len() {
+            self.arms[a].feed_open_at_end();
+            a += 1;
+        }
+    }
+
     /// The per-cut fee drain of every arm.
     pub(crate) fn drain_fees(&mut self, prov: &FeeProvenance, descriptors: &[(u32, String)]) {
         let mut a = 0;
@@ -1220,6 +1252,13 @@ impl<'p> ArmsHook<'p> {
         self.nulls.finish();
         self.signal.drain_fees(fills);
         self.nulls.drain_fees(self.prov, self.descriptors);
+    }
+
+    /// R4c: every arm's trades open at a completed run's end, each once,
+    /// before the rows finish (pin:Bp-open-at-end-completed-only).
+    pub(crate) fn feed_open_at_end(&mut self, m: &StrategySet) {
+        self.signal.feed_open_at_end(m);
+        self.nulls.feed_open_at_end();
     }
 }
 

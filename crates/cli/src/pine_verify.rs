@@ -64,6 +64,8 @@ use strategy_core::{
 use strategy_pine::{HostKind, PineBootCfg, PineStrategy, SlotRoute, WarmSlice};
 use strategy_set::{StampCtx, SLOT_PINE};
 
+pub mod cross;
+
 /// I45: the fields 8g-A does not compare — exactly these three, printed with every result.
 pub const EXCLUDED: [&str; 3] = ["order_ts_ns", "client_oid_base", "header_stamp"];
 /// D23's pool floor: dispatched submits.
@@ -355,6 +357,9 @@ pub struct WindowOut {
     pub diffs: u64,
     /// The first difference: index and both sides.
     pub first_diff: Option<String>,
+    /// 8g-B against the paired replay-from-boot tapes (T22), when `--cross` was given (boxed:
+    /// keeps `WindowOut` small as an `Err`).
+    pub cross: Option<Box<cross::CrossOut>>,
 }
 
 fn out(label: &str, elig: Elig) -> WindowOut {
@@ -365,7 +370,34 @@ fn out(label: &str, elig: Elig) -> WindowOut {
         fills: 0,
         diffs: 0,
         first_diff: None,
+        cross: None,
     }
+}
+
+/// 8g-B's per-script facts from the boot configuration (pin:08-cross-script-syms,
+/// pin:08-cross-t-active); TTL and trade-time reads are filled from the started member.
+fn cross_facts(cfg: &PineBootCfg) -> Vec<cross::ScriptFacts> {
+    let sym_of = |k: &str| cfg.symbols.iter().find(|f| f.key == k).map(|f| f.sym);
+    cfg.manifest
+        .scripts
+        .iter()
+        .map(|sc| {
+            let sym = sym_of(&sc.symbol).unwrap_or_default();
+            let mut syms = vec![sym];
+            for (k, _) in &sc.symbols {
+                if let Some(s) = sym_of(k).filter(|s| !syms.contains(s)) {
+                    syms.push(s);
+                }
+            }
+            let v = usize::from(core_types::symbol_venue_byte(sym));
+            cross::ScriptFacts {
+                sym,
+                syms,
+                delta_ns: cfg.activation_ns.get(v).copied().unwrap_or(u64::MAX),
+                ..cross::ScriptFacts::default()
+            }
+        })
+        .collect()
 }
 
 fn gapless<T>(v: &[T], first: u64, seq: impl Fn(&T) -> u64) -> bool {
@@ -373,7 +405,24 @@ fn gapless<T>(v: &[T], first: u64, seq: impl Fn(&T) -> u64) -> bool {
 }
 
 /// Rules 4 and 6 over `set.tsv`: bit 8 in every line; `rejected_open_cap` never moved.
+/// Longest gap between two consecutive `set.tsv` rows (written every 5 s) that rules 4 and 6
+/// still accept; a longer gap means a lost row (pin:08-set-row-gap).
+const SET_ROW_GAP_MAX_MS: i64 = 10_000;
+
+/// Rules 4 and 6. An answer that cannot be shown is ineligible, never a pass (risk review r21):
+/// no rows, a row gap, a short row or a non-zero `rejected_open_cap` all fail closed.
 fn set_rules(set: &SetTsv) -> Option<String> {
+    if set.rows.is_empty() {
+        return Some("rules 4/6 cannot be shown: set.tsv has no rows".to_string());
+    }
+    for w in set.rows.windows(2) {
+        if w[1].0 - w[0].0 > SET_ROW_GAP_MAX_MS {
+            return Some(format!(
+                "set.tsv rows {} → {} are more than 10 s apart",
+                w[0].0, w[1].0
+            ));
+        }
+    }
     let bit = 1u16 << SLOT_PINE;
     if let Some((utc, mask, _)) = set.rows.iter().find(|(_, m, _)| m & bit == 0) {
         return Some(format!("slot 8 disabled at {utc} (mask {mask:#06x})"));
@@ -381,8 +430,8 @@ fn set_rules(set: &SetTsv) -> Option<String> {
     let Some(k) = set.names.iter().position(|n| n == "rejected_open_cap") else {
         return Some("set.tsv names no rejected_open_cap column".to_string());
     };
-    let first = set.rows.first().and_then(|r| r.2.get(k)).copied();
-    if set.rows.iter().any(|r| r.2.get(k).copied() != first) {
+    // The matcher is fresh at the pine boot, so every row must read 0 (a short row fails too).
+    if set.rows.iter().any(|r| r.2.get(k).copied() != Some(0)) {
         return Some("the paper matcher dropped orders (rejected_open_cap moved)".to_string());
     }
     None
@@ -412,6 +461,13 @@ fn drain_seq(member: &PineStrategy, buf: &mut [PineSeqRec], next: &mut u64) {
 /// 8g-A over one window (§4.9.3 steps 2–6) with eligibility rules 1–6.
 #[must_use]
 pub fn verify_window(w: WindowIn) -> WindowOut {
+    verify_window_cross(w, None)
+}
+
+/// [`verify_window`], then 8g-B (§4.9.4) of the recorded tapes against `rep`, the paired
+/// replay-from-boot tapes (rule 7 is the caller's: a missing pair never reaches here).
+#[must_use]
+pub fn verify_window_cross(w: WindowIn, rep: Option<&cross::Tapes>) -> WindowOut {
     let WindowIn {
         label,
         mut cfg,
@@ -459,6 +515,7 @@ pub fn verify_window(w: WindowIn) -> WindowOut {
     cfg.boot_record = record;
     cfg.warmup = None;
     let boot_ms = cfg.boot_utc_ms;
+    let mut facts = cross_facts(&cfg);
     // Step 3.
     let mut member = PineStrategy::new();
     let needs = match member.configure(cfg) {
@@ -567,6 +624,16 @@ pub fn verify_window(w: WindowIn) -> WindowOut {
         .filter(|r| r.kind == pine_tape::DISPATCH && r.a == pine_ir::EngineVerb::Submit as u8)
         .count() as u64;
     let fills = want.iter().filter(|r| r.kind == pine_tape::FILL).count() as u64;
+    let cross = rep.map(|rep| {
+        let live = cross::Tapes { seq, dec };
+        for (s, f) in facts.iter_mut().enumerate() {
+            f.ttl_ns = member
+                .native_cfg(s)
+                .map_or(0, |n| u64::try_from(n.quote_stale_ns).unwrap_or(0));
+            f.trade_time = member.program(s).is_some_and(cross::calls_trade_time);
+        }
+        Box::new(cross::cross(&live, rep, &facts))
+    });
     WindowOut {
         label,
         elig: Elig::Eligible,
@@ -574,6 +641,7 @@ pub fn verify_window(w: WindowIn) -> WindowOut {
         fills,
         diffs,
         first_diff,
+        cross,
     }
 }
 
@@ -589,7 +657,10 @@ pub struct Verdict {
 }
 
 /// Pool the windows in time order (pin:08-verify-pool-all-eligible) and render the line.
-/// 8g-B is T22: its five counts are 0 here.
+/// The 8g-B class counts sum over the eligible windows' `cross` (0 without `--cross`).
+/// pin:08-cross-prefix-floor: with `--cross`, D23's floor binds the 8g-B prefixes too (Σ
+/// `prefix_orders` ≥ 200, Σ `prefix_fills` ≥ 50, §4.9.5 "for 8g-B, the prefix counts"); the
+/// `8g` line's `orders` / `fills` stay 8g-A's, the prefixes print per window.
 #[must_use]
 pub fn pool(windows: &[WindowOut]) -> Verdict {
     let mut ws: Vec<&WindowOut> = windows.iter().collect();
@@ -598,17 +669,28 @@ pub fn pool(windows: &[WindowOut]) -> Verdict {
     let orders: u64 = el.iter().map(|w| w.orders).sum();
     let fills: u64 = el.iter().map(|w| w.fills).sum();
     let diffs: u64 = el.iter().map(|w| w.diffs).sum();
+    let crossed: Vec<&cross::CrossOut> = el.iter().filter_map(|w| w.cross.as_deref()).collect();
+    let n = |c: cross::Class| crossed.iter().map(|x| x.counts[c as usize]).sum::<u64>();
+    let unattributed = n(cross::Class::Unattributed);
     let line = format!(
-        "8g windows={} eligible={} orders={orders} fills={fills} diffs={diffs} straddles=0 \
-         expiry_straddles=0 interleaves=0 stale_rejudged=0 fill_stamps=0 unattributed=0 \
-         excluded={}",
+        "8g windows={} eligible={} orders={orders} fills={fills} diffs={diffs} straddles={} \
+         expiry_straddles={} interleaves={} stale_rejudged={} fill_stamps={} \
+         unattributed={unattributed} excluded={}",
         ws.len(),
         el.len(),
+        n(cross::Class::Straddle),
+        n(cross::Class::ExpiryStraddle),
+        n(cross::Class::Interleave),
+        n(cross::Class::StaleRejudge),
+        n(cross::Class::FillStamp),
         EXCLUDED.join(",")
     );
-    let exit = if diffs > 0 {
+    let p_orders: u64 = crossed.iter().map(|x| x.prefix_orders).sum();
+    let p_fills: u64 = crossed.iter().map(|x| x.prefix_fills).sum();
+    let short_b = !crossed.is_empty() && (p_orders < POOL_SUBMITS || p_fills < POOL_FILLS);
+    let exit = if diffs > 0 || unattributed > 0 {
         EXIT_RED
-    } else if el.is_empty() || orders < POOL_SUBMITS || fills < POOL_FILLS {
+    } else if el.is_empty() || orders < POOL_SUBMITS || fills < POOL_FILLS || short_b {
         EXIT_UNUSABLE
     } else {
         EXIT_GREEN
@@ -617,17 +699,37 @@ pub fn pool(windows: &[WindowOut]) -> Verdict {
 }
 
 /// The per-window lines printed before the `8g` line: every ineligible window with its reason,
-/// every red one with its first difference.
+/// every red one with its first difference; with `--cross`, each window's 8g-B prefix counts and
+/// every script's divergence point with its class and both sides.
 #[must_use]
 pub fn window_lines(windows: &[WindowOut]) -> Vec<String> {
-    windows
-        .iter()
-        .filter_map(|w| match (&w.elig, &w.first_diff) {
-            (Elig::Ineligible(r), _) => Some(format!("window {} ineligible: {r}", w.label)),
-            (Elig::Eligible, Some(d)) => Some(format!("window {} diffs={}: {d}", w.label, w.diffs)),
-            (Elig::Eligible, None) => None,
-        })
-        .collect()
+    let mut v = Vec::new();
+    for w in windows {
+        match (&w.elig, &w.first_diff) {
+            (Elig::Ineligible(r), _) => v.push(format!("window {} ineligible: {r}", w.label)),
+            (Elig::Eligible, Some(d)) => {
+                v.push(format!("window {} diffs={}: {d}", w.label, w.diffs));
+            }
+            (Elig::Eligible, None) => {}
+        }
+        let Some(c) = w.cross.as_ref().filter(|_| w.elig == Elig::Eligible) else {
+            continue;
+        };
+        v.push(format!(
+            "window {} cross prefix_orders={} prefix_fills={} divergences={}",
+            w.label,
+            c.prefix_orders,
+            c.prefix_fills,
+            c.divergences.len()
+        ));
+        for d in &c.divergences {
+            v.push(format!(
+                "window {} script {} diverges at {} ({:?}): {}",
+                w.label, d.script, d.index, d.class, d.detail
+            ));
+        }
+    }
+    v
 }
 
 /// `pine-verify --check <manifest> [--exec <exec.toml>]` (§4.9.6): 8a offline over a configured
@@ -869,10 +971,66 @@ pub fn load_window(tape_dir: &Path, o: &VerifyOpts) -> Result<Loaded, String> {
 /// tape is exit 2 with its reason.
 #[must_use]
 pub fn run(tapes: &[PathBuf], o: &VerifyOpts) -> (Vec<String>, u8) {
+    run_cross(tapes, o, None)
+}
+
+/// 8g-B's pairing (§4.9.4, rule 7): the replay-from-boot tapes under `root` with the live tape
+/// directory's label. pin:08-cross-pair-by-label: no `<root>/<label>/` → the window is
+/// ineligible (the replay did not accept the capture); a torn file → unreadable (exit 2); a seq
+/// gap in either replay tape or a different `BOOT_SCRIPT` set → ineligible.
+///
+/// # Errors
+/// An unreadable replay tape.
+pub fn pair(
+    root: &Path,
+    label: &str,
+    live_dec: &[PineTapeRec],
+) -> Result<Result<cross::Tapes, String>, String> {
+    let dir = root.join(label);
+    if !dir.is_dir() {
+        return Ok(Err(format!(
+            "8g-B: no replay-from-boot tape {} (rule 7)",
+            dir.display()
+        )));
+    }
+    let rep = cross::read_tapes(&dir)?;
+    if !gapless(&rep.seq, 1, |r| r.seq) || !gapless(&rep.dec, 0, |r| r.seq) {
+        return Ok(Err("8g-B: a seq gap in the replay tapes".to_string()));
+    }
+    let live = cross::Tapes {
+        seq: Vec::new(),
+        dec: live_dec.to_vec(),
+    };
+    Ok(cross::boot_mismatch(&live, &rep).map_or(Ok(rep), Err))
+}
+
+/// [`run`] with 8g-B against the replay-from-boot tapes under `cross_root` (`--cross`).
+#[must_use]
+pub fn run_cross(
+    tapes: &[PathBuf],
+    o: &VerifyOpts,
+    cross_root: Option<&Path>,
+) -> (Vec<String>, u8) {
+    let unreadable = |t: &Path, e: String| {
+        (
+            vec![format!("pine-verify: {}: {e}", t.display())],
+            EXIT_UNUSABLE,
+        )
+    };
     let mut outs = Vec::with_capacity(tapes.len());
     for t in tapes {
         match load_window(t, o) {
-            Ok(Loaded::Window(w)) => outs.push(verify_window(*w)),
+            Ok(Loaded::Window(w)) => {
+                let Some(root) = cross_root else {
+                    outs.push(verify_window(*w));
+                    continue;
+                };
+                match pair(root, &w.label, &w.dec) {
+                    Ok(Ok(rep)) => outs.push(verify_window_cross(*w, Some(&rep))),
+                    Ok(Err(r)) => outs.push(out(&w.label, Elig::Ineligible(r))),
+                    Err(e) => return unreadable(t, e),
+                }
+            }
             Ok(Loaded::Out(w)) => outs.push(w),
             Err(e) => {
                 return (
@@ -900,7 +1058,8 @@ pub struct PineVerifyArgs {
     /// (default `~/multivenue/capture`).
     #[arg(long)]
     pub capture: Option<PathBuf>,
-    /// 8g-B: impl-Bp's replay-from-boot tapes (T22; refused until it lands).
+    /// 8g-B: the root of impl-Bp's replay-from-boot tapes (`backtest --replay-from-boot
+    /// --tape-out <dir>`), paired with each `--tape` by its `<boot_utc_ms>` label (T22).
     #[arg(long)]
     pub cross: Option<PathBuf>,
     /// Where the manifests live (default `~/multivenue/pine`).
@@ -976,11 +1135,6 @@ pub fn main(a: &PineVerifyArgs) -> u8 {
         println!("{msg}");
         return code;
     }
-    if a.cross.is_some() {
-        // T22 (8g-B) needs impl-Bp's replay-from-boot tapes; not wired in this cut.
-        eprintln!("pine-verify: --cross (8g-B) is not available in this build");
-        return EXIT_UNUSABLE;
-    }
     if a.tapes.is_empty() {
         eprintln!("pine-verify: no --tape given");
         return EXIT_UNUSABLE;
@@ -991,7 +1145,7 @@ pub fn main(a: &PineVerifyArgs) -> u8 {
         exec: a.exec.clone(),
         bars_root: a.pine_bars.clone().unwrap_or_else(|| mv("pine/bars")),
     };
-    let (lines, code) = run(&a.tapes, &o);
+    let (lines, code) = run_cross(&a.tapes, &o, a.cross.as_deref());
     for l in &lines {
         println!("{l}");
     }

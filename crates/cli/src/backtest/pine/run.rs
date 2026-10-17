@@ -176,7 +176,7 @@ fn parse_hex32(s: &str) -> Option<[u8; 32]> {
 }
 
 /// pin:Bp-replay-dir-plan.
-fn plan_from_runs(runs: &[RunDir]) -> Result<CutPlan, HarnessError> {
+pub(crate) fn plan_from_runs(runs: &[RunDir]) -> Result<CutPlan, HarnessError> {
     let mut rows = Vec::with_capacity(runs.len());
     for (k, r) in runs.iter().enumerate() {
         let span = span_prepass(r)?;
@@ -377,6 +377,7 @@ pub(crate) fn boot_member(
         virt_ns: 0,
         intake_refused: 0,
         emits: Vec::new(),
+        judge: None,
     };
     set.on_start(&mut ctx)
         .map_err(|e| pre(format!("pine: on_start refused: {e:?}")))?;
@@ -590,6 +591,9 @@ fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
     // The null models retire what they hold; every arm's fees drain (the
     // fault path left the drive before its last per-cut drain).
     hook.finish(&mut fills);
+    if fault.is_none() {
+        hook.feed_open_at_end(&b.set);
+    }
     let mut ledger = hook.signal.ledger.clone();
     for n in &hook.nulls.arms {
         ledger.append_section(&n.ledger); // pin:Bp-null-fee-section

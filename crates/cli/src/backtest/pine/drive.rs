@@ -114,6 +114,11 @@ pub(crate) struct PineCtx<'a> {
     pub(crate) intake_refused: u64,
     /// This record's emissions (cleared after the hook saw them).
     pub(crate) emits: Vec<(Order, bool)>,
+    /// 8g `--fills judged` (T19b, §4.12): each emission is taken at the
+    /// captured stamp of its slot-8 order, and only the member's own
+    /// orders' fills reach it (other slots' share the model). `None` on
+    /// every other drive.
+    pub(crate) judge: Option<&'a mut super::boot::JudgedClock>,
 }
 
 /// pin:Bp-refusal-map-t14 — a model refusal maps to the `SubmitErr` the
@@ -129,7 +134,11 @@ fn submit_err_of(r: IntakeRefusal) -> SubmitErr {
 
 impl PineCtx<'_> {
     fn take(&mut self, o: &Order) -> Result<(), SubmitErr> {
-        let r = self.fills.intake_checked(o, self.virt_ns);
+        let at = match self.judge.as_deref_mut() {
+            Some(j) => j.emit_virt(o, self.virt_ns),
+            None => self.virt_ns,
+        };
+        let r = self.fills.intake_checked(o, at);
         // COPY: one emitted Order (64 B) into the record's log — the null
         // arms mirror it after the callback — a borrow rejected: the
         // member's order is a by-value argument gone at return.
@@ -141,6 +150,13 @@ impl PineCtx<'_> {
                 Err(submit_err_of(r))
             }
         }
+    }
+}
+
+impl PineCtx<'_> {
+    /// Whether a model fill of `oid` is the member's (always, off 8g judged).
+    fn mine(&self, oid: u64) -> bool {
+        self.judge.as_deref().is_none_or(|j| j.is_member_oid(oid))
     }
 }
 
@@ -251,7 +267,7 @@ pub(crate) struct DriveFail {
 }
 
 /// Load one cut's kept records, rebased, APPENDED to `buf`.
-fn load_cut(
+pub(crate) fn load_cut(
     cfg: &DriveCfg<'_>,
     k: usize,
     root: std::path::PathBuf,
@@ -314,7 +330,7 @@ fn load_cut(
 }
 
 /// The per-record state carried across cuts.
-struct Loop {
+pub(crate) struct Loop {
     period: u64,
     next_timer: Option<u64>,
     scratch: Vec<SynthFill>,
@@ -324,7 +340,18 @@ struct Loop {
 }
 
 impl Loop {
-    fn step<M: PineMember, H: DriveHook<M>>(
+    /// A loop for a member whose timer period is `period` (the 8g drive).
+    pub(crate) fn new(period: u64) -> Self {
+        Self {
+            period,
+            next_timer: None,
+            scratch: Vec::with_capacity(MAX_OPEN_TOTAL),
+            dones: Vec::with_capacity(MAX_OPEN_TOTAL),
+            done_log: Vec::with_capacity(MAX_OPEN_TOTAL),
+        }
+    }
+
+    pub(crate) fn step<M: PineMember, H: DriveHook<M>>(
         &mut self,
         rec: &MergedRec,
         m: &mut M,
@@ -376,6 +403,10 @@ impl Loop {
         let mut i = 0;
         while i < self.scratch.len() {
             let f = self.scratch[i];
+            if !ctx.mine(f.client_oid) {
+                i += 1;
+                continue;
+            }
             let mut fill = Fill::new(
                 rec.wall_ns,
                 f.sym,
@@ -395,7 +426,7 @@ impl Loop {
     }
 
     /// The hook sees the record's signal activity, then the logs reset.
-    fn after<M: PineMember, H: DriveHook<M>>(
+    pub(crate) fn after<M: PineMember, H: DriveHook<M>>(
         &mut self,
         m: &mut M,
         ctx: &mut PineCtx<'_>,
@@ -416,7 +447,7 @@ impl Loop {
         ctx.emits.clear();
     }
 
-    fn deliver_done<M: PineMember>(&mut self, m: &mut M, ctx: &mut PineCtx<'_>) {
+    pub(crate) fn deliver_done<M: PineMember>(&mut self, m: &mut M, ctx: &mut PineCtx<'_>) {
         // A member may retire more orders from inside `on_order_done`
         // (a cancel): drain until quiet.
         loop {
@@ -503,6 +534,7 @@ fn drive_inner<M: PineMember, S: CutSource, H: DriveHook<M>>(
         virt_ns: 0,
         intake_refused: 0,
         emits: Vec::with_capacity(MAX_OPEN_TOTAL),
+        judge: None,
     };
     let fail = |out: &DriveOut, err| DriveFail {
         exit: if out.records == 0 { 6 } else { 1 },

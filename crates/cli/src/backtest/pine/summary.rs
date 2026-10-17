@@ -19,13 +19,13 @@
 //! - pin:Bp-baseline-none-in-window — a completed arm no mark of which
 //!   reached the window is baselined at finish on its last equity and
 //!   commission (flat series, net 0): `finish` requires a baseline.
-//! - pin:Bp-closed-retained-9000 — R4's `closed_trade` is RETAINED-indexed;
-//!   the broker retains `min(closedtrades, 9000)` (impl-05 §3.6.1, TV's
-//!   cap), so absolute trade `k` is retained `k − (count − min(count,
-//!   9000))`; strategy-pine exposes no `closed_retained` (request R4b).
-//! - pin:Bp-open-trades-unread — R4 exposes no open-trade read-back, so the
-//!   signal arm feeds no `on_open_trade_at_end` (request R4c); `trades`
-//!   counts the closed ones only until it lands.
+//! - R4's `closed_trade` is RETAINED-indexed: absolute trade `k` is
+//!   retained `k − (closed_count − closed_retained)` (impl-08 R4b; the
+//!   former pin:Bp-closed-retained-9000 is retired).
+//! - Each trade still open at a completed run's end is fed once through
+//!   `on_open_trade_at_end` from R4c's `open_count` / `open_trade` (the
+//!   former pin:Bp-open-trades-unread is retired); a FAULTED row is not fed
+//!   (pin:Bp-open-at-end-completed-only).
 //! - pin:Bp-accum-reserve-window — `reserve(window bars + 2, window days)`:
 //!   bars = the window span over the timeframe; the accumulator clamps a
 //!   longer hold into its last bucket and ignores a bar index past it.
@@ -44,9 +44,6 @@ use strategy_set::StrategySet;
 use super::drive::{DriveHook, SignalRec};
 use super::fees::{ArmFees, FeeLedger, FeeProvenance};
 use crate::backtest::fill::{FeeCharge, FillEngine, MAX_OPEN_TOTAL};
-
-/// pin:Bp-closed-retained-9000.
-pub(crate) const CLOSED_RETAINED_CAP: u32 = 9_000;
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -112,6 +109,11 @@ impl ArmAccum {
         self.acc.on_closed_trade(t);
     }
 
+    /// One trade still open at the end, once (before `finish`).
+    pub(crate) fn on_open_at_end(&mut self, t: &TradeRec) {
+        self.acc.on_open_trade_at_end(t);
+    }
+
     /// The row (§4.11 `finish`). pin:Bp-baseline-none-in-window.
     pub(crate) fn finish(
         &mut self,
@@ -172,6 +174,20 @@ impl<'p> SignalHook<'p> {
         }
     }
 
+    /// R4c: the signal's trades still open at a completed run's end, each
+    /// once, oldest first (pin:Bp-open-at-end-completed-only).
+    pub(crate) fn feed_open_at_end(&mut self, m: &StrategySet) {
+        let p = m.pine();
+        let n = p.open_count(0);
+        let mut i = 0;
+        while i < n {
+            if let Some(t) = p.open_trade(0, i) {
+                self.arm.on_open_at_end(t);
+            }
+            i += 1;
+        }
+    }
+
     /// Drain the model's fee charges into the ledger (pin:Bp-fee-drain-per-cut).
     pub(crate) fn drain_fees(&mut self, fills: &mut FillEngine) {
         fills.take_fee_charges(&mut self.charges);
@@ -204,7 +220,7 @@ impl DriveHook<StrategySet> for SignalHook<'_> {
             }
         }
         let count = p.closed_count(0);
-        let first = count - count.min(CLOSED_RETAINED_CAP);
+        let first = count - count.min(p.closed_retained(0)); // R4b
         while self.arm.closed_seen < count {
             let k = self.arm.closed_seen;
             if k >= first {
@@ -296,6 +312,31 @@ mod tests {
         let s = a.finish(0, 0, TrialEnd::Completed, 0);
         assert_eq!(s.net_bps_1e4, 0);
         assert_eq!(a.day_returns(), &[0.0]);
+    }
+
+    /// R4c (pin:Bp-open-trades-unread retired): a trade open at the end
+    /// counts in `trades`, once, beside the closed ones.
+    #[test]
+    fn an_open_trade_at_the_end_is_fed_once() {
+        let cfg = accum_cfg(1_000_000, 1_000_000, 0, DAY_MS);
+        let mut a = ArmAccum::new(&cfg, 60);
+        a.on_mark(&bar(1, 0), 0, 0);
+        let t = TradeRec {
+            entry_ms: 0,
+            entry_px_1e6: 1_000_000,
+            qty_1e6: 1_000_000,
+            entry_bar: 1,
+            ..TradeRec::default()
+        };
+        a.on_closed(&TradeRec {
+            exit_ms: 60_000,
+            exit_bar: 1,
+            exit_px_1e6: 1_000_000,
+            ..t
+        });
+        a.on_open_at_end(&t);
+        let s = a.finish(0, 0, TrialEnd::Completed, 0);
+        assert_eq!(s.trades, 2);
     }
 
     #[test]

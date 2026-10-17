@@ -1359,8 +1359,11 @@ struct BacktestArgs {
     /// B'3: the daily return series directory (default `<out-dir>/ret`).
     #[arg(long, requires = "strategy")]
     ret_dir: Option<PathBuf>,
-    /// B'3: also write the `pvm-t2-1` report line here.
-    #[arg(long, requires = "strategy")]
+    /// B'3: also write the `pvm-t2-1` report line here; 8g: the `pvm-8g-1` lines (default
+    /// `~/multivenue/pine/8g/<run-id>.jsonl`). pin:Bp-8g-report-out-shared — shared with
+    /// `--replay-from-boot`, so its `requires = "strategy"` is dropped; the legacy arm never
+    /// reads it.
+    #[arg(long)]
     report_out: Option<PathBuf>,
     /// B'3: the scoring window `<from_ms>:<to_ms>`.
     #[arg(long, requires = "strategy")]
@@ -1395,6 +1398,11 @@ struct BacktestArgs {
     /// 8g: impl-08's input journal (`<run>/pine-delivery.bin`).
     #[arg(long, requires = "replay_from_boot")]
     delivery_journal: Option<PathBuf>,
+    /// 8g (impl-08 §4.9, 8g-B): write the replay's decision tapes to
+    /// `<dir>/<boot_utc_ms>/` (seq.bin, decisions.bin, set.tsv) for `pine-verify --cross`.
+    /// Refused inside git.
+    #[arg(long, requires = "replay_from_boot")]
+    tape_out: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -3452,7 +3460,13 @@ fn backtest(args: BacktestArgs) -> ExitCode {
             boot_record: args.boot_record,
             fills: args.fills,
             delivery_journal: args.delivery_journal,
+            pine_dir: args.pine_dir,
+            report_out: args.report_out,
+            tape_out: args.tape_out,
         });
+        if !x.stdout.is_empty() {
+            println!("{}", x.stdout);
+        }
         if !x.stderr.is_empty() {
             eprintln!("{}", x.stderr);
         }

@@ -20,8 +20,9 @@
 //! - pin:Bp-recorded-journal-first — the journal refusal is judged before
 //!   any file is opened (it needs no input to decide).
 //!
-//! Staged: the binary's `--replay-from-boot` argv and the judged / recorded
-//! drive land next (T19b, T20); until then only the tests reach this module.
+//! The member drive over these inputs (judged and recorded), the
+//! `pvm-8g-1` report and the `--tape-out` replay tapes are [`drive8g`]'s
+//! (T19b).
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{BTreeMap, VecDeque};
@@ -61,6 +62,15 @@ pub struct ReplayArgv {
     pub fills: String,
     /// `--delivery-journal`.
     pub delivery_journal: Option<PathBuf>,
+    /// `--pine-dir`: where the manifest's `file` entries resolve (default
+    /// the manifest's directory).
+    pub pine_dir: Option<PathBuf>,
+    /// `--report-out`: the `pvm-8g-1` lines (default
+    /// `~/multivenue/pine/8g/<run-id>.jsonl`; refused inside git).
+    pub report_out: Option<PathBuf>,
+    /// `--tape-out`: the replay's decision tapes go to
+    /// `<dir>/<boot_utc_ms>/` (impl-08 §4.9, 8g-B; refused inside git).
+    pub tape_out: Option<PathBuf>,
 }
 
 /// What the checks fixed before the first record.
@@ -151,29 +161,27 @@ pub(crate) fn check_inputs(a: &ReplayArgv) -> Result<ReplayInputs, DriveFail> {
     })
 }
 
-/// `backtest --replay-from-boot`: the inputs and refusals (exit 6).
-/// pin:Bp-8g-drive-staged — the member drive over the recorded plan and
-/// the judged model (T19b) is not built yet: inputs that pass every check
-/// exit 1 with that reason, never a report.
+/// `backtest --replay-from-boot`: the inputs and refusals (exit 6), then
+/// the 8g member drive (T19b): exit 0 with the `pvm-8g-1` report, 5 on a
+/// divergence (the report names its first index), 4 on a script fault.
 pub fn replay_from_boot_main(a: &ReplayArgv) -> super::run::PineExit {
-    let err = match check_inputs(a) {
-        Ok(_) => DriveFail {
-            exit: 1,
-            err: HarnessError::Usage(
-                "replay-from-boot: inputs accepted; the 8g member drive (T19b) is not built"
-                    .to_owned(),
-            ),
+    let r = check_inputs(a).and_then(|x| drive8g::run_8g(a, x));
+    match r {
+        Ok(x) => x,
+        Err(err) => super::run::PineExit {
+            code: err.exit,
+            stdout: String::new(),
+            stderr: format!("backtest: {}", err.err),
+            closed_ms: Vec::new(),
+            max_fee_drain: 0,
         },
-        Err(f) => f,
-    };
-    super::run::PineExit {
-        code: err.exit,
-        stdout: String::new(),
-        stderr: format!("backtest: {}", err.err),
-        closed_ms: Vec::new(),
-        max_fee_drain: 0,
     }
 }
+
+/// T19b: the boot from the record, the judged and recorded drives, the
+/// report and the replay tapes.
+mod drive8g;
+pub(crate) use drive8g::JudgedClock;
 
 /// §3.6 / §4.12: an 8g divergence — a journal record without its input
 /// (`--fills recorded`) or a member order the capture does not hold
@@ -291,9 +299,8 @@ pub(crate) struct CapturedOrders {
 }
 
 /// pin:Bp-judged-order-key — §4.12 matches on "verb, sym, side, kind, px,
-/// qty, ttl"; `Order` carries no TTL field at this tree (the kind and the
-/// flags carry the order's lifetime), so the key is verb, sym, side, kind,
-/// flags, px, qty.
+/// qty, ttl"; the key is those (`Order::ttl_ns` is the TTL at this tree)
+/// plus the flags (which carry post-only / reduce-only).
 fn same_order(a: &Order, b: &Order) -> bool {
     a.verb == b.verb
         && a.sym == b.sym
@@ -302,6 +309,7 @@ fn same_order(a: &Order, b: &Order) -> bool {
         && a.flags == b.flags
         && a.px == b.px
         && a.qty == b.qty
+        && a.ttl_ns == b.ttl_ns
 }
 
 impl CapturedOrders {
@@ -342,6 +350,16 @@ impl CapturedOrders {
     /// report names at the end of the window).
     pub(crate) fn unmatched(&self) -> usize {
         self.mine.len() - self.next
+    }
+
+    /// The captured order the last successful [`Self::stamp`] matched.
+    pub(crate) fn last_matched(&self) -> Option<&Order> {
+        self.next.checked_sub(1).and_then(|k| self.mine.get(k))
+    }
+
+    /// Slot-8 orders matched so far.
+    pub(crate) fn matched(&self) -> usize {
+        self.next
     }
 }
 

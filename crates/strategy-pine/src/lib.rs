@@ -616,6 +616,13 @@ impl PineStrategy {
         self.script_rt(script).map(|s| s.ncfg)
     }
 
+    /// 8g-B (§4.9.4 fill-stamp): script `script`'s compiled program, sub-programs included — the
+    /// `CALL_BUILTIN` sites `pine-verify --cross` scans. Cold; borrowed.
+    #[must_use]
+    pub fn program(&self, script: usize) -> Option<&pine_ir::PineProgram> {
+        self.script_rt(script).map(|s| s.program)
+    }
+
     /// **R4**: closed trade `i` of script `script`, RETAINED indexing (0 = oldest retained;
     /// absolute trade `k` is `i = k − (closed_count − view().closed_retained)`, impl-05 §3.6.1).
     /// Borrowed, never copied.
