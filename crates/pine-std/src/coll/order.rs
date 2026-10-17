@@ -27,7 +27,11 @@ const SIGN: u64 = 1 << 63;
 const NA: u64 = NA_I64 as u64;
 
 /// An int or float array reference whose every element is still the owner's (§4.16.3), and
-/// whether it is float; the output lane must be the element's (`int` → i64, `float` → f64).
+/// whether it is float. A float array's output lane is f64; an int array's is the row's
+/// declared lane, i64 or f64: TradingView's int-array statistics are not integers (F102:
+/// `array.avg` 806.75, `median` 808.5, `variance` 16.6875 of an int array), so a row whose
+/// pine-spec return becomes `float` is served as such, the i64 lane keeping its provisional
+/// toward-zero reading until then (`pin:04-array-int-stats-provisional`, a pine-spec request).
 fn numeric(f: &Frame<'_>, e: u16, out: u16) -> Result<(Owned, bool), FaultKind> {
     let o = resolve(f, f.coll_arg(e))?;
     if !matches!(o.kind, CollKind::Array) {
@@ -38,7 +42,7 @@ fn numeric(f: &Frame<'_>, e: u16, out: u16) -> Result<(Owned, bool), FaultKind> 
         Ty::Int => false,
         _ => return Err(FaultKind::Internal),
     };
-    if argwin::is_i64(out) == float {
+    if float && argwin::is_i64(out) {
         return Err(FaultKind::Internal);
     }
     if o.base + o.len > o.owner_len {
@@ -148,8 +152,10 @@ fn words_of<'a>(words: &'a [u64], o: &Owned) -> &'a [u64] {
 }
 
 /// `array.median(id)` — `[id, out]`. Float: the middle value, an even count the mean of the two
-/// middles (as `ta.median`, `pin:04-median-even`). Int (`series int`): an even count takes the
-/// **lower** middle — a member, never a rounded mean (`pin:04-median-int-provisional`).
+/// middles (as `ta.median`, `pin:04-median-even`). Int on an f64 lane: the same mean (F102: TV
+/// 808.5 for the int array `[807, 810, na, 800, 810]`). Int on the i64 lane (`series int`, the
+/// pine-spec row today): an even count takes the **lower** middle — a member, never a rounded
+/// mean (`pin:04-median-int-provisional`, refuted by F102 where a lane can carry it).
 fn median(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 2 {
         return Err(FaultKind::Internal);
@@ -160,13 +166,13 @@ fn median(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
     let (n, lo, hi) = scan(w, float);
     let v = if n == 0 {
         f64::NAN
-    } else if !float {
+    } else if !float && argwin::is_i64(args[1]) {
         val(select(w, false, (n - 1) / 2, lo, hi), false)
     } else if n % 2 == 1 {
-        val(select(w, true, n / 2, lo, hi), true)
+        val(select(w, float, n / 2, lo, hi), float)
     } else {
-        let a = val(select(w, true, n / 2 - 1, lo, hi), true);
-        let b = val(select(w, true, n / 2, lo, hi), true);
+        let a = val(select(w, float, n / 2 - 1, lo, hi), float);
+        let b = val(select(w, float, n / 2, lo, hi), float);
         (a + b) / 2.0
     };
     out(f, args[1], v);
@@ -249,12 +255,17 @@ fn nearest_rank(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
     Ok(())
 }
 
-/// `array.percentile_linear_interpolation(id, percentage)` — `[id, p, out]`: the C = 1 definition
-/// (Excel `PERCENTILE.INC`, Hyndman–Fan type 7, as `ta.percentile_linear_interpolation`):
-/// `x = p · (N − 1) / 100`, `k = ⌊x⌋`, `v₍ₖ₎ + (x − k) · (v₍ₖ₊₁₎ − v₍ₖ₎)` over the ascending non-na
-/// values (`pin:04-percentile-linear-provisional`); na `p` or one outside `0..=100` → na. The int
-/// overload (`series int`) takes the interpolated value toward zero
-/// (`pin:04-array-int-stats-provisional`).
+/// `array.percentile_linear_interpolation(id, percentage)` — `[id, p, out]`: the C = 1/2
+/// definition (Hyndman–Fan type 5), as `ta.percentile_linear_interpolation` (operator ruling
+/// R-P15, `pin:04-percentile-linear-c-half`): over the `N` ascending values the 0-based rank
+/// `x = p · N / 100 − 1/2` (the 1-based `h = N · p / 100 + 1/2` less one), clamped to `[0, N − 1]`
+/// (`h ≤ 1` the smallest, `h ≥ N` the largest), `k = ⌊x⌋`, `v₍ₖ₎ + (x − k) · (v₍ₖ₊₁₎ − v₍ₖ₎)`.
+/// Evidence F103 (TV): `p = 25` over `[30, 10, 40, 20]` → 15 and over the 14 values `10..140` → 40
+/// (C = 1 gives 17.5 / 42.5). `pin:04-percentile-linear-na`: an array holding an na element → na
+/// (F101 float and F102 int: TV na at `p = 40` with one na element, while `percentile_nearest_rank`
+/// skips it — the reference's `ta.*` remark "na values … produce an na result"). Empty, na `p` or
+/// one outside `0..=100` → na. The int overload on the i64 lane takes the value toward zero
+/// (`pin:04-array-int-stats-provisional`); on an f64 lane it is exact.
 fn linear(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 3 {
         return Err(FaultKind::Internal);
@@ -264,10 +275,18 @@ fn linear(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
     let (_, words) = f.coll(o.owner)?;
     let w = words_of(words, &o);
     let (n, lo, hi) = scan(w, float);
-    let v = if n == 0 || !(0.0..=100.0).contains(&p) {
+    let v = if n == 0 || n != w.len() as u64 || !(0.0..=100.0).contains(&p) {
         f64::NAN
     } else {
-        let x = (p * (n - 1) as f64) / 100.0;
+        let x = (p * n as f64) / 100.0 - 0.5;
+        let last = (n - 1) as f64;
+        let x = if x < 0.0 {
+            0.0
+        } else if x > last {
+            last
+        } else {
+            x
+        };
         let k = x.floor() as u64;
         debug_assert!(k < n);
         let a = val(select(w, float, k, lo, hi), float);
@@ -293,9 +312,11 @@ fn pct(f: &Frame<'_>, e: u16) -> f64 {
     }
 }
 
-/// `array.avg(id)` of an int array — `[id, out]` (`series int`): the exact mean of the non-na
-/// values toward zero (`Σ` in i128, `/ n` truncating — `int()`'s rounding,
-/// `pin:04-array-int-stats-provisional`); empty / every value na → na.
+/// `array.avg(id)` of an int array — `[id, out]`: the mean of the non-na values (`Σ` in i128);
+/// empty / every value na → na. On an f64 lane `Σ / n` (F102: TV 806.75 for
+/// `[807, 810, na, 800, 810]`); on the i64 lane (`series int`, the pine-spec row today) the exact
+/// mean toward zero (`/ n` truncating — `int()`'s rounding, `pin:04-array-int-stats-provisional`,
+/// refuted by F102 where a lane can carry the fraction).
 fn avg_i(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 2 {
         return Err(FaultKind::Internal);
@@ -315,17 +336,23 @@ fn avg_i(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
         }
         i += 1;
     }
-    // The mean lies between the extremes, so it fits i64.
-    f.set_i64_arg(args[1], (n > 0).then(|| (s / n) as i64));
+    if argwin::is_i64(args[1]) {
+        // The mean lies between the extremes, so it fits i64.
+        f.set_i64_arg(args[1], (n > 0).then(|| (s / n) as i64));
+    } else {
+        let v = if n > 0 { s as f64 / n as f64 } else { f64::NAN };
+        f.set_f64_arg(args[1], v);
+    }
     Ok(())
 }
 
-/// `array.variance` / `array.stdev(id, biased)` of an int array — `[id, biased, out]`
-/// (`series int`): the float definition (`pin:04-array-variance-two-pass`: mean, then
-/// `Σ(x − mean)²` over the non-na values, `/ n` when `biased`, else `/ (n − 1)`; `stdev` its
-/// square root) over the values as f64, then toward zero (`pin:04-array-int-stats-provisional`;
-/// `stdev` is the root of the unrounded variance). Empty / every value na → na; an unbiased
-/// estimate of one value is `0 / 0` → na. A na `biased` (v5) is not true.
+/// `array.variance` / `array.stdev(id, biased)` of an int array — `[id, biased, out]`: the float
+/// rows' definition (`pin:04-array-variance-one-pass`, TV F101: one forward pass summing `Σx` and
+/// `Σx²` over the non-na values as f64, then `coll::part3::var_one_pass`; `stdev` its square
+/// root) — exact on an f64 lane (F102: TV `variance` 16.6875, `stdev` 4.085033659592048), toward
+/// zero on the i64 lane (`series int` today, `pin:04-array-int-stats-provisional`; `stdev` is the
+/// root of the unrounded variance). Empty / every value na → na; an unbiased estimate of one
+/// value is na. A na `biased` (v5) is not true.
 fn var_std_i<const SD: bool>(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 3 {
         return Err(FaultKind::Internal);
@@ -337,11 +364,13 @@ fn var_std_i<const SD: bool>(f: &mut Frame<'_>, args: &[u16]) -> Result<(), Faul
     let biased = f.bool_arg(args[1]) == Some(true);
     let (_, words) = f.coll(o.owner)?;
     let w = words_of(words, &o);
-    let (mut s, mut n) = (0.0f64, 0u64);
+    let (mut s, mut s2, mut n) = (0.0f64, 0.0f64, 0u64);
     let mut i = 0usize;
     while i < w.len() {
         if w[i] != NA {
-            s += w[i] as i64 as f64;
+            let x = w[i] as i64 as f64;
+            s += x;
+            s2 += x * x;
             n += 1;
         }
         i += 1;
@@ -349,18 +378,7 @@ fn var_std_i<const SD: bool>(f: &mut Frame<'_>, args: &[u16]) -> Result<(), Faul
     let v = if n == 0 {
         f64::NAN
     } else {
-        let m = s / n as f64;
-        let mut ss = 0.0f64;
-        let mut i = 0usize;
-        while i < w.len() {
-            if w[i] != NA {
-                let d = w[i] as i64 as f64 - m;
-                ss += d * d;
-            }
-            i += 1;
-        }
-        let d = if biased { n } else { n - 1 };
-        let var = ss / d as f64;
+        let var = super::part3::var_one_pass(s, s2, n, biased);
         if SD {
             var.sqrt()
         } else {
@@ -393,7 +411,8 @@ fn numeric_any(f: &Frame<'_>, e: u16) -> Result<(Owned, bool), FaultKind> {
 
 /// `array.covariance(id1, id2, biased)` — `[id1, id2, biased, out]` (`series float`), any mix of
 /// int and float arrays. `pin:04-array-covariance-pairs`: the reference gives neither a formula
-/// nor an na rule; the literal reading, as `pin:04-array-variance-two-pass`: element `i` of `id1`
+/// nor an na rule; the literal reading, two passes (TV F101 / F102 hold the exact two-pass value
+/// on every row, which the one-pass analogue of `pin:04-array-variance-one-pass` misses): element `i` of `id1`
 /// pairs with element `i` of `id2`, a pair with an na side is skipped (the arrays page: na values
 /// do not make a statistic na), the means of the kept pairs, then `Σ(x − mx)(y − my)` divided by
 /// `n` when `biased` is true, else by `n − 1`. `pin:04-array-covariance-sizes`: arrays of
@@ -445,12 +464,18 @@ fn covariance(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
 
 /// `array.percentrank(id, index)` — `[id, index, out]` (float row `series float`, int row
 /// `series int`). The reference: "the percentage of how many elements in the array are less than
-/// or equal to the reference value" (the element at `index`). `pin:04-array-percentrank`: read
-/// literally — `100 × #(x ≤ ref) / n` over the non-na elements (the reference element counts
-/// itself; an na element is neither counted nor in `n`, as every array statistic), IEEE `≤`
-/// (`−0.0 = +0.0`); an na reference element → na; the int row truncates toward zero
-/// (`pin:04-array-int-stats-provisional`). An `index` outside `[0, size)` — negative (§4.16.5:
-/// only `get set insert remove` normalise one) or na included — is `CollectionBounds`.
+/// or equal to the reference value" (the element at `index`). `pin:04-array-percentrank`
+/// (revised by the TV capture; the r27 reading `100 × #(x ≤ ref) / n` with the reference counting
+/// itself gives 50 / 100 and is refuted): as `ta.percentrank` ranks the current value among the
+/// previous ones, `100 × #(other elements x ≤ ref) / (size − 1)` — the reference element is not
+/// counted, an na element is an element (in `size`) that is never `≤`, IEEE `≤` (`−0.0 = +0.0`).
+/// Evidence F101 (`[s, s − 3, na, s + 7.5, s − 3]`, index 1 → TV 25) and F102 (`[807, 810, na,
+/// 800, 810]`, index 1 → TV 75). Provisional: both captures hold one na element, so they do not
+/// separate `/ (size − 1)` from `/ (non-na count)` — `[10, 20, 30, 40]` at index 3 would (100 vs
+/// 75). One element → `0 / 0` → na; an na reference element → na; the int row on the i64 lane
+/// truncates toward zero (`pin:04-array-int-stats-provisional`). An `index` outside `[0, size)` —
+/// negative (§4.16.5: only `get set insert remove` normalise one) or na included — is
+/// `CollectionBounds`.
 fn percentrank(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 3 {
         return Err(FaultKind::Internal);
@@ -467,11 +492,10 @@ fn percentrank(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
         if is_na(r, float) {
             f64::NAN
         } else {
-            let (mut le, mut n) = (0u64, 0u64);
+            let mut le = 0u64;
             let mut i = 0usize;
             while i < w.len() {
-                if !is_na(w[i], float) {
-                    n += 1;
+                if i != k && !is_na(w[i], float) {
                     let below = if float {
                         f64::from_bits(w[i]) <= f64::from_bits(r)
                     } else {
@@ -481,7 +505,7 @@ fn percentrank(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
                 }
                 i += 1;
             }
-            100.0 * le as f64 / n as f64
+            100.0 * le as f64 / (w.len() - 1) as f64
         }
     };
     out(f, args[2], v);

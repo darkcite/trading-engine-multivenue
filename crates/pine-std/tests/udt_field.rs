@@ -289,7 +289,7 @@ fn udt_binary_searches_by_float_and_int_field() {
         (ov::ARRAY_BINARY_SEARCH_AT, ft(1.5), -1.0),
         (ov::ARRAY_BINARY_SEARCH_AT, ft(f64::NAN), -1.0),
         (ov::ARRAY_BINARY_SEARCH_LEFTMOST_AT, ft(1.5), 1.0),
-        (ov::ARRAY_BINARY_SEARCH_LEFTMOST_AT, ft(0.1), -1.0),
+        (ov::ARRAY_BINARY_SEARCH_LEFTMOST_AT, ft(0.1), 0.0),
         (ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AT, ft(1.5), 2.0),
         (ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AT, ft(10.0), 4.0),
         (ov::ARRAY_BINARY_SEARCH_AT, it(3), 3.0),
@@ -385,4 +385,39 @@ fn udt_bad_selector_is_internal() {
         calls.push(c(id, ins, outs));
         assert_eq!(run(&calls, 1).0.err(), Some(FaultKind::Internal), "{s:?}");
     }
+}
+
+/// F110 (TV, `pin:04-udt-sort-ties`): `array.sort` by a field is stable in both directions —
+/// `(k, id)` pushed `(2,1) (1,2) (2,3) (1,4) (2,5) (1,6)` (`k` in `qty`), ascending by `k` → ids
+/// `2 4 6 1 3 5`, descending → `1 3 5 2 4 6` (not the ascending result reversed); each array is
+/// read back as positions by the unique `id` (`[j]` = the position of id `j + 1`); zero
+/// allocation after the first bar.
+#[test]
+fn udt_field_sort_is_stable_f110() {
+    let mut calls = Vec::new();
+    let mut arrays = Vec::new();
+    for _ in 0..2 {
+        let a = calls.len();
+        calls.push(udt_array());
+        for (k, id) in [(2, 1), (1, 2), (2, 3), (1, 4), (2, 5), (1, 6)] {
+            calls.push(c(
+                ov::ARRAY_PUSH,
+                vec![o(a), obj(id, 0.0, "x", Some(k))],
+                &[],
+            ));
+        }
+        arrays.push(a);
+    }
+    sort(&mut calls, arrays[0], false, f(QTY));
+    sort(&mut calls, arrays[1], true, f(QTY));
+    let asc = order_of(&mut calls, arrays[0], false, f(ID), 6);
+    let desc = order_of(&mut calls, arrays[1], false, f(ID), 6);
+    let (r, n) = run(&calls, 4);
+    for row in r.expect("runs") {
+        // ids 2 4 6 1 3 5: id 1 at 3, id 2 at 0, id 3 at 4, id 4 at 1, id 5 at 5, id 6 at 2.
+        assert_eq!(read(&row, &asc), [3, 0, 4, 1, 5, 2], "ascending");
+        // ids 1 3 5 2 4 6: id 1 at 0, id 2 at 3, id 3 at 1, id 4 at 4, id 5 at 2, id 6 at 5.
+        assert_eq!(read(&row, &desc), [0, 3, 1, 4, 2, 5], "descending");
+    }
+    assert_eq!(n, 0, "stable sort by field allocated after warm-up");
 }

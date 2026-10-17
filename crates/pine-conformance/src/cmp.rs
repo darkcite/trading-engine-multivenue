@@ -141,6 +141,11 @@ pub fn compare_cell_fmt(expected: &Cell, actual: f64, tol: Tol, prints_negzero: 
             MISMATCH
         };
     }
+    // pin:06-float-print — TV's export prints a binary64 with up to 17 significant digits
+    // (`13.258776000000001`); the cell is the f64 its text parses to (`fixture::parse_cell`) and
+    // `exact` is bit equality of that f64 with ours — never a comparison of texts. A longer text of
+    // the same binary64 is `Equal`; E132's `13.258776000000001` (0x402a847e49b1faba) is one ulp
+    // above our 13.258776 (…fab9), a value divergence, not a print artefact.
     if v.to_bits() == actual.to_bits() {
         return Cmp::Equal;
     }
@@ -281,4 +286,48 @@ fn dec_bound_exact(text: &str, actual: f64, sig: u8) -> bool {
         add_sub(&a, &v, true)
     };
     cmp_mag(&diff, &b).is_le()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compare_cell, Cmp};
+    use crate::fixture::{Cell, Tol};
+
+    /// A captured cell as `fixture::parse_cell` builds it: the parsed f64 and the verbatim text.
+    fn cell(text: &str) -> Cell {
+        Cell::Val {
+            v: text.parse().unwrap_or(f64::NAN),
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn float_cells_compare_numerically_e132() {
+        // pin:06-float-print — the export's 17-significant-digit text is compared as its f64.
+        let ours = 13.258_776_f64;
+        // Longer texts of the same binary64 are the same value under `exact`.
+        assert_eq!(
+            compare_cell(&cell("13.2587760000000000"), ours, Tol::Exact),
+            Cmp::Equal
+        );
+        assert_eq!(
+            compare_cell(&cell("13.258775999999999"), ours, Tol::Exact),
+            Cmp::Equal
+        );
+        // E132 row 1777244400000: TV's `13.258776000000001` is the next binary64 up — one ulp, a
+        // value divergence `exact` keeps (inside `ulp 1`).
+        let tv = cell("13.258776000000001");
+        assert_eq!(
+            compare_cell(&tv, ours, Tol::Exact),
+            Cmp::Divergent {
+                ulps: 1,
+                within: false
+            }
+        );
+        assert!(compare_cell(&tv, ours, Tol::Ulp(1)).ok());
+        assert_eq!(
+            compare_cell(&tv, f64::from_bits(ours.to_bits() + 1), Tol::Exact),
+            Cmp::Equal
+        );
+    }
 }

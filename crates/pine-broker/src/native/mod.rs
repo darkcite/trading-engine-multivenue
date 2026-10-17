@@ -24,7 +24,7 @@ use crate::orders::{otype, pflag, CommitCtx, OrderTable};
 use crate::risk::Risk;
 use crate::size::{declared_qty, unit_qty};
 use crate::size::{n_rule_entry, n_rule_scale, size_entry_fill};
-use crate::switch::SWITCHES;
+use crate::switch::{PriceGrid, SWITCHES};
 use crate::tv::path::{sort_cands, Cand};
 use desire::{leg_rest, leg_want, order_rest, order_triggers, order_want, WantIoc, LATCH_EDGE};
 use pine_ir::{
@@ -152,8 +152,7 @@ impl NativeBroker {
         }
         let ctx = CommitCtx {
             bar: self.cur_bar,
-            round_tick_1e6: 0,
-            round_floor: false,
+            grid: PriceGrid::AS_GIVEN,
             allow: self.decl.risk.allow_entry_in,
             position_1e6: self.book.view().position_size_1e6,
             halted: self.risk.halted(),
@@ -1619,6 +1618,8 @@ impl NativeBroker {
             v6: self.dialect == Dialect::V6,
             step_1e6: self.cfg.qty_step_1e6,
             scale,
+            // Native: script prices as given; the venue gate rounds (`gate.rs`).
+            grid: PriceGrid::AS_GIVEN,
         }
     }
 

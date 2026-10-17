@@ -104,9 +104,9 @@ pub(crate) fn run<const J: bool>(fr: &mut Frame<'_>, x: &Exec) -> Result<u32, (F
                     let (a, b) = (c.rf(ins.a), c.rf(ins.b));
                     let r = match ins.op {
                         op::F_DIV => a / b,
-                        // Floored, the divisor's sign (CAR-06-1): 00-INDEX §3.6.1's expression
-                        // evaluated as written — never fmod (`a % b`) plus an adjustment.
-                        op::F_MOD => a - b * (a / b).floor(),
+                        // Truncated, the dividend's sign (CAR-R31-1, superseding CAR-06-1): the
+                        // exact IEEE remainder `fmod` — TradingView F039 / F116 (`pin:06-mod-sign`).
+                        op::F_MOD => a % b,
                         _ => a.powf(b),
                     };
                     let v = if ins.flags & flg::NA_ON_NONFINITE != 0 && !r.is_finite() { f64::NAN } else { r };
@@ -195,11 +195,10 @@ pub(crate) fn run<const J: bool>(fr: &mut Frame<'_>, x: &Exec) -> Result<u32, (F
                             None => (0, true), // b == 0 or MIN / -1 -> na (B8)
                         }
                     } else {
-                        // Floored (CAR-06-1): Rust's remainder has the dividend's sign; move it to
-                        // the divisor's. None <=> b == 0 (na) or MIN % -1 (the true remainder, 0).
-                        let r = a.checked_rem(b).unwrap_or(0);
-                        let v = if (r != 0) & ((r ^ b) < 0) { r.wrapping_add(b) } else { r };
-                        (v, b == 0)
+                        // Truncated, the dividend's sign (CAR-R31-1, superseding CAR-06-1):
+                        // TradingView F004 / F115 (`pin:06-mod-sign`). None <=> b == 0 (na) or
+                        // MIN % -1 (the true remainder, 0).
+                        (a.checked_rem(b).unwrap_or(0), b == 0)
                     };
                     if bad & ops {
                         c.na_arith += 1; // B8: an na-producing event, not a fault

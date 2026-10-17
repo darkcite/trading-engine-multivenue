@@ -76,8 +76,8 @@ pub mod op {
     pub const F_MUL: u8 = 0x14;
     /// `f[dst] = f[a] / f[b]`; [`super::flg::NA_ON_NONFINITE`].
     pub const F_DIV: u8 = 0x15;
-    /// `f[dst] = f[a] − f[b]·⌊f[a] / f[b]⌋` — Pine's floored modulo (the sign
-    /// of the divisor); [`super::flg::NA_ON_NONFINITE`].
+    /// `f[dst] = fmod(f[a], f[b])` — Pine's truncated modulo (the sign of the
+    /// dividend, CAR-R31-1); [`super::flg::NA_ON_NONFINITE`].
     pub const F_MOD: u8 = 0x16;
     /// `f[dst] = -f[a]`.
     pub const F_NEG: u8 = 0x17;
@@ -112,7 +112,8 @@ pub mod op {
     /// Truncating division; `b == 0` or `MIN / -1` ⇒ `na` (B8), no fault.
     /// Always writes the destination's validity.
     pub const I_DIV: u8 = 0x25;
-    /// Floored remainder `a − b·⌊a / b⌋` (the sign of the divisor, Pine's `%`);
+    /// Truncated remainder `a − b·trunc(a / b)` (the sign of the dividend, Pine's `%`,
+    /// CAR-R31-1);
     /// `b == 0` ⇒ `na`, no fault (the value is `pin:06-mod-zero`'s).
     pub const I_MOD: u8 = 0x26;
     /// Wrapping negate.

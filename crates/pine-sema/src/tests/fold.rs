@@ -17,14 +17,20 @@ fn v5() -> Readings {
 }
 
 #[test]
-fn fold_floored_mod_matches_the_formula() {
+fn fold_truncated_mod_has_the_dividends_sign() {
+    // CAR-R31-1 (TradingView F004 F039 F115 F116): `807 % -7 == 2`, `-807 % 7 == -2`,
+    // `807.25 % -2.5 == 2.25`.
     let rd = v5();
-    assert_eq!(fold::f_mod(-1.0, 100.0, &rd), 99.0);
-    assert_eq!(fold::f_mod(1.0, -100.0, &rd), -99.0);
+    assert_eq!(fold::f_mod(-1.0, 100.0, &rd), -1.0);
+    assert_eq!(fold::f_mod(1.0, -100.0, &rd), 1.0);
     assert_eq!(fold::f_mod(7.5, 2.0, &rd), 1.5);
+    assert_eq!(fold::f_mod(807.25, -2.5, &rd), 2.25);
+    assert_eq!(fold::f_mod(-807.25, 2.5, &rd), -2.25);
     assert!(fold::f_mod(1.0, 0.0, &rd).is_nan());
-    assert_eq!(fold::i_mod(-1, 100), Some(99));
-    assert_eq!(fold::i_mod(1, -100), Some(-99));
+    assert_eq!(fold::i_mod(-1, 100), Some(-1));
+    assert_eq!(fold::i_mod(1, -100), Some(1));
+    assert_eq!(fold::i_mod(807, -7), Some(2));
+    assert_eq!(fold::i_mod(-807, 7), Some(-2));
     assert_eq!(fold::i_mod(i64::MIN, -1), Some(0));
     assert_eq!(fold::i_mod(5, 0), None);
 }

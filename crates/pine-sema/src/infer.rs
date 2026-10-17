@@ -1503,7 +1503,7 @@ impl<'a, 's> Infer<'a, 's> {
 
     /// A numeric literal's value, under any number of unary signs (the lexer keeps the sign as a
     /// `Unary`; parentheses make no node): `0`, `-0.0`, `-(1)`. Anything else is `None`
-    /// (pin:02-div-zero-literal, pin:02-negative-qty-scope).
+    /// (pin:02-negative-qty-scope).
     fn lit_num(&self, x: NodeId) -> Option<f64> {
         match self.ast().node(x) {
             Node::IntLit { value } => Some(value as f64),
@@ -1520,13 +1520,36 @@ impl<'a, 's> Infer<'a, 's> {
         }
     }
 
-    /// The divisor of a `/` (`Binary`) or `/=` (`Assign`) node `n` when it is a literal.
-    fn divisor_lit(&self, n: NodeId) -> Option<f64> {
-        match self.ast().node(n) {
-            Node::Binary { rhs, .. } => self.lit_num(rhs),
-            Node::Assign { value, .. } => self.lit_num(value),
-            _ => None,
+    /// A constant arithmetic expression: numeric literals joined only by unary signs and the
+    /// arithmetic operators (`2 - 2`, `-(1.0 - 1.0)`, `0 * 5`; parentheses make no node). A name,
+    /// a call, a history reference or a ternary is not one, whatever it folds to
+    /// (pin:02-div-zero-literal).
+    fn const_arith(&self, x: NodeId) -> bool {
+        match self.ast().node(x) {
+            Node::IntLit { .. } | Node::FloatLit { .. } => true,
+            Node::Unary {
+                op: UnOp::Neg | UnOp::Pos,
+                operand,
+            } => self.const_arith(operand),
+            Node::Binary {
+                op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem,
+                lhs,
+                rhs,
+            } => self.const_arith(lhs) && self.const_arith(rhs),
+            _ => false,
         }
+    }
+
+    /// Whether the divisor of a `/` (`Binary`) or `/=` (`Assign`) node `n` is a constant
+    /// arithmetic expression (a literal included) whose fold `k` — the divisor's own folded value,
+    /// sema's §4.17 fold — is zero.
+    fn divisor_const_zero(&self, n: NodeId, k: Option<K>) -> bool {
+        let d = match self.ast().node(n) {
+            Node::Binary { rhs, .. } => rhs,
+            Node::Assign { value, .. } => value,
+            _ => return false,
+        };
+        num_k(k) == Some(0.0) && self.const_arith(d)
     }
 
     /// A call argument's literal value (a `NamedArg`'s value or a positional argument).
@@ -1577,11 +1600,16 @@ impl<'a, 's> Infer<'a, 's> {
         // divisor is a numeric LITERAL zero ("Division by zero"), whatever the dividend; `/=` is
         // the same operator. Scope narrowed in r27b to what TradingView was seen to refuse
         // (`/ 0`, `/ 0.0`, `/= 0`; a sign or parentheses around the literal count — the sign is
-        // a `Unary`, parentheses make no node): a constant zero reached through a variable or
-        // arithmetic (`/ (2 - 2)`, `z = 0` · `/ z`) still compiles until a paste shows otherwise
-        // (a false refusal loses a script TradingView runs). `%` by zero is not refused (F010,
-        // captured: `syn % 0.0` runs and reads `na`).
-        if op == BinOp::Div && num(lt) && num(rt) && self.divisor_lit(n) == Some(0.0) {
+        // a `Unary`, parentheses make no node). r31 (CI-051 / F118): TradingView refuses
+        // `syn / (2 - 2)` at compile ("Division by zero") too, so a divisor that is a constant
+        // arithmetic expression of literals folding to zero joins (`/ (2 - 2)`, `/ (1.0 - 1.0)`,
+        // `/ (0 * 5)`; the fold is sema's own, so a v5 `const_trunc` `1 / 2` is a zero too). A
+        // zero reached through a variable (`z = 0` · `/ z`), an `input` or a series (F005
+        // `syni / (syni - syni)`, F008 `(syn - syn) / (syn - syn)`: TradingView runs them, `na`)
+        // still compiles until a capture shows otherwise (a false refusal loses a script
+        // TradingView runs). `%` by zero is not refused (F010, captured: `syn % 0.0` runs and
+        // reads `na`; F006 `syni % (syni - syni)` runs).
+        if op == BinOp::Div && num(lt) && num(rt) && self.divisor_const_zero(n, r.k) {
             return self.refuse(ReasonCode::TypeMismatch, at, "Division by zero".to_owned());
         }
         let out = match op {
@@ -1947,11 +1975,15 @@ impl<'a, 's> Infer<'a, 's> {
                 // pin:02-negative-qty-scope — R-P2 (CI-002 / E056): TradingView refuses a
                 // negative LITERAL `qty` of `strategy.entry` at compile ("The "strategy.entry()"
                 // function cannot have a negative "qty" value. Use a positive value in the
-                // function call."). Scope narrowed in r27b to what was seen: `strategy.entry`
-                // only, a literal under a sign (`qty = -1`, `-2.5`); `strategy.order` and a
-                // constant reached through a variable or arithmetic compile until a paste shows
-                // otherwise (a false refusal would lose a script TradingView runs).
-                if full == "strategy.entry" {
+                // function call."). Scope narrowed in r27b to what was seen, a literal under a
+                // sign (`qty = -1`, `-2.5`); r31 (CI-050 / E128): TradingView refuses
+                // `strategy.order(…, qty = -1)` at compile too (3007), so `strategy.order` joins
+                // (its message is not captured; the entry text with the function's name is the
+                // literal reading). `strategy.exit` / `strategy.close` (whose `qty` is a part of
+                // the position, not an order size — a different reference text) and a constant
+                // reached through a variable or arithmetic compile until a capture shows otherwise
+                // (a false refusal would lose a script TradingView runs).
+                if full == "strategy.entry" || full == "strategy.order" {
                     let ps = pine_spec::params(ov);
                     let nodes: &[NodeId] = match self.ast().node(n) {
                         Node::Call { args, .. } if args.len() == argv.len() => args,

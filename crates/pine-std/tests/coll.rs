@@ -1233,11 +1233,11 @@ fn array_part2_reverse_rank_range_every_some() {
     ];
     let r = once(&calls, Dialect::V6).unwrap();
     assert_eq!((r[5], r[6], r[7]), (0.0, 1.0, 2.0));
-    // every / some: v6 bools; an empty array is every = true, some = false.
+    // every / some: v6 bools; an empty array is every = false, some = false (TV F105).
     let bb = coll_block_bytes(CollKind::Array, Ty::Bool, Ty::Void, 4, 16);
     let calls = vec![
         new(ov::ARRAY_NEW_BOOL, Ty::Bool, 4, bb, vec![it(0), NA_I]),
-        c(ov::ARRAY_EVERY, vec![o(0)], I), // 1: true
+        c(ov::ARRAY_EVERY, vec![o(0)], I), // 1: false
         c(ov::ARRAY_SOME, vec![o(0)], I),  // 2: false
         c(ov::ARRAY_PUSH, vec![o(0), it(1)], &[]),
         c(ov::ARRAY_PUSH, vec![o(0), it(1)], &[]),
@@ -1247,7 +1247,7 @@ fn array_part2_reverse_rank_range_every_some() {
         c(ov::ARRAY_SOME, vec![o(0)], I),  // 8: true
     ];
     let r = once(&calls, Dialect::V6).unwrap();
-    assert_eq!((r[1], r[2], r[5], r[7], r[8]), (1.0, 0.0, 1.0, 0.0, 1.0));
+    assert_eq!((r[1], r[2], r[5], r[7], r[8]), (0.0, 0.0, 1.0, 0.0, 1.0));
     // v5: an na bool element is not true.
     let calls = vec![
         new(ov::ARRAY_NEW_BOOL, Ty::Bool, 4, bb, vec![it(1), NA_I]),
@@ -1304,7 +1304,7 @@ fn array_binary_search_rows() {
         (ov::ARRAY_BINARY_SEARCH_AF, f64::NAN, -1.0),
         (ov::ARRAY_BINARY_SEARCH_LEFTMOST_AF, 3.0, 2.0),
         (ov::ARRAY_BINARY_SEARCH_LEFTMOST_AF, 5.0, 3.0),
-        (ov::ARRAY_BINARY_SEARCH_LEFTMOST_AF, -5.0, -1.0),
+        (ov::ARRAY_BINARY_SEARCH_LEFTMOST_AF, -5.0, 0.0),
         (ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AF, 3.0, 3.0),
         (ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AF, 5.0, 4.0),
         (ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AF, 10.0, 6.0),
@@ -1329,10 +1329,10 @@ fn array_binary_search_rows() {
         c(ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AI, vec![o(0), ft(3.0)], I), // 6: 2
         c(ov::ARRAY_BINARY_SEARCH_AI, vec![o(0), ft(3.5)], I), // 7: -1
         c(ov::ARRAY_BINARY_SEARCH_LEFTMOST_AI, vec![o(0), ft(3.5)], I), // 8: 2
-        c(ov::ARRAY_BINARY_SEARCH_LEFTMOST_AI, vec![o(0), ft(0.0)], I), // 9: -1
+        c(ov::ARRAY_BINARY_SEARCH_LEFTMOST_AI, vec![o(0), ft(0.0)], I), // 9: 0 (F106)
     ];
     let r = once(&calls, Dialect::V6).unwrap();
-    assert_eq!((r[5], r[6], r[7], r[8], r[9]), (1.0, 2.0, -1.0, 2.0, -1.0));
+    assert_eq!((r[5], r[6], r[7], r[8], r[9]), (1.0, 2.0, -1.0, 2.0, 0.0));
 }
 
 /// `array.fill` (`pin:04-array-fill-no-grow`): `[from, to)` of the existing elements, `to` na =
@@ -1404,10 +1404,10 @@ fn array_fill_sets_existing_elements_only() {
     assert_eq!(a, 0, "array.fill allocated");
 }
 
-/// `array.variance` / `stdev` (`pin:04-array-variance-two-pass`): mean, then Σ(x − mean)², over
-/// the non-na values; biased ÷ n, unbiased ÷ (n − 1); empty → na.
+/// `array.variance` / `stdev` (`pin:04-array-variance-one-pass`): one forward pass `Σx`, `Σx²`
+/// over the non-na values, `d` = n (biased) or n − 1, `Σx²/d − (Σx/d)·mean`; empty → na.
 #[test]
-fn array_variance_stdev_two_pass() {
+fn array_variance_stdev_one_pass() {
     let b = float_block(8);
     let xs = [1.0, 2.0, f64::NAN, 3.0, 4.0];
     let mut calls = vec![new(
@@ -1426,11 +1426,14 @@ fn array_variance_stdev_two_pass() {
     calls.push(c(ov::ARRAY_STDEV_F, vec![o(0), it(1)], F));
     calls.push(c(ov::ARRAY_STDEV_F, vec![o(0), it(0)], F));
     let r = once(&calls, Dialect::V6).unwrap();
-    let ss = 5.0f64; // mean 2.5: 2.25 + 0.25 + 0.25 + 2.25
-    assert_eq!(r[k], ss / 4.0);
-    assert_eq!(r[k + 1], ss / 3.0);
-    assert_eq!(r[k + 2], (ss / 4.0).sqrt());
-    assert_eq!(r[k + 3], (ss / 3.0).sqrt());
+    // Σx 10, Σx² 30, mean 2.5: biased 30/4 − (10/4)·2.5 = 1.25; unbiased 30/3 − (10/3)·2.5,
+    // 1.666666666666666 (the two-pass 5/3 is 1.6666666666666667).
+    let unb = 30.0f64 / 3.0 - (10.0f64 / 3.0) * 2.5;
+    assert_eq!(r[k], 1.25);
+    assert_eq!(r[k + 1], unb);
+    assert_ne!(unb, 5.0 / 3.0, "the one-pass rounding is observable");
+    assert_eq!(r[k + 2], 1.25f64.sqrt());
+    assert_eq!(r[k + 3], unb.sqrt());
     let calls = vec![
         new(ov::ARRAY_NEW_FLOAT, Ty::Float, 8, b, vec![it(1), ft(2.0)]),
         c(ov::ARRAY_VARIANCE_F, vec![o(0), it(1)], F),
@@ -1526,9 +1529,9 @@ fn array_copy_from_concat() {
     assert_eq!(once(&calls, Dialect::V6), Err(FaultKind::CollectionBounds));
 }
 
-/// `array.join` (`pin:04-array-join-render`): elements as `str.tostring` renders them, na as
-/// `"NaN"`, separated by the separator (a SCRATCH one too); empty → `""`; a na separator → na;
-/// 0 B/op.
+/// `array.join` (`pin:04-array-join-render`): ints as `str.tostring` renders them, floats with
+/// at least one fraction digit (F099: a whole float is `"2.0"`), na as `"NaN"`, separated by the
+/// separator (a SCRATCH one too); empty → `""`; a na separator → na; 0 B/op.
 #[test]
 fn array_join_renders_in_place() {
     let b = float_block(4);
@@ -1543,7 +1546,7 @@ fn array_join_renders_in_place() {
             vec![ft(1.5), ft(f64::NAN), ft(2.0)],
         ),
         c(ov::ARRAY_JOIN_AF, vec![o(0), st(",")], I),
-        c(ov::OP_EQ_STR, vec![o(1), st("1.5,NaN,2")], I),
+        c(ov::OP_EQ_STR, vec![o(1), st("1.5,NaN,2.0")], I),
         new(ov::ARRAY_FROM_AI, Ty::Int, 4, ib, vec![it(1), it(-2), NA_I]),
         c(ov::ARRAY_JOIN_AI, vec![o(3), st(", ")], I),
         c(ov::OP_EQ_STR, vec![o(4), st("1, -2, NaN")], I),
@@ -1709,8 +1712,9 @@ fn map_copy_and_put_all() {
 }
 
 /// Brute force over the non-na values `v` (sorted ascending): `[median, mode, nearest(p),
-/// linear(p)]` as the rows define them; `int` takes the lower middle and truncates toward zero.
-fn bf_order(v: &[f64], p: f64, int: bool) -> [f64; 4] {
+/// linear(p)]` as the rows define them; `int` takes the lower middle and truncates toward zero;
+/// `any_na`: the array holds an na element, so `linear` is na (`pin:04-percentile-linear-na`).
+fn bf_order(v: &[f64], p: f64, int: bool, any_na: bool) -> [f64; 4] {
     if v.is_empty() {
         return [f64::NAN; 4];
     }
@@ -1736,10 +1740,20 @@ fn bf_order(v: &[f64], p: f64, int: bool) -> [f64; 4] {
     }
     let (near, lin) = if (0.0..=100.0).contains(&p) {
         let r = (((p * n as f64) / 100.0).ceil() as usize).clamp(1, n);
-        let x = (p * (n - 1) as f64) / 100.0;
+        // C = 1/2 (`pin:04-percentile-linear-c-half`): 0-based rank p·N/100 − 1/2, clamped.
+        let x = (p * n as f64) / 100.0 - 0.5;
+        let x = if x < 0.0 {
+            0.0
+        } else if x > (n - 1) as f64 {
+            (n - 1) as f64
+        } else {
+            x
+        };
         let k = x.floor() as usize;
         let fr = x - k as f64;
-        let l = if fr == 0.0 || k + 1 >= n {
+        let l = if any_na {
+            f64::NAN
+        } else if fr == 0.0 || k + 1 >= n {
             v[k]
         } else {
             v[k] + fr * (v[k + 1] - v[k])
@@ -1840,7 +1854,7 @@ fn array_order_statistics_and_int_moments_match_bruteforce() {
             hist.push(f[1]);
             let mut v: Vec<f64> = hist.iter().copied().filter(|x| !x.is_nan()).collect();
             v.sort_by(|a, b| a.total_cmp(b));
-            let want = bf_order(&v, f[2], int);
+            let want = bf_order(&v, f[2], int, v.len() < hist.len());
             for (k, &w) in want.iter().enumerate() {
                 let g = r[i][2 + k];
                 assert!(
@@ -1857,15 +1871,16 @@ fn array_order_statistics_and_int_moments_match_bruteforce() {
                 let (avg, var1, sd0) = if v.is_empty() {
                     (f64::NAN, f64::NAN, f64::NAN)
                 } else {
+                    // pin:04-array-variance-one-pass (small ints: Σx, Σx² exact in any order).
                     let s: f64 = v.iter().sum();
+                    let s2: f64 = v.iter().map(|x| x * x).sum();
                     let m = s / n;
-                    let ss: f64 = v.iter().map(|x| (x - m) * (x - m)).sum();
                     let sd0 = if n > 1.0 {
-                        (ss / (n - 1.0)).sqrt().trunc()
+                        (s2 / (n - 1.0) - (s / (n - 1.0)) * m).sqrt().trunc()
                     } else {
                         f64::NAN
                     };
-                    ((s / n).trunc(), (ss / n).trunc(), sd0)
+                    ((s / n).trunc(), (s2 / n - (s / n) * m).trunc(), sd0)
                 };
                 for (k, w) in [(7, avg), (8, var1), (9, sd0)] {
                     let g = r[i][k];
@@ -1916,15 +1931,15 @@ fn bf_cov(xs: &[f64], ys: &[f64], biased: bool) -> f64 {
     sp / if biased { n } else { n - 1.0 }
 }
 
-/// Brute force of `pin:04-array-percentrank`: `100 × #(x ≤ ref) / n` over the non-na values.
+/// Brute force of `pin:04-array-percentrank` (F101 / F102): `100 × #(other x ≤ ref) / (size − 1)`
+/// — the reference not counted, an na element in `size` and never `≤`; one element → na.
 fn bf_prank(v: &[f64], k: usize, int: bool) -> f64 {
     let r = v[k];
     if r.is_nan() {
         return f64::NAN;
     }
-    let live: Vec<f64> = v.iter().copied().filter(|x| !x.is_nan()).collect();
-    let le = live.iter().filter(|x| **x <= r).count() as f64;
-    let p = 100.0 * le / live.len() as f64;
+    let le = (0..v.len()).filter(|&i| i != k && v[i] <= r).count() as f64;
+    let p = 100.0 * le / (v.len() - 1) as f64;
     if int {
         p.trunc()
     } else {
@@ -2050,10 +2065,11 @@ fn array_covariance_and_percentrank_match_bruteforce() {
     // means 2 and 13/3; Σ(dx·dy) = (−1)(−7/3) + 0 + (1)(8/3) = 5.
     assert!((r[k] - 5.0 / 3.0).abs() < 1e-12, "{}", r[k]);
     assert!((r[k + 1] - 2.5).abs() < 1e-12, "{}", r[k + 1]);
-    // 5 is ≥ 2, 4, 5 of four → 75; an na reference → na; 2 is ≥ 1, 2 of three → 66.67.
-    assert_eq!(r[k + 2], 75.0);
+    // [2, 4, 7, 5] at 3: 5 is ≥ 2, 4 of the three others → 66 (int, toward zero); an na
+    // reference → na; [1, 2, 3, na] at 1: 2 is ≥ 1 of the three others (na never ≤) → 33.33.
+    assert_eq!(r[k + 2], 66.0);
     assert!(r[k + 3].is_nan());
-    assert_eq!(r[k + 4], 100.0 * 2.0 / 3.0);
+    assert_eq!(r[k + 4], 100.0 / 3.0);
     // Faults.
     let three = |extra: C| {
         let mut v = arr(
@@ -2204,4 +2220,343 @@ fn array_core_rows_new_from_sort_indices_map_clear() {
         ),
         Err(FaultKind::PoolFull)
     );
+}
+
+// ---- TV captures of 2026-10-17 (F099 F101 F102 F103 F105 F106) -------------------------------
+
+/// An `array.from` of floats (cap 16) at call 0.
+fn floats_from(vals: &[f64]) -> C {
+    new(
+        ov::ARRAY_FROM_AF,
+        Ty::Float,
+        16,
+        float_block(16),
+        vals.iter().map(|&x| ft(x)).collect(),
+    )
+}
+
+/// An `array.from` of ints (cap 16) at call 0; `None` = na.
+fn ints_from(vals: &[Option<i64>]) -> C {
+    new(
+        ov::ARRAY_FROM_AI,
+        Ty::Int,
+        16,
+        coll_block_bytes(CollKind::Array, Ty::Int, Ty::Void, 16, 16),
+        vals.iter().map(|v| v.map_or(NA_I, it)).collect(),
+    )
+}
+
+/// F103 (TV, R-P15): `array.percentile_linear_interpolation` is C = 1/2 — p = 25 over
+/// `[30, 10, 40, 20]` is 15 and over the 14 values `10..140` is 40 (C = 1: 17.5 / 42.5); the int
+/// rows agree (exact here), clamps at the ends (`h ≤ 1` the smallest, `h ≥ N` the largest).
+#[test]
+fn percentile_linear_is_c_half_f103() {
+    let a14 = [
+        50.0, 10.0, 140.0, 30.0, 120.0, 20.0, 90.0, 40.0, 130.0, 60.0, 110.0, 70.0, 100.0, 80.0,
+    ];
+    let pli = ov::ARRAY_PERCENTILE_LINEAR_INTERPOLATION_F;
+    for (vals, p, want) in [
+        (&[30.0, 10.0, 40.0, 20.0][..], 25.0, 15.0),
+        (&a14[..], 25.0, 40.0),
+        (&[30.0, 10.0, 40.0, 20.0][..], 10.0, 10.0),
+        (&[30.0, 10.0, 40.0, 20.0][..], 90.0, 40.0),
+        (&[30.0, 10.0, 40.0, 20.0][..], 50.0, 25.0),
+        (&[30.0, 10.0, 40.0, 20.0][..], 0.0, 10.0),
+        (&[30.0, 10.0, 40.0, 20.0][..], 100.0, 40.0),
+    ] {
+        let calls = vec![floats_from(vals), c(pli, vec![o(0), ft(p)], F)];
+        assert_eq!(
+            once(&calls, Dialect::V6).unwrap()[1],
+            want,
+            "p {p} over {vals:?}"
+        );
+        let iv: Vec<Option<i64>> = vals.iter().map(|&x| Some(x as i64)).collect();
+        let calls = vec![
+            ints_from(&iv),
+            c(
+                ov::ARRAY_PERCENTILE_LINEAR_INTERPOLATION_I,
+                vec![o(0), ft(p)],
+                I,
+            ),
+        ];
+        assert_eq!(once(&calls, Dialect::V6).unwrap()[1], want, "int p {p}");
+    }
+}
+
+/// F101 / F102 (TV): `percentile_linear_interpolation` of an array holding an na element is na
+/// (`pin:04-percentile-linear-na`) while `percentile_nearest_rank` skips it.
+#[test]
+fn percentile_linear_of_array_with_na_is_na_f101() {
+    let calls = vec![
+        floats_from(&[5.0, f64::NAN, 1.0, 3.0]),
+        c(
+            ov::ARRAY_PERCENTILE_LINEAR_INTERPOLATION_F,
+            vec![o(0), ft(40.0)],
+            F,
+        ),
+        c(ov::ARRAY_PERCENTILE_NEAREST_RANK_F, vec![o(0), ft(40.0)], F),
+    ];
+    let r = once(&calls, Dialect::V6).unwrap();
+    assert!(r[1].is_nan());
+    assert_eq!(r[2], 3.0);
+    let calls = vec![
+        ints_from(&[Some(807), Some(810), None, Some(800), Some(810)]),
+        c(
+            ov::ARRAY_PERCENTILE_LINEAR_INTERPOLATION_I,
+            vec![o(0), ft(40.0)],
+            I,
+        ),
+        c(ov::ARRAY_PERCENTILE_NEAREST_RANK_I, vec![o(0), ft(40.0)], I),
+    ];
+    let r = once(&calls, Dialect::V6).unwrap();
+    assert!(r[1].is_nan());
+    assert_eq!(r[2], 807.0);
+}
+
+/// F101 (TV row 0, `syn` = 1168.07): every float statistic of `[s, s − 3, na, s + 7.5, s − 3]`
+/// (and `y = [1, 2, na, 4, 5]` for the covariance) — na skipped except by `pli` (na), and
+/// `percentrank` at index 1 is 25 (`pin:04-array-percentrank`: the reference not counted, divided
+/// by size − 1).
+#[test]
+fn f101_float_stats_with_one_na_match_tv_row0() {
+    let s = 1168.07;
+    let x = [s, s - 3.0, f64::NAN, s + 7.5, s - 3.0];
+    let mut calls = vec![floats_from(&x)];
+    let y = calls.len() as u16;
+    calls.push(floats_from(&[1.0, 2.0, f64::NAN, 4.0, 5.0]));
+    let k = calls.len();
+    calls.extend([
+        c(ov::ARRAY_SUM_F, vec![o(0)], F),
+        c(ov::ARRAY_AVG_F, vec![o(0)], F),
+        c(ov::ARRAY_MIN_F, vec![o(0), it(0)], F),
+        c(ov::ARRAY_MAX_F, vec![o(0), it(0)], F),
+        c(ov::ARRAY_RANGE_F, vec![o(0)], F),
+        c(ov::ARRAY_VARIANCE_F, vec![o(0), it(1)], F),
+        c(ov::ARRAY_STDEV_F, vec![o(0), it(0)], F),
+        c(ov::ARRAY_MEDIAN_F, vec![o(0)], F),
+        c(ov::ARRAY_MODE_F, vec![o(0)], F),
+        c(ov::ARRAY_PERCENTILE_NEAREST_RANK_F, vec![o(0), ft(40.0)], F),
+        c(
+            ov::ARRAY_PERCENTILE_LINEAR_INTERPOLATION_F,
+            vec![o(0), ft(40.0)],
+            F,
+        ),
+        c(ov::ARRAY_PERCENTRANK_F, vec![o(0), it(1)], F),
+        c(ov::ARRAY_COVARIANCE_AFAF, vec![o(0), o(y), it(1)], F),
+    ]);
+    let r = once(&calls, Dialect::V6).unwrap();
+    let tv = [
+        4673.78,
+        1168.445,
+        1165.07,
+        1175.57,
+        10.5,
+        18.421875,
+        4.956056900399752,
+        1166.57,
+        1165.07,
+        1165.07,
+        f64::NAN,
+        25.0,
+        1.125,
+    ];
+    for (j, w) in tv.iter().enumerate() {
+        let g = r[k + j];
+        assert!(
+            (g.is_nan() && w.is_nan()) || (g - w).abs() <= 1e-9 * (1.0 + w.abs()),
+            "column {j}: ours {g} vs TV {w}"
+        );
+    }
+}
+
+/// F102 (TV row 0, `syni` = 807, `[807, 810, na, 800, 810]`): the int rows TV answers with a
+/// fraction — `avg` 806.75, `variance` 16.6875, `stdev` 4.085033659592048, `median` 808.5 — are
+/// served exactly on an f64 output lane (the lane a pine-spec `float` return gives; the i64
+/// lane of today keeps `pin:04-array-int-stats-provisional`); `pli` na, `percentrank` 75 on
+/// either lane, and the members (`sum` `min` `max` `range` `mode` `pnr`) on the i64 lane.
+#[test]
+fn int_array_stats_on_float_lane_match_tv_f102() {
+    let mut calls = vec![ints_from(&[
+        Some(807),
+        Some(810),
+        None,
+        Some(800),
+        Some(810),
+    ])];
+    let k = calls.len();
+    calls.extend([
+        c(ov::ARRAY_AVG_I, vec![o(0)], F),
+        c(ov::ARRAY_VARIANCE_I, vec![o(0), it(1)], F),
+        c(ov::ARRAY_STDEV_I, vec![o(0), it(1)], F),
+        c(ov::ARRAY_MEDIAN_I, vec![o(0)], F),
+        c(
+            ov::ARRAY_PERCENTILE_LINEAR_INTERPOLATION_I,
+            vec![o(0), ft(40.0)],
+            F,
+        ),
+        c(ov::ARRAY_PERCENTRANK_I, vec![o(0), it(1)], F),
+        c(ov::ARRAY_PERCENTRANK_I, vec![o(0), it(1)], I),
+        c(ov::ARRAY_SUM_I, vec![o(0)], I),
+        c(ov::ARRAY_MIN_I, vec![o(0), it(0)], I),
+        c(ov::ARRAY_MAX_I, vec![o(0), it(0)], I),
+        c(ov::ARRAY_RANGE_I, vec![o(0)], I),
+        c(ov::ARRAY_MODE_I, vec![o(0)], I),
+        c(ov::ARRAY_PERCENTILE_NEAREST_RANK_I, vec![o(0), ft(40.0)], I),
+    ]);
+    let r = once(&calls, Dialect::V6).unwrap();
+    let tv = [
+        806.75,
+        16.6875,
+        4.085033659592048,
+        808.5,
+        f64::NAN,
+        75.0,
+        75.0,
+        3227.0,
+        800.0,
+        810.0,
+        10.0,
+        810.0,
+        807.0,
+    ];
+    for (j, w) in tv.iter().enumerate() {
+        let g = r[k + j];
+        assert!(
+            (g.is_nan() && w.is_nan()) || g == *w,
+            "column {j}: ours {g} vs TV {w}"
+        );
+    }
+}
+
+/// F106 (TV, float and int rows identical over `[10, 20, 30, 40]`): the miss law — leftmost
+/// `max(0, ip − 1)`, rightmost `ip` (`pin:04-binary-search`).
+#[test]
+fn binary_search_leftmost_below_is_zero_f106() {
+    let probes: [(usize, f64, f64); 8] = [
+        (0, 20.0, 1.0),
+        (1, 25.0, 1.0),
+        (2, 25.0, 2.0),
+        (1, 5.0, 0.0),
+        (2, 5.0, 0.0),
+        (0, 5.0, -1.0),
+        (1, 45.0, 3.0),
+        (2, 45.0, 4.0),
+    ];
+    let ids_f = [
+        ov::ARRAY_BINARY_SEARCH_AF,
+        ov::ARRAY_BINARY_SEARCH_LEFTMOST_AF,
+        ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AF,
+    ];
+    let ids_i = [
+        ov::ARRAY_BINARY_SEARCH_AI,
+        ov::ARRAY_BINARY_SEARCH_LEFTMOST_AI,
+        ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AI,
+    ];
+    for int in [false, true] {
+        let mut calls = vec![if int {
+            ints_from(&[Some(10), Some(20), Some(30), Some(40)])
+        } else {
+            floats_from(&[10.0, 20.0, 30.0, 40.0])
+        }];
+        for &(m, v, _) in &probes {
+            let id = if int { ids_i[m] } else { ids_f[m] };
+            calls.push(c(id, vec![o(0), ft(v)], I));
+        }
+        let r = once(&calls, Dialect::V6).unwrap();
+        for (j, &(m, v, want)) in probes.iter().enumerate() {
+            assert_eq!(r[1 + j], want, "int {int} mode {m} val {v}");
+        }
+    }
+    // An empty array: the law's literal reading (not captured).
+    let calls = vec![
+        new(
+            ov::ARRAY_NEW_FLOAT,
+            Ty::Float,
+            4,
+            float_block(4),
+            vec![it(0), ft(0.0)],
+        ),
+        c(ov::ARRAY_BINARY_SEARCH_LEFTMOST_AF, vec![o(0), ft(1.0)], I),
+        c(ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AF, vec![o(0), ft(1.0)], I),
+    ];
+    let r = once(&calls, Dialect::V6).unwrap();
+    assert_eq!((r[1], r[2]), (0.0, 0.0));
+}
+
+/// F105 (TV): `array.every` and `array.some` of an empty bool array are both false.
+#[test]
+fn array_every_of_empty_is_false_f105() {
+    let bb = coll_block_bytes(CollKind::Array, Ty::Bool, Ty::Void, 4, 16);
+    let calls = vec![
+        new(ov::ARRAY_NEW_BOOL, Ty::Bool, 4, bb, vec![it(0), NA_I]),
+        c(ov::ARRAY_EVERY, vec![o(0)], I),
+        c(ov::ARRAY_SOME, vec![o(0)], I),
+        new(ov::ARRAY_FROM_AB, Ty::Bool, 4, bb, vec![it(1), it(1)]),
+        c(ov::ARRAY_EVERY, vec![o(3)], I),
+    ];
+    let r = once(&calls, Dialect::V6).unwrap();
+    assert_eq!((r[1], r[2], r[4]), (0.0, 0.0, 1.0));
+}
+
+/// F099 (TV): `array.join` of `array.from(1.0, 2.0, 3.0)` after `array.fill(b, 4.5, 0, 2)` with
+/// `","` is 11 characters — `"4.5,4.5,3.0"`, a whole float keeping one fraction digit
+/// (`pin:04-array-join-render`); ints stay decimal.
+#[test]
+fn array_join_whole_float_keeps_point_f099() {
+    let calls = vec![
+        floats_from(&[1.0, 2.0, 3.0]),
+        c(ov::ARRAY_FILL, vec![o(0), ft(4.5), it(0), it(2)], &[]),
+        c(ov::ARRAY_JOIN_AF, vec![o(0), st(",")], I),
+        c(ov::OP_EQ_STR, vec![o(2), st("4.5,4.5,3.0")], I),
+        floats_from(&[-0.0, 100.0, 0.125, -7.0]),
+        c(ov::ARRAY_JOIN_AF, vec![o(4), st(" ")], I),
+        c(ov::OP_EQ_STR, vec![o(5), st("0.0 100.0 0.125 -7.0")], I),
+        ints_from(&[Some(3), Some(-40)]),
+        c(ov::ARRAY_JOIN_AI, vec![o(7), st(",")], I),
+        c(ov::OP_EQ_STR, vec![o(8), st("3,-40")], I),
+    ];
+    let r = once(&calls, Dialect::V6).unwrap();
+    assert_eq!((r[3], r[6], r[9]), (1.0, 1.0, 1.0));
+}
+
+/// F101 (TV, all 16 captured rows): `array.variance(x)` (biased) and `array.stdev(x, false)` of
+/// `[s, s − 3, na, s + 7.5, s − 3]` carry the one-pass formula's cancellation bit for bit
+/// (`pin:04-array-variance-one-pass`) — e.g. row 2 variance 18.42187500046566 and row 1 stdev
+/// 4.956056900446732, where the exact two-pass value is 18.421875 / 4.956056900399752.
+#[test]
+fn array_variance_is_one_pass_f101() {
+    let tv: [(f64, f64); 16] = [
+        (18.421875, 4.956056900399752),
+        (18.421875, 4.956056900446732),
+        (18.42187500046566, 4.956056900446732),
+        (18.421875, 4.956056900399752),
+        (18.421875, 4.956056900399752),
+        (18.421875, 4.956056900376263),
+        (18.421875, 4.956056900399752),
+        (18.421875, 4.956056900352773),
+        (18.421875, 4.956056900399752),
+        (18.421875, 4.956056900399752),
+        (18.421875, 4.956056900399752),
+        (18.42187499976717, 4.956056900352773),
+        (18.421875, 4.956056900399752),
+        (18.421875, 4.956056900399752),
+        (18.421875, 4.956056900376263),
+        (18.421875, 4.956056900399752),
+    ];
+    // SYN-1 of the fixture: the Park–Miller sequence, `syn = 1000 + (s mod 100000) / 100`.
+    let mut s = 1.0f64;
+    for (row, (var, sd)) in tv.iter().enumerate() {
+        let hi = (s / 127773.0).floor();
+        let lo = s - hi * 127773.0;
+        let t = 16807.0 * lo - 2836.0 * hi;
+        s = if t > 0.0 { t } else { t + 2147483647.0 };
+        let syn = 1000.0 + (s - (s / 100000.0).floor() * 100000.0) / 100.0;
+        let calls = vec![
+            floats_from(&[syn, syn - 3.0, f64::NAN, syn + 7.5, syn - 3.0]),
+            c(ov::ARRAY_VARIANCE_F, vec![o(0), it(1)], F),
+            c(ov::ARRAY_STDEV_F, vec![o(0), it(0)], F),
+        ];
+        let r = once(&calls, Dialect::V6).unwrap();
+        assert_eq!((r[1], r[2]), (*var, *sd), "row {row} (syn {syn})");
+    }
 }

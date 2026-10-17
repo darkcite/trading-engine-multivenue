@@ -577,7 +577,7 @@ fn emit_class_v_slots_are_cleared_in_the_init_block() {
 }
 
 #[test]
-fn emit_mod_is_floored_opcode() {
+fn emit_mod_keeps_its_opcode() {
     let p = v6p("a = bar_index % 3\nb = close % 2.5\nplot(a + b)\n");
     assert!(p.code.iter().any(|i| i.op == op::I_MOD));
     assert!(p.code.iter().any(|i| i.op == op::F_MOD));

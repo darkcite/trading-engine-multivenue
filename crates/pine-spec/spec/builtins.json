@@ -1418,7 +1418,7 @@
             }
           ],
           "ret": [
-            "int"
+            "float"
           ],
           "ret_qual": "series",
           "abi": "call",
@@ -3646,7 +3646,7 @@
             }
           ],
           "ret": [
-            "int"
+            "float"
           ],
           "ret_qual": "series",
           "abi": "call",
@@ -6107,7 +6107,7 @@
             }
           ],
           "ret": [
-            "int"
+            "float"
           ],
           "ret_qual": "series",
           "abi": "call",
@@ -6348,7 +6348,7 @@
             }
           ],
           "ret": [
-            "int"
+            "float"
           ],
           "ret_qual": "series",
           "abi": "call",

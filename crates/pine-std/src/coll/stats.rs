@@ -258,8 +258,8 @@ fn range(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
 
 /// `array.every` / `array.some(id)` — `[id, out]` on a bool array: every element true / at
 /// least one. `pin:04-array-every-some`: an na element (v5) is not true; an empty array is
-/// `every` = true (vacuously) and `some` = false — the literal reading of "all elements … are
-/// true" / "at least one element … is true" (the reference shows no empty case).
+/// `every` = **false** and `some` = false (TV F105: `every` 0 and `some` 0 of `array.new_bool(0)`
+/// — not the vacuous truth; the reference shows no empty case).
 fn every_some<const SOME: bool>(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 2 {
         return Err(FaultKind::Internal);
@@ -271,7 +271,7 @@ fn every_some<const SOME: bool>(f: &mut Frame<'_>, args: &[u16]) -> Result<(), F
     let (_, words) = f.coll(o.owner)?;
     let w = &words[o.base as usize..(o.base + o.len) as usize];
     let mut i = 0usize;
-    let mut v = !SOME;
+    let mut v = !SOME && !w.is_empty();
     while i < w.len() {
         let t = w[i] != 0 && w[i] != NA;
         if SOME && t {
@@ -350,8 +350,11 @@ fn bisect<const LE: bool>(w: &[u64], float: bool, v: f64) -> usize {
 /// reference: the index of `val`, else −1 (plain); else the index of the next smaller element
 /// to the left (leftmost) / of the element to the right of where `val` would lie (rightmost).
 /// `pin:04-binary-search`: a found value is its first occurrence (plain, leftmost) / its last
-/// (rightmost); leftmost below every element is −1, rightmost above every element is the size;
-/// an na `val` is −1 for all three; an unsorted array gives the bisection's answer.
+/// (rightmost). The miss law (TV F106, float and int rows alike, over `[10, 20, 30, 40]`): with
+/// the insertion point `ip`, leftmost = `max(0, ip − 1)` and rightmost = `ip` — leftmost(25) 1,
+/// rightmost(25) 2, leftmost(5) **0** (not −1), rightmost(5) 0, leftmost(45) 3, rightmost(45) 4,
+/// plain(5) −1. An empty array is the law's literal reading (leftmost 0, rightmost 0; not
+/// captured); an na `val` is −1 for all three; an unsorted array gives the bisection's answer.
 fn binary_search<const MODE: u8>(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
     use pine_ir::argwin::is_i64;
     if args.len() != 3 {
@@ -377,7 +380,7 @@ fn binary_search<const MODE: u8>(f: &mut Frame<'_>, args: &[u16]) -> Result<(), 
         match (MODE, found) {
             (0, true) | (1, true) => lo as i64,
             (0, false) => -1,
-            (1, false) => lo as i64 - 1,
+            (1, false) => (lo as i64 - 1).max(0),
             (_, true) => bisect::<true>(w, float, v) as i64 - 1,
             (_, false) => lo as i64,
         }
@@ -425,7 +428,8 @@ fn bisect_obj<const LE: bool>(
 /// `array.binary_search{,_leftmost,_rightmost}(id, val, sort_field)` of an `array<UDT>`
 /// (`MODE` 0 / 1 / 2) — `[id, val, sel, out]`: [`binary_search`] over the int or float field
 /// `sel` names (`pin:02-udt-field-selector`), answers and pins as the scalar rows
-/// (`pin:04-binary-search`). `val` is an int (i64 entry; na → NaN) or a float, compared as
+/// (`pin:04-binary-search`, the F106 miss law: leftmost `max(0, ip − 1)`, rightmost `ip`).
+/// `val` is an int (i64 entry; na → NaN) or a float, compared as
 /// `f64`; sema refuses a string `val` and a field that is not int / float (3007). Only the
 /// elements the bisection reads are touched, so an na element among them is `ScriptRefused`
 /// (`pin:04-udt-sort-na-object`); one it does not read is not.
@@ -466,7 +470,7 @@ fn binary_search_at<const MODE: u8>(f: &mut Frame<'_>, args: &[u16]) -> Result<(
         match (MODE, found) {
             (0, true) | (1, true) => lo as i64,
             (0, false) => -1,
-            (1, false) => lo as i64 - 1,
+            (1, false) => (lo as i64 - 1).max(0),
             (_, true) => bisect_obj::<true>(f, w, field, float, v)? as i64 - 1,
             (_, false) => lo as i64,
         }

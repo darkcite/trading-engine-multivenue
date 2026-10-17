@@ -195,14 +195,16 @@ const TV_PASS: &[&str] = &[
     "B077", "B078", "B082", "B083", "B084", "B085", "B086", "B088", "B090", "B091", "B092", "B093",
     "B094", "B095", "B096", "B097", "B098", "B100", "B102", "B103", "C001", "C002", "C003", "C004",
     "C005", "C006", "C007", "C008", "C009", "C010", "C011", "C012", "C013", "C014", "C015", "C016",
-    "C017", "C018", "C019", "C020", "C021", "C022", "C023", "C024", "C025", "C028", "C031", "C033",
-    "C034", "C035", "C036", "C037", "C039", "C040", "C041", "C042", "C045", "C046", "E109", "F001",
-    "F002", "F003", "F005", "F006", "F008", "F009", "F010", "F012", "F013", "F014", "F016", "F017",
-    "F018", "F021", "F022", "F023", "F026", "F027", "F028", "F029", "F030", "F032", "F033", "F034",
-    "F036", "F038", "F041", "F042", "F043", "F044", "F045", "F046", "F048", "F049", "F050", "F051",
-    "F052", "F053", "F055", "F056", "F057", "F058", "F060", "F066", "F068", "F070", "F072", "F073",
-    "F074", "F075", "F076", "F077", "F078", "F080", "F081", "F086", "F090", "F092", "F093", "F094",
-    "F095", "Z002", "Z003", "Z004", "Z005", "Z009", "Z010", "Z011", "Z012", "Z013", "Z015", "Z016",
+    "C017", "C018", "C019", "C020", "C021", "C022", "C023", "C024", "C025", "C028", "C029", "C031",
+    "C033", "C034", "C035", "C036", "C037", "C039", "C040", "C041", "C042", "C044", "C045", "C046",
+    "D053", "E056", "E109", "E128", "F001", "F002", "F003", "F004", "F005", "F006", "F007", "F008",
+    "F009", "F010", "F012", "F013", "F014", "F016", "F017", "F018", "F021", "F022", "F023", "F026",
+    "F027", "F028", "F029", "F030", "F032", "F033", "F034", "F036", "F038", "F039", "F041", "F042",
+    "F043", "F044", "F045", "F046", "F048", "F049", "F050", "F051", "F052", "F053", "F055", "F056",
+    "F057", "F058", "F060", "F066", "F068", "F070", "F072", "F073", "F074", "F075", "F076", "F077",
+    "F078", "F080", "F081", "F085", "F086", "F090", "F092", "F093", "F094", "F095", "F099", "F100",
+    "F101", "F102", "F103", "F104", "F105", "F106", "F107", "F110", "F112", "F114", "F115", "F116",
+    "F118", "Z002", "Z003", "Z004", "Z005", "Z009", "Z010", "Z011", "Z012", "Z013", "Z015", "Z016",
     "Z019",
 ];
 
@@ -251,8 +253,11 @@ const TV_GAPS: &[(&str, &str)] = &[
     ("B099", "refused-by-us"),
     ("B101", "differ"),
     ("C032", "refused-by-us"),
+    ("D054", "differ"),
     ("E106", "differ"),
-    ("F004", "differ"),
+    ("E110", "differ"),
+    ("E122", "refused-by-us"),
+    ("E123", "refused-by-us"),
     ("F011", "differ"),
     ("F015", "differ"),
     ("F019", "differ"),
@@ -262,7 +267,6 @@ const TV_GAPS: &[(&str, &str)] = &[
     ("F031", "differ"),
     ("F035", "differ"),
     ("F037", "differ"),
-    ("F039", "differ"),
     ("F040", "differ"),
     ("F047", "differ"),
     ("F061", "differ"),
@@ -279,6 +283,8 @@ const TV_GAPS: &[(&str, &str)] = &[
     ("F096", "differ"),
     ("F097", "differ"),
     ("F098", "differ"),
+    ("F117", "differ"),
+    ("F119", "fault-by-us"),
     ("Z001", "refused-by-us"),
     ("Z006", "refused-by-us"),
     ("Z007", "refused-by-us"),
@@ -290,7 +296,9 @@ const TV_GAPS: &[(&str, &str)] = &[
 
 /// Chart / SynSig fixtures of the run: all `harness-gap · NoBarsRoot` without a bars root (the
 /// Mac runs them with `pine-conf report --tv --bars DIR`).
-const TV_NO_BARS: usize = 186;
+const TV_NO_BARS: usize = 194;
+/// The captured TradingView fixtures the ratchet runs (r31 capture session 07).
+const TV_CAPTURED: usize = 550;
 
 fn tv_options() -> RunnerOptions {
     let mut o = RunnerOptions::new(root());
@@ -313,10 +321,11 @@ fn tv_fixtures_hold_the_known_pass_set() {
         .iter()
         .filter(|f| pine_conformance::run::is_tv_captured(f))
         .collect();
+    println!("TVCOUNT {}", tv.len());
     assert_eq!(
         tv.len(),
-        514,
-        "captured fixtures run (517 − C044 D053 D054)"
+        TV_CAPTURED,
+        "captured fixtures run (r31: 550 — F108 escalated, uncapturable)"
     );
     let (mut pass, mut gaps) = (Vec::new(), Vec::new());
     let mut no_bars = 0usize;
@@ -324,11 +333,9 @@ fn tv_fixtures_hold_the_known_pass_set() {
         let t = classify_tv(f, &runner.check_full(f));
         let id = f.id.as_str().to_string();
         let charted = matches!(f.driver, Driver::Chart | Driver::SynSig);
-        if charted {
-            assert_eq!(
-                t.cluster, "harness-gap · NoBarsRoot",
-                "{id}: a Chart / SynSig fixture without bars"
-            );
+        // A Chart / SynSig fixture needs bars — except one whose TradingView outcome is a
+        // compile / run refusal (a paste, R-P2: E056 E110 E128), judged without running bars.
+        if charted && t.cluster == "harness-gap · NoBarsRoot" {
             no_bars += 1;
         } else if t.class == TvClass::Pass {
             pass.push(id);

@@ -6,6 +6,8 @@
 //! (I38); `#[cfg(test)]` `with_switches` constructors build a broker on the other reading. When a
 //! fixture decides against a default, this constant changes in the same commit as the capture.
 
+use crate::money::{ceil_tick, floor_tick, round_tick};
+
 /// `path_tie` — open equidistant from high and low (`pin:05-path-tie`, §4.8.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -124,18 +126,100 @@ pub(crate) enum PctEquityAt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum PriceRounding {
-    /// Rounded down (toward −∞) to `chart.mintick_1e6` (default). `pin:05-price-rounding`
-    /// decided by E113 (CI-034): a buy limit at `close − 12.4 ticks` (77249.5 − 1.24 = 77248.26)
-    /// filled at 77248.2 on all 43 limit fills — neither `NearestTick` (77248.3) nor `None`
-    /// (77248.26). Only buy limits were captured off the grid: sell limits and stops take the same
-    /// one-grid rule (literal reading) until a capture shows otherwise.
-    FloorTick = 0,
+    /// Per order kind, to the grid tick the market reaches no earlier than the script's level
+    /// (default): a buy limit and a sell stop round down (toward −∞), a sell limit and a buy stop
+    /// round up (toward +∞), on `chart.mintick_1e6`. `pin:05-price-rounding` decided (r31) by the
+    /// captured List of Trades read on TV's bars against the r29 readings, a reading counting
+    /// only if it matches every trade of its fixture:
+    /// * buy limit — E113 (`close − 12.4` ticks): `floor_tick` 45/45, `nearest_tick` 0/45,
+    ///   `ceil_tick` 0/45;
+    /// * sell limit — E129 (`close + 12.4 / 12.6` ticks by `syni` parity): `ceil_tick` 45/45,
+    ///   `nearest_tick` 19/45, `floor_tick` 0/45;
+    /// * buy stop — E131 (`close + 12.4 / 12.6`): `ceil_tick` 45/45, `nearest_tick` 19/45,
+    ///   `floor_tick` 0/45;
+    /// * sell stop, an exit leg — E130 (`strategy.exit(stop = avg − 20.4 / 20.6` ticks)):
+    ///   `floor_tick` 92/92 stop exits (42 of them separate the readings), `nearest_tick` 69/92,
+    ///   `ceil_tick` 50/92 — the exit leg's absolute price is rounded like an order's.
+    ///
+    /// An exit leg takes its order's rule (a long's take-profit is a sell limit, its stop-loss a
+    /// sell stop; mirrored for a short) and a stop-limit rounds each price by its own rule: the
+    /// exit-leg limit, the buy-stop leg and the stop-limit are uncaptured (literal reading of the
+    /// four captured kinds). Tick-distance legs (`profit`, `loss`, `trail_points`), the trail
+    /// activation `trail_price` and `trail_offset` are not script prices and stay as given.
+    NeverEarlier = 0,
     #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
-    /// Rounded to `chart.mintick_1e6`, half away from zero (the pre-capture default; refuted).
+    /// Rounded to `chart.mintick_1e6`, half away from zero (the pre-capture default; refuted by
+    /// E113, 0/45).
     NearestTick = 1,
-    #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
-    /// Used as given.
+    /// Used as given (also the native broker's grid, [`PriceGrid::AS_GIVEN`]).
     None = 2,
+    #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
+    /// Rounded down (toward −∞) for every kind — R-P12's provisional default after E113 (CI-034);
+    /// refuted for sell limits by E129 (0/45) and for buy stops by E131 (0/45).
+    FloorTick = 3,
+}
+
+/// A script price's grid (`pin:05-price-rounding`, §4.1): the tick (0 = prices as given) and the
+/// reading. Held by value in each commit and exit-sync context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub(crate) struct PriceGrid {
+    /// `chart.mintick_1e6`; 0 = prices as given.
+    pub(crate) tick_1e6: i64,
+    /// The `price_rounding` reading.
+    pub(crate) rounding: PriceRounding,
+}
+
+const _: () = assert!(core::mem::size_of::<PriceGrid>() == 16);
+const _: () = assert!(core::mem::align_of::<PriceGrid>() == 8);
+
+impl PriceGrid {
+    /// Prices as given: the native broker (the venue gate rounds), TV under `price_rounding =
+    /// None`.
+    pub(crate) const AS_GIVEN: Self = Self {
+        tick_1e6: 0,
+        rounding: PriceRounding::None,
+    };
+
+    /// TV mode: `mintick_1e6` under `rounding` (`None` → [`Self::AS_GIVEN`]).
+    pub(crate) const fn tv(mintick_1e6: i64, rounding: PriceRounding) -> Self {
+        match rounding {
+            PriceRounding::None => Self::AS_GIVEN,
+            _ => Self {
+                tick_1e6: mintick_1e6,
+                rounding,
+            },
+        }
+    }
+
+    /// A limit price on the grid; `buy`: a buy limit (an entry long, `strategy.order` buy, a
+    /// short's take-profit).
+    pub(crate) const fn limit(self, px_1e6: i64, buy: bool) -> i64 {
+        self.on_grid(px_1e6, buy)
+    }
+
+    /// A stop price on the grid; `buy`: a buy stop (an entry long, `strategy.order` buy, a short's
+    /// stop-loss).
+    pub(crate) const fn stop(self, px_1e6: i64, buy: bool) -> i64 {
+        self.on_grid(px_1e6, !buy)
+    }
+
+    /// `down`: `NeverEarlier`'s direction is toward −∞ (a buy limit, a sell stop). Identity when
+    /// `tick_1e6 ≤ 0`.
+    const fn on_grid(self, px_1e6: i64, down: bool) -> i64 {
+        match self.rounding {
+            PriceRounding::NeverEarlier => {
+                if down {
+                    floor_tick(px_1e6, self.tick_1e6)
+                } else {
+                    ceil_tick(px_1e6, self.tick_1e6)
+                }
+            }
+            PriceRounding::NearestTick => round_tick(px_1e6, self.tick_1e6),
+            PriceRounding::None => px_1e6,
+            PriceRounding::FloorTick => floor_tick(px_1e6, self.tick_1e6),
+        }
+    }
 }
 
 /// `cof_close_tick` — a `calc_on_order_fills` execution after a fill at the bar's close
@@ -241,7 +325,7 @@ pub(crate) const SWITCHES: Switches = Switches {
     trail_arm_fire: TrailArmFire::NextSegment,
     cash_per_order: CashPerOrder::PerFill,
     pct_equity_at: PctEquityAt::FillTime,
-    price_rounding: PriceRounding::FloorTick,
+    price_rounding: PriceRounding::NeverEarlier,
     cof_close_tick: CofCloseTick::No,
     cof_next_tick: CofNextTick::NextPoint,
     fill_limits_price: FillLimitsPrice::AtStart,
@@ -250,7 +334,37 @@ pub(crate) const SWITCHES: Switches = Switches {
 
 #[cfg(test)]
 mod tests {
-    use super::{Switches, SWITCHES};
+    use super::{PriceGrid, PriceRounding, Switches, SWITCHES};
+
+    #[test]
+    fn price_grid_rounds_each_kind_never_earlier() {
+        // `pin:05-price-rounding` (r31): buy limit / sell stop down, sell limit / buy stop up.
+        let g = PriceGrid::tv(100_000, PriceRounding::NeverEarlier);
+        let px = 77_239_640_000; // 77239.64 on a 0.1 tick
+        assert_eq!(g.limit(px, true), 77_239_600_000);
+        assert_eq!(g.limit(px, false), 77_239_700_000);
+        assert_eq!(g.stop(px, true), 77_239_700_000);
+        assert_eq!(g.stop(px, false), 77_239_600_000);
+        // On the grid: unchanged by every kind.
+        assert_eq!(g.limit(77_239_600_000, false), 77_239_600_000);
+        assert_eq!(g.stop(77_239_600_000, true), 77_239_600_000);
+        // `None` is the native grid; the other readings ignore the kind.
+        assert_eq!(
+            PriceGrid::tv(100_000, PriceRounding::None),
+            PriceGrid::AS_GIVEN
+        );
+        assert_eq!(PriceGrid::AS_GIVEN.stop(px, true), px);
+        let f = PriceGrid::tv(100_000, PriceRounding::FloorTick);
+        assert_eq!(
+            (f.limit(px, false), f.stop(px, true)),
+            (77_239_600_000, 77_239_600_000)
+        );
+        let n = PriceGrid::tv(100_000, PriceRounding::NearestTick);
+        assert_eq!(
+            (n.limit(px, true), n.stop(px, false)),
+            (77_239_600_000, 77_239_600_000)
+        );
+    }
 
     #[test]
     fn switches_hold_the_defaults() {

@@ -192,7 +192,7 @@ fn ir_shapes_operators_int_division_follows_w1() {
 }
 
 #[test]
-fn ir_shapes_operators_mod_is_floored_with_u15() {
+fn ir_shapes_operators_mod_keeps_its_opcode_with_u15() {
     let r = ir(
         "x = close % 3.0\ny = bar_index % 3\nplot(x + y)\n",
         Dialect::V6,

@@ -549,7 +549,8 @@ pub static PINS: &[Pin] = &[
         v5: &[],
         v6: &[],
         both: &["E113", "E129", "E130", "E131"],
-        // r29 (R-P12): FloorTick is the provisional default; sells and stops add `ceil_tick`.
+        // r31 (capture 07): decided per order kind — buy limit / sell stop floor (E113 45/45,
+        // E130 92/92), sell limit / buy stop ceil (E129, E131 45/45): `NeverEarlier` in pine-broker.
         readings: &["nearest_tick", "none", "floor_tick", "ceil_tick"],
     },
     Pin {

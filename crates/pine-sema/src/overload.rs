@@ -394,7 +394,7 @@ fn results(ov: &Overload, vars: &[Option<Bind>; 3], arg_join: Qual) -> Vec<TypeQ
                 t.b = b.b;
             }
         }
-        let (va, vb) = (tv::a(r.tv), tv::b(r.tv));
+        let (va, vb) = (ret_elem_var(ov, tv::a(r.tv)), tv::b(r.tv));
         if va != tv::NONE {
             if let Some(e) = vars[(va - 1) as usize].and_then(bind_elem) {
                 t.a = e;
@@ -408,6 +408,25 @@ fn results(ov: &Overload, vars: &[Option<Bind>; 3], arg_join: Qual) -> Vec<TypeQ
         out.push(t);
     }
     out
+}
+
+/// The variable a result's element position reads. pin:02-map-keys-values-elem — R-P2 CI-046
+/// (F107, TradingView compiles `array.join(map.keys(m), ",")` and `array.get(map.values(m), 1)` in
+/// v6 and v5): the reference's `map.keys(id)` returns "an array of all the keys", `map.values(id)`
+/// "of all the values", i.e. `array<K>` / `array<V>` of the `map<K,V>` argument. The spec's
+/// signature encoding (impl-00 §3.8) admits only `array<T>` in an array position, so both rows are
+/// written `array<T>` with `T` never bound by a parameter; read as `K` / `V` here. Every other
+/// overload reads its own variable.
+fn ret_elem_var(ov: &Overload, v: u8) -> u8 {
+    if v != tv::T {
+        v
+    } else if ov.id == pine_spec::ov::MAP_KEYS {
+        tv::K
+    } else if ov.id == pine_spec::ov::MAP_VALUES {
+        tv::V
+    } else {
+        v
+    }
 }
 
 /// Steps 1–8 over a built-in entry's overloads.

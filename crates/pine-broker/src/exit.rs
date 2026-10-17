@@ -13,7 +13,7 @@ use crate::cap;
 use crate::fault::{BrokerFault, InternalDefect, ScriptRefusal};
 use crate::money::{floor_step, mul_div, sat_i64, ticks_px};
 use crate::size::n_rule_scale;
-use crate::switch::{ExitQty, ExitReservation, SWITCHES};
+use crate::switch::{ExitQty, ExitReservation, PriceGrid, SWITCHES};
 use pine_ir::{entry_dir, intent_flag as f, BrokerCounters, EntryDir, OrderIntent, StrKey};
 
 /// The ids a `strategy.close(id)` / `strategy.exit(from_entry = id)` may reach the D19 boot trade
@@ -241,13 +241,22 @@ const fn rel(basis_1e6: i64, ticks_1e6: i64, tick_1e6: i64, up: bool) -> i64 {
 }
 
 /// Resolve an exit intent's levels for a trade entered at `basis` (§4.5.2). `long`: the covered
-/// position is long (the legs sell); `v6`: the program's dialect is v6.
+/// position is long (the legs sell); `v6`: the program's dialect is v6; `grid`: the absolute legs'
+/// script-price grid.
+///
+/// `pin:05-price-rounding` — the absolute `limit` / `stop` are script prices, rounded like an
+/// order's of the same kind and side before W23 picks: E130's sell stop at `avg − 20.4 / 20.6`
+/// ticks exits at the floor on 92/92 stop exits (`nearest_tick` 69, `ceil_tick` 50; 75667 where
+/// the unrounded leg gave 75667.06). A long's legs sell (take-profit a sell limit → up, stop-loss
+/// a sell stop → down), a short's buy (mirrored) — the limit legs and the buy stop leg are
+/// uncaptured, literal reading. Tick distances, `trail_price` and `trail_offset` stay as given.
 pub(crate) fn levels(
     it: &OrderIntent,
     basis_1e6: i64,
     tick_1e6: i64,
     long: bool,
     v6: bool,
+    grid: PriceGrid,
 ) -> Levels {
     let fl = it.flags;
     let given = |bit: u16, v: i64| if fl & bit != 0 { Some(v) } else { None };
@@ -267,8 +276,18 @@ pub(crate) fn levels(
         None
     };
     // Long: the lower take-profit and activation, the higher stop-loss; mirrored for a short.
-    let tp = pick(given(f::LIMIT, it.limit_1e6), tp_rel, v6, long);
-    let sl = pick(given(f::STOP, it.stop_1e6), sl_rel, v6, !long);
+    let tp = pick(
+        given(f::LIMIT, grid.limit(it.limit_1e6, !long)),
+        tp_rel,
+        v6,
+        long,
+    );
+    let sl = pick(
+        given(f::STOP, grid.stop(it.stop_1e6, !long)),
+        sl_rel,
+        v6,
+        !long,
+    );
     let act = pick(given(f::TRAIL_PRICE, it.trail_price_1e6), act_rel, v6, long);
     let has_trail = fl & f::TRAIL_OFFSET != 0 && fl & (f::TRAIL_PRICE | f::TRAIL_POINTS) != 0;
     Levels {
@@ -407,6 +426,9 @@ pub(crate) struct SyncCtx {
     /// `FixedNotional`: `(u, d)` at the reference price — an explicit exit `qty` scales by u/d
     /// (§4.7.2). `None` under `AsDeclared`.
     pub(crate) scale: Option<(i64, i64)>,
+    /// The script-price grid of the absolute `limit` / `stop` legs (`pin:05-price-rounding`,
+    /// E130); [`PriceGrid::AS_GIVEN`] for native.
+    pub(crate) grid: PriceGrid,
 }
 
 /// The exit rules and their leg sets (§4.5).
@@ -730,7 +752,14 @@ impl ExitTable {
                         Some((u, d)) => n_rule_scale(u, rule.intent.qty_1e6, d),
                         None => rule.intent.qty_1e6,
                     };
-                    let lv = levels(&rule.intent, lot.entry_px_1e6, ctx.tick_1e6, long, ctx.v6);
+                    let lv = levels(
+                        &rule.intent,
+                        lot.entry_px_1e6,
+                        ctx.tick_1e6,
+                        long,
+                        ctx.v6,
+                        ctx.grid,
+                    );
                     // Built in place in the inactive buffer (no local staging copy).
                     let (lo, hi) = self.sets.split_at_mut(1);
                     let (old_buf, new_buf) = if new == 1 {
@@ -869,12 +898,13 @@ mod tests {
     };
     use crate::book::{Book, FillSrc};
     use crate::fault::{BrokerFault, ScriptRefusal};
-    use crate::switch::ExitReservation;
+    use crate::switch::{ExitReservation, PriceGrid};
     use pine_ir::BrokerCounters;
     use pine_ir::{intent_flag as f, IntentKind, OrderIntent, StrKey};
 
     const TICK: i64 = 10_000; // 0.01
     const BASIS: i64 = 100 * 1_000_000; // 100.00
+    const AS_GIVEN: PriceGrid = PriceGrid::AS_GIVEN;
 
     fn exit(flags: u16) -> OrderIntent {
         OrderIntent {
@@ -907,7 +937,7 @@ mod tests {
             loss_ticks_1e6: 300_000_000,
             ..exit(f::LIMIT | f::PROFIT | f::STOP | f::LOSS)
         };
-        let l = levels(&it, BASIS, TICK, true, false);
+        let l = levels(&it, BASIS, TICK, true, false, AS_GIVEN);
         assert_eq!((l.tp_1e6, l.sl_1e6), (104_000_000, 98_000_000));
         // v5 takes the absolute even when the relative is reached first.
         let it = OrderIntent {
@@ -915,7 +945,7 @@ mod tests {
             stop_1e6: 96_000_000,
             ..it
         };
-        let l = levels(&it, BASIS, TICK, true, false);
+        let l = levels(&it, BASIS, TICK, true, false, AS_GIVEN);
         assert_eq!((l.tp_1e6, l.sl_1e6), (106_000_000, 96_000_000));
     }
 
@@ -929,7 +959,7 @@ mod tests {
             ..exit(f::LIMIT | f::PROFIT | f::STOP | f::LOSS)
         };
         // Long: the lower take-profit (105), the higher stop-loss (97).
-        let l = levels(&it, BASIS, TICK, true, true);
+        let l = levels(&it, BASIS, TICK, true, true, AS_GIVEN);
         assert_eq!((l.tp_1e6, l.sl_1e6), (105_000_000, 97_000_000));
         // Short from 100.00: rel TP 95, rel SL 103; absolute limit 94, stop 104 → 95 and 103.
         let s = OrderIntent {
@@ -937,7 +967,7 @@ mod tests {
             stop_1e6: 104_000_000,
             ..it
         };
-        let l = levels(&s, BASIS, TICK, false, true);
+        let l = levels(&s, BASIS, TICK, false, true, AS_GIVEN);
         assert_eq!((l.tp_1e6, l.sl_1e6), (95_000_000, 103_000_000));
         // One given → it; none → no leg.
         let one = OrderIntent {
@@ -945,11 +975,46 @@ mod tests {
             ..exit(f::LOSS)
         };
         assert_eq!(
-            levels(&one, BASIS, TICK, true, true),
+            levels(&one, BASIS, TICK, true, true, AS_GIVEN),
             Levels {
                 sl_1e6: 97_000_000,
                 ..Levels::default()
             }
+        );
+    }
+
+    #[test]
+    fn exit_legs_round_by_kind_and_side() {
+        // `pin:05-price-rounding` (E130): absolute legs are script prices on the grid. A long's
+        // legs sell — take-profit 100.124 → 100.13 (sell limit, up), stop-loss 99.796 → 99.79
+        // (sell stop, down: E130's 92/92); a short's buy — 99.876 → 99.87 (buy limit, down),
+        // 100.204 → 100.21 (buy stop, up). Tick distances stay as given.
+        let grid = PriceGrid::tv(TICK, crate::switch::PriceRounding::NeverEarlier);
+        let long = OrderIntent {
+            limit_1e6: 100_124_000,
+            stop_1e6: 99_796_000,
+            ..exit(f::LIMIT | f::STOP)
+        };
+        let l = levels(&long, BASIS, TICK, true, true, grid);
+        assert_eq!((l.tp_1e6, l.sl_1e6), (100_130_000, 99_790_000));
+        let short = OrderIntent {
+            limit_1e6: 99_876_000,
+            stop_1e6: 100_204_000,
+            ..exit(f::LIMIT | f::STOP)
+        };
+        let l = levels(&short, BASIS, TICK, false, true, grid);
+        assert_eq!((l.tp_1e6, l.sl_1e6), (99_870_000, 100_210_000));
+        // As given on the native grid.
+        let l = levels(&long, BASIS, TICK, true, true, AS_GIVEN);
+        assert_eq!((l.tp_1e6, l.sl_1e6), (100_124_000, 99_796_000));
+        // `profit` 12.4 ticks is a distance, not a script price: 100.124 kept.
+        let rel = OrderIntent {
+            profit_ticks_1e6: 12_400_000,
+            ..exit(f::PROFIT)
+        };
+        assert_eq!(
+            levels(&rel, BASIS, TICK, true, true, grid).tp_1e6,
+            100_124_000
         );
     }
 
@@ -959,7 +1024,10 @@ mod tests {
             trail_points_1e6: 200_000_000,
             ..exit(f::TRAIL_POINTS)
         };
-        assert_eq!(levels(&act, BASIS, TICK, true, true), Levels::default());
+        assert_eq!(
+            levels(&act, BASIS, TICK, true, true, AS_GIVEN),
+            Levels::default()
+        );
         let t = OrderIntent {
             trail_points_1e6: 200_000_000,
             trail_price_1e6: 101_000_000,
@@ -967,7 +1035,7 @@ mod tests {
             ..exit(f::TRAIL_POINTS | f::TRAIL_PRICE | f::TRAIL_OFFSET)
         };
         // v6, long: the lower activation (101 vs 102); offset 50 ticks = 0.50.
-        let l = levels(&t, BASIS, TICK, true, true);
+        let l = levels(&t, BASIS, TICK, true, true, AS_GIVEN);
         assert_eq!((l.trail_act_1e6, l.trail_off_1e6), (101_000_000, 500_000));
         // v5: the absolute activation.
         let t5 = OrderIntent {
@@ -975,7 +1043,7 @@ mod tests {
             ..t
         };
         assert_eq!(
-            levels(&t5, BASIS, TICK, true, false).trail_act_1e6,
+            levels(&t5, BASIS, TICK, true, false, AS_GIVEN).trail_act_1e6,
             103_000_000
         );
     }
@@ -1059,6 +1127,7 @@ mod tests {
         v6: true,
         step_1e6: 0,
         scale: None,
+        grid: PriceGrid::AS_GIVEN,
     };
     const Q: i64 = 1_000_000;
 

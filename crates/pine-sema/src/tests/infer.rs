@@ -79,8 +79,9 @@ fn infer_int_literal_beyond_i64_is_type_mismatch() {
 fn infer_folds_wrap_mod_and_concat() {
     let (_, k, _) = init_of(Dialect::V6, "x = 9223372036854775807 + 1\n", "x");
     assert_eq!(k, Some(K::Int(i64::MIN)));
+    // CAR-R31-1: truncated, the dividend's sign (TradingView F004 / F115).
     let (_, k, _) = init_of(Dialect::V6, "x = -1 % 100\n", "x");
-    assert_eq!(k, Some(K::Int(99)));
+    assert_eq!(k, Some(K::Int(-1)));
     let (_, k, _) = init_of(Dialect::V6, "x = 5 % 0\n", "x");
     assert_eq!(k, Some(K::Na));
     let (_, k, syms) = init_of(Dialect::V6, "x = \"a\" + \"b\"\n", "x");

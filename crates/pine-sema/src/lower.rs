@@ -801,7 +801,7 @@ impl Lower<'_> {
             BinOp::Div => BinOpK::Div {
                 na_on_nonfinite: na_nonfinite,
             },
-            // M1: floored (the VM's `F_MOD` / `I_MOD`); U15 on the float form only.
+            // CAR-R31-1: truncated (the VM's `F_MOD` / `I_MOD`); U15 on the float form only.
             BinOp::Rem => BinOpK::Mod {
                 na_on_nonfinite: float && na_nonfinite,
             },

@@ -23,16 +23,11 @@ pub(crate) fn f_div(a: f64, b: f64, rd: &Readings) -> f64 {
     non_finite(a / b, rd)
 }
 
-/// Pine's floored float `%` (A2, CAR-06-1: the sign of the divisor), in impl-03 §9 F18's form,
-/// then U15's non-finite rule. `f_mod(-1.0, 100.0) == 99.0`.
+/// Pine's truncated float `%` (CAR-R31-1: the sign of the dividend, the exact IEEE `fmod`, as the
+/// VM's `F_MOD`; TradingView F039 / F116, `pin:06-mod-sign`), then U15's non-finite rule.
+/// `f_mod(-1.0, 100.0) == -1.0`.
 pub(crate) fn f_mod(a: f64, b: f64, rd: &Readings) -> f64 {
-    let r0 = a % b;
-    let r = if r0 != 0.0 && ((r0 < 0.0) != (b < 0.0)) {
-        r0 + b
-    } else {
-        r0
-    };
-    non_finite(r, rd)
+    non_finite(a % b, rd)
 }
 
 /// U15's rule on a float result.
@@ -77,20 +72,16 @@ pub(crate) fn i_div(a: i64, b: i64, rd: &Readings) -> IntDiv {
     }
 }
 
-/// Pine's floored int `%` (CAR-06-1): `b == 0` is `na`; `MIN % −1` is 0; the sign of the divisor.
-/// `i_mod(-1, 100) == Some(99)`.
+/// Pine's truncated int `%` (CAR-R31-1, as the VM's `I_MOD`; TradingView F004 / F115,
+/// `pin:06-mod-sign`): `b == 0` is `na`; `MIN % −1` is 0; the sign of the dividend.
+/// `i_mod(-1, 100) == Some(-1)`.
 pub(crate) const fn i_mod(a: i64, b: i64) -> Option<i64> {
     if b == 0 {
         return None;
     }
-    let r = match a.checked_rem(b) {
+    Some(match a.checked_rem(b) {
         Some(r) => r,
         None => 0,
-    };
-    Some(if r != 0 && ((r < 0) != (b < 0)) {
-        r + b
-    } else {
-        r
     })
 }
 

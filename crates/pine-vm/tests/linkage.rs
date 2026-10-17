@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! Linkage-pass tests: the A2 `barstate.*` table (§3.6.5), floored `%` (CAR-06-1),
+//! Linkage-pass tests: the A2 `barstate.*` table (§3.6.5), truncated `%` (CAR-R31-1),
 //! and the `Tb` layout discipline impl-02 compares against (64-aligned big blocks, flags).
 
 use pine_ir::*;
@@ -188,18 +188,19 @@ fn run_once(p: &PineProgram) -> (Vec<f64>, VmCounters) {
 }
 
 #[test]
-fn exec_i_mod_is_floored_the_sign_of_the_divisor() {
+fn exec_i_mod_is_truncated_the_sign_of_the_dividend() {
+    // CAR-R31-1 (TradingView F004 / F115: `807 % -7 == 2`, `-807 % 7 == -2`).
     let cases: [(i64, i64, Option<i64>); 11] = [
-        (-1, 100, Some(99)),      // the Operators page's worked example
-        (1, -100, Some(-99)),
-        (-7, 3, Some(2)),
-        (7, -3, Some(-2)),
+        (-1, 100, Some(-1)),
+        (1, -100, Some(1)),
+        (-7, 3, Some(-1)),
+        (7, -3, Some(1)),
         (7, 3, Some(1)),
         (-7, -3, Some(-1)),
         (-7, 7, Some(0)),
         (i64::MIN, -1, Some(0)),  // the true remainder, valid, not counted
-        (i64::MIN, 3, Some(1)),
-        (i64::MAX, -2, Some(-1)),
+        (i64::MIN, 3, Some(-2)),
+        (i64::MAX, -2, Some(1)),
         (7, 0, None),             // b == 0: na, counted
     ];
     let pairs: Vec<(u64, u64)> = cases.iter().map(|c| (c.0 as u64, c.1 as u64)).collect();
@@ -216,7 +217,9 @@ fn exec_i_mod_is_floored_the_sign_of_the_divisor() {
 }
 
 #[test]
-fn exec_f_mod_is_the_contract_expression_evaluated_as_written() {
+fn exec_f_mod_is_the_exact_truncated_remainder() {
+    // CAR-R31-1: IEEE `fmod` (the dividend's sign, exact) — TradingView F098 series rows
+    // (`(1.0 + (syn - syn)) % 0.1` = 0.09999999999999995) and F039 / F116 (every row).
     let cases: [(f64, f64); 12] = [
         (-1.0, 100.0), (1.0, -100.0), (5.5, -2.0), (-5.5, 2.0), (7.0, 3.0), (-0.0, 5.0),
         (1.0, 0.1), (10.0, 0.1), (0.7, 0.1), (-0.3, 0.1), (1e17, 7.0), (7.0, 0.0),
@@ -228,7 +231,7 @@ fn exec_f_mod_is_the_contract_expression_evaluated_as_written() {
         let mut k = 0;
         while k < cases.len() {
             let (a, b) = cases[k];
-            let want = a - b * (a / b).floor();
+            let want = a % b;
             if want.is_nan() {
                 assert!(o[k].is_nan(), "{a} % {b} (flags {flags})"); // the flag canonicalises NaN
             } else {
@@ -236,8 +239,8 @@ fn exec_f_mod_is_the_contract_expression_evaluated_as_written() {
             }
             k += 1;
         }
-        assert_eq!((o[0], o[1], o[2], o[3]), (99.0, -99.0, -0.5, 0.5), "the divisor's sign");
-        assert_eq!(o[6], 0.0, "1.0 % 0.1 as written; fmod-and-adjust gives 0.09999999999999995");
+        assert_eq!((o[0], o[1], o[2], o[3]), (-1.0, 1.0, 1.5, -1.5), "the dividend's sign");
+        assert_eq!(o[6], 0.09999999999999995, "1.0 % 0.1 is the exact remainder (TradingView F098)");
         assert!(o[11].is_nan(), "x % 0 is NaN under either U15 reading (0 * inf)");
         flags += 1;
     }

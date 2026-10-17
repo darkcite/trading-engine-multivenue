@@ -223,10 +223,41 @@ mod tests {
         );
     }
 
+    /// A broker on `price_rounding = r` (`pin:05-price-rounding`'s other readings).
+    fn rounding(m: &ProgramMeta, r: crate::switch::PriceRounding) -> TvBroker {
+        let sw = crate::switch::Switches {
+            price_rounding: r,
+            ..crate::switch::SWITCHES
+        };
+        TvBroker::with_switches(m, CFG, sw).unwrap_or_else(|_| unreachable!())
+    }
+
+    /// An entry `side` with `flags` (LIMIT or STOP) at `px_1e6`.
+    fn priced(side: pine_ir::IntentSide, flags: u16, px_1e6: i64) -> OrderIntent {
+        OrderIntent {
+            kind: IntentKind::Entry,
+            id: L1,
+            side,
+            flags,
+            limit_1e6: if flags & f::LIMIT != 0 { px_1e6 } else { 0 },
+            stop_1e6: if flags & f::STOP != 0 { px_1e6 } else { 0 },
+            ..OrderIntent::default()
+        }
+    }
+
+    /// Bar 0 places `it` at close 100.00; bar 1 (100.00 → 99.90 → 100.50 → 100.20) fills it.
+    fn entry_px(b: &mut TvBroker, it: OrderIntent) -> Option<i64> {
+        run(b, &bar(0, 10_000, 10_000, 10_000, 10_000), &[it]);
+        run(b, &bar(1, 10_000, 10_050, 9_990, 10_020), &[]);
+        b.open_trade(0).map(|t| t.entry_px_1e6)
+    }
+
     #[test]
-    fn script_prices_floor_to_the_tick() {
-        // CI-034, `pin:05-price-rounding` — E113: a buy limit 0.4 tick off the grid (…48.26)
-        // fills at …48.2 (floor), not …48.3 (nearest). Here 98.126 on a 0.01 tick → 98.12.
+    fn buy_limit_still_floors_e113() {
+        // CI-034, `pin:05-price-rounding` — E113: a buy limit at `close − 12.4` ticks fills at the
+        // floor on 45/45 trades (`nearest_tick` 0, `ceil_tick` 0). Here 98.126 on a 0.01 tick →
+        // 98.12 (nearest 98.13).
+        use crate::switch::PriceRounding as R;
         let m = meta(E);
         let lim = OrderIntent {
             kind: IntentKind::Entry,
@@ -241,12 +272,70 @@ mod tests {
             b.open_trade(0).map(|t| t.entry_px_1e6)
         };
         assert_eq!(fill(&mut broker(&m)), Some(98_120_000));
-        let near = crate::switch::Switches {
-            price_rounding: crate::switch::PriceRounding::NearestTick,
-            ..crate::switch::SWITCHES
+        assert_eq!(fill(&mut rounding(&m, R::FloorTick)), Some(98_120_000));
+        assert_eq!(fill(&mut rounding(&m, R::NearestTick)), Some(98_130_000));
+    }
+
+    #[test]
+    fn sell_limit_rounds_up_e129() {
+        // `pin:05-price-rounding` — E129: a sell limit at `close + 12.4 / 12.6` ticks fills at the
+        // ceiling on 45/45 trades (`nearest_tick` 19, `floor_tick` 0; trade 1: 77250.8 where
+        // FloorTick gave 77250.7). Here 100.124 → 100.13, not 100.12 (floor and nearest).
+        use crate::switch::PriceRounding as R;
+        use pine_ir::IntentSide::Short;
+        let m = meta(E);
+        let it = priced(Short, f::LIMIT, 100_124_000);
+        assert_eq!(entry_px(&mut broker(&m), it), Some(100_130_000));
+        assert_eq!(
+            entry_px(&mut rounding(&m, R::FloorTick), it),
+            Some(100_120_000)
+        );
+        assert_eq!(
+            entry_px(&mut rounding(&m, R::NearestTick), it),
+            Some(100_120_000)
+        );
+    }
+
+    #[test]
+    fn buy_stop_rounds_up_e131() {
+        // `pin:05-price-rounding` — E131: a buy stop at `close + 12.4 / 12.6` ticks fills at the
+        // ceiling on 45/45 trades (`nearest_tick` 19, `floor_tick` 0). Here 100.124 → 100.13.
+        use crate::switch::PriceRounding as R;
+        use pine_ir::IntentSide::Long;
+        let m = meta(E);
+        let it = priced(Long, f::STOP, 100_124_000);
+        assert_eq!(entry_px(&mut broker(&m), it), Some(100_130_000));
+        assert_eq!(
+            entry_px(&mut rounding(&m, R::FloorTick), it),
+            Some(100_120_000)
+        );
+        // A sell stop (uncaptured as an entry) rounds down, like E130's exit leg.
+        let it = priced(pine_ir::IntentSide::Short, f::STOP, 99_916_000);
+        let mut b = broker(&m);
+        run(&mut b, &bar(0, 10_000, 10_000, 10_000, 10_000), &[it]);
+        run(&mut b, &bar(1, 10_000, 10_000, 9_900, 9_950), &[]);
+        assert_eq!(b.open_trade(0).map(|t| t.entry_px_1e6), Some(99_910_000));
+    }
+
+    #[test]
+    fn exit_stop_is_rounded_e130() {
+        // `pin:05-price-rounding` — E130: `strategy.exit(stop = avg − 20.4 / 20.6` ticks) exits at
+        // the floor on 92/92 stop exits (`nearest_tick` 69, `ceil_tick` 50; trade 3: 75667 where
+        // the unrounded leg gave 75667.06). Here a long from 100.00, stop 99.796 → 99.79.
+        use crate::switch::PriceRounding as R;
+        let m = meta(E);
+        let stop_exit = |b: &mut TvBroker| {
+            open_long(b, 10_005, 9_995, &[exit(f::STOP, 0, 99_796_000)]);
+            // Bar 2: 99.95 → 99.98 → 99.50 (the stop fills on the way) → 99.60.
+            run(b, &bar(2, 9_995, 9_998, 9_950, 9_960), &[]);
+            b.closed_trade(0).map(|t| t.exit_px_1e6)
         };
-        let mut b = TvBroker::with_switches(&m, CFG, near).unwrap_or_else(|_| unreachable!());
-        assert_eq!(fill(&mut b), Some(98_130_000));
+        assert_eq!(stop_exit(&mut broker(&m)), Some(99_790_000));
+        assert_eq!(
+            stop_exit(&mut rounding(&m, R::NearestTick)),
+            Some(99_800_000)
+        );
+        assert_eq!(stop_exit(&mut rounding(&m, R::None)), Some(99_796_000));
     }
 
     #[test]

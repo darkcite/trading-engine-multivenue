@@ -150,7 +150,7 @@ pub(crate) enum BinOpK {
         /// `NA_ON_NONFINITE`.
         na_on_nonfinite: bool,
     },
-    /// `F_MOD` / `I_MOD`: floored, the divisor's sign (M1); float `NA_ON_NONFINITE` per U15.
+    /// `F_MOD` / `I_MOD`: truncated, the dividend's sign (CAR-R31-1); float `NA_ON_NONFINITE` per U15.
     Mod {
         /// `NA_ON_NONFINITE` (float only).
         na_on_nonfinite: bool,

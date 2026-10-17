@@ -11,7 +11,7 @@ use crate::cap;
 use crate::exit::ExitTable;
 use crate::fault::{BrokerFault, ScriptRefusal};
 use crate::intent::validate;
-use crate::money::{floor_tick, round_tick};
+use crate::switch::PriceGrid;
 use pine_ir::{
     intent_flag, AllowEntry, BrokerCounters, IntentKind, IntentSide, OcaType, OrderIntent, StrKey,
     Sym,
@@ -153,27 +153,15 @@ impl PendingOrder {
 pub(crate) struct CommitCtx {
     /// The bar being evaluated.
     pub(crate) bar: u32,
-    /// TV: `chart.mintick_1e6` under `price_rounding = FloorTick` / `NearestTick`; 0 = prices as
-    /// given (native, or `price_rounding = None`).
-    pub(crate) round_tick_1e6: i64,
-    /// `price_rounding = FloorTick` (`pin:05-price-rounding`, CI-034): round down, not half away.
-    pub(crate) round_floor: bool,
+    /// The script-price grid (`pin:05-price-rounding`): TV's `chart.mintick_1e6` under
+    /// `price_rounding`; [`PriceGrid::AS_GIVEN`] for native or `price_rounding = None`.
+    pub(crate) grid: PriceGrid,
     /// `strategy.risk.allow_entry_in`.
     pub(crate) allow: AllowEntry,
     /// The position at commit (for `allow_entry_in`, §4.4.3).
     pub(crate) position_1e6: i64,
     /// A `strategy.risk.*` halt holds: only `Cancel` / `CancelAll` commit (§4.10).
     pub(crate) halted: bool,
-}
-
-/// A script price on `ctx`'s grid (`pin:05-price-rounding`, CI-034 / E113): floored under
-/// `FloorTick`, half away under `NearestTick`, as given when `round_tick_1e6 == 0`.
-const fn script_px(px_1e6: i64, ctx: &CommitCtx) -> i64 {
-    if ctx.round_floor {
-        floor_tick(px_1e6, ctx.round_tick_1e6)
-    } else {
-        round_tick(px_1e6, ctx.round_tick_1e6)
-    }
 }
 
 /// The pending-record key an intent commits to (§4.3): `(kind, id)`; an `Entry` refused by
@@ -647,18 +635,21 @@ impl OrderTable {
         } else {
             0
         };
+        // `pin:05-price-rounding` (r31: E113 buy limit floor 45/45, E129 sell limit ceil 45/45,
+        // E131 buy stop ceil 45/45): each script price on the grid by its own kind and side.
+        let buy = side == IntentSide::Long as u8;
         self.orders[i] = PendingOrder {
             id: key,
             oca_name,
             qty_1e6: if bare { 0 } else { it.qty_1e6 },
             qty_pct_1e6: it.qty_pct_1e6,
             limit_1e6: if has_l {
-                script_px(it.limit_1e6, ctx)
+                ctx.grid.limit(it.limit_1e6, buy)
             } else {
                 0
             },
             stop_1e6: if has_s {
-                script_px(it.stop_1e6, ctx)
+                ctx.grid.stop(it.stop_1e6, buy)
             } else {
                 0
             },
@@ -795,7 +786,7 @@ mod tests {
     use crate::book::Book;
     use crate::exit::ExitTable;
     use crate::fault::{BrokerFault, ScriptRefusal};
-    use crate::switch::ExitReservation;
+    use crate::switch::{ExitReservation, PriceGrid, PriceRounding};
     use pine_ir::{
         intent_flag as f, AllowEntry, BrokerCounters, IntentKind, IntentSide, OcaType, OrderIntent,
         StrKey,
@@ -809,8 +800,10 @@ mod tests {
     fn ctx() -> CommitCtx {
         CommitCtx {
             bar: 7,
-            round_tick_1e6: 250_000,
-            round_floor: false,
+            grid: PriceGrid {
+                tick_1e6: 250_000,
+                rounding: PriceRounding::NearestTick,
+            },
             allow: AllowEntry::All,
             position_1e6: 0,
             halted: false,
@@ -869,7 +862,7 @@ mod tests {
             &stp,
             &CommitCtx {
                 bar: 9,
-                round_tick_1e6: 0,
+                grid: PriceGrid::AS_GIVEN,
                 ..ctx()
             },
             &mut c,

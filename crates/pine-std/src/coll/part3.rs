@@ -4,7 +4,8 @@
 //! `array.*` part 3 (impl-04 §4.16.6, T34 rest): `fill` (in place, never grows), `variance` /
 //! `stdev` of a float array (two-pass), and the element-copying rows `copy`, `from`, `concat`;
 //! the string `sort` / `sort_indices` and (R-P5) the UDT field `sort` / `sort_indices` (`*_AT`,
-//! keyed through `Frame::obj_field`) on one in-place heap sort. Every body checks everything before its first write (§4.16.5, I14); a creator's own checks
+//! keyed through `Frame::obj_field`) on an in-place heap sort (a total order or no observable
+//! tie) and, for the UDT field `sort`, an in-place stable sort (F110). Every body checks everything before its first write (§4.16.5, I14); a creator's own checks
 //! that need the new block's layout follow its init (`pin:04-coll-size-check-after-init`).
 
 use super::array::{declared, flags, word_of};
@@ -12,7 +13,6 @@ use super::{
     as_owned, create, elem_ty, layout_of, owned_word, release, resolve, store, str_fits, str_val,
     Layout, Owned, Pool, StrVal,
 };
-use crate::simd;
 use crate::strnum::{default_shape, Laid, Shape};
 use core::cmp::Ordering;
 use pine_ir::{argwin, CollKind, CollRef, FaultKind, SiteId, StrRef, Ty, NA_I64};
@@ -101,13 +101,28 @@ fn floats<'a>(words: &'a [u64], o: &Owned) -> &'a [f64] {
     unsafe { core::slice::from_raw_parts(w.as_ptr().cast::<f64>(), w.len()) }
 }
 
+/// The one-pass variance of `pin:04-array-variance-one-pass` from the forward sums of the non-na
+/// values `s = Σx`, `s2 = Σx²` and their count `n ≥ 1`: `d = n` when `biased`, else `n − 1`, and
+/// `var = s2 / d − (s / d) · (s / n)`, rounded in exactly that order (an unbiased estimate of one
+/// value divides by 0 → NaN, na). Shared by the float and int rows (`coll::order`).
+#[inline]
+pub(super) fn var_one_pass(s: f64, s2: f64, n: u64, biased: bool) -> f64 {
+    let m = s / n as f64;
+    let d = if biased { n } else { n - 1 } as f64;
+    s2 / d - (s / d) * m
+}
+
 /// `array.variance` / `array.stdev(id, biased)` of a float array — `[id, biased, out]`.
-/// `pin:04-array-variance-two-pass` (lead ruling): the reference's definition, two passes — the
-/// mean `Σx / n` on the §4.9 kernel, then `Σ(x − mean)²` — over the non-na elements (the arrays
-/// page: na values do not make the result na); divided by `n` when `biased` is true, else by
-/// `n − 1`; `stdev` is its square root. Empty / every value na → na (the reference's remark); an
-/// unbiased estimate of one value is `0 / 0` → na (the literal division). A na `biased` (v5) is
-/// not true (as `pin:04-array-every-some`): the unbiased estimate.
+/// `pin:04-array-variance-one-pass` (TV F101, retiring the lead's `pin:04-array-variance-two-pass`):
+/// one forward pass over the non-na elements (the arrays page: na values do not make the result
+/// na) summing `Σx` and `Σx²`, then [`var_one_pass`]; `stdev` is its square root. Evidence: F101's
+/// `variance` (biased) and `stdev(…, false)` columns over `[s, s − 3, na, s + 7.5, s − 3]` carry
+/// this formula's cancellation bit for bit on all 16 rows (row 2 variance 18.42187500046566,
+/// row 11 18.42187499976717, row 1 stdev 4.956056900446732 …), which the exact two-pass
+/// 18.421875 / 4.956056900399752 does not. Empty / every value na → na (the reference's remark);
+/// an unbiased estimate of one value is na; a cancellation below zero gives `stdev` na (the
+/// literal `sqrt`). A na `biased` (v5) is not true (as `pin:04-array-every-some`): the unbiased
+/// estimate.
 fn var_std<const SD: bool>(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 3 {
         return Err(FaultKind::Internal);
@@ -119,23 +134,21 @@ fn var_std<const SD: bool>(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultK
     let biased = f.bool_arg(args[1]) == Some(true);
     let (_, words) = f.coll(o.owner)?;
     let xs = floats(words, &o);
-    let (s, n) = simd::sum_f64_skipna(xs);
+    let (mut s, mut s2, mut n) = (0.0f64, 0.0f64, 0u64);
+    let mut i = 0usize;
+    while i < xs.len() {
+        let x = xs[i];
+        if !x.is_nan() {
+            s += x;
+            s2 += x * x;
+            n += 1;
+        }
+        i += 1;
+    }
     let v = if n == 0 {
         f64::NAN
     } else {
-        let m = s / n as f64;
-        let mut ss = 0.0f64;
-        let mut i = 0usize;
-        while i < xs.len() {
-            let x = xs[i];
-            if !x.is_nan() {
-                let d = x - m;
-                ss += d * d;
-            }
-            i += 1;
-        }
-        let d = if biased { n } else { n - 1 };
-        let var = ss / d as f64;
+        let var = var_one_pass(s, s2, n, biased);
         if SD {
             var.sqrt()
         } else {
@@ -383,8 +396,8 @@ fn array_concat(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
 
 // ---- join -----------------------------------------------------------------------------------
 
-/// Lay out element word `w` of a numeric array (`float`: the default `str.tostring` shape, na →
-/// `"NaN"`; `int`: decimal digits, na → `"NaN"`) into `l`.
+/// Lay out element word `w` of a numeric array (`float`: `sh`, the join shape, na → `"NaN"`;
+/// `int`: decimal digits, na → `"NaN"`) into `l`.
 fn lay_num(l: &mut Laid, w: u64, float: bool, sh: Shape) {
     if float {
         l.set_f64(f64::from_bits(w), sh);
@@ -398,10 +411,15 @@ fn lay_num(l: &mut Laid, w: u64, float: bool, sh: Shape) {
 /// `array.join(id, separator)` — `[id, separator, out]`: one new string, the elements separated
 /// by `separator` (the reference). Sized first, then one `str_alloc_with` filled in place
 /// (§4.16.4); a number is laid out twice (size, then write — no scratch holds its digits).
-/// `pin:04-array-join-render`: the reference names no rendering — an element is rendered as
-/// `str.tostring` renders it (`float`: the default shape, `int`: decimal), an na element of any
-/// type as `"NaN"` (`str.tostring`'s na); a na `separator` makes the result na (na propagates).
-/// Past the arena `StrArenaFull` (all-or-nothing). An empty array is `""`.
+/// `pin:04-array-join-render`: the reference names no rendering — an `int` element is rendered as
+/// `str.tostring` renders it (decimal); a `float` element as the default shape with **at least
+/// one fraction digit** (a whole value keeps `.0`): TV F099 joins `[4.5, 4.5, 3.0]` (its `b0` 4.5
+/// and `b2` 3 columns) with `","` into 11 characters — `"4.5,4.5,3.0"`; `str.tostring`'s `"3"`
+/// gives 9, and no fraction-digit shape but one-at-least yields 11 (`"4.50,4.50,3"` needs a
+/// different shape per element). Non-whole values keep the default shape's digits (not separated
+/// by the capture). An na element of any type is `"NaN"` (`str.tostring`'s na); a na `separator`
+/// makes the result na (na propagates). Past the arena `StrArenaFull` (all-or-nothing). An empty
+/// array is `""`.
 fn array_join(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 3 || !argwin::is_i64(args[2]) {
         return Err(FaultKind::Internal);
@@ -418,7 +436,11 @@ fn array_join(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
         return Ok(());
     };
     let lay = layout_of(f, &o)?;
-    let sh = default_shape(f);
+    // pin:04-array-join-render (F099): a whole float keeps one fraction digit ("3.0").
+    let sh = Shape {
+        min_frac: 1,
+        ..default_shape(f)
+    };
     let wp: *const u64 = f.coll(o.owner)?.1.as_ptr();
     let mut l = Laid::EMPTY;
     let mut total = 0u64;
@@ -634,6 +656,184 @@ unsafe fn heap_sort<C>(p: *mut u64, n: usize, cx: &C, before: fn(&C, u64, u64) -
     }
 }
 
+/// Insertion-sort run length of [`stable_sort`] (Go's `sort.Stable` block size).
+const STABLE_BLOCK: usize = 20;
+
+/// Stable insertion sort of `p[a..b)` under `before` (an element moves left only past one it
+/// goes strictly before, so equal keys keep their order).
+///
+/// # Safety
+/// As [`stable_sort`]; `a <= b <= n`.
+unsafe fn insertion_sort<C>(
+    p: *mut u64,
+    a: usize,
+    b: usize,
+    cx: &C,
+    before: fn(&C, u64, u64) -> bool,
+) {
+    let mut i = a + 1;
+    while i < b {
+        let mut j = i;
+        // SAFETY: `a < j <= i < b <= n` (the caller's contract).
+        while j > a && unsafe { before(cx, *p.add(j), *p.add(j - 1)) } {
+            // SAFETY: as above.
+            unsafe { core::ptr::swap(p.add(j), p.add(j - 1)) };
+            j -= 1;
+        }
+        i += 1;
+    }
+}
+
+/// Swap the `k` words at `p[a..a + k)` with those at `p[b..b + k)` (disjoint ranges).
+///
+/// # Safety
+/// As [`stable_sort`]; both ranges inside `[0, n)` and disjoint.
+unsafe fn swap_range(p: *mut u64, a: usize, b: usize, k: usize) {
+    let mut i = 0usize;
+    while i < k {
+        // SAFETY: `a + i`, `b + i` < `n` (the caller's contract).
+        unsafe { core::ptr::swap(p.add(a + i), p.add(b + i)) };
+        i += 1;
+    }
+}
+
+/// Rotate `p[a..b)` so that `p[m..b)` comes first, by block swaps (Gries–Mills), in place.
+///
+/// # Safety
+/// As [`stable_sort`]; `a < m < b <= n`.
+unsafe fn rotate(p: *mut u64, a: usize, m: usize, b: usize) {
+    debug_assert!(a < m && m < b);
+    let (mut i, mut j) = (m - a, b - m);
+    while i != j {
+        // SAFETY: every range below lies in `[a, b)` and the two of a call are disjoint (Go's
+        // `rotate`, the invariant `m − i >= a`, `m + j <= b`).
+        unsafe {
+            if i > j {
+                swap_range(p, m - i, m, j);
+                i -= j;
+            } else {
+                swap_range(p, m - i, m + j - i, i);
+                j -= i;
+            }
+        }
+    }
+    // SAFETY: as above, `i == j`.
+    unsafe { swap_range(p, m - i, m, i) };
+}
+
+/// Merge the sorted runs `p[a..m)` and `p[m..b)` in place, stably — SymMerge (Kim & Kutzner
+/// 2004, as Go's `sort.Stable`): O((b − a) log) comparisons, rotations for the moves, recursion
+/// depth O(log(b − a)) on the stack, no buffer.
+///
+/// # Safety
+/// As [`stable_sort`]; `a < m < b <= n`.
+unsafe fn sym_merge<C>(
+    p: *mut u64,
+    a: usize,
+    m: usize,
+    b: usize,
+    cx: &C,
+    before: fn(&C, u64, u64) -> bool,
+) {
+    // SAFETY (whole body): every index read or written lies in `[a, b)` ⊆ `[0, n)`.
+    unsafe {
+        if m - a == 1 {
+            // `p[a]` goes before the first of `p[m..b)` it does not follow strictly.
+            let (mut i, mut j) = (m, b);
+            while i < j {
+                let h = i + (j - i) / 2;
+                if before(cx, *p.add(h), *p.add(a)) {
+                    i = h + 1;
+                } else {
+                    j = h;
+                }
+            }
+            let mut k = a;
+            while k + 1 < i {
+                core::ptr::swap(p.add(k), p.add(k + 1));
+                k += 1;
+            }
+            return;
+        }
+        if b - m == 1 {
+            // `p[m]` goes after the last of `p[a..m)` it does not precede strictly.
+            let (mut i, mut j) = (a, m);
+            while i < j {
+                let h = i + (j - i) / 2;
+                if !before(cx, *p.add(m), *p.add(h)) {
+                    i = h + 1;
+                } else {
+                    j = h;
+                }
+            }
+            let mut k = m;
+            while k > i {
+                core::ptr::swap(p.add(k), p.add(k - 1));
+                k -= 1;
+            }
+            return;
+        }
+        let mid = a + (b - a) / 2;
+        let nn = mid + m;
+        let (mut start, mut r) = if m > mid { (nn - b, mid) } else { (a, m) };
+        let q = nn - 1;
+        while start < r {
+            let c = start + (r - start) / 2;
+            if !before(cx, *p.add(q - c), *p.add(c)) {
+                start = c + 1;
+            } else {
+                r = c;
+            }
+        }
+        let end = nn - start;
+        if start < m && m < end {
+            rotate(p, start, m, end);
+        }
+        if a < start && start < mid {
+            sym_merge(p, a, start, mid, cx, before);
+        }
+        if mid < end && end < b {
+            sym_merge(p, mid, end, b, cx, before);
+        }
+    }
+}
+
+/// Stable sort of the `n` words at `p` under `before` (`a` goes before `b`): insertion-sorted runs
+/// of [`STABLE_BLOCK`], then bottom-up [`sym_merge`] passes (Go's `sort.Stable`) — in place, an
+/// index loop, no allocation, no scratch, no closure; O(n log n) comparisons, O(n log² n) swaps.
+/// Equal keys keep their input order in either direction (`pin:04-udt-sort-ties`, F110).
+///
+/// # Safety
+/// `p` names `n` initialised, exclusively owned words for the call (no `&` / `&mut` to them).
+unsafe fn stable_sort<C>(p: *mut u64, n: usize, cx: &C, before: fn(&C, u64, u64) -> bool) {
+    let mut block = STABLE_BLOCK;
+    let (mut a, mut b) = (0usize, block);
+    // SAFETY (whole body): every range passed is inside `[0, n)` (the loop bounds), with
+    // `a < m < b` for each merge.
+    unsafe {
+        while b <= n {
+            insertion_sort(p, a, b, cx, before);
+            a = b;
+            b += block;
+        }
+        insertion_sort(p, a, n, cx, before);
+        while block < n {
+            a = 0;
+            b = 2 * block;
+            while b <= n {
+                sym_merge(p, a, a + block, b, cx, before);
+                a = b;
+                b += 2 * block;
+            }
+            let m = a + block;
+            if m < n {
+                sym_merge(p, a, m, n, cx, before);
+            }
+            block *= 2;
+        }
+    }
+}
+
 fn order(f: &Frame<'_>, e: u16) -> Result<bool, FaultKind> {
     match f.i64_arg(e) {
         Some(0) => Ok(false),
@@ -828,13 +1028,13 @@ fn sort_field(f: &Frame<'_>, e: u16) -> Result<(u32, Ty), FaultKind> {
 }
 
 /// `array.sort(id, order, sort_field)` of an `array<UDT>` (v6) — `[id, order, sel]`: the element
-/// words sorted in place by the field `sel` names, with the scalar rows' sort and order — the
-/// heap sort of [`sort_str`], na field last ascending / first descending. A view sorts its
-/// window of the owner. `pin:04-udt-sort-ties` — the reference is silent on stability; the
-/// scalar rows' in-place sort is not stable, which no scalar array can observe (equal keys are
-/// equal values), but two objects with equal keys are distinct: their order after the sort is
-/// the heap sort's (deterministic, a function of the input order alone), not necessarily their
-/// input order. `sort_indices` is stable (`(key, index)`).
+/// words sorted in place by the field `sel` names, with the scalar rows' order — na field last
+/// ascending / first descending. A view sorts its window of the owner. `pin:04-udt-sort-ties`:
+/// the sort is **stable** — objects with equal keys keep their input order in both directions
+/// (descending is not the ascending result reversed). TV F110: `(k, id)` pushed `(2,1) (1,2)
+/// (2,3) (1,4) (2,5) (1,6)`; ascending by `k` → ids `2 4 6 1 3 5`, descending → `1 3 5 2 4 6`.
+/// [`stable_sort`]: in place, no scratch, no allocation. `sort_indices` is stable too
+/// (`(key, index)`).
 fn sort_at(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 3 {
         return Err(FaultKind::Internal);
@@ -858,7 +1058,7 @@ fn sort_at(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
     // SAFETY: the owner's window `[base, base + len)` (`array` checked it), journaled by
     // `coll_mut` above, unmoved (F8); no reference to it is live (the comparator reads only the
     // objects' blocks — other sites' — and CONST / PERSIST string bytes, F6).
-    unsafe { heap_sort(wp.add(o.base as usize), o.len as usize, &cx, before_obj) };
+    unsafe { stable_sort(wp.add(o.base as usize), o.len as usize, &cx, before_obj) };
     Ok(())
 }
 
@@ -972,4 +1172,58 @@ pub fn bi_array_sort_indices_at(
 /// The `array.concat` row.
 pub fn bi_array_concat(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     array_concat(f, args).map_err(|k| declared(flags(ov::ARRAY_CONCAT), k))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Word `key << 32 | id`; the comparator reads the key only, so ids expose the tie order.
+    fn by_key(desc: &bool, a: u64, b: u64) -> bool {
+        let (x, y) = (a >> 32, b >> 32);
+        if *desc {
+            x > y
+        } else {
+            x < y
+        }
+    }
+
+    fn sorted(mut v: Vec<u64>, desc: bool) -> Vec<u64> {
+        // SAFETY: `v` is a local vector, no other reference to its words during the call.
+        unsafe { stable_sort(v.as_mut_ptr(), v.len(), &desc, by_key) };
+        v
+    }
+
+    /// `pin:04-udt-sort-ties` (F110): equal keys keep their input order in both directions — the
+    /// capture's six objects, then every length 0..=300 (insertion runs and several merge
+    /// levels) with few distinct keys against the standard library's stable sort.
+    #[test]
+    fn stable_sort_keeps_ties_in_input_order_f110() {
+        let f110: Vec<u64> = [(2u64, 1u64), (1, 2), (2, 3), (1, 4), (2, 5), (1, 6)]
+            .iter()
+            .map(|&(k, id)| k << 32 | id)
+            .collect();
+        let ids = |v: Vec<u64>| v.iter().map(|w| w & 0xFFFF_FFFF).collect::<Vec<_>>();
+        assert_eq!(ids(sorted(f110.clone(), false)), [2, 4, 6, 1, 3, 5]);
+        assert_eq!(ids(sorted(f110, true)), [1, 3, 5, 2, 4, 6]);
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for n in 0..=300usize {
+            for keys in [2u64, 7, 1000] {
+                let v: Vec<u64> = (0..n as u64)
+                    .map(|id| {
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        (s % keys) << 32 | id
+                    })
+                    .collect();
+                let mut want = v.clone();
+                want.sort_by_key(|w| w >> 32);
+                assert_eq!(sorted(v.clone(), false), want, "asc n {n} keys {keys}");
+                let mut want = v.clone();
+                want.sort_by_key(|w| core::cmp::Reverse(w >> 32));
+                assert_eq!(sorted(v, true), want, "desc n {n} keys {keys}");
+            }
+        }
+    }
 }

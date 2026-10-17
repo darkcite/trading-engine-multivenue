@@ -6,14 +6,14 @@ pin	pin:04-collection-edges
 script	tests/conformance/fixtures/F/F107.pine
 script_sha256	74754aa4d77f4e7df9a8e270532b2c3a1e586faa1d3b544d9188054b1358067e
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T13:16Z
+tv_build	web:Claude-2.42304.0/Chrome-152.0.7977.149;pine:2026-09
+captured_in	56
 driver	syn
 align	step
 dialects	56
 mode	bar_close
-bars	pending
+bars	24493
 window	head	16
 oracle	tv
 tier	3
@@ -38,4 +38,21 @@ plot	f_F107_value1_na	exact
 plot	f_F107_value1	exact
 plot	f_F107_sz_clear_na	exact
 plot	f_F107_sz_clear	exact
-pending
+series
+0	0	1168.07	0	1170.07	1	1	na	0	1169.07	0	1	0	2	0	2	0	3	0	4	0	0
+1	0	1752.49	0	1754.49	1	1	na	0	1753.49	0	1	0	2	0	2	0	3	0	4	0	0
+2	0	1500.73	0	1502.73	1	1	na	0	1501.73	0	1	0	2	0	2	0	3	0	4	0	0
+3	0	1436.58	0	1438.58	1	1	na	0	1437.58	0	1	0	2	0	2	0	3	0	4	0	0
+4	0	1089.3	0	1091.3	1	1	na	0	1090.3	0	1	0	2	0	2	0	3	0	4	0	0
+5	0	1112.72	0	1114.72	1	1	na	0	1113.72	0	1	0	2	0	2	0	3	0	4	0	0
+6	0	1275.44	0	1277.44	1	1	na	0	1276.44	0	1	0	2	0	2	0	3	0	4	0	0
+7	0	1508.78	0	1510.78	1	1	na	0	1509.78	0	1	0	2	0	2	0	3	0	4	0	0
+8	0	1779.23	0	1781.23	1	1	na	0	1780.23	0	1	0	2	0	2	0	3	0	4	0	0
+9	0	1377.09	0	1379.09	1	1	na	0	1378.09	0	1	0	2	0	2	0	3	0	4	0	0
+10	0	1644.4	0	1646.4	1	1	na	0	1645.4	0	1	0	2	0	2	0	3	0	4	0	0
+11	0	1381.65	0	1383.65	1	1	na	0	1382.65	0	1	0	2	0	2	0	3	0	4	0	0
+12	0	1844.92	0	1846.92	1	1	na	0	1845.92	0	1	0	2	0	2	0	3	0	4	0	0
+13	0	1430.42	0	1432.42	1	1	na	0	1431.42	0	1	0	2	0	2	0	3	0	4	0	0
+14	0	1079.87	0	1081.87	1	1	na	0	1080.87	0	1	0	2	0	2	0	3	0	4	0	0
+15	0	1225.03	0	1227.03	1	1	na	0	1226.03	0	1	0	2	0	2	0	3	0	4	0	0
+end

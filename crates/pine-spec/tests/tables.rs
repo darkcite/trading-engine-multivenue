@@ -667,3 +667,28 @@ fn overloads_unambiguous() {
         }
     }
 }
+
+/// TradingView F102 (2026-10-17, R-P2): an int array `[807, 810, na, 800, 810]` reads
+/// `array.avg` 806.75, `array.variance` 16.6875, `array.stdev` 4.0850…, `array.median` 808.5 —
+/// the int-array overloads of those four return `float` (`pin:04-array-int-stats-provisional`
+/// refuted); `percentile_linear_interpolation` / `percentrank`'s int rows are not evidenced and
+/// keep their declared result.
+#[test]
+fn array_int_stats_return_float_f102() {
+    use pine_spec::ov;
+    for id in [
+        ov::ARRAY_AVG_I,
+        ov::ARRAY_VARIANCE_I,
+        ov::ARRAY_STDEV_I,
+        ov::ARRAY_MEDIAN_I,
+    ] {
+        let o = pine_spec::overload(id);
+        let r = rets(o);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].ty.ty, Ty::Float, "{}", entry_of(o).full.as_str());
+        assert_eq!(r[0].tv, tv::NONE);
+        let p = params(o);
+        assert_eq!(p[0].sig.ty.ty, Ty::Array);
+        assert_eq!(p[0].sig.ty.a, pine_ir::elem::scalar(Ty::Int));
+    }
+}

@@ -355,3 +355,62 @@ fn synthetic_params_match_impl04() {
     }
     assert!(families_seen > 0);
 }
+
+/// R-P2 CI-046 / F107 (`pin:02-map-keys-values-elem`): TradingView compiles
+/// `array.join(map.keys(m), ",")` and `array.get(map.values(m), 1)` (v6 and v5) — `map.keys` of a
+/// `map<K,V>` is an `array<K>`, `map.values` an `array<V>`.
+#[test]
+fn map_keys_values_are_typed_arrays_f107() {
+    let m = "m = map.new<string, float>()\nmap.put(m, \"a\", close)\nk = map.keys(m)\n\
+             v = map.values(m)\n";
+    for d in [Dialect::V5, Dialect::V6] {
+        let body = format!(
+            "{m}plot(na(array.join(k, \",\")) ? na : str.length(array.join(k, \",\")))\n\
+             plot(na(array.get(v, 1)) ? na : array.get(v, 1))\n"
+        );
+        let r = run_with(d, &body, 0b0111);
+        assert_eq!(codes(&r), vec![ACCEPTED], "v{}: {r:?}", d as u8);
+        let p = r.expect("accepted");
+        assert!(pine_vm::verify(&p, &pine_std::BUILTINS).is_ok());
+        accepted(
+            d,
+            &format!(
+                "{m}array<string> ks = map.keys(m)\narray<float> vs = map.values(m)\n\
+                 plot(array.size(ks) + array.size(vs))\n"
+            ),
+        );
+        refused(
+            d,
+            &format!("{m}array<float> ks = map.keys(m)\nplot(array.size(ks))\n"),
+            3007,
+        );
+        refused(
+            d,
+            &format!("{m}array<string> vs = map.values(m)\nplot(array.size(vs))\n"),
+            3007,
+        );
+        accepted(
+            d,
+            "mb = map.new<int, bool>()\nmap.put(mb, 1, true)\n\
+             plot(array.get(map.keys(mb), 0))\nplot(array.get(map.values(mb), 0) ? 1 : 0)\n",
+        );
+    }
+}
+
+/// TradingView F102 (R-P2): `array.avg` / `variance` / `stdev` / `median` of an `array<int>` are
+/// `float` (806.75, 16.6875, 4.0850…, 808.5 on `[807, 810, na, 800, 810]`).
+#[test]
+fn array_int_stats_are_float_f102() {
+    let a = "xi = array.from(int(close), 2, 3)\n";
+    for d in [Dialect::V5, Dialect::V6] {
+        for f in [
+            "array.avg(xi)",
+            "array.variance(xi)",
+            "array.stdev(xi)",
+            "array.median(xi)",
+        ] {
+            accepted(d, &format!("{a}float x = {f}\nplot(x)\n"));
+            refused(d, &format!("{a}int x = {f}\nplot(x)\n"), 3007);
+        }
+    }
+}

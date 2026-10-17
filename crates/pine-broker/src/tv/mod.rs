@@ -26,7 +26,7 @@ use crate::size::{
 };
 use crate::switch::{
     CloseImmediately, CofCloseTick, CofNextTick, ForcedFillSlippage, HistoryTick, PctEquityAt,
-    PriceRounding, PyramidCheck, Switches, TrailArmFire, SWITCHES,
+    PriceGrid, PyramidCheck, Switches, TrailArmFire, SWITCHES,
 };
 use cost::{commission_1e12, slip};
 use margin::{funds_check, liquidation_price, margin_call_qty};
@@ -264,12 +264,7 @@ impl TvBroker {
         }
         let ctx = CommitCtx {
             bar: self.bar.index,
-            round_tick_1e6: if self.sw.price_rounding == PriceRounding::None {
-                0
-            } else {
-                self.chart.mintick_1e6
-            },
-            round_floor: self.sw.price_rounding == PriceRounding::FloorTick,
+            grid: self.price_grid(),
             allow: self.decl.risk.allow_entry_in,
             position_1e6: self.book.view().position_size_1e6,
             halted: self.risk.halted(),
@@ -413,7 +408,15 @@ impl TvBroker {
             v6: self.dialect == Dialect::V6,
             step_1e6: self.chart.qty_step_1e6,
             scale,
+            grid: self.price_grid(),
         }
+    }
+
+    /// The script-price grid (`pin:05-price-rounding`, §4.1): `chart.mintick_1e6` under the
+    /// `price_rounding` switch — entries, `strategy.order` and exit legs alike (E113 E129 E130
+    /// E131).
+    const fn price_grid(&self) -> PriceGrid {
+        PriceGrid::tv(self.chart.mintick_1e6, self.sw.price_rounding)
     }
 
     /// The §4.8.6 verification distance for limit rows.

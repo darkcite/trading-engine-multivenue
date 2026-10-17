@@ -6,14 +6,14 @@ pin	pin:04-collection-edges
 script	tests/conformance/fixtures/F/F105.pine
 script_sha256	5eb298e3c767d038e335bb5c434df45ce92124898e69611123894c5b301b86a3
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T13:15Z
+tv_build	web:Claude-2.42304.0/Chrome-152.0.7977.149;pine:2026-09
+captured_in	56
 driver	syn
 align	step
 dialects	56
 mode	bar_close
-bars	pending
+bars	24493
 window	head	16
 oracle	tv
 tier	3
@@ -21,4 +21,21 @@ plot	f_F105_every1	exact
 plot	f_F105_some2	exact
 plot	f_F105_every0	exact
 plot	f_F105_some0	exact
-pending
+series
+0	1	1	0	0
+1	0	0	0	0
+2	0	0	0	0
+3	1	1	0	0
+4	1	1	0	0
+5	0	0	0	0
+6	1	1	0	0
+7	1	1	0	0
+8	1	1	0	0
+9	1	1	0	0
+10	0	0	0	0
+11	0	0	0	0
+12	0	0	0	0
+13	0	0	0	0
+14	1	1	0	0
+15	1	1	0	0
+end

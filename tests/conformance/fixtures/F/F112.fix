@@ -6,9 +6,9 @@ pin	pin:04-udt-sort-na-object
 script	tests/conformance/fixtures/F/F112.pine
 script_sha256	5e30b410a29eaedee79d518c97c15ffafa8dcf61e714bc314627b8e429e319ff
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T12:47Z
+tv_build	web:Claude-2.42304.0/Chrome-152.0.7977.149;pine:2026-09
+captured_in	6
 driver	syn
 align	step
 dialects	6
@@ -21,7 +21,7 @@ tier	3
 plot	f_F112_id0	exact
 plot	f_F112_id1	exact
 plot	f_F112_id2	exact
-pending
+fault	ScriptRefused	0
 reading	runtime_fault
 fault	ScriptRefused	0
 end
