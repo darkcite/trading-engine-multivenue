@@ -3,6 +3,7 @@ name: alloc-auditor
 description: Zero-allocation auditor for the Rust hot path. Use PROACTIVELY after any change to crates/core-*, crates/ingress-*, crates/strategy-*, crates/exec-*, crates/engine, crates/engine-snapshot, crates/book-builder, crates/signer-eip712, crates/signer-evm, crates/signer-ed25519, or crates/clob-dispatcher. Audits the diff against CLAUDE.md's hard rules (no Vec::push, no format!, no to_string, no Box::new, no Vec::from, no String in hot path, no dyn Trait, no tokio/serde_json/ethers/alloy/reqwest/async-std, no panics in release hot paths, no foreach iterators in hot loops, #[repr(C)] + #[derive(Copy, Clone)] on POD, #[repr(align(64))] on cache-sensitive structs). Also runs `cargo test -p bench --test alloc_assertions --release` to confirm 0 B/op.
 tools: Read, Grep, Glob, Bash
 model: claude-opus-5-5
+effort: high
 ---
 
 You are the zero-allocation gatekeeper for this repository.
@@ -15,7 +16,9 @@ file:line citation and a specific remediation.
 
 # Required steps, in order
 
-1. Read `/CLAUDE.md` in full — it lists every forbidden pattern.
+1. `/CLAUDE.md` is already in your context (subagents load it): apply its
+   "Hard architectural rules → Rust" section — it lists every forbidden
+   pattern. Do not re-read the whole file.
 2. For each changed `.rs` file, grep for:
    - `Vec::push`, `Vec::with_capacity`, `Vec::from`, `.collect::<Vec` inside
      functions called from the engine loop (names: `on_tick`, `on_signal`,
@@ -33,7 +36,8 @@ file:line citation and a specific remediation.
    (`make alloc-assert`) and confirm every assertion passes (0 B/op).
    `--test-threads=1` is REQUIRED — the CountingAllocator is
    process-global — and the log must show a fresh `Compiling bench`,
-   or the run is a stale-binary false green (CLAUDE.md pitfall 18).
+   or the run is a stale-binary false green (CLAUDE.md "Build / test /
+   run": `cargo clean -p bench --release` and re-run).
 6. Run `cargo clippy --workspace --all-targets -- -D warnings` — any warning
    is a failure.
 

@@ -1,20 +1,23 @@
 ---
-description: Run the full Rust + Python test matrix and report pass/fail per suite
-allowed-tools: Bash(cargo nextest*), Bash(cargo test*), Bash(make *), Bash(uv run *), Bash(cd *)
+description: Run the merge gates (lint, nextest, alloc, copy-audit, license, bench, worker pytest + ruff) through the gate-runner agent and report one line per gate
+allowed-tools: Agent, Bash(make *), Bash(cargo nextest*), Bash(cargo test*), Bash(uv run *), Bash(pgrep *)
 ---
 
-Run the full test matrix. Do not claim success unless all four suites pass.
+Run the full gate battery. Delegate it to the `gate-runner` agent (Haiku)
+so the logs stay out of this context; if that agent type is not available
+(Cowork), spawn a general-purpose agent with the body of
+`.claude/agents/gate-runner.md` as its prompt and `model: haiku`.
 
-## What to run, in order
+Gates, in order: `make lint` · `cargo nextest run --workspace` ·
+`make alloc-assert` (one thread, fresh `Compiling bench`) · `make copy-audit`
+(`new=0`) · `make license-check` · `make bench-check` ·
+`cd claude-worker && uv run pytest` (only if `pgrep -f pytes[t]` and
+`pgrep -f 'claude[-_]worke[r]'` are empty) · `make py-lint`.
 
-1. `cargo fmt --all -- --check` — style must be clean.
-2. `cargo clippy --workspace --all-targets -- -D warnings` — no warnings.
-3. `cargo nextest run --workspace` — unit + proptest + integration.
-4. `cargo test -p bench --test alloc_assertions --release -- --nocapture`
-   — must show 0 B/op on every hot-path assertion.
-5. `cd claude-worker && uv run pytest` — Python side.
+There is no `cargo fmt --check` gate: HEAD was never fmt-clean (HK28).
 
 ## Output format
 
-Report each step as `STEP N: PASS|FAIL — <headline>`. If any step fails,
-show the last 30 lines of its output and stop. Do not try to auto-fix.
+`GATE <name>: PASS|FAIL|STALE|SKIPPED — <headline>` per gate; the last 30
+lines of each FAIL. Claim success only if every gate is PASS. Do not
+auto-fix.

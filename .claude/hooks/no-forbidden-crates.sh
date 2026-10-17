@@ -23,19 +23,40 @@ set -u
 
 payload="$(cat)"
 
-# Extract file_path — works for both Write and Edit tools.
-file_path="$(printf '%s' "$payload" \
-    | sed -n 's/.*"file_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -n1)"
+# Extract file_path and the new-content-bearing field (Write -> "content",
+# Edit -> "new_string") from the hook JSON. The payload is ONE line with the
+# file's newlines escaped as \n, so it must be decoded before any per-line
+# grep: a sed extraction left `^` anchored at the payload start and missed
+# every `from x import y` below line 1 (found 2026-10-17).
+field() {
+    printf '%s' "$payload" | python3 -c '
+import json
+import sys
+try:
+    tool_input = json.load(sys.stdin).get("tool_input") or {}
+except ValueError:
+    sys.exit(0)
+sys.stdout.write(str(tool_input.get(sys.argv[1]) or ""))
+' "$1"
+}
 
-# Extract the new-content-bearing field:
-#   Write -> "content"
-#   Edit  -> "new_string"
-new_content="$(printf '%s' "$payload" \
-    | sed -n 's/.*"new_string"[[:space:]]*:[[:space:]]*"\(.*\)".*/\1/p')"
-if [ -z "$new_content" ]; then
+if command -v python3 >/dev/null 2>&1; then
+    file_path="$(field file_path)"
+    new_content="$(field new_string)"
+    if [ -z "$new_content" ]; then
+        new_content="$(field content)"
+    fi
+else
+    # Fallback without python3: single-line view, first-line-only Python check.
+    file_path="$(printf '%s' "$payload" \
+        | sed -n 's/.*"file_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | head -n1)"
     new_content="$(printf '%s' "$payload" \
-        | sed -n 's/.*"content"[[:space:]]*:[[:space:]]*"\(.*\)".*/\1/p')"
+        | sed -n 's/.*"new_string"[[:space:]]*:[[:space:]]*"\(.*\)".*/\1/p')"
+    if [ -z "$new_content" ]; then
+        new_content="$(printf '%s' "$payload" \
+            | sed -n 's/.*"content"[[:space:]]*:[[:space:]]*"\(.*\)".*/\1/p')"
+    fi
 fi
 
 # If we couldn't parse anything, allow and let downstream validation catch it.
@@ -64,7 +85,11 @@ case "$file_path" in
         done
         ;;
     *.py)
-        bad_from=$(printf '%s' "$new_content" | grep -E '^[[:space:]]*from[[:space:]]+[^_[:space:]]' || true)
+        # A real import line: `from <module> import`, excluding `from __future__`.
+        # Prose that merely starts with "from" (docstrings, comments) passes.
+        bad_from=$(printf '%s\n' "$new_content" \
+            | grep -E '^[[:space:]]*from[[:space:]]+[A-Za-z_.][A-Za-z0-9_.]*[[:space:]]+import([[:space:]]|\(|$)' \
+            | grep -vE '^[[:space:]]*from[[:space:]]+__future__[[:space:]]' || true)
         if [ -n "$bad_from" ]; then
             reject "Python file uses 'from x import y' — codebase rule is full 'import x' only."
         fi
