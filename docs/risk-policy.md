@@ -16955,7 +16955,7 @@ and 39 (the P0 pre-registration, sha256 `d06d0038…488e`, registered
 06:01Z). **Commits (main, not pushed — R-PM-5):** `3feceac` PM15-2/3,
 `5849b4e` PM15-4, `1c8b014` PM15-5, `babf584` PM15-6a, `03a3191` PM15-8a,
 `a9987fa` PM15-5b, `a391129` PM15-5c, `cc6900b` PM15-6b, `ef8b22c` PM15-5d,
-`860ab76` PM15-6c, PM15-6d (this entry's last section).
+`860ab76` PM15-6c, `1d41a11` PM15-6d, PM15-6e (this entry's last section).
 **Deployed PAPER 2026-10-17 09:22Z (`03a3191`); `a9987fa` (PM15-5b) since 09:49Z; `ef8b22c` (PM15-5d) since 11:41Z.**
 
 | id | ruling (operator, 2026-10-17) |
@@ -17199,9 +17199,42 @@ Alloc gate 130: the arm's submit and drain and the gateway's submit at
   (eth-account 0.14); J.4 runs in the boot self-test. Alloc gate 131: a
   full batch cycle at 0 B.
 
+### PM15-6e — the operator's tools: the checks, the miss probe, the flip
+
+- **`scripts/pm15-exec.sh self-test | key-check | miss-probe`** runs
+  `multivenue-engine pm-exec` with slot 9's account sourced from the repo
+  `.env` into the binary's environment (the script prints none of it):
+  the pinned vectors (offline); the venue gate read-only with the
+  relayer key proved; and **the miss probe — ONE order**: a $1 FAK BUY
+  on BTC's current window priced at the tick, on the leg whose lowest ask
+  is the higher, sent through pm-gw's own submit path. It refuses with
+  under 5 min left in the window or a lowest ask under 0.05 on that leg,
+  so it cannot fill; the venue's "no match" answer proves the order's
+  signature, its amounts and the clock (spec K.1, K.13) with nothing
+  bought. Any other answer is reported (an acceptance or a doubt costs at
+  most $1).
+- **`scripts/pm15-flip.sh status | live | paper`** edits only
+  `[exec.slot.9]` and `ARM_LIVE` / `EXEC_TOML` (stamped backups), sets
+  the session anchor aside (every `live` starts a new session) and
+  restarts nothing: the next gated restart applies it. The live section
+  is R-PM-8's frame — $250 an order and a market, `halt_on_loss` $500,
+  `max_open_orders` 8, `halt_on_recon_stale_ms` 180 000 (the account read
+  pauses in each window's quiet tail and skips judging the read that sees
+  a redemption), and `cap_day_usd_1e6` **$100 000, out of reach** (two
+  live families × 96 windows × $250 = $48 000 a UTC day; the config law
+  refuses 0). A test pins that the section resolves through the
+  interlock at those numbers.
+- **`live` refuses** unless the committed risk policy has a line that
+  begins with the gate word — `PM15-LIVE-GATE: P0 PASS` for P0's result,
+  or `PM15-LIVE-GATE: ruled` for an operator ruling (R-PM-1); this entry
+  quotes them mid-line, so it opens nothing — `pm15.toml` exists and
+  `STRATEGY` names pm15, `exec.HALT` does not name slot 9, and the key
+  check passes.
+
 ### Open
 
 - `/state`'s pm15 section and the dashboard's slot-9 panel; the arm's,
   pm-gw's and the redeemer's counters on `/metrics`.
-- PM15-6e: the flip script with its "FAK priced to miss" probe.
 - PM15-7 (PolyBolt, dormant).
+- When the account exists: `pm15-exec.sh key-check`, then `miss-probe`,
+  then P0's result or a ruling, then `pm15-flip.sh live`.

@@ -136,3 +136,21 @@ fn what_does_not_read_is_in_doubt() {
     // 503 with no body is still the venue's mode, not a doubt.
     assert_eq!(read_order_answer(503, b"").refusal, Refusal::VenueMode);
 }
+
+/// PM15-6e: the miss probe's guard reads the book's lowest ask whatever
+/// the order of its levels; no asks is `i64::MAX`; a malformed book is no
+/// answer.
+#[test]
+fn the_best_ask_is_the_lowest_of_the_book_s_asks() {
+    let book = br#"{"market":"0x1","asset_id":"1","bids":[{"price":"0.01","size":"5"}],"asks":[{"price":"0.99","size":"10"},{"price":"0.57","size":"3.5"},{"price":"0.6","size":"1"}],"tick_size":"0.01"}"#;
+    assert_eq!(read_best_ask(book), Some(570_000));
+    assert_eq!(read_best_ask(br#"{"bids":[],"asks":[]}"#), Some(i64::MAX));
+    assert_eq!(
+        read_best_ask(br#"{"asks":[{"price":"x","size":"1"}]}"#),
+        None
+    );
+    assert_eq!(read_best_ask(br#"{"bids":[]}"#), None);
+    assert_eq!(Refusal::name_of(Refusal::NoMatch as u8), "no_match");
+    assert_eq!(Refusal::name_of(Refusal::Other as u8), "other");
+    assert_eq!(Refusal::name_of(200), "local");
+}

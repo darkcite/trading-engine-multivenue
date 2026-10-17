@@ -275,6 +275,69 @@ pub fn read_balance(body: &[u8]) -> Option<(i64, i64)> {
     Some((balance, allowance))
 }
 
+impl Refusal {
+    /// The class's name for a tell or a log (`why` of an EVT_REFUSED
+    /// from the venue; a code past the table is `local`).
+    #[must_use]
+    pub const fn name_of(code: u8) -> &'static str {
+        const NAMES: [&str; 17] = [
+            "none",
+            "no_match",
+            "balance",
+            "min_size",
+            "tick",
+            "duplicated",
+            "not_ready",
+            "version",
+            "venue_mode",
+            "restarting",
+            "throttled",
+            "auth",
+            "timed_out",
+            "payload",
+            "closed",
+            "market_delay",
+            "other",
+        ];
+        if (code as usize) < NAMES.len() {
+            NAMES[code as usize]
+        } else {
+            "local"
+        }
+    }
+}
+
+/// The lowest ask price ×1e6 of a `GET /book` answer (its `asks` array of
+/// `{"price","size"}` objects, in whatever order); `Some(i64::MAX)` when
+/// the book has no asks, `None` when the answer does not read. Cold (the
+/// miss probe's guard).
+#[must_use]
+pub fn read_best_ask(body: &[u8]) -> Option<i64> {
+    let p = skip_ws(body, find_field(body, b"\"asks\":")?);
+    if p >= body.len() || body[p] != b'[' {
+        return None;
+    }
+    let end = p + memchr::memchr(b']', &body[p..])?;
+    let asks = &body[p..end];
+    let mut best = i64::MAX;
+    let mut at = 0usize;
+    while let Some(q) = find_field(&asks[at..], b"\"price\":") {
+        let v = at + q;
+        let s = skip_ws(asks, v);
+        if s >= asks.len() || asks[s] != b'"' {
+            return None;
+        }
+        let close = skip_string(asks, s + 1)?;
+        let text = &asks[s + 1..close - 1];
+        match scan_price_1e6(text, 0) {
+            Some((x, n)) if n == text.len() && x > 0 => best = best.min(x),
+            _ => return None,
+        }
+        at = close;
+    }
+    Some(best)
+}
+
 /// The refusal class of a venue message (spec §A.4's strings).
 #[must_use]
 pub fn classify(m: &[u8]) -> Refusal {

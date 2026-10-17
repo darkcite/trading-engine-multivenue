@@ -243,26 +243,32 @@ enum Cmd {
     /// exactly as `run` would, then print the boot tell. No socket, no
     /// thread, no `.env`: exit 0, or 78 with the refusal on stderr.
     Pm15Check(Pm15CheckArgs),
-    /// PM15-6c: slot 9's arm, checked without an order. `--self-test`
-    /// (offline) runs every pinned signing vector; `--key-check` (online,
-    /// read-only; the wrapper sources slot 9's account) adds CLOB V2, the
-    /// account open, the pUSD balance and the exchange's allowance. Exit
-    /// 0, or 78 with the refusal on stderr. Never prints a secret.
+    /// PM15-6c: slot 9's arm, checked. `--self-test` (offline) runs every
+    /// pinned signing vector; `--key-check` (online, read-only; the
+    /// wrapper sources slot 9's account) adds CLOB V2, the account open,
+    /// the pUSD balance, the exchange's allowance and the relayer key;
+    /// `--miss-probe` (PM15-6e, ONE order) sends a $1 FAK priced to miss.
+    /// Exit 0, or 78 with the refusal on stderr. Never prints a secret.
     PmExec(PmExecArgs),
 }
 
 #[derive(Debug, Parser)]
+#[command(group(
+    clap::ArgGroup::new("check")
+        .required(true)
+        .args(["self_test", "key_check", "miss_probe"])
+))]
 struct PmExecArgs {
     /// Offline: the boot self-test's vectors.
-    #[arg(
-        long,
-        conflicts_with = "key_check",
-        required_unless_present = "key_check"
-    )]
+    #[arg(long)]
     self_test: bool,
     /// Online, read-only: the self-test, then the venue gate.
     #[arg(long)]
     key_check: bool,
+    /// Online, ONE order: a $1 FAK BUY priced at the tick, which cannot
+    /// fill — the venue's "no match" proves the order path.
+    #[arg(long)]
+    miss_probe: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -1806,6 +1812,8 @@ fn main() -> ExitCode {
         Cmd::PmExec(args) => {
             let r = if args.key_check {
                 cli::pm15_live::key_check(TlsTransport::default_client_config())
+            } else if args.miss_probe {
+                cli::pm15_live::miss_probe(TlsTransport::default_client_config())
             } else {
                 cli::pm15_live::self_test()
             };

@@ -2546,6 +2546,37 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
+    /// **PM15-6e** — the section `scripts/pm15-flip.sh live` writes
+    /// resolves through the interlock at the frame R-PM-8 names: $250 an
+    /// order and a market, the −$500 bound, the day cap out of reach.
+    #[test]
+    fn the_pm15_flip_writes_a_slot_9_section_the_interlock_resolves() {
+        const FLIP: &str = include_str!("../../../scripts/pm15-flip.sh");
+        let start = FLIP.find("[exec.slot.9]\n# pm15").expect("the section");
+        let end = start + FLIP[start..].find("\nEOF").expect("its end");
+        let section = FLIP[start..end]
+            .replace("$1", "live")
+            .replace("$TS", "test");
+        let d = tmp();
+        let p = write(&d, "exec.toml", &format!("[exec]\n{section}\n"));
+        let b = resolve(Some(&p), Some("9")).unwrap().unwrap();
+        assert!(b.pm15_live() && !b.hl_arm_needed());
+        let s = b.slots.iter().find(|s| s.slot == PM15_SLOT).unwrap();
+        assert_eq!(
+            (
+                s.max_order_usd_1e6,
+                s.cap_instance_usd_1e6,
+                s.halt_on_loss_usd_1e6
+            ),
+            (250_000_000, 250_000_000, 500_000_000)
+        );
+        assert_eq!(
+            s.cap_day_usd_1e6, 100_000_000_000,
+            "no day cap: out of reach"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     /// The caps line is the last thing an operator reads before real
     /// money, so pin it exactly — including the two tokens that say
     /// nothing is enforced yet.

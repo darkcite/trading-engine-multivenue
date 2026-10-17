@@ -137,6 +137,139 @@ fn clob_client(tls: Arc<ClientConfig>) -> Result<HttpsReq, String> {
     .map_err(|e| format!("slot 9's CLOB client: {e:?}"))
 }
 
+/// The miss probe's stake: $1, the marketable-BUY floor.
+const PROBE_USD_1E6: u32 = 1_000_000;
+/// The probe runs only with this much of its window left, s: early, both
+/// legs' books are deep and priced far above the tick.
+const PROBE_LEFT_MIN_S: u64 = 300;
+/// The lowest best ask the probe's leg may show, ×1e6: a BUY at the tick
+/// cannot reach it.
+const PROBE_ASK_MIN_1E6: i64 = 50_000;
+/// The probe's client id (instance 0 of no member).
+const PROBE_CID: u64 = 0x0909_0000_0000_0001;
+
+/// The lowest ask of `token`'s book (`GET /book`, public).
+fn best_ask(clob: &mut HttpsReq, token: &[u8]) -> Result<i64, String> {
+    let mut target = [0u8; 112];
+    let mut at = exec_polymarket::num::put(&mut target, 0, b"/book?token_id=");
+    at = exec_polymarket::num::put(&mut target, at, token);
+    let (http, range) = clob
+        .request(core_net::Method::Get, &target[..at], &[], 0)
+        .map_err(|e| format!("GET /book: {e}"))?;
+    if http != 200 {
+        return Err(format!("GET /book answered {http}"));
+    }
+    exec_polymarket::response::read_best_ask(&clob.resp()[range])
+        .ok_or_else(|| String::from("GET /book did not read"))
+}
+
+/// **`multivenue-engine pm-exec --miss-probe`** (online; ONE order): a
+/// $1 FAK BUY on BTC's current window, priced at the tick on the leg
+/// whose lowest ask is the higher — it cannot fill — sent through pm-gw's
+/// own submit path. The venue's "no match" answer proves the order's
+/// signature, its amounts and the clock (spec K.1, K.13) with nothing
+/// bought. Refused with under [`PROBE_LEFT_MIN_S`] left in the window or
+/// an ask under 0.05 on the leg.
+///
+/// # Errors
+/// A check that fails, or any answer but "no match".
+pub fn miss_probe(tls: Arc<ClientConfig>) -> Result<String, String> {
+    use core_types::pm_roll::{pm_instance_id, PM_WINDOW_S};
+    use exec_polymarket::cmd::{CMD_SUBMIT, EVT_ACK, EVT_IN_DOUBT, EVT_REFUSED, EVT_SENT};
+    use exec_polymarket::response::Refusal;
+    use ingress_polymarket::pm15_discovery::Pm15Discovery;
+
+    self_test()?;
+    let acct = account_from_env()?;
+    let mut clob = clob_client(Arc::clone(&tls))?;
+    let wall = WallAnchor::now();
+    let wall_s = wall.wall_of(now_ns()) / 1_000_000_000;
+    check_venue(&mut clob, &acct, wall_s, i64::from(PROBE_USD_1E6))
+        .map_err(|e| format!("the venue gate: {e}"))?;
+    let left = PM_WINDOW_S - wall_s % PM_WINDOW_S;
+    if left < PROBE_LEFT_MIN_S {
+        return Err(format!(
+            "{left} s left in the window — run it with at least {PROBE_LEFT_MIN_S} s left"
+        ));
+    }
+    let window = (wall_s / PM_WINDOW_S) as u32;
+    let mut disc = Pm15Discovery::new(Arc::clone(&tls), &[b"btc"])
+        .map_err(|e| format!("the Gamma client: {e:?}"))?;
+    let mut spec = PmWindowSpec::EMPTY;
+    disc.fetch(0, window, &mut spec)
+        .map_err(|e| format!("BTC's window {window}: {e:?}"))?;
+    let up = best_ask(&mut clob, spec.up.as_bytes())?;
+    let down = best_ask(&mut clob, spec.down.as_bytes())?;
+    let (leg, ask) = if up >= down { (0u8, up) } else { (1u8, down) };
+    if ask < PROBE_ASK_MIN_1E6 {
+        return Err(format!(
+            "the leg's lowest ask is {ask} ×1e-6: a BUY at the tick could fill — not sent"
+        ));
+    }
+    let instance =
+        pm_instance_id(window, 0).ok_or_else(|| format!("window {window}: no instance id"))?;
+    let tick = spec.tick_1e6 as u32;
+    let (mut eng, end) = exec_gateway::duplex::<PmCmd, PmEvt, PM_CMD_RING, PM_EVT_RING>();
+    let (mut tx, rx) = Ring::<PmWindowSpec, PM15_SPEC_RING>::new().split();
+    let mut gw = PmGateway::new(acct, clob, end, rx, now_ns());
+    if !tx.try_push_ref(&spec) {
+        return Err(String::from("the spec ring refused the window"));
+    }
+    let t = now_ns();
+    gw.step(t, wall.wall_of(t));
+    if gw.tokens().taken() != 1 {
+        return Err(String::from("pm-gw's token table refused the window"));
+    }
+    let mut c = PmCmd::new(CMD_SUBMIT, PROBE_CID);
+    c.px_1e6 = tick;
+    c.usd_1e6 = PROBE_USD_1E6;
+    c.instance = instance;
+    c.tick_1e6 = tick;
+    c.leg = leg;
+    if !eng.cmd.push(&c) {
+        return Err(String::from("the command ring refused the order"));
+    }
+    let t = now_ns();
+    gw.step(t, wall.wall_of(t));
+    let mut sent = false;
+    let mut answer = None;
+    while let Some(e) = eng.evt.pop().map(|e| *e) {
+        match e.kind {
+            EVT_SENT => sent = true,
+            EVT_REFUSED | EVT_ACK | EVT_IN_DOUBT => answer = Some(e),
+            _ => {}
+        }
+    }
+    let Some(e) = answer else {
+        return Err(format!("no answer (sent: {sent})"));
+    };
+    let leg_name = if leg == 0 { "Up" } else { "Down" };
+    match e.kind {
+        EVT_REFUSED if e.why == Refusal::NoMatch as u8 => Ok(format!(
+            "pm-exec miss-probe: PASS — a $1 FAK BUY of BTC {leg_name} (window {window}) at the \
+             tick, its lowest ask {ask} ×1e-6: the venue answered no match (HTTP {}) — the \
+             signature, the amounts and the clock passed; nothing was bought",
+            e.b
+        )),
+        EVT_REFUSED if !sent => Err(format!(
+            "refused before the wire: local reason {} — nothing was sent",
+            e.why
+        )),
+        EVT_REFUSED => Err(format!(
+            "the venue refused it as `{}` (HTTP {}) — not the no-match a sound order gets",
+            Refusal::name_of(e.why),
+            e.b
+        )),
+        EVT_ACK => Err(format!(
+            "the venue ACCEPTED it ({} trade(s)): check the account's trades — at most $1",
+            e.b
+        )),
+        _ => Err(String::from(
+            "IN DOUBT: the answer did not read — check the account's trades (at most $1)",
+        )),
+    }
+}
+
 /// The redemption the environment names: `Ok(None)` by hand
 /// (`PM15_REDEEM=hand`), else the relayer key (type 3 only).
 ///
