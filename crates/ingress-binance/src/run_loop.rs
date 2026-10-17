@@ -215,6 +215,19 @@ pub struct Driver {
     /// one row is the symbol's; its clock is zeroed on reconnect, its
     /// ordinal kept (`core_types::ArrivalSeq`).
     tick_seq: core_types::ArrivalSeq,
+    /// PVM B'1 T8 (Q1 = (a)): a USDⓈ-M bookTicker slot whose symbol is
+    /// on the pine route also subscribes `<sym>@aggTrade` on the SAME
+    /// socket (the sentinel's SUBSCRIBE, the sentinel's parser) — but it
+    /// is NOT a sentinel: USDⓈ-M bookTicker carries its own `T`/`E`, so
+    /// its prints never teach [`Self::feed_clock`] and its ticks inherit
+    /// nothing. Prints are captured as Trade rows and offered to the
+    /// route. `false` on every slot of a boot without a USDⓈ-M route
+    /// symbol, so non-route sockets' traffic is unchanged.
+    usdm_trades: bool,
+    /// PVM B'1: the pine slot's Trade route on this ingress's event
+    /// lane, attached by [`Self::set_trade_route`] (boot). Empty = no
+    /// Trade event is ever pushed (every boot without the pine slot).
+    trade_route: &'static [core_types::SymbolId],
     /// `!Sync` marker.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
 }
@@ -262,6 +275,8 @@ impl Driver {
             sentinel_time_ms: 0,
             sentinel_stale_flag: 0,
             tick_seq: core_types::ArrivalSeq::ZERO,
+            usdm_trades: false,
+            trade_route: &[],
             _not_sync: ::core::marker::PhantomData,
         }
     }
@@ -280,6 +295,32 @@ impl Driver {
     #[inline]
     pub fn has_sentinel(&self) -> bool {
         self.sentinel
+    }
+
+    /// PVM B'1 T8: a USDⓈ-M bookTicker slot for a pine route symbol —
+    /// also subscribes `<symbol>@aggTrade` on the same socket at each
+    /// (re)connect; the prints are captured and routed, the feed clock
+    /// untouched (see the `usdm_trades` field). Boot-only, and only for
+    /// a slot whose sym is on the route (`set_trade_route`).
+    pub fn new_usdm_routed_trades(nonce_seed: u64, sym: SymbolId) -> Self {
+        let mut d = Self::new(nonce_seed, sym);
+        d.usdm_trades = true;
+        d
+    }
+
+    /// PVM B'1 T8: true when this USDⓈ-M slot subscribes routed trades.
+    #[inline]
+    pub fn has_usdm_trades(&self) -> bool {
+        self.usdm_trades
+    }
+
+    /// PVM B'1: attach the pine slot's spawn-time Trade route (≤
+    /// `TRADE_ROUTE_MAX` syms). A routed print is pushed onto the event
+    /// lane as its capture row's `ChannelEvent` only while the spawn
+    /// mask carries `EVENT_LANE_TRADE`. Boot-only.
+    pub fn set_trade_route(&mut self, route: &'static [core_types::SymbolId]) {
+        debug_assert!(route.len() <= core_types::TRADE_ROUTE_MAX);
+        self.trade_route = route;
     }
 
     /// VT2: the sentinel's latest stamp (ms; 0 = none this connection).
@@ -356,6 +397,8 @@ impl Driver {
             sentinel_time_ms: 0,
             sentinel_stale_flag: 0,
             tick_seq: core_types::ArrivalSeq::ZERO,
+            usdm_trades: false,
+            trade_route: &[],
             _not_sync: ::core::marker::PhantomData,
         }
     }
@@ -561,6 +604,7 @@ fn queue_sentinel_subscribe(drv: &mut Driver, path: &[u8]) -> io::Result<()> {
         // rather than send a broken SUBSCRIBE.
         debug_assert!(false, "sentinel slot path names no stream symbol");
         drv.sentinel = false;
+        drv.usdm_trades = false;
         return Ok(());
     };
     queue_masked_text_frame_parts(
@@ -625,7 +669,9 @@ fn advance_ws_upgrade(
             status.add_bytes(header_end as u64);
             // VT2: the spot sentinel subscribes on the same socket the
             // moment the upgrade lands (the next flush sends it).
-            if drv.has_sentinel() {
+            // PVM B'1 T8: a USDⓈ-M route slot subscribes its aggTrade the
+            // same way (and only then — non-route sockets are unchanged).
+            if drv.has_sentinel() || drv.usdm_trades {
                 queue_sentinel_subscribe(drv, path)?;
             }
             Ok(())
@@ -938,6 +984,38 @@ fn handle_mark_price_frame<C: Capture>(
     status.add_ticks(1);
 }
 
+/// PVM B'1 (impl-Bp §3.3): the pine slot's Trade route on this
+/// ingress's event lane, built per trades push from the loop's event
+/// producer, spawn mask and the driver's route. One law at all five
+/// ingress sites: mask test first (bit clear = one AND and a not-taken
+/// branch per print), then the route, then the reserve — a print never
+/// takes the ring past `EVENT_RING_SIZE − EVENT_TRADE_RESERVE`, so a
+/// Trade burst cannot cost a Funding / AssetCtx / Mark / InstrumentRoll
+/// push. A refused print is counted on `trade_shed_total`, never retried.
+struct TradeLane<'a> {
+    tx: &'a mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    mask: u16,
+    route: &'static [core_types::SymbolId],
+    status: &'a core_metrics::IngressStatus,
+}
+
+impl TradeLane<'_> {
+    #[inline(always)]
+    fn offer(&mut self, ev: &ChannelEvent) {
+        if self.mask & core_types::EVENT_LANE_TRADE == 0
+            || !core_types::trade_routed(self.route, ev.sym)
+        {
+            return;
+        }
+        // The ring-slot publish is the designed copy (CLAUDE.md).
+        if self.tx.len() >= EVENT_RING_SIZE - core_types::EVENT_TRADE_RESERVE
+            || !self.tx.try_push_ref(ev)
+        {
+            self.status.inc_trade_shed();
+        }
+    }
+}
+
 fn handle_text_frame<C: Capture>(
     drv: &mut Driver,
     payload_range: core::ops::Range<usize>,
@@ -965,6 +1043,8 @@ fn handle_text_frame<C: Capture>(
         sentinel_time_ms,
         sentinel_stale_flag,
         tick_seq,
+        usdm_trades,
+        trade_route,
         ..
     } = drv;
     let payload = &rx.filled()[payload_range];
@@ -972,25 +1052,30 @@ fn handle_text_frame<C: Capture>(
     capture.raw_frame(now_ns(), payload);
     // VT2 sentinel slot: the socket also carries aggTrade prints and
     // the SUBSCRIBE reply; one substring probe per frame sorts them.
-    if *sentinel {
+    // PVM B'1 T8: a USDⓈ-M route slot carries aggTrade prints the same
+    // way, minus the clock lesson (its bookTicker has its own stamps).
+    if *sentinel || *usdm_trades {
         match classify_sentinel_frame(payload) {
             SentinelFrame::AggTrade => {
                 match parse_trade(payload, *slot_sym) {
                     Some(t) => {
                         let now = now_ns();
-                        // The print's `T` teaches the connection clock;
-                        // the verdict is what the next bookTicker ticks
-                        // inherit until the next print.
-                        let judged = feed_clock.judge(t.ts_ms, now);
-                        *sentinel_time_ms = t.ts_ms;
-                        *sentinel_stale_flag = (judged.stale as u8) * TICK_FLAG_STALE;
-                        status.set_feed_delay_ema_ms(feed_clock.delay_ema_ms());
+                        if *sentinel {
+                            // The print's `T` teaches the connection
+                            // clock; the verdict is what the next
+                            // bookTicker ticks inherit until the next
+                            // print.
+                            let judged = feed_clock.judge(t.ts_ms, now);
+                            *sentinel_time_ms = t.ts_ms;
+                            *sentinel_stale_flag = (judged.stale as u8) * TICK_FLAG_STALE;
+                            status.set_feed_delay_ema_ms(feed_clock.delay_ema_ms());
+                        }
                         // §6.5 capture as a Trade row (v0 px ×1e6, v1
                         // qty ×1e6 negated when the aggressor sold —
-                        // the cross-venue convention); capture only,
-                        // no engine lane (the trade lane is deferred).
+                        // the cross-venue convention); then the pine
+                        // route (PVM B'1), the capture first.
                         let signed_qty = if t.is_buyer_maker { -t.qty_1e6 } else { t.qty_1e6 };
-                        capture.event(&ChannelEvent::new(
+                        let ev = ChannelEvent::new(
                             now,
                             core_types::VenueId::Binance,
                             ChannelId::Trade,
@@ -999,7 +1084,17 @@ fn handle_text_frame<C: Capture>(
                             t.ts_ms,
                             t.price_1e6,
                             signed_qty,
-                        ));
+                        );
+                        capture.event(&ev); // capture first, unchanged
+                        TradeLane {
+                            tx: &mut *event_tx,
+                            mask: event_mask,
+                            route: trade_route,
+                            status,
+                        }
+                        .offer(&ev);
+                        // pin:Bp-usdm-print-counts — a USDⓈ-M route print counts
+                        // as a data row exactly like a spot sentinel print.
                         status.add_msgs(1);
                         status.add_ticks(1);
                     }
@@ -1471,6 +1566,266 @@ mod tests {
     };
     use core_ring::Ring;
     use core_types::NullCapture;
+
+    // ── PVM B'1: the pine slot's Trade route (impl-Bp §7.1) ──────────
+
+    use core_metrics::IngressStatus;
+    use core_types::VenueId;
+
+    const B1_TRADES: &[u8] = br#"{"e":"aggTrade","E":1755216000001,"s":"BTCUSDT","a":26129,"p":"25.35","q":"0.5","f":1,"l":2,"T":1755216000000,"m":true,"M":true}"#;
+    const B1_SYM: core_types::SymbolId = 42;
+    static B1_ROUTE: [core_types::SymbolId; 1] = [B1_SYM];
+    static B1_OTHER: [core_types::SymbolId; 1] = [B1_SYM + 1];
+    const B1_ROWS: usize = 1;
+
+    /// Capture double: records every event and the event lane's depth at
+    /// the moment the capture saw it (capture-first ⇒ the push follows).
+    struct B1Cap<'c> {
+        rows: Vec<(ChannelEvent, usize)>,
+        lane: &'c core_ring::Consumer<ChannelEvent, EVENT_RING_SIZE>,
+    }
+    impl core_types::Capture for B1Cap<'_> {
+        fn event(&mut self, e: &ChannelEvent) {
+            if e.channel == ChannelId::Trade as u8 {
+                self.rows.push((*e, self.lane.len()));
+            }
+        }
+    }
+
+    fn b1_key(e: &ChannelEvent) -> (u64, u8, u8, u32, u64, u64, i64, i64) {
+        (
+            e.ts_ns,
+            e.venue,
+            e.channel,
+            e.sym,
+            e.venue_seq,
+            e.venue_time_ms,
+            e.v0,
+            e.v1,
+        )
+    }
+
+    fn b1_scan(
+        route: &'static [core_types::SymbolId],
+        mask: u16,
+        tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+        cap: &mut B1Cap<'_>,
+        status: &IngressStatus,
+    ) {
+        let mut t = TestTransport::with_capacity(16 * 1024);
+        let mut d = Driver::new_spot_sentinel(7, B1_SYM);
+        d.set_state(State::Steady);
+        d.set_trade_route(route);
+        t.inject_incoming(&ws_text_frame(B1_TRADES));
+        let (mut prod, _cons) = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new().split();
+        let (mut otx, _orx) = opt_ring_pair();
+        let lane = TradeLane {
+            tx,
+            mask,
+            route,
+            status,
+        };
+        super::drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            lane.tx,
+            lane.mask,
+            &mut otx,
+            lane.status,
+            cap,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn binance_trade_route_off_pushes_nothing_and_counts_nothing() {
+        let (mut tx, rx) = core_ring::Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let status = IngressStatus::new();
+        let mut cap = B1Cap {
+            rows: Vec::new(),
+            lane: &rx,
+        };
+        let funding = core_types::EVENT_LANE_FUNDING | core_types::EVENT_LANE_ASSET_CTX;
+        b1_scan(&B1_ROUTE, funding, &mut tx, &mut cap, &status);
+        b1_scan(
+            &[],
+            funding | core_types::EVENT_LANE_TRADE,
+            &mut tx,
+            &mut cap,
+            &status,
+        );
+        assert_eq!(cap.rows.len(), 2 * B1_ROWS, "captured exactly as before");
+        assert_eq!(rx.len(), 0);
+        assert_eq!(status.trade_shed_total(), 0);
+    }
+
+    #[test]
+    fn binance_routed_trade_is_captured_first_and_byte_identical() {
+        let (mut tx, mut rx) = core_ring::Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let status = IngressStatus::new();
+        let rows = {
+            let mut cap = B1Cap {
+                rows: Vec::new(),
+                lane: &rx,
+            };
+            b1_scan(
+                &B1_ROUTE,
+                core_types::EVENT_LANE_TRADE,
+                &mut tx,
+                &mut cap,
+                &status,
+            );
+            cap.rows
+        };
+        assert_eq!(rows.len(), B1_ROWS);
+        let mut i = 0;
+        while i < rows.len() {
+            assert_eq!(rows[i].1, i, "row captured before its push");
+            let got = *rx.try_pop_ref().expect("routed print");
+            assert_eq!(b1_key(&got), b1_key(&rows[i].0));
+            i += 1;
+        }
+        assert!(rx.try_pop_ref().is_none());
+        assert_eq!(status.trade_shed_total(), 0);
+    }
+
+    #[test]
+    fn binance_unrouted_symbol_prints_are_never_pushed() {
+        let (mut tx, rx) = core_ring::Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let status = IngressStatus::new();
+        let mut cap = B1Cap {
+            rows: Vec::new(),
+            lane: &rx,
+        };
+        b1_scan(
+            &B1_OTHER,
+            core_types::EVENT_LANE_TRADE,
+            &mut tx,
+            &mut cap,
+            &status,
+        );
+        assert_eq!(cap.rows.len(), B1_ROWS);
+        assert_eq!(rx.len(), 0);
+        assert_eq!(status.trade_shed_total(), 0);
+    }
+
+    #[test]
+    fn binance_trade_burst_never_costs_a_funding_push() {
+        let (mut tx, rx) = core_ring::Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let status = IngressStatus::new();
+        let mut cap = B1Cap {
+            rows: Vec::new(),
+            lane: &rx,
+        };
+        let mut k = 0;
+        while k < EVENT_RING_SIZE {
+            b1_scan(
+                &B1_ROUTE,
+                core_types::EVENT_LANE_TRADE,
+                &mut tx,
+                &mut cap,
+                &status,
+            );
+            k += 1;
+        }
+        assert_eq!(rx.len(), EVENT_RING_SIZE - core_types::EVENT_TRADE_RESERVE);
+        let funding =
+            ChannelEvent::new(1, VenueId::Binance, ChannelId::Funding, B1_SYM, 0, 0, 1, 1);
+        let mut f = 0;
+        while f < core_types::EVENT_TRADE_RESERVE {
+            assert!(
+                tx.try_push_ref(&funding),
+                "the reserve holds every non-Trade push"
+            );
+            f += 1;
+        }
+    }
+
+    #[test]
+    fn binance_usdm_route_slot_routes_prints_and_leaves_the_feed_clock_alone() {
+        // PVM B'1 T8 (Q1 = (a)): a USDⓈ-M route slot captures and routes
+        // its aggTrade prints; unlike the spot sentinel the print teaches
+        // no clock, so the slot's bookTicker keeps its own stamps.
+        let (mut tx, mut rx) = core_ring::Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let status = core_metrics::IngressStatus::new();
+        let mut t = TestTransport::with_capacity(16 * 1024);
+        let mut d = Driver::new_usdm_routed_trades(7, B1_SYM);
+        assert!(d.has_usdm_trades() && !d.has_sentinel());
+        d.set_state(State::Steady);
+        d.set_trade_route(&B1_ROUTE);
+        t.inject_incoming(&ws_text_frame(B1_TRADES));
+        let (mut prod, mut cons) = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new().split();
+        let (mut otx, _orx) = opt_ring_pair();
+        let mut cap = B1Cap {
+            rows: Vec::new(),
+            lane: &rx,
+        };
+        super::drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &mut tx,
+            core_types::EVENT_LANE_TRADE,
+            &mut otx,
+            &status,
+            &mut cap,
+        )
+        .unwrap();
+        assert_eq!(cap.rows.len(), 1, "captured as a Trade row");
+        let rows = cap.rows;
+        let got = *rx.try_pop_ref().expect("routed");
+        assert_eq!(b1_key(&got), b1_key(&rows[0].0));
+        assert_eq!(got.v1, -500_000);
+        assert_eq!(d.sentinel_time_ms(), 0, "the feed clock learned nothing");
+        assert!(
+            cons.try_pop_ref().is_none(),
+            "prints never reach the tick ring"
+        );
+        assert_eq!(status.parse_errors_total(), 0);
+    }
+
+    #[test]
+    fn binance_usdm_slot_is_not_a_trade_slot_by_default() {
+        let d = Driver::new(7, B1_SYM);
+        assert!(!d.has_usdm_trades() && !d.has_sentinel());
+    }
+
+    #[test]
+    fn binance_every_shed_print_is_counted_once() {
+        let (mut tx, rx) = core_ring::Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let status = IngressStatus::new();
+        let mut cap = B1Cap {
+            rows: Vec::new(),
+            lane: &rx,
+        };
+        let cap_n = EVENT_RING_SIZE - core_types::EVENT_TRADE_RESERVE;
+        let pushes = cap_n / B1_ROWS + 3;
+        let mut k = 0;
+        while k < pushes {
+            b1_scan(
+                &B1_ROUTE,
+                core_types::EVENT_LANE_TRADE,
+                &mut tx,
+                &mut cap,
+                &status,
+            );
+            k += 1;
+        }
+        let offered = (pushes * B1_ROWS) as u64;
+        assert_eq!(rx.len(), cap_n);
+        assert_eq!(status.trade_shed_total(), offered - cap_n as u64);
+        assert_eq!(
+            cap.rows.len() as u64,
+            offered,
+            "a shed print is still captured"
+        );
+        assert_eq!(status.event_ring_drops_total(), 0);
+    }
 
     fn build_driver(seed: u64, sym: SymbolId) -> Driver {
         Driver::new(seed, sym)

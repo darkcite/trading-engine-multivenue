@@ -1522,6 +1522,21 @@ impl Strategy for StrategySet {
     /// it opts in, and submits (if it ever does) are slot-stamped.
     #[inline(always)]
     fn on_venue_event<C: Ctx>(&mut self, event: &ChannelEvent, ctx: &mut C) {
+        // PVM B'1 (00-INDEX §3.15.2): a Trade print on the event lane is
+        // the pine slot's input and nobody else's (pin:Bp-slot-pine — the
+        // spec's "slot 7" is SLOT_PINE, 8). Returning here keeps every
+        // other member's event stream byte-identical to the pre-B'1 one —
+        // strategy-vm learns its wall offset from every event it is
+        // handed. The regime tap below matches Funding / AssetCtx only,
+        // so it never saw a Trade either. (XMM's prints ride their own
+        // `TradePrint` lane into `on_trade`, untouched.)
+        if event.channel == ChannelId::Trade as u8 {
+            if self.enabled & BIT_PINE != 0 {
+                self.pine
+                    .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_PINE));
+            }
+            return;
+        }
         // RG2: the funding reference's prints feed the detector
         // (Funding on every venue; Hyperliquid rides AssetCtx, whose
         // `v0` is the rate — the vm feature engine's law).
@@ -3014,6 +3029,46 @@ mod tests {
             );
             s.on_venue_event(&other, &mut c);
             assert_eq!(s.regime().funding(), (-25_000, 1_700_000_000_000));
+        }
+
+        /// PVM B'1 (impl-Bp §7.2): a Trade print on the funding
+        /// reference never reaches the regime tap — with the pine slot
+        /// enabled or not — and a Funding print after it still does.
+        #[test]
+        fn regime_tap_never_sees_a_trade() {
+            for mask in [BIT_AI_EXEC, BIT_AI_EXEC | BIT_PINE] {
+                let mut s = StrategySet::new(mask);
+                let mut c = ctx();
+                c.now = T0;
+                s.configure_regime(&params(), WallAnchor::new(T0, WALL0), T0)
+                    .unwrap();
+                // No `on_start`: an unconfigured pine shell refuses it
+                // (F19); the tap needs only the configured detector.
+                let print = ChannelEvent::new(
+                    T0 + 1,
+                    VenueId::Binance,
+                    ChannelId::Trade,
+                    BTC,
+                    7,
+                    1_700_000_000_000,
+                    -25_000,
+                    1_000_000,
+                );
+                s.on_venue_event(&print, &mut c);
+                assert_eq!(s.regime().funding(), (0, 0), "mask {mask:#x}");
+                let funding = ChannelEvent::new(
+                    T0 + 2,
+                    VenueId::Binance,
+                    ChannelId::Funding,
+                    BTC,
+                    8,
+                    1_700_000_001_000,
+                    -30_000,
+                    0,
+                );
+                s.on_venue_event(&funding, &mut c);
+                assert_eq!(s.regime().funding(), (-30_000, 1_700_000_001_000));
+            }
         }
 
         #[test]

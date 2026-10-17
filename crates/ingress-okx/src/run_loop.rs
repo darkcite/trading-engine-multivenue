@@ -325,6 +325,10 @@ pub struct Driver {
     /// the venue default or the operator's `--stale-after-ms okx:<ms>`
     /// via [`Self::set_stale_after_ms`].
     feed_clock: FeedClock,
+    /// PVM B'1: the pine slot's Trade route on this ingress's event
+    /// lane, attached by [`Self::set_trade_route`] (boot). Empty = no
+    /// Trade event is ever pushed (every boot without the pine slot).
+    trade_route: &'static [core_types::SymbolId],
     /// `!Sync` marker — see struct doc.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
 }
@@ -410,8 +414,18 @@ impl Driver {
             drop_log_last_ns: 0,
             drop_log_suppressed: 0,
             feed_clock: FeedClock::new(VenueId::Okx.default_stale_after_ms()),
+            trade_route: &[],
             _not_sync: ::core::marker::PhantomData,
         }
+    }
+
+    /// PVM B'1: attach the pine slot's spawn-time Trade route (≤
+    /// `TRADE_ROUTE_MAX` syms). A routed print is pushed onto the event
+    /// lane as its capture row's `ChannelEvent` only while the spawn
+    /// mask carries `EVENT_LANE_TRADE`. Boot-only.
+    pub fn set_trade_route(&mut self, route: &'static [core_types::SymbolId]) {
+        debug_assert!(route.len() <= core_types::TRADE_ROUTE_MAX);
+        self.trade_route = route;
     }
 
     /// WS2: override the establishment budget (tests use millisecond
@@ -994,6 +1008,38 @@ fn scan_opt_summaries<C: Capture>(
     scan
 }
 
+/// PVM B'1 (impl-Bp §3.3): the pine slot's Trade route on this
+/// ingress's event lane, built per trades push from the loop's event
+/// producer, spawn mask and the driver's route. One law at all five
+/// ingress sites: mask test first (bit clear = one AND and a not-taken
+/// branch per print), then the route, then the reserve — a print never
+/// takes the ring past `EVENT_RING_SIZE − EVENT_TRADE_RESERVE`, so a
+/// Trade burst cannot cost a Funding / AssetCtx / Mark / InstrumentRoll
+/// push. A refused print is counted on `trade_shed_total`, never retried.
+struct TradeLane<'a> {
+    tx: &'a mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    mask: u16,
+    route: &'static [core_types::SymbolId],
+    status: &'a IngressStatus,
+}
+
+impl TradeLane<'_> {
+    #[inline(always)]
+    fn offer(&mut self, ev: &ChannelEvent) {
+        if self.mask & core_types::EVENT_LANE_TRADE == 0
+            || !core_types::trade_routed(self.route, ev.sym)
+        {
+            return;
+        }
+        // The ring-slot publish is the designed copy (CLAUDE.md).
+        if self.tx.len() >= EVENT_RING_SIZE - core_types::EVENT_TRADE_RESERVE
+            || !self.tx.try_push_ref(ev)
+        {
+            self.status.inc_trade_shed();
+        }
+    }
+}
+
 /// Walk the `trades` rows of one push. Rows are sliced at successive
 /// `"tradeId":"` markers; each slice parses independently (`px`/`sz`/
 /// `side`/`ts`/`seqId` all follow `tradeId` within a row). Each parsed
@@ -1007,6 +1053,7 @@ fn scan_trades<C: Capture>(
     sym: u32,
     seqs: &mut TradeSeqMonitor,
     capture: &mut C,
+    lane: &mut TradeLane<'_>,
 ) -> TradeScan {
     const MARKER: &[u8] = b"\"tradeId\":\"";
     let mut scan = TradeScan {
@@ -1029,7 +1076,7 @@ fn scan_trades<C: Capture>(
                 scan.regressions += u32::from(seqs.apply(t.seq_id) == TradeSeqOutcome::Regression);
             }
             let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
-            capture.event(&ChannelEvent::new(
+            let ev = ChannelEvent::new(
                 now_ns(),
                 VenueId::Okx,
                 ChannelId::Trade,
@@ -1038,7 +1085,9 @@ fn scan_trades<C: Capture>(
                 t.ts_ns / 1_000_000,
                 t.px_1e6,
                 signed_qty,
-            ));
+            );
+            capture.event(&ev); // capture first, unchanged
+            lane.offer(&ev); // PVM B'1: then the pine route
         } else {
             scan.rows_rejected += 1;
             // Tap the exact rejected row slice — the §6.5 raw-tap
@@ -1153,7 +1202,18 @@ fn handle_data_frame<C: Capture>(
                             }
                         },
                         OkxChannel::Trades => Dispatch::Trades {
-                            scan: scan_trades(payload, sym, &mut drv.trade_seqs[sym_idx], capture),
+                            scan: scan_trades(
+                                payload,
+                                sym,
+                                &mut drv.trade_seqs[sym_idx],
+                                capture,
+                                &mut TradeLane {
+                                    tx: &mut *event_tx,
+                                    mask: event_mask,
+                                    route: drv.trade_route,
+                                    status,
+                                },
+                            ),
                         },
                         OkxChannel::OptSummary => {
                             // Handled by the dedicated family-keyed
@@ -1771,6 +1831,193 @@ mod tests {
     };
     use core_ring::Ring;
     use core_types::NullCapture;
+
+    // ── PVM B'1: the pine slot's Trade route (impl-Bp §7.1) ──────────
+
+    const B1_TRADES: &[u8] = br#"{"arg":{"channel":"trades","instId":"BTC-USDT"},"data":[{"instId":"BTC-USDT","tradeId":"130639474","px":"42219.9","sz":"0.12060306","side":"buy","ts":"1630048897897","count":"3","seqId":123456},{"instId":"BTC-USDT","tradeId":"130639475","px":"42219.8","sz":"0.5","side":"sell","ts":"1630048897898","count":"1","seqId":123457}]}"#;
+    const B1_SYM: core_types::SymbolId = 7;
+    static B1_ROUTE: [core_types::SymbolId; 1] = [B1_SYM];
+    static B1_OTHER: [core_types::SymbolId; 1] = [B1_SYM + 1];
+    const B1_ROWS: usize = 2;
+
+    /// Capture double: records every event and the event lane's depth at
+    /// the moment the capture saw it (capture-first ⇒ the push follows).
+    struct B1Cap<'c> {
+        rows: Vec<(ChannelEvent, usize)>,
+        lane: &'c core_ring::Consumer<ChannelEvent, EVENT_RING_SIZE>,
+    }
+    impl core_types::Capture for B1Cap<'_> {
+        fn event(&mut self, e: &ChannelEvent) {
+            if e.channel == ChannelId::Trade as u8 {
+                self.rows.push((*e, self.lane.len()));
+            }
+        }
+    }
+
+    fn b1_key(e: &ChannelEvent) -> (u64, u8, u8, u32, u64, u64, i64, i64) {
+        (
+            e.ts_ns,
+            e.venue,
+            e.channel,
+            e.sym,
+            e.venue_seq,
+            e.venue_time_ms,
+            e.v0,
+            e.v1,
+        )
+    }
+
+    fn b1_scan(
+        route: &'static [core_types::SymbolId],
+        mask: u16,
+        tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+        cap: &mut B1Cap<'_>,
+        status: &IngressStatus,
+    ) {
+        let mut seqs = crate::TradeSeqMonitor::new();
+        let mut lane = TradeLane {
+            tx,
+            mask,
+            route,
+            status,
+        };
+        scan_trades(B1_TRADES, B1_SYM, &mut seqs, cap, &mut lane);
+    }
+
+    #[test]
+    fn okx_trade_route_off_pushes_nothing_and_counts_nothing() {
+        let (mut tx, rx) = core_ring::Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let status = IngressStatus::new();
+        let mut cap = B1Cap {
+            rows: Vec::new(),
+            lane: &rx,
+        };
+        let funding = core_types::EVENT_LANE_FUNDING | core_types::EVENT_LANE_ASSET_CTX;
+        b1_scan(&B1_ROUTE, funding, &mut tx, &mut cap, &status);
+        b1_scan(
+            &[],
+            funding | core_types::EVENT_LANE_TRADE,
+            &mut tx,
+            &mut cap,
+            &status,
+        );
+        assert_eq!(cap.rows.len(), 2 * B1_ROWS, "captured exactly as before");
+        assert_eq!(rx.len(), 0);
+        assert_eq!(status.trade_shed_total(), 0);
+    }
+
+    #[test]
+    fn okx_routed_trade_is_captured_first_and_byte_identical() {
+        let (mut tx, mut rx) = core_ring::Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let status = IngressStatus::new();
+        let rows = {
+            let mut cap = B1Cap {
+                rows: Vec::new(),
+                lane: &rx,
+            };
+            b1_scan(
+                &B1_ROUTE,
+                core_types::EVENT_LANE_TRADE,
+                &mut tx,
+                &mut cap,
+                &status,
+            );
+            cap.rows
+        };
+        assert_eq!(rows.len(), B1_ROWS);
+        let mut i = 0;
+        while i < rows.len() {
+            assert_eq!(rows[i].1, i, "row captured before its push");
+            let got = *rx.try_pop_ref().expect("routed print");
+            assert_eq!(b1_key(&got), b1_key(&rows[i].0));
+            i += 1;
+        }
+        assert!(rx.try_pop_ref().is_none());
+        assert_eq!(status.trade_shed_total(), 0);
+    }
+
+    #[test]
+    fn okx_unrouted_symbol_prints_are_never_pushed() {
+        let (mut tx, rx) = core_ring::Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let status = IngressStatus::new();
+        let mut cap = B1Cap {
+            rows: Vec::new(),
+            lane: &rx,
+        };
+        b1_scan(
+            &B1_OTHER,
+            core_types::EVENT_LANE_TRADE,
+            &mut tx,
+            &mut cap,
+            &status,
+        );
+        assert_eq!(cap.rows.len(), B1_ROWS);
+        assert_eq!(rx.len(), 0);
+        assert_eq!(status.trade_shed_total(), 0);
+    }
+
+    #[test]
+    fn okx_trade_burst_never_costs_a_funding_push() {
+        let (mut tx, rx) = core_ring::Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let status = IngressStatus::new();
+        let mut cap = B1Cap {
+            rows: Vec::new(),
+            lane: &rx,
+        };
+        let mut k = 0;
+        while k < EVENT_RING_SIZE {
+            b1_scan(
+                &B1_ROUTE,
+                core_types::EVENT_LANE_TRADE,
+                &mut tx,
+                &mut cap,
+                &status,
+            );
+            k += 1;
+        }
+        assert_eq!(rx.len(), EVENT_RING_SIZE - core_types::EVENT_TRADE_RESERVE);
+        let funding = ChannelEvent::new(1, VenueId::Okx, ChannelId::Funding, B1_SYM, 0, 0, 1, 1);
+        let mut f = 0;
+        while f < core_types::EVENT_TRADE_RESERVE {
+            assert!(
+                tx.try_push_ref(&funding),
+                "the reserve holds every non-Trade push"
+            );
+            f += 1;
+        }
+    }
+
+    #[test]
+    fn okx_every_shed_print_is_counted_once() {
+        let (mut tx, rx) = core_ring::Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let status = IngressStatus::new();
+        let mut cap = B1Cap {
+            rows: Vec::new(),
+            lane: &rx,
+        };
+        let cap_n = EVENT_RING_SIZE - core_types::EVENT_TRADE_RESERVE;
+        let pushes = cap_n / B1_ROWS + 3;
+        let mut k = 0;
+        while k < pushes {
+            b1_scan(
+                &B1_ROUTE,
+                core_types::EVENT_LANE_TRADE,
+                &mut tx,
+                &mut cap,
+                &status,
+            );
+            k += 1;
+        }
+        let offered = (pushes * B1_ROWS) as u64;
+        assert_eq!(rx.len(), cap_n);
+        assert_eq!(status.trade_shed_total(), offered - cap_n as u64);
+        assert_eq!(
+            cap.rows.len() as u64,
+            offered,
+            "a shed print is still captured"
+        );
+        assert_eq!(status.event_ring_drops_total(), 0);
+    }
 
     /// Venue-namespaced test symbol (venue byte 2 = Okx, ordinal 1).
     const SYM_BTC: u32 = (2 << 24) | 1;

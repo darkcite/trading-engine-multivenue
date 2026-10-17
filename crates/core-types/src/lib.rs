@@ -2494,6 +2494,43 @@ pub const EVENT_LANE_FUNDING: u16 = event_lane_bit(ChannelId::Funding);
 /// engine treats HL AssetCtx events as funding samples.
 pub const EVENT_LANE_ASSET_CTX: u16 = event_lane_bit(ChannelId::AssetCtx);
 
+/// B'1 (PVM lane B', 00-INDEX §3.15.2): the Trade lane bit. An ingress
+/// sets it on its spawn-time `event_mask` only when it hosts a symbol
+/// the pine slot routes; `strategy-set` forwards Trade to the pine slot
+/// and to no other member. An engine-wide Trade lane would change slot
+/// 5's input: strategy-vm learns its wall offset from every event it
+/// sees. pin:Bp-slot-pine — the spec's "slot 7" is `SLOT_PINE` (8).
+pub const EVENT_LANE_TRADE: u16 = event_lane_bit(ChannelId::Trade);
+
+/// B'1: event-ring slots a Trade print may never occupy. A print that
+/// finds the ring at `EVENT_RING_SIZE - EVENT_TRADE_RESERVE` or fuller
+/// is shed and counted, never queued, so a Trade burst cannot cost a
+/// Funding / AssetCtx / Mark / InstrumentRoll push.
+pub const EVENT_TRADE_RESERVE: usize = EVENT_RING_SIZE / 4;
+
+/// B'1: the most symbols one ingress routes to the pine slot
+/// (strategy-pine hosts at most eight).
+pub const TRADE_ROUTE_MAX: usize = 16;
+
+const _: () = assert!(EVENT_TRADE_RESERVE > 0 && EVENT_TRADE_RESERVE < EVENT_RING_SIZE);
+
+/// B'1: whether `sym` is on an ingress's spawn-time Trade route. Index
+/// loop over at most [`TRADE_ROUTE_MAX`] entries; the empty route
+/// routes nothing.
+#[inline(always)]
+pub fn trade_routed(route: &[SymbolId], sym: SymbolId) -> bool {
+    debug_assert!(route.len() <= TRADE_ROUTE_MAX);
+    let mut i = 0;
+    while i < route.len() {
+        // SAFETY: `i < route.len()` is the loop condition.
+        if unsafe { *route.get_unchecked(i) } == sym {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Capacity of every OptSummary SPSC lane (VM2 V2 — the kind-6
 /// channel enters the engine for the first time; capture-only
 /// before). OKX `opt-summary` pushes whole-family bursts (the capped
@@ -4574,6 +4611,31 @@ mod tests {
             (p.ts_ns, p.sym, p.side, p.kind, p.px, p.qty, p.client_oid, p.ttl_ns),
             (o.ts_ns, o.sym, o.side, o.kind, o.px, o.qty, o.client_oid, o.ttl_ns)
         );
+    }
+
+    #[test]
+    fn trade_routed_empty_route_routes_nothing() {
+        assert!(!trade_routed(&[], 0));
+        assert!(!trade_routed(&[], SYMBOL_ID_NONE));
+    }
+
+    #[test]
+    fn trade_routed_finds_members_only() {
+        let route: [SymbolId; 3] = [3, 9, 40];
+        assert!(trade_routed(&route, 3));
+        assert!(trade_routed(&route, 9));
+        assert!(trade_routed(&route, 40));
+        assert!(!trade_routed(&route, 4));
+        assert!(!trade_routed(&route, SYMBOL_ID_NONE));
+    }
+
+    #[test]
+    fn event_trade_reserve_leaves_room_for_every_non_trade_channel() {
+        let reserve = EVENT_TRADE_RESERVE;
+        assert!(reserve > 0 && reserve < EVENT_RING_SIZE);
+        assert!(reserve >= 128);
+        assert_eq!(EVENT_LANE_TRADE & EVENT_LANE_FUNDING, 0);
+        assert_eq!(EVENT_LANE_TRADE & EVENT_LANE_ASSET_CTX, 0);
     }
 
     #[test]
