@@ -72,12 +72,39 @@ fn int_literal_above_i64_max_is_kept_as_u64() {
     });
 }
 
+/// pin:01-unknown-escape `DropBackslash`: TradingView's `str.length("a\qb")` is 3 (Z017).
 #[test]
-fn unknown_escape_default_keeps_backslash() {
+fn unknown_escape_drops_backslash_z017() {
     with_value("\"a\\qb\"", |_, s, n| match n {
-        Node::StrLit { value, .. } => assert_eq!(s.resolve(value), "a\\qb"),
+        Node::StrLit { value, .. } => assert_eq!(s.resolve(value), "aqb"),
         other => panic!("{other:?}"),
     });
+}
+
+/// The string value of `x = <lit>` (v6).
+fn str_value(lit: &str) -> String {
+    with_value(lit, |_, s, n| match n {
+        Node::StrLit { value, .. } => s.resolve(value).to_string(),
+        other => panic!("{other:?}"),
+    })
+}
+
+/// pin:01-multiline-string-value `Verbatim`: value probe v4 plots `str.length` 3 · 3 · 7 on
+/// TradingView (Z018) — both edge breaks and the closing line's indentation are content.
+#[test]
+fn multiline_values_z018() {
+    assert_eq!(str_value("\"\"\"\nab\"\"\"").chars().count(), 3);
+    assert_eq!(str_value("\"\"\"ab\n\"\"\"").chars().count(), 3);
+    assert_eq!(str_value("\"\"\"ab\n    \"\"\""), "ab\n    ");
+    assert_eq!(str_value("\"\"\"ab\r\n    \"\"\""), "ab\n    ");
+}
+
+/// pin:01-string-line-wrap: TradingView accepts p06's wrapped single-line string (Z006); the break
+/// (normalised) and the next line's indentation stay in the value, as in Z018's multiline literal.
+#[test]
+fn string_line_wrap_value_z006() {
+    assert_eq!(str_value("\"ab\n  cd\""), "ab\n  cd");
+    assert_eq!(str_value("'ab\r\n  cd'"), "ab\n  cd");
 }
 
 #[test]

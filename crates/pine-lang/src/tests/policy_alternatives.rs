@@ -13,33 +13,54 @@ use crate::version::{version_of_with, VersionProbe};
 
 #[test]
 fn policy_alternatives_behave() {
-    // pin:01-mixed-indent: TabIsUnit accepts the line, measured with a tab as one level.
+    // pin:01-mixed-indent: the default TabIsUnit accepts the line, measured with a tab as one
+    // level (Z001); Refuse is 1006 with the same layout.
+    let (lexed, codes, _) = lex_with("if a\n    if b\n\t    x\n", V6, &POLICY);
+    assert!(codes.is_empty());
+    let shape = "If Ident Newline Indent If Ident Newline Indent Ident Newline Dedent Dedent Eof";
+    assert_eq!(show(&lexed), shape);
     let p = SyntaxPolicy {
-        mixed_indent: MixedIndent::TabIsUnit,
+        mixed_indent: MixedIndent::Refuse,
         ..POLICY
     };
     let (lexed, codes, _) = lex_with("if a\n    if b\n\t    x\n", V6, &p);
-    assert!(codes.is_empty());
-    assert_eq!(
-        show(&lexed),
-        "If Ident Newline Indent If Ident Newline Indent Ident Newline Dedent Dedent Eof"
-    );
+    assert_eq!(codes, vec![1006]);
+    assert_eq!(show(&lexed), shape);
 
-    // pin:01-unknown-escape: DropBackslash.
+    // pin:01-unknown-escape: KeepBoth (the default drops the backslash, Z017).
     let p = SyntaxPolicy {
-        unknown_escape: UnknownEscape::DropBackslash,
+        unknown_escape: UnknownEscape::KeepBoth,
         ..POLICY
     };
     let (lexed, _, syms) = lex_with("\"a\\qb\"", V6, &p);
-    assert_eq!(first_str(&lexed, &syms).as_deref(), Some("aqb"));
+    assert_eq!(first_str(&lexed, &syms).as_deref(), Some("a\\qb"));
 
-    // pin:01-multiline-string-value: TrimBreaks drops both edge breaks.
+    // pin:01-multiline-string-value: Verbatim (the default, Z018) keeps everything; KeepBreaks
+    // drops the closing line's indentation; TrimBreaks also drops both edge breaks.
+    let src = "\"\"\"\r\nab\n  \"\"\"";
+    let (lexed, _, syms) = lex_with(src, V6, &POLICY);
+    assert_eq!(first_str(&lexed, &syms).as_deref(), Some("\nab\n  "));
+    let p = SyntaxPolicy {
+        multiline_edges: MultilineEdges::KeepBreaks,
+        ..POLICY
+    };
+    let (lexed, _, syms) = lex_with(src, V6, &p);
+    assert_eq!(first_str(&lexed, &syms).as_deref(), Some("\nab\n"));
     let p = SyntaxPolicy {
         multiline_edges: MultilineEdges::TrimBreaks,
         ..POLICY
     };
-    let (lexed, _, syms) = lex_with("\"\"\"\r\nab\n  \"\"\"", V6, &p);
+    let (lexed, _, syms) = lex_with(src, V6, &p);
     assert_eq!(first_str(&lexed, &syms).as_deref(), Some("ab"));
+
+    // pin:01-first-line-indent: R2 read literally refuses an indented first line (1008); the
+    // default accepts it (Z014).
+    assert!(lex_with(" x = 1\n", V6, &POLICY).1.is_empty());
+    let p = SyntaxPolicy {
+        first_line_indent_refused: true,
+        ..POLICY
+    };
+    assert_eq!(lex_with(" x = 1\n", V6, &p).1, vec![1008]);
 
     // pin:01-bracket-wrap: `[ ]` no longer follows `( )`: column 4 is refused, column 2 wraps.
     let p = SyntaxPolicy {
@@ -56,31 +77,40 @@ fn policy_alternatives_behave() {
     };
     assert!(lex_with("f(a,\n    b)\n", V5, &p).1.is_empty());
 
-    // pin:01-version-form: spaced forms accepted.
+    // pin:01-version-form: spaced forms accepted by the default (Z007); strict is 2103.
+    assert!(matches!(
+        version_of_with("//@version = 6", FileId::ROOT, &POLICY),
+        VersionProbe::Supported { .. }
+    ));
+    assert!(matches!(
+        version_of_with("//@version=6x", FileId::ROOT, &POLICY),
+        VersionProbe::Malformed { .. }
+    ));
     let p = SyntaxPolicy {
-        version_form_strict: false,
+        version_form_strict: true,
         ..POLICY
     };
     assert!(matches!(
         version_of_with("//@version = 6", FileId::ROOT, &p),
-        VersionProbe::Supported { .. }
-    ));
-    assert!(matches!(
-        version_of_with("//@version=6x", FileId::ROOT, &p),
         VersionProbe::Malformed { .. }
     ));
 
-    // pin:01-version-conflict: not refused; the first annotation decides.
-    let p = SyntaxPolicy {
-        version_conflict_refused: false,
-        ..POLICY
-    };
+    // pin:01-version-conflict: not refused by the default, the first annotation decides (Z008);
+    // the refusing alternative is 2105.
     assert!(matches!(
-        version_of_with("//@version=5\n//@version=6", FileId::ROOT, &p),
+        version_of_with("//@version=5\n//@version=6", FileId::ROOT, &POLICY),
         VersionProbe::Supported {
             dialect: pine_ir::Dialect::V5,
             ..
         }
+    ));
+    let p = SyntaxPolicy {
+        version_conflict_refused: true,
+        ..POLICY
+    };
+    assert!(matches!(
+        version_of_with("//@version=5\n//@version=6", FileId::ROOT, &p),
+        VersionProbe::Conflict { .. }
     ));
 }
 
@@ -160,16 +190,23 @@ fn declaration_policy_alternatives_behave() {
     };
     assert!(codes_under(&p, "import u/l/1.2\n").is_empty());
 
-    // pin:01-string-line-wrap: a single-line string may wrap; the break stays in the value.
-    let p = SyntaxPolicy {
-        string_line_wrap: true,
-        ..POLICY
-    };
-    let (lexed, codes, syms) = lex_with("s = \"ab\r\n  cd\"\n", V6, &p);
+    // pin:01-string-line-wrap: by default (Z006) a single-line string may wrap; the break stays
+    // in the value; the refusing alternative is 1001.
+    let (lexed, codes, syms) = lex_with("s = \"ab\r\n  cd\"\n", V6, &POLICY);
     assert!(codes.is_empty());
     assert_eq!(first_str(&lexed, &syms).as_deref(), Some("ab\n  cd"));
     assert!(matches!(
-        version_of_with("s = \"a\n//@version=4\"\n//@version=6", FileId::ROOT, &p),
+        version_of_with(
+            "s = \"a\n//@version=4\"\n//@version=6",
+            FileId::ROOT,
+            &POLICY
+        ),
         VersionProbe::Supported { .. }
     ));
+    let p = SyntaxPolicy {
+        string_line_wrap: false,
+        ..POLICY
+    };
+    let (_, codes, _) = lex_with("s = \"ab\n  cd\"\n", V6, &p);
+    assert!(codes.contains(&1001), "{codes:?}");
 }

@@ -158,12 +158,12 @@ impl Lexer<'_, '_> {
                 continue;
             }
             if j >= n || b[j] == b'\n' || b[j] == b'\r' {
-                return self.error(
-                    code::UNTERMINATED_STRING,
-                    i,
-                    j,
-                    "a string literal is not closed before the end of its line",
-                );
+                let msg = if self.pol.string_line_wrap {
+                    "a string literal is not closed before the end of the file"
+                } else {
+                    "a string literal is not closed before the end of its line"
+                };
+                return self.error(code::UNTERMINATED_STRING, i, j, msg);
             }
             if b[j] == b'\\' {
                 if j + 1 < n && b[j + 1] != b'\n' && b[j + 1] != b'\r' {
@@ -285,8 +285,9 @@ fn resolve_into(raw: &str, unknown: UnknownEscape, scratch: &mut Vec<u8>) {
                         k += 2;
                     }
                     None => {
-                        // pin:01-unknown-escape: the next character is kept by the run either way.
-                        if unknown != UnknownEscape::DropBackslash {
+                        // pin:01-unknown-escape: the next character is kept by the run either way;
+                        // the backslash is dropped (Z017: `str.length("a\qb")` is 3).
+                        if unknown == UnknownEscape::KeepBoth {
                             scratch.push(b'\\');
                         }
                         k += 1;
@@ -324,7 +325,12 @@ fn append(scratch: &mut Vec<u8>, run: &[u8]) {
 fn multiline_value_range(b: &[u8], a: usize, z: usize, edges: MultilineEdges) -> (usize, usize) {
     let mut lo = a;
     let mut hi = z;
-    // The closing line's indentation is never part of the value.
+    // pin:01-multiline-string-value `Verbatim` (Z018: `"""ab` · `    """` is 7 on TradingView):
+    // every byte between the delimiters.
+    if edges == MultilineEdges::Verbatim {
+        return (lo, hi);
+    }
+    // Otherwise the closing line's indentation is not part of the value.
     let mut k = hi;
     while k > lo && (b[k - 1] == b' ' || b[k - 1] == b'\t') {
         k -= 1;

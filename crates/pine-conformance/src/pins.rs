@@ -19,10 +19,12 @@
 //! * `pin:06-time-edges-readings` — `pin:04-time-edges`' readings are the union of impl-04's
 //!   F091–F095 reading names (§4.9.7 gives none).
 //!
-//! `decide` compares exactly (`pin:06-decide-exact-until-cmp`): the one tolerance (`cmp.rs`, T16)
-//! replaces the equality when it lands.
+//! `decide` compares a reading's rows with the runner's own cell comparison (`cmp.rs`, T16):
+//! `pin:06-decide-numeric` (retires `pin:06-decide-exact-until-cmp`, which compared cell texts, so
+//! a reading's `1` never matched a captured `1.0`).
 
-use crate::fixture::{Expect, Fixture, ReadingBody, Stamp};
+use crate::cmp::compare_cell;
+use crate::fixture::{Cell, Expect, Fixture, ReadingBody, Row, Stamp, Tol};
 
 /// One pin — contract §3.17 / common brief §5.1, §4.9.3, or another spec's `pin:0N-*` (§4.9.6–§4.9.7)
 /// — with its fixtures by dialect.
@@ -84,10 +86,10 @@ pub enum Decision {
     NotDiscriminating,
 }
 
-fn matches(body: &ReadingBody, e: &Expect) -> bool {
-    match (body, e) {
-        (ReadingBody::Rows(r), Expect::Series(s)) => r == s,
-        (ReadingBody::Rows(r), Expect::Strategy { series, .. }) => r == series,
+fn matches(body: &ReadingBody, f: &Fixture) -> bool {
+    match (body, &f.expect) {
+        (ReadingBody::Rows(r), Expect::Series(s)) => rows_match(f, r, s),
+        (ReadingBody::Rows(r), Expect::Strategy { series, .. }) => rows_match(f, r, series),
         (ReadingBody::Refuse(c), Expect::Refuse { code }) => c == code,
         (ReadingBody::Fault { kind, row }, Expect::Fault { kind: k, row: w }) => {
             kind == k && row == w
@@ -97,7 +99,37 @@ fn matches(body: &ReadingBody, e: &Expect) -> bool {
     }
 }
 
-/// Compares each captured fixture of `pin` against its readings (exactly, until `cmp.rs`).
+/// `pin:06-decide-numeric` — a reading's rows match the capture when both have the same row keys
+/// and cell counts and every cell passes the runner's comparison (`compare_cell`, `ok`): the
+/// captured cell is the expected side, the reading's value the actual (its `na` is NaN, so `na`
+/// matches only `na`); `exact` is bit equality of the parsed f64s, any other tolerance is the
+/// fixture's plot tolerance. Realtime bookkeeping columns are skipped as the runner skips them.
+fn rows_match(f: &Fixture, reading: &[Row], tv: &[Row]) -> bool {
+    if reading.len() != tv.len() {
+        return false;
+    }
+    for (r, t) in reading.iter().zip(tv) {
+        if r.key != t.key || r.cells.len() != t.cells.len() {
+            return false;
+        }
+        for (p, (rc, tc)) in r.cells.iter().zip(&t.cells).enumerate() {
+            if crate::run::is_rt_bookkeeping(f, p) {
+                continue;
+            }
+            let actual = match rc {
+                Cell::Na => f64::NAN,
+                Cell::Val { v, .. } => *v,
+            };
+            let tol = f.plots.get(p).map_or(Tol::Exact, |s| s.tol);
+            if !compare_cell(tc, actual, tol).ok() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Compares each captured fixture of `pin` against its readings (numerically, `rows_match`).
 pub fn decide(pin: &Pin, fixtures: &[Fixture]) -> Decision {
     let mine: Vec<&Fixture> = fixtures
         .iter()
@@ -112,7 +144,7 @@ pub fn decide(pin: &Pin, fixtures: &[Fixture]) -> Decision {
         let hits: Vec<&str> = f
             .readings
             .iter()
-            .filter(|r| matches(&r.body, &f.expect))
+            .filter(|r| matches(&r.body, f))
             .map(|r| r.name.as_str())
             .collect();
         match hits.as_slice() {
@@ -1055,3 +1087,49 @@ pub static FOREIGN_SWITCH_PINS: &[(&str, &str)] = &[
     ("pin:04-math-random", "impl-04"),
     ("pin:10-shell-decl-args", "impl-10"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{decide, Decision, PINS};
+    use crate::fixture::Fixture;
+
+    /// F082's capture with two readings whose cells are `series`/`reading` texts given here.
+    fn f082(series: &str, na: &str, fals: &str) -> Fixture {
+        let text = format!(
+            "fix\t2\nid\tF082\ngroup\tF\ntitle\tbool(f) of an na float\npin\tpin:02-v5-num-to-bool\n\
+             script\ttests/conformance/fixtures/F/F082.pine\n\
+             script_sha256\tf6ba44f1d357f875c68bcbbd8604e6128cf6f6506e6d21321a328f10e3ab96fa\n\
+             chart_sha256\t06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f\n\
+             captured\t2026-10-17T04:32Z\n\
+             tv_build\tweb:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09\n\
+             captured_in\t5\ndriver\tsyn\nalign\tstep\ndialects\t5\nmode\tbar_close\nbars\t24484\n\
+             window\thead\t1\noracle\ttv\ntier\t1\nplot\tf_F082_val1\texact\n\
+             plot\tf_F082_val2\texact\nseries\n{series}\nend\nreading\tna\n{na}\nend\n\
+             reading\tfalse\n{fals}\nend\n"
+        );
+        Fixture::parse(&text, "F082.fix").expect("a valid .fix")
+    }
+
+    fn pin() -> &'static super::Pin {
+        PINS.iter()
+            .find(|p| p.name == "pin:02-v5-num-to-bool")
+            .expect("the pin row")
+    }
+
+    /// `pin:06-decide-numeric`: a reading's `1.0` matches a captured `1` (the runner's numeric
+    /// compare), `exact` stays bit equality, and `na` matches only `na`.
+    #[test]
+    fn pins_decide_numerically() {
+        let f = f082("0\t1\t-1", "0\t1.0\t-1.0", "0\t0.0\t0.0");
+        assert_eq!(decide(pin(), &[f]), Decision::Reading("na".into()));
+        // One ulp above 1 is not `exact`.
+        let f = f082("0\t1\t-1", "0\t1.0000000000000002\t-1.0", "0\t0.0\t0.0");
+        assert_eq!(decide(pin(), &[f]), Decision::Neither);
+        // `na` against `na`; `na` never matches a number.
+        let f = f082("0\tna\t-1", "0\tna\t-1.0", "0\t0\t-1");
+        assert_eq!(decide(pin(), &[f]), Decision::Reading("na".into()));
+        // Both readings match: a fixture defect.
+        let f = f082("0\t0\t0", "0\t0.0\t0", "0\t0\t0.0");
+        assert_eq!(decide(pin(), &[f]), Decision::NotDiscriminating);
+    }
+}

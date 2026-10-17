@@ -28,7 +28,7 @@ use crate::ir::{
     VSlot,
 };
 use crate::mono::{InstId, Tree};
-use crate::pins::{ForStep, IntCast, NaCompare, NaCondition, OnceFlag};
+use crate::pins::{ForStep, IntCast, NaCompare, NaCondition, OnceFlag, V5NumToBool};
 use crate::resolve::Resolved;
 use crate::scope::Binding;
 use crate::sw::Readings;
@@ -1260,6 +1260,18 @@ impl Lower<'_> {
                     a,
                     b: z,
                 });
+                // pin:02-v5-num-to-bool `Na` (F082: TradingView's v5 `bool(na)` is `na`): an `na`
+                // operand replaces the comparison's `false` with an `na` bool. v6 keeps `false`.
+                if self.d == Dialect::V5 && self.rd.pins.v5_num_to_bool == V5NumToBool::Na {
+                    let isna = self.temp(scalar(Ty::Bool, ty.qual), at);
+                    self.op(Op::NaCheck { dst: isna, a });
+                    let na = self.konst(K::Na, ty, at);
+                    self.op(Op::Sel {
+                        dst,
+                        a: na,
+                        cond: isna,
+                    });
+                }
                 return Ok(dst);
             }
             Some(OpRule::AbsSqrt) => {

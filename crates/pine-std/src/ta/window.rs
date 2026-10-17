@@ -7,7 +7,8 @@
 use crate::args::out1;
 use crate::naf::fdiv;
 use crate::state::{
-    mono_push, mono_query, win_at, win_push, win_repoint, Mono2Hdr, MonoCell, MonoHdr, Prev, WinHdr,
+    mono_push, mono_query, neumaier, win_at, win_push, win_repoint, Mono2Hdr, MonoCell, MonoHdr,
+    Prev, WinHdr,
 };
 use crate::sw;
 use pine_ir::{abi, argwin, FaultKind, SiteId};
@@ -20,19 +21,6 @@ const DIV0: [u8; 2] = sw::both(Sw::FloatDivZero);
 #[inline(always)]
 fn na_div0(f: &Frame<'_>) -> bool {
     sw::pick(DIV0, f.dialect()) == swr::FLOAT_DIV_ZERO_NA
-}
-
-/// Neumaier's compensated running sum: `(sum, compensation)`; the value is `sum + comp`.
-#[inline(always)]
-fn neumaier(acc: (f64, f64), x: f64) -> (f64, f64) {
-    let (s, c) = acc;
-    let t = s + x;
-    let c = if s.abs() >= x.abs() {
-        c + ((s - t) + x)
-    } else {
-        c + ((x - t) + s)
-    };
-    (t, c)
 }
 
 /// TradingView's moments of the newest `len` values (`h.n >= len`): a fresh pass each bar, oldest
@@ -55,6 +43,19 @@ fn fresh_moments(h: &WinHdr, ring: &[f64], len: u32) -> (f64, f64) {
     let n = len as f64;
     let mean = (s.0 + s.1) / n;
     (mean, (s2.0 + s2.1) / n - mean * mean)
+}
+
+/// TradingView's `math.sum` / `ta.sma` numerator over the newest `len` values (`h.n >= len`): a
+/// fresh pass oldest first, Neumaier-compensated (`pin:04-var-fresh-sum`).
+#[inline(always)]
+fn fresh_sum(h: &WinHdr, ring: &[f64], len: u32) -> f64 {
+    let mut s = (0.0f64, 0.0f64);
+    let mut k = len;
+    while k > 0 {
+        k -= 1;
+        s = neumaier(s, win_at(h, ring, k));
+    }
+    s.0 + s.1
 }
 
 /// Window variance over `[src, len, biased, out]`: `sum2/n − mean²` (`fresh_moments`), clamped at 0 before any
@@ -281,9 +282,15 @@ fn put_num(f: &mut Frame<'_>, e: u16, v: f64) {
     }
 }
 
-/// `ta.linreg(source, length, offset)` — block `WinHdr` + `[ring | x column]`: least squares over
-/// `x = len − 1 − k` for the value `k` back, `intercept + slope × (len − 1 − offset)`;
-/// `propagate` na (an na inside the window makes the output na). `len == 1` is the value itself.
+/// `ta.linreg(source, length, offset)` — block `WinHdr` + `[ring | x column]`: least squares,
+/// `intercept + slope × (len − 1 − offset)`; `propagate` na (an na inside the window makes the
+/// output na). `len == 1` is the value itself.
+///
+/// `pin:04-linreg-tv-order` (r33a, CI-015, TV right): TradingView's arithmetic — `x = 1..=len`
+/// oldest value first, `Σx`, `Σy`, `Σx²`, `Σxy` accumulated oldest first, unfused;
+/// `slope = (len·Σxy − Σx·Σy) / (len·Σx² − Σx²)`, `intercept = Σy/len − slope·Σx/len + slope`,
+/// the value `intercept + slope·(len − 1 − offset)` — B074 bit-exact on all 128 rows; the
+/// textbook `x = 0..len` forms (plain / Neumaier / mean-centred) miss 23–30.
 pub fn bi_ta_linreg(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 4 {
         return Err(FaultKind::Internal);
@@ -306,7 +313,7 @@ pub fn bi_ta_linreg(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(),
             win_repoint(h, ring, len);
             let mut k = 0u32;
             while k < len {
-                xs[k as usize] = (len - 1 - k) as f64;
+                xs[k as usize] = (len - k) as f64;
                 k += 1;
             }
         }
@@ -317,17 +324,22 @@ pub fn bi_ta_linreg(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(),
             src
         } else {
             let n = len as f64;
-            let sx = n * (n - 1.0) / 2.0;
-            let sxx = (n - 1.0) * n * (2.0 * n - 1.0) / 6.0;
-            let mut sxy = 0.0f64;
-            let mut k = 0u32;
-            while k < len {
-                sxy = win_at(h, ring, k).mul_add(xs[k as usize], sxy);
-                k += 1;
+            // Σx and Σx² are integers: TradingView's running sums of them are exact while below
+            // 2^53 (any window up to ~2^17 values); here they are exact integers rounded once.
+            let l = u128::from(len);
+            let sx = (l * (l + 1) / 2) as f64;
+            let sxx = (l * (l + 1) * (2 * l + 1) / 6) as f64;
+            let (mut sy, mut sxy) = (0.0f64, 0.0f64);
+            let mut k = len;
+            while k > 0 {
+                k -= 1;
+                let y = win_at(h, ring, k);
+                sy += y;
+                sxy += y * xs[k as usize];
             }
-            let slope = (n * sxy - sx * h.sum) / (n * sxx - sx * sx);
-            let icept = (h.sum - slope * sx) / n;
-            slope.mul_add(n - 1.0 - off as f64, icept)
+            let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+            let icept = sy / n - slope * sx / n + slope;
+            icept + slope * (n - 1.0 - off as f64)
         }
     };
     f.set_f64_arg(args[3], out);
@@ -364,7 +376,10 @@ fn dev_core(
     if h.n < len {
         return Ok(None);
     }
-    let mean = h.sum / len as f64;
+    // pin:04-dev-tv-order (r33a, CI-015, TV right): `mean` is TradingView's `ta.sma` (the fresh
+    // Neumaier sum, `pin:04-var-fresh-sum`), the deviations summed newest first, plain — B087 and
+    // B079 bit-exact on all 128 rows; a plain fresh-sum mean misses 26 of B087's.
+    let mean = fresh_sum(h, ring, len) / len as f64;
     let mut sum = 0.0f64;
     let mut i = 0u32;
     while i < len {
@@ -393,8 +408,11 @@ pub fn bi_ta_cci(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), Fa
 
 /// `ta.cog(source, length)` — block `WinHdr` + `[ring | (i + 1) column]`: the manual's
 /// `pine_cog`, `−num / sum` with `num = Σ source[i]·(i + 1)` (newest first, unfused as written)
-/// and `sum` = `math.sum(source, length)` taken by the same pass (exact, no rolling drift); ÷0 per
-/// `Sw::FloatDivZero`. `skip` na.
+/// and `sum` = `math.sum(source, length)`; ÷0 per `Sw::FloatDivZero`. `skip` na.
+///
+/// `pin:04-cog-tv-order` (r33a, CI-015, TV right): `sum` is TradingView's `math.sum` — the fresh
+/// Neumaier sum (`fresh_sum`) — and `num` the plain newest-first sum: B081 bit-exact on all 128
+/// rows; a plain newest-first `sum` misses 60.
 pub fn bi_ta_cog(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 3 {
         return Err(FaultKind::Internal);
@@ -427,15 +445,13 @@ pub fn bi_ta_cog(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), Fa
         if h.n < len {
             f64::NAN
         } else {
-            let (mut num, mut sum) = (0.0f64, 0.0f64);
+            let mut num = 0.0f64;
             let mut i = 0u32;
             while i < len {
-                let price = win_at(h, ring, i);
-                num += price * ws[i as usize];
-                sum += price;
+                num += win_at(h, ring, i) * ws[i as usize];
                 i += 1;
             }
-            fdiv(-num, sum, na0)
+            fdiv(-num, fresh_sum(h, ring, len), na0)
         }
     };
     f.set_f64_arg(args[2], out);

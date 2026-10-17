@@ -10,14 +10,16 @@
 //! through `compile_with` (the private tests, §7.12) and is marked as such.
 
 /// `pin:02-shadow-builtin` — may a user function take a built-in function's name? Acts in §4.3.3.
-/// Probe: a script defining `nz(x) => x + 1` and plotting `nz(1)`.
+/// Probe: a script defining `nz(x) => x + 1` and plotting `nz(1)`. Answered by capture F079
+/// (2026-10-17, v5 and v6): TradingView accepts the script and plots 2, so the user function
+/// replaces the built-in (lead ruling r33, R-P1: TV is the oracle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShadowBuiltin {
-    /// Default — conservative: the documentation never says a user function may replace a
-    /// built-in function, so the declaration is `3004`.
-    Refuse,
-    /// The user overload set replaces the built-in name for every call in that file.
+    /// The old conservative reading: the declaration is `3004`. Kept as the alternative.
     #[cfg_attr(not(test), allow(dead_code))] // selected only through compile_with (§7.12)
+    Refuse,
+    /// Default (F079) — the user overload set replaces the built-in name for every call in that
+    /// file.
     Shadow,
 }
 
@@ -141,6 +143,20 @@ pub(crate) enum OnceFlag {
     VaripLike,
 }
 
+/// `pin:02-v5-num-to-bool` — what v5's numeric → `bool` conversion gives for an `na` operand
+/// (impl-02 §4.4.3, §4.14.6). Probe (v5): `float f = na` · `b = bool(f)` · `plot(na(b) ? 1 : 0)`.
+/// ANSWERED by the capture (CI-024 / F082, R-P1/R-P20): TradingView plots `na(b)` = 1 and the
+/// three-way `na(b) ? -1 : b ? 1 : 0` = −1, so `bool(na)` is an `na` v5 bool (reading `na`). v6
+/// is unchanged: bools are never `na`, `bool(na)` is `false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum V5NumToBool {
+    /// Default: an `na` operand gives an `na` bool.
+    Na,
+    /// An `na` operand gives `false` (as v6).
+    #[cfg_attr(not(test), allow(dead_code))] // selected only through compile_with (§7.12)
+    False,
+}
+
 /// `pin:06-cond-call-state` — does a stateful call in an `if` / `switch` block advance on bars
 /// the block skips? Acts in §4.7.5 (`hoist.rs`). Probe: `if bar_index % 2 == 0` ·
 /// `    x := ta.sma(close, 3)`.
@@ -172,6 +188,8 @@ pub(crate) struct Pins {
     pub(crate) na_compare: NaCompare,
     /// `pin:02-na-condition`.
     pub(crate) na_condition: NaCondition,
+    /// `pin:02-v5-num-to-bool`.
+    pub(crate) v5_num_to_bool: V5NumToBool,
     /// `pin:02-for-step`.
     pub(crate) for_step: ForStep,
     /// `pin:02-once-flag`.
@@ -182,7 +200,7 @@ pub(crate) struct Pins {
 
 /// The default reading of every pin.
 pub(crate) const DEFAULT: Pins = Pins {
-    shadow_builtin: ShadowBuiltin::Refuse,
+    shadow_builtin: ShadowBuiltin::Shadow,
     fn_global_assign: FnGlobalAssign::Refuse,
     for_counter_shadow: ForCounterShadow::Refuse,
     color_alpha: ColorAlpha::RoundHalfUp,
@@ -190,6 +208,7 @@ pub(crate) const DEFAULT: Pins = Pins {
     var_qualifier: VarQualifier::Series,
     na_compare: NaCompare::FalseBoth,
     na_condition: NaCondition::AsFalse,
+    v5_num_to_bool: V5NumToBool::Na,
     for_step: ForStep::RuntimeFault,
     once_flag: OnceFlag::VarLike,
     cond_call_state: CondCallState::ExecutedOnly,

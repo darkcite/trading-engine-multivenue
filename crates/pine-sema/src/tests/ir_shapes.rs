@@ -11,7 +11,7 @@ use pine_ir::{Diag, Dialect, FileId, Lane, OverloadId, SymTable};
 use pine_lang::Ast;
 
 use crate::ir::{BinOpK, Block, CmpK, CondKind, Ir, LoopKind, Op, SlotKind, Stmt, UnOpK, VSlot};
-use crate::pins::{ForStep, IntCast, NaCompare, NaCondition, OnceFlag};
+use crate::pins::{ForStep, IntCast, NaCompare, NaCondition, OnceFlag, V5NumToBool};
 use crate::sw::Readings;
 use crate::{imports, infer, lower, mono, resolve, LibCache};
 
@@ -595,6 +595,39 @@ fn ir_shapes_structures_na_condition_follows_pin() {
         .expect("if");
     assert!(!matches!(r.body.0[at - 1], Stmt::Op(Op::NaSet { .. })));
     assert!(matches!(r.body.0[at], Stmt::If { na_else: true, .. }));
+}
+
+/// `pin:02-v5-num-to-bool` (F082: TradingView's v5 `bool(na)` is `na`): v5 `bool(f)` is the
+/// comparison against zero, then `NA_CHECK f` selecting the `na` constant; v6 and the `False`
+/// reading keep the bare comparison (an `na` operand gives `false`).
+#[test]
+fn v5_num_to_bool_f082() {
+    let body = "float f = na\nb = bool(f)\nplot(b ? 1 : 0)\n";
+    let shape = |r: &Ir| -> Option<bool> {
+        let o = ops(r);
+        let at = o
+            .iter()
+            .position(|x| matches!(x, Op::Cmp { op: CmpK::Ne, .. }))?;
+        let &Op::Cmp { dst, a, .. } = o[at] else {
+            return None;
+        };
+        match (o.get(at + 1), o.get(at + 2)) {
+            (
+                Some(Op::NaCheck { dst: c, a: x }),
+                Some(Op::Sel {
+                    dst: d,
+                    a: na,
+                    cond,
+                }),
+            ) if *x == a && *cond == *c && *d == dst => Some(r.const_of(*na) == Some((0, false))),
+            _ => Some(false),
+        }
+    };
+    assert_eq!(shape(&ir(body, Dialect::V5)), Some(true));
+    assert_eq!(shape(&ir(body, Dialect::V6)), Some(false));
+    let mut rd = Readings::of(Dialect::V5);
+    rd.pins.v5_num_to_bool = V5NumToBool::False;
+    assert_eq!(shape(&ir_with(body, Dialect::V5, &rd)), Some(false));
 }
 
 #[test]

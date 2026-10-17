@@ -6,7 +6,7 @@
 //! `ta.valuewhen`, `ta.rising`, `ta.falling`, `ta.pivothigh`, `ta.pivotlow`.
 
 use crate::args::out1;
-use crate::state::{seq_peek, seq_push_back, Cum, Prev, Seq};
+use crate::state::{seq_bar_gap, seq_peek, seq_push_back, Cum, Prev, Seq};
 use crate::sw;
 use pine_ir::{abi, argwin, FaultKind, SiteId, NA_I64};
 use pine_spec::{swr, Sw};
@@ -54,7 +54,9 @@ fn lag(f: &Frame<'_>, args: &[u16]) -> Result<Option<u32>, FaultKind> {
 }
 
 /// `ta.change(float, len)` / `ta.mom(src, len)`: `src − src[len]` over the site's ring;
-/// `propagate` na (an na enters the ring).
+/// `propagate` na (an na enters the ring). The ring is indexed by bar: the bars a conditional
+/// call skipped carry the last value (`seq_bar_gap`, `pin:06-cond-call-state` — B041 bit-exact on
+/// all 128 tail rows; a per-execution history misses all 128). `ta.mom` shares the body.
 pub fn bi_change_f(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     let src = f.f64_arg(args[0]);
     let dst = out1(args)?;
@@ -62,18 +64,21 @@ pub fn bi_change_f(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), 
         f.set_f64_arg(dst, f64::NAN);
         return Ok(());
     };
+    let bar = f.bar_index();
     let old = {
         let (h, ring) = f.state_split::<Seq, f64>(site);
         if k as usize >= ring.len() {
             return Err(FaultKind::ScriptRefused);
         }
+        seq_bar_gap(h, ring, bar);
         seq_push_back(h, ring, src, k)
     };
     f.set_f64_arg(dst, old.map_or(f64::NAN, |o| src - o));
     Ok(())
 }
 
-/// `ta.change(int, len)`: an `int` result; na while warming up or with an na on either side.
+/// `ta.change(int, len)`: an `int` result; na while warming up or with an na on either side. The
+/// ring is indexed by bar as `ta.change(float, len)`'s (`pin:06-cond-call-state`).
 pub fn bi_change_i(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     let src = f.i64_arg(args[0]);
     let dst = out1(args)?;
@@ -81,11 +86,13 @@ pub fn bi_change_i(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), 
         f.set_i64_arg(dst, None);
         return Ok(());
     };
+    let bar = f.bar_index();
     let old = {
         let (h, ring) = f.state_split::<Seq, i64>(site);
         if k as usize >= ring.len() {
             return Err(FaultKind::ScriptRefused);
         }
+        seq_bar_gap(h, ring, bar);
         seq_push_back(h, ring, src.unwrap_or(NA_I64), k)
     };
     let r = match (src, old) {
@@ -96,7 +103,8 @@ pub fn bi_change_i(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), 
     Ok(())
 }
 
-/// `ta.change(bool, len)`: `src != src[len]`; `false` while warming up or on an na side.
+/// `ta.change(bool, len)`: `src != src[len]`; `false` while warming up or on an na side. The ring
+/// is indexed by bar as `ta.change(float, len)`'s (`pin:06-cond-call-state`).
 pub fn bi_change_b(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     let src = f.bool_arg(args[0]);
     let dst = out1(args)?;
@@ -108,11 +116,13 @@ pub fn bi_change_b(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), 
         Some(b) => b as i64,
         None => NA_I64,
     };
+    let bar = f.bar_index();
     let old = {
         let (h, ring) = f.state_split::<Seq, i64>(site);
         if k as usize >= ring.len() {
             return Err(FaultKind::ScriptRefused);
         }
+        seq_bar_gap(h, ring, bar);
         seq_push_back(h, ring, code, k)
     };
     let r = matches!(old, Some(o) if o != NA_I64 && code != NA_I64 && o != code);
@@ -391,7 +401,7 @@ mod tests {
                 n: 0,
                 pos: 0,
                 aux: 0,
-                _pad: 0,
+                bar: 0,
             };
             let mut ring = [0.0f64; 4];
             for &x in xs {

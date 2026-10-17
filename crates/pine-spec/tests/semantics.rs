@@ -89,8 +89,8 @@ const SW: [(Sw, &str, u8, u8); 22] = [
     (
         Sw::EmaSeed,
         "ema_seed",
-        swr::EMA_SEED_FIRST_VALUE,
-        swr::EMA_SEED_FIRST_VALUE,
+        swr::EMA_SEED_SMA,
+        swr::EMA_SEED_SMA,
     ),
     (
         Sw::KcBasis,
@@ -101,8 +101,8 @@ const SW: [(Sw, &str, u8, u8); 22] = [
     (
         Sw::RisingFalling,
         "rising_falling",
-        swr::RISING_FALLING_GT_ALL_PRIOR,
-        swr::RISING_FALLING_GT_ALL_PRIOR,
+        swr::RISING_FALLING_MONOTONE,
+        swr::RISING_FALLING_MONOTONE,
     ),
     (
         Sw::RoundTies,

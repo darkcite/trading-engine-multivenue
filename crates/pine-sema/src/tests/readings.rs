@@ -104,10 +104,10 @@ fn readings_unknown_switch_code_is_internal() {
 fn readings_shadow_builtin_both() {
     let src = "nz(float x) => x + 1\nplot(nz(1.0))\n";
     let mut r = Readings::of(Dialect::V5);
-    assert_eq!(r.pins.shadow_builtin, ShadowBuiltin::Refuse);
-    assert_eq!(codes(src, &r), vec![3004]);
-    r.pins.shadow_builtin = ShadowBuiltin::Shadow;
+    assert_eq!(r.pins.shadow_builtin, ShadowBuiltin::Shadow);
     assert_eq!(codes(src, &r), vec![ACCEPTED]);
+    r.pins.shadow_builtin = ShadowBuiltin::Refuse;
+    assert_eq!(codes(src, &r), vec![3004]);
 }
 
 #[test]

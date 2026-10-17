@@ -241,12 +241,12 @@
         "first_value",
         "sma"
       ],
-      "v5": "first_value",
-      "v6": "first_value",
+      "v5": "sma",
+      "v6": "sma",
       "normative": false,
       "source": "",
       "pin": "pin:U01-ema-seed",
-      "doc": "ta.ema seed: first_value starts at the first non-na value; sma at the SMA of the first length values; applies to every EMA-based ta.*. Default: REVIEW 4.2, unverified"
+      "doc": "ta.ema seed: first_value starts at the first non-na value; sma at the SMA of the first length values; applies to every EMA-based ta.*. Default: the TradingView capture (r33a, CI-014: B007 B009 B043 B045 B061 B101 print na for the first length - 1 rows in v5 and v6)"
     },
     {
       "id": "kc_basis",
@@ -273,12 +273,12 @@
         "gt_all_prior",
         "monotone"
       ],
-      "v5": "gt_all_prior",
-      "v6": "gt_all_prior",
+      "v5": "monotone",
+      "v6": "monotone",
       "normative": false,
       "source": "",
       "pin": "pin:U03-rising-falling",
-      "doc": "ta.rising/falling: gt_all_prior is src > src[i] for every i in 1..=length; monotone is src[i] > src[i+1] for every i in 0..length. Default: REVIEW 4.2"
+      "doc": "ta.rising/falling: gt_all_prior is src > src[i] for every i in 1..=length; monotone is src[i] > src[i+1] for every i in 0..length. Default: the TradingView capture (r33a, CI-017: B064 B066 v5 and B065 B067 v6 fit monotone on all 128 rows, false - not na - while warming up; gt_all_prior misses 23-24)"
     },
     {
       "id": "round_ties",

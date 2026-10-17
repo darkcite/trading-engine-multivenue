@@ -180,15 +180,17 @@ fn ta_median_and_mode_equal_bruteforce_skipping_na() {
     }
 }
 
+/// `pin:U18-ta-na-propagation` (r33a, B075): the previous `length` bars, an na never counted on
+/// either side (an na current value ranks 0); na only while fewer than `length` bars precede.
 #[test]
-fn ta_percentrank_equals_bruteforce_and_propagates_na() {
+fn ta_percentrank_equals_bruteforce_na_compares_false() {
     for holes in [false, true] {
         let xs = tape(3000, holes);
         for len in [1u32, 4, 17] {
             let l = len as usize;
             let want: Vec<f64> = (0..xs.len())
                 .map(|t| {
-                    if t < l || xs[t - l..=t].iter().any(|v| v.is_nan()) {
+                    if t < l {
                         return f64::NAN;
                     }
                     let c = xs[t - l..t].iter().filter(|&&p| p <= xs[t]).count();

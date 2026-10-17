@@ -7,8 +7,8 @@
 use crate::args::out1;
 use crate::naf::{fdiv, fmax, fmin};
 use crate::state::{
-    ewma_hold, ewma_step, winp_push, winp_repoint, AtrHdr, CmoHdr, DmiHdr, Ewma, MfiHdr, Prev,
-    TsiHdr,
+    ewma_feed, ewma_step, winp_fresh_sums, winp_push, winp_repoint, AtrHdr, CmoHdr, DmiHdr, MfiHdr,
+    Prev, Smoother, TsiHdr,
 };
 use crate::sw;
 use pine_ir::{abi, argwin, FaultKind, SiteId};
@@ -68,7 +68,8 @@ pub fn bi_ta_tr_var(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(),
     Ok(())
 }
 
-/// `ta.atr(length)` = `rma(tr(true), length)` — window `[len, out]`; seed per `Sw::RmaSeed`.
+/// `ta.atr(length)` = `rma(tr(true), length)` — window `[len, out]`; seed per `Sw::RmaSeed`;
+/// `ta.rma`'s arithmetic and na rule (`pin:04-ewma-tv-arith`: B105 bit-exact on all 256 rows).
 pub fn bi_ta_atr(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 2 {
         return Err(FaultKind::Internal);
@@ -85,11 +86,7 @@ pub fn bi_ta_atr(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), Fa
     let out = {
         let s = f.state::<AtrHdr>(site);
         let tr = tr_step(&mut s.prev, h, l, c, true);
-        if tr.is_nan() {
-            ewma_hold(&s.ew)
-        } else {
-            ewma_step(&mut s.ew, tr, 1.0 / len as f64, len as u32, sma)
-        }
+        ewma_feed(&mut s.ew, tr, len as u32, Smoother::Rma, sma)
     };
     f.set_f64_arg(args[1], out);
     Ok(())
@@ -122,7 +119,13 @@ fn rsi_of(up: f64, dn: f64) -> f64 {
 }
 
 /// `ta.rsi(source, length)` — window `[src, len, out]`: Wilder smoothing of the gains and losses
-/// (seed per `Sw::RmaSeed`); `skip` na holds the value.
+/// (seed per `Sw::RmaSeed`, `pin:04-ewma-tv-arith`).
+///
+/// `pin:U18-ta-na-propagation` (r33a verdict, CI-014, TV right): the manual's `u = max(x − x[1],
+/// 0)`, `d = max(x[1] − x, 0)` with `x[1]` the previous execution's source, na included — an na
+/// source, or the execution after one, gives an na change: the output is na and neither `rma`
+/// moves. B052 / B054 (column 2) bit-exact on all 128 tail rows; the change against the last
+/// non-na source misses 115.
 pub fn bi_ta_rsi(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 3 {
         return Err(FaultKind::Internal);
@@ -133,19 +136,16 @@ pub fn bi_ta_rsi(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), Fa
         return Ok(());
     };
     let sma = sw::pick(RMA_SEED, f.dialect()) == swr::RMA_SEED_SMA;
-    let out = if src.is_nan() {
-        let s = f.state_ro::<crate::state::RsiHdr>(site);
-        rsi_of(ewma_hold(&s.up), ewma_hold(&s.dn))
-    } else {
+    let out = {
         let s = f.state::<crate::state::RsiHdr>(site);
         let primed = s.prev.primed != 0;
         let d = src - s.prev.v;
         s.prev.v = src;
         s.prev.primed = 1;
-        if primed {
-            let a = 1.0 / len as f64;
-            let u = ewma_step(&mut s.up, if d > 0.0 { d } else { 0.0 }, a, len, sma);
-            let w = ewma_step(&mut s.dn, if d < 0.0 { -d } else { 0.0 }, a, len, sma);
+        if primed && !d.is_nan() {
+            let k = Smoother::Rma;
+            let u = ewma_step(&mut s.up, if d > 0.0 { d } else { 0.0 }, len, k, sma);
+            let w = ewma_step(&mut s.dn, if d < 0.0 { -d } else { 0.0 }, len, k, sma);
             rsi_of(u, w)
         } else {
             f64::NAN
@@ -157,7 +157,9 @@ pub fn bi_ta_rsi(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), Fa
 
 /// `ta.macd(source, fastlen, slowlen, siglen) -> (macd, signal, hist)` — window
 /// `[src, fast, slow, sig, macd, signal, hist]`; the signal is the EMA of the macd line; seeds per
-/// `Sw::EmaSeed`; `skip` na holds every output.
+/// `Sw::EmaSeed`; `ta.ema`'s arithmetic and na rule throughout (`pin:04-ewma-tv-arith`,
+/// `pin:U18-ta-na-propagation`): an na source gives na outputs and moves nothing, an na macd line
+/// (warm-up) is not fed to the signal. B043–B048 bit-exact on every captured row.
 pub fn bi_ta_macd(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 7 {
         return Err(FaultKind::Internal);
@@ -178,19 +180,14 @@ pub fn bi_ta_macd(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), F
     };
     let sma = sw::pick(EMA_SEED, f.dialect()) == swr::EMA_SEED_SMA;
     let (m, g) = if src.is_nan() {
-        let s = f.state_ro::<crate::state::MacdHdr>(site);
-        (ewma_hold(&s.fast) - ewma_hold(&s.slow), ewma_hold(&s.sig))
+        (f64::NAN, f64::NAN)
     } else {
         let s = f.state::<crate::state::MacdHdr>(site);
-        let a = ewma_step(&mut s.fast, src, 2.0 / (fl as f64 + 1.0), fl, sma);
-        let b = ewma_step(&mut s.slow, src, 2.0 / (sl as f64 + 1.0), sl, sma);
+        let k = Smoother::Ema;
+        let a = ewma_step(&mut s.fast, src, fl, k, sma);
+        let b = ewma_step(&mut s.slow, src, sl, k, sma);
         let m = a - b;
-        let g = if m.is_nan() {
-            ewma_hold(&s.sig)
-        } else {
-            ewma_step(&mut s.sig, m, 2.0 / (gl as f64 + 1.0), gl, sma)
-        };
-        (m, g)
+        (m, ewma_feed(&mut s.sig, m, gl, k, sma))
     };
     f.set_f64_arg(args[4], m);
     f.set_f64_arg(args[5], g);
@@ -201,7 +198,10 @@ pub fn bi_ta_macd(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), F
 const KC_BASIS: [u8; 2] = sw::both(Sw::KcBasis);
 
 /// The Keltner step shared by `ta.kc` and `ta.kcw`: `(mid, up, lo)` over
-/// `[src, len, mult, useTrueRange, …]`; `skip` na holds the value.
+/// `[src, len, mult, useTrueRange, …]` — the manual's `basis = ta.ema(src, len)` and
+/// `ta.ema(span, len)` (or `ta.rma`, `Sw::KcBasis`) as two independent smoothers with their own
+/// arithmetic and na rule (`pin:04-ewma-tv-arith`, `pin:U18-ta-na-propagation`): an na source
+/// makes the basis (and both bands) na while the span's smoother still moves.
 fn kc(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(f64, f64, f64), FaultKind> {
     let src = f.f64_arg(args[0]);
     let mult = f.f64_arg(args[2]);
@@ -218,25 +218,20 @@ fn kc(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(f64, f64, f64), 
         ema_sma
     };
     let (h, l, c) = hlc(f);
-    let (mid, band) = if src.is_nan() {
-        let s = f.state_ro::<crate::state::KcHdr>(site);
-        (ewma_hold(&s.mid), ewma_hold(&s.band))
-    } else {
+    let (mid, band) = {
         let s = f.state::<crate::state::KcHdr>(site);
-        let a = 2.0 / (len as f64 + 1.0);
-        let mid = ewma_step(&mut s.mid, src, a, len, ema_sma);
+        let mid = ewma_feed(&mut s.mid, src, len, Smoother::Ema, ema_sma);
         let span = if use_tr {
             tr_step(&mut s.prev, h, l, c, false)
         } else {
             h - l
         };
-        let ab = if rma_band { 1.0 / len as f64 } else { a };
-        let band = if span.is_nan() {
-            ewma_hold(&s.band)
+        let kb = if rma_band {
+            Smoother::Rma
         } else {
-            ewma_step(&mut s.band, span, ab, len, band_sma)
+            Smoother::Ema
         };
-        (mid, band)
+        (mid, ewma_feed(&mut s.band, span, len, kb, band_sma))
     };
     Ok((mid, mult.mul_add(band, mid), (-mult).mul_add(band, mid)))
 }
@@ -284,11 +279,7 @@ pub fn bi_ta_supertrend(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result
         let s = f.state::<crate::state::StHdr>(site);
         let atr_was_na = s.atr.ew.seeded == 0;
         let tr = tr_step(&mut s.atr.prev, h, l, c, true);
-        let atr = if tr.is_nan() {
-            ewma_hold(&s.atr.ew)
-        } else {
-            ewma_step(&mut s.atr.ew, tr, 1.0 / len as f64, len, sma)
-        };
+        let atr = ewma_feed(&mut s.atr.ew, tr, len, Smoother::Rma, sma);
         let src = (h + l) / 2.0;
         let (mut up, mut dn) = (factor.mul_add(atr, src), (-factor).mul_add(atr, src));
         let (pu, pd) = (s.up, s.dn); // nz(): a stored na is kept as 0
@@ -463,7 +454,7 @@ fn change_pairs(
     if h.win.n < len {
         None
     } else {
-        Some((h.win.sum, h.win.sum2))
+        Some(winp_fresh_sums(&h.win, ring, len))
     }
 }
 
@@ -539,8 +530,11 @@ pub fn bi_ta_mfi(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), Fa
 /// `ta.tsi(source, short_length, long_length)` — window `[src, short, long, out]`: with
 /// `m = ta.change(src)`, `ema(ema(m, long), short) / ema(ema(|m|, long), short)` — the long
 /// smoothing first, as TradingView's TSI's `double_smooth`, and no `× 100` (the manual's range is
-/// [−1, 1]) (`pin:04-tsi-order`); seeds per `Sw::EmaSeed`; ÷0 per `Sw::FloatDivZero`. `skip` na:
-/// every smoother holds; the first accepted execution has no change.
+/// [−1, 1]) (`pin:04-tsi-order`); seeds per `Sw::EmaSeed`; ÷0 per `Sw::FloatDivZero`. `ta.ema`'s
+/// arithmetic and na rule (`pin:04-ewma-tv-arith`, `pin:U18-ta-na-propagation`): `m = src −
+/// src[1]` against the previous execution's source, na included (as `ta.rsi`'s change, B052); an
+/// na `m` (the first execution, an na source or the one after it, `∞ − ∞`) or an na inner EMA is
+/// not fed and the output is na. B101 bit-exact on all 128 rows.
 pub fn bi_ta_tsi(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 4 {
         return Err(FaultKind::Internal);
@@ -558,45 +552,33 @@ pub fn bi_ta_tsi(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), Fa
         let s = f.state::<TsiHdr>(site);
         // `src − prev` is na when either is na, and also when both are the same infinity (IEEE
         // ∞ − ∞); an na change is not fed to the smoothers (`pin:04-ta-composed`), as `macd`'s `m`.
-        let m = src - s.prev.v;
-        if s.prev.primed != 0 && !m.is_nan() {
-            let (al, as_) = (2.0 / (ll as f64 + 1.0), 2.0 / (sl as f64 + 1.0));
-            let m1 = ewma_step(&mut s.m1, m, al, ll, sma);
-            if !m1.is_nan() {
-                ewma_step(&mut s.m2, m1, as_, sl, sma);
-            }
-            let a1 = ewma_step(&mut s.a1, m.abs(), al, ll, sma);
-            if !a1.is_nan() {
-                ewma_step(&mut s.a2, a1, as_, sl, sma);
-            }
-        }
-        if !src.is_nan() {
-            s.prev.v = src;
-            s.prev.primed = 1;
-        }
-        (ewma_hold(&s.m2), ewma_hold(&s.a2))
+        let m = if s.prev.primed != 0 {
+            src - s.prev.v
+        } else {
+            f64::NAN
+        };
+        s.prev.v = src;
+        s.prev.primed = 1;
+        let k = Smoother::Ema;
+        let m1 = ewma_feed(&mut s.m1, m, ll, k, sma);
+        let m2 = ewma_feed(&mut s.m2, m1, sl, k, sma);
+        let a1 = ewma_feed(&mut s.a1, m.abs(), ll, k, sma);
+        let a2 = ewma_feed(&mut s.a2, a1, sl, k, sma);
+        (m2, a2)
     };
     f.set_f64_arg(args[3], fdiv(num, den, na0));
     Ok(())
-}
-
-/// Feed a non-na `v` to a Wilder smoother (`rma` is `skip`: an na is not fed, the value holds).
-#[inline(always)]
-fn rma_feed(e: &mut Ewma, v: f64, len: u32, sma: bool) -> f64 {
-    if v.is_nan() {
-        ewma_hold(e)
-    } else {
-        ewma_step(e, v, 1.0 / len as f64, len, sma)
-    }
 }
 
 /// `ta.dmi(diLength, adxSmoothing) -> (+DI, −DI, ADX)` — window `[diLen, adxLen, +di, −di,
 /// adx]`, the §4.13.7 row literally: `up = high − high[1]`, `down = low[1] − low`;
 /// `+DM = up > down && up > 0 ? up : 0`, `−DM = down > up && down > 0 ? down : 0`; `TR` = the
 /// `ta.tr` variable; each smoothed by `rma(·, diLen)` (seed per `Sw::RmaSeed`);
-/// `±DI = 100 × rma(±DM) / rma(TR)`; `DX = 100 × |+DI − −DI| / (+DI + −DI)`;
-/// `ADX = rma(DX, adxLen)`; each `/` per `Sw::FloatDivZero`. History is the site's previous
-/// execution; an na term is not fed to its `rma` (the inner rows' own rule, `pin:04-ta-composed`).
+/// `±DI = 100 × rma(±DM) / rma(TR)` (each `/` per `Sw::FloatDivZero`); `ADX = 100 ×
+/// rma(|+DI − −DI| / (sum == 0 ? 1 : sum), adxLen)` with `sum = +DI + −DI` — the manual's order
+/// (`pin:04-dmi-adx-order`, r33a: B106 column 3 bit-exact on all 256 rows; `rma(100 × |…| / sum)`
+/// misses 190). History is the site's previous execution; every `rma` has `ta.rma`'s arithmetic
+/// and na rule (`pin:04-ewma-tv-arith`; an na term is not fed and gives na, `pin:04-ta-composed`).
 pub fn bi_ta_dmi(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 5 {
         return Err(FaultKind::Internal);
@@ -642,13 +624,15 @@ pub fn bi_ta_dmi(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), Fa
         s.l1 = l;
         s.c1 = c;
         s.primed = 1;
-        let t = rma_feed(&mut s.tr, tr, dl, sma);
-        let p = rma_feed(&mut s.p, pdm, dl, sma);
-        let m = rma_feed(&mut s.m, mdm, dl, sma);
+        let k = Smoother::Rma;
+        let t = ewma_feed(&mut s.tr, tr, dl, k, sma);
+        let p = ewma_feed(&mut s.p, pdm, dl, k, sma);
+        let m = ewma_feed(&mut s.m, mdm, dl, k, sma);
         let pdi = fdiv(100.0 * p, t, na0);
         let mdi = fdiv(100.0 * m, t, na0);
-        let dx = fdiv(100.0 * (pdi - mdi).abs(), pdi + mdi, na0);
-        let adx = rma_feed(&mut s.adx, dx, al, sma);
+        let sum = pdi + mdi;
+        let q = (pdi - mdi).abs() / if sum == 0.0 { 1.0 } else { sum };
+        let adx = 100.0 * ewma_feed(&mut s.adx, q, al, k, sma);
         (pdi, mdi, adx)
     };
     f.set_f64_arg(args[2], pdi);

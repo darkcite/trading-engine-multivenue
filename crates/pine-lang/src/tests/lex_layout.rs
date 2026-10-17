@@ -109,8 +109,9 @@ fn layout_token_table() {
             "Ident Eq Ident Plus Newline Indent Ident Newline Dedent Eof",
             &[],
         ),
-        // 15. an indented first line (R2)
-        ("  x = 1\n", V6, "Ident Eq Int Newline Eof", &[1008]),
+        // 15. an indented first line: no line is open, so it starts a statement
+        //     (pin:01-first-line-indent — TradingView accepts Z014; R2 read literally was 1008)
+        ("  x = 1\n", V6, "Ident Eq Int Newline Eof", &[]),
         // 16. a block at 8 spaces (1009), then column 4 stays in it, then column 0 closes it
         (
             "if a\n        x\n    y\n    w\nz\n",
@@ -126,12 +127,13 @@ fn layout_token_table() {
             "If Ident Newline Indent Ident Newline Dedent Eof",
             &[],
         ),
-        // 18. a mixed tab/space line on a real block column (pin:01-mixed-indent)
+        // 18. a mixed tab/space line on a real block column, a tab one level
+        //     (pin:01-mixed-indent `TabIsUnit` — TradingView accepts Z001)
         (
             "if a\n    if b\n\t    x\n",
             V6,
             "If Ident Newline Indent If Ident Newline Indent Ident Newline Dedent Dedent Eof",
-            &[1006],
+            &[],
         ),
         // 19. EOF inside a block
         (

@@ -288,7 +288,7 @@ fn literals_parse_to_values() {
     assert_eq!(sx("#FF0000"), "#ff0000None");
     assert_eq!(sx("#ff0000a0"), "#ff0000Some(160)");
     assert_eq!(sx("true or false"), "(or true false)");
-    assert_eq!(sx("'a\\qb'"), "\"a\\\\qb\"");
+    assert_eq!(sx("'a\\qb'"), "\"aqb\"");
 }
 
 #[test]

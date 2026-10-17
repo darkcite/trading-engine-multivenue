@@ -292,9 +292,14 @@ pub fn bi_ta_mode(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), F
 }
 
 /// `ta.percentrank(source, length)` = `100 × #(previous length values ≤ current) / length`
-/// (§4.13.6; warm-up `W(len + 1)`). `propagate`: a na current value or a na among the previous
-/// `length` values yields na. The ring (`cap ≥ length`) holds the previous values when the current
-/// one is ranked, then takes it.
+/// (§4.13.6). The ring (`cap ≥ length`) holds the previous values when the current one is ranked,
+/// then takes it.
+///
+/// `pin:U18-ta-na-propagation` (r33a verdict, CI-014, TV right): the window is the previous
+/// `length` bars, na included, and an na takes part in the count as Pine compares — `false` on
+/// either side: an na among the previous values is never counted, an na current value counts 0
+/// (the output is 0, not na). The output is na only while fewer than `length` previous bars
+/// exist. B075 bit-exact on all 128 rows; `propagate` (an na in the window → na) misses 85.
 pub fn bi_ta_percentrank(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 3 {
         return Err(FaultKind::Internal);
@@ -314,12 +319,13 @@ pub fn bi_ta_percentrank(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Resul
         if h.len != len {
             win_repoint(h, ring, len);
         }
-        let v = if src.is_nan() || h.n < len || h.na_in != 0 {
+        let v = if h.n < len {
             f64::NAN
         } else {
             let mut c = 0u32;
             let mut k = 0u32;
             while k < len {
+                // NaN on either side compares false: an na is never counted.
                 c += (win_at(h, ring, k) <= src) as u32;
                 k += 1;
             }

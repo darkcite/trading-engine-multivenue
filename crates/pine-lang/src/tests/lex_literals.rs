@@ -62,22 +62,13 @@ fn literal_table() {
         ("\"a\\\\b\"", V6, "Str Newline Eof", &[], Some("a\\b")),
         ("\"a\\\"b\"", V6, "Str Newline Eof", &[], Some("a\"b")),
         ("'a\\'b'", V6, "Str Newline Eof", &[], Some("a'b")),
-        ("\"a\\qb\"", V6, "Str Newline Eof", &[], Some("a\\qb")),
+        // pin:01-unknown-escape `DropBackslash` (Z017: TradingView's length is 3).
+        ("\"a\\qb\"", V6, "Str Newline Eof", &[], Some("aqb")),
         ("\"abc", V6, "Error Newline Eof", &[1001], None),
-        (
-            "\"abc\nx",
-            V6,
-            "Error Newline Ident Newline Eof",
-            &[1001],
-            None,
-        ),
-        (
-            "\"a\\\nx",
-            V6,
-            "Error Newline Ident Newline Eof",
-            &[1001],
-            None,
-        ),
+        // pin:01-string-line-wrap (Z006): a single-line string may wrap, so an unclosed one runs
+        // to the end of the file.
+        ("\"abc\nx", V6, "Error Newline Eof", &[1001], None),
+        ("\"a\\\nx", V6, "Error Newline Eof", &[1001], None),
         (
             "\"\"\"\nline1\r\n  line2\n\"\"\"",
             V6,
@@ -85,12 +76,13 @@ fn literal_table() {
             &[],
             Some("\nline1\n  line2\n"),
         ),
+        // pin:01-multiline-string-value `Verbatim` (Z018: the closing indentation is kept).
         (
             "'''\n  a\n  '''",
             V6,
             "Str Newline Eof",
             &[],
-            Some("\n  a\n"),
+            Some("\n  a\n  "),
         ),
         (
             "\"\"\"a\\tb\"\"\"",

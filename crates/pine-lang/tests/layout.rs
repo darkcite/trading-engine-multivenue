@@ -24,7 +24,7 @@ fn printed(v: u8, body: &str) -> Result<String, Vec<u16>> {
 
 #[test]
 fn layout_membership_table() {
-    let ok: [(u8, &str, &str); 14] = [
+    let ok: [(u8, &str, &str); 16] = [
         (
             6,
             "if c\n    x := 1\ny := 2\n",
@@ -67,16 +67,22 @@ fn layout_membership_table() {
         ),
         (6, "f(x) =>\n    x + 1\n", "f(x) =>\n    (x + 1)\n"),
         (6, "x = a +\n // c\n  b\n", "x = (a + b)\n"),
+        // pin:01-first-line-indent (TradingView accepts Z014): an indented first line.
+        (6, "  x = 1\n", "x = 1\n"),
+        // pin:01-mixed-indent `TabIsUnit` (TradingView accepts Z001): a tab is one level.
+        (
+            6,
+            "if a\n    if b\n\t    x := 1\n",
+            "if a\n    if b\n        x := 1\n",
+        ),
     ];
     for (v, src, want) in ok {
         assert_eq!(printed(v, src), Ok(want.to_string()), "{src:?}");
     }
-    let refused: [(u8, &str, &[u16]); 6] = [
+    let refused: [(u8, &str, &[u16]); 4] = [
         (5, "x = f(a,\n    b)\n", &[2104]),
         (6, "x = a +\n    b\n", &[1008]),
-        (6, "  x = 1\n", &[1008]),
         (6, "if a\n        x := 1\n    y := 2\n", &[1009]),
-        (6, "if a\n    if b\n\t    x := 1\n", &[1006]),
         (6, "x = 1\n    y = 2\n    z = 3\n", &[1008]),
     ];
     for (v, src, want) in refused {

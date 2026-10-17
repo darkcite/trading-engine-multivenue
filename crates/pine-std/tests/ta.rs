@@ -1111,21 +1111,28 @@ fn ta_vwma_is_the_pair_window() {
     assert!(got[311].is_nan());
 }
 
-/// The manual's `pine_alma` at bar `i` (na while fewer than `len` values exist or any is na).
+/// The manual's `pine_alma` at bar `i` in TradingView's order (`pin:04-alma-tv-order`: the
+/// weights normalised first, `Σ x·(w / norm)` oldest first); na while fewer than `len` values exist
+/// or any is na.
 fn pine_alma(x: &[f64], i: usize, len: usize, offset: f64, sigma: f64, floor: bool) -> f64 {
     let m = offset * (len - 1) as f64;
     let m = if floor { m.floor() } else { m };
     let s = len as f64 / sigma;
-    let (mut norm, mut sum) = (0.0f64, 0.0f64);
+    let mut norm = 0.0f64;
+    let mut ws = Vec::new();
     for k in 0..len {
         let d = k as f64 - m;
         let weight = (-(d * d) / (2.0 * (s * s))).exp();
         norm += weight;
+        ws.push(weight);
+    }
+    let mut sum = 0.0f64;
+    for (k, w) in ws.iter().enumerate() {
         let back = len - k - 1;
         let v = if i >= back { x[i - back] } else { f64::NAN };
-        sum += v * weight;
+        sum += v * (w / norm);
     }
-    sum / norm
+    sum
 }
 
 /// I26: the fixed-weight windows recomputed from the values equal the emitted value bit for bit.
@@ -1167,7 +1174,7 @@ fn fixed_weight_windows_are_recompute_exact() {
         }
         assert!(got[700].is_nan() && got[700 + len - 1].is_nan() && !got[700 + len].is_nan());
     }
-    // ta.wma: newest-first fused dot with weights len − k.
+    // ta.wma: weights len − k, the products summed oldest first, unfused (`pin:04-wma-tv-order`).
     for len in [1usize, 7, 30] {
         let got = col(
             &run_x(
@@ -1182,14 +1189,15 @@ fn fixed_weight_windows_are_recompute_exact() {
         );
         for i in len - 1..c.len() {
             let mut acc = 0.0f64;
-            for k in 0..len {
-                acc = c[i - k].mul_add((len - k) as f64, acc);
+            for k in (0..len).rev() {
+                acc += c[i - k] * (len - k) as f64;
             }
             let want = acc / (len as f64 * (len as f64 + 1.0) / 2.0);
             assert_eq!(got[i].to_bits(), want.to_bits(), "wma {len} {i}");
         }
     }
-    // ta.cog: `−num / sum`, both from one newest-first pass (pine_cog, unfused).
+    // ta.cog: `−num / sum`, `num` newest first unfused, `sum` the Neumaier `math.sum`
+    // (`pin:04-cog-tv-order`).
     for len in [1usize, 10] {
         let got = col(
             &run_x(
@@ -1203,21 +1211,32 @@ fn fixed_weight_windows_are_recompute_exact() {
             0,
         );
         for i in len - 1..c.len() {
-            let (mut num, mut sum) = (0.0f64, 0.0f64);
+            let (mut num, mut sum) = (0.0f64, (0.0f64, 0.0f64));
             for k in 0..len {
                 num += c[i - k] * (k + 1) as f64;
-                sum += c[i - k];
             }
+            for k in (0..len).rev() {
+                let (s, e, x) = (sum.0, sum.1, c[i - k]);
+                let t = s + x;
+                let e = e + if s.abs() >= x.abs() {
+                    (s - t) + x
+                } else {
+                    (x - t) + s
+                };
+                sum = (t, e);
+            }
+            let sum = sum.0 + sum.1;
             assert_eq!(got[i].to_bits(), (-num / sum).to_bits(), "cog {len} {i}");
         }
     }
-    // ta.swma.
+    // ta.swma (`pin:04-swma-tv-order`).
     let got = col(&run_x(ov::TA_SWMA, &[FEED], &[Lane::F64], 0, &b, 0), 0);
     for i in 3..c.len() {
-        let want = (c[i] + c[i - 3]) / 6.0 + (c[i - 1] + c[i - 2]) * (2.0 / 6.0);
+        let want = (c[i] + 2.0 * c[i - 1] + 2.0 * c[i - 2] + c[i - 3]) / 6.0;
         assert_eq!(got[i].to_bits(), want.to_bits(), "swma {i}");
     }
-    // ta.linreg: Σxy fused newest first against the cached x column, the closed forms.
+    // ta.linreg: TradingView's `x = 1..=len` oldest first, every sum oldest first, unfused
+    // (`pin:04-linreg-tv-order`) — bit for bit.
     for (len, off) in [(10usize, 0i64), (25, 3)] {
         let ins = [FEED, iconst(len as i64), iconst(off)];
         let got = col(
@@ -1226,22 +1245,18 @@ fn fixed_weight_windows_are_recompute_exact() {
         );
         for i in 2 * len..c.len() {
             let n = len as f64;
-            let sx = n * (n - 1.0) / 2.0;
-            let sxx = (n - 1.0) * n * (2.0 * n - 1.0) / 6.0;
-            let mut sxy = 0.0f64;
-            for k in 0..len {
-                sxy = c[i - k].mul_add((len - 1 - k) as f64, sxy);
+            let (mut sx, mut sy, mut sxx, mut sxy) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for j in 0..len {
+                let (x, y) = ((j + 1) as f64, c[i + 1 - len + j]);
+                sx += x;
+                sy += y;
+                sxx += x * x;
+                sxy += x * y;
             }
-            // The rolling Σy is the body's own (I27 bounds it); recompute it exactly and require
-            // agreement to a few ulps, the dot product bit for bit through `sxy`.
-            let sy: f64 = (0..len).map(|k| c[i - k]).sum();
             let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
-            let icept = (sy - slope * sx) / n;
-            let want = slope.mul_add(n - 1.0 - off as f64, icept);
-            assert!(
-                (got[i] - want).abs() <= want.abs() * 1e-12,
-                "linreg {len} {i}"
-            );
+            let icept = sy / n - slope * sx / n + slope;
+            let want = icept + slope * (n - 1.0 - off as f64);
+            assert_eq!(got[i].to_bits(), want.to_bits(), "linreg {len} {i}");
         }
     }
 }
@@ -1384,22 +1399,38 @@ fn oscillator_windows_match_reference() {
     );
 }
 
-/// A recursive smoother over a series with na holes (skip: hold), seeded per `sma_seed`.
-fn sm_ref(xs: &[f64], len: usize, alpha: f64, sma_seed: bool) -> Vec<f64> {
-    let (mut v, mut acc, mut n) = (f64::NAN, 0.0f64, 0usize);
+/// TradingView's `ta.ema` (`rma == false`) / `ta.rma` over a series with na holes
+/// (`pin:04-ewma-tv-arith`, `pin:U18-ta-na-propagation`): `v + α·(x − v)` with `α = 2/(len + 1)`
+/// unfused, or `(v·(len − 1) + x) / len`; the SMA seed is the Neumaier sum of the first `len`
+/// values; an na `x` prints na and leaves the state.
+fn sm_ref(xs: &[f64], len: usize, rma: bool, sma_seed: bool) -> Vec<f64> {
+    let (mut v, mut acc, mut n) = (f64::NAN, (0.0f64, 0.0f64), 0usize);
     let mut out = Vec::new();
     for &x in xs {
-        if !x.is_nan() {
-            n += 1;
-            if !v.is_nan() {
-                v = alpha.mul_add(x - v, v);
-            } else if !sma_seed {
-                v = x;
+        if x.is_nan() {
+            out.push(f64::NAN);
+            continue;
+        }
+        n += 1;
+        if !v.is_nan() {
+            v = if rma {
+                (v * (len - 1) as f64 + x) / len as f64
             } else {
-                acc += x;
-                if n >= len {
-                    v = acc / len as f64;
-                }
+                v + 2.0 / (len as f64 + 1.0) * (x - v)
+            };
+        } else if !sma_seed {
+            v = x;
+        } else {
+            let (s, c) = acc;
+            let t = s + x;
+            let c = c + if s.abs() >= x.abs() {
+                (s - t) + x
+            } else {
+                (x - t) + s
+            };
+            acc = (t, c);
+            if n >= len {
+                v = (acc.0 + acc.1) / len as f64;
             }
         }
         out.push(v);
@@ -1476,9 +1507,8 @@ fn oscillator_smoothers_match_reference() {
         .map(|i| if i == 0 { f64::NAN } else { c[i] - c[i - 1] })
         .collect();
     let am: Vec<f64> = m.iter().map(|x| x.abs()).collect();
-    let (al, as_) = (2.0 / 26.0, 2.0 / 14.0);
-    let num = sm_ref(&sm_ref(&m, 25, al, ema_sma), 13, as_, ema_sma);
-    let den = sm_ref(&sm_ref(&am, 25, al, ema_sma), 13, as_, ema_sma);
+    let num = sm_ref(&sm_ref(&m, 25, false, ema_sma), 13, false, ema_sma);
+    let den = sm_ref(&sm_ref(&am, 25, false, ema_sma), 13, false, ema_sma);
     for i in 0..c.len() {
         let want = num[i] / den[i];
         assert!(
@@ -1509,15 +1539,22 @@ fn oscillator_smoothers_match_reference() {
         let mx = |a: f64, b: f64| if a >= b { a } else { b };
         tr[i] = mx(mx(h - l, (h - c1).abs()), (l - c1).abs());
     }
-    let t = sm_ref(&tr, 14, 1.0 / 14.0, rma_sma);
-    let p = sm_ref(&pdm, 14, 1.0 / 14.0, rma_sma);
-    let q = sm_ref(&mdm, 14, 1.0 / 14.0, rma_sma);
+    let t = sm_ref(&tr, 14, true, rma_sma);
+    let p = sm_ref(&pdm, 14, true, rma_sma);
+    let q = sm_ref(&mdm, 14, true, rma_sma);
     let pdi: Vec<f64> = (0..n).map(|i| 100.0 * p[i] / t[i]).collect();
     let mdi: Vec<f64> = (0..n).map(|i| 100.0 * q[i] / t[i]).collect();
+    // `pin:04-dmi-adx-order`: `100 × rma(|+DI − −DI| / (sum == 0 ? 1 : sum))`.
     let dx: Vec<f64> = (0..n)
-        .map(|i| 100.0 * (pdi[i] - mdi[i]).abs() / (pdi[i] + mdi[i]))
+        .map(|i| {
+            let sum = pdi[i] + mdi[i];
+            (pdi[i] - mdi[i]).abs() / if sum == 0.0 { 1.0 } else { sum }
+        })
         .collect();
-    let adx = sm_ref(&dx, 10, 0.1, rma_sma);
+    let adx: Vec<f64> = sm_ref(&dx, 10, true, rma_sma)
+        .iter()
+        .map(|x| 100.0 * x)
+        .collect();
     for i in 0..n {
         assert!(
             bits_eq(&r[i], &[pdi[i], mdi[i], adx[i]]),
@@ -1823,7 +1860,8 @@ fn pivot_window_is_left_plus_right_plus_one() {
 }
 
 /// I6 — a stateful site skipped by a false branch produces, on its next execution, exactly what
-/// it would have without the skipped bars.
+/// it would have without the skipped bars; the bar-indexed rows (`ta.wma`, `ta.change`,
+/// `pin:06-cond-call-state`) instead see each skipped bar as a repeat of the last executed value.
 #[test]
 fn conditional_site_does_not_advance() {
     let b = bx_tape(400);
@@ -1837,10 +1875,9 @@ fn conditional_site_does_not_advance() {
     let bk: Vec<Bx> = kept.iter().map(|&i| b[i]).collect();
     let fk: Vec<Vec<f64>> = kept.iter().map(|&i| feed[i].clone()).collect();
     let src = fcol(0, Lane::F64);
-    let rows: [(OverloadId, Vec<(Lane, Src)>, Lane, u32); 12] = [
+    let rows: [(OverloadId, Vec<(Lane, Src)>, Lane, u32); 11] = [
         (ov::TA_SMA, vec![src, iconst(9)], Lane::F64, 9),
         (ov::TA_EMA, vec![src, iconst(9)], Lane::F64, 0),
-        (ov::TA_HMA, vec![src, iconst(9)], Lane::F64, 9),
         (ov::TA_VWMA, vec![src, iconst(9)], Lane::F64, 9),
         (
             ov::TA_ALMA,
@@ -1866,6 +1903,32 @@ fn conditional_site_does_not_advance() {
         let sub = col(&run_feed(*id, ins, &[*lane], *len, &bk, &fk, None), 0);
         for (j, &i) in kept.iter().enumerate() {
             assert!(bits_eq(&[all[i]], &[sub[j]]), "{id:?} bar {i}");
+        }
+    }
+    // Bar-indexed: the guarded site equals an every-bar site whose skipped bars repeat the last
+    // executed source (B023 / B041's law).
+    let mut last = f64::NAN;
+    let carried: Vec<Vec<f64>> = feed
+        .iter()
+        .map(|r| {
+            if r[1] != 0.0 {
+                last = r[0];
+            }
+            vec![last, 1.0]
+        })
+        .collect();
+    for (id, len) in [(ov::TA_WMA, 9u32), (ov::TA_CHANGE_F, 9)] {
+        let ins = [src, iconst(len as i64)];
+        let all = col(
+            &run_feed(id, &ins, &[Lane::F64], len, &b, &feed, Some(1)),
+            0,
+        );
+        let car = col(
+            &run_feed(id, &ins, &[Lane::F64], len, &b, &carried, None),
+            0,
+        );
+        for &i in &kept {
+            assert!(bits_eq(&[all[i]], &[car[i]]), "{id:?} bar {i}");
         }
     }
 }

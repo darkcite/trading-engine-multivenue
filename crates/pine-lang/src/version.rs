@@ -283,9 +283,13 @@ mod tests {
             version_of("//@version=", f),
             VersionProbe::Malformed { .. }
         ));
+        // pin:01-version-form: spaced forms are accepted (Z007).
         assert!(matches!(
             version_of("//@version = 6", f),
-            VersionProbe::Malformed { .. }
+            VersionProbe::Supported {
+                dialect: Dialect::V6,
+                ..
+            }
         ));
         assert!(matches!(
             version_of("//@version=6x", f),
@@ -295,9 +299,13 @@ mod tests {
             version_of("//@version=6  \t", f),
             VersionProbe::Supported { .. }
         ));
+        // pin:01-version-conflict: not refused, the first annotation decides (Z008).
         assert!(matches!(
             version_of("//@version=5\n//@version=6", f),
-            VersionProbe::Conflict { .. }
+            VersionProbe::Supported {
+                dialect: Dialect::V5,
+                ..
+            }
         ));
         assert!(matches!(
             version_of("//@version=6\n//@version=6", f),

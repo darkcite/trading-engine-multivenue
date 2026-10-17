@@ -24,8 +24,9 @@ pub struct WinHdr {
     pub na_in: u32,
     /// Accepted values until the exact recompute (§4.5).
     pub recompute: u32,
-    /// Always zero.
-    pub _pad: u32,
+    /// A bar-indexed window's stamp: `bar_index + 1` of the last execution (0 = cold); zero in
+    /// every other window (`win_bar_gap`).
+    pub bar: u32,
 }
 const _: () = assert!(core::mem::size_of::<WinHdr>() == 40 && core::mem::align_of::<WinHdr>() == 8);
 // SAFETY: repr(C), Copy, no references, no padding read; all-zero is `len == 0`: never executed.
@@ -116,13 +117,40 @@ pub fn win_push(h: &mut WinHdr, ring: &mut [f64], v: f64) {
     }
 }
 
+/// A bar-indexed window (TradingView's `ta.wma` history) before this execution's value: the
+/// bars the site skipped since its last execution each repeat the newest value (at most `len`
+/// of them — older ones leave the window anyway), then `bar` is stamped. A cold window, or a
+/// second execution on the same bar, fills nothing.
+///
+/// `pin:06-cond-call-state` (r33a verdict, CI-016, TV right): a `ta.wma` / `ta.change` call
+/// inside a conditional indexes its history by bar, a skipped bar carrying the value of the last
+/// execution — B023 and B041 bit-exact on all 128 tail rows; the per-execution history of the
+/// recursive and accumulating rows (`ta.sma`, `ta.ema`, `ta.rma`, `ta.stdev`, `ta.highest`,
+/// `ta.rsi`, `ta.macd`: B005 B011 B017 B029 B035 B053 B047) is unchanged.
+pub fn win_bar_gap(h: &mut WinHdr, ring: &mut [f64], bar_index: i64) {
+    debug_assert!((0..u32::MAX as i64).contains(&bar_index));
+    let stamp = (bar_index + 1) as u32;
+    if h.bar != 0 && h.n > 0 && stamp > h.bar + 1 {
+        let skipped = stamp - h.bar - 1;
+        let fill = if skipped < h.len { skipped } else { h.len };
+        let v = win_at(h, ring, 0);
+        let mut k = 0u32;
+        while k < fill {
+            win_push(h, ring, v);
+            k += 1;
+        }
+    }
+    h.bar = stamp;
+}
+
 /// A recursive smoother (`ta.ema`, `ta.rma`, and inside the EMA/RMA-based `ta.*`).
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct Ewma {
-    /// The smoothed value once seeded.
+    /// The smoothed value once seeded; while an SMA seed accumulates, the Neumaier compensation
+    /// of `acc` (all-zero cold state: both 0).
     pub value: f64,
-    /// Σ of the first `len` accepted values (the SMA seed).
+    /// Σ of the first `len` accepted values (the SMA seed), Neumaier-compensated by `value`.
     pub acc: f64,
     /// Accepted values (saturating).
     pub n: u32,
@@ -133,14 +161,38 @@ const _: () = assert!(core::mem::size_of::<Ewma>() == 24 && core::mem::align_of:
 // SAFETY: repr(C) POD; all-zero is `seeded == 0`: never seeded.
 unsafe impl StateBlock for Ewma {}
 
-/// One step of `s` on a non-na `v` with weight `alpha ∈ (0, 1]`; `sma_seed` seeds with the mean of
-/// the first `len` values, else with the first value. Returns the output (na until seeded).
+/// The recurrence an [`Ewma`] runs once seeded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Smoother {
+    /// `ta.ema`: `α = 2/(len + 1)`, `value + α·(v − value)`, unfused.
+    Ema,
+    /// `ta.rma` (Wilder): `(value·(len − 1) + v) / len`.
+    Rma,
+}
+
+/// One step of `s` on a non-na `v`; `sma_seed` seeds with the mean of the first `len` values, else
+/// with the first value. Returns the output (na until seeded).
+///
+/// `pin:04-ewma-tv-arith` (r33a, CI-014 / CI-015, TV right): TradingView's arithmetic, bit-exact
+/// on every captured row of B007 B010 B012 B013 B016 B018 B043–B048 B052 B054 B061 B101 B105
+/// B106 — the EMA step is `value + α·(v − value)` with `α = 2/(len + 1)` and the product rounded
+/// (the fused form misses 16 of B012's column-1 rows, `α·v + (1 − α)·value` 106 of B007's); the
+/// RMA step is `(value·(len − 1) + v) / len` (every `α`-form misses B013 on 90+ of 128 rows); the
+/// SMA seed is the mean of the first `len` accepted values summed oldest first with Neumaier's
+/// compensation — TradingView's `ta.sma` (`pin:04-var-fresh-sum`; a plain sum misses B043 on 23
+/// rows).
 #[inline]
-pub fn ewma_step(s: &mut Ewma, v: f64, alpha: f64, len: u32, sma_seed: bool) -> f64 {
-    debug_assert!(!v.is_nan());
+pub fn ewma_step(s: &mut Ewma, v: f64, len: u32, kind: Smoother, sma_seed: bool) -> f64 {
+    debug_assert!(!v.is_nan() && len >= 1);
     s.n = s.n.saturating_add(1);
     if s.seeded != 0 {
-        s.value = alpha.mul_add(v - s.value, s.value);
+        s.value = match kind {
+            Smoother::Ema => {
+                let a = 2.0 / (len as f64 + 1.0);
+                s.value + a * (v - s.value)
+            }
+            Smoother::Rma => (s.value * (len - 1) as f64 + v) / len as f64,
+        };
         return s.value;
     }
     if !sma_seed {
@@ -148,9 +200,16 @@ pub fn ewma_step(s: &mut Ewma, v: f64, alpha: f64, len: u32, sma_seed: bool) -> 
         s.seeded = 1;
         return v;
     }
-    s.acc += v;
+    // Neumaier: `value` holds the compensation until the seed (cold: 0).
+    let t = s.acc + v;
+    s.value += if s.acc.abs() >= v.abs() {
+        (s.acc - t) + v
+    } else {
+        (v - t) + s.acc
+    };
+    s.acc = t;
     if s.n >= len {
-        s.value = s.acc / len as f64;
+        s.value = (s.acc + s.value) / len as f64;
         s.seeded = 1;
         s.value
     } else {
@@ -158,13 +217,19 @@ pub fn ewma_step(s: &mut Ewma, v: f64, alpha: f64, len: u32, sma_seed: bool) -> 
     }
 }
 
-/// The output of a cold-or-seeded smoother on an na execution (`skip`: hold the value).
+/// One execution of a smoother on `v` — TradingView's `ta.ema` / `ta.rma` na rule: an na `v`
+/// yields na and leaves the block untouched (the next value continues from the last one).
+///
+/// `pin:U18-ta-na-propagation` (r33a verdict, CI-014, TV right): the output is na on the na bar
+/// and the recurrence resumes from the held value — B010 B016 (and B012/B018 column 2, B046,
+/// B048, B052, B054) bit-exact on all 128 tail rows; holding the value as output misses the 13
+/// na rows of each, restarting the seed misses 88+.
 #[inline(always)]
-pub fn ewma_hold(s: &Ewma) -> f64 {
-    if s.seeded != 0 {
-        s.value
-    } else {
+pub fn ewma_feed(s: &mut Ewma, v: f64, len: u32, kind: Smoother, sma_seed: bool) -> f64 {
+    if v.is_nan() {
         f64::NAN
+    } else {
+        ewma_step(s, v, len, kind, sma_seed)
     }
 }
 
@@ -207,8 +272,9 @@ pub struct Seq {
     pub pos: u32,
     /// Body-specific word.
     pub aux: u32,
-    /// Always zero.
-    pub _pad: u32,
+    /// A bar-indexed sequence's stamp (`ta.change`): `bar_index + 1` of the last execution, 0 =
+    /// cold; zero in every other sequence (`seq_bar_gap`).
+    pub bar: u32,
 }
 const _: () = assert!(core::mem::size_of::<Seq>() == 16 && core::mem::align_of::<Seq>() == 4);
 // SAFETY: repr(C) POD; all-zero is `n == 0`: never executed.
@@ -236,6 +302,28 @@ pub fn seq_push_back<T: Copy>(h: &mut Seq, ring: &mut [T], v: T, k: u32) -> Opti
     } else {
         None
     }
+}
+
+/// A bar-indexed sequence (`ta.change`) before this execution's value: the bars the site skipped
+/// since its last execution each repeat the newest value (at most `ring.len()` of them), then
+/// `bar` is stamped; a cold sequence or a second execution on the same bar fills nothing
+/// (`pin:06-cond-call-state`, as `win_bar_gap`).
+pub fn seq_bar_gap<T: Copy>(h: &mut Seq, ring: &mut [T], bar_index: i64) {
+    debug_assert!((0..u32::MAX as i64).contains(&bar_index));
+    let stamp = (bar_index + 1) as u32;
+    if h.bar != 0 && stamp > h.bar + 1 {
+        if let Some(v) = seq_peek(h, ring, 0) {
+            let cap = ring.len() as u32;
+            let skipped = stamp - h.bar - 1;
+            let fill = if skipped < cap { skipped } else { cap };
+            let mut k = 0u32;
+            while k < fill {
+                let _ = seq_push_back(h, ring, v, 0);
+                k += 1;
+            }
+        }
+    }
+    h.bar = stamp;
 }
 
 /// Header of a monotonic deque (`ta.highest`, `ta.lowest`, `…bars`); the tail is `MonoCell`s.
@@ -478,7 +566,7 @@ pub struct AlmaHdr {
     pub m: f64,
     /// `s = length / sigma`.
     pub s: f64,
-    /// `Σ weights`.
+    /// `Σ` of the raw weights (the tail holds each weight `/ norm`, `pin:04-alma-tv-order`).
     pub norm: f64,
 }
 const _: () =
@@ -595,6 +683,36 @@ pub fn winp_repoint(h: &mut WinHdr, ring: &[[f64; 2]], len: u32) {
     h.sum2 = b;
     h.na_in = 0;
     h.recompute = WIN_RECOMPUTE;
+}
+
+/// Neumaier's compensated running sum: `(sum, compensation)`; the value is `sum + comp`.
+#[inline(always)]
+pub fn neumaier(acc: (f64, f64), x: f64) -> (f64, f64) {
+    let (s, c) = acc;
+    let t = s + x;
+    let c = if s.abs() >= x.abs() {
+        c + ((s - t) + x)
+    } else {
+        c + ((x - t) + s)
+    };
+    (t, c)
+}
+
+/// `(Σa, Σb)` over the newest `len` pairs (`h.n >= len`), TradingView's `math.sum`: a fresh pass
+/// each bar, oldest pair first, Neumaier-compensated (`pin:04-var-fresh-sum`; r33a: B080 `ta.cmo`
+/// bit-exact on all 128 rows, a plain fresh sum misses 31).
+pub fn winp_fresh_sums(h: &WinHdr, ring: &[[f64; 2]], len: u32) -> (f64, f64) {
+    let cap = ring.len() as u32;
+    debug_assert!(len >= 1 && len <= cap && h.n >= len);
+    let (mut a, mut b) = ((0.0f64, 0.0f64), (0.0f64, 0.0f64));
+    let mut k = len;
+    while k > 0 {
+        k -= 1;
+        let p = at2(ring, back(h, cap, k));
+        a = neumaier(a, p[0]);
+        b = neumaier(b, p[1]);
+    }
+    (a.0 + a.1, b.0 + b.1)
 }
 
 /// `win_push` over `(a, b)` pairs into `sum = Σa`, `sum2 = Σb`; accept the non-na pair.

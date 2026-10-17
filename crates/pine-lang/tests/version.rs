@@ -31,9 +31,11 @@ const TABLE: [(&str, Result<Dialect, u16>); 20] = [
     ("//@version\n", Err(2103)),
     ("//@version=\n", Err(2103)),
     ("//@version=abc\n", Err(2103)),
-    ("//@version = 6\n", Err(2103)),
+    // pin:01-version-form (TradingView accepts Z007): spaces may surround the `=`.
+    ("//@version = 6\n", Ok(Dialect::V6)),
     ("//@version=6x\n", Err(2103)),
-    ("//@version=5\n//@version=6\n", Err(2105)),
+    // pin:01-version-conflict (TradingView accepts Z008): not refused, the first decides.
+    ("//@version=5\n//@version=6\n", Ok(Dialect::V5)),
     ("//@version=6\n//@version=6\n", Ok(Dialect::V6)),
     ("//@version=6  \t\n", Ok(Dialect::V6)),
     ("", Err(3001)),

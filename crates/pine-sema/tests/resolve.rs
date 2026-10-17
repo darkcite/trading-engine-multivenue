@@ -187,8 +187,10 @@ fn resolve_fn_assigning_a_global_is_refused_by_default() {
 }
 
 #[test]
-fn resolve_user_function_named_like_builtin_is_reserved_by_default() {
-    refused("nz(float x) => x + 1\nplot(nz(1.0))\n", 3004);
+fn resolve_user_function_named_like_builtin_shadows_it_f079() {
+    // TradingView F079 (v5 and v6) accepts the declaration and plots 2: the user function
+    // replaces the built-in (pin:02-shadow-builtin = Shadow)
+    accepted("nz(float x) => x + 1\nplot(nz(1.0))\n");
     // a user method may share a built-in method's name ([methods])
     accepted("method push(array<float> a, float v) => a.size()\nplot(close)\n");
 }

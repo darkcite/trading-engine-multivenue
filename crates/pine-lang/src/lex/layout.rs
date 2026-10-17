@@ -86,7 +86,7 @@ impl Layout {
     ) -> u8 {
         // 1. Measure: a tab is one level (R1).
         let mut col = line.spaces + INDENT_UNIT_SPACES * line.tabs;
-        if line.spaces > 0 && line.tabs > 0 && pol.mixed_indent != MixedIndent::TabIsUnit {
+        if line.spaces > 0 && line.tabs > 0 && pol.mixed_indent == MixedIndent::Refuse {
             diags.at(
                 code::MIXED_INDENT,
                 self.file,
@@ -126,19 +126,23 @@ impl Layout {
             }
             return CONTINUATION;
         }
-        // 4. A non-multiple of four continues an open line (R3); else no statement may begin
-        //    with white space (R2).
+        // 4. A non-multiple of four continues an open line (R3). With no line open (the first
+        //    code line only) it continues nothing: pin:01-first-line-indent — TradingView accepts
+        //    it (Z014) and the line starts a statement at the block column; R2's literal reading
+        //    (1008) is the policy alternative.
         if !aligned {
             if self.line_open {
                 return CONTINUATION;
             }
-            diags.at(
-                code::UNEXPECTED_INDENT,
-                self.file,
-                line.lo,
-                line.ws_end,
-                "a statement cannot begin with white space here",
-            );
+            if pol.first_line_indent_refused {
+                diags.at(
+                    code::UNEXPECTED_INDENT,
+                    self.file,
+                    line.lo,
+                    line.ws_end,
+                    "a statement cannot begin with white space here",
+                );
+            }
             col = self.stack[self.top];
         }
         // 5. A multiple of four starts a statement line.

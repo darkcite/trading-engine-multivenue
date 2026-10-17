@@ -27,7 +27,7 @@ const PLANTS: [&str; 19] = [
     "if c\n    f(x) => x\n",
     "var [a, b] = f()\n",
     "v = 1.2.3\n",
-    "if a\n    if b\n\t    x = 1\n",
+    "if a\n        x = 1\n",
     "for i = 0 10\n    x = 1\n",
     "x =\n",
     "switch\n    => 1\n    => 2\n",
