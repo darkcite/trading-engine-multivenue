@@ -493,7 +493,7 @@ impl Pm15Driver {
                     ask_px: 0,
                     ask_sz: 0,
                 };
-                self.push_touch(i, none, self.last_vt[i], TICK_FLAG_STALE, ts_ns, out);
+                self.push_touch(i, none, self.last_vt[i], 0, TICK_FLAG_STALE, ts_ns, out);
                 out.counters.inc(Pm15Counter::TouchesWithdrawn);
             }
             i += 1;
@@ -729,7 +729,7 @@ impl Pm15Driver {
         }
         self.last[i] = t;
         self.last_vt[i] = self.last_vt[i].max(venue_ms);
-        self.push_touch(i, t, venue_ms, 0, ts_ns, out);
+        self.push_touch(i, t, venue_ms, venue_ms, 0, ts_ns, out);
     }
 
     /// The market socket answered our `PING`: it delivers in order, so every
@@ -745,28 +745,34 @@ impl Pm15Driver {
                 && self.fams.slot(i / 2).ticks()
             {
                 let t = self.last[i];
-                // The key of the touch re-asserted: the sequencer's newest,
-                // so it takes the next ordinal (a same-key duplicate does).
-                self.push_touch(i, t, self.last_vt[i], 0, ts_ns, out);
+                // Keyed on the touch's newest venue stamp, so it takes the
+                // next ordinal (a same-key duplicate does); stamped with no
+                // venue time — the PONG carries none, and the touch's own
+                // stamp is old by the book's quiet: judged by it, a quiet
+                // book would be called stale (PM15-5d).
+                self.push_touch(i, t, self.last_vt[i], 0, 0, ts_ns, out);
                 out.counters.inc(Pm15Counter::TouchesReasserted);
             }
             i += 1;
         }
     }
 
-    /// Stamp, sequence, capture and push leg `i`'s touch `t`; `flags` is
-    /// OR-ed with the clock's staleness verdict.
+    /// Sequence (on `key`), stamp (with `venue_ms`, 0 = none), capture and
+    /// push leg `i`'s touch `t`; `flags` is OR-ed with the clock's
+    /// staleness verdict on `venue_ms`.
+    #[allow(clippy::too_many_arguments)]
     fn push_touch<C: Capture>(
         &mut self,
         i: usize,
         t: Touch15,
+        key: u64,
         venue_ms: u64,
         flags: u8,
         ts_ns: NsTs,
         out: &mut Pm15Out<'_, C>,
     ) {
         let (s, leg) = (i / 2, (i % 2) as u32);
-        let seq = self.seq[i].next(venue_ms);
+        let seq = self.seq[i].next(key);
         out.status.note_arrival_seq(seq);
         let judged = self.market_clock.judge(venue_ms, ts_ns);
         if judged.stale {

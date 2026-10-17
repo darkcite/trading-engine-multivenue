@@ -423,8 +423,8 @@ fn a_session_lost_restarts_every_ladder_and_resubscribes_what_is_bound() {
         (a.bid_px, a.ask_px, a.ask_qty)
     );
     assert_eq!(
-        (b.ts_ns, b.venue_seq, b.is_stale()),
-        (now + 5, a.venue_seq + 1, false)
+        (b.ts_ns, b.venue_seq, b.is_stale(), b.venue_time_ms),
+        (now + 5, a.venue_seq + 1, false, 0)
     );
     assert_eq!(rig.counters.of(Pm15Counter::TouchesReasserted), 1);
     // The session drops: the touch is withdrawn — stale, both sides zero.
@@ -451,4 +451,9 @@ fn a_session_lost_restarts_every_ladder_and_resubscribes_what_is_bound() {
     // session restarted: emitted.
     d.on_market_text(book.as_bytes(), now, now, &mut rig.out());
     assert_eq!(rig.rec.ticks.len(), 4);
+    // PM15-5d: an hour on, the book still quiet — the re-assertion is not
+    // judged by the touch's old stamp.
+    d.on_market_text(b"PONG", now + 3_600_000_000_000, now, &mut rig.out());
+    assert_eq!(rig.rec.ticks.len(), 5);
+    assert!(!rig.rec.ticks[4].is_stale(), "a quiet book is not a stale one");
 }
