@@ -7,7 +7,7 @@
 //! `pin:06-csv-quoting` — RFC 4180 quoting (a field in `"`, `""` an escaped quote); the delimiter
 //! and line end come from `format.tsv`; a trailing empty line is ignored.
 
-use super::format::{ExportFormat, TimeFormat, CCY};
+use super::format::{ExportFormat, TimeFormat, TradesTimeFormat, CCY};
 use crate::dec::{parse_dec, Dec};
 use crate::fixture::{Cell, ExitCols, Summary, TradeRow};
 
@@ -123,6 +123,43 @@ pub fn parse_time(s: &str, fmt: &ExportFormat) -> Result<i64, String> {
             };
             let days = days_from_civil(n(0, 4)?, n(5, 7)?, n(8, 10)?);
             Ok(((days * 24 + n(11, 13)?) * 60 + n(14, 16)?) * 60_000 + sec * 1000)
+        }
+    }
+}
+
+/// A List of Trades `col_time` cell → UTC ms, under `trades_time_format`
+/// (`pin:06-trades-time-format`): `ymd_hm` is exactly `YYYY-MM-DD HH:MM`, a real calendar date,
+/// `HH` 00–23, `MM` 00–59, UTC (`time_zone`), no zone suffix.
+pub fn parse_trade_time(s: &str, fmt: &ExportFormat) -> Result<i64, String> {
+    let bad = || format!("bad trade time `{s}` (trades_time_format)");
+    match fmt.trades_time_format {
+        TradesTimeFormat::YmdHm => {
+            let b = s.as_bytes();
+            let shape = b.len() == 16
+                && b[4] == b'-'
+                && b[7] == b'-'
+                && b[10] == b' '
+                && b[13] == b':'
+                && b.iter()
+                    .enumerate()
+                    .all(|(i, c)| matches!(i, 4 | 7 | 10 | 13) || c.is_ascii_digit());
+            if !shape {
+                return Err(bad());
+            }
+            let n = |a: usize, z: usize| s[a..z].parse::<i64>().map_err(|_| bad());
+            let (y, m, d, hh, mm) = (n(0, 4)?, n(5, 7)?, n(8, 10)?, n(11, 13)?, n(14, 16)?);
+            let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+            let dim = match m {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                2 if leap => 29,
+                2 => 28,
+                _ => return Err(bad()),
+            };
+            if !(1..=dim).contains(&d) || hh > 23 || mm > 59 {
+                return Err(bad());
+            }
+            Ok(((days_from_civil(y, m, d) * 24 + hh) * 60 + mm) * 60_000)
         }
     }
 }
@@ -295,7 +332,14 @@ fn parse_trade_pass(
             continue;
         }
         let long = ty % 2 == 0;
-        let t = parse_time(f(3), fmt)?;
+        // `pin:06-trades-open-row` — a still-open trade's exit record prints `Open` / `Open` / `—` in
+        // time / signal / price (probe-03, 2026-10-17): its time and price cells are never read.
+        let open = ty >= 2 && f(2) == c.open_signal;
+        let t = if open {
+            0
+        } else {
+            parse_trade_time(f(3), fmt).map_err(|e| format!("row {line}: {e}"))?
+        };
         if ty < 2 {
             if out.iter().any(|x| x.n == n) {
                 return Err(format!("row {line}: trade {n} entered twice"));
@@ -334,7 +378,7 @@ fn parse_trade_pass(
         tr.qty = dec(f(5), "qty")?;
         tr.runup = opt_dec(f(8), "favorable excursion")?;
         tr.drawdown = opt_dec(f(9), "adverse excursion")?;
-        if f(2) != c.open_signal {
+        if !open {
             tr.exit = Some(ExitCols {
                 ms: t,
                 px: dec(f(4), "price")?,

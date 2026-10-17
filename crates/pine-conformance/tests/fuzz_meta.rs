@@ -10,9 +10,12 @@ use std::path::PathBuf;
 
 use pine_conformance::fuzz::ast::{self, Expr, HistRef, Program, Stmt};
 use pine_conformance::fuzz::diff::{Harness, Interleaved, ModeVsMode};
-use pine_conformance::fuzz::grammar::{alphabet, FUZZ_DENY, FUZZ_DENY_NS};
+use pine_conformance::fuzz::grammar::{
+    alphabet, alphabet_for, FUZZ_ADMIT_V2, FUZZ_DENY, FUZZ_DENY_NS,
+};
 use pine_conformance::fuzz::{
     generate, shrink, GrammarConfig, Predicate, Profile, ShrinkBudget, Signature, GRAMMAR_VERSION,
+    GRAMMAR_VERSIONS,
 };
 use pine_conformance::run::{RunError, DEFAULT_LIMITS};
 use pine_ir::{DiagCode, Dialect};
@@ -55,6 +58,130 @@ fn generate_is_pure_over_10k_seeds() {
         "{} distinct programs",
         distinct.len()
     );
+}
+
+/// The grammar-1 sample digest: SHA-256 over the rendered sources of seeds `0..500` in v5 then v6,
+/// then the `regressions.tsv` seeds and four far seeds, each source followed by `\0`. Recorded
+/// from the grammar-1 generator before grammar 2 landed (r22).
+const GRAMMAR_1_SAMPLE_SHA256: &str =
+    "9f2142e0460d9d278b3597dc6beaf456e2e0f1c6716104e5b1f99ac8e52cbacc";
+
+fn grammar_1_sample_digest() -> String {
+    let mut all = String::new();
+    for d in [Dialect::V5, Dialect::V6] {
+        let c = GrammarConfig {
+            grammar_version: 1,
+            ..cfg(d)
+        };
+        let far = [4u64, 692, 8_817_263, 1 << 40, u64::MAX];
+        for s in (0..500u64).chain(far) {
+            let g = generate(s, &c);
+            assert_eq!(g.grammar_version, 1, "seed {s}");
+            all.push_str(&g.source);
+            all.push('\0');
+        }
+    }
+    core_crypto::sha256(all.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// §4.8.5: a run is a pure function of `(GRAMMAR_VERSION, seed, GrammarConfig)` — grammar 2's
+/// `input` production leaves every grammar-1 program byte-identical (the `regressions.tsv`
+/// grammar-1 rows replay unchanged; `pin:06-fuzz-grammar-version-gate`).
+#[test]
+fn grammar_1_seeds_are_byte_identical_under_grammar_2() {
+    let got = grammar_1_sample_digest();
+    println!("grammar-1 sample digest {got}");
+    assert_eq!(got, GRAMMAR_1_SAMPLE_SHA256);
+}
+
+/// Counts `input` calls in `e`, asserting each takes one literal `defval`.
+fn input_calls(e: &Expr, s: u64) -> u32 {
+    match e {
+        Expr::Call { name, args, .. } => {
+            let own = if *name == "input" {
+                assert!(
+                    matches!(
+                        args.as_slice(),
+                        [Expr::LitI(_) | Expr::LitF(_) | Expr::LitB(_)]
+                    ),
+                    "seed {s}: input with a non-constant defval {args:?}"
+                );
+                1
+            } else {
+                0
+            };
+            own + args.iter().map(|a| input_calls(a, s)).sum::<u32>()
+        }
+        Expr::Bin(_, a, b) | Expr::Cmp(_, a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
+            input_calls(a, s) + input_calls(b, s)
+        }
+        Expr::Not(a) | Expr::IsNa(a) | Expr::Nz(a) => input_calls(a, s),
+        Expr::Tern(c, a, b) => input_calls(c, s) + input_calls(a, s) + input_calls(b, s),
+        _ => 0,
+    }
+}
+
+fn stmt_inputs(list: &[Stmt], s: u64) -> u32 {
+    let mut n = 0;
+    for st in list {
+        n += match st {
+            Stmt::Assign { e, .. } => {
+                assert!(
+                    !matches!(e, Expr::Call { name: "input", .. }),
+                    "seed {s}: a reassignment's whole value is an input (3050)"
+                );
+                input_calls(e, s)
+            }
+            Stmt::Decl { e, .. } | Stmt::Plot { e, .. } => input_calls(e, s),
+            Stmt::If { cond, then, els } => {
+                input_calls(cond, s) + stmt_inputs(then, s) + stmt_inputs(els, s)
+            }
+            Stmt::For { body, .. } => stmt_inputs(body, s),
+        };
+    }
+    n
+}
+
+/// Grammar 2 (r22, `pin:06-fuzz-grammar-version-gate`): the bare `input` is in the alphabet with
+/// its constant-`defval` rows generable and its `series` row (`INPUT_F_SRC`, the source-type
+/// built-in form) never emitted (`pin:06-fuzz-input-const-defval`); grammar 1 has no `input`. Over
+/// 2 000 seeds per dialect the production is exercised, every `input` takes a literal `defval`, and
+/// no reassignment's whole value is an `input` call.
+#[test]
+fn grammar_2_admits_input_with_a_constant_defval_only() {
+    for d in [Dialect::V5, Dialect::V6] {
+        let c = cfg(d);
+        assert_eq!(c.grammar_version, 2);
+        let rows = |v: u16| -> Vec<(u16, bool)> {
+            alphabet_for(v, d, c.active_tiers)
+                .iter()
+                .filter(|b| b.name == "input")
+                .map(|b| (b.ov, b.ret.is_some()))
+                .collect()
+        };
+        assert!(rows(1).is_empty(), "grammar 1 has no input");
+        let v2 = rows(2);
+        assert!(
+            v2.contains(&(pine_spec::ov::INPUT_F_SRC.0, false)),
+            "{v2:?}"
+        );
+        let generable = v2.iter().filter(|r| r.1).count();
+        assert!(generable >= 3, "int/float/bool rows: {v2:?}");
+        let (mut progs, mut calls) = (0u32, 0u32);
+        for s in 0..2_000u64 {
+            let n = stmt_inputs(&generate(s, &c).ast.stmts, s);
+            progs += u32::from(n > 0);
+            calls += n;
+        }
+        println!(
+            "v{}: {progs} of 2000 programs, {calls} input calls",
+            d as u8
+        );
+        assert!(progs > 100, "v{}: {progs} programs with an input", d as u8);
+    }
 }
 
 #[test]
@@ -124,10 +251,17 @@ fn stmt_calls(list: &[Stmt], out: &mut Vec<u16>) {
 #[test]
 fn alphabet_is_a_subset_of_active_tiers() {
     for d in [Dialect::V5, Dialect::V6] {
-        for mask in [0b0001u8, 0b0011, 0b0111, 0b1111] {
-            let a = alphabet(d, mask);
+        for (v, mask) in GRAMMAR_VERSIONS
+            .iter()
+            .flat_map(|&v| [0b0001u8, 0b0011, 0b0111, 0b1111].map(|m| (v, m)))
+        {
+            let a = alphabet_for(v, d, mask);
             assert!(!a.is_empty());
             for b in &a {
+                // pin:06-fuzz-grammar-version-gate: grammar 2 admits FUZZ_ADMIT_V2 only.
+                if v >= 2 && FUZZ_ADMIT_V2.contains(&b.name) {
+                    continue;
+                }
                 let ov = &pine_spec::OVERLOADS[b.ov as usize];
                 let e = &pine_spec::ENTRIES[ov.entry as usize];
                 assert_ne!(
@@ -478,8 +612,8 @@ fn interleaved_instances_agree_on_1000_seeds() {
     assert_eq!(div, known("interleaved"), "interleaved findings moved");
 }
 
-/// §4.8.5: every `regressions.tsv` row of this grammar still reproduces under mode (a) — a row
-/// with a fixture id still diverges; an id `-` row (an engine-panic finding,
+/// §4.8.5: every `regressions.tsv` row, under its own grammar version, still reproduces under
+/// mode (a) — a row with a fixture id still diverges; an id `-` row (an engine-panic finding,
 /// `pin:06-regressions-panic-rows`) still panics with a [`KNOWN_PANICS`] message while its class
 /// is open, and once the class is fixed (it left the table) the row stays and must run clean —
 /// no panic, no divergence. A row that stops reproducing is as much a finding as one that starts.
@@ -497,11 +631,21 @@ fn regressions_still_reproduce() {
             matches!(cols[3], "SemanticBug" | "Unimplemented" | "Declined"),
             "{l}"
         );
-        if v != GRAMMAR_VERSION {
-            continue;
-        }
+        // pin:06-fuzz-grammar-version-gate: a row replays under its own grammar version (every
+        // version this build still generates); a version it no longer generates is red.
+        assert!(
+            GRAMMAR_VERSIONS.contains(&v),
+            "{l}: grammar {v} not generated"
+        );
         rows += 1;
-        let g = generate(seed, &c);
+        let g = generate(
+            seed,
+            &GrammarConfig {
+                grammar_version: v,
+                ..c.clone()
+            },
+        );
+        assert_eq!(g.grammar_version, v, "{l}");
         let mut p = ModeVsMode {
             h: Harness::new(root(), "regr").expect("harness"),
             bars: 128,

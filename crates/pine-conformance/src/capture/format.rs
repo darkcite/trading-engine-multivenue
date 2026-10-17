@@ -48,6 +48,18 @@ pub enum TimeFormat {
     Iso,
 }
 
+/// How the List of Trades prints its `col_time` cells (`trades_time_format`).
+///
+/// `pin:06-trades-time-format` — §4.7.3 leaves "the date format" of the List of Trades a format key
+/// to VERIFY at probe-03; probe-03 and the E001 capture (2026-10-17) print `YYYY-MM-DD HH:MM`: UTC
+/// (`time_zone`), the fill bar's open, no zone suffix, no seconds. The key is required like every
+/// other §4.7.3 key (§4.4 says nothing of it); the chart's `time_format` is a separate key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradesTimeFormat {
+    /// `ymd_hm` — `YYYY-MM-DD HH:MM`, UTC.
+    YmdHm,
+}
+
 /// The List of Trades column titles (`pin:06-export-columns-verify-in-recon`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TradeColumns {
@@ -106,8 +118,11 @@ pub struct ExportFormat {
     pub delimiter: u8,
     /// `eol`: `lf` / `crlf`.
     pub crlf: bool,
-    /// `time_format`: `unix_s`, `unix_ms`, `iso`.
+    /// `time_format`: `unix_s`, `unix_ms`, `iso` — the chart export's time column.
     pub time_format: TimeFormat,
+    /// `trades_time_format`: `ymd_hm` — the List of Trades `col_time` cells
+    /// (`pin:06-trades-time-format`).
+    pub trades_time_format: TradesTimeFormat,
     /// `time_zone` — must be `UTC` (`pin:06-export-utc-only`: the chart is UTC, §4.1.4).
     pub time_zone: String,
     /// `time_column` — the chart export's time column title.
@@ -137,7 +152,7 @@ pub struct ExportFormat {
     pub summary: SummaryRows,
 }
 
-const KEYS: [&str; 15] = [
+const KEYS: [&str; 16] = [
     "digits",
     "na",
     "inf",
@@ -145,6 +160,7 @@ const KEYS: [&str; 15] = [
     "delimiter",
     "eol",
     "time_format",
+    "trades_time_format",
     "time_zone",
     "ohlcv_columns",
     "titles_verbatim",
@@ -318,7 +334,8 @@ pub fn load_format(root: &Path) -> Result<ExportFormat, FixError> {
     Ok(fmt)
 }
 
-/// Parses `format.tsv` text: every key of §4.7.3 plus `time_column`, `p_negzero` (optional, `no`),
+/// Parses `format.tsv` text: every key of §4.7.3 plus `time_column`, `trades_time_format`
+/// (`pin:06-trades-time-format`), `p_negzero` (optional, `no`),
 /// the `col_*` / `type_*` / `open_signal` / `sum_*` titles (optional as a block: absent = this
 /// export has no trade report).
 pub fn parse_format(text: &str, path: &str) -> Result<ExportFormat, FixError> {
@@ -393,6 +410,17 @@ pub fn parse_format(text: &str, path: &str) -> Result<ExportFormat, FixError> {
         "iso" => TimeFormat::Iso,
         _ => return Err(err(path, tl, "time_format is unix_s|unix_ms|iso".into())),
     };
+    let (ttv, ttl) = need("trades_time_format")?;
+    let trades_time_format = match ttv {
+        "ymd_hm" => TradesTimeFormat::YmdHm,
+        _ => {
+            return Err(err(
+                path,
+                ttl,
+                "trades_time_format is ymd_hm (pin:06-trades-time-format)".into(),
+            ))
+        }
+    };
     let (zv, zl) = need("time_zone")?;
     if zv != "UTC" {
         return Err(err(
@@ -437,6 +465,7 @@ pub fn parse_format(text: &str, path: &str) -> Result<ExportFormat, FixError> {
         delimiter,
         crlf,
         time_format,
+        trades_time_format,
         time_zone: zv.to_string(),
         time_column: need("time_column")?.0.to_string(),
         ohlcv_columns: need("ohlcv_columns")?

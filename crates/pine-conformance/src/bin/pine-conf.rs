@@ -132,18 +132,21 @@ fn shrink(root: &Path, rest: &[&str]) -> ExitCode {
         Some(Ok(max_steps)) => ShrinkBudget { max_steps },
         Some(Err(_)) => return usage(),
     };
-    if v != fuzz::GRAMMAR_VERSION {
+    if !fuzz::GRAMMAR_VERSIONS.contains(&v) {
         eprintln!(
-            "pine-conf shrink: grammar {v} is not this build's {}",
-            fuzz::GRAMMAR_VERSION
+            "pine-conf shrink: grammar {v} is not one this build generates ({:?})",
+            fuzz::GRAMMAR_VERSIONS
         );
         return ExitCode::from(2);
     }
-    let cfg = GrammarConfig::for_profile(
-        Profile::Indicator,
-        Dialect::V6,
-        pine_conformance::run::DEFAULT_LIMITS.active_tiers,
-    );
+    let cfg = GrammarConfig {
+        grammar_version: v,
+        ..GrammarConfig::for_profile(
+            Profile::Indicator,
+            Dialect::V6,
+            pine_conformance::run::DEFAULT_LIMITS.active_tiers,
+        )
+    };
     let g = fuzz::generate(seed, &cfg);
     let h = match diff::Harness::new(root.to_path_buf(), "cli") {
         Ok(h) => h,
@@ -381,7 +384,11 @@ fn distil(root: &Path, rest: &[&str]) -> ExitCode {
                 r.differing.len(),
                 ids(&r.differing)
             );
-            if r.differing.is_empty() {
+            // pin:06-distil-56 — each I9 refusal is printed; the rest of the sheet was written.
+            for (id, why) in &r.refused {
+                eprintln!("pine-conf distil: refused {}: {why}", id.as_str());
+            }
+            if r.differing.is_empty() && r.refused.is_empty() {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(1)

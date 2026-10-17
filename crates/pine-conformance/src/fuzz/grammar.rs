@@ -12,6 +12,14 @@
 //! `x = e`, `var x = e`, `x := e`, `if`/`else`, literal `for`, `plot`, and every expression form of
 //! §4.8.2 except field access; `while`, `switch`, user functions and `type` (and the `Broker`,
 //! `Security`, `Collections` additions) are a later grammar version — each bumps the version.
+//!
+//! `pin:06-fuzz-grammar-version-gate` — §4.8.3 derives the alphabet ("when a tier lands, the
+//! alphabet grows with no generator change") while §4.8.5 makes `(GRAMMAR_VERSION, seed)` the
+//! whole reproducer: an alphabet that grows under a fixed version re-draws every recorded seed.
+//! The two are reconciled by gating the alphabet on the version: `alphabet_for(v, …)` is fixed
+//! per `v`, a growth ([`FUZZ_ADMIT_V2`]) lands under a new version, and every older version stays
+//! generable byte-identically. Grammar 2 = grammar 1 + the bare `input(…)` with a constant
+//! `defval`; no `v := input(…)` (a reassigned whole value names a second input `v`, `3050`).
 
 use pine_ir::{Dialect, Qual, Ty};
 use pine_spec::{params, pf, rets};
@@ -31,6 +39,7 @@ use super::{GrammarConfig, Profile};
 /// `series` row `INPUT_F_SRC` fed a non-constant) and 3 `3050` (`vN := input(…)` names a second
 /// input `vN`) — so the generator cannot yet emit only valid `input()` calls, and admitting it
 /// re-draws every grammar-1 program (the `regressions.tsv` seeds) — a `GRAMMAR_VERSION` decision.
+/// Taken in r22: grammar 2 admits it ([`FUZZ_ADMIT_V2`]); these lists stay grammar 1's.
 pub const FUZZ_DENY_NS: [&str; 18] = [
     "input",
     "strategy",
@@ -120,6 +129,26 @@ pub fn denied(e: &pine_spec::Entry) -> bool {
         || FUZZ_DENY.contains(&e.full_str())
 }
 
+/// Full names grammar 2 takes out of [`FUZZ_DENY`] (`pin:06-fuzz-grammar-version-gate`). The bare
+/// `input(…)` is emitted with a constant `defval` only (`pin:06-fuzz-input-const-defval`).
+pub const FUZZ_ADMIT_V2: [&str; 1] = ["input"];
+
+/// [`denied`] under grammar `version`: grammar ≥ 2 admits [`FUZZ_ADMIT_V2`].
+pub fn denied_in(version: u16, e: &pine_spec::Entry) -> bool {
+    denied(e) && !(version >= 2 && FUZZ_ADMIT_V2.contains(&e.full_str()))
+}
+
+/// `pin:06-fuzz-input-const-defval` — an admitted `input` row whose `defval` is `series` (the
+/// `INPUT_F_SRC` row: a source-type built-in, `pin:02-input-source-defval`) is in the alphabet but
+/// never emitted: every source-type built-in (`close`, `hl2`, …) reads the bar, which the drives
+/// of §4.8.4 a differ in (`pin:06-fuzz-implicit-bar`), and any other series `defval` is `3008`.
+fn series_defval(ov: &pine_spec::Overload, name: &str) -> bool {
+    name == "input"
+        && params(ov)
+            .iter()
+            .any(|p| p.name.as_str() == "defval" && p.sig.ty.qual == Qual::Series)
+}
+
 /// Whether `ov` can be emitted by the type-directed grammar in `d`: required parameters scalar
 /// and positional, one scalar result, no type variable; and it reads no bar field implicitly
 /// (`gen::group_b::IMPLICIT_BAR_READERS`: the drives of §4.8.4 a differ in their bars, never in
@@ -154,9 +183,14 @@ fn generable(ov: &pine_spec::Overload, name: &str, d: Dialect) -> Option<Sc> {
     Some(ret)
 }
 
-/// The derived alphabet (§4.8.3): `pine_spec::OVERLOADS ∩ active_tiers ∩ dialect − FUZZ_DENY`,
-/// in overload order. Load-time; allocates.
+/// The derived alphabet (§4.8.3) of the current [`super::GRAMMAR_VERSION`]; see [`alphabet_for`].
 pub fn alphabet(d: Dialect, active_tiers: u8) -> Vec<Builtin> {
+    alphabet_for(super::GRAMMAR_VERSION, d, active_tiers)
+}
+
+/// The derived alphabet (§4.8.3) of grammar `version`: `pine_spec::OVERLOADS ∩ active_tiers ∩
+/// dialect − FUZZ_DENY (+ FUZZ_ADMIT_V2 from grammar 2)`, in overload order. Load-time; allocates.
+pub fn alphabet_for(version: u16, d: Dialect, active_tiers: u8) -> Vec<Builtin> {
     let mut out = Vec::new();
     for (i, ov) in pine_spec::OVERLOADS.iter().enumerate() {
         let e = &pine_spec::ENTRIES[ov.entry as usize];
@@ -166,7 +200,7 @@ pub fn alphabet(d: Dialect, active_tiers: u8) -> Vec<Builtin> {
         // pin:06-fuzz-alphabet-scope — §4.8.3 stays "inside the implemented tiers": an entry
         // `pine_spec` marks `Scope::Declined` is refused by design (3024 `declined=1`), so it is
         // outside the alphabet like a denied name.
-        if e.is_type || denied(e) || e.scope == pine_spec::Scope::Declined {
+        if e.is_type || denied_in(version, e) || e.scope == pine_spec::Scope::Declined {
             continue;
         }
         // pin:06-fuzz-alphabet-served — "implemented" is pine-std's knowledge (`pine_spec::Scope`):
@@ -179,7 +213,11 @@ pub fn alphabet(d: Dialect, active_tiers: u8) -> Vec<Builtin> {
         out.push(Builtin {
             name,
             ov: i as u16,
-            ret: generable(ov, name, d),
+            ret: if series_defval(ov, name) {
+                None
+            } else {
+                generable(ov, name, d)
+            },
         });
     }
     out
@@ -204,6 +242,8 @@ struct Gen<'a> {
     budget: u16,
     ill_pending: bool,
     ill_typed: bool,
+    /// The next `expr` is a reassignment's whole value: no `input` call at its top (`3050`).
+    no_input_top: bool,
 }
 
 impl Gen<'_> {
@@ -277,6 +317,10 @@ impl Gen<'_> {
 
     /// An expression of type `ty`; `calls` false below an `and`/`or` right operand (W3).
     fn expr(&mut self, ty: Sc, depth: u8, calls: bool) -> Expr {
+        // Grammar 2: a reassignment's whole value is never an `input` call (`vN := input(…)`
+        // names a second input `vN`, `3050`); grammar 1's alphabet has no `input`, so the filter
+        // below leaves its draws untouched.
+        let no_input = std::mem::take(&mut self.no_input_top);
         if depth == 0 {
             return self.leaf(ty);
         }
@@ -286,6 +330,7 @@ impl Gen<'_> {
                 .iter()
                 .copied()
                 .filter(|b| b.ret == Some(ty) || (ty == Sc::Float && b.ret == Some(Sc::Int)))
+                .filter(|b| !(no_input && b.name == "input"))
                 .collect()
         } else {
             Vec::new()
@@ -414,6 +459,7 @@ impl Gen<'_> {
             1 if !assignable.is_empty() => {
                 let v = self.pick(&assignable);
                 let dep = self.depth();
+                self.no_input_top = true;
                 let e = self.expr(v.ty, dep, true);
                 Stmt::Assign { slot: v.slot, e }
             }
@@ -475,7 +521,7 @@ pub fn program(seed: u64, cfg: &GrammarConfig) -> (Program, bool) {
         Profile::Indicator,
         "pin:06-fuzz-grammar-v1-subset"
     );
-    let alpha_all = alphabet(cfg.dialect, cfg.active_tiers);
+    let alpha_all = alphabet_for(cfg.grammar_version, cfg.dialect, cfg.active_tiers);
     let mut rng = Xoshiro256StarStar::seed_from(seed);
     let ill_pending = rng.permille(cfg.ill_typed_permille);
     let mut g = Gen {
@@ -489,6 +535,7 @@ pub fn program(seed: u64, cfg: &GrammarConfig) -> (Program, bool) {
         next_loop: 0,
         budget: cfg.max_stmts,
         ill_typed: false,
+        no_input_top: false,
     };
     let mut stmts = Vec::new();
     let n = 1 + g.rng.below(u32::from(cfg.max_stmts.max(1)));

@@ -10,6 +10,8 @@ pub mod distil;
 pub mod format;
 
 pub use barhash::{barhash, barhash_tsv, window_rows};
-pub use csv::{parse_chart_csv, parse_summary_csv, parse_trades_csv, ChartExport};
+pub use csv::{
+    parse_chart_csv, parse_summary_csv, parse_trade_time, parse_trades_csv, ChartExport,
+};
 pub use distil::{distil, record_paste, CaptureStamp, DistilReport, Paste};
-pub use format::{load_format, parse_format, ExportFormat};
+pub use format::{load_format, parse_format, ExportFormat, TradesTimeFormat};

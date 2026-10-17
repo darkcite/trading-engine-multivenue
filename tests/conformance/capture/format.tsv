@@ -1,0 +1,47 @@
+# capture/format.tsv — TradingView export format, measured 2026-10-17 (impl-06 §4.7.3) by probe-00
+# (raw probe-00.6.2026-10-17T0344Z.csv) and probe-03 (raw probe-03.trades.2026-10-17T0351Z.csv),
+# tv_build web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09. Chart: "Download chart data", Time format UNIX timestamp.
+# na, +inf, -inf and also |x| = 1e300 all print as an empty cell; 1e-300 prints 1e-300; values print shortest round-trip.
+# Chart CSV: no BOM, no volume column, no final newline. Trades CSV: UTF-8 BOM, exit row before entry row,
+# times "YYYY-MM-DD HH:MM" (bar open of the fill bar, UTC, no Z); the open trade prints Open / Open / — on its exit row.
+# trades_time_format (pin:06-trades-time-format) records that spelling: ymd_hm = YYYY-MM-DD HH:MM, UTC; time_format stays the chart's.
+# The Metrics view has no export in the Premium UI: sum_* keys are not measured (O6).
+digits	17
+na	
+inf	
+neg_inf	
+delimiter	comma
+eol	lf
+time_format	unix_s
+trades_time_format	ymd_hm
+time_zone	UTC
+time_column	time
+ohlcv_columns	open,high,low,close
+titles_verbatim	yes
+data_window_exported	yes
+pnl_basis	net
+size_digits	6
+duration_offset	0
+p_negzero	no
+col_trade	Trade number
+col_type	Type
+col_time	Date and time
+col_signal	Signal
+col_price	Price {ccy}
+col_qty	Size (qty)
+col_size_value	Size (value)
+col_pnl	Net PnL {ccy}
+col_return_pct	Return %
+col_commission	Commission {ccy}
+col_fav_exc	Favorable excursion {ccy}
+col_fav_exc_pct	Favorable excursion %
+col_adv_exc	Adverse excursion {ccy}
+col_adv_exc_pct	Adverse excursion %
+col_cum_pnl	Cumulative PnL {ccy}
+col_cum_pnl_pct	Cumulative PnL %
+col_bars	Duration (bars)
+type_entry_long	Entry long
+type_entry_short	Entry short
+type_exit_long	Exit long
+type_exit_short	Exit short
+open_signal	Open

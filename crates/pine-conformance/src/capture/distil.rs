@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 use pine_ir::Dialect;
 
 use super::csv::ChartExport;
+use crate::chart::spec;
 use crate::fixture::{
-    is_capture_utc, is_tv_build, Align, Cell, Dialects, Expect, Fixture, FixtureId, Group,
+    is_capture_utc, is_tv_build, Align, Cell, Dialects, Driver, Expect, Fixture, FixtureId, Group,
     ReadingBody, Row, Stamp, Summary, Tol, TradeRow, Window,
 };
 
@@ -33,6 +34,9 @@ pub struct DistilReport {
     pub written: Vec<FixtureId>,
     /// Under `verify`: fixtures whose new body differs from the tracked one.
     pub differing: Vec<FixtureId>,
+    /// Fixtures refused and not written, with the reason: a second-dialect capture that differs
+    /// from the first (I9, `pin:06-distil-56`). The rest of the sheet is still written.
+    pub refused: Vec<(FixtureId, String)>,
 }
 
 /// What TradingView did when one fixture was pasted alone (§4.7.5).
@@ -99,36 +103,153 @@ fn title_id(t: &str) -> Option<FixtureId> {
     rest[4..].starts_with('_').then_some(id)
 }
 
-/// Rows of the export selected by the fixture's alignment and window: `Step` keys are the export's
-/// row index (bar 0 = the first exported bar), `Time` keys the bar open ms.
-fn select(f: &Fixture, export: &ChartExport, cols: &[usize]) -> Vec<Row> {
-    let n = export.rows.len();
-    let (lo, hi) = match f.window {
-        Window::Head(k) => (0, (k as usize).min(n)),
-        Window::Tail(k) => (n.saturating_sub(k as usize), n),
-        Window::Time { .. } => (0, n),
+/// Whether an exported cell is the plotted integer `1`.
+fn is_one(c: &Cell) -> bool {
+    matches!(c, Cell::Val { v, .. } if *v == 1.0)
+}
+
+/// The rows a window keeps of `n` eligible rows: `[lo, hi)` positions among them.
+///
+/// `pin:06-distil-short-window` — a `head n` / `tail n` body holds exactly `n` rows
+/// (`pin:06-window-row-count`), so fewer eligible rows than `n` is `Err`: the distiller never writes
+/// a `.fix` its own parser refuses.
+fn head_tail(id: FixtureId, w: Window, n: usize, what: &str) -> Result<(usize, usize), String> {
+    let (k, head) = match w {
+        Window::Head(k) => (k as usize, true),
+        Window::Tail(k) => (k as usize, false),
+        Window::Time { .. } => return Ok((0, n)),
     };
-    let mut out = Vec::with_capacity(hi - lo);
-    let mut i = lo;
-    while i < hi {
-        let (t, cells) = &export.rows[i];
-        let in_window = match f.window {
-            Window::Time { from_ms, to_ms } => *t >= from_ms && *t < to_ms,
-            _ => true,
-        };
-        if in_window {
-            let key = match f.align {
-                Align::Step => i as i64,
-                Align::Time => *t,
-            };
-            out.push(Row {
-                key,
-                cells: cols.iter().map(|c| cells[*c].clone()).collect(),
-            });
-        }
-        i += 1;
+    if n < k {
+        return Err(format!(
+            "{}: window wants {k} row(s), the export has {n} {what} (pin:06-distil-short-window)",
+            id.as_str()
+        ));
     }
-    out
+    Ok(if head { (0, k) } else { (n - k, n) })
+}
+
+/// The export column of `f`'s plot titled `f_<ID>_<suffix>`, or `Err` naming the fixture.
+fn rt_col(f: &Fixture, cols: &[usize], suffix: &str) -> Result<usize, String> {
+    let title = format!("f_{}_{suffix}", f.id.as_str());
+    f.plots
+        .iter()
+        .position(|p| p.title == title)
+        .map(|p| cols[p])
+        .ok_or_else(|| {
+            format!(
+                "{}: a driver-rt fixture without its `{title}` plot cannot be distilled — §4.7.8 keeps \
+                 the rows where `f_<ID>_rt` and `f_<ID>_done` are 1 (pin:06-distil-rt-rows)",
+                f.id.as_str()
+            )
+        })
+}
+
+/// Rows of the export selected by the fixture's alignment and window (§4.1.3), and the `bars` to
+/// record (`None` = leave `f.bars` as it is).
+///
+/// - `align step`: TradingView's last row is the open realtime bar and is dropped; `bars` = the
+///   remaining row count; `head n` keeps rows `0..n`, `tail n` rows `bars−n..bars`, the key the row
+///   index (bar 0 = TradingView's first loaded bar).
+/// - `align time`: only rows whose bar open lies in `[FROM_MS, TO_MS)` (`pine_spec::chart`) are
+///   eligible; `head n` / `tail n` select among them, a `time` window intersects with that range;
+///   the key is the bar open ms.
+/// - `driver rt` (§4.7.8): only the rows where the fixture's `f_<ID>_rt` and `f_<ID>_done` plots are
+///   both 1 are eligible (the open realtime bar has `done = 0` and drops out with them); `tail n`
+///   selects among them; the keys are `bars−n..bars` with `bars = history + realtime` of the `rt`
+///   line — the rows `run.rs` steps for an `Rt` drive (§4.1.6), whose last `realtime` rows are the
+///   realtime bars.
+///
+/// `pin:06-distil-rt-rows` — the rt rule applies to `driver rt` fixtures (the live session of
+/// §4.7.8); a `mode realtime` fixture on another driver (E016–E032, E105: on-tick / on-fill
+/// strategies over history) is distilled by its alignment. A `driver rt` fixture needs a `tail n`
+/// window with `n ≤ realtime` (the compared keys are realtime bars on our side).
+fn select(
+    f: &Fixture,
+    export: &ChartExport,
+    cols: &[usize],
+) -> Result<(Vec<Row>, Option<u32>), String> {
+    let id = f.id;
+    let rows = &export.rows;
+    // (export row index, key) of every selected row.
+    let mut picked: Vec<(usize, i64)> = Vec::new();
+    let bars;
+    if f.driver == Driver::Rt {
+        let rt =
+            f.rt.ok_or_else(|| format!("{}: driver rt without an `rt` line", id.as_str()))?;
+        let (c_rt, c_done) = (rt_col(f, cols, "rt")?, rt_col(f, cols, "done")?);
+        let k = match f.window {
+            Window::Tail(k) if k <= rt.realtime => k,
+            _ => {
+                return Err(format!(
+                    "{}: a driver-rt fixture compares `tail n` with n ≤ realtime {} \
+                     (pin:06-distil-rt-rows)",
+                    id.as_str(),
+                    rt.realtime
+                ))
+            }
+        };
+        let elig: Vec<usize> = (0..rows.len())
+            .filter(|i| is_one(&rows[*i].1[c_rt]) && is_one(&rows[*i].1[c_done]))
+            .collect();
+        let (lo, hi) = head_tail(
+            id,
+            f.window,
+            elig.len(),
+            "realtime row(s) with rt = done = 1",
+        )?;
+        let total = rt.history + rt.realtime;
+        let first = i64::from(total) - i64::from(k);
+        for (j, &i) in elig[lo..hi].iter().enumerate() {
+            picked.push((i, first + j as i64));
+        }
+        bars = Some(total);
+    } else {
+        match f.align {
+            Align::Step => {
+                let n = rows.len().checked_sub(1).ok_or_else(|| {
+                    format!(
+                        "{}: an empty export (no open realtime bar to drop)",
+                        id.as_str()
+                    )
+                })?;
+                let (lo, hi) = head_tail(id, f.window, n, "confirmed row(s)")?;
+                for (i, (t, _)) in rows.iter().enumerate().take(hi).skip(lo) {
+                    let in_window = match f.window {
+                        Window::Time { from_ms, to_ms } => *t >= from_ms && *t < to_ms,
+                        _ => true,
+                    };
+                    if in_window {
+                        picked.push((i, i as i64));
+                    }
+                }
+                bars = Some(n as u32);
+            }
+            Align::Time => {
+                let (from, to) = match f.window {
+                    Window::Time { from_ms, to_ms } => {
+                        (from_ms.max(spec::FROM_MS), to_ms.min(spec::TO_MS))
+                    }
+                    _ => (spec::FROM_MS, spec::TO_MS),
+                };
+                let elig: Vec<usize> = (0..rows.len())
+                    .filter(|i| rows[*i].0 >= from && rows[*i].0 < to)
+                    .collect();
+                let (lo, hi) = head_tail(id, f.window, elig.len(), "row(s) in [FROM_MS, TO_MS)")?;
+                for &i in &elig[lo..hi] {
+                    picked.push((i, rows[i].0));
+                }
+                bars = None;
+            }
+        }
+    }
+    let out = picked
+        .iter()
+        .map(|&(i, key)| Row {
+            key,
+            cells: cols.iter().map(|c| rows[i].1[*c].clone()).collect(),
+        })
+        .collect();
+    Ok((out, bars))
 }
 
 /// §4.4.2: an export of fewer than 17 digits turns every non-integral `exact` / `ulp` plot into
@@ -148,10 +269,26 @@ fn retol(f: &mut Fixture, rows: &[Row], digits: u8) {
     }
 }
 
-/// Applies a new capture to `f`; returns whether the tracked file changes in its body.
-///
 /// `pin:06-distil-56` — a `56` fixture's second dialect capture must reproduce the first exactly
-/// (I9: TradingView's v5 and v6 agree, or the fixture is mis-tabled): a differing body is `Err`.
+/// (I9: TradingView's v5 and v6 agree, or the fixture is mis-tabled): a differing body is refused —
+/// the reason, collected in [`DistilReport::refused`]; that fixture is not written, the rest of the
+/// sheet is (one mis-tabled fixture never stops a sheet). Under `verify` nothing is written and the
+/// tracked body is the reference for both dialects: a difference is `differing`, not a refusal.
+fn i9_refusal(f: &Fixture, body: &Expect, stamp: &CaptureStamp) -> Option<String> {
+    let bit = dialect_bit(stamp.dialect);
+    let prior = f.captured_in.filter(|c| c.0 & !bit.0 != 0);
+    // A capture outside the fixture's dialects is `apply`'s `Err`, never a refusal.
+    (f.dialects.has(stamp.dialect) && prior.is_some() && f.expect != *body).then(|| {
+        format!(
+            "{}: the v{} capture differs from the other dialect's (I9, pin:06-distil-56)",
+            f.id.as_str(),
+            stamp.dialect as u8
+        )
+    })
+}
+
+/// Applies a new capture to `f`; returns whether the tracked file changes in its body. The caller
+/// has already ruled out an I9 refusal ([`i9_refusal`]).
 fn apply(
     f: &mut Fixture,
     body: Expect,
@@ -162,14 +299,6 @@ fn apply(
     if !f.dialects.has(stamp.dialect) {
         return Err(format!(
             "{}: captured in v{} outside its dialects",
-            f.id.as_str(),
-            stamp.dialect as u8
-        ));
-    }
-    let prior = f.captured_in.filter(|c| c.0 & !bit.0 != 0);
-    if prior.is_some() && f.expect != body {
-        return Err(format!(
-            "{}: the v{} capture differs from the other dialect's (I9)",
             f.id.as_str(),
             stamp.dialect as u8
         ));
@@ -245,7 +374,7 @@ pub fn distil(
                 .ok_or_else(|| format!("{}: plot `{}` not in the export", id.as_str(), p.title))?;
             cols.push(c);
         }
-        let rows = select(&f, export, &cols);
+        let (rows, bars) = select(&f, export, &cols)?;
         let body = match trades {
             Some(tr) => Expect::Strategy {
                 series: rows.clone(),
@@ -257,12 +386,12 @@ pub fn distil(
             None => Expect::Series(rows.clone()),
         };
         if !verify {
+            if let Some(why) = i9_refusal(&f, &body, stamp) {
+                rep.refused.push((id, why));
+                continue;
+            }
             retol(&mut f, &rows, export.digits);
         }
-        let bars = match f.align {
-            Align::Step => Some(export.rows.len() as u32),
-            Align::Time => f.bars,
-        };
         apply(&mut f, body, stamp, bars)?;
         finish(&path, &f, &tracked, verify, &mut rep)?;
     }
@@ -336,6 +465,12 @@ pub fn record_paste(
             }
         }
     };
+    if !verify {
+        if let Some(why) = i9_refusal(&f, &body, stamp) {
+            rep.refused.push((f.id, why));
+            return Ok(rep);
+        }
+    }
     apply(&mut f, body, stamp, None)?;
     finish(fix, &f, &tracked, verify, &mut rep)?;
     Ok(rep)

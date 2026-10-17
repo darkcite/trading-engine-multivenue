@@ -18,6 +18,20 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// The tree's options with the captured `syminfo.tsv` pointed at an explicitly absent file (a fresh,
+/// empty temp dir), so the runner reads the stand-in whether or not the tree holds the captured
+/// file (the Mac does once probe-00 ran) — `pin:06-runner-syminfo-path`.
+fn standin_options(tag: &str) -> RunnerOptions {
+    let dir =
+        std::env::temp_dir().join(format!("pine-conf-no-syminfo-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let mut o = RunnerOptions::new(root());
+    o.syminfo_tsv = dir.join("syminfo.tsv");
+    assert!(!o.syminfo_tsv.exists(), "the captured syminfo is absent");
+    o
+}
+
 /// Every `.fix` under `tests/conformance/fixtures/<group>/`, sorted by id.
 fn load_all() -> Vec<Fixture> {
     let dir = root().join("tests/conformance/fixtures");
@@ -87,7 +101,7 @@ fn short(v: &Verdict) -> String {
 
 #[test]
 fn standin_fixtures_hold_the_known_pass_set() {
-    let mut runner = Runner::new(RunnerOptions::new(root())).expect("runner");
+    let mut runner = Runner::new(standin_options("pass-set")).expect("runner");
     assert_eq!(runner.syminfo_source(), SyminfoSource::StandIn);
     let all = load_all();
     assert_eq!(all.len(), 566, "fixture count");
@@ -138,7 +152,8 @@ fn standin_fixtures_hold_the_known_pass_set() {
 
 #[test]
 fn tv_fixtures_refuse_without_the_captured_syminfo() {
-    let mut runner = Runner::new(RunnerOptions::new(root())).expect("runner");
+    let mut runner = Runner::new(standin_options("refuse")).expect("runner");
+    assert_eq!(runner.syminfo_source(), SyminfoSource::StandIn);
     let all = load_all();
     let f = all
         .iter()

@@ -9,10 +9,11 @@
 use std::path::{Path, PathBuf};
 
 use pine_conformance::capture::{
-    distil, parse_chart_csv, parse_format, parse_summary_csv, parse_trades_csv, record_paste,
-    CaptureStamp, ExportFormat, Paste,
+    distil, parse_chart_csv, parse_format, parse_summary_csv, parse_trade_time, parse_trades_csv,
+    record_paste, CaptureStamp, ChartExport, ExportFormat, Paste, TradesTimeFormat,
 };
-use pine_conformance::fixture::{Cell, Dialects, Expect, Fixture, FixtureId, Stamp, Tol};
+use pine_conformance::chart::spec;
+use pine_conformance::fixture::{Cell, Dialects, Expect, Fixture, FixtureId, Row, Stamp, Tol};
 use pine_ir::{DiagCode, Dialect, FaultKind};
 
 /// A hand-made `format.tsv` (ours; the values are placeholders until probe-00 / probe-03). The
@@ -29,6 +30,7 @@ neg_inf\t-Infinity
 delimiter\tcomma
 eol\tlf
 time_format\tiso
+trades_time_format\tymd_hm
 time_zone\tUTC
 time_column\ttime
 ohlcv_columns\topen,high,low,close,Volume
@@ -92,12 +94,13 @@ fn trades_export(header: &[u8], rows: &str) -> Vec<u8> {
 }
 
 /// Hand-made List of Trades rows under the recon header's 17 columns: trade 1 closed long (exit
-/// record first), trade 2 an open short.
+/// record first), trade 2 an open short — its exit record prints `Open` / `Open` / `—` in time /
+/// signal / price, as probe-03 does. Times are `ymd_hm` (`pin:06-trades-time-format`).
 const RECON_ROWS: &str = "\
-1,Exit long,2026-01-01T03:00Z,X,60200,0.5,30100,38.25,0.13,0,40.00,0.13,-5.50,-0.02,38.25,0.04,3
-1,Entry long,2026-01-01T00:00Z,L,60123.5,0.5,30061.75,38.25,0.13,0,40.00,0.13,-5.50,-0.02,38.25,0.04,3
-2,Entry short,2026-01-01T04:00Z,S,60300,1,60300,,,,,,,,,,
-2,Exit short,2026-01-01T05:00Z,Open,60250,1,60250,50.00,0.08,0,51.00,0.08,0,0,88.25,0.09,1
+1,Exit long,2026-01-01 03:00,X,60200,0.5,30100,38.25,0.13,0,40.00,0.13,-5.50,-0.02,38.25,0.04,3
+1,Entry long,2026-01-01 00:00,L,60123.5,0.5,30061.75,38.25,0.13,0,40.00,0.13,-5.50,-0.02,38.25,0.04,3
+2,Entry short,2026-01-01 04:00,S,60300,1,60300,,,,,,,,,,
+2,Exit short,Open,Open,—,1,60250,50.00,0.08,0,51.00,0.08,0,0,88.25,0.09,1
 ";
 
 fn stamp(d: Dialect) -> CaptureStamp {
@@ -132,12 +135,13 @@ fn load(root: &Path, id: &str) -> Fixture {
     Fixture::parse(&std::fs::read_to_string(&p).unwrap(), "t").unwrap()
 }
 
-/// A hand-made 64-bar chart export for A001 (`window head 64`): OHLCV, a foreign plot, then A001's
-/// two plots; the last bar's value is `last_val`.
+/// A hand-made chart export for A001 (`window head 64`): OHLCV, a foreign plot, then A001's two
+/// plots; 64 confirmed bars, the last of them valued `last_val`, then TradingView's open realtime
+/// bar (row 64, §4.1.3 — the distiller drops it).
 fn a001_export(last_val: &str) -> String {
     let mut s = String::from("time,open,high,low,close,Volume,MA 20,f_A001_isna,f_A001_val\n");
     let vals = ["1.5", "2.25", "NaN", "-0.125", "3"];
-    for i in 0..64usize {
+    for i in 0..65usize {
         let v = if i == 63 { last_val } else { vals[i % 5] };
         let isna = if v == "NaN" { "1" } else { "0" };
         s.push_str(&format!(
@@ -274,10 +278,10 @@ fn capture_trades_recon_header_parses() {
     )
     .is_err());
     // A second exit of one trade, or an exit without an entry, is refused.
-    let twice = format!("{RECON_ROWS}1,Exit long,2026-01-01T03:00Z,X,60200,0.5,,,,,,,,,,,3\n");
+    let twice = format!("{RECON_ROWS}1,Exit long,2026-01-01 03:00,X,60200,0.5,,,,,,,,,,,3\n");
     let err = parse_trades_csv(&trades_export(&header, &twice), &f).unwrap_err();
     assert!(err.contains("exited twice"), "{err}");
-    let orphan = "3,Exit long,2026-01-01T03:00Z,X,60200,0.5,,,,,,,,,,,3\n";
+    let orphan = "3,Exit long,2026-01-01 03:00,X,60200,0.5,,,,,,,,,,,3\n";
     assert!(parse_trades_csv(&trades_export(&header, orphan), &f).is_err());
 }
 
@@ -408,9 +412,16 @@ fn capture_verify_reports_a_changed_cell() {
         before,
         "verify never writes"
     );
-    // pin:06-distil-56 — a v5 capture that differs from the v6 one is refused (I9).
-    assert!(distil(&sheet, &changed, None, None, &stamp(Dialect::V5), false).is_err());
-    assert!(distil(&sheet, &first, None, None, &stamp(Dialect::V5), false).is_ok());
+    // pin:06-distil-56 — a v5 capture that differs from the v6 one is refused (I9): reported, not
+    // written.
+    let r5 = distil(&sheet, &changed, None, None, &stamp(Dialect::V5), false).unwrap();
+    assert!(r5.written.is_empty());
+    assert_eq!(r5.refused.len(), 1);
+    assert_eq!(r5.refused[0].0, FixtureId::parse("A001").unwrap());
+    assert!(r5.refused[0].1.contains("I9"), "{}", r5.refused[0].1);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    let ok = distil(&sheet, &first, None, None, &stamp(Dialect::V5), false).unwrap();
+    assert!(ok.refused.is_empty() && ok.written.len() == 1);
     assert_eq!(load(&root, "A001").captured_in, Some(Dialects::BOTH));
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -587,7 +598,8 @@ fn rehearsal_distil_passes_group_a() {
         csv.push_str(t);
     }
     csv.push('\n');
-    for r in 0..i64::from(n) {
+    // Row `n` is TradingView's open realtime bar (§4.1.3): the distiller drops it.
+    for r in 0..=i64::from(n) {
         csv.push_str(&format!(
             "{},1,2,0.5,1.5,10",
             1_767_225_600_000 + r * 3_600_000
@@ -629,4 +641,352 @@ fn rehearsal_distil_passes_group_a() {
         assert!(matches!(v, Verdict::Pass), "{}: {v:?}", id.as_str());
     }
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The sample format with unix-ms chart times (hand-made exports below key rows by `pine_spec::chart`).
+fn fmt_ms() -> ExportFormat {
+    let mut f = parse_format(
+        &FORMAT
+            .replace("time_format\tiso", "time_format\tunix_ms")
+            .replace("digits\t8", "digits\t17"),
+        "ms",
+    )
+    .unwrap();
+    f.resolve_ccy("USDT").unwrap();
+    f
+}
+
+/// A hand-made chart export: `time,open,<titles>` then one `t,1,<cells>` record per row.
+fn export_ms(titles: &str, rows: &[(i64, String)]) -> ChartExport {
+    let mut s = format!("time,open,{titles}\n");
+    for (t, cells) in rows {
+        s.push_str(&format!("{t},1,{cells}\n"));
+    }
+    parse_chart_csv(s.as_bytes(), &fmt_ms()).unwrap()
+}
+
+/// The printed text of a row's `p`-th cell.
+fn text(r: &Row, p: usize) -> &str {
+    match &r.cells[p] {
+        Cell::Val { text, .. } => text,
+        Cell::Na => "na",
+    }
+}
+
+fn series(f: &Fixture) -> &[Row] {
+    match &f.expect {
+        Expect::Series(r) => r,
+        Expect::Strategy { series, .. } => series,
+        e => panic!("{}: not a series: {e:?}", f.id.as_str()),
+    }
+}
+
+/// §4.1.3 `align step`: TradingView's last row is the open realtime bar — dropped; `bars` is the
+/// remaining count; `head n` keeps rows `0..n`, `tail n` rows `bars−n..bars`.
+#[test]
+fn capture_distil_step_drops_the_open_bar() {
+    let root = tree("step", &["A001", "B004"]);
+    let sheet = root.join("tests/conformance/sheets/v6/sheet-x.pine");
+    // 200 confirmed bars valued by their index, then the open bar valued 9999.
+    let rows: Vec<(i64, String)> = (0..201i64)
+        .map(|i| {
+            let v = if i == 200 { 9999 } else { i };
+            (spec::FROM_MS + i * spec::TF_MS, format!("0,{v},0,{v}"))
+        })
+        .collect();
+    let e = export_ms("f_A001_isna,f_A001_val,f_B004_isna,f_B004_val", &rows);
+    let rep = distil(&sheet, &e, None, None, &stamp(Dialect::V6), false).unwrap();
+    assert_eq!(rep.written.len(), 2);
+    let a = load(&root, "A001");
+    assert_eq!(a.bars, Some(200), "bars = rows less the open bar");
+    let ra = series(&a);
+    assert_eq!(ra.len(), 64);
+    assert_eq!((ra[0].key, text(&ra[0], 1)), (0, "0"));
+    assert_eq!((ra[63].key, text(&ra[63], 1)), (63, "63"));
+    let b = load(&root, "B004");
+    assert_eq!(b.bars, Some(200));
+    let rb = series(&b);
+    assert_eq!(rb.len(), 128);
+    assert_eq!((rb[0].key, text(&rb[0], 1)), (72, "72"));
+    assert_eq!((rb[127].key, text(&rb[127], 1)), (199, "199"));
+    assert!(
+        rb.iter().all(|r| text(r, 1) != "9999"),
+        "the open bar leaked"
+    );
+    // 64 rows = 63 confirmed + the open bar: `head 64` is short → Err naming the fixture; 65 is
+    // exactly enough.
+    let root2 = tree("step-short", &["A001"]);
+    let sheet2 = root2.join("tests/conformance/sheets/v6/sheet-x.pine");
+    let short = export_ms(
+        "f_A001_isna,f_A001_val",
+        &rows[..64]
+            .iter()
+            .map(|(t, _)| (*t, "0,1".to_string()))
+            .collect::<Vec<_>>(),
+    );
+    let err = distil(&sheet2, &short, None, None, &stamp(Dialect::V6), false).unwrap_err();
+    assert!(
+        err.contains("A001") && err.contains("short-window"),
+        "{err}"
+    );
+    let exact = export_ms(
+        "f_A001_isna,f_A001_val",
+        &rows[..65]
+            .iter()
+            .map(|(t, _)| (*t, "0,1".to_string()))
+            .collect::<Vec<_>>(),
+    );
+    distil(&sheet2, &exact, None, None, &stamp(Dialect::V6), false).unwrap();
+    assert_eq!(load(&root2, "A001").bars, Some(64));
+    // An empty export has no open bar to drop.
+    let empty = export_ms("f_A001_isna,f_A001_val", &[]);
+    assert!(distil(&sheet2, &empty, None, None, &stamp(Dialect::V6), false).is_err());
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root2);
+}
+
+/// §4.1.3 `align time`: only rows opening in `[FROM_MS, TO_MS)` are eligible; `tail n` picks the
+/// last `n` before `TO_MS`; rows before `FROM_MS` never count; a `time` window intersects with the
+/// range. A `mode realtime` fixture on another driver (E105) goes by its alignment
+/// (pin:06-distil-rt-rows).
+#[test]
+fn capture_distil_time_selects_inside_the_chart_window() {
+    let root = tree("time", &["D001", "E001", "E105"]);
+    let sheet = root.join("tests/conformance/sheets/v6/sheet-x.pine");
+    let hour = |k: i64| spec::FROM_MS + k * spec::TF_MS;
+    let n_bars = (spec::TO_MS - spec::FROM_MS) / spec::TF_MS;
+    // 10 bars before FROM_MS, the window, 5 bars after TO_MS (the last one the open bar).
+    let rows: Vec<(i64, String)> = (-10..n_bars + 5)
+        .map(|k| (hour(k), format!("0,{k}")))
+        .collect();
+    let e = export_ms("f_D001_isna,f_D001_val", &rows);
+    distil(&sheet, &e, None, None, &stamp(Dialect::V6), false).unwrap();
+    let d = load(&root, "D001");
+    assert_eq!(d.bars, None);
+    let rd = series(&d);
+    assert_eq!(rd.len(), 256);
+    assert_eq!(
+        rd[255].key,
+        spec::TO_MS - spec::TF_MS,
+        "ends at TO_MS − TF_MS"
+    );
+    assert_eq!(rd[0].key, spec::TO_MS - 256 * spec::TF_MS);
+    assert_eq!(text(&rd[255], 1), (n_bars - 1).to_string());
+    // Rows before FROM_MS are not eligible: 300 of them plus 100 inside are short of `tail 256`.
+    let early: Vec<(i64, String)> = (-300..100).map(|k| (hour(k), format!("0,{k}"))).collect();
+    let err = distil(
+        &sheet,
+        &export_ms("f_D001_isna,f_D001_val", &early),
+        None,
+        None,
+        &stamp(Dialect::V6),
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("D001") && err.contains("[FROM_MS, TO_MS)"),
+        "{err}"
+    );
+    // A `time` window wider than the chart window keeps exactly `[FROM_MS, TO_MS)`.
+    let p = root.join("tests/conformance/fixtures/E/E001.fix");
+    let fix = std::fs::read_to_string(&p).unwrap();
+    let wide = format!(
+        "window\ttime\t{}\t{}",
+        spec::FROM_MS - 10 * spec::TF_MS,
+        spec::TO_MS + 10 * spec::TF_MS
+    );
+    let fix = fix.replace(
+        &format!("window\ttime\t{}\t{}", spec::FROM_MS, spec::TO_MS),
+        &wide,
+    );
+    assert!(fix.contains(&wide));
+    std::fs::write(&p, fix).unwrap();
+    let pos: Vec<(i64, String)> = rows.iter().map(|(t, _)| (*t, "1".to_string())).collect();
+    let ee = export_ms("f_E001_pos", &pos);
+    distil(&sheet, &ee, Some(&[]), None, &stamp(Dialect::V6), false).unwrap();
+    let r1 = series(&load(&root, "E001")).to_vec();
+    assert_eq!(r1.len() as i64, n_bars);
+    assert_eq!(
+        (r1[0].key, r1[r1.len() - 1].key),
+        (spec::FROM_MS, spec::TO_MS - spec::TF_MS)
+    );
+    // E105: mode realtime, driver synsig — by its alignment, no rt / done plots needed.
+    let e105 = export_ms("f_E105_pos", &pos);
+    distil(&sheet, &e105, Some(&[]), None, &stamp(Dialect::V6), false).unwrap();
+    assert_eq!(series(&load(&root, "E105")).len() as i64, n_bars);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// §4.7.8: a `driver rt` fixture keeps the rows where `f_<ID>_rt` and `f_<ID>_done` are 1; `tail n`
+/// selects among them; keys `bars−n..bars`, `bars = history + realtime` (§4.1.6). Fewer such rows
+/// than `n`, or no rt / done plot, is `Err` naming the fixture.
+#[test]
+fn capture_distil_rt_keeps_confirmed_realtime_rows() {
+    let root = tree("rt", &["C039", "C045"]);
+    let sheet = root.join("tests/conformance/sheets/v6/sheet-x.pine");
+    let t = |i: i64| spec::FROM_MS + i * 60_000;
+    // 100 history rows (rt 0, done 1), then 20 realtime rows (rt 1, done 1, val = 100 + i) with one
+    // unconfirmed (done 0) among them, then the open realtime bar (rt 1, done 0).
+    let mut rows: Vec<(i64, String)> = (0..100).map(|i| (t(i), "0,1,1".to_string())).collect();
+    for i in 100..121 {
+        let done = if i == 110 { 0 } else { 1 };
+        rows.push((t(i), format!("1,{done},{}", 100 + i)));
+    }
+    rows.push((t(121), "1,0,7777".to_string()));
+    let titles = "f_C039_rt,f_C039_done,f_C039_val";
+    distil(
+        &sheet,
+        &export_ms(titles, &rows),
+        None,
+        None,
+        &stamp(Dialect::V6),
+        false,
+    )
+    .unwrap();
+    let f = load(&root, "C039");
+    let rt = f.rt.unwrap();
+    assert_eq!(f.bars, Some(rt.history + rt.realtime));
+    let r = series(&f);
+    assert_eq!(r.len(), 16);
+    let total = i64::from(rt.history + rt.realtime);
+    assert_eq!((r[0].key, r[15].key), (total - 16, total - 1));
+    // The last 16 confirmed realtime rows: 105..=120 less the unconfirmed 110 → 104..=120 \ {110}.
+    let vals: Vec<&str> = r.iter().map(|x| text(x, 2)).collect();
+    assert_eq!(vals[0], "204");
+    assert_eq!(vals[15], "220");
+    assert!(!vals.contains(&"210") && !vals.contains(&"7777"));
+    assert!(r.iter().all(|x| text(x, 0) == "1" && text(x, 1) == "1"));
+    // Too few confirmed realtime rows.
+    let few: Vec<(i64, String)> = rows[..110].to_vec();
+    let err = distil(
+        &sheet,
+        &export_ms(titles, &few),
+        None,
+        None,
+        &stamp(Dialect::V6),
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("C039") && err.contains("rt = done = 1"),
+        "{err}"
+    );
+    // C045 (`rt … open`) carries no rt / done plot: refused, named.
+    let c45 = "f_C045_isconfirmed,f_C045_islast,f_C045_isnew,f_C045_isrealtime,f_C045_ishistory,\
+               f_C045_isfirst,f_C045_islch";
+    let rows45: Vec<(i64, String)> = (0..70)
+        .map(|i| (t(i), "0,0,0,0,1,0,0".to_string()))
+        .collect();
+    let err = distil(
+        &sheet,
+        &export_ms(c45, &rows45),
+        None,
+        None,
+        &stamp(Dialect::V6),
+        false,
+    )
+    .unwrap_err();
+    assert!(err.contains("C045") && err.contains("f_C045_rt"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// I9 (pin:06-distil-56): a fixture whose second-dialect capture differs is refused and reported;
+/// every other fixture of the sheet is still written.
+#[test]
+fn capture_distil_i9_refusal_does_not_stop_the_sheet() {
+    let root = tree("i9", &["A001", "A002"]);
+    let sheet = root.join("tests/conformance/sheets/v6/sheet-x.pine");
+    let mk = |a001: &str| {
+        let rows: Vec<(i64, String)> = (0..65i64)
+            .map(|i| (spec::FROM_MS + i * spec::TF_MS, format!("0,{a001},0,2")))
+            .collect();
+        export_ms("f_A001_isna,f_A001_val,f_A002_isna,f_A002_val", &rows)
+    };
+    let v6 = distil(&sheet, &mk("1"), None, None, &stamp(Dialect::V6), false).unwrap();
+    assert_eq!(v6.written.len(), 2);
+    let a001 = root.join("tests/conformance/fixtures/A/A001.fix");
+    let before = std::fs::read_to_string(&a001).unwrap();
+    let v5 = distil(&sheet, &mk("1.5"), None, None, &stamp(Dialect::V5), false).unwrap();
+    assert_eq!(v5.written, [FixtureId::parse("A002").unwrap()]);
+    assert_eq!(v5.refused.len(), 1);
+    assert_eq!(v5.refused[0].0, FixtureId::parse("A001").unwrap());
+    assert!(v5.refused[0].1.contains("A001") && v5.refused[0].1.contains("I9"));
+    assert_eq!(
+        std::fs::read_to_string(&a001).unwrap(),
+        before,
+        "refused, not written"
+    );
+    assert_eq!(load(&root, "A001").captured_in, Some(Dialects::V6));
+    assert_eq!(load(&root, "A002").captured_in, Some(Dialects::BOTH));
+    // Under verify the tracked body is the reference: a difference is `differing`, not refused.
+    let ver = distil(&sheet, &mk("1.5"), None, None, &stamp(Dialect::V5), true).unwrap();
+    assert!(ver.refused.is_empty());
+    assert_eq!(ver.differing, [FixtureId::parse("A001").unwrap()]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// pin:06-trades-time-format — List of Trades times are `YYYY-MM-DD HH:MM` (UTC, the fill bar's
+/// open); the key is required; the chart's `time_format` is untouched.
+#[test]
+fn capture_trades_time_format_ymd_hm() {
+    let f = fmt();
+    assert_eq!(f.trades_time_format, TradesTimeFormat::YmdHm);
+    assert_eq!(
+        parse_trade_time("2026-01-01 00:00", &f).unwrap(),
+        1_767_225_600_000
+    );
+    // probe-03 / E001's first entry: 2026-04-18 03:00 = FROM_MS (2026-04-16) + 2 days + 3 h.
+    assert_eq!(
+        parse_trade_time("2026-04-18 03:00", &f).unwrap(),
+        spec::FROM_MS + 51 * spec::TF_MS
+    );
+    for bad in [
+        "2026-04-18T03:00Z",
+        "2026-04-18 03:00:00",
+        "2026-04-18 3:00",
+        "2026-02-29 00:00",
+        "2026-04-31 00:00",
+        "2026-13-01 00:00",
+        "2026-04-18 24:00",
+        "2026-04-18 03:60",
+        "Open",
+        "",
+    ] {
+        assert!(parse_trade_time(bad, &f).is_err(), "{bad}");
+    }
+    assert!(parse_trade_time("2028-02-29 23:59", &f).is_ok());
+    // A trade row with the chart's ISO spelling is refused, row named.
+    let iso = "1,Entry long,2026-01-01T00:00Z,L,1,1,1,,,,,,,,,,\n";
+    let err = parse_trades_csv(&trades_export(&recon_header(), iso), &f).unwrap_err();
+    assert!(
+        err.contains("row 2") && err.contains("trades_time_format"),
+        "{err}"
+    );
+    // The key is required, and `ymd_hm` is its one value.
+    let e = parse_format(&FORMAT.replace("trades_time_format\tymd_hm\n", ""), "f")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("trades_time_format"), "{e}");
+    let e = parse_format(
+        &FORMAT.replace("trades_time_format\tymd_hm", "trades_time_format\tiso"),
+        "f",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("ymd_hm"), "{e}");
+}
+
+/// The tracked `capture/format.tsv` (probe-00 / probe-03, 2026-10-17, plus `trades_time_format`)
+/// parses and reads a List of Trades under the recon header.
+#[test]
+fn capture_tracked_format_tsv_parses() {
+    let p = real_root().join("tests/conformance/capture/format.tsv");
+    let mut f = parse_format(&std::fs::read_to_string(&p).unwrap(), "format.tsv").unwrap();
+    assert_eq!(f.trades_time_format, TradesTimeFormat::YmdHm);
+    assert_eq!((f.digits, f.delimiter, f.crlf), (17, b',', false));
+    assert!(f.has_ccy());
+    f.resolve_ccy("USDT").unwrap();
+    let t = parse_trades_csv(&trades_export(&recon_header(), RECON_ROWS), &f).unwrap();
+    assert_eq!(t.len(), 2);
+    assert!(t[1].exit.is_none());
 }

@@ -173,10 +173,17 @@ pub struct RunnerOptions {
     pub limits: CompileLimits,
     /// Bars for an align-`Step` fixture whose `bars` is still pending (smoke runs).
     pub syn_bars_default: u32,
+    /// The captured `syminfo.tsv` the runner looks for, resolved against `root` (an absolute path
+    /// stays as it is); absent, the stand-in is read (`pin:06-syminfo-standin`).
+    ///
+    /// `pin:06-runner-syminfo-path` — §3.3 fixes the file at [`chart::SYMINFO_TSV`]; the path is
+    /// injectable so a test can point the runner at an explicitly absent file and hold the
+    /// stand-in's behaviour whether or not the captured file exists in the tree.
+    pub syminfo_tsv: PathBuf,
 }
 
 impl RunnerOptions {
-    /// `root`, no bars root, [`DEFAULT_LIMITS`].
+    /// `root`, no bars root, [`DEFAULT_LIMITS`], the captured syminfo at [`chart::SYMINFO_TSV`].
     ///
     /// `pin:06-syn-bars-default` — §3.3 names `syn_bars_default`, not its value: 64.
     pub fn new(root: PathBuf) -> Self {
@@ -185,6 +192,7 @@ impl RunnerOptions {
             bars_root: None,
             limits: DEFAULT_LIMITS,
             syn_bars_default: 64,
+            syminfo_tsv: PathBuf::from(chart::SYMINFO_TSV),
         }
     }
 }
@@ -265,10 +273,13 @@ fn fix_err(path: &str, line: u32, what: String) -> RunError {
     })
 }
 
-fn load_syminfo(root: &Path) -> Result<(Option<Syminfo>, SyminfoSource), RunError> {
+fn load_syminfo(
+    root: &Path,
+    captured: &Path,
+) -> Result<(Option<Syminfo>, SyminfoSource), RunError> {
     // COPY: syminfo.tsv's bytes (< 1 KiB) once per Runner, at load — the parser owns no file —
     // mapping the file rejected (load time, eight lines).
-    match std::fs::read_to_string(root.join(chart::SYMINFO_TSV)) {
+    match std::fs::read_to_string(root.join(captured)) {
         Ok(t) => {
             return chart::parse_syminfo(&t)
                 .map(|s| (Some(s), SyminfoSource::Captured))
@@ -386,7 +397,7 @@ impl Runner {
     /// outputs: absent, the P&L basis is `Net` (contract §3.12: `pnl_1e12` is net) and the exit-cause
     /// texts are empty (no id-less exit matches until probe-03 measures them).
     pub fn new(opts: RunnerOptions) -> Result<Self, RunError> {
-        let (si, si_src) = load_syminfo(&opts.root)?;
+        let (si, si_src) = load_syminfo(&opts.root, &opts.syminfo_tsv)?;
         // COPY: signals.tsv's bytes (< 1 KiB) once per Runner, at load — the parser owns no file —
         // mapping the file rejected (load time, four lines).
         let signals = match std::fs::read_to_string(opts.root.join(SIGNALS_TSV)) {
