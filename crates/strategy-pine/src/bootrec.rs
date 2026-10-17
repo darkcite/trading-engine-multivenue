@@ -38,6 +38,13 @@
 //!   tape directory's name and `BOOT_HDR`'s `aux`) as a fifth key between `boot_mono_ns` and
 //!   `route`. The extension rule is pin:08-boot-record-facts': the magic stays `# pvm-boot-1`,
 //!   the line is mandatory, so a record written before it fails the strict parse (fail closed).
+//! - pin:08-boot-record-anchor (lead ruling R3, 2026-10-17; retires pin:Bp-recorded-wall-map):
+//!   the header carries the live member's exact wall anchor — the `WallAnchor` pair its
+//!   `PineBootCfg::anchor` held (`mono_ns`, `wall_ns`, decimal u64, ns) — as two keys
+//!   `anchor_mono_ns`, `anchor_wall_ns` right after `route`; replay-from-boot maps a capture
+//!   stamp `ts` to wall time as `anchor_wall + (ts − anchor_mono)` (`WallAnchor::wall_of`), the
+//!   live member's own map. Same extension rule: the magic stays `# pvm-boot-1`, both lines are
+//!   mandatory, so a record written before them fails the strict parse (fail closed).
 
 use crate::{PineSymbolFacts, SlotRoute};
 
@@ -78,6 +85,8 @@ pub struct BootRecord {
     pub boot_utc_ms: i64,
     /// The route the boot ran.
     pub route: SlotRoute,
+    /// pin:08-boot-record-anchor: the live member's wall anchor (`PineBootCfg::anchor`).
+    pub anchor: core_time::WallAnchor,
     /// One per manifest script, manifest order.
     pub scripts: Vec<BootRecordScript>,
     /// pin:08-boot-record-facts: the symbol facts the boot ran on (configure order).
@@ -136,6 +145,11 @@ impl BootRecord {
             self.boot_mono_ns,
             self.boot_utc_ms,
             route_name(self.route)
+        ));
+        // pin:08-boot-record-anchor.
+        s.push_str(&format!(
+            "anchor_mono_ns\t{}\nanchor_wall_ns\t{}\n",
+            self.anchor.mono_ns, self.anchor.wall_ns
         ));
         for sc in &self.scripts {
             s.push_str(&format!("script\t{}\t", sc.idx));
@@ -281,6 +295,14 @@ impl BootRecord {
             "off" => SlotRoute::Off,
             other => return Err(format!("route `{other}` is not paper|live|off")),
         };
+        // pin:08-boot-record-anchor: mandatory (an older record fails closed).
+        let anchor_mono_ns = kv("anchor_mono_ns")?
+            .parse::<u64>()
+            .map_err(|_| "anchor_mono_ns is not a u64")?;
+        let anchor_wall_ns = kv("anchor_wall_ns")?
+            .parse::<u64>()
+            .map_err(|_| "anchor_wall_ns is not a u64")?;
+        let anchor = core_time::WallAnchor::new(anchor_mono_ns, anchor_wall_ns);
         let mut scripts = Vec::new();
         let mut symbols = Vec::new();
         let mut queue_syms: Option<Vec<core_types::SymbolId>> = None;
@@ -349,6 +371,7 @@ impl BootRecord {
             boot_mono_ns,
             boot_utc_ms,
             route,
+            anchor,
             scripts,
             symbols,
             queue_syms,
@@ -374,6 +397,7 @@ mod tests {
             boot_mono_ns: 42,
             boot_utc_ms: 1_760_000_000_124,
             route: SlotRoute::Paper,
+            anchor: core_time::WallAnchor::new(31_000_000_017, 1_760_000_000_123_999_001),
             scripts: vec![
                 BootRecordScript {
                     idx: 0,
@@ -431,6 +455,36 @@ mod tests {
         assert!(text.contains("\nboot_mono_ns\t42\nboot_utc_ms\t1760000000124\nroute\tpaper\n"));
         assert!(text.contains("\t0123456789abcdef\n"));
         assert_eq!(BootRecord::parse(&text).unwrap(), r);
+    }
+
+    /// pin:08-boot-record-anchor: the live wall anchor (ns, exact) right after `route`; both
+    /// keys mandatory, in place, u64 — a record without them fails closed.
+    #[test]
+    fn boot_record_carries_the_live_wall_anchor() {
+        let r = rec();
+        let text = r.render();
+        assert!(text.contains(
+            "\nroute\tpaper\nanchor_mono_ns\t31000000017\nanchor_wall_ns\t1760000000123999001\nscript\t0\t"
+        ), "{text}");
+        assert_eq!(BootRecord::parse(&text).unwrap().anchor, r.anchor);
+        for bad in [
+            text.replacen("anchor_mono_ns\t31000000017\n", "", 1),
+            text.replacen("anchor_wall_ns\t1760000000123999001\n", "", 1),
+            text.replacen("anchor_mono_ns\t31000000017", "anchor_mono_ns\t-1", 1),
+            text.replacen(
+                "anchor_wall_ns\t1760000000123999001",
+                "anchor_wall_ns\t1.5",
+                1,
+            ),
+            text.replacen(
+                "anchor_mono_ns\t31000000017\nanchor_wall_ns\t1760000000123999001",
+                "anchor_wall_ns\t1760000000123999001\nanchor_mono_ns\t31000000017",
+                1,
+            ),
+        ] {
+            assert_ne!(bad, text);
+            assert!(BootRecord::parse(&bad).is_err(), "accepted: {bad}");
+        }
     }
 
     /// pin:08-boot-record-facts / pin:08-verify-queue-sym-ineligible / pin:08-boot-record-exec-sha:

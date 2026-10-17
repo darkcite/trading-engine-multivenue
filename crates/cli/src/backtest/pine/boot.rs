@@ -8,7 +8,10 @@
 //! refusals, all exit 6 before any record — more than one run in the root,
 //! a record epoch other than the run directory's, a window whose anchor is
 //! later than `boot_mono_ns + BOOT_SLACK_NS`, a manifest that does not hash
-//! to the record, `--fills recorded` without `--delivery-journal`.
+//! to the record, `--fills recorded` without `--delivery-journal`, a
+//! `--delivery-journal` that does not resolve or has `pine-delivery.void`
+//! beside its canonical path (pin:08-delivery-void-file, risk r23 B3;
+//! pin:08-delivery-journal-canonical, risk r24).
 //!
 //! Literal readings:
 //! - pin:Bp-boot-record-default — without `--boot-record` the record is
@@ -92,6 +95,43 @@ fn refuse(msg: String) -> DriveFail {
     }
 }
 
+/// pin:08-delivery-void-file (risk r23 B3): a journal the live hook voided — a gap or a write
+/// error, marked by `pine-delivery.void` beside it — is refused, exit 6. A marker that cannot be
+/// checked (any error but not-found) refuses too.
+///
+/// pin:08-delivery-journal-canonical (risk r24): the marker is looked up beside the journal's
+/// `std::fs::canonicalize`d path, so a journal reached through a symlink finds its run's marker;
+/// a path that does not resolve is refused. Returns that path — the file checked is the file
+/// read. A journal COPIED away from its run carries no marker: `--delivery-journal` must be the
+/// live run's own `<run>/pine-delivery.bin` (risk-policy, "PVM — slot 8, paper only").
+fn refuse_voided_journal(p: &std::path::Path) -> Result<PathBuf, DriveFail> {
+    let real = std::fs::canonicalize(p).map_err(|e| {
+        refuse(format!(
+            "--delivery-journal {} cannot be resolved: {e}",
+            p.display()
+        ))
+    })?;
+    let void = real.with_file_name(crate::pine_delivery::VOID_FILE);
+    match std::fs::symlink_metadata(&void) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(real),
+        Err(e) => Err(refuse(format!(
+            "--delivery-journal {}: its void marker {} cannot be checked: {e}",
+            p.display(),
+            void.display()
+        ))),
+        Ok(_) => {
+            let text = std::fs::read_to_string(&void).unwrap_or_default();
+            Err(refuse(format!(
+                "--delivery-journal {} was voided by its live boot ({}: {}) — a voided journal \
+                 is not replayed",
+                p.display(),
+                void.display(),
+                text.lines().nth(1).unwrap_or("no reason recorded")
+            )))
+        }
+    }
+}
+
 /// §4.12's inputs and refusals (exit 6 each).
 pub(crate) fn check_inputs(a: &ReplayArgv) -> Result<ReplayInputs, DriveFail> {
     let fills = match a.fills.as_str() {
@@ -105,6 +145,11 @@ pub(crate) fn check_inputs(a: &ReplayArgv) -> Result<ReplayInputs, DriveFail> {
             "--fills recorded needs --delivery-journal (impl-08 R6)".to_owned(),
         ));
     }
+    // pin:08-delivery-journal-canonical: the canonical path is the one read below.
+    let journal_real = match &a.delivery_journal {
+        Some(p) => Some(refuse_voided_journal(p)?),
+        None => None,
+    };
     let mut runs = discover_runs(&a.window_root).map_err(|e| refuse(e.to_string()))?;
     if runs.len() != 1 {
         return Err(refuse(format!(
@@ -146,7 +191,7 @@ pub(crate) fn check_inputs(a: &ReplayArgv) -> Result<ReplayInputs, DriveFail> {
             a.manifest.display()
         )));
     }
-    let journal = match &a.delivery_journal {
+    let journal = match &journal_real {
         Some(p) => Some(
             crate::pine_delivery::read_journal(p)
                 .map_err(|e| refuse(format!("--delivery-journal {}: {e}", p.display())))?,

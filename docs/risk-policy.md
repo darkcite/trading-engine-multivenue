@@ -17034,9 +17034,19 @@ capture durability, not an observability option. Only the `engine_pine_*` mirror
 `engine_loop_drains_pine_outside_the_metrics_gate`.
 *Amended 2026-10-17 (risk r21 #3, `pin:08-tape-buffered`):* the tapes exist only with
 `--pine-tape`. Each engine-thread writer (`seq.bin`, `decisions.bin`, `set.tsv`,
-`pine-delivery.bin`) is a 64 KiB `BufWriter` allocated when it opens at boot; a 5 s drain writes
-into the buffers and flushes once, and the final drain flushes too. A write or flush error is
-logged at ERROR and voids the window; it never stops the engine.
+`pine-delivery.bin`) is a 64 KiB `BufWriter` allocated when it opens at boot. A 5 s pass costs
+one flush per file, plus a write(2) per full 64 KiB buffer, and no fsync; the final drain flushes
+too. A write or flush error is logged at ERROR; it never stops the engine. *Amended 2026-10-17
+(risk r23 B3):* what "void" means per file. The tapes' cursors move per record written and the
+buffer keeps unwritten bytes, so a later pass retries without duplicates; a failure that persists
+leaves a shorter tape (8g-A red, or an honest shorter window). The delivery journal is voided by
+a file: see `pine-delivery.void` below. *Amended 2026-10-17 (risk r24):* voiding costs the 5 s
+pass once per boot, and only on that failure: `void()` opens the marker `O_CREAT|O_EXCL`
+(`create_new`), makes a few small unbuffered writes with no fsync, and drops the journal writer
+(one last flush attempt, the close, and the free of its 64 KiB buffer and 8 KiB drain slice).
+On the write-error branch the marker's `write\t<error>` line formats the OS error, which may
+allocate once (the existing `error = %e` log line on that branch already did). Every later pass
+skips the journal.
 
 **The boot record and `pine-verify` (risk review r21, 2026-10-17).**
 - **`<run>/pine-boot.tsv`** (`# pvm-boot-1`) is written once, atomically, right after
@@ -17049,7 +17059,24 @@ logged at ERROR and voids the window; it never stops the engine.
   symbol. The kept list goes to slot 8's hook after every member block, so the record cannot
   miss one, whatever the block order (r21 #4).
 - **`<run>/pine-delivery.bin`** (R6) is written with `--pine-tape` only. Raw 32 B records,
-  append-only; a gap voids the window.
+  append-only; a gap voids the window. *Amended 2026-10-17 (risk r23 B3,
+  `pin:08-delivery-void-file`, `pin:08-delivery-cursor-per-record`):* the cursor moves per record
+  written, so a retried drain never writes a record twice. A gap or a write / flush error closes
+  the journal for the rest of the boot and creates `<run>/pine-delivery.void` once
+  (`create_new`; `# pvm-delivery-void-1`, then `gap\t<n>` or `write\t<error>`).
+  `backtest --replay-from-boot` refuses a `--delivery-journal` with that file beside it, exit 6,
+  before any record. *Amended 2026-10-17 (risk r24, `pin:08-delivery-journal-canonical`):* it
+  first resolves `--delivery-journal` with `std::fs::canonicalize` (a path that does not resolve
+  is refused, exit 6), looks for the marker beside the resolved file, and reads that file. The
+  guarantee is exactly this, with two limits:
+  - **A copied journal carries no marker.** The marker is looked up beside the journal's
+    canonical path only, so a symlink to the run's journal is judged by the run's marker, but a
+    journal COPIED elsewhere (into a hand-built window root beside `pine-boot.tsv`, say) is read
+    as if whole. `--delivery-journal` must be the live run's own `<run>/pine-delivery.bin`.
+  - **A marker that cannot be created is only logged**: ERROR `pine: delivery void marker NOT
+    written` (with `error` and `path`), after the ERROR that voided the journal; the run goes on.
+    The records carry no journal ordinal, so nothing else on disk marks that hole: those two log
+    lines are then the only record that the journal is void.
 - **`pine-verify` is offline and read-only.** It opens no socket, reads no `.env` and arms
   nothing. It replays on its own slot-8-only `PaperMatcher`. An armed `exec.toml` is loaded under
   its own arming: rule 3 is a re-hash of the bytes against `exec_sha256`, never the two-switch
@@ -17063,6 +17090,75 @@ logged at ERROR and voids the window; it never stops the engine.
 - **Replay tapes never append.** `backtest --replay-from-boot --tape-out` names its tape directory
   from the record's `boot_utc_ms` and creates every file new. An existing tape is refused with
   exit 2 (r21 #5). `pine-verify --cross` therefore pairs live and replay tapes exactly.
+
+**8g-B pairing and the output paths (risk review r22, 2026-10-17).**
+- **The pairing rule (B1, N1).** `pine-verify --cross <root>` pairs the live tape
+  `tape/<boot_utc_ms>/` with `<root>/<boot_utc_ms>/`, made by
+  `backtest --replay-from-boot --fills recorded --tape-out <root>` over that boot's run (same
+  label, same `oid_epoch`). Each of the following makes the window ineligible: listed with its
+  reason, never counted, never red.
+  - No tape under the label (rule 7).
+  - A seq gap in either replay tape.
+  - A replay `BOOT_HDR` that does not read route Paper, host Replay, and the live header's
+    `oid_epoch` and `boot_utc_ms`; or a live header whose host is not Engine. The live tape is
+    never paired with itself (`pin:08-cross-pair-is-replay`).
+  - A replay made in the other mode. `--tape-out` writes `replay.tsv` (`# pvm-replay-1`, then
+    `fills\t<mode>`), created new. 8g-B pairs with `recorded` only. Absent, malformed or
+    `judged` is ineligible (`pin:08-cross-replay-fills-file`). *Amended 2026-10-17 (risk r23
+    B2, `pin:08-replay-file-after-clean-drive`):* `replay.tsv` is written last, after the final
+    flush, and only by a drive that finished clean. A replay that faulted (exit 4), diverged
+    (exit 5) or aborted on an I/O error has tapes but no `replay.tsv`; its window is ineligible
+    ("unrecorded or unfinished replay"). impl-08 §4.9 names no mode;
+    impl-Bp §4.12 recommends `recorded` as the member-determinism gate
+    (`pin:08-cross-fills-recorded`).
+  - Different `BOOT_SCRIPT` sets on the two tapes (`pin:08-cross-boot-scripts`).
+- **Four tape fields are NOT compared (N2, `pin:08-cross-fields-listed`).** A pair is equal iff
+  the fields impl-08 §4.9.1 lists for its kind are equal. `DISPATCH`: a, b, c, bar, oid, px,
+  qty, id, previous oid. `DISPOSITION`: a, oid. `FILL`: oid, px, signed qty, fee, `time_ms`.
+  The four fields outside those lists:
+  - `DISPOSITION.b`, the rule. It is the host's: 1 (paper evidence) live, 3 on the replay.
+  - `FILL.a`, the origin. It is the host's.
+  - `FILL.b`, the side. The signed qty carries it.
+  - `FILL.bar_index`. §4.9.1's `FILL` list names no bar.
+
+  8g-B cannot see a difference in these four.
+- **The wall anchor (`pin:08-boot-record-anchor`, lead ruling R3; retires
+  `pin:Bp-recorded-wall-map`).** The boot record carries the live member's wall anchor, exact
+  in ns. The replayed member runs on the identity anchor. The harness maps every record and
+  journal stamp onto the live anchor: `wall = anchor_wall + (ts − anchor_mono)`. The
+  `BOOT_HDR` anchor words (x0, x1) are therefore not compared.
+- **`set.tsv` must cover the window (C1, `pin:08-set-rows-span`).** Rules 4/6 hold only when
+  all of the following do; else the window is ineligible.
+  - Rows strictly increase, each at most 10 s after the one before (`0 < d ≤ 10 000` ms,
+    overflow-checked).
+  - The first row is at most 10 s after the boot.
+  - The last row is at least `min(boot + 2 h, last in-window seq record's wall) − 10 s`. With
+    no seq record, the boot stands in.
+  - Every row has slot 8's bit set, and every row reads `rejected_open_cap` 0 (a short row
+    fails).
+- **`--report-out` and `--tape-out` refusals (C2, C3).** Each path is judged on its canonical
+  form (`pin:08-out-canonical`): the longest existing prefix goes through `canonicalize`, which
+  follows every symlink; the remainder is applied lexically. A dangling link cannot be
+  resolved: exit 6.
+  - Inside a git working tree, a symlink into one included: exit 6.
+  - A report under `~/multivenue/` but not under `~/multivenue/pine/` (both canonical): exit 6
+    (`pin:08-report-out-pine-only`).
+  - An existing report: exit 2, before any record. The one write is `create_new`, so a report
+    is never overwritten (`pin:08-report-out-create-new`).
+  - The replay's default report, `~/multivenue/pine/8g/<run>.jsonl`, is checked the same way.
+  - `--tape-out` gets the git refusal only, not the pine-only rule (risk r23): a tape under the
+    live root `~/multivenue/pine/tape/` is accepted. Harmless: every file is created new (an
+    existing label exits 2, never appended), and a replay tape carries host Replay, so rule 1
+    (host Engine) makes a window read from it ineligible.
+  - `--report-out` belongs to the pine arms only (`--strategy pine`, `--replay-from-boot`). The
+    legacy ruleset arm refuses it at parse (C4, `pin:Bp-8g-report-out-shared`).
+- **The live tape is created new (`pin:08-live-tape-create-new`; retires the live
+  create-or-append).** The live `--pine-tape` creates every file under
+  `~/multivenue/pine/tape/<boot_utc_ms>/` new. A second boot on the same label, or a clock
+  stepped back onto an earlier one, finds the files (a dangling link counts). That boot's tapes
+  are then OFF, with one ERROR line (`pine: --pine-tape not opened — tapes OFF for this boot,
+  window void`). Nothing is appended to the earlier tape. The boot itself never fails because
+  of a tape: `incidents.log` still appends and the member runs.
 
 **Bench.** `bench/benches/hot_path.rs` builds `StrategySet::new(BUILT_MASK)`, so
 `strategy_set/on_tick_all` now includes the inert pine member (one branch and one counter); a
@@ -17088,4 +17184,20 @@ logged at ERROR and voids the window; it never stops the engine.
 `verify_queue_tracked_pine_symbol_is_ineligible`), `tests/pine_hook.rs`, `pine_tape`
 `create_new_refuses_an_existing_tape`, `pine_delivery`
 `queue_syms_reach_the_boot_record_whatever_the_block_order`; `strategy-pine` `bootrec`
-(`boot_record_round_trips`, `boot_record_parse_is_strict`) and `tests/bootrec.rs`.
+(`boot_record_round_trips`, `boot_record_parse_is_strict`,
+`boot_record_carries_the_live_wall_anchor`) and `tests/bootrec.rs`. Risk review r22: `cli`
+`backtest::pine::fees` (`a_symlink_into_a_git_tree_is_refused`,
+`a_report_under_multivenue_must_be_under_pine`, `a_report_is_created_new_and_never_overwritten`),
+`drive8g` (`report_out_and_tape_out_refuse_git_and_a_symlink_into_git`,
+`an_existing_report_out_is_refused_and_kept`,
+`tape_out_writes_the_replay_tapes_under_the_boot_label`), `backtest::pine::run`
+`report_out_refuses_git_a_link_into_git_and_an_existing_file`, `tests/backtest_pine_gate.rs`
+`report_out_is_refused_by_the_legacy_ruleset_arm`, `pine_tape`
+`live_open_refuses_a_second_boot_on_the_same_label`, `pine_metrics`
+`a_second_boot_on_the_same_label_runs_with_tapes_off`, `pine_verify`
+(`set_rules_require_increasing_rows_at_most_10_s_apart`,
+`set_rules_require_the_rows_to_cover_the_window`), `pine_verify::cross`
+(`cross_refuses_the_live_tape_as_its_own_replay`,
+`cross_refuses_a_replay_made_in_the_wrong_fills_mode`, `cross_compares_only_the_listed_fields`),
+`tests/pine_verify.rs` (`cross_pairs_a_live_paper_window_with_its_replay_from_boot`,
+`replay_from_boot_recorded_mode_reproduces_the_live_fills`).

@@ -444,6 +444,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// pin:08-live-tape-create-new (risk r22): a second boot on the same `boot_utc_ms` label (a
+    /// restart within the millisecond, a clock stepped back) finds the first boot's tape — its
+    /// tapes are OFF (the window is void) and nothing is appended to the earlier tape, but the
+    /// boot goes on: `open` returns, incidents still reach `incidents.log`, drains do not fail.
+    #[test]
+    fn a_second_boot_on_the_same_label_runs_with_tapes_off() {
+        let dir = std::env::temp_dir().join(format!("pine-drain-again-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let boot = 1_767_225_600_000i64;
+        let io = PineIo {
+            pine_dir: dir.clone(),
+            tape: true,
+            boot_utc_ms: boot,
+        };
+        let m = Rings {
+            inc: vec![PineIncident {
+                seq: 0,
+                event: pine_incident::FAULT,
+                ..PineIncident::default()
+            }],
+            seq: vec![strategy_core::PineSeqRec {
+                seq: 1,
+                ..Default::default()
+            }],
+            dec: vec![strategy_core::PineTapeRec::default()],
+        };
+        let mc = clob_dispatcher::MatcherCounters::default();
+        let mut first = PineDrain::open(&io);
+        assert!(first.tape.is_some());
+        first.drain(&m, boot + 5_000, &mc);
+        drop(first);
+        let tape = dir.join("tape").join(boot.to_string());
+        let before: Vec<Vec<u8>> = ["seq.bin", "decisions.bin", "set.tsv"]
+            .iter()
+            .map(|n| std::fs::read(tape.join(n)).expect("first tape"))
+            .collect();
+        let mut again = PineDrain::open(&io);
+        assert!(again.tape.is_none(), "tapes OFF for the second boot");
+        assert!(again.log.is_some(), "the boot goes on");
+        again.drain(&m, boot + 5_000, &mc);
+        again.drain(&m, boot + 10_000, &mc);
+        let after: Vec<Vec<u8>> = ["seq.bin", "decisions.bin", "set.tsv"]
+            .iter()
+            .map(|n| std::fs::read(tape.join(n)).expect("first tape"))
+            .collect();
+        assert_eq!(after, before, "nothing appended to the earlier tape");
+        let log = std::fs::read_to_string(dir.join("incidents.log")).expect("incidents.log");
+        assert_eq!(
+            log.lines().count(),
+            2,
+            "both boots log their incident: {log}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// pin:08-drain-outside-metrics, structurally: in the engine loop's 5 s block the pine drain
     /// sits beside `hook.drain` BEFORE the metrics gate and only the mirror inside it; the
     /// shutdown drains it too, before `eng.stop()`.
@@ -560,6 +615,9 @@ impl PineDrain {
     /// Boot-only: open `incidents.log` (append) and, with `--pine-tape`, the tape directory. A
     /// file that cannot be opened is logged and its drain skipped — never a refused boot (the
     /// member keeps its rings; `incidents` and the tape counters still count).
+    /// pin:08-live-tape-create-new (risk r22): the tape is created new; an existing tape under
+    /// this boot's label (a second boot on it, a clock stepped back) or any other open error
+    /// turns the tapes OFF for this boot with one ERROR line — the window is void.
     #[must_use]
     pub fn open(io: &PineIo) -> Self {
         let _ = std::fs::create_dir_all(&io.pine_dir);
@@ -575,7 +633,12 @@ impl PineDrain {
                 io.boot_utc_ms,
                 &MATCHER_COLS,
             )
-            .map_err(|e| tracing::error!(error = %e, "pine: tape directory not writable"))
+            .map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    "pine: --pine-tape not opened — tapes OFF for this boot, window void"
+                );
+            })
             .ok()
         } else {
             None

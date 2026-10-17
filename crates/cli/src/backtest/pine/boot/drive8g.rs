@@ -48,8 +48,11 @@
 //! - pin:Bp-recorded-model-fills-discarded — in recorded mode the model still
 //!   sees every tick (intake and caps stay paper's), but its fills are
 //!   dropped: the journal's fills are the member's.
-//! - pin:Bp-recorded-wall-map — journal stamps (timers, fills) are engine
-//!   clock and reach the member on the run's wall map, as records do.
+//! - pin:08-boot-record-anchor (lead ruling R3, 2026-10-17; retires
+//!   pin:Bp-recorded-wall-map, the `run_epoch + (ts − first_ts)` map) —
+//!   records and journal stamps (timers, fills) are engine clock and reach
+//!   the member on the live member's own anchor from the boot record:
+//!   `wall = anchor_wall + (ts − anchor_mono)` (`WallAnchor::wall_of`).
 //! - pin:Bp-8g-tape-set-line — the replay writes one `set.tsv` line at the
 //!   end: the set's enabled mask and zero matcher counters (a replay has no
 //!   paper matcher).
@@ -72,7 +75,7 @@ use crate::backtest::pine::drive::{
     load_cut, CutSpace, DriveCfg, DriveFail, DriveHook, DriveOut, Loop, PineCtx, PineMember,
     Residency, SignalRec, EXIT_FAULT,
 };
-use crate::backtest::pine::fees::refuse_inside_git;
+use crate::backtest::pine::fees::{check_report_out, refuse_inside_git, write_new};
 use crate::backtest::pine::run::{plan_from_runs, PineExit};
 use crate::backtest::{parse_model_params, HarnessError, MergedRec, RecPayload, VIRT_T0};
 use crate::pine_tape::PineTapeWriter;
@@ -565,6 +568,12 @@ pub(crate) fn load_window(x: &ReplayInputs, route: &[u32]) -> Result<Vec<MergedR
         &mut buf,
     )
     .map_err(|e| pre(e.to_string()))?;
+    // pin:08-boot-record-anchor: each record's wall on the live anchor — its capture stamp is
+    // `first_ts + (virt − VIRT_T0)` (pin:Bp-8g-virt, one cut over the run's own span).
+    let (anchor, first_ts) = (x.record.anchor, x.span.first_ts_ns);
+    for r in &mut buf {
+        r.wall_ns = anchor.wall_of(first_ts.saturating_add(r.virt_ns.saturating_sub(VIRT_T0)));
+    }
     Ok(buf)
 }
 
@@ -585,7 +594,9 @@ pub(crate) fn run_8g(a: &ReplayArgv, x: ReplayInputs) -> Result<PineExit, DriveF
             .join("multivenue/pine/8g")
             .join(format!("{run_id}.jsonl"))
     });
-    refuse_inside_git("--report-out", &report)?;
+    // pin:08-out-canonical, pin:08-report-out-pine-only, pin:08-report-out-create-new (risk r22
+    // C2/C3): the default path too — outside git, under `~/multivenue/` only in `pine/`, new.
+    check_report_out("--report-out", &report)?;
     if let Some(t) = &a.tape_out {
         refuse_inside_git("--tape-out", t)?;
     }
@@ -640,8 +651,9 @@ pub(crate) fn run_8g(a: &ReplayArgv, x: ReplayInputs) -> Result<PineExit, DriveF
         FillSource::Recorded => {
             let journal = x.journal.as_deref().unwrap_or(&[]);
             let plan = plan_recorded(journal, &recs, &eng_fills)?;
-            let epoch = x.run.epoch_ns;
-            let wall_of = |ts: u64| epoch + ts.saturating_sub(first_ts);
+            // pin:08-boot-record-anchor: the live member's own map.
+            let anchor = x.record.anchor;
+            let wall_of = |ts: u64| anchor.wall_of(ts);
             drive_recorded(
                 &mut set, &mut fills, &recs, &plan, journal, &eng_fills, wall_of, &mut tape,
             )?
@@ -653,6 +665,20 @@ pub(crate) fn run_8g(a: &ReplayArgv, x: ReplayInputs) -> Result<PineExit, DriveF
             .map_err(|e| io_fail(format!("tape set.tsv: {e}")))?;
         // pin:08-tape-buffered: the final flush.
         w.flush().map_err(|e| io_fail(format!("tape flush: {e}")))?;
+        // pin:08-cross-replay-fills-file (risk r22 N1): the replay tape names its fill source, so
+        // `pine-verify --cross` refuses a replay made in the other mode.
+        // pin:08-replay-file-after-clean-drive (risk r23 B2): written last, and only by a drive
+        // that finished clean — a fault or a divergence (`run.fail`) writes none, and an I/O
+        // abort returned above. An unfinished replay then has no `replay.tsv`, and `pair()`
+        // makes its window ineligible.
+        if run.fail.is_none() {
+            let mode = match x.fills {
+                FillSource::Judged => "judged",
+                FillSource::Recorded => "recorded",
+            };
+            w.replay_mode(mode)
+                .map_err(|e| io_fail(format!("tape {}: {e}", crate::pine_tape::REPLAY_FILE)))?;
+        }
     }
     write_report(&report, &run_id, &x, &recs, &run, &eng_fills, boot_utc_ms)
 }
@@ -738,7 +764,8 @@ fn write_report(
     }
     let mut body = lines.join("\n");
     body.push('\n');
-    std::fs::write(path, body).map_err(|e| io_fail(format!("{}: {e}", path.display())))?;
+    // pin:08-report-out-create-new: never overwritten (exit 2 if one appeared since the check).
+    write_new("--report-out", path, body.as_bytes())?;
     Ok(PineExit {
         code,
         stdout: summary,

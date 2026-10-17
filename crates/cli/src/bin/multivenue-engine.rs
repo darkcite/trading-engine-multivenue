@@ -1162,7 +1162,11 @@ struct XmmParityArgs {
     tail_s: u64,
 }
 
+/// pin:Bp-8g-report-out-shared (risk r22 C4): `--report-out` belongs to the Pine arms only —
+/// `--strategy pine` or `--replay-from-boot` (the group `pine_report_arm`); the legacy ruleset /
+/// member arm refuses it at parse.
 #[derive(Debug, Parser)]
+#[command(group(clap::ArgGroup::new("pine_report_arm").args(["strategy", "replay_from_boot"])))]
 struct BacktestArgs {
     /// Candidate ruleset JSON artifact (8g §4.1 grammar). Required
     /// unless `--member` names a coded member (Tier 3).
@@ -1361,9 +1365,9 @@ struct BacktestArgs {
     ret_dir: Option<PathBuf>,
     /// B'3: also write the `pvm-t2-1` report line here; 8g: the `pvm-8g-1` lines (default
     /// `~/multivenue/pine/8g/<run-id>.jsonl`). pin:Bp-8g-report-out-shared — shared with
-    /// `--replay-from-boot`, so its `requires = "strategy"` is dropped; the legacy arm never
-    /// reads it.
-    #[arg(long)]
+    /// `--replay-from-boot`: it requires `--strategy` or `--replay-from-boot` (risk r22 C4), so
+    /// the legacy arm refuses it.
+    #[arg(long, requires = "pine_report_arm")]
     report_out: Option<PathBuf>,
     /// B'3: the scoring window `<from_ms>:<to_ms>`.
     #[arg(long, requires = "strategy")]

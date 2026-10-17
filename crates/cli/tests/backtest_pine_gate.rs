@@ -59,3 +59,44 @@ fn null_arm_without_a_seed_exits_2_and_writes_nothing() {
     assert!(!d.join("out").exists(), "nothing written");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// pin:Bp-8g-report-out-shared (risk r22 C4): the legacy ruleset arm refuses `--report-out` at
+/// parse (exit 2, nothing written); `--replay-from-boot` still takes it (no parse refusal).
+#[test]
+fn report_out_is_refused_by_the_legacy_ruleset_arm() {
+    let d = scratch("reportout");
+    let rep = d.join("r.jsonl");
+    let o = Command::new(BIN)
+        .args(["backtest", "--ruleset"])
+        .arg(d.join("ruleset.json"))
+        .arg("--replay-dir")
+        .arg(d.join("replay"))
+        .args(["--split", "70/30", "--report-out"])
+        .arg(&rep)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(2), "{err}");
+    assert!(
+        err.contains("required arguments were not provided"),
+        "{err}"
+    );
+    assert!(o.stdout.is_empty() && !rep.exists());
+    let o = Command::new(BIN)
+        .arg("backtest")
+        .arg("--replay-from-boot")
+        .arg(d.join("absent-window"))
+        .arg("--pine-manifest")
+        .arg(d.join("manifest.toml"))
+        .arg("--report-out")
+        .arg(&rep)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !err.contains("required arguments were not provided"),
+        "{err}"
+    );
+    assert!(!err.contains("cannot be used with"), "{err}");
+    let _ = std::fs::remove_dir_all(&d);
+}

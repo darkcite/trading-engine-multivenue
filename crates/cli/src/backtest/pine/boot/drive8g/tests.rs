@@ -100,10 +100,15 @@ fn write_run(dir: &Path, stale_k: u64) {
 /// The window root, the manifest, the universe and the paper boot's own
 /// record (`pine-boot.tsv`); the capture's orders are written by `capture`.
 fn fixture(tag: &str) -> (Fx, ReplayArgv) {
+    fixture_with(tag, "hold.pine")
+}
+
+/// [`fixture`] on another script of the fixture directory.
+fn fixture_with(tag: &str, script: &str) -> (Fx, ReplayArgv) {
     let root = std::env::temp_dir().join(format!("cli-pine-8g-drive-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     write_run(&run_dir(&root), 40);
-    let src = std::fs::read(script_dir().join("hold.pine")).unwrap();
+    let src = std::fs::read(script_dir().join(script)).unwrap();
     let sha: String = core_crypto::sha256(&src)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -111,7 +116,7 @@ fn fixture(tag: &str) -> (Fx, ReplayArgv) {
     std::fs::write(
         root.join("manifest.toml"),
         format!(
-            "[[script]]\nsha256 = \"{sha}\"\nfile = \"hold.pine\"\ndialect = 6\nenabled = 1\n\
+            "[[script]]\nsha256 = \"{sha}\"\nfile = \"{script}\"\ndialect = 6\nenabled = 1\n\
              mode = \"bar_close\"\nsymbol = \"hyperliquid:btc\"\ntimeframe_s = 60\n\
              venue = \"hyperliquid\"\nmax_bars_back = 5000\ncoalesce_ms = 250\n\
              coalesce_bps = 0\ninsn_budget = 2000000\nqty_notional_1e6 = 12000000\n\
@@ -150,7 +155,10 @@ fn fixture(tag: &str) -> (Fx, ReplayArgv) {
     // pin:08-boot-record-boot-utc-ms: the paper boot's instant, carried by its record.
     let set = boot_set(&a, facts, [0; 32], None, BOOT_MS, &mut fills)
         .unwrap_or_else(|f| panic!("{}", f.err));
-    let rec = set.pine().boot_record(EA, 0).expect("record");
+    let mut rec = set.pine().boot_record(EA, 0).expect("record");
+    // pin:08-boot-record-anchor: the paper boot's anchor — wall EA at capture ts 0, the venue
+    // clock `write_run` stamps (this stand-in boot ran on the replay host's identity anchor).
+    rec.anchor = core_time::WallAnchor::new(0, EA);
     std::fs::write(root.join("pine-boot.tsv"), rec.render()).unwrap();
     (Fx { root }, a)
 }
@@ -162,6 +170,13 @@ fn model() -> ModelParams {
 /// The paper session: the plain loop over the window, every emission
 /// stamped `POP` after its record's ingress, slot 8's.
 fn paper_orders(a: &ReplayArgv) -> Vec<Order> {
+    let (orders, faulted) = paper_session(a);
+    assert!(!faulted);
+    orders
+}
+
+/// [`paper_orders`] and whether the session faulted (its emissions up to the fault).
+fn paper_session(a: &ReplayArgv) -> (Vec<Order>, bool) {
     let x = check_inputs(a).unwrap_or_else(|f| panic!("{}", f.err));
     let mut fills = FillEngine::new(model(), u64::MAX);
     let mut set = super::boot_from_record(a, &x, x.record.boot_utc_ms, &mut fills)
@@ -169,9 +184,9 @@ fn paper_orders(a: &ReplayArgv) -> Vec<Order> {
     let recs = load_window(&x, &[SYM]).unwrap_or_else(|f| panic!("{}", f.err));
     let run = drive_judged(&mut set, &mut fills, &recs, None, &mut None)
         .unwrap_or_else(|f| panic!("{}", f.err));
-    assert!(run.fail.is_none());
     let first = x.span.first_ts_ns;
-    run.log
+    let orders = run
+        .log
         .emits
         .iter()
         .map(|(o, virt)| {
@@ -180,7 +195,8 @@ fn paper_orders(a: &ReplayArgv) -> Vec<Order> {
             c.ts_ns = first + (virt - VIRT_T0) + POP;
             c
         })
-        .collect()
+        .collect();
+    (orders, run.fail.is_some())
 }
 
 fn write_orders(a: &ReplayArgv, orders: &[Order]) {
@@ -443,9 +459,16 @@ fn tape_out_writes_the_replay_tapes_under_the_boot_label() {
     assert_eq!(lines.len(), 2, "{set}");
     assert!(lines[0].starts_with("#utc_ms\tmask\t"));
     assert!(lines[1].starts_with(&format!("{label}\t")));
+    // pin:08-cross-replay-fills-file (risk r22 N1): the tape names its fill source.
+    assert_eq!(
+        crate::pine_verify::cross::replay_fills(&dir).as_deref(),
+        Some("judged")
+    );
     // pin:08-tape-out-create-new (risk r21 #5): a second replay into the same
-    // `--tape-out` is refused, exit 2, and the first tape is untouched.
+    // `--tape-out` is refused, exit 2, and the first tape is untouched (a new
+    // `--report-out`: the first report is never overwritten either).
     let before = std::fs::read(dir.join("decisions.bin")).unwrap();
+    a.report_out = Some(fx.root.join("out/8g-again.jsonl"));
     let again = super::super::replay_from_boot_main(&a);
     assert_eq!(again.code, super::EXIT_TAPE_EXISTS, "{}", again.stderr);
     assert_eq!(again.code, 2);
@@ -466,13 +489,23 @@ fn cross_pairs_replay_tapes_by_label_and_reports_a_seeded_divergence() {
     a.tape_out = Some(fx.root.join("live"));
     assert_eq!(super::super::replay_from_boot_main(&a).code, 0);
     a.tape_out = Some(fx.root.join("replay"));
+    // pin:08-report-out-create-new: each run its own report.
+    a.report_out = Some(fx.root.join("out/8g-replay.jsonl"));
     assert_eq!(super::super::replay_from_boot_main(&a).code, 0);
     // pin:08-boot-record-boot-utc-ms: both tapes carry the record's label exactly.
     let label = BOOT_MS.to_string();
     let live = cross::read_tapes(&fx.root.join("live").join(&label)).expect("live tapes");
-    let rep = pair(&fx.root.join("replay"), &label, &live.dec)
-        .expect("readable")
-        .expect("paired");
+    // pin:08-cross-pair-is-replay (risk r22 B1): a replay tape standing in for the live side is
+    // never paired (its host is Replay, not Engine); the comparison below reads both directly.
+    let refused = pair(&fx.root.join("replay"), &label, &live.dec).expect("readable");
+    assert!(
+        refused
+            .clone()
+            .unwrap_err()
+            .contains("not this boot's replay-from-boot tape"),
+        "{refused:?}"
+    );
+    let rep = cross::read_tapes(&fx.root.join("replay").join(&label)).expect("replay tapes");
     // Rule 7: no replay tape under the label → ineligible, listed.
     let none = pair(&fx.root.join("replay"), "1", &live.dec).expect("readable");
     assert!(none.unwrap_err().contains("rule 7"));
@@ -499,4 +532,147 @@ fn cross_pairs_replay_tapes_by_label_and_reports_a_seeded_divergence() {
     assert_eq!((d.index, d.class), (0, cross::Class::Unattributed), "{o:?}");
     assert_eq!(o.unattributed(), 1);
     assert!(d.detail.contains("live Some("), "{}", d.detail);
+}
+
+/// pin:08-out-canonical (risk r22 C3): `--report-out` and `--tape-out` each refuse a path inside
+/// a git working tree and a symlink into one, exit 6, before any record — nothing is written
+/// through the link, and a refused tape leaves no report behind.
+#[test]
+fn report_out_and_tape_out_refuse_git_and_a_symlink_into_git() {
+    let (fx, mut a) = fixture("git");
+    write_orders(&a, &[]);
+    std::fs::create_dir_all(fx.root.join("repo/.git")).unwrap();
+    std::fs::create_dir_all(fx.root.join("repo/deep")).unwrap();
+    std::os::unix::fs::symlink(fx.root.join("repo/deep"), fx.root.join("link")).unwrap();
+    let ok = fx.root.join("out/ok.jsonl");
+    for (report, tape) in [
+        (fx.root.join("repo/r.jsonl"), None),
+        (fx.root.join("link/r.jsonl"), None),
+        (ok.clone(), Some(fx.root.join("repo/tape"))),
+        (ok.clone(), Some(fx.root.join("link/tape"))),
+    ] {
+        a.report_out = Some(report.clone());
+        a.tape_out = tape.clone();
+        let x = super::super::replay_from_boot_main(&a);
+        assert_eq!(x.code, 6, "{} {}", report.display(), x.stderr);
+        assert!(
+            x.stderr.contains("research never enters git"),
+            "{}",
+            x.stderr
+        );
+        let flag = if tape.is_some() {
+            "--tape-out"
+        } else {
+            "--report-out"
+        };
+        assert!(x.stderr.contains(flag), "{}", x.stderr);
+        assert!(!ok.exists(), "no report written");
+    }
+    assert!(!fx.root.join("repo/r.jsonl").exists());
+    assert!(!fx.root.join("repo/tape").exists());
+    let deep = std::fs::read_dir(fx.root.join("repo/deep"))
+        .unwrap()
+        .count();
+    assert_eq!(deep, 0, "nothing written through the link");
+}
+
+/// pin:08-report-out-create-new (risk r22 C2): an existing `--report-out` is refused, exit 2,
+/// before any record — its bytes are kept and no tape is written; a dangling link there cannot
+/// be resolved (pin:08-out-canonical), exit 6, and is never written through.
+#[test]
+fn an_existing_report_out_is_refused_and_kept() {
+    let (fx, mut a) = fixture("exists");
+    write_orders(&a, &[]);
+    let r = fx.root.join("out/8g.jsonl");
+    std::fs::create_dir_all(fx.root.join("out")).unwrap();
+    std::fs::write(&r, "earlier\n").unwrap();
+    a.report_out = Some(r.clone());
+    a.tape_out = Some(fx.root.join("tape"));
+    let x = super::super::replay_from_boot_main(&a);
+    assert_eq!(x.code, 2, "{}", x.stderr);
+    assert!(x.stderr.contains("never overwritten"), "{}", x.stderr);
+    assert_eq!(std::fs::read_to_string(&r).unwrap(), "earlier\n");
+    assert!(!fx.root.join("tape").exists(), "refused before the tape");
+    let d = fx.root.join("out/dangling.jsonl");
+    std::os::unix::fs::symlink(fx.root.join("nowhere"), &d).unwrap();
+    a.report_out = Some(d);
+    let x = super::super::replay_from_boot_main(&a);
+    assert_eq!(x.code, 6, "{}", x.stderr);
+    assert!(x.stderr.contains("cannot be resolved"), "{}", x.stderr);
+    assert!(!fx.root.join("nowhere").exists(), "never written through");
+}
+
+/// pin:08-replay-file-after-clean-drive (risk r23 B2): a replay whose script faults still
+/// flushes its tapes (the last `set.tsv` line included) but writes no `replay.tsv`, so 8g-B's
+/// pairing finds an unfinished replay and the window is ineligible — even against a live header
+/// that is otherwise this boot's (Engine host, same epoch and label).
+#[test]
+fn a_faulting_replay_leaves_no_replay_file_and_its_window_is_ineligible() {
+    use crate::pine_verify::{cross, pair};
+    let (fx, mut a) = fixture_with("b2fault", "fault.pine");
+    let (orders, faulted) = paper_session(&a);
+    assert!(faulted, "fault.pine faults once it holds a position");
+    write_orders(&a, &orders);
+    a.tape_out = Some(fx.root.join("replay"));
+    let x = super::super::replay_from_boot_main(&a);
+    assert_eq!(x.code, super::EXIT_FAULT, "{} {}", x.stdout, x.stderr);
+    let label = BOOT_MS.to_string();
+    let dir = fx.root.join("replay").join(&label);
+    let set = std::fs::read_to_string(dir.join("set.tsv")).unwrap();
+    assert_eq!(set.lines().count(), 2, "the tapes were flushed: {set}");
+    assert!(!dir.join(crate::pine_tape::REPLAY_FILE).exists());
+    assert_eq!(cross::replay_fills(&dir), None);
+    let rep = cross::read_tapes(&dir).expect("replay tapes");
+    let mut live = rep.dec.clone();
+    assert_eq!(live[0].kind, strategy_core::pine_tape::BOOT_HDR);
+    live[0].b = strategy_pine::HostKind::Engine as u8;
+    let e = pair(&fx.root.join("replay"), &label, &live)
+        .expect("readable")
+        .expect_err("ineligible");
+    assert!(e.contains("unrecorded or unfinished replay"), "{e}");
+}
+
+/// pin:08-replay-file-after-clean-drive (risk r23 B2): a replay that aborts through a `?` after
+/// its tape opened — here `plan_recorded`'s exit 5 on a journal record the capture lacks; a tape
+/// I/O error returns the same way — leaves the tape directory without `replay.tsv`, and the
+/// window is ineligible. Structurally, `replay.tsv` has exactly one writer in `run_8g`: after
+/// the drive returned, after the final flush, under `run.fail.is_none()`.
+#[test]
+fn an_aborted_replay_leaves_no_replay_file_and_its_window_is_ineligible() {
+    use crate::pine_delivery::rec_bytes;
+    use crate::pine_verify::{cross, pair};
+    use strategy_pine::delivery::{kind, PineDeliveryRec};
+    let (fx, mut a) = fixture("b2abort");
+    write_orders(&a, &paper_orders(&a));
+    let j = fx.root.join("pine-delivery.bin");
+    let r = PineDeliveryRec {
+        ts_ns: 7,
+        sym: SYM,
+        kind: kind::TICK,
+        venue: VenueId::Hyperliquid as u8,
+        ..PineDeliveryRec::default()
+    };
+    std::fs::write(&j, rec_bytes(&r)).unwrap();
+    a.fills = "recorded".to_owned();
+    a.delivery_journal = Some(j);
+    a.tape_out = Some(fx.root.join("replay"));
+    let x = super::super::replay_from_boot_main(&a);
+    assert_eq!(x.code, super::super::EXIT_DIVERGED, "{}", x.stderr);
+    let label = BOOT_MS.to_string();
+    let dir = fx.root.join("replay").join(&label);
+    assert!(dir.join("decisions.bin").exists(), "the tape had opened");
+    assert!(!dir.join(crate::pine_tape::REPLAY_FILE).exists());
+    assert_eq!(cross::replay_fills(&dir), None);
+    assert!(pair(&fx.root.join("replay"), &label, &[])
+        .expect("readable")
+        .is_err());
+    // The one writer, after the drive and the final flush, guarded by the drive's verdict.
+    let src = include_str!("../drive8g.rs");
+    let body = &src[src.find("pub(crate) fn run_8g(").expect("run_8g")..];
+    let body = &body[..body.find("\nfn write_report(").expect("end of run_8g")];
+    assert_eq!(src.matches(".replay_mode(").count(), 1, "one writer");
+    let at = |pat: &str| body.find(pat).unwrap_or_else(|| panic!("{pat}"));
+    let w = at(".replay_mode(");
+    assert!(at("drive_recorded(") < w && at("drive_judged(") < w);
+    assert!(at("w.flush()") < w && at("if run.fail.is_none() {") < w);
 }

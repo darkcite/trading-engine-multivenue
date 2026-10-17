@@ -840,15 +840,10 @@ fn compared(dec: &[strategy_core::PineTapeRec]) -> Vec<strategy_core::PineTapeRe
 /// I47 end to end (T22, §4.9.4): a live paper window recorded on the real engine loop, replayed
 /// from boot (`backtest --replay-from-boot --fills recorded --tape-out`, the library entry), then
 /// `pine-verify --cross` over the live tape and the replay tape: zero divergences, exit 0 once
-/// pooled to D23's floor.
-///
-/// FINDING (2026-10-17, red): script 0 diverges at index 1, the first `FILL` (oid 1): equal in
-/// oid, px, qty and fee, `time_ms` live 1767225600434 vs replay 1767225590420. The replay's wall
-/// map (`cuts::Place::wall`, `run_epoch_ns + (ts − first_ts)`; pin:Bp-recorded-wall-map) is not
-/// the live member's anchor (`anchor.wall_of(ts)`): it is off by (anchor wall − run epoch) −
-/// (first record − anchor mono), 10 014 ms here. Unattributed (no trade-time builtin).
+/// pooled to D23's floor. The replay maps capture time to wall time on the live member's own
+/// anchor, carried by the boot record (pin:08-boot-record-anchor, lead ruling R3 2026-10-17,
+/// which closed the `FILL` `time_ms` FINDING of the retired pin:Bp-recorded-wall-map).
 #[test]
-#[ignore = "FINDING: 8g-B FILL time_ms — replay wall map ≠ the live anchor (see the doc)"]
 fn cross_pairs_a_live_paper_window_with_its_replay_from_boot() {
     big(|| {
         let r = record("cross");
@@ -952,8 +947,8 @@ fn cross_reports_a_seeded_replay_dispatch_at_its_index() {
 /// T20 acceptance (impl-Bp §4.12 `--fills recorded`, `drive_recorded`): the delivery journal of a
 /// live paper window, matched to its capture, reproduces the recorded fills — every slot-8 fill
 /// of `engine-fills.pmlr` delivered in the journal's order, the replay's `FILL` decisions the
-/// live ones in origin, side, bar, oid, px, signed qty and fee. Their `time_ms` stamp is the
-/// wall map's (the I47 FINDING above, asserted strictly there).
+/// live ones in origin, side, bar, oid, px, signed qty, fee and `time_ms` (the live anchor's
+/// wall map, pin:08-boot-record-anchor).
 #[test]
 fn replay_from_boot_recorded_mode_reproduces_the_live_fills() {
     big(|| {
@@ -978,7 +973,19 @@ fn replay_from_boot_recorded_mode_reproduces_the_live_fills() {
         let fills = |d: &[strategy_core::PineTapeRec]| -> Vec<_> {
             d.iter()
                 .filter(|d| d.kind == pine_tape::FILL)
-                .map(|d| (d.script, d.a, d.b, d.bar_index, d.oid, d.x0, d.x1, d.x2))
+                .map(|d| {
+                    (
+                        d.script,
+                        d.a,
+                        d.b,
+                        d.bar_index,
+                        d.oid,
+                        d.x0,
+                        d.x1,
+                        d.x2,
+                        d.aux,
+                    )
+                })
                 .collect()
         };
         assert_eq!(fills(&rep.dec), fills(&r.dec));

@@ -61,7 +61,7 @@ use super::cuts::{
     CutSource, LocalSource, SplitLaw,
 };
 use super::drive::{drive_cuts_hooked, DriveCfg, DriveFail, DriveOut, PineCtx, Residency};
-use super::fees::{fee_provenance, refuse_inside_git, FeeSym};
+use super::fees::{check_report_out, fee_provenance, refuse_inside_git, write_new, FeeSym};
 use super::gate;
 use super::null::{null_trial_id, NullCfg};
 use super::nullarm::{ArmsHook, NullArm, NullArms, NullEnv};
@@ -485,7 +485,9 @@ fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
     refuse_inside_git("--rows-out", &rows_out)?;
     refuse_inside_git("--ret-dir", &ret_dir)?;
     if let Some(r) = &a.report_out {
-        refuse_inside_git("--report-out", r)?;
+        // pin:08-out-canonical, pin:08-report-out-pine-only, pin:08-report-out-create-new
+        // (risk r22 C2/C3).
+        check_report_out("--report-out", r)?;
     }
     let mut src_local = LocalSource;
     let mut src_spool = a.cut_spool.as_ref().map(|d| {
@@ -757,10 +759,8 @@ fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
         b.notional_1e6,
     );
     if let Some(r) = &a.report_out {
-        std::fs::write(r, format!("{stdout}\n")).map_err(|e| DriveFail {
-            exit: 1,
-            err: HarnessError::Capture(format!("--report-out {}: {e}", r.display())),
-        })?;
+        // pin:08-report-out-create-new: never overwritten (exit 2 if one appeared since the check).
+        write_new("--report-out", r, format!("{stdout}\n").as_bytes())?;
     }
     let mut closed_ms = Vec::new();
     let mut i = 0u32;

@@ -678,6 +678,7 @@ mod tests {
             boot_mono_ns: 99,
             boot_utc_ms: 1_767_225_600_000,
             route: SlotRoute::Paper,
+            anchor: core_time::WallAnchor::new(98, 1_767_225_600_000_000_000),
             scripts: vec![strategy_pine::BootRecordScript {
                 idx: 0,
                 sha256: [4; 32],

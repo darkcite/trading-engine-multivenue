@@ -36,7 +36,8 @@
 //! - pin:Bp-fee-row-none-printed — an AMM swap (`FeeRowId::NONE`, bps 0
 //!   by law) still gets its row, venue/class/leg/column `-`, measured 0.
 
-use std::path::Path;
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 
 use core_config::instrument_class::class_of_descriptor;
 use core_types::{InstrumentClass, VenueId};
@@ -345,10 +346,11 @@ pub(crate) fn fee_provenance(
     Ok(prov)
 }
 
-/// §4.10 item 6 (hard rule 13 — research never enters git): refuse an
-/// output path inside a git working tree (a `.git` in it or any ancestor
-/// of its nearest existing directory).
-pub(crate) fn refuse_inside_git(what: &str, path: &Path) -> Result<(), DriveFail> {
+/// pin:08-out-canonical (risk r22 C3): an output path is judged on its canonical form — the
+/// longest prefix that exists (`symlink_metadata`, so a dangling link counts) resolved by
+/// `canonicalize` (every symlink followed; one that cannot be resolved refuses, exit 6), the
+/// rest (not created yet, so it holds no link) applied lexically: `..` pops, `.` is dropped.
+pub(crate) fn canonical_out(what: &str, path: &Path) -> Result<PathBuf, DriveFail> {
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -356,14 +358,50 @@ pub(crate) fn refuse_inside_git(what: &str, path: &Path) -> Result<(), DriveFail
             .map_err(|e| refuse(EXIT_REFUSED, format!("{what}: cwd: {e}")))?
             .join(path)
     };
-    let mut cur: Option<&Path> = Some(&abs);
+    let comps: Vec<Component<'_>> = abs.components().collect();
+    let mut k = comps.len();
+    while k > 1 && std::fs::symlink_metadata(comps[..k].iter().collect::<PathBuf>()).is_err() {
+        k -= 1;
+    }
+    let base: PathBuf = comps[..k].iter().collect();
+    let mut out = std::fs::canonicalize(&base).map_err(|e| {
+        refuse(
+            EXIT_REFUSED,
+            format!(
+                "{what} {}: {} cannot be resolved: {e}",
+                path.display(),
+                base.display()
+            ),
+        )
+    })?;
+    for c in &comps[k..] {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(n) => out.push(n),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// §4.10 item 6 (hard rule 13 — research never enters git): refuse an
+/// output path inside a git working tree (a `.git` in it or any ancestor
+/// of it), judged on its canonical form (pin:08-out-canonical): a symlink
+/// into a repository is refused like the repository path itself.
+pub(crate) fn refuse_inside_git(what: &str, path: &Path) -> Result<(), DriveFail> {
+    let canon = canonical_out(what, path)?;
+    let mut cur: Option<&Path> = Some(&canon);
     while let Some(d) = cur {
         if d.join(".git").exists() {
             return Err(refuse(
                 EXIT_REFUSED,
                 format!(
-                    "{what} {} is inside the git working tree {} — research never enters git",
+                    "{what} {} (resolves to {}) is inside the git working tree {} — research \
+                     never enters git",
                     path.display(),
+                    canon.display(),
                     d.display()
                 ),
             ));
@@ -371,6 +409,89 @@ pub(crate) fn refuse_inside_git(what: &str, path: &Path) -> Result<(), DriveFail
         cur = d.parent();
     }
     Ok(())
+}
+
+/// pin:08-report-out-pine-only (risk r22 C2): a report whose canonical path (pin:08-out-canonical)
+/// is under `~/multivenue/` but not under `~/multivenue/pine/` (each canonical too) is refused,
+/// exit 6 — the engine's own files there are never a report's target. `HOME` unset or empty: no
+/// `~` to judge, nothing refused.
+pub(crate) fn refuse_multivenue_outside_pine(
+    what: &str,
+    path: &Path,
+    home: Option<&Path>,
+) -> Result<(), DriveFail> {
+    let Some(home) = home.filter(|h| !h.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    let canon = canonical_out(what, path)?;
+    let mv = canonical_out(what, &home.join("multivenue"))?;
+    let pine = canonical_out(what, &home.join("multivenue/pine"))?;
+    if canon.starts_with(&mv) && !canon.starts_with(&pine) {
+        return Err(refuse(
+            EXIT_REFUSED,
+            format!(
+                "{what} {} (resolves to {}) is under {} but not under {} — a report never lands \
+                 among the engine's files",
+                path.display(),
+                canon.display(),
+                mv.display(),
+                pine.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// pin:08-report-out-create-new (risk r22 C2): a report file is created new, never overwritten.
+/// An existing path (a dangling symlink included) is refused before the first record, exit 2.
+pub(crate) fn refuse_existing(what: &str, path: &Path) -> Result<(), DriveFail> {
+    if std::fs::symlink_metadata(path).is_ok() {
+        return Err(refuse(
+            EXIT_USAGE,
+            format!(
+                "{what} {} exists: a report is never overwritten (remove it or choose another \
+                 {what})",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A report path's guards, before the first record: inside git (exit 6), under `~/multivenue/`
+/// outside `pine/` (exit 6), existing (exit 2).
+pub(crate) fn check_report_out(what: &str, path: &Path) -> Result<(), DriveFail> {
+    refuse_inside_git(what, path)?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    refuse_multivenue_outside_pine(what, path, home.as_deref())?;
+    refuse_existing(what, path)
+}
+
+/// pin:08-report-out-create-new: the report's one write, `create_new` — a file that appeared
+/// since [`check_report_out`] is refused (exit 2), never overwritten; any other error is exit 1.
+pub(crate) fn write_new(what: &str, path: &Path, body: &[u8]) -> Result<(), DriveFail> {
+    let io = |e: std::io::Error| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            refuse(
+                EXIT_USAGE,
+                format!(
+                    "{what} {} exists: a report is never overwritten",
+                    path.display()
+                ),
+            )
+        } else {
+            DriveFail {
+                exit: 1,
+                err: HarnessError::Capture(format!("{what} {}: {e}", path.display())),
+            }
+        }
+    };
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(io)?;
+    f.write_all(body).and_then(|()| f.flush()).map_err(io)
 }
 
 #[cfg(test)]
@@ -498,6 +619,126 @@ mod tests {
         assert_eq!(e.exit, 6);
         assert!(e.err.to_string().contains("research never enters git"));
         assert!(refuse_inside_git("--out-dir", &root.join("out")).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// pin:08-out-canonical (risk r22 C3): a symlink into a repository's subdirectory — as a
+    /// parent or as the path itself, with a not-yet-created remainder or a `..` — is refused like
+    /// the repository path; a dangling link that cannot be resolved refuses too.
+    #[test]
+    fn a_symlink_into_a_git_tree_is_refused() {
+        let root = std::env::temp_dir().join(format!("cli-pine-git-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("repo/.git")).unwrap();
+        std::fs::create_dir_all(root.join("repo/deep/dir")).unwrap();
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        std::os::unix::fs::symlink(root.join("repo/deep/dir"), root.join("link")).unwrap();
+        std::os::unix::fs::symlink(root.join("repo/gone"), root.join("dangling")).unwrap();
+        for p in [
+            root.join("link"),
+            root.join("link/new/r.jsonl"),
+            root.join("out/../link/x"),
+            root.join("link/../../../repo-sibling/../repo/x"),
+        ] {
+            let e = refuse_inside_git("--report-out", &p).unwrap_err();
+            assert_eq!(e.exit, 6, "{}", p.display());
+            assert!(
+                e.err.to_string().contains("research never enters git"),
+                "{}",
+                e.err
+            );
+        }
+        let e = refuse_inside_git("--tape-out", &root.join("dangling")).unwrap_err();
+        assert_eq!(e.exit, 6);
+        assert!(
+            e.err.to_string().contains("cannot be resolved"),
+            "{}",
+            e.err
+        );
+        // The canonical form of a path outside any repository passes.
+        assert!(refuse_inside_git("--tape-out", &root.join("out/new/../tape")).is_ok());
+        assert_eq!(
+            canonical_out("x", &root.join("out/a/./b/../c")).unwrap(),
+            std::fs::canonicalize(root.join("out")).unwrap().join("a/c")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// pin:08-report-out-pine-only (risk r22 C2): under `~/multivenue/` only `pine/` takes a
+    /// report — a symlink from `pine/` back into the engine's files is judged where it lands;
+    /// outside `~/multivenue/` and with no `HOME` nothing is refused.
+    #[test]
+    fn a_report_under_multivenue_must_be_under_pine() {
+        let home = std::env::temp_dir().join(format!("cli-pine-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("multivenue/pine/8g")).unwrap();
+        std::fs::create_dir_all(home.join("multivenue/worker")).unwrap();
+        std::fs::create_dir_all(home.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(
+            home.join("multivenue/worker"),
+            home.join("multivenue/pine/back"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(home.join("multivenue"), home.join("mv")).unwrap();
+        let h = Some(home.as_path());
+        for p in [
+            home.join("multivenue/state.json"),
+            home.join("multivenue/worker/r.jsonl"),
+            home.join("multivenue/pine/back/r.jsonl"),
+            home.join("multivenue/pine/../r.jsonl"),
+            home.join("mv/worker/r.jsonl"),
+        ] {
+            let e = refuse_multivenue_outside_pine("--report-out", &p, h).unwrap_err();
+            assert_eq!(e.exit, 6, "{}", p.display());
+            assert!(e.err.to_string().contains("not under"), "{}", e.err);
+        }
+        for p in [
+            home.join("multivenue/pine/8g/r.jsonl"),
+            home.join("multivenue/pine/new/r.jsonl"),
+            home.join("mv/pine/r.jsonl"),
+            home.join("elsewhere/r.jsonl"),
+        ] {
+            assert!(
+                refuse_multivenue_outside_pine("--report-out", &p, h).is_ok(),
+                "{}",
+                p.display()
+            );
+        }
+        let p = home.join("multivenue/worker/r.jsonl");
+        assert!(refuse_multivenue_outside_pine("--report-out", &p, None).is_ok());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// pin:08-report-out-create-new (risk r22 C2): an existing report (a dangling link too) is
+    /// refused up front, exit 2; the write itself never overwrites one.
+    #[test]
+    fn a_report_is_created_new_and_never_overwritten() {
+        let root = std::env::temp_dir().join(format!("cli-pine-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let p = root.join("r.jsonl");
+        assert!(refuse_existing("--report-out", &p).is_ok());
+        write_new("--report-out", &p, b"first\n").unwrap();
+        let e = refuse_existing("--report-out", &p).unwrap_err();
+        assert_eq!(e.exit, 2);
+        assert!(e.err.to_string().contains("never overwritten"), "{}", e.err);
+        let e = write_new("--report-out", &p, b"second\n").unwrap_err();
+        assert_eq!(e.exit, 2);
+        assert_eq!(std::fs::read(&p).unwrap(), b"first\n");
+        std::os::unix::fs::symlink(root.join("nowhere"), root.join("d.jsonl")).unwrap();
+        assert_eq!(
+            refuse_existing("--report-out", &root.join("d.jsonl"))
+                .unwrap_err()
+                .exit,
+            2
+        );
+        assert_eq!(
+            write_new("--report-out", &root.join("d.jsonl"), b"x")
+                .unwrap_err()
+                .exit,
+            2
+        );
+        assert!(!root.join("nowhere").exists(), "never written through");
         let _ = std::fs::remove_dir_all(&root);
     }
     // ---- T14, the per-fill half ----

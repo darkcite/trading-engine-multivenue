@@ -68,6 +68,9 @@ fn fixture(
         boot_mono_ns,
         boot_utc_ms: (rec_epoch / 1_000_000) as i64,
         route: SlotRoute::Paper,
+        // pin:08-boot-record-anchor: the run epoch at the first tick (the map these fixtures
+        // were written against).
+        anchor: core_time::WallAnchor::new(first_s * SEC, EA),
         scripts: Vec::new(),
         symbols: Vec::new(),
         queue_syms: Vec::new(),
@@ -124,6 +127,81 @@ fn recorded_fills_without_a_journal_is_refused() {
     refused(&a, "recorded without a journal");
     a.fills = String::new();
     refused(&a, "recorded is the default");
+}
+
+/// pin:08-delivery-void-file (risk r23 B3): a `--delivery-journal` with `pine-delivery.void`
+/// beside it is refused, exit 6, in either fill mode — a dangling link there counts; without the
+/// marker the same journal is read.
+#[test]
+fn a_voided_delivery_journal_is_refused() {
+    use crate::pine_delivery::{DELIVERY_FILE, VOID_FILE, VOID_MAGIC};
+    let (fx, mut a) = fixture("void", 0, EA, 0, true);
+    let run = fx.root.join(format!("run-{EA}"));
+    let j = run.join(DELIVERY_FILE);
+    std::fs::write(&j, [0u8; 32]).unwrap();
+    a.delivery_journal = Some(j.clone());
+    let x = check_inputs(&a).unwrap_or_else(|f| panic!("{}", f.err));
+    assert_eq!(x.journal.map(|v| v.len()), Some(1));
+    let void = run.join(VOID_FILE);
+    std::fs::write(&void, format!("{VOID_MAGIC}\ngap\t7\n")).unwrap();
+    for fills in ["judged", "recorded"] {
+        a.fills = fills.to_owned();
+        refused(&a, fills);
+        let e = check_inputs(&a).err().expect("refused").err.to_string();
+        assert!(e.contains("voided") && e.contains("gap\t7"), "{e}");
+    }
+    std::fs::remove_file(&void).unwrap();
+    std::os::unix::fs::symlink(fx.root.join("nowhere"), &void).unwrap();
+    refused(&a, "a dangling marker");
+}
+
+/// pin:08-delivery-journal-canonical (risk r24): a journal reached through a file symlink (here
+/// in the window root, beside `pine-boot.tsv`) is judged by the marker beside its real file —
+/// refused, exit 6, when the run directory holds one, read through the link when it does not.
+#[test]
+fn a_voided_journal_through_a_symlink_is_refused() {
+    use crate::pine_delivery::{DELIVERY_FILE, VOID_FILE, VOID_MAGIC};
+    let (fx, mut a) = fixture("voidlink", 0, EA, 0, true);
+    let run = fx.root.join(format!("run-{EA}"));
+    let j = run.join(DELIVERY_FILE);
+    std::fs::write(&j, [0u8; 64]).unwrap();
+    let link = fx.root.join(DELIVERY_FILE);
+    std::os::unix::fs::symlink(&j, &link).unwrap();
+    a.delivery_journal = Some(link);
+    let x = check_inputs(&a).unwrap_or_else(|f| panic!("{}", f.err));
+    assert_eq!(x.journal.map(|v| v.len()), Some(2));
+    std::fs::write(run.join(VOID_FILE), format!("{VOID_MAGIC}\nwrite\tEIO\n")).unwrap();
+    assert!(
+        !fx.root.join(VOID_FILE).exists(),
+        "no marker beside the link"
+    );
+    for fills in ["judged", "recorded"] {
+        a.fills = fills.to_owned();
+        refused(&a, fills);
+        let e = check_inputs(&a).err().expect("refused").err.to_string();
+        assert!(e.contains("voided") && e.contains("write\tEIO"), "{e}");
+    }
+}
+
+/// pin:08-delivery-journal-canonical (risk r24): a `--delivery-journal` that does not resolve —
+/// a missing file, or a dangling link — is refused, exit 6, before any record.
+#[test]
+fn an_unresolvable_delivery_journal_is_refused() {
+    use crate::pine_delivery::DELIVERY_FILE;
+    let (fx, mut a) = fixture("voidnores", 0, EA, 0, true);
+    a.delivery_journal = Some(fx.root.join("nope").join(DELIVERY_FILE));
+    for fills in ["judged", "recorded"] {
+        a.fills = fills.to_owned();
+        refused(&a, fills);
+        let e = check_inputs(&a).err().expect("refused").err.to_string();
+        assert!(e.contains("cannot be resolved"), "{e}");
+    }
+    let link = fx.root.join(DELIVERY_FILE);
+    std::os::unix::fs::symlink(fx.root.join("nowhere"), &link).unwrap();
+    a.delivery_journal = Some(link);
+    refused(&a, "a dangling journal link");
+    let e = check_inputs(&a).err().expect("refused").err.to_string();
+    assert!(e.contains("cannot be resolved"), "{e}");
 }
 
 /// §4.12: a record naming another run, or a root of two runs, is refused.

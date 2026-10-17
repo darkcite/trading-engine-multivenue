@@ -11,7 +11,9 @@
 //! - **The delivery journal** (R6): with `--pine-tape` only, the member's ring
 //!   (`PineStrategy::delivery_view`) is drained on the 5 s report block, and once more when the
 //!   loop ends, into `<run dir>/pine-delivery.bin` — raw 32-byte records, append-only. A gap (an
-//!   overrun the member counted) is logged: the window is then ineligible.
+//!   overrun the member counted) or a write error closes the journal for the rest of the boot
+//!   and creates `<run dir>/pine-delivery.void` (pin:08-delivery-void-file); replay-from-boot
+//!   refuses a journal with that file next to it (exit 6).
 //!
 //! COPY-DOCTRINE: boot-time and 5 s-cadence operator I/O, never on the decision path; it may
 //! allocate at `open` (paths, the drain buffer) and copies records into fixed byte images.
@@ -26,6 +28,14 @@
 //! - pin:08-tape-buffered (risk r21 #3): the journal is a `BufWriter` of
 //!   [`crate::pine_tape::TAPE_BUF_BYTES`] allocated at `open`; each drain (5 s and final) writes
 //!   into it and flushes once at its end. A write or flush error is logged; the window is void.
+//! - pin:08-delivery-cursor-per-record (risk r23 B3): the read cursor moves past each record as
+//!   it is written (`first + k + 1`, the tape writer's per-record rule), never once per batch, so
+//!   a drain retried after a failed write never writes a record twice.
+//! - pin:08-delivery-void-file (risk r23 B3; impl-Bp §4.12 "a journal gap is ineligible"): on a
+//!   gap or a write / flush error the hook drops the writer (no later drain) and creates
+//!   [`VOID_FILE`] beside the journal once, `create_new`: [`VOID_MAGIC`], then one
+//!   `<gap|write>\t<detail>` line. The marker is the refusal; its text is for the operator. A
+//!   marker that cannot be created is logged at ERROR (the run goes on).
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -40,6 +50,10 @@ pub const DELIVERY_FILE: &str = "pine-delivery.bin";
 pub const REC_BYTES: usize = 32;
 /// Records drained per view call.
 pub const DRAIN_BATCH: usize = 256;
+/// pin:08-delivery-void-file: the marker beside a journal the live hook voided.
+pub const VOID_FILE: &str = "pine-delivery.void";
+/// pin:08-delivery-void-file: the marker's first line.
+pub const VOID_MAGIC: &str = "# pvm-delivery-void-1";
 
 /// One record as its 32-byte image (pin:08-delivery-bytes-le).
 #[must_use]
@@ -114,11 +128,12 @@ pub struct DeliveryDrain {
     pub gap: u64,
 }
 
-/// `<run dir>/pine-delivery.bin`, append-only, and the read cursor.
+/// `<run dir>/pine-delivery.bin`, append-only, and the read cursor. `W` is the file (a test
+/// sink in this module's tests).
 #[derive(Debug)]
-pub struct DeliveryWriter {
+pub struct DeliveryWriter<W: Write = File> {
     path: PathBuf,
-    file: BufWriter<File>,
+    file: BufWriter<W>,
     next: u64,
     buf: Box<[PineDeliveryRec]>,
 }
@@ -130,16 +145,20 @@ impl DeliveryWriter {
     /// The file cannot be opened.
     pub fn open(run_dir: &Path) -> io::Result<Self> {
         let path = run_dir.join(DELIVERY_FILE);
-        let file = BufWriter::with_capacity(
-            crate::pine_tape::TAPE_BUF_BYTES,
-            OpenOptions::new().create(true).append(true).open(&path)?,
-        );
-        Ok(Self {
+        let f = OpenOptions::new().create(true).append(true).open(&path)?;
+        Ok(Self::with_sink(path, f, crate::pine_tape::TAPE_BUF_BYTES))
+    }
+}
+
+impl<W: Write> DeliveryWriter<W> {
+    /// The writer over `sink`, buffered by `buf_bytes`. Boot-only (allocates the buffers).
+    fn with_sink(path: PathBuf, sink: W, buf_bytes: usize) -> Self {
+        Self {
             path,
-            file,
+            file: BufWriter::with_capacity(buf_bytes, sink),
             next: 0,
             buf: vec![PineDeliveryRec::default(); DRAIN_BATCH].into_boxed_slice(),
-        })
+        }
     }
 
     /// The journal's path.
@@ -153,18 +172,28 @@ impl DeliveryWriter {
     /// # Errors
     /// A write failed.
     pub fn drain(&mut self, p: &PineStrategy) -> io::Result<DeliveryDrain> {
+        self.drain_view(|out, from| p.delivery_view(out, from))
+    }
+
+    /// [`Self::drain`] over any `delivery_view`-shaped source: `(first, n)` records from
+    /// `max(from, oldest)`, contiguous.
+    fn drain_view(
+        &mut self,
+        mut view: impl FnMut(&mut [PineDeliveryRec], u64) -> (u64, u32),
+    ) -> io::Result<DeliveryDrain> {
         let mut o = DeliveryDrain::default();
         loop {
-            let (first, n) = p.delivery_view(&mut self.buf, self.next);
+            let (first, n) = view(&mut self.buf, self.next);
             if n == 0 {
                 break;
             }
             o.gap += first.saturating_sub(self.next);
-            for r in &self.buf[..n as usize] {
+            for (k, r) in self.buf[..n as usize].iter().enumerate() {
                 self.file.write_all(&rec_bytes(r))?;
+                // pin:08-delivery-cursor-per-record (risk r23 B3).
+                self.next = first + k as u64 + 1;
+                o.written += 1;
             }
-            self.next = first + u64::from(n);
-            o.written += u64::from(n);
         }
         // pin:08-tape-buffered: one flush per drain.
         self.file.flush()?;
@@ -182,6 +211,8 @@ pub struct PineHook {
     record: Option<PathBuf>,
     /// pin:08-verify-queue-sym-ineligible: the symbols the paper queue law tracks at this boot.
     queue_syms: Vec<core_types::SymbolId>,
+    /// pin:08-delivery-void-file: `<run dir>/pine-delivery.void`, built at boot.
+    void_path: PathBuf,
 }
 
 impl PineHook {
@@ -190,6 +221,7 @@ impl PineHook {
     #[must_use]
     pub fn new(run_dir: PathBuf, run_epoch_ns: u64, tape: bool) -> Self {
         Self {
+            void_path: run_dir.join(VOID_FILE),
             run_dir,
             run_epoch_ns,
             tape,
@@ -243,20 +275,50 @@ impl PineHook {
         self.record.as_deref()
     }
 
-    /// The 5 s block (and the loop's end): drain the journal, logging a gap or a write failure.
+    /// The 5 s block (and the loop's end): drain the journal. A gap or a write failure voids it
+    /// (pin:08-delivery-void-file): logged, the writer dropped, the marker created.
     pub fn on_drain(&mut self, p: &PineStrategy) -> Option<DeliveryDrain> {
         let w = self.writer.as_mut()?;
         match w.drain(p) {
+            Ok(o) if o.gap == 0 => Some(o),
             Ok(o) => {
-                if o.gap > 0 {
-                    tracing::error!(gap = o.gap, "pine: delivery journal gap — window void");
-                }
+                tracing::error!(
+                    gap = o.gap,
+                    "pine: delivery journal gap — window void, journal closed"
+                );
+                self.void(format_args!("gap\t{}", o.gap));
                 Some(o)
             }
             Err(e) => {
-                tracing::error!(error = %e, "pine: delivery journal write failed — window void");
+                tracing::error!(
+                    error = %e,
+                    "pine: delivery journal write failed — window void, journal closed"
+                );
+                self.void(format_args!("write\t{e}"));
                 None
             }
+        }
+    }
+
+    /// pin:08-delivery-void-file (risk r23 B3): drop the writer (no later drain writes) and
+    /// create the marker once, `create_new`. Cold: at most once per boot.
+    fn void(&mut self, why: std::fmt::Arguments<'_>) {
+        self.writer = None;
+        let made = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.void_path)
+            .and_then(|mut f| {
+                writeln!(f, "{VOID_MAGIC}")?;
+                writeln!(f, "{why}")?;
+                f.flush()
+            });
+        if let Err(e) = made {
+            tracing::error!(
+                error = %e,
+                path = %self.void_path.display(),
+                "pine: delivery void marker NOT written"
+            );
         }
     }
 
@@ -328,5 +390,90 @@ mod tests {
         std::fs::write(&p, [0u8; 64]).expect("write");
         assert_eq!(read_journal(&p).expect("read").len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sink whose `fail_at`-th `write` call fails, taking nothing; every other call takes all.
+    #[derive(Debug, Default)]
+    struct FailOnce {
+        out: Vec<u8>,
+        calls: usize,
+        fail_at: usize,
+    }
+
+    impl Write for FailOnce {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.calls == self.fail_at {
+                return Err(io::Error::other("seeded write error"));
+            }
+            self.out.extend_from_slice(b);
+            Ok(b.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `delivery::view`'s shape over `ring` (record `i` has `seq == i`), the oldest kept `oldest`.
+    fn view_of(
+        ring: &[PineDeliveryRec],
+        oldest: u64,
+    ) -> impl FnMut(&mut [PineDeliveryRec], u64) -> (u64, u32) + '_ {
+        move |out, from| {
+            let first = from.max(oldest);
+            let mut n = 0usize;
+            while (first as usize + n) < ring.len() && n < out.len() {
+                out[n] = ring[first as usize + n];
+                n += 1;
+            }
+            (first, n as u32)
+        }
+    }
+
+    fn ring(n: u64) -> Vec<PineDeliveryRec> {
+        (0..n)
+            .map(|i| PineDeliveryRec {
+                ts_ns: i,
+                seq: i,
+                ..PineDeliveryRec::default()
+            })
+            .collect()
+    }
+
+    /// pin:08-delivery-cursor-per-record (risk r23 B3): a write that fails in the middle of a
+    /// batch leaves the cursor on the record that failed, so the retried drain writes every
+    /// record exactly once, in order — the old once-per-batch cursor re-wrote the batch's head.
+    #[test]
+    fn a_mid_batch_write_error_does_not_duplicate_records() {
+        let ring = ring(600);
+        // A 64 B buffer: record 2c triggers write call c (records 2c−2, 2c−1). Call 70 fails at
+        // record 140 — inside the first 256-record batch.
+        let sink = FailOnce {
+            fail_at: 70,
+            ..FailOnce::default()
+        };
+        let mut w = DeliveryWriter::with_sink(PathBuf::from("mem"), sink, 2 * REC_BYTES);
+        assert!(w.drain_view(view_of(&ring, 0)).is_err());
+        assert_eq!(w.next, 140, "the cursor stands on the record that failed");
+        let o = w.drain_view(view_of(&ring, 0)).expect("retry");
+        assert_eq!(
+            o,
+            DeliveryDrain {
+                written: 460,
+                gap: 0
+            }
+        );
+        let out = &w.file.get_ref().out;
+        assert_eq!(out.len(), 600 * REC_BYTES, "no record twice, none lost");
+        for (i, c) in out.chunks_exact(REC_BYTES).enumerate() {
+            let mut a = [0u8; REC_BYTES];
+            a.copy_from_slice(c);
+            assert_eq!(rec_from_bytes(&a).seq, i as u64);
+        }
+        // A gap is counted, never hidden: the oldest kept moved past the cursor.
+        let mut g = DeliveryWriter::with_sink(PathBuf::from("mem"), FailOnce::default(), 64);
+        let o = g.drain_view(view_of(&ring, 100)).expect("drain");
+        assert_eq!((o.written, o.gap), (500, 100));
     }
 }

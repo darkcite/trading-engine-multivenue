@@ -414,6 +414,36 @@ fn rows_ret_and_report_paths_are_honoured() {
     assert_eq!(rep.trim_end(), x.stdout);
 }
 
+/// pin:08-out-canonical, pin:08-report-out-create-new (risk r22 C2/C3): a `--report-out` inside
+/// a git tree, or through a symlink into one, refuses (exit 6); an existing report refuses
+/// (exit 2) and keeps its bytes — each before any record.
+#[test]
+fn report_out_refuses_git_a_link_into_git_and_an_existing_file() {
+    let (fx, mut a) = fixture("repout", "hold.pine", &[0, 90]);
+    std::fs::create_dir_all(fx.root.join("repo/.git")).unwrap();
+    std::fs::create_dir_all(fx.root.join("repo/deep")).unwrap();
+    std::os::unix::fs::symlink(fx.root.join("repo/deep"), fx.root.join("link")).unwrap();
+    for p in [fx.root.join("repo/r.jsonl"), fx.root.join("link/r.jsonl")] {
+        a.report_out = Some(p.clone());
+        let x = run_pine_main(&a);
+        assert_eq!(x.code, 6, "{} {}", p.display(), x.stderr);
+        assert!(
+            x.stderr.contains("research never enters git"),
+            "{}",
+            x.stderr
+        );
+        assert!(!p.exists(), "{}", p.display());
+    }
+    let r = fx.root.join("report.jsonl");
+    std::fs::write(&r, "earlier\n").unwrap();
+    a.report_out = Some(r.clone());
+    let x = run_pine_main(&a);
+    assert_eq!(x.code, 2, "{}", x.stderr);
+    assert!(x.stderr.contains("never overwritten"), "{}", x.stderr);
+    assert_eq!(std::fs::read_to_string(&r).unwrap(), "earlier\n");
+    assert!(!fx.root.join("out").exists(), "refused before any record");
+}
+
 /// I18: a manifest with two scripts refuses before any record (exit 6),
 /// nothing written.
 #[test]

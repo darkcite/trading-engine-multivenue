@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use cli::paper::LoopHook;
 use cli::pine_boot::{build, finish_at_loop, DiscoveredFacts, PineFlags};
-use cli::pine_delivery::{read_journal, PineHook, DELIVERY_FILE};
+use cli::pine_delivery::{read_journal, PineHook, DELIVERY_FILE, VOID_FILE, VOID_MAGIC};
 use core_types::{ChannelEvent, ChannelId, Price, Qty, Tick, VenueId};
 use ingress_hyperliquid::discovery::HlDiscovery;
 use strategy_core::{Strategy, StrategyCounters};
@@ -178,6 +178,65 @@ fn no_tape_record_only() {
     assert!(hook.on_drain(set.pine()).is_none());
     assert!(dir.join(BOOT_RECORD_FILE).exists());
     assert!(!dir.join(DELIVERY_FILE).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// pin:08-delivery-void-file (risk r23 B3): an overrun of the member's journal ring between two
+/// drains voids the journal — the drain reports the gap, the writer is closed (no later drain
+/// writes), `pine-delivery.void` holds the reason — and `backtest --replay-from-boot` then
+/// refuses that `--delivery-journal`, exit 6, before any record.
+#[test]
+fn a_journal_gap_voids_the_journal_and_the_replay_is_refused() {
+    let dir = tmp("void");
+    let run = dir.join("run-1");
+    std::fs::create_dir_all(&run).expect("run");
+    let (mut set, _) = started_set(&dir, true);
+    let mut hook = PineHook::new(run.clone(), RUN_EPOCH_NS, true);
+    assert!(hook.on_started(set.pine(), 1).is_some());
+    let first = hook.on_drain(set.pine()).expect("a clean drain");
+    assert_eq!(first.gap, 0);
+    assert!(!run.join(VOID_FILE).exists());
+    // One more tick than the ring holds, undrained: the oldest is overwritten.
+    let mut ctx = Clocked;
+    let n = strategy_pine::DELIVERY_CAP as i64 + 1;
+    let mut k = 0i64;
+    while k < n {
+        set.on_tick(&quote(T0_MS + 10 + k), &mut ctx);
+        k += 1;
+    }
+    let o = hook.on_drain(set.pine()).expect("the gap drain");
+    assert!(o.gap >= 1, "{o:?}");
+    assert!(hook.journal_path().is_none(), "the writer is closed");
+    let text = std::fs::read_to_string(run.join(VOID_FILE)).expect("void marker");
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some(VOID_MAGIC));
+    assert_eq!(lines.next(), Some(&*format!("gap\t{}", o.gap)));
+    // A later drain writes nothing and leaves the marker as it was.
+    let len = std::fs::metadata(run.join(DELIVERY_FILE))
+        .expect("journal")
+        .len();
+    set.on_tick(&quote(T0_MS + 10 + n), &mut ctx);
+    assert!(hook.on_drain(set.pine()).is_none());
+    assert_eq!(
+        std::fs::metadata(run.join(DELIVERY_FILE))
+            .expect("journal")
+            .len(),
+        len
+    );
+    assert_eq!(
+        std::fs::read_to_string(run.join(VOID_FILE)).expect("void"),
+        text
+    );
+    let a = cli::backtest::ReplayArgv {
+        window_root: run.clone(),
+        manifest: fixtures().join("manifest.toml"),
+        fills: "recorded".to_owned(),
+        delivery_journal: Some(run.join(DELIVERY_FILE)),
+        ..cli::backtest::ReplayArgv::default()
+    };
+    let x = cli::backtest::replay_from_boot_main(&a);
+    assert_eq!(x.code, 6, "{}", x.stderr);
+    assert!(x.stderr.contains("voided"), "{}", x.stderr);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

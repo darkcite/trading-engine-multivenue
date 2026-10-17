@@ -10,14 +10,32 @@
 //! copies freely.
 //!
 //! Literal readings:
-//! - pin:08-cross-fields-listed: a pair is equal iff the fields §4.9.1 lists for its kind are —
-//!   `DISPATCH` a, b, c, bar, oid, px, qty, id, previous oid; `DISPOSITION` a and oid (b, the
-//!   rule, is the host's: 1 paper evidence live, 3 replay); `FILL` oid, px, signed qty, fee and
-//!   `time_ms` (a, the origin, is the host's). `seq` / `seq_ref` are tape positions, not fields.
+//! - pin:08-cross-fields-listed (risk r22 N2): a pair is equal iff the fields §4.9.1 lists for
+//!   its kind are — `DISPATCH` a, b, c, bar, oid, px, qty, id, previous oid; `DISPOSITION` a and
+//!   oid; `FILL` oid, px, signed qty, fee and `time_ms`. Four tape fields are therefore NOT
+//!   compared, because §4.9.1's field lists do not name them: `DISPOSITION.b` (the rule — the
+//!   host's: 1 paper evidence live, 3 replay), `FILL.a` (the origin — the host's), `FILL.b` (the
+//!   side — §4.9.1 lists the signed qty, which carries it) and `FILL.bar_index` (§4.9.1's `FILL`
+//!   list names no bar). `seq` / `seq_ref` are tape positions, not fields.
+//! - pin:08-cross-pair-is-replay (risk r22 B1): the paired tape is this boot's replay from boot
+//!   iff its `BOOT_HDR` (§4.9.2: a route, b host, x2 `oid_epoch`, aux `boot_utc_ms`) reads route
+//!   Paper, host Replay and the live header's `oid_epoch` and `boot_utc_ms`, and the live header
+//!   reads host Engine; else the window is ineligible. The anchor words (x0, x1) are not
+//!   compared: the replay's member runs on the identity anchor and its harness maps capture time
+//!   to wall time on the boot record's anchor (pin:08-boot-record-anchor).
+//! - pin:08-cross-replay-fills-file (risk r22 N1): a replay tape names its `--fills` source in
+//!   `replay.tsv` (`# pvm-replay-1`, then `fills\t<mode>`); absent, malformed or another mode
+//!   than [`CROSS_FILLS`] → ineligible.
+//! - pin:08-cross-fills-recorded (risk r22 N1): impl-08 §4.9 names no `--fills` value for 8g-B;
+//!   impl-Bp §4.12 names `--fills recorded` "the member-determinism gate — recommended to
+//!   impl-08 as the one it gates on", and impl-08 §3.7 adopts R6, the journal `--fills recorded`
+//!   requires (impl-Bp R6: "without it 8g can only run `--fills judged`"). 8g-B pairs with
+//!   `recorded` only.
 //! - pin:08-cross-window-drain: the live side ends as 8g-A's window does (the first seq record
 //!   past boot + 2 h, or the tape's end); the replay side ends one past the last replay copy of
-//!   the in-window live TICK / EVENT inputs (masked identity, same occurrence); when one has no
-//!   copy, at the replay's end.
+//!   the in-window live TICK / EVENT / FILL inputs (masked identity, same occurrence; FILL since
+//!   2026-10-17 — a fill delivered after the last tick was cut from the replay side); when one
+//!   has no copy, at the replay's end.
 //! - pin:08-cross-input-identity: the replay re-stamps `ts_ns` on the record's wall map
 //!   (`drive.rs`), so "the same tick" is the same payload with `ts_ns` and `TICK_FLAG_STALE`
 //!   masked (`venue_seq`, `sym`, prices and venue time kept); an event masks `ts_ns`; a fill
@@ -44,6 +62,7 @@ use std::collections::{HashMap, HashSet};
 
 use core_types::{ChannelEvent, Fill, Tick, TICK_FLAG_STALE};
 use strategy_core::{pine_seq, pine_tape, PineSeqRec, PineTapeRec};
+use strategy_pine::{HostKind, SlotRoute};
 
 /// The trade-time builtins (§4.9.4 fill-stamp).
 pub const TRADE_TIME_BUILTINS: [&str; 3] = [
@@ -165,7 +184,7 @@ fn ident(r: &PineSeqRec) -> (u8, [u64; 8]) {
 }
 
 fn is_input(r: &PineSeqRec) -> bool {
-    r.kind == pine_seq::TICK || r.kind == pine_seq::EVENT
+    r.kind == pine_seq::TICK || r.kind == pine_seq::EVENT || r.kind == pine_seq::FILL
 }
 
 /// The script's inputs (pin:08-cross-script-syms) among `seq` records with `seq ≤ bound`.
@@ -370,6 +389,36 @@ fn classify(live: &Side<'_>, rep: &Side<'_>, f: &ScriptFacts, script: u8, k: usi
         return Class::FillStamp;
     }
     Class::Unattributed
+}
+
+/// pin:08-cross-fills-recorded: the replay `--fills` source 8g-B pairs with.
+pub const CROSS_FILLS: &str = "recorded";
+
+/// pin:08-cross-pair-is-replay: `rep` is the replay-from-boot tape of the live boot `live`.
+#[must_use]
+pub fn is_replay_of(live: &[PineTapeRec], rep: &[PineTapeRec]) -> bool {
+    let first = |d: &[PineTapeRec]| d.first().filter(|r| r.kind == pine_tape::BOOT_HDR).copied();
+    let (Some(l), Some(r)) = (first(live), first(rep)) else {
+        return false;
+    };
+    l.b == HostKind::Engine as u8
+        && r.a == SlotRoute::Paper as u8
+        && r.b == HostKind::Replay as u8
+        && r.aux == l.aux
+        && r.x2 == l.x2
+}
+
+/// pin:08-cross-replay-fills-file: the replay tape's `--fills` source; `None` when `replay.tsv`
+/// is absent or not exactly its two lines.
+#[must_use]
+pub fn replay_fills(dir: &std::path::Path) -> Option<String> {
+    let t = std::fs::read_to_string(dir.join(crate::pine_tape::REPLAY_FILE)).ok()?;
+    let mut l = t.lines();
+    if l.next()? != crate::pine_tape::REPLAY_MAGIC {
+        return None;
+    }
+    let m = l.next()?.strip_prefix("fills\t")?.to_string();
+    l.next().is_none().then_some(m)
 }
 
 /// pin:08-cross-boot-scripts: `None` when the two boots ran the same scripts.

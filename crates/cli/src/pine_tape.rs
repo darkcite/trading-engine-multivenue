@@ -22,9 +22,14 @@
 //!   pass and at the final one. A write or flush error is returned (the caller logs it; the
 //!   window is void).
 //! - pin:08-tape-out-create-new (risk r21 #5): a replay tape (`backtest --replay-from-boot
-//!   --tape-out`, [`PineTapeWriter::create_new`]) never appends — any of the three files already
-//!   under `<root>/<label>/` refuses it. The live `--pine-tape` ([`PineTapeWriter::open`]) keeps
-//!   create-or-append.
+//!   --tape-out`, [`PineTapeWriter::create_new`]) never appends — any of the three files (or
+//!   `replay.tsv`) already under `<root>/<label>/` refuses it.
+//! - pin:08-live-tape-create-new (risk r22; retires the live create-or-append): the live
+//!   `--pine-tape` ([`PineTapeWriter::open`]) is created new as well — a second boot on the same
+//!   `boot_utc_ms` label, or a clock stepped back onto an earlier one, finds the files and is
+//!   refused (`AlreadyExists`), never appended into an earlier tape. The caller turns the tapes
+//!   OFF for that boot with one ERROR line (the window is void); the boot itself goes on.
+//!   "Exists" is `symlink_metadata` (a dangling link counts), and each file opens `create_new`.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -37,6 +42,10 @@ pub const DRAIN_BATCH: usize = 256;
 pub const TAPE_BUF_BYTES: usize = 64 * 1024;
 /// The tape directory's three files.
 const TAPE_FILES: [&str; 3] = ["seq.bin", "decisions.bin", "set.tsv"];
+/// pin:08-cross-replay-fills-file: a replay tape's fill-source record, next to the three files.
+pub const REPLAY_FILE: &str = "replay.tsv";
+/// pin:08-cross-replay-fills-file: its first line.
+pub const REPLAY_MAGIC: &str = "# pvm-replay-1";
 
 /// One `PineSeqRec` as its 128-byte image (pin:08-tape-bytes-le).
 #[must_use]
@@ -102,13 +111,20 @@ pub struct PineTapeWriter {
 }
 
 impl PineTapeWriter {
-    /// Create `<root>/<boot_utc_ms>/` with `seq.bin`, `decisions.bin` and `set.tsv` (the last
-    /// starting with its header naming the matcher's counters). Boot-only.
+    /// The live `--pine-tape`: create `<root>/<boot_utc_ms>/` with `seq.bin`, `decisions.bin`
+    /// and `set.tsv` (the last starting with its header naming the matcher's counters), every
+    /// file new (pin:08-live-tape-create-new). Boot-only.
     ///
     /// # Errors
-    /// The directory or a file cannot be created.
+    /// A tape file already exists under the label (`AlreadyExists`, nothing created or appended),
+    /// or the directory or a file cannot be created.
     pub fn open(root: &Path, boot_utc_ms: i64, matcher_names: &[&str]) -> io::Result<Self> {
-        Self::open_with(root, boot_utc_ms, matcher_names, false)
+        Self::open_new(
+            root,
+            boot_utc_ms,
+            matcher_names,
+            "a second boot on this label or a clock stepped back",
+        )
     }
 
     /// [`open`](Self::open) for a replay tape (pin:08-tape-out-create-new): every file is created
@@ -118,37 +134,40 @@ impl PineTapeWriter {
     /// # Errors
     /// A tape file already exists, or the directory or a file cannot be created.
     pub fn create_new(root: &Path, boot_utc_ms: i64, matcher_names: &[&str]) -> io::Result<Self> {
-        Self::open_with(root, boot_utc_ms, matcher_names, true)
+        Self::open_new(
+            root,
+            boot_utc_ms,
+            matcher_names,
+            "remove it or choose another --tape-out",
+        )
     }
 
-    fn open_with(
+    fn open_new(
         root: &Path,
         boot_utc_ms: i64,
         matcher_names: &[&str],
-        fresh: bool,
+        hint: &str,
     ) -> io::Result<Self> {
         let dir = root.join(boot_utc_ms.to_string());
-        if fresh {
-            if let Some(n) = TAPE_FILES.iter().find(|n| dir.join(n).exists()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "{} exists: a replay tape is never appended to (remove it or choose \
-                         another --tape-out)",
-                        dir.join(n).display()
-                    ),
-                ));
-            }
+        if let Some(n) = TAPE_FILES
+            .iter()
+            .chain(core::iter::once(&REPLAY_FILE))
+            .find(|n| std::fs::symlink_metadata(dir.join(n)).is_ok())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} exists: a tape is never appended to ({hint})",
+                    dir.join(n).display()
+                ),
+            ));
         }
         std::fs::create_dir_all(&dir)?;
         let open = |n: &str| {
-            let mut o = OpenOptions::new();
-            if fresh {
-                o.write(true).create_new(true);
-            } else {
-                o.create(true).append(true);
-            }
-            o.open(dir.join(n))
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dir.join(n))
                 .map(|f| BufWriter::with_capacity(TAPE_BUF_BYTES, f))
         };
         let seq = open(TAPE_FILES[0])?;
@@ -173,6 +192,21 @@ impl PineTapeWriter {
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// pin:08-cross-replay-fills-file (risk r22 N1): a replay tape records its `--fills` source
+    /// as `<dir>/replay.tsv` — `# pvm-replay-1`, then one `fills\t<recorded|judged>` line —
+    /// created new (never overwritten). The live `--pine-tape` writes none. Boot-only.
+    ///
+    /// # Errors
+    /// The file exists or cannot be written.
+    pub fn replay_mode(&self, fills: &str) -> io::Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.dir.join(REPLAY_FILE))?;
+        writeln!(f, "{REPLAY_MAGIC}\nfills\t{fills}")?;
+        f.flush()
     }
 
     /// Drain both rings until empty; gaps are counted, never hidden (I44).
@@ -349,7 +383,8 @@ mod tests {
     }
 
     /// pin:08-tape-out-create-new (risk r21 #5): a replay tape refuses an existing file under
-    /// its label and appends nothing; the live writer still opens create-or-append.
+    /// its label and appends nothing; the live writer refuses it too
+    /// (pin:08-live-tape-create-new).
     #[test]
     fn create_new_refuses_an_existing_tape() {
         let root = std::env::temp_dir().join(format!("pine-tape-new-{}", std::process::id()));
@@ -376,10 +411,41 @@ mod tests {
             !root.join("7").join("seq.bin").exists(),
             "refused before creating"
         );
-        assert!(
-            PineTapeWriter::open(&root, 7, &["judged"]).is_ok(),
-            "live appends"
+        // pin:08-live-tape-create-new (risk r22): the live writer refuses it too.
+        let e = PineTapeWriter::open(&root, 7, &["judged"]).expect_err("live refused");
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert!(!root.join("7").join("seq.bin").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// pin:08-live-tape-create-new (risk r22): a second live boot on the same label (or a clock
+    /// stepped back onto it) is refused before any file is created — the first boot's tape keeps
+    /// its bytes; a dangling link under the label counts as a file; a fresh label opens.
+    #[test]
+    fn live_open_refuses_a_second_boot_on_the_same_label() {
+        let root = std::env::temp_dir().join(format!("pine-tape-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut w = PineTapeWriter::open(&root, 9, &["judged"]).expect("first boot");
+        w.set_line(9, 0x0100, &[1]).expect("set");
+        w.flush().expect("flush");
+        drop(w);
+        let set = root.join("9").join("set.tsv");
+        let before = std::fs::read(&set).expect("set");
+        let e = PineTapeWriter::open(&root, 9, &["judged"]).expect_err("second boot");
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert!(e.to_string().contains("never appended"), "{e}");
+        assert!(e.to_string().contains("clock stepped back"), "{e}");
+        assert_eq!(
+            std::fs::read(&set).expect("set"),
+            before,
+            "nothing appended"
         );
+        std::fs::create_dir_all(root.join("10")).expect("dir");
+        std::os::unix::fs::symlink(root.join("nowhere"), root.join("10").join("decisions.bin"))
+            .expect("link");
+        assert!(PineTapeWriter::open(&root, 10, &["judged"]).is_err());
+        assert!(!root.join("nowhere").exists(), "never written through");
+        assert!(PineTapeWriter::open(&root, 11, &["judged"]).is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 

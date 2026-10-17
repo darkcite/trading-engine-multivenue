@@ -411,17 +411,41 @@ const SET_ROW_GAP_MAX_MS: i64 = 10_000;
 
 /// Rules 4 and 6. An answer that cannot be shown is ineligible, never a pass (risk review r21):
 /// no rows, a row gap, a short row or a non-zero `rejected_open_cap` all fail closed.
-fn set_rules(set: &SetTsv) -> Option<String> {
+///
+/// pin:08-set-rows-span (risk r22 C1): the rows must cover the window — consecutive rows
+/// strictly increasing and at most 10 s apart (`checked_sub`, `0 < d ≤ 10 000` ms), the first at
+/// most 10 s after the boot (`boot_ms`), the last at least `min(boot + 2 h, last_seq_ms) − 10 s`
+/// (`last_seq_ms`: the wall ms of the last in-window sequencing record, pin:08-verify-window-end;
+/// `None` without one → the boot).
+fn set_rules(set: &SetTsv, boot_ms: i64, last_seq_ms: Option<i64>) -> Option<String> {
     if set.rows.is_empty() {
         return Some("rules 4/6 cannot be shown: set.tsv has no rows".to_string());
     }
     for w in set.rows.windows(2) {
-        if w[1].0 - w[0].0 > SET_ROW_GAP_MAX_MS {
+        let d = w[1].0.checked_sub(w[0].0);
+        if !d.is_some_and(|d| d > 0 && d <= SET_ROW_GAP_MAX_MS) {
             return Some(format!(
-                "set.tsv rows {} → {} are more than 10 s apart",
+                "set.tsv rows {} → {} are not increasing and at most 10 s apart",
                 w[0].0, w[1].0
             ));
         }
+    }
+    let (first, last) = (set.rows[0].0, set.rows[set.rows.len() - 1].0);
+    if boot_ms
+        .checked_add(SET_ROW_GAP_MAX_MS)
+        .is_none_or(|lim| first > lim)
+    {
+        return Some(format!(
+            "set.tsv's first row {first} is more than 10 s after the boot {boot_ms}"
+        ));
+    }
+    let end = boot_ms
+        .saturating_add(WINDOW_MS)
+        .min(last_seq_ms.unwrap_or(boot_ms));
+    if last < end.saturating_sub(SET_ROW_GAP_MAX_MS) {
+        return Some(format!(
+            "set.tsv's last row {last} is more than 10 s before the window's end {end}"
+        ));
     }
     let bit = 1u16 << SLOT_PINE;
     if let Some((utc, mask, _)) = set.rows.iter().find(|(_, m, _)| m & bit == 0) {
@@ -496,14 +520,21 @@ pub fn verify_window_cross(w: WindowIn, rep: Option<&cross::Tapes>) -> WindowOut
     if hdr.a != SlotRoute::Paper as u8 || hdr.b != HostKind::Engine as u8 {
         return inel(format!("route {} host {}: not paper/engine", hdr.a, hdr.b));
     }
-    if let Some(r) = ineligible.or_else(|| set_rules(&set)) {
-        return inel(r);
-    }
-    // Step 2: the boot from the records.
     let anchor = core_time::WallAnchor::new(
         u64::try_from(hdr.x0).unwrap_or(0),
         u64::try_from(hdr.x1).unwrap_or(0),
     );
+    // pin:08-set-rows-span: the last in-window sequencing record's wall (pin:08-verify-window-end).
+    let hdr_boot_ms = hdr.aux as i64;
+    let last_seq_ms = seq
+        .iter()
+        .map(|r| i64::try_from(anchor.wall_of(r.e_ns) / 1_000_000).unwrap_or(i64::MAX))
+        .take_while(|&ms| ms <= hdr_boot_ms.saturating_add(WINDOW_MS))
+        .last();
+    if let Some(r) = ineligible.or_else(|| set_rules(&set, hdr_boot_ms, last_seq_ms)) {
+        return inel(r);
+    }
+    // Step 2: the boot from the records.
     cfg.anchor = anchor;
     cfg.oid_epoch = u32::try_from(hdr.x2).unwrap_or(0);
     cfg.boot_utc_ms = hdr.aux as i64;
@@ -1000,6 +1031,8 @@ pub fn load_window(tape_dir: &Path, o: &VerifyOpts) -> Result<Loaded, String> {
     let pine_syms: Vec<core_types::SymbolId> = rec.symbols.iter().map(|f| f.sym).collect();
     let ineligible = rule5(&run, &pine_syms, anchor, end_ms);
     // pin:08-verify-delivery-carried.
+    // pin:08-delivery-void-file (risk r24, latent): carried, never read today (`delivery: _`);
+    // any future consumer must first pass `backtest::pine::boot::refuse_voided_journal`.
     let jp = run.join(crate::pine_delivery::DELIVERY_FILE);
     let delivery = if jp.is_file() {
         crate::pine_delivery::read_journal(&jp).map_err(|e| format!("unreadable: {e}"))?
@@ -1031,7 +1064,10 @@ pub fn run(tapes: &[PathBuf], o: &VerifyOpts) -> (Vec<String>, u8) {
 /// 8g-B's pairing (§4.9.4, rule 7): the replay-from-boot tapes under `root` with the live tape
 /// directory's label. pin:08-cross-pair-by-label: no `<root>/<label>/` → the window is
 /// ineligible (the replay did not accept the capture); a torn file → unreadable (exit 2); a seq
-/// gap in either replay tape or a different `BOOT_SCRIPT` set → ineligible.
+/// gap in either replay tape, a tape that is not this boot's replay (pin:08-cross-pair-is-replay),
+/// a replay made with another `--fills` source (pin:08-cross-fills-recorded), an unrecorded or
+/// unfinished replay (no `replay.tsv`, pin:08-replay-file-after-clean-drive) or a different
+/// `BOOT_SCRIPT` set → ineligible.
 ///
 /// # Errors
 /// An unreadable replay tape.
@@ -1050,6 +1086,32 @@ pub fn pair(
     let rep = cross::read_tapes(&dir)?;
     if !gapless(&rep.seq, 1, |r| r.seq) || !gapless(&rep.dec, 0, |r| r.seq) {
         return Ok(Err("8g-B: a seq gap in the replay tapes".to_string()));
+    }
+    // pin:08-cross-pair-is-replay (risk r22 B1): never the live tape paired with itself.
+    if !cross::is_replay_of(live_dec, &rep.dec) {
+        return Ok(Err(
+            "8g-B: paired tape is not this boot's replay-from-boot tape".to_string(),
+        ));
+    }
+    // pin:08-cross-fills-recorded (risk r22 N1).
+    match cross::replay_fills(&dir) {
+        Some(m) if m == cross::CROSS_FILLS => {}
+        Some(m) => {
+            return Ok(Err(format!(
+                "8g-B: the replay tape's fill source is {m} (8g-B pairs with --fills {})",
+                cross::CROSS_FILLS
+            )))
+        }
+        // pin:08-replay-file-after-clean-drive (risk r23 B2): only a drive that finished clean
+        // writes `replay.tsv`; a faulted, diverged or aborted replay has none.
+        None => {
+            return Ok(Err(format!(
+                "8g-B: unrecorded or unfinished replay (no well-formed {}; 8g-B pairs with \
+                 --fills {})",
+                crate::pine_tape::REPLAY_FILE,
+                cross::CROSS_FILLS
+            )))
+        }
     }
     let live = cross::Tapes {
         seq: Vec::new(),
@@ -1205,4 +1267,62 @@ pub fn main(a: &PineVerifyArgs) -> u8 {
         println!("{l}");
     }
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{set_rules, SetTsv, WINDOW_MS};
+
+    const BOOT: i64 = 1_767_225_600_000;
+
+    /// Rows at `utc` (bit 8 set, `rejected_open_cap` 0).
+    fn set(utc: &[i64]) -> SetTsv {
+        SetTsv {
+            names: vec!["rejected_open_cap".to_string()],
+            rows: utc.iter().map(|&u| (u, 0x01FF, vec![0])).collect(),
+        }
+    }
+
+    fn reason(s: &SetTsv, last_seq_ms: Option<i64>) -> String {
+        set_rules(s, BOOT, last_seq_ms).unwrap_or_default()
+    }
+
+    /// pin:08-set-rows-span: consecutive rows `0 < d ≤ 10 s` (`checked_sub`, no overflow).
+    #[test]
+    fn set_rules_require_increasing_rows_at_most_10_s_apart() {
+        let t = BOOT + 5_000;
+        assert_eq!(
+            set_rules(&set(&[t, t + 5_000, t + 15_000]), BOOT, Some(t)),
+            None
+        );
+        for bad in [
+            vec![t, t + 10_001],
+            vec![t, t],
+            vec![t, t - 1],
+            vec![t, i64::MIN],
+            vec![i64::MIN, t],
+        ] {
+            assert!(
+                reason(&set(&bad), Some(t)).contains("10 s apart"),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// pin:08-set-rows-span: the first row ≤ boot + 10 s; the last ≥ min(boot + 2 h, the last
+    /// in-window seq wall) − 10 s.
+    #[test]
+    fn set_rules_require_the_rows_to_cover_the_window() {
+        assert_eq!(set_rules(&set(&[BOOT + 10_000]), BOOT, None), None);
+        assert!(reason(&set(&[BOOT + 10_001]), None).contains("after the boot"));
+        // The last seq record at boot + 60 s: the last row must reach boot + 50 s.
+        let rows: Vec<i64> = (1..=10).map(|k| BOOT + 5_000 * k).collect();
+        assert_eq!(set_rules(&set(&rows), BOOT, Some(BOOT + 60_000)), None);
+        assert!(reason(&set(&rows), Some(BOOT + 60_001)).contains("before the window's end"));
+        // A tape past boot + 2 h is bounded by the window: rows to boot + 2 h − 10 s suffice.
+        let full: Vec<i64> = (1..=1_438).map(|k| BOOT + 5_000 * k).collect();
+        assert_eq!(*full.last().unwrap_or(&0), BOOT + WINDOW_MS - 10_000);
+        assert_eq!(set_rules(&set(&full), BOOT, Some(BOOT + WINDOW_MS)), None);
+        assert!(reason(&set(&full[..1_437]), Some(BOOT + WINDOW_MS)).contains("window's end"));
+    }
 }

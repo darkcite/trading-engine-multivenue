@@ -210,6 +210,9 @@ pub struct PineStrategy {
     boot_err: Option<PineLoadError>,
     /// pin:08-boot-record-boot-utc-ms: the boot instant `on_start` ran on (the boot record's).
     boot_utc_ms: i64,
+    /// pin:08-boot-record-anchor: a replay boot's record anchor (the live member's), rendered
+    /// back by `boot_record`; `None` on the engine host (its own `PineBootCfg::anchor`).
+    record_anchor: Option<core_time::WallAnchor>,
 }
 
 impl core::fmt::Debug for PineStrategy {
@@ -276,6 +279,7 @@ impl PineStrategy {
             core: None,
             boot_err: None,
             boot_utc_ms: 0,
+            record_anchor: None,
         }
     }
 
@@ -495,6 +499,9 @@ impl PineStrategy {
             boot_mono_ns,
             boot_utc_ms: self.boot_utc_ms,
             route: core.route,
+            // pin:08-boot-record-anchor: the anchor this member maps every stamp through (a
+            // replay's: the record's, the live member's).
+            anchor: self.record_anchor.unwrap_or(core.anchor),
             scripts,
             // COPY: the boot's symbol facts (≤ MAX_SYMBOLS rows) — boot only, the record is
             // owned by the host — a borrow would tie the record to the member.
@@ -834,6 +841,8 @@ impl Strategy for PineStrategy {
         let boot_ns = u64::try_from(pine_ir::scale::ns_from_ms(st.cfg.boot_utc_ms)).unwrap_or(0);
         // pin:08-boot-record-boot-utc-ms: kept for `boot_record` (a Copy, no allocation).
         self.boot_utc_ms = st.cfg.boot_utc_ms;
+        // pin:08-boot-record-anchor: a replay re-renders the anchor of the record it booted from.
+        self.record_anchor = st.record.as_ref().map(|r| r.anchor);
         let mut sha_lo = [0u8; 8];
         sha_lo.copy_from_slice(&st.cfg.manifest_sha256[..8]);
         let hdr = tape::BootHdr {
