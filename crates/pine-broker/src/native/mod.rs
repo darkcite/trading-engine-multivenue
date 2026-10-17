@@ -153,6 +153,7 @@ impl NativeBroker {
         let ctx = CommitCtx {
             bar: self.cur_bar,
             round_tick_1e6: 0,
+            round_floor: false,
             allow: self.decl.risk.allow_entry_in,
             position_1e6: self.book.view().position_size_1e6,
             halted: self.risk.halted(),

@@ -388,7 +388,16 @@ fn bf_linear(w: &[f64], p: f64) -> f64 {
         return f64::NAN;
     }
     let v = sorted(w);
-    let x = (p * (v.len() - 1) as f64) / 100.0;
+    // C = 1/2 (`pin:04-percentile-linear-c-half`, CI-015b): rank `p·N/100 − 1/2`, clamped.
+    let x = (p * v.len() as f64) / 100.0 - 0.5;
+    let last = (v.len() - 1) as f64;
+    let x = if x < 0.0 {
+        0.0
+    } else if x > last {
+        last
+    } else {
+        x
+    };
     let k = x.floor() as usize;
     let frac = x - k as f64;
     if frac == 0.0 || k + 1 == v.len() {
@@ -398,12 +407,13 @@ fn bf_linear(w: &[f64], p: f64) -> f64 {
     }
 }
 
-/// Operator ruling 2026-10-16 (`pin:04-percentile-linear-provisional`, `pin:04-percentile-linear-na`):
-/// `ta.percentile_linear_interpolation` is the C = 1 interpolation over the newest `length`
-/// executions; a na among them gives na (the reference: "`na` values ... are included in
-/// calculations and will produce an `na` result"); it allocates nothing.
+/// CI-015b (B096; `pin:04-percentile-linear-c-half` retires `pin:04-percentile-linear-provisional`,
+/// `pin:04-percentile-linear-na` kept): `ta.percentile_linear_interpolation` is the C = 1/2
+/// interpolation over the newest `length` executions; a na among them gives na (the reference:
+/// "`na` values ... are included in calculations and will produce an `na` result"); it
+/// allocates nothing.
 #[test]
-fn ta_percentile_linear_interpolation_is_c1_and_propagates_na() {
+fn ta_percentile_linear_interpolation_is_c_half_and_propagates_na() {
     for holes in [false, true] {
         let base = tape(1500, holes);
         let xs: Vec<f64> = base
@@ -445,14 +455,46 @@ fn ta_percentile_linear_interpolation_is_c1_and_propagates_na() {
             }
         }
     }
-    // 1..=10 at 25 %: x = 2.25 → 3 + 0.25 · (4 − 3).
+    // 1..=10 at 25 %: x = 2.5 − 0.5 = 2.0 → 3; at 35 %: x = 3.0 → 4; at 30 %: x = 2.5 → 3.5.
     let xs: Vec<f64> = (1..=10).map(|v| v as f64).collect();
+    for (p, want) in [
+        (25.0, 3.0),
+        (35.0, 4.0),
+        (30.0, 3.5),
+        (2.0, 1.0),
+        (99.0, 10.0),
+    ] {
+        let (got, _) = run_p(
+            ov::TA_PERCENTILE_LINEAR_INTERPOLATION,
+            10,
+            &xs,
+            false,
+            Some(p),
+        );
+        assert_eq!(got[9], want, "p = {p}");
+    }
+    // B096 row 13: `ta.percentile_linear_interpolation(syn, 14, 2.0)` over SYN-1's first 14
+    // values is their minimum, 1089.3 (C = 1 gave 1095.3892).
+    let syn = syn1(14);
     let (got, _) = run_p(
         ov::TA_PERCENTILE_LINEAR_INTERPOLATION,
-        10,
-        &xs,
+        14,
+        &syn,
         false,
-        Some(25.0),
+        Some(2.0),
     );
-    assert_eq!(got[9], 3.25);
+    assert_eq!(got[13], 1089.3);
+}
+
+/// SYN-1's first `n` `syn` values (impl-06 §4.1.1, the prelude's exact binary64 order).
+fn syn1(n: usize) -> Vec<f64> {
+    let (mut s, mut out) = (1.0f64, Vec::with_capacity(n));
+    while out.len() < n {
+        let hi = (s / 127773.0).floor();
+        let lo = s - hi * 127773.0;
+        let t = 16807.0 * lo - 2836.0 * hi;
+        s = if t > 0.0 { t } else { t + 2147483647.0 };
+        out.push(1000.0 + (s - (s / 100000.0).floor() * 100000.0) / 100.0);
+    }
+    out
 }

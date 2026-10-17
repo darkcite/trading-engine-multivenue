@@ -527,7 +527,15 @@ fn ir_shapes_structures_for_step_follows_pin() {
     .expect_err("a zero step");
     assert_eq!(e.code.0, 3007);
     let dynamic = "s = 0\nfor i = 0 to 4 by bar_index % 2 + 1\n    s += i\nplot(s)\n";
-    let e = try_ir(dynamic, Dialect::V6, &rd).expect_err("a dynamic step");
+    // CI-004 / F085: the default `RuntimeFault` guards the loop with `runtime.error`.
+    let r = ir_with(dynamic, Dialect::V6, &rd);
+    let ov = pine_spec::ov::RUNTIME_ERROR;
+    assert!(all(&r)
+        .iter()
+        .any(|s| matches!(s, Stmt::Op(Op::Call { ov: o, .. }) if *o == ov)));
+    let mut refuse = rd;
+    refuse.pins.for_step = ForStep::RefuseDynamic;
+    let e = try_ir(dynamic, Dialect::V6, &refuse).expect_err("a dynamic step");
     assert_eq!(e.code.0, 3008);
     let mut abs = rd;
     abs.pins.for_step = ForStep::RuntimeAbs;

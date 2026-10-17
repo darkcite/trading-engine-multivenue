@@ -812,7 +812,8 @@ fn linreg_and_bbw_match_bruteforce() {
     let bb = run3(ov::TA_BB, &[20], &[2.0], 20, &c);
     let bbw = run_g(ov::TA_BBW, &[In::Close, In::Int(20), In::F(2.0)], 20, &b);
     for i in 0..c.len() {
-        let want = (bb[i][1] - bb[i][2]) / bb[i][0];
+        // CI-015a (B078, `pin:04-bbw-percent`): TradingView's `ta.bbw` is a percentage.
+        let want = (bb[i][1] - bb[i][2]) / bb[i][0] * 100.0;
         assert!(close_eq(bbw[i], want), "bbw {i}");
     }
 }

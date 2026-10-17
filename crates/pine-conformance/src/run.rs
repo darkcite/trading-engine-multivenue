@@ -263,6 +263,18 @@ pub enum SyminfoSource {
     Missing,
 }
 
+/// The closed trades a TV broker dropped (it retains the newest 9 000, impl-05 I12), and their
+/// totals — what `cum_pnl` of the first kept trade already holds (CI-029, E109).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Evicted {
+    /// `closedtrades − closed_retained`.
+    pub trades: u32,
+    /// The dropped trades' net P&L (`netprofit` − the retained closed trades').
+    pub net_1e12: i128,
+    /// The dropped trades' commission (`commission_paid` − every listed trade's fee).
+    pub fee_1e12: i128,
+}
+
 /// What one run produced.
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
@@ -278,6 +290,8 @@ pub struct RunOutcome {
     pub trades: Vec<TradeRec>,
     /// The broker's run record (strategies whose expectation carries trades).
     pub record: Option<RunRecord>,
+    /// The closed trades the broker dropped from its retained list (`pin:06-trade-trim-kept`).
+    pub evicted: Evicted,
     /// Chart bars stepped.
     pub bars: u32,
     /// Evaluations (parent and sub-programs, intrabar included).
@@ -771,7 +785,8 @@ impl Runner {
         }
         let mut buf = vec![f64::NAN; keys.len() * src.len()];
         // 11
-        let mut broker = if prog.meta.kind == ScriptKind::Strategy && f.driver != Driver::Rt {
+        // pin:06-rt-broker (CI-030) — an `Rt` strategy (E106) gets its `TvBroker` too.
+        let mut broker = if prog.meta.kind == ScriptKind::Strategy {
             Some(
                 pine_broker::TvBroker::new(
                     &prog.meta,
@@ -861,13 +876,12 @@ impl Runner {
             }
             Drive::Rt(tape) => {
                 let rt = tape.spec();
-                let mut none = None;
                 let mut b = Bar::default();
                 let mut k = 0u32;
                 while k < rt.history && res.is_ok() {
                     tape.history_bar(k, &mut b);
                     if let Err(h) =
-                        step_chart_bar(&b, &mut subs, &mut store, &mut vm, &mut none, &mut evals)
+                        step_chart_bar(&b, &mut subs, &mut store, &mut vm, &mut broker, &mut evals)
                     {
                         res = Err(h);
                         break;
@@ -880,8 +894,15 @@ impl Runner {
                 }
                 let mut r = 0u32;
                 while r < rt.realtime && res.is_ok() {
-                    if let Err(h) = step_rt_bar(tape, r, &mut subs, &mut store, &mut vm, &mut evals)
-                    {
+                    if let Err(h) = step_rt_bar(
+                        tape,
+                        r,
+                        &mut subs,
+                        &mut store,
+                        &mut vm,
+                        &mut broker,
+                        &mut evals,
+                    ) {
                         res = Err(h);
                         break;
                     }
@@ -901,11 +922,12 @@ impl Runner {
         // 16
         let mut trades = Vec::new();
         let mut record = None;
+        let mut evicted = Evicted::default();
         if let (Some(b), Expect::Strategy { .. }) = (&broker, &f.expect) {
             let view = b.view();
-            if view.closed_retained < view.closedtrades {
-                return Err(RunError::TradesEvicted);
-            }
+            // pin:06-trade-trim-kept (CI-029, E109) — a trimmed list is compared as TradingView
+            // keeps it (the newest closed trades); the dropped trades' totals seed `cum_pnl`.
+            evicted.trades = view.closedtrades - view.closed_retained;
             let mut i = 0u32;
             while i < view.closed_retained {
                 trades.push(*b.closed_trade(i).expect("closed_retained bounds the list"));
@@ -916,7 +938,14 @@ impl Runner {
                 trades.push(*b.open_trade(i).expect("opentrades bounds the list"));
                 i += 1;
             }
-            record = Some(b.record());
+            let rec = b.record();
+            if evicted.trades > 0 {
+                let net = crate::trades::retained_pnl(&trades, crate::trades::PnlBasis::Net);
+                let fees: i128 = trades.iter().map(|t| t.fee_1e12).sum();
+                evicted.net_1e12 = view.netprofit_1e12 - net;
+                evicted.fee_1e12 = rec.commission_paid_1e12 - fees;
+            }
+            record = Some(rec);
         }
         let counters = vm.counters();
         Ok(RunOutcome {
@@ -926,6 +955,7 @@ impl Runner {
             plot_ix,
             trades,
             record,
+            evicted,
             bars: n_rows,
             evaluations: evals,
             counters,
@@ -1056,6 +1086,7 @@ impl Runner {
                 plot_ix: plot_ix.clone(),
                 trades: Vec::new(),
                 record: None,
+                evicted: Evicted::default(),
                 bars: n,
                 evaluations: e,
                 counters: c,
@@ -1191,13 +1222,21 @@ impl Runner {
                     return Verdict::Fail(d);
                 }
                 // pin:06-pnl-basis-net — `Net` until capture/format.tsv records probe-03's basis.
-                let td = crate::trades::compare_trades(
-                    trades,
-                    &o.trades,
-                    &o.syms,
-                    &self.signals,
-                    crate::trades::PnlBasis::Net,
-                )
+                // pin:06-trade-trim-kept (CI-029) — the kept trades, `cum_pnl` seeded; on a SYN
+                // tape (E109) only the kept list's shape is TradingView's.
+                let td = if f.driver == Driver::Syn && o.evicted.trades > 0 {
+                    crate::trades::compare_kept_shape(trades, &o.trades, o.evicted.trades)
+                } else {
+                    crate::trades::compare_trades_kept(
+                        trades,
+                        &o.trades,
+                        o.evicted.trades,
+                        o.evicted.net_1e12,
+                        &o.syms,
+                        &self.signals,
+                        crate::trades::PnlBasis::Net,
+                    )
+                }
                 .or_else(|| {
                     let s = summary.as_ref()?;
                     let rec = o.record.as_ref()?;
@@ -1205,7 +1244,8 @@ impl Runner {
                         .trades
                         .iter()
                         .filter(|t| t.flags & pine_ir::trade_flag::OPEN == 0)
-                        .count() as u32;
+                        .count() as u32
+                        + o.evicted.trades;
                     crate::trades::compare_summary(s, rec, closed)
                 });
                 match td {
@@ -1269,14 +1309,15 @@ fn fail(what: String) -> Verdict {
 /// `pin:06-rt-bookkeeping-columns` (R-P3, 2026-10-17) — on a `Driver::Rt` fixture the plots whose
 /// title ends `_rt`, `_done`, `_upd` or `_k` are capture bookkeeping (which rows are realtime and
 /// confirmed, the tick count): a `series` body never compares them; the report says so.
+///
+/// r27 review: one bookkeeping rule for the runner and distil — a plot is bookkeeping exactly when
+/// `capture::distil::is_relation_column` says it is not a relation column (`RT_BOOKKEEPING` and the
+/// `tick_` counters, `pin:06-distil-tick-columns`).
 pub fn is_rt_bookkeeping(f: &Fixture, p: usize) -> bool {
     f.driver == Driver::Rt
-        && f.plots.get(p).is_some_and(|s| {
-            matches!(
-                s.title.rsplit('_').next(),
-                Some("rt" | "done" | "upd" | "k")
-            )
-        })
+        && f.plots
+            .get(p)
+            .is_some_and(|s| !crate::capture::distil::is_relation_column(f.id, &s.title))
 }
 
 /// The run row index of row key `key` (`Step`: the key; `Time`: from the open time).

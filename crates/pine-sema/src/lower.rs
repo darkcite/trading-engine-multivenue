@@ -186,6 +186,8 @@ pub(crate) fn lower(
         ti: tree.nodes.first().map_or(t.root, |n| n.type_inst as usize),
         ir: Ir::default(),
         vars: HashMap::new(),
+        globals: HashMap::new(),
+        depth: 0,
         params: Vec::new(),
         out: Vec::new(),
         prelude: Vec::new(),
@@ -266,6 +268,12 @@ struct Lower<'a> {
     ir: Ir,
     /// `var id` → its slot (this Instantiation's).
     vars: HashMap<u32, VSlot>, // INDEX-ONLY
+    /// The root Instantiation's `vars` while a user call is inlined (CI-012, F030 F051–F053): a
+    /// function body reads the script's global variables (Pine's scope rule); `vars` then holds
+    /// the callee's own. Empty at depth 0.
+    globals: HashMap<u32, VSlot>, // INDEX-ONLY
+    /// User-call inlining depth.
+    depth: u32,
     /// This Instantiation's parameters, by index (§4.6.2: by value, the argument's own slot).
     params: Vec<VSlot>,
     /// The block being built.
@@ -505,9 +513,7 @@ impl Lower<'_> {
             }
             Node::Ident { .. } | Node::Field { .. } => match self.binding(n) {
                 Some(Binding::Var { id, .. } | Binding::Counter { id }) => self
-                    .vars
-                    .get(&id)
-                    .copied()
+                    .var_slot(id)
                     .ok_or_else(|| self.todo(n, "a variable of another scope")),
                 Some(Binding::Param { index }) => self
                     .params
@@ -870,7 +876,12 @@ impl Lower<'_> {
         let Some(child) = self.tree.child(self.inst, n) else {
             return Err(self.todo(n, "a call with no Instantiation"));
         };
-        let Node::Call { args, .. } = self.ast.node(n) else {
+        let Node::Call {
+            callee: fnode,
+            args,
+            ..
+        } = self.ast.node(n)
+        else {
             return Err(self.todo(n, "a call node"));
         };
         let callee = &self.t.insts[ti];
@@ -879,13 +890,34 @@ impl Lower<'_> {
         else {
             return Err(self.todo(n, "a callee without a declaration"));
         };
-        let Node::FuncDecl { params, body, .. } = cast.node(decl) else {
+        let Node::FuncDecl {
+            params,
+            body,
+            method,
+            ..
+        } = cast.node(decl)
+        else {
             return Err(self.todo(n, "a callee that is not a function"));
         };
+        // CI-012 (C007 C014 C021 C033): `recv.m(…)` binds the receiver to the method's first
+        // parameter, as infer's `method_call` does (it inserts the receiver as argument 0); a
+        // library path `lib.m(x)` is a function-style call.
+        let recv = match self.ast.node(fnode) {
+            Node::Field { base, .. }
+                if method && !matches!(self.binding(base), Some(Binding::Lib { .. })) =>
+            {
+                Some(base)
+            }
+            _ => None,
+        };
+        let off = usize::from(recv.is_some());
         // Positional arguments bind in order, named ones by name; an omitted parameter takes its
         // declared default, folded in the callee's TypeInst (§4.6.2). Arguments are evaluated in
-        // source order.
+        // source order (the receiver first).
         let mut by_param: Vec<Option<NodeId>> = vec![None; params.len()];
+        if let (Some(b), Some(p0)) = (recv, by_param.first_mut()) {
+            *p0 = Some(b);
+        }
         for (k, &a) in args.iter().enumerate() {
             let (slot, v) = match self.ast.node(a) {
                 Node::NamedArg { name, value } => {
@@ -898,7 +930,7 @@ impl Lower<'_> {
                     });
                     (at, value)
                 }
-                _ => (Some(k), a),
+                _ => (Some(k + off), a),
             };
             match slot.and_then(|i| by_param.get_mut(i)) {
                 Some(b) => *b = Some(v),
@@ -906,7 +938,7 @@ impl Lower<'_> {
             }
         }
         let mut vals: Vec<Option<VSlot>> = vec![None; params.len()];
-        for &a in args {
+        for &a in recv.iter().chain(args) {
             let v = match self.ast.node(a) {
                 Node::NamedArg { value, .. } => value,
                 _ => a,
@@ -952,23 +984,42 @@ impl Lower<'_> {
                 _ => return Err(self.todo(n, "a parameter default that does not fold")),
             }
         }
+        let mut outer = std::mem::take(&mut self.vars);
+        if self.depth == 0 {
+            // The caller is the script's top level: its variables are the globals.
+            self.globals = std::mem::take(&mut outer);
+        }
         let saved = (
             self.inst,
             self.ti,
             self.ast,
-            std::mem::take(&mut self.vars),
+            outer,
             std::mem::replace(&mut self.params, bound),
         );
         self.inst = child;
         self.ti = ti;
         self.ast = cast;
+        self.depth += 1;
         let r = f(self, body);
+        self.depth -= 1;
         self.inst = saved.0;
         self.ti = saved.1;
         self.ast = saved.2;
-        self.vars = saved.3;
+        self.vars = if self.depth == 0 {
+            std::mem::take(&mut self.globals)
+        } else {
+            saved.3
+        };
         self.params = saved.4;
         r
+    }
+
+    /// A variable's slot: this Instantiation's, else (inside a user call of the root file) the
+    /// script's global (CI-012, `pin:W3-lazy-and-or` fixtures F030 F051–F053).
+    fn var_slot(&self, id: u32) -> Option<VSlot> {
+        let own = self.vars.get(&id).copied();
+        let root_file = self.cur().file == 0;
+        own.or_else(|| (root_file && self.depth > 0).then(|| self.globals.get(&id).copied())?)
     }
 
     /// A tuple body: its statements, then the last one's elements.
@@ -2146,6 +2197,12 @@ impl Lower<'_> {
                     let msg = "a `for` step must be a constant (pin:02-for-step)".to_owned();
                     return Err(diag(ReasonCode::QualifierTooWeak, self.ast.span(x), msg));
                 }
+                None if self.rd.pins.for_step == ForStep::RuntimeFault => {
+                    // CI-004 / F085: the step as written, checked once on entering the `for`.
+                    let v = self.value_as(x, ct)?;
+                    self.step_check(v, ct.ty, self.ast.span(x))?;
+                    (v, None, false)
+                }
                 None => {
                     // `RuntimeAbs`: the step's absolute value; zero runs no iteration.
                     let v = self.value_as(x, ct)?;
@@ -2286,6 +2343,45 @@ impl Lower<'_> {
             _ => None,
         };
         self.push_loop(at, ctr, head, c, b, bd, stepb, trip, LoopKind::For);
+        Ok(())
+    }
+
+    /// CI-004 / F085, `pin:02-for-step` `RuntimeFault`: `if not (s > 0)` call pine-std's
+    /// `runtime.error` (`ScriptRefused`) with TradingView's text. A comparison with `na` is false
+    /// (contract §3.6.1), so an `na` step faults too: it is not greater than zero.
+    fn step_check(&mut self, s: VSlot, ty: Ty, at: Span) -> Result<(), Diag> {
+        const MSG: &str = "'step' in loop must be greater than zero.";
+        let zero = if ty == Ty::Float {
+            K::Float(0.0)
+        } else {
+            K::Int(0)
+        };
+        let z = self.konst(zero, scalar(ty, Qual::Const), at);
+        let ok = self.temp(scalar(Ty::Bool, Qual::Series), at);
+        self.op(Op::Cmp {
+            op: CmpK::Gt,
+            dst: ok,
+            a: s,
+            b: z,
+        });
+        let ov = self.helper("runtime.error", at)?;
+        let ((), fault, _) = self.region(|x| {
+            x.op(Op::Call {
+                ov,
+                args: vec![Arg::Str(MSG)],
+                outs: Vec::new(),
+                span: at,
+            });
+            Ok(())
+        })?;
+        self.push_if(
+            ok,
+            Block::default(),
+            Vec::new(),
+            fault,
+            Vec::new(),
+            CondKind::If,
+        );
         Ok(())
     }
 
@@ -2842,6 +2938,21 @@ impl Lower<'_> {
                     scalar(Ty::Int, Qual::Const),
                     at,
                 )))
+            }
+            DefaultSrc::TimeframeChange => {
+                // CI-012 / CI-041 (B120 D059, `ta.vwap(src)`): "as if `timeframe.change()` were
+                // passed" — the call itself, at this call site, with its own `timeframe` default.
+                let ov = pine_spec::ov::TIMEFRAME_CHANGE;
+                let dv = pine_spec::params(pine_spec::overload(ov))[0].default;
+                let tf = self.literal_arg(dv, scalar(Ty::String, Qual::Series), at)?;
+                let dst = self.temp(t, at);
+                self.op(Op::Call {
+                    ov,
+                    args: vec![tf],
+                    outs: vec![dst],
+                    span: at,
+                });
+                Ok(Arg::Slot(dst))
             }
             other => {
                 let msg = format!("not implemented: lowering the derived default {other:?} (T20)");

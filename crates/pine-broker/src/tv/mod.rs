@@ -8,12 +8,16 @@
 pub(crate) mod cost;
 pub(crate) mod margin;
 pub(crate) mod path;
+#[cfg(test)]
+mod tests_r27b;
+#[cfg(test)]
+mod tests_trades;
 
 use crate::book::{lot_flag, Book, FillSrc};
 use crate::cap;
 use crate::decl::{check_tv, decl_hash64};
 use crate::exit::{set_state, ExitTable, SyncCtx};
-use crate::fault::{BrokerFault, InternalDefect};
+use crate::fault::{BrokerFault, InternalDefect, ScriptRefusal};
 use crate::money::{floor_step, mul_div, sat_i64};
 use crate::orders::{otype, pflag, state, CommitCtx, OrderTable};
 use crate::risk::Risk;
@@ -21,14 +25,14 @@ use crate::size::{
     declared_qty, n_rule_entry, n_rule_scale, open_entry_trades, size_entry, unit_qty,
 };
 use crate::switch::{
-    CloseImmediately, CofCloseTick, CofNextTick, ForcedFillSlippage, PctEquityAt, PriceRounding,
-    PyramidCheck, Switches, TrailArmFire, SWITCHES,
+    CloseImmediately, CofCloseTick, CofNextTick, ForcedFillSlippage, HistoryTick, PctEquityAt,
+    PriceRounding, PyramidCheck, Switches, TrailArmFire, SWITCHES,
 };
 use cost::{commission_1e12, slip};
 use margin::{funds_check, liquidation_price, margin_call_qty};
 use path::{before, path, reach, segment, sort_cands, Cand, Level};
 use pine_ir::{
-    decl_flag, Bar, BrokerCounters, BrokerView, ChartInfo, DiagCode, Dialect, IntentKind,
+    barflag, decl_flag, Bar, BrokerCounters, BrokerView, ChartInfo, DiagCode, Dialect, IntentKind,
     OrderIntent, ProgramMeta, RunRecord, SizingMode, StrKey, StrategyDecl, TradeRec, TvCfg,
 };
 
@@ -38,8 +42,10 @@ pub enum TvStep {
     /// Evaluate the script against `bar`, then call `submit(vm.intents())`. `intrabar == false`:
     /// the bar-close evaluation → `VmInstance::step_bar`. `intrabar == true`: a
     /// `calc_on_order_fills` execution at a fill tick → `VmInstance::step_tick` (script state rolls
-    /// back; the intents it emits commit, W21). `bar` is always the **full** bar: on historical
-    /// bars TradingView's extra executions see the bar's final OHLCV (§4.3.2).
+    /// back; the intents it emits commit, W21). `bar` is the **full** bar: on historical bars
+    /// TradingView's extra executions see the bar's final OHLCV (§4.3.2) — except a history-tick
+    /// run (`history_tick = PathPoints`, §4.8.9), whose `bar` is the developing bar at its path
+    /// point with `barflag::CONFIRMED` dropped (`pin:05-hist-tick-bar`).
     Evaluate {
         /// The full bar.
         bar: Bar,
@@ -56,7 +62,12 @@ const _: () = assert!(core::mem::size_of::<TvStep>() == 128);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WalkState {
     Idle,
-    AwaitingSubmit { intrabar: bool, tick_px: i64 },
+    /// `hist`: the outstanding evaluation is a history-tick run (§4.8.9).
+    AwaitingSubmit {
+        intrabar: bool,
+        tick_px: i64,
+        hist: bool,
+    },
     Walking,
 }
 
@@ -111,13 +122,39 @@ pub struct TvBroker {
     late_a: i64,
     /// The current segment's trails have been moved (`after_segment` ran).
     trailed: bool,
+    /// v5 orders that died unfilled at their fill attempt — sized to zero, refused by pyramiding,
+    /// nothing to close — and so do not count (`pin:05-v5-order-limit`, CI-005 / E110).
+    v5_dropped: u64,
+    /// The price the latest evaluation saw (its `tick_px`): a market order's sizing price
+    /// (`pin:05-qty-reference-price`, CI-035).
+    eval_px_1e6: i64,
+    /// `history_tick = PathPoints` and the script sets `calc_on_every_history_tick` (§4.8.9).
+    hist: bool,
+    /// Per bar: the history-tick runs issued, bit = path point 0–2 (§4.8.9); all set on a
+    /// realtime bar or when `hist` is off.
+    hist_done: u8,
 }
+
+/// `hist_done` with every history-tick run issued.
+const HIST_ALL: u8 = 0b111;
 
 impl TvBroker {
     /// Validates `meta.decl`, `meta.chart` and `cfg` (§3.7) and allocates the closed-trade ring —
     /// the one allocation. Refuses with the §3.7 code; never panics.
     pub fn new(meta: &ProgramMeta, cfg: TvCfg) -> Result<Self, DiagCode> {
-        check_tv(meta, &cfg)?;
+        Self::build(meta, cfg, SWITCHES, BrokerCounters::default())
+    }
+
+    /// `new` on the switch reading `sw` (the default `SWITCHES` outside tests, I38); `counters`
+    /// the zeroed counters (`BrokerCounters::default()` stays inside a `fn new`, §4.17).
+    fn build(
+        meta: &ProgramMeta,
+        cfg: TvCfg,
+        sw: Switches,
+        counters: BrokerCounters,
+    ) -> Result<Self, DiagCode> {
+        let path_points = sw.history_tick == HistoryTick::PathPoints;
+        check_tv(meta, &cfg, path_points)?;
         let d = meta.decl;
         // COPY: §4.17 #7 the broker by value, 76 096 B, once at construction — init-time move
         // into the host's slot — an out-parameter or a boxed broker rejected: the frozen signature.
@@ -126,7 +163,7 @@ impl TvBroker {
             chart: meta.chart,
             dialect: meta.dialect,
             cfg,
-            sw: SWITCHES,
+            sw,
             decl_hash: decl_hash64(&d),
             book: Book::new(
                 d.initial_capital_1e6,
@@ -134,9 +171,9 @@ impl TvBroker {
                 d.flags & decl_flag::CLOSE_ANY != 0,
             ),
             orders: OrderTable::new(),
-            exits: ExitTable::new(SWITCHES.exit_reservation),
+            exits: ExitTable::new(sw.exit_reservation),
             risk: Risk::new(&d),
-            counters: BrokerCounters::default(),
+            counters,
             bar: Bar::default(),
             path: [0; 4],
             seg: 0,
@@ -153,6 +190,10 @@ impl TvBroker {
             last_bar: None,
             late_a: 0,
             trailed: false,
+            v5_dropped: 0,
+            eval_px_1e6: 0,
+            hist: path_points && d.flags & decl_flag::CALC_ON_EVERY_HISTORY_TICK != 0,
+            hist_done: HIST_ALL,
         })
     }
 
@@ -196,6 +237,12 @@ impl TvBroker {
         self.trailed = false;
         self.evaluated = false;
         self.close_work = false;
+        // §4.8.9: history-tick runs on history bars only (`pin:05-hist-tick-runs`).
+        self.hist_done = if self.hist && bar.flags & barflag::REALTIME == 0 {
+            0
+        } else {
+            HIST_ALL
+        };
         self.state = WalkState::Walking;
         self.walk()
     }
@@ -203,20 +250,26 @@ impl TvBroker {
     /// Validates and COMMITS one evaluation's intents (W21, §4.3), resumes the walk and returns
     /// the next step. `intents` may be empty. `Err` → the host aborts the run (D13, backtest).
     pub fn submit(&mut self, intents: &[OrderIntent]) -> Result<TvStep, BrokerFault> {
-        let (intrabar, tick_px) = match self.state {
-            WalkState::AwaitingSubmit { intrabar, tick_px } => (intrabar, tick_px),
+        let (intrabar, tick_px, hist) = match self.state {
+            WalkState::AwaitingSubmit {
+                intrabar,
+                tick_px,
+                hist,
+            } => (intrabar, tick_px, hist),
             _ => return Err(BrokerFault::Internal(InternalDefect::PathCursor)),
         };
+        self.eval_px_1e6 = tick_px;
         if let Some(f) = self.latched {
             return Err(f);
         }
         let ctx = CommitCtx {
             bar: self.bar.index,
-            round_tick_1e6: if self.sw.price_rounding == PriceRounding::NearestTick {
-                self.chart.mintick_1e6
-            } else {
+            round_tick_1e6: if self.sw.price_rounding == PriceRounding::None {
                 0
+            } else {
+                self.chart.mintick_1e6
             },
+            round_floor: self.sw.price_rounding == PriceRounding::FloorTick,
             allow: self.decl.risk.allow_entry_in,
             position_1e6: self.book.view().position_size_1e6,
             halted: self.risk.halted(),
@@ -228,19 +281,29 @@ impl TvBroker {
             &self.book,
             &mut self.counters,
         )?;
+        // `pin:05-v5-order-limit` (CI-005 / E110): the run that creates the 9001st order faults;
+        // the slice is committed but the broker is latched, so nothing of it ever fills.
+        if let Err(f) = self.v5_order_check() {
+            self.latched = Some(f);
+            return Err(f);
+        }
         let eval = self.orders.eval();
         self.stamp_born(eval);
-        if intrabar && self.sw.cof_next_tick == CofNextTick::RestOfSegment {
+        // `pin:05-hist-tick-next-point` (provisional): an order born at the history-tick run at
+        // point k fills from point k + 1 on, whatever `cof_next_tick` reads.
+        if intrabar && !hist && self.sw.cof_next_tick == CofNextTick::RestOfSegment {
             self.admit_late(eval, tick_px);
         }
         let same_tick = self.sw.close_immediately == CloseImmediately::SameTick;
         if intrabar && same_tick {
-            // `immediately` closes born now fill at this execution's tick, before the walk resumes.
+            // `immediately` closes born now fill at this execution's tick, before the walk resumes
+            // — a history-tick run's too, at its path point (`pin:05-hist-tick-immediately`,
+            // provisional).
             let mut i = 0;
             while i < self.orders.len() {
                 let o = self.orders.get(i);
                 if o.is_live() && o.born_eval == eval && o.flags & pflag::IMMEDIATELY != 0 {
-                    if let Err(f) = self.execute_order(i, tick_px, true) {
+                    if let Err(f) = self.execute_counted(i, tick_px, true) {
                         self.latched = Some(f);
                         return Err(f);
                     }
@@ -323,6 +386,7 @@ impl TvBroker {
         self.state = WalkState::AwaitingSubmit {
             intrabar: false,
             tick_px: self.path[3],
+            hist: false,
         };
         TvStep::Evaluate {
             bar: self.bar,
@@ -443,6 +507,10 @@ impl TvBroker {
         if let Err(f) = self.exits.sync(&self.book, &ctx) {
             self.latched.get_or_insert(f);
         }
+        // `pin:05-v5-order-limit`: exit legs are orders, created when their set is built.
+        if let Err(f) = self.v5_order_check() {
+            self.latched.get_or_insert(f);
+        }
         let (a, b) = segment(&self.path, self.seg);
         let eval = self.orders.eval();
         let all_on_close = self.decl.flags & decl_flag::ORDERS_ON_CLOSE != 0;
@@ -517,7 +585,25 @@ impl TvBroker {
                     };
                     self.collect(after, false);
                 }
-                if let Some(step) = self.run_ticks(true) {
+                // §4.8.9: at path point `seg` (0–2) the fills at the point first, then the
+                // history-tick run (`pin:05-hist-tick-fill-first`, provisional).
+                if self.seg <= 2 && self.hist_done & (1 << self.seg) == 0 {
+                    let at = self.path[self.seg];
+                    if let Some(step) = self.run_ticks(true, Some(at)) {
+                        return step;
+                    }
+                    self.hist_done |= 1 << self.seg;
+                    self.state = WalkState::AwaitingSubmit {
+                        intrabar: true,
+                        tick_px: at,
+                        hist: true,
+                    };
+                    return TvStep::Evaluate {
+                        bar: self.developing(self.seg),
+                        intrabar: true,
+                    };
+                }
+                if let Some(step) = self.run_ticks(true, None) {
                     return step;
                 }
                 if self.seg <= 2 {
@@ -543,6 +629,7 @@ impl TvBroker {
                 self.state = WalkState::AwaitingSubmit {
                     intrabar: false,
                     tick_px: self.path[3],
+                    hist: false,
                 };
                 return TvStep::Evaluate {
                     bar: self.bar,
@@ -553,12 +640,12 @@ impl TvBroker {
                 self.seg = 3;
                 self.collect(None, true);
                 self.seg = 4;
-                if let Some(step) = self.run_ticks(false) {
+                if let Some(step) = self.run_ticks(false, None) {
                     return step;
                 }
             } else if self.cur < self.n_cand {
                 // The on-close pass resumed after a `cof_close_tick = Yes` execution.
-                if let Some(step) = self.run_ticks(false) {
+                if let Some(step) = self.run_ticks(false, None) {
                     return step;
                 }
             } else {
@@ -569,11 +656,15 @@ impl TvBroker {
     }
 
     /// Process the collected candidates tick by tick (§4.8.7 lines 10–20); `Some` when the walk
-    /// must return (an intrabar `Evaluate`, or a latched fault).
-    fn run_ticks(&mut self, may_evaluate: bool) -> Option<TvStep> {
+    /// must return (an intrabar `Evaluate`, or a latched fault). `stop_at = Some(p)`: only the
+    /// tick at `p`, the segment's start point (candidates are in path order, §4.8.9).
+    fn run_ticks(&mut self, may_evaluate: bool, stop_at: Option<i64>) -> Option<TvStep> {
         let c = self.path[3];
         while self.cur < self.n_cand {
             let px = self.cand[self.cur].key;
+            if stop_at.is_some_and(|p| p != px) {
+                return None;
+            }
             let mut any = false;
             while self.cur < self.n_cand && self.cand[self.cur].key == px {
                 let k = self.cand[self.cur];
@@ -607,6 +698,7 @@ impl TvBroker {
                 self.state = WalkState::AwaitingSubmit {
                     intrabar: true,
                     tick_px: px,
+                    hist: false,
                 };
                 return Some(TvStep::Evaluate {
                     bar: self.bar,
@@ -684,7 +776,7 @@ impl TvBroker {
             return Ok(false);
         }
         let slipped = matches!(lv, Level::Market | Level::BuyStop(_) | Level::SellStop(_));
-        self.execute_order(idx, px, slipped)
+        self.execute_counted(idx, px, slipped)
     }
 
     /// `tick(px)` (§4.8.7): mark, then the risk rules at that price.
@@ -725,7 +817,8 @@ impl TvBroker {
             };
             let fee = commission_1e12(&self.decl, fpx, size, pv, true, self.sw.cash_per_order);
             let src = FillSrc {
-                id: StrKey::NONE,
+                // `pin:05-exit-signal-text` (CI-032; E071 E072): "Margin call".
+                id: crate::signal::MARGIN_CALL,
                 sym: pine_ir::Sym::NONE,
                 named_entry: StrKey::NONE,
                 born_bar: self.bar.index,
@@ -780,7 +873,8 @@ impl TvBroker {
         let pv = self.chart.pointvalue_1e6;
         let fee = commission_1e12(&self.decl, fpx, q_abs, pv, true, self.sw.cash_per_order);
         let src = FillSrc {
-            id: StrKey::NONE,
+            // `pin:05-exit-signal-text` (CI-032; E092 E093 E094): the tripping rule's text.
+            id: self.risk.trip_signal(),
             sym: pine_ir::Sym::NONE,
             named_entry: StrKey::NONE,
             born_bar: self.bar.index,
@@ -802,7 +896,63 @@ impl TvBroker {
         Ok(())
     }
 
+    /// The developing bar at path point `k` (0–2) of a history-tick run (§4.8.9,
+    /// `pin:05-hist-tick-bar`, provisional): the open, the extremes the path has reached, the
+    /// point's price as the close; the bar's full volume, its times and index unchanged;
+    /// `barflag::CONFIRMED` dropped.
+    fn developing(&self, k: usize) -> Bar {
+        let (mut hi, mut lo) = (self.path[0], self.path[0]);
+        let mut j = 1;
+        while j <= k && j < 3 {
+            hi = hi.max(self.path[j]);
+            lo = lo.min(self.path[j]);
+            j += 1;
+        }
+        // COPY: the 64-B bar, once per history-tick run (≤ 3 a bar) — the run's `Evaluate`
+        // carries it by value (frozen `TvStep`) — editing `self.bar` in place rejected: the walk
+        // and the bar-close evaluation read the full bar.
+        Bar {
+            high_1e6: hi,
+            low_1e6: lo,
+            close_1e6: self.path[k.min(2)],
+            flags: self.bar.flags & !barflag::CONFIRMED,
+            ..self.bar
+        }
+    }
+
+    /// `pin:05-v5-order-limit` (CI-005 / E110, R-P2): in a v5 compilation the 9001st order faults
+    /// `Script(OrderTableFull)` — TradingView's RE10138 "Maximum number of orders (9000) was
+    /// reached.", a plain runtime error (ScriptRefused; no new kind, lead answer 2). An order is a
+    /// newly created pending record or a new exit leg; a modification (a re-send of the same live
+    /// order), an intent refused at commit and an order that dies unfilled at its fill attempt
+    /// (zero size, pyramiding, nothing to close) are not counted (lead answer 3). v6 never faults.
+    fn v5_order_check(&self) -> Result<(), BrokerFault> {
+        if self.dialect != Dialect::V5 {
+            return Ok(());
+        }
+        let n = self
+            .orders
+            .created()
+            .saturating_add(self.exits.legs_created())
+            .saturating_sub(self.v5_dropped);
+        if n > cap::V5_ORDERS {
+            return Err(BrokerFault::Script(ScriptRefusal::OrderTableFull));
+        }
+        Ok(())
+    }
+
+    /// `execute_order`, counting a record that died unfilled (`Ok(false)`: zero size, refused) out
+    /// of the v5 orders (`pin:05-v5-order-limit`).
+    fn execute_counted(&mut self, i: usize, px: i64, slipped: bool) -> Result<bool, BrokerFault> {
+        let filled = self.execute_order(i, px, slipped)?;
+        if !filled {
+            self.v5_dropped = self.v5_dropped.saturating_add(1);
+        }
+        Ok(filled)
+    }
+
     /// Size, price and book order `i` at `px` (before slippage when `slipped`); §4.7, §4.8.6.
+    /// Every `Ok(false)` kills the record unfilled.
     fn execute_order(&mut self, i: usize, px0: i64, slipped: bool) -> Result<bool, BrokerFault> {
         // The scalars the fill reads (`apply_fill` and the counters borrow `self` mutably).
         let (kind, side, id, id_sym, born_bar, born_eval, gen_open, ot, filled, qty, qty_pct) = {
@@ -953,8 +1103,14 @@ impl TvBroker {
         if kind == IntentKind::Entry as u8 {
             lot_flags |= lot_flag::PYRAMID;
         }
+        let closes = kind == IntentKind::Close as u8 || kind == IntentKind::CloseAll as u8;
         let src = FillSrc {
-            id,
+            // `pin:05-exit-signal-text` (CI-032): a close's fill carries its exit order's id.
+            id: if closes {
+                self.orders.get(i).exit_key
+            } else {
+                id
+            },
             sym: id_sym,
             named_entry: if kind == IntentKind::Close as u8 {
                 id
@@ -1133,12 +1289,24 @@ impl TvBroker {
             PctEquityAt::OrderTime => o.gen_equity_1e12(),
         };
         let explicit = o.qty_1e6 > 0;
+        // `pin:05-qty-reference-price` (CI-035; E045 E047 E048 E050): TradingView sizes a default-
+        // quantity MARKET order at the price its creating evaluation saw (the bar's close for a
+        // bar-close run: E045 trade 1, 10 % of 1 000 000 at the order bar's close 77249.5 →
+        // 1.294506, not 77249.6's fill → 1.294505; 45/45 trades of E047 / E048 / E050, 44/45 of
+        // E045, where the fill price matches 23), and a limit / stop order at its fill (E046 E049:
+        // 39/39 limit fills sized at their fill price; a gapped limit, uncaptured, keeps §4.7.3's
+        // fill price). The 1e-6 floor stays `pin:05-qty-rounding`.
+        let ref_px = if o.otype == otype::MARKET && self.eval_px_1e6 > 0 {
+            self.eval_px_1e6
+        } else {
+            px
+        };
         let q = match self.cfg.sizing {
             SizingMode::AsDeclared => {
                 if explicit {
                     o.qty_1e6
                 } else {
-                    declared_qty(&self.decl, px, pv, eq)
+                    declared_qty(&self.decl, ref_px, pv, eq)
                 }
             }
             SizingMode::FixedNotional { notional_1e6 } => {
@@ -1191,9 +1359,7 @@ impl TvBroker {
         cfg: TvCfg,
         sw: Switches,
     ) -> Result<Self, DiagCode> {
-        let mut b = Self::new(meta, cfg)?;
-        b.sw = sw;
-        b.exits = ExitTable::new(sw.exit_reservation);
+        let mut b = Self::build(meta, cfg, sw, BrokerCounters::default())?;
         b.exits.set_exit_qty(sw.exit_qty);
         Ok(b)
     }
@@ -1420,6 +1586,8 @@ mod tests {
     fn pct_equity_at_order_time() {
         // `pin:05-pct-equity-time`: 10 % of equity; B is generated at bar 1's close (equity
         // 100 000, the 100-lot A marked at 100) and fills at bar 2's open, 110 (equity 101 000).
+        // `pin:05-qty-reference-price` (CI-035): the market order B sizes at its creating
+        // evaluation's price, bar 1's close 100, not at the 110 fill.
         let mut m = meta();
         m.decl.pyramiding = 2;
         m.decl.default_qty_type = pine_ir::QtyType::PercentOfEquity;
@@ -1441,12 +1609,12 @@ mod tests {
             run(&mut b, &bar(2, 110 * E, 111 * E, 109 * E, 110 * E), &[]);
             b.open_trade(1).map(|t| t.qty_1e6)
         };
-        assert_eq!(qty_b(SWITCHES), Some(91_818_181)); // 10 100 / 110
+        assert_eq!(qty_b(SWITCHES), Some(101 * E)); // 10 100 / 100 (was 10 100 / 110)
         let ot = crate::switch::Switches {
             pct_equity_at: crate::switch::PctEquityAt::OrderTime,
             ..SWITCHES
         };
-        assert_eq!(qty_b(ot), Some(90_909_090)); // 10 000 / 110
+        assert_eq!(qty_b(ot), Some(100 * E)); // 10 000 / 100
     }
 
     #[test]

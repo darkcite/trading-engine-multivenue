@@ -11,7 +11,7 @@ use crate::cap;
 use crate::exit::ExitTable;
 use crate::fault::{BrokerFault, ScriptRefusal};
 use crate::intent::validate;
-use crate::money::round_tick;
+use crate::money::{floor_tick, round_tick};
 use pine_ir::{
     intent_flag, AllowEntry, BrokerCounters, IntentKind, IntentSide, OcaType, OrderIntent, StrKey,
     Sym,
@@ -109,8 +109,12 @@ pub(crate) struct PendingOrder {
     /// cumulative — the bound of a deferred reversal's remainder (`pin:05-reversal-own-qty`).
     /// Kept across a re-commit on the same side, like `DEFERRED`.
     pub(crate) opened_1e6: i64,
-    /// Always zero.
-    pub(crate) _pad: [u32; 2],
+    /// Close / CloseAll: the exit ORDER's id, a closed trade's `exit_id` (`pin:05-exit-signal-text`,
+    /// CI-032) — `Close`: the intent's own `id` (TradingView's `Close entry(s) order <id>`, keyed by
+    /// the emitter; `from_entry` when the intent left it `NONE`); `CloseAll`:
+    /// `signal::CLOSE_ALL`, or the entry's id for the `allow_entry_in` override (E095: the trade
+    /// shows `S1`). `NONE` for the other kinds.
+    pub(crate) exit_key: StrKey,
 }
 
 const _: () = assert!(core::mem::size_of::<PendingOrder>() == 128);
@@ -149,15 +153,27 @@ impl PendingOrder {
 pub(crate) struct CommitCtx {
     /// The bar being evaluated.
     pub(crate) bar: u32,
-    /// TV: `chart.mintick_1e6` under `price_rounding = NearestTick`; 0 = prices as given (native,
-    /// or `price_rounding = None`).
+    /// TV: `chart.mintick_1e6` under `price_rounding = FloorTick` / `NearestTick`; 0 = prices as
+    /// given (native, or `price_rounding = None`).
     pub(crate) round_tick_1e6: i64,
+    /// `price_rounding = FloorTick` (`pin:05-price-rounding`, CI-034): round down, not half away.
+    pub(crate) round_floor: bool,
     /// `strategy.risk.allow_entry_in`.
     pub(crate) allow: AllowEntry,
     /// The position at commit (for `allow_entry_in`, §4.4.3).
     pub(crate) position_1e6: i64,
     /// A `strategy.risk.*` halt holds: only `Cancel` / `CancelAll` commit (§4.10).
     pub(crate) halted: bool,
+}
+
+/// A script price on `ctx`'s grid (`pin:05-price-rounding`, CI-034 / E113): floored under
+/// `FloorTick`, half away under `NearestTick`, as given when `round_tick_1e6 == 0`.
+const fn script_px(px_1e6: i64, ctx: &CommitCtx) -> i64 {
+    if ctx.round_floor {
+        floor_tick(px_1e6, ctx.round_tick_1e6)
+    } else {
+        round_tick(px_1e6, ctx.round_tick_1e6)
+    }
 }
 
 /// The pending-record key an intent commits to (§4.3): `(kind, id)`; an `Entry` refused by
@@ -222,6 +238,9 @@ pub(crate) struct OrderTable {
     n: u16,
     next_seq: u32,
     eval: u32,
+    /// Pending records created so far — a new key; a modification (a re-send of the same live
+    /// order) is not one (`pin:05-v5-order-limit`, CI-005 / E110).
+    created: u64,
 }
 
 impl OrderTable {
@@ -232,7 +251,14 @@ impl OrderTable {
             n: 0,
             next_seq: 0,
             eval: 0,
+            created: 0,
         }
+    }
+
+    /// Pending records created so far (`pin:05-v5-order-limit`): every new key, never a
+    /// modification of a live record.
+    pub(crate) fn created(&self) -> u64 {
+        self.created
     }
 
     /// Records in use (live or dead-not-yet-freed).
@@ -604,6 +630,7 @@ impl OrderTable {
                 let s = self.next_seq;
                 self.next_seq = self.next_seq.wrapping_add(1);
                 self.n += 1;
+                self.created = self.created.saturating_add(1);
                 (self.len() - 1, s, 0, 0, 0, 0, 0)
             }
         };
@@ -626,12 +653,12 @@ impl OrderTable {
             qty_1e6: if bare { 0 } else { it.qty_1e6 },
             qty_pct_1e6: it.qty_pct_1e6,
             limit_1e6: if has_l {
-                round_tick(it.limit_1e6, ctx.round_tick_1e6)
+                script_px(it.limit_1e6, ctx)
             } else {
                 0
             },
             stop_1e6: if has_s {
-                round_tick(it.stop_1e6, ctx.round_tick_1e6)
+                script_px(it.stop_1e6, ctx)
             } else {
                 0
             },
@@ -654,7 +681,19 @@ impl OrderTable {
             gen_eq_lo: 0,
             gen_eq_hi: 0,
             opened_1e6: opened,
-            _pad: [0; 2],
+            exit_key: if kind == IntentKind::CloseAll as u8 {
+                if bare {
+                    it.id
+                } else {
+                    crate::signal::CLOSE_ALL
+                }
+            } else if kind == IntentKind::Close as u8 && it.id != StrKey::NONE {
+                it.id
+            } else if kind == IntentKind::Close as u8 {
+                key
+            } else {
+                StrKey::NONE
+            },
         };
         Ok(())
     }
@@ -771,6 +810,7 @@ mod tests {
         CommitCtx {
             bar: 7,
             round_tick_1e6: 250_000,
+            round_floor: false,
             allow: AllowEntry::All,
             position_1e6: 0,
             halted: false,

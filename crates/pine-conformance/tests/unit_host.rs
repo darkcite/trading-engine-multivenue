@@ -329,8 +329,12 @@ fn host_commits_after_every_evaluation() {
     // calc_on_order_fills: the fill bar is evaluated twice (the fill tick, then the close). The
     // broker refuses `open_bar` (PathCursor) unless every Evaluate was answered by `submit`, so a
     // clean run with a two-evaluation bar proves the host committed after each.
+    // A fixed contract (not v6's default 100 % of equity): since `pin:05-qty-reference-price`
+    // (R-P12) a default-sized market entry is sized at the order bar's close, and on this rising
+    // chart the next open's funds check refuses 100 % of equity — the sizing law is not under
+    // test here, the host's commits are.
     let src = "//@version=6
-strategy(\"c\", calc_on_order_fills = true)
+strategy(\"c\", calc_on_order_fills = true, default_qty_type = strategy.fixed, default_qty_value = 1)
 if bar_index == 1
     strategy.entry(\"L\", strategy.long)
 plot(strategy.position_size, \"ps\")

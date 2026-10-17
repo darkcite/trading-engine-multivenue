@@ -191,9 +191,10 @@ fn r_p2(body: &str, d: pine_ir::Dialect, decl: &str) -> (Vec<u16>, String) {
     (c, msg.unwrap_or_default())
 }
 
-/// R-P2 F007 (`pin:02-div-zero-literal`): a `/` whose divisor folds to a `const` zero is TradingView's
-/// compile error "Division by zero" (`3007`, `pin:06-r-p2-refuse-code`); `/=` too. `%` by a
-/// constant zero (F010, captured `na`), a series zero and an `input` zero still compile.
+/// R-P2 CI-001 / F007 (`pin:02-div-zero-literal`, narrowed r27b): a `/` whose divisor is a literal
+/// zero is TradingView's compile error "Division by zero" (`3007`, `pin:06-r-p2-refuse-code`);
+/// `/=` too. A constant zero through arithmetic or a variable, `%` by zero (F010, captured `na`),
+/// a series zero and an `input` zero still compile (paste probes for the next session).
 #[test]
 fn refusal_r_p2_literal_division_by_zero_is_3007() {
     use pine_ir::Dialect::{V5, V6};
@@ -203,7 +204,7 @@ fn refusal_r_p2_literal_division_by_zero_is_3007() {
             "x = close / 0.0\nplot(x)\n",
             "x = close / 0\nplot(x)\n",
             "x = 1.0 / 0.0\nplot(x)\n",
-            "x = close / (2 - 2)\nplot(x)\n",
+            "x = close / (0)\nplot(x)\n",
             "x = close / -0.0\nplot(x)\n",
             "var float a = 1.0\na /= 0\nplot(a)\n",
         ] {
@@ -212,6 +213,8 @@ fn refusal_r_p2_literal_division_by_zero_is_3007() {
             assert_eq!(msg, "Division by zero", "{d:?} {body}");
         }
         for body in [
+            "x = close / (2 - 2)\nplot(x)\n",
+            "z = 0.0\nx = close / z\nplot(x)\n",
             "x = close % 0.0\nplot(x)\n",
             "x = close / (close - close)\nplot(x)\n",
             "x = close / input.float(0.0, \"d\")\nplot(x)\n",
@@ -223,9 +226,10 @@ fn refusal_r_p2_literal_division_by_zero_is_3007() {
     }
 }
 
-/// R-P2 E056 (`pin:02-negative-qty-scope`): a `const` negative `qty` of `strategy.entry` /
-/// `strategy.order` is TradingView's compile error (`3007`, its text); `0`, a positive, an
-/// `input` and `strategy.close`'s `qty` still compile.
+/// R-P2 CI-002 / E056 (`pin:02-negative-qty-scope`, narrowed r27b): a negative literal `qty` of
+/// `strategy.entry` is TradingView's compile error (`3007`, its text); `0`, a positive, an
+/// `input`, a constant through a variable or arithmetic, `strategy.order` and `strategy.close`'s
+/// `qty` still compile (paste probes for the next session).
 #[test]
 fn refusal_r_p2_negative_qty_literal_is_3007() {
     use pine_ir::Dialect::{V5, V6};
@@ -239,10 +243,6 @@ fn refusal_r_p2_negative_qty_literal_is_3007() {
             (
                 "strategy.entry(\"L1\", strategy.long, -2.5)\nplot(close)\n",
                 "strategy.entry",
-            ),
-            (
-                "strategy.order(\"O\", strategy.short, qty = -1)\nplot(close)\n",
-                "strategy.order",
             ),
         ] {
             let (c, msg) = r_p2(body, d, st);
@@ -258,6 +258,9 @@ fn refusal_r_p2_negative_qty_literal_is_3007() {
             "strategy.entry(\"L1\", strategy.long, qty = 0)\nplot(close)\n",
             "strategy.entry(\"L1\", strategy.long, qty = input.float(-1.0, \"q\"))\nplot(close)\n",
             "strategy.entry(\"L1\", strategy.long)\nstrategy.close(\"L1\", qty = -1)\nplot(close)\n",
+            "q = -1\nstrategy.entry(\"L1\", strategy.long, qty = q)\nplot(close)\n",
+            "strategy.entry(\"L1\", strategy.long, qty = 0 - 1)\nplot(close)\n",
+            "strategy.order(\"O\", strategy.short, qty = -1)\nplot(close)\n",
         ] {
             let (c, _) = r_p2(body, d, st);
             assert!(common::passes(&c), "{d:?} {body}: {c:?}");

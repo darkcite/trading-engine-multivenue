@@ -48,6 +48,7 @@ fn outcome(keys: &[i64], isna: &[f64], val: &[f64]) -> RunOutcome {
         plot_ix: vec![0, 1],
         trades: Vec::new(),
         record: None,
+        evicted: Default::default(),
         bars: keys.len() as u32,
         evaluations: keys.len() as u64,
         counters: VmCounters::default(),

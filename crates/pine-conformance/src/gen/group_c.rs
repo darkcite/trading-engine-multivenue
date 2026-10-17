@@ -28,9 +28,14 @@ pub const RT_DEFAULT: RtSpec = RtSpec {
     open: false,
 };
 
-/// C045's drive: SYN-1's 64 history steps, then one forming realtime bar (ticks, no confirm).
+/// C045's drive: 128 history steps, then one forming realtime bar (ticks, no confirm).
+///
+/// `pin:06-c045-window` (r27b, CI-028 fixture defect) — the compared window is the last 65 rows
+/// (`C045_TAIL`) of a 129-row run, keys 64–128: no compared row is the chart's first bar on either
+/// side (TradingView's export of 469 history rows + the open bar, distilled by position, and our
+/// 128 history steps), so `isfirst` reads 0 on every compared row of both.
 pub const RT_C045: RtSpec = RtSpec {
-    history: 64,
+    history: 128,
     realtime: 1,
     ticks: 3,
     htf_mult: 0,
@@ -660,9 +665,13 @@ fn c_rt() -> Vec<Row> {
     ]
 }
 
+/// C045's compared rows: 64 history rows plus the open realtime row (`pin:06-c045-window`).
+pub const C045_TAIL: u32 = 65;
+
 /// C045: the seven `barstate.*` flags as 0/1 on every row.
 ///
-/// `pin:06-c045-window` — `tail 65`: our run's 64 history rows plus the open realtime row.
+/// `pin:06-c045-window` — `tail 65` of a 129-row run (CI-028): the last 64 history rows plus the
+/// open realtime row, the chart's first bar 64 rows above the window.
 fn c_bs() -> Row {
     let flags = [
         ("barstate.isconfirmed", "isconfirmed"),
@@ -684,7 +693,7 @@ fn c_bs() -> Row {
         plots,
     );
     r.pins.push("pin:U17-barstate-table".into());
-    r.window = Window::Tail(RT_C045.history + 1);
+    r.window = Window::Tail(C045_TAIL);
     r.run = Run {
         driver: Driver::Rt,
         mode: ExecMode::Realtime,

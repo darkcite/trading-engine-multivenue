@@ -820,17 +820,124 @@ fn emit_int_div_follows_w1() {
     assert!(p.code.iter().any(|i| i.op == op::F_I2F));
 }
 
-/// `pin:02-for-step`: a `by` step that does not fold is refused by default (`3008`).
+/// The first bar whose step faults, and the fault (compile and verify must succeed).
+fn first_fault(src: &str, d: Dialect, closes: &[f64]) -> Option<(usize, pine_ir::FaultKind)> {
+    use pine_ir::{barflag, StepOutcome};
+    use pine_vm::testkit::{bar, Arena, Ctx};
+    let p = match compile_src(src, &default_opts(d, ExecMode::BarClose)) {
+        Ok(p) => p,
+        Err(e) => panic!("{e:#?}\n{src}"),
+    };
+    let v = pine_vm::verify(&p, &pine_std::BUILTINS).expect("verifies");
+    let mut arena = Arena::new(p.layout.total_bytes as usize);
+    let mut vm = pine_vm::VmInstance::new(v, arena.slice());
+    let mut ctx = Ctx { now: 0 };
+    for (i, &c) in closes.iter().enumerate() {
+        if let StepOutcome::Fault(k) = vm.step_bar(&bar(i as u32, c, barflag::CONFIRMED), &mut ctx)
+        {
+            return Some((i, k));
+        }
+    }
+    None
+}
+
+/// CI-004 / F085 (`pin:02-for-step` `RuntimeFault`, operator R-P2): a `by` step that does not
+/// fold compiles; on entering the `for`, a step that is not greater than zero (`na` included)
+/// faults `ScriptRefused` on that bar — TradingView's "Error on bar 0: 'step' in loop must be
+/// greater than zero." — through pine-std's `runtime.error` body. A positive dynamic step runs.
 #[test]
-fn emit_for_step_non_constant_is_refused_by_default() {
+fn emit_for_step_dynamic_not_positive_faults_script_refused() {
+    use pine_ir::FaultKind::ScriptRefused;
+    let closes = [10.0, 11.0, 12.0, 13.0];
     for d in [Dialect::V5, Dialect::V6] {
+        let h = format!("//@version={}\nindicator(\"t\")\n", d as u8);
+        // F085's shape: a negative int step through a series expression.
+        let f085 = format!(
+            "{h}int s = -2 + (bar_index - bar_index)\nc = 0\nfor i = 0 to 10 by s\n    c += 1\n\
+             plot(c)\n"
+        );
+        assert_eq!(
+            first_fault(&f085, d, &closes),
+            Some((0, ScriptRefused)),
+            "{d:?}"
+        );
+        // Zero, a float step and an `na` step; the fault waits for the bar that reaches it.
+        for (step, at) in [
+            ("bar_index - bar_index", 0),
+            ("bar_index >= 2 ? 0.0 : 1.0", 2),
+            ("bar_index >= 1 ? na : 1", 1),
+        ] {
+            let s =
+                format!("{h}st = {step}\nc = 0.0\nfor i = 0.0 to 4.0 by st\n    c += 1\nplot(c)\n");
+            assert_eq!(
+                first_fault(&s, d, &closes),
+                Some((at, ScriptRefused)),
+                "{d:?} {step}"
+            );
+        }
+        // A positive dynamic step runs: 0, 2, …, 10 (6 trips) or 0 … 10 (11 trips).
         let s = format!(
-            "//@version={}\nindicator(\"t\")\nst = bar_index % 2 + 1\nv = 0\n\
-             for i = 0 to 10 by st\n    v += 1\nplot(v)\n",
+            "{h}st = bar_index % 2 + 1\nv = 0\nfor i = 0 to 10 by st\n    v += 1\nplot(v)\n"
+        );
+        assert_eq!(
+            plots_of(&s, d, ExecMode::BarClose, &closes, 0),
+            vec![11.0, 6.0, 11.0, 6.0]
+        );
+        // A downward loop: the step is still a magnitude and must be positive.
+        let s = format!(
+            "{h}st = bar_index - bar_index - 1\nv = 0\nfor i = 5 to 0 by st\n    v += 1\nplot(v)\n"
+        );
+        assert_eq!(
+            first_fault(&s, d, &closes),
+            Some((0, ScriptRefused)),
+            "{d:?} downward"
+        );
+    }
+}
+
+/// CI-004: a constant step that is not positive stays a compile refusal (`3007`).
+#[test]
+fn emit_for_step_constant_not_positive_is_3007() {
+    for d in [Dialect::V5, Dialect::V6] {
+        for st in ["0", "-1", "-0.5"] {
+            let s = format!(
+                "//@version={}\nindicator(\"t\")\nv = 0\nfor i = 0 to 10 by {st}\n    v += 1\n\
+                 plot(v)\n",
+                d as u8
+            );
+            let r = compile_src(&s, &default_opts(d, ExecMode::BarClose));
+            assert_eq!(common::codes(&r), vec![3007], "{d:?} {st}");
+        }
+    }
+}
+
+/// CI-003 / C029 (operator R-P2): reading a field of an `na` object faults `ScriptRefused` on that
+/// bar — TradingView's "Error on bar 0: Cannot access the 'Pt.x' field of an undefined object."
+/// (the VM's `o_field`, `object.rs:62`). A guarded read does not fault.
+#[test]
+fn emit_field_of_na_object_faults_script_refused() {
+    use pine_ir::FaultKind::ScriptRefused;
+    let closes = [10.0, 11.0, 12.0];
+    for d in [Dialect::V5, Dialect::V6] {
+        let h = format!(
+            "//@version={}\nindicator(\"t\")\ntype Pt\n    int x\n",
             d as u8
         );
-        let r = compile_src(&s, &default_opts(d, ExecMode::BarClose));
-        assert_eq!(common::codes(&r), vec![3008], "{d:?}");
+        let s = format!("{h}Pt o = na\ne = o.x\nplot(na(e) ? 1 : 0)\n");
+        assert_eq!(
+            first_fault(&s, d, &closes),
+            Some((0, ScriptRefused)),
+            "{d:?}"
+        );
+        // The object is `na` from bar 1 on: the fault waits for bar 1.
+        let s = format!("{h}Pt o = bar_index < 1 ? Pt.new(7) : na\ne = o.x\nplot(e)\n");
+        assert_eq!(
+            first_fault(&s, d, &closes),
+            Some((1, ScriptRefused)),
+            "{d:?} late"
+        );
+        let s = format!("{h}Pt o = na\ne = na(o) ? -1 : o.x\nplot(e)\n");
+        assert_eq!(first_fault(&s, d, &closes), None, "{d:?} guarded");
     }
 }
 
@@ -1102,5 +1209,106 @@ fn emit_ternary_evaluates_the_selected_arm_only_by_default() {
                 .any(|i| i.op == op::F_SEL || i.op == op::I_SEL),
             "{d:?}"
         );
+    }
+}
+
+/// CI-012 (C007 C014 C021 C033): `recv.m()` binds the receiver to the method's first parameter
+/// (it used to fall to "a parameter default that does not fold", 3255); plain, `var` and
+/// `varip` locals and a method that writes its object's field.
+#[test]
+fn emit_method_call_binds_its_receiver() {
+    let closes = [10.0, 11.0, 12.0];
+    for d in [Dialect::V5, Dialect::V6] {
+        let h = format!("//@version={}\nindicator(\"t\")\n", d as u8);
+        for (q, want) in [
+            ("", [1.0, 1.0, 1.0]),
+            ("var ", [1.0, 2.0, 3.0]),
+            ("varip ", [1.0, 2.0, 3.0]),
+        ] {
+            let s = format!(
+                "{h}method tick(int this) =>\n    {q}int acc = 0\n    acc := acc + 1\n    \
+                 acc + this\nx = 0\na = x.tick()\nplot(a)\n"
+            );
+            assert_eq!(
+                plots_of(&s, d, ExecMode::BarClose, &closes, 0),
+                want,
+                "{d:?} {q}"
+            );
+        }
+        let s = format!(
+            "{h}type Pt\n    int x\nmethod bump(Pt this) => this.x += 1\nvar o = Pt.new(0)\n\
+             o.bump()\nplot(o.x)\n"
+        );
+        assert_eq!(
+            plots_of(&s, d, ExecMode::BarClose, &closes, 0),
+            [1.0, 2.0, 3.0],
+            "{d:?}"
+        );
+        // A method with a further argument, positional and named.
+        let s = format!(
+            "{h}method add(float this, float k = 1.0) => this + k\nc = close\nplot(c.add(2.0))\n\
+             plot(c.add(k = 3.0))\nplot(c.add())\n"
+        );
+        assert_eq!(
+            plots_of(&s, d, ExecMode::BarClose, &closes, 0),
+            [12.0, 13.0, 14.0]
+        );
+        assert_eq!(
+            plots_of(&s, d, ExecMode::BarClose, &closes, 1),
+            [13.0, 14.0, 15.0]
+        );
+        assert_eq!(
+            plots_of(&s, d, ExecMode::BarClose, &closes, 2),
+            [11.0, 12.0, 13.0]
+        );
+    }
+}
+
+/// CI-012 (F030 F051–F053, `pin:W3-lazy-and-or`): a function body reads the script's global
+/// variables and writes a global object's field (it used to be "a variable of another scope",
+/// 3255), also from a nested call and from a lazy `or` operand.
+#[test]
+fn emit_function_reads_globals() {
+    let closes = [10.0, 11.0, 12.0, 13.0];
+    for d in [Dialect::V5, Dialect::V6] {
+        let h = format!("//@version={}\nindicator(\"t\")\n", d as u8);
+        let s = format!("{h}g = close * 2\nf() => g + 1\nk() => f() * 10\nplot(f())\nplot(k())\n");
+        assert_eq!(
+            plots_of(&s, d, ExecMode::BarClose, &closes, 0),
+            [21.0, 23.0, 25.0, 27.0]
+        );
+        assert_eq!(
+            plots_of(&s, d, ExecMode::BarClose, &closes, 1),
+            [210.0, 230.0, 250.0, 270.0]
+        );
+        // F052's shape: a `var` local of the function written into a global object's field.
+        let s = format!(
+            "{h}type Ctr\n    int n = 0\nvar Ctr k = Ctr.new()\nf_count() =>\n    var int c = 0\n    \
+             c += 1\n    k.n := c\n    c > 0\nv = close > 0 and f_count()\nplot(k.n)\n"
+        );
+        assert_eq!(
+            plots_of(&s, d, ExecMode::BarClose, &closes, 0),
+            [1.0, 2.0, 3.0, 4.0]
+        );
+        // F030's shape: a global series read by a function in a lazy `or` operand.
+        let s = format!(
+            "{h}g = close\nrhs() => ta.sma(g, 2) > 0\nv = close > 100 or rhs()\nplot(v ? 1 : 0)\n"
+        );
+        let got = plots_of(&s, d, ExecMode::BarClose, &closes, 0);
+        assert_eq!(&got[1..], [1.0, 1.0, 1.0], "{d:?}");
+    }
+}
+
+/// CI-012 / CI-041 (B120 D059): `ta.vwap(src)` takes its `anchor` default as if
+/// `timeframe.change()` were passed (it used to be 3255 "the derived default TimeframeChange").
+#[test]
+fn emit_vwap_anchor_default_is_timeframe_change() {
+    for d in [Dialect::V5, Dialect::V6] {
+        let s = format!(
+            "//@version={}\nindicator(\"t\")\nv = ta.vwap(close)\nplot(v)\n",
+            d as u8
+        );
+        let got = plots_of(&s, d, ExecMode::BarClose, &[10.0, 11.0, 12.0], 0);
+        assert!(got.iter().all(|v| v.is_finite()), "{d:?} {got:?}");
     }
 }

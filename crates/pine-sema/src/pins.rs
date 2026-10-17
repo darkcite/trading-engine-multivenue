@@ -107,10 +107,17 @@ pub(crate) enum NaCondition {
 /// `pin:02-for-step` — a `for … by s` whose step does not fold. Acts in §4.14.4. The loops page
 /// documents a positive step and is silent on a computed one. Probe:
 /// `s = bar_index % 2 + 1` · `for i = 0 to 4 by s` · `    x += 1`.
+/// ANSWERED by the capture (CI-004 / F085, operator R-P2): `RuntimeFault` — TradingView runs the
+/// script and stops it with "Error on bar 0: 'step' in loop must be greater than zero.".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ForStep {
-    /// Default — conservative: `3008`.
+    /// `3008` (the pre-capture conservative default).
+    #[cfg_attr(not(test), allow(dead_code))] // selected only through compile_with (§7.12)
     RefuseDynamic,
+    /// Default: the step is used as written; on entering the `for` statement a step that is not
+    /// greater than zero (`na` included: it is not greater than zero) faults `ScriptRefused`
+    /// through pine-std's `runtime.error` body (no VM change, r27 lead answer 14).
+    RuntimeFault,
     /// The step's absolute value is used; a zero step runs no iteration.
     #[cfg_attr(not(test), allow(dead_code))] // selected only through compile_with (§7.12)
     RuntimeAbs,
@@ -180,7 +187,7 @@ pub(crate) const DEFAULT: Pins = Pins {
     var_qualifier: VarQualifier::Series,
     na_compare: NaCompare::FalseBoth,
     na_condition: NaCondition::AsFalse,
-    for_step: ForStep::RefuseDynamic,
+    for_step: ForStep::RuntimeFault,
     once_flag: OnceFlag::VarLike,
     cond_call_state: CondCallState::ExecutedOnly,
 };

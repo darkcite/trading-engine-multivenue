@@ -22,6 +22,7 @@ use pine_ir::Dialect;
 const USAGE: &str = "usage: pine-conf gen [--check] | pine-conf sheets --dialect 5|6 \
 | pine-conf distil --sheet S --chart CSV [--trades CSV --perf CSV] --utc T --build B --dialect 5|6 [--verify] \
 | pine-conf distil --id ID --paste compiled|refused|runtime-error --utc T --build B --dialect 5|6 [--verify] \
+| pine-conf distil --rebody FIX [--verify] \
 | pine-conf status | pine-conf pins | pine-conf barhash --bars DIR [--write] \
 | pine-conf shrink --grammar V --seed S --mode mode-vs-mode|interleaved [--budget STEPS] \
 | pine-conf report --tv [--out MD] [--bars DIR] [--title T]";
@@ -185,8 +186,9 @@ fn report_tv(root: &Path, rest: &[&str]) -> ExitCode {
             "bars root: {} (pin:06-report-tv-cli)",
             bars.unwrap_or("none — every Chart / SynSig fixture is a harness gap")
         ),
-        "R-P1: TradingView is the oracle — every non-pass is an engine (or harness) item; \
-         pine-vm / pine-ir items go through a CAR"
+        "R-P1 (revised 2026-10-17): every non-pass is documented in conformance/issues.md and \
+         ruled by the lead before any change — TV right, engine right, fixture defect or capture \
+         artifact; pine-vm / pine-ir items go through a CAR"
             .to_string(),
         "Rt series bodies compare only their non-bookkeeping columns (rt, done, upd, k are \
          bookkeeping, pin:06-rt-bookkeeping-columns)"
@@ -421,8 +423,22 @@ fn hex(b: &[u8; 32]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// `pine-conf distil` — the sheet form or the paste form (§3.12, §4.7.5).
+/// `pine-conf distil` — the sheet form or the paste form (§3.12, §4.7.5), or `--rebody FIX`.
+///
+/// `pin:06-distil-rebody-cli` (R-P3, CI-006..009 follow-up; C039–C042, C046) — `--rebody FIX
+/// [--verify]` turns a flagged `driver rt` fixture's captured `series` body into its §4.7.8
+/// `relation` body (`capture::distil::rebody_relation`): no stamp arguments (the capture's stamps
+/// stay), a varying relation column is refused (exit 1, the file untouched).
 fn distil(root: &Path, rest: &[&str]) -> ExitCode {
+    if let ["--rebody", fix, tail @ ..] = rest {
+        let verify = match tail {
+            [] => false,
+            ["--verify"] => true,
+            _ => return usage(),
+        };
+        let rep = capture::distil::rebody_relation(&root.join(fix), verify);
+        return distil_done(rep, verify);
+    }
     let mut kv: Vec<(&str, &str)> = Vec::new();
     let mut verify = false;
     let mut i = 0;
@@ -496,6 +512,11 @@ fn distil(root: &Path, rest: &[&str]) -> ExitCode {
         }
         _ => return usage(),
     };
+    distil_done(rep, verify)
+}
+
+/// Prints a distil report; exit 0 = all written / equal, 1 = a difference, refusal or error.
+fn distil_done(rep: Result<capture::DistilReport, String>, verify: bool) -> ExitCode {
     match rep {
         Ok(r) => {
             let ids = |v: &[FixtureId]| v.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(" ");

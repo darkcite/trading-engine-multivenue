@@ -16,7 +16,8 @@ use super::emit::{Line, Prelude, Script};
 use super::group_c::RT_DEFAULT;
 use super::{Cell, Run};
 use crate::fixture::{
-    Align, Dialects, Driver, Expect, FixtureId, Group, Oracle, RtSpec, Tol, Window,
+    Align, Dialects, Driver, Expect, FixtureId, Group, Oracle, Reading, ReadingBody, RtSpec, Tol,
+    Window,
 };
 
 /// `LookaheadLeak` (I12): an unoffset `lookahead_on` refused when compiled `live_bound = true`.
@@ -571,9 +572,43 @@ fn cell(r: Row) -> Cell {
         window: r.window,
         tols,
         expect: r.expect,
-        readings: Vec::new(),
+        readings: u12_readings(r.n),
         run: r.run,
     }
+}
+
+/// `pin:U12-lookahead-off-realtime`'s readings (r27b, lead answer 5 — written before the
+/// re-capture, CI-007 / CI-008), over the relation columns of the §4.5.3 Rt run (the HTF sub-program
+/// publishes its developing bar on every tick and confirms with the period's closing bar, before
+/// the parent's `step_bar`):
+///
+/// - D053 — `developing` (the developing 5-minute bar, whose close is the forming bar's close on every
+///   update): `eqc` 1, `dev` 1; `last_confirmed` (the previous confirmed 5-minute close until the
+///   period closes): `eqc` 1 (the period confirms on its closing bar's confirm), `dev` 0.
+/// - D054 — none. `pin:06-d054-no-u12-reading`: `gaps_on` emits only a confirmed element newer
+///   than the last emission (`pine-std` `request.rs`), which both readings deliver at the period's
+///   closing confirm alone, so both predict `uni` varying (0 on that bar, 1 elsewhere) — no
+///   constant relation, nothing that discriminates (§4.9.4); its capture decides CI-008 directly.
+fn u12_readings(n: u16) -> Vec<Reading> {
+    if n != 53 {
+        return Vec::new();
+    }
+    let rel = |eqc: i64, dev: i64| {
+        ReadingBody::Relation(vec![
+            ("f_D053_eqc".to_string(), eqc),
+            ("f_D053_dev".to_string(), dev),
+        ])
+    };
+    vec![
+        Reading {
+            name: "developing".into(),
+            body: rel(1, 1),
+        },
+        Reading {
+            name: "last_confirmed".into(),
+            body: rel(1, 0),
+        },
+    ]
 }
 
 /// Every group-D cell (D001–D062).

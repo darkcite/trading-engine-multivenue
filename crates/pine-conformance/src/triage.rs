@@ -741,17 +741,8 @@ pub fn classify_tv(f: &Fixture, c: &crate::run::Checked) -> TvTriage {
                 refusal_text(e),
             )
         }
-        // pin:06-tv-rt-strategy-gap — §4.5.3: an `Rt` run hands nothing to a broker, so a strategy's
-        // position plots on the tape (E106, tv_only) cannot be judged here.
-        (_, Ok(o)) if f.driver == Driver::Rt && f.id.group() == Group::E => mk(
-            TvClass::HarnessGap,
-            Crate::Harness,
-            "harness-gap · Rt strategy runs without a broker (§4.5.3)".into(),
-            match &c.expectation {
-                Verdict::Fail(d) => value_first(f, d, o),
-                v => format!("{v:?}"),
-            },
-        ),
+        // pin:06-tv-rt-strategy-gap retired r27b (CI-030): an `Rt` strategy runs with a `TvBroker`
+        // (pin:06-rt-broker, §4.5.3 amended), so E106 is judged like any strategy.
         (_, Ok(o)) => match &c.expectation {
             Verdict::Fail(d) if d.trade.is_some() => {
                 let tk = match &d.trade {

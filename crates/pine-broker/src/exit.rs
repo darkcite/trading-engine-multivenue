@@ -425,6 +425,9 @@ pub(crate) struct ExitTable {
     exit_qty: ExitQty,
     /// A6.3: which `from_entry` ids reach the D19 boot trade.
     boot: BootDirs,
+    /// Exit legs (take-profit, stop-loss, trail) of every set built new — not carried — so far:
+    /// each is an order (`pin:05-v5-order-limit`, CI-005 / E110).
+    legs_created: u64,
 }
 
 impl ExitTable {
@@ -440,6 +443,7 @@ impl ExitTable {
             reservation,
             exit_qty: SWITCHES.exit_qty,
             boot: BootDirs::empty(),
+            legs_created: 0,
         }
     }
 
@@ -451,6 +455,12 @@ impl ExitTable {
     /// The A6.3 boot-reach table.
     pub(crate) fn boot_dirs(&self) -> &BootDirs {
         &self.boot
+    }
+
+    /// Exit legs created so far: the present legs of every set `sync` built new rather than
+    /// carried (`pin:05-v5-order-limit`).
+    pub(crate) fn legs_created(&self) -> u64 {
+        self.legs_created
     }
 
     /// The live sets, in reservation order.
@@ -686,6 +696,7 @@ impl ExitTable {
         // The active buffer is `self.cur`; the build writes the other one.
         let new = 1 - self.cur;
         let mut n = 0;
+        let mut fresh = 0_u64;
         let mut ri = self.next_rule(None);
         while let Some(r_i) = ri {
             // A borrow of the rule: the build writes `self.sets`, a disjoint field.
@@ -769,12 +780,20 @@ impl ExitTable {
                         }
                         k += 1;
                     }
+                    if k == self.ns {
+                        // Built new, not carried: each present leg is a created order
+                        // (`pin:05-v5-order-limit`, CI-005 / E110).
+                        fresh += u64::from(s.tp_1e6 != 0)
+                            + u64::from(s.sl_1e6 != 0)
+                            + u64::from(s.trail_act_1e6 != 0);
+                    }
                     n += 1;
                 }
                 t += 1;
             }
             ri = self.next_rule(Some(rule.seq));
         }
+        self.legs_created = self.legs_created.saturating_add(fresh);
         self.cur = new;
         self.ns = n;
         rederive(&mut self.sets[new][..n], pos);

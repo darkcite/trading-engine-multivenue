@@ -31,7 +31,11 @@ const PCT_100: i64 = 100 * 1_000_000;
 const DAY_S: i32 = 86_400;
 
 /// 5100, 5101, 5109, 5107, 5102 — the declaration and program checks both brokers share, in order.
-fn check_program(meta: &ProgramMeta) -> Result<(), DiagCode> {
+/// `history_ticks`: the TV broker evaluates at the history path points (`HistoryTick::PathPoints`,
+/// R-P6), so `calc_on_every_history_tick` is not refused (`5109` lifted) and joins
+/// `calc_on_order_fills` in the `5107` pairing check (lead answer 13: a mis-paired program refuses
+/// `5107`, no new code). The native broker always passes `false` (R-P6: it keeps `5109`).
+fn check_program(meta: &ProgramMeta, history_ticks: bool) -> Result<(), DiagCode> {
     let flags = meta.decl.flags;
     if flags & decl_flag::BAR_MAGNIFIER != 0 {
         return Err(code::BAR_MAGNIFIER);
@@ -39,10 +43,11 @@ fn check_program(meta: &ProgramMeta) -> Result<(), DiagCode> {
     if meta.nonstandard_chart {
         return Err(code::NONSTANDARD_CHART);
     }
-    if flags & decl_flag::CALC_ON_EVERY_HISTORY_TICK != 0 {
+    let hist = flags & decl_flag::CALC_ON_EVERY_HISTORY_TICK != 0;
+    if hist && !history_ticks {
         return Err(code::HISTORY_TICK);
     }
-    if flags & decl_flag::CALC_ON_ORDER_FILLS != 0 && !meta.uses_intrabar {
+    if (flags & decl_flag::CALC_ON_ORDER_FILLS != 0 || hist) && !meta.uses_intrabar {
         return Err(code::INTRABAR_ON_BAR_CLOSE);
     }
     if meta.decl.pyramiding.max(1) > cap::PYRAMIDING_MAX {
@@ -89,9 +94,14 @@ fn decl_is_out_of_domain(d: &StrategyDecl) -> bool {
     d.flags & !KNOWN_FLAGS != 0
 }
 
-/// Every §3.7 refusal for `TvBroker::new`, in order.
-pub(crate) fn check_tv(meta: &ProgramMeta, cfg: &TvCfg) -> Result<(), DiagCode> {
-    check_program(meta)?;
+/// Every §3.7 refusal for `TvBroker::new`, in order. `history_ticks`: the `history_tick` switch
+/// reads `PathPoints` (§4.2; `5109` lifted).
+pub(crate) fn check_tv(
+    meta: &ProgramMeta,
+    cfg: &TvCfg,
+    history_ticks: bool,
+) -> Result<(), DiagCode> {
+    check_program(meta, history_ticks)?;
     if chart_is_unusable(&meta.chart) {
         return Err(code::BAD_CHART_INFO);
     }
@@ -135,7 +145,7 @@ fn native_cfg_is_out_of_domain(cfg: &NativeCfg) -> bool {
 
 /// Every §3.7 refusal for `NativeBroker::new`, in order.
 pub(crate) fn check_native(meta: &ProgramMeta, cfg: &NativeCfg) -> Result<(), DiagCode> {
-    check_program(meta)?;
+    check_program(meta, false)?;
     if chart_is_unusable(&meta.chart)
         || cfg.tick_1e6 <= 0
         || cfg.qty_step_1e6 < 0
@@ -187,13 +197,40 @@ mod tests {
     //! One test per §3.7 code (§7.2's names; `tests/construct.rs` repeats them through the public
     //! constructors once `TvBroker::new` / `NativeBroker::new` land, T11 / T14).
 
-    use super::{check_native, check_tv, decl_hash64};
+    use super::{check_native, decl_hash64};
     use crate::fault::code;
     use pine_ir::{
-        decl_flag, fnv1a64_continue, AllowEntry, ChartInfo, CommissionType, LimitPrimitive,
-        NativeCfg, ProgramMeta, QtyType, RiskRules, SizingMode, StrategyDecl, TvCfg,
-        FNV1A64_OFFSET,
+        decl_flag, fnv1a64_continue, AllowEntry, ChartInfo, CommissionType, DiagCode,
+        LimitPrimitive, NativeCfg, ProgramMeta, QtyType, RiskRules, SizingMode, StrategyDecl,
+        TvCfg, FNV1A64_OFFSET,
     };
+
+    /// `check_tv` on the default `history_tick = Refuse` reading.
+    fn check_tv(m: &ProgramMeta, c: &TvCfg) -> Result<(), DiagCode> {
+        super::check_tv(m, c, false)
+    }
+
+    #[test]
+    fn history_tick_lifted_under_path_points_5107_when_mis_paired() {
+        // R-P6 / lead answers 6, 13 (`pin:05-hist-tick-refuse`): `PathPoints` lifts 5109 for the
+        // TV broker only; a history-tick program sema did not mark `uses_intrabar` refuses 5107;
+        // the native broker keeps 5109; 5100 / 5101 still come first.
+        let mut m = meta();
+        m.decl.flags |= decl_flag::CALC_ON_EVERY_HISTORY_TICK;
+        assert_eq!(
+            super::check_tv(&m, &tv(), true),
+            Err(code::INTRABAR_ON_BAR_CLOSE)
+        );
+        m.uses_intrabar = true;
+        assert_eq!(super::check_tv(&m, &tv(), true), Ok(()));
+        assert_eq!(check_tv(&m, &tv()), Err(code::HISTORY_TICK));
+        assert_eq!(check_native(&m, &native()), Err(code::HISTORY_TICK));
+        m.nonstandard_chart = true;
+        assert_eq!(
+            super::check_tv(&m, &tv(), true),
+            Err(code::NONSTANDARD_CHART)
+        );
+    }
 
     fn meta() -> ProgramMeta {
         ProgramMeta {

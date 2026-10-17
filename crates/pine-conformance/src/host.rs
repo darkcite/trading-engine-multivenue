@@ -329,12 +329,20 @@ pub fn step_chart_bar(
 ///
 /// `pin:06-rt-now-is-forming-close` — on a tick, every `HostCtx` (sub-program and parent) carries
 /// the forming chart bar's `close_ms` (§4.5.5 "realtime the forming bar's close_ms").
+///
+/// `pin:06-rt-broker` (CI-030, E106; impl-06 §4.5.3 amended r27b) — an `Rt` strategy runs with a
+/// `TvBroker`: history bars and each realtime bar's confirm go through [`step_chart_bar`] (the
+/// broker's bar walk, its close evaluation commits); the ticks read the broker (`strategy.*` is
+/// current) but their intents are not committed — the TV broker's protocol is bar-level and
+/// `calc_on_every_tick` is history-inert there (impl-05 §4.3.1), so realtime per-tick commits are a
+/// broker item, never invented here.
 pub fn step_rt_bar(
     tape: &crate::bars::SynTape,
     r: u32,
     subs: &mut [SubRun<'_>],
     store: &mut SeriesStore,
     vm: &mut VmInstance<'_>,
+    broker: &mut Option<TvBroker>,
     evals: &mut u64,
 ) -> Result<(), HostFault> {
     let rt = tape.spec();
@@ -371,7 +379,7 @@ pub fn step_rt_bar(
         let out = {
             let mut ctx = HostCtx {
                 store,
-                broker: None,
+                broker: broker.as_ref(),
                 now_ms: fb.close_ms,
             };
             vm.step_tick(&fb, &mut ctx)
@@ -386,6 +394,10 @@ pub fn step_rt_bar(
         return Ok(());
     }
     tape.confirm(r, &mut fb);
+    if broker.is_some() {
+        // pin:06-rt-broker — the confirm is the broker's bar walk and close evaluation.
+        return step_chart_bar(&fb, subs, store, vm, broker, evals);
+    }
     step_subs(&fb, subs, store, evals)?;
     let out = {
         let mut ctx = HostCtx {

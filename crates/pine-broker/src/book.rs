@@ -66,6 +66,33 @@ fn gross_1e12(sign: i128, px_1e6: i64, entry_px_1e6: i64, n_1e6: i128, pv_1e6: i
     sign * mul_div(mul_div(diff, n_1e6, 1), i128::from(pv_1e6), E6)
 }
 
+/// Open trade `l`'s `(max_runup_1e6, max_drawdown_1e6)` after one more sample at `px` (§4.6.3).
+///
+/// `pin:05-trade-excursion` (CI-033 / CI-034) — TradingView's per-trade favorable / adverse
+/// excursion ("Favorable / Adverse excursion" in the List of Trades, `max_runup` /
+/// `max_drawdown`) is the extreme of the trade's open profit — `sign·value(p − entry, |qty|, pv)`
+/// net of the entry fee the trade carries (`pin:05-openprofit-fees`) — over the path points from
+/// its entry fill to its exit fill, the exit fill price included and the exit bar's path after it
+/// excluded; run-up floored at 0, drawdown at 0 (printed ≤ 0 by TradingView). A partially closed
+/// trade gives each closed slice its quantity's share. Derived from 6 067 captured trades of the
+/// E fixtures on the chart's own OHLC (5 878 match to the cent; the rest are other broker laws:
+/// trails, exit legs, CI-036): E009 run-up 200 = the profit target, E011 drawdown −772.5 = the stop,
+/// E116 a same-bar stop (−200), E111 a 1-of-20 slice (4.7, not 94), E063–E068 the entry fee.
+fn excursion_at(l: &TradeRec, px_1e6: i64, pv_1e6: i64) -> (i64, i64) {
+    let a = i128::from(l.qty_1e6).abs();
+    let open =
+        gross_1e12(sgn(l.qty_1e6), px_1e6, l.entry_px_1e6, a, pv_1e6).saturating_sub(l.fee_1e12);
+    (
+        l.max_runup_1e6.max(e12_to_1e6_floor(open.max(0))),
+        l.max_drawdown_1e6.max(e12_to_1e6_ceil((-open).max(0))),
+    )
+}
+
+/// `v·n/lq` (truncated) — a closed slice's share of its trade's excursion; `0 < n < lq`.
+fn share_of(v: i64, n: i128, lq: i128) -> i64 {
+    crate::money::sat_i64(mul_div(i128::from(v), n, lq))
+}
+
 /// The book both brokers drive (§4.6.1).
 pub(crate) struct Book {
     /// Open trades, a ring: index `(head + i) & MASK`, oldest first.
@@ -402,6 +429,15 @@ impl Book {
             let (l_qty, l_fee, l_entry) = (l.qty_1e6, l.fee_1e12, l.entry_px_1e6);
             let lq = i128::from(l_qty).abs();
             let n = red_left.min(lq);
+            // `pin:05-trade-excursion` (CI-033; E009 E011 E063 E111 E116): the exit fill is the
+            // closing trade's last excursion sample, on the open-profit basis (§4.6.3); the slice
+            // takes its quantity's share of the trade's excursion, the rest stays with the lot.
+            let (ru, dd) = excursion_at(&self.lots[s], px_1e6, self.pv_1e6);
+            let (c_ru, c_dd) = if n == lq {
+                (ru, dd)
+            } else {
+                (share_of(ru, n, lq), share_of(dd, n, lq))
+            };
             let exit_share = if n == qty_left {
                 fee_left
             } else {
@@ -426,6 +462,8 @@ impl Book {
             c.qty_1e6 = c_qty;
             c.fee_1e12 = c_fee;
             c.pnl_1e12 = c_pnl;
+            c.max_runup_1e6 = c_ru;
+            c.max_drawdown_1e6 = c_dd;
             c.flags = trade_flag::PNL_NET | cause;
             c.exit_id = src.id;
             c.exit_sym = src.sym;
@@ -453,6 +491,8 @@ impl Book {
             let lot = &mut self.lots[s];
             lot.fee_1e12 -= entry_share;
             lot.qty_1e6 -= c_qty;
+            lot.max_runup_1e6 = ru - c_ru;
+            lot.max_drawdown_1e6 = dd - c_dd;
             if lot.qty_1e6 == 0 {
                 self.remove_lot(i);
             }
@@ -534,8 +574,10 @@ impl Book {
             let a = i128::from(l.qty_1e6).abs();
             let gross = gross_1e12(sgn(l.qty_1e6), px_1e6, l.entry_px_1e6, a, pv);
             l.pnl_1e12 = gross.saturating_sub(l.fee_1e12);
-            l.max_runup_1e6 = l.max_runup_1e6.max(e12_to_1e6_floor(gross.max(0)));
-            l.max_drawdown_1e6 = l.max_drawdown_1e6.max(e12_to_1e6_ceil((-gross).max(0)));
+            // `pin:05-trade-excursion`: sampled on the open-profit basis (net of the entry fee).
+            let o = l.pnl_1e12;
+            l.max_runup_1e6 = l.max_runup_1e6.max(e12_to_1e6_floor(o.max(0)));
+            l.max_drawdown_1e6 = l.max_drawdown_1e6.max(e12_to_1e6_ceil((-o).max(0)));
             open = open.saturating_add(l.pnl_1e12);
             let (ru, dd, e, q) = (
                 l.max_runup_1e6,

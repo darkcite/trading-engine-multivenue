@@ -556,8 +556,10 @@ pub fn bi_ta_tsi(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), Fa
     let na0 = sw::pick(DIV0, d) == swr::FLOAT_DIV_ZERO_NA;
     let (num, den) = {
         let s = f.state::<TsiHdr>(site);
-        if !src.is_nan() && s.prev.primed != 0 {
-            let m = src - s.prev.v;
+        // `src − prev` is na when either is na, and also when both are the same infinity (IEEE
+        // ∞ − ∞); an na change is not fed to the smoothers (`pin:04-ta-composed`), as `macd`'s `m`.
+        let m = src - s.prev.v;
+        if s.prev.primed != 0 && !m.is_nan() {
             let (al, as_) = (2.0 / (ll as f64 + 1.0), 2.0 / (sl as f64 + 1.0));
             let m1 = ewma_step(&mut s.m1, m, al, ll, sma);
             if !m1.is_nan() {

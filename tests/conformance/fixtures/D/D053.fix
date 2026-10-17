@@ -24,3 +24,11 @@ plot	f_D053_k	exact
 plot	f_D053_eqc	exact
 plot	f_D053_dev	exact
 pending
+reading	developing
+f_D053_eqc	1
+f_D053_dev	1
+end
+reading	last_confirmed
+f_D053_eqc	1
+f_D053_dev	0
+end

@@ -124,11 +124,18 @@ pub(crate) enum PctEquityAt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum PriceRounding {
-    /// Rounded to `chart.mintick_1e6`, half away from zero (default).
-    NearestTick = 0,
+    /// Rounded down (toward −∞) to `chart.mintick_1e6` (default). `pin:05-price-rounding`
+    /// decided by E113 (CI-034): a buy limit at `close − 12.4 ticks` (77249.5 − 1.24 = 77248.26)
+    /// filled at 77248.2 on all 43 limit fills — neither `NearestTick` (77248.3) nor `None`
+    /// (77248.26). Only buy limits were captured off the grid: sell limits and stops take the same
+    /// one-grid rule (literal reading) until a capture shows otherwise.
+    FloorTick = 0,
+    #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
+    /// Rounded to `chart.mintick_1e6`, half away from zero (the pre-capture default; refuted).
+    NearestTick = 1,
     #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
     /// Used as given.
-    None = 1,
+    None = 2,
 }
 
 /// `cof_close_tick` — a `calc_on_order_fills` execution after a fill at the bar's close
@@ -159,13 +166,31 @@ pub(crate) enum CofNextTick {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum FillLimitsPrice {
-    /// At its limit (default).
-    AtLimit = 0,
-    /// At the segment's start, as with `fill_limits_ticks = 0`.
-    AtStart = 1,
+    /// At the segment's start, as with `fill_limits_ticks = 0` (default). `pin:05-fill-limits`
+    /// decided by E120 (CI-034 / CI-036): a buy limit 50 ticks through the market with
+    /// `backtest_fill_limits_assumption = 3` filled at the next bar's open on all 45 entries, not
+    /// at its limit — TradingView's docs ("still executes verified limit orders at their specified
+    /// prices") describe a limit reached inside the bar; noted for the lead.
+    AtStart = 0,
+    #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
+    /// At its limit (the pre-capture default; refuted by E120).
+    AtLimit = 1,
 }
 
-/// One reading of every §4.2 switch. 14 bytes, held by value in each broker.
+/// `history_tick` — `calc_on_every_history_tick = true` in TV mode (R-P6; impl-05 §3.7, §4.8.9).
+/// `Refuse` until CAR-D1 is applied and the history-tick fixtures are captured; the native broker
+/// refuses the flag (`5109`) on every reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum HistoryTick {
+    /// `5109` at construction (default).
+    Refuse = 0,
+    #[cfg_attr(not(test), allow(dead_code))] // constructed by `with_switches` tests only.
+    /// Evaluate at the history path points (`pin:05-hist-tick-*`, provisional).
+    PathPoints = 1,
+}
+
+/// One reading of every §4.2 switch. 15 bytes, held by value in each broker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub(crate) struct Switches {
@@ -197,9 +222,11 @@ pub(crate) struct Switches {
     pub(crate) cof_next_tick: CofNextTick,
     /// §4.8.6.
     pub(crate) fill_limits_price: FillLimitsPrice,
+    /// §3.7, §4.8.9.
+    pub(crate) history_tick: HistoryTick,
 }
 
-const _: () = assert!(core::mem::size_of::<Switches>() == 14);
+const _: () = assert!(core::mem::size_of::<Switches>() == 15);
 const _: () = assert!(core::mem::align_of::<Switches>() == 1);
 
 /// The defaults (I38): the §4.2 table's "default" column.
@@ -214,10 +241,11 @@ pub(crate) const SWITCHES: Switches = Switches {
     trail_arm_fire: TrailArmFire::NextSegment,
     cash_per_order: CashPerOrder::PerFill,
     pct_equity_at: PctEquityAt::FillTime,
-    price_rounding: PriceRounding::NearestTick,
+    price_rounding: PriceRounding::FloorTick,
     cof_close_tick: CofCloseTick::No,
     cof_next_tick: CofNextTick::NextPoint,
-    fill_limits_price: FillLimitsPrice::AtLimit,
+    fill_limits_price: FillLimitsPrice::AtStart,
+    history_tick: HistoryTick::Refuse,
 };
 
 #[cfg(test)]
@@ -243,6 +271,7 @@ mod tests {
             s.cof_close_tick as u8,
             s.cof_next_tick as u8,
             s.fill_limits_price as u8,
+            s.history_tick as u8,
         ];
         let mut i = 0;
         while i < d.len() {

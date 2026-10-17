@@ -104,6 +104,31 @@ const fn e6_to_e12(v: i64) -> i128 {
     v as i128 * 1_000_000
 }
 
+/// `v / 10^scale` printed as TradingView prints money, prices and sizes: sign, integer digits, the
+/// fraction without trailing zeros (`-1853700000` at scale 6 → `-1853.7`). Divergence text only.
+///
+/// `pin:06-trade-money-units` (CI-033 / CI-034, harness part) — a trade field's divergence shows
+/// ours in TradingView's units and sign, never the raw ×1e6 / ×1e12 integer.
+pub fn render_scaled(v: i128, scale: u32) -> String {
+    let p = 10u128.pow(scale);
+    let m = v.unsigned_abs();
+    let (int, frac) = (m / p, m % p);
+    let sign = if v < 0 { "-" } else { "" };
+    if frac == 0 {
+        return format!("{sign}{int}");
+    }
+    let f = format!("{frac:0w$}", w = scale as usize);
+    format!("{sign}{int}.{}", f.trim_end_matches('0'))
+}
+
+/// `pin:06-trade-adverse-sign` (CI-033, harness part) — TradingView's List of Trades prints the
+/// adverse excursion (`drawdown`) as a signed money value ≤ 0 (`-1853.7`, E005), the favorable one
+/// (`runup`) ≥ 0; `TradeRec::max_drawdown_1e6` is the unsigned magnitude. The comparison negates
+/// ours, so a drawdown compares in TradingView's sign; the value laws stay the broker's.
+const fn adverse_signed(max_drawdown_1e6: i64) -> i64 {
+    -max_drawdown_1e6
+}
+
 fn sym_text(syms: &SymTable, s: Sym) -> Option<&str> {
     if s == Sym::NONE {
         None
@@ -182,16 +207,13 @@ fn compare_one(
         let ours = sym_text(syms, a.entry_sym).unwrap_or("<id>").to_string();
         return field(n, "entry_sig", e.entry_sig.clone(), ours);
     }
+    let px = |v: i64| render_scaled(i128::from(v), 6);
     if scaled_half_away(e.entry_px, 6) != i128::from(a.entry_px_1e6) {
-        return field(
-            n,
-            "entry_px",
-            e.entry_px.render(),
-            a.entry_px_1e6.to_string(),
-        );
+        return field(n, "entry_px", e.entry_px.render(), px(a.entry_px_1e6));
     }
     if scaled_half_away(e.qty, 6) != i128::from(a.qty_1e6.unsigned_abs()) {
-        return field(n, "qty", e.qty.render(), a.qty_1e6.to_string());
+        let q = render_scaled(i128::from(a.qty_1e6.unsigned_abs()), 6);
+        return field(n, "qty", e.qty.render(), q);
     }
     if let Some(x) = &e.exit {
         if x.ms != a.exit_ms {
@@ -202,7 +224,7 @@ fn compare_one(
             return field(n, "exit_sig", x.sig.clone(), ours);
         }
         if scaled_half_away(x.px, 6) != i128::from(a.exit_px_1e6) {
-            return field(n, "exit_px", x.px.render(), a.exit_px_1e6.to_string());
+            return field(n, "exit_px", x.px.render(), px(a.exit_px_1e6));
         }
         if let Some(b) = e.bars {
             let ours = a.exit_bar.wrapping_sub(a.entry_bar);
@@ -213,12 +235,12 @@ fn compare_one(
         // An open trade's P&L is marked at export time: compared on closed trades only.
         if let Some(p) = e.pnl {
             if !money_ok(pnl_on(a, basis), p) {
-                return field(n, "pnl", p.render(), pnl_on(a, basis).to_string());
+                return field(n, "pnl", p.render(), render_scaled(pnl_on(a, basis), 12));
             }
         }
         if let Some(c) = e.cum_pnl {
             if !money_ok(cum, c) {
-                return field(n, "cum_pnl", c.render(), cum.to_string());
+                return field(n, "cum_pnl", c.render(), render_scaled(cum, 12));
             }
         }
     }
@@ -227,23 +249,39 @@ fn compare_one(
         if money_ok(e6_to_e12(ours_1e6), d) {
             None
         } else {
-            field(n, name, d.render(), ours_1e6.to_string())
+            field(n, name, d.render(), render_scaled(i128::from(ours_1e6), 6))
         }
     };
     money("runup", e.runup, a.max_runup_1e6)
-        .or_else(|| money("drawdown", e.drawdown, a.max_drawdown_1e6))
+        .or_else(|| money("drawdown", e.drawdown, adverse_signed(a.max_drawdown_1e6)))
 }
 
-/// §4.4.4: structural fields exact, prices exact after ×1e6 half-away, sizes exact, money within half a
-/// printed unit; `actual` is closed-then-open in trade order.
-pub fn compare_trades(
+/// The trades TradingView kept after trimming, against the broker's retained ones (CI-029, E109).
+///
+/// `pin:06-trade-trim-kept` — TradingView keeps the NEWEST 9 000 closed trades: E109's List of
+/// Trades starts at trade #3243 = `closedtrades` 12 242 − 9 000 + 1 and ends at #12242, and its
+/// `strategy.closedtrades.first_index` plot reads 3242; the TV broker retains the newest 9 000 too
+/// (`closed_retained`, `first_index = closedtrades − closed_retained`). `evicted` = the broker's
+/// dropped count: the first expected row must be trade `evicted + 1` (field `n`), and the running
+/// `cum_pnl` starts at `cum_seed` = the dropped trades' P&L on `basis` (the broker's closed totals
+/// minus the retained trades'), never at the export's own first `cum_pnl`.
+pub fn compare_trades_kept(
     expected: &[TradeRow],
     actual: &[TradeRec],
+    evicted: u32,
+    cum_seed: i128,
     syms: &SymTable,
     signals: &SignalTable,
     basis: PnlBasis,
 ) -> Option<TradeDiv> {
-    let mut cum = 0i128;
+    if evicted > 0 {
+        if let Some(e) = expected.first() {
+            if e.n != evicted + 1 {
+                return field(e.n, "n", e.n.to_string(), (evicted + 1).to_string());
+            }
+        }
+    }
+    let mut cum = cum_seed;
     let mut first: Option<(usize, TradeDiv)> = None;
     let both = expected.len().min(actual.len());
     let mut i = 0usize;
@@ -268,7 +306,63 @@ pub fn compare_trades(
     first.map(|(_, d)| d)
 }
 
-/// `closed_trades` = the number of closed `TradeRec`s (`RunRecord` counts wins and losses, not the total).
+/// The shape of a trimmed list on a tape that is not TradingView's (CI-029, E109).
+///
+/// `pin:06-trade-trim-kept` — E109 runs on SYN bars (`driver syn`, `align step`) while TradingView
+/// traded its chart, so prices, times and money are not comparable; what is: TradingView kept the
+/// newest closed trades — its rows are numbered `evicted + 1 …`, consecutively — and as many as the
+/// broker retained closed. `actual` is closed-then-open; open trades are not in this comparison.
+pub fn compare_kept_shape(
+    expected: &[TradeRow],
+    actual: &[TradeRec],
+    evicted: u32,
+) -> Option<TradeDiv> {
+    let closed = actual
+        .iter()
+        .filter(|t| t.flags & trade_flag::OPEN == 0)
+        .count();
+    let mut i = 0usize;
+    while i < expected.len() {
+        let e = &expected[i];
+        let want = evicted + i as u32 + 1;
+        if e.n != want || e.exit.is_none() {
+            return field(e.n, "n", e.n.to_string(), want.to_string());
+        }
+        i += 1;
+    }
+    (expected.len() != closed).then_some(TradeDiv::Count {
+        expected: expected.len(),
+        actual: closed,
+        first_mismatch: expected.len().min(closed),
+    })
+}
+
+/// The P&L on `basis` of the broker's retained closed trades (`actual` closed-then-open).
+pub fn retained_pnl(actual: &[TradeRec], basis: PnlBasis) -> i128 {
+    let mut s = 0i128;
+    let mut i = 0usize;
+    while i < actual.len() {
+        if actual[i].flags & trade_flag::OPEN == 0 {
+            s += pnl_on(&actual[i], basis);
+        }
+        i += 1;
+    }
+    s
+}
+
+/// §4.4.4: structural fields exact, prices exact after ×1e6 half-away, sizes exact, money within half a
+/// printed unit; `actual` is closed-then-open in trade order.
+pub fn compare_trades(
+    expected: &[TradeRow],
+    actual: &[TradeRec],
+    syms: &SymTable,
+    signals: &SignalTable,
+    basis: PnlBasis,
+) -> Option<TradeDiv> {
+    compare_trades_kept(expected, actual, 0, 0, syms, signals, basis)
+}
+
+/// `closed_trades` =the number of closed `TradeRec`s (`RunRecord` counts wins and losses, not the total).
 pub fn compare_summary(
     expected: &Summary,
     actual: &RunRecord,

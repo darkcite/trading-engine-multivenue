@@ -238,6 +238,29 @@ pub fn bi_round(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultK
     Ok(())
 }
 
+/// `math.round(number, precision) -> float` — window `[number, precision, out]`: `number`
+/// rounded to `precision` decimal places as `round(number × 10^precision) / 10^precision`, ties
+/// per `Sw::RoundTies` as `math.round(x)` (`pin:04-round-precision`, CI-013, fixture F016). A na
+/// `number` or `precision` → na; a negative `precision` rounds to tens, hundreds, …; a scale
+/// that overflows (`|precision| > 308`) yields na through the NaN of `inf / inf` or `0 / 0`.
+pub fn bi_round_prec(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 3 {
+        return Err(FaultKind::Internal);
+    }
+    let x = f.f64_arg(args[0]);
+    let half_up = sw::pick(TIES, f.dialect()) == swr::ROUND_TIES_HALF_UP;
+    let v = match f.i64_arg(args[1]) {
+        None => f64::NAN,
+        Some(p) => {
+            let p = p.clamp(-400, 400) as i32;
+            let scale = 10f64.powi(p);
+            round_ties(x * scale, half_up) / scale
+        }
+    };
+    f.set_f64_arg(args[2], v);
+    Ok(())
+}
+
 /// `math.round_to_mintick(x)`: `to_1e6(x)` rounded to a multiple of the chart's `mintick_1e6`
 /// in integer arithmetic (ties per `Sw::RoundTies`), back through `from_1e6`.
 pub fn bi_round_to_mintick(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {

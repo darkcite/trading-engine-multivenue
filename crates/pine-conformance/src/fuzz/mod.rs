@@ -41,12 +41,13 @@ use pine_ir::Dialect;
 ///
 /// 2 (r22): the bare `input(…)` joins the alphabet with a constant `defval`
 /// (`grammar::FUZZ_ADMIT_V2`, `pin:06-fuzz-grammar-version-gate`).
-pub const GRAMMAR_VERSION: u16 = 2;
+/// 3 (r27b): the five rows pine-std began serving join (`grammar::FUZZ_SERVED_V3`).
+pub const GRAMMAR_VERSION: u16 = 3;
 
 /// Every grammar version this build still generates, byte-identically per `(version, seed, cfg)`:
 /// §4.8.3's derived alphabet grows only under a new version, so §4.8.5's `regressions.tsv` rows
 /// of an older version replay the very program they recorded (`pin:06-fuzz-grammar-version-gate`).
-pub const GRAMMAR_VERSIONS: [u16; 2] = [1, 2];
+pub const GRAMMAR_VERSIONS: [u16; 3] = [1, 2, 3];
 
 /// `(GRAMMAR_VERSION, seed, id, bucket)` per shrunk divergence, replayed by
 /// `regressions_still_reproduce` (§4.8.5).

@@ -32,6 +32,7 @@ mod money;
 mod native;
 mod orders;
 mod risk;
+mod signal;
 mod size;
 mod switch;
 mod tv;
@@ -56,6 +57,10 @@ pub(crate) mod cap {
     pub(crate) const LOTS: usize = 128;
     /// Closed trades retained — TradingView's documented 9000 (§4.6.6).
     pub(crate) const CLOSED_RETAIN: usize = 9000;
+    /// v5 only, TV mode: orders a script may create; the 9001st faults the run that creates it
+    /// (`pin:05-v5-order-limit`, CI-005 / E110: RE10138 "Maximum number of orders (9000) was
+    /// reached.", §4.6.6).
+    pub(crate) const V5_ORDERS: u64 = 9000;
     /// Native: sent orders tracked — one IoC, ≤ `max_open − 1` resting makers and ≤ `MAX_OPEN`
     /// replaced predecessors (§4.12.6).
     pub(crate) const SENT: usize = 16;

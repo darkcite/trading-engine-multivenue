@@ -20,6 +20,8 @@
 //! per `v`, a growth ([`FUZZ_ADMIT_V2`]) lands under a new version, and every older version stays
 //! generable byte-identically. Grammar 2 = grammar 1 + the bare `input(…)` with a constant
 //! `defval`; no `v := input(…)` (a reassigned whole value names a second input `v`, `3050`).
+//! Grammar 3 = grammar 2 + the rows pine-std began serving in r27b ([`FUZZ_SERVED_V3`]): a row
+//! `pine_std::served` newly calls served grows the alphabet too, so it lands under a version.
 
 use pine_ir::{Dialect, Qual, Ty};
 use pine_spec::{params, pf, rets};
@@ -133,6 +135,23 @@ pub fn denied(e: &pine_spec::Entry) -> bool {
 /// `input(…)` is emitted with a constant `defval` only (`pin:06-fuzz-input-const-defval`).
 pub const FUZZ_ADMIT_V2: [&str; 1] = ["input"];
 
+/// Overloads pine-std began serving after grammar 2 was cut (r27b, 2026-10-17: CI-013 `ta.max`,
+/// `ta.min`, `ta.range` float / int; CI-015 `math.round(x, precision)`). Grammar ≥ 3 admits them;
+/// grammars 1–2 never draw them, so their seeds replay byte-identically
+/// (`pin:06-fuzz-grammar-version-gate`). The next row pine-std serves joins a grammar 4 list.
+pub const FUZZ_SERVED_V3: [pine_ir::OverloadId; 5] = [
+    pine_spec::ov::MATH_ROUND_F,
+    pine_spec::ov::TA_MAX,
+    pine_spec::ov::TA_MIN,
+    pine_spec::ov::TA_RANGE_F,
+    pine_spec::ov::TA_RANGE_I,
+];
+
+/// Whether overload `i` is outside grammar `version` because pine-std served it later.
+fn served_later(version: u16, i: u16) -> bool {
+    version < 3 && FUZZ_SERVED_V3.contains(&pine_ir::OverloadId(i))
+}
+
 /// [`denied`] under grammar `version`: grammar ≥ 2 admits [`FUZZ_ADMIT_V2`].
 pub fn denied_in(version: u16, e: &pine_spec::Entry) -> bool {
     denied(e) && !(version >= 2 && FUZZ_ADMIT_V2.contains(&e.full_str()))
@@ -189,7 +208,8 @@ pub fn alphabet(d: Dialect, active_tiers: u8) -> Vec<Builtin> {
 }
 
 /// The derived alphabet (§4.8.3) of grammar `version`: `pine_spec::OVERLOADS ∩ active_tiers ∩
-/// dialect − FUZZ_DENY (+ FUZZ_ADMIT_V2 from grammar 2)`, in overload order. Load-time; allocates.
+/// dialect − FUZZ_DENY (+ FUZZ_ADMIT_V2 from grammar 2, + FUZZ_SERVED_V3 from grammar 3)`, in
+/// overload order. Load-time; allocates.
 pub fn alphabet_for(version: u16, d: Dialect, active_tiers: u8) -> Vec<Builtin> {
     let mut out = Vec::new();
     for (i, ov) in pine_spec::OVERLOADS.iter().enumerate() {
@@ -206,7 +226,9 @@ pub fn alphabet_for(version: u16, d: Dialect, active_tiers: u8) -> Vec<Builtin> 
         // pin:06-fuzz-alphabet-served — "implemented" is pine-std's knowledge (`pine_spec::Scope`):
         // a row `pine_std::served` calls `Unreachable` is refused `3024 … unserved=1` by the
         // snapshot, not by the program, so it waits outside the alphabet until pine-std serves it.
-        if pine_std::served(pine_ir::OverloadId(i as u16)) == pine_std::Served::Unreachable {
+        if pine_std::served(pine_ir::OverloadId(i as u16)) == pine_std::Served::Unreachable
+            || served_later(version, i as u16)
+        {
             continue;
         }
         let name = e.full_str();

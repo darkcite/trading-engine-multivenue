@@ -111,16 +111,39 @@ pub(crate) fn run(ir: &mut Ir, sites: &[Site]) -> Result<(), Diag> {
         }
         let prov = f.fixpoint();
         f.check(&prov)?;
-        f.rewrites(&prov)
+        (f.rewrites(&prov), f.dead(&prov))
     };
-    if rewrites.is_empty() {
+    let (rewrites, dead) = rewrites;
+    if rewrites.is_empty() && dead.is_empty() {
         return Ok(());
     }
     let mut body = std::mem::take(&mut ir.body);
     let mut k = 0usize;
-    rewrite_block(ir, &mut body, &rewrites, &mut k);
+    rewrite_block(ir, &mut body, &rewrites, &dead, &mut k);
     ir.body = body;
     Ok(())
+}
+
+/// The fault of a field access on a handle no creation site reaches (CI-003 / C029).
+const NA_OBJECT_MSG: &str = "Cannot access a field of an undefined object. The object is 'na'.";
+
+/// `pin:02-field-of-no-object` (amended r27b, CI-003 / C029, operator R-P2): a field access whose
+/// handle no creation site reaches is `na` whenever it runs, and TradingView stops the script
+/// there ("Error on bar 0: Cannot access the 'Pt.x' field of an undefined object. The object is
+/// 'na'."). The access becomes pine-std's `runtime.error` (`ScriptRefused`, the VM's own
+/// `o_field` fault kind), its result `na`, so verifier rule 15 never sees a field op without an
+/// `O_NEW`.
+fn no_object(dst: Option<VSlot>, span: Span) -> Vec<Stmt> {
+    let mut v = vec![Stmt::Op(Op::Call {
+        ov: pine_spec::ov::RUNTIME_ERROR,
+        args: vec![Arg::Str(NA_OBJECT_MSG)],
+        outs: Vec::new(),
+        span,
+    })];
+    if let Some(d) = dst {
+        v.push(Stmt::Op(Op::NaSet { a: d }));
+    }
+    v
 }
 
 impl<'a> Facts<'a> {
@@ -349,17 +372,8 @@ impl<'a> Facts<'a> {
     fn check(&self, prov: &HashMap<Target, Set>) -> Result<(), Diag> {
         let mut buf = Vec::new();
         for it in &self.items {
-            if let Op::ObjGet { h, .. } | Op::ObjSet { h, .. } = it.op {
-                if prov.get(&Target::Slot(*h)).is_none_or(BTreeSet::is_empty) {
-                    // pin:02-field-of-no-object — no creation site reaches the handle: it is
-                    // `na` whenever the access runs (a run-time `ScriptRefused`), and verifier
-                    // rule 15 refuses a field op no `O_NEW` precedes. impl-02 names no code.
-                    let msg = "not implemented: a field access no object creation reaches \
-                               (the handle is always `na`; pin:02-field-of-no-object)"
-                        .to_owned();
-                    return Err(diag(ReasonCode::Internal, self.info(*h).span, msg));
-                }
-            }
+            // A field access no creation site reaches is lowered by `dead` / `no_object`
+            // (pin:02-field-of-no-object, CI-003).
             buf.clear();
             self.contrib(it, prov, &mut buf);
             for (t, set) in &buf {
@@ -445,6 +459,19 @@ impl<'a> Facts<'a> {
     fn pending(&self, src: VSlot) -> bool {
         pending(self.ir, src)
     }
+
+    /// The handles of field accesses no creation site reaches (`pin:02-field-of-no-object`).
+    fn dead(&self, prov: &HashMap<Target, Set>) -> HashSet<VSlot> {
+        let mut out = HashSet::new(); // INDEX-ONLY
+        for it in &self.items {
+            if let Op::ObjGet { h, .. } | Op::ObjSet { h, .. } = it.op {
+                if prov.get(&Target::Slot(*h)).is_none_or(BTreeSet::is_empty) {
+                    out.insert(*h);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// A `string` field store lowering left for this pass: its source is not a staging slot.
@@ -465,7 +492,13 @@ fn scalar_info(ir: &Ir, like: VSlot, ty: Ty) -> SlotInfo {
     }
 }
 
-fn rewrite_block(ir: &mut Ir, b: &mut Block, rw: &[Vec<(u32, VSlot)>], k: &mut usize) {
+fn rewrite_block(
+    ir: &mut Ir,
+    b: &mut Block,
+    rw: &[Vec<(u32, VSlot)>],
+    dead: &HashSet<VSlot>,
+    k: &mut usize,
+) {
     let mut out = Vec::with_capacity(b.0.len());
     for mut s in std::mem::take(&mut b.0) {
         match &mut s {
@@ -473,24 +506,36 @@ fn rewrite_block(ir: &mut Ir, b: &mut Block, rw: &[Vec<(u32, VSlot)>], k: &mut u
                 let cands = rw.get(*k).cloned().unwrap_or_default();
                 *k += 1;
                 let (h, field, src) = (*h, *field, *src);
-                out.extend(dispatch(ir, h, field, src, &cands));
+                if dead.contains(&h) {
+                    out.extend(no_object(None, ir.slots[h.0 as usize].span));
+                } else {
+                    out.extend(dispatch(ir, h, field, src, &cands));
+                }
+                continue;
+            }
+            Stmt::Op(Op::ObjSet { h, .. }) if dead.contains(h) => {
+                out.extend(no_object(None, ir.slots[h.0 as usize].span));
+                continue;
+            }
+            Stmt::Op(Op::ObjGet { dst, h, .. }) if dead.contains(h) => {
+                out.extend(no_object(Some(*dst), ir.slots[h.0 as usize].span));
                 continue;
             }
             Stmt::Op(_) | Stmt::Break | Stmt::Continue => {}
             Stmt::If { then, els, .. } => {
-                rewrite_block(ir, then, rw, k);
-                rewrite_block(ir, els, rw, k);
+                rewrite_block(ir, then, rw, dead, k);
+                rewrite_block(ir, els, rw, dead, k);
             }
             Stmt::Loop {
                 head, body, step, ..
             } => {
-                rewrite_block(ir, head, rw, k);
-                rewrite_block(ir, body, rw, k);
-                rewrite_block(ir, step, rw, k);
+                rewrite_block(ir, head, rw, dead, k);
+                rewrite_block(ir, body, rw, dead, k);
+                rewrite_block(ir, step, rw, dead, k);
             }
             Stmt::Unrolled { copies } => {
                 for c in copies.iter_mut() {
-                    rewrite_block(ir, c, rw, k);
+                    rewrite_block(ir, c, rw, dead, k);
                 }
             }
         }
@@ -512,7 +557,7 @@ fn dispatch(ir: &mut Ir, h: VSlot, f: u16, v: VSlot, cands: &[(u32, VSlot)]) -> 
         ]
     };
     match cands {
-        // `check` refused an empty candidate set (pin:02-field-of-no-object).
+        // A handle no site reaches never gets here: `rewrite_block` lowers it by `no_object`.
         [] => Vec::new(),
         [(_, t)] => arm(*t),
         _ => {

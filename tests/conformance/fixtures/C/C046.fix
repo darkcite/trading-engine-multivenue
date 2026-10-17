@@ -21,23 +21,8 @@ rt	64	16	3	0
 plot	f_C046_rt	exact
 plot	f_C046_done	exact
 plot	f_C046_ok	exact
-series
-64	1	1	0
-65	1	1	0
-66	1	1	0
-67	1	1	0
-68	1	1	0
-69	1	1	0
-70	1	1	0
-71	1	1	0
-72	1	1	0
-73	1	1	0
-74	1	1	0
-75	1	1	0
-76	1	1	0
-77	1	1	0
-78	1	1	0
-79	1	1	0
+relation
+f_C046_ok	0
 end
 reading	var_like
 f_C046_ok	0

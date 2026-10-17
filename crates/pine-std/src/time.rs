@@ -173,6 +173,115 @@ pub fn bi_time_tradingday(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<
     Ok(())
 }
 
+/// The second timeframes `timeframe.from_seconds` rounds up to (`pin:04-from-seconds`).
+const FROM_S_SECONDS: [i64; 6] = [1, 5, 10, 15, 30, 45];
+
+/// `timeframe.from_seconds(seconds)` as `(multiplier, unit)` (`0` = minutes): an exact
+/// representation in the largest unit first — month (`IN_SECONDS_MONTH`, ≤ 12), week (≤ 52),
+/// day (≤ 365), minute (≤ 1440), second (`FROM_S_SECONDS`) — else the next higher valid
+/// timeframe in the smallest unit that holds `s`: `s ≤ 1` → `1S`, then the second set, then
+/// whole minutes up to 1440, then whole days up to 365, and above 365 days `12M` (the
+/// reference's remarks: 2–5 s → `5S`, 604 799 → `7D`, 604 800 → `1W`, above 366 days → `12M`;
+/// `pin:04-from-seconds`, CI-013, fixtures F075 F076 F092).
+fn from_seconds_parts(s: i64) -> (i64, u8) {
+    const MIN: i64 = 60;
+    const DAY: i64 = 86_400;
+    const WEEK: i64 = 604_800;
+    if s <= 1 {
+        return (1, b'S');
+    }
+    if s % IN_SECONDS_MONTH == 0 && s / IN_SECONDS_MONTH <= 12 {
+        return (s / IN_SECONDS_MONTH, b'M');
+    }
+    if s % WEEK == 0 && s / WEEK <= 52 {
+        return (s / WEEK, b'W');
+    }
+    if s % DAY == 0 && s / DAY <= 365 {
+        return (s / DAY, b'D');
+    }
+    if s % MIN == 0 && s / MIN <= 1440 {
+        return (s / MIN, 0);
+    }
+    let mut i = 0usize;
+    while i < FROM_S_SECONDS.len() {
+        if s <= FROM_S_SECONDS[i] {
+            return (FROM_S_SECONDS[i], b'S');
+        }
+        i += 1;
+    }
+    if s <= 1440 * MIN {
+        let m = (s + MIN - 1) / MIN;
+        return if m == 1440 { (1, b'D') } else { (m, 0) };
+    }
+    if s <= 365 * DAY {
+        return ((s + DAY - 1) / DAY, b'D');
+    }
+    (12, b'M')
+}
+
+/// `timeframe.from_seconds(seconds) -> string` — window `[seconds, out]`: `from_seconds_parts`
+/// written with its multiplier always (`"1D"`, also in v5: F075 printed length 2 in both
+/// dialects, so the `tf_multiplier` switch does not apply here — `pin:04-from-seconds`); a na
+/// `seconds` → na. At most 5 bytes of scratch.
+pub fn bi_tf_from_seconds(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 2 {
+        return Err(FaultKind::Internal);
+    }
+    let Some(s) = f.i64_arg(args[0]) else {
+        f.set_i64_arg(args[1], None);
+        return Ok(());
+    };
+    let (mut m, unit) = from_seconds_parts(s);
+    let mut digits = [0u8; 5];
+    let mut k = 0usize;
+    loop {
+        digits[k] = b'0' + (m % 10) as u8;
+        k += 1;
+        m /= 10;
+        if m == 0 || k == 4 {
+            break;
+        }
+    }
+    let n = k + usize::from(unit != 0);
+    let (r, dst) = f.str_alloc(n as u32)?;
+    let mut j = 0usize;
+    while k > 0 {
+        k -= 1;
+        dst[j] = digits[k];
+        j += 1;
+    }
+    if unit != 0 {
+        dst[j] = unit;
+    }
+    f.set_i64_arg(args[1], Some(r.0 as i64));
+    Ok(())
+}
+
+/// `session.isfirstbar` (`LAST == false`) / `session.islastbar` — stateless over the bar's own
+/// span: the day's session of a 24/7 UTC venue opens at `time_tradingday`
+/// (`pin:04-exchange-tz`), so the bar is the session's first when its span `[open, close)`
+/// starts in that day and its open lies less than one bar length past the day's open (it covers
+/// the session open), and the last when its close reaches the next day's open. A bar of a day
+/// or more is both (`pin:04-session-first-last`, CI-041, fixture D058).
+pub fn bi_session_edge<const LAST: bool>(
+    f: &mut Frame<'_>,
+    _: SiteId,
+    args: &[u16],
+) -> Result<(), FaultKind> {
+    if args.len() != 1 {
+        return Err(FaultKind::Internal);
+    }
+    let (open, close) = (f.bar().open_ms, f.bar().close_ms);
+    let day = barclock::open_ms(open, 86_400);
+    let r = if LAST {
+        close >= day + 86_400_000
+    } else {
+        open - day < close - open
+    };
+    f.set_bool_arg(args[0], r);
+    Ok(())
+}
+
 /// A `series` timeframe string at run time, in seconds: `""` → the chart's; na, a string
 /// outside the grammar, or one off the bar clock → `None` (na, §4.12).
 #[inline]

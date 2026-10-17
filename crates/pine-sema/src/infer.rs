@@ -1401,6 +1401,42 @@ impl<'a, 's> Infer<'a, 's> {
         Ex::of(TypeQ::scalar(Ty::Bool, join(l.t.qual, r.t.qual)), k)
     }
 
+    /// A numeric literal's value, under any number of unary signs (the lexer keeps the sign as a
+    /// `Unary`; parentheses make no node): `0`, `-0.0`, `-(1)`. Anything else is `None`
+    /// (pin:02-div-zero-literal, pin:02-negative-qty-scope).
+    fn lit_num(&self, x: NodeId) -> Option<f64> {
+        match self.ast().node(x) {
+            Node::IntLit { value } => Some(value as f64),
+            Node::FloatLit { value } => Some(value),
+            Node::Unary {
+                op: UnOp::Neg,
+                operand,
+            } => self.lit_num(operand).map(|v| -v),
+            Node::Unary {
+                op: UnOp::Pos,
+                operand,
+            } => self.lit_num(operand),
+            _ => None,
+        }
+    }
+
+    /// The divisor of a `/` (`Binary`) or `/=` (`Assign`) node `n` when it is a literal.
+    fn divisor_lit(&self, n: NodeId) -> Option<f64> {
+        match self.ast().node(n) {
+            Node::Binary { rhs, .. } => self.lit_num(rhs),
+            Node::Assign { value, .. } => self.lit_num(value),
+            _ => None,
+        }
+    }
+
+    /// A call argument's literal value (a `NamedArg`'s value or a positional argument).
+    fn arg_lit(&self, a: NodeId) -> Option<f64> {
+        match self.ast().node(a) {
+            Node::NamedArg { value, .. } => self.lit_num(value),
+            _ => self.lit_num(a),
+        }
+    }
+
     /// Every binary operator but `and` / `or` (§4.4.3).
     fn arith(&mut self, n: NodeId, op: BinOp, l: Ex, r: Ex) -> Ex {
         if l.bad || r.bad {
@@ -1437,17 +1473,15 @@ impl<'a, 's> Infer<'a, 's> {
         let num = |t: Ty| matches!(t, Ty::Int | Ty::Float);
         let (lt, rt) = (l.t.ty, r.t.ty);
         let same = (l.t.ty, l.t.a, l.t.b) == (r.t.ty, r.t.a, r.t.b);
-        // pin:02-div-zero-literal — R-P2 (F007): TradingView refuses a `/` whose divisor is a
-        // `const` that folds to zero at compile time ("Division by zero"), whatever the
-        // dividend; `/=` is the same operator. `%` by a constant zero is not refused (F010,
-        // captured: `syn % 0.0` runs and reads `na`), nor is a divisor of any weaker qualifier
-        // (an `input` keeps its folded default but is not constant).
-        if op == BinOp::Div
-            && num(lt)
-            && num(rt)
-            && r.t.qual == Qual::Const
-            && num_k(r.k) == Some(0.0)
-        {
+        // pin:02-div-zero-literal — R-P2 (CI-001 / F007): TradingView refuses a `/` whose
+        // divisor is a numeric LITERAL zero ("Division by zero"), whatever the dividend; `/=` is
+        // the same operator. Scope narrowed in r27b to what TradingView was seen to refuse
+        // (`/ 0`, `/ 0.0`, `/= 0`; a sign or parentheses around the literal count — the sign is
+        // a `Unary`, parentheses make no node): a constant zero reached through a variable or
+        // arithmetic (`/ (2 - 2)`, `z = 0` · `/ z`) still compiles until a paste shows otherwise
+        // (a false refusal loses a script TradingView runs). `%` by zero is not refused (F010,
+        // captured: `syn % 0.0` runs and reads `na`).
+        if op == BinOp::Div && num(lt) && num(rt) && self.divisor_lit(n) == Some(0.0) {
             return self.refuse(ReasonCode::TypeMismatch, at, "Division by zero".to_owned());
         }
         let out = match op {
@@ -1810,18 +1844,24 @@ impl<'a, 's> Infer<'a, 's> {
                     let msg = format!("`{full}` must be a top-level statement of the script");
                     return self.refuse(ReasonCode::QualifierTooWeak, at, msg);
                 }
-                // pin:02-negative-qty-scope — R-P2 (E056): TradingView refuses a `const` `qty`
-                // below zero at compile ("The "strategy.entry()" function cannot have a negative
-                // "qty" value. Use a positive value in the function call."). Captured for
-                // `strategy.entry`; `strategy.order` (the other order-opening call, same `qty`
-                // doc) reads the same. `strategy.exit` / `strategy.close` are not refused until
-                // a capture shows it (a false refusal would lose a script TradingView runs).
-                if full == "strategy.entry" || full == "strategy.order" {
+                // pin:02-negative-qty-scope — R-P2 (CI-002 / E056): TradingView refuses a
+                // negative LITERAL `qty` of `strategy.entry` at compile ("The "strategy.entry()"
+                // function cannot have a negative "qty" value. Use a positive value in the
+                // function call."). Scope narrowed in r27b to what was seen: `strategy.entry`
+                // only, a literal under a sign (`qty = -1`, `-2.5`); `strategy.order` and a
+                // constant reached through a variable or arithmetic compile until a paste shows
+                // otherwise (a false refusal would lose a script TradingView runs).
+                if full == "strategy.entry" {
                     let ps = pine_spec::params(ov);
-                    for (k, a) in argv.iter().enumerate() {
+                    let nodes: &[NodeId] = match self.ast().node(n) {
+                        Node::Call { args, .. } if args.len() == argv.len() => args,
+                        _ => &[],
+                    };
+                    for k in 0..argv.len() {
                         let Some(r) = p.bound[k] else { continue };
-                        let neg = num_k(a.k).is_some_and(|q| q < 0.0);
-                        if ps[r as usize].name.as_str() == "qty" && a.t.qual == Qual::Const && neg {
+                        let lit = nodes.get(k).and_then(|&a| self.arg_lit(a));
+                        let neg = lit.is_some_and(|q| q < 0.0);
+                        if ps[r as usize].name.as_str() == "qty" && neg {
                             let msg = format!(
                                 "The \"{full}()\" function cannot have a negative \"qty\" value. \
                                  Use a positive value in the function call."

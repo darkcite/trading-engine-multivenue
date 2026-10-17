@@ -7,7 +7,7 @@
 use crate::args::out1;
 use crate::naf::fdiv;
 use crate::state::{
-    mono_push, mono_query, win_at, win_push, win_repoint, Mono2Hdr, MonoCell, MonoHdr, WinHdr,
+    mono_push, mono_query, win_at, win_push, win_repoint, Mono2Hdr, MonoCell, MonoHdr, Prev, WinHdr,
 };
 use crate::sw;
 use pine_ir::{abi, argwin, FaultKind, SiteId};
@@ -22,7 +22,42 @@ fn na_div0(f: &Frame<'_>) -> bool {
     sw::pick(DIV0, f.dialect()) == swr::FLOAT_DIV_ZERO_NA
 }
 
-/// Window variance over `[src, len, biased, out]`: `sum2/n − mean²`, clamped at 0 before any
+/// Neumaier's compensated running sum: `(sum, compensation)`; the value is `sum + comp`.
+#[inline(always)]
+fn neumaier(acc: (f64, f64), x: f64) -> (f64, f64) {
+    let (s, c) = acc;
+    let t = s + x;
+    let c = if s.abs() >= x.abs() {
+        c + ((s - t) + x)
+    } else {
+        c + ((x - t) + s)
+    };
+    (t, c)
+}
+
+/// TradingView's moments of the newest `len` values (`h.n >= len`): a fresh pass each bar, oldest
+/// value first, each sum Neumaier-compensated, squares unfused — `mean = (Σ x) / n`,
+/// `var = (Σ x·x) / n − mean²` (`pin:04-var-fresh-sum`, CI-015 / CI-015a: bit-exact on every
+/// captured row of B025 B030 (both columns) B077 (3 columns) B078 B103 — 8 columns, 1024 rows;
+/// the header's rolling sums and a plain fresh sum both drift in the last digits from row 15;
+/// an exactly rounded sum (`fsum`) also matches and is not separated by the capture). The
+/// header's rolling sums still track the window; only the reported moments come from this pass.
+#[inline(always)]
+fn fresh_moments(h: &WinHdr, ring: &[f64], len: u32) -> (f64, f64) {
+    let (mut s, mut s2) = ((0.0f64, 0.0f64), (0.0f64, 0.0f64));
+    let mut k = len;
+    while k > 0 {
+        k -= 1;
+        let x = win_at(h, ring, k);
+        s = neumaier(s, x);
+        s2 = neumaier(s2, x * x);
+    }
+    let n = len as f64;
+    let mean = (s.0 + s.1) / n;
+    (mean, (s2.0 + s2.1) / n - mean * mean)
+}
+
+/// Window variance over `[src, len, biased, out]`: `sum2/n − mean²` (`fresh_moments`), clamped at 0 before any
 /// `sqrt` (§4.5 item 3); `biased == false` scales by `n/(n−1)`. `skip` na (W5/U18). An na
 /// `biased` (v5) yields na (`pin:04-biased-na`).
 #[inline(always)]
@@ -52,8 +87,7 @@ fn variance(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(f64, u16),
         return Ok((f64::NAN, dst));
     }
     let n = len as f64;
-    let mean = h.sum / n;
-    let v = h.sum2 / n - mean * mean;
+    let (_, v) = fresh_moments(h, ring, len);
     let v = if v > 0.0 { v } else { 0.0 };
     let v = if biased {
         v
@@ -147,36 +181,104 @@ fn bb_core(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(f64, f64), 
     if h.n < len {
         return Ok((f64::NAN, f64::NAN));
     }
-    let n = len as f64;
-    let m = h.sum / n;
-    let v = h.sum2 / n - m * m;
+    let (m, v) = fresh_moments(h, ring, len);
     Ok((m, if v > 0.0 { v.sqrt() } else { 0.0 }))
 }
 
 /// `ta.bb(series, length, mult) -> (middle, upper, lower)` — window `[src, len, mult, mid, up,
-/// lo]`: `sma ± mult × stdev`.
+/// lo]`: `sma ± mult × stdev`, unfused as the reference writes it (`dev = mult × stdev`,
+/// `basis ± dev`; `pin:04-var-fresh-sum`, CI-015, fixture B077).
 pub fn bi_ta_bb(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 6 {
         return Err(FaultKind::Internal);
     }
     let mult = f.f64_arg(args[2]);
     let (mid, sd) = bb_core(f, site, args)?;
+    let dev = mult * sd;
     f.set_f64_arg(args[3], mid);
-    f.set_f64_arg(args[4], mult.mul_add(sd, mid));
-    f.set_f64_arg(args[5], (-mult).mul_add(sd, mid));
+    f.set_f64_arg(args[4], mid + dev);
+    f.set_f64_arg(args[5], mid - dev);
     Ok(())
 }
 
-/// `ta.bbw(series, length, mult)` = `(upper − lower) / middle`.
+/// `ta.bbw(series, length, mult)` = the reference's own Pine twin, unfused as written:
+/// `dev = mult × stdev`, `(((basis + dev) − (basis − dev)) / basis) × 100` — a percentage
+/// (`pin:04-bbw-percent`, CI-015a, fixture B078: TradingView 64.43888212862731 at row 13 where
+/// the plain ratio gave 0.644…).
 pub fn bi_ta_bbw(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 4 {
         return Err(FaultKind::Internal);
     }
     let mult = f.f64_arg(args[2]);
     let (mid, sd) = bb_core(f, site, args)?;
-    let (up, lo) = (mult.mul_add(sd, mid), (-mult).mul_add(sd, mid));
-    f.set_f64_arg(args[3], (up - lo) / mid);
+    let dev = mult * sd;
+    f.set_f64_arg(args[3], ((mid + dev) - (mid - dev)) / mid * 100.0);
     Ok(())
+}
+
+/// `ta.max(source)` (`MAX`) / `ta.min(source)` — block `Prev` (`v` = the extreme so far,
+/// `primed` = a non-na value was seen): the all-time extreme of the non-na values from the first
+/// bar; na until the first one (`skip`, warm-up 1). CI-013, fixtures B092 B094.
+pub fn bi_ta_alltime<const MAX: bool>(
+    f: &mut Frame<'_>,
+    site: SiteId,
+    args: &[u16],
+) -> Result<(), FaultKind> {
+    if args.len() != 2 {
+        return Err(FaultKind::Internal);
+    }
+    let src = f.f64_arg(args[0]);
+    let v = {
+        let s = f.state::<Prev>(site);
+        if !src.is_nan() && (s.primed == 0 || (MAX && src > s.v) || (!MAX && src < s.v)) {
+            s.v = src;
+            s.primed = 1;
+        }
+        if s.primed == 0 {
+            f64::NAN
+        } else {
+            s.v
+        }
+    };
+    f.set_f64_arg(args[1], v);
+    Ok(())
+}
+
+/// `ta.range(source, length)` = `highest − lowest` of the newest `length` non-na values over a
+/// `Mono2Hdr` block (one deque per extreme, as `ta.stoch`); na until `length` are accepted
+/// (`skip`). The `int` overload (`source` and the result in the i64 lane) runs the same deques
+/// on the exact f64 image of each value (|v| < 2^53) and writes the exact difference back.
+/// CI-013, fixture B098.
+pub fn bi_ta_range(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 3 {
+        return Err(FaultKind::Internal);
+    }
+    let int = argwin::is_i64(args[0]);
+    let src = if int {
+        f.i64_arg(args[0]).map_or(f64::NAN, |v| v as f64)
+    } else {
+        f.f64_arg(args[0])
+    };
+    let Some(len) = f.i64_arg(args[1]) else {
+        put_num(f, args[2], f64::NAN);
+        return Ok(());
+    };
+    let v = match hilo(f, site, src, src, len)? {
+        Some((hh, ll)) => hh - ll,
+        None => f64::NAN,
+    };
+    put_num(f, args[2], v);
+    Ok(())
+}
+
+/// Write `v` (NaN = na) to output `e` in its lane (an `int` output holds an exact difference).
+#[inline(always)]
+fn put_num(f: &mut Frame<'_>, e: u16, v: f64) {
+    if argwin::is_i64(e) {
+        f.set_i64_arg(e, if v.is_nan() { None } else { Some(v as i64) });
+    } else {
+        f.set_f64_arg(e, v);
+    }
 }
 
 /// `ta.linreg(source, length, offset)` — block `WinHdr` + `[ring | x column]`: least squares over

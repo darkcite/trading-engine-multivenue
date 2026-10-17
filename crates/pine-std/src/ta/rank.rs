@@ -144,18 +144,30 @@ fn median_lower(w: &mut [f64], _: f64) -> f64 {
     *v
 }
 
-/// The linearly interpolated `p`-th percentile of `w` (non-empty, no NaN): the reference says
-/// only "linear interpolation between the two nearest ranks", so the common C = 1 definition
-/// (Excel `PERCENTILE.INC`, NumPy `linear`, Hyndman–Fan type 7) is used: `x = p · (N − 1) / 100`,
+/// The linearly interpolated `p`-th percentile of `w` (non-empty, no NaN): the reference's
+/// "linear interpolation between the two nearest ranks" is the Wikipedia method of that name in
+/// its first variant, C = 1/2 (Hyndman–Fan type 5): the 0-based rank `x = p · N / 100 − 1/2`,
+/// clamped to `[0, N − 1]` (below the first rank the smallest value, above the last the largest),
 /// `k = ⌊x⌋`, `v = w₍ₖ₎ + (x − k) · (w₍ₖ₊₁₎ − w₍ₖ₎)` over the ascending order statistics
-/// (`pin:04-percentile-linear-provisional`, operator ruling 2026-10-16). A na `p` or one outside
-/// `0..=100` → na (`pin:04-percentile-range`).
+/// (`pin:04-percentile-linear-c-half`, CI-015b, fixture B096). Evidence: B096 (`p = 2`, `N = 14`)
+/// is the window minimum on all 128 captured rows (row 13: 1089.3); C = 1 interpolates there
+/// (1095.3892) and is refuted; C = 0 also clamps at `p = 2` and is not separated by the capture
+/// (a fixture at `p = 25` would separate them: C = 1/2 rank 3.0, C = 0 rank 2.75). A na `p` or
+/// one outside `0..=100` → na (`pin:04-percentile-range`).
 fn linear(w: &mut [f64], p: f64) -> f64 {
     if !(0.0..=100.0).contains(&p) {
         return f64::NAN;
     }
     let n = w.len();
-    let x = (p * (n - 1) as f64) / 100.0;
+    let x = (p * n as f64) / 100.0 - 0.5;
+    let last = (n - 1) as f64;
+    let x = if x < 0.0 {
+        0.0
+    } else if x > last {
+        last
+    } else {
+        x
+    };
     let k = x.floor() as usize;
     debug_assert!(k < n);
     let (_, lo, hi) = w.select_nth_unstable_by(k, cmp_na_last);

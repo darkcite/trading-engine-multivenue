@@ -457,3 +457,103 @@ fn summary_against_run_record() {
         Some(TradeDiv::Field { field: "net", .. })
     ));
 }
+
+/// CI-033 / CI-034 harness part (`pin:06-trade-money-units`, `pin:06-trade-adverse-sign`, E005,
+/// E113): the adverse excursion compares in TradingView's sign (`-1853.7` against our unsigned
+/// magnitude), and a divergence shows ours in TradingView's units.
+#[test]
+fn trades_compare_money_in_tv_units_and_sign() {
+    use pine_conformance::trades::render_scaled;
+    assert_eq!(render_scaled(1_853_700_000, 6), "1853.7");
+    assert_eq!(render_scaled(-1_853_700_000, 6), "-1853.7");
+    assert_eq!(render_scaled(200_000_000, 6), "200");
+    assert_eq!(render_scaled(77_248_300_000, 6), "77248.3");
+    assert_eq!(render_scaled(-4_700_000_000_000, 12), "-4.7");
+    assert_eq!(render_scaled(0, 6), "0");
+    let syms = SymTable::new();
+    let mut a = rec(0, 100 * 1_000_000, 1_000_000, 1_000_000_000_000, 0);
+    a.max_drawdown_1e6 = 1_853_700_000;
+    a.max_runup_1e6 = 200_000_000;
+    let mut e = row(1, 0, "100", "1.00");
+    e.drawdown = Some(d("-1853.7"));
+    e.runup = Some(d("200"));
+    let sig = SignalTable::default();
+    assert_eq!(
+        compare_trades(&[e.clone()], &[a], &syms, &sig, PnlBasis::Net),
+        None
+    );
+    // A real value difference (E011: TV −772.5, ours 425.5) still differs, printed in TV units.
+    a.max_drawdown_1e6 = 425_500_000;
+    e.drawdown = Some(d("-772.5"));
+    assert_eq!(
+        compare_trades(&[e.clone()], &[a], &syms, &sig, PnlBasis::Net),
+        Some(TradeDiv::Field {
+            n: 1,
+            field: "drawdown",
+            expected: "-772.5".into(),
+            actual: "-425.5".into(),
+        })
+    );
+    // E113: entry_px "77248.2" against ours 77248.3 — the text is in TradingView's units.
+    let b = rec(0, 77_248_300_000, 1_000_000, 1_000_000_000_000, 0);
+    let p = row(1, 0, "77248.2", "1.00");
+    assert_eq!(
+        compare_trades(&[p], &[b], &syms, &sig, PnlBasis::Net),
+        Some(TradeDiv::Field {
+            n: 1,
+            field: "entry_px",
+            expected: "77248.2".into(),
+            actual: "77248.3".into(),
+        })
+    );
+}
+
+/// CI-029 (`pin:06-trade-trim-kept`, E109): TradingView keeps the newest trades — its first kept
+/// row is trade `evicted + 1`; `cum_pnl` runs on from the dropped trades' P&L; on a SYN tape only
+/// the kept list's shape compares.
+#[test]
+fn trades_trimmed_list_compares_the_kept_end() {
+    use pine_conformance::trades::{compare_kept_shape, compare_trades_kept};
+    let syms = SymTable::new();
+    let sig = SignalTable::default();
+    let a = [rec(0, 100 * 1_000_000, 1_000_000, 1_000_000_000_000, 0)];
+    let mut e = row(4, 0, "100", "1.00");
+    e.cum_pnl = Some(d("6.00"));
+    // Three trades dropped, worth 5.00 net: the kept trade #4 carries cum 6.00.
+    let seed = 5_000_000_000_000;
+    assert_eq!(
+        compare_trades_kept(&[e.clone()], &a, 3, seed, &syms, &sig, PnlBasis::Net),
+        None
+    );
+    assert!(matches!(
+        compare_trades_kept(&[e.clone()], &a, 3, 0, &syms, &sig, PnlBasis::Net),
+        Some(TradeDiv::Field {
+            field: "cum_pnl",
+            ..
+        })
+    ));
+    // The oldest end kept instead (#1 after three dropped) is the `n` field.
+    let first = row(1, 0, "100", "1.00");
+    assert!(matches!(
+        compare_trades_kept(&[first.clone()], &a, 3, seed, &syms, &sig, PnlBasis::Net),
+        Some(TradeDiv::Field { field: "n", .. })
+    ));
+    // Shape only (E109 on SYN bars): numbering and the closed count, never prices.
+    let far = row(4, 999, "65310.4", "128.4");
+    assert_eq!(compare_kept_shape(&[far.clone()], &a, 3), None);
+    assert!(matches!(
+        compare_kept_shape(&[first], &a, 3),
+        Some(TradeDiv::Field { field: "n", .. })
+    ));
+    let mut open = a[0];
+    open.flags |= trade_flag::OPEN;
+    assert!(compare_kept_shape(&[far], &[a[0], open, open], 3).is_none());
+    assert!(matches!(
+        compare_kept_shape(&[row(4, 0, "1", "1"), row(5, 0, "1", "1")], &a, 3),
+        Some(TradeDiv::Count {
+            expected: 2,
+            actual: 1,
+            ..
+        })
+    ));
+}

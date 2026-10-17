@@ -571,6 +571,12 @@ const fn build() -> Built {
         ov::MATH_ROUND_I,
         row(ov::MATH_ROUND_I, math::bi_round, 1, 0, Blk::None),
     );
+    // CI-013 (F016): `math.round(number, precision)`.
+    put(
+        &mut b,
+        ov::MATH_ROUND_F,
+        row(ov::MATH_ROUND_F, math::bi_round_prec, 1, 0, Blk::None),
+    );
     let mt = math::bi_round_to_mintick;
     put(
         &mut b,
@@ -801,6 +807,27 @@ const fn build() -> Built {
         &mut b,
         ov::TA_WPR,
         row(skip(ov::TA_WPR), w::bi_ta_wpr, 3, st, MONO2),
+    );
+    // CI-013 (B092 B094 B098): the all-time extremes and `ta.range`.
+    put(
+        &mut b,
+        ov::TA_MAX,
+        row(skip(ov::TA_MAX), w::bi_ta_alltime::<true>, 1, st, PREV),
+    );
+    put(
+        &mut b,
+        ov::TA_MIN,
+        row(skip(ov::TA_MIN), w::bi_ta_alltime::<false>, 1, st, PREV),
+    );
+    put(
+        &mut b,
+        ov::TA_RANGE_F,
+        row(skip(ov::TA_RANGE_F), w::bi_ta_range, 3, st, MONO2),
+    );
+    put(
+        &mut b,
+        ov::TA_RANGE_I,
+        row(skip(ov::TA_RANGE_I), w::bi_ta_range, 3, st, MONO2),
     );
     use ta::osc as o;
     put(
@@ -2066,6 +2093,30 @@ const fn build() -> Built {
         ov::TIMENOW_VAR,
         row(ov::TIMENOW_VAR, tm::bi_timenow, 1, bf::NEEDS_CTX, Blk::None),
     );
+    // CI-013 (F075 F076 F092): `timeframe.from_seconds`.
+    put(
+        &mut b,
+        ov::TIMEFRAME_FROM_SECONDS,
+        row(
+            ov::TIMEFRAME_FROM_SECONDS,
+            tm::bi_tf_from_seconds,
+            2,
+            bf::STR_ALLOC,
+            Blk::None,
+        ),
+    );
+    // CI-041 (D058): the session's first / last bar.
+    let (sf, sl) = (tm::bi_session_edge::<false>, tm::bi_session_edge::<true>);
+    put(
+        &mut b,
+        ov::SESSION_ISFIRSTBAR_VAR,
+        row(ov::SESSION_ISFIRSTBAR_VAR, sf, 1, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::SESSION_ISLASTBAR_VAR,
+        row(ov::SESSION_ISLASTBAR_VAR, sl, 1, 0, Blk::None),
+    );
     put(
         &mut b,
         ov::TIME_TRADINGDAY_VAR,
@@ -2971,6 +3022,18 @@ const fn build() -> Built {
         &mut b,
         ov::MAP_PUT_ALL,
         row(ov::MAP_PUT_ALL, cm::bi_map_put_all, 8, SP, Blk::None),
+    );
+    // CI-004 / F085: `runtime.error` — also sema's run-time `for` step check (pin:02-for-step).
+    put(
+        &mut b,
+        ov::RUNTIME_ERROR,
+        row(
+            ov::RUNTIME_ERROR,
+            crate::runtime::bi_runtime_error,
+            1,
+            0,
+            Blk::None,
+        ),
     );
     // The bar's prelude series (`ValueSrc::Call`): the reference's literal definitions.
     use crate::barvar as bv;

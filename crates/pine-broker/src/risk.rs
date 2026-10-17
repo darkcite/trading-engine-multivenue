@@ -7,7 +7,8 @@
 //! the detecting tick, flagged `RISK_FLATTEN`). `allow_entry_in` / `max_position_size` are §4.7.5's.
 
 use crate::money::pct_1e12;
-use pine_ir::{decl_flag, BrokerCounters, StrategyDecl};
+use crate::signal;
+use pine_ir::{decl_flag, BrokerCounters, StrKey, StrategyDecl};
 
 /// No halt.
 const HALT_NONE: u8 = 0;
@@ -30,6 +31,8 @@ pub(crate) struct Risk {
     fills_today: u32,
     loss_streak: u32,
     halt: u8,
+    /// The last trip's exit-order id (`pin:05-exit-signal-text`, CI-032).
+    trip: StrKey,
 }
 
 impl Risk {
@@ -48,7 +51,13 @@ impl Risk {
             fills_today: 0,
             loss_streak: 0,
             halt: HALT_NONE,
+            trip: StrKey::NONE,
         }
+    }
+
+    /// The exit-order id TradingView gives the last trip's flatten (`crate::signal`).
+    pub(crate) fn trip_signal(&self) -> StrKey {
+        self.trip
     }
 
     /// While halted, only `Cancel` / `CancelAll` intents commit.
@@ -86,6 +95,7 @@ impl Risk {
             && self.loss_streak >= self.max_cons_loss_days
         {
             counters.risk_trips_cons_loss_days += 1;
+            self.trip = signal::RISK_CONS_LOSS_DAYS;
             self.halt = HALT_FOREVER;
             return true;
         }
@@ -115,6 +125,7 @@ impl Risk {
             };
             if peak_1e12.saturating_sub(equity_1e12) >= bound {
                 counters.risk_trips_drawdown += 1;
+                self.trip = signal::RISK_MAX_DRAWDOWN;
                 self.halt = HALT_FOREVER;
                 return true;
             }
@@ -130,6 +141,7 @@ impl Risk {
             };
             if self.day_open_equity_1e12.saturating_sub(equity_1e12) >= bound {
                 counters.risk_trips_intraday_loss += 1;
+                self.trip = signal::RISK_INTRADAY_LOSS;
                 self.halt = HALT_DAY;
                 return true;
             }
@@ -137,6 +149,7 @@ impl Risk {
         if self.max_intraday_filled_orders > 0 && self.fills_today > self.max_intraday_filled_orders
         {
             counters.risk_trips_intraday_orders += 1;
+            self.trip = signal::RISK_INTRADAY_ORDERS;
             self.halt = HALT_DAY;
             return true;
         }

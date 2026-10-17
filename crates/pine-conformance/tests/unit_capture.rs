@@ -875,7 +875,8 @@ fn capture_distil_rt_keeps_confirmed_realtime_rows() {
         "{err}"
     );
     // C045 (`rt … open`) carries no rt / done plot (pin:06-distil-rt-noflags): its last 65 rows,
-    // the open realtime bar included, keyed 0..65 (history 64 + realtime 1).
+    // the open realtime bar included, keyed 64..129 (history 128 + realtime 1; CI-028,
+    // pin:06-c045-window: no compared row is the chart's first bar).
     let c45 = "f_C045_isconfirmed,f_C045_islast,f_C045_isnew,f_C045_isrealtime,f_C045_ishistory,\
                f_C045_isfirst,f_C045_islch";
     let mut rows45: Vec<(i64, String)> = (0..69)
@@ -892,10 +893,10 @@ fn capture_distil_rt_keeps_confirmed_realtime_rows() {
     )
     .unwrap();
     let f = load(&root, "C045");
-    assert_eq!(f.bars, Some(65));
+    assert_eq!(f.bars, Some(129));
     let r = series(&f);
     assert_eq!(r.len(), 65);
-    assert_eq!((r[0].key, r[64].key), (0, 64));
+    assert_eq!((r[0].key, r[64].key), (64, 128));
     assert_eq!((text(&r[64], 0), text(&r[64], 3)), ("0", "1"));
     assert_eq!((text(&r[63], 0), text(&r[63], 3)), ("1", "0"));
     // Too few rows for the window.

@@ -649,7 +649,7 @@
     },
     {
       "id": "MG-12",
-      "what": "more than 9 000 orders: v5 raises a runtime error and halts, v6 trims (neither broker caps orders; fixtures stay under 9 000)",
+      "what": "more than 9 000 orders: v5 raises a runtime error and halts, v6 trims; the TV broker faults a v5 run at the 9 001st order created (ScriptRefused, RE10138; pin:05-v5-order-limit, CI-005 / E110), the native broker does not cap",
       "mech": "not_emulated",
       "switch": "",
       "subjects": [],
@@ -42546,7 +42546,9 @@
           ],
           "ret_qual": "join",
           "abi": "call",
-          "bf": [],
+          "bf": [
+            "str_alloc"
+          ],
           "state": {
             "k": "none"
           },

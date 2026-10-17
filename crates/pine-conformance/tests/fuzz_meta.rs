@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use pine_conformance::fuzz::ast::{self, Expr, HistRef, Program, Stmt};
 use pine_conformance::fuzz::diff::{Harness, Interleaved, ModeVsMode};
 use pine_conformance::fuzz::grammar::{
-    alphabet, alphabet_for, FUZZ_ADMIT_V2, FUZZ_DENY, FUZZ_DENY_NS,
+    alphabet, alphabet_for, FUZZ_ADMIT_V2, FUZZ_DENY, FUZZ_DENY_NS, FUZZ_SERVED_V3,
 };
 use pine_conformance::fuzz::{
     generate, shrink, GrammarConfig, Predicate, Profile, ShrinkBudget, Signature, GRAMMAR_VERSION,
@@ -66,17 +66,22 @@ fn generate_is_pure_over_10k_seeds() {
 const GRAMMAR_1_SAMPLE_SHA256: &str =
     "9f2142e0460d9d278b3597dc6beaf456e2e0f1c6716104e5b1f99ac8e52cbacc";
 
-fn grammar_1_sample_digest() -> String {
+/// The grammar-2 sample digest, the same sample: recorded at r27 HEAD (`4d917db4`), before
+/// pine-std's r27b rows grew the alphabet (they landed as grammar 3, `FUZZ_SERVED_V3`).
+const GRAMMAR_2_SAMPLE_SHA256: &str =
+    "865785be7d2deaa8360bf41cd2d2262ba8f828fe3705ae2d7130eda4ca398705";
+
+fn grammar_sample_digest(v: u16) -> String {
     let mut all = String::new();
     for d in [Dialect::V5, Dialect::V6] {
         let c = GrammarConfig {
-            grammar_version: 1,
+            grammar_version: v,
             ..cfg(d)
         };
         let far = [4u64, 692, 8_817_263, 1 << 40, u64::MAX];
         for s in (0..500u64).chain(far) {
             let g = generate(s, &c);
-            assert_eq!(g.grammar_version, 1, "seed {s}");
+            assert_eq!(g.grammar_version, v, "seed {s}");
             all.push_str(&g.source);
             all.push('\0');
         }
@@ -92,9 +97,46 @@ fn grammar_1_sample_digest() -> String {
 /// grammar-1 rows replay unchanged; `pin:06-fuzz-grammar-version-gate`).
 #[test]
 fn grammar_1_seeds_are_byte_identical_under_grammar_2() {
-    let got = grammar_1_sample_digest();
+    let got = grammar_sample_digest(1);
     println!("grammar-1 sample digest {got}");
     assert_eq!(got, GRAMMAR_1_SAMPLE_SHA256);
+}
+
+/// §4.8.5 again for grammar 2: pine-std's newly served rows (r27b) grow only grammar 3's alphabet,
+/// so every grammar-2 program stays byte-identical (`pin:06-fuzz-grammar-version-gate`).
+#[test]
+fn grammar_2_seeds_are_byte_identical_under_grammar_3() {
+    let got = grammar_sample_digest(2);
+    println!("grammar-2 sample digest {got}");
+    assert_eq!(got, GRAMMAR_2_SAMPLE_SHA256);
+}
+
+/// Grammar 3 (r27b): exactly the rows pine-std began serving join; grammars 1–2 never draw them,
+/// and grammar 3's alphabet is grammar 2's plus those rows, in overload order.
+#[test]
+fn grammar_3_admits_the_rows_served_in_r27b() {
+    for d in [Dialect::V5, Dialect::V6] {
+        let c = cfg(d);
+        assert_eq!(c.grammar_version, 3);
+        let ovs = |v: u16| -> Vec<u16> {
+            alphabet_for(v, d, c.active_tiers)
+                .iter()
+                .map(|b| b.ov)
+                .collect()
+        };
+        let (v1, v2, v3) = (ovs(1), ovs(2), ovs(3));
+        for o in FUZZ_SERVED_V3 {
+            assert!(
+                !v1.contains(&o.0) && !v2.contains(&o.0),
+                "{o:?} before grammar 3"
+            );
+            assert!(v3.contains(&o.0), "{o:?} missing from grammar 3");
+        }
+        let mut want = v2.clone();
+        want.extend(FUZZ_SERVED_V3.iter().map(|o| o.0));
+        want.sort_unstable();
+        assert_eq!(v3, want);
+    }
 }
 
 /// Counts `input` calls in `e`, asserting each takes one literal `defval`.
@@ -154,7 +196,7 @@ fn stmt_inputs(list: &[Stmt], s: u64) -> u32 {
 fn grammar_2_admits_input_with_a_constant_defval_only() {
     for d in [Dialect::V5, Dialect::V6] {
         let c = cfg(d);
-        assert_eq!(c.grammar_version, 2);
+        assert!(c.grammar_version >= 2);
         let rows = |v: u16| -> Vec<(u16, bool)> {
             alphabet_for(v, d, c.active_tiers)
                 .iter()
@@ -512,6 +554,8 @@ const MODE_FINDINGS: &[(&str, u16, u64)] = &[];
 /// `ta.highestbars`/`ta.lowestbars` now write their `int` result via `set_i64_arg`; seed 4,
 /// B088/B091) and "!a.is_nan() && !b.is_nan()" (pine-std `change_pairs`: an `inf − inf` change
 /// pair is skipped, `pin:04-change-pair-nan`; seed 692 `ta.cmo(math.exp(syni), 12)`).
+/// Fixed r27b, never tabled: "!v.is_nan()" (pine-std `bi_ta_tsi`: an `∞ − ∞` change is not fed to
+/// the smoothers, `pin:04-ta-composed`; grammar-3 seeds 286 and 456, `ta.tsi(… ta.cum(math.exp …))`).
 const KNOWN_PANICS: &[(&str, &str)] = &[];
 
 /// `(programs run, divergent seeds, panicking seeds with their message)`.
