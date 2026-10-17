@@ -593,3 +593,48 @@ fn the_tallies_reach_the_metrics_block_once_a_second() {
     b.arm.pump(1 + PUBLISH_EVERY_NS);
     assert_eq!(s.arm(0), 2);
 }
+
+/// PM15-6f: legs restored at boot are valued at cost (a settled one as it
+/// was left, its redemption not asked again by the arm); a leg pm-gw
+/// expires is booked at 0, its redemption already asked.
+#[test]
+fn restored_legs_are_valued_at_cost_and_an_expired_one_at_zero() {
+    use crate::held::{HeldLeg, HELD_OPEN, HELD_WON};
+    let mut b = bench();
+    let mut open = HeldLeg::EMPTY;
+    open.instance = inst(0);
+    open.state = HELD_OPEN;
+    open.shares_1e6 = 100_000_000;
+    open.cost_1e6 = 93_000_000;
+    let mut won = open;
+    won.instance = inst(1);
+    won.state = HELD_WON;
+    won.cost_1e6 = 50_000_000;
+    b.arm.restore_legs(&[open, won]);
+    assert_eq!(b.arm.counters().legs_restored, 2);
+    read(
+        &mut b,
+        1_000_000_000,
+        &[(inst(0), 0, 100_000_000), (inst(1), 0, 100_000_000)],
+    );
+    b.arm.on_idle();
+    assert_eq!(
+        b.arm.anchor_1e6(),
+        Some(1_143_000_000),
+        "pUSD and both legs at cost"
+    );
+    assert!(
+        cmds(&mut b).is_empty(),
+        "the won leg was asked before the restart"
+    );
+    gw(&mut b, PmEvt::about(EVT_EXPIRED, u64::from(inst(0)) << 8));
+    read(
+        &mut b,
+        1_000_000_000,
+        &[(inst(0), 0, 100_000_000), (inst(1), 0, 100_000_000)],
+    );
+    b.arm.on_idle();
+    assert_eq!(b.arm.counters().legs_expired, 1);
+    assert_eq!(b.arm.halt_signal().pnl_delta_usd_1e6, -93_000_000);
+    assert!(cmds(&mut b).is_empty(), "its redemption is pm-gw's already");
+}

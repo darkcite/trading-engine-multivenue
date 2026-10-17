@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicI64, Ordering};
 pub const PUBLISH_EVERY_NS: u64 = 1_000_000_000;
 
 /// The arm's words: its tallies, then [`ARM_LEVELS`] levels.
-pub const ARM_WORDS: usize = 30;
+pub const ARM_WORDS: usize = 32;
 /// The arm's levels (the last words): halted, reconciled, the account's
 /// worth, the session anchor, the drift.
 pub const ARM_LEVELS: usize = 5;
@@ -44,6 +44,8 @@ pub const ARM_NAMES: [&str; ARM_WORDS] = [
     "legs_redeemed",
     "legs_lost",
     "redeem_asks",
+    "legs_expired",
+    "legs_restored",
     "ledger_full",
     "halted",
     "reconciled",
@@ -54,7 +56,7 @@ pub const ARM_NAMES: [&str; ARM_WORDS] = [
 
 /// pm-gw's words: its tallies and its redeemer's, then [`GW_LEVELS`]
 /// level.
-pub const GW_WORDS: usize = 28;
+pub const GW_WORDS: usize = 33;
 /// pm-gw's levels (the last word): halted.
 pub const GW_LEVELS: usize = 1;
 /// pm-gw's names, in word order.
@@ -76,6 +78,11 @@ pub const GW_NAMES: [&str; GW_WORDS] = [
     "account_reads",
     "redeem_off",
     "redeem_no_row",
+    "held_full",
+    "held_no_row",
+    "held_expired",
+    "held_writes",
+    "held_write_failures",
     "redeem_queued",
     "redeem_dupes",
     "redeem_queue_full",

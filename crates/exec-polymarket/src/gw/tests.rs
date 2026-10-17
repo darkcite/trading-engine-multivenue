@@ -526,3 +526,133 @@ fn pm_gw_publishes_its_tallies_once_a_second() {
         "acks, refused, in_doubt and halted are each writer's own"
     );
 }
+
+/// A wall second `s` into the window `w` seconds after OPEN's.
+fn wall_at(w: u64, s: u64) -> u64 {
+    (OPEN + w * 900 + s) * 1_000_000_000
+}
+
+fn watch(shares: u64, cost: u32, leg: u8) -> PmCmd {
+    let mut c = PmCmd::new(CMD_WATCH, shares);
+    c.instance = instance();
+    c.leg = leg;
+    c.usd_1e6 = cost;
+    c
+}
+
+/// PM15-6f: pm-gw mirrors the arm's legs — the token's id and the
+/// condition copied while the window's row exists — and writes the table
+/// whole, off the quiet tail, at each change.
+#[test]
+fn the_held_table_mirrors_the_arm_and_persists_whole() {
+    let mut b = bench();
+    let dir = std::env::temp_dir().join(format!("pm15-held-gw-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("pm15-held.state");
+    b.gw.set_persist(path.clone());
+    assert!(b.eng.cmd.push(&watch(100_000_000, 93_000_000, 0)));
+    b.gw.step(2, WALL);
+    assert!(!path.exists(), "not in the quiet tail");
+    let h = b.gw.held()[0];
+    assert_eq!(
+        (h.dec(), h.state, h.shares_1e6, h.cost_1e6),
+        (
+            &b"1234"[..],
+            crate::held::HELD_OPEN,
+            100_000_000,
+            93_000_000
+        )
+    );
+    assert_eq!(Some(h.condition), crate::num::hex32(COND));
+    assert!(b.eng.cmd.push(&watch(150_000_000, 140_000_000, 0)));
+    b.gw.step(3, wall_at(1, 100));
+    let text = std::fs::read_to_string(&path).unwrap();
+    let back = crate::held::parse_held(&text, &account().poly_address_text).unwrap();
+    assert_eq!(back, b.gw.held().to_vec());
+    assert_eq!(back[0].shares_1e6, 150_000_000, "the update");
+    let mut stop = watch(0, 0, 0);
+    stop.leg |= WATCH_STOP;
+    assert!(b.eng.cmd.push(&stop));
+    b.gw.step(4, wall_at(1, 100));
+    assert!(b.gw.held().is_empty());
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        crate::held::parse_held(&text, &account().poly_address_text).unwrap(),
+        vec![]
+    );
+    assert_eq!(b.gw.counters().held_writes, 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PM15-6f: an open leg whose window ended HELD_EXPIRE_S ago without a
+/// settlement is expired at the next account read: asked redeemed, told
+/// to the arm.
+#[test]
+fn an_open_leg_expires_after_its_window_and_is_asked_redeemed() {
+    let mut b = bench();
+    let mut rly = Rig::with_body(crate::redeem::RELAYER_BODY);
+    rly.answer(500, b"{}");
+    let key = crate::redeem::RelayerKey::new(b"relayer-key").unwrap();
+    b.gw.set_redeemer(crate::redeem::Redeemer::new(key, [0x11; 20], 137), rly);
+    assert!(b.eng.cmd.push(&watch(100_000_000, 93_000_000, 1)));
+    b.gw.step(2, WALL);
+    // Not yet: 800 s after the window's end — the write (no file: the rig),
+    // then a whole account read: the balance, the leg, its end.
+    let w = wall_at(1, 800);
+    b.gw.clob_mut()
+        .answer(200, br#"{"balance":"1","allowances":{}}"#);
+    b.gw.clob_mut().answer(200, br#"{"balance":"1"}"#);
+    let mut k = 0u64;
+    while k < 4 {
+        b.gw.step(10, w);
+        k += 1;
+    }
+    assert_eq!(b.gw.counters().held_expired, 0);
+    assert_eq!(b.gw.counters().account_reads, 1);
+    let t = 10 + ACCOUNT_EVERY_NS;
+    b.gw.clob_mut()
+        .answer(200, br#"{"balance":"1","allowances":{}}"#);
+    b.gw.step(t, wall_at(2, 100));
+    assert_eq!(b.gw.counters().held_expired, 1);
+    assert_eq!(b.gw.held()[0].state, crate::held::HELD_UNKNOWN);
+    assert_eq!(b.gw.redeem_counters().queued, 1);
+    let mut expired = 0;
+    while let Some(e) = b.eng.evt.pop().map(|e| *e) {
+        if e.kind == EVT_EXPIRED {
+            assert_eq!(e.a, (u64::from(instance()) << 8) | 1);
+            expired += 1;
+        }
+    }
+    assert_eq!(expired, 1);
+}
+
+/// PM15-6f: legs restored at boot are read by their own token id (their
+/// window long gone from the table), and a settled one is asked redeemed
+/// again.
+#[test]
+fn restored_legs_are_read_by_their_own_token_and_a_settled_one_is_redeemed() {
+    let mut b = bench();
+    let rly = Rig::with_body(crate::redeem::RELAYER_BODY);
+    let key = crate::redeem::RelayerKey::new(b"relayer-key").unwrap();
+    b.gw.set_redeemer(crate::redeem::Redeemer::new(key, [0x11; 20], 137), rly);
+    let mut won = crate::held::HeldLeg::EMPTY;
+    won.instance = pm_instance_id(pm_window_of_open(OPEN).unwrap() - 7, 0).unwrap();
+    won.state = crate::held::HELD_WON;
+    won.condition = [0x42; 32];
+    won.dec_len = 3;
+    won.dec[..3].copy_from_slice(b"999");
+    let mut open = won;
+    open.state = crate::held::HELD_OPEN;
+    open.leg = 1;
+    b.gw.restore_held(&[won, open], 5);
+    assert_eq!((b.gw.held().len(), b.gw.redeem_counters().queued), (2, 1));
+    let wall = wall_at(0, 100);
+    b.gw.clob_mut()
+        .answer(200, br#"{"balance":"1","allowances":{}}"#);
+    b.gw.step(10, wall);
+    b.gw.clob_mut().answer(200, br#"{"balance":"0"}"#);
+    b.gw.step(11, wall);
+    let sent = &b.gw.clob_mut().sent;
+    let last = core::str::from_utf8(&sent[sent.len() - 1].target).unwrap();
+    assert!(last.contains("CONDITIONAL&token_id=999&"), "{last}");
+}

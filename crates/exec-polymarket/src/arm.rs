@@ -72,10 +72,11 @@ use core_types::pm_roll::{PM_SETTLED_DOWN, PM_SETTLED_UP};
 
 use crate::cmd::{
     PmCmd, PmEvt, CMD_RECON, CMD_REDEEM, CMD_SUBMIT, CMD_WATCH, EVT_ACK, EVT_BALANCE, EVT_DONE,
-    EVT_FILL, EVT_GAP, EVT_IN_DOUBT, EVT_POSITION, EVT_READ_DONE, EVT_REFUSED, EVT_SENT,
-    PM_CMD_RING, PM_EVT_RING, PM_USER_RING,
+    EVT_EXPIRED, EVT_FILL, EVT_GAP, EVT_IN_DOUBT, EVT_POSITION, EVT_READ_DONE, EVT_REFUSED,
+    EVT_SENT, PM_CMD_RING, PM_EVT_RING, PM_USER_RING,
 };
 use crate::gw::WATCH_STOP;
+use crate::held::{HeldLeg, HELD_OPEN, HELD_UNKNOWN, HELD_WON};
 use crate::stats::{word, PmExecStats, ARM_WORDS, PUBLISH_EVERY_NS};
 use crate::user::PUB_USER_RX_NS;
 use crate::userws::{TS_CONFIRMED, TS_FAILED};
@@ -204,6 +205,10 @@ pub struct ArmCounters {
     pub legs_lost: u64,
     /// Redemptions asked of pm-gw.
     pub redeem_asks: u64,
+    /// Legs pm-gw expired unsettled (PM15-6f).
+    pub legs_expired: u64,
+    /// Legs restored from the held file at boot (PM15-6f).
+    pub legs_restored: u64,
     /// Legs the ledger could not take (halts).
     pub ledger_full: u64,
 }
@@ -396,6 +401,8 @@ impl PmArm {
             word(c.legs_redeemed),
             word(c.legs_lost),
             word(c.redeem_asks),
+            word(c.legs_expired),
+            word(c.legs_restored),
             word(c.ledger_full),
             i64::from(self.halted),
             i64::from(self.reconciled),
@@ -566,6 +573,7 @@ impl PmArm {
             }
             EVT_POSITION => return self.on_position(ev),
             EVT_READ_DONE => return self.on_read_done(now),
+            EVT_EXPIRED => return self.on_expired(ev),
             _ => {}
         }
         let Some(i) = self.find_cid(ev.a) else {
@@ -785,7 +793,8 @@ impl PmArm {
                 l.shares_1e6 += qty;
                 l.cost_1e6 += cost;
                 l.last_fill_ns = now;
-                return;
+                let (s, c) = (l.shares_1e6, l.cost_1e6);
+                return self.watch(instance, leg, s, c);
             }
             if l.state == L_FREE && free.is_none() {
                 free = Some(k);
@@ -808,13 +817,71 @@ impl PmArm {
             state: L_OPEN,
             asked: false,
         };
-        let mut c = PmCmd::new(CMD_WATCH, 0);
+        self.watch(instance, leg, qty, cost);
+    }
+
+    /// pm-gw's mirror of a leg: watched, and its shares and cost held
+    /// (persisted) — at every fill.
+    fn watch(&mut self, instance: u32, leg: u8, shares_1e6: i64, cost_1e6: i64) {
+        let mut c = PmCmd::new(CMD_WATCH, u64::try_from(shares_1e6).unwrap_or(0));
         c.instance = instance;
         c.leg = leg;
+        c.usd_1e6 = u32::try_from(cost_1e6).unwrap_or(u32::MAX);
         if !self.end.cmd.push(&c) {
-            // The watch is the read of this leg: without it the drift is
-            // blind — fail fast.
+            // The watch is the read of this leg and its record across a
+            // restart: without it the drift is blind — fail fast.
             self.halt();
+        }
+    }
+
+    /// The legs a previous process held (the held file) — boot-only,
+    /// before the first read: valued at cost (a settled one as the
+    /// settlement left it), read again from the next account read.
+    pub fn restore_legs(&mut self, held: &[HeldLeg]) {
+        let mut i = 0usize;
+        let mut k = 0usize;
+        while i < held.len() && k < LEDGER_LEGS {
+            let h = &held[i];
+            i += 1;
+            while k < LEDGER_LEGS && self.legs[k].state != L_FREE {
+                k += 1;
+            }
+            if k == LEDGER_LEGS {
+                break;
+            }
+            self.legs[k] = Leg {
+                shares_1e6: h.shares_1e6,
+                cost_1e6: h.cost_1e6,
+                venue_1e6: -1,
+                last_fill_ns: 0,
+                instance: h.instance,
+                leg: h.leg & 1,
+                state: match h.state {
+                    HELD_OPEN => L_OPEN,
+                    HELD_WON => L_WON,
+                    _ => L_LOST,
+                },
+                asked: h.state != HELD_OPEN,
+            };
+            self.counters.legs_restored += 1;
+        }
+    }
+
+    /// pm-gw expired an open leg (its roll will never settle here): booked
+    /// as settled unknown — at 0 — its redemption already asked.
+    fn on_expired(&mut self, ev: &PmEvt) {
+        let instance = (ev.a >> 8) as u32;
+        let leg = (ev.a & 1) as u8;
+        let mut k = 0usize;
+        while k < LEDGER_LEGS {
+            let l = &mut self.legs[k];
+            if l.state == L_OPEN && l.instance == instance && l.leg == leg {
+                l.state = L_LOST;
+                l.asked = true;
+                self.counters.legs_expired += 1;
+                return;
+            }
+            k += 1;
         }
     }
 
@@ -870,6 +937,12 @@ impl PmArm {
             if l.state != L_OPEN && !l.asked && l.venue_1e6 > 0 {
                 let mut c = PmCmd::new(CMD_REDEEM, 0);
                 c.instance = l.instance;
+                c.leg = l.leg;
+                c.tries = if l.state == L_WON {
+                    HELD_WON
+                } else {
+                    HELD_UNKNOWN
+                };
                 if self.end.cmd.push(&c) {
                     self.legs[k - 1].asked = true;
                     self.counters.redeem_asks += 1;

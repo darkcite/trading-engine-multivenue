@@ -16956,7 +16956,8 @@ and 39 (the P0 pre-registration, sha256 `d06d0038…488e`, registered
 `5849b4e` PM15-4, `1c8b014` PM15-5, `babf584` PM15-6a, `03a3191` PM15-8a,
 `a9987fa` PM15-5b, `a391129` PM15-5c, `cc6900b` PM15-6b, `ef8b22c` PM15-5d,
 `860ab76` PM15-6c, `1d41a11` PM15-6d, `a0d7ca7` PM15-6e, `4597be6` PM15-8b
-(the dashboard's slot-9 panel), `19e2d77` PM15-7, PM15-8c (the last section).
+(the dashboard's slot-9 panel), `19e2d77` PM15-7, `ac84a1f` PM15-8c, PM15-6f (the last
+section).
 **Deployed PAPER 2026-10-17 09:22Z (`03a3191`); `a9987fa` (PM15-5b) since 09:49Z; `ef8b22c` (PM15-5d) since 11:41Z.**
 
 | id | ruling (operator, 2026-10-17) |
@@ -17267,6 +17268,34 @@ published at most once a second, mirrored as `engine_pm15_arm_*` and
 builds the arm: the family reads 0. The dashboard's slot-9 panel shows the
 arm's rows once it is live (submitted, acks, refused, in doubt, fills,
 reads, the worth against the anchor, the drift, the redemptions).
+
+### PM15-6f — a restart keeps the legs the account holds
+
+Before it, a restart emptied the arm's ledger: a held leg vanished from
+the worth — a false loss against the restored session anchor — and a won
+leg was never redeemed.
+
+- **pm-gw's held table** (`exec_polymarket::held`, ≤ 32 legs — the arm's
+  ledger size; `WATCH_MAX` 16 → 32, and a full table refuses instead of
+  evicting): every leg the arm holds, from its `CMD_WATCH` at each fill
+  (shares and cost), its `CMD_REDEEM` at settlement (won / unknown) and
+  its `WATCH_STOP` when the leg leaves — with the token's decimal id and
+  the market's condition copied while the window's row exists, so the
+  reads and the redemption outlive the token table.
+- **`pm15-held.state`** beside `exec.toml`: the table written whole
+  (through a temporary, renamed) at each change, on pm-gw's idle path,
+  never in a window's quiet tail (a failed write retries in 30 s).
+- **The boot** restores it to both: the arm's ledger (at cost; a settled
+  leg as it was left) and pm-gw's reads and redemption (a settled leg
+  asked again). Another account's file refuses the boot. A new session's
+  anchor is the pUSD plus the inherited legs at cost.
+- **A leg the restarted engine will never see settle** (its window ended
+  before the boot; the ingress tracks the current and next ones) is
+  expired 900 s after its window's end — after the ingress's own
+  10-minute retirement, so a settlement the engine sees always comes
+  first: asked redeemed and told to the arm (`EVT_EXPIRED`), which books
+  it settled unknown, at 0; its later zero balance reads as redeemed,
+  never as a drift.
 
 ### Open
 

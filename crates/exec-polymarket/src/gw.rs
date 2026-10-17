@@ -61,8 +61,11 @@ use crate::amounts::{clears_floors, fak_buy};
 use crate::clob::PmClob;
 use crate::cmd::{
     PmCmd, PmEvt, CMD_RECON, CMD_REDEEM, CMD_SUBMIT, CMD_WATCH, EVT_ACK, EVT_BALANCE, EVT_DONE,
-    EVT_IN_DOUBT, EVT_POSITION, EVT_READ_DONE, EVT_REFUSED, EVT_SENT, LOCAL_AMOUNTS, LOCAL_FLOOR,
-    LOCAL_NO_TOKEN, LOCAL_REQUEST, LOCAL_SIGN, PM_CMD_RING, PM_EVT_RING,
+    EVT_EXPIRED, EVT_IN_DOUBT, EVT_POSITION, EVT_READ_DONE, EVT_REFUSED, EVT_SENT, LOCAL_AMOUNTS,
+    LOCAL_FLOOR, LOCAL_NO_TOKEN, LOCAL_REQUEST, LOCAL_SIGN, PM_CMD_RING, PM_EVT_RING,
+};
+use crate::held::{
+    render_held, HeldLeg, HELD_EXPIRE_S, HELD_FILE_MAX, HELD_MAX, HELD_OPEN, HELD_UNKNOWN, HELD_WON,
 };
 use crate::num::{hex32, put, put_u64};
 use crate::redeem::{RedeemCounters, Redeemer};
@@ -96,8 +99,10 @@ pub const ACCOUNT_EVERY_NS: u64 = 30_000_000_000;
 /// No account read in a window's last this many seconds (the late law's
 /// τ < 20 s, with room).
 pub const QUIET_TAIL_S: u64 = 30;
-/// Tokens watched at once.
-pub const WATCH_MAX: usize = 16;
+/// Tokens watched at once: every leg the arm's ledger can hold.
+pub const WATCH_MAX: usize = HELD_MAX;
+/// After a failed write of the held file, the next try, ns.
+pub const HELD_RETRY_NS: u64 = 30_000_000_000;
 /// `PmCmd.leg` bit of a CMD_WATCH that stops watching.
 pub const WATCH_STOP: u8 = 0x80;
 
@@ -147,6 +152,16 @@ pub struct GwCounters {
     pub redeem_off: u64,
     /// Redemption asks whose window has left the token table.
     pub redeem_no_row: u64,
+    /// Legs refused: the held table was full (the arm halts first).
+    pub held_full: u64,
+    /// Legs held whose window had left the token table (no token id).
+    pub held_no_row: u64,
+    /// Held legs expired unsettled ([`HELD_EXPIRE_S`] after their window).
+    pub held_expired: u64,
+    /// Writes of the held file.
+    pub held_writes: u64,
+    /// Writes of the held file that failed (retried).
+    pub held_write_failures: u64,
 }
 
 /// pm-gw's core (module docs).
@@ -165,8 +180,14 @@ pub struct PmGateway<W: PmClob> {
     target: [u8; 256],
     halted: bool,
     counters: GwCounters,
-    watch: [(u32, u8); WATCH_MAX],
-    watch_n: usize,
+    /// The legs the account holds (PM15-6f, [`crate::held`]).
+    held: [HeldLeg; HELD_MAX],
+    held_n: usize,
+    held_dirty: bool,
+    held_next_ns: u64,
+    /// The held file and its temporary (`None`: not persisted — the rigs).
+    persist: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    persist_buf: Box<[u8; HELD_FILE_MAX]>,
     /// The next account read's start, ns; its step (0 = the balance, then
     /// the watched tokens; `usize::MAX` = idle).
     account_next_ns: u64,
@@ -212,8 +233,12 @@ impl<W: PmClob> PmGateway<W> {
             target: [0; 256],
             halted: false,
             counters: GwCounters::default(),
-            watch: [(0, 0); WATCH_MAX],
-            watch_n: 0,
+            held: [HeldLeg::EMPTY; HELD_MAX],
+            held_n: 0,
+            held_dirty: false,
+            held_next_ns: 0,
+            persist: None,
+            persist_buf: exec_gateway::boxed_array(0),
             account_next_ns: 0,
             account_step: usize::MAX,
             redeem: None,
@@ -226,6 +251,36 @@ impl<W: PmClob> PmGateway<W> {
     /// boot-only.
     pub fn set_stats(&mut self, stats: std::sync::Arc<PmExecStats>) {
         self.stats = Some(stats);
+    }
+
+    /// Persist the held legs to `path` (written whole through a temporary
+    /// beside it) — boot-only.
+    pub fn set_persist(&mut self, path: std::path::PathBuf) {
+        let tmp = path.with_extension("state.tmp");
+        self.persist = Some((path, tmp));
+    }
+
+    /// The legs a previous process held (its held file) — boot-only,
+    /// before the first pass: read again from the next account read, a
+    /// settled one asked redeemed again (the redeemer's queue is not
+    /// persisted).
+    pub fn restore_held(&mut self, legs: &[HeldLeg], now_ns: u64) {
+        let mut i = 0usize;
+        while i < legs.len() && self.held_n < HELD_MAX {
+            let h = legs[i];
+            self.held[self.held_n] = h;
+            self.held_n += 1;
+            if h.state != HELD_OPEN {
+                self.redeem_condition(&h.condition, now_ns);
+            }
+            i += 1;
+        }
+    }
+
+    /// The legs held (tests, the cli's tells).
+    #[must_use]
+    pub fn held(&self) -> &[HeldLeg] {
+        &self.held[..self.held_n]
     }
 
     /// The tallies (the redeemer's with them) into `/metrics`' block.
@@ -254,6 +309,11 @@ impl<W: PmClob> PmGateway<W> {
             word(c.account_reads),
             word(c.redeem_off),
             word(c.redeem_no_row),
+            word(c.held_full),
+            word(c.held_no_row),
+            word(c.held_expired),
+            word(c.held_writes),
+            word(c.held_write_failures),
             word(r.queued),
             word(r.dupes),
             word(r.queue_full),
@@ -343,8 +403,8 @@ impl<W: PmClob> PmGateway<W> {
                         return true;
                     }
                     CMD_RECON => self.queue_recon(cmd),
-                    CMD_WATCH => self.set_watch(cmd.instance, cmd.leg),
-                    CMD_REDEEM => self.ask_redeem(cmd.instance, now_ns),
+                    CMD_WATCH => self.on_watch(&cmd),
+                    CMD_REDEEM => self.ask_redeem(&cmd, now_ns),
                     _ => {}
                 }
             }
@@ -358,9 +418,13 @@ impl<W: PmClob> PmGateway<W> {
             }
             let quiet = (wall_ns / 1_000_000_000) % core_types::pm_roll::PM_WINDOW_S
                 >= core_types::pm_roll::PM_WINDOW_S - QUIET_TAIL_S;
+            if self.held_dirty && !quiet && now_ns >= self.held_next_ns && self.write_held(now_ns) {
+                return true;
+            }
             if self.account_step == usize::MAX && now_ns >= self.account_next_ns && !quiet {
                 self.account_next_ns = now_ns.saturating_add(ACCOUNT_EVERY_NS);
                 self.account_step = 0;
+                self.expire_held(wall_ns / 1_000_000_000, now_ns);
             }
             if self.account_step != usize::MAX && !quiet {
                 self.account_one(wall_ns);
@@ -377,56 +441,162 @@ impl<W: PmClob> PmGateway<W> {
         did
     }
 
-    /// Queue the condition of `instance`'s window for redemption.
-    fn ask_redeem(&mut self, instance: u32, now_ns: u64) {
+    /// A settled leg (`instance`, `leg`; `tries` = [`HELD_WON`] or
+    /// [`HELD_UNKNOWN`]): its held state, and its condition queued for
+    /// redemption.
+    fn ask_redeem(&mut self, cmd: &PmCmd, now_ns: u64) {
+        let state = if cmd.tries == HELD_UNKNOWN {
+            HELD_UNKNOWN
+        } else {
+            HELD_WON
+        };
+        let mut cond = [0u8; 32];
+        if let Some(i) = self.held_index(cmd.instance, cmd.leg & 1) {
+            self.held[i].state = state;
+            self.held_dirty = true;
+            cond = self.held[i].condition;
+        }
+        if cond == [0; 32] {
+            if let Some(row) = self.tokens.find(cmd.instance) {
+                if let Some(c) = hex32(&row.condition_id[..row.condition_len]) {
+                    cond = c;
+                }
+            }
+        }
+        self.redeem_condition(&cond, now_ns);
+    }
+
+    /// Queue `cond` (zero: unknown) with the redeemer, or count why not.
+    fn redeem_condition(&mut self, cond: &[u8; 32], now_ns: u64) {
         let Some((r, _)) = &mut self.redeem else {
             self.counters.redeem_off += 1;
             return;
         };
-        let cond = match self.tokens.find(instance) {
-            Some(row) => hex32(&row.condition_id[..row.condition_len]),
-            None => None,
-        };
-        match cond {
-            Some(c) => r.ask(&c, now_ns),
-            None => self.counters.redeem_no_row += 1,
+        if *cond == [0; 32] {
+            self.counters.redeem_no_row += 1;
+            return;
         }
+        r.ask(cond, now_ns);
     }
 
-    fn set_watch(&mut self, instance: u32, leg: u8) {
-        let key = (instance, leg & 1);
+    fn held_index(&self, instance: u32, leg: u8) -> Option<usize> {
         let mut i = 0usize;
-        while i < self.watch_n {
-            if self.watch[i] == key {
-                if leg & WATCH_STOP != 0 {
-                    self.watch[i] = self.watch[self.watch_n - 1];
-                    self.watch_n -= 1;
-                }
-                return;
+        while i < self.held_n {
+            if self.held[i].instance == instance && self.held[i].leg == leg {
+                return Some(i);
             }
             i += 1;
         }
-        if leg & WATCH_STOP != 0 {
+        None
+    }
+
+    /// The arm's leg (`client_oid` its shares ×1e6, `usd_1e6` its cost):
+    /// new, updated, or (`WATCH_STOP`) gone.
+    fn on_watch(&mut self, cmd: &PmCmd) {
+        let leg = cmd.leg & 1;
+        let shares = i64::try_from(cmd.client_oid).unwrap_or(i64::MAX);
+        let cost = i64::from(cmd.usd_1e6);
+        if let Some(i) = self.held_index(cmd.instance, leg) {
+            if cmd.leg & WATCH_STOP != 0 {
+                self.held[i] = self.held[self.held_n - 1];
+                self.held_n -= 1;
+            } else {
+                self.held[i].shares_1e6 = shares;
+                self.held[i].cost_1e6 = cost;
+            }
+            self.held_dirty = true;
             return;
         }
-        if self.watch_n == WATCH_MAX {
-            // The oldest goes: the arm watches far fewer than this.
-            let mut k = 1usize;
-            while k < WATCH_MAX {
-                self.watch[k - 1] = self.watch[k];
-                k += 1;
-            }
-            self.watch_n -= 1;
+        if cmd.leg & WATCH_STOP != 0 {
+            return;
         }
-        self.watch[self.watch_n] = key;
-        self.watch_n += 1;
+        if self.held_n == HELD_MAX {
+            self.counters.held_full += 1;
+            return;
+        }
+        let mut h = HeldLeg::EMPTY;
+        h.instance = cmd.instance;
+        h.leg = leg;
+        h.state = HELD_OPEN;
+        h.shares_1e6 = shares;
+        h.cost_1e6 = cost;
+        match self.tokens.find(cmd.instance) {
+            Some(row) => {
+                let l = &row.legs[usize::from(leg)];
+                let n = l.dec_len.min(80);
+                // COPY: the leg's decimal id (≤ 80 B) into its held record —
+                // once a leg (cold): the reads and the redemption outlive the
+                // window's row.
+                h.dec[..n].copy_from_slice(&l.dec[..n]);
+                h.dec_len = n as u8;
+                if let Some(c) = hex32(&row.condition_id[..row.condition_len]) {
+                    h.condition = c;
+                }
+            }
+            None => self.counters.held_no_row += 1,
+        }
+        self.held[self.held_n] = h;
+        self.held_n += 1;
+        self.held_dirty = true;
+    }
+
+    /// Expire every open leg whose window ended [`HELD_EXPIRE_S`] ago at
+    /// wall second `wall_s`: asked redeemed, told to the arm.
+    fn expire_held(&mut self, wall_s: u64, now_ns: u64) {
+        let mut i = 0usize;
+        while i < self.held_n {
+            let h = self.held[i];
+            i += 1;
+            if h.state != HELD_OPEN {
+                continue;
+            }
+            let (window, _) = core_types::pm_roll::pm_instance_parts(h.instance);
+            let end_s = (u64::from(window) + 1) * core_types::pm_roll::PM_WINDOW_S;
+            if wall_s < end_s + HELD_EXPIRE_S {
+                continue;
+            }
+            self.held[i - 1].state = HELD_UNKNOWN;
+            self.held_dirty = true;
+            self.counters.held_expired += 1;
+            self.redeem_condition(&h.condition, now_ns);
+            self.emit(&PmEvt::about(
+                EVT_EXPIRED,
+                (u64::from(h.instance) << 8) | u64::from(h.leg),
+            ));
+        }
+    }
+
+    /// The held file, written whole through its temporary; `false` when
+    /// nothing is persisted (the rigs).
+    fn write_held(&mut self, now_ns: u64) -> bool {
+        self.held_dirty = false;
+        let Some((path, tmp)) = &self.persist else {
+            return false;
+        };
+        let n = render_held(
+            &mut self.persist_buf[..],
+            &self.acct.poly_address_text,
+            &self.held[..self.held_n],
+        );
+        // ALLOC: the two paths' C strings inside std::fs — cold, once a
+        // leg's change, never in a window's quiet tail.
+        let ok = std::fs::write(tmp, &self.persist_buf[..n]).is_ok()
+            && std::fs::rename(tmp, path).is_ok();
+        if ok {
+            self.counters.held_writes += 1;
+        } else {
+            self.counters.held_write_failures += 1;
+            self.held_dirty = true;
+            self.held_next_ns = now_ns.saturating_add(HELD_RETRY_NS);
+        }
+        true
     }
 
     /// One request of the account read: the balance (step 0), then the
     /// watched tokens; EVT_READ_DONE after the last.
     fn account_one(&mut self, wall_ns: u64) {
         let step = self.account_step;
-        if step > self.watch_n {
+        if step > self.held_n {
             self.account_step = usize::MAX;
             self.counters.account_reads += 1;
             return self.emit(&PmEvt::about(EVT_READ_DONE, 0));
@@ -437,21 +607,22 @@ impl<W: PmClob> PmGateway<W> {
         if step == 0 {
             at = put(&mut self.target, at, b"COLLATERAL");
         } else {
-            let (inst, leg) = self.watch[step - 1];
+            let k = step - 1;
+            let (inst, leg) = (self.held[k].instance, self.held[k].leg);
             key = (u64::from(inst) << 8) | u64::from(leg);
-            let Some(row) = self.tokens.find(inst) else {
-                let mut e = PmEvt::about(EVT_POSITION, key);
-                e.why = 1;
-                return self.emit(&e);
-            };
-            let l = &row.legs[usize::from(leg & 1)];
-            let dec_len = l.dec_len;
-            let mut dec = [0u8; 80];
-            // COPY: the token's decimal id (≤ 78 B) out of the table for
-            // the query's render — once per read, cold.
-            dec[..dec_len].copy_from_slice(&l.dec[..dec_len]);
             at = put(&mut self.target, at, b"CONDITIONAL&token_id=");
-            at = put(&mut self.target, at, &dec[..dec_len]);
+            let n = usize::from(self.held[k].dec_len).min(80);
+            if n > 0 {
+                at = put(&mut self.target, at, &self.held[k].dec[..n]);
+            } else {
+                let Some(row) = self.tokens.find(inst) else {
+                    let mut e = PmEvt::about(EVT_POSITION, key);
+                    e.why = 1;
+                    return self.emit(&e);
+                };
+                let l = &row.legs[usize::from(leg & 1)];
+                at = put(&mut self.target, at, &l.dec[..l.dec_len]);
+            }
         }
         at = put(&mut self.target, at, b"&signature_type=");
         at = put_u64(&mut self.target, at, u64::from(self.acct.sig_type));

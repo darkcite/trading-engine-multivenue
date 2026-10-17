@@ -43,6 +43,7 @@ use exec_polymarket::account::PmAccount;
 use exec_polymarket::arm::{PmArm, PmArmCfg};
 use exec_polymarket::cmd::{PmCmd, PmEvt, PM_CMD_RING, PM_EVT_RING, PM_USER_RING};
 use exec_polymarket::gw::{PmGateway, BODY_MIN};
+use exec_polymarket::held::{parse_held, HeldLeg, HELD_UNKNOWN};
 use exec_polymarket::redeem::{
     wallet_nonce, Redeemer, RelayerKey, RELAYER_BODY, RELAYER_HOST, RELAYER_RESP,
 };
@@ -94,6 +95,44 @@ pub const ENV_REDEEM: &str = "PM15_REDEEM";
 #[must_use]
 pub fn anchor_path(exec_toml: &Path) -> PathBuf {
     exec_toml.with_file_name("pm15-pnl-anchor.state")
+}
+
+/// Where slot 9's held legs live (PM15-6f): beside the exec artifact.
+#[must_use]
+pub fn held_path(exec_toml: &Path) -> PathBuf {
+    exec_toml.with_file_name("pm15-held.state")
+}
+
+/// The held legs a previous process wrote (none when the file is absent).
+///
+/// # Errors
+/// An unreadable file, another account's, or one that does not parse.
+fn read_held(path: &Path, owner: &[u8; 42]) -> Result<Vec<HeldLeg>, String> {
+    // COPY: boot, once — the held file's text.
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_held(&text, owner).map_err(|e| {
+            format!(
+                "{}: {e} — set it aside only after redeeming its legs by hand",
+                path.display()
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// The held legs' worth at boot: an unredeemed leg at its cost, one
+/// settled unknown at 0 (the arm's own book).
+fn held_worth(held: &[HeldLeg]) -> i64 {
+    let mut w = 0i64;
+    let mut i = 0usize;
+    while i < held.len() {
+        if held[i].state != HELD_UNKNOWN {
+            w += held[i].cost_1e6;
+        }
+        i += 1;
+    }
+    w
 }
 
 /// Slot 9's arm, booted.
@@ -504,20 +543,23 @@ pub fn boot_pm15_arm(
     let bound = s.halt_on_loss_usd_1e6.max(s.max_order_usd_1e6);
     let facts = check_venue(&mut clob, &acct, wall_s, bound)
         .map_err(|e| format!("slot 9's venue gate: {e}"))?;
+    let held_file = held_path(&eb.path);
+    let held = read_held(&held_file, &acct.poly_address_text)?;
     let anchor_file = anchor_path(&eb.path);
     let restored = read_anchor(&anchor_file, &acct.poly_address_text)?;
     let anchor = match restored {
         Some(a) => a,
         None => {
+            // A new session's worth: pUSD and the legs it inherits.
+            let worth = facts.balance_1e6 + held_worth(&held);
             // COPY: boot, once — the anchor's one line.
             let line = format!(
-                "pm15-anchor v1 owner={} worth_1e6={} set_unix_s={wall_s}\n",
+                "pm15-anchor v1 owner={} worth_1e6={worth} set_unix_s={wall_s}\n",
                 String::from_utf8_lossy(&acct.poly_address_text),
-                facts.balance_1e6
             );
             std::fs::write(&anchor_file, line)
                 .map_err(|e| format!("{}: {e}", anchor_file.display()))?;
-            facts.balance_1e6
+            worth
         }
     };
     let redeem = boot_redeemer(&acct, Arc::clone(&tls))?;
@@ -535,13 +577,14 @@ pub fn boot_pm15_arm(
     let (user_tx, user_rx) = Ring::<PmEvt, PM_USER_RING>::new().split();
     let user = PmUserDriver::new(&acct, user_tx, Arc::clone(&eng.stats));
     let mut tell = String::with_capacity(512);
-    // COPY: boot, once — the addresses' texts into the tell.
     let _ = write!(
         tell,
         "pm15: LIVE ARM ARMED — Polymarket CLOB V2, slot 9's FAK BUYs on its own account \
          (signature type {}, owner {}, maker {}): live families 0b{live_families:b}; pUSD {}, the \
-         exchange's allowance {}; session anchor {} ({}); session loss bound ${}; {}",
+         exchange's allowance {}; session anchor {} ({}); session loss bound ${}; {}; held legs \
+         restored: {}",
         acct.sig_type,
+        // COPY: boot, once — the addresses' texts into the tell.
         String::from_utf8_lossy(&acct.poly_address_text),
         String::from_utf8_lossy(&acct.maker_text),
         usd(facts.balance_1e6),
@@ -554,12 +597,15 @@ pub fn boot_pm15_arm(
         },
         s.halt_on_loss_usd_1e6 / 1_000_000,
         redeem_text(redeem.as_ref()),
+        held.len(),
     );
     let mut gw = PmGateway::new(acct, clob, end, specs, now_ns());
     if let Some((r, rly, _)) = redeem {
         gw.set_redeemer(r, rly);
     }
     gw.set_stats(Arc::clone(&stats));
+    gw.restore_held(&held, now_ns());
+    gw.set_persist(held_file);
     let mut arm = PmArm::new(
         PmArmCfg {
             slot: PM15_SLOT as u8,
@@ -569,6 +615,7 @@ pub fn boot_pm15_arm(
         user_rx,
     );
     arm.restore_anchor(anchor);
+    arm.restore_legs(&held);
     arm.set_stats(stats);
     let flag = Arc::new(AtomicBool::new(false));
     let gw_flag = Arc::clone(&flag);
@@ -636,6 +683,32 @@ mod tests {
     #[test]
     fn the_self_test_passes_in_this_binary() {
         assert!(self_test().unwrap().contains("PASS"));
+    }
+
+    #[test]
+    fn the_held_file_is_optional_and_its_worth_skips_the_unknown() {
+        let dir = std::env::temp_dir().join(format!("pm15-held-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = held_path(&dir.join("exec.toml"));
+        let me = *b"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+        assert_eq!(read_held(&p, &me), Ok(vec![]), "none yet");
+        let mut a = HeldLeg::EMPTY;
+        a.instance = 7;
+        a.state = exec_polymarket::held::HELD_OPEN;
+        a.cost_1e6 = 250_000_000;
+        a.condition = [1; 32];
+        let mut b = a;
+        b.instance = 8;
+        b.state = HELD_UNKNOWN;
+        let mut buf = vec![0u8; exec_polymarket::held::HELD_FILE_MAX];
+        let n = exec_polymarket::held::render_held(&mut buf, &me, &[a, b]);
+        std::fs::write(&p, &buf[..n]).unwrap();
+        let held = read_held(&p, &me).unwrap();
+        assert_eq!(held.len(), 2);
+        assert_eq!(held_worth(&held), 250_000_000);
+        let other = *b"0x0000000000000000000000000000000000000001";
+        assert!(read_held(&p, &other).unwrap_err().contains("by hand"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

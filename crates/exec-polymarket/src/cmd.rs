@@ -28,10 +28,14 @@ pub const CMD_SUBMIT: u8 = 1;
 /// `PmCmd.kind`: read the venue's trades of an order past its deadline.
 pub const CMD_RECON: u8 = 2;
 /// `PmCmd.kind` (PM15-6c): watch a token the arm holds — pm-gw reads its
-/// CONDITIONAL balance at every account read (`instance`, `leg`).
+/// CONDITIONAL balance at every account read (`instance`, `leg`; `leg |
+/// WATCH_STOP` stops). PM15-6f: sent at every fill of the leg, carrying
+/// its shares ×1e6 in `client_oid` and its cost ×1e6 in `usd_1e6`
+/// (pm-gw's held table, persisted).
 pub const CMD_WATCH: u8 = 3;
 /// `PmCmd.kind` (PM15-6d): redeem the market of a settled leg the account
-/// still holds (`instance`) — pm-gw queues its condition for the relayer.
+/// still holds (`instance`, `leg`; `tries` = `held::HELD_WON` or
+/// `held::HELD_UNKNOWN`) — pm-gw queues its condition for the relayer.
 pub const CMD_REDEEM: u8 = 4;
 
 /// One command (engine → pm-gw).
@@ -116,6 +120,10 @@ pub const EVT_POSITION: u8 = 9;
 /// `PmEvt.kind` (PM15-6c): one account read is complete (every watched
 /// token reported after the balance).
 pub const EVT_READ_DONE: u8 = 10;
+/// `PmEvt.kind` (PM15-6f): a held leg expired unsettled — its window
+/// ended `held::HELD_EXPIRE_S` ago and no settlement came (a boot after
+/// it); pm-gw asked its redemption — `a` = `instance << 8 | leg`.
+pub const EVT_EXPIRED: u8 = 11;
 
 /// `PmEvt.why` of a refusal made before the wire: no token for the
 /// instance.
