@@ -432,7 +432,7 @@ E102	E	6	tv	synsig	time	bar_close	1	pin:W23-exit-legs	tests/conformance/fixtures
 E103	E	5	tv	synsig	time	bar_close	1	pin:W23-exit-legs	tests/conformance/fixtures/E/E103.pine	2026-10-17T06:30Z
 E104	E	6	tv	synsig	time	bar_close	1	pin:W23-exit-legs	tests/conformance/fixtures/E/E104.pine	2026-10-17T06:30Z
 E105	E	56	tv	synsig	time	realtime	1	pin:W21-intrabar-commit,pin:05-cof-close-tick,pin:05-cof-next-tick	tests/conformance/fixtures/E/E105.pine	2026-10-17T06:31Z
-E106	E	56	tv_only	rt	step	realtime	1	pin:W21-intrabar-commit	tests/conformance/fixtures/E/E106.pine	pending
+E106	E	56	tv_only	rt	step	realtime	1	pin:W21-intrabar-commit	tests/conformance/fixtures/E/E106.pine	2026-10-17T07:27Z
 E107	E	56	tv	synsig	time	bar_close	1	pin:04-strategy-edges	tests/conformance/fixtures/E/E107.pine	2026-10-17T06:31Z
 E108	E	56	tv	synsig	time	bar_close	1	pin:04-strategy-edges	tests/conformance/fixtures/E/E108.pine	2026-10-17T06:31Z
 E109	E	6	tv	syn	step	bar_close	1	pin:05-trade-trim	tests/conformance/fixtures/E/E109.pine	2026-10-17T06:32Z
