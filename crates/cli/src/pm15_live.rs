@@ -119,7 +119,7 @@ pub fn spec_tee() -> (
     Ring::<PmWindowSpec, PM15_SPEC_RING>::new().split()
 }
 
-fn env(name: &str) -> Result<String, String> {
+pub(crate) fn env(name: &str) -> Result<String, String> {
     std::env::var(name)
         .map_err(|_| format!("{name} is not set (the wrapper sources slot 9's account)"))
 }

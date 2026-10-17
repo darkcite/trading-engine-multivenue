@@ -50,6 +50,8 @@
 //! - [`book15`] — a full 0.001 ladder per token, so a touch carries its
 //!   size;
 //! - [`rtds`] — the Chainlink reports the markets settle on;
+//! - [`polybolt`] — PolyBolt's reference prices (`price.crypto`, the 60-s
+//!   TWAP), DORMANT until the account's credentials exist (PM15-7);
 //! - [`pm15_loop`] — the ingress thread: the market and RTDS sockets on
 //!   one poll, into the engine's PM15 lane.
 
@@ -68,6 +70,7 @@ pub mod discovery;
 pub mod gamma15;
 pub mod pm15_discovery;
 pub mod pm15_loop;
+pub mod polybolt;
 pub mod rolling;
 pub mod rtds;
 pub mod run_loop;

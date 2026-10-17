@@ -16955,7 +16955,8 @@ and 39 (the P0 pre-registration, sha256 `d06d0038…488e`, registered
 06:01Z). **Commits (main, not pushed — R-PM-5):** `3feceac` PM15-2/3,
 `5849b4e` PM15-4, `1c8b014` PM15-5, `babf584` PM15-6a, `03a3191` PM15-8a,
 `a9987fa` PM15-5b, `a391129` PM15-5c, `cc6900b` PM15-6b, `ef8b22c` PM15-5d,
-`860ab76` PM15-6c, `1d41a11` PM15-6d, PM15-6e (this entry's last section).
+`860ab76` PM15-6c, `1d41a11` PM15-6d, `a0d7ca7` PM15-6e, `4597be6` PM15-8b
+(the dashboard's slot-9 panel), PM15-7 (this entry's last section).
 **Deployed PAPER 2026-10-17 09:22Z (`03a3191`); `a9987fa` (PM15-5b) since 09:49Z; `ef8b22c` (PM15-5d) since 11:41Z.**
 
 | id | ruling (operator, 2026-10-17) |
@@ -17231,10 +17232,35 @@ Alloc gate 130: the arm's submit and drain and the gateway's submit at
   `STRATEGY` names pm15, `exec.HALT` does not name slot 9, and the key
   check passes.
 
+### PM15-7 — PolyBolt, dormant (R-PM-3)
+
+- **Why:** RTDS's price topics — the strike's and the pricer's source
+  today — are "legacy for reference prices" since PolyBolt's launch
+  (2026-09-15); no removal date is announced. PolyBolt
+  (`wss://ws-live-v2.polymarket.com/ws`) serves `price.crypto` (Chainlink
+  by default since 2026-10-02) and `price.crypto.twap` (the 60-s TWAP the
+  markets settle on) behind an `op: auth` frame with the account's CLOB
+  API credentials.
+- **Built:** `ingress_polymarket::polybolt` — the auth and subscribe
+  frames rendered in place, and the parser of a report into RTDS's own
+  record (`full_accuracy_value` when present, else `value` quoted or
+  bare, each rounded half up from its digits; a stamp in Unix ms or ISO
+  8601 UTC; the channel's `seq` and `dropped`). RTDS's 18-decimal
+  conversion is shared (`rtds::fav_px`). Alloc gate 132: the frames and
+  the parse at 0 B.
+- **Dormant:** nothing in the engine reads it. The shapes are the
+  migration guide's; the raw frames need credentials.
+  `scripts/pm15-exec.sh polybolt-probe [--assets btc,eth] [--seconds N]`
+  (`multivenue-engine pm15-polybolt-probe`) prints them live — the first
+  frames raw (one naming the API key withheld), the per-asset price and
+  TWAP every 10 s — before PolyBolt becomes slot 9's mark, which is its
+  own cut and its own entry here.
+
 ### Open
 
-- `/state`'s pm15 section and the dashboard's slot-9 panel; the arm's,
-  pm-gw's and the redeemer's counters on `/metrics`.
-- PM15-7 (PolyBolt, dormant).
+- The arm's, pm-gw's and the redeemer's counters on `/metrics` (zero
+  until live); a `/state` pm15 section (the dashboard's panel reads
+  `/metrics`).
+- PolyBolt as the mark, after `polybolt-probe` has run on the account.
 - When the account exists: `pm15-exec.sh key-check`, then `miss-probe`,
   then P0's result or a ruling, then `pm15-flip.sh live`.

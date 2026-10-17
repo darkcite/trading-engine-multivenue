@@ -20859,3 +20859,33 @@ fn pm15_relayer_redemption_is_zero_alloc() {
         "gate 131: the redeemer allocated {allocs} times ({nbytes} B)"
     );
 }
+
+/// Gate 132 (PM15-7, dormant): PolyBolt's frames — the auth and subscribe
+/// renders and the parse of a price and a TWAP report — at 0 B.
+#[test]
+fn pm15_polybolt_frames_are_zero_alloc() {
+    use ingress_polymarket::polybolt::{
+        parse_polybolt, render_auth, render_subscribe, PbFrame, PbReport, POLYBOLT_TWAP_S,
+    };
+    const PRICE: &[u8] = br#"{"v":1,"channel":"price.crypto","seq":5,"payload":{"timestamp":"2026-09-08T16:49:37Z","value":"78794.15450441","symbol":"btcusd"}}"#;
+    const TWAP: &[u8] = br#"{"v":1,"channel":"price.crypto.twap","seq":6,"payload":{"symbol":"ethusd","window_seconds":60,"full_accuracy_value":"4123456789012345678901","timestamp":1792238400250}}"#;
+    let mut buf = [0u8; 1024];
+    let mut r = PbReport::default();
+    let g = AllocGuard::new();
+    let mut n = 0u64;
+    let mut i = 0u64;
+    while i < 64 {
+        n += render_auth(&mut buf, b"key", b"c2VjcmV0", b"pass").unwrap() as u64;
+        n += render_subscribe(&mut buf, &[b"btc", b"eth"], POLYBOLT_TWAP_S).unwrap() as u64;
+        n += u64::from(parse_polybolt(PRICE, &mut r) == PbFrame::Price);
+        n += u64::from(parse_polybolt(TWAP, &mut r) == PbFrame::Twap);
+        i += 1;
+    }
+    let (allocs, nbytes, _) = g.delta();
+    assert!(n > 0 && r.px.px_1e6 == 4_123_456_789);
+    assert_eq!(
+        allocs, 0,
+        "gate 132: PolyBolt's frames allocated {allocs} times ({nbytes} B)"
+    );
+}
+

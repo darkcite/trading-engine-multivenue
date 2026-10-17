@@ -66,6 +66,7 @@ pub mod har_writer;
 pub mod hl_outcome_probe;
 pub mod pm15_boot;
 pub mod pm15_live;
+pub mod pm15_polybolt;
 pub mod pm15_probe;
 /// HYPARB H5: `hyparb.toml` → the slot-0 member's params.
 pub mod hyparb_boot;

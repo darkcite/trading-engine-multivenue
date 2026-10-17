@@ -141,20 +141,8 @@ fn parse_report(frame: &[u8]) -> Option<ChainlinkPx> {
     if body.get(p) != Some(&b'"') {
         return None;
     }
-    let mut v: u128 = 0;
-    let mut i = p + 1;
-    while i < body.len() && body[i].is_ascii_digit() {
-        if i - p > FAV_DIGITS_MAX {
-            return None;
-        }
-        v = v * 10 + u128::from(body[i] - b'0');
-        i += 1;
-    }
-    if i == p + 1 || body.get(i) != Some(&b'"') || v == 0 {
-        return None;
-    }
-    let px_1e12 = i64::try_from((v + DIV_1E12 / 2) / DIV_1E12).ok()?;
-    let px_1e6 = i64::try_from((v + DIV_1E6 / 2) / DIV_1E6).ok()?;
+    let close = p + 1 + memchr::memchr(b'"', body.get(p + 1..)?)?;
+    let (px_1e6, px_1e12) = fav_px(body.get(p + 1..close)?)?;
     Some(ChainlinkPx {
         ts_ms,
         px_1e6,
@@ -162,6 +150,31 @@ fn parse_report(frame: &[u8]) -> Option<ChainlinkPx> {
         asset_at: asset_at as u32,
         asset_len: asset_len as u32,
     })
+}
+
+/// A `full_accuracy_value` — the report as an integer of 18 decimals, the
+/// digits inside its quotes — as ×1e6 and ×1e12, each rounded half up
+/// (shared with PolyBolt, PM15-7). `None` for no digits, a non-digit, more
+/// than [`FAV_DIGITS_MAX`] digits, or zero.
+pub(crate) fn fav_px(digits: &[u8]) -> Option<(i64, i64)> {
+    if digits.is_empty() || digits.len() > FAV_DIGITS_MAX {
+        return None;
+    }
+    let mut v: u128 = 0;
+    let mut i = 0usize;
+    while i < digits.len() {
+        if !digits[i].is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + u128::from(digits[i] - b'0');
+        i += 1;
+    }
+    if v == 0 {
+        return None;
+    }
+    let px_1e12 = i64::try_from((v + DIV_1E12 / 2) / DIV_1E12).ok()?;
+    let px_1e6 = i64::try_from((v + DIV_1E6 / 2) / DIV_1E6).ok()?;
+    Some((px_1e6, px_1e12))
 }
 
 #[cfg(test)]

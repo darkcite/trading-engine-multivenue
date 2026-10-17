@@ -250,6 +250,11 @@ enum Cmd {
     /// `--miss-probe` (PM15-6e, ONE order) sends a $1 FAK priced to miss.
     /// Exit 0, or 78 with the refusal on stderr. Never prints a secret.
     PmExec(PmExecArgs),
+    /// PM15-7: PolyBolt's `price.crypto` and `price.crypto.twap` for the
+    /// assets, on the account's CLOB API credentials (the wrapper sources
+    /// them; never printed), for `--seconds`: the first frames raw, a JSON
+    /// line every 10 s and a final one. No order, no engine.
+    Pm15PolyboltProbe(Pm15ProbeArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -1824,6 +1829,23 @@ fn main() -> ExitCode {
                 }
                 Err(reason) => {
                     eprintln!("pm-exec: {reason}");
+                    ExitCode::from(78)
+                }
+            }
+        }
+        Cmd::Pm15PolyboltProbe(args) => {
+            // JSON lines only on stdout.
+            init_tracing_stderr();
+            let assets: Vec<String> = args
+                .assets
+                .split(',')
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+                .collect();
+            match cli::pm15_polybolt::run(&assets, args.seconds) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("pm15-polybolt-probe: {e}");
                     ExitCode::from(78)
                 }
             }
