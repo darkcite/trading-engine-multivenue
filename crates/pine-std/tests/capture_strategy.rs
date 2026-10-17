@@ -735,7 +735,8 @@ fn view() -> BrokerView {
         sum_trade_pct_1e6: 3_500_000,
         sum_win_pct_1e6: 9_000_000,
         sum_loss_pct_1e6: -5_500_000,
-        _pad: [0; 1],
+        // CAR-R33-1: the broker's f64 net profit, here the integer's own value.
+        netprofit_f64_bits: 250.5f64.to_bits(),
     }
 }
 

@@ -89,7 +89,7 @@ impl NativeBroker {
     pub fn new(meta: &ProgramMeta, cfg: NativeCfg) -> Result<Self, DiagCode> {
         check_native(meta, &cfg)?;
         let d = meta.decl;
-        // COPY: §4.17 #7 the broker by value, 89 408 B, once at construction — init-time move
+        // COPY: §4.17 #7 the broker by value, 89 472 B, once at construction — init-time move
         // into the host's slot — an out-parameter or a boxed broker rejected: the frozen signature.
         let mut b = Self {
             decl: d,
@@ -121,6 +121,8 @@ impl NativeBroker {
             cand: [Cand::default(); cap::ORDERS + cap::LEG_SETS],
         };
         b.exits.load_boot_dirs(&meta.entry_dirs);
+        // CAR-R33-1: the script-visible net profit forms prices on the chart's tick.
+        b.book.set_mintick(meta.chart.mintick_1e6);
         Ok(b)
     }
 

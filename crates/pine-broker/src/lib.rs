@@ -10,7 +10,8 @@
 //!   the position comes from `on_fill` only (LAW E-5). Paper, live, tier-2 replay.
 //!
 //! Doctrine: `pine-ir` is the only dependency; no clock (P5); no global state (P2); no `f64`
-//! (D18: price/qty `i64 ×1e6`, money `i128 ×1e12`); no `dyn`; one heap allocation per broker, in
+//! (D18: price/qty `i64 ×1e6`, money `i128 ×1e12`) — save the script-visible net profit of
+//! `visible` (CAR-R33-1), which no broker law reads; no `dyn`; one heap allocation per broker, in
 //! `new`; no allocation after it; intents COMMIT (W21).
 
 #![deny(missing_docs, unused_must_use, unreachable_pub, unsafe_op_in_unsafe_fn)]
@@ -36,6 +37,7 @@ mod signal;
 mod size;
 mod switch;
 mod tv;
+mod visible;
 
 pub use buf::EngineIntentBuf;
 pub use fault::{code, BrokerFault, InternalDefect, ScriptRefusal};

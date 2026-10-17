@@ -445,6 +445,10 @@ pub(crate) struct Ir {
     pub(crate) var_decls: Vec<(VSlot, VSlot)>,
     /// `max_bars_back(x, n)` (§4.10.4): `(x's slot, n)`, the variable's own cap.
     pub(crate) var_caps: Vec<(VSlot, u32)>,
+    /// `pin:03-hist-dynamic-offset` (CAR-R33-2): every dynamic `x[k]`'s limit constant (an
+    /// un-interned `Const` slot) with its series `x`; lowering's end sets the constant to `x`'s
+    /// own `max_bars_back(x, n)` once every call is seen.
+    pub(crate) hist_guards: Vec<(VSlot, VSlot)>,
     /// `request.security` calls (§4.11.2–§4.11.3): each one's detached expression block and its
     /// element calls' outputs, in lowering order.
     pub(crate) requests: Vec<Request>,
@@ -510,6 +514,17 @@ impl Ir {
         });
         self.consts.insert(key, v);
         self.const_list.push((v, bits, valid));
+        v
+    }
+
+    /// A `Const` slot of its own (never shared through the interning index), so lowering may
+    /// set its bits later ([`Ir::hist_guards`]).
+    pub(crate) fn konst_own(&mut self, info: SlotInfo, bits: u64) -> VSlot {
+        let v = self.slot(SlotInfo {
+            kind: SlotKind::Const,
+            ..info
+        });
+        self.const_list.push((v, bits, true));
         v
     }
 

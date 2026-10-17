@@ -44,6 +44,7 @@ const KNOBS: lower::Knobs<'static> = lower::Knobs {
     timeframe_s: 3600,
     strs: [pine_ir::Sym::NONE; 6],
     own: &[],
+    hist_cap: 5000,
 };
 
 pub(super) fn ir_with(body: &str, d: Dialect, rd: &Readings) -> Ir {
@@ -664,6 +665,58 @@ fn ir_shapes_structures_and_or_follow_w3() {
     )));
 }
 
+/// CAR-R33-3 (`pin:W13-bool-na`, TradingView A079 / F035): a v5 strict `and` / `or` reads an
+/// `na` operand as `false` — `NZ_I t, n, false` before `B_AND` / `B_OR`; a comparison operand
+/// (never `na`) is used as is; v6 bools are never `na` and get no `NZ_I`.
+#[test]
+fn ir_shapes_structures_v5_and_or_read_na_as_false() {
+    let body = "bool n = na
+a = n and true
+b = n or close > open
+plot(a ? 1 : 0)
+plot(b ? 1 : 0)
+";
+    let r = ir(body, Dialect::V5);
+    let o = ops(&r);
+    let nz: Vec<VSlot> = o
+        .iter()
+        .filter_map(|x| match x {
+            Op::Nz { dst, b, .. } => {
+                let f = r.const_list.iter().find(|c| c.0 == *b).expect("a const");
+                assert_eq!((f.1, f.2), (0, true), "nz(n, false)");
+                Some(*dst)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(nz.len(), 2, "one per `n` operand: {o:?}");
+    let bins: Vec<(VSlot, VSlot)> = o
+        .iter()
+        .filter_map(|x| match x {
+            Op::Bin {
+                op: BinOpK::And | BinOpK::Or,
+                a,
+                b,
+                ..
+            } => Some((*a, *b)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(bins.len(), 2);
+    assert_eq!(bins[0].0, nz[0]);
+    assert_eq!(bins[1].0, nz[1]);
+    // `true` and the comparison are never `na`: no NZ_I.
+    assert!(!nz.contains(&bins[0].1) && !nz.contains(&bins[1].1));
+    let r6 = ir(
+        "bool n = false
+a = n and true
+plot(a ? 1 : 0)
+",
+        Dialect::V6,
+    );
+    assert!(!ops(&r6).iter().any(|x| matches!(x, Op::Nz { .. })));
+}
+
 #[test]
 fn ir_shapes_structures_ternary_follows_u14() {
     let body = "x = close > open ? close : open\nplot(x)\n";
@@ -935,13 +988,128 @@ fn ir_shapes_history_reads_slots_and_materialises_expressions() {
     // `(high - low)[1]` reads the temporary the subtraction writes.
     assert_eq!(r.slots[h[1].0 .0 as usize].kind, SlotKind::Temp);
     assert_eq!(h[1].1, Off::Const(1));
-    // A dynamic offset goes through `NZ_I kk, k, −1`.
+    // A dynamic offset goes through `NZ_I kk, k, 0` (CAR-R33-2: `x[na]` is `x[0]`).
     let Off::Dyn(kk) = h[2].1 else {
         panic!("{:?}", h[2])
     };
-    assert!(ops(&r)
+    let Some(Op::Nz { b, .. }) = ops(&r)
+        .into_iter()
+        .find(|o| matches!(o, Op::Nz { dst, .. } if *dst == kk))
+    else {
+        panic!("no NZ_I for the offset")
+    };
+    assert!(r.const_list.iter().any(|c| c.0 == *b && c.1 == 0 && c.2));
+}
+
+/// CAR-R33-2 (`pin:03-hist-dynamic-offset`, TradingView F087 / F089): a dynamic offset below 0
+/// or beyond the series' buffer calls `runtime.error`; the limit is the variable's own
+/// `max_bars_back(x, n)` wherever the call sits, else the knobs' `hist_cap`.
+#[test]
+fn ir_shapes_history_dynamic_offset_is_guarded() {
+    let every = |r: &Ir| -> Vec<Op> {
+        all(r)
+            .into_iter()
+            .filter_map(|s| match s {
+                Stmt::Op(o) => Some(o.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let guard = |r: &Ir| -> Vec<u64> {
+        let rt = op_id("runtime.error");
+        let mut lims = Vec::new();
+        for s in all(r) {
+            let Stmt::If { cond, then, .. } = s else {
+                continue;
+            };
+            if !block_ops(then)
+                .iter()
+                .any(|o| matches!(o, Op::Call { ov, .. } if *ov == rt))
+            {
+                continue;
+            }
+            let Some(Op::Bin {
+                op: BinOpK::Or,
+                b: big,
+                ..
+            }) = every(r)
+                .into_iter()
+                .find(|o| matches!(o, Op::Bin { dst, .. } if dst == cond))
+            else {
+                panic!("the guard's condition is `k < 0 or k > limit`")
+            };
+            let Some(Op::Cmp {
+                op: CmpK::Gt,
+                b: lim,
+                ..
+            }) = every(r)
+                .into_iter()
+                .find(|o| matches!(o, Op::Cmp { dst, .. } if *dst == big))
+            else {
+                panic!("no `k > limit`")
+            };
+            let c = r.const_list.iter().find(|c| c.0 == lim).expect("a const");
+            lims.push(c.1);
+        }
+        lims
+    };
+    let r = ir(
+        "n = bar_index % 3
+plot(close[n])
+",
+        Dialect::V6,
+    );
+    assert_eq!(guard(&r), vec![5000]);
+    // A loop counter is guarded too (a negative counter faults), with no NZ_I.
+    let r = ir(
+        "s = 0.0
+for i = 0 to 2
+    s += close[i]
+plot(s)
+",
+        Dialect::V5,
+    );
+    assert_eq!(guard(&r), vec![5000]);
+    // The variable's own cap, declared after the read.
+    let r = ir(
+        "x = close * 2
+n = bar_index % 3
+y = x[n]
+max_bars_back(x, 300)
+plot(y)
+",
+        Dialect::V6,
+    );
+    assert_eq!(guard(&r), vec![300]);
+    // A constant offset has no guard.
+    assert!(guard(&ir(
+        "plot(close[3])
+",
+        Dialect::V6
+    ))
+    .is_empty());
+}
+
+/// CAR-R33-4: a folded float `%` is rounded to 15 significant digits (TradingView F098).
+#[test]
+fn ir_shapes_folded_float_mod_is_15_digits() {
+    let r = ir(
+        "plot(1.0 % 0.1)
+plot(10.0 % 0.1)
+",
+        Dialect::V6,
+    );
+    for want in [0.1f64, 0.0999999999999995] {
+        assert!(
+            r.const_list.iter().any(|c| c.1 == want.to_bits()),
+            "{want} {:?}",
+            r.const_list
+        );
+    }
+    assert!(!r
+        .const_list
         .iter()
-        .any(|o| matches!(o, Op::Nz { dst, .. } if *dst == kk)));
+        .any(|c| c.1 == 0.09999999999999995f64.to_bits()));
 }
 
 #[test]

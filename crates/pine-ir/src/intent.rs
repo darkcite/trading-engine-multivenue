@@ -270,8 +270,11 @@ pub struct BrokerView {
     pub sum_win_pct_1e6: i64,
     /// A9: the same Σ over losing closed trades (`pnl < 0`; ≤ 0).
     pub sum_loss_pct_1e6: i64,
-    /// Always zero.
-    pub _pad: [u64; 1],
+    /// CAR-R33-1 (r33h): `strategy.netprofit` as TradingView forms it, as `f64::to_bits` (the
+    /// view derives `Eq`) — the f64 running sum, in close order, of every closed slice's
+    /// script-visible profit, less the open trades' paid entry fees. Script-visible only: the
+    /// broker's money stays `netprofit_1e12`. `0` (the default) reads `0.0`.
+    pub netprofit_f64_bits: u64,
 }
 
 const _: () = assert!(core::mem::size_of::<IntentKind>() == 1);
@@ -288,3 +291,6 @@ const _: () = assert!(core::mem::offset_of!(TradeRec, pnl_1e12) == 64);
 const _: () = assert!(core::mem::size_of::<BrokerView>() == 256);
 const _: () = assert!(core::mem::align_of::<BrokerView>() == 64);
 const _: () = assert!(core::mem::offset_of!(BrokerView, equity_1e12) == 80);
+// CAR-R33-1: the former `_pad: [u64; 1]` slot; nothing else moves.
+const _: () = assert!(core::mem::offset_of!(BrokerView, sum_loss_pct_1e6) == 240);
+const _: () = assert!(core::mem::offset_of!(BrokerView, netprofit_f64_bits) == 248);

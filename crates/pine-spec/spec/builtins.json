@@ -289,12 +289,12 @@
         "half_up",
         "half_away"
       ],
-      "v5": "half_up",
-      "v6": "half_up",
+      "v5": "half_away",
+      "v6": "half_away",
       "normative": false,
-      "source": "",
+      "source": "TradingView capture F015 (2026-10-17, v5 and v6): math.round(-0.5) = -1, math.round(-2.5) = -3, 64/64 rows (CAR-R33-8)",
       "pin": "pin:U04-round-ties",
-      "doc": "math.round ties: half_up toward +inf (-2.5 -> -2); half_away away from zero (sema may lower to I_F2I + ROUND only under half_away). Default: REVIEW 4.2"
+      "doc": "math.round ties: half_up toward +inf (-2.5 -> -2); half_away away from zero (sema may lower to I_F2I + ROUND only under half_away). Default half_away: F015 (CAR-R33-8)"
     },
     {
       "id": "int_of_na",

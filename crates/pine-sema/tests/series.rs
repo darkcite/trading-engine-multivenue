@@ -151,8 +151,11 @@ fn series_manifest_cap_above_hard_limit_is_refused() {
     assert_eq!(refused(Dialect::V6, "plot(close)\n", &o), vec![3017]);
 }
 
+/// CAR-R33-2 (`pin:03-hist-dynamic-offset`, TradingView F088): an `na` dynamic offset reads the
+/// current bar — `NZ_I kk, k, 0` before the read — and the read is guarded by a
+/// `runtime.error` call (F087 / F089: a negative offset, or one beyond the buffer, faults).
 #[test]
-fn series_na_dynamic_offset_reads_out_of_range() {
+fn series_na_dynamic_offset_reads_the_current_bar() {
     let mut o = opts(Dialect::V6);
     o.limits.max_bars_back = 10;
     let p = prog(
@@ -160,17 +163,39 @@ fn series_na_dynamic_offset_reads_out_of_range() {
         "k = bar_index > 2 ? 1 : na\nplot(close[k])\n",
         &o,
     );
-    // The offset is guarded by `NZ_I kk, k, −1` before the dynamic read.
     let h = p
         .code
         .iter()
         .position(|i| i.op == op::HIST_F)
         .expect("HIST_F");
     assert_ne!(p.code[h].flags & pine_ir::flg::K_DYNAMIC, 0);
-    let guard = p.code[..h]
+    let nz = p.code[..h]
         .iter()
-        .any(|i| i.op == op::NZ_I && i.dst == p.code[h].b);
-    assert!(guard, "{:?}", p.code);
+        .find(|i| i.op == op::NZ_I && i.dst == p.code[h].b)
+        .unwrap_or_else(|| panic!("{:?}", p.code));
+    // The replacement is the constant 0 (the init block's `I_CONST`).
+    let zero = p
+        .code
+        .iter()
+        .find(|i| i.op == op::I_CONST && i.dst == nz.b)
+        .expect("I_CONST");
+    assert_eq!(p.consts[zero.a as usize], 0);
+    assert!(
+        !p.code.iter().any(|i| i.op == op::NZ_I
+            && p.code.iter().any(|c| c.op == op::I_CONST
+                && c.dst == i.b
+                && p.consts[c.a as usize] == u64::MAX)),
+        "no `NZ_I kk, k, −1` is left"
+    );
+    let rt = pine_spec::lookup("runtime.error")
+        .expect("runtime.error")
+        .ov_lo;
+    assert!(
+        p.code[..h]
+            .iter()
+            .any(|i| i.op == op::CALL_BUILTIN && u32::from(i.a) == u32::from(rt)),
+        "the guard's runtime.error"
+    );
 }
 
 #[test]

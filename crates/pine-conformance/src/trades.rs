@@ -213,6 +213,19 @@ fn pnl_on(a: &TradeRec, basis: PnlBasis) -> i128 {
     }
 }
 
+/// How the expected `cum_pnl` of a closed trade is formed.
+#[derive(Debug, Clone, Copy)]
+pub enum CumPnl<'a> {
+    /// The running P&L on `basis` of the listed closed trades, from a seed (the dropped trades'
+    /// P&L, `pin:06-trade-trim-kept`).
+    Running(i128),
+    /// REQ-r33g-1 (r33h): the broker's net profit just after each listed closed trade was booked
+    /// (`TvBroker::closed_cum_net`, oldest retained first) — TradingView's `cum_pnl` includes the
+    /// still-open trades' paid entry fees (E062: −1602.94 = −1596.94 − six 1 USD fees). Net basis;
+    /// a trade without a recorded value compares the running sum.
+    Recorded(&'a [i128]),
+}
+
 /// One trade; `cum` is the running closed P&L on `basis` through this trade.
 fn compare_one(
     e: &TradeRow,
@@ -316,6 +329,32 @@ pub fn compare_trades_kept(
     signals: &SignalTable,
     basis: PnlBasis,
 ) -> Option<TradeDiv> {
+    compare_trades_cum(
+        expected,
+        actual,
+        evicted,
+        CumPnl::Running(cum_seed),
+        syms,
+        signals,
+        basis,
+    )
+}
+
+/// [`compare_trades_kept`] with the expected `cum_pnl` formed as `cum` says: `actual` is
+/// closed-then-open, so closed trade `i` is `actual[i]` and `CumPnl::Recorded(v)[i]`'s.
+pub fn compare_trades_cum(
+    expected: &[TradeRow],
+    actual: &[TradeRec],
+    evicted: u32,
+    cum: CumPnl<'_>,
+    syms: &SymTable,
+    signals: &SignalTable,
+    basis: PnlBasis,
+) -> Option<TradeDiv> {
+    let (cum_seed, recorded) = match cum {
+        CumPnl::Running(seed) => (seed, None),
+        CumPnl::Recorded(v) => (0, Some(v)),
+    };
     if evicted > 0 {
         if let Some(e) = expected.first() {
             if e.n != evicted + 1 {
@@ -332,7 +371,11 @@ pub fn compare_trades_kept(
         if a.flags & trade_flag::OPEN == 0 {
             cum += pnl_on(a, basis);
         }
-        if let Some(d) = compare_one(&expected[i], a, cum, syms, signals, basis) {
+        let at = match recorded.and_then(|v| v.get(i)) {
+            Some(r) if a.flags & trade_flag::OPEN == 0 => *r,
+            _ => cum,
+        };
+        if let Some(d) = compare_one(&expected[i], a, at, syms, signals, basis) {
             first = Some((i, d));
             break;
         }

@@ -134,6 +134,12 @@ fn compile_with(
                 timeframe_s: opts.chart.timeframe_s,
                 strs: fold_strs(&files, opts, d, &mut syms),
                 own: &own,
+                // CAR-R33-2: the declared buffer, else the manifest's (§4.10.4 keeps D <= M).
+                hist_cap: if decl.max_bars_back > 0 {
+                    decl.max_bars_back
+                } else {
+                    opts.limits.max_bars_back
+                },
             };
             let ir = lower::lower(&typed, &tree, &resolved, &files, &syms, rd, d, knobs);
             let udt_fields: Vec<u16> = typed.udts.iter().map(|u| u.fields.len() as u16).collect();

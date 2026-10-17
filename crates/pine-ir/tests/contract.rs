@@ -372,3 +372,28 @@ fn default_pods_are_all_zero_and_none() {
     assert_eq!(StepOutcome::Ok, StepOutcome::Ok);
     assert_eq!(CONTRACT_VERSION, 4);
 }
+
+/// CAR-R33-1 (r33h): `BrokerView::netprofit_f64_bits` carries an f64 by its bits — the default
+/// view reads `+0.0`, and every f64 (−0.0, a NaN payload, a subnormal) round-trips exactly, so the
+/// view's derived `Eq` compares the value bit for bit.
+#[test]
+fn broker_view_netprofit_f64_bits_round_trip() {
+    assert_eq!(
+        f64::from_bits(BrokerView::default().netprofit_f64_bits).to_bits(),
+        0.0f64.to_bits()
+    );
+    for v in [
+        -1595.800000000003f64,
+        -0.0,
+        f64::MIN_POSITIVE / 2.0,
+        f64::from_bits(0x7ff8_0000_0000_0001),
+    ] {
+        let b = BrokerView {
+            netprofit_f64_bits: v.to_bits(),
+            ..BrokerView::default()
+        };
+        assert_eq!(f64::from_bits(b.netprofit_f64_bits).to_bits(), v.to_bits());
+        assert_eq!(b, b);
+        assert_ne!(b, BrokerView::default());
+    }
+}

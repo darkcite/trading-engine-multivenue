@@ -4,7 +4,8 @@
 //! impl-05 §7.10 `grep_gates.rs` — the source greps over `crates/pine-broker/src` with comments,
 //! string literals and `#[cfg(test)]` items stripped:
 //! * `no_float_no_eight_decimal_scale_no_clock_no_dyn` (I4, P5) — no `f64` / `f32` / float
-//!   literal, no `100_000_000`, no `std::time` / `Instant` / `SystemTime`, no `dyn`;
+//!   literal, no `100_000_000`, no `std::time` / `Instant` / `SystemTime`, no `dyn`; floats only
+//!   in `visible.rs`, the script-visible net profit no broker law reads (CAR-R33-1, r33h);
 //! * `allocation_only_in_closed_ring_new` (I4) — no `Vec` / `String` / `vec!` / `format!` /
 //!   `Box::new` / `to_string` / `to_vec` / `to_owned` / `collect` outside `ClosedRing::new`, and
 //!   no closure handed to an iterator loop;
@@ -251,7 +252,13 @@ fn bad_number(code: &str, t: &Tok<'_>) -> Option<&'static str> {
     None
 }
 
-/// Gate I4 / P5 over one file's code: floats, the 1e8 scale, clocks, `dyn`.
+/// CAR-R33-1 (r33h): the one source file that may name a float — `strategy.netprofit` as
+/// TradingView forms it, an f64 the book carries as bits and no broker law reads. Its clocks,
+/// `dyn` and 1e8 scale stay gated.
+const FLOAT_FILE: &str = "visible.rs";
+
+/// Gate I4 / P5 over one file's code: floats (outside [`FLOAT_FILE`]), the 1e8 scale, clocks,
+/// `dyn`.
 fn gate_float_scale_clock_dyn(file: &str, raw: &str) -> Vec<String> {
     let code = code_of(raw);
     let mut v = Vec::new();
@@ -263,6 +270,10 @@ fn gate_float_scale_clock_dyn(file: &str, raw: &str) -> Vec<String> {
             "time" if code[..t.at].trim_end().ends_with("std::") => Some("std::time"),
             _ => bad_number(&code, &t),
         };
+        let float = matches!(hit, Some("float type" | "float literal"));
+        if float && file == FLOAT_FILE {
+            continue;
+        }
         if let Some(h) = hit {
             v.push(format!("{file}:{}: {h} `{}`", t.line, t.text));
         }
@@ -680,6 +691,21 @@ fn the_float_scale_clock_dyn_gate_is_live() {
     ] {
         assert_eq!(
             gate_float_scale_clock_dyn("bad.rs", bad).len(),
+            1,
+            "missed: {bad}"
+        );
+    }
+    // CAR-R33-1: `visible.rs` may name floats, nothing else gated; no other file may.
+    let vis = "fn a(n: u64, p: f64) -> u64 { (f64::from_bits(n) + p * 1e-8 + 0.5).to_bits() }";
+    assert!(gate_float_scale_clock_dyn(FLOAT_FILE, vis).is_empty());
+    assert_eq!(gate_float_scale_clock_dyn("book.rs", vis).len(), 4); // f64 ×2, 1e-8, 0.5
+    for bad in [
+        "const S: i64 = 100_000_000;",
+        "fn a() { let t = Instant::now(); }",
+        "fn a(x: &dyn Fn()) {}",
+    ] {
+        assert_eq!(
+            gate_float_scale_clock_dyn(FLOAT_FILE, bad).len(),
             1,
             "missed: {bad}"
         );

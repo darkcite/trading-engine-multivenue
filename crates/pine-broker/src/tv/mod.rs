@@ -159,9 +159,9 @@ impl TvBroker {
         let path_points = sw.history_tick == HistoryTick::PathPoints;
         check_tv(meta, &cfg, path_points)?;
         let d = meta.decl;
-        // COPY: §4.17 #7 the broker by value, 76 096 B, once at construction — init-time move
+        // COPY: §4.17 #7 the broker by value, 76 160 B, once at construction — init-time move
         // into the host's slot — an out-parameter or a boxed broker rejected: the frozen signature.
-        Ok(Self {
+        let mut b = Self {
             decl: d,
             chart: meta.chart,
             dialect: meta.dialect,
@@ -197,7 +197,10 @@ impl TvBroker {
             eval_px_1e6: 0,
             hist: path_points && d.flags & decl_flag::CALC_ON_EVERY_HISTORY_TICK != 0,
             hist_done: HIST_ALL,
-        })
+        };
+        // CAR-R33-1: the script-visible net profit forms prices on the chart's tick.
+        b.book.set_mintick(meta.chart.mintick_1e6);
+        Ok(b)
     }
 
     /// Starts `bar`: marks at the open, walks the intrabar path filling the orders committed so
@@ -363,6 +366,15 @@ impl TvBroker {
     #[must_use]
     pub fn closed_trade(&self, i: u32) -> Option<&TradeRec> {
         self.book.closed_trade(i)
+    }
+
+    /// REQ-r33g-1: the net profit ×1e12 just after closed trade `i` (0 = oldest retained) was
+    /// booked — what `strategy.netprofit` read at that moment: the closed trades' P&L so far less
+    /// the still-open trades' paid entry fees (`pin:05-openprofit-fees`). TradingView's List of
+    /// Trades prints it as the trade's cumulative P&L (E062). `None` past `closed_retained`.
+    #[must_use]
+    pub fn closed_cum_net(&self, i: u32) -> Option<i128> {
+        self.book.closed_cum_net(i)
     }
 
     /// Every refusal and adjustment so far (§4.15).

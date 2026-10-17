@@ -1675,7 +1675,8 @@ impl<'a, 's> Infer<'a, 's> {
                             BinOp::Sub => a - b,
                             BinOp::Mul => a * b,
                             BinOp::Div => fold::f_div(a, b, self.rd),
-                            _ => fold::f_mod(a, b, self.rd),
+                            // CAR-R33-4: the folded `%` is rounded to 15 significant digits.
+                            _ => fold::sig15(fold::f_mod(a, b, self.rd)),
                         })),
                         _ => None,
                     };

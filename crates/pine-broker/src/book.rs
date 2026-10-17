@@ -6,6 +6,10 @@
 //! Written by [`Book::apply_fill`] and [`Book::mark`] only. Every check that can refuse a fill runs
 //! before the first mutation, so a refused fill leaves the book untouched. Zero allocation after
 //! [`Book::new`] (whose `ClosedRing` is the crate's one allocation); index loops.
+//!
+//! CAR-R33-1 (r33h): beside `netprofit_1e12` the book keeps `strategy.netprofit` as TradingView
+//! forms it, an f64 running sum ([`crate::visible`]); it is lent to the script through
+//! `BrokerView::netprofit_f64_bits` and read by no broker law.
 
 use crate::cap;
 use crate::closed::ClosedRing;
@@ -13,6 +17,7 @@ use crate::fault::{BrokerFault, InternalDefect, ScriptRefusal};
 use crate::money::{
     e12_to_1e6_ceil, e12_to_1e6_floor, mul_div, trade_pct_1e6, usd_1e6_to_1e12, E6,
 };
+use crate::visible;
 use pine_ir::{trade_flag, BrokerView, StrKey, Sym, TradeRec};
 
 /// `cap::LOTS − 1`: the ring mask (`LOTS` is a power of two).
@@ -109,12 +114,18 @@ pub(crate) struct Book {
     n: u16,
     next_open_seq: u32,
     pv_1e6: i64,
+    /// `chart.mintick_1e6` — the tick of the script-visible price formation
+    /// ([`visible::px_f64`]); 0 until [`Book::set_mintick`] (prices then read `px / 1e6`).
+    mt_1e6: i64,
     close_any: bool,
     position_1e6: i64,
     avg_px_1e6: i64,
     mark_1e6: i64,
     initial_1e12: i128,
     netprofit_1e12: i128,
+    /// CAR-R33-1: the f64 running sum of the closed slices' script-visible profits, in close
+    /// order ([`visible::add_slice`]), held as `f64::to_bits` (D18: the book names no float).
+    net_f64_bits: u64,
     grossprofit_1e12: i128,
     grossloss_1e12: i128,
     commission_1e12: i128,
@@ -157,12 +168,14 @@ impl Book {
             n: 0,
             next_open_seq: 0,
             pv_1e6: 0,
+            mt_1e6: 0,
             close_any: false,
             position_1e6: 0,
             avg_px_1e6: 0,
             mark_1e6: 0,
             initial_1e12: 0,
             netprofit_1e12: 0,
+            net_f64_bits: 0,
             grossprofit_1e12: 0,
             grossloss_1e12: 0,
             commission_1e12: 0,
@@ -192,7 +205,8 @@ impl Book {
     }
 
     /// Back to the empty book of [`Book::new`], IN PLACE: the closed ring is cleared, never
-    /// reallocated (I3/I4 — the D19 boot reconciliation runs after `new`).
+    /// reallocated (I3/I4 — the D19 boot reconciliation runs after `new`). The mintick of
+    /// [`Book::set_mintick`] is a chart constant and stays.
     pub(crate) fn reset(&mut self, initial_capital_1e6: i64, pointvalue_1e6: i64, close_any: bool) {
         let initial = usd_1e6_to_1e12(initial_capital_1e6);
         let mut i = 0;
@@ -214,6 +228,7 @@ impl Book {
         self.mark_1e6 = 0;
         self.initial_1e12 = initial;
         self.netprofit_1e12 = 0;
+        self.net_f64_bits = 0;
         self.grossprofit_1e12 = 0;
         self.grossloss_1e12 = 0;
         self.commission_1e12 = 0;
@@ -240,6 +255,12 @@ impl Book {
         self.refresh_view();
     }
 
+    /// The chart's mintick ×1e6 for the script-visible price formation (CAR-R33-1); each broker
+    /// sets it once after [`Book::new`]. Changes no integer.
+    pub(crate) fn set_mintick(&mut self, mintick_1e6: i64) {
+        self.mt_1e6 = mintick_1e6;
+    }
+
     /// Ring slot of open trade `i`.
     const fn slot(&self, i: usize) -> usize {
         (self.head as usize + i) & MASK
@@ -261,6 +282,13 @@ impl Book {
     /// Closed trade `i` (0 = oldest retained).
     pub(crate) fn closed_trade(&self, i: u32) -> Option<&TradeRec> {
         self.closed.get(i)
+    }
+
+    /// REQ-r33g-1: the net profit ×1e12 the view read just after closed trade `i` (0 = oldest
+    /// retained) was booked — the closed trades' P&L so far less the still-open trades' paid entry
+    /// fees (`pin:05-openprofit-fees`), TradingView's List of Trades `cum_pnl`.
+    pub(crate) fn closed_cum_net(&self, i: u32) -> Option<i128> {
+        self.closed.cum_net(i)
     }
 
     /// Fills booked.
@@ -319,6 +347,18 @@ impl Book {
             return None;
         }
         Some(self.lot_flags[self.slot(i as usize)])
+    }
+
+    /// Σ fee over the open trades: their paid entry fees (`pin:05-openprofit-fees`).
+    fn open_fees_1e12(&self) -> i128 {
+        let n = usize::from(self.n);
+        let mut s = 0_i128;
+        let mut i = 0;
+        while i < n {
+            s = s.saturating_add(self.lots[self.slot(i)].fee_1e12);
+            i += 1;
+        }
+        s
     }
 
     /// Σ |qty| over the open trades.
@@ -417,6 +457,8 @@ impl Book {
         let mut fee_left = fee_1e12;
         let mut qty_left = aq;
         let mut red_left = red;
+        // REQ-r33g-1: the open trades' paid entry fees, kept current slice by slice.
+        let mut open_fees = if red > 0 { self.open_fees_1e12() } else { 0 };
         while red_left > 0 {
             let i = self.next_to_close(src.named_entry);
             let s = self.slot(i);
@@ -450,7 +492,21 @@ impl Book {
             let c_qty = i64::try_from(sign * n).unwrap_or(0);
             let c_fee = entry_share.saturating_add(exit_share);
             let c_pnl = gross_1e12(sign, px_1e6, l_entry, n, self.pv_1e6).saturating_sub(c_fee);
-            let c = self.closed.push_slot();
+            // CAR-R33-1 (`pin:04-trade-profit-f64`, `pin:05-net-f64-fees-provisional`): the
+            // slice's script-visible profit joins the f64 running sum in close order.
+            self.net_f64_bits = visible::add_slice(
+                self.net_f64_bits,
+                l_entry,
+                px_1e6,
+                c_qty,
+                entry_share,
+                exit_share,
+                self.mt_1e6,
+                self.pv_1e6,
+            );
+            // The lot gives up `entry_share` below (removed when it reaches zero).
+            open_fees = open_fees.saturating_sub(entry_share);
+            let (c, cum) = self.closed.push_slot();
             // COPY: §4.17 #1 lot → closed-ring slot, 128 B, once per closed slice — the ring owns
             // an immutable record while the lot slot is reused — a local staging copy (2×) rejected.
             *c = self.lots[s];
@@ -466,6 +522,10 @@ impl Book {
             c.exit_ms = time_ms;
             c.exit_bar = bar_index;
             self.netprofit_1e12 = self.netprofit_1e12.saturating_add(c_pnl);
+            // REQ-r33g-1 (r33g, TV E062): TradingView's `cum_pnl` after a close is the net profit
+            // at that moment — the still-open trades' paid entry fees included (−1602.94 =
+            // −1596.94 − six 1 USD entry fees); recorded beside the record, same ring.
+            *cum = self.netprofit_1e12.saturating_sub(open_fees);
             // A9: the closed record's percents, read as `closedtrades.*_percent` reads it.
             let (c_ru, c_dd) = (c.max_runup_1e6, c.max_drawdown_1e6);
             self.roll_trade_pcts(c_ru, c_dd, l_entry, c_qty);
@@ -644,12 +704,7 @@ impl Book {
     /// `margin_liquidation_price_1e6` is the TV margin module's (§4.9.3) and is left as it is.
     fn refresh_view(&mut self) {
         let eq = self.equity_1e12();
-        let mut open_fees = 0_i128;
-        let mut i = 0;
-        while i < usize::from(self.n) {
-            open_fees = open_fees.saturating_add(self.lots[self.slot(i)].fee_1e12);
-            i += 1;
-        }
+        let open_fees = self.open_fees_1e12();
         let entry_name = if self.n == 0 {
             StrKey::NONE
         } else {
@@ -687,7 +742,9 @@ impl Book {
         v.sum_trade_pct_1e6 = self.sum_trade_pct_1e6;
         v.sum_win_pct_1e6 = self.sum_win_pct_1e6;
         v.sum_loss_pct_1e6 = self.sum_loss_pct_1e6;
-        v._pad = [0; 1];
+        // CAR-R33-1: the f64 net profit, less the open trades' paid entry fees as the integer
+        // `netprofit_1e12` above (`pin:05-openprofit-fees`).
+        v.netprofit_f64_bits = visible::view_bits(self.net_f64_bits, open_fees);
     }
 }
 
@@ -815,7 +872,6 @@ mod tests {
             (all, win, loss),
             "A9 sums"
         );
-        assert_eq!(v._pad, [0; 1]);
     }
 
     /// A9 by hand: long 2 @ 100 marked 90 then 110 (drawdown and run-up $20 on a $200 base:

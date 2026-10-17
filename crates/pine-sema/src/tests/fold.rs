@@ -36,6 +36,21 @@ fn fold_truncated_mod_has_the_dividends_sign() {
 }
 
 #[test]
+fn fold_float_mod_rounds_to_15_significant_digits() {
+    // CAR-R33-4 (TradingView F098, folded columns): the folded `%` is the VM's `F_MOD` rounded
+    // to 15 significant digits; the series columns keep the exact remainder (`f_mod` itself).
+    let rd = v5();
+    assert_eq!(fold::f_mod(1.0, 0.1, &rd), 0.09999999999999995);
+    assert_eq!(fold::sig15(fold::f_mod(1.0, 0.1, &rd)), 0.1);
+    assert_eq!(fold::sig15(fold::f_mod(10.0, 0.1, &rd)), 0.0999999999999995);
+    assert_eq!(fold::sig15(fold::f_mod(-0.3, 0.1, &rd)), -0.1);
+    assert_eq!(fold::sig15(fold::f_mod(807.25, -2.5, &rd)), 2.25);
+    assert!(fold::sig15(fold::f_mod(1.0, 0.0, &rd)).is_nan());
+    assert_eq!(fold::sig15(f64::INFINITY), f64::INFINITY);
+    assert_eq!(fold::sig15(-0.0).to_bits(), (-0.0f64).to_bits());
+}
+
+#[test]
 fn fold_int_arith_wraps() {
     assert_eq!(fold::i_add(i64::MAX, 1), i64::MIN);
     assert_eq!(fold::i_sub(i64::MIN, 1), i64::MAX);
@@ -68,13 +83,15 @@ fn fold_float_div_zero_reads_u15() {
 
 #[test]
 fn fold_round_reads_u04() {
+    // CAR-R33-8 (F015, 64/64): ties go away from zero by default in both dialects.
     let mut rd = v5();
-    assert_eq!(rd.round_ties, pine_spec::swr::ROUND_TIES_HALF_UP);
-    assert_eq!(fold::round(-2.5, &rd), Some(-2));
-    assert_eq!(fold::round(2.5, &rd), Some(3));
-    rd.round_ties = pine_spec::swr::ROUND_TIES_HALF_AWAY;
+    assert_eq!(rd.round_ties, pine_spec::swr::ROUND_TIES_HALF_AWAY);
     assert_eq!(fold::round(-2.5, &rd), Some(-3));
+    assert_eq!(fold::round(-0.5, &rd), Some(-1));
+    assert_eq!(fold::round(2.5, &rd), Some(3));
     assert_eq!(fold::round(f64::NAN, &rd), None);
+    rd.round_ties = pine_spec::swr::ROUND_TIES_HALF_UP;
+    assert_eq!(fold::round(-2.5, &rd), Some(-2));
 }
 
 #[test]

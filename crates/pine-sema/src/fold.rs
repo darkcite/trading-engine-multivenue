@@ -30,6 +30,19 @@ pub(crate) fn f_mod(a: f64, b: f64, rd: &Readings) -> f64 {
     non_finite(a % b, rd)
 }
 
+/// `pin:03-float-mod` (CAR-R33-4, TradingView F098): a folded float `%` is the VM's `F_MOD`
+/// rounded to 15 significant decimal digits — `1.0 % 0.1` is `0.1`, `10.0 % 0.1` is
+/// `0.0999999999999995`, `-0.3 % 0.1` is `-0.1` (3 of 3 folded columns), while the same `%` on a
+/// series is the exact remainder (F098's series columns). Non-finite values pass through.
+/// `pin:02-fold-sig15-ties`: an exact decimal tie at the 16th digit takes Rust's correctly
+/// rounded `{:.14e}` (the capture is silent on ties).
+pub(crate) fn sig15(x: f64) -> f64 {
+    if !x.is_finite() {
+        return x;
+    }
+    format!("{x:.14e}").parse::<f64>().unwrap_or(x)
+}
+
 /// U15's rule on a float result.
 fn non_finite(r: f64, rd: &Readings) -> f64 {
     if rd.float_div_zero == swr::FLOAT_DIV_ZERO_NA && !r.is_finite() {

@@ -63,6 +63,10 @@ pub(crate) struct Knobs<'a> {
     /// `ticker_map` ticker mapped to it (as 5a's `target` resolves them) — for the child's
     /// capture defaults (`pin:02-child-capture-decl-defaults`).
     pub(crate) own: &'a [Sym],
+    /// The historical buffer's limit of a series without its own `max_bars_back(x, n)`: the
+    /// declaration's `max_bars_back`, else the manifest's (`pin:03-hist-dynamic-offset`,
+    /// CAR-R33-2) — never above the ring demand `C` (§4.10.4), so a guarded `x[k]` stays in its ring.
+    pub(crate) hist_cap: u32,
 }
 
 /// [`Knobs::strs`]' index of `syminfo.tickerid`; `ticker` … `type` follow, `timeframe.period` last.
@@ -212,6 +216,14 @@ pub(crate) fn lower(
     let mut body = lw.prelude;
     body.extend(lw.out);
     ir.body = Block(body);
+    // CAR-R33-2: a series' own `max_bars_back(x, n)` is its buffer's limit, wherever the call sits.
+    for i in 0..ir.hist_guards.len() {
+        let (c, src) = ir.hist_guards[i];
+        let own = ir.var_caps.iter().filter(|v| v.0 == src).map(|v| v.1).max();
+        if let (Some(n), Some(e)) = (own, ir.const_list.iter_mut().find(|e| e.0 == c)) {
+            e.1 = u64::from(n);
+        }
+    }
     // §4.14.8: every `hline` after every other index — shift their `__plot` past the others.
     let base = ir.plots.len() as u64;
     fix_hlines(&mut ir.body, base, d);
@@ -2043,7 +2055,9 @@ impl Lower<'_> {
         let at = self.ast.span(n);
         let a = self.cond(lhs)?;
         if self.rd.and_or == swr::AND_OR_STRICT {
+            let a = self.na_as_false(a, at);
             let b = self.cond(rhs)?;
+            let b = self.na_as_false(b, at);
             let k = if op == BinOp::And {
                 BinOpK::And
             } else {
@@ -2066,6 +2080,42 @@ impl Lower<'_> {
             self.push_if(t, Block::default(), Vec::new(), rb, rd, CondKind::LazyAndOr);
         }
         Ok(t)
+    }
+
+    /// `pin:W13-bool-na` (CAR-R33-3, TradingView A079 / F035, v5): an `na` operand of a strict
+    /// `and` / `or` reads as `false` and the result is never `na` — `na and true` and `na and
+    /// false` are `false`, `na or true` is `true` (every captured row). `v` as `nz(v, false)` when
+    /// it is a `bool` that can be `na` (`BoolNa = nullable`); a valid constant, or a result the
+    /// last emitted operation made never-`na` (a comparison, `na()`, a nested `and` / `or`), is
+    /// returned as is.
+    fn na_as_false(&mut self, v: VSlot, at: Span) -> VSlot {
+        if self.rd.bool_na != swr::BOOL_NA_NULLABLE || self.slot_ty(v).ty != Ty::Bool {
+            return v;
+        }
+        let kind = self.ir.slots.get(v.0 as usize).map(|s| s.kind);
+        if kind == Some(SlotKind::Const) && self.ir.const_list.iter().any(|c| c.0 == v && c.2) {
+            return v;
+        }
+        let fresh = matches!(
+            self.out.last(),
+            Some(Stmt::Op(
+                Op::Cmp { dst, .. }
+                    | Op::NaCheck { dst, .. }
+                    | Op::Nz { dst, .. }
+                    | Op::Bin {
+                        op: BinOpK::And | BinOpK::Or,
+                        dst,
+                        ..
+                    }
+            )) if *dst == v
+        );
+        if fresh {
+            return v;
+        }
+        let f = self.konst(K::Bool(false), scalar(Ty::Bool, Qual::Const), at);
+        let t = self.temp(self.slot_ty(v), at);
+        self.op(Op::Nz { dst: t, a: v, b: f });
+        t
     }
 
     /// `switch`: the subject once; arms test `subject == pattern` (or their own condition) in
@@ -2737,8 +2787,9 @@ impl Lower<'_> {
     // ---- history (T12, §4.4.6, §4.10.2) ------------------------------------------------------
 
     /// `e[k]`: `x[0]` is the slot itself; a constant `k ≥ 1` reads `K::Const`, a dynamic one its
-    /// slot through `NZ_I kk, k, −1` (an `na` offset reads out of range). A base pass 3 listed as
-    /// materialised reads a temporary written where the expression stands.
+    /// slot through `NZ_I kk, k, 0` (CAR-R33-2: an `na` offset reads the current bar) behind
+    /// [`Self::hist_guard`]. A base pass 3 listed as materialised reads a temporary written where
+    /// the expression stands.
     fn hist(&mut self, n: NodeId, base: NodeId, offset: NodeId, ty: TypeQ) -> Result<VSlot, Diag> {
         use crate::ir::K as Off;
         let at = self.ast.span(n);
@@ -2755,23 +2806,84 @@ impl Lower<'_> {
             Some(_) => return Err(self.todo(offset, "a non-int constant offset")),
             None => {
                 let kv = self.expr(offset)?;
-                if self.ir.slots.get(kv.0 as usize).map(|s| s.kind) == Some(SlotKind::Counter) {
-                    Off::Dyn(kv)
+                let kk = if self.ir.slots.get(kv.0 as usize).map(|s| s.kind)
+                    == Some(SlotKind::Counter)
+                {
+                    kv
                 } else {
-                    let m1 = self.konst(K::Int(-1), scalar(Ty::Int, Qual::Const), at);
+                    // pin:03-hist-dynamic-offset (CAR-R33-2, TradingView F088): an `na` offset
+                    // reads the current bar, `x[na]` is `x[0]` (16 of 16 captured rows).
+                    let z = self.konst(K::Int(0), scalar(Ty::Int, Qual::Const), at);
                     let kk = self.temp(scalar(Ty::Int, Qual::Series), at);
                     self.op(Op::Nz {
                         dst: kk,
                         a: kv,
-                        b: m1,
+                        b: z,
                     });
-                    Off::Dyn(kk)
-                }
+                    kk
+                };
+                self.hist_guard(kk, src, at)?;
+                Off::Dyn(kk)
             }
         };
         let dst = self.temp(ty, at);
         self.op(Op::Hist { dst, src, k });
         Ok(dst)
+    }
+
+    /// `pin:03-hist-dynamic-offset` (CAR-R33-2, TradingView F087 / F089): a dynamic offset `k`
+    /// below 0 or beyond the series' historical buffer is TradingView's runtime error ("If a
+    /// script references values beyond the historical buffer's limit, it causes a runtime
+    /// error", the *Limitations* page) — `if k < 0 or k > limit` calls pine-std's `runtime.error`
+    /// (`ScriptRefused`), as `step_check` does. The limit is `x`'s own `max_bars_back(x, n)`,
+    /// else [`Knobs::hist_cap`]; an offset within it but beyond the bars seen so far stays `na`
+    /// (row 0 of F087–F089: `x[1]` on the first bar). An `na` counter compares false.
+    fn hist_guard(&mut self, k: VSlot, src: VSlot, at: Span) -> Result<(), Diag> {
+        const MSG: &str =
+            "The requested historical offset is beyond the historical buffer's limit.";
+        let z = self.konst(K::Int(0), scalar(Ty::Int, Qual::Const), at);
+        let info = self.info(scalar(Ty::Int, Qual::Const), SlotKind::Const, Sym::NONE, at);
+        let lim = self.ir.konst_own(info, u64::from(self.knobs.hist_cap));
+        self.ir.hist_guards.push((lim, src));
+        let b = scalar(Ty::Bool, Qual::Series);
+        let (neg, big, bad) = (self.temp(b, at), self.temp(b, at), self.temp(b, at));
+        self.op(Op::Cmp {
+            op: CmpK::Lt,
+            dst: neg,
+            a: k,
+            b: z,
+        });
+        self.op(Op::Cmp {
+            op: CmpK::Gt,
+            dst: big,
+            a: k,
+            b: lim,
+        });
+        self.op(Op::Bin {
+            op: BinOpK::Or,
+            dst: bad,
+            a: neg,
+            b: big,
+        });
+        let ov = self.helper("runtime.error", at)?;
+        let ((), fault, _) = self.region(|x| {
+            x.op(Op::Call {
+                ov,
+                args: vec![Arg::Str(MSG)],
+                outs: Vec::new(),
+                span: at,
+            });
+            Ok(())
+        })?;
+        self.push_if(
+            bad,
+            fault,
+            Vec::new(),
+            Block::default(),
+            Vec::new(),
+            CondKind::If,
+        );
+        Ok(())
     }
 
     // ---- argument windows (T12, §4.14.5) ---------------------------------------------------

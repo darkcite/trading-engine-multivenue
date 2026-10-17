@@ -504,9 +504,11 @@ pub enum Var {
     PositionSize,
     /// `position_avg_price` (×1e6; 0 → na; read as [`px_f64`] forms it).
     PositionAvgPrice,
-    /// `equity` (×1e12).
+    /// `equity` = `(initial_capital + netprofit) + openprofit` in f64 over the reads of
+    /// [`Var::NetProfit`] and [`open_profit_f64`] (CAR-R33-1); where the open profit falls back,
+    /// `equity_1e12`.
     Equity,
-    /// `netprofit` (×1e12).
+    /// `netprofit` (`BrokerView::netprofit_f64_bits`, CAR-R33-1).
     NetProfit,
     /// `openprofit` (the f64 sum of [`open_profit_f64`], else ×1e12).
     OpenProfit,
@@ -541,7 +543,8 @@ pub enum Var {
     /// `closedtrades.first_index` = `closedtrades − closed_retained` (int).
     FirstIndex,
     /// `netprofit_percent` = `netprofit / initial_capital × 100` ("the total value of all
-    /// completed trades, expressed as a percentage of the initial capital").
+    /// completed trades, expressed as a percentage of the initial capital"), over the f64
+    /// `netprofit` (CAR-R33-1).
     NetProfitPct,
     /// `grossprofit_percent` = `grossprofit / initial_capital × 100`.
     GrossProfitPct,
@@ -760,6 +763,7 @@ fn round_sig10(v: f64) -> f64 {
 pub fn bi_var<const V: u8>(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     const OP: u8 = Var::OpenProfit as u8;
     const OPP: u8 = Var::OpenProfitPct as u8;
+    const EQ: u8 = Var::Equity as u8;
     let e = out_of(args, 0)?;
     let int_out = pine_ir::argwin::is_i64(e);
     let x = Fmt::of(f);
@@ -769,7 +773,7 @@ pub fn bi_var<const V: u8>(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result
         None if int_out => Val::I(None),
         None => Val::F(f64::NAN),
         Some(b) => {
-            let open = if V == OP || V == OPP {
+            let open = if V == OP || V == OPP || V == EQ {
                 open_profit_f64(ctx, b, close_1e6, x)
             } else {
                 None
@@ -817,11 +821,22 @@ fn read_var(b: &BrokerView, v: u8, x: Fmt, open: Option<f64>) -> Val {
     const ALP: u8 = Var::AvgLossTradePct as u8;
     let ic = scale::from_1e12(b.initial_capital_1e12);
     let op = open.unwrap_or_else(|| scale::from_1e12(b.openprofit_1e12));
+    // CAR-R33-1 (`pin:04-netprofit-f64`, r33h): `strategy.netprofit` is the broker's f64 running
+    // sum of the closed slices' script-visible profits, less the open trades' paid entry fees —
+    // E086 4320/4320 rows (`netprofit_1e12 / 1e12` 72), E118 `netprofit_percent` 4320/4320 (72).
+    let np = f64::from_bits(b.netprofit_f64_bits);
     match v {
         PS => Val::F(qty_f64(b.position_size_1e6)),
         PAP => Val::F(nz_px(b.position_avg_price_1e6, x.mt_1e6)),
-        EQ => Val::F(scale::from_1e12(b.equity_1e12)),
-        NP => Val::F(scale::from_1e12(b.netprofit_1e12)),
+        // `pin:04-equity-f64` (r33h): `(initial_capital + netprofit) + openprofit`, in that order,
+        // over the f64 reads — E085 4320/4320 rows (`ic + (np + op)` 3697, `equity_1e12` 3396),
+        // E114 4320/4320 at a 0.1 % commission (`equity_1e12` 3732). Where the open profit is not
+        // the bar close's (`open_profit_f64` → `None`), `equity_1e12 / 1e12` as before.
+        EQ => Val::F(match open {
+            Some(o) => (ic + np) + o,
+            None => scale::from_1e12(b.equity_1e12),
+        }),
+        NP => Val::F(np),
         OP => Val::F(op),
         GP => Val::F(scale::from_1e12(b.grossprofit_1e12)),
         GL => Val::F(scale::from_1e12(b.grossloss_1e12)),
@@ -840,7 +855,9 @@ fn read_var(b: &BrokerView, v: u8, x: Fmt, open: Option<f64>) -> Val {
         LT => Val::I(Some(b.losstrades as i64)),
         ET => Val::I(Some(b.eventrades as i64)),
         FI => Val::I(Some(first_index(b) as i64)),
-        NPP => Val::F(pct(scale::from_1e12(b.netprofit_1e12), ic)),
+        // `np / ic × 100` in that order (E118 4320/4320; `np × 100 / ic` 2890, `np / (ic / 100)`
+        // 3311).
+        NPP => Val::F(pct(np, ic)),
         GPP => Val::F(pct(scale::from_1e12(b.grossprofit_1e12), ic)),
         GLP => Val::F(pct(scale::from_1e12(b.grossloss_1e12), ic)),
         AT => Val::F(round_sig10(div_na(
@@ -855,6 +872,9 @@ fn read_var(b: &BrokerView, v: u8, x: Fmt, open: Option<f64>) -> Val {
             scale::from_1e12(b.grossloss_1e12),
             b.losstrades as f64,
         ))),
+        // `pin:04-openprofit-pct-base-int` (r33h): the realized-equity base stays the integer
+        // `initial_capital + netprofit` — no capture reads `openprofit_percent`, so CAR-R33-1's f64
+        // `ic + np` (equity's own first term) is the candidate, not the law.
         OPP => Val::F(pct(
             op,
             scale::from_1e12(b.initial_capital_1e12 + b.netprofit_1e12),

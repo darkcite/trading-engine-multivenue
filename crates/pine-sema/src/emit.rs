@@ -54,8 +54,8 @@ fn info(ty: Ty, lane: Lane, kind: SlotKind) -> SlotInfo {
 
 /// Before the analyses: every constant call argument becomes a `Const` slot (§4.14.5 rule 2; a
 /// pine-spec string interned as a `CONST` string), a dynamic history offset is guarded by
-/// `NZ_I kk, k, −1` (§4.10.2), and the init flag `g` is allocated. Refuses what emission does
-/// not cover yet. Returns `g`.
+/// `NZ_I kk, k, 0` (§4.10.2; CAR-R33-2: `x[na]` reads the current bar, TradingView F088), and the
+/// init flag `g` is allocated. Refuses what emission does not cover yet. Returns `g`.
 pub(crate) fn prepare(ir: &mut Ir, syms: &mut SymTable, d: Dialect) -> Result<VSlot, Diag> {
     let mut body = std::mem::take(&mut ir.body);
     let r = prep_block(ir, syms, &mut body, d);
@@ -119,11 +119,12 @@ fn prep_block(ir: &mut Ir, syms: &mut SymTable, b: &mut Block, d: Dialect) -> Re
                         kind: SlotKind::Temp,
                         ..info(Ty::Int, Lane::I64, SlotKind::Temp)
                     });
-                    let m1 = ir.konst(info(Ty::Int, Lane::I64, SlotKind::Const), u64::MAX, true);
+                    // pin:03-hist-dynamic-offset (CAR-R33-2): `x[na]` is `x[0]`.
+                    let z = ir.konst(info(Ty::Int, Lane::I64, SlotKind::Const), 0, true);
                     out.push(Stmt::Op(Op::Nz {
                         dst: kk,
                         a: v,
-                        b: m1,
+                        b: z,
                     }));
                     *k = K::Dyn(kk);
                 }

@@ -648,5 +648,9 @@ fn a9_percent_aggregates_ride_on_fill_and_open_bar() {
         (v.sum_trade_pct_1e6, v.sum_win_pct_1e6, v.sum_loss_pct_1e6),
         (-5 * E, 0, -5 * E)
     );
-    assert_eq!(v._pad, [0; 1]);
+    // CAR-R33-1: the native book forms the script-visible net profit too (mintick 0.01).
+    assert_eq!(
+        f64::from_bits(v.netprofit_f64_bits).to_bits(),
+        (-50f64).to_bits()
+    );
 }

@@ -107,8 +107,8 @@ const SW: [(Sw, &str, u8, u8); 22] = [
     (
         Sw::RoundTies,
         "round_ties",
-        swr::ROUND_TIES_HALF_UP,
-        swr::ROUND_TIES_HALF_UP,
+        swr::ROUND_TIES_HALF_AWAY,
+        swr::ROUND_TIES_HALF_AWAY,
     ),
     (
         Sw::IntOfNa,

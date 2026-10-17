@@ -292,6 +292,10 @@ pub struct RunOutcome {
     pub record: Option<RunRecord>,
     /// The closed trades the broker dropped from its retained list (`pin:06-trade-trim-kept`).
     pub evicted: Evicted,
+    /// REQ-r33g-1: the broker's net profit ×1e12 just after each retained closed trade was booked
+    /// (`TvBroker::closed_cum_net`), parallel to the closed part of `trades` — TradingView's List
+    /// of Trades `cum_pnl`.
+    pub cum_net: Vec<i128>,
     /// Chart bars stepped.
     pub bars: u32,
     /// Evaluations (parent and sub-programs, intrabar included).
@@ -953,6 +957,7 @@ impl Runner {
         res?;
         // 16
         let mut trades = Vec::new();
+        let mut cum_net = Vec::new();
         let mut record = None;
         let mut evicted = Evicted::default();
         if let (Some(b), Expect::Strategy { .. }) = (&broker, &f.expect) {
@@ -963,6 +968,10 @@ impl Runner {
             let mut i = 0u32;
             while i < view.closed_retained {
                 trades.push(*b.closed_trade(i).expect("closed_retained bounds the list"));
+                cum_net.push(
+                    b.closed_cum_net(i)
+                        .expect("closed_retained bounds the list"),
+                );
                 i += 1;
             }
             let mut i = 0u32;
@@ -988,6 +997,7 @@ impl Runner {
             trades,
             record,
             evicted,
+            cum_net,
             bars: n_rows,
             evaluations: evals,
             counters,
@@ -1119,6 +1129,7 @@ impl Runner {
                 trades: Vec::new(),
                 record: None,
                 evicted: Evicted::default(),
+                cum_net: Vec::new(),
                 bars: n,
                 evaluations: e,
                 counters: c,
@@ -1254,16 +1265,19 @@ impl Runner {
                     return Verdict::Fail(d);
                 }
                 // pin:06-pnl-basis-net — `Net` until capture/format.tsv records probe-03's basis.
-                // pin:06-trade-trim-kept (CI-029) — the kept trades, `cum_pnl` seeded; on a SYN
-                // tape (E109) only the kept list's shape is TradingView's.
+                // pin:06-trade-trim-kept (CI-029) — the kept trades; on a SYN tape (E109) only the
+                // kept list's shape is TradingView's.
+                // REQ-r33g-1 (r33h) — `cum_pnl` is the broker's net profit at each close
+                // (`closed_cum_net`, the open trades' paid entry fees included), which already
+                // carries the dropped trades: no seed.
                 let td = if f.driver == Driver::Syn && o.evicted.trades > 0 {
                     crate::trades::compare_kept_shape(trades, &o.trades, o.evicted.trades)
                 } else {
-                    crate::trades::compare_trades_kept(
+                    crate::trades::compare_trades_cum(
                         trades,
                         &o.trades,
                         o.evicted.trades,
-                        o.evicted.net_1e12,
+                        crate::trades::CumPnl::Recorded(&o.cum_net),
                         &o.syms,
                         &self.signals,
                         crate::trades::PnlBasis::Net,
