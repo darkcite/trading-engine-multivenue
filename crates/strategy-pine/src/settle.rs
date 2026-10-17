@@ -153,6 +153,8 @@ pub(crate) fn report_cancelled(core: &mut Core, c: &mut PineCounters, i: usize, 
     };
     core.scripts[i].broker.on_cancelled(oid);
     c.cancelled_reported = c.cancelled_reported.wrapping_add(1);
+    // impl-Bp §3.10 R6: kind 3 — every cancel or withhold the member reports.
+    crate::delivery::done(core, i, oid);
     let h = core.retired_head;
     core.retired[h] = Retired {
         oid,

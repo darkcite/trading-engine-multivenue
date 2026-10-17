@@ -444,6 +444,9 @@ pub(crate) struct Core {
     /// R8: the fee ×1e12 the host noted for the next fill (`note_fill_fee`), keyed by its client
     /// oid; consumed (taken) by the next `fills::on_fill`.
     pub(crate) noted_fee: Option<(u64, i128)>,
+    /// R8, cold: notes consumed by a fill of another oid (pin:08-noted-fee-one-fill; the model
+    /// was booked). A host sequencing defect: `debug_assert!` in debug, counted in release.
+    pub(crate) noted_fee_mismatched: u64,
     /// R7: `BAR_MARKS_CAP` marks per script, script-major (replay host only; empty on the engine).
     pub(crate) marks: Box<[(Bar, i128)]>,
     /// `on_start`'s warm-up walk is running (a VM fault is `WARM_FAULT`).
@@ -452,6 +455,8 @@ pub(crate) struct Core {
     pub(crate) warm_ms: i64,
     /// §4.9.2 (T18): the sequencing and decision rings (empty without `--pine-tape`).
     pub(crate) tape: crate::tape::Tape,
+    /// impl-Bp §3.10 R6: the delivery journal (empty without `--pine-tape`).
+    pub(crate) delivery: crate::delivery::Journal,
     /// §4.7.8: the last warm-up evaluation's intents are judged by the boot policy (`arm`), so
     /// `eval_script` does not count them discarded.
     pub(crate) boot_eval: bool,
@@ -716,6 +721,7 @@ pub(crate) fn build(st: Staged) -> Result<Box<Core>, PineLoadError> {
         inc_seq: 0,
         flat_due: 0,
         noted_fee: None,
+        noted_fee_mismatched: 0,
         // R7 (pin:08-bar-marks-replay-only): only a replay host drains marks; the engine records
         // none, so it carries no ring.
         marks: vec![
@@ -742,6 +748,14 @@ pub(crate) fn build(st: Staged) -> Result<Box<Core>, PineLoadError> {
                 vec![strategy_core::PineTapeRec::default(); nd].into_boxed_slice(),
             )
         },
+        delivery: crate::delivery::Journal::new(
+            cfg.tape,
+            vec![
+                crate::delivery::PineDeliveryRec::default();
+                if cfg.tape { crate::DELIVERY_CAP } else { 0 }
+            ]
+            .into_boxed_slice(),
+        ),
     }))
 }
 

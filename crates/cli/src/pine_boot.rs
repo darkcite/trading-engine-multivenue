@@ -353,6 +353,11 @@ pub struct PineBoot {
     pub pine_dir: PathBuf,
     /// SHA-256 of the manifest bytes, hex (the boot tell).
     pub manifest_hex: String,
+    /// The run's capture directory (`pine-boot.tsv`, `pine-delivery.bin`); set by the `run` bin
+    /// after [`build`] (`None`: no run directory — no boot record, no journal).
+    pub run_dir: Option<PathBuf>,
+    /// The run directory's epoch (`new_capture_run_dir`), the record's `run_epoch_ns`.
+    pub run_epoch_ns: u64,
 }
 
 /// §3.6 `build` (PAPER half): manifest, slot config, route, facts from discovery, empty boot
@@ -455,6 +460,8 @@ pub fn build(
         bars_root: flags.bars_root.clone(),
         pine_dir: flags.pine_dir.clone(),
         manifest_hex,
+        run_dir: None,
+        run_epoch_ns: 0,
     })
 }
 

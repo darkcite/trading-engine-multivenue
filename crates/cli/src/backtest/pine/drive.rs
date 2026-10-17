@@ -32,7 +32,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use core_types::{CancelReq, Fill, ModifyReq, Order, Price, Qty, VENUE_COUNT};
+use core_types::{CancelReq, Fill, ModifyReq, Order, Price, Qty, Tick, VENUE_COUNT};
 use strategy_core::{Ctx, Strategy, SubmitErr};
 
 use super::cuts::{CutPlan, CutSource, Rebase};
@@ -66,6 +66,46 @@ pub(crate) trait PineMember: Strategy {
 /// The exit of a drive that stopped on a script fault (§4.5 item 4, I16).
 pub(crate) const EXIT_FAULT: u8 = 4;
 
+/// What runs beside the member, in record order (T15: the arms'
+/// `TrialAccum`s and the per-cut fee drain; T16: the null arms). No `dyn`:
+/// the drive is generic over it.
+pub(crate) trait DriveHook<M> {
+    /// A tick, right after the signal's model saw it (the null arms feed
+    /// their own models here, before the member's callback).
+    fn on_tick(&mut self, _tick: &Tick, _virt_ns: u64, _wall_ns: u64) {}
+    /// After every record — its callback, fills and dispositions delivered
+    /// (R7: the bar marks are drained here, after every record) — and once
+    /// more after `on_stop`. `rec` is what the signal arm did in it.
+    fn after_record(&mut self, _m: &mut M, _fills: &mut FillEngine, _rec: &SignalRec<'_>) {}
+    /// After each cut's last record (the per-cut drains, so nothing grows
+    /// with the run).
+    fn after_cut(&mut self, _m: &mut M, _fills: &mut FillEngine) {}
+}
+
+/// No arm beside the member (the T11–T13 drives; `run.rs` always hooks).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct NoHook;
+
+impl<M> DriveHook<M> for NoHook {}
+
+/// What the signal arm did in one record, in production order per list
+/// (§4.8: the null arms observe the orders slot 8 emitted and its fills).
+/// pin:Bp-null-t16-staged — read by the null arms (the next T16 step).
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct SignalRec<'a> {
+    pub(crate) virt_ns: u64,
+    pub(crate) wall_ns: u64,
+    /// Every emission (timers, the callback, dispositions, `on_stop`) as
+    /// the model saw it — PLACE / CANCEL / MODIFY records — and whether the
+    /// model took it.
+    pub(crate) emits: &'a [(Order, bool)],
+    /// The signal's model fills of this record.
+    pub(crate) fills: &'a [SynthFill],
+    /// The signal's orders that left its model in this record.
+    pub(crate) dones: &'a [OrderDone],
+}
+
 /// The pine arm's `Ctx`: intake happens HERE, synchronously, at the
 /// current record's `virt_ns`.
 pub(crate) struct PineCtx<'a> {
@@ -73,6 +113,8 @@ pub(crate) struct PineCtx<'a> {
     pub(crate) now_ns: u64,
     pub(crate) virt_ns: u64,
     pub(crate) intake_refused: u64,
+    /// This record's emissions (cleared after the hook saw them).
+    pub(crate) emits: Vec<(Order, bool)>,
 }
 
 /// pin:Bp-refusal-map-t14 — a model refusal maps to the `SubmitErr` the
@@ -88,7 +130,12 @@ fn submit_err_of(r: IntakeRefusal) -> SubmitErr {
 
 impl PineCtx<'_> {
     fn take(&mut self, o: &Order) -> Result<(), SubmitErr> {
-        match self.fills.intake_checked(o, self.virt_ns) {
+        let r = self.fills.intake_checked(o, self.virt_ns);
+        // COPY: one emitted Order (64 B) into the record's log — the null
+        // arms mirror it after the callback — a borrow rejected: the
+        // member's order is a by-value argument gone at return.
+        self.emits.push((*o, r.is_ok()));
+        match r {
             Ok(()) => Ok(()),
             Err(r) => {
                 self.intake_refused += 1;
@@ -273,15 +320,18 @@ struct Loop {
     next_timer: Option<u64>,
     scratch: Vec<SynthFill>,
     dones: Vec<OrderDone>,
+    /// The record's dispositions, for the hook.
+    done_log: Vec<OrderDone>,
 }
 
 impl Loop {
-    fn step<M: PineMember>(
+    fn step<M: PineMember, H: DriveHook<M>>(
         &mut self,
         rec: &MergedRec,
         m: &mut M,
         ctx: &mut PineCtx<'_>,
         out: &mut DriveOut,
+        hook: &mut H,
     ) {
         ctx.virt_ns = rec.virt_ns;
         let next = *self
@@ -306,6 +356,7 @@ impl Loop {
                 tick.ts_ns = rec.wall_ns;
                 ctx.fills
                     .on_record(&tick, rec.virt_ns, rec.wall_ns, &mut self.scratch);
+                hook.on_tick(&tick, rec.virt_ns, rec.wall_ns);
                 m.on_tick(&tick, ctx);
             }
             RecPayload::Event(e) => {
@@ -339,9 +390,31 @@ impl Loop {
             m.on_fill(&fill, ctx);
             i += 1;
         }
-        self.scratch.clear();
         self.deliver_done(m, ctx);
+        self.after(m, ctx, hook, rec.virt_ns, rec.wall_ns);
         out.records += 1;
+    }
+
+    /// The hook sees the record's signal activity, then the logs reset.
+    fn after<M: PineMember, H: DriveHook<M>>(
+        &mut self,
+        m: &mut M,
+        ctx: &mut PineCtx<'_>,
+        hook: &mut H,
+        virt_ns: u64,
+        wall_ns: u64,
+    ) {
+        let rec = SignalRec {
+            virt_ns,
+            wall_ns,
+            emits: &ctx.emits,
+            fills: &self.scratch,
+            dones: &self.done_log,
+        };
+        hook.after_record(m, ctx.fills, &rec);
+        self.scratch.clear();
+        self.done_log.clear();
+        ctx.emits.clear();
     }
 
     fn deliver_done<M: PineMember>(&mut self, m: &mut M, ctx: &mut PineCtx<'_>) {
@@ -356,6 +429,7 @@ impl Loop {
             for d in &batch {
                 m.on_order_done(d, ctx);
             }
+            self.done_log.extend_from_slice(&batch);
         }
     }
 }
@@ -377,6 +451,7 @@ fn faulted(out: &DriveOut, rec: &MergedRec) -> DriveFail {
 /// Drive `member` over every cut of `cfg.plan` from `src`. `fills` carries
 /// the boundary (fixed from the plan before this call, I13) and has its
 /// pine bookkeeping enabled here. `buf` is reused (capacity kept).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn drive_cuts<M: PineMember, S: CutSource>(
     cfg: &DriveCfg<'_>,
     src: &mut S,
@@ -384,19 +459,32 @@ pub(crate) fn drive_cuts<M: PineMember, S: CutSource>(
     fills: &mut FillEngine,
     buf: &mut Vec<MergedRec>,
 ) -> Result<DriveOut, DriveFail> {
-    let r = drive_inner(cfg, src, member, fills, buf);
+    drive_cuts_hooked(cfg, src, member, fills, buf, &mut NoHook)
+}
+
+/// [`drive_cuts`] with `hook` beside the member (T15, T16).
+pub(crate) fn drive_cuts_hooked<M: PineMember, S: CutSource, H: DriveHook<M>>(
+    cfg: &DriveCfg<'_>,
+    src: &mut S,
+    member: &mut M,
+    fills: &mut FillEngine,
+    buf: &mut Vec<MergedRec>,
+    hook: &mut H,
+) -> Result<DriveOut, DriveFail> {
+    let r = drive_inner(cfg, src, member, fills, buf, hook);
     if r.is_err() {
         src.abort();
     }
     r
 }
 
-fn drive_inner<M: PineMember, S: CutSource>(
+fn drive_inner<M: PineMember, S: CutSource, H: DriveHook<M>>(
     cfg: &DriveCfg<'_>,
     src: &mut S,
     member: &mut M,
     fills: &mut FillEngine,
     buf: &mut Vec<MergedRec>,
+    hook: &mut H,
 ) -> Result<DriveOut, DriveFail> {
     fills.enable_pine_bookkeeping(MAX_OPEN_TOTAL);
     let mut out = DriveOut::default();
@@ -408,12 +496,14 @@ fn drive_inner<M: PineMember, S: CutSource>(
         next_timer: None,
         scratch: Vec::with_capacity(MAX_OPEN_TOTAL),
         dones: Vec::with_capacity(MAX_OPEN_TOTAL),
+        done_log: Vec::with_capacity(MAX_OPEN_TOTAL),
     };
     let mut ctx = PineCtx {
         fills,
         now_ns: 0,
         virt_ns: 0,
         intake_refused: 0,
+        emits: Vec::with_capacity(MAX_OPEN_TOTAL),
     };
     let fail = |out: &DriveOut, err| DriveFail {
         exit: if out.records == 0 { 6 } else { 1 },
@@ -439,13 +529,14 @@ fn drive_inner<M: PineMember, S: CutSource>(
                 out.max_resident = out.max_resident.max(buf.len());
                 let mut i = 0;
                 while i < buf.len() {
-                    lp.step(&buf[i], member, &mut ctx, &mut out);
+                    lp.step(&buf[i], member, &mut ctx, &mut out, hook);
                     if member.faulted() {
                         return Err(faulted(&out, &buf[i]));
                     }
                     i += 1;
                 }
                 buf.clear();
+                hook.after_cut(member, ctx.fills);
                 src.done(row).map_err(|e| fail(&out, e))?;
             }
         }
@@ -467,13 +558,14 @@ fn drive_inner<M: PineMember, S: CutSource>(
             out.max_resident = buf.len();
             let mut i = 0;
             while i < buf.len() {
-                lp.step(&buf[i], member, &mut ctx, &mut out);
+                lp.step(&buf[i], member, &mut ctx, &mut out, hook);
                 if member.faulted() {
                     return Err(faulted(&out, &buf[i]));
                 }
                 i += 1;
             }
             buf.clear();
+            hook.after_cut(member, ctx.fills);
             for row in &cfg.plan.rows {
                 src.done(row).map_err(|e| fail(&out, e))?;
             }
@@ -482,6 +574,9 @@ fn drive_inner<M: PineMember, S: CutSource>(
     member.on_stop(&mut ctx);
     ctx.fills.finish_pine();
     lp.deliver_done(member, &mut ctx);
+    let (v, w) = (ctx.virt_ns, ctx.now_ns);
+    lp.after(member, &mut ctx, hook, v, w);
+    hook.after_cut(member, ctx.fills);
     out.intake_refused = ctx.intake_refused;
     Ok(out)
 }

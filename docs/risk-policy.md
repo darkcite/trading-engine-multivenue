@@ -16947,6 +16947,12 @@ Hyperliquid (O-PVM-2). Lead ruling: `all` keeps meaning the eight production mem
      live slot 8 never reaches here (refusals 1–2).
    - **Paper boots flat.** A non-empty `boot_state` off Live is refused (`6013`,
      `pin:08-boot-state-live-only`).
+   - **The boot adoption is asserted at both ends (I38).** `reconcile_boot` silently changes
+     nothing on a broker that is no longer pristine, and a flat adoption cannot be told from a
+     skipped one by the position alone (risk review r15). So `arm::adopt` asserts
+     `NativeBroker::is_pristine()` BEFORE `reconcile_boot` (a sequencing defect of the member
+     otherwise), and after it that the adoption took: no longer pristine, the venue's position
+     and, when not flat, its average price on the book. Both are `assert!` in every build.
    - **`oid_epoch != 0`.** An epoch of 0 is refused at load (`6006`, `pin:08-epoch-zero-refused`).
      With epoch 0, every own fill decodes as a prior boot's and paper re-fires without bound. The
      epoch is the boot's UTC second.
@@ -16963,6 +16969,20 @@ Hyperliquid (O-PVM-2). Lead ruling: `all` keeps meaning the eight production mem
    - **`activation_ns` is taken from the matcher's table** (`pin:08-activation-from-matcher-table`,
      found by G5). It is `core_fill::ACTIVATION_NS_DEFAULT[..8]`, the table `PaperMatcher` judges
      by. With zeros, an IoC was reported cancelled and then filled.
+
+**`[exec] enabled = 0`** (`pin:08-exec-boot-resolved`). Slot 8's route is the router's resolved
+row (above). Under `[exec] enabled = 0` that row is the paper default: `[exec.slot.8]`'s mode
+(including `off`), caps and venues are ignored; only `[exec.slot.8.pine]` still applies.
+`enabled = 0` disarms live, it does not stop slot 8: to stop it, drop pine from `STRATEGY` (and
+`--pine`) or `DisableStrategy(8)`.
+
+**Fees and bar marks.** R7 bar marks (`take_bar_marks`, `pin:08-bar-marks-replay-only`) and R8
+noted fees (`note_fill_fee`) are replay-host only: the B'3 harness drains the marks and notes
+each fill's fee; the engine records no marks and notes no fee. Engine paper books every slot-8
+fill at the `[exec.slot.8.pine]` fee model (`fee_taker_ppm` / `fee_maker_ppm`), rounded up
+(`fills::model_fee_1e12`). A negative noted fee aborts in every build, never clamped
+(`pin:08-noted-fee-non-negative`); a note naming another fill books the model and is counted
+in release (`noted_fee_mismatched`, `pin:08-noted-fee-one-fill`).
 
 **No rollback door is needed.** No live order from slot 8 can exist (refusals 1–3), so an
 older binary never meets a slot-8 cloid or cid; S16-R5's door stays shut. Slot 8's live-arming
@@ -17019,10 +17039,12 @@ mirrors nothing.
 `pine_slot_8_is_refused_in_every_live_arm`; `cli` `pine_boot`
 `pine_requires_the_flag_both_ways`, `pine_with_a_legacy_strategy_refuses`,
 `tests/pine_boot_refusal.rs` (the real binary) and `tests/pine_t19.rs`
-(`facts_come_from_discovery`, `build_is_paper_flat_and_configures`); `strategy-set`
+(`facts_come_from_discovery`, `build_is_paper_flat_and_configures`,
+`exec_disabled_slot8_is_the_paper_default`); `strategy-set`
 `pine_is_slot_8_by_name_only_and_all_excludes_it`, `pine_enable_8_refused_disable_8_honoured`,
 `pine_receives_only_fills_attributed_to_slot_8`, `a_trade_print_changes_no_existing_member`;
-`strategy-pine` `tests/fault.rs` `no_slot8_order_is_post_only`; `pine-broker`
+`strategy-pine` `tests/fault.rs` `no_slot8_order_is_post_only`, `tests/readback.rs`
+(`noted_fee_negative_fails_fast`, `noted_fee_mismatch_is_counted`); `pine-broker`
 `tests/native_maker.rs` (`a_requote_at_a_cap_of_one_unit_is_one_modify_not_cancel_and_submit`,
 `a_requote_keeps_every_other_outstanding_order_in_its_gates_and_never_passes_the_cap`) and
 `native` `an_event_stamped_on_an_earlier_day_never_rolls_the_day`; `ingress-binance`

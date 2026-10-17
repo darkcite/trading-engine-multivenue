@@ -74,6 +74,7 @@ mod clock;
 mod coalesce;
 mod counters;
 mod ctx;
+pub mod delivery;
 mod fault;
 mod fills;
 mod host;
@@ -174,6 +175,9 @@ pub const INCIDENT_CAP: usize = 64;
 pub const SEQ_TAPE_CAP: usize = 16_384;
 /// Decision-tape ring (`PineTapeRec`, 64 B): 1 MiB.
 pub const DECISION_TAPE_CAP: usize = 16_384;
+/// R6 delivery-journal ring (`PineDeliveryRec`, 32 B): 1 MiB — the sequencing tape's records
+/// plus room for the kind-3 dispositions between two 5 s drains.
+pub const DELIVERY_CAP: usize = 32_768;
 /// R7: bar marks one script holds between two [`PineStrategy::take_bar_marks`] calls (replay
 /// host only; a row confirms at most one bar per callback, pin:08-bar-marks-undrained-panics).
 pub const BAR_MARKS_CAP: usize = 16;
@@ -687,6 +691,30 @@ impl PineStrategy {
         }
     }
 
+    /// R6 (impl-Bp §3.10): the delivery-journal records with ordinal `>= from` still in the
+    /// ring, oldest first, into `out`; returns `(ordinal of out[0], n)` — a reader whose cursor
+    /// is behind the first ordinal has lost `first − from` records (pin:08-delivery-ordinal).
+    /// `(from, 0)` before `on_start` or without `--pine-tape`. Cold; never allocates.
+    pub fn delivery_view(&self, out: &mut [delivery::PineDeliveryRec], from: u64) -> (u64, u32) {
+        match self.core.as_ref() {
+            Some(core) => delivery::view(core, out, from),
+            None => (from, 0),
+        }
+    }
+
+    /// R6: journal records overwritten before any [`Self::delivery_view`] returned them.
+    #[must_use]
+    pub fn delivery_dropped(&self) -> u64 {
+        self.core.as_ref().map_or(0, |c| c.delivery.dropped())
+    }
+
+    /// R8, cold: notes ([`Self::note_fill_fee`]) consumed by a fill of another oid — a host
+    /// sequencing defect, counted in release (pin:08-noted-fee-one-fill). 0 before `on_start`.
+    #[must_use]
+    pub fn noted_fee_mismatched(&self) -> u64 {
+        self.core.as_ref().map_or(0, |c| c.noted_fee_mismatched)
+    }
+
     /// One dropped callback (pin:08-inert-counts-ignored).
     #[inline(always)]
     fn ignore(&mut self) {
@@ -820,6 +848,7 @@ impl Strategy for PineStrategy {
                 tape::words(tick),
                 ctx,
             );
+            delivery::tick(core, tick);
             coalesce::begin_callback(core);
             if core.host == HostKind::Replay {
                 // Replay: every callback is a settle point, evidence from earlier records only.
@@ -855,6 +884,7 @@ impl Strategy for PineStrategy {
             tape::words(fill),
             ctx,
         );
+        delivery::fill(core, fill);
         coalesce::begin_callback(core);
         let took = fills::on_fill(core, &mut self.counters, fill).is_some();
         if took {
@@ -900,6 +930,7 @@ impl Strategy for PineStrategy {
             tape::words(event),
             ctx,
         );
+        delivery::event(core, event);
         coalesce::begin_callback(core);
         settle::resolve_point(core, &mut self.counters);
         if trade {

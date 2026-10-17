@@ -199,6 +199,45 @@ fn noted_fee_reaches_the_broker() {
     assert_eq!(run(Some(5_364_162_000)), 5_364_162_000, "the host's fee");
 }
 
+/// pin:08-noted-fee-non-negative: a negative noted fee fails fast in every mode (`assert!`),
+/// never clamped to the model.
+#[test]
+#[should_panic(expected = "pin:08-noted-fee-non-negative")]
+fn noted_fee_negative_fails_fast() {
+    let mut p = member_with(boot(vec![rt("rt_entry.pine", 0)]));
+    let mut ctx = RecCtx::new();
+    p.on_venue_event(&print(0, T0 + 10, 100_000_000, 1_000_000), &mut ctx);
+    p.on_tick(&quote(0, T0 + 20), &mut ctx);
+    let o = order_from(&ctx, 0);
+    p.note_fill_fee(o.client_oid, -1);
+    p.on_fill(&fill_of(&o, o.qty.raw(), 1), &mut ctx);
+}
+
+/// pin:08-noted-fee-one-fill: a note naming another oid is a host defect — `debug_assert!` in
+/// debug, counted on the cold `noted_fee_mismatched` in release (the model books).
+#[test]
+fn noted_fee_mismatch_is_counted() {
+    let mut p = member_with(boot(vec![rt("rt_entry.pine", 0)]));
+    let mut ctx = RecCtx::new();
+    assert_eq!(p.noted_fee_mismatched(), 0);
+    p.on_venue_event(&print(0, T0 + 10, 100_000_000, 1_000_000), &mut ctx);
+    p.on_tick(&quote(0, T0 + 20), &mut ctx);
+    let o = order_from(&ctx, 0);
+    p.note_fill_fee(o.client_oid ^ 1, 7);
+    let f = fill_of(&o, o.qty.raw(), 1);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.on_fill(&f, &mut ctx)));
+    assert_eq!(r.is_err(), cfg!(debug_assertions), "a defect in debug only");
+    assert_eq!(p.noted_fee_mismatched(), 1);
+    if !cfg!(debug_assertions) {
+        assert_eq!(p.pine_counters().fills, 1);
+        let rec = p.broker_record(0).expect("record");
+        assert_eq!(
+            rec.commission_paid_1e12, 0,
+            "the model at 0 ppm, not the note"
+        );
+    }
+}
+
 fn replay_member() -> PineStrategy {
     let mut b = boot(vec![script("sma_always.pine", 0)]);
     b.host = HostKind::Replay;

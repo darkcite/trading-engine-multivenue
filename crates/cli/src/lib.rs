@@ -87,6 +87,8 @@ pub mod pine_boot;
 pub mod pine_metrics;
 /// PVM impl-08 T18: the `--pine-tape` writer (`seq.bin`, `decisions.bin`, `set.tsv`).
 pub mod pine_tape;
+/// PVM impl-08 (R5/R6): slot 8's loop hook — the boot record and the delivery journal.
+pub mod pine_delivery;
 pub mod pinning;
 pub mod regime_boot;
 pub mod sigint;

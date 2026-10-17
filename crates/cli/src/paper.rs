@@ -3547,7 +3547,7 @@ pub fn engine_loop_ev_full<D: OrderDispatch>(
     if let Err(reason) = configure_ev(&mut strat, &cfg, artifact_path) {
         return EngineLoopResult::Failed(reason);
     }
-    run_engine_loop(cons, disp, strat, obs)
+    run_engine_loop(cons, disp, strat, obs, NoHook)
 }
 
 /// Run Strategy D (rule-tree). `rules_path` points at a JSON-
@@ -3567,7 +3567,7 @@ pub fn engine_loop_rule_tree_full<D: OrderDispatch>(
     if let Err(reason) = configure_rule_tree(&mut strat, &cfg, rules_path, sym_for_rule) {
         return EngineLoopResult::Failed(reason);
     }
-    run_engine_loop(cons, disp, strat, obs)
+    run_engine_loop(cons, disp, strat, obs, NoHook)
 }
 
 /// Load + configure a rule-tree instance (rules file, params, symbol
@@ -3692,6 +3692,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     }
 
     let mut set = strategy_set::StrategySet::new(mask);
+    let mut pine_hook: Option<crate::pine_delivery::PineHook> = None;
     // PVM impl-08 T19 (pin:08-facts-from-discovery boot order): discovery and facts ran in the
     // bin; here the wall anchor, `configure`, the warm bars and the boot tell — PAPER ONLY.
     if let Some(mut pb) = pine {
@@ -3729,6 +3730,12 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
                 tape,
                 boot_utc_ms: boot_ms,
             });
+            // R5/R6 (lead ruling 2026-10-17, the typed path): the boot record right after
+            // `eng.start()` and the delivery journal's drains, through the loop hook.
+            pine_hook = pb
+                .run_dir
+                .take()
+                .map(|dir| crate::pine_delivery::PineHook::new(dir, pb.run_epoch_ns, tape));
         }
     }
     if let Some(boot) = vrp {
@@ -4255,7 +4262,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         hcv = mask & strategy_set::BIT_HCV != 0,
         "strategy-set: composed"
     );
-    run_engine_loop(cons, disp, set, obs)
+    run_engine_loop(cons, disp, set, obs, pine_hook)
 }
 
 /// Lower-hex render of a 32-byte hash (boot log; cold path).
@@ -9615,11 +9622,52 @@ fn mirror_ingress_counters(
     *last = cur;
 }
 
-fn run_engine_loop<S, D>(cons: Consumers, disp: D, strat: S, obs: Observability) -> EngineLoopResult
+/// PVM impl-08 (lead ruling 2026-10-17, the typed path): work an arm does on its CONCRETE
+/// strategy right after `eng.start()` and on the 5 s report cadence — without a strategy-core
+/// or strategy-set trait change. Boot-time and cold; never on the decision path.
+pub trait LoopHook<S> {
+    /// Once, right after `eng.start()` returned `Ok`; `mono_ns` is the engine clock then.
+    fn started(&mut self, strat: &S, mono_ns: u64);
+    /// Every 5 s report block, and once more after the loop's last iteration (before
+    /// `eng.stop()`).
+    fn drain(&mut self, strat: &S);
+}
+
+/// The arms without a hook.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoHook;
+
+impl<S> LoopHook<S> for NoHook {
+    fn started(&mut self, _: &S, _: u64) {}
+    fn drain(&mut self, _: &S) {}
+}
+
+impl<S, H: LoopHook<S>> LoopHook<S> for Option<H> {
+    fn started(&mut self, strat: &S, mono_ns: u64) {
+        if let Some(h) = self.as_mut() {
+            h.started(strat, mono_ns);
+        }
+    }
+    fn drain(&mut self, strat: &S) {
+        if let Some(h) = self.as_mut() {
+            h.drain(strat);
+        }
+    }
+}
+
+fn run_engine_loop<S, D, H>(
+    cons: Consumers,
+    disp: D,
+    strat: S,
+    obs: Observability,
+    hook: H,
+) -> EngineLoopResult
 where
     S: strategy_core::Strategy,
     D: OrderDispatch,
+    H: LoopHook<S>,
 {
+    let mut hook = hook;
     // Phase 8a lane engine: five tick lanes + one signal lane + four
     // fill lanes. The signal lane is bound to the RPC ring — the D2
     // disposition for Stage 1 (per §3.3).
@@ -9724,6 +9772,8 @@ where
         tracing::error!(error = ?e, "engine on_start failed");
         return EngineLoopResult::Failed("engine_loop: on_start failed");
     }
+    // PVM impl-08 R5: the arm's after-start hook (slot 8's boot record), boot-time, once.
+    hook.started(eng.strategy(), now_ns());
 
     let mut next_report = now_ns() + REPORT_PERIOD_NS;
     // RG6: the 1 s `/state` publish gate + the boot-boxed scratch the
@@ -9987,6 +10037,9 @@ where
             // were hoisted out of that gate deliberately; these belong
             // beside them.
             flush_member_state!();
+            // PVM impl-08 R6: the arm's 5 s hook (slot 8's delivery journal) — capture
+            // durability, outside the metrics gate like the flushes above.
+            hook.drain(eng.strategy());
             // HYPARB H8: hand the period's AMM decisions to the testnet
             // shadow (a ring push each; nothing blocks, nothing is sent
             // from this thread).
@@ -10347,6 +10400,8 @@ where
     //
     // Unconditional, and a no-op on an unchanged epoch.
     flush_member_state!();
+    // PVM impl-08 R6: the journal's last records (the loop's final iteration).
+    hook.drain(eng.strategy());
     eng.stop();
     // H3.7: the state writer stops and is joined FIRST — a write in flight
     // and the forced write below must never share a path's temp file. A

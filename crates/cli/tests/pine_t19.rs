@@ -251,6 +251,62 @@ fn build_reads_the_resolved_exec_boot() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// pin:08-exec-boot-resolved (risk review r16): under `[exec] enabled = 0` slot 8's row is the
+/// router's paper default — `[exec.slot.8]`'s `mode = "off"`, caps and venues are ignored
+/// (`SlotRoute::Paper`, zero caps, no venue); only `[exec.slot.8.pine]` still applies.
+#[test]
+fn exec_disabled_slot8_is_the_paper_default() {
+    let (hl, usdm) = discovered();
+    let d = DiscoveredFacts {
+        hl_sz_decimals: &hl,
+        bn_usdm: &usdm,
+        bn_spot: &[],
+    };
+    let tmp = std::env::temp_dir().join(format!("pine-t19-exec0-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("tmp");
+    let exec = tmp.join("exec.toml");
+    let src = "[exec]\nenabled = 0\n[exec.slot.8]\nmode = \"off\"\nvenues = [\"hyperliquid\"]\n\
+               max_order_usd_1e6 = 50000000\nmax_open_orders = 8\ncap_day_usd_1e6 = 900000000\n\
+               cap_instance_usd_1e6 = 200000000\n[exec.slot.8.pine]\nrefusal_streak_max = 7\n\
+               fee_taker_ppm = 450\n";
+    std::fs::write(&exec, src).expect("exec.toml");
+    let eb = cli::exec_boot::resolve(Some(&exec), None)
+        .expect("resolves")
+        .expect("an artifact");
+    assert!(!eb.enabled);
+    let flags = PineFlags {
+        manifest: fixtures().join("manifest.toml"),
+        tape: false,
+        bars_root: tmp.join("bars"),
+        pine_dir: tmp.clone(),
+    };
+    let resolve = |k: &str| (k == "hyperliquid:btc").then_some(4096u32);
+    let pb = build(&flags, Some(&eb), resolve, &d).expect("build");
+    assert_eq!(
+        pb.cfg.route,
+        strategy_pine::SlotRoute::Paper,
+        "mode = off ignored"
+    );
+    assert_eq!(
+        (
+            pb.cfg.slot_caps.max_order_usd_1e6,
+            pb.cfg.slot_caps.cap_instance_usd_1e6,
+            pb.cfg.slot_caps.cap_day_usd_1e6,
+            pb.cfg.slot_caps.max_open_orders
+        ),
+        (0, 0, 0, 0),
+        "caps ignored"
+    );
+    assert_eq!(pb.cfg.slot_venue, None, "venues ignored");
+    assert_eq!(
+        (pb.cfg.slot.refusal_streak_max, pb.cfg.fee.taker_ppm),
+        (7, 450),
+        "[exec.slot.8.pine] still applies"
+    );
+    assert_eq!(pb.cfg.exec_sha256, eb.hash);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// pin:08-replay-facts-screen-universe: a replay host's facts come from the screen universe —
 /// the member configures and starts from them as `HostKind::Replay`; no file, or no row,
 /// refuses.

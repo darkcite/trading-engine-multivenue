@@ -173,16 +173,158 @@ fn a_hold_opened_in_one_cut_closes_in_the_next() {
 }
 
 /// I16: a script fault stops the replay at that record and exits 4 with
-/// the `(FaultKind, pc, bar, sha)` print. pin:Bp-fault-rows-t15 — the
-/// FAULTED rows are T15's.
+/// the `(FaultKind, pc, bar, sha)` print; every arm's row is written
+/// FAULTED and no series (T15).
 #[test]
 fn a_script_fault_aborts_writes_faulted_rows_and_exits_4() {
-    let (_fx, a) = fixture("i16", "fault.pine", &[0, 90, 330]);
+    let (fx, a) = fixture("i16", "fault.pine", &[0, 90, 330]);
     let x = run_pine_main(&a);
     assert_eq!(x.code, 4, "{} {}", x.stderr, x.stdout);
     assert!(x.stderr.contains("InsnBudget"), "{}", x.stderr);
     assert!(x.stderr.contains("sha "), "{}", x.stderr);
     assert!(x.stdout.contains("\"faulted\":true"), "{}", x.stdout);
+    let rows = pine_screen::rows::RowsFile::open(&fx.root.join("out/rows.t2")).unwrap();
+    assert_eq!(rows.recs().len(), 1);
+    let s = rows.recs()[0].summary;
+    assert_ne!(s.flags & pine_ir::trial_flag::FAULTED, 0);
+    assert_eq!((s.faults, s.obs_days, s.net_bps_1e4), (1, 0, 0));
+    let ret = pine_screen::ret::ret_path(&fx.root.join("out/ret"), &[0xab; 32]);
+    assert!(!ret.exists(), "a FAULTED row has no series");
+    assert!(x.stdout.contains("\"ret_sha256\":\"\""), "{}", x.stdout);
+}
+
+/// I17: one `RowRec` per arm in trial-id order in one `RowsHdr { tier: 2 }`
+/// file with the run's notional and fee digest; one series per non-FAULTED
+/// arm with `obs_days` values. (The nulls' rows follow the signal's from T16.)
+#[test]
+fn one_row_and_one_series_per_arm_in_trial_id_order() {
+    let (fx, a) = fixture("i17a", "hold.pine", &[0, 90, 330]);
+    let x = run_pine_main(&a);
+    assert_eq!(x.code, 0, "{} {}", x.stderr, x.stdout);
+    let rows = pine_screen::rows::RowsFile::open(&fx.root.join("out/rows.t2")).unwrap();
+    let h = rows.hdr();
+    assert_eq!(h.tier, 2);
+    assert_eq!(h.sizing_notional_1e6, 12_000_000);
+    assert_eq!(h.fee_digest, pine_screen::ids::fee_digest(&["hl.perp:2:5"]));
+    assert_eq!(rows.recs().len(), field(&x.stdout, "rows") as usize);
+    assert_eq!(rows.recs()[0].trial_id, [0xab; 32], "signal first");
+    let s = rows.recs()[0].summary;
+    assert_eq!(s.obs_days, 1, "the fixture spans one UTC day");
+    let ret = pine_screen::ret::ret_path(&fx.root.join("out/ret"), &[0xab; 32]);
+    let days = pine_screen::ret::read_ret(&ret).unwrap();
+    assert_eq!(days.len(), s.obs_days as usize);
+    let sha: String = pine_screen::ret::ret_sha256(&days)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert!(
+        x.stdout.contains(&format!("\"ret_sha256\":\"{sha}\"")),
+        "{}",
+        x.stdout
+    );
+}
+
+/// I17: the row is `TrialAccum::finish`'s — `FIXED_NOTIONAL` at the
+/// manifest's notional, `gross = net + fee` exactly, the series sums to the
+/// net, every closed broker trade counted, the fee from the R8 commission.
+#[test]
+fn rows_come_from_trial_accum_with_impl07s_identities() {
+    let (fx, a) = fixture("i17b", "hold.pine", &[0, 90, 330]);
+    let x = run_pine_main(&a);
+    assert_eq!(x.code, 0, "{} {}", x.stderr, x.stdout);
+    let rows = pine_screen::rows::RowsFile::open(&fx.root.join("out/rows.t2")).unwrap();
+    let s = rows.recs()[0].summary;
+    assert_ne!(s.flags & pine_ir::trial_flag::FIXED_NOTIONAL, 0);
+    assert_eq!(s.flags & pine_ir::trial_flag::FAULTED, 0);
+    assert_eq!(s.sizing_notional_1e6, 12_000_000);
+    assert_eq!(s.gross_bps_1e4, s.net_bps_1e4 + s.fee_bps_1e4);
+    assert!(s.closed >= 1, "{}", x.stdout);
+    assert_eq!(i128::from(s.closed), field(&x.stdout, "closed_trades"));
+    assert!(s.fee_bps_1e4 > 0, "R8: the broker booked the harness fees");
+    let ret = pine_screen::ret::ret_path(&fx.root.join("out/ret"), &[0xab; 32]);
+    let days = pine_screen::ret::read_ret(&ret).unwrap();
+    let sum: f64 = days.iter().sum();
+    assert_eq!((sum * 10_000.0).round() as i64, s.net_bps_1e4);
+    assert_eq!(field(&x.stdout, "net_bps_1e4"), i128::from(s.net_bps_1e4));
+}
+
+/// pin:Bp-fee-drain-per-cut (risk-review nit): the model's pine fee charges
+/// are drained per cut, so no drain holds the whole run's fills.
+#[test]
+fn fee_charges_drain_per_cut_not_per_run() {
+    let (_fx, a) = fixture("drain", "hold.pine", &[0, 90, 150, 270, 330]);
+    let x = run_pine_main(&a);
+    assert_eq!(x.code, 0, "{} {}", x.stderr, x.stdout);
+    let rows = field(&x.stdout, "fee_rows") as usize;
+    assert!(rows >= 4, "{}", x.stdout);
+    assert!(x.max_fee_drain >= 1);
+    assert!(
+        x.max_fee_drain < rows,
+        "one drain carried {} of {rows} charges",
+        x.max_fee_drain
+    );
+}
+
+/// T16: the null arms are parsed at boot — a `--null-seeds` file of the
+/// wrong length refuses before any record (exit 6, nothing written), and
+/// `--trial-id` derives one id per null arm.
+#[test]
+fn null_arms_are_parsed_before_the_first_record() {
+    let (fx, mut a) = fixture("nullcfg", "hold.pine", &[0, 90]);
+    std::fs::write(fx.root.join("seeds.txt"), "1\n2\n3\n").unwrap();
+    a.null_seed = None;
+    a.null_seeds = Some(fx.root.join("seeds.txt"));
+    a.null_replicates = 2;
+    let x = run_pine_main(&a);
+    assert_eq!(x.code, 6, "{}", x.stderr);
+    assert!(x.stderr.contains("need 2"), "{}", x.stderr);
+    assert!(!fx.root.join("out").exists(), "nothing written");
+    a.null_seeds = None;
+    a.null_seed = Some(3);
+    a.trial_ids = None;
+    let x = run_pine_main(&a);
+    assert_eq!(x.code, 0, "{}", x.stderr);
+    assert_eq!(
+        field(&x.stdout, "trials"),
+        3,
+        "the signal + 2 sign-flip replicates"
+    );
+}
+
+/// pin:Bp-trial-ids-count: `--trial-ids` must name the signal and every
+/// null arm.
+#[test]
+fn trial_ids_must_name_every_arm() {
+    let (fx, mut a) = fixture("tids", "hold.pine", &[0, 90]);
+    std::fs::write(fx.root.join("ids.txt"), format!("{}\n", "cd".repeat(32))).unwrap();
+    a.trial_id = None;
+    a.trial_ids = Some(fx.root.join("ids.txt"));
+    let x = run_pine_main(&a);
+    assert_eq!(x.code, 6, "{}", x.stderr);
+    assert!(x.stderr.contains("need 2"), "{}", x.stderr);
+    std::fs::write(
+        fx.root.join("ids.txt"),
+        format!("{}\n{}\n", "cd".repeat(32), "ef".repeat(32)),
+    )
+    .unwrap();
+    let x = run_pine_main(&a);
+    assert_eq!(x.code, 0, "{}", x.stderr);
+}
+
+/// `--rows-out` / `--ret-dir` / `--report-out` land where named; the report
+/// file holds the stdout line.
+#[test]
+fn rows_ret_and_report_paths_are_honoured() {
+    let (fx, mut a) = fixture("paths", "hold.pine", &[0, 90, 330]);
+    a.rows_out = Some(fx.root.join("elsewhere/r.t2"));
+    a.ret_dir = Some(fx.root.join("series"));
+    a.report_out = Some(fx.root.join("report.jsonl"));
+    let x = run_pine_main(&a);
+    assert_eq!(x.code, 0, "{} {}", x.stderr, x.stdout);
+    assert!(fx.root.join("elsewhere/r.t2").is_file());
+    assert!(pine_screen::ret::ret_path(&fx.root.join("series"), &[0xab; 32]).is_file());
+    let rep = std::fs::read_to_string(fx.root.join("report.jsonl")).unwrap();
+    assert_eq!(rep.trim_end(), x.stdout);
 }
 
 /// I18: a manifest with two scripts refuses before any record (exit 6),

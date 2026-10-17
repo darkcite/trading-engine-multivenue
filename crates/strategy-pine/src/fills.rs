@@ -16,7 +16,12 @@
 //!   whose oid matches the noted one books that fee, any other books the model.
 //! - pin:08-noted-fee-one-fill: the noted fee is consumed by the very next `on_fill` whatever it
 //!   decodes to (dropped fills included); a mismatched oid is a host sequencing defect
-//!   (`debug_assert!`) and the model is booked.
+//!   (`debug_assert!`; counted on the cold `Core::noted_fee_mismatched` in release, read by
+//!   `PineStrategy::noted_fee_mismatched`) and the model is booked.
+//! - pin:08-noted-fee-non-negative: a noted fee below 0 is refused fail-fast with `assert!` in
+//!   every mode (never clamped to the model): the replay host's fee is a commission, never a
+//!   rebate (`backtest::fill` asserts `fee_1e12 >= 0` on the same value). Only the replay host
+//!   notes fees (R8), so the engine host's fill path never evaluates it.
 //! - pin:08-fill-script-out-of-range: a fill of this boot's epoch naming a script index past the
 //!   loaded scripts is counted `fills_foreign` and dropped (no broker owns it).
 //! - pin:08-late-flip-closeall-t16 is RETIRED (T16): a late reducer fill that flips the sign
@@ -60,14 +65,18 @@ pub(crate) fn model_fee_1e12(px_1e6: i64, qty_1e6: i64, pointvalue_1e6: i64, ppm
 pub(crate) fn on_fill(core: &mut Core, c: &mut PineCounters, f: &Fill) -> Option<usize> {
     // R8 (pin:08-noted-fee-one-fill): the host's fee for THIS fill, consumed here.
     let noted = core.noted_fee.take();
-    // I4: a `match`, not a closure.
-    debug_assert!(
-        match noted {
-            Some((oid, _)) => oid == f.order_id,
-            None => true,
-        },
-        "pine: note_fill_fee named another fill"
-    );
+    if let Some((oid_n, fee_n)) = noted {
+        // pin:08-noted-fee-non-negative: fail fast, never clamp.
+        assert!(
+            fee_n >= 0,
+            "pine: note_fill_fee: a negative fee (pin:08-noted-fee-non-negative)"
+        );
+        if oid_n != f.order_id {
+            // pin:08-noted-fee-one-fill: counted in release (the model books below).
+            core.noted_fee_mismatched = core.noted_fee_mismatched.wrapping_add(1);
+            debug_assert_eq!(oid_n, f.order_id, "pine: note_fill_fee named another fill");
+        }
+    }
     // The set routes attributed fills only; a replay host's fills are unattributed (§4.5.6).
     if core.host == HostKind::Engine && f.strategy_id != SLOT_PINE {
         c.fills_foreign = c.fills_foreign.wrapping_add(1);

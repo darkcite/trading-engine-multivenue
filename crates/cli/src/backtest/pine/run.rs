@@ -34,8 +34,10 @@
 //!   hands the member wall ns).
 //! - pin:Bp-warmup-cold-until-flag — no `--warmup-bars-root` yet: every row
 //!   boots cold (no slice), impl-08 §4.3.6's legal reading of "no bars".
-//! - pin:Bp-null-arms-t16 — `--null-arm` / seeds are parsed and validated;
-//!   the null arms run from T16; the report says `null_arms_run: 0`.
+//! - pin:Bp-null-arms-t16 — `--null-arm` / seeds are parsed and validated
+//!   (`null::NullCfg`, exit 6) and the null trial ids derived (`trials` in
+//!   the report counts them); the arms' drive is T16's next step, so the
+//!   report still says `null_arms_run: 0` and only the signal row is written.
 //! - pin:Bp-gate-t18 — exit 3 (UNJUDGED) is T18's; a judged run exits 0.
 
 use std::path::{Path, PathBuf};
@@ -51,16 +53,19 @@ use super::cuts::{
     boundary_virt_ns, check_plan, parse_cut_plan, span_prepass, CutPlan, CutRoot, CutRow,
     CutSource, LocalSource, SplitLaw,
 };
-use super::drive::{drive_cuts, DriveCfg, DriveFail, DriveOut, PineCtx, Residency};
-use super::fees::{fee_provenance, refuse_inside_git, FeeLedger, FeeSym};
+use super::drive::{drive_cuts_hooked, DriveCfg, DriveFail, DriveOut, PineCtx, Residency};
+use super::fees::{fee_provenance, refuse_inside_git, FeeSym};
+use super::null::{null_trial_id, NullCfg};
 use super::spool::SpoolSource;
-use crate::backtest::fill::{FillEngine, MAX_OPEN_TOTAL};
+use super::summary::{accum_cfg, write_rows, ArmAccum, ArmRow, SignalHook};
+use crate::backtest::fill::FillEngine;
 use crate::backtest::keep::KeepPolicy;
 use crate::backtest::{
     discover_runs, parse_model_params, parse_split, read_manifest_rows, HarnessError, MergedRec,
     RunDir,
 };
 use crate::pine::universe::{load_universe, UniverseRow};
+use pine_screen::rows::TrialEnd;
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -115,6 +120,12 @@ pub struct PineArgv {
     pub trial_ids: Option<PathBuf>,
     /// `--out-dir` (default `~/multivenue/pine/tier2/<signal id>/`).
     pub out_dir: Option<PathBuf>,
+    /// `--rows-out` (default `<out_dir>/rows.t2`; pin:Bp-rows-out-default).
+    pub rows_out: Option<PathBuf>,
+    /// `--ret-dir` (default `<out_dir>/ret`).
+    pub ret_dir: Option<PathBuf>,
+    /// `--report-out`: the `pvm-t2-1` line is also written here.
+    pub report_out: Option<PathBuf>,
 }
 
 /// What the binary prints and exits with.
@@ -128,6 +139,8 @@ pub struct PineExit {
     pub stderr: String,
     /// The signal arm's closed trades `(entry_ms, exit_ms)`, oldest retained first.
     pub closed_ms: Vec<(i64, i64)>,
+    /// The most fee charges one per-cut drain carried (pin:Bp-fee-drain-per-cut).
+    pub max_fee_drain: usize,
 }
 
 fn pre(msg: String) -> DriveFail {
@@ -181,7 +194,42 @@ fn parse_window(s: &str) -> Option<(i64, i64)> {
 }
 
 /// The trial ids: signal first (T16 appends the nulls').
-fn trial_ids(a: &PineArgv) -> Result<Vec<[u8; 32]>, DriveFail> {
+/// The run's null arms (§3.8): a bad `--null-arm` / seed source refuses
+/// before any record (exit 6; clap already refused the missing ones, exit 2).
+fn null_cfg(a: &PineArgv) -> Result<NullCfg, DriveFail> {
+    let text = match &a.null_seeds {
+        Some(p) => Some(
+            std::fs::read_to_string(p)
+                .map_err(|e| pre(format!("--null-seeds {}: {e}", p.display())))?,
+        ),
+        None => None,
+    };
+    NullCfg::from_argv(&a.null_arm, a.null_replicates, a.null_seed, text.as_deref()).map_err(pre)
+}
+
+/// Every trial id: the signal's, then the nulls' mode-major (§3.8).
+/// pin:Bp-trial-ids-count — `--trial-ids` must name exactly `1 + arms` ids.
+fn trial_ids(a: &PineArgv, nulls: &NullCfg) -> Result<Vec<[u8; 32]>, DriveFail> {
+    let ids = signal_and_given_ids(a)?;
+    if a.trial_id.is_some() {
+        let mut out = ids;
+        for j in 0..nulls.arms() {
+            out.push(null_trial_id(&out[0], j as u32));
+        }
+        return Ok(out);
+    }
+    if ids.len() != 1 + nulls.arms() {
+        return Err(pre(format!(
+            "--trial-ids names {} ids; the signal and {} null arms need {}",
+            ids.len(),
+            nulls.arms(),
+            1 + nulls.arms()
+        )));
+    }
+    Ok(ids)
+}
+
+fn signal_and_given_ids(a: &PineArgv) -> Result<Vec<[u8; 32]>, DriveFail> {
     if let Some(id) = &a.trial_id {
         return parse_hex32(id)
             .map(|x| vec![x])
@@ -209,6 +257,10 @@ pub(crate) struct PineBooted {
     pub(crate) route: Vec<u32>,
     pub(crate) descriptors: Vec<(u32, String)>,
     pub(crate) script_sha: [u8; 32],
+    /// The manifest's `qty_notional_1e6` (the rows' `FIXED_NOTIONAL` N, I17).
+    pub(crate) notional_1e6: i64,
+    /// The script's timeframe (the accumulator's reserve).
+    pub(crate) tf_s: u32,
 }
 
 /// The pine arm boot (T13): manifest → one script → facts and the route in
@@ -312,6 +364,7 @@ pub(crate) fn boot_member(
         now_ns: 0,
         virt_ns: 0,
         intake_refused: 0,
+        emits: Vec::new(),
     };
     set.on_start(&mut ctx)
         .map_err(|e| pre(format!("pine: on_start refused: {e:?}")))?;
@@ -320,6 +373,8 @@ pub(crate) fn boot_member(
         route,
         descriptors,
         script_sha: script.sha256,
+        notional_1e6: script.qty_notional_1e6,
+        tf_s: script.timeframe_s,
     })
 }
 
@@ -333,12 +388,14 @@ pub fn run_pine_main(a: &PineArgv) -> PineExit {
             stdout: String::new(),
             stderr: format!("backtest --strategy pine: {}", f.err),
             closed_ms: Vec::new(),
+            max_fee_drain: 0,
         },
     }
 }
 
 fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
-    let ids = trial_ids(a)?;
+    let nulls = null_cfg(a)?;
+    let ids = trial_ids(a, &nulls)?;
     let plan = match (&a.cut_plan, &a.replay_dir) {
         (Some(p), _) => {
             let bytes =
@@ -404,6 +461,18 @@ fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
             .join(hex32(&ids[0]))
     });
     refuse_inside_git("--out-dir", &out_dir)?;
+    // pin:Bp-rows-out-default — without the flags the rows and series land
+    // in the out dir (`rows.t2`, `ret/`); every path is outside git (§4.10 item 6).
+    let rows_out = a
+        .rows_out
+        .clone()
+        .unwrap_or_else(|| out_dir.join("rows.t2"));
+    let ret_dir = a.ret_dir.clone().unwrap_or_else(|| out_dir.join("ret"));
+    refuse_inside_git("--rows-out", &rows_out)?;
+    refuse_inside_git("--ret-dir", &ret_dir)?;
+    if let Some(r) = &a.report_out {
+        refuse_inside_git("--report-out", r)?;
+    }
     let mut src_local = LocalSource;
     let mut src_spool = a.cut_spool.as_ref().map(|d| {
         // pin:Bp-cut-wait-capped — `--cut-wait-s` bounded by the ≤ 2 h law.
@@ -451,9 +520,20 @@ fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
         residency: Residency::Streamed,
     };
     let mut buf: Vec<MergedRec> = Vec::new();
+    let pointvalue_1e6 = b.set.pine().chart(0).map_or(0, |c| c.pointvalue_1e6);
+    let acfg = accum_cfg(b.notional_1e6, pointvalue_1e6, from_ms, to_ms);
+    let descriptors = b.descriptors.clone();
+    let mut hook = SignalHook::new(ArmAccum::new(&acfg, b.tf_s), &prov, &descriptors);
     let r = match src_spool.as_mut() {
-        Some(s) => drive_cuts(&dcfg, s, &mut *b.set, &mut fills, &mut buf),
-        None => drive_cuts(&dcfg, &mut src_local, &mut *b.set, &mut fills, &mut buf),
+        Some(s) => drive_cuts_hooked(&dcfg, s, &mut *b.set, &mut fills, &mut buf, &mut hook),
+        None => drive_cuts_hooked(
+            &dcfg,
+            &mut src_local,
+            &mut *b.set,
+            &mut fills,
+            &mut buf,
+            &mut hook,
+        ),
     };
     let (out, code, fault) = match r {
         Ok(o) => (o, 0u8, None),
@@ -467,22 +547,39 @@ fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
         exit: 1,
         err: HarnessError::Capture(format!("{}: {e}", out_dir.display())),
     })?;
-    let mut charges = Vec::with_capacity(MAX_OPEN_TOTAL);
-    fills.take_fee_charges(&mut charges);
-    let mut ledger = FeeLedger::new(&prov);
-    let arm = ledger.push_arm(&prov, "signal", &charges, |s| {
-        b.descriptors
-            .iter()
-            .find(|(x, _)| *x == s)
-            .map(|(_, d)| d.as_str())
-    });
-    ledger.write(&out_dir).map_err(|e| DriveFail {
+    // The fault path left the drive before its last per-cut drain.
+    hook.drain_fees(&mut fills);
+    hook.ledger.write(&out_dir).map_err(|e| DriveFail {
         exit: 1,
         err: HarnessError::Capture(format!("fees.tsv: {e}")),
     })?;
+    let arm = hook.fees;
     let p = b.set.pine();
     let rec = p.broker_record(0);
     let commission = rec.map_or(0, |r| r.commission_paid_1e12);
+    // §4.11: the signal row (T16 appends the nulls, mode-major).
+    let end = if fault.is_some() {
+        TrialEnd::Faulted
+    } else {
+        TrialEnd::Completed
+    };
+    let summary = hook.arm.finish(commission, p.max_insns(0), end, 0);
+    let mut arms = [(
+        ArmRow {
+            trial_id: ids[0],
+            summary,
+            ret_sha256: None,
+        },
+        hook.arm.day_returns(),
+    )];
+    write_rows(&rows_out, &ret_dir, b.notional_1e6, prov.digest, &mut arms).map_err(|e| {
+        DriveFail {
+            exit: 1,
+            err: HarnessError::Capture(e),
+        }
+    })?;
+    let sig = arms[0].0;
+    let ret_sha = sig.ret_sha256.map(|h| hex32(&h)).unwrap_or_default();
     let mut stderr = String::new();
     if let Some((f, k)) = &fault {
         stderr = match k {
@@ -498,7 +595,9 @@ fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
         "{{\"schema\":\"pvm-t2-1\",\"exit\":{code},\"signal_id\":\"{}\",\"trials\":{},\
          \"cuts\":{},\"records\":{},\"closed_trades\":{},\"commission_1e12\":{commission},\
          \"fee_rows\":{},\"fee_1e12\":{},\"fee_digest\":\"{}\",\"fees_measured\":{},\
-         \"faulted\":{},\"null_arms_run\":0}}",
+         \"faulted\":{},\"null_arms_run\":0,\"rows\":{},\"flags\":{},\"net_bps_1e4\":{},\
+         \"gross_bps_1e4\":{},\"fee_bps_1e4\":{},\"trades\":{},\"closed\":{},\"obs_days\":{},\
+         \"ret_sha256\":\"{ret_sha}\"}}",
         hex32(&ids[0]),
         ids.len(),
         out.cuts.len(),
@@ -507,9 +606,23 @@ fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
         arm.rows,
         arm.fee_1e12,
         hex32(&prov.digest),
-        ledger.fees_measured(),
+        hook.ledger.fees_measured(),
         fault.is_some(),
+        arms.len(),
+        sig.summary.flags,
+        sig.summary.net_bps_1e4,
+        sig.summary.gross_bps_1e4,
+        sig.summary.fee_bps_1e4,
+        sig.summary.trades,
+        sig.summary.closed,
+        sig.summary.obs_days,
     );
+    if let Some(r) = &a.report_out {
+        std::fs::write(r, format!("{stdout}\n")).map_err(|e| DriveFail {
+            exit: 1,
+            err: HarnessError::Capture(format!("--report-out {}: {e}", r.display())),
+        })?;
+    }
     let mut closed_ms = Vec::new();
     let mut i = 0u32;
     while let Some(t) = p.closed_trade(0, i) {
@@ -521,6 +634,7 @@ fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
         stdout,
         stderr,
         closed_ms,
+        max_fee_drain: hook.max_drain,
     })
 }
 

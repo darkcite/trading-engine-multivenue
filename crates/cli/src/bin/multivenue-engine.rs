@@ -1348,6 +1348,15 @@ struct BacktestArgs {
     /// B'3: research artifact directory (refused inside a git tree).
     #[arg(long, requires = "strategy")]
     out_dir: Option<PathBuf>,
+    /// B'3: the tier-2 rows file (default `<out-dir>/rows.t2`).
+    #[arg(long, requires = "strategy")]
+    rows_out: Option<PathBuf>,
+    /// B'3: the daily return series directory (default `<out-dir>/ret`).
+    #[arg(long, requires = "strategy")]
+    ret_dir: Option<PathBuf>,
+    /// B'3: also write the `pvm-t2-1` report line here.
+    #[arg(long, requires = "strategy")]
+    report_out: Option<PathBuf>,
     /// B'3: the scoring window `<from_ms>:<to_ms>`.
     #[arg(long, requires = "strategy")]
     window_ms: Option<String>,
@@ -3554,6 +3563,9 @@ fn backtest_pine(args: BacktestArgs) -> ExitCode {
         trial_id: args.trial_id,
         trial_ids: args.trial_ids,
         out_dir: args.out_dir,
+        rows_out: args.rows_out,
+        ret_dir: args.ret_dir,
+        report_out: args.report_out,
     };
     let x = cli::backtest::run_pine_main(&argv);
     if !x.stderr.is_empty() {
@@ -4333,7 +4345,12 @@ fn run(args: RunArgs) -> ExitCode {
                 |k| cli::pine_boot::resolve_key(&boot.allocated, k),
                 &facts,
             ) {
-                Ok(b) => Some(b),
+                Ok(mut b) => {
+                    // R5/R6: the boot record and the delivery journal live in the run dir.
+                    b.run_dir = Some(run_dir.clone());
+                    b.run_epoch_ns = epoch_ns;
+                    Some(b)
+                }
                 Err(reason) => {
                     error!(reason, "pine: slot 8 refused — boot aborted");
                     return ExitCode::from(1);

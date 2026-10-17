@@ -28,6 +28,10 @@ pub(crate) mod arm;
 pub(crate) mod cuts;
 pub(crate) mod drive;
 pub(crate) mod fees;
+/// T16: the null machinery (modes, seeds, the null gate, sign-flip's pieces).
+pub(crate) mod null;
 /// T13: `backtest --strategy pine` end to end (boot, drive, report).
 pub(crate) mod run;
 pub(crate) mod spool;
+/// T15: one `TrialAccum` per arm, `RowsWriter`, `write_ret` (§4.11).
+pub(crate) mod summary;

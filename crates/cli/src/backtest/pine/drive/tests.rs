@@ -16,7 +16,9 @@ use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
 
 use super::super::cuts::{boundary_virt_ns, parse_cut_plan, CutPlan, LocalSource, SplitLaw};
 use super::super::spool::{write_marker, SpoolSource, ABORT_MARKER};
-use super::{drive_cuts, DriveCfg, DriveOut, PineMember, Residency};
+use super::{
+    drive_cuts, drive_cuts_hooked, DriveCfg, DriveHook, DriveOut, PineMember, Residency, SignalRec,
+};
 use crate::backtest::fill::{DoneReason, FillEngine, OrderDone};
 use crate::backtest::keep::KeepPolicy;
 use crate::backtest::MergedRec;
@@ -716,4 +718,79 @@ fn a_script_fault_stops_the_replay_at_that_record_and_exits_4() {
     assert_eq!(e.exit, super::EXIT_FAULT);
     assert_eq!(m.inner.ticks, 60, "nothing after the faulting record");
     assert!(!m.inner.log.iter().any(|l| l == "stop"), "no on_stop");
+}
+
+/// T16's input: what a hook beside the member records of the signal arm.
+#[derive(Default)]
+struct Recorder {
+    ticks: u32,
+    places_taken: u64,
+    refused: u64,
+    fills_of: std::collections::BTreeMap<u64, i64>,
+    dones: Vec<OrderDone>,
+    last_virt: u64,
+}
+
+impl DriveHook<Stub> for Recorder {
+    fn on_tick(&mut self, _t: &Tick, _virt_ns: u64, _wall_ns: u64) {
+        self.ticks += 1;
+    }
+
+    fn after_record(&mut self, _m: &mut Stub, _f: &mut FillEngine, rec: &SignalRec<'_>) {
+        assert!(rec.virt_ns >= self.last_virt, "records in order");
+        self.last_virt = rec.virt_ns;
+        assert!(rec.wall_ns > 0, "the record's wall time");
+        for (o, ok) in rec.emits {
+            if !*ok {
+                self.refused += 1;
+            } else if o.verb == core_types::ORDER_VERB_PLACE {
+                self.places_taken += 1;
+            }
+        }
+        for f in rec.fills {
+            *self.fills_of.entry(f.client_oid).or_insert(0) += f.qty_1e6;
+        }
+        self.dones.extend_from_slice(rec.dones);
+    }
+}
+
+/// §4.8 (T16's observation point): the hook sees every signal emission as
+/// the model took it, every signal fill and every disposition — the same
+/// ones the member saw, in the same order.
+#[test]
+fn the_hook_sees_every_signal_emission_fill_and_done_in_record_order() {
+    let fx = fixture("hook");
+    let p = plan(&fx, false);
+    let keep = pine_keep();
+    let cfg = DriveCfg {
+        plan: &p,
+        keep: &keep,
+        stale_after_ms: [1_000; VENUE_COUNT],
+        residency: Residency::Streamed,
+    };
+    let mut stub = Stub::default();
+    let mut fills = engine(&p);
+    let mut buf: Vec<MergedRec> = Vec::new();
+    let mut rec = Recorder::default();
+    let out = drive_cuts_hooked(
+        &cfg,
+        &mut LocalSource,
+        &mut stub,
+        &mut fills,
+        &mut buf,
+        &mut rec,
+    )
+    .unwrap();
+    assert_eq!(rec.ticks, stub.ticks, "every tick, before the member's");
+    assert_eq!(rec.places_taken, stub.oid, "every PLACE the model took");
+    assert_eq!(rec.refused, out.intake_refused);
+    assert_eq!(rec.fills_of, stub.fills_of);
+    assert_eq!(
+        rec.dones, stub.done_seen,
+        "the member's dispositions, in order"
+    );
+    // The hook changes nothing the member sees.
+    let (plain, r) = run_with(&p, &pine_keep(), Residency::Streamed, &mut LocalSource);
+    assert_eq!(r.unwrap(), out);
+    assert_eq!(plain.log, stub.log);
 }
