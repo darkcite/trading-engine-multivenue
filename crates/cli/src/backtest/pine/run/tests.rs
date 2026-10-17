@@ -184,10 +184,15 @@ fn a_script_fault_aborts_writes_faulted_rows_and_exits_4() {
     assert!(x.stderr.contains("sha "), "{}", x.stderr);
     assert!(x.stdout.contains("\"faulted\":true"), "{}", x.stdout);
     let rows = pine_screen::rows::RowsFile::open(&fx.root.join("out/rows.t2")).unwrap();
-    assert_eq!(rows.recs().len(), 1);
+    // The signal and its one sign-flip arm (pin:Bp-null-fault-rows).
+    assert_eq!(rows.recs().len(), 2);
     let s = rows.recs()[0].summary;
     assert_ne!(s.flags & pine_ir::trial_flag::FAULTED, 0);
     assert_eq!((s.faults, s.obs_days, s.net_bps_1e4), (1, 0, 0));
+    assert_ne!(
+        rows.recs()[1].summary.flags & pine_ir::trial_flag::FAULTED,
+        0
+    );
     let ret = pine_screen::ret::ret_path(&fx.root.join("out/ret"), &[0xab; 32]);
     assert!(!ret.exists(), "a FAULTED row has no series");
     assert!(x.stdout.contains("\"ret_sha256\":\"\""), "{}", x.stdout);
@@ -289,6 +294,88 @@ fn null_arms_are_parsed_before_the_first_record() {
         3,
         "the signal + 2 sign-flip replicates"
     );
+}
+
+/// T16 end to end: the sign-flip arms run in the signal's pass — one row
+/// per arm in trial-id order (signal, then the nulls' derived ids), one
+/// `arms` entry each, and every null arm's parity holds (no U7).
+#[test]
+fn sign_flip_arms_run_beside_the_signal_end_to_end() {
+    let (fx, mut a) = fixture("t16e2e", "hold.pine", &[0, 90, 330]);
+    a.null_replicates = 2;
+    a.null_seed = Some(9);
+    a.trial_ids = None;
+    let x = run_pine_main(&a);
+    assert_eq!(x.code, 0, "{} {}", x.stderr, x.stdout);
+    assert_eq!(field(&x.stdout, "null_arms_run"), 2);
+    let rows = pine_screen::rows::RowsFile::open(&fx.root.join("out/rows.t2")).unwrap();
+    assert_eq!(rows.recs().len(), 3);
+    let sig = rows.recs()[0].trial_id;
+    for j in 0..2u32 {
+        assert_eq!(
+            rows.recs()[1 + j as usize].trial_id,
+            super::super::null::null_trial_id(&sig, j)
+        );
+    }
+    assert_eq!(x.stdout.matches("\"arm\":\"sign-flip\"").count(), 2);
+    assert!(!x.stdout.contains("\"U7\""), "{}", x.stdout);
+    // I19: the same seed reproduces the rows file byte for byte.
+    let first = std::fs::read(fx.root.join("out/rows.t2")).unwrap();
+    std::fs::remove_dir_all(fx.root.join("out")).unwrap();
+    let y = run_pine_main(&a);
+    assert_eq!(y.code, 0, "{}", y.stderr);
+    assert_eq!(std::fs::read(fx.root.join("out/rows.t2")).unwrap(), first);
+}
+
+/// T17 end to end: the three modes run in one pass, rows mode-major in
+/// `--null-arm` order, every arm's parity holding (no U7).
+#[test]
+fn all_three_modes_run_in_one_pass_end_to_end() {
+    let (fx, mut a) = fixture("t17e2e", "hold.pine", &[0, 90, 330]);
+    a.null_arm = vec![
+        "sign-flip".to_owned(),
+        "phase-random".to_owned(),
+        "cadence-match".to_owned(),
+    ];
+    a.null_replicates = 2;
+    a.trial_ids = None;
+    let x = run_pine_main(&a);
+    // The fixture's cap_instance equals its unit notional, so a null entry
+    // priced above the signal's can trip U1 on that null (exit 3) — never U7.
+    assert!(x.code == 0 || x.code == 3, "{} {}", x.stderr, x.stdout);
+    assert_eq!(field(&x.stdout, "null_arms_run"), 6);
+    let rows = pine_screen::rows::RowsFile::open(&fx.root.join("out/rows.t2")).unwrap();
+    assert_eq!(rows.recs().len(), 7);
+    let at = |s: &str| x.stdout.find(s).unwrap();
+    assert!(at("\"arm\":\"sign-flip\"") < at("\"arm\":\"phase-random\""));
+    assert!(at("\"arm\":\"phase-random\"") < at("\"arm\":\"cadence-match\""));
+    assert!(!x.stdout.contains("\"U7\""), "{}", x.stdout);
+}
+
+/// I21: a rule that trips in a null arm flags that arm's row only, prints
+/// `7002` for it, and exits 3; the signal row stays unflagged.
+#[test]
+fn a_null_arm_trip_leaves_the_signal_row_unflagged() {
+    let (fx, mut a) = fixture("i21null", "hold.pine", &[0, 90, 330]);
+    a.null_arm = vec!["cadence-match".to_owned()];
+    a.null_replicates = 2;
+    a.trial_ids = None;
+    let x = run_pine_main(&a);
+    assert_eq!(x.code, 3, "{} {}", x.stderr, x.stdout);
+    assert!(
+        x.stderr.contains("7002 UNJUDGED arm=cadence-match/"),
+        "{}",
+        x.stderr
+    );
+    assert!(!x.stderr.contains("arm=signal"), "{}", x.stderr);
+    let rows = pine_screen::rows::RowsFile::open(&fx.root.join("out/rows.t2")).unwrap();
+    let u = pine_ir::trial_flag::UNJUDGED;
+    assert_eq!(rows.recs()[0].summary.flags & u, 0, "signal unflagged");
+    let flagged = rows.recs()[1..]
+        .iter()
+        .filter(|r| r.summary.flags & u != 0)
+        .count();
+    assert_eq!(flagged, x.stderr.matches("7002 UNJUDGED").count());
 }
 
 /// pin:Bp-trial-ids-count: `--trial-ids` must name the signal and every

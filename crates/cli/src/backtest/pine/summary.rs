@@ -139,7 +139,10 @@ impl ArmAccum {
 /// record, the fee ledger per cut.
 pub(crate) struct SignalHook<'p> {
     pub(crate) arm: ArmAccum,
-    marks: [(Bar, i128); strategy_pine::BAR_MARKS_CAP],
+    /// The last record's R7 drain: `marks[..last_marks]` (the null arms
+    /// mark their equity at the same bars, T16).
+    pub(crate) marks: [(Bar, i128); strategy_pine::BAR_MARKS_CAP],
+    pub(crate) last_marks: usize,
     charges: Vec<FeeCharge>,
     pub(crate) ledger: FeeLedger,
     prov: &'p FeeProvenance,
@@ -159,6 +162,7 @@ impl<'p> SignalHook<'p> {
         Self {
             arm,
             marks: [(Bar::default(), 0); strategy_pine::BAR_MARKS_CAP],
+            last_marks: 0,
             charges: Vec::with_capacity(MAX_OPEN_TOTAL),
             ledger: FeeLedger::new(prov),
             prov,
@@ -188,6 +192,7 @@ impl<'p> SignalHook<'p> {
 impl DriveHook<StrategySet> for SignalHook<'_> {
     fn after_record(&mut self, m: &mut StrategySet, _fills: &mut FillEngine, _rec: &SignalRec<'_>) {
         let n = m.pine_mut().take_bar_marks(0, &mut self.marks);
+        self.last_marks = n;
         let p = m.pine();
         if n > 0 {
             let c = p.broker_record(0).map_or(0, |r| r.commission_paid_1e12);

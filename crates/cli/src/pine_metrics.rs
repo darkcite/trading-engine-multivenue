@@ -357,6 +357,119 @@ mod tests {
         );
         assert_eq!(incident_line(&i, &mut [0u8; 16]), 0, "too small: nothing");
     }
+
+    /// A member double: `inc` incidents and the two tape rings.
+    struct Rings {
+        inc: Vec<PineIncident>,
+        seq: Vec<strategy_core::PineSeqRec>,
+        dec: Vec<strategy_core::PineTapeRec>,
+    }
+
+    fn view<T: Copy>(src: &[T], seq_of: impl Fn(&T) -> u64, out: &mut [T], from: u64) -> u32 {
+        let mut n = 0usize;
+        for r in src.iter().filter(|r| seq_of(r) >= from) {
+            if n == out.len() {
+                break;
+            }
+            out[n] = *r;
+            n += 1;
+        }
+        n as u32
+    }
+
+    impl strategy_core::StrategyCounters for Rings {
+        fn strategy_kind(&self) -> &'static str {
+            "pine"
+        }
+        fn pine_counters(&self) -> PineCounters {
+            PineCounters::default()
+        }
+        fn pine_incidents_view(&self, out: &mut [PineIncident], from: u64) -> u32 {
+            view(&self.inc, |r| r.seq, out, from)
+        }
+        fn pine_seq_view(&self, out: &mut [strategy_core::PineSeqRec], from: u64) -> u32 {
+            view(&self.seq, |r| r.seq, out, from)
+        }
+        fn pine_tape_view(&self, out: &mut [strategy_core::PineTapeRec], from: u64) -> u32 {
+            view(&self.dec, |r| r.seq, out, from)
+        }
+    }
+
+    /// pin:08-drain-outside-metrics: a boot with metrics OFF — no registry, `mirror` never
+    /// called — still appends every incident to `incidents.log` and drains both tapes and
+    /// `set.tsv`; a second pass writes no record twice.
+    #[test]
+    fn metrics_off_boot_still_drains_incidents_and_tapes() {
+        let dir = std::env::temp_dir().join(format!("pine-drain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let boot = 1_767_225_600_000i64;
+        let m = Rings {
+            inc: (0..2u64)
+                .map(|s| PineIncident {
+                    seq: s,
+                    event: pine_incident::FAULT,
+                    ..PineIncident::default()
+                })
+                .collect(),
+            seq: (1..=3u64)
+                .map(|s| strategy_core::PineSeqRec {
+                    seq: s,
+                    ..Default::default()
+                })
+                .collect(),
+            dec: (0..2u64)
+                .map(|s| strategy_core::PineTapeRec {
+                    seq: s,
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        let mut d = PineDrain::open(&PineIo {
+            pine_dir: dir.clone(),
+            tape: true,
+            boot_utc_ms: boot,
+        });
+        let mc = clob_dispatcher::MatcherCounters::default();
+        d.drain(&m, boot + 5_000, &mc);
+        d.drain(&m, boot + 10_000, &mc);
+        let log = std::fs::read_to_string(dir.join("incidents.log")).expect("incidents.log");
+        assert_eq!(log.lines().count(), 2, "{log}");
+        assert!(log.lines().all(|l| l.split('\t').nth(3) == Some("FAULT")));
+        let tape = dir.join("tape").join(boot.to_string());
+        let seq = std::fs::read(tape.join("seq.bin")).expect("seq.bin");
+        let dec = std::fs::read(tape.join("decisions.bin")).expect("decisions.bin");
+        assert_eq!((seq.len(), dec.len()), (3 * 128, 2 * 64));
+        let set = std::fs::read_to_string(tape.join("set.tsv")).expect("set.tsv");
+        assert_eq!(set.lines().count(), 3, "header + one line per pass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// pin:08-drain-outside-metrics, structurally: in the engine loop's 5 s block the pine drain
+    /// sits beside `hook.drain` BEFORE the metrics gate and only the mirror inside it; the
+    /// shutdown drains it too, before `eng.stop()`.
+    #[test]
+    fn engine_loop_drains_pine_outside_the_metrics_gate() {
+        let src = include_str!("paper.rs");
+        let at = |pat: &str, from: usize| {
+            src[from..]
+                .find(pat)
+                .map(|i| i + from)
+                .unwrap_or_else(|| panic!("{pat}"))
+        };
+        let block = at("if now >= next_report {", at("fn run_engine_loop<", 0));
+        let hook = at("hook.drain(eng.strategy());", block);
+        let drain = at("d.drain(", block);
+        let gate = at(
+            "if let (Some(reg), Some(ids)) = (obs.metrics.as_ref(), obs.counter_ids.as_ref())",
+            block,
+        );
+        let mirror = at("d.mirror(", block);
+        assert!(hook < drain && drain < gate && gate < mirror);
+        assert!(!src.contains("d.tick("), "the old in-gate pass is gone");
+        let last = at("hook.drain(eng.strategy());", mirror);
+        let last_drain = at("d.drain(", last);
+        assert!(last_drain < at("eng.stop();", last));
+    }
 }
 
 /// `set.tsv`'s matcher columns (pin:08-set-tsv-columns, pin:08-set-tsv-matcher-read): the paper
@@ -477,15 +590,12 @@ impl PineDrain {
         }
     }
 
-    /// One 5 s pass: the metric mirror (when registered), the incident drain (each line to the
-    /// log and at ERROR), the tape drain plus one `set.tsv` line carrying `matcher`
-    /// ([`matcher_row`] of the dispatcher's `matcher_counters()`).
-    pub fn tick<S: strategy_core::StrategyCounters>(
+    /// The 5 s metric mirror (`engine_pine_*`), INSIDE the cli's metrics gate: with the family
+    /// unregistered (`reg` `None`) the baseline only moves. Allocates nothing.
+    pub fn mirror<S: strategy_core::StrategyCounters>(
         &mut self,
         reg: Option<(&core_metrics::MetricsRegistry, &PineMetricIds)>,
         strat: &S,
-        utc_ms: i64,
-        matcher: &clob_dispatcher::MatcherCounters,
     ) {
         let cur = strat.pine_counters();
         if let Some((r, ids)) = reg {
@@ -493,6 +603,20 @@ impl PineDrain {
         } else {
             self.last = cur;
         }
+    }
+
+    /// One 5 s pass of the durable outputs: the incident drain (each line to the log and at
+    /// ERROR), the tape drain plus one `set.tsv` line carrying `matcher` ([`matcher_row`] of the
+    /// dispatcher's `matcher_counters()`). pin:08-drain-outside-metrics (lead ruling
+    /// 2026-10-17): the cli calls this beside the loop hook's drain, OUTSIDE the metrics gate —
+    /// the T18 tapes and `incidents.log` are capture durability, not an observability option —
+    /// on the 5 s block and once more after the loop's last iteration.
+    pub fn drain<S: strategy_core::StrategyCounters>(
+        &mut self,
+        strat: &S,
+        utc_ms: i64,
+        matcher: &clob_dispatcher::MatcherCounters,
+    ) {
         let log = &mut self.log;
         let lost = drain_incidents(
             strat,
@@ -500,6 +624,9 @@ impl PineDrain {
             &mut self.out,
             &mut self.line,
             |l| {
+                // COPY: one incident line (≤ 512 B, ASCII) borrowed as text for the ERROR log, on
+                // the 5 s cadence off the decision path — `from_utf8_lossy` borrows valid UTF-8 —
+                // logging the raw bytes rejected (unreadable in the operator's log).
                 tracing::error!(line = %String::from_utf8_lossy(l).trim_end(), "pine: incident");
                 if let Some(f) = log.as_mut() {
                     use std::io::Write;

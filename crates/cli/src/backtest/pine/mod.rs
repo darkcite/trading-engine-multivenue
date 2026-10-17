@@ -28,8 +28,12 @@ pub(crate) mod arm;
 pub(crate) mod cuts;
 pub(crate) mod drive;
 pub(crate) mod fees;
+/// T18: the UNJUDGED gate (rules U1–U7, `7002`, exit 3).
+pub(crate) mod gate;
 /// T16: the null machinery (modes, seeds, the null gate, sign-flip's pieces).
 pub(crate) mod null;
+/// T16: the null arms' drive (own model, book, accumulator, fee section).
+pub(crate) mod nullarm;
 /// T13: `backtest --strategy pine` end to end (boot, drive, report).
 pub(crate) mod run;
 pub(crate) mod spool;

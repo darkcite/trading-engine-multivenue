@@ -90,9 +90,8 @@ impl<M> DriveHook<M> for NoHook {}
 
 /// What the signal arm did in one record, in production order per list
 /// (§4.8: the null arms observe the orders slot 8 emitted and its fills).
-/// pin:Bp-null-t16-staged — read by the null arms (the next T16 step).
+/// Read by the null arms (`nullarm.rs`).
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SignalRec<'a> {
     pub(crate) virt_ns: u64,
     pub(crate) wall_ns: u64,

@@ -377,6 +377,7 @@ dependencies = [
  "libc",
  "mio 0.8.11",
  "opt-registry",
+ "pine-broker",
  "pine-ir",
  "pine-lang",
  "pine-screen",

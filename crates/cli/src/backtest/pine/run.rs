@@ -34,11 +34,18 @@
 //!   hands the member wall ns).
 //! - pin:Bp-warmup-cold-until-flag — no `--warmup-bars-root` yet: every row
 //!   boots cold (no slice), impl-08 §4.3.6's legal reading of "no bars".
-//! - pin:Bp-null-arms-t16 — `--null-arm` / seeds are parsed and validated
-//!   (`null::NullCfg`, exit 6) and the null trial ids derived (`trials` in
-//!   the report counts them); the arms' drive is T16's next step, so the
-//!   report still says `null_arms_run: 0` and only the signal row is written.
-//! - pin:Bp-gate-t18 — exit 3 (UNJUDGED) is T18's; a judged run exits 0.
+//! - Every `--null-arm` mode runs beside the signal in its pass (T16–T17,
+//!   `nullarm`); the report's `arms` carry each arm's `entries_emitted` /
+//!   `entries_pending_at_end` (pin:Bp-null-entries-emitted) and rules.
+//! - pin:Bp-report-additive — the `pvm-t2-1` line keeps its T13–T15 keys
+//!   and adds `null_arms_run`, `u4_signal_rate_ppm`, `unit_notional_1e6`
+//!   and `arms` (signal first, then the nulls mode-major).
+//! - pin:Bp-null-chart-sym — the null arms mark the manifest's chart symbol
+//!   (the first resolved fact) at each bar's close.
+//! - pin:Bp-null-max-insns — a null row's `max_insns` is the signal's
+//!   (§4.11 "the signal's `max_insns`").
+//! - pin:Bp-null-fault-rows — on a script fault every null row is FAULTED
+//!   too (the pass they share stopped), and gets no series.
 
 use std::path::{Path, PathBuf};
 
@@ -55,7 +62,9 @@ use super::cuts::{
 };
 use super::drive::{drive_cuts_hooked, DriveCfg, DriveFail, DriveOut, PineCtx, Residency};
 use super::fees::{fee_provenance, refuse_inside_git, FeeSym};
+use super::gate;
 use super::null::{null_trial_id, NullCfg};
+use super::nullarm::{ArmsHook, NullArm, NullArms, NullEnv};
 use super::spool::SpoolSource;
 use super::summary::{accum_cfg, write_rows, ArmAccum, ArmRow, SignalHook};
 use crate::backtest::fill::FillEngine;
@@ -261,6 +270,8 @@ pub(crate) struct PineBooted {
     pub(crate) notional_1e6: i64,
     /// The script's timeframe (the accumulator's reserve).
     pub(crate) tf_s: u32,
+    /// The chart symbol (pin:Bp-null-chart-sym).
+    pub(crate) chart_sym: u32,
 }
 
 /// The pine arm boot (T13): manifest → one script → facts and the route in
@@ -294,6 +305,7 @@ pub(crate) fn boot_member(
         crate::pine_boot::facts_from_screen_universe(key, sym, universe)
     })
     .map_err(pre)?;
+    let chart_sym = symbols.first().map_or(0, |f| f.sym);
     let mut route: Vec<u32> = symbols.iter().map(|f| f.sym).collect();
     route.sort_unstable();
     route.dedup();
@@ -375,6 +387,7 @@ pub(crate) fn boot_member(
         script_sha: script.sha256,
         notional_1e6: script.qty_notional_1e6,
         tf_s: script.timeframe_s,
+        chart_sym,
     })
 }
 
@@ -484,7 +497,8 @@ fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
         None => src_local.open(&plan.rows[0]),
     }
     .map_err(|e| pre(e.to_string()))?;
-    let mut fills = FillEngine::new(model, boundary_virt_ns(&plan, law));
+    let boundary = boundary_virt_ns(&plan, law);
+    let mut fills = FillEngine::new(model, boundary);
     let boot_ms = (plan.rows[0].wall_from_ns() / 1_000_000) as i64;
     let mut b = boot_member(
         &a.manifest,
@@ -523,7 +537,33 @@ fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
     let pointvalue_1e6 = b.set.pine().chart(0).map_or(0, |c| c.pointvalue_1e6);
     let acfg = accum_cfg(b.notional_1e6, pointvalue_1e6, from_ms, to_ms);
     let descriptors = b.descriptors.clone();
-    let mut hook = SignalHook::new(ArmAccum::new(&acfg, b.tf_s), &prov, &descriptors);
+    let signal_hook = SignalHook::new(ArmAccum::new(&acfg, b.tf_s), &prov, &descriptors);
+    // §4.8: one arm per (mode, replicate), mode-major, each with its own
+    // model (the signal's parameters and boundary), book and accumulator.
+    let env = NullEnv {
+        ncfg: b.set.pine().native_cfg(0).unwrap_or_default(),
+        pv_1e6: pointvalue_1e6,
+        chart_sym: b.chart_sym,
+        tf_s: b.tf_s,
+    };
+    let mut null_arms = Vec::with_capacity(nulls.arms());
+    for j in 0..nulls.arms() {
+        let (mode, rep) = nulls.arm(j);
+        null_arms.push(NullArm::new(
+            mode,
+            rep,
+            nulls.seeds[j],
+            FillEngine::new(model, boundary),
+            ArmAccum::new(&acfg, b.tf_s),
+            &prov,
+        ));
+    }
+    let mut hook = ArmsHook::new(
+        signal_hook,
+        NullArms::new(env, null_arms),
+        &prov,
+        &descriptors,
+    );
     let r = match src_spool.as_mut() {
         Some(s) => drive_cuts_hooked(&dcfg, s, &mut *b.set, &mut fills, &mut buf, &mut hook),
         None => drive_cuts_hooked(
@@ -547,40 +587,131 @@ fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
         exit: 1,
         err: HarnessError::Capture(format!("{}: {e}", out_dir.display())),
     })?;
-    // The fault path left the drive before its last per-cut drain.
-    hook.drain_fees(&mut fills);
-    hook.ledger.write(&out_dir).map_err(|e| DriveFail {
+    // The null models retire what they hold; every arm's fees drain (the
+    // fault path left the drive before its last per-cut drain).
+    hook.finish(&mut fills);
+    let mut ledger = hook.signal.ledger.clone();
+    for n in &hook.nulls.arms {
+        ledger.append_section(&n.ledger); // pin:Bp-null-fee-section
+    }
+    ledger.write(&out_dir).map_err(|e| DriveFail {
         exit: 1,
         err: HarnessError::Capture(format!("fees.tsv: {e}")),
     })?;
-    let arm = hook.fees;
+    let arm = hook.signal.fees;
     let p = b.set.pine();
     let rec = p.broker_record(0);
     let commission = rec.map_or(0, |r| r.commission_paid_1e12);
-    // §4.11: the signal row (T16 appends the nulls, mode-major).
     let end = if fault.is_some() {
         TrialEnd::Faulted
     } else {
         TrialEnd::Completed
     };
-    let summary = hook.arm.finish(commission, p.max_insns(0), end, 0);
-    let mut arms = [(
+    // §4.9: the UNJUDGED gate per arm (U1–U6 on its counters, U7 on a
+    // null's parity); a tripped arm's row is flagged, `7002` printed.
+    let sig_counters = p.broker_counters(0).copied().unwrap_or_default();
+    let sig_rules = gate::rules_of(&sig_counters);
+    let mut lines_7002 = Vec::new();
+    if sig_rules != 0 {
+        lines_7002.push(gate::line_7002("signal", sig_rules, &sig_counters));
+    }
+    let flag_of = gate::row_flag;
+    let max_insns = p.max_insns(0);
+    let summary = hook
+        .signal
+        .arm
+        .finish(commission, max_insns, end, flag_of(sig_rules));
+    let mut null_rules = Vec::with_capacity(hook.nulls.arms.len());
+    let mut null_summaries = Vec::with_capacity(hook.nulls.arms.len());
+    for n in hook.nulls.arms.iter_mut() {
+        let r = gate::null_rules(&n.counters, n.parity_ok());
+        if r != 0 {
+            lines_7002.push(gate::line_7002(&n.label, r, &n.counters));
+        }
+        null_rules.push(r);
+        // pin:Bp-null-max-insns, pin:Bp-null-fault-rows.
+        null_summaries.push(n.accum.finish(n.fee_1e12, max_insns, end, flag_of(r)));
+    }
+    // §4.11: signal first, then the nulls mode-major (trial-id order).
+    let mut arms = Vec::with_capacity(1 + null_summaries.len());
+    arms.push((
         ArmRow {
             trial_id: ids[0],
             summary,
             ret_sha256: None,
         },
-        hook.arm.day_returns(),
-    )];
+        hook.signal.arm.day_returns(),
+    ));
+    for (j, n) in hook.nulls.arms.iter().enumerate() {
+        arms.push((
+            ArmRow {
+                trial_id: ids[1 + j],
+                summary: null_summaries[j],
+                ret_sha256: None,
+            },
+            n.accum.day_returns(),
+        ));
+    }
     write_rows(&rows_out, &ret_dir, b.notional_1e6, prov.digest, &mut arms).map_err(|e| {
         DriveFail {
             exit: 1,
             err: HarnessError::Capture(e),
         }
     })?;
+    let tripped = sig_rules != 0 || null_rules.iter().any(|r| *r != 0);
+    let code = if code == 0 && tripped {
+        gate::EXIT_UNJUDGED
+    } else {
+        code
+    };
     let sig = arms[0].0;
     let ret_sha = sig.ret_sha256.map(|h| hex32(&h)).unwrap_or_default();
-    let mut stderr = String::new();
+    let mut arms_json = String::new();
+    for (j, (row, _)) in arms.iter().enumerate() {
+        let (label, rep, rules, (emitted, pending), c) = if j == 0 {
+            (
+                "signal",
+                0,
+                sig_rules,
+                (hook.nulls.signal_places, 0),
+                sig_counters,
+            )
+        } else {
+            let n = &hook.nulls.arms[j - 1];
+            (
+                n.mode.label(),
+                n.replicate,
+                null_rules[j - 1],
+                n.entries(),
+                n.counters,
+            )
+        };
+        let names = gate::rule_names(rules);
+        let rules_list = if names.is_empty() {
+            String::new()
+        } else {
+            format!("\"{}\"", names.replace(',', "\",\""))
+        };
+        if j > 0 {
+            arms_json.push(',');
+        }
+        arms_json.push_str(&format!(
+            "{{\"trial_id\":\"{}\",\"arm\":\"{label}\",\"replicate\":{rep},\"flags\":{},\
+             \"rules\":[{rules_list}],\"net_bps_1e4\":{},\"gross_bps_1e4\":{},\"fee_bps_1e4\":{},\
+             \"trades\":{},\"closed\":{},\"entries_emitted\":{emitted},\
+             \"entries_pending_at_end\":{pending},\"u4_rate_ppm\":{},\"ret_sha256\":\"{}\"}}",
+            hex32(&row.trial_id),
+            row.summary.flags,
+            row.summary.net_bps_1e4,
+            row.summary.gross_bps_1e4,
+            row.summary.fee_bps_1e4,
+            row.summary.trades,
+            row.summary.closed,
+            gate::u4_rate_ppm(&c),
+            row.ret_sha256.map(|h| hex32(&h)).unwrap_or_default(),
+        ));
+    }
+    let mut stderr = lines_7002.join("\n");
     if let Some((f, k)) = &fault {
         stderr = match k {
             Some((kind, pc, bar)) => format!(
@@ -595,9 +726,10 @@ fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
         "{{\"schema\":\"pvm-t2-1\",\"exit\":{code},\"signal_id\":\"{}\",\"trials\":{},\
          \"cuts\":{},\"records\":{},\"closed_trades\":{},\"commission_1e12\":{commission},\
          \"fee_rows\":{},\"fee_1e12\":{},\"fee_digest\":\"{}\",\"fees_measured\":{},\
-         \"faulted\":{},\"null_arms_run\":0,\"rows\":{},\"flags\":{},\"net_bps_1e4\":{},\
+         \"faulted\":{},\"null_arms_run\":{},\"rows\":{},\"flags\":{},\"net_bps_1e4\":{},\
          \"gross_bps_1e4\":{},\"fee_bps_1e4\":{},\"trades\":{},\"closed\":{},\"obs_days\":{},\
-         \"ret_sha256\":\"{ret_sha}\"}}",
+         \"ret_sha256\":\"{ret_sha}\",\"u4_signal_rate_ppm\":{},\"unit_notional_1e6\":{},\
+         \"arms\":[{arms_json}]}}",
         hex32(&ids[0]),
         ids.len(),
         out.cuts.len(),
@@ -606,8 +738,9 @@ fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
         arm.rows,
         arm.fee_1e12,
         hex32(&prov.digest),
-        hook.ledger.fees_measured(),
+        ledger.fees_measured(),
         fault.is_some(),
+        hook.nulls.arms.len(),
         arms.len(),
         sig.summary.flags,
         sig.summary.net_bps_1e4,
@@ -616,6 +749,8 @@ fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
         sig.summary.trades,
         sig.summary.closed,
         sig.summary.obs_days,
+        gate::u4_rate_ppm(&sig_counters),
+        b.notional_1e6,
     );
     if let Some(r) = &a.report_out {
         std::fs::write(r, format!("{stdout}\n")).map_err(|e| DriveFail {
@@ -634,7 +769,7 @@ fn run_inner(a: &PineArgv) -> Result<PineExit, DriveFail> {
         stdout,
         stderr,
         closed_ms,
-        max_fee_drain: hook.max_drain,
+        max_fee_drain: hook.signal.max_drain,
     })
 }
 

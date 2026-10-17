@@ -30,10 +30,9 @@
 //! - pin:Bp-null-sent-at-gate — `ioc_sent` / `maker_sent` count at the
 //!   gate's pass (the record the null emits); fills and remainders come from
 //!   the null model's dispositions.
-//! - pin:Bp-null-t16-staged — the gate and sign-flip's pieces land (tested)
-//!   before the arm's drive (the next T16 step: the null `FillEngine` per
-//!   arm fed beside the signal's); until then they are unused outside tests.
-#![cfg_attr(not(test), allow(dead_code))]
+//!
+//! The arms' drive (their own `FillEngine`s fed beside the signal's) is
+//! `nullarm.rs` (T16–T17).
 
 use pine_ir::{BrokerCounters, NativeCfg};
 
@@ -434,6 +433,7 @@ impl OrderMap {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn len(&self) -> usize {
         self.pairs.len()
     }

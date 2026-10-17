@@ -10040,6 +10040,18 @@ where
             // PVM impl-08 R6: the arm's 5 s hook (slot 8's delivery journal) — capture
             // durability, outside the metrics gate like the flushes above.
             hook.drain(eng.strategy());
+            // PVM impl-08 T17/T18 (pin:08-drain-outside-metrics): slot 8's tapes, `set.tsv`
+            // and `incidents.log` beside it; only the `engine_pine_*` mirror sits in the gate.
+            if let Some(d) = pine_drain.as_mut() {
+                let utc_ms = i64::try_from(core_time::WallAnchor::now().wall_ns / 1_000_000)
+                    .unwrap_or(i64::MAX);
+                // pin:08-set-tsv-matcher-read: the dispatcher's own matcher read.
+                d.drain(
+                    eng.strategy(),
+                    utc_ms,
+                    &clob_dispatcher::OrderDispatch::matcher_counters(eng.dispatcher()),
+                );
+            }
             // HYPARB H8: hand the period's AMM decisions to the testnet
             // shadow (a ring push each; nothing blocks, nothing is sent
             // from this thread).
@@ -10107,15 +10119,7 @@ where
                 mirror_xmm_metrics(reg, &ids.xmm, eng.strategy(), &mut xmm_last);
                 mirror_hcv_metrics(reg, &ids.hcv, eng.strategy(), &mut hcv_last);
                 if let Some(d) = pine_drain.as_mut() {
-                    let utc_ms = i64::try_from(core_time::WallAnchor::now().wall_ns / 1_000_000)
-                        .unwrap_or(i64::MAX);
-                    // pin:08-set-tsv-matcher-read: the matcher read `/metrics` already makes.
-                    d.tick(
-                        ids.pine.as_ref().map(|p| (&**reg, p)),
-                        eng.strategy(),
-                        utc_ms,
-                        &clob_dispatcher::OrderDispatch::matcher_counters(eng.dispatcher()),
-                    );
+                    d.mirror(ids.pine.as_ref().map(|p| (&**reg, p)), eng.strategy());
                 }
                 mirror_vrp_metrics(reg, &ids.vrp, eng.strategy(), &mut vrp_last);
                 mirror_xsd_metrics(reg, &ids.xsd, eng.strategy(), &mut xsd_last);
@@ -10402,6 +10406,16 @@ where
     flush_member_state!();
     // PVM impl-08 R6: the journal's last records (the loop's final iteration).
     hook.drain(eng.strategy());
+    // pin:08-drain-outside-metrics: and slot 8's last tape / incident records, likewise.
+    if let Some(d) = pine_drain.as_mut() {
+        let utc_ms =
+            i64::try_from(core_time::WallAnchor::now().wall_ns / 1_000_000).unwrap_or(i64::MAX);
+        d.drain(
+            eng.strategy(),
+            utc_ms,
+            &clob_dispatcher::OrderDispatch::matcher_counters(eng.dispatcher()),
+        );
+    }
     eng.stop();
     // H3.7: the state writer stops and is joined FIRST — a write in flight
     // and the forced write below must never share a path's temp file. A

@@ -155,6 +155,38 @@ fn closed_trades_read_back_in_retained_order() {
     assert!(p.closed_trade(0, 1).is_none());
 }
 
+/// R4b `closed_retained` / R4c `open_count` + `open_trade`: the open trade's entry fields while
+/// it is open, then one retained closed trade and nothing open.
+#[test]
+fn open_trades_and_retained_count_read_back() {
+    let q = PineStrategy::new();
+    assert_eq!((q.closed_retained(0), q.open_count(0)), (0, 0));
+    assert!(q.open_trade(0, 0).is_none());
+    let mut p = member_with(boot(vec![rt("rt_close.pine", 0)]));
+    assert_eq!((p.closed_retained(1), p.open_count(1)), (0, 0), "past the scripts");
+    let mut ctx = RecCtx::new();
+    p.on_venue_event(&print(0, T0 + 10, 100_000_000, 1_000_000), &mut ctx);
+    p.on_tick(&quote(0, T0 + 20), &mut ctx);
+    let entry = order_from(&ctx, 0);
+    assert_eq!(p.open_count(0), 0, "the ack is not the fill (E-5)");
+    p.on_fill(&fill_of(&entry, entry.qty.raw(), 1), &mut ctx);
+    assert_eq!((p.open_count(0), p.closed_retained(0)), (1, 0));
+    let o = *p.open_trade(0, 0).expect("open trade 0");
+    assert_eq!(o.qty_1e6, entry.qty.raw(), "the long, signed");
+    assert_eq!(o.entry_px_1e6, entry.px.raw(), "the fill price");
+    assert_eq!((o.exit_ms, o.exit_px_1e6, o.exit_bar), (0, 0, u32::MAX), "open");
+    assert!(p.open_trade(0, 1).is_none());
+    let mark = ctx.n;
+    p.on_venue_event(&print(0, T0 + 30, 100_000_000, 1_000_000), &mut ctx);
+    p.on_tick(&quote(0, T0 + 40), &mut ctx);
+    let exit = order_from(&ctx, mark);
+    p.on_fill(&fill_of(&exit, exit.qty.raw(), 1), &mut ctx);
+    assert_eq!((p.open_count(0), p.closed_retained(0), p.closed_count(0)), (0, 1, 1));
+    assert!(p.open_trade(0, 0).is_none());
+    let c = p.closed_trade(0, 0).expect("closed");
+    assert_eq!((c.entry_ms, c.entry_px_1e6), (o.entry_ms, o.entry_px_1e6), "same trade");
+}
+
 /// R4 `fault`: the kind, pc and bar of the incident; `None` for a running script.
 #[test]
 fn fault_reports_the_disabling_fault() {

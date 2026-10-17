@@ -627,6 +627,32 @@ impl PineStrategy {
             .map_or(0, |s| s.broker.view().closedtrades)
     }
 
+    /// **R4b** (B'3 request): the closed trades script `script`'s broker still RETAINS
+    /// (`view().closed_retained`, impl-05 §3.6.1) — [`Self::closed_trade`]'s index bound; absolute
+    /// trade `k` is retained `k − (closed_count − closed_retained)`. 0 before `on_start` or past
+    /// the loaded scripts. Cold.
+    #[must_use]
+    pub fn closed_retained(&self, script: usize) -> u32 {
+        self.script_rt(script)
+            .map_or(0, |s| s.broker.view().closed_retained)
+    }
+
+    /// **R4c** (B'3 request): the trades script `script` still holds open
+    /// (`view().opentrades`); 0 before `on_start` or past the loaded scripts. Cold.
+    #[must_use]
+    pub fn open_count(&self, script: usize) -> u32 {
+        self.script_rt(script)
+            .map_or(0, |s| s.broker.view().opentrades)
+    }
+
+    /// **R4c** (B'3 request): open trade `i` of script `script` (0 = oldest open) — its entry
+    /// fields, and the open profit at the last mark (`TradeRec::pnl_1e12`, impl-05) — what B'3
+    /// feeds `TrialAccum::on_open_trade_at_end`. Borrowed, never copied. Cold.
+    #[must_use]
+    pub fn open_trade(&self, script: usize, i: u32) -> Option<&pine_ir::TradeRec> {
+        self.script_rt(script).and_then(|s| s.broker.open_trade(i))
+    }
+
     /// **R4**: script `script`'s run record (callable mid-run, impl-05 §3.4) — `TrialAccum`'s
     /// commission. Cold.
     #[must_use]

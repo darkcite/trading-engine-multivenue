@@ -89,6 +89,8 @@ pub mod pine_metrics;
 pub mod pine_tape;
 /// PVM impl-08 (R5/R6): slot 8's loop hook — the boot record and the delivery journal.
 pub mod pine_delivery;
+/// PVM impl-08 T21: `pine-verify`, the 8g-A determinism gate (`VerifyCtx`, eligibility, pooling).
+pub mod pine_verify;
 pub mod pinning;
 pub mod regime_boot;
 pub mod sigint;

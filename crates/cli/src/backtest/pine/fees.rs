@@ -125,14 +125,25 @@ pub(crate) struct ArmFees {
 pub(crate) struct FeeLedger {
     text: String,
     undeclared: u64,
+    /// The header block's length (a null arm's section is the rest).
+    hdr_len: usize,
 }
 
 impl FeeLedger {
     pub(crate) fn new(prov: &FeeProvenance) -> Self {
+        let text = prov.header();
         Self {
-            text: prov.header(),
+            hdr_len: text.len(),
+            text,
             undeclared: 0,
         }
+    }
+
+    /// T16 (pin:Bp-null-fee-section): append another arm's section — its
+    /// rows without its header block — after this ledger's rows.
+    pub(crate) fn append_section(&mut self, other: &FeeLedger) {
+        self.text.push_str(&other.text[other.hdr_len..]);
+        self.undeclared += other.undeclared;
     }
 
     /// Append `arm`'s charges (drained from its model by

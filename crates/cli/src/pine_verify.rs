@@ -1,0 +1,607 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
+//! PVM impl-08 T21 (§4.9.3, §4.9.5, §4.9.6): `pine-verify`, the 8g-A determinism gate — a fresh
+//! slot-8 member re-run from boot over the recorded sequencing tape (`seq.bin`), on a slot-8-only
+//! `PaperMatcher` driven on the RECORDED pop clock ([`VerifyCtx`]), its decision tape compared
+//! with the recorded `decisions.bin` record for record (I43); eligibility rules 1–6, pooling
+//! (Σ dispatched submits ≥ 200 and Σ fills ≥ 50), the `8g …` line and the exit codes.
+//!
+//! COPY-DOCTRINE: offline operator verb (never the engine loop): reads whole files, allocates and
+//! copies freely.
+//!
+//! Literal readings:
+//! - pin:08-verify-exclusions-absent: the three exclusions (I45) name fields no decision record
+//!   carries (`Order::ts_ns`, the client-oid base, a tape-file header stamp — the T18 files have
+//!   no header), so every field of every `PineTapeRec` is compared; the list is printed verbatim.
+//! - pin:08-verify-gap-ineligible: a seq gap in either tape (an overrun the member counted,
+//!   §4.9.2) makes THAT window unusable — listed with its reason, never counted, never red;
+//!   an unreadable file (a length not a multiple of the record) is exit 2 for the run.
+//! - pin:08-verify-pool-all-eligible: every eligible window is pooled (time order); 200 submits
+//!   and 50 fills are a floor, not a stopping point — a red window after the floor is still red.
+//! - pin:08-verify-diff-wins: any 8g-A difference is exit 1 even when the pool is short (a red is
+//!   a red); exit 2 only for a clean but short pool.
+//! - pin:08-verify-diffs-records: `diffs` counts unequal record positions (a record missing on one
+//!   side counts) over the window's compared prefix.
+//! - pin:08-verify-fills-decision: `fills` counts the window's `FILL` decision records;
+//!   `orders` its `DISPATCH` records with verb `Submit`.
+//! - pin:08-verify-window-end: the window ends before the first sequencing record whose
+//!   `wall_of(e_ns)` (BOOT_HDR's anchor) passes `boot_utc_ms + 7 200 000`; decision records
+//!   whose `seq_ref` is at or past that record are outside it.
+//! - pin:08-verify-boot-inputs: rule 3's BOOT digests are compared as the replay's own BOOT
+//!   records (`BOOT_SCRIPT`, `BOOT_STATE`, re-hashed by the replay's `configure`) against the
+//!   recorded ones: unequal → "inputs changed", ineligible; the caller's re-hash of `exec.toml`
+//!   and the bar files arrives as [`WindowIn::ineligible`].
+//! - pin:08-verify-queue-syms-untracked: the slot-8-only matcher tracks no queue symbol; a live
+//!   boot that tracked a slot-8 symbol for slot 6's queue law judged pine makers there by it —
+//!   rule 5's literal reading (orders) does not see it; recorded here, not tolerated.
+
+use clob_dispatcher::{DispatchError, PaperMatcher};
+use core_types::{CancelReq, ChannelEvent, Fill, ModifyReq, NsTs, Order, Tick, FILL_ORIGIN_PAPER};
+use strategy_core::{
+    pine_seq, pine_tape, Ctx, PineSeqRec, PineTapeRec, Strategy, StrategyCounters, SubmitErr,
+};
+use strategy_pine::{HostKind, PineBootCfg, PineStrategy, SlotRoute, WarmSlice};
+use strategy_set::{StampCtx, SLOT_PINE};
+
+/// I45: the fields 8g-A does not compare — exactly these three, printed with every result.
+pub const EXCLUDED: [&str; 3] = ["order_ts_ns", "client_oid_base", "header_stamp"];
+/// D23's pool floor: dispatched submits.
+pub const POOL_SUBMITS: u64 = 200;
+/// D23's pool floor: fills.
+pub const POOL_FILLS: u64 = 50;
+/// The ≤ 2 h law: a window is the first 2 h after its boot.
+pub const WINDOW_MS: i64 = 7_200_000;
+
+/// Exit: thresholds met, `diffs=0`.
+pub const EXIT_GREEN: u8 = 0;
+/// Exit: an 8g-A difference.
+pub const EXIT_RED: u8 = 1;
+/// Exit: unusable (short pool, every window ineligible, an unreadable tape).
+pub const EXIT_UNUSABLE: u8 = 2;
+
+// ---------------------------------------------------------------- VerifyCtx (I46)
+
+/// §4.9.3: `strategy_core::Ctx` over a slot-8-only `PaperMatcher`, calling it exactly as
+/// `PaperDispatcher` does (I46) — `submit(&order, order.ts_ns)` then `Ok`, the matcher's own
+/// `cancel` / `modify(&req, req.order().ts_ns)` results mapped as the engine maps them; `now_ns()`
+/// is the recorded pop clock.
+pub struct VerifyCtx {
+    /// The matcher (boxed: ≈ 93 KiB).
+    pub matcher: Box<PaperMatcher>,
+    /// The recorded pop stamp of the record being replayed.
+    pub pop: NsTs,
+}
+
+impl Default for VerifyCtx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VerifyCtx {
+    /// A fresh matcher, pop 0.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            matcher: Box::new(PaperMatcher::new()),
+            pop: 0,
+        }
+    }
+}
+
+/// The engine's `submit_err_of` (engine/src/lib.rs, private), exhaustive on purpose: a new
+/// `DispatchError` variant is a compile error here too.
+#[must_use]
+pub fn submit_err_of(e: DispatchError) -> SubmitErr {
+    match e {
+        DispatchError::QueueFull => SubmitErr::RingFull,
+        DispatchError::Unsupported => SubmitErr::Unsupported,
+        DispatchError::NoSuchOrder => SubmitErr::NoSuchOrder,
+        DispatchError::Disconnected
+        | DispatchError::SignerRejected
+        | DispatchError::EncodeOverflow
+        | DispatchError::JsonMalformed
+        | DispatchError::Http(_)
+        | DispatchError::SlotDisabled
+        | DispatchError::NoLiveRoute
+        | DispatchError::IdentityMismatch
+        | DispatchError::Unroutable
+        | DispatchError::AmbiguousOrder
+        | DispatchError::RiskRefused => SubmitErr::Refused,
+    }
+}
+
+impl Ctx for VerifyCtx {
+    fn submit(&mut self, order: Order) -> Result<(), SubmitErr> {
+        self.matcher.submit(&order, order.ts_ns);
+        Ok(())
+    }
+    fn cancel(&mut self, req: CancelReq) -> Result<(), SubmitErr> {
+        self.matcher.cancel(&req).map_err(submit_err_of)
+    }
+    fn modify(&mut self, prev_client_oid: u64, order: Order) -> Result<(), SubmitErr> {
+        let req = ModifyReq::new(prev_client_oid, order);
+        self.matcher
+            .modify(&req, req.order().ts_ns)
+            .map_err(submit_err_of)
+    }
+    fn now_ns(&self) -> NsTs {
+        self.pop
+    }
+}
+
+// ---------------------------------------------------------------- tape files
+
+fn le64(b: &[u8], at: usize) -> u64 {
+    let mut w = [0u8; 8];
+    w.copy_from_slice(&b[at..at + 8]);
+    u64::from_le_bytes(w)
+}
+
+fn le32(b: &[u8], at: usize) -> u32 {
+    let mut w = [0u8; 4];
+    w.copy_from_slice(&b[at..at + 4]);
+    u32::from_le_bytes(w)
+}
+
+/// `seq.bin` back to records (the inverse of `pine_tape::seq_bytes`).
+///
+/// # Errors
+/// A length that is not a whole number of 128 B records.
+pub fn seq_from_bytes(b: &[u8]) -> Result<Vec<PineSeqRec>, String> {
+    if b.len() % 128 != 0 {
+        return Err(format!(
+            "seq.bin: {} B is not a whole number of 128 B records",
+            b.len()
+        ));
+    }
+    Ok(b.chunks_exact(128)
+        .map(|r| {
+            let mut p = [0u64; 8];
+            for (k, w) in p.iter_mut().enumerate() {
+                *w = le64(r, 64 + k * 8);
+            }
+            PineSeqRec {
+                seq: le64(r, 0),
+                pop_ns: le64(r, 8),
+                e_ns: le64(r, 16),
+                kind: r[24],
+                payload: p,
+                ..PineSeqRec::default()
+            }
+        })
+        .collect())
+}
+
+/// `decisions.bin` back to records (the inverse of `pine_tape::dec_bytes`).
+///
+/// # Errors
+/// A length that is not a whole number of 64 B records.
+pub fn dec_from_bytes(b: &[u8]) -> Result<Vec<PineTapeRec>, String> {
+    if b.len() % 64 != 0 {
+        return Err(format!(
+            "decisions.bin: {} B is not a whole number of 64 B records",
+            b.len()
+        ));
+    }
+    Ok(b.chunks_exact(64)
+        .map(|r| PineTapeRec {
+            seq: le64(r, 0),
+            seq_ref: le64(r, 8),
+            x0: le64(r, 16) as i64,
+            x1: le64(r, 24) as i64,
+            x2: le64(r, 32),
+            aux: le64(r, 40),
+            bar_index: le32(r, 48),
+            oid: le32(r, 52),
+            kind: r[56],
+            script: r[57],
+            a: r[58],
+            b: r[59],
+            c: le32(r, 60),
+        })
+        .collect())
+}
+
+/// `set.tsv`, parsed: the matcher column names and one `(utc_ms, mask, counters)` per line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SetTsv {
+    /// The header's matcher column names.
+    pub names: Vec<String>,
+    /// One row per 5 s line.
+    pub rows: Vec<(i64, u16, Vec<u64>)>,
+}
+
+/// Parse `set.tsv` (pin:08-set-tsv-columns).
+///
+/// # Errors
+/// A missing header or a malformed line.
+pub fn parse_set_tsv(text: &str) -> Result<SetTsv, String> {
+    let mut lines = text.lines();
+    let hdr = lines.next().ok_or("set.tsv: empty")?;
+    let names = hdr
+        .strip_prefix("#utc_ms\tmask\t")
+        .ok_or("set.tsv: no header")?
+        .split(',')
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    for (n, l) in lines.enumerate() {
+        let bad = || format!("set.tsv line {}: {l:?}", n + 2);
+        let mut f = l.split('\t');
+        let utc = f.next().and_then(|s| s.parse().ok()).ok_or_else(bad)?;
+        let mask = f
+            .next()
+            .and_then(|s| s.strip_prefix("0x"))
+            .and_then(|s| u16::from_str_radix(s, 16).ok())
+            .ok_or_else(bad)?;
+        let vals = f
+            .next()
+            .ok_or_else(bad)?
+            .split(',')
+            .map(|v| v.parse::<u64>().map_err(|_| bad()))
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.push((utc, mask, vals));
+    }
+    Ok(SetTsv { names, rows })
+}
+
+/// A recorded input POD back from its 64 B image.
+fn pod<T: core_types::AsBytes>(w: &[u64; 8]) -> T {
+    const { assert!(core::mem::size_of::<T>() == 64) };
+    // SAFETY: `T: AsBytes` is `#[repr(C, align(64))]` with every byte a named plain-integer
+    // field (core-types' contract) except a `Side` — validated by the caller before this read
+    // (`fill_of`); 64 B asserted above; `read_unaligned` takes no alignment from `w`.
+    unsafe { core::ptr::read_unaligned(w.as_ptr().cast::<T>()) }
+}
+
+/// A POD's 64 B image as words (the member's `tape::words`).
+fn words<T: core_types::AsBytes>(v: &T) -> [u64; 8] {
+    const { assert!(core::mem::size_of::<T>() == 64) };
+    // SAFETY: `T: AsBytes` — 64 B (asserted), every byte initialised (core-types' contract);
+    // `[u64; 8]` has no invalid values; `read_unaligned` needs no alignment.
+    unsafe { core::ptr::read_unaligned(core::ptr::from_ref(v).cast::<[u64; 8]>()) }
+}
+
+fn tick_of(w: &[u64; 8]) -> Tick {
+    pod(w)
+}
+
+fn event_of(w: &[u64; 8]) -> ChannelEvent {
+    pod(w)
+}
+
+/// A recorded fill, its `Side` byte checked first (an invalid discriminant is unreadable).
+fn fill_of(w: &[u64; 8]) -> Option<Fill> {
+    let at = core::mem::offset_of!(Fill, side);
+    let byte = w[at / 8].to_le_bytes()[at % 8];
+    (byte <= 1).then(|| pod(w))
+}
+
+/// A recorded tick's `Side`-free check is a no-op; ticks carry no enum.
+const _: () = assert!(core::mem::size_of::<Tick>() == 64 && core::mem::size_of::<Fill>() == 64);
+
+// ---------------------------------------------------------------- one window
+
+/// Why a window is not counted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Elig {
+    /// Counted.
+    Eligible,
+    /// §4.9.5: listed with its reason, never counted, never red.
+    Ineligible(String),
+}
+
+/// One tape directory (one boot = one window), loaded.
+pub struct WindowIn {
+    /// The tape directory's name (`<boot_utc_ms>`).
+    pub label: String,
+    /// The rebuilt boot configuration (manifest, scripts, facts, exec, slot caps) — BOOT_HDR's
+    /// anchor, epoch and boot instant are applied by [`verify_window`].
+    pub cfg: PineBootCfg,
+    /// The warm slices the boot read.
+    pub warm: Vec<WarmSlice>,
+    /// `seq.bin`.
+    pub seq: Vec<PineSeqRec>,
+    /// `decisions.bin`.
+    pub dec: Vec<PineTapeRec>,
+    /// `set.tsv`.
+    pub set: SetTsv,
+    /// A rule-3 (exec.toml, bar files) or rule-5 (`engine-orders.pmlr`) reason the caller found.
+    pub ineligible: Option<String>,
+}
+
+/// One window's result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowOut {
+    /// The tape directory's name.
+    pub label: String,
+    /// Counted or not.
+    pub elig: Elig,
+    /// Dispatched submits in the compared prefix.
+    pub orders: u64,
+    /// `FILL` decision records in the compared prefix.
+    pub fills: u64,
+    /// Unequal record positions (pin:08-verify-diffs-records).
+    pub diffs: u64,
+    /// The first difference: index and both sides.
+    pub first_diff: Option<String>,
+}
+
+fn out(label: &str, elig: Elig) -> WindowOut {
+    WindowOut {
+        label: label.to_string(),
+        elig,
+        orders: 0,
+        fills: 0,
+        diffs: 0,
+        first_diff: None,
+    }
+}
+
+fn gapless<T>(v: &[T], first: u64, seq: impl Fn(&T) -> u64) -> bool {
+    v.iter().zip(first..).all(|(r, want)| seq(r) == want)
+}
+
+/// Rules 4 and 6 over `set.tsv`: bit 8 in every line; `rejected_open_cap` never moved.
+fn set_rules(set: &SetTsv) -> Option<String> {
+    let bit = 1u16 << SLOT_PINE;
+    if let Some((utc, mask, _)) = set.rows.iter().find(|(_, m, _)| m & bit == 0) {
+        return Some(format!("slot 8 disabled at {utc} (mask {mask:#06x})"));
+    }
+    let Some(k) = set.names.iter().position(|n| n == "rejected_open_cap") else {
+        return Some("set.tsv names no rejected_open_cap column".to_string());
+    };
+    let first = set.rows.first().and_then(|r| r.2.get(k)).copied();
+    if set.rows.iter().any(|r| r.2.get(k).copied() != first) {
+        return Some("the paper matcher dropped orders (rejected_open_cap moved)".to_string());
+    }
+    None
+}
+
+fn drain_dec(member: &PineStrategy, buf: &mut [PineTapeRec], into: &mut Vec<PineTapeRec>) {
+    loop {
+        let from = into.last().map_or(0, |r| r.seq + 1);
+        let n = member.pine_tape_view(buf, from) as usize;
+        if n == 0 {
+            return;
+        }
+        into.extend_from_slice(&buf[..n]);
+    }
+}
+
+fn drain_seq(member: &PineStrategy, buf: &mut [PineSeqRec], next: &mut u64) {
+    loop {
+        let n = member.pine_seq_view(buf, *next) as usize;
+        if n == 0 {
+            return;
+        }
+        *next = buf[n - 1].seq + 1;
+    }
+}
+
+/// 8g-A over one window (§4.9.3 steps 2–6) with eligibility rules 1–6.
+#[must_use]
+pub fn verify_window(w: WindowIn) -> WindowOut {
+    let WindowIn {
+        label,
+        mut cfg,
+        warm,
+        seq,
+        dec,
+        set,
+        ineligible,
+    } = w;
+    let inel = |r: String| out(&label, Elig::Ineligible(r));
+    // Rule 2 (pin:08-verify-gap-ineligible).
+    if !gapless(&seq, 1, |r| r.seq) || !gapless(&dec, 0, |r| r.seq) {
+        return inel("unusable: a seq gap in the tapes (ring overrun)".to_string());
+    }
+    let Some(hdr) = dec
+        .first()
+        .filter(|r| r.kind == pine_tape::BOOT_HDR)
+        .copied()
+    else {
+        return inel("unusable: decisions.bin does not start with BOOT_HDR".to_string());
+    };
+    // Rule 1.
+    if hdr.a != SlotRoute::Paper as u8 || hdr.b != HostKind::Engine as u8 {
+        return inel(format!("route {} host {}: not paper/engine", hdr.a, hdr.b));
+    }
+    if let Some(r) = ineligible.or_else(|| set_rules(&set)) {
+        return inel(r);
+    }
+    // Step 2: the boot from the records.
+    let anchor = core_time::WallAnchor::new(
+        u64::try_from(hdr.x0).unwrap_or(0),
+        u64::try_from(hdr.x1).unwrap_or(0),
+    );
+    cfg.anchor = anchor;
+    cfg.oid_epoch = u32::try_from(hdr.x2).unwrap_or(0);
+    cfg.boot_utc_ms = hdr.aux as i64;
+    cfg.route = SlotRoute::Paper;
+    cfg.host = HostKind::Engine;
+    cfg.tape = true;
+    let boot_ms = cfg.boot_utc_ms;
+    // Step 3.
+    let mut member = PineStrategy::new();
+    if let Err(e) = member.configure(cfg) {
+        return inel(format!(
+            "inputs changed: configure refused ({}): {}",
+            e.code.0, e.detail
+        ));
+    }
+    if let Err(e) = member.supply_warm(warm) {
+        return inel(format!(
+            "inputs changed: warm-up refused ({}): {}",
+            e.code.0, e.detail
+        ));
+    }
+    let mut ctx = VerifyCtx::new();
+    if member
+        .on_start(&mut StampCtx::new(&mut ctx, SLOT_PINE))
+        .is_err()
+    {
+        return inel("inputs changed: on_start refused".to_string());
+    }
+    let mut dbuf = vec![PineTapeRec::default(); 256];
+    let mut sbuf = vec![PineSeqRec::default(); 256];
+    let mut got: Vec<PineTapeRec> = Vec::with_capacity(dec.len());
+    let mut snext = 1u64;
+    drain_dec(&member, &mut dbuf, &mut got);
+    // Rule 3 (pin:08-verify-boot-inputs).
+    let boot_n = dec.iter().take_while(|r| r.seq_ref == 0).count();
+    let boot_ok =
+        |r: &PineTapeRec| r.kind == pine_tape::BOOT_SCRIPT || r.kind == pine_tape::BOOT_STATE;
+    let rec_boot: Vec<_> = dec[..boot_n].iter().filter(|r| boot_ok(r)).collect();
+    let rep_boot: Vec<_> = got
+        .iter()
+        .filter(|r| r.seq_ref == 0 && boot_ok(r))
+        .collect();
+    if rec_boot != rep_boot {
+        return inel("inputs changed: a BOOT digest differs".to_string());
+    }
+    // Steps 4 and 6.
+    let end_ms = boot_ms.saturating_add(WINDOW_MS);
+    let mut first_diff: Option<String> = None;
+    let mut diffs = 0u64;
+    let mut end_seq = u64::MAX;
+    for r in &seq {
+        let wall_ms = anchor.wall_of(r.e_ns) / 1_000_000;
+        if i64::try_from(wall_ms).unwrap_or(i64::MAX) > end_ms {
+            end_seq = r.seq;
+            break;
+        }
+        ctx.pop = r.pop_ns;
+        match r.kind {
+            pine_seq::TICK => {
+                let t = tick_of(&r.payload);
+                ctx.matcher.observe_tick(&t, r.pop_ns);
+                member.on_tick(&t, &mut StampCtx::new(&mut ctx, SLOT_PINE));
+            }
+            pine_seq::EVENT => {
+                let e = event_of(&r.payload);
+                member.on_venue_event(&e, &mut StampCtx::new(&mut ctx, SLOT_PINE));
+            }
+            pine_seq::FILL => {
+                let Some(rec) = fill_of(&r.payload) else {
+                    return inel(format!("unusable: seq {} carries an invalid fill", r.seq));
+                };
+                let f = if rec.origin == FILL_ORIGIN_PAPER {
+                    match ctx.matcher.try_next_fill() {
+                        Some(m) if words(&m) == r.payload => m,
+                        m => {
+                            diffs += 1;
+                            first_diff.get_or_insert_with(|| {
+                                format!("seq {}: FILL recorded {rec:?} replayed {m:?}", r.seq)
+                            });
+                            rec
+                        }
+                    }
+                } else {
+                    rec
+                };
+                member.on_fill(&f, &mut StampCtx::new(&mut ctx, SLOT_PINE));
+            }
+            k => return inel(format!("unusable: seq {} has kind {k}", r.seq)),
+        }
+        drain_dec(&member, &mut dbuf, &mut got);
+        drain_seq(&member, &mut sbuf, &mut snext);
+    }
+    // Step 5.
+    let want: Vec<&PineTapeRec> = dec.iter().filter(|r| r.seq_ref < end_seq).collect();
+    let have: Vec<&PineTapeRec> = got.iter().filter(|r| r.seq_ref < end_seq).collect();
+    let n = want.len().max(have.len());
+    for i in 0..n {
+        let (a, b) = (want.get(i), have.get(i));
+        if a != b {
+            diffs += 1;
+            first_diff
+                .get_or_insert_with(|| format!("decision {i}: recorded {a:?} replayed {b:?}"));
+        }
+    }
+    let orders = want
+        .iter()
+        .filter(|r| r.kind == pine_tape::DISPATCH && r.a == pine_ir::EngineVerb::Submit as u8)
+        .count() as u64;
+    let fills = want.iter().filter(|r| r.kind == pine_tape::FILL).count() as u64;
+    WindowOut {
+        label,
+        elig: Elig::Eligible,
+        orders,
+        fills,
+        diffs,
+        first_diff,
+    }
+}
+
+// ---------------------------------------------------------------- pooling and the line
+
+/// The pooled verdict (§4.9.5, §4.9.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    /// The `8g …` line (one line; the spec's wrapping is layout).
+    pub line: String,
+    /// 0 / 1 / 2.
+    pub exit: u8,
+}
+
+/// Pool the windows in time order (pin:08-verify-pool-all-eligible) and render the line.
+/// 8g-B is T22: its five counts are 0 here.
+#[must_use]
+pub fn pool(windows: &[WindowOut]) -> Verdict {
+    let mut ws: Vec<&WindowOut> = windows.iter().collect();
+    ws.sort_by_key(|w| w.label.parse::<i64>().unwrap_or(i64::MAX));
+    let el: Vec<&&WindowOut> = ws.iter().filter(|w| w.elig == Elig::Eligible).collect();
+    let orders: u64 = el.iter().map(|w| w.orders).sum();
+    let fills: u64 = el.iter().map(|w| w.fills).sum();
+    let diffs: u64 = el.iter().map(|w| w.diffs).sum();
+    let line = format!(
+        "8g windows={} eligible={} orders={orders} fills={fills} diffs={diffs} straddles=0 \
+         expiry_straddles=0 interleaves=0 stale_rejudged=0 fill_stamps=0 unattributed=0 \
+         excluded={}",
+        ws.len(),
+        el.len(),
+        EXCLUDED.join(",")
+    );
+    let exit = if diffs > 0 {
+        EXIT_RED
+    } else if el.is_empty() || orders < POOL_SUBMITS || fills < POOL_FILLS {
+        EXIT_UNUSABLE
+    } else {
+        EXIT_GREEN
+    };
+    Verdict { line, exit }
+}
+
+/// The per-window lines printed before the `8g` line: every ineligible window with its reason,
+/// every red one with its first difference.
+#[must_use]
+pub fn window_lines(windows: &[WindowOut]) -> Vec<String> {
+    windows
+        .iter()
+        .filter_map(|w| match (&w.elig, &w.first_diff) {
+            (Elig::Ineligible(r), _) => Some(format!("window {} ineligible: {r}", w.label)),
+            (Elig::Eligible, Some(d)) => Some(format!("window {} diffs={}: {d}", w.label, w.diffs)),
+            (Elig::Eligible, None) => None,
+        })
+        .collect()
+}
+
+/// `pine-verify --check <manifest> [--exec <exec.toml>]` (§4.9.6): 8a offline over a configured
+/// `cfg` — `0` loads, `1` the refusal (its code and detail returned for printing).
+#[must_use]
+pub fn check(cfg: PineBootCfg) -> (u8, String) {
+    let mut m = PineStrategy::new();
+    match m.configure(cfg) {
+        Ok(needs) => (
+            0,
+            format!("pine-verify --check: loads ({} warm rows)", needs.len()),
+        ),
+        Err(e) => (
+            1,
+            format!("pine-verify --check: refused {} {}", e.code.0, e.detail),
+        ),
+    }
+}

@@ -120,6 +120,9 @@ exec-hyperevm        = { workspace = true, features = ["testnode"] }
 exec-hyperliquid     = { workspace = true, features = ["loopback", "testvenue"] }
 # BX3: the scripted venue's self-signed certificate.
 rcgen                = { workspace = true }
+# PVM B'3 T16 (impl-Bp §4.8): `null_gates_agree_with_the_native_broker_on_a_gate_table`
+# drives one gate table through `NativeBroker` (public API only). Test-only.
+pine-broker          = { workspace = true }
 # XMM XH4f: the sweep word the composition test's scripted gateway end sets.
 exec-gateway         = { workspace = true }
 # core-crypto moved to [dependencies] with the 8h backtest harness —

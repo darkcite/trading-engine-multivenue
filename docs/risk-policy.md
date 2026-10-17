@@ -17024,10 +17024,14 @@ the pre-B'1 one (xmm's prints ride their own `TradePrint` lane).
   symbols. A route symbol on a lane without Trade capture refuses (`6006`).
 - The commit that wires the route into the boot carries its own risk review.
 
-**Observability.** Slot 8's 5 s pine drain (the metrics mirror, `incidents.log`, the tape) runs
-only when metrics are enabled. It ticks inside the `/metrics` mirror block. A pine boot without
-`--metrics` still opens `incidents.log` and the tape, but it drains nothing into them and
-mirrors nothing.
+**Observability.** *Amended 2026-10-17 (lead ruling, pin:08-drain-outside-metrics):* slot 8's
+durable outputs — the T18 tapes (`seq.bin`, `decisions.bin`, `set.tsv`) and `incidents.log` —
+drain on every 5 s block beside the loop hook's drain, OUTSIDE the metrics gate, and once more
+after the loop's last iteration (before `eng.stop()`), with or without `--metrics`: they are
+capture durability, not an observability option. Only the `engine_pine_*` mirror stays inside the
+`/metrics` block; a pine boot without `--metrics` mirrors nothing. Tests: `cli` `pine_metrics`
+`metrics_off_boot_still_drains_incidents_and_tapes`,
+`engine_loop_drains_pine_outside_the_metrics_gate`.
 
 **Bench.** `bench/benches/hot_path.rs` builds `StrategySet::new(BUILT_MASK)`, so
 `strategy_set/on_tick_all` now includes the inert pine member (one branch and one counter); a
