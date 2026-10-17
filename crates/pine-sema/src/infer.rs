@@ -151,6 +151,12 @@ impl Ex {
     fn is_na(&self) -> bool {
         self.t.ty == Ty::Void && self.k == Some(K::Na)
     }
+    /// `pin:02-once-is-void`: a `void` that is not an (untyped, maybe-) `na` — a call with no
+    /// result, a structure ending in one (`once`), or a tuple. `conv` reads every `void` as the
+    /// untyped `na`, so a site that needs a value refuses this first (`3007`).
+    fn no_value(&self) -> bool {
+        self.t.ty == Ty::Void && self.k != Some(K::Na) && !self.may_na
+    }
 }
 
 /// The per-TypeInst working state.
@@ -590,7 +596,7 @@ impl<'a, 's> Infer<'a, 's> {
         let vname = self.syms.resolve(ast.sym(name)).to_owned();
         let base = match written {
             Some(w) => {
-                if conv(e.t, w, self.d, self.rd).is_none() {
+                if e.no_value() || conv(e.t, w, self.d, self.rd).is_none() {
                     let msg = if e.is_na() {
                         format!("`{vname}`: a v6 `bool` is never `na`")
                     } else {
@@ -728,7 +734,7 @@ impl<'a, 's> Infer<'a, 's> {
             qual: Qual::Series,
             ..tt
         };
-        if conv(v.t, want, self.d, self.rd).is_none() {
+        if v.no_value() || conv(v.t, want, self.d, self.rd).is_none() {
             let msg = format!("cannot assign {} to {}", ty_name(v.t), ty_name(tt));
             return self.refuse(ReasonCode::TypeMismatch, at, msg);
         }
@@ -830,7 +836,14 @@ impl<'a, 's> Infer<'a, 's> {
                 let mut ts = Vec::with_capacity(items.len());
                 let mut bad = false;
                 for &i in items {
-                    let e = self.expr(i);
+                    let mut e = self.expr(i);
+                    if !e.bad && e.no_value() {
+                        // pin:02-once-is-void — a `void` call (a function ending in `once`)
+                        // returned as a tuple element carries no value: `3007`.
+                        let at = self.ast().span(i);
+                        let msg = "a tuple element has no value (a `void` call)".to_owned();
+                        e = self.refuse(ReasonCode::TypeMismatch, at, msg);
+                    }
                     bad |= e.bad;
                     ts.push(e.t);
                 }
@@ -940,9 +953,14 @@ impl<'a, 's> Infer<'a, 's> {
                     self.condition(c);
                 }
                 self.cond += 1;
-                let v = self.block(body);
+                self.block(body);
                 self.cond -= 1;
-                Ex::of(v.t, None)
+                // pin:02-once-is-void — the v6 reference: `once` "does not return usable values",
+                // and a script "cannot assign … a call to a function that ends with a `once`
+                // statement". Literal reading: the structure is `void`, so a function ending in
+                // one is `void` (legal as a statement), and assigning or returning its call in a
+                // tuple is `3007` (`var_decl` / `store` / `Node::Tuple`).
+                Ex::of(void(), None)
             }
             Node::Block { .. } => self.block(n),
             Node::NamedArg { value, .. } => self.expr(value),

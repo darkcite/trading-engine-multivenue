@@ -294,3 +294,34 @@ fn infer_sma_cross_strategy_types() {
         assert_eq!(codes(&r), vec![ACCEPTED], "v{}: {r:?}", d as u8);
     }
 }
+
+/// `pin:02-once-is-void` (delta report 2026-10-17 §2.3): a user function whose body ends in `once`
+/// is `void`; called as a statement it compiles end to end (was `3255` at lowering).
+const ONCE_TAIL: &str = "f() =>\n    x = 0\n    once close > open\n        x := 1\n";
+
+#[test]
+fn infer_once_is_void_function_ending_in_once_compiles() {
+    for body in [
+        format!("{ONCE_TAIL}f()\nplot(close)\n"),
+        format!("{ONCE_TAIL}g() => f()\ng()\nplot(close)\n"),
+        "x = 0\nonce\n    x := 1\nplot(x)\n".to_owned(),
+    ] {
+        let r = compile_src(&script(V6, &body), &default_opts(V6, ExecMode::BarClose));
+        assert_eq!(codes(&r), vec![ACCEPTED], "{body}: {r:?}");
+    }
+}
+
+/// `pin:02-once-is-void`: assigning the call (plain, typed, `:=`, through a forwarding function)
+/// or returning it as a tuple element is `3007`.
+#[test]
+fn infer_once_is_void_assigning_its_call_is_3007() {
+    for tail in [
+        "y = f()\nplot(close)\n",
+        "float y = f()\nplot(close)\n",
+        "y = 0\ny := f()\nplot(y)\n",
+        "g() => f()\nz = g()\nplot(close)\n",
+        "h() => [close, f()]\n[a, b] = h()\nplot(a)\n",
+    ] {
+        refused(V6, &format!("{ONCE_TAIL}{tail}"), 3007);
+    }
+}

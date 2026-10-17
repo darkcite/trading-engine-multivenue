@@ -3,6 +3,7 @@
 // PIN: pin:01-bracket-wrap
 // OURS: accept
 // TV: pending
+// DOCS: accept (release notes Sep 2026, any indent in [ ]); answered, Z002 confirms
 //@version=6
 indicator("p02")
 f() => [1,

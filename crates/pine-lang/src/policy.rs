@@ -40,7 +40,9 @@ pub(crate) enum MultilineEdges {
 pub(crate) struct SyntaxPolicy {
     /// pin:01-mixed-indent — `Refuse`.
     pub(crate) mixed_indent: MixedIndent,
-    /// pin:01-bracket-wrap — `true`: lines wrapped inside `[ ]` follow the `( )` rule.
+    /// pin:01-bracket-wrap — `true`: lines wrapped inside `[ ]` follow the `( )` rule. ANSWERED by
+    /// the docs (release notes, September 2026: any indentation inside `[ … ]`, v6); probe p02 and
+    /// fixtures Z002/Z003 stay as the confirming capture (delta report 2026-10-17 L2).
     pub(crate) bracket_wrap_like_paren: bool,
     /// pin:01-v5-paren-wrap — `true`: v5 refuses a multiple-of-four wrapped line in `( )` (2104).
     pub(crate) v5_paren_wrap_strict: bool,

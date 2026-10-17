@@ -119,6 +119,9 @@ pub(crate) enum ForStep {
 /// `pin:02-once-flag` — is a `once` block's flag rolled back with a tick? Acts in §4.14.4. The
 /// conditional-structures page says "evaluated only once" and is silent on realtime ticks.
 /// Probe: `once` · `    label.new(bar_index, high)` on a realtime bar with several ticks.
+/// ANSWERED by the docs: `VarLike` — the v6 reference's `once` remark: on an open bar "the local
+/// block executes on the bar's current tick, then Pine's rollback process resets the structure's
+/// state" (delta report 2026-10-17 §2.2, L2). Fixture C046 stays as the confirming capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OnceFlag {
     /// Default: a `var` flag — a tick that ran the body and is rolled back runs it again.
