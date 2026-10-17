@@ -1,0 +1,22 @@
+fix	2
+id	E022
+group	E
+title	entry stop, calc_on_order_fills
+pin	pin:05-cof-close-tick
+pin	pin:05-cof-next-tick
+script	tests/conformance/fixtures/E/E022.pine
+script_sha256	6d5e6600efc6183741effa8e1bf115ce202307655f3c951f975260c2644e977d
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	realtime
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E022_pos	exact
+pending

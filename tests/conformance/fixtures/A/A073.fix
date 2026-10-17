@@ -1,0 +1,23 @@
+fix	2
+id	A073
+group	A
+title	var across a conditional assignment · bool
+pin	pin:W13-bool-na
+script	tests/conformance/fixtures/A/A073.pine
+script_sha256	b2eeb585cd7130f251e21cc2b439a0bb23596c771526e2bd153b3d8e4eea8681
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	5
+twin	A089
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_A073_isna	exact
+plot	f_A073_val	exact
+pending

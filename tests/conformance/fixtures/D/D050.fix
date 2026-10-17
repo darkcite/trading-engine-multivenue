@@ -1,0 +1,20 @@
+fix	2
+id	D050
+group	D
+title	the chart's own symbol and timeframe equal close
+script	tests/conformance/fixtures/D/D050.pine
+script_sha256	5b09091183e08d514edfff09fea829b56c6527bd93a7b163485f04c1304a10c7
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	chart
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	tail	256
+oracle	tv
+tier	2
+plot	f_D050_val	exact
+pending

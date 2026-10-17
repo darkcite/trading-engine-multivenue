@@ -1,0 +1,24 @@
+fix	2
+id	A069
+group	A
+title	na == na · bool
+pin	pin:06-na-compare
+pin	pin:W13-bool-na
+script	tests/conformance/fixtures/A/A069.pine
+script_sha256	341f25ff784b726cadfb54f66988d69ee0e06b912749d5dbd6cdbd5658a07467
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	5
+twin	A085
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_A069_isna	exact
+plot	f_A069_val	exact
+pending

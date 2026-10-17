@@ -73,6 +73,7 @@ members = [
     "crates/pine-ir",
     "crates/pine-lang",
     "crates/pine-screen",
+    "crates/pine-conformance",
     "crates/pine-sema",
     "crates/pine-spec",
     "crates/pine-std",
@@ -249,6 +250,7 @@ pine-broker = { path = "crates/pine-broker" }
 pine-ir = { path = "crates/pine-ir" }
 pine-lang = { path = "crates/pine-lang" }
 pine-screen = { path = "crates/pine-screen" }
+pine-conformance = { path = "crates/pine-conformance" }
 pine-sema = { path = "crates/pine-sema" }
 pine-spec = { path = "crates/pine-spec" }
 pine-std = { path = "crates/pine-std" }

@@ -1,0 +1,20 @@
+fix	2
+id	E032
+group	E
+title	close, calc_on_every_tick
+script	tests/conformance/fixtures/E/E032.pine
+script_sha256	4cba10f59aab4ca5316a8247bd56f902c142585640ef762103b8b4a4392ac75e
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	realtime
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E032_pos	exact
+pending

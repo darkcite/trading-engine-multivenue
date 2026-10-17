@@ -1,0 +1,21 @@
+fix	2
+id	Z009
+group	Z
+title	probe p09_local_type · pin:01-local-type-decl
+pin	pin:01-local-type-decl
+script	crates/pine-lang/tests/probes/p09_local_type.pine
+script_sha256	eee9e4eec9426923087f7950b3cfe76341e540445cf2b1b117545cf2e4a72c13
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	6
+mode	bar_close
+bars	pending
+window	head	1
+oracle	tv
+tier	1
+plot	f_Z009_ok	exact
+pending

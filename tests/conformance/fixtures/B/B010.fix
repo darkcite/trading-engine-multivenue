@@ -1,0 +1,23 @@
+fix	2
+id	B010
+group	B
+title	ta.ema over synna
+pin	pin:04-ta-reference
+pin	pin:U18-ta-na-propagation
+script	tests/conformance/fixtures/B/B010.pine
+script_sha256	69aa48253a5dec7adf01cbf27f0ce9b2fd7feb92173efa65d12cd0ea0b9891e0
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	tail	128
+oracle	tv
+tier	1
+plot	f_B010_isna	exact
+plot	f_B010_val	ulp	9
+pending

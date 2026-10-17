@@ -1,0 +1,22 @@
+fix	2
+id	F040
+group	F
+title	v5 negative array index faults
+pin	pin:W15-neg-index
+script	tests/conformance/fixtures/F/F040.pine
+script_sha256	0000000000000000000000000000000000000000000000000000000000f04001
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	syn
+align	step
+dialects	5
+twin	F041
+mode	bar_close
+bars	1
+window	head	1
+oracle	declined
+tier	4
+plot	f_F040_val	exact
+fault	CollectionBounds	0

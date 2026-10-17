@@ -1,0 +1,30 @@
+fix	2
+id	F074
+group	F
+title	PROJ of color.red, color.teal, color.yellow
+pin	pin:00-color-consts
+script	tests/conformance/fixtures/F/F074.pine
+script_sha256	fabf92229a6b48f74ec0a149b29bad8c6aff1a553cb0e538013e5bbbfd9c901a
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	6
+twin	F073
+mode	bar_close
+bars	pending
+window	head	1
+oracle	tv
+tier	1
+plot	f_F074_val1	exact
+plot	f_F074_val2	exact
+plot	f_F074_val3	exact
+pending
+reading	v5_values
+0	16732754.0	35195.0	16771899.0
+end
+reading	v6_values
+0	15873605.0	563585.0	16635957.0
+end

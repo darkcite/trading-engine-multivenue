@@ -1,0 +1,21 @@
+fix	2
+id	F038
+group	F
+title	math.todegrees(math.toradians(syn))
+script	tests/conformance/fixtures/F/F038.pine
+script_sha256	d96be28e005c3cf954060713b3b48dcde3391572df60209012125a3bca2b0e9a
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_F038_isna	exact
+plot	f_F038_val	ulp	2
+pending

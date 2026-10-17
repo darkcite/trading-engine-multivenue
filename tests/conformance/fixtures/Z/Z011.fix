@@ -1,0 +1,21 @@
+fix	2
+id	Z011
+group	Z
+title	probe p11_array_suffix · pin:01-array-suffix-type
+pin	pin:01-array-suffix-type
+script	crates/pine-lang/tests/probes/p11_array_suffix.pine
+script_sha256	8bc4c78b8aa2747e50d63ec3eb398d4c5faa64daa87c6bbe305c14c13ca0a1f8
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	6
+mode	bar_close
+bars	pending
+window	head	1
+oracle	tv
+tier	1
+plot	f_Z011_ok	exact
+pending

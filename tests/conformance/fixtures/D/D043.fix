@@ -1,0 +1,23 @@
+fix	2
+id	D043
+group	D
+title	D value and time, gaps off
+script	tests/conformance/fixtures/D/D043.pine
+script_sha256	c2b92c2d59de1425e662f1093d406a43b66018fec2b328ece37cc9eff1c6d229
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	chart
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	tail	256
+oracle	tv
+tier	2
+plot	f_D043_isna1	exact
+plot	f_D043_val1	exact
+plot	f_D043_isna2	exact
+plot	f_D043_val2	exact
+pending

@@ -1,0 +1,24 @@
+fix	2
+id	D058
+group	D
+title	the exchange time zone and the trading day
+pin	pin:04-exchange-tz
+script	tests/conformance/fixtures/D/D058.pine
+script_sha256	8db4c3de7d0049e6f25a2ba6384c4a4fe159f72adacbfaa37b7923882609ac59
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	chart
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	tail	256
+oracle	tv
+tier	1
+plot	f_D058_val1	exact
+plot	f_D058_val2	exact
+plot	f_D058_val3	exact
+plot	f_D058_val4	exact
+pending

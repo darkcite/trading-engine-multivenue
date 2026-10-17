@@ -1,0 +1,21 @@
+fix	2
+id	C033
+group	C
+title	a method mutates its receiver
+script	tests/conformance/fixtures/C/C033.pine
+script_sha256	35029e2baa1de7b37830f8e51a367b8ac0df2c5188bc30299268ca2044c89c51
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_C033_isna	exact
+plot	f_C033_val	exact
+pending

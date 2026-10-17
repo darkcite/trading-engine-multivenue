@@ -1,0 +1,20 @@
+fix	2
+id	B085
+group	B
+title	ta.crossunder warm-up
+script	tests/conformance/fixtures/B/B085.pine
+script_sha256	44afb9ecfa37551a100a4fa1556df7a25b152879734d1518d96ebba4decf4c71
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	128
+oracle	tv
+tier	1
+plot	f_B085_val	exact
+pending

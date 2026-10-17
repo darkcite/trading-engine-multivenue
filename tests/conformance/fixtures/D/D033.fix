@@ -1,0 +1,20 @@
+fix	2
+id	D033
+group	D
+title	"240" against input.timeframe("240")
+script	tests/conformance/fixtures/D/D033.pine
+script_sha256	dd5fcd8d43aafa12b33f2b0c49648cd77e93fdb962396f10e1fd5acb4ea2ac79
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	chart
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	tail	256
+oracle	tv
+tier	2
+plot	f_D033_val	exact
+pending

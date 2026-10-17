@@ -1,0 +1,20 @@
+fix	2
+id	E018
+group	E
+title	entry limit, process_orders_on_close
+script	tests/conformance/fixtures/E/E018.pine
+script_sha256	3fb0f1d1c9654ad7bd4822800e7f71d0d77befeecc4f765b63851980964f2657
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E018_pos	exact
+pending

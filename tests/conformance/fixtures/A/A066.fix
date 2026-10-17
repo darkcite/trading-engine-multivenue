@@ -1,0 +1,23 @@
+fix	2
+id	A066
+group	A
+title	na → value at a known step · bool
+pin	pin:W13-bool-na
+script	tests/conformance/fixtures/A/A066.pine
+script_sha256	343be911122bc9a681ac202ea1cc26c6a1d873497ec698a77d7dd190e3d9a06f
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	5
+twin	A082
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_A066_isna	exact
+plot	f_A066_val	exact
+pending

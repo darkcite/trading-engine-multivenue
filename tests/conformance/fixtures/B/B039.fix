@@ -1,0 +1,22 @@
+fix	2
+id	B039
+group	B
+title	ta.change with len 200
+pin	pin:04-ta-reference
+script	tests/conformance/fixtures/B/B039.pine
+script_sha256	60405aeecce60cf58035d7899f1dfc06d6ece2f68e171e1efa0338b060c4f9a4
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	128
+oracle	tv
+tier	1
+plot	f_B039_isna	exact
+plot	f_B039_val	exact
+pending

@@ -1,0 +1,21 @@
+fix	2
+id	Z002
+group	Z
+title	probe p02_bracket_wrap_v6 · pin:01-bracket-wrap
+pin	pin:01-bracket-wrap
+script	crates/pine-lang/tests/probes/p02_bracket_wrap_v6.pine
+script_sha256	159760d5ce60d0dde5895131db159153bb2668219871539089e14a4025daac61
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	6
+mode	bar_close
+bars	pending
+window	head	1
+oracle	tv
+tier	1
+plot	f_Z002_ok	exact
+pending

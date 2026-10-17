@@ -1,0 +1,20 @@
+fix	2
+id	E060
+group	E
+title	oca cancel, entry + exit
+script	tests/conformance/fixtures/E/E060.pine
+script_sha256	cd76e75d885d3cf0d6822d0964053e8d3aca2ea74b9693c0056301a8926488b7
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E060_pos	exact
+pending

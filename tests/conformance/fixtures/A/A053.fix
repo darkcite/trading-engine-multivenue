@@ -1,0 +1,23 @@
+fix	2
+id	A053
+group	A
+title	na == na · string
+pin	pin:06-na-compare
+pin	pin:04-string-edges
+script	tests/conformance/fixtures/A/A053.pine
+script_sha256	44e91d015b471dda6d5b174f69f001d99880cdf10a337c24a7aff9e5130a9d8b
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_A053_isna	exact
+plot	f_A053_val	exact
+pending

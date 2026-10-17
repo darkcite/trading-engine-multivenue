@@ -1,0 +1,22 @@
+fix	2
+id	F096
+group	F
+title	ta.ema(syn, 5) under every inert indicator argument
+pin	pin:10-shell-decl-args
+script	tests/conformance/fixtures/F/F096.pine
+script_sha256	7c21bfa075967d8c742a1e1a5b97d393ac3965a1c425ca5cd63b90d3e0a46d2c
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_F096_isna	exact
+plot	f_F096_val	exact
+pending

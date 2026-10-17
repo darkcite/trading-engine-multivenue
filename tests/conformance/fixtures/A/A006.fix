@@ -1,0 +1,22 @@
+fix	2
+id	A006
+group	A
+title	na != na · int
+pin	pin:06-na-compare
+script	tests/conformance/fixtures/A/A006.pine
+script_sha256	3619070261044c90020912460d4b6bb942a76221488f86dd0390da16857f8aae
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_A006_isna	exact
+plot	f_A006_val	exact
+pending

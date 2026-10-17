@@ -1,0 +1,22 @@
+fix	2
+id	D023
+group	D
+title	close at 5
+pin	pin:06-ltf-intrabar
+script	tests/conformance/fixtures/D/D023.pine
+script_sha256	6520dcc2316c6a79743d5db4a02c275a15ce82befc56163fd0fcc52907dca86d
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	chart
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	tail	256
+oracle	tv
+tier	2
+plot	f_D023_isna	exact
+plot	f_D023_val	exact
+pending

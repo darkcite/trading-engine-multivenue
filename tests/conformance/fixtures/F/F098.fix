@@ -1,0 +1,33 @@
+fix	2
+id	F098
+group	F
+title	float % of a non-representable divisor, folded and series
+pin	pin:03-float-mod
+script	tests/conformance/fixtures/F/F098.pine
+script_sha256	d242a6887dfabfff261e0e2031f921b19d3e23c6bd92acbbbdaf708124a6909e
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	1
+oracle	tv
+tier	1
+plot	f_F098_val1	exact
+plot	f_F098_val2	exact
+plot	f_F098_val3	exact
+plot	f_F098_val4	exact
+plot	f_F098_val5	exact
+plot	f_F098_val6	exact
+plot	f_F098_val7	exact
+pending
+reading	as_written
+0	0.0	0.0	5.551115123125783e-17	0.0	0.0	5.551115123125783e-17	0.06999999999993634
+end
+reading	exact_remainder
+0	0.09999999999999995	0.09999999999999945	2.7755575615628914e-17	0.09999999999999995	0.09999999999999945	2.7755575615628914e-17	0.06999999999993634
+end

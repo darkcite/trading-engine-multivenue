@@ -1,0 +1,24 @@
+fix	2
+id	F024
+group	F
+title	math.log(0.0), math.log(0.0 - 1.0)
+pin	pin:06-nonfinite
+script	tests/conformance/fixtures/F/F024.pine
+script_sha256	77de5bc87cdbef1a83dbf1c31072e63d7f24bb2680b4063fc31b4c1dc654d3ef
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_F024_isna1	exact
+plot	f_F024_val1	exact
+plot	f_F024_isna2	exact
+plot	f_F024_val2	exact
+pending

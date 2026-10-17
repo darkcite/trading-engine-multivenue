@@ -1,0 +1,22 @@
+fix	2
+id	D060
+group	D
+title	the first loaded bar
+pin	pin:00-dataset-start
+script	tests/conformance/fixtures/D/D060.pine
+script_sha256	e757d33578d7da0e68647fac494d4ca0545b17ca175c75cd2970651d4385f9e8
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	chart
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	tail	256
+oracle	tv_only
+tier	1
+plot	f_D060_t0	exact
+plot	f_D060_bar_index	exact
+pending

@@ -1,0 +1,22 @@
+fix	2
+id	A089
+group	A
+title	var across a conditional assignment · bool
+pin	pin:W13-bool-na
+script	tests/conformance/fixtures/A/A089.pine
+script_sha256	a4a1f4a486e39744f51a986ee723f7b9a8729337b21fef7e73af49be75689d56
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	syn
+align	step
+dialects	6
+twin	A073
+mode	bar_close
+bars	pending
+window	head	64
+oracle	authored
+tier	1
+plot	f_A089_val	exact
+refuse	3007

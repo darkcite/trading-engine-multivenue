@@ -1,0 +1,21 @@
+fix	2
+id	B116
+group	B
+title	ta.pvt on the chart
+script	tests/conformance/fixtures/B/B116.pine
+script_sha256	9ac92be8c098a61ff38eea3e657a85c45213b9e80636ed5c489157218c7696f2
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	chart
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	tail	256
+oracle	tv
+tier	1
+plot	f_B116_isna	exact
+plot	f_B116_val	exact
+pending

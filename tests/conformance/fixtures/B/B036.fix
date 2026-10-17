@@ -1,0 +1,24 @@
+fix	2
+id	B036
+group	B
+title	ta.highest at two sites
+pin	pin:04-ta-reference
+script	tests/conformance/fixtures/B/B036.pine
+script_sha256	3f62ea142ab4d2ab095820169d80086abb2dab64381cb8d56407afbcf670eb63
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	tail	128
+oracle	tv
+tier	1
+plot	f_B036_isna1	exact
+plot	f_B036_val1	exact
+plot	f_B036_isna2	exact
+plot	f_B036_val2	exact
+pending

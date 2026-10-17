@@ -1,0 +1,21 @@
+fix	2
+id	A019
+group	A
+title	nz 1-arg default · float
+script	tests/conformance/fixtures/A/A019.pine
+script_sha256	a7c44f41b76fcfc098c383f716ff74a5dc13cade7f5a187bfe9492587c00ebdc
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_A019_isna	exact
+plot	f_A019_val	exact
+pending

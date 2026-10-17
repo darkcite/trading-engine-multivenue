@@ -1,0 +1,21 @@
+fix	2
+id	D035
+group	D
+title	timeframe 1H
+script	tests/conformance/fixtures/D/D035.pine
+script_sha256	dee67b9cf16fc9dd442fe8a93c314910bff5957425ef0464816122faf7586f6b
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	chart
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	tail	256
+oracle	authored
+tier	2
+plot	f_D035_isna	exact
+plot	f_D035_val	exact
+refuse	5001

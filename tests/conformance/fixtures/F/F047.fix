@@ -1,0 +1,22 @@
+fix	2
+id	F047
+group	F
+title	9007199254740993 == 9007199254740992, 9007199254740993.0 == 9007199254740992.0
+pin	pin:06-int-width
+script	tests/conformance/fixtures/F/F047.pine
+script_sha256	6103432f7d96d4b8d49d28223fcca03f17bea23ab376ec93b549763e16c38482
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_F047_val1	exact
+plot	f_F047_val2	exact
+pending

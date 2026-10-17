@@ -1,0 +1,23 @@
+fix	2
+id	A080
+group	A
+title	fixnan · bool
+pin	pin:W13-bool-na
+script	tests/conformance/fixtures/A/A080.pine
+script_sha256	0304e1be5f0b5b00b44e1aec79e78d3b89ce5772b5211bdfd39c1afae8229cd0
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	5
+twin	A096
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_A080_isna	exact
+plot	f_A080_val	exact
+pending

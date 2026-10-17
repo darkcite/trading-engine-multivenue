@@ -1,0 +1,24 @@
+fix	2
+id	F062
+group	F
+title	0.1 + 0.2 == 0.3, 1.0000000001 == 1.0, 1e-10 == 2e-10
+pin	pin:U06-float-eq-v6
+script	tests/conformance/fixtures/F/F062.pine
+script_sha256	929bf4b483fc4fdfc37619c4f9b80683015b6dd65cc83bb0644791b499645849
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	6
+twin	F061
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_F062_val1	exact
+plot	f_F062_val2	exact
+plot	f_F062_val3	exact
+pending

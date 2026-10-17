@@ -1,0 +1,21 @@
+fix	2
+id	Z001
+group	Z
+title	probe p01_mixed_indent · pin:01-mixed-indent
+pin	pin:01-mixed-indent
+script	crates/pine-lang/tests/probes/p01_mixed_indent.pine
+script_sha256	f4cf6778ecd220e841e9fcf41853b9095ecea9a54b6afa6b451808a63120ec9c
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	6
+mode	bar_close
+bars	pending
+window	head	1
+oracle	tv
+tier	1
+plot	f_Z001_ok	exact
+pending

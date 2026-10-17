@@ -1,0 +1,24 @@
+fix	2
+id	E108
+group	E
+title	the last closed trade's accessors
+pin	pin:04-strategy-edges
+script	tests/conformance/fixtures/E/E108.pine
+script_sha256	86810d911d568e39db38f49c64380214da959abfe70ac63cb13d2995d06172b1
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E108_pos	exact
+plot	f_E108_profit	exact
+plot	f_E108_comm	exact
+plot	f_E108_ep	exact
+pending

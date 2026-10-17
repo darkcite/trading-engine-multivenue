@@ -1,0 +1,22 @@
+fix	2
+id	E104
+group	E
+title	exit trail_price + trail_points
+pin	pin:W23-exit-legs
+script	tests/conformance/fixtures/E/E104.pine
+script_sha256	ea4d518b402add51ef540be14f6b72e56d0ab61945c3016fd70a2a396e525554
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	6
+twin	E103
+mode	bar_close
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E104_pos	exact
+pending

@@ -1,0 +1,23 @@
+fix	2
+id	B047
+group	B
+title	ta.macd inside a conditional
+pin	pin:04-ta-reference
+pin	pin:06-cond-call-state
+script	tests/conformance/fixtures/B/B047.pine
+script_sha256	4afbb3bc6b96cf7609d19a336e6b80f902c9582b1ac419921852bdac95ef4962
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	tail	128
+oracle	tv
+tier	1
+plot	f_B047_isna	exact
+plot	f_B047_val	ulp	32
+pending

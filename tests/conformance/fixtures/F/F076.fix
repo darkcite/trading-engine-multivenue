@@ -1,0 +1,33 @@
+fix	2
+id	F076
+group	F
+title	str.length(timeframe.from_seconds(s)), s in 86400, 604800, 3600
+pin	pin:00-tf-multiplier
+script	tests/conformance/fixtures/F/F076.pine
+script_sha256	5f31ee6100ee1f116054fb3dabf79357970d0360d47b7caa588b565eb9c7f25a
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	6
+twin	F075
+mode	bar_close
+bars	pending
+window	head	1
+oracle	tv
+tier	1
+plot	f_F076_isna1	exact
+plot	f_F076_val1	exact
+plot	f_F076_isna2	exact
+plot	f_F076_val2	exact
+plot	f_F076_isna3	exact
+plot	f_F076_val3	exact
+pending
+reading	omit_one
+0	0.0	1.0	0.0	1.0	0.0	2.0
+end
+reading	always
+0	0.0	2.0	0.0	2.0	0.0	2.0
+end

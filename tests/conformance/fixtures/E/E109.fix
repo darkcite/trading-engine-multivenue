@@ -1,0 +1,23 @@
+fix	2
+id	E109
+group	E
+title	two orders per trade, every step
+pin	pin:05-trade-trim
+script	tests/conformance/fixtures/E/E109.pine
+script_sha256	d85f6a2bb92a5bff8e214049845f8ef70249ed84fb9b05ff956afe5a2bc2e655
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	6
+mode	bar_close
+bars	pending
+window	tail	64
+oracle	tv
+tier	1
+plot	f_E109_closed	exact
+plot	f_E109_first	exact
+plot	f_E109_isna0	exact
+pending

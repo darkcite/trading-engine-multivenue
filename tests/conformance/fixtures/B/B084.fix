@@ -1,0 +1,20 @@
+fix	2
+id	B084
+group	B
+title	ta.crossover warm-up
+script	tests/conformance/fixtures/B/B084.pine
+script_sha256	c5f46fbe09ebd6e79ed7f92aed3cd16a2a085934366ac6d822680a5be91bc49b
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	128
+oracle	tv
+tier	1
+plot	f_B084_val	exact
+pending

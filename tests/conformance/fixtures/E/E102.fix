@@ -1,0 +1,22 @@
+fix	2
+id	E102
+group	E
+title	exit stop + loss
+pin	pin:W23-exit-legs
+script	tests/conformance/fixtures/E/E102.pine
+script_sha256	dcf5530d25188e5b398f381c9d08a8bf863e9af9e6b2e4142a96a2a34e4d6271
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	6
+twin	E101
+mode	bar_close
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E102_pos	exact
+pending

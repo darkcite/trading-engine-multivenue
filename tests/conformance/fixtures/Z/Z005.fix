@@ -1,0 +1,21 @@
+fix	2
+id	Z005
+group	Z
+title	probe p05_paren_wrap_v6 · pin:01-v5-paren-wrap
+pin	pin:01-v5-paren-wrap
+script	crates/pine-lang/tests/probes/p05_paren_wrap_v6.pine
+script_sha256	be570fe91cac8fbca1f9b811866abded522d8eab9358b490fb4d82bcee671a8c
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	6
+mode	bar_close
+bars	pending
+window	head	1
+oracle	tv
+tier	1
+plot	f_Z005_ok	exact
+pending

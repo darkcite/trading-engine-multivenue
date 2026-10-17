@@ -1,0 +1,23 @@
+fix	2
+id	D042
+group	D
+title	240 value and time, gaps on
+script	tests/conformance/fixtures/D/D042.pine
+script_sha256	265fc97944a5f104c48d8fa4919606deebe637f5c2991d77d0d66a0cd3ecda51
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	chart
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	tail	256
+oracle	tv
+tier	2
+plot	f_D042_isna1	exact
+plot	f_D042_val1	exact
+plot	f_D042_isna2	exact
+plot	f_D042_val2	exact
+pending

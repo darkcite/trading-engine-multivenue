@@ -1,0 +1,23 @@
+fix	2
+id	F051
+group	F
+title	synb or rhs(k)
+pin	pin:W3-lazy-and-or
+script	tests/conformance/fixtures/F/F051.pine
+script_sha256	9a4007da27a5aa0987448710fac0224835098e8142aa54be6a624f7cc83f285d
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	6
+twin	F030
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_F051_val	exact
+plot	f_F051_cnt	exact
+pending

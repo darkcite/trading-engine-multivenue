@@ -1,0 +1,28 @@
+fix	2
+id	C044
+group	C
+title	updates per bar with each barstate flag
+pin	pin:U17-barstate-table
+script	tests/conformance/fixtures/C/C044.pine
+script_sha256	7d03cad11e2fc983c6f88aec7a88cc8ef207b21e48acd116263bc995e2aa0671
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	rt
+align	step
+dialects	56
+mode	realtime
+bars	pending
+window	tail	16
+oracle	tv
+tier	1
+rt	64	16	3	0
+plot	f_C044_rt	exact
+plot	f_C044_done	exact
+plot	f_C044_isnew	exact
+plot	f_C044_isconfirmed	exact
+plot	f_C044_ishistory	exact
+plot	f_C044_notlast	exact
+plot	f_C044_notrt	exact
+pending

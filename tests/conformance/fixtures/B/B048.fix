@@ -1,0 +1,24 @@
+fix	2
+id	B048
+group	B
+title	ta.macd at two sites
+pin	pin:04-ta-reference
+script	tests/conformance/fixtures/B/B048.pine
+script_sha256	dcf5bc164f660ddab15ba40980e9f54b1eb558d22e274612754586126af30329
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	tail	128
+oracle	tv
+tier	1
+plot	f_B048_isna1	exact
+plot	f_B048_val1	ulp	32
+plot	f_B048_isna2	exact
+plot	f_B048_val2	ulp	32
+pending

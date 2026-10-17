@@ -1,0 +1,20 @@
+fix	2
+id	E007
+group	E
+title	close, baseline
+script	tests/conformance/fixtures/E/E007.pine
+script_sha256	2d001f5ce1698246c1971c46473ce3967ee3d0657b1190a529ea82a8b0c1cc0d
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E007_pos	exact
+pending

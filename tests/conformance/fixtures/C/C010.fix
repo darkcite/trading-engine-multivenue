@@ -1,0 +1,21 @@
+fix	2
+id	C010
+group	C
+title	var inside for_block
+script	tests/conformance/fixtures/C/C010.pine
+script_sha256	ef20934f88cb403be9e13930c993a08a82e47cb0bccd4973761599baa1d28db4
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_C010_isna	exact
+plot	f_C010_val	exact
+pending

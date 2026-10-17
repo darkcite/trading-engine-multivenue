@@ -1,0 +1,21 @@
+fix	2
+id	E061
+group	E
+title	oca reduce, two entries
+pin	pin:05-cash-per-order
+script	tests/conformance/fixtures/E/E061.pine
+script_sha256	a3de006b77f61be379398c4ec9c189eec415546f8349514dbed3e5e23fc8d2d7
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E061_pos	exact
+pending

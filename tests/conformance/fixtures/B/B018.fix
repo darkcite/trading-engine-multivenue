@@ -1,0 +1,24 @@
+fix	2
+id	B018
+group	B
+title	ta.rma at two sites
+pin	pin:04-ta-reference
+script	tests/conformance/fixtures/B/B018.pine
+script_sha256	63d87fee1de725ec78c0b5ca63f3b36e1766eccc156db0beb63a41394e457728
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	tail	128
+oracle	tv
+tier	1
+plot	f_B018_isna1	exact
+plot	f_B018_val1	ulp	22
+plot	f_B018_isna2	exact
+plot	f_B018_val2	ulp	22
+pending

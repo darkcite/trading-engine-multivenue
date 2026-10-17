@@ -1,0 +1,20 @@
+fix	2
+id	E029
+group	E
+title	exit stop, calc_on_every_tick
+script	tests/conformance/fixtures/E/E029.pine
+script_sha256	568f5ce935101770cb3aa257c4c433214fa55d1917b3610226b5b7e9837e0970
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	realtime
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E029_pos	exact
+pending

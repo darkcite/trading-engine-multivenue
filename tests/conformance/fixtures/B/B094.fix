@@ -1,0 +1,21 @@
+fix	2
+id	B094
+group	B
+title	ta.min warm-up
+script	tests/conformance/fixtures/B/B094.pine
+script_sha256	8aaf69fef5ebd4038d67682df4b98d8a73ce6bcbdc12b872dd4026436ca3dde4
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	128
+oracle	tv
+tier	1
+plot	f_B094_isna	exact
+plot	f_B094_val	exact
+pending

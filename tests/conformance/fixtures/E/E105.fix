@@ -1,0 +1,23 @@
+fix	2
+id	E105
+group	E
+title	an order placed in a fill re-execution
+pin	pin:W21-intrabar-commit
+pin	pin:05-cof-close-tick
+pin	pin:05-cof-next-tick
+script	tests/conformance/fixtures/E/E105.pine
+script_sha256	ac372a33d43e6abf5ae1f255387ddac330bb990cefd99a443f03f8317ef5ec9b
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	realtime
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E105_pos	exact
+pending

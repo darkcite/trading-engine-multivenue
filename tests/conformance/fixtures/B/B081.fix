@@ -1,0 +1,21 @@
+fix	2
+id	B081
+group	B
+title	ta.cog warm-up
+script	tests/conformance/fixtures/B/B081.pine
+script_sha256	31feebd14ff96088411e361a54e0c69544a8bf9411585693dd8c02677a67b9cb
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	128
+oracle	tv
+tier	1
+plot	f_B081_isna	exact
+plot	f_B081_val	exact
+pending

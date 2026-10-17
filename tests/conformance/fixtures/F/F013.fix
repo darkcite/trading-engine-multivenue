@@ -1,0 +1,22 @@
+fix	2
+id	F013
+group	F
+title	float(9007199254740993)
+pin	pin:06-int-width
+script	tests/conformance/fixtures/F/F013.pine
+script_sha256	9cf3e6c7bb6d27261525a7adebb8643849904319a847a761011acc85d45cab7c
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_F013_isna	exact
+plot	f_F013_val	exact
+pending

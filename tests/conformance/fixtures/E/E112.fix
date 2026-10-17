@@ -1,0 +1,21 @@
+fix	2
+id	E112
+group	E
+title	an exit qty over two trades
+pin	pin:05-exit-qty-per-trade
+script	tests/conformance/fixtures/E/E112.pine
+script_sha256	54bc5c320efc878a92638c6bfa570a2ed2905ae07a2829934ac4f6073db2690e
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E112_pos	exact
+pending

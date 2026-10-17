@@ -1,0 +1,23 @@
+fix	2
+id	A062
+group	A
+title	na in a collection · string
+pin	pin:04-string-edges
+pin	pin:04-collection-edges
+script	tests/conformance/fixtures/A/A062.pine
+script_sha256	10c479c24032c50871fb494bb8e84907990f73761c401f7ec9ad46b49e45679b
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	3
+plot	f_A062_isna	exact
+plot	f_A062_val	exact
+refuse	3010

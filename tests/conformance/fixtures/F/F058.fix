@@ -1,0 +1,23 @@
+fix	2
+id	F058
+group	F
+title	a / 2
+pin	pin:W1-int-div
+script	tests/conformance/fixtures/F/F058.pine
+script_sha256	a3eed716fccf6800276f5aa62a6bcc48b98e5a99c125974cdb47545598968f60
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	6
+twin	F057
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_F058_isna	exact
+plot	f_F058_val	exact
+pending

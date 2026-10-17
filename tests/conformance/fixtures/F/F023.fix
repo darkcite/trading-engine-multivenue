@@ -1,0 +1,21 @@
+fix	2
+id	F023
+group	F
+title	math.sqrt(0.0 - 1.0)
+script	tests/conformance/fixtures/F/F023.pine
+script_sha256	57de6e4f5175b5940fe329288e530b01c16cc58fc2b592091c74619a52a9fbe7
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_F023_isna	exact
+plot	f_F023_val	exact
+pending

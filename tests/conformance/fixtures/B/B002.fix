@@ -1,0 +1,22 @@
+fix	2
+id	B002
+group	B
+title	ta.sma with len 1
+pin	pin:04-ta-reference
+script	tests/conformance/fixtures/B/B002.pine
+script_sha256	23e9d8cb86108e2b061ff07e5bd33d2d3a662014efbffdd447a764c5450b1913
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	128
+oracle	tv
+tier	1
+plot	f_B002_isna	exact
+plot	f_B002_val	ulp	4
+pending

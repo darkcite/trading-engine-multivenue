@@ -1,0 +1,21 @@
+fix	2
+id	F034
+group	F
+title	color.rgb(1,2,3) == color.rgb(1,2,3)
+pin	pin:04-color-edges
+script	tests/conformance/fixtures/F/F034.pine
+script_sha256	7b48f51c2205bb3f5cce96236f0c42d0e3766e5b308d6a45f6f8ad0d5d16e7ec
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_F034_val	exact
+pending

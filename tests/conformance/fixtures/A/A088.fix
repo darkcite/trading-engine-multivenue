@@ -1,0 +1,22 @@
+fix	2
+id	A088
+group	A
+title	na() on a value · bool
+pin	pin:W13-bool-na
+script	tests/conformance/fixtures/A/A088.pine
+script_sha256	3cf06d526c65513fa6fb1dbf61c1a761daaafe1b44da8e7d918de3c887e6159a
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	syn
+align	step
+dialects	6
+twin	A072
+mode	bar_close
+bars	pending
+window	head	64
+oracle	authored
+tier	1
+plot	f_A088_val	exact
+refuse	3005

@@ -1,0 +1,22 @@
+fix	2
+id	F002
+group	F
+title	(0 - syni) / 7
+pin	pin:W1-int-div
+script	tests/conformance/fixtures/F/F002.pine
+script_sha256	7d9b30d7a766505ceddfc728732cc23388b3fd181862769d9d894a3c42e8396e
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_F002_isna	exact
+plot	f_F002_val	exact
+pending

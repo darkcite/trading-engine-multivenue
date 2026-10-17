@@ -1,0 +1,21 @@
+fix	2
+id	C021
+group	C
+title	varip inside method_body
+script	tests/conformance/fixtures/C/C021.pine
+script_sha256	c02286587ca2a913d3d8fb8dfd38319b7dde6adf9f88a0b06feecb03cc2a5ad5
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_C021_isna	exact
+plot	f_C021_val	exact
+pending

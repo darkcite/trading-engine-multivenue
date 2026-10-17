@@ -1,0 +1,20 @@
+fix	2
+id	E020
+group	E
+title	entry limit, calc_on_every_tick
+script	tests/conformance/fixtures/E/E020.pine
+script_sha256	e5fe64ce0bd67f1435c2014e44232eecebfab5e50ffae58e611c360803ae01c0
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	realtime
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E020_pos	exact
+pending

@@ -1,0 +1,24 @@
+fix	2
+id	C042
+group	C
+title	a varip string survives the rollback
+script	tests/conformance/fixtures/C/C042.pine
+script_sha256	fb6101e53859136988d82f447a1f0592973ff010eda8593602c73dbe227a6985
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	rt
+align	step
+dialects	56
+mode	realtime
+bars	pending
+window	tail	16
+oracle	tv
+tier	1
+rt	64	16	3	0
+plot	f_C042_rt	exact
+plot	f_C042_done	exact
+plot	f_C042_upd	exact
+plot	f_C042_ok	exact
+pending

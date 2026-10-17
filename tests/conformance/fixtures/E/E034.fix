@@ -1,0 +1,21 @@
+fix	2
+id	E034
+group	E
+title	entry market, pyramiding 3
+pin	pin:05-pyramiding-check
+script	tests/conformance/fixtures/E/E034.pine
+script_sha256	090f23df3b3cc7d78c7ccd5df747a67d303b10b43a7c02d6b32b6be113668459
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E034_pos	exact
+pending

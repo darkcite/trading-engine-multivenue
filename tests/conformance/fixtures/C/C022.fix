@@ -1,0 +1,21 @@
+fix	2
+id	C022
+group	C
+title	a fresh object each bar
+script	tests/conformance/fixtures/C/C022.pine
+script_sha256	1c2fcfc2da61cc5e4d41982fadd25d1cc855fcf8496b7421c996d422a44f8517
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_C022_isna	exact
+plot	f_C022_val	exact
+pending

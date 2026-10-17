@@ -1,0 +1,21 @@
+fix	2
+id	B090
+group	B
+title	ta.lowest warm-up
+script	tests/conformance/fixtures/B/B090.pine
+script_sha256	d3d2a02b0550995c54ab6275f49d8059942cc234a41e2664df21f35a3e6d9e62
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	128
+oracle	tv
+tier	1
+plot	f_B090_isna	exact
+plot	f_B090_val	exact
+pending

@@ -1,0 +1,21 @@
+fix	2
+id	B110
+group	B
+title	ta.nvi on the chart
+script	tests/conformance/fixtures/B/B110.pine
+script_sha256	7ecf02ea5c258c382294f5b4d446bbbd96d9a1613e1b5c27b59791ab1cc33f57
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	chart
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	tail	256
+oracle	tv
+tier	1
+plot	f_B110_isna	exact
+plot	f_B110_val	exact
+pending

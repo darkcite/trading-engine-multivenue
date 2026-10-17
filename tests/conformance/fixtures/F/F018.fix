@@ -1,0 +1,21 @@
+fix	2
+id	F018
+group	F
+title	math.sign((syn - syn) * -1.0)
+script	tests/conformance/fixtures/F/F018.pine
+script_sha256	7ce2fc33b5580501ba25e904f8673fd536a7f05bbe257999fbc5e4b2e7b43039
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_F018_isna	exact
+plot	f_F018_val	exact
+pending

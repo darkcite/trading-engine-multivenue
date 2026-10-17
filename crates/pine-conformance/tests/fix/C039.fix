@@ -1,0 +1,33 @@
+fix	2
+id	C039
+group	C
+title	var advances once per realtime bar
+pin	pin:U17-barstate-table
+script	tests/conformance/fixtures/C/C039.pine
+script_sha256	0000000000000000000000000000000000000000000000000000000000c03901
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	rt
+align	step
+dialects	56
+mode	realtime
+bars	12
+window	head	8
+oracle	algebraic
+tier	1
+rt	8	4	3	0	open
+plot	f_C039_var	exact
+plot	f_C039_rt	exact
+relation
+f_C039_var	1
+f_C039_rt	0
+end
+reading	per_tick
+f_C039_var	3
+f_C039_rt	-2
+end
+reading	per_bar
+f_C039_var	1
+end

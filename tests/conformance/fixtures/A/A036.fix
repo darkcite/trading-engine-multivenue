@@ -1,0 +1,22 @@
+fix	2
+id	A036
+group	A
+title	nz replacement · color
+pin	pin:04-color-edges
+script	tests/conformance/fixtures/A/A036.pine
+script_sha256	f05b32d0dfca5b2fd5e067e518c56699e32d0719f0585ebb1c9fbffda23d1218
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_A036_isna	exact
+plot	f_A036_val	exact
+pending

@@ -1,0 +1,22 @@
+fix	2
+id	A090
+group	A
+title	history on the first bar · bool
+pin	pin:W13-bool-na
+script	tests/conformance/fixtures/A/A090.pine
+script_sha256	a0f500374a5a0e327dadb2a5d519534dfd608a19ba8fc2869fb583eda0ac87a8
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	6
+twin	A074
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_A090_val	exact
+pending

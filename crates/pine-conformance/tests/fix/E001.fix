@@ -1,0 +1,38 @@
+fix	2
+id	E001
+group	E
+title	strategy.entry long on SYN-T signals, market exit
+script	tests/conformance/fixtures/E/E001.pine
+script_sha256	0000000000000000000000000000000000000000000000000000000000e00101
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2026-11-06T10:02Z
+tv_build	web:Chrome/131.0;pine:2026-10
+captured_in	6
+driver	synsig
+align	time
+dialects	6
+mode	bar_close
+bars	-
+window	time	1772668800000	1788220800000
+oracle	tv
+tier	2
+plot	f_E001_pos	exact
+series
+1772668800000	0
+1772672400000	1
+1772676000000	-1
+end
+trades
+1	long	1772672400000	60123.5	L1	1772676000000	60510.2	Close entry(s) order L1	1	386.7	386.7	1284.1	75.3	44
+2	short	1772676000000	60510.2	S1	-	-	-	0.5	-	-	-	-	-
+end
+summary
+net	1234.56
+gross_profit	2000.00
+gross_loss	-765.44
+commission	0
+max_drawdown	-0.00
+closed	20
+wins	1
+losses	19
+end

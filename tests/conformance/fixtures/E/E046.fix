@@ -1,0 +1,20 @@
+fix	2
+id	E046
+group	E
+title	entry limit, default_qty_type percent_of_equity
+script	tests/conformance/fixtures/E/E046.pine
+script_sha256	81060b61010e6cae02ffffd181916a8bdc470b57366d4a4e47681761084e68f8
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E046_pos	exact
+pending

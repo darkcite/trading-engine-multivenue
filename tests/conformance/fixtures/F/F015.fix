@@ -1,0 +1,26 @@
+fix	2
+id	F015
+group	F
+title	math.round(0.5), math.round(-0.5), math.round(1.5), math.round(-1.5), math.round(2.5), math.round(-2.5)
+pin	pin:U04-round-ties
+script	tests/conformance/fixtures/F/F015.pine
+script_sha256	8a0db02ae3e0e91ee7e59ff4ed384ee8f0d2f5e4f7bb6a3c038e54f81ddbf90a
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_F015_val1	exact
+plot	f_F015_val2	exact
+plot	f_F015_val3	exact
+plot	f_F015_val4	exact
+plot	f_F015_val5	exact
+plot	f_F015_val6	exact
+pending

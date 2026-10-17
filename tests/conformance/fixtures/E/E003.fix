@@ -1,0 +1,20 @@
+fix	2
+id	E003
+group	E
+title	entry stop, baseline
+script	tests/conformance/fixtures/E/E003.pine
+script_sha256	a09dc8410cfb3222280e2379e7820341e991ec0cc4a2de920d39cdeeea43a1fe
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E003_pos	exact
+pending

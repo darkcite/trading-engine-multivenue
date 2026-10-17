@@ -1,0 +1,23 @@
+fix	2
+id	B049
+group	B
+title	ta.rsi warm-up
+pin	pin:04-ta-reference
+pin	pin:00-rma-seed
+script	tests/conformance/fixtures/B/B049.pine
+script_sha256	5e55c7ff65bc222cb1fcde1adbbd8136d6e57dbb2f1a6348cfd14f495c203e1d
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	128
+oracle	tv
+tier	1
+plot	f_B049_isna	exact
+plot	f_B049_val	ulp	34
+pending

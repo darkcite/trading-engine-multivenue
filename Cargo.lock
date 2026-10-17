@@ -186,6 +186,7 @@ dependencies = [
  "strategy-hyparb",
  "strategy-icdp",
  "strategy-latency-arb",
+ "strategy-pine",
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
@@ -393,6 +394,7 @@ dependencies = [
  "strategy-hcv",
  "strategy-hyparb",
  "strategy-icdp",
+ "strategy-pine",
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
@@ -1502,6 +1504,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pine-conformance"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "pine-broker",
+ "pine-ir",
+ "pine-lang",
+ "pine-screen",
+ "pine-sema",
+ "pine-spec",
+ "pine-std",
+ "pine-vm",
+]
+
+[[package]]
 name = "pine-ir"
 version = "0.1.0"
 
@@ -2209,6 +2226,7 @@ dependencies = [
  "pine-std",
  "pine-vm",
  "strategy-core",
+ "strategy-pine",
 ]
 
 [[package]]

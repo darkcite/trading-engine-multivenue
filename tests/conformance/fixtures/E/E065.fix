@@ -1,0 +1,20 @@
+fix	2
+id	E065
+group	E
+title	commission cash_per_contract, slippage 0
+script	tests/conformance/fixtures/E/E065.pine
+script_sha256	2665612979931baee351cb1d65eca51643c4085bd5577e6e7fd773fad5b36b6c
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E065_pos	exact
+pending

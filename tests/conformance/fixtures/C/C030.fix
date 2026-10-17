@@ -1,0 +1,21 @@
+fix	2
+id	C030
+group	C
+title	a var na object assigned later
+script	tests/conformance/fixtures/C/C030.pine
+script_sha256	15d221454fe39b38910ce68e27aeffd77f531af35d3f5946f1cb03c9bee68627
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	declined
+tier	1
+plot	f_C030_isna	exact
+plot	f_C030_val	exact
+refuse	3047

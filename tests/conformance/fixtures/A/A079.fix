@@ -1,0 +1,23 @@
+fix	2
+id	A079
+group	A
+title	na through an operation · bool
+pin	pin:W13-bool-na
+script	tests/conformance/fixtures/A/A079.pine
+script_sha256	790ec2b06bca006b2e8c07bef7296f854f5d3a4dec674b63948c2a11f7ef2794
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	5
+twin	A095
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_A079_isna	exact
+plot	f_A079_val	exact
+pending

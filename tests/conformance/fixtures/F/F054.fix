@@ -1,0 +1,23 @@
+fix	2
+id	F054
+group	F
+title	n and false, n or true
+pin	pin:W13-bool-na
+script	tests/conformance/fixtures/F/F054.pine
+script_sha256	39ca745c3adab9c631cc01721ded1b2f0010de6d45f093d10f09fde760948485
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	syn
+align	step
+dialects	6
+twin	F035
+mode	bar_close
+bars	pending
+window	head	64
+oracle	authored
+tier	1
+plot	f_F054_val1	exact
+plot	f_F054_val2	exact
+refuse	3007

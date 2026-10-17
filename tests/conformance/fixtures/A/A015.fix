@@ -1,0 +1,21 @@
+fix	2
+id	A015
+group	A
+title	na through an operation · int
+script	tests/conformance/fixtures/A/A015.pine
+script_sha256	02ecaf26ac115e7c74bb5f9af156c02d305813b69ea4aa472ef18b19b21f38df
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_A015_isna	exact
+plot	f_A015_val	exact
+pending

@@ -1,0 +1,23 @@
+fix	2
+id	E114
+group	E
+title	openprofit net of the entry fee
+pin	pin:05-openprofit-fees
+script	tests/conformance/fixtures/E/E114.pine
+script_sha256	8f14f3b4851e12ad5dc91a81275a4bc700213fe128456b29c38ea5b6a2af69f6
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E114_pos	exact
+plot	f_E114_oprofit	exact
+plot	f_E114_eq	exact
+pending

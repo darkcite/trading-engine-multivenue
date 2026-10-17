@@ -1,0 +1,21 @@
+fix	2
+id	D028
+group	D
+title	a user function at 240
+script	tests/conformance/fixtures/D/D028.pine
+script_sha256	82d58062962f8101ed362044ed4b071740177fc4af6c79298cf92da8a5a0e312
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	chart
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	tail	256
+oracle	tv
+tier	2
+plot	f_D028_isna	exact
+plot	f_D028_val	exact
+pending

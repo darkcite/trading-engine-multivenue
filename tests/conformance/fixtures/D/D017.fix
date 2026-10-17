@@ -1,0 +1,21 @@
+fix	2
+id	D017
+group	D
+title	240 close[1] with lookahead on
+script	tests/conformance/fixtures/D/D017.pine
+script_sha256	0006f6defa37a5749f29f2003a99c02d68154715a85c632f5986fdabbfc4d94e
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	chart
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	tail	256
+oracle	tv
+tier	2
+plot	f_D017_isna	exact
+plot	f_D017_val	exact
+pending

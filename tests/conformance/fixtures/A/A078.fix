@@ -1,0 +1,24 @@
+fix	2
+id	A078
+group	A
+title	na in a collection · bool
+pin	pin:W13-bool-na
+pin	pin:04-collection-edges
+script	tests/conformance/fixtures/A/A078.pine
+script_sha256	51154e71b03ececf29631125f8cf95903d517b201374e5bd45cf09be952d0c3c
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	pending
+driver	syn
+align	step
+dialects	5
+twin	A094
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	3
+plot	f_A078_isna	exact
+plot	f_A078_val	exact
+refuse	3010

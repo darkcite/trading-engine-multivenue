@@ -1,0 +1,23 @@
+fix	2
+id	A068
+group	A
+title	nz replacement · bool
+pin	pin:W13-bool-na
+script	tests/conformance/fixtures/A/A068.pine
+script_sha256	c8647c8306b98ff175acc22b4028d3549f07ad3eba0188215b12ce4eb1c3c83c
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	5
+twin	A084
+mode	bar_close
+bars	pending
+window	head	64
+oracle	tv
+tier	1
+plot	f_A068_isna	exact
+plot	f_A068_val	exact
+pending

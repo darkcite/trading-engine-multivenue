@@ -1,0 +1,28 @@
+fix	2
+id	F079
+group	F
+title	na in a typed declaration
+pin	pin:02-typed-na
+pin	pin:W13-bool-na
+script	tests/conformance/fixtures/F/F079.pine
+script_sha256	0000000000000000000000000000000000000000000000000000000000f07901
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	6
+mode	bar_close
+bars	pending
+window	head	1
+oracle	tv_only
+tier	1
+plot	f_F079_val	exact
+pending
+reading	loads
+0	na
+end
+reading	refused
+refuse	3012
+end

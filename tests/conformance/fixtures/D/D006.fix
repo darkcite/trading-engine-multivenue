@@ -1,0 +1,21 @@
+fix	2
+id	D006
+group	D
+title	240 ta.sma(close, 5), gaps on, lookahead off
+script	tests/conformance/fixtures/D/D006.pine
+script_sha256	68f95f03e2bbb83bcd39e7b73148e9710f2003f34b6c4fc5ed23bf392d23f5a8
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	chart
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	tail	256
+oracle	tv
+tier	2
+plot	f_D006_isna	exact
+plot	f_D006_val	exact
+pending

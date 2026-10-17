@@ -1,0 +1,23 @@
+fix	2
+id	F084
+group	F
+title	a reassigned length passed to a simple length parameter
+pin	pin:02-var-qualifier
+script	tests/conformance/fixtures/F/F084.pine
+script_sha256	3f02cf54541d2856d744d11ae7f365c4bf04ef72cbbf0213d43402871d26e4a7
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	syn
+align	step
+dialects	6
+twin	F083
+mode	bar_close
+bars	pending
+window	head	1
+oracle	authored
+tier	1
+plot	f_F084_isna	exact
+plot	f_F084_val	exact
+refuse	3008

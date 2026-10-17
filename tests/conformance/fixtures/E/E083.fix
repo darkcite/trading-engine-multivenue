@@ -1,0 +1,23 @@
+fix	2
+id	E083
+group	E
+title	strategy.opentrades read back
+pin	pin:05-drawdown-sampling
+pin	pin:04-strategy-edges
+script	tests/conformance/fixtures/E/E083.pine
+script_sha256	99c19a156e411d89984de4a1d434ad5cef67da224c38708d3c71f2eb7d94ebba
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E083_pos	exact
+plot	f_E083_open	exact
+pending

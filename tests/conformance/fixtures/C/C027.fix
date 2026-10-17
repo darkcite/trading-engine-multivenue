@@ -1,0 +1,21 @@
+fix	2
+id	C027
+group	C
+title	objects pushed into a var array
+script	tests/conformance/fixtures/C/C027.pine
+script_sha256	47ed78c0e9d6193ca510a0454b4c0fd8cb4096d3527b9cf96ddf0100078a6866
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	64
+oracle	declined
+tier	3
+plot	f_C027_isna	exact
+plot	f_C027_val	exact
+refuse	3047

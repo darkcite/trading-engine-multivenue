@@ -1,0 +1,20 @@
+fix	2
+id	E047
+group	E
+title	close, default_qty_type percent_of_equity
+script	tests/conformance/fixtures/E/E047.pine
+script_sha256	47cd955dd7da9c079cfedf2ddb2e70c602ce5ffc8bbcd70ee031f096a13d9b82
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E047_pos	exact
+pending
