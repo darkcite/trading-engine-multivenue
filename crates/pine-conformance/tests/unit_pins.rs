@@ -29,10 +29,11 @@ fn disk() -> Vec<Fixture> {
 #[test]
 fn every_pin_has_fixtures() {
     // §4.9.8: 26 + 9 + 21 + 38 = 94 names (the 9th `pin:06-*` is R-P2's
-    // `pin:06-na-object-field`), each with ≥ 1 fixture.
-    assert_eq!(PINS.len(), 94);
+    // `pin:06-na-object-field`), each with ≥ 1 fixture; r29 (2026-10-17) adds the capture
+    // session's ten — `pin:U17-hist-close-isnew`, five `pin:05-hist-tick-*`, four `pin:04-*` — 104.
+    assert_eq!(PINS.len(), 104);
     let names: BTreeSet<&str> = PINS.iter().map(|p| p.name).collect();
-    assert_eq!(names.len(), 94, "unique");
+    assert_eq!(names.len(), 104, "unique");
     let fx = disk();
     for p in PINS {
         assert!(p.ids().count() >= 1, "{} has no fixture", p.name);
@@ -66,7 +67,7 @@ fn every_pin_has_fixtures() {
         assert_eq!(pins::decide(p, &pre), Decision::Pending, "{}", p.name);
     }
     let tsv = pins::tsv(&pre);
-    assert_eq!(tsv.lines().count(), 94);
+    assert_eq!(tsv.lines().count(), 104);
     assert!(tsv
         .lines()
         .all(|l| l.split('\t').count() == 6 && l.ends_with("\tpending\tpending\tpending")));
@@ -125,8 +126,9 @@ fn every_switch_pin_is_published() {
             assert!(names.contains(p), "pine_spec switch pin {p} unpublished");
         }
     }
-    // §4.9.6–§4.9.7's `pin:NN-*` (NN ≠ 06) names: 21 + 38 = 59, owner `impl-NN`.
-    assert_eq!(FOREIGN_SWITCH_PINS.len(), 59);
+    // §4.9.6–§4.9.7's `pin:NN-*` (NN ≠ 06) names: 21 + 38 = 59, owner `impl-NN`; r29 adds nine
+    // (five `pin:05-hist-tick-*`, four `pin:04-*`) ahead of the linkage pass: 68.
+    assert_eq!(FOREIGN_SWITCH_PINS.len(), 68);
     for (p, owner) in FOREIGN_SWITCH_PINS {
         assert!(names.contains(p), "{p} unpublished");
         let nn = &p["pin:".len().."pin:".len() + 2];
@@ -176,7 +178,8 @@ fn manifest_counts_match_disk() {
     }
     // I10: the fixed blocks; B = 76 fixed + the derived counts.
     let (w, ch) = pine_conformance::gen::group_b::derived_counts();
-    let want = [96, 76 + w + ch, 46, 62, 121, 98, 19];
+    // r29 (2026-10-17): E122–E132 and F099–F119 appended for the next capture session.
+    let want = [96, 76 + w + ch, 46, 62, 132, 119, 19];
     for (g, n) in Group::ALL.iter().zip(want) {
         assert_eq!(c[*g as usize] as usize, n, "group {}", g.letter());
     }

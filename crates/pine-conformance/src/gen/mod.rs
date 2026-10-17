@@ -15,6 +15,7 @@ pub mod group_c;
 pub mod group_d;
 pub mod group_e;
 pub mod group_f;
+pub mod group_f2;
 pub mod group_z;
 pub mod readings;
 pub mod sheet;

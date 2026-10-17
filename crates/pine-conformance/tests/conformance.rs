@@ -81,8 +81,11 @@ const PASS: &[&str] = &[
 /// pine-sema landed both; D051/D052 left it by pin:06-d051-live-refuse (see [`SMOKE`]).
 const KNOWN_GAPS: &[(&str, &str)] = &[];
 
-/// Skips the environment explains (§4.5.9): tier-3 fixtures under `DEFAULT_LIMITS` (`0b0011`).
-const SKIPS: &[&str] = &["A094", "C027", "C043", "F065", "F067", "F069", "F071"];
+/// Skips the environment explains (§4.5.9): tier-3 fixtures under `DEFAULT_LIMITS` (`0b0011`);
+/// r29 adds the UDT field rows' v5 twins F109, F111, F113 (authored `refuse 3005`, tier 3).
+const SKIPS: &[&str] = &[
+    "A094", "C027", "C043", "F065", "F067", "F069", "F071", "F109", "F111", "F113",
+];
 
 /// Smoke fixtures (`pending` body, ours): `Verdict::Pending` where the bar files exist (the Mac),
 /// `Skipped(NoBarsRoot)` here — pin:06-d051-live-refuse.
@@ -106,7 +109,8 @@ fn standin_fixtures_hold_the_known_pass_set() {
     let mut runner = Runner::new(standin_options("pass-set")).expect("runner");
     assert_eq!(runner.syminfo_source(), SyminfoSource::StandIn);
     let all = load_all();
-    assert_eq!(all.len(), 566, "fixture count");
+    // r29 (2026-10-17): 566 + E122–E132 + F099–F119 (pending, or the v5 twins' authored refusals).
+    assert_eq!(all.len(), 598, "fixture count");
     let (mut pass, mut gaps, mut skips) = (Vec::new(), Vec::new(), Vec::new());
     let mut smoke: Vec<String> = Vec::new();
     for f in all.iter().filter(|f| ours(f)) {

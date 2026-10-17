@@ -1,0 +1,24 @@
+fix	2
+id	F105
+group	F
+title	array.every and array.some, an empty array included
+pin	pin:04-collection-edges
+script	tests/conformance/fixtures/F/F105.pine
+script_sha256	5eb298e3c767d038e335bb5c434df45ce92124898e69611123894c5b301b86a3
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	16
+oracle	tv
+tier	3
+plot	f_F105_every1	exact
+plot	f_F105_some2	exact
+plot	f_F105_every0	exact
+plot	f_F105_some0	exact
+pending

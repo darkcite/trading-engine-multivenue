@@ -5,7 +5,9 @@
 //! between, and the foreign switch pins. LOAD-TIME ONLY (DOCTRINE law 2): allocates freely.
 //!
 //! `PINS` is exactly the rows of §4.9.2–§4.9.3 and §4.9.6–§4.9.7 (94 names, §4.9.8 — the 94th,
-//! `pin:06-na-object-field`, is R-P2's, 2026-10-17); a row's ids are
+//! `pin:06-na-object-field`, is R-P2's, 2026-10-17) plus r29's ten (the capture session's
+//! history-tick, tier-3 and R-P15 pins: `pin:U17-hist-close-isnew`, five `pin:05-hist-tick-*`,
+//! four `pin:04-*`; 104, pending the §4.9 linkage pass); a row's ids are
 //! split by the fixture's declared `dialects`. Where a row's fixture list is narrower than the
 //! generator's assignment, the generator's is kept and the widening is pinned:
 //! * `pin:06-na-compare-v6-bool` — `pin:06-na-compare` also lists A085/A086 (the v6 bool row's
@@ -339,7 +341,7 @@ pub static PINS: &[Pin] = &[
         name: "pin:U15-float-div-zero",
         v5: &[],
         v6: &[],
-        both: &["F005", "F007", "F008", "F009", "F041"],
+        both: &["F005", "F007", "F008", "F009", "F041", "F118"],
         // R-P2: `refuse_literal` is F007's (a literal `/ 0.0` is a compile refusal on TradingView).
         readings: &["na", "ieee", "refuse_literal"],
     },
@@ -356,6 +358,15 @@ pub static PINS: &[Pin] = &[
         v6: &[],
         both: &["C044", "C045"],
         readings: &["contract", "isnew_on_confirm"],
+    },
+    // r29 (CAR-D1, R-P6): the bar column's `isnew` on a history bar's bar-close run when the
+    // script sets `calc_on_every_history_tick` — provisional `close_isnew`.
+    Pin {
+        name: "pin:U17-hist-close-isnew",
+        v5: &[],
+        v6: &["E123"],
+        both: &[],
+        readings: &["close_isnew", "close_not_new"],
     },
     Pin {
         name: "pin:U18-ta-na-propagation",
@@ -380,7 +391,7 @@ pub static PINS: &[Pin] = &[
         name: "pin:06-mod-sign",
         v5: &[],
         v6: &[],
-        both: &["F004", "F039"],
+        both: &["F004", "F039", "F115", "F116"],
         readings: &["floored", "truncated"],
     },
     Pin {
@@ -477,8 +488,9 @@ pub static PINS: &[Pin] = &[
         name: "pin:05-margin-funds-check",
         v5: &[],
         v6: &[],
-        both: &["E055", "E071", "E072"],
-        readings: &[],
+        both: &["E055", "E071", "E072", "E132"],
+        // r29: CI-042's probe (E132) names the readings (`readings::BROKER_READINGS`).
+        readings: &["reject", "reduce", "fill_whole"],
     },
     Pin {
         name: "pin:05-qty-rounding",
@@ -491,8 +503,8 @@ pub static PINS: &[Pin] = &[
         name: "pin:05-bad-qty",
         v5: &[],
         v6: &[],
-        both: &["E056"],
-        readings: &["refuse_literal"],
+        both: &["E056", "E128"],
+        readings: &["refuse_literal", "runtime_fault", "ignored"],
     },
     Pin {
         name: "pin:05-cof-close-tick",
@@ -536,8 +548,9 @@ pub static PINS: &[Pin] = &[
         name: "pin:05-price-rounding",
         v5: &[],
         v6: &[],
-        both: &["E113"],
-        readings: &["nearest_tick", "none"],
+        both: &["E113", "E129", "E130", "E131"],
+        // r29 (R-P12): FloorTick is the provisional default; sells and stops add `ceil_tick`.
+        readings: &["nearest_tick", "none", "floor_tick", "ceil_tick"],
     },
     Pin {
         name: "pin:05-openprofit-fees",
@@ -587,6 +600,46 @@ pub static PINS: &[Pin] = &[
         v6: &[],
         both: &["E120", "E121"],
         readings: &["at_limit", "at_start"],
+    },
+    // r29 (R-P6, impl-05 §4.8.9): the history-tick pins, provisional default first.
+    Pin {
+        name: "pin:05-hist-tick-runs",
+        v5: &[],
+        v6: &["E122"],
+        both: &[],
+        readings: &[
+            "three_points_and_close",
+            "four_ticks_and_close",
+            "extremes_and_close",
+        ],
+    },
+    Pin {
+        name: "pin:05-hist-tick-next-point",
+        v5: &[],
+        v6: &["E124"],
+        both: &[],
+        readings: &["next_point", "bar_close", "next_bar_open"],
+    },
+    Pin {
+        name: "pin:05-hist-tick-immediately",
+        v5: &[],
+        v6: &["E125"],
+        both: &[],
+        readings: &["same_point", "next_point"],
+    },
+    Pin {
+        name: "pin:05-hist-tick-cof",
+        v5: &[],
+        v6: &["E126"],
+        both: &[],
+        readings: &["cof_first", "tick_first", "merged"],
+    },
+    Pin {
+        name: "pin:05-hist-tick-fill-first",
+        v5: &[],
+        v6: &["E127"],
+        both: &[],
+        readings: &["fill_then_run", "run_then_fill"],
     },
     Pin {
         name: "pin:00-rma-seed",
@@ -753,8 +806,14 @@ pub static PINS: &[Pin] = &[
         name: "pin:02-for-step",
         v5: &[],
         v6: &[],
-        both: &["F085"],
-        readings: &["refuse_dynamic", "runtime_abs", "runtime_fault"],
+        both: &["F085", "F119"],
+        readings: &[
+            "refuse_dynamic",
+            "runtime_abs",
+            "runtime_fault",
+            "na_default",
+            "no_loop",
+        ],
     },
     Pin {
         name: "pin:02-fn-global-assign",
@@ -829,9 +888,40 @@ pub static PINS: &[Pin] = &[
     Pin {
         name: "pin:04-collection-edges",
         v5: &["F065", "F067", "F069", "F071", "A078"],
-        v6: &["F066", "F068", "F070", "F072", "A094"],
-        both: &["A014", "A030", "A046", "A062"],
+        v6: &["F066", "F068", "F070", "F072", "A094", "F108"],
+        both: &[
+            "A014", "A030", "A046", "A062", "F099", "F100", "F101", "F102", "F105", "F107", "F114",
+        ],
         readings: &[],
+    },
+    // r29 (R-P5, R-P15): the tier-3 pins the capture decides, pine-std's reading first.
+    Pin {
+        name: "pin:04-percentile-linear-c-half",
+        v5: &[],
+        v6: &[],
+        both: &["F103", "F104"],
+        readings: &["c_half", "c_zero", "c_one"],
+    },
+    Pin {
+        name: "pin:04-binary-search",
+        v5: &[],
+        v6: &[],
+        both: &["F106"],
+        readings: &["minus_one", "zero"],
+    },
+    Pin {
+        name: "pin:04-udt-sort-ties",
+        v5: &[],
+        v6: &["F110"],
+        both: &[],
+        readings: &["stable", "heap_order"],
+    },
+    Pin {
+        name: "pin:04-udt-sort-na-object",
+        v5: &[],
+        v6: &["F112"],
+        both: &[],
+        readings: &["runtime_fault", "na_last", "na_first"],
     },
     Pin {
         name: "pin:04-strategy-edges",
@@ -908,6 +998,11 @@ pub static FOREIGN_SWITCH_PINS: &[(&str, &str)] = &[
     ("pin:05-trade-trim", "impl-05"),
     ("pin:05-v5-order-limit", "impl-05"),
     ("pin:05-fill-limits", "impl-05"),
+    ("pin:05-hist-tick-runs", "impl-05"),
+    ("pin:05-hist-tick-next-point", "impl-05"),
+    ("pin:05-hist-tick-immediately", "impl-05"),
+    ("pin:05-hist-tick-cof", "impl-05"),
+    ("pin:05-hist-tick-fill-first", "impl-05"),
     ("pin:00-rma-seed", "impl-00"),
     ("pin:00-dataset-start", "impl-00"),
     ("pin:00-color-consts", "impl-00"),
@@ -941,6 +1036,10 @@ pub static FOREIGN_SWITCH_PINS: &[(&str, &str)] = &[
     ("pin:04-string-edges", "impl-04"),
     ("pin:04-color-edges", "impl-04"),
     ("pin:04-collection-edges", "impl-04"),
+    ("pin:04-percentile-linear-c-half", "impl-04"),
+    ("pin:04-binary-search", "impl-04"),
+    ("pin:04-udt-sort-ties", "impl-04"),
+    ("pin:04-udt-sort-na-object", "impl-04"),
     ("pin:04-strategy-edges", "impl-04"),
     ("pin:04-exchange-tz", "impl-04"),
     ("pin:04-time-edges", "impl-04"),

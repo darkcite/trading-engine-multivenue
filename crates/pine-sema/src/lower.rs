@@ -1162,28 +1162,10 @@ impl Lower<'_> {
             Callee::User(ti) => return self.inline(n, ti as usize, ty),
             Callee::Udt(decl) => return self.udt_call(n, decl, ty),
         };
-        let Node::Call { args, .. } = self.ast.node(n) else {
+        if !matches!(self.ast.node(n), Node::Call { .. }) {
             return Err(self.todo(n, "a call node"));
-        };
-        let bound = self
-            .cur()
-            .bound
-            .iter()
-            .find(|b| b.0 == n)
-            .map(|b| b.1.clone())
-            .unwrap_or_default();
-        // (parameter row, value node), sorted by row.
-        let mut given: Vec<(u16, NodeId)> = Vec::with_capacity(args.len());
-        for (k, &a) in args.iter().enumerate() {
-            if let Some(row) = bound.get(k).copied().flatten() {
-                let v = match self.ast.node(a) {
-                    Node::NamedArg { value, .. } => value,
-                    _ => a,
-                };
-                given.push((row, v));
-            }
         }
-        given.sort_by_key(|g| g.0);
+        let given = self.given(n);
         let o = pine_spec::overload(ov);
         let full = pine_spec::entry_of(o).full_str();
         if o.abi == pine_spec::Abi::Folded {
@@ -1365,31 +1347,17 @@ impl Lower<'_> {
     /// folds; their text is kept raw and resolved in 5a against the options.
     fn security(&mut self, n: NodeId, ov: OverloadId, hints: &[TypeQ]) -> Result<Vec<VSlot>, Diag> {
         let at = self.ast.span(n);
-        let Node::Call { args, .. } = self.ast.node(n) else {
+        if !matches!(self.ast.node(n), Node::Call { .. }) {
             return Err(self.todo(n, "a call node"));
-        };
-        let bound = self
-            .cur()
-            .bound
-            .iter()
-            .find(|b| b.0 == n)
-            .map(|b| b.1.clone())
-            .unwrap_or_default();
+        }
+        let given = self.given(n);
         let o = pine_spec::overload(ov);
         let ps = pine_spec::params(o);
         let arg = |name: &str| -> Option<NodeId> {
-            for (k, &a) in args.iter().enumerate() {
-                let Some(row) = bound.get(k).copied().flatten() else {
-                    continue;
-                };
-                if ps.get(usize::from(row)).map(|p| p.name.as_str()) == Some(name) {
-                    return Some(match self.ast.node(a) {
-                        Node::NamedArg { value, .. } => value,
-                        _ => a,
-                    });
-                }
-            }
-            None
+            given
+                .iter()
+                .find(|g| ps.get(usize::from(g.0)).map(|p| p.name.as_str()) == Some(name))
+                .map(|g| g.1)
         };
         let (sym_n, tf_n, e_n) = (arg("symbol"), arg("timeframe"), arg("expression"));
         let (gaps_n, look_n) = (arg("gaps"), arg("lookahead"));
@@ -1609,6 +1577,19 @@ impl Lower<'_> {
         self.literal_arg(dv, t, at)
     }
 
+    /// Built-in call `n`'s given arguments as `(parameter row, value node)`, sorted by row; a
+    /// method-form call's receiver binds the first row (`Inst::bound_args`).
+    fn given(&self, n: NodeId) -> Vec<(u16, NodeId)> {
+        let mut given: Vec<(u16, NodeId)> = self
+            .cur()
+            .bound_args(self.ast, n)
+            .into_iter()
+            .filter_map(|(r, v)| Some((r?, v)))
+            .collect();
+        given.sort_by_key(|g| g.0);
+        given
+    }
+
     /// One `CALL_BUILTIN` with its window and one fresh output per `tys` (§4.14.5).
     fn builtin_call(
         &mut self,
@@ -1617,9 +1598,9 @@ impl Lower<'_> {
         tys: &[TypeQ],
     ) -> Result<Vec<VSlot>, Diag> {
         let at = self.ast.span(n);
-        let Node::Call { args, .. } = self.ast.node(n) else {
+        if !matches!(self.ast.node(n), Node::Call { .. }) {
             return Err(self.todo(n, "a call node"));
-        };
+        }
         let bound = self
             .cur()
             .bound
@@ -1627,17 +1608,7 @@ impl Lower<'_> {
             .find(|b| b.0 == n)
             .map(|b| b.1.clone())
             .unwrap_or_default();
-        let mut given: Vec<(u16, NodeId)> = Vec::with_capacity(args.len());
-        for (k, &a) in args.iter().enumerate() {
-            if let Some(row) = bound.get(k).copied().flatten() {
-                let v = match self.ast.node(a) {
-                    Node::NamedArg { value, .. } => value,
-                    _ => a,
-                };
-                given.push((row, v));
-            }
-        }
-        given.sort_by_key(|g| g.0);
+        let given = self.given(n);
         let o = pine_spec::overload(ov);
         self.entry_site(o, &given);
         let first = tys
@@ -2971,15 +2942,10 @@ impl Lower<'_> {
             DefaultSrc::Param { row: r, arg } => match arg {
                 // `shorttitle` ← `title`: the other argument's value.
                 Some(k) => {
-                    let Node::Call { args, .. } = self.ast.node(n) else {
-                        return Err(self.todo(n, "a call node"));
-                    };
-                    let Some(&a) = args.get(usize::from(k)) else {
+                    let Some(&(_, v)) =
+                        crate::infer::bound_args(self.ast, n, bound).get(usize::from(k))
+                    else {
                         return Err(self.todo(n, "a missing argument"));
-                    };
-                    let v = match self.ast.node(a) {
-                        Node::NamedArg { value, .. } => value,
-                        _ => a,
                     };
                     Ok(Arg::Slot(self.value_as(v, t)?))
                 }
@@ -3075,21 +3041,8 @@ impl Lower<'_> {
             let msg = format!("the declaration has no `{name}`");
             return Err(diag(ReasonCode::Internal, at, msg));
         };
-        let bound = root
-            .bound
-            .iter()
-            .find(|b| b.0 == c)
-            .map(|b| b.1.clone())
-            .unwrap_or_default();
-        if let (Some(k), Node::Call { args, .. }) = (
-            bound.iter().position(|&b| b == Some(row as u16)),
-            root_ast.node(c),
-        ) {
-            let a = args[k];
-            let v = match root_ast.node(a) {
-                Node::NamedArg { value, .. } => value,
-                _ => a,
-            };
+        let given = root.bound_args(root_ast, c);
+        if let Some(&(_, v)) = given.iter().find(|g| g.0 == Some(row as u16)) {
             return match root.k.get(v.0 as usize).copied().flatten() {
                 Some(k) => {
                     let ty = root.ty.get(v.0 as usize).copied().flatten().unwrap_or(t);

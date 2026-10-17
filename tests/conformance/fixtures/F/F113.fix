@@ -1,0 +1,23 @@
+fix	2
+id	F113
+group	F
+title	array.sort by a UDT field with an na element
+script	tests/conformance/fixtures/F/F113.pine
+script_sha256	97c4d375bf866c68adbc85f55d3c59512fb584cc235d04a371cdf25781e57ce5
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	syn
+align	step
+dialects	5
+twin	F112
+mode	bar_close
+bars	pending
+window	head	1
+oracle	authored
+tier	3
+plot	f_F113_id0	exact
+plot	f_F113_id1	exact
+plot	f_F113_id2	exact
+refuse	3005

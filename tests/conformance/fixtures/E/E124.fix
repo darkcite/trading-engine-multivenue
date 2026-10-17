@@ -1,0 +1,21 @@
+fix	2
+id	E124
+group	E
+title	a market entry created at a history tick
+pin	pin:05-hist-tick-next-point
+script	tests/conformance/fixtures/E/E124.pine
+script_sha256	0d380d2ab0b73dbef454a3681b51a702c87bbf9d5f7d6b78b2918e59fe0fffb5
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	6
+mode	realtime
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E124_pos	exact
+pending

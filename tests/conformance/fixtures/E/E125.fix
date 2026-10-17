@@ -1,0 +1,21 @@
+fix	2
+id	E125
+group	E
+title	strategy.close immediately at a history tick
+pin	pin:05-hist-tick-immediately
+script	tests/conformance/fixtures/E/E125.pine
+script_sha256	8412052df6c45e1ab696acf003ad6c2a6cfb64b05d6729b1646d4fb6fa035ef9
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	6
+mode	realtime
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E125_pos	exact
+pending

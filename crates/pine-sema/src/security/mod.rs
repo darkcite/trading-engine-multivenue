@@ -90,23 +90,11 @@ pub(crate) fn check(
 
 fn bound_args(ast: &Ast, inst: &Inst, n: NodeId, ov: pine_ir::OverloadId) -> Vec<ArgOf> {
     let ps = pine_spec::params(pine_spec::overload(ov));
-    let rows = inst
-        .bound
-        .iter()
-        .find(|b| b.0 == n)
-        .map(|b| b.1.clone())
-        .unwrap_or_default();
-    let Node::Call { args, .. } = ast.node(n) else {
-        return Vec::new();
-    };
-    let mut out = Vec::with_capacity(args.len());
-    for (i, &a) in args.iter().enumerate() {
-        let Some(Some(r)) = rows.get(i).copied() else {
+    let given = inst.bound_args(ast, n);
+    let mut out = Vec::with_capacity(given.len());
+    for (r, v) in given {
+        let Some(r) = r else {
             continue;
-        };
-        let v = match ast.node(a) {
-            Node::NamedArg { value, .. } => value,
-            _ => a,
         };
         out.push(ArgOf {
             name: ps[usize::from(r)].name.as_str(),

@@ -1,0 +1,22 @@
+fix	2
+id	E127
+group	E
+title	a fill at a path point seen by that point's run
+pin	pin:05-hist-tick-fill-first
+script	tests/conformance/fixtures/E/E127.pine
+script_sha256	0216294bfe27e2a621ec921b2069fde347d6790ace8ca6bc92c0ab9df8cde948
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	6
+mode	realtime
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E127_pos	exact
+plot	f_E127_p1	exact
+pending

@@ -1,4 +1,4 @@
-# fix 2 · pine-conf gen · A 96 B 124 C 46 D 62 E 121 F 98 Z 19 · total 566
+# fix 2 · pine-conf gen · A 96 B 124 C 46 D 62 E 132 F 119 Z 19 · total 598
 A001	A	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/A/A001.pine	2026-10-17T04:23Z
 A002	A	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/A/A002.pine	2026-10-17T04:23Z
 A003	A	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/A/A003.pine	2026-10-17T04:23Z
@@ -448,6 +448,17 @@ E118	E	56	tv	synsig	time	bar_close	1	pin:04-strategy-edges	tests/conformance/fix
 E119	E	56	declined	synsig	time	bar_close	1	-	tests/conformance/fixtures/E/E119.pine	n/a
 E120	E	56	tv	synsig	time	bar_close	1	pin:05-fill-limits	tests/conformance/fixtures/E/E120.pine	2026-10-17T06:36Z
 E121	E	56	tv	synsig	time	bar_close	1	pin:05-fill-limits	tests/conformance/fixtures/E/E121.pine	2026-10-17T06:36Z
+E122	E	6	tv	syn	step	realtime	1	pin:05-hist-tick-runs	tests/conformance/fixtures/E/E122.pine	pending
+E123	E	6	tv	syn	step	realtime	1	pin:U17-hist-close-isnew	tests/conformance/fixtures/E/E123.pine	pending
+E124	E	6	tv	synsig	time	realtime	1	pin:05-hist-tick-next-point	tests/conformance/fixtures/E/E124.pine	pending
+E125	E	6	tv	synsig	time	realtime	1	pin:05-hist-tick-immediately	tests/conformance/fixtures/E/E125.pine	pending
+E126	E	6	tv	synsig	time	realtime	1	pin:05-hist-tick-cof	tests/conformance/fixtures/E/E126.pine	pending
+E127	E	6	tv	synsig	time	realtime	1	pin:05-hist-tick-fill-first	tests/conformance/fixtures/E/E127.pine	pending
+E128	E	56	tv	syn	step	bar_close	1	pin:05-bad-qty	tests/conformance/fixtures/E/E128.pine	pending
+E129	E	56	tv	synsig	time	bar_close	1	pin:05-price-rounding	tests/conformance/fixtures/E/E129.pine	pending
+E130	E	56	tv	synsig	time	bar_close	1	pin:05-price-rounding	tests/conformance/fixtures/E/E130.pine	pending
+E131	E	56	tv	synsig	time	bar_close	1	pin:05-price-rounding	tests/conformance/fixtures/E/E131.pine	pending
+E132	E	56	tv	synsig	time	bar_close	1	pin:05-margin-funds-check	tests/conformance/fixtures/E/E132.pine	pending
 F001	F	56	tv	syn	step	bar_close	1	pin:W1-int-div	tests/conformance/fixtures/F/F001.pine	2026-10-17T06:40Z
 F002	F	56	tv	syn	step	bar_close	1	pin:W1-int-div	tests/conformance/fixtures/F/F002.pine	2026-10-17T06:40Z
 F003	F	56	tv	syn	step	bar_close	1	pin:W1-int-div	tests/conformance/fixtures/F/F003.pine	2026-10-17T06:40Z
@@ -546,6 +557,27 @@ F095	F	56	tv	syn	step	bar_close	1	pin:04-time-edges	tests/conformance/fixtures/F
 F096	F	56	tv	syn	step	bar_close	1	pin:10-shell-decl-args	tests/conformance/fixtures/F/F096.pine	2026-10-17T06:38Z
 F097	F	56	tv	syn	step	bar_close	1	pin:10-shell-decl-args	tests/conformance/fixtures/F/F097.pine	2026-10-17T06:39Z
 F098	F	56	tv	syn	step	bar_close	1	pin:03-float-mod	tests/conformance/fixtures/F/F098.pine	2026-10-17T04:39Z
+F099	F	56	tv	syn	step	bar_close	3	pin:04-collection-edges	tests/conformance/fixtures/F/F099.pine	pending
+F100	F	56	tv	syn	step	bar_close	3	pin:04-collection-edges	tests/conformance/fixtures/F/F100.pine	pending
+F101	F	56	tv	syn	step	bar_close	3	pin:04-collection-edges	tests/conformance/fixtures/F/F101.pine	pending
+F102	F	56	tv	syn	step	bar_close	3	pin:04-collection-edges	tests/conformance/fixtures/F/F102.pine	pending
+F103	F	56	tv	syn	step	bar_close	3	pin:04-percentile-linear-c-half	tests/conformance/fixtures/F/F103.pine	pending
+F104	F	56	tv	syn	step	bar_close	1	pin:04-percentile-linear-c-half	tests/conformance/fixtures/F/F104.pine	pending
+F105	F	56	tv	syn	step	bar_close	3	pin:04-collection-edges	tests/conformance/fixtures/F/F105.pine	pending
+F106	F	56	tv	syn	step	bar_close	3	pin:04-binary-search	tests/conformance/fixtures/F/F106.pine	pending
+F107	F	56	tv	syn	step	bar_close	3	pin:04-collection-edges	tests/conformance/fixtures/F/F107.pine	pending
+F108	F	6	tv	syn	step	bar_close	3	pin:04-collection-edges	tests/conformance/fixtures/F/F108.pine	pending
+F109	F	5	authored	syn	step	bar_close	3	-	tests/conformance/fixtures/F/F109.pine	n/a
+F110	F	6	tv	syn	step	bar_close	3	pin:04-udt-sort-ties	tests/conformance/fixtures/F/F110.pine	pending
+F111	F	5	authored	syn	step	bar_close	3	-	tests/conformance/fixtures/F/F111.pine	n/a
+F112	F	6	tv	syn	step	bar_close	3	pin:04-udt-sort-na-object	tests/conformance/fixtures/F/F112.pine	pending
+F113	F	5	authored	syn	step	bar_close	3	-	tests/conformance/fixtures/F/F113.pine	n/a
+F114	F	56	tv	syn	step	bar_close	3	pin:04-collection-edges	tests/conformance/fixtures/F/F114.pine	pending
+F115	F	56	tv	syn	step	bar_close	1	pin:06-mod-sign	tests/conformance/fixtures/F/F115.pine	pending
+F116	F	56	tv	syn	step	bar_close	1	pin:06-mod-sign	tests/conformance/fixtures/F/F116.pine	pending
+F117	F	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/F/F117.pine	pending
+F118	F	56	tv	syn	step	bar_close	1	pin:U15-float-div-zero	tests/conformance/fixtures/F/F118.pine	pending
+F119	F	56	tv	syn	step	bar_close	1	pin:02-for-step	tests/conformance/fixtures/F/F119.pine	pending
 Z001	Z	6	tv	syn	step	bar_close	1	pin:01-mixed-indent	crates/pine-lang/tests/probes/p01_mixed_indent.pine	2026-10-17T03:53Z
 Z002	Z	6	tv	syn	step	bar_close	1	pin:01-bracket-wrap	crates/pine-lang/tests/probes/p02_bracket_wrap_v6.pine	2026-10-17T03:53Z
 Z003	Z	5	tv	syn	step	bar_close	1	pin:01-bracket-wrap	crates/pine-lang/tests/probes/p03_bracket_wrap_v5.pine	2026-10-17T03:53Z

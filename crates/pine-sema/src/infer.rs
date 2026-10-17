@@ -85,6 +85,41 @@ pub(crate) struct Inst {
     pub(crate) ret_tuple: Vec<TypeQ>,
 }
 
+impl Inst {
+    /// Built-in call `n`'s arguments with the rows they bind ([`bound_args`]); empty for a call
+    /// typing recorded no rows for.
+    pub(crate) fn bound_args(&self, ast: &Ast, n: NodeId) -> Vec<(Option<u16>, NodeId)> {
+        match self.bound.iter().find(|b| b.0 == n) {
+            Some((_, rows)) => bound_args(ast, n, rows),
+            None => Vec::new(),
+        }
+    }
+}
+
+/// Built-in call `n`'s arguments in the order its `rows` index (`Picked::bound`, the `arg` of
+/// `overload::default_src`): `(row, value node)` per argument, row `None` for a dropped v5
+/// repeat, a named argument as its value. A method-form call `recv.m(…)` binds its receiver as
+/// argument 0 (`Infer::call` inserts it before `method_call`) and its written arguments after it,
+/// so its rows are one more than the written arguments.
+pub(crate) fn bound_args(ast: &Ast, n: NodeId, rows: &[Option<u16>]) -> Vec<(Option<u16>, NodeId)> {
+    let Node::Call { callee, args, .. } = ast.node(n) else {
+        return Vec::new();
+    };
+    let recv = match ast.node(callee) {
+        Node::Field { base, .. } if rows.len() == args.len() + 1 => Some(base),
+        _ => None,
+    };
+    debug_assert!(rows.len() == args.len() + usize::from(recv.is_some()));
+    let written = args.iter().map(|&a| match ast.node(a) {
+        Node::NamedArg { value, .. } => value,
+        _ => a,
+    });
+    rows.iter()
+        .copied()
+        .zip(recv.into_iter().chain(written))
+        .collect()
+}
+
 /// Everything pass 3 learned.
 #[derive(Debug)]
 pub(crate) struct Typed {
@@ -2045,20 +2080,13 @@ impl<'a, 's> Infer<'a, 's> {
     ) -> Option<Vec<TypeQ>> {
         let ps = pine_spec::params(ov);
         let ast = self.ast();
-        let Node::Call { args, .. } = ast.node(n) else {
-            return None;
-        };
-        for (k, &a) in args.iter().enumerate() {
-            let Some(Some(r)) = bound.get(k).copied() else {
+        for (r, v) in bound_args(ast, n, bound) {
+            let Some(r) = r else {
                 continue;
             };
             if ps.get(usize::from(r)).map(|p| p.name.as_str()) != Some("expression") {
                 continue;
             }
-            let v = match ast.node(a) {
-                Node::NamedArg { value, .. } => value,
-                _ => a,
-            };
             let Node::Tuple { items } = ast.node(v) else {
                 return None;
             };

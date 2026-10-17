@@ -131,24 +131,12 @@ struct Args<'a> {
 impl<'a> Args<'a> {
     /// The value node of the argument bound to parameter `name`.
     fn node(&self, name: &str) -> Option<NodeId> {
-        let s = self.s?;
-        let Node::Call { args, .. } = self.ast.node(s) else {
-            return None;
-        };
-        let (_, bound) = self.root.bound.iter().find(|b| b.0 == s)?;
         let ps = pine_spec::params(pine_spec::overload(self.ov));
-        for (k, &a) in args.iter().enumerate() {
-            let Some(row) = bound.get(k).copied().flatten() else {
-                continue;
-            };
-            if ps[row as usize].name.as_str() == name {
-                return Some(match self.ast.node(a) {
-                    Node::NamedArg { value, .. } => value,
-                    _ => a,
-                });
-            }
-        }
-        None
+        self.root
+            .bound_args(self.ast, self.s?)
+            .into_iter()
+            .find(|&(r, _)| r.is_some_and(|r| ps[r as usize].name.as_str() == name))
+            .map(|(_, v)| v)
     }
 
     /// `(value, the argument's span)`: the folded argument, else the dialect's default row (no

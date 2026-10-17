@@ -106,12 +106,14 @@ fn group_e_market_cycles_in_range() {
 #[test]
 fn group_e_is_121_and_laid_out() {
     let cells = group_e::cells();
-    assert_eq!(cells.len(), 121);
+    // r29 (2026-10-17): E122–E132 appended (history ticks E122–E127 compile `realtime`; E122,
+    // E123 and E128 are `Syn` plots-only rows, `align step`).
+    assert_eq!(cells.len(), 132);
     for (i, c) in cells.iter().enumerate() {
         let n = i as u16 + 1;
         assert_eq!(c.script.id, FixtureId::from_parts(Group::E, n), "dense");
         let realtime_tim = (15..=32).contains(&n) && (n - 15) % 3 > 0;
-        let rt = matches!(n, 105 | 106) || realtime_tim;
+        let rt = matches!(n, 105 | 106 | 122..=127) || realtime_tim;
         assert_eq!(
             c.run.mode == ExecMode::Realtime,
             rt,
@@ -125,6 +127,20 @@ fn group_e_is_121_and_laid_out() {
                 assert_eq!(c.window, Window::Tail(64));
                 assert!(c.script.plots.iter().all(|p| p.1 != "pos"));
             }
+            122 | 123 => {
+                assert_eq!(c.run.driver, Driver::Syn);
+                assert_eq!(c.run.align, Align::Step);
+                assert_eq!(c.window, Window::Head(64));
+                assert_eq!(c.script.dialects, Dialects::V6);
+                assert!(c.script.plots.iter().all(|p| p.1 != "pos"));
+                assert!(c.readings.len() >= 2, "E{n:03}: readings before capture");
+            }
+            128 => {
+                assert_eq!(c.run.driver, Driver::Syn);
+                assert_eq!(c.window, Window::Head(2));
+                assert_eq!(c.script.plots[0].1, "pos");
+                assert_eq!(c.readings.len(), 3);
+            }
             106 => {
                 assert_eq!(c.run.driver, Driver::Rt);
                 assert_eq!(c.oracle, Oracle::TvOnly);
@@ -135,6 +151,10 @@ fn group_e_is_121_and_laid_out() {
                 assert_eq!(c.script.plots[0].1, "pos");
             }
         }
+    }
+    // r29: `calc_on_every_history_tick` is a v6-only parameter — the history-tick rows are v6.
+    for n in 122..=127usize {
+        assert_eq!(cells[n - 1].script.dialects, Dialects::V6, "E{n:03}");
     }
     let ds = |n: usize| cells[n - 1].script.dialects;
     assert_eq!((ds(69), ds(70)), (Dialects::V5, Dialects::V6));
@@ -177,6 +197,17 @@ fn group_e_is_121_and_laid_out() {
         (117, "pin:05-close-all-keeps-pending"),
         (118, "pin:04-strategy-edges"),
         (121, "pin:05-fill-limits"),
+        (122, "pin:05-hist-tick-runs"),
+        (123, "pin:U17-hist-close-isnew"),
+        (124, "pin:05-hist-tick-next-point"),
+        (125, "pin:05-hist-tick-immediately"),
+        (126, "pin:05-hist-tick-cof"),
+        (127, "pin:05-hist-tick-fill-first"),
+        (128, "pin:05-bad-qty"),
+        (129, "pin:05-price-rounding"),
+        (130, "pin:05-price-rounding"),
+        (131, "pin:05-price-rounding"),
+        (132, "pin:05-margin-funds-check"),
     ] {
         assert!(pinned(n, p), "E{n:03} {p}");
     }

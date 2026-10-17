@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! Group E — the broker (impl-06 §4.2.5, E001–E121). GENERATOR-TIME ONLY.
+//! Group E — the broker (impl-06 §4.2.5, E001–E121; r29 appends E122–E132). GENERATOR-TIME ONLY.
 //!
 //! `Driver::SynSig` (SYN-T decides *when*, the chart *at what price*), `align time`,
 //! `window time FROM_MS TO_MS`, `dialects 56`, `mode bar_close`, oracle `tv` (body pending until
@@ -51,7 +51,9 @@ use super::emit::{self, Line, Prelude, Script};
 use super::group_c::RT_DEFAULT;
 use super::{Cell, Run};
 use crate::chart::{spec, STOP_MS};
-use crate::fixture::{Align, Dialects, Driver, Expect, FixtureId, Group, Oracle, Tol, Window};
+use crate::fixture::{
+    Align, Dialects, Driver, Expect, FixtureId, Group, Oracle, Reading, ReadingBody, Tol, Window,
+};
 use crate::syn::SynSeq;
 
 /// `CurrencyConversion` (CAR-02-1): E119's declined code.
@@ -172,6 +174,10 @@ struct Row {
     window: Window,
     prelude: bool,
     kind: Option<Kind>,
+    /// SYN-1 instead of SYN-T (the r29 `Syn` history-tick rows read `_n`, never `time`, I5).
+    syn1: bool,
+    /// Authored readings (r29: the rows whose readings need no chart price, §4.9.4).
+    readings: Vec<Reading>,
 }
 
 fn synsig() -> Run {
@@ -355,6 +361,8 @@ fn row(n: u16, title: &str, hdr: Hdr, mut body: Vec<String>, kind: Option<Kind>)
         },
         prelude: true,
         kind,
+        syn1: false,
+        readings: Vec::new(),
     }
 }
 
@@ -1171,6 +1179,265 @@ fn part2() -> Vec<Row> {
     o
 }
 
+/// The r29 history-tick header (R-P6, CAR-D1): `calc_on_every_history_tick` is a v6-only
+/// parameter of a both-dialect overload, so the rows are `dialects 6` (§4.3 rule 2 names
+/// overloads; no twin) and compile `mode realtime` (a `bar_close` compilation is `3052`).
+const HIST_TICK: &str = "calc_on_every_history_tick = true";
+
+/// E105's per-bar execution counter (reset when `time` changes).
+const TIME_CTR: [&str; 6] = [
+    "varip int k@ = 0",
+    "varip int tl@ = 0",
+    "if time != tl@",
+    ">tl@ := time",
+    ">k@ := 0",
+    "k@ := k@ + 1",
+];
+
+/// E122 / E123's counters on SYN-1: a bar is new when `_n` (a `var`, so constant over a bar's
+/// rolled-back executions) changes — `time` is a bar field (I5). `pin:06-r29-syn-hist-reset`.
+const SYN_CTR: [&str; 14] = [
+    "varip int k@ = 0",
+    "varip int nl@ = 0",
+    "varip int cf@ = 0",
+    "varip int tn@ = 0",
+    "if _n != nl@",
+    ">nl@ := _n",
+    ">k@ := 0",
+    ">cf@ := 0",
+    ">tn@ := 0",
+    "k@ := k@ + 1",
+    "if barstate.isconfirmed",
+    ">cf@ := cf@ + 1",
+    "if barstate.isnew and not barstate.isconfirmed",
+    ">tn@ := tn@ + 1",
+];
+
+/// `head 64` rows of one constant pair per row (the history-tick readings, §4.9.4).
+fn const_rows(name: &str, v: [f64; 2]) -> Reading {
+    let rows = (0..64).map(|i| super::readings::row(i, &v)).collect();
+    Reading {
+        name: name.to_string(),
+        body: ReadingBody::Rows(rows),
+    }
+}
+
+/// E122–E132 (r29): history ticks (R-P6), the `strategy.order` negative-`qty` probe (R-P2), the
+/// off-grid sell-limit / stop probes (R-P12) and CI-042's default sizing. Readings: E122, E123,
+/// E128 carry blocks; the rest predict trade rows and are named in `readings::BROKER_READINGS`.
+fn part3() -> Vec<Row> {
+    let mut o = Vec::new();
+    // E-hist (E122, E123): `Syn`, plots only, no orders.
+    for (n, title, pin, plots) in [
+        (
+            122u16,
+            "executions per history bar under calc_on_every_history_tick",
+            "pin:05-hist-tick-runs",
+            [("k@", "runs"), ("cf@", "conf")],
+        ),
+        (
+            123,
+            "barstate.isnew at a history bar's close and on its ticks",
+            "pin:U17-hist-close-isnew",
+            [("barstate.isnew ? 1 : 0", "closenew"), ("tn@", "tnew")],
+        ),
+    ] {
+        let mut h = Hdr::base();
+        h.extra = vec![HIST_TICK];
+        let b = s(&SYN_CTR);
+        let mut r = row(n, title, h, b, None);
+        r.body.truncate(r.body.len() - 3);
+        r.prelude = false;
+        r.syn1 = true;
+        r.ds = Dialects::V6;
+        r.window = Window::Head(64);
+        r.run = Run {
+            mode: ExecMode::Realtime,
+            ..Run::default()
+        };
+        r.plots = plots
+            .iter()
+            .map(|(e, k)| (e.to_string(), k.to_string()))
+            .collect();
+        r.readings = if n == 122 {
+            super::readings::HIST_TICK_RUNS
+                .iter()
+                .map(|(name, v)| const_rows(name, *v))
+                .collect()
+        } else {
+            super::readings::HIST_TICK_ISNEW
+                .iter()
+                .map(|(name, v)| const_rows(name, *v))
+                .collect()
+        };
+        r.pins.push(pin);
+        o.push(r);
+    }
+    // E-hist (E124–E127): SynSig, trades compared.
+    let hist = |n: u16, title: &str, pin: &'static str, cof: bool, body: Vec<String>| {
+        let mut h = Hdr::base();
+        h.on_fills = cof;
+        h.extra = vec![HIST_TICK];
+        let mut b = s(&TIME_CTR);
+        b.extend(body);
+        let mut r = row(n, title, h, b, None);
+        r.ds = Dialects::V6;
+        r.run.mode = ExecMode::Realtime;
+        r.pins.push(pin);
+        r
+    };
+    let flat_k1 = format!("{} and k@ == 1", and(ON_LO, FLAT));
+    let mut b = when(&flat_k1, &["strategy.entry(\"L1\", strategy.long)"]);
+    b.extend(when(
+        &format!("{} and k@ == 1", and(ON_HI, LONG)),
+        &["strategy.close(\"L1\")"],
+    ));
+    o.push(hist(
+        124,
+        "a market entry created at a history tick",
+        "pin:05-hist-tick-next-point",
+        false,
+        b,
+    ));
+    let conf_lo = format!("{} and barstate.isconfirmed", and(ON_LO, FLAT));
+    let conf_hi = format!("{} and barstate.isconfirmed", and(ON_HI, LONG));
+    let mut b = when(&conf_lo, &["strategy.entry(\"L1\", strategy.long)"]);
+    b.extend(when(
+        &format!("{} and k@ == 2", and(ON_HI, LONG)),
+        &["strategy.close(\"L1\", immediately = true)"],
+    ));
+    o.push(hist(
+        125,
+        "strategy.close immediately at a history tick",
+        "pin:05-hist-tick-immediately",
+        false,
+        b,
+    ));
+    let mut b = s(&["varip float c1@ = na", "if k@ == 1", ">c1@ := close"]);
+    b.extend(when(&conf_lo, &["strategy.entry(\"L1\", strategy.long)"]));
+    b.extend(when(&conf_hi, &["strategy.close(\"L1\")"]));
+    let mut r = hist(
+        126,
+        "history ticks with calc_on_order_fills",
+        "pin:05-hist-tick-cof",
+        true,
+        b,
+    );
+    r.plots.extend([
+        ("k@".to_string(), "runs".to_string()),
+        ("c1@ == close ? 1 : 0".to_string(), "first".to_string()),
+    ]);
+    o.push(r);
+    let mut b = s(&[
+        "varip float p1@ = 0.0",
+        "if k@ == 1",
+        ">p1@ := strategy.position_size",
+    ]);
+    b.extend(when(&conf_lo, &["strategy.entry(\"L1\", strategy.long)"]));
+    b.extend(when(&conf_hi, &["strategy.close(\"L1\")"]));
+    let mut r = hist(
+        127,
+        "a fill at a path point seen by that point's run",
+        "pin:05-hist-tick-fill-first",
+        false,
+        b,
+    );
+    r.plots.push(("p1@".to_string(), "p1".to_string()));
+    o.push(r);
+    // E-r-p2 (E128): `Syn`, the order on every step; readings need no price.
+    let b = s(&["strategy.order(\"L\", strategy.long, qty = -1)"]);
+    let mut r = row(
+        128,
+        "strategy.order with a negative qty",
+        Hdr::base(),
+        b,
+        None,
+    );
+    r.body.truncate(r.body.len() - 3);
+    r.prelude = false;
+    r.window = Window::Head(2);
+    r.run = Run::default();
+    let rows = (0..2).map(|i| super::readings::row(i, &[0.0])).collect();
+    r.readings = vec![
+        Reading {
+            name: "refuse_literal".to_string(),
+            body: ReadingBody::Refuse(super::readings::R_P2_REFUSE),
+        },
+        Reading {
+            name: "runtime_fault".to_string(),
+            body: ReadingBody::Fault {
+                kind: pine_ir::FaultKind::ScriptRefused,
+                row: 0,
+            },
+        },
+        Reading {
+            name: "ignored".to_string(),
+            body: ReadingBody::Rows(rows),
+        },
+    ];
+    r.pins.push("pin:05-bad-qty");
+    o.push(r);
+    // E-round (E129–E131): off-grid sell limit, sell stop, buy stop; the offset alternates
+    // between .4 and .6 of a tick (by `syni`'s parity at the signal) so each order kind alone
+    // separates FloorTick, NearestTick and CeilTick (`readings::BROKER_READINGS`).
+    let off = |a: &str, b2: &str| format!("off@ := syni % 2 == 0 ? {a} : {b2}");
+    let mut b = s(&["var float off@ = 12.4"]);
+    b.extend(when(
+        &and(ON_LO, FLAT),
+        &[
+            &off("12.4", "12.6"),
+            "strategy.entry(\"S\", strategy.short, limit = close + off@ * syminfo.mintick)",
+        ],
+    ));
+    b.extend(when(&and(ON_HI, SHORT), &["strategy.close(\"S\")"]));
+    let mut r = row(129, "a sell limit off the tick grid", Hdr::base(), b, None);
+    r.pins.push("pin:05-price-rounding");
+    o.push(r);
+    let mut b = s(&["var float off@ = 20.4"]);
+    b.extend(when(
+        &and(ON_LO, FLAT),
+        &[&off("20.4", "20.6"), "strategy.entry(\"L\", strategy.long)"],
+    ));
+    b.extend(when(
+        LONG,
+        &[concat!(
+            "strategy.exit(\"X\", \"L\", ",
+            "stop = strategy.position_avg_price - off@ * syminfo.mintick)"
+        )],
+    ));
+    b.extend(when(&and(ON_HI, LONG), &["strategy.close(\"L\")"]));
+    let mut r = row(130, "a sell stop off the tick grid", Hdr::base(), b, None);
+    r.pins.push("pin:05-price-rounding");
+    o.push(r);
+    let mut b = s(&["var float off@ = 12.4"]);
+    b.extend(when(
+        &and(ON_LO, FLAT),
+        &[
+            &off("12.4", "12.6"),
+            "strategy.entry(\"L\", strategy.long, stop = close + off@ * syminfo.mintick)",
+        ],
+    ));
+    b.extend(when(&and(ON_HI, LONG), &["strategy.close(\"L\")"]));
+    let mut r = row(131, "a buy stop off the tick grid", Hdr::base(), b, None);
+    r.pins.push("pin:05-price-rounding");
+    o.push(r);
+    // E-size (E132): CI-042 — 100 % of equity at margin 100, a market entry whose fill open may
+    // gap above its order bar's close.
+    let mut h = Hdr::base();
+    h.qty_type = Some("strategy.percent_of_equity");
+    h.qty_value = "100";
+    h.margin = Some(("100", "100"));
+    let mut r = shaped(
+        132,
+        "100 % of equity at margin 100, a market entry",
+        h,
+        Shape::EntryMarket,
+    );
+    r.pins.push("pin:05-margin-funds-check");
+    o.push(r);
+    o
+}
+
 fn line(t: &str, id: FixtureId) -> Line {
     let sfx = format!("_{}", id.as_str());
     let depth = t.bytes().take_while(|&c| c == b'>').count();
@@ -1201,7 +1468,11 @@ fn block(n: u16) -> &'static str {
         111..=117 => "E-pin5",
         118 => "E-edge",
         119 => "E-fx",
-        _ => "E-fill",
+        120..=121 => "E-fill",
+        122..=127 => "E-hist",
+        128 => "E-r-p2",
+        129..=131 => "E-round",
+        _ => "E-size",
     }
 }
 
@@ -1223,7 +1494,9 @@ fn cell(r: Row) -> Cell {
         twin,
         pins: pins.clone(),
         decl: Some(r.hdr.render(id)),
-        prelude: if r.prelude {
+        prelude: if r.syn1 {
+            Prelude::Syn1
+        } else if r.prelude {
             Prelude::SynT {
                 from_ms: spec::FROM_MS,
                 stop_ms: STOP_MS,
@@ -1243,7 +1516,7 @@ fn cell(r: Row) -> Cell {
         window: r.window,
         tols,
         expect: r.expect,
-        readings: Vec::new(),
+        readings: r.readings,
         run: r.run,
     }
 }
@@ -1275,6 +1548,7 @@ fn table_pins(n: u16) -> Vec<&'static str> {
 fn rows() -> Vec<Row> {
     let mut rs = part1();
     rs.extend(part2());
+    rs.extend(part3());
     rs.sort_by_key(|r| r.n);
     for r in &mut rs {
         r.pins.extend(table_pins(r.n));
@@ -1282,7 +1556,7 @@ fn rows() -> Vec<Row> {
     rs
 }
 
-/// Every group-E cell (E001–E121).
+/// Every group-E cell (E001–E121, then r29's E122–E132).
 pub fn cells() -> Vec<Cell> {
     rows().into_iter().map(cell).collect()
 }

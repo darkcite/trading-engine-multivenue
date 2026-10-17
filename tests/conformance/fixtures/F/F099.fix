@@ -1,0 +1,51 @@
+fix	2
+id	F099
+group	F
+title	array core: new push get set pop shift unshift insert remove first last slice concat fill reverse includes indexof lastindexof join
+pin	pin:04-collection-edges
+script	tests/conformance/fixtures/F/F099.pine
+script_sha256	fb601d4bb4db1df5423bdeae52d57d335369456b765f30e0a77392ddd509dd66
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	16
+oracle	tv
+tier	3
+plot	f_F099_size_a_na	exact
+plot	f_F099_size_a	exact
+plot	f_F099_first_a_na	exact
+plot	f_F099_first_a	exact
+plot	f_F099_last_a_na	exact
+plot	f_F099_last_a	exact
+plot	f_F099_pop_na	exact
+plot	f_F099_pop	exact
+plot	f_F099_shift_na	exact
+plot	f_F099_shift	exact
+plot	f_F099_remove_na	exact
+plot	f_F099_remove	exact
+plot	f_F099_size_c_na	exact
+plot	f_F099_size_c	exact
+plot	f_F099_c0_na	exact
+plot	f_F099_c0	exact
+plot	f_F099_size_sl_na	exact
+plot	f_F099_size_sl	exact
+plot	f_F099_sl0_na	exact
+plot	f_F099_sl0	exact
+plot	f_F099_b0_na	exact
+plot	f_F099_b0	exact
+plot	f_F099_b2_na	exact
+plot	f_F099_b2	exact
+plot	f_F099_idx_na	exact
+plot	f_F099_idx	exact
+plot	f_F099_lastidx_na	exact
+plot	f_F099_lastidx	exact
+plot	f_F099_join_na	exact
+plot	f_F099_join	exact
+plot	f_F099_includes	exact
+pending

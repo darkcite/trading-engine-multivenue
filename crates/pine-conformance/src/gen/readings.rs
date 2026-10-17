@@ -480,3 +480,276 @@ pub fn sma_last_n_valid(x: &[f64], len: usize) -> Vec<f64> {
         })
         .collect()
 }
+
+// ---- r29 (2026-10-17): the readings of the next capture session, written before it (§9) --------
+
+/// The `C` of a linearly interpolated percentile (`pin:04-percentile-linear-c-half`, R-P15): the
+/// "linear interpolation between closest ranks" family. With `N` values and `p` in percent, the
+/// 0-based rank is `x = (p · N) / 100 − 1/2` (`Half`, pine-std's `ta.*` default since R-P15),
+/// `(p · (N + 1)) / 100 − 1` (`Zero`) or `(p · (N − 1)) / 100` (`One`, Excel `PERCENTILE.INC`,
+/// pine-std's `array.*` row today), clamped to `[0, N − 1]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PctC {
+    /// `C = 1/2`.
+    Half,
+    /// `C = 0`.
+    Zero,
+    /// `C = 1`.
+    One,
+}
+
+/// `percentile_linear_interpolation` of `vals` (no `na`) at `p` under `c`: the ascending order
+/// statistics `w`, `k = ⌊x⌋`, `w₍ₖ₎ + (x − k) · (w₍ₖ₊₁₎ − w₍ₖ₎)` — pine-std's operation order
+/// (`coll/order.rs` `linear`, `ta/rank.rs` `linear`). `pin:06-twin-pct-form`.
+pub fn pct_linear(vals: &[f64], p: f64, c: PctC) -> f64 {
+    // COPY: `vals` (one fixture's ≤ 14 values) into a sorted scratch — generation time, cold —
+    // sorting the caller's slice in place rejected: the caller keeps the series order.
+    let mut w = vals.to_vec();
+    w.sort_by(f64::total_cmp);
+    let n = w.len();
+    let x = match c {
+        PctC::Half => (p * n as f64) / 100.0 - 0.5,
+        PctC::Zero => (p * (n + 1) as f64) / 100.0 - 1.0,
+        PctC::One => (p * (n - 1) as f64) / 100.0,
+    };
+    let x = x.clamp(0.0, (n - 1) as f64);
+    let k = x.floor() as usize;
+    let frac = x - k as f64;
+    if frac == 0.0 || k + 1 >= n {
+        w[k]
+    } else {
+        w[k] + frac * (w[k + 1] - w[k])
+    }
+}
+
+/// `ta.percentile_linear_interpolation(x, len, p)` under `c`: `na` until `len` values exist.
+pub fn ta_pct_linear(x: &[f64], len: usize, p: f64, c: PctC) -> Vec<f64> {
+    (0..x.len())
+        .map(|i| {
+            if i + 1 < len {
+                NA
+            } else {
+                pct_linear(&x[i + 1 - len..=i], p, c)
+            }
+        })
+        .collect()
+}
+
+/// `pin:04-binary-search`'s two readings of `binary_search_leftmost` for a value below every
+/// element: `MinusOne` (pine-std's pin: "the next smaller element to the left" does not exist)
+/// and `Zero` (the v6 reference's statement, lead r29).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftBelow {
+    /// `−1`.
+    MinusOne,
+    /// `0`.
+    Zero,
+}
+
+/// `array.binary_search` (`mode` 0) / `_leftmost` (1) / `_rightmost` (2) of `v` in the ascending
+/// `w` (no duplicates in the r29 fixture, so "which occurrence" is not asked): plain → the index
+/// or −1; leftmost → the index, else that of the next smaller element (below every element:
+/// `below`); rightmost → the index, else that of the element to the right of where `v` would lie
+/// (above every element: the size).
+pub fn bsearch(w: &[f64], v: f64, mode: u8, below: LeftBelow) -> f64 {
+    let lo = w.iter().take_while(|&&x| x < v).count();
+    let found = lo < w.len() && w[lo] == v;
+    let r = match (mode, found) {
+        (_, true) => lo as i64,
+        (0, false) => -1,
+        (1, false) if lo == 0 => match below {
+            LeftBelow::MinusOne => -1,
+            LeftBelow::Zero => 0,
+        },
+        (1, false) => lo as i64 - 1,
+        _ => lo as i64,
+    };
+    r as f64
+}
+
+/// `pin:04-udt-sort-ties`, reading `heap_order`: the input positions in the order pine-std's
+/// in-place heap sort (`coll/part3.rs` `heap_sort` / `sift` under `before_obj`: strict `<`, or
+/// strict `>` descending, ties unbroken) leaves them — operation for operation.
+pub fn heap_sort_order(keys: &[f64], desc: bool) -> Vec<usize> {
+    let before = |a: usize, b: usize| {
+        if desc {
+            keys[a] > keys[b]
+        } else {
+            keys[a] < keys[b]
+        }
+    };
+    let sift = |p: &mut [usize], root: usize, end: usize| {
+        let mut r = root;
+        loop {
+            let mut ch = 2 * r + 1;
+            if ch >= end {
+                break;
+            }
+            if ch + 1 < end && before(p[ch], p[ch + 1]) {
+                ch += 1;
+            }
+            if !before(p[r], p[ch]) {
+                break;
+            }
+            p.swap(r, ch);
+            r = ch;
+        }
+    };
+    let n = keys.len();
+    let mut p: Vec<usize> = (0..n).collect();
+    let mut s = n / 2;
+    while s > 0 {
+        s -= 1;
+        sift(&mut p, s, n);
+    }
+    let mut end = n;
+    while end > 1 {
+        end -= 1;
+        p.swap(0, end);
+        sift(&mut p, 0, end);
+    }
+    p
+}
+
+/// `pin:04-udt-sort-ties`, reading `stable`: equal keys keep their input order.
+pub fn stable_sort_order(keys: &[f64], desc: bool) -> Vec<usize> {
+    let mut p: Vec<usize> = (0..keys.len()).collect();
+    p.sort_by(|&a, &b| {
+        let o = keys[a].total_cmp(&keys[b]);
+        if desc {
+            o.reverse()
+        } else {
+            o
+        }
+    });
+    p
+}
+
+/// History ticks (R-P6, impl-05 §4.8.9, CAR-D1): the per-bar constants each reading predicts for
+/// E122 (`runs`, `conf`: executions per history bar, and those with `barstate.isconfirmed`) —
+/// `pin:05-hist-tick-runs`. `three_points_and_close` is impl-05's provisional reading (the open
+/// and the two extremes in path order, then the confirmed bar close); the *strategy()* reference
+/// ("a new execution … on every available tick in each historical bar. Historical ticks refer to
+/// bar OHLC prices") also reads as four tick executions at O, H/L, L/H, C before the bar-close
+/// execution (`four_ticks_and_close`), or as the extremes and the close only, the open being the
+/// previous close's continuation (`extremes_and_close`).
+pub const HIST_TICK_RUNS: [(&str, [f64; 2]); 3] = [
+    ("three_points_and_close", [4.0, 1.0]),
+    ("four_ticks_and_close", [5.0, 1.0]),
+    ("extremes_and_close", [3.0, 1.0]),
+];
+
+/// E123's per-bar constants (`closenew`: `barstate.isnew` at the bar-close execution; `tnew`:
+/// tick executions with `barstate.isnew`) — `pin:U17-hist-close-isnew`. Both readings take
+/// CAR-D1's tick column (`isnew` on a bar's first history tick only, `tnew = 1`); they differ in
+/// the bar column: `close_isnew` (contract §3.6.5 unchanged, impl-03's provisional) /
+/// `close_not_new` (as a realtime bar's closing update, *Bar states*: `isnew` only on the bar's
+/// first execution).
+pub const HIST_TICK_ISNEW: [(&str, [f64; 2]); 2] =
+    [("close_isnew", [1.0, 1.0]), ("close_not_new", [0.0, 1.0])];
+
+/// The r29 broker probes whose readings predict List-of-Trades rows (chart prices): named here
+/// before capture, decided by reading the captured trades against the prediction (§4.9.4,
+/// `pin:06-r29-broker-readings`) — `(fixture, pin, reading, prediction)`; the provisional default
+/// first. E129 / E131 place their level at `+12.4` / `+12.6` ticks from the order bar's close (by
+/// `syni`'s parity), E130 at `−20.4` / `−20.6` ticks from the average price; E132 is CI-042.
+pub const BROKER_READINGS: &[(&str, &str, &str, &str)] = &[
+    (
+        "E124",
+        HT_NEXT,
+        "next_point",
+        "an entry born at the open's run fills at point 1, same bar",
+    ),
+    (
+        "E124",
+        HT_NEXT,
+        "bar_close",
+        "it fills at the same bar's close",
+    ),
+    (
+        "E124",
+        HT_NEXT,
+        "next_bar_open",
+        "it fills at the next bar's open",
+    ),
+    (
+        "E125",
+        HT_IMM,
+        "same_point",
+        "close(immediately) born at point 1's run fills at point 1",
+    ),
+    (
+        "E125",
+        HT_IMM,
+        "next_point",
+        "it fills at point 2 (the second extreme)",
+    ),
+    (
+        "E126",
+        HT_COF,
+        "cof_first",
+        "fill bars: runs 5, first 1 (the fill's run precedes the tick's)",
+    ),
+    (
+        "E126",
+        HT_COF,
+        "tick_first",
+        "fill bars: runs 5, first 0 (the open's tick run first)",
+    ),
+    (
+        "E126",
+        HT_COF,
+        "merged",
+        "fill bars: runs 4 (one execution serves both)",
+    ),
+    (
+        "E127",
+        HT_FILL,
+        "fill_then_run",
+        "p1 = 1 on the bar whose open fills the entry",
+    ),
+    (
+        "E127",
+        HT_FILL,
+        "run_then_fill",
+        "p1 = 0 on that bar (the fill shows from the next run)",
+    ),
+    (
+        "E129 E130 E131",
+        ROUND,
+        "floor_tick",
+        "+12.4 / +12.6 ticks fill at +12 / +12; -20.4 / -20.6 at -21 / -21",
+    ),
+    (
+        "E129 E130 E131",
+        ROUND,
+        "nearest_tick",
+        "+12 / +13; -20 / -21",
+    ),
+    ("E129 E130 E131", ROUND, "ceil_tick", "+13 / +13; -20 / -20"),
+    (
+        "E132",
+        FUNDS,
+        "reject",
+        "an entry whose fill open exceeds its order bar's close: no trade",
+    ),
+    (
+        "E132",
+        FUNDS,
+        "reduce",
+        "it fills with the quantity the funds allow at the fill price",
+    ),
+    (
+        "E132",
+        FUNDS,
+        "fill_whole",
+        "it fills at the order-bar-close quantity (a margin call may follow)",
+    ),
+];
+
+const HT_NEXT: &str = "pin:05-hist-tick-next-point";
+const HT_IMM: &str = "pin:05-hist-tick-immediately";
+const HT_COF: &str = "pin:05-hist-tick-cof";
+const HT_FILL: &str = "pin:05-hist-tick-fill-first";
+const ROUND: &str = "pin:05-price-rounding";
+const FUNDS: &str = "pin:05-margin-funds-check";

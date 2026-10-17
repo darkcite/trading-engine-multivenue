@@ -1,0 +1,31 @@
+fix	2
+id	F103
+group	F
+title	array.percentile_linear_interpolation at p = 25, N = 4 and N = 14
+pin	pin:04-percentile-linear-c-half
+script	tests/conformance/fixtures/F/F103.pine
+script_sha256	2706a1aeed0491dfa78c54dc8f355ec295ebdb54e0d07f7b586bd32b1d5f4ac4
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	1
+oracle	tv
+tier	3
+plot	f_F103_n4	exact
+plot	f_F103_n14	exact
+pending
+reading	c_half
+0	15.0	40.0
+end
+reading	c_zero
+0	12.5	37.5
+end
+reading	c_one
+0	17.5	42.5
+end

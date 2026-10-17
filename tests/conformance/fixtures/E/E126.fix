@@ -1,0 +1,23 @@
+fix	2
+id	E126
+group	E
+title	history ticks with calc_on_order_fills
+pin	pin:05-hist-tick-cof
+script	tests/conformance/fixtures/E/E126.pine
+script_sha256	46b75496fa221bd35f581ed804f274d5a228c25a4d8aa6e57a0c376f75fe089e
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	6
+mode	realtime
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E126_pos	exact
+plot	f_E126_runs	exact
+plot	f_E126_first	exact
+pending

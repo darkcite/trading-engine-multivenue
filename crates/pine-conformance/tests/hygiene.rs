@@ -966,6 +966,21 @@ const SECTION_4_9_6: [&str; 21] = [
     "pin:05-fill-limits",
 ];
 
+/// r29 (2026-10-17): the foreign pins the generator publishes ahead of impl-06's §4.9.6 / §4.9.7
+/// linkage pass (the capture session's history-tick and tier-3 pins; the lead amends the tables,
+/// then these move into the two transcriptions above and below).
+const R29_AHEAD_OF_LINKAGE: [&str; 9] = [
+    "pin:05-hist-tick-runs",
+    "pin:05-hist-tick-next-point",
+    "pin:05-hist-tick-immediately",
+    "pin:05-hist-tick-cof",
+    "pin:05-hist-tick-fill-first",
+    "pin:04-percentile-linear-c-half",
+    "pin:04-binary-search",
+    "pin:04-udt-sort-ties",
+    "pin:04-udt-sort-na-object",
+];
+
 /// §4.9.7's names, transcribed from the spec table (`pin:01-array-suffix-type` appears in two rows).
 const SECTION_4_9_7: [&str; 38] = [
     "pin:00-rma-seed",
@@ -1016,6 +1031,7 @@ fn foreign_switch_pins_are_section_4_9_names() {
     let mut names: Vec<&str> = SECTION_4_9_6
         .iter()
         .chain(SECTION_4_9_7.iter())
+        .chain(R29_AHEAD_OF_LINKAGE.iter())
         .copied()
         .collect();
     names.sort_unstable();
@@ -1041,10 +1057,12 @@ fn foreign_switch_pins_are_section_4_9_names() {
 #[test]
 fn manifest_is_frozen() {
     const HEADER: &str =
-        "# fix 2 · pine-conf gen · A 96 B 124 C 46 D 62 E 121 F 98 Z 19 · total 566";
+        "# fix 2 · pine-conf gen · A 96 B 124 C 46 D 62 E 132 F 119 Z 19 · total 598";
     // Re-frozen 2026-10-17 (R-P2): C029 gained `pin:06-na-object-field`. R-P3: C044 / D053 / D054
-    // are pending (rewritten as tick-independent relations, awaiting their re-capture).
-    const FROZEN_SHA256: &str = "f37058d6f251fa8207f84a32d17f8047b3fe532cc5d954a8eaa54073be1cd837";
+    // are pending (rewritten as tick-independent relations, awaiting their re-capture). Re-frozen
+    // r29 (2026-10-17): E122–E132 and F099–F119 appended for the next capture session (pending;
+    // F109 / F111 / F113 authored `refuse 3005`); no existing row changed.
+    const FROZEN_SHA256: &str = "3852fd5b2c2862d236685e5bfd8babd7cf56b722a6407996c7264ea140b100e2";
     let text =
         std::fs::read_to_string(workspace_root().join(pine_conformance::manifest::MANIFEST_TSV))
             .unwrap();
@@ -1058,7 +1076,7 @@ fn manifest_is_frozen() {
         masked.push('\n');
         rows += 1;
     }
-    assert_eq!(rows, 566);
+    assert_eq!(rows, 598);
     let sha = core_crypto::sha256(masked.as_bytes());
     let hex: String = sha.iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(hex, FROZEN_SHA256, "manifest generator-owned columns moved");

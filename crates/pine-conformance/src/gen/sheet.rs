@@ -20,6 +20,10 @@
 //!
 //! `pin:06-sheet-request-count` — a fixture's requests are the `request.` tokens of its body and
 //! plots; it is request-bearing when that count is ≥ 1.
+//!
+//! `pin:06-sheet-round` (r29) — a fixture appended after a capture round packs only with the
+//! fixtures of its own round, so the sheets already captured keep their committed bytes (§4.7.9
+//! re-pastes the committed sheets) and the new fixtures land on new sheets numbered after them.
 
 use std::path::Path;
 
@@ -44,6 +48,26 @@ pub const NEVER_PACKED: [&str; 14] = [
     "D057", "D060", "F079", "F083", "F084", "F085", "F086", "F087", "F088", "F089", "F093", "F095",
     "F096", "F097",
 ];
+
+/// The last id of each fixed group block captured before r29 (A, C, D, E, F, Z); B's data-derived
+/// tail is regenerated with `pine-spec` and is never split (`pin:06-sheet-round`).
+pub const R28_LAST: [(Group, u16); 6] = [
+    (Group::A, 96),
+    (Group::C, 46),
+    (Group::D, 62),
+    (Group::E, 121),
+    (Group::F, 98),
+    (Group::Z, 19),
+];
+
+/// The capture round of `id`: 0 for the ids captured through r28, 1 for r29's.
+pub fn round(id: FixtureId) -> u8 {
+    let last = R28_LAST
+        .iter()
+        .find(|(g, _)| *g == id.group())
+        .map_or(u16::MAX, |(_, n)| *n);
+    u8::from(id.number() > last)
+}
 
 /// `tests/conformance/sheets/v<d>`.
 pub fn sheet_dir(d: Dialect) -> String {
@@ -108,7 +132,7 @@ pub fn requests(c: &Cell) -> usize {
 struct Bin {
     group: Group,
     shared: bool,
-    key: (u8, u8, u8),
+    key: (u8, u8, u8, u8),
     cells: Vec<usize>,
     plots: usize,
     req_fixtures: usize,
@@ -167,6 +191,7 @@ pub fn sheets(d: Dialect) -> Vec<Sheet> {
             c.run.driver as u8,
             c.run.align as u8,
             u8::from(c.script.prelude == Prelude::Syn1),
+            round(c.script.id),
         );
         let group = c.script.id.group();
         let (plots, req) = (c.script.plots.len(), requests(c));

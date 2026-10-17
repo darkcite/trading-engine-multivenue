@@ -1060,9 +1060,11 @@ fn fpin_cell(p: Fp) -> Cell {
     }
 }
 
-/// Every group-F cell (F001–F098).
+/// Every group-F cell: F001–F098, then r29's F099–F119 (`group_f2`, appended so no captured id
+/// moves).
 pub fn cells() -> Vec<Cell> {
     let mut c: Vec<Cell> = rows().iter().map(cell).collect();
     c.extend(fpins().into_iter().map(fpin_cell));
+    c.extend(super::group_f2::cells());
     c
 }

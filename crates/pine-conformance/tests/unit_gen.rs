@@ -209,7 +209,8 @@ fn group_a_amended_examples_are_byte_identical() {
 fn group_f_table_is_98_and_unique() {
     use pine_conformance::gen::group_f;
     let cells = group_f::cells();
-    assert_eq!(cells.len(), 98, "F001–F098 (§4.2.6)");
+    // r29 (2026-10-17): F099–F119 appended (`group_f2`, the next capture session's fixtures).
+    assert_eq!(cells.len(), 119, "F001–F098 (§4.2.6) + F099–F119 (r29)");
     let mut seen = std::collections::HashSet::new();
     for (i, c) in cells.iter().enumerate() {
         let id = c.script.id;
@@ -258,7 +259,7 @@ fn group_f_table_is_98_and_unique() {
         }
     }
     // The F-pin block's window and readings (§4.2.6): head 1 unless stated.
-    for c in &cells[72..] {
+    for c in &cells[72..98] {
         let n = c.script.id.number();
         let head = match n {
             87..=89 => 16,
@@ -665,4 +666,46 @@ fn gen_voids_a_capture_whose_script_changed() {
     assert_eq!(c40.captured, Stamp::At("2026-10-17T07:07Z".into()));
     assert!(matches!(c40.expect, Expect::Relation(_)));
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// r29 (2026-10-17): the capture session's F block — tiers, the UDT field rows' rule-2 twins
+/// (v6 fixture, v5 `refuse 3005` authored), and which rows carry readings written before capture.
+#[test]
+fn group_f_r29_block_is_laid_out() {
+    use pine_conformance::fixture::{Expect, Oracle};
+    use pine_conformance::gen::group_f;
+    let cells = group_f::cells();
+    for c in &cells[98..] {
+        let n = c.script.id.number();
+        let tier = if matches!(n, 104 | 115..=119) { 1 } else { 3 };
+        assert_eq!(c.tier, tier, "F{n:03} tier");
+        let twin_v5 = matches!(n, 109 | 111 | 113);
+        if twin_v5 {
+            assert_eq!(c.script.dialects, Dialects::V5, "F{n:03}");
+            assert_eq!(c.oracle, Oracle::Authored, "F{n:03}");
+            assert_eq!(
+                c.expect,
+                Expect::Refuse {
+                    code: pine_ir::DiagCode(3005)
+                },
+                "F{n:03}"
+            );
+            assert_eq!(c.script.twin, Some(FixtureId::from_parts(Group::F, n - 1)));
+        } else {
+            assert_eq!(c.oracle, Oracle::Tv, "F{n:03}");
+            assert_eq!(c.expect, Expect::Pending, "F{n:03}");
+        }
+        if matches!(n, 108 | 110 | 112) {
+            assert_eq!(c.script.dialects, Dialects::V6, "F{n:03}");
+        }
+        let read = matches!(n, 103 | 104 | 106 | 110 | 112 | 115 | 116 | 118 | 119);
+        assert_eq!(!c.readings.is_empty(), read, "F{n:03} readings");
+    }
+    // R-P15: F103 separates C = 1/2 (15, 40), C = 0 (12.5, 37.5) and C = 1 (17.5, 42.5).
+    let f103: Vec<&str> = cells[102]
+        .readings
+        .iter()
+        .map(|r| r.name.as_str())
+        .collect();
+    assert_eq!(f103, ["c_half", "c_zero", "c_one"]);
 }
