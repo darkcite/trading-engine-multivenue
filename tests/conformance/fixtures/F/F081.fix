@@ -6,14 +6,14 @@ pin	pin:02-na-condition
 script	tests/conformance/fixtures/F/F081.pine
 script_sha256	8724aa71ae6e48006ec3e69e1076d2c70bc232689f959d4f943e4ecfda31508c
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T04:32Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	5
 driver	syn
 align	step
 dialects	5
 mode	bar_close
-bars	pending
+bars	24484
 window	head	1
 oracle	tv
 tier	1
@@ -23,7 +23,9 @@ plot	f_F081_isna2	exact
 plot	f_F081_val2	exact
 plot	f_F081_isna3	exact
 plot	f_F081_val3	exact
-pending
+series
+0	0	2	0	2	0	2
+end
 reading	as_false
 0	0.0	2.0	0.0	2.0	0.0	2.0
 end

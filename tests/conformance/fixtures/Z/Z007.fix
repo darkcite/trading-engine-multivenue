@@ -6,9 +6,9 @@ pin	pin:01-version-form
 script	crates/pine-lang/tests/probes/p07_version_spaced.pine
 script_sha256	b9730490668f89d980ba8303b7d1dee093fd36c7d9c2f43af433b3e4b0884bc0
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T03:53Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	6
 driver	syn
 align	step
 dialects	6
@@ -18,4 +18,4 @@ window	head	1
 oracle	tv
 tier	1
 plot	f_Z007_ok	exact
-pending
+parse	accept

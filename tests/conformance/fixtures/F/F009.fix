@@ -6,17 +6,82 @@ pin	pin:U15-float-div-zero
 script	tests/conformance/fixtures/F/F009.pine
 script_sha256	ec9deeea44f65453b52ec749f7799bf47c3f2ee2789b795475da95d8f2e2c9c2
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T04:36Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	56
 driver	syn
 align	step
 dialects	56
 mode	bar_close
-bars	pending
+bars	24484
 window	head	64
 oracle	tv
 tier	1
 plot	f_F009_isna	exact
 plot	f_F009_val	exact
-pending
+series
+0	1	na
+1	1	na
+2	1	na
+3	1	na
+4	1	na
+5	1	na
+6	1	na
+7	1	na
+8	1	na
+9	1	na
+10	1	na
+11	1	na
+12	1	na
+13	1	na
+14	1	na
+15	1	na
+16	1	na
+17	1	na
+18	1	na
+19	1	na
+20	1	na
+21	1	na
+22	1	na
+23	1	na
+24	1	na
+25	1	na
+26	1	na
+27	1	na
+28	1	na
+29	1	na
+30	1	na
+31	1	na
+32	1	na
+33	1	na
+34	1	na
+35	1	na
+36	1	na
+37	1	na
+38	1	na
+39	1	na
+40	1	na
+41	1	na
+42	1	na
+43	1	na
+44	1	na
+45	1	na
+46	1	na
+47	1	na
+48	1	na
+49	1	na
+50	1	na
+51	1	na
+52	1	na
+53	1	na
+54	1	na
+55	1	na
+56	1	na
+57	1	na
+58	1	na
+59	1	na
+60	1	na
+61	1	na
+62	1	na
+63	1	na
+end

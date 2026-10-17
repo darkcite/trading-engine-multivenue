@@ -5,9 +5,9 @@ title	probe p14_global_leading_space · R2
 script	crates/pine-lang/tests/probes/p14_global_leading_space.pine
 script_sha256	4f10bab827d6b909fe216729d05d1d604d06fa6046ae3cfdf7ee1a4feb31658b
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T03:53Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	6
 driver	syn
 align	step
 dialects	6
@@ -17,4 +17,4 @@ window	head	1
 oracle	tv
 tier	1
 plot	f_Z014_ok	exact
-pending
+parse	accept

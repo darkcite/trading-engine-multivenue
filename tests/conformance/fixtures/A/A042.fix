@@ -6,17 +6,82 @@ pin	pin:04-color-edges
 script	tests/conformance/fixtures/A/A042.pine
 script_sha256	a65aeaa9627b341d8b07ed215c803d2ffa33ce12b2733b332929d47a41085a37
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T04:35Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	56
 driver	syn
 align	step
 dialects	56
 mode	bar_close
-bars	pending
+bars	24484
 window	head	64
 oracle	tv
 tier	1
 plot	f_A042_isna	exact
 plot	f_A042_val	exact
-pending
+series
+0	1	na
+1	0	66051
+2	1	na
+3	1	na
+4	0	66051
+5	0	66051
+6	1	na
+7	0	66051
+8	0	66051
+9	0	66051
+10	0	66051
+11	1	na
+12	1	na
+13	1	na
+14	1	na
+15	0	66051
+16	0	66051
+17	1	na
+18	0	66051
+19	0	66051
+20	0	66051
+21	1	na
+22	1	na
+23	0	66051
+24	1	na
+25	0	66051
+26	0	66051
+27	1	na
+28	1	na
+29	0	66051
+30	1	na
+31	1	na
+32	0	66051
+33	0	66051
+34	1	na
+35	0	66051
+36	0	66051
+37	0	66051
+38	1	na
+39	0	66051
+40	0	66051
+41	0	66051
+42	0	66051
+43	1	na
+44	1	na
+45	1	na
+46	0	66051
+47	1	na
+48	1	na
+49	1	na
+50	1	na
+51	1	na
+52	1	na
+53	0	66051
+54	0	66051
+55	0	66051
+56	1	na
+57	1	na
+58	1	na
+59	0	66051
+60	0	66051
+61	0	66051
+62	0	66051
+63	0	66051
+end

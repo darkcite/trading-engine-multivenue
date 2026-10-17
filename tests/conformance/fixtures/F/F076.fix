@@ -6,15 +6,15 @@ pin	pin:00-tf-multiplier
 script	tests/conformance/fixtures/F/F076.pine
 script_sha256	5f31ee6100ee1f116054fb3dabf79357970d0360d47b7caa588b565eb9c7f25a
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T04:11Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	6
 driver	syn
 align	step
 dialects	6
 twin	F075
 mode	bar_close
-bars	pending
+bars	24484
 window	head	1
 oracle	tv
 tier	1
@@ -24,7 +24,9 @@ plot	f_F076_isna2	exact
 plot	f_F076_val2	exact
 plot	f_F076_isna3	exact
 plot	f_F076_val3	exact
-pending
+series
+0	0	2	0	2	0	2
+end
 reading	omit_one
 0	0.0	1.0	0.0	1.0	0.0	2.0
 end

@@ -5,9 +5,9 @@ title	probe p13_wrap_multiple_of_four · R3
 script	crates/pine-lang/tests/probes/p13_wrap_multiple_of_four.pine
 script_sha256	cce16fdc532df6dc2a15eb7c961f7b389ca49f7857714118c1e74adfcd36ba63
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T03:53Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	6
 driver	syn
 align	step
 dialects	6
@@ -17,4 +17,4 @@ window	head	1
 oracle	tv
 tier	1
 plot	f_Z013_ok	exact
-pending
+parse	reject

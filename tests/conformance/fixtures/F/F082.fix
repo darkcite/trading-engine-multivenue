@@ -6,20 +6,22 @@ pin	pin:02-v5-num-to-bool
 script	tests/conformance/fixtures/F/F082.pine
 script_sha256	f6ba44f1d357f875c68bcbbd8604e6128cf6f6506e6d21321a328f10e3ab96fa
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T04:32Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	5
 driver	syn
 align	step
 dialects	5
 mode	bar_close
-bars	pending
+bars	24484
 window	head	1
 oracle	tv
 tier	1
 plot	f_F082_val1	exact
 plot	f_F082_val2	exact
-pending
+series
+0	1	-1
+end
 reading	na
 0	1.0	-1.0
 end

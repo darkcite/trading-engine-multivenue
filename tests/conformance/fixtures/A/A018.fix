@@ -5,17 +5,82 @@ title	na → value at a known step · float
 script	tests/conformance/fixtures/A/A018.pine
 script_sha256	b9832422f99811bec8e8bcf6c740ddc7203b7cca6414e55b1d6f1600a28b567e
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T04:34Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	56
 driver	syn
 align	step
 dialects	56
 mode	bar_close
-bars	pending
+bars	24484
 window	head	64
 oracle	tv
 tier	1
 plot	f_A018_isna	exact
 plot	f_A018_val	exact
-pending
+series
+0	1	na
+1	1	na
+2	1	na
+3	1	na
+4	1	na
+5	1	na
+6	1	na
+7	1	na
+8	1	na
+9	1	na
+10	1	na
+11	1	na
+12	1	na
+13	1	na
+14	1	na
+15	1	na
+16	1	na
+17	1	na
+18	1	na
+19	1	na
+20	1	na
+21	1	na
+22	1	na
+23	1	na
+24	1	na
+25	1	na
+26	1	na
+27	1	na
+28	1	na
+29	1	na
+30	1	na
+31	1	na
+32	0	7.5
+33	0	7.5
+34	0	7.5
+35	0	7.5
+36	0	7.5
+37	0	7.5
+38	0	7.5
+39	0	7.5
+40	0	7.5
+41	0	7.5
+42	0	7.5
+43	0	7.5
+44	0	7.5
+45	0	7.5
+46	0	7.5
+47	0	7.5
+48	0	7.5
+49	0	7.5
+50	0	7.5
+51	0	7.5
+52	0	7.5
+53	0	7.5
+54	0	7.5
+55	0	7.5
+56	0	7.5
+57	0	7.5
+58	0	7.5
+59	0	7.5
+60	0	7.5
+61	0	7.5
+62	0	7.5
+63	0	7.5
+end

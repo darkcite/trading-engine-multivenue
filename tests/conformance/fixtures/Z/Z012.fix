@@ -5,9 +5,9 @@ title	probe p12_block_unit_tab · R1
 script	crates/pine-lang/tests/probes/p12_block_unit_tab.pine
 script_sha256	84fec4658661bca279a8786f1c6065a215129c9f7ba23d44eba9294c365965a6
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T03:53Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	6
 driver	syn
 align	step
 dialects	6
@@ -17,4 +17,4 @@ window	head	1
 oracle	tv
 tier	1
 plot	f_Z012_ok	exact
-pending
+parse	accept

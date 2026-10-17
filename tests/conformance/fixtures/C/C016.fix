@@ -5,17 +5,82 @@ title	varip inside if_block
 script	tests/conformance/fixtures/C/C016.pine
 script_sha256	ad89308e6a64037d6c8f180df15c654900e85615b00d69bb3537814d70213fe7
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T04:40Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	56
 driver	syn
 align	step
 dialects	56
 mode	bar_close
-bars	pending
+bars	24484
 window	head	64
 oracle	tv
 tier	1
 plot	f_C016_isna	exact
 plot	f_C016_val	exact
-pending
+series
+0	0	1
+1	1	na
+2	1	na
+3	0	2
+4	0	3
+5	1	na
+6	0	4
+7	0	5
+8	0	6
+9	0	7
+10	1	na
+11	1	na
+12	1	na
+13	1	na
+14	0	8
+15	0	9
+16	1	na
+17	0	10
+18	0	11
+19	0	12
+20	1	na
+21	1	na
+22	0	13
+23	1	na
+24	0	14
+25	0	15
+26	1	na
+27	1	na
+28	0	16
+29	1	na
+30	1	na
+31	0	17
+32	0	18
+33	1	na
+34	0	19
+35	0	20
+36	0	21
+37	1	na
+38	0	22
+39	0	23
+40	0	24
+41	0	25
+42	1	na
+43	1	na
+44	1	na
+45	0	26
+46	1	na
+47	1	na
+48	1	na
+49	1	na
+50	1	na
+51	1	na
+52	0	27
+53	0	28
+54	0	29
+55	1	na
+56	1	na
+57	1	na
+58	0	30
+59	0	31
+60	0	32
+61	0	33
+62	0	34
+63	1	na
+end

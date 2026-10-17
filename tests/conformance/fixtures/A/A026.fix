@@ -5,17 +5,82 @@ title	history on the first bar · float
 script	tests/conformance/fixtures/A/A026.pine
 script_sha256	2e740bca70a4ab31209f6437eb28aa844c29442a26ca530b9bb650af98263286
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-17T04:34Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	56
 driver	syn
 align	step
 dialects	56
 mode	bar_close
-bars	pending
+bars	24484
 window	head	64
 oracle	tv
 tier	1
 plot	f_A026_isna	exact
 plot	f_A026_val	exact
-pending
+series
+0	1	na
+1	0	7.5
+2	1	na
+3	1	na
+4	0	7.5
+5	0	7.5
+6	1	na
+7	0	7.5
+8	0	7.5
+9	0	7.5
+10	0	7.5
+11	1	na
+12	1	na
+13	1	na
+14	1	na
+15	0	7.5
+16	0	7.5
+17	1	na
+18	0	7.5
+19	0	7.5
+20	0	7.5
+21	1	na
+22	1	na
+23	0	7.5
+24	1	na
+25	0	7.5
+26	0	7.5
+27	1	na
+28	1	na
+29	0	7.5
+30	1	na
+31	1	na
+32	0	7.5
+33	0	7.5
+34	1	na
+35	0	7.5
+36	0	7.5
+37	0	7.5
+38	1	na
+39	0	7.5
+40	0	7.5
+41	0	7.5
+42	0	7.5
+43	1	na
+44	1	na
+45	1	na
+46	0	7.5
+47	1	na
+48	1	na
+49	1	na
+50	1	na
+51	1	na
+52	1	na
+53	0	7.5
+54	0	7.5
+55	0	7.5
+56	1	na
+57	1	na
+58	1	na
+59	0	7.5
+60	0	7.5
+61	0	7.5
+62	0	7.5
+63	0	7.5
+end
