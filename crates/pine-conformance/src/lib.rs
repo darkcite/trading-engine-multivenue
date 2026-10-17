@@ -5,9 +5,10 @@
 //! loop; allocation and copying outside `host::step_*` are free and deliberate. The §3.15.3 loop in
 //! `host` is asserted 0-alloc by `tests/alloc_step.rs`, and each of its copies carries `// COPY:`.
 //!
-//! Modules land task by task (impl-06 §6); this edition carries T1–T14: `bars`, `capture`
-//! (`barhash`), `chart`, `dec`, `fixture`, `gen` (`emit`, `readings`, groups A–F and Z), `host`,
-//! `manifest`, `pins`, `run` (the error model), `syn`.
+//! Modules land task by task (impl-06 §6); this edition carries T1–T16: `bars`, `capture`
+//! (`barhash`), `chart`, `cmp`, `dec`, `fixture`, `gen` (`emit`, `readings`, groups A–F and Z),
+//! `host`, `manifest`, `pins`, `report` (the verdict model; `render` is T17's), `run` (the §4.5.1
+//! pipeline and `check`), `syn`, `trades`.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs, unused_must_use, unreachable_pub)]
@@ -15,14 +16,17 @@
 pub mod bars;
 pub mod capture;
 pub mod chart;
+pub mod cmp;
 pub mod dec;
 pub mod fixture;
 pub mod gen;
 pub mod host;
 pub mod manifest;
 pub mod pins;
+pub mod report;
 pub mod run;
 pub mod syn;
+pub mod trades;
 
 /// Root of the fixture tree, relative to the workspace root.
 pub const FIXTURE_ROOT: &str = "tests/conformance";

@@ -388,4 +388,11 @@ impl ChartSource {
         self.find(symbol_key, tf_s, clamp)
             .map(|i| self.open[i].file.hdr())
     }
+
+    /// `BarFile::rows()` of a file already opened by [`ChartSource::rows`] — the shared borrow the
+    /// runner takes once every key of a run is open (the chart and each sub-program at once).
+    pub fn opened(&self, symbol_key: &str, tf_s: u32, clamp: pine_screen::Clamp) -> Option<&[Bar]> {
+        self.find(symbol_key, tf_s, clamp)
+            .map(|i| self.open[i].file.rows())
+    }
 }

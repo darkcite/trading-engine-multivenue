@@ -323,3 +323,185 @@ fn aligned_buf_is_64_aligned() {
         assert!(s.iter().all(|&x| x == 0));
     }
 }
+
+#[test]
+fn host_commits_after_every_evaluation() {
+    // calc_on_order_fills: the fill bar is evaluated twice (the fill tick, then the close). The
+    // broker refuses `open_bar` (PathCursor) unless every Evaluate was answered by `submit`, so a
+    // clean run with a two-evaluation bar proves the host committed after each.
+    let src = "//@version=6
+strategy(\"c\", calc_on_order_fills = true)
+if bar_index == 1
+    strategy.entry(\"L\", strategy.long)
+plot(strategy.position_size, \"ps\")
+";
+    let si = syminfo();
+    let opts = compile_opts(
+        &si,
+        Dialect::V6,
+        ExecMode::Realtime,
+        false,
+        pine_conformance::run::DEFAULT_LIMITS,
+        core_crypto::sha256(src.as_bytes()),
+    );
+    let mut syms = SymTable::new();
+    let ast = pine_lang::parse(src, FileId::ROOT, &mut syms).expect("parse");
+    let prog = pine_sema::compile(&ast, syms, &opts, &mut pine_sema::LibCache::empty())
+        .unwrap_or_else(|d| {
+            panic!(
+                "compile {:?}",
+                d.iter().map(|d| d.code.0).collect::<Vec<_>>()
+            )
+        });
+    let broker = pine_broker::TvBroker::new(
+        &prog.meta,
+        TvCfg {
+            sizing: pine_ir::SizingMode::AsDeclared,
+            day_offset_s: 0,
+            _pad: 0,
+        },
+    )
+    .unwrap_or_else(|c| panic!("TvBroker::new {}", c.0));
+    let mut broker = Some(broker);
+    let v = pine_vm::verify(&prog, &pine_std::BUILTINS).expect("verify");
+    let mut arena = AlignedBuf::new(prog.layout.total_bytes);
+    let mut vm = VmInstance::new(v, arena.as_mut_slice());
+    let mut store = SeriesStore::with_slots(&[]);
+    let rows = chart_rows(8);
+    let mut per_bar = Vec::new();
+    let mut evals = 0u64;
+    for row in &rows {
+        let before = evals;
+        if step_chart_bar(row, &mut [], &mut store, &mut vm, &mut broker, &mut evals).is_err() {
+            panic!("fault at bar {}", row.index);
+        }
+        per_bar.push(evals - before);
+    }
+    assert_eq!(per_bar[0], 1);
+    assert!(per_bar.iter().all(|&n| n >= 1));
+    assert!(
+        per_bar.contains(&2),
+        "a fill bar evaluates twice: {per_bar:?}"
+    );
+    assert!(broker.unwrap().view().position_size_1e6 > 0);
+}
+
+/// A fixture of ours over a script written to a temp file (the runner resolves an absolute
+/// `script` as is).
+fn temp_fixture(
+    tag: &str,
+    src: &str,
+    ds: pine_conformance::fixture::Dialects,
+) -> pine_conformance::fixture::Fixture {
+    use pine_conformance::fixture::{Align, Driver, Expect, Fixture, Oracle, Window};
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let any = std::fs::read_to_string(root.join("tests/conformance/fixtures/A/A051.fix")).unwrap();
+    let mut f = Fixture::parse(&any, "A051.fix").expect("A051 parses");
+    let dir = std::env::temp_dir().join(format!("pine-conf-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.pine");
+    std::fs::write(&path, src).unwrap();
+    f.script = path.display().to_string();
+    f.script_sha256 = core_crypto::sha256(src.as_bytes());
+    f.dialects = ds;
+    f.driver = Driver::Syn;
+    f.align = Align::Step;
+    f.bars = Some(8);
+    f.window = Window::Head(8);
+    f.oracle = Oracle::Authored;
+    f.tier = 1;
+    f.live_refuse = None;
+    f.plots = vec![pine_conformance::fixture::PlotSpec {
+        title: "p".into(),
+        tol: pine_conformance::fixture::Tol::Exact,
+    }];
+    f.expect = Expect::Pending;
+    f
+}
+
+fn runner(limits: pine_ir::CompileLimits) -> pine_conformance::run::Runner {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut o = pine_conformance::run::RunnerOptions::new(root);
+    o.limits = limits;
+    pine_conformance::run::Runner::new(o).expect("runner")
+}
+
+#[test]
+fn run_dual_dialect_asserts_invariance() {
+    use pine_conformance::fixture::Dialects;
+    use pine_conformance::report::{Verdict, NO_ROW};
+    use pine_conformance::run::dialect_divergence;
+    let f = temp_fixture(
+        "dual",
+        "//@version=6\nindicator(\"t\")\nplot(bar_index * 2, \"p\")\n",
+        Dialects::BOTH,
+    );
+    let mut r = runner(pine_conformance::run::DEFAULT_LIMITS);
+    let v6 = r.run(&f, Dialect::V6);
+    let v5 = r.run(&f, Dialect::V5);
+    assert_eq!(dialect_divergence(&v6, &v5), None);
+    assert!(matches!(r.check(&f), Verdict::Pending));
+    let a = v6.as_ref().expect("v6 runs");
+    assert_eq!(a.keys, (0..8).collect::<Vec<i64>>());
+    assert_eq!(a.plots[5], 10.0);
+    // A planted v5/v6 difference on row 5.
+    let mut planted = v5.expect("v5 runs");
+    planted.plots[5] = 11.0;
+    assert_eq!(dialect_divergence(&v6, &Ok(planted)), Some((5, 0)));
+    // One dialect refused, the other ran.
+    let refused = Err(pine_conformance::run::RunError::Skip(
+        pine_conformance::run::SkipReason::TvOnly,
+    ));
+    assert_eq!(
+        dialect_divergence(&v6, &refused),
+        Some((NO_ROW, usize::MAX))
+    );
+}
+
+#[test]
+fn run_reports_fault_with_pc_and_bar() {
+    use pine_conformance::fixture::{Dialects, Expect};
+    use pine_conformance::report::Verdict;
+    use pine_conformance::run::RunError;
+    let mut f = temp_fixture(
+        "fault",
+        "//@version=6
+indicator(\"t\")
+s = 0.0
+if bar_index == 3
+    for i = 0 to 1000000
+        s += i
+plot(s, \"p\")
+",
+        Dialects::V6,
+    );
+    let mut r = runner(pine_ir::CompileLimits {
+        insn_budget: 5_000,
+        ..pine_conformance::run::DEFAULT_LIMITS
+    });
+    match r.run(&f, Dialect::V6) {
+        Err(RunError::Fault {
+            kind,
+            pc,
+            bar_index,
+            sub,
+        }) => {
+            assert_eq!(kind, pine_ir::FaultKind::InsnBudget);
+            assert_ne!(pc, u32::MAX, "pc from VmInstance::last_fault");
+            assert_eq!(bar_index, 3);
+            assert!(!sub);
+        }
+        other => panic!("expected an InsnBudget fault, got {other:?}"),
+    }
+    assert_eq!(r.fault_row(), Some(3));
+    f.expect = Expect::Fault {
+        kind: pine_ir::FaultKind::InsnBudget,
+        row: 3,
+    };
+    assert!(matches!(r.check(&f), Verdict::Pass));
+    f.expect = Expect::Fault {
+        kind: pine_ir::FaultKind::InsnBudget,
+        row: 4,
+    };
+    assert!(matches!(r.check(&f), Verdict::Fail(_)));
+}

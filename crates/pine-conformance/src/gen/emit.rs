@@ -9,9 +9,9 @@
 use crate::fixture::{Dialects, FixtureId};
 use crate::syn;
 
-/// Spaces per block level. A private `4` until T15 adds the `pine-lang` edge, then
-/// `pine_lang::INDENT_UNIT_SPACES` (impl-01 v4 §3.11: "the generator's only source of indentation").
-pub const INDENT: usize = 4;
+/// Spaces per block level: `pine_lang::INDENT_UNIT_SPACES` (impl-01 v4 §3.11: "the generator's only
+/// source of indentation"; T15 added the `pine-lang` edge).
+pub const INDENT: usize = pine_lang::INDENT_UNIT_SPACES as usize;
 
 /// The `display =` argument of every fixture plot (§4.2.0; flips to `display.all` if probe-00 shows
 /// data-window plots are not exported, R11).

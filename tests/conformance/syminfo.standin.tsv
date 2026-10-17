@@ -1,0 +1,12 @@
+# NOT A CAPTURE. Stand-in for syminfo.tsv (impl-06 §4.1.4) until probe-00 writes the real file.
+# pin:06-syminfo-standin (lead ruling): only fixtures whose oracle is not tv run against it; a tv-oracle fixture refuses 7003.
+# Stated facts: venue 1 (VenueId::Binance, §4.1.4), day_offset_s 0 (§4.1.4), ticker/base/currency from SYMBOL BINANCE:BTCUSDT.P.
+# Pinned (not stated in impl-00/impl-06): mintick_1e6 100000, pointvalue_1e6 1000000, type crypto.
+mintick_1e6	100000
+pointvalue_1e6	1000000
+ticker	BTCUSDT.P
+basecurrency	BTC
+currency	USDT
+type	crypto
+venue	1
+day_offset_s	0
