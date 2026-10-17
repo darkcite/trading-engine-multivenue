@@ -18,6 +18,10 @@
 //!   taker's (`trader_side` says whether that is us).
 //! * A frame that does not scan is an error the gateway counts and halts
 //!   on (fail-closed: a fill must never be lost silently).
+//! * PM15-6b: recon reads the same trade objects from
+//!   `GET /data/trades` (spec §G.2) — [`scan_trades_page`]: the envelope's
+//!   `data[]` of trade objects without an `event_type` (and with
+//!   `match_time` in place of `timestamp`), and its `next_cursor`.
 
 use core_parse::{scan_price_1e6, skip_json_value, skip_string, skip_ws};
 
@@ -141,7 +145,7 @@ pub fn scan_user_frame(buf: &[u8], out: &mut [UserEvt]) -> Result<Scanned, ScanE
     }
     if buf[p] == b'{' {
         let end = skip_json_value(buf, p).ok_or(ScanErr::Json)?;
-        one_object(&buf[p..end], out, &mut r)?;
+        one_object(&buf[p..end], out, &mut r, false)?;
         return Ok(r);
     }
     if buf[p] != b'[' {
@@ -158,7 +162,7 @@ pub fn scan_user_frame(buf: &[u8], out: &mut [UserEvt]) -> Result<Scanned, ScanE
             b',' => i += 1,
             b'{' => {
                 let end = skip_json_value(buf, i).ok_or(ScanErr::Json)?;
-                one_object(&buf[i..end], out, &mut r)?;
+                one_object(&buf[i..end], out, &mut r, false)?;
                 i = end;
             }
             _ => return Err(ScanErr::Json),
@@ -184,15 +188,100 @@ struct Spans {
     fee_rate_bps: Option<(usize, usize)>,
 }
 
-fn one_object(obj: &[u8], out: &mut [UserEvt], r: &mut Scanned) -> Result<(), ScanErr> {
+/// PM15-6b: one page of `GET /data/trades` — its `data[]` trades into
+/// `out`, and the `next_cursor` to ask for next (its span in `buf`; `None`
+/// at the end: absent, empty or `LTE=`).
+///
+/// # Errors
+/// [`ScanErr`] — recon retries later; nothing is booked from the page.
+pub fn scan_trades_page(
+    buf: &[u8],
+    out: &mut [UserEvt],
+) -> Result<(Scanned, Option<(usize, usize)>), ScanErr> {
+    let p = skip_ws(buf, 0);
+    if p >= buf.len() || buf[p] != b'{' {
+        return Err(ScanErr::Json);
+    }
+    let end = skip_json_value(buf, p).ok_or(ScanErr::Json)?;
+    let env = &buf[p..end];
+    let mut data = None;
+    let mut cursor = None;
+    let mut i = 1usize;
+    loop {
+        i = skip_ws(env, i);
+        if i >= env.len() {
+            return Err(ScanErr::Json);
+        }
+        match env[i] {
+            b'}' => break,
+            b',' => {
+                i += 1;
+                continue;
+            }
+            b'"' => {}
+            _ => return Err(ScanErr::Json),
+        }
+        let kend = skip_string(env, i + 1).ok_or(ScanErr::Json)?;
+        let key = &env[i + 1..kend - 1];
+        let mut v = skip_ws(env, kend);
+        if v >= env.len() || env[v] != b':' {
+            return Err(ScanErr::Json);
+        }
+        v = skip_ws(env, v + 1);
+        let vend = skip_json_value(env, v).ok_or(ScanErr::Json)?;
+        match key {
+            b"data" => data = Some((v, vend)),
+            b"next_cursor" => cursor = Some((v, vend)),
+            _ => {}
+        }
+        i = vend;
+    }
+    let mut r = Scanned::default();
+    let (ds, de) = data.ok_or(ScanErr::Field)?;
+    if env[ds] != b'[' {
+        return Err(ScanErr::Json);
+    }
+    let mut j = ds + 1;
+    loop {
+        j = skip_ws(env, j);
+        if j >= de {
+            return Err(ScanErr::Json);
+        }
+        match env[j] {
+            b']' => break,
+            b',' => j += 1,
+            b'{' => {
+                let oend = skip_json_value(env, j).ok_or(ScanErr::Json)?;
+                one_object(&env[j..oend], out, &mut r, true)?;
+                j = oend;
+            }
+            _ => return Err(ScanErr::Json),
+        }
+    }
+    let next = match text(env, cursor) {
+        Some(c) if !c.is_empty() && c != b"LTE=" => cursor.map(|(s, e)| (p + s + 1, p + e - 1)),
+        _ => None,
+    };
+    Ok((r, next))
+}
+
+fn one_object(
+    obj: &[u8],
+    out: &mut [UserEvt],
+    r: &mut Scanned,
+    rest: bool,
+) -> Result<(), ScanErr> {
     let sp = members(obj)?;
-    let et = text(obj, sp.event_type);
-    let kind = match et {
-        Some(b"trade") => KIND_TRADE,
-        Some(b"order") => KIND_ORDER,
-        _ => {
-            r.skipped += 1;
-            return Ok(());
+    let kind = if rest {
+        KIND_TRADE
+    } else {
+        match text(obj, sp.event_type) {
+            Some(b"trade") => KIND_TRADE,
+            Some(b"order") => KIND_ORDER,
+            _ => {
+                r.skipped += 1;
+                return Ok(());
+            }
         }
     };
     if r.events >= out.len() {
@@ -211,6 +300,9 @@ fn one_object(obj: &[u8], out: &mut [UserEvt], r: &mut Scanned) -> Result<(), Sc
             Some((v, n)) if n == t.len() => v,
             _ => return Err(ScanErr::Field),
         },
+        // A REST trade carries `match_time` (seconds) instead: not read —
+        // recon books by trade id, never by time.
+        None if rest => 0,
         None => return Err(ScanErr::Field),
     };
     e.asset_hash = fnv1a(text(obj, sp.asset_id).ok_or(ScanErr::Field)?);

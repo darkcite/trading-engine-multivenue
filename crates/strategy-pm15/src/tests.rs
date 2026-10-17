@@ -417,3 +417,37 @@ fn the_book_gates_name_their_reason_and_a_quiet_book_still_takes() {
     assert_eq!(m.counters().skip_book, 2);
     assert_eq!(c.orders.len(), 1);
 }
+
+/// PM15-6b: a live fill the taker hold delayed past the pending's
+/// write-off still books — by its client id's family, instance and leg.
+#[test]
+fn a_late_fill_books_by_its_client_id() {
+    let mut m = member();
+    let now = 100 * S;
+    let mut c = TestCtx {
+        now,
+        orders: Vec::new(),
+    };
+    let w = pm_window_of_open(OPEN).unwrap();
+    let pair = pm_pair_of_window(w);
+    m.on_venue_event(&roll(w, false, 0), &mut c);
+    m.on_venue_event(&law(w, PM_LEG_DOWN, 10_000), &mut c);
+    m.on_tick(&touch(w, PM_LEG_DOWN, now, 920_000, 930_000), &mut c);
+    m.take(0, pair, 1, 990_000, now, &mut c);
+    let o = c.orders[0];
+    m.on_timer(now + 10 * S, &mut c);
+    assert_eq!(m.market(0, pair).pending.oid, 0, "written off");
+    m.on_fill(
+        &Fill::new(now, o.sym, Side::Bid, Price::from_raw(930_000), Qty::from_raw(50_000_000), o.client_oid),
+        &mut c,
+    );
+    let mk = *m.market(0, pair);
+    assert_eq!((mk.pos_1e6[1], mk.cost_1e6[1]), (50_000_000, 46_500_000));
+    assert_eq!((m.counters().late_fills, m.counters().unknown_fills), (1, 0));
+    // Another instance's: unknown.
+    m.on_fill(
+        &Fill::new(now, o.sym, Side::Bid, Price::from_raw(930_000), Qty::from_raw(1), o.client_oid + 8),
+        &mut c,
+    );
+    assert_eq!(m.counters().unknown_fills, 1);
+}

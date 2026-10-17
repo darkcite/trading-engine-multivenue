@@ -749,26 +749,29 @@ impl Pm15Strategy {
         }
     }
 
-    /// Book one fill against a market's pending IoC.
+    /// Book one fill: against a market's pending IoC, or — a live fill the
+    /// taker hold delayed past the pending's write-off (PM15-6b) — by its
+    /// client id's family, instance and leg.
     fn book_fill(&mut self, fill: &core_types::Fill) {
         let qty = fill.qty.raw();
         if qty <= 0 || fill.is_settlement() {
             return;
         }
+        let oid = fill.order_id;
+        let px = fill.px.raw();
+        let cost = (i128::from(px) * i128::from(qty) / i128::from(ONE_1E6)) as i64;
+        let fee = (i128::from(FEE_RATE_1E6)
+            * i128::from(px)
+            * i128::from(ONE_1E6 - px)
+            * i128::from(qty)
+            / 1_000_000_000_000_000_000) as i64;
         let mut f = 0usize;
         while f < self.params.n_families {
             let mut pair = 0usize;
             while pair < PM_PAIRS {
                 let m = &mut self.markets[f][pair];
-                if m.pending.oid != 0 && m.pending.oid == fill.order_id {
+                if m.pending.oid != 0 && m.pending.oid == oid {
                     let leg = (m.pending.leg & 1) as usize;
-                    let px = fill.px.raw();
-                    let cost = (i128::from(px) * i128::from(qty) / i128::from(ONE_1E6)) as i64;
-                    let fee = (i128::from(FEE_RATE_1E6)
-                        * i128::from(px)
-                        * i128::from(ONE_1E6 - px)
-                        * i128::from(qty)
-                        / 1_000_000_000_000_000_000) as i64;
                     let first = m.pending.filled_1e6 == 0;
                     m.pos_1e6[leg] += qty;
                     m.cost_1e6[leg] += cost;
@@ -792,6 +795,29 @@ impl Pm15Strategy {
                 pair += 1;
             }
             f += 1;
+        }
+        // A late fill: no pending names it, its client id still does.
+        let inst = (oid & core_types::OID_INSTANCE_MASK) as u32;
+        let f = ((oid >> OID_FAMILY_SHIFT) & 0xFFFF) as usize;
+        let leg = ((oid >> OID_LEG_SHIFT) & 1) as usize;
+        let (_, inst_f) = pm_instance_parts(inst);
+        if f < self.params.n_families && inst_f == f && inst != 0 {
+            let mut pair = 0usize;
+            while pair < PM_PAIRS {
+                let m = &mut self.markets[f][pair];
+                if m.instance == inst {
+                    m.pos_1e6[leg] += qty;
+                    m.cost_1e6[leg] += cost;
+                    m.fee_1e6[leg] += fee;
+                    m.committed_1e6 += cost;
+                    self.counters.fills += 1;
+                    self.counters.late_fills += 1;
+                    self.counters.fees_1e6 += fee;
+                    self.counters.bought_1e6 += cost;
+                    return;
+                }
+                pair += 1;
+            }
         }
         self.counters.unknown_fills += 1;
     }

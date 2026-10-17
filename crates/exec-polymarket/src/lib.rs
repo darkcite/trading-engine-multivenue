@@ -22,6 +22,18 @@
 //! | [`selftest`] | every pinned vector, run at boot before the arm may arm |
 //! | [`num`] | the decimal and hex renderers |
 //!
+//! ## PM15-6b (the threads' cores: socket-free, rig-tested)
+//!
+//! | module | thread | responsibility |
+//! |---|---|---|
+//! | [`cmd`] | — | the 64 B command and event records of the three rings |
+//! | [`account`] | — | the key, the three addresses of the signature type, the API credentials |
+//! | [`tokens`] | pm-gw | the token table the discovery tee feeds: ids, body prefixes, condition ids |
+//! | [`clob`] | pm-gw | the request cycle (`core_net::HttpsReq`, or the rig) |
+//! | [`gw`] | pm-gw | submit (amounts → sign → body in place → MAC → SENT → POST → answer), the retry law, recon |
+//! | [`user`] | pm-user | the user channel: subscribe, trades → FILL, the session's loss → GAP |
+//! | [`arm`] | engine | `OrderDispatch`: admission (D-9), the in-flight table, fills once, retirements after them |
+//!
 //! ## The laws
 //!
 //! * **E-1** — a failure is a refusal, counted; never a modelled fill.
@@ -42,13 +54,20 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod account;
 pub mod amounts;
+pub mod arm;
+pub mod clob;
+pub mod cmd;
+pub mod gw;
 pub mod l2;
 pub mod num;
 pub mod render;
 pub mod response;
 pub mod selftest;
 pub mod sign;
+pub mod tokens;
+pub mod user;
 pub mod userws;
 
 /// The CLOB REST host (V2 since the 2026-04-28 cutover; there is no

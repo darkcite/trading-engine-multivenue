@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! The `POST /order` request, rendered in place as **four spans** the
-//! gateway writes to the TLS stream in turn — no span is ever copied into
-//! another:
+//! The `POST /order` body, rendered as **two spans**:
 //!
 //! ```text
-//! [auth head]    per account, at boot   POST /order HTTP/1.1 · Host · User-Agent · Content-Type · POLY_ADDRESS · POLY_API_KEY · POLY_PASSPHRASE
-//! [dynamic head] per order              POLY_SIGNATURE · POLY_TIMESTAMP · Content-Length · CRLF
-//! [prefix]       per token, at the roll {"order":{"maker":…,"signer":…,"tokenId":…,"side":"BUY",…,"salt":
-//! [tail]         per order              <salt>,"makerAmount":…,"takerAmount":…,"timestamp":…,"signature":…},"owner":…,"orderType":"FAK",…}
+//! [prefix]  per token, at the roll  {"order":{"maker":…,"signer":…,"tokenId":…,"side":"BUY",…,"salt":
+//! [tail]    per order               <salt>,"makerAmount":…,"takerAmount":…,"timestamp":…,"signature":…},"owner":…,"orderType":"FAK",…}
 //! ```
+//!
+//! PM15-6b: the gateway lays them side by side in `core_net::HttpsReq`'s
+//! body window (the prefix copied, the tail rendered in place after it),
+//! and the client renders the head — the `POLY_*` lines ride its extra
+//! headers — flush against them: one contiguous write, one TLS record.
 //!
 //! The venue parses the body as JSON, so the key order is ours (the three
 //! official SDKs use three different orders, spec §A.1): ours puts every
@@ -26,12 +27,6 @@ pub const PREFIX_MAX: usize = 448;
 
 /// An order tail's capacity (the longest is 906 B: below).
 pub const TAIL_MAX: usize = 1024;
-
-/// The auth head's capacity.
-pub const AUTH_HEAD_MAX: usize = 512;
-
-/// The dynamic head's capacity.
-pub const DYN_HEAD_MAX: usize = 128;
 
 /// The longest `owner` / `POLY_API_KEY` (a UUID is 36 B).
 pub const API_KEY_MAX: usize = 64;
@@ -58,50 +53,6 @@ pub fn is_plain_token(v: &[u8]) -> bool {
         i += 1;
     }
     true
-}
-
-/// The auth head of `method_path` (e.g. `b"POST /order"`; a GET carries
-/// its query here — the query is not signed): the request line and the
-/// account's fixed lines. Boot-time, once per request template.
-pub fn render_auth_head(
-    method_path: &[u8],
-    address_text: &[u8; 42],
-    api_key: &[u8],
-    passphrase: &[u8],
-    out: &mut [u8; AUTH_HEAD_MAX],
-) -> usize {
-    debug_assert!(is_plain_token(api_key) && is_plain_token(passphrase));
-    let mut at = put(out, 0, method_path);
-    at = put(out, at, b" HTTP/1.1\r\nHost: ");
-    at = put(out, at, crate::CLOB_HOST.as_bytes());
-    at = put(out, at, b"\r\nUser-Agent: multivenue-engine\r\nAccept: */*\r\nContent-Type: application/json\r\nPOLY_ADDRESS: ");
-    at = put(out, at, address_text);
-    at = put(out, at, b"\r\nPOLY_API_KEY: ");
-    at = put(out, at, api_key);
-    at = put(out, at, b"\r\nPOLY_PASSPHRASE: ");
-    at = put(out, at, passphrase);
-    put(out, at, b"\r\n")
-}
-
-/// The per-request lines: the MAC, the very `ts` digits it covers, and
-/// (with a body) its length; then the blank line.
-pub fn render_dynamic_head(
-    l2_sig: &[u8; crate::l2::L2_SIG_LEN],
-    ts_digits: &[u8],
-    content_len: Option<usize>,
-    out: &mut [u8; DYN_HEAD_MAX],
-) -> usize {
-    let mut at = put(out, 0, b"POLY_SIGNATURE: ");
-    at = put(out, at, l2_sig);
-    at = put(out, at, b"\r\nPOLY_TIMESTAMP: ");
-    at = put(out, at, ts_digits);
-    at = put(out, at, b"\r\n");
-    if let Some(n) = content_len {
-        at = put(out, at, b"Content-Length: ");
-        at = put_u64(out, at, n as u64);
-        at = put(out, at, b"\r\n");
-    }
-    put(out, at, b"\r\n")
 }
 
 /// Unix seconds as the `POLY_TIMESTAMP` digits, into `out`; returns

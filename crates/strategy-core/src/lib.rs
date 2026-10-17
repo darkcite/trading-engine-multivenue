@@ -1543,7 +1543,10 @@ pub struct Pm15Counters {
     pub submit_refused: u64,
     /// Fills booked against a pending IoC.
     pub fills: u64,
-    /// Fills no pending owned.
+    /// PM15-6b: fills booked by their client id after the pending was
+    /// written off (a live fill the taker hold delayed).
+    pub late_fills: u64,
+    /// Fills no pending nor live market owned.
     pub unknown_fills: u64,
     /// Settled markets where a position of ours won.
     pub settled_won: u64,
@@ -1568,7 +1571,7 @@ pub struct Pm15Counters {
 
 /// How many cumulative tallies [`Pm15Counters`] carries (its fields from
 /// `rolls` through `settled_unknown`, in order).
-pub const PM15_TALLIES: usize = 30;
+pub const PM15_TALLIES: usize = 31;
 
 /// The metric suffix of each tally, in [`Pm15Counters::tallies`] order.
 pub const PM15_COUNTER_NAMES: [&str; PM15_TALLIES] = [
@@ -1598,6 +1601,7 @@ pub const PM15_COUNTER_NAMES: [&str; PM15_TALLIES] = [
     "takes_unfilled",
     "submit_refused",
     "fills",
+    "late_fills",
     "unknown_fills",
     "settled_won",
     "settled_lost",
@@ -1635,6 +1639,7 @@ impl Pm15Counters {
             self.takes_unfilled,
             self.submit_refused,
             self.fills,
+            self.late_fills,
             self.unknown_fills,
             self.settled_won,
             self.settled_lost,

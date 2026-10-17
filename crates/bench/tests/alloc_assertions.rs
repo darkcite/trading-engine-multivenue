@@ -20488,17 +20488,14 @@ fn pm15_ingress_driver_and_member_are_zero_alloc() {
 
 /// PM15-6a gate 115: the slot-9 arm's order path without a socket — the
 /// FAK amounts, the struct hash and signature (EOA and the Deposit
-/// Wallet's wrapper), the per-order tail and dynamic head, the L2 MAC over
-/// the request's spans, the answer's read and a user-channel frame's scan.
-/// Zero bytes per order.
+/// Wallet's wrapper), the per-order tail, the L2 MAC over the request's
+/// spans, the answer's read and a user-channel frame's scan. Zero bytes
+/// per order. (PM15-6b: the head is `HttpsReq`'s, gate 77b's.)
 #[test]
 fn pm15_exec_order_path_is_zero_alloc() {
     use exec_polymarket::amounts::fak_buy;
     use exec_polymarket::l2::L2Secret;
-    use exec_polymarket::render::{
-        render_dynamic_head, render_order_tail, render_token_prefix, render_ts, DYN_HEAD_MAX, PREFIX_MAX,
-        TAIL_MAX,
-    };
+    use exec_polymarket::render::{render_order_tail, render_token_prefix, render_ts, PREFIX_MAX, TAIL_MAX};
     use exec_polymarket::response::{read_order_answer, Verdict};
     use exec_polymarket::sign::{sign_order, SIG_MAX};
     use exec_polymarket::userws::{scan_user_frame, UserEvt, KIND_TRADE};
@@ -20519,7 +20516,6 @@ fn pm15_exec_order_path_is_zero_alloc() {
     let api_key: &[u8] = b"00000000-0000-0000-0000-000000000000";
     let mut prefix = [0u8; PREFIX_MAX];
     let mut tail = [0u8; TAIL_MAX];
-    let mut dynh = [0u8; DYN_HEAD_MAX];
     let mut sig = [0u8; SIG_MAX];
     let mut ts = [0u8; 20];
     let mut evts = [UserEvt::BLANK; 4];
@@ -20570,8 +20566,7 @@ fn pm15_exec_order_path_is_zero_alloc() {
         let t = render_order_tail(o.salt, &a, o.timestamp_ms, &sig[..s.sig_len], api_key, &mut tail);
         let tn = render_ts(1_792_217_690 + i, &mut ts);
         let mac = secret.sign(&[&ts[..tn], b"POST", b"/order", &prefix[..p], &tail[..t]]);
-        let d = render_dynamic_head(&mac, &ts[..tn], Some(p + t), &mut dynh);
-        bytes_out += d + t;
+        bytes_out += mac.len() + t;
         if read_order_answer(200, answer).verdict == Verdict::Accepted {
             accepted += 1;
         }
@@ -20582,7 +20577,177 @@ fn pm15_exec_order_path_is_zero_alloc() {
         i += 1;
     }
     let (allocs, nbytes, _) = g.delta();
-    std::hint::black_box((bytes_out, &tail, &dynh));
+    std::hint::black_box((bytes_out, &tail));
     assert_eq!((accepted, fills), (N, N), "gate 115: every answer accepted and every frame a fill");
     assert_eq!(allocs, 0, "gate 115: the Polymarket order path allocated {allocs} times ({nbytes} B)");
+}
+
+/// PM15-6b gate 130: the slot-9 arm's two halves on one thread, at 0 B per
+/// order. pm-gw end to end on a fixed CLOB rig — the window from the spec
+/// ring, the amounts, the signature, the body in place, the MAC, SENT, the
+/// request and its answer (the venue's zero-fill FAK refusal) — and the
+/// arm admitting, draining SENT and REFUSED and retiring; then the arm
+/// alone against a scripted duplex: SENT, ACK, a channel trade booked
+/// once, a repeat, the retirement.
+#[test]
+fn pm15_exec_arm_and_gateway_are_zero_alloc() {
+    use clob_dispatcher::OrderDispatch;
+    use core_types::pm_roll::{pm_instance_id, pm_pair_of_window, pm_rolling_sym, pm_window_of_open};
+    use core_types::{ChannelEvent, ChannelId, Order, Price, Qty, Side, VenueId};
+    use exec_polymarket::account::PmAccount;
+    use exec_polymarket::arm::{PmArm, PmArmCfg};
+    use exec_polymarket::clob::PmClob;
+    use exec_polymarket::cmd::{PmCmd, PmEvt, EVT_ACK, EVT_SENT, PM_CMD_RING, PM_EVT_RING, PM_USER_RING};
+    use exec_polymarket::gw::{PmGateway, BODY_MIN};
+    use exec_polymarket::userws::TS_MATCHED;
+    use ingress_polymarket::gamma15::{PmTokenId, PmWindowSpec};
+    use ingress_polymarket::pm15_loop::PM15_SPEC_RING;
+
+    struct FixedClob {
+        body: Box<[u8; BODY_MIN]>,
+        resp: &'static [u8],
+        posts: u64,
+    }
+    impl PmClob for FixedClob {
+        fn body_mut(&mut self) -> &mut [u8] {
+            &mut self.body[..]
+        }
+        fn request(
+            &mut self,
+            _m: core_net::Method,
+            _t: &[u8],
+            extra: &[core_net::Header<'_>],
+            body_len: usize,
+        ) -> Result<(u16, core::ops::Range<usize>), core_net::PostErr> {
+            self.posts += (extra.len() == 5 && body_len > 0) as u64;
+            Ok((400, 0..self.resp.len()))
+        }
+        fn resp(&self) -> &[u8] {
+            self.resp
+        }
+    }
+
+    const N: u64 = 64;
+    let key = [0x42u8; 32];
+    let me = signer_eip712::address_from_private_key(&key).unwrap();
+    let acct = |k: &[u8; 32]| {
+        PmAccount::new(
+            0,
+            me,
+            None,
+            b"00000000-0000-0000-0000-000000000000",
+            b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            b"pass",
+            signer_eip712::parse_secret_key(k).unwrap(),
+        )
+        .unwrap()
+    };
+    let w = pm_window_of_open(1_792_216_800).unwrap();
+    let inst = pm_instance_id(w, 0).unwrap();
+    let pair = pm_pair_of_window(w);
+    let up = pm_rolling_sym(0, pair, 0);
+    let mut spec = PmWindowSpec::EMPTY;
+    spec.window = w;
+    spec.tick_1e6 = 10_000;
+    spec.min_size_1e6 = 5_000_000;
+    let tok = |d: &[u8]| {
+        let mut t = PmTokenId::NONE;
+        t.b[..d.len()].copy_from_slice(d);
+        t.len = d.len() as u8;
+        t
+    };
+    spec.up = tok(b"74913418352376030655968323928940542465856871160803692353977404305259528321778");
+    spec.down = tok(b"1234");
+    spec.condition_id_len = 66;
+    spec.condition_id.copy_from_slice(b"0x53efa9a4a5bddfd12a4d154653e337cedf2ec6667842dca165036ac21f6765b7");
+    let law = ChannelEvent::new(0, VenueId::Polymarket, ChannelId::OutcomeMeta, up, u64::from(inst), 0, 10_000, 5_000_000);
+    let order = |i: u64| {
+        let mut o = Order::new(
+            1,
+            VenueId::Polymarket,
+            up,
+            Side::Bid,
+            core_fill::ORDER_KIND_IOC,
+            Price::from_raw(930_000),
+            Qty::from_raw(268_810_000),
+            (i << 49) | u64::from(inst),
+        );
+        o.strategy_id = 9;
+        o
+    };
+
+    // Half one: the arm and pm-gw on one thread.
+    let (eng, end) = exec_gateway::duplex::<PmCmd, PmEvt, PM_CMD_RING, PM_EVT_RING>();
+    let (mut specs_tx, specs_rx) = core_ring::Ring::<PmWindowSpec, PM15_SPEC_RING>::new().split();
+    let (_user_tx, user_rx) = core_ring::Ring::<PmEvt, PM_USER_RING>::new().split();
+    let clob = FixedClob {
+        body: exec_gateway::boxed_array(0),
+        resp: br#"{"error":"no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found."}"#,
+        posts: 0,
+    };
+    let mut gw = PmGateway::new(acct(&key), clob, end, specs_rx, 7);
+    let mut arm = PmArm::new(PmArmCfg { slot: 9, live_families: 1 }, eng, user_rx);
+    arm.on_venue_event(&law);
+    assert!(specs_tx.try_push_ref(&spec));
+    gw.step(1, 1_792_217_690_000_000_000);
+    // Warm-up: the first signature builds the secp256k1 context (boot).
+    arm.submit(&order(0)).unwrap();
+    gw.step(2, 1_792_217_690_000_000_000);
+    arm.on_idle();
+    arm.on_idle();
+    let _ = arm.try_next_retired();
+    let g = AllocGuard::new();
+    let mut retired = 0u64;
+    let mut i = 1u64;
+    while i <= N {
+        arm.submit(&order(i)).unwrap();
+        gw.step(2 + i, 1_792_217_690_000_000_000 + i * 1_000_000);
+        arm.on_idle();
+        arm.on_idle();
+        while arm.try_next_retired().is_some() {
+            retired += 1;
+        }
+        i += 1;
+    }
+    let (allocs, nbytes, _) = g.delta();
+    assert_eq!(retired, N, "gate 130: every order refused and retired");
+    assert_eq!(gw.counters().refused, N + 1);
+    assert_eq!(allocs, 0, "gate 130: the arm and pm-gw allocated {allocs} times ({nbytes} B)");
+
+    // Half two: the arm against a scripted duplex and user ring.
+    let (eng, mut end) = exec_gateway::duplex::<PmCmd, PmEvt, PM_CMD_RING, PM_EVT_RING>();
+    let (mut user_tx, user_rx) = core_ring::Ring::<PmEvt, PM_USER_RING>::new().split();
+    let mut arm = PmArm::new(PmArmCfg { slot: 9, live_families: 1 }, eng, user_rx);
+    arm.on_venue_event(&law);
+    let g = AllocGuard::new();
+    let mut fills = 0u64;
+    let mut retired = 0u64;
+    let mut i = 1u64;
+    while i <= N {
+        let o = order(i);
+        arm.submit(&o).unwrap();
+        while end.cmd.pop().is_some() {}
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&i.to_le_bytes());
+        let mut e = PmEvt::about(EVT_SENT, o.client_oid);
+        e.order_id = id;
+        assert!(end.evt.emit(&e));
+        let mut e = PmEvt::about(EVT_ACK, o.client_oid);
+        e.order_id = id;
+        e.b = 1;
+        assert!(end.evt.emit(&e));
+        let t = PmEvt::fill(id, 1_000 + i, 930_000, 268_810_000, TS_MATCHED);
+        assert!(user_tx.try_push_ref(&t));
+        assert!(user_tx.try_push_ref(&t));
+        while arm.try_next_fill().is_some() {
+            fills += 1;
+        }
+        while arm.try_next_retired().is_some() {
+            retired += 1;
+        }
+        i += 1;
+    }
+    let (allocs, nbytes, _) = g.delta();
+    assert_eq!((fills, retired), (N, N), "gate 130: each trade booked once, each order retired");
+    assert_eq!(allocs, 0, "gate 130: the arm allocated {allocs} times ({nbytes} B)");
 }

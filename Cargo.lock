@@ -874,9 +874,16 @@ dependencies = [
 name = "exec-polymarket"
 version = "0.1.0"
 dependencies = [
+ "clob-dispatcher",
  "core-crypto",
+ "core-fill",
+ "core-net",
  "core-parse",
+ "core-ring",
+ "core-time",
  "core-types",
+ "exec-gateway",
+ "ingress-polymarket",
  "memchr",
  "signer-eip712",
  "zeroize",

@@ -1,0 +1,300 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
+//! The arm against a scripted pm-gw and pm-user: the test holds the
+//! gateway's end of the duplex and the user ring's producer.
+//!
+//! COPY-DOCTRINE: a test-only module (`#[cfg(test)] mod tests;` in
+//! `arm.rs`): every copy here builds a fixture or reads the rig's rings.
+
+use super::*;
+use crate::cmd::PM_USER_RING;
+use crate::userws::{TS_CONFIRMED, TS_FAILED, TS_MATCHED, TS_MINED};
+use core_ring::{Producer, Ring};
+use core_types::pm_roll::{pm_instance_id, pm_mark_sym, pm_pair_of_window, pm_rolling_sym, pm_window_of_open};
+use exec_gateway::{duplex, GatewayEnd};
+
+const OPEN: u64 = 1_792_216_800;
+const SLOT: u8 = 9;
+
+struct Bench {
+    arm: PmArm,
+    gw: GatewayEnd<PmCmd, PmEvt, PM_CMD_RING, PM_EVT_RING>,
+    user: Producer<PmEvt, PM_USER_RING>,
+}
+
+fn window() -> u32 {
+    pm_window_of_open(OPEN).unwrap()
+}
+
+fn inst(f: usize) -> u32 {
+    pm_instance_id(window(), f).unwrap()
+}
+
+fn sym(f: usize, leg: u32) -> SymbolId {
+    pm_rolling_sym(f, pm_pair_of_window(window()), leg)
+}
+
+fn law(f: usize, leg: u32, tick: i64) -> ChannelEvent {
+    ChannelEvent::new(
+        0,
+        VenueId::Polymarket,
+        ChannelId::OutcomeMeta,
+        sym(f, leg),
+        u64::from(inst(f)),
+        0,
+        tick,
+        5_000_000,
+    )
+}
+
+fn bench() -> Bench {
+    let (eng, gw) = duplex::<PmCmd, PmEvt, PM_CMD_RING, PM_EVT_RING>();
+    let (user, user_rx) = Ring::<PmEvt, PM_USER_RING>::new().split();
+    let mut arm = PmArm::new(
+        PmArmCfg {
+            slot: SLOT,
+            live_families: 0b11,
+        },
+        eng,
+        user_rx,
+    );
+    arm.on_venue_event(&law(0, 0, 10_000));
+    arm.on_venue_event(&law(0, 1, 10_000));
+    arm.on_venue_event(&law(1, 0, 1_000));
+    Bench { arm, gw, user }
+}
+
+fn oid(f: usize, leg: u64, seq: u64) -> u64 {
+    (seq << 49) | (leg << 48) | ((f as u64) << 32) | u64::from(inst(f))
+}
+
+fn order(f: usize, leg: u32, px: i64, qty: i64, seq: u64) -> Order {
+    let mut o = Order::new(
+        1,
+        VenueId::Polymarket,
+        sym(f, leg),
+        Side::Bid,
+        ORDER_KIND_IOC,
+        Price::from_raw(px),
+        Qty::from_raw(qty),
+        oid(f, u64::from(leg), seq),
+    );
+    o.strategy_id = SLOT;
+    o
+}
+
+fn cmds(b: &mut Bench) -> Vec<PmCmd> {
+    let mut v = Vec::new();
+    while let Some(c) = b.gw.cmd.pop() {
+        v.push(*c);
+    }
+    v
+}
+
+fn gw(b: &mut Bench, e: PmEvt) {
+    assert!(b.gw.evt.emit(&e));
+}
+
+fn sent(cid: u64, id: [u8; 32]) -> PmEvt {
+    let mut e = PmEvt::about(EVT_SENT, cid);
+    e.order_id = id;
+    e
+}
+
+fn ack(cid: u64, id: [u8; 32], trades: i64) -> PmEvt {
+    let mut e = PmEvt::about(EVT_ACK, cid);
+    e.order_id = id;
+    e.b = trades;
+    e
+}
+
+fn fills(b: &mut Bench) -> Vec<Fill> {
+    let mut v = Vec::new();
+    while let Some(f) = b.arm.try_next_fill() {
+        v.push(f);
+    }
+    v
+}
+
+#[test]
+fn admission_refuses_everything_but_a_live_familys_ioc_buy_on_its_law() {
+    let mut b = bench();
+    let mut o = order(0, 0, 930_000, 268_810_000, 1);
+    o.strategy_id = 3;
+    assert_eq!(b.arm.submit(&o), Err(DispatchError::Unroutable), "another slot");
+    let mut o = order(0, 0, 930_000, 1_000_000, 1);
+    o.sym = pm_mark_sym(0);
+    assert_eq!(b.arm.submit(&o), Err(DispatchError::Unroutable), "the mark slot");
+    let mut o = order(0, 0, 930_000, 1_000_000, 1);
+    o.side = Side::Ask;
+    assert_eq!(b.arm.submit(&o), Err(DispatchError::Unroutable), "never a sell");
+    let o = order(2, 0, 930_000, 1_000_000, 1);
+    assert_eq!(b.arm.submit(&o), Err(DispatchError::Unroutable), "SOL is not live (D-9)");
+    let o = order(1, 1, 930_000, 1_000_000, 1);
+    assert_eq!(b.arm.submit(&o), Err(DispatchError::Unroutable), "no law on ETH's Down yet");
+    assert_eq!(
+        (b.arm.counters().refused_shape, b.arm.counters().refused_family),
+        (4, 1)
+    );
+    assert!(cmds(&mut b).is_empty());
+    // BTC Up at 0.93 for 268.81 shares: $249.99 to spend.
+    let o = order(0, 0, 930_000, 268_810_000, 1);
+    assert_eq!(b.arm.submit(&o), Ok(()));
+    let c = cmds(&mut b);
+    assert_eq!(c.len(), 1);
+    assert_eq!(
+        (c[0].kind, c[0].client_oid, c[0].px_1e6, c[0].usd_1e6, c[0].instance, c[0].tick_1e6, c[0].leg),
+        (CMD_SUBMIT, o.client_oid, 930_000, 249_990_000, inst(0), 10_000, 0)
+    );
+    assert_eq!(b.arm.submit(&o), Err(DispatchError::Unroutable), "one cid, one order");
+    assert_eq!(b.arm.cancel(&CancelReq::new(1, VenueId::Polymarket, o.sym, o.client_oid)), Err(DispatchError::Unsupported));
+}
+
+#[test]
+fn an_order_books_each_trade_once_and_retires_a_poll_after_its_fills() {
+    let mut b = bench();
+    let o = order(0, 0, 930_000, 268_810_000, 1);
+    b.arm.submit(&o).unwrap();
+    let _ = cmds(&mut b);
+    let id = [3u8; 32];
+    gw(&mut b, sent(o.client_oid, id));
+    gw(&mut b, ack(o.client_oid, id, 2));
+    assert!(b.user.try_push_ref(&PmEvt::fill(id, 11, 920_000, 100_000_000, TS_MATCHED)));
+    assert!(b.user.try_push_ref(&PmEvt::fill(id, 11, 920_000, 100_000_000, TS_MINED)));
+    let f = fills(&mut b);
+    assert_eq!(f.len(), 1, "a trade id is booked once");
+    assert_eq!(
+        (f[0].sym, f[0].px.raw(), f[0].qty.raw(), f[0].order_id, f[0].strategy_id),
+        (o.sym, 920_000, 100_000_000, o.client_oid, SLOT)
+    );
+    assert_eq!(f[0].origin, FILL_ORIGIN_VENUE);
+    assert!(b.arm.try_next_retired().is_none(), "one of two trades: open");
+    assert!(b.user.try_push_ref(&PmEvt::fill(id, 12, 930_000, 168_810_000, TS_MATCHED)));
+    // Done at that poll; its retirement is released by the next one —
+    // which `fills` ran after it had popped the fill.
+    assert_eq!(fills(&mut b).len(), 1);
+    let r = b.arm.try_next_retired().expect("retired after its fills");
+    assert_eq!((r.client_oid, r.slot, r.why), (o.client_oid, SLOT, RETIRED_FILLED));
+    assert!(b.user.try_push_ref(&PmEvt::fill(id, 12, 930_000, 168_810_000, TS_CONFIRMED)));
+    assert!(fills(&mut b).is_empty());
+    assert_eq!((b.arm.counters().confirmed, b.arm.counters().repeats), (1, 2));
+    assert!(!b.arm.halted());
+    assert_eq!(b.arm.open_orders(), 0);
+}
+
+#[test]
+fn a_fill_before_its_sent_is_read_finds_its_order_and_a_stranger_halts() {
+    let mut b = bench();
+    let o = order(0, 1, 900_000, 10_000_000, 2);
+    b.arm.submit(&o).unwrap();
+    let id = [8u8; 32];
+    // The channel's trade is in the user ring before the arm read SENT.
+    assert!(b.user.try_push_ref(&PmEvt::fill(id, 5, 900_000, 10_000_000, TS_MATCHED)));
+    gw(&mut b, sent(o.client_oid, id));
+    // (SENT is read first anyway: the gw ring is drained before the user
+    // ring; and again on a trade that finds no order.)
+    assert_eq!(fills(&mut b).len(), 1);
+    assert!(!b.arm.halted());
+    assert!(b.user.try_push_ref(&PmEvt::fill([9; 32], 6, 900_000, 1_000_000, TS_MATCHED)));
+    assert!(fills(&mut b).is_empty());
+    assert!(b.arm.halted(), "a trade of no order of ours");
+    assert_eq!(b.arm.submit(&order(0, 0, 930_000, 1_000_000, 3)), Err(DispatchError::SlotDisabled));
+}
+
+#[test]
+fn a_reversal_after_a_booking_halts() {
+    let mut b = bench();
+    let o = order(0, 0, 930_000, 10_000_000, 1);
+    b.arm.submit(&o).unwrap();
+    let id = [4u8; 32];
+    gw(&mut b, sent(o.client_oid, id));
+    assert!(b.user.try_push_ref(&PmEvt::fill(id, 21, 930_000, 10_000_000, TS_MATCHED)));
+    assert!(b.user.try_push_ref(&PmEvt::fill(id, 21, 930_000, 10_000_000, TS_FAILED)));
+    assert_eq!(fills(&mut b).len(), 1);
+    assert!(b.arm.halted());
+    assert_eq!(b.arm.counters().reversed, 1);
+}
+
+#[test]
+fn refusals_retire_and_doubt_goes_to_recon_which_books_and_retires() {
+    let mut b = bench();
+    let o = order(0, 0, 930_000, 10_000_000, 1);
+    b.arm.submit(&o).unwrap();
+    let _ = cmds(&mut b);
+    let mut r = PmEvt::about(EVT_REFUSED, o.client_oid);
+    r.why = crate::response::Refusal::NoMatch as u8;
+    gw(&mut b, r);
+    b.arm.on_idle();
+    b.arm.on_idle();
+    let ret = b.arm.try_next_retired().unwrap();
+    assert_eq!(ret.why, RETIRED_REJECTED);
+    assert_eq!(b.arm.counters().no_match, 1);
+    // In doubt: recon after DOUBT_RECON_NS, keyed by the order's id.
+    let o2 = order(0, 0, 930_000, 10_000_000, 2);
+    b.arm.submit(&o2).unwrap();
+    let _ = cmds(&mut b);
+    let id = [6u8; 32];
+    gw(&mut b, sent(o2.client_oid, id));
+    let mut d = PmEvt::about(EVT_IN_DOUBT, o2.client_oid);
+    d.order_id = id;
+    gw(&mut b, d);
+    let t0 = core_time::now_ns();
+    b.arm.pump(t0);
+    assert!(cmds(&mut b).is_empty(), "not yet");
+    b.arm.pump(t0 + DOUBT_RECON_NS + SCAN_EVERY_NS);
+    let c = cmds(&mut b);
+    assert_eq!((c.len(), c[0].kind, c[0].order_id, c[0].instance), (1, CMD_RECON, id, inst(0)));
+    // Recon's fill comes on the gw ring, then DONE.
+    gw(&mut b, PmEvt::fill(id, 31, 925_000, 10_000_000, TS_CONFIRMED));
+    let mut done = PmEvt::about(EVT_DONE, o2.client_oid);
+    done.b = 1;
+    gw(&mut b, done);
+    let f = fills(&mut b);
+    assert_eq!((f.len(), f[0].px.raw()), (1, 925_000));
+    b.arm.on_idle();
+    assert_eq!(b.arm.try_next_retired().unwrap().why, RETIRED_FILLED);
+    // A recon that could not read the trades: the slot stops.
+    let o3 = order(0, 0, 930_000, 10_000_000, 3);
+    b.arm.submit(&o3).unwrap();
+    let mut done = PmEvt::about(EVT_DONE, o3.client_oid);
+    done.b = -1;
+    gw(&mut b, done);
+    b.arm.on_idle();
+    assert!(b.arm.halted());
+}
+
+#[test]
+fn a_gap_and_a_deadline_send_open_orders_to_recon_and_a_late_trade_still_books() {
+    let mut b = bench();
+    let o = order(0, 0, 930_000, 10_000_000, 1);
+    b.arm.submit(&o).unwrap();
+    let _ = cmds(&mut b);
+    let id = [2u8; 32];
+    gw(&mut b, sent(o.client_oid, id));
+    gw(&mut b, ack(o.client_oid, id, 1));
+    assert!(b.user.try_push_ref(&PmEvt::about(EVT_GAP, 0)));
+    b.arm.on_idle();
+    let c = cmds(&mut b);
+    assert_eq!((c.len(), c[0].kind, c[0].client_oid), (1, CMD_RECON, o.client_oid));
+    // Recon found nothing; DONE retires it. A trade the venue sends later
+    // still finds the kept row.
+    let mut done = PmEvt::about(EVT_DONE, o.client_oid);
+    done.b = 0;
+    gw(&mut b, done);
+    b.arm.on_idle();
+    b.arm.on_idle();
+    assert_eq!(b.arm.try_next_retired().unwrap().why, RETIRED_CANCELED_VENUE);
+    assert!(b.user.try_push_ref(&PmEvt::fill(id, 41, 930_000, 4_000_000, TS_MATCHED)));
+    assert_eq!(fills(&mut b).len(), 1, "a late trade of a done order");
+    assert!(!b.arm.halted());
+    // The deadline: an order with no answer goes to recon.
+    let o2 = order(0, 0, 930_000, 10_000_000, 2);
+    b.arm.submit(&o2).unwrap();
+    let _ = cmds(&mut b);
+    gw(&mut b, sent(o2.client_oid, [1; 32]));
+    let t0 = core_time::now_ns();
+    b.arm.pump(t0 + DEADLINE_NS + SCAN_EVERY_NS);
+    let c = cmds(&mut b);
+    assert_eq!((c.len(), c[0].kind, c[0].order_id), (1, CMD_RECON, [1; 32]));
+}

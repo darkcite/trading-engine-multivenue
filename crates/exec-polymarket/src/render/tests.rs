@@ -39,31 +39,6 @@ fn plain_tokens_are_judged() {
     assert!(!is_plain_token(b"crlf\r\n"));
 }
 
-#[test]
-fn the_heads_render_exactly() {
-    let me = eip55(&address_from_private_key(&HARDHAT).unwrap());
-    let mut head = [0u8; AUTH_HEAD_MAX];
-    let n = render_auth_head(b"POST /order", &me, KEY, b"pass-phrase", &mut head);
-    assert_eq!(
-        s(&head[..n]),
-        "POST /order HTTP/1.1\r\nHost: clob.polymarket.com\r\nUser-Agent: multivenue-engine\r\nAccept: */*\r\n\
-         Content-Type: application/json\r\nPOLY_ADDRESS: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\r\n\
-         POLY_API_KEY: 00000000-0000-0000-0000-000000000000\r\nPOLY_PASSPHRASE: pass-phrase\r\n"
-    );
-    let mut ts = [0u8; 20];
-    let t = render_ts(1_780_449_126, &mut ts);
-    let mut dynh = [0u8; DYN_HEAD_MAX];
-    let sig = *b"fsWxxxgNmOGHMGBHXU5bnY1vEoT82vOHZWF8txkUfjU=";
-    let n = render_dynamic_head(&sig, &ts[..t], Some(1234), &mut dynh);
-    assert_eq!(
-        s(&dynh[..n]),
-        "POLY_SIGNATURE: fsWxxxgNmOGHMGBHXU5bnY1vEoT82vOHZWF8txkUfjU=\r\nPOLY_TIMESTAMP: 1780449126\r\n\
-         Content-Length: 1234\r\n\r\n"
-    );
-    let n = render_dynamic_head(&sig, &ts[..t], None, &mut dynh);
-    assert!(s(&dynh[..n]).ends_with("POLY_TIMESTAMP: 1780449126\r\n\r\n"));
-}
-
 /// The body for the VER real-token EOA order: our key order, its
 /// signature (the VER vector), and the MAC over the two spans.
 #[test]
