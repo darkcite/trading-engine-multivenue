@@ -274,7 +274,8 @@ pub(crate) fn check(p: &PineProgram, t: &'static BuiltinTable) -> Result<(), Ver
             let ok = if st && co {
                 false
             } else if st {
-                s < n_states && l.states[s].kind == StateKind::Builtin && l.states[s].bytes >= ent.state_bytes_min
+                // The body's view: the state half of a RESTART block (CAR-R33-9), else the block.
+                s < n_states && l.states[s].kind == StateKind::Builtin && l.states[s].view_bytes() >= ent.state_bytes_min
             } else if co {
                 s < n_states && l.states[s].kind == StateKind::Collection
             } else {

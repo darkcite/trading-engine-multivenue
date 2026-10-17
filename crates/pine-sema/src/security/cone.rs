@@ -53,6 +53,8 @@ pub(crate) struct Cx<'a> {
     pub(crate) depth: u32,
     /// The dialect's argument-less `strategy()` fold — every child's `decl` (§4.16).
     pub(crate) bare: pine_ir::StrategyDecl,
+    /// U13 reads `restart` (CAR-R33-9, §4.7.4) — the root's reading, for every child's sites.
+    pub(crate) ta_restart: bool,
 }
 
 /// Every key the whole tree has extracted so far (`3031`, §4.11.6).

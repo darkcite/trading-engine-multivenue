@@ -359,7 +359,13 @@ impl ChartSource {
             })?;
         if let Err(e) = std::fs::metadata(&path) {
             if e.kind() == std::io::ErrorKind::NotFound {
-                return Err(RunError::Skip(SkipReason::NoBarFile { tf_s }));
+                // COPY: the symbol key (≤ 64 B) once per missing file, on the skip path (load
+                // time) — the skip names the symbol as well as the timeframe (r33j, D047) —
+                // a `&'static str` lookup over the ticker map rejected (any key may be asked for).
+                return Err(RunError::Skip(SkipReason::NoBarFile {
+                    symbol_key: symbol_key.to_owned(),
+                    tf_s,
+                }));
             }
         }
         let file = match pine_screen::BarFile::open_clamped(&path, clamp) {

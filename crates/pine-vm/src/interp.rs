@@ -5,7 +5,7 @@
 //! bar path and contains no journal instruction. No closures, no iterators,
 //! no `?`, no allocation; every unchecked access names its verifier rule.
 
-use pine_ir::{flg, op, ring_flag, FaultKind, Insn, RingDesc, SiteId, StateDesc, NA_I64};
+use pine_ir::{flg, op, ring_flag, state_flag, FaultKind, Insn, RingDesc, SiteId, StateDesc, NA_I64};
 
 use crate::builtin::{bf, BuiltinEntry};
 use crate::frame::{Core, Frame};
@@ -388,7 +388,9 @@ pub(crate) fn run<const J: bool>(fr: &mut Frame<'_>, x: &Exec) -> Result<u32, (F
                         debug_assert!((ins.dst as u32) < x.states_len, "rule 23");
                         let d = *x.states.add(ins.dst as usize);
                         c.cur_off = d.off;
-                        c.cur_bytes = d.bytes;
+                        // U13 `restart` (CAR-R33-9): an in-loop site re-runs from its pre-image;
+                        // the body sees the state half. Every other block as before.
+                        c.cur_bytes = if d.flags & state_flag::RESTART != 0 { restart::<J>(c, d) } else { d.bytes };
                     } else {
                         c.cur_off = 0;
                         c.cur_bytes = 0;
@@ -461,6 +463,52 @@ pub(crate) fn run<const J: bool>(fr: &mut Frame<'_>, x: &Exec) -> Result<u32, (F
             }
         }
     }
+}
+
+/// The `CALL_BUILTIN` prologue of a `state_flag::RESTART` site — U13 reading `restart`
+/// (CAR-R33-9, `pin:U13-ta-in-loop`): every execution of an in-loop site on a bar starts from the
+/// block as committed at the previous bar, and the bar's last execution leaves the block kept.
+/// The block is `[state b | pre-image b | stamp u64]` (rule 6). The bar's first execution (stamp
+/// ≠ `bar_index + 1`) saves the state into the pre-image and stamps it; every later execution on
+/// the bar restores the state from the pre-image. In a tick the whole block is journaled before
+/// either write, so the undo restores state, pre-image and stamp together and the next evaluation
+/// of the bar re-saves. Returns `b`, the bytes the body sees.
+///
+/// # Safety
+/// `d` is a verified descriptor with `RESTART` (rule 6: a `Builtin` block, `IN_LOOP`,
+/// `bytes = 2b + 8`, `b ≥ 8` and 8-aligned, inside the states region).
+#[inline(never)]
+unsafe fn restart<const J: bool>(c: &mut Core, d: StateDesc) -> u32 {
+    debug_assert!(
+        d.flags & state_flag::IN_LOOP != 0 && d.bytes >= 24 && (d.bytes - 8) % 16 == 0 && d.off % 8 == 0,
+        "rule 6: malformed RESTART block"
+    );
+    let b = (d.bytes - StateDesc::RESTART_STAMP_BYTES) / 2;
+    if J {
+        c.touch_block(d.off, d.bytes);
+    }
+    // SAFETY: rule 6 — [off, off + 2b + 8) is a verified Builtin block of the arena; the stamp at
+    // off + 2b is 8-aligned (off and b are multiples of 8); state and pre-image are disjoint halves.
+    unsafe {
+        let blk = c.base.add(d.off as usize);
+        let pre = blk.add(b as usize);
+        let stamp = blk.add(2 * b as usize) as *mut u64;
+        let now = (c.bar_index + 1) as u64; // >= 1: a cold (zeroed) block never matches
+        if *stamp != now {
+            // COPY: the state into its pre-image, b bytes per in-loop site per bar evaluation —
+            // the bar's first execution must leave the committed block recoverable for the repeats
+            // — a journal-based undo rejected: the journal is off in bar-close mode and records a
+            // block once per tick, not once per execution.
+            core::ptr::copy_nonoverlapping(blk, pre, b as usize);
+            *stamp = now;
+        } else {
+            // COPY: the pre-image back over the state, b bytes per repeat execution — the restart
+            // itself — running the body on the pre-image in place rejected: the bar must commit
+            // the last execution's state, which then would need a copy back at bar end anyway.
+            core::ptr::copy_nonoverlapping(pre, blk, b as usize);
+        }
+    }
+    b
 }
 
 /// Debug: a builtin's error is one its flags declare.

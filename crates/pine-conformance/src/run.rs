@@ -23,12 +23,16 @@ use crate::host::{
 use crate::report::{Divergence, Verdict, NO_ROW};
 
 /// Why a fixture did not run. Counted and printed, never a pass or a failure (I20).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy` since r33j: `NoBarFile` names the symbol key it missed (load-time text).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
     /// `RunnerOptions::bars_root` is `None`.
     NoBarsRoot,
     /// No prepared bar file at `bar_path(root, key, tf_s)`.
     NoBarFile {
+        /// The canonical symbol key asked for (`binance_usdm:ethusdt` for D047).
+        symbol_key: String,
         /// The timeframe asked for.
         tf_s: u32,
     },
@@ -1179,7 +1183,7 @@ impl Runner {
             ))
         ) && matches!(f.expect, Expect::Refuse { .. });
         if let (Err(RunError::Skip(s)), false) = (&r0, compiled) {
-            let v = Verdict::Skipped(*s);
+            let v = Verdict::Skipped(s.clone());
             return done(v.clone(), v, r0);
         }
         let exp = self.expectation(f, &r0, fault_key);

@@ -185,7 +185,11 @@ pub(crate) fn check(p: &PineProgram) -> Result<(), VerifyError> {
             && b >= min
             && o >= lo
             && o + b <= hi
-            && d.flags & !state_flag::IN_LOOP == 0;
+            && d.flags & !state_flag::ALL == 0
+            // CAR-R33-9: a RESTART block is an IN_LOOP Builtin block `[state b | pre-image b |
+            // stamp u64]` with b >= 8 and 8-aligned — the prologue's copies stay inside it.
+            && (d.flags & state_flag::RESTART == 0
+                || (d.kind == StateKind::Builtin && d.flags & state_flag::IN_LOOP != 0 && b >= 24 && (b - 8) % 16 == 0));
         if !ok {
             return Err(e(rule::STATE_DENSE, NO_PC, k as u32));
         }

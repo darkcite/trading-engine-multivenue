@@ -397,3 +397,35 @@ fn broker_view_netprofit_f64_bits_round_trip() {
         assert_ne!(b, BrokerView::default());
     }
 }
+
+/// CAR-R33-9 (r33i, `pin:U13-ta-in-loop`): the `RESTART` bit and its block layout
+/// `[state b | pre-image b | stamp u64]` — `bytes = 2b + 8`, the body's view `b`.
+#[test]
+fn state_flag_restart_block_layout_is_frozen() {
+    assert_eq!(state_flag::IN_LOOP, 1);
+    assert_eq!(state_flag::RESTART, 2);
+    assert_eq!(state_flag::ALL, 3);
+    assert_eq!(StateDesc::RESTART_STAMP_BYTES, 8);
+    assert_eq!(StateDesc::restart_bytes(8), 24);
+    assert_eq!(StateDesc::restart_bytes(64), 136);
+    assert_eq!(StateDesc::restart_bytes(u32::MAX & !7), u32::MAX & !7);
+    let d = |flags: u8, bytes: u32| StateDesc {
+        site: SiteId(0),
+        kind: StateKind::Builtin,
+        flags,
+        off: 64,
+        bytes,
+    };
+    assert_eq!(
+        d(state_flag::IN_LOOP | state_flag::RESTART, 136).view_bytes(),
+        64
+    );
+    assert_eq!(d(state_flag::IN_LOOP, 136).view_bytes(), 136);
+    assert_eq!(d(0, 64).view_bytes(), 64);
+    let mut b = 8;
+    while b <= 4096 {
+        let r = d(state_flag::RESTART, StateDesc::restart_bytes(b));
+        assert_eq!((r.view_bytes(), r.bytes % 8, (r.bytes - 8) % 16), (b, 0, 0));
+        b += 8;
+    }
+}

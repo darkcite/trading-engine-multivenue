@@ -98,6 +98,15 @@ pub mod state_flag {
     /// `Builtin` site with it advances inside the loop is the
     /// `pin:U13-ta-in-loop` switch (contract §3.17), never assumed here.
     pub const IN_LOOP: u8 = 1 << 0;
+    /// U13 reading `restart` (CAR-R33-9, `pin:U13-ta-in-loop`): an `IN_LOOP` `Builtin` block
+    /// laid out as `[state b | pre-image b | stamp u64]`, `bytes = 2b + 8` (see
+    /// [`StateDesc::restart_bytes`]); the builtin body sees only the first `b` bytes
+    /// ([`StateDesc::view_bytes`]). Every execution of the site on a bar starts from the block
+    /// as committed at the previous bar; the bar's last execution leaves the block kept. The
+    /// VM's `CALL_BUILTIN` prologue keeps the pre-image, stamped with `bar_index + 1`.
+    pub const RESTART: u8 = 1 << 1;
+    /// Every defined bit.
+    pub const ALL: u8 = IN_LOOP | RESTART;
 }
 
 /// One per-site block. 12 bytes. `states[i].site == SiteId(i)` (I-4).
@@ -114,6 +123,35 @@ pub struct StateDesc {
     pub off: u32,
     /// Block size in bytes, a multiple of 8.
     pub bytes: u32,
+}
+
+impl StateDesc {
+    /// Bytes of a [`state_flag::RESTART`] block's stamp, its last word.
+    pub const RESTART_STAMP_BYTES: u32 = 8;
+
+    /// The bytes of a [`state_flag::RESTART`] block whose body sees `view` bytes:
+    /// `2 · view + 8` (`view` 8-aligned, so the result is too); saturates at the 8-aligned
+    /// `u32::MAX`, which no verified frame holds.
+    #[must_use]
+    pub const fn restart_bytes(view: u32) -> u32 {
+        let b = 2 * view as u64 + Self::RESTART_STAMP_BYTES as u64;
+        if b > (u32::MAX & !7) as u64 {
+            u32::MAX & !7
+        } else {
+            b as u32
+        }
+    }
+
+    /// The bytes a builtin body addresses: `(bytes − 8) / 2` for a [`state_flag::RESTART`]
+    /// block (the state half), `bytes` otherwise.
+    #[must_use]
+    pub const fn view_bytes(&self) -> u32 {
+        if self.flags & state_flag::RESTART != 0 {
+            self.bytes.saturating_sub(Self::RESTART_STAMP_BYTES) / 2
+        } else {
+            self.bytes
+        }
+    }
 }
 
 /// What a captured plot index is.

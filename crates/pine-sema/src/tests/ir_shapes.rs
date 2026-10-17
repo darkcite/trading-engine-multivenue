@@ -859,6 +859,7 @@ fn ir_shapes_structures_sma_cross_strategy_lowers() {
         collection_cap: 64,
         str_cell_bytes: 128,
         udt_fields: &[],
+        ta_restart: rd.ta_in_loop == pine_spec::swr::TA_IN_LOOP_RESTART,
     };
     let sites = crate::sites::number(&r, &cx).expect("numbers");
     // Two `ta.sma` windows, then `ta.crossover` and `ta.crossunder` (pre-order).
@@ -1325,7 +1326,7 @@ fn ir_shapes_entry_dirs_list_constant_ids() {
 
 // ---- T14: sites -----------------------------------------------------------------------------
 
-fn sites_of(body: &str, rd: &Readings) -> Result<Vec<crate::sites::Site>, Diag> {
+pub(super) fn sites_of(body: &str, rd: &Readings) -> Result<Vec<crate::sites::Site>, Diag> {
     let mut ir = try_ir(body, Dialect::V6, rd)?;
     crate::hoist::run(&mut ir, rd)?;
     let cx = crate::sites::SiteCtx {
@@ -1334,6 +1335,7 @@ fn sites_of(body: &str, rd: &Readings) -> Result<Vec<crate::sites::Site>, Diag> 
         collection_cap: 64,
         str_cell_bytes: 128,
         udt_fields: &[4],
+        ta_restart: rd.ta_in_loop == pine_spec::swr::TA_IN_LOOP_RESTART,
     };
     crate::sites::number(&ir, &cx)
 }
@@ -1352,17 +1354,22 @@ fn sites_same_fn_two_call_sites_get_disjoint_state() {
 
 #[test]
 fn sites_window_lengths_and_loops() {
-    use pine_ir::state_flag::IN_LOOP;
+    use pine_ir::state_flag::{IN_LOOP, RESTART};
     let rd = Readings::of(Dialect::V6);
-    // A series length takes the cap; a loop body's site is IN_LOOP; an object site is sized by
-    // its fields.
+    // A series length takes the cap; a loop body's site is IN_LOOP — and, under the default U13
+    // `restart` (CAR-R33-9), RESTART with its block doubled to `2b + 8`; an object site is sized
+    // by its fields.
     let body = format!(
         "{POINT}n = bar_index % 5 + 1\na = ta.sma(close, n)\ns = 0.0\nfor i = 0 to 2\n    s += ta.sma(close, 3)\np = P.new()\nplot(a + s)\n"
     );
     let s = sites_of(&body, &rd).expect("numbers");
-    assert_eq!(s[0].bytes, 40 + 8 * 500);
-    assert_eq!(s[1].flags & IN_LOOP, IN_LOOP);
-    assert_eq!(s[1].bytes, 40 + 8 * 3);
+    assert_eq!((s[0].bytes, s[0].flags), (40 + 8 * 500, 0));
+    assert_eq!(s[1].flags, IN_LOOP | RESTART);
+    assert_eq!(s[1].bytes, 2 * (40 + 8 * 3) + 8);
+    assert_eq!(
+        s[1].len, 3,
+        "the window is the call's, not the doubled block's"
+    );
     assert_eq!(
         (s[2].kind, s[2].bytes),
         (pine_ir::StateKind::Object, 32 + 8 * 4)

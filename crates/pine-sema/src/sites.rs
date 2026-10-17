@@ -7,12 +7,14 @@
 //! Pass 5b (impl-02 §4.7.1–§4.7.2): the final IR (after `hoist.rs`) walked in pre-order —
 //! statements in order, `then` before `els`, `head` before `body` before `step`, copies in order —
 //! gives the next `SiteId` to every stateful `Call` (`Builtin`), collection creator
-//! (`Collection`) and `ObjNew` (`Object`), with its block bytes and `IN_LOOP`. Window lengths:
+//! (`Collection`) and `ObjNew` (`Object`), with its block bytes and `IN_LOOP` — and, under U13
+//! `restart` (CAR-R33-9), `RESTART` on an in-loop `ta.*` site, whose block doubles to
+//! `[state b | pre-image b | stamp]` (`StateDesc::restart_bytes`). Window lengths:
 //! a constant argument `n` (`n ≤ 0` → `3007`, `> MAX_WINDOW` → `3017`), anything else the
 //! effective cap `C` (`C == 0` → `3016`). More than `MAX_SITES` → `3015`; a creator under
 //! `collection_cap == 0` → `3018`.
 
-use pine_ir::{elem, state_flag, CollKind, Diag, Dialect, Lane, Span, StateKind, Ty};
+use pine_ir::{elem, state_flag, CollKind, Diag, Dialect, Lane, Span, StateDesc, StateKind, Ty};
 use pine_spec::{StateShape, StateSpec};
 
 use crate::code::{diag, ReasonCode};
@@ -49,6 +51,8 @@ pub(crate) struct SiteCtx<'a> {
     pub(crate) str_cell_bytes: u32,
     /// `udt_fields[decl]`: each user type's field count.
     pub(crate) udt_fields: &'a [u16],
+    /// U13 reads `restart` (`Readings::ta_in_loop == swr::TA_IN_LOOP_RESTART`, §4.7.4).
+    pub(crate) ta_restart: bool,
 }
 
 /// Number every site of `ir`.
@@ -70,10 +74,16 @@ fn walk(ir: &Ir, b: &Block, flags: u8, cx: &SiteCtx<'_>, out: &mut Vec<Site>) ->
                 let o = pine_spec::overload(*ov);
                 if o.is_stateful() {
                     let l = window_len(ir, o, args, cx, *span)?;
+                    let b = o.state.block_bytes(l);
+                    let (flags, bytes) = if restarts(o, flags, b, cx) {
+                        (flags | state_flag::RESTART, StateDesc::restart_bytes(b))
+                    } else {
+                        (flags, b)
+                    };
                     out.push(Site {
                         kind: StateKind::Builtin,
                         flags,
-                        bytes: o.state.block_bytes(l),
+                        bytes,
                         span: *span,
                         len: l,
                         warm: warmup(ir, o, args, cx),
@@ -127,6 +137,21 @@ fn walk(ir: &Ir, b: &Block, flags: u8, cx: &SiteCtx<'_>, out: &mut Vec<Site>) ->
         }
     }
     Ok(())
+}
+
+/// U13 `restart` (CAR-R33-9, §4.7.4): a stateful `ta.*` site inside a loop body, at any depth
+/// (`for`, `while`, `for…in`; head, body and step), gets `RESTART`, so every execution on a bar
+/// re-runs from the block committed at the previous bar. `pin:02-ta-in-loop-restart-scope`: the
+/// switch is `ta_in_loop` and its capture (B068 `ta.sma`, B069 `ta.ema`) is of `ta.*`; every other
+/// stateful row in a loop (`math.sum`, `math.random`, `fixnan`, `str.match`, `timeframe.change`,
+/// `request.security`) keeps `per_call` until a fixture decides it — `math.random` restarting would
+/// repeat one draw per bar. A site outside every loop never repeats on a bar and is unchanged
+/// (`pin:06-cond-call-state` governs it).
+fn restarts(o: &pine_spec::Overload, flags: u8, b: u32, cx: &SiteCtx<'_>) -> bool {
+    cx.ta_restart
+        && flags & state_flag::IN_LOOP != 0
+        && b > 0
+        && pine_spec::entry_of(o).ns.as_str() == "ta"
 }
 
 /// A collection creator's block bytes (§4.7.1): `array.slice` is a view

@@ -422,14 +422,15 @@
       "owner": "pine-sema",
       "readings": [
         "per_call",
-        "per_iteration"
+        "per_iteration",
+        "restart"
       ],
-      "v5": "per_call",
-      "v6": "per_call",
+      "v5": "restart",
+      "v6": "restart",
       "normative": false,
       "source": "",
       "pin": "pin:U13-ta-in-loop",
-      "doc": "ta.* in a loop: per_call is one block per site advanced by every execution; per_iteration one block per iteration index. Default: design note 6"
+      "doc": "ta.* in a loop: per_call is one block per site advanced by every execution; per_iteration one block per iteration index; restart is one block per site where every execution on a bar starts from the block committed at the previous bar and the bar's last execution is kept (sema sets state_flag::RESTART, the VM keeps a pre-image). Default restart: the TradingView capture (CAR-R33-9: B068 ta.sma and B069 ta.ema in a for loop fit restart on 128/128 rows in v5 and v6; per_call fits 2/128, per_iteration 128/128 on B068 and 4/128 on B069)"
     },
     {
       "id": "ternary_arms",

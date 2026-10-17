@@ -143,8 +143,8 @@ const SW: [(Sw, &str, u8, u8); 22] = [
     (
         Sw::TaInLoop,
         "ta_in_loop",
-        swr::TA_IN_LOOP_PER_CALL,
-        swr::TA_IN_LOOP_PER_CALL,
+        swr::TA_IN_LOOP_RESTART,
+        swr::TA_IN_LOOP_RESTART,
     ),
     (
         Sw::TernaryArms,

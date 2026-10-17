@@ -150,12 +150,16 @@ fn compile_with(
             } else {
                 decl.max_bars_back
             };
+            // U13 `restart` (CAR-R33-9): in-loop `ta.*` sites get `RESTART`, here and in every
+            // child (the cone's `Cx` carries the reading down).
+            let ta_restart = rd.ta_in_loop == pine_spec::swr::TA_IN_LOOP_RESTART;
             let cx = sites::SiteCtx {
                 d,
                 cap,
                 collection_cap: opts.limits.collection_cap,
                 str_cell_bytes: opts.limits.str_cell_bytes,
                 udt_fields: &udt_fields,
+                ta_restart,
             };
             let r = ir.and_then(|mut ir| {
                 hoist::run(&mut ir, rd)?;
@@ -167,6 +171,7 @@ fn compile_with(
                     udt_fields: &udt_fields,
                     depth: 0,
                     bare: decl.bare,
+                    ta_restart,
                 };
                 let subs =
                     security::cone::extract(&mut ir, &scx, &mut security::cone::Tree::default())?;
@@ -353,6 +358,7 @@ fn child(
         udt_fields: parent.udt_fields,
         depth: parent.depth + 1,
         bare: parent.bare,
+        ta_restart: parent.ta_restart,
     };
     let subs = security::cone::extract(&mut ir, &scx, tree)?;
     let cx = sites::SiteCtx {
@@ -361,6 +367,7 @@ fn child(
         collection_cap: opts.limits.collection_cap,
         str_cell_bytes: opts.limits.str_cell_bytes,
         udt_fields: parent.udt_fields,
+        ta_restart: parent.ta_restart,
     };
     let sites = sites::number(&ir, &cx)?;
     let decl = decl::Decl::child(parent.bare);

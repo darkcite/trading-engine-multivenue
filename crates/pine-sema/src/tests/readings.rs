@@ -264,6 +264,103 @@ fn readings_ta_in_loop_per_iteration_unrolls_in_a_request() {
     );
 }
 
+/// The whole program of `body` under U13 reading `reading` (v6).
+fn compiled(body: &str, reading: u8) -> pine_ir::PineProgram {
+    let mut rd = Readings::of(Dialect::V6);
+    rd.ta_in_loop = reading;
+    let src = format!("//@version=6\nindicator(\"t\")\n{body}");
+    let mut syms = SymTable::new();
+    let ast = pine_lang::parse(&src, FileId::ROOT, &mut syms).expect("parses");
+    compile_with(&ast, syms, &opts(Dialect::V6), &mut LibCache::empty(), &rd).expect("compiles")
+}
+
+/// CAR-R33-9: `restart` is the default in both dialects; it keeps one site per in-loop call (no
+/// unrolling), sets `RESTART` beside `IN_LOOP` and doubles the block to `2b + 8`
+/// (`ta.sma(close, 5)`: `b = 40 + 8 × 5`); the program verifies against pine-std's table, whose
+/// `state_bytes_min` rule 23 now measures against the view `b`. `per_call` and `per_iteration`
+/// are unchanged.
+#[test]
+fn readings_ta_in_loop_restart_flags_and_doubles_the_block() {
+    use pine_ir::state_flag::{IN_LOOP, RESTART};
+    use pine_spec::swr;
+    for d in [Dialect::V5, Dialect::V6] {
+        assert_eq!(Readings::of(d).ta_in_loop, swr::TA_IN_LOOP_RESTART, "{d:?}");
+    }
+    let ir = ta_in_loop(LOOP3, swr::TA_IN_LOOP_RESTART).expect("lowers");
+    assert_eq!(sma_sites(&ir), 1, "one site: restart never unrolls");
+    let b = 40 + 8 * 5;
+    let shape = |reading: u8| -> Vec<(u8, u32)> {
+        let p = compiled(LOOP3, reading);
+        pine_vm::verify(&p, &pine_std::BUILTINS).expect("verifies");
+        p.layout.states.iter().map(|s| (s.flags, s.bytes)).collect()
+    };
+    assert_eq!(
+        shape(swr::TA_IN_LOOP_RESTART),
+        [(IN_LOOP | RESTART, 2 * b + 8)]
+    );
+    assert_eq!(shape(swr::TA_IN_LOOP_PER_CALL), [(IN_LOOP, b)]);
+    assert_eq!(
+        shape(swr::TA_IN_LOOP_PER_ITERATION),
+        [(IN_LOOP, b), (IN_LOOP, b), (IN_LOOP, b)]
+    );
+}
+
+/// CAR-R33-9 scope: every `ta.*` site in a loop body at any depth — nested `for`, `while`,
+/// `for…in`, a function inlined into the body — restarts; a conditional call outside every loop
+/// (`pin:06-cond-call-state`, B023 B041 B047) and a non-`ta` stateful row in a loop
+/// (`pin:02-ta-in-loop-restart-scope`: `math.sum`, `math.random`) do not.
+#[test]
+fn readings_ta_in_loop_restart_scope() {
+    use pine_ir::state_flag::{IN_LOOP, RESTART};
+    let rd = Readings::of(Dialect::V6);
+    let w3 = 40 + 8 * 3;
+    let one = |body: &str| -> (u8, u32) {
+        let s = super::ir_shapes::sites_of(body, &rd).expect(body);
+        let b: Vec<_> = s
+            .iter()
+            .filter(|x| x.kind == pine_ir::StateKind::Builtin)
+            .collect();
+        assert_eq!(b.len(), 1, "{body}: {s:?}");
+        (b[0].flags, b[0].bytes)
+    };
+    let restarted = (IN_LOOP | RESTART, 2 * w3 + 8);
+    for body in [
+        "s = 0.0\nfor i = 0 to 1\n    for j = 0 to 1\n        s += ta.sma(close, 3)\nplot(s)\n",
+        "s = 0.0\ni = 0\nwhile i < 3\n    s += ta.sma(close, 3)\n    i += 1\nplot(s)\n",
+        "a = array.from(1.0, 2.0)\ns = 0.0\nfor x in a\n    s += ta.sma(close + x, 3)\nplot(s)\n",
+        "f(x) => ta.sma(x, 3)\ns = 0.0\nfor i = 0 to 2\n    s += f(close + i)\nplot(s)\n",
+        "s = 0.0\nfor i = 0 to 2\n    if close > open\n        s += ta.sma(close, 3)\nplot(s)\n",
+    ] {
+        assert_eq!(one(body), restarted, "{body}");
+    }
+    // Outside every loop: unchanged (a conditional call is `pin:06-cond-call-state`'s).
+    let cond = "s = 0.0\nif close > open\n    s := ta.sma(close, 3)\nplot(s)\n";
+    assert_eq!(one(cond), (0, w3));
+    // Not `ta.*`: `per_call`, the block as before.
+    let sum = "s = 0.0\nfor i = 0 to 2\n    s += math.sum(close, 3)\nplot(s)\n";
+    assert_eq!(one(sum), (IN_LOOP, w3));
+    let rnd = "s = 0.0\nfor i = 0 to 2\n    s += math.random(0, 1, 42)\nplot(s)\n";
+    let (f, _) = one(rnd);
+    assert_eq!(f, IN_LOOP, "math.random keeps drawing");
+}
+
+/// CAR-R33-9 in a request: the child numbers the loop's `ta.sma` with `RESTART`; the parent
+/// keeps none of it.
+#[test]
+fn readings_ta_in_loop_restart_in_a_request() {
+    use pine_ir::state_flag::{IN_LOOP, RESTART};
+    let body = "f() =>\n    s = 0.0\n    for i = 0 to 2\n        s += ta.sma(close, 5)\n    s\n\
+                plot(request.security(syminfo.tickerid, \"D\", f()[1]))\n";
+    let p = compiled(body, pine_spec::swr::TA_IN_LOOP_RESTART);
+    let child = &p.subprograms[0].program.layout.states;
+    assert_eq!(child.len(), 1);
+    assert_eq!(
+        (child[0].flags, child[0].bytes),
+        (IN_LOOP | RESTART, 2 * (40 + 8 * 5) + 8)
+    );
+    assert!(p.layout.states.iter().all(|s| s.flags & RESTART == 0));
+}
+
 // ---- `pin:06-cond-call-state` (§4.7.5, `hoist.rs`) -------------------------------------------
 
 fn cond_call(body: &str, pin: crate::pins::CondCallState) -> Result<crate::ir::Ir, pine_ir::Diag> {

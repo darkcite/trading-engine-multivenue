@@ -161,7 +161,10 @@ fn chart_source_skips_without_a_root() {
     let root = scratch("skip");
     let mut empty = ChartSource::new(Some(root.clone()));
     match empty.rows(spec::SYMBOL_KEY, 3600, clamp) {
-        Err(RunError::Skip(SkipReason::NoBarFile { tf_s: 3600 })) => {}
+        Err(RunError::Skip(SkipReason::NoBarFile {
+            symbol_key,
+            tf_s: 3600,
+        })) if symbol_key == spec::SYMBOL_KEY => {}
         other => panic!("want Skip(NoBarFile), got {:?}", other.err()),
     }
     let _ = std::fs::remove_dir_all(root);
