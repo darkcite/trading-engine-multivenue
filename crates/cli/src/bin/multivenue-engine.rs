@@ -1403,6 +1403,10 @@ struct BacktestArgs {
     /// Refused inside git.
     #[arg(long, requires = "replay_from_boot")]
     tape_out: Option<PathBuf>,
+    /// 8g: the warm-up bar root the paper boot read (its `--pine-bars`); the replay warms from
+    /// it as the boot did. Absent: no bar file is read (a warm-booted record refuses, exit 6).
+    #[arg(long, requires = "replay_from_boot")]
+    pine_bars: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -3463,6 +3467,7 @@ fn backtest(args: BacktestArgs) -> ExitCode {
             pine_dir: args.pine_dir,
             report_out: args.report_out,
             tape_out: args.tape_out,
+            pine_bars: args.pine_bars,
         });
         if !x.stdout.is_empty() {
             println!("{}", x.stdout);

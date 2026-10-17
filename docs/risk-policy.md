@@ -17032,6 +17032,37 @@ capture durability, not an observability option. Only the `engine_pine_*` mirror
 `/metrics` block; a pine boot without `--metrics` mirrors nothing. Tests: `cli` `pine_metrics`
 `metrics_off_boot_still_drains_incidents_and_tapes`,
 `engine_loop_drains_pine_outside_the_metrics_gate`.
+*Amended 2026-10-17 (risk r21 #3, `pin:08-tape-buffered`):* the tapes exist only with
+`--pine-tape`. Each engine-thread writer (`seq.bin`, `decisions.bin`, `set.tsv`,
+`pine-delivery.bin`) is a 64 KiB `BufWriter` allocated when it opens at boot; a 5 s drain writes
+into the buffers and flushes once, and the final drain flushes too. A write or flush error is
+logged at ERROR and voids the window; it never stops the engine.
+
+**The boot record and `pine-verify` (risk review r21, 2026-10-17).**
+- **`<run>/pine-boot.tsv`** (`# pvm-boot-1`) is written once, atomically, right after
+  `eng.start()`. It carries the boot's per-symbol facts, `queue_syms` (every symbol the paper
+  queue law tracks at this boot), `exec_sha256` (the SHA-256 of `exec.toml`'s bytes, zeros
+  without `--exec`) and `boot_utc_ms` (the live tape's label, `pin:08-boot-record-boot-utc-ms`).
+  The parse is strict: a record missing any of these fails closed. A failed write is logged at
+  ERROR, never refused; that run then cannot be replayed from boot.
+- **Queue symbols.** The boot reaches the queue law only through one call that also keeps the
+  symbol. The kept list goes to slot 8's hook after every member block, so the record cannot
+  miss one, whatever the block order (r21 #4).
+- **`<run>/pine-delivery.bin`** (R6) is written with `--pine-tape` only. Raw 32 B records,
+  append-only; a gap voids the window.
+- **`pine-verify` is offline and read-only.** It opens no socket, reads no `.env` and arms
+  nothing. It replays on its own slot-8-only `PaperMatcher`. An armed `exec.toml` is loaded under
+  its own arming: rule 3 is a re-hash of the bytes against `exec_sha256`, never the two-switch
+  interlock (r21 #1).
+- **What makes a window ineligible.** Listed with its reason, never counted, never red:
+  - a pine symbol that is also in `queue_syms` (`pin:08-verify-queue-sym-ineligible`);
+  - rules 4/6 that cannot be shown: no `set.tsv` rows, a row gap over 10 s, a short row, or a
+    non-zero `rejected_open_cap`.
+- **What is red.** A fill the replayed matcher still holds after the replay counts as a diff
+  (r21 #2).
+- **Replay tapes never append.** `backtest --replay-from-boot --tape-out` names its tape directory
+  from the record's `boot_utc_ms` and creates every file new. An existing tape is refused with
+  exit 2 (r21 #5). `pine-verify --cross` therefore pairs live and replay tapes exactly.
 
 **Bench.** `bench/benches/hot_path.rs` builds `StrategySet::new(BUILT_MASK)`, so
 `strategy_set/on_tick_all` now includes the inert pine member (one branch and one counter); a
@@ -17052,4 +17083,9 @@ capture durability, not an observability option. Only the `engine_pine_*` mirror
 `tests/native_maker.rs` (`a_requote_at_a_cap_of_one_unit_is_one_modify_not_cancel_and_submit`,
 `a_requote_keeps_every_other_outstanding_order_in_its_gates_and_never_passes_the_cap`) and
 `native` `an_event_stamped_on_an_earlier_day_never_rolls_the_day`; `ingress-binance`
-`binance_every_shed_print_is_counted_once`.
+`binance_every_shed_print_is_counted_once`; `cli` `tests/pine_verify.rs` (incl.
+`verify_rule3_rehashes_an_armed_exec_toml`, `verify_counts_a_fill_left_in_the_matcher_as_a_diff`,
+`verify_queue_tracked_pine_symbol_is_ineligible`), `tests/pine_hook.rs`, `pine_tape`
+`create_new_refuses_an_existing_tape`, `pine_delivery`
+`queue_syms_reach_the_boot_record_whatever_the_block_order`; `strategy-pine` `bootrec`
+(`boot_record_round_trips`, `boot_record_parse_is_strict`) and `tests/bootrec.rs`.

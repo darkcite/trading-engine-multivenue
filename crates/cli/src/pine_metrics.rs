@@ -653,6 +653,10 @@ impl PineDrain {
             if let Err(e) = t.set_line(utc_ms, mask, &matcher_row(matcher)) {
                 tracing::error!(error = %e, "pine: set.tsv write failed — window void");
             }
+            // pin:08-tape-buffered (risk r21 #3): one flush per pass, the final pass included.
+            if let Err(e) = t.flush() {
+                tracing::error!(error = %e, "pine: tape flush failed — window void");
+            }
         }
     }
 }

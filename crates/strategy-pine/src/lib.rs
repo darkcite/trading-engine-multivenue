@@ -208,6 +208,8 @@ pub struct PineStrategy {
     core: Option<Box<rt::Core>>,
     /// The last load refusal (`configure` or `on_start`).
     boot_err: Option<PineLoadError>,
+    /// pin:08-boot-record-boot-utc-ms: the boot instant `on_start` ran on (the boot record's).
+    boot_utc_ms: i64,
 }
 
 impl core::fmt::Debug for PineStrategy {
@@ -273,6 +275,7 @@ impl PineStrategy {
             staged: None,
             core: None,
             boot_err: None,
+            boot_utc_ms: 0,
         }
     }
 
@@ -490,6 +493,7 @@ impl PineStrategy {
             manifest_sha256: core.manifest_sha256,
             run_epoch_ns,
             boot_mono_ns,
+            boot_utc_ms: self.boot_utc_ms,
             route: core.route,
             scripts,
             // COPY: the boot's symbol facts (≤ MAX_SYMBOLS rows) — boot only, the record is
@@ -828,6 +832,8 @@ impl Strategy for PineStrategy {
             .boot_exit_policy
             .unwrap_or(core_config::pine::BootExitPolicy::Accept);
         let boot_ns = u64::try_from(pine_ir::scale::ns_from_ms(st.cfg.boot_utc_ms)).unwrap_or(0);
+        // pin:08-boot-record-boot-utc-ms: kept for `boot_record` (a Copy, no allocation).
+        self.boot_utc_ms = st.cfg.boot_utc_ms;
         let mut sha_lo = [0u8; 8];
         sha_lo.copy_from_slice(&st.cfg.manifest_sha256[..8]);
         let hdr = tape::BootHdr {

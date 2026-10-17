@@ -676,6 +676,7 @@ mod tests {
             manifest_sha256: [3; 32],
             run_epoch_ns: 1_767_225_600_000_000_000,
             boot_mono_ns: 99,
+            boot_utc_ms: 1_767_225_600_000,
             route: SlotRoute::Paper,
             scripts: vec![strategy_pine::BootRecordScript {
                 idx: 0,

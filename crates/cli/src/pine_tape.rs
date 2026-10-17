@@ -16,14 +16,27 @@
 //! - pin:08-set-tsv-columns: `set.tsv` is `<utc_ms>\t<enabled_mask hex>\t<matcher counters,
 //!   comma-separated>`; the matcher's counter order is the caller's (`matcher_counters()`, paper
 //!   arm only, E-2) and is stated once in the first line `#utc_ms\tmask\t<names>`.
+//! - pin:08-tape-buffered (risk r21 #3): each file is a `BufWriter` of [`TAPE_BUF_BYTES`]
+//!   allocated at `open` (boot); a drain's records go to the buffer (one `write(2)` per full
+//!   buffer, not per record) and [`PineTapeWriter::flush`] pushes all three files once per 5 s
+//!   pass and at the final one. A write or flush error is returned (the caller logs it; the
+//!   window is void).
+//! - pin:08-tape-out-create-new (risk r21 #5): a replay tape (`backtest --replay-from-boot
+//!   --tape-out`, [`PineTapeWriter::create_new`]) never appends — any of the three files already
+//!   under `<root>/<label>/` refuses it. The live `--pine-tape` ([`PineTapeWriter::open`]) keeps
+//!   create-or-append.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use strategy_core::{PineSeqRec, PineTapeRec, StrategyCounters};
 
 /// Records drained per view call (the caller's buffers are this long).
 pub const DRAIN_BATCH: usize = 256;
+/// Each tape file's write buffer (pin:08-tape-buffered).
+pub const TAPE_BUF_BYTES: usize = 64 * 1024;
+/// The tape directory's three files.
+const TAPE_FILES: [&str; 3] = ["seq.bin", "decisions.bin", "set.tsv"];
 
 /// One `PineSeqRec` as its 128-byte image (pin:08-tape-bytes-le).
 #[must_use]
@@ -79,9 +92,9 @@ pub struct DrainOut {
 #[derive(Debug)]
 pub struct PineTapeWriter {
     dir: PathBuf,
-    seq: File,
-    dec: File,
-    set: File,
+    seq: BufWriter<File>,
+    dec: BufWriter<File>,
+    set: BufWriter<File>,
     next_seq: u64,
     next_dec: u64,
     seq_buf: Box<[PineSeqRec]>,
@@ -95,18 +108,55 @@ impl PineTapeWriter {
     /// # Errors
     /// The directory or a file cannot be created.
     pub fn open(root: &Path, boot_utc_ms: i64, matcher_names: &[&str]) -> io::Result<Self> {
+        Self::open_with(root, boot_utc_ms, matcher_names, false)
+    }
+
+    /// [`open`](Self::open) for a replay tape (pin:08-tape-out-create-new): every file is created
+    /// new; an existing one under `<root>/<boot_utc_ms>/` is refused (`AlreadyExists`) before any
+    /// file is created, so nothing is ever appended to an earlier tape.
+    ///
+    /// # Errors
+    /// A tape file already exists, or the directory or a file cannot be created.
+    pub fn create_new(root: &Path, boot_utc_ms: i64, matcher_names: &[&str]) -> io::Result<Self> {
+        Self::open_with(root, boot_utc_ms, matcher_names, true)
+    }
+
+    fn open_with(
+        root: &Path,
+        boot_utc_ms: i64,
+        matcher_names: &[&str],
+        fresh: bool,
+    ) -> io::Result<Self> {
         let dir = root.join(boot_utc_ms.to_string());
+        if fresh {
+            if let Some(n) = TAPE_FILES.iter().find(|n| dir.join(n).exists()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "{} exists: a replay tape is never appended to (remove it or choose \
+                         another --tape-out)",
+                        dir.join(n).display()
+                    ),
+                ));
+            }
+        }
         std::fs::create_dir_all(&dir)?;
         let open = |n: &str| {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join(n))
+            let mut o = OpenOptions::new();
+            if fresh {
+                o.write(true).create_new(true);
+            } else {
+                o.create(true).append(true);
+            }
+            o.open(dir.join(n))
+                .map(|f| BufWriter::with_capacity(TAPE_BUF_BYTES, f))
         };
-        let seq = open("seq.bin")?;
-        let dec = open("decisions.bin")?;
-        let mut set = open("set.tsv")?;
+        let seq = open(TAPE_FILES[0])?;
+        let dec = open(TAPE_FILES[1])?;
+        let mut set = open(TAPE_FILES[2])?;
         writeln!(set, "#utc_ms\tmask\t{}", matcher_names.join(","))?;
+        // The header reaches the disk at boot, before the first 5 s pass.
+        set.flush()?;
         Ok(Self {
             dir,
             seq,
@@ -171,6 +221,18 @@ impl PineTapeWriter {
             write!(self.set, "{v}")?;
         }
         self.set.write_all(b"\n")
+    }
+
+    /// Push the three buffers to their files (pin:08-tape-buffered): once per 5 s pass, after
+    /// its `set.tsv` line, and at the final pass. Every file is flushed even when one fails.
+    ///
+    /// # Errors
+    /// The first flush that failed (the window is void).
+    pub fn flush(&mut self) -> io::Result<()> {
+        let a = self.seq.flush();
+        let b = self.dec.flush();
+        let c = self.set.flush();
+        a.and(b).and(c)
     }
 }
 
@@ -262,6 +324,15 @@ mod tests {
             "idempotent"
         );
         w.set_line(1_767_225_605_000, 0x0100, &[3, 1]).expect("set");
+        // pin:08-tape-buffered: whole 64 KiB buffers only reach the file before the pass's flush.
+        let early = std::fs::metadata(w.dir().join("seq.bin"))
+            .expect("seq")
+            .len();
+        assert!(
+            early < 700 * 128 && early % TAPE_BUF_BYTES as u64 == 0,
+            "{early}"
+        );
+        w.flush().expect("flush");
         let seq = std::fs::read(w.dir().join("seq.bin")).expect("seq");
         let dec = std::fs::read(w.dir().join("decisions.bin")).expect("dec");
         assert_eq!((seq.len(), dec.len()), (700 * 128, 300 * 64));
@@ -273,6 +344,41 @@ mod tests {
         assert_eq!(
             set,
             "#utc_ms\tmask\tjudged,filled\n1767225605000\t0x0100\t3,1\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// pin:08-tape-out-create-new (risk r21 #5): a replay tape refuses an existing file under
+    /// its label and appends nothing; the live writer still opens create-or-append.
+    #[test]
+    fn create_new_refuses_an_existing_tape() {
+        let root = std::env::temp_dir().join(format!("pine-tape-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut w = PineTapeWriter::create_new(&root, 7, &["judged"]).expect("first");
+        w.set_line(7, 0x0100, &[0]).expect("set");
+        w.flush().expect("flush");
+        drop(w);
+        let set = root.join("7").join("set.tsv");
+        let before = std::fs::read(&set).expect("set");
+        let e = PineTapeWriter::create_new(&root, 7, &["judged"]).expect_err("refused");
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert!(e.to_string().contains("never appended"), "{e}");
+        assert_eq!(
+            std::fs::read(&set).expect("set"),
+            before,
+            "nothing appended"
+        );
+        // Any one of the three files refuses it.
+        std::fs::remove_file(root.join("7").join("seq.bin")).expect("rm");
+        std::fs::remove_file(&set).expect("rm");
+        assert!(PineTapeWriter::create_new(&root, 7, &["judged"]).is_err());
+        assert!(
+            !root.join("7").join("seq.bin").exists(),
+            "refused before creating"
+        );
+        assert!(
+            PineTapeWriter::open(&root, 7, &["judged"]).is_ok(),
+            "live appends"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -33,6 +33,11 @@
 //!   exec_sha256`, all zeros without `--exec`): 8g rule 3's `exec.toml` re-hash compares with it
 //!   (no decision record carries it). The three trailing kinds are mandatory, in this order, so
 //!   a record written before them fails the strict parse (fail closed).
+//! - pin:08-boot-record-boot-utc-ms (R5b, risk r21; retires pin:Bp-8g-boot-utc-ms): the header
+//!   carries the paper boot's `boot_utc_ms` (`PineBootCfg::boot_utc_ms`, decimal i64 — the live
+//!   tape directory's name and `BOOT_HDR`'s `aux`) as a fifth key between `boot_mono_ns` and
+//!   `route`. The extension rule is pin:08-boot-record-facts': the magic stays `# pvm-boot-1`,
+//!   the line is mandatory, so a record written before it fails the strict parse (fail closed).
 
 use crate::{PineSymbolFacts, SlotRoute};
 
@@ -69,6 +74,8 @@ pub struct BootRecord {
     pub run_epoch_ns: u64,
     /// Engine monotonic clock when slot 8 finished `on_start`.
     pub boot_mono_ns: u64,
+    /// pin:08-boot-record-boot-utc-ms: the boot instant, UTC ms (the live tape's label).
+    pub boot_utc_ms: i64,
     /// The route the boot ran.
     pub route: SlotRoute,
     /// One per manifest script, manifest order.
@@ -115,7 +122,8 @@ const fn route_name(r: SlotRoute) -> &'static str {
 }
 
 impl BootRecord {
-    /// The file's bytes: the magic line, four header lines, one `script` line per script.
+    /// The file's bytes: the magic line, five header lines, one `script` line per script, the
+    /// `symbol` lines, `queue_syms`, `exec_sha256`.
     #[must_use]
     pub fn render(&self) -> String {
         let mut s = String::with_capacity(256 + 160 * self.scripts.len());
@@ -123,9 +131,10 @@ impl BootRecord {
         s.push_str("\nmanifest_sha256\t");
         hex(&mut s, &self.manifest_sha256);
         s.push_str(&format!(
-            "\nrun_epoch_ns\t{}\nboot_mono_ns\t{}\nroute\t{}\n",
+            "\nrun_epoch_ns\t{}\nboot_mono_ns\t{}\nboot_utc_ms\t{}\nroute\t{}\n",
             self.run_epoch_ns,
             self.boot_mono_ns,
+            self.boot_utc_ms,
             route_name(self.route)
         ));
         for sc in &self.scripts {
@@ -233,8 +242,9 @@ impl BootRecord {
             .collect()
     }
 
-    /// Strict parse: the magic, the four header keys in order, then `script` lines numbered from
-    /// 0 without a gap. Nothing else (blank lines included) is accepted.
+    /// Strict parse: the magic, the five header keys in order, then `script` lines numbered from
+    /// 0 without a gap, the `symbol` lines, `queue_syms`, `exec_sha256`. Nothing else (blank
+    /// lines included) is accepted.
     ///
     /// # Errors
     /// The first malformed line, human-readable.
@@ -261,6 +271,10 @@ impl BootRecord {
         let boot_mono_ns = kv("boot_mono_ns")?
             .parse::<u64>()
             .map_err(|_| "boot_mono_ns is not a u64")?;
+        // pin:08-boot-record-boot-utc-ms: mandatory (an older record fails closed).
+        let boot_utc_ms = kv("boot_utc_ms")?
+            .parse::<i64>()
+            .map_err(|_| "boot_utc_ms is not an i64")?;
         let route = match kv("route")?.as_str() {
             "paper" => SlotRoute::Paper,
             "live" => SlotRoute::Live,
@@ -333,6 +347,7 @@ impl BootRecord {
             manifest_sha256,
             run_epoch_ns,
             boot_mono_ns,
+            boot_utc_ms,
             route,
             scripts,
             symbols,
@@ -357,6 +372,7 @@ mod tests {
             manifest_sha256: [0xab; 32],
             run_epoch_ns: 1_760_000_000_123_456_789,
             boot_mono_ns: 42,
+            boot_utc_ms: 1_760_000_000_124,
             route: SlotRoute::Paper,
             scripts: vec![
                 BootRecordScript {
@@ -412,7 +428,7 @@ mod tests {
         let r = rec();
         let text = r.render();
         assert!(text.starts_with("# pvm-boot-1\nmanifest_sha256\tabab"));
-        assert!(text.contains("\nroute\tpaper\n"));
+        assert!(text.contains("\nboot_mono_ns\t42\nboot_utc_ms\t1760000000124\nroute\tpaper\n"));
         assert!(text.contains("\t0123456789abcdef\n"));
         assert_eq!(BootRecord::parse(&text).unwrap(), r);
     }
@@ -449,6 +465,14 @@ mod tests {
             good.replacen("0123456789abcdef", "0123456789ABCDEF", 1),
             good.replacen("boot_mono_ns", "boot_mono", 1),
             format!("{good}\n"),
+            // pin:08-boot-record-boot-utc-ms: mandatory, in place, an i64.
+            good.replacen("boot_utc_ms\t1760000000124\n", "", 1),
+            good.replacen("boot_utc_ms\t1760000000124", "boot_utc_ms\t1.5", 1),
+            good.replacen(
+                "boot_utc_ms\t1760000000124\nroute\tpaper",
+                "route\tpaper\nboot_utc_ms\t1760000000124",
+                1,
+            ),
             // pin:08-boot-record-facts: the trailing kinds are mandatory, ordered and typed.
             good.replacen("queue_syms\t4096,4097\n", "", 1),
             good.replacen(&format!("exec_sha256\t{}\n", "cd".repeat(32)), "", 1),

@@ -3693,6 +3693,11 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
 
     let mut set = strategy_set::StrategySet::new(mask);
     let mut pine_hook: Option<crate::pine_delivery::PineHook> = None;
+    // pin:08-verify-queue-sym-ineligible (risk r21 #4): every symbol the paper queue law tracks
+    // at this boot, whichever member block runs first — handed to slot 8's hook right before the
+    // loop starts (its boot record is written after `eng.start()`), so the order of the blocks
+    // below can never leave the record's `queue_syms` short.
+    let mut queue_syms: Vec<core_types::SymbolId> = Vec::new();
     // PVM impl-08 T19 (pin:08-facts-from-discovery boot order): discovery and facts ran in the
     // bin; here the wall anchor, `configure`, the warm bars and the boot tell — PAPER ONLY.
     if let Some(mut pb) = pine {
@@ -3971,12 +3976,8 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         // the first post-only order on each meets a known book.
         let mut i = 0usize;
         while i < boot.params.n_perps as usize {
-            disp.track_queue_sym(boot.params.perps[i].hl_sym);
-            // PVM impl-08 (pin:08-verify-queue-sym-ineligible): slot 8's boot record lists every
-            // queue-tracked symbol, so `pine-verify` can refuse a window that shares one.
-            if let Some(h) = pine_hook.as_mut() {
-                h.note_queue_sym(boot.params.perps[i].hl_sym);
-            }
+            // PVM impl-08 (pin:08-verify-queue-sym-ineligible): kept for slot 8's boot record.
+            track_queue_sym_kept(&mut disp, &mut queue_syms, boot.params.perps[i].hl_sym);
             i += 1;
         }
         tracing::info!("{}", crate::xmm_boot::render_boot_tell(boot));
@@ -4267,7 +4268,27 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         hcv = mask & strategy_set::BIT_HCV != 0,
         "strategy-set: composed"
     );
+    // risk r21 #4: after every member block, before the loop (and so before the record).
+    if let Some(h) = pine_hook.as_mut() {
+        for s in &queue_syms {
+            h.note_queue_sym(*s);
+        }
+    }
     run_engine_loop(cons, disp, set, obs, pine_hook)
+}
+
+/// The boot's one door to the paper queue law (pin:08-verify-queue-sym-ineligible, risk r21 #4):
+/// the dispatcher tracks `sym` and `kept` remembers it for slot 8's boot record — one call, so a
+/// tracked symbol can never be missing from the record. Boot only (may allocate).
+fn track_queue_sym_kept<D: OrderDispatch>(
+    disp: &mut D,
+    kept: &mut Vec<core_types::SymbolId>,
+    sym: core_types::SymbolId,
+) {
+    disp.track_queue_sym(sym);
+    if !kept.contains(&sym) {
+        kept.push(sym);
+    }
 }
 
 /// Lower-hex render of a 32-byte hash (boot log; cold path).

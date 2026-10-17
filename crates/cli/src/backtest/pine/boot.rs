@@ -71,6 +71,8 @@ pub struct ReplayArgv {
     /// `--tape-out`: the replay's decision tapes go to
     /// `<dir>/<boot_utc_ms>/` (impl-08 §4.9, 8g-B; refused inside git).
     pub tape_out: Option<PathBuf>,
+    /// `--pine-bars`: the warm-up bar root the paper boot read (pin:Bp-8g-pine-bars).
+    pub pine_bars: Option<PathBuf>,
 }
 
 /// What the checks fixed before the first record.

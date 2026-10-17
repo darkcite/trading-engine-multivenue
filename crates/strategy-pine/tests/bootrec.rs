@@ -62,6 +62,8 @@ fn boot_record_is_read_back_from_a_started_member() {
         (1_767_225_600_000_000_000, 123)
     );
     assert_eq!(rec.route, SlotRoute::Paper);
+    // pin:08-boot-record-boot-utc-ms: the boot instant the member ran on (R5b).
+    assert_eq!(rec.boot_utc_ms, cfg().boot_utc_ms);
     assert_eq!(rec.scripts.len(), 2);
     let sha = core_crypto::sha256(&std::fs::read(dir().join("sma_always.pine")).expect("src"));
     for (i, s) in rec.scripts.iter().enumerate() {

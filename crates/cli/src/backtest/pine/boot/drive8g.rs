@@ -22,9 +22,16 @@
 //!   span (pin:Bp-replay-dir-plan): `virt(ts) = VIRT_T0 + (ts − first_ts)`,
 //!   for records and captured stamps alike; a stamp before the first
 //!   record clamps to it.
-//! - pin:Bp-8g-boot-utc-ms — the boot instant is the record's
-//!   `boot_mono_ns` on the run's wall map (`run_epoch + boot_mono −
-//!   first_ts`), in ms; it names the tape directory (`<boot_utc_ms>/`).
+//! - pin:08-boot-record-boot-utc-ms (R5b, risk r21; retires
+//!   pin:Bp-8g-boot-utc-ms, the `run_epoch + boot_mono − first_ts`
+//!   reconstruction) — the boot instant is the record's `boot_utc_ms`, the
+//!   live boot's own; it boots the replay and names the tape directory
+//!   (`<boot_utc_ms>/`), the live tape's label.
+//! - pin:Bp-8g-pine-bars — "warms up from the same bar files" (§4.12):
+//!   with `--pine-bars <root>` the replay calls the paper boot's own
+//!   `pine_boot::warm(needs, root, boot_utc_ms)`; the member re-hashes each
+//!   chart row against the record (6013). Without it no bar file is read,
+//!   so a warm-booted record refuses (exit 6) — never a cold replay.
 //! - pin:Bp-8g-slot-caps-sum — `SlotCaps8` is the sum of the manifest's
 //!   script caps (`max_order` unset), so the slot never binds before a
 //!   script's own (§4.5's reading for one script, summed for many).
@@ -74,6 +81,8 @@ use crate::pine_tape::PineTapeWriter;
 pub(crate) const STRADDLE_NS: u64 = 5_000_000;
 /// Records between two tape drains (the rings hold far more).
 const TAPE_DRAIN_EVERY: usize = 1024;
+/// pin:08-tape-out-create-new: `--tape-out` names an existing tape (the harness's usage exit).
+pub(crate) const EXIT_TAPE_EXISTS: u8 = 2;
 
 fn pre(msg: String) -> DriveFail {
     DriveFail {
@@ -283,7 +292,7 @@ pub(crate) fn boot_set(
         manifest,
     };
     let mut set = Box::new(StrategySet::new(BIT_PINE));
-    set.pine_mut().configure(cfg).map_err(|e| {
+    let needs = set.pine_mut().configure(cfg).map_err(|e| {
         pre(format!(
             "configure refused ({}): {} {:?}",
             e.code.0,
@@ -291,8 +300,12 @@ pub(crate) fn boot_set(
             e.diags.iter().map(|d| &d.msg).collect::<Vec<_>>()
         ))
     })?;
+    // pin:Bp-8g-pine-bars: the paper boot's own warm-up call on the same root and instant.
+    let warm = a.pine_bars.as_deref().map_or_else(Vec::new, |root| {
+        crate::pine_boot::warm(&needs, root, boot_utc_ms).0
+    });
     set.pine_mut()
-        .supply_warm(Vec::new())
+        .supply_warm(warm)
         .map_err(|e| pre(format!("warm-up refused ({}): {}", e.code.0, e.detail)))?;
     let mut ctx = PineCtx {
         fills,
@@ -577,10 +590,9 @@ pub(crate) fn run_8g(a: &ReplayArgv, x: ReplayInputs) -> Result<PineExit, DriveF
         refuse_inside_git("--tape-out", t)?;
     }
     let first_ts = x.span.first_ts_ns;
-    // pin:Bp-8g-boot-utc-ms.
-    let boot_utc_ms = ((i128::from(x.run.epoch_ns) + i128::from(x.record.boot_mono_ns)
-        - i128::from(first_ts))
-        / 1_000_000) as i64;
+    // pin:08-boot-record-boot-utc-ms (R5b; retires pin:Bp-8g-boot-utc-ms): the live boot's own
+    // instant, from its record — the live tape's label, so `pine-verify --cross` pairs exactly.
+    let boot_utc_ms = x.record.boot_utc_ms;
     let mut route: Vec<u32> = x.record.symbols.iter().map(|f| f.sym).collect();
     route.sort_unstable();
     route.dedup();
@@ -600,10 +612,22 @@ pub(crate) fn run_8g(a: &ReplayArgv, x: ReplayInputs) -> Result<PineExit, DriveF
         x.run.epoch_ns,
     )?;
     let mut set = boot_from_record(a, &x, boot_utc_ms, &mut fills)?;
+    // pin:08-tape-out-create-new (risk r21 #5): an existing tape under the label is refused,
+    // exit 2, never appended to.
     let mut tape = match &a.tape_out {
         Some(dir) => Some(
-            PineTapeWriter::open(dir, boot_utc_ms, &crate::pine_metrics::MATCHER_COLS)
-                .map_err(|e| io_fail(format!("--tape-out {}: {e}", dir.display())))?,
+            PineTapeWriter::create_new(dir, boot_utc_ms, &crate::pine_metrics::MATCHER_COLS)
+                .map_err(|e| {
+                    let msg = format!("replay-from-boot: --tape-out {}: {e}", dir.display());
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        DriveFail {
+                            exit: EXIT_TAPE_EXISTS,
+                            err: HarnessError::Usage(msg),
+                        }
+                    } else {
+                        io_fail(format!("--tape-out {}: {e}", dir.display()))
+                    }
+                })?,
         ),
         None => None,
     };
@@ -627,6 +651,8 @@ pub(crate) fn run_8g(a: &ReplayArgv, x: ReplayInputs) -> Result<PineExit, DriveF
         let zeros = [0u64; crate::pine_metrics::MATCHER_COLS.len()];
         w.set_line(boot_utc_ms, set.enabled_mask(), &zeros)
             .map_err(|e| io_fail(format!("tape set.tsv: {e}")))?;
+        // pin:08-tape-buffered: the final flush.
+        w.flush().map_err(|e| io_fail(format!("tape flush: {e}")))?;
     }
     write_report(&report, &run_id, &x, &recs, &run, &eng_fills, boot_utc_ms)
 }

@@ -14,23 +14,26 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
+use cli::backtest::{replay_from_boot_main, ReplayArgv};
+use cli::paper::open_fills_capture;
 use cli::pine_boot::{
     build, finish_at_loop, warm as warm_bars, write_boot_record, DiscoveredFacts, PineFlags,
 };
+use cli::pine_delivery::{PineHook, DELIVERY_FILE};
 use cli::pine_metrics::{matcher_row, MATCHER_COLS};
 use cli::pine_tape::PineTapeWriter;
 use cli::pine_verify::{
-    check, dec_from_bytes, load_window, parse_set_tsv, pool, run as verify_run, seq_from_bytes,
-    verify_window, Elig, Loaded, VerifyCtx, VerifyOpts, WindowIn, WindowOut, EXCLUDED, EXIT_GREEN,
-    EXIT_RED, EXIT_UNUSABLE,
+    check, cross, dec_from_bytes, load_window, pair, parse_set_tsv, pool, run as verify_run,
+    run_cross, seq_from_bytes, verify_window, verify_window_cross, Elig, Loaded, VerifyCtx,
+    VerifyOpts, WindowIn, WindowOut, EXCLUDED, EXIT_GREEN, EXIT_RED, EXIT_UNUSABLE,
 };
 use clob_dispatcher::{OrderDispatch, PaperDispatcher};
-use core_io::{SlotCapture, SlotKind};
+use core_io::{PmlrCapture, PmlrReader, SlotCapture, SlotKind, TapCfg};
 use core_ring::{Producer, Ring};
 use core_time::{now_ns, WallAnchor};
 use core_types::{
-    make_symbol_id, CancelReq, ChannelEvent, ChannelId, Fill, Order, Price, Qty, Side, Tick,
-    VenueId,
+    make_symbol_id, CancelReq, Capture, ChannelEvent, ChannelId, Fill, Order, Price, Qty, Side,
+    Tick, VenueId,
 };
 use engine::ENGINE_ORDERS_FILE;
 use engine::{Engine, FILL_RING_SIZE, SIGNAL_RING_SIZE, TICK_RING_SIZE};
@@ -230,16 +233,18 @@ fn record(tag: &str) -> Recorded {
         SlotCapture::open(run.join(ENGINE_ORDERS_FILE), SlotKind::Order, RUN_EPOCH_NS)
             .expect("orders capture"),
     );
+    // The run's engine-fills capture (`paper::open_fills_capture`, replay-from-boot's fills).
+    eng.set_fill_capture(open_fills_capture(&run, RUN_EPOCH_NS).expect("fills capture"));
+    // The HL ingress capture (`hl-ticks.pmlr` / `hl-events.pmlr`), as the HL thread owns it:
+    // each tick and print captured before its ring push.
+    let mut cap = PmlrCapture::open(&run, "hl", RUN_EPOCH_NS, TapCfg::off()).expect("hl cap");
     eng.start().expect("on_start");
-    // R5: the boot record, as `PineHook::on_started` writes it.
-    let rec = eng
-        .strategy()
-        .pine()
-        .boot_record(RUN_EPOCH_NS, 1)
-        .expect("record");
-    write_boot_record(&run, &rec).expect("boot record");
+    // R5 + R6: the arm's after-start hook as `run_engine_loop` calls it — the boot record
+    // (`boot_mono_ns` = the loop's clock, `boot_utc_ms`) and, with the tape, the journal.
+    let mut hook = PineHook::new(run.clone(), RUN_EPOCH_NS, true);
+    assert!(hook.on_started(eng.strategy().pine(), now_ns()).is_some());
     let wall_ms = |ts: u64| anchor.wall_of(ts) / 1_000_000;
-    let quote = |tp: &mut Producer<Tick, TICK_RING_SIZE>| {
+    let quote = |tp: &mut Producer<Tick, TICK_RING_SIZE>, cap: &mut PmlrCapture| {
         let ts = now_ns();
         let mut t = Tick::new(
             ts,
@@ -252,9 +257,11 @@ fn record(tag: &str) -> Recorded {
             Qty::from_raw(1_000_000),
         );
         t.venue_time_ms = wall_ms(ts);
+        cap.tick(&t);
         assert!(tp.try_push_ref(&t));
     };
-    let print = |ep: &mut Producer<ChannelEvent, { core_types::EVENT_RING_SIZE }>, px: i64| {
+    type EvP = Producer<ChannelEvent, { core_types::EVENT_RING_SIZE }>;
+    let print = |ep: &mut EvP, cap: &mut PmlrCapture, px: i64| {
         let ts = now_ns();
         let ev = ChannelEvent::new(
             ts,
@@ -266,17 +273,22 @@ fn record(tag: &str) -> Recorded {
             px,
             1_000_000,
         );
+        cap.event(&ev);
         assert!(ep.try_push_ref(&ev));
     };
     // Long, filled; short (reversal), filled; flat, filled.
     for px in [101_000_000, 99_000_000, 100_000_000] {
-        print(&mut ep, px);
-        quote(&mut tp);
+        print(&mut ep, &mut cap, px);
+        quote(&mut tp, &mut cap);
         eng.tick(64);
         sleep(JUDGE_WAIT);
-        quote(&mut tp);
+        quote(&mut tp, &mut cap);
         eng.tick(64);
     }
+    cap.flush_all().expect("hl capture flush");
+    // R6: the journal's last records, as the loop's end drains them.
+    let d = hook.on_drain(eng.strategy().pine()).expect("journal");
+    assert!(d.written > 0 && d.gap == 0, "{d:?}");
     let mut w = PineTapeWriter::open(&dir.join("tape"), boot_ms, &MATCHER_COLS).expect("tape");
     let o = w.drain(eng.strategy()).expect("drain");
     assert_eq!((o.seq_gap, o.dec_gap), (0, 0));
@@ -287,6 +299,8 @@ fn record(tag: &str) -> Recorded {
         &matcher_row(&eng.dispatcher().matcher_counters()),
     )
     .expect("set");
+    // pin:08-tape-buffered: the pass's flush puts the records on disk.
+    w.flush().expect("flush");
     let td = w.dir().to_path_buf();
     // Drains the order capture into `engine-orders.pmlr` (rule 5's input).
     eng.stop();
@@ -726,4 +740,257 @@ fn inel(r: &Recorded, o: &VerifyOpts) -> WindowOut {
         Ok(_) => panic!("loaded as a window"),
         Err(w) => w,
     }
+}
+
+/// An `exec.toml` that legally arms slot 3 (exec_boot's smallest live artifact).
+const ARMED_EXEC: &str = "[exec]\n[exec.slot.3]\nmode = \"live\"\nname = \"bin15\"\n\
+     venues = [\"hyperliquid\"]\nmax_order_usd_1e6 = 100000000\n\
+     cap_instance_usd_1e6 = 1000000000\ncap_day_usd_1e6 = 30000000000\n\
+     max_open_orders = 64\nrequest_budget_floor = 2000\n\
+     halt_on_reject_streak = 5\nhalt_on_recon_drift_usd_1e6 = 5000000\n\
+     halt_on_ws_gap_ms = 30000\nhalt_on_asset_refusal_streak = 3\n\
+     halt_on_recon_stale_ms = 300000\n";
+
+/// Risk r21 #1: rule 3 RE-HASHES `exec.toml`'s bytes against the record's `exec_sha256` — an
+/// artifact with an armed slot whose bytes match stays eligible (the two-switch interlock is the
+/// live boot's question, never `pine-verify`'s); one changed byte, or `--exec` missing while the
+/// boot had one, is "inputs changed".
+#[test]
+fn verify_rule3_rehashes_an_armed_exec_toml() {
+    big(|| {
+        let r = record("exec");
+        let ep = r.dir.join("exec.toml");
+        std::fs::write(&ep, ARMED_EXEC).expect("exec");
+        let p = r.run.join(strategy_pine::BOOT_RECORD_FILE);
+        let mut rec = strategy_pine::BootRecord::parse(&std::fs::read_to_string(&p).expect("rec"))
+            .expect("parse");
+        rec.exec_sha256 = core_crypto::sha256(ARMED_EXEC.as_bytes());
+        write_boot_record(&r.run, &rec).expect("write");
+        let mut o = opts(&r);
+        o.exec = Some(ep.clone());
+        let w = loaded(&r, &o).unwrap_or_else(|w| panic!("armed + matching bytes: {w:?}"));
+        assert!(w.ineligible.is_none(), "{:?}", w.ineligible);
+        assert_eq!(w.cfg.exec_sha256, rec.exec_sha256);
+        // One byte more: the bytes no longer hash to the record.
+        std::fs::write(&ep, format!("{ARMED_EXEC}# edited\n")).expect("edit");
+        let w = inel(&r, &o);
+        assert!(reason(&w).starts_with("inputs changed"), "{w:?}");
+        assert!(reason(&w).contains("does not hash"), "{w:?}");
+        // The boot had an exec.toml and `--exec` is absent.
+        o.exec = None;
+        assert!(reason(&inel(&r, &o)).starts_with("inputs changed"));
+        let _ = std::fs::remove_dir_all(&r.dir);
+    });
+}
+
+/// Risk r21 #2: a fill the replayed matcher still holds after the replay loop counts as a diff —
+/// the tapes cut just before the last recorded FILL (both sides consistent, every compared
+/// record equal) are red, never green.
+#[test]
+fn verify_counts_a_fill_left_in_the_matcher_as_a_diff() {
+    big(|| {
+        let r = record("leftover");
+        let mut w = window(&r, "1767225600000");
+        let cut = w
+            .seq
+            .iter()
+            .rev()
+            .find(|s| s.kind == strategy_core::pine_seq::FILL)
+            .expect("a recorded fill")
+            .seq;
+        w.seq.retain(|s| s.seq < cut);
+        w.dec.retain(|d| d.seq_ref < cut);
+        let out = verify_window(w);
+        assert_eq!(out.elig, Elig::Eligible, "{out:?}");
+        assert!(out.diffs >= 1, "{out:?}");
+        let d = out.first_diff.clone().unwrap_or_default();
+        assert!(d.contains("matcher fill left after the replay"), "{d}");
+        assert_eq!(pool(&[out]).exit, EXIT_RED);
+        let _ = std::fs::remove_dir_all(&r.dir);
+    });
+}
+
+/// impl-Bp §4.12 over the recorded run: the run directory is the window root (its own
+/// `pine-boot.tsv`), the same manifest, bar root and journal; the replay tapes under `out`.
+fn replay_argv(r: &Recorded, fills: &str, out: &str) -> ReplayArgv {
+    ReplayArgv {
+        window_root: r.run.clone(),
+        manifest: r.dir.join("manifest.toml"),
+        boot_record: None,
+        fills: fills.to_string(),
+        delivery_journal: Some(r.run.join(DELIVERY_FILE)),
+        pine_dir: Some(r.dir.clone()),
+        report_out: Some(r.dir.join(format!("{out}.jsonl"))),
+        tape_out: Some(r.dir.join(out)),
+        pine_bars: Some(r.dir.join("bars")),
+    }
+}
+
+/// The decision records 8g-B compares (§4.9.4), per script 0.
+fn compared(dec: &[strategy_core::PineTapeRec]) -> Vec<strategy_core::PineTapeRec> {
+    dec.iter()
+        .filter(|d| {
+            d.script == 0
+                && [pine_tape::DISPATCH, pine_tape::DISPOSITION, pine_tape::FILL].contains(&d.kind)
+        })
+        .copied()
+        .collect()
+}
+
+/// I47 end to end (T22, §4.9.4): a live paper window recorded on the real engine loop, replayed
+/// from boot (`backtest --replay-from-boot --fills recorded --tape-out`, the library entry), then
+/// `pine-verify --cross` over the live tape and the replay tape: zero divergences, exit 0 once
+/// pooled to D23's floor.
+///
+/// FINDING (2026-10-17, red): script 0 diverges at index 1, the first `FILL` (oid 1): equal in
+/// oid, px, qty and fee, `time_ms` live 1767225600434 vs replay 1767225590420. The replay's wall
+/// map (`cuts::Place::wall`, `run_epoch_ns + (ts − first_ts)`; pin:Bp-recorded-wall-map) is not
+/// the live member's anchor (`anchor.wall_of(ts)`): it is off by (anchor wall − run epoch) −
+/// (first record − anchor mono), 10 014 ms here. Unattributed (no trade-time builtin).
+#[test]
+#[ignore = "FINDING: 8g-B FILL time_ms — replay wall map ≠ the live anchor (see the doc)"]
+fn cross_pairs_a_live_paper_window_with_its_replay_from_boot() {
+    big(|| {
+        let r = record("cross");
+        let a = replay_argv(&r, "recorded", "replay");
+        let x = replay_from_boot_main(&a);
+        assert_eq!(x.code, 0, "{} {}", x.stdout, x.stderr);
+        let root = r.dir.join("replay");
+        let label = T0_MS.to_string();
+        assert_eq!(r.tape.file_name().and_then(|n| n.to_str()), Some(&*label));
+        let o = opts(&r);
+        // The verb, one window: 8g-A clean, 8g-B no divergence (one window is short: exit 2).
+        let (lines, code) = run_cross(std::slice::from_ref(&r.tape), &o, Some(&root));
+        let last = lines.last().expect("8g line").clone();
+        assert!(
+            last.contains(" diffs=0 ") && last.contains(" unattributed=0 "),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("divergences=0")),
+            "{lines:?}"
+        );
+        assert_eq!(code, EXIT_UNUSABLE, "{lines:?}");
+        // Pooled to the floor (the same clean window relabelled): exit 0.
+        let rep = pair(&root, &label, &r.dec)
+            .expect("readable")
+            .expect("paired");
+        let w = match load_window(&r.tape, &o).expect("tapes") {
+            Loaded::Window(w) => verify_window_cross(*w, Some(&rep)),
+            Loaded::Out(w) => panic!("{w:?}"),
+        };
+        let c = w.cross.clone().expect("8g-B ran");
+        assert!(c.divergences.is_empty(), "{c:?}");
+        assert!(c.prefix_orders >= 3 && c.prefix_fills >= 3, "{c:?}");
+        let n = 200usize
+            .div_ceil(usize::try_from(c.prefix_orders).expect("n"))
+            .max(50usize.div_ceil(usize::try_from(c.prefix_fills).expect("n")));
+        let ws: Vec<WindowOut> = (0..n)
+            .map(|k| WindowOut {
+                label: format!("{}", T0_MS + i64::try_from(k).expect("k")),
+                ..w.clone()
+            })
+            .collect();
+        let v = pool(&ws);
+        assert_eq!(v.exit, EXIT_GREEN, "{}", v.line);
+        assert!(v.line.contains(" unattributed=0 "), "{}", v.line);
+        let _ = std::fs::remove_dir_all(&r.dir);
+    });
+}
+
+/// I47 (T22) on the live / replay-from-boot pair: one replay DISPATCH `px_1e6` + 1 on disk (the
+/// script's first compared record, before any FILL) → `pine-verify --cross` reports it at its
+/// index, unattributed, exit 1.
+#[test]
+fn cross_reports_a_seeded_replay_dispatch_at_its_index() {
+    big(|| {
+        let r = record("seed");
+        let x = replay_from_boot_main(&replay_argv(&r, "recorded", "replay"));
+        assert_eq!(x.code, 0, "{} {}", x.stdout, x.stderr);
+        let (root, label, o) = (r.dir.join("replay"), T0_MS.to_string(), opts(&r));
+        let rep = pair(&root, &label, &r.dec)
+            .expect("readable")
+            .expect("paired");
+        // The live and replay DISPATCH sequences agree (the seed is the only difference there).
+        let disp = |d: &[strategy_core::PineTapeRec]| -> Vec<_> {
+            compared(d)
+                .into_iter()
+                .filter(|d| d.kind == pine_tape::DISPATCH)
+                .map(|d| (d.a, d.b, d.c, d.bar_index, d.oid, d.x0, d.x1, d.x2, d.aux))
+                .collect()
+        };
+        assert_eq!(disp(&rep.dec), disp(&r.dec));
+        let dpath = root.join(&label).join("decisions.bin");
+        let mut bytes = std::fs::read(&dpath).expect("dec");
+        let i = rep
+            .dec
+            .iter()
+            .position(|d| d.kind == pine_tape::DISPATCH)
+            .expect("a replay dispatch");
+        let k = compared(&rep.dec)
+            .iter()
+            .position(|d| d.seq == rep.dec[i].seq)
+            .expect("compared");
+        let at = i * 64 + 16;
+        let px = i64::from_le_bytes(bytes[at..at + 8].try_into().expect("8")) + 1;
+        bytes[at..at + 8].copy_from_slice(&px.to_le_bytes());
+        std::fs::write(&dpath, &bytes).expect("seed");
+        let (lines, code) = run_cross(std::slice::from_ref(&r.tape), &o, Some(&root));
+        assert_eq!(code, EXIT_RED, "{lines:?}");
+        assert_eq!(k, 0, "the first DISPATCH is the first compared record");
+        let want = format!("script 0 diverges at {k} (Unattributed)");
+        assert!(lines.iter().any(|l| l.contains(&want)), "{want}: {lines:?}");
+        assert!(lines.last().expect("8g").contains(" diffs=0 "), "{lines:?}");
+        assert!(
+            lines.last().expect("8g").contains(" unattributed=1 "),
+            "{lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&r.dir);
+    });
+}
+
+/// T20 acceptance (impl-Bp §4.12 `--fills recorded`, `drive_recorded`): the delivery journal of a
+/// live paper window, matched to its capture, reproduces the recorded fills — every slot-8 fill
+/// of `engine-fills.pmlr` delivered in the journal's order, the replay's `FILL` decisions the
+/// live ones in origin, side, bar, oid, px, signed qty and fee. Their `time_ms` stamp is the
+/// wall map's (the I47 FINDING above, asserted strictly there).
+#[test]
+fn replay_from_boot_recorded_mode_reproduces_the_live_fills() {
+    big(|| {
+        let r = record("t20");
+        let x = replay_from_boot_main(&replay_argv(&r, "recorded", "replay"));
+        assert_eq!(x.code, 0, "{} {}", x.stdout, x.stderr);
+        let eng: Vec<Fill> = PmlrReader::<Fill>::open(r.run.join(engine::ENGINE_FILLS_FILE))
+            .expect("fills")
+            .records()
+            .iter()
+            .filter(|f| f.strategy_id == strategy_set::SLOT_PINE)
+            .copied()
+            .collect();
+        assert!(eng.len() >= 3, "{}", eng.len());
+        assert!(
+            x.stdout
+                .contains(&format!("\"recorded_fills\":{}", eng.len())),
+            "{}",
+            x.stdout
+        );
+        let rep = cross::read_tapes(&r.dir.join("replay").join(T0_MS.to_string())).expect("rep");
+        let fills = |d: &[strategy_core::PineTapeRec]| -> Vec<_> {
+            d.iter()
+                .filter(|d| d.kind == pine_tape::FILL)
+                .map(|d| (d.script, d.a, d.b, d.bar_index, d.oid, d.x0, d.x1, d.x2))
+                .collect()
+        };
+        assert_eq!(fills(&rep.dec), fills(&r.dec));
+        assert_eq!(fills(&rep.dec).len(), eng.len());
+        // The journal's FILL records are the delivered ones, in order.
+        let j = cli::pine_delivery::read_journal(&r.run.join(DELIVERY_FILE)).expect("journal");
+        let jf: Vec<u64> = j
+            .iter()
+            .filter(|d| d.kind == strategy_pine::delivery::kind::FILL)
+            .map(|d| d.seq)
+            .collect();
+        assert_eq!(jf, eng.iter().map(|f| f.order_id).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&r.dir);
+    });
 }

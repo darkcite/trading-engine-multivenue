@@ -66,6 +66,7 @@ fn fixture(
         },
         run_epoch_ns: rec_epoch,
         boot_mono_ns,
+        boot_utc_ms: (rec_epoch / 1_000_000) as i64,
         route: SlotRoute::Paper,
         scripts: Vec::new(),
         symbols: Vec::new(),

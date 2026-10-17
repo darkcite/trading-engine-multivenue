@@ -23,9 +23,12 @@
 //! - pin:08-boot-record-write-logged: a boot record that cannot be written is logged at ERROR and
 //!   the run continues (the tape writer's precedent: an evidence file never refuses a boot); the
 //!   run then has no record and impl-Bp's replay-from-boot refuses it.
+//! - pin:08-tape-buffered (risk r21 #3): the journal is a `BufWriter` of
+//!   [`crate::pine_tape::TAPE_BUF_BYTES`] allocated at `open`; each drain (5 s and final) writes
+//!   into it and flushes once at its end. A write or flush error is logged; the window is void.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use strategy_pine::delivery::PineDeliveryRec;
@@ -115,7 +118,7 @@ pub struct DeliveryDrain {
 #[derive(Debug)]
 pub struct DeliveryWriter {
     path: PathBuf,
-    file: File,
+    file: BufWriter<File>,
     next: u64,
     buf: Box<[PineDeliveryRec]>,
 }
@@ -127,7 +130,10 @@ impl DeliveryWriter {
     /// The file cannot be opened.
     pub fn open(run_dir: &Path) -> io::Result<Self> {
         let path = run_dir.join(DELIVERY_FILE);
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = BufWriter::with_capacity(
+            crate::pine_tape::TAPE_BUF_BYTES,
+            OpenOptions::new().create(true).append(true).open(&path)?,
+        );
         Ok(Self {
             path,
             file,
@@ -160,6 +166,8 @@ impl DeliveryWriter {
             self.next = first + u64::from(n);
             o.written += u64::from(n);
         }
+        // pin:08-tape-buffered: one flush per drain.
+        self.file.flush()?;
         Ok(o)
     }
 }
@@ -288,6 +296,26 @@ mod tests {
         assert_eq!(&b[0..8], &0x0102_0304_0506_0708u64.to_le_bytes());
         assert_eq!(&b[22..24], &[0, 0]);
         assert_eq!(rec_from_bytes(&b), r);
+    }
+
+    /// pin:08-verify-queue-sym-ineligible (risk r21 #4), structurally: the paper boot reaches the
+    /// queue law only through `track_queue_sym_kept`, and hands the kept symbols to slot 8's hook
+    /// after the last member block's use and right before the loop — whatever the block order.
+    #[test]
+    fn queue_syms_reach_the_boot_record_whatever_the_block_order() {
+        let src = include_str!("paper.rs");
+        let at = |pat: &str| src.find(pat).unwrap_or_else(|| panic!("{pat}"));
+        assert_eq!(src.matches(".track_queue_sym(").count(), 1, "one door");
+        assert!(at(".track_queue_sym(") > at("fn track_queue_sym_kept<"));
+        let last_use = src.rfind("track_queue_sym_kept(&mut disp").expect("a use");
+        let hand = at("h.note_queue_sym(*s);");
+        let run = at("run_engine_loop(cons, disp, set, obs, pine_hook)");
+        assert!(last_use < hand && hand < run, "{last_use} {hand} {run}");
+        assert_eq!(
+            src.matches("note_queue_sym(").count(),
+            1,
+            "only the hand-off"
+        );
     }
 
     #[test]

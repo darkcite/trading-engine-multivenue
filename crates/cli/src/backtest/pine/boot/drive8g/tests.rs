@@ -28,6 +28,8 @@ const SYM: u32 = make_symbol_id(VenueId::Hyperliquid, 0);
 /// The paper pop delay of a captured stamp after its record's ingress.
 const POP: u64 = 3_000_000;
 const END_S: u64 = 330;
+/// The paper boot's `boot_utc_ms` (its record's; the tape label).
+const BOOT_MS: i64 = (EA / 1_000_000) as i64;
 
 fn script_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pine-bp")
@@ -145,8 +147,9 @@ fn fixture(tag: &str) -> (Fx, ReplayArgv) {
     )
     .unwrap();
     let mut fills = FillEngine::new(model(), u64::MAX);
-    let set =
-        boot_set(&a, facts, [0; 32], None, 0, &mut fills).unwrap_or_else(|f| panic!("{}", f.err));
+    // pin:08-boot-record-boot-utc-ms: the paper boot's instant, carried by its record.
+    let set = boot_set(&a, facts, [0; 32], None, BOOT_MS, &mut fills)
+        .unwrap_or_else(|f| panic!("{}", f.err));
     let rec = set.pine().boot_record(EA, 0).expect("record");
     std::fs::write(root.join("pine-boot.tsv"), rec.render()).unwrap();
     (Fx { root }, a)
@@ -161,8 +164,8 @@ fn model() -> ModelParams {
 fn paper_orders(a: &ReplayArgv) -> Vec<Order> {
     let x = check_inputs(a).unwrap_or_else(|f| panic!("{}", f.err));
     let mut fills = FillEngine::new(model(), u64::MAX);
-    let mut set =
-        super::boot_from_record(a, &x, 0, &mut fills).unwrap_or_else(|f| panic!("{}", f.err));
+    let mut set = super::boot_from_record(a, &x, x.record.boot_utc_ms, &mut fills)
+        .unwrap_or_else(|f| panic!("{}", f.err));
     let recs = load_window(&x, &[SYM]).unwrap_or_else(|f| panic!("{}", f.err));
     let run = drive_judged(&mut set, &mut fills, &recs, None, &mut None)
         .unwrap_or_else(|f| panic!("{}", f.err));
@@ -219,8 +222,9 @@ fn replay_from_boot_seeds_the_member_from_the_record() {
     let (fx, a) = fixture("seed");
     let x = check_inputs(&a).unwrap_or_else(|f| panic!("{}", f.err));
     let mut fills = FillEngine::new(model(), u64::MAX);
-    let set =
-        super::boot_from_record(&a, &x, 0, &mut fills).unwrap_or_else(|f| panic!("{}", f.err));
+    // pin:08-boot-record-boot-utc-ms: booted on the record's instant, it renders it back.
+    let set = super::boot_from_record(&a, &x, x.record.boot_utc_ms, &mut fills)
+        .unwrap_or_else(|f| panic!("{}", f.err));
     let again = set.pine().boot_record(EA, 0).expect("record");
     assert_eq!(again, x.record);
     assert_eq!(again.symbols[0].sym, SYM);
@@ -422,9 +426,12 @@ fn tape_out_writes_the_replay_tapes_under_the_boot_label() {
     a.tape_out = Some(fx.root.join("tape"));
     let x = super::super::replay_from_boot_main(&a);
     assert_eq!(x.code, 0, "{}", x.stderr);
-    // pin:Bp-8g-boot-utc-ms: run epoch + boot_mono (0) − first ts (the
-    // first print, at 0).
-    let label = (EA / 1_000_000).to_string();
+    // pin:08-boot-record-boot-utc-ms (retires pin:Bp-8g-boot-utc-ms): the
+    // record's own boot instant names the tape, nothing reconstructed.
+    let label = BOOT_MS.to_string();
+    let rec = std::fs::read_to_string(fx.root.join("pine-boot.tsv")).unwrap();
+    let rec = strategy_pine::BootRecord::parse(&rec).unwrap();
+    assert_eq!(rec.boot_utc_ms.to_string(), label);
     assert_eq!(field(&x.stdout, "boot_utc_ms"), label);
     let dir = fx.root.join("tape").join(&label);
     let dec = std::fs::read(dir.join("decisions.bin")).unwrap();
@@ -436,6 +443,15 @@ fn tape_out_writes_the_replay_tapes_under_the_boot_label() {
     assert_eq!(lines.len(), 2, "{set}");
     assert!(lines[0].starts_with("#utc_ms\tmask\t"));
     assert!(lines[1].starts_with(&format!("{label}\t")));
+    // pin:08-tape-out-create-new (risk r21 #5): a second replay into the same
+    // `--tape-out` is refused, exit 2, and the first tape is untouched.
+    let before = std::fs::read(dir.join("decisions.bin")).unwrap();
+    let again = super::super::replay_from_boot_main(&a);
+    assert_eq!(again.code, super::EXIT_TAPE_EXISTS, "{}", again.stderr);
+    assert_eq!(again.code, 2);
+    assert!(again.stderr.contains("never appended"), "{}", again.stderr);
+    assert_eq!(std::fs::read(dir.join("decisions.bin")).unwrap(), before);
+    assert_eq!(std::fs::read_to_string(dir.join("set.tsv")).unwrap(), set);
 }
 
 /// I47 end to end (impl-08 T22): a window's tapes and its replay-from-boot tapes, both written
@@ -451,7 +467,8 @@ fn cross_pairs_replay_tapes_by_label_and_reports_a_seeded_divergence() {
     assert_eq!(super::super::replay_from_boot_main(&a).code, 0);
     a.tape_out = Some(fx.root.join("replay"));
     assert_eq!(super::super::replay_from_boot_main(&a).code, 0);
-    let label = (EA / 1_000_000).to_string();
+    // pin:08-boot-record-boot-utc-ms: both tapes carry the record's label exactly.
+    let label = BOOT_MS.to_string();
     let live = cross::read_tapes(&fx.root.join("live").join(&label)).expect("live tapes");
     let rep = pair(&fx.root.join("replay"), &label, &live.dec)
         .expect("readable")

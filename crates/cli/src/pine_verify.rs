@@ -607,6 +607,23 @@ pub fn verify_window_cross(w: WindowIn, rep: Option<&cross::Tapes>) -> WindowOut
         drain_dec(&member, &mut dbuf, &mut got);
         drain_seq(&member, &mut sbuf, &mut snext);
     }
+    // risk r21 #2: a fill the replayed matcher still holds after the loop is a divergence (the
+    // recorded run never delivered it), so a window ending on one is never green.
+    // pin:08-verify-leftover-fills: when the loop stopped at the window's end, the recorded
+    // paper FILLs past it (in tape order) are what the live engine delivered next — a leftover
+    // equal to the next one is the cut, not a divergence; every other leftover counts.
+    let mut past = seq.iter().filter(|r| {
+        r.seq >= end_seq
+            && r.kind == pine_seq::FILL
+            && fill_of(&r.payload).is_some_and(|f| f.origin == FILL_ORIGIN_PAPER)
+    });
+    while let Some(m) = ctx.matcher.try_next_fill() {
+        if past.next().is_some_and(|r| words(&m) == r.payload) {
+            continue;
+        }
+        diffs += 1;
+        first_diff.get_or_insert_with(|| format!("matcher fill left after the replay: {m:?}"));
+    }
     // Step 5.
     let want: Vec<&PineTapeRec> = dec.iter().filter(|r| r.seq_ref < end_seq).collect();
     let have: Vec<&PineTapeRec> = got.iter().filter(|r| r.seq_ref < end_seq).collect();
@@ -840,6 +857,44 @@ fn find_manifest(dir: &Path, sha: &[u8; 32]) -> Option<PathBuf> {
         .find(|p| std::fs::read(p).is_ok_and(|b| core_crypto::sha256(&b) == *sha))
 }
 
+/// `exec.toml` resolved under its OWN arming (risk r21 #1): `pine-verify` is offline, arms
+/// nothing and opens no socket, so the two-switch interlock (an operator's `--arm-live` agreeing
+/// with the artifact) is the live boot's question, never this verb's — the artifact's live mask is
+/// passed as its own second switch. A slot the interlock refuses whatever the flag (slot 8, an
+/// unbuilt slot) is still refused.
+///
+/// # Errors
+/// The artifact cannot be read, parsed or resolved (human-readable).
+pub fn resolve_as_armed(p: &Path) -> Result<crate::exec_boot::ExecBoot, String> {
+    let (file, _) = core_config::exec::load(p).map_err(|e| e.to_string())?;
+    let mask = crate::exec_boot::render_slot_mask(file.live_mask());
+    let spec = mask.trim_start_matches('[').trim_end_matches(']');
+    crate::exec_boot::resolve(Some(p), Some(spec))?
+        .ok_or_else(|| format!("{}: resolved to nothing", p.display()))
+}
+
+/// Rule 3's `exec.toml` (pin:08-verify-rule3-via-record, risk r21 #1): the bytes' SHA-256 —
+/// exactly what `ExecBoot::hash` is (`core_config::exec::load`'s bytes) — against the record's
+/// `exec_sha256`. Unequal or unreadable → "inputs changed"; equal → the boot's own configuration
+/// ([`resolve_as_armed`]), whose interlock never decides eligibility. pin:08-verify-exec-resolve-
+/// unusable: bytes that hash to the record but no longer resolve (a binary that changed the
+/// artifact's grammar) are "unusable", not "inputs changed" — the inputs did not change.
+fn exec_of_record(p: &Path, want: &[u8; 32]) -> Result<crate::exec_boot::ExecBoot, String> {
+    let bytes =
+        std::fs::read(p).map_err(|e| format!("inputs changed: exec.toml {}: {e}", p.display()))?;
+    if core_crypto::sha256(&bytes) != *want {
+        return Err("inputs changed: exec.toml does not hash to the boot record".to_string());
+    }
+    let eb = resolve_as_armed(p).map_err(|e| {
+        format!("unusable: exec.toml hashes to the boot record but does not resolve: {e}")
+    })?;
+    // The file was read twice: the resolved bytes must be the hashed ones.
+    if eb.hash != *want {
+        return Err("inputs changed: exec.toml does not hash to the boot record".to_string());
+    }
+    Ok(eb)
+}
+
 /// pin:08-verify-rule5-window: another slot's order on a pine symbol, by `boot + 2 h`.
 fn rule5(
     run: &Path,
@@ -914,18 +969,17 @@ pub fn load_window(tape_dir: &Path, o: &VerifyOpts) -> Result<Loaded, String> {
             o.manifest_dir.display()
         ));
     };
-    // pin:08-verify-rule3-via-record: exec.toml.
+    // pin:08-verify-rule3-via-record: exec.toml — a RE-HASH of its bytes (risk r21 #1).
     let eb = match o.exec.as_deref() {
-        Some(p) => match crate::exec_boot::resolve(Some(p), None) {
-            Ok(eb) => eb,
-            Err(e) => return inel(format!("inputs changed: exec.toml refused: {e}")),
+        Some(p) => match exec_of_record(p, &rec.exec_sha256) {
+            Ok(eb) => Some(eb),
+            Err(r) => return inel(r),
         },
+        None if rec.exec_sha256 != [0u8; 32] => {
+            return inel("inputs changed: exec.toml does not hash to the boot record".to_string())
+        }
         None => None,
     };
-    let exec_sha = eb.as_ref().map_or([0u8; 32], |b| b.hash);
-    if exec_sha != rec.exec_sha256 {
-        return inel("inputs changed: exec.toml does not hash to the boot record".to_string());
-    }
     let flags = crate::pine_boot::PineFlags {
         manifest,
         tape: true,
@@ -1095,8 +1149,9 @@ fn mv(rel: &str) -> PathBuf {
 /// # Errors
 /// The manifest, `exec.toml` or a missing fact, human-readable (exit 1 — the refusal).
 fn check_cfg(a: &PineVerifyArgs, manifest: &Path) -> Result<PineBootCfg, String> {
+    // risk r21 #1: an armed artifact loads its slot section too (offline, nothing armed).
     let eb = match a.exec.as_deref() {
-        Some(p) => crate::exec_boot::resolve(Some(p), None)?,
+        Some(p) => Some(resolve_as_armed(p)?),
         None => None,
     };
     let flags = crate::pine_boot::PineFlags {
