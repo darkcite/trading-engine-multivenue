@@ -7,15 +7,15 @@
 //! The warm-up merge-walk (`warm`) reuses `step_sub_bar`, `tick_sub` and `eval_script`.
 //!
 //! Hot module (I4): no allocation, no clock (time arrives as event data, P5), index loops only.
-//! The one `dyn` is `&mut dyn BarCtx` (`ctx::PineCtx`). The order path (8d) is not wired: a
-//! committing evaluation's intents are counted in `Core::intents_unrouted` and dropped at the one
-//! site 8d replaces (`commit`, with `broker.apply_intents(vm.intents(), now_ns)` then
-//! `reconcile` + dispatch, §4.3.9 steps 5–6).
+//! The one `dyn` is `&mut dyn BarCtx` (`ctx::PineCtx`). A committing evaluation hands its intents
+//! to `host::commit` (`broker.apply_intents(vm.intents(), now_ns)`, §4.3.9 step 5); `reconcile` +
+//! dispatch (step 6) run in `host::flush` at the end of the callback
+//! (pin:08-reconcile-at-callback-end). Realtime ticks are `coalesce` (8c, T11).
 //!
 //! Literal readings:
-//! - pin:08-fault-latch-until-8e: a script fault, or a fault of any instance it reads, latches
-//!   the script (never stepped again) and counts `scripts_faulted`; a sub fault also latches every
-//!   instance that reads it. The D13 incident, disable and flatten are 8e (T15).
+//! - pin:08-fault-latch-until-8e (RETIRED by T15): a script fault, or a fault of any instance it
+//!   reads, goes through `fault::disable` (the D13 incident, the sticky disable, the flatten); a
+//!   sub fault also latches every instance that reads it (§4.3.8) and disables every parent (I35).
 //! - pin:08-cold-check-at-eval: a cold script's I16 test runs at each evaluation, after the bar's
 //!   confirm and before `step_bar`: the chart row's confirmed bars (`bar.index + 1`, warm bars
 //!   included) ≥ `warmup_bars`, and every instance in its own table holds ≥ `history` confirmed
@@ -28,32 +28,17 @@
 //!   value on history.
 //! - pin:08-gapped-once-per-bar: `bars_gapped` counts a confirmed bar once when its hole is longer
 //!   than the `max_bars_back` of any script charting the row.
-//! - pin:08-realtime-ticks-8c: the third stepping-table row (a `Realtime` parent about to
-//!   `step_tick`) and every chart `step_tick` are 8c (T11); this run steps bars only.
 
 use crate::bars::{self, Confirmed, TradeOut};
+use crate::clock::{advance, now_ms};
+use crate::coalesce;
 use crate::ctx::PineCtx;
 use crate::rt::Core;
+use crate::settle;
 use core_time::barclock;
 use core_types::{ChannelEvent, Tick};
 use pine_ir::{Bar, ExecMode, StepOutcome};
-use strategy_core::PineCounters;
-
-/// `E = max(E, ts)`; a regression leaves E and counts (§4.4.1).
-#[inline]
-fn advance(core: &mut Core, c: &mut PineCounters, ts_ns: core_time::NsTs) {
-    if ts_ns < core.e_ns {
-        c.event_ts_regressions = c.event_ts_regressions.wrapping_add(1);
-    } else {
-        core.e_ns = ts_ns;
-    }
-}
-
-/// `BarCtx::now_ms` live: `ms_from_ns(sat_i64(anchor.wall_of(E)))` (§4.4.1).
-#[inline]
-fn now_ms(core: &Core) -> i64 {
-    pine_ir::scale::ms_from_ns(i64::try_from(core.anchor.wall_of(core.e_ns)).unwrap_or(i64::MAX))
-}
+use strategy_core::{pine_tape, PineCounters};
 
 /// Whether `sym` feeds any row (a pine symbol).
 #[inline]
@@ -71,7 +56,6 @@ pub(crate) fn is_pine_sym(core: &Core, sym: core_types::SymbolId) -> bool {
 /// §4.4.2 `on_venue_event`, the Trade arm: one print of a pine symbol into every row of it.
 pub(crate) fn on_trade(core: &mut Core, c: &mut PineCounters, ev: &ChannelEvent) {
     advance(core, c, ev.ts_ns);
-    core.cb_seq = core.cb_seq.wrapping_add(1);
     let t = bars::t_ms(ev.venue_time_ms, ev.ts_ns, &core.anchor);
     let q = bars::qty_abs(ev.v1);
     let now = now_ms(core);
@@ -80,20 +64,32 @@ pub(crate) fn on_trade(core: &mut Core, c: &mut PineCounters, ev: &ChannelEvent)
         if core.rows[r].sym == ev.sym {
             match core.rows[r].on_trade(ev.v0, q, t) {
                 TradeOut::Late => c.prints_late = c.prints_late.wrapping_add(1),
-                TradeOut::ConfirmedAndOpened(cf) => confirm_row(core, c, r, &cf, now),
-                // 8c (T11): `mark_updated(row)` — the realtime scripts' tick_pending.
-                TradeOut::Updated | TradeOut::Opened => {}
+                TradeOut::ConfirmedAndOpened(cf) => {
+                    confirm_row(core, c, r, &cf, now);
+                    coalesce::mark_updated(core, r);
+                }
+                TradeOut::Updated | TradeOut::Opened => coalesce::mark_updated(core, r),
             }
         }
         r += 1;
     }
+    coalesce::run_pending_ticks(core, c, ev.sym);
 }
 
-/// §4.4.2 `on_tick`, the bar half: a quote tick of a pine symbol confirms its rows by time only
-/// (I12). The quote itself (8c/8d) is not kept yet.
+/// §4.4.2 `on_tick`: E, the symbol's `Quote`, new gone-evidence, the rows confirmed by time only
+/// (I12), the pending ticks, and a reconcile owed to every script on the symbol (synthetic stops
+/// and held limits live on the touch, §4.5.1).
 pub(crate) fn on_quote(core: &mut Core, c: &mut PineCounters, t: &Tick) {
     advance(core, c, t.ts_ns);
-    core.cb_seq = core.cb_seq.wrapping_add(1);
+    let q = crate::clock::quote_of(core, t);
+    let mut k = 0usize;
+    while k < core.syms.len() {
+        if core.syms[k] == t.sym {
+            core.quotes[k] = q;
+        }
+        k += 1;
+    }
+    settle::observe_tick(core, t);
     let tm = bars::t_ms(t.venue_time_ms, t.ts_ns, &core.anchor);
     let now = now_ms(core);
     let mut r = 0usize;
@@ -104,6 +100,14 @@ pub(crate) fn on_quote(core: &mut Core, c: &mut PineCounters, t: &Tick) {
             }
         }
         r += 1;
+    }
+    coalesce::run_pending_ticks(core, c, t.sym);
+    let mut i = 0usize;
+    while i < core.scripts.len() {
+        if core.scripts[i].sym == t.sym {
+            core.dirty |= 1u32 << i;
+        }
+        i += 1;
     }
 }
 
@@ -161,14 +165,19 @@ fn confirm_row(core: &mut Core, c: &mut PineCounters, r: usize, cf: &Confirmed, 
     while i < core.scripts.len() {
         if core.scripts[i].chart_row == r {
             live_script(core, c, i, &cf.bar, now);
+            // R7: the bar's mark after its evaluation (pin:08-bar-mark-every-chart-confirm).
+            crate::marks::record(core, i, &cf.bar);
         }
         i += 1;
     }
+    coalesce::on_confirm(core, r);
 }
 
 /// §4.3.9 for one script on a live confirmed chart bar.
 fn live_script(core: &mut Core, c: &mut PineCounters, i: usize, bar: &Bar, now: i64) {
-    if core.scripts[i].faulted {
+    if core.scripts[i].disabled {
+        // D13's slow phase: one flatten attempt per confirmed chart bar (§4.6 step 5).
+        crate::fault::on_chart_confirm(core, i);
         return;
     }
     // 1. sub-programs: the chart-close time-confirm first (the table's second row) …
@@ -197,9 +206,12 @@ fn live_script(core: &mut Core, c: &mut PineCounters, i: usize, bar: &Bar, now: 
         if dev.open_ms != contain {
             continue;
         }
+        // Part of the confirm: spends first, never refused (I21). Inside a tick evaluation the
+        // instance is part of the script's `charge_tick` instead.
+        coalesce::spend(core, core.subs[s].charge);
         tick_sub(core, c, s, &dev, now, false);
     }
-    if core.scripts[i].faulted {
+    if core.scripts[i].disabled {
         return;
     }
     // 2–5.
@@ -211,6 +223,7 @@ pub(crate) fn step_sub_bar(core: &mut Core, c: &mut PineCounters, s: usize, bar:
     if core.subs[s].faulted {
         return;
     }
+    coalesce::spend(core, core.subs[s].charge);
     let Core { subs, series, .. } = core;
     let sub = &mut subs[s];
     let out = {
@@ -290,16 +303,21 @@ pub(crate) fn eval_script(
     now: i64,
     history: bool,
 ) {
-    if core.scripts[i].faulted {
+    if core.scripts[i].disabled {
         return;
     }
-    // I16: a cold script's gate, before the evaluation (pin:08-cold-check-at-eval).
-    let committing = !history && (!core.scripts[i].cold || turns_warm(core, c, i, bar));
+    // I16: a cold script's gate, before the evaluation (pin:08-cold-check-at-eval); then W21's
+    // other conditions (enabled, not faulted, route not `Off`, §4.4.5).
+    let committing = !history
+        && (!core.scripts[i].cold || turns_warm(core, c, i, bar))
+        && crate::host::commits(core, i);
+    coalesce::spend(core, core.scripts[i].charge_bar);
     let Core {
         scripts, series, ..
     } = core;
     let sc = &mut scripts[i];
     sc.broker.open_bar(bar);
+    sc.bar_ix = bar.index;
     let out = {
         let mut ctx = PineCtx {
             series,
@@ -310,8 +328,17 @@ pub(crate) fn eval_script(
         sc.vm.step_bar(bar, &mut ctx)
     };
     c.bar_evals = c.bar_evals.wrapping_add(1);
-    if let StepOutcome::Fault(_) = out {
-        script_fault(core, c, i);
+    if let StepOutcome::Fault(k) = out {
+        crate::tape::eval(
+            core,
+            c,
+            i,
+            pine_tape::EVAL_BAR,
+            bar,
+            k as u8,
+            u8::from(history),
+        );
+        crate::fault::vm_fault(core, c, i);
         return;
     }
     // §4.3.9 step 4, I19 (impl-03 F17): fail fast.
@@ -320,18 +347,32 @@ pub(crate) fn eval_script(
         "pine: bars_seen != bar.index + 1 (I19)"
     );
     let n = sc.vm.intents().len() as u64;
+    let flags = u8::from(history) | (u8::from(committing) << 3);
+    crate::tape::eval(core, c, i, pine_tape::EVAL_BAR, bar, 0, flags);
     if committing {
-        commit(core, n);
-    } else {
+        crate::host::commit(core, c, i);
+    } else if !core.boot_eval {
         c.intents_discarded = c.intents_discarded.wrapping_add(n);
     }
 }
 
-/// The 8d site (§4.3.9 steps 5–6): `broker.apply_intents(vm.intents(), now_ns)?`, then
-/// `reconcile` + dispatch. Until 8d the intents are counted and dropped here.
-#[inline]
-fn commit(core: &mut Core, n: u64) {
-    core.intents_unrouted = core.intents_unrouted.wrapping_add(n);
+/// §4.4.3 step 2 for script `i`: `broker.open_bar(&forming)`, then `step_tick(&forming, ctx)` —
+/// the one `dyn`. Only a `Realtime` script is ever ticked (I23; `coalesce` guards it).
+pub(crate) fn step_script_tick(core: &mut Core, i: usize, forming: &Bar, now: i64) -> StepOutcome {
+    let Core {
+        scripts, series, ..
+    } = core;
+    let sc = &mut scripts[i];
+    debug_assert!(sc.program.mode == ExecMode::Realtime, "I23");
+    sc.broker.open_bar(forming);
+    sc.bar_ix = forming.index;
+    let mut ctx = PineCtx {
+        series,
+        subs: sc.subs.entries(),
+        broker: Some(&sc.broker),
+        now_ms: now,
+    };
+    sc.vm.step_tick(forming, &mut ctx)
 }
 
 /// I16: whether cold script `i` turns warm at this evaluation; flips it when so.
@@ -355,20 +396,8 @@ fn turns_warm(core: &mut Core, c: &mut PineCounters, i: usize, bar: &Bar) -> boo
     true
 }
 
-/// pin:08-fault-latch-until-8e.
-fn script_fault(core: &mut Core, c: &mut PineCounters, i: usize) {
-    if core.scripts[i].faulted {
-        return;
-    }
-    core.scripts[i].faulted = true;
-    c.scripts_faulted = c.scripts_faulted.wrapping_add(1);
-    if core.scripts[i].cold {
-        core.scripts[i].cold = false;
-        c.scripts_cold = c.scripts_cold.saturating_sub(1);
-    }
-}
-
-/// §4.3.8: a sub fault latches, and every reader (instances and scripts) is latched with it.
+/// §4.3.8: a sub fault latches, and every reader (instances and scripts) is latched with it; every
+/// parent script is disabled through D13's one path, one `SUB_FAULT` incident each (I35).
 fn sub_fault(core: &mut Core, c: &mut PineCounters, s: usize) {
     core.subs[s].faulted = true;
     let bit = 1u32 << s;
@@ -382,7 +411,7 @@ fn sub_fault(core: &mut Core, c: &mut PineCounters, s: usize) {
     let mut i = 0usize;
     while i < core.scripts.len() {
         if core.scripts[i].reads_subs & bit != 0 {
-            script_fault(core, c, i);
+            crate::fault::sub_fault_parent(core, c, i, s);
         }
         i += 1;
     }

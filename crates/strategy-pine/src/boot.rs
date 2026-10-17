@@ -135,6 +135,20 @@ pub struct PineBootCfg {
     pub exec_sha256: [u8; 32],
     /// Write the 8g tapes (`--pine-tape`).
     pub tape: bool,
+    /// impl-Bp §3.9 **R5**: a replay of a recorded boot (`boot_record` / `warmup` are refused
+    /// without it). pin:08-r5-owned-paths: §3.9's `Option<&Path>` is owned here (`PathBuf`) —
+    /// this struct is boot-only and owned (`Clone`, no lifetime), §3.2.
+    pub replay: bool,
+    /// R5: the boot record `pine-boot.tsv` (impl-Bp §3.10). `configure` reads it: the manifest
+    /// and every script must hash to it (`6001`), the client-oid epoch is the record's, the
+    /// reconciled state must be flat (`6013`), and `supply_warm` checks each script's chart-row
+    /// warm digest (`6013`).
+    pub boot_record: Option<std::path::PathBuf>,
+    /// R5: `(bar root, last warm-up close_ms)` — tier 2 warms up on the bars tier 1 screened.
+    /// The host reads the slices from the root (`cli::pine_boot::warm_replay`); the member's
+    /// warm gate is `close_ms ≤ min(open_ms(boot_utc_ms, tf), last close_ms)`
+    /// (pin:08-r5-warmup-gate).
+    pub warmup: Option<(std::path::PathBuf, i64)>,
 }
 
 /// Warm-up bars wanted for one row.

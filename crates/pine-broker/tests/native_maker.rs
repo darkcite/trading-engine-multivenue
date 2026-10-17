@@ -21,6 +21,11 @@ fn broker(max_open: u32) -> NativeBroker {
 
 /// `broker` with its `cap_day_1e6`.
 fn broker_day(max_open: u32, cap_day_1e6: i64) -> NativeBroker {
+    broker_caps(max_open, 100_000 * E, cap_day_1e6)
+}
+
+/// `broker` with its `cap_instance_1e6` and `cap_day_1e6` (the unit is 1 000 USD).
+fn broker_caps(max_open: u32, cap_instance_1e6: i64, cap_day_1e6: i64) -> NativeBroker {
     let meta = ProgramMeta {
         chart: ChartInfo {
             symbol_hash: 1,
@@ -42,7 +47,7 @@ fn broker_day(max_open: u32, cap_day_1e6: i64) -> NativeBroker {
     };
     let cfg = NativeCfg {
         unit_notional_1e6: 1_000 * E,
-        cap_instance_1e6: 100_000 * E,
+        cap_instance_1e6,
         cap_day_1e6,
         min_notional_1e6: 0,
         qty_step_1e6: 1_000,
@@ -231,6 +236,166 @@ fn a_take_profit_covering_the_position_is_requoted_by_cancel_then_submit() {
         (r.verb, r.px_1e6, r.qty_1e6),
         (EngineVerb::Submit, 106 * E, pos)
     );
+}
+
+#[test]
+fn a_requote_at_a_cap_of_one_unit_is_one_modify_not_cancel_and_submit() {
+    // E-7 at `cap_instance == unit`: a Modify REPLACES the resting maker, so the requote's gates see
+    // `outstanding − prev + new` (pin:05-requote-replaces-prev). Counting prev beside its own
+    // replacement refused every requote, and the maker churned (Cancel + Submit) on every quote.
+    let mut b = broker_caps(4, 1_000 * E, 1_000_000 * E);
+    let mut out = EngineIntentBuf::new();
+    b.apply_intents(&[limit_entry(1, 95 * E)], NOW).unwrap();
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    let first = out.as_slice()[0];
+    assert_eq!(
+        (first.verb, first.qty_1e6),
+        (EngineVerb::Submit, 10_526_000)
+    );
+    b.on_ack(first.client_oid);
+    // A fresh quote with nothing changed: the maker keeps resting.
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert!(
+        out.is_empty(),
+        "an unchanged maker rests: {:?}",
+        out.as_slice()
+    );
+    // The limit moves: one Modify carrying prev's oid — no Cancel, no Submit.
+    b.apply_intents(&[limit_entry(1, 96 * E)], NOW).unwrap();
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert_eq!(out.len(), 1, "{:?}", out.as_slice());
+    let m = out.as_slice()[0];
+    assert_eq!(
+        (m.verb, m.prev_client_oid, m.px_1e6, m.qty_1e6),
+        (EngineVerb::Modify, first.client_oid, 96 * E, 10_416_000)
+    );
+    assert_eq!((b.counters().modifies, b.counters().skipped_cap), (1, 0));
+    b.on_ack(m.client_oid);
+    b.on_cancelled(first.client_oid);
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert!(out.is_empty(), "{:?}", out.as_slice());
+}
+
+#[test]
+fn a_requote_keeps_every_other_outstanding_order_in_its_gates_and_never_passes_the_cap() {
+    // cap 1.5 units; A (1 unit at 95) and B (0.5 unit at 90) rest. A's requote replaces A only: B
+    // stays in the count, so 0.9 unit fits (a Modify) and 1.2 units do not (A is taken back, and
+    // its re-submit is refused at gate 5 and counted once).
+    let mut b = broker_caps(4, 1_500 * E, 1_000_000 * E);
+    let mut out = EngineIntentBuf::new();
+    let a = |qty: i64| OrderIntent {
+        flags: f::LIMIT | f::QTY,
+        qty_1e6: qty,
+        ..limit_entry(1, 95 * E)
+    };
+    let other = OrderIntent {
+        seq: 1,
+        flags: f::LIMIT | f::QTY,
+        qty_1e6: E / 2,
+        ..limit_entry(2, 90 * E)
+    };
+    b.apply_intents(&[a(E), other], NOW).unwrap();
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert_eq!(out.len(), 2);
+    let (sa, sb) = (out.as_slice()[0], out.as_slice()[1]);
+    assert_eq!(
+        (sa.verb, sa.qty_1e6, sb.verb, sb.qty_1e6),
+        (
+            EngineVerb::Submit,
+            10_526_000,
+            EngineVerb::Submit,
+            5_555_000
+        )
+    );
+    b.on_ack(sa.client_oid);
+    b.on_ack(sb.client_oid);
+    // 0.9 unit beside B: (9.473 + 5.555) × 95 = 1 427.66 ≤ 1 500 — prev's 10.526 left the count.
+    b.apply_intents(&[a(900_000)], NOW).unwrap();
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert_eq!(out.len(), 1, "{:?}", out.as_slice());
+    let m = out.as_slice()[0];
+    assert_eq!(
+        (m.verb, m.prev_client_oid, m.qty_1e6),
+        (EngineVerb::Modify, sa.client_oid, 9_473_000)
+    );
+    b.on_ack(m.client_oid);
+    b.on_cancelled(sa.client_oid);
+    // 1.2 units beside B: (12.631 + 5.555) × 95 = 1 727.67 > 1 500 — no Modify; taken back …
+    let caps = b.counters().skipped_cap;
+    b.apply_intents(&[a(1_200_000)], NOW).unwrap();
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert_eq!(out.len(), 1, "{:?}", out.as_slice());
+    let c = out.as_slice()[0];
+    assert_eq!((c.verb, c.client_oid), (EngineVerb::Cancel, m.client_oid));
+    assert_eq!((b.counters().modifies, b.counters().skipped_cap), (1, caps));
+    // … and refused at its re-submit (the record dies, counted once); B rests untouched.
+    b.on_cancelled(m.client_oid);
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert!(out.is_empty(), "{:?}", out.as_slice());
+    assert_eq!(b.counters().skipped_cap, caps + 1);
+    b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+        .unwrap();
+    assert!(out.is_empty(), "{:?}", out.as_slice());
+    assert_eq!(b.counters().skipped_cap, caps + 1);
+}
+
+#[test]
+fn a_reducing_requote_at_a_cap_of_one_unit_is_still_judged_against_the_position() {
+    // The fix is for increasing requotes only: with the position at the cap, a take-profit covering
+    // the whole position is still requoted by cancel-then-submit (prev stays in R, §4.12.4 rule 4),
+    // and a partial one (50 %) still by one Modify.
+    for (pct, full) in [(0, true), (50 * E, false)] {
+        let mut b = broker_caps(4, 1_000 * E, 1_000_000 * E);
+        let mut out = EngineIntentBuf::new();
+        let pos = long_at_100(&mut b, &mut out);
+        assert_eq!(pos, 10 * E);
+        let tp = |px: i64| OrderIntent {
+            kind: IntentKind::Exit,
+            id: StrKey(9),
+            from_entry: StrKey(1),
+            flags: if full {
+                f::LIMIT
+            } else {
+                f::LIMIT | f::QTY_PCT
+            },
+            qty_pct_1e6: pct,
+            limit_1e6: px,
+            ..OrderIntent::default()
+        };
+        let m = rest_tp(&mut b, &mut out, tp(105 * E));
+        let size = if full { pos } else { pos / 2 };
+        assert_eq!(m.qty_1e6, size);
+        b.apply_intents(&[tp(106 * E)], NOW).unwrap();
+        b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+            .unwrap();
+        assert_eq!(out.len(), 1, "{:?}", out.as_slice());
+        let r = out.as_slice()[0];
+        if full {
+            assert_eq!((r.verb, r.client_oid), (EngineVerb::Cancel, m.client_oid));
+            assert_eq!(b.counters().modifies, 0);
+            b.on_cancelled(m.client_oid);
+            b.reconcile(&quote(100 * E, 100 * E, NOW), NOW, &mut out)
+                .unwrap();
+            let s = out.as_slice()[0];
+            assert_eq!(
+                (s.verb, s.px_1e6, s.qty_1e6),
+                (EngineVerb::Submit, 106 * E, pos)
+            );
+        } else {
+            assert_eq!(
+                (r.verb, r.prev_client_oid, r.px_1e6, r.qty_1e6),
+                (EngineVerb::Modify, m.client_oid, 106 * E, size)
+            );
+        }
+    }
 }
 
 #[test]

@@ -18,10 +18,10 @@
 //!   first (`6005`, §4.8), so `6010`/`6011` never read an absent Live key.
 //! - pin:08-charge-per-instance: §4.4.4's load check sums, per symbol, the static charge of every
 //!   P4-deduped instance (script or sub-program) whose row is on that symbol.
-//! - pin:08-sub-charge-own-bound (operator ruling 2026-10-16): a script is charged its manifest
-//!   `insn_budget`; a sub-program instance is charged ONCE, at its own bound (`rt::sub_bound`: a
-//!   verified static worst case when exposed, else its compiled `insn_budget_per_eval`), shared by
-//!   every script that reads it.
+//! - pin:08-sub-charge-own-bound (operator ruling 2026-10-16; A10 integrated 2026-10-17): a script
+//!   is charged its manifest `insn_budget`; a sub-program instance is charged ONCE, at its own
+//!   bound (`rt::sub_bound`: `pine_vm::Verified::static_charge()` when the child is acyclic, else
+//!   its compiled `insn_budget_per_eval`), shared by every script that reads it.
 //! - pin:08-broker-refusal-key: a `NativeBroker::new` refusal (`5100`–`5109`) names `file` — the
 //!   `strategy()` declaration is in the source.
 

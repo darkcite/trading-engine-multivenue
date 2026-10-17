@@ -110,6 +110,9 @@ fn boot(scripts: Vec<PineScriptCfg>) -> PineBootCfg {
         fee: FeeModel::default(),
         exec_sha256: [0; 32],
         tape: false,
+        replay: false,
+        boot_record: None,
+        warmup: None,
     }
 }
 
@@ -509,9 +512,9 @@ fn per_symbol_charge_over_budget_is_6011() {
     assert_refusal(&refuse(b), 6011, None, "event_insn_budget");
 }
 
-/// Operator ruling 2026-10-16 (pin:08-sub-charge-own-bound): one script and two distinct HTF
-/// children fit the paper default `event_insn_budget` (4 000 000) with no slot override — each
-/// child is charged once at its own compiled bound, the parent its manifest `insn_budget`.
+/// Operator ruling 2026-10-16 + A10 (pin:08-sub-charge-own-bound): each child is charged once at
+/// its own bound — `Verified::static_charge()` for a loop-free `request.security(…, close)` child,
+/// far below its compiled cap — and the parent its manifest `insn_budget`.
 #[test]
 fn one_script_two_htf_children_fit_the_paper_default() {
     let b = boot(vec![budgeted("htf_two.pine", 0, 1_000_000)]);
@@ -519,13 +522,40 @@ fn one_script_two_htf_children_fit_the_paper_default() {
     let p = started(b);
     let pr = p.rt_probe().expect("core");
     assert_eq!((pr.n_scripts, pr.n_subs, pr.n_rows), (1, 2, 3));
-    // The same tree at 1.4e6 charges 3 × 1.4e6 = 4.2e6 on btc: over the default, refused.
+    // Before A10 this tree at 1.4e6 charged 3 × 1.4e6 = 4.2e6 and was refused; the children's
+    // static bounds make it fit.
+    let p = started(boot(vec![budgeted("htf_two.pine", 0, 1_400_000)]));
+    let pr = p.rt_probe().expect("core");
+    for k in 0..pr.n_subs {
+        assert!(
+            pr.sub_charge[k] > 0 && pr.sub_charge[k] < 10_000,
+            "a loop-free child is charged its small static bound: {}",
+            pr.sub_charge[k]
+        );
+    }
+    // The parent alone at the whole default plus its children: over, refused.
     assert_refusal(
-        &refuse(boot(vec![budgeted("htf_two.pine", 0, 1_400_000)])),
+        &refuse(boot(vec![budgeted("htf_two.pine", 0, 4_000_000)])),
         6011,
         None,
         "event_insn_budget",
     );
+}
+
+/// A10: many loop-free HTF children fit the paper default — three charts × eight children (24
+/// instances) with every parent at 3.9e6: per coin 3.9e6 + 8 small static bounds ≤ 4e6. Under the
+/// compiled-cap charge each child would have cost its parent's 3.9e6.
+#[test]
+fn many_loop_free_htf_children_fit_the_paper_default() {
+    let p = started(boot(
+        (0..3)
+            .map(|c| budgeted("htf_many.pine", c, 3_900_000))
+            .collect(),
+    ));
+    let pr = p.rt_probe().expect("core");
+    assert_eq!((pr.n_scripts, pr.n_subs), (3, 24));
+    let per_coin: u64 = pr.sub_charge[..8].iter().sum();
+    assert!(per_coin + 3_900_000 <= 4_000_000, "Σ children {per_coin}");
 }
 
 #[test]

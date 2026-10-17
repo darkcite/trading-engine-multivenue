@@ -516,6 +516,14 @@ impl NativeBroker {
         self.pristine = false;
     }
 
+    /// `true` while nothing has touched the book: no committed intent, no fill, no send and no
+    /// `reconcile_boot` yet — the only state in which `reconcile_boot` adopts (I34). Cold; a host
+    /// asserts it before adopting (strategy-pine's I38 check).
+    #[must_use]
+    pub fn is_pristine(&self) -> bool {
+        self.pristine
+    }
+
     /// Everything a `strategy.*` variable reads; the host's `BarCtx::broker`. Always current.
     #[must_use]
     pub fn view(&self) -> &BrokerView {
@@ -575,12 +583,14 @@ impl NativeBroker {
     }
 
     /// The resting maker the owner of sent order `o` wants, with its size: `None` when it
-    /// wants none (or the owner is gone).
+    /// wants none (or the owner is gone). `replaces`: the sent slot of the owner's live maker a
+    /// requote would replace (`None` when nothing is sent) — its quantity leaves the gates' count.
     fn rest_of(
         &mut self,
         set: bool,
         idx: usize,
         q: &Quote,
+        replaces: Option<usize>,
     ) -> Result<Option<(WantIoc, i64)>, BrokerFault> {
         if self.cfg.limit_primitive != LimitPrimitive::Maker {
             return Ok(None);
@@ -606,7 +616,7 @@ impl NativeBroker {
             return Ok(None);
         };
         let px = w.limit_1e6.unwrap_or(0);
-        let qty = self.size_order(idx, w, px, false)?;
+        let qty = self.size_order(idx, w, px, false, replaces)?;
         Ok(Some((w, qty)))
     }
 
@@ -622,8 +632,9 @@ impl NativeBroker {
     }
 
     /// A requote of sent maker `i` to `qty` fits beside it (§4.12.4 rule 4): reducing — the new
-    /// size within `|pos| − R` with `prev` still in `R`; increasing — the size check already ran
-    /// the gates with `prev` outstanding (`qty > 0`); and fewer than `MAX_OPEN` replaced.
+    /// size within `|pos| − R` with `prev` still in `R`; increasing — the dry-run size already ran
+    /// the gates on `outstanding − prev + qty` (`qty > 0`, `pin:05-requote-replaces-prev`); and
+    /// fewer than `MAX_OPEN` replaced.
     fn requote_fits(&self, reduce: bool, qty: i64) -> bool {
         let mut replaced = 0;
         let mut k = 0;
@@ -729,7 +740,7 @@ impl NativeBroker {
                 } else if self.preempt && reduce == 1 && side == closing_side {
                     true
                 } else {
-                    match self.rest_of(set, idx, q)? {
+                    match self.rest_of(set, idx, q, Some(i))? {
                         None => true,
                         Some((w, qty)) => {
                             let same_side = u8::from(!w.buy) == side;
@@ -800,7 +811,7 @@ impl NativeBroker {
                 )
             };
             if live_maker && !self.has_pending_replacement(prev) {
-                if let Some((w, qty)) = self.rest_of(set, idx, q)? {
+                if let Some((w, qty)) = self.rest_of(set, idx, q, Some(i))? {
                     let px = self.maker_px(w);
                     let changed = px != o_px || qty != remaining;
                     if changed && u8::from(!w.buy) == side && self.requote_fits(w.reduce, qty) {
@@ -851,7 +862,7 @@ impl NativeBroker {
         now_ns: u64,
         out: &mut EngineIntentBuf,
     ) -> Result<bool, BrokerFault> {
-        let Some((w, qty)) = self.rest_of(set, idx, q)? else {
+        let Some((w, qty)) = self.rest_of(set, idx, q, None)? else {
             return Ok(false);
         };
         if w.reduce && self.preempt {
@@ -884,7 +895,7 @@ impl NativeBroker {
             .max(0);
             floor_step(qty.min(room), self.cfg.qty_step_1e6)
         } else {
-            self.size_order(idx, w, w.limit_1e6.unwrap_or(0), true)?
+            self.size_order(idx, w, w.limit_1e6.unwrap_or(0), true, None)?
         };
         if qty <= 0 {
             return Ok(true);
@@ -1012,14 +1023,24 @@ impl NativeBroker {
         r
     }
 
-    /// Unfilled outstanding increasing quantity on side `buy`, and its notional at `px`.
-    fn outstanding_increasing(&self, buy: bool, px_1e6: i64) -> (i64, i128) {
+    /// Unfilled outstanding increasing quantity on side `buy`, and its notional at `px`, less sent
+    /// slot `replaces` (the maker a requote's `Modify` would replace).
+    fn outstanding_increasing(
+        &self,
+        buy: bool,
+        px_1e6: i64,
+        replaces: Option<usize>,
+    ) -> (i64, i128) {
         let pv = self.chart.pointvalue_1e6;
         let (mut q, mut v) = (0_i64, 0_i128);
         let mut i = 0;
         while i < self.sent.slots() {
             let o = self.sent.get(i);
-            if o.state != sent_state::FREE && o.reduce == 0 && (o.side == 0) == buy {
+            if replaces != Some(i)
+                && o.state != sent_state::FREE
+                && o.reduce == 0
+                && (o.side == 0) == buy
+            {
                 let u = o.qty_1e6 - o.filled_1e6;
                 q = q.saturating_add(u);
                 v = v.saturating_add(value_1e12(px_1e6, u, pv));
@@ -1030,7 +1051,13 @@ impl NativeBroker {
     }
 
     /// Gates 3, 5, 6 on an increasing quantity at reference price `px` (§4.12.3); `false` refuses
-    /// (counted).
+    /// (counted). `replaces`: the sent maker a requote would `Modify` (`None` for a send).
+    /// `pin:05-requote-replaces-prev` (lead ruling 2026-10-16, E-7): a `Modify` REPLACES the
+    /// resting maker, so a requote's gates see `outstanding − prev + new` — prev's unfilled
+    /// quantity leaves the count, every other outstanding order (a `Replaced` predecessor
+    /// included) stays in it. Counting prev beside its own replacement refused every requote at
+    /// `cap_instance == unit` and turned each into Cancel + Submit (E-7 churn). Reducing requotes
+    /// are unchanged (`|pos| − R` with prev in `R`, `requote_fits`).
     fn gates_pass(
         &mut self,
         buy: bool,
@@ -1038,6 +1065,7 @@ impl NativeBroker {
         inc_1e6: i64,
         px_1e6: i64,
         count: bool,
+        replaces: Option<usize>,
     ) -> bool {
         let pv = self.chart.pointvalue_1e6;
         let n = u64::from(count);
@@ -1045,7 +1073,7 @@ impl NativeBroker {
             self.counters.skipped_min_notional += n;
             return false;
         }
-        let (out_q, out_v) = self.outstanding_increasing(buy, px_1e6);
+        let (out_q, out_v) = self.outstanding_increasing(buy, px_1e6, replaces);
         let hi = held_1e6.saturating_add(out_q).saturating_add(inc_1e6);
         if value_1e12(px_1e6, hi, pv) > usd_1e6_to_1e12(self.cfg.cap_instance_1e6) {
             self.counters.skipped_cap += n;
@@ -1065,14 +1093,21 @@ impl NativeBroker {
     /// Size pending order `i` for want `w` at reference price `px` (§4.7, §4.12.3–§4.12.4).
     /// `commit`: refusals kill the record and count, and the record's `pflag::DEFERRED` bit is set
     /// when outstanding reducers cut the send short of what it wants (§4.12.4 rules 2–3);
-    /// otherwise a dry run (requote checks) that changes nothing. `Ok(0)`: nothing to send now.
+    /// otherwise a dry run (requote checks) that changes nothing. `replaces`: the record's live
+    /// maker a requote would replace, out of the gates' count (`None` for a send, `gates_pass`).
+    /// `Ok(0)`: nothing to send now.
     fn size_order(
         &mut self,
         i: usize,
         w: WantIoc,
         px: i64,
         commit: bool,
+        replaces: Option<usize>,
     ) -> Result<i64, BrokerFault> {
+        debug_assert!(
+            !commit || replaces.is_none(),
+            "only a requote dry run replaces"
+        );
         let pos = self.book.view().position_size_1e6;
         // The scalars sizing reads (sizing borrows `self` mutably, so no borrow of the record).
         let (kind, id, qty, qty_pct, filled, reduced, born_eval, deferred) = {
@@ -1140,7 +1175,8 @@ impl NativeBroker {
             u
         };
         if deferred && kind == IntentKind::Entry as u8 {
-            return Ok(self.size_deferred_reversal(i, w, (want - reduced).max(0), px, commit));
+            let q_open = (want - reduced).max(0);
+            return Ok(self.size_deferred_reversal(i, w, q_open, px, commit, replaces));
         }
         want = (want - filled - reduced).max(0);
         let adds = pos == 0 || (pos > 0) == w.buy;
@@ -1190,7 +1226,7 @@ impl NativeBroker {
             return Ok(0);
         }
         let held = if adds { pos.saturating_abs() } else { 0 };
-        if open > 0 && !self.gates_pass(w.buy, held, open, px, commit) {
+        if open > 0 && !self.gates_pass(w.buy, held, open, px, commit, replaces) {
             if commit {
                 self.orders.kill(i);
             }
@@ -1236,6 +1272,7 @@ impl NativeBroker {
         q_open: i64,
         px: i64,
         commit: bool,
+        replaces: Option<usize>,
     ) -> i64 {
         let pos = self.book.view().position_size_1e6;
         let toward = if w.buy { pos } else { pos.saturating_neg() };
@@ -1255,7 +1292,7 @@ impl NativeBroker {
             return 0; // the reducers in flight cover it: wait for their dispositions
         }
         let open = send.saturating_add(r_dir).saturating_sub(flat_dist).max(0);
-        if open > 0 && !self.gates_pass(w.buy, toward.max(0), open, px, commit) {
+        if open > 0 && !self.gates_pass(w.buy, toward.max(0), open, px, commit, replaces) {
             if commit {
                 self.orders.kill(i);
             }
@@ -1326,7 +1363,7 @@ impl NativeBroker {
             return Ok(false);
         };
         let px = if w.buy { q.ask_1e6 } else { q.bid_1e6 };
-        let qty = self.size_order(i, w, px, true)?;
+        let qty = self.size_order(i, w, px, true, None)?;
         if qty <= 0 {
             return Ok(false); // covered by outstanding reducers: wait for their dispositions
         }
@@ -1512,18 +1549,34 @@ impl NativeBroker {
     }
 
     /// Roll the UTC day on event time `ms` (§4.11): the day notional resets.
+    /// `pin:05-boot-day-seed-kept` (R-08-T16-1, §4.14.1 literal: the boot seed is the day notional
+    /// "of the UTC day of the first event-time call"): the first call (`day == None`) ADOPTS its
+    /// day and keeps what `reconcile_boot` seeded; only a known day moving forward zeroes it.
+    /// Zeroing at adoption wiped the seed, so a restart could spend the day cap twice. Before
+    /// the first call the notional is the seed or 0 (`on_fill` rolls before it accrues).
+    /// `pin:05-roll-day-forward-only` (risk review of R-08-T16-1): event times from different
+    /// sources (a quote's `now_ns`, a fill's own `time_ms`) need not be monotone, and §4.11 rolls
+    /// the day — it never un-rolls it. An event stamped on a day EARLIER than the adopted one
+    /// rolls nothing: no zeroing (an event stamped before the boot across 00:00Z no longer wipes
+    /// the seed, nor does the next same-day event zero it again), no risk roll (no day halt lifts),
+    /// and a late fill's notional counts toward the adopted day — conservative, the direction
+    /// §4.14.1 already takes for a seed landing on the next day. No counter: `BrokerCounters`
+    /// is pine-ir's (canonical).
     fn roll_day(&mut self, ms: i64) {
         let day = ms.div_euclid(DAY_MS);
-        if self.day != Some(day) {
-            self.day = Some(day);
-            self.day_notional_1e12 = 0;
-            let (eq, net) = (
-                self.book.view().equity_1e12,
-                self.book.view().netprofit_1e12,
-            );
-            if self.risk.roll_day(day, eq, net, &mut self.counters) {
-                self.flatten_pending = true;
+        if let Some(d) = self.day {
+            if day <= d {
+                return; // the same day, or an earlier one (forward only)
             }
+            self.day_notional_1e12 = 0;
+        }
+        self.day = Some(day);
+        let (eq, net) = (
+            self.book.view().equity_1e12,
+            self.book.view().netprofit_1e12,
+        );
+        if self.risk.roll_day(day, eq, net, &mut self.counters) {
+            self.flatten_pending = true;
         }
     }
 
@@ -1864,5 +1917,116 @@ mod tests {
         // Marked at the last bar's close (100): open profit 10.
         assert_eq!(b.view().openprofit_1e12, 10 * i128::from(E) * i128::from(E));
         assert_eq!(b.day_notional_1e12, 500 * i128::from(E) * i128::from(E));
+    }
+
+    const DAY_NS: u64 = 86_400_000_000_000;
+    /// Ten days and ten seconds after the epoch: some UTC day, event time.
+    const T0: u64 = 10 * DAY_NS + 10_000_000_000;
+    /// 99 950 USD of the 100 000 USD day cap already spent before the restart.
+    const SEED_1E6: i64 = 99_950 * E;
+
+    fn seed_1e12() -> i128 {
+        i128::from(SEED_1E6) * i128::from(E)
+    }
+
+    fn touch(ts: u64) -> pine_ir::Quote {
+        pine_ir::Quote {
+            bid_1e6: 100 * E,
+            ask_1e6: 100 * E,
+            bid_qty_1e6: E,
+            ask_qty_1e6: E,
+            ts_ns: ts,
+            ..pine_ir::Quote::default()
+        }
+    }
+
+    #[test]
+    fn the_boot_day_seed_survives_the_first_event_time_call_and_a_real_roll_zeroes_it() {
+        // pin:05-boot-day-seed-kept (R-08-T16-1): the first event-time call adopts its UTC day
+        // with the seed; zeroing it there let a restart spend the day cap twice.
+        let mut b = broker();
+        let mut out = crate::EngineIntentBuf::new();
+        b.reconcile_boot(0, 0, SEED_1E6);
+        let entry = OrderIntent {
+            kind: IntentKind::Entry,
+            id: StrKey(1),
+            ..OrderIntent::default()
+        };
+        b.apply_intents(&[entry], T0).unwrap(); // the first event-time call
+        assert_eq!(b.day_notional_1e12, seed_1e12());
+        // Gate 6: 99 950 + one unit (100) > 100 000 — refused, counted, nothing sent.
+        b.reconcile(&touch(T0), T0, &mut out).unwrap();
+        assert!(out.is_empty(), "{:?}", out.as_slice());
+        assert_eq!(b.counters().skipped_cap, 1);
+        assert_eq!(b.day_notional_1e12, seed_1e12());
+        // A real day change still resets it (§4.11).
+        b.reconcile(&touch(T0 + DAY_NS), T0 + DAY_NS, &mut out)
+            .unwrap();
+        assert_eq!(b.day_notional_1e12, 0);
+    }
+
+    #[test]
+    fn the_primed_order_reconcile_then_boot_keeps_the_seed() {
+        // strategy-pine's `pin:08-boot-day-primed` order: one reconcile on the pristine broker,
+        // then reconcile_boot — the same day notional as boot-first, and a repeat boot is inert.
+        let mut b = broker();
+        let mut out = crate::EngineIntentBuf::new();
+        b.reconcile(&touch(T0), T0, &mut out).unwrap();
+        assert!(out.is_empty());
+        assert!(
+            b.is_pristine(),
+            "a reconcile sending nothing keeps it pristine"
+        );
+        b.reconcile_boot(2 * E, 95 * E, SEED_1E6);
+        assert!(!b.is_pristine(), "the adoption ends pristine");
+        assert_eq!(b.view().position_size_1e6, 2 * E, "still pristine: adopted");
+        b.reconcile(&touch(T0 + 1), T0 + 1, &mut out).unwrap();
+        assert_eq!(b.day_notional_1e12, seed_1e12());
+        b.reconcile_boot(0, 0, 0); // not pristine any more: changes nothing (I34)
+        assert_eq!(
+            (b.view().position_size_1e6, b.day_notional_1e12),
+            (2 * E, seed_1e12())
+        );
+        b.reconcile(&touch(T0 + DAY_NS), T0 + DAY_NS, &mut out)
+            .unwrap();
+        assert_eq!(b.day_notional_1e12, 0);
+    }
+
+    #[test]
+    fn an_event_stamped_on_an_earlier_day_never_rolls_the_day() {
+        // pin:05-roll-day-forward-only: a boot seed survives an event stamped before the boot
+        // across 00:00Z, and the next same-day event; a late fill counts toward the adopted day.
+        let usd = |x: i64| i128::from(x) * i128::from(E) * i128::from(E);
+        let mut b = broker();
+        let mut out = crate::EngineIntentBuf::new();
+        b.reconcile_boot(0, 0, 500 * E);
+        b.reconcile(&touch(T0), T0, &mut out).unwrap(); // adopts day 10 with the seed
+        let before = T0 - 20_000_000_000; // 23:59:50Z of day 9
+        b.reconcile(&touch(before), before, &mut out).unwrap();
+        assert_eq!(b.day_notional_1e12, usd(500), "an earlier day never rolls");
+        b.reconcile(&touch(T0 + 1), T0 + 1, &mut out).unwrap();
+        assert_eq!(
+            b.day_notional_1e12,
+            usd(500),
+            "nor does the adopted day again"
+        );
+        // A one-unit (100 USD) entry, its fill stamped on day 9: counted toward day 10.
+        let entry = OrderIntent {
+            kind: IntentKind::Entry,
+            id: StrKey(1),
+            ..OrderIntent::default()
+        };
+        b.apply_intents(&[entry], T0 + 2).unwrap();
+        b.reconcile(&touch(T0 + 2), T0 + 2, &mut out).unwrap();
+        let e = out.as_slice()[0];
+        b.on_ack(e.client_oid);
+        let before_ms = i64::try_from(before / 1_000_000).unwrap_or(0);
+        b.on_fill(e.client_oid, e.qty_1e6, 100 * E, 0, 1, before_ms)
+            .unwrap();
+        assert_eq!(b.day_notional_1e12, usd(600));
+        // A forward change still zeroes it (§4.11).
+        b.reconcile(&touch(T0 + DAY_NS), T0 + DAY_NS, &mut out)
+            .unwrap();
+        assert_eq!(b.day_notional_1e12, 0);
     }
 }

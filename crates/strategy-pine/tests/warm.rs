@@ -133,10 +133,10 @@ fn cold_script_discards_until_warm_then_commits() {
         match turned {
             None if c.scripts_cold == 0 => {
                 turned = Some(k);
-                assert!(pr.intents_unrouted > 0, "the turning evaluation commits");
+                assert!(pr.intents_committed > 0, "the turning evaluation commits");
             }
             None => assert_eq!(
-                pr.intents_unrouted, 0,
+                pr.intents_committed, 0,
                 "bar {k}: a cold script commits nothing"
             ),
             Some(_) => {}
@@ -177,5 +177,5 @@ fn merge_walk_steps_subs_and_the_lookahead_history_bar() {
     assert!(!tail.0, "the last 4 h close superseded the history tail");
     assert_eq!(pr.row_last[1].index, 9);
     // Warm-up commits nothing (§4.3.6 step 3).
-    assert_eq!(pr.intents_unrouted, 0);
+    assert_eq!(pr.intents_committed, 0);
 }

@@ -9,7 +9,7 @@
 
 use core_config::pine::{PineLimitPrimitive, PineManifest, PineMode, PineScriptCfg, PineSlotCfg};
 use core_time::{NsTs, WallAnchor};
-use core_types::{ChannelEvent, ChannelId, Order, Price, Qty, Tick, VenueId};
+use core_types::{CancelReq, ChannelEvent, ChannelId, Order, Price, Qty, Tick, VenueId};
 use pine_ir::{barflag, Bar};
 use std::path::PathBuf;
 use strategy_core::{Ctx, Strategy, SubmitErr};
@@ -22,15 +22,128 @@ pub const T0: i64 = 1_767_225_600_000;
 /// One minute, ms.
 pub const MIN: i64 = 60_000;
 
-/// No order path, no clock.
+/// Accepts every order and records nothing; no clock (P5: `now_ns` panics).
 pub struct NoCtx;
 
 impl Ctx for NoCtx {
     fn submit(&mut self, _order: Order) -> Result<(), SubmitErr> {
-        panic!("slot 8 has no order path before 8d");
+        Ok(())
+    }
+    fn cancel(&mut self, _req: CancelReq) -> Result<(), SubmitErr> {
+        Ok(())
+    }
+    fn modify(&mut self, _prev: u64, _order: Order) -> Result<(), SubmitErr> {
+        Ok(())
     }
     fn now_ns(&self) -> NsTs {
         panic!("no clock on the decision path (P5)");
+    }
+}
+
+/// What a scripted ctx saw: the verb (0 submit, 1 modify, 2 cancel), the order (a cancel's
+/// fields in `ts_ns` / `sym` / `venue` / `client_oid` / `strategy_id`), the modify's `prev`.
+#[derive(Debug, Clone, Copy)]
+pub struct Rec {
+    pub verb: u8,
+    pub order: Order,
+    pub prev: u64,
+}
+
+/// Records capacity (fixed: the ctx never allocates after construction).
+pub const REC_CAP: usize = 4096;
+
+/// The scripted `Ctx` double (§7.6): records every verb into a fixed ring and answers from
+/// scripted results; no clock.
+pub struct RecCtx {
+    pub recs: Box<[Rec]>,
+    pub n: usize,
+    pub submit_res: Result<(), SubmitErr>,
+    pub modify_res: Result<(), SubmitErr>,
+    pub cancel_res: Result<(), SubmitErr>,
+    /// Submits of this symbol answer `Refused` (`u32::MAX` = none).
+    pub refuse_sym: u32,
+    /// The pop clock `now_ns` answers (`None`: no clock — P5, it panics). Only `--pine-tape`'s
+    /// `PopStamp::take` may read it (I5).
+    pub clock: Option<NsTs>,
+}
+
+impl RecCtx {
+    pub fn new() -> Self {
+        let z = Order::new(
+            0,
+            VenueId::Hyperliquid,
+            0,
+            core_types::Side::Bid,
+            0,
+            Price::from_raw(0),
+            Qty::from_raw(0),
+            0,
+        );
+        Self {
+            recs: vec![
+                Rec {
+                    verb: 0,
+                    order: z,
+                    prev: 0
+                };
+                REC_CAP
+            ]
+            .into_boxed_slice(),
+            n: 0,
+            submit_res: Ok(()),
+            modify_res: Ok(()),
+            cancel_res: Ok(()),
+            refuse_sym: u32::MAX,
+            clock: None,
+        }
+    }
+    fn push(&mut self, verb: u8, order: Order, prev: u64) {
+        let k = self.n % REC_CAP;
+        self.recs[k] = Rec { verb, order, prev };
+        self.n += 1;
+    }
+    /// The recorded verbs, oldest first (≤ `REC_CAP`).
+    pub fn seen(&self) -> &[Rec] {
+        &self.recs[..self.n.min(REC_CAP)]
+    }
+}
+
+impl Default for RecCtx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Ctx for RecCtx {
+    fn submit(&mut self, order: Order) -> Result<(), SubmitErr> {
+        self.push(0, order, 0);
+        if order.sym == self.refuse_sym {
+            return Err(SubmitErr::Refused);
+        }
+        self.submit_res
+    }
+    fn cancel(&mut self, req: CancelReq) -> Result<(), SubmitErr> {
+        let mut o = Order::new(
+            req.ts_ns,
+            VenueId::Hyperliquid,
+            req.sym,
+            core_types::Side::Bid,
+            0,
+            Price::from_raw(0),
+            Qty::from_raw(0),
+            req.client_oid,
+        );
+        o.venue = req.venue;
+        o.strategy_id = req.strategy_id;
+        self.push(2, o, 0);
+        self.cancel_res
+    }
+    fn modify(&mut self, prev: u64, order: Order) -> Result<(), SubmitErr> {
+        self.push(1, order, prev);
+        self.modify_res
+    }
+    fn now_ns(&self) -> NsTs {
+        self.clock.expect("no clock on the decision path (P5)")
     }
 }
 
@@ -115,6 +228,9 @@ pub fn boot(scripts: Vec<PineScriptCfg>) -> PineBootCfg {
         fee: FeeModel::default(),
         exec_sha256: [0; 32],
         tape: false,
+        replay: false,
+        boot_record: None,
+        warmup: None,
     }
 }
 

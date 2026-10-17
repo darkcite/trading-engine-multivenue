@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// OUR CODE: enters while flat and closes while long — the R4 closed-trade read-back probe
+// (impl-Bp §3.9, impl-08 §3.7: closed_trade / closed_count).
+strategy("rt close (strategy-pine R4)", overlay = true)
+plot(close)
+if strategy.position_size == 0
+    strategy.entry("L", strategy.long)
+else
+    strategy.close("L")

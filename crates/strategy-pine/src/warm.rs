@@ -15,12 +15,15 @@
 //!   truth is unknowable). Neither is a refusal (§4.3.6: "makes the row cold").
 //! - pin:08-warm-boot-open-gate: the last bar's `close_ms ≤ barclock::open_ms(boot_utc_ms, tf)`;
 //!   a slice with no bars is cold.
-//! - pin:08-warm-no-reconcile-boot-on-paper: `reconcile_boot` (§4.2 step 5, D19) needs a venue
-//!   boot state; slot 8 is paper only and `boot_state` is empty, so no warm-up calls it (8f).
+//! - pin:08-warm-no-reconcile-boot-on-paper is RETIRED (T16): every committing WARM script calls
+//!   `reconcile_boot` immediately before its LAST warm-up evaluation (`arm::adopt`, D19, I38) —
+//!   zeros on paper and replay (pin:08-boot-state-any-route) — and that evaluation's intents go to
+//!   the boot policy (`arm::boot_commit`, §4.7.8); cold scripts adopt in `arm::finish_boot`.
 //! - pin:08-warm-ties-subs-first: per `close_ms`, every sub-program instance on a tied row steps
 //!   first (instance order — children before parents), then every script charting a tied row
 //!   (manifest order); a row that is both a sub row and a chart row steps in both phases.
 
+use crate::arm::{self, BootArm};
 use crate::bars::NONE_MS;
 use crate::boot::WarmSlice;
 use crate::rt::{Core, Plan};
@@ -60,10 +63,14 @@ fn valid(bars: &[Bar], tf: u32, boot_open: i64, max_lag: u32, need: u32) -> bool
 }
 
 /// `supply_warm`: per plan row, the renumbered, masked bars of a valid slice, or `None` (cold).
+///
+/// pin:08-r5-warmup-gate: `cut_ms` (R5 `warmup`'s last warm-up `close_ms`) lowers the boot-open
+/// gate to `min(open_ms(boot_utc_ms, tf), cut_ms)` — the lag rule is measured from the same gate.
 pub(crate) fn validate(
     plan: &Plan,
     slices: Vec<WarmSlice>,
     boot_utc_ms: i64,
+    cut_ms: Option<i64>,
     max_lag: u32,
 ) -> Vec<Option<Box<[Bar]>>> {
     let n = plan.rows.len();
@@ -79,7 +86,10 @@ pub(crate) fn validate(
         };
         seen[r] = seen[r].saturating_add(1);
         let row = &plan.rows[r];
-        let boot_open = barclock::open_ms(boot_utc_ms, row.tf_s);
+        let boot_open = match cut_ms {
+            Some(c) => barclock::open_ms(boot_utc_ms, row.tf_s).min(c),
+            None => barclock::open_ms(boot_utc_ms, row.tf_s),
+        };
         if seen[r] > 1 || !valid(&sl.bars, row.tf_s, boot_open, max_lag, row.need) {
             out[r] = None;
             continue;
@@ -100,10 +110,27 @@ pub(crate) fn validate(
 
 /// §4.2 step 5 + §4.3.7: the merge-walk over every warm row, then the rows' live start and the
 /// cold scripts. Boot only.
-pub(crate) fn walk(core: &mut Core, c: &mut PineCounters, warm: &[Option<Box<[Bar]>>]) {
+pub(crate) fn walk(
+    core: &mut Core,
+    c: &mut PineCounters,
+    warm: &[Option<Box<[Bar]>>],
+    boot: &BootArm<'_>,
+) {
     let n_rows = core.rows.len();
     debug_assert!(warm.len() == n_rows);
     let mut cur = vec![0usize; n_rows];
+    core.warming = true;
+    // §4.3.7 decided before the walk (it reads only which rows are warm): a script that ends cold
+    // adopts in `finish_boot`, never at a warm-up evaluation (§4.7.5).
+    let row_warm = |r: usize| warm[r].as_ref().is_some_and(|b| !b.is_empty());
+    let mut ends_warm = 0u32;
+    for (i, s) in core.scripts.iter().enumerate() {
+        if row_warm(s.chart_row)
+            && (0..n_rows).all(|r| s.reads_rows & (1u32 << r) == 0 || row_warm(r))
+        {
+            ends_warm |= 1u32 << i;
+        }
+    }
     loop {
         // The smallest pending close.
         let mut t = i64::MAX;
@@ -155,8 +182,20 @@ pub(crate) fn walk(core: &mut Core, c: &mut PineCounters, warm: &[Option<Box<[Ba
                     step::tick_sub(core, c, s, &h, b.close_ms, true);
                 }
             }
-            // 2–3. `open_bar`, `step_bar` at `now_ms = close_ms`; the intents are discarded.
-            step::eval_script(core, c, i, &b, b.close_ms, true);
+            // 2–3. `open_bar`, `step_bar` at `now_ms = close_ms`; the intents are discarded —
+            // except at a warm script's LAST warm-up bar: adopt first, then the boot policy.
+            core.warm_ms = b.close_ms;
+            let row = core.scripts[i].chart_row;
+            let last = warm[row].as_ref().is_some_and(|w| cur[row] + 1 == w.len());
+            if last && ends_warm & (1u32 << i) != 0 && arm::committing_at_boot(core, i) {
+                arm::adopt(core, c, i, boot);
+                core.boot_eval = true;
+                step::eval_script(core, c, i, &b, b.close_ms, true);
+                core.boot_eval = false;
+                arm::boot_commit(core, c, i, boot);
+            } else {
+                step::eval_script(core, c, i, &b, b.close_ms, true);
+            }
         }
         for (r, at) in cur.iter_mut().enumerate() {
             if adv & (1u32 << r) != 0 {
@@ -164,6 +203,7 @@ pub(crate) fn walk(core: &mut Core, c: &mut PineCounters, warm: &[Option<Box<[Ba
             }
         }
     }
+    core.warming = false;
     // Live bars continue each warm row at `n`.
     let mut cold_rows = 0u32;
     for (r, w) in warm.iter().enumerate() {
@@ -187,7 +227,7 @@ pub(crate) fn walk(core: &mut Core, c: &mut PineCounters, warm: &[Option<Box<[Ba
             }
         }
         let sm = &mut core.scripts[i];
-        sm.cold = is_cold && !sm.faulted;
+        sm.cold = is_cold && !sm.disabled;
         if sm.cold {
             cold += 1;
         }
