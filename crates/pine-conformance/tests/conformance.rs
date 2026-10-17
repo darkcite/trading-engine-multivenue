@@ -54,34 +54,23 @@ fn ours(f: &Fixture) -> bool {
 /// The fixtures that pass today (T15, 2026-10-17, stand-in syminfo, `DEFAULT_LIMITS`).
 const PASS: &[&str] = &[
     "A051", "A052", "A064", "A081", "A082", "A083", "A084", "A085", "A086", "A087", "A088", "A089",
-    "A091", "A092", "A093", "A095", "A096", "C026", "C038", "D035", "D036", "D037", "D038", "D039",
-    "D040", "D048", "D049", "D057", "D061", "E119", "F054", "F059", "F084",
+    "A091", "A092", "A093", "A095", "A096", "C026", "C030", "C038", "D035", "D036", "D037", "D038",
+    "D039", "D040", "D048", "D049", "D057", "D061", "D062", "E119", "F054", "F059", "F084",
 ];
 
 /// Known gaps: `(id, what the run did, owner)` — findings for the lead, never test or expectation
 /// edits. Remove a row when its owner lands the fix (the pass set then grows).
-const KNOWN_GAPS: &[(&str, &str)] = &[
-    // pine-sema: v6 refuses 3005 NotInDialect before 3047 ReferenceEscape; v5 gives 3047 (I9).
-    (
-        "C030",
-        "DialectDivergence: v6 Compile(3005), v5 Compile(3047)",
-    ),
-    // spec/generator: §4.2.4 D-refuse is "compiled live_bound = true → 3043", but §4.5.1 step 6 runs
-    // live_bound = false and the .fix carries no live_refuse line — the run compiles.
-    (
-        "D051",
-        "compiled where 3043 was expected (live_bound=false run)",
-    ),
-    (
-        "D052",
-        "compiled where 3043 was expected (live_bound=false run)",
-    ),
-    // pine-sema: request.currency_rate raises 3255 Internal, not 3053 CurrencyConversion.
-    ("D062", "expected refusal 3053, got Compile(3255 Internal)"),
-];
+///
+/// 2026-10-17: C030 (pine-sema 3005-before-3047, I9) and D062 (3255 → 3053) left the table when
+/// pine-sema landed both; D051/D052 left it by pin:06-d051-live-refuse (see [`SMOKE`]).
+const KNOWN_GAPS: &[(&str, &str)] = &[];
 
 /// Skips the environment explains (§4.5.9): tier-3 fixtures under `DEFAULT_LIMITS` (`0b0011`).
 const SKIPS: &[&str] = &["A094", "C027", "C043", "F065", "F067", "F069", "F071"];
+
+/// Smoke fixtures (`pending` body, ours): `Verdict::Pending` where the bar files exist (the Mac),
+/// `Skipped(NoBarsRoot)` here — pin:06-d051-live-refuse.
+const SMOKE: &[&str] = &["D051", "D052"];
 
 fn short(v: &Verdict) -> String {
     match v {
@@ -103,12 +92,18 @@ fn standin_fixtures_hold_the_known_pass_set() {
     let all = load_all();
     assert_eq!(all.len(), 566, "fixture count");
     let (mut pass, mut gaps, mut skips) = (Vec::new(), Vec::new(), Vec::new());
+    let mut smoke: Vec<String> = Vec::new();
     for f in all.iter().filter(|f| ours(f)) {
         let v = runner.check(f);
         let id = f.id.as_str().to_string();
         match &v {
             Verdict::Pass => pass.push(id),
             Verdict::Skipped(SkipReason::TierInactive { .. }) => skips.push(id),
+            Verdict::Pending | Verdict::Skipped(SkipReason::NoBarsRoot)
+                if SMOKE.contains(&id.as_str()) =>
+            {
+                smoke.push(id)
+            }
             Verdict::DialectDivergence { .. } => {
                 let mut w = short(&v);
                 for d in [Dialect::V6, Dialect::V5] {
@@ -138,6 +133,7 @@ fn standin_fixtures_hold_the_known_pass_set() {
     assert_eq!(pass, want_pass, "pass set moved");
     assert_eq!(got_gaps, want_gaps, "known-gaps table moved");
     assert_eq!(skips, want_skips, "skips moved");
+    assert_eq!(smoke, SMOKE, "smoke set moved");
 }
 
 #[test]

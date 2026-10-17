@@ -25,8 +25,10 @@ pub mod manifest;
 pub mod pins;
 pub mod report;
 pub mod run;
+pub mod sig;
 pub mod syn;
 pub mod trades;
+pub mod triage;
 
 /// Root of the fixture tree, relative to the workspace root.
 pub const FIXTURE_ROOT: &str = "tests/conformance";

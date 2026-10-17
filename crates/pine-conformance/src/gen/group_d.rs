@@ -355,7 +355,12 @@ fn rest() -> Vec<Row> {
         );
         r.ds = ds;
         r.twin = twin;
-        o.push(with_expect(r, Oracle::Authored, 3043));
+        // pin:06-d051-live-refuse (lead ruling) — §4.2.4's "compiled live_bound = true → 3043" is
+        // the I12 `live_refuse 3043` line (§4.5.1 runs live_bound = false); the body is the smoke
+        // `pending` of that live_bound = false run, compared to nothing.
+        r.oracle = Oracle::Authored;
+        r.run.live_refuse = Some(LOOKAHEAD_LEAK);
+        o.push(r);
     }
     o.push(rt(53, false));
     o.push(rt(54, true));

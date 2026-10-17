@@ -140,10 +140,19 @@ fn cmp_dec_absorbs_half_up_rendering() {
     assert_eq!(format_sig(12.5, 2), "12");
     assert!(compare_cell(&val(13.0, "13"), 12.5, Tol::Dec(2)).ok());
     assert!(!compare_cell(&val(13.0, "13"), 12.25, Tol::Dec(2)).ok());
-    // pin:06-dec-bound-f64 — the arm is evaluated in f64 as §4.4.2 writes it, so a fractional tie
-    // whose difference is inexact (0.125 → "0.13": 0.13 − 0.125 = 0.005000000000000004) falls out.
+    // pin:06-dec-bound-exact — the arm is exact decimal: a fractional half-up tie (0.125 → "0.13";
+    // in f64, 0.13 − 0.125 = 0.005000000000000004 > 0.005) is inside; one ULP past it is not.
     assert_eq!(format_sig(0.125, 2), "0.12");
-    assert!(!compare_cell(&val(0.13, "0.13"), 0.125, Tol::Dec(2)).ok());
+    assert!(compare_cell(&val(0.13, "0.13"), 0.125, Tol::Dec(2)).ok());
+    let below = f64::from_bits(0.125f64.to_bits() - 1);
+    assert!(!compare_cell(&val(0.13, "0.13"), below, Tol::Dec(2)).ok());
+    assert!(compare_cell(&val(-0.13, "-0.13"), -0.125, Tol::Dec(2)).ok());
+    // 0.135 is not exactly representable; its f64 lies just above 0.135 — outside "0.13" ± 0.005.
+    assert!(!compare_cell(&val(0.13, "0.13"), 0.135, Tol::Dec(2)).ok());
+    // Large magnitude: "60000" at 2 sig absorbs ±500 exactly.
+    assert!(compare_cell(&val(60000.0, "60000"), 60500.0, Tol::Dec(2)).ok());
+    let past = f64::from_bits(60500f64.to_bits() + 1);
+    assert!(!compare_cell(&val(60000.0, "60000"), past, Tol::Dec(2)).ok());
 }
 
 #[test]
@@ -267,6 +276,125 @@ fn trades_pnl_net_and_gross_bases() {
         None
     );
     assert!(compare_trades(&[row(1, 0, "100", "1.10")], &a, &syms, &s, PnlBasis::Net).is_some());
+}
+
+#[test]
+fn trades_size_is_exact() {
+    let syms = SymTable::new();
+    let s = SignalTable::default();
+    let a = [rec(0, 100_000_000, 1_000_000, 1_000_000_000_000, 0)];
+    let mut e = row(1, 0, "100", "1.00");
+    e.qty = d("1.000001");
+    assert!(matches!(
+        compare_trades(&[e.clone()], &a, &syms, &s, PnlBasis::Net),
+        Some(TradeDiv::Field { field: "qty", .. })
+    ));
+    e.qty = d("1.0000005");
+    assert!(matches!(
+        compare_trades(&[e], &a, &syms, &s, PnlBasis::Net),
+        Some(TradeDiv::Field { field: "qty", .. })
+    ));
+    // A short trade's size is the magnitude; the side is its own field.
+    let short = [rec(0, 100_000_000, -1_000_000, 1_000_000_000_000, 0)];
+    assert!(matches!(
+        compare_trades(
+            &[row(1, 0, "100", "1.00")],
+            &short,
+            &syms,
+            &s,
+            PnlBasis::Net
+        ),
+        Some(TradeDiv::Field { field: "side", .. })
+    ));
+    let mut es = row(1, 0, "100", "1.00");
+    es.long = false;
+    assert_eq!(
+        compare_trades(&[es], &short, &syms, &s, PnlBasis::Net),
+        None
+    );
+}
+
+#[test]
+fn trades_open_trade_compares_entry_fields_only() {
+    let syms = SymTable::new();
+    let s = SignalTable::default();
+    let mut a = rec(0, 100_000_000, 1_000_000, 7_000_000_000_000, 0);
+    a.flags |= trade_flag::OPEN;
+    let mut e = row(1, 0, "100", "999.99");
+    e.exit = None;
+    e.cum_pnl = Some(d("123.45"));
+    // The marked P&L (and the running total) of an open trade is ignored.
+    assert_eq!(
+        compare_trades(&[e.clone()], &[a], &syms, &s, PnlBasis::Net),
+        None
+    );
+    // Its entry fields are not.
+    let mut px = e.clone();
+    px.entry_px = d("100.5");
+    assert!(matches!(
+        compare_trades(&[px], &[a], &syms, &s, PnlBasis::Net),
+        Some(TradeDiv::Field {
+            field: "entry_px",
+            ..
+        })
+    ));
+    // Its OPEN flag is not: an exported exit against our open trade diverges, and vice versa.
+    assert!(matches!(
+        compare_trades(&[row(1, 0, "100", "7.00")], &[a], &syms, &s, PnlBasis::Net),
+        Some(TradeDiv::Field { field: "open", .. })
+    ));
+    let mut closed = a;
+    closed.flags &= !trade_flag::OPEN;
+    assert!(matches!(
+        compare_trades(&[e], &[closed], &syms, &s, PnlBasis::Net),
+        Some(TradeDiv::Field { field: "open", .. })
+    ));
+}
+
+#[test]
+fn trades_exit_signal_from_signals_table() {
+    let syms = SymTable::new();
+    let s = SignalTable::parse(
+        "liquidation\tMargin call\nrisk_flatten\tRisk flatten\nclose\tClose entry\nclose_all\tClose all\n",
+    )
+    .unwrap();
+    let idless = |flags: u32| {
+        let mut a = rec(0, 100_000_000, 1_000_000, 1_000_000_000_000, 0);
+        a.exit_id = pine_ir::StrKey::NONE;
+        a.flags = trade_flag::PNL_NET | flags;
+        a
+    };
+    let with_sig = |sig: &str| {
+        let mut e = row(1, 0, "100", "1.00");
+        e.exit.as_mut().unwrap().sig = sig.into();
+        e
+    };
+    let cmp = |e: TradeRow, a: TradeRec| compare_trades(&[e], &[a], &syms, &s, PnlBasis::Net);
+    let liq = idless(trade_flag::LIQUIDATION);
+    assert_eq!(cmp(with_sig("Margin call"), liq), None);
+    assert!(matches!(
+        cmp(with_sig("Close entry"), liq),
+        Some(TradeDiv::Field {
+            field: "exit_sig",
+            ..
+        })
+    ));
+    let flat = idless(trade_flag::RISK_FLATTEN);
+    assert_eq!(cmp(with_sig("Risk flatten"), flat), None);
+    assert!(cmp(with_sig("Margin call"), flat).is_some());
+    // pin:06-exit-cause-close — an id-less plain exit matches either close text.
+    let plain = idless(0);
+    assert_eq!(cmp(with_sig("Close entry"), plain), None);
+    assert_eq!(cmp(with_sig("Close all"), plain), None);
+    assert!(cmp(with_sig("Margin call"), plain).is_some());
+    // A user exit id wins over the table.
+    assert_eq!(
+        cmp(
+            with_sig("X"),
+            rec(0, 100_000_000, 1_000_000, 1_000_000_000_000, 0)
+        ),
+        None
+    );
 }
 
 #[test]

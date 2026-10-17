@@ -523,29 +523,28 @@ fn lookahead_fixtures_declare_live_refuse() {
         let src = pine_conformance::gen::emit_cell(c).pine;
         let la_on = src.contains("lookahead = barmerge.lookahead_on");
         let offset = src.contains("close[1], lookahead = barmerge.lookahead_on");
-        let refused = matches!(c.expect, Expect::Refuse { code } if code == LOOKAHEAD_LEAK);
-        if la_on && !offset && !refused {
+        // I12: every unoffset lookahead_on fixture carries live_refuse 3043 — D051/D052 included
+        // (pin:06-d051-live-refuse); none expects the refusal of its live_bound = false run.
+        assert!(
+            !matches!(c.expect, Expect::Refuse { code } if code == LOOKAHEAD_LEAK),
+            "{}",
+            id.as_str()
+        );
+        if la_on && !offset {
             assert_eq!(c.run.live_refuse, Some(LOOKAHEAD_LEAK), "{}", id.as_str());
             leaky.push(id.number());
         } else {
             assert_eq!(c.run.live_refuse, None, "{}", id.as_str());
         }
-        if refused {
-            assert_eq!(c.oracle, Oracle::Authored);
-        }
         let rt = c.run.driver == Driver::Rt;
         assert_eq!(rt, (53..=54).contains(&id.number()));
         assert_eq!(rt, c.run.rt.is_some());
     }
-    // §4.2.4: the eight lookahead_on D-matrix fixtures; D017/D018 are offset (leak-free).
-    assert_eq!(leaky, [3, 4, 7, 8, 11, 12, 15, 16]);
+    // §4.2.4: the eight lookahead_on D-matrix fixtures and D-refuse; D017/D018 are offset.
+    assert_eq!(leaky, [3, 4, 7, 8, 11, 12, 15, 16, 51, 52]);
     for n in [51usize, 52] {
-        assert_eq!(
-            cells[n - 1].expect,
-            Expect::Refuse {
-                code: LOOKAHEAD_LEAK
-            }
-        );
+        assert_eq!(cells[n - 1].expect, Expect::Pending);
+        assert_eq!(cells[n - 1].oracle, Oracle::Authored);
     }
     assert_eq!(cells[52].run.rt.unwrap().htf_mult, 5);
     assert_eq!(cells[59].oracle, Oracle::TvOnly);

@@ -155,14 +155,130 @@ pub fn compare_cell_fmt(expected: &Cell, actual: f64, tol: Tol, prints_negzero: 
             format_sig(actual, sig) == text || {
                 // pin:06-dec-zero-bound — `⌊log₁₀|v|⌋` is undefined at v = 0: the bound is 0 there
                 // (only the text arm can match a printed zero).
-                // pin:06-dec-bound-f64 — evaluated in f64 exactly as §4.4.2 writes it: a fractional
-                // tie whose difference is inexact (0.13 vs 0.125) falls outside (lead: exact decimal?).
-                v != 0.0 && {
-                    let e = v.abs().log10().floor() as i32 - i32::from(sig) + 1;
-                    (actual - v).abs() <= 0.5 * 10f64.powi(e)
-                }
+                // pin:06-dec-bound-exact (lead ruling, retires pin:06-dec-bound-f64) — the bound is
+                // evaluated in exact decimal arithmetic over the printed text and the exact decimal
+                // expansion of `actual`, so a fractional tie (0.13 vs 0.125) is inside.
+                v != 0.0 && dec_bound_exact(text, actual, sig)
             }
         }
     };
     Cmp::Divergent { ulps, within }
+}
+
+/// A finite decimal text as `(neg, digits, exp)`, value `± int(digits) · 10^exp` (digits 0–9, MSB
+/// first). `[+-]?d*[.d*]([eE][+-]?d+)?` with at least one digit; anything else is `None`.
+fn dec_parts(text: &str) -> Option<(bool, Vec<u8>, i64)> {
+    let (neg, t) = match text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (mant, e) = match t.find(['e', 'E']) {
+        Some(i) => (&t[..i], t[i + 1..].parse::<i64>().ok()?),
+        None => (t, 0),
+    };
+    let (ip, fp) = mant.split_once('.').unwrap_or((mant, ""));
+    if ip.is_empty() && fp.is_empty() {
+        return None;
+    }
+    let mut digits = Vec::with_capacity(ip.len() + fp.len());
+    for b in ip.bytes().chain(fp.bytes()) {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        digits.push(b - b'0');
+    }
+    Some((neg, digits, e - fp.len() as i64))
+}
+
+/// Leading zeros stripped.
+fn trim(v: &[u8]) -> &[u8] {
+    let z = v.iter().take_while(|d| **d == 0).count();
+    &v[z..]
+}
+
+fn cmp_mag(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let (a, b) = (trim(a), trim(b));
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// `digits · 10^(exp − to)` (`to ≤ exp`).
+fn rescale(d: &[u8], exp: i64, to: i64) -> Vec<u8> {
+    // COPY: one decimal's digits (≤ ~1.5 K bytes) per `dec` bound check, compare time only — the
+    // rescaled value needs its own buffer to grow — an in-place rescale rejected (input borrowed).
+    let mut v = d.to_vec();
+    v.resize(d.len() + (exp - to) as usize, 0);
+    v
+}
+
+/// `a + b` (`add`) or `a − b` (`a ≥ b`), digit vectors MSB first.
+fn add_sub(a: &[u8], b: &[u8], add: bool) -> Vec<u8> {
+    let n = a.len().max(b.len()) + 1;
+    let mut out = vec![0u8; n];
+    let (mut carry, mut i) = (0i16, 0usize);
+    while i < n {
+        let da = if i < a.len() {
+            i16::from(a[a.len() - 1 - i])
+        } else {
+            0
+        };
+        let db = if i < b.len() {
+            i16::from(b[b.len() - 1 - i])
+        } else {
+            0
+        };
+        let mut s = if add {
+            da + db + carry
+        } else {
+            da - db + carry
+        };
+        carry = 0;
+        if s >= 10 {
+            s -= 10;
+            carry = 1;
+        } else if s < 0 {
+            s += 10;
+            carry = -1;
+        }
+        out[n - 1 - i] = s as u8;
+        i += 1;
+    }
+    debug_assert_eq!(carry, 0, "add_sub: a < b");
+    out
+}
+
+/// §4.4.2's second `dec` arm, `|a − v| ≤ 0.5 · 10^(⌊log₁₀|v|⌋ − sig + 1)`, in exact decimal:
+/// `v` is the printed text, `a` the exact decimal expansion of the `f64` (≤ 1074 fractional digits,
+/// so `{:.1100}` prints it without rounding). `v ≠ 0`. A text that is not a finite decimal is
+/// outside (fail closed).
+fn dec_bound_exact(text: &str, actual: f64, sig: u8) -> bool {
+    let Some((vn, vd, ve)) = dec_parts(text) else {
+        return false;
+    };
+    let Some((an, ad, ae)) = dec_parts(&format!("{actual:.1100}")) else {
+        return false;
+    };
+    let vt = trim(&vd);
+    if vt.is_empty() {
+        return false;
+    }
+    // 0.5 · 10^(L − sig + 1) = 5 · 10^(L − sig), L = ⌊log₁₀|v|⌋ = digits − 1 + exp.
+    let l = vt.len() as i64 - 1 + ve;
+    let be = l - i64::from(sig.max(1));
+    let to = ve.min(ae).min(be);
+    let (v, a, b) = (
+        rescale(&vd, ve, to),
+        rescale(&ad, ae, to),
+        rescale(&[5], be, to),
+    );
+    let diff = if vn == an {
+        if cmp_mag(&a, &v).is_ge() {
+            add_sub(&a, &v, false)
+        } else {
+            add_sub(&v, &a, false)
+        }
+    } else {
+        add_sub(&a, &v, true)
+    };
+    cmp_mag(&diff, &b).is_le()
 }
