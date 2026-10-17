@@ -12,6 +12,7 @@ description  = "BIN15 rolling-binary member: HIP-4 outcome markets priced off a 
 core-fill     = { workspace = true }
 core-regime   = { workspace = true }
 core-time     = { workspace = true }
+core-twaplock = { workspace = true }
 core-types    = { workspace = true }
 core-vol      = { workspace = true }
 strategy-core = { workspace = true }

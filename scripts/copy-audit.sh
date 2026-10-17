@@ -78,7 +78,7 @@ if [ "$#" -eq 0 ]; then
     set -- crates/exec-router crates/exec-hyperliquid crates/signer-eip712 \
            crates/signer-evm crates/signer-ed25519 crates/exec-binance crates/exec-hyperevm \
            crates/clob-dispatcher crates/cli/src/bn_live.rs crates/cli/src/xmm_live.rs \
-           crates/cli/src/bin15_live.rs crates/strategy-bin15 \
+           crates/cli/src/bin15_live.rs crates/strategy-bin15 crates/core-twaplock \
            crates/core-net \
            crates/core-ring crates/ingress-binance crates/ingress-okx crates/ingress-deribit \
            crates/ingress-hyperliquid crates/ingress-mexc crates/ingress-bybit \

@@ -1,0 +1,15 @@
+[package]
+name         = "core-twaplock"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Late-window pricing of a binary settled on a 60-second TWAP: the HIP-4 last-value grid (BIN15 H90) and Polymarket's Chainlink report grid (PM15), one integer settlement law. No floats, no allocation after construction."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-regime = { workspace = true }

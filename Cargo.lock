@@ -548,6 +548,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-twaplock"
+version = "0.1.0"
+dependencies = [
+ "core-regime",
+]
+
+[[package]]
 name = "core-types"
 version = "0.1.0"
 
@@ -2024,6 +2031,7 @@ dependencies = [
  "core-fill",
  "core-regime",
  "core-time",
+ "core-twaplock",
  "core-types",
  "core-vol",
  "strategy-core",

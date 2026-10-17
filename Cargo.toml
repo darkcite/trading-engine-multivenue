@@ -15,6 +15,7 @@ members = [
     "crates/core-ring",
     "crates/core-simd",
     "crates/core-time",
+    "crates/core-twaplock",
     "crates/core-types",
 
     # --- ingress adapters (one per external source) ---
@@ -196,6 +197,7 @@ core-simd    = { path = "crates/core-simd" }
 core-time    = { path = "crates/core-time" }
 core-types   = { path = "crates/core-types" }
 core-vol     = { path = "crates/core-vol" }
+core-twaplock = { path = "crates/core-twaplock" }
 core-fill    = { path = "crates/core-fill" }
 core-amm     = { path = "crates/core-amm" }
 
