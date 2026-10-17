@@ -165,13 +165,19 @@ fn meta_inputs_unmatched_overrides_are_reported() {
 /// Fuzz r21 (`input` admitted to the alphabet: 77+ compile panics in `nacap`/`refs`/`series`):
 /// an `input(…)` whose `defval` does not fold — the `series` row `INPUT_F_SRC` fed a series —
 /// is `3008` at the call (`pin:02-input-series-defval`), never an unfolded call whose missing value
-/// slot a later pass indexes. A constant `defval`, nested or in a local block, still folds.
+/// slot a later pass indexes. A constant `defval`, nested or in a local block, still folds. Since
+/// r22 a source-type built-in `defval` (`input(close)`) is a source input
+/// (`pin:02-input-source-defval`, the next test); any other non-constant stays `3008`: an
+/// expression, a history read, a user variable bound to a source, a non-float built-in series
+/// (`bar_index`, `time`) and a `simple` built-in (`syminfo.mintick`).
 #[test]
 fn meta_inputs_unfoldable_defval_is_3008_not_a_panic() {
     for body in [
-        "x = input(close)\nplot(x)\n",
         "plot(input(close * 2))\n",
-        "plot(nz(input(close)))\n",
+        "x = input(close[1])\nplot(x)\n",
+        "x = input(bar_index)\nplot(x)\n",
+        "x = input(time)\nplot(x)\n",
+        "x = input(syminfo.mintick)\nplot(x)\n",
         "v = close\nplot(nz(input(v)))\n",
         "plot(input((false ? close : 96.79)))\n",
         "for i = 0 to 3\n    float v = input(i)\nplot(close)\n",
@@ -188,4 +194,90 @@ fn meta_inputs_unfoldable_defval_is_3008_not_a_panic() {
     ] {
         assert_eq!(run(body, Vec::new()), vec![ACCEPTED], "{body:?}");
     }
+}
+
+/// r22 lead ruling, `pin:02-input-source-defval`: TradingView's `input()` reference gives `defval`
+/// as "const int/float/bool/string/color or source-type built-ins" — "built-in series float
+/// variables … `close`, `hlc3`" — and its example `i_src = input(close, "Source")` feeds
+/// `ta.sma`. The `series` row `INPUT_F_SRC` over such a built-in is therefore a source input that
+/// aliases the series exactly as `input.source` does: the same code and constants, the same
+/// descriptor (kind `Source`, `String`, the series' name as its default), and a manifest override
+/// re-aliases it (`5006` when the override names no built-in float series), in every position the
+/// r21 sweep met (bound, nested, inside a block).
+#[test]
+fn meta_inputs_bare_input_over_a_source_builtin_aliases_like_input_source() {
+    use pine_ir::{input_flag, InputKind, Sym, Ty};
+    let compile = |body: &str, inputs: Vec<InputOverride>| {
+        let mut o = default_opts(Dialect::V6, ExecMode::BarClose);
+        o.inputs = inputs;
+        compile_src(&format!("//@version=6\nindicator(\"t\")\n{body}"), &o)
+    };
+    for (bare, named) in [
+        ("input(close, \"S\")", "input.source(close, \"S\")"),
+        ("input(hlc3)", "input.source(hlc3)"),
+        ("input(defval = hl2)", "input.source(defval = hl2)"),
+        (
+            "input(open, title = \"S\")",
+            "input.source(open, title = \"S\")",
+        ),
+    ] {
+        for (shape, ovr) in [
+            ("s = {}\nplot(ta.sma(s, 10))\nplot(s[1])\n", None),
+            ("s = {}\nplot(s)\n", Some("ohlc4")),
+        ] {
+            let ovs = || match ovr {
+                Some(v) => ov("s", InputValue::Str(v.to_owned())),
+                None => Vec::new(),
+            };
+            let a = compile(&shape.replace("{}", bare), ovs()).expect(bare);
+            let b = compile(&shape.replace("{}", named), ovs()).expect(named);
+            assert_eq!(a.code, b.code, "{bare}: the same code as {named}");
+            // The constant pools agree; a constant-string `StrRef` (region 0) may sit at another
+            // blob offset (`input.source` interns `source`), so those compare as text.
+            assert_eq!(a.consts.len(), b.consts.len(), "{bare}");
+            for (x, y) in a.consts.iter().zip(&b.consts) {
+                if x != y {
+                    let text = |p: &pine_ir::PineProgram, c: u64| {
+                        assert_eq!(c >> 62, 0, "{bare}: a non-string constant differs");
+                        p.syms
+                            .str_at(((c >> 32) & 0x3FFF_FFFF) as u32, c as u32)
+                            .to_vec()
+                    };
+                    assert_eq!(text(&a, *x), text(&b, *y), "{bare}");
+                }
+            }
+            let (da, db) = (a.meta.inputs[0], b.meta.inputs[0]);
+            assert_eq!((da.kind, da.ty), (InputKind::Source, Ty::String), "{bare}");
+            assert_eq!(
+                (da.kind, da.ty, da.flags),
+                (db.kind, db.ty, db.flags),
+                "{bare}"
+            );
+            let name =
+                |p: &pine_ir::PineProgram, bits: u64| p.syms.resolve(Sym(bits as u32)).to_owned();
+            assert_eq!(
+                name(&a, da.default_bits),
+                name(&b, db.default_bits),
+                "{bare}"
+            );
+            if let Some(v) = ovr {
+                assert_eq!(name(&a, da.default_bits), v, "{bare}: overridden");
+                assert_ne!(da.flags & input_flag::OVERRIDDEN, 0, "{bare}");
+            }
+        }
+    }
+    // Every position the r21 sweep met compiles; an override naming no built-in float series is
+    // the same `5006` as `input.source`'s.
+    for body in [
+        "x = input(close)\nplot(x)\n",
+        "plot(nz(input(close)))\n",
+        "plot(input(hlc3) + close)\n",
+        "for i = 0 to 3\n    float v = input(low)\nplot(close)\n",
+        "if close > 0\n    float v = input(high)\nplot(close)\n",
+    ] {
+        assert_eq!(run(body, Vec::new()), vec![ACCEPTED], "{body:?}");
+    }
+    let bad = ov("x", InputValue::Str("bar_index".to_owned()));
+    assert_eq!(run("x = input(close)\nplot(x)\n", bad.clone()), vec![5006]);
+    assert_eq!(run("x = input.source(close)\nplot(x)\n", bad), vec![5006]);
 }

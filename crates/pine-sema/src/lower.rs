@@ -1137,8 +1137,10 @@ impl Lower<'_> {
         let full = pine_spec::entry_of(o).full_str();
         if o.abi == pine_spec::Abi::Folded {
             // §4.14.6's last row: inputs, declarations, risk rules and `max_bars_back` fold.
-            // `input.source` aliases the series it names (§4.12.2).
-            if o.input == Some(pine_ir::InputKind::Source) {
+            // `input.source` aliases the series it names (§4.12.2); so does a bare `input()`
+            // over a source-type built-in (pin:02-input-source-defval: typing refused any other
+            // non-constant `INPUT_F_SRC` defval with `3008`, so this row reaches here aliased).
+            if o.input == Some(pine_ir::InputKind::Source) || ov == pine_spec::ov::INPUT_F_SRC {
                 let key = (self.cur().file, n);
                 let Some(&(_, name)) = self.t.sources.iter().find(|x| x.0 == key) else {
                     return Err(self.todo(n, "an input.source without an alias"));

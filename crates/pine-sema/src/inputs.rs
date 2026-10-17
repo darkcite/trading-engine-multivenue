@@ -229,8 +229,9 @@ impl Inputs {
             // pin:02-input-series-defval — every other kind's value in effect is a constant
             // (§4.12.3), so a `defval` that does not fold has no value to fold the call to: the
             // `series` row `input(defval: series float)` (pine-spec `INPUT_F_SRC`, kind `float`)
-            // over anything but a constant is `3008` here, never an unfolded call (fuzz r21:
-            // `input(syn[18] / …)`, `input(i)` — the lowering's no-value slot panicked later).
+            // over anything but a constant or a source-type built-in (which infer.rs turns into
+            // kind `Source`, pin:02-input-source-defval) is `3008` here, never an unfolded call
+            // (fuzz r21: `input(syn[18] / …)`, `input(i)` — the lowering's no-value slot panicked).
             if value.is_none() {
                 let msg = "input: `defval` must be a compile-time constant".to_owned();
                 diags.push(diag(ReasonCode::QualifierTooWeak, s.span, msg));
@@ -249,8 +250,9 @@ impl Inputs {
 }
 
 /// §4.12.2: `name` is, in dialect `d`, an entry whose value row is a `float` series read from a
-/// reserved slot or a prelude call (`close`, `hlc3`, …).
-fn names_float_series(name: &str, d: Dialect) -> bool {
+/// reserved slot or a prelude call (`close`, `hlc3`, …). Also the source-type built-in test of a
+/// bare `input(defval)` (`pin:02-input-source-defval`, infer.rs).
+pub(crate) fn names_float_series(name: &str, d: Dialect) -> bool {
     pine_spec::lookup(name)
         .and_then(|e| e.values().iter().find(|v| v.versions.has(d)).copied())
         .is_some_and(|v| {

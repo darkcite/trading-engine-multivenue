@@ -1830,8 +1830,27 @@ impl<'a, 's> Infer<'a, 's> {
                                 }
                             } else if kind == InputKind::Source && row.name.as_str() == "defval" {
                                 source = self.builtin_path(v).map(|t| self.syms.intern(&t));
+                            } else if p.ov == pine_spec::ov::INPUT_F_SRC
+                                && row.name.as_str() == "defval"
+                            {
+                                // pin:02-input-source-defval — TradingView's `input()` reference:
+                                // `defval` is "const int/float/bool/string/color or source-type
+                                // built-ins … built-in series float variables … `close`, `hlc3`"
+                                // (example `i_src = input(close, "Source")`). The `series` row
+                                // over such a built-in is a source input: kind `Source`, aliasing
+                                // the series exactly as `input.source` (§4.12.2). Any other
+                                // non-constant `defval` stays `3008` (pin:02-input-series-defval).
+                                source = self
+                                    .builtin_path(v)
+                                    .filter(|t| crate::inputs::names_float_series(t, self.d))
+                                    .map(|t| self.syms.intern(&t));
                             }
                         }
+                        let kind = if p.ov == pine_spec::ov::INPUT_F_SRC && source.is_some() {
+                            InputKind::Source
+                        } else {
+                            kind
+                        };
                         let var = self.pending_var.filter(|v| v.0 == n).map(|v| v.1);
                         let site = Site {
                             key: (self.cur.file, n),
