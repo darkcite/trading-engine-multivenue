@@ -20,10 +20,11 @@ core-time    = { workspace = true }
 core-types   = { workspace = true }
 memchr       = { workspace = true }
 mio          = { workspace = true }
+# PM15: the TLS client config the rolling ingress's sockets are built with.
+rustls       = { workspace = true }
 
 [dev-dependencies]
 # HK31: the sequencer tests apply its ticks to `TopOfBook`.
 book-builder = { workspace = true }
 proptest     = { workspace = true }
 rcgen        = { workspace = true }
-rustls       = { workspace = true }

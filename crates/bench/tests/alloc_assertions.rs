@@ -1421,7 +1421,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     // MX2's MEXC at lane 6 and WS9's Bybit at lane 5; four opt lanes
     // since HC1; five fill lanes since BX3 gave Binance lane 4); break
     // the build loudly if that drifts.
-    const _: () = assert!(NUM_TICK_LANES == 8 && engine::NUM_OPT_LANES == 4 && NUM_FILL_LANES == 5);
+    const _: () = assert!(NUM_TICK_LANES == 9 && engine::NUM_OPT_LANES == 4 && NUM_FILL_LANES == 5);
 
     struct NoopStrat;
     impl StrategyCounters for NoopStrat {}
@@ -1456,6 +1456,8 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_t5p, t5) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t6p, t6) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t7p, t7) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    // PM15: lane 8, the rolling families.
+    let (_t8p, t8) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     // WS10-A: eight venue-event lanes ride in every engine. Lane 2
     // (OKX) gets a live producer — the measured window below pushes
     // one funding ChannelEvent per iteration and the engine drains
@@ -1476,6 +1478,8 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_e6p, e6) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     let (_e7p, e7) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e8p, e8) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     // WS10-B: two depth lanes; lane 0 (OKX) live — the measured
     // window pushes one DepthTopK per iteration and the engine
@@ -1516,8 +1520,8 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let mut eng = Engine::new(
         NoopStrat,
         PaperDispatcher::new(),
-        [t0, t1, t2, t3, t4, t5, t6, t7],
-        [e0, e1, e2, e3, e4, e5, e6, e7],
+        [t0, t1, t2, t3, t4, t5, t6, t7, t8],
+        [e0, e1, e2, e3, e4, e5, e6, e7, e8],
         [d0, d1],
         [o0, o1, o2, o3],
         sc,

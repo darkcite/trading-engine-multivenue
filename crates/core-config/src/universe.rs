@@ -32,7 +32,7 @@
 
 use std::path::Path;
 
-use core_types::pm_roll::{pm_rolling_sym, PM_LEG_DOWN, PM_LEG_MARK, PM_LEG_UP, PM_ROLLING_MAX};
+use core_types::pm_roll::{pm_slot_sym, PM_ROLLING_MAX, PM_ROLLING_STRIDE, PM_SLOT_TAGS};
 use core_types::{make_symbol_id, SymbolId, VenueId};
 
 // ---------------------------------------------------------------
@@ -411,7 +411,8 @@ pub struct Universe {
     /// bit for bit.
     ///
     /// A family is not an instrument: it is three reserved `SymbolId`
-    /// slots — `[up]`, `[down]` and `[mark]` (`core_types::pm_roll`) —
+    /// slots — two token pairs by window parity and `[mark]`
+    /// (`core_types::pm_roll`) —
     /// whose venue tokens are rebound every 15 minutes.
     pub pm_rolling: Vec<String>,
     /// `[binance] spot` — lowercase stream symbols in file order.
@@ -545,9 +546,9 @@ pub struct Instrument {
 pub struct AllocatedUniverse {
     /// Flattened PM tokens (a YES/NO entry contributes YES then NO).
     pub pm_tokens: Vec<PmToken>,
-    /// PM15: the rolling slots, THREE rows per `[polymarket] rolling`
-    /// family — `[up]`, `[down]`, `[mark]` — from the
-    /// `core_types::pm_roll` pool (`polymarket-rolling:<key>[<leg>]`).
+    /// PM15: the rolling slots, FIVE rows per `[polymarket] rolling`
+    /// family — `[up0]`, `[down0]`, `[up1]`, `[down1]`, `[mark]` — from the
+    /// `core_types::pm_roll` pool (`polymarket-rolling:<key>[<slot>]`).
     pub pm_rolling: Vec<Instrument>,
     /// Binance spot instruments.
     pub bn_spot: Vec<Instrument>,
@@ -1145,6 +1146,18 @@ fn validate_pm_entry(s: &str, line_no: usize) -> Result<(), UniverseError> {
             format!("bad PM entry `{s}` (more than one `:`)"),
         )),
     }
+}
+
+/// PM15: the asset of a validated `[polymarket] rolling` key
+/// (`updown:<asset>:15m` → `<asset>`, the slug's spelling).
+#[must_use]
+pub fn pm_rolling_asset(key: &str) -> Option<&str> {
+    let rest = key.strip_prefix("updown:")?;
+    let asset = rest.strip_suffix(":15m")?;
+    if asset.is_empty() || asset.contains(':') {
+        return None;
+    }
+    Some(asset)
 }
 
 /// PM15: `updown:<asset>:15m` — the slug's own spelling: `<asset>` is
@@ -2042,19 +2055,16 @@ pub fn allocate_with_anchors(
         }
     }
 
-    // PM15: three rows per ROLLING family — the reserved Up/Down/mark
+    // PM15: five rows per ROLLING family — the two Up/Down pairs (window
+    // parity) and the mark (`core_types::pm_roll::PM_SLOT_TAGS`).
     // slots. Which window a slot means at a time is a
     // `ChannelId::InstrumentRoll` event, never a manifest column.
     for f in 0..u.pm_rolling.len() {
         let key = &u.pm_rolling[f];
-        for (leg, tag) in [
-            (PM_LEG_UP, "up"),
-            (PM_LEG_DOWN, "down"),
-            (PM_LEG_MARK, "mark"),
-        ] {
-            let name = format!("{key}[{tag}]");
+        for off in 0..PM_ROLLING_STRIDE {
+            let name = format!("{key}[{}]", PM_SLOT_TAGS[off as usize]);
             out.pm_rolling.push(Instrument {
-                sym: pm_rolling_sym(f, leg),
+                sym: pm_slot_sym(f, off),
                 descriptor: format!("polymarket-rolling:{name}"),
                 name,
             });
@@ -2940,7 +2950,7 @@ map = ["0:0", "1:1"]
     }
 
     /// PM15: the `[polymarket] rolling` key. Absent is the pre-PM15 boot;
-    /// each family allocates three slots from the `core_types::pm_roll`
+    /// each family allocates five slots from the `core_types::pm_roll`
     /// pool, clear of the static tokens and the legacy anchors.
     #[test]
     fn pm_rolling_families_parse_allocate_and_refuse_every_other_shape() {
@@ -2954,20 +2964,23 @@ map = ["0:0", "1:1"]
         ))
         .unwrap();
         assert_eq!(u.pm_rolling, vec!["updown:btc:15m", "updown:eth:15m"]);
+        assert_eq!(pm_rolling_asset(&u.pm_rolling[1]), Some("eth"));
+        assert_eq!(pm_rolling_asset("updown:btc:5m"), None);
+        assert_eq!(pm_rolling_asset("updown::15m"), None);
         let a = allocate(&u).unwrap();
-        assert_eq!(a.pm_rolling.len(), 6, "three slots per family");
-        let want = [
-            ("polymarket-rolling:updown:btc:15m[up]", pm_rolling_sym(0, PM_LEG_UP)),
-            ("polymarket-rolling:updown:btc:15m[down]", pm_rolling_sym(0, PM_LEG_DOWN)),
-            ("polymarket-rolling:updown:btc:15m[mark]", pm_rolling_sym(0, PM_LEG_MARK)),
-            ("polymarket-rolling:updown:eth:15m[up]", pm_rolling_sym(1, PM_LEG_UP)),
-            ("polymarket-rolling:updown:eth:15m[down]", pm_rolling_sym(1, PM_LEG_DOWN)),
-            ("polymarket-rolling:updown:eth:15m[mark]", pm_rolling_sym(1, PM_LEG_MARK)),
-        ];
-        for (row, (desc, sym)) in a.pm_rolling.iter().zip(want) {
-            assert_eq!(row.descriptor, desc);
-            assert_eq!(row.sym, sym);
-            assert!(core_types::pm_roll::pm_rolling_of(row.sym).is_some());
+        assert_eq!(a.pm_rolling.len(), 10, "five slots per family");
+        let mut k = 0usize;
+        for (f, key) in ["updown:btc:15m", "updown:eth:15m"].iter().enumerate() {
+            for (off, tag) in ["up0", "down0", "up1", "down1", "mark"].iter().enumerate() {
+                let row = &a.pm_rolling[k];
+                assert_eq!(row.descriptor, format!("polymarket-rolling:{key}[{tag}]"));
+                assert_eq!(row.sym, pm_slot_sym(f, off as u32));
+                assert_eq!(
+                    core_types::pm_roll::pm_rolling_of(row.sym),
+                    Some((f, off as u32))
+                );
+                k += 1;
+            }
         }
         // The static tokens keep their ids: the anchor and flat + 1.
         assert_eq!(a.pm_tokens[0].sym, LEGACY_PM_ANCHOR_SYM);
@@ -2987,7 +3000,9 @@ map = ["0:0", "1:1"]
             let src = format!("[polymarket]\n{bad}\n");
             assert!(parse(&src).is_err(), "{bad}");
         }
-        assert!(parse("[polymarket]\nrolling = [\"updown:btc:15m\", \"updown:btc:15m\"]\n").is_err());
+        assert!(
+            parse("[polymarket]\nrolling = [\"updown:btc:15m\", \"updown:btc:15m\"]\n").is_err()
+        );
         let mut many = String::from("[polymarket]\nrolling = [");
         for i in 0..=PM_ROLLING_MAX {
             many.push_str(&format!("\"updown:a{i}:15m\","));

@@ -37,6 +37,21 @@
 //! (next 2026-11-21 21:25:29Z), after which every tick would have been
 //! `Stale` until a restart. The full stamp rides `Tick.venue_time_ms`
 //! (VT2) under both laws.
+//!
+//! ## PM15 — the rolling 15-minute families (2026-10-17)
+//!
+//! Beside the static markets above, the crate carries Polymarket's
+//! ROLLING 15-minute crypto up/down families on a thread of their own
+//! (`core_types::pm_roll` is the data model):
+//!
+//! - [`pm15_discovery`] — a cold thread that looks each window's market
+//!   up on Gamma by slug and checks it under the venue law ([`gamma15`]);
+//! - [`rolling`] — the bindings and the roll schedule (pure state);
+//! - [`book15`] — a full 0.001 ladder per token, so a touch carries its
+//!   size;
+//! - [`rtds`] — the Chainlink reports the markets settle on;
+//! - [`pm15_loop`] — the ingress thread: the market and RTDS sockets on
+//!   one poll, into the engine's PM15 lane.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -48,7 +63,13 @@
     clippy::undocumented_unsafe_blocks
 )]
 
+pub mod book15;
 pub mod discovery;
+pub mod gamma15;
+pub mod pm15_discovery;
+pub mod pm15_loop;
+pub mod rolling;
+pub mod rtds;
 pub mod run_loop;
 
 pub use run_loop::{

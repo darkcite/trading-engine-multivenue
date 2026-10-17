@@ -64,6 +64,7 @@ pub mod har_writer;
 /// BIN15 H90 L4: the late window's live dust test (`hl-outcome-probe`) —
 /// MAINNET, the operator's to run (ruling O-H90-3).
 pub mod hl_outcome_probe;
+pub mod pm15_probe;
 /// HYPARB H5: `hyparb.toml` → the slot-0 member's params.
 pub mod hyparb_boot;
 pub mod hyparb_live;
@@ -106,11 +107,12 @@ pub use paper::{
     new_capture_run_dir, open_events_capture, open_fills_capture, open_orders_capture,
     parse_ai_hmac_key, parse_raw_tap_flags, parse_stale_after_ms, signal_shutdown, spawn_ai,
     spawn_binance, spawn_binance_multi, spawn_bybit, spawn_deribit, spawn_hypercall,
-    spawn_hyperevm, spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_polymarket, spawn_rpc,
+    spawn_hyperevm, spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_pm15, spawn_polymarket,
+    spawn_rpc,
     split_host_port, state_writer, AiIngressCounterIds, AiIngressStatus, BinanceConnSpec,
     BybitConnSpec, CaptureGaugeIds, CaptureMetrics, Consumers, EngineConfig, EngineCounters,
     EngineLoopResult, EngineLoopStats, ExecObs, HcMetricIds, HypercallSpec, IngressCounterIds,
-    IngressStatusSet, LatencyDump, LiveDispatcher, LiveDispatcherErr, MexcConnSpec, Observability,
+    IngressStatusSet, LatencyDump, Pm15MetricIds, LiveDispatcher, LiveDispatcherErr, MexcConnSpec, Observability,
     RawTapConfig, Rings, RunDirGuard, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
 };
 pub use pinning::{pin_current_thread_to_core, PinError};

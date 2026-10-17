@@ -233,6 +233,21 @@ enum Cmd {
     /// the wrapper's refusal code) with the refusal and the valid names
     /// on stderr.
     StrategyMask(StrategyMaskArgs),
+    /// PM15: run the rolling 15-minute ingress (Gamma discovery, the
+    /// market and RTDS sockets) on its own for `--seconds`, draining its
+    /// lane here and printing a JSON line every 10 s and a final one. No
+    /// account, no order, no capture: safe beside the live engine.
+    Pm15Probe(Pm15ProbeArgs),
+}
+
+#[derive(Debug, Parser)]
+struct Pm15ProbeArgs {
+    /// The families' assets, comma-separated (the slug's spelling).
+    #[arg(long, default_value = "btc,eth")]
+    assets: String,
+    /// How long to run, 1 ..= 3600 s.
+    #[arg(long, default_value_t = 120)]
+    seconds: u64,
 }
 
 /// `hl-outcome-probe --network`.
@@ -1734,6 +1749,23 @@ fn main() -> ExitCode {
             // JSON lines only on stdout.
             init_tracing_stderr();
             hl_outcome_probe(&args)
+        }
+        Cmd::Pm15Probe(args) => {
+            // JSON lines only on stdout.
+            init_tracing_stderr();
+            let assets: Vec<String> = args
+                .assets
+                .split(',')
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+                .collect();
+            match cli::pm15_probe::run(&assets, args.seconds) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("pm15-probe: {e}");
+                    ExitCode::from(1)
+                }
+            }
         }
     }
 }
@@ -4510,6 +4542,9 @@ fn run(args: RunArgs) -> ExitCode {
     // HC1: lane 7 = Hypercall (VenueId 9 — HyperEvm, 8, has no tick
     // lane; engine::tick_lane_of).
     let (hypercall_prod, hypercall_lane_cons) = rings.tick[7].clone().split();
+    // PM15: lane 8 = the Polymarket rolling families (engine::PM15_LANE —
+    // venue byte Polymarket, wired by index).
+    let (pm15_prod, pm15_lane_cons) = rings.tick[engine::PM15_LANE].clone().split();
     // WS10-A: venue-event lanes, tick-lane indexing. Producers ride
     // into the four funding-capable venue spawns; PM (0) and the
     // spare lane 4 producer for HL are dropped — HL carries premium
@@ -4524,6 +4559,8 @@ fn run(args: RunArgs) -> ExitCode {
     let (_pm_event_prod, pm_event_cons) = rings.event[0].clone().split();
     // VM2 V2: HL gained its event lane — funding rides AssetCtx.
     let (hl_event_prod, hl_event_cons) = rings.event[4].clone().split();
+    // PM15: the rolling families' roll, order law and Chainlink mark.
+    let (pm15_event_prod, pm15_event_cons) = rings.event[engine::PM15_LANE].clone().split();
     let event_lane_cons = [
         pm_event_cons,
         bn_event_cons,
@@ -4533,6 +4570,7 @@ fn run(args: RunArgs) -> ExitCode {
         bybit_event_cons,
         mexc_event_cons,
         hypercall_event_cons,
+        pm15_event_cons,
     ];
     // WS10-B: depth lanes (engine::depth_lane_of order — okx 0,
     // deribit 1). Producers ride into the two depth-capable spawns.
@@ -5342,6 +5380,49 @@ fn run(args: RunArgs) -> ExitCode {
         drop(hypercall_opt_prod);
     }
 
+    // PM15: the rolling 15-minute families (`[polymarket] rolling`).
+    // Absent = the unspawned shape: lane 8 reads empty, bit for bit the
+    // pre-PM15 boot.
+    if boot.pm_rolling.is_empty() {
+        drop(pm15_prod);
+        drop(pm15_event_prod);
+    } else {
+        let mut assets = Vec::with_capacity(boot.pm_rolling.len());
+        for key in &boot.pm_rolling {
+            match core_config::universe::pm_rolling_asset(key) {
+                Some(a) => assets.push(a.to_string()),
+                None => {
+                    error!(key = %key, "pm15: a rolling key the universe let through has no asset");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        info!(families = ?assets, "pm15: starting the rolling discovery + ingress threads");
+        match cli::spawn_pm15(
+            assets,
+            tls_config.clone(),
+            core_time::WallAnchor::now(),
+            stale_after_ms[core_types::VenueId::Polymarket as usize],
+            pm15_prod,
+            pm15_event_prod,
+            statuses.pm15.clone(),
+            statuses.pm15c.clone(),
+            12,
+            &run_dir,
+            epoch_ns,
+            raw_tap_cfg.pm15,
+            capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_pm15)),
+        ) {
+            Ok(hs) => handles.extend(hs),
+            Err(e) => {
+                error!(error = ?e, "pm15: boot failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        }
+    }
+
     if let Some(polygon_path) = args.polygon_path {
         match WssEndpoint::resolve(&cfg.alchemy_host, 443, &polygon_path) {
             Ok(rpc_ep) => {
@@ -5535,6 +5616,7 @@ fn run(args: RunArgs) -> ExitCode {
             bybit_lane_cons,
             mexc_lane_cons,
             hypercall_lane_cons,
+            pm15_lane_cons,
         ],
         event_lanes: event_lane_cons,
         depth_lanes: depth_lane_cons,

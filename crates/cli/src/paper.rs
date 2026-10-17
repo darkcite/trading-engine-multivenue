@@ -619,7 +619,8 @@ const _: () = {
 pub struct Rings {
     /// One tick ring per venue lane, indexed by `engine::tick_lane_of`
     /// (0 = Polymarket, 1 = Binance, 2 = OKX, 3 = Deribit,
-    /// 4 = Hyperliquid, 5 = Bybit, 6 = MEXC, 7 = Hypercall). Lanes without a spawned
+    /// 4 = Hyperliquid, 5 = Bybit, 6 = MEXC, 7 = Hypercall; 8 = the PM15
+    /// rolling families, `engine::PM15_LANE`). Lanes without a spawned
     /// ingress simply never see a producer push — the engine drains
     /// them empty.
     pub tick: [Arc<Ring<Tick, TICK_RING_SIZE>>; NUM_TICK_LANES],
@@ -683,6 +684,8 @@ impl Rings {
                 Ring::new(),
                 Ring::new(),
                 Ring::new(),
+                // PM15: lane 8, the rolling families.
+                Ring::new(),
             ],
             rpc_signal: Ring::new(),
             hyperevm_signal: Ring::new(),
@@ -704,6 +707,8 @@ impl Rings {
                 Ring::new(),
                 Ring::new(),
                 Ring::new(),
+                Ring::new(),
+                // PM15: lane 8 — the roll, the order law, the Chainlink mark.
                 Ring::new(),
             ],
             depth: [Ring::new(), Ring::new()],
@@ -765,6 +770,12 @@ pub struct IngressStatusSet {
     /// published (`engine_ingress_binance_options_*`); the lane's
     /// messages, rows and drops stay on `binance`.
     pub binance_options: Arc<IngressStatus>,
+    /// PM15: the rolling families' ingress thread (its market socket).
+    /// Down unless `[polymarket] rolling` names a family.
+    pub pm15: Arc<IngressStatus>,
+    /// PM15: the rolling families' own counters (ingress + discovery
+    /// threads), beside the generic slot like `hl_roll`.
+    pub pm15c: Arc<ingress_polymarket::pm15_loop::Pm15Counters>,
 }
 
 impl IngressStatusSet {
@@ -785,6 +796,8 @@ impl IngressStatusSet {
             hc: Arc::new(ingress_hypercall::HcCounters::new()),
             hl_roll: Arc::new(ingress_hyperliquid::family::HlRollStatus::new()),
             binance_options: Arc::new(IngressStatus::new()),
+            pm15: Arc::new(IngressStatus::new()),
+            pm15c: Arc::new(ingress_polymarket::pm15_loop::Pm15Counters::new()),
         }
     }
 }
@@ -798,6 +811,126 @@ impl Default for IngressStatusSet {
 // ---------------------------------------------------------------
 // Thread bootstrappers
 // ---------------------------------------------------------------
+
+/// PM15: the rolling families' market socket — the windows and the
+/// clocks. The subscribe-time snapshot of every bound token can arrive as
+/// ONE array frame (16 slots × 2 legs × ≤ 12 KiB measured per market), so
+/// the receive window is 1 MiB; the venue pings nothing, our `PING` every
+/// 10 s keeps the idle law fed.
+pub const PM15_MARKET_WS: core_net::WsCfg = core_net::WsCfg {
+    rx_cap: 1 << 20,
+    tx_cap: 64 * 1024,
+    establish_ns: 10_000_000_000,
+    idle_ns: 30_000_000_000,
+};
+
+/// PM15: the RTDS socket (one report a second per asset, ≈ 300 B each).
+pub const PM15_RTDS_WS: core_net::WsCfg = core_net::WsCfg {
+    rx_cap: 64 * 1024,
+    tx_cap: 4 * 1024,
+    establish_ns: 10_000_000_000,
+    idle_ns: 15_000_000_000,
+};
+
+/// PM15: spawn the rolling families' two threads (`ingress_polymarket`
+/// crate docs): `pm15-discovery` (Gamma, blocking, unpinned) and
+/// `ingress-pm15` (the market and RTDS sockets on one poll, pinned to
+/// `core_id`), feeding `engine::PM15_LANE` — `tick_tx` and `event_tx` are
+/// that lane's producers. `assets` are the families' assets in
+/// `[polymarket] rolling` order. Opens the `pm15` capture and resolves
+/// all three hosts BEFORE spawning: a failure is a boot error.
+///
+/// # Errors
+/// The capture could not be opened, or a host did not resolve.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_pm15(
+    assets: Vec<String>,
+    tls_config: RustlsConfig,
+    wall_anchor: core_time::WallAnchor,
+    stale_after_ms: u32,
+    mut tick_tx: Producer<Tick, TICK_RING_SIZE>,
+    mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
+    status: Arc<IngressStatus>,
+    counters: Arc<ingress_polymarket::pm15_loop::Pm15Counters>,
+    core_id: usize,
+    run_dir: &Path,
+    epoch_ns: u64,
+    tap_cfg: TapCfg,
+    capture_metrics: CaptureMetrics,
+) -> io::Result<Vec<JoinHandle<()>>> {
+    use ingress_polymarket::pm15_loop as p15;
+    let mut capture = GaugedCapture::new(
+        PmlrCapture::open(run_dir, "pm15", epoch_ns, tap_cfg)?,
+        capture_metrics,
+    );
+    if tap_cfg.mode != TapMode::Off {
+        capture.set_tap_venue_byte(run_dir, "pm15", VenueId::Polymarket.to_u8())?;
+    }
+    let refs: Vec<&[u8]> = assets.iter().map(|a| a.as_bytes()).collect();
+    let mut discovery =
+        ingress_polymarket::pm15_discovery::Pm15Discovery::new(tls_config.clone(), &refs)
+            .map_err(|e| io::Error::other(format!("pm15: gamma client: {e:?}")))?;
+    let seed = now_ns();
+    let market = core_net::WsConn::new(
+        p15::PM15_MARKET_HOST,
+        443,
+        p15::PM15_MARKET_PATH,
+        tls_config.clone(),
+        PM15_MARKET_WS,
+        p15::PM15_MARKET_TOKEN,
+        seed,
+    )
+    .map_err(|e| io::Error::other(format!("pm15: market socket: {e}")))?;
+    let rtds = core_net::WsConn::new(
+        ingress_polymarket::rtds::RTDS_HOST,
+        443,
+        ingress_polymarket::rtds::RTDS_PATH,
+        tls_config,
+        PM15_RTDS_WS,
+        p15::PM15_RTDS_TOKEN,
+        seed.rotate_left(17),
+    )
+    .map_err(|e| io::Error::other(format!("pm15: rtds socket: {e}")))?;
+    let mut driver = p15::Pm15Driver::new(&refs, stale_after_ms);
+    drop(refs);
+    let (mut spec_tx, mut spec_rx) =
+        Ring::<ingress_polymarket::gamma15::PmWindowSpec, { p15::PM15_SPEC_RING }>::new().split();
+    let disc_counters = counters.clone();
+    let h_disc = spawn_or_die(
+        thread::Builder::new().name("pm15-discovery".into()),
+        "pm15-discovery",
+        move || discovery.run(wall_anchor, &mut spec_tx, &disc_counters, &SHUTDOWN),
+    );
+    let h_ing = spawn_or_die(
+        thread::Builder::new().name("ingress-pm15".into()),
+        "ingress-pm15",
+        move || {
+            log_pin_outcome("pm15", core_id);
+            let mut socks = p15::Pm15Sockets { market, rtds };
+            let mut out = p15::Pm15Out {
+                tick: &mut tick_tx,
+                event: &mut event_tx,
+                event_mask: p15::PM15_EVENT_MASK,
+                status: &status,
+                counters: &counters,
+                capture: &mut capture,
+            };
+            if let Err(e) = p15::run_pm15(
+                &mut driver,
+                &mut socks,
+                &mut spec_rx,
+                &mut out,
+                wall_anchor,
+                seed,
+                &SHUTDOWN,
+            ) {
+                tracing::error!(error = ?e, "pm15: poll failed; the rolling ingress stops");
+                status.set_state(IngressState::Down);
+            }
+        },
+    );
+    Ok(vec![h_disc, h_ing])
+}
 
 /// Spawn the Polymarket CLOB ingress thread. `producer` is the SPSC
 /// producer half of the tick ring; the consumer half stays on the
@@ -3207,6 +3340,9 @@ pub struct RawTapConfig {
     /// HC5: tap config for the Hypercall ingress (every WS text
     /// payload; the REST poller's bodies are not tapped).
     pub hypercall: TapCfg,
+    /// PM15: tap config for the rolling families' ingress (both sockets'
+    /// text payloads; label `pm15`).
+    pub pm15: TapCfg,
 }
 
 /// Parse `--raw-tap <CSV|all>` + `--raw-tap-mode <rejects|all>` +
@@ -3246,6 +3382,7 @@ pub fn parse_raw_tap_flags(
         mexc: TapCfg::off(),
         hyperevm: TapCfg::off(),
         hypercall: TapCfg::off(),
+        pm15: TapCfg::off(),
     };
 
     let spec = match raw_tap.map(str::trim).filter(|s| !s.is_empty()) {
@@ -3264,10 +3401,11 @@ pub fn parse_raw_tap_flags(
         cfg.mexc = enabled_cfg;
         cfg.hyperevm = enabled_cfg;
         cfg.hypercall = enabled_cfg;
+        cfg.pm15 = enabled_cfg;
         return Ok(cfg);
     }
 
-    let mut seen: [&str; 10] = [""; 10];
+    let mut seen: [&str; 11] = [""; 11];
     for (n_seen, item) in spec.split(',').enumerate() {
         let label = item.trim();
         if label.is_empty() {
@@ -3291,6 +3429,7 @@ pub fn parse_raw_tap_flags(
             "mexc" => cfg.mexc = enabled_cfg,
             "hyperevm" => cfg.hyperevm = enabled_cfg,
             "hypercall" => cfg.hypercall = enabled_cfg,
+            "pm15" => cfg.pm15 = enabled_cfg,
             _ => return Err("--raw-tap: unknown venue label"),
         }
     }
@@ -4345,6 +4484,9 @@ impl Observability {
             let ingress_hypercall_state = reg
                 .register_gauge("engine_ingress_hypercall_state")
                 .map_err(|_| "register engine_ingress_hypercall_state")?;
+            let ingress_pm15_state = reg
+                .register_gauge("engine_ingress_pm15_state")
+                .map_err(|_| "register engine_ingress_pm15_state")?;
             // T1(c) (outage 2026-08-27 §5.5): per-venue last-TICK age
             // in seconds. `*_state` lies on a 1 Hz-churning lane (a
             // sampler nearly always catches it mid-cycle at Up) and
@@ -4424,6 +4566,7 @@ impl Observability {
             let ingress_mexc = register_ingress_counters(&mut reg, "mexc")?;
             let ingress_hyperevm = register_ingress_counters(&mut reg, "hyperevm")?;
             let ingress_hypercall = register_ingress_counters(&mut reg, "hypercall")?;
+            let ingress_pm15 = register_ingress_counters(&mut reg, "pm15")?;
 
             // §6.5 capture-health gauges, one pair per spawnable
             // ingress thread (short capture-venue labels — see
@@ -4442,6 +4585,7 @@ impl Observability {
             let capture_mexc = register_capture_gauges(&mut reg, "mexc")?;
             let capture_hyperevm = register_capture_gauges(&mut reg, "hyperevm")?;
             let capture_hypercall = register_capture_gauges(&mut reg, "hypercall")?;
+            let capture_pm15 = register_capture_gauges(&mut reg, "pm15")?;
 
             // §6.1 boot-discovery coverage gauges — PM/OKX/Deribit/HL
             // + Binance since M1 (exchangeInfo audit); RPC alone has
@@ -4471,6 +4615,9 @@ impl Observability {
             // HC5: the venue's own family (the slow-consumer law, quote
             // shapes, the poller) — gauges mirrored from its atomics.
             let hypercall = register_hypercall_metrics(&mut reg)?;
+            // PM15: the rolling families' own family (gauges mirrored
+            // from `Pm15Counters`).
+            let pm15 = register_pm15_metrics(&mut reg)?;
 
             // Phase-8f AI family: §4.4 counters + heartbeat-age gauge
             // (mirrored centrally from the shared status slot), the
@@ -4569,6 +4716,7 @@ impl Observability {
                 ingress_mexc_state,
                 ingress_hyperevm_state,
                 ingress_hypercall_state,
+                ingress_pm15_state,
                 ingress_last_tick_age,
                 restart_stamp_age,
                 max_tick_age_ns,
@@ -4583,6 +4731,7 @@ impl Observability {
                 ingress_mexc,
                 ingress_hyperevm,
                 ingress_hypercall,
+                ingress_pm15,
                 capture_pm,
                 capture_bn,
                 capture_okx,
@@ -4593,6 +4742,7 @@ impl Observability {
                 capture_mexc,
                 capture_hyperevm,
                 capture_hypercall,
+                capture_pm15,
                 coverage_pm,
                 coverage_okx,
                 coverage_deribit,
@@ -4606,6 +4756,7 @@ impl Observability {
                 binance_options_selected,
                 hypercall_options_selected,
                 hypercall,
+                pm15,
                 ingress_ai,
                 capture_ai,
                 fills_capture,
@@ -4971,6 +5122,8 @@ pub struct EngineCounters {
     pub ingress_hyperevm_state: core_metrics::GaugeId,
     /// HC5: per-ingress state gauge, Hypercall public WS.
     pub ingress_hypercall_state: core_metrics::GaugeId,
+    /// PM15: per-ingress state gauge, the rolling families' market socket.
+    pub ingress_pm15_state: core_metrics::GaugeId,
     /// T1(c): per-venue last-tick-age gauges in seconds
     /// (`engine_ingress_<venue>_last_tick_age_seconds`; -1 = no tick
     /// since boot). Order: pm, bn, okx, deribit, hl, bybit, rpc, mexc,
@@ -5008,6 +5161,8 @@ pub struct EngineCounters {
     pub ingress_hyperevm: IngressCounterIds,
     /// HC5: §6.4 loss-accounting counters, Hypercall thread.
     pub ingress_hypercall: IngressCounterIds,
+    /// PM15: §6.4 loss-accounting counters, the rolling families' thread.
+    pub ingress_pm15: IngressCounterIds,
     /// §6.5 capture-health gauges, Polymarket thread.
     pub capture_pm: CaptureGaugeIds,
     /// §6.5 capture-health gauges, Binance thread.
@@ -5029,6 +5184,8 @@ pub struct EngineCounters {
     /// HC5: capture-health gauges, Hypercall (its REST rows included —
     /// the ingress thread writes them).
     pub capture_hypercall: CaptureGaugeIds,
+    /// PM15: capture-health gauges, the rolling families (`pm15`).
+    pub capture_pm15: CaptureGaugeIds,
     /// §6.1 boot-discovery coverage gauge, Polymarket (always runs).
     pub coverage_pm: GaugeId,
     /// §6.1 boot-discovery coverage gauge, OKX (0 when unconfigured).
@@ -5048,6 +5205,8 @@ pub struct EngineCounters {
     pub hypercall_options_selected: GaugeId,
     /// HC5: the Hypercall venue family ([`register_hypercall_metrics`]).
     pub hypercall: HcMetricIds,
+    /// PM15: the rolling families' family ([`register_pm15_metrics`]).
+    pub pm15: Pm15MetricIds,
     /// §6.1 boot-discovery coverage gauge, Hyperliquid (0 when
     /// unconfigured).
     pub coverage_hyperliquid: GaugeId,
@@ -5122,8 +5281,8 @@ pub struct EngineCounters {
 /// E1: the execution router's metric family. Boot-only.
 ///
 /// `core-metrics` registers FIXED names — there is no label mechanism
-/// (`MAX_COUNTERS = 640` since XMM XH4f — 512 at E7, 256 before —, `MAX_GAUGES = 512` — 384
-/// before XH4f —, `NAME_MAX = 63`), so the
+/// (`MAX_COUNTERS = 768` since PM15-2 — 640 at XMM XH4f, 512 at E7, 256 before —,
+/// `MAX_GAUGES = 640` — 512 at XH4f, 384 before —, `NAME_MAX = 63`), so the
 /// per-slot names are generated as whole strings at boot, one
 /// `register_counter` call each, and never formatted again. The
 /// per-slot family is registered for LIVE slots ONLY: an all-paper
@@ -9235,6 +9394,52 @@ fn register_hypercall_metrics(reg: &mut MetricsRegistry) -> Result<HcMetricIds, 
     Ok(HcMetricIds { gauges })
 }
 
+/// PM15: the rolling families' family — one gauge per
+/// `ingress_polymarket::pm15_loop::Pm15Counter` (`engine_ingress_pm15_<name>_total`,
+/// monotonic by construction) and the bound-slot gauge last
+/// (`engine_ingress_pm15_slots_bound`). Plain stores, as [`HcMetricIds`].
+#[derive(Copy, Clone, Debug)]
+pub struct Pm15MetricIds {
+    /// One gauge per [`pm15_metric_values`] entry.
+    pub gauges: [GaugeId; PM15_METRICS],
+}
+
+/// Size of the PM15 family: the tallies and the bound-slot gauge.
+pub const PM15_METRICS: usize = ingress_polymarket::pm15_loop::PM15_COUNTERS + 1;
+
+/// Register the PM15 family (boot-only; the names are rendered once).
+fn register_pm15_metrics(reg: &mut MetricsRegistry) -> Result<Pm15MetricIds, &'static str> {
+    let mut gauges = [GaugeId::default(); PM15_METRICS];
+    let mut i = 0usize;
+    while i < ingress_polymarket::pm15_loop::PM15_COUNTERS {
+        let name = format!(
+            "engine_ingress_pm15_{}_total",
+            ingress_polymarket::pm15_loop::PM15_COUNTER_NAMES[i]
+        );
+        gauges[i] = reg
+            .register_gauge(&name)
+            .map_err(|_| "register pm15 gauge")?;
+        i += 1;
+    }
+    gauges[i] = reg
+        .register_gauge("engine_ingress_pm15_slots_bound")
+        .map_err(|_| "register pm15 gauge")?;
+    Ok(Pm15MetricIds { gauges })
+}
+
+/// The PM15 family's current values, in [`register_pm15_metrics`] order.
+#[must_use]
+pub fn pm15_metric_values(c: &ingress_polymarket::pm15_loop::Pm15Counters) -> [u64; PM15_METRICS] {
+    let mut v = [0u64; PM15_METRICS];
+    let mut i = 0usize;
+    while i < ingress_polymarket::pm15_loop::PM15_COUNTERS {
+        v[i] = c.get(i);
+        i += 1;
+    }
+    v[i] = c.slots_bound();
+    v
+}
+
 /// The Hypercall family's current values, in [`HC_METRIC_NAMES`] order.
 /// Relaxed loads — statistics, never a synchronization point.
 #[must_use]
@@ -9482,9 +9687,10 @@ where
     let mut last_orders = 0u64;
     // Last-mirrored snapshots for the §6.4 ingress counters
     // (pm, bn, okx, rpc, deribit, hyperliquid, bybit, mexc, hyperevm,
-    // hypercall) so registry counters get monotonic deltas. Append-only:
-    // existing indices are load-bearing, new venues go at the end.
-    let mut ingress_last = [IngressCountersSnapshot::default(); 10];
+    // hypercall, pm15) so registry counters get monotonic deltas.
+    // Append-only: existing indices are load-bearing, new venues go at
+    // the end.
+    let mut ingress_last = [IngressCountersSnapshot::default(); 11];
     // T1(c): last-tick-age derivation state per venue —
     // (ticks_total last seen, wall ns when it last advanced);
     // wall ns 0 = never ticked. Order pairs with
@@ -9896,6 +10102,15 @@ where
                         .set(ing.hyperevm.state() as i64);
                     reg.gauge(ids.ingress_hypercall_state)
                         .set(ing.hypercall.state() as i64);
+                    reg.gauge(ids.ingress_pm15_state)
+                        .set(ing.pm15.state() as i64);
+                    // PM15: the rolling families' tallies — plain stores.
+                    let pm = pm15_metric_values(&ing.pm15c);
+                    let mut k = 0usize;
+                    while k < PM15_METRICS {
+                        reg.gauge(ids.pm15.gauges[k]).set(pm[k] as i64);
+                        k += 1;
+                    }
                     // HC5: the venue family — plain stores (see
                     // `HcMetricIds`).
                     let hc = hc_metric_values(&ing.hc);
@@ -9956,6 +10171,12 @@ where
                         &ids.ingress_hypercall,
                         &ing.hypercall,
                         &mut ingress_last[9],
+                    );
+                    mirror_ingress_counters(
+                        reg,
+                        &ids.ingress_pm15,
+                        &ing.pm15,
+                        &mut ingress_last[10],
                     );
 
                     // T1(c): per-venue last-tick age from the stamps
@@ -13930,6 +14151,7 @@ mod tests {
             cfg.mexc,
             cfg.hyperevm,
             cfg.hypercall,
+            cfg.pm15,
         ] {
             assert_eq!(c.mode, TapMode::All);
             assert_eq!(c.budget_bytes, want_bytes);
@@ -13955,6 +14177,7 @@ mod tests {
             cfg.mexc,
             cfg.hyperevm,
             cfg.hypercall,
+            cfg.pm15,
         ] {
             assert_eq!(c.mode, TapMode::Off);
             assert_eq!(c.budget_bytes, 0);
@@ -13965,7 +14188,7 @@ mod tests {
     #[test]
     fn raw_tap_flags_every_known_venue_label_accepted() {
         let cfg = parse_raw_tap_flags(
-            Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm,hypercall"),
+            Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm,hypercall,pm15"),
             "all",
             1,
         )
@@ -13981,6 +14204,7 @@ mod tests {
             cfg.mexc,
             cfg.hyperevm,
             cfg.hypercall,
+            cfg.pm15,
         ] {
             assert_eq!(c.mode, TapMode::All);
         }
@@ -14029,7 +14253,7 @@ mod tests {
     fn raw_tap_flags_rejects_more_labels_than_known_venues() {
         assert_eq!(
             parse_raw_tap_flags(
-                Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm,hypercall,pm2"),
+                Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm,hypercall,pm15,pm2"),
                 "rejects",
                 64
             )

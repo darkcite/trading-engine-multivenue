@@ -1932,7 +1932,15 @@ impl Strategy for Bin15Strategy {
             return;
         }
         match core_types::ChannelId::from_u8(event.channel) {
-            Some(core_types::ChannelId::InstrumentRoll) => self.on_roll(event),
+            // PM15: Polymarket's rolling families ride the same channel
+            // (venue byte Polymarket, `core_types::pm_roll`); this member's
+            // families are Hyperliquid's, and a roll of another venue
+            // names none of them — not even as a refusal to count.
+            Some(core_types::ChannelId::InstrumentRoll)
+                if event.venue == VenueId::Hyperliquid as u8 =>
+            {
+                self.on_roll(event)
+            }
             Some(core_types::ChannelId::Mark) => {
                 let Some(u) = self.underlying_of_sym(event.sym) else {
                     return;
@@ -2268,6 +2276,27 @@ mod tests {
         assert_eq!(m.counters().rolls_settled, 1);
         assert_eq!(m.counters().families_dormant, 1);
         assert!(!m.marks[0].vol[0].is_armed());
+    }
+
+    /// PM15: a Polymarket roll — the same channel, the same codec — never
+    /// binds, settles or counts against a Hyperliquid family, whatever its
+    /// family byte and strike say.
+    #[test]
+    fn a_polymarket_roll_is_not_this_members() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        warm(&mut m, 0);
+        m.on_venue_event(&roll_event(0, 2649, 60, 79_000_000_000, expiry(900), false), &mut c);
+        let mut pm = roll_event(0, 2650, 60, 79_000_000_000, expiry(900), false);
+        pm.venue = VenueId::Polymarket as u8;
+        m.on_venue_event(&pm, &mut c);
+        let mut pm_settled = roll_event(0, 2649, 60, 0, expiry(900), true);
+        pm_settled.venue = VenueId::Polymarket as u8;
+        m.on_venue_event(&pm_settled, &mut c);
+        assert_eq!(m.family(0).expect("f").live.outcome, 2649, "the HL instance stands");
+        assert_eq!(m.counters().rolls, 1);
+        assert_eq!(m.counters().rolls_settled, 0);
+        assert_eq!(m.counters().spec_refused, 0, "not even counted");
     }
 
     #[test]

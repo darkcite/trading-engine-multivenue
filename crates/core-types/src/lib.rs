@@ -1551,7 +1551,10 @@ pub enum ChannelId {
     AssetCtx = 5,
     /// Whole-venue mid sweep (HL `allMids`).
     AllMids = 6,
-    /// HIP-4 outcome lifecycle (HL `outcomeMetaUpdates`).
+    /// HIP-4 outcome lifecycle (HL `outcomeMetaUpdates`). PM15: on
+    /// venue byte Polymarket, a rolling leg's ORDER LAW — its price tick
+    /// and minimum size, at creation and at every `tick_size_change`
+    /// (see [`pm_roll`]).
     OutcomeMeta = 7,
     /// Polymarket `price_change` rows that did not move the touch (the
     /// touch-moving ones become Ticks).
@@ -1613,9 +1616,10 @@ pub enum ChannelId {
     /// | 56..64 | 0 = created, 1 = settled |
     ///
     /// PM15: the same channel carries Polymarket's rolling 15-minute
-    /// up/down families (venue byte Polymarket), with the window index
-    /// in the outcome field and the strike unpublished at creation —
-    /// see [`pm_roll`].
+    /// up/down families (venue byte Polymarket): the instance id
+    /// (window × 8 + family) in the outcome field, the slot pair
+    /// (2 × family + window parity) in the family field, and the strike
+    /// unpublished at creation — see [`pm_roll`].
     InstrumentRoll = 13,
     /// HC3: ONE quote provider's side of a Hypercall indicative quote —
     /// the per-provider detail behind the venue's `best_bid`/`best_ask`
