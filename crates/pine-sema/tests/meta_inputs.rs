@@ -161,3 +161,31 @@ fn meta_inputs_unmatched_overrides_are_reported() {
     let p = compile_src(&src, &none).expect("compiles");
     assert!(pine_sema::unmatched_input_overrides(&p, &none).is_empty());
 }
+
+/// Fuzz r21 (`input` admitted to the alphabet: 77+ compile panics in `nacap`/`refs`/`series`):
+/// an `input(…)` whose `defval` does not fold — the `series` row `INPUT_F_SRC` fed a series —
+/// is `3008` at the call (`pin:02-input-series-defval`), never an unfolded call whose missing value
+/// slot a later pass indexes. A constant `defval`, nested or in a local block, still folds.
+#[test]
+fn meta_inputs_unfoldable_defval_is_3008_not_a_panic() {
+    for body in [
+        "x = input(close)\nplot(x)\n",
+        "plot(input(close * 2))\n",
+        "plot(nz(input(close)))\n",
+        "v = close\nplot(nz(input(v)))\n",
+        "plot(input((false ? close : 96.79)))\n",
+        "for i = 0 to 3\n    float v = input(i)\nplot(close)\n",
+    ] {
+        let r = std::panic::catch_unwind(|| run(body, Vec::new()));
+        assert_eq!(r.ok(), Some(vec![3008]), "{body:?}");
+    }
+    for body in [
+        "plot(input(3.0) + close)\n",
+        "plot(input(true) ? 1.0 : 2.0)\n",
+        "plot(ta.highest(input(4.59), 3))\n",
+        "for i = 0 to 3\n    float v = input(3)\nplot(close)\n",
+        "if close > 0\n    bool v3 = input(false)\nplot(close)\n",
+    ] {
+        assert_eq!(run(body, Vec::new()), vec![ACCEPTED], "{body:?}");
+    }
+}

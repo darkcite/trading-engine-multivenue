@@ -226,6 +226,15 @@ impl Inputs {
             }
             None
         } else {
+            // pin:02-input-series-defval — every other kind's value in effect is a constant
+            // (§4.12.3), so a `defval` that does not fold has no value to fold the call to: the
+            // `series` row `input(defval: series float)` (pine-spec `INPUT_F_SRC`, kind `float`)
+            // over anything but a constant is `3008` here, never an unfolded call (fuzz r21:
+            // `input(syn[18] / …)`, `input(i)` — the lowering's no-value slot panicked later).
+            if value.is_none() {
+                let msg = "input: `defval` must be a compile-time constant".to_owned();
+                diags.push(diag(ReasonCode::QualifierTooWeak, s.span, msg));
+            }
             value
         };
         self.descs.push(d);

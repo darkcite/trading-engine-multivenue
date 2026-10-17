@@ -100,7 +100,11 @@ pub fn bi_extreme<const MAX: bool, const SRC: bool, const BARS: bool>(
     let len = f.i64_arg(args[n_in - 1]);
     let dst = out1(args)?;
     let Some(len) = len else {
-        f.set_f64_arg(dst, f64::NAN);
+        if BARS {
+            f.set_i64_arg(dst, None);
+        } else {
+            f.set_f64_arg(dst, f64::NAN);
+        }
         return Ok(());
     };
     let r = {
@@ -113,17 +117,12 @@ pub fn bi_extreme<const MAX: bool, const SRC: bool, const BARS: bool>(
         }
         mono_query(h, q, len as u32)
     };
-    let out = match r {
-        None => f64::NAN,
-        Some((v, back)) => {
-            if BARS {
-                -(back as f64)
-            } else {
-                v
-            }
-        }
-    };
-    f.set_f64_arg(dst, out);
+    // `…bars` returns `series int` (pine-spec TA_*BARS*): its output entry is in the i64 lane.
+    if BARS {
+        f.set_i64_arg(dst, r.map(|(_, back)| -i64::from(back)));
+    } else {
+        f.set_f64_arg(dst, r.map_or(f64::NAN, |(v, _)| v));
+    }
     Ok(())
 }
 

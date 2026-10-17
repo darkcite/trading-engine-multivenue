@@ -422,8 +422,9 @@ fn ta_highest_lowest_equal_bruteforce() {
         let ii = In::Int(len as i64);
         let hs = run_g(ov::TA_HIGHEST_SRC, &[In::Close, ii], cap, &b);
         let ls = run_g(ov::TA_LOWEST_SRC, &[In::Close, ii], cap, &b);
-        let hb = run_g(ov::TA_HIGHESTBARS_SRC, &[In::Close, ii], cap, &b);
-        let lb = run_g(ov::TA_LOWESTBARS_SRC, &[In::Close, ii], cap, &b);
+        // `…bars` returns `series int`: its output is an i64-lane entry (fuzz r21 seed 4, B088/B091).
+        let hb = run_o(ov::TA_HIGHESTBARS_SRC, &[In::Close, ii], cap, &b, true);
+        let lb = run_o(ov::TA_LOWESTBARS_SRC, &[In::Close, ii], cap, &b, true);
         // ta.highest(length) (implicit `high`) is v5-only in pine-spec: it runs in a v5 program.
         let hh = run_od(ov::TA_HIGHEST, &[ii], cap, &b, false, Dialect::V5);
         for i in 0..c.len() {
@@ -1403,6 +1404,52 @@ fn sm_ref(xs: &[f64], len: usize, alpha: f64, sma_seed: bool) -> Vec<f64> {
         out.push(v);
     }
     out
+}
+
+/// Fuzz r21 seed 692 (`ta.cmo(math.exp(syni), 12)`): a non-na but infinite source makes the
+/// change `inf − inf` = na; the row's `skip` rule drops that pair (`pin:04-change-pair-nan`) —
+/// never the window kernel's non-na assert. An all-`+inf` source accepts no `ta.cmo` pair (na
+/// forever); a run whose feed turns `+inf` mid-tape agrees bit-for-bit with the clean run before.
+#[test]
+fn cmo_and_mfi_skip_an_na_change_pair() {
+    let mut b = bx_tape(80);
+    let inf = fconst(f64::INFINITY);
+    let all = col(
+        &run_i5(ov::TA_CMO, &[inf, iconst(5)], &[Lane::F64], 5, &b),
+        0,
+    );
+    assert!(all.iter().all(|x| x.is_nan()), "{all:?}");
+    let clean = [
+        col(
+            &run_i5(ov::TA_CMO, &[FEED, iconst(5)], &[Lane::F64], 5, &b),
+            0,
+        ),
+        col(
+            &run_i5(ov::TA_MFI, &[FEED, iconst(5)], &[Lane::F64], 5, &b),
+            0,
+        ),
+    ];
+    for (i, x) in b.iter_mut().enumerate() {
+        if (20..24).contains(&i) {
+            x.4 = f64::INFINITY;
+            x.3 = if i % 2 == 0 { 0.0 } else { x.3 };
+        }
+    }
+    let dirty = [
+        col(
+            &run_i5(ov::TA_CMO, &[FEED, iconst(5)], &[Lane::F64], 5, &b),
+            0,
+        ),
+        col(
+            &run_i5(ov::TA_MFI, &[FEED, iconst(5)], &[Lane::F64], 5, &b),
+            0,
+        ),
+    ];
+    for k in 0..2 {
+        assert!(bits_eq(&clean[k][..20], &dirty[k][..20]), "row {k}");
+    }
+    // `ta.cmo` is warm by then (`ta.mfi` may be na on a one-sided window: ÷0 → na).
+    assert!(clean[0][6..20].iter().all(|x| !x.is_nan()));
 }
 
 /// T23 — the recursive oscillators (`ta.tsi`, `ta.dmi`) against compositions of the smoother.

@@ -452,7 +452,13 @@ fn change_pairs(
     if accept {
         let (a, b) = pair(src, src - h.prev);
         h.prev = src;
-        winp_push(&mut h.win, ring, a, b);
+        // pin:04-change-pair-nan — a non-na source can still give an na pair (`+inf − +inf` for
+        // the change, `0 × inf` for `ta.mfi`'s volume weight): the row's `skip` rule (§4.6) then
+        // applies to the pair — not accepted, the window unchanged — while the accepted source
+        // still becomes `prev` (fuzz r21 seed 692: `ta.cmo(math.exp(syni), 12)`).
+        if !a.is_nan() && !b.is_nan() {
+            winp_push(&mut h.win, ring, a, b);
+        }
     }
     if h.win.n < len {
         None

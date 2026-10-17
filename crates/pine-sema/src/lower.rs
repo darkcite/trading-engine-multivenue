@@ -721,7 +721,12 @@ impl Lower<'_> {
         }
         // The operand lane: float when either side is float, or for `/` of two ints (W1: a
         // `const_trunc` pair of constants already folded, §4.17; `fraction` always widens).
-        let float = is(lt, Ty::Float) || is(rt, Ty::Float) || op == BinOp::Div;
+        // A `const_trunc` pair infer typed `int` without a value (`timestamp(…)` of literals:
+        // `const`, not folded) stays in the int lane — `I_DIV`, truncating like `fold::i_div`
+        // (§4.14.2's "both operands `const` → truncating, type `int`"); widening it fed `I_DIV`
+        // two f64 entries (r21 I9 F093: v5 `na(x) ? na : x` plotted na for `x` = 0).
+        let int_div = op == BinOp::Div && ty.ty == Ty::Int && is(lt, Ty::Int) && is(rt, Ty::Int);
+        let float = is(lt, Ty::Float) || is(rt, Ty::Float) || (op == BinOp::Div && !int_div);
         let numeric =
             (is(lt, Ty::Int) || is(lt, Ty::Float)) && (is(rt, Ty::Int) || is(rt, Ty::Float));
         let (a, b) = if numeric && float {
