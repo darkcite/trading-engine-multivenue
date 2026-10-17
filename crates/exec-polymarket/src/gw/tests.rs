@@ -58,7 +58,10 @@ impl PmClob for Rig {
         self.sent.push(Sent {
             method,
             target: target.to_vec(),
-            headers: extra.iter().map(|(n, v)| (n.to_vec(), v.to_vec())).collect(),
+            headers: extra
+                .iter()
+                .map(|(n, v)| (n.to_vec(), v.to_vec()))
+                .collect(),
             body: self.body[..body_len].to_vec(),
         });
         match self.script.pop_front().expect("the script has an answer") {
@@ -166,9 +169,10 @@ fn accepted(id: &[u8; 32], trades: &str) -> Vec<u8> {
 /// throwaway rig with the same seed and read its SENT.
 fn digest_of_next(cid: u64) -> [u8; 32] {
     let mut b = bench();
-    b.gw.clob_mut()
-        .script
-        .push_back(Ok((400, br#"{"error":"not enough balance / allowance"}"#.to_vec())));
+    b.gw.clob_mut().script.push_back(Ok((
+        400,
+        br#"{"error":"not enough balance / allowance"}"#.to_vec(),
+    )));
     assert!(b.eng.cmd.push(&submit(cid)));
     b.gw.step(2, WALL);
     let ev = events(&mut b);
@@ -180,7 +184,9 @@ fn digest_of_next(cid: u64) -> [u8; 32] {
 fn a_submit_is_signed_rendered_in_place_maced_sent_then_acked() {
     let id = digest_of_next(41);
     let mut b = bench();
-    b.gw.clob_mut().script.push_back(Ok((200, accepted(&id, r#"["t-1"]"#))));
+    b.gw.clob_mut()
+        .script
+        .push_back(Ok((200, accepted(&id, r#"["t-1"]"#))));
     assert!(b.eng.cmd.push(&submit(41)));
     assert!(b.gw.step(2, WALL));
     let ev = events(&mut b);
@@ -188,22 +194,40 @@ fn a_submit_is_signed_rendered_in_place_maced_sent_then_acked() {
     assert_eq!((ev[0].kind, ev[0].a, ev[0].order_id), (EVT_SENT, 41, id));
     assert_eq!((ev[1].kind, ev[1].a, ev[1].b), (EVT_ACK, 41, 1));
     let s = &b.gw.clob_mut().sent[0];
-    assert_eq!((s.method, s.target.as_slice()), (Method::Post, &b"/order"[..]));
+    assert_eq!(
+        (s.method, s.target.as_slice()),
+        (Method::Post, &b"/order"[..])
+    );
     let body = std::str::from_utf8(&s.body).unwrap();
     assert!(body.starts_with(r#"{"order":{"maker":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","signer":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","tokenId":"1234","side":"BUY""#), "{body}");
     // $249.99 at 0.93 on tick 0.01: 268.8064… shares, truncated to the
     // 4-decimal grain.
-    assert!(body.contains(r#""makerAmount":"249990000","takerAmount":"268806400""#), "{body}");
+    assert!(
+        body.contains(r#""makerAmount":"249990000","takerAmount":"268806400""#),
+        "{body}"
+    );
     assert!(body.ends_with(r#""owner":"00000000-0000-0000-0000-000000000000","orderType":"FAK","deferExec":false,"postOnly":false}"#));
     // The MAC covers ts ‖ POST ‖ /order ‖ the exact body sent.
-    let h = |n: &[u8]| s.headers.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone()).unwrap();
+    let h = |n: &[u8]| {
+        s.headers
+            .iter()
+            .find(|(k, _)| k == n)
+            .map(|(_, v)| v.clone())
+            .unwrap()
+    };
     assert_eq!(h(b"POLY_TIMESTAMP"), b"1792217690");
-    assert_eq!(h(b"POLY_ADDRESS"), b"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+    assert_eq!(
+        h(b"POLY_ADDRESS"),
+        b"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+    );
     assert_eq!(h(b"POLY_API_KEY"), KEY);
     assert_eq!(h(b"POLY_PASSPHRASE"), PASS);
-    let want = crate::l2::L2Secret::from_base64(SECRET)
-        .unwrap()
-        .sign(&[b"1792217690", b"POST", b"/order", &s.body]);
+    let want = crate::l2::L2Secret::from_base64(SECRET).unwrap().sign(&[
+        b"1792217690",
+        b"POST",
+        b"/order",
+        &s.body,
+    ]);
     assert_eq!(h(b"POLY_SIGNATURE"), want);
     assert_eq!(b.gw.counters().posts, 1);
 }
@@ -218,12 +242,16 @@ fn a_zero_fill_fak_and_each_halting_class_are_refusals() {
     assert!(b.eng.cmd.push(&submit(1)));
     b.gw.step(2, WALL);
     let ev = events(&mut b);
-    assert_eq!((ev[1].kind, ev[1].why, ev[1].b), (EVT_REFUSED, Refusal::NoMatch as u8, 400));
+    assert_eq!(
+        (ev[1].kind, ev[1].why, ev[1].b),
+        (EVT_REFUSED, Refusal::NoMatch as u8, 400)
+    );
     assert!(!b.gw.halted());
     // 401: the account is refused — halt; the next submit never leaves.
-    b.gw.clob_mut()
-        .script
-        .push_back(Ok((401, br#"{"error":"Unauthorized/Invalid api key"}"#.to_vec())));
+    b.gw.clob_mut().script.push_back(Ok((
+        401,
+        br#"{"error":"Unauthorized/Invalid api key"}"#.to_vec(),
+    )));
     assert!(b.eng.cmd.push(&submit(2)));
     b.gw.step(3, WALL);
     let ev = events(&mut b);
@@ -233,7 +261,10 @@ fn a_zero_fill_fak_and_each_halting_class_are_refusals() {
     assert!(b.eng.cmd.push(&submit(3)));
     b.gw.step(4, WALL);
     let ev = events(&mut b);
-    assert_eq!((ev.len(), ev[0].kind, ev[0].why), (1, EVT_REFUSED, LOCAL_REQUEST));
+    assert_eq!(
+        (ev.len(), ev[0].kind, ev[0].why),
+        (1, EVT_REFUSED, LOCAL_REQUEST)
+    );
     assert_eq!(b.gw.clob_mut().sent.len(), 2, "nothing more on the wire");
 }
 
@@ -246,7 +277,9 @@ fn the_retry_law_resends_the_same_bytes_once_then_doubts() {
         left_host: false,
     };
     b.gw.clob_mut().script.push_back(Err(lost));
-    b.gw.clob_mut().script.push_back(Ok((200, accepted(&id, "[]"))));
+    b.gw.clob_mut()
+        .script
+        .push_back(Ok((200, accepted(&id, "[]"))));
     assert!(b.eng.cmd.push(&submit(9)));
     b.gw.step(2, WALL);
     let ev = events(&mut b);
@@ -257,7 +290,9 @@ fn the_retry_law_resends_the_same_bytes_once_then_doubts() {
     assert_eq!(b.gw.counters().resends, 1);
     // `order timed out` (rejected before the book), then the venue says
     // the copy is a duplicate: the first one's fate stands — in doubt.
-    b.gw.clob_mut().script.push_back(Ok((500, br#"{"error":"order timed out"}"#.to_vec())));
+    b.gw.clob_mut()
+        .script
+        .push_back(Ok((500, br#"{"error":"order timed out"}"#.to_vec())));
     b.gw.clob_mut().script.push_back(Ok((
         400,
         br#"{"error":"order 0x12 is invalid. Duplicated."}"#.to_vec(),
@@ -284,7 +319,9 @@ fn the_retry_law_resends_the_same_bytes_once_then_doubts() {
 #[test]
 fn an_answer_naming_another_order_id_halts_and_doubts() {
     let mut b = bench();
-    b.gw.clob_mut().script.push_back(Ok((200, accepted(&[7; 32], "[]"))));
+    b.gw.clob_mut()
+        .script
+        .push_back(Ok((200, accepted(&[7; 32], "[]"))));
     assert!(b.eng.cmd.push(&submit(5)));
     b.gw.step(2, WALL);
     let ev = events(&mut b);
@@ -333,9 +370,15 @@ fn recon_reads_the_accounts_trades_and_emits_the_orders_own_once_paced() {
         hex(&ours)
     );
     // The first read fails: queued again, paced.
-    b.gw.clob_mut().script.push_back(Ok((502, b"bad gateway".to_vec())));
-    b.gw.clob_mut().script.push_back(Ok((200, page1.into_bytes())));
-    b.gw.clob_mut().script.push_back(Ok((200, page2.into_bytes())));
+    b.gw.clob_mut()
+        .script
+        .push_back(Ok((502, b"bad gateway".to_vec())));
+    b.gw.clob_mut()
+        .script
+        .push_back(Ok((200, page1.into_bytes())));
+    b.gw.clob_mut()
+        .script
+        .push_back(Ok((200, page2.into_bytes())));
     let mut c = PmCmd::new(CMD_RECON, 77);
     c.order_id = ours;
     c.instance = instance();
@@ -348,19 +391,40 @@ fn recon_reads_the_accounts_trades_and_emits_the_orders_own_once_paced() {
     b.gw.step(10 + RECON_GAP_NS, WALL);
     let ev = events(&mut b);
     assert_eq!(ev.len(), 3, "{ev:?}");
-    assert_eq!((ev[0].kind, ev[0].order_id, ev[0].b, ev[0].c), (EVT_FILL, ours, 930_000, 100_500_000));
+    assert_eq!(
+        (ev[0].kind, ev[0].order_id, ev[0].b, ev[0].c),
+        (EVT_FILL, ours, 930_000, 100_500_000)
+    );
     assert_eq!(ev[0].a, crate::userws::fnv1a(b"t-1"));
-    assert_eq!((ev[1].kind, ev[1].b, ev[1].why), (EVT_FILL, 920_000, crate::userws::TS_CONFIRMED));
+    assert_eq!(
+        (ev[1].kind, ev[1].b, ev[1].why),
+        (EVT_FILL, 920_000, crate::userws::TS_CONFIRMED)
+    );
     assert_eq!((ev[2].kind, ev[2].a, ev[2].b), (EVT_DONE, 77, 2));
     let sent = &b.gw.clob_mut().sent;
     assert_eq!(sent[1].method, Method::Get);
     let t1 = std::str::from_utf8(&sent[1].target).unwrap();
-    assert_eq!(t1, format!("/data/trades?market={}&after=1792217390", std::str::from_utf8(COND).unwrap()));
-    assert!(std::str::from_utf8(&sent[2].target).unwrap().ends_with("&next_cursor=MTAw"));
-    let h = sent[1].headers.iter().find(|(k, _)| k == b"POLY_SIGNATURE").unwrap();
-    let want = crate::l2::L2Secret::from_base64(SECRET)
+    assert_eq!(
+        t1,
+        format!(
+            "/data/trades?market={}&after=1792217390",
+            std::str::from_utf8(COND).unwrap()
+        )
+    );
+    assert!(std::str::from_utf8(&sent[2].target)
         .unwrap()
-        .sign(&[b"1792217690", b"GET", b"/data/trades", b""]);
+        .ends_with("&next_cursor=MTAw"));
+    let h = sent[1]
+        .headers
+        .iter()
+        .find(|(k, _)| k == b"POLY_SIGNATURE")
+        .unwrap();
+    let want = crate::l2::L2Secret::from_base64(SECRET).unwrap().sign(&[
+        b"1792217690",
+        b"GET",
+        b"/data/trades",
+        b"",
+    ]);
     assert_eq!(h.1, want, "the path is signed, the query is not");
 }
 
@@ -376,4 +440,69 @@ fn recon_gives_up_after_its_tries_and_halts() {
     let ev = events(&mut b);
     assert_eq!((ev[0].kind, ev[0].a, ev[0].b), (EVT_DONE, 3, -1));
     assert_eq!(b.eng.stats.halt_reason(), HALT_RECON);
+}
+
+#[test]
+fn the_account_read_goes_one_request_a_pass_outside_the_late_tail() {
+    let mut b = bench();
+    // The watch arrives; the read starts at the first pass outside a
+    // window's last 30 s (WALL is at 890 s of its window: quiet).
+    let mut w = PmCmd::new(CMD_WATCH, 0);
+    w.instance = instance();
+    w.leg = 1;
+    assert!(b.eng.cmd.push(&w));
+    b.gw.step(2, WALL);
+    assert!(b.gw.clob_mut().sent.is_empty(), "the late tail is quiet");
+    let calm = WALL + 20_000_000_000; // 10 s into the next window
+    b.gw.clob_mut().script.push_back(Ok((
+        200,
+        br#"{"balance":"1234560000","allowances":{"0xE111180000d2663C0091e4f400237545B87B996B":"115792089237316195423570985008687907853269984665640564039457584007913129639935","0xe2222d279d744050d28e00520010520000310F59":"0"}}"#.to_vec(),
+    )));
+    b.gw.clob_mut().script.push_back(Ok((
+        200,
+        br#"{"balance":"268810000","allowances":{}}"#.to_vec(),
+    )));
+    b.gw.step(3, calm);
+    let ev = events(&mut b);
+    assert_eq!(
+        (ev.len(), ev[0].kind, ev[0].b, ev[0].c, ev[0].why),
+        (1, EVT_BALANCE, 1_234_560_000, i64::MAX, 0)
+    );
+    b.gw.step(4, calm);
+    let ev = events(&mut b);
+    assert_eq!(
+        (ev[0].kind, ev[0].a, ev[0].b),
+        (EVT_POSITION, (u64::from(instance()) << 8) | 1, 268_810_000)
+    );
+    b.gw.step(5, calm);
+    assert_eq!(events(&mut b)[0].kind, EVT_READ_DONE);
+    let sent = &b.gw.clob_mut().sent;
+    assert_eq!(
+        sent[0].target,
+        b"/balance-allowance?asset_type=COLLATERAL&signature_type=0"
+    );
+    assert_eq!(
+        sent[1].target,
+        b"/balance-allowance?asset_type=CONDITIONAL&token_id=5678&signature_type=0"
+    );
+    let h = sent[0]
+        .headers
+        .iter()
+        .find(|(k, _)| k == b"POLY_SIGNATURE")
+        .unwrap();
+    let want = crate::l2::L2Secret::from_base64(SECRET).unwrap().sign(&[
+        b"1792217710",
+        b"GET",
+        b"/balance-allowance",
+        b"",
+    ]);
+    assert_eq!(h.1, want);
+    // Not again before ACCOUNT_EVERY_NS; a failed read says so.
+    b.gw.step(6, calm);
+    assert!(events(&mut b).is_empty());
+    b.gw.clob_mut().script.push_back(Ok((503, Vec::new())));
+    b.gw.step(4 + ACCOUNT_EVERY_NS, calm);
+    let ev = events(&mut b);
+    assert_eq!((ev[0].kind, ev[0].why), (EVT_BALANCE, 1));
+    assert_eq!(b.gw.counters().account_failures, 1);
 }

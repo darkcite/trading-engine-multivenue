@@ -6,23 +6,26 @@
 //! (the signed struct's `tokenId`) and their body prefix (rendered once,
 //! here: every field fixed for the account, the token and BUY), the
 //! condition id (recon's `market`) and the minimum size. One row per
-//! family per window parity, the ingress's own slot law: a window
-//! replaces its predecessor two windows back.
+//! family per window mod [`TOKEN_SPAN`]: a window's row outlives its end
+//! by three windows — the late trades, recon and the redemption's reads
+//! of its legs all find it (discovery fetches one window ahead, so a
+//! parity table would lose a window the moment it ended).
 //!
 //! Cold path: a window arrives every 15 minutes per family; an order
 //! reads its row by index.
 
-use core_types::pm_roll::{
-    pm_instance_id, pm_instance_parts, pm_pair_of_window, PM_PAIRS, PM_ROLLING_MAX,
-};
+use core_types::pm_roll::{pm_instance_id, pm_instance_parts, PM_ROLLING_MAX};
 use ingress_polymarket::gamma15::PmWindowSpec;
 use signer_eip712::pmv2::u256_from_decimal;
 
 use crate::account::PmAccount;
 use crate::render::{render_token_prefix, PREFIX_MAX};
 
-/// Rows: one per family per window parity.
-pub const TOKEN_ROWS: usize = PM_ROLLING_MAX * PM_PAIRS;
+/// Windows a family's rows hold.
+pub const TOKEN_SPAN: usize = 4;
+
+/// Rows: one per family per window mod [`TOKEN_SPAN`].
+pub const TOKEN_ROWS: usize = PM_ROLLING_MAX * TOKEN_SPAN;
 
 /// One leg of a window.
 #[repr(C)]
@@ -30,6 +33,10 @@ pub const TOKEN_ROWS: usize = PM_ROLLING_MAX * PM_PAIRS;
 pub struct TokenLeg {
     /// The token id, big-endian `uint256`.
     pub id_be: [u8; 32],
+    /// Bytes of `dec` used.
+    pub dec_len: usize,
+    /// The token id's decimal text (the account read's `token_id`).
+    pub dec: [u8; 80],
     /// Bytes of `prefix` used.
     pub prefix_len: usize,
     /// The body's prefix for a BUY of this token (`render::render_token_prefix`).
@@ -56,6 +63,8 @@ pub struct TokenRow {
 
 const EMPTY_LEG: TokenLeg = TokenLeg {
     id_be: [0; 32],
+    dec_len: 0,
+    dec: [0; 80],
     prefix_len: 0,
     prefix: [0; PREFIX_MAX],
 };
@@ -93,7 +102,7 @@ impl Default for PmTokens {
 }
 
 impl PmTokens {
-    /// Empty — **boot-only** (the rows are boxed here, ≈ 16 KiB).
+    /// Empty — **boot-only** (the rows are boxed here, ≈ 31 KiB).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -111,7 +120,7 @@ impl PmTokens {
 
     #[inline(always)]
     fn row_of(window: u32, family: usize) -> usize {
-        (family * PM_PAIRS + pm_pair_of_window(window)) % TOKEN_ROWS
+        (family * TOKEN_SPAN + window as usize % TOKEN_SPAN) % TOKEN_ROWS
     }
 
     /// Take one window from discovery (a repeat of the window its row
@@ -156,6 +165,9 @@ impl PmTokens {
                 spec.down.as_bytes()
             };
             let l = &mut row.legs[leg];
+            l.dec_len = dec.len().min(80);
+            // COPY: the decimal id (≤ 78 B) — cold, once a window.
+            l.dec[..l.dec_len].copy_from_slice(&dec[..l.dec_len]);
             l.prefix_len = render_token_prefix(
                 &acct.maker_text,
                 &acct.signer_text,

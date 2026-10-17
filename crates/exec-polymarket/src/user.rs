@@ -39,6 +39,10 @@ pub const USER_SCAN_MAX: usize = 32;
 /// The subscribe frame's capacity.
 const SUB_MAX: usize = 512;
 
+/// The published word (the kit's `GatewayStats::publish`) where pm-user
+/// stamps each frame's arrival, monotonic ns — the arm's `ws_gap_ns`.
+pub const PUB_USER_RX_NS: usize = 0;
+
 /// Halt: a user-channel frame did not scan.
 pub const HALT_USER_SCAN: u64 = HALT_VENUE_BASE + 5;
 /// Halt: the user ring had no room for an event.
@@ -87,7 +91,11 @@ impl PmUserDriver {
     /// **Boot-only.** `out` is the user ring's producer; `stats` the arm's
     /// shared block (the halt word).
     #[must_use]
-    pub fn new(acct: &PmAccount, out: Producer<PmEvt, PM_USER_RING>, stats: Arc<GatewayStats>) -> Self {
+    pub fn new(
+        acct: &PmAccount,
+        out: Producer<PmEvt, PM_USER_RING>,
+        stats: Arc<GatewayStats>,
+    ) -> Self {
         let mut sub = [0u8; SUB_MAX];
         let mut at = put(&mut sub, 0, br#"{"auth":{"apiKey":""#);
         at = put(&mut sub, at, acct.api_key());
@@ -127,9 +135,10 @@ impl PmUserDriver {
         self.push(&PmEvt::about(EVT_GAP, 0));
     }
 
-    /// One text frame.
-    pub fn on_text(&mut self, p: &[u8]) {
+    /// One text frame, read at monotonic `now_ns`.
+    pub fn on_text(&mut self, p: &[u8], now_ns: u64) {
         self.counters.frames += 1;
+        self.stats.publish(PUB_USER_RX_NS, now_ns);
         if p == b"PONG" {
             self.counters.pongs += 1;
             return;
@@ -160,7 +169,13 @@ impl PmUserDriver {
             }
             let key = fnv1a(&e.trade_id[..usize::from(e.trade_id_len)]);
             self.counters.fills += 1;
-            self.push(&PmEvt::fill(e.order_id, key, e.price_1e6, e.size_1e6, e.status));
+            self.push(&PmEvt::fill(
+                e.order_id,
+                key,
+                e.price_1e6,
+                e.size_1e6,
+                e.status,
+            ));
         }
     }
 

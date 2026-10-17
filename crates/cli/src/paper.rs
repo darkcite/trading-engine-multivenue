@@ -859,6 +859,12 @@ pub fn spawn_pm15(
     epoch_ns: u64,
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
+    tee: Option<
+        Producer<
+            ingress_polymarket::gamma15::PmWindowSpec,
+            { ingress_polymarket::pm15_loop::PM15_SPEC_RING },
+        >,
+    >,
 ) -> io::Result<Vec<JoinHandle<()>>> {
     use ingress_polymarket::pm15_loop as p15;
     let mut capture = GaugedCapture::new(
@@ -872,6 +878,10 @@ pub fn spawn_pm15(
     let mut discovery =
         ingress_polymarket::pm15_discovery::Pm15Discovery::new(tls_config.clone(), &refs)
             .map_err(|e| io::Error::other(format!("pm15: gamma client: {e:?}")))?;
+    // PM15-6c: slot 9's gateway reads every window too, when it is live.
+    if let Some(t) = tee {
+        discovery.set_tee(t);
+    }
     let seed = now_ns();
     let market = core_net::WsConn::new(
         p15::PM15_MARKET_HOST,

@@ -653,6 +653,12 @@ pub struct XmmSpec<'a> {
 pub struct GatewayStop(Arc<AtomicBool>);
 
 impl GatewayStop {
+    /// PM15-6c: an owner over `flag` (slot 9's two threads share one).
+    #[must_use]
+    pub fn of(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
     /// Let the gateway thread stop — once the engine loop returned (the
     /// arm's shutdown is done with it), or on a boot abort (the arm never
     /// ran).

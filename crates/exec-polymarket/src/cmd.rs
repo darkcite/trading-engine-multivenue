@@ -27,6 +27,9 @@ pub const PM_USER_RING: usize = 256;
 pub const CMD_SUBMIT: u8 = 1;
 /// `PmCmd.kind`: read the venue's trades of an order past its deadline.
 pub const CMD_RECON: u8 = 2;
+/// `PmCmd.kind` (PM15-6c): watch a token the arm holds — pm-gw reads its
+/// CONDITIONAL balance at every account read (`instance`, `leg`).
+pub const CMD_WATCH: u8 = 3;
 
 /// One command (engine → pm-gw).
 #[repr(C, align(64))]
@@ -99,6 +102,17 @@ pub const EVT_DONE: u8 = 6;
 /// `PmEvt.kind`: the user channel's session was lost (no replay: every
 /// open order needs recon).
 pub const EVT_GAP: u8 = 7;
+/// `PmEvt.kind` (PM15-6c): the account's pUSD read — `b` = the balance
+/// ×1e6, `c` = the CTF Exchange V2 allowance ×1e6 (capped at `i64::MAX`);
+/// `why` = 1 when the read failed (then `b`, `c` are 0).
+pub const EVT_BALANCE: u8 = 8;
+/// `PmEvt.kind` (PM15-6c): a watched token's CONDITIONAL balance — `a` =
+/// `instance << 8 | leg`, `b` = shares ×1e6; `why` = 1 when the read
+/// failed.
+pub const EVT_POSITION: u8 = 9;
+/// `PmEvt.kind` (PM15-6c): one account read is complete (every watched
+/// token reported after the balance).
+pub const EVT_READ_DONE: u8 = 10;
 
 /// `PmEvt.why` of a refusal made before the wire: no token for the
 /// instance.

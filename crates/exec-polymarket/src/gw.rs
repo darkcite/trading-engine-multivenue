@@ -25,6 +25,14 @@
 //! request per [`RECON_GAP_NS`]; a failed read is retried up to
 //! [`RECON_TRIES_MAX`] times, then DONE with `b = -1` and the halt.
 //!
+//! **The account read** (PM15-6c, every [`ACCOUNT_EVERY_NS`]): the pUSD
+//! balance and the CTF Exchange V2 allowance (`GET /balance-allowance
+//! ?asset_type=COLLATERAL`), then each token the arm watches
+//! (`asset_type=CONDITIONAL&token_id=`) — EVT_BALANCE, EVT_POSITION per
+//! token, EVT_READ_DONE. One request per pass and only with no command
+//! waiting, and never in a window's last [`QUIET_TAIL_S`] seconds (the
+//! late law's): a read never delays an order by more than one request.
+//!
 //! **Halts** (the kit's halt word, the first reason wins): an answer whose
 //! `orderID` is not the digest signed (D-5), a refusal that names the
 //! account or the protocol (`Version`, `Auth`, `Payload`, `Closed`), recon
@@ -46,9 +54,9 @@ use crate::account::PmAccount;
 use crate::amounts::{clears_floors, fak_buy};
 use crate::clob::PmClob;
 use crate::cmd::{
-    PmCmd, PmEvt, CMD_RECON, CMD_SUBMIT, EVT_ACK, EVT_DONE, EVT_IN_DOUBT, EVT_REFUSED, EVT_SENT,
-    LOCAL_AMOUNTS, LOCAL_FLOOR, LOCAL_NO_TOKEN, LOCAL_REQUEST, LOCAL_SIGN, PM_CMD_RING,
-    PM_EVT_RING,
+    PmCmd, PmEvt, CMD_RECON, CMD_SUBMIT, CMD_WATCH, EVT_ACK, EVT_BALANCE, EVT_DONE, EVT_IN_DOUBT,
+    EVT_POSITION, EVT_READ_DONE, EVT_REFUSED, EVT_SENT, LOCAL_AMOUNTS, LOCAL_FLOOR, LOCAL_NO_TOKEN,
+    LOCAL_REQUEST, LOCAL_SIGN, PM_CMD_RING, PM_EVT_RING,
 };
 use crate::num::{put, put_u64};
 use crate::render::{render_order_tail, render_ts, PREFIX_MAX, TAIL_MAX};
@@ -75,6 +83,15 @@ pub const RECON_PAGES_MAX: usize = 4;
 pub const RECON_PAGE_TRADES: usize = 128;
 /// The body window a client must offer: the longest prefix and tail.
 pub const BODY_MIN: usize = PREFIX_MAX + TAIL_MAX;
+/// How often pm-gw reads the account, ns.
+pub const ACCOUNT_EVERY_NS: u64 = 30_000_000_000;
+/// No account read in a window's last this many seconds (the late law's
+/// τ < 20 s, with room).
+pub const QUIET_TAIL_S: u64 = 30;
+/// Tokens watched at once.
+pub const WATCH_MAX: usize = 16;
+/// `PmCmd.leg` bit of a CMD_WATCH that stops watching.
+pub const WATCH_STOP: u8 = 0x80;
 
 /// Halt: an answer's `orderID` is not the digest signed (D-5).
 pub const HALT_ORDER_ID: u64 = HALT_VENUE_BASE + 1;
@@ -112,6 +129,12 @@ pub struct GwCounters {
     pub recon_fills: u64,
     /// Recons finished.
     pub recon_done: u64,
+    /// Account requests sent.
+    pub account_requests: u64,
+    /// Account requests that failed.
+    pub account_failures: u64,
+    /// Account reads completed.
+    pub account_reads: u64,
 }
 
 /// pm-gw's core (module docs).
@@ -130,6 +153,12 @@ pub struct PmGateway<W: PmClob> {
     target: [u8; 256],
     halted: bool,
     counters: GwCounters,
+    watch: [(u32, u8); WATCH_MAX],
+    watch_n: usize,
+    /// The next account read's start, ns; its step (0 = the balance, then
+    /// the watched tokens; `usize::MAX` = idle).
+    account_next_ns: u64,
+    account_step: usize,
 }
 
 impl<W: PmClob> PmGateway<W> {
@@ -146,7 +175,10 @@ impl<W: PmClob> PmGateway<W> {
         specs: Consumer<PmWindowSpec, PM15_SPEC_RING>,
         seed: u64,
     ) -> Self {
-        assert!(clob.body_mut().len() >= BODY_MIN, "pm-gw: the body window is too small");
+        assert!(
+            clob.body_mut().len() >= BODY_MIN,
+            "pm-gw: the body window is too small"
+        );
         Self {
             acct,
             clob,
@@ -162,6 +194,10 @@ impl<W: PmClob> PmGateway<W> {
             target: [0; 256],
             halted: false,
             counters: GwCounters::default(),
+            watch: [(0, 0); WATCH_MAX],
+            watch_n: 0,
+            account_next_ns: 0,
+            account_step: usize::MAX,
         }
     }
 
@@ -210,22 +246,134 @@ impl<W: PmClob> PmGateway<W> {
             // COPY: the 64 B command off the ring — its fields are read
             // across the blocking request below (the guard is released at
             // once).
+            // At most one blocking request a pass: a submit's, else a
+            // recon's, else (no command waiting) one of the account read's.
             let next = self.end.cmd.pop().map(|c| *c);
             if let Some(cmd) = next {
                 did = true;
                 match cmd.kind {
-                    CMD_SUBMIT => self.submit(&cmd, wall_ns),
+                    CMD_SUBMIT => {
+                        self.submit(&cmd, wall_ns);
+                        return true;
+                    }
                     CMD_RECON => self.queue_recon(cmd),
+                    CMD_WATCH => self.set_watch(cmd.instance, cmd.leg),
                     _ => {}
                 }
             }
             if self.recon_n > 0 && now_ns >= self.recon_next_ns {
                 self.recon_next_ns = now_ns.saturating_add(RECON_GAP_NS);
                 self.recon_one(wall_ns);
+                return true;
+            }
+            if !self.end.cmd.is_empty() {
+                return did;
+            }
+            let quiet = (wall_ns / 1_000_000_000) % core_types::pm_roll::PM_WINDOW_S
+                >= core_types::pm_roll::PM_WINDOW_S - QUIET_TAIL_S;
+            if self.account_step == usize::MAX && now_ns >= self.account_next_ns && !quiet {
+                self.account_next_ns = now_ns.saturating_add(ACCOUNT_EVERY_NS);
+                self.account_step = 0;
+            }
+            if self.account_step != usize::MAX && !quiet {
+                self.account_one(wall_ns);
                 did = true;
             }
         }
         did
+    }
+
+    fn set_watch(&mut self, instance: u32, leg: u8) {
+        let key = (instance, leg & 1);
+        let mut i = 0usize;
+        while i < self.watch_n {
+            if self.watch[i] == key {
+                if leg & WATCH_STOP != 0 {
+                    self.watch[i] = self.watch[self.watch_n - 1];
+                    self.watch_n -= 1;
+                }
+                return;
+            }
+            i += 1;
+        }
+        if leg & WATCH_STOP != 0 {
+            return;
+        }
+        if self.watch_n == WATCH_MAX {
+            // The oldest goes: the arm watches far fewer than this.
+            let mut k = 1usize;
+            while k < WATCH_MAX {
+                self.watch[k - 1] = self.watch[k];
+                k += 1;
+            }
+            self.watch_n -= 1;
+        }
+        self.watch[self.watch_n] = key;
+        self.watch_n += 1;
+    }
+
+    /// One request of the account read: the balance (step 0), then the
+    /// watched tokens; EVT_READ_DONE after the last.
+    fn account_one(&mut self, wall_ns: u64) {
+        let step = self.account_step;
+        if step > self.watch_n {
+            self.account_step = usize::MAX;
+            self.counters.account_reads += 1;
+            return self.emit(&PmEvt::about(EVT_READ_DONE, 0));
+        }
+        self.account_step = step + 1;
+        let mut at = put(&mut self.target, 0, b"/balance-allowance?asset_type=");
+        let mut key = 0u64;
+        if step == 0 {
+            at = put(&mut self.target, at, b"COLLATERAL");
+        } else {
+            let (inst, leg) = self.watch[step - 1];
+            key = (u64::from(inst) << 8) | u64::from(leg);
+            let Some(row) = self.tokens.find(inst) else {
+                let mut e = PmEvt::about(EVT_POSITION, key);
+                e.why = 1;
+                return self.emit(&e);
+            };
+            let l = &row.legs[usize::from(leg & 1)];
+            let dec_len = l.dec_len;
+            let mut dec = [0u8; 80];
+            // COPY: the token's decimal id (≤ 78 B) out of the table for
+            // the query's render — once per read, cold.
+            dec[..dec_len].copy_from_slice(&l.dec[..dec_len]);
+            at = put(&mut self.target, at, b"CONDITIONAL&token_id=");
+            at = put(&mut self.target, at, &dec[..dec_len]);
+        }
+        at = put(&mut self.target, at, b"&signature_type=");
+        at = put_u64(&mut self.target, at, u64::from(self.acct.sig_type));
+        self.counters.account_requests += 1;
+        let res = l2_request(
+            &mut self.clob,
+            &self.acct,
+            Method::Get,
+            &self.target[..at],
+            0,
+            wall_ns / 1_000_000_000,
+        );
+        let read = match res {
+            Ok((200, range)) => crate::response::read_balance(&self.clob.resp()[range]),
+            _ => None,
+        };
+        let mut e = if step == 0 {
+            PmEvt::about(EVT_BALANCE, 0)
+        } else {
+            PmEvt::about(EVT_POSITION, key)
+        };
+        match read {
+            Some((balance, allowance)) => {
+                e.b = balance;
+                e.c = allowance;
+            }
+            None => {
+                self.counters.account_failures += 1;
+                e.why = 1;
+            }
+        }
+        self.emit(&e);
     }
 
     fn emit(&mut self, e: &PmEvt) {
@@ -256,17 +404,6 @@ impl<W: PmClob> PmGateway<W> {
         self.salt = x;
         let s = x & ((1u64 << 53) - 1);
         s | u64::from(s == 0)
-    }
-
-    /// The L2 MAC (`POLY_SIGNATURE`) over `ts ‖ method ‖ path ‖ body`.
-    fn l2_mac(
-        &self,
-        ts: &[u8],
-        method: &[u8],
-        path: &[u8],
-        body: &[u8],
-    ) -> [u8; crate::l2::L2_SIG_LEN] {
-        self.acct.l2.sign(&[ts, method, path, body])
     }
 
     fn submit(&mut self, cmd: &PmCmd, wall_ns: u64) {
@@ -339,26 +476,20 @@ impl<W: PmClob> PmGateway<W> {
                 tail,
             )
         };
-        let mut ts = [0u8; 20];
-        let tlen = render_ts(wall_ns / 1_000_000_000, &mut ts);
-        let mac = {
-            let body = &self.clob.body_mut()[..body_len];
-            self.acct.l2.sign(&[&ts[..tlen], b"POST", b"/order", body])
-        };
         let mut sent = PmEvt::about(EVT_SENT, cid);
         sent.order_id = signed.order_id;
         self.emit(&sent);
         self.counters.posts += 1;
         let mut attempt = 0u8;
         loop {
-            let headers: [Header<'_>; 5] = [
-                (b"POLY_ADDRESS", &self.acct.poly_address_text),
-                (b"POLY_API_KEY", self.acct.api_key()),
-                (b"POLY_PASSPHRASE", self.acct.passphrase()),
-                (b"POLY_SIGNATURE", &mac),
-                (b"POLY_TIMESTAMP", &ts[..tlen]),
-            ];
-            let res = self.clob.request(Method::Post, b"/order", &headers, body_len);
+            let res = l2_request(
+                &mut self.clob,
+                &self.acct,
+                Method::Post,
+                b"/order",
+                body_len,
+                wall_ns / 1_000_000_000,
+            );
             let retry = match res {
                 Ok((http, range)) => {
                     let ans = read_order_answer(http, &self.clob.resp()[range]);
@@ -379,7 +510,9 @@ impl<W: PmClob> PmGateway<W> {
                             self.emit(&e);
                             return;
                         }
-                        Verdict::Refused if ans.refusal == Refusal::TimedOut && attempt == 0 => true,
+                        Verdict::Refused if ans.refusal == Refusal::TimedOut && attempt == 0 => {
+                            true
+                        }
                         Verdict::Refused if ans.refusal == Refusal::Duplicated => {
                             // The first copy's fate stands: recon reads it.
                             self.in_doubt(cid, signed.order_id);
@@ -389,7 +522,10 @@ impl<W: PmClob> PmGateway<W> {
                             self.counters.refused += 1;
                             if matches!(
                                 ans.refusal,
-                                Refusal::Version | Refusal::Auth | Refusal::Payload | Refusal::Closed
+                                Refusal::Version
+                                    | Refusal::Auth
+                                    | Refusal::Payload
+                                    | Refusal::Closed
                             ) {
                                 self.halt(HALT_REFUSAL);
                             }
@@ -451,7 +587,7 @@ impl<W: PmClob> PmGateway<W> {
         self.recon_n -= 1;
         let cid = cmd.client_oid;
         let Some(row) = self.tokens.find(cmd.instance) else {
-            // The window left the table (two windows on): its trades are
+            // The window left the table (four windows on): its trades are
             // unreadable here — fail closed.
             self.halt(HALT_RECON);
             let mut e = PmEvt::about(EVT_DONE, cid);
@@ -478,21 +614,15 @@ impl<W: PmClob> PmGateway<W> {
                 at = put(&mut self.target, at, b"&next_cursor=");
                 at = put(&mut self.target, at, &cursor[..cursor_len]);
             }
-            let tlen_target = at;
-            let mut ts = [0u8; 20];
-            let tlen = render_ts(wall_ns / 1_000_000_000, &mut ts);
-            // The query is not signed (spec §B.1): the path only.
-            let mac = self.l2_mac(&ts[..tlen], b"GET", b"/data/trades", b"");
             self.counters.recon_requests += 1;
-            let headers: [Header<'_>; 5] = [
-                (b"POLY_ADDRESS", &self.acct.poly_address_text),
-                (b"POLY_API_KEY", self.acct.api_key()),
-                (b"POLY_PASSPHRASE", self.acct.passphrase()),
-                (b"POLY_SIGNATURE", &mac),
-                (b"POLY_TIMESTAMP", &ts[..tlen]),
-            ];
-            let target = &self.target[..tlen_target];
-            let res = self.clob.request(Method::Get, target, &headers, 0);
+            let res = l2_request(
+                &mut self.clob,
+                &self.acct,
+                Method::Get,
+                &self.target[..at],
+                0,
+                wall_ns / 1_000_000_000,
+            );
             let range = match res {
                 Ok((200, range)) => range,
                 _ => return self.recon_failed(cmd),
@@ -544,6 +674,47 @@ impl<W: PmClob> PmGateway<W> {
         }
         self.queue_recon(cmd);
     }
+}
+
+/// One L2-authenticated request (spec §B.1) at wall second `wall_s`: the
+/// MAC over `ts ‖ METHOD ‖ path ‖ body` — the target's path alone (a query
+/// is not signed) and the first `body_len` bytes of the body window — and
+/// the five `POLY_*` headers beside the client's own.
+///
+/// # Errors
+/// The client's [`PostErr`].
+pub fn l2_request<W: PmClob>(
+    clob: &mut W,
+    acct: &PmAccount,
+    method: Method,
+    target: &[u8],
+    body_len: usize,
+    wall_s: u64,
+) -> Result<(u16, core::ops::Range<usize>), PostErr> {
+    let path = match memchr::memchr(b'?', target) {
+        Some(q) => &target[..q],
+        None => target,
+    };
+    let verb: &[u8] = match method {
+        Method::Get => b"GET",
+        Method::Post => b"POST",
+        Method::Put => b"PUT",
+        Method::Delete => b"DELETE",
+    };
+    let mut ts = [0u8; 20];
+    let tlen = render_ts(wall_s, &mut ts);
+    let mac = {
+        let body = &clob.body_mut()[..body_len];
+        acct.l2.sign(&[&ts[..tlen], verb, path, body])
+    };
+    let headers: [Header<'_>; 5] = [
+        (b"POLY_ADDRESS", &acct.poly_address_text),
+        (b"POLY_API_KEY", acct.api_key()),
+        (b"POLY_PASSPHRASE", acct.passphrase()),
+        (b"POLY_SIGNATURE", &mac),
+        (b"POLY_TIMESTAMP", &ts[..tlen]),
+    ];
+    clob.request(method, target, &headers, body_len)
 }
 
 #[cfg(test)]

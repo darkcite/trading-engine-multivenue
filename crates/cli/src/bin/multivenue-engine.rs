@@ -243,6 +243,26 @@ enum Cmd {
     /// exactly as `run` would, then print the boot tell. No socket, no
     /// thread, no `.env`: exit 0, or 78 with the refusal on stderr.
     Pm15Check(Pm15CheckArgs),
+    /// PM15-6c: slot 9's arm, checked without an order. `--self-test`
+    /// (offline) runs every pinned signing vector; `--key-check` (online,
+    /// read-only; the wrapper sources slot 9's account) adds CLOB V2, the
+    /// account open, the pUSD balance and the exchange's allowance. Exit
+    /// 0, or 78 with the refusal on stderr. Never prints a secret.
+    PmExec(PmExecArgs),
+}
+
+#[derive(Debug, Parser)]
+struct PmExecArgs {
+    /// Offline: the boot self-test's vectors.
+    #[arg(
+        long,
+        conflicts_with = "key_check",
+        required_unless_present = "key_check"
+    )]
+    self_test: bool,
+    /// Online, read-only: the self-test, then the venue gate.
+    #[arg(long)]
+    key_check: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -1771,16 +1791,35 @@ fn main() -> ExitCode {
             init_tracing_stderr();
             hl_outcome_probe(&args)
         }
-        Cmd::Pm15Check(args) => match cli::pm15_boot::check(args.universe.as_deref(), args.pm15.as_deref()) {
-            Ok(tell) => {
-                println!("{tell}");
-                ExitCode::SUCCESS
+        Cmd::Pm15Check(args) => {
+            match cli::pm15_boot::check(args.universe.as_deref(), args.pm15.as_deref()) {
+                Ok(tell) => {
+                    println!("{tell}");
+                    ExitCode::SUCCESS
+                }
+                Err(reason) => {
+                    eprintln!("pm15-check: {reason}");
+                    ExitCode::from(78)
+                }
             }
-            Err(reason) => {
-                eprintln!("pm15-check: {reason}");
-                ExitCode::from(78)
+        }
+        Cmd::PmExec(args) => {
+            let r = if args.key_check {
+                cli::pm15_live::key_check(TlsTransport::default_client_config())
+            } else {
+                cli::pm15_live::self_test()
+            };
+            match r {
+                Ok(tell) => {
+                    println!("{tell}");
+                    ExitCode::SUCCESS
+                }
+                Err(reason) => {
+                    eprintln!("pm-exec: {reason}");
+                    ExitCode::from(78)
+                }
             }
-        },
+        }
         Cmd::Pm15Probe(args) => {
             // JSON lines only on stdout.
             init_tracing_stderr();
@@ -4157,6 +4196,18 @@ fn run(args: RunArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // PM15-6c: slot 9's gateway reads every window discovery finds — the
+    // tee's two ends, when slot 9 is live (the producer into the PM15
+    // ingress's spawn, the consumer into slot 9's arm).
+    let (mut pm15_tee_tx, mut pm15_tee_rx) = if exec_boot
+        .as_ref()
+        .is_some_and(cli::exec_boot::ExecBoot::pm15_live)
+    {
+        let (t, r) = cli::pm15_live::spec_tee();
+        (Some(t), Some(r))
+    } else {
+        (None, None)
+    };
     // (BX9: before the discovery too — a live Binance arm's options held
     // outside the chain join it right after the discovery, before any
     // table is built from the chain: the R3 ruling.)
@@ -5444,6 +5495,7 @@ fn run(args: RunArgs) -> ExitCode {
             epoch_ns,
             raw_tap_cfg.pm15,
             capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_pm15)),
+            pm15_tee_tx.take(),
         ) {
             Ok(hs) => handles.extend(hs),
             Err(e) => {
@@ -5759,6 +5811,8 @@ fn run(args: RunArgs) -> ExitCode {
     let mut xmm_stop: Option<cli::xmm_live::GatewayStop> = None;
     // XMM XH4i-5: slot 3's gateway thread's owner, alike.
     let mut bin15_stop: Option<cli::xmm_live::GatewayStop> = None;
+    // PM15-6c: slot 9's two threads' owner, alike.
+    let mut pm15_stop: Option<cli::xmm_live::GatewayStop> = None;
     let result = match (strategy_choice, args.live, set_mask) {
         // HYPARB H0 (O-H1): `latency-arb` has no arm any more — slot 0
         // is the hyparb set member and the old name falls through to
@@ -6543,6 +6597,48 @@ fn run(args: RunArgs) -> ExitCode {
                     } else {
                         exec_router::NO_SLOT
                     };
+                    // PM15-6c: **slot 9 on its own Polymarket arm**, when the
+                    // artifact marks it live: `SlotSplit(9, …)` just outside
+                    // slot 3's — none (`NO_SLOT`) without, so the
+                    // compositions stay sixteen. Its two threads are
+                    // released after the loop, as slot 3's.
+                    let pm15_arm = if eb.pm15_live() {
+                        let booted = match pm15_tee_rx.take() {
+                            Some(rx) => cli::pm15_live::boot_pm15_arm(
+                                &eb,
+                                pm15_boot.as_ref(),
+                                TlsTransport::default_client_config(),
+                                rx,
+                            ),
+                            None => Err(String::from(
+                                "slot 9 is live, but the PM15 ingress did not start (no \
+                                 `[polymarket] rolling` families): its arm would have no tokens",
+                            )),
+                        };
+                        match booted {
+                            Ok(b) => {
+                                warn!("{}", b.tell);
+                                pm15_stop = Some(b.stop);
+                                handles.extend(b.handles);
+                                Some(b.arm)
+                            }
+                            Err(reason) => {
+                                error!(%reason, "pm15: slot 9's arm refused — boot aborted");
+                                if let Some(s) = &bin15_stop {
+                                    s.release();
+                                }
+                                join_reverse(handles);
+                                return ExitCode::from(1);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let pm15_slot = if pm15_arm.is_some() {
+                        cli::exec_boot::PM15_SLOT as u8
+                    } else {
+                        exec_router::NO_SLOT
+                    };
                     let xmm_arm = if eb.gateway_live().is_some() {
                         let spec = cli::xmm_live::XmmSpec {
                             eb: &eb,
@@ -6563,6 +6659,9 @@ fn run(args: RunArgs) -> ExitCode {
                             Err(reason) => {
                                 error!(%reason, "xmm: slot 6's gateway arm refused — boot aborted");
                                 if let Some(s) = &bin15_stop {
+                                    s.release();
+                                }
+                                if let Some(s) = &pm15_stop {
                                     s.release();
                                 }
                                 join_reverse(handles);
@@ -6625,6 +6724,9 @@ fn run(args: RunArgs) -> ExitCode {
                             if let Some(s) = &bin15_stop {
                                 s.release();
                             }
+                            if let Some(s) = &pm15_stop {
+                                s.release();
+                            }
                             join_reverse(handles);
                             return ExitCode::from(1);
                         }};
@@ -6670,14 +6772,17 @@ fn run(args: RunArgs) -> ExitCode {
                             // chase a pointer).
                             match xmm_arm {
                                 None => {
-                                    let inner =
-                                        exec_router::SlotSplit::new(bin15_slot, $inner, bin15_gw);
+                                    let inner = exec_router::SlotSplit::new(
+                                        pm15_slot,
+                                        exec_router::SlotSplit::new(bin15_slot, $inner, bin15_gw),
+                                        pm15_arm,
+                                    );
                                     let mut d = exec_router::RoutedDispatcher::new(
                                         eb.route, paper, inner, anchor,
                                     );
                                     wire_exec_halts(&mut d, &eb, halt_mask, aliases);
                                     $(
-                                        let split_aliases = *d.live().a()$(.$hop())*.aliases();
+                                        let split_aliases = *d.live().a().a()$(.$hop())*.aliases();
                                         finish_bn!(d, split_aliases, $specs);
                                     )?
                                     enter_loop!(d, $what)
@@ -6685,7 +6790,11 @@ fn run(args: RunArgs) -> ExitCode {
                                 Some((xmm, xspecs, net)) => {
                                     let split = exec_router::SlotSplit::new(
                                         cli::exec_boot::XMM_SLOT as u8,
-                                        exec_router::SlotSplit::new(bin15_slot, $inner, bin15_gw),
+                                        exec_router::SlotSplit::new(
+                                            pm15_slot,
+                                            exec_router::SlotSplit::new(bin15_slot, $inner, bin15_gw),
+                                            pm15_arm,
+                                        ),
                                         xmm,
                                     );
                                     let mut d = exec_router::RoutedDispatcher::new(
@@ -6693,7 +6802,7 @@ fn run(args: RunArgs) -> ExitCode {
                                     );
                                     wire_exec_halts(&mut d, &eb, halt_mask, aliases);
                                     $(
-                                        let split_aliases = *d.live().a().a()$(.$hop())*.aliases();
+                                        let split_aliases = *d.live().a().a().a()$(.$hop())*.aliases();
                                         finish_bn!(d, split_aliases, $specs);
                                     )?
                                     finish_xmm!(d, xspecs);
@@ -6815,6 +6924,9 @@ fn run(args: RunArgs) -> ExitCode {
         s.release();
     }
     if let Some(s) = &bin15_stop {
+        s.release();
+    }
+    if let Some(s) = &pm15_stop {
         s.release();
     }
     join_reverse(handles);

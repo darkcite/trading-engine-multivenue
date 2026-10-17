@@ -220,6 +220,61 @@ fn read_error(http: u16, body: &[u8]) -> OrderAnswer {
     a
 }
 
+/// PM15-6c: a `GET /balance-allowance` answer (spec §G.4) —
+/// `{"balance":"<6-decimal base units>","allowances":{"0x<spender>":"<n>"}}`
+/// — as `(balance, allowance of the CTF Exchange V2)`, both ×1e6 (base
+/// units are ×1e6), the allowance capped at `i64::MAX` (an approval of
+/// `maxUint256` is 78 digits) and 0 when not named. `None` when the
+/// balance does not read.
+#[must_use]
+pub fn read_balance(body: &[u8]) -> Option<(i64, i64)> {
+    let b = string_field(body, b"\"balance\":")?;
+    let balance = match core_parse::scan_u64(b, 0) {
+        Some((v, n)) if n == b.len() && v <= i64::MAX as u64 => v as i64,
+        _ => return None,
+    };
+    // The spender's key, as the venue may spell it (checksummed or not).
+    const SPENDER: &[u8] = b"0xe111180000d2663c0091e4f400237545b87b996b";
+    let mut allowance = 0i64;
+    if let Some(p) = find_field(body, b"\"allowances\":") {
+        let mut i = skip_ws(body, p);
+        if i < body.len() && body[i] == b'{' {
+            i += 1;
+            loop {
+                i = skip_ws(body, i);
+                if i >= body.len() || body[i] != b'"' {
+                    break;
+                }
+                let kend = skip_string(body, i + 1)?;
+                let k = &body[i + 1..kend - 1];
+                let mut v = skip_ws(body, kend);
+                if v >= body.len() || body[v] != b':' {
+                    return None;
+                }
+                v = skip_ws(body, v + 1);
+                if v >= body.len() || body[v] != b'"' {
+                    return None;
+                }
+                let vend = skip_string(body, v + 1)?;
+                if k.eq_ignore_ascii_case(SPENDER) {
+                    let t = &body[v + 1..vend - 1];
+                    allowance = match core_parse::scan_u64(t, 0) {
+                        Some((x, n)) if n == t.len() => x.min(i64::MAX as u64) as i64,
+                        // More digits than a u64 holds: unlimited.
+                        _ if !t.is_empty() && t.iter().all(u8::is_ascii_digit) => i64::MAX,
+                        _ => 0,
+                    };
+                }
+                i = skip_ws(body, vend);
+                if i < body.len() && body[i] == b',' {
+                    i += 1;
+                }
+            }
+        }
+    }
+    Some((balance, allowance))
+}
+
 /// The refusal class of a venue message (spec §A.4's strings).
 #[must_use]
 pub fn classify(m: &[u8]) -> Refusal {

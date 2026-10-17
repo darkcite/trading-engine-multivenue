@@ -11,7 +11,9 @@ use super::*;
 use crate::cmd::PM_USER_RING;
 use crate::userws::{TS_CONFIRMED, TS_FAILED, TS_MATCHED, TS_MINED};
 use core_ring::{Producer, Ring};
-use core_types::pm_roll::{pm_instance_id, pm_mark_sym, pm_pair_of_window, pm_rolling_sym, pm_window_of_open};
+use core_types::pm_roll::{
+    pm_instance_id, pm_mark_sym, pm_pair_of_window, pm_rolling_sym, pm_window_of_open,
+};
 use exec_gateway::{duplex, GatewayEnd};
 
 const OPEN: u64 = 1_792_216_800;
@@ -122,19 +124,42 @@ fn admission_refuses_everything_but_a_live_familys_ioc_buy_on_its_law() {
     let mut b = bench();
     let mut o = order(0, 0, 930_000, 268_810_000, 1);
     o.strategy_id = 3;
-    assert_eq!(b.arm.submit(&o), Err(DispatchError::Unroutable), "another slot");
+    assert_eq!(
+        b.arm.submit(&o),
+        Err(DispatchError::Unroutable),
+        "another slot"
+    );
     let mut o = order(0, 0, 930_000, 1_000_000, 1);
     o.sym = pm_mark_sym(0);
-    assert_eq!(b.arm.submit(&o), Err(DispatchError::Unroutable), "the mark slot");
+    assert_eq!(
+        b.arm.submit(&o),
+        Err(DispatchError::Unroutable),
+        "the mark slot"
+    );
     let mut o = order(0, 0, 930_000, 1_000_000, 1);
     o.side = Side::Ask;
-    assert_eq!(b.arm.submit(&o), Err(DispatchError::Unroutable), "never a sell");
-    let o = order(2, 0, 930_000, 1_000_000, 1);
-    assert_eq!(b.arm.submit(&o), Err(DispatchError::Unroutable), "SOL is not live (D-9)");
-    let o = order(1, 1, 930_000, 1_000_000, 1);
-    assert_eq!(b.arm.submit(&o), Err(DispatchError::Unroutable), "no law on ETH's Down yet");
     assert_eq!(
-        (b.arm.counters().refused_shape, b.arm.counters().refused_family),
+        b.arm.submit(&o),
+        Err(DispatchError::Unroutable),
+        "never a sell"
+    );
+    let o = order(2, 0, 930_000, 1_000_000, 1);
+    assert_eq!(
+        b.arm.submit(&o),
+        Err(DispatchError::Unroutable),
+        "SOL is not live (D-9)"
+    );
+    let o = order(1, 1, 930_000, 1_000_000, 1);
+    assert_eq!(
+        b.arm.submit(&o),
+        Err(DispatchError::Unroutable),
+        "no law on ETH's Down yet"
+    );
+    assert_eq!(
+        (
+            b.arm.counters().refused_shape,
+            b.arm.counters().refused_family
+        ),
         (4, 1)
     );
     assert!(cmds(&mut b).is_empty());
@@ -144,11 +169,35 @@ fn admission_refuses_everything_but_a_live_familys_ioc_buy_on_its_law() {
     let c = cmds(&mut b);
     assert_eq!(c.len(), 1);
     assert_eq!(
-        (c[0].kind, c[0].client_oid, c[0].px_1e6, c[0].usd_1e6, c[0].instance, c[0].tick_1e6, c[0].leg),
-        (CMD_SUBMIT, o.client_oid, 930_000, 249_990_000, inst(0), 10_000, 0)
+        (
+            c[0].kind,
+            c[0].client_oid,
+            c[0].px_1e6,
+            c[0].usd_1e6,
+            c[0].instance,
+            c[0].tick_1e6,
+            c[0].leg
+        ),
+        (
+            CMD_SUBMIT,
+            o.client_oid,
+            930_000,
+            249_990_000,
+            inst(0),
+            10_000,
+            0
+        )
     );
-    assert_eq!(b.arm.submit(&o), Err(DispatchError::Unroutable), "one cid, one order");
-    assert_eq!(b.arm.cancel(&CancelReq::new(1, VenueId::Polymarket, o.sym, o.client_oid)), Err(DispatchError::Unsupported));
+    assert_eq!(
+        b.arm.submit(&o),
+        Err(DispatchError::Unroutable),
+        "one cid, one order"
+    );
+    assert_eq!(
+        b.arm
+            .cancel(&CancelReq::new(1, VenueId::Polymarket, o.sym, o.client_oid)),
+        Err(DispatchError::Unsupported)
+    );
 }
 
 #[test]
@@ -160,25 +209,48 @@ fn an_order_books_each_trade_once_and_retires_a_poll_after_its_fills() {
     let id = [3u8; 32];
     gw(&mut b, sent(o.client_oid, id));
     gw(&mut b, ack(o.client_oid, id, 2));
-    assert!(b.user.try_push_ref(&PmEvt::fill(id, 11, 920_000, 100_000_000, TS_MATCHED)));
-    assert!(b.user.try_push_ref(&PmEvt::fill(id, 11, 920_000, 100_000_000, TS_MINED)));
+    assert!(b
+        .user
+        .try_push_ref(&PmEvt::fill(id, 11, 920_000, 100_000_000, TS_MATCHED)));
+    assert!(b
+        .user
+        .try_push_ref(&PmEvt::fill(id, 11, 920_000, 100_000_000, TS_MINED)));
     let f = fills(&mut b);
     assert_eq!(f.len(), 1, "a trade id is booked once");
     assert_eq!(
-        (f[0].sym, f[0].px.raw(), f[0].qty.raw(), f[0].order_id, f[0].strategy_id),
+        (
+            f[0].sym,
+            f[0].px.raw(),
+            f[0].qty.raw(),
+            f[0].order_id,
+            f[0].strategy_id
+        ),
         (o.sym, 920_000, 100_000_000, o.client_oid, SLOT)
     );
     assert_eq!(f[0].origin, FILL_ORIGIN_VENUE);
-    assert!(b.arm.try_next_retired().is_none(), "one of two trades: open");
-    assert!(b.user.try_push_ref(&PmEvt::fill(id, 12, 930_000, 168_810_000, TS_MATCHED)));
+    assert!(
+        b.arm.try_next_retired().is_none(),
+        "one of two trades: open"
+    );
+    assert!(b
+        .user
+        .try_push_ref(&PmEvt::fill(id, 12, 930_000, 168_810_000, TS_MATCHED)));
     // Done at that poll; its retirement is released by the next one —
     // which `fills` ran after it had popped the fill.
     assert_eq!(fills(&mut b).len(), 1);
     let r = b.arm.try_next_retired().expect("retired after its fills");
-    assert_eq!((r.client_oid, r.slot, r.why), (o.client_oid, SLOT, RETIRED_FILLED));
-    assert!(b.user.try_push_ref(&PmEvt::fill(id, 12, 930_000, 168_810_000, TS_CONFIRMED)));
+    assert_eq!(
+        (r.client_oid, r.slot, r.why),
+        (o.client_oid, SLOT, RETIRED_FILLED)
+    );
+    assert!(b
+        .user
+        .try_push_ref(&PmEvt::fill(id, 12, 930_000, 168_810_000, TS_CONFIRMED)));
     assert!(fills(&mut b).is_empty());
-    assert_eq!((b.arm.counters().confirmed, b.arm.counters().repeats), (1, 2));
+    assert_eq!(
+        (b.arm.counters().confirmed, b.arm.counters().repeats),
+        (1, 2)
+    );
     assert!(!b.arm.halted());
     assert_eq!(b.arm.open_orders(), 0);
 }
@@ -190,16 +262,23 @@ fn a_fill_before_its_sent_is_read_finds_its_order_and_a_stranger_halts() {
     b.arm.submit(&o).unwrap();
     let id = [8u8; 32];
     // The channel's trade is in the user ring before the arm read SENT.
-    assert!(b.user.try_push_ref(&PmEvt::fill(id, 5, 900_000, 10_000_000, TS_MATCHED)));
+    assert!(b
+        .user
+        .try_push_ref(&PmEvt::fill(id, 5, 900_000, 10_000_000, TS_MATCHED)));
     gw(&mut b, sent(o.client_oid, id));
     // (SENT is read first anyway: the gw ring is drained before the user
     // ring; and again on a trade that finds no order.)
     assert_eq!(fills(&mut b).len(), 1);
     assert!(!b.arm.halted());
-    assert!(b.user.try_push_ref(&PmEvt::fill([9; 32], 6, 900_000, 1_000_000, TS_MATCHED)));
+    assert!(b
+        .user
+        .try_push_ref(&PmEvt::fill([9; 32], 6, 900_000, 1_000_000, TS_MATCHED)));
     assert!(fills(&mut b).is_empty());
     assert!(b.arm.halted(), "a trade of no order of ours");
-    assert_eq!(b.arm.submit(&order(0, 0, 930_000, 1_000_000, 3)), Err(DispatchError::SlotDisabled));
+    assert_eq!(
+        b.arm.submit(&order(0, 0, 930_000, 1_000_000, 3)),
+        Err(DispatchError::SlotDisabled)
+    );
 }
 
 #[test]
@@ -209,8 +288,12 @@ fn a_reversal_after_a_booking_halts() {
     b.arm.submit(&o).unwrap();
     let id = [4u8; 32];
     gw(&mut b, sent(o.client_oid, id));
-    assert!(b.user.try_push_ref(&PmEvt::fill(id, 21, 930_000, 10_000_000, TS_MATCHED)));
-    assert!(b.user.try_push_ref(&PmEvt::fill(id, 21, 930_000, 10_000_000, TS_FAILED)));
+    assert!(b
+        .user
+        .try_push_ref(&PmEvt::fill(id, 21, 930_000, 10_000_000, TS_MATCHED)));
+    assert!(b
+        .user
+        .try_push_ref(&PmEvt::fill(id, 21, 930_000, 10_000_000, TS_FAILED)));
     assert_eq!(fills(&mut b).len(), 1);
     assert!(b.arm.halted());
     assert_eq!(b.arm.counters().reversed, 1);
@@ -244,9 +327,15 @@ fn refusals_retire_and_doubt_goes_to_recon_which_books_and_retires() {
     assert!(cmds(&mut b).is_empty(), "not yet");
     b.arm.pump(t0 + DOUBT_RECON_NS + SCAN_EVERY_NS);
     let c = cmds(&mut b);
-    assert_eq!((c.len(), c[0].kind, c[0].order_id, c[0].instance), (1, CMD_RECON, id, inst(0)));
+    assert_eq!(
+        (c.len(), c[0].kind, c[0].order_id, c[0].instance),
+        (1, CMD_RECON, id, inst(0))
+    );
     // Recon's fill comes on the gw ring, then DONE.
-    gw(&mut b, PmEvt::fill(id, 31, 925_000, 10_000_000, TS_CONFIRMED));
+    gw(
+        &mut b,
+        PmEvt::fill(id, 31, 925_000, 10_000_000, TS_CONFIRMED),
+    );
     let mut done = PmEvt::about(EVT_DONE, o2.client_oid);
     done.b = 1;
     gw(&mut b, done);
@@ -276,7 +365,10 @@ fn a_gap_and_a_deadline_send_open_orders_to_recon_and_a_late_trade_still_books()
     assert!(b.user.try_push_ref(&PmEvt::about(EVT_GAP, 0)));
     b.arm.on_idle();
     let c = cmds(&mut b);
-    assert_eq!((c.len(), c[0].kind, c[0].client_oid), (1, CMD_RECON, o.client_oid));
+    assert_eq!(
+        (c.len(), c[0].kind, c[0].client_oid),
+        (1, CMD_RECON, o.client_oid)
+    );
     // Recon found nothing; DONE retires it. A trade the venue sends later
     // still finds the kept row.
     let mut done = PmEvt::about(EVT_DONE, o.client_oid);
@@ -284,8 +376,13 @@ fn a_gap_and_a_deadline_send_open_orders_to_recon_and_a_late_trade_still_books()
     gw(&mut b, done);
     b.arm.on_idle();
     b.arm.on_idle();
-    assert_eq!(b.arm.try_next_retired().unwrap().why, RETIRED_CANCELED_VENUE);
-    assert!(b.user.try_push_ref(&PmEvt::fill(id, 41, 930_000, 4_000_000, TS_MATCHED)));
+    assert_eq!(
+        b.arm.try_next_retired().unwrap().why,
+        RETIRED_CANCELED_VENUE
+    );
+    assert!(b
+        .user
+        .try_push_ref(&PmEvt::fill(id, 41, 930_000, 4_000_000, TS_MATCHED)));
     assert_eq!(fills(&mut b).len(), 1, "a late trade of a done order");
     assert!(!b.arm.halted());
     // The deadline: an order with no answer goes to recon.
@@ -297,4 +394,104 @@ fn a_gap_and_a_deadline_send_open_orders_to_recon_and_a_late_trade_still_books()
     b.arm.pump(t0 + DEADLINE_NS + SCAN_EVERY_NS);
     let c = cmds(&mut b);
     assert_eq!((c.len(), c[0].kind, c[0].order_id), (1, CMD_RECON, [1; 32]));
+}
+
+fn read(b: &mut Bench, balance: i64, legs: &[(u32, u8, i64)]) {
+    let mut e = PmEvt::about(EVT_BALANCE, 0);
+    e.b = balance;
+    e.c = i64::MAX;
+    gw(b, e);
+    for &(inst, leg, shares) in legs {
+        let mut p = PmEvt::about(EVT_POSITION, (u64::from(inst) << 8) | u64::from(leg));
+        p.b = shares;
+        gw(b, p);
+    }
+    gw(b, PmEvt::about(EVT_READ_DONE, 0));
+}
+
+#[test]
+fn the_ledger_watches_values_at_cost_realises_a_settled_loss_and_drops_the_redeemed() {
+    let mut b = bench();
+    let o = order(0, 0, 930_000, 100_000_000, 1);
+    b.arm.submit(&o).unwrap();
+    let _ = cmds(&mut b);
+    let id = [3u8; 32];
+    gw(&mut b, sent(o.client_oid, id));
+    gw(&mut b, ack(o.client_oid, id, 1));
+    assert!(b
+        .user
+        .try_push_ref(&PmEvt::fill(id, 1, 930_000, 100_000_000, TS_MATCHED)));
+    assert_eq!(fills(&mut b).len(), 1);
+    let c = cmds(&mut b);
+    assert_eq!(
+        (c.len(), c[0].kind, c[0].instance, c[0].leg),
+        (1, CMD_WATCH, inst(0), 0)
+    );
+    assert_eq!(
+        b.arm.halt_signal().reconciled,
+        0,
+        "not read yet: the router refuses places"
+    );
+    // The first read: $1 000 pUSD and the leg as booked — seeded, anchored
+    // at $1 093 (the leg at cost).
+    read(&mut b, 1_000_000_000, &[(inst(0), 0, 100_000_000)]);
+    b.arm.on_idle();
+    let s = b.arm.halt_signal();
+    assert_eq!(
+        (
+            s.reconciled,
+            s.pnl_judged,
+            s.pnl_delta_usd_1e6,
+            s.recon_drift_usd_1e6
+        ),
+        (1, 1, 0, 0)
+    );
+    assert_eq!(b.arm.anchor_1e6(), Some(1_093_000_000));
+    // The roll settles Down: the Up leg is lost — worth $93 less.
+    let roll = ChannelEvent::new(
+        0,
+        VenueId::Polymarket,
+        ChannelId::InstrumentRoll,
+        sym(0, 0),
+        core_types::pack_roll_seq(inst(0), 60, pm_pair_of_window(window()), true),
+        0,
+        PM_SETTLED_DOWN,
+        0,
+    );
+    b.arm.on_venue_event(&roll);
+    read(&mut b, 1_000_000_000, &[(inst(0), 0, 100_000_000)]);
+    b.arm.on_idle();
+    assert_eq!(b.arm.halt_signal().pnl_delta_usd_1e6, -93_000_000);
+    // Redeemed: the venue holds none — the leg leaves, its watch stops.
+    read(&mut b, 1_000_000_000, &[(inst(0), 0, 0)]);
+    b.arm.on_idle();
+    assert_eq!(b.arm.counters().legs_redeemed, 1);
+    let c = cmds(&mut b);
+    assert_eq!((c[0].kind, c[0].leg), (CMD_WATCH, crate::gw::WATCH_STOP));
+    // A drift: a leg whose venue balance disagrees (the fill old enough).
+    let o2 = order(0, 1, 900_000, 50_000_000, 2);
+    b.arm.on_venue_event(&law(0, 1, 10_000));
+    b.arm.submit(&o2).unwrap();
+    let id2 = [4u8; 32];
+    gw(&mut b, sent(o2.client_oid, id2));
+    assert!(b
+        .user
+        .try_push_ref(&PmEvt::fill(id2, 2, 900_000, 50_000_000, TS_MATCHED)));
+    let _ = fills(&mut b);
+    b.arm.legs[0].last_fill_ns = 0;
+    b.arm.legs[1].last_fill_ns = 0;
+    read(&mut b, 955_000_000, &[(inst(0), 1, 40_000_000)]);
+    b.arm.on_idle();
+    assert_eq!(
+        b.arm.halt_signal().recon_drift_usd_1e6,
+        9_000_000,
+        "10 shares at $0.90"
+    );
+    // A failed read is not an agreement: the age grows from the last one.
+    let mut e = PmEvt::about(EVT_BALANCE, 0);
+    e.why = 1;
+    gw(&mut b, e);
+    gw(&mut b, PmEvt::about(EVT_READ_DONE, 0));
+    b.arm.on_idle();
+    assert_eq!(b.arm.counters().reads_disagreed, 1);
 }

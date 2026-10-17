@@ -359,6 +359,7 @@ dependencies = [
  "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",
+ "exec-polymarket",
  "exec-router",
  "ingress-ai",
  "ingress-binance",
@@ -885,6 +886,7 @@ dependencies = [
  "exec-gateway",
  "ingress-polymarket",
  "memchr",
+ "mio 0.8.11",
  "signer-eip712",
  "zeroize",
 ]

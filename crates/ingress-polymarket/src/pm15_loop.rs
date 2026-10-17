@@ -148,10 +148,12 @@ pub enum Pm15Counter {
     DiscoveryFetchErrors,
     /// Discovery: a spec the ring could not take.
     DiscoveryRingFull,
+    /// PM15-6c: a spec slot 9's gateway's tee could not take.
+    DiscoveryTeeFull,
 }
 
 /// How many [`Pm15Counter`]s there are.
-pub const PM15_COUNTERS: usize = Pm15Counter::DiscoveryRingFull as usize + 1;
+pub const PM15_COUNTERS: usize = Pm15Counter::DiscoveryTeeFull as usize + 1;
 
 /// The metric suffix of each counter, in discriminant order.
 pub const PM15_COUNTER_NAMES: [&str; PM15_COUNTERS] = [
@@ -182,6 +184,7 @@ pub const PM15_COUNTER_NAMES: [&str; PM15_COUNTERS] = [
     "discovery_law_refused",
     "discovery_fetch_errors",
     "discovery_ring_full",
+    "discovery_tee_full",
 ];
 
 /// The counters: the ingress and the discovery threads write, the

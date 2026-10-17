@@ -32,7 +32,9 @@
 //! | [`clob`] | pm-gw | the request cycle (`core_net::HttpsReq`, or the rig) |
 //! | [`gw`] | pm-gw | submit (amounts → sign → body in place → MAC → SENT → POST → answer), the retry law, recon |
 //! | [`user`] | pm-user | the user channel: subscribe, trades → FILL, the session's loss → GAP |
-//! | [`arm`] | engine | `OrderDispatch`: admission (D-9), the in-flight table, fills once, retirements after them |
+//! | [`arm`] | engine | `OrderDispatch`: admission (D-9), the in-flight table, fills once, retirements after them; the ledger, the account's worth and the halt signal (6c) |
+//! | [`run`] | pm-gw, pm-user | the threads' loops (6c) |
+//! | [`venue`] | boot | the venue gate: version 2, the account open, pUSD readable, the allowance (D-8, 6c) |
 //!
 //! ## The laws
 //!
@@ -64,11 +66,13 @@ pub mod l2;
 pub mod num;
 pub mod render;
 pub mod response;
+pub mod run;
 pub mod selftest;
 pub mod sign;
 pub mod tokens;
 pub mod user;
 pub mod userws;
+pub mod venue;
 
 /// The CLOB REST host (V2 since the 2026-04-28 cutover; there is no
 /// testnet the arm uses — the venue gate is the self-test plus a FAK

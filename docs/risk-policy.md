@@ -16954,8 +16954,9 @@ provided when coding is done". **Plans:** project docs
 and 39 (the P0 pre-registration, sha256 `d06d0038…488e`, registered
 06:01Z). **Commits (main, not pushed — R-PM-5):** `3feceac` PM15-2/3,
 `5849b4e` PM15-4, `1c8b014` PM15-5, `babf584` PM15-6a, `03a3191` PM15-8a,
-`a9987fa` PM15-5b.
-**Deployed PAPER 2026-10-17 09:22Z (`03a3191`); `a9987fa` (PM15-5b) since 09:49Z; PM15-5c below.**
+`a9987fa` PM15-5b, `a391129` PM15-5c, `cc6900b` PM15-6b, `ef8b22c` PM15-5d,
+PM15-6c (this entry's last section).
+**Deployed PAPER 2026-10-17 09:22Z (`03a3191`); `a9987fa` (PM15-5b) since 09:49Z; `ef8b22c` (PM15-5d) since 11:41Z.**
 
 | id | ruling (operator, 2026-10-17) |
 |---|---|
@@ -17008,8 +17009,10 @@ and 39 (the P0 pre-registration, sha256 `d06d0038…488e`, registered
 ### Live is refused today — three switches
 
 1. `exec.toml` has no `[exec.slot.9]`: slot 9 is paper.
-2. `LIVE_ARM_VENUES` has no Polymarket: a live slot 9 refuses the boot
-   until PM15-6c adds the arm.
+2. `--arm-live` must name 9 as well (LAW E-1's second switch), and slot 9
+   is live on exactly `["polymarket"]`: since PM15-6c `LIVE_ARM_VENUES`
+   holds Polymarket for slot 9 alone (any other slot naming it refuses
+   the boot), and the arm boots only through the venue gate below.
 3. P0 (doc 39) must read PASS, or a ruling override it, before the flip
    arms beyond the dust test; and `pm15.toml live_assets` ⊆ {btc, eth} is
    enforced by the member and again by the arm's admission (PM15-6 D-9).
@@ -17095,8 +17098,74 @@ ingress emits a leg's touch only when it changes — and a favourite at
 Live safety is unchanged by the bound: a FAK is matched by the venue at
 its own book, never above the member's limit `p − e`.
 
+### PM15-5d — a re-asserted touch is not judged by its old stamp (`ef8b22c`)
+
+5c's re-assertion carried the leg's last venue stamp, so the feed clock
+judged an unchanged touch stale exactly when it was re-asserted. The
+re-asserted touch is now stamped `venue_ms = 0` (the clock does not judge
+it); the member's own 8 s bound is the only freshness law on it. Seen
+since: in the last ~25 s of a window the favourite usually has **no ask
+at all** (its bid 0.99 / 0.999) — the remaining `skip_book` is the
+venue's book, not the feed.
+
+### PM15-6b — the arm's cores, socket-free (`cc6900b`)
+
+`exec-polymarket`'s three threads' cores, each driven by a test rig:
+
+- **`PmArm`** (the engine's `OrderDispatch` for slot 9): admission —
+  slot 9, a rolling leg, its family in `live_families` (⊆ BTC, ETH: D-9),
+  an IoC BUY at 0 < p < 1, a free row, not halted; the push is one 64 B
+  ring write. Fills only from the user channel's `trade` (E-5), each
+  trade id booked once; retirements only after the fills; a `FAILED`
+  after a booked match halts the slot.
+- **pm-gw** (`PmGateway`): one blocking request per pass — the order
+  (SENT before the POST; the retry law D-12), else recon
+  (`/data/trades?market=&after=`, paged, at most one per 2 s), else the
+  account read. An answer it cannot read is IN DOUBT (the stake held
+  until recon), never a release.
+- **pm-user** (`PmUserDriver`): the user channel, `PING` every 5 s; a
+  session lost asks recon for every open order.
+
+Alloc gate 130: the arm's submit and drain and the gateway's submit at
+0 B.
+
+### PM15-6c — the venue gate, the interlock, the composition
+
+- **The interlock:** slot 9 live on exactly `["polymarket"]`, Polymarket
+  live on slot 9 alone; `PNL_JUDGING_VENUES` gains Polymarket (the arm
+  judges its own bound).
+- **The boot** (`cli::pm15_live`), each step a refusal that aborts the
+  boot when slot 9 is armed: the pm15 member in `--strategy` and
+  `live_assets` naming a family it carries; the self-test (every pinned
+  vector, in the binary that signs); the account from `PM15_SIG_TYPE`,
+  `PM15_OWNER_KEY`, `PM15_WALLET`, `PM15_API_KEY`, `PM15_API_SECRET`,
+  `PM15_API_PASSPHRASE` (the wrapper sources them; never printed); the
+  venue gate — `GET /version` = 2, `/auth/ban-status/closed-only` false,
+  the pUSD balance readable and its CTF Exchange V2 allowance at least
+  `max(halt_on_loss, max_order)`. The per-market half of D-8 is
+  discovery's own law: a window that is neg-risk, not 0.07 / exponent 1 /
+  taker-only, or not on a 0.01 / 0.001 tick never reaches the arm.
+- **The session anchor** (`pm15-pnl-anchor.state` beside `exec.toml`):
+  the pUSD balance at the session's first boot, restored by every later
+  boot for the same owner (another owner's file refuses). The arm reads
+  the account every 30 s (one request per pass, never in a window's last
+  30 s): pUSD plus each watched token's balance; a leg unredeemed after
+  settlement is worth its cost, a settled loser 0. The E7 loss bound,
+  drift, the reject streak, the user channel's gap and recon's age halt
+  the slot through `HaltSignal`.
+- **The composition:** `SlotSplit(9, SlotSplit(3, …, bin15_gw), pm15)`,
+  `NO_SLOT` when slot 9 is not live; the discovery thread tees every
+  window spec to pm-gw's token table.
+- **`multivenue-engine pm-exec --self-test`** (offline) and
+  **`--key-check`** (online, read-only: the venue gate with no allowance
+  floor, the balance and allowance printed). Exit 0 or 78.
+- **Paper unchanged:** with slot 9 paper nothing above is built (no tee,
+  no thread, no socket).
+
 ### Open
 
-- `/state`'s pm15 section and the dashboard's slot-9 panel.
-- PM15-6b (the gateway), PM15-6c (the venue gate, the interlock, the
-  relayer redemption), PM15-7 (PolyBolt, dormant), the flip script.
+- `/state`'s pm15 section and the dashboard's slot-9 panel; the arm's and
+  pm-gw's counters on `/metrics`.
+- PM15-6d: the relayer redemption (D-10, a `WALLET` batch on a cold
+  thread), the flip script with its "FAK priced to miss" probe.
+- PM15-7 (PolyBolt, dormant).

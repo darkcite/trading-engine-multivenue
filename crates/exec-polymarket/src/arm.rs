@@ -33,6 +33,19 @@
 //! **Retirements** follow their order's fills by one poll (the HL arm's
 //! XH4f law: a router sees a fill before the retirement of its order).
 //!
+//! **The venue relationship** (PM15-6c, [`OrderDispatch::halt_signal`]):
+//! the arm keeps a ledger of the legs it bought (shares and cost) and
+//! asks pm-gw to watch each; every account read (pm-gw's, 30 s) compares
+//! the venue's CONDITIONAL balance of each leg with the ledger — the
+//! drift, legs bought in the last [`DRIFT_SETTLE_NS`] aside — and values
+//! the account: pUSD + each unredeemed leg AT COST, a leg its roll settled
+//! as lost at 0 (an unsettled win is not a gain, a settled loss is a
+//! loss). A leg whose venue balance reads 0 after its settlement has been
+//! redeemed: it leaves the ledger (its pUSD is in the balance). The first
+//! read that agrees seeds the router (`reconciled`) and sets the session
+//! anchor (unless the boot restored one). The user channel's silence is
+//! `ws_gap_ns` (pm-user stamps every frame; its `PONG` every 5 s).
+//!
 //! Zero allocation after [`PmArm::new`]; one 64 B ring write per order.
 
 use core_types::pm_roll::{pm_instance_parts, pm_rolling_of, PM_OFF_MARK, PM_ROLLING_MAX};
@@ -50,10 +63,16 @@ use core_ring::Consumer;
 use exec_gateway::{EngineEnd, HALT_NONE};
 
 use crate::amounts::usd_of;
+use clob_dispatcher::HaltSignal;
+use core_types::pm_roll::{PM_SETTLED_DOWN, PM_SETTLED_UP};
+
 use crate::cmd::{
-    PmCmd, PmEvt, CMD_RECON, CMD_SUBMIT, EVT_ACK, EVT_DONE, EVT_FILL, EVT_GAP, EVT_IN_DOUBT,
-    EVT_REFUSED, EVT_SENT, PM_CMD_RING, PM_EVT_RING, PM_USER_RING,
+    PmCmd, PmEvt, CMD_RECON, CMD_SUBMIT, CMD_WATCH, EVT_ACK, EVT_BALANCE, EVT_DONE, EVT_FILL,
+    EVT_GAP, EVT_IN_DOUBT, EVT_POSITION, EVT_READ_DONE, EVT_REFUSED, EVT_SENT, PM_CMD_RING,
+    PM_EVT_RING, PM_USER_RING,
 };
+use crate::gw::WATCH_STOP;
+use crate::user::PUB_USER_RX_NS;
 use crate::userws::{TS_CONFIRMED, TS_FAILED};
 
 /// The engine's end of the pm-gw duplex.
@@ -73,6 +92,38 @@ pub const DOUBT_RECON_NS: u64 = 2_000_000_000;
 pub const DONE_KEEP_NS: u64 = 120_000_000_000;
 /// The deadline scan's cadence, ns.
 const SCAN_EVERY_NS: u64 = 100_000_000;
+/// Legs the ledger holds (more than two windows of every family's legs).
+pub const LEDGER_LEGS: usize = 32;
+/// A leg bought this recently is left out of a read's drift (its fill and
+/// the venue's balance may straddle the read), ns.
+pub const DRIFT_SETTLE_NS: u64 = 15_000_000_000;
+
+const L_FREE: u8 = 0;
+const L_OPEN: u8 = 1;
+const L_WON: u8 = 2;
+const L_LOST: u8 = 3;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Leg {
+    shares_1e6: i64,
+    cost_1e6: i64,
+    /// The venue's shares at the current read (`-1` = not read).
+    venue_1e6: i64,
+    last_fill_ns: u64,
+    instance: u32,
+    leg: u8,
+    state: u8,
+}
+
+const EMPTY_LEG: Leg = Leg {
+    shares_1e6: 0,
+    cost_1e6: 0,
+    venue_1e6: -1,
+    last_fill_ns: 0,
+    instance: 0,
+    leg: 0,
+    state: L_FREE,
+};
 
 const R_FREE: u8 = 0;
 const R_QUEUED: u8 = 1;
@@ -135,6 +186,14 @@ pub struct ArmCounters {
     pub out_full: u64,
     /// DONE rows reused before their keep ran out.
     pub evicted_young: u64,
+    /// Account reads that agreed.
+    pub reads_agreed: u64,
+    /// Account reads that did not (a failed request or a drift).
+    pub reads_disagreed: u64,
+    /// Legs the venue redeemed (left the ledger).
+    pub legs_redeemed: u64,
+    /// Legs the ledger could not take (halts).
+    pub ledger_full: u64,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -238,6 +297,16 @@ pub struct PmArm {
     halted: bool,
     next_scan_ns: u64,
     counters: ArmCounters,
+    legs: [Leg; LEDGER_LEGS],
+    balance_1e6: i64,
+    allowance_1e6: i64,
+    read_failed: bool,
+    drift_1e6: i64,
+    reconciled: bool,
+    agreed_ns: u64,
+    anchor_1e6: Option<i64>,
+    equity_1e6: i64,
+    reject_streak: u32,
 }
 
 impl PmArm {
@@ -258,7 +327,38 @@ impl PmArm {
             halted: false,
             next_scan_ns: 0,
             counters: ArmCounters::default(),
+            legs: [EMPTY_LEG; LEDGER_LEGS],
+            balance_1e6: 0,
+            allowance_1e6: 0,
+            read_failed: false,
+            drift_1e6: 0,
+            reconciled: false,
+            agreed_ns: 0,
+            anchor_1e6: None,
+            equity_1e6: 0,
+            reject_streak: 0,
         }
+    }
+
+    /// Restore the session anchor a previous boot set (pUSD + legs at
+    /// cost, ×1e6) — boot, before the first read.
+    pub fn restore_anchor(&mut self, anchor_1e6: i64) {
+        self.anchor_1e6 = Some(anchor_1e6);
+    }
+
+    /// The session anchor (set by the first agreeing read, or restored).
+    #[inline]
+    #[must_use]
+    pub const fn anchor_1e6(&self) -> Option<i64> {
+        self.anchor_1e6
+    }
+
+    /// The account's worth at the last agreeing read (pUSD + legs at
+    /// cost, a settled loss at 0), and its pUSD balance and allowance.
+    #[inline]
+    #[must_use]
+    pub const fn worth_1e6(&self) -> (i64, i64, i64) {
+        (self.equity_1e6, self.balance_1e6, self.allowance_1e6)
     }
 
     /// The tallies.
@@ -381,8 +481,23 @@ impl PmArm {
     }
 
     fn on_gw(&mut self, ev: &PmEvt, now: u64) {
-        if ev.kind == EVT_FILL {
-            return self.on_fill(ev, now);
+        match ev.kind {
+            EVT_FILL => return self.on_fill(ev, now),
+            EVT_BALANCE => {
+                self.balance_1e6 = ev.b;
+                self.allowance_1e6 = ev.c;
+                self.read_failed = ev.why != 0;
+                self.drift_1e6 = 0;
+                let mut k = 0usize;
+                while k < LEDGER_LEGS {
+                    self.legs[k].venue_1e6 = -1;
+                    k += 1;
+                }
+                return;
+            }
+            EVT_POSITION => return self.on_position(ev),
+            EVT_READ_DONE => return self.on_read_done(now),
+            _ => {}
         }
         let Some(i) = self.find_cid(ev.a) else {
             // An event about an order the arm does not hold: pm-gw and the
@@ -400,6 +515,7 @@ impl PmArm {
             }
             EVT_ACK => {
                 self.counters.acks += 1;
+                self.reject_streak = 0;
                 let r = &mut self.rows[i];
                 r.expected = ev.b.clamp(0, i64::from(TRADES_UNKNOWN - 1)) as u16;
                 if r.state == R_SENT || r.state == R_QUEUED {
@@ -410,7 +526,10 @@ impl PmArm {
             EVT_REFUSED => {
                 self.counters.refused += 1;
                 if ev.why == crate::response::Refusal::NoMatch as u8 {
+                    // A FAK that met no ask: an outcome, not a fault.
                     self.counters.no_match += 1;
+                } else {
+                    self.reject_streak = self.reject_streak.saturating_add(1);
                 }
                 self.done(i, now, RETIRED_REJECTED);
             }
@@ -481,6 +600,8 @@ impl PmArm {
             return self.halt();
         }
         self.remember(key);
+        let (inst, sym) = (self.rows[i].instance, self.rows[i].sym);
+        self.ledger_add(inst, sym, px, qty, now);
         let r = &mut self.rows[i];
         r.filled_1e6 += qty;
         r.booked = r.booked.saturating_add(1);
@@ -577,6 +698,140 @@ impl PmArm {
         if !self.retired.push(Retired::new(cid, self.cfg.slot, why)) {
             self.counters.out_full += 1;
             self.halt();
+        }
+    }
+
+    /// Book a fill into the ledger; a new leg is watched.
+    fn ledger_add(&mut self, instance: u32, sym: SymbolId, px: i64, qty: i64, now: u64) {
+        let leg = match pm_rolling_of(sym) {
+            Some((_, off)) => (off % 2) as u8,
+            None => 0,
+        };
+        let cost = (i128::from(px) * i128::from(qty) / 1_000_000) as i64;
+        let mut free = None;
+        let mut k = 0usize;
+        while k < LEDGER_LEGS {
+            let l = &mut self.legs[k];
+            if l.state != L_FREE && l.instance == instance && l.leg == leg {
+                l.shares_1e6 += qty;
+                l.cost_1e6 += cost;
+                l.last_fill_ns = now;
+                return;
+            }
+            if l.state == L_FREE && free.is_none() {
+                free = Some(k);
+            }
+            k += 1;
+        }
+        let Some(k) = free else {
+            // Thirty-two legs unredeemed: the redemption is not running —
+            // the worth would go blind.
+            self.counters.ledger_full += 1;
+            return self.halt();
+        };
+        self.legs[k] = Leg {
+            shares_1e6: qty,
+            cost_1e6: cost,
+            venue_1e6: -1,
+            last_fill_ns: now,
+            instance,
+            leg,
+            state: L_OPEN,
+        };
+        let mut c = PmCmd::new(CMD_WATCH, 0);
+        c.instance = instance;
+        c.leg = leg;
+        if !self.end.cmd.push(&c) {
+            // The watch is the read of this leg: without it the drift is
+            // blind — fail fast.
+            self.halt();
+        }
+    }
+
+    fn on_position(&mut self, ev: &PmEvt) {
+        let instance = (ev.a >> 8) as u32;
+        let leg = (ev.a & 1) as u8;
+        let mut k = 0usize;
+        while k < LEDGER_LEGS {
+            let l = &mut self.legs[k];
+            if l.state != L_FREE && l.instance == instance && l.leg == leg {
+                if ev.why != 0 {
+                    self.read_failed = true;
+                } else {
+                    l.venue_1e6 = ev.b;
+                }
+                return;
+            }
+            k += 1;
+        }
+    }
+
+    /// The read is complete: the drift, the redemptions, the worth.
+    fn on_read_done(&mut self, now: u64) {
+        let mut drift = 0i64;
+        let mut worth = self.balance_1e6;
+        let mut complete = !self.read_failed;
+        let mut k = 0usize;
+        while k < LEDGER_LEGS {
+            let l = self.legs[k];
+            k += 1;
+            if l.state == L_FREE {
+                continue;
+            }
+            if l.venue_1e6 < 0 {
+                complete = false;
+            } else if l.state != L_OPEN && l.venue_1e6 == 0 {
+                // Settled and gone from the account: redeemed.
+                self.counters.legs_redeemed += 1;
+                self.legs[k - 1] = EMPTY_LEG;
+                let mut c = PmCmd::new(CMD_WATCH, 0);
+                c.instance = l.instance;
+                c.leg = l.leg | WATCH_STOP;
+                let _ = self.end.cmd.push(&c);
+                continue;
+            } else if now.saturating_sub(l.last_fill_ns) >= DRIFT_SETTLE_NS {
+                let d = (l.venue_1e6 - l.shares_1e6).abs();
+                // Priced at the leg's own average cost.
+                if l.shares_1e6 > 0 {
+                    drift = drift.max(
+                        (i128::from(d) * i128::from(l.cost_1e6) / i128::from(l.shares_1e6)) as i64,
+                    );
+                }
+            }
+            if l.state != L_LOST {
+                worth += l.cost_1e6;
+            }
+        }
+        self.drift_1e6 = drift;
+        if complete {
+            self.counters.reads_agreed += 1;
+            self.reconciled = true;
+            self.agreed_ns = now;
+            self.equity_1e6 = worth;
+            if self.anchor_1e6.is_none() {
+                self.anchor_1e6 = Some(worth);
+            }
+        } else {
+            self.counters.reads_disagreed += 1;
+        }
+    }
+
+    /// A settled roll: its instance's legs are won or lost (unknown: lost
+    /// — the conservative book).
+    fn on_settled(&mut self, ev: &ChannelEvent) {
+        let (inst, _, _, settled) = core_types::unpack_roll_seq(ev.venue_seq);
+        if !settled || pm_rolling_of(ev.sym).is_none() {
+            return;
+        }
+        let mut k = 0usize;
+        while k < LEDGER_LEGS {
+            let l = &mut self.legs[k];
+            if l.state == L_OPEN && l.instance == inst {
+                let won = (l.leg == 0 && ev.v0 == PM_SETTLED_UP)
+                    || (l.leg == 1 && ev.v0 == PM_SETTLED_DOWN);
+                l.state = if won { L_WON } else { L_LOST };
+            }
+            k += 1;
         }
     }
 
@@ -704,11 +959,40 @@ impl OrderDispatch for PmArm {
     }
 
     fn on_venue_event(&mut self, event: &ChannelEvent) {
-        if event.venue == VenueId::Polymarket as u8
-            && ChannelId::from_u8(event.channel) == Some(ChannelId::OutcomeMeta)
-        {
-            self.on_law(event);
+        if event.venue != VenueId::Polymarket as u8 {
+            return;
         }
+        match ChannelId::from_u8(event.channel) {
+            Some(ChannelId::OutcomeMeta) => self.on_law(event),
+            Some(ChannelId::InstrumentRoll) => self.on_settled(event),
+            _ => {}
+        }
+    }
+
+    fn halt_signal(&self) -> HaltSignal {
+        let now = core_time::now_ns();
+        let rx = self.end.stats.published(PUB_USER_RX_NS);
+        let ws_gap = if rx == 0 { 0 } else { now.saturating_sub(rx) };
+        let age = if self.agreed_ns == 0 {
+            0
+        } else {
+            now.saturating_sub(self.agreed_ns)
+        };
+        let (judged, delta) = match self.anchor_1e6 {
+            Some(a) if self.reconciled => (true, self.equity_1e6 - a),
+            _ => (false, 0),
+        };
+        HaltSignal::new(
+            ws_gap,
+            self.drift_1e6,
+            self.reject_streak,
+            0,
+            false,
+            self.reconciled,
+            age,
+        )
+        .with_pnl(judged, delta)
+        .with_gateway_halted(self.halted())
     }
 }
 

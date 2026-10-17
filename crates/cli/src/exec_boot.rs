@@ -106,10 +106,16 @@ use tracing::info;
 /// refused naming its phase), for at most ONE live slot (BX-7 as built),
 /// in the same commit as the O-BX18 side table and its reader, the
 /// `VenueLock` and `MarginRisk` producers and obligations 1–4 and 8.
+///
+/// **PM15-6c: `VenueId::Polymarket`**, for slot 9 only ([`PM15_SLOT`]) and
+/// only alone: its arm (`exec_polymarket`, `cli::pm15_live`) sends FAK
+/// BUYs on CLOB V2 from the slot's own account. The legacy Polymarket
+/// `--live` dispatcher is not this arm and never arms through it.
 pub const LIVE_ARM_VENUES: &[u8] = &[
     core_types::VenueId::Hyperliquid as u8,
     core_types::VenueId::HyperEvm as u8,
     core_types::VenueId::Binance as u8,
+    core_types::VenueId::Polymarket as u8,
 ];
 
 /// **BX6 (obligation 5)** — the venues whose live arm judges the E7
@@ -117,10 +123,19 @@ pub const LIVE_ARM_VENUES: &[u8] = &[
 /// trade has its bound judged only when BOTH can (`HaltSignal::merged`
 /// ANDs `pnl_judged` and SUMS the deltas), so a bounded slot spanning an
 /// arm outside this set would never halt on it: refused at boot.
+///
+/// PM15-6c: Polymarket — slot 9's arm judges its account's pUSD with its
+/// unredeemed legs at cost (a settled loss at 0) against the session
+/// anchor (`exec_polymarket::arm`).
 pub const PNL_JUDGING_VENUES: &[u8] = &[
     core_types::VenueId::Hyperliquid as u8,
     core_types::VenueId::Binance as u8,
+    core_types::VenueId::Polymarket as u8,
 ];
+
+/// PM15-6c: the one slot with a live Polymarket arm, `pm15` — live on
+/// `["polymarket"]` alone or not at all.
+pub const PM15_SLOT: usize = strategy_set::SLOT_PM15 as usize;
 
 /// The one slot with a live HyperEVM arm: `hyparb`. It is live on BOTH
 /// of its venues or not at all — an AMM leg without its hedge, or a
@@ -246,6 +261,12 @@ impl ExecBoot {
     #[must_use]
     pub fn hyparb_live(&self) -> bool {
         slot_in(self.live_mask, HYPEREVM_SLOT)
+    }
+
+    /// PM15-6c: is slot 9 (its own Polymarket arm) armed?
+    #[must_use]
+    pub fn pm15_live(&self) -> bool {
+        slot_in(self.live_mask, PM15_SLOT)
     }
 
     /// XMM XH4f: does slot `slot` name the gateway transport?
@@ -687,6 +708,23 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
                      live arm is slot 0's (hyparb) — refusing"
                 ));
             }
+            // PM15-6c: Polymarket is slot 9's alone, and slot 9 is live on
+            // it alone.
+            let pm = s.venues.contains(&(core_types::VenueId::Polymarket as u8));
+            if slot == PM15_SLOT && !(pm && s.venues.len() == 1) {
+                return Err(format!(
+                    "exec: slot {slot} ({slot_name}) is marked live with venues {:?}; it is live \
+                     on exactly [\"polymarket\"] or not at all (PM15-6c)",
+                    s.venues
+                ));
+            }
+            if slot != PM15_SLOT && pm {
+                return Err(format!(
+                    "exec: slot {slot} ({slot_name}) is marked live for `polymarket`, whose only \
+                     live arm is slot 9's (pm15) — refusing (the legacy `--live` dispatcher is \
+                     not an exec arm)"
+                ));
+            }
         }
 
         // A live slot needs a compiled arm for EVERY venue it names.
@@ -715,8 +753,9 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
                     return Err(format!(
                         "exec: slot {slot} ({slot_name}) is marked live for venue `{vname}`, \
                          but this binary has NO live execution arm for it (the arms compiled \
-                         in are hyperliquid, binance (USDⓈ-M, classic), and hyperevm for slot \
-                         0). Slot {slot} can only be \"paper\" or \"off\" on that venue. \
+                         in are hyperliquid, binance (USDⓈ-M, classic), hyperevm for slot 0 \
+                         and polymarket for slot 9). Slot {slot} can only be \"paper\" or \
+                         \"off\" on that venue. \
                          Refusing the boot rather than trading it on paper under a live label."
                     ));
                 }
@@ -1898,9 +1937,10 @@ mod tests {
                 core_types::VenueId::Hyperliquid as u8,
                 core_types::VenueId::HyperEvm as u8,
                 core_types::VenueId::Binance as u8,
+                core_types::VenueId::Polymarket as u8,
             ]
         );
-        assert!(b.hl_arm_needed() && !b.hyparb_live());
+        assert!(b.hl_arm_needed() && !b.hyparb_live() && !b.pm15_live());
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -2447,6 +2487,62 @@ mod tests {
         let b = resolve(Some(&p), Some("3")).unwrap().unwrap();
         assert!(!b.hyparb_live() && b.hl_arm_needed());
         assert!(resolve(Some(&p), Some("0,3")).is_err(), "--arm-live 0 on a paper slot 0");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **PM15-6c** — slot 9 is live on exactly `["polymarket"]` or not at
+    /// all, and Polymarket is slot 9's alone. Armed alone it needs no HL
+    /// arm; beside a live slot 3 both arms boot; a second venue on slot 9,
+    /// another venue in its place, or polymarket on any other slot each
+    /// refuse the boot by name.
+    #[test]
+    fn slot_9_is_live_on_polymarket_alone_and_polymarket_is_slot_9_s_alone() {
+        let d = tmp();
+        let pm15 = MINIMAL_LIVE
+            .replace("[exec.slot.3]", "[exec.slot.9]")
+            .replace("name = \"bin15\"", "name = \"pm15\"")
+            .replace("[\"hyperliquid\"]", "[\"polymarket\"]");
+        let p = write(&d, "exec.toml", &pm15);
+        let b = resolve(Some(&p), Some("9")).unwrap().unwrap();
+        assert!(b.pm15_live() && !b.hl_arm_needed() && !b.hyparb_live());
+        assert!(b.route.venue_live(core_types::VenueId::Polymarket as u8));
+        assert!(!b.route.venue_live(core_types::VenueId::Hyperliquid as u8));
+        // A second venue beside polymarket: refused.
+        let two = pm15.replace("[\"polymarket\"]", "[\"polymarket\", \"hyperliquid\"]");
+        let p = write(&d, "exec-two.toml", &two);
+        let e = resolve(Some(&p), Some("9")).unwrap_err();
+        assert!(
+            e.contains("slot 9 (pm15)") && e.contains("exactly [\"polymarket\"]"),
+            "{e}"
+        );
+        // Another venue in its place: refused the same way.
+        let hl = pm15.replace("[\"polymarket\"]", "[\"hyperliquid\"]");
+        let p = write(&d, "exec-hl.toml", &hl);
+        let e = resolve(Some(&p), Some("9")).unwrap_err();
+        assert!(e.contains("exactly [\"polymarket\"]"), "{e}");
+        // Polymarket on slot 3: refused, naming slot 9's arm.
+        let bin15_pm = MINIMAL_LIVE.replace("[\"hyperliquid\"]", "[\"polymarket\"]");
+        let p = write(&d, "exec-3pm.toml", &bin15_pm);
+        let e = resolve(Some(&p), Some("3")).unwrap_err();
+        assert!(
+            e.contains("slot 3 (bin15)") && e.contains("slot 9's (pm15)"),
+            "{e}"
+        );
+        // With slot 3 live too: both arms.
+        let both = format!("{pm15}{}", MINIMAL_LIVE.replace("[exec]\n", ""));
+        let p = write(&d, "exec-both.toml", &both);
+        let b = resolve(Some(&p), Some("3,9")).unwrap().unwrap();
+        assert!(b.pm15_live() && b.slot_live(3) && b.hl_arm_needed());
+        // The two switches still have to agree.
+        assert!(
+            resolve(Some(&p), Some("3")).is_err(),
+            "slot 9 live without --arm-live 9"
+        );
+        // Paper arms nothing.
+        let paper = pm15.replace("mode = \"live\"", "mode = \"paper\"");
+        let p = write(&d, "exec-paper.toml", &paper);
+        let b = resolve(Some(&p), None).unwrap().unwrap();
+        assert!(!b.any_live() && !b.pm15_live());
         std::fs::remove_dir_all(&d).ok();
     }
 

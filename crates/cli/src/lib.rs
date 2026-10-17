@@ -65,6 +65,7 @@ pub mod har_writer;
 /// MAINNET, the operator's to run (ruling O-H90-3).
 pub mod hl_outcome_probe;
 pub mod pm15_boot;
+pub mod pm15_live;
 pub mod pm15_probe;
 /// HYPARB H5: `hyparb.toml` → the slot-0 member's params.
 pub mod hyparb_boot;

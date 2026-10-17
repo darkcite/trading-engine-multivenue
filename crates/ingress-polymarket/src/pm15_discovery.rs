@@ -76,6 +76,9 @@ pub struct Pm15Discovery {
     retry_win: [[u32; MEMO]; PM_ROLLING_MAX],
     retry_at: [[u64; MEMO]; PM_ROLLING_MAX],
     target: [u8; 96],
+    /// PM15-6c: slot 9's arm's gateway, when it is live — every window
+    /// handed to the ingress is handed to it too (its token table).
+    tee: Option<Producer<PmWindowSpec, PM15_SPEC_RING>>,
 }
 
 impl Pm15Discovery {
@@ -108,6 +111,7 @@ impl Pm15Discovery {
             retry_win: [[0; MEMO]; PM_ROLLING_MAX],
             retry_at: [[0; MEMO]; PM_ROLLING_MAX],
             target: [0; 96],
+            tee: None,
         };
         let mut f = 0usize;
         while f < assets.len() {
@@ -156,6 +160,11 @@ impl Pm15Discovery {
         parse_window_spec(body, f, asset, window, out).map_err(FetchErr::Law)
     }
 
+    /// PM15-6c: hand every window to `tee` too (slot 9's gateway). Boot.
+    pub fn set_tee(&mut self, tee: Producer<PmWindowSpec, PM15_SPEC_RING>) {
+        self.tee = Some(tee);
+    }
+
     /// One pass at wall time `wall_ns` (engine clock `now`): look up every
     /// window not yet handed over and hand over what passes.
     pub fn pass(
@@ -189,6 +198,13 @@ impl Pm15Discovery {
                         if prod.try_push_ref(&spec) {
                             self.found[f][cell] = w;
                             counters.inc(Pm15Counter::DiscoveryOk);
+                            if let Some(t) = &mut self.tee {
+                                if !t.try_push_ref(&spec) {
+                                    // The gateway refuses that window's
+                                    // orders unsent (no token): counted.
+                                    counters.inc(Pm15Counter::DiscoveryTeeFull);
+                                }
+                            }
                         } else {
                             counters.inc(Pm15Counter::DiscoveryRingFull);
                         }

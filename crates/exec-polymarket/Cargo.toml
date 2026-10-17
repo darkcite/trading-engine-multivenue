@@ -25,6 +25,8 @@ core-time     = { workspace = true }
 exec-gateway  = { workspace = true }
 # PM15-6b: PmWindowSpec (the token table's input) and Pm15Wire.
 ingress-polymarket = { workspace = true }
+# PM15-6c: pm-user's poll over the user channel's socket.
+mio           = { workspace = true }
 # The SHA-256 / HMAC / base64 the L2 auth needs (dependency-free).
 core-crypto   = { workspace = true }
 # The in-place JSON scanners (find_field, skip_string, scan_price_1e6).

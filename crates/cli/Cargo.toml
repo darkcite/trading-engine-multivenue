@@ -67,6 +67,10 @@ exec-hyperliquid     = { workspace = true }
 # HC9 (O-HC19): the Hypercall order arm, driven by the `hypercall-live`
 # operator verbs (the engine does not arm it before slot 7's ruling).
 exec-hypercall       = { workspace = true }
+# PM15-6c: slot 9's Polymarket arm (PmArm, pm-gw, pm-user) and the
+# engine ⇄ pm-gw duplex.
+exec-polymarket      = { workspace = true }
+exec-gateway         = { workspace = true }
 # HYPARB H8: the HyperEVM write path, TESTNET ONLY (O-H5) — the shadow of
 # each paper AMM decision (O-H12) and the `evm-testnet` operator verbs.
 exec-hyperevm        = { workspace = true }
@@ -111,8 +115,8 @@ exec-hyperevm        = { workspace = true, features = ["testnode"] }
 exec-hyperliquid     = { workspace = true, features = ["loopback", "testvenue"] }
 # BX3: the scripted venue's self-signed certificate.
 rcgen                = { workspace = true }
-# XMM XH4f: the sweep word the composition test's scripted gateway end sets.
-exec-gateway         = { workspace = true }
+# (XMM XH4f's sweep word for the composition test: exec-gateway is a
+# [dependencies] entry since PM15-6c.)
 # core-crypto moved to [dependencies] with the 8h backtest harness —
 # ruleset_engine_wiring keeps hashing artifacts through it unchanged.
 # backtest_harness merge ordering proptests (8h design §12).
