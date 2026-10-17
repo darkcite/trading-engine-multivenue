@@ -146,7 +146,21 @@ const RT_PRE: &[&str] = &[
 ];
 
 /// D-rt (D053, D054): `k` counts the bar's updates where `h != close` (gaps off) or `na(h)` (gaps
-/// on); the relation is read on rows with `rt = 1`, `done = 1` (`pin:06-c-rt-window`).
+/// on) — a tick count, bookkeeping only (`pin:06-distil-tick-columns`); the relation columns are
+/// read on rows with `rt = 1`, `done = 1` (`pin:06-c-rt-window`).
+///
+/// `pin:06-d053-relation` (R-P3) — TradingView's `k` took 13 distinct values over 16 bars, so D053
+/// states: `eqc` = on a 1-minute bar that closes a 5-minute bar (`time % 300000 == 240000`), the
+/// 5-minute value equals `close` on the bar's last (confirming) update, 1 on every other bar;
+/// `dev` = on a bar that does not close a 5-minute bar, some update saw the 5-minute value equal
+/// `close` (the developing HTF bar, U12), 1 on a closing bar.
+///
+/// `pin:06-d054-relation` (R-P3) — TradingView's `k` was 0 on some bars and the update count on
+/// the rest, so D054 states: `uni` = `na(h)` reads the same on every update of the bar (`k` is 0 or
+/// `upd`); `one` = on the bar that closes a 5-minute period whose first bar was realtime, exactly
+/// one 1-minute bar of the period ended with a non-`na` value (counted by a `var`, so each bar
+/// contributes its last update), 1 on every other bar. Neither names which bar of the period
+/// carries the value: the capture decides nothing the relation does not state.
 fn rt(n: u16, gaps_on: bool) -> Row {
     let mut b: Vec<String> = RT_PRE.iter().map(|s| s.to_string()).collect();
     let extra = if gaps_on {
@@ -155,12 +169,50 @@ fn rt(n: u16, gaps_on: bool) -> Row {
         ""
     };
     b.push(format!("h@ = {}", sec("5", "close", extra)));
-    b.push(if gaps_on {
-        "k@ += na(h@) ? 1 : 0".to_string()
+    let s = |x: &[&str]| x.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+    let rel: Vec<(String, String, Tol)> = if gaps_on {
+        b.extend(s(&[
+            "k@ += na(h@) ? 1 : 0",
+            "var int nb@ = 0",
+            "var bool full@ = false",
+            "if time % 300000 == 0",
+            ">nb@ := 0",
+            ">full@ := barstate.isrealtime",
+            "if not na(h@)",
+            ">nb@ += 1",
+        ]));
+        vec![
+            (
+                "k@ == 0 or k@ == upd@ ? 1 : 0".to_string(),
+                "uni".to_string(),
+                Tol::Exact,
+            ),
+            (
+                "time % 300000 == 240000 and full@ ? (nb@ == 1 ? 1 : 0) : 1".to_string(),
+                "one".to_string(),
+                Tol::Exact,
+            ),
+        ]
     } else {
-        "k@ += h@ != close ? 1 : 0".to_string()
-    });
-    let plots = vec![
+        b.extend(s(&[
+            "k@ += h@ != close ? 1 : 0",
+            "varip int sn@ = 0",
+            "if upd@ == 1",
+            ">sn@ := 0",
+            "if h@ == close",
+            ">sn@ := 1",
+            "c5@ = time % 300000 == 240000",
+        ]));
+        vec![
+            (
+                "c5@ ? (h@ == close ? 1 : 0) : 1".to_string(),
+                "eqc".to_string(),
+                Tol::Exact,
+            ),
+            ("c5@ ? 1 : sn@".to_string(), "dev".to_string(), Tol::Exact),
+        ]
+    };
+    let mut plots = vec![
         (
             "barstate.isrealtime ? 1 : 0".to_string(),
             "rt".to_string(),
@@ -169,10 +221,11 @@ fn rt(n: u16, gaps_on: bool) -> Row {
         ("done@".to_string(), "done".to_string(), Tol::Exact),
         ("k@".to_string(), "k".to_string(), Tol::Exact),
     ];
+    plots.extend(rel);
     let title = if gaps_on {
-        "updates where the 5-minute value is na, gaps on"
+        "the 5-minute value with gaps on, tick-independent"
     } else {
-        "updates where the 5-minute value differs from close"
+        "the 5-minute value against close, tick-independent"
     };
     let mut r = row(n, title, b, plots);
     r.pins.push("pin:U12-lookahead-off-realtime");

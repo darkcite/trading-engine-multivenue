@@ -20,3 +20,6 @@ tier	1
 plot	f_F007_isna	exact
 plot	f_F007_val	exact
 pending
+reading	refuse_literal
+refuse	3007
+end

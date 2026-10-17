@@ -2778,7 +2778,15 @@ const fn build() -> Built {
     // selection, `coll::order`) and the int moments (`pin:04-array-int-stats-provisional`).
     {
         use crate::coll::order as co;
-        let rows: [(OverloadId, BuiltinFn); 11] = [
+        // r27 (R-P5): `percentrank` and `covariance` (`pin:04-array-percentrank`,
+        // `pin:04-array-covariance-pairs`, `pin:04-array-covariance-sizes`).
+        let rows: [(OverloadId, BuiltinFn); 17] = [
+            (ov::ARRAY_PERCENTRANK_F, co::bi_array_percentrank),
+            (ov::ARRAY_PERCENTRANK_I, co::bi_array_percentrank),
+            (ov::ARRAY_COVARIANCE_AFAF, co::bi_array_covariance),
+            (ov::ARRAY_COVARIANCE_AFAI, co::bi_array_covariance),
+            (ov::ARRAY_COVARIANCE_AIAF, co::bi_array_covariance),
+            (ov::ARRAY_COVARIANCE_AIAI, co::bi_array_covariance),
             (ov::ARRAY_MEDIAN_F, co::bi_array_median),
             (ov::ARRAY_MEDIAN_I, co::bi_array_median),
             (ov::ARRAY_MODE_F, co::bi_array_mode),

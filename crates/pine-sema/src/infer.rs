@@ -1437,6 +1437,19 @@ impl<'a, 's> Infer<'a, 's> {
         let num = |t: Ty| matches!(t, Ty::Int | Ty::Float);
         let (lt, rt) = (l.t.ty, r.t.ty);
         let same = (l.t.ty, l.t.a, l.t.b) == (r.t.ty, r.t.a, r.t.b);
+        // pin:02-div-zero-literal — R-P2 (F007): TradingView refuses a `/` whose divisor is a
+        // `const` that folds to zero at compile time ("Division by zero"), whatever the
+        // dividend; `/=` is the same operator. `%` by a constant zero is not refused (F010,
+        // captured: `syn % 0.0` runs and reads `na`), nor is a divisor of any weaker qualifier
+        // (an `input` keeps its folded default but is not constant).
+        if op == BinOp::Div
+            && num(lt)
+            && num(rt)
+            && r.t.qual == Qual::Const
+            && num_k(r.k) == Some(0.0)
+        {
+            return self.refuse(ReasonCode::TypeMismatch, at, "Division by zero".to_owned());
+        }
         let out = match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
                 if num(lt) && num(rt) =>
@@ -1796,6 +1809,26 @@ impl<'a, 's> Infer<'a, 's> {
                 if ov.abi == pine_spec::Abi::Folded && ov.input.is_none() && !top {
                     let msg = format!("`{full}` must be a top-level statement of the script");
                     return self.refuse(ReasonCode::QualifierTooWeak, at, msg);
+                }
+                // pin:02-negative-qty-scope — R-P2 (E056): TradingView refuses a `const` `qty`
+                // below zero at compile ("The "strategy.entry()" function cannot have a negative
+                // "qty" value. Use a positive value in the function call."). Captured for
+                // `strategy.entry`; `strategy.order` (the other order-opening call, same `qty`
+                // doc) reads the same. `strategy.exit` / `strategy.close` are not refused until
+                // a capture shows it (a false refusal would lose a script TradingView runs).
+                if full == "strategy.entry" || full == "strategy.order" {
+                    let ps = pine_spec::params(ov);
+                    for (k, a) in argv.iter().enumerate() {
+                        let Some(r) = p.bound[k] else { continue };
+                        let neg = num_k(a.k).is_some_and(|q| q < 0.0);
+                        if ps[r as usize].name.as_str() == "qty" && a.t.qual == Qual::Const && neg {
+                            let msg = format!(
+                                "The \"{full}()\" function cannot have a negative \"qty\" value. \
+                                 Use a positive value in the function call."
+                            );
+                            return self.refuse(ReasonCode::TypeMismatch, at, msg);
+                        }
+                    }
                 }
                 if let Some(d) = overload::unserved(p.ov, at) {
                     self.diags.push(d);

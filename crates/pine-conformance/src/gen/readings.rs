@@ -15,6 +15,64 @@
 /// `na`.
 pub const NA: f64 = f64::NAN;
 
+/// `pin:06-r-p2-refuse-code` — the code F007 (a literal `/ 0.0`) and E056 (a negative `qty`
+/// literal) are refused with. No `DiagCode` names either refusal yet (contract §3.3 lists none,
+/// no CAR assigns one); impl-02 §3.4 row 7 (`TypeMismatch`, `3007`) is the class the spec gives
+/// constant-value domain refusals ("a non-positive constant window length or `for` step, a
+/// negative constant history offset, … a negative `pyramiding`"), so both read `3007` until pine-sema
+/// assigns a dedicated code — then this constant (one line) follows it.
+pub const R_P2_REFUSE: pine_ir::DiagCode = pine_ir::DiagCode(3007);
+
+/// TradingView's v5 order cap (migration guide, *Excess orders are trimmed*: "when a strategy
+/// creates more than 9000 orders, it raises a runtime error"; capture: RE10138 "Maximum number of
+/// orders (9000) was reached.").
+pub const V5_ORDER_LIMIT: i64 = 9000;
+
+/// E110's fault row, computed from its script (`pin:06-e110-fault-row`): `t` flips every step and
+/// each step places exactly one order (step `2j` `strategy.entry`, step `2j + 1` `strategy.close`
+/// of the position the previous order opened), so order `n` is created on step `n − 1` and the
+/// `V5_ORDER_LIMIT + 1`-th — the first past the cap — on step `V5_ORDER_LIMIT`; the
+/// `V5_ORDER_LIMIT`-th order also fills at that step's open (`process_orders_on_close = false`).
+/// Both readings of "where the cap bites" name the same row.
+pub const fn e110_fault_row() -> i64 {
+    V5_ORDER_LIMIT
+}
+
+/// R-P2 (operator ruling 2026-10-17): the five escalated fixtures adopt TradingView's captured
+/// behaviour (vault `capture-texts.md`). Each gets one reading the lead's re-paste
+/// (`pine-conf distil --paste`) records:
+///
+/// | id | reading | body | TradingView |
+/// |---|---|---|---|
+/// | F007 | `refuse_literal` | `refuse 3007` ([`R_P2_REFUSE`]) | compile error "Division by zero" |
+/// | E056 | `refuse_literal` | `refuse 3007` | compile error "… cannot have a negative "qty" value …" |
+/// | C029 | `runtime_fault` | `fault ScriptRefused 0` | "Error on bar 0: Cannot access the … field of an undefined object" |
+/// | F085 | `runtime_fault` | `fault ScriptRefused 0` | "Error on bar 0: 'step' in loop must be greater than zero." |
+/// | E110 | `runtime_fault` | `fault ScriptRefused 9000` ([`e110_fault_row`]) | RE10138 "Maximum number of orders (9000) was reached." |
+///
+/// `ScriptRefused` is contract §3.11's kind for "something Pine itself rejects at runtime" (its doc
+/// names "a field of an `na` object"); impl-06 §4.2.5 already records E110 as `fault ScriptRefused
+/// 9000`. Any other id: no reading.
+pub fn escalated(id: &str) -> Vec<crate::fixture::Reading> {
+    use crate::fixture::{Reading, ReadingBody};
+    use pine_ir::FaultKind;
+    let refuse = || ReadingBody::Refuse(R_P2_REFUSE);
+    let fault = |row: i64| ReadingBody::Fault {
+        kind: FaultKind::ScriptRefused,
+        row,
+    };
+    let (name, body) = match id {
+        "F007" | "E056" => ("refuse_literal", refuse()),
+        "C029" | "F085" => ("runtime_fault", fault(0)),
+        "E110" => ("runtime_fault", fault(e110_fault_row())),
+        _ => return Vec::new(),
+    };
+    vec![Reading {
+        name: name.to_string(),
+        body,
+    }]
+}
+
 fn hist(x: &[f64], i: usize, k: usize) -> f64 {
     if k <= i {
         x[i - k]

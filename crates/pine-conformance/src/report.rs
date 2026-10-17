@@ -62,7 +62,7 @@ impl Divergence {
 // --------------------------------------------------------------------------------------------
 
 use crate::cmp::{compare_cell_fmt, format_sig, Cmp};
-use crate::fixture::{Cell, Dialects, Expect, Fixture, Row, Stamp, Tol};
+use crate::fixture::{Cell, Dialects, Expect, Fixture, Group, Row, Stamp, Tol};
 use crate::run::RunOutcome;
 use crate::sig::{actual_at, kind_name, matching_reading, Kind};
 use crate::triage::{bucket_name, owner_name, Bucket, Triage};
@@ -341,4 +341,245 @@ pub fn render_with(
         out.push_str("  note      : reclassify in the generator table.\n");
     }
     out
+}
+
+// --------------------------------------------------------------------------------------------
+// The TradingView divergence report (R-P1, `pine-conf report --tv`). Compare-time code.
+// --------------------------------------------------------------------------------------------
+
+use crate::triage::{crate_name, tv_class_name, Crate, TvClass, TvTriage};
+
+const TV_CLASSES: [TvClass; 5] = [
+    TvClass::Pass,
+    TvClass::Differ,
+    TvClass::RefusedByUs,
+    TvClass::FaultByUs,
+    TvClass::HarnessGap,
+];
+
+/// `(pass, differ, refused-by-us, fault-by-us, harness-gap)` over `rows`.
+pub fn tv_counts(rows: &[(&Fixture, TvTriage)]) -> [usize; 5] {
+    let mut c = [0usize; 5];
+    for (_, t) in rows {
+        c[TV_CLASSES
+            .iter()
+            .position(|x| *x == t.class)
+            .expect("five classes")] += 1;
+    }
+    c
+}
+
+/// The clusters of the non-pass rows, largest first: `(cluster, crate, ids)`.
+pub fn tv_clusters<'a>(rows: &'a [(&'a Fixture, TvTriage)]) -> Vec<(String, Crate, Vec<&'a str>)> {
+    let mut out: Vec<(String, Crate, Vec<&str>)> = Vec::new();
+    for (f, t) in rows.iter().filter(|(_, t)| t.class != TvClass::Pass) {
+        match out.iter_mut().find(|(k, _, _)| *k == t.cluster) {
+            Some((_, _, ids)) => ids.push(f.id.as_str()),
+            None => out.push((t.cluster.clone(), t.krate, vec![f.id.as_str()])),
+        }
+    }
+    out.sort_by(|a, b| b.2.len().cmp(&a.2.len()).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+fn md_cell(s: &str) -> String {
+    s.replace('|', "\\|")
+}
+
+fn ids_text(ids: &[&str], max: usize) -> String {
+    let mut s = ids.iter().take(max).copied().collect::<Vec<_>>().join(" ");
+    if ids.len() > max {
+        s.push_str(&format!(" … (+{})", ids.len() - max));
+    }
+    s
+}
+
+/// The divergence report (Markdown): totals per group, the clusters, every non-pass by crate and
+/// by pin with its first difference, the pass list. `context` lines print under the title.
+pub fn render_tv(title: &str, context: &[String], rows: &[(&Fixture, TvTriage)]) -> String {
+    let mut o = String::new();
+    o.push_str(&format!("# {title}\n\n"));
+    for l in context {
+        o.push_str(&format!("- {l}\n"));
+    }
+    let c = tv_counts(rows);
+    o.push_str(&format!(
+        "\n**{} fixtures: pass {} · differ {} · refused-by-us {} · fault-by-us {} · harness-gap {}**\n",
+        rows.len(),
+        c[0],
+        c[1],
+        c[2],
+        c[3],
+        c[4]
+    ));
+    o.push_str("\n## Totals per group\n\n| group | ran | pass | differ | refused-by-us | fault-by-us | harness-gap |\n|---|---|---|---|---|---|---|\n");
+    for g in [
+        Group::A,
+        Group::B,
+        Group::C,
+        Group::D,
+        Group::E,
+        Group::F,
+        Group::Z,
+    ] {
+        let sub: Vec<(&Fixture, TvTriage)> = rows
+            .iter()
+            .filter(|(f, _)| f.id.group() == g)
+            .map(|(f, t)| (*f, t.clone()))
+            .collect();
+        if sub.is_empty() {
+            continue;
+        }
+        let k = tv_counts(&sub);
+        o.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            g.letter(),
+            sub.len(),
+            k[0],
+            k[1],
+            k[2],
+            k[3],
+            k[4]
+        ));
+    }
+    o.push_str(&format!(
+        "| **all** | {} | {} | {} | {} | {} | {} |\n",
+        rows.len(),
+        c[0],
+        c[1],
+        c[2],
+        c[3],
+        c[4]
+    ));
+    // Per crate totals.
+    o.push_str("\n## Non-pass per probable crate\n\n| crate | differ | refused-by-us | fault-by-us | harness-gap |\n|---|---|---|---|---|\n");
+    for k in [
+        Crate::Lang,
+        Crate::Sema,
+        Crate::Std,
+        Crate::Vm,
+        Crate::Broker,
+        Crate::Harness,
+    ] {
+        let n = |cl: TvClass| {
+            rows.iter()
+                .filter(|(_, t)| t.krate == k && t.class == cl)
+                .count()
+        };
+        let row = [
+            n(TvClass::Differ),
+            n(TvClass::RefusedByUs),
+            n(TvClass::FaultByUs),
+            n(TvClass::HarnessGap),
+        ];
+        if row.iter().sum::<usize>() > 0 {
+            o.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                crate_name(k),
+                row[0],
+                row[1],
+                row[2],
+                row[3]
+            ));
+        }
+    }
+    let clusters = tv_clusters(rows);
+    o.push_str("\n## Clusters (largest first)\n\n| # | n | crate | cluster | fixtures |\n|---|---|---|---|---|\n");
+    for (i, (k, cr, ids)) in clusters.iter().enumerate() {
+        o.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            i + 1,
+            ids.len(),
+            crate_name(*cr),
+            md_cell(k),
+            ids_text(ids, 12)
+        ));
+    }
+    o.push_str("\n## Every non-pass by crate (first difference)\n");
+    for k in [
+        Crate::Lang,
+        Crate::Sema,
+        Crate::Std,
+        Crate::Vm,
+        Crate::Broker,
+        Crate::Harness,
+    ] {
+        let sub: Vec<&(&Fixture, TvTriage)> = rows
+            .iter()
+            .filter(|(_, t)| t.class != TvClass::Pass && t.krate == k)
+            .collect();
+        if sub.is_empty() {
+            continue;
+        }
+        o.push_str(&format!(
+            "\n### {} ({})\n\n| id | class | pins | first difference | note |\n|---|---|---|---|---|\n",
+            crate_name(k),
+            sub.len()
+        ));
+        for (f, t) in sub {
+            o.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                f.id.as_str(),
+                tv_class_name(t.class),
+                md_cell(&f.pins.join(" ")),
+                md_cell(&t.first),
+                md_cell(t.note.as_deref().unwrap_or(""))
+            ));
+        }
+    }
+    // By pin.
+    let mut pins: Vec<&str> = rows
+        .iter()
+        .filter(|(_, t)| t.class != TvClass::Pass)
+        .flat_map(|(f, _)| f.pins.iter().map(String::as_str))
+        .collect();
+    pins.sort_unstable();
+    pins.dedup();
+    o.push_str("\n## Every non-pass by pin\n\n| pin | fixtures (class, crate) |\n|---|---|\n");
+    for p in pins {
+        let list: Vec<String> = rows
+            .iter()
+            .filter(|(f, t)| t.class != TvClass::Pass && f.pins.iter().any(|x| x == p))
+            .map(|(f, t)| {
+                format!(
+                    "{} ({}, {})",
+                    f.id.as_str(),
+                    tv_class_name(t.class),
+                    crate_name(t.krate)
+                )
+            })
+            .collect();
+        o.push_str(&format!("| {} | {} |\n", md_cell(p), list.join(" · ")));
+    }
+    let unpinned: Vec<&str> = rows
+        .iter()
+        .filter(|(f, t)| t.class != TvClass::Pass && f.pins.is_empty())
+        .map(|(f, _)| f.id.as_str())
+        .collect();
+    o.push_str(&format!(
+        "| (no pin) | {} fixtures (see the crate tables) |\n",
+        unpinned.len()
+    ));
+    let pass: Vec<&str> = rows
+        .iter()
+        .filter(|(_, t)| t.class == TvClass::Pass)
+        .map(|(f, _)| f.id.as_str())
+        .collect();
+    o.push_str(&format!(
+        "\n## Pass ({})\n\n{}\n",
+        pass.len(),
+        pass.join(" ")
+    ));
+    let noted: Vec<String> = rows
+        .iter()
+        .filter(|(_, t)| t.class == TvClass::Pass && t.note.is_some())
+        .map(|(f, t)| format!("{}: {}", f.id.as_str(), t.note.as_deref().unwrap_or("")))
+        .collect();
+    if !noted.is_empty() {
+        o.push_str("\nPass notes:\n\n");
+        for n in noted {
+            o.push_str(&format!("- {n}\n"));
+        }
+    }
+    o
 }

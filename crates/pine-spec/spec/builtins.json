@@ -1539,14 +1539,14 @@
             },
             {
               "name": "val",
-              "ty": "T",
+              "ty": "V",
               "qual": "series",
               "flags": [],
               "default": null
             },
             {
               "name": "sort_field",
-              "ty": "int",
+              "ty": "K",
               "qual": "const",
               "flags": [
                 "optional"
@@ -1575,8 +1575,15 @@
           "input": null,
           "tv": {
             "T": [
-              "float",
+              "udt"
+            ],
+            "K": [
               "int",
+              "string"
+            ],
+            "V": [
+              "int",
+              "float",
               "string"
             ]
           }
@@ -1686,14 +1693,14 @@
             },
             {
               "name": "val",
-              "ty": "T",
+              "ty": "V",
               "qual": "series",
               "flags": [],
               "default": null
             },
             {
               "name": "sort_field",
-              "ty": "int",
+              "ty": "K",
               "qual": "const",
               "flags": [
                 "optional"
@@ -1722,8 +1729,15 @@
           "input": null,
           "tv": {
             "T": [
-              "float",
+              "udt"
+            ],
+            "K": [
               "int",
+              "string"
+            ],
+            "V": [
+              "int",
+              "float",
               "string"
             ]
           }
@@ -1833,14 +1847,14 @@
             },
             {
               "name": "val",
-              "ty": "T",
+              "ty": "V",
               "qual": "series",
               "flags": [],
               "default": null
             },
             {
               "name": "sort_field",
-              "ty": "int",
+              "ty": "K",
               "qual": "const",
               "flags": [
                 "optional"
@@ -1869,8 +1883,15 @@
           "input": null,
           "tv": {
             "T": [
-              "float",
+              "udt"
+            ],
+            "K": [
               "int",
+              "string"
+            ],
+            "V": [
+              "int",
+              "float",
               "string"
             ]
           }
@@ -5545,7 +5566,7 @@
             },
             {
               "name": "sort_field",
-              "ty": "int",
+              "ty": "K",
               "qual": "const",
               "flags": [
                 "optional"
@@ -5581,6 +5602,10 @@
               "string",
               "enum",
               "udt"
+            ],
+            "K": [
+              "int",
+              "string"
             ]
           }
         }
@@ -5876,7 +5901,7 @@
             },
             {
               "name": "sort_field",
-              "ty": "int",
+              "ty": "K",
               "qual": "const",
               "flags": [
                 "optional"
@@ -5915,6 +5940,10 @@
               "string",
               "enum",
               "udt"
+            ],
+            "K": [
+              "int",
+              "string"
             ]
           }
         }

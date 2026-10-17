@@ -216,3 +216,43 @@ fn screen_rows_do_not_depend_on_k_or_grouping_eleven() {
     split.extend(run(&refs[8..11], &mut ws));
     assert_eq!(split, singles, "K = 4 + 4 + 3 (one reused Workspace)");
 }
+
+/// R-P5 (2026-10-17): `SCREEN_LIMITS` activates tier 3, so `pvm7_grid_array` — the Tier-3 smoke of
+/// impl-07 §4.0 — compiles and screens without a fault; under the former mask (`0b0011`) sema
+/// refuses it as a deferred builtin.
+#[test]
+fn grid_array_screens_under_tier3() {
+    assert_eq!(pine_screen::SCREEN_LIMITS.active_tiers, 0b0111);
+    let src = read("pvm7_grid_array.pine");
+    let t = compile(&src).unwrap_or_else(|e| panic!("tier 3 active: {e:?}"));
+    assert_eq!(t.mode(), ExecMode::Realtime);
+    let b = bars_of(&sine_closes(2_000));
+    let mut ws = Workspace::new();
+    let o = run_trial(&t, &b, &cfg(40, 80), &mut ws).expect("ScreenErr (ours)");
+    assert!(
+        !matches!(o.status, TrialStatus::Faulted(_) | TrialStatus::Refused(_)),
+        "{:?}",
+        o.status
+    );
+    let tm: Vec<(String, String)> = Vec::new();
+    let old = pine_screen::TrialSpec {
+        source: &src,
+        symbol_key: CHART_KEY,
+        chart: chart(),
+        syminfo_strs: ["BTCUSDT", "BTC", "USDT", "crypto"],
+        inputs: &[],
+        ticker_map: &tm,
+        limits: pine_ir::CompileLimits {
+            active_tiers: 0b0011,
+            ..pine_screen::SCREEN_LIMITS
+        },
+    };
+    match pine_screen::compile_trial(&old, &mut pine_sema::LibCache::empty()) {
+        Err(CompileRefusal::Compile(ds)) => assert!(
+            ds.iter()
+                .any(|d| d.msg.contains("deferred-builtin ns=array")),
+            "{ds:?}"
+        ),
+        other => panic!("tiers 1–2 must refuse array.*: {:?}", other.err()),
+    }
+}

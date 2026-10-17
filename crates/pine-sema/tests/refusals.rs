@@ -181,3 +181,86 @@ fn refusal_diagnostics_are_sorted_and_deduplicated() {
         assert!(k(&w[0]) < k(&w[1]));
     }
 }
+
+/// Both dialects, bar close: the codes and the first diagnostic's message.
+fn r_p2(body: &str, d: pine_ir::Dialect, decl: &str) -> (Vec<u16>, String) {
+    let src = format!("//@version={}\n{decl}\n{body}", d as u8);
+    let r = compile_src(&src, &common::default_opts(d, pine_ir::ExecMode::BarClose));
+    let c = codes(&r);
+    let msg = r.err().and_then(|ds| ds.first().map(|x| x.msg.clone()));
+    (c, msg.unwrap_or_default())
+}
+
+/// R-P2 F007 (`pin:02-div-zero-literal`): a `/` whose divisor folds to a `const` zero is TradingView's
+/// compile error "Division by zero" (`3007`, `pin:06-r-p2-refuse-code`); `/=` too. `%` by a
+/// constant zero (F010, captured `na`), a series zero and an `input` zero still compile.
+#[test]
+fn refusal_r_p2_literal_division_by_zero_is_3007() {
+    use pine_ir::Dialect::{V5, V6};
+    let ind = "indicator(\"t\")";
+    for d in [V5, V6] {
+        for body in [
+            "x = close / 0.0\nplot(x)\n",
+            "x = close / 0\nplot(x)\n",
+            "x = 1.0 / 0.0\nplot(x)\n",
+            "x = close / (2 - 2)\nplot(x)\n",
+            "x = close / -0.0\nplot(x)\n",
+            "var float a = 1.0\na /= 0\nplot(a)\n",
+        ] {
+            let (c, msg) = r_p2(body, d, ind);
+            assert_eq!(c, vec![3007], "{d:?} {body}");
+            assert_eq!(msg, "Division by zero", "{d:?} {body}");
+        }
+        for body in [
+            "x = close % 0.0\nplot(x)\n",
+            "x = close / (close - close)\nplot(x)\n",
+            "x = close / input.float(0.0, \"d\")\nplot(x)\n",
+            "x = close / 0.5\nplot(x)\n",
+        ] {
+            let (c, _) = r_p2(body, d, ind);
+            assert!(common::passes(&c), "{d:?} {body}: {c:?}");
+        }
+    }
+}
+
+/// R-P2 E056 (`pin:02-negative-qty-scope`): a `const` negative `qty` of `strategy.entry` /
+/// `strategy.order` is TradingView's compile error (`3007`, its text); `0`, a positive, an
+/// `input` and `strategy.close`'s `qty` still compile.
+#[test]
+fn refusal_r_p2_negative_qty_literal_is_3007() {
+    use pine_ir::Dialect::{V5, V6};
+    let st = "strategy(\"s\")";
+    for d in [V5, V6] {
+        for (body, f) in [
+            (
+                "if close > open\n    strategy.entry(\"L1\", strategy.long, qty = -1)\nplot(close)\n",
+                "strategy.entry",
+            ),
+            (
+                "strategy.entry(\"L1\", strategy.long, -2.5)\nplot(close)\n",
+                "strategy.entry",
+            ),
+            (
+                "strategy.order(\"O\", strategy.short, qty = -1)\nplot(close)\n",
+                "strategy.order",
+            ),
+        ] {
+            let (c, msg) = r_p2(body, d, st);
+            assert_eq!(c, vec![3007], "{d:?} {body}");
+            let want = format!(
+                "The \"{f}()\" function cannot have a negative \"qty\" value. Use a positive \
+                 value in the function call."
+            );
+            assert_eq!(msg, want, "{d:?} {body}");
+        }
+        for body in [
+            "strategy.entry(\"L1\", strategy.long, qty = 1)\nplot(close)\n",
+            "strategy.entry(\"L1\", strategy.long, qty = 0)\nplot(close)\n",
+            "strategy.entry(\"L1\", strategy.long, qty = input.float(-1.0, \"q\"))\nplot(close)\n",
+            "strategy.entry(\"L1\", strategy.long)\nstrategy.close(\"L1\", qty = -1)\nplot(close)\n",
+        ] {
+            let (c, _) = r_p2(body, d, st);
+            assert!(common::passes(&c), "{d:?} {body}: {c:?}");
+        }
+    }
+}

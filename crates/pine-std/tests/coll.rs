@@ -1890,3 +1890,318 @@ fn array_order_statistics_and_int_moments_match_bruteforce() {
     let r = once(&calls, Dialect::V6).unwrap();
     assert_eq!((r[k], r[k + 1], r[k + 2]), (3.0, 3.0, 4.0));
 }
+
+/// Brute force of `pin:04-array-covariance-pairs`: pairs with an na side skipped, two passes.
+fn bf_cov(xs: &[f64], ys: &[f64], biased: bool) -> f64 {
+    let p: Vec<(f64, f64)> = xs
+        .iter()
+        .zip(ys)
+        .filter(|(x, y)| !x.is_nan() && !y.is_nan())
+        .map(|(x, y)| (*x, *y))
+        .collect();
+    if p.is_empty() {
+        return f64::NAN;
+    }
+    let n = p.len() as f64;
+    let (mut sa, mut sb) = (0.0, 0.0);
+    for (x, y) in &p {
+        sa += x;
+        sb += y;
+    }
+    let (ma, mb) = (sa / n, sb / n);
+    let mut sp = 0.0;
+    for (x, y) in &p {
+        sp += (x - ma) * (y - mb);
+    }
+    sp / if biased { n } else { n - 1.0 }
+}
+
+/// Brute force of `pin:04-array-percentrank`: `100 × #(x ≤ ref) / n` over the non-na values.
+fn bf_prank(v: &[f64], k: usize, int: bool) -> f64 {
+    let r = v[k];
+    if r.is_nan() {
+        return f64::NAN;
+    }
+    let live: Vec<f64> = v.iter().copied().filter(|x| !x.is_nan()).collect();
+    let le = live.iter().filter(|x| **x <= r).count() as f64;
+    let p = 100.0 * le / live.len() as f64;
+    if int {
+        p.trunc()
+    } else {
+        p
+    }
+}
+
+/// r27 (R-P5): `array.covariance` (all four int / float pairings, biased and not) and
+/// `array.percentrank` (float, int) agree with a brute force on every bar of two growing arrays
+/// with na, duplicates and negatives, and allocate nothing after warm-up; the fault rows: an
+/// index outside `[0, size)` (negative and na included) and arrays of different sizes are
+/// `CollectionBounds`, a na reference `ScriptRefused`; one pair unbiased → na.
+#[test]
+fn array_covariance_and_percentrank_match_bruteforce() {
+    let fb = coll_block_bytes(CollKind::Array, Ty::Float, Ty::Void, 64, 16);
+    let ib = coll_block_bytes(CollKind::Array, Ty::Int, Ty::Void, 64, 16);
+    let mut a = new(ov::ARRAY_NEW_FLOAT, Ty::Float, 64, fb, vec![it(0), ft(0.0)]);
+    a.guard = Some(0);
+    let mut b = new(ov::ARRAY_NEW_INT, Ty::Int, 64, ib, vec![it(0), it(0)]);
+    b.guard = Some(0);
+    let idx = (Lane::I64, Src::Feed(3));
+    let calls = vec![
+        a,
+        b,
+        c(ov::ARRAY_PUSH, vec![o(0), (Lane::F64, Src::Feed(1))], &[]),
+        c(ov::ARRAY_PUSH, vec![o(1), (Lane::I64, Src::Feed(2))], &[]),
+        c(ov::ARRAY_COVARIANCE_AFAF, vec![o(0), o(0), it(1)], F),
+        c(ov::ARRAY_COVARIANCE_AFAI, vec![o(0), o(1), it(1)], F),
+        c(ov::ARRAY_COVARIANCE_AIAF, vec![o(1), o(0), it(0)], F),
+        c(ov::ARRAY_COVARIANCE_AIAI, vec![o(1), o(1), it(0)], F),
+        c(ov::ARRAY_PERCENTRANK_F, vec![o(0), idx], F),
+        c(ov::ARRAY_PERCENTRANK_I, vec![o(1), idx], I),
+    ];
+    let mut s = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let feed: Vec<Vec<f64>> = (0..60u64)
+        .map(|i| {
+            let r = next();
+            let x = if r % 7 == 0 {
+                f64::NAN
+            } else {
+                (((r >> 20) % 13) as f64 - 6.0) * 1.25
+            };
+            let r2 = next();
+            let y = if r2 % 6 == 0 {
+                f64::NAN
+            } else {
+                ((r2 >> 20) % 11) as f64 - 5.0
+            };
+            let k = (next() % (i + 1)) as f64;
+            vec![(i == 0) as u8 as f64, x, y, k]
+        })
+        .collect();
+    let (r, allocs) = run(&calls, &feed, Dialect::V6);
+    let r = r.unwrap();
+    assert_eq!(allocs, 0, "allocated after warm-up");
+    let (mut xs, mut ys) = (Vec::new(), Vec::new());
+    for (i, f) in feed.iter().enumerate() {
+        xs.push(f[1]);
+        ys.push(f[2]);
+        let k = f[3] as usize;
+        let want = [
+            bf_cov(&xs, &xs, true),
+            bf_cov(&xs, &ys, true),
+            bf_cov(&ys, &xs, false),
+            bf_cov(&ys, &ys, false),
+            bf_prank(&xs, k, false),
+            bf_prank(&ys, k, true),
+        ];
+        for (j, w) in want.iter().enumerate() {
+            let g = r[i][4 + j];
+            assert!(
+                (g.is_nan() && w.is_nan()) || g == *w,
+                "bar {i} col {}: {g} vs {w}",
+                4 + j
+            );
+        }
+    }
+    // Values on a fixed pair: x = [1, 2, 3, na], y = [2, 4, 7, 5] → pairs (1,2) (2,4) (3,7).
+    let arr = |id: OverloadId, t: Ty, bytes: u32, vals: &[(Lane, Src)]| {
+        let init = if t == Ty::Float { ft(0.0) } else { it(0) };
+        let mut v = vec![new(id, t, 8, bytes, vec![it(0), init])];
+        for x in vals {
+            v.push(c(ov::ARRAY_PUSH, vec![o(0), *x], &[]));
+        }
+        v
+    };
+    let fb8 = coll_block_bytes(CollKind::Array, Ty::Float, Ty::Void, 8, 16);
+    let ib8 = coll_block_bytes(CollKind::Array, Ty::Int, Ty::Void, 8, 16);
+    let mut calls = arr(
+        ov::ARRAY_NEW_FLOAT,
+        Ty::Float,
+        fb8,
+        &[ft(1.0), ft(2.0), ft(3.0), (Lane::F64, Src::Na)],
+    );
+    let base = calls.len() as u16;
+    let mut tail = arr(
+        ov::ARRAY_NEW_INT,
+        Ty::Int,
+        ib8,
+        &[it(2), it(4), it(7), it(5)],
+    );
+    for t in &mut tail {
+        for x in &mut t.ins {
+            if let (_, Src::Out(k, _)) = x {
+                *k += base;
+            }
+        }
+    }
+    calls.extend(tail);
+    let k = calls.len();
+    calls.push(c(ov::ARRAY_COVARIANCE_AFAI, vec![o(0), o(base), it(1)], F));
+    calls.push(c(ov::ARRAY_COVARIANCE_AFAI, vec![o(0), o(base), it(0)], F));
+    calls.push(c(ov::ARRAY_PERCENTRANK_I, vec![o(base), it(3)], I));
+    calls.push(c(ov::ARRAY_PERCENTRANK_F, vec![o(0), it(3)], F));
+    calls.push(c(ov::ARRAY_PERCENTRANK_F, vec![o(0), it(1)], F));
+    let r = once(&calls, Dialect::V6).unwrap();
+    // means 2 and 13/3; Σ(dx·dy) = (−1)(−7/3) + 0 + (1)(8/3) = 5.
+    assert!((r[k] - 5.0 / 3.0).abs() < 1e-12, "{}", r[k]);
+    assert!((r[k + 1] - 2.5).abs() < 1e-12, "{}", r[k + 1]);
+    // 5 is ≥ 2, 4, 5 of four → 75; an na reference → na; 2 is ≥ 1, 2 of three → 66.67.
+    assert_eq!(r[k + 2], 75.0);
+    assert!(r[k + 3].is_nan());
+    assert_eq!(r[k + 4], 100.0 * 2.0 / 3.0);
+    // Faults.
+    let three = |extra: C| {
+        let mut v = arr(
+            ov::ARRAY_NEW_FLOAT,
+            Ty::Float,
+            fb8,
+            &[ft(1.0), ft(2.0), ft(3.0)],
+        );
+        v.push(extra);
+        once(&v, Dialect::V6)
+    };
+    for (ix, why) in [(it(3), "== size"), (it(-1), "negative"), (NA_I, "na")] {
+        assert_eq!(
+            three(c(ov::ARRAY_PERCENTRANK_F, vec![o(0), ix], F)),
+            Err(FaultKind::CollectionBounds),
+            "{why}"
+        );
+    }
+    let mut sizes = arr(ov::ARRAY_NEW_FLOAT, Ty::Float, fb8, &[ft(1.0), ft(2.0)]);
+    let b2 = sizes.len() as u16;
+    sizes.push(new(
+        ov::ARRAY_NEW_FLOAT,
+        Ty::Float,
+        8,
+        fb8,
+        vec![it(3), ft(0.0)],
+    ));
+    sizes.push(c(ov::ARRAY_COVARIANCE_AFAF, vec![o(0), o(b2), it(1)], F));
+    assert_eq!(once(&sizes, Dialect::V6), Err(FaultKind::CollectionBounds));
+    assert_eq!(
+        three(c(ov::ARRAY_COVARIANCE_AFAF, vec![o(0), NA_I, it(1)], F)),
+        Err(FaultKind::ScriptRefused)
+    );
+    let mut one = arr(ov::ARRAY_NEW_FLOAT, Ty::Float, fb8, &[ft(4.0)]);
+    let k = one.len();
+    one.push(c(ov::ARRAY_COVARIANCE_AFAF, vec![o(0), o(0), it(0)], F));
+    one.push(c(ov::ARRAY_COVARIANCE_AFAF, vec![o(0), o(0), it(1)], F));
+    let r = once(&one, Dialect::V6).unwrap();
+    assert!(r[k].is_nan(), "one pair unbiased is 0/0");
+    assert_eq!(r[k + 1], 0.0);
+}
+
+/// r27 inventory: the served tier-3 core rows no test named before — `array.new<T>`,
+/// `new_color`, `from` (generic, bool, color), int `sort_indices` (both orders, na placement) and
+/// `map.clear` — values and fault rows (`new<T>` negative size `ScriptRefused`, size past `__cap`
+/// `PoolFull`), and 0 B/op over bars after the first.
+#[test]
+fn array_core_rows_new_from_sort_indices_map_clear() {
+    let ib = coll_block_bytes(CollKind::Array, Ty::Int, Ty::Void, 4, 16);
+    let fb = coll_block_bytes(CollKind::Array, Ty::Float, Ty::Void, 4, 16);
+    let red = 0x00F2_3645_i64;
+    let calls = vec![
+        // 0..=2: array.new<int>(2, 5), get(1), size.
+        new(ov::ARRAY_NEW, Ty::Int, 4, ib, vec![it(2), it(5)]),
+        c(ov::ARRAY_GET, vec![o(0), it(1)], I),
+        c(ov::ARRAY_SIZE, vec![o(0)], I),
+        // 3..=4: array.new_color(3, red), get(-1) (v6 from the end).
+        new(ov::ARRAY_NEW_COLOR, Ty::Color, 4, ib, vec![it(3), it(red)]),
+        c(ov::ARRAY_GET, vec![o(3), it(-1)], I),
+        // 5..=7: array.from(true, false, na) (bool), get(1), size.
+        new(
+            ov::ARRAY_FROM_AB,
+            Ty::Bool,
+            4,
+            ib,
+            vec![it(1), it(0), it(0)],
+        ),
+        c(ov::ARRAY_GET, vec![o(5), it(1)], I),
+        c(ov::ARRAY_SIZE, vec![o(5)], I),
+        // 8..=9: array.from(color…), get(0).
+        new(ov::ARRAY_FROM_AC, Ty::Color, 4, ib, vec![it(red), it(0)]),
+        c(ov::ARRAY_GET, vec![o(8), it(0)], I),
+        // 10..=11: array.from<float>(1.5, na, -2.0), get(2).
+        new(
+            ov::ARRAY_FROM_AT,
+            Ty::Float,
+            4,
+            fb,
+            vec![ft(1.5), ft(f64::NAN), ft(-2.0)],
+        ),
+        c(ov::ARRAY_GET, vec![o(10), it(2)], F),
+        // 12..=17: int sort_indices of [3, na, 1, 2] ascending / descending, joined.
+        new(
+            ov::ARRAY_FROM_AI,
+            Ty::Int,
+            4,
+            ib,
+            vec![it(3), NA_I, it(1), it(2)],
+        ),
+        new(
+            ov::ARRAY_SORT_INDICES_AI,
+            Ty::Int,
+            4,
+            ib,
+            vec![o(12), it(0)],
+        ),
+        c(ov::ARRAY_JOIN_AI, vec![o(13), st(",")], I),
+        c(ov::OP_EQ_STR, vec![o(14), st("2,3,0,1")], I),
+        new(
+            ov::ARRAY_SORT_INDICES_AI,
+            Ty::Int,
+            4,
+            ib,
+            vec![o(12), it(1)],
+        ),
+        c(ov::ARRAY_JOIN_AI, vec![o(16), st(",")], I),
+        c(ov::OP_EQ_STR, vec![o(17), st("1,0,3,2")], I),
+        // 19..=24: map.clear empties the map; a later put works.
+        map_new(Ty::Int, Ty::Float, 4),
+        c(ov::MAP_PUT, vec![o(19), it(1), ft(1.0)], F),
+        c(ov::MAP_PUT, vec![o(19), it(2), ft(2.0)], F),
+        c(ov::MAP_CLEAR, vec![o(19)], &[]),
+        c(ov::MAP_GET, vec![o(19), it(1)], F),
+        c(ov::MAP_SIZE, vec![o(19)], I),
+        c(ov::MAP_PUT, vec![o(19), it(2), ft(3.0)], F),
+        c(ov::MAP_GET, vec![o(19), it(2)], F),
+        c(ov::MAP_SIZE, vec![o(19)], I),
+    ];
+    let feed: Vec<Vec<f64>> = (0..4).map(|_| vec![0.0]).collect();
+    let (r, a) = run(&calls, &feed, Dialect::V6);
+    let r = r.unwrap();
+    assert_eq!(a, 0, "allocated after warm-up");
+    for row in &r {
+        assert_eq!((row[1], row[2]), (5.0, 2.0), "new<int>");
+        assert_eq!(row[4], red as f64, "new_color get(-1)");
+        assert_eq!((row[6], row[7]), (0.0, 3.0), "from bool");
+        assert_eq!(row[9], red as f64, "from color");
+        assert_eq!(row[11], -2.0, "from<float>");
+        assert_eq!(row[15], 1.0, "sort_indices ascending: na last");
+        assert_eq!(row[18], 1.0, "sort_indices descending: na first");
+        assert!(row[23].is_nan(), "cleared key is na");
+        assert_eq!(row[24], 0.0, "cleared size");
+        assert!(row[25].is_nan(), "put after clear is a new key");
+        assert_eq!((row[26], row[27]), (3.0, 1.0));
+    }
+    // Fault rows of the generic creator.
+    assert_eq!(
+        once(
+            &[new(ov::ARRAY_NEW, Ty::Int, 4, ib, vec![it(-1), it(0)])],
+            Dialect::V6
+        ),
+        Err(FaultKind::ScriptRefused)
+    );
+    assert_eq!(
+        once(
+            &[new(ov::ARRAY_NEW, Ty::Int, 4, ib, vec![it(5), it(0)])],
+            Dialect::V6
+        ),
+        Err(FaultKind::PoolFull)
+    );
+}

@@ -549,3 +549,120 @@ fn lookahead_fixtures_declare_live_refuse() {
     assert_eq!(cells[52].run.rt.unwrap().htf_mult, 5);
     assert_eq!(cells[59].oracle, Oracle::TvOnly);
 }
+
+/// R-P3: C044 / D053 / D054 are tick-independent relations (pin:06-c044-relation,
+/// pin:06-d053-relation, pin:06-d054-relation): `rt`, `done`, then bookkeeping (D's `k`), then
+/// relation columns only; every relation reading names exactly those columns; all three pending.
+#[test]
+fn rt_relation_fixtures_are_tick_independent() {
+    use pine_conformance::capture::distil::is_relation_column;
+    use pine_conformance::fixture::{Expect, ReadingBody};
+    let gen = pine_conformance::gen::generate();
+    let get = |id: &str| {
+        let f = FixtureId::parse(id).unwrap();
+        gen.iter().find(|g| g.fix.id == f).unwrap()
+    };
+    for (id, want) in [
+        (
+            "C044",
+            &[
+                "isnew",
+                "confirmed",
+                "confmono",
+                "ishistory",
+                "notlast",
+                "notrt",
+            ][..],
+        ),
+        ("D053", &["eqc", "dev"][..]),
+        ("D054", &["uni", "one"][..]),
+    ] {
+        let g = get(id);
+        assert_eq!(g.fix.expect, Expect::Pending, "{id}");
+        let rel: Vec<&str> = g
+            .fix
+            .plots
+            .iter()
+            .filter(|p| is_relation_column(g.fix.id, &p.title))
+            .map(|p| &p.title[7..])
+            .collect();
+        assert_eq!(rel, want, "{id}");
+        for r in &g.fix.readings {
+            let ReadingBody::Relation(rows) = &r.body else {
+                panic!("{id}: {} is not a relation reading", r.name)
+            };
+            let t: Vec<&str> = rows.iter().map(|(t, _)| &t[7..]).collect();
+            assert_eq!(t, want, "{id}: {}", r.name);
+        }
+        // The tick counts the old bodies compared are gone from the plots (TradingView's 1-or-2).
+        assert!(!g.pine.contains("bc_C044 +="), "{id}");
+    }
+    // U17's two readings differ only in `isnew` (A2's first-update-only vs v4's confirm step).
+    let c44 = &get("C044").fix.readings;
+    let names: Vec<&str> = c44.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["contract", "isnew_on_confirm"]);
+    assert_ne!(c44[0].body, c44[1].body);
+}
+
+/// R-P2: the escalated five carry the reading the lead's re-paste records, and stay pending.
+#[test]
+fn escalated_five_carry_r_p2_readings() {
+    use pine_conformance::fixture::{Expect, ReadingBody};
+    use pine_conformance::gen::readings::{e110_fault_row, R_P2_REFUSE};
+    use pine_ir::FaultKind;
+    let gen = pine_conformance::gen::generate();
+    let fault = |row| ReadingBody::Fault {
+        kind: FaultKind::ScriptRefused,
+        row,
+    };
+    for (id, name, body) in [
+        ("F007", "refuse_literal", ReadingBody::Refuse(R_P2_REFUSE)),
+        ("E056", "refuse_literal", ReadingBody::Refuse(R_P2_REFUSE)),
+        ("C029", "runtime_fault", fault(0)),
+        ("F085", "runtime_fault", fault(0)),
+        ("E110", "runtime_fault", fault(9000)),
+    ] {
+        let f = &gen.iter().find(|g| g.fix.id.as_str() == id).unwrap().fix;
+        assert_eq!(f.expect, Expect::Pending, "{id}");
+        let r = f.readings.iter().find(|r| r.name == name).unwrap();
+        assert_eq!(r.body, body, "{id}");
+        assert!(!f.pins.is_empty(), "{id}: readings need a pin");
+    }
+    assert_eq!(e110_fault_row(), 9000);
+    assert_eq!(pine_conformance::gen::readings::escalated("A001"), []);
+}
+
+/// pin:06-merge-script-changed — `gen` voids a capture whose script the generator rewrote (the
+/// fixture returns to pending) and keeps one whose script is unchanged.
+#[test]
+fn gen_voids_a_capture_whose_script_changed() {
+    use pine_conformance::fixture::{Expect, Fixture, Stamp};
+    let root = std::env::temp_dir().join(format!("pine-conf-gen-merge-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    pine_conformance::gen::write(&root).unwrap();
+    let path = |id: &str| root.join(format!("tests/conformance/fixtures/{}/{id}.fix", &id[..1]));
+    let read = |id: &str| Fixture::parse(&std::fs::read_to_string(path(id)).unwrap(), id).unwrap();
+    // Stamp two fixtures as captured (a relation body, valid for both); C044's against other
+    // script bytes.
+    for (id, stale) in [("C044", true), ("C040", false)] {
+        let mut f = read(id);
+        f.captured = Stamp::At("2026-10-17T07:07Z".into());
+        f.tv_build = Stamp::At("web:x;pine:2026-09".into());
+        f.expect = Expect::Relation(vec![(format!("f_{id}_rt"), 1)]);
+        if stale {
+            f.script_sha256 = [7u8; 32];
+        }
+        std::fs::write(path(id), f.render()).unwrap();
+    }
+    pine_conformance::gen::write(&root).unwrap();
+    let c44 = read("C044");
+    assert_eq!(
+        (c44.captured, c44.expect),
+        (Stamp::Pending, Expect::Pending)
+    );
+    let c40 = read("C040");
+    assert_eq!(c40.captured, Stamp::At("2026-10-17T07:07Z".into()));
+    assert!(matches!(c40.expect, Expect::Relation(_)));
+    let _ = std::fs::remove_dir_all(&root);
+}

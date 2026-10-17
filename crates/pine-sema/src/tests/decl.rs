@@ -8,8 +8,8 @@
 //! `ProgramMeta`, T20).
 
 use pine_ir::{
-    decl_flag, AllowEntry, CommissionType, Dialect, FileId, QtyType, RiskRules, ScriptKind,
-    StrategyDecl, SymTable,
+    decl_flag, AllowEntry, CommissionType, CompileOpts, Dialect, ExecMode, FileId, QtyType,
+    RiskRules, ScriptKind, StrategyDecl, SymTable,
 };
 
 use super::readings::opts;
@@ -22,10 +22,15 @@ const E6: i64 = 1_000_000;
 
 /// Passes 1–3 and the declaration fold of `src`; the codes without the snapshot's `unserved=1`.
 fn fold(src: &str, d: Dialect) -> (Decl, Vec<u16>) {
+    fold_in(src, d, ExecMode::BarClose)
+}
+
+/// [`fold`] for a compilation of `mode` (an intrabar flag needs `Realtime`: `3052`).
+fn fold_in(src: &str, d: Dialect, mode: ExecMode) -> (Decl, Vec<u16>) {
     let mut syms = SymTable::new();
     let ast = pine_lang::parse(src, FileId::ROOT, &mut syms).expect("parses");
     let rd = Readings::of(d);
-    let o = opts(d);
+    let o = CompileOpts { mode, ..opts(d) };
     let mut diags = Vec::new();
     let graph = imports::load(&ast, &mut syms, &mut LibCache::empty(), &mut diags);
     let res = resolve::resolve(&ast, &graph, &syms, &rd, &mut diags);
@@ -46,6 +51,14 @@ fn v6(args: &str) -> Decl {
         &format!("//@version=6\nstrategy(\"s\"{args})\nplot(close)\n"),
         Dialect::V6,
     )
+}
+
+/// [`v6`] compiled `Realtime` (R-P6: `calc_on_every_history_tick` is `3052` in `BarClose`).
+fn v6_rt(args: &str) -> Decl {
+    let src = format!("//@version=6\nstrategy(\"s\"{args})\nplot(close)\n");
+    let (decl, codes) = fold_in(&src, Dialect::V6, ExecMode::Realtime);
+    assert!(codes.is_empty(), "{codes:?}");
+    decl
 }
 
 #[test]
@@ -119,20 +132,26 @@ fn decl_flags_follow_the_declaration() {
         ),
         ("close_entries_rule = \"ANY\"", decl_flag::CLOSE_ANY),
         ("use_bar_magnifier = true", decl_flag::BAR_MAGNIFIER),
-        (
-            "calc_on_every_history_tick = true",
-            decl_flag::CALC_ON_EVERY_HISTORY_TICK,
-        ),
     ] {
         assert_eq!(v6(&format!(", {arg}")).strategy.flags, bit, "{arg}");
     }
+    let h = v6_rt(", calc_on_every_history_tick = true").strategy.flags;
+    assert_eq!(h, decl_flag::CALC_ON_EVERY_HISTORY_TICK);
     assert_eq!(v6(", close_entries_rule = \"FIFO\"").strategy.flags, 0);
 }
 
 #[test]
 fn decl_history_tick_flag_sets_uses_intrabar() {
-    assert!(v6(", calc_on_every_history_tick = true").uses_intrabar);
+    assert!(v6_rt(", calc_on_every_history_tick = true").uses_intrabar);
     assert!(!v6(", calc_on_every_history_tick = false").uses_intrabar);
+}
+
+/// R-P6: the flag joins rule `3052` — a `BarClose` compilation refuses it, `Realtime` accepts.
+#[test]
+fn decl_history_tick_flag_in_bar_close_is_3052() {
+    let src = "//@version=6\nstrategy(\"s\", calc_on_every_history_tick = true)\nplot(close)\n";
+    assert_eq!(fold(src, Dialect::V6).1, vec![3052]);
+    assert!(fold_in(src, Dialect::V6, ExecMode::Realtime).1.is_empty());
 }
 
 #[test]

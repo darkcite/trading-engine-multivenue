@@ -4,7 +4,8 @@
 //! The pin table (impl-06 §3.8, §4.9): pin → fixture ids by dialect, the readings a decision chooses
 //! between, and the foreign switch pins. LOAD-TIME ONLY (DOCTRINE law 2): allocates freely.
 //!
-//! `PINS` is exactly the rows of §4.9.2–§4.9.3 and §4.9.6–§4.9.7 (93 names, §4.9.8); a row's ids are
+//! `PINS` is exactly the rows of §4.9.2–§4.9.3 and §4.9.6–§4.9.7 (94 names, §4.9.8 — the 94th,
+//! `pin:06-na-object-field`, is R-P2's, 2026-10-17); a row's ids are
 //! split by the fixture's declared `dialects`. Where a row's fixture list is narrower than the
 //! generator's assignment, the generator's is kept and the widening is pinned:
 //! * `pin:06-na-compare-v6-bool` — `pin:06-na-compare` also lists A085/A086 (the v6 bool row's
@@ -339,7 +340,8 @@ pub static PINS: &[Pin] = &[
         v5: &[],
         v6: &[],
         both: &["F005", "F007", "F008", "F009", "F041"],
-        readings: &["na", "ieee"],
+        // R-P2: `refuse_literal` is F007's (a literal `/ 0.0` is a compile refusal on TradingView).
+        readings: &["na", "ieee", "refuse_literal"],
     },
     Pin {
         name: "pin:U16-block-local-carry",
@@ -425,6 +427,15 @@ pub static PINS: &[Pin] = &[
         both: &["D023", "D024"],
         readings: &[],
     },
+    // R-P2 (2026-10-17): C029's runtime fault is a reading the re-paste records, and readings
+    // belong to pin fixtures (pin:06-reading-needs-pin) — §4.9.3's ninth row.
+    Pin {
+        name: "pin:06-na-object-field",
+        v5: &[],
+        v6: &[],
+        both: &["C029"],
+        readings: &["runtime_fault"],
+    },
     Pin {
         name: "pin:05-path-tie",
         v5: &[],
@@ -481,7 +492,7 @@ pub static PINS: &[Pin] = &[
         v5: &[],
         v6: &[],
         both: &["E056"],
-        readings: &[],
+        readings: &["refuse_literal"],
     },
     Pin {
         name: "pin:05-cof-close-tick",
@@ -568,7 +579,7 @@ pub static PINS: &[Pin] = &[
         v5: &["E110"],
         v6: &[],
         both: &[],
-        readings: &[],
+        readings: &["runtime_fault"],
     },
     Pin {
         name: "pin:05-fill-limits",
@@ -743,7 +754,7 @@ pub static PINS: &[Pin] = &[
         v5: &[],
         v6: &[],
         both: &["F085"],
-        readings: &["refuse_dynamic", "runtime_abs"],
+        readings: &["refuse_dynamic", "runtime_abs", "runtime_fault"],
     },
     Pin {
         name: "pin:02-fn-global-assign",

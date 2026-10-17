@@ -247,7 +247,7 @@ C025	C	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/C/C025.pine	2026-
 C026	C	56	declined	syn	step	bar_close	1	-	tests/conformance/fixtures/C/C026.pine	n/a
 C027	C	56	declined	syn	step	bar_close	3	-	tests/conformance/fixtures/C/C027.pine	n/a
 C028	C	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/C/C028.pine	2026-10-17T06:40Z
-C029	C	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/C/C029.pine	pending
+C029	C	56	tv	syn	step	bar_close	1	pin:06-na-object-field	tests/conformance/fixtures/C/C029.pine	pending
 C030	C	56	declined	syn	step	bar_close	1	-	tests/conformance/fixtures/C/C030.pine	n/a
 C031	C	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/C/C031.pine	2026-10-17T06:40Z
 C032	C	56	tv	syn	step	bar_close	1	-	tests/conformance/fixtures/C/C032.pine	2026-10-17T06:40Z
@@ -262,7 +262,7 @@ C040	C	56	tv	rt	step	realtime	1	-	tests/conformance/fixtures/C/C040.pine	2026-10
 C041	C	56	tv	rt	step	realtime	1	-	tests/conformance/fixtures/C/C041.pine	2026-10-17T07:07Z
 C042	C	56	tv	rt	step	realtime	1	-	tests/conformance/fixtures/C/C042.pine	2026-10-17T07:07Z
 C043	C	56	declined	rt	step	realtime	3	-	tests/conformance/fixtures/C/C043.pine	n/a
-C044	C	56	tv	rt	step	realtime	1	pin:U17-barstate-table	tests/conformance/fixtures/C/C044.pine	2026-10-17T07:07Z
+C044	C	56	tv	rt	step	realtime	1	pin:U17-barstate-table	tests/conformance/fixtures/C/C044.pine	pending
 C045	C	56	tv	rt	step	realtime	1	pin:U17-barstate-table	tests/conformance/fixtures/C/C045.pine	2026-10-17T06:47Z
 C046	C	6	tv	rt	step	realtime	1	pin:02-once-flag	tests/conformance/fixtures/C/C046.pine	2026-10-17T07:07Z
 D001	D	56	tv	chart	time	bar_close	2	-	tests/conformance/fixtures/D/D001.pine	2026-10-17T04:48Z
@@ -317,8 +317,8 @@ D049	D	56	declined	chart	time	bar_close	2	-	tests/conformance/fixtures/D/D049.pi
 D050	D	56	tv	chart	time	bar_close	2	-	tests/conformance/fixtures/D/D050.pine	2026-10-17T04:53Z
 D051	D	5	authored	chart	time	bar_close	2	-	tests/conformance/fixtures/D/D051.pine	n/a
 D052	D	6	authored	chart	time	bar_close	2	-	tests/conformance/fixtures/D/D052.pine	n/a
-D053	D	56	tv	rt	step	realtime	2	pin:U12-lookahead-off-realtime	tests/conformance/fixtures/D/D053.pine	2026-10-17T07:07Z
-D054	D	56	tv	rt	step	realtime	2	pin:U12-lookahead-off-realtime	tests/conformance/fixtures/D/D054.pine	2026-10-17T07:07Z
+D053	D	56	tv	rt	step	realtime	2	pin:U12-lookahead-off-realtime	tests/conformance/fixtures/D/D053.pine	pending
+D054	D	56	tv	rt	step	realtime	2	pin:U12-lookahead-off-realtime	tests/conformance/fixtures/D/D054.pine	pending
 D055	D	56	tv	chart	time	bar_close	1	pin:04-time-edges	tests/conformance/fixtures/D/D055.pine	2026-10-17T04:53Z
 D056	D	56	tv	chart	time	bar_close	1	pin:04-time-edges	tests/conformance/fixtures/D/D056.pine	2026-10-17T04:53Z
 D057	D	56	declined	chart	time	bar_close	1	pin:04-time-edges	tests/conformance/fixtures/D/D057.pine	n/a

@@ -55,7 +55,7 @@ pub const SCREEN_LIMITS: CompileLimits = CompileLimits {
     str_scratch_bytes: 8_192,
     intent_cap: 32,
     max_frame_bytes: 64 << 20,
-    active_tiers: 0b0011, // Tiers 1–2; bit 2 when lane D lands (impl-04)
+    active_tiers: 0b0111, // Tiers 1–3 (R-P5, 2026-10-17: lane D's tier 3 served by pine-std)
 };
 
 /// Most candidates one group steps per bar read (L1 interleave, §4.4).

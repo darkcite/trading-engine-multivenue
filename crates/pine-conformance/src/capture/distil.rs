@@ -137,6 +137,97 @@ fn has_rt_flags(f: &Fixture) -> bool {
     want("rt") && want("done")
 }
 
+/// `pin:06-distil-tick-columns` — the plot suffixes (`f_<ID>_<suffix>`) of a `driver rt` fixture that
+/// are per-update bookkeeping, never a relation: the row filter (`rt`, `done`) and the tick counts
+/// (`upd`, `k`). §4.7.8: "tick-count columns are never compared" (R-P3).
+pub const RT_BOOKKEEPING: &[&str] = &["rt", "done", "upd", "k"];
+
+/// `pin:06-distil-tick-columns` — the generator marks any further tick-count plot by this suffix
+/// prefix (`f_<ID>_tick_<what>`); such a column is bookkeeping too.
+pub const TICK_COUNTER_PREFIX: &str = "tick_";
+
+/// Whether plot `title` of fixture `id` is a relation column (§4.7.8): every plot of a flagged
+/// `driver rt` fixture except [`RT_BOOKKEEPING`] and the [`TICK_COUNTER_PREFIX`] columns.
+pub fn is_relation_column(id: FixtureId, title: &str) -> bool {
+    let sfx = title
+        .strip_prefix("f_")
+        .and_then(|r| r.strip_prefix(id.as_str()))
+        .and_then(|r| r.strip_prefix('_'))
+        .unwrap_or(title);
+    !(RT_BOOKKEEPING.contains(&sfx) || sfx.starts_with(TICK_COUNTER_PREFIX))
+}
+
+/// The §4.7.8 `relation` body over the kept `rt = done = 1` rows: per relation column its one
+/// value. `pin:06-distil-relation` — a column that takes more than one value over those rows, or
+/// whose one value is `na` or not an integer, is not a tick-independent relation: `Err` naming the
+/// column and its distinct values in row order (an I9-style refusal — never averaged).
+fn relation_of(f: &Fixture, rows: &[Row]) -> Result<Vec<(String, i64)>, String> {
+    let id = f.id.as_str();
+    let mut out = Vec::new();
+    for (p, spec) in f.plots.iter().enumerate() {
+        if !is_relation_column(f.id, &spec.title) {
+            continue;
+        }
+        let mut distinct: Vec<&Cell> = Vec::new();
+        for r in rows {
+            let c = &r.cells[p];
+            let seen = distinct.iter().any(|d| match (d, c) {
+                (Cell::Na, Cell::Na) => true,
+                (Cell::Val { v: a, .. }, Cell::Val { v: b, .. }) => a == b,
+                _ => false,
+            });
+            if !seen {
+                distinct.push(c);
+            }
+        }
+        let shown = |d: &[&Cell]| -> String {
+            d.iter()
+                .map(|c| match c {
+                    Cell::Na => "na".to_string(),
+                    Cell::Val { text, .. } => text.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match distinct.as_slice() {
+            [Cell::Val { v, .. }] if v.is_finite() && v.fract() == 0.0 && v.abs() < 9.0e18 => {
+                out.push((spec.title.clone(), *v as i64));
+            }
+            [one] => {
+                return Err(format!(
+                    "{id}: relation column `{}` is constant but not an integer ({}) — §4.7.8 \
+                     (pin:06-distil-relation)",
+                    spec.title,
+                    shown(&[one])
+                ))
+            }
+            [] => {
+                return Err(format!(
+                    "{id}: no rt = done = 1 row to read relation column `{}` from",
+                    spec.title
+                ))
+            }
+            many => {
+                let (n, k, vals) = (rows.len(), many.len(), shown(many));
+                let why = format!(
+                    "{id}: relation column `{}` varies over the {n} rt = done = 1 rows ({k} \
+                     distinct: {vals}) — not tick-independent; refused, never averaged (§4.7.8, \
+                     pin:06-distil-relation)",
+                    spec.title
+                );
+                return Err(why);
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "{id}: a driver-rt fixture with rt / done plots but no relation column \
+             (pin:06-distil-tick-columns)"
+        ));
+    }
+    Ok(out)
+}
+
 /// The export column of `f`'s plot titled `f_<ID>_<suffix>`, or `Err` naming the fixture.
 fn rt_col(f: &Fixture, cols: &[usize], suffix: &str) -> Result<usize, String> {
     let title = format!("f_{}_{suffix}", f.id.as_str());
@@ -429,7 +520,23 @@ pub fn distil(
             cols.push(c);
         }
         let (rows, bars) = select(&f, export, &cols)?;
+        // §4.7.8 (R-P3): a flagged `driver rt` fixture records the relation body, not its rows;
+        // the no-flags rule (C045, E106 — pin:06-distil-rt-noflags) keeps its rows.
+        let relation = f.driver == Driver::Rt && has_rt_flags(&f);
+        if relation && (trades.is_some() || summary.is_some()) {
+            return Err(format!(
+                "{}: a relation fixture carries no trades or summary (§4.7.8)",
+                id.as_str()
+            ));
+        }
         let body = match trades {
+            _ if relation => match relation_of(&f, &rows) {
+                Ok(rel) => Expect::Relation(rel),
+                Err(why) => {
+                    rep.refused.push((id, why));
+                    continue;
+                }
+            },
             Some(tr) => Expect::Strategy {
                 series: rows.clone(),
                 // COPY: the List of Trades rows (one strategy's trades), offline — the fixture owns
@@ -449,6 +556,66 @@ pub fn distil(
         apply(&mut f, body, stamp, bars)?;
         finish(&path, &f, &tracked, verify, &mut rep)?;
     }
+    Ok(rep)
+}
+
+/// R-P3 for a fixture distilled before the relation rule: a flagged `driver rt` fixture whose
+/// captured body is still the `series` rows distil kept (every row `rt = done = 1`) gets the
+/// §4.7.8 `relation` body those rows yield — the same [`relation_of`] a fresh distil applies, the
+/// stamps unchanged. A varying column is refused (in `refused`, the file untouched); a fixture that
+/// is not a flagged rt fixture, or holds no captured `series` body, is `Err`. `verify = true`
+/// compares instead of writing.
+///
+/// `pin:06-distil-rebody` — no TradingView export is re-read: the kept rows already in the `.fix`
+/// are exactly the rows distil would keep from it (`tail n` of the `rt = done = 1` rows).
+pub fn rebody_relation(fix: &Path, verify: bool) -> Result<DistilReport, String> {
+    let tracked = load(fix)?;
+    let mut f = tracked.clone();
+    let id = f.id;
+    if f.driver != Driver::Rt || !has_rt_flags(&f) {
+        return Err(format!(
+            "{}: not a driver-rt fixture with rt / done plots (§4.7.8)",
+            id.as_str()
+        ));
+    }
+    let Expect::Series(rows) = &f.expect else {
+        return Err(format!(
+            "{}: no captured series body to turn into a relation",
+            id.as_str()
+        ));
+    };
+    if !matches!(f.captured, Stamp::At(_)) {
+        return Err(format!("{}: not captured", id.as_str()));
+    }
+    let (c_rt, c_done) = (
+        rt_col(&f, &(0..f.plots.len()).collect::<Vec<_>>(), "rt")?,
+        rt_col(&f, &(0..f.plots.len()).collect::<Vec<_>>(), "done")?,
+    );
+    if !rows
+        .iter()
+        .all(|r| is_one(&r.cells[c_rt]) && is_one(&r.cells[c_done]))
+    {
+        return Err(format!(
+            "{}: a series row with rt or done ≠ 1 is not a kept realtime row",
+            id.as_str()
+        ));
+    }
+    let mut rep = DistilReport::default();
+    let rel = match relation_of(&f, rows) {
+        Ok(rel) => rel,
+        Err(why) => {
+            rep.refused.push((id, why));
+            return Ok(rep);
+        }
+    };
+    f.expect = Expect::Relation(rel);
+    if verify {
+        // The relation is a re-reading of the tracked rows: equal by construction.
+        rep.written.push(id);
+        return Ok(rep);
+    }
+    std::fs::write(fix, f.render()).map_err(|e| format!("{}: {e}", fix.display()))?;
+    rep.written.push(id);
     Ok(rep)
 }
 

@@ -2,8 +2,9 @@ fix	2
 id	C029
 group	C
 title	a field of an na object
+pin	pin:06-na-object-field
 script	tests/conformance/fixtures/C/C029.pine
-script_sha256	897a6c5a754a47cfdb84e5a95adadae8bbef2b85e597149bfb9a91455d52abaf
+script_sha256	e3eafc5f841328c4e348740b6e1d28d2bd29232c43af516b4455f869182ffb72
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
 captured	pending
 tv_build	pending
@@ -19,3 +20,6 @@ tier	1
 plot	f_C029_isna	exact
 plot	f_C029_val	exact
 pending
+reading	runtime_fault
+fault	ScriptRefused	0
+end

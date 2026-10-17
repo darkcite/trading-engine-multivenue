@@ -822,24 +822,26 @@ fn capture_distil_time_selects_inside_the_chart_window() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// §4.7.8: a `driver rt` fixture keeps the rows where `f_<ID>_rt` and `f_<ID>_done` are 1; `tail n`
-/// selects among them; keys `bars−n..bars`, `bars = history + realtime` (§4.1.6). Fewer such rows
-/// than `n`, or no rt / done plot, is `Err` naming the fixture.
+/// §4.7.8 (R-P3): a `driver rt` fixture keeps the rows where `f_<ID>_rt` and `f_<ID>_done` are 1
+/// (`tail n` among them, `bars = history + realtime`, §4.1.6) and records the `relation` body: per
+/// relation column its one value; `rt`, `done` and the tick count `upd` are never compared
+/// (pin:06-distil-tick-columns). Fewer such rows than `n`, or no rt / done plot, is `Err` naming
+/// the fixture.
 #[test]
 fn capture_distil_rt_keeps_confirmed_realtime_rows() {
-    let root = tree("rt", &["C039", "C045"]);
+    let root = tree("rt", &["C040", "C045"]);
     let sheet = root.join("tests/conformance/sheets/v6/sheet-x.pine");
     let t = |i: i64| spec::FROM_MS + i * 60_000;
-    // 100 history rows (rt 0, done 1), then 20 realtime rows (rt 1, done 1, val = 100 + i) with one
-    // unconfirmed (done 0) among them, then the open realtime bar (rt 1, done 0).
-    let mut rows: Vec<(i64, String)> = (0..100).map(|i| (t(i), "0,1,1".to_string())).collect();
+    // 100 history rows (rt 0, done 1, ok 0), then 21 realtime rows (rt 1, done 1, upd varying, ok 1)
+    // with one unconfirmed (done 0, ok 0) among them, then the open realtime bar (rt 1, done 0).
+    let mut rows: Vec<(i64, String)> = (0..100).map(|i| (t(i), "0,1,1,0".to_string())).collect();
     for i in 100..121 {
-        let done = if i == 110 { 0 } else { 1 };
-        rows.push((t(i), format!("1,{done},{}", 100 + i)));
+        let (done, ok) = if i == 110 { (0, 0) } else { (1, 1) };
+        rows.push((t(i), format!("1,{done},{},{ok}", 150 + i % 7)));
     }
-    rows.push((t(121), "1,0,7777".to_string()));
-    let titles = "f_C039_rt,f_C039_done,f_C039_val";
-    distil(
+    rows.push((t(121), "1,0,3,0".to_string()));
+    let titles = "f_C040_rt,f_C040_done,f_C040_upd,f_C040_ok";
+    let rep = distil(
         &sheet,
         &export_ms(titles, &rows),
         None,
@@ -848,19 +850,15 @@ fn capture_distil_rt_keeps_confirmed_realtime_rows() {
         false,
     )
     .unwrap();
-    let f = load(&root, "C039");
+    assert!(rep.refused.is_empty(), "{:?}", rep.refused);
+    let f = load(&root, "C040");
     let rt = f.rt.unwrap();
     assert_eq!(f.bars, Some(rt.history + rt.realtime));
-    let r = series(&f);
-    assert_eq!(r.len(), 16);
-    let total = i64::from(rt.history + rt.realtime);
-    assert_eq!((r[0].key, r[15].key), (total - 16, total - 1));
-    // The last 16 confirmed realtime rows: 105..=120 less the unconfirmed 110 → 104..=120 \ {110}.
-    let vals: Vec<&str> = r.iter().map(|x| text(x, 2)).collect();
-    assert_eq!(vals[0], "204");
-    assert_eq!(vals[15], "220");
-    assert!(!vals.contains(&"210") && !vals.contains(&"7777"));
-    assert!(r.iter().all(|x| text(x, 0) == "1" && text(x, 1) == "1"));
+    assert_eq!(f.captured_in, Some(Dialects::V6));
+    assert_eq!(
+        f.expect,
+        Expect::Relation(vec![("f_C040_ok".to_string(), 1)])
+    );
     // Too few confirmed realtime rows.
     let few: Vec<(i64, String)> = rows[..110].to_vec();
     let err = distil(
@@ -873,7 +871,7 @@ fn capture_distil_rt_keeps_confirmed_realtime_rows() {
     )
     .unwrap_err();
     assert!(
-        err.contains("C039") && err.contains("rt = done = 1"),
+        err.contains("C040") && err.contains("rt = done = 1"),
         "{err}"
     );
     // C045 (`rt … open`) carries no rt / done plot (pin:06-distil-rt-noflags): its last 65 rows,
@@ -911,6 +909,112 @@ fn capture_distil_rt_keeps_confirmed_realtime_rows() {
     )
     .unwrap_err();
     assert!(err.contains("C045"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// §4.7.8, pin:06-distil-relation — a relation column that varies over the kept `rt = done = 1`
+/// rows is refused (I9-style, in `refused`, naming the column and its distinct values; never
+/// averaged) and that fixture is not written, while the sheet's other fixture is; a constant that
+/// is `na` or not an integer is refused too. Bookkeeping columns may vary freely.
+#[test]
+fn capture_relation_requires_a_constant() {
+    let root = tree("rel", &["C039", "C042"]);
+    let sheet = root.join("tests/conformance/sheets/v6/sheet-x.pine");
+    let t = |i: i64| spec::FROM_MS + i * 60_000;
+    // C039 (rt, done, val) varies 1 / 2 on its realtime rows; C042 (rt, done, upd, ok) holds ok = 1.
+    let mk = |c42_ok: &str| {
+        let mut rows: Vec<(i64, String)> = (0..64)
+            .map(|i| (t(i), "0,1,1,0,1,4,0".to_string()))
+            .collect();
+        for i in 64..84 {
+            let v = 1 + i % 2;
+            rows.push((t(i), format!("1,1,{v},1,1,{},{c42_ok}", 200 + i)));
+        }
+        rows.push((t(84), "1,0,1,1,0,1,0".to_string()));
+        export_ms(
+            "f_C039_rt,f_C039_done,f_C039_val,f_C042_rt,f_C042_done,f_C042_upd,f_C042_ok",
+            &rows,
+        )
+    };
+    let before =
+        std::fs::read_to_string(root.join("tests/conformance/fixtures/C/C039.fix")).unwrap();
+    let rep = distil(&sheet, &mk("1"), None, None, &stamp(Dialect::V6), false).unwrap();
+    assert_eq!(rep.written, [FixtureId::parse("C042").unwrap()]);
+    assert_eq!(rep.refused.len(), 1);
+    let (id, why) = &rep.refused[0];
+    assert_eq!(*id, FixtureId::parse("C039").unwrap());
+    assert!(
+        why.contains("f_C039_val")
+            && why.contains("2 distinct: 1, 2")
+            && why.contains("never averaged"),
+        "{why}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("tests/conformance/fixtures/C/C039.fix")).unwrap(),
+        before,
+        "refused, not written"
+    );
+    assert_eq!(
+        load(&root, "C042").expect,
+        Expect::Relation(vec![("f_C042_ok".to_string(), 1)])
+    );
+    // A constant that is not an integer is no relation either.
+    let rep = distil(&sheet, &mk("0.5"), None, None, &stamp(Dialect::V6), false).unwrap();
+    assert!(rep
+        .refused
+        .iter()
+        .any(|(id, w)| id.as_str() == "C042" && w.contains("not an integer")));
+    // The bookkeeping set (pin:06-distil-tick-columns).
+    use pine_conformance::capture::distil::is_relation_column;
+    let c = FixtureId::parse("C044").unwrap();
+    for s in ["rt", "done", "upd", "k", "tick_confirmed"] {
+        assert!(!is_relation_column(c, &format!("f_C044_{s}")), "{s}");
+    }
+    assert!(is_relation_column(c, "f_C044_isnew"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// pin:06-distil-rebody — a flagged rt fixture distilled before R-P3 (a captured `series` body of
+/// `rt = done = 1` rows) gets the relation body those rows yield, stamps kept; a varying column is
+/// refused with the file untouched; a pending or non-rt fixture is `Err`.
+#[test]
+fn capture_rebody_turns_kept_rows_into_a_relation() {
+    use pine_conformance::capture::distil::rebody_relation;
+    let root = tree("rebody", &["C040", "C039", "A001"]);
+    let fix = |id: &str| root.join(format!("tests/conformance/fixtures/C/{id}.fix"));
+    let mut f = load(&root, "C040");
+    f.captured = Stamp::At("2026-10-17T07:07Z".into());
+    f.expect = Expect::Series(
+        (64..80)
+            .map(|k| pine_conformance::gen::readings::row(k, &[1.0, 1.0, 200.0 + k as f64, 1.0]))
+            .collect(),
+    );
+    std::fs::write(fix("C040"), f.render()).unwrap();
+    let rep = rebody_relation(&fix("C040"), false).unwrap();
+    assert_eq!(rep.written.len(), 1);
+    let g = load(&root, "C040");
+    assert_eq!(
+        g.expect,
+        Expect::Relation(vec![("f_C040_ok".to_string(), 1)])
+    );
+    assert_eq!(g.captured, f.captured);
+    // C039's `val` varies: refused, untouched.
+    let mut f = load(&root, "C039");
+    f.captured = Stamp::At("2026-10-17T07:07Z".into());
+    f.expect = Expect::Series(
+        (64..80)
+            .map(|k| pine_conformance::gen::readings::row(k, &[1.0, 1.0, (k % 2) as f64]))
+            .collect(),
+    );
+    std::fs::write(fix("C039"), f.render()).unwrap();
+    let before = std::fs::read_to_string(fix("C039")).unwrap();
+    let rep = rebody_relation(&fix("C039"), false).unwrap();
+    assert_eq!(rep.refused.len(), 1);
+    assert!(rep.refused[0].1.contains("f_C039_val"), "{:?}", rep.refused);
+    assert_eq!(std::fs::read_to_string(fix("C039")).unwrap(), before);
+    // Not a driver-rt fixture.
+    let a001 = root.join("tests/conformance/fixtures/A/A001.fix");
+    assert!(rebody_relation(&a001, false).is_err());
     let _ = std::fs::remove_dir_all(&root);
 }
 

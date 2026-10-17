@@ -539,36 +539,77 @@ fn c_rt() -> Vec<Row> {
     );
     v43 = declined(v43, 3048);
     v43.tier = 3;
+    // pin:06-c044-relation (R-P3, 2026-10-17) — TradingView's isconfirmed COUNT was 1 or 2 per
+    // bar (the confirming update runs twice), so C044 states tick-independent relations instead:
+    // `isnew` = 1 when barstate.isnew held on the bar's first update and on no later one;
+    // `confirmed` = barstate.isconfirmed on the bar's last update (the row is the closing update);
+    // `confmono` = 1 when no update after an isconfirmed one read isconfirmed false; `ishistory`,
+    // `notlast`, `notrt` count the updates with ishistory / not islast / not isrealtime (0 for
+    // any number of updates).
     let mut v44 = rt_row(
         44,
-        "updates per bar with each barstate flag",
+        "barstate flags per realtime update, tick-independent",
         &[
-            "varip int bn@ = 0",
-            "varip int bc@ = 0",
+            "varip int nw@ = 1",
+            "varip int cm@ = 1",
+            "varip int pc@ = 0",
             "varip int bh@ = 0",
             "varip int bl@ = 0",
             "varip int br@ = 0",
             "if upd@ == 1",
-            ">bn@ := 0",
-            ">bc@ := 0",
+            ">nw@ := 1",
+            ">cm@ := 1",
+            ">pc@ := 0",
             ">bh@ := 0",
             ">bl@ := 0",
             ">br@ := 0",
-            "bn@ += barstate.isnew ? 1 : 0",
-            "bc@ += barstate.isconfirmed ? 1 : 0",
+            "if barstate.isnew != (upd@ == 1)",
+            ">nw@ := 0",
+            "if pc@ == 1 and not barstate.isconfirmed",
+            ">cm@ := 0",
+            "if barstate.isconfirmed",
+            ">pc@ := 1",
             "bh@ += barstate.ishistory ? 1 : 0",
             "bl@ += not barstate.islast ? 1 : 0",
             "br@ += not barstate.isrealtime ? 1 : 0",
         ],
         &[
-            ("bn@", "isnew"),
-            ("bc@", "isconfirmed"),
+            ("nw@", "isnew"),
+            ("barstate.isconfirmed ? 1 : 0", "confirmed"),
+            ("cm@", "confmono"),
             ("bh@", "ishistory"),
             ("bl@", "notlast"),
             ("br@", "notrt"),
         ],
     );
     v44.pins.push("pin:U17-barstate-table".into());
+    // U17's readings over C044's relation (§4.9.2): `contract` (A2: isnew on the first update
+    // only) and `isnew_on_confirm` (v4's table: isnew also in the confirm step, so not first-only).
+    let rel44 = |isnew: i64| {
+        ReadingBody::Relation(
+            [
+                ("isnew", isnew),
+                ("confirmed", 1),
+                ("confmono", 1),
+                ("ishistory", 0),
+                ("notlast", 0),
+                ("notrt", 0),
+            ]
+            .iter()
+            .map(|(s, v)| (format!("f_C044_{s}"), *v))
+            .collect(),
+        )
+    };
+    v44.readings = vec![
+        Reading {
+            name: "contract".into(),
+            body: rel44(1),
+        },
+        Reading {
+            name: "isnew_on_confirm".into(),
+            body: rel44(0),
+        },
+    ];
     vec![
         rt_row(
             39,

@@ -3,7 +3,8 @@
 
 //! `array.*` order statistics and the int moments (impl-04 §4.16.6; operator ruling 2026-10-16):
 //! `median`, `mode`, `percentile_nearest_rank`, `percentile_linear_interpolation` of an int or
-//! float array, and `avg` / `variance` / `stdev` of an int array.
+//! float array, and `avg` / `variance` / `stdev` of an int array; `percentrank` (int / float) and
+//! `covariance` (any int / float pairing) (r27, R-P5).
 //!
 //! No scratch and no copy: a collection block has no region a body may permute (the owner's words
 //! are the script's array; spare capacity past `len` is not guaranteed — a full array has none),
@@ -370,6 +371,123 @@ fn var_std_i<const SD: bool>(f: &mut Frame<'_>, args: &[u16]) -> Result<(), Faul
     Ok(())
 }
 
+// ---- covariance / percentrank (r27, R-P5) ------------------------------------------------------
+
+/// An int or float array reference whose every element is still the owner's (§4.16.3), and
+/// whether it is float — for a row whose output lane does not follow the element.
+fn numeric_any(f: &Frame<'_>, e: u16) -> Result<(Owned, bool), FaultKind> {
+    let o = resolve(f, f.coll_arg(e))?;
+    if !matches!(o.kind, CollKind::Array) {
+        return Err(FaultKind::Internal);
+    }
+    let float = match o.elem {
+        Ty::Float => true,
+        Ty::Int => false,
+        _ => return Err(FaultKind::Internal),
+    };
+    if o.base + o.len > o.owner_len {
+        return Err(FaultKind::CollectionBounds);
+    }
+    Ok((o, float))
+}
+
+/// `array.covariance(id1, id2, biased)` — `[id1, id2, biased, out]` (`series float`), any mix of
+/// int and float arrays. `pin:04-array-covariance-pairs`: the reference gives neither a formula
+/// nor an na rule; the literal reading, as `pin:04-array-variance-two-pass`: element `i` of `id1`
+/// pairs with element `i` of `id2`, a pair with an na side is skipped (the arrays page: na values
+/// do not make a statistic na), the means of the kept pairs, then `Σ(x − mx)(y − my)` divided by
+/// `n` when `biased` is true, else by `n − 1`. `pin:04-array-covariance-sizes`: arrays of
+/// different sizes have no pairing → `CollectionBounds`. No kept pair → na; an unbiased estimate of
+/// one pair is `0 / 0` → na. A na `biased` (v5) is not true (as `array.variance`).
+fn covariance(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 4 || argwin::is_i64(args[3]) {
+        return Err(FaultKind::Internal);
+    }
+    let (a, af) = numeric_any(f, args[0])?;
+    let (b, bf) = numeric_any(f, args[1])?;
+    if a.len != b.len {
+        return Err(FaultKind::CollectionBounds);
+    }
+    let biased = f.bool_arg(args[2]) == Some(true);
+    let v = {
+        let (_, wa) = f.coll(a.owner)?;
+        let (_, wb) = f.coll(b.owner)?;
+        let (xa, xb) = (words_of(wa, &a), words_of(wb, &b));
+        let (mut sa, mut sb, mut n) = (0.0f64, 0.0f64, 0u64);
+        let mut i = 0usize;
+        while i < xa.len() {
+            if !is_na(xa[i], af) && !is_na(xb[i], bf) {
+                sa += val(xa[i], af);
+                sb += val(xb[i], bf);
+                n += 1;
+            }
+            i += 1;
+        }
+        if n == 0 {
+            f64::NAN
+        } else {
+            let (ma, mb) = (sa / n as f64, sb / n as f64);
+            let mut sp = 0.0f64;
+            let mut i = 0usize;
+            while i < xa.len() {
+                if !is_na(xa[i], af) && !is_na(xb[i], bf) {
+                    sp += (val(xa[i], af) - ma) * (val(xb[i], bf) - mb);
+                }
+                i += 1;
+            }
+            let d = if biased { n } else { n - 1 };
+            sp / d as f64
+        }
+    };
+    f.set_f64_arg(args[3], v);
+    Ok(())
+}
+
+/// `array.percentrank(id, index)` — `[id, index, out]` (float row `series float`, int row
+/// `series int`). The reference: "the percentage of how many elements in the array are less than
+/// or equal to the reference value" (the element at `index`). `pin:04-array-percentrank`: read
+/// literally — `100 × #(x ≤ ref) / n` over the non-na elements (the reference element counts
+/// itself; an na element is neither counted nor in `n`, as every array statistic), IEEE `≤`
+/// (`−0.0 = +0.0`); an na reference element → na; the int row truncates toward zero
+/// (`pin:04-array-int-stats-provisional`). An `index` outside `[0, size)` — negative (§4.16.5:
+/// only `get set insert remove` normalise one) or na included — is `CollectionBounds`.
+fn percentrank(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 3 {
+        return Err(FaultKind::Internal);
+    }
+    let (o, float) = numeric(f, args[0], args[2])?;
+    let k = match f.i64_arg(args[1]) {
+        Some(k) if 0 <= k && k < o.len as i64 => k as usize,
+        _ => return Err(FaultKind::CollectionBounds),
+    };
+    let v = {
+        let (_, words) = f.coll(o.owner)?;
+        let w = words_of(words, &o);
+        let r = w[k];
+        if is_na(r, float) {
+            f64::NAN
+        } else {
+            let (mut le, mut n) = (0u64, 0u64);
+            let mut i = 0usize;
+            while i < w.len() {
+                if !is_na(w[i], float) {
+                    n += 1;
+                    let below = if float {
+                        f64::from_bits(w[i]) <= f64::from_bits(r)
+                    } else {
+                        (w[i] as i64) <= (r as i64)
+                    };
+                    le += below as u64;
+                }
+                i += 1;
+            }
+            100.0 * le as f64 / n as f64
+        }
+    };
+    out(f, args[2], v);
+    Ok(())
+}
+
 // ---- the rows (pine-vm `flag_ok`) --------------------------------------------------------------
 
 /// The `array.median` rows (float / int).
@@ -407,4 +525,12 @@ pub fn bi_array_variance_i(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result
 /// The `array.stdev` row of an int array.
 pub fn bi_array_stdev_i(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     var_std_i::<true>(f, args).map_err(|k| declared(flags(ov::ARRAY_STDEV_I), k))
+}
+/// The `array.covariance` rows (every int / float pairing).
+pub fn bi_array_covariance(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    covariance(f, args).map_err(|k| declared(flags(ov::ARRAY_COVARIANCE_AFAF), k))
+}
+/// The `array.percentrank` rows (float / int).
+pub fn bi_array_percentrank(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    percentrank(f, args).map_err(|k| declared(flags(ov::ARRAY_PERCENTRANK_F), k))
 }

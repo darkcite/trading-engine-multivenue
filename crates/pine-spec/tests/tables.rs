@@ -194,10 +194,15 @@ fn version_masks_consistent() {
 
 fn default_matches(ov: &Overload, p: &pine_spec::Param) -> bool {
     let t = p.sig.ty.ty;
-    let var = tv::whole(p.sig.tv) != 0;
+    let w = tv::whole(p.sig.tv);
+    let var = w != 0;
+    // pin:00-var-literal-default (L3): a whole type variable takes a literal default of a kind
+    // it admits (`sort_field`, `const int/string`, default 0).
+    let var_admits = |k: u8| var && ov.tv_kinds[w as usize - 1] & k != 0;
     match p.default.kind {
         DefaultKind::None | DefaultKind::Na => true,
-        DefaultKind::Int => !var && t == Ty::Int,
+        DefaultKind::Int if var => var_admits(kind::of(Ty::Int)),
+        DefaultKind::Int => t == Ty::Int,
         DefaultKind::Float => !var && t == Ty::Float,
         DefaultKind::Bool => !var && t == Ty::Bool && p.default.bits <= 1,
         DefaultKind::Color => !var && t == Ty::Color,

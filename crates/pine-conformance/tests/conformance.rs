@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use pine_conformance::fixture::{Fixture, Oracle};
+use pine_conformance::fixture::{Driver, Fixture, Oracle};
 use pine_conformance::report::Verdict;
 use pine_conformance::run::{Runner, RunnerOptions, SkipReason, SyminfoSource};
 use pine_ir::Dialect;
@@ -163,4 +163,216 @@ fn tv_fixtures_refuse_without_the_captured_syminfo() {
     let e = r.expect_err("a tv fixture against the stand-in refuses");
     assert_eq!(e.code(), Some(pine_conformance::code::FIXTURE_PARSE));
     assert!(format!("{e:?}").contains("pin:06-syminfo-standin"));
+}
+
+// ------------------------------------------------------------------------------------------------
+// R-P1 (2026-10-17): TradingView is the oracle. Every captured fixture (`run::is_tv_captured`: oracle
+// tv / tv_only, a captured body, not in `run::TV_EXCLUDED`) runs through the real engine against the
+// captured `syminfo.tsv` under `run::TV_LIMITS` (tier 3 active), classified by
+// `triage::classify_tv`. The pass set is pinned like the stand-in's: a regression is a pass leaving
+// [`TV_PASS`]; an engine fix is a row leaving [`TV_GAPS`] (or changing class). `pine-conf report
+// --tv` writes the same run as the divergence report (vault `conformance/run-r27.md`).
+// ------------------------------------------------------------------------------------------------
+
+/// TradingView passes (r27, 2026-10-17, no bars root): 228 of 514.
+const TV_PASS: &[&str] = &[
+    "A001", "A002", "A003", "A004", "A005", "A006", "A007", "A008", "A009", "A010", "A011", "A012",
+    "A013", "A014", "A015", "A016", "A017", "A018", "A019", "A020", "A021", "A022", "A023", "A024",
+    "A025", "A026", "A027", "A028", "A029", "A030", "A031", "A032", "A033", "A034", "A035", "A036",
+    "A037", "A038", "A039", "A040", "A041", "A042", "A043", "A044", "A045", "A046", "A048", "A049",
+    "A050", "A054", "A055", "A056", "A057", "A058", "A059", "A060", "A061", "A062", "A065", "A066",
+    "A067", "A068", "A069", "A070", "A071", "A072", "A073", "A074", "A075", "A076", "A077", "A078",
+    "A080", "A090", "B001", "B002", "B003", "B004", "B005", "B006", "B008", "B011", "B013", "B014",
+    "B015", "B017", "B019", "B020", "B021", "B026", "B027", "B031", "B032", "B033", "B034", "B035",
+    "B036", "B037", "B038", "B039", "B040", "B042", "B044", "B049", "B050", "B051", "B053", "B055",
+    "B056", "B057", "B058", "B059", "B060", "B070", "B071", "B076", "B082", "B083", "B084", "B085",
+    "B086", "B088", "B090", "B091", "B093", "B095", "B097", "B100", "B102", "C001", "C002", "C003",
+    "C004", "C005", "C006", "C008", "C009", "C010", "C011", "C012", "C013", "C015", "C016", "C017",
+    "C018", "C019", "C020", "C022", "C023", "C024", "C025", "C028", "C031", "C034", "C035", "C036",
+    "C037", "C039", "C040", "C041", "C042", "C046", "F001", "F002", "F003", "F005", "F006", "F008",
+    "F009", "F010", "F012", "F013", "F014", "F017", "F018", "F021", "F022", "F023", "F026", "F027",
+    "F028", "F029", "F032", "F033", "F034", "F036", "F038", "F041", "F042", "F043", "F044", "F045",
+    "F046", "F048", "F049", "F050", "F055", "F056", "F057", "F058", "F060", "F066", "F068", "F070",
+    "F072", "F073", "F074", "F077", "F078", "F080", "F081", "F086", "F090", "F093", "F094", "F095",
+    "Z002", "Z003", "Z004", "Z005", "Z009", "Z010", "Z011", "Z012", "Z013", "Z015", "Z016", "Z019",
+];
+
+/// Known TradingView divergences `(id, class)` — engine items for their crates (R-P1), never
+/// expectation edits (vault `conformance/run-r27.md` has the first difference of each). The
+/// Chart / SynSig fixtures are not listed: without bar files every one is `harness-gap`
+/// (`NoBarsRoot`), asserted by rule ([`TV_NO_BARS`]).
+const TV_GAPS: &[(&str, &str)] = &[
+    ("A047", "differ"),
+    ("A053", "differ"),
+    ("A063", "differ"),
+    ("A079", "differ"),
+    ("B007", "differ"),
+    ("B009", "differ"),
+    ("B010", "differ"),
+    ("B012", "differ"),
+    ("B016", "differ"),
+    ("B018", "differ"),
+    ("B022", "differ"),
+    ("B023", "differ"),
+    ("B024", "differ"),
+    ("B025", "differ"),
+    ("B028", "differ"),
+    ("B029", "differ"),
+    ("B030", "differ"),
+    ("B041", "differ"),
+    ("B043", "differ"),
+    ("B045", "differ"),
+    ("B046", "differ"),
+    ("B047", "differ"),
+    ("B048", "differ"),
+    ("B052", "differ"),
+    ("B054", "differ"),
+    ("B061", "differ"),
+    ("B064", "differ"),
+    ("B065", "differ"),
+    ("B066", "differ"),
+    ("B067", "differ"),
+    ("B068", "differ"),
+    ("B069", "differ"),
+    ("B072", "differ"),
+    ("B073", "differ"),
+    ("B074", "differ"),
+    ("B075", "differ"),
+    ("B077", "differ"),
+    ("B078", "differ"),
+    ("B079", "differ"),
+    ("B080", "differ"),
+    ("B081", "differ"),
+    ("B087", "differ"),
+    ("B089", "differ"),
+    ("B092", "refused-by-us"),
+    ("B094", "refused-by-us"),
+    ("B096", "differ"),
+    ("B098", "refused-by-us"),
+    ("B099", "refused-by-us"),
+    ("B101", "differ"),
+    ("B103", "differ"),
+    ("C007", "refused-by-us"),
+    ("C014", "refused-by-us"),
+    ("C021", "refused-by-us"),
+    ("C032", "refused-by-us"),
+    ("C033", "refused-by-us"),
+    ("C045", "differ"),
+    ("E106", "harness-gap"),
+    ("E109", "harness-gap"),
+    ("F004", "differ"),
+    ("F011", "differ"),
+    ("F015", "differ"),
+    ("F016", "refused-by-us"),
+    ("F019", "differ"),
+    ("F020", "differ"),
+    ("F024", "differ"),
+    ("F025", "differ"),
+    ("F030", "refused-by-us"),
+    ("F031", "differ"),
+    ("F035", "differ"),
+    ("F037", "differ"),
+    ("F039", "differ"),
+    ("F040", "differ"),
+    ("F047", "differ"),
+    ("F051", "refused-by-us"),
+    ("F052", "refused-by-us"),
+    ("F053", "refused-by-us"),
+    ("F061", "differ"),
+    ("F062", "differ"),
+    ("F063", "differ"),
+    ("F064", "differ"),
+    ("F075", "refused-by-us"),
+    ("F076", "refused-by-us"),
+    ("F079", "refused-by-us"),
+    ("F082", "differ"),
+    ("F083", "refused-by-us"),
+    ("F087", "differ"),
+    ("F088", "differ"),
+    ("F089", "differ"),
+    ("F091", "differ"),
+    ("F092", "refused-by-us"),
+    ("F096", "differ"),
+    ("F097", "differ"),
+    ("F098", "differ"),
+    ("Z001", "refused-by-us"),
+    ("Z006", "refused-by-us"),
+    ("Z007", "refused-by-us"),
+    ("Z008", "refused-by-us"),
+    ("Z014", "refused-by-us"),
+    ("Z017", "differ"),
+    ("Z018", "differ"),
+];
+
+/// Chart / SynSig fixtures of the run: all `harness-gap · NoBarsRoot` without a bars root (the
+/// Mac runs them with `pine-conf report --tv --bars DIR`).
+const TV_NO_BARS: usize = 186;
+
+fn tv_options() -> RunnerOptions {
+    let mut o = RunnerOptions::new(root());
+    o.limits = pine_conformance::run::TV_LIMITS;
+    o.run_tv_only = true;
+    o
+}
+
+#[test]
+fn tv_fixtures_hold_the_known_pass_set() {
+    use pine_conformance::triage::{classify_tv, tv_class_name, TvClass};
+    let mut runner = Runner::new(tv_options()).expect("runner");
+    assert_eq!(
+        runner.syminfo_source(),
+        SyminfoSource::Captured,
+        "the captured syminfo.tsv is in the tree"
+    );
+    let all = load_all();
+    let tv: Vec<&Fixture> = all
+        .iter()
+        .filter(|f| pine_conformance::run::is_tv_captured(f))
+        .collect();
+    assert_eq!(
+        tv.len(),
+        514,
+        "captured fixtures run (517 − C044 D053 D054)"
+    );
+    let (mut pass, mut gaps) = (Vec::new(), Vec::new());
+    let mut no_bars = 0usize;
+    for f in tv {
+        let t = classify_tv(f, &runner.check_full(f));
+        let id = f.id.as_str().to_string();
+        let charted = matches!(f.driver, Driver::Chart | Driver::SynSig);
+        if charted {
+            assert_eq!(
+                t.cluster, "harness-gap · NoBarsRoot",
+                "{id}: a Chart / SynSig fixture without bars"
+            );
+            no_bars += 1;
+        } else if t.class == TvClass::Pass {
+            pass.push(id);
+        } else {
+            println!("TVGAP {id}\t{}\t{}", tv_class_name(t.class), t.first);
+            gaps.push((id, tv_class_name(t.class).to_string()));
+        }
+    }
+    println!(
+        "tv: pass {} / gap {} / no bars {no_bars}",
+        pass.len(),
+        gaps.len()
+    );
+    assert_eq!(no_bars, TV_NO_BARS, "Chart / SynSig fixture count");
+    println!("TVPASS {pass:?}");
+    let want_pass: Vec<String> = TV_PASS.iter().map(|s| s.to_string()).collect();
+    let want_gaps: Vec<(String, String)> = TV_GAPS
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+    let lost: Vec<&String> = want_pass.iter().filter(|p| !pass.contains(p)).collect();
+    assert!(
+        lost.is_empty(),
+        "TradingView regressions (left the pass set): {lost:?}"
+    );
+    assert_eq!(
+        pass, want_pass,
+        "TradingView pass set moved (an engine fix: update TV_PASS / TV_GAPS)"
+    );
+    assert_eq!(gaps, want_gaps, "TradingView gap table moved");
 }

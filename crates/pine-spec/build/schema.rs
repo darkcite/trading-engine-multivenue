@@ -1183,7 +1183,7 @@ fn lower_overload(
             }
         }
         let dn = po.get("default");
-        let default = lower_default(dn, s, pv, fulls, val_ranges, &m.values)?;
+        let default = lower_default(dn, s, &tvk, pv, fulls, val_ranges, &m.values)?;
         if let Some(target) = derived_param(dn)? {
             pending.push((m.params.len(), target, dn.off));
         }
@@ -1276,6 +1276,7 @@ fn lower_overload(
 fn lower_default(
     n: &Node<'_>,
     s: Sig,
+    tvk: &[u8; 3],
     pv: Mask,
     fulls: &[&str],
     val_ranges: &[(u16, u16)],
@@ -1317,7 +1318,31 @@ fn lower_default(
     }
     let o = Obj::of(n, "default", &["k", "v"], &[])?;
     let v = o.get("v");
-    let ty = if s.tv & 3 != 0 { Ty::Void } else { s.ty.ty };
+    // pin:00-var-literal-default — a whole type variable takes a literal default of a scalar
+    // kind it admits (L3, delta 2026-10-17: `sort_field` is `const int/string`, "The default
+    // is 0"); any other literal on a variable stays R9. A `value` default on one stays R21.
+    let ty = match s.tv & 3 {
+        0 => s.ty.ty,
+        w => {
+            let (lit, kn) = match kind {
+                "int" => (Ty::Int, "int"),
+                "float" => (Ty::Float, "float"),
+                "bool" => (Ty::Bool, "bool"),
+                "color" => (Ty::Color, "color"),
+                "str" => (Ty::String, "string"),
+                _ => (Ty::Void, ""),
+            };
+            let bit = KIND_NAMES
+                .iter()
+                .position(|k| *k == kn)
+                .map_or(0, |i| 1u8 << i);
+            if tvk[w as usize - 1] & bit != 0 {
+                lit
+            } else {
+                Ty::Void
+            }
+        }
+    };
     let mismatch = || {
         fail(
             v.off,

@@ -161,6 +161,54 @@ pub const SIGNALS_TSV: &str = "tests/conformance/capture/signals.tsv";
 /// The realtime chart's timeframe (§4.5.3: the live capture chart is 1-minute).
 pub const RT_TIMEFRAME_S: u32 = 60;
 
+/// `pin:06-tv-run-tier3` (R-P5, 2026-10-17: tier 3 now) — the TradingView run compiles under
+/// [`DEFAULT_LIMITS`] with tier 3 active (`0b0111`): a tier-3 fixture is judged, never skipped.
+pub const TV_LIMITS: CompileLimits = CompileLimits {
+    active_tiers: 0b0111,
+    ..DEFAULT_LIMITS
+};
+
+/// Captured fixtures left out of the TradingView run by id. Empty: a fixture waiting for a
+/// re-capture (C044 / D053 / D054, R-P3) or a re-paste (F007 / C029 / F085 / E056 / E110, R-P2) is
+/// `pending` and the `pending` filter already skips it; once captured it must be judged again, so
+/// nothing is excluded by id (r27 review fix 2).
+pub const TV_EXCLUDED: &[&str] = &[];
+
+/// A captured TradingView fixture of the run: oracle `tv` / `tv_only`, a captured body (not
+/// `pending`), not in [`TV_EXCLUDED`].
+pub fn is_tv_captured(f: &Fixture) -> bool {
+    f.oracle.is_captured_kind()
+        && f.expect != Expect::Pending
+        && !TV_EXCLUDED.contains(&f.id.as_str())
+}
+
+/// Every `.fix` under `<root>/tests/conformance/fixtures/<group>/`, sorted by group then id.
+pub fn load_tree(root: &Path) -> Result<Vec<Fixture>, String> {
+    let dir = root.join(crate::FIXTURE_ROOT).join("fixtures");
+    let mut groups: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    groups.sort();
+    let mut out = Vec::new();
+    for g in groups {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&g)
+            .map_err(|e| format!("{}: {e}", g.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "fix"))
+            .collect();
+        files.sort();
+        for p in files {
+            // COPY: one .fix's bytes (≤ ~1 MiB) per fixture at load — Fixture::parse owns no file —
+            // mapping the tree rejected (load time, never a bar step).
+            let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+            out.push(Fixture::parse(&text, &p.display().to_string()).map_err(|e| e.to_string())?);
+        }
+    }
+    Ok(out)
+}
+
 /// How the runner is pointed at the tree.
 #[derive(Debug, Clone)]
 pub struct RunnerOptions {
@@ -180,6 +228,12 @@ pub struct RunnerOptions {
     /// injectable so a test can point the runner at an explicitly absent file and hold the
     /// stand-in's behaviour whether or not the captured file exists in the tree.
     pub syminfo_tsv: PathBuf,
+    /// Run `tv_only` fixtures instead of skipping them (`SkipReason::TvOnly`, §4.5.9).
+    ///
+    /// `pin:06-tv-only-runs-in-report` — §4.5.9 skips `tv_only` in the suite; R-P1 (2026-10-17)
+    /// makes every captured fixture, `tv_only` included, an oracle for the divergence report
+    /// (`pine-conf report --tv`). The suite keeps the skip (`false`).
+    pub run_tv_only: bool,
 }
 
 impl RunnerOptions {
@@ -193,6 +247,7 @@ impl RunnerOptions {
             limits: DEFAULT_LIMITS,
             syn_bars_default: 64,
             syminfo_tsv: PathBuf::from(chart::SYMINFO_TSV),
+            run_tv_only: false,
         }
     }
 }
@@ -465,6 +520,27 @@ impl Runner {
         Ok((text, sha))
     }
 
+    /// The script's text as written: the chart pin and I2 checked, no dialect rewrite.
+    fn source_bytes(&self, f: &Fixture) -> Result<String, RunError> {
+        if f.chart_sha256 != spec::SHA256 {
+            return Err(RunError::ChartHash {
+                fixture: f.chart_sha256,
+                chart: spec::SHA256,
+            });
+        }
+        let bytes = std::fs::read(self.opts.root.join(&f.script))
+            .map_err(|e| fix_err(&f.script, 0, format!("cannot read the script: {e}")))?;
+        if core_crypto::sha256(&bytes) != f.script_sha256 {
+            return Err(fix_err(
+                &f.script,
+                0,
+                "script_sha256 ≠ the script's bytes (I2)".into(),
+            ));
+        }
+        String::from_utf8(bytes)
+            .map_err(|_| fix_err(&f.script, 0, "the script is not UTF-8".into()))
+    }
+
     /// The syminfo `f` may run against (`pin:06-syminfo-standin`).
     fn syminfo_for(&self, f: &Fixture) -> Result<&Syminfo, RunError> {
         match (&self.si, self.si_src) {
@@ -543,7 +619,7 @@ impl Runner {
         if tier_bit & self.opts.limits.active_tiers == 0 {
             return Err(RunError::Skip(SkipReason::TierInactive { tier: f.tier }));
         }
-        if f.oracle == Oracle::TvOnly {
+        if f.oracle == Oracle::TvOnly && !self.opts.run_tv_only {
             return Err(RunError::Skip(SkipReason::TvOnly));
         }
         let refuse = matches!(f.expect, Expect::Refuse { .. });
@@ -997,12 +1073,30 @@ impl Runner {
     /// Everything a fixture asserts: every declared dialect (and v5 ≡ v6 for `56`, I9), the
     /// `live_refuse` compile, the expectation under §4.4's tolerance.
     pub fn check(&mut self, f: &Fixture) -> Verdict {
+        self.check_full(f).verdict
+    }
+
+    /// [`Runner::check`] with what it saw: the primary dialect's run and the expectation held
+    /// against that run alone (the TradingView divergence report, `pine-conf report --tv`).
+    pub fn check_full(&mut self, f: &Fixture) -> Checked {
         let d0 = primary_dialect(f.dialects);
         if let Expect::Parse { accept } = f.expect {
-            return self.check_parse(f, d0, accept);
+            let v = self.check_parse(f, d0, accept);
+            return Checked {
+                verdict: v.clone(),
+                primary: None,
+                expectation: v,
+                fault_row: None,
+            };
         }
         let r0 = self.run(f, d0);
         let fault_key = self.fault_key;
+        let done = |verdict: Verdict, expectation: Verdict, r0| Checked {
+            verdict,
+            primary: Some(r0),
+            expectation,
+            fault_row: fault_key,
+        };
         // A `Refuse` fixture reaches a bars skip only after it compiled: that is its failure.
         let compiled = matches!(
             r0,
@@ -1011,12 +1105,14 @@ impl Runner {
             ))
         ) && matches!(f.expect, Expect::Refuse { .. });
         if let (Err(RunError::Skip(s)), false) = (&r0, compiled) {
-            return Verdict::Skipped(*s);
+            let v = Verdict::Skipped(*s);
+            return done(v.clone(), v, r0);
         }
+        let exp = self.expectation(f, &r0, fault_key);
         if f.dialects == Dialects::BOTH {
             let r5 = self.run(f, Dialect::V5);
             if let Some((first_row, plot)) = dialect_divergence(&r0, &r5) {
-                return Verdict::DialectDivergence { first_row, plot };
+                return done(Verdict::DialectDivergence { first_row, plot }, exp, r0);
             }
         }
         if let Some(code) = f.live_refuse {
@@ -1027,28 +1123,38 @@ impl Runner {
                 match self.compile_only(f, d, true) {
                     Err(e) if e.code() == Some(code) => {}
                     Err(e) => {
-                        return fail(format!(
+                        let v = fail(format!(
                             "live_refuse {}: v{} refused {e:?}",
                             code.0, d as u8
-                        ))
+                        ));
+                        return done(v, exp, r0);
                     }
                     Ok(_) => {
-                        return fail(format!(
+                        let v = fail(format!(
                             "live_refuse {}: v{} compiled live-bound",
                             code.0, d as u8
-                        ))
+                        ));
+                        return done(v, exp, r0);
                     }
                 }
             }
         }
-        self.expectation(f, &r0, fault_key)
+        done(exp.clone(), exp, r0)
     }
 
     fn check_parse(&mut self, f: &Fixture, d: Dialect, accept: bool) -> Verdict {
         if let Err(e) = self.syminfo_for(f) {
             return fail(format!("{e:?}"));
         }
-        let (text, _) = match self.source(f, d) {
+        // pin:06-parse-raw-text — a `Parse` fixture in one dialect parses the script's bytes as
+        // written (I2 still checked): the version line is what Z007 / Z008 probe, so the dialect
+        // rewrite (which refuses a malformed or second version line) is not applied to it.
+        let src = if f.dialects == Dialects::BOTH {
+            self.source(f, d).map(|(t, _)| t)
+        } else {
+            self.source_bytes(f)
+        };
+        let text = match src {
             Ok(t) => t,
             Err(e) => return fail(format!("{e:?}")),
         };
@@ -1142,8 +1248,44 @@ impl Runner {
     }
 }
 
+/// What [`Runner::check_full`] saw.
+#[derive(Debug)]
+pub struct Checked {
+    /// [`Runner::check`]'s verdict.
+    pub verdict: Verdict,
+    /// The primary dialect's run (`None` for a `Parse` expectation).
+    pub primary: Option<Result<RunOutcome, RunError>>,
+    /// The expectation held against the primary run alone — it differs from `verdict` when I9
+    /// (v5 ≢ v6) or `live_refuse` decided first.
+    pub expectation: Verdict,
+    /// The primary run's fault row key.
+    pub fault_row: Option<i64>,
+}
+
 fn fail(what: String) -> Verdict {
     Verdict::Fail(Divergence::error(what))
+}
+
+/// `pin:06-rt-bookkeeping-columns` (R-P3, 2026-10-17) — on a `Driver::Rt` fixture the plots whose
+/// title ends `_rt`, `_done`, `_upd` or `_k` are capture bookkeeping (which rows are realtime and
+/// confirmed, the tick count): a `series` body never compares them; the report says so.
+pub fn is_rt_bookkeeping(f: &Fixture, p: usize) -> bool {
+    f.driver == Driver::Rt
+        && f.plots.get(p).is_some_and(|s| {
+            matches!(
+                s.title.rsplit('_').next(),
+                Some("rt" | "done" | "upd" | "k")
+            )
+        })
+}
+
+/// The run row index of row key `key` (`Step`: the key; `Time`: from the open time).
+fn row_index(f: &Fixture, key: i64) -> i64 {
+    match (f.align, f.driver) {
+        (Align::Step, _) => key,
+        (Align::Time, Driver::Rt) => (key - spec::FROM_MS) / (i64::from(RT_TIMEFRAME_S) * 1000),
+        (Align::Time, _) => (key - spec::FROM_MS) / spec::TF_MS,
+    }
 }
 
 /// §4.4.2 over every expected row: the first divergent row, the first out of bound.
@@ -1166,6 +1308,10 @@ fn compare_rows(f: &Fixture, rows: &[Row], o: &RunOutcome) -> Option<Divergence>
         }
         let mut p = 0usize;
         while p < np {
+            if is_rt_bookkeeping(f, p) {
+                p += 1;
+                continue;
+            }
             let c = compare_cell(&row.cells[p], o.plots[r * np + p], f.plots[p].tol);
             if c != crate::cmp::Cmp::Equal {
                 let d = div.get_or_insert(Divergence {
@@ -1187,15 +1333,25 @@ fn compare_rows(f: &Fixture, rows: &[Row], o: &RunOutcome) -> Option<Divergence>
 }
 
 /// `Relation`: every realtime row of each title equals its constant (exactly).
+///
+/// `pin:06-relation-rows` (R-P3) — "realtime row" is a row whose run index is ≥ `rt.history`
+/// (for `align time` the index comes from the open time, never the key itself); where the fixture
+/// declares a `_done` bookkeeping plot, a row our run left unconfirmed (`done` ≠ 1, the open last
+/// bar of `rt … open`) is not one, mirroring distil's `rt = 1 & done = 1` row set (§4.7.8).
 fn relation(f: &Fixture, rel: &[(String, i64)], o: &RunOutcome) -> Verdict {
     let history = f.rt.map_or(0, |r| i64::from(r.history));
     let np = o.plot_ix.len();
+    let done_p = (0..f.plots.len())
+        .find(|&p| is_rt_bookkeeping(f, p) && f.plots[p].title.ends_with("_done"));
     for (title, c) in rel {
         let Some(p) = f.plots.iter().position(|ps| &ps.title == title) else {
             return fail(format!("relation names `{title}`, not a declared plot"));
         };
         for (r, key) in o.keys.iter().enumerate() {
-            if *key < history {
+            if row_index(f, *key) < history {
+                continue;
+            }
+            if done_p.is_some_and(|dp| o.plots[r * np + dp] != 1.0) {
                 continue;
             }
             let v = o.plots[r * np + p];

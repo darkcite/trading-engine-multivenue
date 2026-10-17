@@ -65,6 +65,16 @@ fn decl_calc_on_every_tick_in_bar_close_is_refused() {
     assert_eq!(run(&off, ExecMode::BarClose), vec![ACCEPTED]);
 }
 
+/// R-P6 (delta 2026-10-17 §2.4): `calc_on_every_history_tick` joins rule `3052`.
+#[test]
+fn decl_calc_on_every_history_tick_in_bar_close_is_refused() {
+    let s = strategy(", calc_on_every_history_tick = true");
+    assert_eq!(run(&s, ExecMode::BarClose), vec![3052]);
+    assert_eq!(run(&s, ExecMode::Realtime), vec![ACCEPTED]);
+    let off = strategy(", calc_on_every_history_tick = false");
+    assert_eq!(run(&off, ExecMode::BarClose), vec![ACCEPTED]);
+}
+
 #[test]
 fn decl_close_entries_rule_other_than_fifo_any_is_refused() {
     let lifo = strategy(", close_entries_rule = \"LIFO\"");

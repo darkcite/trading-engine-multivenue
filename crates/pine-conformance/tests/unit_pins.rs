@@ -28,10 +28,11 @@ fn disk() -> Vec<Fixture> {
 
 #[test]
 fn every_pin_has_fixtures() {
-    // §4.9.8: 26 + 8 + 21 + 38 = 93 names, each with ≥ 1 fixture.
-    assert_eq!(PINS.len(), 93);
+    // §4.9.8: 26 + 9 + 21 + 38 = 94 names (the 9th `pin:06-*` is R-P2's
+    // `pin:06-na-object-field`), each with ≥ 1 fixture.
+    assert_eq!(PINS.len(), 94);
     let names: BTreeSet<&str> = PINS.iter().map(|p| p.name).collect();
-    assert_eq!(names.len(), 93, "unique");
+    assert_eq!(names.len(), 94, "unique");
     let fx = disk();
     for p in PINS {
         assert!(p.ids().count() >= 1, "{} has no fixture", p.name);
@@ -65,7 +66,7 @@ fn every_pin_has_fixtures() {
         assert_eq!(pins::decide(p, &pre), Decision::Pending, "{}", p.name);
     }
     let tsv = pins::tsv(&pre);
-    assert_eq!(tsv.lines().count(), 93);
+    assert_eq!(tsv.lines().count(), 94);
     assert!(tsv
         .lines()
         .all(|l| l.split('\t').count() == 6 && l.ends_with("\tpending\tpending\tpending")));

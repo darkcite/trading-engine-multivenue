@@ -19,3 +19,6 @@ oracle	tv
 tier	1
 plot	f_E056_pos	exact
 pending
+reading	refuse_literal
+refuse	3007
+end

@@ -539,7 +539,14 @@ fn unsupported(a: &Args<'_>, kind: ScriptKind, opts: &CompileOpts, diags: &mut V
 
 /// The checks only a `strategy(…)` declaration has: `3052` and `3053`.
 fn strategy_checks(a: &Args<'_>, opts: &CompileOpts, f: &mut Fold<'_>) {
-    for flag in ["calc_on_order_fills", "calc_on_every_tick"] {
+    // R-P6 (delta 2026-10-17 §2.4): `calc_on_every_history_tick` executes intrabar too (the TV
+    // broker evaluates the history path points), so a `BarClose` compilation refuses it as the
+    // other two, rather than reaching `step_tick`'s Internal fault.
+    for flag in [
+        "calc_on_order_fills",
+        "calc_on_every_tick",
+        "calc_on_every_history_tick",
+    ] {
         if let Some((V::Bool(true), sp)) = a.get(flag) {
             if opts.mode == ExecMode::BarClose {
                 let msg = format!("`{flag} = true` needs a realtime compilation (mode BarClose)");

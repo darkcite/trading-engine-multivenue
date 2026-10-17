@@ -25,3 +25,6 @@ end
 reading	runtime_abs
 0	6.0
 end
+reading	runtime_fault
+fault	ScriptRefused	0
+end

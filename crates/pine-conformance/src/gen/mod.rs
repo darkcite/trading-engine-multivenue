@@ -116,6 +116,9 @@ pub fn cells() -> Vec<Cell> {
                 cell.script.pins.push(p.to_string());
             }
         }
+        // R-P2: the escalated five's readings (`readings::escalated`), after the group's own.
+        cell.readings
+            .extend(readings::escalated(cell.script.id.as_str()));
     }
     c
 }
@@ -259,6 +262,13 @@ fn merge_capture(new: &Fixture, old: &Fixture) -> Fixture {
     // when pine-std landed the builtin: A014/A030/A046/A062/A078, 2026-10-17) carries nothing
     // captured: its `n/a` stamps and authored body are not capture-owned (I1).
     if !old.oracle.is_captured_kind() || old.captured == Stamp::NotApplicable {
+        return new.clone();
+    }
+    // pin:06-merge-script-changed (R-P3, 2026-10-17) — a capture belongs to the script bytes it was
+    // taken from: when the generator rewrites a captured fixture's script (C044 / D053 / D054 became
+    // tick-independent relations) the old body is void and the fixture returns to pending. `gen
+    // --check` reports any such rewrite before `gen` runs, so no capture is dropped unseen.
+    if old.script_sha256 != new.script_sha256 {
         return new.clone();
     }
     let mut m = new.clone();

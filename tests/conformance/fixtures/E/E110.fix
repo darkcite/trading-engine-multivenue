@@ -19,3 +19,6 @@ oracle	tv_only
 tier	1
 plot	f_E110_closed	exact
 pending
+reading	runtime_fault
+fault	ScriptRefused	9000
+end

@@ -23,7 +23,8 @@ const USAGE: &str = "usage: pine-conf gen [--check] | pine-conf sheets --dialect
 | pine-conf distil --sheet S --chart CSV [--trades CSV --perf CSV] --utc T --build B --dialect 5|6 [--verify] \
 | pine-conf distil --id ID --paste compiled|refused|runtime-error --utc T --build B --dialect 5|6 [--verify] \
 | pine-conf status | pine-conf pins | pine-conf barhash --bars DIR [--write] \
-| pine-conf shrink --grammar V --seed S --mode mode-vs-mode|interleaved [--budget STEPS]";
+| pine-conf shrink --grammar V --seed S --mode mode-vs-mode|interleaved [--budget STEPS] \
+| pine-conf report --tv [--out MD] [--bars DIR] [--title T]";
 
 /// The vault capture directory (§4.7.10, untracked) and its `manifest.tsv`.
 ///
@@ -102,7 +103,132 @@ fn main() -> ExitCode {
         ["status"] => status(root),
         ["distil", rest @ ..] => distil(root, rest),
         ["shrink", rest @ ..] => shrink(root, rest),
+        ["report", "--tv", rest @ ..] => report_tv(root, rest),
         _ => usage(),
+    }
+}
+
+/// `pine-conf report --tv [--out MD] [--bars DIR] [--title T]` (R-P1, 2026-10-17): every captured
+/// TradingView fixture (`run::is_tv_captured`) through the real engine with the captured
+/// `syminfo.tsv`, classified pass / differ / refused-by-us / fault-by-us / harness-gap
+/// (`triage::classify_tv`), rendered by `report::render_tv` to `--out` (else stdout). Exit 0 = every
+/// fixture passed, 1 = a non-pass, 2 = usage or an unreadable input.
+///
+/// `pin:06-report-tv-cli` — without `--bars` every `Chart` / `SynSig` fixture is a harness gap
+/// (`NoBarsRoot`); the Mac passes its prepared bar root.
+fn report_tv(root: &Path, rest: &[&str]) -> ExitCode {
+    use pine_conformance::run::{self, Runner, RunnerOptions, SyminfoSource};
+    use pine_conformance::triage;
+    let mut out: Option<&str> = None;
+    let mut bars: Option<&str> = None;
+    let mut title = "Conformance run — engine vs the TradingView capture";
+    let mut i = 0;
+    while i < rest.len() {
+        match (rest[i], rest.get(i + 1)) {
+            ("--out", Some(v)) => out = Some(v),
+            ("--bars", Some(v)) => bars = Some(v),
+            ("--title", Some(v)) => title = v,
+            _ => return usage(),
+        }
+        i += 2;
+    }
+    let mut opts = RunnerOptions::new(root.to_path_buf());
+    opts.limits = run::TV_LIMITS;
+    opts.run_tv_only = true;
+    opts.bars_root = bars.map(std::path::PathBuf::from);
+    let mut runner = match Runner::new(opts) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("pine-conf report: {e:?}");
+            return ExitCode::from(2);
+        }
+    };
+    if runner.syminfo_source() != SyminfoSource::Captured {
+        eprintln!("pine-conf report: tests/conformance/syminfo.tsv (the capture) is missing");
+        return ExitCode::from(2);
+    }
+    let all = match run::load_tree(root) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("pine-conf report: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let tv: Vec<&Fixture> = all.iter().filter(|f| run::is_tv_captured(f)).collect();
+    let mut rows = Vec::with_capacity(tv.len());
+    for f in &tv {
+        let c = runner.check_full(f);
+        rows.push((*f, triage::classify_tv(f, &c)));
+    }
+    let captured = all
+        .iter()
+        .filter(|f| f.oracle.is_captured_kind() && f.expect != Expect::Pending)
+        .count();
+    let pending: Vec<&str> = all
+        .iter()
+        .filter(|f| f.oracle.is_captured_kind() && f.expect == Expect::Pending)
+        .map(|f| f.id.as_str())
+        .collect();
+    let ctx = vec![
+        format!(
+            "{captured} captured fixtures (oracle tv / tv_only); ran {} — excluded this round: {} \
+             (R-P3 redesign); pending, not captured: {}",
+            rows.len(),
+            run::TV_EXCLUDED.join(" "),
+            pending.join(" ")
+        ),
+        "engine: pine-lang → pine-sema → verify → pine-vm → pine-std → TvBroker; syminfo: the \
+         captured tests/conformance/syminfo.tsv; limits: DEFAULT_LIMITS with tier 3 active \
+         (pin:06-tv-run-tier3); tv_only fixtures run (pin:06-tv-only-runs-in-report)"
+            .to_string(),
+        format!(
+            "bars root: {} (pin:06-report-tv-cli)",
+            bars.unwrap_or("none — every Chart / SynSig fixture is a harness gap")
+        ),
+        "R-P1: TradingView is the oracle — every non-pass is an engine (or harness) item; \
+         pine-vm / pine-ir items go through a CAR"
+            .to_string(),
+        "Rt series bodies compare only their non-bookkeeping columns (rt, done, upd, k are \
+         bookkeeping, pin:06-rt-bookkeeping-columns)"
+            .to_string(),
+    ];
+    let text = pine_conformance::report::render_tv(title, &ctx, &rows);
+    let c = pine_conformance::report::tv_counts(&rows);
+    match out {
+        Some(p) => {
+            if let Err(e) = std::fs::write(p, &text) {
+                eprintln!("pine-conf report: {p}: {e}");
+                return ExitCode::from(2);
+            }
+        }
+        None => print!("{text}"),
+    }
+    println!(
+        "pine-conf report --tv: {} ran · pass {} · differ {} · refused-by-us {} · fault-by-us {} · harness-gap {}",
+        rows.len(),
+        c[0],
+        c[1],
+        c[2],
+        c[3],
+        c[4]
+    );
+    for (i, (k, cr, ids)) in pine_conformance::report::tv_clusters(&rows)
+        .iter()
+        .take(10)
+        .enumerate()
+    {
+        println!(
+            "  {:>2}. {:>3}  {:<11} {k}  [{}]",
+            i + 1,
+            ids.len(),
+            triage::crate_name(*cr),
+            ids.iter().take(6).copied().collect::<Vec<_>>().join(" ")
+        );
+    }
+    if c[0] == rows.len() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
     }
 }
 

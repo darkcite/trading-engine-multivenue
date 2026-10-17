@@ -1042,7 +1042,8 @@ fn foreign_switch_pins_are_section_4_9_names() {
 fn manifest_is_frozen() {
     const HEADER: &str =
         "# fix 2 · pine-conf gen · A 96 B 124 C 46 D 62 E 121 F 98 Z 19 · total 566";
-    const FROZEN_SHA256: &str = "278009dad060fa802c5f3201b7fc19ed8a519cd2dc1480ee9e0632b8edfbd4a9";
+    // Re-frozen 2026-10-17 (R-P2): C029 gained `pin:06-na-object-field`.
+    const FROZEN_SHA256: &str = "f37058d6f251fa8207f84a32d17f8047b3fe532cc5d954a8eaa54073be1cd837";
     let text =
         std::fs::read_to_string(workspace_root().join(pine_conformance::manifest::MANIFEST_TSV))
             .unwrap();
