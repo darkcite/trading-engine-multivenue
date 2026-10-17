@@ -101,7 +101,13 @@ use core_types::{
 /// row, for the reason `AssetTable` refuses rather than evicts: an
 /// overwritten binding books a real position against the wrong
 /// market.
-pub const LEDGER_ROWS: usize = 16;
+///
+/// PM15-5 (2026-10-17): 16 → 32. Polymarket's rolling families take TWO
+/// rows each (one per window-parity slot pair, `core_types::pm_roll`): seven
+/// assets are 14 rows beside BIN15's eight Hyperliquid families, and the
+/// ledger binds every roll it sees — at 16 a PM boot would have left
+/// Hyperliquid's next instances refused.
+pub const LEDGER_ROWS: usize = 32;
 
 /// Live-arm orders the resting table can hold at once.
 ///
@@ -844,8 +850,9 @@ const _: () = assert!(LEDGER_RESTING <= u16::MAX as usize);
 // arrays 512 → 1 024 rows (+28 KiB), the 16 family rows 192 → 320 B
 // (+2 KiB) and the per-slot arrays doubled. The S16-3 review's
 // `resting_hi` (u16) sits in the 2 B the u16 `seeded` and the u32 `inst_n`
-// left as padding: the size is unchanged.
-const _: () = assert!(core::mem::size_of::<Ledger>() == 146_048);
+// left as padding: the size is unchanged. PM15-5 re-pin (146 048 →
+// 151 168 B): the family rows 16 → 32 (+16 × 320 B).
+const _: () = assert!(core::mem::size_of::<Ledger>() == 151_168);
 
 impl Ledger {
     /// An empty, UNSEEDED ledger: nothing bound, nothing held,

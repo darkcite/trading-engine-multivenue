@@ -214,7 +214,7 @@ pub fn default_seed_dir() -> Result<String, super::ConfigError> {
     super::expand_tilde("~/multivenue")
 }
 
-fn ints(kv: &[(String, Value, usize)], key: &str) -> Result<Vec<i64>, Bin15Error> {
+pub(crate) fn ints(kv: &[(String, Value, usize)], key: &str) -> Result<Vec<i64>, Bin15Error> {
     match kv.iter().find(|(k, _, _)| k == key) {
         Some((_, Value::Ints(v), _)) => Ok(v.clone()),
         Some((_, _, l)) => Err(err(format!("line {l}: `{key}` must be an integer array"))),
@@ -222,7 +222,7 @@ fn ints(kv: &[(String, Value, usize)], key: &str) -> Result<Vec<i64>, Bin15Error
     }
 }
 
-fn strs(kv: &[(String, Value, usize)], key: &str) -> Result<Vec<String>, Bin15Error> {
+pub(crate) fn strs(kv: &[(String, Value, usize)], key: &str) -> Result<Vec<String>, Bin15Error> {
     match kv.iter().find(|(k, _, _)| k == key) {
         Some((_, Value::Strs(v), _)) => Ok(v.clone()),
         Some((_, _, l)) => Err(err(format!("line {l}: `{key}` must be a string array"))),
@@ -230,7 +230,7 @@ fn strs(kv: &[(String, Value, usize)], key: &str) -> Result<Vec<String>, Bin15Er
     }
 }
 
-fn int(kv: &[(String, Value, usize)], key: &str) -> Result<i64, Bin15Error> {
+pub(crate) fn int(kv: &[(String, Value, usize)], key: &str) -> Result<i64, Bin15Error> {
     match kv.iter().find(|(k, _, _)| k == key) {
         Some((_, Value::Int(v), _)) => Ok(*v),
         Some((_, _, l)) => Err(err(format!("line {l}: `{key}` must be an integer"))),
@@ -238,7 +238,7 @@ fn int(kv: &[(String, Value, usize)], key: &str) -> Result<i64, Bin15Error> {
     }
 }
 
-fn opt_int(kv: &[(String, Value, usize)], key: &str, default: i64) -> Result<i64, Bin15Error> {
+pub(crate) fn opt_int(kv: &[(String, Value, usize)], key: &str, default: i64) -> Result<i64, Bin15Error> {
     match kv.iter().find(|(k, _, _)| k == key) {
         Some((_, Value::Int(v), _)) => Ok(*v),
         Some((_, _, l)) => Err(err(format!("line {l}: `{key}` must be an integer"))),
@@ -414,7 +414,7 @@ fn opt_pos_u64(
     }
 }
 
-fn pos_u64(kv: &[(String, Value, usize)], key: &str) -> Result<u64, Bin15Error> {
+pub(crate) fn pos_u64(kv: &[(String, Value, usize)], key: &str) -> Result<u64, Bin15Error> {
     let v = int(kv, key)?;
     u64::try_from(v).map_err(|_| err(format!("`{key}` must be positive (got {v})")))
 }
@@ -424,7 +424,7 @@ fn pos_u64(kv: &[(String, Value, usize)], key: &str) -> Result<u64, Bin15Error> 
 /// interpolation rests on: a table that dips makes `p̂` non-monotone in
 /// the mark, and a non-monotone fair value is an arbitrage the member
 /// would trade against itself.
-fn table(
+pub(crate) fn table(
     kv: &[(String, Value, usize)],
     key: &str,
     n: usize,

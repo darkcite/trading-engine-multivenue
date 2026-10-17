@@ -437,6 +437,13 @@ pub trait StrategyCounters {
         Bin15Counters::default()
     }
 
+    /// PM15: slot 9's observables (`engine_pm15_*`), mirrored by the cli's
+    /// generic 5 s block like [`Self::bin15_counters`].
+    #[inline]
+    fn pm15_counters(&self) -> Pm15Counters {
+        Pm15Counters::default()
+    }
+
     /// BIN15 O4b: copy the per-family view into `out`, returning how
     /// many families are CONFIGURED (not how many are live — a dormant
     /// slot still has a row, because "no instance" is the observation).
@@ -1469,6 +1476,160 @@ pub struct XmmPerpView {
     pub _pad: [u8; 5],
 }
 const _: () = assert!(core::mem::size_of::<XmmPerpView>() == 72);
+
+/// PM15 (slot 9): the Polymarket 15-minute H90 member's observables.
+///
+/// The tallies are cumulative (the cli mirrors them as deltas into
+/// `engine_pm15_<name>_total`, names in [`PM15_COUNTER_NAMES`] order —
+/// [`Pm15Counters::tallies`]); the levels below them are gauges. Every
+/// `hold_*` / `skip_*` is a REASON, the bin15 law: the operator of a
+/// silent member needs to know which gate held.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pm15Counters {
+    /// `InstrumentRoll` created events bound to a market slot.
+    pub rolls: u64,
+    /// Settled rolls that closed a market with a winner.
+    pub rolls_settled: u64,
+    /// Settled rolls with no winner known (retired unresolved).
+    pub rolls_unknown: u64,
+    /// Rolls refused on shape (a venue, slot or family byte not ours).
+    pub rolls_refused: u64,
+    /// Strikes estimated from the Chainlink reports (`[open−60, open−1]`).
+    pub strikes_computed: u64,
+    /// Strikes taken from the venue's published `priceToBeat`.
+    pub strikes_published: u64,
+    /// Windows whose strike could not be estimated (reports missing).
+    pub strikes_missing: u64,
+    /// Pricer runs inside the window that produced a price.
+    pub reprices: u64,
+    /// Pricer holds: under the σ minimum.
+    pub hold_sigma: u64,
+    /// Pricer holds: no fresh fast-venue mid or basis.
+    pub hold_nowcast: u64,
+    /// Pricer holds: the newest report too old.
+    pub hold_mark: u64,
+    /// Pricer holds: an observed second with no report.
+    pub hold_observed: u64,
+    /// Pricer holds: shape (no strike, past the end, out of range).
+    pub hold_shape: u64,
+    /// Entries skipped: the belief under `p_min`.
+    pub skip_belief: u64,
+    /// Entries skipped: the belief held, not yet on `persist` seconds.
+    pub skip_persist: u64,
+    /// Entries skipped: no fresh ask on the favoured leg.
+    pub skip_book: u64,
+    /// Entries skipped: the ask not `e` under the belief.
+    pub skip_price: u64,
+    /// Entries skipped: a cap, the order count or the minimum size.
+    pub skip_cap: u64,
+    /// Entries skipped: the session loss bound is spent.
+    pub skip_halt: u64,
+    /// IoCs submitted.
+    pub takes_submitted: u64,
+    /// IoCs that filled (any quantity).
+    pub takes_filled: u64,
+    /// IoCs that reached their deadline with nothing filled.
+    pub takes_unfilled: u64,
+    /// Submits the dispatcher refused.
+    pub submit_refused: u64,
+    /// Fills booked against a pending IoC.
+    pub fills: u64,
+    /// Fills no pending owned.
+    pub unknown_fills: u64,
+    /// Settled markets where a position of ours won.
+    pub settled_won: u64,
+    /// Settled markets where a position of ours lost.
+    pub settled_lost: u64,
+    /// Settled markets whose winner was unknown with a position open.
+    pub settled_unknown: u64,
+    // ---- levels (gauges) ----
+    /// Realised session P&L ×1e6 USD, fees included.
+    pub pnl_1e6: i64,
+    /// Fees paid this session ×1e6 USD.
+    pub fees_1e6: i64,
+    /// Notional bought this session ×1e6 USD.
+    pub bought_1e6: i64,
+    /// Cost of the positions not yet settled ×1e6 USD.
+    pub open_cost_1e6: i64,
+    /// Markets live right now.
+    pub markets_live: u64,
+    /// `1` once the session loss bound is spent (entries stop).
+    pub halted: u64,
+}
+
+/// How many cumulative tallies [`Pm15Counters`] carries (its fields from
+/// `rolls` through `settled_unknown`, in order).
+pub const PM15_TALLIES: usize = 28;
+
+/// The metric suffix of each tally, in [`Pm15Counters::tallies`] order.
+pub const PM15_COUNTER_NAMES: [&str; PM15_TALLIES] = [
+    "rolls",
+    "rolls_settled",
+    "rolls_unknown",
+    "rolls_refused",
+    "strikes_computed",
+    "strikes_published",
+    "strikes_missing",
+    "reprices",
+    "hold_sigma",
+    "hold_nowcast",
+    "hold_mark",
+    "hold_observed",
+    "hold_shape",
+    "skip_belief",
+    "skip_persist",
+    "skip_book",
+    "skip_price",
+    "skip_cap",
+    "skip_halt",
+    "takes_submitted",
+    "takes_filled",
+    "takes_unfilled",
+    "submit_refused",
+    "fills",
+    "unknown_fills",
+    "settled_won",
+    "settled_lost",
+    "settled_unknown",
+];
+
+impl Pm15Counters {
+    /// The tallies in [`PM15_COUNTER_NAMES`] order.
+    #[must_use]
+    pub const fn tallies(&self) -> [u64; PM15_TALLIES] {
+        [
+            self.rolls,
+            self.rolls_settled,
+            self.rolls_unknown,
+            self.rolls_refused,
+            self.strikes_computed,
+            self.strikes_published,
+            self.strikes_missing,
+            self.reprices,
+            self.hold_sigma,
+            self.hold_nowcast,
+            self.hold_mark,
+            self.hold_observed,
+            self.hold_shape,
+            self.skip_belief,
+            self.skip_persist,
+            self.skip_book,
+            self.skip_price,
+            self.skip_cap,
+            self.skip_halt,
+            self.takes_submitted,
+            self.takes_filled,
+            self.takes_unfilled,
+            self.submit_refused,
+            self.fills,
+            self.unknown_fills,
+            self.settled_won,
+            self.settled_lost,
+            self.settled_unknown,
+        ]
+    }
+}
 
 /// BIN15 counters (`engine_bin15_*`), mirrored by the cli's generic 5 s
 /// block. Defined HERE for the reason [`IcdpCounters`] is.

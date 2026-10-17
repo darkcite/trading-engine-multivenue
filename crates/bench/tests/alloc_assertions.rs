@@ -20296,3 +20296,192 @@ fn binance_equity_lane_render_and_scan_steady_state() {
     assert_eq!((pages, lists), (N.div_ceil(64), N.div_ceil(64)), "gate 113: the page and the listing at their cadence");
     assert_eq!(allocs, 0, "gate 113: equity's render and scans allocated {allocs} times ({bytes} B)");
 }
+
+/// PM15 gate 114: the rolling 15m ingress driver's frame paths and slot 9's
+/// member, in steady state — `book` snapshots, `price_change` events (the
+/// ladder, the venue touch, the change-gated tick), Chainlink reports
+/// (marks), the roll clock; and the member's report grid, nowcast, pricer,
+/// persistence, take, fill and settlement. Zero bytes per operation.
+#[test]
+fn pm15_ingress_driver_and_member_are_zero_alloc() {
+    use core_ring::Ring;
+    use core_twaplock::late::LateLut;
+    use core_types::pm_roll::{
+        pm_instance_id, pm_mark_sym, pm_pair_of_window, pm_roll_family, pm_rolling_sym,
+        pm_window_end_ns, pm_window_of_open, PM_LEG_DOWN, PM_LEG_UP, PM_SETTLED_UP, PM_TWAP_S,
+    };
+    use core_types::{ChannelEvent, ChannelId, Fill, NullCapture, Order, Price, Qty, Side, Tick, VenueId};
+    use ingress_polymarket::gamma15::PmWindowSpec;
+    use ingress_polymarket::pm15_loop::{Pm15Counters, Pm15Driver, Pm15Out, Pm15Wire, PM15_EVENT_MASK};
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+
+    /// A wire that counts what it would send.
+    struct CountWire(usize);
+    impl Pm15Wire for CountWire {
+        fn is_open(&self) -> bool {
+            true
+        }
+        fn queue(&mut self, parts: &[&[u8]]) -> bool {
+            let mut i = 0usize;
+            while i < parts.len() {
+                self.0 += parts[i].len();
+                i += 1;
+            }
+            true
+        }
+    }
+    /// A ctx that counts orders and keeps the last one.
+    struct CountCtx {
+        now: u64,
+        n: u64,
+        last: Option<Order>,
+    }
+    impl Ctx for CountCtx {
+        fn submit(&mut self, order: Order) -> Result<(), SubmitErr> {
+            self.n += 1;
+            self.last = Some(order);
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    const S: u64 = 1_000_000_000;
+    const OPEN: u64 = 1_792_216_800;
+    let w = pm_window_of_open(OPEN).unwrap();
+    let up = b"74913418352376030655968323928940542465856871160803692353977404305259528321778";
+    let down = b"108416957532714595532891587985594213692071846013834323276407586325741402897137";
+
+    // ---- the ingress driver (boot: tables, rings, frames) ----
+    let mut spec = PmWindowSpec::EMPTY;
+    spec.window = w;
+    spec.tick_1e6 = 10_000;
+    spec.min_size_1e6 = 5_000_000;
+    spec.up.b[..up.len()].copy_from_slice(up);
+    spec.up.len = up.len() as u8;
+    spec.down.b[..down.len()].copy_from_slice(down);
+    spec.down.len = down.len() as u8;
+    let (mut tick_tx, mut tick_rx) = Ring::<Tick, { ingress_polymarket::DEFAULT_TICK_RING_CAP }>::new().split();
+    let (mut ev_tx, mut ev_rx) = Ring::<ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let status = core_metrics::IngressStatus::new();
+    let counters = Pm15Counters::new();
+    let mut cap = NullCapture;
+    let mut wire = CountWire(0);
+    let mut d = Pm15Driver::new(&[b"btc"], 5_000);
+    let wall0 = (OPEN + 100) * S;
+    {
+        let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap };
+        d.offer(&spec, wall0, wall0, &mut out, &mut wire);
+    }
+    let us = std::str::from_utf8(up).unwrap();
+    let ds = std::str::from_utf8(down).unwrap();
+    let book = format!(
+        "[{{\"market\":\"0x70\",\"asset_id\":\"{us}\",\"timestamp\":\"1792216900000\",\"hash\":\"h\",\"bids\":[{{\"price\":\"0.40\",\"size\":\"10\"}},{{\"price\":\"0.50\",\"size\":\"10\"}}],\"asks\":[{{\"price\":\"0.60\",\"size\":\"7\"}},{{\"price\":\"0.52\",\"size\":\"7\"}}],\"event_type\":\"book\"}}, {{\"market\":\"0x70\",\"asset_id\":\"{ds}\",\"timestamp\":\"1792216900000\",\"hash\":\"h\",\"bids\":[{{\"price\":\"0.48\",\"size\":\"7\"}}],\"asks\":[{{\"price\":\"0.50\",\"size\":\"10\"}}],\"event_type\":\"book\"}}]"
+    );
+    let mut changes: Vec<String> = Vec::with_capacity(64);
+    let mut k = 0u32;
+    while k < 64 {
+        let sz = 10 + k % 7;
+        changes.push(format!(
+            "{{\"market\":\"0x70\", \"price_changes\":[{{\"asset_id\":\"{us}\", \"price\":\"0.50\", \"size\":\"{sz}\", \"side\":\"BUY\", \"hash\":\"a\", \"best_bid\":\"0.5\", \"best_ask\":\"0.52\"}}, {{\"asset_id\":\"{ds}\", \"price\":\"0.50\", \"size\":\"{sz}\", \"side\":\"SELL\", \"hash\":\"b\", \"best_bid\":\"0.48\", \"best_ask\":\"0.5\"}}], \"timestamp\":\"{}\", \"event_type\":\"price_change\"}}",
+            1_792_216_900_000u64 + u64::from(k)
+        ));
+        k += 1;
+    }
+    let mut marks: Vec<String> = Vec::with_capacity(64);
+    let mut k = 0u64;
+    while k < 64 {
+        marks.push(format!(
+            "{{\"connection_id\":\"x\",\"payload\":{{\"full_accuracy_value\":\"{}\",\"symbol\":\"btc/usd\",\"timestamp\":{},\"value\":1.0}},\"timestamp\":1,\"topic\":\"crypto_prices_chainlink\",\"type\":\"update\"}}",
+            81_000_000_000_000_000_000_000u128 + u128::from(k) * 1_000_000_000_000_000,
+            (OPEN + 200 + k) * 1_000
+        ));
+        k += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut i = 0usize;
+    while i < 2_000 {
+        let now = wall0 + i as u64 * 1_000_000;
+        let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap };
+        if i % 256 == 0 {
+            d.on_market_text(book.as_bytes(), now, now, &mut out);
+        }
+        d.on_market_text(changes[i % 64].as_bytes(), now, now, &mut out);
+        if i % 32 == 0 {
+            d.on_rtds_text(marks[(i / 32) % 64].as_bytes(), now, &mut out);
+            d.on_clock(now, now, &mut out, &mut wire);
+        }
+        d.perform(now, &mut out, &mut wire);
+        while tick_rx.try_pop_ref().is_some() {}
+        while ev_rx.try_pop_ref().is_some() {}
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    assert!(counters.of(ingress_polymarket::pm15_loop::Pm15Counter::Marks) > 0, "gate 114: marks flowed");
+    assert!(status.ticks_total() > 0, "gate 114: ticks flowed");
+    assert_eq!(allocs, 0, "gate 114: the PM15 ingress driver allocated {allocs} times ({bytes} B)");
+
+    // ---- slot 9's member (boot: configure, the grids) ----
+    let mut lut = Box::new(LateLut::flat());
+    let mut z = 0usize;
+    while z < core_twaplock::late::LATE_PHI_POINTS {
+        lut.phi[z] = (500_000 + ((z as i64 * 2_000).min(4_000_000) / 8)) as u32;
+        z += 1;
+    }
+    let perp = core_types::make_symbol_id(VenueId::Hyperliquid, 1);
+    let mut perp_sym = [core_types::SYMBOL_ID_NONE; strategy_pm15::PM15_MAX_FAMILIES];
+    perp_sym[0] = perp;
+    let p = strategy_pm15::Pm15Params { n_families: 1, perp_sym, ..strategy_pm15::Pm15Params::default() };
+    let mut m = strategy_pm15::Pm15Strategy::new();
+    m.configure(p, lut, core_time::WallAnchor::new(0, 0)).expect("gate 114: configure");
+    let roll = |wc: u32, settled: bool, v0: i64| {
+        let pair = pm_pair_of_window(wc);
+        let inst = pm_instance_id(wc, 0).unwrap();
+        ChannelEvent::new(0, VenueId::Polymarket, ChannelId::InstrumentRoll, pm_rolling_sym(0, pair, PM_LEG_UP), core_types::pack_roll_seq(inst, PM_TWAP_S, pm_roll_family(0, pair), settled), 0, v0, pm_window_end_ns(wc) as i64)
+    };
+    let law = |wc: u32| {
+        let inst = pm_instance_id(wc, 0).unwrap();
+        ChannelEvent::new(0, VenueId::Polymarket, ChannelId::OutcomeMeta, pm_rolling_sym(0, pm_pair_of_window(wc), PM_LEG_UP), u64::from(inst), 0, 10_000, 5_000_000)
+    };
+    let mut c = CountCtx { now: 0, n: 0, last: None };
+    let base: i64 = 81_000_000_000;
+    let g = AllocGuard::new();
+    let mut cycle = 0u32;
+    // Four windows two apart (one slot pair), each with the 20 minutes of
+    // tape before it (the overlap is older than the newest report: ignored).
+    while cycle < 4 {
+        let wc = w + 2 * cycle;
+        let open = OPEN + u64::from(cycle) * 1_800;
+        let end = open + 900;
+        let pair = pm_pair_of_window(wc);
+        let mut s = open - 1_200;
+        while s < end - 2 {
+            if s == open {
+                c.now = open * S;
+                m.on_venue_event(&roll(wc, false, 0), &mut c);
+                m.on_venue_event(&law(wc), &mut c);
+            }
+            let px = if s >= open { base + 400_000_000 } else { base } + if s % 2 == 0 { 2_000_000 } else { -2_000_000 };
+            c.now = s * S - 200_000_000;
+            m.on_tick(&Tick::new(c.now, VenueId::Hyperliquid, perp, 1, Price::from_raw(px - 500_000), Qty::from_raw(1), Price::from_raw(px + 500_000), Qty::from_raw(1)), &mut c);
+            c.now = s * S + 1_300_000_000;
+            m.on_venue_event(&ChannelEvent::new(c.now, VenueId::Polymarket, ChannelId::Mark, pm_mark_sym(0), s, s * 1_000, px, px * 1_000_000), &mut c);
+            m.on_tick(&Tick::new(c.now, VenueId::Polymarket, pm_rolling_sym(0, pair, PM_LEG_UP), 1, Price::from_raw(920_000), Qty::from_raw(500_000_000), Price::from_raw(930_000), Qty::from_raw(500_000_000)), &mut c);
+            m.on_tick(&Tick::new(c.now, VenueId::Polymarket, pm_rolling_sym(0, pair, PM_LEG_DOWN), 1, Price::from_raw(70_000), Qty::from_raw(500_000_000), Price::from_raw(80_000), Qty::from_raw(500_000_000)), &mut c);
+            if let Some(o) = c.last.take() {
+                m.on_fill(&Fill::new(c.now, o.sym, Side::Bid, Price::from_raw(930_000), o.qty, o.client_oid), &mut c);
+            }
+            m.on_timer(c.now, &mut c);
+            s += 1;
+        }
+        m.on_venue_event(&roll(wc, true, PM_SETTLED_UP), &mut c);
+        cycle += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    let ct = m.counters();
+    assert!(c.n >= 4 && ct.settled_won == 4, "gate 114: the member took and settled every cycle ({} orders, {:?})", c.n, ct);
+    assert_eq!(allocs, 0, "gate 114: slot 9's member allocated {allocs} times ({bytes} B)");
+    std::hint::black_box((wire.0, ct));
+}

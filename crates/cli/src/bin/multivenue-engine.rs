@@ -1502,6 +1502,12 @@ struct RunArgs {
     /// boot must be — and the member holds until its HAR window warms.
     #[arg(long)]
     bin15_seed_dir: Option<PathBuf>,
+    /// PM15-5: the slot-9 parameter artifact (`~/multivenue/pm15.toml` by
+    /// default). Read only when the requested mask carries the pm15 bit
+    /// (`--strategy …+pm15`; `all` does not name it); an absent or
+    /// unresolvable artifact refuses the boot with the bit set.
+    #[arg(long)]
+    pm15: Option<PathBuf>,
     /// HYPARB H5: the slot-0 parameter artifact
     /// (`~/multivenue/hyparb.toml` by default). Read only when the
     /// requested mask carries slot 0 (`--strategy hyparb` / `ai+hyparb`
@@ -6053,6 +6059,32 @@ fn run(args: RunArgs) -> ExitCode {
                 join_reverse(handles);
                 return ExitCode::from(1);
             }
+            // PM15-5: slot 9's artifact, against the same descriptor table
+            // and the universe's `[polymarket] rolling` order.
+            let pm15_boot = if cli::pm15_boot::pm15_wanted(requested) {
+                match cli::pm15_boot::load_pm15_boot(
+                    args.pm15.as_deref(),
+                    &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                    &boot.pm_rolling,
+                ) {
+                    Ok(b) => b,
+                    Err(reason) => {
+                        error!(reason, "pm15: artifact refused — boot aborted");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                None
+            };
+            if cli::pm15_boot::pm15_wanted(requested) && pm15_boot.is_none() {
+                error!(
+                    "pm15: requested by --strategy but the artifact is absent \
+                     (~/multivenue/pm15.toml or --pm15) — boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
             // HYPARB H5: slot 0's artifact. Coins resolve against the
             // same descriptor table; pools against the universe's
             // `[hyperevm]` list (the universe allocates their symbols).
@@ -6207,6 +6239,7 @@ fn run(args: RunArgs) -> ExitCode {
                         regime_boot.as_ref(),
                         hyparb_boot.as_ref(),
                         har_boot.as_ref(),
+                        pm15_boot.as_ref(),
                     )
                 }
                 // WITH `--exec`: the same loop over the compositing
@@ -6551,6 +6584,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
                                 har_boot.as_ref(),
+                                pm15_boot.as_ref(),
                             )
                         }};
                     }

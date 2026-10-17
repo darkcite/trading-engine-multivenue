@@ -2579,6 +2579,11 @@ pub const STRATEGY_SLOT_VM: u8 = 5;
 /// [`AiCmdKind::SetBinarySpec`] commands must target exactly this slot.
 pub const STRATEGY_SLOT_BIN15: u8 = 3;
 
+/// Strategy-set slot of `strategy-pm15` (PM15-5, 2026-10-17): H90 on
+/// Polymarket's rolling 15-minute up/down markets. Slot 9 was reserved
+/// until then, so no capture carries another member's rows under it.
+pub const STRATEGY_SLOT_PM15: u8 = 9;
+
 /// `AiCmd::side` sentinel meaning "no side" (every kind except
 /// `OrderIntent`).
 pub const AI_SIDE_NONE: u8 = 0xFF;

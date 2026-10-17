@@ -175,7 +175,7 @@ pub const UNBUILT_SLOT_NAME: &str = "reserved";
 /// Slot names, for boot tells and refusal messages. Index = slot.
 /// Derived from `strategy_set::MEMBERS` — the member table's own names,
 /// so the two cannot drift — and [`UNBUILT_SLOT_NAME`] for every slot no
-/// row names (8–15, S16-R5).
+/// row names (8 and 10–15, S16-R5; 9 is PM15's since PM15-5).
 pub const SLOT_NAMES: [&str; EXEC_SLOTS] = {
     let mut names = [UNBUILT_SLOT_NAME; EXEC_SLOTS];
     let mut i = 0;

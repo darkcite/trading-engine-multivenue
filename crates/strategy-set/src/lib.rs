@@ -33,7 +33,9 @@
 //! | 5 | `strategy-vm` | built (8g item 6) |
 //! | 6 | `strategy-xmm` | built (XMM XH1, 2026-09-26 — **was `strategy-icdp`**, unlinked the same day, O-XH1; lands DARK until XH3) — configured only when `~/multivenue/xmm.toml` resolves |
 //! | 7 | `strategy-hcv` | built (HC11, 2026-09-26 — Hypercall S1; lands DARK, paper only, in no configured mask, O-HC18) — configured only when `~/multivenue/hcv.toml` resolves |
-//! | 8–15 | — | **reserved** (S16-2, ruling S16-R5): no member; an `EnableStrategy` is refused and counted |
+//! | 8 | — | **reserved** (S16-2, ruling S16-R5; branch `pvm-pine-engine` claims it) |
+//! | 9 | `strategy-pm15` | built (PM15-5, 2026-10-17 — H90 on Polymarket's 15-minute up/down markets; paper first, ruling R-PM-2) — configured only when `~/multivenue/pm15.toml` resolves; not in `all` ([`ALL_MASK`]) |
+//! | 10–15 | — | **reserved** (S16-2, ruling S16-R5): no member; an `EnableStrategy` is refused and counted |
 //!
 //! Slots 0–7 are all built since HC11 (slot 7 was never assigned before,
 //! so no capture carries rows of another member under it). Slots 8–15 are
@@ -248,8 +250,8 @@ macro_rules! member_gen {
             pub const $bn: SlotMask = 1 << $sn;
         )*
         /// Every built member's bit: the OR of the member table's rows
-        /// (slots 0–7, all of them since HC11; 8–15 are reserved, S16-R5,
-        /// so this is `0x00FF`).
+        /// (slots 0–7 since HC11, and slot 9 since PM15-5 — `0x02FF`; 8 and
+        /// 10–15 are reserved, S16-R5).
         pub const BUILT_MASK: SlotMask = $($bn)|*;
         /// The member table's rows in slot order: every member's slot,
         /// bit, `--strategy` name and `regime.toml` label key. Boot-only
@@ -429,6 +431,8 @@ macro_rules! member_table {
                 xmm: strategy_xmm::XmmStrategy, "xmm", Some("xmm")),
             (SLOT_HCV = 7, BIT_HCV,
                 hcv: strategy_hcv::HcvStrategy, "hcv", None),
+            (SLOT_PM15 = core_types::STRATEGY_SLOT_PM15, BIT_PM15,
+                pm15: strategy_pm15::Pm15Strategy, "pm15", None),
         }
     };
 }
@@ -448,6 +452,15 @@ pub const SET_AI_EXEC_SLOTS: usize = 64;
 // (VM2 V3: the vm's book generic is gone — mids live in the feature
 // engine's fixed sym slots — so the old `SET_VM_SLOTS = 512` law
 // retired with it.)
+
+/// What `--strategy all` composes: the members of slots 0–7, the set as it
+/// stood before slot 9 was built. A member added since joins a boot only
+/// by NAME (`…+pm15`), so `all` on an existing wrapper does not grow a new
+/// member behind the operator's back (the PM15 lane copies the precedent
+/// of branch `pvm-pine-engine`'s slot 8).
+pub const ALL_MASK: SlotMask = 0x00FF;
+
+const _: () = assert!(ALL_MASK & !BUILT_MASK == 0, "`all` names only built members");
 
 /// The `ai` group: the AI-pushed lanes, ai-exec + vm (operator ruling
 /// 2026-09-02 — Rust-coded strategies disabled at boot; the engine
@@ -494,7 +507,7 @@ impl core::fmt::Display for StrategyParseErr<'_> {
 /// ruling S16-R3) — the ONE parser: the engine's boot, its
 /// `strategy-mask` subcommand and, through that, the launchd wrapper.
 ///
-/// `all` alone is every built member ([`BUILT_MASK`]). Anything else is
+/// `all` alone is [`ALL_MASK`] (slots 0–7). Anything else is
 /// `+`-joined segments in any order, each a member's name ([`MEMBERS`])
 /// or `ai` ([`AI_MASK`]); the mask is the OR of theirs, so an overlap or a
 /// repeat is the union (`ai+vm` = `ai`, `vrp+vrp` = `vrp`). Refused: the
@@ -511,7 +524,7 @@ pub fn parse_strategy(s: &str) -> Result<SlotMask, StrategyParseErr<'_>> {
         return Err(StrategyParseErr::Empty);
     }
     if s == "all" {
-        return Ok(BUILT_MASK);
+        return Ok(ALL_MASK);
     }
     let mut mask: SlotMask = 0;
     for seg in s.split('+') {
@@ -1027,6 +1040,19 @@ impl StrategySet {
         &self.hcv
     }
 
+    /// Configure the pm15 member (boot-only: `configure` with the resolved
+    /// artifact).
+    #[inline]
+    pub fn pm15_mut(&mut self) -> &mut strategy_pm15::Pm15Strategy {
+        &mut self.pm15
+    }
+
+    /// The pm15 member (cli: boot tells).
+    #[inline]
+    pub fn pm15(&self) -> &strategy_pm15::Pm15Strategy {
+        &self.pm15
+    }
+
     /// Set-level `EnableStrategy` handling. See module docs.
     #[inline]
     fn enable_slot(&mut self, slot: u8) {
@@ -1257,6 +1283,11 @@ impl StrategyCounters for StrategySet {
     #[inline]
     fn bin15_counters(&self) -> strategy_core::Bin15Counters {
         self.bin15.bin15_counters()
+    }
+    /// PM15: slot 9's observables.
+    #[inline]
+    fn pm15_counters(&self) -> strategy_core::Pm15Counters {
+        self.pm15.pm15_counters()
     }
     #[inline]
     fn bin15_families_view(&self, out: &mut [strategy_core::Bin15FamilyView]) -> u32 {
@@ -1933,7 +1964,7 @@ mod tests {
         assert_eq!(
             Unknown("nope").to_string(),
             "unknown name `nope` — valid: `+`-joined names from hyparb, vrp, xsd, bin15, \
-             ai-exec, vm, xmm, hcv, ai (= ai-exec+vm); or `all` alone",
+             ai-exec, vm, xmm, hcv, pm15, ai (= ai-exec+vm); or `all` alone",
             "the refusal names the valid set"
         );
     }
@@ -1950,32 +1981,32 @@ mod tests {
         assert_eq!(parse_strategy("xmm+bin15"), Ok(72), "refused before S16-1c");
     }
 
+    /// One set per call, dropped on return: the set is ≈ 170 KiB by value,
+    /// and a dozen live `let s` bindings in one debug frame overflow the
+    /// 2 MiB test-thread stack.
+    fn enabled_of(mask: SlotMask) -> SlotMask {
+        StrategySet::new(mask).enabled_mask()
+    }
+
     #[test]
     fn new_clamps_reserved_bits_to_built_mask() {
-        let s = StrategySet::new(0xFF);
-        assert_eq!(s.enabled_mask(), BUILT_MASK);
+        assert_eq!(enabled_of(0xFF), 0x00FF);
         const _: () = assert!(
-            BUILT_MASK == 0x00FF,
-            "slots 0–7 built since HC11; 8–15 reserved (S16-R5)"
+            BUILT_MASK == 0x02FF,
+            "slots 0–7 built since HC11, slot 9 since PM15-5; 8 and 10–15 reserved (S16-R5)"
         );
-        // S16-2: the reserved high byte is cleared, whole or alone — it
-        // never lands on the low byte's members.
-        let s = StrategySet::new(0xFFFF);
-        assert_eq!(s.enabled_mask(), BUILT_MASK);
-        let s = StrategySet::new(0xFF00);
-        assert_eq!(s.enabled_mask(), 0);
-        let s = StrategySet::new((1 as SlotMask) << 11);
-        assert_eq!(s.enabled_mask(), 0, "slot 11 is not slot 3");
-        let s = StrategySet::new(0b1000_0000);
-        assert_eq!(s.enabled_mask(), BIT_HCV, "slot 7 is built (hcv since HC11)");
-        let s = StrategySet::new(BIT_XSD);
-        assert_eq!(s.enabled_mask(), BIT_XSD, "slot 2 is built now (XSD-3)");
-        let s = StrategySet::new(BIT_XMM);
-        assert_eq!(s.enabled_mask(), BIT_XMM, "slot 6 is built (xmm since XMM XH1)");
-        let s = StrategySet::new(BIT_AI_EXEC);
-        assert_eq!(s.enabled_mask(), BIT_AI_EXEC, "slot 4 is built now");
-        let s = StrategySet::new(BIT_VM);
-        assert_eq!(s.enabled_mask(), BIT_VM, "slot 5 is built now (8g)");
+        // S16-2: the reserved bits of the high byte are cleared, whole or
+        // alone — they never land on the low byte's members; slot 9's bit
+        // is pm15's.
+        assert_eq!(enabled_of(0xFFFF), BUILT_MASK);
+        assert_eq!(enabled_of(0xFF00), BIT_PM15);
+        assert_eq!(enabled_of(0xFD00), 0, "8 and 10–15 are reserved");
+        assert_eq!(enabled_of((1 as SlotMask) << 11), 0, "slot 11 is not slot 3");
+        assert_eq!(enabled_of(0b1000_0000), BIT_HCV, "slot 7 is built (hcv since HC11)");
+        assert_eq!(enabled_of(BIT_XSD), BIT_XSD, "slot 2 is built now (XSD-3)");
+        assert_eq!(enabled_of(BIT_XMM), BIT_XMM, "slot 6 is built (xmm since XMM XH1)");
+        assert_eq!(enabled_of(BIT_AI_EXEC), BIT_AI_EXEC, "slot 4 is built now");
+        assert_eq!(enabled_of(BIT_VM), BIT_VM, "slot 5 is built now (8g)");
     }
 
     #[test]
@@ -2198,15 +2229,16 @@ mod tests {
 
     /// Migrated from slot 5 in 8g item 6 (§8), from slot 6 in ICDP I4
     /// (slot 6 is xmm since XMM XH1) and from slot 7 in HC11 (hcv). Since
-    /// S16-2 the ids past 7 are the RESERVED slots 8–15 (S16-R5; probed
-    /// twice here — the `s16_*` tests take every mask path at 8, 11, 15).
+    /// S16-2 the ids past 7 are the RESERVED slots 8 and 10–15 (S16-R5;
+    /// 9 is PM15's since PM15-5; probed twice here at 8 and 10 — the
+    /// `s16_*` tests take every mask path at 8, 11, 15).
     #[test]
     fn enable_reserved_or_unknown_slot_refused() {
         let mut s = StrategySet::new(0);
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
         s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, 8), &mut c);
-        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, 9), &mut c);
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, 10), &mut c);
         assert_eq!(s.enabled_mask(), 0);
         assert_eq!(s.enable_refused_total(), 2);
         assert!(!s.is_halted(), "unknown-slot refusal is not a halt");
@@ -3095,10 +3127,14 @@ mod tests {
 
     /// S16-1c: every mask the members compose parses back from its names
     /// in slot order (= [`MaskNames`]), reversed, and with `ai` standing
-    /// for ai-exec + vm at either end.
+    /// for ai-exec + vm at either end. Masks carrying a reserved bit
+    /// (slot 8, below PM15's) name no member set and are skipped.
     #[test]
     fn every_mask_round_trips_through_the_parser() {
         for mask in 1..=BUILT_MASK {
+            if mask & !BUILT_MASK != 0 {
+                continue;
+            }
             let names: Vec<&str> = MEMBERS
                 .iter()
                 .filter(|m| mask & m.bit != 0)
@@ -3126,14 +3162,24 @@ mod tests {
     /// slot numbers in order, each member's `--strategy` name composes its
     /// own bit alone, `BUILT_MASK` is the rows' OR, and the label keys are
     /// the `regime.toml [labels.<member>]` sections the cli resolves
-    /// (`regime_boot::coded_member_slot`): vm and hcv carry none.
+    /// (`regime_boot::coded_member_slot`): vm, hcv and pm15 carry none.
     #[test]
     fn the_member_table_is_the_slot_map() {
         let slots: Vec<u8> = MEMBERS.iter().map(|m| m.slot).collect();
-        assert_eq!(slots, [0, 1, 2, 3, 4, 5, 6, 7], "wire-stable");
+        assert_eq!(slots, [0, 1, 2, 3, 4, 5, 6, 7, 9], "wire-stable");
         assert_eq!(
-            [SLOT_HYPARB, SLOT_VRP, SLOT_XSD, SLOT_BIN15, SLOT_AI_EXEC, SLOT_VM, SLOT_XMM, SLOT_HCV],
-            [0, 1, 2, 3, 4, 5, 6, 7]
+            [
+                SLOT_HYPARB,
+                SLOT_VRP,
+                SLOT_XSD,
+                SLOT_BIN15,
+                SLOT_AI_EXEC,
+                SLOT_VM,
+                SLOT_XMM,
+                SLOT_HCV,
+                SLOT_PM15
+            ],
+            [0, 1, 2, 3, 4, 5, 6, 7, 9]
         );
         let mut or: SlotMask = 0;
         for m in MEMBERS {
@@ -3143,7 +3189,10 @@ mod tests {
         }
         assert_eq!(or, BUILT_MASK);
         let names: Vec<&str> = MEMBERS.iter().map(|m| m.name).collect();
-        assert_eq!(names, ["hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "hcv"]);
+        assert_eq!(
+            names,
+            ["hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "hcv", "pm15"]
+        );
         let keys: Vec<Option<&str>> = MEMBERS.iter().map(|m| m.regime_key).collect();
         assert_eq!(
             keys,
@@ -3155,6 +3204,7 @@ mod tests {
                 Some("ai_exec"),
                 None,
                 Some("xmm"),
+                None,
                 None
             ]
         );

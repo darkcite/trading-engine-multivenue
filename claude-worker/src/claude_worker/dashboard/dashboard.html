@@ -88,10 +88,11 @@ const VALUES = {
   source:['measured','declared','unknown'],
 };
 // Slot map (index = slot). /state schema 2 carries 8 per-slot entries,
-// schema 3 (S16-5) carries 16 — slots 8–15 are reserved (no member). Every
-// per-slot array is walked by ITS OWN length, never by this table's.
+// schema 3 (S16-5) carries 16 — slot 9 is pm15 (PM15-5), 8 and 10–15 are
+// reserved (no member). Every per-slot array is walked by ITS OWN length,
+// never by this table's.
 const SLOT_NAMES = ['hyparb','vrp','xsd','bin15','ai-exec','vm','xmm','hcv',
-  'reserved','reserved','reserved','reserved','reserved','reserved','reserved','reserved'];
+  'reserved','pm15','reserved','reserved','reserved','reserved','reserved','reserved'];
 // Slots 0–7 keep their colours; 8–15 got eight distinguishable new ones.
 const SLOT_COLORS = ['#e2b13c','#8a93a6','#5b9cf5','#39c26c','#e25b4c','#c78cf5','#4cc3e2','#8a93a6',
   '#f08c3c','#e26fae','#9fd356','#3cc9a0','#b5895a','#7a7ff0','#d4d46a','#f2a2a2'];

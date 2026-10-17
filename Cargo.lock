@@ -141,6 +141,7 @@ dependencies = [
  "core-ring",
  "core-settle",
  "core-time",
+ "core-twaplock",
  "core-types",
  "core-vol",
  "criterion",
@@ -180,6 +181,7 @@ dependencies = [
  "strategy-hyparb",
  "strategy-icdp",
  "strategy-latency-arb",
+ "strategy-pm15",
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
@@ -346,6 +348,7 @@ dependencies = [
  "core-regime",
  "core-ring",
  "core-time",
+ "core-twaplock",
  "core-types",
  "core-vol",
  "engine",
@@ -382,6 +385,7 @@ dependencies = [
  "strategy-hcv",
  "strategy-hyparb",
  "strategy-icdp",
+ "strategy-pm15",
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
@@ -2112,6 +2116,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "strategy-pm15"
+version = "0.1.0"
+dependencies = [
+ "core-fill",
+ "core-time",
+ "core-twaplock",
+ "core-types",
+ "strategy-core",
+]
+
+[[package]]
 name = "strategy-rule-tree"
 version = "0.1.0"
 dependencies = [
@@ -2137,6 +2152,7 @@ dependencies = [
  "strategy-core",
  "strategy-hcv",
  "strategy-hyparb",
+ "strategy-pm15",
  "strategy-vm",
  "strategy-vrp",
  "strategy-xmm",

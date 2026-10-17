@@ -50,6 +50,9 @@ opt-registry         = { workspace = true }
 book-builder         = { workspace = true }
 strategy-ai-exec     = { workspace = true }
 strategy-bin15       = { workspace = true }
+# PM15 gate 114: the rolling 15m ingress driver and slot 9's member.
+strategy-pm15        = { workspace = true }
+core-twaplock        = { workspace = true }
 strategy-core        = { workspace = true }
 strategy-latency-arb = { workspace = true }
 strategy-ev          = { workspace = true }

@@ -3711,8 +3711,12 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     regime: Option<&RegimeBoot>,
     hyparb: Option<&crate::hyparb_boot::HyparbBoot>,
     har: Option<&crate::har_boot::HarBoot>,
+    pm15: Option<&crate::pm15_boot::Pm15Boot>,
 ) -> EngineLoopResult {
     let mut configured = strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
+    if pm15.is_some() {
+        configured |= strategy_set::BIT_PM15;
+    }
     if hyparb.is_some() {
         configured |= strategy_set::BIT_HYPARB;
     }
@@ -3960,6 +3964,17 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         }
         let dormant = set.bin15_mut().counters().families_dormant as usize;
         tracing::info!("{}", crate::bin15_boot::render_boot_tell(boot, dormant));
+    }
+    if let Some(boot) = pm15 {
+        // PM15-5: the wall anchor is taken HERE, once — the member states
+        // every window on wall time through it. The Φ table (16 KiB) is
+        // cloned out of the boot struct, once.
+        let anchor = core_time::WallAnchor::now();
+        if let Err(e) = set.pm15_mut().configure(boot.params, Box::new((*boot.lut).clone()), anchor) {
+            tracing::error!(error = ?e, "pm15: configure failed");
+            return EngineLoopResult::Failed("engine_loop_set: pm15 configure rejected");
+        }
+        tracing::info!("{}", crate::pm15_boot::render_boot_tell(boot));
     }
     if let Some(boot) = hyparb {
         // HYPARB H5. The wall anchor is taken HERE, once — the member's
@@ -4637,6 +4652,7 @@ impl Observability {
             let vrp = register_vrp_metrics(&mut reg)?;
             let xsd = register_xsd_metrics(&mut reg)?;
             let bin15 = register_bin15_metrics(&mut reg)?;
+            let pm15_member = register_pm15_member_metrics(&mut reg)?;
             let hyparb = register_hyparb_metrics(&mut reg)?;
             let hyparb_evm = register_hyparb_evm_metrics(&mut reg)?;
             let regime = register_regime_metrics(&mut reg)?;
@@ -4769,6 +4785,7 @@ impl Observability {
                 vrp,
                 xsd,
                 bin15,
+                pm15_member,
                 hyparb,
                 hyparb_evm,
                 regime,
@@ -5260,6 +5277,8 @@ pub struct EngineCounters {
     pub xsd: XsdMetricIds,
     /// BIN15 O4b: the `engine_bin15_*` family (slot 3).
     pub bin15: Bin15MetricIds,
+    /// PM15-5: the `engine_pm15_*` family (slot 9).
+    pub pm15_member: Pm15MemberMetricIds,
     /// HYPARB H6: the `engine_hyparb_*` family (slot 0).
     pub hyparb: HyparbMetricIds,
     /// HYPARB H8: the `engine_hyparb_evm_*` family (the testnet shadow).
@@ -8207,6 +8226,89 @@ fn register_bin15_metrics(
     })
 }
 
+/// PM15-5: the `engine_pm15_*` family (slot 9) — the member's tallies as
+/// counters (`engine_pm15_<name>_total`, deltas of
+/// [`strategy_core::Pm15Counters::tallies`]) and its levels as gauges.
+#[derive(Copy, Clone, Debug)]
+pub struct Pm15MemberMetricIds {
+    /// One counter per [`strategy_core::PM15_COUNTER_NAMES`] entry.
+    pub tallies: [core_metrics::CounterId; strategy_core::PM15_TALLIES],
+    /// The levels, in [`PM15_LEVEL_NAMES`] order.
+    pub levels: [GaugeId; PM15_LEVELS],
+}
+
+/// The PM15 member's level gauges.
+pub const PM15_LEVELS: usize = 6;
+
+/// Their names, in [`pm15_levels`] order.
+pub const PM15_LEVEL_NAMES: [&str; PM15_LEVELS] = [
+    "engine_pm15_pnl_usd_1e6",
+    "engine_pm15_fees_usd_1e6",
+    "engine_pm15_bought_usd_1e6",
+    "engine_pm15_open_cost_usd_1e6",
+    "engine_pm15_markets_live",
+    "engine_pm15_halted",
+];
+
+/// The levels of `c`, in [`PM15_LEVEL_NAMES`] order.
+#[must_use]
+pub fn pm15_levels(c: &strategy_core::Pm15Counters) -> [i64; PM15_LEVELS] {
+    [
+        c.pnl_1e6,
+        c.fees_1e6,
+        c.bought_1e6,
+        c.open_cost_1e6,
+        c.markets_live as i64,
+        c.halted as i64,
+    ]
+}
+
+/// Register the PM15 member family (boot-only; names rendered once).
+fn register_pm15_member_metrics(reg: &mut MetricsRegistry) -> Result<Pm15MemberMetricIds, &'static str> {
+    let mut tallies = [core_metrics::CounterId::default(); strategy_core::PM15_TALLIES];
+    let mut i = 0usize;
+    while i < strategy_core::PM15_TALLIES {
+        let name = format!("engine_pm15_{}_total", strategy_core::PM15_COUNTER_NAMES[i]);
+        tallies[i] = reg
+            .register_counter(&name)
+            .map_err(|_| "register pm15 counter")?;
+        i += 1;
+    }
+    let mut levels = [GaugeId::default(); PM15_LEVELS];
+    let mut k = 0usize;
+    while k < PM15_LEVELS {
+        levels[k] = reg
+            .register_gauge(PM15_LEVEL_NAMES[k])
+            .map_err(|_| "register pm15 gauge")?;
+        k += 1;
+    }
+    Ok(Pm15MemberMetricIds { tallies, levels })
+}
+
+/// Mirror the PM15 member family: tallies as monotonic deltas, levels as
+/// stores. 5 s cadence — cold path.
+fn mirror_pm15_member_metrics<S: strategy_core::StrategyCounters>(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &Pm15MemberMetricIds,
+    strat: &S,
+    last: &mut strategy_core::Pm15Counters,
+) {
+    let cur = strat.pm15_counters();
+    let (now, before) = (cur.tallies(), last.tallies());
+    let mut i = 0usize;
+    while i < strategy_core::PM15_TALLIES {
+        reg.counter(ids.tallies[i]).inc(now[i].saturating_sub(before[i]));
+        i += 1;
+    }
+    let lv = pm15_levels(&cur);
+    let mut k = 0usize;
+    while k < PM15_LEVELS {
+        reg.gauge(ids.levels[k]).set(lv[k]);
+        k += 1;
+    }
+    *last = cur;
+}
+
 /// Mirror the BIN15 family as monotonic deltas of the cumulative
 /// strategy counters, plus the per-family levels. 5 s cadence — cold
 /// path.
@@ -9722,6 +9824,8 @@ where
     // instance dies at its own expiry, so there is nothing an epoch
     // could carry across a restart that the next roll does not rebind.
     let mut bin15_last = strategy_core::Bin15Counters::default();
+    // PM15-5: slot 9's counter baseline.
+    let mut pm15_last = strategy_core::Pm15Counters::default();
     let mut hyparb_last = strategy_core::HyparbCounters::default();
     // HYPARB H8: the testnet shadow's tap, owned by this thread from here.
     let mut hyparb_shadow = obs.hyparb_shadow.take();
@@ -9997,6 +10101,7 @@ where
                 mirror_vrp_metrics(reg, &ids.vrp, eng.strategy(), &mut vrp_last);
                 mirror_xsd_metrics(reg, &ids.xsd, eng.strategy(), &mut xsd_last);
                 mirror_bin15_metrics(reg, &ids.bin15, eng.strategy(), &mut bin15_last);
+                mirror_pm15_member_metrics(reg, &ids.pm15_member, eng.strategy(), &mut pm15_last);
                 mirror_hyparb_metrics(reg, &ids.hyparb, eng.strategy(), &mut hyparb_last);
                 mirror_hyparb_evm_metrics(
                     reg,

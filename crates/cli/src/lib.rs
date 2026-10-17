@@ -64,6 +64,7 @@ pub mod har_writer;
 /// BIN15 H90 L4: the late window's live dust test (`hl-outcome-probe`) —
 /// MAINNET, the operator's to run (ruling O-H90-3).
 pub mod hl_outcome_probe;
+pub mod pm15_boot;
 pub mod pm15_probe;
 /// HYPARB H5: `hyparb.toml` → the slot-0 member's params.
 pub mod hyparb_boot;

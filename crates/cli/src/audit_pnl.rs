@@ -2166,8 +2166,11 @@ mod tests {
         for (i, m) in members.iter().enumerate() {
             assert_eq!(strategy_label(i as u8), *m);
         }
+        assert_eq!(strategy_label(9), "pm15");
         for id in 8..MAX_STRATEGY_SLOTS {
-            assert_eq!(strategy_label(id), "reserved", "slot {id}");
+            if id != 9 {
+                assert_eq!(strategy_label(id), "reserved", "slot {id}");
+            }
         }
         assert_eq!(strategy_label(MAX_STRATEGY_SLOTS), "unknown");
         assert_eq!(strategy_label(0xFE), "unknown");
